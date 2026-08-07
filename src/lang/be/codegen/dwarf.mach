@@ -337,7 +337,7 @@ fun resolve(itn: *intern.Interner, id: intern.StrId) str {
 # disp:      readable source name for DW_AT_name, or STR_NIL to fall back to `name`
 # disp_off:  byte offset of the DW_AT_name string within `.debug_str`
 # external:  true when the symbol has global linkage (DW_AT_external)
-# decl_file: 0-based DWARF file index of the function's first row, or 0
+# decl_file: DWARF file slot of the function's first row, or 0 (the primary file)
 # decl_line: 1-based source line of the function's first row, or 0
 # ret_ty:    index into the type table for the return type, or -1 when the return is
 #            void or an unresolved type (no DW_AT_type)
@@ -474,7 +474,7 @@ rec LocRange {
 # func_idx:    index of the enclosing DwFunc (subprogram) in the subs array
 # callee:      inlined callee's symbol name (DW_AT_abstract_origin target)
 # origin_off:  `.debug_info` offset of the callee's abstract-instance subprogram DIE
-# call_file:   1-based DWARF file index of the call site (DW_AT_call_file)
+# call_file:   DWARF file slot of the call site (DW_AT_call_file)
 # call_line:   1-based source line of the call site (DW_AT_call_line)
 # parent:      enclosing instance's 1-based site id within the same function (0 = directly
 #              under the subprogram), for nested inlines
@@ -1025,31 +1025,51 @@ fun frame_base_omit_reg(tgt: *target.Target) i32 {
 val MAX_FILES: u32 = 256;
 
 # a compile unit's source-file table, mapping the encoder rows' `source.FileId`s to
-# 0-based DWARF file indices in first-seen order
+# DWARF file slots in first-seen order.
+#
+# the emitted table reserves slot 0 for the CU's primary source file (DWARF 5 §6.2.4
+# requires it to match the CU DIE's DW_AT_name) and lists the interned ids from slot 1
+# up, so `ids[i]` is DWARF slot `i + 1`. slot 1 must exist whenever the line program
+# has any row: DWARF 5 §6.2.2 gives the state machine's `file` register an initial
+# value of 1, and a consumer materializes that register at the start of every sequence
+# before any DW_LNS_set_file is seen. reserving slot 0 also keeps `DW_AT_decl_file` /
+# `DW_AT_call_file` 0 meaningful (the primary file) when a location cannot be recovered.
 # ---
-# ids:   the distinct FileIds, in first-seen order (dwarf index = array index)
-# count: number of files
+# ids:   the distinct FileIds, in first-seen order (dwarf slot = array index + 1)
+# count: number of interned files (the emitted table holds one more)
 rec FileTable {
     ids:   [256]source.FileId;
     count: u32;
 }
 
-# find or append `id` in the file table, returning its 0-based DWARF file index, or
-# -1 when the table is full
+# find or append `id` in the file table, returning its DWARF file slot, or -1 when the
+# table is full
 # ---
 # ft: the file table to search / grow
 # id: the FileId to intern into the table
-# ret: the 0-based dwarf file index, or -1 on overflow
+# ret: the dwarf file slot (1-based), or -1 on overflow
 fun file_index(ft: *FileTable, id: source.FileId) i32 {
-    var i: u32 = 0;
-    for (i < ft.count) {
-        if (ft.ids[i] == id) { ret i::i32; }
-        i = i + 1;
-    }
+    val hit: i32 = file_slot(ft, id);
+    if (hit >= 0) { ret hit; }
     if (ft.count >= MAX_FILES) { ret -1; }
     ft.ids[ft.count] = id;
     ft.count = ft.count + 1;
-    ret (ft.count - 1)::i32;
+    ret ft.count::i32;
+}
+
+# look `id` up in the file table without growing it, for the emission passes that run
+# after the line header has committed the table's size
+# ---
+# ft: the file table to search
+# id: the FileId to look up
+# ret: the dwarf file slot (1-based), or -1 when `id` is not interned
+fun file_slot(ft: *FileTable, id: source.FileId) i32 {
+    var i: u32 = 0;
+    for (i < ft.count) {
+        if (ft.ids[i] == id) { ret (i + 1)::i32; }
+        i = i + 1;
+    }
+    ret -1;
 }
 
 # copy a byte buffer's contents into a fresh image-owned, exactly-sized allocation
@@ -2274,11 +2294,12 @@ fun emit_row(b: *enc.ByteBuf, addr_delta: u32, line_delta: i32) {
 # text_sec:     the `.text` section index (rows outside it are ignored)
 # address_size: target pointer width in bytes
 # comp_dir:     the compilation directory (line-header directory 0)
-# ft:           the built file table (line-header file entries)
+# name:         the CU's primary source path (DW_AT_name), emitted as file slot 0
+# ft:           the built file table (line-header file entries), read only here
 # b:            out - the line-program bytes
 # addr_off:     out - per-function byte offset of the set_address address field
 fun build_line(s: *session.Session, funcs: *DwFunc, nfuncs: u32, rows: *enc.LineRow, row_count: u32,
-               text_sec: u32, address_size: u8, comp_dir: str, ft: *FileTable,
+               text_sec: u32, address_size: u8, comp_dir: str, name: str, ft: *FileTable,
                b: *enc.ByteBuf, addr_off: *u32) {
     val len_pos: usize = b.len;
     enc.emit_u32(b, 0);              # unit_length (backpatched)
@@ -2307,11 +2328,15 @@ fun build_line(s: *session.Session, funcs: *DwFunc, nfuncs: u32, rows: *enc.Line
     uleb(b, 1);
     emit_cstr(b, comp_dir);
 
-    # file table: two format fields (path/string, dir_index/udata), one entry per file.
+    # file table: two format fields (path/string, dir_index/udata). slot 0 is the CU's
+    # primary source file (matching DW_AT_name), then one entry per interned file, so
+    # the state machine's initial `file` register of 1 always names a declared entry.
     enc.emit_byte(b, 2);
     uleb(b, DW_LNCT_path::u64);            uleb(b, DW_FORM_string::u64);
     uleb(b, DW_LNCT_directory_index::u64); uleb(b, 0x0F::u64);  # DW_FORM_udata
-    uleb(b, ft.count::u64);
+    uleb(b, (ft.count + 1)::u64);
+    emit_cstr(b, name);
+    uleb(b, 0);
     var fi: u32 = 0;
     for (fi < ft.count) {
         emit_cstr(b, file_path(s, ft.ids[fi]));
@@ -2381,27 +2406,29 @@ fun build_line(s: *session.Session, funcs: *DwFunc, nfuncs: u32, rows: *enc.Line
     bin.write_u32_le(b.data, len_pos, (b.len - ul_end)::u32);
 }
 
-# a resolved (dwarf file index, 1-based line) for a source location
+# a resolved (dwarf file slot, 1-based line) for a source location
 # ---
-# file: 0-based dwarf file index
+# file: dwarf file slot (0 is the CU's primary source file)
 # line: 1-based source line
 rec PosLine {
     file: u32;
     line: i32;
 }
 
-# resolve a source location to its dwarf file index and 1-based line, defaulting to
-# (0, 1) when the file or position cannot be recovered
+# resolve a source location to its dwarf file slot and 1-based line, defaulting to
+# (0, 1) - the CU's primary file, first line - when the file or position cannot be
+# recovered. lookup only: the table is grown by the pre-pass that runs before the line
+# header commits its size, never by an emission pass reading it back
 # ---
 # s:   session, for the source map
 # loc: the source location to resolve
 # ft:  the file table (already populated with this loc's file)
-# ret: the (file index, line) pair
+# ret: the (file slot, line) pair
 fun pos_of(s: *session.Session, loc: source.SrcLoc, ft: *FileTable) PosLine {
     var out: PosLine;
     out.file = 0;
     out.line = 1;
-    val fx: i32 = file_index(ft, loc.file);
+    val fx: i32 = file_slot(ft, loc.file);
     if (fx >= 0) { out.file = fx::u32; }
     val fo: O.Option[*source.SourceFile] = source.get(?s.sources, loc.file);
     if (O.is_some[*source.SourceFile](fo)) {
@@ -2656,7 +2683,8 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, mir
         fi0 = fi0 + 1;
     }
 
-    # pre-populate the file table so the line header lists every file it references.
+    # pre-populate the file table so the line header lists every file it references;
+    # every later pass only reads it back, so no slot can appear after the header.
     var ft: FileTable;
     ft.count = 0;
     var r: u32 = 0;
@@ -2858,7 +2886,7 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, mir
     val type_fixups: *TypeFixup = R.unwrap_ok[*TypeFixup, str](rfx);
 
     build_abbrev(?b_abbrev);
-    build_line(s, funcs, nfuncs, rows, row_count, text_sec, address_size, comp_dir, ?ft, ?b_line, addr_off);
+    build_line(s, funcs, nfuncs, rows, row_count, text_sec, address_size, comp_dir, name, ?ft, ?b_line, addr_off);
     # loclists / rnglists before info: they stamp each variable's `loclist_off` and each
     # instance's `rnglist_off`, which build_info patches into the sec_offset fields.
     if (has_loclists) {
@@ -3097,8 +3125,7 @@ fun gather_inlines(s: *session.Session, irmod: *ir.Module, funcs: *DwFunc, nfunc
                 di.call_line = pl.line::u32;
             }
             or {
-                # no call-site location: attribute to the enclosing function's file rather
-                # than file index 0, which is out of range when the file table is empty.
+                # no call-site location: attribute to the enclosing function's file.
                 di.call_file = funcs[i].decl_file;
                 di.call_line = funcs[i].decl_line;
             }
@@ -4401,7 +4428,7 @@ test "mach.lang.be.codegen.dwarf.build_line:prologue_end_and_entry_row" {
     var ft: FileTable; ft.count = 0;
     var b: enc.ByteBuf = enc.buf_init(?alloc);
     var addr_off: [1]u32; addr_off[0] = 0;
-    build_line(?s, ?fn, 1, ?row, 1, 0, 8, "/", ?ft, ?b, ?addr_off[0]);
+    build_line(?s, ?fn, 1, ?row, 1, 0, 8, "/", "/", ?ft, ?b, ?addr_off[0]);
 
     # exactly one DW_LNS_set_prologue_end for the one function. scan the program past the
     # DW_LNE_set_address address field (addr_off records its start) so no header u32 length
@@ -4410,6 +4437,53 @@ test "mach.lang.be.codegen.dwarf.build_line:prologue_end_and_entry_row" {
     var i: usize = (addr_off[0] + 8)::usize;
     for (i < b.len) { if (b.data[i] == DW_LNS_set_prologue_end) { pe = pe + 1; } i = i + 1; }
     if (pe != 1) { code = 1; }
+
+    enc.buf_dnit(?b);
+    session.dnit(?s);
+    ret code;
+}
+
+# DWARF 5 §6.2.2 gives the line state machine's `file` register an initial value of 1,
+# which a consumer materializes at the start of every sequence before any
+# DW_LNS_set_file. the emitted file table must therefore always declare a slot 1, so
+# build_line reserves slot 0 for the CU's primary source and lists the interned files
+# from 1 up (binutils' addr2line rejected the whole section otherwise, #2582)
+test "mach.lang.be.codegen.dwarf.build_line:file_table_declares_slot_one" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var code: i32 = 0;
+
+    var fn: DwFunc;
+    fn.name = intern.STR_NIL; fn.offset = 0; fn.size = 16; fn.weak = false;
+    fn.disp = intern.STR_NIL; fn.disp_off = 0; fn.external = false;
+    fn.decl_file = 0; fn.decl_line = 1; fn.ret_ty = -1; fn.var_start = 0; fn.var_count = 0;
+
+    # one interned source file, as a single-file compile unit has.
+    var ft: FileTable; ft.count = 0;
+    if (file_index(?ft, 7::source.FileId) != 1) { code = 1; }
+    if (file_slot(?ft, 7::source.FileId) != 1) { code = 1; }
+    if (file_slot(?ft, 9::source.FileId) != -1) { code = 1; }
+
+    var row: enc.LineRow;
+    row.text_offset = 8; row.sec = 0; row.loc.file = 7::source.FileId; row.loc.offset = 0;
+
+    var b: enc.ByteBuf = enc.buf_init(?alloc);
+    var addr_off: [1]u32; addr_off[0] = 0;
+    build_line(?s, ?fn, 1, ?row, 1, 0, 8, "/", "/", ?ft, ?b, ?addr_off[0]);
+
+    # walk to the file-entry count: 30 fixed header bytes, then the directory table
+    # (format count, one two-byte format pair, entry count, the one-byte comp_dir plus
+    # its NUL), then the file format count and its two two-byte pairs.
+    val fc: usize = 30 + 1 + 2 + 1 + 2 + 1 + 4;
+    if (b.data[fc] != 2) { code = 1; }
+    if (b.data[fc - 1] != 0x0F) { code = 1; }
+
+    # and the row names slot 1, not slot 0.
+    var sf: usize = (addr_off[0] + 8)::usize;
+    if (b.data[sf] != DW_LNS_set_file || b.data[sf + 1] != 1) { code = 1; }
 
     enc.buf_dnit(?b);
     session.dnit(?s);

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run.sh — the integration-test harness.
 #
-# usage: run.sh --target <name> [--runmode native|qemu] [--bless] [--filter <glob>] <compiler>
+# usage: run.sh --target <name> [--runmode native|qemu] [--deps float|pin] [--bless] [--filter <glob>] <compiler>
 #
 # for each case directory under int/{surface,regression}/ that holds a mach.toml,
 # the harness loads its defaults (overridable by an optional line-based case.conf),
@@ -44,6 +44,20 @@
 # said so. Use it to iterate locally; CI never passes it, so the authoritative
 # lane - native on the real runner targets.conf names - is unaffected.
 #
+# DEPENDENCY RESOLUTION. a case declares `ref = "branch/main"` for mach-std, which
+# tracks its latest RELEASE, and the harness resolves it fresh: that is deliberate,
+# and it is what catches a downstream break early. `--deps pin` states the other
+# intent instead, resolving every case to the mach-std commit THIS REPO'S OWN
+# mach.lock records - the one the compiler in the same checkout was built against -
+# so a release-gate run is reproducible and a bisect over mach commits is sound
+# (#2592). the pin is the root lock rather than a file of its own precisely so it
+# cannot rot against the compiler's: bumping the dependency bumps both at once.
+#
+# both modes write int/out/deps.txt naming the commit every case actually compiled
+# against. the PASS/FAIL lines have carried that since #2387, but a log line only
+# answers the question while the log exists, and "what did the run that cut this tag
+# build against" is asked afterwards. CI uploads the file.
+#
 # `--runmode qemu` only reaches a leg qemu-user can actually load: qemu_bin() in
 # lib/produce.sh names the ELF-only rule and the three targets that can never
 # work under it (#2453) - passing `qemu` for one of those fails loudly with that
@@ -51,7 +65,7 @@
 set -eu
 
 usage() {
-    echo "usage: run.sh --target <name> [--runmode native|qemu] [--bless] [--filter <glob>] <compiler>" >&2
+    echo "usage: run.sh --target <name> [--runmode native|qemu] [--deps float|pin] [--bless] [--filter <glob>] <compiler>" >&2
     exit 2
 }
 
@@ -59,6 +73,7 @@ target=
 runmode_override=
 bless=0
 filter='*'
+deps_mode=float
 compiler=
 
 while [ $# -gt 0 ]; do
@@ -70,6 +85,11 @@ while [ $# -gt 0 ]; do
                        *) echo "run.sh: --runmode must be 'native' or 'qemu', got '$runmode_override'" >&2; usage ;;
                    esac ;;
         --filter)  shift; [ $# -gt 0 ] || usage; filter=$1 ;;
+        --deps)    shift; [ $# -gt 0 ] || usage; deps_mode=$1
+                   case "$deps_mode" in
+                       float|pin) : ;;
+                       *) echo "run.sh: --deps must be 'float' or 'pin', got '$deps_mode'" >&2; usage ;;
+                   esac ;;
         --bless)   bless=1 ;;
         -h|--help) usage ;;
         -*) echo "run.sh: unknown flag '$1'" >&2; usage ;;
@@ -107,21 +127,90 @@ if [ ! -f "$compiler" ] && [ -f "$compiler$exe" ]; then
     compiler=$compiler$exe
 fi
 
-# lock_commit <mach.lock> <name> — the commit mach.lock records for [dep.<name>],
-# or empty when the file or the entry is absent.
-lock_commit() {
-    lockfile=$1
-    want=$2
-    [ -f "$lockfile" ] || return 0
-    awk -v want="$want" '
-        /^\[dep\./ { name = $0; sub(/^\[dep\./, "", name); sub(/\]$/, "", name); next }
-        /^commit = / && name == want {
-            sha = $0
-            sub(/^commit = "/, "", sha); sub(/"$/, "", sha)
-            print sha
-            exit
+# dep_field <toml> <name> <key> — the value of <key> inside the [dep.<name>] table
+# of a mach.toml or mach.lock, or empty when the file, the table, or the key is
+# absent. one reader for both files: they spell the same table differently (a
+# manifest's `git =` is a lock's `url =`) but the table structure is identical, and a
+# second parser for it is the drifting-parallel-enumeration shape this repo already
+# treats as a defect family (see case.sh's header).
+dep_field() {
+    [ -f "$1" ] || return 0
+    awk -v want="$2" -v key="$3" '
+        /^\[/ { in_dep = 0 }
+        /^\[dep\./ {
+            name = $0; sub(/^\[dep\./, "", name); sub(/\]$/, "", name)
+            in_dep = (name == want); next
         }
-    ' "$lockfile"
+        in_dep && $1 == key && $2 == "=" {
+            v = $0; sub(/^[^=]*=[[:space:]]*"/, "", v); sub(/"[[:space:]]*$/, "", v)
+            print v; exit
+        }
+    ' "$1"
+}
+
+# lock_commit <mach.lock> <name> — the commit mach.lock records for [dep.<name>].
+lock_commit() {
+    dep_field "$1" "$2" commit
+}
+
+# case_deps <case-dir> — the names of the [dep.<name>] tables a case declares.
+case_deps() {
+    awk '/^\[dep\./ { n = $0; sub(/^\[dep\./, "", n); sub(/\]$/, "", n); print n }' \
+        "$1/mach.toml"
+}
+
+# prepare_case_deps <case-dir> — settle what the case's `dep pull` will resolve.
+#
+# A case declares `ref = "branch/main"`, which tracks mach-std's latest RELEASE, so
+# the harness has always resolved it fresh and int/.gitignore refuses a committed
+# lock. That early warning is worth keeping, but on a RELEASE GATE it means a tag can
+# be cut against a dependency nobody recorded, and two runs of the same mach commit
+# that straddle a mach-std merge are not comparable - which cost real time in the
+# v4.7.1 cut (#2592).
+#
+# So the resolution is now a stated mode rather than an accident:
+#
+#   float — remove any lock first, so the ref genuinely resolves fresh. this is not a
+#           no-op: `dep pull` HONORS a lock that is present even for a `branch/` ref
+#           (it is the same mechanism that pins this repo's own mach-std), so without
+#           the removal a tree that had ever run pinned would keep resolving that pin
+#           silently, which is the defect this issue names, reintroduced locally.
+#
+#   pin   — write the lock from THIS REPO'S OWN mach.lock, so a case resolves the
+#           same mach-std commit the compiler in the same checkout was built against.
+#           deliberately not a new pin file: that would be a second thing to bump and
+#           could rot against the compiler's, where the root lock is already advanced
+#           deliberately and already means "the mach-std this release is built on".
+prepare_case_deps() {
+    dir=$1
+    if [ "$deps_mode" = float ]; then
+        rm -f "$dir/mach.lock"
+        return 0
+    fi
+    tmplock=$dir/mach.lock.new
+    echo "# written by int/run.sh --deps pin from the repo root mach.lock; not tracked." >"$tmplock"
+    pinned=0
+    for name in $(case_deps "$dir"); do
+        # only a git dep floats. a `path =` dep (surface/pe-import-claim-cascade's
+        # `prov`) is a directory inside this repo, so it is already exactly as
+        # reproducible as the checkout and has no commit to record.
+        url=$(dep_field "$dir/mach.toml" "$name" git)
+        [ -n "$url" ] || continue
+        commit=$(lock_commit "$root_lock" "$name")
+        if [ -z "$commit" ]; then
+            echo "run.sh: --deps pin: mach.lock records no commit for git dep '$name', declared by ${dir#"$here"/}" >&2
+            rm -f "$tmplock"
+            return 1
+        fi
+        printf '\n[dep.%s]\nurl = "%s"\nref = "%s"\ncommit = "%s"\n' \
+            "$name" "$url" "$(dep_field "$dir/mach.toml" "$name" ref)" "$commit" >>"$tmplock"
+        pinned=$((pinned + 1))
+    done
+    if [ "$pinned" -eq 0 ]; then
+        rm -f "$tmplock" "$dir/mach.lock"
+        return 0
+    fi
+    mv "$tmplock" "$dir/mach.lock"
 }
 
 # dep_commits <case-dir> — print "name@shortsha ..." for every git dep checked
@@ -153,22 +242,31 @@ lock_commit() {
 # last regenerated it, contradicting that intent. But an ephemeral lock means
 # nothing durable records which commit a given run actually compiled against -
 # `mach dep pull`'s own lock write vanishes with the rest of the case's gitignored
-# state. Printing the checkout into every PASS/FAIL/BLESS line is that record: it
-# survives exactly as long as the CI log does, which is exactly as long as anyone
-# would want to ask "what did this run compile against".
+# state. Printing the checkout into every PASS/FAIL/BLESS line is one record.
+#
+# That line was once argued to survive "as long as the CI log does, which is
+# exactly as long as anyone would want to ask". #2592 is the counterexample: the
+# question was asked during the v4.7.1 cut, about a run whose log had to be dug
+# out of scrollback, and answering it wrong sent the investigation at the release
+# instead of at a mach-std merge. So the same fact is now also written to
+# int/out/deps.txt, which CI uploads as an artifact of the run itself, and a
+# release-gate run pins rather than floats (--deps pin, prepare_case_deps above).
+#
+# <fmt> is `short` for the PASS/FAIL label a human reads, or `full` for that
+# manifest, whose whole purpose is to be usable to reproduce the resolution later.
 dep_commits() {
     dir=$1
+    fmt=${2:-short}
     [ -d "$dir/dep" ] || return 0
     for depdir in "$dir"/dep/*/; do
         [ -d "${depdir}.git" ] || [ -f "${depdir}.git" ] || continue
         name=$(basename "$depdir")
-        head=$(git -C "$depdir" rev-parse --short HEAD 2>/dev/null) || continue
+        full=$(git -C "$depdir" rev-parse HEAD 2>/dev/null) || continue
+        short=$(git -C "$depdir" rev-parse --short HEAD 2>/dev/null) || continue
+        if [ "$fmt" = full ]; then head=$full; else head=$short; fi
         locked=$(lock_commit "$dir/mach.lock" "$name")
-        if [ -n "$locked" ]; then
-            case "$locked" in
-                "$head"*) printf '%s@%s ' "$name" "$head" ;;
-                *)        printf '%s@%s!lock=%s ' "$name" "$head" "$(printf '%s' "$locked" | cut -c1-7)" ;;
-            esac
+        if [ -n "$locked" ] && [ "$locked" != "$full" ]; then
+            printf '%s@%s!lock=%s ' "$name" "$head" "$(printf '%s' "$locked" | cut -c1-7)"
         else
             printf '%s@%s ' "$name" "$head"
         fi
@@ -183,6 +281,25 @@ if [ -n "$runmode_override" ] && [ "$runmode_override" != "$runmode" ]; then
     echo "run.sh: --runmode overrides '$target' to $runmode_override (targets.conf says $runmode; not CI-equivalent, see NATIVE vs QEMU FIDELITY above)" >&2
     runmode=$runmode_override
 fi
+
+root_lock=$here/../mach.lock
+
+# the run's dependency record. every PASS/FAIL line already names the resolved commit
+# (#2387), but a log line is recoverable only from scrollback, and the question this
+# answers - "what did the run that cut this tag actually compile against" - is asked
+# after the fact, often once the log has rotated. this is a file CI can upload beside
+# the rest of the run's artifacts (#2592). it lives under the gitignored int/out/.
+manifest=$here/out/deps.txt
+mkdir -p "$here/out"
+{
+    echo "# int dependency resolution"
+    echo "# target: $target"
+    echo "# deps-mode: $deps_mode"
+    if [ "$deps_mode" = pin ]; then
+        echo "# pin source: mach.lock (this repo)"
+    fi
+    echo "# columns: case profile dep@commit..."
+} >"$manifest"
 
 fails=0
 ran=0
@@ -211,6 +328,11 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
         exec|relro-fault|panic-exit|debuginfo) golden="$dir/expect.txt" ;;
         *)                                     golden="$dir/expect.$build_target.txt" ;;
     esac
+
+    # once per case, not per profile: `dep pull` honors the lock left by the first
+    # profile, so deciding here is both what makes a case's two profiles agree on one
+    # commit and what keeps the resolution cost at one per case, as it already was.
+    prepare_case_deps "$dir" || exit 2
 
     for profile in $case_profiles; do
         ran=$((ran + 1))
@@ -271,6 +393,11 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
         deps=$(dep_commits "$dir")
         flabel=$label
         [ -n "$deps" ] && flabel="$label (${deps% })"
+
+        full_deps=$(dep_commits "$dir" full)
+        if [ -n "$full_deps" ]; then
+            echo "$case_id $profile ${full_deps% }" >>"$manifest"
+        fi
 
         # a build-fails case asserts the compile is rejected and takes the compiler's
         # 'error:' diagnostic as its observable (deterministic: no paths, just the
