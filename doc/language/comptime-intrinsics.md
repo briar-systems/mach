@@ -160,10 +160,37 @@ $each f in $fields(T) {
 }
 ```
 
-That form is what makes recursive reflection expressible: inside the loop a field's
-type has no spelling, only the descriptor. A path that is genuinely a qualified type
-name (`mod.Type`) still reads as one, and a wrong one still reports against the type
-grammar.
+The same form is valid in a **generic argument list**, which is what makes a walk
+recursive rather than merely descending (#2691):
+
+```mach
+fun eq[T](a: *T, b: *T) bool {
+    $each f in $fields(T) {
+        $if ($is_record(f.type)) {
+            if (!eq[f.type](?a.[f], ?b.[f])) { ret false; }   # re-enter at the field's type
+        }
+        $or { if (a.[f] != b.[f]) { ret false; } }
+    }
+    ret true;
+}
+```
+
+Without it, `$fields(f.type)` gives one level of descent per `$each` someone wrote,
+so a walk reaches only as deep as its author hand-unrolled. With it the walk is
+written once and reaches any depth.
+
+**Termination is structural and needs no depth limit.** Each descent instantiates at
+a field's own type, a record's fields are finite, and a record cannot contain itself
+by value — a self-reference must go through a pointer, which is a different type and
+which `$is_record` does not select. Note that a walk which followed references would
+not have this property: `rec Grow[T] { p: *Grow[*T]; }` is legal and has unboundedly
+many distinct instances reachable through its pointer.
+
+Inside the loop a field's type has no spelling, only the descriptor. A path that is
+genuinely a qualified type name (`mod.Type`) still reads as one, and a wrong one
+still reports against the type grammar — in the generic argument list exactly as in
+an intrinsic operand. A name that is not a `$each` loop variable is reported where
+it is written.
 
 ## Type intrinsic
 
