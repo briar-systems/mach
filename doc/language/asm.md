@@ -187,10 +187,91 @@ On aarch64 and riscv64 a statement must emit a whole number of instruction words
 `.byte 0x1f, 0x20, 0x03` is refused, because three bytes would misalign every
 instruction after it. x86-64 has no such constraint.
 
-A raw encoding is an instruction stream the parser cannot read, so the block's clobber
-set becomes **every register in every bank**, and an `#[oblivious]` function may not
-contain one at all — which is why a real mnemonic is always preferable where one
-exists.
+A raw encoding is an instruction stream the parser cannot read, so by default the
+block's clobber set becomes **every register in every bank**, and an `#[oblivious]`
+function may not contain one at all — which is why a real mnemonic is always preferable
+where one exists.
+
+## Declaring a raw encoding's effects
+
+That default is correct and expensive: with nothing held live across the statement, the
+allocator spills every value in a callee-saved register and the prologue saves every
+callee-saved register the function could reach. A raw encoding may instead state what it
+writes, with a `::` clause on the directive:
+
+```mach
+asm x86_64 {
+    mov dx, {port}
+    .byte 0xee :: writes()                 # out dx, al - reads dx and al, writes nothing
+    .byte 0x0f, 0x31 :: writes(rax, rdx)   # rdtsc - lands its result in EDX:EAX
+}
+
+asm aarch64 {
+    .word 0xd4000002 :: writes(x0, x1, x2, x3)   # hvc #0, returning per SMCCC
+}
+
+asm riscv64 {
+    .word 0xc0102573 :: writes(a0)               # csrr a0, time
+}
+```
+
+This is the same move the system-register surface above already makes. The named set is
+deliberately not exhaustive because any register is *also* nameable by its encoding;
+declared clobbers do for instructions what `s3_3_c14_c0_2` does for registers. The
+curated mnemonic table stays the ergonomic path, and the escape hatch stops being a
+cliff — an unmodeled instruction can be used at full codegen quality on the day it is
+needed.
+
+`writes()` with an empty list is a **declaration**, not an omission: it says the
+encoding writes no register. Leaving the clause off entirely is what keeps today's
+conservative default, so nothing written before this existed changes behaviour.
+
+Registers are named in the target's own vocabulary, in either bank:
+
+| target | general-purpose | float / vector |
+|---|---|---|
+| x86-64 | `rax`–`r15` | `xmm0`–`xmm15` |
+| aarch64 | `x0`–`x30`, `sp`, `xzr` | `v0`–`v31` |
+| riscv64 | `x0`–`x31`, psABI aliases (`a0`, `t0`, `sp`, …) | `f0`–`f31`, psABI aliases (`fa0`, `ft0`, …) |
+
+A width is not a register: `eax`, `w0` and `v2.4s` are refused, because `eax` and `rax`
+are one register whose bits the allocator tracks as a unit and accepting both spellings
+would suggest the clobber set told them apart.
+
+### What the compiler still guarantees, and what it does not
+
+A declaration moves part of the correctness burden from the compiler to you, and it is
+worth being precise about which part.
+
+**Still checked.** The clause is accounted for like every other byte of the statement,
+so a malformed one fails the build rather than being silently dropped — a mistyped
+`writes(` is an error, not a declaration that quietly said nothing. Every register named
+must resolve in this target's own name table, so a typo fails rather than declaring a
+smaller set than you wrote. An attribute that does not exist is refused by name.
+
+**Structurally bounded.** A clause may only follow a **data directive**. A modeled
+instruction's effects come from its mnemonic and cannot be overridden, so a declaration
+can only ever narrow the maximally conservative default, at exactly the statements where
+the compiler had no information at all. It can never contradict something the compiler
+derived, and a wrong one affects only the single statement carrying it.
+
+**Not checked, and it cannot be.** Whether the bytes write what the clause says. The
+compiler does not decode the payload — decoding it is what the mnemonic table *is*.
+**If you under-declare, you get a miscompile**: the allocator will keep a value in a
+register your encoding overwrites. This is the one place in the inline-asm surface where
+correctness rests on the author. Declare what the instruction's manual says it writes,
+including any implicit destination, and prefer a real mnemonic whenever one exists.
+
+**A declaration buys allocation quality, not verification.** An `#[oblivious]` function
+still refuses a data directive whether or not it is declared. A write set says which
+registers change; it says nothing about whether the encoding branches on a secret or
+divides in variable time, which is what that check exists to catch.
+
+`writes(...)` is the only attribute today. The clause is a space-separated list so more
+can be added, but an attribute is only added once it changes what the compiler does —
+`noreturn` is not here yet because control flow reaching past an `asm` block is a CFG
+fact the effect model does not touch, and a `barrier` attribute would be inert, since
+every `asm` block is already assumed to modify arbitrary memory.
 
 ## System registers (aarch64)
 
@@ -315,6 +396,9 @@ current level cannot reach traps at run time, as the architecture defines.
   function's clobber set.
 - **Memory clobber.** Every `asm` block is conservatively assumed to
   modify arbitrary memory.
+- **Raw encodings.** A data directive is a stream the parser cannot read, so
+  it clobbers every register in every bank unless it
+  [declares what it writes](#declaring-a-raw-encodings-effects).
 
 ## Multi-arch dispatch
 
