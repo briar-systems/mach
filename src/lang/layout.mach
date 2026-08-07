@@ -112,6 +112,10 @@ pub fun machine(ptr_width: u32, vector_bits: u32) Machine {
 # field_count: NODE_AGGREGATE: the number of fields
 # decl_align:  NODE_AGGREGATE: an `#[align(...)]` override, 0 for none
 # overlays:    NODE_AGGREGATE: true for a union (fields at offset 0), false for a record
+# packed:      NODE_AGGREGATE: a `#[packed]` record or union, laid out with no padding
+#              between fields and none at the tail, and taking no alignment from its
+#              fields. it composes with decl_align rather than conflicting: packed
+#              decides padding, decl_align decides the whole aggregate's alignment
 pub rec Node {
     kind:        NodeKind;
     bytes:       u32;
@@ -120,6 +124,7 @@ pub rec Node {
     field_count: u32;
     decl_align:  u32;
     overlays:    bool;
+    packed:      bool;
 }
 
 # describe node `id` within the caller's erased context
@@ -272,8 +277,16 @@ pub fun field_offset_of(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, fie
     for (i < n.field_count) {
         val fe: Extent = walk(ctx, describe, field, field(ctx, id, i), m, 1, max_depth);
         if (!fe.ok) { ret unknown_extent(fe.cause); }
-        offset = round_up(offset, fe.align);
-        if (i == field_ix) { ret extent(offset, fe.align); }
+        # THE SECOND PADDING SITE. this walk computes offsets independently of the
+        # size fold above, so a packed aggregate has to be honoured in both or
+        # `$size_of` and `$offset_of` would describe different layouts for one record.
+        if (!n.packed) { offset = round_up(offset, fe.align); }
+        # a packed field's offset carries the aggregate's alignment (1) rather than the
+        # field's own, since nothing guarantees the field is aligned for its type.
+        if (i == field_ix) {
+            if (n.packed) { ret extent(offset, 1); }
+            ret extent(offset, fe.align);
+        }
         offset = offset + fe.size;
         i = i + 1;
     }
@@ -331,12 +344,19 @@ fun walk(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, m: Machine, depth:
         for (i < n.field_count) {
             val e: Extent = walk(ctx, describe, field, field(ctx, id, i), m, depth + 1, max_depth);
             if (!e.ok) { ret unknown_extent(e.cause); }
-            if (e.align > align) { align = e.align; }
+            # a PACKED aggregate contributes no inter-field padding and takes no
+            # alignment from its fields: both round_up calls below are the padding, and
+            # both are what a layout decided elsewhere does not have. the record still
+            # aligns to whatever `#[align(N)]` states, which is the composition rule --
+            # packed removes padding, align sets the whole record's alignment.
+            if (!n.packed) {
+                if (e.align > align) { align = e.align; }
+            }
             if (n.overlays) {
                 if (e.size > widest) { widest = e.size; }
             }
             or {
-                offset = round_up(offset, e.align);
+                if (!n.packed) { offset = round_up(offset, e.align); }
                 offset = offset + e.size;
             }
             i = i + 1;
@@ -577,5 +597,106 @@ test "mach.lang.layout.extent:unbounded_walks_past_any_constant" {
     val fits: Extent = extent_of(nil, tg_describe, tg_field, 0, machine(8, 128), 69);
     if (!fits.ok)        { ret 1; }
     if (fits.size != 1)  { ret 1; }
+    ret 0;
+}
+
+
+# a multi-field node table for the packed fold: aggregate 0 holds up to four fields,
+# whose node ids are the entries of `pk_fields`. Separate from `tg_*` because that
+# describer answers one field per aggregate and the padding question needs several.
+var pk_nodes:  [8]Node;
+var pk_fields: [16]u32;
+
+fun pk_describe(ctx: ptr, id: u32) Node { ret pk_nodes[id]; }
+
+# keyed by AGGREGATE and index, unlike `tg_field` above: the nesting test walks two
+# aggregates in one extent, and a table that ignored the aggregate id would hand the
+# inner one the outer's fields and recurse into itself.
+fun pk_field(ctx: ptr, id: u32, index: u32) u32 { ret pk_fields[id * 2 + index]; }
+
+# `#[packed]` removes both paddings, and the numbers are stated here rather than
+# read back from the compiler (#2715)
+#
+# `{ u8; u32; }` is the canonical case: naturally it is 8 bytes (three bytes of
+# padding before the u32, align 4), packed it is 5 bytes at align 1. Every number
+# below is what the C ABI gives for the same shape, so the pin is against a layout
+# decided elsewhere rather than against this fold's own answer.
+test "mach.lang.layout.extent:packed_removes_padding" {
+    # field nodes: a 1-byte scalar and a 4-byte scalar
+    pk_nodes[1] = node(NODE_SCALAR); pk_nodes[1].bytes = 1;
+    pk_nodes[2] = node(NODE_SCALAR); pk_nodes[2].bytes = 4;
+    pk_fields[0] = 1;
+    pk_fields[1] = 2;
+
+    pk_nodes[0] = node(NODE_AGGREGATE);
+    pk_nodes[0].field_count = 2;
+
+    # natural: 1 byte, three of padding, four more; align 4
+    val nat: Extent = extent_of(nil, pk_describe, pk_field, 0, machine(8, 128), DEPTH_UNBOUNDED);
+    if (!nat.ok)       { ret 1; }
+    if (nat.size != 8) { ret 1; }
+    if (nat.align != 4) { ret 1; }
+
+    # packed: no inter-field padding, no tail padding, align 1
+    pk_nodes[0].packed = true;
+    val pkd: Extent = extent_of(nil, pk_describe, pk_field, 0, machine(8, 128), DEPTH_UNBOUNDED);
+    if (!pkd.ok)       { ret 1; }
+    if (pkd.size != 5) { ret 1; }
+    if (pkd.align != 1) { ret 1; }
+
+    # COMPOSITION WITH #[align(N)]: packed decides padding, align decides the
+    # aggregate's alignment. the fields stay unpadded and the tail rounds to N.
+    pk_nodes[0].decl_align = 8;
+    val both: Extent = extent_of(nil, pk_describe, pk_field, 0, machine(8, 128), DEPTH_UNBOUNDED);
+    if (!both.ok)        { ret 1; }
+    if (both.size != 8)  { ret 1; }
+    if (both.align != 8) { ret 1; }
+
+    # a packed UNION overlays as before and loses only its tail padding: the widest
+    # member is 4, so packed it is 4 at align 1 rather than 4 at align 4.
+    pk_nodes[0].decl_align = 0;
+    pk_nodes[0].overlays   = true;
+    val uni_p: Extent = extent_of(nil, pk_describe, pk_field, 0, machine(8, 128), DEPTH_UNBOUNDED);
+    if (uni_p.size != 4)  { ret 1; }
+    if (uni_p.align != 1) { ret 1; }
+
+    pk_nodes[0].packed = false;
+    val uni_n: Extent = extent_of(nil, pk_describe, pk_field, 0, machine(8, 128), DEPTH_UNBOUNDED);
+    if (uni_n.size != 4)  { ret 1; }
+    if (uni_n.align != 4) { ret 1; }
+
+    ret 0;
+}
+
+# packing is NOT transitive (#2715)
+#
+# C's rule, and the one that composes: an inner record keeps its own internal
+# padding and is merely PLACED without padding by the outer. "packed" reads as
+# transitive, so the case is pinned rather than left to the reader.
+test "mach.lang.layout.extent:packed_does_not_propagate" {
+    # inner: { u8; u32; } natural -> 8 bytes, align 4
+    pk_nodes[3] = node(NODE_SCALAR); pk_nodes[3].bytes = 1;
+    pk_nodes[4] = node(NODE_SCALAR); pk_nodes[4].bytes = 4;
+    pk_fields[10] = 3;
+    pk_fields[11] = 4;
+    pk_nodes[5] = node(NODE_AGGREGATE);
+    pk_nodes[5].field_count = 2;
+
+    val inner: Extent = extent_of(nil, pk_describe, pk_field, 5, machine(8, 128), DEPTH_UNBOUNDED);
+    if (inner.size != 8) { ret 1; }
+
+    # outer packed: { u8; inner; }. the inner keeps its 8 bytes, and is placed at
+    # offset 1 with no padding -> 9. a transitive rule would give 6.
+    pk_nodes[6] = node(NODE_SCALAR); pk_nodes[6].bytes = 1;
+    pk_fields[14] = 6;
+    pk_fields[15] = 5;
+    pk_nodes[7] = node(NODE_AGGREGATE);
+    pk_nodes[7].field_count = 2;
+    pk_nodes[7].packed      = true;
+
+    val outer: Extent = extent_of(nil, pk_describe, pk_field, 7, machine(8, 128), DEPTH_UNBOUNDED);
+    if (!outer.ok)       { ret 1; }
+    if (outer.size != 9) { ret 1; }
+    if (outer.align != 1) { ret 1; }
     ret 0;
 }

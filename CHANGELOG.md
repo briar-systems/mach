@@ -5,6 +5,123 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.15.0] - 2026-08-07
+
+### Added
+
+#### A vector narrower than the vector register works (#2697)
+`f32x3` and every other sub-register-width shape were refused by name, because codegen could not carry one. `op_width_of` answered a **single number** for two different questions, a value's register width and its memory footprint. Those coincide while every vector is exactly 16 bytes, and stop coinciding the moment a lane-derived layout makes one 12. A 12-byte vector truncated to 8 on a move, and carrying it at the register width instead overran its slot and clobbered the next field.
+
+The two questions are now separate. The hole was never "non-power-of-two" as first supposed: it is any size **strictly between the target's general-purpose register width and 16**, which is a target-dependent range rather than a property of the number.
+
+So `rec Vertex { pos: f32x3; uv: f32x2; }` is genuinely **20 bytes**, and `[N]Vertex` is a real vertex buffer rather than a padded array indistinguishable from one built on `f32x4`.
+
+**A sub-width vector cannot yet cross a function boundary.** Passing or returning one is a clean refusal naming the ABI classifier, not a miscompile. #2687 carries that half.
+
+#### A project can declare the toolchain it needs (#2714)
+A manifest could not say which compiler it required, so a project using a feature added last week failed on an older toolchain with an ordinary parse error pointing at the feature rather than at the version. `[project].mach` takes a semver minimum, validated when the manifest is read:
+
+```toml
+[project]
+mach = "4.15.0"
+```
+
+Checked for the root project and for every dependency, so a dependency that outgrows the running compiler says so in its own name rather than failing somewhere in its source.
+
+#### `#[packed]`, a record laid out with no padding (#2715)
+`#[align(N)]` only ever raises alignment, and nothing did the inverse, so any shape whose layout is decided elsewhere — a C struct, a file header, a wire frame, a vertex whose stride the buffer fixes — could not be described as a record at all. `#[packed]` on a `rec` or `uni` places every field immediately after the previous one, adds no tail padding, and takes no alignment from its fields.
+
+It **composes** with `#[align]` rather than conflicting: packed decides padding, align decides the record's own alignment. It is **not transitive**, matching C — an inner record keeps its own internal padding and is merely *placed* without any, which is the rule that composes and the one a reader is most likely to assume wrongly.
+
+Three refusals, and one of them turned out to be two:
+
+- **The address of a packed field.** `?r.b` would yield a `*u32`, which states alignment 4 to everything downstream while the storage has none. The access is fine; the pointer *type* is what is untrue, and it travels. The predicate walks the whole access chain, so `?r.arr[0]`, `?r.inner.x` and `?p.b` through a `*Packed` are refused too. `?r` on the whole record stays legal — a `*Packed` describes an align-1 pointee correctly. Fail-closed on purpose: refusing is relaxable once alignment can ride in a pointer type, permitting is not tightenable.
+- **Atomics on a packed field**, which needed no rule of its own. Atomics are not a language surface in mach — `std.sync.atomic` is ordinary functions over `*i64` — so a pointer is the only route an atomic has to a field, and the address-of rule already refuses to hand one out. Pinned as an `int` case so the coupling fails loudly if atomics ever become an intrinsic over an lvalue.
+- **Vector fields**, including through an array or a nested record. The reason is evidence, not arithmetic: an unaligned *scalar* access is measured on hardware and that measurement is what `#[packed]` rests on, while an unaligned *vector* access has no equivalent measurement and is the case where an emulator is least trustworthy. #2687 carries the aggregate-layout half. A sequencing decision, not a permanent rule.
+
+Also refused on a `#[uniform]` / `#[storage]` interface block, whose member offsets are fixed by std140 / std430.
+
+**riscv64 gets a written claim rather than a green tick.** Unaligned access there is permitted-but-may-trap and Linux emulates a trapping one in the kernel, so a packed field access is expected to be correct and pathologically slow. That cost cannot be measured under qemu-user, which emulates the misaligned load directly and never takes the kernel path. The decorator docs say so rather than leaving a passing correctness leg to be read as a usability result.
+#### `$length_of`, and a type operand may be a value binding (#2536)
+A program could not ask a value how long it is. `$size_of` took a **type**, and a binding's type has no spelling -- `val LOGO: [_]u8` really is a concrete `[7194]u8` that is simply never written -- so an `#[embed]` could be indexed and passed around and never **iterated**. The only way to learn an embed's length was to declare it as an explicit `[N]u8`, which defeats the inferred form for any asset whose size is not fixed by contract.
+
+Two changes, and they are separable on purpose.
+
+**`$length_of(T)` counts elements where `$size_of(T)` counts bytes.** For `[N]u8` the two answers are equal, and for everything else they are not. Making the caller divide by an element size is exactly the silent-arithmetic error this codebase keeps finding, and the equality at `u8` is what hides it during development, so the distinction belongs in the surface rather than in the caller's head. A vector's length is its **lane count**, which is decided rather than incidental.
+
+Only a fixed array and a vector have an answer. Everything else is **refused rather than guessed**, naming the type: a pointer (`str` included) has a length the compiler does not know, and a record has a field count rather than an element count.
+
+**A value binding is accepted in a comptime intrinsic's type-operand slot**, denoting that binding's type:
+
+```mach
+#[embed("assets/logo.qoi")]
+val LOGO: [_]u8;
+
+var i: u64 = 0;
+for (i < $length_of(LOGO)) { ... }     # 7194 elements
+$size_of(LOGO)                         # 7194 bytes
+```
+
+This is the **operand slot's** rule rather than a per-intrinsic one -- "does this name a type" is the slot's question, and every intrinsic that takes one asks it identically -- and it is *only* that slot. A name written where a type is expected and resolving to a value is still a mistake in every other position, and accepting it there would turn a typo into a silently-typed binding. The slot is marked where it is produced, by the parser, rather than inferred later from context.
+
+The issue's premise that "a value name and a type name occupy separate registries" does **not** hold: both live in one scope chain, so a name is either a type or a value and never both. There is no ambiguity to resolve, which is why the scoping is by position rather than by lookup order.
+
+A local binding's operand resolves the binding's **annotation node** rather than reading the parallel `decl_type` array, because the operand is reached from `resolve_all_types`, which runs before that array is filled -- reading it would answer TYPE_ERROR for every binding declared after the measurement. Pinned by a case that measures a binding declared later in the file.
+
+The `#[embed]` limitation note on the decorators page comes out with this.
+
+#### `$pointee_of(T)` makes a reference field traversable (#2693)
+`$is_pointer(f.type)` told a reflection walk that a field was a reference, and that is where the walk stopped: there was no way to ask what a typed reference points at. `std.derive` refused every reference field at comptime as a result, which blocked the whole family that wants one -- deep equality, owning clone, a hash over pointed-to contents, and a formatter that renders a `str` field, since `str` is `def str: *char` and so a reference field like any other.
+
+`$pointee_of` is a type **constructor**, in the same family as `*`, `[N]` and `^`, rather than an intrinsic call. That is what makes it nest, and nesting is the requirement rather than a nicety: the descent a walk actually performs is `$fields($pointee_of(f.type))`, an operand inside an operand, and a call cannot appear where a type is required.
+
+```mach
+$each f in $fields(Node) {
+    $if ($is_pointer(f.type)) {
+        $each g in $fields($pointee_of(f.type)) { total = total + (@(n.[f])).[g]; }
+    }
+    $or { total = total + n.[f]; }
+}
+```
+
+**Everything that is not a typed reference is refused, and the refusal names what it was handed**: the raw `ptr` with its own cause (it is untyped and carries no pointee), `^*U` because `$is_pointer` answers false for it and descending would put the intrinsic back into the disagreement with its own gate that #2692 closed, and any other type by name. A plausible wrong answer here flows into a `$fields` walk that then reports about the wrong record, which is the failure class a refusal exists to prevent.
+
+**`$pointee_of(**U)` is `*U`, one level and not all of them.** An implementation that peeled to the innermost non-pointer passes every single-level case and is wrong here, so it is pinned by value rather than by compiling.
+
+**A latent memo bug surfaced with it and is fixed.** `resolve_type_ref` skipped its memo for `f.type`, whose answer changes per `$each` iteration -- but the rule was written as "this node IS `f.type`" when the real rule is "this node's answer is not fixed by its source text". The two agreed only because `f.type` was spellable at two leaf sites and nowhere else. `$pointee_of(f.type)` is a composite containing one, so the memo would have handed every iteration after the first the first field's pointee. Pinned by a record with two reference fields at *different* pointees, where a stale answer is a clean compile with a wrong field count.
+
+Termination is the caller's problem and is stated as such: unlike the by-value walk of #2691, following references does not terminate structurally, since `rec Grow[T] { p: *Grow[*T]; }` has unboundedly many instances reachable through its pointer.
+
+### Fixed
+
+#### An inline-asm `{name}` operand ran out of reach in a large frame (#2689)
+A `{name}` binding was addressed frame-pointer-relative, and on aarch64 the addressing form's immediate range gave it a reach of **sixteen** slots. A function with a larger frame, or one an inliner had grown, refused to encode. riscv64 had the same limit at 128 slots. x86-64 had none, which is why it went unnoticed.
+
+The reach was not the real defect. The interface itself said *frame-pointer-relative*, freezing one target's addressing choice into the contract every target reads, when which base a `{name}` uses is part of the addressing decision and only the target knows which of its forms reaches. aarch64 and riscv64 now measure from the stack pointer, x86-64 keeps the frame pointer, and asm-bound slots moved to the bottom of the slot region so what separates a `{name}` from its base is the callee-save and outgoing-argument areas, bounded by the ABI rather than by the function.
+
+**New refusal:** an inline-asm body that binds a `{name}` may not write the stack pointer, on targets that measure from it. The displacement is taken once at block entry, so the pointer must still be where it was. The whole block is judged rather than a prefix, because a backward branch reaches an earlier `{name}` again with the moved pointer. Move the stack adjustment out of the block, or drop the `{name}` and stage the address into a register.
+
+#### Field stores went through a second layout policy that no decorator could reach (#2715)
+`mir.lower_ir`'s `struct_field_offset` re-derived every field offset with its own `round_up` over each field's alignment, rather than calling `ir_type.byte_offset` like every other offset consumer. So a `#[packed]` record reported correct `$size_of`, `$align_of` and `$offset_of` — those go through the shared layout policy — while the code that actually **read and wrote the fields** placed them at the **natural** offsets, and nothing errored. A record whose fields fit its packed size wrote its last field past the end of its own storage.
+
+Found by an `int` case whose golden is a **byte image** rather than a set of intrinsics. Pinning `$size_of` / `$offset_of` proves only that the compiler agrees with itself; the bytes are what a C struct or a wire frame is actually compared against. The duplicate walk is deleted — there is now one layout policy, so a future layout decorator cannot be taught to half the compiler.
+
+#### A secret spilled to memory no longer launders past the `#[oblivious]` asm walk (#2706)
+The `#[oblivious]` inline-asm walk carried taint as a register bitmask with **no memory domain**, so a secret stored to the stack and reloaded came back in a register the model believed public. That defeated all three leak checks at once - a branch condition, a memory address, and a variable-latency operand:
+
+```
+mov rax, {r}
+mov [rsp], rax
+mov rbx, [rsp]
+mov rcx, [rbx]     # a secret-derived address, accepted
+```
+
+The direct form was always refused, which made the gate look sound while an ordinary spill walked through it. Memory is now the third taint domain beside the register set and the flags bit, shared across x86-64, aarch64 and riscv64 as the walk itself is.
+
+The domain is one bit for all of memory, and monotone. Per-slot tracking is not sound at this layer: `[rsp + k]` and `[rbp + j]` can name the same byte with nothing relating two base registers, and a slot key is an address rather than an extent, so overlapping accesses of different widths compare as different slots. The failure direction is over-refusal, never acceptance, and a body only loses by it if it stores a secret, reloads some other public value, and then leaks through what it reloaded.
+
+Note for anyone extending the walk: "does this instruction store" cannot be read from the `writes` mask, which names register operands. aarch64 `str` and riscv64 `sd` both declare `AW_NONE`, so a memory domain derived from that mask fires on x86-64 and silently passes every store on the other two targets.
+
 ## [4.14.0] - 2026-08-07
 
 ### Added
