@@ -474,14 +474,58 @@ pub def EmitFn: fun(*encode.EncodeState, *Cursor, *Labels, *Item) R.Result[bool,
 # offsets are `.text`-relative.
 pub def PatchFn: fun(*encode.EncodeState, u32, u32) R.Result[bool, str];
 
-# the frame-pointer-relative offset of the slot a MIR value owns, or none
+# the offset of the slot a MIR value owns, RELATIVE TO THE BASE REGISTER THIS TARGET
+# ADDRESSES A `{name}` FROM, or none
 #
-# Per-ISA and not an accident: the offset a slot sits at relative to the frame
-# pointer depends on what that target's prologue reserves between the two - x86-64
-# reserves nothing below RBP, riscv64 pins s0 at the frame top with the ra / s0
-# record and the callee-saved areas beneath it. A shared implementation would resolve
-# `{name}` to a different address than the same target's own loads and stores.
+# It used to say frame-pointer-relative, and saying so was #2689: it froze one target's
+# addressing choice into the interface every other target reads. WHICH BASE IS PART OF
+# THE ADDRESSING DECISION, and the addressing decision is the target's, because only
+# the target knows which of its forms reaches. The offset returned here and the base
+# register the ISA's operand lexer names are two halves of one answer and must agree.
+#
+# What that choice costs when it is made badly: a frame slot sits BELOW the frame
+# pointer, so an fp-relative displacement is negative, and aarch64's scaled imm12 form
+# is unsigned-only - the whole reach for a `{name}` was the unscaled imm9's -256, which
+# is thirty-two eight-byte slots, and one inlined syscall wrapper too many exceeded it.
+# aarch64 and riscv64 therefore measure from the STACK pointer, where the displacement
+# is positive and the scaled form applies, and the frame phase lays asm-bound slots at
+# the bottom of the slot region so that what separates a `{name}` from the stack pointer
+# is the callee-save and outgoing-argument areas - bounded by the ABI, not by the
+# function. x86-64's disp32 reaches either end of any frame, so it keeps RBP, the base
+# its own loads and stores already use.
+#
+# The bias between whatever base is chosen and the laid-out offset is per-ISA and not an
+# accident: what a target's prologue reserves between the two differs - x86-64 reserves
+# nothing below RBP, riscv64 pins s0 at the frame top with the ra / s0 record and the
+# callee-saved areas beneath it - so a shared implementation would resolve `{name}` to a
+# different address than the same target's own loads and stores.
+#
+# WHATEVER BASE IS CHOSEN MUST NOT MOVE for the life of the block. A target that picks
+# the frame pointer gets that for free. One that picks the stack pointer says so by
+# wiring `writes_sp`, which is what holds the promise.
 pub def SlotFn: fun(*mir.MirFunction, u32) O.Option[i64];
+
+# true when one parsed statement writes the stack pointer
+#
+# WIRING THIS IS HOW A GRAMMAR DECLARES THAT ITS `SlotFn` MEASURES FROM THE STACK
+# POINTER, and it is the obligation that comes with saying so. A `{name}` displacement
+# is measured once, at block entry, so a statement inside the block that moves the base -
+# a push, a pre-index store through SP, an `addi sp, sp, -16` - invalidates every
+# `{name}` in the block, including one a backward branch reaches again. That is a silent
+# wrong address, the failure mode this family keeps producing, so the block is refused.
+# A grammar whose `SlotFn` measures from the frame pointer leaves this nil: it has no
+# such promise to keep, and inventing an answer would refuse bodies that are correct on
+# it. The field is therefore not optional in the usual sense - it is the declaration.
+#
+# Per-ISA because which register is the stack pointer is, and because an ISA can spell
+# it ambiguously: aarch64's index 31 is the zero register in one operand position and SP
+# in another, told apart only by `AOF_STACK_PTR`, so a shared scan over the write mask
+# would read `mov xzr, x0` as moving the stack.
+#
+# A RAW BYTE PAYLOAD WRITES IT unless the statement declared otherwise, exactly as
+# `fold_clobbers` treats every other register: the compiler does not decode the bytes,
+# so it cannot see the push inside them.
+pub def WritesSpFn: fun(*Item) bool;
 
 # the constant-time classification of one of this grammar's mnemonics
 #
@@ -559,7 +603,10 @@ pub def DeclRegFn: fun(str, *u8, *u32) bool;
 # parse:      the operand lexer
 # emit:       the assembler
 # patch:      the branch-displacement insert
-# slot:       the frame-pointer-relative offset of a local's stack slot
+# slot:       a local's stack-slot offset from the base this target addresses it from
+# writes_sp:  true when a statement moves the stack pointer - wired only by a grammar
+#             whose `slot` measures from it, nil by one that measures from the frame
+#             pointer
 # all_gp:     every general-purpose register the grammar can reach
 # all_fp:     every float / vector register an unreadable byte stream could reach
 # word:       the instruction word size in bytes, or 0 for a variable-length encoding
@@ -579,6 +626,7 @@ pub rec Grammar {
     emit:       EmitFn;
     patch:      PatchFn;
     slot:       SlotFn;
+    writes_sp:  WritesSpFn;
     all_gp:     u32;
     all_fp:     u32;
     word:       u8;
@@ -1424,8 +1472,8 @@ fun unknown_message(c: *Cursor, lo: usize, hi: usize) str {
 #
 # The shared half of a local binding: the token shape, the lookup against the block's
 # bindings, and the laid-out frame's slot offset. What the offset BECOMES is the
-# target's - `[rbp + off]`, `off(s0)`, `[x29, #off]` - so the ISA's lexer calls this
-# and builds its own memory operand.
+# target's - `[rbp + off]`, `off(sp)`, `[sp, #off]` - so the ISA's lexer calls this and
+# builds its own memory operand around the base register `SlotFn` measured from.
 #
 # Returns ok(false) when the parse carries no binding context: before the frame is
 # laid out a binding's displacement genuinely is unknown. The operand stays a binding
@@ -1435,7 +1483,7 @@ fun unknown_message(c: *Cursor, lo: usize, hi: usize) str {
 # c:   the cursor
 # lo:  body offset of the `{`
 # hi:  body offset just past the `}`
-# off: receives the frame-pointer-relative slot offset
+# off: receives the slot offset, in the base register `SlotFn` measures from
 # ret: ok(true) when resolved, ok(false) when there is no binding context, or the
 #      refusal naming the malformed or unbound reference
 pub fun bind_offset(c: *Cursor, lo: usize, hi: usize, off: *i64) R.Result[bool, str] {
@@ -1816,6 +1864,13 @@ pub fun encode_block(st: *encode.EncodeState, g: *Grammar, f: *mir.MirFunction, 
                           "encode: inline-asm block is not for this target")));
     }
 
+    if (pl.bind_count > 0 && g.writes_sp != nil) {
+        val sr: R.Result[bool, str] = check_stable_sp(st, g, f, pl);
+        if (R.is_err[bool, str](sr)) {
+            ret R.err[bool, str](encode.asm_located_message(st, mi.loc, R.unwrap_err[bool, str](sr)));
+        }
+    }
+
     var l: Labels;
     labels_init(?l, st.alloc);
 
@@ -1836,6 +1891,45 @@ pub fun encode_block(st: *encode.EncodeState, g: *Grammar, f: *mir.MirFunction, 
     }
     labels_dnit(?l);
     if (fail != nil) { ret R.err[bool, str](encode.asm_located_message(st, mi.loc, fail)); }
+    ret R.ok[bool, str](true);
+}
+
+# refuse a `{name}`-binding block that moves the stack pointer
+#
+# Reached only on a grammar that wired `writes_sp`, which is how it says its `SlotFn`
+# measures from the stack pointer. That displacement is taken once, at block entry, so
+# the pointer must still be where it was when the access runs. The break is not local to
+# the statements after the write: a backward branch inside the body reaches an earlier
+# `{name}` again with the moved pointer. So the whole block is judged, not a prefix of
+# it, and it is judged BEFORE a byte is emitted.
+#
+# It costs one extra parse of a body that is a handful of statements, and only for a
+# block that binds at all - a `#[naked]` prologue writing SP owns no locals and is
+# never scanned.
+# ---
+# st: the shared encode state
+# g:  the target's grammar
+# f:  the function whose frame the bindings resolve against
+# pl: the block's payload
+# ret: ok(true), or the unlocated refusal
+fun check_stable_sp(st: *encode.EncodeState, g: *Grammar, f: *mir.MirFunction, pl: *mir.MirAsm) R.Result[bool, str] {
+    var c: Cursor;
+    cursor_init(?c, g, pl.body, st.alloc, st.interner, f, pl);
+    var item: Item;
+    var done: bool = false;
+    for (!done) {
+        val pr: R.Result[bool, str] = next(?c, ?item);
+        # a malformed body is the emitting pass's diagnostic to issue, not this one's:
+        # reporting it here would name the scan in a message about a typo.
+        if (R.is_err[bool, str](pr))     { ret R.ok[bool, str](true); }
+        or (!R.unwrap_ok[bool, str](pr)) { done = true; }
+        or (g.writes_sp(?item)) {
+            ret R.err[bool, str](span_message(?c,
+                "encode: inline-asm statement '", item.src_off, item.src_off + item.src_len,
+                "' writes the stack pointer in a body that binds a '{name}' local, whose slot is addressed from a base fixed at block entry; move the stack adjustment out of the block, or drop the '{name}' and stage the address into a register first",
+                "encode: an inline-asm body that binds a '{name}' local may not write the stack pointer, because a '{name}' slot is addressed from a base fixed at block entry"));
+        }
+    }
     ret R.ok[bool, str](true);
 }
 
