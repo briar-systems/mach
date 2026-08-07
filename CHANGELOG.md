@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 **Two source-compatibility changes.** A type may no longer be declared with a vector form's name, and the comptime shape predicates no longer see through `^`.
 
+### Added
+
+#### A reflection walk can re-enter itself at a field's type (#2691)
+
+`$fields(f.type)` (#2454) let a walk descend into a record-typed field, but only **one syntactic level per `$each` someone wrote**. Closing the loop needs the walk to re-enter itself at the field's type, and the only spelling for that is a generic call — which did not parse, because a generic argument list reads with the type grammar where `f.type` is indistinguishable from a qualified `module.Type`:
+
+```mach
+fun eq[T](a: *T, b: *T) bool {
+    $each f in $fields(T) {
+        $if ($is_record(f.type)) {
+            if (!eq[f.type](?a.[f], ?b.[f])) { ret false; }
+        }
+        $or { if (a.[f] != b.[f]) { ret false; } }
+    }
+    ret true;
+}
+```
+
+Neither of the two alternatives worked either: there is no inference from the argument, so `eq(?a.[f], ?b.[f])` resolves against the template rather than instantiating, and `$type_of` is not a type operand. All three doors were locked, which is why `std.derive` shipped a hand-unrolled ladder with a documented depth cap.
+
+#2454's one-token lookahead now extends to the generic argument list. `f.type` there is a `TYPE_KIND_FIELD_TYPE` node carrying the loop variable's name rather than a resolved type, because which field it names is decided per iteration by the unroll.
+
+**Termination is structural**, so there is no depth limit and none is needed: each descent instantiates at a field's own type, a record's fields are finite, and a record cannot contain itself by value — the compiler already refuses that as a recursive type of infinite size, verified for the direct, mutual, and generic-growing forms. A self-reference must go through a pointer, which is a different type and which `$is_record` does not select.
+
+Two implementation notes worth carrying:
+
+- **A `f.type` node is never memoized.** `resolve_type_ref` caches a syntactic node's resolved type, which is sound only because every other spelling's meaning is fixed by its source text. This one is not: a single node serves every iteration, so caching the first answer gives the second field the first field's type. Pinned by a case with two record fields of different arity, which is a wrong count rather than a silent pass.
+- **Both phases resolve it through one helper.** Sema resolves it during its own `$each` unroll; lowering resolves it during the unroll it runs for a walk whose `$fields` operand was an unbound generic parameter at template sema — which is the shape a generic derive actually has. `comptime.field_type_of_binding` is the single implementation, going through the same installed field resolver as the `f.type` value projection, so a descriptor read as a value and the same descriptor read as a type cannot land on different fields.
+
+The lookahead does not absorb real mistakes: a genuinely wrong operand in the same position (`g[nosuchmod.T]`) still reports against the type grammar, a name that is not a `$each` loop variable is reported where it is written, and `type` stays contextual so an ordinary record field called `type` is untouched.
+
+
+
 ### Changed
 
 #### `^` is stripped only where the question is about storage (#2692)
