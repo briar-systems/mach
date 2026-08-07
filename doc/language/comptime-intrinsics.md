@@ -136,27 +136,69 @@ and folds in a `$if` / `$or` gate:
 $is_record(T)           # T is a record (or an instance of one)
 $is_union(T)            # T is a union  (or an instance of one)
 $is_pointer(T)          # T is a reference: the raw `ptr` or a typed `*U`
+$is_secret(T)           # T is `^`-qualified at the outermost level
 ```
 
 They are **comptime-only** — a gate condition selects an arm, and there is no
 runtime boolean for one to become, so using a predicate as a value is an error.
 
 **`^` is a constructor, and a predicate answers about the outermost one.** `^Pair`
-is a secret, not a record, so all three answer false and a reflection walk refuses
-it instead of descending into secret storage. That is what keeps a predicate and
-`$fields` in agreement: `$fields(^Pair)` refuses, so a gate that called `^Pair` a
-record would send a walk into an operand the intrinsic then rejects.
+is a secret, not a record, so the three shape predicates answer false and a
+reflection walk refuses it instead of descending into secret storage. That is what
+keeps a predicate and `$fields` in agreement: `$fields(^Pair)` refuses, so a gate
+that called `^Pair` a record would send a walk into an operand the intrinsic then
+rejects.
 
-Outermost means outermost. `^*u8` is a secret pointer and answers false; `*^u8` is
-a **public** pointer to secret storage and is still a pointer, since the address is
-public. A generic instance answers as the declaration it instantiates, so `Box[i64]`
-is a record — which is the type a reflection loop actually meets — and `Box[^u64]`
-is a record too, because the instance is not itself secret; its field is, and the
-field is where a walk meets the question.
+Outermost means outermost. `^*u8` is a secret pointer and `$is_pointer` answers
+false; `*^u8` is a **public** pointer to secret storage and is still a pointer,
+since the address is public. A generic instance answers as the declaration it
+instantiates, so `Box[i64]` is a record — which is the type a reflection loop
+actually meets — and `Box[^u64]` is a record too, because the instance is not itself
+secret; its field is, and the field is where a walk meets the question.
 
-Because all three answer false for `^T`, "nothing classifies it" is itself a usable
-signal: a walk that gates on the three predicates and refuses the fallthrough
-refuses secrets without needing to ask about secrecy directly.
+`$is_secret` is the family's fourth member and its one **exception**, and the
+exception is coherent rather than special-cased: the other three ask about the shape
+*under* the wrapper, this one asks about the wrapper itself. It is what makes the
+other three's false readable — `$is_record(^Pair)` and `$is_record(u64)` are
+otherwise the same answer, so before this a library could only ever meet a secret as
+a fallthrough it had to refuse.
+
+```mach
+$each f in $fields(T) {
+    $if ($is_secret(f.type)) { ... }        # redact, refuse, or compare in constant time
+    $or { ... }                             # an ordinary public field
+}
+```
+
+`$is_secret` draws the outermost line in exactly the same place the shape predicates
+do, so the four cannot disagree about what a type is:
+
+| operand | `$is_secret` | why |
+|---|---|---|
+| `^u64`, `^Pair`, `^[4]u8` | true | `^` is outermost |
+| `^*u8` | true | a secret **pointer**: the address is the secret |
+| `^^T` | true | `^^T` collapses to `^T` |
+| `*^u8` | false | a **public** pointer to secret storage |
+| `[4]^u8` | false | a public array of secret elements |
+| `rec S { k: ^u64; }` | false | the record is public, its **field** is secret |
+| `Box[^u64]` | false | the instance is a record; its field is secret |
+| `u64`, `Pair`, `ptr` | false | no `^` anywhere |
+
+**It is not transitive, deliberately.** "Does this contain a secret anywhere" is a
+different question, and folding the two together would make the common case answer
+wrong: a `fmt` derive gating on a transitive answer would redact a whole record over
+one field, and could not tell which field to redact. The per-field question is the
+one a walk actually has, and `$is_secret(f.type)` is exactly it.
+
+Where the transitive question is genuinely wanted through a reference, it is
+**composed** rather than built in: `$is_secret($pointee_of(f.type))` says whether a
+pointer field points at secret storage. Note that `$pointee_of(^*U)` is refused, so
+there is no route through a secret pointer — which is correct, since `$is_secret` has
+already answered true for it and a walk should stop there.
+
+Because the shape predicates answer false for `^T`, "nothing classifies it" remains
+a usable signal on its own: a walk that gates on the three and refuses the
+fallthrough refuses secrets. `$is_secret` turns that refusal into a decision.
 
 ```mach
 rec Inner { x: u64; y: u64; }
@@ -250,6 +292,7 @@ about storage.**
 |---|---|
 | `$size_of` / `$length_of` / `$align_of` / `$offset_of` | yes — a secret occupies its base type's storage |
 | `$is_record` / `$is_union` / `$is_pointer` | no — `^T` is a secret, not a `T` |
+| `$is_secret` | no — and it is the one query *about* the `^` |
 | `$pointee_of` | no — `^*U` is a secret, and is refused rather than followed |
 | `$type_name` | no — the spelling is `^T` |
 | `$fields` | no — a secret record is refused, not walked |
