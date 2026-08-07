@@ -1448,12 +1448,14 @@ elf_seg_identical() {
 # produce_debuginfo <runmode> <target> <nog_binary> <g_binary>
 # the binary-inspection producer for the debuginfo case kind (#2039): asserts, purely
 # host-side over the artifacts run.sh built with and without `-g`, that (1) the
-# standard structural validator accepts the whole `-g` image, (2) `-g` is loadable-
-# byte additive, and (3) duplicate generic, comptime-value, and pack instances retain
+# standard structural validator accepts the whole `-g` image, (1b) a real consumer
+# (addr2line, i.e. libbfd) decodes the line table without a diagnostic and resolves the
+# entry point to a name, (2) `-g` is loadable-byte additive, and (3) duplicate generic,
+# comptime-value, and pack instances retain
 # one live, symbolizable DIE while each discarded copy carries DWARF's dead-code address,
 # has no line-table sequence at the winner, and has no location list at the winner.
 # the facts are ISA-independent, so the golden is shared. requires llvm-dwarfdump,
-# llvm-symbolizer, and readelf on the leg; a missing validator is a hard error.
+# llvm-symbolizer, readelf, and addr2line on the leg; a missing tool is a hard error.
 produce_debuginfo() {
     nog=$3
     g=$4
@@ -1466,11 +1468,36 @@ produce_debuginfo() {
     command -v readelf >/dev/null 2>&1 || {
         echo "int: debuginfo: readelf not found (install 'binutils')" >&2; return 2
     }
+    command -v addr2line >/dev/null 2>&1 || {
+        echo "int: debuginfo: addr2line not found (install 'binutils')" >&2; return 2
+    }
 
     if "$dd_tool" --verify "$g" >/dev/null 2>&1; then
         echo "dwarfdump_verify=clean"
     else
         echo "dwarfdump_verify=errors"
+    fi
+
+    # CONSUMER-SIDE DECODE (#2582). --verify above checks structural and reference
+    # integrity; it does NOT check that the line program decodes against the file table
+    # the way a consumer reads it, so it accepted a .debug_line that binutils rejected
+    # outright ("mangled line number section (bad file number)") on every CU. addr2line
+    # is the cheapest standard consumer of that decode - the same libbfd path perf, gdb,
+    # and most crash symbolizers reach - so its stderr is the observable, verbatim when
+    # non-empty so a regression names itself in the diff rather than reading `errors`.
+    # the entry point is the address because every leg's image has one at a known place.
+    entry=$(readelf -hW "$g" 2>/dev/null | awk '/Entry point address:/{print $NF}')
+    a2l_err=$(addr2line -f -e "$g" "$entry" 2>&1 >/dev/null | sed -n '1p')
+    a2l_fn=$(addr2line -f -e "$g" "$entry" 2>/dev/null | sed -n '1p')
+    if [ -n "$a2l_err" ]; then
+        echo "addr2line_stderr=$a2l_err"
+    else
+        echo "addr2line_stderr=clean"
+    fi
+    if [ -n "$a2l_fn" ] && [ "$a2l_fn" != "??" ]; then
+        echo "addr2line_entry=resolved"
+    else
+        echo "addr2line_entry=unresolved"
     fi
 
     if elf_seg_identical "$g" "$nog"; then
