@@ -405,6 +405,53 @@ rec ImportAttribution {
     module: intern.StrId;
     decl:   intern.StrId;
     lib:    intern.StrId;
+    arms:   *ArmStep;
+    arm_len: u32;
+}
+
+# one step of a declaration's comptime-arm path: the `$if` chain it sits under and
+# which arm of that chain
+# ---
+# cif: DeclId of the enclosing DECL_KIND_COMPTIME_IF
+# arm: index of the branch within that chain
+rec ArmStep {
+    cif: u32;
+    arm: u32;
+}
+
+# one arm path the walk allocated, held so it can be released in bulk
+# ---
+# data: the path array
+# len:  its element count
+rec OwnedPath {
+    data: *ArmStep;
+    len:  u32;
+}
+
+# whether two declarations can never both apply: some `$if` chain encloses both and
+# puts them in DIFFERENT arms, which no target selects together
+#
+# This is a property of the source, decided without evaluating any condition -
+# deliberately, because this pass runs before sema and a declaration-scope
+# condition is not always foldable here (a `$size_of` in one is sema's diagnostic
+# to report, not this pass's).
+# ---
+# a:  first declaration's arm path
+# an: its length
+# b:  second declaration's arm path
+# bn: its length
+# ret: true when the two are mutually exclusive
+fun arms_exclusive(a: *ArmStep, an: u32, b: *ArmStep, bn: u32) bool {
+    var i: u32 = 0;
+    for (i < an) {
+        var j: u32 = 0;
+        for (j < bn) {
+            if (a[i].cif == b[j].cif && a[i].arm != b[j].arm) { ret true; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # project the per-decl `#[library(...)]` attributions
@@ -422,6 +469,9 @@ rec ImportAttribution {
 pub fun register_import_libraries(p: *project.Project) R.Result[bool, str] {
     var attrs: map.Map[intern.StrId, ImportAttribution] =
         map.init[intern.StrId, ImportAttribution](p.alloc, map.hash_u32, map.eq_u32);
+    # every arm path the walk builds, kept alive for the whole registration (a
+    # stored attribution borrows one) and released together at the end
+    var paths: vector.Vector[OwnedPath] = vector.init[OwnedPath](p.alloc);
     var i: u32 = 0;
     for (i < p.module_len) {
         val m: *project.ModuleEntry = ?p.modules[i];
@@ -438,16 +488,29 @@ pub fun register_import_libraries(p: *project.Project) R.Result[bool, str] {
                 source = O.unwrap[*src.SourceFile](src_opt).text;
             }
             val r: R.Result[bool, str] = bind_import_libraries(p, i::session.ModuleId,
-                source, ?attrs, mod_node.decls_start, mod_node.decls_len);
+                source, ?attrs, ?paths, nil::*ArmStep, 0,
+                mod_node.decls_start, mod_node.decls_len);
             if (R.is_err[bool, str](r)) {
+                free_arm_paths(p, ?paths);
                 map.dnit[intern.StrId, ImportAttribution](?attrs);
                 ret r;
             }
         }
         i = i + 1;
     }
+    free_arm_paths(p, ?paths);
     map.dnit[intern.StrId, ImportAttribution](?attrs);
     ret R.ok[bool, str](true);
+}
+
+# release every arm path the registration walk allocated
+fun free_arm_paths(p: *project.Project, paths: *vector.Vector[OwnedPath]) {
+    var i: usize = 0;
+    for (i < paths.len) {
+        A.deallocate[ArmStep](p.alloc, paths.data[i].data, paths.data[i].len::usize);
+        i = i + 1;
+    }
+    vector.dnit[OwnedPath](paths);
 }
 
 # walk a decl list (recursing into comptime-if branch
@@ -459,6 +522,8 @@ pub fun register_import_libraries(p: *project.Project) R.Result[bool, str] {
 # across the whole walk so a contradicting second one is refused by name
 fun bind_import_libraries(p: *project.Project, mid: session.ModuleId, source: str,
                           attrs: *map.Map[intern.StrId, ImportAttribution],
+                          paths: *vector.Vector[OwnedPath],
+                          path: *ArmStep, path_len: u32,
                           start: u32, len: u32) R.Result[bool, str] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
     var i: u32 = 0;
@@ -481,18 +546,28 @@ fun bind_import_libraries(p: *project.Project, mid: session.ModuleId, source: st
                         ret R.err[bool, str]("internal: ext decl carries a #[library] attribution but no link name");
                     }
                     val r: R.Result[bool, str] = bind_one_import_library(p, mid, source,
-                        attrs, d, O.unwrap[intern.StrId](name_opt),
+                        attrs, path, path_len, d, O.unwrap[intern.StrId](name_opt),
                         O.unwrap[intern.StrId](lib_opt));
                     if (R.is_err[bool, str](r)) { ret r; }
                 }
             }
             or (d.kind == decl.DECL_KIND_COMPTIME_IF) {
+                # every arm is walked, as `scan_export_directives` walks them: the
+                # conditions are not foldable in this pass, which runs before sema.
+                # each arm extends the path so a declaration under one arm is known
+                # never to coexist with a declaration under a sibling arm
                 val ci: *decl.DeclComptimeIf = ?d.data.comptime_if;
                 var bi: u32 = 0;
                 for (bi < ci.branches_len) {
                     val br: *decl.ComptimeBranch = ?m.a.comptime_branches[ci.branches_start + bi];
+                    val pr: R.Result[*ArmStep, str] =
+                        push_arm(p, paths, path, path_len, did::u32, bi);
+                    if (R.is_err[*ArmStep, str](pr)) {
+                        ret R.err[bool, str](R.unwrap_err[*ArmStep, str](pr));
+                    }
                     val rb: R.Result[bool, str] = bind_import_libraries(p, mid, source, attrs,
-                                                                       br.body_start, br.body_len);
+                        paths, R.unwrap_ok[*ArmStep, str](pr), path_len + 1,
+                        br.body_start, br.body_len);
                     if (R.is_err[bool, str](rb)) { ret rb; }
                     bi = bi + 1;
                 }
@@ -520,25 +595,74 @@ fun bind_import_libraries(p: *project.Project, mid: session.ModuleId, source: st
 # ret:    ok(true) once recorded, or the conflict as a user-facing string
 fun bind_one_import_library(p: *project.Project, mid: session.ModuleId, source: str,
                             attrs: *map.Map[intern.StrId, ImportAttribution],
+                            path: *ArmStep, path_len: u32,
                             d: *decl.Decl, name: intern.StrId,
                             lib: intern.StrId) R.Result[bool, str] {
     var here: ImportAttribution;
-    here.module = session.module_fqn(p.s, mid);
-    here.decl   = attribution_decl_name(p, source, d);
-    here.lib    = lib;
+    here.module  = session.module_fqn(p.s, mid);
+    here.decl    = attribution_decl_name(p, source, d);
+    here.lib     = lib;
+    here.arms    = path;
+    here.arm_len = path_len;
 
     val prev: R.Result[*ImportAttribution, str] =
         map.get[intern.StrId, ImportAttribution](attrs, ?name);
     if (R.is_ok[*ImportAttribution, str](prev)) {
         val had: *ImportAttribution = R.unwrap_ok[*ImportAttribution, str](prev);
         if (had.lib == lib) { ret R.ok[bool, str](true); }
-        ret R.err[bool, str](attribution_conflict_message(p, name, had, ?here));
+        # two declarations under different arms of one `$if` chain never both
+        # apply, so they are not a conflict to report. WHICH of them the link
+        # then sees is a separate, pre-existing defect: this pass runs before the
+        # target selects an arm, so the last arm walked still wins. That is
+        # unchanged here on purpose - repairing it means projecting attributions
+        # after arm selection, which is a pass-ordering change well beyond #2529.
+        if (!arms_exclusive(had.arms, had.arm_len, path, path_len)) {
+            ret R.err[bool, str](attribution_conflict_message(p, name, had, ?here));
+        }
     }
 
     val ins: R.Result[bool, str] =
         map.insert[intern.StrId, ImportAttribution](attrs, name, here);
     if (R.is_err[bool, str](ins)) { ret ins; }
     ret session.register_import_library(p.s, name, lib);
+}
+
+# extend an arm path by one step, returning the new owned array
+#
+# The parent path is copied rather than shared: a sibling arm extends the same
+# parent, so the two must not alias one buffer. `paths` takes ownership, keeping
+# every array alive for the whole registration (stored attributions borrow them)
+# and releasing them together at the end.
+# ---
+# p:        the project (allocator)
+# paths:    the registration's owned-path list
+# path:     the parent path, or nil at module scope
+# path_len: the parent path's length
+# cif:      DeclId of the `$if` chain being entered
+# arm:      index of the arm being entered
+# ret:      the extended path, or an allocation error
+fun push_arm(p: *project.Project, paths: *vector.Vector[OwnedPath],
+             path: *ArmStep, path_len: u32, cif: u32, arm: u32) R.Result[*ArmStep, str] {
+    val ar: R.Result[*ArmStep, str] = A.allocate[ArmStep](p.alloc, (path_len + 1)::usize);
+    if (R.is_err[*ArmStep, str](ar)) { ret ar; }
+    val buf: *ArmStep = R.unwrap_ok[*ArmStep, str](ar);
+    var i: u32 = 0;
+    for (i < path_len) {
+        buf[i] = path[i];
+        i = i + 1;
+    }
+    buf[path_len].cif = cif;
+    buf[path_len].arm = arm;
+
+    var owned: OwnedPath;
+    owned.data = buf;
+    owned.len  = path_len + 1;
+    val pr: R.Result[usize, str] = vector.push[OwnedPath](paths, owned);
+    if (R.is_err[usize, str](pr)) {
+        A.deallocate[ArmStep](p.alloc, buf, (path_len + 1)::usize);
+        ret R.err[*ArmStep, str](R.unwrap_err[usize, str](pr));
+    }
+    ret R.ok[*ArmStep, str](buf);
 }
 
 # the bare source identifier of an `ext` declaration, or STR_NIL when it cannot be
