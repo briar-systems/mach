@@ -50,8 +50,9 @@ rec Key { d: ^[32]u8; }
 fun first(k: Key) ^u8 { ret k.d[0]; }            # element of a secret array is ^u8
 ```
 
-`&T` of a `^T` value is the public pointer `*^T` (the address is public, the
-pointee secret), and dereferencing `*^T` recovers the secret `^T`.
+Taking the address of a `^T` value with `?` gives the public pointer `*^T` (the
+address is public, the pointee secret), and dereferencing it with `@` recovers
+the secret `^T`.
 
 ## Gates
 
