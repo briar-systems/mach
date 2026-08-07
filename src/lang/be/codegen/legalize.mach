@@ -72,6 +72,20 @@
 # multiply operand is already refused upstream, in `mir.lower`, before this pass
 # ever sees one.
 #
+# THE COMPARISON IS TWO ALGORITHMS (#2495). An EQUALITY (`==` / `!=`) is lane-wise
+# and order-independent: every lane is compared natively and the results reduced,
+# with AND for `==` and OR for `!=`. An ORDERED relation (`<` / `<=`) is a
+# lexicographic walk over the lanes, run from the LEAST significant lane UP so each
+# step folds the answer for the lanes below it into the lane above as that lane's
+# tie-break - which is the same order-of-significance rule a top-down walk states,
+# with the early exit replaced by an equality gate, because this pass cannot emit
+# the control flow an early exit needs. Signedness belongs to the TOP lane alone,
+# the only lane holding a sign bit. Both are built from the three relations a
+# narrow-ALU encoder is assumed to have (`==`, `!=`, unsigned `<`): a signed
+# less-than is the unsigned one over sign-biased operands and a `<=` is the
+# reversed strict form complemented, so neither algorithm ever emits a piece its
+# target's encoder would refuse.
+#
 # THE ADDRESS IS A VALUE TOO. A target whose registers are narrower than an address
 # (mos6502: 8-bit registers, 16-bit pointers) cannot hold a runtime pointer in one
 # register either, so a memory access through one is legalized as well - at ANY
@@ -380,7 +394,15 @@ fun plan_lanes(alloc: *A.Allocator, mach: *Machine, f: *mir.MirFunction, out: *L
         var ii: u32 = 0;
         for (ii < b.instr_count) {
             val mi: *mir.MirInstr = ?b.instrs[ii];
+            # A COMPARISON IS THE ONE OPCODE WHOSE `width` IS NOT ITS DESTINATION'S
+            # (#2495). `mir.lower_ir`'s `set_generic_widths` stamps a comparison with
+            # its OPERAND width, because that is the width the relation executes at;
+            # the destination is the one-byte boolean the relation produces. Planning
+            # lanes off `mi.width` here would split that boolean into as many lanes as
+            # the operands have and leave every consumer - which reads it at its own
+            # native width - naming a vreg the expansion no longer defines.
             if (!instr_is_vector(f, mi) && mir.instr_defines_shape(mi) &&
+                !mir.is_cmp_opcode(mi.opcode) &&
                 mi.width > maw && mi.operand_count > 0 &&
                 mi.operands[0].kind == mir.MIR_OP_VREG) {
                 val dv: u32 = mi.operands[0].vreg;
@@ -620,6 +642,7 @@ fun expansion_count(plan: *LanePlan, mi: *mir.MirInstr) R.Result[u32, str] {
         ret R.ok[u32, str](dst_lane_count(plan, mi));
     }
     if (op == mir.MIR_MUL) { ret mul_piece_count(plan, mi); }
+    if (mir.is_cmp_opcode(op)) { ret cmp_piece_count(plan, mi); }
     ret R.err[u32, str](unsupported_message(op, mi.width));
 }
 
@@ -823,6 +846,9 @@ fun expand_instr(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: 
     }
     if (op == mir.MIR_MUL) {
         ret expand_mul(alloc, plan, f, mi, dst, cursor);
+    }
+    if (mir.is_cmp_opcode(op)) {
+        ret expand_cmp(alloc, plan, f, mi, dst, cursor);
     }
     if (op == mir.MIR_ZEXT) {
         ret expand_zext(alloc, plan, mi, dst, cursor);
@@ -1899,6 +1925,327 @@ fun expand_mul(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *m
     ret R.ok[bool, str](true);
 }
 
+# whether a comparison is one of the two EQUALITY relations
+#
+# The family split the whole comparison expansion turns on (#2495): equality is
+# lane-wise and order-independent, an ordered relation is a lexicographic walk.
+fun cmp_is_equality(op: mir.MirOpcode) bool {
+    ret op == mir.MIR_CMP_EQ || op == mir.MIR_CMP_NE;
+}
+
+# whether an ordered comparison reads its most significant lane as SIGNED
+fun cmp_is_signed(op: mir.MirOpcode) bool {
+    ret op == mir.MIR_CMP_LT_S || op == mir.MIR_CMP_LE_S;
+}
+
+# whether an ordered comparison admits equality (the two `<=` relations)
+fun cmp_is_le(op: mir.MirOpcode) bool {
+    ret op == mir.MIR_CMP_LE_S || op == mir.MIR_CMP_LE_U;
+}
+
+# whether a comparison's destination is the native BOOLEAN the plan leaves unsplit
+#
+# `plan_lanes` deliberately never plans a comparison's destination (its `mi.width`
+# is the operand width, not the destination's), so a destination that IS lane-split
+# means the instruction is not the shape this expansion models and must be refused
+# rather than half-written.
+# ---
+# plan: the function's lane assignment
+# d:    the comparison's operand 0
+# ret:  true when the destination is a plain unsplit vreg
+fun cmp_dest_is_native(plan: *LanePlan, d: *mir.MirOperand) bool {
+    if (d.kind != mir.MIR_OP_VREG) { ret false; }
+    ret d.vreg >= plan.orig_count || plan.lane_base[d.vreg] == LANE_NONE;
+}
+
+# THE THREE NATIVE RELATIONS a lane comparison is built from, and why only three.
+#
+# A narrow-ALU target is assumed to realize `==`, `!=` and UNSIGNED `<` at its
+# native width, and nothing more: mos6502's encoder realizes exactly those three
+# and names the signed and `<=` forms a documented frontier it refuses. So neither
+# algorithm below ever emits a signed or a `<=` piece, even to express a signed or
+# a `<=` comparison. Both are reached from the three instead:
+#
+#   a <s b   ==   (a ^ $80) <u (b ^ $80)     the sign bias reorders the signed
+#                                            values into unsigned order, which is
+#                                            what flipping the sign bit means
+#   a <= b   ==   !(b < a)                   the reversed strict form, complemented
+#
+# Costing that honestly is the point of this function: a signed lane relation is
+# three pieces where an unsigned one is a single compare, and a `<=` one more
+# again, and the piece COUNT and the piece EMIT read the same statement of it.
+# ---
+# signed: true when this lane's relation is signed (only ever the top lane)
+# le:     true when the relation admits equality
+# ret:    the native-width piece count of one lane relation
+fun cmp_rel_pieces(signed: bool, le: bool) u32 {
+    var n: u32 = 1;
+    if (signed) { n = 3; }
+    if (le)     { n = n + 1; }
+    ret n;
+}
+
+# emit one lane relation `d = (a REL b)` from the three native relations
+#
+# See `cmp_rel_pieces` for the two identities this realizes and why it may use
+# nothing else. The sign bias is emitted unconditionally for a signed lane, an
+# immediate operand included: a fixed cost is what lets the count agree with the
+# emit without either inspecting operand kinds.
+# ---
+# alloc:  backing allocator for piece operand arrays and lane temporaries
+# f:      the MIR function (for appending temporaries)
+# src:    the comparison being replaced (source of loc / inline_site)
+# dst:    the rebuilt instruction array
+# cursor: next write index into `dst`; advanced past the emitted pieces
+# d:      the destination the 0 / 1 result lands in
+# a:      the left lane operand
+# b:      the right lane operand
+# lw:     the native lane width in bytes
+# signed: true when this lane's relation is signed
+# le:     true when the relation admits equality
+# ret:    ok(true) on success, or an allocation error
+fun emit_lane_rel(alloc: *A.Allocator, f: *mir.MirFunction, src: *mir.MirInstr,
+                  dst: *mir.MirInstr, cursor: *u32,
+                  d: mir.MirOperand, a: mir.MirOperand, b: mir.MirOperand, lw: u8,
+                  signed: bool, le: bool) R.Result[bool, str] {
+    # `a <= b` is `!(b < a)`, so the strict form below reads the operands reversed
+    # and the complement at the end turns it back around.
+    var x: mir.MirOperand = a;
+    var y: mir.MirOperand = b;
+    if (le) { x = b; y = a; }
+
+    if (signed) {
+        val bias: mir.MirOperand = mir.op_imm(1::i64 << (lw::i64 * 8 - 1));
+        val rx: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](rx)) { ret R.err[bool, str](R.unwrap_err[u32, str](rx)); }
+        val bx: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rx));
+        val r1: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, mir.MIR_XOR, bx, x, bias, lw);
+        if (R.is_err[bool, str](r1)) { ret r1; }
+
+        val ry: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](ry)) { ret R.err[bool, str](R.unwrap_err[u32, str](ry)); }
+        val by: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](ry));
+        val r2: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, mir.MIR_XOR, by, y, bias, lw);
+        if (R.is_err[bool, str](r2)) { ret r2; }
+
+        x = bx;
+        y = by;
+    }
+
+    if (!le) { ret emit_bin(alloc, dst, cursor, src, mir.MIR_CMP_LT_U, d, x, y, lw); }
+
+    val rt: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](rt)) { ret R.err[bool, str](R.unwrap_err[u32, str](rt)); }
+    val t: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rt));
+    val r3: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, mir.MIR_CMP_LT_U, t, x, y, lw);
+    if (R.is_err[bool, str](r3)) { ret r3; }
+    ret emit_bin(alloc, dst, cursor, src, mir.MIR_XOR, d, t, mir.op_imm(1), lw);
+}
+
+# the exact piece count of a wide comparison's expansion, or a loud error
+#
+# Rejects the shapes the expansion cannot realize before any block is rebuilt: an
+# operand that is neither lane-ready nor an immediate, a lane count past what a
+# scalar can span, and a destination that is not the native boolean the plan left
+# unsplit - the same shapes `expand_cmp` itself checks, so the two cannot disagree.
+# The per-family arithmetic below walks the SAME lanes in the same order the
+# expansion does, reading `cmp_rel_pieces` for each, rather than restating a closed
+# formula the emit could drift away from.
+# ---
+# plan: the function's lane assignment
+# mi:   the comparison instruction
+# ret:  the exact piece count, or an error naming the unsupported shape
+fun cmp_piece_count(plan: *LanePlan, mi: *mir.MirInstr) R.Result[u32, str] {
+    val nl: u32 = wide_lane_count(plan, mi);
+    if (mi.operand_count != 3 || nl > MAX_SHIFT_LANES ||
+        !cmp_dest_is_native(plan, ?mi.operands[0]) ||
+        !operand_is_lane_ready(plan, ?mi.operands[1], nl) ||
+        !operand_is_lane_ready(plan, ?mi.operands[2], nl)) {
+        ret R.err[u32, str](unsupported_message(mi.opcode, mi.width));
+    }
+
+    val op: mir.MirOpcode = mi.opcode;
+    # one native compare per lane, joined by one reduction step per lane after the
+    # first: no lane relation, so no signedness and no `<=` cost anywhere in it.
+    if (cmp_is_equality(op)) { ret R.ok[u32, str](2 * nl - 1); }
+
+    val signed: bool = cmp_is_signed(op);
+    # the bottom lane carries the relation itself; every lane above it contributes a
+    # strict less-than plus the three-piece tie-break (equality, gate, join).
+    var total: u32 = cmp_rel_pieces(signed && nl == 1, cmp_is_le(op));
+    var i: u32 = 1;
+    for (i < nl) {
+        total = total + cmp_rel_pieces(signed && i == nl - 1, false) + 3;
+        i = i + 1;
+    }
+    ret R.ok[u32, str](total);
+}
+
+# expand a wide comparison into native-width pieces (#2495)
+#
+# TWO ALGORITHMS, NOT ONE DISPATCH ARM, which is why this is a separate expansion
+# rather than another entry beside the bitwise ops:
+#
+# EQUALITY (`==` / `!=`) is lane-wise and ORDER-INDEPENDENT. Every lane is compared
+# natively and the results are reduced - with AND for `==` (every lane must agree)
+# and with OR for `!=` (any lane differing is enough). No lane depends on another's
+# result, so there is nothing to walk and no early exit to want.
+#
+# AN ORDERED RELATION (`<` / `<=`) is a LEXICOGRAPHIC walk over the lanes, and the
+# walk here runs from the LEAST significant lane UP, folding each lower answer into
+# the lane above it as that lane's tie-break:
+#
+#     res = (a[0] REL b[0])                      the bottom lane, the relation itself
+#     res = (a[i] <u b[i]) | ((a[i] == b[i]) & res)   every lane above, in turn
+#
+# which is the same order-of-significance rule a top-down walk states - a lane that
+# differs decides the answer and a lane that matches defers to the lanes below it -
+# with the early exit replaced by the equality gate, because this pass cannot emit
+# the control flow an early exit needs. Running it bottom-up is what makes that
+# branchless: each step needs only the answer for the lanes below it, which it
+# already has. A top-down walk would need the answer for the lanes it has not
+# reached yet, and getting THAT wrong - letting a lower lane override a higher one -
+# is the failure this shape is built to not have.
+#
+# SIGNEDNESS BELONGS TO THE TOP LANE ALONE. Only the most significant lane holds the
+# sign bit, so it is the only lane whose relation is signed; every lane below it
+# compares unsigned, the bottom lane included - unless the operation spans a single
+# lane, where the bottom lane IS the top one. `<=` is the mirror case: it differs
+# from `<` only at the bottom lane, since every lane above tie-breaks on equality
+# and passes the lower answer through unchanged.
+#
+# BRANCHLESS AND BUILT FROM THREE PRIMITIVES. Neither algorithm emits a signed or a
+# `<=` piece even when realizing a signed or `<=` comparison - see `cmp_rel_pieces`
+# for the two identities that reach them from `==`, `!=` and unsigned `<`, the only
+# relations a narrow-ALU encoder is assumed to have.
+#
+# SHARED, NOT MOS6502-SPECIFIC: nothing here reads a mos6502 fact, only
+# `plan.lane_width` and the lane-operand path.
+# ---
+# alloc:  backing allocator for piece operand arrays and lane temporaries
+# plan:   the function's lane assignment
+# f:      the MIR function (for appending temporaries)
+# mi:     the comparison to expand
+# dst:    the rebuilt instruction array
+# cursor: next write index into `dst`; advanced past the emitted pieces
+# ret:    ok(true) on success, or an error naming the unsupported shape
+fun expand_cmp(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *mir.MirInstr,
+               dst: *mir.MirInstr, cursor: *u32) R.Result[bool, str] {
+    val rc: R.Result[u32, str] = cmp_piece_count(plan, mi);
+    if (R.is_err[u32, str](rc)) { ret R.err[bool, str](R.unwrap_err[u32, str](rc)); }
+
+    if (cmp_is_equality(mi.opcode)) { ret expand_cmp_equality(alloc, plan, f, mi, dst, cursor); }
+    ret expand_cmp_ordered(alloc, plan, f, mi, dst, cursor);
+}
+
+# expand `==` / `!=` as one native compare per lane reduced across the lanes
+fun expand_cmp_equality(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *mir.MirInstr,
+                        dst: *mir.MirInstr, cursor: *u32) R.Result[bool, str] {
+    val nl: u32 = wide_lane_count(plan, mi);
+    val lw: u8  = plan.lane_width;
+    val d:  mir.MirOperand = mi.operands[0];
+
+    var lane_op: mir.MirOpcode = mir.MIR_CMP_EQ;
+    var join:    mir.MirOpcode = mir.MIR_AND;
+    if (mi.opcode == mir.MIR_CMP_NE) { lane_op = mir.MIR_CMP_NE; join = mir.MIR_OR; }
+
+    var acc: mir.MirOperand;
+    var i: u32 = 0;
+    for (i < nl) {
+        # a single-lane comparison has nothing to reduce, so its compare writes the
+        # destination directly rather than a temporary nothing would read.
+        var out: mir.MirOperand = d;
+        if (nl > 1) {
+            val rt: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](rt)) { ret R.err[bool, str](R.unwrap_err[u32, str](rt)); }
+            out = mir.op_vreg(R.unwrap_ok[u32, str](rt));
+        }
+        val rl: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, lane_op, out,
+                                               lane_operand(plan, ?mi.operands[1], i),
+                                               lane_operand(plan, ?mi.operands[2], i), lw);
+        if (R.is_err[bool, str](rl)) { ret rl; }
+
+        if (i == 0) { acc = out; }
+        or {
+            # the last reduction step lands in the destination.
+            var jd: mir.MirOperand = d;
+            if (i < nl - 1) {
+                val rj: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+                if (R.is_err[u32, str](rj)) { ret R.err[bool, str](R.unwrap_err[u32, str](rj)); }
+                jd = mir.op_vreg(R.unwrap_ok[u32, str](rj));
+            }
+            val rr: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, join, jd, acc, out, lw);
+            if (R.is_err[bool, str](rr)) { ret rr; }
+            acc = jd;
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# expand `<` / `<=` as the branchless lexicographic walk from the bottom lane up
+fun expand_cmp_ordered(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *mir.MirInstr,
+                       dst: *mir.MirInstr, cursor: *u32) R.Result[bool, str] {
+    val nl: u32 = wide_lane_count(plan, mi);
+    val lw: u8  = plan.lane_width;
+    val d:  mir.MirOperand = mi.operands[0];
+    val signed: bool = cmp_is_signed(mi.opcode);
+
+    # the bottom lane: the only lane carrying the relation itself, and signed only
+    # when it is also the top lane.
+    var res: mir.MirOperand = d;
+    if (nl > 1) {
+        val r0: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](r0)) { ret R.err[bool, str](R.unwrap_err[u32, str](r0)); }
+        res = mir.op_vreg(R.unwrap_ok[u32, str](r0));
+    }
+    val rb: R.Result[bool, str] = emit_lane_rel(alloc, f, mi, dst, cursor, res,
+                                                lane_operand(plan, ?mi.operands[1], 0),
+                                                lane_operand(plan, ?mi.operands[2], 0), lw,
+                                                signed && nl == 1, cmp_is_le(mi.opcode));
+    if (R.is_err[bool, str](rb)) { ret rb; }
+
+    var i: u32 = 1;
+    for (i < nl) {
+        val a: mir.MirOperand = lane_operand(plan, ?mi.operands[1], i);
+        val b: mir.MirOperand = lane_operand(plan, ?mi.operands[2], i);
+
+        # this lane's own strict less-than: signed at the top lane, unsigned below.
+        val rl: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](rl)) { ret R.err[bool, str](R.unwrap_err[u32, str](rl)); }
+        val lt: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rl));
+        val r1: R.Result[bool, str] = emit_lane_rel(alloc, f, mi, dst, cursor, lt, a, b, lw,
+                                                    signed && i == nl - 1, false);
+        if (R.is_err[bool, str](r1)) { ret r1; }
+
+        # the tie-break: when this lane matches, the answer is the one below it.
+        val re: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](re)) { ret R.err[bool, str](R.unwrap_err[u32, str](re)); }
+        val eq: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](re));
+        val r2: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, mir.MIR_CMP_EQ, eq, a, b, lw);
+        if (R.is_err[bool, str](r2)) { ret r2; }
+
+        val rg: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](rg)) { ret R.err[bool, str](R.unwrap_err[u32, str](rg)); }
+        val g: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rg));
+        val r3: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, mir.MIR_AND, g, eq, res, lw);
+        if (R.is_err[bool, str](r3)) { ret r3; }
+
+        # the last join lands in the destination.
+        var out: mir.MirOperand = d;
+        if (i < nl - 1) {
+            val ro: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](ro)) { ret R.err[bool, str](R.unwrap_err[u32, str](ro)); }
+            out = mir.op_vreg(R.unwrap_ok[u32, str](ro));
+        }
+        val r4: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, mir.MIR_OR, out, lt, g, lw);
+        if (R.is_err[bool, str](r4)) { ret r4; }
+        res = out;
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
 # the destination lane count of a width-changing op (its operation width in native
 # lanes, at least one)
 fun dst_lane_count(plan: *LanePlan, mi: *mir.MirInstr) u32 {
@@ -2030,6 +2377,9 @@ fun unsupported_message(op: mir.MirOpcode, width: u8) str {
     }
     if (op == mir.MIR_LOAD || op == mir.MIR_STORE) {
         ret "legalize: wide memory access through an unsupported operand shape on this target";
+    }
+    if (mir.is_cmp_opcode(op)) {
+        ret "legalize: wide comparison through an unsupported operand shape on this target";
     }
     if (op == mir.MIR_GEP || op == mir.MIR_ALLOCA) {
         ret "legalize: materializing an address wider than one register is not yet legalized on this target";
@@ -2562,6 +2912,298 @@ test "mach.lang.be.codegen.legalize:shift_is_inert_on_a_variable_shift_machine" 
     mach.var_shift = false;
     if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f))) { ret 1; }
     if (b.instrs == before_ptr) { ret 1; }
+    ret 0;
+}
+
+# test-only: a one-instruction function `v0 = v1 <cmp> v2` at `width` bytes, with `v1`
+# and `v2` defined by wide immediate moves so the planner marks them wide
+#
+# The comparison itself carries the OPERAND width on `mi.width`, which is what
+# `mir.lower_ir` stamps on a comparison and what makes its destination the one
+# destination in this pass that must NOT be planned into lanes.
+fun t_cmp_fn(alloc: *A.Allocator, f: *mir.MirFunction, b: *mir.MirBlock,
+             op: mir.MirOpcode, width: u8) {
+    t_vregs(alloc, f, 3);
+    t_block(alloc, b, 3);
+    var m1: [2]mir.MirOperand;
+    m1[0] = mir.op_vreg(1); m1[1] = mir.op_imm(0x0102030405060708);
+    t_instr(alloc, b, 0, mir.MIR_MOV, ?m1[0], 2, width);
+    var m2: [2]mir.MirOperand;
+    m2[0] = mir.op_vreg(2); m2[1] = mir.op_imm(0x1122334455667788);
+    t_instr(alloc, b, 1, mir.MIR_MOV, ?m2[0], 2, width);
+    var cm: [3]mir.MirOperand;
+    cm[0] = mir.op_vreg(0); cm[1] = mir.op_vreg(1); cm[2] = mir.op_vreg(2);
+    t_instr(alloc, b, 2, op, ?cm[0], 3, width);
+    f.blocks = b; f.block_count = 1;
+}
+
+# a wide EQUALITY is lane-wise and order-independent: one native compare per lane,
+# reduced with AND for `==` and OR for `!=`, and nothing else (#2495)
+#
+# The cheap half of the comparison work. No lane depends on another's result, so
+# there is no walk and no tie-break - which is exactly what distinguishes it from
+# the ordered relations below and why the two are separate algorithms rather than
+# one dispatch arm.
+test "mach.lang.be.codegen.legalize:expands_wide_equality_lane_wise" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var mach: Machine = t_mach(1, 2);
+
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    t_cmp_fn(?alloc, ?f, ?b, mir.MIR_CMP_EQ, 2);
+    if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f))) { ret 1; }
+
+    # 2 lanes per wide immediate move + the three-piece equality: two lane compares
+    # and the single AND that reduces them.
+    if (b.instr_count != 7) { ret 1; }
+    # lanes go to the two OPERANDS only (v1 -> v3,v4; v2 -> v5,v6); the destination
+    # v0 is the native boolean the relation produces and is never split.
+    if (b.instrs[4].opcode != mir.MIR_CMP_EQ) { ret 1; }
+    if (b.instrs[4].operands[1].vreg != 3)    { ret 1; }  # lane 0 of v1
+    if (b.instrs[4].operands[2].vreg != 5)    { ret 1; }  # lane 0 of v2
+    if (b.instrs[5].opcode != mir.MIR_CMP_EQ) { ret 1; }
+    if (b.instrs[5].operands[1].vreg != 4)    { ret 1; }  # lane 1 of v1
+    if (b.instrs[5].operands[2].vreg != 6)    { ret 1; }  # lane 1 of v2
+    if (b.instrs[6].opcode != mir.MIR_AND)    { ret 1; }
+    if (b.instrs[6].operands[0].vreg != 0)    { ret 1; }  # straight into the boolean
+
+    # `!=` is the same shape with the reduction inverted: any lane differing suffices.
+    var f2: mir.MirFunction;
+    var b2: mir.MirBlock;
+    t_cmp_fn(?alloc, ?f2, ?b2, mir.MIR_CMP_NE, 2);
+    if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f2))) { ret 1; }
+    if (b2.instr_count != 7)                    { ret 1; }
+    if (b2.instrs[4].opcode != mir.MIR_CMP_NE)  { ret 1; }
+    if (b2.instrs[5].opcode != mir.MIR_CMP_NE)  { ret 1; }
+    if (b2.instrs[6].opcode != mir.MIR_OR)      { ret 1; }
+    if (b2.instrs[6].operands[0].vreg != 0)     { ret 1; }
+
+    # none of it is a branch: an equality emits no control flow and adds no block.
+    var i: u32 = 4;
+    for (i < 7) {
+        if (b.instrs[i].width != 1)            { ret 1; }
+        if (b.instrs[i].opcode == mir.MIR_BR)  { ret 1; }
+        if (b.instrs[i].opcode == mir.MIR_CBR) { ret 1; }
+        i = i + 1;
+    }
+    if (f.block_count != 1) { ret 1; }
+    ret 0;
+}
+
+# a wide ORDERED relation is a lexicographic walk from the BOTTOM lane UP, each lane
+# folding the answer below it in through an equality gate (#2495)
+#
+# THE WALK ORDER IS THE WHOLE ALGORITHM. Running it bottom-up is what makes the
+# lexicographic answer branchless: every step needs only the answer for the lanes
+# below it, which it already has. The first emitted piece must therefore read the
+# BOTTOM lanes and the last must write the destination - pinned here, because a walk
+# that started at the top would need an answer it has not computed yet and the
+# obvious repair for that (letting a lower lane's result win) is precisely the bug
+# this shape exists to not have.
+test "mach.lang.be.codegen.legalize:expands_wide_ordered_as_a_lexicographic_walk" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var mach: Machine = t_mach(1, 2);
+
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    t_cmp_fn(?alloc, ?f, ?b, mir.MIR_CMP_LT_U, 2);
+    if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f))) { ret 1; }
+
+    # 4 move lanes + the five-piece walk: the bottom lane's relation, then the top
+    # lane's less-than, equality, gate and join.
+    if (b.instr_count != 9) { ret 1; }
+
+    # piece 4 is the BOTTOM lane, and it is the relation itself.
+    if (b.instrs[4].opcode != mir.MIR_CMP_LT_U) { ret 1; }
+    if (b.instrs[4].operands[1].vreg != 3)      { ret 1; }  # lane 0 of v1
+    if (b.instrs[4].operands[2].vreg != 5)      { ret 1; }  # lane 0 of v2
+    # the top lane contributes its own strict less-than and its equality...
+    if (b.instrs[5].opcode != mir.MIR_CMP_LT_U) { ret 1; }
+    if (b.instrs[5].operands[1].vreg != 4)      { ret 1; }  # lane 1 of v1
+    if (b.instrs[6].opcode != mir.MIR_CMP_EQ)   { ret 1; }
+    if (b.instrs[6].operands[1].vreg != 4)      { ret 1; }
+    # ...which GATES the answer from below, rather than being ORed with it blind.
+    if (b.instrs[7].opcode != mir.MIR_AND)      { ret 1; }
+    if (b.instrs[7].operands[1].vreg != b.instrs[6].operands[0].vreg) { ret 1; }  # the equality
+    if (b.instrs[7].operands[2].vreg != b.instrs[4].operands[0].vreg) { ret 1; }  # the lower answer
+    if (b.instrs[8].opcode != mir.MIR_OR)       { ret 1; }
+    if (b.instrs[8].operands[1].vreg != b.instrs[5].operands[0].vreg) { ret 1; }  # this lane's less-than
+    if (b.instrs[8].operands[0].vreg != 0)      { ret 1; }  # into the boolean
+
+    # SIGNEDNESS IS THE TOP LANE'S ALONE, and it is reached from the unsigned compare
+    # over sign-biased operands rather than from a signed piece the encoder may not
+    # have. The bottom lane keeps the plain unsigned compare it had above.
+    var fs: mir.MirFunction;
+    var bs: mir.MirBlock;
+    t_cmp_fn(?alloc, ?fs, ?bs, mir.MIR_CMP_LT_S, 2);
+    if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?fs))) { ret 1; }
+    if (bs.instr_count != 11)                     { ret 1; }
+    if (bs.instrs[4].opcode != mir.MIR_CMP_LT_U)  { ret 1; }  # bottom lane, still unsigned
+    if (bs.instrs[4].operands[1].vreg != 3)       { ret 1; }
+    if (bs.instrs[5].opcode != mir.MIR_XOR)       { ret 1; }  # the top lane's sign bias
+    if (bs.instrs[5].operands[1].vreg != 4)       { ret 1; }
+    if (bs.instrs[5].operands[2].imm  != 0x80)    { ret 1; }
+    if (bs.instrs[6].opcode != mir.MIR_XOR)       { ret 1; }
+    if (bs.instrs[6].operands[2].imm  != 0x80)    { ret 1; }
+    if (bs.instrs[7].opcode != mir.MIR_CMP_LT_U)  { ret 1; }  # biased, so unsigned again
+    if (bs.instrs[10].operands[0].vreg != 0)      { ret 1; }
+    # no signed or `<=` piece is emitted anywhere, at either signedness: those are the
+    # relations a narrow-ALU encoder is not assumed to have.
+    var i: u32 = 0;
+    for (i < bs.instr_count) {
+        if (bs.instrs[i].opcode == mir.MIR_CMP_LT_S) { ret 1; }
+        if (bs.instrs[i].opcode == mir.MIR_CMP_LE_S) { ret 1; }
+        if (bs.instrs[i].opcode == mir.MIR_CMP_LE_U) { ret 1; }
+        if (bs.instrs[i].opcode == mir.MIR_BR)       { ret 1; }
+        if (bs.instrs[i].opcode == mir.MIR_CBR)      { ret 1; }
+        i = i + 1;
+    }
+
+    # `<=` differs from `<` at the BOTTOM lane only - every lane above tie-breaks on
+    # equality and passes the lower answer through - and is the reversed strict form
+    # complemented, so its bottom compare reads its operands the other way round.
+    var fl: mir.MirFunction;
+    var bl: mir.MirBlock;
+    t_cmp_fn(?alloc, ?fl, ?bl, mir.MIR_CMP_LE_U, 2);
+    if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?fl))) { ret 1; }
+    if (bl.instr_count != 10)                    { ret 1; }
+    if (bl.instrs[4].opcode != mir.MIR_CMP_LT_U) { ret 1; }
+    if (bl.instrs[4].operands[1].vreg != 5)      { ret 1; }  # lane 0 of v2, reversed
+    if (bl.instrs[4].operands[2].vreg != 3)      { ret 1; }  # lane 0 of v1
+    if (bl.instrs[5].opcode != mir.MIR_XOR)      { ret 1; }  # the complement
+    if (bl.instrs[5].operands[2].imm != 1)       { ret 1; }
+    if (bl.instrs[9].operands[0].vreg != 0)      { ret 1; }
+    ret 0;
+}
+
+# every one of the six comparisons expands at a piece count that is a closed formula
+# in the width, and `expansion_count` agrees with `expand_instr` exactly (#2495)
+#
+# The counts are pinned per relation and per width so a change to either algorithm
+# has to state what it costs - the same discipline the shift barrel's counts are held
+# to. They also encode the two cost claims the design makes: an equality is far
+# cheaper than an ordered relation at every width, and the signed and `<=` surcharges
+# are CONSTANT rather than per-lane, because signedness touches only the top lane and
+# `<=` only the bottom one.
+test "mach.lang.be.codegen.legalize:pins_wide_comparison_piece_counts" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var mach: Machine = t_mach(1, 2);
+
+    var ops: [6]mir.MirOpcode;
+    ops[0] = mir.MIR_CMP_EQ;   ops[1] = mir.MIR_CMP_NE;
+    ops[2] = mir.MIR_CMP_LT_U; ops[3] = mir.MIR_CMP_LT_S;
+    ops[4] = mir.MIR_CMP_LE_U; ops[5] = mir.MIR_CMP_LE_S;
+
+    var widths: [3]u8;  widths[0] = 2; widths[1] = 4; widths[2] = 8;
+    # the expansion's own pieces, per relation (rows) and per width (columns).
+    var want: [18]u32;
+    want[0]  = 3;  want[1]  = 7;  want[2]  = 15;   # EQ
+    want[3]  = 3;  want[4]  = 7;  want[5]  = 15;   # NE
+    want[6]  = 5;  want[7]  = 13; want[8]  = 29;   # LT_U
+    want[9]  = 7;  want[10] = 15; want[11] = 31;   # LT_S
+    want[12] = 6;  want[13] = 14; want[14] = 30;   # LE_U
+    want[15] = 8;  want[16] = 16; want[17] = 32;   # LE_S
+
+    var r: u32 = 0;
+    for (r < 6) {
+        var c: u32 = 0;
+        for (c < 3) {
+            var f: mir.MirFunction;
+            var b: mir.MirBlock;
+            t_cmp_fn(?alloc, ?f, ?b, ops[r], widths[c]);
+            if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f))) { ret 1; }
+            # the two wide immediate moves cost one lane each; the rest is the compare.
+            if (b.instr_count != 2 * widths[c]::u32 + want[r * 3 + c]) { ret 1; }
+            # the answer always lands in the original destination vreg, and that vreg
+            # is the LAST thing written - nothing follows the join.
+            if (b.instrs[b.instr_count - 1].operands[0].kind != mir.MIR_OP_VREG) { ret 1; }
+            if (b.instrs[b.instr_count - 1].operands[0].vreg != 0)               { ret 1; }
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    ret 0;
+}
+
+# a comparison's DESTINATION is the native boolean, never split into lanes (#2495)
+#
+# A comparison is the one opcode whose `mi.width` is its OPERAND width rather than
+# its destination's, so the lane planner has to exclude it by name. Planning it would
+# hand the one-byte boolean as many lanes as the operands have and leave every
+# consumer - which reads it at its own native width - naming a vreg the expansion no
+# longer defines. Pinned by counting the lane vregs the plan actually allocates.
+test "mach.lang.be.codegen.legalize:leaves_a_comparison_destination_unsplit" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var mach: Machine = t_mach(1, 2);
+
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    t_cmp_fn(?alloc, ?f, ?b, mir.MIR_CMP_EQ, 8);
+    if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f))) { ret 1; }
+
+    # THE PLAN SPLIT EXACTLY TWO VALUES, NOT THREE. Lanes are assigned in definition
+    # order from the original vreg count, so the two OPERANDS take v3..v10 and
+    # v11..v18 and the next id an expansion temporary can occupy is v19. Had the
+    # destination been planned as well it would hold v19..v26, and v19 would name a
+    # lane rather than the first temporary - which is what this pins.
+    if (b.instrs[16].operands[0].vreg != 19) { ret 1; }  # the first lane compare's temp
+
+    # v0 keeps its single native home: it is written once, by the LAST piece, whole.
+    # A planned destination could not satisfy this - `lane_operand` would have mapped
+    # operand 0 onto a lane vreg and v0 would be written by nothing at all.
+    var writes_v0: u32 = 0;
+    var i: u32 = 0;
+    for (i < b.instr_count) {
+        if (b.instrs[i].operands[0].kind == mir.MIR_OP_VREG &&
+            b.instrs[i].operands[0].vreg == 0) { writes_v0 = writes_v0 + 1; }
+        i = i + 1;
+    }
+    if (writes_v0 != 1)                                   { ret 1; }
+    if (b.instrs[b.instr_count - 1].operands[0].vreg != 0) { ret 1; }
+    if (b.instrs[b.instr_count - 1].width != 1)            { ret 1; }
+
+    # and the whole expansion runs at the native lane width, destination included.
+    i = 16;
+    for (i < b.instr_count) {
+        if (b.instrs[i].width != 1) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# a wide comparison through an operand shape the expansion cannot decompose is
+# REFUSED with a diagnostic naming the comparison, never half-written
+test "mach.lang.be.codegen.legalize:rejects_a_wide_comparison_of_an_unsupported_shape" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var mach: Machine = t_mach(1, 2);
+
+    # a comparison whose destination is a physical register rather than a value vreg:
+    # a shape the boolean-destination expansion does not model.
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 3);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 3);
+    var m1: [2]mir.MirOperand;
+    m1[0] = mir.op_vreg(1); m1[1] = mir.op_imm(0x0102);
+    t_instr(?alloc, ?b, 0, mir.MIR_MOV, ?m1[0], 2, 2);
+    var m2: [2]mir.MirOperand;
+    m2[0] = mir.op_vreg(2); m2[1] = mir.op_imm(0x0304);
+    t_instr(?alloc, ?b, 1, mir.MIR_MOV, ?m2[0], 2, 2);
+    var cm: [3]mir.MirOperand;
+    cm[0] = mir.op_preg(4); cm[1] = mir.op_vreg(1); cm[2] = mir.op_vreg(2);
+    t_instr(?alloc, ?b, 2, mir.MIR_CMP_LT_U, ?cm[0], 3, 2);
+    f.blocks = ?b; f.block_count = 1;
+
+    val before: *mir.MirInstr = b.instrs;
+    if (!R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f))) { ret 1; }
+    # the refusal precedes the rebuild, so the block is left exactly as it was.
+    if (b.instrs != before)     { ret 1; }
+    if (b.instr_count != 3)     { ret 1; }
     ret 0;
 }
 
