@@ -100,6 +100,17 @@ pub val VC_TYPE_AGREE:      VerifyCheck = 13;
 # shipping
 pub val VC_CALL_ARG_TYPE:   VerifyCheck = 14;
 
+# a bitcast may not cross the value / address representation classes. An aggregate
+# (struct / union / array) is carried by its storage ADDRESS; a scalar or vector is
+# carried by VALUE. A bitcast between the two classes is a representation change,
+# not the retag the opcode means, and neither end of it is expressible: from an
+# aggregate it hands back the storage address as the scalar, and into an aggregate
+# it produces an aggregate-typed value every consumer then dereferences as a
+# pointer. `:~` lowering materializes the crossing with a load or a store instead
+# (#2670). Always on: the shape is individually coherent at both ends and only wrong
+# in combination, which review does not catch and only an invariant does
+pub val VC_BITCAST_CLASS:   VerifyCheck = 15;
+
 # one invariant failure, located as precisely as the failing check allows
 # ---
 # function: index into Module.functions
@@ -199,6 +210,7 @@ pub fun describe(check: VerifyCheck) str {
     if (check == VC_DOMINANCE)       { ret "dominance: operand definition does not dominate its use"; }
     if (check == VC_REACHABILITY)    { ret "reachability: block is unreachable"; }
     if (check == VC_AGG_ADDRESS)     { ret "aggregate representation: aggregate-typed operand is not address-producing"; }
+    if (check == VC_BITCAST_CLASS)   { ret "bitcast crosses the value / address representation classes without materializing it"; }
     if (check == VC_TYPE_RESOLVE)    { ret "type resolution: operand or aux type does not resolve"; }
     if (check == VC_DANGLING_ID)     { ret "dangling id: a block list names an out-of-range instruction id"; }
     if (check == VC_TYPE_AGREE)      { ret "type agreement: operand types violate the opcode's typing contract"; }
@@ -642,6 +654,8 @@ fun check_one_instr(m: *ir.Module, fn: *ir.Function, iid: id.InstructionId, fi: 
     # declared IRT_FN signature. now that generic instances carry real signatures,
     # this makes the #2035 defect class (a by-value aggregate arg mis-typed to a
     # pointer) structurally impossible to ship.
+    val res_bc: R.Result[bool, str] = check_bitcast_class(m, ins, fi, bid, iid, r);
+    if (R.is_err[bool, str](res_bc)) { ret res_bc; }
     val res_call: R.Result[bool, str] = check_call_arg_types(m, ins, fi, bid, iid, r);
     if (R.is_err[bool, str](res_call)) { ret res_call; }
     ret R.ok[bool, str](true);
@@ -771,6 +785,33 @@ fun check_type_agree(m: *ir.Module, ins: *instruction.Instruction, fi: u32, bid:
 # iid: the instruction id (located on a violation)
 # r:   the report to record into
 # ret: true on completion, or an allocation error
+# VC_BITCAST_CLASS: a bitcast's operand and result must sit on the same side of the
+# value / address divide
+#
+# `is_aggregate` is the single classifier the lowerer and the back end already share,
+# so this asks exactly the question they both answer. A crossing is a representation
+# change the opcode cannot express, and it shipped in both directions before #2670:
+# `[8]u8 :~ i64` evaluated to the array's stack address, and `i64 :~ [8]u8` emitted a
+# copy from whatever the integer's bytes looked like as a pointer. Neither faulted
+# reliably, so the first was a silent wrong answer.
+#
+# A sentinel-typed operand is not classified: an unresolvable id is VC_TYPE_RESOLVE's
+# to report, and reading it here would double-report one defect.
+# ---
+# m:   the module (type table)
+# ins: the instruction to check
+# ret: ok(true) once checked, or an allocation error from `push`
+fun check_bitcast_class(m: *ir.Module, ins: *instruction.Instruction, fi: u32, bid: id.BlockId, iid: id.InstructionId, r: *VerifyReport) R.Result[bool, str] {
+    if (ins.kind != instruction.OP_BITCAST) { ret R.ok[bool, str](true); }
+    if (ins.operand_count < 1)              { ret R.ok[bool, str](true); }
+    val src: type.IrTypeId = (?ins.operands[0]).ty;
+    if (src == type.IRT_NIL || ins.ty == type.IRT_NIL) { ret R.ok[bool, str](true); }
+    if (type.is_aggregate(?m.types, src) == type.is_aggregate(?m.types, ins.ty)) {
+        ret R.ok[bool, str](true);
+    }
+    ret push(r, fi, bid, iid, VC_BITCAST_CLASS);
+}
+
 fun check_call_arg_types(m: *ir.Module, ins: *instruction.Instruction, fi: u32, bid: id.BlockId, iid: id.InstructionId, r: *VerifyReport) R.Result[bool, str] {
     if (ins.kind != instruction.OP_CALL) { ret R.ok[bool, str](true); }
     if (ins.operand_count == 0)          { ret R.ok[bool, str](true); }
@@ -1996,6 +2037,94 @@ test "mach.lang.me.ir.verify.check_pred_consistency:wrong_member" {
     # block 3's preds are {1, 2}; rewrite to {1, 1} - same length, wrong members.
     env.m.functions[0].blocks[3].preds[1] = 1::id.BlockId;
     if (t_count(?env, false, false, VC_PRED_CONSISTENT) < 1) { ret 1; }
+    ret 0;
+}
+
+# a bitcast from a scalar VALUE into an aggregate is rejected, always on
+#
+# The shape #2670 shipped: `i64 :~ [8]u8` lowered to a bitcast whose result was
+# aggregate-typed but whose operand was a register-resident value, and every
+# consumer then treated the result as the aggregate's address. Checked with repr
+# OFF as well as on, because this is the invariant that stops the defect class from
+# returning and an opt-in tripwire would not have caught the original.
+test "mach.lang.me.ir.verify.check_bitcast_class:value_into_aggregate" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+
+    val ar_r: R.Result[type.IrTypeId, str] = type.intern_array(?env.m.types, env.i64ty, 1);
+    if (R.is_err[type.IrTypeId, str](ar_r)) { ret 1; }
+    val arrty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](ar_r);
+
+    val b0: id.BlockId = t_block(?env);
+    builder.set_block(?env.bld, b0);
+
+    # bitcast an i64 constant into the array type: a value crossing into an address
+    val bc: R.Result[value.Value, str] = builder.emit_bitcast(?env.bld, t_ci(?env, 7), arrty);
+    if (R.is_err[value.Value, str](bc)) { ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+
+    if (t_count(?env, false, false, VC_BITCAST_CLASS) < 1) { ret 1; }
+    if (t_count(?env, false, true,  VC_BITCAST_CLASS) < 1) { ret 1; }
+    ret 0;
+}
+
+# and the mirror: a bitcast from an aggregate ADDRESS out to a scalar
+#
+# `[8]u8 :~ i64` is the direction that did not fault. It evaluated to the array's
+# stack address, so it is the one a test must cover or the silent form stays live.
+test "mach.lang.me.ir.verify.check_bitcast_class:aggregate_into_value" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+
+    val ar_r: R.Result[type.IrTypeId, str] = type.intern_array(?env.m.types, env.i64ty, 1);
+    if (R.is_err[type.IrTypeId, str](ar_r)) { ret 1; }
+    val arrty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](ar_r);
+
+    val b0: id.BlockId = t_block(?env);
+    builder.set_block(?env.bld, b0);
+
+    val slot_r: R.Result[value.Value, str] = builder.emit_alloca(?env.bld, arrty, t_ci(?env, 1));
+    if (R.is_err[value.Value, str](slot_r)) { ret 1; }
+    val agg: value.Value = value.retype(R.unwrap_ok[value.Value, str](slot_r), arrty);
+
+    val bc: R.Result[value.Value, str] = builder.emit_bitcast(?env.bld, agg, env.i64ty);
+    if (R.is_err[value.Value, str](bc)) { ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+
+    if (t_count(?env, false, false, VC_BITCAST_CLASS) < 1) { ret 1; }
+    ret 0;
+}
+
+# a bitcast WITHIN one class is the retag the opcode means and must not be flagged,
+# or the check would reject every pointer retype and signedness flip in the tree
+test "mach.lang.me.ir.verify.check_bitcast_class:same_class_accepted" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+
+    val ar_r: R.Result[type.IrTypeId, str] = type.intern_array(?env.m.types, env.i64ty, 1);
+    if (R.is_err[type.IrTypeId, str](ar_r)) { ret 1; }
+    val arrty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](ar_r);
+    val ar2_r: R.Result[type.IrTypeId, str] = type.intern_array(?env.m.types, env.i64ty, 1);
+    if (R.is_err[type.IrTypeId, str](ar2_r)) { ret 1; }
+    val arrty2: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](ar2_r);
+
+    val b0: id.BlockId = t_block(?env);
+    builder.set_block(?env.bld, b0);
+
+    # value -> value
+    val v1: R.Result[value.Value, str] = builder.emit_bitcast(?env.bld, t_ci(?env, 7), env.i64ty);
+    if (R.is_err[value.Value, str](v1)) { ret 1; }
+
+    # aggregate -> aggregate, both carried by address
+    val slot_r: R.Result[value.Value, str] = builder.emit_alloca(?env.bld, arrty, t_ci(?env, 1));
+    if (R.is_err[value.Value, str](slot_r)) { ret 1; }
+    val agg: value.Value = value.retype(R.unwrap_ok[value.Value, str](slot_r), arrty);
+    val v2: R.Result[value.Value, str] = builder.emit_bitcast(?env.bld, agg, arrty2);
+    if (R.is_err[value.Value, str](v2)) { ret 1; }
+
+    if (R.is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+
+    if (t_count(?env, false, false, VC_BITCAST_CLASS) != 0) { ret 1; }
     ret 0;
 }
 
