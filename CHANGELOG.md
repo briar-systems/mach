@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.11.0] - 2026-08-07
+
+Closes out the import-attribution work, makes `mach build` and `mach test` agree about whether a project compiles, and stops the linker emitting debug info it has invalidated.
+
+### Fixed
+- **`mach build` silently skipped modules unreachable from an artifact entry** (#2539), so a module under `src` that nothing imported was never checked and a broken one stayed green indefinitely. `mach test` roots its load at the whole source tree and did check it, so the two commands disagreed about whether the project compiled, which is the part that erodes trust in a green build. Resolve and sema now walk every module under `src`; lower, codegen, emit and link still walk only the reachable prefix, so an unreferenced module costs no object code and does not enter the artifact. The cost falls on the front end, which is the cheap half.
+- **A `[step]` writing into the module object tree silently clobbered compiled modules** (#2532). `{project.out}/obj/<project.id>/` is where a project's own modules land, and a vendored library whose sources share those names overwrote them, or was overwritten, with the link proceeding on whatever survived. It produced a runtime failure that looked exactly like a miscompilation. Declared step outputs are now validated at manifest load, and undeclared writes into the tree are caught after the step runs.
+- **A foreign Mach-O object's DWARF was merged without remapping its unrelocated cross-section offsets** (#2540). The damage was worse than shifted offsets: `.debug_abbrev` is deduplicated across contributors, which is correct where every module's table is byte-identical, but for a foreign unit it substitutes a **different producer's table**. The linker now leaves out the debug sections of a module that does not reference its own DWARF through relocations, keyed on that property rather than on the format, so a foreign ELF object still merges on its own evidence. Two hand-built fixtures turned out not to be representative of a real mach object and were corrected rather than the rule being loosened around them.
+- **A target-conditional `#[library]` attribution bound to the arm the target does not take** (#2639). Attributions were projected before any arm was selected, so the last arm walked won. Loud when the losing arm's library is absent, and silent when both are present, where the import is simply attributed to the wrong library.
+- **A manifest `symbols = [...]` claim keyed on the source spelling while `#[library]` keyed on the link name** (#2636), so on Mach-O the two occupied disjoint key spaces: a claim attributed nothing, the link failed with the very error the claim exists to prevent, and the claim-vs-decorator conflict check could not fire at all. Found by the darwin release gate.
+
+### Added
+- **spirv: interface variables and descriptors** (#2571, partial) — `Input`/`Output`/`Uniform` storage classes with `Location`, `BuiltIn`, `DescriptorSet` and `Binding` decorations, validator-clean. A vertex stage reading a `Location` input and writing `BuiltIn Position` works end to end. Reading a **member** of a uniform block is refused: MIR folds an aggregate walk into a byte displacement and `OpAccessChain` needs the ordinal, which an offset does not determine because unions overlap and nested aggregates share offsets. Filed as #2649, and #2571 stays open on it.
+
+### Changed
+- mach-std advanced to **0.24.2** (#2651, #2652). `O_DIRECTORY` had been given `O_DIRECT`'s value on riscv64, so `fs.read_dir` could not open a directory there at all, which is what blocked #2539: front-ending every module makes the compiler enumerate a source tree, and the riscv64 self-host case is the only place a riscv64-hosted compiler runs. The first correction over-generalised and broke aarch64, which swaps the two flags relative to asm-generic; **this repo's native aarch64 leg caught that immediately**, and 0.24.2 restores it.
+
 ## [4.10.0] - 2026-08-07
 
 Repairs two defects shipped in 4.9.0, one of them a regression, and lands a large `Result` codegen win, declared clobbers for raw inline-asm encodings, and the first three layers of the SPIR-V backend.

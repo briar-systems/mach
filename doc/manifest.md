@@ -456,7 +456,7 @@ the same entries, so nothing behaves differently as a dependency.
 | `name`    | shape | Library/framework name — required for `source = "system"`/`"framework"`, forbidden for `"local"`. |
 | `path`    | shape | File path — required for `source = "local"`, forbidden otherwise. A template (see below). |
 | `library` | no | Stable logical name used by `#[library("...")]`; defaults to the `[link.<name>]` table name. |
-| `symbols` | no | Array of symbol names this dependency provides, attributing imports that have no `ext` declaration to decorate (see below). Omit for none. |
+| `symbols` | no | Array of symbol names this dependency provides, attributing imports that have no `ext` declaration to decorate (see below). Written as **source-level** names; the target's C symbol prefix is applied by Mach. Omit for none. |
 | `os`      | yes | Filter axis: a canonical `os` value, `"*"` (any), an array of values, or `[]` (none). |
 | `isa`     | yes | Filter axis over `isa`, same forms. |
 | `abi`     | yes | Filter axis over `abi`, same forms. |
@@ -499,6 +499,16 @@ isa     = "*"
 abi     = "*"
 export  = true
 ```
+
+Each name is written the way you would write it in **source**, without the
+target's C symbol prefix. Mach applies that prefix itself, exactly as it does for
+an `ext fun` declaration, so `symbols = ["Sleep"]` attributes the `Sleep` a Linux
+or Windows object names and the `_Sleep` a Mach-O object names, and one manifest
+is correct on every target. The prefix is only ever added, never stripped: `_exit`
+is a real C symbol whose Mach-O object spelling is `__exit`, so "already
+prefixed" is not something a spelling can be checked for. Writing the mangled
+form yourself therefore does not work — on darwin `symbols = ["_Sleep"]` claims
+`__Sleep`, which nothing imports.
 
 Nothing reads a library's export table to derive this, so the claim is what makes
 cross-linking a PE from a Linux host work with no target DLL present. Claims
@@ -570,6 +580,25 @@ it does not depend on whether `dep/<alias>` is a directory or a local-path symli
 nor on the directory from which the consumer was invoked. An ordinary relative
 consumer root (including `./` segments) and its normalized absolute spelling produce
 the same expanded command and cache key.
+
+**The module object tree is reserved.** `{project.out}/obj/<project.id>/` belongs
+to the compiler: every module of the project compiles to one object in it, named
+after the module's path (`src/window.mach` in project `glfw` becomes
+`{project.out}/obj/glfw/window.o`). A step that writes there collides with those
+objects by name, and because the link takes whichever file survived, the result is
+a binary that is subtly wrong rather than a build that fails.
+
+A step output is therefore rejected in that subtree. A declared `out` inside it
+fails at manifest load, naming the step and the path, before any step runs. A step
+that writes an object there without declaring it is caught after it runs, with the
+same message — this covers the common case of a vendored `make` dropping every
+object it built into the output directory.
+
+Pick any other subtree of `{project.out}`. The conventional choice for a vendored
+library is a directory named after the library rather than after the project, e.g.
+`{project.out}/obj/miniaudio/` for a project whose own id is `audio`; note that
+this only stays clear of the reserved tree while the two names differ, so prefer a
+distinct sibling such as `{project.out}/vendor/<library>/`.
 
 **Target environment.** Every step process additionally inherits the active
 build cell's target tuple as `MACH_TARGET_ISA`, `MACH_TARGET_OS`, and

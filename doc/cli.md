@@ -249,8 +249,9 @@ Two declarations supply it:
 
 - `#[library("name")]` on an `ext` declaration, for a symbol your Mach source
   declares. See [language/ext-fun.md](language/ext-fun.md#library-attribution).
-- `symbols = [...]` on a `[link.X]` entry, for a symbol your source never
-  declares — the Win32 or system references a **static archive leaves
+- `symbols = [...]` on a `[link.X]` entry, written as **source-level** names (the
+  target's C symbol prefix is applied by Mach, so one spelling is right on every
+  target), for a symbol your source never declares — the Win32 or system references a **static archive leaves
   undefined**. Merging an `.a` pulls in its members' undefined symbols, and those
   have no Mach declaration to decorate, so the providing library is named in the
   manifest instead. See [manifest.md](manifest.md#linkname--link-requirements).

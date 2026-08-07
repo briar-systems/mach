@@ -64,6 +64,7 @@ fwd project.TargetEntry;
 fwd project.MODE_LIBRARY;
 fwd project.TARGET_OPT_RELEASE;
 fwd project.dnit_project;
+fwd project.link_name_for;
 
 # the union-build entry-count helper, re-exported so `mach test` / tooling
 # consumers keep spelling it as `driver.count_target_gated`
@@ -133,7 +134,7 @@ pub fun build_project(s: *session.Session, project_root: str, target_name: str) 
 # entries the build engine dispatches individually run here in sequence, so a
 # non-engine flow and an engine unit execute identical pieces.
 fun build_project_impl(s: *session.Session, project_root: str, sel: *manifest.Selection, m: *manifest.Manifest, req: *request.BuildRequest, for_union: bool, all_own_src: bool, run_steps: bool) R.Result[project.Project, outcome.Fail] {
-    val begin_r: R.Result[project.Project, outcome.Fail] = begin_build_impl(s, project_root, sel, m, req, nil, for_union, all_own_src);
+    val begin_r: R.Result[project.Project, outcome.Fail] = begin_build_impl(s, project_root, sel, m, req, nil, for_union, all_own_src, all_own_src);
     if (R.is_err[project.Project, outcome.Fail](begin_r)) { ret begin_r; }
     var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](begin_r);
 
@@ -184,11 +185,19 @@ pub fun begin_build(s: *session.Session, m: *manifest.Manifest, req: *request.Bu
     sel.artifact     = req.artifact;
     sel.want_lib     = req.want_lib;
     sel.has_artifact = !str_empty(req.artifact);
-    ret begin_build_impl(s, req.project_root, ?sel, m, req, ev, false, request.test_goal(req.goal));
+    # every engine build front-ends the whole source tree, so `mach build` and
+    # `mach test` agree on whether the project compiles (#2539). `is_test` stays the
+    # narrower fact - it picks the link surface and the back-end work set.
+    ret begin_build_impl(s, req.project_root, ?sel, m, req, ev, false, request.test_goal(req.goal), true);
 }
 
 # the shared open: init + query binding + config synthesis + target entry
-fun begin_build_impl(s: *session.Session, project_root: str, sel: *manifest.Selection, m: *manifest.Manifest, req: *request.BuildRequest, ev: *readout.Progress, for_union: bool, all_own_src: bool) R.Result[project.Project, outcome.Fail] {
+#
+# `is_test` selects the `mach test` link surface (the union of every artifact's
+# libs); `all_own_src` loads every own-source module as a load root. They are
+# independent: a `mach build` loads the whole tree to check it while still linking
+# one artifact.
+fun begin_build_impl(s: *session.Session, project_root: str, sel: *manifest.Selection, m: *manifest.Manifest, req: *request.BuildRequest, ev: *readout.Progress, for_union: bool, is_test: bool, all_own_src: bool) R.Result[project.Project, outcome.Fail] {
     var p: project.Project;
     project.init_project(?p, s);
     p.events      = ev;
@@ -206,7 +215,7 @@ fun begin_build_impl(s: *session.Session, project_root: str, sel: *manifest.Sele
     # synthesis directly; a legacy entry reads the conventional <root>/mach.toml.
     var cfg_r: R.Result[bool, str];
     if (m != nil) {
-        cfg_r = dcfg.load_config_manifest(?p, project_root, m, sel, for_union, all_own_src);
+        cfg_r = dcfg.load_config_manifest(?p, project_root, m, sel, for_union, is_test);
     }
     or {
         val mp_r: R.Result[str, str] = load.join_path(s.alloc, project_root, manifest.MANIFEST_FILE);
@@ -215,7 +224,7 @@ fun begin_build_impl(s: *session.Session, project_root: str, sel: *manifest.Sele
             ret R.err[project.Project, outcome.Fail](outcome.user(R.unwrap_err[str, str](mp_r)));
         }
         val manifest_path: str = R.unwrap_ok[str, str](mp_r);
-        cfg_r = dcfg.load_project_config(?p, project_root, manifest_path, sel, for_union, all_own_src);
+        cfg_r = dcfg.load_project_config(?p, project_root, manifest_path, sel, for_union, is_test);
         str_free(s.alloc, manifest_path);
     }
     if (R.is_err[bool, str](cfg_r)) {
@@ -348,16 +357,25 @@ pub fun run_load_phase(p: *project.Project) R.Result[bool, outcome.Fail] {
         ei = ei + 1;
     }
 
-    # test builds root collection at the whole source tree, not the entrypoint's
-    # import closure, so a `pub` module with no in-tree `use` consumer still has
-    # its tests collected (#1863). dfs_load dedups by FQN, so this only adds the
-    # modules the entry/union walks missed.
+    # the artifact closure is settled: everything loaded so far is what this build
+    # emits and links, and the whole-source sweep below only appends past it (#2539).
+    p.emit_len = p.topo_len;
+
+    # root the load at the whole source tree, not the entrypoint's import closure,
+    # so a `pub` module with no in-tree `use` consumer is still checked (#2539) and
+    # still has its tests collected (#1863). dfs_load dedups by FQN, so this only
+    # adds the modules the entry/union walks missed.
     if (p.all_own_src) {
         val allsrc_r: R.Result[bool, str] = union.load_all_own_src(p);
         if (R.is_err[bool, str](allsrc_r)) {
             ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](allsrc_r)));
         }
     }
+
+    # a test dispatcher links every module in the tree, so the back-end work set is
+    # the whole topo order rather than one artifact's closure.
+    if (passes.test_build(p)) { p.emit_len = p.topo_len; }
+
     readout.phase_end(p.events, readout.PH_LOAD, p.topo_len, "module", "modules");
 
     # the module table is stable past the load pass; publish every module's
@@ -395,13 +413,6 @@ pub fun run_load_phase(p: *project.Project) R.Result[bool, outcome.Fail] {
     val exp_r: R.Result[bool, str] = union.register_export_names(p);
     if (R.is_err[bool, str](exp_r)) {
         ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](exp_r)));
-    }
-
-    # project `#[library(...)]` attributions onto link-name keys now that every
-    # import's final link name (`#[symbol]` override or bare `ext` name) is settled.
-    val imp_r: R.Result[bool, str] = union.register_import_libraries(p);
-    if (R.is_err[bool, str](imp_r)) {
-        ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](imp_r)));
     }
 
     ret R.ok[bool, outcome.Fail](true);

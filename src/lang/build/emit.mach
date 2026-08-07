@@ -43,6 +43,7 @@ use mach.lang.manifest;
 use mach.lang.me.ir;
 use mach.lang.me.ir.printer;
 use mach.lang.session;
+use mach.lang.target;
 use mach.lang.target.of;
 use mach.lang.target.of.ar;
 use mach.lang.target.os;
@@ -375,7 +376,7 @@ fun collect_defined_globals(p: *driver.Project, img: *of.ObjectImage, member: *a
 # out_path: receives the owned archive path on success
 # ret:      ok(true) on success, or the failure as a Fail
 pub fun emit_static_archive(p: *driver.Project, unit: *plan.BuildUnit, images: *of.ObjectImage, paths: **u8, out_path: **u8) R.Result[bool, outcome.Fail] {
-    val len: u32 = p.topo_len;
+    val len: u32 = p.emit_len;
 
     val archive: str = unit.out_path;
     if (O.is_some[str](ensure_parents(p.alloc, archive))) {
@@ -493,9 +494,9 @@ pub fun link_executable(p: *driver.Project, paths: **u8, len: u32,
 # ---
 # p:      the project carrying the topo order and allocator
 # images: the per-module object images, indexed by module id
-# ret:    an owned topo-ordered image array (length `p.topo_len`), or an error
+# ret:    an owned topo-ordered image array (length `p.emit_len`), or an error
 fun gather_topo_images(p: *driver.Project, images: *of.ObjectImage) R.Result[*of.ObjectImage, str] {
-    val len: u32 = p.topo_len;
+    val len: u32 = p.emit_len;
     val res_ord: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](p.alloc, len::usize);
     if (R.is_err[*of.ObjectImage, str](res_ord)) { ret res_ord; }
     val ordered: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](res_ord);
@@ -529,8 +530,8 @@ pub fun link_flat_images(p: *driver.Project, images: *of.ObjectImage, exe_path: 
 
     val ctx: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
     val res_link: R.Result[bool, str] =
-        linker.link_images(p.s, ?p.target, ordered, p.topo_len, nil::*of.DynLib, 0, exe_path, artifact_product_name(p), linker.LINK_EXE, ctx.req.pie, image_options);
-    A.deallocate[of.ObjectImage](p.alloc, ordered, p.topo_len::usize);
+        linker.link_images(p.s, ?p.target, ordered, p.emit_len, nil::*of.DynLib, 0, exe_path, artifact_product_name(p), linker.LINK_EXE, ctx.req.pie, image_options);
+    A.deallocate[of.ObjectImage](p.alloc, ordered, p.emit_len::usize);
     if (R.is_err[bool, str](res_link)) {
         ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](res_link)));
     }
@@ -567,9 +568,9 @@ pub fun link_mixed_images(p: *driver.Project, images: *of.ObjectImage,
 
     val ctx: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
     val res_link: R.Result[bool, str] =
-        linker.link_mixed(p.s, ?p.target, ordered, p.topo_len, ext_paths, ext_count,
+        linker.link_mixed(p.s, ?p.target, ordered, p.emit_len, ext_paths, ext_count,
                           dynlibs, dynlib_len, exe_path, artifact_product_name(p), linker.LINK_EXE, ctx.req.pie, image_options);
-    A.deallocate[of.ObjectImage](p.alloc, ordered, p.topo_len::usize);
+    A.deallocate[of.ObjectImage](p.alloc, ordered, p.emit_len::usize);
     if (R.is_err[bool, str](res_link)) {
         ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](res_link)));
     }
@@ -906,7 +907,18 @@ fun resolve_and_store_input(p: *driver.Project, req: *manifest.LinkRequirement,
 fun register_link_claims(p: *driver.Project, req: *manifest.LinkRequirement) R.Result[bool, outcome.Fail] {
     var i: u32 = 0;
     for (i < req.symbol_count) {
-        val sym: intern.StrId = req.symbols[i];
+        # a claim is written in `mach.toml` as a SOURCE-level name, so it is put
+        # through the same prefix rule a declaration's link name goes through
+        # before it is registered. registering it verbatim keyed the two
+        # attribution routes on different spellings, which diverge wherever the
+        # target has a C symbol prefix: on Mach-O a `symbols = ["Sleep"]` claim
+        # registered `Sleep` while the linker asked for `_Sleep`, so the claim
+        # attributed nothing and could not conflict with a decorator (#2636)
+        val ln: R.Result[intern.StrId, str] = driver.link_name_for(p, req.symbols[i]);
+        if (R.is_err[intern.StrId, str](ln)) {
+            ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[intern.StrId, str](ln)));
+        }
+        val sym: intern.StrId = R.unwrap_ok[intern.StrId, str](ln);
         val prev: O.Option[intern.StrId] = session.import_library(p.s, sym);
         if (O.is_some[intern.StrId](prev)) {
             val had: intern.StrId = O.unwrap[intern.StrId](prev);
@@ -925,24 +937,35 @@ fun register_link_claims(p: *driver.Project, req: *manifest.LinkRequirement) R.R
     ret R.ok[bool, outcome.Fail](true);
 }
 
-# a claim reaches the linker as an attribution, an identical re-claim is tolerated
-# (the export cascade re-walks a requirement the project also names itself), and a
-# contradicting claim is refused rather than resolved by order
+# a claim reaches the linker as an attribution under the TARGET's link spelling,
+# an identical re-claim is tolerated (the export cascade re-walks a requirement
+# the project also names itself), and a contradicting claim is refused rather
+# than resolved by order
+#
+# Both targets are exercised from one claim string. Every earlier claim test ran
+# on a format whose C symbol prefix is empty, where the manifest spelling and the
+# link name coincide, so none of them could see #2636: on Mach-O the claim
+# registered `Sleep` while the linker asked for `_Sleep`, and the claim
+# attributed nothing at all.
 test "mach.lang.build.emit.register_link_claims:pins_and_rejects_conflicts" {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }
     val sr: R.Result[session.Session, str] = session.init(?alloc);
     if (R.is_err[session.Session, str](sr)) { ret 1; }
     var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { session.dnit(?s); ret 1; }
 
     var p: driver.Project;
     p.s = ?s;
     p.alloc = ?alloc;
 
-    val sym_r:  R.Result[intern.StrId, str] = intern.intern(?s.interner, "Sleep");
-    val k32_r:  R.Result[intern.StrId, str] = intern.intern(?s.interner, "kernel32");
-    val u32_r:  R.Result[intern.StrId, str] = intern.intern(?s.interner, "user32");
-    if (R.is_err[intern.StrId, str](sym_r) || R.is_err[intern.StrId, str](k32_r)
+    val sym_r:   R.Result[intern.StrId, str] = intern.intern(?s.interner, "Sleep");
+    val pre_r:   R.Result[intern.StrId, str] = intern.intern(?s.interner, "_Sleep");
+    val k32_r:   R.Result[intern.StrId, str] = intern.intern(?s.interner, "kernel32");
+    val u32_r:   R.Result[intern.StrId, str] = intern.intern(?s.interner, "user32");
+    if (R.is_err[intern.StrId, str](sym_r) || R.is_err[intern.StrId, str](pre_r)
+        || R.is_err[intern.StrId, str](k32_r)
         || R.is_err[intern.StrId, str](u32_r)) { session.dnit(?s); ret 1; }
     var syms: [1]intern.StrId;
     syms[0] = R.unwrap_ok[intern.StrId, str](sym_r);
@@ -955,8 +978,13 @@ test "mach.lang.build.emit.register_link_claims:pins_and_rejects_conflicts" {
     req.symbol_count = 1;
 
     var code: i32 = 0;
-    if (R.is_err[bool, outcome.Fail](register_link_claims(?p, ?req))) { code = 1; }
 
+    # a target with no C symbol prefix: manifest spelling and link name coincide
+    val lr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (R.is_err[target.Target, str](lr)) { session.dnit(?s); ret 1; }
+    p.target = R.unwrap_ok[target.Target, str](lr);
+
+    if (R.is_err[bool, outcome.Fail](register_link_claims(?p, ?req))) { code = 1; }
     val got: O.Option[intern.StrId] = session.import_library(?s, syms[0]);
     if (!O.is_some[intern.StrId](got) || O.unwrap[intern.StrId](got) != req.library) { code = 1; }
 
@@ -966,6 +994,24 @@ test "mach.lang.build.emit.register_link_claims:pins_and_rejects_conflicts" {
     # a second entry claiming the same symbol for a different library is refused
     var other: manifest.LinkRequirement = req;
     other.library = R.unwrap_ok[intern.StrId, str](u32_r);
+    if (R.is_ok[bool, outcome.Fail](register_link_claims(?p, ?other))) { code = 1; }
+
+    # Mach-O: the SAME manifest spelling must register under `_Sleep`, the name
+    # the linker looks the attribution up under, and must not register the bare
+    # source spelling, which nothing would ever ask for
+    session.reset_module_registry(?s);
+    val dr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "darwin", "sysv64");
+    if (R.is_err[target.Target, str](dr)) { session.dnit(?s); ret 1; }
+    p.target = R.unwrap_ok[target.Target, str](dr);
+
+    if (R.is_err[bool, outcome.Fail](register_link_claims(?p, ?req))) { code = 1; }
+    val dgot: O.Option[intern.StrId] =
+        session.import_library(?s, R.unwrap_ok[intern.StrId, str](pre_r));
+    if (!O.is_some[intern.StrId](dgot) || O.unwrap[intern.StrId](dgot) != req.library) { code = 1; }
+    if (O.is_some[intern.StrId](session.import_library(?s, syms[0]))) { code = 1; }
+
+    # and the conflict check still fires there, which it could not while the two
+    # routes occupied disjoint key spaces
     if (R.is_ok[bool, outcome.Fail](register_link_claims(?p, ?other))) { code = 1; }
 
     session.dnit(?s);
@@ -1040,13 +1086,13 @@ test "mach.lang.build.emit.static_path_present:deduplicates_exact_paths" {
 # ret:       ok(true) on success, or the failure as a Fail
 pub fun write_objects(p: *driver.Project, images: *of.ObjectImage,
                       obj_base: *u8, paths_out: ***u8) R.Result[bool, outcome.Fail] {
-    val len: u32 = p.topo_len;
+    val len: u32 = p.emit_len;
     val res_paths: R.Result[**u8, str] = A.allocate[*u8](p.alloc, len::usize);
     if (R.is_err[**u8, str](res_paths)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
     val paths: **u8 = R.unwrap_ok[**u8, str](res_paths);
 
     var i: u32 = 0;
-    for (i < p.topo_len) {
+    for (i < p.emit_len) {
         val mid: session.ModuleId   = p.topo[i];
         val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
 
