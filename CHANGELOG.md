@@ -5,9 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [4.15.0] - 2026-08-07
 
 ### Added
+
+#### A vector narrower than the vector register works (#2697)
+`f32x3` and every other sub-register-width shape were refused by name, because codegen could not carry one. `op_width_of` answered a **single number** for two different questions, a value's register width and its memory footprint. Those coincide while every vector is exactly 16 bytes, and stop coinciding the moment a lane-derived layout makes one 12. A 12-byte vector truncated to 8 on a move, and carrying it at the register width instead overran its slot and clobbered the next field.
+
+The two questions are now separate. The hole was never "non-power-of-two" as first supposed: it is any size **strictly between the target's general-purpose register width and 16**, which is a target-dependent range rather than a property of the number.
+
+So `rec Vertex { pos: f32x3; uv: f32x2; }` is genuinely **20 bytes**, and `[N]Vertex` is a real vertex buffer rather than a padded array indistinguishable from one built on `f32x4`.
+
+**A sub-width vector cannot yet cross a function boundary.** Passing or returning one is a clean refusal naming the ABI classifier, not a miscompile. #2687 carries that half.
+
+#### A project can declare the toolchain it needs (#2714)
+A manifest could not say which compiler it required, so a project using a feature added last week failed on an older toolchain with an ordinary parse error pointing at the feature rather than at the version. `[project].mach` takes a semver minimum, validated when the manifest is read:
+
+```toml
+[project]
+mach = "4.15.0"
+```
+
+Checked for the root project and for every dependency, so a dependency that outgrows the running compiler says so in its own name rather than failing somewhere in its source.
 
 #### `#[packed]`, a record laid out with no padding (#2715)
 `#[align(N)]` only ever raises alignment, and nothing did the inverse, so any shape whose layout is decided elsewhere — a C struct, a file header, a wire frame, a vertex whose stride the buffer fixes — could not be described as a record at all. `#[packed]` on a `rec` or `uni` places every field immediately after the previous one, adds no tail padding, and takes no alignment from its fields.
@@ -74,6 +93,13 @@ $each f in $fields(Node) {
 Termination is the caller's problem and is stated as such: unlike the by-value walk of #2691, following references does not terminate structurally, since `rec Grow[T] { p: *Grow[*T]; }` has unboundedly many instances reachable through its pointer.
 
 ### Fixed
+
+#### An inline-asm `{name}` operand ran out of reach in a large frame (#2689)
+A `{name}` binding was addressed frame-pointer-relative, and on aarch64 the addressing form's immediate range gave it a reach of **sixteen** slots. A function with a larger frame, or one an inliner had grown, refused to encode. riscv64 had the same limit at 128 slots. x86-64 had none, which is why it went unnoticed.
+
+The reach was not the real defect. The interface itself said *frame-pointer-relative*, freezing one target's addressing choice into the contract every target reads, when which base a `{name}` uses is part of the addressing decision and only the target knows which of its forms reaches. aarch64 and riscv64 now measure from the stack pointer, x86-64 keeps the frame pointer, and asm-bound slots moved to the bottom of the slot region so what separates a `{name}` from its base is the callee-save and outgoing-argument areas, bounded by the ABI rather than by the function.
+
+**New refusal:** an inline-asm body that binds a `{name}` may not write the stack pointer, on targets that measure from it. The displacement is taken once at block entry, so the pointer must still be where it was. The whole block is judged rather than a prefix, because a backward branch reaches an earlier `{name}` again with the moved pointer. Move the stack adjustment out of the block, or drop the `{name}` and stage the address into a register.
 
 #### Field stores went through a second layout policy that no decorator could reach (#2715)
 `mir.lower_ir`'s `struct_field_offset` re-derived every field offset with its own `round_up` over each field's alignment, rather than calling `ir_type.byte_offset` like every other offset consumer. So a `#[packed]` record reported correct `$size_of`, `$align_of` and `$offset_of` — those go through the shared layout policy — while the code that actually **read and wrote the fields** placed them at the **natural** offsets, and nothing errored. A record whose fields fit its packed size wrote its last field past the end of its own storage.
