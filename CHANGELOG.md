@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+#### `#[packed]`, a record laid out with no padding (#2715)
+`#[align(N)]` only ever raises alignment, and nothing did the inverse, so any shape whose layout is decided elsewhere — a C struct, a file header, a wire frame, a vertex whose stride the buffer fixes — could not be described as a record at all. `#[packed]` on a `rec` or `uni` places every field immediately after the previous one, adds no tail padding, and takes no alignment from its fields.
+
+It **composes** with `#[align]` rather than conflicting: packed decides padding, align decides the record's own alignment. It is **not transitive**, matching C — an inner record keeps its own internal padding and is merely *placed* without any, which is the rule that composes and the one a reader is most likely to assume wrongly.
+
+Three refusals, and one of them turned out to be two:
+
+- **The address of a packed field.** `?r.b` would yield a `*u32`, which states alignment 4 to everything downstream while the storage has none. The access is fine; the pointer *type* is what is untrue, and it travels. The predicate walks the whole access chain, so `?r.arr[0]`, `?r.inner.x` and `?p.b` through a `*Packed` are refused too. `?r` on the whole record stays legal — a `*Packed` describes an align-1 pointee correctly. Fail-closed on purpose: refusing is relaxable once alignment can ride in a pointer type, permitting is not tightenable.
+- **Atomics on a packed field**, which needed no rule of its own. Atomics are not a language surface in mach — `std.sync.atomic` is ordinary functions over `*i64` — so a pointer is the only route an atomic has to a field, and the address-of rule already refuses to hand one out. Pinned as an `int` case so the coupling fails loudly if atomics ever become an intrinsic over an lvalue.
+- **Vector fields**, including through an array or a nested record, with the diagnostic naming #2687. A sequencing decision, not a permanent rule.
+
+Also refused on a `#[uniform]` / `#[storage]` interface block, whose member offsets are fixed by std140 / std430.
+
+**riscv64 gets a written claim rather than a green tick.** Unaligned access there is permitted-but-may-trap and Linux emulates a trapping one in the kernel, so a packed field access is expected to be correct and pathologically slow. That cost cannot be measured under qemu-user, which emulates the misaligned load directly and never takes the kernel path. The decorator docs say so rather than leaving a passing correctness leg to be read as a usability result.
+
+### Fixed
+
+#### Field stores went through a second layout policy that no decorator could reach (#2715)
+`mir.lower_ir`'s `struct_field_offset` re-derived every field offset with its own `round_up` over each field's alignment, rather than calling `ir_type.byte_offset` like every other offset consumer. So a `#[packed]` record reported correct `$size_of`, `$align_of` and `$offset_of` — those go through the shared layout policy — while the code that actually **read and wrote the fields** placed them at the **natural** offsets, and nothing errored. A record whose fields fit its packed size wrote its last field past the end of its own storage.
+
+Found by an `int` case whose golden is a **byte image** rather than a set of intrinsics. Pinning `$size_of` / `$offset_of` proves only that the compiler agrees with itself; the bytes are what a C struct or a wire frame is actually compared against. The duplicate walk is deleted — there is now one layout policy, so a future layout decorator cannot be taught to half the compiler.
+
 ## [4.14.0] - 2026-08-07
 
 ### Added
