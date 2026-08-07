@@ -345,6 +345,10 @@ macho_objdump() {
 # the initialized local slot must be rebased, while the zero-on-disk import slot
 # must bind ___stderrp to libSystem. On the native Intel macOS leg the same PIE is
 # also executed and its values compared byte-for-byte with the runtime contract.
+#
+# The two non-relaxable local signatures (GOT32 / GOT64) carry a `movq (%rax), %rax`
+# the import ones do not: X86_64_RELOC_GOT resolves to the slot address, so reading
+# the local int takes two loads where testing the imported pointer takes one (#2586).
 produce_macho_got() {
     target=$2
     bin=$3
@@ -385,8 +389,9 @@ produce_macho_got() {
                     b[i+15] == 192) {
                     ni++; vi = pc + 7 + s32(i + 3)
                 }
-                if (i + 9 <= n && b[i] == 72 && b[i+1] == 141 && b[i+2] == 5 &&
-                    b[i+7] == 139 && b[i+8] == 0 && b[i+9] == 195) {
+                if (i + 12 <= n && b[i] == 72 && b[i+1] == 141 && b[i+2] == 5 &&
+                    b[i+7] == 72 && b[i+8] == 139 && b[i+9] == 0 &&
+                    b[i+10] == 139 && b[i+11] == 0 && b[i+12] == 195) {
                     gl++; vgl = pc + 7 + s32(i + 3)
                 }
                 if (i + 17 <= n && b[i] == 72 && b[i+1] == 141 && b[i+2] == 5 &&
@@ -395,10 +400,11 @@ produce_macho_got() {
                     b[i+15] == 182 && b[i+16] == 192 && b[i+17] == 195) {
                     gi++; vgi = pc + 7 + s32(i + 3)
                 }
-                if (i + 22 <= n && b[i] == 72 && b[i+1] == 184 && b[i+10] == 72 &&
+                if (i + 25 <= n && b[i] == 72 && b[i+1] == 184 && b[i+10] == 72 &&
                     b[i+11] == 141 && b[i+12] == 13 && b[i+13] == 249 && b[i+14] == 255 &&
                     b[i+15] == 255 && b[i+16] == 255 && b[i+17] == 72 && b[i+18] == 1 &&
-                    b[i+19] == 200 && b[i+20] == 139 && b[i+21] == 0 && b[i+22] == 195) {
+                    b[i+19] == 200 && b[i+20] == 72 && b[i+21] == 139 && b[i+22] == 0 &&
+                    b[i+23] == 139 && b[i+24] == 0 && b[i+25] == 195) {
                     g64++; vg64 = pc + 10 + s64(i + 2)
                 }
             }

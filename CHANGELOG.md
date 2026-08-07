@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.7.1] - 2026-08-07
+
+A correctness release for the toolchain itself. Debug information no longer
+changes the code that is generated, the CI seed resolves from a published
+release rather than whatever the client considers newest, and the Windows
+resource case that had never built now executes on real Windows.
+
+### Fixed
+- link: relocations sourced from debug sections no longer feed the atom
+  liveness index, so a DWARF reference reaching across a duplicate weak
+  function body can no longer keep that body alive. Building with and without
+  `-g` now emits identical `PT_LOAD` segments (#2572, #2577).
+- infra: the CI seed resolves through the latest published release, so a draft
+  or partially uploaded release can no longer become the seed for every lane.
+  Seed resolution lives in one composite action instead of nine call sites
+  (#2573, #2574).
+- int: `surface/pe-resources-native` declares the required `need` key. The case
+  had never built, so PE resource emission shipped in 4.7.0 with no executing
+  coverage. It now runs on the Windows leg (#2579, #2580).
+
+### Known issues
+- `[step]` build steps cannot execute on a native Windows host. Program
+  resolution and `cmd.exe` argument quoting are both wrong (#2578, #2587).
+- the darwin x86_64 integration case for GOT indirection fails, because the
+  case's own hand-written assembly dereferences a non-relaxable GOT slot once
+  where two loads are required. The linker's GOT emission is correct at every
+  relocation form and its output is byte-identical once the case is corrected,
+  so this is a test defect rather than a compiler one. It does mean the Mach-O
+  x64 GOT support added in 4.7.0 has not yet been executed on darwin (#2586).
+
 ## [4.7.0] - 2026-08-06
 
 Adds compile-time file embedding, Windows executable resources, and PE subsystem
