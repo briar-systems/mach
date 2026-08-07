@@ -284,8 +284,13 @@ enumerates.
 ## Types
 
 Compiler-seeded primitives (the complete set): `u8 u16 u32 u64`,
-`i8 i16 i32 i64`, `f32 f64`, and the untyped pointer `ptr`. SIMD vector names
-(`f32x4` …) are a planned design and **do not resolve as types yet**.
+`i8 i16 i32 i64`, `f32 f64`, and the untyped pointer `ptr`.
+
+Ten 128-bit SIMD vector types are also seeded: `f32x4 f64x2`, `i8x16 i16x8
+i32x4 i64x2`, and `u8x16 u16x8 u32x4 u64x2` — a single `x`, no other shapes.
+Literals are full-arity (`f32x4{1.0, 2.0, 3.0, 4.0}`), lane access `v[i]` takes
+a comptime-constant index, and the operators apply lane-wise with a comparison
+producing a same-shape unsigned mask. See `doc/language/types.md`.
 
 ```mach
 *T                  # pointer          ?x address-of, @p dereference
