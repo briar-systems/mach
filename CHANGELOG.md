@@ -18,6 +18,17 @@ The refusal itself is unchanged. Its diagnostic and `doc/language/decorators.md`
 
 ### Fixed
 
+#### Every SPIR-V operation on a sub-width vector was mistyped (#2743)
+A vector narrower than 128 bits reached the SPIR-V target correctly as a type and was computed on as if it had four lanes. `fun add3(a: f32x3, b: f32x3) f32x3 { ret a + b; }` built with no diagnostic and emitted `OpFAdd %v4float` inside a function declared `%v3float`, which the Khronos validator rejects. Arithmetic, bitwise, comparison-to-mask and lane writes were all affected, on every shape that is not exactly one 128-bit register, and a vector literal was the single spelling that failed loudly - as an internal error with no source location, because it is the one site that counted operands.
+
+The MIR lane descriptor carried an element class and an element byte-width and **derived** the lane count as `16 / element-bytes`. That is the 128-bit assumption #2687 removed from the language, still standing in the one representation it did not reach. It is sound for the ten shapes that are 128 bits and wrong for every other one.
+
+The descriptor now carries the lane count as a supplied fact. It is a `u32` packing the class, the lane width and the count, with sixteen bits of count rather than the four a 128-bit register would need, because the hardest member is the **over**-width vector of #2727 rather than the sub-width one at hand. Its constructor takes the count positionally, so a descriptor cannot be built without one, and the IR type accessor that feeds it now reports the count alongside the class and width for the same reason - a caller holding the width but not the count is exactly the shape that invented one.
+
+**No machine target changed.** x86-64, aarch64 and riscv64 select an instruction from the lane class and width and write a whole register, so none of them ever read a lane count, and all three were correct on the bug. That is why it survived: SPIR-V is the only target that must *name* a vector type, so it is the only place the count is observable, and the eleven `int/surface/spirv-*` cases were 128-bit shapes by construction.
+
+`int/surface/spirv-vector-narrow` covers `f32x2`, `f32x3`, `i32x2` and `u32x3` through arithmetic, bitwise, compare-to-mask, lane read, lane write, construction, control flow and calls, validated by `spirv-val`. The unit test over the descriptor changed too: it asserted `16 / element-bytes` back at itself, which is how a derivation pins its own defect.
+
 #### The pinned integration lane can run (#2729)
 `int/run.sh --deps pin` stopped on the first SPIR-V case on every target, because no lock recorded a commit for `mach-shader`. The lock was not stale, it was the wrong set: the root `mach.lock` is written by `mach dep pull` from the **root manifest**, so it can only ever cover the compiler's own dependency closure, while `int` builds a larger one. Two cases declared a dep the root has no reason to.
 
