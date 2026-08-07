@@ -40,6 +40,10 @@ A decorator is written as an attribute:
 #[embed("path")]     # compile-time file embedding (val only)
 #[stage("name")]     # GPU pipeline stage; makes the function an entry point
 #[workgroup(x,y,z)]  # compute workgroup dimensions (with #[stage("compute")])
+#[input(n)]          # shader interface input at location n (global only)
+#[output(n)]         # shader interface output at location n (global only)
+#[builtin("name")]   # pipeline built-in variable (global only)
+#[uniform(set, bnd)] # descriptor-bound uniform block (global only)
 ```
 
 Decorators appear **before** the declaration they target, one per line or
@@ -408,6 +412,57 @@ stage takes the single-invocation default `(1, 1, 1)`; the dimensions are always
 declared in the emitted module, since a compute stage that does not state its
 workgroup size is not one a consumer can dispatch.
 
+### `input(n)` / `output(n)` / `builtin(str)` / `uniform(set, binding)` — shader interface
+
+A pipeline stage does not receive its inputs or return its results through a call.
+It reads and writes **module-scope variables** that the pipeline binds, and these
+four directives say which kind each variable is. They apply only to module-level
+`val` / `var` bindings, and a variable carries **exactly one** of them — the four
+are mutually exclusive.
+
+```mach
+#[input(0)]            var in_position: f32x4;
+#[output(0)]           var out_colour:  f32x4;
+#[builtin("position")] var position:    f32x4;
+
+rec Camera { view: f32x4; proj: f32x4; }
+#[uniform(0, 0)] var camera: Camera;
+```
+
+`input` and `output` number a **varying** with a location, which is how one
+stage's outputs line up with the next stage's inputs: the producer's
+`#[output(0)]` feeds the consumer's `#[input(0)]`.
+
+`builtin` names a value the pipeline supplies or consumes instead of one a
+location carries. The accepted set is closed:
+
+| Value                 | Meaning                        | Direction |
+|-----------------------|--------------------------------|-----------|
+| `"position"`          | clip-space vertex position     | written   |
+| `"point_size"`        | rasterized point size          | written   |
+| `"vertex_index"`      | index of the current vertex    | read      |
+| `"instance_index"`    | index of the current instance  | read      |
+| `"frag_coord"`        | fragment window coordinate     | read      |
+| `"global_invocation"` | compute global invocation id   | read      |
+| `"local_invocation"`  | compute local invocation id    | read      |
+| `"workgroup_id"`      | compute workgroup id           | read      |
+
+The direction is a property of the built-in, not something you restate — a stage
+writes its position and reads what the pipeline hands it — so there is no
+input/output marker to pair with `builtin`, and none that could disagree with it.
+
+`uniform` binds a read-only block by descriptor set and binding. Its type **must
+be a `rec`**: a uniform is a block with a host-visible layout, and a bare scalar
+or vector has no block layout for a pipeline to bind. The record is emitted with
+its `Block` decoration and an explicit byte offset on every member, taken from the
+same layout the rest of the compiler uses, so what the shader reads is what the
+host wrote. Wrap a single value in a one-field record.
+
+As with `#[stage(...)]`, these are accepted on every target and acted on only by a
+target that forms pipeline stages. On `spirv` each becomes an `OpVariable` in the
+matching storage class, carrying the matching decoration, and the Input and Output
+variables are named in every entry point's interface list.
+
 ## Applicability
 
 | Directive   | `fun` | `ext fun` | `val` / `var` | `rec` / `uni` |
@@ -424,6 +479,10 @@ workgroup size is not one a consumer can dispatch.
 | `embed`     |  no   |    no     |      yes      |      no       |
 | `stage`     |  yes  |    no     |      no       |      no       |
 | `workgroup` |  yes  |    no     |      no       |      no       |
+| `input`     |  no   |    no     |      yes      |      no       |
+| `output`    |  no   |    no     |      yes      |      no       |
+| `builtin`   |  no   |    no     |      yes      |      no       |
+| `uniform`   |  no   |    no     |      yes      |      no       |
 
 The `val` / `var` column is shared, but `embed` accepts only `val` — a `var`
 is refused (see [`embed`](#embedstr--compile-time-file-embedding) above).
