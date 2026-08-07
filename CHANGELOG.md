@@ -28,9 +28,12 @@ resource case that had never built now executes on real Windows.
 ### Known issues
 - `[step]` build steps cannot execute on a native Windows host. Program
   resolution and `cmd.exe` argument quoting are both wrong (#2578, #2587).
-- darwin x86_64 binaries that use GOT indirection fail native execution. The
-  Mach-O x64 GOT support added in 4.7.0 was never executed on darwin before
-  that release (#2586).
+- the darwin x86_64 integration case for GOT indirection fails, because the
+  case's own hand-written assembly dereferences a non-relaxable GOT slot once
+  where two loads are required. The linker's GOT emission is correct at every
+  relocation form and its output is byte-identical once the case is corrected,
+  so this is a test defect rather than a compiler one. It does mean the Mach-O
+  x64 GOT support added in 4.7.0 has not yet been executed on darwin (#2586).
 
 ## [4.7.0] - 2026-08-06
 
