@@ -296,18 +296,25 @@ fun-decl ::= "fun" IDENT [ generic-params ] param-list [ type ] ( block | ";" )
 param-list ::= "(" [ params ] ")"
 
 params ::= typed-name { "," typed-name } [ "," pack-param ]
+         | typed-name { "," typed-name } [ "," c-variadic ]
          | pack-param
 
 pack-param ::= IDENT ":" "..."
+c-variadic  ::= "..."
 
 typed-name ::= [ "$" ] IDENT ":" type
 ```
 
 - A trailing `name: ...` declares a **comptime variadic pack parameter**
-  (`TYPE_KIND_PACK`); it must be the last parameter. The C-style bare `...`
-  variadic-parameter marker was **removed in v2.0.0** — the parser rejects it
-  with a migration diagnostic pointing to `name: ...`. (A function *pointer
-  type* may still carry `...` for FFI; see `fun-type-params` below.)
+  (`TYPE_KIND_PACK`); it must be the last parameter.
+- A trailing **bare** `...` declares a **C-variadic** signature: the preceding
+  parameters are the fixed arity and a call may pass further arguments, placed by
+  the target's C variadic rules (see
+  [ext-fun.md](ext-fun.md#c-variadic-imports)). It is accepted only on an `ext`
+  declaration and only after at least one fixed parameter. Anywhere else it is the
+  C-style marker **removed in v2.0.0**, rejected with a migration diagnostic that
+  names both surviving forms. (A function *pointer type* also carries `...`; see
+  `fun-type-params` below.)
 - A leading `$` on a `typed-name` marks it a **comptime value parameter**.
 
 > **Divergence (parser vs. doc).** `typed-name` is shared between function
