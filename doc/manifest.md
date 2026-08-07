@@ -256,7 +256,7 @@ concern — it is controlled only by the `--emit-ir` / `--emit-asm` CLI flags (s
 
 The `vectorize` lever only ever *subtracts*. The pass it gates runs in the release
 pipeline on targets that report 128-bit vector support (SSE2 on x86-64, NEON on
-aarch64) and rewrites counted, unit-stride loops whose dependence analysis proves
+aarch64, and `OpTypeVector` on spirv) and rewrites counted, unit-stride loops whose dependence analysis proves
 independence — element-wise maps behind a runtime alias guard, and associative-exact
 integer reductions. A loop it cannot prove safe stays scalar, and a target without
 hardware vectors (riscv64) never enters the pass, so `vectorize = false` changes

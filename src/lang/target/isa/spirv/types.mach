@@ -85,6 +85,31 @@ val TAG_FLOAT: u8 = 1;  # OpTypeFloat, `a` = bit width
 val TAG_BOOL:  u8 = 2;  # OpTypeBool
 val TAG_VOID:  u8 = 3;  # OpTypeVoid
 val TAG_PTR:   u8 = 4;  # OpTypePointer, `a` = storage class, `b` = pointee id
+val TAG_VEC:   u8 = 5;  # OpTypeVector, `a` = component type id, `b` = component count
+
+# the largest component count a Shader module may give an OpTypeVector
+#
+# SPIR-V caps a vector at 2, 3, or 4 components; 8 and 16 exist only under the
+# Vector16 capability, which is a Kernel (OpenCL) feature a Shader module may not
+# declare. mach's ten seeded vector types are all 128 bits, so the four with
+# narrow lanes - `i8x16` / `u8x16` (16 lanes) and `i16x8` / `u16x8` (8 lanes) -
+# have no Shader-legal SPIR-V vector form at all, and the emitter refuses them by
+# name rather than emitting a type no consumer accepts.
+pub val MAX_VECTOR_COMPONENTS: u32 = 4;
+
+# a memoized composite constant: its result type id and the borrowed-then-copied
+# component id list
+# ---
+# type_id:   the composite's SPIR-V type id
+# parts:     owned copy of the component constant ids
+# part_count: number of components
+# id:        the allocated SPIR-V constant id
+rec CompositeKey {
+    type_id:    u32;
+    parts:      *u32;
+    part_count: u32;
+    id:         u32;
+}
 
 # the per-module type / constant memoization table
 #
@@ -93,14 +118,16 @@ val TAG_PTR:   u8 = 4;  # OpTypePointer, `a` = storage class, `b` = pointee id
 # handful of distinct types and constants, so a scan is cheaper than a hash.
 # ---
 # b:       the module builder the ids are allocated from and instructions emitted into
-# scalars: memoized scalar / pointer types
-# consts:  memoized constants
+# scalars: memoized scalar / vector / pointer types
+# consts:  memoized scalar constants
 # fns:     memoized function types
+# comps:   memoized composite (vector) constants
 pub rec TypeTable {
     b:       *spirv.Builder;
     scalars: Vector[ScalarKey];
     consts:  Vector[ConstKey];
     fns:     Vector[FnKey];
+    comps:   Vector[CompositeKey];
 }
 
 # construct an empty type table over a builder
@@ -113,6 +140,7 @@ pub fun types_init(b: *spirv.Builder) TypeTable {
     tt.scalars = vector.init[ScalarKey](b.alloc);
     tt.consts  = vector.init[ConstKey](b.alloc);
     tt.fns     = vector.init[FnKey](b.alloc);
+    tt.comps   = vector.init[CompositeKey](b.alloc);
     ret tt;
 }
 
@@ -128,9 +156,18 @@ pub fun types_dnit(tt: *TypeTable) {
         }
         i = i + 1;
     }
+    var ci: usize = 0;
+    for (ci < tt.comps.len) {
+        val ck: *CompositeKey = ?tt.comps.data[ci];
+        if (ck.parts != nil && ck.part_count > 0) {
+            A.deallocate[u32](tt.b.alloc, ck.parts, ck.part_count::usize);
+        }
+        ci = ci + 1;
+    }
     vector.dnit[ScalarKey](?tt.scalars);
     vector.dnit[ConstKey](?tt.consts);
     vector.dnit[FnKey](?tt.fns);
+    vector.dnit[CompositeKey](?tt.comps);
 }
 
 # find a cached scalar / pointer id by shape, or 0 when absent
@@ -228,6 +265,52 @@ pub fun type_void(tt: *TypeTable) u32 {
     spirv.inst(tt.b, ?tt.b.types_consts, spirv.OP_TYPE_VOID, ?ops[0], 1);
     scalar_put(tt, TAG_VOID, 0, 0, id);
     ret id;
+}
+
+# the id of the vector type of `count` lanes of `elem`, emitting it on first use
+#
+# Returns 0 for a component count no Shader module may declare, so the caller can
+# name the offending type in a diagnostic instead of emitting an OpTypeVector that
+# only a Kernel module could carry (see MAX_VECTOR_COMPONENTS).
+# ---
+# tt:    the table
+# elem:  the component type id (a scalar int or float)
+# count: the number of components
+# ret:   the OpTypeVector id, or 0 when `count` is not Shader-legal
+pub fun type_vector(tt: *TypeTable, elem: u32, count: u32) u32 {
+    if (count < 2 || count > MAX_VECTOR_COMPONENTS) { ret 0; }
+    val hit: u32 = scalar_find(tt, TAG_VEC, elem, count);
+    if (hit != 0) { ret hit; }
+    val id: u32 = spirv.alloc_id(tt.b);
+    var ops: [3]u32;
+    ops[0] = id; ops[1] = elem; ops[2] = count;
+    spirv.inst(tt.b, ?tt.b.types_consts, spirv.OP_TYPE_VECTOR, ?ops[0], 3);
+    scalar_put(tt, TAG_VEC, elem, count, id);
+    ret id;
+}
+
+# the component type and count of a vector type id
+#
+# Lets a caller holding only a vector id reach its lane type - to mint a lane
+# constant, or to type the scalar side of an extract - without carrying the shape
+# alongside the id.
+# ---
+# tt:        the table
+# id:        the type id to describe
+# out_count: receives the component count (0 when `id` is not a vector)
+# ret:       the component type id, or 0 when `id` is not a vector
+pub fun vector_shape(tt: *TypeTable, id: u32, out_count: *u32) u32 {
+    @out_count = 0;
+    var i: usize = 0;
+    for (i < tt.scalars.len) {
+        val k: *ScalarKey = ?tt.scalars.data[i];
+        if (k.id == id && k.tag == TAG_VEC) {
+            @out_count = k.b;
+            ret k.a;
+        }
+        i = i + 1;
+    }
+    ret 0;
 }
 
 # the id of the pointer type `storage`-class to `pointee`, emitting it on first use
@@ -384,6 +467,50 @@ pub fun const_scalar(tt: *TypeTable, type_id: u32, lo: u32, hi: u32) u32 {
     ret id;
 }
 
+# the id of the composite constant of type `type_id` over `parts`, emitting it on
+# first use
+#
+# A vector constant has no literal of its own: `OpConstantComposite` names the
+# already-minted constant id of each lane, so the caller mints the lanes first.
+# Deduplicated on the type plus an exact component-id-sequence match.
+# ---
+# tt:      the table
+# type_id: the composite's result type id
+# parts:   the component constant ids
+# n:       number of components
+# ret:     the OpConstantComposite id, or 0 when the component count is out of range
+pub fun const_composite(tt: *TypeTable, type_id: u32, parts: *u32, n: u32) u32 {
+    if (n == 0 || n > MAX_VECTOR_COMPONENTS) { ret 0; }
+
+    var i: usize = 0;
+    for (i < tt.comps.len) {
+        val k: *CompositeKey = ?tt.comps.data[i];
+        if (k.type_id == type_id && k.part_count == n && params_equal(k.parts, parts, n)) {
+            ret k.id;
+        }
+        i = i + 1;
+    }
+
+    val id: u32 = spirv.alloc_id(tt.b);
+    var ops: [6]u32;
+    ops[0] = type_id; ops[1] = id;
+    var pi: u32 = 0;
+    for (pi < n) { ops[2 + pi] = parts[pi]; pi = pi + 1; }
+    spirv.inst(tt.b, ?tt.b.types_consts, spirv.OP_CONSTANT_COMPOSITE, ?ops[0], n + 2);
+
+    var copy: *u32 = nil;
+    val rc: R.Result[*u32, str] = A.allocate[u32](tt.b.alloc, n::usize);
+    if (R.is_err[*u32, str](rc)) { tt.b.err = true; ret id; }
+    copy = R.unwrap_ok[*u32, str](rc);
+    var ci: u32 = 0;
+    for (ci < n) { copy[ci] = parts[ci]; ci = ci + 1; }
+
+    var k: CompositeKey;
+    k.type_id = type_id; k.parts = copy; k.part_count = n; k.id = id;
+    vector.push[CompositeKey](?tt.comps, k);
+    ret id;
+}
+
 # whether a type id names the boolean type this table minted
 # ---
 # tt: the table
@@ -496,6 +623,53 @@ test "mach.lang.target.isa.spirv.types:dedup" {
     val c3: u32 = const_int(?tt, 32, 8);
     if (c1 != c2) { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
     if (c1 == c3) { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
+
+    types_dnit(?tt);
+    spirv.builder_dnit(?b);
+    ret 0;
+}
+
+test "mach.lang.target.isa.spirv.types:vector_shapes_and_limit" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var b: spirv.Builder = spirv.builder_init(?alloc);
+    var tt: TypeTable = types_init(?b);
+
+    val f32t: u32 = type_float(?tt, 32);
+    val v4f: u32 = type_vector(?tt, f32t, 4);
+    if (v4f == 0) { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
+    # the same shape interns once.
+    if (type_vector(?tt, f32t, 4) != v4f) { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
+    # a different lane count is a different type, as is a different component type.
+    if (type_vector(?tt, f32t, 2) == v4f) { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
+    if (type_vector(?tt, type_int(?tt, 32), 4) == v4f) { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
+
+    # the shape is recoverable from the id alone.
+    var count: u32 = 0;
+    if (vector_shape(?tt, v4f, ?count) != f32t) { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
+    if (count != 4) { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
+    # a scalar is not a vector, and says so rather than reporting a bogus shape.
+    if (vector_shape(?tt, f32t, ?count) != 0) { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
+    if (count != 0) { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
+
+    # mach's four narrow-lane vectors need 8 and 16 components, which a Shader
+    # module may not declare; the table refuses rather than minting a type only a
+    # Kernel module could carry.
+    if (type_vector(?tt, type_int(?tt, 8), 16) != 0)  { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
+    if (type_vector(?tt, type_int(?tt, 16), 8) != 0)  { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
+    # a 1-component "vector" is not a vector either.
+    if (type_vector(?tt, f32t, 1) != 0) { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
+
+    # a composite constant interns on its component ids, and a different lane value
+    # is a different constant.
+    val one: u32 = const_float(?tt, 32, 0x3F800000);
+    val two: u32 = const_float(?tt, 32, 0x40000000);
+    var p1: [4]u32; p1[0] = one; p1[1] = one; p1[2] = one; p1[3] = one;
+    var p2: [4]u32; p2[0] = one; p2[1] = one; p2[2] = one; p2[3] = two;
+    val c1: u32 = const_composite(?tt, v4f, ?p1[0], 4);
+    if (c1 == 0) { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
+    if (const_composite(?tt, v4f, ?p1[0], 4) != c1) { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
+    if (const_composite(?tt, v4f, ?p2[0], 4) == c1) { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
 
     types_dnit(?tt);
     spirv.builder_dnit(?b);
