@@ -35,8 +35,26 @@ u8x16  u16x8  u32x4  u64x2      # unsigned integer lanes
 The spelling is `<u|i|f><width>x<count>` with a **single** `x`. A name like
 `f32x4x4` is not a vector type (it resolves as an ordinary identifier); a matrix
 is an algorithm over vectors and belongs in a library over vector elements, not
-the language. A vector spelling is recognized only in type position, so a value
-may still be named `f32x4` without colliding with the type.
+the language.
+
+A vector spelling is recognized only in **type position**, so a *value* may still
+be named `f32x4` without colliding with the type:
+
+```mach
+val f32x4: i64 = 7;             # fine: values are a different position
+```
+
+A **type** may not. `rec`, `uni`, and `def` reject a name spelled as a vector
+form, because a type declared with a vector's name would be silently unreachable
+— every use in type position resolves to the vector instead:
+
+```mach
+rec f32x3 { x: f32; }           # error: `f32x3` is spelled as a vector type
+```
+
+This holds for any well-formed spelling, including ones this target does not
+currently admit (`f32x3`, `f32x7`), so the name cannot be claimed and then
+collide when the bound moves.
 
 Three rules bound the form:
 
