@@ -48,6 +48,7 @@ use std.text.string.str_free;
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
+use format: std.format;
 
 use mach.lang.be.obj;
 use enc: mach.lang.be.codegen.encode;
@@ -1957,6 +1958,7 @@ fun attach_load_sections(alloc: *A.Allocator, segs: *of.LoadSegment, count: u32,
                 secs[w].offset = groups.items[i].base;
                 secs[w].len    = groups.items[i].len;
                 secs[w].align  = groups.items[i].align;
+                secs[w].flags  = groups.items[i].flags;
                 w = w + 1;
             }
             i = i + 1;
@@ -2104,6 +2106,7 @@ fun build_exec_functions(alloc: *A.Allocator, out_img: *of.ObjectImage,
 rec SectionGroup {
     name:   intern.StrId;
     slot:   u32;
+    flags:  u32;
     align:  u32;
     len:    u32;
     base:   u32;
@@ -2136,14 +2139,22 @@ fun free_section_groups(alloc: *A.Allocator, g: *SectionGroups) {
 
 # the index of the group a (slot, name) pair belongs to, or 0xFFFFFFFF when absent
 # ---
-# g:    the group plan to search
-# slot: the merged accumulator index
-# name: the interned section name
-# ret:  the group index, or 0xFFFFFFFF
-fun section_group_index(g: *SectionGroups, slot: u32, name: intern.StrId) u32 {
+# A section's LOADER-VISIBLE properties are part of its identity, not just its
+# name: an initializer-pointer array and a plain data section could otherwise share
+# one output section and one set of flags, and whichever came first would decide
+# whether the loader runs the other's contents (#2637). Only `SEC_FLAG_IMAGE_MASK`
+# counts, so a linker-internal permission does not split an output section in two
+# ---
+# g:     the group plan to search
+# slot:  the merged accumulator index
+# name:  the interned section name
+# flags: the section's SEC_FLAG_* properties
+# ret:   the group index, or 0xFFFFFFFF
+fun section_group_index(g: *SectionGroups, slot: u32, name: intern.StrId, flags: u32) u32 {
     var i: u32 = 0;
     for (i < g.count) {
-        if (g.items[i].slot == slot && g.items[i].name == name) { ret i; }
+        if (g.items[i].slot == slot && g.items[i].name == name
+            && g.items[i].flags == flags) { ret i; }
         i = i + 1;
     }
     ret 0xFFFFFFFF;
@@ -2151,7 +2162,7 @@ fun section_group_index(g: *SectionGroups, slot: u32, name: intern.StrId) u32 {
 
 # append an empty group for a (slot, name) pair and return its index
 fun section_group_add(alloc: *A.Allocator, g: *SectionGroups, slot: u32,
-                      name: intern.StrId) R.Result[u32, str] {
+                      name: intern.StrId, flags: u32) R.Result[u32, str] {
     if (g.count == g.cap) {
         var new_cap: u32 = g.cap * 2;
         if (new_cap == 0) { new_cap = 8; }
@@ -2164,6 +2175,7 @@ fun section_group_add(alloc: *A.Allocator, g: *SectionGroups, slot: u32,
     val i: u32 = g.count;
     g.items[i].name   = name;
     g.items[i].slot   = slot;
+    g.items[i].flags  = flags;
     g.items[i].align  = 1;
     g.items[i].len    = 0;
     g.items[i].base   = 0;
@@ -2195,9 +2207,119 @@ fun section_group_add(alloc: *A.Allocator, g: *SectionGroups, slot: u32,
 # sec_base:     per-module prefix offset into the flat placement array
 # groups:       out - the planned groups
 # ret:          ok(true) on success, or an error string
+# sentinel `dup_of` entry: the section owns its own placement
+val EMBED_OWNS: u32 = 0xFFFFFFFF;
+
+# whether an input section is an embed atom eligible to share another's placement
+#
+# The `SEC_FLAG_EMBED` marker is the whole authority: an ordinary global's address
+# is observably its own, so nothing else may coalesce however identical its bytes
+# (#2541). Two further conditions are the writer's, not the marker's. A section
+# carrying relocations is refused, because byte-identical content does not imply
+# identical relocation targets and the surviving copy would be patched for the
+# wrong module. A section the atom planner has shortened is refused, because the
+# bytes compared below are no longer the bytes emitted
+# ---
+# modules: the input image array
+# m:       the owning module index
+# sc:      the section index within that module
+# atoms:   the atom plan, for the section's live contribution length
+# flat:    the section's flat placement index
+# ret:     true when the section may take part in embed coalescing
+fun embed_atom_eligible(modules: *of.ObjectImage, m: u32, sc: u32,
+                        atoms: *AtomPlan, flat: u32) bool {
+    val sec: *of.Section = ?modules[m].sections[sc];
+    if ((sec.flags & of.SEC_FLAG_EMBED) == 0)      { ret false; }
+    if (!is_loadable_kind(sec.kind))               { ret false; }
+    if (atom_live_len(atoms, flat, sec.len) != sec.len) { ret false; }
+    var ri: u32 = 0;
+    for (ri < modules[m].reloc_count) {
+        if (modules[m].relocations[ri].section == sc) { ret false; }
+        ri = ri + 1;
+    }
+    ret true;
+}
+
+# whether two embed atoms may share one placement
+#
+# Everything that makes the two placements interchangeable has to match, not just
+# the bytes: the section name and kind decide where the content lands, and the
+# alignment decides what the surviving placement guarantees - a stricter second
+# atom sharing a weaker first one would silently inherit the weaker guarantee
+# ---
+# a: the earlier atom
+# b: the candidate that would share its placement
+# ret: true when one placement serves both
+fun embed_atoms_match(a: *of.Section, b: *of.Section) bool {
+    if (a.name != b.name || a.kind != b.kind) { ret false; }
+    if (a.len != b.len || a.align != b.align) { ret false; }
+    if (a.len == 0)                           { ret true; }
+    if (a.bytes == nil || b.bytes == nil)     { ret false; }
+    ret memory.raw_equal(a.bytes::ptr, b.bytes::ptr, a.len::usize);
+}
+
+# decide, for every input section, whether it shares an earlier section's placement
+#
+# Byte-identical `#[embed]` content declared by two MODULES of one artifact must
+# occupy one final placement, so that the two symbols compare equal - #2518
+# deduplicated only within a module, and the linker is the first place that sees
+# them all (#2541). The first atom of a given content owns the placement and every
+# later match points at it; the merge then contributes the winner's bytes once and
+# resolves every alias to its address.
+#
+# The result is consulted by both merge passes, so the measuring pass and the
+# placing pass can never disagree about which sections carry bytes
+# ---
+# alloc:        allocator backing the returned array
+# modules:      the input image array
+# module_count: number of input images
+# sec_base:     per-module prefix offset into the flat placement array
+# sec_total:    total number of input sections
+# atoms:        the atom plan
+# ret:          per-flat-section winner index, or EMBED_OWNS; freed by the caller
+fun plan_embed_coalescing(alloc: *A.Allocator, modules: *of.ObjectImage, module_count: u32,
+                          sec_base: *u32, sec_total: u32,
+                          atoms: *AtomPlan) R.Result[*u32, str] {
+    if (sec_total == 0) { ret R.ok[*u32, str](nil); }
+    val ar: R.Result[*u32, str] = A.allocate[u32](alloc, sec_total::usize);
+    if (R.is_err[*u32, str](ar)) { ret ar; }
+    val dup: *u32 = R.unwrap_ok[*u32, str](ar);
+    var i: u32 = 0;
+    for (i < sec_total) { dup[i] = EMBED_OWNS; i = i + 1; }
+
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sc: u32 = 0;
+        for (sc < modules[m].section_count) {
+            val flat: u32 = sec_base[m] + sc;
+            if (!embed_atom_eligible(modules, m, sc, atoms, flat)) { sc = sc + 1; cnt; }
+            val sec: *of.Section = ?modules[m].sections[sc];
+
+            # the earliest matching atom owns the placement, so the scan stops at the
+            # first hit and a chain of duplicates all point at one winner.
+            var wm: u32 = 0;
+            for (wm <= m && dup[flat] == EMBED_OWNS) {
+                var wc: u32 = 0;
+                for (wc < modules[wm].section_count && dup[flat] == EMBED_OWNS) {
+                    val wflat: u32 = sec_base[wm] + wc;
+                    if (wflat >= flat)                                          { wc = wc + 1; cnt; }
+                    if (dup[wflat] != EMBED_OWNS)                               { wc = wc + 1; cnt; }
+                    if (!embed_atom_eligible(modules, wm, wc, atoms, wflat))    { wc = wc + 1; cnt; }
+                    if (embed_atoms_match(?modules[wm].sections[wc], sec))      { dup[flat] = wflat; }
+                    wc = wc + 1;
+                }
+                wm = wm + 1;
+            }
+            sc = sc + 1;
+        }
+        m = m + 1;
+    }
+    ret R.ok[*u32, str](dup);
+}
+
 fun plan_section_groups(alloc: *A.Allocator, modules: *of.ObjectImage, module_count: u32,
                         merged: *MergedSection, atoms: *AtomPlan, sec_base: *u32,
-                        groups: *SectionGroups) R.Result[bool, str] {
+                        dup: *u32, groups: *SectionGroups) R.Result[bool, str] {
     var m: u32 = 0;
     for (m < module_count) {
         var sc: u32 = 0;
@@ -2205,11 +2327,14 @@ fun plan_section_groups(alloc: *A.Allocator, modules: *of.ObjectImage, module_co
             val sec: *of.Section = ?modules[m].sections[sc];
             if (sec.kind::u32 >= MERGED_KIND_COUNT) { sc = sc + 1; cnt; }
             if (!is_loadable_kind(sec.kind))        { sc = sc + 1; cnt; }
+            # a coalesced embed atom contributes no bytes: it takes the placement the
+            # winner already measured into this group.
+            if (dup != nil && dup[sec_base[m] + sc] != EMBED_OWNS) { sc = sc + 1; cnt; }
 
             val slot: u32 = sec.kind::u32;
-            var gi: u32 = section_group_index(groups, slot, sec.name);
+            var gi: u32 = section_group_index(groups, slot, sec.name, sec.flags & of.SEC_FLAG_IMAGE_MASK);
             if (gi == 0xFFFFFFFF) {
-                val ar: R.Result[u32, str] = section_group_add(alloc, groups, slot, sec.name);
+                val ar: R.Result[u32, str] = section_group_add(alloc, groups, slot, sec.name, sec.flags & of.SEC_FLAG_IMAGE_MASK);
                 if (R.is_err[u32, str](ar)) { ret R.err[bool, str](R.unwrap_err[u32, str](ar)); }
                 gi = R.unwrap_ok[u32, str](ar);
             }
@@ -3229,8 +3354,18 @@ fun accumulate_sections(s: *session.Session, modules: *of.ObjectImage, module_co
     # below fixes each group's offset; the loop then replays the same arithmetic
     # per member from the group's cursor.
     fill_section_bases(modules, module_count, sec_base);
+    var sec_total: u32 = 0;
+    var tm: u32 = 0;
+    for (tm < module_count) { sec_total = sec_total + modules[tm].section_count; tm = tm + 1; }
+    val dr: R.Result[*u32, str] =
+        plan_embed_coalescing(s.alloc, modules, module_count, sec_base, sec_total, atoms);
+    if (R.is_err[*u32, str](dr)) { ret R.err[bool, str](R.unwrap_err[*u32, str](dr)); }
+    val dup: *u32 = R.unwrap_ok[*u32, str](dr);
+    fin {
+        if (dup != nil && sec_total > 0) { A.deallocate[u32](s.alloc, dup, sec_total::usize); }
+    }
     val gp: R.Result[bool, str] =
-        plan_section_groups(s.alloc, modules, module_count, merged, atoms, sec_base, groups);
+        plan_section_groups(s.alloc, modules, module_count, merged, atoms, sec_base, dup, groups);
     if (R.is_err[bool, str](gp)) { ret R.err[bool, str](R.unwrap_err[bool, str](gp)); }
 
     # .debug_abbrev is byte-identical across every module (a deterministic, complete
@@ -3297,6 +3432,13 @@ fun accumulate_sections(s: *session.Session, modules: *of.ObjectImage, module_co
                 placements[flat].offset       = 0;
                 placements[flat].vaddr        = 0;
             }
+            or (dup != nil && dup[flat] != EMBED_OWNS) {
+                # a coalesced embed atom shares the winning atom's placement, so every
+                # symbol defined in it resolves to that address and its bytes are
+                # written once. the winner has a lower flat index, so its placement is
+                # already final by the time this runs.
+                placements[flat] = placements[dup[flat]];
+            }
             or {
                 var a: u32 = sec.align;
                 # PE runtime-function rows are copied into the writer-owned final
@@ -3315,7 +3457,7 @@ fun accumulate_sections(s: *session.Session, modules: *of.ObjectImage, module_co
                 var cursor: u64 = merged[ki].len::u64;
                 var gi: u32 = 0xFFFFFFFF;
                 if (is_loadable_kind(sec.kind)) {
-                    gi = section_group_index(groups, ki, sec.name);
+                    gi = section_group_index(groups, ki, sec.name, sec.flags & of.SEC_FLAG_IMAGE_MASK);
                     # plan_section_groups registered every loadable name from these
                     # same inputs, so a miss is an internal invariant break.
                     if (gi == 0xFFFFFFFF) { ret R.err[bool, str]("linker: section group not registered in the merge"); }
@@ -3925,6 +4067,68 @@ fun module_weak_function_ref_is_dead(modules: *of.ObjectImage, m: u32, name: int
     ret false;
 }
 
+# whether a relocation is a DWARF code address: a 64-bit absolute patch site in one of
+# the four debug sections that hold executable addresses. the sec_offset references
+# into `.debug_str` / `.debug_loclists` / `.debug_rnglists` are RK_ABS32 and carry
+# section offsets rather than addresses, so the kind alone separates them
+# ---
+# r:            the relocation to classify
+# info_sec / line_sec / loclists_sec / rnglists_sec: module-local debug section indices
+# ret:          true when the relocation patches an executable address
+fun is_dwarf_code_address(r: *of.Relocation, info_sec: u32, line_sec: u32,
+                          loclists_sec: u32, rnglists_sec: u32) bool {
+    if (r.kind != of.RK_ABS64) { ret false; }
+    ret r.section == info_sec || r.section == line_sec
+        || r.section == loclists_sec || r.section == rnglists_sec;
+}
+
+# whether a DWARF code-address relocation's addend still describes the same instruction
+# after the atom plan compresses its anchor's section
+#
+# the patch is `atom_live_offset(anchor) + addend`: the anchor is rebased over the
+# discarded intervals and the addend is then added raw. that is the right instruction
+# only when no discarded interval lies between the anchor and the effective location.
+# `atom_live_offset` counts surviving bytes, so the condition is exactly
+# `live(anchor + addend) == live(anchor) + addend`, the two diverging by the number of
+# dead bytes in between. this is the "anchor remapped, addend not" staleness the atom
+# plan's crossing audit guards against elsewhere, which DWARF sat outside of purely
+# because every reference mach emits is intra-function (#2620).
+#
+# the atom plan is asked directly rather than comparing the effective location against
+# the anchor symbol's extent, because `sym.size` is authoritative in no format the
+# linker reads: Mach-O's nlist and COFF's symbol record carry no size field at all and
+# both parsers store 0, and mach's own codegen writes 0 for every function symbol. an
+# extent test would be scoped to nothing. the remap identity needs no size and holds
+# for every format.
+#
+# a dead anchor or a dead effective location is not this check's business: #2583's
+# tombstone owns that case and resolves it to the dead-code sentinel.
+# ---
+# modules:  the input image array
+# m:        index of the module owning the reference
+# sy:       index within module `m` of the anchor symbol the addend is measured from
+# addend:   the reference's addend, in bytes from the anchor
+# sec_base: per-module prefix offset into the flat section space
+# atoms:    the dead-atom plan
+# ret:      true when the addend survives the remap unchanged
+fun dwarf_addend_survives_remap(modules: *of.ObjectImage, m: u32, sy: u32,
+                                addend: i64, sec_base: *u32, atoms: *AtomPlan) bool {
+    if (addend == 0) { ret true; }
+    val sym: *of.Symbol = ?modules[m].symbols[sy];
+    if (sym.section == of.SECTION_EXTERNAL || sym.section >= modules[m].section_count) {
+        ret true;
+    }
+    val eff: i64 = sym.offset::i64 + addend;
+    if (eff < 0 || eff > 0xFFFFFFFF) { ret false; }
+    val flat: u32 = sec_base[m] + sym.section;
+    val e: u32 = eff::u32;
+    if (atom_offset_dead(atoms, flat, sym.offset) || atom_offset_dead(atoms, flat, e)) {
+        ret true;
+    }
+    val want: i64 = atom_live_offset(atoms, flat, sym.offset)::i64 + addend;
+    ret atom_live_offset(atoms, flat, e)::i64 == want;
+}
+
 # apply every relocation in module `m` into the merged
 # bytes. a LOCAL target resolves directly from module `m`'s own symbol array;
 # a GLOBAL target (or an undefined extern) resolves by name through `sym_locs`, and
@@ -4080,6 +4284,17 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
         # the sentinel IS the value the field must hold, and apply_reloc adds the addend
         # to whatever target it is given, which would wrap 0xFFFF... into a low address.
         var apply_addend: i64 = r.addend;
+
+        # a DWARF code address is patched as `remapped anchor + raw addend`, which only
+        # names the intended instruction while no discarded interval separates the two.
+        # every reference mach emits is intra-function and so cannot straddle one, but
+        # nothing generated that property and nothing would notice it breaking, and the
+        # failure is a silently wrong address in debug info (#2620). refuse instead.
+        if (is_dwarf_code_address(r, info_sec, line_sec, loclists_sec, rnglists_sec)
+            && !dwarf_addend_survives_remap(modules, m, r.sym, r.addend, sec_base, atoms)) {
+            ret R.err[bool, str](dwarf_addend_message(s, modules, m, target_name, r));
+        }
+
         if ((target.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0
             && target.section != of.SECTION_EXTERNAL) {
             if (!local_symbol_target(modules, m, r.sym, placements, sec_base,
@@ -4752,6 +4967,19 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
                 dyn.info.imports[idx].symbol = decl.import_name;
                 dyn.info.imports[idx].ordinal = decl.ordinal;
                 dyn.info.imports[idx].by_ordinal = !decl.by_name;
+            }
+            # the loader-facing name is settled. it must not still carry the
+            # format's import-address prefix: `__imp_X` denotes the address cell
+            # the import table itself synthesizes for X, so no library exports a
+            # symbol under that name and an image importing one links clean and
+            # fails only at load. canonicalization strips one level, so a doubled
+            # prefix, a manifest claim keyed on the alias, or an import-library
+            # record naming one all reach here intact (#2527)
+            if (!str_empty(tgt.of.import_address_prefix)
+                && is_import_address_alias(s, dyn.info.imports[idx].symbol,
+                                           tgt.of.import_address_prefix)) {
+                ret R.err[bool, str](import_alias_message(
+                    s, dyn.info.imports[idx].symbol, tgt.of.import_address_prefix));
             }
             val ins: R.Result[bool, str] =
                 map.insert[intern.StrId, u32](?dyn.import_map, cn.canonical, idx);
@@ -5649,7 +5877,7 @@ fun build_local_got_plan(s: *session.Session, modules: *of.ObjectImage,
     # their own named run at the tail of the rel.ro segment. without it the segment's
     # sections would stop short of its own bytes (#2606).
     val gn: intern.StrId = intern_or_nil(s, "__got");
-    val ga: R.Result[u32, str] = section_group_add(s.alloc, groups, relro, gn);
+    val ga: R.Result[u32, str] = section_group_add(s.alloc, groups, relro, gn, 0);
     if (R.is_err[u32, str](ga)) { ret R.err[bool, str](R.unwrap_err[u32, str](ga)); }
     val gi: u32 = R.unwrap_ok[u32, str](ga);
     groups.items[gi].align  = 8;
@@ -6114,6 +6342,35 @@ fun dup_message(s: *session.Session, name: intern.StrId) str {
 # s:    shared session holding the interner
 # name: interned name of the undefined symbol
 # ret:  the diagnostic string (degraded if the name cannot be resolved)
+# build the diagnostic for a DWARF code-address relocation whose addend does not
+# survive the atom plan's remap of its anchor (#2620). names the anchor symbol, the
+# addend, and the debug section holding the patch site, since the three together
+# identify the emitting site
+# ---
+# s:       shared session holding the interner and allocator
+# modules: the input image array, for the section's own name
+# m:       index of the module owning the relocation
+# name:    interned name of the anchor symbol
+# r:       the offending relocation
+# ret:     the diagnostic string (degraded if a name cannot be resolved)
+fun dwarf_addend_message(s: *session.Session, modules: *of.ObjectImage, m: u32,
+                         name: intern.StrId, r: *of.Relocation) str {
+    val fallback: str =
+        "linker: DWARF code-address addend does not survive dead-code elimination";
+    val nm: O.Option[str] = intern.lookup(?s.interner, name);
+    if (!O.is_some[str](nm)) { ret fallback; }
+    var sec: str = "?";
+    if (r.section < modules[m].section_count) {
+        val sn: O.Option[str] = intern.lookup(?s.interner, modules[m].sections[r.section].name);
+        if (O.is_some[str](sn)) { sec = O.unwrap[str](sn); }
+    }
+    val res: R.Result[str, str] = format.sprint(s.alloc,
+        "linker: {} relocation against '{}' with addend {} crosses a discarded body; its address would be stale",
+        sec, O.unwrap[str](nm), r.addend);
+    if (R.is_err[str, str](res)) { ret fallback; }
+    ret R.unwrap_ok[str, str](res);
+}
+
 fun undef_message(s: *session.Session, name: intern.StrId) str {
     val nm: O.Option[str] = intern.lookup(?s.interner, name);
     if (O.is_some[str](nm)) { ret join2(s, "undefined symbol: ", O.unwrap[str](nm), "undefined symbol"); }
@@ -6176,6 +6433,47 @@ fun unattributed_import_message(s: *session.Session, sym_name: intern.StrId,
     if (str_len(cands) == 0) { ret claim; }
     val pre: str = join2(s, claim, "; candidate libraries: ", claim);
     ret join2(s, pre, cands, pre);
+}
+
+# whether a loader-facing import name still carries the format's import-address
+# prefix. a bare prefix is not an alias: it names no export
+# ---
+# s:      shared session holding the interner
+# name:   the import's loader-facing name
+# prefix: the active format's import-address prefix (caller checks it is non-empty)
+# ret:    true when the name is `<prefix><export>`
+fun is_import_address_alias(s: *session.Session, name: intern.StrId, prefix: str) bool {
+    val no: O.Option[str] = intern.lookup(?s.interner, name);
+    if (!O.is_some[str](no)) { ret false; }
+    val text: str = O.unwrap[str](no);
+    ret str_starts_with(text, prefix) && str_len(text) > str_len(prefix);
+}
+
+# build the diagnostic for an import whose loader-facing name is an
+# import-address alias. names the export the alias denotes, says what the prefix
+# means so the refusal is not mistaken for an unsupported spelling, and points at
+# importing the undecorated export instead
+# ---
+# s:      shared session holding the interner
+# name:   the offending import name (`<prefix><export>`)
+# prefix: the active format's import-address prefix
+# ret:    the diagnostic string (degraded when the name cannot be resolved)
+fun import_alias_message(s: *session.Session, name: intern.StrId, prefix: str) str {
+    val no: O.Option[str] = intern.lookup(?s.interner, name);
+    if (!O.is_some[str](no)) {
+        ret "dynamic import names an import-address alias rather than an export; import the undecorated export instead";
+    }
+    val text: str = O.unwrap[str](no);
+    val export: str = (text::usize + str_len(prefix))::str;
+
+    val head: str = join3(s, "dynamic import '", text, "' names the import-address alias of '",
+                          "dynamic import names an import-address alias");
+    val a: str = join3(s, head, export, "' rather than an export: '", head);
+    val b: str = join3(s, a, prefix,
+        "' is the convention for the address cell the import table itself synthesizes, so no library exports a symbol under that name and the image would fail to load. import '",
+        a);
+    ret join3(s, b, export,
+        "' instead - the linker emits that import and resolves every alias reference to its address cell", b);
 }
 
 # join a link's dynamic dependencies into a "name (loader), ..." list for a
@@ -6734,6 +7032,291 @@ test "mach.lang.be.linker.patch_relocations:parsed_weak_dwarf_tombstones" {
     session.dnit(?s);
     if (!elf_ok || !macho_ok) { ret 1; }
     ret 0;
+}
+
+# drive one DWARF code address whose addend reaches across a body the atom plan
+# discarded, and report what the linker did with it
+#
+# module 1 lays `.text` out as [anchor 0,16) [dup 16,32) [tail 32,48) and carries a
+# `.debug_info` address against `anchor` with addend 32, which names `tail`'s first
+# byte. module 0 also defines the weak `dup` and wins it, so module 1's copy is
+# discarded and `tail` slides down into its place. `anchor` itself is remapped, the
+# addend is not, and `anchor + 32` then points 16 bytes past `tail`'s new start.
+#
+# the bodies are a whole multiple of the section alignment on purpose. `atom_resume_offset`
+# preserves each later symbol's alignment residue, so a hole that is not a multiple of
+# the section's alignment is refilled with padding and nothing after it moves - a
+# fixture built that way discards a body and still proves nothing, which is why this
+# one reads `tail` back and reports that outcome separately.
+#
+# nothing mach emits has this shape, which is exactly why the linker has to construct
+# it to be able to test the refusal (#2620).
+# ---
+# s:   session
+# tgt: the target whose writer and parser the objects round-trip through
+# ret: 0 refused with the expected diagnostic, 1 linked and wrote the stale address,
+#      2 linked without writing a stale address, 3 refused for another reason,
+#      4 the fixture itself could not be built, 5 linked but the atom plan discarded
+#      nothing, so the fixture no longer exercises the case at all
+fun lt_dwarf_addend_crossing(s: *session.Session, tgt: *target.Target) i32 {
+    val alloc: *A.Allocator = s.alloc;
+    val text:   intern.StrId = lt_name(s, ".text");
+    val info:   intern.StrId = lt_name(s, ".debug_info");
+    val dup:    intern.StrId = lt_name(s, "crossing_weak");
+    val anchor: intern.StrId = lt_name(s, "crossing_anchor");
+    val tail:   intern.StrId = lt_name(s, "crossing_tail");
+    val entry:  intern.StrId = lt_name(s, tgt.os.entry_symbol);
+    if (text == intern.STR_NIL || info == intern.STR_NIL || dup == intern.STR_NIL
+        || anchor == intern.STR_NIL || tail == intern.STR_NIL || entry == intern.STR_NIL) {
+        ret 4;
+    }
+
+    var win_text:   [32]u8;
+    var cross_text: [48]u8;
+    var i: u32 = 0;
+    for (i < 32) { win_text[i] = (0x10 + i)::u8; i = i + 1; }
+    i = 0;
+    for (i < 48) { cross_text[i] = (0x40 + i)::u8; i = i + 1; }
+
+    # three marker/address pairs: the crossing address, then `anchor` and `tail` with
+    # addend 0, which give the test the live bases to measure the crossing one against
+    # and let it confirm the atom plan actually discarded the body in between.
+    var cross_info: [48]u8;
+    i = 0;
+    for (i < 48) { cross_info[i] = 0; i = i + 1; }
+    i = 0;
+    for (i < 8) {
+        cross_info[i] = 0xC1; cross_info[16 + i] = 0xC2; cross_info[32 + i] = 0xC3;
+        i = i + 1;
+    }
+
+    var win_secs: [1]of.Section;
+    win_secs[0].name = text; win_secs[0].kind = of.SK_TEXT;
+    win_secs[0].bytes = ?win_text[0]; win_secs[0].len = 32; win_secs[0].align = 16;
+
+    var cross_secs: [2]of.Section;
+    cross_secs[0].name = text; cross_secs[0].kind = of.SK_TEXT;
+    cross_secs[0].bytes = ?cross_text[0]; cross_secs[0].len = 48; cross_secs[0].align = 16;
+    cross_secs[1].name = info; cross_secs[1].kind = of.SK_DEBUG;
+    cross_secs[1].bytes = ?cross_info[0]; cross_secs[1].len = 48; cross_secs[1].align = 1;
+
+    val weak_flags: u32 =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+    val fn_flags: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var win_syms: [2]of.Symbol;
+    win_syms[0].name = dup; win_syms[0].section = 0;
+    win_syms[0].offset = 0; win_syms[0].size = 16; win_syms[0].flags = weak_flags;
+    win_syms[1].name = entry; win_syms[1].section = 0;
+    win_syms[1].offset = 16; win_syms[1].size = 16; win_syms[1].flags = fn_flags;
+
+    var cross_syms: [3]of.Symbol;
+    cross_syms[0].name = anchor; cross_syms[0].section = 0;
+    cross_syms[0].offset = 0; cross_syms[0].size = 16; cross_syms[0].flags = fn_flags;
+    cross_syms[1].name = dup; cross_syms[1].section = 0;
+    cross_syms[1].offset = 16; cross_syms[1].size = 16; cross_syms[1].flags = weak_flags;
+    cross_syms[2].name = tail; cross_syms[2].section = 0;
+    cross_syms[2].offset = 32; cross_syms[2].size = 16; cross_syms[2].flags = fn_flags;
+
+    var cross_relocs: [3]of.Relocation;
+    cross_relocs[0].section = 1; cross_relocs[0].offset = 8;
+    cross_relocs[0].kind = of.RK_ABS64; cross_relocs[0].sym = 0;
+    cross_relocs[0].addend = 32;
+    cross_relocs[1].section = 1; cross_relocs[1].offset = 24;
+    cross_relocs[1].kind = of.RK_ABS64; cross_relocs[1].sym = 0;
+    cross_relocs[1].addend = 0;
+    cross_relocs[2].section = 1; cross_relocs[2].offset = 40;
+    cross_relocs[2].kind = of.RK_ABS64; cross_relocs[2].sym = 2;
+    cross_relocs[2].addend = 0;
+
+    var modules: [2]of.ObjectImage;
+    modules[0] = lt_image(s, lt_name(s, "crossing-winner"), ?win_secs[0], 1,
+                          ?win_syms[0], 2, nil::*of.Relocation, 0);
+    modules[1] = lt_image(s, lt_name(s, "crossing-loser"), ?cross_secs[0], 2,
+                          ?cross_syms[0], 3, ?cross_relocs[0], 3);
+
+    val wtf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "cross_dwarf_winner");
+    if (R.is_err[fs.TempFile, str](wtf_r)) { ret 4; }
+    var wtf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](wtf_r);
+    val ltf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "cross_dwarf_loser");
+    if (R.is_err[fs.TempFile, str](ltf_r)) { fs.temp_close_and_remove(?wtf); ret 4; }
+    var ltf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](ltf_r);
+    val etf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "cross_dwarf_exe");
+    if (R.is_err[fs.TempFile, str](etf_r)) {
+        fs.temp_close_and_remove(?wtf); fs.temp_close_and_remove(?ltf); ret 4;
+    }
+    var etf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](etf_r);
+    val wpath: str = fs.temp_path(?wtf);
+    val lpath: str = fs.temp_path(?ltf);
+    val epath: str = fs.temp_path(?etf);
+
+    var code: i32 = 4;
+    var wrote: bool = true;
+    if (R.is_err[bool, str](tgt.of.emit_object(tgt.isa, ?modules[0], wpath::*u8))) { wrote = false; }
+    if (wrote && R.is_err[bool, str](tgt.of.emit_object(tgt.isa, ?modules[1], lpath::*u8))) { wrote = false; }
+    if (wrote) {
+        var paths: [2]*u8;
+        paths[0] = wpath::*u8; paths[1] = lpath::*u8;
+        val lr: R.Result[bool, str] = link(s, tgt, ?paths[0], 2,
+            nil::*of.DynLib, 0, epath::*u8, "crossing_dwarf"::*u8,
+            LINK_EXE, false, of.image_options_default(of.SUBSYSTEM_CONSOLE));
+        if (R.is_err[bool, str](lr)) {
+            code = 3;
+            if (str_contains(R.unwrap_err[bool, str](lr), "crosses a discarded body")) { code = 0; }
+        }
+        or {
+            # the link went through: read back what it patched. `tail` slid down with the
+            # discarded body, so the correct crossing address is `tail` itself and the
+            # stale one the raw addend produces is anchor + 32. a `tail` that did NOT
+            # slide means nothing was discarded and the fixture proves nothing, which is
+            # reported as its own outcome rather than passing quietly.
+            code = 4;
+            val rr: R.Result[Vector[u8], str] = fs.read_bytes(alloc, epath);
+            if (R.is_ok[Vector[u8], str](rr)) {
+                var out: Vector[u8] = R.unwrap_ok[Vector[u8], str](rr);
+                var anchor_va: u64 = 0;
+                var cross_va: u64 = 0;
+                var tail_va: u64 = 0;
+                if (lt_marker_live_value(out.data, out.len, 0xC2, ?anchor_va)
+                    && lt_marker_live_value(out.data, out.len, 0xC1, ?cross_va)
+                    && lt_marker_live_value(out.data, out.len, 0xC3, ?tail_va)) {
+                    code = 5;
+                    if (tail_va == anchor_va + 16) {
+                        code = 2;
+                        if (cross_va == anchor_va + 32) { code = 1; }
+                    }
+                }
+                vector.dnit[u8](?out);
+            }
+        }
+    }
+
+    fs.temp_close_and_remove(?wtf);
+    fs.temp_close_and_remove(?ltf);
+    fs.temp_close_and_remove(?etf);
+    ret code;
+}
+
+# a DWARF code address whose addend reaches across a discarded weak body is refused
+# rather than patched. the linker rebases the anchor over the hole and then adds the
+# raw addend, so the result names an instruction 8 bytes past the one meant; nothing
+# the encoder emits has that shape today, and this is what notices if that changes
+test "mach.lang.be.linker.patch_relocations:dwarf_addend_crossing_refused" {
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val er: R.Result[target.Target, str] =
+        target.select(?reg, "x86_64", "linux", "sysv64");
+    if (R.is_err[target.Target, str](er)) { ret 1; }
+    var elf_tgt: target.Target = R.unwrap_ok[target.Target, str](er);
+
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    val code: i32 = lt_dwarf_addend_crossing(?s, ?elf_tgt);
+    session.dnit(?s);
+    ret code;
+}
+
+# round-trip one 16-byte function symbol through a target's object writer and parser
+# and report the size the parser recovered
+# ---
+# s:   session
+# tgt: the target whose writer and parser to exercise
+# out: out - the recovered `sym.size`
+# ret: true when the round trip completed and the symbol was found
+fun lt_roundtrip_symbol_size(s: *session.Session, tgt: *target.Target, out: *u32) bool {
+    val alloc: *A.Allocator = s.alloc;
+    val text: intern.StrId = lt_name(s, ".text");
+    val fname: intern.StrId = lt_name(s, "sized_probe");
+    if (text == intern.STR_NIL || fname == intern.STR_NIL) { ret false; }
+
+    var body: [16]u8;
+    var i: u32 = 0;
+    for (i < 16) { body[i] = (0x90 + i)::u8; i = i + 1; }
+
+    var secs: [1]of.Section;
+    secs[0].name = text; secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?body[0]; secs[0].len = 16; secs[0].align = 16;
+
+    var syms: [1]of.Symbol;
+    syms[0].name = fname; syms[0].section = 0; syms[0].offset = 0; syms[0].size = 16;
+    syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var img: of.ObjectImage = lt_image(s, lt_name(s, "sized"), ?secs[0], 1,
+                                       ?syms[0], 1, nil::*of.Relocation, 0);
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "sym_size_probe");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret false; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val path: str = fs.temp_path(?tf);
+
+    var ok: bool = false;
+    if (R.is_ok[bool, str](tgt.of.emit_object(tgt.isa, ?img, path::*u8))) {
+        val rr: R.Result[Vector[u8], str] = fs.read_bytes(alloc, path);
+        if (R.is_ok[Vector[u8], str](rr)) {
+            var raw: Vector[u8] = R.unwrap_ok[Vector[u8], str](rr);
+            var back: of.ObjectImage;
+            val pr: R.Result[bool, str] = tgt.of.parse_object::of.ParserFn(
+                alloc, ?s.interner, raw.data, raw.len, ?back);
+            if (R.is_ok[bool, str](pr)) {
+                var sy: u32 = 0;
+                for (sy < back.symbol_count) {
+                    if (back.symbols[sy].name == fname) { @out = back.symbols[sy].size; ok = true; }
+                    sy = sy + 1;
+                }
+            }
+            vector.dnit[u8](?raw);
+        }
+    }
+    fs.temp_close_and_remove(?tf);
+    ret ok;
+}
+
+# `sym.size` survives an ELF round trip and is lost by Mach-O and COFF, because their
+# symbol records have no size field to carry it: a Mach-O `nlist` is name / type /
+# section / desc / value, and a COFF symbol record is name / value / section / type /
+# class / aux-count. neither has anywhere to put one, so both parsers store 0.
+#
+# this is the boundary #2620's check had to be designed around. an anchor-extent test
+# would have been silently inert on two of the three formats the linker reads - and on
+# ELF too, since mach's own codegen writes size 0 for every function symbol it emits -
+# so the check asks the atom plan whether the addend survives its remap instead, which
+# needs no size at all. this test exists so that boundary is a checked fact rather than
+# a claim in a comment: if a parser ever learns to recover a size, this fails and the
+# reasoning above gets revisited on purpose
+test "mach.lang.be.linker.symbol_size:carried_by_elf_only" {
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val er: R.Result[target.Target, str] = target.select(?reg, "x86_64", "linux", "sysv64");
+    val mr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "darwin", "sysv64");
+    val cr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "windows", "win64");
+    if (R.is_err[target.Target, str](er) || R.is_err[target.Target, str](mr)
+        || R.is_err[target.Target, str](cr)) { ret 1; }
+    var elf_tgt: target.Target = R.unwrap_ok[target.Target, str](er);
+    var macho_tgt: target.Target = R.unwrap_ok[target.Target, str](mr);
+    var coff_tgt: target.Target = R.unwrap_ok[target.Target, str](cr);
+
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var code: i32 = 0;
+    var elf_size: u32 = 0xFFFFFFFF;
+    var macho_size: u32 = 0xFFFFFFFF;
+    var coff_size: u32 = 0xFFFFFFFF;
+    if (!lt_roundtrip_symbol_size(?s, ?elf_tgt, ?elf_size))     { code = 1; }
+    if (!lt_roundtrip_symbol_size(?s, ?macho_tgt, ?macho_size)) { code = 1; }
+    if (!lt_roundtrip_symbol_size(?s, ?coff_tgt, ?coff_size))   { code = 1; }
+    session.dnit(?s);
+
+    if (elf_size != 16)  { code = 1; }
+    if (macho_size != 0) { code = 1; }
+    if (coff_size != 0)  { code = 1; }
+    ret code;
 }
 
 # look up one production ISA vtable from a populated test registry
@@ -7637,6 +8220,84 @@ test "mach.lang.be.linker.unattributed_import_message:names_both_routes" {
     ret 0;
 }
 
+# `__imp_X` names the address cell the import table synthesizes for X, not an
+# export any library provides, so an import plan row still carrying the prefix
+# must be refused. an import-library record reaches the plan through
+# `ImportDecl.import_name`, which canonicalization never sees, so this route
+# would otherwise link clean and fail only at load (#2527)
+test "mach.lang.be.linker.build_dynamic_info:rejects_import_address_alias" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val tr: R.Result[target.Target, str] =
+        target.select(?reg, "x86_64", "windows", "win64");
+    if (R.is_err[target.Target, str](tr)) { ret 1; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+
+    # the object symbol is undecorated, so canonicalization leaves it alone and
+    # only the declaration's loader-facing name carries the prefix
+    val symbol: intern.StrId = lt_name(?s, "Sleep");
+    val alias: intern.StrId = lt_name(?s, "__imp_Sleep");
+    val library: intern.StrId = lt_name(?s, "kernel32.dll");
+    if (symbol == intern.STR_NIL || alias == intern.STR_NIL
+        || library == intern.STR_NIL) { ret 1; }
+
+    var sym: of.Symbol;
+    sym.name = symbol;
+    sym.section = of.SECTION_EXTERNAL;
+    sym.offset = 0;
+    sym.size = 0;
+    sym.flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+              | of.SYM_OBJ_FLAG_FUNCTION;
+    var decl: of.ImportDecl;
+    decl.symbol = symbol;
+    decl.import_name = alias;
+    decl.library = library;
+    decl.ordinal = 0;
+    decl.by_name = true;
+    decl.is_code = true;
+    var module: of.ObjectImage =
+        lt_image(?s, lt_name(?s, "import-user"), nil::*of.Section, 0,
+                 ?sym, 1, nil::*of.Relocation, 0);
+    module.imports = ?decl;
+    module.import_count = 1;
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var dyn: DynState;
+    init_dynstate(?dyn);
+    val built: R.Result[bool, str] =
+        build_dynamic_info(?s, ?tgt, ?dyn, ?module, 1, ?locs,
+                           nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+
+    var code: i32 = 0;
+    if (R.is_ok[bool, str](built)) { code = 1; }
+    or {
+        # the plan must carry no row at all, and the message must name both the
+        # alias and the export it denotes so the remedy is stated, not implied
+        val msg: str = R.unwrap_err[bool, str](built);
+        if (dyn.info.import_count != 0)                    { code = 1; }
+        if (!str_contains(msg, "'__imp_Sleep'"))           { code = 1; }
+        if (!str_contains(msg, "import-address alias"))    { code = 1; }
+        if (!str_contains(msg, "import 'Sleep' instead"))  { code = 1; }
+    }
+
+    # a bare prefix names no export, so it is not an alias and is left alone
+    val bare: intern.StrId = lt_name(?s, "__imp_");
+    if (is_import_address_alias(?s, bare, "__imp_"))  { code = 1; }
+    if (is_import_address_alias(?s, symbol, "__imp_")) { code = 1; }
+    if (!is_import_address_alias(?s, alias, "__imp_")) { code = 1; }
+
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret code;
+}
+
 # a short-import declaration builds a loader binding without persisting an
 # attribution in the shared session, which may link a later artifact
 test "mach.lang.be.linker.build_dynamic_info:declared_import_is_link_local" {
@@ -8267,6 +8928,120 @@ fun lt_fixed16_is(buf: *u8, off: usize, name: str) bool {
 # The plain `.data` inputs still merge together and still come out spelled `__data`,
 # the Mach-O canonical name for their kind - identity is preserved for a name that
 # CARRIES identity, not invented for one that does not.
+# fill one test embed section
+fun lt_embed_sec(sec: *of.Section, name: intern.StrId, kind: of.SectionKind,
+                 bytes: *u8, len: u32, align: u32, embed: bool) {
+    sec.name  = name;
+    sec.kind  = kind;
+    sec.bytes = bytes;
+    sec.len   = len;
+    sec.align = align;
+    sec.flags = 0;
+    if (embed) { sec.flags = of.SEC_FLAG_EMBED; }
+}
+
+# byte-identical `#[embed]` atoms in different modules share one placement, and
+# everything that is not a byte-identical embed atom keeps its own (#2541)
+#
+# The whole risk of this feature is over-merging. An ordinary global's address is
+# observably its own, so `?A == ?B` becoming true is a miscompile, not an
+# optimization - which is why the marker, and not byte equality, is the authority.
+# The cases below are the ways two sections can look alike and still have to stay
+# apart: same bytes but not marked, different bytes, a stricter alignment (the
+# second atom would silently inherit the first's weaker guarantee), a different
+# section name or kind (the content would land somewhere else), and a section
+# carrying a relocation (identical bytes do not imply identical relocation targets,
+# so the survivor would be patched for the wrong module).
+test "mach.lang.be.linker.plan_embed_coalescing:only_matching_embed_atoms" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val rodata: intern.StrId = lt_name(?s, ".rodata");
+    val other:  intern.StrId = lt_name(?s, ".rodata.assets");
+    if (rodata == intern.STR_NIL || other == intern.STR_NIL) { ret 1; }
+
+    var abc: [4]u8;
+    var xyz: [4]u8;
+    var i: u32 = 0;
+    for (i < 4) { abc[i] = 0xA0 + i::u8; xyz[i] = 0xF0 + i::u8; i = i + 1; }
+
+    # module 0 owns the content; module 1 declares six lookalikes of which only the
+    # first is a genuine duplicate.
+    var secs0: [1]of.Section;
+    lt_embed_sec(?secs0[0], rodata, of.SK_RODATA, ?abc[0], 4, 8, true);
+
+    var secs1: [6]of.Section;
+    lt_embed_sec(?secs1[0], rodata, of.SK_RODATA, ?abc[0], 4, 8,  true);   # the duplicate
+    lt_embed_sec(?secs1[1], rodata, of.SK_RODATA, ?abc[0], 4, 8,  false);  # not marked
+    lt_embed_sec(?secs1[2], rodata, of.SK_RODATA, ?xyz[0], 4, 8,  true);   # different bytes
+    lt_embed_sec(?secs1[3], rodata, of.SK_RODATA, ?abc[0], 4, 64, true);   # stricter alignment
+    lt_embed_sec(?secs1[4], other,  of.SK_RODATA, ?abc[0], 4, 8,  true);   # different section
+    lt_embed_sec(?secs1[5], rodata, of.SK_DATA,   ?abc[0], 4, 8,  true);   # different kind
+
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "m0"), ?secs0[0], 1, nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+    mods[1] = lt_image(?s, lt_name(?s, "m1"), ?secs1[0], 6, nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+
+    var sec_base: [2]u32;
+    sec_base[0] = 0;
+    sec_base[1] = 1;
+
+    val dr: R.Result[*u32, str] =
+        plan_embed_coalescing(?alloc, ?mods[0], 2, ?sec_base[0], 7, nil::*AtomPlan);
+    if (R.is_err[*u32, str](dr)) { ret 1; }
+    val dup: *u32 = R.unwrap_ok[*u32, str](dr);
+
+    # the owner keeps its own placement, and only the true duplicate points at it.
+    if (dup[0] != EMBED_OWNS) { ret 1; }
+    if (dup[1] != 0)          { ret 1; }
+    i = 2;
+    for (i < 7) {
+        if (dup[i] != EMBED_OWNS) { ret 1; }
+        i = i + 1;
+    }
+    A.deallocate[u32](?alloc, dup, 7::usize);
+
+    # a third module repeating the content joins the same winner rather than chaining
+    # onto the second module's duplicate, so every alias resolves to one address.
+    var secs2: [1]of.Section;
+    lt_embed_sec(?secs2[0], rodata, of.SK_RODATA, ?abc[0], 4, 8, true);
+    var mods3: [3]of.ObjectImage;
+    mods3[0] = mods[0];
+    mods3[1] = mods[1];
+    mods3[2] = lt_image(?s, lt_name(?s, "m2"), ?secs2[0], 1, nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+    var base3: [3]u32;
+    base3[0] = 0; base3[1] = 1; base3[2] = 7;
+    val dr3: R.Result[*u32, str] =
+        plan_embed_coalescing(?alloc, ?mods3[0], 3, ?base3[0], 8, nil::*AtomPlan);
+    if (R.is_err[*u32, str](dr3)) { ret 1; }
+    val dup3: *u32 = R.unwrap_ok[*u32, str](dr3);
+    if (dup3[7] != 0) { ret 1; }
+    A.deallocate[u32](?alloc, dup3, 8::usize);
+
+    # a relocation inside an atom takes it out of the running entirely: byte-identical
+    # content can still point at different targets.
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = of.RK_ABS64;
+    relocs[0].sym = of.SYMBOL_NONE; relocs[0].addend = 0;
+    var mods_r: [2]of.ObjectImage;
+    mods_r[0] = mods[0];
+    mods_r[1] = lt_image(?s, lt_name(?s, "m1r"), ?secs1[0], 1, nil::*of.Symbol, 0, ?relocs[0], 1);
+    var base_r: [2]u32;
+    base_r[0] = 0; base_r[1] = 1;
+    val drr: R.Result[*u32, str] =
+        plan_embed_coalescing(?alloc, ?mods_r[0], 2, ?base_r[0], 2, nil::*AtomPlan);
+    if (R.is_err[*u32, str](drr)) { ret 1; }
+    val dupr: *u32 = R.unwrap_ok[*u32, str](drr);
+    if (dupr[1] != EMBED_OWNS) { ret 1; }
+    A.deallocate[u32](?alloc, dupr, 2::usize);
+
+    session.dnit(?s);
+    ret 0;
+}
+
 test "mach.lang.be.linker.link_modules:input_section_names_survive" {
     var reg: target.TargetRegistry = target.registry_init();
     if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
