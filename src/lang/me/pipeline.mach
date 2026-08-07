@@ -43,6 +43,7 @@ use mach.lang.me.transform.sroa;
 use mach.lang.me.transform.vectorize;
 use mach.lang.source;
 use mach.lang.target;
+use vecform: mach.lang.me.vecform;
 use mach.lang.target.resolved;
 
 # optimisation level selecting the pipeline's stage sequence
@@ -239,6 +240,37 @@ pub fun run(m: *ir.Module, tgt: *target.Target, level: OptLevel, verify_ir: bool
         }
     }
 
+    # THE SIMD LEVER, asked once for the whole module and before anything is rewritten
+    # (#2726). `require` means a vector operator that would realize as per-lane scalar
+    # code is a build error rather than a silent expansion, and that is now a
+    # per-OPERATION question on every target rather than a per-target one: SSE2 has no
+    # 32-bit lane integer multiply and NEON no 64-bit one, so a capable target
+    # scalarizes too, and the lever has to see it.
+    #
+    # Placed ahead of both realization stages so nothing has been expanded yet when it
+    # fires - the error describes the IR the front end produced, not a half-legalized
+    # form. On the `scalarize` posture the expansions below run and the note tallies
+    # them.
+    if (simd_require) {
+        val res_req: R.Result[bool, str] = require_check(m, tgt, itn);
+        if (R.is_err[bool, str](res_req)) { ret res_req; }
+    }
+
+    # realize the operators this target has no packed form for, on a target that DOES
+    # have a vector unit (#2726). Vector values stay vectors and keep their packed
+    # operators; only the gap operators become per-lane work, so `i32x4 + i32x4` still
+    # selects PADDD next to an `i32x4 * i32x4` that does not.
+    #
+    # A SIMD-incapable target skips this: `scalarize.run` below rewrites every vector
+    # value and operator, which subsumes it, and doing both would expand the gap ops
+    # twice.
+    if (tgt.model.has_v128 && !simd_require) {
+        val res_gap: R.Result[bool, str] = scalarize.expand_gap_ops(m, tgt);
+        if (R.is_err[bool, str](res_gap)) { ret res_gap; }
+        val res_verify_gap: R.Result[bool, str] = verify_stage(m, true, ?vc);
+        if (R.is_err[bool, str](res_verify_gap)) { ret res_verify_gap; }
+    }
+
     # vector lane access is legalized ahead of the SIMD gate (#2236): a target that
     # keeps vectors but has no lane-access form (x86-64 today) has every
     # OP_VEC_EXTRACT / OP_VEC_INSERT rewritten to the vector's memory image here. a
@@ -252,85 +284,70 @@ pub fun run(m: *ir.Module, tgt: *target.Target, level: OptLevel, verify_ir: bool
         if (R.is_err[bool, str](res_verify_lanes)) { ret res_verify_lanes; }
     }
 
-    # the single SIMD gate (#2017), keyed on the resolved posture over the target
-    # capability fact. on an incapable target (`has_v128 == false`) the profile lever
-    # decides what a would-scalarize vector op means:
-    #   require   -> a precise build error naming the op, function, and arch, from the
-    #                shared detection (#2016's `scalarize.detect`); the pass is skipped
-    #                so nothing is silently expanded.
-    #   scalarize -> the default posture: run #2016's scalarization pass, which lowers
-    #                every IRT_VECTOR value and lane-wise operator to a defined per-lane
-    #                scalar form over 16-byte stack slots (so no vector survives to MIR
-    #                selection) and tallies the one-shot note. runs last, after all
-    #                optimization, so it legalizes the final IR; the verifier re-checks.
-    # a no-op on a capable target under either posture (nothing scalarizes).
-    if (!tgt.model.has_v128) {
-        if (simd_require) {
-            val res_req: R.Result[bool, str] = require_check(m, tgt, itn);
-            if (R.is_err[bool, str](res_req)) { ret res_req; }
-        } or {
-            val res_scalarize: R.Result[bool, str] = scalarize.run(m, tgt);
-            if (R.is_err[bool, str](res_scalarize)) { ret res_scalarize; }
-            val res_verify_scalarize: R.Result[bool, str] = verify_stage(m, true, ?vc);
-            if (R.is_err[bool, str](res_verify_scalarize)) { ret res_verify_scalarize; }
-        }
+    # whole-module scalarization on a SIMD-incapable target (#2016): every IRT_VECTOR
+    # value and lane-wise operator becomes a defined per-lane scalar form over 16-byte
+    # stack slots, so no vector survives to MIR selection and the per-target isel guard
+    # stays a loud backstop. Runs last, after all optimization, so it legalizes the
+    # final IR; the verifier re-checks.
+    #
+    # The `require` posture has already refused above, so reaching here under it means
+    # nothing scalarizes - but an incapable target scalarizes EVERY operator, so
+    # `require` cannot reach here with a vector operator at all. A no-op on a capable
+    # target, where the gap expansion above is the whole of the scalar realization.
+    if (!tgt.model.has_v128 && !simd_require) {
+        val res_scalarize: R.Result[bool, str] = scalarize.run(m, tgt);
+        if (R.is_err[bool, str](res_scalarize)) { ret res_scalarize; }
+        val res_verify_scalarize: R.Result[bool, str] = verify_stage(m, true, ?vc);
+        if (R.is_err[bool, str](res_verify_scalarize)) { ret res_verify_scalarize; }
     }
 
     # exit verification: full invariant check before the backend takes over.
     ret run_verify(m, true, false, ?vc);
 }
 
-# the `require`-posture enforcement (#2017): reject the first would-scalarize vector
-# operator on an incapable target, using #2016's shared detection so the error names
-# exactly the sites the scalarize-posture note would tally. clean (ok) for a module
-# with no would-scalarize operators, so a vectorless build is never rejected.
+# the `require`-posture enforcement (#2017): reject the first vector operator whose
+# realization on this target is per-lane scalar code, using the shared detection so
+# the error names exactly the sites the scalarize-posture note would tally. clean
+# (ok) for a module with no scalar-realized operators, so a vectorless build - or one
+# whose every operator has a packed form - is never rejected.
+#
+# Runs on EVERY target now, not only a SIMD-incapable one (#2726). A capable target
+# still has per-operation gaps (SSE2 has no 32-bit lane integer multiply, NEON no
+# 64-bit one), and those scalarize exactly as an incapable target's operators do, so
+# the lever a project sets to refuse a silent scalar expansion has to see them.
 # ---
 # m:   the module about to be handed to the back end
-# tgt: the incapable target (`has_v128 == false`) whose arch the message names
+# tgt: the target whose packed forms decide each operator's realization
 # itn: interner, to resolve the offending function's name
-# ret: ok(true) when nothing would scalarize, or the require build-error string
+# ret: ok(true) when nothing scalarizes, or the require build-error string
 fun require_check(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner) R.Result[bool, str] {
     var site: scalarize.ScalarizeSite;
-    val count: u32 = scalarize.detect(m, ?site);
+    val count: u32 = scalarize.detect(m, tgt, ?site);
     if (count == 0) { ret R.ok[bool, str](true); }
     ret R.err[bool, str](require_msg(m, tgt, itn, ?site));
 }
 
-# assemble the precise require-mode error naming the offending operator, its
-# containing function, and the incapable arch, plus the actionable fix
+# assemble the precise require-mode error naming the offending operator, its lane
+# width, its containing function, and the arch, plus the actionable fix
+#
+# The lane width is load-bearing rather than decoration: on a capable target the
+# shortfall is per-operation, so "vector multiply would scalarize on x86_64" without
+# it reads as a claim about every multiply, when the same multiply at 16-bit lanes
+# packs as PMULLW.
 fun require_msg(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner, site: *scalarize.ScalarizeSite) str {
-    val op: str = vector_op_name(site.op);
+    val op: str = vecform.vec_op_name(vecform.vec_op_of(site.op));
     var fname: str = "<anonymous>";
     val on: O.Option[str] = intern.lookup(itn, site.fn_name);
     if (O.is_some[str](on)) { fname = O.unwrap[str](on); }
 
+    var why: str = "target has no packed form for this operation at this lane width";
+    if (!tgt.model.has_v128) { why = "target has no 128-bit SIMD"; }
+
     val rj: R.Result[str, str] = format.sprint(m.alloc,
-        "simd = \"require\": vector {} in '{}' would scalarize on {} (target has no 128-bit SIMD); set simd = \"scalarize\" to build with the scalar expansion",
-        op, fname, tgt.isa.name);
+        "simd = \"require\": vector {} on {}-bit lanes in '{}' would scalarize on {} ({}); set simd = \"scalarize\" to build with the scalar expansion",
+        op, site.lane_bits, fname, tgt.isa.name, why);
     if (R.is_err[str, str](rj)) { ret R.unwrap_err[str, str](rj); }
     ret R.unwrap_ok[str, str](rj);
-}
-
-# a friendly name for a lane-wise vector operator (the set `scalarize.detect`
-# reports; anything else is defensive)
-fun vector_op_name(k: instruction.InstrKind) str {
-    if (k == instruction.OP_ADD)      { ret "add"; }
-    if (k == instruction.OP_SUB)      { ret "subtract"; }
-    if (k == instruction.OP_NEG)      { ret "negate"; }
-    if (k == instruction.OP_MUL)      { ret "multiply"; }
-    if (k == instruction.OP_DIV_S)    { ret "divide"; }
-    if (k == instruction.OP_DIV_U)    { ret "divide"; }
-    if (k == instruction.OP_AND)      { ret "and"; }
-    if (k == instruction.OP_OR)       { ret "or"; }
-    if (k == instruction.OP_XOR)      { ret "xor"; }
-    if (k == instruction.OP_NOT)      { ret "complement"; }
-    if (k == instruction.OP_CMP_EQ)   { ret "compare"; }
-    if (k == instruction.OP_CMP_NE)   { ret "compare"; }
-    if (k == instruction.OP_CMP_LT_S) { ret "compare"; }
-    if (k == instruction.OP_CMP_LT_U) { ret "compare"; }
-    if (k == instruction.OP_CMP_LE_S) { ret "compare"; }
-    if (k == instruction.OP_CMP_LE_U) { ret "compare"; }
-    ret "operation";
 }
 
 # everything the verifier needs beyond the module itself: the --verify-ir gate and
@@ -715,6 +732,10 @@ test "mach.lang.me.pipeline.run:simd_require_gate" {
         if (!str_contains(msg, "add"))               { code = 1; }
         if (!str_contains(msg, "kernel"))            { code = 1; }
         if (!str_contains(msg, "riscv64"))           { code = 1; }
+        # the lane width is part of the shortfall now (#2726): the same operation can
+        # pack at one width and scalarize at another, so naming the operation alone
+        # does not say what to change.
+        if (!str_contains(msg, "32-bit lanes"))      { code = 1; }
     }
     ir.dnit(?m);
 
@@ -734,6 +755,60 @@ test "mach.lang.me.pipeline.run:simd_require_gate" {
     if (R.is_err[bool, str](run(?m2, ?rv, OPT_DEBUG, false, true, true, false, ?itn, nil))) { code = 1; }
     ir.dnit(?m2);
 
+    # A CAPABLE TARGET IS NOT EXEMPT (#2726). The lever used to be reachable only where
+    # `has_v128` was false, so a project that set `require` to refuse a silent scalar
+    # expansion was told nothing about the expansions x86-64 and aarch64 perform for
+    # the operations their ISAs do not pack. These three modules are the same i32x4
+    # multiply handed to the three shipping targets, and the verdicts differ only by
+    # what each target can encode: SSE2 has no PMULLD, NEON has MUL.4s, riscv64 has no
+    # vector unit. Asserting the aarch64 arm PASSES is what distinguishes a working
+    # authority from one that simply refuses everything.
+    if (mul_require_refused(?alloc, ?itn, ?reg, "x86_64",  "sysv64") != 1) { code = 1; }
+    if (mul_require_refused(?alloc, ?itn, ?reg, "riscv64", "lp64")   != 1) { code = 1; }
+    if (mul_require_refused(?alloc, ?itn, ?reg, "aarch64", "aapcs64") != 0) { code = 1; }
+
     intern.dnit(?itn);
     ret code;
+}
+
+# build a module holding one live `i32x4 * i32x4` in 'kernel', run the pipeline for
+# the named target under `simd = "require"`, and report whether it was refused
+#
+# 1 when the build is refused (the multiply realizes as scalar code there), 0 when it
+# is accepted (a packed form exists), and 2 on any setup failure so a broken setup can
+# never read as either verdict.
+fun mul_require_refused(alloc: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry, isa_name: str, abi_name: str) i32 {
+    val trr: R.Result[resolved.Target, str] = target.select(reg, isa_name, "linux", abi_name);
+    if (R.is_err[resolved.Target, str](trr)) { ret 2; }
+    var rv: resolved.Target = R.unwrap_ok[resolved.Target, str](trr);
+
+    val rfn: R.Result[intern.StrId, str] = intern.intern(itn, "kernel");
+    if (R.is_err[intern.StrId, str](rfn)) { ret 2; }
+
+    val rm: R.Result[ir.Module, str] = ir.init(alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 2; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+    val ri: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 32);
+    if (R.is_err[ir_type.IrTypeId, str](ri)) { ir.dnit(?m); ret 2; }
+    val rvt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_vector(?m.types, R.unwrap_ok[ir_type.IrTypeId, str](ri), 4);
+    if (R.is_err[ir_type.IrTypeId, str](rvt)) { ir.dnit(?m); ret 2; }
+    val vec: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rvt);
+
+    val rfa: R.Result[u32, str] = ir.function_add(?m, R.unwrap_ok[intern.StrId, str](rfn), vec, 0);
+    if (R.is_err[u32, str](rfa)) { ir.dnit(?m); ret 2; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rfa)];
+    var b: builder.Builder = builder.init(?m);
+    builder.set_function(?b, fn);
+    val rb: R.Result[id.BlockId, str] = builder.new_block(?b);
+    if (R.is_err[id.BlockId, str](rb)) { ir.dnit(?m); ret 2; }
+    builder.set_block(?b, R.unwrap_ok[id.BlockId, str](rb));
+
+    val rmul: R.Result[value.Value, str] = builder.emit_mul(?b, value.param(0, vec), value.param(1, vec));
+    if (R.is_err[value.Value, str](rmul)) { ir.dnit(?m); ret 2; }
+    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rmul)))) { ir.dnit(?m); ret 2; }
+
+    val res: R.Result[bool, str] = run(?m, ?rv, OPT_DEBUG, false, true, true, false, itn, nil);
+    ir.dnit(?m);
+    if (R.is_err[bool, str](res)) { ret 1; }
+    ret 0;
 }
