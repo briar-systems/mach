@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+#### The `#[packed]` vector refusal now waits on one thing, not two (#2728)
+The refusal is sequencing rather than policy, and it was waiting on two conditions: evidence that an unaligned vector access is correct on real silicon, and #2687's aggregate-layout half. The first is now settled.
+
+`int/surface/unaligned-vector` stores and loads `i32x4`, `f32x4`, `i32x3` and `f32x3` at deliberately misaligned offsets. A store probe reassembles every lane from four byte loads and a load probe writes the bytes by hand, so neither reads back through the access it measures, and a sentinel in the bytes on both sides of each extent catches the truncated and over-wide stores a lane check alone cannot see. It is correct in both profiles on every **native** leg: `linux-arm64` on `ubuntu-24.04-arm`, which is the row that matters because aarch64 has 128-bit forms with alignment requirements, plus `linux` and `windows` on x86-64. Nothing faults, no lane is dropped, no neighbour is disturbed. `linux-riscv64` passes and is deliberately not counted: it runs under qemu-user, and riscv64 declares no 128-bit vector support, so the access there is a scalar expansion rather than a vector access.
+
+The refusal itself is unchanged. Its diagnostic and `doc/language/decorators.md` now name what actually remains.
+
 ### Fixed
 
 #### The pinned integration lane can run (#2729)
