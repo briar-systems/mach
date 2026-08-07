@@ -12,6 +12,11 @@
 #                 execution cannot observe (PE ASLR bit, macho PIE bit). dispatched
 #                 on the artifact's own magic, so it is independent of how the case
 #                 maps to a leg. no LLVM; reads little-endian fields (every runner is LE).
+#   macho-framing— walk a Mach-O executable's load commands and report how the image
+#                 is framed: the __PAGEZERO span, __TEXT's base, and the section
+#                 commands on every segment, plus which entry command it carries.
+#                 the static and dyld-loaded layouts must agree on all of it except
+#                 the entry command (#2599). no LLVM; od/dd reads only.
 #   macho-signed— structurally resolve the three x86_64 immediate-store displacements
 #                 and compare them with independent initialized-data markers, proving
 #                 SIGNED_1/_2/_4 each linked to its exact target without a mac runner.
@@ -312,8 +317,8 @@ field_macho() {
 
 # macho_segment_fields <file> <segname> — print a segment's
 # "vmaddr vmsize fileoff filesize" tuple from LC_SEGMENT_64, or fail when absent.
-# The executable writer emits section-header-less load segments, so the load
-# commands are the independent file-offset-to-VA map structural checks must use.
+# The load commands are the independent file-offset-to-VA map structural checks
+# must use; a section command's own offsets are derived from them.
 macho_segment_fields() {
     bin=$1
     want=$2
@@ -340,6 +345,72 @@ macho_segment_fields() {
     done
     echo "int: macho: segment '$want' not found" >&2
     return 2
+}
+
+# produce_macho_framing <runmode> <target> <binary>
+# Walk a Mach-O executable's load commands and report how the image is FRAMED: the
+# __PAGEZERO span, __TEXT's base, whether __PAGEZERO ends exactly where __TEXT
+# begins, then one line per LC_SEGMENT_64 naming its section commands, and finally
+# which entry command the image carries.
+#
+# The framing is what a static (LC_UNIXTHREAD) and a dyld-loaded (LC_MAIN) image
+# must have IN COMMON - the entry command is the only line that may differ between
+# the two goldens (#2599, where the non-PIE image was based a page below
+# DARWIN_BASE_ADDR, carried a __PAGEZERO one page short of 4 GiB, and emitted no
+# section commands at all, leaving `llvm-objdump -d` with nothing to disassemble).
+# Addresses other than the base are deliberately left out: they move with the
+# program's size, and the fact under test is the framing, not the layout.
+produce_macho_framing() {
+    bin=$3
+    magic=$(read_le_uint "$bin" 0 4)
+    [ "$magic" = "4277009103" ] || { echo "int: macho-framing: not a 64-bit mach-o (magic $magic)" >&2; return 2; }
+    ncmds=$(read_le_uint "$bin" 16 4)
+
+    pagezero_size=
+    text_vmaddr=
+    entry=none
+    segs=$(mktemp)
+    off=32
+    i=0
+    while [ "$i" -lt "$ncmds" ]; do
+        cmd=$(read_le_uint "$bin" "$off" 4)
+        cmdsize=$(read_le_uint "$bin" $((off + 4)) 4)
+        case "$cmd" in
+            25)   # LC_SEGMENT_64
+                name=$(dd if="$bin" bs=1 skip=$((off + 8)) count=16 2>/dev/null | tr '\0' '\n' | head -n 1)
+                vmaddr=$(read_le_uint "$bin" $((off + 24)) 8)
+                vmsize=$(read_le_uint "$bin" $((off + 32)) 8)
+                nsects=$(read_le_uint "$bin" $((off + 64)) 4)
+                [ "$name" = "__PAGEZERO" ] && pagezero_size=$vmsize
+                [ "$name" = "__TEXT" ] && text_vmaddr=$vmaddr
+                sects=
+                k=0
+                while [ "$k" -lt "$nsects" ]; do
+                    sh=$((off + 72 + k * 80))
+                    sname=$(dd if="$bin" bs=1 skip="$sh" count=16 2>/dev/null | tr '\0' '\n' | head -n 1)
+                    if [ -z "$sects" ]; then sects=$sname; else sects="$sects,$sname"; fi
+                    k=$((k + 1))
+                done
+                [ -n "$sects" ] || sects=-
+                printf 'seg %s nsects=%s sects=%s\n' "$name" "$nsects" "$sects" >>"$segs"
+                ;;
+            5)          entry=LC_UNIXTHREAD ;;   # LC_UNIXTHREAD
+            2147483688) entry=LC_MAIN ;;         # LC_MAIN (0x80000028)
+        esac
+        [ "$cmdsize" -ge 8 ] || { rm -f "$segs"; echo "int: macho-framing: zero-size load command" >&2; return 2; }
+        off=$((off + cmdsize))
+        i=$((i + 1))
+    done
+
+    [ -n "$pagezero_size" ] || { rm -f "$segs"; echo "int: macho-framing: no __PAGEZERO" >&2; return 2; }
+    [ -n "$text_vmaddr" ]   || { rm -f "$segs"; echo "int: macho-framing: no __TEXT" >&2; return 2; }
+
+    printf 'pagezero_vmsize=0x%x\n' "$pagezero_size"
+    printf 'text_vmaddr=0x%x\n' "$text_vmaddr"
+    printf 'pagezero_abuts_text=%s\n' "$(( pagezero_size == text_vmaddr ))"
+    cat "$segs"
+    rm -f "$segs"
+    printf 'entry=%s\n' "$entry"
 }
 
 # produce_macho_signed <runmode> <target> <binary>
@@ -1878,6 +1949,7 @@ produce() {
         field)       produce_field "$@" ;;
         macho-signed) produce_macho_signed "$@" ;;
         macho-got)   produce_macho_got "$@" ;;
+        macho-framing) produce_macho_framing "$@" ;;
         macho-abs-bind) produce_macho_abs_bind "$@" ;;
         pe-imports)  produce_pe_imports "$@" ;;
         pe-exceptions) produce_pe_exceptions "$@" ;;
