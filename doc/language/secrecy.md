@@ -216,6 +216,30 @@ On a target whose grammar has no flag reader at all, every one of these facts is
 vacuous, and that vacuity is asserted per target rather than assumed: adding an
 aarch64 `cset` later has to state its facts deliberately.
 
+The rows whose facts could wrongly *permit* a leak are measured against the CPU
+rather than asserted from a manual — `int/surface/ct-flags-hardware` runs each
+instruction twice with the flags preset all-set and all-clear and reports what it
+actually defines, preserves, and reads. Three rows are exempt and stay a reasoned
+classification: `popfq`, `iretq` and `syscall` take their flags from the stack,
+the interrupt frame, or a masked prior RFLAGS, and no experiment of that shape can
+tell you where a value came *from*.
+
+**What the walk does not model is memory.** A secret spilled to the stack and
+reloaded comes back in a register the walk believes is public, and every check
+downstream of it is defeated:
+
+```
+mov rax, {r}
+mov [rsp], rax
+mov rbx, [rsp]
+mov rcx, [rbx]     # a secret-derived address, accepted
+```
+
+The direct form of that — `mov rax, {r}` then `mov rbx, [rax]` — *is* refused, so
+the gate works and this path specifically escapes it. Taint is a register set with
+no memory domain, on every target, and closing it is tracked as #2706. Reading the
+flags model above as evidence that laundering is closed in general would be wrong.
+
 The variable-latency check also bites unevenly: x86-64's and aarch64's asm grammars
 carry no divide, multiply or float instruction at all, so it reaches only their
 register-count shifts. riscv64's grammar admits the whole M-extension, so on that
