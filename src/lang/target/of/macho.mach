@@ -1543,6 +1543,7 @@ pub fun register_macho(reg: *of.OfRegistry) R.Result[bool, str] {
     # Mach-O image, position-independent or not, so __TEXT lands on the base and
     # __PAGEZERO spans the whole low region below it (#2599).
     macho_vtable.header_in_first_segment = true;
+    macho_vtable.header_span = header_span;
     macho_vtable.executable_section_location = nil;
 
     # Mach-O relocates and writes for the two Apple-silicon-era isas.
@@ -1849,6 +1850,89 @@ fun macho_dwarf_free(alloc: *A.Allocator, d: *MachoDwarf, debug_count: u32) {
     d.sec_offs = nil;
 }
 
+# the bytes reserved below the first load segment for the mach header + load
+# commands, installed as the of.HeaderSpanFn
+#
+# A Mach-O header carries one command per segment, one section_64 per named section
+# and one per dependency, so it grows with the image and a fixed one-page
+# reservation caps a link that the format itself does not cap - `sizeofcmds` is a
+# uint32 (#2690). An objective-c input reaches that cap easily: since #2606 the
+# linker preserves input section identity, so every __objc_* section a vendored
+# archive carries is another 80 bytes here.
+#
+# The result is an upper bound, not the exact size. The writer lays the header into
+# this span and pads the rest of it, so over-reserving costs padding inside __TEXT's
+# leading pages while under-reserving fails the link - every term below therefore
+# takes the larger reading where the arch or the layout is not yet fixed: both
+# platform commands are counted, the entry command is the larger of LC_UNIXTHREAD's
+# thread state and LC_MAIN, and each load segment is charged a command of its own
+# even though adjacent same-protection segments collapse into one.
+# ---
+# shape: the measured image shape
+# page:  the target's page size
+# ret:   reserved bytes, rounded up to a whole number of pages
+fun header_span(shape: *of.HeaderShape, page: u64) u64 {
+    if (shape == nil) { ret page; }
+
+    # __PAGEZERO and __LINKEDIT frame the load segments, and an image that binds
+    # imports also carries the synthesized __STUBS and __GOT.
+    var seg_cmds:   u32 = shape.seg_count + 2;
+    var sect_total: u32 = shape.sect_count;
+    if (shape.imports) {
+        seg_cmds   = seg_cmds + 2;
+        sect_total = sect_total + 2;
+    }
+
+    var entry_cmd: usize = 16 + ARM_THREAD_STATE64_COUNT::usize * 4;
+    if (16 + X86_THREAD_STATE64_COUNT::usize * 4 > entry_cmd) {
+        entry_cmd = 16 + X86_THREAD_STATE64_COUNT::usize * 4;
+    }
+    if (ENTRY_POINT_CMD_SIZE > entry_cmd) { entry_cmd = ENTRY_POINT_CMD_SIZE; }
+
+    var size: usize = MACH_HEADER_64_SIZE
+                    + seg_cmds::usize * SEGMENT_CMD_64_SIZE
+                    + sect_total::usize * SECTION_64_SIZE
+                    + DYLD_INFO_CMD_SIZE + SYMTAB_CMD_SIZE + DYSYMTAB_CMD_SIZE
+                    + dylinker_cmd_size() + entry_cmd + LINKEDIT_DATA_CMD_SIZE
+                    + BUILD_VERSION_CMD_SIZE + UUID_CMD_SIZE
+                    + macho_dwarf_cmd_bytes(shape.debug_count);
+
+    var i: u32 = 0;
+    for (i < shape.lib_count) {
+        size = size + dylib_cmd_size(bin.resolve_name(shape.itn, shape.libs[i].soname));
+        if (shape.libs[i].rpath != intern.STR_NIL
+            && !rpath_seen_before(shape.libs, i, shape.libs[i].rpath)) {
+            size = size + rpath_cmd_size(bin.resolve_name(shape.itn, shape.libs[i].rpath));
+        }
+        i = i + 1;
+    }
+
+    ret bin.align_up_u64(size::u64, page);
+}
+
+# the header span the linker reserved for this image: the gap it left between the
+# image base and the first load segment's virtual address
+#
+# The writer does not choose this. The reservation is fixed during vaddr assignment
+# (`of.HeaderSpanFn`), and __TEXT is based exactly on `image_base` because the
+# header occupies that gap - widening the span here instead would slide __TEXT, and
+# __PAGEZERO under it, below the base (#2599).
+# ---
+# segs:       the linker's load segments
+# seg_count:  number of load segments
+# image_base: the linker's image base
+# ret:        ok(the reserved bytes), or an error when no header fits below the base
+fun reserved_header_span(segs: *of.LoadSegment, seg_count: u32,
+                         image_base: u64) R.Result[usize, str] {
+    if (seg_count == 0 || segs == nil) {
+        ret R.err[usize, str]("macho: image has no load segments to map the header into");
+    }
+    if (segs[0].vaddr <= image_base) {
+        ret R.err[usize, str]("macho: base address too low to map the header");
+    }
+    ret R.ok[usize, str]((segs[0].vaddr - image_base)::usize);
+}
+
 # write a static MH_EXECUTE Mach-O, installed as the of.ExecFn
 #
 # Frames the linker's laid-out load segments with a leading __PAGEZERO (the
@@ -1872,7 +1956,8 @@ fun macho_dwarf_free(alloc: *A.Allocator, d: *MachoDwarf, debug_count: u32) {
 # seg_count:  number of segments
 # page_size:  segment-alignment page (unused; Mach-O maps its own fixed per-arch vm
 #             page via `macho_page_size` - 16 KiB arm64, 4 KiB x86_64)
-# image_base: linker image base (unused; Mach-O derives framing from segment vaddrs)
+# image_base: linker image base; __TEXT is based exactly here and the header fills
+#             the span the linker reserved between it and the first segment
 # entry:      program entry-point virtual address
 # funcs:      per-function metadata (unused)
 # func_count: number of entries in funcs (unused)
@@ -1901,10 +1986,11 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
     # (#1698); the structure round-trips in the of.macho parser unit test.
     val have_dwarf: bool = debug_count > 0;
 
-    # __PAGEZERO spans the low region below __TEXT; it is present whenever the image
-    # base is non-zero (darwin executables always carry one). its exact span depends
-    # on hdr_span, computed once the load-command size is known below.
-    var has_pagezero: bool = seg_count > 0 && segs[0].vaddr > 0;
+    # __PAGEZERO spans [0, base), so it is present exactly when the image base is
+    # non-zero (darwin executables always carry one). __TEXT is based on the base, so
+    # the span is the base itself - reading it off the first segment instead would
+    # make it depend on the header span, which is not yet known here.
+    val has_pagezero: bool = image_base > 0;
     # a static image has no loader-applied rebases, so no segment is dyld's
     # rebased-then-read-only __DATA_CONST and the load segments collapse purely by
     # protection: the linker's rodata and rel.ro segments are one read-only Mach-O
@@ -1927,30 +2013,22 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
 
     # the mach header + load commands map into __TEXT's first hdr_span bytes: the
     # Apple Silicon kernel admits a signed image only when the header lies inside the
-    # signed, mapped __TEXT. the first linker segment must therefore sit strictly
-    # above hdr_span, leaving room for the header below it and a non-empty
-    # __PAGEZERO under that - the linker reserves exactly this page for every Mach-O
-    # image (`of.header_in_first_segment`), position-independent or not.
-    if (header_end > exec_page::usize) {
-        ret R.err[bool, str]("macho: exec header exceeds the one-page reservation");
+    # signed, mapped __TEXT. the first linker segment therefore sits hdr_span above
+    # the base, leaving room for the header below it and a non-empty __PAGEZERO under
+    # that - the linker reserved exactly that span (`of.header_in_first_segment`,
+    # sized through `header_span`), position-independent or not.
+    val hs: R.Result[usize, str] = reserved_header_span(segs, seg_count, image_base);
+    if (R.is_err[usize, str](hs)) { ret R.err[bool, str](R.unwrap_err[usize, str](hs)); }
+    val hdr_span: usize = R.unwrap_ok[usize, str](hs);
+    if (header_end > hdr_span) {
+        ret R.err[bool, str]("macho: exec header exceeds the linker's reservation");
     }
-    val hdr_span: usize = exec_page::usize;
-    if (seg_count > 0 && segs[0].vaddr <= hdr_span::u64) {
-        ret R.err[bool, str]("macho: exec base address too low to map the header");
-    }
-    var text_va:       u64 = 0;
-    var pagezero_size: u64 = 0;
-    if (seg_count > 0) {
-        text_va       = segs[0].vaddr - hdr_span::u64;
-        pagezero_size = text_va;
-    }
+    val text_va:       u64 = segs[0].vaddr - hdr_span::u64;
+    val pagezero_size: u64 = text_va;
 
-    var seg_offsets: *usize = nil;
-    if (seg_count > 0) {
-        val ro: R.Result[*usize, str] = A.zallocate[usize](alloc, seg_count::usize);
-        if (R.is_err[*usize, str](ro)) { ret R.err[bool, str]("macho: exec offset table alloc failed"); }
-        seg_offsets = R.unwrap_ok[*usize, str](ro);
-    }
+    val ro: R.Result[*usize, str] = A.zallocate[usize](alloc, seg_count::usize);
+    if (R.is_err[*usize, str](ro)) { ret R.err[bool, str]("macho: exec offset table alloc failed"); }
+    val seg_offsets: *usize = R.unwrap_ok[*usize, str](ro);
 
     # the first linker segment's bytes follow the header at hdr_span; the rest are
     # page-aligned in turn. __TEXT (the first segment) therefore shares its file
@@ -1979,7 +2057,7 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
     val dwp: R.Result[MachoDwarf, str] =
         macho_dwarf_plan(alloc, debug, debug_count, total_size, macho_page_size(arch_id)::usize);
     if (R.is_err[MachoDwarf, str](dwp)) {
-        if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
+        A.deallocate[usize](alloc, seg_offsets, seg_count::usize);
         ret R.err[bool, str](R.unwrap_err[MachoDwarf, str](dwp));
     }
     dw = R.unwrap_ok[MachoDwarf, str](dwp);
@@ -1988,9 +2066,8 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
     # __TEXT - the first segment, now carrying the header - is the executable segment
     # the code signature authorizes: it starts at file offset 0 and spans the header
     # plus the linker's text bytes.
-    var exec_base:  u64 = 0;
-    var exec_limit: u64 = 0;
-    if (seg_count > 0) { exec_limit = hdr_span::u64 + segs[0].filesz::u64; }
+    val exec_base:  u64 = 0;
+    val exec_limit: u64 = hdr_span::u64 + segs[0].filesz::u64;
 
     # the ad-hoc code signature lives in a trailing __LINKEDIT segment and covers
     # every byte before it (including the __DWARF bytes), so it is laid out last and
@@ -2007,7 +2084,7 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
     val res_buf: R.Result[*u8, str] = A.zallocate[u8](alloc, total_size);
     if (R.is_err[*u8, str](res_buf)) {
         macho_dwarf_free(alloc, ?dw, debug_count);
-        if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
+        A.deallocate[usize](alloc, seg_offsets, seg_count::usize);
         ret R.err[bool, str]("macho: exec buffer alloc failed");
     }
     var buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
@@ -2053,7 +2130,7 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
     write_code_signature(buf, code_limit, name, code_limit, exec_base, exec_limit);
 
     macho_dwarf_free(alloc, ?dw, debug_count);
-    if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
+    A.deallocate[usize](alloc, seg_offsets, seg_count::usize);
 
     val wr: R.Result[bool, str] = bin.write_atomic(itn, alloc, path, buf, total_size, 0o755,
         "macho: exec", "macho: could not create output file",
@@ -3373,7 +3450,8 @@ fun macho_got_ordinal(dyn: *of.DynamicInfo, import_index: u32) u32 {
 # seg_count:   number of segments
 # page_size:   segment-alignment page (unused; Mach-O maps its own fixed per-arch vm
 #              page via `macho_page_size`)
-# image_base:  linker image base (unused; Mach-O derives framing from segment vaddrs)
+# image_base:  linker image base; __TEXT is based exactly here and the header fills
+#              the span the linker reserved between it and the first segment
 # entry:       program entry-point virtual address
 # funcs:       per-function metadata (unused)
 # func_count:  number of entries in funcs (unused)
@@ -3448,7 +3526,7 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     # the linker's load segments collapse into + (stubs, got when there are function
     # imports) + __LINKEDIT.
     val grp_count: u32 = seg_group_count(dyn, segs, seg_count);
-    var seg_cmds: u32 = frame_cmd_count(dyn, segs, seg_count, segs[0].vaddr > 0) + 1;  # + __LINKEDIT
+    var seg_cmds: u32 = frame_cmd_count(dyn, segs, seg_count, image_base > 0) + 1;  # + __LINKEDIT
     if (nstub > 0) { seg_cmds = seg_cmds + 1; }   # __STUBS
     if (ngot > 0)  { seg_cmds = seg_cmds + 1; }   # __GOT
 
@@ -3500,18 +3578,16 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     }
 
     var lay: MachoDynLayout;
-    # a PIE image reserves exactly one page for the header so __TEXT maps at the OS
-    # base (the linker reserved that page above the base when assigning vaddrs); a
-    # non-PIE image maps the header below the linker's first segment, sized to fit.
-    # the linker reserved exactly one page above the image base for the header, so
-    # the header span is that page for both layouts: growing it instead would push
-    # __TEXT (and __PAGEZERO with it) below the base (#2599).
-    if (MACH_HEADER_64_SIZE + sizeofcmds > page) {
-        ret R.err[bool, str]("macho: dyn-exec header exceeds the one-page reservation");
-    }
-    lay.hdr_span = page;
-    if (segs[0].vaddr <= lay.hdr_span::u64) {
-        ret R.err[bool, str]("macho: dyn-exec base address too low to map the header");
+    # the header maps into __TEXT's first hdr_span bytes in both layouts, so __TEXT
+    # is based exactly on the image base and __PAGEZERO spans the whole low region
+    # under it. the span is the one the linker reserved when it assigned vaddrs
+    # (`of.HeaderSpanFn`); growing it here instead would push __TEXT, and __PAGEZERO
+    # with it, below the base (#2599).
+    val hs: R.Result[usize, str] = reserved_header_span(segs, seg_count, image_base);
+    if (R.is_err[usize, str](hs)) { ret R.err[bool, str](R.unwrap_err[usize, str](hs)); }
+    lay.hdr_span = R.unwrap_ok[usize, str](hs);
+    if (MACH_HEADER_64_SIZE + sizeofcmds > lay.hdr_span) {
+        ret R.err[bool, str]("macho: dyn-exec header exceeds the linker's reservation");
     }
     lay.text_va       = segs[0].vaddr - lay.hdr_span::u64;
     lay.pagezero_size = lay.text_va;
@@ -5340,11 +5416,13 @@ fun ts_exec_x64() u8 {
     var code: [8]u8;
     var k: usize = 0;
     for (k < 8) { code[k] = 0x90; k = k + 1; }
+    # the linker leaves the header span above the base, so its first segment starts
+    # there and __TEXT is based exactly on the base.
     val base:  u64 = 0x100000000;
-    val entry: u64 = base + 0;
+    val entry: u64 = base + 4096;
 
     var segs: [1]of.LoadSegment;
-    segs[0].vaddr = base; segs[0].filesz = 8; segs[0].memsz = 8;
+    segs[0].vaddr = base + 4096; segs[0].filesz = 8; segs[0].memsz = 8;
     segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?code[0];
 
     val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_exe");
@@ -5423,11 +5501,13 @@ fun ts_exec_arm64() u8 {
     var code: [8]u8;
     bin.write_u32_le(?code[0], 0, 0xD503201F);  # nop
     bin.write_u32_le(?code[0], 4, 0xD65F03C0);  # ret
+    # arm64 darwin maps 16 KiB pages, so the header span the linker leaves above the
+    # base is that much.
     val base:  u64 = 0x100000000;
-    val entry: u64 = base + 0;
+    val entry: u64 = base + 16384;
 
     var segs: [1]of.LoadSegment;
-    segs[0].vaddr = base; segs[0].filesz = 8; segs[0].memsz = 8;
+    segs[0].vaddr = base + 16384; segs[0].filesz = 8; segs[0].memsz = 8;
     segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?code[0];
 
     val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_a64exe");
@@ -5530,11 +5610,14 @@ fun ts_dyn_exec(arch_id: u32) u8 {
         # a second instruction loads an imported data address through GOT_LOAD.
         code[7] = 0x48; code[8] = 0x8B; code[9] = 0x05;
     }
-    val base:  u64 = 0x100000000;
-    val entry: u64 = base;
+    val base:   u64 = 0x100000000;
+    # the linker leaves the arch page above the base for the header, so its first
+    # segment starts there.
+    val seg_va: u64 = base + macho_page_size(arch_id);
+    val entry:  u64 = seg_va;
 
     var segs: [1]of.LoadSegment;
-    segs[0].vaddr = base; segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].vaddr = seg_va; segs[0].filesz = 16; segs[0].memsz = 16;
     segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?code[0];
 
     var libs: [1]of.DynLib;
@@ -5558,12 +5641,12 @@ fun ts_dyn_exec(arch_id: u32) u8 {
 
     var fx: [1]of.PltFixup;
     fx[0].seg_index = 0; fx[0].seg_offset = fixup_off; fx[0].import_index = 1;
-    fx[0].patch_vaddr = base + fixup_off::u64; fx[0].addend = fixup_add;
+    fx[0].patch_vaddr = seg_va + fixup_off::u64; fx[0].addend = fixup_add;
 
     var gx: [1]of.ImportAddrFixup;
     if (arch_id == isa.ARCH_X86_64) {
         gx[0].seg_index = 0; gx[0].seg_offset = 10; gx[0].import_index = 0;
-        gx[0].patch_vaddr = base + 10; gx[0].kind = of.RK_GOTPCREL; gx[0].addend = -4;
+        gx[0].patch_vaddr = seg_va + 10; gx[0].kind = of.RK_GOTPCREL; gx[0].addend = -4;
         dyn.import_addr_fixups = ?gx[0];
         dyn.import_addr_fixup_count = 1;
     }
@@ -5814,6 +5897,7 @@ fun t_rebase_vaddr(buf: *u8, nth: u32) u64 {
 # seg_count: number of load segments
 # dyn:       the dynamic-link plan
 # entry:     the entry virtual address
+# base:      the image base the linker reserved the header span above
 # ret:       the emitted image bytes, or an error string
 # give each hand-built load segment the one named section a link of mach's own
 # objects would produce for it, since those objects carry one section name per kind
@@ -5848,13 +5932,13 @@ fun t_name_segs(alloc: *A.Allocator, itn: *intern.Interner, segs: *of.LoadSegmen
 
 fun t_emit_dyn(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
                segs: *of.LoadSegment, seg_count: u32, dyn: *of.DynamicInfo,
-               entry: u64) R.Result[Vector[u8], str] {
+               entry: u64, base: u64) R.Result[Vector[u8], str] {
     if (t_name_segs(alloc, itn, segs, seg_count) != 0) { ret R.err[Vector[u8], str]("names"); }
     val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "macho_seg");
     if (R.is_err[fs.TempFile, str](tf_r)) { ret R.err[Vector[u8], str]("temp"); }
     var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
     val em: R.Result[bool, str] = emit_dyn_exec(alloc, itn, isa_vt, segs, seg_count,
-                                                0x4000, segs[0].vaddr, entry,
+                                                0x4000, base, entry,
                                                 nil::*of.ExecFunction, 0, dyn, nil::*of.PltFixup, 0,
                                                 nil::*of.Section, 0, nil::*of.Section, 0,
                                                 fs.temp_path(?tf)::*u8, "machoseg"::*u8, of.image_options_default(of.SUBSYSTEM_CONSOLE));
@@ -5998,7 +6082,7 @@ fun ts_exec_frames_like_dyn() u8 {
     var dyn: of.DynamicInfo;
     dyn.interp = intern.STR_NIL;
     dyn.pie = true;
-    val dr: R.Result[Vector[u8], str] = t_emit_dyn(?alloc, ?itn, ?isa_vt, ?segs[0], 3, ?dyn, first);
+    val dr: R.Result[Vector[u8], str] = t_emit_dyn(?alloc, ?itn, ?isa_vt, ?segs[0], 3, ?dyn, first, base);
     if (R.is_err[Vector[u8], str](dr)) { ret 1; }
     val dynb: Vector[u8] = R.unwrap_ok[Vector[u8], str](dr);
 
@@ -6046,6 +6130,193 @@ fun ts_exec_frames_like_dyn() u8 {
     ret 0;
 }
 
+# write `segs` through both executable writers and hand each image back, so a fact
+# that must hold of the Mach-O framing can be asserted on the layouts together
+# ---
+# alloc:     allocator for the temp files and the returned bytes
+# itn:       interner the writers resolve names through
+# isa_vt:    the instruction-set vtable
+# segs:      the load segments to frame
+# seg_count: number of load segments
+# base:      the image base the header span was reserved above
+# stat:      out - the static (LC_UNIXTHREAD) image bytes
+# dynb:      out - the dyld-loaded (LC_MAIN) image bytes
+# ret:       0 when both writers succeeded, 1 otherwise
+fun t_emit_both(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
+                segs: *of.LoadSegment, seg_count: u32, base: u64,
+                stat: *Vector[u8], dynb: *Vector[u8]) u8 {
+    val opts: of.ImageOptions = of.image_options_default(of.SUBSYSTEM_CONSOLE);
+    val entry: u64 = segs[0].vaddr;
+
+    val sf: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "macho_both_s");
+    if (R.is_err[fs.TempFile, str](sf)) { ret 1; }
+    var stf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](sf);
+    val se: R.Result[bool, str] = emit_exec(alloc, itn, isa_vt, segs, seg_count,
+                                            macho_page_size(isa_vt.id), base, entry,
+                                            nil::*of.ExecFunction, 0, nil::*of.Section, 0,
+                                            nil::*of.Section, 0,
+                                            fs.temp_path(?stf)::*u8, "machoboth"::*u8, opts);
+    if (R.is_err[bool, str](se)) { fs.temp_close_and_remove(?stf); ret 1; }
+    val sb: R.Result[Vector[u8], str] = fs.read_bytes(alloc, fs.temp_path(?stf));
+    fs.temp_close_and_remove(?stf);
+    if (R.is_err[Vector[u8], str](sb)) { ret 1; }
+
+    var dyn: of.DynamicInfo;
+    dyn.interp = intern.STR_NIL;
+    dyn.pie = true;
+    val df: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "macho_both_d");
+    if (R.is_err[fs.TempFile, str](df)) { ret 1; }
+    var dtf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](df);
+    val de: R.Result[bool, str] = emit_dyn_exec(alloc, itn, isa_vt, segs, seg_count,
+                                                macho_page_size(isa_vt.id), base, entry,
+                                                nil::*of.ExecFunction, 0, ?dyn, nil::*of.PltFixup, 0,
+                                                nil::*of.Section, 0, nil::*of.Section, 0,
+                                                fs.temp_path(?dtf)::*u8, "machoboth"::*u8, opts);
+    if (R.is_err[bool, str](de)) { fs.temp_close_and_remove(?dtf); ret 1; }
+    val db: R.Result[Vector[u8], str] = fs.read_bytes(alloc, fs.temp_path(?dtf));
+    fs.temp_close_and_remove(?dtf);
+    if (R.is_err[Vector[u8], str](db)) { ret 1; }
+
+    @stat = R.unwrap_ok[Vector[u8], str](sb);
+    @dynb = R.unwrap_ok[Vector[u8], str](db);
+    ret 0;
+}
+
+# an image whose load commands outgrow one page still links, and its header lands
+# inside the span the linker reserved rather than pushing __TEXT off the base
+#
+# A Mach-O header carries an 80-byte section_64 per named section, and since #2606
+# the linker preserves input section identity instead of coalescing, so an
+# objective-c input contributes one per __objc_* section and the header clears a
+# page long before the address space runs out. `sizeofcmds` is a uint32, so the
+# format caps nothing here - a one-page cap was the linker's, and refusing the link
+# was #2690.
+#
+# Both halves matter. The wide reservation must produce the same framing the narrow
+# one did (__PAGEZERO spanning the whole low region, __TEXT based exactly on the
+# base, the header at file offset 0 inside it), or widening it would have
+# reintroduced the image-slid-a-page-low defect of #2599. And the same fixture
+# offered only the old one-page span must be REFUSED by both writers: without that,
+# a writer that quietly truncated its own load commands would pass everything above
+fun ts_header_span_multi_page(arch_id: u32) u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    var isa_vt: isa.IsaVTable = t_isa(arch_id);
+
+    val pg:    u64 = macho_page_size(arch_id);
+    val nsect: u32 = 256;
+
+    var bytes: [2048]u8;
+    var k: usize = 0;
+    for (k < 2048) { bytes[k] = 0; k = k + 1; }
+
+    val sr: R.Result[*of.LoadSection, str] = A.zallocate[of.LoadSection](?alloc, nsect::usize);
+    if (R.is_err[*of.LoadSection, str](sr)) { ret 1; }
+    val secs: *of.LoadSection = R.unwrap_ok[*of.LoadSection, str](sr);
+
+    # "__sNNN" - distinct names, since a section table with a repeated name would
+    # rebind every by-name lookup and is not what a real link produces.
+    var nm: [8]u8;
+    nm[0] = 0x5F; nm[1] = 0x5F; nm[2] = 0x73; nm[6] = 0; nm[7] = 0;
+    var i: u32 = 0;
+    for (i < nsect) {
+        nm[3] = (48 + (i / 100) % 10)::u8;
+        nm[4] = (48 + (i / 10) % 10)::u8;
+        nm[5] = (48 + i % 10)::u8;
+        secs[i].name   = t_intern(?itn, ?nm[0]);
+        if (secs[i].name == intern.STR_NIL) { ret 1; }
+        secs[i].kind   = of.SK_TEXT;
+        secs[i].offset = i * 8;
+        secs[i].len    = 8;
+        secs[i].align  = 8;
+        i = i + 1;
+    }
+
+    var segs: [1]of.LoadSegment;
+    segs[0].filesz = 2048; segs[0].memsz = 2048;
+    segs[0].flags  = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE;
+    segs[0].bytes  = ?bytes[0];
+    segs[0].sections      = secs;
+    segs[0].section_count = nsect;
+
+    # the span the linker would reserve for this shape, through the same vtable hook
+    # it calls during vaddr assignment.
+    var shape: of.HeaderShape;
+    shape.itn         = ?itn;
+    shape.libs        = nil::*of.DynLib;
+    shape.lib_count   = 0;
+    shape.seg_count   = 1;
+    shape.sect_count  = nsect;
+    shape.debug_count = 0;
+    shape.pie         = true;
+    shape.imports     = false;
+    val span: u64 = header_span(?shape, pg);
+    if (span <= pg)          { ret 1; }   # the fixture must outgrow one page
+    if ((span % pg) != 0)    { ret 1; }   # ... in whole pages
+
+    val base: u64 = 0x100000000;
+    segs[0].vaddr = base + span;
+
+    var stat: Vector[u8];
+    var dynb: Vector[u8];
+    if (t_emit_both(?alloc, ?itn, ?isa_vt, ?segs[0], 1, base, ?stat, ?dynb) != 0) { ret 1; }
+
+    var w: u32 = 0;
+    for (w < 2) {
+        var buf: *u8 = stat.data;
+        if (w == 1) { buf = dynb.data; }
+
+        # the header really is over a page, and it fits the reservation.
+        val sizeofcmds: usize = bin.read_u32_le(buf, 20)::usize;
+        if (sizeofcmds::u64 <= pg)                              { ret 1; }
+        if (MACH_HEADER_64_SIZE + sizeofcmds > span::usize)     { ret 1; }
+
+        # __PAGEZERO spans the whole low region and __TEXT is based exactly on the
+        # base, with the header at file offset 0 inside it (#2599).
+        val pz: usize = t_find_seg(buf, "__PAGEZERO");
+        val tx: usize = t_find_seg(buf, "__TEXT");
+        if (pz == 0 || tx == 0)                                 { ret 1; }
+        if (bin.read_u64_le(buf, pz + 24) != 0)                 { ret 1; }
+        if (bin.read_u64_le(buf, pz + 32) != base)              { ret 1; }
+        if (bin.read_u64_le(buf, tx + 24) != base)              { ret 1; }
+        if (bin.read_u64_le(buf, tx + 40) != 0)                 { ret 1; }
+        if (bin.read_u32_le(buf, tx + 64) != nsect)             { ret 1; }
+
+        # the first section starts where the reservation ends, in both address and
+        # file offset, so the header and the content agree on where the header stops.
+        val s0: usize = tx + SEGMENT_CMD_64_SIZE;
+        if (bin.read_u64_le(buf, s0 + 32) != base + span)       { ret 1; }
+        if (bin.read_u32_le(buf, s0 + 48)::u64 != span)         { ret 1; }
+        w = w + 1;
+    }
+
+    # offered only the page the linker used to reserve unconditionally, both writers
+    # refuse rather than emit a header that overruns its span.
+    segs[0].vaddr = base + pg;
+    val opts: of.ImageOptions = of.image_options_default(of.SUBSYSTEM_CONSOLE);
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_span_bad");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val bad_s: R.Result[bool, str] = emit_exec(?alloc, ?itn, ?isa_vt, ?segs[0], 1,
+                                               pg, base, base + pg,
+                                               nil::*of.ExecFunction, 0, nil::*of.Section, 0,
+                                               nil::*of.Section, 0,
+                                               fs.temp_path(?tf)::*u8, "machospanbad"::*u8, opts);
+    var dyn: of.DynamicInfo;
+    dyn.interp = intern.STR_NIL;
+    dyn.pie = true;
+    val bad_d: R.Result[bool, str] = emit_dyn_exec(?alloc, ?itn, ?isa_vt, ?segs[0], 1,
+                                                   pg, base, base + pg,
+                                                   nil::*of.ExecFunction, 0, ?dyn, nil::*of.PltFixup, 0,
+                                                   nil::*of.Section, 0, nil::*of.Section, 0,
+                                                   fs.temp_path(?tf)::*u8, "machospanbad"::*u8, opts);
+    fs.temp_close_and_remove(?tf);
+    if (!R.is_err[bool, str](bad_s)) { ret 1; }
+    if (!R.is_err[bool, str](bad_d)) { ret 1; }
+    ret 0;
+}
+
 # the Mach-O segment table a PIE link with distinct rodata and rel.ro segments must
 # produce: exactly one segment is SG_READ_ONLY - the one the rebase stream writes
 # into, which is also the only one that may be named __DATA_CONST - while un-rebased
@@ -6070,19 +6341,21 @@ fun ts_dyn_exec_relro_segments(arch_id: u32) u8 {
     for (k < 80) { bytes[k] = 0; k = k + 1; }
 
     # text, data, rodata, rel.ro, bss - each on its own 16 KiB page, in the linker's
-    # per-kind segment order.
-    val base: u64 = 0x100000000;
-    val pg:   u64 = 0x4000;
+    # per-kind segment order, starting one page above the base where the linker
+    # reserved the header span.
+    val base:  u64 = 0x100000000;
+    val pg:    u64 = 0x4000;
+    val first: u64 = base + pg;
     var segs: [5]of.LoadSegment;
-    segs[0].vaddr = base;          segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].vaddr = first;          segs[0].filesz = 16; segs[0].memsz = 16;
     segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE;  segs[0].bytes = ?bytes[0];
-    segs[1].vaddr = base + pg;     segs[1].filesz = 16; segs[1].memsz = 16;
+    segs[1].vaddr = first + pg;     segs[1].filesz = 16; segs[1].memsz = 16;
     segs[1].flags = of.SEG_FLAG_READ | of.SEG_FLAG_WRITE;    segs[1].bytes = ?bytes[16];
-    segs[2].vaddr = base + pg * 2; segs[2].filesz = 16; segs[2].memsz = 16;
+    segs[2].vaddr = first + pg * 2; segs[2].filesz = 16; segs[2].memsz = 16;
     segs[2].flags = of.SEG_FLAG_READ;                        segs[2].bytes = ?bytes[32];
-    segs[3].vaddr = base + pg * 3; segs[3].filesz = 16; segs[3].memsz = 16;
+    segs[3].vaddr = first + pg * 3; segs[3].filesz = 16; segs[3].memsz = 16;
     segs[3].flags = of.SEG_FLAG_READ;                        segs[3].bytes = ?bytes[48];
-    segs[4].vaddr = base + pg * 4; segs[4].filesz = 0;  segs[4].memsz = 16;
+    segs[4].vaddr = first + pg * 4; segs[4].filesz = 0;  segs[4].memsz = 16;
     segs[4].flags = of.SEG_FLAG_READ | of.SEG_FLAG_WRITE;    segs[4].bytes = nil;
 
     # pointers to slide in rel.ro and in data: a writable segment is already writable
@@ -6098,7 +6371,7 @@ fun ts_dyn_exec_relro_segments(arch_id: u32) u8 {
     dyn.base_reloc_count = 2;
     dyn.pie = true;
 
-    val r1: R.Result[Vector[u8], str] = t_emit_dyn(?alloc, ?itn, ?isa_vt, ?segs[0], 5, ?dyn, base);
+    val r1: R.Result[Vector[u8], str] = t_emit_dyn(?alloc, ?itn, ?isa_vt, ?segs[0], 5, ?dyn, first, base);
     if (R.is_err[Vector[u8], str](r1)) { ret 1; }
     val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](r1);
 
@@ -6108,7 +6381,7 @@ fun ts_dyn_exec_relro_segments(arch_id: u32) u8 {
     if (t_count_segs_named(buf.data, "__DATA_CONST") != 1)                   { ret 1; }
     val dc: usize = t_find_seg(buf.data, "__DATA_CONST");
     if (dc == 0)                                                             { ret 1; }
-    if (bin.read_u64_le(buf.data, dc + 24) != base + pg * 3)                 { ret 1; }
+    if (bin.read_u64_le(buf.data, dc + 24) != first + pg * 3)                 { ret 1; }
     if ((bin.read_u32_le(buf.data, dc + 68) & SG_READ_ONLY) == 0)            { ret 1; }
     if (bin.read_u32_le(buf.data, dc + 60) != (VM_PROT_READ | VM_PROT_WRITE)) { ret 1; }
     if (bin.read_u32_le(buf.data, dc + 64) != 1)                             { ret 1; }
@@ -6118,7 +6391,7 @@ fun ts_dyn_exec_relro_segments(arch_id: u32) u8 {
     if (t_count_segs_named(buf.data, "__RODATA") != 1)                       { ret 1; }
     val rd: usize = t_find_seg(buf.data, "__RODATA");
     if (rd == 0)                                                             { ret 1; }
-    if (bin.read_u64_le(buf.data, rd + 24) != base + pg * 2)                 { ret 1; }
+    if (bin.read_u64_le(buf.data, rd + 24) != first + pg * 2)                 { ret 1; }
     if (bin.read_u32_le(buf.data, rd + 60) != VM_PROT_READ)                  { ret 1; }
     if (bin.read_u32_le(buf.data, rd + 56) != VM_PROT_READ)                  { ret 1; }
     if ((bin.read_u32_le(buf.data, rd + 68) & SG_READ_ONLY) != 0)            { ret 1; }
@@ -6128,7 +6401,7 @@ fun ts_dyn_exec_relro_segments(arch_id: u32) u8 {
     # after fixups, faulting the program's first store to a pointer-valued global.
     val dt: usize = t_find_seg(buf.data, "__DATA");
     if (dt == 0)                                                             { ret 1; }
-    if (bin.read_u64_le(buf.data, dt + 24) != base + pg)                     { ret 1; }
+    if (bin.read_u64_le(buf.data, dt + 24) != first + pg)                     { ret 1; }
     if (bin.read_u32_le(buf.data, dt + 60) != (VM_PROT_READ | VM_PROT_WRITE)) { ret 1; }
     if (bin.read_u32_le(buf.data, dt + 56) != (VM_PROT_READ | VM_PROT_WRITE)) { ret 1; }
     if ((bin.read_u32_le(buf.data, dt + 68) & SG_READ_ONLY) != 0)            { ret 1; }
@@ -6136,31 +6409,31 @@ fun ts_dyn_exec_relro_segments(arch_id: u32) u8 {
     # every section names the segment it lives in, and each rebase resolves through
     # its selected segment back to the address the linker recorded.
     if (!t_sections_match_segname(buf.data))                                 { ret 1; }
-    if (t_rebase_vaddr(buf.data, 0) != base + pg)                            { ret 1; }
-    if (t_rebase_vaddr(buf.data, 1) != base + pg * 3)                        { ret 1; }
+    if (t_rebase_vaddr(buf.data, 0) != first + pg)                            { ret 1; }
+    if (t_rebase_vaddr(buf.data, 1) != first + pg * 3)                        { ret 1; }
     if (t_rebase_vaddr(buf.data, 2) != 0)                                    { ret 1; }
 
     # rodata rebased as well: both read-only segments now need dyld's fixup pass, and
     # Mach-O maps one such segment - they share it, carrying a section each, so the
     # image keeps exactly one SG_READ_ONLY instead of being refused.
     dyn.base_reloc_count = 3;
-    val r2: R.Result[Vector[u8], str] = t_emit_dyn(?alloc, ?itn, ?isa_vt, ?segs[0], 5, ?dyn, base);
+    val r2: R.Result[Vector[u8], str] = t_emit_dyn(?alloc, ?itn, ?isa_vt, ?segs[0], 5, ?dyn, first, base);
     if (R.is_err[Vector[u8], str](r2)) { ret 1; }
     val buf2: Vector[u8] = R.unwrap_ok[Vector[u8], str](r2);
     if (t_count_sg_read_only(buf2.data) != 1)                                { ret 1; }
     if (t_count_segs_named(buf2.data, "__DATA_CONST") != 1)                  { ret 1; }
     if (t_count_segs_named(buf2.data, "__RODATA") != 0)                      { ret 1; }
     val dc2: usize = t_find_seg(buf2.data, "__DATA_CONST");
-    if (bin.read_u64_le(buf2.data, dc2 + 24) != base + pg * 2)               { ret 1; }
+    if (bin.read_u64_le(buf2.data, dc2 + 24) != first + pg * 2)               { ret 1; }
     if (bin.read_u32_le(buf2.data, dc2 + 64) != 2)                           { ret 1; }
     if (bin.read_u64_le(buf2.data, dc2 + 32)
         != bin.align_up_u64(pg + 16, macho_page_size(arch_id)))              { ret 1; }
     if (!t_sections_match_segname(buf2.data))                                { ret 1; }
     # the merged members share one command index, and their offsets are measured from
     # that command's address, not from the member's own.
-    if (t_rebase_vaddr(buf2.data, 0) != base + pg)                           { ret 1; }
-    if (t_rebase_vaddr(buf2.data, 1) != base + pg * 2)                       { ret 1; }
-    if (t_rebase_vaddr(buf2.data, 2) != base + pg * 3)                       { ret 1; }
+    if (t_rebase_vaddr(buf2.data, 0) != first + pg)                           { ret 1; }
+    if (t_rebase_vaddr(buf2.data, 1) != first + pg * 2)                       { ret 1; }
+    if (t_rebase_vaddr(buf2.data, 2) != first + pg * 3)                       { ret 1; }
     ret 0;
 }
 
@@ -6179,16 +6452,17 @@ fun ts_dyn_exec_split_data_const() u8 {
     var k: usize = 0;
     for (k < 64) { bytes[k] = 0; k = k + 1; }
 
-    val base: u64 = 0x100000000;
-    val pg:   u64 = 0x4000;
+    val base:  u64 = 0x100000000;
+    val pg:    u64 = 0x4000;
+    val first: u64 = base + pg;
     var segs: [4]of.LoadSegment;
-    segs[0].vaddr = base;          segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].vaddr = first;          segs[0].filesz = 16; segs[0].memsz = 16;
     segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?bytes[0];
-    segs[1].vaddr = base + pg;     segs[1].filesz = 16; segs[1].memsz = 16;
+    segs[1].vaddr = first + pg;     segs[1].filesz = 16; segs[1].memsz = 16;
     segs[1].flags = of.SEG_FLAG_READ;                       segs[1].bytes = ?bytes[16];
-    segs[2].vaddr = base + pg * 2; segs[2].filesz = 16; segs[2].memsz = 16;
+    segs[2].vaddr = first + pg * 2; segs[2].filesz = 16; segs[2].memsz = 16;
     segs[2].flags = of.SEG_FLAG_READ | of.SEG_FLAG_WRITE;   segs[2].bytes = ?bytes[32];
-    segs[3].vaddr = base + pg * 3; segs[3].filesz = 16; segs[3].memsz = 16;
+    segs[3].vaddr = first + pg * 3; segs[3].filesz = 16; segs[3].memsz = 16;
     segs[3].flags = of.SEG_FLAG_READ;                       segs[3].bytes = ?bytes[48];
 
     var brs: [2]of.BaseReloc;
@@ -6201,7 +6475,7 @@ fun ts_dyn_exec_split_data_const() u8 {
     dyn.base_reloc_count = 2;
     dyn.pie = true;
 
-    val r: R.Result[Vector[u8], str] = t_emit_dyn(?alloc, ?itn, ?isa_vt, ?segs[0], 4, ?dyn, base);
+    val r: R.Result[Vector[u8], str] = t_emit_dyn(?alloc, ?itn, ?isa_vt, ?segs[0], 4, ?dyn, first, base);
     if (!R.is_err[Vector[u8], str](r))                                       { ret 1; }
     val msg: str = R.unwrap_err[Vector[u8], str](r);
     # the diagnostic names both offending segments and a relocation inside the second.
@@ -6225,14 +6499,15 @@ fun ts_exec_merges_read_only() u8 {
     var k: usize = 0;
     for (k < 48) { bytes[k] = 0; k = k + 1; }
 
-    val base: u64 = 0x100000000;
-    val pg:   u64 = 0x4000;
+    val base:  u64 = 0x100000000;
+    val pg:    u64 = 0x4000;
+    val first: u64 = base + pg;
     var segs: [3]of.LoadSegment;
-    segs[0].vaddr = base;          segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].vaddr = first;          segs[0].filesz = 16; segs[0].memsz = 16;
     segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?bytes[0];
-    segs[1].vaddr = base + pg;     segs[1].filesz = 16; segs[1].memsz = 16;
+    segs[1].vaddr = first + pg;     segs[1].filesz = 16; segs[1].memsz = 16;
     segs[1].flags = of.SEG_FLAG_READ;                       segs[1].bytes = ?bytes[16];
-    segs[2].vaddr = base + pg * 2; segs[2].filesz = 16; segs[2].memsz = 16;
+    segs[2].vaddr = first + pg * 2; segs[2].filesz = 16; segs[2].memsz = 16;
     segs[2].flags = of.SEG_FLAG_READ;                       segs[2].bytes = ?bytes[32];
 
     val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_exec_ro");
@@ -6240,7 +6515,7 @@ fun ts_exec_merges_read_only() u8 {
     var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
     if (t_name_segs(?alloc, ?itn, ?segs[0], 3) != 0) { ret 1; }
     val em: R.Result[bool, str] = emit_exec(?alloc, ?itn, ?isa_vt, ?segs[0], 3,
-                                            pg, base, base,
+                                            pg, base, first,
                                             nil::*of.ExecFunction, 0, nil::*of.Section, 0,
                                             nil::*of.Section, 0,
                                             fs.temp_path(?tf)::*u8, "machoexecro"::*u8, of.image_options_default(of.SUBSYSTEM_CONSOLE));
@@ -6255,7 +6530,7 @@ fun ts_exec_merges_read_only() u8 {
     if (rd == 0)                                                             { ret 1; }
     # one command spanning both read-only segments, from the first's address to the
     # second's end.
-    if (bin.read_u64_le(buf.data, rd + 24) != base + pg)                     { ret 1; }
+    if (bin.read_u64_le(buf.data, rd + 24) != first + pg)                     { ret 1; }
     if (bin.read_u64_le(buf.data, rd + 32)
         != bin.align_up_u64(pg + 16, EXEC_PAGE_SIZE))                        { ret 1; }
     if (bin.read_u32_le(buf.data, rd + 60) != VM_PROT_READ)                  { ret 1; }
@@ -6487,6 +6762,8 @@ test "mach.lang.target.of.macho:dyn_exec" {
     if (ts_dyn_exec_split_data_const() != 0)               { ret 1; }
     if (ts_exec_merges_read_only() != 0)                   { ret 1; }
     if (ts_exec_frames_like_dyn() != 0)                    { ret 1; }
+    if (ts_header_span_multi_page(isa.ARCH_X86_64) != 0)   { ret 1; }
+    if (ts_header_span_multi_page(isa.ARCH_AARCH64) != 0)  { ret 1; }
     if (ts_import_address_fixup_validation() != 0)         { ret 1; }
     ret 0;
 }
@@ -6509,10 +6786,10 @@ fun ts_exec_debug_roundtrip() u8 {
     var k: usize = 0;
     for (k < 8) { code[k] = 0x90; k = k + 1; }
     val base:  u64 = 0x100000000;
-    val entry: u64 = base;
+    val entry: u64 = base + 4096;
 
     var segs: [1]of.LoadSegment;
-    segs[0].vaddr = base; segs[0].filesz = 8; segs[0].memsz = 8;
+    segs[0].vaddr = base + 4096; segs[0].filesz = 8; segs[0].memsz = 8;
     segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?code[0];
 
     var info_bytes: [4]u8;

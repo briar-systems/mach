@@ -93,10 +93,22 @@ $is_pointer(T)          # T is a reference: the raw `ptr` or a typed `*U`
 They are **comptime-only** — a gate condition selects an arm, and there is no
 runtime boolean for one to become, so using a predicate as a value is an error.
 
-A `^` secret wrapper is stripped before the question is answered: `^Pair` is a
-record, because `^T` is a wrapper over `T`'s storage. A generic instance answers as
-the declaration it instantiates, so `Box[i64]` is a record — which is the type a
-reflection loop actually meets.
+**`^` is a constructor, and a predicate answers about the outermost one.** `^Pair`
+is a secret, not a record, so all three answer false and a reflection walk refuses
+it instead of descending into secret storage. That is what keeps a predicate and
+`$fields` in agreement: `$fields(^Pair)` refuses, so a gate that called `^Pair` a
+record would send a walk into an operand the intrinsic then rejects.
+
+Outermost means outermost. `^*u8` is a secret pointer and answers false; `*^u8` is
+a **public** pointer to secret storage and is still a pointer, since the address is
+public. A generic instance answers as the declaration it instantiates, so `Box[i64]`
+is a record — which is the type a reflection loop actually meets — and `Box[^u64]`
+is a record too, because the instance is not itself secret; its field is, and the
+field is where a walk meets the question.
+
+Because all three answer false for `^T`, "nothing classifies it" is itself a usable
+signal: a walk that gates on the three predicates and refuses the fallthrough
+refuses secrets without needing to ask about secrecy directly.
 
 ```mach
 rec Inner { x: u64; y: u64; }
@@ -118,7 +130,22 @@ $type_name(T)           # the type's spelling, as a NUL-terminated string
 Unlike the predicates this **is** a value (`*u8`), usable anywhere one is. The
 spelling is the same one diagnostics print, so a name a program reads and a name an
 error reports cannot drift. Composites spell compositely (`$type_name(*Pair)` is
-`"*Pair"`), and a `^` wrapper is stripped as it is for the predicates.
+`"*Pair"`), and `^` spells too: `$type_name(^Pair)` is `"^Pair"`. Stripping it would
+be a drift on the one qualifier where a drift matters most, since a diagnostic about
+that type prints `^Pair`.
+
+## Where `^` is stripped
+
+One rule covers the whole surface: **`^` is stripped only where the question is
+about storage.**
+
+| asks about | strips `^` |
+|---|---|
+| `$size_of` / `$align_of` / `$offset_of` | yes — a secret occupies its base type's storage |
+| `$is_record` / `$is_union` / `$is_pointer` | no — `^T` is a secret, not a `T` |
+| `$type_name` | no — the spelling is `^T` |
+| `$fields` | no — a secret record is refused, not walked |
+| type comparison (`f.type == u64`) | no — `^u64` is not `u64` |
 
 ## The type operand
 

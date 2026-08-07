@@ -56,6 +56,7 @@ use R: std.types.result;
 
 use mach.lang.intern;
 use mach.lang.source;
+use mach.lang.spirvop;
 use mach.lang.target.resolved;
 use mach.lang.me.ir;
 use mach.lang.me.ir.type;
@@ -82,6 +83,10 @@ use mach.lang.target.isa.spirv.types;
 # has_entry: whether any function in the module declares a pipeline stage, which
 #           decides whether this is a shader module (entry points, no Linkage) or a
 #           library module (Linkage exports, no entry point)
+# gtype_ids: the SPIR-V VALUE type each interface variable was declared with, and
+#           gstorage its storage class. An access chain's result is a pointer to a
+#           member of that exact type, and a laid-out block's array members are not
+#           interned, so the declared id has to be remembered rather than rebuilt.
 # gvar_ids: SPIR-V OpVariable id per IR global index, allocated before any body is
 #           emitted so a load or store can name a variable declared later (0 for a
 #           global carrying no interface role)
@@ -103,10 +108,19 @@ rec Emit {
     fn_ids:    *u32;
     has_entry: bool;
     gvar_ids:  *u32;
+    gtype_ids: *u32;
+    gstorage:  *u32;
     iface_ids: *u32;
     iface_len: u32;
     gslot:     *u32;
     iface_use: *u8;
+
+    # the id each extended instruction set was imported under, indexed by
+    # spirvop.SPV_SET_*; 0 means "not imported yet". indexed rather than one field
+    # per set so a second set is a row in `spirvop`, not a change here. the import
+    # is minted at the FIRST call that needs it, which is what makes it on demand:
+    # a module using none of them carries no OpExtInstImport at all
+    ext_ids:   [8]u32;
 
     # the refusal context: which function is being emitted and which instruction
     # is being translated, so a refusal can say so without every site threading
@@ -125,11 +139,18 @@ rec Emit {
 # type_id: SPIR-V element type id per vreg (0 when the vreg has no determined type)
 # var_id:  SPIR-V OpVariable id per vreg (0 when the vreg needs no variable)
 # is_bool: whether the vreg holds a boolean (defined by a comparison)
+# chain_id: for a vreg defined by an access chain, the resulting POINTER id, and
+#          chain_ty the type it points at. Such a vreg holds an address rather than
+#          a value, so it gets no backing variable and is never loaded as one; the
+#          load or store that consumes it addresses through the chain instead
 # n:       number of vregs
 rec VMaps {
     type_id: *u32;
     var_id:  *u32;
     is_bool: *bool;
+    chain_id: *u32;
+    chain_ty: *u32;
+    chain_sc: *u32;
     n:       u32;
 }
 
@@ -180,8 +201,10 @@ pub fun emit_module(tgt: *resolved.Target, irmod: *ir.Module,
     var e: Emit;
     e.alloc = mirmod.alloc; e.interner = mirmod.interner;
     e.tgt = tgt; e.ir = irmod; e.b = ?b; e.tt = ?tt; e.fn_ids = nil;
-    e.gvar_ids = nil; e.iface_ids = nil; e.iface_len = 0;
+    e.gvar_ids = nil; e.gtype_ids = nil; e.gstorage = nil; e.iface_ids = nil; e.iface_len = 0;
     e.gslot = nil; e.iface_use = nil;
+    var xi: u32 = 0;
+    for (xi < 8) { e.ext_ids[xi] = 0; xi = xi + 1; }
     e.srcmap = mirmod.srcmap; e.cur_fn = nil; e.cur_instr = nil;
 
     # a module is a shader module or a library module, never both, and which one is
@@ -240,6 +263,15 @@ pub fun emit_module(tgt: *resolved.Target, irmod: *ir.Module,
         # a body-less MIR function (an extern declaration) lowers to an empty shell;
         # it contributes no OpFunction (SPIR-V imports are a later phase).
         if (mf.block_count == 0) { fi = fi + 1; cnt; }
+        # a function that IS a SPIR-V instruction contributes no OpFunction either.
+        # It has a mach body - that is what makes `shader.math` a real library on a
+        # CPU target rather than a set of declarations - but on this target every
+        # call to it becomes the instruction, so the body is unreachable. Emitting it
+        # anyway would be worse than dead weight: the native body is written in terms
+        # of the bit manipulation a CPU needs, which is exactly what logical
+        # addressing refuses, so the module would fail to build over code nothing
+        # calls.
+        if (instruction_mapped(e.ir, mf.name)) { fi = fi + 1; cnt; }
         val fr: R.Result[bool, str] = emit_function(?e, mf);
         if (R.is_err[bool, str](fr)) {
             emit_dnit(?e, irmod.function_len);
@@ -284,6 +316,14 @@ fun emit_dnit(e: *Emit, n: u32) {
         A.deallocate[u32](e.alloc, e.gslot, e.ir.global_len::usize);
     }
     e.gslot = nil;
+    if (e.gtype_ids != nil && e.ir.global_len > 0) {
+        A.deallocate[u32](e.alloc, e.gtype_ids, e.ir.global_len::usize);
+    }
+    e.gtype_ids = nil;
+    if (e.gstorage != nil && e.ir.global_len > 0) {
+        A.deallocate[u32](e.alloc, e.gstorage, e.ir.global_len::usize);
+    }
+    e.gstorage = nil;
     if (e.iface_use != nil && n > 0 && e.iface_len > 0) {
         A.deallocate[u8](e.alloc, e.iface_use, (n * e.iface_len)::usize);
     }
@@ -319,9 +359,15 @@ fun declare_interface(e: *Emit) R.Result[bool, str] {
     val rs: R.Result[*u32, str] = A.allocate[u32](e.alloc, n::usize);
     if (R.is_err[*u32, str](rs)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rs)); }
     e.gslot = R.unwrap_ok[*u32, str](rs);
+    val rt: R.Result[*u32, str] = A.allocate[u32](e.alloc, n::usize);
+    if (R.is_err[*u32, str](rt)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rt)); }
+    e.gtype_ids = R.unwrap_ok[*u32, str](rt);
+    val rc: R.Result[*u32, str] = A.allocate[u32](e.alloc, n::usize);
+    if (R.is_err[*u32, str](rc)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rc)); }
+    e.gstorage = R.unwrap_ok[*u32, str](rc);
 
     var i: u32 = 0;
-    for (i < n) { e.gvar_ids[i] = 0; e.iface_ids[i] = 0; e.gslot[i] = 0; i = i + 1; }
+    for (i < n) { e.gvar_ids[i] = 0; e.iface_ids[i] = 0; e.gslot[i] = 0; e.gtype_ids[i] = 0; e.gstorage[i] = 0; i = i + 1; }
 
     i = 0;
     for (i < n) {
@@ -362,7 +408,9 @@ fun declare_interface(e: *Emit) R.Result[bool, str] {
         var vop: [3]u32;
         vop[0] = ptr_ty; vop[1] = var_id; vop[2] = storage;
         spirv.inst(e.b, ?e.b.types_consts, spirv.OP_VARIABLE, ?vop[0], 3);
-        e.gvar_ids[i] = var_id;
+        e.gvar_ids[i]  = var_id;
+        e.gtype_ids[i] = value_ty;
+        e.gstorage[i]  = storage;
 
         if (g.iface == ir.IFACE_INPUT || g.iface == ir.IFACE_OUTPUT) {
             decorate(e, var_id, spirv.DECOR_LOCATION, g.iface_a);
@@ -446,7 +494,7 @@ fun laid_out_struct(e: *Emit, id: type.IrTypeId, relaxed_stride: bool) R.Result[
         members[i] = R.unwrap_ok[u32, str](mr);
         i = i + 1;
     }
-    val struct_id: u32 = types.type_struct(e.tt, ?members[0], n);
+    val struct_id: u32 = types.type_struct(e.tt, ?members[0], n, true);
     if (struct_id == 0) { ret R.err[u32, str]("spirv.emit: could not build a uniform block type"); }
 
     i = 0;
@@ -805,13 +853,6 @@ fun emit_function(e: *Emit, mf: *mir.MirFunction) R.Result[bool, str] {
     }
     or (!e.has_entry) { emit_linkage_export(e, fn_id, fn_name); }
 
-    # a vector materialized through memory is refused up front, under its own name.
-    # Reaching it instruction by instruction would report the `alloca` that opens the
-    # sequence, which is the least informative part of it.
-    if (builds_vector_through_memory(e, mf)) {
-        ret unsupported(e, "constructing a vector from a literal or an uninitialized local is not yet supported by the SPIR-V target: the value is built in an ADDRESSABLE LOCAL and read back out, and this milestone emits no local allocations at all. a literal additionally writes its lanes through per-lane indices, which MIR folds into byte displacements the lane ordinal cannot be recovered from. derive the vector from an existing vector value instead - lane assignment onto a parameter, or arithmetic");
-    }
-
     # the structured shape of the body, or a refusal naming the construct.
     val cr: R.Result[cfg.Structure, str] = cfg.analyze(mf, e.alloc);
     if (R.is_err[cfg.Structure, str](cr)) { ret R.err[bool, str](R.unwrap_err[cfg.Structure, str](cr)); }
@@ -970,45 +1011,6 @@ fun defining_instr(mf: *mir.MirFunction, vreg: u32) *mir.MirInstr {
 fun address_operand_index(mi: *mir.MirInstr) u32 {
     if (mi.opcode == mir.MIR_LOAD) { ret 1; }
     ret 0;
-}
-
-# whether a function materializes a vector by reading one out of a local allocation
-#
-# The signature of the vector-literal / zero-init lowering: an `alloca f32x4`
-# written lane by lane or zeroed, then a whole-vector `load f32x4` off the same
-# pointer. The ALLOCA origin is the identifying part. A vector arriving from or
-# leaving through an interface variable reads the same way at the instruction level
-# but originates in a global, and reporting it as a literal sent readers to the
-# wrong problem.
-#
-# The allocation used to be an `[4]f32` reinterpreted as a vector through its
-# pointer, which no SPIR-V back end could have accepted. That is fixed upstream: it
-# is now allocated at the vector's own type, so what remains is only that this
-# milestone emits no local allocations.
-# ---
-# e:   the emission state
-# mf:  the MIR function
-# ret: true when a vector-typed load or store reads a local allocation
-fun builds_vector_through_memory(e: *Emit, mf: *mir.MirFunction) bool {
-    var bi: u32 = 0;
-    for (bi < mf.block_count) {
-        val blk: *mir.MirBlock = ?mf.blocks[bi];
-        var ii: u32 = 0;
-        for (ii < blk.instr_count) {
-            val mi: *mir.MirInstr = ?blk.instrs[ii];
-            if ((mi.opcode == mir.MIR_LOAD || mi.opcode == mir.MIR_STORE)
-                && mir.vec_lane_is_vector(mi.vec_lane)
-                && mi.operand_count == 2) {
-                var gix: u32 = 0;
-                if (address_origin(e, mf, ?mi.operands[address_operand_index(mi)], ?gix) == ADDR_ALLOCA) {
-                    ret true;
-                }
-            }
-            ii = ii + 1;
-        }
-        bi = bi + 1;
-    }
-    ret false;
 }
 
 # the diagnostic for a CFG the reconstruction cannot express, naming the function
@@ -1371,6 +1373,9 @@ fun build_vmaps(e: *Emit, mf: *mir.MirFunction, irfn: *ir.Function, out: *VMaps)
     out.type_id = nil;
     out.var_id  = nil;
     out.is_bool = nil;
+    out.chain_id = nil;
+    out.chain_ty = nil;
+    out.chain_sc = nil;
     if (n == 0) { ret R.ok[bool, str](true); }
 
     val rt: R.Result[*u32, str] = A.allocate[u32](e.alloc, n::usize);
@@ -1382,9 +1387,18 @@ fun build_vmaps(e: *Emit, mf: *mir.MirFunction, irfn: *ir.Function, out: *VMaps)
     val rb: R.Result[*bool, str] = A.allocate[bool](e.alloc, n::usize);
     if (R.is_err[*bool, str](rb)) { ret R.err[bool, str](R.unwrap_err[*bool, str](rb)); }
     out.is_bool = R.unwrap_ok[*bool, str](rb);
+    val rch: R.Result[*u32, str] = A.allocate[u32](e.alloc, n::usize);
+    if (R.is_err[*u32, str](rch)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rch)); }
+    out.chain_id = R.unwrap_ok[*u32, str](rch);
+    val rct: R.Result[*u32, str] = A.allocate[u32](e.alloc, n::usize);
+    if (R.is_err[*u32, str](rct)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rct)); }
+    out.chain_ty = R.unwrap_ok[*u32, str](rct);
+    val rcs: R.Result[*u32, str] = A.allocate[u32](e.alloc, n::usize);
+    if (R.is_err[*u32, str](rcs)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rcs)); }
+    out.chain_sc = R.unwrap_ok[*u32, str](rcs);
 
     var i: u32 = 0;
-    for (i < n) { out.type_id[i] = 0; out.var_id[i] = 0; out.is_bool[i] = false; i = i + 1; }
+    for (i < n) { out.type_id[i] = 0; out.var_id[i] = 0; out.is_bool[i] = false; out.chain_id[i] = 0; out.chain_ty[i] = 0; out.chain_sc[i] = 0; i = i + 1; }
 
     # a vreg fed from a nominal register is typed by the DECLARATION behind that
     # register, never by the move: the ABI pre-coloring is emitted at the machine
@@ -1408,10 +1422,19 @@ fun build_vmaps(e: *Emit, mf: *mir.MirFunction, irfn: *ir.Function, out: *VMaps)
                 val v: u32 = mi.operands[0].vreg;
                 var t: u32 = 0;
                 if (callee != intern.STR_NIL) {
-                    val cix: u32 = ir_function_index(e.ir, callee);
-                    if (cix != IR_FN_NONE) {
+                    # by RECORD, not by `ir_function_index`, which skips a
+                    # declaration because its answer also selects a pre-allocated
+                    # SPIR-V id. What is wanted here is the callee's declared RETURN
+                    # TYPE, which a signature-only declaration has just as much as a
+                    # definition does. Looking it up the other way left every
+                    # cross-module call's result typed by the move's machine width
+                    # instead: an `f32` came back 64 bits wide and a scalar returned
+                    # from vector arguments came back a vector, and the module failed
+                    # validation at the store rather than at the call.
+                    val cfn: *ir.Function = ir_function_record(e.ir, callee);
+                    if (cfn != nil) {
                         var cvoid: bool = false;
-                        t = ir_return_spv_type(e, ?e.ir.functions[cix], ?cvoid);
+                        t = ir_return_spv_type(e, cfn, ?cvoid);
                         if (cvoid) { t = 0; }
                     }
                     callee = intern.STR_NIL;
@@ -1438,6 +1461,15 @@ fun build_vmaps(e: *Emit, mf: *mir.MirFunction, irfn: *ir.Function, out: *VMaps)
     val r2: R.Result[bool, str] = type_computed_defs(e, mf, out, false);
     if (R.is_err[bool, str](r2)) { ret r2; }
 
+    # a local allocation becomes a Function-storage OpVariable, declared HERE rather
+    # than where the MIR_ALLOCA sits: SPIR-V requires every Function variable to be
+    # in the function's first block, ahead of any other instruction. The allocation's
+    # result vreg is an address, so it is recorded as an access chain base - the same
+    # shape an interface variable's id has - and every load, store and member walk
+    # off it then goes through machinery that already exists.
+    val ar: R.Result[bool, str] = declare_allocas(e, mf, out);
+    if (R.is_err[bool, str](ar)) { ret ar; }
+
     # emit one OpVariable(Function) per defined vreg, at the entry, and record its id.
     i = 0;
     for (i < n) {
@@ -1452,6 +1484,73 @@ fun build_vmaps(e: *Emit, mf: *mir.MirFunction, irfn: *ir.Function, out: *VMaps)
         i = i + 1;
     }
     ret R.ok[bool, str](true);
+}
+
+# declare one Function-storage OpVariable per local allocation, at the entry
+#
+# The allocated TYPE comes from the frame slot rather than from the instruction:
+# `MIR_ALLOCA` carries a slot reference, and the slot records the IR type it was
+# allocated at. Without that this could not be done at all - a size and an alignment
+# do not determine a type, and a Function variable needs one.
+# ---
+# e:   the emission state
+# mf:  the MIR function
+# out: the maps being filled
+# ret: true on success, or a precise error string
+fun declare_allocas(e: *Emit, mf: *mir.MirFunction, out: *VMaps) R.Result[bool, str] {
+    var bi: u32 = 0;
+    for (bi < mf.block_count) {
+        val blk: *mir.MirBlock = ?mf.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            if (mi.opcode != mir.MIR_ALLOCA || mi.operand_count < 2
+                || mi.operands[0].kind != mir.MIR_OP_VREG) { ii = ii + 1; cnt; }
+            val dst: u32 = mi.operands[0].vreg;
+            if (dst >= out.n) { ii = ii + 1; cnt; }
+
+            val slot: *mir.MirSlot = find_slot(mf, mi.operands[1].vreg);
+            if (slot == nil || slot.ty == mir.SLOT_TY_NIL) {
+                ret unsupported(e, "a local allocation whose type was not recorded is not supported by the SPIR-V target: a shader variable needs a type, and a size and alignment do not determine one");
+            }
+            val ty: u32 = ir_value_spv_type(e, slot.ty);
+            if (ty == 0) {
+                ret unsupported(e, unsupported_ir_type(e, slot.ty,
+                    "unsupported local allocation type in the SPIR-V target"));
+            }
+            # a slot wider than its own type is an array of them, which is pointer
+            # arithmetic across whole objects rather than one variable.
+            if (slot.size != type.byte_size(?e.ir.types, slot.ty, e.tgt)) {
+                ret unsupported(e, "a multi-element local allocation is not supported by the SPIR-V target: it is an array of whole objects reached by pointer arithmetic, which the logical addressing model has no form for");
+            }
+
+            val ptr_ty: u32 = types.type_ptr(e.tt, spirv.STORAGE_FUNCTION, ty);
+            val var_id: u32 = spirv.alloc_id(e.b);
+            var vop: [3]u32;
+            vop[0] = ptr_ty; vop[1] = var_id; vop[2] = spirv.STORAGE_FUNCTION;
+            spirv.inst(e.b, ?e.b.functions, spirv.OP_VARIABLE, ?vop[0], 3);
+            out.chain_id[dst] = var_id;
+            out.chain_ty[dst] = ty;
+            out.chain_sc[dst] = spirv.STORAGE_FUNCTION;
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# the frame slot a slot-key names, or nil when none does
+# ---
+# mf:  the MIR function
+# key: the slot-key vreg
+# ret: the slot, or nil
+fun find_slot(mf: *mir.MirFunction, key: u32) *mir.MirSlot {
+    var i: u32 = 0;
+    for (i < mf.frame.slot_count) {
+        if (mf.frame.slots[i].value == key) { ret ?mf.frame.slots[i]; }
+        i = i + 1;
+    }
+    ret nil;
 }
 
 # type every vreg a computing instruction defines, from its result width and class
@@ -1474,6 +1573,10 @@ fun type_computed_defs(e: *Emit, mf: *mir.MirFunction, out: *VMaps, skip_copies:
         var ii: u32 = 0;
         for (ii < blk.instr_count) {
             val mi: *mir.MirInstr = ?blk.instrs[ii];
+            # a structural GEP defines an ADDRESS. It gets no element type and no
+            # backing variable: the access chain it becomes is consumed directly by
+            # the load or store that follows, never loaded as a value.
+            if (mi.opcode == mir.MIR_GEP || mi.opcode == mir.MIR_ALLOCA) { ii = ii + 1; cnt; }
             if (mir.instr_defines_shape(mi) && mi.operands[0].kind == mir.MIR_OP_VREG) {
                 val v: u32 = mi.operands[0].vreg;
                 if (v < out.n && out.type_id[v] == 0 && !(skip_copies && is_reg_copy(mi))) {
@@ -1555,7 +1658,11 @@ fun vmaps_dnit(e: *Emit, vm: *VMaps) {
     if (vm.type_id != nil) { A.deallocate[u32](e.alloc, vm.type_id, vm.n::usize); }
     if (vm.var_id != nil)  { A.deallocate[u32](e.alloc, vm.var_id, vm.n::usize); }
     if (vm.is_bool != nil) { A.deallocate[bool](e.alloc, vm.is_bool, vm.n::usize); }
-    vm.type_id = nil; vm.var_id = nil; vm.is_bool = nil; vm.n = 0;
+    if (vm.chain_id != nil) { A.deallocate[u32](e.alloc, vm.chain_id, vm.n::usize); }
+    if (vm.chain_ty != nil) { A.deallocate[u32](e.alloc, vm.chain_ty, vm.n::usize); }
+    if (vm.chain_sc != nil) { A.deallocate[u32](e.alloc, vm.chain_sc, vm.n::usize); }
+    vm.type_id = nil; vm.var_id = nil; vm.is_bool = nil;
+    vm.chain_id = nil; vm.chain_ty = nil; vm.chain_sc = nil; vm.n = 0;
 }
 
 # the SPIR-V scalar type of one lane of a lane descriptor, or 0 when unmappable
@@ -1654,6 +1761,19 @@ fun ir_value_spv_type(e: *Emit, id: type.IrTypeId) u32 {
         val elem: u32 = ir_value_spv_type(e, t.data.array_.element);
         if (elem == 0) { ret 0; }
         ret types.type_array(e.tt, elem, t.data.array_.count, false);
+    }
+    if (t.kind == type.IRT_STRUCT) {
+        val n: u32 = t.data.struct_.field_count;
+        if (n == 0 || n > types.MAX_STRUCT_MEMBERS) { ret 0; }
+        var members: [16]u32;
+        var i: u32 = 0;
+        for (i < n) {
+            val mt: u32 = ir_value_spv_type(e, t.data.struct_.fields[i]);
+            if (mt == 0) { ret 0; }
+            members[i] = mt;
+            i = i + 1;
+        }
+        ret types.type_struct(e.tt, ?members[0], n, false);
     }
     ret 0;
 }
@@ -1792,12 +1912,15 @@ fun interface_target(e: *Emit, op: *mir.MirOperand) u32 {
 # the diagnostic for an addressed access the milestone cannot carry, named by what
 # the address actually originates in
 #
-# Several lowerings land here and each is fixed somewhere different, so each says
-# so. A member walk into a uniform block, and an index into any other aggregate,
-# need this emitter to build an access chain from the ordinals MIR now keeps;
-# anything else is ordinary addressed memory this milestone does not have.
-# Reporting any of them under another's name sends a reader to the wrong problem,
-# which is exactly what the first version of this did.
+# Each lowering that lands here is fixed somewhere different, so each says so, and
+# reporting one under another's name sends a reader to the wrong problem - which is
+# what the first version of this did, twice.
+#
+# A member walk no longer arrives at all: MIR keeps the GEP's index list on this
+# target (#2649) and the emitter builds an `OpAccessChain` from it, so reading and
+# writing a block member is supported. What is left here is a whole-AGGREGATE copy,
+# which lowers to a byte copy rather than a value load or store, and addressed
+# memory with no interface variable behind it.
 #
 # A scalar `f32` / `f64` interface variable used to have an arm here, because the
 # float address materialization was applied on every target and destroyed the
@@ -1817,11 +1940,8 @@ fun addressed_memory_refusal(e: *Emit, mf: *mir.MirFunction, op: *mir.MirOperand
     if (g.iface == ir.IFACE_NONE) {
         ret "a plain module-scope variable is not reachable from the SPIR-V target: a shader has no general global storage, so a module-scope `val` / `var` reaches a stage only by carrying an interface role (`#[input]`, `#[output]`, `#[builtin]`, or `#[uniform]`)";
     }
-    if (g.iface == ir.IFACE_UNIFORM) {
-        ret "reading a member of a `#[uniform(...)]` block is not yet supported by the SPIR-V target: SPIR-V reaches one through an OpAccessChain naming the member's ORDINAL. MIR now KEEPS the walk on a logical-addressing target rather than folding it to a byte displacement (#2649), so the ordinals are present on the `MIR_GEP` as operands 2 onward; what is missing is this emitter building the access chain from them. the block itself is declared correctly, with its Block decoration and member offsets";
-    }
     if (is_aggregate_type(e, g.ty)) {
-        ret "indexing into an aggregate shader interface variable is not yet supported by the SPIR-V target: SPIR-V reaches an element through an OpAccessChain naming its ORDINAL. MIR now KEEPS the walk on a logical-addressing target rather than folding it to a byte displacement (#2649), so the ordinals are present on the `MIR_GEP` as operands 2 onward; what is missing is this emitter building the access chain from them. the variable itself is declared correctly; read or write it whole";
+        ret "copying a whole record or array to or from a shader interface variable is not supported by the SPIR-V target: an aggregate assignment lowers to a byte copy, which addresses the object rather than loading or storing a value of it. reading and writing its MEMBERS individually is supported, and is what a shader wants anyway - a whole-block copy would move the descriptor's contents rather than the values in it";
     }
     ret "this shader interface variable is reachable only as a whole-variable read or write in the SPIR-V target";
 }
@@ -1849,7 +1969,9 @@ fun emit_global_load(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *Regs
     if (mi.operand_count != 2 || mi.operands[0].kind != mir.MIR_OP_VREG) {
         ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[0]));
     }
-    val var_id: u32 = interface_target(e, ?mi.operands[1]);
+    var chain_ty: u32 = 0;
+    var var_id: u32 = chain_target(vm, ?mi.operands[1], ?chain_ty);
+    if (var_id == 0) { var_id = interface_target(e, ?mi.operands[1]); }
     if (var_id == 0) { ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[1])); }
     val dst: u32 = mi.operands[0].vreg;
     if (dst >= vm.n || vm.type_id[dst] == 0) {
@@ -1875,9 +1997,14 @@ fun emit_global_load(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *Regs
 # ret:      true on success, or a precise error string
 fun emit_global_store(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count != 2) { ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[0])); }
-    val var_id: u32 = interface_target(e, ?mi.operands[0]);
+    var chain_ty: u32 = 0;
+    var var_id: u32 = chain_target(vm, ?mi.operands[0], ?chain_ty);
+    var value_ty: u32 = chain_ty;
+    if (var_id == 0) {
+        var_id = interface_target(e, ?mi.operands[0]);
+        value_ty = interface_value_type(e, ?mi.operands[0]);
+    }
     if (var_id == 0) { ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[0])); }
-    val value_ty: u32 = interface_value_type(e, ?mi.operands[0]);
     val value: u32 = read_operand(e, vm, preg_val, ?mi.operands[1], value_ty);
     if (e.b.err || value == 0) { ret R.err[bool, str]("spirv.emit: unreadable value in an interface store"); }
     var ops: [2]u32;
@@ -1902,6 +2029,176 @@ fun interface_value_type(e: *Emit, op: *mir.MirOperand) u32 {
         i = i + 1;
     }
     ret 0;
+}
+
+# emit an OpAccessChain for a structural GEP into a shader interface variable
+#
+# MIR now keeps a GEP's index list on this target rather than folding it to a byte
+# displacement, which is what makes this expressible at all: SPIR-V reaches a member
+# by its ORDINAL and an offset does not determine one.
+#
+# THE LEADING INDEX IS DROPPED, and that is not a detail. A getelementptr's first
+# index strides over the source pointee type without descending into it - `gep %p, 0,
+# 1` is "the 0th object, then member 1" - while an OpAccessChain's base pointer
+# already names the object, so it takes only the descending indices. A NONZERO
+# leading index is pointer arithmetic across whole objects, which the logical model
+# has no form for; it is refused rather than dropped, because dropping it would
+# silently read the wrong object.
+#
+# The result is a pointer, recorded on the destination vreg rather than stored into
+# a backing variable, and the load or store that consumes it addresses through it.
+# ---
+# e:        the emission state
+# mf:       the MIR function
+# vm:       the per-vreg value maps
+# preg_val: the identity convention's nominal register file
+# mi:       the MIR_GEP instruction ([dst, base, idx...])
+# ret:      true on success, or a precise error string
+fun emit_access_chain(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *Regs,
+                      mi: *mir.MirInstr) R.Result[bool, str] {
+    # a two-operand GEP is the FLAT form, an address materialization with no index
+    # list; nothing on this target should produce one.
+    if (mi.operand_count < 3 || mi.operands[0].kind != mir.MIR_OP_VREG) {
+        ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[1]));
+    }
+    # the base is either the interface variable itself or a chain already built off
+    # it: `m.mvp[2]` lowers to two GEPs, the second based on the first's result, and
+    # an OpAccessChain's base may be any pointer.
+    var base_id: u32 = 0;
+    var base_ty: u32 = 0;
+    var base_sc: u32 = 0;
+    var prior_ty: u32 = 0;
+    val prior: u32 = chain_target(vm, ?mi.operands[1], ?prior_ty);
+    if (prior != 0) {
+        base_id = prior;
+        base_ty = prior_ty;
+        base_sc = chain_storage(vm, ?mi.operands[1]);
+    }
+    or {
+        var gix: u32 = 0;
+        if (address_origin(e, mf, ?mi.operands[1], ?gix) != ADDR_GLOBAL) {
+            ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[1]));
+        }
+        val g: *ir.Global = ?e.ir.globals[gix];
+        if (g.iface == ir.IFACE_NONE || e.gvar_ids[gix] == 0) {
+            ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[1]));
+        }
+        base_id = e.gvar_ids[gix];
+        base_ty = e.gtype_ids[gix];
+        base_sc = e.gstorage[gix];
+    }
+
+    # index 0 strides over whole objects; only 0 names this one.
+    if (mi.operands[2].kind != mir.MIR_OP_IMM || mi.operands[2].imm != 0) {
+        ret unsupported(e, "pointer arithmetic across whole objects is not supported by the SPIR-V target: a logical pointer names one object, so a getelementptr's leading index may only be 0");
+    }
+
+    val dst: u32 = mi.operands[0].vreg;
+    if (dst >= vm.n) { ret R.err[bool, str]("spirv.emit: access chain result vreg out of range"); }
+
+    val count: u32 = mi.operand_count - 3;
+    if (count == 0 || count > 8) {
+        ret unsupported(e, "an access chain of more than 8 levels is not supported by the SPIR-V target");
+    }
+
+    var idx: [8]u32;
+    var cur: u32 = base_ty;
+    var k: u32 = 0;
+    for (k < count) {
+        val opnd: *mir.MirOperand = ?mi.operands[3 + k];
+        if (opnd.kind == mir.MIR_OP_IMM) {
+            if (opnd.imm < 0) { ret unsupported(e, "a negative index is not supported by the SPIR-V target"); }
+            cur = types.composite_member(e.tt, cur, opnd.imm::u32);
+            idx[k] = types.const_int(e.tt, 32, opnd.imm);
+        }
+        or {
+            # a runtime index is legal into an array, whose element type does not
+            # depend on it, and never into a struct, whose member type does.
+            val elem: u32 = types.composite_member(e.tt, cur, 0);
+            var lanes: u32 = 0;
+            if (elem == 0 || types.vector_shape(e.tt, cur, ?lanes) != 0) {
+                ret unsupported(e, "a runtime index into a record or vector is not supported by the SPIR-V target: SPIR-V takes a struct member and a vector lane by a constant ordinal, since the type reached depends on which one it is");
+            }
+            idx[k] = read_operand(e, vm, preg_val, opnd, types.type_int(e.tt, 32));
+            cur = elem;
+        }
+        if (cur == 0 || idx[k] == 0) {
+            ret unsupported(e, "an index reaches past the end of its aggregate in the SPIR-V target");
+        }
+        k = k + 1;
+    }
+    if (e.b.err) { ret R.err[bool, str]("spirv.emit: unreadable index in an access chain"); }
+
+    val ptr_ty: u32 = types.type_ptr(e.tt, base_sc, cur);
+    val result: u32 = spirv.alloc_id(e.b);
+    var ops: [11]u32;
+    ops[0] = ptr_ty; ops[1] = result; ops[2] = base_id;
+    k = 0;
+    for (k < count) { ops[3 + k] = idx[k]; k = k + 1; }
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_ACCESS_CHAIN, ?ops[0], count + 3);
+
+    vm.chain_id[dst] = result;
+    vm.chain_ty[dst] = cur;
+    vm.chain_sc[dst] = base_sc;
+    ret R.ok[bool, str](true);
+}
+
+# the access chain an address operand resolves to, or 0 when it is not one
+# ---
+# vm:      the per-vreg value maps
+# op:      the address operand
+# out_ty:  receives the type the chain points at
+# ret:     the pointer id, or 0
+fun chain_target(vm: *VMaps, op: *mir.MirOperand, out_ty: *u32) u32 {
+    @out_ty = 0;
+    var v: u32 = mir.MIR_VREG_NIL;
+    if (op.kind == mir.MIR_OP_VREG) { v = op.vreg; }
+    or (op.kind == mir.MIR_OP_MEM && op.imm == 0) { v = op.vreg; }
+    if (v == mir.MIR_VREG_NIL || v >= vm.n) { ret 0; }
+    @out_ty = vm.chain_ty[v];
+    ret vm.chain_id[v];
+}
+
+# the storage class of the access chain an address operand resolves to
+# ---
+# vm: the per-vreg value maps
+# op: the address operand
+# ret: the storage class, or 0
+fun chain_storage(vm: *VMaps, op: *mir.MirOperand) u32 {
+    var v: u32 = mir.MIR_VREG_NIL;
+    if (op.kind == mir.MIR_OP_VREG) { v = op.vreg; }
+    or (op.kind == mir.MIR_OP_MEM && op.imm == 0) { v = op.vreg; }
+    if (v == mir.MIR_VREG_NIL || v >= vm.n) { ret 0; }
+    ret vm.chain_sc[v];
+}
+
+# emit the zeroing of a whole object as a single store of its null value
+#
+# `MIR_MEMZERO` survives to this target as a whole-object operation (#2669) rather
+# than being expanded into a run of sized byte stores, which is what makes this one
+# instruction. `OpConstantNull` spells the zero of any type, so an aggregate needs
+# no member-by-member construction.
+# ---
+# e:   the emission state
+# mf:  the MIR function
+# vm:  the per-vreg value maps
+# mi:  the MIR_MEMZERO instruction ([dst_mem, size])
+# ret: true on success, or a precise error string
+fun emit_memzero(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count < 1) { ret R.err[bool, str]("spirv.emit: memzero with no destination"); }
+    var target_ty: u32 = 0;
+    var target: u32 = chain_target(vm, ?mi.operands[0], ?target_ty);
+    if (target == 0) {
+        target = interface_target(e, ?mi.operands[0]);
+        target_ty = interface_value_type(e, ?mi.operands[0]);
+    }
+    if (target == 0 || target_ty == 0) {
+        ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[0]));
+    }
+    var ops: [2]u32;
+    ops[0] = target; ops[1] = types.const_null(e.tt, target_ty);
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_STORE, ?ops[0], 2);
+    ret R.ok[bool, str](true);
 }
 
 # select the integer or float form of a class-polymorphic opcode
@@ -2058,12 +2355,10 @@ fun emit_instr(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *Regs, mi: 
     if (op == mir.MIR_STORE) { ret emit_global_store(e, mf, vm, preg_val, mi); }
     # a GEP that survives to here computed an address, which the milestone carries
     # in no form; the refusal names what the address originates in.
-    if (op == mir.MIR_GEP && mi.operand_count >= 2) {
-        ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[1]));
-    }
-    if (op == mir.MIR_ALLOCA || op == mir.MIR_GEP) {
-        ret unsupported(e, "a local allocation is not supported by the SPIR-V target: a shader has no stack, so a value needing addressable storage has nowhere to live");
-    }
+    if (op == mir.MIR_GEP) { ret emit_access_chain(e, mf, vm, preg_val, mi); }
+    # the allocation's variable was declared at the entry, where SPIR-V requires it.
+    if (op == mir.MIR_ALLOCA) { ret R.ok[bool, str](true); }
+    if (op == mir.MIR_MEMZERO) { ret emit_memzero(e, mf, vm, mi); }
 
     ret unsupported(e, "instruction is not yet supported by the SPIR-V target");
 }
@@ -2086,6 +2381,18 @@ fun emit_call(e: *Emit, preg_val: *Regs, mi: *mir.MirInstr) R.Result[bool, str] 
     if (callee.kind != mir.MIR_OP_SYM) {
         ret unsupported(e, "a call through a function pointer is not yet supported by the SPIR-V target");
     }
+
+    # a callee carrying `#[spirv_op(set, name)]` is not called at all: it IS one
+    # instruction, and this call site becomes that instruction. Checked before the
+    # in-module lookup below, because the whole point is that the callee is usually
+    # NOT in this module - a SPIR-V module is compiled per mach module and a shader
+    # module may declare no linkage, so `shader.math` could not be called even if
+    # its body were emitted.
+    val xfn: *ir.Function = ir_function_record(e.ir, callee.sym);
+    if (xfn != nil && xfn.spv_set != spirvop.SPV_SET_NONE) {
+        ret emit_spirv_op(e, preg_val, xfn);
+    }
+
     val fix: u32 = ir_function_index(e.ir, callee.sym);
     if (fix == IR_FN_NONE || e.fn_ids == nil || e.fn_ids[fix] == 0) {
         ret unsupported(e, "a call to a function defined outside the module is not yet supported by the SPIR-V target");
@@ -2119,6 +2426,137 @@ fun emit_call(e: *Emit, preg_val: *Regs, mi: *mir.MirInstr) R.Result[bool, str] 
         preg_val.is_imm[0] = false;
     }
     ret R.ok[bool, str](true);
+}
+
+# emit the single SPIR-V instruction a `#[spirv_op(set, name)]` callee stands for
+#
+# The contract is uniform across every instruction in the table and is what makes
+# adding one a row rather than a case: the result type is the mach function's
+# declared return type, and the operands are its parameters in declaration order,
+# read out of the identity convention's register file exactly as a real call's
+# arguments would be. That covers the awkward members without special-casing them -
+# `Length` and `OpDot` return a scalar from vectors, `Refract` mixes a scalar
+# operand with vector ones, `FClamp` and `SmoothStep` take three.
+#
+# The signature is read from the IR function's type rather than from `params`,
+# because for a cross-module callee the declaration is signature-only: it was
+# synthesized from a name and a type and has no parameter list of its own.
+#
+# A core-set instruction is emitted directly; an extended one is an OpExtInst
+# naming the imported set's id and the instruction number within it, with the set
+# imported here on first use.
+# ---
+# e:        the emission state
+# preg_val: the identity convention's nominal register file
+# fn:       the callee's IR function record, carrying spv_set / spv_op
+# ret:      true on success, or a precise error string
+fun emit_spirv_op(e: *Emit, preg_val: *Regs, fn: *ir.Function) R.Result[bool, str] {
+    val sig_opt: O.Option[*type.IrType] = type.get(?e.ir.types, fn.sig);
+    if (O.is_none[*type.IrType](sig_opt)) {
+        ret R.err[bool, str]("spirv.emit: a `spirv_op` callee has no signature type");
+    }
+    val sig: *type.IrType = O.unwrap[*type.IrType](sig_opt);
+    if (sig.kind != type.IRT_FN) {
+        ret R.err[bool, str]("spirv.emit: a `spirv_op` callee's signature is not a function type");
+    }
+    val argc: u32 = sig.data.fn.param_count;
+    # 12 operands is past every instruction in the table (the widest is three) and
+    # leaves the fixed operand array a comfortable size.
+    if (argc > 12) {
+        ret unsupported(e, "a `spirv_op` function takes at most 12 parameters on the SPIR-V target");
+    }
+
+    var returns_void: bool = false;
+    val ret_ty: u32 = ir_return_spv_type(e, fn, ?returns_void);
+    if (ret_ty == 0) { ret unsupported(e, "unsupported return type in the SPIR-V target"); }
+    # every instruction in the table produces a value. a void one would leave the
+    # result register holding whatever the previous call left there, which is the
+    # silent-wrong-value failure this decorator exists to avoid.
+    if (returns_void) {
+        ret unsupported(e, "a `spirv_op` function must return a value; a SPIR-V instruction has a result id");
+    }
+
+    var ops: [16]u32;
+    var base: u32 = 2;
+    ops[0] = ret_ty;
+    val result: u32 = spirv.alloc_id(e.b);
+    ops[1] = result;
+    if (fn.spv_set != spirvop.SPV_SET_CORE) {
+        val set_id: u32 = ext_set_id(e, fn.spv_set);
+        if (set_id == 0) {
+            ret R.err[bool, str]("spirv.emit: a `spirv_op` names an instruction set with no import name");
+        }
+        ops[2] = set_id;
+        ops[3] = fn.spv_op;
+        base = 4;
+    }
+
+    var i: u32 = 0;
+    for (i < argc) {
+        val aid: u32 = reg_value(e, preg_val, i, ir_value_spv_type(e, sig.data.fn.params[i]));
+        if (aid == 0) { ret R.err[bool, str]("spirv.emit: `spirv_op` argument with no pre-colored value"); }
+        ops[base + i] = aid;
+        i = i + 1;
+    }
+
+    var opcode: u32 = spirv.OP_EXT_INST;
+    if (fn.spv_set == spirvop.SPV_SET_CORE) { opcode = fn.spv_op; }
+    spirv.inst(e.b, ?e.b.functions, opcode, ?ops[0], base + argc);
+
+    # the return register, which the result move reads next - the same handoff a
+    # real OpFunctionCall makes.
+    preg_val.val_id[0] = result;
+    preg_val.is_imm[0] = false;
+    ret R.ok[bool, str](true);
+}
+
+# the id an extended instruction set is imported under, importing it on first use
+#
+# One OpExtInstImport per set per module: a second import of the same set is
+# invalid, so the id is cached rather than re-minted. Returns 0 when the set has no
+# import name, which is the core set and never reaches here.
+# ---
+# e:   the emission state
+# set: one of spirvop.SPV_SET_*
+# ret: the set's id, or 0
+fun ext_set_id(e: *Emit, set: u8) u32 {
+    if (set::u32 >= 8) { ret 0; }
+    if (e.ext_ids[set::u32] != 0) { ret e.ext_ids[set::u32]; }
+    val name: str = spirvop.set_import_name(set);
+    if (str_len(name) == 0::usize) { ret 0; }
+    val id: u32 = spirv.ext_inst_import(e.b, name);
+    e.ext_ids[set::u32] = id;
+    ret id;
+}
+
+# the IR function record of the given interned name, defined or merely declared
+#
+# `ir_function_index` deliberately skips FN_FLAG_EXTERN entries, since its answer
+# selects a pre-allocated SPIR-V id and a declaration has none. A `spirv_op` callee
+# is normally exactly such a declaration - the definition is in another mach module
+# - so its record is looked up separately.
+# ---
+# irmod: the IR module
+# name:  the interned function name
+# ret:   the function record, or nil
+fun ir_function_record(irmod: *ir.Module, name: intern.StrId) *ir.Function {
+    var i: u32 = 0;
+    for (i < irmod.function_len) {
+        if (irmod.functions[i].name == name) { ret ?irmod.functions[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# whether the named function is one a `#[spirv_op(...)]` maps to an instruction
+# ---
+# irmod: the IR module
+# name:  the interned function name
+# ret:   true when the function carries a SPIR-V instruction mapping
+fun instruction_mapped(irmod: *ir.Module, name: intern.StrId) bool {
+    val fn: *ir.Function = ir_function_record(irmod, name);
+    if (fn == nil) { ret false; }
+    ret fn.spv_set != spirvop.SPV_SET_NONE;
 }
 
 # produce an SSA value id for an operand, materializing a load / constant as needed

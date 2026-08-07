@@ -69,8 +69,10 @@ pub val IRT_FN:     IrTypeKind = 6;
 # a union: its members overlap at offset 0; size is the max member size and
 # align the max member align. shares the struct payload (the member type list)
 pub val IRT_UNION:  IrTypeKind = 7;
-# a 128-bit SIMD vector of `lanes` elements of `element` (#1965). register-class,
-# not aggregate: it flows in one vector register, 16-byte size and alignment
+# a SIMD vector of `lanes` elements of `element` (#1965). register-class, not
+# aggregate. its extent is lane-derived (#2687): size is `lanes * element size`, and
+# alignment is the whole size for a vector that fills the target's vector register,
+# one lane for a narrower one
 pub val IRT_VECTOR: IrTypeKind = 8;
 
 # array payload: an element type and a fixed element count, stored inline so an
@@ -267,7 +269,7 @@ pub fun is_float_scalar(t: *IrTypeTable, id: IrTypeId) bool {
     ret O.unwrap[*IrType](opt_get).kind == IRT_FLOAT;
 }
 
-# whether a type is a 128-bit vector (#1965)
+# whether a type is a vector (#1965)
 #
 # The single classifier the backend consults to route a vector value to the
 # vector register bank and to guard against it reaching unimplemented selection.
@@ -367,7 +369,7 @@ pub fun intern_array(t: *IrTypeTable, element: IrTypeId, count: u32) R.Result[Ir
     ret intern_inline(t, ir);
 }
 
-# intern a 128-bit vector type (#1965)
+# intern a vector type (#1965)
 # ---
 # t:       the table
 # element: scalar element IrTypeId (an IRT_INT or IRT_FLOAT)
@@ -462,8 +464,16 @@ fun describe_node(ctx: ptr, id: u32) layout.Node {
     }
     # a first-class `fun(...)` value is a function pointer, so it lays out as one.
     if (ir.kind == IRT_PTR || ir.kind == IRT_FN) { ret layout.node(layout.NODE_POINTER); }
-    # all ten vector shapes are 128-bit (#1965).
-    if (ir.kind == IRT_VECTOR) { ret layout.node(layout.NODE_VECTOR); }
+    # a vector's extent is lane-derived, so the node carries its lane shape (#2687).
+    # the lane width comes from the element type, which is always a scalar.
+    if (ir.kind == IRT_VECTOR) {
+        val opt_el: O.Option[*IrType] = get(t, ir.data.vector_.element);
+        if (O.is_none[*IrType](opt_el)) { ret layout.node(layout.NODE_UNKNOWN); }
+        var n: layout.Node = layout.node(layout.NODE_VECTOR);
+        n.bytes = bits_to_bytes(O.unwrap[*IrType](opt_el).data.bits);
+        n.count = ir.data.vector_.lanes;
+        ret n;
+    }
     if (ir.kind == IRT_ARRAY) {
         var n: layout.Node = layout.node(layout.NODE_ARRAY);
         n.child = ir.data.array_.element;
@@ -505,7 +515,7 @@ fun describe_field(ctx: ptr, id: u32, index: u32) u32 {
 # that construction already rules out.
 fun ir_extent(t: *IrTypeTable, id: IrTypeId, tgt: *target.Target, what: str) layout.Extent {
     val e: layout.Extent = layout.extent_of(t::ptr, describe_node, describe_field, id,
-                                            ptr_width_of(tgt), layout.DEPTH_UNBOUNDED);
+                                            machine_of(tgt), layout.DEPTH_UNBOUNDED);
     if (!e.ok) { panic_cause(what, e.cause); }
     ret e;
 }
@@ -543,17 +553,17 @@ fun append_str(buf: *u8, n: usize, cap: usize, s: str) usize {
     ret o;
 }
 
-# the target's pointer width, which every layout query needs
+# the target facts every layout query needs
 #
-# A Target with no ISA is not a resolved target and cannot answer this. The layout
-# reads the width up front rather than only on reaching a pointer, so an unresolved
-# target is reported here instead of surfacing as a fault deep in a walk - or, worse,
-# going unnoticed on the types that happen not to contain a pointer.
-fun ptr_width_of(tgt: *target.Target) u32 {
+# A Target with no ISA is not a resolved target and cannot answer these. The layout
+# reads them up front rather than only on reaching a pointer or a vector, so an
+# unresolved target is reported here instead of surfacing as a fault deep in a walk -
+# or, worse, going unnoticed on the types that happen to contain neither.
+fun machine_of(tgt: *target.Target) layout.Machine {
     if (tgt == nil || tgt.isa == nil) {
         panic("ir.type: layout query needs a resolved target with an instruction set\n");
     }
-    ret tgt.isa.pointer_width;
+    ret layout.machine(tgt.isa.pointer_width, tgt.model.vector_bits);
 }
 
 # the size in bytes of an IR type for the given target
@@ -601,7 +611,7 @@ pub fun byte_align(t: *IrTypeTable, id: IrTypeId, tgt: *target.Target) u32 {
 # ret:      byte offset of the field
 pub fun byte_offset(t: *IrTypeTable, id: IrTypeId, field_ix: u32, tgt: *target.Target) u32 {
     val e: layout.Extent = layout.field_offset_of(t::ptr, describe_node, describe_field, id,
-                                                  field_ix, ptr_width_of(tgt), layout.DEPTH_UNBOUNDED);
+                                                  field_ix, machine_of(tgt), layout.DEPTH_UNBOUNDED);
     if (!e.ok) { panic_cause("ir.type.byte_offset: ", e.cause); }
     ret e.size;
 }
@@ -900,8 +910,9 @@ test "mach.lang.me.ir.type.intern_struct:align_override" {
     ret 0;
 }
 
-# IRT_VECTOR interns and dedups by (element, lanes), sizes and aligns to 16, and
-# is register-class (not aggregate) (#1965)
+# IRT_VECTOR interns and dedups by (element, lanes), is register-class (not
+# aggregate) (#1965), and lays out lane-derived: a vector filling the target's vector
+# register aligns to its whole size, a narrower one to a single lane (#2687)
 test "mach.lang.me.ir.type.intern_vector:dedup_size_align" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -930,11 +941,30 @@ test "mach.lang.me.ir.type.intern_vector:dedup_size_align" {
     var arch: isa.IsaVTable = isa.machine_isa(isa.ARCH_UNKNOWN, "test", 0, 8, nil, nil, nil);
     var tgt: target.Target;
     tgt.isa = ?arch;
+    # the layout turns on the vector register width, so the test target must declare
+    # one. left at 0 this proves nothing: every vector would compare as register-filling.
+    tgt.model.vector_bits = 128;
 
+    # f32x4 fills the 128-bit register, so it is register-aligned.
     if (byte_size(?types, vecty, ?tgt)  != 16) { dnit(?types); ret 1; }
     if (byte_align(?types, vecty, ?tgt) != 16) { dnit(?types); ret 1; }
     # register-class, not aggregate.
     if (is_aggregate(?types, vecty))           { dnit(?types); ret 1; }
+
+    # f32x3 is narrower than the register: packed to 12 bytes and aligned to one lane,
+    # which is what makes an array of them a usable packed vertex buffer.
+    val r4: R.Result[IrTypeId, str] = intern_vector(?types, f32ty, 3);
+    if (R.is_err[IrTypeId, str](r4)) { dnit(?types); ret 1; }
+    val v3: IrTypeId = R.unwrap_ok[IrTypeId, str](r4);
+    if (byte_size(?types, v3, ?tgt)  != 12) { dnit(?types); ret 1; }
+    if (byte_align(?types, v3, ?tgt) != 4)  { dnit(?types); ret 1; }
+    if (is_aggregate(?types, v3))           { dnit(?types); ret 1; }
+
+    # the same f32x4 on a 256-bit target no longer fills the register, so it drops to
+    # lane alignment while keeping its size. this is the discontinuity, not a bug.
+    tgt.model.vector_bits = 256;
+    if (byte_size(?types, vecty, ?tgt)  != 16) { dnit(?types); ret 1; }
+    if (byte_align(?types, vecty, ?tgt) != 4)  { dnit(?types); ret 1; }
 
     dnit(?types);
     ret 0;

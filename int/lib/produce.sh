@@ -85,6 +85,22 @@
 #                 nothing, so there is no binary to run and the module tree is the
 #                 artifact; the external validator is what makes this a validity
 #                 check rather than a round-trip through mach's own reader.
+#   spirv-shader— validate the module tree AND report the instructions the emitter
+#                 actually produced for it (#2688). "the validator was happy" is not
+#                 evidence that a `sqrt` became a `Sqrt`: an emitter that stopped
+#                 substituting and left an ordinary call, or one that substituted the
+#                 wrong instruction number, produces a module spirv-val accepts. so
+#                 this disassembles each module and prints every OpExtInst by SET and
+#                 INSTRUCTION NAME with its operand count, plus every core OpDot, in
+#                 emission order, alongside the module's OpExtInstImport count - which
+#                 is what makes "imported only when used" an assertion rather than a
+#                 claim. the environment is chosen PER MODULE rather than per case:
+#                 a module carrying entry points is a shader and is validated under
+#                 vulkan1.3, and one without is a library, which declares the Linkage
+#                 capability Vulkan forbids outright and is validated universally. a
+#                 case that consumes a library dependency delivers both at once, so
+#                 one environment for the whole tree cannot be right. needs spirv-val
+#                 and spirv-dis.
 #   vector-emit — disassemble the case's own objects and report, per function,
 #                 whether the compiler EMITTED packed SIMD (#2207). the observable
 #                 execution cannot produce: a vectorizer that silently stops firing
@@ -596,6 +612,91 @@ produce_macho_mod_init() {
     fi
 
     echo "mod_init_func=type9-rebased"
+}
+
+# produce_macho_header_span <runmode> <target> <binary>
+# Assert that a darwin image whose load commands exceed one page linked, and that
+# its header agrees with the span the linker reserved below the first segment.
+#
+# The Mach-O header carries an 80-byte section_64 per named section and an
+# LC_LOAD_DYLIB per dependency, so it grows with the image; `sizeofcmds` is a
+# uint32 and the format caps it nowhere near a page. A fixed one-page reservation
+# refused the link outright (#2690).
+#
+# Size alone would be a weak observable. The reservation is what places __TEXT:
+# the header occupies the gap between the image base and the first segment, so a
+# writer that widened the gap on its own would slide __TEXT, and __PAGEZERO with
+# it, below the base - the defect of #2599, which every size check would still
+# pass. The framing is therefore asserted alongside: __PAGEZERO spans the whole low
+# region, __TEXT is based exactly where __PAGEZERO ends, and the header sits at
+# file offset 0 inside it.
+#
+# The page size is read from the image's own cputype rather than passed in, since
+# the leg here is linux and darwin maps 16 KiB pages on arm64 and 4 KiB on x86_64.
+produce_macho_header_span() {
+    bin=$3
+    magic=$(read_le_uint "$bin" 0 4)
+    [ "$magic" = "4277009103" ] || { echo "int: macho-header-span: not a 64-bit mach-o (magic $magic)" >&2; return 2; }
+
+    cputype=$(read_le_uint "$bin" 4 4)
+    case "$cputype" in
+        16777223) page=4096  ;;   # CPU_TYPE_X86_64
+        16777228) page=16384 ;;   # CPU_TYPE_ARM64
+        *) echo "int: macho-header-span: unexpected cputype $cputype" >&2; return 2 ;;
+    esac
+
+    ncmds=$(read_le_uint "$bin" 16 4)
+    sizeofcmds=$(read_le_uint "$bin" 20 4)
+
+    pagezero_size=
+    text_vmaddr=
+    text_fileoff=
+    sect_addr=
+    sect_fileoff=
+    dylibs=0
+    off=32
+    i=0
+    while [ "$i" -lt "$ncmds" ]; do
+        cmd=$(read_le_uint "$bin" "$off" 4)
+        cmdsize=$(read_le_uint "$bin" $((off + 4)) 4)
+        case "$cmd" in
+            25)   # LC_SEGMENT_64
+                name=$(dd if="$bin" bs=1 skip=$((off + 8)) count=16 2>/dev/null | tr '\0' '\n' | head -n 1)
+                if [ "$name" = "__PAGEZERO" ]; then
+                    pagezero_size=$(read_le_uint "$bin" $((off + 32)) 8)
+                fi
+                if [ "$name" = "__TEXT" ]; then
+                    text_vmaddr=$(read_le_uint "$bin" $((off + 24)) 8)
+                    text_fileoff=$(read_le_uint "$bin" $((off + 40)) 8)
+                    nsects=$(read_le_uint "$bin" $((off + 64)) 4)
+                    [ "$nsects" -gt 0 ] || { echo "int: macho-header-span: __TEXT carries no section" >&2; return 2; }
+                    sect_addr=$(read_le_uint "$bin" $((off + 72 + 32)) 8)
+                    sect_fileoff=$(read_le_uint "$bin" $((off + 72 + 48)) 4)
+                fi
+                ;;
+            12) dylibs=$((dylibs + 1)) ;;   # LC_LOAD_DYLIB
+        esac
+        [ "$cmdsize" -ge 8 ] || { echo "int: macho-header-span: zero-size load command" >&2; return 2; }
+        off=$((off + cmdsize))
+        i=$((i + 1))
+    done
+
+    [ -n "$pagezero_size" ] || { echo "int: macho-header-span: no __PAGEZERO" >&2; return 2; }
+    [ -n "$text_vmaddr" ]   || { echo "int: macho-header-span: no __TEXT" >&2; return 2; }
+
+    # the reservation is the gap the header fills: from __TEXT's start to its first
+    # section's content.
+    reservation=$((sect_addr - text_vmaddr))
+
+    printf 'sizeofcmds_over_one_page=%s\n' "$(( sizeofcmds > page ))"
+    printf 'multiple_dylib_loads=%s\n' "$(( dylibs > 1 ))"
+    printf 'reservation_whole_pages=%s\n' "$(( reservation > 0 && reservation % page == 0 ))"
+    printf 'header_fits_reservation=%s\n' "$(( 32 + sizeofcmds <= reservation ))"
+    printf 'first_section_fileoff_is_reservation=%s\n' "$(( sect_fileoff == reservation ))"
+    printf 'pagezero_vmsize=0x%x\n' "$pagezero_size"
+    printf 'text_vmaddr=0x%x\n' "$text_vmaddr"
+    printf 'text_fileoff=%s\n' "$text_fileoff"
+    printf 'pagezero_abuts_text=%s\n' "$(( pagezero_size == text_vmaddr ))"
 }
 
 # produce_macho_sections <runmode> <target> <binary>
@@ -1803,6 +1904,81 @@ spirv_val_env() {
     printf 'modules=%d validator=clean\n' "$n"
 }
 
+# produce_spirv_shader <runmode> <target> <binary>
+# validate the delivered module tree and report the instructions the emitter put in
+# it.
+#
+# spirv-val alone cannot see this case's subject. A `sh.sqrt(x)` that stopped being
+# substituted and came out as an ordinary OpFunctionCall validates. One substituted
+# with the wrong instruction number validates too, as whichever instruction that
+# number names. So the observable is the disassembly, normalized: per module, the
+# number of extended sets imported, then one line per OpExtInst naming the SET it
+# indexes and the INSTRUCTION within it, and one per core OpDot, in emission order.
+# Result ids are dropped (they renumber whenever anything else in the module
+# changes); operand COUNTS are kept, because an instruction given the wrong arity is
+# the other way to be wrong here.
+#
+# The environment is per module. A module with entry points is a shader and gets the
+# strict vulkan1.3 rules; a module without them is a library, whose Linkage
+# capability Vulkan rejects outright. A case that depends on a library delivers one
+# of each, so no single environment covers the tree.
+produce_spirv_shader() {
+    out_dir=$(dirname "$3")
+    if ! command -v spirv-val >/dev/null 2>&1; then
+        echo "int: spirv-shader: the validator is not installed (spirv-tools)" >&2
+        return 2
+    fi
+    if ! command -v spirv-dis >/dev/null 2>&1; then
+        echo "int: spirv-shader: the disassembler is not installed (spirv-tools)" >&2
+        return 2
+    fi
+    n=0
+    for m in $(find "$out_dir" -name '*.spv' | sort); do
+        dis=$(spirv-dis --no-header "$m") || return 1
+        # the module's own name, relative to the output root, so the observable does
+        # not carry the mktemp path the case was built under.
+        rel=${m#"$out_dir"/}
+        if printf '%s\n' "$dis" | grep -q '^ *OpEntryPoint '; then
+            kind=shader
+            spirv-val --target-env vulkan1.3 "$m" || return 1
+            env=vulkan1.3
+        else
+            kind=library
+            spirv-val "$m" || return 1
+            env=universal
+        fi
+        imports=$(printf '%s\n' "$dis" | grep -c 'OpExtInstImport' || true)
+        printf 'module=%s kind=%s env=%s validator=clean extimports=%d\n' \
+            "$rel" "$kind" "$env" "$imports"
+        printf '%s\n' "$dis" | awk '
+            # "%29 = OpExtInstImport "GLSL.std.450"" — remember which set each id is,
+            # so an OpExtInst can be reported by set NAME rather than by an id that
+            # renumbers on every unrelated change.
+            $3 == "OpExtInstImport" {
+                name = $4; gsub(/"/, "", name)
+                setname[$1] = name
+                printf "  import %s\n", name
+                next
+            }
+            # "%28 = OpExtInst %v4float %29 Normalize %27" — result type, set id and
+            # instruction name, then the operands.
+            $3 == "OpExtInst" {
+                s = setname[$5]; if (s == "") { s = "<unimported>" }
+                printf "  extinst %s %s operands=%d\n", s, $6, NF - 6
+                next
+            }
+            # "%33 = OpDot %float %31 %32" — core, no set involved.
+            $3 == "OpDot" { printf "  core OpDot operands=%d\n", NF - 4; next }
+        '
+        n=$((n + 1))
+    done
+    if [ "$n" -eq 0 ]; then
+        echo "int: spirv-shader: the build delivered no .spv module" >&2
+        return 2
+    fi
+    printf 'modules=%d\n' "$n"
+}
+
 # resolve_dwarfdump — print an llvm-dwarfdump on PATH, preferring the unversioned
 # name and falling back to the highest-versioned one (ubuntu ships llvm-dwarfdump-NN).
 # empty output (return 1) when none is installed.
@@ -2290,6 +2466,7 @@ produce() {
         embed-dedup) produce_embed_dedup "$@" ;;
         macho-framing) produce_macho_framing "$@" ;;
         macho-sections) produce_macho_sections "$@" ;;
+        macho-header-span) produce_macho_header_span "$@" ;;
         macho-imports) produce_macho_imports "$@" ;;
         macho-mod-init) produce_macho_mod_init "$@" ;;
         macho-abs-bind) produce_macho_abs_bind "$@" ;;
@@ -2305,6 +2482,7 @@ produce() {
         debuginfo)   produce_debuginfo "$@" ;;
         spirv-val)   produce_spirv_val "$@" ;;
         spirv-val-vulkan) produce_spirv_val_vulkan "$@" ;;
+        spirv-shader) produce_spirv_shader "$@" ;;
         vector-emit) produce_vector_emit "$@" ;;
         vector-lanes) produce_vector_lanes "$@" ;;
         frame-elision) produce_frame_elision "$@" ;;
