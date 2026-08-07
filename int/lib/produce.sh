@@ -12,6 +12,11 @@
 #                 execution cannot observe (PE ASLR bit, macho PIE bit). dispatched
 #                 on the artifact's own magic, so it is independent of how the case
 #                 maps to a leg. no LLVM; reads little-endian fields (every runner is LE).
+#   macho-framing— walk a Mach-O executable's load commands and report how the image
+#                 is framed: the __PAGEZERO span, __TEXT's base, and the section
+#                 commands on every segment, plus which entry command it carries.
+#                 the static and dyld-loaded layouts must agree on all of it except
+#                 the entry command (#2599). no LLVM; od/dd reads only.
 #   macho-signed— structurally resolve the three x86_64 immediate-store displacements
 #                 and compare them with independent initialized-data markers, proving
 #                 SIGNED_1/_2/_4 each linked to its exact target without a mac runner.
@@ -312,8 +317,8 @@ field_macho() {
 
 # macho_segment_fields <file> <segname> — print a segment's
 # "vmaddr vmsize fileoff filesize" tuple from LC_SEGMENT_64, or fail when absent.
-# The executable writer emits section-header-less load segments, so the load
-# commands are the independent file-offset-to-VA map structural checks must use.
+# The load commands are the independent file-offset-to-VA map structural checks
+# must use; a section command's own offsets are derived from them.
 macho_segment_fields() {
     bin=$1
     want=$2
@@ -340,6 +345,72 @@ macho_segment_fields() {
     done
     echo "int: macho: segment '$want' not found" >&2
     return 2
+}
+
+# produce_macho_framing <runmode> <target> <binary>
+# Walk a Mach-O executable's load commands and report how the image is FRAMED: the
+# __PAGEZERO span, __TEXT's base, whether __PAGEZERO ends exactly where __TEXT
+# begins, then one line per LC_SEGMENT_64 naming its section commands, and finally
+# which entry command the image carries.
+#
+# The framing is what a static (LC_UNIXTHREAD) and a dyld-loaded (LC_MAIN) image
+# must have IN COMMON - the entry command is the only line that may differ between
+# the two goldens (#2599, where the non-PIE image was based a page below
+# DARWIN_BASE_ADDR, carried a __PAGEZERO one page short of 4 GiB, and emitted no
+# section commands at all, leaving `llvm-objdump -d` with nothing to disassemble).
+# Addresses other than the base are deliberately left out: they move with the
+# program's size, and the fact under test is the framing, not the layout.
+produce_macho_framing() {
+    bin=$3
+    magic=$(read_le_uint "$bin" 0 4)
+    [ "$magic" = "4277009103" ] || { echo "int: macho-framing: not a 64-bit mach-o (magic $magic)" >&2; return 2; }
+    ncmds=$(read_le_uint "$bin" 16 4)
+
+    pagezero_size=
+    text_vmaddr=
+    entry=none
+    segs=$(mktemp)
+    off=32
+    i=0
+    while [ "$i" -lt "$ncmds" ]; do
+        cmd=$(read_le_uint "$bin" "$off" 4)
+        cmdsize=$(read_le_uint "$bin" $((off + 4)) 4)
+        case "$cmd" in
+            25)   # LC_SEGMENT_64
+                name=$(dd if="$bin" bs=1 skip=$((off + 8)) count=16 2>/dev/null | tr '\0' '\n' | head -n 1)
+                vmaddr=$(read_le_uint "$bin" $((off + 24)) 8)
+                vmsize=$(read_le_uint "$bin" $((off + 32)) 8)
+                nsects=$(read_le_uint "$bin" $((off + 64)) 4)
+                [ "$name" = "__PAGEZERO" ] && pagezero_size=$vmsize
+                [ "$name" = "__TEXT" ] && text_vmaddr=$vmaddr
+                sects=
+                k=0
+                while [ "$k" -lt "$nsects" ]; do
+                    sh=$((off + 72 + k * 80))
+                    sname=$(dd if="$bin" bs=1 skip="$sh" count=16 2>/dev/null | tr '\0' '\n' | head -n 1)
+                    if [ -z "$sects" ]; then sects=$sname; else sects="$sects,$sname"; fi
+                    k=$((k + 1))
+                done
+                [ -n "$sects" ] || sects=-
+                printf 'seg %s nsects=%s sects=%s\n' "$name" "$nsects" "$sects" >>"$segs"
+                ;;
+            5)          entry=LC_UNIXTHREAD ;;   # LC_UNIXTHREAD
+            2147483688) entry=LC_MAIN ;;         # LC_MAIN (0x80000028)
+        esac
+        [ "$cmdsize" -ge 8 ] || { rm -f "$segs"; echo "int: macho-framing: zero-size load command" >&2; return 2; }
+        off=$((off + cmdsize))
+        i=$((i + 1))
+    done
+
+    [ -n "$pagezero_size" ] || { rm -f "$segs"; echo "int: macho-framing: no __PAGEZERO" >&2; return 2; }
+    [ -n "$text_vmaddr" ]   || { rm -f "$segs"; echo "int: macho-framing: no __TEXT" >&2; return 2; }
+
+    printf 'pagezero_vmsize=0x%x\n' "$pagezero_size"
+    printf 'text_vmaddr=0x%x\n' "$text_vmaddr"
+    printf 'pagezero_abuts_text=%s\n' "$(( pagezero_size == text_vmaddr ))"
+    cat "$segs"
+    rm -f "$segs"
+    printf 'entry=%s\n' "$entry"
 }
 
 # produce_macho_signed <runmode> <target> <binary>
@@ -1448,12 +1519,14 @@ elf_seg_identical() {
 # produce_debuginfo <runmode> <target> <nog_binary> <g_binary>
 # the binary-inspection producer for the debuginfo case kind (#2039): asserts, purely
 # host-side over the artifacts run.sh built with and without `-g`, that (1) the
-# standard structural validator accepts the whole `-g` image, (2) `-g` is loadable-
-# byte additive, and (3) duplicate generic, comptime-value, and pack instances retain
+# standard structural validator accepts the whole `-g` image, (1b) a real consumer
+# (addr2line, i.e. libbfd) decodes the line table without a diagnostic and resolves the
+# entry point to a name, (2) `-g` is loadable-byte additive, and (3) duplicate generic,
+# comptime-value, and pack instances retain
 # one live, symbolizable DIE while each discarded copy carries DWARF's dead-code address,
 # has no line-table sequence at the winner, and has no location list at the winner.
 # the facts are ISA-independent, so the golden is shared. requires llvm-dwarfdump,
-# llvm-symbolizer, and readelf on the leg; a missing validator is a hard error.
+# llvm-symbolizer, readelf, and addr2line on the leg; a missing tool is a hard error.
 produce_debuginfo() {
     nog=$3
     g=$4
@@ -1466,11 +1539,36 @@ produce_debuginfo() {
     command -v readelf >/dev/null 2>&1 || {
         echo "int: debuginfo: readelf not found (install 'binutils')" >&2; return 2
     }
+    command -v addr2line >/dev/null 2>&1 || {
+        echo "int: debuginfo: addr2line not found (install 'binutils')" >&2; return 2
+    }
 
     if "$dd_tool" --verify "$g" >/dev/null 2>&1; then
         echo "dwarfdump_verify=clean"
     else
         echo "dwarfdump_verify=errors"
+    fi
+
+    # CONSUMER-SIDE DECODE (#2582). --verify above checks structural and reference
+    # integrity; it does NOT check that the line program decodes against the file table
+    # the way a consumer reads it, so it accepted a .debug_line that binutils rejected
+    # outright ("mangled line number section (bad file number)") on every CU. addr2line
+    # is the cheapest standard consumer of that decode - the same libbfd path perf, gdb,
+    # and most crash symbolizers reach - so its stderr is the observable, verbatim when
+    # non-empty so a regression names itself in the diff rather than reading `errors`.
+    # the entry point is the address because every leg's image has one at a known place.
+    entry=$(readelf -hW "$g" 2>/dev/null | awk '/Entry point address:/{print $NF}')
+    a2l_err=$(addr2line -f -e "$g" "$entry" 2>&1 >/dev/null | sed -n '1p')
+    a2l_fn=$(addr2line -f -e "$g" "$entry" 2>/dev/null | sed -n '1p')
+    if [ -n "$a2l_err" ]; then
+        echo "addr2line_stderr=$a2l_err"
+    else
+        echo "addr2line_stderr=clean"
+    fi
+    if [ -n "$a2l_fn" ] && [ "$a2l_fn" != "??" ]; then
+        echo "addr2line_entry=resolved"
+    else
+        echo "addr2line_entry=unresolved"
     fi
 
     if elf_seg_identical "$g" "$nog"; then
@@ -1851,6 +1949,7 @@ produce() {
         field)       produce_field "$@" ;;
         macho-signed) produce_macho_signed "$@" ;;
         macho-got)   produce_macho_got "$@" ;;
+        macho-framing) produce_macho_framing "$@" ;;
         macho-abs-bind) produce_macho_abs_bind "$@" ;;
         pe-imports)  produce_pe_imports "$@" ;;
         pe-exceptions) produce_pe_exceptions "$@" ;;
