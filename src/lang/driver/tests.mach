@@ -1196,11 +1196,14 @@ fun ut_vector_local_wellformed(p: *project.Project) i32 {
                     var ix: u32 = 0;
                     for (ix < blk.instr_count) {
                         val ins: *instruction.Instruction = ?fn.instrs[blk.instructions[ix]];
+                        # the zero fill is a SIZED memzero of the local's own storage,
+                        # and that storage is now the vector type itself rather than an
+                        # `[lanes]elem` reshape of it (#2640). the shape is not what
+                        # #2043 is about; the constant check below is.
                         if (ins.kind == instruction.OP_MEMZERO) {
                             seen_memzero = true;
-                            if (ir_type.is_vector(?m.types, ins.aux_ty)) { bad = true; }
+                            if (!ir_type.is_vector(?m.types, ins.aux_ty)) { bad = true; }
                         }
-                        if (ins.kind == instruction.OP_GEP && ir_type.is_vector(?m.types, ins.aux_ty)) { bad = true; }
                         var oi: u32 = 0;
                         for (oi < ins.operand_count) {
                             if (ins.operands[oi].kind == value.VAL_CONST_INT
@@ -1221,11 +1224,92 @@ fun ut_vector_local_wellformed(p: *project.Project) i32 {
     ret 0;
 }
 
-# an uninitialized vector local default-initializes to all-zero lanes through the
-# aggregate memzero over its array-shaped storage, on all three targets' pipelines
-# -- never the scalar zero_const that produced a vector-typed constant the verifier
-# rejected (#2043). the program reads a lane no write touched, so the memzero must
-# stay live; it holds no vector operator, so it lowers clean on every target
+# no vector value is loaded out of an allocation of a different type (#2640)
+#
+# The defect this pins is a TYPE LIE, not an inefficiency: a vector literal and an
+# uninitialized vector local allocated `[lanes]elem` and then read the slot back with
+# a whole-vector load, so the allocation was reinterpreted through its pointer. A
+# target under a logical addressing model gives a pointer exactly one pointee type
+# and has no pointer bitcast, so it cannot encode that at all -- and on every target
+# it under-aligned the storage, since the reshaped array carried the ELEMENT's
+# alignment (4 for f32) where the vector declares 16.
+#
+# The assertion is the property rather than the mechanism: every vector-typed load
+# whose address is an alloca must load that alloca's own type. It stays true of any
+# later lowering that removes the memory entirely, which the round trip still here is
+# a separate change to fix.
+# ---
+# p:   the lowered project
+# ret: 0 when no vector load reinterprets its allocation, 1 otherwise
+fun ut_vector_load_matches_alloca(p: *project.Project) i32 {
+    var mi: u32 = 0;
+    for (mi < p.module_len) {
+        val me: *project.ModuleEntry = ?p.modules[mi];
+        if (me.ir_module == nil) { mi = mi + 1; cnt; }
+        val m: *ir.Module = me.ir_module;
+        var fi: u32 = 0;
+        for (fi < m.function_len) {
+            val fn: *ir.Function = ?m.functions[fi];
+            var ii: u32 = 0;
+            for (ii < fn.instr_len) {
+                val ins: *instruction.Instruction = ?fn.instrs[ii];
+                if (ins.kind == instruction.OP_LOAD && ir_type.is_vector(?m.types, ins.ty)
+                    && ins.operand_count >= 1 && ins.operands[0].kind == value.VAL_INSTR) {
+                    val did: ir.InstructionId = ins.operands[0].data.instr;
+                    if (did != ir.INSTR_NIL && did::u32 < fn.instr_len) {
+                        val def: *instruction.Instruction = ?fn.instrs[did];
+                        if (def.kind == instruction.OP_ALLOCA && def.aux_ty != ins.ty) { ret 1; }
+                    }
+                }
+                ii = ii + 1;
+            }
+            fi = fi + 1;
+        }
+        mi = mi + 1;
+    }
+    ret 0;
+}
+
+# a vector literal and an uninitialized vector local allocate storage of the
+# vector's own type (#2640)
+#
+# Checked on linux-arm64 ONLY, and that is the point rather than a shortcut. It is
+# the target that declares `has_lane_ops`, so `scalarize.expand_lane_ops` returns
+# early and vectors survive lowering intact -- the same path a logical-addressing
+# target takes. Every other target runs the scalar expansion, which DELIBERATELY
+# represents a vector as `[lanes]elem` in memory because it has no vector register
+# class at all. Asserting there would be asserting against that pass's whole job.
+test "mach.lang.driver:vector_storage_is_not_reinterpreted" {
+    val src: str = "fun mk(o: *f32x4, d: f32) { val k: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0}; var z: f32x4; val b: f32x4 = f32x4{d, d, d, d}; @o = k + z + b; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { mk(argv:~*f32x4, 1.0); ret 0; }\n";
+    var bad: i32 = 0;
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    val pr: R.Result[project.Project, outcome.Fail] = ut_vec_lower(?s, ?alloc, src, "linux-arm64");
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+    if (ut_vector_load_matches_alloca(?p) != 0) { bad = 1; }
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# an uninitialized vector local default-initializes to all-zero lanes through a
+# sized memzero of storage carrying the VECTOR's own type, on all three targets'
+# pipelines -- never the scalar zero_const that produced a vector-typed constant the
+# verifier rejected (#2043). the program reads a lane no write touched, so the
+# memzero must stay live; it holds no vector operator, so it lowers clean on every
+# target
+#
+# The invariant #2043 needs is the constant check: no VAL_CONST_INT operand may
+# carry a vector type. The storage SHAPE is a separate decision, and it changed with
+# #2640 -- the local is allocated at the vector type instead of being reshaped to
+# `[lanes]elem` and read back through its pointer, which is a reinterpretation a
+# logical-addressing target cannot express. So the memzero is now asserted to be
+# over the vector rather than away from it, and a lane gep into vector storage is no
+# longer a failure.
 test "mach.lang.driver:vector_local_default_init" {
     val src: str = "fun f(o: *i32) { var v: i32x4; @o = v[2]; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { f(argv:~*i32); ret 0; }\n";
     var targets: [3]str;
@@ -11828,6 +11912,170 @@ fun ut_attr_probe(s: *session.Session, alloc: *A.Allocator, names: *str, texts: 
     }
     project.dnit_project(?p);
     ret R.ok[str, outcome.Fail](out);
+}
+
+# ut_attr_probe over the whole-source loader, so the fixture's orphan modules are
+# LOADED without being COMPILED - the state #2539 made routine and #2657 scoped
+# attribution against
+#
+# `build_project_test` sets all_own_src (every module under src becomes a load
+# root) while the internal default request keeps GOAL_EXECUTE, so `emit_len` stays
+# at the artifact's closure. That combination is what makes loaded-but-not-compiled
+# reachable from a test; plain `build_project` never loads an orphan at all, and a
+# real `mach test` compiles every module it loads.
+fun ut_attr_probe_allsrc(s: *session.Session, alloc: *A.Allocator, names: *str, texts: *str,
+                         n: u32, target_name: str, sym: str) R.Result[str, outcome.Fail] {
+    val root_r: R.Result[str, str] = ut_scaffold(alloc, names, texts, n);
+    if (R.is_err[str, str](root_r)) {
+        ret R.err[str, outcome.Fail](outcome.user(R.unwrap_err[str, str](root_r)));
+    }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    val rr: R.Result[bool, str] = driver.setup_registry(?s.registry);
+    if (R.is_err[bool, str](rr)) {
+        fs.remove_all(alloc, root);
+        ret R.err[str, outcome.Fail](outcome.user(R.unwrap_err[bool, str](rr)));
+    }
+
+    var sel: manifest.Selection;
+    sel.target = target_name; sel.profile = ""; sel.artifact = "";
+    sel.want_lib = false; sel.has_artifact = false;
+    val pr: R.Result[project.Project, outcome.Fail] = driver.build_project_test(s, root, ?sel);
+    fs.remove_all(alloc, root);
+    if (R.is_err[project.Project, outcome.Fail](pr)) {
+        ret R.err[str, outcome.Fail](R.unwrap_err[project.Project, outcome.Fail](pr));
+    }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    # the fixture is only meaningful while some loaded module is not compiled; a
+    # probe where the two sets coincide would pass whatever the pass walked. this
+    # compares against module_len rather than topo_len so it holds for both kinds of
+    # exclusion: a plain orphan sits in topo past emit_len, while a target-gated one
+    # is kept out of topo altogether and only module_len still counts it
+    if (p.emit_len >= p.module_len) {
+        project.dnit_project(?p);
+        ret R.err[str, outcome.Fail](outcome.user("fixture loaded no uncompiled module"));
+    }
+
+    val se: R.Result[bool, outcome.Fail] = passes.run_sema_pass(?p);
+    if (R.is_err[bool, outcome.Fail](se)) {
+        project.dnit_project(?p);
+        ret R.err[str, outcome.Fail](R.unwrap_err[bool, outcome.Fail](se));
+    }
+    val le: R.Result[bool, outcome.Fail] = passes.run_lower_pass(?p);
+    if (R.is_err[bool, outcome.Fail](le)) {
+        project.dnit_project(?p);
+        ret R.err[str, outcome.Fail](R.unwrap_err[bool, outcome.Fail](le));
+    }
+
+    var out: str = "";
+    val sid: R.Result[intern.StrId, str] = intern.intern(?s.interner, sym);
+    if (R.is_ok[intern.StrId, str](sid)) {
+        val got: O.Option[intern.StrId] =
+            session.import_library(s, R.unwrap_ok[intern.StrId, str](sid));
+        if (O.is_some[intern.StrId](got)) {
+            val nm: O.Option[str] = intern.lookup(?s.interner, O.unwrap[intern.StrId](got));
+            if (O.is_some[str](nm)) { out = O.unwrap[str](nm); }
+        }
+    }
+    project.dnit_project(?p);
+    ret R.ok[str, outcome.Fail](out);
+}
+
+# an attribution from a module no artifact compiles must not be projected at all
+# (#2657)
+#
+# This is the direct form of the decision: attribution follows the COMPILED set.
+# The orphan here carries the only `#[library]` in the tree, so a pass that walked
+# every loaded module reports 'user32' and a pass scoped to `emit_len` reports
+# nothing. Asserting the absence rather than a conflict is what separates "the
+# attribution is not projected" from "the conflict check stopped looking".
+test "mach.lang.driver:uncompiled_module_attribution_not_projected" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [2]str; names[0] = "main.mach"; names[1] = "orphan.mach";
+    var texts: [2]str;
+    # main imports nothing, so orphan is loaded as a src root and never compiled
+    texts[0] = "fun main() i32 { ret 0; }\n";
+    texts[1] = "#[library(\"user32\")]\next fun Sleep(ms: u32);\npub fun call() { Sleep(0); }\n";
+
+    var bad: i32 = 0;
+    val pr: R.Result[str, outcome.Fail] =
+        ut_attr_probe_allsrc(?s, ?alloc, ?names[0], ?texts[0], 2, "linux", "Sleep");
+    if (R.is_err[str, outcome.Fail](pr)) { bad = 1; }
+    or {
+        val got: str = R.unwrap_ok[str, outcome.Fail](pr);
+        if (!str_equals(got, "")) { bad = 1; }
+    }
+
+    session.dnit(?s);
+    ret bad;
+}
+
+# when a compiled and an uncompiled module disagree, the compiled one wins outright
+# rather than the pair being a conflict (#2657)
+#
+# Before scoping, this was a hard error: a module nothing links could break a build
+# by naming a library. The assertion is the surviving attribution, not merely that
+# the build succeeded, so a fix that dropped both would fail here.
+test "mach.lang.driver:compiled_module_wins_over_uncompiled_attribution" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [3]str; names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "orphan.mach";
+    var texts: [3]str;
+    texts[0] = "use uniontest.a;\nfun main() i32 { a.call(); ret 0; }\n";
+    texts[1] = "#[library(\"kernel32\")]\next fun Sleep(ms: u32);\npub fun call() { Sleep(0); }\n";
+    texts[2] = "#[library(\"user32\")]\next fun Sleep(ms: u32);\npub fun call() { Sleep(0); }\n";
+
+    var bad: i32 = 0;
+    val pr: R.Result[str, outcome.Fail] =
+        ut_attr_probe_allsrc(?s, ?alloc, ?names[0], ?texts[0], 3, "linux", "Sleep");
+    if (R.is_err[str, outcome.Fail](pr)) { bad = 1; }
+    or {
+        val got: str = R.unwrap_ok[str, outcome.Fail](pr);
+        if (!str_equals(got, "kernel32")) { bad = 1; }
+    }
+
+    session.dnit(?s);
+    ret bad;
+}
+
+# a module the build excluded as target-gated must not attribute either (#2657)
+#
+# Its own top-level `$error` guard fired, so the driver already keeps it out of
+# topo and no other pass touches it. Attribution was the one pass that still read
+# it, which made an excluded module able to fail the build.
+test "mach.lang.driver:target_gated_module_does_not_attribute" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [3]str; names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "gated.mach";
+    var texts: [3]str;
+    texts[0] = "use uniontest.a;\nfun main() i32 { a.call(); ret 0; }\n";
+    texts[1] = "#[library(\"kernel32\")]\next fun Sleep(ms: u32);\npub fun call() { Sleep(0); }\n";
+    texts[2] = "$if ($mach.build.os != $mach.os.darwin) {\n    $error(\"uniontest.gated: darwin only\");\n}\n\n#[library(\"user32\")]\next fun Sleep(ms: u32);\npub fun call() { Sleep(0); }\n";
+
+    var bad: i32 = 0;
+    val pr: R.Result[str, outcome.Fail] =
+        ut_attr_probe_allsrc(?s, ?alloc, ?names[0], ?texts[0], 3, "linux", "Sleep");
+    if (R.is_err[str, outcome.Fail](pr)) { bad = 1; }
+    or {
+        val got: str = R.unwrap_ok[str, outcome.Fail](pr);
+        if (!str_equals(got, "kernel32")) { bad = 1; }
+    }
+
+    session.dnit(?s);
+    ret bad;
 }
 
 # two `ext` declarations pinning one link name to different libraries must be a
