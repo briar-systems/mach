@@ -5,6 +5,90 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.8.0] - 2026-08-07
+
+Adds C-variadic `ext fun`, so a C function taking `...` can be declared and
+called correctly on every supported target — including Apple arm64, whose
+variadic tail goes on the stack rather than in registers. Also repairs build
+steps on Windows, where they had never worked at all.
+
+### Added
+- lang: an `ext fun` may declare a C-variadic tail with a trailing `...`, and a
+  call through it lowers per target. Apple arm64 is the case that forces the
+  feature to be a real ABI decision rather than a parser change: AAPCS64 passes
+  named arguments in registers, but Darwin's variant places every variadic
+  argument on the stack, so a fixed-arity declaration of `printf` is silently
+  wrong there in a way that no diagnostic catches. The rule is pinned to the
+  (os, isa) pair rather than to either alone (#2575, #2584).
+
+### Fixed
+- driver: build steps run on a native Windows host. mach prefixed each step
+  command with `cd /d "<root>" && ` and passed the result as a single argv
+  element, which the argv joiner escapes with the CRT convention — an embedded
+  `"` becomes `\"`, which `cmd.exe` does not implement. `cmd` stripped the outer
+  quote pair, took the rest literally, and `cd` reported `Path not found.` The
+  prefix was unconditional, so **every** step failed, and a project root
+  containing a space is the common case on Windows. The root now leaves the
+  command string entirely: `exec.run_shell` (mach-std 0.23.0) resolves the
+  interpreter from `%ComSpec%`, applies the working directory in the child, and
+  owns the per-platform quoting, so the two conventions have nowhere left to
+  disagree. The POSIX path's matching exposure to a root containing `'` goes
+  with it (#2578, #2587, #2602).
+- int: the harness drops the step stamp cache before each case build. mach skips
+  a step whose stamp matches and whose outputs exist, neither of which depends
+  on the compiler, and the harness cleared only `out/int` — so a stamp from an
+  earlier run made later runs skip the step engine outright, and a case
+  asserting on step output kept passing against a compiler that could not run a
+  step at all. A fresh CI checkout has no stamps, so only local iteration saw
+  it, in the direction that reports green (#2602).
+- int: the x86-64 GOT fixture reads its local GOT slot through both loads, so
+  the case asserts the signature it was written to assert (#2586, #2596).
+
+### Verification
+- The Windows `[step]` fixtures run on `windows-latest`, **native**, on every
+  PR, and were confirmed by name in the job log rather than inferred from a
+  green leg. Both the Windows and POSIX cases were demonstrated failing against
+  unfixed code before being accepted.
+- The C-variadic lowering was checked against clang's own output on all four
+  conventions, and against a C object built by the runner's own `cc` on both
+  macOS legs.
+
+### Known issues
+- Non-PIE darwin x86_64 images are malformed — `__PAGEZERO` is one page short of
+  4 GiB, `__TEXT` is based one page below `DARWIN_BASE_ADDR`, and the load
+  segments carry no section commands. The `--pie` path, which arm64 darwin and
+  every `--pie` x86-64 build use, is unaffected (#2599).
+
+## [4.7.1] - 2026-08-07
+
+A correctness release for the toolchain itself. Debug information no longer
+changes the code that is generated, the CI seed resolves from a published
+release rather than whatever the client considers newest, and the Windows
+resource case that had never built now executes on real Windows.
+
+### Fixed
+- link: relocations sourced from debug sections no longer feed the atom
+  liveness index, so a DWARF reference reaching across a duplicate weak
+  function body can no longer keep that body alive. Building with and without
+  `-g` now emits identical `PT_LOAD` segments (#2572, #2577).
+- infra: the CI seed resolves through the latest published release, so a draft
+  or partially uploaded release can no longer become the seed for every lane.
+  Seed resolution lives in one composite action instead of nine call sites
+  (#2573, #2574).
+- int: `surface/pe-resources-native` declares the required `need` key. The case
+  had never built, so PE resource emission shipped in 4.7.0 with no executing
+  coverage. It now runs on the Windows leg (#2579, #2580).
+
+### Known issues
+- `[step]` build steps cannot execute on a native Windows host. Program
+  resolution and `cmd.exe` argument quoting are both wrong (#2578, #2587).
+- the darwin x86_64 integration case for GOT indirection fails, because the
+  case's own hand-written assembly dereferences a non-relaxable GOT slot once
+  where two loads are required. The linker's GOT emission is correct at every
+  relocation form and its output is byte-identical once the case is corrected,
+  so this is a test defect rather than a compiler one. It does mean the Mach-O
+  x64 GOT support added in 4.7.0 has not yet been executed on darwin (#2586).
+
 ## [4.7.0] - 2026-08-06
 
 Adds compile-time file embedding, Windows executable resources, and PE subsystem
