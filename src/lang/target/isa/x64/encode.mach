@@ -1521,6 +1521,68 @@ fun encode_movsx(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     ret 0;
 }
 
+# encode a control-register move, `0F 20 /r` (read) or `0F 22 /r` (write) (#2590)
+#
+# The control register is not a register the compiler models, so it rides the
+# instruction as the NUMBER that goes in ModR/M.reg, carried by an immediate operand.
+# WHICH OPERAND CARRIES IT IS THE DIRECTION - an immediate destination writes the
+# control register, an immediate source reads it - so the pair needs one opcode rather
+# than two, exactly as the machine spells it.
+#
+# The operand size is fixed at 64 bits in long mode and takes no REX.W: only the
+# extension bits matter, REX.R for CR8 and REX.B for r8-r15. Emitting a REX.W here
+# would not widen anything - it would change nothing the CPU reads and add a byte the
+# disassembly does not show.
+fun encode_mov_ctlreg(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
+    val start: usize = buf.len;
+    val dst: *isa.Operand = ?mi.dst;
+    val src1: *isa.Operand = ?mi.src1;
+
+    var gp: *isa.Operand = dst;
+    var cr: *isa.Operand = src1;
+    var op: u8 = 0x20;
+    if (dst.kind == isa.OPK_IMM) {
+        gp = src1;
+        cr = dst;
+        op = 0x22;
+    }
+    if (gp.kind != isa.OPK_REG || cr.kind != isa.OPK_IMM) { ret 0; }
+
+    var rex: u8 = 0x40;
+    if (cr.imm >= 8)      { rex = rex | 0x04; }
+    if (needs_rex(gp.reg)) { rex = rex | 0x01; }
+    if (rex != 0x40) { enc.emit_byte(buf, rex); }
+
+    enc.emit_byte(buf, 0x0F);
+    enc.emit_byte(buf, op);
+    enc.emit_byte(buf, encode_modrm(3, (cr.imm & 7)::u8, reg_bits(gp.reg)));
+    ret (buf.len - start)::i32;
+}
+
+# encode a segment-selector read, `8C /r` (#2590)
+#
+# The mirror of the control-register form with one asymmetry the architecture imposes:
+# only the READ direction exists here, so the segment number is always the source.
+#
+# THE 64-BIT SPELLING TAKES NO REX.W, which is not an omission: `8C` writing a 32-bit
+# register already zero-fills the upper half, so the wide form would encode the same
+# effect one byte longer. Both nasm and GNU as assemble `mov rax, cs` to `8c c8` for
+# that reason, and matching them is what keeps a golden comparable against either.
+# Only the 16-bit form is genuinely different, and it takes the operand-size prefix.
+fun encode_mov_segreg(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
+    val start: usize = buf.len;
+    val dst: *isa.Operand = ?mi.dst;
+    val src1: *isa.Operand = ?mi.src1;
+    if (dst.kind != isa.OPK_REG || src1.kind != isa.OPK_IMM) { ret 0; }
+
+    if (mi.size == 2) { enc.emit_byte(buf, 0x66); }
+    emit_rex_if_needed(buf, 0, src1.imm::i32, dst.reg);
+
+    enc.emit_byte(buf, 0x8C);
+    enc.emit_byte(buf, encode_modrm(3, (src1.imm & 7)::u8, reg_bits(dst.reg)));
+    ret (buf.len - start)::i32;
+}
+
 # encode MOVSXD (32->64 sign extension)
 fun encode_movsxd(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     val start: usize = buf.len;
@@ -2016,6 +2078,22 @@ fun encode_inst_one(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     if (opcode == x64.RDTSC) { enc.emit_byte(buf, 0x0F); enc.emit_byte(buf, 0x31); ret 2; }
     if (opcode == x64.RDMSR) { enc.emit_byte(buf, 0x0F); enc.emit_byte(buf, 0x32); ret 2; }
     if (opcode == x64.WRMSR) { enc.emit_byte(buf, 0x0F); enc.emit_byte(buf, 0x30); ret 2; }
+
+    # the remaining no-operand forms (#2590). `iretq` is the one whose REX.W is
+    # LOAD-BEARING rather than a width decoration: bare `CF` pops a 32-bit frame, and a
+    # long-mode interrupt frame is eight bytes per slot, so the prefix is what makes it
+    # read the frame the CPU pushed.
+    if (opcode == x64.CLD)    { enc.emit_byte(buf, 0xFC); ret 1; }
+    if (opcode == x64.PUSHFQ) { enc.emit_byte(buf, 0x9C); ret 1; }
+    if (opcode == x64.POPFQ)  { enc.emit_byte(buf, 0x9D); ret 1; }
+    if (opcode == x64.IRETQ)  { enc.emit_byte(buf, 0x48); enc.emit_byte(buf, 0xCF); ret 2; }
+    if (opcode == x64.SWAPGS) {
+        enc.emit_byte(buf, 0x0F); enc.emit_byte(buf, 0x01); enc.emit_byte(buf, 0xF8);
+        ret 3;
+    }
+
+    if (opcode == x64.MOV_CR)  { ret encode_mov_ctlreg(mi, buf); }
+    if (opcode == x64.MOV_SEG) { ret encode_mov_segreg(mi, buf); }
 
     # `lidt m` - group-15 /3 on a memory operand (privileged).
     if (opcode == x64.LIDT) {
@@ -4999,7 +5077,36 @@ val X64P_TWO:    u16 = 3;  # `dst, src`
 # as a 16-bit access and emit `66 ef` instead of `ee` (#2468).
 val X64P_PORTIO: u16 = 8;
 val X64P_BRANCH: u16 = 4;  # a branch target: a symbol or a numeric local label
-val X64P_CALL:   u16 = 5;  # a call target: a branch target, a register, or a memory operand
+# a control-transfer target: a branch target, a register, or a memory operand
+#
+# Shared by `call` and `jmp`, which take the same three shapes and differ only in the
+# ModR/M extension the encoder picks. `jmp` spelled only the first shape until #2590,
+# so a trampoline could make the call but not the tail jump.
+val X64P_XFER:   u16 = 5;
+
+# the width relation a mnemonic holds among its operands, in `Mnemonic.flags[13:12]`
+#
+# The axis an explicit operand-size prefix is checked against (#2595). A prefix is only
+# meaningful relative to what the instruction itself says the width is, and every
+# mnemonic says something different-shaped: most say "one width for everything", the
+# extending moves say "the source is narrower on purpose", and a handful say "the width
+# is not mine to choose". Stating it per row is what lets a contradiction be REFUSED
+# rather than silently dropped, which is the whole complaint - and it means a mnemonic
+# added later declares its rule instead of inheriting whichever one happened to fit the
+# rows already here.
+val X64W_MASK:    u16 = 0x3000;
+# every operand shares one width, so an explicit prefix must agree with any register
+# operand and otherwise SETS the width (`mov dword [rcx], 1`)
+val X64W_UNIFORM: u16 = 0x0000;
+# the source is deliberately narrower than the destination register (`movzx` / `movsx`),
+# so a memory source must name its own width and there is nothing to agree with
+val X64W_NARROW:  u16 = 0x1000;
+# the operand size is architecturally fixed at 64 bits in long mode (`push`, `pop`, an
+# indirect `call` / `jmp`), so a prefix naming anything else describes no instruction
+val X64W_FIXED64: u16 = 0x2000;
+# the operand names no scalar width at all - `lidt`'s pseudo-descriptor is ten bytes and
+# port i/o has no memory operand - so any prefix is meaningless rather than merely wrong
+val X64W_UNSIZED: u16 = 0x3000;
 
 # the mnemonic carries a LOCK prefix, in `Mnemonic.flags[15:8]`
 #
@@ -5011,7 +5118,7 @@ val X64F_LOCK: u16 = 0x0100;
 #
 # The one per-STATEMENT bit in a field that otherwise carries per-mnemonic facts:
 # `call` names one mnemonic but two encodings, and which one a statement takes is a
-# property of its operand, not of the name. `x64_call_target` sets it and `x64_build`
+# property of its operand, not of the name. `x64_xfer_target` sets it and `x64_build`
 # translates it to the encoder's `x64.FLAG_INDIRECT`.
 val X64F_INDIRECT: u16 = 0x0200;
 
@@ -5033,8 +5140,11 @@ val X64_ALL_FP: u32 = 0xFFFF;
 # the operand pattern half of a mnemonic row's flags
 fun x64_pattern(flags: u16) u16 { ret flags & 0x00FF; }
 
+# the width-relation half of a mnemonic row's flags
+fun x64_width_class(flags: u16) u16 { ret flags & X64W_MASK; }
+
 # number of rows in the x86-64 inline-asm mnemonic table
-val X64_MNEMONIC_COUNT: usize = 55;
+val X64_MNEMONIC_COUNT: usize = 60;
 
 # the x86-64 inline-asm instruction surface
 #
@@ -5060,19 +5170,47 @@ val X64_MNEMONICS: [X64_MNEMONIC_COUNT]iasm.Mnemonic = [X64_MNEMONIC_COUNT]iasm.
     iasm.Mnemonic{ name: "rdtsc",   code: x64.RDTSC::u32,   form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_EDX_EAX_WRITES, flags: X64P_NONE, words: 0 },
     iasm.Mnemonic{ name: "rdmsr",   code: x64.RDMSR::u32,   form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_EDX_EAX_WRITES, flags: X64P_NONE, words: 0 },
     iasm.Mnemonic{ name: "wrmsr",   code: x64.WRMSR::u32,   form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: X64P_NONE, words: 0 },
-    iasm.Mnemonic{ name: "lidt",    code: x64.LIDT::u32,    form: iasm.AF_OPS,  writes: iasm.AW_NONE, implicit: 0, flags: X64P_ONE,  words: 0 },
-    iasm.Mnemonic{ name: "in",      code: x64.IN::u32,      form: iasm.AF_OPS,  writes: iasm.AW_OP0,  implicit: 0, flags: X64P_PORTIO, words: 0 },
-    iasm.Mnemonic{ name: "out",     code: x64.OUT::u32,     form: iasm.AF_OPS,  writes: iasm.AW_NONE, implicit: 0, flags: X64P_PORTIO, words: 0 },
+    iasm.Mnemonic{ name: "lidt",    code: x64.LIDT::u32,    form: iasm.AF_OPS,  writes: iasm.AW_NONE, implicit: 0, flags: X64P_ONE | X64W_UNSIZED,  words: 0 },
+    iasm.Mnemonic{ name: "in",      code: x64.IN::u32,      form: iasm.AF_OPS,  writes: iasm.AW_OP0,  implicit: 0, flags: X64P_PORTIO | X64W_UNSIZED, words: 0 },
+    iasm.Mnemonic{ name: "out",     code: x64.OUT::u32,     form: iasm.AF_OPS,  writes: iasm.AW_NONE, implicit: 0, flags: X64P_PORTIO | X64W_UNSIZED, words: 0 },
     iasm.Mnemonic{ name: "mfence",  code: x64.MFENCE::u32,  form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: X64P_NONE, words: 0 },
     iasm.Mnemonic{ name: "pause",   code: x64.PAUSE::u32,   form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: X64P_NONE, words: 0 },
     iasm.Mnemonic{ name: "nop",     code: x64.NOP::u32,     form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: X64P_NONE, words: 0 },
+
+    # the rest of the freestanding no-operand surface (#2590). NOT ONE OF THESE WRITES
+    # A REGISTER THE ALLOCATOR TRACKS, and each is worth saying rather than defaulting:
+    #
+    #   `cld`    clears DF. The direction flag is sticky process state the ABI requires
+    #            be clear at every call boundary, but it is a flag, and the allocator
+    #            holds no value in flags.
+    #   `pushfq` reads RFLAGS and pushes it; `popfq` pops it and writes RFLAGS. Both
+    #            adjust RSP, which the frame pass reserves and never hands out, so
+    #            neither writes an allocatable register.
+    #   `swapgs` exchanges GS.base with the KernelGSbase MSR. It changes what a
+    #            `gs:`-prefixed access MEANS - and this grammar spells no segment
+    #            override, so nothing it can express depends on the answer.
+    #   `iretq`  loads RIP, CS, RFLAGS, RSP and SS from the interrupt frame. IT DOES NOT
+    #            FALL THROUGH, which the effect model has no way to say: `Mnemonic` can
+    #            name registers written and nothing else. That is sound here rather than
+    #            merely convenient - a clobber set describes the registers a value
+    #            cannot survive in ACROSS the instruction, and nothing survives an
+    #            instruction control never returns from, so the empty set is correct on
+    #            the only path that exists. What is lost is not soundness but the
+    #            ability to warn about the unreachable statements after it (#2590).
+    iasm.Mnemonic{ name: "cld",    code: x64.CLD::u32,    form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: X64P_NONE, words: 0 },
+    iasm.Mnemonic{ name: "pushfq", code: x64.PUSHFQ::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: X64P_NONE, words: 0 },
+    iasm.Mnemonic{ name: "popfq",  code: x64.POPFQ::u32,  form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: X64P_NONE, words: 0 },
+    iasm.Mnemonic{ name: "swapgs", code: x64.SWAPGS::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: X64P_NONE, words: 0 },
+    iasm.Mnemonic{ name: "iretq",  code: x64.IRETQ::u32,  form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: X64P_NONE, words: 0 },
 
     # control transfers. a call's caller-saved clobbers are already covered by the
     # asm block's own barrier, and no branch form writes a register itself - an
     # indirect call no more than a direct one: it READS the register or memory
     # holding its target, and what the callee destroys is the barrier's business.
-    iasm.Mnemonic{ name: "call", code: x64.CALL::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: X64P_CALL, words: 0 },
-    iasm.Mnemonic{ name: "jmp",  code: x64.JMP::u32,  form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: X64P_BRANCH, words: 0 },
+    # `jmp` takes the same three shapes `call` does (#2590); the indirect operand of
+    # either is fixed 64-bit in long mode.
+    iasm.Mnemonic{ name: "call", code: x64.CALL::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: X64P_XFER | X64W_FIXED64, words: 0 },
+    iasm.Mnemonic{ name: "jmp",  code: x64.JMP::u32,  form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: X64P_XFER | X64W_FIXED64, words: 0 },
     iasm.Mnemonic{ name: "je",   code: x64.JE::u32,   form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: X64P_BRANCH, words: 0 },
     iasm.Mnemonic{ name: "jz",   code: x64.JE::u32,   form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: X64P_BRANCH, words: 0 },
     iasm.Mnemonic{ name: "jne",  code: x64.JNE::u32,  form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: X64P_BRANCH, words: 0 },
@@ -5099,9 +5237,11 @@ val X64_MNEMONICS: [X64_MNEMONIC_COUNT]iasm.Mnemonic = [X64_MNEMONIC_COUNT]iasm.
     iasm.Mnemonic{ name: "cmpxchg",      code: x64.CMPXCHG::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0,                 implicit: X64_RAX_WRITE, flags: X64P_TWO, words: 0 },
     iasm.Mnemonic{ name: "xadd",         code: x64.XADD::u32,    form: iasm.AF_OPS, writes: iasm.AW_OP0 | iasm.AW_OP1,   implicit: 0,             flags: X64P_TWO, words: 0 },
 
-    # the two-operand move / ALU family writes its destination.
-    iasm.Mnemonic{ name: "movzx", code: x64.MOVZX::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_TWO, words: 0 },
-    iasm.Mnemonic{ name: "movsx", code: x64.MOVSX::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_TWO, words: 0 },
+    # the two-operand move / ALU family writes its destination. the two extending
+    # moves are the family's only members whose source is a DIFFERENT width from
+    # their destination, which is exactly what the narrow width class states.
+    iasm.Mnemonic{ name: "movzx", code: x64.MOVZX::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_TWO | X64W_NARROW, words: 0 },
+    iasm.Mnemonic{ name: "movsx", code: x64.MOVSX::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_TWO | X64W_NARROW, words: 0 },
     iasm.Mnemonic{ name: "mov",   code: x64.MOV::u32,   form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_TWO, words: 0 },
     iasm.Mnemonic{ name: "lea",   code: x64.LEA::u32,   form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_TWO, words: 0 },
     iasm.Mnemonic{ name: "add",   code: x64.ADD::u32,   form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_TWO, words: 0 },
@@ -5124,8 +5264,8 @@ val X64_MNEMONICS: [X64_MNEMONIC_COUNT]iasm.Mnemonic = [X64_MNEMONIC_COUNT]iasm.
     iasm.Mnemonic{ name: "not",  code: x64.NOT::u32,  form: iasm.AF_OPS, writes: iasm.AW_OP0,  implicit: 0, flags: X64P_ONE, words: 0 },
     iasm.Mnemonic{ name: "inc",  code: x64.INC::u32,  form: iasm.AF_OPS, writes: iasm.AW_OP0,  implicit: 0, flags: X64P_ONE, words: 0 },
     iasm.Mnemonic{ name: "dec",  code: x64.DEC::u32,  form: iasm.AF_OPS, writes: iasm.AW_OP0,  implicit: 0, flags: X64P_ONE, words: 0 },
-    iasm.Mnemonic{ name: "push", code: x64.PUSH::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: X64P_ONE, words: 0 },
-    iasm.Mnemonic{ name: "pop",  code: x64.POP::u32,  form: iasm.AF_OPS, writes: iasm.AW_OP0,  implicit: 0, flags: X64P_ONE, words: 0 },
+    iasm.Mnemonic{ name: "push", code: x64.PUSH::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: X64P_ONE | X64W_FIXED64, words: 0 },
+    iasm.Mnemonic{ name: "pop",  code: x64.POP::u32,  form: iasm.AF_OPS, writes: iasm.AW_OP0,  implicit: 0, flags: X64P_ONE | X64W_FIXED64, words: 0 },
 };
 
 # map a register name to its (id, size), or false when the token names no register
@@ -5197,13 +5337,84 @@ fun x64_reg(name: str, op: *iasm.Operand) bool {
     ret false;
 }
 
+# the control-register number `name` denotes, or false when it names none (#2590)
+#
+# CR1 and CR5-CR7 are reserved and reference them faults, so they are absent rather
+# than encodable: the set here is the one long mode defines.
+fun x64_ctlreg(name: str, num: *i64) bool {
+    if (str_equals(name, "cr0")) { @num = 0; ret true; }
+    if (str_equals(name, "cr2")) { @num = 2; ret true; }
+    if (str_equals(name, "cr3")) { @num = 3; ret true; }
+    if (str_equals(name, "cr4")) { @num = 4; ret true; }
+    if (str_equals(name, "cr8")) { @num = 8; ret true; }
+    ret false;
+}
+
+# the segment-register number `name` denotes, or false when it names none (#2590)
+fun x64_segreg(name: str, num: *i64) bool {
+    if (str_equals(name, "es")) { @num = 0; ret true; }
+    if (str_equals(name, "cs")) { @num = 1; ret true; }
+    if (str_equals(name, "ss")) { @num = 2; ret true; }
+    if (str_equals(name, "ds")) { @num = 3; ret true; }
+    if (str_equals(name, "fs")) { @num = 4; ret true; }
+    if (str_equals(name, "gs")) { @num = 5; ret true; }
+    ret false;
+}
+
+# the byte width the operand-size keyword at `body[lo..hi)` opens with, plus the offset
+# just past it and its following whitespace; or 0 when the region opens with none
+#
+# The keyword must be followed by whitespace, so a symbol operand spelled `byte` or a
+# register named for one is untouched: a prefix is a prefix only when something follows
+# it (#2595).
+# ---
+# body: the asm body
+# lo:   offset the operand token starts at
+# hi:   offset just past the token
+# rest: receives the offset of the first byte past the keyword and its whitespace
+# ret:  1, 2, 4 or 8, or 0 when no keyword is present
+fun x64_size_keyword(body: str, lo: usize, hi: usize, rest: *usize) u8 {
+    var width: u8 = 0;
+    var len: usize = 0;
+    if (lo + 4 < hi && str_region_equals(body, lo, 4, "byte"))  { width = 1; len = 4; }
+    or (lo + 4 < hi && str_region_equals(body, lo, 4, "word"))  { width = 2; len = 4; }
+    or (lo + 5 < hi && str_region_equals(body, lo, 5, "dword")) { width = 4; len = 5; }
+    or (lo + 5 < hi && str_region_equals(body, lo, 5, "qword")) { width = 8; len = 5; }
+    or { ret 0; }
+    if (!iasm.is_space(body[lo + len])) { ret 0; }
+    var i: usize = lo + len;
+    for (i < hi && iasm.is_space(body[i])) { i = i + 1; }
+    @rest = i;
+    ret width;
+}
+
 # parse one x86-64 operand token into `op`
 #
 # A register, a `[base + index*scale + disp]` / `[symbol]` memory reference, an
-# immediate, a `{name}` local binding, or a bare symbol name.
+# immediate, a `{name}` local binding, or a bare symbol name - optionally under an
+# explicit operand-size keyword, which only a memory reference may carry.
 fun x64_operand(c: *iasm.Cursor, lo: usize, hi: usize, role: str, op: *iasm.Operand) R.Result[bool, str] {
     @op = iasm.op_none();
     if (hi <= lo) { ret R.err[bool, str]("encode: malformed inline-asm operand"); }
+
+    # an explicit size names the width of a MEMORY access, which is the one operand
+    # kind whose width the text does not otherwise state. On a register it would be
+    # either redundant or a contradiction (`dword rax` names two widths), so it is
+    # refused there rather than accepted and ignored (#2595).
+    var rest: usize = lo;
+    val width: u8 = x64_size_keyword(c.body, lo, hi, ?rest);
+    if (width != 0) {
+        if (!(hi - rest >= 3 && c.body[rest] == '['::char && c.body[hi - 1] == ']'::char)) {
+            ret R.err[bool, str](iasm.span_message(c,
+                "encode: inline-asm operand-size prefix on '", lo, hi,
+                "' may only precede a memory operand",
+                "encode: an inline-asm operand-size prefix may only precede a memory operand"));
+        }
+        val mr: R.Result[bool, str] = x64_mem(c, rest, hi, role, op);
+        if (R.is_err[bool, str](mr)) { ret mr; }
+        op.size = width;
+        ret R.ok[bool, str](true);
+    }
 
     # a `{name}` local: with a laid-out frame it becomes the `[rbp + off]` stack slot
     # it denotes; without one the displacement is genuinely unknown, and the operand
@@ -5214,11 +5425,12 @@ fun x64_operand(c: *iasm.Cursor, lo: usize, hi: usize, role: str, op: *iasm.Oper
         val br: R.Result[bool, str] = iasm.bind_offset(c, lo, hi, ?off);
         if (R.is_err[bool, str](br)) { ret br; }
         if (R.unwrap_ok[bool, str](br)) {
-            @op = iasm.op_mem(x64.RBP, off, -1, 0, 8);
+            # unsized, like any other memory operand: the frame slot the binding names
+            # states an ADDRESS, and the access width is the instruction's.
+            @op = iasm.op_mem(x64.RBP, off, -1, 0, 0);
             ret R.ok[bool, str](true);
         }
         op.kind     = iasm.AOP_BIND;
-        op.size     = 8;
         op.name_off = lo + 1;
         op.name_len = hi - lo - 2;
         ret R.ok[bool, str](true);
@@ -5254,7 +5466,9 @@ fun x64_operand(c: *iasm.Cursor, lo: usize, hi: usize, role: str, op: *iasm.Oper
 fun x64_mem(c: *iasm.Cursor, lo: usize, hi: usize, role: str, op: *iasm.Operand) R.Result[bool, str] {
     @op = iasm.op_none();
     op.kind = iasm.AOP_MEM;
-    op.size = 8;
+    # left UNSIZED: `[rcx]` names an address, not a width. the caller sets a width only
+    # when the text stated one, which is what makes an explicit prefix distinguishable
+    # from the instruction's own width instead of being folded into it (#2595).
 
     val inner_lo: usize = lo + 1;
     val inner_hi: usize = hi - 1;
@@ -5390,10 +5604,11 @@ fun x64_bind_base_message(c: *iasm.Cursor, role: str) str {
 
 # turn one resolved x86-64 statement into a parsed item
 #
-# The operation width comes from whichever side is a register (a memory or immediate
-# operand inherits it); a `[symbol]` on either side becomes the instruction's pending
-# relocation. An unresolved `{name}` is a memory operand whose displacement is not
-# known yet, so the statement is modeled exactly as it is once the frame is laid out.
+# The operation width comes from whichever side is a register, else from an explicit
+# operand-size prefix, else defaults to 64 bits; a `[symbol]` on either side becomes
+# the instruction's pending relocation. An unresolved `{name}` is a memory operand
+# whose displacement is not known yet, so the statement is modeled exactly as it is
+# once the frame is laid out.
 fun x64_parse(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, str] {
     val pat: u16 = x64_pattern(s.m.flags);
     val n: u32 = s.nargs;
@@ -5406,9 +5621,22 @@ fun x64_parse(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, s
         if (n != 1) { ret R.err[bool, str]("encode: inline-asm branch expects one target"); }
         ret x64_branch_target(c, s, item);
     }
-    if (pat == X64P_CALL) {
-        if (n != 1) { ret R.err[bool, str]("encode: inline-asm call expects one target"); }
-        ret x64_call_target(c, s, item);
+    if (pat == X64P_XFER) {
+        if (n != 1) {
+            ret R.err[bool, str](x64_named_message(c, s, "encode: inline-asm '", "' expects one target",
+                "encode: an inline-asm control transfer expects one target"));
+        }
+        ret x64_xfer_target(c, s, item);
+    }
+
+    # a `mov` naming a control or segment register is a DIFFERENT INSTRUCTION that
+    # happens to share the spelling, so it is resolved before the general operand
+    # lexer rather than through it: those registers belong to no file the lexer
+    # knows, and letting one reach `x64_reg` could only produce a wrong id (#2590).
+    if (s.m.code == x64.MOV::u32 && n == 2) {
+        val sr: R.Result[bool, str] = x64_mov_sysreg(c, s, item);
+        if (R.is_err[bool, str](sr)) { ret sr; }
+        if (R.unwrap_ok[bool, str](sr)) { ret R.ok[bool, str](true); }
     }
 
     var i: u32 = 0;
@@ -5427,7 +5655,7 @@ fun x64_parse(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, s
         if (op.kind == iasm.AOP_SYM || (op.kind == iasm.AOP_MEM && (op.flags & iasm.AOF_MEM_SYM) != 0)) {
             ret R.err[bool, str]("encode: inline-asm one-operand symbol form unsupported");
         }
-        ret R.ok[bool, str](true);
+        ret x64_check_widths(c, s, item);
     }
 
     if (n != 2) {
@@ -5448,22 +5676,215 @@ fun x64_parse(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, s
         item.ref_off = item.ops[1].name_off;
         item.ref_len = item.ops[1].name_len;
     }
+    ret x64_check_widths(c, s, item);
+}
+
+# check each operand's stated width against the width relation its mnemonic declares
+#
+# THE POINT IS THAT A CONTRADICTION IS REFUSED, not merely that a prefix is accepted
+# (#2595): `movzx eax, word [rcx]` and `mov eax, word [rcx]` differ by nothing a lexer
+# can see, and the second one names two widths for the same access. Silently keeping
+# one of them is how a sized load becomes a differently-sized load, which is the class
+# of bug a size keyword exists to prevent.
+#
+# The rule per class is the mnemonic's, read off `X64W_*` rather than off the opcode,
+# so a row added later states its own relation instead of inheriting one.
+fun x64_check_widths(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, str] {
+    val cls: u16 = x64_width_class(s.m.flags);
+
+    if (cls == X64W_UNSIZED) {
+        if (x64_sized_operand(item) != 0) {
+            ret R.err[bool, str](x64_named_message(c, s, "encode: inline-asm instruction '",
+                "' takes no operand-size prefix: its memory operand names no scalar width",
+                "encode: an inline-asm instruction takes no operand-size prefix: its memory operand names no scalar width"));
+        }
+        ret R.ok[bool, str](true);
+    }
+
+    if (cls == X64W_FIXED64) {
+        val w: u8 = x64_sized_operand(item);
+        if (w != 0 && w != 8) {
+            ret R.err[bool, str](x64_named_message(c, s, "encode: inline-asm instruction '",
+                "' has a fixed 64-bit operand size in long mode, so a narrower operand-size prefix names no instruction",
+                "encode: an inline-asm instruction has a fixed 64-bit operand size in long mode, so a narrower operand-size prefix names no instruction"));
+        }
+        ret R.ok[bool, str](true);
+    }
+
+    if (cls == X64W_NARROW) { ret x64_check_narrow(c, s, item); }
+
+    # X64W_UNIFORM: a register operand states the width, so any prefix must agree with
+    # it. with no register operand the prefix is the only statement of the width, and
+    # is what makes `mov dword [rcx], 1` a four-byte store rather than an eight-byte one.
+    val rw: u8 = x64_register_width(item);
+    if (rw == 0) { ret R.ok[bool, str](true); }
+    var i: u32 = 0;
+    for (i < item.nops) {
+        val w: u8 = item.ops[i::usize].size;
+        if (item.ops[i::usize].kind == iasm.AOP_MEM && w != 0 && w != rw) {
+            ret R.err[bool, str](x64_named_message(c, s, "encode: inline-asm instruction '",
+                "' names an operand-size prefix that contradicts the width its register operand states",
+                "encode: an inline-asm instruction names an operand-size prefix that contradicts the width its register operand states"));
+        }
+        i = i + 1;
+    }
     ret R.ok[bool, str](true);
 }
 
-# resolve a CALL target, which is one of three things
+# the width checks for the two extending moves, whose source is narrower by design
 #
-# `call [...]` calls through memory and `call <reg>` through a register - both the
-# `FF /2` indirect encoding, which the ABI clobbers exactly as a direct call does.
-# Anything else is a direct `E8 rel32` to a label or symbol, resolved by
-# `x64_branch_target` unchanged. The fork is on the operand's SHAPE, so a register
-# named `call` could never take is a malformed branch target rather than a silently
-# accepted indirect call.
+# The one family where a memory source MUST be sized: `movzx eax, [rcx]` names no
+# source width at all, and the widths the instruction admits (one byte and two) are
+# not the destination's. Reading such a statement as a same-width move is what the
+# encoder did before a prefix could be written - a plain 32-bit `mov` where the author
+# asked for a zero-extending byte load (#2595).
+fun x64_check_narrow(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, str] {
+    val dst: *iasm.Operand = ?item.ops[0];
+    val src: *iasm.Operand = ?item.ops[1];
+    if (dst.kind != iasm.AOP_REG) {
+        ret R.err[bool, str](x64_named_message(c, s, "encode: inline-asm instruction '",
+            "' must extend into a register destination",
+            "encode: an inline-asm extending move must extend into a register destination"));
+    }
+    if (src.kind == iasm.AOP_MEM && src.size == 0) {
+        ret R.err[bool, str](x64_named_message(c, s, "encode: inline-asm instruction '",
+            "' does not state the width of its memory source; write it as `byte [...]`, `word [...]` or `dword [...]`",
+            "encode: an inline-asm extending move does not state the width of its memory source; write it as `byte [...]`, `word [...]` or `dword [...]`"));
+    }
+    val sw: u8 = src.size;
+    if (sw == 0) { ret R.ok[bool, str](true); }
+    if (sw >= dst.size) {
+        ret R.err[bool, str](x64_named_message(c, s, "encode: inline-asm instruction '",
+            "' names a source at least as wide as its destination, which extends nothing",
+            "encode: an inline-asm extending move names a source at least as wide as its destination, which extends nothing"));
+    }
+    # `movzx` reaches only the byte and word source forms: x86-64 spells no
+    # `movzx r64, r/m32`, because a plain 32-bit move already clears the upper half.
+    # `movsx` adds the dword form, which is MOVSXD.
+    if (s.m.code == x64.MOVZX::u32 && sw != 1 && sw != 2) {
+        ret R.err[bool, str](x64_named_message(c, s, "encode: inline-asm instruction '",
+            "' has no 32-bit source form; a 32-bit move already zero-extends, so write `mov` instead",
+            "encode: inline-asm `movzx` has no 32-bit source form; a 32-bit move already zero-extends, so write `mov` instead"));
+    }
+    ret R.ok[bool, str](true);
+}
+
+# the width the first explicitly-sized memory operand states, or 0 when none does
+fun x64_sized_operand(item: *iasm.Item) u8 {
+    var i: u32 = 0;
+    for (i < item.nops) {
+        val op: *iasm.Operand = ?item.ops[i::usize];
+        if (op.kind == iasm.AOP_MEM && op.size != 0) { ret op.size; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# the width the statement's register operand states, or 0 when it has none
+fun x64_register_width(item: *iasm.Item) u8 {
+    var i: u32 = 0;
+    for (i < item.nops) {
+        if (item.ops[i::usize].kind == iasm.AOP_REG) { ret item.ops[i::usize].size; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# "encode: inline-asm instruction '<mnemonic>'<suffix>", or `fallback` un-named
 #
-# `call [symbol]` is refused: the rip-relative form would need a relocation whose
-# meaning (call the pointer STORED at the symbol) differs from the direct
-# `call symbol` beside it, and nothing in the language produces it today.
-fun x64_call_target(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, str] {
+# The fallback must state the SAME refusal without the mnemonic, not a vaguer one: the
+# effect derivation parses with no interner, so this is the message a reader gets on
+# every path that is not the located emit-time re-parse.
+fun x64_named_message(c: *iasm.Cursor, s: *iasm.Stmt, prefix: str, suffix: str, fallback: str) str {
+    ret iasm.named_message(c.alloc, c.interner, prefix, s.m.name, suffix, fallback);
+}
+
+# resolve a `mov` whose source or destination names a control or segment register
+#
+# Returns ok(false) when neither side does, leaving the statement to the ordinary
+# two-operand path. On a match the item is retargeted to the instruction the machine
+# actually has: the system register becomes the NUMBER it encodes into ModR/M.reg,
+# carried as an immediate operand, and its POSITION is the direction.
+#
+# Carrying it as an immediate rather than as a register id is what keeps the effect
+# model honest. `mov` writes its first operand, and `mov cr3, rax` writes a control
+# register - not general-purpose register 3. An immediate names no register, so the
+# shared fold credits nothing, which is exactly right (#2590).
+fun x64_mov_sysreg(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, str] {
+    var dbuf: [32]u8;
+    var sbuf: [32]u8;
+    if (!iasm.copy_region(c.body, s.arg_lo[0], s.arg_hi[0], ?dbuf[0], 32)) { ret R.ok[bool, str](false); }
+    if (!iasm.copy_region(c.body, s.arg_lo[1], s.arg_hi[1], ?sbuf[0], 32)) { ret R.ok[bool, str](false); }
+    val dtok: str = (?dbuf[0])::str;
+    val stok: str = (?sbuf[0])::str;
+
+    var dnum: i64 = 0;
+    var snum: i64 = 0;
+    val dst_cr:  bool = x64_ctlreg(dtok, ?dnum);
+    val src_cr:  bool = x64_ctlreg(stok, ?snum);
+    val dst_seg: bool = x64_segreg(dtok, ?dnum);
+    val src_seg: bool = x64_segreg(stok, ?snum);
+    if (!dst_cr && !src_cr && !dst_seg && !src_seg) { ret R.ok[bool, str](false); }
+    if ((dst_cr || dst_seg) && (src_cr || src_seg)) {
+        ret R.err[bool, str]("encode: inline-asm `mov` cannot move between two system registers; go through a general-purpose register");
+    }
+
+    # a segment register is readable and not writable here: `mov cs, ...` and
+    # `mov ss, ...` do not exist in long mode at all, and the remaining loads have
+    # descriptor-cache and interrupt-shadow effects no caller has needed.
+    if (dst_seg) {
+        ret R.err[bool, str]("encode: inline-asm `mov` into a segment register is unsupported; only reading one (`mov eax, cs`) is");
+    }
+
+    var gp: iasm.Operand = iasm.op_none();
+    var gp_lo: usize = s.arg_lo[0];
+    var gp_hi: usize = s.arg_hi[0];
+    var gp_tok: str = dtok;
+    if (dst_cr) { gp_lo = s.arg_lo[1]; gp_hi = s.arg_hi[1]; gp_tok = stok; }
+    if (!x64_reg(gp_tok, ?gp)) {
+        ret R.err[bool, str](iasm.span_message(c,
+            "encode: inline-asm system-register move names '", gp_lo, gp_hi,
+            "' where a general-purpose register is required",
+            "encode: an inline-asm system-register move requires a general-purpose register on its other side"));
+    }
+
+    if (src_cr || dst_cr) {
+        # a control register is 64 bits in long mode and there is no narrower form, so
+        # a narrower register name is refused rather than widened behind the author.
+        if (gp.size != 8) {
+            ret R.err[bool, str]("encode: inline-asm control-register move requires a 64-bit general-purpose register");
+        }
+        item.code = x64.MOV_CR::u32;
+    }
+    or { item.code = x64.MOV_SEG::u32; }
+
+    if (dst_cr) {
+        item.ops[0] = iasm.op_imm(dnum, 8);
+        item.ops[1] = gp;
+    } or {
+        item.ops[0] = gp;
+        item.ops[1] = iasm.op_imm(snum, 8);
+    }
+    ret R.ok[bool, str](true);
+}
+
+# resolve a CALL or JMP target, which is one of three things
+#
+# `<xfer> [...]` transfers through memory and `<xfer> <reg>` through a register - the
+# `FF /2` and `FF /4` indirect encodings, which clobber exactly as their direct twins
+# do. Anything else is a direct `E8` / `E9 rel32` to a label or symbol, resolved by
+# `x64_branch_target` unchanged. The fork is on the operand's SHAPE, so a register the
+# mnemonic could never take is a malformed branch target rather than a silently
+# accepted indirect transfer.
+#
+# `call [symbol]` and `jmp [symbol]` are refused: the rip-relative form would need a
+# relocation whose meaning (transfer to the pointer STORED at the symbol) differs from
+# the direct `call symbol` beside it, and nothing in the language produces it today.
+#
+# ONE RESOLVER FOR BOTH MNEMONICS. The shapes are identical and only the ModR/M
+# extension differs, which the encoder already picks off the opcode; two resolvers is
+# how `call` came to spell the register form and `jmp` did not (#2590).
+fun x64_xfer_target(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, str] {
     val lo: usize = s.arg_lo[0];
     val hi: usize = s.arg_hi[0];
 
@@ -5471,7 +5892,9 @@ fun x64_call_target(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[b
         val r: R.Result[bool, str] = x64_mem(c, lo, hi, "", ?item.ops[0]);
         if (R.is_err[bool, str](r)) { ret r; }
         if ((item.ops[0].flags & iasm.AOF_MEM_SYM) != 0) {
-            ret R.err[bool, str]("encode: inline-asm indirect call through a symbol's address is unsupported; use `call <symbol>` for a direct call, or load the address into a register");
+            ret R.err[bool, str](x64_named_message(c, s, "encode: inline-asm indirect '",
+                "' through a symbol's address is unsupported; name the symbol directly for a direct transfer, or load the address into a register",
+                "encode: an inline-asm indirect control transfer through a symbol's address is unsupported; name the symbol directly for a direct transfer, or load the address into a register"));
         }
         item.flags = item.flags | X64F_INDIRECT;
         ret R.ok[bool, str](true);
@@ -5480,10 +5903,13 @@ fun x64_call_target(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[b
     var buf: [32]u8;
     var reg_op: iasm.Operand = iasm.op_none();
     if (iasm.copy_region(c.body, lo, hi, ?buf[0], 32) && x64_reg((?buf[0])::str, ?reg_op)) {
-        # `FF /2` in 64-bit mode has a fixed 64-bit operand size; a narrower register
-        # name cannot be encoded and is refused rather than widened behind the author.
+        # `FF /2` and `FF /4` in 64-bit mode have a fixed 64-bit operand size; a
+        # narrower register name cannot be encoded and is refused rather than widened
+        # behind the author.
         if (reg_op.size != 8) {
-            ret R.err[bool, str]("encode: inline-asm indirect call requires a 64-bit register");
+            ret R.err[bool, str](x64_named_message(c, s, "encode: inline-asm indirect '",
+                "' requires a 64-bit register",
+                "encode: an inline-asm indirect control transfer requires a 64-bit register"));
         }
         item.ops[0] = reg_op;
         item.flags  = item.flags | X64F_INDIRECT;
@@ -5551,14 +5977,15 @@ fun x64_build(item: *iasm.Item) isa.Inst {
         mi.flags = enc_flags;
         ret mi;
     }
-    if (pat == X64P_CALL) {
-        # a direct call carries its target as a relocation or a local-label fixup, not
-        # as an operand, so it builds like any other branch.
+    if (pat == X64P_XFER) {
+        # a direct transfer carries its target as a relocation or a local-label fixup,
+        # not as an operand, so it builds like any other branch.
         if ((item.flags & X64F_INDIRECT) == 0) {
             mi.flags = enc_flags;
             ret mi;
         }
-        # `FF /2` is fixed 64-bit in long mode: it takes no REX.W and no width flag.
+        # `FF /2` and `FF /4` are fixed 64-bit in long mode: neither takes a REX.W nor
+        # a width flag.
         mi.size  = 8;
         mi.flags = enc_flags | x64.FLAG_INDIRECT::u16;
         mi.dst   = x64_to_isa(?item.ops[0], 8);
@@ -5574,15 +6001,57 @@ fun x64_build(item: *iasm.Item) isa.Inst {
         ret mi;
     }
 
-    var size: u8 = 8;
-    if (item.ops[0].kind == iasm.AOP_REG)                       { size = item.ops[0].size; }
-    or (item.nops > 1 && item.ops[1].kind == iasm.AOP_REG)      { size = item.ops[1].size; }
+    # a control-register move has no width to choose: it is fixed 64-bit and takes no
+    # REX.W, so it carries the size for the printer and no width flag for the encoder.
+    if (item.code == x64.MOV_CR::u32) {
+        mi.size  = 8;
+        mi.flags = enc_flags;
+        mi.dst   = x64_to_isa(?item.ops[0], 8);
+        mi.src1  = x64_to_isa(?item.ops[1], 8);
+        ret mi;
+    }
 
+    val size: u8 = x64_inst_size(item);
     mi.size  = size;
     mi.flags = width_flags_for(size) | enc_flags;
-    mi.dst   = x64_to_isa(?item.ops[0], size);
-    if (pat == X64P_TWO) { mi.src1 = x64_to_isa(?item.ops[1], size); }
+    mi.dst   = x64_to_isa(?item.ops[0], x64_operand_size(?item.ops[0], size));
+    if (pat == X64P_TWO) { mi.src1 = x64_to_isa(?item.ops[1], x64_operand_size(?item.ops[1], size)); }
     ret mi;
+}
+
+# the operation width one parsed statement runs at
+#
+# A register operand states it outright. Failing that an explicit operand-size prefix
+# does, which is what makes `mov dword [rcx], 1` a four-byte store; failing both, the
+# machine word. The order matters and is checked, not assumed: `x64_check_widths` has
+# already refused any statement whose prefix and register operand disagree, so
+# whichever is read first is the same answer.
+fun x64_inst_size(item: *iasm.Item) u8 {
+    var i: u32 = 0;
+    for (i < item.nops) {
+        if (item.ops[i::usize].kind == iasm.AOP_REG) { ret item.ops[i::usize].size; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < item.nops) {
+        val op: *iasm.Operand = ?item.ops[i::usize];
+        if (op.kind == iasm.AOP_MEM && op.size != 0) { ret op.size; }
+        i = i + 1;
+    }
+    ret 8;
+}
+
+# the width one operand is accessed at: its own when it states one, else the
+# instruction's
+#
+# The whole of what a size prefix buys past the parse. `movzx eax, word [rcx]` is one
+# instruction with TWO widths - a four-byte destination and a two-byte load - and the
+# encoder already reads them separately (`encode_movzx` picks 0F B6 or 0F B7 off the
+# source operand's size). What was missing was any way for the text to say the second
+# one (#2595).
+fun x64_operand_size(op: *iasm.Operand, inst_size: u8) u8 {
+    if (op.kind == iasm.AOP_MEM && op.size != 0) { ret op.size; }
+    ret inst_size;
 }
 
 # emit one parsed x86-64 item
@@ -7141,9 +7610,21 @@ pub fun asm_ct_class(code: u32, flags: u16) ct.AsmClass {
     # branching on the result - is a leak the OTHER checks catch, because the branch or
     # the address is where the secret actually escapes. Reading a clock is not itself a
     # disclosure of the secret.
+    #
+    # THE REMAINING FREESTANDING SET (#2590) IS THE SAME ANSWER FOR THE SAME REASON, and
+    # two of it are worth naming. `iretq` does not return, so nothing after it executes
+    # and it discloses nothing this program holds; what it restores comes from the
+    # interrupt frame, which is memory the address checks already govern. `swapgs`
+    # exchanges a segment base, and its latency is fixed - a program that then addresses
+    # memory through the swapped base leaks through that ACCESS, which check (b) sees,
+    # not through the exchange. The two system-register moves are data movement at fixed
+    # latency, and WHICH register each names is part of the instruction word rather than
+    # an operand, so it can never be secret.
     if (code == x64.IN::u32    || code == x64.OUT::u32   || code == x64.CLI::u32 ||
         code == x64.STI::u32   || code == x64.LIDT::u32  || code == x64.RDTSC::u32 ||
-        code == x64.RDMSR::u32 || code == x64.WRMSR::u32) {
+        code == x64.RDMSR::u32 || code == x64.WRMSR::u32 || code == x64.CLD::u32 ||
+        code == x64.PUSHFQ::u32 || code == x64.POPFQ::u32 || code == x64.IRETQ::u32 ||
+        code == x64.SWAPGS::u32 || code == x64.MOV_CR::u32 || code == x64.MOV_SEG::u32) {
         ret ct.asm_op(ct.CT_OP_NONE);
     }
 
@@ -7307,6 +7788,316 @@ test "mach.lang.target.isa.x64.encode.portio:byte_exact" {
     # `lidt m` is group-15 /3 on a memory operand.
     var b3: [3]u8; b3[0] = 0x0F; b3[1] = 0x01; b3[2] = 0x18;
     if (!t_asm_bytes("lidt [rax]", ?b3[0], 3)) { bad = 1; }
+
+    ret bad;
+}
+
+# the remaining freestanding mnemonics encode to the bytes an independent assembler
+# produces for the same spellings (#2590)
+#
+# EVERY EXPECTED BYTE BELOW IS NASM's, cross-checked against GNU as where the two could
+# differ, not re-derived from this encoder. Each spelling was a `.byte` payload before
+# it existed, and a raw payload degrades the block's clobber set to every register in
+# every bank.
+#
+# `iretq` is where a wrong byte hides most quietly: bare `CF` also assembles, and it
+# pops a 32-bit frame from a stack holding a 64-bit one. The REX.W is what makes it the
+# instruction an interrupt handler needs, so it is pinned rather than assumed.
+test "mach.lang.target.isa.x64.encode.freestanding:byte_exact" {
+    var bad: i32 = 0;
+
+    var b1: [1]u8;
+    b1[0] = 0xFC;
+    if (!t_asm_bytes("cld", ?b1[0], 1))    { bad = 1; }
+    b1[0] = 0x9C;
+    if (!t_asm_bytes("pushfq", ?b1[0], 1)) { bad = 1; }
+    b1[0] = 0x9D;
+    if (!t_asm_bytes("popfq", ?b1[0], 1))  { bad = 1; }
+
+    var b2: [2]u8;
+    b2[0] = 0x48; b2[1] = 0xCF;
+    if (!t_asm_bytes("iretq", ?b2[0], 2)) { bad = 1; }
+
+    var b3: [3]u8;
+    b3[0] = 0x0F; b3[1] = 0x01; b3[2] = 0xF8;
+    if (!t_asm_bytes("swapgs", ?b3[0], 3)) { bad = 1; }
+
+    ret bad;
+}
+
+# `jmp` reaches every shape `call` does, which is the asymmetry #2590 names: a
+# trampoline could make the indirect call but not the indirect tail jump
+#
+# `FF /4` differs from the call's `FF /2` only in the ModR/M extension, so these are
+# the call test's bytes with that one field changed - which is exactly the property
+# worth pinning, since a resolver shared between the two mnemonics gets the extension
+# from the opcode and could silently hand back the other one.
+test "mach.lang.target.isa.x64.encode.x64_xfer_target:jmp_indirect_forms_byte_exact" {
+    var bad: i32 = 0;
+
+    var reg_want: [2]u8;
+    reg_want[0] = 0xFF; reg_want[1] = 0xE0;
+    if (!t_asm_bytes("jmp rax", ?reg_want[0], 2)) { bad = 1; }
+    reg_want[1] = 0xE1;
+    if (!t_asm_bytes("jmp rcx", ?reg_want[0], 2)) { bad = 1; }
+
+    # an extended register takes REX.B, and the extension stays /4.
+    var r11_want: [3]u8;
+    r11_want[0] = 0x41; r11_want[1] = 0xFF; r11_want[2] = 0xE3;
+    if (!t_asm_bytes("jmp r11", ?r11_want[0], 3)) { bad = 1; }
+
+    var m0_want: [2]u8;
+    m0_want[0] = 0xFF; m0_want[1] = 0x20;
+    if (!t_asm_bytes("jmp [rax]", ?m0_want[0], 2)) { bad = 1; }
+
+    var m8_want: [3]u8;
+    m8_want[0] = 0xFF; m8_want[1] = 0x60; m8_want[2] = 0x08;
+    if (!t_asm_bytes("jmp [rax + 8]", ?m8_want[0], 3)) { bad = 1; }
+
+    var mi_want: [4]u8;
+    mi_want[0] = 0xFF; mi_want[1] = 0x64; mi_want[2] = 0xD8; mi_want[3] = 0x10;
+    if (!t_asm_bytes("jmp [rax + rbx*8 + 16]", ?mi_want[0], 4)) { bad = 1; }
+
+    # the absolute form, for a fixed-address ABI: mod=00 rm=100 escapes to a SIB
+    # naming neither base nor index.
+    var abs_want: [7]u8;
+    abs_want[0] = 0xFF; abs_want[1] = 0x24; abs_want[2] = 0x25;
+    abs_want[3] = 0x18; abs_want[4] = 0x00; abs_want[5] = 0x10; abs_want[6] = 0x00;
+    if (!t_asm_bytes("jmp [0x100018]", ?abs_want[0], 7)) { bad = 1; }
+
+    # a direct jump is untouched: it still resolves as a branch target carrying its
+    # symbol as a relocation, and takes no indirect flag.
+    var g: iasm.Grammar = x64_grammar();
+    var c: iasm.Cursor;
+    iasm.cursor_init(?c, ?g, "jmp main", nil, nil, nil, nil);
+    var item: iasm.Item;
+    if (R.is_err[bool, str](iasm.next(?c, ?item)))  { ret 1; }
+    if (item.ref != iasm.AR_SYM)                    { bad = 1; }
+    val dm: isa.Inst = x64_build(?item);
+    if (dm.opcode != x64.JMP)                       { bad = 1; }
+    if ((dm.flags & x64.FLAG_INDIRECT::u16) != 0)   { bad = 1; }
+    if (dm.dst.kind != isa.OPK_NONE)                { bad = 1; }
+
+    # and the narrow-register refusal `call` already had applies to `jmp` too.
+    if (!t_asm_refused("jmp eax", "64-bit register"))     { bad = 1; }
+    if (!t_asm_refused("jmp [main]", "symbol's address")) { bad = 1; }
+
+    ret bad;
+}
+
+# the system-register moves encode to nasm's bytes, in both directions and at every
+# register the architecture defines (#2590)
+#
+# The control-register forms are where the extension bits hide: CR8 needs REX.R and an
+# extended general-purpose register needs REX.B, and the two are independent, so a REX
+# built from one of them alone still assembles - to a different instruction.
+test "mach.lang.target.isa.x64.encode.sysreg_moves:byte_exact" {
+    var bad: i32 = 0;
+
+    var b3: [3]u8;
+    b3[0] = 0x0F; b3[1] = 0x20; b3[2] = 0xD0;
+    if (!t_asm_bytes("mov rax, cr2", ?b3[0], 3)) { bad = 1; }
+    b3[2] = 0xC0;
+    if (!t_asm_bytes("mov rax, cr0", ?b3[0], 3)) { bad = 1; }
+    # the write direction is the same instruction with 0F 22.
+    b3[1] = 0x22; b3[2] = 0xD8;
+    if (!t_asm_bytes("mov cr3, rax", ?b3[0], 3)) { bad = 1; }
+
+    # REX.B for an extended general-purpose register.
+    var b4: [4]u8;
+    b4[0] = 0x41; b4[1] = 0x0F; b4[2] = 0x20; b4[3] = 0xD9;
+    if (!t_asm_bytes("mov r9, cr3", ?b4[0], 4)) { bad = 1; }
+    b4[0] = 0x41; b4[1] = 0x0F; b4[2] = 0x22; b4[3] = 0xDA;
+    if (!t_asm_bytes("mov cr3, r10", ?b4[0], 4)) { bad = 1; }
+    # REX.R for CR8, which is a different bit entirely.
+    b4[0] = 0x44; b4[1] = 0x0F; b4[2] = 0x20; b4[3] = 0xC0;
+    if (!t_asm_bytes("mov rax, cr8", ?b4[0], 4)) { bad = 1; }
+
+    # the segment read: `8C /r`, no REX.W even at 64 bits (a 32-bit write already
+    # clears the upper half, which is why both nasm and GNU as emit these bytes).
+    var b2: [2]u8;
+    b2[0] = 0x8C; b2[1] = 0xC8;
+    if (!t_asm_bytes("mov eax, cs", ?b2[0], 2)) { bad = 1; }
+    if (!t_asm_bytes("mov rax, cs", ?b2[0], 2)) { bad = 1; }
+    b2[1] = 0xE8;
+    if (!t_asm_bytes("mov eax, gs", ?b2[0], 2)) { bad = 1; }
+    # the 16-bit form is the one that really differs.
+    b3[0] = 0x66; b3[1] = 0x8C; b3[2] = 0xC8;
+    if (!t_asm_bytes("mov ax, cs", ?b3[0], 3)) { bad = 1; }
+
+    # the forms the architecture or this grammar does not have.
+    if (!t_asm_refused("mov cs, rax", "segment register"))     { bad = 1; }
+    if (!t_asm_refused("mov eax, cr2", "64-bit"))              { bad = 1; }
+    if (!t_asm_refused("mov cr3, cr2", "two system"))          { bad = 1; }
+    # cr1 is reserved, so it is not a register name and the token is not an operand.
+    if (!t_asm_refused("mov rax, cr1", "bare-symbol"))         { bad = 1; }
+
+    ret bad;
+}
+
+# a system-register move writes a register file the allocator does not track, and the
+# clobber set must say so rather than crediting the number as a register id (#2590)
+#
+# `mov cr3, rax` writes CR3. Reading its first operand as general-purpose register 3
+# would report RBX written - sound, but a spill of a live value for no reason, and the
+# kind of wrong-by-coincidence the raw-byte spelling was supposed to be replaced to
+# avoid. The read direction is the one that genuinely writes a register.
+test "mach.lang.target.isa.x64.encode.asm_clobbers:sysreg_moves" {
+    var gp: u32 = 0;
+    var fp: u32 = 0;
+    var bad: i32 = 0;
+
+    # a page-fault handler reading the faulting address writes only RAX.
+    asm_clobbers("mov rax, cr2", ?gp, ?fp);
+    if (gp != 1) { bad = 1; }
+    if (fp != 0) { bad = 1; }
+
+    # a page-table switch writes NO general-purpose register - in particular not RBX,
+    # which is what crediting `cr3` as a register id would report.
+    gp = 0; fp = 0;
+    asm_clobbers("mov cr3, rax", ?gp, ?fp);
+    if (gp != 0) { bad = 1; }
+
+    # reading the live selector writes its destination and nothing else.
+    gp = 0; fp = 0;
+    asm_clobbers("mov ecx, cs", ?gp, ?fp);
+    if (gp != 2) { bad = 1; }
+
+    ret bad;
+}
+
+# the rest of the freestanding set writes no register the allocator tracks, so a block
+# using it keeps every live value (#2590)
+test "mach.lang.target.isa.x64.encode.asm_clobbers:freestanding_writes_nothing" {
+    var gp: u32 = 0;
+    var fp: u32 = 0;
+    var bad: i32 = 0;
+
+    # flags, the stack pointer and a segment base are all outside the allocated file.
+    asm_clobbers("cld\npushfq\npopfq\nswapgs\niretq", ?gp, ?fp);
+    if (gp != 0) { bad = 1; }
+    if (fp != 0) { bad = 1; }
+
+    # an indirect jump READS its target register, exactly as an indirect call does.
+    gp = 0; fp = 0;
+    asm_clobbers("jmp rax", ?gp, ?fp);
+    if (gp != 0) { bad = 1; }
+
+    # the same instructions as raw bytes are opaque, which is the cost these rows
+    # remove: `swapgs` and `iretq` spelled by hand.
+    gp = 0; fp = 0;
+    asm_clobbers(".byte 0x0f, 0x01, 0xf8\n.byte 0x48, 0xcf", ?gp, ?fp);
+    if (gp != X64_ALL_GP) { bad = 1; }
+    if (fp != X64_ALL_FP) { bad = 1; }
+
+    ret bad;
+}
+
+# an explicit operand-size prefix names the width of a memory access, and one that
+# contradicts the instruction's own width is refused rather than dropped (#2595)
+#
+# The accepted half and the refused half are the same feature: a prefix is only worth
+# writing if the compiler acts on it, and only safe to write if a wrong one fails the
+# build. Every accepted spelling below is checked against nasm's bytes for the same
+# text, so the width really reaches the encoding rather than being parsed and lost.
+test "mach.lang.target.isa.x64.encode.sized_memory_operands:byte_exact" {
+    var bad: i32 = 0;
+
+    # the extending moves, which are why the prefix is needed at all: the source is a
+    # different width from the destination, so nothing else can state it.
+    var b3: [3]u8;
+    b3[0] = 0x0F; b3[1] = 0xB7; b3[2] = 0x01;
+    if (!t_asm_bytes("movzx eax, word [rcx]", ?b3[0], 3)) { bad = 1; }
+    b3[1] = 0xB6;
+    if (!t_asm_bytes("movzx eax, byte [rcx]", ?b3[0], 3)) { bad = 1; }
+    b3[1] = 0xBF;
+    if (!t_asm_bytes("movsx eax, word [rcx]", ?b3[0], 3)) { bad = 1; }
+
+    # the same loads into a 64-bit destination take REX.W, and the source width still
+    # picks the opcode independently of it.
+    var b4: [4]u8;
+    b4[0] = 0x48; b4[1] = 0x0F; b4[2] = 0xB6; b4[3] = 0x01;
+    if (!t_asm_bytes("movzx rax, byte [rcx]", ?b4[0], 4)) { bad = 1; }
+    # a 32-bit sign-extended source is MOVSXD, a different opcode entirely.
+    var sxd: [3]u8;
+    sxd[0] = 0x48; sxd[1] = 0x63; sxd[2] = 0x01;
+    if (!t_asm_bytes("movsx rax, dword [rcx]", ?sxd[0], 3)) { bad = 1; }
+
+    # a store through a pointer with no register to name the width: the prefix is the
+    # only statement of it, and without one the access stays the machine word.
+    var st4: [6]u8;
+    st4[0] = 0xC7; st4[1] = 0x01;
+    st4[2] = 0x01; st4[3] = 0x00; st4[4] = 0x00; st4[5] = 0x00;
+    if (!t_asm_bytes("mov dword [rcx], 1", ?st4[0], 6)) { bad = 1; }
+    var st2: [5]u8;
+    st2[0] = 0x66; st2[1] = 0xC7; st2[2] = 0x01; st2[3] = 0x01; st2[4] = 0x00;
+    if (!t_asm_bytes("mov word [rcx], 1", ?st2[0], 5)) { bad = 1; }
+    var st1: [3]u8;
+    st1[0] = 0xC6; st1[1] = 0x01; st1[2] = 0x01;
+    if (!t_asm_bytes("mov byte [rcx], 1", ?st1[0], 3)) { bad = 1; }
+    # unsized, the same statement is the eight-byte store it always was.
+    var st8: [7]u8;
+    st8[0] = 0x48; st8[1] = 0xC7; st8[2] = 0x01;
+    st8[3] = 0x01; st8[4] = 0x00; st8[5] = 0x00; st8[6] = 0x00;
+    if (!t_asm_bytes("mov [rcx], 1", ?st8[0], 7)) { bad = 1; }
+
+    # a one-operand read-modify-write reaches the same width choice.
+    var neg8: [3]u8;
+    neg8[0] = 0x48; neg8[1] = 0xF7; neg8[2] = 0x19;
+    if (!t_asm_bytes("neg qword [rcx]", ?neg8[0], 3)) { bad = 1; }
+    var neg4: [2]u8;
+    neg4[0] = 0xF7; neg4[1] = 0x19;
+    if (!t_asm_bytes("neg dword [rcx]", ?neg4[0], 2)) { bad = 1; }
+    var inc2: [3]u8;
+    inc2[0] = 0x66; inc2[1] = 0xFF; inc2[2] = 0x00;
+    if (!t_asm_bytes("inc word [rax]", ?inc2[0], 3)) { bad = 1; }
+
+    # a prefix that AGREES with the register operand is accepted and changes nothing.
+    var mv4: [2]u8;
+    mv4[0] = 0x8B; mv4[1] = 0x01;
+    if (!t_asm_bytes("mov eax, dword [rcx]", ?mv4[0], 2)) { bad = 1; }
+
+    ret bad;
+}
+
+# a contradictory or meaningless operand-size prefix fails the build naming the
+# instruction, which is the half of #2595 that makes the other half safe
+test "mach.lang.target.isa.x64.encode.sized_memory_operands:contradictions_refused" {
+    var bad: i32 = 0;
+
+    # the register operand states four bytes and the prefix says two. silently
+    # honouring either one is a differently-sized access than the text describes.
+    if (!t_asm_refused("mov eax, word [rcx]", "contradicts"))   { bad = 1; }
+    if (!t_asm_refused("mov word [rcx], eax", "contradicts"))   { bad = 1; }
+    if (!t_asm_refused("add rax, dword [rcx]", "contradicts"))  { bad = 1; }
+
+    # an extending move cannot extend from a source as wide as its destination.
+    if (!t_asm_refused("movzx eax, dword [rcx]", "as wide"))    { bad = 1; }
+    if (!t_asm_refused("movsx rax, qword [rcx]", "as wide"))    { bad = 1; }
+    # ... and `movzx` has no 32-bit source form at all.
+    if (!t_asm_refused("movzx rax, dword [rcx]", "32-bit source form")) { bad = 1; }
+    # an unsized memory source names no width, which the encoder would otherwise read
+    # as a same-width move - a plain `mov` where a zero-extending load was written.
+    if (!t_asm_refused("movzx eax, [rcx]", "does not state the width")) { bad = 1; }
+
+    # a fixed-64 form takes no narrower prefix.
+    if (!t_asm_refused("push dword [rax]", "fixed 64-bit"))     { bad = 1; }
+    if (!t_asm_refused("pop word [rax]", "fixed 64-bit"))       { bad = 1; }
+    # `lidt`'s operand is a ten-byte pseudo-descriptor, which no keyword names.
+    if (!t_asm_refused("lidt qword [rax]", "no scalar width"))  { bad = 1; }
+
+    # the prefix belongs to a memory operand; on anything else it names two widths or
+    # none, and is refused rather than ignored.
+    if (!t_asm_refused("mov qword rax, rcx", "may only precede a memory operand")) { bad = 1; }
+    if (!t_asm_refused("mov rax, dword 1", "may only precede a memory operand"))   { bad = 1; }
+
+    # a symbol that merely LOOKS like a keyword is untouched: a prefix is a prefix only
+    # when whitespace and a memory operand follow it, so `[word]` still names a symbol
+    # and the statement parses to the register write it always did.
+    var gp: u32 = 0;
+    var fp: u32 = 0;
+    asm_clobbers("lea rax, [word]", ?gp, ?fp);
+    if (gp != 1) { bad = 1; }
 
     ret bad;
 }
