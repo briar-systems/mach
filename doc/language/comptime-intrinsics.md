@@ -13,6 +13,7 @@ the binding declares — Mach has no compiler-known `usize`.
 
 ```mach
 $size_of(T)             # byte size of type T
+$length_of(T)           # ELEMENT count of type T
 $align_of(T)            # byte alignment of type T
 $offset_of(T, field)    # byte offset of T's field
 ```
@@ -36,14 +37,61 @@ fun probe[T]() u64 {
 `$offset_of`'s **second** argument is the exception: a bare field name, resolved
 against the record's layout, never a type or a value.
 
+### `$length_of` — elements, not bytes
+
+`$size_of` counts bytes and `$length_of` counts elements. For `[N]u8` the two
+answers are equal; for everything else they are not, and the difference is
+deliberately in the surface rather than in the caller's head — making a caller
+divide by an element size is exactly the silent-arithmetic error the `u8` case
+hides during development.
+
+```mach
+val PIXELS: [400]f32x4 = ...;
+$length_of(PIXELS)      # 400   — elements
+$size_of(PIXELS)        # 6400  — bytes
+$length_of(f32x4)       # 4     — a vector's lane count
+```
+
+**Only a fixed array and a vector have an answer**, and everything else is
+refused rather than guessed: a pointer (`str` included) has a length the compiler
+does not know, and a record has a field count rather than an element count. The
+refusal names the type it was handed.
+
+`^` **is** stripped, which puts `$length_of` with `$size_of` rather than with the
+shape predicates: how many elements are stored is a storage question, and `^[4]u8`
+stores four of them.
+
+### The operand may be a binding
+
+Every intrinsic taking a type operand also accepts a **value binding** there,
+denoting that binding's type. A binding's type has no spelling — `val LOGO: [_]u8`
+really is a concrete `[7194]u8` that cannot be written — so without this a program
+can index an embed and pass it around and never learn its length:
+
+```mach
+#[embed("assets/logo.qoi")]
+val LOGO: [_]u8;
+
+$length_of(LOGO)        # 7194 — elements
+$size_of(LOGO)          # 7194 — bytes
+
+var i: u64 = 0;
+for (i < $length_of(LOGO)) { ... }
+```
+
+This is the operand slot's rule, not a per-intrinsic one, and it is **only** that
+slot. A name written where a type is expected and resolving to a value is still a
+mistake in every other position, and accepting it there would turn that mistake into
+a silently-typed binding.
+
 ### Where a layout intrinsic is constant
 
-`$size_of` and `$align_of` fold in every **type** position, including ones resolved
+`$size_of`, `$length_of` and `$align_of` fold in every **type** position, including ones resolved
 before layout would otherwise be known — the measured type's layout is established
 on demand when the measurement asks for it, so where the type is *declared* relative
 to where it is measured makes no difference:
 
-| position | `$size_of` / `$align_of` |
+| position | `$size_of` / `$length_of` / `$align_of` |
 |---|---|
 | `val` / `var` initializer | yes |
 | global `align` | yes |
@@ -60,7 +108,7 @@ rec Over { x: u8; }
 rec Holder { buf: [$size_of(Pair)]u8; }   # an array length, inside a field type
 ```
 
-`$offset_of` is the exception among the three: it folds in a value position but not
+`$offset_of` is the exception among the four: it folds in a value position but not
 in a type one, because a field offset is settled during lowering rather than by the
 front end.
 
@@ -200,7 +248,7 @@ about storage.**
 
 | asks about | strips `^` |
 |---|---|
-| `$size_of` / `$align_of` / `$offset_of` | yes — a secret occupies its base type's storage |
+| `$size_of` / `$length_of` / `$align_of` / `$offset_of` | yes — a secret occupies its base type's storage |
 | `$is_record` / `$is_union` / `$is_pointer` | no — `^T` is a secret, not a `T` |
 | `$pointee_of` | no — `^*U` is a secret, and is refused rather than followed |
 | `$type_name` | no — the spelling is `^T` |
@@ -209,7 +257,7 @@ about storage.**
 
 ## The type operand
 
-`$size_of` / `$align_of` / `$offset_of` / `$fields` and the queries above all take a
+`$size_of` / `$length_of` / `$align_of` / `$offset_of` / `$fields` and the queries above all take a
 **type** in argument 0, written with the ordinary type grammar — plus one extra
 form: a field descriptor's `f.type` inside a `$each` body. `$pointee_of` is part of
 that grammar rather than one of its consumers, so it composes with every one of
