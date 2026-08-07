@@ -42,6 +42,11 @@
 #   pe-imports  — like field, but walks the PE import directory and reports every
 #                 `<dll>:<symbol>` binding (#2510). PE-only; the observable for
 #                 two-level-namespace attribution, which execution cannot check.
+#   macho-imports — the Mach-O analogue: reports every `<dylib>:<symbol>` bind row
+#                 from both the bind and lazy-bind tables. Mach-O is a two-level
+#                 namespace too, so which dylib provides each import is a fact
+#                 only the emitted metadata carries (#2636). Cross-built on the
+#                 linux leg and read with llvm-objdump host-side, like macho-got.
 #   pe-exceptions — walks the PE exception directory and verifies the linked
 #                 clang fixture's runtime-function row and foreign UNWIND_INFO.
 #   pe-codeview — verifies real clang CodeView SECREL+SECTION pairs name the
@@ -932,6 +937,34 @@ produce_macho_got() {
     echo "local_slot=rebase"
     echo "import_slots=deduplicated"
     echo "import_slot=libSystem-bind"
+}
+
+# produce_macho_imports <runmode> <target> <binary>
+#
+# Every `<dylib>:<symbol>` the image asks dyld to bind, from both the bind and the
+# lazy-bind table, sorted. Mach-O records imports per dependency exactly as PE
+# does, so this is the observable for attribution on darwin: a claim that failed
+# to attribute does not merely bind to the wrong dylib, it fails the link, and a
+# claim attributed to the wrong entry shows up here as the wrong dylib name.
+#
+# Both tables carry the dylib in the second-to-last column and the symbol in the
+# last, so one rule reads either; a data row is recognized by its leading segment
+# name, which no header line has.
+#
+# The sort is pinned to the C collation, as produce_pe_imports's is: a dylib list
+# mixing cases (`libSystem`, `libcurses`) orders differently under a UTF-8 locale
+# than under C, so an unpinned sort makes the golden depend on the runner's
+# environment rather than on the emitted image.
+produce_macho_imports() {
+    _runmode=$1
+    _target=$2
+    bin=$3
+
+    binds=$(macho_objdump --macho --bind "$bin") || return 2
+    lazy=$(macho_objdump --macho --lazy-bind "$bin") || return 2
+    printf '%s\n%s\n' "$binds" "$lazy" |
+        awk '$1 ~ /^__/ && NF >= 5 { print $(NF-1) ":" $NF }' |
+        LC_ALL=C sort -u
 }
 
 # produce_macho_abs_bind <runmode> <target> <binary>
@@ -2257,6 +2290,7 @@ produce() {
         embed-dedup) produce_embed_dedup "$@" ;;
         macho-framing) produce_macho_framing "$@" ;;
         macho-sections) produce_macho_sections "$@" ;;
+        macho-imports) produce_macho_imports "$@" ;;
         macho-mod-init) produce_macho_mod_init "$@" ;;
         macho-abs-bind) produce_macho_abs_bind "$@" ;;
         pe-imports)  produce_pe_imports "$@" ;;

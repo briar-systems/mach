@@ -157,6 +157,9 @@ ext fun WSAStartup(ver: u16, data: *u8) i32;
   manifest instead, by the `symbols` key on the `[link.X]` entry that supplies
   it; see [manifest.md](../manifest.md#linkname--link-requirements). The two
   declarations write the same attribution, so a symbol may be claimed only once.
+  A claim is spelled like the source name, not like the object symbol: both routes
+  key on the link name, and Mach applies the target's C symbol prefix to the
+  manifest name just as it does to a declaration's.
 - "Only once" is checked across every declaration, and two `#[library]`
   decorators are no exception. Two `ext` declarations that resolve to the same
   link name but name different libraries are a hard error identifying both
