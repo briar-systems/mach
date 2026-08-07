@@ -9,6 +9,7 @@
 # export-demanded dependencies. Sits atop the load, deps, and union submodules;
 # the facade sequences it around the passes.
 
+use std.allocator.page;
 use std.collections.sort;
 use std.collections.vector;
 use std.crypto.hash.sha256;
@@ -18,6 +19,7 @@ use std.format;
 use fs: std.filesystem;
 use std.collections.vector.Vector;
 use std.text.string.str_free;
+use std.text.string.str_dup;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -29,6 +31,7 @@ use std.types.string.str_empty;
 use std.types.string.str_equals;
 use std.types.string.str_len;
 use std.types.string.str_copy_slice;
+use std.types.string.str_starts_with;
 use spath: std.types.path;
 
 use A: std.allocator;
@@ -254,6 +257,12 @@ pub fun load_config_manifest(p: *project.Project, project_root: str, m: *manifes
         val vr: R.Result[bool, str] = validate_local_links(p, project_root, m, bu.target, project_out_str, ?cell_v);
         if (R.is_err[bool, str](vr)) { str_free(p.alloc, project_out_str); ret R.err[bool, str](R.unwrap_err[bool, str](vr)); }
 
+        # up-front step-output validation (#2532): a declared `out` inside the module
+        # object tree would silently clobber a module's object, so it errors here
+        # rather than producing a subtly wrong binary.
+        val sor: R.Result[bool, str] = validate_step_outputs(p, m, project_out_str, ?cell_v);
+        if (R.is_err[bool, str](sor)) { str_free(p.alloc, project_out_str); ret R.err[bool, str](R.unwrap_err[bool, str](sor)); }
+
         # `mach test` links the union of every artifact's referenced entries (native
         # target), not just the primary's, plus the exported dep entries the cascade
         # pass adds below (#1964). replaces the single-artifact libs synthesized above.
@@ -356,6 +365,96 @@ fun local_link_error(alloc: *A.Allocator, name: str, path: str) str {
     val res_msg: R.Result[str, str] = format.sprint(alloc, "mach.toml: [link.{}] path '{}' matches no step output and does not exist on disk", name, path);
     if (R.is_err[str, str](res_msg)) { ret "mach.toml: a local link path matches no step output and does not exist on disk"; }
     ret R.unwrap_ok[str, str](res_msg);
+}
+
+# the module object tree for `proj_out`: `<project.out>/obj/<project.id>`, the
+# directory every module of this project compiles its object into
+#
+# The path is composed rather than read off a build unit because the check runs at
+# manifest load, before any unit is planned. It matches what emit.mirror_fqn
+# ultimately writes: `<obj_dir>/<fqn with dots as slashes>.o`, and every own module's
+# fqn starts with the project id.
+# ---
+# a:        allocator for the returned string
+# proj_out: the expanded `[project].out` for this build cell
+# id:       the project id
+# ret:      the owned reserved-tree path, without a trailing separator
+fun module_obj_tree(a: *A.Allocator, proj_out: str, id: str) str {
+    ret sfmt(a, "{}/obj/{}", proj_out, id);
+}
+
+# whether `path` names the module object tree or anything inside it
+#
+# Both strings come from the same `{project.out}` expansion, so they share spelling
+# and a prefix test is exact. The separator check keeps a sibling directory whose
+# name merely starts with the id (`obj/glfw-vendor` against `obj/glfw`) outside the
+# reserved tree.
+fun path_in_module_obj_tree(path: str, tree: str) bool {
+    if (str_equals(path, tree)) { ret true; }
+    if (!str_starts_with(path, tree)) { ret false; }
+    ret path[str_len(tree)] == '/';
+}
+
+# the shared message for a step output that lands in the module object tree
+fun step_out_reserved_error(a: *A.Allocator, what: str, name: str, path: str, tree: str) str {
+    val res_msg: R.Result[str, str] = format.sprint(a,
+        "{} '{}' writes '{}' into '{}/', the module object tree: the compiler owns that directory and one object per module lands in it, so a step output there is overwritten by (or overwrites) a module's object. write it elsewhere under {{project.out}}",
+        what, name, path, tree);
+    if (R.is_err[str, str](res_msg)) { ret "a build step writes into the module object tree, which the compiler owns"; }
+    ret R.unwrap_ok[str, str](res_msg);
+}
+
+# reject a declared step `out` that lands in the module object tree (#2532)
+#
+# A step whose output shares a directory with the per-module objects silently
+# clobbers them, or is clobbered by them, and the build links whatever survived - a
+# binary that is subtly wrong rather than one that fails. The overlap is knowable
+# from the declared outs alone, so it fails here, at manifest load, before any step
+# runs. Steps that write more than they declare are caught after the fact by the
+# post-run check in run_one_step.
+# ---
+# p:        the active project
+# m:        the parsed root manifest
+# proj_out: the expanded project out the step outs home against
+# v:        the target/profile template variables for path expansion
+fun validate_step_outputs(p: *project.Project, m: *manifest.Manifest, proj_out: str, v: *manifest.TmplVars) R.Result[bool, str] {
+    if (m.step_count == 0) { ret R.ok[bool, str](true); }
+
+    val id_opt: O.Option[str] = intern.lookup(?p.s.interner, m.id);
+    if (O.is_none[str](id_opt)) { ret R.err[bool, str]("internal: project id not interned"); }
+    val tree: str = module_obj_tree(p.alloc, proj_out, O.unwrap[str](id_opt));
+
+    var si: u32 = 0;
+    for (si < m.step_count) {
+        val step: *manifest.StepDef = ?m.steps[si];
+        val name_opt: O.Option[str] = intern.lookup(?p.s.interner, step.name);
+        if (O.is_none[str](name_opt)) { str_free(p.alloc, tree); ret R.err[bool, str]("internal: step name not interned"); }
+        val sname: str = O.unwrap[str](name_opt);
+
+        var oi: u32 = 0;
+        for (oi < step.out_count) {
+            val raw_opt: O.Option[str] = intern.lookup(?p.s.interner, step.out[oi]);
+            if (O.is_none[str](raw_opt)) { str_free(p.alloc, tree); ret R.err[bool, str]("internal: step output not interned"); }
+
+            val exp_r: R.Result[str, str] = manifest.expand(p.alloc, O.unwrap[str](raw_opt), proj_out, v);
+            if (R.is_err[str, str](exp_r)) { str_free(p.alloc, tree); ret R.err[bool, str](R.unwrap_err[str, str](exp_r)); }
+            val exp: str = R.unwrap_ok[str, str](exp_r);
+
+            if (path_in_module_obj_tree(exp, tree)) {
+                val label: str = sfmt(p.alloc, "[step.{}]", sname);
+                val msg: str = step_out_reserved_error(p.alloc, "mach.toml: declared output of", label, exp, tree);
+                str_free(p.alloc, label);
+                str_free(p.alloc, exp);
+                str_free(p.alloc, tree);
+                ret R.err[bool, str](msg);
+            }
+            str_free(p.alloc, exp);
+            oi = oi + 1;
+        }
+        si = si + 1;
+    }
+    str_free(p.alloc, tree);
+    ret R.ok[bool, str](true);
 }
 
 # compute the demanded step plan for the current build cell and store it in
@@ -895,6 +994,129 @@ fun step_env_free(a: *A.Allocator, env: **u8) {
     A.deallocate[*u8](a, env, (n + 1)::usize);
 }
 
+# one file in a module-object-tree snapshot: its path plus the identity a rewrite
+# changes
+#
+# Presence alone is not enough. A step that OVERWRITES a module object left by an
+# earlier compile is the mach-glfw failure exactly, and on an incremental build that
+# object is already on disk when the step starts. Recording mtime and size makes a
+# rewrite as visible as a fresh drop.
+# ---
+# path:  the absolute file path
+# sec:   modification time, whole seconds
+# nsec:  modification time, nanoseconds within the second
+# size:  size in bytes
+rec TreeFile {
+    path: str;
+    sec:  i64;
+    nsec: i64;
+    size: usize;
+}
+
+# append every file under `dir` (recursively) to `out` with its identity
+#
+# A missing directory yields no entries rather than an error: the module object tree
+# does not exist yet on a cold build, which is the common case at step time. Symlinks
+# are not followed, matching the src walk - a walk that chased one could escape the
+# tree or loop.
+fun collect_tree_files(a: *A.Allocator, dir: str, out: *vector.Vector[TreeFile]) {
+    val names_r: R.Result[Vector[str], str] = fs.read_dir(a, dir);
+    if (R.is_err[Vector[str], str](names_r)) { ret; }
+    var names: Vector[str] = R.unwrap_ok[Vector[str], str](names_r);
+
+    var i: usize = 0;
+    for (i < names.len) {
+        val child_r: R.Result[str, str] = load.join_path(a, dir, names.data[i]);
+        if (R.is_ok[str, str](child_r)) {
+            val child: str = R.unwrap_ok[str, str](child_r);
+            val fi_r: R.Result[fs.Metadata, str] = fs.metadata_link(child);
+            var kept: bool = false;
+            if (R.is_ok[fs.Metadata, str](fi_r)) {
+                val fi: fs.Metadata = R.unwrap_ok[fs.Metadata, str](fi_r);
+                if (fs.meta_is_dir(?fi)) {
+                    collect_tree_files(a, child, out);
+                }
+                or (fs.meta_is_file(?fi)) {
+                    var tf: TreeFile;
+                    tf.path = child;
+                    tf.sec  = fi.modified.sec;
+                    tf.nsec = fi.modified.nsec;
+                    tf.size = fi.size;
+                    val pr: R.Result[usize, str] = vector.push[TreeFile](out, tf);
+                    if (R.is_ok[usize, str](pr)) { kept = true; }
+                }
+            }
+            if (!kept) { str_free(a, child); }
+        }
+        i = i + 1;
+    }
+    free_str_vector(a, ?names);
+}
+
+# free a Vector[str] and every path it owns
+fun free_str_vector(a: *A.Allocator, v: *Vector[str]) {
+    var i: usize = 0;
+    for (i < v.len) { str_free(a, v.data[i]); i = i + 1; }
+    vector.dnit[str](v);
+}
+
+# free a Vector[TreeFile] and every path it owns
+fun free_tree_files(a: *A.Allocator, v: *Vector[TreeFile]) {
+    var i: usize = 0;
+    for (i < v.len) { str_free(a, v.data[i].path); i = i + 1; }
+    vector.dnit[TreeFile](v);
+}
+
+# whether `f` appears in `snap` unchanged - same path, same mtime, same size
+#
+# A file that matches by path but differs in either was rewritten while the step
+# ran, which counts the same as one that appeared.
+fun snapshot_holds(snap: *Vector[TreeFile], f: *TreeFile) bool {
+    var i: usize = 0;
+    for (i < snap.len) {
+        val s: *TreeFile = ?snap.data[i];
+        if (str_equals(s.path, f.path)) {
+            ret s.sec == f.sec && s.nsec == f.nsec && s.size == f.size;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the post-run backstop for #2532: report a file the step created or rewrote inside
+# the module object tree
+#
+# The load-time check only sees declared outputs. A script that writes more than it
+# declares - a vendored `make` dropping every `.o` it built into the output dir, the
+# case the issue was filed from - is invisible there and is caught here instead. The
+# comparison is against a snapshot taken immediately before the step, so an object a
+# previous compile left in the tree is not blamed on the step unless the step
+# actually touched it.
+# ---
+# a:      the step's allocator
+# before: the tree snapshot taken before the step ran
+# tree:   the absolute module object tree path
+# name:   the step name, for the message
+# ret:    ok(true), or the first offending path as an error
+fun check_step_left_obj_tree(a: *A.Allocator, before: *Vector[TreeFile], tree: str, name: str) R.Result[bool, str] {
+    var after: Vector[TreeFile] = vector.init[TreeFile](a);
+    collect_tree_files(a, tree, ?after);
+
+    var msg: str = "";
+    var i: usize = 0;
+    for (i < after.len) {
+        if (!snapshot_holds(before, ?after.data[i])) {
+            msg = step_out_reserved_error(a, "build step", name, after.data[i].path, tree);
+            i = after.len;
+        }
+        or { i = i + 1; }
+    }
+    free_tree_files(a, ?after);
+
+    if (str_empty(msg)) { ret R.ok[bool, str](true); }
+    ret R.err[bool, str](msg);
+}
+
 # run one step from `project_root` (its shell CWD), homing `{project.out}` to
 # `home_out`. root steps home to the root out and run from the root; a dependency's
 # steps run from the dep checkout and home to a path that climbs back to the root out
@@ -948,6 +1170,18 @@ fun run_one_step(a: *A.Allocator, p: *project.Project, step: *manifest.StepDef, 
         ret R.err[bool, str](R.unwrap_err[bool, str](mdr));
     }
 
+    # snapshot the module object tree so a file the step leaves there is attributable
+    # to this step rather than to a previous compile (#2532). the tree is always the
+    # ROOT project's: a dependency's step homes its outputs elsewhere, but the module
+    # objects it could clobber are the consumer's.
+    val obj_tree_rel: str = module_obj_tree(a, root_out, O.unwrap[str](intern.lookup(?p.s.interner, p.config.id)));
+    var obj_tree: str = "";
+    val ot_r: R.Result[str, str] = load.join_path(a, root_project, obj_tree_rel);
+    if (R.is_ok[str, str](ot_r)) { obj_tree = R.unwrap_ok[str, str](ot_r); }
+    str_free(a, obj_tree_rel);
+    var obj_before: Vector[TreeFile] = vector.init[TreeFile](a);
+    if (!str_empty(obj_tree)) { collect_tree_files(a, obj_tree, ?obj_before); }
+
     val msg: str = sfmt(a, "step {}: {}\n", step_name, expanded_cmd);
     print.print(msg);
     str_free(a, msg);
@@ -981,12 +1215,28 @@ fun run_one_step(a: *A.Allocator, p: *project.Project, step: *manifest.StepDef, 
 
     if (R.is_err[exec.ExitStatus, str](res_run)) {
         if (stampable) { str_free(a, hex); str_free(a, stamp_path); }
+        free_tree_files(a, ?obj_before);
+        str_free(a, obj_tree);
         ret R.err[bool, str]("failed to execute build step");
     }
     val status: exec.ExitStatus = R.unwrap_ok[exec.ExitStatus, str](res_run);
     if (!exec.exited(status) || exec.code(status) != 0) {
         if (stampable) { str_free(a, hex); str_free(a, stamp_path); }
+        free_tree_files(a, ?obj_before);
+        str_free(a, obj_tree);
         ret R.err[bool, str]("build step exited non-zero");
+    }
+
+    # the backstop for a script that wrote more than it declared: anything new in the
+    # module object tree fails the build before the stamp is written, so the next run
+    # does not treat the step as cached (#2532).
+    var left: R.Result[bool, str] = R.ok[bool, str](true);
+    if (!str_empty(obj_tree)) { left = check_step_left_obj_tree(a, ?obj_before, obj_tree, step_name); }
+    free_tree_files(a, ?obj_before);
+    str_free(a, obj_tree);
+    if (R.is_err[bool, str](left)) {
+        if (stampable) { str_free(a, hex); str_free(a, stamp_path); }
+        ret left;
     }
 
     if (stampable) {
@@ -1168,4 +1418,97 @@ pub fun execute_dep_steps(p: *project.Project, isa: str, os: str, abi: str) R.Re
         i = i + 1;
     }
     ret R.ok[bool, str](true);
+}
+
+# whether `hay` contains `needle`, for the message assertions below
+fun cfg_contains(hay: str, needle: str) bool {
+    val hn: usize = str_len(hay);
+    val nn: usize = str_len(needle);
+    if (nn > hn) { ret false; }
+    var i: usize = 0;
+    for (i + nn <= hn) {
+        var j: usize = 0;
+        for (j < nn && hay[i + j] == needle[j]) { j = j + 1; }
+        if (j == nn) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+test "mach.lang.driver.config.path_in_module_obj_tree:boundaries" {
+    # #2532: the reserved-tree test must catch the directory itself and anything
+    # under it, while leaving a sibling whose name merely shares the prefix alone.
+    # `obj/vend-c` against `obj/vend` is the case a bare str_starts_with gets wrong.
+    val tree: str = "out/linux/debug/obj/vend";
+    if (!path_in_module_obj_tree("out/linux/debug/obj/vend", tree))            { ret 1; }
+    if (!path_in_module_obj_tree("out/linux/debug/obj/vend/window.o", tree))   { ret 2; }
+    if (!path_in_module_obj_tree("out/linux/debug/obj/vend/gl/ctx.o", tree))   { ret 3; }
+    if (path_in_module_obj_tree("out/linux/debug/obj/vend-c/window.o", tree))  { ret 4; }
+    if (path_in_module_obj_tree("out/linux/debug/obj/other/window.o", tree))   { ret 5; }
+    if (path_in_module_obj_tree("out/linux/debug/vendor/window.o", tree))      { ret 6; }
+    ret 0;
+}
+
+test "mach.lang.driver.config.check_step_left_obj_tree:new_file_only" {
+    # the post-run backstop for a step that writes more than it declares. an object
+    # already in the tree when the step started belongs to a previous compile and must
+    # not be blamed on the step; one that appeared while it ran must be.
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "mach_steptree_test");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val dup_r: R.Result[str, str] = str_dup(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[str, str](dup_r)) { ret 1; }
+    val tree: str = R.unwrap_ok[str, str](dup_r);
+    if (O.is_some[str](fs.create_dir_all(?alloc, tree, 493))) { ret 1; }
+
+    var bad: i32 = 0;
+
+    # an object from a previous compile, present before the step runs
+    val stale: str = sfmt(?alloc, "{}/main.o", tree);
+    fs.write_bytes(stale, "x", 1::usize, 420);
+
+    var before: vector.Vector[TreeFile] = vector.init[TreeFile](?alloc);
+    collect_tree_files(?alloc, tree, ?before);
+
+    # nothing new yet: the pre-existing object must not be reported
+    val clean: R.Result[bool, str] = check_step_left_obj_tree(?alloc, ?before, tree, "vendor");
+    if (R.is_err[bool, str](clean)) { bad = 1; }
+
+    # now the step drops its own object into the tree
+    val dropped: str = sfmt(?alloc, "{}/window.o", tree);
+    fs.write_bytes(dropped, "x", 1::usize, 420);
+
+    val dirty: R.Result[bool, str] = check_step_left_obj_tree(?alloc, ?before, tree, "vendor");
+    if (R.is_ok[bool, str](dirty)) { bad = 1; }
+    or {
+        val msg: str = R.unwrap_err[bool, str](dirty);
+        if (!cfg_contains(msg, "vendor"))            { bad = 1; }
+        or (!cfg_contains(msg, "window.o"))          { bad = 1; }
+        or (!cfg_contains(msg, "module object tree")) { bad = 1; }
+    }
+
+    # a step that OVERWRITES an object already in the tree, rather than adding one,
+    # is the same collision and must be caught the same way. this is the incremental
+    # case: on the second build the compiler's object is already on disk when the
+    # step starts, so a presence-only snapshot would wave it through.
+    free_tree_files(?alloc, ?before);
+    fs.remove_file(dropped);
+    var before2: vector.Vector[TreeFile] = vector.init[TreeFile](?alloc);
+    collect_tree_files(?alloc, tree, ?before2);
+    fs.write_bytes(stale, "yy", 2::usize, 420);
+    val rewritten: R.Result[bool, str] = check_step_left_obj_tree(?alloc, ?before2, tree, "vendor");
+    if (R.is_ok[bool, str](rewritten)) { bad = 1; }
+    or {
+        val msg2: str = R.unwrap_err[bool, str](rewritten);
+        if (!cfg_contains(msg2, "main.o")) { bad = 1; }
+    }
+    free_tree_files(?alloc, ?before2);
+    str_free(?alloc, stale);
+    str_free(?alloc, dropped);
+    fs.remove_all(?alloc, tree);
+    ret bad;
 }

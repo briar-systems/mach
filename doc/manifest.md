@@ -581,6 +581,25 @@ nor on the directory from which the consumer was invoked. An ordinary relative
 consumer root (including `./` segments) and its normalized absolute spelling produce
 the same expanded command and cache key.
 
+**The module object tree is reserved.** `{project.out}/obj/<project.id>/` belongs
+to the compiler: every module of the project compiles to one object in it, named
+after the module's path (`src/window.mach` in project `glfw` becomes
+`{project.out}/obj/glfw/window.o`). A step that writes there collides with those
+objects by name, and because the link takes whichever file survived, the result is
+a binary that is subtly wrong rather than a build that fails.
+
+A step output is therefore rejected in that subtree. A declared `out` inside it
+fails at manifest load, naming the step and the path, before any step runs. A step
+that writes an object there without declaring it is caught after it runs, with the
+same message — this covers the common case of a vendored `make` dropping every
+object it built into the output directory.
+
+Pick any other subtree of `{project.out}`. The conventional choice for a vendored
+library is a directory named after the library rather than after the project, e.g.
+`{project.out}/obj/miniaudio/` for a project whose own id is `audio`; note that
+this only stays clear of the reserved tree while the two names differ, so prefer a
+distinct sibling such as `{project.out}/vendor/<library>/`.
+
 **Target environment.** Every step process additionally inherits the active
 build cell's target tuple as `MACH_TARGET_ISA`, `MACH_TARGET_OS`, and
 `MACH_TARGET_ABI`, so a `cmd` or the script it invokes can branch on the target
