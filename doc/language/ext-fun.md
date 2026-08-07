@@ -165,6 +165,9 @@ ext fun WSAStartup(ver: u16, data: *u8) i32;
   table names never depends on module load order. Two declarations naming the
   *same* library are accepted: they name one provider, which is what a shared
   binding declared in two modules does.
+- Declarations under **different arms of one `$if` chain** are exempt, because no
+  target selects both arms, so they never both apply. A target-conditional
+  attribution is written the obvious way and is not a conflict.
 
 `library` composes with `symbol`: the rename sets the imported symbol's name,
 `library` sets the dependency it is imported from. On one decl the import is emitted
