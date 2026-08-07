@@ -56,6 +56,7 @@ use R: std.types.result;
 
 use mach.lang.intern;
 use mach.lang.source;
+use mach.lang.spirvop;
 use mach.lang.target.resolved;
 use mach.lang.me.ir;
 use mach.lang.me.ir.type;
@@ -113,6 +114,13 @@ rec Emit {
     iface_len: u32;
     gslot:     *u32;
     iface_use: *u8;
+
+    # the id each extended instruction set was imported under, indexed by
+    # spirvop.SPV_SET_*; 0 means "not imported yet". indexed rather than one field
+    # per set so a second set is a row in `spirvop`, not a change here. the import
+    # is minted at the FIRST call that needs it, which is what makes it on demand:
+    # a module using none of them carries no OpExtInstImport at all
+    ext_ids:   [8]u32;
 
     # the refusal context: which function is being emitted and which instruction
     # is being translated, so a refusal can say so without every site threading
@@ -195,6 +203,8 @@ pub fun emit_module(tgt: *resolved.Target, irmod: *ir.Module,
     e.tgt = tgt; e.ir = irmod; e.b = ?b; e.tt = ?tt; e.fn_ids = nil;
     e.gvar_ids = nil; e.gtype_ids = nil; e.gstorage = nil; e.iface_ids = nil; e.iface_len = 0;
     e.gslot = nil; e.iface_use = nil;
+    var xi: u32 = 0;
+    for (xi < 8) { e.ext_ids[xi] = 0; xi = xi + 1; }
     e.srcmap = mirmod.srcmap; e.cur_fn = nil; e.cur_instr = nil;
 
     # a module is a shader module or a library module, never both, and which one is
@@ -253,6 +263,15 @@ pub fun emit_module(tgt: *resolved.Target, irmod: *ir.Module,
         # a body-less MIR function (an extern declaration) lowers to an empty shell;
         # it contributes no OpFunction (SPIR-V imports are a later phase).
         if (mf.block_count == 0) { fi = fi + 1; cnt; }
+        # a function that IS a SPIR-V instruction contributes no OpFunction either.
+        # It has a mach body - that is what makes `shader.math` a real library on a
+        # CPU target rather than a set of declarations - but on this target every
+        # call to it becomes the instruction, so the body is unreachable. Emitting it
+        # anyway would be worse than dead weight: the native body is written in terms
+        # of the bit manipulation a CPU needs, which is exactly what logical
+        # addressing refuses, so the module would fail to build over code nothing
+        # calls.
+        if (instruction_mapped(e.ir, mf.name)) { fi = fi + 1; cnt; }
         val fr: R.Result[bool, str] = emit_function(?e, mf);
         if (R.is_err[bool, str](fr)) {
             emit_dnit(?e, irmod.function_len);
@@ -1403,10 +1422,19 @@ fun build_vmaps(e: *Emit, mf: *mir.MirFunction, irfn: *ir.Function, out: *VMaps)
                 val v: u32 = mi.operands[0].vreg;
                 var t: u32 = 0;
                 if (callee != intern.STR_NIL) {
-                    val cix: u32 = ir_function_index(e.ir, callee);
-                    if (cix != IR_FN_NONE) {
+                    # by RECORD, not by `ir_function_index`, which skips a
+                    # declaration because its answer also selects a pre-allocated
+                    # SPIR-V id. What is wanted here is the callee's declared RETURN
+                    # TYPE, which a signature-only declaration has just as much as a
+                    # definition does. Looking it up the other way left every
+                    # cross-module call's result typed by the move's machine width
+                    # instead: an `f32` came back 64 bits wide and a scalar returned
+                    # from vector arguments came back a vector, and the module failed
+                    # validation at the store rather than at the call.
+                    val cfn: *ir.Function = ir_function_record(e.ir, callee);
+                    if (cfn != nil) {
                         var cvoid: bool = false;
-                        t = ir_return_spv_type(e, ?e.ir.functions[cix], ?cvoid);
+                        t = ir_return_spv_type(e, cfn, ?cvoid);
                         if (cvoid) { t = 0; }
                     }
                     callee = intern.STR_NIL;
@@ -2353,6 +2381,18 @@ fun emit_call(e: *Emit, preg_val: *Regs, mi: *mir.MirInstr) R.Result[bool, str] 
     if (callee.kind != mir.MIR_OP_SYM) {
         ret unsupported(e, "a call through a function pointer is not yet supported by the SPIR-V target");
     }
+
+    # a callee carrying `#[spirv_op(set, name)]` is not called at all: it IS one
+    # instruction, and this call site becomes that instruction. Checked before the
+    # in-module lookup below, because the whole point is that the callee is usually
+    # NOT in this module - a SPIR-V module is compiled per mach module and a shader
+    # module may declare no linkage, so `shader.math` could not be called even if
+    # its body were emitted.
+    val xfn: *ir.Function = ir_function_record(e.ir, callee.sym);
+    if (xfn != nil && xfn.spv_set != spirvop.SPV_SET_NONE) {
+        ret emit_spirv_op(e, preg_val, xfn);
+    }
+
     val fix: u32 = ir_function_index(e.ir, callee.sym);
     if (fix == IR_FN_NONE || e.fn_ids == nil || e.fn_ids[fix] == 0) {
         ret unsupported(e, "a call to a function defined outside the module is not yet supported by the SPIR-V target");
@@ -2386,6 +2426,137 @@ fun emit_call(e: *Emit, preg_val: *Regs, mi: *mir.MirInstr) R.Result[bool, str] 
         preg_val.is_imm[0] = false;
     }
     ret R.ok[bool, str](true);
+}
+
+# emit the single SPIR-V instruction a `#[spirv_op(set, name)]` callee stands for
+#
+# The contract is uniform across every instruction in the table and is what makes
+# adding one a row rather than a case: the result type is the mach function's
+# declared return type, and the operands are its parameters in declaration order,
+# read out of the identity convention's register file exactly as a real call's
+# arguments would be. That covers the awkward members without special-casing them -
+# `Length` and `OpDot` return a scalar from vectors, `Refract` mixes a scalar
+# operand with vector ones, `FClamp` and `SmoothStep` take three.
+#
+# The signature is read from the IR function's type rather than from `params`,
+# because for a cross-module callee the declaration is signature-only: it was
+# synthesized from a name and a type and has no parameter list of its own.
+#
+# A core-set instruction is emitted directly; an extended one is an OpExtInst
+# naming the imported set's id and the instruction number within it, with the set
+# imported here on first use.
+# ---
+# e:        the emission state
+# preg_val: the identity convention's nominal register file
+# fn:       the callee's IR function record, carrying spv_set / spv_op
+# ret:      true on success, or a precise error string
+fun emit_spirv_op(e: *Emit, preg_val: *Regs, fn: *ir.Function) R.Result[bool, str] {
+    val sig_opt: O.Option[*type.IrType] = type.get(?e.ir.types, fn.sig);
+    if (O.is_none[*type.IrType](sig_opt)) {
+        ret R.err[bool, str]("spirv.emit: a `spirv_op` callee has no signature type");
+    }
+    val sig: *type.IrType = O.unwrap[*type.IrType](sig_opt);
+    if (sig.kind != type.IRT_FN) {
+        ret R.err[bool, str]("spirv.emit: a `spirv_op` callee's signature is not a function type");
+    }
+    val argc: u32 = sig.data.fn.param_count;
+    # 12 operands is past every instruction in the table (the widest is three) and
+    # leaves the fixed operand array a comfortable size.
+    if (argc > 12) {
+        ret unsupported(e, "a `spirv_op` function takes at most 12 parameters on the SPIR-V target");
+    }
+
+    var returns_void: bool = false;
+    val ret_ty: u32 = ir_return_spv_type(e, fn, ?returns_void);
+    if (ret_ty == 0) { ret unsupported(e, "unsupported return type in the SPIR-V target"); }
+    # every instruction in the table produces a value. a void one would leave the
+    # result register holding whatever the previous call left there, which is the
+    # silent-wrong-value failure this decorator exists to avoid.
+    if (returns_void) {
+        ret unsupported(e, "a `spirv_op` function must return a value; a SPIR-V instruction has a result id");
+    }
+
+    var ops: [16]u32;
+    var base: u32 = 2;
+    ops[0] = ret_ty;
+    val result: u32 = spirv.alloc_id(e.b);
+    ops[1] = result;
+    if (fn.spv_set != spirvop.SPV_SET_CORE) {
+        val set_id: u32 = ext_set_id(e, fn.spv_set);
+        if (set_id == 0) {
+            ret R.err[bool, str]("spirv.emit: a `spirv_op` names an instruction set with no import name");
+        }
+        ops[2] = set_id;
+        ops[3] = fn.spv_op;
+        base = 4;
+    }
+
+    var i: u32 = 0;
+    for (i < argc) {
+        val aid: u32 = reg_value(e, preg_val, i, ir_value_spv_type(e, sig.data.fn.params[i]));
+        if (aid == 0) { ret R.err[bool, str]("spirv.emit: `spirv_op` argument with no pre-colored value"); }
+        ops[base + i] = aid;
+        i = i + 1;
+    }
+
+    var opcode: u32 = spirv.OP_EXT_INST;
+    if (fn.spv_set == spirvop.SPV_SET_CORE) { opcode = fn.spv_op; }
+    spirv.inst(e.b, ?e.b.functions, opcode, ?ops[0], base + argc);
+
+    # the return register, which the result move reads next - the same handoff a
+    # real OpFunctionCall makes.
+    preg_val.val_id[0] = result;
+    preg_val.is_imm[0] = false;
+    ret R.ok[bool, str](true);
+}
+
+# the id an extended instruction set is imported under, importing it on first use
+#
+# One OpExtInstImport per set per module: a second import of the same set is
+# invalid, so the id is cached rather than re-minted. Returns 0 when the set has no
+# import name, which is the core set and never reaches here.
+# ---
+# e:   the emission state
+# set: one of spirvop.SPV_SET_*
+# ret: the set's id, or 0
+fun ext_set_id(e: *Emit, set: u8) u32 {
+    if (set::u32 >= 8) { ret 0; }
+    if (e.ext_ids[set::u32] != 0) { ret e.ext_ids[set::u32]; }
+    val name: str = spirvop.set_import_name(set);
+    if (str_len(name) == 0::usize) { ret 0; }
+    val id: u32 = spirv.ext_inst_import(e.b, name);
+    e.ext_ids[set::u32] = id;
+    ret id;
+}
+
+# the IR function record of the given interned name, defined or merely declared
+#
+# `ir_function_index` deliberately skips FN_FLAG_EXTERN entries, since its answer
+# selects a pre-allocated SPIR-V id and a declaration has none. A `spirv_op` callee
+# is normally exactly such a declaration - the definition is in another mach module
+# - so its record is looked up separately.
+# ---
+# irmod: the IR module
+# name:  the interned function name
+# ret:   the function record, or nil
+fun ir_function_record(irmod: *ir.Module, name: intern.StrId) *ir.Function {
+    var i: u32 = 0;
+    for (i < irmod.function_len) {
+        if (irmod.functions[i].name == name) { ret ?irmod.functions[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# whether the named function is one a `#[spirv_op(...)]` maps to an instruction
+# ---
+# irmod: the IR module
+# name:  the interned function name
+# ret:   true when the function carries a SPIR-V instruction mapping
+fun instruction_mapped(irmod: *ir.Module, name: intern.StrId) bool {
+    val fn: *ir.Function = ir_function_record(irmod, name);
+    if (fn == nil) { ret false; }
+    ret fn.spv_set != spirvop.SPV_SET_NONE;
 }
 
 # produce an SSA value id for an operand, materializing a load / constant as needed
