@@ -50,6 +50,7 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_contains;
+use std.types.string.str_equals;
 use std.types.string.str_len;
 
 use std.crypto.hash.sha256;
@@ -1999,7 +2000,7 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
 
     # __PAGEZERO and the mapped load segments, framed exactly as the dyld-loaded
     # path frames them; only the entry command below differs.
-    var lc: usize = write_frame_cmds(buf, MACH_HEADER_64_SIZE, nil::*of.DynamicInfo, segs,
+    var lc: usize = write_frame_cmds(buf, MACH_HEADER_64_SIZE, itn, nil::*of.DynamicInfo, segs,
                                      seg_count, seg_offsets, pagezero_size, text_va,
                                      hdr_span, exec_page);
     write_segment_bytes(buf, segs, seg_count, seg_offsets);
@@ -2407,16 +2408,17 @@ fun write_segment_cmd(buf: *u8, off: usize, name: str, vmaddr: u64, vmsize: u64,
 # addr:     the section virtual address
 # size:     the section byte size
 # fileoff:  the section file offset
+# align:    the section's required alignment in bytes (recorded as its log2)
 # flags:    the section flags word
 # ret:      the byte offset just past the entry
 fun write_section_64(buf: *u8, off: usize, sectname: str, segname: str, addr: u64, size: u64,
-                     fileoff: u32, flags: u32) usize {
+                     fileoff: u32, align: u32, flags: u32) usize {
     write_fixed16(buf, off, sectname);
     write_fixed16(buf, off + 16, segname);
     bin.write_u64_le(buf, off + 32, addr);
     bin.write_u64_le(buf, off + 40, size);
     bin.write_u32_le(buf, off + 48, fileoff);
-    bin.write_u32_le(buf, off + 52, 0);
+    bin.write_u32_le(buf, off + 52, align_log2(align));
     bin.write_u32_le(buf, off + 56, 0);
     bin.write_u32_le(buf, off + 60, 0);
     bin.write_u32_le(buf, off + 64, flags);
@@ -2450,7 +2452,88 @@ fun frame_cmd_count(dyn: *of.DynamicInfo, segs: *of.LoadSegment, seg_count: u32,
 # ret:       the byte size of the framing commands
 fun frame_cmd_bytes(dyn: *of.DynamicInfo, segs: *of.LoadSegment, seg_count: u32, pagezero: bool) usize {
     ret frame_cmd_count(dyn, segs, seg_count, pagezero)::usize * SEGMENT_CMD_64_SIZE
-        + seg_count::usize * SECTION_64_SIZE;
+        + frame_sect_total(segs, seg_count)::usize * SECTION_64_SIZE;
+}
+
+# the number of section_64 entries the framing emits: every named section of every
+# load segment. the linker names each one after the input sections it merged, so a
+# runtime that finds content by name (libobjc's __objc_classlist scan, dyld's
+# __mod_init_func) finds it in the image (#2606)
+# ---
+# segs:      the linker's load segments
+# seg_count: number of load segments
+# ret:       the total section count
+fun frame_sect_total(segs: *of.LoadSegment, seg_count: u32) u32 {
+    var n:  u32 = 0;
+    var li: u32 = 0;
+    for (li < seg_count) {
+        n = n + segs[li].section_count;
+        li = li + 1;
+    }
+    ret n;
+}
+
+# the number of section_64 entries one Mach-O segment carries: the named sections
+# of every load segment that collapsed into it
+# ---
+# segs:  the linker's load segments
+# first: the Mach-O segment's first load segment index
+# last:  its last load segment index
+# ret:   the section count
+fun group_sect_count(segs: *of.LoadSegment, first: u32, last: u32) u32 {
+    var n: u32 = 0;
+    var m: u32 = first;
+    for (m <= last) {
+        n = n + segs[m].section_count;
+        m = m + 1;
+    }
+    ret n;
+}
+
+# the Mach-O section name for one of a load segment's named sections
+#
+# The inverse of the parser's canonicalization: a section still carrying its kind's
+# abstract canonical name is content with no identity beyond its kind, so it takes
+# this format's spelling (`.text` -> `__text`). A section that carries anything else
+# was named by an input object and keeps that name, which is the whole point - a
+# runtime that scans for `__DATA,__objc_classlist` finds nothing if the linker
+# renames it (#2606)
+# ---
+# itn: interner resolving the section's name
+# sec: the named section
+# ret: the 16-byte-clamped Mach-O section name
+fun exec_sectname(itn: *intern.Interner, sec: *of.LoadSection) str {
+    val nm: str = bin.resolve_name(itn, sec.name);
+    if (nm == nil || str_equals(nm, of.canonical_section_name(sec.kind))) {
+        ret macho_sectname(sec.kind);
+    }
+    ret nm;
+}
+
+# write one load segment's named sections into a segment command's section table
+# ---
+# buf:     the output buffer
+# off:     byte offset of the first section_64 entry to write
+# itn:     interner resolving each section's name
+# seg:     the load segment whose sections are written
+# segname: the enclosing Mach-O segment name
+# fileoff: the segment's file offset
+# ret:     the byte offset just past the last entry written
+fun write_load_sections(buf: *u8, off: usize, itn: *intern.Interner, seg: *of.LoadSegment,
+                        segname: str, fileoff: usize) usize {
+    var w: usize = off;
+    var i: u32 = 0;
+    for (i < seg.section_count) {
+        val sec: *of.LoadSection = ?seg.sections[i];
+        # a zero-fill section occupies no file bytes, so it carries no file offset.
+        var soff: u32 = 0;
+        if (sec.kind != of.SK_BSS) { soff = (fileoff + sec.offset::usize)::u32; }
+        w = write_section_64(buf, w, exec_sectname(itn, sec), segname,
+                             seg.vaddr + sec.offset::u64, sec.len::u64, soff,
+                             sec.align, macho_section_flags(sec.kind));
+        i = i + 1;
+    }
+    ret w;
 }
 
 # write the image framing: __PAGEZERO, then the mapped load segments
@@ -2468,6 +2551,7 @@ fun frame_cmd_bytes(dyn: *of.DynamicInfo, segs: *of.LoadSegment, seg_count: u32,
 # ---
 # buf:           the output buffer
 # lc:            byte offset to write the first command at
+# itn:           interner resolving each named section's name
 # dyn:           the dynamic-link plan (nil for a static link)
 # segs:          the linker's load segments
 # seg_count:     number of load segments
@@ -2477,9 +2561,9 @@ fun frame_cmd_bytes(dyn: *of.DynamicInfo, segs: *of.LoadSegment, seg_count: u32,
 # hdr_span:      bytes reserved for the header + load commands at __TEXT's start
 # exec_page:     the target's vm page size
 # ret:           the byte offset just past the last command written
-fun write_frame_cmds(buf: *u8, lc: usize, dyn: *of.DynamicInfo, segs: *of.LoadSegment,
-                     seg_count: u32, seg_offsets: *usize, pagezero_size: u64, text_va: u64,
-                     hdr_span: usize, exec_page: u64) usize {
+fun write_frame_cmds(buf: *u8, lc: usize, itn: *intern.Interner, dyn: *of.DynamicInfo,
+                     segs: *of.LoadSegment, seg_count: u32, seg_offsets: *usize,
+                     pagezero_size: u64, text_va: u64, hdr_span: usize, exec_page: u64) usize {
     var off: usize = lc;
     if (pagezero_size > 0) {
         off = write_segment_cmd(buf, off, "__PAGEZERO", 0, pagezero_size, 0, 0, 0, 0, 0);
@@ -2489,11 +2573,10 @@ fun write_frame_cmds(buf: *u8, lc: usize, dyn: *of.DynamicInfo, segs: *of.LoadSe
     val text_prot: u32 = seg_vm_prot(dyn, segs, 0);
     var tsec: usize = write_segment_cmd(buf, off, "__TEXT", text_va,
                           bin.align_up_u64(hdr_span::u64 + segs[0].memsz::u64, exec_page),
-                          0, hdr_span::u64 + segs[0].filesz::u64, text_prot, text_prot, 1);
+                          0, hdr_span::u64 + segs[0].filesz::u64, text_prot, text_prot,
+                          segs[0].section_count);
     if (seg_is_data_const(dyn, segs, 0)) { bin.write_u32_le(buf, off + 68, SG_READ_ONLY); }
-    write_section_64(buf, tsec, dyn_sectname(segs[0].flags, false), "__TEXT", segs[0].vaddr,
-                     segs[0].memsz::u64, seg_offsets[0]::u32, dyn_sect_flags(segs[0].flags, false));
-    off = tsec + SECTION_64_SIZE;
+    off = write_load_sections(buf, tsec, itn, ?segs[0], "__TEXT", seg_offsets[0]);
 
     var li: u32 = 1;
     for (li < seg_count) {
@@ -2519,16 +2602,12 @@ fun write_frame_cmds(buf: *u8, lc: usize, dyn: *of.DynamicInfo, segs: *of.LoadSe
                                              exec_page);
 
         var lsec: usize = write_segment_cmd(buf, off, gname, segs[li].vaddr, grp_vmsz,
-                              seg_offsets[li]::u64, grp_fsz, prot, prot, last - li + 1);
+                              seg_offsets[li]::u64, grp_fsz, prot, prot,
+                              group_sect_count(segs, li, last));
         if (seg_is_data_const(dyn, segs, li)) { bin.write_u32_le(buf, off + 68, SG_READ_ONLY); }
         m = li;
         for (m <= last) {
-            val zf: bool = segs[m].filesz == 0 && segs[m].memsz > 0;
-            var soff: u32 = seg_offsets[m]::u32;
-            if (zf) { soff = 0; }
-            write_section_64(buf, lsec, dyn_sectname(segs[m].flags, zf), gname,
-                             segs[m].vaddr, segs[m].memsz::u64, soff, dyn_sect_flags(segs[m].flags, zf));
-            lsec = lsec + SECTION_64_SIZE;
+            lsec = write_load_sections(buf, lsec, itn, ?segs[m], gname, seg_offsets[m]);
             m = m + 1;
         }
         off = lsec;
@@ -3240,32 +3319,6 @@ fun macho_got_ordinal(dyn: *of.DynamicInfo, import_index: u32) u32 {
     ret n;
 }
 
-# the section name for a linker load segment, chosen from its permissions and
-# whether it is zero-fill (bss): executable is __text, zero-fill is __bss, other
-# writable is __data, read-only is __const
-# ---
-# flags:    the segment's SEG_FLAG_* permission bits
-# zerofill: whether the segment carries no file bytes (bss)
-# ret:      the section name
-fun dyn_sectname(flags: u32, zerofill: bool) str {
-    if ((flags & of.SEG_FLAG_EXECUTE) != 0) { ret "__text"; }
-    if (zerofill)                           { ret "__bss"; }
-    if ((flags & of.SEG_FLAG_WRITE) != 0)   { ret "__data"; }
-    ret "__const";
-}
-
-# the section flags word for a linker load segment: executable code is pure
-# instructions, zero-fill is S_ZEROFILL, the rest are regular
-# ---
-# flags:    the segment's SEG_FLAG_* permission bits
-# zerofill: whether the segment carries no file bytes (bss)
-# ret:      the section flags word
-fun dyn_sect_flags(flags: u32, zerofill: bool) u32 {
-    if ((flags & of.SEG_FLAG_EXECUTE) != 0) { ret S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS; }
-    if (zerofill)                           { ret S_ZEROFILL; }
-    ret 0;
-}
-
 # write a dynamically-linked MH_EXECUTE Mach-O, installed as the of.DynExecFn
 #
 # frames the linker's laid-out load segments into a dyld-loadable executable: a
@@ -3384,10 +3437,11 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     var entry_cmd_size: usize = thread_cmd_size;
     if (pie) { entry_cmd_size = ENTRY_POINT_CMD_SIZE; }
 
-    # every loadable segment carries one section_64 entry (the linker's segments
-    # plus the synthesized stub and got segments) so the llvm/otool readers and the
-    # bind-opcode segment index resolve against a real section table.
-    var sect_total: u32 = seg_count;
+    # every load segment carries one section_64 entry per named section the linker
+    # merged into it, plus one each for the synthesized stub and got segments, so the
+    # llvm/otool readers and the bind-opcode segment index resolve against a real
+    # section table and a name-based runtime scan finds its section (#2606).
+    var sect_total: u32 = frame_sect_total(segs, seg_count);
     if (nstub > 0) { sect_total = sect_total + 1; }
     if (ngot > 0)  { sect_total = sect_total + 1; }
 
@@ -3560,7 +3614,7 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
 
     # __PAGEZERO and the mapped load segments, framed exactly as the static path
     # frames them; only the entry command below differs.
-    var lc: usize = write_frame_cmds(buf, MACH_HEADER_64_SIZE, dyn, segs, seg_count,
+    var lc: usize = write_frame_cmds(buf, MACH_HEADER_64_SIZE, itn, dyn, segs, seg_count,
                                      seg_offsets, lay.pagezero_size, lay.text_va,
                                      lay.hdr_span, exec_page);
 
@@ -3574,7 +3628,8 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
                                lay.stubs_off::u64, lay.stubs_size::u64,
                                VM_PROT_READ | VM_PROT_EXECUTE, VM_PROT_READ | VM_PROT_EXECUTE, 1);
         write_section_64(buf, sec, "__stubs", "__STUBS", lay.stubs_va, lay.stubs_size::u64,
-                         lay.stubs_off::u32, S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS);
+                         lay.stubs_off::u32, 4,
+                         S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS);
         lc = sec + SECTION_64_SIZE;
     }
     if (ngot > 0) {
@@ -3583,7 +3638,7 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
                                lay.got_off::u64, lay.got_size::u64,
                                VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, 1);
         write_section_64(buf, gsec, "__got", "__GOT", lay.got_va, lay.got_size::u64,
-                         lay.got_off::u32, 0);
+                         lay.got_off::u32, 8, 0);
         lc = gsec + SECTION_64_SIZE;
     }
 
@@ -3929,7 +3984,14 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
                 for (ni < 16) { name_buf[ni] = buf[sh + ni]; ni = ni + 1; }
                 name_buf[16] = 0;
                 var canon_buf: [17]u8;
-                val canon: str = canonical_sectname((?name_buf[0])::str, ?canon_buf[0]);
+                var canon: str = canonical_sectname((?name_buf[0])::str, ?canon_buf[0]);
+                # a loadable section named by this writer's own kind spelling carries
+                # no identity beyond its kind, so it takes the abstract canonical name
+                # and merges with every other object's plain code and data. any other
+                # name is the section's identity and survives the link (#2606).
+                if (kind != of.SK_DEBUG && str_equals(canon, macho_sectname(kind))) {
+                    canon = of.canonical_section_name(kind);
+                }
                 val rin: R.Result[intern.StrId, str] = intern.intern(itn, canon);
                 if (R.is_err[intern.StrId, str](rin)) {
                     free_parse_scratch(alloc, sec_base, sec_anchor, sec_n);
@@ -5262,6 +5324,7 @@ fun ts_exec_x64() u8 {
 
     # the product name is deliberately not the temp-file basename, to prove the
     # code-sign identifier tracks the name, not the output path.
+    if (t_name_segs(?alloc, ?itn, ?segs[0], 1) != 0) { ret 1; }
     val em: R.Result[bool, str] = emit_exec(?alloc, ?itn, ?isa_vt, ?segs[0], 1,
                                             4096, base, entry,
                                             nil::*of.ExecFunction, 0, nil::*of.Section, 0,
@@ -5342,6 +5405,7 @@ fun ts_exec_arm64() u8 {
     var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
     val tpath: str = fs.temp_path(?tf);
 
+    if (t_name_segs(?alloc, ?itn, ?segs[0], 1) != 0) { ret 1; }
     val em: R.Result[bool, str] = emit_exec(?alloc, ?itn, ?isa_vt, ?segs[0], 1,
                                             16384, base, entry,
                                             nil::*of.ExecFunction, 0, nil::*of.Section, 0,
@@ -5485,6 +5549,7 @@ fun ts_dyn_exec(arch_id: u32) u8 {
     var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
     val tpath: str = fs.temp_path(?tf);
 
+    if (t_name_segs(?alloc, ?itn, ?segs[0], 1) != 0) { ret 1; }
     val em: R.Result[bool, str] = emit_dyn_exec(?alloc, ?itn, ?isa_vt, ?segs[0], 1,
                                                 4096, base, entry,
                                                 nil::*of.ExecFunction, 0, ?dyn, ?fx[0], 1,
@@ -5720,9 +5785,41 @@ fun t_rebase_vaddr(buf: *u8, nth: u32) u64 {
 # dyn:       the dynamic-link plan
 # entry:     the entry virtual address
 # ret:       the emitted image bytes, or an error string
+# give each hand-built load segment the one named section a link of mach's own
+# objects would produce for it, since those objects carry one section name per kind
+#
+# The writers emit a section header per `of.LoadSection`, and the linker guarantees
+# every mapped segment carries at least one, so a fixture that skipped this would
+# be exercising an image the linker cannot produce. The arrays are allocated from
+# the test's page allocator and live as long as it does
+fun t_name_segs(alloc: *A.Allocator, itn: *intern.Interner, segs: *of.LoadSegment, seg_count: u32) u8 {
+    var i: u32 = 0;
+    for (i < seg_count) {
+        val ar: R.Result[*of.LoadSection, str] = A.zallocate[of.LoadSection](alloc, 1);
+        if (R.is_err[*of.LoadSection, str](ar)) { ret 1; }
+        val sec: *of.LoadSection = R.unwrap_ok[*of.LoadSection, str](ar);
+        val zf: bool = segs[i].filesz == 0 && segs[i].memsz > 0;
+        var nm:   str = "__const";
+        var kind: of.SectionKind = of.SK_RODATA;
+        if ((segs[i].flags & of.SEG_FLAG_EXECUTE) != 0) { nm = "__text"; kind = of.SK_TEXT; }
+        or (zf)                                         { nm = "__bss";  kind = of.SK_BSS; }
+        or ((segs[i].flags & of.SEG_FLAG_WRITE) != 0)   { nm = "__data"; kind = of.SK_DATA; }
+        sec.name   = t_intern(itn, nm);
+        sec.kind   = kind;
+        sec.offset = 0;
+        sec.len    = segs[i].memsz::u32;
+        sec.align  = 8;
+        segs[i].sections      = sec;
+        segs[i].section_count = 1;
+        i = i + 1;
+    }
+    ret 0;
+}
+
 fun t_emit_dyn(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
                segs: *of.LoadSegment, seg_count: u32, dyn: *of.DynamicInfo,
                entry: u64) R.Result[Vector[u8], str] {
+    if (t_name_segs(alloc, itn, segs, seg_count) != 0) { ret R.err[Vector[u8], str]("names"); }
     val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "macho_seg");
     if (R.is_err[fs.TempFile, str](tf_r)) { ret R.err[Vector[u8], str]("temp"); }
     var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
@@ -5815,6 +5912,7 @@ fun ts_exec_frames_like_dyn() u8 {
     val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_frame");
     if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
     var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    if (t_name_segs(?alloc, ?itn, ?segs[0], 3) != 0) { ret 1; }
     val em: R.Result[bool, str] = emit_exec(?alloc, ?itn, ?isa_vt, ?segs[0], 3,
                                             pg, base, first,
                                             nil::*of.ExecFunction, 0, nil::*of.Section, 0,
@@ -6070,6 +6168,7 @@ fun ts_exec_merges_read_only() u8 {
     val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_exec_ro");
     if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
     var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    if (t_name_segs(?alloc, ?itn, ?segs[0], 3) != 0) { ret 1; }
     val em: R.Result[bool, str] = emit_exec(?alloc, ?itn, ?isa_vt, ?segs[0], 3,
                                             pg, base, base,
                                             nil::*of.ExecFunction, 0, nil::*of.Section, 0,
@@ -6367,6 +6466,7 @@ fun ts_exec_debug_roundtrip() u8 {
     var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
     val tpath: str = fs.temp_path(?tf);
 
+    if (t_name_segs(?alloc, ?itn, ?segs[0], 1) != 0) { ret 1; }
     val em: R.Result[bool, str] = emit_exec(?alloc, ?itn, ?isa_vt, ?segs[0], 1,
                                             4096, base, entry,
                                             nil::*of.ExecFunction, 0, nil::*of.Section, 0,
