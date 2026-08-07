@@ -32,7 +32,7 @@ Repairs two defects shipped in 4.9.0, one of them a regression, and lands a larg
 
 ### Tests and CI
 - **int: a floating dep resolved once per case rather than once per run** (#2619), so a suite spanning a mach-std merge could compile some cases against one standard library and some against another while reporting one verdict. Landed after the 4.9.0 branch was cut.
-- Two `#[library]` attribution tests asserted a symbol's source spelling, which is the link name only on a format with no symbol prefix. They passed on linux and windows and failed on the darwin release gate. The divergence they exposed, between the decorator and manifest-claim attribution keys, is real and is filed as #2636.
+- Four `#[library]` attribution tests asserted a symbol's source spelling, which is the link name only on a format with no symbol prefix. They passed on linux and windows and failed on the darwin release gate, twice, in two separate changes. `ut_names_import` and `ut_import_attribution` now state that rule once so the next test in this area cannot repeat it. The divergence they exposed, between the decorator and manifest-claim attribution keys, is real and is filed as #2636.
 
 ## [4.9.0] - 2026-08-07
 
