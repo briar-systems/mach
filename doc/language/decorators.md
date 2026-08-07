@@ -256,11 +256,14 @@ source of faults.
 an atomic has to a field, and there is no pointer to hand it.
 
 **Vector fields.** A vector in a packed record is refused for now, including one
-reached through an array or a nested record. What a vector's memory footprint and
-alignment are is being settled by
-[#2687](https://github.com/briar-systems/mach/issues/2687); pinning a packed
-placement rule for vectors before that lands would race it rather than compose with
-it. This is a sequencing decision and is expected to be lifted, not a permanent rule.
+reached through an array or a nested record. The reason is evidence rather than
+arithmetic: an unaligned **scalar** access is measured on real hardware, and that
+measurement is what `#[packed]` rests on, but there is no equivalent measurement for a
+vector — the widest access, the one with alignment-requiring ISA forms, and the case
+where an emulator is least trustworthy about what silicon does.
+[#2687](https://github.com/briar-systems/mach/issues/2687) carries the other half, a
+lane-dependent vector footprint through aggregate layout and ABI classification. This
+is a sequencing decision and is expected to be lifted, not a permanent rule.
 
 **Interface blocks.** `packed` cannot apply to a `#[uniform]` or `#[storage]` block:
 its member offsets are fixed by the std140 / std430 layout rules and emitted as

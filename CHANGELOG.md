@@ -18,7 +18,7 @@ Three refusals, and one of them turned out to be two:
 
 - **The address of a packed field.** `?r.b` would yield a `*u32`, which states alignment 4 to everything downstream while the storage has none. The access is fine; the pointer *type* is what is untrue, and it travels. The predicate walks the whole access chain, so `?r.arr[0]`, `?r.inner.x` and `?p.b` through a `*Packed` are refused too. `?r` on the whole record stays legal — a `*Packed` describes an align-1 pointee correctly. Fail-closed on purpose: refusing is relaxable once alignment can ride in a pointer type, permitting is not tightenable.
 - **Atomics on a packed field**, which needed no rule of its own. Atomics are not a language surface in mach — `std.sync.atomic` is ordinary functions over `*i64` — so a pointer is the only route an atomic has to a field, and the address-of rule already refuses to hand one out. Pinned as an `int` case so the coupling fails loudly if atomics ever become an intrinsic over an lvalue.
-- **Vector fields**, including through an array or a nested record, with the diagnostic naming #2687. A sequencing decision, not a permanent rule.
+- **Vector fields**, including through an array or a nested record. The reason is evidence, not arithmetic: an unaligned *scalar* access is measured on hardware and that measurement is what `#[packed]` rests on, while an unaligned *vector* access has no equivalent measurement and is the case where an emulator is least trustworthy. #2687 carries the aggregate-layout half. A sequencing decision, not a permanent rule.
 
 Also refused on a `#[uniform]` / `#[storage]` interface block, whose member offsets are fixed by std140 / std430.
 
@@ -30,6 +30,22 @@ Also refused on a `#[uniform]` / `#[storage]` interface block, whose member offs
 `mir.lower_ir`'s `struct_field_offset` re-derived every field offset with its own `round_up` over each field's alignment, rather than calling `ir_type.byte_offset` like every other offset consumer. So a `#[packed]` record reported correct `$size_of`, `$align_of` and `$offset_of` — those go through the shared layout policy — while the code that actually **read and wrote the fields** placed them at the **natural** offsets, and nothing errored. A record whose fields fit its packed size wrote its last field past the end of its own storage.
 
 Found by an `int` case whose golden is a **byte image** rather than a set of intrinsics. Pinning `$size_of` / `$offset_of` proves only that the compiler agrees with itself; the bytes are what a C struct or a wire frame is actually compared against. The duplicate walk is deleted — there is now one layout policy, so a future layout decorator cannot be taught to half the compiler.
+
+#### A secret spilled to memory no longer launders past the `#[oblivious]` asm walk (#2706)
+The `#[oblivious]` inline-asm walk carried taint as a register bitmask with **no memory domain**, so a secret stored to the stack and reloaded came back in a register the model believed public. That defeated all three leak checks at once - a branch condition, a memory address, and a variable-latency operand:
+
+```
+mov rax, {r}
+mov [rsp], rax
+mov rbx, [rsp]
+mov rcx, [rbx]     # a secret-derived address, accepted
+```
+
+The direct form was always refused, which made the gate look sound while an ordinary spill walked through it. Memory is now the third taint domain beside the register set and the flags bit, shared across x86-64, aarch64 and riscv64 as the walk itself is.
+
+The domain is one bit for all of memory, and monotone. Per-slot tracking is not sound at this layer: `[rsp + k]` and `[rbp + j]` can name the same byte with nothing relating two base registers, and a slot key is an address rather than an extent, so overlapping accesses of different widths compare as different slots. The failure direction is over-refusal, never acceptance, and a body only loses by it if it stores a secret, reloads some other public value, and then leaks through what it reloaded.
+
+Note for anyone extending the walk: "does this instruction store" cannot be read from the `writes` mask, which names register operands. aarch64 `str` and riscv64 `sd` both declare `AW_NONE`, so a memory domain derived from that mask fires on x86-64 and silently passes every store on the other two targets.
 
 ## [4.14.0] - 2026-08-07
 
