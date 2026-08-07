@@ -795,10 +795,15 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
     # assign each merged section a virtual address (an executable or a shared
     # object; a relocatable library carries none). sections are placed in canonical
     # order from the OS base, each kind page-aligned; a position-independent image
-    # (PIE or shared) is based a page above.
+    # (PIE or shared) is based a page above. the header reservation above the base is
+    # provisional until the dynamic plan is built and the image shape can be measured
+    # (see `measure_header_shape` below); a format whose header outgrows it reassigns
+    # from the measured shape then.
     val assign_vaddrs: bool = (mode == LINK_EXE) || shared;
+    var header_reserve: u64 = 0;
     if (assign_vaddrs) {
-        assign_section_vaddrs(tgt, merged, position_independent);
+        header_reserve = header_reserve_bytes(tgt, position_independent, nil::*of.HeaderShape);
+        assign_section_vaddrs(tgt, merged, header_reserve);
         finalize_placement_vaddrs(merged, placements, sec_total);
     }
 
@@ -832,7 +837,7 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
             ret R.err[bool, str](R.unwrap_err[bool, str](gp_r));
         }
         if (local_got.count > 0) {
-            assign_section_vaddrs(tgt, merged, position_independent);
+            assign_section_vaddrs(tgt, merged, header_reserve);
             finalize_placement_vaddrs(merged, placements, sec_total);
             finalize_local_got_vaddrs(merged, ?local_got);
 
@@ -920,6 +925,37 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
                 map.dnit[intern.StrId, SymbolLoc](?sym_locs);
                 free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms, ?groups);
                 ret R.err[bool, str](R.unwrap_err[bool, str](dr));
+            }
+        }
+
+        # the image shape is settled now, so the header reservation can be sized for
+        # real. a format whose header outgrew the provisional page gets a wider span,
+        # which moves every load segment up: virtual addresses are reassigned and the
+        # symbol table recollected before any relocation reads an address. the header
+        # size does not depend on those addresses, so this converges in one step.
+        if (assign_vaddrs) {
+            var shape: of.HeaderShape;
+            measure_header_shape(s, ?out_img, merged, ?groups, ?dyn, position_independent, ?shape);
+            val want: u64 = header_reserve_bytes(tgt, position_independent, ?shape);
+            if (want > header_reserve) {
+                header_reserve = want;
+                assign_section_vaddrs(tgt, merged, header_reserve);
+                finalize_placement_vaddrs(merged, placements, sec_total);
+                if (local_got.count > 0) { finalize_local_got_vaddrs(merged, ?local_got); }
+
+                map.dnit[intern.StrId, SymbolLoc](?sym_locs);
+                sym_locs = map.init[intern.StrId, SymbolLoc](alloc, map.hash_u32, map.eq_u32);
+                val recollect: R.Result[bool, str] = collect_symbols(
+                    s, modules, module_count, placements, sec_base, ?sym_locs,
+                    assign_vaddrs, ?atoms);
+                if (R.is_err[bool, str](recollect)) {
+                    free_dynstate(alloc, ?dyn);
+                    obj.dnit(?out_img);
+                    free_local_got_plan(alloc, ?local_got);
+                    map.dnit[intern.StrId, SymbolLoc](?sym_locs);
+                    free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms, ?groups);
+                    ret R.err[bool, str](R.unwrap_err[bool, str](recollect));
+                }
             }
         }
 
@@ -3707,16 +3743,11 @@ fun reorder_flat_entry_first(modules: *of.ObjectImage, module_count: u32,
 # give each used merged section a base virtual address,
 # starting from the OS base and page-aligning each kind's start
 #
-# An image whose header maps inside its first load segment reserves the first page
+# An image whose header maps inside its first load segment reserves `reserve` bytes
 # above the base for it, so that segment (which maps the header at its start)
 # begins exactly at the base - for Mach-O, __TEXT on the base with __PAGEZERO
-# spanning [0, base). The writer asserts the header fits the one-page reservation.
-#
-# Two independent things ask for the reservation and it is one page either way: a
-# position-independent image (PIE or shared) always reserves it, and so does any
-# format that maps its header inside the first segment (`of.header_in_first_segment`,
-# true for Mach-O), whose non-PIE layout would otherwise be framed a page below the
-# base (#2599).
+# spanning [0, base). `header_reserve_bytes` sizes the reservation; the writer lays
+# the header into exactly it and fails if the header outgrew it.
 #
 # Each kind's start is aligned up to at least the OS page, so every merged segment
 # begins on a fresh page and thus owns its trailing (partial) page - no two segments
@@ -3724,15 +3755,15 @@ fun reorder_flat_entry_first(modules: *of.ObjectImage, module_count: u32,
 # the `.data.rel.ro` RELRO region up to a page boundary cannot reach into the following
 # segment's pages.
 # ---
-# tgt:    active target - supplies the OS base address and page size
-# merged: the per-kind accumulators, whose vaddrs are assigned in place
-# pie:    true when the image is position-independent (PIE or shared)
-fun assign_section_vaddrs(tgt: *target.Target, merged: *MergedSection, pie: bool) {
+# tgt:     active target - supplies the OS base address and page size
+# merged:  the per-kind accumulators, whose vaddrs are assigned in place
+# reserve: bytes left above the base for the image header, from
+#          `header_reserve_bytes`; 0 for a format that maps its header elsewhere
+fun assign_section_vaddrs(tgt: *target.Target, merged: *MergedSection, reserve: u64) {
     val base: u64 = os_base_addr(tgt);
     val page: u64 = os_page_size(tgt);
 
-    var va: u64 = base;
-    if (pie || header_reserve_page(tgt)) { va = base + page; }
+    var va: u64 = base + reserve;
     var i: u32 = 0;
     for (i < MERGED_KIND_COUNT) {
         if (merged[i].used && is_loadable_kind(merged[i].kind)) {
@@ -6389,18 +6420,98 @@ fun image_name(modules: *of.ObjectImage, module_count: u32) intern.StrId {
 }
 
 # whether the target's object format maps the image header inside the first load
-# segment, so the linker must leave a page above the base for it
+# segment, so the linker must leave room above the base for it
 #
-# The reservation belongs to the format, not to position independence: Mach-O
-# frames __TEXT one header span below its first content byte in both the
-# LC_MAIN and LC_UNIXTHREAD layouts, so without the gap a non-PIE image is based
-# a page low and its __PAGEZERO is short by the same page (#2599)
+# Whether to reserve, not how much - `header_reserve_bytes` sizes it. The
+# reservation belongs to the format, not to position independence: Mach-O frames
+# __TEXT one header span below its first content byte in both the LC_MAIN and
+# LC_UNIXTHREAD layouts, so without the gap a non-PIE image is based a page low and
+# its __PAGEZERO is short by the same page (#2599)
 # ---
 # tgt: active target - supplies the object-format vtable
-# ret: true when a header page must be reserved above the image base
+# ret: true when a header span must be reserved above the image base
 fun header_reserve_page(tgt: *target.Target) bool {
     if (tgt.of == nil) { ret false; }
     ret tgt.of.header_in_first_segment;
+}
+
+# how many bytes to leave above the image base for the header, before the first
+# load segment
+#
+# Two independent things ask for a reservation: a position-independent image (PIE
+# or shared) always wants one, and so does any format that maps its header inside
+# the first segment (`of.header_in_first_segment`, true for Mach-O), whose non-PIE
+# layout would otherwise be framed a page below the base (#2599). One page covers
+# both, except for a format whose header grows with the image: Mach-O carries a
+# command per segment, section and dependency and outgrows a page on a large link
+# (#2690), so it sizes the span itself through `of.header_span`.
+#
+# `shape` is nil on the provisional first assignment, before the dynamic plan
+# exists. That reserves a page, which is what every image got before; the caller
+# measures the real shape once the plan is built and reassigns if it wants more.
+# ---
+# tgt:   active target - supplies the page size and the object-format vtable
+# pie:   true when the image is position-independent (PIE or shared)
+# shape: the measured image shape, or nil before it is known
+# ret:   bytes to reserve above the base, a multiple of the page size
+fun header_reserve_bytes(tgt: *target.Target, pie: bool, shape: *of.HeaderShape) u64 {
+    if (!pie && !header_reserve_page(tgt)) { ret 0; }
+    val page: u64 = os_page_size(tgt);
+    if (tgt.of == nil || tgt.of.header_span == nil || shape == nil) { ret page; }
+    val want: u64 = tgt.of.header_span(shape, page);
+    if (want <= page) { ret page; }
+    ret bin.align_up_u64(want, page);
+}
+
+# measure the image shape the header reservation is sized from
+#
+# Every field is settled by the time the dynamic plan is built, and none of them
+# depends on a virtual address, so measuring here and reassigning virtual addresses
+# from the answer converges in one step rather than iterating.
+# ---
+# s:       shared session, for the interner the format resolves names through
+# out_img: the merged image, for its non-allocated debug sections
+# merged:  the per-kind accumulators
+# groups:  the planned named-section groups
+# dyn:     the dynamic-link state (its plan may name no dependency)
+# pie:     true when the image is position-independent
+# shape:   out - the measured shape
+fun measure_header_shape(s: *session.Session, out_img: *of.ObjectImage, merged: *MergedSection,
+                         groups: *SectionGroups, dyn: *DynState, pie: bool,
+                         shape: *of.HeaderShape) {
+    shape.itn       = ?s.interner;
+    shape.libs      = dyn.info.libs;
+    shape.lib_count = dyn.info.lib_count;
+    shape.pie       = pie;
+    shape.imports   = dyn.info.import_count > 0;
+
+    # the segments and sections `build_load_segments` will produce, counted the same
+    # way it counts them.
+    var segs:  u32 = 0;
+    var sects: u32 = 0;
+    var k:     u32 = 0;
+    for (k < MERGED_KIND_COUNT) {
+        if (is_loadable_kind(merged[k].kind) && merged[k].used && merged[k].len > 0) {
+            segs = segs + 1;
+            var i: u32 = 0;
+            for (i < groups.count) {
+                if (groups.items[i].slot == k && groups.items[i].len > 0) { sects = sects + 1; }
+                i = i + 1;
+            }
+        }
+        k = k + 1;
+    }
+
+    var dbg: u32 = 0;
+    var d:   u32 = 0;
+    for (d < out_img.section_count) {
+        if (out_img.sections[d].kind == of.SK_DEBUG) { dbg = dbg + 1; }
+        d = d + 1;
+    }
+
+    shape.seg_count   = segs;
+    shape.sect_count  = sects;
+    shape.debug_count = dbg;
 }
 
 # the base virtual address for the active target's executables. a per-target
