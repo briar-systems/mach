@@ -120,6 +120,13 @@ The reach was not the real defect. The interface itself said *frame-pointer-rela
 
 **New refusal:** an inline-asm body that binds a `{name}` may not write the stack pointer, on targets that measure from it. The displacement is taken once at block entry, so the pointer must still be where it was. The whole block is judged rather than a prefix, because a backward branch reaches an earlier `{name}` again with the moved pointer. Move the stack adjustment out of the block, or drop the `{name}` and stage the address into a register.
 
+#### The NEON integer-multiply arrangement rule was wrong in both directions (#2721)
+`arm64/encode.mach` declared the `MUL (vector)` base word as "legal only on .8h (size 1)". NEON encodes that word at sizes 0/1/2 as `.16b` / `.8h` / `.4s` and leaves size 3 **unallocated**, so the comment forbade three arrangements the hardware has and omitted the one real constraint: there is no `mul v.2d`.
+
+The encoder was not wrong yet, because nothing selected the word at another size. That is exactly the #2037 shape — a base word plus a size field that *looks* general, with nothing pinning what each arrangement encodes — and a widening that trusted the word's apparent generality would emit `0x4EE29C20`, an invalid encoding, rather than refuse.
+
+Each permitted arrangement is now pinned byte-exact against the encoding definition, and `neon_3same_size_ok` makes the hole a fact the compiler enforces: a 64-bit integer lane multiply reaching the selector is a defined error emitting no bytes, proved by driving the selector directly rather than by arguing no caller reaches it.
+
 #### Field stores went through a second layout policy that no decorator could reach (#2715)
 `mir.lower_ir`'s `struct_field_offset` re-derived every field offset with its own `round_up` over each field's alignment, rather than calling `ir_type.byte_offset` like every other offset consumer. So a `#[packed]` record reported correct `$size_of`, `$align_of` and `$offset_of` — those go through the shared layout policy — while the code that actually **read and wrote the fields** placed them at the **natural** offsets, and nothing errored. A record whose fields fit its packed size wrote its last field past the end of its own storage.
 
