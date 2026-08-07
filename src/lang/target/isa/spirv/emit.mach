@@ -78,6 +78,9 @@ use mach.lang.target.isa.spirv.types;
 # fn_ids:   SPIR-V id per IR function index, allocated before any body is emitted
 #           so a call can name a callee defined later in the module (0 for a
 #           function with no body)
+# has_entry: whether any function in the module declares a pipeline stage, which
+#           decides whether this is a shader module (entry points, no Linkage) or a
+#           library module (Linkage exports, no entry point)
 rec Emit {
     alloc:    *A.Allocator;
     interner: *intern.Interner;
@@ -86,6 +89,7 @@ rec Emit {
     b:        *spirv.Builder;
     tt:       *types.TypeTable;
     fn_ids:   *u32;
+    has_entry: bool;
 }
 
 # the per-function value maps, sized to the function's vreg count
@@ -149,6 +153,17 @@ pub fun emit_module(tgt: *resolved.Target, irmod: *ir.Module,
     var e: Emit;
     e.alloc = mirmod.alloc; e.interner = mirmod.interner;
     e.tgt = tgt; e.ir = irmod; e.b = ?b; e.tt = ?tt; e.fn_ids = nil;
+
+    # a module is a shader module or a library module, never both, and which one is
+    # settled before any function is emitted: the answer decides both the capability
+    # set and whether each function is published under a linkage export.
+    e.has_entry = false;
+    var si: u32 = 0;
+    for (si < irmod.function_len) {
+        if (irmod.functions[si].stage != ir.STAGE_NONE
+            && (irmod.functions[si].flags & ir.FN_FLAG_EXTERN) == 0) { e.has_entry = true; }
+        si = si + 1;
+    }
 
     # every defined function gets its id before any body is emitted, so a call can
     # name a callee that appears later in the module (or itself).
@@ -219,7 +234,13 @@ fun emit_dnit(e: *Emit, n: u32) {
 # e: the emission state
 fun emit_preamble(e: *Emit) {
     emit_cap(e, spirv.CAP_SHADER);
-    emit_cap(e, spirv.CAP_LINKAGE);
+    # Linkage is what lets a module with no entry point publish its functions to a
+    # consumer, and it is the RIGHT thing for a compiled mach library. It is also
+    # forbidden in a module meant for a Vulkan pipeline: a shader module is complete
+    # in itself and declares no external linkage, and spirv-val rejects the
+    # capability outright under a Vulkan environment. So the two are exclusive, and
+    # the presence of an entry point is what decides which module this is.
+    if (!e.has_entry) { emit_cap(e, spirv.CAP_LINKAGE); }
     val need: u32 = e.b.caps_needed;
     if ((need & spirv.NEED_INT8) != 0)    { emit_cap(e, spirv.CAP_INT8); }
     if ((need & spirv.NEED_INT16) != 0)   { emit_cap(e, spirv.CAP_INT16); }
@@ -282,11 +303,19 @@ fun emit_function(e: *Emit, mf: *mir.MirFunction) R.Result[bool, str] {
 
     val fn_id: u32 = e.fn_ids[fix];
 
-    # export decoration: OpDecorate <fn> LinkageAttributes "<name>" Export.
     val name_opt: O.Option[str] = intern.lookup(e.interner, mf.name);
     if (O.is_none[str](name_opt)) { ret R.err[bool, str]("spirv.emit: function name not interned"); }
     val fn_name: str = O.unwrap[str](name_opt);
-    emit_linkage_export(e, fn_id, fn_name);
+
+    # a staged function becomes an entry point; in a library module every function is
+    # published under a linkage export instead. The two are exclusive: SPIR-V forbids
+    # decorating an entry point with LinkageAttributes, and a Vulkan module may not
+    # declare the Linkage capability at all.
+    if (irfn.stage != ir.STAGE_NONE) {
+        val er: R.Result[bool, str] = emit_entry_point(e, irfn, fn_id, entry_name(e, irfn, fn_name), returns_void);
+        if (R.is_err[bool, str](er)) { ret er; }
+    }
+    or (!e.has_entry) { emit_linkage_export(e, fn_id, fn_name); }
 
     # a vector materialized through memory is refused up front, under its own name.
     # Reaching it instruction by instruction would report the `alloca` that opens the
@@ -603,6 +632,88 @@ fun read_condition(e: *Emit, vm: *VMaps, preg_val: *Regs, op: *mir.MirOperand) u
     ops[0] = types.type_bool(e.tt); ops[1] = result; ops[2] = raw; ops[3] = zero;
     spirv.inst(e.b, ?e.b.functions, opcode, ?ops[0], 4);
     ret result;
+}
+
+# the name a consumer looks an entry point up by: the function's BARE source name
+#
+# Not the mangled linkage name the rest of the back end uses. An entry point name is
+# a lookup key passed to a pipeline-creation call, not a linker symbol - and a
+# shader module declares no Linkage capability at all, so the mangled name has
+# nothing to refer to inside one. Falls back to the linkage name only for a
+# synthesized function carrying no source spelling, which cannot currently declare a
+# stage anyway.
+# ---
+# e:       the emission state
+# irfn:    the IR function
+# linkage: the mangled linkage name, the fallback
+# ret:     the entry point name
+fun entry_name(e: *Emit, irfn: *ir.Function, linkage: str) str {
+    if (irfn.disp == intern.STR_NIL) { ret linkage; }
+    val opt: O.Option[str] = intern.lookup(e.interner, irfn.disp);
+    if (O.is_none[str](opt)) { ret linkage; }
+    ret O.unwrap[str](opt);
+}
+
+# emit the OpEntryPoint, and the execution modes the stage requires
+#
+# SPIR-V constrains an entry function's signature hard: it takes no parameters and
+# returns void, because a pipeline stage's inputs and outputs travel through
+# interface VARIABLES rather than through a call. That is checked here rather than
+# left to the validator, so a mach signature that cannot be a stage is reported
+# against the function that declared the stage.
+#
+# The interface operand list names every Input and Output variable the entry point
+# statically uses. It is empty until interface variables exist, which is valid: an
+# entry point that reads and writes nothing has nothing to list.
+#
+# Two execution modes are not optional under Vulkan and are emitted with the stage
+# rather than left to the author: a fragment stage must fix its framebuffer origin,
+# and a compute stage must declare its workgroup size.
+# ---
+# e:            the emission state
+# irfn:         the IR function (its stage and workgroup dimensions)
+# fn_id:        the function's SPIR-V id
+# name:         the entry point's name, as a consumer will look it up
+# returns_void: whether the function returns void
+# ret:          true on success, or a precise error string
+fun emit_entry_point(e: *Emit, irfn: *ir.Function, fn_id: u32, name: str,
+                     returns_void: bool) R.Result[bool, str] {
+    if (!returns_void) {
+        ret unsupported(e, "a function declaring a `#[stage(...)]` must return nothing: a pipeline stage's results leave through its output interface variables, not through a return value");
+    }
+    if (irfn.param_count != 0) {
+        ret unsupported(e, "a function declaring a `#[stage(...)]` must take no parameters: a pipeline stage's inputs arrive through its input interface variables, not as arguments");
+    }
+
+    var model: u32 = spirv.EXEC_MODEL_VERTEX;
+    if (irfn.stage == ir.STAGE_FRAGMENT) { model = spirv.EXEC_MODEL_FRAGMENT; }
+    or (irfn.stage == ir.STAGE_COMPUTE)  { model = spirv.EXEC_MODEL_GLCOMPUTE; }
+
+    # OpEntryPoint <model> <fn> "<name>" <interface...>; the interface list is empty
+    # until interface variables land.
+    val sw: u32 = spirv.string_words(name);
+    val total: u32 = 2 + sw;
+    val ra: R.Result[*u32, str] = A.allocate[u32](e.alloc, total::usize);
+    if (R.is_err[*u32, str](ra)) { ret R.err[bool, str](R.unwrap_err[*u32, str](ra)); }
+    val ops: *u32 = R.unwrap_ok[*u32, str](ra);
+    ops[0] = model;
+    ops[1] = fn_id;
+    spirv.pack_string(name, ?ops[2]);
+    spirv.inst(e.b, ?e.b.entry_points, spirv.OP_ENTRY_POINT, ops, total);
+    A.deallocate[u32](e.alloc, ops, total::usize);
+
+    if (irfn.stage == ir.STAGE_FRAGMENT) {
+        var fm: [2]u32;
+        fm[0] = fn_id; fm[1] = spirv.EXEC_MODE_ORIGIN_UPPER_LEFT;
+        spirv.inst(e.b, ?e.b.exec_modes, spirv.OP_EXECUTION_MODE, ?fm[0], 2);
+    }
+    if (irfn.stage == ir.STAGE_COMPUTE) {
+        var cm: [5]u32;
+        cm[0] = fn_id; cm[1] = spirv.EXEC_MODE_LOCAL_SIZE;
+        cm[2] = irfn.wg_x; cm[3] = irfn.wg_y; cm[4] = irfn.wg_z;
+        spirv.inst(e.b, ?e.b.exec_modes, spirv.OP_EXECUTION_MODE, ?cm[0], 5);
+    }
+    ret R.ok[bool, str](true);
 }
 
 # emit the LinkageAttributes Export decoration for a function

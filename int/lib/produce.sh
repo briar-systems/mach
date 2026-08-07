@@ -70,7 +70,10 @@
 #                 requires llvm-dwarfdump, llvm-symbolizer, and readelf; it runs only
 #                 on the ELF debug-info legs, which install them.
 #   spirv-val   — validate every `.spv` module a finished-module target delivered
-#                 with the Khronos validator (spirv-tools). the target links
+#                 with the Khronos validator (spirv-tools), in its universal
+#                 environment. `spirv-val-vulkan` is the same check under the
+#                 stricter Vulkan environment, for a module carrying entry points.
+#                 the target links
 #                 nothing, so there is no binary to run and the module tree is the
 #                 artifact; the external validator is what makes this a validity
 #                 check rather than a round-trip through mach's own reader.
@@ -1656,19 +1659,52 @@ produce_built() {
 # the observable is the module count plus the verdict, so a build that silently
 # stopped emitting fails on the count rather than passing vacuously.
 produce_spirv_val() {
-    out_dir=$(dirname "$3")
+    spirv_val_env "$3" ''
+}
+
+# produce_spirv_val_vulkan <runmode> <target> <binary>
+# as produce_spirv_val, but validates against the VULKAN environment rather than
+# the universal one. the two are different contracts and a module cannot satisfy
+# both: a library module declares the Linkage capability so a consumer can find its
+# exported functions, and Vulkan forbids that capability outright; a shader module
+# carries entry points and no linkage at all. so a case picks the environment its
+# module is actually meant for, and the stricter Vulkan rules — the fragment
+# stage's mandatory origin, the compute stage's mandatory workgroup size — are
+# genuinely checked rather than skipped by validating everything universally.
+produce_spirv_val_vulkan() {
+    spirv_val_env "$3" vulkan1.3
+}
+
+# spirv_val_env <binary> <target-env>
+# shared body: glob the case's output root (a finished-module target has no linked
+# binary, so the delivery is the module tree) and run spirv-val over each `.spv`.
+# an EXTERNAL validator is the point — mach reading back its own bytes proves
+# self-consistency, not validity. the observable is the module count plus the
+# verdict, so a build that silently stopped emitting fails on the count rather than
+# passing vacuously.
+spirv_val_env() {
+    out_dir=$(dirname "$1")
+    env_arg=$2
     if ! command -v spirv-val >/dev/null 2>&1; then
         echo "int: spirv-val: the validator is not installed (spirv-tools)" >&2
         return 2
     fi
     n=0
     for m in $(find "$out_dir" -name '*.spv' | sort); do
-        spirv-val "$m" || return 1
+        if [ -n "$env_arg" ]; then
+            spirv-val --target-env "$env_arg" "$m" || return 1
+        else
+            spirv-val "$m" || return 1
+        fi
         n=$((n + 1))
     done
     if [ "$n" -eq 0 ]; then
         echo "int: spirv-val: the build delivered no .spv module" >&2
         return 2
+    fi
+    if [ -n "$env_arg" ]; then
+        printf 'modules=%d validator=clean env=%s\n' "$n" "$env_arg"
+        return 0
     fi
     printf 'modules=%d validator=clean\n' "$n"
 }
@@ -2172,6 +2208,7 @@ produce() {
         built)       produce_built "$@" ;;
         debuginfo)   produce_debuginfo "$@" ;;
         spirv-val)   produce_spirv_val "$@" ;;
+        spirv-val-vulkan) produce_spirv_val_vulkan "$@" ;;
         vector-emit) produce_vector_emit "$@" ;;
         vector-lanes) produce_vector_lanes "$@" ;;
         frame-elision) produce_frame_elision "$@" ;;
