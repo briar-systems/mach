@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [4.13.0] - 2026-08-07
+
+**Two source-compatibility changes.** A type may no longer be declared with a vector form's name, and the comptime shape predicates no longer see through `^`.
 
 ### Changed
 
@@ -36,6 +38,44 @@ Reasoning by analogy to #2297 (field resolution) and #2373 (cast width) is what 
 A walk still has to classify **positively** for this to refuse rather than skip: gate on the shapes you handle and refuse the fallthrough, which is what `std.derive` does and what the docs now prescribe. Because all three predicates answer false for `^T`, "nothing classifies it" is a usable secrecy signal on its own.
 
 Blast radius: no user-level consumer in this repo. In mach-std every consumer is `std.derive`, where a `^`-wrapped record field now fails with derive's own written message instead of the raw intrinsic error.
+
+#### A type may not be declared with a vector form's name (#2687)
+`rec u8x16 { a: i64; }` used to compile clean and be silently unreachable: the builtin won every use, and the only symptom was a later error pointing at the wrong thing. `uni` and `def` behaved the same. It is now refused as a name collision.
+
+The guard keys on the spelling rather than on the target's vector width, so `f32x3` and `f32x7` are reserved everywhere. Otherwise a name would be claimable on a 128-bit target and collide on a wider one from identical source.
+
+**Values are unaffected.** A vector spelling is read in type position only, so `val f32x4` remains legal and is not shadowed by anything.
+
+### Added
+
+#### GLSL.std.450 extended instructions for shader stages (#2688)
+A `#[spirv_op(set, name)]` decorator declares which SPIR-V instruction a function *is*, over two sets: `"core"` and `"GLSL.std.450"`. 33 extended instructions plus core `OpDot`, covering the common-value, trigonometric, exponential, range/interpolation and geometry families. The extended set is imported only when used.
+
+The compiler names no library: it knows how to read the decorator and emit the instruction, nothing more. `briar-systems/mach-shader` provides `shader.math` over these, and anyone may declare their own.
+
+Deliberately shader-only. A decorated function may carry a body, and that body runs on every non-spirv target; a bodiless one called from a CPU build fails at link naming the symbol. A native fallback would make `sh.sqrt` and `math.sqrt_f32` the same function on a CPU and a different one on a GPU, which is the only outcome that never errors.
+
+#### A vector is read as the form `TxN`, bounded by the target's vector width (#2687, partial)
+Vector types were a table of ten hard-coded spellings. They are now read as `<element>x<lanes>` and bounded by a new `MachineModel.vector_bits`, which is 128 on every current target.
+
+The bound is a width rather than the `has_v128` capability: rv64gc and mos6502 declare no vector unit and still admit every 128-bit spelling today through scalarization, so gating on the capability would refuse names that compile correctly, and a boolean cannot express a wider future target at all.
+
+A vector's extent is now lane-derived rather than a flat 16 bytes. Size is `lane_size * lanes`. Alignment is the full size when the vector fills the vector register and one lane otherwise -- a vector that fills the register aligns to its whole size because the machine's vector load requires it, and a narrower one is a packed aggregate. All ten former spellings are exactly 128 bits and are unchanged in both size and alignment.
+
+**`vec3` is not delivered yet.** A vector narrower than the vector register is refused by name, because codegen cannot carry one: `op_width_of` answers a single number for both a value's register width and its memory footprint, which is invisible while every vector is 16 bytes and truncating once they are not (#2697). The form, the bound, the layout rule and the documentation are in, and lifting the restriction is deleting one check.
+
+### Fixed
+
+#### A darwin link failed when load commands exceeded one page (#2690)
+The Mach-O header reservation was hardcoded at one page, so an image whose load commands exceeded 4096 bytes was refused outright with `macho: dyn-exec header exceeds the one-page reservation`. Nothing in the format caps them there -- `sizeofcmds` is a `uint32`.
+
+The reservation is now computed from the actual load commands and rounded to the target's page size. It grows **inside** `__TEXT`, so `__TEXT` still maps at the image base and `__PAGEZERO` is unchanged; widening the gap below the first segment instead would have slid both down, which is #2599.
+
+Reachable by any objective-c consumer rather than only unusually large images: #2606 stopped coalescing input sections, and every surviving section costs an 80-byte `section_64`. Sixty `#[section]` globals cross the cap on section count alone.
+
+#### SPIR-V access chains, local allocations, and a dead shuffle constant (#2649)
+A GEP's index list now survives to a logical-addressing target as member ordinals rather than being folded into a byte displacement, so a struct member read lowers to `OpAccessChain` instead of being unrepresentable. Local allocations and a dead shuffle constant were fixed alongside it.
+
 
 ## [4.12.0] - 2026-08-07
 
