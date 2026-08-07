@@ -215,6 +215,7 @@ fun elaborate_nominal(sc: *context.SemaContext, did: id.DeclId, ty: type.TypeId,
     layout_state_set(sc, did, context.LAYOUT_ACTIVE);
     build_field_table(sc, ty, fields_start, fields_len);
     record_type_align(sc, did, ty);
+    record_type_packed(sc, did, ty, fields_start, fields_len);
     layout_state_set(sc, did, context.LAYOUT_READY);
     ret O.none[intern.StrId]();
 }
@@ -780,6 +781,115 @@ pub fun check_uni_secrecy_all(sc: *context.SemaContext) {
     }
 
     if (seen != nil) { A.deallocate[u32](sc.s.alloc, seen, cap::usize); }
+}
+
+# record a `#[packed]` decorator on `did` against nominal TypeId `ty` (#2715)
+#
+# `#[packed]` carries no argument, so there is nothing to fold: the decorator's
+# presence is the whole value. It is registered on the session where `#[align]`
+# registers its own, so the front end and the middle end build the same layout node
+# and cannot disagree about a record's size.
+# ---
+# sc:           sema context
+# did:          the record/union declaration carrying the decorator
+# ty:           the nominal TypeId to pack
+# fields_start: index of its first field
+# fields_len:   number of fields
+fun record_type_packed(sc: *context.SemaContext, did: id.DeclId, ty: type.TypeId,
+                       fields_start: u32, fields_len: u32) {
+    val d_opt: O.Option[*decl.Decl] = ast.get_decl(sc.a, did);
+    if (O.is_none[*decl.Decl](d_opt)) { ret; }
+    val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+
+    var i: u32 = 0;
+    for (i < d.decorators_len) {
+        val dec: *decl.Decorator = ?sc.a.decorators[d.decorators_start + i];
+        if (str_region_equals(sc.source, dec.name.offset, dec.name.len, "packed")) {
+            val rr: R.Result[bool, str] = session.register_type_packed(sc.s, ty::u32);
+            if (R.is_err[bool, str](rr)) { ret; }
+            check_packed_no_vector_fields(sc, fields_start, fields_len);
+            ret;
+        }
+        i = i + 1;
+    }
+}
+
+# refuse a vector anywhere in a `#[packed]` aggregate's fields, for now (#2715)
+#
+# A packed record places each field where the previous one ended, so a vector lands at
+# whatever offset the bytes before it happen to reach.
+#
+# The reason is EVIDENCE, not arithmetic. An unaligned SCALAR access is measured on real
+# hardware (`int/surface/unaligned-access`, whose linux-arm64 row runs native), and that
+# measurement is what `#[packed]` rests on. There is no equivalent measurement for a
+# vector, and a vector is exactly where it would be least safe to assume: the widest
+# access, the one with alignment-requiring ISA forms, and the case where qemu is most
+# likely to be confidently wrong about what silicon does. #2687 carries the other half -
+# a lane-dependent vector footprint through aggregate layout and ABI classification.
+#
+# This is a SEQUENCING refusal, not a permanent rule. It lifts when an unaligned vector
+# access has been measured on hardware and #2687 has settled the layout half.
+#
+# It lives here rather than in decorator validation because decorators are validated
+# before field types are resolved. `build_field_table` has just run for this
+# declaration, so every field type is known.
+#
+# The walk is transitive through by-value containment even though PACKING is not: an
+# unpacked inner record keeps its own internal padding but is itself placed at an
+# arbitrary offset by the packed outer, which misaligns the vectors inside it just as
+# surely as a direct field. Refusing the containing case too is what keeps this
+# fail-closed rather than leaving the hole the direct check would miss.
+# ---
+# sc:           sema context
+# fields_start: index of the first field
+# fields_len:   number of fields
+fun check_packed_no_vector_fields(sc: *context.SemaContext, fields_start: u32, fields_len: u32) {
+    var i: u32 = 0;
+    for (i < fields_len) {
+        val tn: *decl.TypedName = ?sc.a.typed_names[fields_start + i];
+        val fty: type.TypeId = context.resolved_type_of(sc, tn.ty);
+        # force the field's own layout material so a nested aggregate has a field table
+        # to walk. the outer declaration is LAYOUT_ACTIVE here, so forcing the OUTER
+        # would report itself as a cycle; each field on its own is the right grain.
+        ensure_layout_ready(sc, fty);
+        if (type_contains_vector(sc, fty, 0)) {
+            context.report(sc, tn.name, "a vector field is not allowed in a `#[packed]` record: packing places it at an offset nothing guarantees is a multiple of its width, and an unaligned vector access has not been measured on hardware the way an unaligned scalar access has, with #2687 carrying the aggregate-layout half. this is a sequencing refusal and is expected to be lifted, not a permanent rule. until then, store the lanes as scalar fields, or drop `#[packed]` from this record");
+            ret;
+        }
+        i = i + 1;
+    }
+}
+
+# whether `t` contains a vector in storage it owns by value
+#
+# Follows an array's element and an aggregate's fields, and stops at a pointer, whose
+# width is fixed whatever it points at. By-value containment is acyclic - the occurs
+# check (#2355) rejects a record that contains itself - so `depth` bounds a legal but
+# absurd nest rather than guarding a cycle, matching `ensure_layout_walk`.
+fun type_contains_vector(sc: *context.SemaContext, t: type.TypeId, depth: u32) bool {
+    if (depth > LAYOUT_FORCE_MAX_DEPTH) { ret false; }
+    if (t == type.TYPE_NIL || t == type.TYPE_ERROR) { ret false; }
+
+    val base: type.TypeId = type.strip_secret(?sc.s.types, t);
+    if (type.is_vector(?sc.s.types, base)) { ret true; }
+
+    val bt: O.Option[*type.Type] = type.get(?sc.s.types, base);
+    if (O.is_none[*type.Type](bt)) { ret false; }
+    val ty: *type.Type = O.unwrap[*type.Type](bt);
+
+    if (ty.kind == type.TYPE_ARRAY) { ret type_contains_vector(sc, ty.data.array.base, depth + 1); }
+    if (ty.kind != type.TYPE_REC && ty.kind != type.TYPE_UNI && ty.kind != type.TYPE_INSTANCE) { ret false; }
+
+    val n: u32 = type.field_count(?sc.s.types, base);
+    var i: u32 = 0;
+    for (i < n) {
+        val fe: O.Option[*type.FieldEntry] = type.field_at(?sc.s.types, base, i);
+        if (O.is_some[*type.FieldEntry](fe)) {
+            if (type_contains_vector(sc, O.unwrap[*type.FieldEntry](fe).ty, depth + 1)) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # fold an `#[align(...)]` decorator on `did` and record the resulting alignment
@@ -1752,6 +1862,25 @@ fun infer_unary(sc: *context.SemaContext, u: *expr.ExprUnary, span: token.Span) 
             context.report(sc, span, "cannot take the address of an uninstantiated generic function: a generic is a template, not code, so it has no address until its type arguments are supplied. call it with them (`f[i64](x)`), or take the address of a non-generic function");
             ret type.TYPE_ERROR;
         }
+        # a field of a `#[packed]` record has no alignment its type can carry (#2715).
+        # `?r.b` on `#[packed] rec P { a: u8; b: u32; }` yields a `*u32`, and a `*u32`
+        # states align 4 to every reader of it, while the field it points at sits at
+        # offset 1. The pointer TYPE is the lie, not the access: `@p` through it is
+        # correct on the targets measured, but the moment that pointer is passed on,
+        # nothing downstream can tell it apart from an aligned one - and an atomic,
+        # which every ISA requires naturally aligned, is exactly what a caller does
+        # with a `*i64`.
+        #
+        # Refused rather than permitted because the two directions are not symmetric:
+        # refusing is relaxable once alignment can ride in a pointer type, whereas
+        # permitting silently cannot be tightened later without breaking programs that
+        # came to depend on it. Rust refuses; C permits, and it is a standing fault
+        # source. `?r` on the whole record stays legal - a `*P` describes an align-1
+        # pointee correctly, and only a FIELD's address loses the truth.
+        if (operand_is_packed_field(sc, u.operand)) {
+            context.report(sc, span, "cannot take the address of a field of a `#[packed]` record: the field sits at an offset its own type does not guarantee, so the resulting pointer would claim an alignment the storage does not have. copy the field into a local and take that address, or take the address of the whole record (`?r`), whose pointer type is honest about being align 1");
+            ret type.TYPE_ERROR;
+        }
         ret ptr_to(sc, ot);
     }
     if (u.op == expr.UN_DEREF) {
@@ -1805,6 +1934,67 @@ fun operand_is_uninstantiated_generic(sc: *context.SemaContext, eid: id.ExprId) 
     val cf: O.Option[*decl.DeclFun] = callee_fun_decl(sc, eid);
     if (O.is_none[*decl.DeclFun](cf)) { ret false; }
     ret O.unwrap[*decl.DeclFun](cf).generics_len > 0;
+}
+
+# whether `eid` denotes storage inside a `#[packed]` aggregate (#2715)
+#
+# A CHAIN WALK, not a single check. `?r.b` is the obvious case, but `?r.arr[0]`,
+# `?r.inner.x` and `?p.b` where `p: *Packed` all name storage placed by a packed
+# layout and all yield the same underaligned address, so a check that looked only at
+# the outermost access would refuse the easy spelling and pass the rest. The walk
+# descends the member / index spine and asks the question at every member link.
+#
+# It reads `expr_type`, which the operand's own inference has just filled in for every
+# node in this spine, so no subexpression is re-inferred here.
+# ---
+# sc:  sema context
+# eid: the address-of operand
+# ret: true when some step of the chain projects a field out of a packed aggregate
+fun operand_is_packed_field(sc: *context.SemaContext, eid: id.ExprId) bool {
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+    if (O.is_none[*expr.Expr](e_opt)) { ret false; }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
+
+    if (e.kind == expr.EXPR_KIND_MEMBER) {
+        if (expr_type_is_packed(sc, e.data.member.object)) { ret true; }
+        ret operand_is_packed_field(sc, e.data.member.object);
+    }
+    # an index does not itself project a field, but it can sit BETWEEN two that do
+    # (`?r.arr[0]`), so the walk passes through rather than stopping.
+    if (e.kind == expr.EXPR_KIND_INDEX) {
+        ret operand_is_packed_field(sc, e.data.index.object);
+    }
+    ret false;
+}
+
+# whether the semantic type of expression `eid` is a packed nominal
+#
+# Secrecy and any number of pointer hops are stripped first: `p.b` through a
+# `*Packed` is a field of a packed record exactly as `r.b` is, and a `^Packed` is
+# too. `aggregate_nominal` resolves a generic instance to the declaration the
+# `#[packed]` was written on, which is where the session records it.
+fun expr_type_is_packed(sc: *context.SemaContext, eid: id.ExprId) bool {
+    if (sc.expr_type == nil) { ret false; }
+    if (eid == id.EXPR_NIL || eid >= sc.a.expr_len::u32) { ret false; }
+
+    ret type_is_packed_nominal(sc, sc.expr_type[eid]);
+}
+
+# whether `t`, after secrecy and every pointer hop is stripped, names a packed nominal
+#
+# The pointer spine is finite by construction - `intern_pointer` only ever builds `*T`
+# over an already-interned `T` - so the walk terminates without a depth bound.
+fun type_is_packed_nominal(sc: *context.SemaContext, t: type.TypeId) bool {
+    if (t == type.TYPE_NIL || t == type.TYPE_ERROR) { ret false; }
+    val base: type.TypeId = type.strip_secret(?sc.s.types, t);
+    val bt: O.Option[*type.Type] = type.get(?sc.s.types, base);
+    if (O.is_none[*type.Type](bt)) { ret false; }
+    val ty: *type.Type = O.unwrap[*type.Type](bt);
+    if (ty.kind == type.TYPE_POINTER) { ret type_is_packed_nominal(sc, ty.data.pointer.base); }
+
+    val nom: type.TypeId = type.aggregate_nominal(?sc.s.types, base);
+    if (nom == type.TYPE_ERROR) { ret false; }
+    ret session.type_is_packed(sc.s, nom::u32);
 }
 
 # CALL: callee must be TYPE_FUN; check arity and each argument against the
