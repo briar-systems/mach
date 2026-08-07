@@ -21,11 +21,14 @@
 #                 commands on every segment, plus which entry command it carries.
 #                 the static and dyld-loaded layouts must agree on all of it except
 #                 the entry command (#2599). no LLVM; od/dd reads only.
+#   macho-mod-init— assert a __DATA,__mod_init_func section reaches the image with the
+#                 section TYPE dyld dispatches on, and on a darwin runner run the image
+#                 and require that dyld actually called it (#2637).
 #   macho-sections— assert a linked darwin image kept its inputs' (segment, section)
 #                 names, the identity a name-based runtime scan needs: __objc_classlist
 #                 concatenated contiguously from two objects, __objc_imageinfo's flags
-#                 intact, and a rebased __mod_init_func entry (#2606). on a darwin
-#                 runner it also RUNS the image, the only way to see the initializer fire.
+#                 intact, and a typed, rebased __mod_init_func entry (#2606). structural
+#                 only: its objc metadata is synthetic, and libobjc faults on it (#2637).
 #   macho-signed— structurally resolve the three x86_64 immediate-store displacements
 #                 and compare them with independent initialized-data markers, proving
 #                 SIGNED_1/_2/_4 each linked to its exact target without a mac runner.
@@ -75,7 +78,10 @@
 #                 requires llvm-dwarfdump, llvm-symbolizer, and readelf; it runs only
 #                 on the ELF debug-info legs, which install them.
 #   spirv-val   — validate every `.spv` module a finished-module target delivered
-#                 with the Khronos validator (spirv-tools). the target links
+#                 with the Khronos validator (spirv-tools), in its universal
+#                 environment. `spirv-val-vulkan` is the same check under the
+#                 stricter Vulkan environment, for a module carrying entry points.
+#                 the target links
 #                 nothing, so there is no binary to run and the module tree is the
 #                 artifact; the external validator is what makes this a validity
 #                 check rather than a round-trip through mach's own reader.
@@ -492,7 +498,9 @@ produce_macho_framing() {
 }
 
 # macho_section_fields <file> <segname> <sectname> — print a section's
-# "addr size fileoff align" tuple from its section_64 entry, or fail when absent.
+# "addr size fileoff align flags" tuple from its section_64 entry, or fail when
+# absent. `flags` carries the section TYPE in its low byte, which is what dyld
+# dispatches on (S_MOD_INIT_FUNC_POINTERS = 9).
 macho_section_fields() {
     bin=$1
     want_seg=$2
@@ -511,11 +519,12 @@ macho_section_fields() {
                 sh=$((off + 72 + k * 80))
                 sectname=$(dd if="$bin" bs=1 skip="$sh" count=16 2>/dev/null | tr '\0' '\n' | head -n 1)
                 if [ "$segname" = "$want_seg" ] && [ "$sectname" = "$want_sect" ]; then
-                    printf '%s %s %s %s\n' \
+                    printf '%s %s %s %s %s\n' \
                         "$(read_le_uint "$bin" $((sh + 32)) 8)" \
                         "$(read_le_uint "$bin" $((sh + 40)) 8)" \
                         "$(read_le_uint "$bin" $((sh + 48)) 4)" \
-                        "$(read_le_uint "$bin" $((sh + 52)) 4)"
+                        "$(read_le_uint "$bin" $((sh + 52)) 4)" \
+                        "$(read_le_uint "$bin" $((sh + 64)) 4)"
                     return 0
                 fi
                 k=$((k + 1))
@@ -527,6 +536,66 @@ macho_section_fields() {
     done
     echo "int: macho: section '$want_seg,$want_sect' not found" >&2
     return 2
+}
+
+# produce_macho_mod_init <runmode> <target> <binary>
+# Assert that a __DATA,__mod_init_func section reaches the image as one dyld will
+# actually run, then on a darwin runner run it and require that dyld did.
+#
+# Presence and even a correct pointer are not enough. dyld finds an image's
+# initializers by scanning for sections whose TYPE is S_MOD_INIT_FUNC_POINTERS, so
+# a section carrying the right name, the right alignment, and a correctly rebased
+# pointer at the right address is still never called if the link emitted the
+# default S_REGULAR type - which is exactly what #2637 was. Every structural fact
+# below held while the initializer silently did not run, so the structural half
+# constrains the image and the darwin run is what settles it.
+produce_macho_mod_init() {
+    runmode=$1
+    target=$2
+    bin=$3
+
+    fields=$(macho_section_fields "$bin" __DATA __mod_init_func) || return 2
+    set -- $fields
+    mi_addr=$1; mi_size=$2; mi_align=$4; mi_flags=$5
+
+    [ $((mi_flags & 0xFF)) -eq 9 ] || {
+        echo "int: macho-mod-init: __mod_init_func has section type $((mi_flags & 0xFF)), expected 9 (S_MOD_INIT_FUNC_POINTERS); dyld dispatches on the type and never runs any other" >&2
+        return 1
+    }
+    [ "$mi_size" -eq 8 ] || {
+        echo "int: macho-mod-init: __mod_init_func is $mi_size bytes, expected one 8-byte entry" >&2
+        return 1
+    }
+    [ "$mi_align" -ge 3 ] || {
+        echo "int: macho-mod-init: __mod_init_func is 2^$mi_align aligned, expected at least pointer alignment" >&2
+        return 1
+    }
+
+    # the entry is an in-image pointer, so a PIE must slide it: with no rebase row
+    # dyld would call whatever the unslid address happens to land on.
+    mi_hex=$(printf '0x%X' "$mi_addr")
+    rebases=$(macho_objdump --macho --rebase "$bin") || return 2
+    [ "$(printf '%s\n' "$rebases" | grep -F -c "$mi_hex")" -eq 1 ] || {
+        echo "int: macho-mod-init: __mod_init_func has no rebase row at $mi_hex" >&2
+        return 1
+    }
+
+    if [ "$target" = darwin-x86_64 ]; then
+        out=$(mktemp)
+        run_captured native "$target" "$bin" "$out" || { rm -f "$out"; return 1; }
+        rm -f "$out"
+        if [ "$run_status" -ne 0 ]; then
+            report_run_failure "macho-mod-init: the native PIE" "$run_status" "$run_out"
+            return 1
+        fi
+        [ "$run_out" = "init ok" ] || {
+            echo "int: macho-mod-init: dyld did not run the __mod_init_func entry" >&2
+            diff_expected_actual "init ok" "$run_out"
+            return 1
+        }
+    fi
+
+    echo "mod_init_func=type9-rebased"
 }
 
 # produce_macho_sections <runmode> <target> <binary>
@@ -543,9 +612,13 @@ macho_section_fields() {
 # sharing a name, which is what a per-input section would produce and what libobjc's
 # single-array walk cannot read.
 #
-# On a darwin runner the same image is executed, which is the only way to see
-# whether dyld actually CALLED the __mod_init_func entry: unlike a missing objc
-# section, a dropped initializer fails silently and the program runs on regardless.
+# This image is inspected and never RUN, deliberately. Its objc metadata is
+# synthetic - a class list entry has to point at a real Objective-C class object,
+# and building one needs the macOS SDK - so the markers that make concatenation
+# order checkable here are not addresses at all. libobjc reads that list for real
+# on darwin and dereferences every entry, so running this image faults before main
+# (#2637). Executing a genuine __mod_init_func initializer is `macho-mod-init`,
+# whose payload is valid content a runtime can act on correctly.
 produce_macho_sections() {
     target=$2
     bin=$3
@@ -588,7 +661,13 @@ produce_macho_sections() {
 
     fields=$(macho_section_fields "$bin" __DATA __mod_init_func) || return 2
     set -- $fields
-    mi_addr=$1; mi_size=$2; mi_align=$4
+    mi_addr=$1; mi_size=$2; mi_align=$4; mi_flags=$5
+    # the section TYPE is the low byte of the flags word, and dyld dispatches on it:
+    # S_MOD_INIT_FUNC_POINTERS is 9 (#2637).
+    [ $((mi_flags & 0xFF)) -eq 9 ] || {
+        echo "int: macho-sections: __mod_init_func has section type $((mi_flags & 0xFF)), expected 9 (S_MOD_INIT_FUNC_POINTERS)" >&2
+        return 1
+    }
     [ "$mi_size" -eq 8 ] || {
         echo "int: macho-sections: __mod_init_func is $mi_size bytes, expected one 8-byte entry" >&2
         return 1
@@ -605,21 +684,6 @@ produce_macho_sections() {
         echo "int: macho-sections: __mod_init_func has no rebase row at $mi_hex" >&2
         return 1
     }
-
-    if [ "$target" = darwin-x86_64 ]; then
-        out=$(mktemp)
-        run_captured native "$target" "$bin" "$out" || { rm -f "$out"; return 1; }
-        rm -f "$out"
-        if [ "$run_status" -ne 0 ]; then
-            report_run_failure "macho-sections: the native PIE" "$run_status" "$run_out"
-            return 1
-        fi
-        [ "$run_out" = "init ok" ] || {
-            echo "int: macho-sections: dyld did not run the __mod_init_func entry" >&2
-            diff_expected_actual "init ok" "$run_out"
-            return 1
-        }
-    fi
 
     echo "objc_classlist=concatenated-16-pointer-aligned"
     echo "objc_imageinfo=version0-flags64"
@@ -1684,19 +1748,52 @@ produce_built() {
 # the observable is the module count plus the verdict, so a build that silently
 # stopped emitting fails on the count rather than passing vacuously.
 produce_spirv_val() {
-    out_dir=$(dirname "$3")
+    spirv_val_env "$3" ''
+}
+
+# produce_spirv_val_vulkan <runmode> <target> <binary>
+# as produce_spirv_val, but validates against the VULKAN environment rather than
+# the universal one. the two are different contracts and a module cannot satisfy
+# both: a library module declares the Linkage capability so a consumer can find its
+# exported functions, and Vulkan forbids that capability outright; a shader module
+# carries entry points and no linkage at all. so a case picks the environment its
+# module is actually meant for, and the stricter Vulkan rules — the fragment
+# stage's mandatory origin, the compute stage's mandatory workgroup size — are
+# genuinely checked rather than skipped by validating everything universally.
+produce_spirv_val_vulkan() {
+    spirv_val_env "$3" vulkan1.3
+}
+
+# spirv_val_env <binary> <target-env>
+# shared body: glob the case's output root (a finished-module target has no linked
+# binary, so the delivery is the module tree) and run spirv-val over each `.spv`.
+# an EXTERNAL validator is the point — mach reading back its own bytes proves
+# self-consistency, not validity. the observable is the module count plus the
+# verdict, so a build that silently stopped emitting fails on the count rather than
+# passing vacuously.
+spirv_val_env() {
+    out_dir=$(dirname "$1")
+    env_arg=$2
     if ! command -v spirv-val >/dev/null 2>&1; then
         echo "int: spirv-val: the validator is not installed (spirv-tools)" >&2
         return 2
     fi
     n=0
     for m in $(find "$out_dir" -name '*.spv' | sort); do
-        spirv-val "$m" || return 1
+        if [ -n "$env_arg" ]; then
+            spirv-val --target-env "$env_arg" "$m" || return 1
+        else
+            spirv-val "$m" || return 1
+        fi
         n=$((n + 1))
     done
     if [ "$n" -eq 0 ]; then
         echo "int: spirv-val: the build delivered no .spv module" >&2
         return 2
+    fi
+    if [ -n "$env_arg" ]; then
+        printf 'modules=%d validator=clean env=%s\n' "$n" "$env_arg"
+        return 0
     fi
     printf 'modules=%d validator=clean\n' "$n"
 }
@@ -2189,6 +2286,7 @@ produce() {
         macho-framing) produce_macho_framing "$@" ;;
         macho-sections) produce_macho_sections "$@" ;;
         macho-imports) produce_macho_imports "$@" ;;
+        macho-mod-init) produce_macho_mod_init "$@" ;;
         macho-abs-bind) produce_macho_abs_bind "$@" ;;
         pe-imports)  produce_pe_imports "$@" ;;
         pe-exceptions) produce_pe_exceptions "$@" ;;
@@ -2201,6 +2299,7 @@ produce() {
         built)       produce_built "$@" ;;
         debuginfo)   produce_debuginfo "$@" ;;
         spirv-val)   produce_spirv_val "$@" ;;
+        spirv-val-vulkan) produce_spirv_val_vulkan "$@" ;;
         vector-emit) produce_vector_emit "$@" ;;
         vector-lanes) produce_vector_lanes "$@" ;;
         frame-elision) produce_frame_elision "$@" ;;
