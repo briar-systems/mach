@@ -24,8 +24,10 @@ There is no compiler `bool`. `bool` is a stdlib `def bool: u8;` with `true` /
 A vector type is a **form**, not a fixed list: any primitive numeric element
 followed by `x` and a lane count.
 
+On a 128-bit target the spellings this currently accepts are:
+
 ```mach
-f32x4  f32x3  f32x2  f64x2      # float lanes
+f32x4  f64x2                    # float lanes
 i8x16  i16x8  i32x4  i64x2      # signed integer lanes
 u8x16  u16x8  u32x4  u64x2      # unsigned integer lanes
 ```
@@ -36,12 +38,17 @@ is an algorithm over vectors and belongs in a library over vector elements, not
 the language. A vector spelling is recognized only in type position, so a value
 may still be named `f32x4` without colliding with the type.
 
-Two rules bound the form:
+Three rules bound the form:
 
 - **At least 2 lanes.** `f32x1` is refused; a one-lane vector is just its scalar.
 - **No wider than the target's vector register.** Every current target is 128
   bits, so `f32x7` (224 bits) is refused by name. The error names the width you
   asked for and the width the target has, rather than reporting an unknown type.
+- **Currently, exactly as wide as the register.** A vector *narrower* than the
+  vector register (`f32x3`, `f32x2`) is read and laid out correctly but refused
+  by name for now, because codegen cannot yet carry a value whose register width
+  and memory footprint differ. This restriction is temporary and is the only
+  thing between the form and `vec3`.
 
 `ptr` is not a lane element: its width is target-defined rather than a scalar bit
 count, so `ptrx2` is not a vector spelling.
@@ -49,7 +56,8 @@ count, so `ptrx2` is not a vector spelling.
 ### Size and alignment
 
 `$size_of` is **lane-derived**: `lanes × element size`, packed, with no padding
-up to the register width.
+up to the register width. (The sub-register rows below are the rule the layout
+already implements; those spellings are not yet accepted — see above.)
 
 | type | `$size_of` | `$align_of` |
 |---|---|---|
