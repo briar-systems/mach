@@ -20,6 +20,9 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_region_equals;
 
 use A: std.allocator;
 use O: std.types.option;
@@ -74,14 +77,17 @@ pub val TYPE_PACK: TypeKind = 18;
 # to the same machine shape as `T`; it constrains only sema's flow typing
 pub val TYPE_SECRET: TypeKind = 19;
 
-# a 128-bit SIMD vector type `<u|i|f><width>x<count>` (#1965). the portable
-# vector model: all ten seeded shapes are legal on every target, with a payload
-# carrying the lane scalar kind and lane count. lowers to a 16-byte register-class
-# value; whether a lane-wise op is one instruction or a scalar expansion is a
-# backend concern
+# a SIMD vector type spelled `<element>x<lanes>` (#1965, generalized in #2687). the
+# portable vector model: any primitive scalar element and any lane count whose total
+# width fits the target's vector register is legal on every target, with a payload
+# carrying the lane scalar kind and lane count. its extent is lane-derived, so
+# `f32x4` is 16 bytes and `f32x3` is 12; whether a lane-wise op is one instruction or
+# a scalar expansion is a backend concern
 pub val TYPE_VECTOR: TypeKind = 20;
 
-# number of seeded vector types (the ten 128-bit shapes)
+# number of PRE-SEEDED vector types. no longer the set of legal vectors, which is the
+# `TxN` form bounded by the target's vector width (#2687): these ten 128-bit shapes
+# are merely interned at session init so they have stable TypeIds
 pub val VEC_COUNT: u32 = 10;
 
 # scalar class of a primitive TypeKind, the discriminator of PrimDesc
@@ -158,10 +164,11 @@ pub rec TypeSecret {
     base: TypeId;
 }
 
-# 128-bit SIMD vector type payload (#1965)
+# SIMD vector type payload (#1965)
 #
-# Two vectors are identical iff (element, lanes) match. `element` is one of the
-# ten scalar prim kinds; `lanes` is 2, 4, 8, or 16 so that element*lanes is 128.
+# Two vectors are identical iff (element, lanes) match. `element` is one of the ten
+# scalar prim kinds (never `ptr`, which has no scalar bit width); `lanes` is at least
+# 2, and `element bits * lanes` is bounded by the target's vector width (#2687).
 # ---
 # element: lane scalar TypeKind (u8..i64, f32, f64)
 # lanes:   lane count
@@ -172,8 +179,10 @@ pub rec TypeVector {
 
 # the spelling, lane scalar, and lane count of one seeded vector type
 #
-# The single source of truth for the ten shapes, shared by the interner's init
-# seeding and the resolver's name registry, keyed by ordinal.
+# The ten shapes the interner pre-seeds at init so they have stable TypeIds. NOT the
+# set of legal vectors: that is the `TxN` form `vector_form` reads, bounded by the
+# target's vector width (#2687). Kept as the fixture the regression tests measure the
+# pre-#2687 shapes against.
 # ---
 # name:    source spelling, e.g. "f32x4"
 # element: lane scalar TypeKind
@@ -209,6 +218,143 @@ pub fun vec_shape(index: u32) VecShape {
     or (index == 9) { s.name = "u64x2"; s.element = TYPE_U64; s.lanes = 2;  }
 
     ret s;
+}
+
+# the source spelling of a primitive TypeKind, the inverse of the ordinal
+#
+# The one place a primitive's spelling is written down. The resolver's primitive
+# registry and the `TxN` vector form both read it, so a spelling can never drift
+# between the name a program writes and the element a vector form accepts.
+# ---
+# kind: the primitive TypeKind to spell
+# ret:  the spelling, or nil for a non-primitive kind
+pub fun prim_name(kind: TypeKind) str {
+    if      (kind == TYPE_U8)  { ret "u8";  }
+    or (kind == TYPE_U16) { ret "u16"; }
+    or (kind == TYPE_U32) { ret "u32"; }
+    or (kind == TYPE_U64) { ret "u64"; }
+    or (kind == TYPE_I8)  { ret "i8";  }
+    or (kind == TYPE_I16) { ret "i16"; }
+    or (kind == TYPE_I32) { ret "i32"; }
+    or (kind == TYPE_I64) { ret "i64"; }
+    or (kind == TYPE_F32) { ret "f32"; }
+    or (kind == TYPE_F64) { ret "f64"; }
+    or (kind == TYPE_PTR) { ret "ptr"; }
+    ret nil;
+}
+
+# how reading a spelling as the vector form `<element>x<lanes>` came out
+#
+# Three outcomes rather than two, because "this is not a vector spelling" and
+# "this is a vector the target will not admit" need different diagnostics: the
+# first falls through to ordinary name resolution, the second must name the
+# vector and the bound it exceeded (#2687).
+pub def VecFormStatus: u8;
+
+# the largest lane count the form reader carries as a number. a count past this
+# is clamped to `MAX_VEC_LANES + 1`, so it still reports as too wide without the
+# digit loop carrying an unbounded value
+pub val MAX_VEC_LANES: u32 = 65535;
+
+# not a vector spelling at all; the caller resolves the name by other means
+pub val VEC_FORM_NONE:      VecFormStatus = 0;
+# a well formed shape within the target's bound
+pub val VEC_FORM_OK:        VecFormStatus = 1;
+# a well formed shape wider than the target's vector width admits
+pub val VEC_FORM_TOO_WIDE:  VecFormStatus = 2;
+# a well formed element with a degenerate lane count (0 or 1)
+pub val VEC_FORM_BAD_LANES: VecFormStatus = 3;
+
+# the shape a `TxN` spelling denotes, and whether the target admits it
+# ---
+# status:  which of the four outcomes reading the spelling produced
+# element: lane scalar TypeKind; only meaningful when status is not VEC_FORM_NONE
+# lanes:   lane count; only meaningful when status is not VEC_FORM_NONE
+# bits:    element bits times lanes, the width the bound is tested against
+pub rec VecForm {
+    status:  VecFormStatus;
+    element: TypeKind;
+    lanes:   u32;
+    bits:    u32;
+}
+
+# read `name` as the vector form `<element>x<lanes>`, bounded by `vector_bits`
+#
+# THE FORM, NOT A TABLE (#2687). A vector type is any primitive scalar element
+# followed by `x` and a lane count, admitted when the total width fits the
+# target's vector register width. The ten formerly seeded spellings are exactly
+# the forms whose width is 128, so they keep resolving unchanged and are no
+# longer special.
+#
+# `ptr` is not a lane element: its width is target-defined rather than a scalar
+# bit count, so no lane count gives it a well defined vector width. A lane count
+# below 2 is refused rather than admitted as a degenerate one-lane vector, which
+# has no register representation and which SPIR-V's OpTypeVector forbids
+# outright.
+#
+# The width product is computed in u64 so an absurd lane count reports as too
+# wide rather than wrapping u32 into a shape that appears to fit.
+# ---
+# name:        the spelling to read
+# vector_bits: the widest vector the target admits, in bits
+# ret:         the shape and whether the target admits it
+pub fun vector_form(name: str, vector_bits: u32) VecForm {
+    var f: VecForm;
+    f.status  = VEC_FORM_NONE;
+    f.element = TYPE_U8;
+    f.lanes   = 0;
+    f.bits    = 0;
+
+    if (name == nil) { ret f; }
+    val n: usize = str_len(name);
+    # the shortest well formed spelling is `u8x2`, so anything shorter cannot be
+    # one. tested before the split so the `n - 1` below never underflows.
+    if (n < 4) { ret f; }
+
+    # no primitive spelling contains an `x`, so the first one splits the form.
+    var split: usize = 0;
+    for (split < n && name[split] != 'x') { split = split + 1; }
+    if (split == 0) { ret f; }
+    if (split >= n - 1) { ret f; }
+
+    var element: TypeKind = TYPE_U8;
+    var found:   bool     = false;
+    var k:       u32      = 0;
+    for (k < PRIM_COUNT) {
+        val kind: TypeKind = k::u8;
+        if (kind != TYPE_PTR && str_region_equals(name, 0, split, prim_name(kind))) {
+            element = kind;
+            found   = true;
+        }
+        k = k + 1;
+    }
+    if (!found) { ret f; }
+
+    # a strict decimal lane count: digits only, and no leading zero, so a
+    # near-miss identifier stays an ordinary unresolved name.
+    if (name[split + 1] == '0') { ret f; }
+    var lanes: u64   = 0;
+    var i:     usize = split + 1;
+    for (i < n) {
+        val c: u8 = name[i];
+        if (c < '0' || c > '9') { ret f; }
+        lanes = lanes * 10 + (c - '0')::u64;
+        if (lanes > MAX_VEC_LANES::u64) { lanes = MAX_VEC_LANES::u64 + 1; }
+        i = i + 1;
+    }
+
+    f.element = element;
+    f.lanes   = lanes::u32;
+    if (lanes > MAX_VEC_LANES::u64) { f.lanes = MAX_VEC_LANES + 1; }
+
+    if (lanes < 2) { f.status = VEC_FORM_BAD_LANES; ret f; }
+
+    val width: u64 = prim_desc(element).bits::u64 * lanes;
+    if (width > vector_bits::u64) { f.status = VEC_FORM_TOO_WIDE; ret f; }
+
+    f.bits   = width::u32;
+    f.status = VEC_FORM_OK;
+    ret f;
 }
 
 # fixed-size array type payload
@@ -656,7 +802,7 @@ pub fun is_secret(ti: *TypeInterner, tid: TypeId) bool {
     ret O.unwrap[*Type](opt_type).kind == TYPE_SECRET;
 }
 
-# whether `tid` is a 128-bit vector type (#1965)
+# whether `tid` is a vector type (#1965)
 #
 # A secret `^T` is classified by its inner type, so a secret vector still reports
 # as a vector for layout and lane classification.
@@ -905,7 +1051,7 @@ pub fun intern_array(ti: *TypeInterner, base: TypeId, count: u32) R.Result[TypeI
     ret intern_dedup(ti, t);
 }
 
-# intern a 128-bit vector type (#1965)
+# intern a vector type (#1965)
 #
 # Returns an existing TypeId when the same (element, lanes) shape has been
 # interned before.
@@ -1809,6 +1955,111 @@ test "mach.lang.type.is_union:instance_follows_its_nominal" {
     if (is_record(?ti, u32_id))  { dnit(?ti); ret 1; }
 
     dnit(?ti);
+    ret 0;
+}
+
+# `vector_form` reads `<element>x<lanes>` and separates the three outcomes: a
+# shape the target admits, a shape too wide for it, and a spelling that is not a
+# vector at all. the ten formerly seeded spellings are exactly the 128-bit forms
+test "mach.lang.type.vector_form:reads_the_form_and_the_bound" {
+    # every one of the ten shapes the compiler used to seed by name reads back as
+    # itself under a 128-bit bound. this is the regression bar (#2687).
+    var vi: u32 = 0;
+    for (vi < VEC_COUNT) {
+        val sh: VecShape = vec_shape(vi);
+        val f:  VecForm  = vector_form(sh.name, 128);
+        if (f.status  != VEC_FORM_OK) { ret 1; }
+        if (f.element != sh.element)  { ret 1; }
+        if (f.lanes   != sh.lanes)    { ret 1; }
+        if (f.bits    != 128)         { ret 1; }
+        vi = vi + 1;
+    }
+
+    # the sub-128 forms the issue exists for, with their element and lane count
+    # checked rather than only their acceptance.
+    val v3: VecForm = vector_form("f32x3", 128);
+    if (v3.status != VEC_FORM_OK) { ret 1; }
+    if (v3.element != TYPE_F32)   { ret 1; }
+    if (v3.lanes != 3)            { ret 1; }
+    if (v3.bits != 96)            { ret 1; }
+
+    val u3: VecForm = vector_form("u32x3", 128);
+    if (u3.status != VEC_FORM_OK) { ret 1; }
+    if (u3.element != TYPE_U32)   { ret 1; }
+    if (u3.lanes != 3)            { ret 1; }
+
+    val v2: VecForm = vector_form("f32x2", 128);
+    if (v2.status != VEC_FORM_OK) { ret 1; }
+    if (v2.lanes != 2)            { ret 1; }
+    if (v2.bits != 64)            { ret 1; }
+
+    # REFUSED: wider than the bound. f32x7 is 224 bits, so a 128-bit target must
+    # report it as too wide rather than as an unknown name.
+    val w7: VecForm = vector_form("f32x7", 128);
+    if (w7.status != VEC_FORM_TOO_WIDE) { ret 1; }
+    if (w7.element != TYPE_F32)         { ret 1; }
+    if (w7.lanes != 7)                  { ret 1; }
+
+    # REFUSED: exactly one lane past the bound, the boundary case.
+    if (vector_form("f32x5", 128).status != VEC_FORM_TOO_WIDE)  { ret 1; }
+    if (vector_form("i8x17", 128).status != VEC_FORM_TOO_WIDE)  { ret 1; }
+    if (vector_form("f64x3", 128).status != VEC_FORM_TOO_WIDE)  { ret 1; }
+
+    # REFUSED: a lane count so large the width product would wrap a u32 still
+    # reports too wide, never a shape that appears to fit.
+    if (vector_form("u64x4294967295", 128).status != VEC_FORM_TOO_WIDE) { ret 1; }
+
+    # REFUSED: a degenerate lane count is its own outcome, not a width failure.
+    if (vector_form("f32x1", 128).status != VEC_FORM_BAD_LANES) { ret 1; }
+
+    # the bound is the target's, not a constant: a 64-bit vector unit admits
+    # f32x2 and refuses the f32x4 a 128-bit one takes.
+    if (vector_form("f32x2", 64).status != VEC_FORM_OK)        { ret 1; }
+    if (vector_form("f32x4", 64).status != VEC_FORM_TOO_WIDE)  { ret 1; }
+    # and a wider unit admits what 128 bits refuses, so the form does not itself
+    # cap at 128 (the super-128 register classes are a separate problem).
+    if (vector_form("f32x8", 256).status != VEC_FORM_OK) { ret 1; }
+
+    # NOT A VECTOR: these fall through to ordinary name resolution rather than
+    # producing a vector diagnostic.
+    if (vector_form(nil, 128).status     != VEC_FORM_NONE) { ret 1; }
+    if (vector_form("", 128).status      != VEC_FORM_NONE) { ret 1; }
+    if (vector_form("f32", 128).status   != VEC_FORM_NONE) { ret 1; }
+    if (vector_form("f32x", 128).status  != VEC_FORM_NONE) { ret 1; }
+    if (vector_form("x4", 128).status    != VEC_FORM_NONE) { ret 1; }
+    if (vector_form("f33x4", 128).status != VEC_FORM_NONE) { ret 1; }
+    if (vector_form("f32x4y", 128).status != VEC_FORM_NONE) { ret 1; }
+    # a leading zero is not a lane count, so `f32x04` stays an ordinary name.
+    if (vector_form("f32x04", 128).status != VEC_FORM_NONE) { ret 1; }
+    # `ptr` has no scalar bit width, so no lane count makes a vector of it.
+    if (vector_form("ptrx2", 128).status  != VEC_FORM_NONE) { ret 1; }
+    # a user identifier that merely contains an x is untouched.
+    if (vector_form("matrix4", 128).status != VEC_FORM_NONE) { ret 1; }
+
+    ret 0;
+}
+
+# `prim_name` round-trips every primitive ordinal to its spelling, so the
+# resolver's registry and the vector form read one table
+test "mach.lang.type.prim_name:spells_every_primitive" {
+    if (!str_equals(prim_name(TYPE_U8),  "u8"))  { ret 1; }
+    if (!str_equals(prim_name(TYPE_U16), "u16")) { ret 1; }
+    if (!str_equals(prim_name(TYPE_U32), "u32")) { ret 1; }
+    if (!str_equals(prim_name(TYPE_U64), "u64")) { ret 1; }
+    if (!str_equals(prim_name(TYPE_I8),  "i8"))  { ret 1; }
+    if (!str_equals(prim_name(TYPE_I16), "i16")) { ret 1; }
+    if (!str_equals(prim_name(TYPE_I32), "i32")) { ret 1; }
+    if (!str_equals(prim_name(TYPE_I64), "i64")) { ret 1; }
+    if (!str_equals(prim_name(TYPE_F32), "f32")) { ret 1; }
+    if (!str_equals(prim_name(TYPE_F64), "f64")) { ret 1; }
+    if (!str_equals(prim_name(TYPE_PTR), "ptr")) { ret 1; }
+    # every ordinal below PRIM_COUNT has a spelling, and a non-primitive has none
+    var k: u32 = 0;
+    for (k < PRIM_COUNT) {
+        if (prim_name(k::u8) == nil) { ret 1; }
+        k = k + 1;
+    }
+    if (prim_name(TYPE_VECTOR) != nil) { ret 1; }
     ret 0;
 }
 

@@ -60,7 +60,7 @@ pub val NODE_UNKNOWN:   NodeKind = 0;
 pub val NODE_SCALAR:    NodeKind = 1;
 # a pointer or function value: the target's pointer width, aligned to it
 pub val NODE_POINTER:   NodeKind = 2;
-# a 128-bit vector: 16 bytes, 16-byte aligned
+# a vector of `count` lanes each `bytes` wide; its extent is lane-derived (#2687)
 pub val NODE_VECTOR:    NodeKind = 3;
 # `count` elements of node `child`
 pub val NODE_ARRAY:     NodeKind = 4;
@@ -70,6 +70,33 @@ pub val NODE_AGGREGATE: NodeKind = 5;
 # following field nor lowers an enclosing aggregate's alignment
 pub val NODE_ZERO:      NodeKind = 6;
 
+# the target facts the fold reads
+#
+# Bundled rather than passed as loose parameters because the fold's dependence on the
+# target is an axis that grows: `ptr_width` was the only such fact until a vector's
+# alignment came to turn on the register width. A new fact is a field here rather than
+# another positional argument threaded through three call sites.
+# ---
+# ptr_width:   the target's pointer width in bytes
+# vector_bits: the widest vector the target admits, in bits, which is the width at
+#              which a vector is register-resident rather than a packed aggregate
+pub rec Machine {
+    ptr_width:   u32;
+    vector_bits: u32;
+}
+
+# a Machine from its two facts
+# ---
+# ptr_width:   the target's pointer width in bytes
+# vector_bits: the target's vector register width in bits
+# ret:         the assembled Machine
+pub fun machine(ptr_width: u32, vector_bits: u32) Machine {
+    var m: Machine;
+    m.ptr_width   = ptr_width;
+    m.vector_bits = vector_bits;
+    ret m;
+}
+
 # one type node, described by the caller in terms this policy folds
 #
 # Only the fields its `kind` selects are read, so a describer fills the rest with
@@ -78,7 +105,9 @@ pub val NODE_ZERO:      NodeKind = 6;
 # ---
 # kind:        which storage shape this node has
 # bytes:       NODE_SCALAR: the scalar's width in bytes
+#              NODE_VECTOR: one lane's width in bytes
 # count:       NODE_ARRAY: the element count
+#              NODE_VECTOR: the lane count
 # child:       NODE_ARRAY: the element's node id
 # field_count: NODE_AGGREGATE: the number of fields
 # decl_align:  NODE_AGGREGATE: an `#[align(...)]` override, 0 for none
@@ -210,12 +239,12 @@ pub fun round_up(value: u32, align: u32) u32 {
 # describe:  names a node's storage shape
 # field:     names an aggregate's field node ids
 # id:        the node to measure
-# ptr_width: the target's pointer width in bytes
+# m:         the target facts the fold reads
 # max_depth: the depth past which the walk declines; DEPTH_UNBOUNDED for an acyclic graph
 # ret:       the determined Extent, or `ok = false` with a cause when it cannot be computed
-pub fun extent_of(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, ptr_width: u32,
+pub fun extent_of(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, m: Machine,
                   max_depth: u32) Extent {
-    ret walk(ctx, describe, field, id, ptr_width, 0, max_depth);
+    ret walk(ctx, describe, field, id, m, 0, max_depth);
 }
 
 # the byte offset of field `field_ix` within aggregate node `id`
@@ -228,11 +257,11 @@ pub fun extent_of(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, ptr_width
 # field:     names an aggregate's field node ids
 # id:        the aggregate node
 # field_ix:  the zero-based field index
-# ptr_width: the target's pointer width in bytes
+# m:         the target facts the fold reads
 # max_depth: the depth past which the walk declines; DEPTH_UNBOUNDED for an acyclic graph
 # ret:       an Extent whose `size` is the offset, or `ok = false` with a cause
 pub fun field_offset_of(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, field_ix: u32,
-                        ptr_width: u32, max_depth: u32) Extent {
+                        m: Machine, max_depth: u32) Extent {
     val n: Node = describe(ctx, id);
     if (n.kind != NODE_AGGREGATE)  { ret unknown_extent(EXTENT_NOT_AGGREGATE); }
     if (field_ix >= n.field_count) { ret unknown_extent(EXTENT_FIELD_RANGE); }
@@ -241,7 +270,7 @@ pub fun field_offset_of(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, fie
     var offset: u32 = 0;
     var i:      u32 = 0;
     for (i < n.field_count) {
-        val fe: Extent = walk(ctx, describe, field, field(ctx, id, i), ptr_width, 1, max_depth);
+        val fe: Extent = walk(ctx, describe, field, field(ctx, id, i), m, 1, max_depth);
         if (!fe.ok) { ret unknown_extent(fe.cause); }
         offset = round_up(offset, fe.align);
         if (i == field_ix) { ret extent(offset, fe.align); }
@@ -258,7 +287,7 @@ pub fun field_offset_of(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, fie
 # `max_depth` of DEPTH_UNBOUNDED disables the depth test entirely, so an acyclic caller
 # pays nothing and no legal graph is refused. A failing child's cause propagates
 # unchanged, so a depth failure eight levels down still reports as a depth failure.
-fun walk(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, ptr_width: u32, depth: u32,
+fun walk(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, m: Machine, depth: u32,
          max_depth: u32) Extent {
     if (max_depth != DEPTH_UNBOUNDED && depth > max_depth) { ret unknown_extent(EXTENT_DEPTH); }
 
@@ -266,11 +295,27 @@ fun walk(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, ptr_width: u32, de
 
     if (n.kind == NODE_ZERO)    { ret extent(0, 1); }
     if (n.kind == NODE_SCALAR)  { ret extent(n.bytes, n.bytes); }
-    if (n.kind == NODE_POINTER) { ret extent(ptr_width, ptr_width); }
-    if (n.kind == NODE_VECTOR)  { ret extent(16, 16); }
+    if (n.kind == NODE_POINTER) { ret extent(m.ptr_width, m.ptr_width); }
+
+    # a vector's extent is lane-derived: `lanes` lanes of `bytes` each, packed, with
+    # NO padding to the vector register (#2687). a packed `f32x3` is 12 bytes, which is
+    # what makes `[N]f32x3` a usable vertex buffer - padding it to 16 would make it
+    # indistinguishable from `f32x4` in memory and withhold the reason for having it.
+    #
+    # THE ALIGNMENT IS DISCONTINUOUS AT THE REGISTER WIDTH, DELIBERATELY. A vector that
+    # FILLS the vector register aligns to its whole size, because the machine's vector
+    # load requires it. A narrower one is a packed aggregate that scalarizes or loads
+    # piecewise, so it aligns only to one lane. This reads as an inconsistency on first
+    # meeting and is not one: do not "fix" it into uniformity, which would either
+    # over-align every vertex attribute or under-align every register-resident vector.
+    if (n.kind == NODE_VECTOR) {
+        val size: u32 = n.bytes * n.count;
+        if (size * 8 >= m.vector_bits) { ret extent(size, size); }
+        ret extent(size, n.bytes);
+    }
 
     if (n.kind == NODE_ARRAY) {
-        val e: Extent = walk(ctx, describe, field, n.child, ptr_width, depth + 1, max_depth);
+        val e: Extent = walk(ctx, describe, field, n.child, m, depth + 1, max_depth);
         if (!e.ok) { ret unknown_extent(e.cause); }
         # widen the product: a total past a u32 would wrap and report a wrong extent.
         val total: u64 = e.size::u64 * n.count::u64;
@@ -284,7 +329,7 @@ fun walk(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, ptr_width: u32, de
         var widest: u32 = 0;
         var i:      u32 = 0;
         for (i < n.field_count) {
-            val e: Extent = walk(ctx, describe, field, field(ctx, id, i), ptr_width, depth + 1, max_depth);
+            val e: Extent = walk(ctx, describe, field, field(ctx, id, i), m, depth + 1, max_depth);
             if (!e.ok) { ret unknown_extent(e.cause); }
             if (e.align > align) { align = e.align; }
             if (n.overlays) {
@@ -365,10 +410,70 @@ fun tg_chain(n: u32) {
 # when the graph was merely deeper than the bound. Each cause must now be nameable, and
 # a cause raised deep in a walk must reach the top UNCHANGED rather than being flattened
 # into "a field failed", or the message is still wrong just less obviously.
+# a vector's extent is lane-derived, and the alignment is DISCONTINUOUS at the vector
+# register width by design: a vector that fills the register aligns to its whole size,
+# a narrower one aligns to a single lane. the regression bar is that every one of the
+# ten shapes the compiler shipped before #2687 is exactly 128 bits and so still
+# measures (16, 16) - lane-derived layout is a pure extension here, not an ABI change
+test "mach.lang.layout.extent:vector_is_lane_derived" {
+    # a helper shape: `lanes` lanes of `bytes` each.
+    tg_nodes[0]       = node(NODE_VECTOR);
+
+    # THE REGRESSION BAR: all ten pre-#2687 shapes are 128-bit and measure (16, 16).
+    # (element bytes, lanes) for f32x4 f64x2 i8x16 i16x8 i32x4 i64x2 u8x16 u16x8 u32x4 u64x2
+    var eb: [10]u32;
+    var ln: [10]u32;
+    eb[0] = 4; ln[0] = 4;   eb[1] = 8; ln[1] = 2;
+    eb[2] = 1; ln[2] = 16;  eb[3] = 2; ln[3] = 8;
+    eb[4] = 4; ln[4] = 4;   eb[5] = 8; ln[5] = 2;
+    eb[6] = 1; ln[6] = 16;  eb[7] = 2; ln[7] = 8;
+    eb[8] = 4; ln[8] = 4;   eb[9] = 8; ln[9] = 2;
+
+    var i: u32 = 0;
+    for (i < 10) {
+        tg_nodes[0].bytes = eb[i];
+        tg_nodes[0].count = ln[i];
+        val e: Extent = extent_of(nil, tg_describe, tg_field, 0, machine(8, 128), DEPTH_UNBOUNDED);
+        if (!e.ok)        { ret 1; }
+        if (e.size != 16) { ret 1; }
+        if (e.align != 16) { ret 1; }
+        i = i + 1;
+    }
+
+    # SUB-WIDTH: packed, and aligned to ONE LANE rather than to the register. f32x3 is
+    # 12 bytes so that `[N]f32x3` is a usable packed vertex buffer.
+    tg_nodes[0].bytes = 4; tg_nodes[0].count = 3;
+    val v3: Extent = extent_of(nil, tg_describe, tg_field, 0, machine(8, 128), DEPTH_UNBOUNDED);
+    if (v3.size != 12) { ret 1; }
+    if (v3.align != 4) { ret 1; }
+
+    tg_nodes[0].bytes = 4; tg_nodes[0].count = 2;
+    val v2: Extent = extent_of(nil, tg_describe, tg_field, 0, machine(8, 128), DEPTH_UNBOUNDED);
+    if (v2.size != 8) { ret 1; }
+    if (v2.align != 4) { ret 1; }
+
+    tg_nodes[0].bytes = 2; tg_nodes[0].count = 4;
+    val i16x4: Extent = extent_of(nil, tg_describe, tg_field, 0, machine(8, 128), DEPTH_UNBOUNDED);
+    if (i16x4.size != 8) { ret 1; }
+    if (i16x4.align != 2) { ret 1; }
+
+    # THE DISCONTINUITY, stated as a test so it cannot be "fixed" into uniformity
+    # without failing here: the same f32x4 shape is register-aligned on a 128-bit
+    # target and lane-aligned on a wider one, where it no longer fills the register.
+    tg_nodes[0].bytes = 4; tg_nodes[0].count = 4;
+    val at128: Extent = extent_of(nil, tg_describe, tg_field, 0, machine(8, 128), DEPTH_UNBOUNDED);
+    if (at128.align != 16) { ret 1; }
+    val at256: Extent = extent_of(nil, tg_describe, tg_field, 0, machine(8, 256), DEPTH_UNBOUNDED);
+    if (at256.size != 16) { ret 1; }
+    if (at256.align != 4) { ret 1; }
+
+    ret 0;
+}
+
 test "mach.lang.layout.extent:causes_are_distinguishable" {
     # a node the describer cannot classify
     tg_nodes[0] = node(NODE_UNKNOWN);
-    val unk: Extent = extent_of(nil, tg_describe, tg_field, 0, 8, DEPTH_UNBOUNDED);
+    val unk: Extent = extent_of(nil, tg_describe, tg_field, 0, machine(8, 128), DEPTH_UNBOUNDED);
     if (unk.ok)                            { ret 1; }
     if (unk.cause != EXTENT_UNKNOWN_NODE)  { ret 1; }
 
@@ -377,7 +482,7 @@ test "mach.lang.layout.extent:causes_are_distinguishable" {
     tg_nodes[0].field_count = 1;
     tg_fields[0]            = 1;
     tg_nodes[1]             = node(NODE_UNKNOWN);
-    val prop: Extent = extent_of(nil, tg_describe, tg_field, 0, 8, DEPTH_UNBOUNDED);
+    val prop: Extent = extent_of(nil, tg_describe, tg_field, 0, machine(8, 128), DEPTH_UNBOUNDED);
     if (prop.ok)                           { ret 1; }
     if (prop.cause != EXTENT_UNKNOWN_NODE) { ret 1; }
 
@@ -394,18 +499,18 @@ test "mach.lang.layout.extent:causes_are_distinguishable" {
     tg_nodes[1].count       = 4294967295;
     tg_nodes[2]             = node(NODE_SCALAR);
     tg_nodes[2].bytes       = 4;
-    val prop2: Extent = extent_of(nil, tg_describe, tg_field, 0, 8, DEPTH_UNBOUNDED);
+    val prop2: Extent = extent_of(nil, tg_describe, tg_field, 0, machine(8, 128), DEPTH_UNBOUNDED);
     if (prop2.ok)                             { ret 1; }
     if (prop2.cause != EXTENT_ARRAY_OVERFLOW) { ret 1; }
 
     # the same, through field_offset_of's own propagation path
-    val prop3: Extent = field_offset_of(nil, tg_describe, tg_field, 0, 0, 8, DEPTH_UNBOUNDED);
+    val prop3: Extent = field_offset_of(nil, tg_describe, tg_field, 0, 0, machine(8, 128), DEPTH_UNBOUNDED);
     if (prop3.ok)                             { ret 1; }
     if (prop3.cause != EXTENT_ARRAY_OVERFLOW) { ret 1; }
 
     # a depth failure raised below an aggregate must arrive as a DEPTH failure too
     tg_chain(8);
-    val prop4: Extent = extent_of(nil, tg_describe, tg_field, 0, 8, 3);
+    val prop4: Extent = extent_of(nil, tg_describe, tg_field, 0, machine(8, 128), 3);
     if (prop4.ok)                    { ret 1; }
     if (prop4.cause != EXTENT_DEPTH) { ret 1; }
 
@@ -415,20 +520,20 @@ test "mach.lang.layout.extent:causes_are_distinguishable" {
     tg_nodes[0].count = 4294967295;
     tg_nodes[1]       = node(NODE_SCALAR);
     tg_nodes[1].bytes = 4;
-    val ovf: Extent = extent_of(nil, tg_describe, tg_field, 0, 8, DEPTH_UNBOUNDED);
+    val ovf: Extent = extent_of(nil, tg_describe, tg_field, 0, machine(8, 128), DEPTH_UNBOUNDED);
     if (ovf.ok)                             { ret 1; }
     if (ovf.cause != EXTENT_ARRAY_OVERFLOW) { ret 1; }
 
     # deeper than the caller's bound
     tg_chain(8);
-    val deep: Extent = extent_of(nil, tg_describe, tg_field, 0, 8, 3);
+    val deep: Extent = extent_of(nil, tg_describe, tg_field, 0, machine(8, 128), 3);
     if (deep.ok)                   { ret 1; }
     if (deep.cause != EXTENT_DEPTH) { ret 1; }
 
     # a field offset asked of something that is not an aggregate
     tg_nodes[0]       = node(NODE_SCALAR);
     tg_nodes[0].bytes = 4;
-    val nag: Extent = field_offset_of(nil, tg_describe, tg_field, 0, 0, 8, DEPTH_UNBOUNDED);
+    val nag: Extent = field_offset_of(nil, tg_describe, tg_field, 0, 0, machine(8, 128), DEPTH_UNBOUNDED);
     if (nag.ok)                            { ret 1; }
     if (nag.cause != EXTENT_NOT_AGGREGATE) { ret 1; }
 
@@ -438,13 +543,13 @@ test "mach.lang.layout.extent:causes_are_distinguishable" {
     tg_fields[0]            = 1;
     tg_nodes[1]             = node(NODE_SCALAR);
     tg_nodes[1].bytes       = 4;
-    val rng: Extent = field_offset_of(nil, tg_describe, tg_field, 0, 3, 8, DEPTH_UNBOUNDED);
+    val rng: Extent = field_offset_of(nil, tg_describe, tg_field, 0, 3, machine(8, 128), DEPTH_UNBOUNDED);
     if (rng.ok)                          { ret 1; }
     if (rng.cause != EXTENT_FIELD_RANGE) { ret 1; }
 
     # and a determined extent carries EXTENT_OK, so `cause` is never stale from a
     # previous failure
-    val good: Extent = extent_of(nil, tg_describe, tg_field, 1, 8, DEPTH_UNBOUNDED);
+    val good: Extent = extent_of(nil, tg_describe, tg_field, 1, machine(8, 128), DEPTH_UNBOUNDED);
     if (!good.ok)                 { ret 1; }
     if (good.cause != EXTENT_OK)  { ret 1; }
     ret 0;
@@ -458,18 +563,18 @@ test "mach.lang.layout.extent:unbounded_walks_past_any_constant" {
     # 70 levels: past the 64 that used to be hardcoded, and past any bound a caller
     # would plausibly pick
     tg_chain(70);
-    val deep: Extent = extent_of(nil, tg_describe, tg_field, 0, 8, DEPTH_UNBOUNDED);
+    val deep: Extent = extent_of(nil, tg_describe, tg_field, 0, machine(8, 128), DEPTH_UNBOUNDED);
     if (!deep.ok)          { ret 1; }
     if (deep.size  != 1)   { ret 1; }
     if (deep.align != 1)   { ret 1; }
 
     # the same graph declines under a bound below its depth, and says why
-    val bounded: Extent = extent_of(nil, tg_describe, tg_field, 0, 8, 64);
+    val bounded: Extent = extent_of(nil, tg_describe, tg_field, 0, machine(8, 128), 64);
     if (bounded.ok)                    { ret 1; }
     if (bounded.cause != EXTENT_DEPTH) { ret 1; }
 
     # a bound at or above the depth admits it
-    val fits: Extent = extent_of(nil, tg_describe, tg_field, 0, 8, 69);
+    val fits: Extent = extent_of(nil, tg_describe, tg_field, 0, machine(8, 128), 69);
     if (!fits.ok)        { ret 1; }
     if (fits.size != 1)  { ret 1; }
     ret 0;
