@@ -10,13 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 #### An over-aligned stack local is over-aligned at run time (#2735)
-`#[align(32)]` and above worked on a global and did nothing on a local. The slot's offset was a correct multiple of the requested alignment, but it was measured from the frame pointer, and the only alignment that reaches the frame pointer is the ABI's 16-byte call boundary. So the address was a multiple of 32 exactly when the process stack happened to start on one — which depends on the environment block, and therefore changes between runs of the same binary. `$size_of` already reported the padded size, so the storage was sized for a promise the placement did not keep.
+`#[align(32)]` and above worked on a global and did nothing on a local. The slot's offset was a correct multiple of the requested alignment, but it was measured from the frame pointer, and the only alignment that reaches the frame pointer is the ABI's 16-byte call boundary. So the address was a multiple of 32 exactly when the process stack happened to start on one, which depends on the environment block and therefore changes between runs of the same binary. `$size_of` already reported the padded size, so the storage was sized for a promise the placement did not keep.
 
-A function whose frame contains an over-aligned slot now gets a prologue that masks the stack pointer down to the largest alignment that frame needs, and its locals, spills and callee-save area are addressed from there. The frame pointer stays exactly where the ABI put it: incoming stack arguments and the frame record hang off it and belong to the caller, and after a mask only one of the two pointers is still a fixed distance from the caller's stack. Debug info follows the same split — such a function's `DW_AT_frame_base` names the stack pointer, which is the register its recorded offsets are measured from.
+A function whose frame contains an over-aligned slot now gets a prologue that masks the stack pointer down to the largest alignment that frame needs, and its locals, spills and callee-save area are addressed from there. The frame pointer stays exactly where the ABI put it: incoming stack arguments and the frame record hang off it and belong to the caller, and after a mask only one of the two pointers is still a fixed distance from the caller's stack. Debug info follows the same split: such a function's `DW_AT_frame_base` names the stack pointer, which is the register its recorded offsets are measured from.
 
 The decision is recorded once, on `MirFrame`, and every encoder reads it. So is the distance from the stack pointer to the slot region's base, which aarch64 and riscv64 had each been re-deriving for inline-asm `{name}` operands since #2689.
 
 The cost falls only on functions that ask: one masking instruction and up to `N - 16` bytes of frame. A function with nothing over-aligned emits a byte-identical prologue to before.
+#### The pinned integration lane can run (#2729)
+`int/run.sh --deps pin` stopped on the first SPIR-V case on every target, because no lock recorded a commit for `mach-shader`. The lock was not stale, it was the wrong set: the root `mach.lock` is written by `mach dep pull` from the **root manifest**, so it can only ever cover the compiler's own dependency closure, while `int` builds a larger one. Two cases declared a dep the root has no reason to.
+
+So the pin now reads two sources with disjoint coverage. The root `mach.lock` stays authoritative for anything the compiler also builds against, which is what keeps `mach-std` to one place to bump, and the new `int/deps.lock` covers only the difference. `int/lib/update-deps.sh` writes it from what `mach dep pull` resolves, so no ref-to-commit mapping is reimplemented outside the compiler.
+
+The lane failing was the smaller half. `--deps pin` exists because a case floating a ref can change verdict with zero changes in this repo (#2592), and it is what a release gate and a bisect run, yet its inputs were only ever validated by running it, and the one pinned run in CI is the main-cadence darwin gate, whose leg set contains neither case that declares the missing dep. `int/lib/check-deps.sh` now checks the whole condition statically on every PR - coverage, that the two locks stay disjoint, that no pin outlives the case that asked for it, that cases declaring one dep agree about it, and that a branch ref is `branch/main` - and a pinned linux run of the full suite joins the PR lane. Every run also prints the mode and, when pinned, every lock entry it consulted, so a floating run cannot be read afterwards as a pinned one.
 
 #### A sub-width vector can cross a function boundary (#2687)
 4.15.0 shipped `f32x3` working inside a function and refused at every call boundary. Passing or returning one reported `CLASS_FP scalar of unsupported size`, which made the shape unusable in practice: a shader-math or vertex-building library is nothing but functions taking and returning these.
@@ -120,6 +126,26 @@ $each f in $fields(Node) {
 
 Termination is the caller's problem and is stated as such: unlike the by-value walk of #2691, following references does not terminate structurally, since `rec Grow[T] { p: *Grow[*T]; }` has unboundedly many instances reachable through its pointer.
 
+### Changed
+
+#### Vector operation legality is target-independent, so an unpacked lane op scalarizes instead of being refused (#2726)
+`i32x4 * i32x4` was refused at the language level, citing x86-64's SSE2 baseline (`pmulld` is SSE4.1). That refused it on **riscv64** — a target with no vector unit, which scalarizes `i32x4 + i32x4` one line up and would lower the multiply to four ordinary scalar multiplies — and on **aarch64**, whose NEON `MUL` supports `.4s` in hardware. The rule refused work on the targets least able to benefit from the refusal.
+
+The legality of a vector type and of a vector operation are now both target-independent; only the **realization** is target-dependent. Integer `*` is legal at every lane width on every target, and the backend picks the packed form where one exists and the per-lane scalar expansion where one does not.
+
+The rule's three homes collapse onto one authority. `isa.packed_width` answers a realization question — "how wide is this target's packed form for this operation at this lane width, or 0 for none" — declared per ISA beside the other capability facts and reached through the single mid-end door `me.vecform`. **Sema stops asking entirely**, because it was never a legality question. It returns a *width* rather than a bool so #2727 has the number to split by, and it is keyed on the lane width and never the lane count, so a vector wider than the register splits into chunks that each get the same answer.
+
+**`simd = "require"` now applies per operation on every target**, not only where there is no vector unit, and names the lane width:
+
+```
+error: simd = "require": vector multiply on 64-bit lanes in '_M4case4mainN5mul64' would scalarize on aarch64
+       (target has no packed form for this operation at this lane width); set simd = "scalarize" to build with the scalar expansion
+```
+
+A project that set the lever precisely to refuse a silent scalar expansion was previously told nothing about the ones x86-64 and aarch64 perform.
+
+The auto-vectorizer consults the same authority, so it forms a vector multiply only where the target packs one rather than forming one the realization stage would immediately take apart.
+
 ### Fixed
 
 #### An inline-asm `{name}` operand ran out of reach in a large frame (#2689)
@@ -128,6 +154,13 @@ A `{name}` binding was addressed frame-pointer-relative, and on aarch64 the addr
 The reach was not the real defect. The interface itself said *frame-pointer-relative*, freezing one target's addressing choice into the contract every target reads, when which base a `{name}` uses is part of the addressing decision and only the target knows which of its forms reaches. aarch64 and riscv64 now measure from the stack pointer, x86-64 keeps the frame pointer, and asm-bound slots moved to the bottom of the slot region so what separates a `{name}` from its base is the callee-save and outgoing-argument areas, bounded by the ABI rather than by the function.
 
 **New refusal:** an inline-asm body that binds a `{name}` may not write the stack pointer, on targets that measure from it. The displacement is taken once at block entry, so the pointer must still be where it was. The whole block is judged rather than a prefix, because a backward branch reaches an earlier `{name}` again with the moved pointer. Move the stack adjustment out of the block, or drop the `{name}` and stage the address into a register.
+
+#### The NEON integer-multiply arrangement rule was wrong in both directions (#2721)
+`arm64/encode.mach` declared the `MUL (vector)` base word as "legal only on .8h (size 1)". NEON encodes that word at sizes 0/1/2 as `.16b` / `.8h` / `.4s` and leaves size 3 **unallocated**, so the comment forbade three arrangements the hardware has and omitted the one real constraint: there is no `mul v.2d`.
+
+The encoder was not wrong yet, because nothing selected the word at another size. That is exactly the #2037 shape — a base word plus a size field that *looks* general, with nothing pinning what each arrangement encodes — and a widening that trusted the word's apparent generality would emit `0x4EE29C20`, an invalid encoding, rather than refuse.
+
+Each permitted arrangement is now pinned byte-exact against the encoding definition, and `neon_3same_size_ok` makes the hole a fact the compiler enforces: a 64-bit integer lane multiply reaching the selector is a defined error emitting no bytes, proved by driving the selector directly rather than by arguing no caller reaches it.
 
 #### Field stores went through a second layout policy that no decorator could reach (#2715)
 `mir.lower_ir`'s `struct_field_offset` re-derived every field offset with its own `round_up` over each field's alignment, rather than calling `ir_type.byte_offset` like every other offset consumer. So a `#[packed]` record reported correct `$size_of`, `$align_of` and `$offset_of` — those go through the shared layout policy — while the code that actually **read and wrote the fields** placed them at the **natural** offsets, and nothing errored. A record whose fields fit its packed size wrote its last field past the end of its own storage.

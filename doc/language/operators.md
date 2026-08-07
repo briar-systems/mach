@@ -122,17 +122,13 @@ cast. See [secrecy.md](secrecy.md).
 ## SIMD vectors
 
 The seeded 128-bit vector types (see [types.md](types.md)) carry lane-wise
-operators. The table below is the honest set — what lowers to one instruction per
-operator on the SSE2 (x86_64) and NEON (aarch64) baselines. Everything in it also
-lowers to a **defined unrolled scalar expansion** with identical results on a
-target without the hardware (see [policy.md](policy.md)), so a vector operator
-means the same thing on every target.
+operators. **Which operators are legal is target-independent.** The table below is
+the whole surface, and it is identical on every target.
 
 | Lane family | `+` `-` | `*` | `/` | `%` | `& \| ^ ~` | `<< >>` | `== != < > <= >=` |
 |---|---|---|---|---|---|---|---|
 | float — `f32x4`, `f64x2` | yes | yes | yes | no | — | no | → same-shape unsigned mask |
-| integer, 16-bit lanes — `i16x8`, `u16x8` | yes | yes | no | no | yes | no | → same-shape unsigned mask |
-| integer, other widths — `i8x16` `i32x4` `i64x2` (+ unsigned) | yes | no | no | no | yes | no | → same-shape unsigned mask |
+| integer — `i8x16` `i16x8` `i32x4` `i64x2` (+ unsigned) | yes | yes | no | no | yes | no | → same-shape unsigned mask |
 
 Both operands of a binary operator must be the **same** vector shape: there is no
 implicit scalar↔vector mixing and no cross-shape widening. Anything the table
@@ -140,11 +136,30 @@ marks `no` is a compile error, not a silent fallback:
 
 - no vector `%` on any lane type;
 - no integer vector `/` — division is float lanes only;
-- integer vector `*` is 16-bit lanes only (32-bit `pmulld` is SSE4.1, off the SSE2
-  baseline);
 - bitwise `& | ^ ~` require integer lanes; the shifts `<< >>` are not in this
   increment (a per-lane variable shift is AVX2-only on x86_64, with no 8-bit
   packed form).
+
+### Legality is target-independent; realization is not
+
+A legal operator means the same thing on every target, but not every target has a
+packed instruction for every one. The backend picks, in order: the packed form
+where the target has one, else a **defined unrolled scalar expansion** with
+lane-identical results (see [policy.md](policy.md)). Neither choice changes the
+answer, so nothing about the surface depends on it.
+
+Integer `*` is where this is most visible today:
+
+| shape | x86_64 (SSE2) | aarch64 (NEON) | riscv64 (no vector unit) |
+|---|---|---|---|
+| `i8x16 * i8x16` | scalar expansion | packed `mul .16b` | scalar expansion |
+| `i16x8 * i16x8` | packed `pmullw` | packed `mul .8h` | scalar expansion |
+| `i32x4 * i32x4` | scalar expansion (`pmulld` is SSE4.1) | packed `mul .4s` | scalar expansion |
+| `i64x2 * i64x2` | scalar expansion | scalar expansion (NEON has no `.2d` multiply) | scalar expansion |
+
+A project that cannot afford a scalar expansion sets `simd = "require"` in its
+profile (see [../manifest.md](../manifest.md)), which turns the shortfall into a
+build error naming the operation, its lane width, the function and the target.
 
 A comparison produces the same-shape **unsigned mask** vector — one lane per input
 lane, all-ones bits (`0xFF…`) for true and all-zeros for false, exactly what the
