@@ -193,6 +193,10 @@ val SUB_SP_REG_X: u32 = 0xCB2063FF;
 
 # the zero register / stack pointer encode as register 31 in the relevant fields
 val ZR: u32 = 31;
+# the same number spelled for the position that reads it as SP - a load/store base, an
+# add/sub Rn/Rd. named separately from `ZR` so a site that means the stack pointer says
+# so, since the two are told apart only by where the field sits
+val SP_REG: u32 = 31;
 # the intra-procedure-call scratch registers (IP0 = X16, IP1 = X17) the encoder
 # claims for immediate materialization; both are caller-saved and never hold a live
 # value across the point the encoder uses them
@@ -1539,6 +1543,26 @@ rec A64Mem {
 # encoder's twin, reading the laid-out frame directly
 fun frame_slot_offset(f: *mir.MirFunction, v: u32) O.Option[i64] {
     ret codegen_frame.slot_offset(?f.frame, v, 0);
+}
+
+# the STACK-pointer offset of the slot a MIR value owns, for an inline-asm
+# `{name}` - the grammar's `slot` hook, and deliberately not the twin above
+#
+# A compiler-emitted access takes the frame pointer because it can be legalized through
+# IP0 when the negative displacement outgrows the imm9. An author-written one cannot
+# (#2667), so it takes the base whose form reaches furthest: `SP` puts the displacement
+# on the positive side, where the SCALED imm12 applies, and the frame phase lays
+# asm-bound slots at the bottom of the slot region, so what separates a `{name}` from SP
+# is the callee-save and outgoing-argument areas alone (#2689).
+#
+# `emit_prologue` leaves `SP = X29 - frame_subsize(f)` and nothing between the prologue
+# and the epilogue's `MOV SP, X29` moves it - a variable-length alloca is refused at
+# lowering, and an asm body that writes SP is refused by the shared `writes_sp` check
+# whenever it binds a `{name}`.
+fun asm_slot_offset(f: *mir.MirFunction, v: u32) O.Option[i64] {
+    val fp_off: O.Option[i64] = codegen_frame.slot_offset(?f.frame, v, 0);
+    if (!O.is_some[i64](fp_off)) { ret O.none[i64](); }
+    ret O.some[i64](frame_subsize(f)::i64 + O.unwrap[i64](fp_off));
 }
 
 # lower a post-regalloc MIR_OP_MEM operand to its A64 base / offset /
@@ -4196,17 +4220,22 @@ fun a64_operand(c: *iasm.Cursor, lo: usize, hi: usize, op: *iasm.Operand) R.Resu
     @op = iasm.op_none();
     if (hi <= lo) { ret R.err[bool, str]("encode: malformed inline-asm operand"); }
 
-    # a `{name}` local: with a laid-out frame it becomes the `[x29, off]` stack slot
+    # a `{name}` local: with a laid-out frame it becomes the `[sp, off]` stack slot
     # it denotes; without one the displacement is genuinely unknown, and the operand
     # stays a binding - it names a stack slot either way, so it can never be a
     # register and the effect model reads it exactly as it reads memory.
+    #
+    # SP, not X29: the displacement is then positive and the scaled imm12 form reaches
+    # it at any frame depth, where the frame pointer's negative displacement had only
+    # the unscaled imm9's -256 (#2689). `AOF_STACK_PTR` is what tells the emitters that
+    # register 31 here is the stack pointer and not the zero register.
     if (c.body[lo] == '{'::char) {
         var off: i64 = 0;
         val br: R.Result[bool, str] = iasm.bind_offset(c, lo, hi, ?off);
         if (R.is_err[bool, str](br)) { ret br; }
         if (R.unwrap_ok[bool, str](br)) {
-            @op = iasm.op_mem(arm64.FP, off, -1, 0, 8);
-            op.flags = iasm.AOF_HAS_DISP;
+            @op = iasm.op_mem(SP_REG::i32, off, -1, 0, 8);
+            op.flags = iasm.AOF_HAS_DISP | iasm.AOF_STACK_PTR;
             ret R.ok[bool, str](true);
         }
         op.kind     = iasm.AOP_BIND;
@@ -4914,9 +4943,12 @@ fun a64_emit_ldst(st: *encode.EncodeState, c: *iasm.Cursor, item: *iasm.Item) R.
 
 # the diagnostic for an inline-asm ldr/str whose offset needs an address scratch
 #
-# A `{name}` offset lands here when the enclosing frame outgrew the immediate range, so
-# the message names the frame rather than the number: the author wrote `{name}`, not an
-# offset, and what they can act on is the size of the function's locals.
+# A `{name}` is measured from SP with its slot laid at the bottom of the frame's slot
+# region, so what stands between it and the base is the callee-save and outgoing-
+# argument areas - both ABI-bounded - and reaching here means the function passes an
+# enormous argument region on the stack. The message names the frame rather than the
+# number: the author wrote `{name}`, not an offset, and the frame is what they can act
+# on.
 fun a64_offset_message(c: *iasm.Cursor, off: i64) str {
     if (c.interner == nil) {
         ret "encode: inline-asm ldr/str offset is out of range for both immediate forms; addressing it would need a scratch register this body may be using, so reduce the function's frame or stage the address into a register first";
@@ -5021,6 +5053,36 @@ fun a64_patch(st: *encode.EncodeState, patch_pos: u32, target_off: u32) R.Result
     ret patch_branch_arm64(st, ?fx, target_off);
 }
 
+# true when one AArch64 statement writes SP
+#
+# Read off the SAME write facts the effect model folds, one operand position at a time,
+# because that is the only place the SP / ZR distinction survives: register 31 is the
+# zero register in a destination field and the stack pointer in an address base, and
+# `AOF_STACK_PTR` is what the operand lexer set to say which one was written.
+#
+# A raw byte payload writes it exactly as it writes every other register - the compiler
+# does not decode the payload - unless the statement declared a set that omits it.
+fun a64_writes_sp(item: *iasm.Item) bool {
+    if (item.kind == iasm.AI_LABEL) { ret false; }
+    if (item.kind == iasm.AI_BYTES) {
+        if (item.declared) { ret (item.decl_gp & (1::u32 << SP_REG)) != 0; }
+        ret true;
+    }
+    if ((item.writes & iasm.AW_OP0) != 0 && item.nops > 0 && a64_is_sp(?item.ops[0])) { ret true; }
+    if ((item.writes & iasm.AW_OP1) != 0 && item.nops > 1 && a64_is_sp(?item.ops[1])) { ret true; }
+    if ((item.writes & iasm.AW_WB_BASE) != 0) {
+        var i: u32 = 0;
+        for (i < item.nops) {
+            val op: *iasm.Operand = ?item.ops[i::usize];
+            if (op.kind == iasm.AOP_MEM && (op.flags & iasm.AOF_WRITEBACK) != 0 && a64_is_sp(op)) {
+                ret true;
+            }
+            i = i + 1;
+        }
+    }
+    ret false;
+}
+
 # the AArch64 inline-assembly grammar
 fun a64_grammar() iasm.Grammar {
     var g: iasm.Grammar;
@@ -5035,7 +5097,8 @@ fun a64_grammar() iasm.Grammar {
     g.parse      = a64_parse;
     g.emit       = a64_emit;
     g.patch      = a64_patch;
-    g.slot       = frame_slot_offset;
+    g.slot       = asm_slot_offset;
+    g.writes_sp  = a64_writes_sp;
     g.all_gp     = 0xFFFFFFFF;
     g.all_fp     = 0xFFFFFFFF;
     g.word       = 4;
@@ -7435,9 +7498,16 @@ test "mach.lang.target.isa.arm64.encode:inline_asm_branches_to_numeric_local_lab
     ret bad;
 }
 
-# a `{name}` local substitutes to its `[x29, #off]` frame slot (the AArch64 analogue
-# of x86-64's `[rbp+off]`); a slot at -8 loads/stores through the LDUR/STUR forms.
-# inline-asm {name} local resolves to a frame slot
+# a `{name}` local substitutes to its `[sp, #off]` frame slot, and the offset is
+# POSITIVE, which is what puts it in the scaled imm12 form (#2689)
+#
+# The frame here is one no frame-pointer-relative form could have addressed: the slot
+# sits 8 KiB below X29, far outside the unscaled imm9's -256, and the whole reach for a
+# `{name}` used to be that imm9 because the scaled form is unsigned-only. Measured from
+# SP - with the frame phase laying the asm-bound slot at the bottom of the slot region,
+# which is the end SP sits at - the same slot is 64 bytes up, and the scaled form
+# encodes it.
+# inline-asm {name} local resolves to a stack-pointer-relative frame slot
 test "mach.lang.target.isa.arm64.encode:inline_asm_name_local_resolves_to_a_frame_slot" {
     var bad: i32 = 0;
     var st: encode.EncodeState;
@@ -7448,12 +7518,19 @@ test "mach.lang.target.isa.arm64.encode:inline_asm_name_local_resolves_to_a_fram
     var slots: [1]mir.MirSlot;
     slots[0].value  = 100;
     slots[0].kind   = mir.SLOT_SPILL;
-    slots[0].offset = -8;
+    slots[0].offset = -8192;
     slots[0].size   = 4;
     slots[0].align  = 4;
     var f: mir.MirFunction;
-    f.frame.slots      = ?slots[0];
-    f.frame.slot_count = 1;
+    f.frame.slots         = ?slots[0];
+    f.frame.slot_count    = 1;
+    f.frame.size          = 8192;
+    f.frame.outgoing_size = 64;
+    f.callee_mask         = 0;
+    f.callee_mask_fp      = 0;
+
+    # SP = X29 - align16(8192 + 64), so the slot at X29-8192 is SP+64.
+    if (frame_subsize(?f) != 8256) { bad = 1; }
 
     val xr: R.Result[intern.StrId, str] = intern.intern(?interner, "x");
     if (R.is_err[intern.StrId, str](xr)) { ret 1; }
@@ -7473,11 +7550,77 @@ test "mach.lang.target.isa.arm64.encode:inline_asm_name_local_resolves_to_a_fram
     val r: R.Result[bool, str] = encode_asm_block_arm64(?st, ?f, 0, ?mi);
     if (R.is_err[bool, str](r)) { bad = 1; }
     or {
-        # ldr w0, [x29, #-8] -> ldur w0,[x29,#-8] = 0xb85f83a0
-        if (read_word(?st.buf, 0) != 0xB85F83A0) { bad = 1; }
-        # str w0, [x29, #-8] -> stur w0,[x29,#-8] = 0xb81f83a0
-        if (read_word(?st.buf, 4) != 0xB81F83A0) { bad = 1; }
+        # ldr w0, [sp, #64] -> scaled imm12 = 16, Rn = 31 = 0xb94043e0
+        if (read_word(?st.buf, 0) != 0xB94043E0) { bad = 1; }
+        # str w0, [sp, #64] -> 0xb90043e0
+        if (read_word(?st.buf, 4) != 0xB90043E0) { bad = 1; }
     }
+
+    # AND THE OLD BASE COULD NOT HAVE ENCODED IT: the frame-pointer displacement this
+    # same slot carries is outside both immediate forms, so before #2689 this body
+    # refused to build rather than emitting the two words above.
+    if (mem_access_needs_no_scratch(-8192, 4)) { bad = 1; }
+
+    encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# an inline-asm body that binds a `{name}` may not write SP, because the binding's
+# displacement is measured from SP at block entry (#2689)
+#
+# The refusal is over the WHOLE block, not the statements after the write: a backward
+# branch reaches an earlier `{name}` again with the moved pointer, so a prefix scan
+# would pass a body that mis-addresses on its second time round. The write here is
+# therefore placed AFTER the access it would invalidate.
+# inline-asm {name} with an SP-moving body is refused
+test "mach.lang.target.isa.arm64.encode:inline_asm_name_local_refuses_a_body_that_moves_sp" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+
+    var slots: [1]mir.MirSlot;
+    slots[0].value  = 100;
+    slots[0].kind   = mir.SLOT_SPILL;
+    slots[0].offset = -16;
+    slots[0].size   = 8;
+    slots[0].align  = 8;
+    var f: mir.MirFunction;
+    f.frame.slots      = ?slots[0];
+    f.frame.slot_count = 1;
+    f.frame.size       = 16;
+
+    val xr: R.Result[intern.StrId, str] = intern.intern(?interner, "x");
+    if (R.is_err[intern.StrId, str](xr)) { ret 1; }
+    var binds: [1]mir.MirAsmBind;
+    binds[0].name      = R.unwrap_ok[intern.StrId, str](xr);
+    binds[0].slot_vreg = 100;
+
+    var pl: mir.MirAsm;
+    pl.isa        = "aarch64";
+    pl.binds      = ?binds[0];
+    pl.bind_count = 1;
+
+    var mi: mir.MirInstr = mir.instr(mir.MIR_ASM, nil, 0, 0, 0);
+    mi.asm_block     = ?pl;
+
+    # a bare `sub sp, sp, 16` after the access.
+    pl.body = "ldr x0, {x}\nsub sp, sp, 16";
+    if (!R.is_err[bool, str](encode_asm_block_arm64(?st, ?f, 0, ?mi))) { bad = 1; }
+
+    # a pre-index store, which writes SP back rather than naming it as a destination.
+    pl.body = "ldr x0, {x}\nstp x1, x2, [sp, -16]!";
+    if (!R.is_err[bool, str](encode_asm_block_arm64(?st, ?f, 0, ?mi))) { bad = 2; }
+
+    # a raw payload declares nothing, so it reaches SP like every other register.
+    pl.body = "ldr x0, {x}\n.word 0xd10043ff";
+    if (!R.is_err[bool, str](encode_asm_block_arm64(?st, ?f, 0, ?mi))) { bad = 3; }
+
+    # AND THE CHECK IS NOT REFUSING EVERYTHING. `xzr` is register 31 too, and a body
+    # that reads SP without writing it is fine - both still encode.
+    pl.body = "ldr x0, {x}\nmov xzr, x1\nldr x2, [sp, 8]";
+    if (R.is_err[bool, str](encode_asm_block_arm64(?st, ?f, 0, ?mi))) { bad = 4; }
 
     encode.buf_dnit(?st.buf);
     ret bad;
@@ -8407,6 +8550,44 @@ test "mach.lang.target.isa.arm64.encode.asm_ct_class:every_grammar_row_is_classi
 # both plain register operands, so the walk sees mechanically that the retry
 # conditions on CONTENTION status rather than on a taint. x86-64 cannot do this: its
 # `jcc` family conditions on FLAGS, which the effect model does not represent (#2460).
+# a secret spilled to memory and reloaded stays secret (#2706)
+#
+# The register bitmask carried no memory domain, so a store and a reload returned a
+# secret in a register the model believed public, defeating ALL THREE leak checks at
+# once.
+#
+# EVERY CASE IS RUN TWICE ON THE SAME BODY, once with the binding registered secret and
+# once with none registered. The secret run must be refused and the public run must be
+# accepted. That pairing is the whole point: an inline-asm body this grammar cannot
+# parse is refused as unverifiable, so a one-sided test would go green on a body that
+# never parsed, proving nothing. Two earlier drafts of this test did exactly that.
+#
+# THIS TARGET IS THE ONE THAT CATCHES A TARGET-SHAPED FIX. aarch64 `str` declares
+# `AW_NONE`, because the `writes` mask names REGISTER operands and a store writes no
+# register. A memory domain fed from that mask fires on x86-64's `mov [rsp], rax` and
+# silently passes every store here.
+test "mach.lang.target.isa.arm64.encode.asm_ct_scan:a_spill_does_not_launder_a_secret" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var bad: i32 = 0;
+
+    var names: [1]str;
+    names[0] = "r";
+
+    # (b) the reloaded secret reaches a memory address.
+    val addr: str = "ldr x0, {r}\nstr x0, [sp]\nldr x1, [sp]\nldr x2, [x1]";
+    if (!R.is_err[bool, str](asm_ct_scan(addr, ?names[0], 1, false, false, ?alloc))) { bad = bad + 1; }
+    if (R.is_err[bool, str](asm_ct_scan(addr, ?names[0], 0, false, false, ?alloc)))  { bad = bad + 2; }
+
+    # (a) the reloaded secret reaches a register-conditioned branch, the only
+    # conditional shape this grammar has statically.
+    val br: str = "ldr x0, {r}\nstr x0, [sp]\nldr x1, [sp]\ncbnz x1, 1f\n1:\nnop";
+    if (!R.is_err[bool, str](asm_ct_scan(br, ?names[0], 1, false, false, ?alloc)))   { bad = bad + 4; }
+    if (R.is_err[bool, str](asm_ct_scan(br, ?names[0], 0, false, false, ?alloc)))    { bad = bad + 8; }
+
+    ret bad;
+}
+
 test "mach.lang.target.isa.arm64.encode.asm_ct_class:branches_are_register_conditioned" {
     var bad: i32 = 0;
 
