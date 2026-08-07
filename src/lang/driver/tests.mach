@@ -30,6 +30,8 @@ use R: std.types.result;
 use ctime: std.chrono.time;
 
 use mach.lang.be.codegen;
+use mir: mach.lang.be.codegen.mir;
+use mirlower: mach.lang.be.codegen.mir.lower;
 use mach.lang.be.obj;
 use mach.lang.build.outcome;
 use mach.lang.build.qctx;
@@ -1000,7 +1002,7 @@ fun ut_vec_lower(s: *session.Session, alloc: *A.Allocator, src: str, target_name
     names[0] = "main.mach";
     var texts: [1]str;
     texts[0] = src;
-    val root_r: R.Result[str, str] = ut_scaffold(alloc, ?names[0], ?texts[0], 1);
+    val root_r: R.Result[str, str] = ut_scaffold_m(alloc, ut_manifest_spirv(), ?names[0], ?texts[0], 1);
     if (R.is_err[str, str](root_r)) { ret R.err[project.Project, outcome.Fail](outcome.user(R.unwrap_err[str, str](root_r))); }
     val root: str = R.unwrap_ok[str, str](root_r);
     val rr: R.Result[bool, str] = driver.setup_registry(?s.registry);
@@ -1392,6 +1394,95 @@ test "mach.lang.driver:vector_storage_is_not_reinterpreted" {
     project.dnit_project(?p);
     session.dnit(?s);
     ret bad;
+}
+
+# a manifest declaring the spirv target alongside linux, for a test that must lower
+# the SAME source both ways. kept separate from `ut_manifest` so adding a target
+# here cannot perturb the ~180 tests that share that fixture
+fun ut_manifest_spirv() str {
+    ret "[project]\nid = \"uniontest\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[target.linux-arm64]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n\n[target.linux-riscv64]\nisa = \"riscv64\"\nos = \"linux\"\nabi = \"lp64\"\n\n[target.spirv]\nisa = \"spirv\"\nos = \"freestanding\"\nabi = \"spirv\"\n\n[artifact.uniontest]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/uniontest\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+}
+
+# the widest MIR_GEP operand count in a lowered module, or 0 when there is no gep
+# ---
+# mm:  the lowered MIR module
+# ret: the largest `operand_count` seen on a MIR_GEP
+fun ut_max_gep_operands(mm: *mir.MirModule) u32 {
+    var best: u32 = 0;
+    var fi: u32 = 0;
+    for (fi < mm.function_len) {
+        val mf: *mir.MirFunction = ?mm.functions[fi];
+        var bi: u32 = 0;
+        for (bi < mf.block_count) {
+            val blk: *mir.MirBlock = ?mf.blocks[bi];
+            var ii: u32 = 0;
+            for (ii < blk.instr_count) {
+                val mi: *mir.MirInstr = ?blk.instrs[ii];
+                if (mi.opcode == mir.MIR_GEP && mi.operand_count > best) { best = mi.operand_count; }
+                ii = ii + 1;
+            }
+            bi = bi + 1;
+        }
+        fi = fi + 1;
+    }
+    ret best;
+}
+
+# lower `src` for `tname` all the way to MIR and report the widest MIR_GEP
+# ---
+# alloc: allocator for the session and the MIR arena
+# src:   the module source
+# tname: the target to lower for
+# ret:   the widest MIR_GEP operand count, or -1 on any failure
+fun ut_gep_shape(alloc: *A.Allocator, src: str, tname: str) i64 {
+    val sr: R.Result[session.Session, str] = session.init(alloc);
+    if (R.is_err[session.Session, str](sr)) { ret -1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    val pr: R.Result[project.Project, outcome.Fail] = ut_vec_lower(?s, alloc, src, tname);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret -1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+    var out: i64 = -1;
+    var mi: u32 = 0;
+    for (mi < p.module_len) {
+        val me: *project.ModuleEntry = ?p.modules[mi];
+        if (me.ir_module == nil) { mi = mi + 1; cnt; }
+        val mr: R.Result[mir.MirModule, str] = mirlower.lower_ir(?p.target, me.ir_module, alloc, ?s.interner, ?s.sources);
+        if (R.is_err[mir.MirModule, str](mr)) { mi = mi + 1; cnt; }
+        var mm: mir.MirModule = R.unwrap_ok[mir.MirModule, str](mr);
+        val w: u32 = ut_max_gep_operands(?mm);
+        if (w::i64 > out) { out = w::i64; }
+        mi = mi + 1;
+    }
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret out;
+}
+
+# a MIR_GEP keeps its index list on a logical-addressing target and folds to a
+# byte displacement on a flat one (#2649)
+#
+# THE OPERAND COUNT IS THE CONTRACT the SPIR-V emitter reads to tell the two apart.
+# A flat GEP is `[dst, mem]` at exactly 2; a structural one is
+# `[dst, base, idx0, ...]` at more than 2. A member walk `g.x.a` carries two IR
+# indices, so it must reach 4 on spirv and stay at 2 on every machine target.
+#
+# Asserting the count on BOTH sides is what makes this a regression test rather
+# than a feature test: gating the fold the wrong way round, or dropping the gate
+# entirely, moves one of the two numbers.
+test "mach.lang.driver:gep_index_list_survives_on_logical_addressing" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val src: str = "rec Inner { a: i64; b: i64; }\nrec Outer { x: Inner; y: i64; }\n#[uniform(0, 0)] var g: Outer;\n#[output(0)] var o: i32;\n#[stage(\"vertex\")]\nfun vs() { o = g.x.a::i32; }\nfun main() i32 { ret 0; }\n";
+
+    # spirv keeps the walk: base plus two indices, past the flat form's 2.
+    if (ut_gep_shape(?alloc, src, "spirv") <= 2) { ret 1; }
+
+    # every flat target folds it away and stays at exactly 2.
+    val nsrc: str = "rec Inner { a: i64; b: i64; }\nrec Outer { x: Inner; y: i64; }\nvar g: Outer;\nfun rd() i64 { ret g.x.a; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret rd()::i32; }\n";
+    if (ut_gep_shape(?alloc, nsrc, "linux")         != 2) { ret 1; }
+    if (ut_gep_shape(?alloc, nsrc, "linux-arm64")   != 2) { ret 1; }
+    if (ut_gep_shape(?alloc, nsrc, "linux-riscv64") != 2) { ret 1; }
+    ret 0;
 }
 
 # an uninitialized vector local default-initializes to all-zero lanes through a
