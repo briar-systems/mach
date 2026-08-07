@@ -33,6 +33,7 @@ A decorator is written as an attribute:
 #[inline]            # force inlining (no arguments)
 #[noinline]          # forbid inlining (no arguments)
 #[align(expr)]       # alignment; expr is a comptime integer
+#[packed]            # lay a rec / uni out with no padding (no arguments)
 #[section(".name")]  # place in a named object section
 #[oblivious]         # constant-time boundary (no arguments)
 #[scalar]            # opt out of auto-vectorization (no arguments)
@@ -175,6 +176,116 @@ naming the type that closes it.
   by any global of that type.
 - `align` does not apply to `def` aliases (transparent, no layout of their
   own).
+
+### `packed` — no padding
+
+Lays a `rec` or `uni` out with no padding: every field sits immediately after the
+previous one, there is no padding at the tail, and the type takes no alignment from
+its fields. Takes no arguments.
+
+`align` only ever raises alignment. `packed` is the inverse, and it exists for the
+case where the layout is not mach's to choose — a C struct, a file header, a wire
+frame, a vertex whose stride a buffer fixes. Without it such a shape cannot be
+described as a record at all.
+
+```mach
+#[packed]
+rec Header {
+    magic:    u8;    # offset 0
+    version:  u16;   # offset 1
+    length:   u32;   # offset 3
+    checksum: u64;   # offset 7
+}                    # $size_of == 15, $align_of == 1
+```
+
+Naturally the same shape is 24 bytes. `$size_of`, `$align_of` and `$offset_of` all
+report the packed layout, and so does the code that reads and writes the fields —
+there is one layout, not a declared one and an emitted one.
+
+#### Composition with `align`
+
+The two compose rather than conflict, and each owns one question:
+
+- `packed` decides **padding** — none between fields, none at the tail.
+- `align(N)` decides the **record's own alignment**, and rounds its size up to a
+  multiple of `N`.
+
+```mach
+#[packed] #[align(8)]
+rec Frame { a: u8; b: u32; }   # fields at 0 and 1; $align_of == 8, $size_of == 8
+```
+
+#### Packing is not transitive
+
+A `packed` record packs **its own** fields. A record it contains keeps its own
+internal padding and is merely *placed* without padding. This matches C, and it is
+the rule that composes: an inner type's layout does not change depending on who
+holds it.
+
+```mach
+rec Point { x: u8; y: u32; }   # natural: y at 4, size 8
+
+#[packed]
+rec Msg { tag: u8; p: Point; } # p at offset 1, still 8 bytes; $size_of(Msg) == 9
+```
+
+A transitive rule would make `Msg` 6 bytes and silently change `Point`'s meaning
+inside it. If the inner record must be packed too, write `#[packed]` on it as well.
+
+#### What is refused
+
+**The address of a packed field.** `?r.b` on a packed record would yield a `*u32`,
+and a `*u32` states alignment 4 to everything downstream of it while the storage it
+names has none. The access through such a pointer is correct on the targets mach
+supports today; the **pointer type** is what is untrue, and it travels — an atomic,
+which every ISA requires naturally aligned, is exactly what a caller does with a
+pointer it was handed. The refusal covers the whole access chain, so `?r.arr[0]`,
+`?r.inner.x` and `?p.b` through a `*Packed` are refused for the same reason.
+
+`?r` on the **whole** record stays legal: a `*Packed` describes an align-1 pointee
+correctly, and nothing is lost by handing it out. To work with a field's value, copy
+it into a local.
+
+This is fail-closed on purpose. Refusing can be relaxed later, once alignment can
+ride in a pointer type; permitting cannot be tightened later without breaking
+programs that came to depend on it. Rust refuses; C permits, and it is a standing
+source of faults.
+
+**Atomics on a packed field** are refused by that same rule, not by one of their own.
+`std.sync.atomic` is ordinary functions over `*i64`, so a pointer is the only route
+an atomic has to a field, and there is no pointer to hand it.
+
+**Vector fields.** A vector in a packed record is refused for now, including one
+reached through an array or a nested record. The reason is evidence rather than
+arithmetic: an unaligned **scalar** access is measured on real hardware, and that
+measurement is what `#[packed]` rests on, but there is no equivalent measurement for a
+vector — the widest access, the one with alignment-requiring ISA forms, and the case
+where an emulator is least trustworthy about what silicon does.
+[#2687](https://github.com/briar-systems/mach/issues/2687) carries the other half, a
+lane-dependent vector footprint through aggregate layout and ABI classification. This
+is a sequencing decision and is expected to be lifted, not a permanent rule.
+
+**Interface blocks.** `packed` cannot apply to a `#[uniform]` or `#[storage]` block:
+its member offsets are fixed by the std140 / std430 layout rules and emitted as
+explicit SPIR-V `Offset` decorations, which packing would contradict.
+
+#### Target note: riscv64
+
+Unaligned access is permitted-but-may-trap on RV64. Where the hardware does not do it,
+Linux emulates the access in the kernel, so a packed field access there is expected to
+be **correct and pathologically slow** — a trap-and-emulate round trip per access
+rather than a load. Correctness tests on that target will pass and prove nothing about
+usability, so treat a green riscv64 leg as evidence about correctness only.
+
+This has not been measured on riscv64 hardware. It cannot be: qemu-user emulates a
+misaligned guest load directly and never takes the kernel path, so a qemu measurement
+shows no cost whether or not real silicon would. If the cost turns out to matter, the
+answer is byte-wise lowering of packed field access on faulting targets, which is
+codegen work and not part of `#[packed]` as it stands.
+
+x86-64 and aarch64 do unaligned scalar access in hardware. The aarch64 answer is
+measured on real hardware rather than assumed — `int`'s `linux-arm64` leg runs
+natively.
 
 ### `section(str)` — object section placement
 
@@ -546,6 +657,7 @@ in it.
 | `inline`    |  yes  |    no     |      no       |      no       |
 | `noinline`  |  yes  |    no     |      no       |      no       |
 | `align`     |  no   |    no     |      yes      |      yes      |
+| `packed`    |  no   |    no     |      no       |      yes      |
 | `section`   |  yes  |    yes    |      yes      |      no       |
 | `oblivious` |  yes  |    no     |      no       |      no       |
 | `scalar`    |  yes  |    no     |      no       |      no       |
