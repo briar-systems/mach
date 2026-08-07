@@ -43,7 +43,8 @@ A decorator is written as an attribute:
 #[input(n)]          # shader interface input at location n (global only)
 #[output(n)]         # shader interface output at location n (global only)
 #[builtin("name")]   # pipeline built-in variable (global only)
-#[uniform(set, bnd)] # descriptor-bound uniform block (global only)
+#[uniform(set, bnd)] # descriptor-bound uniform block, read-only (global only)
+#[storage(set, bnd)] # descriptor-bound storage buffer, read-write (global only)
 ```
 
 Decorators appear **before** the declaration they target, one per line or
@@ -412,7 +413,7 @@ stage takes the single-invocation default `(1, 1, 1)`; the dimensions are always
 declared in the emitted module, since a compute stage that does not state its
 workgroup size is not one a consumer can dispatch.
 
-### `input(n)` / `output(n)` / `builtin(str)` / `uniform(set, binding)` — shader interface
+### `input(n)` / `output(n)` / `builtin(str)` / `uniform(set, binding)` / `storage(set, binding)` — shader interface
 
 A pipeline stage does not receive its inputs or return its results through a call.
 It reads and writes **module-scope variables** that the pipeline binds, and these
@@ -427,6 +428,9 @@ are mutually exclusive.
 
 rec Camera { view: f32x4; proj: f32x4; }
 #[uniform(0, 0)] var camera: Camera;
+
+rec Particles { pos: [64]f32x4; }
+#[storage(0, 1)] var particles: Particles;
 ```
 
 `input` and `output` number a **varying** with a location, which is how one
@@ -458,6 +462,21 @@ its `Block` decoration and an explicit byte offset on every member, taken from t
 same layout the rest of the compiler uses, so what the shader reads is what the
 host wrote. Wrap a single value in a one-field record.
 
+`storage` binds a **read-write** buffer by descriptor set and binding, where
+`uniform` binds a read-only one. Both must be a `rec` for the same reason, and both
+are emitted as a `Block`-decorated struct with an explicit offset on every member.
+
+They differ in one place: their **layout rules**. A uniform block follows
+std140-shaped rules, under which an array's stride is rounded up to 16 — which
+mach's own layout does not do, so an array of anything narrower than 16 bytes is
+refused rather than silently repacked. A storage buffer follows std430-shaped
+rules, which use the element's natural stride, and that *is* mach's layout, so
+`[8]f32` is fine in a `storage` block and rejected in a `uniform` one.
+
+A compute stage's data path is `storage`: Vulkan forbids the `Output` storage class
+in a compute execution model, so a compute shader reads and writes buffers rather
+than varyings.
+
 As with `#[stage(...)]`, these are accepted on every target and acted on only by a
 target that forms pipeline stages. On `spirv` each becomes an `OpVariable` in the
 matching storage class, carrying the matching decoration, and the Input and Output
@@ -483,6 +502,7 @@ variables are named in every entry point's interface list.
 | `output`    |  no   |    no     |      yes      |      no       |
 | `builtin`   |  no   |    no     |      yes      |      no       |
 | `uniform`   |  no   |    no     |      yes      |      no       |
+| `storage`   |  no   |    no     |      yes      |      no       |
 
 The `val` / `var` column is shared, but `embed` accepts only `val` — a `var`
 is refused (see [`embed`](#embedstr--compile-time-file-embedding) above).

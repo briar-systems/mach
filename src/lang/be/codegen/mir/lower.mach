@@ -2175,7 +2175,7 @@ fun lower_alloca(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instructio
     if (R.is_err[u32, str](skr)) { ret R.err[bool, str](R.unwrap_err[u32, str](skr)); }
     val sk: u32 = R.unwrap_ok[u32, str](skr);
 
-    val ar: R.Result[bool, str] = lctx.add_alloca_slot(ctx, sk, total, elem_align);
+    val ar: R.Result[bool, str] = lctx.add_alloca_slot(ctx, sk, total, elem_align, inst.aux_ty::u32);
     if (R.is_err[bool, str](ar)) { ret ar; }
 
     # record the slot-key vreg under this alloca's instruction id so an
@@ -2277,6 +2277,13 @@ fun lower_vec_insert(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instru
 # float load addresses `[base]` rather than an unrelocated `[rip+sym]` that would
 # read the wrong address. An integer load keeps the symbol operand: its generic
 # encoding records the relocation directly.
+#
+# That is a FLAT-ADDRESSING repair and is gated on it (#2655). Under a logical
+# addressing model there is no `[rip+sym]` to leave unrelocated and no address to
+# materialize: a variable IS its pointer, at one pointee type, and rewriting the
+# operand to `[base + 0]` only destroys the direct reference the target reaches it
+# through. Applying it there made a scalar float interface variable unencodable in
+# either direction while an integer or vector one worked, from identical IR.
 # ---
 # ctx:  the per-function lowering context
 # mb:   the destination MIR block
@@ -2292,7 +2299,7 @@ fun lower_load(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction,
         ret R.err[bool, str]("mir.lower_ir: load defines no result vreg");
     }
     var mem: mir.MirOperand = lctx.mem_operand_of(ctx, inst.operands[0]);
-    if (mem.kind == mir.MIR_OP_SYM && lctx.value_is_float(ctx, inst.ty)) {
+    if (ctx.tgt.model.flat_addressing && mem.kind == mir.MIR_OP_SYM && lctx.value_is_float(ctx, inst.ty)) {
         var base: u32 = mir.MIR_VREG_NIL;
         val ar: R.Result[bool, str] = lctx.addr_to_vreg(ctx, mb, mem, ?base);
         if (R.is_err[bool, str](ar)) { ret R.err[bool, str](R.unwrap_err[bool, str](ar)); }
@@ -2355,9 +2362,10 @@ fun lower_store(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
     # destination MEM. a global symbol destination must therefore be LEA-materialized
     # into a GP base vreg first (so the store addresses `[base]`), mirroring the
     # float-load path; an integer store keeps the symbol destination and relocates
-    # through the generic encoding.
+    # through the generic encoding. gated on flat addressing for the same reason the
+    # load is (#2655).
     var dest: mir.MirOperand = lctx.mem_operand_of(ctx, inst.operands[1]);
-    if (dest.kind == mir.MIR_OP_SYM && lctx.value_is_float(ctx, inst.operands[0].ty)) {
+    if (ctx.tgt.model.flat_addressing && dest.kind == mir.MIR_OP_SYM && lctx.value_is_float(ctx, inst.operands[0].ty)) {
         var dbase: u32 = mir.MIR_VREG_NIL;
         val dr: R.Result[bool, str] = lctx.addr_to_vreg(ctx, mb, dest, ?dbase);
         if (R.is_err[bool, str](dr)) { ret R.err[bool, str](R.unwrap_err[bool, str](dr)); }
@@ -2449,6 +2457,25 @@ fun lower_memzero(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instructi
         ret R.err[bool, str]("mir.lower_ir: memzero is missing its pointee type");
     }
     val size: u32 = ir_type.byte_size(ctx.types, inst.aux_ty, ctx.tgt);
+
+    # a logical-addressing target keeps the whole-object form (#2669). The chunked
+    # store run below is a byte-space expansion: its stores are sized for the
+    # machine, not for the object, so an 8-byte chunk over a `f32x4` spans two lanes
+    # and there is no structural access that names it. Recovering the intent from
+    # such a run afterwards would mean pattern-matching the chunking strategy, which
+    # breaks silently on partial zeroing, an interleaved store, or a change of chunk
+    # widths - so the intent is kept rather than reconstructed.
+    if (!ctx.tgt.model.flat_addressing) {
+        val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
+        if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](r)); }
+        val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
+        ops[0] = agg_pointer_mem(ctx, inst.operands[0], 0);
+        ops[1] = mir.op_imm(size::i64);
+        var mi: mir.MirInstr = mir.instr(mir.MIR_MEMZERO, ops, 2,
+                                         ctx.tgt.model.gpr_width::u8, ctx.tgt.model.gpr_width::u8);
+        ret lctx.push_instr(ctx, mb, mi);
+    }
+
     var off: i64 = 0;
     for (off::u32 < size) {
         val remaining: u32 = size - off::u32;
@@ -2529,6 +2556,15 @@ fun lower_gep(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, 
         ret R.err[bool, str]("mir.lower_ir: gep with indices is missing its source pointee type");
     }
 
+    # a logical-addressing target reaches a member by ORDINAL, not by byte, so the
+    # walk is kept rather than folded (#2649). the fold below is a byte-space
+    # transformation and is not merely slower there, it is unrecoverable: an offset
+    # does not determine an ordinal, because unions overlap, a nested aggregate
+    # shares an offset with its first member, and padding belongs to no member.
+    if (!ctx.tgt.model.flat_addressing) {
+        ret lower_gep_structural(ctx, mb, inst, dst, base);
+    }
+
     # walk the indices, accumulating a constant displacement and at most one
     # scaled runtime index. a struct level needs a constant field ordinal.
     var disp:      i64 = 0;
@@ -2557,6 +2593,14 @@ fun lower_gep(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, 
             if (ct.kind == ir_type.IRT_ARRAY) {
                 stride = ir_type.byte_size(ctx.types, ct.data.array_.element, ctx.tgt)::u64;
                 cur_ty = ct.data.array_.element;
+            } or (ct.kind == ir_type.IRT_VECTOR) {
+                # a vector indexes by LANE, at the element's stride: its storage is
+                # exactly `lanes` elements end to end, the same walk an array of the
+                # element type takes. Vector storage is allocated at the vector's own
+                # type rather than reshaped to `[lanes]elem` (#2640), so this is the
+                # level a lane address descends through.
+                stride = ir_type.byte_size(ctx.types, ct.data.vector_.element, ctx.tgt)::u64;
+                cur_ty = ct.data.vector_.element;
             } or (ct.kind == ir_type.IRT_STRUCT || ct.kind == ir_type.IRT_UNION) {
                 is_struct = true;
             } or {
@@ -2609,6 +2653,57 @@ fun lower_gep(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, 
     ops[1] = R.unwrap_ok[mir.MirOperand, str](mem);
     # the GEP selects to a LEA computing a pointer-sized effective address.
     var mi: mir.MirInstr = mir.instr(mir.MIR_GEP, ops, 2,
+                                     ctx.tgt.model.gpr_width::u8, ctx.tgt.model.gpr_width::u8);
+    ret lctx.push_instr(ctx, mb, mi);
+}
+
+# lower an OP_GEP structurally, keeping its index list, for a logical-addressing
+# target (#2649)
+#
+# The flat form above folds the whole walk into `[base + index*scale + disp]`,
+# because on a byte-addressed machine that IS the address. Under a logical
+# addressing model a pointer names one object at one pointee type and a member is
+# reached by its ORDINAL, so the walk has to survive lowering: the emitter builds an
+# `OpAccessChain` from exactly these indices.
+#
+# THE OPERAND LAYOUT IS THE CONTRACT. A structural GEP is
+# `[dst, base, idx0, idx1, ...]` - `operand_count > 2` - where the indices are the
+# IR GEP's own index operands in order, unchanged and unscaled, following the
+# standard getelementptr model (index 0 strides over the source pointee type, each
+# later index descends one level). A flat GEP stays `[dst, mem]` at
+# `operand_count == 2`, so a consumer distinguishes the two by the count alone and
+# every machine target's lowering is bit-for-bit what it was.
+#
+# The source pointee type is NOT carried here. It is recoverable at the consumer
+# from what the base names - a global's declared type, or the `MirSlot.ty` of the
+# frame slot a local base's `MIR_ALLOCA` defines - and duplicating it into the
+# operand list would be a second source of truth for a fact the base already fixes.
+#
+# That was only half true when this was written: the global path held, but
+# `lower_alloca` measured `aux_ty` into a size and an align and then discarded the
+# id, so a local base fixed nothing (#2673). `MirSlot` carries the id now, which is
+# what makes the sentence above true of both kinds of base rather than one.
+# ---
+# ctx:  the per-function lowering context
+# mb:   the destination MIR block
+# inst: the IR OP_GEP instruction
+# dst:  the destination vreg
+# base: the lowered base operand
+# ret:  true on success, or a lowering / allocation error
+fun lower_gep_structural(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction,
+                         dst: u32, base: mir.MirOperand) R.Result[bool, str] {
+    val n: usize = (inst.operand_count + 1)::usize;
+    val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, n);
+    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](r)); }
+    val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
+    ops[0] = mir.op_vreg(dst);
+    ops[1] = base;
+    var k: u32 = 1;
+    for (k < inst.operand_count) {
+        ops[(k + 1)::usize] = lctx.lower_value(ctx, inst.operands[k]);
+        k = k + 1;
+    }
+    var mi: mir.MirInstr = mir.instr(mir.MIR_GEP, ops, inst.operand_count + 1,
                                      ctx.tgt.model.gpr_width::u8, ctx.tgt.model.gpr_width::u8);
     ret lctx.push_instr(ctx, mb, mi);
 }

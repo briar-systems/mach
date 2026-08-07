@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.12.0] - 2026-08-07
+
+**Contains a critical correctness fix. Anyone on 4.11.0 or earlier should upgrade.**
+
+### Fixed
+
+#### A bit reinterpret confused values with addresses, in both directions (#2670)
+`OP_BITCAST` did not distinguish an operand that *is* a value from one carried by its storage address. An aggregate's rvalue is its address; a scalar's or vector's is the value itself. So `:~` across that divide changed the type tag without changing the representation:
+
+- **`a:~i64` over a `[8]u8` evaluated to the array's own stack address.** It does not fault. It is a silent wrong answer that also places a stack address into ordinary integer data, readable and printable with no indication anything is wrong.
+- **`x:~[8]u8` produced an aggregate-typed value from a register**, which the store then dereferenced as a pointer. It faults only when the operand's bytes do not happen to form a mapped address, so the observable was "sometimes SIGSEGV, sometimes silent corruption".
+
+Both directions, every target, both profiles. **This predates the 4.9/4.10/4.11 series** — it reproduces on 4.7.1 — so there is no regression window to bisect.
+
+`lower_reinterpret` now materializes the crossing: a **load** when the source is an aggregate, an **alloca plus store** when the destination is. Within one class nothing is materialized, because aggregate-to-aggregate is a pointer retag and value-to-value is the genuine reinterpret the opcode means. The fix is at the producer, so the bad shape never enters the IR.
+
+A new always-on IR verifier invariant, `VC_BITCAST_CLASS`, refuses a bitcast whose operand and result sit on opposite sides of the divide. Always on rather than behind the `repr` gate, because this shape is individually coherent at both ends and wrong only in combination — what review misses and only an invariant catches.
+
+The documentation asserted the property that caused the bug: `mir.mach` said a `:~` was a plain `MIR_BITCAST` "in every direction", reasoning entirely about register banks, with no notion of an address-carried side. Corrected (#2679).
+
+- **The `:~` size check read every `rec` and `uni` as 0 bytes** (#2672), so no record reinterpret compiled at all while `$size_of` reported the correct size. That is why records were absent from #2670's evidence: unreachable rather than working. `::` was affected identically through the same call. Sequenced deliberately after #2670, since fixing it alone would have enabled records straight into the miscompile.
+- **An inline-asm `ldr`/`str` offset outside both aarch64 immediate forms clobbered IP0** (#2667), silently destroying a live value in an author's own asm body. A compiler-emitted access may borrow IP0 because it is reserved from allocation; an author-written one may not. Frame-size dependent, so invisible in small tests.
+- **Inline-asm `{name}` slots are now laid out nearest the frame pointer** (#2674). They are the one slot kind that cannot be legalized when the offset is out of range, and the reach is smaller than it looks: slots are below the frame pointer, aarch64's scaled `imm12` is unsigned-only, so the whole reach is the unscaled `imm9`'s -256. Thirty-three ordinary locals ahead of an asm block was enough.
+- **128-bit vectors reached codegen under `simd = "scalarize"`** (#2654), so nothing using `std` built for riscv64. The scalarizer had no case for a vector-to-vector `MIR_BITCAST`, which the signed-select idiom in `std` produces. mach-std's full suite now runs on riscv64, having never executed there.
+- **A manifest `symbols = [...]` claim keyed on the source spelling** while `#[library]` keyed on the link name (#2636), so on Mach-O the two occupied disjoint key spaces and a claim attributed nothing.
+- **A target-conditional `#[library]` bound to the arm the target does not take** (#2639).
+- **`#[library]` attributions were projected from every loaded module** (#2657) rather than the compiled set, which #2539 had made a live problem rather than a latent one.
+
+### Changed
+- **Float loads and stores no longer materialize the address unconditionally** (#2655), gated on a new `MachineModel.flat_addressing`. Native output byte-identical across three targets and both profiles.
+- **A structural GEP keeps its index list on a logical-addressing target** (#2649, enabling half), **`MirSlot` carries its allocated type** (#2673), and **`memzero` survives as a whole-object operation** (#2669). Three erasures where MIR discarded structure for a machine reason a logical-addressing target cannot reconstruct. Each proven not to change machine-target output: the entire compiler binary is byte-identical across two of them.
+- **The backend's unsupported-instruction refusal names the opcode, the function and a position** (#2656), the last instance of the complaint #2538 fixed for the IR verifier.
+
+### Added
+- **spirv**: cross-wired refusals corrected and `OpTypeArray` with `ArrayStride` (#2659), **storage buffers via `#[storage(set, binding)]`** (#2665). A uniform block is std140-shaped and a storage buffer std430-shaped, so the array shapes a uniform must refuse are exactly the ones a storage buffer accepts. Refused rather than repacked, because every offset comes from the compiler's own layout so a host writing by `$offset_of` sees what the shader reads.
+- **A vector is allocated at its own type** (#2640, first stage), which also fixed a real **under-alignment on every target**: `types.md` declares a vector's `$align_of` to be 16 and an `[4]f32` slot is 4-byte aligned.
+
 ## [4.11.0] - 2026-08-07
 
 Closes out the import-attribution work, makes `mach build` and `mach test` agree about whether a project compiles, and stops the linker emitting debug info it has invalidated.
