@@ -42,6 +42,31 @@ pub fun add_via_asm(a: i64, b: i64) i64 {
 }
 ```
 
+### A body that binds `{name}` may not move the stack pointer
+
+A `{name}` becomes a fixed displacement off a base register, measured once when the
+block is assembled. On aarch64 and riscv64 that base is the **stack pointer**, because
+it is the only one whose displacement stays inside those ISAs' immediate forms however
+deep the enclosing frame is. A statement that moves the stack pointer therefore moves
+every `{name}` in the block out from under its own address, and the compiler refuses the
+block rather than assembling a wrong one:
+
+```mach
+var x: i64 = 0;
+asm aarch64 {
+    ldr x9, {x}
+    stp x1, x2, [sp, -16]!   # refused: this body binds {x}
+}
+```
+
+The refusal covers the whole block, not the statements after the write, because a
+backward branch reaches an earlier `{name}` again with the pointer already moved. Push
+and pop around the block instead, or drop the `{name}` and stage the address into a
+register yourself.
+
+A body that binds no `{name}` is unaffected and may do whatever it likes with the stack
+pointer, which is what a `#[naked]` function's hand-written prologue does.
+
 ## Calls and jumps (x86-64)
 
 `call` and `jmp` take the same three shapes, and which one a statement means is
