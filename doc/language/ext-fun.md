@@ -85,6 +85,16 @@ The fixed parameters always follow the target's ordinary calling convention. The
 A tail argument keeps its *form* on every target: a record too large to pass by
 value is still passed by reference, and only the hidden pointer's location moves.
 
+The *fixed* parameters diverge on Apple arm64 too, on a separate axis: a fixed
+argument that lands on the stack there takes its **natural size and alignment**,
+where AAPCS64 rounds every stack argument up to an 8-byte slot. Past the eight GP
+registers, `(…, int i, short j, long long k)` occupies `[sp+0]`, `[sp+4]`, `[sp+8]`
+on `darwin-aarch64` and `[sp+0]`, `[sp+8]`, `[sp+16]` on `linux-arm64`. Mach applies
+each target's own rule, so nothing in a declaration has to say which one is in force.
+Note only that Apple's two rules genuinely differ from each other: the variadic tail
+in the table above keeps its 8-byte minimum on the very target where a fixed argument
+does not.
+
 Apple arm64 is the reason this form exists. The obvious workaround — declaring the
 call at its fixed arity, `ext fun open(path: *u8, flags: i32, mode: u32) i32` —
 works on Linux and on x86-64 and is **silently wrong** there: the fixed-arity
@@ -147,6 +157,14 @@ ext fun WSAStartup(ver: u16, data: *u8) i32;
   manifest instead, by the `symbols` key on the `[link.X]` entry that supplies
   it; see [manifest.md](../manifest.md#linkname--link-requirements). The two
   declarations write the same attribution, so a symbol may be claimed only once.
+- "Only once" is checked across every declaration, and two `#[library]`
+  decorators are no exception. Two `ext` declarations that resolve to the same
+  link name but name different libraries are a hard error identifying both
+  (`import '<sym>' is attributed to library '<a>' by declaration '<d>' in module
+  '<m>' and to library '<b>' by declaration ...`), so which library the import
+  table names never depends on module load order. Two declarations naming the
+  *same* library are accepted: they name one provider, which is what a shared
+  binding declared in two modules does.
 
 `library` composes with `symbol`: the rename sets the imported symbol's name,
 `library` sets the dependency it is imported from. On one decl the import is emitted

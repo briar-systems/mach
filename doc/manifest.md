@@ -667,6 +667,23 @@ If a selection is well-formed but enumerates nothing — a `--target` no artifac
 lists — the build fails naming that target and the declared artifacts, rather than
 succeeding with an empty plan.
 
+### A named artifact can settle the target
+
+`--bin <name>` / `--lib <name>` with no `--target` lets the artifact decide, since
+its `targets` list may already leave only one answer:
+
+- exactly one declared target: that target is used, and `--target` would only
+  repeat what the manifest already said
+- several, one of which matches the host: the host target, as before
+- several, none matching the host: refused, naming the targets the artifact does
+  declare so the choice is visible without opening `mach.toml`
+
+An explicit `--target` always wins, including when it names a target the artifact
+does not list — that pair is still refused by name. This only applies to a named
+artifact: enumerating the artifact axis keeps the target fixed for the whole
+matrix, so a bare `mach build <path>` never widens into a target it was not asked
+for.
+
 ### `-o` names one output
 
 `-o` is accepted exactly when the selection resolves to a single build cell, and

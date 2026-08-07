@@ -12,6 +12,16 @@
 #                 execution cannot observe (PE ASLR bit, macho PIE bit). dispatched
 #                 on the artifact's own magic, so it is independent of how the case
 #                 maps to a leg. no LLVM; reads little-endian fields (every runner is LE).
+#   macho-framing— walk a Mach-O executable's load commands and report how the image
+#                 is framed: the __PAGEZERO span, __TEXT's base, and the section
+#                 commands on every segment, plus which entry command it carries.
+#                 the static and dyld-loaded layouts must agree on all of it except
+#                 the entry command (#2599). no LLVM; od/dd reads only.
+#   macho-sections— assert a linked darwin image kept its inputs' (segment, section)
+#                 names, the identity a name-based runtime scan needs: __objc_classlist
+#                 concatenated contiguously from two objects, __objc_imageinfo's flags
+#                 intact, and a rebased __mod_init_func entry (#2606). on a darwin
+#                 runner it also RUNS the image, the only way to see the initializer fire.
 #   macho-signed— structurally resolve the three x86_64 immediate-store displacements
 #                 and compare them with independent initialized-data markers, proving
 #                 SIGNED_1/_2/_4 each linked to its exact target without a mac runner.
@@ -114,20 +124,114 @@ qemu_bin() {
     esac
 }
 
+# is_signal_exit <status> — true when a wait status is a signal death rather than a
+# deliberate return. a signal death is 128 + N with N in 1..64 (POSIX real-time
+# signals cap there). the two are completely different defects - a process that
+# faulted versus one that ran to completion and returned nonzero because it computed
+# a wrong value - so nothing that reports a failed run may collapse them (#2593,
+# #2369).
+is_signal_exit() {
+    [ "$1" -ge 129 ] && [ "$1" -le 192 ]
+}
+
+# describe_exit <status> — a nonzero wait status as a diagnostic phrase, naming a
+# signal death separately from a deliberate return. for the golden-observable form
+# of the same distinction see produce_panic_exit, whose `exit=signal(N)` token this
+# deliberately does not share: that one is diffed text, this one is prose for a
+# human reading a failure.
+describe_exit() {
+    if is_signal_exit "$1"; then
+        echo "died on signal $(($1 - 128)) (exit $1)"
+    else
+        echo "returned $1"
+    fi
+}
+
+# run_captured <runmode> <target> <binary> <stdout-file> [<stderr-file>]
+# run a built binary, writing its stdout to <stdout-file> and its exit status to
+# `run_status`. with a fifth argument stderr goes to that file, otherwise it is
+# merged into <stdout-file>. `run_out` is the stdout as a string, for producers that
+# compare it; a producer forwarding stdout as its observable must cat the file
+# instead, since `$(...)` strips trailing newlines the golden may carry.
+# always returns 0 unless the run could not be attempted: classifying the status is
+# the caller's job, and every executed case has to be able to see it.
+#
+# captured to a file rather than through `$(...)` so the status read sits on the line
+# directly after the command, the shape that survives this harness's `set -e` (see
+# produce_panic_exit). `$(...)` cannot carry the status either: after
+# `if ! v=$(cmd)`, `$?` inside the branch is the negation's 0, not the command's.
+run_captured() {
+    if [ "$1" = "qemu" ]; then
+        _rc_interp=$(qemu_bin "$2") || return 1
+        if [ $# -ge 5 ]; then
+            "$_rc_interp" "$3" >"$4" 2>"$5"
+        else
+            "$_rc_interp" "$3" >"$4" 2>&1
+        fi
+    else
+        if [ $# -ge 5 ]; then
+            "$3" >"$4" 2>"$5"
+        else
+            "$3" >"$4" 2>&1
+        fi
+    fi
+    run_status=$?
+    run_out=$(cat "$4")
+    return 0
+}
+
+# report_run_failure <label> <status> <output>
+# report a failed execution of a built binary: what the status actually was, and
+# everything the program printed before it stopped. the output is the evidence -
+# #2586 was a program that printed four correct values and one wrong one, and the
+# harness discarded the line naming the defect and said "execution failed" (#2593).
+report_run_failure() {
+    echo "int: $1: $(describe_exit "$2")" >&2
+    if [ -n "$3" ]; then
+        printf '%s\n' "$3" | sed 's/^/    /' >&2
+    else
+        echo "    (the program printed nothing)" >&2
+    fi
+}
+
+# diff_expected_actual <expected> <actual>
+# report a runtime contract mismatch as a diff. a producer that compares a program's
+# output against a fixed contract must show WHICH line disagreed: #2586 was one wrong
+# value among five correct ones, and naming it is the whole diagnosis (#2593).
+diff_expected_actual() {
+    _de=$(mktemp)
+    _da=$(mktemp)
+    printf '%s\n' "$1" >"$_de"
+    printf '%s\n' "$2" >"$_da"
+    diff -u --label expected --label actual "$_de" "$_da" | sed 's/^/    /' >&2
+    rm -f "$_de" "$_da"
+}
+
 # produce_exec <runmode> <target> <binary>
 # runs the built binary and forwards its stdout as the observable. native mode runs
 # it directly; qemu mode runs it under the matching qemu-user (qemu_bin). the
 # producer's exit status is the program's, so a crash (nonzero) fails the case.
+#
+# on failure run.sh discards this producer's stdout and shows only its stderr, so a
+# failing run reports the status and the program's own stdout there instead - without
+# it a crashed exec case says only "producer exit 139" and throws away how far the
+# program got (#2593).
 produce_exec() {
     runmode=$1
     target=$2
     bin=$3
-    if [ "$runmode" = "qemu" ]; then
-        interp=$(qemu_bin "$target") || return 1
-        "$interp" "$bin"
-    else
-        "$bin"
+    out=$(mktemp)
+    err=$(mktemp)
+    run_captured "$runmode" "$target" "$bin" "$out" "$err" || { rm -f "$out" "$err"; return 1; }
+    if [ "$run_status" -ne 0 ]; then
+        report_run_failure "exec" "$run_status" "$run_out"
+        [ -s "$err" ] && sed 's/^/    /' "$err" >&2
+        rm -f "$out" "$err"
+        return "$run_status"
     fi
+    cat "$err" >&2
+    cat "$out"
+    rm -f "$out" "$err"
 }
 
 # produce_relro_fault <runmode> <target> <binary>
@@ -137,21 +241,25 @@ produce_exec() {
 # both natively and under qemu-user; any other status means the region stayed writable.
 # the program's own stdout is discarded - the observable is purely the fault fact - so
 # this is a runtime (exec-like) producer sharing one target-independent golden.
+#
+# on the expected fault the program's output is noise and stays out of the way. on any
+# other status it is evidence - how far the program got before the write that should
+# have faulted did not - so it is reported to stderr, leaving the observable the golden
+# pins byte-identical (#2593).
 produce_relro_fault() {
     runmode=$1
     target=$2
     bin=$3
-    if [ "$runmode" = "qemu" ]; then
-        interp=$(qemu_bin "$target") || return 1
-        "$interp" "$bin" >/dev/null 2>&1
-    else
-        "$bin" >/dev/null 2>&1
-    fi
-    ec=$?
+    out=$(mktemp)
+    run_captured "$runmode" "$target" "$bin" "$out" || { rm -f "$out"; return 1; }
+    ec=$run_status
+    rm -f "$out"
     if [ "$ec" -eq 139 ]; then
         echo "relro_write=faulted"
     else
         echo "relro_write=exit$ec"
+        report_run_failure "relro-fault: expected the RELRO write to fault, but the program" \
+            "$ec" "$run_out"
     fi
 }
 
@@ -175,16 +283,11 @@ produce_panic_exit() {
     target=$2
     bin=$3
     out=$(mktemp)
-    if [ "$runmode" = "qemu" ]; then
-        interp=$(qemu_bin "$target") || { rm -f "$out"; return 1; }
-        "$interp" "$bin" >"$out" 2>&1
-    else
-        "$bin" >"$out" 2>&1
-    fi
-    ec=$?
+    run_captured "$runmode" "$target" "$bin" "$out" || { rm -f "$out"; return 1; }
+    ec=$run_status
     cat "$out"
     rm -f "$out"
-    if [ "$ec" -ge 129 ] && [ "$ec" -le 192 ]; then
+    if is_signal_exit "$ec"; then
         echo "exit=signal($((ec - 128)))"
     else
         echo "exit=$ec"
@@ -219,8 +322,8 @@ field_macho() {
 
 # macho_segment_fields <file> <segname> — print a segment's
 # "vmaddr vmsize fileoff filesize" tuple from LC_SEGMENT_64, or fail when absent.
-# The executable writer emits section-header-less load segments, so the load
-# commands are the independent file-offset-to-VA map structural checks must use.
+# The load commands are the independent file-offset-to-VA map structural checks
+# must use; a section command's own offsets are derived from them.
 macho_segment_fields() {
     bin=$1
     want=$2
@@ -247,6 +350,207 @@ macho_segment_fields() {
     done
     echo "int: macho: segment '$want' not found" >&2
     return 2
+}
+
+# produce_macho_framing <runmode> <target> <binary>
+# Walk a Mach-O executable's load commands and report how the image is FRAMED: the
+# __PAGEZERO span, __TEXT's base, whether __PAGEZERO ends exactly where __TEXT
+# begins, then one line per LC_SEGMENT_64 naming its section commands, and finally
+# which entry command the image carries.
+#
+# The framing is what a static (LC_UNIXTHREAD) and a dyld-loaded (LC_MAIN) image
+# must have IN COMMON - the entry command is the only line that may differ between
+# the two goldens (#2599, where the non-PIE image was based a page below
+# DARWIN_BASE_ADDR, carried a __PAGEZERO one page short of 4 GiB, and emitted no
+# section commands at all, leaving `llvm-objdump -d` with nothing to disassemble).
+# Addresses other than the base are deliberately left out: they move with the
+# program's size, and the fact under test is the framing, not the layout.
+produce_macho_framing() {
+    bin=$3
+    magic=$(read_le_uint "$bin" 0 4)
+    [ "$magic" = "4277009103" ] || { echo "int: macho-framing: not a 64-bit mach-o (magic $magic)" >&2; return 2; }
+    ncmds=$(read_le_uint "$bin" 16 4)
+
+    pagezero_size=
+    text_vmaddr=
+    entry=none
+    segs=$(mktemp)
+    off=32
+    i=0
+    while [ "$i" -lt "$ncmds" ]; do
+        cmd=$(read_le_uint "$bin" "$off" 4)
+        cmdsize=$(read_le_uint "$bin" $((off + 4)) 4)
+        case "$cmd" in
+            25)   # LC_SEGMENT_64
+                name=$(dd if="$bin" bs=1 skip=$((off + 8)) count=16 2>/dev/null | tr '\0' '\n' | head -n 1)
+                vmaddr=$(read_le_uint "$bin" $((off + 24)) 8)
+                vmsize=$(read_le_uint "$bin" $((off + 32)) 8)
+                nsects=$(read_le_uint "$bin" $((off + 64)) 4)
+                [ "$name" = "__PAGEZERO" ] && pagezero_size=$vmsize
+                [ "$name" = "__TEXT" ] && text_vmaddr=$vmaddr
+                sects=
+                k=0
+                while [ "$k" -lt "$nsects" ]; do
+                    sh=$((off + 72 + k * 80))
+                    sname=$(dd if="$bin" bs=1 skip="$sh" count=16 2>/dev/null | tr '\0' '\n' | head -n 1)
+                    if [ -z "$sects" ]; then sects=$sname; else sects="$sects,$sname"; fi
+                    k=$((k + 1))
+                done
+                [ -n "$sects" ] || sects=-
+                printf 'seg %s nsects=%s sects=%s\n' "$name" "$nsects" "$sects" >>"$segs"
+                ;;
+            5)          entry=LC_UNIXTHREAD ;;   # LC_UNIXTHREAD
+            2147483688) entry=LC_MAIN ;;         # LC_MAIN (0x80000028)
+        esac
+        [ "$cmdsize" -ge 8 ] || { rm -f "$segs"; echo "int: macho-framing: zero-size load command" >&2; return 2; }
+        off=$((off + cmdsize))
+        i=$((i + 1))
+    done
+
+    [ -n "$pagezero_size" ] || { rm -f "$segs"; echo "int: macho-framing: no __PAGEZERO" >&2; return 2; }
+    [ -n "$text_vmaddr" ]   || { rm -f "$segs"; echo "int: macho-framing: no __TEXT" >&2; return 2; }
+
+    printf 'pagezero_vmsize=0x%x\n' "$pagezero_size"
+    printf 'text_vmaddr=0x%x\n' "$text_vmaddr"
+    printf 'pagezero_abuts_text=%s\n' "$(( pagezero_size == text_vmaddr ))"
+    cat "$segs"
+    rm -f "$segs"
+    printf 'entry=%s\n' "$entry"
+}
+
+# macho_section_fields <file> <segname> <sectname> — print a section's
+# "addr size fileoff align" tuple from its section_64 entry, or fail when absent.
+macho_section_fields() {
+    bin=$1
+    want_seg=$2
+    want_sect=$3
+    ncmds=$(read_le_uint "$bin" 16 4)
+    off=32
+    i=0
+    while [ "$i" -lt "$ncmds" ]; do
+        cmd=$(read_le_uint "$bin" "$off" 4)
+        cmdsize=$(read_le_uint "$bin" $((off + 4)) 4)
+        if [ "$cmd" -eq 25 ]; then
+            segname=$(dd if="$bin" bs=1 skip=$((off + 8)) count=16 2>/dev/null | tr '\0' '\n' | head -n 1)
+            nsects=$(read_le_uint "$bin" $((off + 64)) 4)
+            k=0
+            while [ "$k" -lt "$nsects" ]; do
+                sh=$((off + 72 + k * 80))
+                sectname=$(dd if="$bin" bs=1 skip="$sh" count=16 2>/dev/null | tr '\0' '\n' | head -n 1)
+                if [ "$segname" = "$want_seg" ] && [ "$sectname" = "$want_sect" ]; then
+                    printf '%s %s %s %s\n' \
+                        "$(read_le_uint "$bin" $((sh + 32)) 8)" \
+                        "$(read_le_uint "$bin" $((sh + 40)) 8)" \
+                        "$(read_le_uint "$bin" $((sh + 48)) 4)" \
+                        "$(read_le_uint "$bin" $((sh + 52)) 4)"
+                    return 0
+                fi
+                k=$((k + 1))
+            done
+        fi
+        [ "$cmdsize" -ge 8 ] || return 2
+        off=$((off + cmdsize))
+        i=$((i + 1))
+    done
+    echo "int: macho: section '$want_seg,$want_sect' not found" >&2
+    return 2
+}
+
+# produce_macho_sections <runmode> <target> <binary>
+# Assert that a linked darwin image kept the (segment, section) identity of its
+# inputs, which is what a name-based runtime scan needs: libobjc walks
+# __DATA,__objc_classlist and reads __DATA,__objc_imageinfo, and dyld calls every
+# pointer in __DATA,__mod_init_func (#2606). Merging inputs by KIND alone drops the
+# names and the sections do not exist in the output at all, even though their bytes
+# are still mapped somewhere inside __data.
+#
+# Presence is not enough, so this also reads the bytes back. Two clang objects each
+# contribute one __objc_classlist pointer, and the section must be ONE contiguous
+# 16-byte pointer-aligned run holding both markers in link order - not two sections
+# sharing a name, which is what a per-input section would produce and what libobjc's
+# single-array walk cannot read.
+#
+# On a darwin runner the same image is executed, which is the only way to see
+# whether dyld actually CALLED the __mod_init_func entry: unlike a missing objc
+# section, a dropped initializer fails silently and the program runs on regardless.
+produce_macho_sections() {
+    target=$2
+    bin=$3
+
+    fields=$(macho_section_fields "$bin" __DATA __objc_classlist) || return 2
+    set -- $fields
+    cl_size=$2; cl_off=$3; cl_align=$4
+    [ "$cl_size" -eq 16 ] || {
+        echo "int: macho-sections: __objc_classlist is $cl_size bytes, expected the two inputs concatenated into 16" >&2
+        return 1
+    }
+    [ "$cl_align" -ge 3 ] || {
+        echo "int: macho-sections: __objc_classlist is 2^$cl_align aligned, expected at least pointer alignment" >&2
+        return 1
+    }
+    [ $((cl_off % 8)) -eq 0 ] || {
+        echo "int: macho-sections: __objc_classlist lands at file offset $cl_off, not pointer-aligned" >&2
+        return 1
+    }
+    marker_a=$(read_le_uint "$bin" "$cl_off" 8)
+    marker_b=$(read_le_uint "$bin" $((cl_off + 8)) 8)
+    [ "$marker_a" -eq 9734 ] && [ "$marker_b" -eq 9739 ] || {
+        echo "int: macho-sections: __objc_classlist holds $marker_a,$marker_b; expected the probe-a then probe-b markers 9734,9739" >&2
+        return 1
+    }
+
+    fields=$(macho_section_fields "$bin" __DATA __objc_imageinfo) || return 2
+    set -- $fields
+    ii_size=$2; ii_off=$3
+    [ "$ii_size" -eq 8 ] || {
+        echo "int: macho-sections: __objc_imageinfo is $ii_size bytes, expected 8" >&2
+        return 1
+    }
+    ii_version=$(read_le_uint "$bin" "$ii_off" 4)
+    ii_flags=$(read_le_uint "$bin" $((ii_off + 4)) 4)
+    [ "$ii_version" -eq 0 ] && [ "$ii_flags" -eq 64 ] || {
+        echo "int: macho-sections: __objc_imageinfo holds version=$ii_version flags=$ii_flags; libobjc validates these and the input set 0/64" >&2
+        return 1
+    }
+
+    fields=$(macho_section_fields "$bin" __DATA __mod_init_func) || return 2
+    set -- $fields
+    mi_addr=$1; mi_size=$2; mi_align=$4
+    [ "$mi_size" -eq 8 ] || {
+        echo "int: macho-sections: __mod_init_func is $mi_size bytes, expected one 8-byte entry" >&2
+        return 1
+    }
+    [ "$mi_align" -ge 3 ] || {
+        echo "int: macho-sections: __mod_init_func is 2^$mi_align aligned, expected at least pointer alignment" >&2
+        return 1
+    }
+    # the entry is an in-image pointer, so a PIE must slide it: without a rebase row
+    # dyld would call whatever the unslid address happens to land on.
+    mi_hex=$(printf '0x%X' "$mi_addr")
+    rebases=$(macho_objdump --macho --rebase "$bin") || return 2
+    [ "$(printf '%s\n' "$rebases" | grep -F -c "$mi_hex")" -eq 1 ] || {
+        echo "int: macho-sections: __mod_init_func has no rebase row at $mi_hex" >&2
+        return 1
+    }
+
+    if [ "$target" = darwin-x86_64 ]; then
+        out=$(mktemp)
+        run_captured native "$target" "$bin" "$out" || { rm -f "$out"; return 1; }
+        rm -f "$out"
+        if [ "$run_status" -ne 0 ]; then
+            report_run_failure "macho-sections: the native PIE" "$run_status" "$run_out"
+            return 1
+        fi
+        [ "$run_out" = "init ok" ] || {
+            echo "int: macho-sections: dyld did not run the __mod_init_func entry" >&2
+            diff_expected_actual "init ok" "$run_out"
+            return 1
+        }
+    fi
+
+    echo "objc_classlist=concatenated-16-pointer-aligned"
+    echo "objc_imageinfo=version0-flags64"
+    echo "mod_init_func=present-rebased"
 }
 
 # produce_macho_signed <runmode> <target> <binary>
@@ -474,16 +778,19 @@ produce_macho_got() {
     }
 
     if [ "$target" = darwin-x86_64 ]; then
-        runtime=$("$bin") || {
-            echo "int: macho-got: native PIE execution failed" >&2
-            return 1
-        }
+        out=$(mktemp)
+        run_captured native "$target" "$bin" "$out" || { rm -f "$out"; return 1; }
+        rm -f "$out"
         expected=$(printf '%s\n' \
             'local-load=40' 'local-got=40' 'local-got64=40' \
             'import-load=1' 'import-got=1')
-        [ "$runtime" = "$expected" ] || {
-            echo "int: macho-got: native PIE output was not exact" >&2
-            printf '%s\n' "$runtime" >&2
+        if [ "$run_status" -ne 0 ]; then
+            report_run_failure "macho-got: the native PIE" "$run_status" "$run_out"
+            return 1
+        fi
+        [ "$run_out" = "$expected" ] || {
+            echo "int: macho-got: the native PIE ran to completion but computed wrong values" >&2
+            diff_expected_actual "$expected" "$run_out"
             return 1
         }
     fi
@@ -546,13 +853,16 @@ produce_macho_abs_bind() {
     check_slot ___stderrp || return 1
 
     if [ "$target" = darwin-x86_64 ]; then
-        runtime=$("$bin") || {
-            echo "int: macho-abs-bind: native PIE execution failed" >&2
+        out=$(mktemp)
+        run_captured native "$target" "$bin" "$out" || { rm -f "$out"; return 1; }
+        rm -f "$out"
+        if [ "$run_status" -ne 0 ]; then
+            report_run_failure "macho-abs-bind: the native PIE" "$run_status" "$run_out"
             return 1
-        }
-        [ "$runtime" = "abs-bind=1" ] || {
-            echo "int: macho-abs-bind: native PIE output was not exact" >&2
-            printf '%s\n' "$runtime" >&2
+        fi
+        [ "$run_out" = "abs-bind=1" ] || {
+            echo "int: macho-abs-bind: the native PIE ran to completion but computed wrong values" >&2
+            diff_expected_actual "abs-bind=1" "$run_out"
             return 1
         }
     fi
@@ -1349,12 +1659,14 @@ elf_seg_identical() {
 # produce_debuginfo <runmode> <target> <nog_binary> <g_binary>
 # the binary-inspection producer for the debuginfo case kind (#2039): asserts, purely
 # host-side over the artifacts run.sh built with and without `-g`, that (1) the
-# standard structural validator accepts the whole `-g` image, (2) `-g` is loadable-
-# byte additive, and (3) duplicate generic, comptime-value, and pack instances retain
+# standard structural validator accepts the whole `-g` image, (1b) a real consumer
+# (addr2line, i.e. libbfd) decodes the line table without a diagnostic and resolves the
+# entry point to a name, (2) `-g` is loadable-byte additive, and (3) duplicate generic,
+# comptime-value, and pack instances retain
 # one live, symbolizable DIE while each discarded copy carries DWARF's dead-code address,
 # has no line-table sequence at the winner, and has no location list at the winner.
 # the facts are ISA-independent, so the golden is shared. requires llvm-dwarfdump,
-# llvm-symbolizer, and readelf on the leg; a missing validator is a hard error.
+# llvm-symbolizer, readelf, and addr2line on the leg; a missing tool is a hard error.
 produce_debuginfo() {
     nog=$3
     g=$4
@@ -1367,11 +1679,36 @@ produce_debuginfo() {
     command -v readelf >/dev/null 2>&1 || {
         echo "int: debuginfo: readelf not found (install 'binutils')" >&2; return 2
     }
+    command -v addr2line >/dev/null 2>&1 || {
+        echo "int: debuginfo: addr2line not found (install 'binutils')" >&2; return 2
+    }
 
     if "$dd_tool" --verify "$g" >/dev/null 2>&1; then
         echo "dwarfdump_verify=clean"
     else
         echo "dwarfdump_verify=errors"
+    fi
+
+    # CONSUMER-SIDE DECODE (#2582). --verify above checks structural and reference
+    # integrity; it does NOT check that the line program decodes against the file table
+    # the way a consumer reads it, so it accepted a .debug_line that binutils rejected
+    # outright ("mangled line number section (bad file number)") on every CU. addr2line
+    # is the cheapest standard consumer of that decode - the same libbfd path perf, gdb,
+    # and most crash symbolizers reach - so its stderr is the observable, verbatim when
+    # non-empty so a regression names itself in the diff rather than reading `errors`.
+    # the entry point is the address because every leg's image has one at a known place.
+    entry=$(readelf -hW "$g" 2>/dev/null | awk '/Entry point address:/{print $NF}')
+    a2l_err=$(addr2line -f -e "$g" "$entry" 2>&1 >/dev/null | sed -n '1p')
+    a2l_fn=$(addr2line -f -e "$g" "$entry" 2>/dev/null | sed -n '1p')
+    if [ -n "$a2l_err" ]; then
+        echo "addr2line_stderr=$a2l_err"
+    else
+        echo "addr2line_stderr=clean"
+    fi
+    if [ -n "$a2l_fn" ] && [ "$a2l_fn" != "??" ]; then
+        echo "addr2line_entry=resolved"
+    else
+        echo "addr2line_entry=unresolved"
     fi
 
     if elf_seg_identical "$g" "$nog"; then
@@ -1752,6 +2089,8 @@ produce() {
         field)       produce_field "$@" ;;
         macho-signed) produce_macho_signed "$@" ;;
         macho-got)   produce_macho_got "$@" ;;
+        macho-framing) produce_macho_framing "$@" ;;
+        macho-sections) produce_macho_sections "$@" ;;
         macho-abs-bind) produce_macho_abs_bind "$@" ;;
         pe-imports)  produce_pe_imports "$@" ;;
         pe-exceptions) produce_pe_exceptions "$@" ;;
