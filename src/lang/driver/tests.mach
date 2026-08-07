@@ -11883,6 +11883,21 @@ test "mach.lang.driver:oblivious_asm_validated_not_refused" {
     if (ut_codegen_target_ok("#[oblivious]\nfun ll(p: *i64) i64 { var v: i64 = 0; asm aarch64 { ldr x12, {p}\n ldaxr x9, [x12]\n stlxr w10, x9, [x12]\n cbnz w10, 1f\n1:\n nop } ret v; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux-arm64") != 0) { bad = 1; }
     if (ut_codegen_target_ok("#[oblivious]\nfun f(x: ^u64) ^u64 { var r: ^u64 = x; asm riscv64 { nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux-riscv64") != 0) { bad = 1; }
 
+    # THE LIFT (#2460). A compare-and-branch over PUBLIC data is now accepted on
+    # x86-64. Before the flags model this was refused outright, whether or not the
+    # block carried a secret, because the walk could not tell the two apart.
+    if (ut_codegen_target_ok("#[oblivious]\nfun f(x: ^u64) ^u64 { var r: ^u64 = x; asm x86_64 { cmp rax, rbx\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux") != 0) { bad = 1; }
+
+    # and a secret compare followed by a DEFINING public compare is accepted too:
+    # `cmp` overwrites every flag this grammar can read, so the second one leaves
+    # nothing of the first behind. This is the case that distinguishes a real model
+    # from a blanket "any secret anywhere in the block poisons it" rule.
+    if (ut_codegen_target_ok("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r}\n cmp rax, 1\n cmp rbx, rcx\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux") != 0) { bad = 1; }
+
+    # a `setcc` over PUBLIC flags is not a laundering path, so its destination stays
+    # public and may index memory. The refusal twin of this is in the leaks test.
+    if (ut_codegen_target_ok("#[oblivious]\nfun f(x: ^u64) ^u64 { var r: ^u64 = x; asm x86_64 { cmp rax, rbx\n setb bl\n mov rcx, [rbx] } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux") != 0) { bad = 1; }
+
     ret bad;
 }
 
@@ -11893,13 +11908,59 @@ test "mach.lang.driver:oblivious_asm_leaks_refused" {
     var bad: i32 = 0;
 
     # THE NIGHTMARE CASE. `cmp {secret}, rbx ; je` conditions the branch on FLAGS,
-    # which the inline-asm effect model does not represent - so a register-only walk
-    # would pass it as leak-free. Refused on x86-64 whether or not a secret is
-    # present, and the message says why and where the lift is tracked.
+    # which a register-only walk would pass as leak-free. Still refused, but since
+    # #2460 it is refused because the SECRET reached FLAGS rather than because the
+    # model could not see FLAGS at all: the `cmp` reads a secret binding and taints
+    # them, and the `je` consumes that taint.
     if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { cmp {r}, rbx\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
         "linux", "its condition rides the flags register") != 0) { bad = 1; }
     if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { cmp {r}, rbx\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
-        "linux", "#2460") != 0) { bad = 1; }
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+
+    # THE UNSOUND DIRECTION (#2460). `inc` writes ZF but NOT CF, so it must not be
+    # taken to have refreshed FLAGS: a `jc` after it reads a CF still derived from
+    # the secret `cmp`. This is the case a two-fact "writes flags therefore clears"
+    # model accepts, and it is the reason `defines_flags` exists as a separate fact.
+    # It fails the moment `inc` is given `defines_flags`.
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { cmp {r}, rbx\n inc rax\n jc 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    # the same for a shift, which writes nothing at all at count 0
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { cmp {r}, rbx\n shl rax, 1\n jc 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+
+    # EACH PARTIAL WRITER TAINTS ON ITS OWN SECRET OPERAND. `inc` / `dec` and the
+    # three shifts may write an observable flag, so a secret passing through one
+    # makes FLAGS secret-derived even though none of them DEFINES every flag.
+    #
+    # All five are spelled out rather than one standing for the family: the mutation
+    # sweep showed that testing `inc` and `shl` alone left `dec`, `shr` and `sar`
+    # with no behavioural coverage, so their `writes_flags` could be deleted with the
+    # suite still green - a fact nothing depends on, which is indistinguishable from
+    # a fact that is wrong.
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r}\n inc rax\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r}\n dec rax\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r}\n shl rax, 1\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r}\n shr rax, 1\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r}\n sar rax, 1\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+
+    # AN UNMODELED FLAG SOURCE taints unconditionally: `popfq` loads FLAGS from the
+    # stack, which the model does not represent, so a `je` after it is refused even
+    # though nothing in the block reads a secret binding. These rows carry NO
+    # operands, so an operand-conditioned taint rule could never fire for them.
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { popfq\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+
+    # A SECRET LAUNDERED OUT OF FLAGS. `setb` consumes CF into a register, so that
+    # register is secret-derived; indexing memory with it leaks through the cache.
+    # Without `reads_flags` the model knows FLAGS is tainted and still calls `bl`
+    # public, which is a silent pass of exactly the kind this issue exists to close.
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r}\n cmp rax, 1\n setb bl\n mov rcx, [rbx] } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "addresses memory with a secret value") != 0) { bad = 1; }
 
     # a data directive's payload can encode ANY instruction, including a secret-
     # dependent branch. there is nothing to analyze, so it is refused on KIND -
@@ -12846,3 +12907,175 @@ test "mach.lang.driver:comptime_arm_does_not_mask_cross_module_conflict" {
     ret bad;
 }
 
+
+# A TAINT SURVIVES EVERY ROW THAT DOES NOT DEFINE EVERY OBSERVABLE FLAG
+#
+# One case per grammar row, generated from the row list rather than written for
+# the interesting few. The mutation sweep is why: testing `inc` and `shl` and
+# letting them stand for the family left `dec`, `shr` and `sar` with no
+# behavioural coverage at all, so their facts could be deleted with the suite
+# still green - and a fact nothing depends on is indistinguishable from a fact
+# that is wrong.
+#
+# Each block taints FLAGS with a secret `cmp`, executes ONE row with entirely
+# public operands, and then reads CF. The row must not have cleared the taint, so
+# the read is refused. Give any of these rows `defines_flags` and its case fails.
+test "mach.lang.driver:oblivious_asm_taint_survives_every_non_defining_row" {
+    var bad: i32 = 0;
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n mov rbx, rdx\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n lea rbx, [rdx]\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n xchg rbx, rdx\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n movzx rbx, dl\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n movsx rbx, dl\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n shl rbx, 1\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n shr rbx, 1\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n sar rbx, 1\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n not rbx\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n inc rbx\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n dec rbx\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n push rbx\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n pop rbx\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n setb bl\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n setae bl\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n jmp 1f\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n call 1f\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n lidt [rbx]\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n in al, 0x60\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n out 0x60, al\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n ret\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n hlt\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n cli\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n sti\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n rdtsc\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n rdmsr\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n wrmsr\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n mfence\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n pause\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n nop\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n cld\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n pushfq\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n swapgs\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    ret bad;
+}
+
+# AND IT IS CLEARED BY EVERY ROW THAT DOES DEFINE THEM
+#
+# The other direction, and the reason this model is not simply "any secret in the
+# block poisons it": an instruction that unconditionally overwrites every flag
+# this grammar can read leaves nothing of the earlier secret behind, so a branch
+# after it is public and is accepted. Remove any of these rows' `defines_flags`
+# and its case fails, which is what makes the fact load-bearing rather than
+# merely asserted.
+test "mach.lang.driver:oblivious_asm_taint_cleared_by_every_defining_row" {
+    var bad: i32 = 0;
+    if (ut_codegen_target_ok("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n add rbx, rdx\n je 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux") != 0) { bad = 1; }
+    if (ut_codegen_target_ok("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n sub rbx, rdx\n je 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux") != 0) { bad = 1; }
+    if (ut_codegen_target_ok("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n and rbx, rdx\n je 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux") != 0) { bad = 1; }
+    if (ut_codegen_target_ok("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n or rbx, rdx\n je 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux") != 0) { bad = 1; }
+    if (ut_codegen_target_ok("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n xor rbx, rdx\n je 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux") != 0) { bad = 1; }
+    if (ut_codegen_target_ok("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n cmp rbx, rdx\n je 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux") != 0) { bad = 1; }
+    if (ut_codegen_target_ok("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n test rbx, rdx\n je 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux") != 0) { bad = 1; }
+    if (ut_codegen_target_ok("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n neg rbx\n je 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux") != 0) { bad = 1; }
+    if (ut_codegen_target_ok("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n cmpxchg rbx, rdx\n je 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux") != 0) { bad = 1; }
+    if (ut_codegen_target_ok("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rsi, {r}\n cmp rsi, 1\n xadd rbx, rdx\n je 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux") != 0) { bad = 1; }
+    ret bad;
+}
+
+# AN UNMODELED FLAG SOURCE TAINTS WITH NO SECRET IN SIGHT
+#
+# `popfq` and `iretq` load FLAGS from the stack or the interrupt frame, and
+# `syscall` masks the existing RFLAGS - none of which this model represents. All
+# three carry NO operands, so the ordinary "secret operand taints" rule is
+# structurally unable to fire for them and they need their own unconditional
+# arm. Nothing in these blocks reads a secret binding at all.
+test "mach.lang.driver:oblivious_asm_unmodeled_flag_sources_taint" {
+    var bad: i32 = 0;
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { popfq\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { iretq\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { syscall\n jc 1f\n 1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    ret bad;
+}
+
+# BOTH SETcc SPELLINGS CARRY A SECRET OUT OF FLAGS AND INTO A REGISTER
+#
+# `setb` and `setae` are distinct grammar rows on distinct opcodes, so covering
+# one leaves the other free to launder. The destination becomes secret-derived,
+# and indexing memory with it leaks through the cache.
+test "mach.lang.driver:oblivious_asm_setcc_does_not_launder_flags" {
+    var bad: i32 = 0;
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r}\n cmp rax, 1\n setb bl\n mov rcx, [rbx] } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "addresses memory with a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r}\n cmp rax, 1\n setae bl\n mov rcx, [rbx] } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "addresses memory with a secret value") != 0) { bad = 1; }
+    ret bad;
+}
+
+# EVERY DEFINING ROW ALSO TAINTS ON ITS OWN SECRET OPERAND
+#
+# `defines_flags` implies `writes_flags`, and the second half needs its own
+# coverage: a definer whose operands are secret must TAINT, not clear. The clear
+# arm requires public operands, so these two behaviours are disjoint and a test of
+# one says nothing about the other.
+#
+# One case per row rather than one for the family. The mutation sweep is why:
+# with only `cmp` covered, deleting `writes_flags` from `add`, `sub`, `and`, `or`,
+# `xor`, `test`, `neg`, `cmpxchg` or `xadd` left the suite green - nine facts that
+# nothing depended on, which reads identically to nine facts that are wrong.
+test "mach.lang.driver:oblivious_asm_defining_rows_taint_on_secret_operands" {
+    var bad: i32 = 0;
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r}\n add rax, rbx\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r}\n sub rax, rbx\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r}\n and rax, rbx\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r}\n or rax, rbx\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r}\n xor rax, rbx\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r}\n test rax, rbx\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r}\n neg rax\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r}\n cmpxchg rbx, rax\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r}\n xadd rbx, rax\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "branches on a secret value") != 0) { bad = 1; }
+    ret bad;
+}
