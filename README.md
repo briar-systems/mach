@@ -126,6 +126,7 @@ build system is documented in:
 
 - [`doc/manifest.md`](doc/manifest.md): the `mach.toml` manifest reference
 - [`doc/cli.md`](doc/cli.md): the `mach` command-line reference
+- [`doc/distribution.md`](doc/distribution.md): shipping an application to users
 
 
 # Credit
