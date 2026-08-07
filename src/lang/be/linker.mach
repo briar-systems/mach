@@ -48,6 +48,7 @@ use std.text.string.str_free;
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
+use format: std.format;
 
 use mach.lang.be.obj;
 use enc: mach.lang.be.codegen.encode;
@@ -3649,6 +3650,68 @@ fun module_weak_function_ref_is_dead(modules: *of.ObjectImage, m: u32, name: int
     ret false;
 }
 
+# whether a relocation is a DWARF code address: a 64-bit absolute patch site in one of
+# the four debug sections that hold executable addresses. the sec_offset references
+# into `.debug_str` / `.debug_loclists` / `.debug_rnglists` are RK_ABS32 and carry
+# section offsets rather than addresses, so the kind alone separates them
+# ---
+# r:            the relocation to classify
+# info_sec / line_sec / loclists_sec / rnglists_sec: module-local debug section indices
+# ret:          true when the relocation patches an executable address
+fun is_dwarf_code_address(r: *of.Relocation, info_sec: u32, line_sec: u32,
+                          loclists_sec: u32, rnglists_sec: u32) bool {
+    if (r.kind != of.RK_ABS64) { ret false; }
+    ret r.section == info_sec || r.section == line_sec
+        || r.section == loclists_sec || r.section == rnglists_sec;
+}
+
+# whether a DWARF code-address relocation's addend still describes the same instruction
+# after the atom plan compresses its anchor's section
+#
+# the patch is `atom_live_offset(anchor) + addend`: the anchor is rebased over the
+# discarded intervals and the addend is then added raw. that is the right instruction
+# only when no discarded interval lies between the anchor and the effective location.
+# `atom_live_offset` counts surviving bytes, so the condition is exactly
+# `live(anchor + addend) == live(anchor) + addend`, the two diverging by the number of
+# dead bytes in between. this is the "anchor remapped, addend not" staleness the atom
+# plan's crossing audit guards against elsewhere, which DWARF sat outside of purely
+# because every reference mach emits is intra-function (#2620).
+#
+# the atom plan is asked directly rather than comparing the effective location against
+# the anchor symbol's extent, because `sym.size` is authoritative in no format the
+# linker reads: Mach-O's nlist and COFF's symbol record carry no size field at all and
+# both parsers store 0, and mach's own codegen writes 0 for every function symbol. an
+# extent test would be scoped to nothing. the remap identity needs no size and holds
+# for every format.
+#
+# a dead anchor or a dead effective location is not this check's business: #2583's
+# tombstone owns that case and resolves it to the dead-code sentinel.
+# ---
+# modules:  the input image array
+# m:        index of the module owning the reference
+# sy:       index within module `m` of the anchor symbol the addend is measured from
+# addend:   the reference's addend, in bytes from the anchor
+# sec_base: per-module prefix offset into the flat section space
+# atoms:    the dead-atom plan
+# ret:      true when the addend survives the remap unchanged
+fun dwarf_addend_survives_remap(modules: *of.ObjectImage, m: u32, sy: u32,
+                                addend: i64, sec_base: *u32, atoms: *AtomPlan) bool {
+    if (addend == 0) { ret true; }
+    val sym: *of.Symbol = ?modules[m].symbols[sy];
+    if (sym.section == of.SECTION_EXTERNAL || sym.section >= modules[m].section_count) {
+        ret true;
+    }
+    val eff: i64 = sym.offset::i64 + addend;
+    if (eff < 0 || eff > 0xFFFFFFFF) { ret false; }
+    val flat: u32 = sec_base[m] + sym.section;
+    val e: u32 = eff::u32;
+    if (atom_offset_dead(atoms, flat, sym.offset) || atom_offset_dead(atoms, flat, e)) {
+        ret true;
+    }
+    val want: i64 = atom_live_offset(atoms, flat, sym.offset)::i64 + addend;
+    ret atom_live_offset(atoms, flat, e)::i64 == want;
+}
+
 # apply every relocation in module `m` into the merged
 # bytes. a LOCAL target resolves directly from module `m`'s own symbol array;
 # a GLOBAL target (or an undefined extern) resolves by name through `sym_locs`, and
@@ -3804,6 +3867,17 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
         # the sentinel IS the value the field must hold, and apply_reloc adds the addend
         # to whatever target it is given, which would wrap 0xFFFF... into a low address.
         var apply_addend: i64 = r.addend;
+
+        # a DWARF code address is patched as `remapped anchor + raw addend`, which only
+        # names the intended instruction while no discarded interval separates the two.
+        # every reference mach emits is intra-function and so cannot straddle one, but
+        # nothing generated that property and nothing would notice it breaking, and the
+        # failure is a silently wrong address in debug info (#2620). refuse instead.
+        if (is_dwarf_code_address(r, info_sec, line_sec, loclists_sec, rnglists_sec)
+            && !dwarf_addend_survives_remap(modules, m, r.sym, r.addend, sec_base, atoms)) {
+            ret R.err[bool, str](dwarf_addend_message(s, modules, m, target_name, r));
+        }
+
         if ((target.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0
             && target.section != of.SECTION_EXTERNAL) {
             if (!local_symbol_target(modules, m, r.sym, placements, sec_base,
@@ -5825,6 +5899,35 @@ fun dup_message(s: *session.Session, name: intern.StrId) str {
 # s:    shared session holding the interner
 # name: interned name of the undefined symbol
 # ret:  the diagnostic string (degraded if the name cannot be resolved)
+# build the diagnostic for a DWARF code-address relocation whose addend does not
+# survive the atom plan's remap of its anchor (#2620). names the anchor symbol, the
+# addend, and the debug section holding the patch site, since the three together
+# identify the emitting site
+# ---
+# s:       shared session holding the interner and allocator
+# modules: the input image array, for the section's own name
+# m:       index of the module owning the relocation
+# name:    interned name of the anchor symbol
+# r:       the offending relocation
+# ret:     the diagnostic string (degraded if a name cannot be resolved)
+fun dwarf_addend_message(s: *session.Session, modules: *of.ObjectImage, m: u32,
+                         name: intern.StrId, r: *of.Relocation) str {
+    val fallback: str =
+        "linker: DWARF code-address addend does not survive dead-code elimination";
+    val nm: O.Option[str] = intern.lookup(?s.interner, name);
+    if (!O.is_some[str](nm)) { ret fallback; }
+    var sec: str = "?";
+    if (r.section < modules[m].section_count) {
+        val sn: O.Option[str] = intern.lookup(?s.interner, modules[m].sections[r.section].name);
+        if (O.is_some[str](sn)) { sec = O.unwrap[str](sn); }
+    }
+    val res: R.Result[str, str] = format.sprint(s.alloc,
+        "linker: {} relocation against '{}' with addend {} crosses a discarded body; its address would be stale",
+        sec, O.unwrap[str](nm), r.addend);
+    if (R.is_err[str, str](res)) { ret fallback; }
+    ret R.unwrap_ok[str, str](res);
+}
+
 fun undef_message(s: *session.Session, name: intern.StrId) str {
     val nm: O.Option[str] = intern.lookup(?s.interner, name);
     if (O.is_some[str](nm)) { ret join2(s, "undefined symbol: ", O.unwrap[str](nm), "undefined symbol"); }
@@ -6444,6 +6547,291 @@ test "mach.lang.be.linker.patch_relocations:parsed_weak_dwarf_tombstones" {
     session.dnit(?s);
     if (!elf_ok || !macho_ok) { ret 1; }
     ret 0;
+}
+
+# drive one DWARF code address whose addend reaches across a body the atom plan
+# discarded, and report what the linker did with it
+#
+# module 1 lays `.text` out as [anchor 0,16) [dup 16,32) [tail 32,48) and carries a
+# `.debug_info` address against `anchor` with addend 32, which names `tail`'s first
+# byte. module 0 also defines the weak `dup` and wins it, so module 1's copy is
+# discarded and `tail` slides down into its place. `anchor` itself is remapped, the
+# addend is not, and `anchor + 32` then points 16 bytes past `tail`'s new start.
+#
+# the bodies are a whole multiple of the section alignment on purpose. `atom_resume_offset`
+# preserves each later symbol's alignment residue, so a hole that is not a multiple of
+# the section's alignment is refilled with padding and nothing after it moves - a
+# fixture built that way discards a body and still proves nothing, which is why this
+# one reads `tail` back and reports that outcome separately.
+#
+# nothing mach emits has this shape, which is exactly why the linker has to construct
+# it to be able to test the refusal (#2620).
+# ---
+# s:   session
+# tgt: the target whose writer and parser the objects round-trip through
+# ret: 0 refused with the expected diagnostic, 1 linked and wrote the stale address,
+#      2 linked without writing a stale address, 3 refused for another reason,
+#      4 the fixture itself could not be built, 5 linked but the atom plan discarded
+#      nothing, so the fixture no longer exercises the case at all
+fun lt_dwarf_addend_crossing(s: *session.Session, tgt: *target.Target) i32 {
+    val alloc: *A.Allocator = s.alloc;
+    val text:   intern.StrId = lt_name(s, ".text");
+    val info:   intern.StrId = lt_name(s, ".debug_info");
+    val dup:    intern.StrId = lt_name(s, "crossing_weak");
+    val anchor: intern.StrId = lt_name(s, "crossing_anchor");
+    val tail:   intern.StrId = lt_name(s, "crossing_tail");
+    val entry:  intern.StrId = lt_name(s, tgt.os.entry_symbol);
+    if (text == intern.STR_NIL || info == intern.STR_NIL || dup == intern.STR_NIL
+        || anchor == intern.STR_NIL || tail == intern.STR_NIL || entry == intern.STR_NIL) {
+        ret 4;
+    }
+
+    var win_text:   [32]u8;
+    var cross_text: [48]u8;
+    var i: u32 = 0;
+    for (i < 32) { win_text[i] = (0x10 + i)::u8; i = i + 1; }
+    i = 0;
+    for (i < 48) { cross_text[i] = (0x40 + i)::u8; i = i + 1; }
+
+    # three marker/address pairs: the crossing address, then `anchor` and `tail` with
+    # addend 0, which give the test the live bases to measure the crossing one against
+    # and let it confirm the atom plan actually discarded the body in between.
+    var cross_info: [48]u8;
+    i = 0;
+    for (i < 48) { cross_info[i] = 0; i = i + 1; }
+    i = 0;
+    for (i < 8) {
+        cross_info[i] = 0xC1; cross_info[16 + i] = 0xC2; cross_info[32 + i] = 0xC3;
+        i = i + 1;
+    }
+
+    var win_secs: [1]of.Section;
+    win_secs[0].name = text; win_secs[0].kind = of.SK_TEXT;
+    win_secs[0].bytes = ?win_text[0]; win_secs[0].len = 32; win_secs[0].align = 16;
+
+    var cross_secs: [2]of.Section;
+    cross_secs[0].name = text; cross_secs[0].kind = of.SK_TEXT;
+    cross_secs[0].bytes = ?cross_text[0]; cross_secs[0].len = 48; cross_secs[0].align = 16;
+    cross_secs[1].name = info; cross_secs[1].kind = of.SK_DEBUG;
+    cross_secs[1].bytes = ?cross_info[0]; cross_secs[1].len = 48; cross_secs[1].align = 1;
+
+    val weak_flags: u32 =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+    val fn_flags: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var win_syms: [2]of.Symbol;
+    win_syms[0].name = dup; win_syms[0].section = 0;
+    win_syms[0].offset = 0; win_syms[0].size = 16; win_syms[0].flags = weak_flags;
+    win_syms[1].name = entry; win_syms[1].section = 0;
+    win_syms[1].offset = 16; win_syms[1].size = 16; win_syms[1].flags = fn_flags;
+
+    var cross_syms: [3]of.Symbol;
+    cross_syms[0].name = anchor; cross_syms[0].section = 0;
+    cross_syms[0].offset = 0; cross_syms[0].size = 16; cross_syms[0].flags = fn_flags;
+    cross_syms[1].name = dup; cross_syms[1].section = 0;
+    cross_syms[1].offset = 16; cross_syms[1].size = 16; cross_syms[1].flags = weak_flags;
+    cross_syms[2].name = tail; cross_syms[2].section = 0;
+    cross_syms[2].offset = 32; cross_syms[2].size = 16; cross_syms[2].flags = fn_flags;
+
+    var cross_relocs: [3]of.Relocation;
+    cross_relocs[0].section = 1; cross_relocs[0].offset = 8;
+    cross_relocs[0].kind = of.RK_ABS64; cross_relocs[0].sym = 0;
+    cross_relocs[0].addend = 32;
+    cross_relocs[1].section = 1; cross_relocs[1].offset = 24;
+    cross_relocs[1].kind = of.RK_ABS64; cross_relocs[1].sym = 0;
+    cross_relocs[1].addend = 0;
+    cross_relocs[2].section = 1; cross_relocs[2].offset = 40;
+    cross_relocs[2].kind = of.RK_ABS64; cross_relocs[2].sym = 2;
+    cross_relocs[2].addend = 0;
+
+    var modules: [2]of.ObjectImage;
+    modules[0] = lt_image(s, lt_name(s, "crossing-winner"), ?win_secs[0], 1,
+                          ?win_syms[0], 2, nil::*of.Relocation, 0);
+    modules[1] = lt_image(s, lt_name(s, "crossing-loser"), ?cross_secs[0], 2,
+                          ?cross_syms[0], 3, ?cross_relocs[0], 3);
+
+    val wtf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "cross_dwarf_winner");
+    if (R.is_err[fs.TempFile, str](wtf_r)) { ret 4; }
+    var wtf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](wtf_r);
+    val ltf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "cross_dwarf_loser");
+    if (R.is_err[fs.TempFile, str](ltf_r)) { fs.temp_close_and_remove(?wtf); ret 4; }
+    var ltf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](ltf_r);
+    val etf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "cross_dwarf_exe");
+    if (R.is_err[fs.TempFile, str](etf_r)) {
+        fs.temp_close_and_remove(?wtf); fs.temp_close_and_remove(?ltf); ret 4;
+    }
+    var etf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](etf_r);
+    val wpath: str = fs.temp_path(?wtf);
+    val lpath: str = fs.temp_path(?ltf);
+    val epath: str = fs.temp_path(?etf);
+
+    var code: i32 = 4;
+    var wrote: bool = true;
+    if (R.is_err[bool, str](tgt.of.emit_object(tgt.isa, ?modules[0], wpath::*u8))) { wrote = false; }
+    if (wrote && R.is_err[bool, str](tgt.of.emit_object(tgt.isa, ?modules[1], lpath::*u8))) { wrote = false; }
+    if (wrote) {
+        var paths: [2]*u8;
+        paths[0] = wpath::*u8; paths[1] = lpath::*u8;
+        val lr: R.Result[bool, str] = link(s, tgt, ?paths[0], 2,
+            nil::*of.DynLib, 0, epath::*u8, "crossing_dwarf"::*u8,
+            LINK_EXE, false, of.image_options_default(of.SUBSYSTEM_CONSOLE));
+        if (R.is_err[bool, str](lr)) {
+            code = 3;
+            if (str_contains(R.unwrap_err[bool, str](lr), "crosses a discarded body")) { code = 0; }
+        }
+        or {
+            # the link went through: read back what it patched. `tail` slid down with the
+            # discarded body, so the correct crossing address is `tail` itself and the
+            # stale one the raw addend produces is anchor + 32. a `tail` that did NOT
+            # slide means nothing was discarded and the fixture proves nothing, which is
+            # reported as its own outcome rather than passing quietly.
+            code = 4;
+            val rr: R.Result[Vector[u8], str] = fs.read_bytes(alloc, epath);
+            if (R.is_ok[Vector[u8], str](rr)) {
+                var out: Vector[u8] = R.unwrap_ok[Vector[u8], str](rr);
+                var anchor_va: u64 = 0;
+                var cross_va: u64 = 0;
+                var tail_va: u64 = 0;
+                if (lt_marker_live_value(out.data, out.len, 0xC2, ?anchor_va)
+                    && lt_marker_live_value(out.data, out.len, 0xC1, ?cross_va)
+                    && lt_marker_live_value(out.data, out.len, 0xC3, ?tail_va)) {
+                    code = 5;
+                    if (tail_va == anchor_va + 16) {
+                        code = 2;
+                        if (cross_va == anchor_va + 32) { code = 1; }
+                    }
+                }
+                vector.dnit[u8](?out);
+            }
+        }
+    }
+
+    fs.temp_close_and_remove(?wtf);
+    fs.temp_close_and_remove(?ltf);
+    fs.temp_close_and_remove(?etf);
+    ret code;
+}
+
+# a DWARF code address whose addend reaches across a discarded weak body is refused
+# rather than patched. the linker rebases the anchor over the hole and then adds the
+# raw addend, so the result names an instruction 8 bytes past the one meant; nothing
+# the encoder emits has that shape today, and this is what notices if that changes
+test "mach.lang.be.linker.patch_relocations:dwarf_addend_crossing_refused" {
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val er: R.Result[target.Target, str] =
+        target.select(?reg, "x86_64", "linux", "sysv64");
+    if (R.is_err[target.Target, str](er)) { ret 1; }
+    var elf_tgt: target.Target = R.unwrap_ok[target.Target, str](er);
+
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    val code: i32 = lt_dwarf_addend_crossing(?s, ?elf_tgt);
+    session.dnit(?s);
+    ret code;
+}
+
+# round-trip one 16-byte function symbol through a target's object writer and parser
+# and report the size the parser recovered
+# ---
+# s:   session
+# tgt: the target whose writer and parser to exercise
+# out: out - the recovered `sym.size`
+# ret: true when the round trip completed and the symbol was found
+fun lt_roundtrip_symbol_size(s: *session.Session, tgt: *target.Target, out: *u32) bool {
+    val alloc: *A.Allocator = s.alloc;
+    val text: intern.StrId = lt_name(s, ".text");
+    val fname: intern.StrId = lt_name(s, "sized_probe");
+    if (text == intern.STR_NIL || fname == intern.STR_NIL) { ret false; }
+
+    var body: [16]u8;
+    var i: u32 = 0;
+    for (i < 16) { body[i] = (0x90 + i)::u8; i = i + 1; }
+
+    var secs: [1]of.Section;
+    secs[0].name = text; secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?body[0]; secs[0].len = 16; secs[0].align = 16;
+
+    var syms: [1]of.Symbol;
+    syms[0].name = fname; syms[0].section = 0; syms[0].offset = 0; syms[0].size = 16;
+    syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var img: of.ObjectImage = lt_image(s, lt_name(s, "sized"), ?secs[0], 1,
+                                       ?syms[0], 1, nil::*of.Relocation, 0);
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "sym_size_probe");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret false; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val path: str = fs.temp_path(?tf);
+
+    var ok: bool = false;
+    if (R.is_ok[bool, str](tgt.of.emit_object(tgt.isa, ?img, path::*u8))) {
+        val rr: R.Result[Vector[u8], str] = fs.read_bytes(alloc, path);
+        if (R.is_ok[Vector[u8], str](rr)) {
+            var raw: Vector[u8] = R.unwrap_ok[Vector[u8], str](rr);
+            var back: of.ObjectImage;
+            val pr: R.Result[bool, str] = tgt.of.parse_object::of.ParserFn(
+                alloc, ?s.interner, raw.data, raw.len, ?back);
+            if (R.is_ok[bool, str](pr)) {
+                var sy: u32 = 0;
+                for (sy < back.symbol_count) {
+                    if (back.symbols[sy].name == fname) { @out = back.symbols[sy].size; ok = true; }
+                    sy = sy + 1;
+                }
+            }
+            vector.dnit[u8](?raw);
+        }
+    }
+    fs.temp_close_and_remove(?tf);
+    ret ok;
+}
+
+# `sym.size` survives an ELF round trip and is lost by Mach-O and COFF, because their
+# symbol records have no size field to carry it: a Mach-O `nlist` is name / type /
+# section / desc / value, and a COFF symbol record is name / value / section / type /
+# class / aux-count. neither has anywhere to put one, so both parsers store 0.
+#
+# this is the boundary #2620's check had to be designed around. an anchor-extent test
+# would have been silently inert on two of the three formats the linker reads - and on
+# ELF too, since mach's own codegen writes size 0 for every function symbol it emits -
+# so the check asks the atom plan whether the addend survives its remap instead, which
+# needs no size at all. this test exists so that boundary is a checked fact rather than
+# a claim in a comment: if a parser ever learns to recover a size, this fails and the
+# reasoning above gets revisited on purpose
+test "mach.lang.be.linker.symbol_size:carried_by_elf_only" {
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val er: R.Result[target.Target, str] = target.select(?reg, "x86_64", "linux", "sysv64");
+    val mr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "darwin", "sysv64");
+    val cr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "windows", "win64");
+    if (R.is_err[target.Target, str](er) || R.is_err[target.Target, str](mr)
+        || R.is_err[target.Target, str](cr)) { ret 1; }
+    var elf_tgt: target.Target = R.unwrap_ok[target.Target, str](er);
+    var macho_tgt: target.Target = R.unwrap_ok[target.Target, str](mr);
+    var coff_tgt: target.Target = R.unwrap_ok[target.Target, str](cr);
+
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var code: i32 = 0;
+    var elf_size: u32 = 0xFFFFFFFF;
+    var macho_size: u32 = 0xFFFFFFFF;
+    var coff_size: u32 = 0xFFFFFFFF;
+    if (!lt_roundtrip_symbol_size(?s, ?elf_tgt, ?elf_size))     { code = 1; }
+    if (!lt_roundtrip_symbol_size(?s, ?macho_tgt, ?macho_size)) { code = 1; }
+    if (!lt_roundtrip_symbol_size(?s, ?coff_tgt, ?coff_size))   { code = 1; }
+    session.dnit(?s);
+
+    if (elf_size != 16)  { code = 1; }
+    if (macho_size != 0) { code = 1; }
+    if (coff_size != 0)  { code = 1; }
+    ret code;
 }
 
 # look up one production ISA vtable from a populated test registry
