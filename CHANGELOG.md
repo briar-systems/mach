@@ -100,8 +100,6 @@ The floor is now a declared model fact (`alu_min_width`) rather than a constant 
 
 A scalar comparison feeding arithmetic is likewise reconciled: SPIR-V's comparison yields a boolean with no numeric representation, which per-lane mask construction needs as a 0/1 value. That is the scalar counterpart of the `OpSelect` widening a lane-wise compare's mask already used.
 
-### Changed
-
 #### A float literal narrowed to `f32` is folded at its own width (#2752)
 A float literal is carried as a comptime `f64` bit pattern from the lexer onward, so an `f64` constant narrowed by an explicit `::f32` reached the back end as a double-width materialization plus a runtime convert. Two instructions, and on x86-64 an FP scratch register, for a value known at compile time. `me.pass.constfold` now folds an `FP_TRUNC` whose operand is a `VAL_CONST_FLOAT` into the constant.
 
@@ -123,8 +121,6 @@ Two things the issue expected turned out not to need changing. The front end alr
 
 This also makes the constant pool's four-byte `CONST_F32` entry reachable from source for the first time.
 
-
-### Changed
 
 #### The FNEG sign mask and aarch64's `fmov` immediate reach the constant pool (#2754)
 Two constant materializations the pool did not reach, both because the ISA form that would consume one was not modelled by the encoder. They are independent and both landed here.
@@ -149,8 +145,9 @@ The x86-64 read-only growth is the two 16-byte mask entries, one per width, shar
 
 `int/surface/float-emit`'s `maxabs` moves 4 to 2 on x86-64, which is exactly the mask's bank move and the XOR that read it. The two that remain are the `t < 0.0` comparison materializing its zero, a different constant and one the pool deliberately never takes.
 
-Also fixed while here: `encode.intern_const` refused to check its interner and dereferenced a null one, crashing inside `intern` rather than naming the encoder that asked. It now reports.
+Also fixed while here, both without a separate issue: `encode.intern_const` refused to check its interner and dereferenced a null one, crashing inside `intern` rather than naming the encoder that asked, and now reports instead.
 
+And aarch64's memory-access family no longer carries a **width-0 pseudo-width**. Every entry point in it used to open with `if (w == 0) { w = 8; }`, a convention from when a MIR pseudo could reach an access, which #2766 left in place as the one substitution it did not remove. Nothing reaches it: routing 0 into a refused width instead left the whole aarch64 surface green, the unit suite, every `int` case on `linux-arm64` in both profiles, and the compiler's own source cross-built for `linux-arm64` and `darwin-aarch64` at both optimisation levels. A default nothing exercises is not a safety net, it is a silent doubleword waiting for the first caller that means something else by 0, so 0 is now refused like any other width the target has no form for and the refusal is driven from a test that fails with the fallback restored. `is64` keeps its own 0 rule, which selects an ALU register form rather than a memory form and which a pseudo with no value width legitimately reaches.
 
 ## [4.16.0] - 2026-08-08
 
@@ -162,8 +159,6 @@ Also fixed while here: `encode.intern_const` refused to check its interner and d
 `int/surface/debugger-gdb` now does: one `gdb --batch` session per `opt` level breaks on a call inlined at release only (`#[inline]`, which the debug pipeline's no-inlining-pass makes a real call there instead) and reads its parameter back from whatever register or stack slot the location list names, breaks mid-loop on a local that stays register-resident for the whole loop and reads a running sum this case's own case.conf computes by hand, and confirms a local that is written and never read carries no location at either profile - "optimized out" is the correct answer there, not a gap. A single `step` off a loop body line is asserted to land on the condition check, then back into the body, by source line rather than instruction count.
 
 Scoped to the `linux` leg only: gdb is what a Linux runner carries (no lldb here), and this is the one leg whose result was read by hand against the source. `linux-arm64` runs gdb natively in CI and could plausibly carry this case too, but that leg's session was never exercised or hand-verified, so it - along with `linux-riscv64` (qemu-user has no ptrace story a host gdb can attach through), `windows`, and both `darwin` legs - stays explicitly unverified rather than assumed to work.
-
-### Added
 
 #### An integer vector multiply works on every target (#2726, #2721)
 `i32x4 * i32x4` was refused at the language level on **every** target, citing x86-64's SSE2 baseline, where `pmulld` is SSE4.1. That refused it on aarch64, whose NEON hardware has the instruction, and on riscv64, which has no vector unit at all and would have lowered it to four ordinary scalar multiplies.
@@ -587,8 +582,6 @@ Blast radius: no user-level consumer in this repo. In mach-std every consumer is
 The guard keys on the spelling rather than on the target's vector width, so `f32x3` and `f32x7` are reserved everywhere. Otherwise a name would be claimable on a 128-bit target and collide on a wider one from identical source.
 
 **Values are unaffected.** A vector spelling is read in type position only, so `val f32x4` remains legal and is not shadowed by anything.
-
-### Added
 
 #### GLSL.std.450 extended instructions for shader stages (#2688)
 A `#[spirv_op(set, name)]` decorator declares which SPIR-V instruction a function *is*, over two sets: `"core"` and `"GLSL.std.450"`. 33 extended instructions plus core `OpDot`, covering the common-value, trigonometric, exponential, range/interpolation and geometry families. The extended set is imported only when used.
