@@ -1029,7 +1029,9 @@ fun note_sym_target(st: *encode.EncodeState, sym: intern.StrId, mod: isa.SymModi
         op.sym_addend = addend;
         ret;
     }
-    @op = isa.make_sym_addend(sym::u32, 8, mod, addend);
+    # the reference width is the machine's pointer width: an address is what this
+    # operand names, so it is 8 bytes on rv64 and 4 on rv32
+    @op = isa.make_sym_addend(sym::u32, st.model.pointer_width::u8, mod, addend);
 }
 
 # read the 32-bit little-endian word at `pos` in the text sink
@@ -1048,18 +1050,53 @@ fun write_word(buf: *encode.ByteBuf, pos: usize, word: u32) {
     buf.data[pos + 3] = ((word >> 24) & 0xFF)::u8;
 }
 
-# the major opcode of the register ALU group for an operation width. RV64-SPECIFIC:
-# a 32-bit operation selects the word ALU (OPC_OP_32 -> addw/subw/...), every other
-# width the full-register ALU (OPC_OP). an RV32 sibling always returns OPC_OP here
-fun alu_opcode(width: u8) u32 {
-    if (width == 4) { ret OPC_OP_32; }
+# XLEN in bytes for the machine this encode targets, the authority every width
+# decision below reads (#2778)
+#
+# The register width IS the machine's, so it comes from the model rather than from a
+# constant: 8 on rv64, 4 on rv32. Every form choice that used to compare a value's
+# width against a literal 8 compares it against this instead, which is what lets one
+# encoder serve both widths of the ISA.
+fun xlen(st: *encode.EncodeState) u8 { ret st.model.gpr_width::u8; }
+
+# FLEN in bytes for the machine this encode targets
+#
+# A SEPARATE FACT FROM XLEN, and the pair is the reason this is read rather than
+# assumed: rv64gc has XLEN 8 and FLEN 8, and rv32gc has XLEN 4 and FLEN 8. Code that
+# took one literal for both was correct only while they coincided.
+fun flen(st: *encode.EncodeState) u8 { ret (st.model.flen_bits / 8)::u8; }
+
+# the major opcode of the register ALU group for an operation width
+#
+# THE WORD ALU IS AN RV64 GROUP AND EXISTS AT EXACTLY ONE WIDTH. RV64 holds a 32-bit
+# value sign-extended across its 64-bit register, so a 32-bit operation uses the `*W`
+# group (addw / subw / sllw / ...) to re-establish that. RV32 has no `*W` group at
+# all - a 32-bit operation there IS a full-register operation, and `OPC_OP_32` would
+# encode a reserved opcode.
+#
+# THE CONDITION IS THE PAIR, not either half. `width == 4` alone is the RV64 rule read
+# as if it were the ISA's; `width < xl` alone would sweep in the sub-word widths,
+# which take the full-register group on RV64 today. Both facts have to hold, so both
+# are tested.
+# ---
+# width: the operation width in bytes
+# xl:    XLEN in bytes for the target machine
+# ret:   the major opcode of the register ALU group
+fun alu_opcode(width: u8, xl: u8) u32 {
+    if (width == 4 && xl == 8) { ret OPC_OP_32; }
     ret OPC_OP;
 }
 
-# the major opcode of the immediate ALU group for an operation width. RV64-SPECIFIC:
-# a 32-bit operation selects OPC_OP_IMM_32 (addiw/slliw/...), every other width OPC_OP_IMM
-fun alu_imm_opcode(width: u8) u32 {
-    if (width == 4) { ret OPC_OP_IMM_32; }
+# the major opcode of the immediate ALU group for an operation width, the immediate
+# twin of `alu_opcode` and gated on the same pair of facts: a 32-bit operation on an
+# XLEN-64 machine selects OPC_OP_IMM_32 (addiw / slliw / ...), and every other case
+# the full-register OPC_OP_IMM
+# ---
+# width: the operation width in bytes
+# xl:    XLEN in bytes for the target machine
+# ret:   the major opcode of the immediate ALU group
+fun alu_imm_opcode(width: u8, xl: u8) u32 {
+    if (width == 4 && xl == 8) { ret OPC_OP_IMM_32; }
     ret OPC_OP_IMM;
 }
 
@@ -1080,13 +1117,17 @@ fun alu_imm_opcode(width: u8) u32 {
 # ---
 # width:   the access width in bytes
 # is_load: true for the load direction
-# ret:     the funct3, or an error naming the width RV64I has no integer access for
-fun int_mem_funct3(width: u8, is_load: bool) R.Result[u32, str] {
+# xl:      XLEN in bytes for the target machine; the widest access it has
+# ret:     the funct3, or an error naming the width this machine has no access for
+fun int_mem_funct3(width: u8, is_load: bool, xl: u8) R.Result[u32, str] {
+    if (width > xl) {
+        ret R.err[u32, str]("internal compiler error: this RISC-V machine has no integer memory access wider than its registers");
+    }
     if (width == 1) { if (is_load) { ret R.ok[u32, str](0x4); } ret R.ok[u32, str](0x0); }  # lbu / sb
     if (width == 2) { if (is_load) { ret R.ok[u32, str](0x5); } ret R.ok[u32, str](0x1); }  # lhu / sh
     if (width == 4) { if (is_load) { ret R.ok[u32, str](0x2); } ret R.ok[u32, str](0x2); }  # lw  / sw
     if (width == 8) { if (is_load) { ret R.ok[u32, str](0x3); } ret R.ok[u32, str](0x3); }  # ld  / sd
-    ret R.err[u32, str]("internal compiler error: riscv64 has no integer memory access form for this width (expected 1, 2, 4, or 8)");
+    ret R.err[u32, str]("internal compiler error: riscv has no integer memory access form for this width (expected 1, 2, 4, or 8)");
 }
 
 # the GP register index a post-regalloc register operand names. only a physical
@@ -1127,15 +1168,24 @@ fun emit_li32(st: *encode.EncodeState, rd: u32, v: i32) {
     val hi20: u32 = ((v + 0x800) >> 12)::u32 & 0xFFFFF;
     val lo12: u32 = v::u32 & 0xFFF;
     emit_u(st, OPC_LUI, rd, hi20);
-    if (lo12 != 0) { emit_i(st, OPC_OP_IMM_32, F3_ADD, rd, rd, lo12); }
+    # `addiw` on RV64 so the materialized value carries the sign-extended-to-XLEN form
+    # a computed 32-bit value has; on RV32 the register IS 32 bits, there is no `addiw`,
+    # and plain `addi` is both the only form and the correct one
+    if (lo12 != 0) { emit_i(st, alu_imm_opcode(4, xlen(st)), F3_ADD, rd, rd, lo12); }
 }
 
 # materialize the signed immediate `value` into GP register `rd`. a value within the
 # 12-bit signed immediate is a single `addi rd, x0, value`; a 32-bit value takes the
-# `lui ; addiw` pair. RV64-SPECIFIC: a value wider than 32 bits takes the recursive
-# (materialize the high part ; `slli rd, rd, 12` ; `addi rd, rd, lo12`) sequence -
-# the 64-bit constant length an RV32 sibling never reaches, since its widest
-# immediate is 32-bit and it stops at the `lui ; addiw` path above
+# `lui ; addi(w)` pair, whose second instruction `emit_li32` picks by XLEN.
+#
+# THE RECURSIVE TAIL IS REACHABLE ONLY WHERE A REGISTER CAN HOLD THE VALUE. A value
+# wider than 32 bits takes the (materialize the high part ; `slli rd, rd, 12` ;
+# `addi rd, rd, lo12`) sequence, which needs a register wider than 32 bits to land
+# in. On an XLEN-32 machine no constant reaching here is that wide: a value the front
+# end typed wider than the register is split into native-width lanes by
+# `be.codegen.legalize` before selection, so each lane's constant fits the `lui ;
+# addi` path above. The tail is therefore unreachable rather than wrong there, and
+# stays unguarded until an XLEN-32 target exists to make a guard testable.
 fun emit_li(st: *encode.EncodeState, rd: u32, value: i64) {
     if (value >= -2048 && value <= 2047) {
         emit_i(st, OPC_OP_IMM, F3_ADD, rd, RZERO, value::u32 & 0xFFF);
@@ -1201,7 +1251,7 @@ fun emit_addi(st: *encode.EncodeState, rd: u32, rs1: u32, off: i64) {
 fun emit_mem_access(st: *encode.EncodeState, rt: u32, base: u32, off: i64, width: u8, is_load: bool) R.Result[bool, str] {
     # the form resolves BEFORE the offset materialization, so a refused width leaves
     # no half sequence in the sink.
-    val f3r: R.Result[u32, str] = int_mem_funct3(width, is_load);
+    val f3r: R.Result[u32, str] = int_mem_funct3(width, is_load, xlen(st));
     if (R.is_err[u32, str](f3r)) { ret R.err[bool, str](R.unwrap_err[u32, str](f3r)); }
     val f3: u32 = R.unwrap_ok[u32, str](f3r);
     var b: u32 = base;
@@ -1221,17 +1271,29 @@ fun emit_mem_access(st: *encode.EncodeState, rt: u32, base: u32, off: i64, width
 }
 
 # the bytes the prologue reserves at the top of the frame, just below the frame
-# pointer: the 16-byte ra / s0 record plus the callee-saved GP and FP save areas.
+# pointer: the ra / s0 record plus the callee-saved GP and FP save areas.
 # `s0` is pinned at the entry stack pointer (the frame top), so the shared frame
 # phase's frame-pointer-relative local offsets - which assume locals sit immediately
 # below the frame pointer - must be biased down past this reserved region or they
 # would alias the saved record. mirrors the layout `frame_total` / `emit_prologue`
 # / `save_callee_gp` emit. pub so the assembly printer biases its rendered slot
 # offsets by the exact reservation the encoder applies
-pub fun frame_reserved_top(f: *mir.MirFunction) i64 {
-    val gp_bytes: u32 = popcount32(f.callee_mask) * 8;
-    val fp_bytes: u32 = popcount32(f.callee_mask_fp) * 8;
-    val n: u32 = 16 + gp_bytes + fp_bytes;
+#
+# THREE STRIDES, NOT ONE (#2778). The ra / s0 record is two GP registers, a saved
+# integer register costs XLEN bytes, and a saved float register costs FLEN bytes.
+# All three read 8 on rv64gc, which is why one literal served all three and was
+# correct - XLEN and FLEN coincide there. They do not coincide on rv32gc, whose
+# registers are 4 bytes and whose f registers are still 8, so a single stride would
+# either overlap the float saves onto each other or leave the integer area twice the
+# size it needs. Each stride is now read from the fact that decides it.
+# ---
+# st: encoder driver state, read for the machine's XLEN and FLEN
+# f:  the function whose frame is being measured
+# ret: the reserved byte count at the top of the frame
+pub fun frame_reserved_top(st: *encode.EncodeState, f: *mir.MirFunction) i64 {
+    val gp_bytes: u32 = popcount32(f.callee_mask) * xlen(st)::u32;
+    val fp_bytes: u32 = popcount32(f.callee_mask_fp) * flen(st)::u32;
+    val n: u32 = (2 * xlen(st)::u32) + gp_bytes + fp_bytes;
     # in a realigned frame the slot region's base is `sp + total - this`, so BOTH have to
     # be multiples of the requested alignment for the base to carry it (#2735). the
     # padding lands between the callee-save areas and the locals, where nothing reads it.
@@ -1377,7 +1439,7 @@ fun encode_alu3(st: *encode.EncodeState, mi: *mir.MirInstr, funct3: u32, funct7:
     val rs2: u32 = R.unwrap_ok[i32, str](rmr)::u32;
 
     var opcode: u32 = OPC_OP;
-    if (word_form) { opcode = alu_opcode(mi.width); }
+    if (word_form) { opcode = alu_opcode(mi.width, xlen(st)); }
     emit_r(st, opcode, funct3, funct7, rd, rs1, rs2);
     ret R.ok[bool, str](true);
 }
@@ -1402,7 +1464,7 @@ fun encode_addsub(st: *encode.EncodeState, mi: *mir.MirInstr, is_sub: bool) R.Re
         var v: i64 = rhs.imm;
         if (is_sub) { v = 0 - v; }
         if (v >= -2048 && v <= 2047) {
-            emit_i(st, alu_imm_opcode(mi.width), F3_ADD, rd, rs1, v::u32 & 0xFFF);
+            emit_i(st, alu_imm_opcode(mi.width, xlen(st)), F3_ADD, rd, rs1, v::u32 & 0xFFF);
             ret R.ok[bool, str](true);
         }
     }
@@ -1413,7 +1475,7 @@ fun encode_addsub(st: *encode.EncodeState, mi: *mir.MirInstr, is_sub: bool) R.Re
 
     var f7: u32 = F7_ZERO;
     if (is_sub) { f7 = F7_SUB; }
-    emit_r(st, alu_opcode(mi.width), F3_ADD, f7, rd, rs1, rs2);
+    emit_r(st, alu_opcode(mi.width, xlen(st)), F3_ADD, f7, rd, rs1, rs2);
     ret R.ok[bool, str](true);
 }
 
@@ -1442,7 +1504,7 @@ fun encode_shift(st: *encode.EncodeState, mi: *mir.MirInstr, funct3: u32, is_ari
         if (mi.width == 4) { mask = 0x1F; }
         var imm: u32 = rhs.imm::u32 & mask;
         if (is_arith) { imm = imm | 0x400; }  # funct7 0x20 -> imm[10]
-        emit_i(st, alu_imm_opcode(mi.width), funct3, rd, rs1, imm);
+        emit_i(st, alu_imm_opcode(mi.width, xlen(st)), funct3, rd, rs1, imm);
         ret R.ok[bool, str](true);
     }
 
@@ -1452,7 +1514,7 @@ fun encode_shift(st: *encode.EncodeState, mi: *mir.MirInstr, funct3: u32, is_ari
 
     var f7: u32 = F7_ZERO;
     if (is_arith) { f7 = F7_SUB; }
-    emit_r(st, alu_opcode(mi.width), funct3, f7, rd, rs1, rs2);
+    emit_r(st, alu_opcode(mi.width, xlen(st)), funct3, f7, rd, rs1, rs2);
     ret R.ok[bool, str](true);
 }
 
@@ -1466,7 +1528,7 @@ fun encode_neg(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
     val rsr: R.Result[i32, str] = req_gpr(?mi.operands[1]);
     if (R.is_err[i32, str](rsr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rsr)); }
     val rs: u32 = R.unwrap_ok[i32, str](rsr)::u32;
-    emit_r(st, alu_opcode(mi.width), F3_ADD, F7_SUB, rd, RZERO, rs);
+    emit_r(st, alu_opcode(mi.width, xlen(st)), F3_ADD, F7_SUB, rd, RZERO, rs);
     ret R.ok[bool, str](true);
 }
 
@@ -1683,7 +1745,7 @@ fun emit_global_load(st: *encode.EncodeState, rt: u32, symop: *mir.MirOperand, w
     if (symop.sym == intern.STR_NIL) {
         ret R.err[bool, str]("encode: folded-global load has no resolved symbol name");
     }
-    val f3r: R.Result[u32, str] = int_mem_funct3(width, true);
+    val f3r: R.Result[u32, str] = int_mem_funct3(width, true, xlen(st));
     if (R.is_err[u32, str](f3r)) { ret R.err[bool, str](R.unwrap_err[u32, str](f3r)); }
     val hr: R.Result[bool, str] = emit_pcrel_hi(st, SCRATCH, symop.sym, symop.sym_off);
     if (R.is_err[bool, str](hr)) { ret hr; }
@@ -1702,7 +1764,7 @@ fun emit_global_store(st: *encode.EncodeState, symop: *mir.MirOperand, val_op: *
     if (symop.sym == intern.STR_NIL) {
         ret R.err[bool, str]("encode: folded-global store has no resolved symbol name");
     }
-    val f3r: R.Result[u32, str] = int_mem_funct3(width, false);
+    val f3r: R.Result[u32, str] = int_mem_funct3(width, false, xlen(st));
     if (R.is_err[u32, str](f3r)) { ret R.err[bool, str](R.unwrap_err[u32, str](f3r)); }
     var rt: u32 = RZERO;
     if (val_op.kind == mir.MIR_OP_IMM) {
@@ -1841,7 +1903,7 @@ fun narrow_cmp_source(st: *encode.EncodeState, reg: u32, scratch: u32, width: u8
     # machine word; it passes through like any full-width operand (narrowing it
     # would compute a shift past the register width / an unallocated bitfield).
     if (width == 0 || width >= 4) { ret reg; }
-    val sh: u32 = 64 - (width::u32 * 8);
+    val sh: u32 = (xlen(st)::u32 * 8) - (width::u32 * 8);
     if (signed) {
         emit_i(st, OPC_OP_IMM, F3_SLL, scratch, reg, sh);                # slli scratch, reg, sh
         emit_i(st, OPC_OP_IMM, F3_SRL, scratch, scratch, sh | 0x400);    # srai scratch, scratch, sh
@@ -2160,7 +2222,7 @@ fun encode_divide(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, str
     val f3r: R.Result[u32, str] = divide_funct3(mi.opcode);
     if (R.is_err[u32, str](f3r)) { ret R.err[bool, str](R.unwrap_err[u32, str](f3r)); }
 
-    emit_r(st, alu_opcode(mi.width), R.unwrap_ok[u32, str](f3r), F7_MULDIV, rd, rs1, rs2);
+    emit_r(st, alu_opcode(mi.width, xlen(st)), R.unwrap_ok[u32, str](f3r), F7_MULDIV, rd, rs1, rs2);
     ret R.ok[bool, str](true);
 }
 
@@ -2187,22 +2249,28 @@ fun encode_convert(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, st
     if (R.is_err[i32, str](rsr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rsr)); }
     val rs: u32 = R.unwrap_ok[i32, str](rsr)::u32;
 
+    # THE CANONICAL FORM OF A 32-BIT VALUE IS A PROPERTY OF THE REGISTER, NOT OF THE
+    # VALUE. On RV64 a 32-bit value lives sign-extended across the 64-bit register, so
+    # producing one means `sext.w`. On RV32 the register IS 32 bits, there is nothing
+    # above the value to extend into, and the same canonicalization is a plain `mv` -
+    # which is exactly what `alu_imm_opcode` at width 4 selects on each machine.
     if (mi.opcode == mir.MIR_TRUNC) {
-        emit_i(st, OPC_OP_IMM_32, F3_ADD, rd, rs, 0);  # sext.w rd, rs (addiw rd,rs,0)
+        emit_i(st, alu_imm_opcode(4, xlen(st)), F3_ADD, rd, rs, 0);  # sext.w / mv rd, rs
         ret R.ok[bool, str](true);
     }
     if (mi.opcode == mir.MIR_BITCAST) {
-        # a same-width reinterpret: an 8-byte value copies all 64 bits (`mv`); a
-        # 32-bit value canonicalizes to its sign-extended form (`sext.w`).
-        if (dw >= 8) { emit_i(st, OPC_OP_IMM, F3_ADD, rd, rs, 0); }      # mv rd, rs
-        or           { emit_i(st, OPC_OP_IMM_32, F3_ADD, rd, rs, 0); }   # sext.w rd, rs
+        # a same-width reinterpret: a register-width value copies the whole register
+        # (`mv`); a narrower one canonicalizes to the machine's form for it.
+        if (dw >= xlen(st)) { emit_i(st, OPC_OP_IMM, F3_ADD, rd, rs, 0); }               # mv rd, rs
+        or                  { emit_i(st, alu_imm_opcode(4, xlen(st)), F3_ADD, rd, rs, 0); }  # sext.w / mv
         ret R.ok[bool, str](true);
     }
     if (mi.opcode == mir.MIR_SEXT) {
-        if (sw >= 8) { emit_i(st, OPC_OP_IMM, F3_ADD, rd, rs, 0); ret R.ok[bool, str](true); }  # mv
-        if (sw == 4) { emit_i(st, OPC_OP_IMM_32, F3_ADD, rd, rs, 0); ret R.ok[bool, str](true); }  # sext.w
-        # sign-extend a 1 / 2-byte source: shift its sign bit to bit 63 then back.
-        val sh: u32 = 64 - (sw::u32 * 8);
+        if (sw >= xlen(st)) { emit_i(st, OPC_OP_IMM, F3_ADD, rd, rs, 0); ret R.ok[bool, str](true); }  # mv
+        if (sw == 4) { emit_i(st, alu_imm_opcode(4, xlen(st)), F3_ADD, rd, rs, 0); ret R.ok[bool, str](true); }  # sext.w / mv
+        # sign-extend a 1 / 2-byte source: shift its sign bit to the top of the
+        # register then back.
+        val sh: u32 = (xlen(st)::u32 * 8) - (sw::u32 * 8);
         emit_i(st, OPC_OP_IMM, F3_SLL, rd, rs, sh);            # slli rd, rs, sh
         emit_i(st, OPC_OP_IMM, F3_SRL, rd, rd, sh | 0x400);    # srai rd, rd, sh
         ret R.ok[bool, str](true);
@@ -2213,7 +2281,7 @@ fun encode_convert(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, st
         emit_i(st, OPC_OP_IMM, F3_AND, rd, rs, 0xFF);  # andi rd, rs, 0xFF
         ret R.ok[bool, str](true);
     }
-    val sh: u32 = 64 - (sw::u32 * 8);
+    val sh: u32 = (xlen(st)::u32 * 8) - (sw::u32 * 8);
     emit_i(st, OPC_OP_IMM, F3_SLL, rd, rs, sh);  # slli rd, rs, sh
     emit_i(st, OPC_OP_IMM, F3_SRL, rd, rd, sh);  # srli rd, rd, sh
     ret R.ok[bool, str](true);
@@ -2668,7 +2736,7 @@ fun encode_fp_conv(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirIns
         # a sub-word source carries undefined high bits; sign / zero extend it into the
         # GP scratch to a clean 32-bit value before the W-form convert.
         if (sw < 4) {
-            val shamt: u32 = 64 - (sw::u32 * 8);
+            val shamt: u32 = (xlen(st)::u32 * 8) - (sw::u32 * 8);
             if (signed) {
                 emit_i(st, OPC_OP_IMM, F3_SLL, SCRATCH, gp, shamt);
                 emit_i(st, OPC_OP_IMM, F3_SRL, SCRATCH, SCRATCH, shamt | 0x400);  # srai
@@ -2856,13 +2924,15 @@ fun align16(n: u32) u32 {
 }
 
 # the 16-byte-aligned total the prologue allocates below the entry stack pointer: the
-# 16-byte ra / s0 record, the callee-saved GP and FP save areas, the local frame, and
-# the outgoing-argument region, read from the shared frame facts. unlike AArch64 the
+# ra / s0 record, the callee-saved GP and FP save areas, the local frame, and the
+# outgoing-argument region, read from the shared frame facts. unlike AArch64 the
 # record is part of this single allocation rather than a separate pre-index push.
-# each callee-saved register (GP or FP) takes one 8-byte slot. pub so the assembly
-# printer renders the exact reservation the encoder subtracts from sp
-pub fun frame_total(f: *mir.MirFunction) u32 {
-    val reserved: u32 = frame_reserved_top(f)::u32;
+# a saved GP register takes an XLEN-byte slot and a saved float register an FLEN-byte
+# one - see `frame_reserved_top`, which owns that arithmetic. the 16-byte alignment
+# is the psABI's and is a family-wide constant, not an XLEN-derived one. pub so the
+# assembly printer renders the exact reservation the encoder subtracts from sp
+pub fun frame_total(st: *encode.EncodeState, f: *mir.MirFunction) u32 {
+    val reserved: u32 = frame_reserved_top(st, f)::u32;
     val n: u32 = align16(reserved + f.frame.size + f.frame.outgoing_size);
     if (f.frame.realign != 0) {
         val rmask: u32 = f.frame.realign - 1;
@@ -2889,17 +2959,25 @@ fun emit_sp_adjust(st: *encode.EncodeState, delta: u32, subtract: bool) {
 
 # save (or restore) the callee-saved GP registers `callee_mask` selects, in ascending
 # register order, in the area just below the ra / s0 record. each register takes an
-# 8-byte slot, the first at `total - 24` (8 below the s0 slot at `total - 16`),
-# addressed SP-relative. the area sits within `frame_total`'s GP region
+# XLEN-byte slot, the first one XLEN below the s0 slot, addressed SP-relative. the
+# area sits within `frame_total`'s GP region
+#
+# THE STRIDE AND THE ACCESS WIDTH ARE THE SAME FACT, and both are the register's own
+# width - saving a register in a slot of a different size either truncates it or
+# leaves a hole the layout did not budget for. `frame_reserved_top` measures this same
+# region, so the two must read XLEN from the same place or they disagree by
+# construction.
 fun save_callee_gp(st: *encode.EncodeState, f: *mir.MirFunction, total: u32, store: bool) {
+    val w: u8 = xlen(st);
+    val rec: i64 = (2 * w::i64);
     var n: u32 = 0;
     var r: u32 = 0;
     for (r < 32) {
         if ((f.callee_mask & (1::u32 << r)) != 0) {
-            val off: i64 = (total::i64) - 16 - 8 - (8 * n)::i64;
-            # the literal doubleword the save area is laid out in, which
-            # `int_mem_funct3` implements, so the refusal cannot fire here.
-            emit_mem_access(st, r, RSP, off, 8, !store);
+            val off: i64 = (total::i64) - rec - w::i64 - (w::i64 * n::i64);
+            # the register-width access the save area is laid out in, which
+            # `int_mem_funct3` implements at every XLEN, so the refusal cannot fire here.
+            emit_mem_access(st, r, RSP, off, w, !store);
             n = n + 1;
         }
         r = r + 1;
@@ -2908,19 +2986,27 @@ fun save_callee_gp(st: *encode.EncodeState, f: *mir.MirFunction, total: u32, sto
 
 # save (or restore) the callee-saved FP registers `callee_mask_fp` selects, in
 # ascending register order, in the area just below the callee-saved GP area. each
-# register takes an 8-byte slot (the F/D registers are 64-bit under lp64d), the first
-# at `total - 16 - gp_bytes - 8`, addressed SP-relative through `fsd` / `fld`. the
-# area sits within `frame_total`'s FP region, below the GP region
+# register takes an FLEN-byte slot, the first at `total - record - gp_bytes - FLEN`,
+# addressed SP-relative through `fsd` / `fsw`. the area sits within `frame_total`'s FP
+# region, below the GP region
+#
+# THIS IS WHERE FLEN AND XLEN PART COMPANY. The GP area above it strides by XLEN and
+# this one strides by FLEN, and reading one literal for both was correct only while
+# the machine made them equal. rv32gc has 4-byte registers and 8-byte f registers, so
+# the GP area's size and this area's stride are two different numbers there.
 fun save_callee_fp(st: *encode.EncodeState, f: *mir.MirFunction, total: u32, store: bool) {
-    val gp_bytes: i64 = (popcount32(f.callee_mask) * 8)::i64;
+    val xw: u8 = xlen(st);
+    val fw: u8 = flen(st);
+    val rec: i64 = (2 * xw::i64);
+    val gp_bytes: i64 = (popcount32(f.callee_mask)::i64 * xw::i64);
     var n: u32 = 0;
     var r: u32 = 0;
     for (r < 32) {
         if ((f.callee_mask_fp & (1::u32 << r)) != 0) {
-            val off: i64 = (total::i64) - 16 - gp_bytes - 8 - (8 * n)::i64;
-            # a callee-saved f register saves its full 64 bits, the literal width
-            # `fp_mem_funct3` implements, so the refusal cannot fire here.
-            emit_fp_mem(st, r, RSP, off, 8, !store);
+            val off: i64 = (total::i64) - rec - gp_bytes - fw::i64 - (fw::i64 * n::i64);
+            # a callee-saved f register saves its full width, which `fp_mem_funct3`
+            # implements at 4 and 8, so the refusal cannot fire here.
+            emit_fp_mem(st, r, RSP, off, fw, !store);
             n = n + 1;
         }
         r = r + 1;
@@ -2936,8 +3022,8 @@ fun emit_prologue(st: *encode.EncodeState, f: *mir.MirFunction, total: u32) {
         # the record and s0 are placed from the ENTRY stack pointer, before the mask
         # moves it: s0 must keep pointing at the frame top, because incoming stack
         # arguments sit at `[s0+0]` and belong to the caller (#2735).
-        emit_mem_access(st, RRA, RSP, 0 - 8, 8, false);           # sd ra, -8(sp)
-        emit_mem_access(st, RFP, RSP, 0 - 16, 8, false);          # sd s0, -16(sp)
+        emit_mem_access(st, RRA, RSP, 0 - xlen(st)::i64, xlen(st), false);       # s{d,w} ra, -XLEN(sp)
+        emit_mem_access(st, RFP, RSP, 0 - (2 * xlen(st)::i64), xlen(st), false); # s{d,w} s0, -2*XLEN(sp)
         emit_addi(st, RFP, RSP, 0);                               # addi s0, sp, 0
         emit_sp_realign(st, f.frame.realign);
         emit_sp_adjust(st, total, true);
@@ -2946,8 +3032,8 @@ fun emit_prologue(st: *encode.EncodeState, f: *mir.MirFunction, total: u32) {
         ret;
     }
     emit_sp_adjust(st, total, true);
-    emit_mem_access(st, RRA, RSP, (total::i64) - 8, 8, false);   # sd ra, total-8(sp)
-    emit_mem_access(st, RFP, RSP, (total::i64) - 16, 8, false);  # sd s0, total-16(sp)
+    emit_mem_access(st, RRA, RSP, (total::i64) - xlen(st)::i64, xlen(st), false);       # s{d,w} ra, total-XLEN(sp)
+    emit_mem_access(st, RFP, RSP, (total::i64) - (2 * xlen(st)::i64), xlen(st), false); # s{d,w} s0, total-2*XLEN(sp)
     emit_addi(st, RFP, RSP, total::i64);                         # addi s0, sp, total
     save_callee_gp(st, f, total, true);
     save_callee_fp(st, f, total, true);
@@ -2984,12 +3070,12 @@ fun emit_epilogue(st: *encode.EncodeState, f: *mir.MirFunction, total: u32) {
         # the mask is undone by restoring sp from s0, which the mask never touched, so
         # whatever it discarded is irrelevant. s0 is reloaded last, after sp names it.
         emit_addi(st, RSP, RFP, 0);                              # addi sp, s0, 0
-        emit_mem_access(st, RRA, RSP, 0 - 8, 8, true);           # ld ra, -8(sp)
-        emit_mem_access(st, RFP, RSP, 0 - 16, 8, true);          # ld s0, -16(sp)
+        emit_mem_access(st, RRA, RSP, 0 - xlen(st)::i64, xlen(st), true);       # l{d,w} ra, -XLEN(sp)
+        emit_mem_access(st, RFP, RSP, 0 - (2 * xlen(st)::i64), xlen(st), true); # l{d,w} s0, -2*XLEN(sp)
         ret;
     }
-    emit_mem_access(st, RRA, RSP, (total::i64) - 8, 8, true);    # ld ra, total-8(sp)
-    emit_mem_access(st, RFP, RSP, (total::i64) - 16, 8, true);   # ld s0, total-16(sp)
+    emit_mem_access(st, RRA, RSP, (total::i64) - xlen(st)::i64, xlen(st), true);       # l{d,w} ra, total-XLEN(sp)
+    emit_mem_access(st, RFP, RSP, (total::i64) - (2 * xlen(st)::i64), xlen(st), true); # l{d,w} s0, total-2*XLEN(sp)
     emit_sp_adjust(st, total, false);
 }
 
@@ -3365,12 +3451,12 @@ fun encode_function_body(st: *encode.EncodeState, f: *mir.MirFunction) R.Result[
     if (R.is_err[bool, str](ms)) { ret ms; }
 
     val naked: bool = f.frame.omit;
-    val total: u32 = frame_total(f);
+    val total: u32 = frame_total(st, f);
     # the two distances to the slot region's base, stamped before any operand is
     # resolved. s0 is pinned at the frame TOP here, with the record and the callee-save
     # areas beneath it, so the base sits `fp_dist` below s0 and `base_dist` above sp.
     # one derivation, read by the encoder's own accesses and by the DWARF producer.
-    f.frame.fp_dist   = frame_reserved_top(f)::u32;
+    f.frame.fp_dist   = frame_reserved_top(st, f)::u32;
     f.frame.base_dist = total - f.frame.fp_dist;
     if (!naked) { emit_prologue(st, f, total); }
     val rp: R.Result[bool, str] = check_accounted(st, fn_base, PROLOGUE_REGION);
@@ -4920,18 +5006,39 @@ fun rv_asm_text(st: *encode.EncodeState, f: *mir.MirFunction, l: *iasm.Labels, t
 }
 
 
+# the machine the emit-level tests below encode for: rv64gc, XLEN 64 and FLEN 64
+#
+# The width facts `register.mach` states for the shipped riscv64 target, and only
+# those - the encoder reads no other field of the model. It is stated here rather
+# than borrowed from the ISA vtable because `register.mach` imports this module and
+# reaching back would close the cycle the split exists to avoid.
+#
+# IT CANNOT SILENTLY DRIFT FROM THE REAL ONE. Every assertion below is byte-exact
+# against `llvm-mc -triple=riscv64`, so a width here that disagreed with the target's
+# would select a different form and fail the comparison rather than pass quietly.
+var t_model_rv64: isa.MachineModel;
+fun rv64_machine() *isa.MachineModel {
+    t_model_rv64.pointer_width = 8;
+    t_model_rv64.gpr_width     = 8;
+    t_model_rv64.max_alu_width = 8;
+    t_model_rv64.alu_min_width = 4;
+    t_model_rv64.spill_width   = 8;
+    t_model_rv64.flen_bits     = 64;
+    ret ?t_model_rv64;
+}
+
 # a fresh page-backed EncodeState carrying only a byte sink, for exercising the
 # emit-level helpers (packers / prologue / epilogue / branch patch) directly
 fun tbuf(st: *encode.EncodeState, alloc: *A.Allocator) {
     page.make(alloc);
-    encode.state_blank(st, alloc);
+    encode.state_blank(st, alloc, rv64_machine());
 }
 
 # the same, plus a live interner, for a test whose path mints a constant-pool symbol
 fun tbuf_interned(st: *encode.EncodeState, alloc: *A.Allocator, itn: *intern.Interner) {
     page.make(alloc);
     @itn = intern.init(alloc);
-    encode.state_blank(st, alloc);
+    encode.state_blank(st, alloc, rv64_machine());
     st.interner = itn;
 }
 
@@ -5082,12 +5189,19 @@ test "mach.lang.target.isa.riscv.encode:width_driven_loads_stores_and_alu" {
     if (read_word(?st.buf, 8)  != 0x00A5A023) { bad = 1; }
     if (read_word(?st.buf, 12) != 0x00A5B023) { bad = 1; }
 
-    # alu_opcode / alu_imm_opcode select the RV64 word group only at 32-bit width.
-    if (alu_opcode(8) != OPC_OP)         { bad = 1; }
-    if (alu_opcode(4) != OPC_OP_32)      { bad = 1; }
-    if (alu_opcode(1) != OPC_OP)         { bad = 1; }
-    if (alu_imm_opcode(8) != OPC_OP_IMM) { bad = 1; }
-    if (alu_imm_opcode(4) != OPC_OP_IMM_32) { bad = 1; }
+    # alu_opcode / alu_imm_opcode select the word group only at 32-bit width AND on a
+    # 64-bit register machine. the XLEN-4 arm is the one that distinguishes the pair
+    # from the old `width == 4` rule: on rv32 a 32-bit operation is a full-register
+    # operation, and the word group is a reserved opcode rather than a narrower form.
+    if (alu_opcode(8, 8) != OPC_OP)         { bad = 1; }
+    if (alu_opcode(4, 8) != OPC_OP_32)      { bad = 1; }
+    if (alu_opcode(1, 8) != OPC_OP)         { bad = 1; }
+    if (alu_imm_opcode(8, 8) != OPC_OP_IMM) { bad = 1; }
+    if (alu_imm_opcode(4, 8) != OPC_OP_IMM_32) { bad = 1; }
+    if (alu_opcode(4, 4) != OPC_OP)         { bad = 1; }
+    if (alu_opcode(1, 4) != OPC_OP)         { bad = 1; }
+    if (alu_imm_opcode(4, 4) != OPC_OP_IMM) { bad = 1; }
+    if (alu_imm_opcode(1, 4) != OPC_OP_IMM) { bad = 1; }
 
     encode.buf_dnit(?st.buf);
     ret bad;
@@ -5486,7 +5600,7 @@ test "mach.lang.target.isa.riscv.encode:leaf_prologue_epilogue" {
     f.callee_mask = 0; f.callee_mask_fp = 0;
     f.frame.size = 0; f.frame.outgoing_size = 0; f.frame.slots = nil; f.frame.slot_count = 0;
 
-    val total: u32 = frame_total(?f);
+    val total: u32 = frame_total(?st, ?f);
     if (total != 16) { bad = 1; }
 
     emit_prologue(?st, ?f, total);
@@ -5519,7 +5633,7 @@ test "mach.lang.target.isa.riscv.encode:callee_save_gp_frame" {
     f.callee_mask_fp = 0;
     f.frame.size = 0; f.frame.outgoing_size = 0; f.frame.slots = nil; f.frame.slot_count = 0;
 
-    val total: u32 = frame_total(?f);
+    val total: u32 = frame_total(?st, ?f);
     if (total != 32) { bad = 1; }
 
     emit_prologue(?st, ?f, total);
