@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+#### A target owns its own type definitions, and `#[spirv_op]` becomes `#[op]` (#2888)
+The compiler knew what a sampler was. `src/lang/type.mach` carried a name grammar (`[i|u](sampler|texture|image)<dim>[ms][array][shadow]`), an `ImgForm` reader, a `TypeImage` payload, dimensionality and form enums, and a word list to print a handle back. None of it belonged to a language, and the consequence for a shader library was that it could not add a handle type, could not name a dimensionality, and could not add an instruction without a compiler release.
+
+The operations half of this moved in #2891. This is the types half. `TargetDefs` grows a type-constructor table beside the operation one, with the same contract and the same two readers: the front end closes the value set so a misspelled constructor is a compile error at the declaration, and the back end mints the type from the same row. A row carries an operand LIST rather than just an arity, because a constructor may compose over another type, and an entry is either a literal word or the tag of the constructor a type operand must name. It also carries a refusal hook, which is how a target says why it cannot emit a combination its constructor spells.
+
+A **bodyless `def` carrying `#[handle(target, constructor, operands...)]`** declares a type the owning target mints:
+
+```mach
+#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED)]
+pub def Texture2D;
+
+#[handle("spirv", "sampled_image", Texture2D)]
+pub def Sampler2D;
+```
+
+`def` is the carrier rather than an empty `rec` because it already means "this name denotes a type" and promises no fields and no storage. An empty `rec` promises storage, fields, copyability and nestability, and an attribute retracting all four would make the declaration form assert the opposite of the truth.
+
+`Sampler2D` **names** the image it wraps rather than restating that image's operands, so there is one statement of the shape and the two cannot disagree. That required a real change to how a decorator argument is read, since an argument is an expression position and a bare type name was refused with `` `Inner` is a record type, not a value ``. The change is scoped to this directive and to an argument that names a handle: a type name in `#[align]` is still refused exactly as it was.
+
+The rules a handle carries are fixed and closed, never varied per declaration, and each follows from the one fact the directive states, that the program does not own the representation: no fields, no indexing, no construction, no local binding, no record or union field, no pointer or array around one, and an extent the target declares. On a target that mints no such type the declaration is inert, so a library of handles still compiles for a CPU.
+
+The four refusals the old grammar carried by name survive, re-keyed to the operand that causes each rather than to a spelling, so a depth image, a multisampled image, a `Rect` / `Buffer` / `SubpassData` dimensionality and a storage image are each refused at the declaration with what SPIR-V would need instead. Two further checks close the operand words themselves, which a grammar did not need: an operand is any comptime word a declaration folds, so a value outside the set the target emits would otherwise be written into the module verbatim.
+
+**The name grammar is gone in the same change.** `sampler2d` and its relatives no longer exist, `src/lang/type.mach` loses 495 lines and carries a target-neutral `TYPE_HANDLE` whose payload is a constructor tag and opaque operand words it never reads, and `#[spirv_op(set, name)]` is now `#[op(target, set, name)]` with no alias. Carrying the target as a string in the source rather than in the directive's name is what leaves the front and middle ends unaware of anything but the machinery.
+
+A textured shader emits a **byte-identical module** across the migration: the sampled-image fixture built with the old spellings and with the new declarations produces the same 3984 bytes, and `spirv-val --target-env vulkan1.3` accepts both.
+
 ### Fixed
 
 #### `$length_of` folds in a comptime gate, and a gate folds the same way in both passes (#2875)
