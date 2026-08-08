@@ -76,6 +76,15 @@ Every float encoder on every register machine now refuses a width it does not im
 
 The aarch64 calling convention's two `make_slot_hfa(reg, 1, 16, size)` literals are on the same path and are now written as what they are: the **V register** width, not the vector's. A `f32x3` is twelve bytes and rides a whole register, so "correcting" the literal to `size` breaks it - which is measured, not supposed. What the literal did hide is the vector too wide for one register that #2727 makes legal, which would have been handed V0 and a piece describing half of it; those now spill by value and return indirectly.
 
+#### `--emit-ir` shows a float constant, not its truncated integer magnitude (#2753)
+Every float constant in an IR dump rendered as the integer part of its magnitude, so the surface could not show any distinction living below the decimal point, at the top of the range, or at the bottom of it. `1.5` and `1.75` both printed `f1`. A positive infinity printed `f9223372036854775808`, which is also what the finite value 2^63 printed, so an infinity read as a plausible finite number and the two were indistinguishable. The smallest denormal printed `f0`.
+
+The middle end never lost any of this: `me/pass/cse.mach` value-numbers float constants by bit pattern and `me/pass/algebraic.mach` declines to fold `x + 0.0`, precisely so the IR keeps IEEE distinctions apart. Only the view collapsed them, which matters because a dump is what someone reads when they already suspect a float bug and the fraction is the evidence.
+
+Constants now render through `std.format.write_f64` in shortest round-trippable decimal, so `f1.5`, `f1.75`, `f5e-324` and `f9.223372036854776e18` are each themselves, and the non-finite classes spell themselves as `finf`, `f-inf` and `fnan` rather than borrowing an integer. A NaN whose payload is not the canonical quiet one renders its full bit pattern as `fnan:0x…`, since a payload is a distinction the middle end keeps too. Signed zero still renders `f-0` and `f0`, which #2274 established.
+
+The reason recorded in the code for the old rendering - that std had no float formatter - had gone stale; `printer.mach` already imported `std.format`. The unit test that pinned `-1.5` to `f-1` and `2.5` to `f2` was enforcing the defect rather than any intended behaviour, and now pins the real rendering across the IEEE classes, built from bit patterns rather than decimal literals. Objects are byte-identical: this moves nothing but the dump.
+
 #### An over-aligned stack local is over-aligned at run time (#2735)
 `#[align(32)]` and above worked on a global and did nothing on a local. The slot's offset was a correct multiple of the requested alignment, but it was measured from the frame pointer, and the only alignment that reaches the frame pointer is the ABI's 16-byte call boundary. So the address was a multiple of 32 exactly when the process stack happened to start on one, which depends on the environment block and therefore changes between runs of the same binary. `$size_of` already reported the padded size, so the storage was sized for a promise the placement did not keep.
 
