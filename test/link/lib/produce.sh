@@ -127,7 +127,7 @@
 #                 handle types carry no spirv-dis friendly name, so ids are replaced
 #                 by the shape they were declared with; every id in the output is a
 #                 description, never a number. needs spirv-val and spirv-dis.
-# build-fails is a run-mode but not a producer: it asserts the compile is REJECTED
+# build-fails is a run mode but not a producer: it asserts the compile is REJECTED
 # and takes the compiler's 'error:' diagnostic as the observable. it is handled in
 # run.sh (there is no artifact to run), noted here for discoverability.
 

@@ -2,7 +2,7 @@
 # cc.sh — resolve a C compiler for the leg a case's [step] is building against.
 #
 # A [step] that shells out to a bare `cc` assumes the host toolchain targets the
-# leg being built. That holds on a leg's own native CI runner (every targets.conf
+# leg being built. That holds on a leg's own native CI runner (every engines.conf
 # row builds natively there) but not on a developer's cross-build from a
 # different host - `mach --target linux-arm64` on an x86-64 box still runs the
 # host's x86-64 `cc`, so the step silently emits an x86-64 object that gets
@@ -35,7 +35,7 @@ set -eu
 : "${MACH_TARGET_OS:?cc.sh: MACH_TARGET_OS is not set - this must run as a mach build [step]}"
 
 # host_isa / host_os — this host's own toolchain target, normalized to the
-# same vocabulary targets.conf and every case's [target.*] block use.
+# same vocabulary engines.conf and every case's [target.*] block use.
 host_isa() {
     case "$(uname -m)" in
         x86_64|amd64)  echo x86_64 ;;
@@ -62,10 +62,10 @@ fi
 #
 # COMPILE-ONLY NEEDS NO CROSS LINKER. It DOES need the target's libc headers as
 # soon as a probe includes one, and this file used to claim otherwise - "needs no
-# sysroot or cross-linker for any of these, verified against every targets.conf
+# sysroot or cross-linker for any of these, verified against every registered
 # leg (mach#2741)". That claim was verified against a set that could not disprove
-# it: `c-variadic` was exempt on linux-riscv64, so no probe that cross-built here
-# had ever included a libc header. Un-exempting it (mach#2771) reached the case
+# it: `c-variadic` skipped riscv64-linux, so no probe that cross-built here
+# had ever included a libc header. Restoring that leg (mach#2771) reached the case
 # that falsifies it, and clang resolved the HOST's /usr/include/stdint.h while
 # targeting riscv64 - failing inside it on a file no case mentions
 # ("bits/libc-header-start.h file not found", a multiarch host's glibc looking for
@@ -74,7 +74,7 @@ fi
 # of quiet divergence mach#2741 named. So the riscv64 branch names a sysroot, and
 # no branch pretends the headers are free.
 #
-# extend this table exactly when targets.conf gains a leg (same axis
+# extend this table exactly when engines.conf gains a leg (same axis
 # check-target-matrix.sh already enforces one block per [target.*] on).
 triple=
 extra=
@@ -84,7 +84,7 @@ case "$MACH_TARGET_OS-$MACH_TARGET_ISA" in
     linux-aarch64)   triple=aarch64-linux-gnu ;;
     # riscv64 needs five flags to keep clang's output inside what mach's ELF
     # reader consumes and matching the ABI mach's own riscv64 backend implements,
-    # none of which lose anything these int-case probes need:
+    # none of which lose anything these case probes need:
     #   -march=rv64gc -mabi=lp64d     PINS the architecture profile AND the hard-
     #                                  float calling convention mach's lp64.mach
     #                                  implements (float/double args in the fa
@@ -121,7 +121,7 @@ case "$MACH_TARGET_OS-$MACH_TARGET_ISA" in
     # relocation arithmetic it will never otherwise need (mach#2741).
     #
     # ...and a SYSROOT, because this is the one leg CI cross-builds: linux-riscv64
-    # is the only targets.conf row whose runner is not its own ISA, so it is the
+    # is the only engines.conf row whose runner is not its own ISA, so it is the
     # only leg whose probes need target libc headers in CI. `--sysroot` alone is
     # sufficient and is what makes the resolution honest - clang finds
     # <sysroot>/include and stops searching the host's /usr/include, so a probe
@@ -145,7 +145,7 @@ case "$MACH_TARGET_OS-$MACH_TARGET_ISA" in
     darwin-x86_64)   triple=x86_64-apple-darwin ;;
     darwin-aarch64)  triple=arm64-apple-darwin ;;
     *)
-        echo "cc.sh: no cross-compile triple known for $MACH_TARGET_OS/$MACH_TARGET_ISA (host is $(host_os)/$(host_isa)); add one to int/lib/cc.sh's triple table" >&2
+        echo "cc.sh: no cross-compile triple known for $MACH_TARGET_OS/$MACH_TARGET_ISA (host is $(host_os)/$(host_isa)); add one to test/link/lib/cc.sh's triple table" >&2
         exit 1
         ;;
 esac

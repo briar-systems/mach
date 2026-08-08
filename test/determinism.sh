@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# check-determinism.sh — prove the incremental (warm) build path is deterministic.
+# determinism.sh — prove the incremental (warm) build path is deterministic.
 #
-# usage: check-determinism.sh <compiler> [project-dir]
+# usage: determinism.sh <compiler> [project-dir]
 #
 # The clean self-host fixpoint (b == c) that the build lanes run only exercises
 # from-scratch builds. This guards the warm/incremental path the query engine
@@ -16,7 +16,7 @@ set -eu
 cc=${1:-}
 dir=${2:-.}
 if [ -z "$cc" ]; then
-    echo "usage: check-determinism.sh <compiler> [project-dir]" >&2
+    echo "usage: determinism.sh <compiler> [project-dir]" >&2
     exit 2
 fi
 cc=$(realpath "$cc")
