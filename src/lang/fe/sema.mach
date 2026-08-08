@@ -50,7 +50,7 @@ use mach.lang.fe.token;
 use mach.lang.intern;
 use mach.lang.session;
 use mach.lang.source;
-use mach.lang.spirvop;
+use isa: mach.lang.target.isa;
 use mach.lang.type;
 
 # re-export sema's shared state and accessor API (which lives in the context
@@ -1148,6 +1148,12 @@ fun resolve_embeds_one(sc: *context.SemaContext, did: id.DeclId) R.Result[bool, 
 
     if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
         val ci: *decl.DeclComptimeIf = ?d.data.comptime_if;
+        # a chain that declares nothing carries no `#[embed]` to resolve, and the
+        # layout resolver this pass would need to select an arm is not installed
+        # until body inference (#2876)
+        if (comptime.comptime_if_declares_nothing(sc.a, ci.branches_start, ci.branches_len)) {
+            ret R.ok[bool, str](true);
+        }
         var b: u32 = 0;
         for (b < ci.branches_len) {
             val br: *decl.ComptimeBranch = ?sc.a.comptime_branches[ci.branches_start + b];
@@ -1237,11 +1243,18 @@ fun infer_one_decl(sc: *context.SemaContext, did: id.DeclId) R.Result[bool, str]
 #
 # The selected arm's decl list is walked so its declared types are computed in
 # the enclosing pass.
+#
+# A chain no arm of which declares anything declares no type to compute, and the
+# resolvers its gate may need are installed only around body inference, so it is left
+# untouched here and decided there instead (#2876).
 # ---
 # sc:  the context
 # ci:  the comptime-if decl payload
 # ret: true once the active arm is walked, or the first error
 fun infer_decls_comptime_if(sc: *context.SemaContext, ci: *decl.DeclComptimeIf) R.Result[bool, str] {
+    if (comptime.comptime_if_declares_nothing(sc.a, ci.branches_start, ci.branches_len)) {
+        ret R.ok[bool, str](true);
+    }
     var i: u32 = 0;
     for (i < ci.branches_len) {
         val br: *decl.ComptimeBranch = ?sc.a.comptime_branches[ci.branches_start + i];
@@ -1572,11 +1585,22 @@ fun validate_storage_quals(sc: *context.SemaContext, dec: *decl.Decorator) {
 # report unless a `#[spirv_op(set, name)]` names an instruction the compiler can
 # actually emit
 #
-# The pair is looked up in `spirvop`, the same table lowering resolves the opcode
-# from, so an accepted spelling here and an emitted opcode there cannot drift. Both
-# halves are reported separately: an unknown set and an unknown name in a known set
-# are different mistakes, and "GLSL.std.450 defines no Sqrtf" is a more useful
+# The pair is looked up in the SELECTED TARGET's own definition table, reached as
+# data on the comptime context beside `pointer_width` (#2888). The emitter resolves
+# the opcode from the same rows, so an accepted spelling here and an emitted opcode
+# there cannot drift, and this pass names no target: a target that publishes no
+# operations refuses every spelling, which is what an ordinary machine target should
+# do with a shader instruction.
+#
+# Both halves are reported separately: an unknown set and an unknown name in a known
+# set are different mistakes, and "GLSL.std.450 defines no Sqrtf" is a more useful
 # diagnostic than a single combined refusal.
+#
+# THE ARITY IS CHECKED HERE. The decorator's contract is that operands come from the
+# parameters in order, so a declaration whose parameter list is the wrong length
+# assembles an instruction with the wrong operand count. The family looks uniform and
+# is not: `Reflect` takes two operands where `Refract` takes three, and `FMin` two
+# where `FClamp` takes three.
 # ---
 # sc:  the context
 # d:   the decorated decl
@@ -1601,13 +1625,26 @@ fun validate_spirv_op(sc: *context.SemaContext, d: *decl.Decl, dec: *decl.Decora
     }
     if (set_e.span.len < 2::usize || nam_e.span.len < 2::usize) { ret; }
 
-    val set_v: u8 = spirvop.set_of(sc.source, set_e.span.offset + 1::usize, set_e.span.len - 2::usize);
-    if (set_v == spirvop.SPV_SET_NONE) {
-        context.report(sc, set_e.span, "unknown SPIR-V instruction set; `spirv_op` accepts \"core\" or \"GLSL.std.450\"");
+    val defs: *isa.TargetDefs = sc.ctx.target_defs;
+
+    # a target that publishes no instructions holds no opinion about these spellings,
+    # so the declaration is inert here rather than wrong. it emits no body, and a call
+    # to one is an undefined symbol at link, which is where a CPU build should say so.
+    if (defs == nil || defs.op_count == 0) { ret; }
+
+    if (!isa.op_set_exists_region(defs, sc.source, set_e.span.offset + 1::usize, set_e.span.len - 2::usize)) {
+        context.report(sc, set_e.span, "the selected target defines no instruction set of this name; a `spirv_op` declaration is emitted only by a target that publishes the instruction");
         ret;
     }
-    if (spirvop.opcode_of(set_v, sc.source, nam_e.span.offset + 1::usize, nam_e.span.len - 2::usize) == spirvop.SPV_OP_NONE) {
-        context.report(sc, nam_e.span, "that instruction set defines no instruction of this name, or the SPIR-V target does not carry it; see `mach.lang.spirvop` for the accepted names and why each omission is one");
+    val od: *isa.OpDef = isa.op_def_of_region(defs,
+        sc.source, set_e.span.offset + 1::usize, set_e.span.len - 2::usize,
+        sc.source, nam_e.span.offset + 1::usize, nam_e.span.len - 2::usize);
+    if (od == nil) {
+        context.report(sc, nam_e.span, "that instruction set defines no instruction of this name, or the selected target does not carry it; the target's own table lists the accepted names and why each omission is one");
+        ret;
+    }
+    if (d.data.fun_.params_len != od.arity) {
+        context.report(sc, dec.name, "the declaration's parameter count does not match the instruction's operand count: operands come from the parameters in order, so a mismatch assembles the instruction with the wrong number of operands");
     }
 }
 
@@ -2151,12 +2188,77 @@ fun infer_binding_init(sc: *context.SemaContext, did: id.DeclId, d: *decl.Decl) 
     ret R.ok[bool, str](true);
 }
 
+# evaluate a decl-scope comptime-if that declares nothing, and walk its active arm
+#
+# THIS IS THE PASS THAT DECIDES SUCH A CHAIN (#2876). Name resolution left every arm
+# bound and unselected, because a chain that introduces no name has no reason to be
+# decided before types exist - and a gate that measures, compares or queries a type
+# can only be answered once they do. The layout / type / type-query resolvers are
+# installed around this pass, so the gate folds through exactly the machinery a
+# function-body gate folds through, and the two cannot disagree about a size.
+#
+# The gate is folded HERE WITH DIAGNOSTICS, unlike a declaring chain's, which
+# resolution has already evaluated and already reported on. A deferred gate that
+# still cannot fold has been refused by nobody yet, so an unreported failure would
+# read as an inactive arm and quietly discard a `$error` guard. Such a gate ends the
+# chain rather than falling through to the next arm, for the #2464 reason: a gate
+# that decided nothing must not let an `$or` arm assert the opposite of the failure
+# just reported.
+# ---
+# sc:  the context
+# ci:  the comptime-if decl payload
+# ret: true once the active arm is walked, or the first error
+fun infer_bodies_deferred_chain(sc: *context.SemaContext, ci: *decl.DeclComptimeIf) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < ci.branches_len) {
+        val br: *decl.ComptimeBranch = ?sc.a.comptime_branches[ci.branches_start + i];
+        if (br.cond == id.EXPR_NIL) {
+            ret infer_bodies_in_list(sc, br.body_start, br.body_len);
+        }
+        val e_opt: O.Option[*expr.Expr] = ast.get_expr(sc.a, br.cond);
+        if (O.is_none[*expr.Expr](e_opt)) { ret R.err[bool, str]("comptime branch cond ExprId out of range"); }
+        val cond_span: token.Span = O.unwrap[*expr.Expr](e_opt).span;
+
+        # type the gate before folding it, exactly as `prune_type_comparison_chain`
+        # does: the type and type-query resolvers answer out of the operand types
+        # this populates, so a gate folded against an untyped operand would refuse a
+        # question it can answer.
+        val saved_gate: bool = sc.in_comptime_gate;
+        sc.in_comptime_gate = true;
+        val gate_ty: type.TypeId = infer.infer_expr(sc, br.cond);
+        sc.in_comptime_gate = saved_gate;
+        # a gate that did not type decides nothing and its error is already filed, so
+        # walking the arms anyway would fire a `$error` guard that contradicts it
+        # (#2464)
+        if (gate_ty == type.TYPE_ERROR) { ret R.ok[bool, str](true); }
+
+        val res_eval: R.Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, br.cond, ?sc.s.interner);
+        if (R.is_err[comptime.CTValue, str](res_eval)) {
+            context.report(sc, cond_span, R.unwrap_err[comptime.CTValue, str](res_eval));
+            ret R.ok[bool, str](true);
+        }
+        val gate_val: comptime.CTValue = R.unwrap_ok[comptime.CTValue, str](res_eval);
+        if (gate_val.kind != comptime.CT_KIND_BOOL) {
+            context.report(sc, cond_span, "comptime branch condition must be a bool");
+            ret R.ok[bool, str](true);
+        }
+        if (gate_val.data.b) {
+            ret infer_bodies_in_list(sc, br.body_start, br.body_len);
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
 # evaluate a body-scope comptime-if and recurse into the first active arm
 # ---
 # sc:  the context
 # ci:  the comptime-if decl payload
 # ret: true once the active arm is walked, or the first error
 fun infer_bodies_comptime_if(sc: *context.SemaContext, ci: *decl.DeclComptimeIf) R.Result[bool, str] {
+    if (comptime.comptime_if_declares_nothing(sc.a, ci.branches_start, ci.branches_len)) {
+        ret infer_bodies_deferred_chain(sc, ci);
+    }
     var i: u32 = 0;
     for (i < ci.branches_len) {
         val br: *decl.ComptimeBranch = ?sc.a.comptime_branches[ci.branches_start + i];
@@ -2540,6 +2642,24 @@ fun infer_stmt_comptime_if(sc: *context.SemaContext, start: u32, len: u32, fn_re
     var i: u32 = 0;
     for (i < len) {
         val br: *decl.ComptimeBranch = ?sc.a.comptime_branches[start + i];
+
+        # A GATE SEMA FOLDS IS A GATE SEMA TYPED, the same rule
+        # `prune_type_comparison_chain` and `infer_bodies_deferred_chain` follow.
+        # Lowering re-evaluates this gate at monomorphization and its layout and
+        # type-query resolvers answer out of the operand types stamped here, so a
+        # gate folded untyped measures a type lowering cannot see and the two passes
+        # select different arms (#2875).
+        if (br.cond != id.EXPR_NIL) {
+            val saved_gate: bool = sc.in_comptime_gate;
+            sc.in_comptime_gate = true;
+            val gate_ty: type.TypeId = infer.infer_expr(sc, br.cond);
+            sc.in_comptime_gate = saved_gate;
+            # a gate that did not type decides nothing, and its error is already
+            # filed. walking the arms anyway would fire a `$error` guard that
+            # contradicts it (#2464)
+            if (gate_ty == type.TYPE_ERROR) { ret R.ok[bool, str](true); }
+        }
+
         val res_active: R.Result[bool, str] = comptime_branch_active(sc, br);
         if (R.is_err[bool, str](res_active)) { ret res_active; }
         if (R.unwrap_ok[bool, str](res_active)) {

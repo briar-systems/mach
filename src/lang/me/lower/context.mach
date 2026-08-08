@@ -38,7 +38,7 @@ use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.session;
 use mach.lang.source;
-use mach.lang.spirvop;
+use isa: mach.lang.target.isa;
 use target:  mach.lang.target.resolved;
 use mach.lang.type;
 
@@ -680,8 +680,8 @@ pub fun resolve_type_query(data: ptr, tid: u32, which: u8) R.Result[O.Option[com
     ret infer.answer_type_query(lc.s, tid, which);
 }
 
-# the layout resolver lowering installs so a `$size_of` / `$align_of` gate folds
-# here as well as in sema (#2857)
+# the layout resolver lowering installs so a `$size_of` / `$align_of` / `$length_of`
+# gate folds here as well as in sema (#2857, #2875)
 #
 # LOWERING NEEDS ITS OWN because a `$if` chain does not always fold in sema: a chain
 # gated on a comptime value parameter, or one inside a generic body, has its arm
@@ -696,15 +696,13 @@ pub fun resolve_type_query(data: ptr, tid: u32, which: u8) R.Result[O.Option[com
 # expression: sema's `type_extent` and this both resolve through the one session
 # layout entry (see the note at `lower_type`), so the three cannot disagree.
 #
+# `$length_of` counts elements rather than measuring storage, so it is answered from
+# the SEMA type's `element_count` and never reaches the IR: an element count is a
+# property of the type spelling and is the same on every target, which is exactly
+# what makes reading it here equal to sema's answer.
+#
 # `$offset_of` answers none: it takes a field as its second argument, which this
 # signature does not carry, and sema does not fold it in a gate either.
-#
-# `$length_of` answers none too, for a different and narrower reason: its operand is
-# often written inline (`$length_of([4]f32)`), and an inline type-ref inside a GATE
-# carries no recorded expression type here, so the count cannot be read back. Rather
-# than report a false "expects a fixed array" against an operand that plainly is one,
-# a `$length_of` gate is not deferred to this point at all - see
-# `gate_has_layout_intrinsic` in resolve, and #2875.
 # ---
 # data: the erased *LowerContext
 # eid:  the intrinsic call expression, as a raw id
@@ -716,7 +714,8 @@ pub fun resolve_layout_intrinsic(data: ptr, eid: u32) R.Result[O.Option[comptime
     val src: str = module_source(lc);
     val is_size:  bool = comptime.is_size_of_call(lc.a, src, e);
     val is_align: bool = comptime.is_align_of_call(lc.a, src, e);
-    if (!is_size && !is_align) {
+    val is_len:   bool = comptime.is_length_of_call(lc.a, src, e);
+    if (!is_size && !is_align && !is_len) {
         ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]());
     }
 
@@ -727,6 +726,17 @@ pub fun resolve_layout_intrinsic(data: ptr, eid: u32) R.Result[O.Option[comptime
     # secret-stripped for the reason every other shape decision here is (#2297):
     # `^T` occupies exactly `T`'s storage.
     val op_ty: type.TypeId = type.strip_secret(?lc.s.types, expr_type_of(lc, arg));
+
+    if (is_len) {
+        # the count is read after substitution, so `$length_of(T)` inside a
+        # monomorphized body counts the instance's type argument.
+        val n_opt: O.Option[u32] = type.element_count(?lc.s.types, substitute_type(lc, op_ty));
+        if (O.is_none[u32](n_opt)) {
+            ret R.err[O.Option[comptime.CTValue], str]("`$length_of` expects a fixed array or a vector");
+        }
+        ret R.ok[O.Option[comptime.CTValue], str](
+            O.some[comptime.CTValue](comptime.ct_uint(O.unwrap[u32](n_opt)::u64)));
+    }
 
     val res_ir: R.Result[ir_type.IrTypeId, str] = lower_type(lc, op_ty);
     if (R.is_err[ir_type.IrTypeId, str](res_ir)) {
@@ -1882,9 +1892,10 @@ pub fun ast_source(lc: *LowerContext, a: *ast.Ast) str {
 
 # read a function decl's `#[spirv_op(set, name)]` into a resolved set tag and opcode
 #
-# Both arguments are string literals sema has already closed against the same
-# `spirvop` table, so an unrecognized spelling cannot reach here; SPV_SET_NONE
-# covers the decorator being absent, which is every ordinary function.
+# Both arguments are string literals sema has already closed against the SAME table
+# this reads, the selected target's own, so an unrecognized spelling cannot reach
+# here (#2888). `isa.NO_OP_SET` covers the decorator being absent, which is every
+# ordinary function, and covers a target that publishes no operations at all.
 #
 # The decl and its source text are passed rather than taken from the context
 # because this is read on BOTH sides of a module boundary: on the definition, where
@@ -1894,29 +1905,30 @@ pub fun ast_source(lc: *LowerContext, a: *ast.Ast) str {
 # a:      the AST the decl belongs to
 # src:    that AST's source text
 # d:      the function's decl
+# defs:   the selected target's operation table, or nil
 # out_op: receives the opcode within the set, untouched when there is no decorator
-# ret:    one of spirvop.SPV_SET_*
-pub fun decl_spirv_op(a: *ast.Ast, src: str, d: *adecl.Decl, out_op: *u32) u8 {
-    if (a == nil || d == nil) { ret spirvop.SPV_SET_NONE; }
+# ret:    the target's own tag for the set, or isa.NO_OP_SET
+pub fun decl_target_op(a: *ast.Ast, src: str, d: *adecl.Decl, defs: *isa.TargetDefs, out_op: *u32) u32 {
+    if (a == nil || d == nil) { ret isa.NO_OP_SET; }
     var i: u32 = 0;
     for (i < d.decorators_len) {
         val dec: *adecl.Decorator = ?a.decorators[d.decorators_start + i];
         if (!str_region_equals(src, dec.name.offset, dec.name.len, "spirv_op")) { i = i + 1; cnt; }
-        if (dec.args_len != 2) { ret spirvop.SPV_SET_NONE; }
+        if (dec.args_len != 2) { ret isa.NO_OP_SET; }
         val opt_set: O.Option[*aexpr.Expr] = ast.get_expr(a, a.expr_ids[dec.args_start]);
         val opt_nam: O.Option[*aexpr.Expr] = ast.get_expr(a, a.expr_ids[dec.args_start + 1]);
-        if (O.is_none[*aexpr.Expr](opt_set) || O.is_none[*aexpr.Expr](opt_nam)) { ret spirvop.SPV_SET_NONE; }
+        if (O.is_none[*aexpr.Expr](opt_set) || O.is_none[*aexpr.Expr](opt_nam)) { ret isa.NO_OP_SET; }
         val set_e: *aexpr.Expr = O.unwrap[*aexpr.Expr](opt_set);
         val nam_e: *aexpr.Expr = O.unwrap[*aexpr.Expr](opt_nam);
-        if (set_e.span.len < 2::usize || nam_e.span.len < 2::usize) { ret spirvop.SPV_SET_NONE; }
-        val set_v: u8 = spirvop.set_of(src, set_e.span.offset + 1::usize, set_e.span.len - 2::usize);
-        if (set_v == spirvop.SPV_SET_NONE) { ret spirvop.SPV_SET_NONE; }
-        val op: u32 = spirvop.opcode_of(set_v, src, nam_e.span.offset + 1::usize, nam_e.span.len - 2::usize);
-        if (op == spirvop.SPV_OP_NONE) { ret spirvop.SPV_SET_NONE; }
-        @out_op = op;
-        ret set_v;
+        if (set_e.span.len < 2::usize || nam_e.span.len < 2::usize) { ret isa.NO_OP_SET; }
+        val od: *isa.OpDef = isa.op_def_of_region(defs,
+            src, set_e.span.offset + 1::usize, set_e.span.len - 2::usize,
+            src, nam_e.span.offset + 1::usize, nam_e.span.len - 2::usize);
+        if (od == nil) { ret isa.NO_OP_SET; }
+        @out_op = od.opcode;
+        ret od.set_tag;
     }
-    ret spirvop.SPV_SET_NONE;
+    ret isa.NO_OP_SET;
 }
 
 # emit an OP_DBG_VALUE binding the source variable named by `name_span` (type
