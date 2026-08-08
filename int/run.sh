@@ -413,19 +413,18 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
 
         # the golden is shared across build-targets for target-independent observables
         # (exec, the relro-fault guard, and the panic-exit guard, whose outputs are all
-        # target-independent; debuginfo, whose two facts — validator-clean and additive
-        # — hold identically on every ELF ISA), per-profile for gdb-session (its stop/
-        # frame/value facts are a real function of the active profile's own codegen —
-        # opt0's location and line-table construction is a materially different
-        # pipeline from opt2's, #2779 — rather than of the target ISA/format the
-        # build-target axis tracks, which is why this reads $profile and must live
-        # inside this loop rather than being decided once per case like the other two
-        # tiers), and per-build-target for structural producers (their fact is
-        # format-specific).
+        # target-independent; debuginfo and symtab, whose facts hold identically on
+        # every ELF ISA), per-profile for gdb-session (its stop/frame/value facts are
+        # a real function of the active profile's own codegen — opt0's location and
+        # line-table construction is a materially different pipeline from opt2's,
+        # #2779 — rather than of the target ISA/format the build-target axis tracks,
+        # which is why this reads $profile and must live inside this loop rather than
+        # being decided once per case like the other two tiers), and per-build-target
+        # for structural producers (their fact is format-specific).
         case "$case_run" in
-            exec|relro-fault|panic-exit|debuginfo|varloc-fbreg) golden="$dir/expect.txt" ;;
-            gdb-session)                                        golden="$dir/expect.$profile.txt" ;;
-            *)                                                   golden="$dir/expect.$build_target.txt" ;;
+            exec|relro-fault|panic-exit|debuginfo|varloc-fbreg|symtab) golden="$dir/expect.txt" ;;
+            gdb-session) golden="$dir/expect.$profile.txt" ;;
+            *)           golden="$dir/expect.$build_target.txt" ;;
         esac
 
         # the build artifact goes under the case's gitignored out/ via a path
