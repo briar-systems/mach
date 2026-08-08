@@ -408,7 +408,7 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
     # hold identically on every ELF ISA) and per-build-target for structural producers
     # (their fact is format-specific).
     case "$case_run" in
-        exec|relro-fault|panic-exit|debuginfo|varloc-fbreg) golden="$dir/expect.txt" ;;
+        exec|relro-fault|panic-exit|debuginfo|varloc-fbreg|symtab) golden="$dir/expect.txt" ;;
         *)                                                 golden="$dir/expect.$build_target.txt" ;;
     esac
 

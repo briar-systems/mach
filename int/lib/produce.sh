@@ -2169,10 +2169,19 @@ produce_debuginfo() {
         ')
         set -- $counts
         printf 'weak_%s_dies=live:%s,dead:%s\n' "$label" "$1" "$2"
+        # a substring match, not equality: once a `.symtab` exists (#2772) a real
+        # symbolizer prefers the ELF symbol table's linkage name over DWARF's
+        # DW_AT_name for the function-name field, so the resolved text is the
+        # mangled form (e.g. `_M7dbgcase7genericN11identI3i64E`), not the bare
+        # source identifier - and the mangling scheme itself is due to change
+        # (the dotted-name rewrite). either way the source identifier is still
+        # IN there, so that is the fact this asserts, printed back as the
+        # semantic label rather than the raw resolved text so the golden names
+        # what was checked instead of freezing today's mangling spelling.
         symbol=missing
         if [ -n "$3" ]; then
             resolved=$("$sym_tool" --obj="$g" "$3" | sed -n '1p')
-            if [ "$resolved" = "$want" ]; then symbol=$resolved; fi
+            case "$resolved" in *"$want"*) symbol=$want ;; esac
         fi
         printf 'weak_%s_symbol=%s\n' "$label" "$symbol"
 
@@ -2200,6 +2209,95 @@ produce_debuginfo() {
             printf 'weak_pack_locations=%s\n' "$loc_state"
         fi
     done
+}
+
+# produce_symtab <runmode> <target> <binary>
+# the ELF `.symtab` observable (#2772): a PLAIN build (no `-g`, no special flag -
+# the shape a shipped release binary actually has) now carries a real function
+# symbol table, which int/surface/debuginfo cannot speak to at all (DWARF is a
+# `-g`-only concern). requires nm, readelf, and addr2line; a missing tool is a
+# hard error, the same contract produce_debuginfo already uses for its own
+# validators.
+produce_symtab() {
+    b=$3
+    command -v nm >/dev/null 2>&1 || {
+        echo "int: symtab: nm not found (install the 'binutils' package)" >&2; return 2
+    }
+    command -v readelf >/dev/null 2>&1 || {
+        echo "int: symtab: readelf not found (install the 'binutils' package)" >&2; return 2
+    }
+    command -v addr2line >/dev/null 2>&1 || {
+        echo "int: symtab: addr2line not found (install the 'binutils' package)" >&2; return 2
+    }
+
+    sh_out=$(readelf -SW "$b" 2>/dev/null)
+    if printf '%s\n' "$sh_out" | grep -qE '\.symtab +SYMTAB'; then
+        echo "symtab_present=yes"
+    else
+        echo "symtab_present=no"
+    fi
+    if printf '%s\n' "$sh_out" | grep -qE '\.strtab +STRTAB'; then
+        echo "strtab_present=yes"
+    else
+        echo "strtab_present=no"
+    fi
+
+    # `nm` (the standard "does this binary have symbols at all" tool) finds both
+    # the fixture's functions as defined (T) symbols: `main` (an explicit
+    # `#[symbol("main")]`, unmangled) and `burn` (mangled - matched by substring,
+    # not exact name, since the mangling scheme is not this case's concern).
+    nm_out=$(nm "$b" 2>/dev/null)
+    if printf '%s\n' "$nm_out" | grep -qE ' T main$'; then
+        echo "nm_main=defined"
+    else
+        echo "nm_main=missing"
+    fi
+    if printf '%s\n' "$nm_out" | grep -qE ' T .*burn'; then
+        echo "nm_burn=defined"
+    else
+        echo "nm_burn=missing"
+    fi
+
+    # mid-function resolution: the address at burn's st_value PLUS HALF of its
+    # st_size must still resolve to burn - the check `st_size` is right, not just
+    # present, and the one most likely to be skipped (a symbol table with entries
+    # and no real sizes looks fine under `nm` and only fails a profiler later).
+    burn_line=$(readelf -sW "$b" 2>/dev/null | awk '/burn/ && / FUNC / { print; exit }')
+    burn_val=$(printf '%s\n' "$burn_line" | awk '{ print $2 }')
+    burn_size=$(printf '%s\n' "$burn_line" | awk '{ print $3 }')
+    if [ -n "$burn_val" ] && [ -n "$burn_size" ] && [ "$burn_size" -gt 0 ]; then
+        mid=$(( 0x$burn_val + burn_size / 2 ))
+        resolved=$(addr2line -f -e "$b" "$(printf '0x%x' "$mid")" 2>/dev/null | sed -n '1p')
+        case "$resolved" in
+            *burn*) echo "midfunc_resolve=burn" ;;
+            *)      echo "midfunc_resolve=other" ;;
+        esac
+    else
+        echo "midfunc_resolve=no-symbol"
+    fi
+
+    # byte-additivity (the property int/surface/debuginfo's elf_seg_identical
+    # proves for DWARF, here read directly off the load segments rather than
+    # from a before/after diff, since this symbol table is unconditional - there
+    # is no "before" build to compare against): every PT_LOAD's file extent must
+    # end at or before .symtab's file offset, so a loader - which reads only
+    # PT_LOAD - never sees a byte the symbol table touched.
+    # readelf -SW's leading "[ N]" is two whitespace-split fields ("[" and "N]"),
+    # so the section name is $3 and the file offset is $6.
+    symtab_off_hex=$(printf '%s\n' "$sh_out" | awk '$3 == ".symtab" { print $6; exit }')
+    last_load_end=0
+    while read -r typ off _va _pa filesz _memsz _flg _align; do
+        [ "$typ" = "LOAD" ] || continue
+        seg_end=$(( off + filesz ))
+        if [ "$seg_end" -gt "$last_load_end" ]; then last_load_end=$seg_end; fi
+    done <<PHDRS
+$(readelf -lW "$b" 2>/dev/null | awk '/^  LOAD/ { print }')
+PHDRS
+    if [ -n "$symtab_off_hex" ] && [ "$last_load_end" -le "$(( 0x$symtab_off_hex ))" ]; then
+        echo "symtab_after_loadable=yes"
+    else
+        echo "symtab_after_loadable=no"
+    fi
 }
 
 # resolve_objdump — print an llvm-objdump on PATH, preferring the unversioned name
@@ -2760,6 +2858,7 @@ produce() {
         flat-loader) produce_flat_loader "$@" ;;
         built)       produce_built "$@" ;;
         debuginfo)   produce_debuginfo "$@" ;;
+        symtab)      produce_symtab "$@" ;;
         spirv-val)   produce_spirv_val "$@" ;;
         spirv-val-vulkan) produce_spirv_val_vulkan "$@" ;;
         spirv-shader) produce_spirv_shader "$@" ;;

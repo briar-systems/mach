@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### A release build now carries a real ELF `.symtab`, so `perf` and a crash reporter can resolve a function name without a `-g` rebuild (#2772)
+Mach emitted no `.symtab` in any build, release or `-g`: `nm` reported nothing, `perf` could not symbolize a profile, and a crash address from a shipped binary mapped to a function only by rebuilding with `-g` and doing a DWARF lookup against the exact matching build - two ordinary workflows a shipping game needs, neither possible before this.
+
+A static ELF executable (`emit_exec`) now carries `.symtab` + `.strtab` with every defined function's mangled name, final virtual address, and byte size, collected by `build_symtab_entries` from the same merged-symbol data `build_exec_functions` already reads for PE unwind tables, and serialized by `elf.build_symtab_bytes`. Function symbols only, not globals: functions cover profiling and crash triage, and a data symbol table costs more file size for less of either. Sizes are real, not zero-filled - `nm` alone cannot see a `st_size` gap, but a profiler attributing an address *inside* a hot loop can, so this repo's own `int/surface/symtab` case asserts a mid-function address resolves correctly, not just a function's entry point.
+
+Trails every `PT_LOAD` segment exactly like `int/surface/debuginfo`'s DWARF sections already do (`readelf -SW`/`-lW` confirm `.symtab`'s file offset never precedes a loaded segment's end), so a release image's runtime bytes are unchanged - the loader ignores non-allocated sections and a release build stays byte-for-byte the same program, just no longer anonymous to a debugger or profiler reading its container. This is a real, measured trade against the previous byte-identical *header-less* release image, though: a build that carried no section-header table at all now carries one whenever it carries a symbol table (which is every static build now), and the compiler's own release binary - a large, real program with 8,408 function symbols - grew by about 611 KiB (7.3%) for it. `perf record`/`perf report` on a release build built with this change resolves `[.] main` by name where it previously showed a raw address; `addr2line -f` on an address in the middle of a function's body (not just its entry) resolves to that function, proving `st_size` is correct and not merely present.
+
+Scoped to ELF's plain static executable writer (`emit_exec`) for now: a PIE/dynamically-linked executable (`emit_dyn_exec`) and a shared library (`emit_shared`) do not carry a symbol table yet, and neither does Mach-O (`LC_SYMTAB`) or PE/COFF (its own, mostly-obsolete-under-PDB symbol table) - both accept the same `of.SymtabEntry` channel for `of.ExecFn` conformance and ignore it. `of.SymtabEntry` (name, final vaddr, byte size, STB_LOCAL/STB_GLOBAL linkage) is the format-neutral shape a future writer for either reads from, so extending coverage is wiring a serializer, not redesigning the data.
+
 ### Fixed
 
 #### A C `[step]` cross-builds for its leg instead of silently assuming the host toolchain targets it (#2741)
