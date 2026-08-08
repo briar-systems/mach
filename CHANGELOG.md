@@ -29,6 +29,13 @@ The two paths computed one fact in two places and agreed only by accident. The h
 
 ### Added
 
+#### aarch64 emits the B and H views of a V register, so a two-byte vector moves in one instruction (#2716)
+`vec_mem_widths` declared 4, 8 and 16 on aarch64 while the architecture also has B and H views of the same V register. The gap was not neutral: declaring 1 and 2 anyway turned an `i8x2` copy into `internal compiler error: aarch64 has no float memory access form for this width`, because the model claimed a capability the encoder did not have. That is what an aspirational declaration produces, and it is why the field describes **what the back end emits** rather than what the ISA has.
+
+The encoder emits them now — `ldr`/`str`, `ldur`/`stur` and the register-offset forms at B and H, every word byte-exact against `llvm-mc -triple=aarch64` and re-checked by disassembling the emitted object — so the declaration grew to match. That order is the rule, never the reverse. `copy_i8x2` goes from a stack frame, a 16-byte scratch slot and a chunk walk to `ldr h0, [x2]` / `str h0, [x1]`.
+
+They join the plain `ldr`/`str` mnemonic rows rather than taking `ldrb`/`ldrh`: those name a W destination and have to say which part of it they wrote, while `ldr b0, [x1]` transfers exactly the register named. The width-refusal test moved with the forms — 1 and 2 are now asserted **accepted** at their exact words, and 0, 12 and 32 stay refused, which is the property that test exists for.
+
 #### A vector of any lane count compiles on every target, whether or not a vector register can hold it (#2727)
 `f32x5`, `f32x8` and `f32x16` were refused **by name** at the front end on every target: `vector `f32x8` is 256 bits wide, more than this target's 128-bit vector width`. That read a realization fact as a legality rule, and it was incoherent besides — rv64gc has no vector unit at all, scalarizes every vector it is handed, and still refused `f32x8` on the ground of a 128-bit SIMD width it does not have.
 
