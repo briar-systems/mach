@@ -88,6 +88,19 @@ it (Darwin's underscore prefix, nothing elsewhere; see
 [ext-fun.md](ext-fun.md)). `symbol` gives the exact name the linker sees, with no
 platform prefix applied to it.
 
+A mangled name is the source FQN, dotted, with generic arguments after a `$`:
+`std.types.string.str_len`, `std.types.option.unwrap$ptr`. Each argument is
+introduced by a run of `$` whose length is its nesting depth, so a nested
+argument closes without a bracket — `f[Map[Vec[i64], str], u8]` is
+`m.f$m.Map$$m.Vec$$$i64$$str$u8`. `p$u8` is `*u8`, `sec$u32` is `^u32`,
+`arr4$u8` is `[4]u8`, `fn$$i64$$u8` is `fun(u8) i64`, a record is its own dotted
+origin FQN, a comptime value is its literal, and a variadic-pack instance carries
+a `pack` marker before its element list. A `test "label"` symbol keeps the quoted
+label as its name. There is no prefix: a mangled name always contains a `.`, and
+a C identifier never can. Both `.` and `$` are legal in an inline-asm symbol, so
+any emitted symbol can be named from `asm` — but the spelling is not a stability
+promise, and binding to one from C is not a supported use.
+
 ### `library(str)` — dynamic import attribution
 
 Pins an `ext` import to a specific dependency in the link set. Applies to

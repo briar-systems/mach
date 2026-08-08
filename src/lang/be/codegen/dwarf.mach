@@ -455,6 +455,14 @@ rec DwVar {
 # cmp_rel:     the relation (encoder CMPREL_*) for a VLOC_CMP
 # cmp_signed:  true for a signed relation
 # cmp_width:   compare width in bytes (0 reads as the machine word)
+# reused:      true when `end` was bounded by `bound_storage_reuse` finding another
+#              variable's real binding claiming this same physical home (mach#2779)
+#              rather than by the next binding of THIS variable, or by a VLOC_CMP's
+#              own fused-terminator extent. classify_var reads this to force the
+#              loclist tier even when the home never disagreed with itself - a
+#              stationary single-location DW_AT_location has no PC bound at all, so
+#              describing "valid only until the reuse point" needs a loclist
+#              regardless of how many distinct homes the variable itself had.
 rec LocRange {
     start:   u32;
     end:     u32;
@@ -470,6 +478,7 @@ rec LocRange {
     cmp_rel:    u8;
     cmp_signed: bool;
     cmp_width:  u8;
+    reused:     bool;
 }
 
 # one inlined-subroutine instance, emitted as a DW_TAG_inlined_subroutine nested under
@@ -3271,8 +3280,9 @@ fun gather_vars(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, dty
         i = i + 1;
     }
 
-    # phase B: per variable, collect its bindings as contiguous PC-ordered ranges, then
-    # classify the location tier.
+    # phase B: per variable, collect its bindings as contiguous PC-ordered ranges.
+    # classification (phase D) waits until every variable's ranges exist, since
+    # phase C bounds a range against every OTHER variable in the function.
     var vi: u32 = fn_var_start;
     for (vi < @var_count) {
         val v: *DwVar = ?vars[vi];
@@ -3336,6 +3346,7 @@ fun gather_vars(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, dty
             ranges[@range_count].cmp_rel    = cmp_rel;
             ranges[@range_count].cmp_signed = cmp_signed;
             ranges[@range_count].cmp_width  = cmp_width;
+            ranges[@range_count].reused     = false;
             @range_count = @range_count + 1;
             k = k + 1;
         }
@@ -3351,8 +3362,93 @@ fun gather_vars(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, dty
             r = r + 1;
         }
 
-        classify_var(v, ranges);
         vi = vi + 1;
+    }
+
+    # phase C: bound a real-home range to the point some OTHER variable's binding
+    # first claims the identical physical home. The opt0 allocator reusing a dead
+    # variable's storage is legitimate codegen - a range's default end (`hi`, the
+    # function's own end, set above) is only ever wrong when nothing later in the
+    # SAME variable's own bindings closes it first, which is exactly the case a
+    # reused-but-never-rebound variable falls into: its one binding's range still
+    # runs to `hi` even after the debugger's storage genuinely became a different
+    # variable's (mach#2779). must run over every variable ONLY after every
+    # variable's own ranges above are fully built and sorted, since it searches
+    # across the whole function's variable set, not just the one range in hand.
+    var vi2: u32 = fn_var_start;
+    for (vi2 < @var_count) {
+        val v2: *DwVar = ?vars[vi2];
+        var r2: u32 = v2.range_start;
+        val vend2: u32 = v2.range_start + v2.range_count;
+        for (r2 < vend2) {
+            val rg2: *LocRange = ?ranges[r2];
+            if (range_real_home(v2, rg2)) {
+                bound_storage_reuse(vars, ranges, fn_var_start, @var_count, vi2, rg2);
+            }
+            r2 = r2 + 1;
+        }
+        vi2 = vi2 + 1;
+    }
+
+    # phase D: classify each variable's location tier from its final ranges, now
+    # that phase C has bounded every storage-reuse collision.
+    var vi3: u32 = fn_var_start;
+    for (vi3 < @var_count) {
+        classify_var(?vars[vi3], ranges);
+        vi3 = vi3 + 1;
+    }
+}
+
+# bound `rg`'s end to the earliest point some OTHER variable's binding in the same
+# function AND THE SAME INLINE SITE claims the identical physical home (register or
+# frame slot). Converges to the EARLIEST such collision regardless of scan order:
+# each accepted collision narrows `rg.end`, and only a collision starting before the
+# current (possibly already-narrowed) `rg.end` is accepted, so a later, looser match
+# found first can never widen it back out. Marks the range `reused` so `classify_var`
+# promotes an otherwise-stationary home to a bounded loclist - a plain exprloc has no
+# PC bound at all, so "valid only until the reuse point" cannot be expressed by
+# leaving the home alone (mach#2779).
+#
+# THE INLINE-SITE RESTRICTION IS LOAD-BEARING, not an optimization. At opt2, a whole
+# call tree can inline into one subprogram, so `gather_vars` gathers every inlined
+# instance's own locals into the SAME per-function `vars` slice, distinguished only
+# by `inline_site`. Two variables in DIFFERENT inline instances (or one inlined, one
+# not) can legitimately land in the same physical register with no live-range overlap
+# at all - ordinary, correct register reuse across two calls that simply never run at
+# the same time in the compiled code - and neither is ever in the OTHER's DWARF
+# scope, so a debugger could never confuse them regardless of what their ranges say.
+# Comparing across inline sites anyway found exactly that false positive here: adding
+# two new, unrelated functions to the same source file changed opt2's register
+# assignment enough that `accumulate`'s `i` (its own top-level scope) collided on
+# paper with an inlined `dies`/`staysalive` local dozens of lines later in `main`,
+# and this function truncated `i`'s real, still-live value away at a PC that was
+# still genuinely inside `accumulate`'s own loop.
+# ---
+# vars/ranges:   the shared per-function variable / range arrays
+# fn_var_start / var_count: this function's variable slice within `vars`
+# vi:  the index of `rg`'s own owning variable (excluded from the search - a
+#      variable's later binding of ITSELF already closed `rg.end` above, and is not
+#      a storage "reuse" in the sense this bounds); its `inline_site` scopes the
+#      search to variables sharing that same site
+# rg:  the range to bound, mutated in place
+fun bound_storage_reuse(vars: *DwVar, ranges: *LocRange, fn_var_start: u32, var_count: u32, vi: u32, rg: *LocRange) {
+    val site: u32 = vars[vi].inline_site;
+    var vj: u32 = fn_var_start;
+    for (vj < var_count) {
+        if (vj == vi || vars[vj].inline_site != site) { vj = vj + 1; cnt; }
+        val other: *DwVar = ?vars[vj];
+        var rk: u32 = other.range_start;
+        val oend: u32 = other.range_start + other.range_count;
+        for (rk < oend) {
+            val og: *LocRange = ?ranges[rk];
+            if (range_real_home(other, og) && og.start > rg.start && og.start < rg.end
+                && home_eq(rg.kind, rg.reg, rg.off, rg.net, og.kind, og.reg, og.off, og.net)) {
+                rg.end    = og.start;
+                rg.reused = true;
+            }
+            rk = rk + 1;
+        }
+        vj = vj + 1;
     }
 }
 
@@ -3451,15 +3547,20 @@ fun range_real_home(v: *DwVar, rg: *LocRange) bool {
 # classify a variable's location tier from its gathered ranges: VLOC_NONE when no
 # binding has a real home (every binding optimized out, or - for a byref aggregate -
 # only register homes, which it cannot describe); a single inline exprloc (VLOC_REG /
-# VLOC_FRAME, `range_count` cleared) when every real binding agrees on one home;
-# VLOC_LOCLIST (ranges kept) when two real homes disagree. A non-real binding never
-# constrains a stationary home - it only introduces a loclist gap
+# VLOC_FRAME, `range_count` cleared) when every real binding agrees on one home AND
+# none was bounded by a storage-reuse collision; VLOC_LOCLIST (ranges kept) when two
+# real homes disagree, OR `bound_storage_reuse` (phase C, mach#2779) narrowed one of
+# them - a stationary exprloc has no PC bound at all, so "this home is only valid
+# until it was reused" cannot be said without a loclist even when the home itself
+# never changed. A non-real binding never constrains a stationary home - it only
+# introduces a loclist gap
 # ---
 # v:      the variable to classify (loc_kind / home / range_count set in place)
 # ranges: the shared range array (this variable's slice is `[range_start, +range_count)`)
 fun classify_var(v: *DwVar, ranges: *LocRange) {
     var first: i32 = -1;
     var multi: bool = false;
+    var reused: bool = false;
     var r: u32 = v.range_start;
     val end: u32 = v.range_start + v.range_count;
     for (r < end) {
@@ -3470,11 +3571,13 @@ fun classify_var(v: *DwVar, ranges: *LocRange) {
                            ranges[r].kind, ranges[r].reg, ranges[r].off, ranges[r].net)) {
                 multi = true;
             }
+            if (ranges[r].reused) { reused = true; }
         }
         r = r + 1;
     }
-    if (first < 0) { v.loc_kind = VLOC_NONE; v.range_count = 0; ret; }
-    if (multi)     { v.loc_kind = VLOC_LOCLIST; ret; }
+    if (first < 0)   { v.loc_kind = VLOC_NONE; v.range_count = 0; ret; }
+    if (multi)       { v.loc_kind = VLOC_LOCLIST; ret; }
+    if (reused)      { v.loc_kind = VLOC_LOCLIST; ret; }
     # a single computed-compare binding still takes the loclist tier: its range
     # is bounded to the fused terminator's bytes, which a whole-scope
     # single-location DW_AT_location cannot express.
@@ -4710,6 +4813,53 @@ test "mach.lang.be.codegen.dwarf.classify_var:tiers" {
     var v4: DwVar; v4.range_start=6; v4.range_count=2;
     classify_var(?v4, ?ranges[0]);
     if (v4.loc_kind != VLOC_FRAME || v4.offset != -8 || v4.range_count != 0) { code = 1; }
+
+    # a SINGLE real home, never disagreeing with itself, but marked `reused` (mach#2779)
+    # -> still a loclist, not a stationary exprloc. A plain exprloc has no PC bound, so
+    # a home that only became invalid partway through the scope cannot be described by
+    # leaving it stationary just because it was consistent while it lasted.
+    ranges[0].reused = true;
+    var v5: DwVar; v5.range_start=0; v5.range_count=1;
+    classify_var(?v5, ?ranges[0]);
+    if (v5.loc_kind != VLOC_LOCLIST) { code = 1; }
+    ranges[0].reused = false;
+    ret code;
+}
+
+# bound_storage_reuse truncates a range to the point another variable's binding
+# claims the identical physical home - but only within the SAME inline site. A
+# collision across DIFFERENT inline sites (mach#2779's own regression: adding two
+# unrelated functions changed opt2's register assignment enough that an inlined
+# local several call sites away happened to land on the same register as a live
+# accumulator variable, with no real relationship between the two) must NOT truncate
+# anything - the two variables are never in each other's DWARF scope, so a debugger
+# could never confuse them regardless of what their ranges say.
+test "mach.lang.be.codegen.dwarf.bound_storage_reuse:same_site_truncates_cross_site_does_not" {
+    var code: i32 = 0;
+    var vars: [2]DwVar;
+    var ranges: [2]LocRange;
+
+    # same inline site (0): `other` claims r5 starting at offset 8, inside `rg`'s
+    # [0, 100) - `rg` must be truncated to end at 8 and marked reused.
+    vars[0].inline_site = 0;
+    vars[0].byref = false;
+    vars[0].range_start = 0; vars[0].range_count = 0;
+    vars[1].inline_site = 0;
+    vars[1].byref = false;
+    vars[1].range_start = 1; vars[1].range_count = 1;
+    ranges[1].start=8; ranges[1].end=20; ranges[1].kind=VLOC_REG; ranges[1].reg=5; ranges[1].off=0; ranges[1].net=0; ranges[1].reused=false;
+    var rg: LocRange;
+    rg.start=0; rg.end=100; rg.kind=VLOC_REG; rg.reg=5; rg.off=0; rg.net=0; rg.reused=false;
+    bound_storage_reuse(?vars[0], ?ranges[0], 0, 2, 0, ?rg);
+    if (rg.end != 8 || !rg.reused) { code = 1; }
+
+    # identical collision, but `other` (index 1) now belongs to inline site 1, a
+    # DIFFERENT scope from `rg`'s owner (site 0): no truncation, no reused flag.
+    vars[1].inline_site = 1;
+    var rg2: LocRange;
+    rg2.start=0; rg2.end=100; rg2.kind=VLOC_REG; rg2.reg=5; rg2.off=0; rg2.net=0; rg2.reused=false;
+    bound_storage_reuse(?vars[0], ?ranges[0], 0, 2, 0, ?rg2);
+    if (rg2.end != 100 || rg2.reused) { code = 1; }
     ret code;
 }
 

@@ -2546,6 +2546,13 @@ fun bind_expr(rc: *ResolveContext, eid: id.ExprId) R.Result[bool, str] {
         if (R.is_err[bool, str](rc_e)) { ret rc_e; }
         ret bind_generic_call(rc, e.data.call.type_args_start, e.data.call.type_args_len, e.data.call.args_start, e.data.call.args_len);
     }
+    if (e.kind == expr.EXPR_KIND_GENERIC_INSTANCE) {
+        # `object[T, ..]` with no call after it (#2342): the bracket reads as a
+        # type-argument list, and possibly also as a subscript. choose now from
+        # the object's resolved kind, exactly as resolve_bracket_call does for
+        # the callee form, and canonicalize before sema sees the node.
+        ret resolve_bracket_value(rc, eid);
+    }
     if (e.kind == expr.EXPR_KIND_INDEX) {
         val ro: R.Result[bool, str] = bind_expr(rc, e.data.index.object);
         if (R.is_err[bool, str](ro)) { ret ro; }
@@ -2701,6 +2708,98 @@ fun resolve_bracket_call(rc: *ResolveContext, eid: id.ExprId) R.Result[bool, str
     e.data.call.type_args_start = 0;
     e.data.call.type_args_len   = 0;
     ret bind_expr_list(rc, args_start, args_len);
+}
+
+# resolves a bracket in VALUE position `object[x]` (EXPR_KIND_GENERIC_INSTANCE)
+# that the parser could not classify: `[x]` read as a type-argument list, and
+# possibly also as an index expression
+#
+# The predicate here is deliberately NOT callee_accepts_type_args. With no `(` to
+# key on, every subscript in the language reaches this path, so the question must
+# be the narrow one - does the object name a FUNCTION declaration, the only thing
+# a value-position instance can denote - rather than the broad "can this take
+# type arguments in callee position". The broad predicate accepts SYM_IMPORTED
+# unconditionally and would rule `mod.ARR[i]`, an imported array indexed by a
+# name, a generic instance.
+#
+# The node is canonicalized to the chosen shape: kept as a generic instance with
+# index_callee cleared, or rewritten in place into the pre-built INDEX node's
+# shape so sema and lowering see an ordinary subscript.
+# ---
+# rc:  resolver state for the module being resolved
+# eid: the bracket-value expression
+# ret: ok(true), or a binding error
+fun resolve_bracket_value(rc: *ResolveContext, eid: id.ExprId) R.Result[bool, str] {
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, eid);
+    if (O.is_none[*expr.Expr](e_opt)) { ret R.err[bool, str]("ExprId out of range"); }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
+
+    val object:          id.ExprId = e.data.call.callee;
+    val index_callee:    id.ExprId = e.data.call.index_callee;
+    val type_args_start: u32       = e.data.call.type_args_start;
+    val type_args_len:   u32       = e.data.call.type_args_len;
+    val span:            token.Span = e.span;
+
+    val ro: R.Result[bool, str] = bind_expr(rc, object);
+    if (R.is_err[bool, str](ro)) { ret ro; }
+
+    if (object_names_function(rc, object)) {
+        e.data.call.index_callee = id.EXPR_NIL;
+        ret bind_generic_call(rc, type_args_start, type_args_len, 0, 0);
+    }
+
+    if (index_callee == id.EXPR_NIL) {
+        # the payload is a type spelling and nothing else (`arr[*i32]`), so there
+        # is no subscript reading to fall back on. report against the object,
+        # which is what the type arguments would have had to name.
+        val re: R.Result[bool, str] = diagnostic.error(?rc.s.diags, rc.a.file_id, span,
+            "type arguments in value position name a generic instance, but this does not name a generic function");
+        if (R.is_err[bool, str](re)) { ret re; }
+        e.kind = expr.EXPR_KIND_ERROR;
+        ret R.ok[bool, str](true);
+    }
+
+    val idx_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, index_callee);
+    if (O.is_none[*expr.Expr](idx_opt)) { ret R.err[bool, str]("ExprId out of range"); }
+    val idxn: *expr.Expr = O.unwrap[*expr.Expr](idx_opt);
+    val rs: R.Result[bool, str] = bind_expr(rc, idxn.data.index.index);
+    if (R.is_err[bool, str](rs)) { ret rs; }
+
+    # rewrite this node into the index reading rather than forwarding to the
+    # pre-built one: `eid` is the id every parent already holds.
+    val idx_payload: expr.ExprIndex = idxn.data.index;
+    e.kind       = expr.EXPR_KIND_INDEX;
+    e.data.index = idx_payload;
+    ret R.ok[bool, str](true);
+}
+
+# true when a value-position bracket's object names a function DECLARATION - the
+# only referent `object[T, ..]` can instantiate
+#
+# A SYM_FUN is a function. A SYM_IMPORTED carries no referent kind, so the origin
+# module's AST is read for the decl's kind, the same discriminator lowering's
+# names_function uses. Everything else - a binding, a parameter, a record or def
+# name, an unresolved name - makes the bracket a subscript.
+# ---
+# rc:     resolver state for the module being resolved
+# object: the resolved object expression
+# ret:    true when `object` names a function declaration
+fun object_names_function(rc: *ResolveContext, object: id.ExprId) bool {
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, object);
+    if (O.is_none[*expr.Expr](e_opt)) { ret false; }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
+    if (e.kind != expr.EXPR_KIND_IDENT && e.kind != expr.EXPR_KIND_MEMBER) { ret false; }
+    if (rc.expr_resolved == nil)                                           { ret false; }
+    val sid: SymbolId = rc.expr_resolved[object];
+    if (sid == SYMBOL_NIL || sid >= rc.sym_len) { ret false; }
+    val sym: *Symbol = ?rc.symbols[sid];
+    if (sym.kind == SYM_FUN)      { ret true; }
+    if (sym.kind != SYM_IMPORTED) { ret false; }
+    val origin_ast: *ast.Ast = session.module_ast(rc.s, sym.origin);
+    if (origin_ast == nil) { ret false; }
+    val opt_d: O.Option[*decl.Decl] = ast.get_decl(origin_ast, sym.decl);
+    if (O.is_none[*decl.Decl](opt_d)) { ret false; }
+    ret O.unwrap[*decl.Decl](opt_d).kind == decl.DECL_KIND_FUN;
 }
 
 # binds a generic call's type arguments and value arguments - the tail shared by

@@ -19,6 +19,7 @@ use std.types.string.str;
 use std.types.string.str_len;
 use std.types.string.str_copy_slice;
 use std.types.string.str_join;
+use std.types.string.str_region_equals;
 use std.text.string.str_free;
 use std.types.view.view;
 
@@ -98,6 +99,7 @@ fun lower_rvalue_kind(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr)
     if (k == expr.EXPR_KIND_MEMBER)         { ret lower_member_rvalue(ctx, eid, e); }
     if (k == expr.EXPR_KIND_PROJECT)        { ret lower_project_rvalue(ctx, eid, e); }
     if (k == expr.EXPR_KIND_INDEX)          { ret lower_index_rvalue(ctx, eid, e); }
+    if (k == expr.EXPR_KIND_GENERIC_INSTANCE) { ret lower_generic_instance(ctx, eid, e); }
     if (k == expr.EXPR_KIND_CALL)           { ret lower_call(ctx, eid, e); }
     if (k == expr.EXPR_KIND_BINARY)         { ret lower_binary(ctx, eid, e); }
     if (k == expr.EXPR_KIND_UNARY)          { ret lower_unary(ctx, eid, e); }
@@ -191,6 +193,9 @@ pub fun lower_lvalue(ctx: *context.LowerContext, eid: id.ExprId) R.Result[value.
     if (k == expr.EXPR_KIND_MEMBER)  { ret lower_member_lvalue(ctx, eid, e); }
     if (k == expr.EXPR_KIND_PROJECT) { ret lower_project_lvalue(ctx, eid, e); }
     if (k == expr.EXPR_KIND_INDEX)   { ret lower_index_lvalue(ctx, eid, e); }
+    # `?f[T]` (#2342): a function reference IS an address, so the instance's
+    # lvalue and rvalue are the same value, exactly as they are for a plain `?f`.
+    if (k == expr.EXPR_KIND_GENERIC_INSTANCE) { ret lower_generic_instance(ctx, eid, e); }
     if (k == expr.EXPR_KIND_UNARY) {
         # `@p` as an lvalue is the rvalue of p (already a pointer)
         if (e.data.unary.op == expr.UN_DEREF) {
@@ -712,6 +717,11 @@ fun symbol_reference(ctx: *context.LowerContext, eid: id.ExprId, sid: resolve.Sy
         val res_fn: R.Result[value.Value, str] = fn_reference(ctx, link, vty, references_import_function(ctx, sym));
         if (R.is_err[value.Value, str](res_fn)) { ret res_fn; }
         stamp_spirv_op(ctx, sym, R.unwrap_ok[value.Value, str](res_fn));
+        # a cross-module `#[inline]` callee's BODY is queued for emission here, so the
+        # extern just formed is upgraded to a definition by the drain and the inliner
+        # can reach it (#2231).
+        val res_ci: R.Result[bool, str] = enqueue_inline_import(ctx, sym, link);
+        if (R.is_err[bool, str](res_ci)) { ret R.err[value.Value, str](R.unwrap_err[bool, str](res_ci)); }
         ret res_fn;
     }
 
@@ -912,6 +922,108 @@ fun references_import_function(ctx: *context.LowerContext, sym: *resolve.Symbol)
     val d: *decl.Decl = O.unwrap[*decl.Decl](opt_d);
     if (d.kind != decl.DECL_KIND_FUN) { ret false; }
     ret (d.flags & decl.DECL_FLAG_EXT) != 0;
+}
+
+# queue a cross-module `#[inline]` callee's body for emission into THIS module, so the
+# reference just formed resolves to a definition the inliner can see (#2231)
+#
+# THE AXIS THIS EXTENDS. A dependency's function body reaches an importer's IR only when
+# the function is a TEMPLATE - generic, comptime-param, or pack-tailed - because those
+# have no single concrete body the defining module could emit. Everything else is
+# emitted extern in the importer and called through the linker. `#[inline]` is the third
+# member of that same axis and the first one the author asks for rather than the type
+# system forcing: it declares that the body IS part of the function's public surface,
+# so an importer may materialise it. That is what an atomic needs, because every caller
+# of `std.sync.atomic` is in another module and a call is most of what the operation
+# costs.
+#
+# THE LINKAGE IS WHAT KEEPS THE FUNCTION ONE FUNCTION. The copy is emitted PUB | WEAK
+# under the ORIGIN's mangled name - not a private clone - so the defining module's
+# strong definition wins at link time and every reference in every object, including
+# the ones inside the importer that holds the weak copy, binds to that single address.
+# A private clone would give `?atomic.load` a different answer per module, which is a
+# silent wrong answer rather than a missed optimisation. This is the same PUB | WEAK a
+# generic instance uses, for the same reason.
+#
+# WHAT THE DRAIN DOES WITH IT. `append_function` finds the signature-only extern this
+# call site just created and upgrades it IN PLACE, so the call already recorded as
+# `value.fn(index)` now names the definition. Without that the extern would be orphaned
+# and the inliner would still see a bodiless callee.
+#
+# A template is excluded here by all three of its syntactic markers rather than by the
+# one that happens to be reachable: a generic parameter list, a comptime parameter, or
+# a trailing pack. Each of those already owns a call-lowering path that forms its own
+# instance name, and enqueueing one of them under the plain mangled name would emit a
+# body against no substitution at all.
+# ---
+# ctx:  per-module lowering context
+# sym:  the symbol naming the callee
+# link: the callee's mangled linkage name (the instance name the drain defines)
+# ret:  true when queued or not applicable, or an allocation / cap error
+fun enqueue_inline_import(ctx: *context.LowerContext, sym: *resolve.Symbol, link: intern.StrId) R.Result[bool, str] {
+    if (sym.kind != resolve.SYM_IMPORTED) { ret R.ok[bool, str](true); }
+    val origin_ast: *ast.Ast = session.module_ast(ctx.s, sym.origin);
+    if (origin_ast == nil) { ret R.ok[bool, str](true); }
+    val opt_d: O.Option[*decl.Decl] = ast.get_decl(origin_ast, sym.decl);
+    if (O.is_none[*decl.Decl](opt_d)) { ret R.ok[bool, str](true); }
+    val d: *decl.Decl = O.unwrap[*decl.Decl](opt_d);
+    if (d.kind != decl.DECL_KIND_FUN)             { ret R.ok[bool, str](true); }
+    # a declared `ext fun` is a foreign symbol, not a mach body, and a bodiless mach
+    # declaration has nothing to flow.
+    if ((d.flags & decl.DECL_FLAG_EXT) != 0)      { ret R.ok[bool, str](true); }
+    if (d.data.fun_.body == id.STMT_NIL)          { ret R.ok[bool, str](true); }
+    if (d.data.fun_.generics_len > 0)             { ret R.ok[bool, str](true); }
+    if (fun_decl_is_template(origin_ast, d))      { ret R.ok[bool, str](true); }
+    if (!decl_has_origin_decorator(ctx, origin_ast, d, "inline")) { ret R.ok[bool, str](true); }
+
+    ret context.enqueue_instance(ctx, sym.decl, sym.origin, nil, 0, link, sym.name);
+}
+
+# whether a function declaration is a TEMPLATE by virtue of its parameter list: any
+# comptime value parameter, or a trailing comptime variadic pack
+#
+# Read purely syntactically off the DECLARING module's AST, since this runs against a
+# foreign AST whose typing is not the active one.
+# ---
+# a: the AST owning the declaration
+# d: the function Decl
+# ret: true when a parameter makes the function a template
+fun fun_decl_is_template(a: *ast.Ast, d: *decl.Decl) bool {
+    var i: u32 = 0;
+    for (i < d.data.fun_.params_len) {
+        val pool_ix: u32 = d.data.fun_.params_start + i;
+        if (pool_ix::usize >= a.typed_name_len) { ret true; }
+        val tn: *decl.TypedName = ?a.typed_names[pool_ix];
+        if (tn.comptime) { ret true; }
+        val opt_t: O.Option[*atype.Type] = ast.get_type(a, tn.ty);
+        if (O.is_some[*atype.Type](opt_t)
+            && O.unwrap[*atype.Type](opt_t).kind == atype.TYPE_KIND_PACK) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether a decl in a FOREIGN module's AST carries a `#[...]` decorator named `name`
+#
+# `decl_has_decorator` in decl.mach reads spans against the lowering context's own
+# module source; a decorator span from another module's AST indexes another module's
+# text, so the source is taken from that AST instead. Same discipline as
+# `stamp_spirv_op`.
+# ---
+# ctx:  per-module lowering context
+# a:    the AST owning the declaration
+# d:    the Decl to inspect
+# name: the decorator directive name to match
+# ret:  true when the decorator is present
+fun decl_has_origin_decorator(ctx: *context.LowerContext, a: *ast.Ast, d: *decl.Decl, name: str) bool {
+    val src: str = context.ast_source(ctx, a);
+    var i: u32 = 0;
+    for (i < d.decorators_len) {
+        val dec: *decl.Decorator = ?a.decorators[d.decorators_start + i];
+        if (str_region_equals(src, dec.name.offset, dec.name.len, name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # whether a symbol names a function DECLARATION
@@ -1857,7 +1969,7 @@ fun lower_callee(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) R.Re
             # already rejects such a call with a clean diagnostic and the driver
             # aborts before lowering, so reaching here is a coherence violation:
             # neither lower_value_callee (which ignores the type args, producing a
-            # wrong symbol) nor lower_generic_callee (which lowers against the
+            # wrong symbol) nor lower_generic_instance (which lowers against the
             # comptime-stripped signature) is correct, so hard-error instead.
             if (f.generics_len > 0) {
                 ret R.err[value.Value, str]("lower: comptime value parameters on a generic function are not supported");
@@ -1873,7 +1985,7 @@ fun lower_callee(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) R.Re
     if (e.data.call.type_args_len == 0) {
         ret lower_rvalue(ctx, e.data.call.callee);
     }
-    ret lower_generic_callee(ctx, eid, e);
+    ret lower_generic_instance(ctx, eid, e);
 }
 
 # the callee's origin DeclFun
@@ -2244,18 +2356,23 @@ fun collect_call_type_args(ctx: *context.LowerContext, e: *expr.Expr, argc: u32)
     ret R.ok[*type.TypeId, str](args);
 }
 
-# resolve a generic call to its monomorphized instance
+# resolve `f[T, ..]` to its monomorphized instance, as a function reference
 #
-# Reads the call-site type arguments, computes the instance's mangled linkage
-# name, enqueues the instance for body emission, and returns a function
-# reference to it. The instance lives in the generic's origin module; the back end
-# emits a name-based call the linker binds to the (weak, deduped) instance body.
+# Reads the site's type arguments, computes the instance's mangled linkage name,
+# enqueues the instance for body emission, and returns a function reference to
+# it. The instance lives in the generic's origin module; the back end emits a
+# name-based reference the linker binds to the (weak, deduped) instance body.
+#
+# Shared by the callee form `f[T](x)`, where the call consumes the reference as
+# its target, and the value form `f[T]` (#2342), where the reference IS the
+# expression's value. One body, so the two spellings enqueue the same instance
+# under the same name by construction.
 # ---
 # ctx: per-module lowering context
-# eid: the call expression
-# e:   the resolved call node
+# eid: the call or generic-instance expression
+# e:   the resolved node (its ExprCall payload)
 # ret: a function reference to the instance, or an error
-fun lower_generic_callee(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) R.Result[value.Value, str] {
+fun lower_generic_instance(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) R.Result[value.Value, str] {
     val sid: resolve.SymbolId = context.expr_symbol_of(ctx, e.data.call.callee);
     val opt_sym: O.Option[*resolve.Symbol] = context.symbol_of(ctx, sid);
     if (O.is_none[*resolve.Symbol](opt_sym)) {
