@@ -4,6 +4,12 @@
 # stdout, which run.sh diffs against the golden. the producer is the only thing
 # that varies between verification modes; the golden-diff core does not change.
 #
+# CHOOSING ONE. this list says what each producer observes. int/observability.md says
+# what running a program structurally CANNOT observe, maps each of those classes to
+# the surface that can, and states which of them needed an integration test at all -
+# most of the historical cases did not. most producers below exist because of one of
+# its entries, so read the two together, and read it first before adding a case.
+#
 # producers:
 #   exec        — run the program, observe its stdout (native / qemu).
 #   relro-fault — run the program and report whether its write to a RELRO'd .rodata
