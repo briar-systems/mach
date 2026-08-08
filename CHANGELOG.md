@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### An RV64-only mnemonic in an `asm riscv32` body is refused rather than assembled (#2864)
+`ld`, `sd`, `addw` and the rest of the `*W` group do not exist at XLEN 32, and an `asm riscv32` body naming one assembled it anyway. The image carried an instruction the hardware does not implement, so the mistake surfaced as an illegal-instruction trap at run time instead of a diagnostic at build time - a wrong answer through a green build, which is the failure mode this target class exists to catch.
+
+The cause was a split authority. One mnemonic table served both machines and the rows carried no width, so the assembler knew the spelling and the encoder knew the machine and neither asked the other. The fix states the fact once, on the instruction: every `MachOp` declares the register widths it exists at, and both the assembler and the encoder read that. A mnemonic is refused because the instruction it names does not exist here, which is why an alias, a pseudo spelling and a row the suffix decoder synthesizes all inherit the answer without being listed anywhere - `sext.w` and `amoadd.d` are refused on rv32 for the same reason `addiw` is.
+
+The set is per instruction rather than a minimum register width, so an RV32-only form is expressible when one arrives rather than a reshape of the layer. A form the module does not classify admits nothing, so appending an instruction without stating its machines refuses it loudly instead of admitting it everywhere quietly, and a unit test walks the shipping table and the decoder's whole synthesized range to hold that.
+
+The shift-amount field went the same way: it is as wide as the register it shifts, so `slli a0, a1, 32` is refused on rv32, where its sixth bit would have landed in `funct7` and decoded as a different instruction. `slli a0, a1, 31` still assembles, and every RV64-only spelling still assembles under a `riscv64` tag.
+
+`doc/language/asm.md` no longer tells the reader to gate these spellings themselves.
 #### A CI leg no longer fails because an unrelated apt repository is down (#2885)
 `apt-get update` exits non-zero when any configured repository is unreachable, including repositories the job never installs from. The runner image carries Microsoft's and azure-cli's lists preinstalled, and a 403 from them failed `int pinned (linux)` while every Ubuntu repository the job actually reads fetched fine. It cleared on a rerun, which is worse than a hard failure: it teaches everyone reading CI that a red `int pinned` is probably noise.
 
