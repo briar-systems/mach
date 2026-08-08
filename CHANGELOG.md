@@ -18,6 +18,15 @@ The two paths computed one fact in two places and agreed only by accident. The h
 
 ### Added
 
+#### An adversarial vector-correctness sweep across axes nothing else reaches
+Vectors have shipped three silent miscompiles in recent memory - `f32x3` shipped with no operation ever run through it, `vec_lane_count` carried a 128-bit assumption no CPU backend reads, and #2749 (merged tonight) had both vector-operator expansions substituting a loop-carried phi's uses one block at a time, missing the back-edge operand - and CI was fully green through every one, because the 42 `vector_runtime` cases all cover the ten 128-bit shapes in straight-line code.
+
+`int/surface/vector-carry-and-boundary` puts real lane values through the combinations neither that suite nor the existing `vector-subwidth` / `regression/2749-gap-op-loop-carried` fixtures reach: sub-width and float-lane loop-carried accumulators (including `*`, #2749's own operator, at a shape its fixture never tried), bitwise and comparison-into-mask operators in the carried position, a sub-width vector through two call boundaries as both argument and return, a struct containing a vector returned BY VALUE rather than merely constructed locally, two adjacent vector struct fields with no scalar guard between them, a runtime-indexed array of vectors, and four vector arguments live in one call. Every lane is hand-computed and checked individually, never compared against another target's output - #2749's own bug had two targets agreeing with each other and both being right for reasons unrelated to the defect.
+
+The sweep found no new defect. Only `mul_loop3` (`*`, loop-carried, at `i32x3`) is an actual regression pin against #2749, and only on `linux` (x86-64) - verified by running the case against a compiler built from the commit immediately before #2749's fix merged, where it reads wrong there and correct on `linux-arm64` / `linux-riscv64` (for reasons unrelated to the defect, the same shape #2749's own i32x4 case had, with which targets are "right for the wrong reason" swapped). Every other probe reads correct against that same pre-fix compiler: real coverage of untested combinations, not additional regression pins, and the case's own comments say so rather than implying otherwise.
+
+Over-width shapes (256-bit+) are refused at the front end on the commit this was written against and are not attempted here; #2805 / #2806 are expected to make them legal, and whoever lands that should extend this case's probes to a wide shape rather than add a new one.
+
 #### A shader can bind and sample a texture (#2794)
 The GPU decorator set covered `#[input]`, `#[output]`, `#[builtin]`, `#[uniform]` and `#[storage]`, and none of them declares an image. A shader that reads a texture could not be written at all, which is the remaining blocker for porting boom's shaders off GLSL - every one of them samples a texture.
 
