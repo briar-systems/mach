@@ -76,6 +76,19 @@ Types spell themselves: `p$u8` is `*u8`, `sec$u32` is `^u32`, `arr4$u8` is `[4]u
 Names did **not** get longer. Over the compiler's own release build — same tree, same profile, 11660 distinct symbols either way — the longest goes from **108 bytes to 105**, and the count over the **63-byte inline-asm operand limit** falls from **1543 to 668**. A length prefix costs one or two digits per path segment where a dot costs one character, and the `_M` goes away, so a dotted name is shorter despite being readable. (That cap is a pre-existing limitation with a misdirecting diagnostic — an over-long operand is refused as "malformed" — and is not touched here.)
 
 Fixing the scheme fixes every reader at once — IR dumps, diagnostics, `--emit-asm` headings, linker messages, `objdump`, `perf`, `DW_AT_linkage_name` — rather than teaching a dozen display sites to substitute a friendlier name one at a time, and the places with no source name to substitute are covered too.
+#### An inline-asm body that cannot return no longer claims it does (#2791)
+`std.system.panic`'s `panic_os` issues `SYS_exit_group` and then traps. Its own comment says the trap "is unreachable and kept only as a guard; it is NOT the terminator." Lowering ran the block on past it into an epilogue, so the function's CFG asserted that control returns from `exit_group`, and everything reasoning over the CFG inherited that. It was invisible while such a body was never inlined - the dead epilogue sat at the end of its own function - and became a caller's problem the moment a body like it could be spliced in.
+
+**The fact is derived from the mnemonic row, and cannot be declared.** `hlt`, `brk` and `ebreak` are modeled instructions with table rows, so the compiler already holds it. The inline-asm effect model says a modeled instruction's facts come from its mnemonic row and cannot be overridden, and a `:: noreturn` clause would be exactly that override - on a claim the compiler *acts on*, where the standing rule is that a declaration buys allocation quality and never verification. So there is no declaration to get wrong and nothing rests on the author. The first person who wants a clause here should read this paragraph instead.
+
+**Conservatism runs the opposite way from every other fact in the model**, and the direction is the whole design. A wrong `writes` costs allocation quality; a body wrongly judged non-returning makes lowering **drop everything after it**, which deletes live code. So an unreadable body, a raw `.byte` payload, a body defining a numeric local label, an ISA wiring no analyzer, and a whole-module emitter with no register machine all report that control returns - the behaviour every target had before, never worse.
+
+**Stated limit:** a body that ends the thread of control *without* a trap - a bare `exit_group` syscall with nothing after it - still reads as returning. That is unchanged behaviour rather than a regression, but "cannot return" now has a machine meaning, and the gap between it and an author's intent is where the next surprise lives. The trap is what makes the fact checkable, and mach-std already writes one on all three ISAs.
+
+Nothing downstream needed teaching: `lower_stmt_list` already stops at a terminated block, and the inliner only wires a continuation from a callee's returning paths.
+
+**This is not the fix for the gdb abort that led here.** That was an overlapping-`PT_LOAD` defect in mach's own ELF writer (#2795), unrelated to control flow.
+
 
 ### Fixed
 
