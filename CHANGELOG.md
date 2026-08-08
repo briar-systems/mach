@@ -17,6 +17,28 @@ The message cost a day of investigation before anything was fixed. It named the 
 Which message a user saw was decided by accident, too: the same broken program read `undefined symbol` on a link with no shared library in it and the false `not among the link's dependencies` the moment any unrelated one joined. Two different statements about one program, one of them untrue, selected by something neither of them mentions.
 
 The driver's single walk over the link inputs now records each entry's logical name and whether it resolved static or dynamic, and the linker reads that one account rather than inferring the link from the half it was handed. A failed pin resolves to one of two truthful statements - the library is in the link **as a static input**, which defines symbols rather than importing them, so the symbol is undefined; or the library is genuinely nowhere in the effective link set, in which case the refusal stands and now lists what the link does provide. Both paths that can reach a failed pin call one decision function, so the wording no longer depends on the link's shape: the two int cases that differ only by an unrelated dynamic dependency assert **byte-identical** goldens, and a third holds the genuine refusal so the fix cannot become a blanket permit.
+#### A type mismatch between two same-named types from different modules said `expected P, found P` (#2288)
+A nominal type is interned by `(origin, decl)` and rendered by its bare name, so `rec P` declared in two modules produced exactly this:
+
+```
+error: type mismatch: expected P, found P
+```
+
+The two types are genuinely different and the diagnostic could not show it - the message names the defect and tells the reader nothing about it. That is the failure this epic exists for, arriving in a diagnostic rather than in a dump.
+
+The disambiguation is a property of the **pair**, not of either type, so it lives at the reporting site rather than in the type renderer: qualifying every nominal at every site would make every ordinary diagnostic noisier to fix a case that is rare. When the two renderings collide, the note names each side's defining module instead of the cast advice, which could not apply between two unrelated records anyway:
+
+```
+error: type mismatch: expected P, found P
+  = note: these are two different types that share the name `P`: the first is declared in `dcase.main`, the second in `dcase.lib`
+```
+
+Every diagnostic that names two types routes through **one** decision point, so this is not a patch at one message site. It reaches the assignment mismatch, the `:~` size mismatch (which collapsed the same way - `P (16 bytes) vs P (1 bytes)`), and `incompatible operand types`, whose collision is unreachable today only because aggregate arithmetic and `==` are refused before the message is built. A generic instance is disambiguated too, since `Box[u8]` from two modules renders identically for the same reason.
+
+Found while auditing the surfaces #2288 lists, by producing both sides of each distinction and diffing rather than by reading the printer. The rest of the type renderer came out clean under the same treatment: secret against public (`^u32` / `u32`), generic arguments, vector lane signedness (`i32x4` / `u32x4`), aggregate against scalar at equal width (`[8]u8` / `i64`), packed against unpacked, over-aligned against natural, and function arity all render distinguishably.
+
+Alongside it, `ut_diag_note_has` - the note-reading sibling of the test harness's `ut_diag_has`, which scans a diagnostic's `message` only. A note is a separate field, so until now **no test in the tree could assert anything about a note's text** and every note the compiler attaches was unpinned. That is the same asymmetry #2297 found between `ut_lower_ok` and the sink-reading helpers, arriving through a different door, and it is worth stating plainly: two arms of this change's own test, written against `ut_diag_has` with a bare module name as the needle, passed against the unpatched compiler because some unrelated note in the same compile mentioned that module. They assert the surrounding phrase now, and all five arms fail without the fix.
+
 #### The IR verifier now checks that a conversion is well-*typed* for its own opcode, not merely well-*formed* (#2808)
 The verifier constrained a conversion's **arity** - `OP_TRUNC` / `OP_SEXT` / `OP_ZEXT` / `OP_BITCAST` all sit in the "exactly one operand" bucket - and `VC_TYPE_AGREE` covered operand agreement for binary ops, branch conditions, load/store/gep bases and `ret` against the signature. Nothing related a conversion's **result width** to its operand's, so it checked that a conversion was well-formed and never that it meant what its opcode says. A width-changing `BITCAST`, a `TRUNC` whose result is *wider* than its operand, a `SEXT` / `ZEXT` whose result is *narrower*, and any of the three at *equal* widths were all accepted.
 
