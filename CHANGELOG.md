@@ -41,6 +41,13 @@ The refusal itself is unchanged. Its diagnostic and `doc/language/decorators.md`
 
 ### Fixed
 
+#### The debug-info validator's warnings are now an observable, not a wall (#2755)
+`int/surface/debuginfo` read `llvm-dwarfdump --verify`'s exit status, which is zero on warnings. So "no diagnostics at all" and "no errors, plus a standing wall of about 200 warnings on every `-g` image" both rendered `dwarfdump_verify=clean`, and the golden recorded the second while claiming the first. That is how a validator stops validating: the next real warning arrives into a stream nobody reads.
+
+The case now reads the stream. It reports `errors`, `warnings` or `clean`, and lists the distinct warning texts with only the per-CU section offset elided, so an explained warning class pins itself in the golden and a new one shows up as a diff. The golden moves to record what the producer actually emits today, which is one class, `.debug_line[].prologue.file_names[1] is a duplicate of file_names[0]`, and no other. It is the same single class on x86-64, aarch64 and riscv64, and on Mach-O.
+
+That duplicate is deliberate and stays. DWARF 5 §6.2.4 numbers file entries from 0 and §6.2.2 still gives the line state machine's `file` register an initial value of 1, and the two cannot both be satisfied by a single-file compile unit. binutils resolves it the way §6.2.2 says: measured on binutils 2.47, `addr2line` reports `mangled line number section (bad file number)` on every compile unit of a table whose only entry is slot 0, including clang's own `-gdwarf-5` output. gcc emits the duplicate and llvm-dwarfdump warns on gcc's output identically. `dwarf.mach` now records that, because the obvious repair trades a cosmetic warning from one validator for a real decode failure in every libbfd consumer.
+
 #### An over-aligned stack local is over-aligned at run time (#2735)
 `#[align(32)]` and above worked on a global and did nothing on a local. The slot's offset was a correct multiple of the requested alignment, but it was measured from the frame pointer, and the only alignment that reaches the frame pointer is the ABI's 16-byte call boundary. So the address was a multiple of 32 exactly when the process stack happened to start on one, which depends on the environment block and therefore changes between runs of the same binary. `$size_of` already reported the padded size, so the storage was sized for a promise the placement did not keep.
 

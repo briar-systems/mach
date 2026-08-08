@@ -2049,7 +2049,8 @@ elf_seg_identical() {
 # produce_debuginfo <runmode> <target> <nog_binary> <g_binary>
 # the binary-inspection producer for the debuginfo case kind (#2039): asserts, purely
 # host-side over the artifacts run.sh built with and without `-g`, that (1) the
-# standard structural validator accepts the whole `-g` image, (1b) a real consumer
+# standard structural validator accepts the whole `-g` image and which warning classes
+# it reports while doing so, (1b) a real consumer
 # (addr2line, i.e. libbfd) decodes the line table without a diagnostic and resolves the
 # entry point to a name, (2) `-g` is loadable-byte additive, and (3) duplicate generic,
 # comptime-value, and pack instances retain
@@ -2073,11 +2074,25 @@ produce_debuginfo() {
         echo "int: debuginfo: addr2line not found (install 'binutils')" >&2; return 2
     }
 
-    if "$dd_tool" --verify "$g" >/dev/null 2>&1; then
-        echo "dwarfdump_verify=clean"
-    else
+    # --verify EXITS ZERO ON WARNINGS (#2755). reading only its status collapsed "no
+    # diagnostics at all" onto "no errors, and a standing wall of ~200 warnings", which
+    # is how a validator stops validating: the next real warning lands in a stream
+    # nobody reads. so the observable is the stream, not the status. `errors` is
+    # reported first because an error subsumes a warning, and the distinct warning
+    # TEXTS are listed - sorted, deduplicated, and with only the per-CU `[0x...]`
+    # section offset elided - so a warning class that is present and explained pins
+    # itself here and any NEW class shows up as a golden diff rather than as noise.
+    dd_out=$("$dd_tool" --verify "$g" 2>&1)
+    if printf '%s\n' "$dd_out" | grep -q '^error:'; then
         echo "dwarfdump_verify=errors"
+    elif printf '%s\n' "$dd_out" | grep -q '^warning:'; then
+        echo "dwarfdump_verify=warnings"
+    else
+        echo "dwarfdump_verify=clean"
     fi
+    printf '%s\n' "$dd_out" | sed -n 's/^warning: //p' \
+        | sed -e 's/\[0x[0-9a-fA-F]*\]/[]/g' \
+        | sort -u | while IFS= read -r w; do echo "dwarfdump_warning=$w"; done
 
     # CONSUMER-SIDE DECODE (#2582). --verify above checks structural and reference
     # integrity; it does NOT check that the line program decodes against the file table
