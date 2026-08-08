@@ -87,6 +87,19 @@ Resolve reaches the position through a mechanism that was already there: `bind_c
 
 Two limits are filed rather than left implicit: `$length_of` still does not fold in a gate (#2875), and no declaration-scope gate can see a type at all, which is shared with type queries and comparisons (#2876).
 
+### Changed
+
+#### A target now owns the operations it defines (#2888)
+The compiler knew what a SPIR-V instruction was. `src/lang/spirvop.mach` sat outside the target holding 41 hand-written string comparisons that mapped an instruction name to a number, and the front end read it directly. Adding an instruction meant editing the compiler, so a shader library could not add one at all.
+
+The table now hangs off the ISA vtable and the target fills it. It reaches the front end as data on the comptime context beside `pointer_width`, for the reason stated there: it is a target machine fact the frontend needs, and the frontend has no target. So `fe` names no back end, and unlike before it holds no SPIR-V numbers of its own. `src/lang/spirvop.mach` is gone, and the IR carries the set tag and opcode under target-neutral names.
+
+An instruction's arity is now checked, which nothing did before. The decorator's contract is that operands come from the parameters in order, so a declaration whose parameter list is the wrong length assembled the instruction with the wrong operand count. The family looks uniform and is not: `Reflect` takes two operands where `Refract` takes three, and `FMin` two where `FClamp` takes three.
+
+Emitted output is unchanged. Every machine target is byte-identical, 224 objects each across x86-64, arm64 and riscv64, and the SPIR-V fixtures emit the same bytes.
+
+This is the first piece of #2888. Type constructors, the `#[handle]` and `#[op]` declarations, and the bodyless `def` are not here.
+
 ### Fixed
 
 #### A shader indexing with a `u32` no longer requires `shaderInt64` (#2878)
