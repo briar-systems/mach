@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+#### An `i64` global compiles on rv32 instead of crashing the compiler (#2867)
+A wide global feeding wide arithmetic on riscv32 killed the compiler with SIGSEGV and no diagnostic, and the same construct without the arithmetic produced a refusal. Both came from one place. Lowering folds a global straight into the access as a symbol operand, so a `MIR_LOAD` or `MIR_STORE` on one carries no memory operand at all, while `legalize` entered its memory path on the opcode alone and then indexed the memory operand it assumed was there. The index was `-1`: one shape read a wild pointer and faulted, the other read one slot past the operand array and refused off whatever it found. The refusal was never a decision.
+
+The pass now decides that a memory access is one by finding the address, not by reading the opcode, and it recognizes the two forms an address takes: a memory operand walked by displacement, and a symbol walked by addend. So a wide global is no longer refused either - it is legalized like any other fixed base, one native access per lane at successive offsets on the same symbol, which is what a 64-bit value on a 32-bit machine has always cost. An access whose address is neither form falls through to the named refusal for its opcode rather than into an expansion that cannot describe it.
+
+mos6502, the other target that legalizes to a narrower ALU, is unaffected: an `i64` there needs a frame slot and the pass refuses the wide `MIR_ALLOCA` before any access is examined.
+
+### Added
+
+#### A storage binding nothing writes is emitted `NonWritable`, and can say so (#2879)
+A `#[storage(set, binding)]` buffer that a stage only reads was emitted with no `NonWritable` decoration, so every consumer had to enable `vertexPipelineStoresAndAtomics` to read one from a vertex stage. The read-only case is the common one - a joint palette, an instance buffer, a light list - and it is the case where the decoration is free and its absence costs a hardware requirement.
+
+The emitter now decides it from the module. A storage binding no emitted body stores through is decorated `NonWritable`, over the same emitted closure every other whole-module rule here is stated about, so a store from a drawn-in library body counts exactly as a local one does. The analysis is a **proof rather than a search**: two positions read - a load's address and an access chain's base, whose result is then subject to the same question - and every other appearance of the binding or of a pointer derived from it counts as a write. A missing decoration is therefore possible and a wrong one is not.
+
+`#[storage(set, binding, "readonly")]` states it explicitly, and a store through such a binding is a compile error naming the line that wrote it, on every target rather than only on a SPIR-V build. That is what the qualifier buys over the inference: an accidental write does not produce a wrong module, it produces a correct one that quietly widens the pipeline's requirements, and the qualifier turns it into a diagnostic. The emitter refuses a write it can still see after lowering - an address handed somewhere it cannot follow - so the decoration cannot become a promise the module breaks. The memory qualifier rides after the descriptor pair rather than in a second decorator name, so a further qualifier is one accepted spelling and no new interface role.
+
+Everything else is unchanged: of boom's seven shaders, the six with no storage binding are byte-identical, and `skinned_vert` differs by exactly the one decoration.
+
+#### A layout intrinsic can be measured inside a comptime `$if` (#2857)
+`$size_of` and `$align_of` are constants, but they could not appear in a `$if` condition, so the thing most worth asserting about a layout - a **relationship** between two of them - could only be a runtime test. Two records a renderer writes into one slot at a fixed offset must be the same size; if they diverge, one shader reads its colour out of the middle of a matrix, with no diagnostic at any layer. A test catches that only if someone runs the suite. A `$error` catches it in the build that introduced it.
+
+`$if ($size_of(A) != $size_of(B)) { $error("..."); }` now compiles inside a function body, as does a comparison against a literal and an intrinsic folded into a larger expression.
+
+The measurement is not new and deliberately is not duplicated: the comptime evaluator gained a resolver seam, and sema answers it through the same `fold_layout_intrinsic` a type position already used, so a size measured in an array length and the same size measured in a `$if` cannot disagree. Lowering installs its own resolver beside the type-query one it already had, because a chain gated on a comptime parameter or inside a generic body has its arm selected at monomorphization and never reaches sema's.
+
+Resolve reaches the position through a mechanism that was already there: `bind_comptime_if` defers a chain it cannot fold yet, binding every arm and leaving arm selection to a later pass, which is what a type comparison has always done. A layout gate joins that list rather than introducing a second rule.
+
+### Changed
+
+#### A refused layout intrinsic now says which position refused it, and why (#2857)
+`a layout intrinsic has no value in this position: it measures a type, which only a type position resolves` was true of every position and is now true of one. A **declaration-scope** `$if` still cannot measure, because it selects which declarations exist and that is decided before any type is laid out, so it says that instead and points at the position that does work. `$offset_of` is named apart, since it is unavailable for a different reason - a field offset is decided at lowering - and a message about type checking would be a stale explanation the moment the resolver exists.
+
+Two limits are filed rather than left implicit: `$length_of` still does not fold in a gate (#2875), and no declaration-scope gate can see a type at all, which is shared with type queries and comparisons (#2876).
+
+### Fixed
+
+#### A shader indexing with a `u32` no longer requires `shaderInt64` (#2878)
+A SPIR-V module whose arithmetic was entirely 32-bit declared `OpCapability Int64`, because every array index was widened to the target's pointer width before it reached the emitter. That is right for a byte-addressed machine, where an index is scaled by the element size and added to a base address and so must fill a machine word. SPIR-V addresses logically: an `OpAccessChain` index selects a member, nothing scales it, and the widening bought nothing.
+
+It cost a device requirement. `shaderInt64` is an optional feature, so a shader that performed no 64-bit arithmetic was refused outright by `vkCreateShaderModule` on hardware without it, and was invalid usage on hardware with it unless the application had enabled the feature. Downstream this was worked around by requesting the feature unconditionally and refusing to start without it, which narrowed the hardware the application ran on.
+
+The index width is now taken from `MachineModel.flat_addressing`, the same axis that already gates float address materialization and aggregate member walks (#2655), so the transformation is gated rather than the target. A genuinely 64-bit index still declares `Int64`, since that is what the program asked for. Every machine target's output is byte-identical.
+
+
 ### Added
 
 #### RV32 is a target (#2778)
