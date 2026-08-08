@@ -373,6 +373,62 @@ fun make_two_leaf_slot(agg: abi.AggLayout, nf: u32, fp0: i32, fp1: i32, gp0: i32
     ret abi.make_slot_pieces(class, ?ps[0], 2, size);
 }
 
+# place a value occupying exactly TWO argument words, by the psABI's three-case rule
+#
+# THE RULE IS THE VALUE'S SIZE, NOT ITS TYPE (#2870), and stating it once for both
+# callers is the point of this function. The RISC-V psABI gives one placement for
+# anything two words wide: a consecutive register pair when two remain, the low word
+# in the last register and the high word in an outgoing stack slot when exactly one
+# remains, and the whole value on the stack otherwise. It says that of a 2*XLEN SCALAR
+# and of a 9-16 byte aggregate in the same breath, because from the convention's side
+# they are the same thing.
+#
+# ONLY THE AGGREGATE CALLER EXISTED, and that is the whole defect. A scalar wider than
+# a word fell through to the ordinary single-register clause, which recorded ONE piece
+# for a value needing two. `mir.abi.advance_arg_cursors` advances the bank cursor by
+# the slot's pieces, so the next argument started one register too low and overwrote
+# the high half of this one - `a0`, `a1`, then `a1` again. The emitted code was
+# self-consistent (the callee read the same wrong layout the caller wrote) so anything
+# that never read the first argument's high half still computed the right answer, which
+# is why a full test suite passed over it.
+#
+# INVISIBLE AT LP64 BY CONSTRUCTION. There, `xlen_bytes` is 8 and the language's widest
+# scalar is 8, so no scalar is ever wider than a word and this clause is unreachable.
+# The bug could only ever appear at the width nothing exercised - the same shape as
+# every other RV32 finding under #2778.
+#
+# TWO WORDS IS A PROVEN BOUND HERE, not an assumption worth guarding: `xlen_bits` is 32
+# or 64 across this family and the widest scalar the language has is 64-bit, so a
+# scalar spans at most two words, and an aggregate wider than two words was already
+# routed to a hidden reference by `max_reg_ret` above.
+# ---
+# v:       the family member's descriptor
+# gp_used: the running GP argument-register cursor
+# size:    the value's byte size
+# ret:     the assembled ParamSlot
+fun place_two_words(v: RiscvAbi, gp_used: i32, size: u64) abi.ParamSlot {
+    val word: u64 = xlen_bytes(v);
+
+    # two registers remain: a consecutive pair, low word in the lower-numbered one.
+    # RISC-V deliberately imposes NO even-odd alignment on the pair, unlike AAPCS32 and
+    # o32 - the psABI says so explicitly - so the pair starts wherever the cursor is.
+    if (gp_used + 2 <= v.gp_arg_count) {
+        ret abi.make_slot_pair(abi.CLASS_GP, gp_param_reg(v, gp_used), gp_param_reg(v, gp_used + 1),
+                               0, size, word::u32);
+    }
+
+    # exactly one remains: the boundary rule splits rather than spilling the whole
+    # value, so the low word still rides a register.
+    if (gp_used + 1 == v.gp_arg_count) {
+        var ps: [2]abi.ParamPiece;
+        ps[0] = abi.make_piece(abi.PIECE_GP,    gp_param_reg(v, gp_used), 0,          0, word::u8);
+        ps[1] = abi.make_piece(abi.PIECE_STACK, -1,                       word::i64,  0, word::u8);
+        ret abi.make_slot_pieces(abi.CLASS_GP, ?ps[0], 2, size);
+    }
+
+    ret abi.make_slot(abi.CLASS_STACK, -1, 0, size);
+}
+
 # ------------------------------------------------------- the shared classifier
 
 # assign registers or a stack slot for one argument, for ANY family member
@@ -470,20 +526,9 @@ pub fun classify_arg_v(v: RiscvAbi, index: i32, size: u64, align: u64,
             }
             ret abi.make_slot(abi.CLASS_STACK, -1, 0, size);
         }
-        # one to two words: a consecutive integer pair when two registers remain.
-        if (gp_used + 2 <= v.gp_arg_count) {
-            ret abi.make_slot_pair(abi.CLASS_GP, gp_param_reg(v, gp_used), gp_param_reg(v, gp_used + 1), 0, size, xlen_bytes(v)::u32);
-        }
-        # exactly one register remains: the boundary rule places the low word in it
-        # and the high word in an outgoing stack slot rather than spilling the whole
-        # aggregate.
-        if (gp_used + 1 == v.gp_arg_count) {
-            var ps: [2]abi.ParamPiece;
-            ps[0] = abi.make_piece(abi.PIECE_GP,    gp_param_reg(v, gp_used), 0, 0, word::u8);
-            ps[1] = abi.make_piece(abi.PIECE_STACK, -1,                       word::i64, 0, word::u8);
-            ret abi.make_slot_pieces(abi.CLASS_GP, ?ps[0], 2, size);
-        }
-        ret abi.make_slot(abi.CLASS_STACK, -1, 0, size);
+        # one to two words: the shared two-word placement, which a wide SCALAR now
+        # reaches too - the convention draws no distinction between them (#2870).
+        ret place_two_words(v, gp_used, size);
     }
 
     if (is_float) {
@@ -494,11 +539,23 @@ pub fun classify_arg_v(v: RiscvAbi, index: i32, size: u64, align: u64,
         # float, because the float is wider than the member carries, or because the
         # bank is spent. in every one of those cases the psABI passes the raw bits in
         # an integer argument register, then on the stack.
+        #
+        # AND A DOUBLE IS TWO OF THEM ON ILP32 (#2870). This is the soft-float half of
+        # the same defect: an `f64` under `ilp32` or `ilp32f` reaches the integer bank
+        # with `size` 8 and a 4-byte word, so it needs the pair placement exactly as an
+        # `i64` does. `ilp32d` never gets here, which is why the gap was narrower than
+        # the integer one and no less wrong.
+        if (size > word) { ret place_two_words(v, gp_used, size); }
         if (gp_used < v.gp_arg_count) {
             ret abi.make_slot(abi.CLASS_GP, gp_param_reg(v, gp_used), 0, size);
         }
         ret abi.make_slot(abi.CLASS_STACK, -1, 0, size);
     }
+
+    # an integer scalar wider than a word is two words, placed by the same rule an
+    # aggregate of that size is (#2870). unreachable at lp64, where nothing the
+    # language has is wider than XLEN.
+    if (size > word) { ret place_two_words(v, gp_used, size); }
 
     if (gp_used < v.gp_arg_count) {
         ret abi.make_slot(abi.CLASS_GP, gp_param_reg(v, gp_used), 0, size);
@@ -556,6 +613,13 @@ pub fun classify_return_v(v: RiscvAbi, size: u64, align: u64,
 
     if (is_float && float_in_fp_bank(v, size)) {
         ret abi.make_slot(abi.CLASS_FP, fp_param_reg(v, 0), 0, size);
+    }
+
+    # a scalar wider than a word comes back in a0:a1, the same pair a two-word
+    # aggregate does (#2870). the return bank is never exhausted, so this has only the
+    # pair case and none of `place_two_words`'s spill arithmetic.
+    if (size > word) {
+        ret abi.make_slot_pair(abi.CLASS_GP, REG_A0, REG_A1, 0, size, word::u32);
     }
 
     ret abi.make_slot(abi.CLASS_GP, REG_A0, 0, size);
@@ -926,6 +990,146 @@ test "mach.lang.target.abi.riscv.float_in_fp_bank:is_the_declared_flen" {
     # lp64d: both.
     if (!float_in_fp_bank(v_lp64d(), 4)) { ret 1; }
     if (!float_in_fp_bank(v_lp64d(), 8)) { ret 1; }
+    ret 0;
+}
+
+# A SCALAR WIDER THAN A WORD CONSUMES TWO ARGUMENT REGISTERS, NOT ONE (#2870)
+#
+# The defect this pins was self-consistent between caller and callee: both agreed that
+# an `i64` on ilp32 lived in one register, so the second argument was pre-coloured on
+# top of the first argument's high half, and only a function that actually READ that
+# high half computed a wrong answer. A full suite passed over it.
+#
+# `piece_count` is the assertion that matters rather than `reg`, because
+# `mir.abi.advance_arg_cursors` advances the bank cursor by the slot's PIECES. A slot
+# naming the right first register with one piece is exactly the bug: it points at a0
+# and tells the cursor that a1 is still free.
+#
+# THE LP64 COLUMN IS NOT DECORATION. It is the control that says these assertions are
+# about the width and not about `i64`: the same type, the same classifier, one register
+# there because a word is 8 bytes. Without it a fix that gave every `i64` a pair would
+# pass the ilp32 half and silently break the member that ships.
+test "mach.lang.target.abi.riscv.classify_arg_v:a_wide_scalar_takes_a_register_pair" {
+    # ilp32: an i64 is two words, so a0:a1 and TWO pieces.
+    val a: abi.ParamSlot = classify_arg_v(v_ilp32(), 0, 8, 8, false, 0, false, false, false, 0, 0, 0, 0, abi.agg_none());
+    if (a.class       != abi.CLASS_GP) { ret 1; }
+    if (a.piece_count != 2)            { ret 1; }
+    if (a.pieces[0].reg != REG_A0)     { ret 1; }
+    if (a.pieces[1].reg != REG_A1)     { ret 1; }
+    # the high word's bytes come from offset `word`, which is what makes the pair
+    # geometry rather than two arbitrary registers
+    if (a.pieces[1].src_off != 4)      { ret 1; }
+
+    # the SECOND i64 therefore starts at a2, not a1. this is the defect stated
+    # directly: with a one-piece slot above, a caller advancing by pieces would have
+    # placed this one on top of the first argument's high half.
+    val b: abi.ParamSlot = classify_arg_v(v_ilp32(), 1, 8, 8, false, 0, false, false, false, 2, 0, 0, 0, abi.agg_none());
+    if (b.piece_count   != 2)          { ret 1; }
+    if (b.pieces[0].reg != gp_param_reg(v_ilp32(), 2)) { ret 1; }
+
+    # an i32 under the same member is one word and one piece, so the pair rule is
+    # keyed on the SIZE and not on the member
+    val w: abi.ParamSlot = classify_arg_v(v_ilp32(), 0, 4, 4, false, 0, false, false, false, 0, 0, 0, 0, abi.agg_none());
+    if (w.piece_count != 1)            { ret 1; }
+
+    # NO EVEN-ODD ALIGNMENT: RISC-V says so explicitly, unlike AAPCS32 and o32. an i64
+    # after one i32 starts at a1, and a fix that padded to a2 fails here.
+    val odd: abi.ParamSlot = classify_arg_v(v_ilp32(), 1, 8, 8, false, 0, false, false, false, 1, 0, 0, 0, abi.agg_none());
+    if (odd.piece_count   != 2)        { ret 1; }
+    if (odd.pieces[0].reg != gp_param_reg(v_ilp32(), 1)) { ret 1; }
+    if (odd.pieces[1].reg != gp_param_reg(v_ilp32(), 2)) { ret 1; }
+
+    # lp64: the same type is ONE word, so one register and one piece. the control.
+    val l: abi.ParamSlot = classify_arg_v(v_lp64(), 0, 8, 8, false, 0, false, false, false, 0, 0, 0, 0, abi.agg_none());
+    if (l.piece_count != 1)            { ret 1; }
+    if (l.reg         != REG_A0)       { ret 1; }
+    ret 0;
+}
+
+# THE BOUNDARY RULE APPLIES TO A WIDE SCALAR TOO, and running out of bank is where a
+# convention is most often wrong (#2870)
+#
+# The psABI gives three placements for a two-word value and the third is not "spill it
+# all": with exactly one register left the low word still rides that register and only
+# the high word goes to the stack. That case is reachable on ilp32 with four i64
+# arguments already placed and an odd number of words consumed, and it was written for
+# aggregates years before any scalar could reach it.
+test "mach.lang.target.abi.riscv.classify_arg_v:a_wide_scalar_splits_at_the_bank_boundary" {
+    val n: i32 = v_ilp32().gp_arg_count;
+
+    # exactly one register left: a register piece plus a stack piece
+    val split: abi.ParamSlot = classify_arg_v(v_ilp32(), 0, 8, 8, false, 0, false, false, false, n - 1, 0, 0, 0, abi.agg_none());
+    if (split.class            != abi.CLASS_GP)     { ret 1; }
+    if (split.piece_count      != 2)                { ret 1; }
+    if (split.pieces[0].kind   != abi.PIECE_GP)     { ret 1; }
+    if (split.pieces[1].kind   != abi.PIECE_STACK)  { ret 1; }
+    if (split.pieces[1].src_off != 4)               { ret 1; }
+
+    # none left: the whole value on the stack
+    val stk: abi.ParamSlot = classify_arg_v(v_ilp32(), 0, 8, 8, false, 0, false, false, false, n, 0, 0, 0, abi.agg_none());
+    if (stk.class != abi.CLASS_STACK)               { ret 1; }
+
+    # two left: the ordinary pair, so the three cases are distinguished rather than
+    # the split arm merely being reachable
+    val pair: abi.ParamSlot = classify_arg_v(v_ilp32(), 0, 8, 8, false, 0, false, false, false, n - 2, 0, 0, 0, abi.agg_none());
+    if (pair.piece_count    != 2)                   { ret 1; }
+    if (pair.pieces[1].kind != abi.PIECE_GP)        { ret 1; }
+    ret 0;
+}
+
+# A SOFT-FLOAT DOUBLE IS TWO WORDS TOO, and it reaches the integer bank by a different
+# route (#2870)
+#
+# The float clause falls back to the integer bank on three separate grounds - a
+# soft-float member, a float wider than the member carries, and an exhausted fa bank -
+# and all three land an `f64` on ilp32 in a register PAIR. `ilp32d` is the control: it
+# carries the double in the fa bank and never reaches the integer path at all, which is
+# why this half of the defect was narrower than the integer half and no less wrong.
+test "mach.lang.target.abi.riscv.classify_arg_v:a_soft_double_takes_a_register_pair" {
+    # ilp32 is soft float: the double takes a0:a1
+    val s: abi.ParamSlot = classify_arg_v(v_ilp32(), 0, 8, 8, true, 0, false, false, false, 0, 0, 0, 0, abi.agg_none());
+    if (s.class       != abi.CLASS_GP) { ret 1; }
+    if (s.piece_count != 2)            { ret 1; }
+    if (s.pieces[1].reg != REG_A1)     { ret 1; }
+
+    # ilp32f carries f32 but not f64, so the double takes the same pair
+    val f: abi.ParamSlot = classify_arg_v(v_ilp32f(), 0, 8, 8, true, 0, false, false, false, 0, 0, 0, 0, abi.agg_none());
+    if (f.class       != abi.CLASS_GP) { ret 1; }
+    if (f.piece_count != 2)            { ret 1; }
+
+    # and an f32 under the same member rides fa0, one piece: the pair rule is the
+    # value's width, not "a float on ilp32"
+    val f32: abi.ParamSlot = classify_arg_v(v_ilp32f(), 0, 4, 4, true, 0, false, false, false, 0, 0, 0, 0, abi.agg_none());
+    if (f32.class != abi.CLASS_FP)     { ret 1; }
+
+    # ilp32d carries it in the fa bank: the control that says the pair is a fallback
+    # and not what every ilp32 member does with a double
+    val d: abi.ParamSlot = classify_arg_v(v_ilp32d(), 0, 8, 8, true, 0, false, false, false, 0, 0, 0, 0, abi.agg_none());
+    if (d.class != abi.CLASS_FP)       { ret 1; }
+    ret 0;
+}
+
+# A WIDE SCALAR COMES BACK IN A REGISTER PAIR (#2870)
+#
+# The return half of the same defect, and it needed its own fix rather than falling out
+# of the argument one: `classify_return_v` has its own tail clause. Nothing downstream
+# advances a cursor for a return, so this one never corrupted a neighbour - what it got
+# wrong is the RECORDED placement, which is what a caller reads the result through.
+test "mach.lang.target.abi.riscv.classify_return_v:a_wide_scalar_returns_in_a_pair" {
+    val a: abi.ParamSlot = classify_return_v(v_ilp32(), 8, 8, false, 0, false, false, 0, 0, abi.agg_none());
+    if (a.class         != abi.CLASS_GP) { ret 1; }
+    if (a.piece_count   != 2)            { ret 1; }
+    if (a.pieces[0].reg != REG_A0)       { ret 1; }
+    if (a.pieces[1].reg != REG_A1)       { ret 1; }
+    if (a.pieces[1].src_off != 4)        { ret 1; }
+
+    # one word is still one register
+    val w: abi.ParamSlot = classify_return_v(v_ilp32(), 4, 4, false, 0, false, false, 0, 0, abi.agg_none());
+    if (w.piece_count != 1)              { ret 1; }
+
+    # and lp64 returns the same type in one, the width control again
+    val l: abi.ParamSlot = classify_return_v(v_lp64(), 8, 8, false, 0, false, false, 0, 0, abi.agg_none());
+    if (l.piece_count != 1)              { ret 1; }
     ret 0;
 }
 
