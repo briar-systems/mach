@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+#### A loop-carried vector accumulator through an unpacked operator came out holding the wrong value (#2749)
+The gap expansion (#2726) replaces a vector operator the target has no packed form for with per-lane scalar work and an assembled vector, then points that operator's uses at the assembled value. It rewrote those uses one block at a time, immediately after expanding that block's body. That is correct for every use that follows its definition, and wrong for the one that does not: a loop header's phi names the value the **latch** defines, so its back-edge operand is a forward reference no block order removes.
+
+The phi kept naming the deleted operator. MIR lowering turned the phi edge into a copy from a virtual register nothing defines, and the accumulator came out holding whatever that register happened to be. Measured on x86-64, a loop-carried `i32x4 * i32x4` returned the **multiplier** where the product belonged. aarch64 was right throughout for a reason unrelated to the defect - NEON has `MUL.4s`, so nothing expands there at all - which is why an entire suite of straight-line vector cases passed on every leg while this was live. The lane-access expansion had the identical defect one pass over.
+
+Substitution is now a whole-function step in both passes, after every block has been expanded, because the ordering it needs does not exist.
+
+### Changed
+
+#### The realization authority answers a lane-count ceiling as well as a lane width (#2749)
+`isa.packed_width` answers a question keyed on the lane **width**, and a SPIR-V Shader module's constraint is a lane **count**: `OpTypeVector` takes 2, 3 or 4 components at every element type. For 8-bit lanes the authority reported a 128-bit packed form, meaning sixteen lanes, which no Shader module may declare - so the authority and the emitter gave different answers about the same shape, and the emitter refused `i8x16`, `u8x16`, `i16x8` and `u16x8` by name.
+
+Under #2488 a vector type and a lane-wise operator are legal on **every** target and only the realization varies, so a refusal was the wrong answer. The machine model gains `max_vector_lanes`, folded into the authority so no caller consults two facts and picks the wrong one: every machine target declares no ceiling and its answers are unchanged, asserted rather than assumed; SPIR-V declares four, so 8-bit lanes report a 32-bit packed form and a wider shape takes the scalar expansion. The four by-name refusals are deleted rather than left unreachable, and a vector past the ceiling is realized as an `OpTypeArray` of its lanes - the logical-addressing analogue of a machine target splitting a vector across registers.
+
+`simd = "require"` now names the lane count as well as the lane width, because a target can pack the same operation at one count and scalarize it at another.
+
+The vectorizer takes its lane count from the same authority instead of `16 / element-bytes`, so it cannot form a shape the target would immediately take apart again.
+
+#### Sub-word integer arithmetic on SPIR-V produced a module no consumer accepts (#2749)
+The 4-byte ALU floor is a **register machine's** contract: a sub-word operation leaves the bits above its width undefined, and a spill saves the whole word, so computing narrower would persist residue. SPIR-V has no register file, and its arithmetic opcodes are typed - so computing an 8-bit add at 32 bits emitted an `OpIAdd` whose operand and result types disagree, which `spirv-val` rejects. Any `i8` or `i16` arithmetic reached it.
+
+The floor is now a declared model fact (`alu_min_width`) rather than a constant with two derivations layered on it: 4 on a register machine, 1 on the 8-bit 6502 whose word is one byte, and 1 where there is no register file at all. Machine-target output is byte-identical.
+
+A scalar comparison feeding arithmetic is likewise reconciled: SPIR-V's comparison yields a boolean with no numeric representation, which per-lane mask construction needs as a 0/1 value. That is the scalar counterpart of the `OpSelect` widening a lane-wise compare's mask already used.
+
 ## [4.16.0] - 2026-08-08
 
 ### Added
