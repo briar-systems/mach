@@ -258,6 +258,18 @@ pub val TYPE_QUERY_IS_SECRET:  u8 = 4;
 # the name, or none when this context cannot answer (no resolver installed)
 pub def TypeQueryFn: fun(ptr, u32, u8) R.Result[O.Option[CTValue], str];
 
+# the layout-intrinsic resolver `eval` calls to measure `$size_of` / `$align_of` /
+# `$length_of` in a comptime VALUE position (#2857)
+#
+# Takes the call expression rather than a type id, because the measurement needs the
+# intrinsic's own argument resolved against the installing pass's type universe and
+# needs to know WHICH intrinsic was written. The pass that owns layout answers; the
+# evaluator neither measures nor decides what is measurable.
+#
+# ok(none) means "not something this resolver answers", which falls through to the
+# position's own refusal. An err carries a precise message the caller reports.
+pub def LayoutFoldFn: fun(ptr, u32) R.Result[O.Option[CTValue], str];
+
 # surfaced when a type predicate is used where no type query resolver is installed
 pub val COMPTIME_TYPE_QUERY_NO_RESOLVER_MSG: str =
     "a comptime type predicate is only evaluable after type checking";
@@ -384,6 +396,8 @@ pub rec ComptimeCtx {
     field_data:     ptr;
     query_fn:       *u8;
     query_data:     ptr;
+    layout_fn:      *u8;
+    layout_data:    ptr;
     ident_fn:       *u8;
     ident_data:     ptr;
 }
@@ -460,6 +474,8 @@ pub fun init(
     c.field_data     = nil;
     c.query_fn       = nil;
     c.query_data     = nil;
+    c.layout_fn      = nil;
+    c.layout_data    = nil;
     c.ident_fn       = nil;
     c.ident_data     = nil;
     ret c;
@@ -514,6 +530,22 @@ pub fun set_field_resolver(c: *ComptimeCtx, fn: *u8, data: ptr) {
 pub fun set_type_query_resolver(c: *ComptimeCtx, fn: *u8, data: ptr) {
     c.query_fn   = fn;
     c.query_data = data;
+}
+
+# install the layout resolver `eval` calls to measure a layout intrinsic in a
+# comptime value position (#2857)
+#
+# Only a pass that has the type universe AND can force a type's layout may install
+# one - in practice sema. Resolve leaves it nil, and a layout intrinsic in a
+# declaration-gating `$if` is refused there with a message saying so, which is the
+# same line the type queries already draw.
+# ---
+# c:    the comptime context
+# fn:   erased LayoutFoldFn, or nil to clear
+# data: opaque context handed back to `fn`
+pub fun set_layout_resolver(c: *ComptimeCtx, fn: *u8, data: ptr) {
+    c.layout_fn   = fn;
+    c.layout_data = data;
 }
 
 # install (or clear) the identifier-binding resolver `eval` consults before it
@@ -841,17 +873,16 @@ pub fun eval(
     # generic call rejection describes it wrongly and sends the reader hunting for a
     # non-constant operand that is not there (#2316). TYPE positions do not arrive
     # here at all - they fold the intrinsic against forced layout material before
-    # asking the evaluator (#2442) - so what reaches this arm is a position with no
-    # layout to force: a `$if` / `$or` condition, or a `$assert` once it evaluates.
+    # asking the evaluator (#2442) - so what reaches this arm is a `$if` / `$or`
+    # condition or a `$assert`, which since #2857 is measured through the installed
+    # layout resolver rather than refused outright.
     if (k == expr.EXPR_KIND_CALL) {
         # a type predicate answers about the SHAPE of its operand type rather than
         # its storage, so it folds here in the comptime channel - which is where the
         # `$if` gate that consumes it is decided (#2128).
         val q: O.Option[R.Result[CTValue, str]] = eval_type_query(c, a, source, e, interner);
         if (O.is_some[R.Result[CTValue, str]](q)) { ret O.unwrap[R.Result[CTValue, str]](q); }
-        if (is_layout_intrinsic_call(a, source, e)) {
-            ret R.err[CTValue, str]("a layout intrinsic has no value in this position: it measures a type, which only a type position resolves");
-        }
+        if (is_layout_intrinsic_call(a, source, e)) { ret eval_layout_intrinsic(c, a, source, e); }
         ret R.err[CTValue, str]("function calls are not comptime-evaluable");
     }
     if (k == expr.EXPR_KIND_INDEX)      { ret R.err[CTValue, str]("index expressions are not comptime-evaluable"); }
@@ -862,6 +893,53 @@ pub fun eval(
     if (k == expr.EXPR_KIND_ERROR)      { ret R.err[CTValue, str]("expression has a parse error"); }
 
     ret R.err[CTValue, str]("expression is not comptime-evaluable");
+}
+
+# measure a layout intrinsic in a comptime value position, or say why not (#2857)
+#
+# A size is a constant, and the thing worth asserting about a layout is usually a
+# RELATIONSHIP between two of them - `$size_of(A) == $size_of(B)` for two records a
+# renderer writes into one slot, `$size_of(Header) == 64` for a wire format. That is
+# exactly what a `$if` expresses, so refusing the position turned a compile-time
+# invariant into a runtime test that only fires if someone runs the suite.
+#
+# THE MEASUREMENT IS NOT HERE, and deliberately. Measuring needs the type universe
+# and needs to FORCE the operand's layout material, both of which belong to the pass
+# that owns them; this module would otherwise hold a second layout policy that could
+# disagree with sema's. So the resolver answers and this function only routes.
+#
+# WITH NO RESOLVER INSTALLED the answer is a refusal that says WHEN the intrinsic
+# becomes available rather than claiming it has no value anywhere. That case is a
+# declaration-gating `$if` during resolve, where no type has been checked yet - the
+# same line the type queries already draw, and stated the same way, because a reader
+# who hits one and then the other should not think they are different rules.
+# ---
+# c:      the comptime context
+# a:      the AST
+# source: the module's source text
+# e:      the intrinsic call expression
+# ret:    the measured constant, or a precise refusal
+fun eval_layout_intrinsic(c: *ComptimeCtx, a: *ast.Ast, source: str, e: id.ExprId) R.Result[CTValue, str] {
+    if (c.layout_fn == nil) {
+        # `$offset_of` is named apart because it is unavailable for a DIFFERENT
+        # reason - sema's field-descriptor contract leaves offsets to lowering - so a
+        # message about type checking would be a stale explanation the moment the
+        # resolver exists.
+        if (is_comptime_call(a, source, e, "offset_of")) {
+            ret R.err[CTValue, str]("`$offset_of` has no value in a comptime condition: a field's offset is decided at lowering, later than any comptime branch");
+        }
+        ret R.err[CTValue, str]("a layout intrinsic is only comptime-evaluable after type checking: this position selects a DECLARATION, which is decided before any type is laid out. a `$if` inside a function body is checked later and can measure a type");
+    }
+    val fn: LayoutFoldFn = c.layout_fn::LayoutFoldFn;
+    val r: R.Result[O.Option[CTValue], str] = fn(c.layout_data, e::u32);
+    if (R.is_err[O.Option[CTValue], str](r)) {
+        ret R.err[CTValue, str](R.unwrap_err[O.Option[CTValue], str](r));
+    }
+    val ans: O.Option[CTValue] = R.unwrap_ok[O.Option[CTValue], str](r);
+    if (O.is_none[CTValue](ans)) {
+        ret R.err[CTValue, str]("`$offset_of` has no value in a comptime condition: a field's offset is decided at lowering, later than any comptime branch");
+    }
+    ret R.ok[CTValue, str](O.unwrap[CTValue](ans));
 }
 
 # returns a length-counted view into source covering `span`. the returned view

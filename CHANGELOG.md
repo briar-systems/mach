@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### A layout intrinsic can be measured inside a comptime `$if` (#2857)
+`$size_of` and `$align_of` are constants, but they could not appear in a `$if` condition, so the thing most worth asserting about a layout - a **relationship** between two of them - could only be a runtime test. Two records a renderer writes into one slot at a fixed offset must be the same size; if they diverge, one shader reads its colour out of the middle of a matrix, with no diagnostic at any layer. A test catches that only if someone runs the suite. A `$error` catches it in the build that introduced it.
+
+`$if ($size_of(A) != $size_of(B)) { $error("..."); }` now compiles inside a function body, as does a comparison against a literal and an intrinsic folded into a larger expression.
+
+The measurement is not new and deliberately is not duplicated: the comptime evaluator gained a resolver seam, and sema answers it through the same `fold_layout_intrinsic` a type position already used, so a size measured in an array length and the same size measured in a `$if` cannot disagree. Lowering installs its own resolver beside the type-query one it already had, because a chain gated on a comptime parameter or inside a generic body has its arm selected at monomorphization and never reaches sema's.
+
+Resolve reaches the position through a mechanism that was already there: `bind_comptime_if` defers a chain it cannot fold yet, binding every arm and leaving arm selection to a later pass, which is what a type comparison has always done. A layout gate joins that list rather than introducing a second rule.
+
+### Changed
+
+#### A refused layout intrinsic now says which position refused it, and why (#2857)
+`a layout intrinsic has no value in this position: it measures a type, which only a type position resolves` was true of every position and is now true of one. A **declaration-scope** `$if` still cannot measure, because it selects which declarations exist and that is decided before any type is laid out, so it says that instead and points at the position that does work. `$offset_of` is named apart, since it is unavailable for a different reason - a field offset is decided at lowering - and a message about type checking would be a stale explanation the moment the resolver exists.
+
+Two limits are filed rather than left implicit: `$length_of` still does not fold in a gate (#2875), and no declaration-scope gate can see a type at all, which is shared with type queries and comparisons (#2876).
+
+
+### Added
+
 #### RV32 is a target (#2778)
 mach compiles for 32-bit RISC-V. `isa = "riscv32"` with `abi = "ilp32"`, `"ilp32f"` or `"ilp32d"` resolves a full machine description, and `$mach.arch.riscv32` and the three `$mach.abi.ilp32*` tags exist so a body can be guarded for it.
 
