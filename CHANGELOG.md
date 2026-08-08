@@ -18,6 +18,14 @@ The two paths computed one fact in two places and agreed only by accident. The h
 
 ### Added
 
+#### A sub-width vector crosses to memory in one instruction where the ISA has one, instead of always going through a scratch slot (#2716)
+`i32x2` and `f32x2` cost a stack frame, a 16-byte scratch slot, a whole-register spill and a chunk walk through a GP register to move eight bytes. `copy_i32x2` on x86-64 was 13 instructions and a 32-byte frame; it is now 5 instructions and **no frame**, one `movsd` each way.
+
+Which widths can cross between a **vector register** and memory in one instruction is a declared per-ISA capability (`vec_mem_widths`), read only through `isa.moves_vector_memory`. x86-64 has `movss`/`movsd`/`movups` at 4, 8 and 16; aarch64 has `ldr`/`str` at the S, D and Q views. A width listed there also promises that a load of it **zeroes the lanes above it**, which is what lets the direct load keep the guarantee the scratch round trip provided: the lanes a type does not have read as a defined 0 rather than as frame residue.
+
+The 12-byte shapes stay on the scratch path, and that is the finding rather than a gap: the issue proposed gating on lane alignment, a predicate that is **true for every shape mach can spell** (every lane width is a power of two no greater than 8, so the greedy 8/4/2/1 walk is lane-aligned by induction — its `i16x7` counterexample is arithmetically wrong, the 4-byte chunk at offset 8 covering lanes 4 and 5 exactly). A vacuous guard would have licensed a chunked direct access that neither baseline can encode: `pinsrd`/`pextrd` are SSE4.1 against an SSE2 baseline, and aarch64's single-structure `ld1 {v0.s}[2]` is a form this encoder does not emit yet. Both are pure additions later; until then the round trip covers those shapes, on a declared capability rather than by accident.
+
+Asserted on the emitted code (`int/surface/vector-subwidth-direct`, frame verdicts per shape per leg), because the lanes were already right — a run-and-compare case cannot see this at all.
 #### A shader can bind and sample a texture (#2794)
 The GPU decorator set covered `#[input]`, `#[output]`, `#[builtin]`, `#[uniform]` and `#[storage]`, and none of them declares an image. A shader that reads a texture could not be written at all, which is the remaining blocker for porting boom's shaders off GLSL - every one of them samples a texture.
 
