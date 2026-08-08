@@ -31,8 +31,6 @@ Consolidating them surfaced a disagreement the copies had been hiding. An `$each
 
 A comptime binding that shadows a module constant still resolves innermost-first, which is the half of this that had to be preserved rather than changed: a `$param` or an `$each` variable named after a module constant denotes the inner one.
 
-## [Unreleased]
-
 ### Changed
 
 #### The FNEG sign mask and aarch64's `fmov` immediate reach the constant pool (#2754)
