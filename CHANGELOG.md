@@ -7,7 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+#### A constant out-of-bounds index is refused, on every target (#2751)
+`var xs: [4]i32; ret xs[9];` compiled cleanly on x86-64, aarch64 and riscv64, and on SPIR-V emitted an `OpAccessChain` with `%uint_9` into a four-element array that `spirv-val` did not catch either. The length is part of the type and the index is a constant, so the violation was decidable with no analysis at all. It had simply never been asked.
+
+Sema now asks it, keyed on `type.element_count` — the one definition of "how many elements a type holds", the same answer `$length_of` gives. Keying on the count rather than on the syntax is what makes the spellings free: a `def` alias, an array field of a generic instance, an array nested in a record or in another array, and a `^`-qualified array all name the same interned array type, and all get the same refusal. A vector's lane count is a statically known length too and now takes the identical rule and the identical message, replacing the vector-only wording it had before.
+
+The diagnostic names the index, the type and the length: ``index 9 is out of bounds for `[4]i32` of length 4``.
+
+Scope is deliberate. Only a **constant** index against a **fixed** length is checked, which needs no dataflow. A runtime index is not checked, and a pointer is not checked at all — `*T` carries no length to measure against.
+
+Folding the index now decides on **resolution identity** rather than on name text. The comptime environment is keyed by name, so a block-local `var n` that shares its name with a module-level `val n` used to fold to the module constant. That was already visible on the vector path, where `v[n]` with a local `n = 1` was reported as an out-of-bounds lane against a module-level `n = 9`; it now reports the dynamic-lane refusal it should always have given, and an array indexed by such a local is correctly left alone rather than refused. The runtime-binding rule the `$if` gate check already carried is now one shared definition.
+
 ### Added
+
+#### `$is_secret(T)`, so a reflection walk can act on secrecy instead of refusing it (#2694)
+Every comptime predicate asks about the shape **under** a `^`, so all of them answer false for a secret. `$is_record(^u64)` and `$is_record(u64)` were therefore the same answer, and a `std.derive` walk could only ever meet a secret field as a fallthrough it had to refuse. That is a refusal, not a decision, and it blocked all three things a derive actually wants: a formatter that redacts a secret field, a hash that refuses one (a data-dependent fold is a leak in the shape of a digest), and an equality that selects the constant-time comparison rather than the early-out whose timing is the secret.
+
+`$is_secret(T)` is the positive question, and it joins the predicate family exactly: comptime-only, one type operand, gate position, answered per instantiation inside a generic. It is the family's one exception to the stripping rule, and the exception is coherent rather than special-cased — the other three ask about the wrapped storage, this one asks about the wrapper. The doc's stripping table names it as such.
+
+The contract is **outermost only**, the same line the shape predicates already draw, so the four cannot disagree about what a type is. `^*u8` is true (the pointer is the secret), `*^u8` is false (a public address to secret storage), `[N]^u8` is false, `^^T` is true because `^^T` collapses to `^T`, and a record with a secret field is false — the field is secret, and `$is_secret(f.type)` is where a walk meets that.
+
+There is deliberately no transitive "contains a secret anywhere" query. Folding it in would make the common case wrong: a formatter gating on a transitive answer would redact a whole record over one field, and could not tell which. Where the transitive question is genuinely wanted through a reference it composes instead, `$is_secret($pointee_of(f.type))`. `$pointee_of(^*U)` stays refused, which is right — `$is_secret` has already answered true there and a walk should stop.
+
+A walk that skips a secret field is pinned by the flow rules rather than by convention: reading one into a public accumulator does not compile, so a gate that answers wrongly is a compile error rather than a silent disclosure. The regression case relies on exactly that.
 
 #### A constant pool, so a float constant is loaded rather than rebuilt (#2248, #2700)
 A constant wider than an ISA's immediate forms has to live in memory somewhere. Every back end here instead rebuilt one from instructions at every use, inside loop bodies included: x86-64 spent `movabs r11 ; movq xmm, r11` (two instructions, 15 bytes, and a general-purpose scratch) because SSE has no immediate form at all, aarch64 spent up to four `movz`/`movk` words plus a bank move, and riscv64 spent `emit_li`'s recursive shift-and-add - five to seven words for an arbitrary `f64`, since its widest immediate is 32 bits.
@@ -47,6 +71,17 @@ The refusal itself is unchanged. Its diagnostic and `doc/language/decorators.md`
 The case now reads the stream. It reports `errors`, `warnings` or `clean`, and lists each residual warning text with only the per-CU section offset elided, so a failure names itself in the diff. Exactly one class is filtered, with its reason written beside it, and every other warning of any class now fails the case where before none could.
 
 That filtered class is the duplicate itself, and it is deliberate. DWARF 5 §6.2.4 numbers file entries from 0 and §6.2.2 still gives the line state machine's `file` register an initial value of 1, and a single-file compile unit cannot satisfy both. binutils resolves it the way §6.2.2 says: measured on binutils 2.47, `addr2line` reports `mangled line number section (bad file number)` on every compile unit of a table whose only entry is slot 0, including clang's own `-gdwarf-5` output. gcc emits the duplicate and llvm-dwarfdump warns on gcc's output identically. `dwarf.mach` now records that, because the obvious repair trades a cosmetic warning from one validator for a real decode failure in every libbfd consumer. It is also validator-version dependent - llvm-dwarfdump 18 does not report it and 22 does - so leaving it in the observable would have made the golden a statement about the runner's llvm package rather than about the compiler.
+
+#### An unencodable float move produced a wrong move instead of a diagnostic (#2733)
+All three register machines answered a float-move width they do not implement by **substituting 8** and encoding anyway. `if (w != 4 && w != 8) { w = 8; }` sat in x86-64's `encode_fp_mov`, aarch64's `encode_fmov` and riscv64's `encode_fmov` - the same line in the same role on each - so a move the compiler could not encode became an 8-byte move that dropped everything above the low lane, with no error anywhere. A defensive fallback that produces **wrong output** is worse than no fallback: it converts "the compiler was asked something it cannot do" into "the program computes the wrong answer", which is the worst failure a back end has.
+
+It had already cost real debugging. During #2687 three layers each answered one fixed-size ladder, and the middle layer's honest refusal was **masking** this one - widening that refusal alone compiled cleanly and then silently dropped the top lane of every stack-passed vector. That refusal was the only thing standing between this default and a shipped miscompile.
+
+Every float encoder on every register machine now refuses a width it does not implement, and the census turned up two more sites than the issue named. x86-64 carried a **second** silent narrow in `encode_float_const_mov`, where a wrong width pools an f64-sized image of a constant that is not an f64 - and the constant is the value the program computes with. And the float **conversions** on all three targets carried the same substitution in a shape no search for the ladder finds: they read `dw == 8` / `src_w == 4` and took the other form for everything else, with no ladder to grep for. Arithmetic, negate and compare already refused on all three, and are now pinned by the same tests.
+
+**The refusals are driven, not argued.** Each one is called directly from a unit test with a width it must refuse, and the assertion is that the byte sink stayed **empty** - "returned an error" and "emitted nothing" are different properties, and only the second distinguishes a refusal from an emit-then-error. Arguing that no caller reaches a site is exactly what let this sit. x86-64's `encode_fp_mov` reports its backend bugs rather than ending the process itself to make that checkable at all; the process-terminating decision moved to its single caller, unchanged in behaviour.
+
+The aarch64 calling convention's two `make_slot_hfa(reg, 1, 16, size)` literals are on the same path and are now written as what they are: the **V register** width, not the vector's. A `f32x3` is twelve bytes and rides a whole register, so "correcting" the literal to `size` breaks it - which is measured, not supposed. What the literal did hide is the vector too wide for one register that #2727 makes legal, which would have been handed V0 and a piece describing half of it; those now spill by value and return indirectly.
 
 #### An over-aligned stack local is over-aligned at run time (#2735)
 `#[align(32)]` and above worked on a global and did nothing on a local. The slot's offset was a correct multiple of the requested alignment, but it was measured from the frame pointer, and the only alignment that reaches the frame pointer is the ABI's 16-byte call boundary. So the address was a multiple of 32 exactly when the process stack happened to start on one, which depends on the environment block and therefore changes between runs of the same binary. `$size_of` already reported the padded size, so the storage was sized for a promise the placement did not keep.
