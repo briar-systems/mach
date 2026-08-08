@@ -1,4 +1,4 @@
-# a reference RV32IM core: execute emitted bytes and say what they compute
+# a reference RV32IMFD core: execute emitted bytes and say what they compute
 #
 # The riscv32 counterpart of the reference 6502 core in `isa.mos6502.encode`, and it
 # exists for the reason that one does. rv32 shipped passing the whole suite while four
@@ -37,15 +37,21 @@
 #
 # ===========================================================================
 #
-# SCOPE IS RV32I PLUS M, and that is a closed set from the manual rather than "whatever
-# the corpus showed". Implementing only the instructions one program happened to select
-# would make the harness fail on the next program and look like a codegen bug.
+# SCOPE IS RV32I PLUS M, F AND D, and that is a closed set from the manual rather than
+# "whatever the corpus showed". Implementing only the instructions one program happened
+# to select would make the harness fail on the next program and look like a codegen bug.
 #
-# NOT COVERED, AND REFUSED BY NAME RATHER THAN IGNORED: the F and D extensions, fences,
-# and CSR access. rv32 codegen does select float instructions, so a probe program that
-# uses a float reaches an `fld` here and gets a refusal naming the opcode - a harness
-# that skipped what it did not model would report a pass for a program it never ran.
-# Float coverage is a later change and wants the whole of IEEE 754 done properly.
+# THE FLOAT HALF IS RV32-ONLY, SO THE RV64 FLOAT OPCODES ARE REFUSED BY NAME. `fcvt.l.s`,
+# `fcvt.lu.s`, `fcvt.l.d`, `fcvt.lu.d`, `fcvt.s.l`, `fcvt.s.lu`, `fcvt.d.l`, `fcvt.d.lu`,
+# `fmv.x.d` and `fmv.d.x` each name a 64-bit general-purpose operand, and no RV32 register
+# is that wide. Those are exactly the opcodes #2860 says must never reach an RV32 target,
+# so this core has to be able to SAY it saw one rather than quietly computing an answer
+# the hardware would have trapped on. The refusal carries the mnemonic in `Core.refused`.
+#
+# NOT COVERED, AND REFUSED BY NAME RATHER THAN IGNORED: fences, CSR access, and the half
+# and quad float formats. The `frm` field of `fcsr` IS modeled, because the rounding mode
+# changes results. The accrued exception flags are not modeled, and nothing on this target
+# can observe that: reading them takes a CSR instruction, which is a refusal.
 #
 # TERMINATION is a return to a sentinel address seeded into `ra` before entry: the
 # emitted `ret` is `jalr x0, 0(ra)`, so a jump whose target is the sentinel is the
@@ -57,6 +63,8 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
 
 # the address seeded into `ra`; a jump here is the entry function returning
 #
@@ -77,14 +85,38 @@ pub val MAX_STEPS: u32 = 2000000;
 #
 # `x[0]` is present so register numbering needs no adjustment, and is forced to zero on
 # every write, which is the manual's rule rather than a convenience.
+#
+# `f[0]` IS NOT hardwired to zero. That asymmetry with `x[0]` is the manual's and it is
+# easy to carry over by reflex, which would make `fmv.w.x f0, a0` silently do nothing.
+#
+# FLEN IS 64 AND XLEN IS 32, which is the asymmetry #2874 says is most likely to bite on
+# this target. Every float register is 64 bits wide even though no integer register is,
+# so a single-precision value in one is NaN-boxed rather than merely present in the low
+# half - see `unbox_s` for what that costs a reader of a badly boxed operand.
 # ---
-# x:     the 32 integer registers, x[0] hardwired to zero
-# pc:    the program counter
-# steps: instructions retired, for the runaway backstop and for cost assertions
+# x:       the 32 integer registers, x[0] hardwired to zero
+# f:       the 32 float registers, 64 bits each, f[0] an ordinary register
+# frm:     the rounding mode field of `fcsr`, 0 for round-to-nearest-ties-to-even
+# pc:      the program counter
+# steps:   instructions retired, for the runaway backstop and for cost assertions
+# refused: the mnemonic a refusal named, empty until a run refuses
 pub rec Core {
-    x:     [32]u32;
-    pc:    u32;
-    steps: u32;
+    x:       [32]u32;
+    f:       [32]u64;
+    frm:     u32;
+    pc:      u32;
+    steps:   u32;
+    refused: str;
+}
+
+# record the mnemonic behind a refusal and report the run as not completed
+#
+# A refusal must be able to NAME what it saw. "this core stopped" and "this core met an
+# `fcvt.l.d` on a 32-bit target" are different findings, and only the second one tells a
+# caller whether the compiler or the harness is at fault.
+fun refuse(core: *Core, what: str) bool {
+    core.refused = what;
+    ret false;
 }
 
 # sign-extend the low `bits` of `v`
@@ -126,6 +158,1045 @@ fun wr_mem(mem: *u8, size: usize, addr: u32, n: u32, v: u32) bool {
     ret true;
 }
 
+# ===========================================================================
+# THE F AND D EXTENSIONS. IEEE 754 IS THE DELIVERABLE, NOT THE INSTRUCTION COUNT.
+# ===========================================================================
+#
+# ON COMPUTING WITH THE HOST'S OWN FLOAT ARITHMETIC, AND ON THE EDGES OF THAT PERMISSION.
+#
+# `fadd.d` in round-to-nearest-ties-to-even IS x86-64 binary64 addition. Writing a second
+# soft-float adder and calling that the reference would not be an independent check, it
+# would be a second chance to be wrong in the same place, so the round-to-nearest arms of
+# `fadd`, `fsub`, `fmul` and `fdiv` below are the host's operators (see `host_arith`).
+#
+# THAT PERMISSION IS NARROW AND ITS EDGES ARE HELD HERE, NOT ASSUMED:
+#
+#   - It does not cover the rounding mode. The host is always round-to-nearest. Every
+#     other mode is computed by the soft-float path in this file, which carries a guard
+#     bit and a sticky bit through to a single rounding decision in `round_pack`.
+#   - It does not cover the fused multiply-add. There is no host FMA, and a multiply
+#     followed by an add rounds twice, which is a different function. `soft_fma` forms
+#     the exact 106-bit product in a 256-bit accumulator and rounds once.
+#   - It does not cover `fsqrt`. The host has no square root here, and an approximation
+#     refined by Newton is not correctly rounded. `soft_sqrt` is a digit-by-digit integer
+#     square root whose remainder is the sticky bit, so its rounding is exact.
+#   - It does not cover `fcvt` to an integer. The RISC-V rules are not the C rules and
+#     are DEFINED where C is undefined: a NaN converts to the destination's maximum, an
+#     out-of-range value saturates rather than wrapping or trapping.
+#   - It does not cover NaN-boxing, and it does not cover the sign and NaN rules of
+#     `fsgnj`, `fmin`, `fmax` or the compares. Those are bit rules, written out below.
+#   - It does not cover NaN payloads. RISC-V produces the CANONICAL quiet NaN for every
+#     operation with a NaN result and never propagates an input's payload, so every host
+#     result is canonicalised on the way out.
+#
+# A later reader will be tempted to "simplify" the soft path away, or to route the
+# round-to-nearest arms through it for uniformity. Both are wrong, and for opposite
+# reasons: the first loses every rounding mode the host cannot express, and the second
+# loses the only cross-check this file has on its own soft-float. The differential test
+# at the bottom pins them against each other.
+
+# a float value taken apart: the value is (-1)^sign * man * 2^exp for a finite number
+#
+# `man` is an INTEGER significand rather than a fraction, and `exp` is scaled to match,
+# so a subnormal needs no separate case downstream: it is simply a number whose `man`
+# happens to be below 2^mb.
+# ---
+# sign: 0 positive, 1 negative
+# cls:  0 zero, 1 finite nonzero, 2 infinity, 3 NaN
+# exp:  the exponent of the significand's least significant bit
+# man:  the integer significand
+rec Fp {
+    sign: u32;
+    cls:  u32;
+    exp:  i32;
+    man:  u64;
+}
+
+# the two formats, as the manual's fmt field encodes them in bits 26:25
+val FMT_S: u32 = 0;
+val FMT_D: u32 = 1;
+
+# 1 << n, as a u64
+fun bit(n: u32) u64 {
+    ret 1::u64 << n;
+}
+
+# the index of the highest set bit, or -1 for zero
+fun msb64(v: u64) i32 {
+    var n: i32 = -1;
+    var t: u64 = v;
+    for (t != 0) { t = t >> 1; n = n + 1; }
+    ret n;
+}
+
+# the stored significand field width: 23 for binary32, 52 for binary64
+fun fmt_mb(fmt: u32) u32 {
+    if (fmt == FMT_S) { ret 23; }
+    ret 52;
+}
+
+# the exponent field width: 8 for binary32, 11 for binary64
+fun fmt_eb(fmt: u32) u32 {
+    if (fmt == FMT_S) { ret 8; }
+    ret 11;
+}
+
+# the exponent bias: 127 for binary32, 1023 for binary64
+fun fmt_bias(fmt: u32) i32 {
+    if (fmt == FMT_S) { ret 127; }
+    ret 1023;
+}
+
+# every bit the format occupies
+fun fmt_mask(fmt: u32) u64 {
+    if (fmt == FMT_S) { ret 0xFFFFFFFF; }
+    ret 0xFFFFFFFFFFFFFFFF;
+}
+
+fun fmt_signbit(fmt: u32) u64 {
+    if (fmt == FMT_S) { ret 0x80000000; }
+    ret 0x8000000000000000;
+}
+
+fun fmt_inf(fmt: u32) u64 {
+    if (fmt == FMT_S) { ret 0x7F800000; }
+    ret 0x7FF0000000000000;
+}
+
+# the canonical quiet NaN: the only NaN a RISC-V operation ever produces
+fun fmt_qnan(fmt: u32) u64 {
+    if (fmt == FMT_S) { ret 0x7FC00000; }
+    ret 0x7FF8000000000000;
+}
+
+# the largest finite magnitude, which the directed rounding modes overflow to
+fun fmt_maxfin(fmt: u32) u64 {
+    if (fmt == FMT_S) { ret 0x7F7FFFFF; }
+    ret 0x7FEFFFFFFFFFFFFF;
+}
+
+fun fmt_one(fmt: u32) u64 {
+    if (fmt == FMT_S) { ret 0x3F800000; }
+    ret 0x3FF0000000000000;
+}
+
+fun sign_bits(sign: u32, fmt: u32) u64 {
+    if (sign == 1) { ret fmt_signbit(fmt); }
+    ret 0;
+}
+
+# take a float apart into sign, class, integer significand and exponent
+fun unpack(bits: u64, fmt: u32) Fp {
+    val mb:   u32 = fmt_mb(fmt);
+    val eb:   u32 = fmt_eb(fmt);
+    val bias: i32 = fmt_bias(fmt);
+    var r: Fp;
+    r.sign = ((bits >> (mb + eb)) & 1)::u32;
+    val e: u32 = ((bits >> mb) & (bit(eb) - 1))::u32;
+    val m: u64 = bits & (bit(mb) - 1);
+    if (e == 0) {
+        if (m == 0) { r.cls = 0; r.exp = 0; r.man = 0; ret r; }
+        # a subnormal has no implicit leading one and shares the smallest exponent
+        r.cls = 1;
+        r.man = m;
+        r.exp = 1 - bias - mb::i32;
+        ret r;
+    }
+    if (e == bit(eb)::u32 - 1) {
+        if (m == 0) { r.cls = 2; } or { r.cls = 3; }
+        r.exp = 0;
+        r.man = m;
+        ret r;
+    }
+    r.cls = 1;
+    r.man = bit(mb) | m;
+    r.exp = e::i32 - bias - mb::i32;
+    ret r;
+}
+
+# should a magnitude be incremented, given the bit below it and everything under that
+#
+# THE ONLY PLACE A ROUNDING MODE IS INTERPRETED. Every rounding in this file - the
+# arithmetic, the conversions to integer, the conversions between formats - routes its
+# decision through here, so there is exactly one definition of each mode to get wrong.
+# ---
+# sign: the sign of the value being rounded, which the directed modes depend on
+# m:    the magnitude about to be kept, whose low bit decides a tie under RNE
+# r:    the bit immediately below the kept magnitude
+# s:    true when anything below `r` is nonzero
+# rm:   0 RNE, 1 RTZ, 2 RDN, 3 RUP, 4 RMM
+fun round_up_p(sign: u32, m: u64, r: bool, s: bool, rm: u32) bool {
+    if (rm == 0) { ret r && (s || (m & 1) == 1); }
+    if (rm == 1) { ret false; }
+    if (rm == 2) { ret sign == 1 && (r || s); }
+    if (rm == 3) { ret sign == 0 && (r || s); }
+    ret r;
+}
+
+# the result when a rounded magnitude runs past the format's largest finite value
+#
+# The manual does not send every mode to infinity. Round-toward-zero never produces an
+# infinity it was not given, and each directed mode overflows only in its own direction.
+fun overflow_result(sign: u32, fmt: u32, rm: u32) u64 {
+    if (rm == 1)             { ret sign_bits(sign, fmt) | fmt_maxfin(fmt); }
+    if (rm == 2 && sign == 0) { ret fmt_maxfin(fmt); }
+    if (rm == 3 && sign == 1) { ret fmt_signbit(fmt) | fmt_maxfin(fmt); }
+    ret sign_bits(sign, fmt) | fmt_inf(fmt);
+}
+
+# round (-1)^sign * (man + sticky) * 2^exp into `fmt` under `rm` and encode it
+#
+# THE SINGLE ROUNDING POINT. Every arithmetic result in this file arrives here as an
+# exact value plus one sticky bit, and leaves as an encoded float. Underflow is gradual
+# because the significand's least significant bit is clamped to the subnormal one before
+# any bits are dropped, which is what makes rounding happen at the destination's real
+# precision instead of at full precision followed by a second rounding.
+# ---
+# man: nonzero unless the value is exactly zero, with the sticky strictly below its lsb
+fun round_pack(sign: u32, exp0: i32, man0: u64, sticky0: bool, fmt: u32, rm: u32) u64 {
+    val mb:   u32 = fmt_mb(fmt);
+    val eb:   u32 = fmt_eb(fmt);
+    val bias: i32 = fmt_bias(fmt);
+    val p:    u32 = mb + 1;
+    val emin: i32 = 1 - bias - mb::i32;
+    if (man0 == 0) { ret sign_bits(sign, fmt); }
+
+    var lsb: i32 = exp0 + msb64(man0) - (p::i32 - 1);
+    if (lsb < emin) { lsb = emin; }
+    val sh: i32 = lsb - exp0;
+
+    var m: u64 = 0;
+    var r: bool = false;
+    var s: bool = sticky0;
+    if (sh <= 0) {
+        m = man0 << (0 - sh)::u32;
+    }
+    or (sh > 64) {
+        s = true;
+    }
+    or (sh == 64) {
+        r = (man0 >> 63) == 1;
+        if ((man0 & 0x7FFFFFFFFFFFFFFF) != 0) { s = true; }
+    }
+    or {
+        val u: u32 = sh::u32;
+        m = man0 >> u;
+        r = ((man0 >> (u - 1)) & 1) == 1;
+        if (u > 1 && (man0 & (bit(u - 1) - 1)) != 0) { s = true; }
+    }
+
+    if (round_up_p(sign, m, r, s, rm)) { m = m + 1; }
+    if (m == 0) { ret sign_bits(sign, fmt); }
+    var e: i32 = lsb + bias + mb::i32;
+    if (m >= bit(p)) { m = m >> 1; e = e + 1; }
+    if (m < bit(mb)) { ret sign_bits(sign, fmt) | m; }
+    if (e > bit(eb)::i32 - 2) { ret overflow_result(sign, fmt, rm); }
+    ret sign_bits(sign, fmt) | (e::u64 << mb) | (m - bit(mb));
+}
+
+# a 256-bit unsigned accumulator, four u64 words with word 0 the least significant
+#
+# Wide enough that the exact 106-bit product of two binary64 significands and a 53-bit
+# addend both sit inside it with room to spare, which is what lets `soft_fma` round once
+# instead of twice. The generous headroom is deliberate: the interesting case for a fused
+# multiply-add is catastrophic cancellation, and a frame that only just fits is a frame
+# where a later reader has to prove no bit was lost.
+fun bn_zero(a: *u64) {
+    var i: u32 = 0;
+    for (i < 4) { a[i] = 0; i = i + 1; }
+}
+
+fun bn_copy(d: *u64, s: *u64) {
+    var i: u32 = 0;
+    for (i < 4) { d[i] = s[i]; i = i + 1; }
+}
+
+fun bn_is_zero(a: *u64) bool {
+    var i: u32 = 0;
+    for (i < 4) {
+        if (a[i] != 0) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun bn_msb(a: *u64) i32 {
+    var i: i32 = 3;
+    for (i >= 0) {
+        if (a[i] != 0) { ret i * 64 + msb64(a[i]); }
+        i = i - 1;
+    }
+    ret -1;
+}
+
+fun bn_shl(a: *u64, n: u32) {
+    if (n >= 256) { bn_zero(a); ret; }
+    val wsh: i32 = (n / 64)::i32;
+    val bsh: u32 = n % 64;
+    var i: i32 = 3;
+    for (i >= 0) {
+        val src: i32 = i - wsh;
+        var v: u64 = 0;
+        if (src >= 0) {
+            v = a[src];
+            if (bsh != 0) {
+                v = v << bsh;
+                if (src > 0) { v = v | (a[src - 1] >> (64 - bsh)); }
+            }
+        }
+        a[i] = v;
+        i = i - 1;
+    }
+}
+
+# shift right, reporting whether any set bit fell off the bottom
+fun bn_shr_sticky(a: *u64, n: u32) bool {
+    if (n == 0) { ret false; }
+    if (n >= 256) {
+        val any: bool = !bn_is_zero(a);
+        bn_zero(a);
+        ret any;
+    }
+    val wsh: u32 = n / 64;
+    val bsh: u32 = n % 64;
+    var lost: bool = false;
+    var i: u32 = 0;
+    for (i < wsh) {
+        if (a[i] != 0) { lost = true; }
+        i = i + 1;
+    }
+    if (bsh != 0 && (a[wsh] & (bit(bsh) - 1)) != 0) { lost = true; }
+    i = 0;
+    for (i < 4) {
+        val src: u32 = i + wsh;
+        var v: u64 = 0;
+        if (src < 4) {
+            v = a[src];
+            if (bsh != 0) {
+                v = v >> bsh;
+                if (src + 1 < 4) { v = v | (a[src + 1] << (64 - bsh)); }
+            }
+        }
+        a[i] = v;
+        i = i + 1;
+    }
+    ret lost;
+}
+
+fun bn_add(a: *u64, b: *u64) {
+    var c: u64 = 0;
+    var i: u32 = 0;
+    for (i < 4) {
+        val s1: u64 = a[i] + b[i];
+        var c1: u64 = 0;
+        if (s1 < a[i]) { c1 = 1; }
+        val s2: u64 = s1 + c;
+        if (s2 < s1) { c1 = 1; }
+        a[i] = s2;
+        c = c1;
+        i = i + 1;
+    }
+}
+
+# a -= b, which the callers only reach with a >= b
+fun bn_sub(a: *u64, b: *u64) {
+    var brw: u64 = 0;
+    var i: u32 = 0;
+    for (i < 4) {
+        val d1: u64 = a[i] - b[i];
+        var b1: u64 = 0;
+        if (a[i] < b[i]) { b1 = 1; }
+        val d2: u64 = d1 - brw;
+        if (d1 < brw) { b1 = 1; }
+        a[i] = d2;
+        brw = b1;
+        i = i + 1;
+    }
+}
+
+fun bn_dec(a: *u64) {
+    var i: u32 = 0;
+    for (i < 4) {
+        if (a[i] != 0) { a[i] = a[i] - 1; ret; }
+        a[i] = 0xFFFFFFFFFFFFFFFF;
+        i = i + 1;
+    }
+}
+
+fun bn_cmp(a: *u64, b: *u64) i32 {
+    var i: i32 = 3;
+    for (i >= 0) {
+        if (a[i] > b[i]) { ret 1; }
+        if (a[i] < b[i]) { ret -1; }
+        i = i - 1;
+    }
+    ret 0;
+}
+
+# the exact 128-bit product of two 64-bit values, by 32-bit limbs
+fun bn_set_mul(d: *u64, x: u64, y: u64) {
+    bn_zero(d);
+    val x0: u64 = x & 0xFFFFFFFF;
+    val x1: u64 = x >> 32;
+    val y0: u64 = y & 0xFFFFFFFF;
+    val y1: u64 = y >> 32;
+    val p00: u64 = x0 * y0;
+    val p01: u64 = x0 * y1;
+    val p10: u64 = x1 * y0;
+    var hi:  u64 = x1 * y1;
+    val mid: u64 = p01 + p10;
+    if (mid < p01) { hi = hi + 0x100000000; }
+    val lo: u64 = p00 + (mid << 32);
+    if (lo < p00) { hi = hi + 1; }
+    d[0] = lo;
+    d[1] = hi + (mid >> 32);
+}
+
+# reduce a nonzero accumulator to a 64-bit significand plus a sticky bit
+# ---
+# ret: how far right the significand was taken, to be added to the frame's exponent
+fun bn_reduce(a: *u64, man: *u64, sticky: *bool) i32 {
+    val m: i32 = bn_msb(a);
+    if (m < 64) {
+        @man = a[0];
+        @sticky = false;
+        ret 0;
+    }
+    val sh: i32 = m - 63;
+    var t: [4]u64;
+    bn_copy(?t[0], a);
+    @sticky = bn_shr_sticky(?t[0], sh::u32);
+    @man = t[0];
+    ret sh;
+}
+
+# a fused multiply-add: (-1)^? a*b (+ c) rounded ONCE
+#
+# The product is formed exactly and the addend is shifted into the same 256-bit frame, so
+# the only rounding is the final one. That is the whole difference between this and a
+# multiply followed by an add, and it is visible: with a = b = 1 + 2^-52 and
+# c = -(1 + 2^-51) the fused answer is 2^-104 and the two-rounding answer is zero.
+#
+# The frame's least significant bit sits 200 places below the larger operand's most
+# significant bit. Only the SMALLER operand can ever fall off the bottom of that, and it
+# can only do so when it is more than ninety bits below the other, which is exactly the
+# case where cancellation cannot happen - so a lost bit never decides a rounding it
+# should not have.
+# ---
+# use_c: false makes this a plain multiply, which matters because a product of zero must
+#        keep its own sign rather than take it from an addend that is not there
+fun soft_fma(abits: u64, bbits: u64, cbits: u64, use_c: bool, fmt: u32, rm: u32) u64 {
+    val qn: u64 = fmt_qnan(fmt);
+    val fa: Fp = unpack(abits, fmt);
+    val fb: Fp = unpack(bbits, fmt);
+    var fc: Fp;
+    if (use_c) { fc = unpack(cbits, fmt); }
+
+    if (fa.cls == 3 || fb.cls == 3) { ret qn; }
+    if (use_c && fc.cls == 3) { ret qn; }
+
+    val ps: u32 = fa.sign ^ fb.sign;
+    # an infinity times a zero names no value, so the manual makes it the invalid case
+    if (fa.cls == 2 && fb.cls == 0) { ret qn; }
+    if (fa.cls == 0 && fb.cls == 2) { ret qn; }
+    if (fa.cls == 2 || fb.cls == 2) {
+        if (use_c && fc.cls == 2 && fc.sign != ps) { ret qn; }
+        ret sign_bits(ps, fmt) | fmt_inf(fmt);
+    }
+    if (use_c && fc.cls == 2) { ret sign_bits(fc.sign, fmt) | fmt_inf(fmt); }
+    if (fa.cls == 0 || fb.cls == 0) {
+        if (!use_c) { ret sign_bits(ps, fmt); }
+        if (fc.cls == 0) {
+            # two zeros of unlike sign sum to positive zero, except when rounding down
+            if (ps == fc.sign) { ret sign_bits(ps, fmt); }
+            if (rm == 2)       { ret fmt_signbit(fmt); }
+            ret 0;
+        }
+        ret cbits;
+    }
+
+    var prod: [4]u64;
+    bn_set_mul(?prod[0], fa.man, fb.man);
+    val exp_p: i32 = fa.exp + fb.exp;
+
+    if (!use_c || fc.cls == 0) {
+        var pm: u64 = 0;
+        var pst: bool = false;
+        val psh: i32 = bn_reduce(?prod[0], ?pm, ?pst);
+        ret round_pack(ps, exp_p + psh, pm, pst, fmt, rm);
+    }
+
+    val msb_p: i32 = exp_p + bn_msb(?prod[0]);
+    val msb_c: i32 = fc.exp + msb64(fc.man);
+    var top: i32 = msb_p;
+    if (msb_c > top) { top = msb_c; }
+    val frame: i32 = top - 200;
+
+    var st_p: bool = false;
+    val sp: i32 = exp_p - frame;
+    if (sp >= 0) { bn_shl(?prod[0], sp::u32); }
+    or {
+        var d: i32 = 0 - sp;
+        if (d > 300) { d = 300; }
+        st_p = bn_shr_sticky(?prod[0], d::u32);
+    }
+
+    var cacc: [4]u64;
+    bn_zero(?cacc[0]);
+    cacc[0] = fc.man;
+    var st_c: bool = false;
+    val sc: i32 = fc.exp - frame;
+    if (sc >= 0) { bn_shl(?cacc[0], sc::u32); }
+    or {
+        var d2: i32 = 0 - sc;
+        if (d2 > 300) { d2 = 300; }
+        st_c = bn_shr_sticky(?cacc[0], d2::u32);
+    }
+
+    var sign: u32 = ps;
+    var sticky: bool = false;
+    if (ps == fc.sign) {
+        bn_add(?prod[0], ?cacc[0]);
+        sticky = st_p || st_c;
+    }
+    or (bn_cmp(?prod[0], ?cacc[0]) >= 0) {
+        bn_sub(?prod[0], ?cacc[0]);
+        # the bits lost off the subtrahend make the true difference smaller than the one
+        # just computed by less than one place of this frame, so step back one and let
+        # the sticky bit carry the rest of the story into the rounding
+        if (st_c) { bn_dec(?prod[0]); sticky = true; }
+    }
+    or {
+        bn_sub(?cacc[0], ?prod[0]);
+        bn_copy(?prod[0], ?cacc[0]);
+        sign = fc.sign;
+        if (st_p) { bn_dec(?prod[0]); sticky = true; }
+    }
+
+    if (bn_is_zero(?prod[0])) {
+        # an exact cancellation is positive zero in every mode but round-toward-minus
+        if (rm == 2) { ret fmt_signbit(fmt); }
+        ret 0;
+    }
+    var man: u64 = 0;
+    var st: bool = false;
+    val sh: i32 = bn_reduce(?prod[0], ?man, ?st);
+    ret round_pack(sign, frame + sh, man, sticky || st, fmt, rm);
+}
+
+fun soft_mul(a: u64, b: u64, fmt: u32, rm: u32) u64 {
+    ret soft_fma(a, b, 0, false, fmt, rm);
+}
+
+# a + b, as a*1 + b so the single rounding point is shared with the fused multiply-add
+fun soft_add(a: u64, b: u64, fmt: u32, rm: u32) u64 {
+    ret soft_fma(a, fmt_one(fmt), b, true, fmt, rm);
+}
+
+fun soft_sub(a: u64, b: u64, fmt: u32, rm: u32) u64 {
+    ret soft_fma(a, fmt_one(fmt), b ^ fmt_signbit(fmt), true, fmt, rm);
+}
+
+# a / b, by restoring long division on the significands
+#
+# Sixty-three quotient bits with the remainder as the sticky bit, which is more than the
+# fifty-three the destination needs, so `round_pack` sees an exactly-characterised value
+# and every rounding mode falls out of the one decision it already makes.
+fun soft_div(abits: u64, bbits: u64, fmt: u32, rm: u32) u64 {
+    val qn: u64 = fmt_qnan(fmt);
+    val fa: Fp = unpack(abits, fmt);
+    val fb: Fp = unpack(bbits, fmt);
+    if (fa.cls == 3 || fb.cls == 3) { ret qn; }
+    val sg: u32 = fa.sign ^ fb.sign;
+    if (fa.cls == 2 && fb.cls == 2) { ret qn; }
+    if (fa.cls == 0 && fb.cls == 0) { ret qn; }
+    if (fa.cls == 2) { ret sign_bits(sg, fmt) | fmt_inf(fmt); }
+    if (fb.cls == 2) { ret sign_bits(sg, fmt); }
+    # a nonzero over a zero is an infinity, not an invalid operation
+    if (fb.cls == 0) { ret sign_bits(sg, fmt) | fmt_inf(fmt); }
+    if (fa.cls == 0) { ret sign_bits(sg, fmt); }
+
+    val p: u32 = fmt_mb(fmt) + 1;
+    var ma: u64 = fa.man;
+    var ea: i32 = fa.exp;
+    var mb: u64 = fb.man;
+    var eb: i32 = fb.exp;
+    for (ma < bit(p - 1)) { ma = ma << 1; ea = ea - 1; }
+    for (mb < bit(p - 1)) { mb = mb << 1; eb = eb - 1; }
+
+    val k: u32 = 62;
+    var rem: u64 = ma;
+    var q: u64 = 0;
+    var i: u32 = 0;
+    for (i <= k) {
+        q = q << 1;
+        if (rem >= mb) { q = q | 1; rem = rem - mb; }
+        rem = rem << 1;
+        i = i + 1;
+    }
+    ret round_pack(sg, ea - eb - k::i32, q, rem != 0, fmt, rm);
+}
+
+# bit `p` of `m << k`, without ever forming `m << k`
+fun nbit(m: u64, k: u32, p: u32) u64 {
+    if (p < k) { ret 0; }
+    ret (m >> (p - k)) & 1;
+}
+
+# the square root, digit by digit, correctly rounded in every mode
+#
+# Two result bits are decided per iteration by the schoolbook square-root recurrence, and
+# the remainder left at the end IS the sticky bit, so nothing about the rounding is an
+# estimate. A Newton iteration in host doubles would be within an ulp and wrong at the
+# ties, which is the half of the answer this file exists to check.
+fun soft_sqrt(abits: u64, fmt: u32, rm: u32) u64 {
+    val fa: Fp = unpack(abits, fmt);
+    if (fa.cls == 3) { ret fmt_qnan(fmt); }
+    # the square root of a negative zero is a negative zero, and it is not invalid
+    if (fa.cls == 0) { ret sign_bits(fa.sign, fmt); }
+    if (fa.sign == 1) { ret fmt_qnan(fmt); }
+    if (fa.cls == 2) { ret fmt_inf(fmt); }
+
+    val p: u32 = fmt_mb(fmt) + 1;
+    var m: u64 = fa.man;
+    var e: i32 = fa.exp;
+    for (m < bit(p - 1)) { m = m << 1; e = e - 1; }
+    # the exponent has to be even for the halving to be exact
+    if ((e & 1) != 0) { m = m << 1; e = e - 1; }
+
+    val k: u32 = 32;
+    var wid: u32 = (msb64(m)::u32 + 1) + 2 * k;
+    if ((wid & 1) != 0) { wid = wid + 1; }
+    var res: u64 = 0;
+    var rem: u64 = 0;
+    var i: i32 = wid::i32 - 2;
+    for (i >= 0) {
+        rem = rem * 4 + nbit(m, 2 * k, (i + 1)::u32) * 2 + nbit(m, 2 * k, i::u32);
+        val t: u64 = 4 * res + 1;
+        if (rem >= t) { rem = rem - t; res = res * 2 + 1; }
+        or                                { res = res * 2; }
+        i = i - 2;
+    }
+    ret round_pack(0, (e / 2) - k::i32, res, rem != 0, fmt, rm);
+}
+
+# convert a float to a 32-bit integer under the RISC-V rules, which are not the C rules
+#
+# THE SINGLE MOST LIKELY PLACE FOR THIS FILE TO BE QUIETLY WRONG, because the host's own
+# conversion is undefined exactly where RISC-V is defined and a reader who has written
+# `(int)x` a thousand times will not notice the difference. The manual's rules:
+#
+#   - a NaN converts to the DESTINATION's maximum: 0x7FFFFFFF signed, 0xFFFFFFFF unsigned
+#   - a value above the range saturates to that same maximum
+#   - a value below the range saturates to the minimum: 0x80000000 signed, 0 unsigned
+#   - nothing traps, and nothing wraps
+#
+# A value in (-1, 0] converts to zero for the unsigned forms and is NOT out of range,
+# which is why the sign is applied after the rounding rather than before it.
+# ---
+# sgn: true for the signed word forms, false for the unsigned ones
+fun fcvt_to_word(bits: u64, fmt: u32, rm: u32, sgn: bool) u32 {
+    val fa: Fp = unpack(bits, fmt);
+    if (fa.cls == 3) {
+        if (sgn) { ret 0x7FFFFFFF; }
+        ret 0xFFFFFFFF;
+    }
+    if (fa.cls == 2 || fa.cls == 0) {
+        if (fa.cls == 0)  { ret 0; }
+        if (fa.sign == 0) {
+            if (sgn) { ret 0x7FFFFFFF; }
+            ret 0xFFFFFFFF;
+        }
+        if (sgn) { ret 0x80000000; }
+        ret 0;
+    }
+
+    var mag:  u64  = 0;
+    var over: bool = false;
+    if (fa.exp >= 0) {
+        if (msb64(fa.man) + fa.exp > 62) { over = true; }
+        or { mag = fa.man << fa.exp::u32; }
+    }
+    or {
+        val sh: i32 = 0 - fa.exp;
+        var r: bool = false;
+        var s: bool = false;
+        if (sh > 64) {
+            s = true;
+        }
+        or (sh == 64) {
+            r = (fa.man >> 63) == 1;
+            if ((fa.man & 0x7FFFFFFFFFFFFFFF) != 0) { s = true; }
+        }
+        or {
+            val u: u32 = sh::u32;
+            mag = fa.man >> u;
+            r = ((fa.man >> (u - 1)) & 1) == 1;
+            if (u > 1 && (fa.man & (bit(u - 1) - 1)) != 0) { s = true; }
+        }
+        if (round_up_p(fa.sign, mag, r, s, rm)) { mag = mag + 1; }
+    }
+
+    if (over) {
+        if (fa.sign == 0) {
+            if (sgn) { ret 0x7FFFFFFF; }
+            ret 0xFFFFFFFF;
+        }
+        if (sgn) { ret 0x80000000; }
+        ret 0;
+    }
+    if (sgn) {
+        if (fa.sign == 0) {
+            if (mag > 0x7FFFFFFF) { ret 0x7FFFFFFF; }
+            ret mag::u32;
+        }
+        if (mag > 0x80000000) { ret 0x80000000; }
+        ret (0::u64 - mag)::u32;
+    }
+    # a negative that rounded to zero is in range; anything else negative saturates down
+    if (fa.sign == 1) { ret 0; }
+    if (mag > 0xFFFFFFFF) { ret 0xFFFFFFFF; }
+    ret mag::u32;
+}
+
+# convert a 32-bit integer to a float
+fun fcvt_from_word(v: u32, fmt: u32, rm: u32, sgn: bool) u64 {
+    var mag: u64 = v::u64;
+    var s:   u32 = 0;
+    if (sgn && (v & 0x80000000) != 0) {
+        s = 1;
+        mag = (0::u64 - v::u64) & 0xFFFFFFFF;
+    }
+    if (mag == 0) { ret 0; }
+    ret round_pack(s, 0, mag, false, fmt, rm);
+}
+
+# convert between the two float formats
+fun fcvt_fmt(bits: u64, from: u32, to: u32, rm: u32) u64 {
+    val fa: Fp = unpack(bits, from);
+    if (fa.cls == 3) { ret fmt_qnan(to); }
+    if (fa.cls == 2) { ret sign_bits(fa.sign, to) | fmt_inf(to); }
+    if (fa.cls == 0) { ret sign_bits(fa.sign, to); }
+    ret round_pack(fa.sign, fa.exp, fa.man, false, to, rm);
+}
+
+# fsgnj, fsgnjn and fsgnjx, which move BITS and never look at a value
+#
+# So a NaN keeps its payload here, a signalling NaN stays signalling, and `fsgnjx` of a
+# value with itself is an absolute value rather than a multiply by one.
+# ---
+# mode: 0 take rs2's sign, 1 take its complement, 2 take the xor of both signs
+fun fsgnj(a: u64, b: u64, mode: u32, fmt: u32) u64 {
+    val sb:   u64 = fmt_signbit(fmt);
+    val body: u64 = a & (fmt_mask(fmt) ^ sb);
+    var s:    u64 = b & sb;
+    if (mode == 1) { s = s ^ sb; }
+    or (mode == 2) { s = (a & sb) ^ (b & sb); }
+    ret body | s;
+}
+
+# a total order on the bits that agrees with the numeric order and puts -0 below +0
+#
+# The manual makes fmin and fmax treat -0.0 as less than +0.0, which the IEEE comparison
+# does not, so those two instructions order by this key rather than by comparison.
+fun fp_key(bits: u64, fmt: u32) u64 {
+    val sb: u64 = fmt_signbit(fmt);
+    if ((bits & sb) != 0) { ret bits ^ fmt_mask(fmt); }
+    ret bits | sb;
+}
+
+# fmin and fmax, with the manual's NaN rule: a lone NaN loses to its non-NaN operand
+fun fminmax(a: u64, b: u64, want_max: bool, fmt: u32) u64 {
+    val fa: Fp = unpack(a, fmt);
+    val fb: Fp = unpack(b, fmt);
+    if (fa.cls == 3 && fb.cls == 3) { ret fmt_qnan(fmt); }
+    if (fa.cls == 3) { ret b; }
+    if (fb.cls == 3) { ret a; }
+    val ka: u64 = fp_key(a, fmt);
+    val kb: u64 = fp_key(b, fmt);
+    if (want_max) {
+        if (ka >= kb) { ret a; }
+        ret b;
+    }
+    if (ka <= kb) { ret a; }
+    ret b;
+}
+
+# feq: a NaN compares equal to nothing, and the two zeros compare equal to each other
+fun fp_eq(a: u64, b: u64, fmt: u32) bool {
+    val fa: Fp = unpack(a, fmt);
+    val fb: Fp = unpack(b, fmt);
+    if (fa.cls == 3 || fb.cls == 3) { ret false; }
+    if (fa.cls == 0 && fb.cls == 0) { ret true; }
+    ret (a & fmt_mask(fmt)) == (b & fmt_mask(fmt));
+}
+
+fun fp_lt(a: u64, b: u64, fmt: u32) bool {
+    val fa: Fp = unpack(a, fmt);
+    val fb: Fp = unpack(b, fmt);
+    if (fa.cls == 3 || fb.cls == 3) { ret false; }
+    if (fa.cls == 0 && fb.cls == 0) { ret false; }
+    ret fp_key(a, fmt) < fp_key(b, fmt);
+}
+
+fun fp_le(a: u64, b: u64, fmt: u32) bool {
+    ret fp_lt(a, b, fmt) || fp_eq(a, b, fmt);
+}
+
+# the manual's ten-bit one-hot classification, lowest bit for -infinity
+fun fclass(bits: u64, fmt: u32) u32 {
+    val mb: u32 = fmt_mb(fmt);
+    val fa: Fp = unpack(bits, fmt);
+    if (fa.cls == 3) {
+        # a NaN is quiet when the top bit of its significand field is set
+        if ((bits & bit(mb - 1)) != 0) { ret 512; }
+        ret 256;
+    }
+    if (fa.cls == 2) {
+        if (fa.sign == 1) { ret 1; }
+        ret 128;
+    }
+    if (fa.cls == 0) {
+        if (fa.sign == 1) { ret 8; }
+        ret 16;
+    }
+    if (fa.man < bit(mb)) {
+        if (fa.sign == 1) { ret 4; }
+        ret 32;
+    }
+    if (fa.sign == 1) { ret 2; }
+    ret 64;
+}
+
+# NaN-BOXING: a single-precision value in a 64-bit float register carries all ones above
+#
+# The rule that only exists because FLEN is 64 while XLEN is 32. A single-precision value
+# occupies the low half of an f register and the high half must be all ones. Reading an
+# operand that is not boxed that way yields the CANONICAL QUIET NAN rather than the low
+# half, which is the manual's rule and is the difference between a wrong lowering being
+# caught here and a wrong lowering computing a plausible number.
+fun box_s(v: u64) u64 {
+    ret 0xFFFFFFFF00000000 | (v & 0xFFFFFFFF);
+}
+
+fun unbox_s(v: u64) u64 {
+    if ((v >> 32) != 0xFFFFFFFF) { ret 0x7FC00000; }
+    ret v & 0xFFFFFFFF;
+}
+
+# read a float operand in `fmt`, unboxing and checking the box for the single forms
+fun rdf(core: *Core, r: u32, fmt: u32) u64 {
+    if (fmt == FMT_S) { ret unbox_s(core.f[r]); }
+    ret core.f[r];
+}
+
+# write a float result in `fmt`, boxing the single forms
+fun wrf(core: *Core, r: u32, v: u64, fmt: u32) {
+    if (fmt == FMT_S) { core.f[r] = box_s(v); ret; }
+    core.f[r] = v;
+}
+
+# any NaN a host operation produced becomes the canonical one, which is RISC-V's rule
+fun canon(bits: u64, fmt: u32) u64 {
+    val fa: Fp = unpack(bits, fmt);
+    if (fa.cls == 3) { ret fmt_qnan(fmt); }
+    ret bits;
+}
+
+# add, subtract, multiply and divide in round-to-nearest-ties-to-even, on the host
+#
+# See the argument at the head of this section for why this is the host's arithmetic and
+# what that permission does not extend to.
+# ---
+# op: 0 add, 1 subtract, 2 multiply, 3 divide
+fun host_arith(a: u64, b: u64, op: u32, fmt: u32) u64 {
+    if (fmt == FMT_S) {
+        val x: f32 = (a::u32):~f32;
+        val y: f32 = (b::u32):~f32;
+        var z: f32 = 0.0;
+        if (op == 0)      { z = x + y; }
+        or (op == 1)      { z = x - y; }
+        or (op == 2)      { z = x * y; }
+        or                { z = x / y; }
+        ret canon((z:~u32)::u64, fmt);
+    }
+    val x: f64 = a:~f64;
+    val y: f64 = b:~f64;
+    var z: f64 = 0.0;
+    if (op == 0)      { z = x + y; }
+    or (op == 1)      { z = x - y; }
+    or (op == 2)      { z = x * y; }
+    or                { z = x / y; }
+    ret canon(z:~u64, fmt);
+}
+
+# decode the 3-bit rm field, resolving DYN through `frm` and refusing the reserved values
+#
+# A WRONG ROUNDING MODE SILENTLY APPLIED IS WORSE THAN A REFUSAL, so 5 and 6 are refused
+# rather than folded into some nearby mode, and a dynamic mode inherits that refusal when
+# `frm` itself holds a reserved value.
+fun resolve_rm(core: *Core, funct3: u32, out: *u32) bool {
+    var rm: u32 = funct3;
+    if (rm == 7) {
+        rm = core.frm;
+        if (rm > 4) { ret refuse(core, "a dynamic rounding mode with a reserved frm"); }
+    }
+    if (rm == 5) { ret refuse(core, "rounding mode 5, which is reserved"); }
+    if (rm == 6) { ret refuse(core, "rounding mode 6, which is reserved"); }
+    @out = rm;
+    ret true;
+}
+
+# OP-FP (opcode 1010011), the whole of the F and D register-register set
+#
+# The funct7 field is the manual's two parts: bits 26:25 are the format (00 single, 01
+# double, 10 half, 11 quad) and bits 31:27 are the five-bit operation selector. Every
+# number below is the manual's, written next to the mnemonic it names.
+fun exec_op_fp(core: *Core, w: u32) bool {
+    val rd:     u32 = (w >> 7)  & 0x1F;
+    val funct3: u32 = (w >> 12) & 0x07;
+    val rs1:    u32 = (w >> 15) & 0x1F;
+    val rs2:    u32 = (w >> 20) & 0x1F;
+    val funct7: u32 = (w >> 25) & 0x7F;
+    val fmt:    u32 = funct7 & 0x03;
+    val op5:    u32 = funct7 >> 2;
+
+    if (fmt == 2) { ret refuse(core, "an OP-FP instruction in the half-precision format"); }
+    if (fmt == 3) { ret refuse(core, "an OP-FP instruction in the quad-precision format"); }
+
+    # the RV64-only opcodes, refused ahead of everything else so the refusal names the
+    # mnemonic rather than some field of it that happens to be checked first
+    if (op5 == 0x18 && rs2 == 2) {
+        if (fmt == FMT_S) { ret refuse(core, "fcvt.l.s, which is RV64-only"); }
+        ret refuse(core, "fcvt.l.d, which is RV64-only");
+    }
+    if (op5 == 0x18 && rs2 == 3) {
+        if (fmt == FMT_S) { ret refuse(core, "fcvt.lu.s, which is RV64-only"); }
+        ret refuse(core, "fcvt.lu.d, which is RV64-only");
+    }
+    if (op5 == 0x1A && rs2 == 2) {
+        if (fmt == FMT_S) { ret refuse(core, "fcvt.s.l, which is RV64-only"); }
+        ret refuse(core, "fcvt.d.l, which is RV64-only");
+    }
+    if (op5 == 0x1A && rs2 == 3) {
+        if (fmt == FMT_S) { ret refuse(core, "fcvt.s.lu, which is RV64-only"); }
+        ret refuse(core, "fcvt.d.lu, which is RV64-only");
+    }
+    if (op5 == 0x1C && fmt == FMT_D && funct3 == 0) { ret refuse(core, "fmv.x.d, which is RV64-only"); }
+    if (op5 == 0x1E && fmt == FMT_D)                { ret refuse(core, "fmv.d.x, which is RV64-only"); }
+
+    # these five put an operation selector in funct3 rather than a rounding mode
+    if (op5 == 0x04) {                                          # FSGNJ / FSGNJN / FSGNJX
+        if (funct3 > 2) { ret refuse(core, "fsgnj with an unmodeled funct3"); }
+        wrf(core, rd, fsgnj(rdf(core, rs1, fmt), rdf(core, rs2, fmt), funct3, fmt), fmt);
+        ret true;
+    }
+    if (op5 == 0x05) {                                          # FMIN / FMAX
+        if (funct3 > 1) { ret refuse(core, "fmin/fmax with an unmodeled funct3"); }
+        wrf(core, rd, fminmax(rdf(core, rs1, fmt), rdf(core, rs2, fmt), funct3 == 1, fmt), fmt);
+        ret true;
+    }
+    if (op5 == 0x14) {                                          # FLE / FLT / FEQ
+        val cx: u64 = rdf(core, rs1, fmt);
+        val cy: u64 = rdf(core, rs2, fmt);
+        var t: bool = false;
+        if (funct3 == 0)      { t = fp_le(cx, cy, fmt); }
+        or (funct3 == 1)      { t = fp_lt(cx, cy, fmt); }
+        or (funct3 == 2)      { t = fp_eq(cx, cy, fmt); }
+        or { ret refuse(core, "a float compare with an unmodeled funct3"); }
+        var v: u32 = 0;
+        if (t) { v = 1; }
+        wr(core, rd, v);
+        ret true;
+    }
+    if (op5 == 0x1C) {                                          # FMV.X.W / FCLASS
+        if (rs2 != 0) { ret refuse(core, "an OP-FP move with a reserved rs2"); }
+        if (funct3 == 1) {
+            wr(core, rd, fclass(rdf(core, rs1, fmt), fmt));
+            ret true;
+        }
+        if (funct3 != 0) { ret refuse(core, "an OP-FP move with an unmodeled funct3"); }
+        # fmv.x.w is a bit move of the low half and does not check the box
+        wr(core, rd, (core.f[rs1] & 0xFFFFFFFF)::u32);
+        ret true;
+    }
+    if (op5 == 0x1E) {                                          # FMV.W.X
+        if (rs2 != 0 || funct3 != 0) { ret refuse(core, "an OP-FP move with a reserved field"); }
+        wrf(core, rd, core.x[rs1]::u64, FMT_S);
+        ret true;
+    }
+
+    var rm: u32 = 0;
+    if (!resolve_rm(core, funct3, ?rm)) { ret false; }
+
+    if (op5 <= 3) {                                             # FADD FSUB FMUL FDIV
+        val ax: u64 = rdf(core, rs1, fmt);
+        val bx: u64 = rdf(core, rs2, fmt);
+        var z: u64 = 0;
+        if (rm == 0)       { z = host_arith(ax, bx, op5, fmt); }
+        or (op5 == 0)      { z = soft_add(ax, bx, fmt, rm); }
+        or (op5 == 1)      { z = soft_sub(ax, bx, fmt, rm); }
+        or (op5 == 2)      { z = soft_mul(ax, bx, fmt, rm); }
+        or                 { z = soft_div(ax, bx, fmt, rm); }
+        wrf(core, rd, z, fmt);
+        ret true;
+    }
+    if (op5 == 0x0B) {                                          # FSQRT
+        if (rs2 != 0) { ret refuse(core, "fsqrt with a reserved rs2"); }
+        wrf(core, rd, soft_sqrt(rdf(core, rs1, fmt), fmt, rm), fmt);
+        ret true;
+    }
+    if (op5 == 0x08) {                                          # FCVT.S.D / FCVT.D.S
+        if (fmt == FMT_S) {
+            if (rs2 != 1) { ret refuse(core, "fcvt.s.* from a format outside F and D"); }
+            wrf(core, rd, fcvt_fmt(core.f[rs1], FMT_D, FMT_S, rm), FMT_S);
+            ret true;
+        }
+        if (rs2 != 0) { ret refuse(core, "fcvt.d.* from a format outside F and D"); }
+        wrf(core, rd, fcvt_fmt(rdf(core, rs1, FMT_S), FMT_S, FMT_D, rm), FMT_D);
+        ret true;
+    }
+    if (op5 == 0x18) {                                          # FCVT.W / FCVT.WU
+        if (rs2 > 1) { ret refuse(core, "a float-to-integer conversion with a reserved rs2"); }
+        wr(core, rd, fcvt_to_word(rdf(core, rs1, fmt), fmt, rm, rs2 == 0));
+        ret true;
+    }
+    if (op5 == 0x1A) {                                          # FCVT.*.W / FCVT.*.WU
+        if (rs2 > 1) { ret refuse(core, "an integer-to-float conversion with a reserved rs2"); }
+        wrf(core, rd, fcvt_from_word(core.x[rs1], fmt, rm, rs2 == 0), fmt);
+        ret true;
+    }
+    ret refuse(core, "an OP-FP instruction outside the F and D extensions");
+}
+
+# the four fused multiply-add opcodes: 1000011, 1000111, 1001011, 1001111
+#
+# The R4 format puts a third source in bits 31:27 and the format in bits 26:25. The four
+# forms differ only in which of the product and the addend is negated, and the manual's
+# names are worth reading twice: fnmsub is -(rs1*rs2) + rs3, not rs1*rs2 - rs3.
+fun exec_fma(core: *Core, w: u32, opcode: u32) bool {
+    val rd:     u32 = (w >> 7)  & 0x1F;
+    val funct3: u32 = (w >> 12) & 0x07;
+    val rs1:    u32 = (w >> 15) & 0x1F;
+    val rs2:    u32 = (w >> 20) & 0x1F;
+    val fmt:    u32 = (w >> 25) & 0x03;
+    val rs3:    u32 = (w >> 27) & 0x1F;
+    if (fmt == 2) { ret refuse(core, "a fused multiply-add in the half-precision format"); }
+    if (fmt == 3) { ret refuse(core, "a fused multiply-add in the quad-precision format"); }
+    var rm: u32 = 0;
+    if (!resolve_rm(core, funct3, ?rm)) { ret false; }
+
+    val sb: u64 = fmt_signbit(fmt);
+    var ax: u64 = rdf(core, rs1, fmt);
+    val bx: u64 = rdf(core, rs2, fmt);
+    var cx: u64 = rdf(core, rs3, fmt);
+    if (opcode == 0x47)      { cx = cx ^ sb; }                  # FMSUB
+    or (opcode == 0x4B)      { ax = ax ^ sb; }                  # FNMSUB
+    or (opcode == 0x4F)      { ax = ax ^ sb; cx = cx ^ sb; }    # FNMADD
+    wrf(core, rd, soft_fma(ax, bx, cx, true, fmt, rm), fmt);
+    ret true;
+}
+
 # execute from `core.pc` until the entry function returns to `RETURN_SENTINEL`
 #
 # Field extraction below is the manual's instruction formats, spelled out:
@@ -151,6 +1222,7 @@ fun wr_mem(mem: *u8, size: usize, addr: u32, n: u32, v: u32) bool {
 # ret:  true when the run returned through the sentinel inside the modeled set
 pub fun exec_reference(mem: *u8, size: usize, core: *Core) bool {
     core.steps = 0;
+    core.refused = "";
     for (core.steps < MAX_STEPS) {
         core.steps = core.steps + 1;
         core.x[0] = 0;
@@ -286,12 +1358,56 @@ pub fun exec_reference(mem: *u8, size: usize, core: *Core) bool {
             or (funct7 == 0x01) {
                 if (!exec_muldiv(core, rd, funct3, a, b)) { ret false; }
             }
-            or { ret false; }
+            or { ret refuse(core, "an OP instruction outside the base set and M"); }
             core.pc = next;
         }
-        or { ret false; }
+        # LOAD-FP (opcode 0000111): flw at funct3 010, fld at funct3 011
+        or (opcode == 0x07) {
+            val addr: u32 = a + sext(w >> 20, 12);
+            if (funct3 == 2) {
+                var lo: u32 = 0;
+                if (!rd_mem(mem, size, addr, 4, ?lo)) { ret false; }
+                core.f[rd] = box_s(lo::u64);
+            }
+            or (funct3 == 3) {
+                var lo: u32 = 0;
+                var hi: u32 = 0;
+                if (!rd_mem(mem, size, addr, 4, ?lo))     { ret false; }
+                if (!rd_mem(mem, size, addr + 4, 4, ?hi)) { ret false; }
+                core.f[rd] = lo::u64 | (hi::u64 << 32);
+            }
+            or { ret refuse(core, "a float load in a width outside F and D"); }
+            core.pc = next;
+        }
+        # STORE-FP (opcode 0100111): fsw at funct3 010, fsd at funct3 011
+        or (opcode == 0x27) {
+            val imm:  u32 = sext(((w >> 25) & 0x7F) << 5 | ((w >> 7) & 0x1F), 12);
+            val addr: u32 = a + imm;
+            val v:    u64 = core.f[rs2];
+            # fsw stores the low half whatever is above it, so it does not check the box
+            if (funct3 == 2) {
+                if (!wr_mem(mem, size, addr, 4, (v & 0xFFFFFFFF)::u32)) { ret false; }
+            }
+            or (funct3 == 3) {
+                if (!wr_mem(mem, size, addr, 4, (v & 0xFFFFFFFF)::u32)) { ret false; }
+                if (!wr_mem(mem, size, addr + 4, 4, (v >> 32)::u32))    { ret false; }
+            }
+            or { ret refuse(core, "a float store in a width outside F and D"); }
+            core.pc = next;
+        }
+        # OP-FP (opcode 1010011)
+        or (opcode == 0x53) {
+            if (!exec_op_fp(core, w)) { ret false; }
+            core.pc = next;
+        }
+        # the fused multiply-adds (opcodes 1000011, 1000111, 1001011, 1001111)
+        or (opcode == 0x43 || opcode == 0x47 || opcode == 0x4B || opcode == 0x4F) {
+            if (!exec_fma(core, w, opcode)) { ret false; }
+            core.pc = next;
+        }
+        or { ret refuse(core, "an instruction outside RV32I, M, F and D"); }
     }
-    ret false;
+    ret refuse(core, "a run that exceeded the step cap");
 }
 
 # the M extension's eight instructions, at opcode 0110011 funct7 0000001
@@ -497,19 +1613,19 @@ test "mach.lang.target.isa.riscv.refcore:division_edges_follow_the_manual" {
 # an instruction outside the modeled set is REFUSED, not skipped
 #
 # The property that makes every other assertion in this harness mean something. A core
-# that ignored what it did not model would run a program with a float in it, execute
-# the integer half, and report the answer as if the whole thing had run - a pass for a
-# program that never really ran. `fld` is the concrete case: rv32 codegen does select
-# float instructions, and this harness does not model them.
+# that ignored what it did not model would run a program with a CSR access in it,
+# execute everything around it, and report the answer as if the whole thing had run - a
+# pass for a program that never really ran. `csrrw` is the concrete case: the control and
+# status registers are outside RV32IMFD and this harness does not model them.
 test "mach.lang.target.isa.riscv.refcore:an_unmodeled_instruction_is_refused" {
     var mem: [64]u8;
     var i: usize = 0;
     for (i < 64) { mem[i] = 0; i = i + 1; }
 
-    # fld f0, 0(x2) -> opcode 0000111, the D-extension load. not modeled.
-    val fld: u32 = (0 << 20) | (2 << 15) | (3 << 12) | (0 << 7) | 0x07;
+    # csrrw x5, fcsr, x6 -> opcode 1110011 funct3 001, csr number 0x003. not modeled.
+    val csrrw: u32 = (0x003 << 20) | (6 << 15) | (1 << 12) | (5 << 7) | 0x73;
     var byt: usize = 0;
-    for (byt < 4) { mem[byt] = ((fld >> (byt::u32 * 8)) & 0xFF)::u8; byt = byt + 1; }
+    for (byt < 4) { mem[byt] = ((csrrw >> (byt::u32 * 8)) & 0xFF)::u8; byt = byt + 1; }
 
     var core: Core;
     var z: usize = 0;
@@ -517,6 +1633,7 @@ test "mach.lang.target.isa.riscv.refcore:an_unmodeled_instruction_is_refused" {
     core.pc   = 0;
     core.x[1] = RETURN_SENTINEL;
     if (exec_reference(?mem[0], 64, ?core)) { ret 1; }
+    if (!str_equals(core.refused, "an instruction outside RV32I, M, F and D")) { ret 1; }
 
     # and a load past the end of the image is refused too, rather than reading zeros
     var mem2: [64]u8;
@@ -533,5 +1650,716 @@ test "mach.lang.target.isa.riscv.refcore:an_unmodeled_instruction_is_refused" {
     c2.x[1] = RETURN_SENTINEL;
     c2.x[6] = 0x1000;
     if (exec_reference(?mem2[0], 64, ?c2)) { ret 1; }
+    ret 0;
+}
+
+# put a core into the state a run starts from
+fun t_core(core: *Core) {
+    var i: u32 = 0;
+    for (i < 32) { core.x[i] = 0; core.f[i] = 0; i = i + 1; }
+    core.frm   = 0;
+    core.pc    = 0;
+    core.steps = 0;
+    core.x[1]  = RETURN_SENTINEL;
+}
+
+# copy a word list into a zeroed image
+fun t_load(w: *u32, n: u32, mem: *u8, size: usize) {
+    var i: usize = 0;
+    for (i < size) { mem[i] = 0; i = i + 1; }
+    var k: u32 = 0;
+    for (k < n) {
+        var b: u32 = 0;
+        for (b < 4) { mem[(k * 4 + b)::usize] = ((w[k] >> (b * 8)) & 0xFF)::u8; b = b + 1; }
+        k = k + 1;
+    }
+}
+
+# run one hand-written instruction word, followed by the `ret` the core terminates on
+#
+# EVERY WORD PASSED TO THIS IS A HEX LITERAL WRITTEN OUT BESIDE THE MNEMONIC IT ENCODES.
+# There is deliberately no helper that assembles one from fields, because such a helper
+# would be the decoder written a second time and would agree with a wrong decoder for
+# exactly the reason the file header gives about the encoder.
+fun t_one(w: u32, core: *Core) bool {
+    var mem: [16]u8;
+    var ws: [2]u32;
+    ws[0] = w;
+    ws[1] = 0x00008067;                                  # jalr x0, 0(x1)
+    t_load(?ws[0], 2, ?mem[0], 16);
+    core.pc = 0;
+    ret exec_reference(?mem[0], 16, core);
+}
+
+# run one OP-FP instruction over two double operands and hand back the f3 result
+fun t_d2(w: u32, a: u64, b: u64, out: *u64) bool {
+    var core: Core;
+    t_core(?core);
+    core.f[1] = a;
+    core.f[2] = b;
+    if (!t_one(w, ?core)) { ret false; }
+    @out = core.f[3];
+    ret true;
+}
+
+# run one OP-FP instruction over one double operand and hand back the f3 result
+fun t_d1(w: u32, a: u64, out: *u64) bool {
+    var core: Core;
+    t_core(?core);
+    core.f[1] = a;
+    if (!t_one(w, ?core)) { ret false; }
+    @out = core.f[3];
+    ret true;
+}
+
+# run one OP-FP instruction over one double operand and hand back the x5 result
+fun t_dx(w: u32, a: u64, out: *u32) bool {
+    var core: Core;
+    t_core(?core);
+    core.f[1] = a;
+    if (!t_one(w, ?core)) { ret false; }
+    @out = core.x[5];
+    ret true;
+}
+
+# the float loads and stores move the manual's widths, and `flw` boxes what it loaded
+#
+# `fld` and `fsd` are the two instructions the rv32 corpus selects most, and they are the
+# ones where FLEN exceeding XLEN shows: a 64-bit float register is filled from two 32-bit
+# memory accesses on a machine whose registers are half that wide.
+test "mach.lang.target.isa.riscv.refcore:float_loads_and_stores_move_the_manual_widths" {
+    var mem: [128]u8;
+    var ws: [6]u32;
+    ws[0] = 0x04000113;      # addi x2, x0, 64
+    ws[1] = 0x00013087;      # fld f1, 0(x2)     -> opcode 0000111 funct3 011
+    ws[2] = 0x00113427;      # fsd f1, 8(x2)     -> opcode 0100111 funct3 011
+    ws[3] = 0x01012107;      # flw f2, 16(x2)    -> opcode 0000111 funct3 010
+    ws[4] = 0x00212A27;      # fsw f2, 20(x2)    -> opcode 0100111 funct3 010
+    ws[5] = 0x00008067;      # jalr x0, 0(x1)
+    t_load(?ws[0], 6, ?mem[0], 128);
+
+    # the double 3.141592653589793 and the single 1.0, placed by hand
+    var b: u32 = 0;
+    for (b < 8) { mem[(64 + b)::usize] = ((0x400921FB54442D18::u64 >> (b * 8)) & 0xFF)::u8; b = b + 1; }
+    b = 0;
+    for (b < 4) { mem[(80 + b)::usize] = ((0x3F800000::u32 >> (b * 8)) & 0xFF)::u8; b = b + 1; }
+
+    var core: Core;
+    t_core(?core);
+    if (!exec_reference(?mem[0], 128, ?core)) { ret 1; }
+
+    if (core.f[1] != 0x400921FB54442D18) { ret 1; }
+    # a single loaded into a 64-bit register is NaN-boxed, high half all ones
+    if (core.f[2] != 0xFFFFFFFF3F800000) { ret 1; }
+
+    var got: u64 = 0;
+    b = 0;
+    for (b < 8) { got = got | (mem[(72 + b)::usize]::u64 << (b * 8)); b = b + 1; }
+    if (got != 0x400921FB54442D18) { ret 1; }
+    var gots: u32 = 0;
+    b = 0;
+    for (b < 4) { gots = gots | (mem[(84 + b)::usize]::u32 << (b * 8)); b = b + 1; }
+    # fsw stores the low half only, and does not write the box out to memory
+    if (gots != 0x3F800000) { ret 1; }
+    ret 0;
+}
+
+# a single-precision operand that is not NaN-boxed reads as the canonical quiet NaN
+#
+# THE ASYMMETRY BETWEEN FLEN AND XLEN, made observable. On rv32d an f register is 64 bits
+# and a single-precision value in one must carry all ones above it. A lowering that put a
+# bare 32-bit pattern in an f register without boxing it would compute a plausible number
+# on hardware that ignored the rule and the manual's canonical NaN on hardware that did
+# not, which is the class of divergence this harness exists to catch.
+test "mach.lang.target.isa.riscv.refcore:single_precision_operands_are_nan_boxed" {
+    var core: Core;
+    t_core(?core);
+    # a bare 1.0f with nothing above it, which is NOT a valid box
+    core.f[1] = 0x000000003F800000;
+    core.f[2] = 0xFFFFFFFF3F800000;
+    if (!t_one(0x002081D3, ?core)) { ret 1; }        # fadd.s f3, f1, f2, rne
+    if (core.f[3] != 0xFFFFFFFF7FC00000) { ret 1; }
+
+    # and two properly boxed operands add to 2.0f, boxed
+    t_core(?core);
+    core.f[1] = 0xFFFFFFFF3F800000;
+    core.f[2] = 0xFFFFFFFF3F800000;
+    if (!t_one(0x002081D3, ?core)) { ret 1; }        # fadd.s f3, f1, f2, rne
+    if (core.f[3] != 0xFFFFFFFF40000000) { ret 1; }
+
+    # fmv.w.x boxes what it moved in
+    t_core(?core);
+    core.x[5] = 0x3F800000;
+    if (!t_one(0xF00281D3, ?core)) { ret 1; }        # fmv.w.x f3, x5
+    if (core.f[3] != 0xFFFFFFFF3F800000) { ret 1; }
+
+    # fmv.x.w is a bit move of the low half and does not check the box
+    t_core(?core);
+    core.f[1] = 0xDEADBEEF12345678;
+    if (!t_one(0xE00082D3, ?core)) { ret 1; }        # fmv.x.w x5, f1
+    if (core.x[5] != 0x12345678) { ret 1; }
+
+    # a badly boxed single reaching fcvt.d.s widens the canonical NaN, not the low half
+    var got: u64 = 0;
+    if (!t_d1(0x420081D3, 0x000000003F800000, ?got)) { ret 1; }   # fcvt.d.s f3, f1, rne
+    if (got != 0x7FF8000000000000) { ret 1; }
+    if (!t_d1(0x420081D3, 0xFFFFFFFF3F800000, ?got)) { ret 1; }
+    if (got != 0x3FF0000000000000) { ret 1; }
+
+    # f0 is an ordinary float register: it is NOT hardwired to zero the way x0 is
+    t_core(?core);
+    core.x[5] = 0x40490FDB;
+    if (!t_one(0xF0028053, ?core)) { ret 1; }        # fmv.w.x f0, x5
+    if (core.f[0] != 0xFFFFFFFF40490FDB) { ret 1; }
+    if (!t_one(0xE0000353, ?core)) { ret 1; }        # fmv.x.w x6, f0
+    if (core.x[6] != 0x40490FDB) { ret 1; }
+    ret 0;
+}
+
+# round-to-nearest breaks a tie to the EVEN significand, and the sign of zero is IEEE's
+#
+# Ties-to-even and the sign of zero are the two results a plausible-but-wrong float path
+# gets wrong while agreeing everywhere else, so they are pinned on values chosen for the
+# tie rather than on values that happen to land on one.
+test "mach.lang.target.isa.riscv.refcore:round_to_nearest_ties_to_even_and_signed_zero" {
+    var got: u64 = 0;
+
+    # 2^53 + 1 is exactly halfway between 2^53 and 2^53 + 2, and 2^53 is the even one
+    if (!t_d2(0x022081D3, 0x4340000000000000, 0x3FF0000000000000, ?got)) { ret 1; }
+    if (got != 0x4340000000000000) { ret 1; }
+    # 2^53 + 3 is halfway between 2^53 + 2 and 2^53 + 4, and now the EVEN one is upward
+    if (!t_d2(0x022081D3, 0x4340000000000001, 0x3FF0000000000000, ?got)) { ret 1; }
+    if (got != 0x4340000000000002) { ret 1; }
+
+    # -0.0 + 0.0 is +0.0 under round-to-nearest
+    if (!t_d2(0x022081D3, 0x8000000000000000, 0x0000000000000000, ?got)) { ret 1; }
+    if (got != 0x0000000000000000) { ret 1; }
+    # and -0.0 under round-toward-minus-infinity, which is the one directed exception
+    if (!t_d2(0x0220A1D3, 0x8000000000000000, 0x0000000000000000, ?got)) { ret 1; }
+    if (got != 0x8000000000000000) { ret 1; }
+    # -0.0 * 1.0 keeps its sign, because the sign of a product is the xor of the signs
+    if (!t_d2(0x122081D3, 0x8000000000000000, 0x3FF0000000000000, ?got)) { ret 1; }
+    if (got != 0x8000000000000000) { ret 1; }
+    # -0.0 + -0.0 is -0.0 in every mode
+    if (!t_d2(0x022081D3, 0x8000000000000000, 0x8000000000000000, ?got)) { ret 1; }
+    if (got != 0x8000000000000000) { ret 1; }
+    # an exact cancellation is +0.0 rather than taking the first operand's sign
+    if (!t_d2(0x022081D3, 0xBFF0000000000000, 0x3FF0000000000000, ?got)) { ret 1; }
+    if (got != 0x0000000000000000) { ret 1; }
+    ret 0;
+}
+
+# the subnormals round at the destination's real precision, and underflow is gradual
+test "mach.lang.target.isa.riscv.refcore:subnormals_round_at_the_destination_precision" {
+    var got: u64 = 0;
+
+    # three least-significant-bits times a half is one and a half of them, a tie that
+    # goes to the even neighbour: two
+    if (!t_d2(0x122081D3, 0x0000000000000003, 0x3FE0000000000000, ?got)) { ret 1; }
+    if (got != 0x0000000000000002) { ret 1; }
+    # one least-significant-bit times a half rounds to zero, again by the even rule
+    if (!t_d2(0x122081D3, 0x0000000000000001, 0x3FE0000000000000, ?got)) { ret 1; }
+    if (got != 0x0000000000000000) { ret 1; }
+    # the smallest normal less the smallest subnormal is the largest subnormal
+    if (!t_d2(0x0A2081D3, 0x0010000000000000, 0x0000000000000001, ?got)) { ret 1; }
+    if (got != 0x000FFFFFFFFFFFFF) { ret 1; }
+    # and adding it back climbs out of the subnormals exactly
+    if (!t_d2(0x022081D3, 0x000FFFFFFFFFFFFF, 0x0000000000000001, ?got)) { ret 1; }
+    if (got != 0x0010000000000000) { ret 1; }
+    # a single-precision subnormal widens exactly: 2^-149 as a double
+    if (!t_d1(0x420081D3, 0xFFFFFFFF00000001, ?got)) { ret 1; }   # fcvt.d.s f3, f1, rne
+    if (got != 0x36A0000000000000) { ret 1; }
+    ret 0;
+}
+
+# fcvt to an integer follows the RISC-V saturation rules, which are not the C rules
+#
+# The single most likely conversion to be written from habit instead of from the manual.
+# A host cast is undefined for a NaN and for an out-of-range value, so a core that took
+# the host's answer would agree with any expansion at all in exactly the cases a compiler
+# is most likely to get wrong.
+test "mach.lang.target.isa.riscv.refcore:fcvt_to_integer_saturates_the_manual_way" {
+    var got: u32 = 0;
+
+    # fcvt.w.d x5, f1, rtz
+    if (!t_dx(0xC20092D3, 0x7FF8000000000000, ?got)) { ret 1; }
+    if (got != 0x7FFFFFFF) { ret 1; }                      # a NaN gives the MAXIMUM
+    if (!t_dx(0xC20092D3, 0x7FF0000000000000, ?got)) { ret 1; }
+    if (got != 0x7FFFFFFF) { ret 1; }                      # +infinity
+    if (!t_dx(0xC20092D3, 0xFFF0000000000000, ?got)) { ret 1; }
+    if (got != 0x80000000) { ret 1; }                      # -infinity
+    if (!t_dx(0xC20092D3, 0x41E0000000000000, ?got)) { ret 1; }
+    if (got != 0x7FFFFFFF) { ret 1; }                      # 2^31, one past the top
+    if (!t_dx(0xC20092D3, 0xC1E0000000000000, ?got)) { ret 1; }
+    if (got != 0x80000000) { ret 1; }                      # -2^31, exactly the bottom
+    if (!t_dx(0xC20092D3, 0xC1E0000000200000, ?got)) { ret 1; }
+    if (got != 0x80000000) { ret 1; }                      # -2^31 - 1, one past it
+    if (!t_dx(0xC20092D3, 0xBFE0000000000000, ?got)) { ret 1; }
+    if (got != 0) { ret 1; }                               # -0.5 truncates to zero
+
+    # fcvt.wu.d x5, f1, rtz
+    if (!t_dx(0xC21092D3, 0xBFE0000000000000, ?got)) { ret 1; }
+    if (got != 0) { ret 1; }                               # -0.5 is IN range and is zero
+    if (!t_dx(0xC21092D3, 0xBFF8000000000000, ?got)) { ret 1; }
+    if (got != 0) { ret 1; }                               # -1.5 is out of range, so min
+    if (!t_dx(0xC21092D3, 0x41EFFFFFFFE00000, ?got)) { ret 1; }
+    if (got != 0xFFFFFFFF) { ret 1; }                      # 2^32 - 1, the last in range
+    if (!t_dx(0xC21092D3, 0x41F0000000000000, ?got)) { ret 1; }
+    if (got != 0xFFFFFFFF) { ret 1; }                      # 2^32, one past the top
+    if (!t_dx(0xC21092D3, 0x7FF8000000000000, ?got)) { ret 1; }
+    if (got != 0xFFFFFFFF) { ret 1; }                      # a NaN gives the MAXIMUM
+
+    # the rounding mode is honoured on the way to the integer, not fixed at truncation
+    if (!t_dx(0xC20082D3, 0x4004000000000000, ?got)) { ret 1; }   # fcvt.w.d rne of 2.5
+    if (got != 2) { ret 1; }
+    if (!t_dx(0xC20082D3, 0x400C000000000000, ?got)) { ret 1; }   # rne of 3.5
+    if (got != 4) { ret 1; }
+    if (!t_dx(0xC200A2D3, 0x4004000000000000, ?got)) { ret 1; }   # rdn of 2.5
+    if (got != 2) { ret 1; }
+    if (!t_dx(0xC200B2D3, 0x4004000000000000, ?got)) { ret 1; }   # rup of 2.5
+    if (got != 3) { ret 1; }
+    if (!t_dx(0xC200C2D3, 0x4004000000000000, ?got)) { ret 1; }   # rmm of 2.5
+    if (got != 3) { ret 1; }
+    if (!t_dx(0xC200A2D3, 0xBFE0000000000000, ?got)) { ret 1; }   # rdn of -0.5 is -1
+    if (got != 0xFFFFFFFF) { ret 1; }
+    ret 0;
+}
+
+# integers convert to floats with the destination's precision, not the source's
+test "mach.lang.target.isa.riscv.refcore:fcvt_from_integer_rounds_at_the_destination" {
+    var core: Core;
+
+    t_core(?core);
+    core.x[5] = 0xFFFFFFFF;
+    if (!t_one(0xD20281D3, ?core)) { ret 1; }        # fcvt.d.w f3, x5, rne
+    if (core.f[3] != 0xBFF0000000000000) { ret 1; }  # -1.0
+
+    t_core(?core);
+    core.x[5] = 0xFFFFFFFF;
+    if (!t_one(0xD21281D3, ?core)) { ret 1; }        # fcvt.d.wu f3, x5, rne
+    if (core.f[3] != 0x41EFFFFFFFE00000) { ret 1; }  # 4294967295.0, exact in a double
+
+    t_core(?core);
+    core.x[5] = 0x80000000;
+    if (!t_one(0xD20281D3, ?core)) { ret 1; }        # fcvt.d.w f3, x5, rne
+    if (core.f[3] != 0xC1E0000000000000) { ret 1; }  # -2147483648.0
+
+    # 2^24 + 1 has no single-precision neighbour, and the tie goes to the even one
+    t_core(?core);
+    core.x[5] = 0x01000001;
+    if (!t_one(0xD00281D3, ?core)) { ret 1; }        # fcvt.s.w f3, x5, rne
+    if (core.f[3] != 0xFFFFFFFF4B800000) { ret 1; }
+
+    # 2^32 - 1 rounds all the way up to 2^32 in a single
+    t_core(?core);
+    core.x[5] = 0xFFFFFFFF;
+    if (!t_one(0xD01281D3, ?core)) { ret 1; }        # fcvt.s.wu f3, x5, rne
+    if (core.f[3] != 0xFFFFFFFF4F800000) { ret 1; }
+    ret 0;
+}
+
+# narrowing and widening between the two formats
+test "mach.lang.target.isa.riscv.refcore:fcvt_between_the_float_formats" {
+    var got: u64 = 0;
+
+    # fcvt.s.d f3, f1, rne: 1 + 2^-24 is a single-precision tie, and 1.0f is the even one
+    if (!t_d1(0x401081D3, 0x3FF0000010000000, ?got)) { ret 1; }
+    if (got != 0xFFFFFFFF3F800000) { ret 1; }
+    # 1 + 2^-24 + 2^-25 is past the midpoint, so it rounds up
+    if (!t_d1(0x401081D3, 0x3FF0000018000000, ?got)) { ret 1; }
+    if (got != 0xFFFFFFFF3F800001) { ret 1; }
+    # a double past the single range overflows to infinity under round-to-nearest
+    if (!t_d1(0x401081D3, 0x7FE0000000000000, ?got)) { ret 1; }
+    if (got != 0xFFFFFFFF7F800000) { ret 1; }
+    # and to the largest finite single under round-toward-zero
+    if (!t_d1(0x401091D3, 0x7FE0000000000000, ?got)) { ret 1; }
+    if (got != 0xFFFFFFFF7F7FFFFF) { ret 1; }
+    # a NaN narrows to the CANONICAL single NaN, never to a narrowed payload
+    if (!t_d1(0x401081D3, 0x7FF8000000000001, ?got)) { ret 1; }
+    if (got != 0xFFFFFFFF7FC00000) { ret 1; }
+    ret 0;
+}
+
+# fsgnj moves BITS, and fmin and fmax follow the manual's NaN and signed-zero rules
+test "mach.lang.target.isa.riscv.refcore:fsgnj_fmin_and_fmax_follow_the_manual" {
+    var got: u64 = 0;
+
+    # fsgnj.d f3, f1, f2
+    if (!t_d2(0x222081D3, 0x3FF0000000000000, 0xC000000000000000, ?got)) { ret 1; }
+    if (got != 0xBFF0000000000000) { ret 1; }
+    # fsgnjn.d takes the complement of rs2's sign
+    if (!t_d2(0x222091D3, 0x3FF0000000000000, 0xC000000000000000, ?got)) { ret 1; }
+    if (got != 0x3FF0000000000000) { ret 1; }
+    # fsgnjx.d takes the xor, so two negatives make a positive
+    if (!t_d2(0x2220A1D3, 0xBFF0000000000000, 0xC000000000000000, ?got)) { ret 1; }
+    if (got != 0x3FF0000000000000) { ret 1; }
+    # a NaN keeps its payload through fsgnj, because no value is ever looked at
+    if (!t_d2(0x222081D3, 0x7FF0000000000001, 0xBFF0000000000000, ?got)) { ret 1; }
+    if (got != 0xFFF0000000000001) { ret 1; }
+
+    # fmin.d treats -0.0 as less than +0.0, which the IEEE comparison does not
+    if (!t_d2(0x2A2081D3, 0x8000000000000000, 0x0000000000000000, ?got)) { ret 1; }
+    if (got != 0x8000000000000000) { ret 1; }
+    if (!t_d2(0x2A2091D3, 0x8000000000000000, 0x0000000000000000, ?got)) { ret 1; }
+    if (got != 0x0000000000000000) { ret 1; }              # fmax.d
+    # a lone NaN LOSES: the result is the other operand, whichever side it is on
+    if (!t_d2(0x2A2081D3, 0x7FF8000000000000, 0x3FF0000000000000, ?got)) { ret 1; }
+    if (got != 0x3FF0000000000000) { ret 1; }
+    if (!t_d2(0x2A2081D3, 0x3FF0000000000000, 0x7FF8000000000000, ?got)) { ret 1; }
+    if (got != 0x3FF0000000000000) { ret 1; }
+    # two NaNs give the canonical NaN, not either input
+    if (!t_d2(0x2A2081D3, 0x7FF8000000000001, 0x7FF8000000000002, ?got)) { ret 1; }
+    if (got != 0x7FF8000000000000) { ret 1; }
+    if (!t_d2(0x2A2081D3, 0xBFF0000000000000, 0x3FF0000000000000, ?got)) { ret 1; }
+    if (got != 0xBFF0000000000000) { ret 1; }
+    if (!t_d2(0x2A2091D3, 0xBFF0000000000000, 0x3FF0000000000000, ?got)) { ret 1; }
+    if (got != 0x3FF0000000000000) { ret 1; }
+    ret 0;
+}
+
+# the compares answer false for a NaN, and the two zeros compare equal to each other
+test "mach.lang.target.isa.riscv.refcore:float_compares_are_the_ieee_predicates" {
+    var core: Core;
+
+    t_core(?core);
+    core.f[1] = 0x0000000000000000;
+    core.f[2] = 0x8000000000000000;
+    if (!t_one(0xA220A2D3, ?core)) { ret 1; }        # feq.d x5, f1, f2
+    if (core.x[5] != 1) { ret 1; }
+    if (!t_one(0xA22092D3, ?core)) { ret 1; }        # flt.d x5, f1, f2
+    if (core.x[5] != 0) { ret 1; }
+
+    t_core(?core);
+    core.f[1] = 0x7FF8000000000000;
+    core.f[2] = 0x3FF0000000000000;
+    if (!t_one(0xA220A2D3, ?core)) { ret 1; }        # feq.d
+    if (core.x[5] != 0) { ret 1; }
+    if (!t_one(0xA22092D3, ?core)) { ret 1; }        # flt.d
+    if (core.x[5] != 0) { ret 1; }
+    if (!t_one(0xA22082D3, ?core)) { ret 1; }        # fle.d
+    if (core.x[5] != 0) { ret 1; }
+
+    t_core(?core);
+    core.f[1] = 0xBFF0000000000000;
+    core.f[2] = 0x3FF0000000000000;
+    if (!t_one(0xA22092D3, ?core)) { ret 1; }        # flt.d
+    if (core.x[5] != 1) { ret 1; }
+    if (!t_one(0xA22082D3, ?core)) { ret 1; }        # fle.d
+    if (core.x[5] != 1) { ret 1; }
+    if (!t_one(0xA220A2D3, ?core)) { ret 1; }        # feq.d
+    if (core.x[5] != 0) { ret 1; }
+    ret 0;
+}
+
+# fclass returns the manual's ten-bit one-hot classification
+test "mach.lang.target.isa.riscv.refcore:fclass_is_the_manual_ten_bit_one_hot" {
+    var got: u32 = 0;
+    # fclass.d x5, f1
+    if (!t_dx(0xE20092D3, 0xFFF0000000000000, ?got)) { ret 1; }
+    if (got != 1)   { ret 1; }                             # -infinity
+    if (!t_dx(0xE20092D3, 0xBFF0000000000000, ?got)) { ret 1; }
+    if (got != 2)   { ret 1; }                             # a negative normal
+    if (!t_dx(0xE20092D3, 0x8000000000000001, ?got)) { ret 1; }
+    if (got != 4)   { ret 1; }                             # a negative subnormal
+    if (!t_dx(0xE20092D3, 0x8000000000000000, ?got)) { ret 1; }
+    if (got != 8)   { ret 1; }                             # -0.0
+    if (!t_dx(0xE20092D3, 0x0000000000000000, ?got)) { ret 1; }
+    if (got != 16)  { ret 1; }                             # +0.0
+    if (!t_dx(0xE20092D3, 0x0000000000000001, ?got)) { ret 1; }
+    if (got != 32)  { ret 1; }                             # a positive subnormal
+    if (!t_dx(0xE20092D3, 0x3FF0000000000000, ?got)) { ret 1; }
+    if (got != 64)  { ret 1; }                             # a positive normal
+    if (!t_dx(0xE20092D3, 0x7FF0000000000000, ?got)) { ret 1; }
+    if (got != 128) { ret 1; }                             # +infinity
+    if (!t_dx(0xE20092D3, 0x7FF0000000000001, ?got)) { ret 1; }
+    if (got != 256) { ret 1; }                             # a signalling NaN
+    if (!t_dx(0xE20092D3, 0x7FF8000000000000, ?got)) { ret 1; }
+    if (got != 512) { ret 1; }                             # a quiet NaN
+
+    # fclass.s x5, f1, on a boxed single
+    if (!t_dx(0xE00092D3, 0xFFFFFFFF00800000, ?got)) { ret 1; }
+    if (got != 64)  { ret 1; }                             # the smallest normal single
+    if (!t_dx(0xE00092D3, 0xFFFFFFFF007FFFFF, ?got)) { ret 1; }
+    if (got != 32)  { ret 1; }                             # the largest subnormal single
+    # and an unboxed operand classifies as the canonical quiet NaN it reads as
+    if (!t_dx(0xE00092D3, 0x000000003F800000, ?got)) { ret 1; }
+    if (got != 512) { ret 1; }
+    ret 0;
+}
+
+# the fused multiply-add rounds ONCE, which a multiply followed by an add does not
+#
+# The operands are chosen so the two answers differ rather than merely could: the exact
+# product of (1 + 2^-52) with itself is 1 + 2^-51 + 2^-104, and subtracting 1 + 2^-51
+# leaves 2^-104. Round the product first and that last term is gone, so the two-rounding
+# answer is exactly zero. A core that computed a multiply and then an add would report
+# zero here and would agree with a wrong lowering everywhere it mattered.
+test "mach.lang.target.isa.riscv.refcore:the_fused_multiply_add_rounds_once" {
+    var core: Core;
+    t_core(?core);
+    core.f[1] = 0x3FF0000000000001;                  # 1 + 2^-52
+    core.f[2] = 0x3FF0000000000001;
+    core.f[3] = 0xBFF0000000000002;                  # -(1 + 2^-51)
+    if (!t_one(0x1A208243, ?core)) { ret 1; }        # fmadd.d f4, f1, f2, f3, rne
+    if (core.f[4] != 0x3970000000000000) { ret 1; }  # 2^-104, not zero
+
+    # the four forms differ only in which side is negated, and fnmsub is the one whose
+    # name reads backwards: it is -(rs1*rs2) + rs3
+    t_core(?core);
+    core.f[1] = 0x4000000000000000;                  # 2.0
+    core.f[2] = 0x4008000000000000;                  # 3.0
+    core.f[3] = 0x3FF0000000000000;                  # 1.0
+    if (!t_one(0x1A208243, ?core)) { ret 1; }        # fmadd.d  ->  2*3 + 1 = 7
+    if (core.f[4] != 0x401C000000000000) { ret 1; }
+    if (!t_one(0x1A208247, ?core)) { ret 1; }        # fmsub.d  ->  2*3 - 1 = 5
+    if (core.f[4] != 0x4014000000000000) { ret 1; }
+    if (!t_one(0x1A20824B, ?core)) { ret 1; }        # fnmsub.d -> -(2*3) + 1 = -5
+    if (core.f[4] != 0xC014000000000000) { ret 1; }
+    if (!t_one(0x1A20824F, ?core)) { ret 1; }        # fnmadd.d -> -(2*3) - 1 = -7
+    if (core.f[4] != 0xC01C000000000000) { ret 1; }
+
+    # a single-precision fused multiply-add, boxed on the way out
+    t_core(?core);
+    core.f[1] = 0xFFFFFFFF40000000;                  # 2.0f
+    core.f[2] = 0xFFFFFFFF40400000;                  # 3.0f
+    core.f[3] = 0xFFFFFFFF3F800000;                  # 1.0f
+    if (!t_one(0x18208243, ?core)) { ret 1; }        # fmadd.s f4, f1, f2, f3, rne
+    if (core.f[4] != 0xFFFFFFFF40E00000) { ret 1; }  # 7.0f
+
+    # an infinity times a zero is invalid even when the addend would have covered it
+    t_core(?core);
+    core.f[1] = 0x7FF0000000000000;
+    core.f[2] = 0x0000000000000000;
+    core.f[3] = 0x3FF0000000000000;
+    if (!t_one(0x1A208243, ?core)) { ret 1; }
+    if (core.f[4] != 0x7FF8000000000000) { ret 1; }
+    ret 0;
+}
+
+# fsqrt is correctly rounded, which a Newton refinement in host doubles is not
+test "mach.lang.target.isa.riscv.refcore:fsqrt_is_correctly_rounded" {
+    var got: u64 = 0;
+
+    # fsqrt.d f3, f1, rne
+    if (!t_d1(0x5A0081D3, 0x4010000000000000, ?got)) { ret 1; }
+    if (got != 0x4000000000000000) { ret 1; }              # sqrt(4) is exactly 2
+    if (!t_d1(0x5A0081D3, 0x3FD0000000000000, ?got)) { ret 1; }
+    if (got != 0x3FE0000000000000) { ret 1; }              # sqrt(0.25) is exactly 0.5
+    if (!t_d1(0x5A0081D3, 0x4000000000000000, ?got)) { ret 1; }
+    if (got != 0x3FF6A09E667F3BCD) { ret 1; }              # sqrt(2), the nearest double
+    if (!t_d1(0x5A0081D3, 0x0000000000000004, ?got)) { ret 1; }
+    if (got != 0x1E70000000000000) { ret 1; }              # sqrt of a subnormal, 2^-536
+    if (!t_d1(0x5A0081D3, 0x8000000000000000, ?got)) { ret 1; }
+    if (got != 0x8000000000000000) { ret 1; }              # sqrt(-0.0) is -0.0
+    if (!t_d1(0x5A0081D3, 0xBFF0000000000000, ?got)) { ret 1; }
+    if (got != 0x7FF8000000000000) { ret 1; }              # sqrt of a negative is invalid
+    if (!t_d1(0x5A0081D3, 0x7FF0000000000000, ?got)) { ret 1; }
+    if (got != 0x7FF0000000000000) { ret 1; }              # sqrt(+infinity)
+
+    # fsqrt.s f3, f1, rne
+    if (!t_d1(0x580081D3, 0xFFFFFFFF40800000, ?got)) { ret 1; }
+    if (got != 0xFFFFFFFF40000000) { ret 1; }              # sqrt(4.0f) is 2.0f
+
+    # AN INDEPENDENT CHECK RATHER THAN A RESTATEMENT: for every integer whose square is
+    # exact in a double, the square root has to come back to the integer. The reference
+    # is the squaring, which this core does not compute.
+    var i: u32 = 1;
+    for (i < 400) {
+        val z: f64 = i::f64;
+        val sq: u64 = (z * z):~u64;
+        if (!t_d1(0x5A0081D3, sq, ?got)) { ret 1; }
+        if (got != z:~u64) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# every rounding mode is decoded, resolved through frm, and the reserved ones refused
+#
+# 1/10 is the classic case where the modes part company: the nearest double is above the
+# exact value, so truncation and rounding down land one place below it while rounding up
+# and round-to-nearest land on it. The signs are checked both ways because rounding down
+# and rounding toward zero are the same mode only for a positive result.
+test "mach.lang.target.isa.riscv.refcore:the_rounding_modes_are_decoded_and_applied" {
+    val one: u64 = 0x3FF0000000000000;
+    val neg: u64 = 0xBFF0000000000000;
+    val ten: u64 = 0x4024000000000000;
+    var got: u64 = 0;
+
+    if (!t_d2(0x1A2081D3, one, ten, ?got)) { ret 1; }      # fdiv.d rne
+    if (got != 0x3FB999999999999A) { ret 1; }
+    if (!t_d2(0x1A2091D3, one, ten, ?got)) { ret 1; }      # fdiv.d rtz
+    if (got != 0x3FB9999999999999) { ret 1; }
+    if (!t_d2(0x1A20A1D3, one, ten, ?got)) { ret 1; }      # fdiv.d rdn
+    if (got != 0x3FB9999999999999) { ret 1; }
+    if (!t_d2(0x1A20B1D3, one, ten, ?got)) { ret 1; }      # fdiv.d rup
+    if (got != 0x3FB999999999999A) { ret 1; }
+    if (!t_d2(0x1A20C1D3, one, ten, ?got)) { ret 1; }      # fdiv.d rmm
+    if (got != 0x3FB999999999999A) { ret 1; }
+
+    if (!t_d2(0x1A2091D3, neg, ten, ?got)) { ret 1; }      # rtz of a negative
+    if (got != 0xBFB9999999999999) { ret 1; }
+    if (!t_d2(0x1A20A1D3, neg, ten, ?got)) { ret 1; }      # rdn of a negative
+    if (got != 0xBFB999999999999A) { ret 1; }
+    if (!t_d2(0x1A20B1D3, neg, ten, ?got)) { ret 1; }      # rup of a negative
+    if (got != 0xBFB9999999999999) { ret 1; }
+
+    # the dynamic mode reads frm out of fcsr rather than the instruction
+    var core: Core;
+    t_core(?core);
+    core.f[1] = one;
+    core.f[2] = ten;
+    core.frm  = 1;
+    if (!t_one(0x1A20F1D3, ?core)) { ret 1; }              # fdiv.d f3, f1, f2, dyn
+    if (core.f[3] != 0x3FB9999999999999) { ret 1; }
+    core.frm = 0;
+    if (!t_one(0x1A20F1D3, ?core)) { ret 1; }
+    if (core.f[3] != 0x3FB999999999999A) { ret 1; }
+
+    # 5 and 6 are reserved and are REFUSED, not folded into a nearby mode
+    core.frm = 0;
+    if (t_one(0x1A20D1D3, ?core)) { ret 1; }               # fdiv.d f3, f1, f2, rm 5
+    if (!str_equals(core.refused, "rounding mode 5, which is reserved")) { ret 1; }
+    if (t_one(0x1A20E1D3, ?core)) { ret 1; }               # rm 6
+    if (!str_equals(core.refused, "rounding mode 6, which is reserved")) { ret 1; }
+    # and a dynamic mode inherits the refusal when frm itself is reserved
+    core.frm = 5;
+    if (t_one(0x1A20F1D3, ?core)) { ret 1; }
+    if (!str_equals(core.refused, "a dynamic rounding mode with a reserved frm")) { ret 1; }
+
+    # the directed modes overflow to the largest finite value rather than to infinity
+    if (!t_d2(0x1A2091D3, 0x7FEFFFFFFFFFFFFF, 0x3FE0000000000000, ?got)) { ret 1; }
+    if (got != 0x7FEFFFFFFFFFFFFF) { ret 1; }              # rtz of a doubling overflow
+    if (!t_d2(0x1A2081D3, 0x7FEFFFFFFFFFFFFF, 0x3FE0000000000000, ?got)) { ret 1; }
+    if (got != 0x7FF0000000000000) { ret 1; }              # and rne gives the infinity
+    ret 0;
+}
+
+# every RV64-only float opcode is refused BY NAME on this 32-bit target
+#
+# The point of #2860 made checkable. The `L` suffix names a 64-bit general-purpose
+# operand and no RV32 register is that wide, so none of these can be executed - but a
+# core that merely stopped would leave the caller unable to tell an unencodable opcode
+# from a harness that ran out of instructions.
+test "mach.lang.target.isa.riscv.refcore:rv64_only_float_opcodes_are_refused_by_name" {
+    var core: Core;
+    t_core(?core);
+
+    if (t_one(0xC02082D3, ?core)) { ret 1; }         # fcvt.l.s x5, f1
+    if (!str_equals(core.refused, "fcvt.l.s, which is RV64-only")) { ret 1; }
+    if (t_one(0xC03082D3, ?core)) { ret 1; }         # fcvt.lu.s x5, f1
+    if (!str_equals(core.refused, "fcvt.lu.s, which is RV64-only")) { ret 1; }
+    if (t_one(0xC22082D3, ?core)) { ret 1; }         # fcvt.l.d x5, f1
+    if (!str_equals(core.refused, "fcvt.l.d, which is RV64-only")) { ret 1; }
+    if (t_one(0xC23082D3, ?core)) { ret 1; }         # fcvt.lu.d x5, f1
+    if (!str_equals(core.refused, "fcvt.lu.d, which is RV64-only")) { ret 1; }
+    if (t_one(0xD02281D3, ?core)) { ret 1; }         # fcvt.s.l f3, x5
+    if (!str_equals(core.refused, "fcvt.s.l, which is RV64-only")) { ret 1; }
+    if (t_one(0xD03281D3, ?core)) { ret 1; }         # fcvt.s.lu f3, x5
+    if (!str_equals(core.refused, "fcvt.s.lu, which is RV64-only")) { ret 1; }
+    if (t_one(0xD22281D3, ?core)) { ret 1; }         # fcvt.d.l f3, x5
+    if (!str_equals(core.refused, "fcvt.d.l, which is RV64-only")) { ret 1; }
+    if (t_one(0xD23281D3, ?core)) { ret 1; }         # fcvt.d.lu f3, x5
+    if (!str_equals(core.refused, "fcvt.d.lu, which is RV64-only")) { ret 1; }
+    if (t_one(0xE20082D3, ?core)) { ret 1; }         # fmv.x.d x5, f1
+    if (!str_equals(core.refused, "fmv.x.d, which is RV64-only")) { ret 1; }
+    if (t_one(0xF20281D3, ?core)) { ret 1; }         # fmv.d.x f3, x5
+    if (!str_equals(core.refused, "fmv.d.x, which is RV64-only")) { ret 1; }
+
+    # and the neighbouring RV32 opcodes at the same funct7 still run, so the refusals
+    # above are the rs2 selector and not the whole family being switched off
+    if (!t_one(0xC20092D3, ?core)) { ret 1; }        # fcvt.w.d x5, f1, rtz
+    if (!t_one(0xD20281D3, ?core)) { ret 1; }        # fcvt.d.w f3, x5, rne
+    if (!t_one(0xE00082D3, ?core)) { ret 1; }        # fmv.x.w x5, f1
+    if (!t_one(0xF00281D3, ?core)) { ret 1; }        # fmv.w.x f3, x5
+    ret 0;
+}
+
+# the soft-float path and the host's own arithmetic agree in round-to-nearest
+#
+# THE CROSS-CHECK THAT MAKES BOTH HALVES WORTH HAVING. The core computes the
+# round-to-nearest arms on the host and everything else in the soft-float path here, and
+# those are two independent implementations of the same function. Running the soft path
+# in round-to-nearest over a table that includes the zeros, the subnormals, the extremes,
+# the infinities and a NaN puts them against each other on the cases where a soft-float
+# is wrong: the sticky bit, the tie, the gradual underflow and the overflow.
+test "mach.lang.target.isa.riscv.refcore:soft_float_agrees_with_the_host_in_round_to_nearest" {
+    var v: [20]u64;
+    v[0]  = 0x0000000000000000;      # +0.0
+    v[1]  = 0x8000000000000000;      # -0.0
+    v[2]  = 0x3FF0000000000000;      # 1.0
+    v[3]  = 0xBFF0000000000000;      # -1.0
+    v[4]  = 0x4024000000000000;      # 10.0
+    v[5]  = 0x0000000000000001;      # the smallest subnormal
+    v[6]  = 0x800FFFFFFFFFFFFF;      # the largest negative subnormal
+    v[7]  = 0x0010000000000000;      # the smallest normal
+    v[8]  = 0x7FEFFFFFFFFFFFFF;      # the largest finite
+    v[9]  = 0xFFEFFFFFFFFFFFFF;
+    v[10] = 0x7FF0000000000000;      # +infinity
+    v[11] = 0xFFF0000000000000;
+    v[12] = 0x7FF8000000000000;      # a quiet NaN
+    v[13] = 0x4340000000000001;      # 2^53 + 2, where a tie is one ulp away
+    v[14] = 0x3FB999999999999A;      # 0.1
+    v[15] = 0x0008000000000000;      # a subnormal with half its bits set
+    v[16] = 0x43F0000000000000;      # 2^64
+    v[17] = 0xC1E0000000000000;      # -2^31
+    v[18] = 0x3FF0000000000001;      # 1 + 2^-52
+    v[19] = 0x7FE0000000000000;      # 2^1023, where doubling overflows
+
+    var i: u32 = 0;
+    for (i < 20) {
+        var j: u32 = 0;
+        for (j < 20) {
+            var op: u32 = 0;
+            for (op < 4) {
+                val want: u64 = host_arith(v[i], v[j], op, FMT_D);
+                var got: u64 = 0;
+                if (op == 0)      { got = soft_add(v[i], v[j], FMT_D, 0); }
+                or (op == 1)      { got = soft_sub(v[i], v[j], FMT_D, 0); }
+                or (op == 2)      { got = soft_mul(v[i], v[j], FMT_D, 0); }
+                or                { got = soft_div(v[i], v[j], FMT_D, 0); }
+                if (got != want) { ret 1; }
+                op = op + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    var s: [14]u32;
+    s[0]  = 0x00000000;
+    s[1]  = 0x80000000;
+    s[2]  = 0x3F800000;              # 1.0f
+    s[3]  = 0xBF800000;
+    s[4]  = 0x41200000;              # 10.0f
+    s[5]  = 0x00000001;              # the smallest subnormal single
+    s[6]  = 0x007FFFFF;              # the largest subnormal single
+    s[7]  = 0x00800000;              # the smallest normal single
+    s[8]  = 0x7F7FFFFF;              # the largest finite single
+    s[9]  = 0xFF7FFFFF;
+    s[10] = 0x7F800000;              # +infinity
+    s[11] = 0x7FC00000;              # a quiet NaN
+    s[12] = 0x4B800001;              # 2^24 + 2, where a tie is one ulp away
+    s[13] = 0x3DCCCCCD;              # 0.1f
+
+    i = 0;
+    for (i < 14) {
+        var j2: u32 = 0;
+        for (j2 < 14) {
+            var op2: u32 = 0;
+            for (op2 < 4) {
+                val want2: u64 = host_arith(s[i]::u64, s[j2]::u64, op2, FMT_S);
+                var got2: u64 = 0;
+                if (op2 == 0)      { got2 = soft_add(s[i]::u64, s[j2]::u64, FMT_S, 0); }
+                or (op2 == 1)      { got2 = soft_sub(s[i]::u64, s[j2]::u64, FMT_S, 0); }
+                or (op2 == 2)      { got2 = soft_mul(s[i]::u64, s[j2]::u64, FMT_S, 0); }
+                or                 { got2 = soft_div(s[i]::u64, s[j2]::u64, FMT_S, 0); }
+                if (got2 != want2) { ret 1; }
+                op2 = op2 + 1;
+            }
+            j2 = j2 + 1;
+        }
+        i = i + 1;
+    }
     ret 0;
 }
