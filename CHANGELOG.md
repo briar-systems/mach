@@ -62,6 +62,17 @@ mos6502, the other target that legalizes to a narrower ALU, is unaffected: an `i
 
 ### Added
 
+#### riscv32 converts between a 64-bit integer and a float, open-coded (#2860)
+RV32 has no instruction for it. `fcvt.d.l`, `fcvt.lu.d`, `fcvt.s.l` and the rest of the family name a 64-bit GP operand through their `L` selector, and no RV32 register is that wide, so `i64 -> f64`, `f64 -> u64` and their six siblings had no encoding and were refused by name. `be.codegen.legalize` could not supply one either: it splits a wide integer into native lanes and threads carries between them, and a conversion is a **single rounding of the combined value**, not two lane conversions recombined afterwards, so the model the pass is built on does not apply to it.
+
+The conversion is now open-coded from 32-bit conversions and float arithmetic, rather than lowered to the soft-float helpers (`__floatdidf`, `__fixdfdi` and their twins) a C toolchain would call. The helpers are correct by construction and are a fraction of the code, and they were rejected because they introduce a **runtime dependency this backend has nowhere else on this target**: a freestanding RV32 image, which is the configuration mach's RISC-V targets exist for, would then need a libgcc-shaped runtime linked before an `i64 -> f64` worked at all. The conversion would be missing on exactly the target that wanted it most. The tradeoff is recorded where the expansion is written, because the price of the choice is that a rounding mistake is a silent wrong answer instead of a failure.
+
+Each direction is an identity that rounds exactly once. `i64 -> f64` is `f64(hi) * 2^32 + f64(lo)`: each lane converts exactly, the scale is a power of two, so the closing add is a sum of two exact values. `f64 -> u64` is a truncating split whose two scalings and one subtraction are all exact, and which inherits the saturation and NaN rules **from the native 32-bit `fcvt` in each lane** rather than testing for them, so `NaN` lands on the destination maximum and a negative input on zero without a compare in sight. `f64 -> i64` converts the magnitude that way and then clamps and negates, which is what puts `NaN` and `+inf` on `INT64_MAX` and `-inf` on `INT64_MIN`.
+
+The `f32` forms may **not** take the `f64` result and narrow it. That is a double rounding and it is not innocuous here: a 64-bit integer can round in `f64` to exactly an `f32` midpoint without being one, and ties-to-even then breaks the wrong way. The value is first rounded to odd at a fixed 11-bit granularity when it needs more than 53 bits, which leaves the `f64` carrier exact and makes the narrowing the only rounding. A sweep over values constructed to sit on that midpoint catches the naive version at every exponent from 2^54 up, and passes as written.
+
+The four arms fire only where the conversion's float side rides a float register bank, so mos6502 - one register class, floats in integer lane groups - keeps its refusal, and every 64-bit target is untouched: x86-64, aarch64 and riscv64 objects are byte for byte what they were.
+
 #### A storage binding nothing writes is emitted `NonWritable`, and can say so (#2879)
 A `#[storage(set, binding)]` buffer that a stage only reads was emitted with no `NonWritable` decoration, so every consumer had to enable `vertexPipelineStoresAndAtomics` to read one from a vertex stage. The read-only case is the common one - a joint palette, an instance buffer, a light list - and it is the case where the decoration is free and its absence costs a hardware requirement.
 
