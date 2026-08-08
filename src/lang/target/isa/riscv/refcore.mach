@@ -1,0 +1,537 @@
+# a reference RV32IM core: execute emitted bytes and say what they compute
+#
+# The riscv32 counterpart of the reference 6502 core in `isa.mos6502.encode`, and it
+# exists for the reason that one does. rv32 shipped passing the whole suite while four
+# separate defects sat in it - an argument convention that destroyed a register, a wide
+# compare that answered false for equal values, a whole-lane shift that returned
+# garbage, and a wide multiply nothing had ever run - because every test the target had
+# asserted that codegen EMITTED something, and none of them asserted what the emitted
+# bytes COMPUTE. mos6502 was the only target with an execution harness and it was the
+# only target where that class of defect was caught. This closes that gap.
+#
+# ===========================================================================
+# THIS CORE DECODES INDEPENDENTLY OF THE ENCODER. THAT IS THE WHOLE POINT.
+# ===========================================================================
+#
+# Nothing here imports `isa.riscv`, `isa.riscv.inst` or `isa.riscv.encode`. Every field
+# position, every opcode number and every funct3 / funct7 value below is written out as
+# the number the RISC-V unprivileged ISA manual gives, next to the mnemonic the manual
+# gives it. That is deliberate DUPLICATION of the encoder's knowledge, and deduplicating
+# it would silently destroy this file's only reason to exist.
+#
+# The argument is short. A harness that decoded `add` by asking the encoder which bits
+# mean `add` would agree with the encoder BY CONSTRUCTION: if the encoder emitted the
+# wrong funct7, the core would read it back with the same wrong funct7, execute the
+# instruction the encoder meant, and report a pass. It would verify that the compiler
+# is self-consistent, which nothing has ever doubted, while LOOKING like execution
+# coverage - which makes it worse than no harness at all, because a green run would
+# retire the suspicion that motivated it.
+#
+# So the rule is: where a number is needed, write the manual's number. Where a field is
+# needed, shift and mask it here. If you are reading this because the duplication
+# offends you, that instinct is correct in general and wrong here, and the cost of
+# acting on it is that this file stops testing anything.
+#
+# The one thing legitimately shared with the compiler is the ABI's register numbering,
+# and even that is not imported: `a0` is x10 because the manual says so.
+#
+# ===========================================================================
+#
+# SCOPE IS RV32I PLUS M, and that is a closed set from the manual rather than "whatever
+# the corpus showed". Implementing only the instructions one program happened to select
+# would make the harness fail on the next program and look like a codegen bug.
+#
+# NOT COVERED, AND REFUSED BY NAME RATHER THAN IGNORED: the F and D extensions, fences,
+# and CSR access. rv32 codegen does select float instructions, so a probe program that
+# uses a float reaches an `fld` here and gets a refusal naming the opcode - a harness
+# that skipped what it did not model would report a pass for a program it never ran.
+# Float coverage is a later change and wants the whole of IEEE 754 done properly.
+#
+# TERMINATION is a return to a sentinel address seeded into `ra` before entry: the
+# emitted `ret` is `jalr x0, 0(ra)`, so a jump whose target is the sentinel is the
+# function returning to its caller. Any access outside the image, any instruction
+# outside the set above, and any run that exceeds the step cap is a failure rather than
+# a truncated answer - the same discipline the 6502 core holds to, and for the same
+# reason: a harness that degrades quietly reports green for the runs it gave up on.
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+# the address seeded into `ra`; a jump here is the entry function returning
+#
+# Word-aligned and far outside any image this harness loads, so it cannot collide with
+# a real instruction address. `jalr` clears the low bit of its target, so the sentinel
+# must be even or the comparison would never match.
+pub val RETURN_SENTINEL: u32 = 0xFFFFFFF0;
+
+# the runaway backstop
+#
+# A cap on executed instructions, not a workload ceiling. Generous enough for the
+# expansions `be.codegen.legalize` produces on a 32-bit machine (a wide divide is
+# hundreds of instructions per call and a probe may loop over it), and finite so a
+# sequence that never returns is reported instead of hanging the test binary.
+pub val MAX_STEPS: u32 = 2000000;
+
+# the reference core's architectural state
+#
+# `x[0]` is present so register numbering needs no adjustment, and is forced to zero on
+# every write, which is the manual's rule rather than a convenience.
+# ---
+# x:     the 32 integer registers, x[0] hardwired to zero
+# pc:    the program counter
+# steps: instructions retired, for the runaway backstop and for cost assertions
+pub rec Core {
+    x:     [32]u32;
+    pc:    u32;
+    steps: u32;
+}
+
+# sign-extend the low `bits` of `v`
+fun sext(v: u32, bits: u32) u32 {
+    val sh: u32 = 32 - bits;
+    ret ((v << sh)::i32 >> sh::i32)::u32;
+}
+
+# write a register, honoring x0 (manual: writes to x0 are discarded)
+fun wr(core: *Core, rd: u32, v: u32) {
+    if (rd != 0) { core.x[rd] = v; }
+}
+
+# read `n` bytes little-endian from the image, or report an out-of-bounds access
+#
+# RISC-V is little-endian in every configuration this compiler targets, so the byte
+# order is written out here rather than taken from the machine model - the model is the
+# compiler's own description and this file does not read the compiler's descriptions.
+fun rd_mem(mem: *u8, size: usize, addr: u32, n: u32, out: *u32) bool {
+    if (addr::usize + n::usize > size) { ret false; }
+    var v: u32 = 0;
+    var i: u32 = 0;
+    for (i < n) {
+        v = v | (mem[(addr + i)::usize]::u32 << (i * 8));
+        i = i + 1;
+    }
+    @out = v;
+    ret true;
+}
+
+# write `n` bytes little-endian into the image, or report an out-of-bounds access
+fun wr_mem(mem: *u8, size: usize, addr: u32, n: u32, v: u32) bool {
+    if (addr::usize + n::usize > size) { ret false; }
+    var i: u32 = 0;
+    for (i < n) {
+        mem[(addr + i)::usize] = ((v >> (i * 8)) & 0xFF)::u8;
+        i = i + 1;
+    }
+    ret true;
+}
+
+# execute from `core.pc` until the entry function returns to `RETURN_SENTINEL`
+#
+# Field extraction below is the manual's instruction formats, spelled out:
+#
+#   opcode = bits  6:0     rd     = bits 11:7    funct3 = bits 14:12
+#   rs1    = bits 19:15    rs2    = bits 24:20   funct7 = bits 31:25
+#
+#   I-immediate = sext(bits 31:20, 12)
+#   S-immediate = sext(bits 31:25 : bits 11:7, 12)
+#   B-immediate = sext(bit 31 : bit 7 : bits 30:25 : bits 11:8 : 0, 13)
+#   U-immediate = bits 31:12 << 12
+#   J-immediate = sext(bit 31 : bits 19:12 : bit 20 : bits 30:21 : 0, 21)
+#
+# The B and J forms have their bits scrambled relative to source order; that scrambling
+# is the manual's, it exists so the immediate's bits land under the same wires as the
+# other formats, and getting it wrong is one of the two most likely ways for this file
+# to be quietly incorrect. The other is the division edge cases, which are handled at
+# their opcodes below.
+# ---
+# mem:  the flat memory image, little-endian, address 0 at `mem[0]`
+# size: the image size in bytes
+# core: the core state; `pc` is the entry point, `x[1]` must hold RETURN_SENTINEL
+# ret:  true when the run returned through the sentinel inside the modeled set
+pub fun exec_reference(mem: *u8, size: usize, core: *Core) bool {
+    core.steps = 0;
+    for (core.steps < MAX_STEPS) {
+        core.steps = core.steps + 1;
+        core.x[0] = 0;
+
+        var w: u32 = 0;
+        if (!rd_mem(mem, size, core.pc, 4, ?w)) { ret false; }
+
+        val opcode: u32 = w & 0x7F;
+        val rd:     u32 = (w >> 7)  & 0x1F;
+        val funct3: u32 = (w >> 12) & 0x07;
+        val rs1:    u32 = (w >> 15) & 0x1F;
+        val rs2:    u32 = (w >> 20) & 0x1F;
+        val funct7: u32 = (w >> 25) & 0x7F;
+        val a:      u32 = core.x[rs1];
+        val b:      u32 = core.x[rs2];
+        val next:   u32 = core.pc + 4;
+
+        # LUI (opcode 0110111): the upper immediate, low 12 bits zero
+        if (opcode == 0x37) {
+            wr(core, rd, w & 0xFFFFF000);
+            core.pc = next;
+        }
+        # AUIPC (opcode 0010111): the upper immediate added to THIS instruction's pc
+        or (opcode == 0x17) {
+            wr(core, rd, core.pc + (w & 0xFFFFF000));
+            core.pc = next;
+        }
+        # JAL (opcode 1101111)
+        or (opcode == 0x6F) {
+            val imm: u32 = sext(((w >> 31) & 1) << 20
+                              | ((w >> 12) & 0xFF) << 12
+                              | ((w >> 20) & 1) << 11
+                              | ((w >> 21) & 0x3FF) << 1, 21);
+            val tgt: u32 = core.pc + imm;
+            wr(core, rd, next);
+            if (tgt == RETURN_SENTINEL) { ret true; }
+            core.pc = tgt;
+        }
+        # JALR (opcode 1100111, funct3 000): the target's low bit is cleared
+        or (opcode == 0x67) {
+            if (funct3 != 0) { ret false; }
+            val imm: u32 = sext(w >> 20, 12);
+            val tgt: u32 = (a + imm) & 0xFFFFFFFE;
+            wr(core, rd, next);
+            if (tgt == RETURN_SENTINEL) { ret true; }
+            core.pc = tgt;
+        }
+        # BRANCH (opcode 1100011)
+        or (opcode == 0x63) {
+            val imm: u32 = sext(((w >> 31) & 1) << 12
+                              | ((w >> 7)  & 1) << 11
+                              | ((w >> 25) & 0x3F) << 5
+                              | ((w >> 8)  & 0x0F) << 1, 13);
+            var take: bool = false;
+            if (funct3 == 0)      { take = a == b; }                      # BEQ
+            or (funct3 == 1)      { take = a != b; }                      # BNE
+            or (funct3 == 4)      { take = a::i32 <  b::i32; }            # BLT
+            or (funct3 == 5)      { take = a::i32 >= b::i32; }            # BGE
+            or (funct3 == 6)      { take = a < b; }                       # BLTU
+            or (funct3 == 7)      { take = a >= b; }                      # BGEU
+            or { ret false; }
+            if (take) { core.pc = core.pc + imm; }
+            or        { core.pc = next; }
+        }
+        # LOAD (opcode 0000011)
+        or (opcode == 0x03) {
+            val addr: u32 = a + sext(w >> 20, 12);
+            var v: u32 = 0;
+            if (funct3 == 0)      { if (!rd_mem(mem, size, addr, 1, ?v)) { ret false; } v = sext(v, 8);  }  # LB
+            or (funct3 == 1)      { if (!rd_mem(mem, size, addr, 2, ?v)) { ret false; } v = sext(v, 16); }  # LH
+            or (funct3 == 2)      { if (!rd_mem(mem, size, addr, 4, ?v)) { ret false; } }                   # LW
+            or (funct3 == 4)      { if (!rd_mem(mem, size, addr, 1, ?v)) { ret false; } }                   # LBU
+            or (funct3 == 5)      { if (!rd_mem(mem, size, addr, 2, ?v)) { ret false; } }                   # LHU
+            or { ret false; }
+            wr(core, rd, v);
+            core.pc = next;
+        }
+        # STORE (opcode 0100011)
+        or (opcode == 0x23) {
+            val imm:  u32 = sext(((w >> 25) & 0x7F) << 5 | ((w >> 7) & 0x1F), 12);
+            val addr: u32 = a + imm;
+            if (funct3 == 0)      { if (!wr_mem(mem, size, addr, 1, b)) { ret false; } }  # SB
+            or (funct3 == 1)      { if (!wr_mem(mem, size, addr, 2, b)) { ret false; } }  # SH
+            or (funct3 == 2)      { if (!wr_mem(mem, size, addr, 4, b)) { ret false; } }  # SW
+            or { ret false; }
+            core.pc = next;
+        }
+        # OP-IMM (opcode 0010011)
+        or (opcode == 0x13) {
+            val imm:   u32 = sext(w >> 20, 12);
+            # a shift-immediate's count is the low 5 bits of the immediate field on
+            # RV32, and the bits above it select arithmetic vs logical
+            val shamt: u32 = (w >> 20) & 0x1F;
+            if (funct3 == 0)      { wr(core, rd, a + imm); }                                   # ADDI
+            or (funct3 == 2)      { var t: u32 = 0; if (a::i32 < imm::i32) { t = 1; } wr(core, rd, t); }  # SLTI
+            or (funct3 == 3)      { var t: u32 = 0; if (a < imm)           { t = 1; } wr(core, rd, t); }  # SLTIU
+            or (funct3 == 4)      { wr(core, rd, a ^ imm); }                                   # XORI
+            or (funct3 == 6)      { wr(core, rd, a | imm); }                                   # ORI
+            or (funct3 == 7)      { wr(core, rd, a & imm); }                                   # ANDI
+            or (funct3 == 1)      {
+                if (funct7 != 0x00) { ret false; }
+                wr(core, rd, a << shamt);                                                      # SLLI
+            }
+            or (funct3 == 5)      {
+                if (funct7 == 0x00)      { wr(core, rd, a >> shamt); }                         # SRLI
+                or (funct7 == 0x20)      { wr(core, rd, (a::i32 >> shamt::i32)::u32); }        # SRAI
+                or { ret false; }
+            }
+            or { ret false; }
+            core.pc = next;
+        }
+        # OP (opcode 0110011): the base register-register set at funct7 0000000 /
+        # 0100000, and the M extension at funct7 0000001
+        or (opcode == 0x33) {
+            # a register shift's count is the low 5 bits of rs2 on RV32
+            val shamt: u32 = b & 0x1F;
+            if (funct7 == 0x00) {
+                if (funct3 == 0)      { wr(core, rd, a + b); }                                     # ADD
+                or (funct3 == 1)      { wr(core, rd, a << shamt); }                                # SLL
+                or (funct3 == 2)      { var t: u32 = 0; if (a::i32 < b::i32) { t = 1; } wr(core, rd, t); }  # SLT
+                or (funct3 == 3)      { var t: u32 = 0; if (a < b)           { t = 1; } wr(core, rd, t); }  # SLTU
+                or (funct3 == 4)      { wr(core, rd, a ^ b); }                                     # XOR
+                or (funct3 == 5)      { wr(core, rd, a >> shamt); }                                # SRL
+                or (funct3 == 6)      { wr(core, rd, a | b); }                                     # OR
+                or (funct3 == 7)      { wr(core, rd, a & b); }                                     # AND
+                or { ret false; }
+            }
+            or (funct7 == 0x20) {
+                if (funct3 == 0)      { wr(core, rd, a - b); }                                     # SUB
+                or (funct3 == 5)      { wr(core, rd, (a::i32 >> shamt::i32)::u32); }               # SRA
+                or { ret false; }
+            }
+            or (funct7 == 0x01) {
+                if (!exec_muldiv(core, rd, funct3, a, b)) { ret false; }
+            }
+            or { ret false; }
+            core.pc = next;
+        }
+        or { ret false; }
+    }
+    ret false;
+}
+
+# the M extension's eight instructions, at opcode 0110011 funct7 0000001
+#
+# THE EDGE CASES ARE THE MANUAL'S AND THEY ARE NOT THE HOST'S. RISC-V defines division
+# by zero and signed overflow rather than leaving them undefined, and the definitions
+# are unusual enough that a core written from intuition gets them wrong: a division by
+# zero yields ALL ONES as the quotient and the dividend unchanged as the remainder, and
+# the single overflow case (the most negative integer divided by -1) yields that same
+# most negative integer as the quotient and zero as the remainder. Neither traps.
+#
+# They are also exactly the cases a compiler's own expansion is most likely to get
+# wrong, so a core that took the host's behaviour here would agree with a wrong
+# expansion for the same reason importing the encoder's tables would.
+# ---
+# core:   the core state
+# rd:     the destination register
+# funct3: 0 MUL, 1 MULH, 2 MULHSU, 3 MULHU, 4 DIV, 5 DIVU, 6 REM, 7 REMU
+# a, b:   the two source register values
+# ret:    true when `funct3` names a modeled instruction
+fun exec_muldiv(core: *Core, rd: u32, funct3: u32, a: u32, b: u32) bool {
+    # the most negative 32-bit integer, the sole signed-overflow dividend
+    val int_min: u32 = 0x80000000;
+
+    if (funct3 == 0) {                                                        # MUL
+        wr(core, rd, (a::u64 * b::u64)::u32);
+        ret true;
+    }
+    if (funct3 == 1) {                                                        # MULH
+        val p: i64 = a::i32::i64 * b::i32::i64;
+        wr(core, rd, (p::u64 >> 32)::u32);
+        ret true;
+    }
+    if (funct3 == 2) {                                                        # MULHSU
+        val p: i64 = a::i32::i64 * b::u64::i64;
+        wr(core, rd, (p::u64 >> 32)::u32);
+        ret true;
+    }
+    if (funct3 == 3) {                                                        # MULHU
+        wr(core, rd, ((a::u64 * b::u64) >> 32)::u32);
+        ret true;
+    }
+    if (funct3 == 4) {                                                        # DIV
+        if (b == 0)                            { wr(core, rd, 0xFFFFFFFF); ret true; }
+        if (a == int_min && b == 0xFFFFFFFF)   { wr(core, rd, int_min);    ret true; }
+        wr(core, rd, (a::i32 / b::i32)::u32);
+        ret true;
+    }
+    if (funct3 == 5) {                                                        # DIVU
+        if (b == 0) { wr(core, rd, 0xFFFFFFFF); ret true; }
+        wr(core, rd, a / b);
+        ret true;
+    }
+    if (funct3 == 6) {                                                        # REM
+        if (b == 0)                            { wr(core, rd, a); ret true; }
+        if (a == int_min && b == 0xFFFFFFFF)   { wr(core, rd, 0); ret true; }
+        wr(core, rd, (a::i32 % b::i32)::u32);
+        ret true;
+    }
+    if (funct3 == 7) {                                                        # REMU
+        if (b == 0) { wr(core, rd, a); ret true; }
+        wr(core, rd, a % b);
+        ret true;
+    }
+    ret false;
+}
+
+# the core's decode agrees with the manual's field layout on hand-written words
+#
+# EVERY WORD HERE IS ASSEMBLED BY HAND from the manual's format tables, not by the
+# encoder. That is the same independence the file header argues for, applied to the
+# file's own test: a fixture built by calling the encoder would pass against a core
+# that shared the encoder's mistakes, which is the exact failure this core exists to
+# rule out. Hand-assembly is tedious and it is the only version of this test that
+# means anything.
+test "mach.lang.target.isa.riscv.refcore:decodes_the_manual_field_layout" {
+    var mem: [256]u8;
+    var i: usize = 0;
+    for (i < 256) { mem[i] = 0; i = i + 1; }
+
+    # addi x10, x0, 5      -> imm=5 rs1=0 f3=0 rd=10 op=0010011
+    val addi: u32 = (5 << 20) | (0 << 15) | (0 << 12) | (10 << 7) | 0x13;
+    # addi x11, x0, -3     -> the immediate is sign-extended from 12 bits
+    val addin: u32 = ((0xFFD & 0xFFF) << 20) | (0 << 15) | (0 << 12) | (11 << 7) | 0x13;
+    # sub  x12, x10, x11   -> f7=0100000 rs2=11 rs1=10 f3=0 rd=12 op=0110011
+    val sub: u32 = (0x20 << 25) | (11 << 20) | (10 << 15) | (0 << 12) | (12 << 7) | 0x33;
+    # jalr x0, 0(x1)       -> the `ret` the core terminates on
+    val jr: u32 = (0 << 20) | (1 << 15) | (0 << 12) | (0 << 7) | 0x67;
+
+    var w: [4]u32;
+    w[0] = addi; w[1] = addin; w[2] = sub; w[3] = jr;
+    var k: usize = 0;
+    for (k < 4) {
+        var byt: usize = 0;
+        for (byt < 4) {
+            mem[k * 4 + byt] = ((w[k] >> (byt::u32 * 8)) & 0xFF)::u8;
+            byt = byt + 1;
+        }
+        k = k + 1;
+    }
+
+    var core: Core;
+    var z: usize = 0;
+    for (z < 32) { core.x[z] = 0; z = z + 1; }
+    core.pc   = 0;
+    core.x[1] = RETURN_SENTINEL;
+    if (!exec_reference(?mem[0], 256, ?core)) { ret 1; }
+
+    # 5 - (-3) == 8, which needs the immediate sign-extended and SUB distinguished from
+    # ADD by funct7 alone
+    if (core.x[10] != 5)          { ret 1; }
+    if (core.x[11] != 0xFFFFFFFD) { ret 1; }
+    if (core.x[12] != 8)          { ret 1; }
+    # four instructions retired, so the terminator is counted and nothing ran on
+    if (core.steps != 4)          { ret 1; }
+    ret 0;
+}
+
+# the branch and jump immediates are the manual's SCRAMBLED bit order
+#
+# Pinned separately because it is the likeliest place for this core to be quietly wrong:
+# B and J pack their immediate bits out of source order, and a core that read them as
+# contiguous fields would still run straight-line code perfectly and would take every
+# branch to the wrong place. A test that only ran arithmetic would never notice.
+test "mach.lang.target.isa.riscv.refcore:branch_and_jump_immediates_are_scrambled" {
+    var mem: [256]u8;
+    var i: usize = 0;
+    for (i < 256) { mem[i] = 0; i = i + 1; }
+
+    # at 0: beq x0, x0, +8   -> imm 8 is bit3, which B packs into bits 11:8 of the word
+    val beq: u32 = (0 << 25) | (0 << 20) | (0 << 15) | (0 << 12) | (4 << 8) | 0x63;
+    # at 4: addi x5, x0, 99  -> SKIPPED if the branch decoded correctly
+    val skipped: u32 = (99 << 20) | (0 << 15) | (0 << 12) | (5 << 7) | 0x13;
+    # at 8: jal x0, +8       -> imm 8 is bit3, which J packs into bits 30:21
+    val jal: u32 = ((8 >> 1) << 21) | (0 << 7) | 0x6F;
+    # at 12: addi x5, x0, 77 -> SKIPPED if the jump decoded correctly
+    val skipped2: u32 = (77 << 20) | (0 << 15) | (0 << 12) | (5 << 7) | 0x13;
+    # at 16: jalr x0, 0(x1)
+    val jr: u32 = (1 << 15) | 0x67;
+
+    var w: [5]u32;
+    w[0] = beq; w[1] = skipped; w[2] = jal; w[3] = skipped2; w[4] = jr;
+    var k: usize = 0;
+    for (k < 5) {
+        var byt: usize = 0;
+        for (byt < 4) {
+            mem[k * 4 + byt] = ((w[k] >> (byt::u32 * 8)) & 0xFF)::u8;
+            byt = byt + 1;
+        }
+        k = k + 1;
+    }
+
+    var core: Core;
+    var z: usize = 0;
+    for (z < 32) { core.x[z] = 0; z = z + 1; }
+    core.pc   = 0;
+    core.x[1] = RETURN_SENTINEL;
+    if (!exec_reference(?mem[0], 256, ?core)) { ret 1; }
+
+    # neither skipped instruction ran: x5 is untouched
+    if (core.x[5] != 0) { ret 1; }
+    # branch, jump, return: three instructions
+    if (core.steps != 3) { ret 1; }
+    ret 0;
+}
+
+# the M extension's division edge cases are the manual's, not the host's
+#
+# Division by zero and the single signed-overflow case are DEFINED on RISC-V and defined
+# unusually. A core that inherited the host's behaviour would trap or disagree, and it
+# would disagree in exactly the direction that makes a wrong compiler expansion look
+# right.
+test "mach.lang.target.isa.riscv.refcore:division_edges_follow_the_manual" {
+    var core: Core;
+    var z: usize = 0;
+    for (z < 32) { core.x[z] = 0; z = z + 1; }
+
+    # divide by zero: quotient all ones, remainder the dividend, neither traps
+    if (!exec_muldiv(?core, 5, 4, 17, 0)) { ret 1; }
+    if (core.x[5] != 0xFFFFFFFF) { ret 1; }
+    if (!exec_muldiv(?core, 5, 5, 17, 0)) { ret 1; }
+    if (core.x[5] != 0xFFFFFFFF) { ret 1; }
+    if (!exec_muldiv(?core, 5, 6, 17, 0)) { ret 1; }
+    if (core.x[5] != 17) { ret 1; }
+    if (!exec_muldiv(?core, 5, 7, 17, 0)) { ret 1; }
+    if (core.x[5] != 17) { ret 1; }
+
+    # signed overflow: INT_MIN / -1 is INT_MIN, and its remainder is 0
+    if (!exec_muldiv(?core, 5, 4, 0x80000000, 0xFFFFFFFF)) { ret 1; }
+    if (core.x[5] != 0x80000000) { ret 1; }
+    if (!exec_muldiv(?core, 5, 6, 0x80000000, 0xFFFFFFFF)) { ret 1; }
+    if (core.x[5] != 0) { ret 1; }
+
+    # the high-half multiplies differ by signedness on the same bits, which is the
+    # distinction PR #2871's schoolbook expansion depends on
+    if (!exec_muldiv(?core, 5, 3, 0xFFFFFFFF, 0xFFFFFFFF)) { ret 1; }
+    if (core.x[5] != 0xFFFFFFFE) { ret 1; }   # MULHU: (2^32-1)^2 >> 32
+    if (!exec_muldiv(?core, 5, 1, 0xFFFFFFFF, 0xFFFFFFFF)) { ret 1; }
+    if (core.x[5] != 0)          { ret 1; }   # MULH:  (-1 * -1) >> 32
+    ret 0;
+}
+
+# an instruction outside the modeled set is REFUSED, not skipped
+#
+# The property that makes every other assertion in this harness mean something. A core
+# that ignored what it did not model would run a program with a float in it, execute
+# the integer half, and report the answer as if the whole thing had run - a pass for a
+# program that never really ran. `fld` is the concrete case: rv32 codegen does select
+# float instructions, and this harness does not model them.
+test "mach.lang.target.isa.riscv.refcore:an_unmodeled_instruction_is_refused" {
+    var mem: [64]u8;
+    var i: usize = 0;
+    for (i < 64) { mem[i] = 0; i = i + 1; }
+
+    # fld f0, 0(x2) -> opcode 0000111, the D-extension load. not modeled.
+    val fld: u32 = (0 << 20) | (2 << 15) | (3 << 12) | (0 << 7) | 0x07;
+    var byt: usize = 0;
+    for (byt < 4) { mem[byt] = ((fld >> (byt::u32 * 8)) & 0xFF)::u8; byt = byt + 1; }
+
+    var core: Core;
+    var z: usize = 0;
+    for (z < 32) { core.x[z] = 0; z = z + 1; }
+    core.pc   = 0;
+    core.x[1] = RETURN_SENTINEL;
+    if (exec_reference(?mem[0], 64, ?core)) { ret 1; }
+
+    # and a load past the end of the image is refused too, rather than reading zeros
+    var mem2: [64]u8;
+    i = 0;
+    for (i < 64) { mem2[i] = 0; i = i + 1; }
+    # lw x5, 0(x6) with x6 pointing past the image
+    val lw: u32 = (0 << 20) | (6 << 15) | (2 << 12) | (5 << 7) | 0x03;
+    byt = 0;
+    for (byt < 4) { mem2[byt] = ((lw >> (byt::u32 * 8)) & 0xFF)::u8; byt = byt + 1; }
+    var c2: Core;
+    z = 0;
+    for (z < 32) { c2.x[z] = 0; z = z + 1; }
+    c2.pc   = 0;
+    c2.x[1] = RETURN_SENTINEL;
+    c2.x[6] = 0x1000;
+    if (exec_reference(?mem2[0], 64, ?c2)) { ret 1; }
+    ret 0;
+}
