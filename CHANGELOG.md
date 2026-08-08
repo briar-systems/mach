@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+#### An `i64` global compiles on rv32 instead of crashing the compiler (#2867)
+A wide global feeding wide arithmetic on riscv32 killed the compiler with SIGSEGV and no diagnostic, and the same construct without the arithmetic produced a refusal. Both came from one place. Lowering folds a global straight into the access as a symbol operand, so a `MIR_LOAD` or `MIR_STORE` on one carries no memory operand at all, while `legalize` entered its memory path on the opcode alone and then indexed the memory operand it assumed was there. The index was `-1`: one shape read a wild pointer and faulted, the other read one slot past the operand array and refused off whatever it found. The refusal was never a decision.
+
+The pass now decides that a memory access is one by finding the address, not by reading the opcode, and it recognizes the two forms an address takes: a memory operand walked by displacement, and a symbol walked by addend. So a wide global is no longer refused either - it is legalized like any other fixed base, one native access per lane at successive offsets on the same symbol, which is what a 64-bit value on a 32-bit machine has always cost. An access whose address is neither form falls through to the named refusal for its opcode rather than into an expansion that cannot describe it.
+
+mos6502, the other target that legalizes to a narrower ALU, is unaffected: an `i64` there needs a frame slot and the pass refuses the wide `MIR_ALLOCA` before any access is examined.
+
 ### Added
 
 #### A layout intrinsic can be measured inside a comptime `$if` (#2857)
