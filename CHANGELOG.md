@@ -38,6 +38,19 @@ A textured shader emits a **byte-identical module** across the migration: the sa
 
 ### Fixed
 
+#### An aggregate is passed and returned by value on the SPIR-V target (#2914, #2915)
+`fun sum(p: Pair) u32` was refused for `spirv` with an addressed-memory diagnostic, and `fun make() Pair` failed earlier still with a bare `spirv.emit: unreadable move source` that named no opcode, no function and no position. A shader API where a record cannot cross a call in either direction is not a finished one.
+
+Both come from the shared ABI lowering describing every aggregate placement in **bytes**. An argument was copied into an outgoing stack frame in 8/4/2/1-byte chunks, and a return was materialized into a caller-supplied sret slot and copied out of it. SPIR-V has no frame to build the first in and no pointer to follow for the second, and it never needed either: a composite is passed by value natively, as an `OpFunctionParameter` of the record's own type, and returned by value as an `OpReturnValue` of it.
+
+The lever is the calling convention, which is where every other aggregate placement is already decided. `abi.CLASS_AGG` says the object travels as **one value** in an argument or return position, at its own type, and the spirv convention returns it for an aggregate. It is deliberately not a machine-model property: the addressing model does not settle a calling convention, and sysv64 and win64 already disagree about aggregates on one machine. A future target that passes composites whole declares the class in its own convention file and inherits the whole path.
+
+MIR carries the transfer whole through `MIR_AGG_LOAD` and `MIR_AGG_STORE`, the calling-convention siblings of `MIR_MEMCPY` (#2911). Neither carries a byte count, unlike `MIR_MEMCPY` and `MIR_MEMZERO`, and that is the contract rather than an omission: those two are expanded into a sized run on a flat target, there is no expansion of these anywhere, and a byte count is exactly the fact the class exists in order not to use.
+
+The unlocated internal error was a diagnostic bug in its own right, so it is fixed independently of the feature. Every refusal the SPIR-V emitter raises from inside instruction emission now goes through `mir.instr_refusal`, internal errors and declared unsupported features alike, so each one names its opcode, its function and its source position.
+
+Every machine target's output is unchanged byte for byte: 224 objects each on linux-x86_64, linux-arm64, linux-riscv64 and windows-x86_64, and 225 each on darwin-aarch64 and darwin-x86_64.
+
 #### A comparison result crosses a call and a return boundary on the SPIR-V target (#2910)
 `mix(h, x == x)` compiled for `spirv` handed the `OpIEqual`'s `%bool` straight to an `OpFunctionCall` whose callee declares `%uchar`, and `ret x == x` from a `u8` function returned one out of a `%uchar` function. `spirv-val` rejected both. Neither is float specific: an integer comparison did it too.
 
