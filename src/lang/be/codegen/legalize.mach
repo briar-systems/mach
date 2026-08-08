@@ -734,30 +734,54 @@ fun wide_lane_count(plan: *LanePlan, mi: *mir.MirInstr) u32 {
 # against a stack slot (`MOV pv <- [fp + off]` for an incoming parameter): a move
 # with a memory operand IS a load or a store, and decomposing it per lane makes it
 # one. A declassify rides the move path for the same reason it does everywhere else.
+#
+# THE ADDRESS OPERAND IS WHAT MAKES IT A MEMORY ACCESS, not the opcode alone (#2867).
+# An access whose address this pass cannot name is not routed down the memory path at
+# all. It falls through to the generic refusal, which names the load or store, rather
+# than into an expansion that indexes an operand that is not there.
 # ---
 # mi:  the instruction to test
 # ret: true when the instruction reaches memory
 fun instr_is_memory(mi: *mir.MirInstr) bool {
     val op: mir.MirOpcode = mi.opcode;
-    if (op == mir.MIR_LOAD || op == mir.MIR_STORE) { ret true; }
-    if (op != mir.MIR_MOV && op != mir.MIR_DECLASSIFY) { ret false; }
-    ret mem_operand_index(mi) >= 0;
+    if (op != mir.MIR_LOAD && op != mir.MIR_STORE &&
+        op != mir.MIR_MOV  && op != mir.MIR_DECLASSIFY) { ret false; }
+    ret addr_operand_index(mi) >= 0;
 }
 
-# the index of the instruction's single memory operand, or -1 when it has none
+# the index of the instruction's single address operand, or -1 when it has none
 #
-# A load, a store, and a memory-operand move each carry exactly one; the first one
-# found is therefore the one.
+# An access reaches its address either through a MEM operand or - for a global the
+# lowering folded straight into the access - through a SYM operand naming the datum.
+# Both are fixed bases the expansion walks by displacement, the MEM through `imm` and
+# the SYM through `sym_off`. Only a LOAD or a STORE reads a SYM as an address: a move
+# naming a symbol is materializing that address as a value, which `mir.lower` retags
+# to MIR_GEP, and treating it as an access would decompose the pointer itself.
 # ---
 # mi:  the instruction to inspect
 # ret: the operand index, or -1
-fun mem_operand_index(mi: *mir.MirInstr) i32 {
+fun addr_operand_index(mi: *mir.MirInstr) i32 {
+    val sym_is_addr: bool = mi.opcode == mir.MIR_LOAD || mi.opcode == mir.MIR_STORE;
     var k: u32 = 0;
     for (k < mi.operand_count) {
-        if (mi.operands[k].kind == mir.MIR_OP_MEM) { ret k::i32; }
+        val kind: mir.MirOperandKind = mi.operands[k].kind;
+        if (kind == mir.MIR_OP_MEM) { ret k::i32; }
+        if (kind == mir.MIR_OP_SYM && sym_is_addr) { ret k::i32; }
         k = k + 1;
     }
     ret -1;
+}
+
+# the address operand displaced `off` bytes from `base`
+# ---
+# base: the access's address operand
+# off:  the byte displacement to add
+# ret:  the same address, `off` bytes further along
+fun addr_displaced(base: *mir.MirOperand, off: i64) mir.MirOperand {
+    var o: mir.MirOperand = @base;
+    if (o.kind == mir.MIR_OP_SYM) { o.sym_off = base.sym_off + off::i32; ret o; }
+    o.imm = base.imm + off;
+    ret o;
 }
 
 # whether a memory operand's base is a runtime pointer that must be staged
@@ -789,7 +813,7 @@ fun base_needs_staging(plan: *LanePlan, mem: *mir.MirOperand) bool {
 # ret:  the exact piece count, or an error naming the unsupported shape
 fun memory_piece_count(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr) R.Result[u32, str] {
     if (mi.operand_count != 2) { ret R.err[u32, str](unsupported_message(alloc, mi.opcode, mi.width)); }
-    val mx: i32 = mem_operand_index(mi);
+    val mx: i32 = addr_operand_index(mi);
     val vx: u32 = 1 - mx::u32;
     var n: u32 = wide_lane_count(plan, mi);
     if (!operand_is_lane_ready(plan, ?mi.operands[vx], n)) {
@@ -811,7 +835,8 @@ fun memory_piece_count(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr) 
 # Stages a runtime-pointer base into the backend's reserved address pair first (one
 # native move per pointer lane), then emits one access per value lane at successive
 # displacements off that fixed base. A base that is already fixed - a physical
-# register or a frame-slot key - is used directly and only the displacement walks.
+# register, a frame-slot key, or a symbol - is used directly and only the
+# displacement walks.
 # The pieces are always the explicit `MIR_LOAD` / `MIR_STORE` opcodes even when the
 # source was a memory-operand move, so a backend that has decomposed its addressing
 # sees one memory form rather than two.
@@ -827,7 +852,7 @@ fun expand_memory(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
     val rc: R.Result[u32, str] = memory_piece_count(alloc, plan, mi);
     if (R.is_err[u32, str](rc)) { ret R.err[bool, str](R.unwrap_err[u32, str](rc)); }
 
-    val mx:  u32 = mem_operand_index(mi)::u32;
+    val mx:  u32 = addr_operand_index(mi)::u32;
     val vx:  u32 = 1 - mx;
     val lw:  u8  = plan.lane_width;
     val nl:  u32 = wide_lane_count(plan, mi);
@@ -847,8 +872,7 @@ fun expand_memory(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
 
     var i: u32 = 0;
     for (i < nl) {
-        var mem: mir.MirOperand = base;
-        mem.imm = base.imm + (i * lw::u32)::i64;
+        val mem: mir.MirOperand = addr_displaced(?base, (i * lw::u32)::i64);
         var ops: [2]mir.MirOperand;
         var opcode: mir.MirOpcode = mir.MIR_LOAD;
         if (is_store) {
@@ -3817,6 +3841,67 @@ test "mach.lang.be.codegen.legalize:expands_wide_access_at_a_fixed_base" {
         if (b.instrs[i].operands[1].imm != i::i64)          { ret 1; }
         i = i + 1;
     }
+    ret 0;
+}
+
+# a wide access to a GLOBAL reaches its address through a SYM operand rather than a
+# MEM one, and decomposes into one native access per lane at successive addends on the
+# same symbol (#2867). the symbol is a fixed base exactly as a physical register is,
+# so nothing is staged
+test "mach.lang.be.codegen.legalize:expands_a_wide_access_at_a_symbol" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 1);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 1);
+    var ld: [2]mir.MirOperand;
+    ld[0] = mir.op_vreg(0); ld[1] = mir.op_sym(7, 0);
+    t_instr(?alloc, ?b, 0, mir.MIR_LOAD, ?ld[0], 2, 4);
+    f.blocks = ?b; f.block_count = 1;
+
+    var mach: Machine = t_mach(2, 2);
+    val r: R.Result[bool, str] = legalize_function(?alloc, ?mach, ?f);
+    if (R.is_err[bool, str](r)) { ret 1; }
+    if (b.instr_count != 2)     { ret 1; }
+
+    var i: u32 = 0;
+    for (i < 2) {
+        if (b.instrs[i].opcode != mir.MIR_LOAD)                { ret 1; }
+        if (b.instrs[i].width != 2)                            { ret 1; }
+        if (b.instrs[i].operands[0].vreg != 1 + i)             { ret 1; }
+        if (b.instrs[i].operands[1].kind != mir.MIR_OP_SYM)    { ret 1; }
+        if (b.instrs[i].operands[1].sym != 7)                  { ret 1; }
+        if (b.instrs[i].operands[1].sym_off != (i * 2)::i32)   { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# a wide load whose address is neither a MEM nor a SYM is REFUSED BY NAME, not walked
+# down the memory path with an address operand that is not there (#2867)
+#
+# The positive control is the test above: the same wide load, the same width, the same
+# destination, differing only in that its address operand is one this pass can name.
+# That one succeeds, so this refusal is the address shape being rejected rather than a
+# malformed function being rejected for some other reason.
+test "mach.lang.be.codegen.legalize:refuses_a_wide_access_with_no_address_operand" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 2);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 1);
+    var ld: [2]mir.MirOperand;
+    ld[0] = mir.op_vreg(0); ld[1] = mir.op_vreg(1);
+    t_instr(?alloc, ?b, 0, mir.MIR_LOAD, ?ld[0], 2, 4);
+    f.blocks = ?b; f.block_count = 1;
+
+    var mach: Machine = t_mach(2, 2);
+    val r: R.Result[bool, str] = legalize_function(?alloc, ?mach, ?f);
+    if (!R.is_err[bool, str](r)) { ret 1; }
     ret 0;
 }
 
