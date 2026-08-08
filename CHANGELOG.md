@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+#### A C `[step]` cross-builds for its leg instead of silently assuming the host toolchain targets it (#2741)
+`int/surface/narrow-stack-args` and `int/surface/c-variadic` shelled out to the bare host `cc` to build a probe object, which happens to target the leg on every CI runner (each builds natively) but not on a developer cross-building locally - `mach --target linux-arm64` on an x86-64 host still ran the host's x86-64 `cc`, silently linking an x86-64 object into an aarch64 image. That surfaced as `error: relocation 'plt32' to 'float_tail' overflows` on narrow-stack-args and a qemu `Illegal instruction` on c-variadic, neither of which names its actual cause.
+
+Both cases now build their probe object through `int/lib/cc.sh`, a general contract for any case with a C `[step]`: it uses the host's own `cc` when the host already targets the leg (preserving the point of these cases, which is to catch a *real* toolchain's ABI diverging from mach's model of it - Apple arm64's stack-argument rule, for one), and falls back to `clang -target <triple> -c` otherwise, since mach does the link itself and a cross-compiled object needs no sysroot or cross-linker to satisfy it. A leg cc.sh has no route for (no host match, and clang is missing) fails the step loudly, naming what's missing, rather than surfacing downstream as an opaque link error.
+
+This also lets both cases build for `linux-riscv64` for the first time, previously exempted only because the host-`cc` gap made it impossible; narrow-stack-args passes there cleanly. c-variadic's riscv64 leg stays exempted, but now for a real reason instead of a stale one: every variadic float/double argument comes back as `0`, a genuine mach ABI bug in riscv64's variadic lowering that this cross-build gap had been hiding coverage of (#2771).
+
+`int/run.sh` also now prints a `SKIP <case> [<target>] (exempt, see case.conf)` line for a case's `exempt:` legs, which previously left no trace in the run's output at all - a leg a case never applies to and a leg it was silently excluded from looked identical.
+
+`m`, the bootstrap output `mach build . -o m` (CONTRIBUTING.md's own instruction) produces, is now gitignored.
+
 ## [4.16.0] - 2026-08-08
 
 ### Added

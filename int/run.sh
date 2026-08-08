@@ -389,7 +389,15 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
     # (#2353) so the two never disagree about what a case.conf line means.
     read_case_conf "$dir"
     if ! in_list "$target" "$case_allow"; then continue; fi
-    if in_list "$target" "$case_exempt"; then continue; fi
+    if in_list "$target" "$case_exempt"; then
+        # named in the run accounting rather than vanishing silently (mach#2741):
+        # an exempted leg used to leave no trace at all, so a run this leg was
+        # never applicable to and a run it was quietly dropped from looked
+        # identical. the reason itself lives only in case.conf's comment, same as
+        # exempt always has - this just states that a reason exists and where.
+        echo "SKIP $case_id [$target] (exempt, see case.conf)"
+        continue
+    fi
 
     # the mach target to compile: the build-target if set, else the leg itself.
     build_target=${case_build_target:-$target}
