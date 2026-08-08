@@ -590,9 +590,9 @@ $if (!($mach.build.arch == $mach.arch.x86_64)) { $error("expected x86_64"); }
 ```
 
 The composition inherits `$if`'s condition rules, which is the point: the same
-conditions fold there as in any other gate, and the ones that do not — a type query
+conditions fold there as in any other gate, and the ones that do not (a type query
 over an unbound generic parameter, anything asked of a chain that also declares
-something — refuse with their own cause rather than through a second surface that
+something) refuse with their own cause rather than through a second surface that
 could describe them differently. A chain written this way declares nothing, so it is
 decided during type checking and can measure a type; see
 [comptime-control.md](comptime-control.md).

@@ -134,8 +134,8 @@ arms contain picks which.
   checking instead, where its gate may measure a type (`$size_of`, `$align_of`,
   `$length_of`), query one (`$is_record` and friends), or compare one.
 
-The question is answered from the **syntax**, over every arm — `$if`, every `$or`,
-and the final `$else`-style `$or {}` — before any gate is evaluated. One declaring
+The question is answered from the **syntax**, over every arm (`$if`, every `$or`,
+and the final `$else`-style `$or {}`) before any gate is evaluated. One declaring
 arm anywhere keeps the whole chain at the earlier time. Per-arm answers are not
 possible: which stage runs the gate would then depend on which arm the gate selects,
 and the stage that would have to know that is the one being chosen.
