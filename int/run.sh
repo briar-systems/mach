@@ -410,8 +410,8 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
     # leg ever added to its case.conf, would hold there too) and per-build-target for
     # structural producers (their fact is format-specific).
     case "$case_run" in
-        exec|relro-fault|panic-exit|debuginfo|varloc-fbreg|gdb-session) golden="$dir/expect.txt" ;;
-        *)                                                             golden="$dir/expect.$build_target.txt" ;;
+        exec|relro-fault|panic-exit|debuginfo|varloc-fbreg|symtab|gdb-session) golden="$dir/expect.txt" ;;
+        *)                                                                     golden="$dir/expect.$build_target.txt" ;;
     esac
 
     # once per case, not per profile: `dep pull` honors the lock left by the first
