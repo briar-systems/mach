@@ -38,6 +38,18 @@ A textured shader emits a **byte-identical module** across the migration: the sa
 
 ### Fixed
 
+#### A shader built at `-O0` and was refused at `-O2` (#2921)
+Three sequential array loops in one function built cleanly for `spirv` at `-O0` and at `-g`, and `-O2` refused them: `a loop whose exits do not reconverge on one block is not yet supported by the SPIR-V target`. `-O2` is what ships, so a shader that only compiles at `-O0` does not work, and a profile that reorders and simplifies must not turn an expressible function into an inexpressible one.
+
+Two defects, both raised by the same case, and they answer different questions.
+
+The **auto-vectorizer had no business running on a logical-addressing target**. It rewrites an element-wise loop into a runtime-guarded vector copy plus a scalar remainder, and both halves are byte-oriented: the alias guard compares the two ranges' END ADDRESSES, and the fast copy re-reads an element pointer as a packed vector. SPIR-V has neither -- its pointer names one object at exactly one pointee type -- so the rewrite produces IR the back end cannot express at all. The pass asked only `has_v128`, which spirv answers yes because it really does have vector types and vector operators. Having vector registers and addressing memory as bytes are two questions, and the pass now asks both: `flat_addressing` gates the transformation, so every machine target keeps its vectorization byte for byte and the logical one stays scalar.
+
+The **structurizer's loop-merge search was also too weak**, independently. What the versioner produces is a guard picking between two copies of one loop, both branching straight to the block after them. That flow is reducible and every loop in it has exactly one exit, so SPIR-V can express it: neither header dominates the shared block, but a block interposed on a loop's own exit edge is dominated by that header by construction, and the loop reconverges there while the shared block stays the selection's merge. The reconstruction already had that mechanism for a merge block another construct had claimed, and simply did not reach for it here. It refused instead, which is what the reported error was.
+
+The vectorizer's shape is the one the reconstruction met first, so fixing only the structurizer moves the refusal to the access chain rather than removing it, and fixing only the gate leaves a legal shape refused for the next pass that produces one. A gep whose whole index list is a leading `0` also stopped reporting itself as `an access chain of more than 8 levels`, which it never was.
+}
+
 #### A SPIR-V value is typed by what defines it, not by a MIR width (#2919, #2920)
 Two modules the compiler wrote while reporting success, and that only the external validator refused. A `for` loop whose counter is 8 or 16 bits allocated the counter as a 64-bit variable while its increment and its bound stayed narrow, so the comparison mixed bit widths. A `:~` between two 16-byte vector types declared an `OpTypeInt 128`, which SPIR-V has no form for, beside an `OpBitcast` that was itself typed as the vector it read rather than as the one it produces.
 
