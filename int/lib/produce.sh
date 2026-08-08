@@ -2723,8 +2723,14 @@ dis_case_objects() {
     tool=$(resolve_objdump) || {
         echo "int: $who: llvm-objdump not found (install the 'llvm' package)" >&2; return 2
     }
+    # riscv64 defines a `.Lpcrel_hi.N` label at every `auipc` that starts a psABI
+    # hi/lo pair (mach#2828), and objdump prints one as a `<name>:` line exactly like
+    # a function start. it is an address INSIDE a function, not a new one, so every
+    # scan below that attributes instructions to the enclosing symbol would otherwise
+    # split one function into a dozen. dropped here, once, rather than in each scan.
     find "$objdir" -name '*.o' | sort | while IFS= read -r o; do
-        "$tool" -d --no-show-raw-insn ${extra:+"$extra"} "$o"
+        "$tool" -d --no-show-raw-insn ${extra:+"$extra"} "$o" \
+            | grep -v '^[0-9a-f]\{1,\} <\.Lpcrel_hi\.[0-9]\{1,\}>:$'
     done
 }
 
@@ -2773,12 +2779,13 @@ produce_float_emit() {
 # that names nothing does the same. Neither can pass by accident.
 #
 # The two lists are not required to be EQUAL, and the golden is per-target because of
-# it: how many instructions spell one reference, and how many relocation records cover
-# them, are both the ISA's business. riscv64 is the case in point - `la sym` is an
-# auipc/addi pair carrying `%pcrel_hi` and `%pcrel_lo`, which is two of each, while
-# `call sym` is an auipc/jalr pair the printer names twice and a single
-# `R_RISCV_CALL_PLT` covers. Both are right; what the pairing catches is a name
-# appearing on one side and not the other.
+# it: how many instructions spell one reference, and how many relocation records NAME
+# it, are both the ISA's business. riscv64 is the case in point - `la sym` is an
+# auipc/addi pair the printer names twice, but only the auipc's `%pcrel_hi` names the
+# symbol: the `%pcrel_lo` names the LABEL at that auipc, which is the psABI spelling
+# (mach#2828), so one reference reaches `reloc` once. `call sym` is an auipc/jalr pair
+# the printer names twice and a single `R_RISCV_CALL_PLT` covers. All of these are
+# right; what the pairing catches is a name appearing on one side and not the other.
 #
 # The program's own answer is reported too: the asm loads and calls through those
 # symbols, so a reference that reached the wrong one is a wrong number as well as
