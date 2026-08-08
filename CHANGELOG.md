@@ -18,6 +18,19 @@ The two paths computed one fact in two places and agreed only by accident. The h
 
 ### Added
 
+#### A shader can bind and sample a texture (#2794)
+The GPU decorator set covered `#[input]`, `#[output]`, `#[builtin]`, `#[uniform]` and `#[storage]`, and none of them declares an image. A shader that reads a texture could not be written at all, which is the remaining blocker for porting boom's shaders off GLSL - every one of them samples a texture.
+
+`#[sampler(set, binding)]` binds an **image handle**, at the same descriptor addressing `#[uniform]` uses, so nothing new appears at the descriptor level and a host binds one the way it binds a block. A handle type is a **form** rather than a fixed list, on exactly the terms a vector spelling is: `[i|u] ("sampler" | "texture" | "image") <dim> ["ms"] ["array"] ["shadow"]`, plus a bare `sampler`. `sampler2d` is a combined sampled image; `texture2d` and `sampler` are the separately-bound halves; `1d`, `3d`, `cube`, `array`, and the `i` / `u` sampled scalars are each one row in that grammar and nothing else.
+
+The type carries every `OpTypeImage` operand rather than baking in a 2D combined-sampler assumption, which is what makes the awkward members cost a row apiece instead of a rewrite. The separately-bound form is the proof of it: a handle there is two descriptors and the sampled value is computed rather than loaded, and it needed no new machinery.
+
+Sampling is a `#[spirv_op(...)]` declaration, not a new language form, because a sample IS one SPIR-V instruction the way `sqrt` and `dot` are - `#[spirv_op("core", "OpImageSampleImplicitLod")] fun sample(s: sampler2d, uv: f32x2) f32x4;`. The decorator's existing contract (result type from the declared return, operands from the parameters in order) admits `OpSampledImage` unchanged too, whose operands are two *different* handle types.
+
+Several well-formed spellings are **read and refused by name**, so no member of the family is half-supported or silently miscompiled, and none can be claimed later by an unrelated declaration: `...shadow` (depth-comparison sampling, which needs a reference operand this cut has no form for), `...ms` (fetched per sample rather than sampled), `rect` / `buffer` / `subpass`, and `image...` (a read-write storage image). Each error names the member it refused. A handle behind a pointer, inside an array, in a local binding, wearing another interface role, or with no `#[sampler]` at all is refused with its own sentence.
+
+The observable is the emitted instruction stream, not the validator's verdict: an `OpTypeImage` whose `Dim` came out 2D where the source wrote `sampler3d`, whose `Arrayed` came out 0 where it wrote `array`, or whose `Sampled` came out 2 rather than 1 is a module `spirv-val` accepts describing a different image. `int/surface/spirv-sampled-image` names all seven operands of every image type, the descriptor each handle is bound at, and the handle *type* each sample instruction reads.
+
 #### A generic instance can be named as a value, so a generic can be stored, passed, returned, and addressed (#2342)
 Type arguments were spellable only in **callee** position. `ident[i64](x)` worked, but `ident[i64]` in a value slot was read as the index expression `ident[i64]` and died in resolve with `unresolved identifier \`i64\`` - accurate for the parse that actually happened, and misleading about the intent. So a generic function could not be put in a `fun(i64) i64` binding, passed as a callback, returned, or placed in a table, and `?ident[i64]` was not the address of anything. The only way to get a function value out of a generic was to wrap the call in a non-generic function and take *its* address.
 
@@ -113,6 +126,9 @@ This also lets both cases build for `linux-riscv64` for the first time, previous
 `int/run.sh` also now prints a `SKIP <case> [<target>] (exempt, see case.conf)` line for a case's `exempt:` legs, which previously left no trace in the run's output at all - a leg a case never applies to and a leg it was silently excluded from looked identical.
 
 `m`, the bootstrap output `mach build . -o m` (CONTRIBUTING.md's own instruction) produces, is now gitignored.
+
+#### A whole-variable load from a shader interface variable is typed by the variable (#2794)
+The SPIR-V emitter typed a loaded value from the move's byte width and register class rather than from the object it read. That agrees with the variable's own type for every shape that has a width, which is why it went unnoticed; it cannot express one that does not, and an opaque image handle has no width at all. Inferring one gave a sampled-image load an integer result type - an `OpLoad %ulong` from a sampled-image variable, which a validator rejects and the compiler was happy to write. The store side had always read the variable's type; the load side now does too.
 
 #### A comptime identifier names the declaration it resolves to, not the spelling (#2764)
 The comptime environment is keyed by **name**, and `comptime.eval_ident` looked a bare identifier up in it directly. Resolution identity was never consulted, so a binding was matched by what it is called rather than by which declaration it is. A block-local `val N` shadowing a module-level `val N = 9` therefore read back the **module** constant: `var xs: [N]i64;` under a runtime local `N` compiled as `[9]i64`, and the out-of-bounds diagnostic it later raised named a length the source never wrote.

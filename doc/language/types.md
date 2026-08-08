@@ -127,6 +127,54 @@ lane-wise operators and the comparison-to-mask rule are in
 vector operator is the `simd` profile lever ([manifest.md](manifest.md),
 [policy.md](policy.md)).
 
+## Image and sampler handles
+
+A shader reads a texture through a **handle**: a name for a descriptor the pipeline
+binds, not a value with storage. Like a vector, a handle type is a **form** rather
+than a fixed list:
+
+```
+[i|u] ("sampler" | "texture" | "image") <dim> ["ms"] ["array"] ["shadow"]
+"sampler"
+```
+
+with `<dim>` one of `1d`, `2d`, `3d`, `cube`, `rect`, `buffer`, `subpass`. The
+leading `i` / `u` picks the scalar texels are sampled as (`f32` by default); the
+suffixes read in GLSL's own order, so `isampler2DMSArray` is `isampler2dmsarray`.
+
+| spelling | what it is |
+|---|---|
+| `sampler2d` | a combined sampled image — one descriptor |
+| `texture2d` | an image with no sampler, bound separately |
+| `sampler` | a sampler with no image, bound separately |
+| `isampler2d` / `usampler2d` | integer-sampled images |
+| `sampler2darray` | array-layer image |
+| `sampler3d`, `sampler1d`, `samplercube`, `samplercubearray` | the other dimensionalities |
+
+Handles are **declared with `#[sampler(set, binding)]`** and nothing else — see
+[decorators.md](decorators.md) for how one is bound and sampled. A handle cannot
+sit behind a pointer, inside an array, or in a local binding: it names a
+descriptor rather than an object with an address, and SPIR-V forbids storing an
+image, sampler or sampled-image object at all.
+
+A handle spelling is recognized only in **type position**, and reserves the name
+against a `rec` / `uni` / `def`, on exactly the terms a vector spelling does.
+
+Several well-formed spellings are **read and refused by name**, so they cannot be
+half-supported and cannot be claimed later by an unrelated declaration. Each error
+names the member it refused:
+
+- `...shadow` — depth-comparison sampling, which needs `OpImageSampleDref*` and a
+  reference value.
+- `...ms` — a multisampled image is fetched per sample, not sampled.
+- `rect`, `buffer`, `subpass` — dimensionalities needing further capabilities and
+  a different read path.
+- `image...` — a read-write storage image, which carries an image format and is
+  read and written rather than sampled.
+
+`$size_of` a handle is the target's pointer size: it is a name for a resource,
+and a pointer is the shape every target already has for that.
+
 ## Pointer
 
 `*T` — pointer to a value of type `T`.
