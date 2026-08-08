@@ -65,6 +65,13 @@ The refusal itself is unchanged. Its diagnostic and `doc/language/decorators.md`
 
 ### Fixed
 
+#### The debug-info validator's warnings are now an observable, not a wall (#2755)
+`int/surface/debuginfo` read `llvm-dwarfdump --verify`'s exit status, which is zero on warnings. So "no diagnostics at all" and "no errors, plus a standing wall of about 200 warnings on every `-g` image" both rendered `dwarfdump_verify=clean`, and the golden recorded the second while claiming the first. That is how a validator stops validating: the next real warning arrives into a stream nobody reads.
+
+The case now reads the stream. It reports `errors`, `warnings` or `clean`, and lists each residual warning text with only the per-CU section offset elided, so a failure names itself in the diff. Exactly one class is filtered, with its reason written beside it, and every other warning of any class now fails the case where before none could.
+
+That filtered class is the duplicate itself, and it is deliberate. DWARF 5 §6.2.4 numbers file entries from 0 and §6.2.2 still gives the line state machine's `file` register an initial value of 1, and a single-file compile unit cannot satisfy both. binutils resolves it the way §6.2.2 says: measured on binutils 2.47, `addr2line` reports `mangled line number section (bad file number)` on every compile unit of a table whose only entry is slot 0, including clang's own `-gdwarf-5` output. gcc emits the duplicate and llvm-dwarfdump warns on gcc's output identically. `dwarf.mach` now records that, because the obvious repair trades a cosmetic warning from one validator for a real decode failure in every libbfd consumer. It is also validator-version dependent - llvm-dwarfdump 18 does not report it and 22 does - so leaving it in the observable would have made the golden a statement about the runner's llvm package rather than about the compiler.
+
 #### An unencodable float move produced a wrong move instead of a diagnostic (#2733)
 All three register machines answered a float-move width they do not implement by **substituting 8** and encoding anyway. `if (w != 4 && w != 8) { w = 8; }` sat in x86-64's `encode_fp_mov`, aarch64's `encode_fmov` and riscv64's `encode_fmov` - the same line in the same role on each - so a move the compiler could not encode became an 8-byte move that dropped everything above the low lane, with no error anywhere. A defensive fallback that produces **wrong output** is worse than no fallback: it converts "the compiler was asked something it cannot do" into "the program computes the wrong answer", which is the worst failure a back end has.
 

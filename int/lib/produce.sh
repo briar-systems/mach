@@ -2056,7 +2056,8 @@ elf_seg_identical() {
 # produce_debuginfo <runmode> <target> <nog_binary> <g_binary>
 # the binary-inspection producer for the debuginfo case kind (#2039): asserts, purely
 # host-side over the artifacts run.sh built with and without `-g`, that (1) the
-# standard structural validator accepts the whole `-g` image, (1b) a real consumer
+# standard structural validator accepts the whole `-g` image and which warning classes
+# it reports while doing so, (1b) a real consumer
 # (addr2line, i.e. libbfd) decodes the line table without a diagnostic and resolves the
 # entry point to a name, (2) `-g` is loadable-byte additive, and (3) duplicate generic,
 # comptime-value, and pack instances retain
@@ -2080,10 +2081,41 @@ produce_debuginfo() {
         echo "int: debuginfo: addr2line not found (install 'binutils')" >&2; return 2
     }
 
-    if "$dd_tool" --verify "$g" >/dev/null 2>&1; then
-        echo "dwarfdump_verify=clean"
-    else
+    # --verify EXITS ZERO ON WARNINGS (#2755), so reading only its status collapsed "no
+    # diagnostics at all" onto "no errors, and a wall of warnings". That is how a
+    # validator stops validating: the next real warning lands in a stream nobody reads.
+    # The observable is therefore the stream. `errors` is reported first because an
+    # error subsumes a warning, and each residual warning TEXT is listed - sorted,
+    # deduplicated, with the per-CU `[0x...]` offset elided - so a failure names itself
+    # in the diff instead of reading `warnings`.
+    #
+    # ONE warning class is expected and filtered, with its reason: DWARF 5 §6.2.4
+    # numbers file entries from 0 while §6.2.2 still gives the line state machine's
+    # `file` register an initial value of 1, and binutils resolves that in favour of
+    # §6.2.2. So a single-file CU must declare its source at slot 0 AND at slot 1 or
+    # libbfd rejects the whole section ("mangled line number section (bad file number)",
+    # #2582) - measured on binutils 2.47 against clang's own single-entry `-gdwarf-5`
+    # output as well as ours. gcc emits the duplicate and llvm-dwarfdump warns on gcc's
+    # output identically. It is also validator-version dependent: llvm-dwarfdump 18 does
+    # not report it and 22 does, so leaving it in the stream would make the golden a
+    # statement about the runner's llvm package. Every OTHER warning, of any class,
+    # still fails the case.
+    dd_expected='\.debug_line\[.*\]\.prologue\.file_names\[1\] is a duplicate of file_names\[0\]'
+    dd_out=$("$dd_tool" --verify "$g" 2>&1)
+    # `|| true` because an empty result is the expected outcome of a filter rather than
+    # a failure, and run.sh runs under `set -e`.
+    dd_warn=$(printf '%s\n' "$dd_out" | sed -n 's/^warning: //p' \
+        | { grep -v -E "$dd_expected" || true; } \
+        | sed -e 's/\[0x[0-9a-fA-F]*\]/[]/g' | sort -u)
+    if printf '%s\n' "$dd_out" | grep -q '^error:'; then
         echo "dwarfdump_verify=errors"
+    elif [ -n "$dd_warn" ]; then
+        echo "dwarfdump_verify=warnings"
+    else
+        echo "dwarfdump_verify=clean"
+    fi
+    if [ -n "$dd_warn" ]; then
+        printf '%s\n' "$dd_warn" | while IFS= read -r w; do echo "dwarfdump_warning=$w"; done
     fi
 
     # CONSUMER-SIDE DECODE (#2582). --verify above checks structural and reference
