@@ -87,10 +87,16 @@ $mach.os.freestanding           # no OS / bare metal
 $mach.arch.x86_64
 $mach.arch.aarch64
 $mach.arch.riscv64
+$mach.arch.riscv32
 $mach.abi.sysv
 $mach.abi.win64
 $mach.abi.aapcs64
 $mach.abi.lp64
+$mach.abi.lp64f
+$mach.abi.lp64d
+$mach.abi.ilp32
+$mach.abi.ilp32f
+$mach.abi.ilp32d
 $mach.mode.debug
 $mach.mode.release
 ```

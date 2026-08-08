@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### RV32 is a target (#2778)
+mach compiles for 32-bit RISC-V. `isa = "riscv32"` with `abi = "ilp32"`, `"ilp32f"` or `"ilp32d"` resolves a full machine description, and `$mach.arch.riscv32` and the three `$mach.abi.ilp32*` tags exist so a body can be guarded for it.
+
+Nothing about the RISC-V backend was duplicated to get there. One `build_riscv` fills either arch's vtable, register machine, relocation seam and model from the register width it is handed; the register numbering, the psABI roles, the selection pack, the encoder, the printer and the attribute derivation are shared unchanged. On the convention side the three ilp32 members differ from their lp64 twins in exactly one declared fact, `xlen_bits`, and a test builds each pair and compares every other field rather than asserting that in prose.
+
+The width facts are the machine's and are read as such. `max_alu_width` is 4 on rv32, which puts an `i64` above the ALU and sends it through the same lane-splitting `legalize` pass that serves the 6502's 8-bit one. FLEN stays 64 because rv32gc has the D extension, so a float register is twice the width of an integer one - the pair that a single "word size" gets wrong, and the one the frame layout now reads as two separate strides.
+
+**What rv32 does not do yet, and says so.** The ELF writer stamps ELFCLASS32 from the pointer width while emitting Elf64 structures, so `of.elf` deliberately does not cover this arch and an rv32 linux tuple is refused at resolve time rather than producing a file whose class byte contradicts its layout (#2861). rv32 composes with the `raw` flat image today. Converting between a float and a 64-bit integer has no RV32 instruction and no lowering, so both the encoder and `legalize` refuse it by name with the issue number rather than emitting an RV64 opcode the hardware would trap on (#2860).
+
 #### A shader can use an interface variable declared in another module (#2843)
 #2823 let a shader call a function defined in a shared module, but the shader could not use an **interface variable** one declared. A library that owned anything beyond pure math had nowhere to put its descriptor set: a drawn-in body naming its own module's `#[uniform(...)]` found nothing, and the access was refused as computed addressing.
 

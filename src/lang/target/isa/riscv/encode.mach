@@ -2749,6 +2749,16 @@ fun encode_fp_conv(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirIns
             gp = SCRATCH;
             src_word = true;
         }
+        # THE `L` SELECTORS ARE RV64-ONLY (#2860). `fcvt.s.l` / `fcvt.d.l` and their
+        # unsigned twins name a 64-bit GP operand, and RV32 has no register that wide,
+        # so the form does not exist there. `be.codegen.legalize` splits a wide INTEGER
+        # into native lanes but has no arm for a conversion - a conversion is one
+        # rounding of the whole value, not two independent ones - so a 64-bit source
+        # really can reach here on rv32. Refused by name rather than encoded as an
+        # instruction the hardware will not decode.
+        if (!src_word && xlen(st) == 4) {
+            ret R.err[bool, str]("encode: rv32 has no conversion from a 64-bit integer to a float (fcvt.s.l / fcvt.d.l are RV64-only); see briar-systems/mach#2860");
+        }
         val dbl: bool = dw == 8;
         var f7: u32 = F7_FCVT_I2F;       # single dest (fcvt.s.*)
         if (dbl) { f7 = F7_FCVT_I2F | 1; }  # double dest (fcvt.d.*)
@@ -2779,6 +2789,11 @@ fun encode_fp_conv(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirIns
     val rdr: R.Result[i32, str] = req_gpr(?mi.operands[0]);
     if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
     val rd: u32 = R.unwrap_ok[i32, str](rdr)::u32;
+    # the float-to-integer half of the same RV64-only pair (#2860): `fcvt.l.s` /
+    # `fcvt.lu.d` write a 64-bit GP register, which rv32 does not have
+    if (dw > 4 && xlen(st) == 4) {
+        ret R.err[bool, str]("encode: rv32 has no conversion from a float to a 64-bit integer (fcvt.l.s / fcvt.l.d are RV64-only); see briar-systems/mach#2860");
+    }
     var f7: u32 = F7_FCVT_F2I;            # single source (fcvt.*.s)
     if (sw == 8) { f7 = F7_FCVT_F2I | 1; }  # double source (fcvt.*.d)
     var rs2: u32 = FCVT_L;                # 64-bit signed dest
@@ -2843,6 +2858,16 @@ fun encode_fmov(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
             val rn: u32 = R.unwrap_ok[i32, str](rnr)::u32;
             emit_r(st, OPC_OP_FP, F3_FLE, f7, R.unwrap_ok[i32, str](rdr)::u32, rn, rn);
             ret R.ok[bool, str](true);
+        }
+        # A CROSS-BANK MOVE IS AS WIDE AS BOTH BANKS (#2860). `fmv.d.x` / `fmv.x.d`
+        # move all 64 bits between an f register and a GP one, which needs the GP
+        # register to be 64 bits - so on rv32, where FLEN is 8 and XLEN is 4, the
+        # double-width pair simply has no encoding. `fmv.w.x` / `fmv.x.w` at width 4
+        # exist on both machines and are unaffected. A bitcast between `f64` and `i64`
+        # on rv32 goes through memory, which is what the psABI's own soft-float
+        # sequences do; wiring that lowering is #2860's, not this refusal's.
+        if ((dfp || sfp) && w == 8 && xlen(st) == 4) {
+            ret R.err[bool, str]("encode: rv32 has no cross-bank move for a 64-bit value (fmv.d.x / fmv.x.d are RV64-only); see briar-systems/mach#2860");
         }
         if (dfp) {
             # GP -> FP bit reinterpret (fmv.w.x / fmv.d.x).
@@ -4878,11 +4903,25 @@ fun rv_is_sp(op: *iasm.Operand) bool {
     ret op.kind == iasm.AOP_REG && op.reg == RSP::i32;
 }
 
-# the RV64 inline-assembly grammar
-fun rv_grammar() iasm.Grammar {
+# the inline-asm tag a RISC-V machine of this register width answers to
+#
+# The tag names the TARGET a block was written for, and `asm riscv64 { ... }` inside a
+# body compiled for rv32 is a statement that is not true. So the tag follows the
+# machine: an rv32 target admits `asm riscv32` and refuses `asm riscv64`, which is what
+# makes a comptime arch guard around two blocks select correctly (#2778).
+# ---
+# xl:  XLEN in bytes for the target machine
+# ret: the tag this machine's inline-asm blocks must carry
+fun rv_isa_tag(xl: u8) str {
+    if (xl == 4) { ret "riscv32"; }
+    ret "riscv64";
+}
+
+# the RISC-V inline-assembly grammar, tagged for one machine
+fun rv_grammar_tagged(tag: str) iasm.Grammar {
     var g: iasm.Grammar;
-    g.isa        = "riscv64";
-    g.unknown    = "unknown riscv64 inline-asm instruction '";
+    g.isa        = tag;
+    g.unknown    = "unknown riscv inline-asm instruction '";
     g.rows       = ?RV_MNEMONICS[0];
     g.row_count  = RV_MNEMONIC_COUNT;
     # riscv64's `.word` is one instruction word, as GNU as spells it here (#2479).
@@ -4906,6 +4945,22 @@ fun rv_grammar() iasm.Grammar {
     ret g;
 }
 
+# the grammar for the machine this encode targets
+fun rv_grammar(st: *encode.EncodeState) iasm.Grammar {
+    ret rv_grammar_tagged(rv_isa_tag(xlen(st)));
+}
+
+# the grammar for a path that ANALYSES a body without encoding it
+#
+# `asm_clobbers` and `asm_returns` are vtable hooks taking only the body text - they
+# have no target and cannot know XLEN. They also never read `g.isa`: the tag is
+# compared once, in `iasm.encode_block`, which does have the machine. So these paths
+# take the family's grammar under a tag that is never consulted, and the width-bearing
+# check stays in the one place that can make it.
+fun rv_grammar_analysis() iasm.Grammar {
+    ret rv_grammar_tagged("riscv");
+}
+
 # true when a riscv64 statement cannot fall through to the next (#2791)
 #
 # `ebreak` raises a breakpoint exception, which with no debugger attached terminates
@@ -4918,7 +4973,7 @@ fun rv_no_fall(item: *iasm.Item) bool {
 
 # whether control can fall out of a riscv64 inline-asm body (#2791)
 pub fun asm_returns(body: str) bool {
-    var g: iasm.Grammar = rv_grammar();
+    var g: iasm.Grammar = rv_grammar_analysis();
     ret iasm.returns(?g, body);
 }
 
@@ -4979,7 +5034,7 @@ fun asm_fp_reg_index(tok: str) i32 {
 # gp_out: out - the GP registers the body writes (bit n = register n)
 # fp_out: out - the FP registers the body writes (bit n = register n)
 pub fun asm_clobbers(body: str, gp_out: *u32, fp_out: *u32) {
-    var g: iasm.Grammar = rv_grammar();
+    var g: iasm.Grammar = rv_grammar_analysis();
     iasm.clobbers(?g, body, gp_out, fp_out);
 }
 
@@ -4989,7 +5044,7 @@ pub fun asm_clobbers(body: str, gp_out: *u32, fp_out: *u32) {
 # the driver does the rest, so `{name}` resolution, numeric local labels, byte
 # accounting and the located diagnostic are the same code every target runs.
 fun encode_asm_block_riscv64(st: *encode.EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *mir.MirInstr) R.Result[bool, str] {
-    var g: iasm.Grammar = rv_grammar();
+    var g: iasm.Grammar = rv_grammar(st);
     ret iasm.encode_block(st, ?g, f, mi);
 }
 
@@ -4999,7 +5054,7 @@ fun encode_asm_block_riscv64(st: *encode.EncodeState, f: *mir.MirFunction, fn_ba
 # block path does, so a byte-exact golden is a fact about the shipping parser rather
 # than about a test-only path beside it.
 fun rv_asm_text(st: *encode.EncodeState, f: *mir.MirFunction, l: *iasm.Labels, text: str) R.Result[bool, str] {
-    var g: iasm.Grammar = rv_grammar();
+    var g: iasm.Grammar = rv_grammar(st);
     var c: iasm.Cursor;
     iasm.cursor_init(?c, ?g, text, st.alloc, st.interner, f, nil);
     ret iasm.run(st, ?g, ?c, l);
@@ -5890,16 +5945,18 @@ test "mach.lang.target.isa.riscv.encode:asm_clobbers_classification" {
 
 # a page-backed EncodeState with a live interner, for exercising the inline-asm
 # assembler (which interns symbol names and resolves `{name}` bindings)
+#
+# IT GOES THROUGH `state_blank` RATHER THAN SETTING FIELDS BY HAND, and that is the
+# fix for a real hole rather than a tidy-up. This helper used to assign the seven
+# fields it happened to need, which meant #2862 could make the machine a required
+# CONSTRUCTOR ARGUMENT and this state still reached the encoder without one - a nil
+# model that read as XLEN 0 the moment anything asked. An arity check only binds the
+# callers that call the thing.
 fun tasm(st: *encode.EncodeState, alloc: *A.Allocator, interner: *intern.Interner) {
     page.make(alloc);
     @interner = intern.init(alloc);
-    st.alloc       = alloc;
-    st.buf         = encode.buf_init(alloc);
-    st.interner    = interner;
-    st.syms        = nil; st.sym_count   = 0; st.sym_cap   = 0;
-    st.relocs      = nil; st.reloc_count = 0; st.reloc_cap = 0;
-    st.fixups      = nil; st.fixup_count = 0; st.fixup_cap = 0;
-    st.blocks      = nil; st.block_count = 0; st.block_cap = 0;
+    encode.state_blank(st, alloc, rv64_machine());
+    st.interner = interner;
 }
 
 # every core inline-asm form the std `_start` / syscall path uses, byte-exact against
@@ -6130,7 +6187,7 @@ test "mach.lang.target.isa.riscv.encode:inline_asm_data_directive_refusals" {
     # a directive is not a mnemonic: `.half` is in no table and is refused by name.
     val r4: R.Result[bool, str] = rv_asm_text(?st, ?f, ?labels, ".half 0x1234");
     if (!R.is_err[bool, str](r4))                                                                       { bad = 1; }
-    or { if (!str_contains(R.unwrap_err[bool, str](r4), "unknown riscv64 inline-asm instruction")) { bad = 1; } }
+    or { if (!str_contains(R.unwrap_err[bool, str](r4), "unknown riscv inline-asm instruction")) { bad = 1; } }
 
     iasm.labels_dnit(?labels);
     encode.buf_dnit(?st.buf);
@@ -6372,7 +6429,7 @@ test "mach.lang.target.isa.riscv.encode:inline_asm_symbol_relocs" {
     # an unknown mnemonic is a hard error, not silent bytes.
     val ur: R.Result[bool, str] = rv_asm_text(?st, ?f, ?labels, "frobnicate a0, a1");
     if (!R.is_err[bool, str](ur)) { bad = 1; }
-    or { if (!str_contains(R.unwrap_err[bool, str](ur), "unknown riscv64 inline-asm instruction")) { bad = 1; } }
+    or { if (!str_contains(R.unwrap_err[bool, str](ur), "unknown riscv inline-asm instruction")) { bad = 1; } }
 
     iasm.labels_dnit(?labels);
     encode.buf_dnit(?st.buf);
@@ -6476,7 +6533,7 @@ test "mach.lang.target.isa.riscv.encode:inline_asm_atomics" {
     # silently swallowed by the atomic dispatch.
     val ur: R.Result[bool, str] = rv_asm_text(?st, ?f, ?labels, "amobogus.q a0, a2, (a1)");
     if (!R.is_err[bool, str](ur)) { bad = 1; }
-    or { if (!str_contains(R.unwrap_err[bool, str](ur), "unknown riscv64 inline-asm instruction")) { bad = 1; } }
+    or { if (!str_contains(R.unwrap_err[bool, str](ur), "unknown riscv inline-asm instruction")) { bad = 1; } }
 
     # an atomic address is a memory position, so the parse accepts an unresolved
     # `{name}` there - and the shared driver refuses it before the encoder reads a
@@ -7732,7 +7789,7 @@ test "mach.lang.target.isa.riscv.encode.asm_ct_class:m_extension_is_variable_lat
 # identical checks over their own instruction streams.
 pub fun asm_ct_scan(body: str, secret_names: *str, n_secret: u32,
                     trust_mul: bool, trust_shift: bool, alloc: *A.Allocator) R.Result[bool, str] {
-    var g: iasm.Grammar = rv_grammar();
+    var g: iasm.Grammar = rv_grammar_analysis();
     ret iasm.ct_scan(?g, body, secret_names, n_secret, trust_mul, trust_shift);
 }
 
