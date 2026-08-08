@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### `--pie` and dynamic linking on a loaderless OS are refused by name (#2898)
+`mach build --pie` on a freestanding ELF target failed with `elf: PIE program headers exceed the one-page header reservation (too many load segments)`. That was wrong in both clauses. There were four load segments, not too many, and the reservation was not a page: freestanding declares `page_size = 1` because bare metal has no paging, so the check refused whatever the image contained. On riscv32 a third answer arrived first, the ELF32 dynamic-image message. None of the three named the reason.
+
+The reason is one sentence. A position-independent executable exists to be relocated by a program loader when it maps the image, a dynamically-linked one to have its imports resolved by one, and a shared library to be loaded into something else. `os = "freestanding"` has no loader at all, so each of those is a category mistake in the request rather than a layout that did not fit, and someone passing `--pie` to a bare-metal build should be told which mistake they made rather than shown a segment count:
+
+```
+error: link: a position-independent executable needs a loader to relocate it, and os = "freestanding" has none
+error: link: a dynamically-linked executable needs a loader to resolve it, and os = "freestanding" has none
+error: link: a shared library needs a loader to map it, and os = "freestanding" has none
+```
+
+The refusal reads `os.OsVTable.mapped_by_loader` (#2895) in the linker, at the one line that picks the writer family, so the fact stays in one place and any future no-loader OS inherits it without an object-format writer being touched. It also settles the underflow #2895 left standing: `header_segment_vaddr` frames the header block a page below segment 0, which at a base address of 0 wraps to the top of the address space, and the PIE and dynamic ELF writers still computed it unconditionally. They were kept off it only by the reservation check happening to fail first. With the request refused before a writer is chosen, neither writer is reachable on a loaderless target at all, so the precondition holds by construction rather than by arithmetic accident.
+
+Every linux, darwin and windows image is unchanged byte for byte, `--pie` included, as are freestanding `of = "elf"` and `of = "raw"` static images.
+
 #### A freestanding target can select `of = "elf"` and link, on every architecture (#2895)
 `os = "freestanding"` declares `page_size = 1`, and that is deliberate: bare metal has no paging, so segments carry no alignment obligation and 1 packs them tightly in a flat image. The ELF writer read that length as the size of the one-page reservation the ELF header and the program-header table have to fit inside, so the test was `64 + n*56 <= 1` and every freestanding ELF image was refused no matter how few segments it had. The objects were written correctly; only the link step failed, on x86_64, aarch64, riscv64 and riscv32 alike.
 
@@ -17,6 +32,14 @@ Behind the refusal sat a second fault that the refusal was hiding. `header_segme
 Both come from applying a loader construct to a target with no loader. The leading `PT_LOAD` covering the header block exists so a **program loader** can read the program headers back out of the mapped image - `PT_PHDR`, PIE self-relocation, dynamic linking. A bare-metal image has none: the reset vector enters at the entry point and nothing parses a header at run time. So a loaderless image now emits no header segment at all, and the header block stays file metadata that is never mapped. That is also the only shape available at base address 0, where there is nothing below segment 0 to map it in.
 
 The gate is a fact the OS states about itself - `os.OsVTable.mapped_by_loader`, carried to the writer through `of.ImageOptions` - and deliberately not `page_size == 1` read as a sentinel. A page size is a length in bytes and whether an image is loader-mapped is a property of the platform; spelling one as the other is the same unit confusion that produced the bug. Every linux, darwin and windows image is unchanged, byte for byte, as is `os = "freestanding"` with `of = "raw"`.
+#### A cast that converts nothing emits nothing (#2881)
+`lower_cast` chooses a conversion from the source and target pair and fell through to a bitcast whenever the two shared a width, so a cast whose operand already had the destination type emitted a reinterpretation of a type as itself. In SPIR-V that surfaced as `OpBitcast %ulong %ulong_2`, an instruction with no effect, which is how it was found.
+
+It was never only cosmetic. An identity bitcast is an opaque SSA definition, so the value behind it stops being a constant: `~(0::usize) / 0xFF` in `std.memory.raw_fill` - the byte-splat every `raw_fill` performs - lowered to a runtime `div` on every target, because `0::usize` on a literal already typed `usize` put a bitcast between the constant and the fold. Seventy such divisions disappear from the compiler's own image.
+
+The fold is keyed on the two IR types being EQUAL rather than on their widths matching, which is the distinction that makes it safe: a same-width cast that genuinely reinterprets - an integer and a float, where the bitcast is what carries the general/float register-bank crossing to the backend - has two different IR types and still emits. It sits in the lowerer's conversion selection rather than in `builder.emit_bitcast`, because choosing no instruction is a selection decision and the builder's callers, including the IR verifier's own width test, are entitled to emit exactly what they ask for.
+
+Secrecy is unaffected. `OP_BITCAST` is classified a secret move, so an identity bitcast was a link in the taint chain the `#[oblivious]`-required check reads, but sema forbids `::` and `:~` from adding or dropping `^`, so a cast and its operand always agree on secrecy and the operand's own definition is already stamped. A secret compute reached through an identity cast is still required to declare `#[oblivious]`.
 
 #### An RV64-only mnemonic in an `asm riscv32` body is refused rather than assembled (#2864)
 `ld`, `sd`, `addw` and the rest of the `*W` group do not exist at XLEN 32, and an `asm riscv32` body naming one assembled it anyway. The image carried an instruction the hardware does not implement, so the mistake surfaced as an illegal-instruction trap at run time instead of a diagnostic at build time - a wrong answer through a green build, which is the failure mode this target class exists to catch.
@@ -62,6 +85,14 @@ mos6502, the other target that legalizes to a narrower ALU, is unaffected: an `i
 
 ### Added
 
+#### A declaration-scope `$if` that declares nothing can ask about a type (#2876)
+`$if ($size_of(MeshUniforms) != 64) { $error("MeshUniforms must be 64 bytes"); }` at module scope was rejected: the gate was folded while names were being resolved, and no type has a layout yet at that point. The layout check people actually want to write - a wire format, a uniform block, two records that share a slot - had nowhere to live except a runtime test that only fires if someone runs the suite.
+
+A declaration-scope `$if` now runs at one of two times, and what its arms contain picks which. A chain some arm of which **declares something** is decided while names are resolved, because what it decides is which declarations exist, and every later stage reads that set - a genuinely circular question to ask a type about, since the type universe is built from the declarations the gate is choosing. A chain no arm of which declares anything contributes no name and no type whichever arm wins, so nothing depends on deciding it early: it is decided during type checking, where its gate measures a type, queries one, or compares one. The measurement runs through the same path a function-body gate uses, so a size measured in one position and the same size measured in another cannot disagree.
+
+Which time applies is decided **syntactically, over every arm** - `$if`, every `$or`, and a trailing `$or {}` - before any gate is evaluated. One declaring arm anywhere keeps the whole chain at the earlier time. A per-arm rule would make the stage that runs the gate depend on which arm the gate selects, which is not knowable at the stage that would have to choose. Because a `use` is a declaration, conditional imports - by far the commonest declaration-scope `$if` - are untouched, as is the refusal a declaring chain gives a type question, now naming the arm that declares as the reason.
+
+The cost is stated rather than left to be discovered: `$if` runs at one of two times depending on its contents, written into `doc/language/comptime-control.md` and onto the deferral itself. The one visible consequence is ordering - a reached `$error` under a deferred chain is reported during type checking, so an unrelated resolution error in the same module is now reported before it rather than after.
 #### riscv32 converts between a 64-bit integer and a float, open-coded (#2860)
 RV32 has no instruction for it. `fcvt.d.l`, `fcvt.lu.d`, `fcvt.s.l` and the rest of the family name a 64-bit GP operand through their `L` selector, and no RV32 register is that wide, so `i64 -> f64`, `f64 -> u64` and their six siblings had no encoding and were refused by name. `be.codegen.legalize` could not supply one either: it splits a wide integer into native lanes and threads carries between them, and a conversion is a **single rounding of the combined value**, not two lane conversions recombined afterwards, so the model the pass is built on does not apply to it.
 
@@ -97,6 +128,19 @@ Resolve reaches the position through a mechanism that was already there: `bind_c
 `a layout intrinsic has no value in this position: it measures a type, which only a type position resolves` was true of every position and is now true of one. A **declaration-scope** `$if` still cannot measure, because it selects which declarations exist and that is decided before any type is laid out, so it says that instead and points at the position that does work. `$offset_of` is named apart, since it is unavailable for a different reason - a field offset is decided at lowering - and a message about type checking would be a stale explanation the moment the resolver exists.
 
 Two limits are filed rather than left implicit: `$length_of` still does not fold in a gate (#2875), and no declaration-scope gate can see a type at all, which is shared with type queries and comparisons (#2876).
+
+### Changed
+
+#### A target now owns the operations it defines (#2888)
+The compiler knew what a SPIR-V instruction was. `src/lang/spirvop.mach` sat outside the target holding 41 hand-written string comparisons that mapped an instruction name to a number, and the front end read it directly. Adding an instruction meant editing the compiler, so a shader library could not add one at all.
+
+The table now hangs off the ISA vtable and the target fills it. It reaches the front end as data on the comptime context beside `pointer_width`, for the reason stated there: it is a target machine fact the frontend needs, and the frontend has no target. So `fe` names no back end, and unlike before it holds no SPIR-V numbers of its own. `src/lang/spirvop.mach` is gone, and the IR carries the set tag and opcode under target-neutral names.
+
+An instruction's arity is now checked, which nothing did before. The decorator's contract is that operands come from the parameters in order, so a declaration whose parameter list is the wrong length assembled the instruction with the wrong operand count. The family looks uniform and is not: `Reflect` takes two operands where `Refract` takes three, and `FMin` two where `FClamp` takes three.
+
+Emitted output is unchanged. Every machine target is byte-identical, 224 objects each across x86-64, arm64 and riscv64, and the SPIR-V fixtures emit the same bytes.
+
+This is the first piece of #2888. Type constructors, the `#[handle]` and `#[op]` declarations, and the bodyless `def` are not here.
 
 ### Fixed
 
