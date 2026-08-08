@@ -68,8 +68,30 @@ extra=
 case "$MACH_TARGET_OS-$MACH_TARGET_ISA" in
     linux-x86_64)    triple=x86_64-linux-gnu ;;
     linux-aarch64)   triple=aarch64-linux-gnu ;;
-    # riscv64 needs three flags to keep clang's output inside what mach's ELF
-    # reader consumes, none of which lose anything these int-case probes need:
+    # riscv64 needs five flags to keep clang's output inside what mach's ELF
+    # reader consumes and matching the ABI mach's own riscv64 backend implements,
+    # none of which lose anything these int-case probes need:
+    #   -march=rv64gc -mabi=lp64d     PINS the architecture profile AND the hard-
+    #                                  float calling convention mach's lp64.mach
+    #                                  implements (float/double args in the fa
+    #                                  registers). the bare `riscv64-linux-gnu`
+    #                                  triple's DEFAULT for both is a clang-version /
+    #                                  packaging fact, not a stable one: -mabi=lp64d
+    #                                  alone (the first attempt here) still failed in
+    #                                  CI, on an older clang (18) whose default
+    #                                  -march for the bare triple does not carry the
+    #                                  D extension, so -mabi=lp64d silently produced
+    #                                  a soft-float-shaped object rather than an
+    #                                  error - the SAME toolchain-default hazard as
+    #                                  the original -mabi gap, one knob over, found
+    #                                  the same way: passed on this developer host's
+    #                                  newer clang (whose default -march already
+    #                                  carries +d) and failed in CI (mach#2771's own
+    #                                  first CI run after that PR was already open -
+    #                                  narrow-stack-args's variadic-free floats still
+    #                                  read back as flat zero). pinning both removes
+    #                                  the toolchain dependence outright rather than
+    #                                  hoping every clang defaults the same way.
     #   -mno-relax                    clang's default codegen emits R_RISCV_RELAX
     #                                  (type 51) hints for the linker's optional
     #                                  relaxation pass; mach has no such pass and
@@ -85,7 +107,7 @@ case "$MACH_TARGET_OS-$MACH_TARGET_ISA" in
     # relocation arithmetic it will never otherwise need (mach#2741).
     linux-riscv64)
         triple=riscv64-linux-gnu
-        extra="-mno-relax -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-jump-tables"
+        extra="-march=rv64gc -mabi=lp64d -mno-relax -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-jump-tables"
         ;;
     windows-x86_64)  triple=x86_64-pc-windows-msvc ;;
     darwin-x86_64)   triple=x86_64-apple-darwin ;;
@@ -104,4 +126,36 @@ fi
 # $extra is deliberately unquoted: it is always either empty or a fixed set of
 # single-word flags built above, never user input, so word-splitting it here is
 # the intended expansion, not a quoting bug.
-exec clang -target "$triple" $extra "$@"
+clang -target "$triple" $extra "$@" || exit $?
+
+# the -mabi/-march pin above is a REQUEST, and a toolchain that does not honour it
+# fails silently in the direction that looks like a mach bug: a soft-float probe
+# linked against mach's hard-float code reads every float argument back as zero,
+# which is indistinguishable from a broken classifier. that exact confusion cost
+# real time on mach#2771 twice, once per knob. so verify the produced object
+# rather than trusting the flag, and name the toolchain when it disagrees.
+#
+# riscv64 records the float ABI in the ELF header's e_flags (offset 0x30, 4 bytes
+# LE): mask 0x6 is 0 soft, 2 single, 4 double. mach's lp64.mach implements lp64d,
+# so anything but 4 is a mismatch this suite cannot paper over.
+if [ "$MACH_TARGET_OS-$MACH_TARGET_ISA" = "linux-riscv64" ]; then
+    out=
+    prev=
+    for arg in "$@"; do
+        [ "$prev" = "-o" ] && out=$arg
+        prev=$arg
+    done
+    if [ -n "$out" ] && [ -f "$out" ] && [ "$(head -c 4 "$out" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then
+        flags=$(od -An -tu4 -j 48 -N 4 "$out" | tr -d ' \n')
+        abi=$((flags & 6))
+        if [ "$abi" != "4" ]; then
+            case "$abi" in
+                0) got="soft-float (lp64)" ;;
+                2) got="single-float (lp64f)" ;;
+                *) got="unknown ($abi)" ;;
+            esac
+            echo "cc.sh: $(clang --version | head -1) produced a $got object for '$out' despite -mabi=lp64d -march=rv64gc; mach's riscv64 backend implements lp64d, so every float argument across this boundary would read back as zero. pin a toolchain that honours the flags rather than treating the resulting zeros as a mach defect (mach#2771, mach#2777)" >&2
+            exit 1
+        fi
+    fi
+fi
