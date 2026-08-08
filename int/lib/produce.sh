@@ -2445,21 +2445,21 @@ produce_const_pool() {
 # const_pool_scan — read a `-d -r` disassembly on stdin and print the pool observable
 const_pool_scan() {
     awk '
-    function demangle(s,   i, len, c, out) {
-        if (substr(s, 1, 2) != "_M") { return s }
-        i = 3
-        out = ""
-        while (i <= length(s)) {
-            c = substr(s, i, 1)
-            if (c == "N") { i++; continue }
-            if (c !~ /[0-9]/) { return s }
-            len = 0
-            while (i <= length(s) && substr(s, i, 1) ~ /[0-9]/) { len = len * 10 + substr(s, i, 1); i++ }
-            out = substr(s, i, len)
-            i += len
-        }
-        if (out == "") { return s }
-        return out
+    # strip a mangled name down to its bare identifier plus any `$` argument
+    # list: `std.types.option.unwrap$ptr` -> `unwrap$ptr`. an unmangled symbol
+    # (an `ext` / `#[symbol]` literal, a `.L` local) has no module path to strip
+    # and comes back untouched, which is what keeps `_start` and `main` readable.
+    function demangle(s,   head, i, p) {
+        if (substr(s, 1, 1) == ".") { return s }
+        # a `test "label"` symbol embeds the quoted label, whose own dots are not
+        # path separators; leave it whole rather than cutting inside the quotes.
+        if (index(s, "\"") > 0) { return s }
+        i = index(s, "$")
+        head = (i > 0) ? substr(s, 1, i - 1) : s
+        p = 0
+        for (i = length(head); i >= 1; i--) { if (substr(head, i, 1) == ".") { p = i; break } }
+        if (p == 0) { return s }
+        return substr(s, p + 1)
     }
     /file format/ {
         if      ($0 ~ /x86-64/)   { isa = "x86_64" }
@@ -2574,21 +2574,21 @@ vector_lanes_scan() { emit_scan lanes; }
 #               target's own golden, not an exemption.
 emit_scan() {
     awk -v mode="$1" '
-    function demangle(s,   i, len, c, out) {
-        if (substr(s, 1, 2) != "_M") { return s }
-        i = 3
-        out = ""
-        while (i <= length(s)) {
-            c = substr(s, i, 1)
-            if (c == "N") { i++; continue }
-            if (c !~ /[0-9]/) { return s }
-            len = 0
-            while (i <= length(s) && substr(s, i, 1) ~ /[0-9]/) { len = len * 10 + substr(s, i, 1); i++ }
-            out = substr(s, i, len)
-            i += len
-        }
-        if (out == "") { return s }
-        return out
+    # strip a mangled name down to its bare identifier plus any `$` argument
+    # list: `std.types.option.unwrap$ptr` -> `unwrap$ptr`. an unmangled symbol
+    # (an `ext` / `#[symbol]` literal, a `.L` local) has no module path to strip
+    # and comes back untouched, which is what keeps `_start` and `main` readable.
+    function demangle(s,   head, i, p) {
+        if (substr(s, 1, 1) == ".") { return s }
+        # a `test "label"` symbol embeds the quoted label, whose own dots are not
+        # path separators; leave it whole rather than cutting inside the quotes.
+        if (index(s, "\"") > 0) { return s }
+        i = index(s, "$")
+        head = (i > 0) ? substr(s, 1, i - 1) : s
+        p = 0
+        for (i = length(head); i >= 1; i--) { if (substr(head, i, 1) == ".") { p = i; break } }
+        if (p == 0) { return s }
+        return substr(s, p + 1)
     }
     function packed(m, rest) {
         if (isa == "x86_64") {
