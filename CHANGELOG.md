@@ -118,8 +118,6 @@ The fix is a contract change on the access family, not a check at today's caller
 The census found the same defect on **x86-64**, which the issue did not name: `emit_float_load`, `emit_float_reg_or_slot_load`, `emit_float_store` and `float_const_operand` each read `mov_op = MOVSD; if (w == 4) { mov_op = MOVSS; }`, so every width other than 4 took the eight-byte MOVSD. It was inert only because `encode_fp_mov` returns its vector arm above them. Nothing in the helpers said so, and `emit_float_load` is reached separately by the arithmetic and seed paths. aarch64's `emit_fp_const` carried the same `use64 = width == 8`.
 
 Every refusal is **driven from a unit test** with a width it must refuse, and the assertion is that the output buffer stayed **empty**, not merely that an error was returned. That distinction is load-bearing here: both `emit_mem_access` implementations materialize an out-of-range offset into the scratch register before the access word, and a folded global emits its `adrp` / `auipc` high half before the low one, so a check placed at the emission point rather than at the top would leave stranded instructions behind the error. Every legitimate width still encodes byte-exactly against `llvm-mc`, including aarch64's Q form at 16 and the sub-word integer forms at 1 and 2 that share the same helpers.
-### Changed
-
 #### The realization authority answers a lane-count ceiling as well as a lane width (#2749)
 `isa.packed_width` answers a question keyed on the lane **width**, and a SPIR-V Shader module's constraint is a lane **count**: `OpTypeVector` takes 2, 3 or 4 components at every element type. For 8-bit lanes the authority reported a 128-bit packed form, meaning sixteen lanes, which no Shader module may declare - so the authority and the emitter gave different answers about the same shape, and the emitter refused `i8x16`, `u8x16`, `i16x8` and `u16x8` by name.
 
@@ -135,8 +133,6 @@ The 4-byte ALU floor is a **register machine's** contract: a sub-word operation 
 The floor is now a declared model fact (`alu_min_width`) rather than a constant with two derivations layered on it: 4 on a register machine, 1 on the 8-bit 6502 whose word is one byte, and 1 where there is no register file at all. Machine-target output is byte-identical.
 
 A scalar comparison feeding arithmetic is likewise reconciled: SPIR-V's comparison yields a boolean with no numeric representation, which per-lane mask construction needs as a 0/1 value. That is the scalar counterpart of the `OpSelect` widening a lane-wise compare's mask already used.
-
-### Changed
 
 #### A float literal narrowed to `f32` is folded at its own width (#2752)
 A float literal is carried as a comptime `f64` bit pattern from the lexer onward, so an `f64` constant narrowed by an explicit `::f32` reached the back end as a double-width materialization plus a runtime convert. Two instructions, and on x86-64 an FP scratch register, for a value known at compile time. `me.pass.constfold` now folds an `FP_TRUNC` whose operand is a `VAL_CONST_FLOAT` into the constant.
@@ -159,6 +155,34 @@ Two things the issue expected turned out not to need changing. The front end alr
 
 This also makes the constant pool's four-byte `CONST_F32` entry reachable from source for the first time.
 
+
+#### The FNEG sign mask and aarch64's `fmov` immediate reach the constant pool (#2754)
+Two constant materializations the pool did not reach, both because the ISA form that would consume one was not modelled by the encoder. They are independent and both landed here.
+
+**The x86-64 FNEG sign mask.** An IEEE-754 negation is a sign-bit flip, and the mask it XORs against is one of two values in every program that negates a float. It was rebuilt at every negation through the GP scratch, `movabs r11, mask` then `movq xmm15, r11` then `xorps`: three instructions, twenty bytes and a general-purpose register, for a constant. `encode_xorps` gains the memory-source form it lacked (the same `0F 57 /r` opcode with a ModRM memory operand) and the mask is interned once per width per module, so a negation is one `xorps work, [rip + .Lconst.N]`.
+
+The entry is a **16-byte, 16-byte-aligned** vector, and that is forced rather than chosen: XORPS is the aligned 128-bit form, so it reads sixteen bytes and faults on a misaligned operand. An entry at the float's own width would be wrong twice over. The high lane is zero because XORPS touches it and a negation must leave every bit outside the sign exactly as it found it. This is the pool's `CONST_VEC` kind and its alignment rule getting their first real consumer, and the test reads the shape out of the pool rather than asserting it from the interning call.
+
+**aarch64's `FMOV` scalar immediate.** A64 can build a float constant in one instruction, with no bank move and no memory reference, for the set `±(1 + m/16) × 2^e` with `m` in 0..15 and `e` in -3..4, which is the set numeric code writes most often. The form was not modelled at all, so `1.0`, `2.0`, `0.5` and `-1.5` each cost two instructions. `fmov_imm8` is the `VFPExpandImm` decode read backwards, and `emit_fp_const` takes that arm ahead of its siblings because nothing below it can match one instruction.
+
+The predicate checks both conditions, not just the exponent. A pattern whose mantissa has a bit below the four the field carries looks encodable from the exponent alone, and the form would silently drop those bits. The test pins the boundary at the edges rather than in the middle: one exponent step below the floor, one above the ceiling, and a fifth mantissa bit all fall through to another form, and the two in-range ends encode.
+
+Measured on a kernel of three negations and five constant uses, release profile, `#[noinline]` on every kernel:
+
+| target | negation instructions | constant-use instructions | .text | .rodata |
+| --- | --- | --- | --- | --- |
+| x86-64 | 18 to 9 | 20, unchanged | 442 to 406 | 40 to 72 |
+| aarch64 | 9, unchanged | 25 to 20 | 332 to 280 | 0, unchanged |
+| riscv64 | 9, unchanged | 25, unchanged | 380, unchanged | 32, unchanged |
+
+The x86-64 read-only growth is the two 16-byte mask entries, one per width, shared by every negation in the module: at three negations that is close to a wash on size and a clear win on instruction count and register pressure, and it improves with every further negation. riscv64 does not move on either half, which is correct: its negation is a single `fsgnjn` that needs no mask, and it has no immediate float move form.
+
+`int/surface/float-emit`'s `maxabs` moves 4 to 2 on x86-64, which is exactly the mask's bank move and the XOR that read it. The two that remain are the `t < 0.0` comparison materializing its zero, a different constant and one the pool deliberately never takes.
+
+Also fixed while here, both without a separate issue: `encode.intern_const` refused to check its interner and dereferenced a null one, crashing inside `intern` rather than naming the encoder that asked, and now reports instead.
+
+And aarch64's memory-access family no longer carries a **width-0 pseudo-width**. Every entry point in it used to open with `if (w == 0) { w = 8; }`, a convention from when a MIR pseudo could reach an access, which #2766 left in place as the one substitution it did not remove. Nothing reaches it: routing 0 into a refused width instead left the whole aarch64 surface green, the unit suite, every `int` case on `linux-arm64` in both profiles, and the compiler's own source cross-built for `linux-arm64` and `darwin-aarch64` at both optimisation levels. A default nothing exercises is not a safety net, it is a silent doubleword waiting for the first caller that means something else by 0, so 0 is now refused like any other width the target has no form for and the refusal is driven from a test that fails with the fallback restored. `is64` keeps its own 0 rule, which selects an ALU register form rather than a memory form and which a pseudo with no value width legitimately reaches.
+
 ## [4.16.0] - 2026-08-08
 
 ### Added
@@ -169,8 +193,6 @@ This also makes the constant pool's four-byte `CONST_F32` entry reachable from s
 `int/surface/debugger-gdb` now does: one `gdb --batch` session per `opt` level breaks on a call inlined at release only (`#[inline]`, which the debug pipeline's no-inlining-pass makes a real call there instead) and reads its parameter back from whatever register or stack slot the location list names, breaks mid-loop on a local that stays register-resident for the whole loop and reads a running sum this case's own case.conf computes by hand, and confirms a local that is written and never read carries no location at either profile - "optimized out" is the correct answer there, not a gap. A single `step` off a loop body line is asserted to land on the condition check, then back into the body, by source line rather than instruction count.
 
 Scoped to the `linux` leg only: gdb is what a Linux runner carries (no lldb here), and this is the one leg whose result was read by hand against the source. `linux-arm64` runs gdb natively in CI and could plausibly carry this case too, but that leg's session was never exercised or hand-verified, so it - along with `linux-riscv64` (qemu-user has no ptrace story a host gdb can attach through), `windows`, and both `darwin` legs - stays explicitly unverified rather than assumed to work.
-
-### Added
 
 #### An integer vector multiply works on every target (#2726, #2721)
 `i32x4 * i32x4` was refused at the language level on **every** target, citing x86-64's SSE2 baseline, where `pmulld` is SSE4.1. That refused it on aarch64, whose NEON hardware has the instruction, and on riscv64, which has no vector unit at all and would have lowered it to four ordinary scalar multiplies.
@@ -594,8 +616,6 @@ Blast radius: no user-level consumer in this repo. In mach-std every consumer is
 The guard keys on the spelling rather than on the target's vector width, so `f32x3` and `f32x7` are reserved everywhere. Otherwise a name would be claimable on a 128-bit target and collide on a wider one from identical source.
 
 **Values are unaffected.** A vector spelling is read in type position only, so `val f32x4` remains legal and is not shadowed by anything.
-
-### Added
 
 #### GLSL.std.450 extended instructions for shader stages (#2688)
 A `#[spirv_op(set, name)]` decorator declares which SPIR-V instruction a function *is*, over two sets: `"core"` and `"GLSL.std.450"`. 33 extended instructions plus core `OpDot`, covering the common-value, trigonometric, exponential, range/interpolation and geometry families. The extended set is imported only when used.
