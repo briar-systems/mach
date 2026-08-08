@@ -1893,7 +1893,40 @@ fun emit_interned(out: *writer.Writer, interner: *intern.Interner, id: intern.St
 # op:       the operand carrying the symbol id
 # ret:      true on success, or an error
 fun emit_sym(out: *writer.Writer, interner: *intern.Interner, op: *isa.Operand) R.Result[bool, str] {
-    ret emit_interned(out, interner, op.sym_id::intern.StrId);
+    val res_name: R.Result[bool, str] = emit_interned(out, interner, op.sym_id::intern.StrId);
+    if (R.is_err[bool, str](res_name)) { ret res_name; }
+    ret emit_addend(out, op.sym_addend);
+}
+
+# append a symbol reference's addend as `+N` / `-N`, or nothing when it is zero
+#
+# The offset half of naming an address (#2839). Without it `&g.lo` and `&g.hi`
+# rendered the identical `adrp x0, g` / `add x0, x0, :lo12:g` pair while the objects
+# relocated against `g` and `g+8`. AArch64 spells the offset after the name and
+# inside the modifier's scope (`:lo12:g+8`), which is what the assembler reads back.
+#
+# A ZERO ADDEND PRINTS NOTHING rather than `+0`, because `g` is the spelling an
+# assembler produces for the same relocation - and on the GOT path the zero is load
+# bearing: the slot holds the symbol's base and a nonzero offset rides a trailing
+# `add`, so `:got:g+8` would name an instruction that assembles to different bytes.
+#
+# BARE DECIMAL, NOT `emit_dec_imm`. That helper prefixes `#`, which is how AArch64
+# spells an IMMEDIATE OPERAND - `g+#8` is not an address expression any assembler
+# reads, so the `#` would reintroduce the divergence in a new spelling.
+# ---
+# out:    destination writer
+# addend: the addend to spell
+# ret:    true on success, or the first write error
+fun emit_addend(out: *writer.Writer, addend: i32) R.Result[bool, str] {
+    if (addend == 0) { ret R.ok[bool, str](true); }
+    if (addend < 0) {
+        val res_neg: R.Result[bool, str] = emit_str(out, "-");
+        if (R.is_err[bool, str](res_neg)) { ret res_neg; }
+        ret emit_u64(out, (0 - addend::i64)::u64);
+    }
+    val res_pos: R.Result[bool, str] = emit_str(out, "+");
+    if (R.is_err[bool, str](res_pos)) { ret res_pos; }
+    ret emit_u64(out, addend::u64);
 }
 
 # a fixed capture buffer the rendering tests write into, and its writer
@@ -2183,6 +2216,94 @@ test "mach.lang.target.isa.arm64.printer.render_inst:unmapped_base_is_an_error" 
     note_inst(?buf, ?i);
     if (!buf.asm.failed) { bad = 1; }
 
+    enc.buf_dnit(?buf);
+    ret bad;
+}
+
+# TWO DIFFERENT ADDRESSES INSIDE ONE OBJECT RENDER AS TWO DIFFERENT LINES (#2839)
+#
+# `&g.lo` and `&g.hi` lower to the same symbol at addends 0 and 8, and the objects
+# relocate against `g` and `g+8` (`R_AARCH64_ADR_PREL_PG_HI21 g` versus `g+0x8`). The
+# rendering dropped the addend, so both functions printed the identical
+# `adrp x0, g` / `add x0, x0, :lo12:g` pair - the `.s` stating that two functions
+# compute the same address, which is a wrong claim rather than a missing detail.
+#
+# ASSERTING THE PAIR IS THE POINT. A test that only checked the addend "is printed"
+# would say nothing about the collapse, so both lines are named exactly and the
+# zero-addend one is pinned to have no `+0`.
+#
+# BOTH HALVES SPELL IT on the absolute path, because both relocations carry it and
+# both `adrp Xd, g+8` and `add Xd, Xd, :lo12:g+8` are what an assembler reads back.
+# That is the opposite of RISC-V, where the high half owns the constant alone, and
+# the difference is a property of the two ABIs rather than of this printer.
+#
+# THE GOT PATH SPELLS NONE, and that zero is load bearing rather than absent: a GOT
+# relocation cannot carry an addend, the slot holds the symbol's base, and a nonzero
+# offset rides a trailing `add`. A `:got:g+8` would name an instruction that
+# assembles to different bytes than the object holds.
+#
+# AND THE SPELLING IS BARE DECIMAL. `emit_dec_imm` prefixes `#`, which is how AArch64
+# writes an IMMEDIATE OPERAND, so `g+#8` would be an address expression no assembler
+# reads - the same divergence in a new spelling. Asserted because the first cut of
+# this change emitted exactly that.
+test "mach.lang.target.isa.arm64.printer.render_inst:a_symbol_addend_is_part_of_the_address" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var buf: enc.ByteBuf = enc.buf_init(?alloc);
+
+    var itn: intern.Interner = intern.init(?alloc);
+    val gr: R.Result[intern.StrId, str] = intern.intern(?itn, "g");
+    if (R.is_err[intern.StrId, str](gr)) { ret 1; }
+    val g: intern.StrId = R.unwrap_ok[intern.StrId, str](gr);
+
+    var w: writer.Writer;
+    w.ctx     = nil;
+    w.f_write = test_sink_write;
+    var sink: enc.AsmSink = enc.sink_init(?w, ?itn);
+    buf.asm = ?sink;
+
+    var bad: i32 = 0;
+
+    # the high half of `&g.lo` and of `&g.hi`.
+    # the base words are `encode.mach`'s ADRP_BASE and ADDI_X, spelled here because
+    # the printer is what is under test and reads only the word it is handed.
+    var adrp_lo: Inst = inst(FORM_ADRP, 0x90000000);
+    adrp_lo.dst     = gp(0, 8);
+    adrp_lo.src1    = isa.make_sym(g::u32, 0);
+    adrp_lo.sym_mod = MOD_PCREL_HI;
+    bad = bad | rendered_is(?buf, ?adrp_lo, "adrp x0, g");
+
+    var adrp_hi: Inst = adrp_lo;
+    adrp_hi.src1.sym_addend = 8;
+    bad = bad | rendered_is(?buf, ?adrp_hi, "adrp x0, g+8");
+
+    # a negative addend spells its own sign rather than a `+-8`.
+    var adrp_neg: Inst = adrp_lo;
+    adrp_neg.src1.sym_addend = 0 - 8;
+    bad = bad | rendered_is(?buf, ?adrp_neg, "adrp x0, g-8");
+
+    # the low half carries it too on the absolute path, so the two lines of one pair
+    # agree with each other and with the two relocations.
+    var add_lo: Inst = inst(FORM_ADDSUB_IMM, 0x91000000);
+    add_lo.dst     = gp(0, 8);
+    add_lo.src1    = gp(0, 8);
+    add_lo.src2    = isa.make_sym(g::u32, 8);
+    add_lo.sym_mod = MOD_PCREL_LO;
+    bad = bad | rendered_is(?buf, ?add_lo, "add x0, x0, :lo12:g");
+
+    var add_hi: Inst = add_lo;
+    add_hi.src2.sym_addend = 8;
+    bad = bad | rendered_is(?buf, ?add_hi, "add x0, x0, :lo12:g+8");
+
+    # the GOT half spells none, whatever the reference's own offset - the trailing
+    # `add` the encoder emits says the rest.
+    var got: Inst = inst(FORM_ADRP, 0x90000000);
+    got.dst     = gp(0, 8);
+    got.src1    = isa.make_sym(g::u32, 0);
+    got.sym_mod = MOD_GOT_HI;
+    bad = bad | rendered_is(?buf, ?got, "adrp x0, :got:g");
+
+    intern.dnit(?itn);
     enc.buf_dnit(?buf);
     ret bad;
 }
