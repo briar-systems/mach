@@ -47,8 +47,12 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
 use std.types.string.str_join;
 use std.types.string.str_len;
+
+use std.allocator.page;
+use std.format;
 
 use A: std.allocator;
 use O: std.types.option;
@@ -374,12 +378,17 @@ fun declare_interface(e: *Emit) R.Result[bool, str] {
         val g: *ir.Global = ?e.ir.globals[i];
         if (g.iface == ir.IFACE_NONE) { i = i + 1; cnt; }
 
-        # a built-in whose specified type mach cannot spell is refused here rather
-        # than emitted mistyped: the module would be invalid and the failure would
-        # surface from a validator instead of from the declaration that caused it.
+        # a built-in declared at a type other than the one SPIR-V specifies for it is
+        # refused here rather than emitted mistyped: the module would be invalid and
+        # the failure would surface from a validator instead of from the declaration
+        # that caused it.
+        # reported as a plain error rather than through `unsupported`: nothing is
+        # being emitted yet, so there is no instruction and no current function to
+        # attribute it to, and attributing it to `<unknown function>` would point a
+        # reader away from the declaration that is the whole subject.
         if (g.iface == ir.IFACE_BUILTIN) {
-            val br: str = unspellable_builtin(g.iface_a);
-            if (br != nil) { ret unsupported(e, br); }
+            val br: str = builtin_type_refusal(?e.ir.types, e.alloc, g.iface_a, g.ty);
+            if (br != nil) { ret R.err[bool, str](br); }
         }
 
         var storage: u32 = spirv.STORAGE_INPUT;
@@ -693,23 +702,157 @@ fun decorate(e: *Emit, target: u32, decor: u32, operand: u32) {
     spirv.inst(e.b, ?e.b.decorations, spirv.OP_DECORATE, ?ops[0], 3);
 }
 
-# the refusal for a built-in whose specified type mach has no way to write, or nil
+# the type SPIR-V specifies for a `#[builtin("...")]` variable
 #
-# `GlobalInvocationId`, `LocalInvocationId` and `WorkgroupId` are `uvec3` by the
-# specification, and the requirement is on the VARIABLE's type rather than on how it
-# is read, so widening is not available the way it is for a varying: a `u32x4`
-# decorated with one of these is an invalid module, not a wasteful one. Every mach
-# vector is exactly 128 bits, so `u32x4` exists and `u32x3` cannot. These are refused
-# by name because no correct program can be written against them, which is a
-# different thing from a built-in a user merely typed wrongly - that one has a right
-# answer and the validator names it.
+# Every built-in has one, on the VARIABLE rather than on how it is read, so a
+# variable declared at any other type is an invalid module however it is used. The
+# check is a table for the same reason the selector and the storage class are: a
+# built-in is added along one axis, and a row it cannot be added without is a row
+# that cannot be forgotten.
+#
+# The three compute ids used to be refused outright here on the ground that every
+# mach vector was exactly 128 bits so `u32x3` could not exist. #2687 deleted that
+# rule from the language, which turned the refusal into a false statement and left
+# the whole family unreachable (#2745).
+#
+# SIGNEDNESS IS NOT CHECKABLE AND IS NOT CHECKED. IR carries an integer's width and
+# nothing else, and SPIR-V here emits `OpTypeInt n 0` for both spellings, so `i32x3`
+# and `u32x3` are one type by the time the module exists. The requirement is spelled
+# at the unsigned form because that is what the specification says and what a reader
+# should write. The check is over the shape the module can actually distinguish.
+# ---
+# which:        the ir.BUILTIN_* value
+# out_lanes:    receives the component count, 1 for a scalar
+# out_bits:     receives the element width in bits
+# out_is_float: receives true for a float element
+# ret:          the mach spelling the requirement reads at
+fun builtin_required_type(which: u32, out_lanes: *u32, out_bits: *u32, out_is_float: *bool) str {
+    @out_lanes = 1; @out_bits = 32; @out_is_float = true;
+    if (which == ir.BUILTIN_POSITION || which == ir.BUILTIN_FRAG_COORD) {
+        @out_lanes = 4;
+        ret "`f32x4`, a four-component float vector";
+    }
+    if (which == ir.BUILTIN_POINT_SIZE) {
+        ret "`f32`, a scalar float";
+    }
+    if (which == ir.BUILTIN_GLOBAL_INVOCATION || which == ir.BUILTIN_LOCAL_INVOCATION
+        || which == ir.BUILTIN_WORKGROUP_ID) {
+        @out_lanes = 3; @out_is_float = false;
+        ret "`u32x3`, a three-component 32-bit unsigned vector";
+    }
+    # vertex_index and instance_index
+    @out_is_float = false;
+    ret "`u32` or `i32`, a scalar 32-bit integer";
+}
+
+# the refusal for a `#[builtin("...")]` variable declared at the wrong type, or nil
+# ---
+# tt:    the IR type table
+# alloc: allocator for the composed diagnostic
+# which: the ir.BUILTIN_* value
+# ty:    the variable's IR type
+# ret:   the diagnostic, or nil when the declared type is the specified one
+fun builtin_type_refusal(tt: *type.IrTypeTable, alloc: *A.Allocator, which: u32,
+                         ty: type.IrTypeId) str {
+    var want_lanes: u32    = 0;
+    var want_bits: u32     = 0;
+    var want_is_float: bool = false;
+    val want: str = builtin_required_type(which, ?want_lanes, ?want_bits, ?want_is_float);
+
+    var got_lanes: u32     = 0;
+    var got_bits: u32      = 0;
+    var got_is_float: bool = false;
+    if (ir_scalar_shape(tt, ty, ?got_lanes, ?got_bits, ?got_is_float)
+        && got_lanes == want_lanes && got_bits == want_bits && got_is_float == want_is_float) {
+        ret nil;
+    }
+
+    val r: R.Result[str, str] = format.sprint(alloc,
+        "this `#[builtin(\"{}\")]` variable is declared {}, and SPIR-V specifies it as {}. the requirement is on the variable's TYPE rather than on how it is read, so a wider or narrower one is an invalid module rather than a wasteful one",
+        builtin_spelling(which), ir_type_spelling(tt, alloc, ty), want);
+    if (R.is_err[str, str](r)) {
+        ret "this `#[builtin(\"...\")]` variable is declared at a type SPIR-V does not specify for it";
+    }
+    ret R.unwrap_ok[str, str](r);
+}
+
+# the source spelling of a built-in name, for a diagnostic
 # ---
 # which: the ir.BUILTIN_* value
-# ret:   the diagnostic, or nil when the built-in is spellable
-fun unspellable_builtin(which: u32) str {
-    if (which != ir.BUILTIN_GLOBAL_INVOCATION && which != ir.BUILTIN_LOCAL_INVOCATION
-        && which != ir.BUILTIN_WORKGROUP_ID) { ret nil; }
-    ret "this compute built-in cannot be typed in mach yet: SPIR-V specifies `global_invocation`, `local_invocation` and `workgroup_id` as three-component unsigned vectors, and every mach vector is exactly 128 bits, so `u32x4` exists and `u32x3` does not. a variable of any other type decorated with one of these is an invalid module rather than a wasteful one, so it is refused instead of emitted. the other built-ins, and `#[storage(...)]` buffers, are available to a compute stage";
+# ret:   the string the `#[builtin(...)]` argument carries
+fun builtin_spelling(which: u32) str {
+    if (which == ir.BUILTIN_VERTEX_INDEX)      { ret "vertex_index"; }
+    if (which == ir.BUILTIN_INSTANCE_INDEX)    { ret "instance_index"; }
+    if (which == ir.BUILTIN_FRAG_COORD)        { ret "frag_coord"; }
+    if (which == ir.BUILTIN_POINT_SIZE)        { ret "point_size"; }
+    if (which == ir.BUILTIN_GLOBAL_INVOCATION) { ret "global_invocation"; }
+    if (which == ir.BUILTIN_LOCAL_INVOCATION)  { ret "local_invocation"; }
+    if (which == ir.BUILTIN_WORKGROUP_ID)      { ret "workgroup_id"; }
+    ret "position";
+}
+
+# resolve an IR type to a lane count, element width and element class
+#
+# A scalar answers with one lane, which is what lets one comparison cover both a
+# scalar and a vector requirement. Anything that is neither answers false rather
+# than a shape of its own, since an aggregate has no element width to compare.
+# ---
+# tt:           the IR type table
+# id:           the IR type id
+# out_lanes:    receives the component count, 1 for a scalar
+# out_bits:     receives the element width in bits
+# out_is_float: receives true for a float element
+# ret:          true when the type is a scalar or a vector of one
+fun ir_scalar_shape(tt: *type.IrTypeTable, id: type.IrTypeId, out_lanes: *u32,
+                    out_bits: *u32, out_is_float: *bool) bool {
+    @out_lanes = 0; @out_bits = 0; @out_is_float = false;
+    val opt: O.Option[*type.IrType] = type.get(tt, id);
+    if (O.is_none[*type.IrType](opt)) { ret false; }
+    val t: *type.IrType = O.unwrap[*type.IrType](opt);
+    if (t.kind == type.IRT_FLOAT) { @out_lanes = 1; @out_bits = t.data.bits; @out_is_float = true; ret true; }
+    if (t.kind == type.IRT_INT)   { @out_lanes = 1; @out_bits = t.data.bits; ret true; }
+    if (t.kind != type.IRT_VECTOR) { ret false; }
+    val eopt: O.Option[*type.IrType] = type.get(tt, t.data.vector_.element);
+    if (O.is_none[*type.IrType](eopt)) { ret false; }
+    val et: *type.IrType = O.unwrap[*type.IrType](eopt);
+    if (et.kind != type.IRT_FLOAT && et.kind != type.IRT_INT) { ret false; }
+    @out_lanes = t.data.vector_.lanes;
+    @out_bits = et.data.bits;
+    @out_is_float = et.kind == type.IRT_FLOAT;
+    ret true;
+}
+
+# the mach spelling of an IR type, for a diagnostic
+#
+# An integer is spelled at both signs because IR carries none: reporting one of them
+# would be a guess, and reporting the wrong one against the author's own declaration
+# is exactly the misdirection these refusals exist to avoid.
+# ---
+# tt:    the IR type table
+# alloc: allocator for a composed spelling
+# id:    the IR type id
+# ret:   the spelling, on `alloc` when it has to be composed
+fun ir_type_spelling(tt: *type.IrTypeTable, alloc: *A.Allocator, id: type.IrTypeId) str {
+    var lanes: u32     = 0;
+    var bits: u32      = 0;
+    var is_float: bool = false;
+    if (!ir_scalar_shape(tt, id, ?lanes, ?bits, ?is_float)) {
+        val opt: O.Option[*type.IrType] = type.get(tt, id);
+        if (O.is_none[*type.IrType](opt)) { ret "an unresolved type"; }
+        val k: type.IrTypeKind = O.unwrap[*type.IrType](opt).kind;
+        if (k == type.IRT_PTR)    { ret "a pointer"; }
+        if (k == type.IRT_ARRAY)  { ret "an array"; }
+        if (k == type.IRT_STRUCT) { ret "a record"; }
+        if (k == type.IRT_UNION)  { ret "a union"; }
+        ret "a type with no scalar shape";
+    }
+    var r: R.Result[str, str];
+    if (is_float && lanes == 1)  { r = format.sprint(alloc, "`f{}`", bits); }
+    or (is_float)                { r = format.sprint(alloc, "`f{}x{}`", bits, lanes); }
+    or (lanes == 1)              { r = format.sprint(alloc, "`i{}` / `u{}`", bits, bits); }
+    or                           { r = format.sprint(alloc, "`i{}x{}` / `u{}x{}`", bits, lanes, bits, lanes); }
+    if (R.is_err[str, str](r)) { ret "a type this diagnostic could not render"; }
+    ret R.unwrap_ok[str, str](r);
 }
 
 # the SPIR-V BuiltIn selector for one of mach's built-in names
@@ -1932,6 +2075,13 @@ fun interface_target(e: *Emit, op: *mir.MirOperand) u32 {
 # float address materialization was applied on every target and destroyed the
 # direct symbol reference. #2655 gated that on `MachineModel.flat_addressing`, so
 # those shapes reach the whole-variable path and never arrive here at all.
+#
+# EVERY ORIGIN GETS ITS OWN ARM, including the two that are not globals (#2744). A
+# local slot reported under the module-scope sentence contradicts the program it is
+# reported against - the author declared no module-scope variable at all - and that
+# is exactly what a sub-width vector's scratch round trip and a default-zeroed
+# sub-width local both produced, sending two readers to a role they had already
+# written. A refusal that misdirects is worse than one that says only "unsupported".
 # ---
 # e:   the emission state
 # mf:  the MIR function
@@ -1939,8 +2089,12 @@ fun interface_target(e: *Emit, op: *mir.MirOperand) u32 {
 # ret: the diagnostic text
 fun addressed_memory_refusal(e: *Emit, mf: *mir.MirFunction, op: *mir.MirOperand) str {
     var gix: u32 = 0;
-    if (address_origin(e, mf, op, ?gix) != ADDR_GLOBAL) {
-        ret "addressed memory is not yet supported by the SPIR-V target: a module-scope variable is reachable only when it carries a shader interface role (`#[input]`, `#[output]`, `#[builtin]`, or `#[uniform]`), and only as a whole-variable read or write";
+    val origin: u8 = address_origin(e, mf, op, ?gix);
+    if (origin == ADDR_ALLOCA) {
+        ret "a function-local object is reachable from the SPIR-V target only as a whole value: this access arrived as an address into its storage rather than as a load or a store of the object itself, which logical addressing has no pointer to express. it is a lowering that ran where it should not have, not something the program asked for";
+    }
+    if (origin != ADDR_GLOBAL) {
+        ret "addressed memory is not yet supported by the SPIR-V target: this access reached the back end as a computed address with no object behind it that the emitter can name, and logical addressing has no general pointer to follow";
     }
     val g: *ir.Global = ?e.ir.globals[gix];
     if (g.iface == ir.IFACE_NONE) {
@@ -1949,7 +2103,13 @@ fun addressed_memory_refusal(e: *Emit, mf: *mir.MirFunction, op: *mir.MirOperand
     if (is_aggregate_type(e, g.ty)) {
         ret "copying a whole record or array to or from a shader interface variable is not supported by the SPIR-V target: an aggregate assignment lowers to a byte copy, which addresses the object rather than loading or storing a value of it. reading and writing its MEMBERS individually is supported, and is what a shader wants anyway - a whole-block copy would move the descriptor's contents rather than the values in it";
     }
-    ret "this shader interface variable is reachable only as a whole-variable read or write in the SPIR-V target";
+    val r: R.Result[str, str] = format.sprint(e.alloc,
+        "this shader interface variable carries a role and is not an aggregate, so it is reachable - but the access reached the back end as COMPUTED ADDRESSING rather than as a direct reference to the variable, which is the one shape the SPIR-V target can name. that is a lowering that ran where it should not have, not a limit of the declaration: the variable is {}",
+        ir_type_spelling(?e.ir.types, e.alloc, g.ty));
+    if (R.is_err[str, str](r)) {
+        ret "this shader interface variable is reachable only as a whole-variable read or write in the SPIR-V target";
+    }
+    ret R.unwrap_ok[str, str](r);
 }
 
 # whether an IR type is an aggregate reached by indexing
@@ -3078,4 +3238,88 @@ fun emit_mov(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr) R.Result[
 fun reg_value(e: *Emit, rg: *Regs, k: u32, want_ty: u32) u32 {
     if (!rg.is_imm[k]) { ret rg.val_id[k]; }
     ret immediate(e, want_ty, rg.imm[k]);
+}
+
+# the `#[builtin]` type table, at every built-in and in both directions
+#
+# The table is the whole check, so a row that agrees with itself proves nothing:
+# every built-in is asserted to ACCEPT the type SPIR-V specifies for it and to
+# REFUSE a plausible neighbour of that type. The neighbours are the mistakes a
+# reader actually makes - a `u32x4` where a `u32x3` is specified, a scalar where a
+# vector is, an integer where a float is - each of which the emitter accepted and
+# `spirv-val` rejected before this table existed (#2745).
+test "mach.lang.target.isa.spirv.emit:builtin_type_table" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var tt: type.IrTypeTable;
+    if (O.is_some[str](type.init(?tt, ?alloc))) { ret 1; }
+
+    val f32t: type.IrTypeId  = R.unwrap_ok[type.IrTypeId, str](type.intern_float(?tt, 32));
+    val i32t: type.IrTypeId  = R.unwrap_ok[type.IrTypeId, str](type.intern_int(?tt, 32));
+    val f64t: type.IrTypeId  = R.unwrap_ok[type.IrTypeId, str](type.intern_float(?tt, 64));
+    val v4f: type.IrTypeId   = R.unwrap_ok[type.IrTypeId, str](type.intern_vector(?tt, f32t, 4));
+    val v3f: type.IrTypeId   = R.unwrap_ok[type.IrTypeId, str](type.intern_vector(?tt, f32t, 3));
+    val v3i: type.IrTypeId   = R.unwrap_ok[type.IrTypeId, str](type.intern_vector(?tt, i32t, 3));
+    val v4i: type.IrTypeId   = R.unwrap_ok[type.IrTypeId, str](type.intern_vector(?tt, i32t, 4));
+
+    # position and frag_coord: a four-component float vector, nothing else.
+    if (builtin_type_refusal(?tt, ?alloc, ir.BUILTIN_POSITION, v4f) != nil)   { type.dnit(?tt); ret 1; }
+    if (builtin_type_refusal(?tt, ?alloc, ir.BUILTIN_FRAG_COORD, v4f) != nil) { type.dnit(?tt); ret 1; }
+    if (builtin_type_refusal(?tt, ?alloc, ir.BUILTIN_POSITION, v3f) == nil)   { type.dnit(?tt); ret 1; }
+    if (builtin_type_refusal(?tt, ?alloc, ir.BUILTIN_POSITION, v4i) == nil)   { type.dnit(?tt); ret 1; }
+    if (builtin_type_refusal(?tt, ?alloc, ir.BUILTIN_FRAG_COORD, f32t) == nil) { type.dnit(?tt); ret 1; }
+
+    # point_size: a scalar float, and an f64 is not one - a 64-bit interface
+    # variable needs the Float64 capability this module never declares.
+    if (builtin_type_refusal(?tt, ?alloc, ir.BUILTIN_POINT_SIZE, f32t) != nil) { type.dnit(?tt); ret 1; }
+    if (builtin_type_refusal(?tt, ?alloc, ir.BUILTIN_POINT_SIZE, f64t) == nil) { type.dnit(?tt); ret 1; }
+    if (builtin_type_refusal(?tt, ?alloc, ir.BUILTIN_POINT_SIZE, v4f) == nil)  { type.dnit(?tt); ret 1; }
+
+    # vertex_index and instance_index: a scalar 32-bit integer. IR carries no
+    # signedness, so `i32` and `u32` are one type here and both are accepted.
+    if (builtin_type_refusal(?tt, ?alloc, ir.BUILTIN_VERTEX_INDEX, i32t) != nil)   { type.dnit(?tt); ret 1; }
+    if (builtin_type_refusal(?tt, ?alloc, ir.BUILTIN_INSTANCE_INDEX, i32t) != nil) { type.dnit(?tt); ret 1; }
+    if (builtin_type_refusal(?tt, ?alloc, ir.BUILTIN_VERTEX_INDEX, f32t) == nil)   { type.dnit(?tt); ret 1; }
+    if (builtin_type_refusal(?tt, ?alloc, ir.BUILTIN_INSTANCE_INDEX, v3i) == nil)  { type.dnit(?tt); ret 1; }
+
+    # the three compute ids: a three-component 32-bit integer vector. the `u32x4`
+    # row is the one #2745 is about - it was the only shape the language could
+    # spell, and it is an invalid module rather than a wasteful one.
+    if (builtin_type_refusal(?tt, ?alloc, ir.BUILTIN_GLOBAL_INVOCATION, v3i) != nil) { type.dnit(?tt); ret 1; }
+    if (builtin_type_refusal(?tt, ?alloc, ir.BUILTIN_LOCAL_INVOCATION, v3i) != nil)  { type.dnit(?tt); ret 1; }
+    if (builtin_type_refusal(?tt, ?alloc, ir.BUILTIN_WORKGROUP_ID, v3i) != nil)      { type.dnit(?tt); ret 1; }
+    if (builtin_type_refusal(?tt, ?alloc, ir.BUILTIN_GLOBAL_INVOCATION, v4i) == nil) { type.dnit(?tt); ret 1; }
+    if (builtin_type_refusal(?tt, ?alloc, ir.BUILTIN_LOCAL_INVOCATION, v3f) == nil)  { type.dnit(?tt); ret 1; }
+    if (builtin_type_refusal(?tt, ?alloc, ir.BUILTIN_WORKGROUP_ID, i32t) == nil)     { type.dnit(?tt); ret 1; }
+
+    type.dnit(?tt);
+    ret 0;
+}
+
+# the declared type a `#[builtin]` refusal names is the one the author wrote
+#
+# A refusal that misdirects is worse than one that says only "unsupported": it
+# sends the reader somewhere false. The spelling is asserted here rather than left
+# to a golden, since it is what the whole diagnostic is built on.
+test "mach.lang.target.isa.spirv.emit:ir_type_spelling" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var tt: type.IrTypeTable;
+    if (O.is_some[str](type.init(?tt, ?alloc))) { ret 1; }
+
+    val f32t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](type.intern_float(?tt, 32));
+    val i32t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](type.intern_int(?tt, 32));
+    val v3f: type.IrTypeId  = R.unwrap_ok[type.IrTypeId, str](type.intern_vector(?tt, f32t, 3));
+    val v3i: type.IrTypeId  = R.unwrap_ok[type.IrTypeId, str](type.intern_vector(?tt, i32t, 3));
+    val arr: type.IrTypeId  = R.unwrap_ok[type.IrTypeId, str](type.intern_array(?tt, f32t, 4));
+
+    if (!str_equals(ir_type_spelling(?tt, ?alloc, f32t), "`f32`"))    { type.dnit(?tt); ret 1; }
+    if (!str_equals(ir_type_spelling(?tt, ?alloc, v3f), "`f32x3`"))   { type.dnit(?tt); ret 1; }
+    # an integer is spelled at both signs, because IR carries neither.
+    if (!str_equals(ir_type_spelling(?tt, ?alloc, i32t), "`i32` / `u32`"))       { type.dnit(?tt); ret 1; }
+    if (!str_equals(ir_type_spelling(?tt, ?alloc, v3i), "`i32x3` / `u32x3`"))    { type.dnit(?tt); ret 1; }
+    if (!str_equals(ir_type_spelling(?tt, ?alloc, arr), "an array"))  { type.dnit(?tt); ret 1; }
+
+    type.dnit(?tt);
+    ret 0;
 }
