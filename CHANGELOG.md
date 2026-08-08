@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+#### A float literal narrowed to `f32` is folded at its own width (#2752)
+A float literal is carried as a comptime `f64` bit pattern from the lexer onward, so an `f64` constant narrowed by an explicit `::f32` reached the back end as a double-width materialization plus a runtime convert. Two instructions, and on x86-64 an FP scratch register, for a value known at compile time. `me.pass.constfold` now folds an `FP_TRUNC` whose operand is a `VAL_CONST_FLOAT` into the constant.
+
+The fold is a **retype**, not a value change. A `VAL_CONST_FLOAT` carries its `f64` pattern whatever its type says, and the back end reads the width off the type: `lower_value` narrows through `f64_to_f32_bits` at width 4, exactly as `pack_globals` already did for a module-scope global. So this moves *when* the round-to-nearest-even happens, not what it rounds, and nothing downstream can double-round it either, because every float fold in the pass is gated on `is_f64` and an `f32`-typed constant is inert there.
+
+The **widening** is deliberately not folded, and a test pins that. An `f32`-typed constant still carries the unrounded `f64` pattern, so retyping it to `f64` would produce the double nearest the literal where the machine produces the double nearest the `f32`. That is a value change, and folding it correctly needs a narrow-then-widen round trip through a single-to-double conversion `float` does not have.
+
+Measured on a six-kernel `f32` micro-benchmark covering the ways a narrowing can arise, release profile, `#[noinline]` on every kernel:
+
+| target | kernel instructions | constant-pool symbols |
+| --- | --- | --- |
+| x86-64 | 30 to 24 | 4 to 3 |
+| aarch64 | 33 to 30 | 2 to 1 |
+| riscv64 | 33 to 30 | 3 to 1 |
+
+`int/surface/float-emit` moves on every target, and the movement is the residual its own commentary already named: `main` goes 2 to 0 on x86-64, which is exactly the `CVTSD2SS` and the scratch load feeding it, and 6 to 4 on aarch64 and riscv64, the same pair spelled as a constant materialization into the FP scratch plus the `FCVT` that read it.
+
+Two things the issue expected turned out not to need changing. The front end already types a suffixed or contextually-typed literal at `f32` directly, so `x * 0.1f32`, `x * 0.1` in an `f32` context and `val k: f32 = 0.1` never produced an `FP_TRUNC` at all; only an explicit `::f32` of an `f64`-typed value did. And `fe.comptime` needed no matching fold, because a `val` initializer, an array element and a record field are already narrowed at their own width when the global is packed, which the emitted `.rodata` bytes confirm.
+
+This also makes the constant pool's four-byte `CONST_F32` entry reachable from source for the first time.
+
 ## [4.16.0] - 2026-08-08
 
 ### Added
