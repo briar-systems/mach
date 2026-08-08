@@ -1475,6 +1475,15 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
     val attr: *BuildAttributes = attributes_for(tgt_isa);
 
     val phdr_count: u32 = seg_count + 1;
+
+    # the same one-page header reservation the PIE and dynamic writers refuse to
+    # overrun. the static writer needs it for the same reason and did not have it,
+    # because until the header block moved below segment 0 it had no reserved page to
+    # overrun - it simply sat on top of segment 0's address instead.
+    if (!header_fits_reserved_page(phdr_count, page_size)) {
+        ret R.err[bool, str]("elf: static program headers exceed the one-page header reservation (too many load segments)");
+    }
+
     val phdr_offset: usize = ELF_HEADER_SIZE;
     val phdr_table_size: usize = phdr_count::usize * PHDR_SIZE;
 
@@ -1653,7 +1662,7 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
 
     # leading PT_LOAD covering the ELF header and the program headers.
     var hdr_vaddr: u64 = entry & ~(page_size - 1);
-    if (seg_count > 0) { hdr_vaddr = segs[0].vaddr & ~(page_size - 1); }
+    if (seg_count > 0) { hdr_vaddr = header_segment_vaddr(segs[0].vaddr, page_size); }
     val hdr_filesz: usize = phdr_offset + phdr_table_size;
     bin.write_u32_le(buf, phdr_pos, PT_LOAD);
     bin.write_u32_le(buf, phdr_pos + 4, PF_R);
@@ -1864,6 +1873,32 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
 # ret:        true when the header block still fits its one reserved page
 fun header_fits_reserved_page(phdr_count: u32, page_size: u64) bool {
     ret ELF_HEADER_SIZE + phdr_count::usize * PHDR_SIZE <= page_size::usize;
+}
+
+# the virtual address the leading PT_LOAD maps the ELF header and program-header table
+# at: one page below the first load segment's own page
+#
+# ONE DEFINITION FOR ALL THREE WRITERS, and the reason it is a function is that it was
+# not one. The static writer mapped the header block AT `segs[0].vaddr` while the PIE
+# and dynamic writers mapped it a page below, so two PT_LOADs claimed the same virtual
+# address in every static image mach has ever produced. That is a malformed image: a
+# consumer deriving load addresses from program headers rather than section headers
+# reads two different file ranges for one address. It executes correctly only because
+# the loader maps the segments in order and the later one wins.
+#
+# The reserved page must hold the whole header block, which is what
+# `header_fits_reserved_page` checks - every writer that calls this must call that too,
+# or it emits an image whose segment 0 no longer maps at its own vaddr.
+#
+# The degenerate no-segment case stays with each caller: a writer's default for an
+# image with nothing to load is not this policy, and folding it in here would invent
+# an answer (a PIE image's `entry` of 0 would underflow a page below zero).
+# ---
+# first_seg_vaddr: virtual address of the lowest load segment
+# page_size:       the segment-alignment page
+# ret:             the header block's virtual address
+fun header_segment_vaddr(first_seg_vaddr: u64, page_size: u64) u64 {
+    ret (first_seg_vaddr & ~(page_size - 1)) - page_size;
 }
 
 # one already-emitted allocated section (its body lives in a load segment) to name
@@ -2338,7 +2373,7 @@ fun write_pie_phdrs(buf: *u8, phdr_offset: usize, phdr_count: u32,
     # the page the ELF header + phdrs map at: one page below the first segment's base,
     # so extending the first segment down to file offset 0 covers them.
     var hdr_vaddr: u64 = 0;
-    if (seg_count > 0) { hdr_vaddr = (segs[0].vaddr & ~(page_size - 1)) - page_size; }
+    if (seg_count > 0) { hdr_vaddr = header_segment_vaddr(segs[0].vaddr, page_size); }
 
     # PT_PHDR -> the program-header table (within the first, header-covering PT_LOAD).
     pos = write_phdr(buf, pos, PT_PHDR, PF_R, phdr_offset, hdr_vaddr + phdr_offset::u64,
@@ -4035,7 +4070,7 @@ fun write_dyn_phdrs(buf: *u8, phdr_offset: usize, lay: *DynLayout,
     # the page the ELF header + phdrs map at: one page below the first segment's
     # base, so extending the first segment down to file offset 0 covers them.
     var hdr_vaddr: u64 = 0;
-    if (seg_count > 0) { hdr_vaddr = (segs[0].vaddr & ~(page_size - 1)) - page_size; }
+    if (seg_count > 0) { hdr_vaddr = header_segment_vaddr(segs[0].vaddr, page_size); }
 
     # PT_PHDR -> the program-header table, so the dynamic loader can locate the
     # program's own headers. it lies within the first (header+text) PT_LOAD.
@@ -6587,4 +6622,93 @@ test "mach.lang.target.of.elf.emit_shared:dynamic_sections_in_sht" {
 
     if (bad) { ret 1; }
     ret 0;
+}
+
+# read every PT_LOAD's [vaddr, vaddr+memsz) from an emitted image and report whether any
+# two of them overlap
+#
+# A PROPERTY OVER THE WHOLE IMAGE, not an assertion about `phdr[0]`. The defect this
+# guards was one specific pair claiming one specific address, but keying the test on
+# that pair would pass the moment a later segment-layout change produced a different
+# overlapping pair - which is exactly the class of regression a layout change causes.
+# Stated as "no two load segments claim the same address", it fails closed for whatever
+# the next change does.
+# ---
+# buf: the emitted image bytes
+# ret: true when some pair of PT_LOAD segments overlaps in virtual address
+fun t_any_load_overlap(buf: *Vector[u8]) bool {
+    val e_phoff: usize = bin.read_u64_le(buf.data, 32)::usize;
+    val e_phnum: usize = bin.read_u16_le(buf.data, 56)::usize;
+    var i: usize = 0;
+    for (i < e_phnum) {
+        val ioff: usize = e_phoff + i * PHDR_SIZE;
+        if (bin.read_u32_le(buf.data, ioff) != PT_LOAD) { i = i + 1; cnt; }
+        val ia: u64 = bin.read_u64_le(buf.data, ioff + 16);
+        val iz: u64 = bin.read_u64_le(buf.data, ioff + 40);
+        var j: usize = i + 1;
+        for (j < e_phnum) {
+            val joff: usize = e_phoff + j * PHDR_SIZE;
+            if (bin.read_u32_le(buf.data, joff) != PT_LOAD) { j = j + 1; cnt; }
+            val ja: u64 = bin.read_u64_le(buf.data, joff + 16);
+            val jz: u64 = bin.read_u64_le(buf.data, joff + 40);
+            # a zero-length segment occupies nothing and cannot overlap.
+            if (iz > 0 && jz > 0 && ia < ja + jz && ja < ia + iz) { ret true; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# no two PT_LOAD segments of a static executable claim the same virtual address
+#
+# THE DEFECT: the static writer mapped the ELF header + program-header table AT
+# `segs[0].vaddr` while the PIE and dynamic writers mapped them a page below, so every
+# static image mach produced had two PT_LOADs covering one address. It executed
+# correctly because the loader maps segments in order and the later one wins, which is
+# why nothing caught it for so long - the image is only wrong to a reader, not to the
+# kernel. A consumer that derives load addresses from program headers rather than
+# section headers reads two different file ranges for one address; gdb 17.2 aborted
+# outright, and a consumer that merely picked the first match would have been silently
+# wrong instead.
+#
+# Asserted as a PROPERTY over the emitted phdrs, so it also covers the PIE and dynamic
+# writers and any future segment the layout gains.
+test "mach.lang.target.of.elf.emit_exec:load_segments_do_not_overlap" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var i: intern.Interner = intern.init(?alloc);
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64, EM_X86_64::u32, nil);
+
+    var text: [16]u8;
+    var data: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text[k] = 0x90; data[k] = 0; k = k + 1; }
+    var segs: [2]of.LoadSegment;
+    segs[0].vaddr = 0x400000; segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text[0];
+    segs[1].vaddr = 0x401000; segs[1].filesz = 16; segs[1].memsz = 16;
+    segs[1].flags = of.SEG_FLAG_READ | of.SEG_FLAG_WRITE; segs[1].bytes = ?data[0];
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "elf_overlap");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    var opts: of.ImageOptions;
+    opts.subsystem = 0;
+    val em: R.Result[bool, str] = emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 2, 4096, 0x400000, 0x400000,
+                                            nil::*of.ExecFunction, 0, nil::*of.Section, 0,
+                                            nil::*of.Section, 0, nil::*of.SymtabEntry, 0,
+                                            tpath::*u8, nil::*u8, opts);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    var buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    var bad: i32 = 0;
+    if (t_any_load_overlap(?buf)) { bad = 1; }
+    ret bad;
 }

@@ -7,7 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+#### Every static ELF carried two PT_LOAD segments claiming the same address (#2795)
+The static writer mapped the ELF header and program-header table **at** `segs[0].vaddr`; the PIE and dynamic writers mapped them one page **below** it. So every static executable mach has ever produced had two `PT_LOAD` segments covering the same virtual address - the header block and `.text` both at `0x400000` - on all three ELF targets.
+
+**The image runs correctly**, which is why nothing caught it: the loader maps segments in order and the later mapping wins. It is wrong only to a reader, and mach's linked executables carry no section headers, so program headers are all a reader has. `gdb 17.2` aborts outright at process start; a crash reporter or symbolizer doing the same derivation would have been **silently wrong** instead, which is the worse failure and why this is critical rather than cosmetic.
+
+The two paths computed one fact in two places and agreed only by accident. The header-segment base is now a single definition all three writers call, and `header_fits_reserved_page` guards the static path too - it never needed the guard before only because it had no reserved page to overrun. The regression test asserts the general property that **no two load segments overlap in virtual address**, over the emitted headers rather than about one specific pair, so it fails closed for whatever the next segment-layout change does.
+
 ### Added
+
+#### A generic instance can be named as a value, so a generic can be stored, passed, returned, and addressed (#2342)
+Type arguments were spellable only in **callee** position. `ident[i64](x)` worked, but `ident[i64]` in a value slot was read as the index expression `ident[i64]` and died in resolve with `unresolved identifier \`i64\`` - accurate for the parse that actually happened, and misleading about the intent. So a generic function could not be put in a `fun(i64) i64` binding, passed as a callback, returned, or placed in a table, and `?ident[i64]` was not the address of anything. The only way to get a function value out of a generic was to wrap the call in a non-generic function and take *its* address.
+
+`f[T, ..]` with no call after it now denotes the monomorphized instance itself and types as the **instantiated** signature, so all four uses work and `?f[i64]` is that instance's address. The instance is reached through the same `enqueue_instance` path a call site uses, so the two spellings enqueue the identical instance under the identical linkage name and neither can reach the bare template - the predicate #2302 depends on is satisfied by construction rather than by a second author. A bare `f` is still not a value and still has no address (#2305): a generic is a template, not code, and only an instance denotes a function.
+
+The parse is the same two probes the callee form already ran, with the same four outcomes, so there is no second disambiguation to drift. That does mean **every** bracket in the language now goes through them, where before only `x[...](...)` did, and the reading that was always a subscript has to stay one. Resolve decides the value form with a deliberately *narrower* predicate than the callee form's: only a name resolving to a function **declaration** takes type arguments in value position. The callee form's predicate accepts any imported symbol, which is harmless when a `(` follows and wrong without one - it would rule `mod.ARR[i]`, an imported array subscripted by a name, a generic instance. Both directions are pinned, in one module and across modules, and the whole int suite plus the self-host fixpoint is the acceptance for the blast radius.
+
+Where the payload is a type spelling and nothing else (`arr[*i32]`), there is no subscript reading to fall back on, and the error is now reported against the object - `type arguments in value position name a generic instance, but this does not name a generic function` - rather than as a parse failure on the `*`. A payload that is a value and nothing else (`f[0]`) is untouched and keeps #2305's `not indexable: a function has no elements`.
 
 #### `#[inline]` crosses a module boundary, so an atomic costs its instructions and not a call as well (#2231)
 Every caller of `std.sync.atomic` is in another module, and until now a dependency's function body never reached an importer at all. A `fetch_add` was a `call` to a function whose whole content is four instructions, and #2258 had already removed the stack-slot staging around it, leaving the call as the entire remaining cost the issue named.
