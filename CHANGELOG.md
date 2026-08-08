@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### A shader can use an interface variable declared in another module (#2843)
+#2823 let a shader call a function defined in a shared module, but the shader could not use an **interface variable** one declared. A library that owned anything beyond pure math had nowhere to put its descriptor set: a drawn-in body naming its own module's `#[uniform(...)]` found nothing, and the access was refused as computed addressing.
+
+The cause was that `Emit.root` was the module being compiled and every global resolved against it, so `declare_interface`, `iface_slot_of`, `global_var_id` and the block-layout helpers could only ever see the root's. Globals now flatten into one unit-wide table exactly as functions did, `GlobalEnt` carrying the `(member, index)` pair, and every per-global array is indexed by a table index. A global's type ids are read against **its own module's** type table, which is what the `(member, index)` pair exists to make possible - reading them against the root's would resolve each id to whatever type sits at the same index there, which is a wrong type silently rather than a failure. An extern shadow is never entered in the table for the same reason: it is minted against the consumer's type table, so its type id means nothing outside the module that made it.
+
+A drawn-in module contributes globals by **reachability, not membership**, the rule the function table already stated. A shared module may declare a whole descriptor set, and a shader importing it for one helper does not inherit the rest. The root is exempt: its interface list is the module's pipeline contract, declared whole. Existing single-module shaders emit byte-identical modules.
+
+The driver half closes the module set over cross-module **global** references, not only function ones. A shader that reads a shared module's uniform and calls nothing in it must still draw that module in, and before this it could not resolve the variable at all.
+
 ### Fixed
 
 #### riscv64 images claimed an instruction set they did not have (#2828)
@@ -17,6 +28,11 @@ Nothing states a string now. An image's claims are derived from the two facts th
 The merge rule is the arch's, because a union is right for the ISA string and wrong for everything else. Stack alignment must agree or the inputs cannot be linked. Unaligned access is a permission, so the image permits it if any input needed it. A privileged-spec disagreement leaves the image unable to state one, so it states none. A tag mach does not model survives only while every input that states it agrees. No shared layer can know which tag takes which rule, so the seam hands the arch the whole attribute body and reads none of it; the ELF layer keeps only the container, which the ARM EABI defines identically.
 
 `obj.rehome_remap` copies the body rather than aliasing it. Rehoming exists precisely because the source allocator is going away, so a field holding a pointer into it needs a copy and not an assignment - the note on that function now separates the two failure modes, since a missed scalar reverts to zero on the parallel path while a missed pointer segfaults somewhere else entirely.
+
+#### Two modules could claim one descriptor set and binding with no diagnostic (#2843)
+Within one module a repeated `(set, binding)` is a typo its author can see. Across modules it is neither: two shared libraries can each declare `#[uniform(0, 0)]` without either author seeing the other, and the shader importing both is where the conflict first exists. `spirv-val` does not catch it, because two variables at one pair are well-formed SPIR-V and the conflict is with the pipeline layout, which is not in the module.
+
+The pair is now checked over the set one entry point reaches, across the descriptor roles rather than within one, since a `#[uniform(0, 0)]` and a `#[storage(0, 0)]` are two descriptor types claiming one slot. The Location overlap check widened the same way, and both diagnostics name the declaring **module** when it is not the one being compiled - a message naming two `camera`s tells the one person who can act on it nothing.
 
 ## [4.17.0] - 2026-08-08
 
