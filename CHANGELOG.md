@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### A failed `#[library]` pin said the library was not in the link when it was (#2800)
+`import 'X' pinned to library 'glfw' not among the link's dependencies` was reported for a `glfw` the manifest **did** provide. The linker is handed loader names for the link's dynamic half and bare paths for its static half, so a `source = "local"` entry's logical name never reached it at all, and the only check it could run reported the half it could not see as absent.
+
+The message cost a day of investigation before anything was fixed. It named the manifest, so the report went at the export cascade - which was never broken, and is now pinned by a regression case that passes on the compiler that introduced it. The actual fault was a misspelled entry point (`glfwGetInstanceProcAddr` for GLFW's `glfwGetInstanceProcAddress`), which the message said nothing about.
+
+Which message a user saw was decided by accident, too: the same broken program read `undefined symbol` on a link with no shared library in it and the false `not among the link's dependencies` the moment any unrelated one joined. Two different statements about one program, one of them untrue, selected by something neither of them mentions.
+
+The driver's single walk over the link inputs now records each entry's logical name and whether it resolved static or dynamic, and the linker reads that one account rather than inferring the link from the half it was handed. A failed pin resolves to one of two truthful statements - the library is in the link **as a static input**, which defines symbols rather than importing them, so the symbol is undefined; or the library is genuinely nowhere in the effective link set, in which case the refusal stands and now lists what the link does provide. Both paths that can reach a failed pin call one decision function, so the wording no longer depends on the link's shape: the two int cases that differ only by an unrelated dynamic dependency assert **byte-identical** goldens, and a third holds the genuine refusal so the fix cannot become a blanket permit.
 #### The IR verifier now checks that a conversion is well-*typed* for its own opcode, not merely well-*formed* (#2808)
 The verifier constrained a conversion's **arity** - `OP_TRUNC` / `OP_SEXT` / `OP_ZEXT` / `OP_BITCAST` all sit in the "exactly one operand" bucket - and `VC_TYPE_AGREE` covered operand agreement for binary ops, branch conditions, load/store/gep bases and `ret` against the signature. Nothing related a conversion's **result width** to its operand's, so it checked that a conversion was well-formed and never that it meant what its opcode says. A width-changing `BITCAST`, a `TRUNC` whose result is *wider* than its operand, a `SEXT` / `ZEXT` whose result is *narrower*, and any of the three at *equal* widths were all accepted.
 
