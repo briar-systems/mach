@@ -3056,6 +3056,40 @@ fun atom_resume_offset(dst: u32, end: u32, section_align: u32) u32 {
 }
 
 # physical relocation shape supplied by the active ISA's relocatable-object seam
+# whether a symbol is object-private and named by no relocation in its own module
+#
+# An object-private symbol is resolved by (module, symbol index) and never by name
+# (#2520), so the ONLY thing that can address one is a relocation in the same module.
+# A local no relocation names is therefore unreachable, whatever it sits inside.
+#
+# Relocations sourced from a debug section do not count, for the same reason the atom
+# reference index skips them: debug information DESCRIBES code and must never be what
+# keeps code alive, or the `-g` link retains bodies the plain link discards (#2572).
+#
+# Scans the module's relocations rather than consulting a precomputed set: this is
+# asked only about a symbol that falls inside a duplicate weak body, which is rare,
+# and a set would have to be built for every link to serve those few questions.
+# ---
+# m:  the module owning both the symbol and the relocations that could name it
+# sy: index of the symbol within that module
+# ret: true when the symbol is local and nothing in the module names it
+fun unreferenced_local(m: *of.ObjectImage, sy: u32) bool {
+    if (sy >= m.symbol_count) { ret false; }
+    val sym: *of.Symbol = ?m.symbols[sy];
+    if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0) { ret false; }
+    if (sym.section == of.SECTION_EXTERNAL)        { ret false; }
+    var ri: u32 = 0;
+    for (ri < m.reloc_count) {
+        val r: *of.Relocation = ?m.relocations[ri];
+        if (r.sym == sy
+            && !(r.section < m.section_count && m.sections[r.section].kind == of.SK_DEBUG)) {
+            ret false;
+        }
+        ri = ri + 1;
+    }
+    ret true;
+}
+
 fun atom_reloc_traits(r: *of.Relocation, section: *of.Section,
                       arch: *isa.IsaVTable,
                       codegen_image: bool) rel.RelocTraits {
@@ -3507,16 +3541,25 @@ fun build_atom_plan(s: *session.Session, modules: *of.ObjectImage, module_count:
         if (end <= start) { ci = ci + 1; cnt; }
 
         # a second symbol entry or nonzero extent overlapping the candidate may
-        # remain addressable from live code. The sole exception is COFF's exact
-        # synthetic section anchor for a full COMDAT carrier; relocation
-        # reachability through that anchor is audited below.
+        # remain addressable from live code. Two exceptions: COFF's exact synthetic
+        # section anchor for a full COMDAT carrier, whose relocation reachability is
+        # audited below, and an object-private symbol NOTHING addresses, which cannot
+        # be reached by definition (`unreferenced_local`).
+        #
+        # The second exists because a producer may define interior labels that exist
+        # only to be consumed before this point. riscv64 defines a `.Lpcrel_hi` label
+        # at every `auipc` starting a psABI pair, and the pair collapse rewrites every
+        # reference to one away before the link reads a relocation (#2828); without
+        # this, one such label inside a duplicate weak body kept the whole body alive
+        # and the -g link then described it with a second, contradictory DIE.
         var safe: bool = true;
         var sy: u32 = 0;
         for (sy < modules[cm].symbol_count) {
             if (sy != cy) {
                 val other: *of.Symbol = ?modules[cm].symbols[sy];
                 if (other.section == sym.section
-                    && !atom_is_carrier_anchor(?modules[cm], sym, other, start, end)) {
+                    && !atom_is_carrier_anchor(?modules[cm], sym, other, start, end)
+                    && !unreferenced_local(?modules[cm], sy)) {
                     if (other.offset >= start && other.offset < end) { safe = false; }
                     if (other.size > 0) {
                         val other_end: u64 = other.offset::u64 + other.size::u64;
@@ -10808,15 +10851,23 @@ test "mach.lang.be.linker.atom_plan:copy_remap_and_reloc_liveness" {
     ret 0;
 }
 
-# a second symbol inside a losing function interval keeps that interval live;
-# this is the conservative control for an exposed local/shared label that a live
-# relocation could still address
+# a second symbol inside a losing function interval keeps that interval live WHEN
+# SOMETHING NAMES IT - the conservative control for an exposed local label a live
+# relocation could still address - and does NOT when nothing does. The pair is the
+# test: a local is resolved by index and never by name, so a relocation in its own
+# module is the only thing that can reach one, and a rule that ignored that kept every
+# duplicate weak body alive the moment riscv64 began defining a `.Lpcrel_hi` label at
+# each `auipc` inside one (#2828)
 test "mach.lang.be.linker.atom_plan:shared_symbol_retains_loser" {
     var alloc: A.Allocator;
     page.make(?alloc);
     val sr: R.Result[session.Session, str] = session.init(?alloc);
     if (R.is_err[session.Session, str](sr)) { ret 1; }
     var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val x64: *isa.IsaVTable = lt_isa(?reg, "x86_64");
+    if (x64 == nil) { ret 1; }
 
     val dup: intern.StrId = lt_name(?s, "dup$u64");
     val local: intern.StrId = lt_name(?s, "inside_label");
@@ -10839,19 +10890,37 @@ test "mach.lang.be.linker.atom_plan:shared_symbol_retains_loser" {
     b_syms[0].name = dup; b_syms[0].section = 0; b_syms[0].offset = 0;
     b_syms[0].size = 0; b_syms[0].flags = weak_flags;
     b_syms[1].name = local; b_syms[1].section = 0; b_syms[1].offset = 4;
-    b_syms[1].size = 0; b_syms[1].flags = of.SYM_OBJ_FLAG_FUNCTION;
+    b_syms[1].size = 0; b_syms[1].flags = 0;
+
+    # module b names its own interior label from its own text: that reference is what
+    # makes the label reachable, and the label is what makes the body unsafe to drop
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = of.RK_PC32;
+    relocs[0].sym = 1; relocs[0].addend = 0;
 
     var mods: [2]of.ObjectImage;
     mods[0] = lt_image(?s, lt_name(?s, "a"), ?a_sec[0], 1, ?a_syms[0], 1,
                        nil::*of.Relocation, 0);
     mods[1] = lt_image(?s, lt_name(?s, "b"), ?b_sec[0], 1, ?b_syms[0], 2,
-                       nil::*of.Relocation, 0);
+                       ?relocs[0], 1);
     var bases: [2]u32;
     var plan: AtomPlan;
     init_atom_plan(?plan);
     val pr: R.Result[bool, str] =
-        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, x64, ?plan);
     if (R.is_err[bool, str](pr) || plan.active || plan.drop_count != 0) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+
+    # the SAME shape with nothing naming the label: unreachable, so the duplicate body
+    # goes. this is the riscv64 `.Lpcrel_hi` case, whose references are all rewritten
+    # away by the pair collapse before the link reads a relocation
+    init_atom_plan(?plan);
+    mods[1] = lt_image(?s, lt_name(?s, "b"), ?b_sec[0], 1, ?b_syms[0], 2,
+                       nil::*of.Relocation, 0);
+    val ur: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, x64, ?plan);
+    if (R.is_err[bool, str](ur) || !plan.active || plan.drop_count != 1) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
     ret 0;
 }
 
@@ -10864,6 +10933,11 @@ test "mach.lang.be.linker.atom_plan:sized_extent_and_covering_symbol" {
     val sr: R.Result[session.Session, str] = session.init(?alloc);
     if (R.is_err[session.Session, str](sr)) { ret 1; }
     var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val x64: *isa.IsaVTable = lt_isa(?reg, "x86_64");
+    if (x64 == nil) { ret 1; }
 
     val dup: intern.StrId = lt_name(?s, "sized$u64");
     val cover: intern.StrId = lt_name(?s, "cover");
@@ -10891,16 +10965,22 @@ test "mach.lang.be.linker.atom_plan:sized_extent_and_covering_symbol" {
     b_syms[1].name = cover; b_syms[1].section = 0; b_syms[1].offset = 16;
     b_syms[1].size = 0; b_syms[1].flags = 0;
 
+    # module b names `cover` from its own text, so it is a reachable local and the
+    # covering-extent arm below is testing the extent rather than an unreferenced label
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = of.RK_PC32;
+    relocs[0].sym = 1; relocs[0].addend = 0;
+
     var mods: [2]of.ObjectImage;
     mods[0] = lt_image(?s, lt_name(?s, "a"), ?a_sec[0], 1, ?a_syms[0], 1,
                        nil::*of.Relocation, 0);
     mods[1] = lt_image(?s, lt_name(?s, "b"), ?b_sec[0], 1, ?b_syms[0], 2,
-                       nil::*of.Relocation, 0);
+                       ?relocs[0], 1);
     var bases: [2]u32;
     var plan: AtomPlan;
     init_atom_plan(?plan);
     val sized: R.Result[bool, str] =
-        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, x64, ?plan);
     if (R.is_err[bool, str](sized) || !plan.active || plan.drop_count != 1) { ret 1; }
     if (plan.drops[0].start != 0 || plan.drops[0].end != 8
         || plan.sections[1].live_len != 8) { ret 1; }
@@ -10920,7 +11000,7 @@ test "mach.lang.be.linker.atom_plan:sized_extent_and_covering_symbol" {
     b_syms[1].offset = 0;
     b_syms[1].size = 16;
     val covered: R.Result[bool, str] =
-        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, x64, ?plan);
     if (R.is_err[bool, str](covered) || plan.active) { ret 1; }
     ret 0;
 }
