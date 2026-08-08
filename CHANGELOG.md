@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### A CI leg no longer fails because an unrelated apt repository is down (#2885)
+`apt-get update` exits non-zero when any configured repository is unreachable, including repositories the job never installs from. The runner image carries Microsoft's and azure-cli's lists preinstalled, and a 403 from them failed `int pinned (linux)` while every Ubuntu repository the job actually reads fetched fine. It cleared on a rerun, which is worse than a hard failure: it teaches everyone reading CI that a red `int pinned` is probably noise.
+
+Package installation moved into one composite action the four sites call. The update's verdict is no longer the step's, and the install's is - a package a leg genuinely needs and cannot find still fails it, loudly, which is the signal the update was standing in for. Dropping the unused third-party lists first would work today at the price of a list of other people's repositories to maintain against a runner image nobody here controls; the install is the check that needs no such list. It lives in the action rather than at each call site so a leg cannot be added under the old shape.
+
 #### An `i64` global compiles on rv32 instead of crashing the compiler (#2867)
 A wide global feeding wide arithmetic on riscv32 killed the compiler with SIGSEGV and no diagnostic, and the same construct without the arithmetic produced a refusal. Both came from one place. Lowering folds a global straight into the access as a symbol operand, so a `MIR_LOAD` or `MIR_STORE` on one carries no memory operand at all, while `legalize` entered its memory path on the opcode alone and then indexed the memory operand it assumed was there. The index was `-1`: one shape read a wild pointer and faulted, the other read one slot past the operand array and refused off whatever it found. The refusal was never a decision.
 
