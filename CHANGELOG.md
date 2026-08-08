@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### A cast that converts nothing emits nothing (#2881)
+`lower_cast` chooses a conversion from the source and target pair and fell through to a bitcast whenever the two shared a width, so a cast whose operand already had the destination type emitted a reinterpretation of a type as itself. In SPIR-V that surfaced as `OpBitcast %ulong %ulong_2`, an instruction with no effect, which is how it was found.
+
+It was never only cosmetic. An identity bitcast is an opaque SSA definition, so the value behind it stops being a constant: `~(0::usize) / 0xFF` in `std.memory.raw_fill` - the byte-splat every `raw_fill` performs - lowered to a runtime `div` on every target, because `0::usize` on a literal already typed `usize` put a bitcast between the constant and the fold. Seventy such divisions disappear from the compiler's own image.
+
+The fold is keyed on the two IR types being EQUAL rather than on their widths matching, which is the distinction that makes it safe: a same-width cast that genuinely reinterprets - an integer and a float, where the bitcast is what carries the general/float register-bank crossing to the backend - has two different IR types and still emits. It sits in the lowerer's conversion selection rather than in `builder.emit_bitcast`, because choosing no instruction is a selection decision and the builder's callers, including the IR verifier's own width test, are entitled to emit exactly what they ask for.
+
+Secrecy is unaffected. `OP_BITCAST` is classified a secret move, so an identity bitcast was a link in the taint chain the `#[oblivious]`-required check reads, but sema forbids `::` and `:~` from adding or dropping `^`, so a cast and its operand always agree on secrecy and the operand's own definition is already stamped. A secret compute reached through an identity cast is still required to declare `#[oblivious]`.
+
 #### An RV64-only mnemonic in an `asm riscv32` body is refused rather than assembled (#2864)
 `ld`, `sd`, `addw` and the rest of the `*W` group do not exist at XLEN 32, and an `asm riscv32` body naming one assembled it anyway. The image carried an instruction the hardware does not implement, so the mistake surfaced as an illegal-instruction trap at run time instead of a diagnostic at build time - a wrong answer through a green build, which is the failure mode this target class exists to catch.
 
