@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### An RV64-only mnemonic in an `asm riscv32` body is refused rather than assembled (#2864)
+`ld`, `sd`, `addw` and the rest of the `*W` group do not exist at XLEN 32, and an `asm riscv32` body naming one assembled it anyway. The image carried an instruction the hardware does not implement, so the mistake surfaced as an illegal-instruction trap at run time instead of a diagnostic at build time - a wrong answer through a green build, which is the failure mode this target class exists to catch.
+
+The cause was a split authority. One mnemonic table served both machines and the rows carried no width, so the assembler knew the spelling and the encoder knew the machine and neither asked the other. The fix states the fact once, on the instruction: every `MachOp` declares the register widths it exists at, and both the assembler and the encoder read that. A mnemonic is refused because the instruction it names does not exist here, which is why an alias, a pseudo spelling and a row the suffix decoder synthesizes all inherit the answer without being listed anywhere - `sext.w` and `amoadd.d` are refused on rv32 for the same reason `addiw` is.
+
+The set is per instruction rather than a minimum register width, so an RV32-only form is expressible when one arrives rather than a reshape of the layer. A form the module does not classify admits nothing, so appending an instruction without stating its machines refuses it loudly instead of admitting it everywhere quietly, and a unit test walks the shipping table and the decoder's whole synthesized range to hold that.
+
+The shift-amount field went the same way: it is as wide as the register it shifts, so `slli a0, a1, 32` is refused on rv32, where its sixth bit would have landed in `funct7` and decoded as a different instruction. `slli a0, a1, 31` still assembles, and every RV64-only spelling still assembles under a `riscv64` tag.
+
+`doc/language/asm.md` no longer tells the reader to gate these spellings themselves.
+#### A CI leg no longer fails because an unrelated apt repository is down (#2885)
+`apt-get update` exits non-zero when any configured repository is unreachable, including repositories the job never installs from. The runner image carries Microsoft's and azure-cli's lists preinstalled, and a 403 from them failed `int pinned (linux)` while every Ubuntu repository the job actually reads fetched fine. It cleared on a rerun, which is worse than a hard failure: it teaches everyone reading CI that a red `int pinned` is probably noise.
+
+Package installation moved into one composite action the four sites call. The update's verdict is no longer the step's, and the install's is - a package a leg genuinely needs and cannot find still fails it, loudly, which is the signal the update was standing in for. Dropping the unused third-party lists first would work today at the price of a list of other people's repositories to maintain against a runner image nobody here controls; the install is the check that needs no such list. It lives in the action rather than at each call site so a leg cannot be added under the old shape.
 #### A wide global is executed and value-checked on the rv32 reference core (#2883)
 The rv32 harness loaded `.text` alone out of the unlinked object image, so no program touching a global could be executed: `.data` was not in the core's memory at all, and a global reference on rv32 is an `auipc` / `lw` pair against `%pcrel_hi` and `%pcrel_lo` that the linker patches, so even with the data present the address would have been zero. That is why the #2867 repair - one native access per lane at successive addends on the same symbol - had no in-tree value check and had to be verified against an external interpreter.
 
