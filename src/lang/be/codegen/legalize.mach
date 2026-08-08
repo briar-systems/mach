@@ -132,7 +132,7 @@ use target: mach.lang.target.resolved;
 # the machine facts the pass reads, lifted off the resolved target once
 #
 # Keeping them in a record rather than threading the whole `target.Target` is what
-# lets the pass be exercised directly by its own tests, and it names the exact five
+# lets the pass be exercised directly by its own tests, and it names the exact six
 # facts legalization depends on.
 # ---
 # lane_width: the native ALU width in bytes (`model.max_alu_width`); one lane
@@ -142,6 +142,9 @@ use target: mach.lang.target.resolved;
 # has_mul:    whether the ISA has a hardware integer multiply at all
 #             (`model.has_mul`); false hands this pass every MIR_MUL, native width
 #             included - unlike every other gate here, this one is not width-driven
+# mul_hi:     the width in bytes at which the ISA yields the HIGH half of an unsigned
+#             lane product (`model.mul_hi_width`), or 0. equal to `lane_width` selects
+#             the schoolbook wide multiply; 0 selects the synthesized lane product
 # stage_lo:   low half of the backend's reserved address-staging register pair
 #             (`RegMachine.scratch_reg`), the fixed base a runtime-pointer access
 #             is decomposed at
@@ -151,6 +154,7 @@ rec Machine {
     ptr_width:  u8;
     var_shift:  bool;
     has_mul:    bool;
+    mul_hi:     u8;
     stage_lo:   i32;
     stage_hi:   i32;
 }
@@ -205,6 +209,7 @@ pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[bool, str] {
     mach.ptr_width  = tgt.model.pointer_width::u8;
     mach.var_shift  = tgt.model.has_var_shift;
     mach.has_mul    = tgt.model.has_mul;
+    mach.mul_hi     = tgt.model.mul_hi_width::u8;
     mach.stage_lo   = -1;
     mach.stage_hi   = -1;
     # a register machine declares the reserved scratch pair; a whole-module emitter
@@ -582,11 +587,31 @@ fun legalize_block(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, b:
         i = i + 1;
     }
 
+    # THE COUNT AND THE EMIT MUST AGREE, AND THIS IS WHERE THAT IS CHECKED (#2778).
+    # Every expansion computes its piece count before emitting and this array is sized
+    # from the sum, so the two agreeing is an invariant each expansion honours by hand.
+    # Nothing used to verify it: the block took its length from the PREDICTED total, so
+    # an expansion that emitted fewer pieces than it counted left the tail as zeroed
+    # `MirInstr`s - opcode 0, no operands - silently inside the block, and no test
+    # asserting "block length equals the count" could ever have seen it, because that
+    # length WAS the count. An over-emit is worse and already past the end of the array
+    # by the time it is noticed.
+    #
+    # Taking the length from the cursor and refusing on disagreement turns the quietest
+    # failure this pass has into a named one. It is not defensive: the cost is one
+    # comparison per block, and the alternative is that a miscounted expansion is
+    # discovered as wrong arithmetic on a target nobody runs.
+    if (w != total) {
+        free_pieces(alloc, dst, w);
+        A.deallocate[mir.MirInstr](alloc, dst, total::usize);
+        ret R.err[bool, str]("legalize: an expansion emitted a different number of pieces than it counted (internal compiler error, see briar-systems/mach#2778)");
+    }
+
     if (b.instrs != nil && b.instr_cap > 0) {
         A.deallocate[mir.MirInstr](alloc, b.instrs, b.instr_cap::usize);
     }
     b.instrs      = dst;
-    b.instr_count = total;
+    b.instr_count = w;
     b.instr_cap   = total;
     ret R.ok[bool, str](true);
 }
@@ -1778,13 +1803,243 @@ fun emit_shift_barrel(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction,
     ret R.ok[bool, str](true);
 }
 
-# the exact piece count of a wide multiply's double-and-add expansion, or a loud
-# error
+# the exact piece count of a double-and-add run of `stages` stages over `nl` lanes
+#
+# Read by the count and walked by `emit_double_and_add`, so the two cannot drift.
+# ---
+# nl:     the lane count of the running values and the accumulator
+# stages: how many multiplier bits the run consumes
+fun double_and_add_pieces(nl: u32, stages: u32) u32 {
+    # per stage: extract the running multiplier's low bit, turn it into a select
+    # mask, accumulate the running multiplicand into the result through the carry
+    # chain, and branchlessly select the accumulated-or-unchanged result.
+    val per_stage: u32 = 2 + addsub_chain_piece_count(nl) + 3 * nl;
+    # every stage but the last also advances both running values by one bit: the
+    # multiplicand left (doubling it), the multiplier right (consuming the bit
+    # just tested) - both a shift-by-one template, one lane classification each.
+    val shl1: u32 = const_shift_pieces(nl, 0, 1, true, false);
+    val shr1: u32 = const_shift_pieces(nl, 0, 1, false, false);
+    ret stages * per_stage + (stages - 1) * (shl1 + shr1);
+}
+
+# whether an accumulator lane still holds the immediate zero it was seeded with
+#
+# Named rather than inlined because the emit and the count must agree on it exactly:
+# a lane this answers true for costs no pieces, and a count that disagreed would size
+# the rebuilt array wrong.
+fun lane_is_seed_zero(op: mir.MirOperand) bool {
+    ret op.kind == mir.MIR_OP_IMM && op.imm == 0;
+}
+
+# the pieces accumulating into lane `p` costs, advancing the liveness `live` tracks
+#
+# THE COUNT AND THE EMIT MUST AGREE ON LIVENESS, NOT JUST ON ARITHMETIC, and getting
+# that wrong is how this expansion first shipped a wrong 6502 multiply. A value landing
+# in a lane still holding its seed zero repoints that ONE lane and emits nothing; a
+# value landing in a live lane runs the carry chain, and that chain writes a fresh vreg
+# into EVERY lane above it, so all of them become live too. Tracking only the lane
+# written directly undercounts the next product into a lane the chain had already
+# quietly made live, and an undercounted expansion overruns the array it was sized for.
+# ---
+# live: per-lane liveness, advanced in place
+# nl:   the accumulator's lane count
+# p:    the lane the value is added into
+fun accum_into(live: *bool, nl: u32, p: u32) u32 {
+    if (!live[p]) { live[p] = true; ret 0; }
+    var k: u32 = p;
+    for (k < nl) { live[k] = true; k = k + 1; }
+    ret accum_lane_pieces(nl, p);
+}
+
+# the pieces one `emit_accumulate_lane` costs, when the lane is already live
+#
+# The lane itself, then one add and one carry test per lane above it, less the carry
+# test the top lane does not need because nothing reads its carry-out. `p == nl - 1`
+# lands on 1, which is the same formula and not a special case.
+fun accum_lane_pieces(nl: u32, p: u32) u32 {
+    ret 2 * (nl - p) - 1;
+}
+
+# add a single native-width value into lane `p` of an accumulator, carrying upward
+#
+# The counterpart of `emit_addsub_chain` for the schoolbook multiply: a partial
+# product is ONE lane (or two), not a whole wide value, so adding it through the
+# full-width chain would spend a lane's work on every lane below and above it. This
+# starts at `p` and stops carrying as soon as the top lane is reached.
+#
+# The accumulator lanes are REPLACED, not mutated: each write lands in a fresh vreg
+# and `acc[k]` is repointed, because this pass emits into a single straight-line block
+# where a value is defined once. A lane this has not reached yet may still be the
+# `mir.op_imm(0)` the caller seeded it with, and that is deliberate - the first
+# accumulation into a lane reads the immediate and needs no zeroing move at all.
+# ---
+# alloc:  backing allocator for piece operand arrays and lane temporaries
+# f:      the MIR function (for appending temporaries)
+# src:    the instruction the sequence replaces (source of loc / inline_site)
+# dst:    the rebuilt instruction array
+# cursor: next write index into `dst`; advanced past the emitted pieces
+# acc:    the `nl` accumulator lane operands, repointed in place
+# nl:     the accumulator's lane count
+# lw:     the native lane width in bytes
+# p:      the lane `v` is added into
+# v:      the value added
+# ret:    ok(true) on success, or an allocation error
+fun emit_accumulate_lane(alloc: *A.Allocator, f: *mir.MirFunction, src: *mir.MirInstr,
+                         dst: *mir.MirInstr, cursor: *u32, acc: *mir.MirOperand,
+                         nl: u32, lw: u8, p: u32, v: mir.MirOperand) R.Result[bool, str] {
+    # the FIRST value into a lane is the lane, and costs nothing. the accumulator is
+    # seeded with immediate zeros, and `0 + v` is `v` with no carry out, so this
+    # repoints the lane rather than emitting an add the target would have to
+    # materialize the zero for. `mul_schoolbook_pieces` tracks the same seeding.
+    if (lane_is_seed_zero(acc[p])) { acc[p] = v; ret R.ok[bool, str](true); }
+
+    val rt: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](rt)) { ret R.err[bool, str](R.unwrap_err[u32, str](rt)); }
+    val t: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rt));
+    val r1: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, mir.MIR_ADD, t, acc[p], v, lw);
+    if (R.is_err[bool, str](r1)) { ret r1; }
+
+    # the top lane's carry-out is discarded (wrapping arithmetic), so it is never built
+    if (p == nl - 1) { acc[p] = t; ret R.ok[bool, str](true); }
+
+    val rc: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](rc)) { ret R.err[bool, str](R.unwrap_err[u32, str](rc)); }
+    var carry: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rc));
+    val r2: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, mir.MIR_CMP_LT_U, carry, t, v, lw);
+    if (R.is_err[bool, str](r2)) { ret r2; }
+    acc[p] = t;
+
+    var k: u32 = p + 1;
+    for (k < nl) {
+        val rn: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](rn)) { ret R.err[bool, str](R.unwrap_err[u32, str](rn)); }
+        val n: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rn));
+        val r3: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, mir.MIR_ADD, n, acc[k], carry, lw);
+        if (R.is_err[bool, str](r3)) { ret r3; }
+        acc[k] = n;
+        if (k == nl - 1) { ret R.ok[bool, str](true); }
+
+        # carrying a 0/1 into a lane wraps only when the lane was all-ones, which is
+        # exactly `n <u carry` - the same unsigned-compare carry the add chain uses.
+        val rc2: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](rc2)) { ret R.err[bool, str](R.unwrap_err[u32, str](rc2)); }
+        val c2: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rc2));
+        val r4: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, mir.MIR_CMP_LT_U, c2, n, carry, lw);
+        if (R.is_err[bool, str](r4)) { ret r4; }
+        carry = c2;
+        k = k + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# the pieces one lane product costs
+# ---
+# native:   whether the target declares a widening lane multiply
+# want_hi:  whether the high half is wanted as well as the low
+# lane_bits: bits in one lane
+fun lane_product_pieces(native: bool, want_hi: bool, lane_bits: u32) u32 {
+    if (native) {
+        if (want_hi) { ret 2; }
+        ret 1;
+    }
+    # synthesized: a double-and-add whose multiplier is one lane wide, so it runs
+    # `lane_bits` stages rather than the whole value's - over two lanes when the high
+    # half is wanted and one when it is not.
+    if (want_hi) { ret double_and_add_pieces(2, lane_bits); }
+    ret double_and_add_pieces(1, lane_bits);
+}
+
+# emit the product of two native-width lanes into `lo` and, when wanted, `hi`
+#
+# THE ONE PLACE THE DECLARED FACT IS READ. Everything else in the schoolbook is
+# target-blind; this picks between the ISA's own `MIR_MUL` / `MIR_MUL_HI_U` pair and a
+# double-and-add that synthesizes the same two lanes. That is the contract's whole
+# shape: the EXPANSION is shared and the LEAF is declared, so a target with no
+# multiply at all is a member of the same expansion rather than a separate algorithm.
+# ---
+# alloc:   backing allocator for piece operand arrays and lane temporaries
+# plan:    the function's lane assignment (supplies the declared fact)
+# f:       the MIR function (for appending temporaries)
+# src:     the instruction the sequence replaces
+# dst:     the rebuilt instruction array
+# cursor:  next write index into `dst`; advanced past the emitted pieces
+# a, b:    the two native-width lane operands
+# lo:      destination operand for the low half
+# hi:      destination operand for the high half, ignored when `want_hi` is false
+# want_hi: whether the high half is wanted
+# ret:     ok(true) on success, or an allocation error
+fun emit_lane_product(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, src: *mir.MirInstr,
+                      dst: *mir.MirInstr, cursor: *u32,
+                      a: mir.MirOperand, b: mir.MirOperand,
+                      lo: mir.MirOperand, hi: mir.MirOperand, want_hi: bool) R.Result[bool, str] {
+    val lw: u8 = plan.lane_width;
+    if (plan.mach.mul_hi != 0) {
+        val r1: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, mir.MIR_MUL, lo, a, b, lw);
+        if (R.is_err[bool, str](r1)) { ret r1; }
+        if (!want_hi) { ret R.ok[bool, str](true); }
+        ret emit_bin(alloc, dst, cursor, src, mir.MIR_MUL_HI_U, hi, a, b, lw);
+    }
+
+    # no native lane product: zero-extend both lanes to the width of the answer and run
+    # the double-and-add for exactly one lane's worth of multiplier bits.
+    var mc:  [MAX_SHIFT_LANES]mir.MirOperand;
+    var mp:  [MAX_SHIFT_LANES]mir.MirOperand;
+    var out: [MAX_SHIFT_LANES]mir.MirOperand;
+    mc[0]  = a;
+    mp[0]  = b;
+    out[0] = lo;
+    var n: u32 = 1;
+    if (want_hi) {
+        mc[1]  = mir.op_imm(0);
+        mp[1]  = mir.op_imm(0);
+        out[1] = hi;
+        n = 2;
+    }
+    ret emit_double_and_add(alloc, plan, f, src, dst, cursor, ?mc[0], ?mp[0], ?out[0], n, lw::u32 * 8);
+}
+
+# the exact piece count of the schoolbook expansion over `nl` lanes
+#
+# Walks the same two loops the emit does rather than closing the form, because the
+# per-position cost is not uniform: a partial product at position `p` carries into
+# `nl - p` lanes, and one at the top position needs no high half at all.
+fun mul_schoolbook_pieces(plan: *LanePlan, nl: u32) u32 {
+    val native:    bool = plan.mach.mul_hi != 0;
+    val lane_bits: u32  = plan.lane_width::u32 * 8;
+    # mirrors the emit's seeding lane by lane, which is why this walks rather than
+    # closing the form: which lanes are still their seed zero depends on the order the
+    # partial products arrive in, and the emit and the count must agree exactly.
+    var live: [MAX_SHIFT_LANES]bool;
+    var total: u32 = 0;
+    var i: u32 = 0;
+    for (i < nl) { live[i] = false; i = i + 1; }
+    i = 0;
+    for (i < nl) {
+        var j: u32 = 0;
+        for (i + j < nl) {
+            val p: u32 = i + j;
+            val want_hi: bool = p + 1 < nl;
+            total = total + lane_product_pieces(native, want_hi, lane_bits);
+            total = total + accum_into(?live[0], nl, p);
+            if (want_hi) { total = total + accum_into(?live[0], nl, p + 1); }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    # the accumulator lives in temporaries and is copied out at the end, so a
+    # destination lane that also feeds the multiply is not clobbered mid-expansion.
+    ret total + nl;
+}
+
+# the exact piece count of a wide multiply's expansion, or a loud error
 #
 # Rejects the shapes the expansion cannot realize before any block is rebuilt: an
 # operand that is neither lane-ready, a lane count past what a scalar can span, and
 # a destination that is not a plain vreg - the same shapes `expand_mul` itself
-# checks, so the two cannot disagree.
+# checks, so the two cannot disagree. Also rejects a machine description this pass
+# does not model, LOUDLY and by name rather than by emitting the wrong sequence: a
+# `mul_hi_width` that is neither 0 nor the ALU width, or one declared on a target that
+# says it has no multiply at all.
 # ---
 # plan: the function's lane assignment
 # mi:   the multiply instruction
@@ -1796,53 +2051,54 @@ fun mul_piece_count(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr) R.R
         !operand_is_lane_ready(plan, ?mi.operands[1], nl) || !operand_is_lane_ready(plan, ?mi.operands[2], nl)) {
         ret R.err[u32, str](unsupported_message(alloc, mi.opcode, mi.width));
     }
-    val lw:   u8  = plan.lane_width;
-    val bits: u32 = nl * lw::u32 * 8;
-    # per stage: extract the running multiplier's low bit, turn it into a select
-    # mask, accumulate the running multiplicand into the result through the carry
-    # chain, and branchlessly select the accumulated-or-unchanged result.
-    val per_stage: u32 = 2 + addsub_chain_piece_count(nl) + 3 * nl;
-    # every stage but the last also advances both running values by one bit: the
-    # multiplicand left (doubling it), the multiplier right (consuming the bit
-    # just tested) - both a shift-by-one template, one lane classification each.
-    val shl1: u32 = const_shift_pieces(nl, 0, 1, true, false);
-    val shr1: u32 = const_shift_pieces(nl, 0, 1, false, false);
-    ret R.ok[u32, str](bits * per_stage + (bits - 1) * (shl1 + shr1));
+    if (plan.mach.mul_hi != 0 && plan.mach.mul_hi != plan.lane_width) {
+        ret R.err[u32, str]("legalize: this target declares a widening multiply at a width other than its ALU width, which this pass does not model (see briar-systems/mach#2778)");
+    }
+    if (plan.mach.mul_hi != 0 && !plan.mach.has_mul) {
+        ret R.err[u32, str]("legalize: this target declares the high half of a multiply but no multiply (see briar-systems/mach#2778)");
+    }
+    if (nl > 1) { ret R.ok[u32, str](mul_schoolbook_pieces(plan, nl)); }
+    # a single lane is not a schoolbook of anything: there is one partial product and
+    # it is the answer, so this is the leaf expansion run directly.
+    ret R.ok[u32, str](double_and_add_pieces(nl, nl * plan.lane_width::u32 * 8));
 }
 
-# expand a wide multiply into a double-and-add sequence over the operation's own
-# width
+# expand a wide multiply
 #
-# THE ALGORITHM (#2344). Classic shift-and-add, "Russian peasant" multiplication:
-# for every bit of the multiplier, from the low bit up, the running multiplicand
-# joins an accumulator when that bit is set, then the multiplicand doubles (shifts
-# left one) and the multiplier is consumed one bit (shifts right one) so the NEXT
-# bit tested is always the running value's own low bit - no per-stage lane/bit
-# indexing into the original operand is needed, only two per-stage constant
-# shifts-by-one, which is why this reuses the shift template so directly.
+# THE SHAPE IS SHARED, THE LEAF IS DECLARED (#2778). Above one lane this is schoolbook
+# long multiplication: every pair of lanes contributes a two-lane partial product at
+# lane position `i + j`, and the wrapping result reads only the low `nl` lanes, so a
+# pair whose position is already past the top contributes nothing and is never emitted
+# at all. `emit_lane_product` is the only place that asks what the machine can do; a
+# target declaring `mul_hi_width` gets one `mul` / `mulhu` pair per position, and one
+# declaring 0 gets a double-and-add over that position's two lanes instead.
 #
-# BRANCHLESS, NOT CONSTANT-TIME - and that distinction is deliberate, not an
-# oversight. This pass emits straight-line code into ONE block; it cannot build the
-# new control-flow edges a data-dependent branch would need, so the per-stage
-# "add or don't" decision is a mask-and-select exactly like the shift barrel's own
-# per-stage decision (#2217), for the same structural reason. It is NOT for secrecy:
-# `ct_trust_mul = false` on every target this compiler has (mos6502 included), so
-# `mir.lower`'s GATE (#1646) already refuses a secret multiply operand before this
-# pass ever runs - nothing here needs to be data-independent, and the full
-# `bits`-stage cost (linear in width, no early exit) is paid by every multiply,
-# public values included, purely because this pass cannot express "stop early."
+# WHY THIS BEATS THE DOUBLE-AND-ADD IT REPLACED (#2344). The old expansion was one
+# stage per BIT of the whole value, each stage touching every lane - O(nl * lane_bits)
+# stages of O(nl) work. Schoolbook is O(nl^2) positions of one lane product each. With
+# a native lane product that is the difference between 64 stages and four instructions
+# for an `i64` multiply on a 32-bit machine. Without one the leaf is still a
+# double-and-add, but over ONE lane's multiplier bits rather than the whole value's and
+# over two lanes rather than all of them, so a machine with no multiply at all wins
+# too - less dramatically, and for the same structural reason.
 #
-# THE COST IS HONEST RATHER THAN CHEAP, the same call the shift barrel already
-# made: `bits` stages of an add-chain plus two shifts-by-one is asymptotically
-# BETTER than a lane-wise schoolbook of partial products would be (O(width) stages
-# against O(lanes^2) partial products, each itself a smaller multiply), not merely
-# simpler to write.
+# THE OLD DOC'S ARITHMETIC WAS RIGHT AND ITS CONCLUSION WAS WRONG. It argued O(width)
+# stages beat O(lanes^2) partial products "each itself a smaller multiply". That holds
+# only where a lane product IS a smaller multiply. Where the machine has one it is a
+# single instruction, and where it does not the smaller multiply is cheaper than the
+# bigger one by exactly the factor the recursion saves. The unstated assumption was
+# that the leaf costs the same as the whole, and it never did.
 #
-# SHARED, NOT MOS6502-SPECIFIC: nothing here reads a mos6502 fact: only
-# `plan.lane_width`, the shift template, and the carry chain, all already
-# target-blind. It also serves the native-width case (`u8 * u8`) the same way as
-# the wide one - `nl == 1` runs the identical loop with a single-lane accumulator,
-# the same shape `emit_addsub_chain` already handles for a single-lane add.
+# BRANCHLESS FOR THE SAME STRUCTURAL REASON AS BEFORE, and still not for secrecy: this
+# pass emits straight-line code into one block and cannot build the control-flow edges
+# a data-dependent branch needs. `ct_trust_mul = false` on every target this compiler
+# has, so `mir.lower`'s GATE (#1646) already refuses a secret multiply operand before
+# this pass runs.
+#
+# UNSIGNED LANE PRODUCTS, WHATEVER THE VALUE'S SIGNEDNESS, and that is not an
+# approximation. A wrapping product of `nl` lanes is determined by the low `nl` lanes
+# of the schoolbook sum, and every lane is an unsigned digit of its operand's two's-
+# complement image, so the sign lives entirely in the lanes this discards.
 # ---
 # alloc:  backing allocator for piece operand arrays and lane temporaries
 # plan:   the function's lane assignment
@@ -1858,24 +2114,130 @@ fun expand_mul(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *m
 
     val nl: u32 = wide_lane_count(plan, mi);
     val lw: u8  = plan.lane_width;
-    val lb: u32 = lw::u32 * 8;
-    val bits: u32 = nl * lb;
 
     var dst_ops: [MAX_SHIFT_LANES]mir.MirOperand;
-    var mcand:   [MAX_SHIFT_LANES]mir.MirOperand;  # the running multiplicand, doubles each stage
-    var mplier:  [MAX_SHIFT_LANES]mir.MirOperand;  # the running multiplier, halves each stage
-    var result:  [MAX_SHIFT_LANES]mir.MirOperand;  # the accumulator, zero initially
+    var a_ops:   [MAX_SHIFT_LANES]mir.MirOperand;
+    var b_ops:   [MAX_SHIFT_LANES]mir.MirOperand;
     var i: u32 = 0;
     for (i < nl) {
         dst_ops[i] = lane_operand(plan, ?mi.operands[0], i);
-        mcand[i]   = lane_operand(plan, ?mi.operands[1], i);
-        mplier[i]  = lane_operand(plan, ?mi.operands[2], i);
-        result[i]  = mir.op_imm(0);
+        a_ops[i]   = lane_operand(plan, ?mi.operands[1], i);
+        b_ops[i]   = lane_operand(plan, ?mi.operands[2], i);
+        i = i + 1;
+    }
+
+    if (nl == 1) {
+        ret emit_double_and_add(alloc, plan, f, mi, dst, cursor, ?a_ops[0], ?b_ops[0], ?dst_ops[0],
+                                nl, lw::u32 * 8);
+    }
+
+    # the accumulator starts as immediate zeros, so the first partial product added to
+    # a lane reads the immediate and no zeroing move is emitted for it.
+    var acc: [MAX_SHIFT_LANES]mir.MirOperand;
+    i = 0;
+    for (i < nl) { acc[i] = mir.op_imm(0); i = i + 1; }
+
+    i = 0;
+    for (i < nl) {
+        var j: u32 = 0;
+        for (i + j < nl) {
+            val p: u32 = i + j;
+            val want_hi: bool = p + 1 < nl;
+
+            val rl: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](rl)) { ret R.err[bool, str](R.unwrap_err[u32, str](rl)); }
+            val lo: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rl));
+
+            var hi: mir.MirOperand = mir.op_imm(0);
+            if (want_hi) {
+                val rh: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+                if (R.is_err[u32, str](rh)) { ret R.err[bool, str](R.unwrap_err[u32, str](rh)); }
+                hi = mir.op_vreg(R.unwrap_ok[u32, str](rh));
+            }
+
+            val rp: R.Result[bool, str] = emit_lane_product(alloc, plan, f, mi, dst, cursor,
+                                                            a_ops[i], b_ops[j], lo, hi, want_hi);
+            if (R.is_err[bool, str](rp)) { ret rp; }
+
+            val ra: R.Result[bool, str] = emit_accumulate_lane(alloc, f, mi, dst, cursor, ?acc[0], nl, lw, p, lo);
+            if (R.is_err[bool, str](ra)) { ret ra; }
+            if (want_hi) {
+                val rb: R.Result[bool, str] = emit_accumulate_lane(alloc, f, mi, dst, cursor, ?acc[0], nl, lw, p + 1, hi);
+                if (R.is_err[bool, str](rb)) { ret rb; }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    # copy out last. the destination may be one of the operands (`a = a * b`), so the
+    # expansion must not write a destination lane while a partial product still reads it.
+    i = 0;
+    for (i < nl) {
+        var ops: [2]mir.MirOperand;
+        ops[0] = dst_ops[i];
+        ops[1] = acc[i];
+        val rm: R.Result[bool, str] = emit_piece(alloc, dst, cursor, mi, mir.MIR_MOV, ?ops[0], 2, lw);
+        if (R.is_err[bool, str](rm)) { ret rm; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# run `stages` double-and-add stages, leaving the product in `out`
+#
+# THE ALGORITHM (#2344). Classic shift-and-add, "Russian peasant" multiplication:
+# for every bit of the multiplier, from the low bit up, the running multiplicand
+# joins an accumulator when that bit is set, then the multiplicand doubles (shifts
+# left one) and the multiplier is consumed one bit (shifts right one) so the NEXT
+# bit tested is always the running value's own low bit - no per-stage lane/bit
+# indexing into the original operand is needed, only two per-stage constant
+# shifts-by-one, which is why this reuses the shift template so directly.
+#
+# `stages` IS A PARAMETER RATHER THAN THE VALUE'S WIDTH (#2778), and that is the whole
+# reason this is a function of its own. As the leaf of the schoolbook expansion it
+# multiplies two ONE-LANE values into two lanes, so the multiplier gives out after a
+# lane's worth of bits even though the answer is twice that wide; running the full
+# `nl * lane_bits` stages there would spend half of them on a multiplier already zero.
+#
+# BRANCHLESS, NOT CONSTANT-TIME - and that distinction is deliberate, not an
+# oversight. This pass emits straight-line code into ONE block; it cannot build the
+# new control-flow edges a data-dependent branch would need, so the per-stage
+# "add or don't" decision is a mask-and-select exactly like the shift barrel's own
+# per-stage decision (#2217), for the same structural reason.
+# ---
+# alloc:   backing allocator for piece operand arrays and lane temporaries
+# plan:    the function's lane assignment
+# f:       the MIR function (for appending temporaries)
+# src:     the instruction the sequence replaces
+# dst:     the rebuilt instruction array
+# cursor:  next write index into `dst`; advanced past the emitted pieces
+# a_in:    the `nl` multiplicand lane operands
+# b_in:    the `nl` multiplier lane operands
+# out:     the `nl` destination lane operands, written by the last stage
+# nl:      the lane count of the running values
+# stages:  how many multiplier bits to consume
+# ret:     ok(true) on success, or an allocation error
+fun emit_double_and_add(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, src: *mir.MirInstr,
+                        dst: *mir.MirInstr, cursor: *u32,
+                        a_in: *mir.MirOperand, b_in: *mir.MirOperand, out: *mir.MirOperand,
+                        nl: u32, stages: u32) R.Result[bool, str] {
+    val mi: *mir.MirInstr = src;
+    val lw: u8 = plan.lane_width;
+
+    var mcand:  [MAX_SHIFT_LANES]mir.MirOperand;  # the running multiplicand, doubles each stage
+    var mplier: [MAX_SHIFT_LANES]mir.MirOperand;  # the running multiplier, halves each stage
+    var result: [MAX_SHIFT_LANES]mir.MirOperand;  # the accumulator, zero initially
+    var i: u32 = 0;
+    for (i < nl) {
+        mcand[i]  = a_in[i];
+        mplier[i] = b_in[i];
+        result[i] = mir.op_imm(0);
         i = i + 1;
     }
 
     var j: u32 = 0;
-    for (j < bits) {
+    for (j < stages) {
         # the running multiplier's own low bit - always the next bit to test,
         # because the multiplier itself shifts right one lower each stage.
         val rb: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
@@ -1905,11 +2267,11 @@ fun expand_mul(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *m
 
         # select: result = result ^ ((result ^ cand) & mask), per lane - the last
         # stage lands in the destination lanes, every earlier one in fresh temps.
-        val is_last: bool = j == bits - 1;
+        val is_last: bool = j == stages - 1;
         var nxt: [MAX_SHIFT_LANES]mir.MirOperand;
         i = 0;
         for (i < nl) {
-            if (is_last) { nxt[i] = dst_ops[i]; }
+            if (is_last) { nxt[i] = out[i]; }
             or {
                 val rn: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
                 if (R.is_err[u32, str](rn)) { ret R.err[bool, str](R.unwrap_err[u32, str](rn)); }
@@ -2974,6 +3336,9 @@ fun t_mach(maw: u8, ptr: u8) Machine {
     # a hardware multiply by default: only the multiply-specific tests flip this,
     # so every existing shift / add / memory test keeps its established shape
     m.has_mul    = true;
+    # no widening lane product by default: the schoolbook path is opt-in, so every
+    # existing expansion test keeps the double-and-add shape it was written against
+    m.mul_hi     = 0;
     m.stage_lo   = 6;
     m.stage_hi   = 7;
     ret m;
@@ -3122,8 +3487,12 @@ fun t_divmod_fn(alloc: *A.Allocator, f: *mir.MirFunction, b: *mir.MirBlock,
 # The count agreeing with the emit is the load-bearing assertion, not a detail: this
 # pass sizes the rebuilt instruction array from `expansion_count` BEFORE it expands,
 # so a count that disagreed with the emit would overrun the array or leave it short.
-# Asserting the block length equals the two source moves plus `divmod_piece_count`
-# checks both halves against each other at every width below.
+# The agreement itself is checked in `legalize_block`, which refuses when the emitted
+# cursor and the predicted total differ; what the block length below pins is the
+# `divmod_piece_count` FORMULA, against a width sweep. Those are two different claims
+# and this comment used to conflate them - the length was taken from the predicted
+# total, so it agreed with the count by construction and could not have caught a
+# disagreeing emit (#2778).
 test "mach.lang.be.codegen.legalize:expands_a_wide_divide" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -3221,6 +3590,172 @@ test "mach.lang.be.codegen.legalize:divide_family_costs_agree" {
     if (rs <= ru) { ret 1; }
     # and a signed remainder is exactly one piece cheaper: no sign-word combine.
     if (ds != rs + 1) { ret 1; }
+    ret 0;
+}
+
+# THE PIECE COUNT AND THE EMIT AGREE, at every lane count and under BOTH leaves
+# (#2778)
+#
+# This is the load-bearing assertion for the schoolbook multiply, not a detail, and it
+# is the one that caught the first version of it: the pass sizes the rebuilt array from
+# `expansion_count` BEFORE expanding, so a count that disagrees overruns the array or
+# leaves it short. The disagreement there was about LIVENESS rather than arithmetic -
+# the emit's carry chain writes every lane above the one it starts at, making them all
+# live, and the count only marked the lane written directly, so the next partial
+# product into a lane the chain had already made live was counted at zero. It passed
+# every unit test and produced a wrong multiply on a 6502 core.
+#
+# BOTH LEAVES, because they are counted by different formulas: a declared
+# `mul_hi_width` costs two pieces per position, and no declaration costs a whole
+# double-and-add. A count that agreed with the emit for one and not the other would be
+# invisible to a single-machine sweep.
+test "mach.lang.be.codegen.legalize:multiply_costs_agree_at_every_lane_count" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    # from two lanes up. one lane is not a schoolbook of anything and `has_mul` is
+    # true here, so a native-width multiply is never handed to this pass at all.
+    var widths: [3]u8;
+    widths[0] = 2; widths[1] = 4; widths[2] = 8;
+    var native: u32 = 0;
+    for (native < 2) {
+        var mach: Machine = t_mach(1, 2);
+        if (native == 1) { mach.mul_hi = 1; }
+
+        var k: u32 = 0;
+        for (k < 3) {
+            var f: mir.MirFunction;
+            var b: mir.MirBlock;
+            t_divmod_fn(?alloc, ?f, ?b, mir.MIR_MUL, widths[k], 1000, 7);
+            var plan: LanePlan;
+            if (R.is_err[bool, str](plan_lanes(?alloc, ?mach, ?f, ?plan))) { ret 1; }
+            val rc: R.Result[u32, str] = mul_piece_count(?alloc, ?plan, ?b.instrs[2]);
+            if (R.is_err[u32, str](rc)) { ret 1; }
+            val n: u32 = R.unwrap_ok[u32, str](rc);
+            free_plan(?alloc, ?plan);
+            if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f))) { ret 1; }
+            # the two source moves are one piece per lane each, so `2 * width` of the
+            # block is the operands and the rest is the multiply.
+            if (b.instr_count != 2 * widths[k]::u32 + n) { ret 1; }
+            k = k + 1;
+        }
+        native = native + 1;
+    }
+    ret 0;
+}
+
+# A DECLARED WIDENING MULTIPLY SELECTS THE NATIVE LEAF, and the shape of the answer is
+# schoolbook rather than a shorter double-and-add (#2778)
+#
+# The rv32 shape exactly: `lane_width` 4, an 8-byte multiply, two lanes. Every count
+# below is derived rather than quoted, because the derivation is the specification:
+#
+#   positions are (i, j) with i + j < 2, so (0,0), (0,1) and (1,0).
+#   (0,0) is the only one whose high half is still inside the value, so it costs a
+#   `mul` and a `mulhu`; the other two cost a `mul` each.  -> 4 lane products
+#   (0,0)'s two halves land in lanes 0 and 1, both still holding their seed zero, so
+#   they repoint and emit nothing.                         -> 0 pieces
+#   (0,1) and (1,0) both land in lane 1, now live and also the top lane, so each is a
+#   single add with no carry-out.                          -> 2 pieces
+#   the accumulator is copied into the destination lanes.  -> 2 pieces
+#                                                          => 8 pieces
+#
+# 8 against the 1272 the double-and-add spends at this width is the entire point of
+# the change, and pinning it as a literal is what makes a regression in either
+# direction a failure rather than a slower build nobody notices.
+test "mach.lang.be.codegen.legalize:a_declared_widening_multiply_selects_the_native_leaf" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    t_divmod_fn(?alloc, ?f, ?b, mir.MIR_MUL, 8, 1000, 7);
+
+    var mach: Machine = t_mach(4, 4);
+    mach.mul_hi = 4;
+    if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f))) { ret 1; }
+
+    # two source moves at two lanes each, then the eight pieces derived above
+    if (b.instr_count != 4 + 8) { ret 1; }
+
+    var muls:   u32 = 0;
+    var highs:  u32 = 0;
+    var shifts: u32 = 0;
+    var i: u32 = 4;
+    for (i < b.instr_count) {
+        val op: mir.MirOpcode = b.instrs[i].opcode;
+        if (op == mir.MIR_MUL)      { muls   = muls + 1; }
+        if (op == mir.MIR_MUL_HI_U) { highs  = highs + 1; }
+        if (op == mir.MIR_SHL || op == mir.MIR_SHR_U) { shifts = shifts + 1; }
+        i = i + 1;
+    }
+    # three positions, one of which also wants its high half
+    if (muls != 3)  { ret 1; }
+    if (highs != 1) { ret 1; }
+    # the double-and-add's two shifts-per-stage are gone entirely, which is the
+    # difference between the two expansions and not merely a smaller count of them
+    if (shifts != 0) { ret 1; }
+
+    # and the same instruction on a machine that declares nothing takes the other
+    # leaf: no native product anywhere, and the shifts are back
+    var f2: mir.MirFunction;
+    var b2: mir.MirBlock;
+    t_divmod_fn(?alloc, ?f2, ?b2, mir.MIR_MUL, 8, 1000, 7);
+    var m2: Machine = t_mach(4, 4);
+    if (R.is_err[bool, str](legalize_function(?alloc, ?m2, ?f2))) { ret 1; }
+    var muls2:   u32 = 0;
+    var shifts2: u32 = 0;
+    i = 4;
+    for (i < b2.instr_count) {
+        val op: mir.MirOpcode = b2.instrs[i].opcode;
+        if (op == mir.MIR_MUL || op == mir.MIR_MUL_HI_U) { muls2 = muls2 + 1; }
+        if (op == mir.MIR_SHL || op == mir.MIR_SHR_U)    { shifts2 = shifts2 + 1; }
+        i = i + 1;
+    }
+    if (muls2 != 0)    { ret 1; }
+    if (shifts2 == 0)  { ret 1; }
+    # and it is dramatically longer, which is the claim the change makes
+    if (b2.instr_count <= b.instr_count * 10) { ret 1; }
+    ret 0;
+}
+
+# A MACHINE DESCRIPTION THIS PASS DOES NOT MODEL IS REFUSED BY NAME (#2778)
+#
+# Both refusals are about the DECLARATION rather than the instruction, and that is why
+# they are here rather than left to whatever would go wrong downstream. A
+# `mul_hi_width` that is not the ALU width would have the pass emit a lane product at
+# a width the ISA does not compute at, and a high half declared without a low half
+# would emit a `MIR_MUL` no rule admits. Both are a silent wrong encoding if not
+# caught, which is the failure mode #2860 established the standard for.
+test "mach.lang.be.codegen.legalize:refuses_an_unmodelled_widening_multiply" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    # a widening multiply at a width other than the ALU's
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    t_divmod_fn(?alloc, ?f, ?b, mir.MIR_MUL, 4, 1000, 7);
+    var m1: Machine = t_mach(1, 2);
+    m1.mul_hi = 4;
+    if (!R.is_err[bool, str](legalize_function(?alloc, ?m1, ?f))) { ret 1; }
+
+    # a high half declared on a machine that says it has no multiply at all
+    var f2: mir.MirFunction;
+    var b2: mir.MirBlock;
+    t_divmod_fn(?alloc, ?f2, ?b2, mir.MIR_MUL, 4, 1000, 7);
+    var m2: Machine = t_mach(1, 2);
+    m2.mul_hi  = 1;
+    m2.has_mul = false;
+    if (!R.is_err[bool, str](legalize_function(?alloc, ?m2, ?f2))) { ret 1; }
+
+    # and the coherent declaration this pass DOES model is accepted, so the two
+    # refusals above are not passing because a multiply is refused generally
+    var f3: mir.MirFunction;
+    var b3: mir.MirBlock;
+    t_divmod_fn(?alloc, ?f3, ?b3, mir.MIR_MUL, 4, 1000, 7);
+    var m3: Machine = t_mach(1, 2);
+    m3.mul_hi = 1;
+    if (R.is_err[bool, str](legalize_function(?alloc, ?m3, ?f3))) { ret 1; }
     ret 0;
 }
 
