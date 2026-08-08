@@ -37,6 +37,7 @@ use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 use ctime: std.chrono.time;
+use cdur:  std.chrono.duration;
 use std.sync.atomic;
 use std.sync.thread;
 
@@ -718,7 +719,11 @@ test "mach.lang.driver.passes.intern_producer:name_version" {
 # and published to the session by a completed run_sema_pass - the monomorphizer
 # reaches a generic template's declaring module through those session registries.
 # resolve and sema must both have run first; the CLI compile path drives this after
-# run_sema_pass (build_project itself stops at resolve, #1583)
+# run_sema_pass (build_project itself stops at resolve, #1583).
+#
+# The `lower` and `optimize` roll-up rows are the engine's (`lower_phase` brackets
+# both, #2816); this pass emits only the per-item events and the `optimize`
+# carve-outs, at the places the work actually happens.
 # ---
 # p:   the active project; its topo order and per-build module graph drive the pass
 # ret: true once every module is lowered, or the first error
@@ -741,15 +746,13 @@ pub fun run_lower_pass(p: *project.Project) R.Result[bool, outcome.Fail] {
     val ctx: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
     ctx.p = p;
 
-    readout.phase_begin(p.events, readout.PH_LOWER);
-
     # the parallel prelude, when the request asks for workers: monomorphize and
     # lower the stale modules serially, then optimize them across a pool, and
     # stage each finished module for the loop below to adopt through Q_LOWER
-    # (which stays the value's system of record). It runs inside the phase span,
-    # so `-v` still reports the whole phase's wall; the per-module `-vv` items
-    # below then measure the adoption rather than the work, which is inherent to
-    # any prelude.
+    # (which stays the value's system of record). Both halves narrate their own
+    # work - the serial half as this phase's `-vv` items, the pool as the
+    # `optimize` carve-out - so the loop below narrates only the modules the
+    # prelude did not stage.
     if (lower_parallel_enabled(p)) {
         val rp: R.Result[bool, str] = run_lower_parallel(p);
         if (R.is_err[bool, str](rp)) {
@@ -768,7 +771,6 @@ pub fun run_lower_pass(p: *project.Project) R.Result[bool, outcome.Fail] {
         }
         i = i + 1;
     }
-    readout.phase_end(p.events, readout.PH_LOWER, p.emit_len, "module", "modules");
     ctx.p = nil;
     ret R.ok[bool, outcome.Fail](true);
 }
@@ -868,7 +870,10 @@ fun lower_fail(p: *project.Project, emsg: str) outcome.Fail {
 fun run_lower_one(p: *project.Project, mid: session.ModuleId) R.Result[bool, str] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
 
-    val t_item: ctime.Time = readout.item_begin(p.events);
+    # no `-vv` item here: this loop adopts a value the prelude staged or the
+    # compute below produced, and timing the adoption reported the cache lookup
+    # as the module's lowering cost (#2816). the item is emitted from whichever
+    # of those two actually did the work.
 
     # the lowered-surface fingerprints were all refreshed in topo order by
     # lower_prepare, so every dep this demand validates against is already current.
@@ -878,7 +883,6 @@ fun run_lower_one(p: *project.Project, mid: session.ModuleId) R.Result[bool, str
     if (irm == nil) { ret R.err[bool, str]("Q_LOWER produced no result handle"); }
 
     m.ir_module = irm;
-    readout.item(p.events, readout.PH_LOWER, project.fqn_name(p, m.fqn), t_item);
     ret R.ok[bool, str](true);
 }
 
@@ -1153,12 +1157,14 @@ pub fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Res
     if (R.is_err[*ir.ModuleHome, str](hr)) { ret R.err[query.QueryOutput, str](R.unwrap_err[*ir.ModuleHome, str](hr)); }
     val home: *ir.ModuleHome = R.unwrap_ok[*ir.ModuleHome, str](hr);
 
+    val t_low: ctime.Time = readout.item_begin(p.events);
     val rr_raw: R.Result[*ir.Module, str] = lower_raw(p, mid, home, test_mode);
     if (R.is_err[*ir.Module, str](rr_raw)) {
         val emsg: str = lower_stable_err(p, R.unwrap_err[*ir.Module, str](rr_raw));
         ir_release(alloc, home);
         ret R.err[query.QueryOutput, str](emsg);
     }
+    readout.item(p.events, readout.PH_LOWER, project.fqn_name(p, m.fqn), t_low);
     val irmod: *ir.Module = R.unwrap_ok[*ir.Module, str](rr_raw);
 
     val nid: R.Result[intern.StrId, str] = neutralize_id(p, test_mode);
@@ -1166,7 +1172,16 @@ pub fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Res
         ir_release(alloc, home);
         ret R.err[query.QueryOutput, str](R.unwrap_err[intern.StrId, str](nid));
     }
+    # the serial path's optimize half: fused into this compute rather than run as
+    # its own pass, so it carves its slice out of PH_LOWER's wall to get a row
+    # (#2816). the slices accumulate across the pass's per-module demands, and
+    # the item is this module's own share of them.
+    val t_opt: ctime.Time = readout.span_begin(p.events);
     val ro: R.Result[bool, str] = lower_optimize(p, irmod, R.unwrap_ok[intern.StrId, str](nid));
+    # the item closes before the carve does, so the carve - and the row it feeds -
+    # always bounds the item it contains.
+    readout.item(p.events, readout.PH_OPTIMIZE, project.fqn_name(p, m.fqn), t_opt);
+    readout.span_end(p.events, readout.PH_OPTIMIZE, readout.PH_LOWER, t_opt);
     if (R.is_err[bool, str](ro)) {
         val emsg: str = lower_stable_err(p, R.unwrap_err[bool, str](ro));
         ir_release(alloc, home);
@@ -1357,10 +1372,13 @@ fun lower_parallel_enabled(p: *project.Project) bool {
 # mid: the module being optimized
 # m:   its raw IR, staged in its own arena
 # err: nil on success, else the module's first pass error
+# d:   how long this module's optimization took, measured by its worker - the
+#      only place it can be measured, since the pool's join erases it
 rec PlwSlot {
     mid: session.ModuleId;
     m:   *ir.Module;
     err: str;
+    d:   cdur.Duration;
 }
 
 # the running parallel-optimization job, handed to each worker thread as its
@@ -1406,7 +1424,9 @@ fun plw_worker_main(arg: *u8) {
         if (idx_raw >= pl.slot_len::i64) { ret; }
 
         val slot: *PlwSlot = ?pl.slots[idx_raw::usize];
+        val t0: ctime.Time = ctime.monotonic();
         val r: R.Result[bool, str] = lower_optimize(pl.p, slot.m, pl.main_id);
+        slot.d = ctime.time_sub(ctime.monotonic(), t0);
         if (R.is_err[bool, str](r)) {
             slot.err = R.unwrap_err[bool, str](r);
             atomic.store(?pl.stop, 1::i64);
@@ -1455,6 +1475,7 @@ fun run_lower_parallel(p: *project.Project) R.Result[bool, str] {
             slots[slot_len].mid = mid;
             slots[slot_len].m   = nil;
             slots[slot_len].err = nil;
+            slots[slot_len].d   = 0;
             slot_len = slot_len + 1;
         }
         ti = ti + 1;
@@ -1477,6 +1498,8 @@ fun run_lower_parallel(p: *project.Project) R.Result[bool, str] {
         val mid: session.ModuleId = slots[si].mid;
         val m:   *project.ModuleEntry = ?p.modules[mid::u32];
 
+        val t_item: ctime.Time = readout.item_begin(p.events);
+
         val hr: R.Result[*ir.ModuleHome, str] = ir_home_new(p.s.alloc);
         if (R.is_err[*ir.ModuleHome, str](hr)) {
             lower_sweep_staged(p);
@@ -1496,6 +1519,7 @@ fun run_lower_parallel(p: *project.Project) R.Result[bool, str] {
         m.staged_ir   = R.unwrap_ok[*ir.Module, str](rr_raw);
         m.staged_home = home;
         slots[si].m   = m.staged_ir;
+        readout.item(p.events, readout.PH_LOWER, project.fqn_name(p, m.fqn), t_item);
         si = si + 1;
     }
 
@@ -1521,6 +1545,15 @@ fun run_lower_parallel(p: *project.Project) R.Result[bool, str] {
 
     # spawn nworkers-1 helper threads; the calling thread is the last worker, so a
     # single-worker (jobs 1) run drives the whole pool on this thread with no spawn.
+    #
+    # The pool's wall is the `optimize` row, carved out of PH_LOWER (#2816). The
+    # measurement is taken here, on the main thread, around spawn-to-join: a
+    # worker cannot narrate, both because the Readout is single-threaded state and
+    # because summing concurrent per-module times would report several times the
+    # wall they occupied. That is also why the pool records no per-module `-vv`
+    # items - a module's slice of a pooled wall is not a duration the row is the
+    # sum of.
+    val t_opt: ctime.Time = readout.span_begin(p.events);
     var threads: *thread.Thread = nil;
     val extra: u32 = nworkers - 1;
     if (extra > 0) {
@@ -1544,6 +1577,18 @@ fun run_lower_parallel(p: *project.Project) R.Result[bool, str] {
             k = k + 1;
         }
         A.deallocate[thread.Thread](p.alloc, threads, extra::usize);
+    }
+    readout.span_end(p.events, readout.PH_OPTIMIZE, readout.PH_LOWER, t_opt);
+
+    # the row says how wide the pool was, because the items below deliberately
+    # sum to more than it: they ran concurrently, and a reader must not take
+    # them for a partition of the phase's wall.
+    readout.phase_workers(p.events, readout.PH_OPTIMIZE, nworkers);
+    var ii: u32 = 0;
+    for (ii < slot_len) {
+        val im: *project.ModuleEntry = ?p.modules[slots[ii].mid::u32];
+        readout.item_dur(p.events, readout.PH_OPTIMIZE, project.fqn_name(p, im.fqn), slots[ii].d);
+        ii = ii + 1;
     }
 
     # first error in topo order wins - deterministic regardless of which worker hit
@@ -1659,7 +1704,11 @@ fun free_lower_closure(alloc: *A.Allocator, cl: *LowerClosure) {
 # reach the per-build module graph. run_lower_pass must have run first (each
 # module's optimized IR is borrowed onto its ModuleEntry). the CLI compile path
 # drives this after run_lower_pass; the per-module objects and the link read the
-# borrowed images
+# borrowed images.
+#
+# The `codegen` roll-up row is the engine's (`codegen_phase` brackets the pool and
+# this pass together, #2816): timing this loop alone times the adoption of images
+# the pool already produced.
 # ---
 # p:   the active project; its topo order and per-build module graph drive the pass
 # ret: true once every module is codegen'd, or the first error
@@ -1678,8 +1727,6 @@ pub fun run_codegen_pass(p: *project.Project) R.Result[bool, outcome.Fail] {
     val ctx: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
     ctx.p = p;
 
-    readout.phase_begin(p.events, readout.PH_CODEGEN);
-
     var i: u32 = 0;
     for (i < p.emit_len) {
         val mid: session.ModuleId = p.topo[i];
@@ -1690,7 +1737,6 @@ pub fun run_codegen_pass(p: *project.Project) R.Result[bool, outcome.Fail] {
         }
         i = i + 1;
     }
-    readout.phase_end(p.events, readout.PH_CODEGEN, p.emit_len, "module", "modules");
     ctx.p = nil;
     ret R.ok[bool, outcome.Fail](true);
 }
@@ -1701,15 +1747,15 @@ pub fun run_codegen_pass(p: *project.Project) R.Result[bool, outcome.Fail] {
 fun run_codegen_one(p: *project.Project, mid: session.ModuleId) R.Result[bool, str] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
 
-    val t_item: ctime.Time = readout.item_begin(p.events);
-
+    # no `-vv` item here, for the reason `run_lower_one` carries: on the pooled
+    # path this loop only adopts a staged image, and timing the adoption
+    # reported 0.21ms of per-module detail under a 640ms row (#2816).
     val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_CODEGEN, back_half_key(m.stable_id, test_build(p)));
     if (R.is_err[*query.QueryEntry, str](e_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](e_r)); }
     val img: *of.ObjectImage = image_handle_decode(R.unwrap_ok[*query.QueryEntry, str](e_r));
     if (img == nil) { ret R.err[bool, str]("Q_CODEGEN produced no result handle"); }
 
     m.object_image = img;
-    readout.item(p.events, readout.PH_CODEGEN, project.fqn_name(p, m.fqn), t_item);
     ret R.ok[bool, str](true);
 }
 
@@ -1758,8 +1804,12 @@ pub fun q_codegen_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.R
     val dbg_r: R.Result[codegen.DebugInfo, str] = debug_info_of(p);
     if (R.is_err[codegen.DebugInfo, str](dbg_r)) { ret R.err[query.QueryOutput, str](R.unwrap_err[codegen.DebugInfo, str](dbg_r)); }
 
+    # the serial path's `-vv` item: this is where a module the pool did not build
+    # is actually generated, so this is where its cost can be measured (#2816).
+    val t_cg: ctime.Time = readout.item_begin(p.events);
     val res_cg: R.Result[of.ObjectImage, str] = codegen.codegen_module(s, ?p.target, irmod, nil, R.unwrap_ok[codegen.DebugInfo, str](dbg_r));
     if (R.is_err[of.ObjectImage, str](res_cg)) { ret R.err[query.QueryOutput, str](R.unwrap_err[of.ObjectImage, str](res_cg)); }
+    readout.item(p.events, readout.PH_CODEGEN, project.fqn_name(p, m.fqn), t_cg);
     var img: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](res_cg);
 
     val br: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](alloc, 1::usize);

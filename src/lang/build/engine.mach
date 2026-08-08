@@ -44,6 +44,7 @@ use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 use ctime: std.chrono.time;
+use cdur:  std.chrono.duration;
 use std.sync.atomic;
 use std.sync.thread;
 
@@ -85,8 +86,6 @@ use mach.lang.target.of;
 # dynlib_len:   number of dynamic dependencies
 # out_path:     the produced artifact path, or nil until a phase sets it
 # scope:        the test collection state (tests goals only)
-# link_started: the link narration span is open (its begin fired)
-# t_link:       the link item's start instant (paired with `link_started`)
 rec UnitState {
     irs:          *ir.Module;
     ir_ready:     *bool;
@@ -100,9 +99,6 @@ rec UnitState {
 
     out_path:     *u8;
     scope:        btest.TestScope;
-
-    link_started: bool;
-    t_link:       ctime.Time;
 }
 
 # execute the resolved plan: every unit, one after another, each in its own
@@ -135,6 +131,7 @@ pub fun execute(bp: *plan.BuildPlan, backing: *A.Allocator, oa: *A.Allocator,
     for (i < bp.units.len) {
         val unit: *plan.BuildUnit = ?bp.units.data[i];
         outcome.render_unit(rd, unit.sel_artifact, unit.sel_target, unit.has_artifact);
+        readout.unit_begin(ev);
 
         val ur: R.Result[outcome.BuildOutcome, outcome.Fail] = execute_unit_cold(bp, i, backing, oa, ev, rd);
         if (R.is_err[outcome.BuildOutcome, outcome.Fail](ur)) {
@@ -367,7 +364,6 @@ pub fun execute_warm(bp: *plan.BuildPlan, unit_index: usize, s: *session.Session
     st.scope.sel     = nil;
     st.scope.sel_len = 0;
     st.scope.skipped = 0;
-    st.link_started = false;
 
     # the unit's execution IS its phase vector: dispatch each phase in order,
     # stopping at the first failure.
@@ -445,6 +441,7 @@ pub fun execute_warm_all(bp: *plan.BuildPlan, s: *session.Session, oa: *A.Alloca
     for (i < bp.units.len) {
         val unit: *plan.BuildUnit = ?bp.units.data[i];
         outcome.render_unit(rd, unit.sel_artifact, unit.sel_target, unit.has_artifact);
+        readout.unit_begin(ev);
 
         val ur: R.Result[outcome.BuildOutcome, outcome.Fail] = execute_warm(bp, i, s, oa, ev, rd);
         if (R.is_err[outcome.BuildOutcome, outcome.Fail](ur)) {
@@ -507,8 +504,8 @@ fun run_phase(ph: plan.PhaseKind, p: *driver.Project, unit: *plan.BuildUnit, st:
     if (ph == plan.PH_DEP_STEPS) { result = driver.run_dep_steps_phase(p); }
     if (ph == plan.PH_LOAD)      { result = load_phase(p); }
     if (ph == plan.PH_SEMA)      { result = sema_phase(p, st); }
-    if (ph == plan.PH_LOWER)     { result = lower_phase(p, st, rd); }
-    if (ph == plan.PH_CODEGEN)   { result = codegen_phase(p, st); }
+    if (ph == plan.PH_LOWER)     { result = lower_phase(p, st, rd, ev); }
+    if (ph == plan.PH_CODEGEN)   { result = codegen_phase(p, st, ev); }
     if (ph == plan.PH_EMIT)      { result = emit_phase(p, unit, st, bo, ev); }
     if (ph == plan.PH_LINK)      { result = link_phase(p, unit, st, bo, oa, ev); }
 
@@ -579,7 +576,19 @@ fun sema_phase(p: *driver.Project, st: *UnitState) R.Result[bool, outcome.Fail] 
 
 # PH_LOWER: lower + optimize every module, fill the IR views, and surface the
 # one-shot scalarization note (#2016)
-fun lower_phase(p: *driver.Project, st: *UnitState, rd: *outcome.Render) R.Result[bool, outcome.Fail] {
+#
+# The engine opens both narration spans rather than the pass, because the engine
+# is what dispatches the phase and the pass is not one region per row: lowering
+# and optimization are fused inside one Q_LOWER compute on the serial path and
+# split into two halves of the prelude on the parallel one. The pass carves the
+# optimize slices out of PH_LOWER wherever they actually run (#2816), so the two
+# rows are disjoint and together cover this phase - including the query
+# bookkeeping (`lower_prepare`, the closure dep recording) that belongs to
+# neither half but is real time a reader is owed.
+fun lower_phase(p: *driver.Project, st: *UnitState, rd: *outcome.Render, ev: *readout.Progress) R.Result[bool, outcome.Fail] {
+    readout.phase_begin(ev, readout.PH_LOWER);
+    readout.phase_begin(ev, readout.PH_OPTIMIZE);
+
     val res_lower: R.Result[bool, outcome.Fail] = driver.run_lower_pass(p);
     if (R.is_err[bool, outcome.Fail](res_lower)) { ret res_lower; }
 
@@ -605,13 +614,23 @@ fun lower_phase(p: *driver.Project, st: *UnitState, rd: *outcome.Render) R.Resul
         st.ir_ready[mid::u32] = true;
         i = i + 1;
     }
+
+    readout.phase_end(ev, readout.PH_LOWER, p.emit_len, "module", "modules");
+    readout.phase_end(ev, readout.PH_OPTIMIZE, p.emit_len, "module", "modules");
     ret R.ok[bool, outcome.Fail](true);
 }
 
 # PH_CODEGEN: the parallel pool (an executor property, sized by the request's
 # `jobs`) stages images up front; the serial pass adopts them through
 # Q_CODEGEN and the views collect the borrows
-fun codegen_phase(p: *driver.Project, st: *UnitState) R.Result[bool, outcome.Fail] {
+#
+# The narration span is the engine's, and it opens BEFORE the pool: the pool is
+# where every stale module's machine code is actually produced, and the pass
+# that follows only adopts already-staged images. Timing the pass alone reported
+# 223us for 222 modules of a 6 MB binary (#2816).
+fun codegen_phase(p: *driver.Project, st: *UnitState, ev: *readout.Progress) R.Result[bool, outcome.Fail] {
+    readout.phase_begin(ev, readout.PH_CODEGEN);
+
     # when the request asks for workers (jobs >= 1), codegen the stale modules
     # across the pool up front and stage each finished image on its ModuleEntry;
     # run_codegen_pass then adopts the staged images (Q_CODEGEN stays the value's
@@ -639,30 +658,25 @@ fun codegen_phase(p: *driver.Project, st: *UnitState) R.Result[bool, outcome.Fai
         st.image_ready[mid::u32] = true;
         i = i + 1;
     }
-    ret R.ok[bool, outcome.Fail](true);
-}
 
-# open the link narration span (idempotent): the readout folds the emit + link
-# tail under its single `link` phase, so the span begins at the first of the
-# two phases and closes when the artifact lands
-fun begin_link_narration(st: *UnitState, ev: *readout.Progress) {
-    if (st.link_started) { ret; }
-    st.link_started = true;
-    readout.phase_begin(ev, readout.PH_LINK);
-    st.t_link = readout.item_begin(ev);
+    readout.phase_end(ev, readout.PH_CODEGEN, p.emit_len, "module", "modules");
+    ret R.ok[bool, outcome.Fail](true);
 }
 
 # PH_EMIT: materialize the on-disk per-module artifacts - the `.ir` / `.s`
 # debug dumps and the object tree - per the unit's goal
+#
+# Its own narration row, rather than folded under `link` as it was before #2816:
+# writing an object tree is not linking, and on a 222-module build it is most of
+# what the folded row measured. The plan already separates the two phases; the
+# readout now matches it.
 fun emit_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
                bo: *outcome.BuildOutcome, ev: *readout.Progress) R.Result[bool, outcome.Fail] {
     val ctx: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
     val goal: request.BuildGoal = ctx.req.goal;
     val flat: bool = p.target.of != nil && p.target.of.produces_image;
 
-    if (goal == request.GOAL_EXECUTE || goal == request.GOAL_OBJECTS) {
-        begin_link_narration(st, ev);
-    }
+    readout.phase_begin(ev, readout.PH_EMIT);
 
     # the per-module `.ir` / `.s` debug artifacts, from the same post-pipeline
     # IR the objects are built from; the dirs are plan facts.
@@ -713,7 +727,10 @@ fun emit_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
         val cr: R.Result[bool, outcome.Fail] = btest.collect_scope(p, st.irs, ?st.scope);
         if (R.is_err[bool, outcome.Fail](cr)) { ret cr; }
         bo.tests_skipped = st.scope.skipped;
-        if (st.scope.sel_len == 0) { ret R.ok[bool, outcome.Fail](true); }
+        if (st.scope.sel_len == 0) {
+            readout.phase_end(ev, readout.PH_EMIT, 0, "object", "objects");
+            ret R.ok[bool, outcome.Fail](true);
+        }
     }
 
     val objects: bool = (goal == request.GOAL_EXECUTE && !flat)
@@ -727,13 +744,17 @@ fun emit_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
 
     # the object tree is the delivery for an objects goal, and for an execute goal
     # on a finished-module format - there each emitted module is already the
-    # artifact, so no link phase follows. the narration closes here in both cases.
+    # artifact, so no link phase follows.
     if (goal == request.GOAL_OBJECTS
         || (goal == request.GOAL_EXECUTE && plan.finished_modules(?p.target))) {
         st.out_path = unit.out_path::*u8;
-        readout.phase_end(ev, readout.PH_LINK, p.emit_len, "object", "objects");
-        st.link_started = false;
     }
+
+    # the row counts what this phase actually wrote: the object tree when there
+    # is one, else the `.ir`/`.s` dumps that are the only reason the phase is in
+    # the plan at all.
+    if (objects) { readout.phase_end(ev, readout.PH_EMIT, st.obj_len, "object", "objects"); }
+    or           { readout.phase_end(ev, readout.PH_EMIT, p.emit_len, "module", "modules"); }
     ret R.ok[bool, outcome.Fail](true);
 }
 
@@ -744,14 +765,22 @@ fun link_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
     val ctx: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
     val goal: request.BuildGoal = ctx.req.goal;
 
+    readout.phase_begin(ev, readout.PH_LINK);
+    val t_link: ctime.Time = readout.item_begin(ev);
+
     if (goal == request.GOAL_TESTS) {
         # a scope that selected nothing builds nothing and runs nothing.
-        if (st.scope.sel_len == 0) { ret R.ok[bool, outcome.Fail](true); }
+        if (st.scope.sel_len == 0) {
+            readout.phase_end(ev, readout.PH_LINK, 0, "binary", "binaries");
+            ret R.ok[bool, outcome.Fail](true);
+        }
         val lr: R.Result[bool, outcome.Fail] = btest.link_dispatcher(p, unit, ?st.scope, st.obj_paths);
         if (R.is_err[bool, outcome.Fail](lr)) { ret lr; }
         val rr: R.Result[bool, outcome.Fail] = btest.record_tests(p, ?st.scope, unit.out_path::*u8, ?bo.tests, oa);
         if (R.is_err[bool, outcome.Fail](rr)) { ret rr; }
         st.out_path = unit.out_path::*u8;
+        readout.item(ev, readout.PH_LINK, unit.out_path, t_link);
+        readout.phase_end(ev, readout.PH_LINK, 1, "binary", "binaries");
         ret R.ok[bool, outcome.Fail](true);
     }
 
@@ -764,7 +793,7 @@ fun link_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
         if (te.mode == driver.MODE_LIBRARY) {
             ret R.err[bool, outcome.Fail](outcome.user("a flat-image object format produces only executables; library and '--emit obj' outputs are unsupported"));
         }
-        ret link_flat(p, unit, st, ev);
+        ret link_flat(p, unit, st, ev, t_link);
     }
 
     # library mode: the per-module objects are the deliverable. a `kind =
@@ -821,7 +850,7 @@ fun link_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
     if (R.is_err[bool, outcome.Fail](relink_r)) { emit.dnit_image_options(p.alloc, ?loaded); ret relink_r; }
     if (!R.unwrap_ok[bool, outcome.Fail](relink_r) && fs.is_file(artifact)) {
         st.out_path = artifact::*u8;
-        readout.item(ev, readout.PH_LINK, artifact, st.t_link);
+        readout.item(ev, readout.PH_LINK, artifact, t_link);
         readout.phase_end(ev, readout.PH_LINK, 1, "binary", "binaries");
         emit.dnit_image_options(p.alloc, ?loaded);
         ret R.ok[bool, outcome.Fail](true);
@@ -844,15 +873,14 @@ fun link_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
     if (R.is_err[bool, outcome.Fail](res_link)) { ret res_link; }
 
     st.out_path = artifact::*u8;
-    readout.item(ev, readout.PH_LINK, artifact, st.t_link);
+    readout.item(ev, readout.PH_LINK, artifact, t_link);
     readout.phase_end(ev, readout.PH_LINK, 1, "binary", "binaries");
     ret R.ok[bool, outcome.Fail](true);
 }
 
 # the flat-image executable link: config, Q_LINK consult, then the direct
 # image link when a re-link is needed
-fun link_flat(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState, ev: *readout.Progress) R.Result[bool, outcome.Fail] {
-    begin_link_narration(st, ev);
+fun link_flat(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState, ev: *readout.Progress, t_link: ctime.Time) R.Result[bool, outcome.Fail] {
     val ctx: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
 
     val artifact: str = unit.out_path;
@@ -869,7 +897,7 @@ fun link_flat(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState, ev: *re
     if (R.is_err[bool, outcome.Fail](relink_r)) { ret relink_r; }
     if (!R.unwrap_ok[bool, outcome.Fail](relink_r) && fs.is_file(artifact)) {
         st.out_path = artifact::*u8;
-        readout.item(ev, readout.PH_LINK, artifact, st.t_link);
+        readout.item(ev, readout.PH_LINK, artifact, t_link);
         readout.phase_end(ev, readout.PH_LINK, 1, "binary", "binaries");
         ret R.ok[bool, outcome.Fail](true);
     }
@@ -879,7 +907,7 @@ fun link_flat(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState, ev: *re
     if (R.is_err[bool, outcome.Fail](res_link)) { ret res_link; }
 
     st.out_path = artifact::*u8;
-    readout.item(ev, readout.PH_LINK, artifact, st.t_link);
+    readout.item(ev, readout.PH_LINK, artifact, t_link);
     readout.phase_end(ev, readout.PH_LINK, 1, "binary", "binaries");
     ret R.ok[bool, outcome.Fail](true);
 }
@@ -1087,10 +1115,13 @@ rec PcgWorker {
 # image:  raw image in the producing worker's arena (child-interner names), or nil
 # worker: producing worker index - selects the remap at collection
 # err:    nil on success, else the module's codegen error message
+# d:      how long this module's codegen took, measured by its worker - the only
+#         place it can be measured, since the pool's join erases it (#2816)
 rec PcgSlot {
     image:  *of.ObjectImage;
     worker: u32;
     err:    str;
+    d:      cdur.Duration;
 }
 
 # the running parallel-codegen job, handed to each worker thread as its userdata
@@ -1207,7 +1238,9 @@ fun pcg_worker_main(arg: *u8) {
         val slot: *PcgSlot         = ?pc.slots[idx::usize];
         slot.worker = wid;
 
+        val t0: ctime.Time = ctime.monotonic();
         val r: R.Result[of.ObjectImage, str] = codegen.codegen_module(?w.sess, ?pc.p.target, m.ir_module, nil, pc.dbg);
+        slot.d = ctime.time_sub(ctime.monotonic(), t0);
         if (R.is_err[of.ObjectImage, str](r)) {
             slot.err   = R.unwrap_err[of.ObjectImage, str](r);
             slot.image = nil;
@@ -1288,7 +1321,7 @@ fun run_codegen_parallel(p: *driver.Project) R.Result[bool, str] {
     }
     val slots: *PcgSlot = R.unwrap_ok[*PcgSlot, str](rslots);
     var si: u32 = 0;
-    for (si < stale_len) { slots[si].image = nil; slots[si].worker = 0; slots[si].err = nil; si = si + 1; }
+    for (si < stale_len) { slots[si].image = nil; slots[si].worker = 0; slots[si].err = nil; slots[si].d = 0; si = si + 1; }
 
     # settle the debug-info decision on the main thread, before any worker child interner
     # snapshots the base: a `-g` build interns the DW_AT_producer string into the session
@@ -1365,6 +1398,17 @@ fun run_codegen_parallel(p: *driver.Project) R.Result[bool, str] {
             k = k + 1;
         }
         A.deallocate[thread.Thread](p.alloc, threads, extra::usize);
+    }
+
+    # the row says how wide the pool was, because the items below deliberately
+    # sum to more than it: they ran concurrently, and a reader must not take them
+    # for a partition of the phase's wall (#2816).
+    readout.phase_workers(p.events, readout.PH_CODEGEN, nworkers);
+    var ii: u32 = 0;
+    for (ii < stale_len) {
+        val im: *driver.ModuleEntry = ?p.modules[p.topo[stale[ii::usize]]::u32];
+        readout.item_dur(p.events, readout.PH_CODEGEN, driver.fqn_name(p, im.fqn), slots[ii].d);
+        ii = ii + 1;
     }
 
     # first error in topo order wins - deterministic regardless of which worker hit it.
