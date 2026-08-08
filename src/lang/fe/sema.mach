@@ -111,6 +111,15 @@ pub fun sema(
         ret R.err[context.SemaResult, str](R.unwrap_err[bool, str](res_init));
     }
 
+    # install the identifier-binding resolver for the WHOLE pass, not for a window:
+    # every fold this pass runs - an array length in a type position, a `$if` gate,
+    # a constant index bound - has to decide an identifier on the declaration it
+    # resolves to, and a window would leave whichever fold fell outside it reading
+    # by name (#2764). cleared on every exit below so the borrowed ctx never keeps a
+    # dangling `sc` pointer.
+    val scp_ident: *context.SemaContext = ?sc;
+    comptime.set_ident_resolver(ctx, context.comptime_ident_is_runtime::*u8, scp_ident::ptr);
+
     # install the module-member resolver so `comptime.eval` can fold an imported
     # `pub val` referenced in a type position - an array length like `[a.CAP]u8` -
     # exactly as a local `val` folds (#2081). every syntactic type node, including a
@@ -199,6 +208,7 @@ pub fun sema(
         ret R.err[context.SemaResult, str](R.unwrap_err[bool, str](res_reval));
     }
 
+    comptime.set_ident_resolver(ctx, nil, nil);
     ret build_result(?sc);
 }
 
@@ -643,9 +653,12 @@ fun revalidate_one(sc: *context.SemaContext, deps: *context.SemaDeps, origin: se
     val saved_td:  ptr                  = octx.type_data;
     val saved_qfn: *u8                  = octx.query_fn;
     val saved_qd:  ptr                  = octx.query_data;
+    val saved_ifn: *u8                  = octx.ident_fn;
+    val saved_id:  ptr                  = octx.ident_data;
     comptime.set_field_resolver(octx, context.resolve_field_member::*u8, tscp::ptr);
     comptime.set_type_resolver(octx, context.resolve_type_comparison_operand::*u8, tscp::ptr);
     comptime.set_type_query_resolver(octx, infer.resolve_type_query::*u8, tscp::ptr);
+    comptime.set_ident_resolver(octx, context.comptime_ident_is_runtime::*u8, tscp::ptr);
     tsc.inst_site     = site;
     tsc.inst_site_set = true;
     val res: R.Result[bool, str] = infer_stmt(?tsc, d.data.fun_.body, ret_ty);
@@ -653,6 +666,7 @@ fun revalidate_one(sc: *context.SemaContext, deps: *context.SemaDeps, origin: se
     comptime.set_field_resolver(octx, saved_ffn, saved_fd);
     comptime.set_type_resolver(octx, saved_tfn, saved_td);
     comptime.set_type_query_resolver(octx, saved_qfn, saved_qd);
+    comptime.set_ident_resolver(octx, saved_ifn, saved_id);
 
     free_typeids(sc.s.alloc, scratch_expr, oa.expr_len);
     free_typeids(sc.s.alloc, scratch_decl, oa.decl_len);
@@ -972,6 +986,7 @@ fun source_text_of(s: *session.Session, a: *ast.Ast) str {
 # ---
 # sc: the context to tear down
 fun dnit_context(sc: *context.SemaContext) {
+    if (sc.ctx != nil) { comptime.set_ident_resolver(sc.ctx, nil, nil); }
     if (sc.expr_type != nil && sc.a.expr_len > 0) {
         A.deallocate[type.TypeId](sc.s.alloc, sc.expr_type, sc.a.expr_len);
     }
@@ -2586,26 +2601,25 @@ fun check_comptime_gate(sc: *context.SemaContext, eid: id.ExprId) {
         # evaluator folds directly; leave it to the evaluator.
         if (O.is_none[*resolve.Symbol](opt_sym)) { ret; }
         val sym: *resolve.Symbol = O.unwrap[*resolve.Symbol](opt_sym);
-        if (sym.kind == resolve.SYM_PARAM) {
-            if ((sym.flags & resolve.SYM_FLAG_COMPTIME) == 0) {
+        # whether the name denotes runtime storage is `resolve.symbol_is_runtime`'s
+        # question, asked here exactly as the evaluator asks it, so this gate walk
+        # cannot drift from what `comptime.eval` will actually do with the same leaf
+        # (#2764). only the WORDING is local: the reader needs to hear "parameter"
+        # for a parameter and "value" for a binding.
+        if (resolve.symbol_is_runtime(sym)) {
+            if (sym.kind == resolve.SYM_PARAM) {
                 check.report_named(sc, e.span, "comptime `$if` gate cannot reference runtime parameter '", sym.name, "'", "comptime `$if` gate cannot reference a runtime parameter");
-            }
-            ret;
-        }
-        # a `val` / imported binding is foldable ONLY if it actually resolves to a
-        # comptime constant. a runtime block-local `val n = f();` is SYM_VAL but not
-        # foldable - and the comptime env is name-keyed, so folding it would
-        # spuriously succeed against a same-named MODULE const it shadows (a real
-        # miscompile of the gate). decide on resolution identity first: only a
-        # module-scope val (or an import) reaches the fold test; a block-local val
-        # is rejected outright regardless of any name collision.
-        if (sym.kind == resolve.SYM_VAL || sym.kind == resolve.SYM_IMPORTED) {
-            val is_module: bool = sym.kind == resolve.SYM_IMPORTED
-                                || (sym.flags & resolve.SYM_FLAG_MODULE) != 0;
-            if (!is_module) {
-                check.report_named(sc, e.span, "comptime `$if` gate cannot reference runtime value '", sym.name, "'", "comptime `$if` gate cannot reference a runtime value");
                 ret;
             }
+            check.report_named(sc, e.span, "comptime `$if` gate cannot reference runtime value '", sym.name, "'", "comptime `$if` gate cannot reference a runtime value");
+            ret;
+        }
+        # a comptime parameter is foldable per call site, never here.
+        if (sym.kind == resolve.SYM_PARAM) { ret; }
+        # a `val` / imported binding survives the identity test but is still foldable
+        # only if it actually resolves to a comptime constant, so a module-scope
+        # `val n = f();` is rejected by the fold rather than by the rule above.
+        if (sym.kind == resolve.SYM_VAL || sym.kind == resolve.SYM_IMPORTED) {
             val res_eval: R.Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, eid, ?sc.s.interner);
             if (R.is_err[comptime.CTValue, str](res_eval) && !check.imported_module_const_sym(sc, sym)) {
                 check.report_named(sc, e.span, "comptime `$if` gate cannot reference runtime value '", sym.name, "'", "comptime `$if` gate cannot reference a runtime value");
