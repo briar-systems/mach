@@ -70,6 +70,13 @@ The two paths computed one fact in two places and agreed only by accident. The h
 
 ### Added
 
+#### `int/observability.md`: what a behavioural golden can never observe, and which surface can (#2822)
+`int/run.sh`'s default case runs a program and diffs its output, and every such case is blind in the same ways. Nothing said what those ways were, so the blindness was rediscovered one defect at a time. The document names each class and the surface that can see it, and every entry is a defect this repo already paid for rather than a piece of testing advice.
+
+Two overlapping `PT_LOAD` segments at one address (#2795) could never change any program's output, because the loader resolves the ambiguity and the program is correct - and gdb aborting was luck, since a profiler doing the same derivation would have been silently wrong. A pc-relative pair resolved without chasing its label (#2797) needed a **foreign** clang-18 object, because mach's own writer and reader shared the assumption and every mach-only case agreed with the bug. A float access substituting another width's form (#2766) was settled by byte comparison against `llvm-mc`. Eleven mach-std failures on darwin existed for months behind a green CI that cross-compiled and executed nothing, one of them a wrapper whose `if (rc < 0)` error check could never fire because `pthread` does not use errno, so a failure returned as success.
+
+It also records the degenerate-fixture trap, generalized from `int/surface/narrow-stack-args`: **offset zero validates any scheme that drops the offset**, because adding nothing is indistinguishable from adding correctly. That case is annotated with what it does not cover, alongside the two operating rules already in force here - demonstrate a new case failing against the unpatched compiler before adding it, and assert values and effects over emitted shape, goldens over shape being right for `--emit-asm` and encoder output and wrong as a general-purpose assertion.
+
 #### aarch64 emits the B and H views of a V register, so a two-byte vector moves in one instruction (#2716)
 `vec_mem_widths` declared 4, 8 and 16 on aarch64 while the architecture also has B and H views of the same V register. The gap was not neutral: declaring 1 and 2 anyway turned an `i8x2` copy into `internal compiler error: aarch64 has no float memory access form for this width`, because the model claimed a capability the encoder did not have. That is what an aspirational declaration produces, and it is why the field describes **what the back end emits** rather than what the ISA has.
 

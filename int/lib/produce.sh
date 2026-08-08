@@ -4,6 +4,11 @@
 # stdout, which run.sh diffs against the golden. the producer is the only thing
 # that varies between verification modes; the golden-diff core does not change.
 #
+# CHOOSING ONE. this list says what each producer observes. int/observability.md says
+# what `exec` - the default, and the right first reach - structurally CANNOT observe,
+# and maps each of those classes to the surface that can. most of the producers below
+# exist because of one of its entries, so the two files are meant to be read together.
+#
 # producers:
 #   exec        — run the program, observe its stdout (native / qemu).
 #   relro-fault — run the program and report whether its write to a RELRO'd .rodata
