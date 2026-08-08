@@ -18,7 +18,7 @@
  *     visible as an integer.
  *
  *   - `scale` multiplies by a constant clang pools, the shape that made
- *     int/surface/narrow-stack-args read every float argument back as exactly 0: a
+ *     test/link/cases/narrow-stack-args read every float argument back as exactly 0: a
  *     scale factor loaded from the wrong address is 0.0, and 0.0 times anything is a
  *     plausible-looking zero rather than a crash.
  *
