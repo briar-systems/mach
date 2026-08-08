@@ -23,9 +23,18 @@
 # allocation, no vreg added, no block rebuilt. The output is therefore byte-
 # identical to a build without this pass on every wide-native target; only a
 # target that declares a narrow ALU or no multiply (the 8-bit mos6502 declares
-# both: `max_alu_width = 1`, `has_mul = false`) drives the rewrite. A 128-bit
-# vector instruction (`vec_lane != 0`) is never legalized here: it is the vector
-# path's responsibility and was already legalized (or rejected) in the middle end.
+# both: `max_alu_width = 1`, `has_mul = false`) drives the rewrite.
+#
+# WHAT IS NEVER LEGALIZED HERE: anything riding the FLOAT / VECTOR REGISTER BANK.
+# This pass splits a value into integer lanes and threads carries between them, which
+# is meaningful only for a value the INTEGER ALU computes. A float unit's width is an
+# independent fact - rv32d has 64-bit f-registers on a 32-bit machine - so `f64`
+# operations there are native at `lane_width` 4, and splitting one into integer lanes
+# would move the value out of the float bank entirely. A 128-bit vector was always
+# excluded (it is the vector path's responsibility and was already legalized or
+# rejected in the middle end). A SCALAR float was not, which was invisible while every
+# target's ALU covered every scalar and a silent miscompile on the first one whose does
+# not (#2818). Both are now the one gate `instr_rides_fp_bank` states.
 #
 # THE MODEL. A wide value is one vreg; the pass splits it into
 # `width / max_alu_width` native-width LANE vregs (lane 0 the least significant),
@@ -272,7 +281,7 @@ fun function_needs_legalize(f: *mir.MirFunction, mach: *Machine) bool {
 # mach: the machine facts (native lane width, pointer width, shift/multiply capability)
 # ret:  true when the instruction needs legalization
 fun instr_needs_legalize(f: *mir.MirFunction, mi: *mir.MirInstr, mach: *Machine) bool {
-    if (instr_is_vector(f, mi)) { ret false; }
+    if (instr_rides_fp_bank(f, mi)) { ret false; }
     if (mi.width > mach.lane_width || mi.src_width > mach.lane_width) { ret true; }
     if (!mach.var_shift && is_shift(mi.opcode)) { ret true; }
     if (!mach.has_mul && mi.opcode == mir.MIR_MUL) { ret true; }
@@ -306,18 +315,44 @@ fun instr_has_value_base(mi: *mir.MirInstr) bool {
     ret false;
 }
 
-# whether an instruction rides the 128-bit vector bank (via its lane descriptor or
-# any vector-flagged vreg operand)
+# whether an instruction rides the FLOAT / VECTOR REGISTER BANK, via its lane
+# descriptor or any non-GP vreg operand
+#
+# THE GATE IS THE BANK, NOT THE OPCODE, AND NOT THE WIDTH (#2818). This pass splits a
+# value into INTEGER lanes and threads carries between them, which is meaningful only
+# for a value the integer ALU computes. A value in the float bank is computed by a
+# separate unit whose width has nothing to do with `max_alu_width` - rv32d's
+# f-registers are 64 bits wide on a 32-bit machine - so an `f64` register copy at
+# `lane_width` 4 is a single native `fmv.d`, and splitting it into two 4-byte integer
+# lane moves is a SILENT MISCOMPILE: the lane vregs are GP-class, so the value leaves
+# the float bank and the reassembled halves are not the float. Exactly the shape of
+# #2777, where a move width taken from the machine word rather than the value's own
+# type emitted `fmv.d.x` for an `f32` and NaN-boxed every soft-float `f32` into a NaN.
+#
+# The vector flag alone was the gate before, which excluded a 16-byte vector and
+# admitted a scalar float - invisible while every target's word was 8 and no scalar
+# was ever wider than its ALU, and a wrong answer the moment a target declares a
+# 4-byte word. The register CLASS is the authority both cases share: `vreg_is_fp` is
+# the same fact instruction selection reads to identify a float register copy, and a
+# vector vreg is FP-class too. The `vector` flag is still honored because the phi /
+# merge move splice in `mir.lower` carries a 16-byte width without stamping vec_lane.
+#
+# A TARGET WITH NO FLOAT BANK IS UNAFFECTED. mos6502 declares one register class, so
+# a soft-float `f64` there rides GP vregs, answers false here, and is split by this
+# pass exactly as it was - which is the whole reason mos6502 can have floats at all.
 # ---
 # f:  the MIR function owning the vreg table
 # mi: the instruction to test
-# ret: true when the instruction is a vector op
-fun instr_is_vector(f: *mir.MirFunction, mi: *mir.MirInstr) bool {
+# ret: true when the instruction's values ride the float / vector bank
+fun instr_rides_fp_bank(f: *mir.MirFunction, mi: *mir.MirInstr) bool {
     if (mi.vec_lane != mir.VEC_LANE_NONE) { ret true; }
     var k: u32 = 0;
     for (k < mi.operand_count) {
         val op: *mir.MirOperand = ?mi.operands[k];
-        if (op.kind == mir.MIR_OP_VREG && op.vreg < f.vreg_count && f.vregs[op.vreg].vector) { ret true; }
+        if (op.kind == mir.MIR_OP_VREG && op.vreg < f.vreg_count) {
+            if (f.vregs[op.vreg].vector)    { ret true; }
+            if (mir.vreg_is_fp(f, op.vreg)) { ret true; }
+        }
         k = k + 1;
     }
     ret false;
@@ -402,7 +437,10 @@ fun plan_lanes(alloc: *A.Allocator, mach: *Machine, f: *mir.MirFunction, out: *L
             # lanes off `mi.width` here would split that boolean into as many lanes as
             # the operands have and leave every consumer - which reads it at its own
             # native width - naming a vreg the expansion no longer defines.
-            if (!instr_is_vector(f, mi) && mir.instr_defines_shape(mi) &&
+            # the PLANNER and the needs-legalize GATE read one authority (#2818): a
+            # value the gate excludes must get no lanes here, or the plan describes a
+            # split the rewriter never performs.
+            if (!instr_rides_fp_bank(f, mi) && mir.instr_defines_shape(mi) &&
                 !mir.is_cmp_opcode(mi.opcode) &&
                 mi.width > maw && mi.operand_count > 0 &&
                 mi.operands[0].kind == mir.MIR_OP_VREG) {
@@ -3236,5 +3274,83 @@ test "mach.lang.be.codegen.legalize:rejects_a_shift_at_a_non_power_of_two_width"
     t_shift_fn(?alloc, ?f, ?b, mir.MIR_SHL, 3, mir.op_vreg(2));
     var mach: Machine = t_mach(1, 2);
     if (!R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f))) { ret 1; }
+    ret 0;
+}
+
+# A SCALAR FLOAT IS NEVER SPLIT INTO INTEGER LANES (#2818).
+#
+# The gate excluded only VECTORS, which is indistinguishable from excluding the whole
+# float bank while every target's ALU covers every scalar - no scalar op is ever wider
+# than the lane, so the clause never fired for a float and the omission could not show.
+# At `lane_width` 4 it fires: an `f64` register copy is a plain `MIR_MOV` of width 8,
+# and splitting it produces two 4-byte moves between GP-CLASS lane vregs, so the value
+# leaves the float bank and the halves are not the float. A silent miscompile, the same
+# shape as #2777, and the reason the assertion is inertness rather than a diagnostic:
+# an `f64` move at `lane_width` 4 is a single native instruction (rv32d's `fmv.d`),
+# because a float unit's width is independent of the integer ALU's.
+#
+# THE CONTROLS ARE WHAT MAKE THIS TEST MEAN ANYTHING. The identical function over
+# GP-class vregs at the identical machine MUST still split - otherwise inertness would
+# prove only that the fixture legalizes nothing - and the float function must still be
+# split on a machine with no float bank at all, which is how mos6502 has floats.
+test "mach.lang.be.codegen.legalize:a_float_is_not_split_into_integer_lanes" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    # v0 <- v1, both f64, on a machine whose integer ALU is 4 bytes wide.
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 2);
+    f.vregs[0].class = mir.REG_CLASS_GP + 1;   # the float bank
+    f.vregs[1].class = mir.REG_CLASS_GP + 1;
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 1);
+    var mv: [2]mir.MirOperand;
+    mv[0] = mir.op_vreg(0); mv[1] = mir.op_vreg(1);
+    t_instr(?alloc, ?b, 0, mir.MIR_MOV, ?mv[0], 2, 8);
+    f.blocks = ?b; f.block_count = 1;
+
+    val before_ptr:   *mir.MirInstr = b.instrs;
+    val before_count: u32           = b.instr_count;
+    val before_vregs: u32           = f.vreg_count;
+
+    var mach: Machine = t_mach(4, 4);
+    val r: R.Result[bool, str] = legalize_function(?alloc, ?mach, ?f);
+    if (R.is_err[bool, str](r))        { ret 1; }
+    if (b.instrs != before_ptr)        { ret 1; }  # not reallocated
+    if (b.instr_count != before_count) { ret 1; }  # still one native move
+    if (f.vreg_count != before_vregs)  { ret 1; }  # no integer lanes planned
+
+    # CONTROL 1: the same move over GP-class vregs at the same machine DOES split, so
+    # the inertness above is the gate and not a fixture that legalizes nothing.
+    var gf: mir.MirFunction;
+    t_vregs(?alloc, ?gf, 2);
+    var gb: mir.MirBlock;
+    t_block(?alloc, ?gb, 1);
+    var gi: [2]mir.MirOperand;
+    gi[0] = mir.op_vreg(0); gi[1] = mir.op_imm(0x0102030405060708);
+    t_instr(?alloc, ?gb, 0, mir.MIR_MOV, ?gi[0], 2, 8);
+    gf.blocks = ?gb; gf.block_count = 1;
+
+    val gr: R.Result[bool, str] = legalize_function(?alloc, ?mach, ?gf);
+    if (R.is_err[bool, str](gr))   { ret 1; }
+    if (gb.instr_count != 2)       { ret 1; }  # two 4-byte lane moves
+    if (gf.vreg_count <= 2)        { ret 1; }  # lane vregs were planned
+
+    # CONTROL 2: a target with NO float bank declares one register class, so a
+    # soft-float value rides GP vregs and is split exactly as before - which is the
+    # whole reason mos6502 can compute with floats at all. Same shape as control 1,
+    # asserted separately because it is the case the gate must NOT catch.
+    var sf: mir.MirFunction;
+    t_vregs(?alloc, ?sf, 2);
+    var sb: mir.MirBlock;
+    t_block(?alloc, ?sb, 1);
+    t_instr(?alloc, ?sb, 0, mir.MIR_MOV, ?gi[0], 2, 8);
+    sf.blocks = ?sb; sf.block_count = 1;
+
+    var m8: Machine = t_mach(1, 2);
+    val sr: R.Result[bool, str] = legalize_function(?alloc, ?m8, ?sf);
+    if (R.is_err[bool, str](sr)) { ret 1; }
+    if (sb.instr_count != 8)     { ret 1; }  # eight byte lanes
+    if (sf.vreg_count <= 2)      { ret 1; }
     ret 0;
 }
