@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### `$length_of` folds in a comptime gate, and a gate folds the same way in both passes (#2875)
+`$if ($length_of([4]f32) != 4)` was refused, in a function body and at module scope alike, with `` `$offset_of` has no value in a comptime condition `` against an operand that is plainly a fixed array. `$size_of` and `$align_of` had folded in a gate since #2857, so the one layout intrinsic that counts elements was the odd member of the set.
+
+Lowering walks a `$if` chain by evaluating every gate again, so a layout gate is measured twice: once by sema, choosing which arms are type-checked, and once at lowering, choosing which arms become code. Lowering's layout resolver answered `$size_of` and `$align_of` and returned "not mine" for `$length_of`, and the evaluator renders that as `$offset_of`'s refusal. It now answers the count from the operand's `element_count` over the sema type, which is where an element count belongs: how many elements a type holds is a property of the spelling and is the same on every target, unlike a size, which is measured through the IR against the target's layout.
+
+That exposed the second half. Lowering reads the operand's type out of the slot sema stamps on it, and the ordinary sema fold, the path a plain layout gate takes, folded the gate without typing it first, unlike the two folds beside it. So the operand carried no type at lowering, where `$length_of` read no count and `$size_of` silently measured **zero**: `$if ($size_of([4]f32) == 16)` type-checked its true arm in sema and then lowered its false one, with no diagnostic from either pass. A gate sema folds is now a gate sema typed, so the two passes read the same measurement and select the same arm.
+
 #### `--pie` and dynamic linking on a loaderless OS are refused by name (#2898)
 `mach build --pie` on a freestanding ELF target failed with `elf: PIE program headers exceed the one-page header reservation (too many load segments)`. That was wrong in both clauses. There were four load segments, not too many, and the reservation was not a page: freestanding declares `page_size = 1` because bare metal has no paging, so the check refused whatever the image contained. On riscv32 a third answer arrived first, the ELF32 dynamic-image message. None of the three named the reason.
 
