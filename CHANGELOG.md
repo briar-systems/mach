@@ -17,6 +17,33 @@ A static ELF executable (`emit_exec`) now carries `.symtab` + `.strtab` with eve
 Trails every `PT_LOAD` segment exactly like `int/surface/debuginfo`'s DWARF sections already do (`readelf -SW`/`-lW` confirm `.symtab`'s file offset never precedes a loaded segment's end), so a release image's runtime bytes are unchanged - the loader ignores non-allocated sections and a release build stays byte-for-byte the same program, just no longer anonymous to a debugger or profiler reading its container. This is a real, measured trade against the previous byte-identical *header-less* release image, though: a build that carried no section-header table at all now carries one whenever it carries a symbol table (which is every static build now), and the compiler's own release binary - a large, real program with 8,408 function symbols - grew by about 611 KiB (7.3%) for it. `perf record`/`perf report` on a release build built with this change resolves `[.] main` by name where it previously showed a raw address; `addr2line -f` on an address in the middle of a function's body (not just its entry) resolves to that function, proving `st_size` is correct and not merely present.
 
 Scoped to ELF's plain static executable writer (`emit_exec`) for now: a PIE/dynamically-linked executable (`emit_dyn_exec`) and a shared library (`emit_shared`) do not carry a symbol table yet, and neither does Mach-O (`LC_SYMTAB`) or PE/COFF (its own, mostly-obsolete-under-PDB symbol table) - both accept the same `of.SymtabEntry` channel for `of.ExecFn` conformance and ignore it. `of.SymtabEntry` (name, final vaddr, byte size, STB_LOCAL/STB_GLOBAL linkage) is the format-neutral shape a future writer for either reads from, so extending coverage is wiring a serializer, not redesigning the data.
+### Changed
+
+#### BREAKING: linkage names are dotted and readable
+
+Every symbol Mach emits changes spelling. The mangled name is now the source FQN as the source spells it, with generic arguments after a `$`:
+
+```
+_M3std5types6string7str_lenN7str_len   ->  std.types.string.str_len
+_M3std5types6optionN12unwrapI3ptrE     ->  std.types.option.unwrap$ptr
+_M4mach4lang6internN26"intern.roundtrip"  ->  mach.lang.intern."intern.roundtrip"
+```
+
+**What this breaks.** Object files, static libraries and shared libraries built by 4.16.0 or earlier do not link against ones built by this release: every non-`ext`, non-`#[symbol]` symbol has a different name. Rebuild the whole closure. Anything that named a mangled Mach symbol from outside the compiler breaks with it — a C declaration bound to `_M...` by hand, an inline-asm reference to a mangled name, a linker script or `--wrap` naming one, a symbol allowlist, a profiler or crash-report filter matching the `_M` prefix.
+
+**Who should care.** Almost nobody. `ext fun` foreign symbols and `#[symbol("...")]` names are literal and always were, so the entry point, the `_rt_*` runtime symbols, every C import and every hand-written asm target are all untouched. If you never wrote `_M` anywhere, a rebuild is the whole migration.
+
+**The scheme.** The module path and the bare name are joined by `.`, exactly as the source FQN reads, and there is no prefix — a mangled name always contains a `.` and a C identifier never can, so the old `_M` reserved-space guard bought nothing. A generic argument is introduced by a run of `$` whose **length is its nesting depth**, so nothing needs a closing bracket and a shallow instance stays short:
+
+```
+f[Map[Vec[i64], str], u8]  ->  m.f$m.Map$$m.Vec$$$i64$$str$u8
+```
+
+Types spell themselves: `p$u8` is `*u8`, `sec$u32` is `^u32`, `arr4$u8` is `[4]u8`, `fn$$i64$$u8` is `fun(u8) i64`, a record is its own dotted origin FQN, a comptime value is its literal (`tag$7`, `tag$n3`, `true`, `"text"`), and a variadic pack instance carries a `pack` marker before its element list. `.` and `$` are both accepted in an inline-asm symbol name, so every emitted symbol stays nameable from `asm` — which the old scheme also managed, and which a readable scheme has no excuse to lose.
+
+Names did **not** get longer. Over the compiler's own release build — same tree, same profile, 11660 distinct symbols either way — the longest goes from **108 bytes to 105**, and the count over the **63-byte inline-asm operand limit** falls from **1543 to 668**. A length prefix costs one or two digits per path segment where a dot costs one character, and the `_M` goes away, so a dotted name is shorter despite being readable. (That cap is a pre-existing limitation with a misdirecting diagnostic — an over-long operand is refused as "malformed" — and is not touched here.)
+
+Fixing the scheme fixes every reader at once — IR dumps, diagnostics, `--emit-asm` headings, linker messages, `objdump`, `perf`, `DW_AT_linkage_name` — rather than teaching a dozen display sites to substitute a friendlier name one at a time, and the places with no source name to substitute are covered too.
 
 ### Fixed
 
@@ -65,6 +92,15 @@ A SPIR-V execution model has no call stack, so a cycle in the static call graph 
 
 The parameter limit was two independent literals that disagreed: `emit_function` refused above 16 while `type_fn`'s fixed operand buffer failed above 14 and returned a 0 nobody read, which reached `OpFunction` as the reserved never-valid id. The limit is now stated once as `types.MAX_FN_PARAMS`, both sites read it, 15 and 16 parameters build and validate, and a 0 from `type_fn` is reported instead of passed on.
 
+#### A dead local's stale value survives past its real live range at opt0, and a `ret` statement's line-table row duplicates at function entry (#2779)
+Two opt0-only debug-info defects `int/surface/debugger-gdb` (#2756) caught by driving a real `gdb` session, neither visible to structural DWARF validation because both artifacts are internally consistent, well-formed DWARF that simply describes the wrong thing.
+
+**A variable's `DW_AT_location` was scoped to its lexical extent, not its true live range.** The opt0 allocator reusing a genuinely-dead local's storage is correct codegen (confirmed by checking the runtime value with no debugger involved), but the DWARF location for that local was never bounded to end where the reuse happens, so a debugger stopped after that point read the new occupant's value as though it were still the old variable's. Root cause: `gather_vars` built a variable's location ranges from its own bindings only, so a variable bound once and never rebound kept a stationary location valid to the function's end regardless of what physically happened to its storage afterward. `bound_storage_reuse` now truncates a range to the point some OTHER variable's binding, in the SAME inline site, claims the identical physical home - a stationary home a debugger could no longer trust past that point now reports unavailable instead. Scoping the search to the same inline site is load-bearing, not an optimization: at opt2 with heavy inlining, two variables in unrelated inline instances can land in the same register with no real relationship, and comparing across sites produced exactly that false positive while building this fix's own regression coverage.
+
+**A `ret <expr>;` statement's line-table row was duplicated at the function's own entry address.** `lower_phis` (out-of-SSA phi elimination) runs once, after every block in the function has already been lowered, and stamped its synthesized merge-copy instructions from `ctx.cur_loc` - a cursor left stale at the function's LAST lowered statement by the time phi elimination ran, for every predecessor block's edge regardless of where in the function that predecessor actually was. `break file:22` on a function whose `ret` genuinely lives at line 22 could silently resolve to its entry instead, with no ambiguity warning, reading whatever was left in an uninitialized register. Fixed by stamping from the predecessor block's own terminator location instead, which was already correct when that block was lowered and never went stale.
+
+`int/surface/debugger-gdb` gained two debug-profile-only probes proving both fixes together, asserted as a pair per each bug's own shape: a variable that genuinely dies mid-function now reports unavailable, while a sibling that stays live keeps reading its real value (a fix that reported "unavailable" for both would pass either probe alone); a second breakpoint on a real `ret` statement resolves to its own address and reads the correct value rather than silently landing at the wrong one. Both bugs are specific to opt0's own location and line-table construction and do not reproduce at opt2, so the case's golden is now per-profile (`expect.debug.txt` / `expect.release.txt`) rather than the one `expect.txt` every other `gdb-session` case still uses.
+
 #### A loop-carried vector accumulator through an unpacked operator came out holding the wrong value (#2749)
 The gap expansion (#2726) replaces a vector operator the target has no packed form for with per-lane scalar work and an assembled vector, then points that operator's uses at the assembled value. It rewrote those uses one block at a time, immediately after expanding that block's body. That is correct for every use that follows its definition, and wrong for the one that does not: a loop header's phi names the value the **latch** defines, so its back-edge operand is a forward reference no block order removes.
 
@@ -82,8 +118,6 @@ The fix is a contract change on the access family, not a check at today's caller
 The census found the same defect on **x86-64**, which the issue did not name: `emit_float_load`, `emit_float_reg_or_slot_load`, `emit_float_store` and `float_const_operand` each read `mov_op = MOVSD; if (w == 4) { mov_op = MOVSS; }`, so every width other than 4 took the eight-byte MOVSD. It was inert only because `encode_fp_mov` returns its vector arm above them. Nothing in the helpers said so, and `emit_float_load` is reached separately by the arithmetic and seed paths. aarch64's `emit_fp_const` carried the same `use64 = width == 8`.
 
 Every refusal is **driven from a unit test** with a width it must refuse, and the assertion is that the output buffer stayed **empty**, not merely that an error was returned. That distinction is load-bearing here: both `emit_mem_access` implementations materialize an out-of-range offset into the scratch register before the access word, and a folded global emits its `adrp` / `auipc` high half before the low one, so a check placed at the emission point rather than at the top would leave stranded instructions behind the error. Every legitimate width still encodes byte-exactly against `llvm-mc`, including aarch64's Q form at 16 and the sub-word integer forms at 1 and 2 that share the same helpers.
-### Changed
-
 #### The realization authority answers a lane-count ceiling as well as a lane width (#2749)
 `isa.packed_width` answers a question keyed on the lane **width**, and a SPIR-V Shader module's constraint is a lane **count**: `OpTypeVector` takes 2, 3 or 4 components at every element type. For 8-bit lanes the authority reported a 128-bit packed form, meaning sixteen lanes, which no Shader module may declare - so the authority and the emitter gave different answers about the same shape, and the emitter refused `i8x16`, `u8x16`, `i16x8` and `u16x8` by name.
 

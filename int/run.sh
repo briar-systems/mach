@@ -402,18 +402,6 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
     # the mach target to compile: the build-target if set, else the leg itself.
     build_target=${case_build_target:-$target}
 
-    # the golden is shared across build-targets for target-independent observables (exec,
-    # the relro-fault guard, and the panic-exit guard, whose outputs are all
-    # target-independent; debuginfo, whose two facts — validator-clean and additive —
-    # hold identically on every ELF ISA; gdb-session, whose stop/frame/value facts are
-    # verified by hand to read identically at both opt levels and, were a second ELF
-    # leg ever added to its case.conf, would hold there too) and per-build-target for
-    # structural producers (their fact is format-specific).
-    case "$case_run" in
-        exec|relro-fault|panic-exit|debuginfo|varloc-fbreg|symtab|gdb-session) golden="$dir/expect.txt" ;;
-        *)                                                                     golden="$dir/expect.$build_target.txt" ;;
-    esac
-
     # once per case, not per profile: `dep pull` honors the lock left by the first
     # profile, so deciding here is both what makes a case's two profiles agree on one
     # commit and what keeps the resolution cost at one per case, as it already was.
@@ -422,6 +410,22 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
     for profile in $case_profiles; do
         ran=$((ran + 1))
         label="$case_id [$target/$profile]"
+
+        # the golden is shared across build-targets for target-independent observables
+        # (exec, the relro-fault guard, and the panic-exit guard, whose outputs are all
+        # target-independent; debuginfo and symtab, whose facts hold identically on
+        # every ELF ISA), per-profile for gdb-session (its stop/frame/value facts are
+        # a real function of the active profile's own codegen — opt0's location and
+        # line-table construction is a materially different pipeline from opt2's,
+        # #2779 — rather than of the target ISA/format the build-target axis tracks,
+        # which is why this reads $profile and must live inside this loop rather than
+        # being decided once per case like the other two tiers), and per-build-target
+        # for structural producers (their fact is format-specific).
+        case "$case_run" in
+            exec|relro-fault|panic-exit|debuginfo|varloc-fbreg|symtab) golden="$dir/expect.txt" ;;
+            gdb-session) golden="$dir/expect.$profile.txt" ;;
+            *)           golden="$dir/expect.$build_target.txt" ;;
+        esac
 
         # the build artifact goes under the case's gitignored out/ via a path
         # relative to the case dir: a native windows compiler resolves it against
@@ -533,7 +537,7 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
                 fi
             fi
 
-            if produce "$case_run" "$runmode" "$target" "$bin" "$gbin" >"$tmp/out.txt" 2>"$tmp/err.txt"; then
+            if produce "$case_run" "$runmode" "$target" "$bin" "$gbin" "$profile" >"$tmp/out.txt" 2>"$tmp/err.txt"; then
                 prc=0
             else
                 prc=$?
