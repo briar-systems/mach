@@ -70,6 +70,15 @@ mos6502, the other target that legalizes to a narrower ALU, is unaffected: an `i
 
 ### Added
 
+#### A declaration-scope `$if` that declares nothing can ask about a type (#2876)
+`$if ($size_of(MeshUniforms) != 64) { $error("MeshUniforms must be 64 bytes"); }` at module scope was rejected: the gate was folded while names were being resolved, and no type has a layout yet at that point. The layout check people actually want to write - a wire format, a uniform block, two records that share a slot - had nowhere to live except a runtime test that only fires if someone runs the suite.
+
+A declaration-scope `$if` now runs at one of two times, and what its arms contain picks which. A chain some arm of which **declares something** is decided while names are resolved, because what it decides is which declarations exist, and every later stage reads that set - a genuinely circular question to ask a type about, since the type universe is built from the declarations the gate is choosing. A chain no arm of which declares anything contributes no name and no type whichever arm wins, so nothing depends on deciding it early: it is decided during type checking, where its gate measures a type, queries one, or compares one. The measurement runs through the same path a function-body gate uses, so a size measured in one position and the same size measured in another cannot disagree.
+
+Which time applies is decided **syntactically, over every arm** - `$if`, every `$or`, and a trailing `$or {}` - before any gate is evaluated. One declaring arm anywhere keeps the whole chain at the earlier time. A per-arm rule would make the stage that runs the gate depend on which arm the gate selects, which is not knowable at the stage that would have to choose. Because a `use` is a declaration, conditional imports - by far the commonest declaration-scope `$if` - are untouched, as is the refusal a declaring chain gives a type question, now naming the arm that declares as the reason.
+
+The cost is stated rather than left to be discovered: `$if` runs at one of two times depending on its contents, written into `doc/language/comptime-control.md` and onto the deferral itself. The one visible consequence is ordering - a reached `$error` under a deferred chain is reported during type checking, so an unrelated resolution error in the same module is now reported before it rather than after.
+
 #### A storage binding nothing writes is emitted `NonWritable`, and can say so (#2879)
 A `#[storage(set, binding)]` buffer that a stage only reads was emitted with no `NonWritable` decoration, so every consumer had to enable `vertexPipelineStoresAndAtomics` to read one from a vertex stage. The read-only case is the common one - a joint palette, an instance buffer, a light list - and it is the case where the decoration is free and its absence costs a hardware requirement.
 

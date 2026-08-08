@@ -119,6 +119,56 @@ pub fun load($order: Order, ptr: *i64) i64 {
 }
 ```
 
+## When a declaration-scope `$if` is decided
+
+A `$if` chain written in declaration scope runs at one of two times, and what its
+arms contain picks which.
+
+- **Some arm declares something.** The chain is decided while names are being
+  resolved, because what it decides is which declarations exist and every later
+  stage reads the resulting declaration set. Nothing has a type at that point, so
+  the gate cannot ask a type question: a layout intrinsic, a type predicate or a
+  `$type_of` comparison there is rejected, with a message naming the reason.
+- **No arm declares anything.** The chain contributes no name and no type whichever
+  arm is taken, so nothing depends on deciding it early. It is decided during type
+  checking instead, where its gate may measure a type (`$size_of`, `$align_of`,
+  `$length_of`), query one (`$is_record` and friends), or compare one.
+
+The question is answered from the **syntax**, over every arm (`$if`, every `$or`,
+and the final `$else`-style `$or {}`) before any gate is evaluated. One declaring
+arm anywhere keeps the whole chain at the earlier time. Per-arm answers are not
+possible: which stage runs the gate would then depend on which arm the gate selects,
+and the stage that would have to know that is the one being chosen.
+
+A `use` is a declaration, so a conditional import is always decided while names are
+resolved. That is what makes the common target-gating form work.
+
+```mach
+rec MeshUniforms { model: [16]f32; }
+
+# no arm declares: decided during type checking, so the gate may measure
+$if ($size_of(MeshUniforms) != 64) {
+    $error("MeshUniforms must be 64 bytes");
+}
+
+# the second arm declares, so the whole chain is decided while names are
+# resolved - and the gate is rejected there
+$if ($size_of(MeshUniforms) != 64) {
+    $error("MeshUniforms must be 64 bytes");
+}
+$or {
+    val PADDING: u32 = 0;
+}
+```
+
+The one visible consequence is ordering. A `$error` reached under a chain that
+declares nothing is reported during type checking, so an unrelated name-resolution
+error elsewhere in the same module is reported before it rather than after.
+
+A `$if` inside a **function body** is always decided during type checking: it
+selects statements rather than declarations, so the question above does not arise
+and its gate may always ask about a type.
+
 ## Discarded branches
 
 A `$if` branch that isn't taken is entirely absent from the compiled
