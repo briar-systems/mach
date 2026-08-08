@@ -52,21 +52,30 @@ form, because a type declared with a vector's name would be silently unreachable
 rec f32x3 { x: f32; }           # error: `f32x3` is spelled as a vector type
 ```
 
-This holds for any well-formed spelling, including ones this target does not
-currently admit (`f32x3`, `f32x7`), so the name cannot be claimed and then
-collide when the bound moves.
+This holds for any well-formed spelling, so the name cannot be claimed by a type
+and then collide with the vector it spells.
 
-Three rules bound the form:
+Two rules bound the form, and **neither depends on the target**:
 
 - **At least 2 lanes.** `f32x1` is refused; a one-lane vector is just its scalar.
-- **No wider than the target's vector register.** Every current target is 128
-  bits, so `f32x7` (224 bits) is refused by name. The error names the width you
-  asked for and the width the target has, rather than reporting an unknown type.
-- **Currently, exactly as wide as the register.** A vector *narrower* than the
-  vector register (`f32x3`, `f32x2`) is read and laid out correctly but refused
-  by name for now, because codegen cannot yet carry a value whose register width
-  and memory footprint differ. This restriction is temporary and is the only
-  thing between the form and `vec3`.
+- **At most 65535 lanes.** A compiler limit, not a machine one: the lane count is
+  carried as a 16-bit field through code generation.
+
+Everything else is legal at every width. `f32x3` is 96 bits, `f32x8` is 256, and
+both compile on every target — including one with no vector unit at all.
+
+**Width is a realization question, not a legality one.** How a shape is realized
+does depend on the target, and there are three answers: one packed instruction
+when the shape fits a vector register and the operation has a packed form; a
+value placed in memory and worked one lane at a time when it does not; and
+per-lane scalar code on a target with no vector unit (rv64gc today). All three
+compute identical lanes — the expansion is a fixed unroll, never a reassociation
+— so only performance varies. The `simd` manifest lever (see
+[manifest.md](../manifest.md)) reports or refuses the scalar cases if a project
+cannot afford them.
+
+A target that gains wider vector registers therefore gets **better code**, not
+new spellings.
 
 `ptr` is not a lane element: its width is target-defined rather than a scalar bit
 count, so `ptrx2` is not a vector spelling.
@@ -74,22 +83,27 @@ count, so `ptrx2` is not a vector spelling.
 ### Size and alignment
 
 `$size_of` is **lane-derived**: `lanes × element size`, packed, with no padding
-up to the register width. (The sub-register rows below are the rule the layout
-already implements; those spellings are not yet accepted — see above.)
+at any width.
 
 | type | `$size_of` | `$align_of` |
 |---|---|---|
-| `f32x4` | 16 | 16 |
-| `f32x3` | 12 | 4 |
 | `f32x2` | 8 | 4 |
+| `f32x3` | 12 | 4 |
+| `f32x4` | 16 | 16 |
 | `i16x4` | 8 | 2 |
+| `f32x5` | 20 | 16 |
+| `f32x8` | 32 | 16 |
 
-`$align_of` is deliberately **discontinuous at the register width**. A vector
-that *fills* the vector register aligns to its whole size, because the machine's
-vector load requires it. A narrower one is a packed aggregate that scalarizes or
-loads piecewise, so it aligns to a single lane. This is what makes `[N]f32x3` a
-usable packed vertex buffer: padding `f32x3` to 16 bytes would make it
-indistinguishable from `f32x4` in memory.
+`$align_of` has **two rungs, each for its own reason**. A vector *narrower* than
+the vector register is a packed aggregate that loads piecewise, so it aligns to a
+single lane. One that *fills* the register aligns to its whole size, because the
+machine's vector load requires it. One *wider* than the register is placed as
+several register-width pieces, so it aligns to the register width — 16 for
+`f32x8`, not 32, because there is no 32-byte vector load on a 16-byte register
+for a larger alignment to serve.
+
+The first rung is what makes `[N]f32x3` a usable packed vertex buffer: padding
+`f32x3` to 16 bytes would make it indistinguishable from `f32x4` in memory.
 
 Arrays of vectors (`[4]f32x4`) and pointers to vectors (`*f32x4`) are ordinary
 composite types over a vector element.
@@ -126,6 +140,54 @@ lane-wise operators and the comparison-to-mask rule are in
 [operators.md](operators.md); what a target without hardware SIMD does with a
 vector operator is the `simd` profile lever ([manifest.md](manifest.md),
 [policy.md](policy.md)).
+
+## Image and sampler handles
+
+A shader reads a texture through a **handle**: a name for a descriptor the pipeline
+binds, not a value with storage. Like a vector, a handle type is a **form** rather
+than a fixed list:
+
+```
+[i|u] ("sampler" | "texture" | "image") <dim> ["ms"] ["array"] ["shadow"]
+"sampler"
+```
+
+with `<dim>` one of `1d`, `2d`, `3d`, `cube`, `rect`, `buffer`, `subpass`. The
+leading `i` / `u` picks the scalar texels are sampled as (`f32` by default); the
+suffixes read in GLSL's own order, so `isampler2DMSArray` is `isampler2dmsarray`.
+
+| spelling | what it is |
+|---|---|
+| `sampler2d` | a combined sampled image — one descriptor |
+| `texture2d` | an image with no sampler, bound separately |
+| `sampler` | a sampler with no image, bound separately |
+| `isampler2d` / `usampler2d` | integer-sampled images |
+| `sampler2darray` | array-layer image |
+| `sampler3d`, `sampler1d`, `samplercube`, `samplercubearray` | the other dimensionalities |
+
+Handles are **declared with `#[sampler(set, binding)]`** and nothing else — see
+[decorators.md](decorators.md) for how one is bound and sampled. A handle cannot
+sit behind a pointer, inside an array, or in a local binding: it names a
+descriptor rather than an object with an address, and SPIR-V forbids storing an
+image, sampler or sampled-image object at all.
+
+A handle spelling is recognized only in **type position**, and reserves the name
+against a `rec` / `uni` / `def`, on exactly the terms a vector spelling does.
+
+Several well-formed spellings are **read and refused by name**, so they cannot be
+half-supported and cannot be claimed later by an unrelated declaration. Each error
+names the member it refused:
+
+- `...shadow` — depth-comparison sampling, which needs `OpImageSampleDref*` and a
+  reference value.
+- `...ms` — a multisampled image is fetched per sample, not sampled.
+- `rect`, `buffer`, `subpass` — dimensionalities needing further capabilities and
+  a different read path.
+- `image...` — a read-write storage image, which carries an image format and is
+  read and written rather than sampled.
+
+`$size_of` a handle is the target's pointer size: it is a name for a resource,
+and a pointer is the shape every target already has for that.
 
 ## Pointer
 

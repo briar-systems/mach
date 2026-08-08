@@ -529,25 +529,30 @@ type (`:^` never reinterprets storage). A non-`named-type` lead (`*`, `[`, ...)
 after `:^` leaves a bare strip so it still binds as a multiply/index on the
 stripped value. All three bind as postfix.
 
-Disambiguating a postfix `[`: a bracket whose matching `]` is **not** followed
-by `(` is always an index `obj[idx]`. When it **is** followed by `(`, the
-bracket may open a generic call `callee[T, U](args)` or be the index of an
-index-then-call `callee[idx](args)`. The two grammars overlap — a bare name is
-both a type and a value — so the parser cannot decide locally. It probes the
-payload against both grammars:
+Disambiguating a postfix `[`: the bracket may open a generic argument list
+(`callee[T, U](args)`, or `f[T]` naming an instance as a value) or be an index
+(`obj[idx]`, or the index of an index-then-call `callee[idx](args)`). The two
+grammars overlap — a bare name is both a type and a value — so the parser cannot
+decide locally. It probes the payload against both grammars, and the same four
+outcomes apply whether or not a `(` follows the `]`:
 - reads cleanly **only** as a type list (`*T`, `[N]T`, a comma list, or a
-  nested generic like `Result[bool, str]`) → a generic call;
+  nested generic like `Result[bool, str]`) → generic arguments;
 - reads cleanly **only** as an expression (`i + 1`, `f(x)`, a literal) → an
   index, so `table[0]()` and `table[i + 1]()` are index-then-call;
 - reads cleanly as **both** (a bare identifier, a dotted path, a generic
   application like `v[k]`) → the decision is deferred to name resolution, which
-  picks by the callee's resolved kind: a value (or any non-name callee, e.g. an
-  index/call result) makes `[x]` an index, while a function, type, or imported
-  name takes `[x]` as a type argument. So `table[i]()` calls the indexed
-  function pointer and `make[T]()` instantiates the generic — neither needs
-  parentheses;
+  picks by the object's resolved kind. In **callee** position a value (or any
+  non-name callee, e.g. an index/call result) makes `[x]` an index, while a
+  function, type, or imported name takes `[x]` as a type argument. In **value**
+  position the predicate is narrower — only a name that resolves to a *function
+  declaration* takes type arguments — because with no `(` to key on every
+  subscript in the language reaches this path, and `mod.ARR[i]` must stay an
+  index. So `table[i]()` calls the indexed function pointer, `make[T]()`
+  instantiates the generic, and `make[T]` names that instance as a value;
 - reads cleanly as **neither** → the committing index parse reports the error
-  (never a silent wrong parse).
+  (never a silent wrong parse). In value position, a payload that is a type and
+  nothing else has no index reading to fall back on, and is reported against the
+  object instead.
 - The struct-literal `Name[T]{...}` form is recognized at the **prefix**
   stage (`typed-literal`) and never reaches postfix.
 

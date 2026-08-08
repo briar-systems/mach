@@ -112,6 +112,22 @@
 #                 case that consumes a library dependency delivers both at once, so
 #                 one environment for the whole tree cannot be right. needs spirv-val
 #                 and spirv-dis.
+#   spirv-image — validate the module tree AND report the image / sampler surface the
+#                 emitter produced for it (#2794). spirv-val cannot see this case's
+#                 subject either: an `OpTypeImage` whose Dim operand came out 2D
+#                 where the program wrote `sampler3d`, or whose Sampled operand came
+#                 out 2 rather than 1, is a perfectly valid module describing a
+#                 different image, and one whose sample instruction reads some other
+#                 handle validates as long as the types line up. So this prints every
+#                 OpTypeImage with each of its seven operands, every
+#                 OpTypeSampledImage and OpTypeSampler with what they wrap, every
+#                 UniformConstant variable with the descriptor set and binding
+#                 decorating it, and every OpSampledImage / OpImageSampleImplicitLod
+#                 with its operand count and the TYPE of the handle it reads - which
+#                 is the assertion that ties the sample back to the declaration.
+#                 handle types carry no spirv-dis friendly name, so ids are replaced
+#                 by the shape they were declared with; every id in the output is a
+#                 description, never a number. needs spirv-val and spirv-dis.
 #   vector-emit — disassemble the case's own objects and report, per function,
 #                 whether the compiler EMITTED packed SIMD (#2207). the observable
 #                 execution cannot produce: a vectorizer that silently stops firing
@@ -122,12 +138,26 @@
 #                 vector went to memory (#2236). the same blind spot as vector-emit:
 #                 lane access through a stack round-trip computes the right answer, so
 #                 only the emitted form distinguishes it. needs llvm-objdump.
+#   call-shape  — disassemble the case's own objects and report, per function, how many
+#                 calls its emitted code still makes (#2231). the same blind spot as
+#                 vector-emit, and the sharpest instance of it: a call and the body
+#                 inlined in its place compute the same value by definition, so a
+#                 run-and-compare case cannot tell an inliner that works from one that
+#                 has stopped. reports a COUNT so the `#[noinline]` / undecorated
+#                 opt-outs are pinned by the same numbers. needs llvm-objdump.
 #   float-emit  — disassemble the case's own objects and report, per function, how
 #                 many emitted instructions name the back end's reserved FP scratch
 #                 registers (#2237). the same argument as vector-emit: an encoder
 #                 that stages every allocated float operand through scratch computes
 #                 the right answer while emitting twice the instructions, so only a
 #                 shape observable can see it. needs llvm-objdump.
+#   asm-symbol  — pair the symbol names `--emit-asm` PRINTS for an inline-asm
+#                 statement with the ones the OBJECT relocates against, in file
+#                 order (#2788). a printer reading the wrong table produces a valid
+#                 symbol name from the same module, so the text looks trustworthy
+#                 and names the wrong thing; only holding it against the relocation
+#                 tells the two apart. also runs the program, since a reference that
+#                 reached the wrong symbol is a wrong answer too. needs llvm-objdump.
 #
 # build-fails is a run-mode but not a producer: it asserts the compile is REJECTED
 # and takes the compiler's 'error:' diagnostic as the observable. it is handled in
@@ -2002,6 +2032,116 @@ produce_spirv_shader() {
     printf 'modules=%d\n' "$n"
 }
 
+# produce_spirv_image <runmode> <target> <binary>
+# validate the delivered module tree and report its image / sampler surface.
+#
+# THE OPERANDS ARE THE OBSERVABLE. `OpTypeImage` carries seven of them, and every
+# one of the wrong values a bug produces is a module spirv-val accepts: a Dim of 2D
+# where the source wrote `sampler3d`, an Arrayed of 0 where it wrote `array`, a
+# Sampled of 2 (a storage image) where the sampled form was meant. So each is
+# printed by name rather than counted, and so is the descriptor the handle is bound
+# at - a set or binding that came out 0 binds the wrong descriptor and validates.
+#
+# Ids are replaced by the shape behind them throughout. An image type has no
+# spirv-dis friendly name, so `%22` in a sample instruction says nothing on its own;
+# resolving it to `sampledimage(image(float,2D,...))` is what makes "this sample
+# reads THAT handle" an assertion rather than a claim about two numbers that
+# renumber whenever anything else in the module changes.
+produce_spirv_image() {
+    out_dir=$(dirname "$3")
+    if ! command -v spirv-val >/dev/null 2>&1; then
+        echo "int: spirv-image: the validator is not installed (spirv-tools)" >&2
+        return 2
+    fi
+    if ! command -v spirv-dis >/dev/null 2>&1; then
+        echo "int: spirv-image: the disassembler is not installed (spirv-tools)" >&2
+        return 2
+    fi
+    n=0
+    for m in $(find "$out_dir" -name '*.spv' | sort); do
+        dis=$(spirv-dis --no-header "$m") || return 1
+        rel=${m#"$out_dir"/}
+        if printf '%s\n' "$dis" | grep -q '^ *OpEntryPoint '; then
+            kind=shader
+            spirv-val --target-env vulkan1.3 "$m" || return 1
+            env=vulkan1.3
+        else
+            kind=library
+            spirv-val "$m" || return 1
+            env=universal
+        fi
+        printf 'module=%s kind=%s env=%s validator=clean\n' "$rel" "$kind" "$env"
+        printf '%s\n' "$dis" | awk '
+            # the capabilities a dimensionality demands. a 1D or arrayed-cube image
+            # declared without its capability is an invalid module, and one declared
+            # WITH a capability nothing needs is a module a driver may refuse to
+            # load, so both directions are in the observable.
+            $1 == "OpCapability" { printf "  capability %s\n", $2; next }
+
+            # the descriptor a handle is bound at. decorations precede the types and
+            # variables they apply to, so one pass suffices.
+            $1 == "OpDecorate" && $3 == "DescriptorSet" { dset[$2] = $4; next }
+            $1 == "OpDecorate" && $3 == "Binding"       { dbind[$2] = $4; next }
+
+            # "%4 = OpTypeImage %float 2D 0 0 0 1 Unknown" - all seven operands.
+            $3 == "OpTypeImage" {
+                d = "image(" $4 "," $5 ",depth=" $6 ",arrayed=" $7 ",ms=" $8 ",sampled=" $9 "," $10 ")"
+                desc[$1] = d
+                printf "  type %s\n", d
+                next
+            }
+            $3 == "OpTypeSampledImage" {
+                u = desc[$4]; if (u == "") { u = $4 }
+                desc[$1] = "sampledimage(" u ")"
+                printf "  type %s\n", desc[$1]
+                next
+            }
+            $3 == "OpTypeSampler" { desc[$1] = "sampler"; printf "  type sampler\n"; next }
+
+            # a pointer to a handle, so a variable can be reported by what it points
+            # at rather than by spirv-dis, which names it after an id.
+            $3 == "OpTypePointer" {
+                u = desc[$5]
+                if (u != "") { desc[$1] = "ptr(" $4 "," u ")"; ptr[$1] = u }
+                next
+            }
+
+            # "%9 = OpVariable %_ptr_UniformConstant_7 UniformConstant" - only the
+            # handle-typed ones; every other variable belongs to another feature.
+            $3 == "OpVariable" && ptr[$4] != "" {
+                printf "  binding set=%s binding=%s storage=%s type=%s\n",
+                    (($1 in dset) ? dset[$1] : "<none>"),
+                    (($1 in dbind) ? dbind[$1] : "<none>"),
+                    $5, ptr[$4]
+                next
+            }
+
+            # "%22 = OpLoad %5 %7" - remember the result type so a sample can be
+            # reported by the handle it reads rather than by an operand id.
+            $3 == "OpLoad" { rty[$1] = $4; next }
+
+            $3 == "OpSampledImage" {
+                rty[$1] = $4
+                i = desc[rty[$5]]; if (i == "") { i = "<unknown>" }
+                s = desc[rty[$6]]; if (s == "") { s = "<unknown>" }
+                printf "  combine image=%s sampler=%s operands=%d\n", i, s, NF - 4
+                next
+            }
+            $3 == "OpImageSampleImplicitLod" {
+                h = desc[rty[$5]]; if (h == "") { h = "<unknown>" }
+                printf "  sample result=%s handle=%s operands=%d\n", $4, h, NF - 4
+                next
+            }
+        '
+        n=$((n + 1))
+    done
+    if [ "$n" -eq 0 ]; then
+        echo "int: spirv-image: the build delivered no .spv module" >&2
+        return 2
+    fi
+    printf 'modules=%d\n' "$n"
+}
+
 # resolve_dwarfdump — print an llvm-dwarfdump on PATH, preferring the unversioned
 # name and falling back to the highest-versioned one (ubuntu ships llvm-dwarfdump-NN).
 # empty output (return 1) when none is installed.
@@ -2299,7 +2439,8 @@ PHDRS
         echo "symtab_after_loadable=no"
     fi
 }
-# produce_gdb_session <runmode> <target> <nog_binary> <g_binary>
+
+# produce_gdb_session <runmode> <target> <nog_binary> <g_binary> <profile>
 # the BEHAVIOURAL debugger observable (#2756): int/surface/debuginfo proves the `-g`
 # image is structurally valid; it cannot prove gdb reports the right thing when a
 # user actually breaks into it. this producer drives one real `gdb --batch` session
@@ -2325,20 +2466,45 @@ PHDRS
 # echo ahead of each fact so the normalizer below can key off it instead of gdb's own
 # formatting, and extracts only the function name and source line from a frame
 # line, never its argument list.
+#
+# THE #2779 PROBES ARE DEBUG-ONLY. Both bugs #2779 fixed are specific to opt0's own
+# location and line-table construction and do not reproduce at opt2 (verified by
+# hand: `dies`/`staysalive` auto-inline at release exactly like `addone` does, and a
+# breakpoint's `next` there steps clean out to the caller frame - a same-frame
+# before/after `v` comparison is meaningless once that happens, the same reason
+# `addone` itself never carried this probe). So the golden this run compares against
+# is now PER-PROFILE (`expect.$profile.txt`, see run.sh), and only a debug-profile
+# session sets the extra breakpoints / walks the extra steps below - a release
+# session's transcript, and its golden, are exactly what they were before #2779.
 produce_gdb_session() {
     g=$4
+    profile=${5:-}
     command -v gdb >/dev/null 2>&1 || {
         echo "int: gdb-session: gdb not found (install the 'gdb' package)" >&2; return 2
     }
 
     gdbtmp=$(mktemp -d)
     script=$gdbtmp/session.gdb
-    cat >"$script" <<'GDBEOF'
+    {
+        cat <<'GDBEOF'
 set debuginfod enabled off
 set pagination off
 break main.mach:11
 break main.mach:20
 break main.mach:27
+GDBEOF
+        # line 22 is accumulate's own `ret total;` (Bug B); lines 39 / 50 are
+        # `dies` / `staysalive`'s `val r: i64 = v + 1;` (Bug A pair). set before
+        # `run` like every other breakpoint so their numbering (4/5/6) is stable
+        # regardless of when execution first reaches them.
+        if [ "$profile" = debug ]; then
+            cat <<'GDBEOF'
+break main.mach:22
+break main.mach:39
+break main.mach:50
+GDBEOF
+        fi
+        cat <<'GDBEOF'
 run
 echo SENTINEL:addone_stop\n
 frame 0
@@ -2361,6 +2527,24 @@ echo SENTINEL:step2\n
 step
 delete 2
 continue
+GDBEOF
+        # Bug B: this `continue` reaches accumulate's OWN ret statement before
+        # deadlocal's breakpoint, iff line 22 resolves to its real address rather
+        # than accumulate's entry (the bug: a duplicate row AT the entry, which
+        # this call already passed long before reaching this line, so a broken
+        # build never stops here at all and falls through straight to deadlocal -
+        # a wrong `accum_ret_stop_func` is exactly as loud a failure as a wrong
+        # `accum_ret_total`).
+        if [ "$profile" = debug ]; then
+            cat <<'GDBEOF'
+echo SENTINEL:accum_ret_stop\n
+frame 0
+echo SENTINEL:accum_ret_total\n
+print total
+continue
+GDBEOF
+        fi
+        cat <<'GDBEOF'
 echo SENTINEL:dead_stop\n
 frame 0
 echo SENTINEL:dead_v\n
@@ -2369,17 +2553,53 @@ echo SENTINEL:dead_unused\n
 print unused
 echo SENTINEL:dead_caller\n
 frame 1
+delete 3
 continue
 GDBEOF
+        # `delete 3` above (line 27, deadlocal's `ret`) before the `continue` that
+        # runs past it: at release, adding `dies` / `staysalive` to this file gives
+        # the optimizer more to fold, and it can unify a fragment of one of their
+        # tail sequences with deadlocal's own - gdb then resolves breakpoint 3 to a
+        # THIRD location inside `main`'s inlined call to `dies`, which stops the
+        # session there instead of letting the program finish (found by hand while
+        # adding these probes: the release transcript went from "exited normally"
+        # to no exit line and empty stdout at all, with no other change). deadlocal
+        # is called exactly once, so this deletion loses no coverage - the same
+        # reasoning `delete 2` already applies to the loop breakpoint above.
+        #
+        # Bug A pair: `next` past `val r = v + 1;` and re-read `v`. `dies` must
+        # report it unavailable once `r`'s storage takes over; `staysalive` - v
+        # read again on its own `ret` line - must keep reading the real value.
+        # Asserted together on purpose (see main.mach): a fix that reported
+        # `<optimized out>` for BOTH would pass either probe run alone.
+        if [ "$profile" = debug ]; then
+            cat <<'GDBEOF'
+echo SENTINEL:dies_v_before\n
+print v
+next
+echo SENTINEL:dies_v_after\n
+print v
+continue
+echo SENTINEL:stays_v_before\n
+print v
+next
+echo SENTINEL:stays_v_after\n
+print v
+continue
+GDBEOF
+        fi
+    } >"$script"
 
     transcript=$gdbtmp/transcript.txt
     gdb --batch -q -x "$script" "$g" >"$transcript" 2>&1
 
     # the program's own stdout is ground truth for the values gdb is asked to read
-    # back: a=addone's result, b=accumulate's, c=deadlocal's. cross-checking it
-    # against the golden's hand-computed values is what would catch a normalizer
-    # bug that made every gdb-side assertion vacuously agree with itself.
-    stdout=$(grep -E '^[abc]=[0-9]+$' "$transcript" | paste -sd, -)
+    # back: a=addone's result, b=accumulate's, c=deadlocal's, d=dies's, e=staysalive's
+    # (main.mach calls all five at both profiles, so this line needs no profile
+    # branch even though only debug walks the gdb-side d/e probes below). cross-
+    # checking it against the golden's hand-computed values is what would catch a
+    # normalizer bug that made every gdb-side assertion vacuously agree with itself.
+    stdout=$(grep -E '^[a-e]=[0-9]+$' "$transcript" | paste -sd, -)
     echo "program_stdout=$stdout"
     if grep -q 'exited normally' "$transcript"; then
         echo "exit=normal"
@@ -2510,6 +2730,90 @@ dis_case_objects() {
 # pins the release profile and keeps its kernels under register pressure.
 produce_float_emit() {
     dis_case_objects float-emit "$3" | float_emit_scan
+}
+
+# produce_asm_symbol <runmode> <target> <binary>
+# the INLINE-ASM SYMBOL-OPERAND observable (#2788, epic #2288).
+#
+# `--emit-asm` renders from the encoder, and an operand that reached it without the
+# symbol it references printed whatever string id 0 resolves to - a REAL symbol from
+# the same module. A reader chasing a symbol reference was shown a different, real
+# name rather than something obviously broken, so nothing signalled that the output
+# was untrustworthy; the direct-transfer form printed a bare `call` with no operand at
+# all. Both were text-only: the object was correct throughout, which is why nothing
+# that reads the object could see it.
+#
+# So the observable is the PAIR, and it is the pairing that makes this a test rather
+# than a golden of whatever the printer happens to say:
+#
+#   print=<names>   every `iasm_*` name the emitted assembly text mentions, in order
+#   reloc=<names>   every `iasm_*` name the object's relocations name, in order
+#
+# The case gives every inline-asm-referenced symbol a `#[symbol("iasm_...")]` literal
+# linkage name, so both lists are extractable with no knowledge of the ISA or the
+# mangling scheme, and a compiler-emitted reference to the same declaration (which
+# uses the mangled name) can never be counted as an inline-asm one. A printer that
+# names a different real symbol drops a name from `print` while `reloc` keeps it; one
+# that names nothing does the same. Neither can pass by accident.
+#
+# The two lists are not required to be EQUAL, and the golden is per-target because of
+# it: how many instructions spell one reference, and how many relocation records cover
+# them, are both the ISA's business. riscv64 is the case in point - `la sym` is an
+# auipc/addi pair carrying `%pcrel_hi` and `%pcrel_lo`, which is two of each, while
+# `call sym` is an auipc/jalr pair the printer names twice and a single
+# `R_RISCV_CALL_PLT` covers. Both are right; what the pairing catches is a name
+# appearing on one side and not the other.
+#
+# The program's own answer is reported too: the asm loads and calls through those
+# symbols, so a reference that reached the wrong one is a wrong number as well as
+# wrong text, and the two failures are distinguishable in the diff.
+produce_asm_symbol() {
+    runmode=$1
+    target=$2
+    bin=$3
+
+    dir=$(dirname "$(dirname "$(dirname "$bin")")")
+    id=$(sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$dir/mach.toml" | head -1)
+    if [ -z "$id" ]; then
+        echo "int: asm-symbol: no project id in ${dir}/mach.toml" >&2; return 2
+    fi
+    asmdir="$dir/out/int/build/asm/$id"
+    objdir="$dir/out/int/build/obj/$id"
+    if [ ! -d "$asmdir" ]; then
+        echo "int: asm-symbol: no assembly text at $asmdir (the case must pass --emit-asm and pin out = \"out/int/build\")" >&2; return 2
+    fi
+    if [ ! -d "$objdir" ]; then
+        echo "int: asm-symbol: no objects at $objdir" >&2; return 2
+    fi
+    tool=$(resolve_objdump) || {
+        echo "int: asm-symbol: llvm-objdump not found (install the 'llvm' package)" >&2; return 2
+    }
+
+    # comment lines are dropped: `--emit-asm` heads each function with `# <name>:`,
+    # and a DEFINITION of one of these symbols is not a reference to it.
+    printed=$(find "$asmdir" -name '*.s' | sort | while IFS= read -r a; do
+        grep -v '^[[:space:]]*#' "$a" | grep -o 'iasm_[A-Za-z0-9_]*'
+    done | tr '\n' ' ' | sed 's/ *$//')
+
+    related=$(find "$objdir" -name '*.o' | sort | while IFS= read -r o; do
+        "$tool" -r "$o"
+    done | grep -o 'iasm_[A-Za-z0-9_]*' | tr '\n' ' ' | sed 's/ *$//')
+
+    echo "print=$printed"
+    echo "reloc=$related"
+
+    out=$(mktemp)
+    err=$(mktemp)
+    run_captured "$runmode" "$target" "$bin" "$out" "$err" || { rm -f "$out" "$err"; return 1; }
+    if [ "$run_status" -ne 0 ]; then
+        report_run_failure "asm-symbol" "$run_status" "$run_out"
+        [ -s "$err" ] && sed 's/^/    /' "$err" >&2
+        rm -f "$out" "$err"
+        return "$run_status"
+    fi
+    cat "$err" >&2
+    cat "$out"
+    rm -f "$out" "$err"
 }
 
 # produce_const_pool <runmode> <target> <binary>
@@ -2669,8 +2973,27 @@ vector_lanes_scan() { emit_scan lanes; }
 #     riscv64 — no 128-bit vector model at all: every vector is scalarized into
 #               ordinary integer loads and stores, so both facts are 0 - the
 #               target's own golden, not an exemption.
+#
+#   calls     — `<function> calls=<count>`, how many calls the emitted code still
+#               makes (#2231). the count, not a boolean, because the opt-out half of
+#               the contract is a SPECIFIC number of surviving calls and a boolean
+#               would let "inlined everything in reach" pass as "inlined what was
+#               asked". only forms that write a link register count, so ordinary
+#               control flow inside a function never contributes:
+#     x86_64  — `call` / `callq`.
+#     aarch64 — `bl` and `blr`; the plain `b` / `b.<cond>` branches do not link.
+#     riscv64 — `jal` / `jalr`; the return renders as `ret` and a tail branch as
+#               `j` / `jr`, neither of which is a call. the two-instruction `call`
+#               pseudo (auipc + jalr) counts once, at its `jalr`.
+#
+# <project-id> is optional and, when given, restricts the report to symbols mangled
+# under that project - the case's OWN functions, excluding the dependency template and
+# `#[inline]` instances its object also holds. a mode whose golden would otherwise move
+# with an unrelated mach-std release passes it; the modes that predate it pass nothing
+# and report every symbol, exactly as before.
 emit_scan() {
-    awk -v mode="$1" '
+    awk -v mode="$1" -v own="${2:-}" '
+    BEGIN { if (own != "") { ownpfx = own "." } }
     # strip a mangled name down to its bare identifier plus any `$` argument
     # list: `std.types.option.unwrap$ptr` -> `unwrap$ptr`. an unmangled symbol
     # (an `ext` / `#[symbol]` literal, a `.L` local) has no module path to strip
@@ -2719,6 +3042,18 @@ emit_scan() {
         if (isa == "x86_64")  { return m ~ /^p(extr|insr)[bwdq]$/ }
         return 0
     }
+    function is_call(m, rest) {
+        # the CALL forms only: a branch that does not write a link register is control
+        # flow inside the function and must not be counted, or the number would move
+        # with every unrelated codegen change instead of with the inline decision.
+        if (isa == "x86_64")  { return m ~ /^call(q|l)?$/ }
+        if (isa == "aarch64") { return m == "bl" || m == "blr" }
+        # riscv64: `jal`/`jalr` write a link register; the return is rendered `ret` and
+        # a tail branch `j`/`jr`, so neither is caught here. the `call` pseudo is two
+        # instructions (auipc + jalr) and is counted once, at its jalr.
+        if (isa == "riscv64") { return m == "jal" || m == "jalr" }
+        return 0
+    }
     function is_vecmem(m, rest) {
         if (isa == "aarch64") {
             if (m !~ /^(ldr|str|ldur|stur|ldp|stp)$/) { return 0 }
@@ -2738,6 +3073,7 @@ emit_scan() {
         if (mode == "fpscratch") { return fp_scratch(m, rest) }
         if (mode == "frame")     { return framed(m, rest) }
         if (mode == "lanes")     { return is_lane(m, rest) }
+        if (mode == "calls")     { return is_call(m, rest) }
         return 0
     }
     /file format/ {
@@ -2751,6 +3087,13 @@ emit_scan() {
         sym = $0
         sub(/^[0-9a-f]+ </, "", sym)
         sub(/>:$/, "", sym)
+        # the ownership test reads the MANGLED name: demangling drops the module path
+        # that says whose function this is. the project id is the leading path
+        # component, so a case with id `case` owns `case.main.mixed` and not
+        # `std.print.printlnf`. a symbol carrying a literal name via #[symbol(...)] has
+        # no project prefix and is excluded too, which is right, since such a function
+        # is named for a foreign ABI rather than by this project.
+        if (own != "" && substr(sym, 1, length(ownpfx)) != ownpfx) { cur = ""; next }
         sym = demangle(sym)
         if (!(sym in count)) { names[++n] = sym; count[sym] = 0; count2[sym] = 0 }
         cur = sym
@@ -2784,6 +3127,7 @@ emit_scan() {
             if (mode == "simd")       { print names[i] " " (count[names[i]] > 0 ? "simd" : "scalar") }
             else if (mode == "frame") { print names[i] " " (count[names[i]] > 0 ? "framed" : "frameless") }
             else if (mode == "lanes") { print names[i] " lane=" (count[names[i]] > 0 ? 1 : 0) " vecmem=" (count2[names[i]] > 0 ? 1 : 0) }
+            else if (mode == "calls") { print names[i] " calls=" count[names[i]] }
             else                      { print names[i] " scratch=" count[names[i]] }
         }
     }
@@ -2799,6 +3143,56 @@ produce_vector_lanes() {
 }
 
 
+
+# produce_call_shape <runmode> <target> <binary>
+# the CALL-SHAPE observable (#2231): for each function of the case's own module, how
+# many calls its emitted code still makes.
+#
+# the same argument as vector-emit, and it is the whole reason this case exists twice.
+# a compiler that stops inlining a cross-module `#[inline]` callee computes every value
+# the sibling exec observable checks, exactly and at both profiles, because a call and
+# an inlined body compute the same thing - that is what makes inlining legal. the only
+# place the feature is visible at all is the number of calls left, so a run-and-compare
+# case is vacuously green against the feature being dead, which is this repo's recurring
+# defect: a result that reports more than it verifies.
+#
+# it also carries the OPT-OUT half in the same numbers rather than a second case. a
+# `#[noinline]` callee and an undecorated one must each still cost a call, so their
+# caller's count is nonzero by design. an implementation that inlined everything in
+# reach would pass a case asserting only `calls=0` somewhere; asserting the exact count
+# per function is what makes "the decorator is a contract, in both directions" the
+# thing being tested.
+#
+# needs llvm-objdump.
+#
+# IT REPORTS THE CASE'S OWN FUNCTIONS AND NOTHING ELSE, which the other emitted-shape
+# producers do not need to do. a case's object holds, besides its own code, one weak
+# body per generic / pack / `#[inline]` instance its call sites named - `printlnf` and
+# `vformat` among them. those are mach-std's, they carry dozens of calls each, and int
+# resolves mach-std to its latest RELEASE, so folding them into the golden would make
+# this case fail on an unrelated standard-library change and say nothing about #2231
+# when it did. the filter is the mangled module prefix of the case's own project id,
+# read from its manifest, so what the golden pins is what the case wrote.
+produce_call_shape() {
+    id=$(case_project_id call-shape "$3") || return 2
+    dis_case_objects call-shape "$3" | call_shape_scan "$id"
+}
+
+# case_project_id <producer> <binary> — the `id` from the case's own manifest, the
+# prefix every symbol the case itself defines is mangled under. same directory walk
+# dis_case_objects does; <producer> only names the caller in diagnostics.
+case_project_id() {
+    _cpi_dir=$(dirname "$(dirname "$(dirname "$2")")")
+    _cpi_id=$(sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$_cpi_dir/mach.toml" | head -1)
+    if [ -z "$_cpi_id" ]; then
+        echo "int: $1: no project id in ${_cpi_dir}/mach.toml" >&2; return 2
+    fi
+    printf '%s\n' "$_cpi_id"
+}
+
+# call_shape_scan <project-id> — `<function> calls=<count>` per function of the case's
+# own project (see emit_scan)
+call_shape_scan() { emit_scan calls "$1"; }
 
 # produce_frame_elision <runmode> <target> <binary>
 # the frame-elision observable (#1940): for each function of the case's own module,
@@ -2954,10 +3348,13 @@ produce_varloc_fbreg() {
 }
 
 
-# produce <run> <runmode> <target> <binary> [<g_binary>]
+# produce <run> <runmode> <target> <binary> [<g_binary>] [<profile>]
 # dispatches to the producer named by <run>, forwarding the remaining arguments. the
 # debuginfo producer takes an extra `-g` artifact path run.sh built alongside the
 # default (no-`-g`) one; every other producer inspects the single default artifact.
+# <profile> is appended (not inserted) so every EXISTING producer's positional
+# reading is untouched by its addition; only gdb-session reads it, since only its
+# observable is a real function of the active profile's own codegen (#2779).
 produce() {
     run=$1
     shift
@@ -2990,12 +3387,15 @@ produce() {
         spirv-val)   produce_spirv_val "$@" ;;
         spirv-val-vulkan) produce_spirv_val_vulkan "$@" ;;
         spirv-shader) produce_spirv_shader "$@" ;;
+        spirv-image)  produce_spirv_image "$@" ;;
         vector-emit) produce_vector_emit "$@" ;;
         vector-lanes) produce_vector_lanes "$@" ;;
         frame-elision) produce_frame_elision "$@" ;;
         varloc-fbreg) produce_varloc_fbreg "$@" ;;
         float-emit)  produce_float_emit "$@" ;;
         const-pool)  produce_const_pool "$@" ;;
+        asm-symbol)  produce_asm_symbol "$@" ;;
+        call-shape)  produce_call_shape "$@" ;;
         *) echo "int: unknown run mode '$run'" >&2; return 2 ;;
     esac
 }

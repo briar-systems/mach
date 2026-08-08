@@ -1392,7 +1392,14 @@ fun encode_setcc(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     ret (buf.len - start)::i32;
 }
 
-# encode XORPS xmm,xmm (used to zero an SSE register)
+# encode XORPS in its xmm,xmm form (used to zero an SSE register) and
+# its xmm,mem form (`0F 57 /r` either way, the ModRM byte carrying the difference)
+#
+# The memory form is what lets a float negation read its sign mask straight out of
+# the constant pool (#2754) instead of building it through the GP scratch. XORPS is
+# the ALIGNED 128-bit form, so the memory operand must be 16-byte aligned - which is
+# exactly what `const_align(CONST_VEC, 16)` gives a pool entry, and why the mask is
+# interned as a 16-byte vector rather than at the float's own width
 fun encode_xorps(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     val start: usize = buf.len;
     val dst: *isa.Operand = ?mi.dst;
@@ -1404,6 +1411,13 @@ fun encode_xorps(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
         enc.emit_byte(buf, 0x0F);
         enc.emit_byte(buf, 0x57);
         enc.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (buf.len - start)::i32;
+    }
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_MEM) {
+        emit_rex_mem(buf, 0, dst.reg, src1);
+        enc.emit_byte(buf, 0x0F);
+        enc.emit_byte(buf, 0x57);
+        encode_mem_operand(buf, dst.reg, src1);
         ret (buf.len - start)::i32;
     }
     ret 0;
@@ -3690,17 +3704,52 @@ fun float_sign_mask(w: u8) i64 {
     ret 0x8000000000000000::i64;
 }
 
+# the 16-byte image of a float sign mask, laid out for the aligned
+# XORPS memory form: the width's mask in the low lane, zeros above
+#
+# XORPS is a 128-bit bitwise XOR, so its memory operand is a full 16 bytes whatever
+# the float's own width is. The high lanes must be zero rather than don't-care -
+# XORPS touches them, and a negation must leave everything outside the value's sign
+# bit exactly as it found it.
+# ---
+# w:   4 for an f32 mask, 8 for an f64 mask
+# out: receives the 16-byte little-endian image
+fun float_sign_mask_image(w: u8, out: *u8) {
+    val m: u64 = float_sign_mask(w)::u64;
+    var i: u32 = 0;
+    for (i < 16) {
+        out[i] = 0;
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 8) {
+        out[i] = (m >> (i::u64 * 8::u64))::u8;
+        i = i + 1;
+    }
+}
+
 # materialize a fully-resolved float negation `MIR_FNEG [dst, src]`
 # into its SSE byte sequence, flipping the IEEE-754 sign bit rather than two's-
 # complementing the bit pattern (which the integer MIR_NEG would do). seeds the
 # two-address working register with the value - `dst` itself when the allocator gave
-# the result an XMM register, FLOAT_SCRATCH0 when it spilled it - loads the
-# width-selected sign mask into FLOAT_SCRATCH1 (the mask bits go through the R11 GP
-# scratch then MOVQ, mirroring the immediate operand path of `emit_float_load`, so no
-# float value ever aliases a GP register in the emitted bytes), and XORs the two in
-# place. the width (`mi.width`: 4 for f32, 8 for f64) selects the f32 vs f64 sign
-# mask. XORPS (a 128-bit bitwise XOR) is correct for both widths: the mask only sets
-# the value's sign bit in the low lane and the XOR is purely bitwise
+# the result an XMM register, FLOAT_SCRATCH0 when it spilled it - and XORs it in
+# place against the width-selected sign mask, read straight out of the module's
+# constant pool as `xorps work, [rip + .Lconst.N]`. the width (`mi.width`: 4 for f32,
+# 8 for f64) selects the f32 vs f64 sign mask. XORPS (a 128-bit bitwise XOR) is
+# correct for both widths: the mask only sets the value's sign bit in the low lane
+# and the XOR is purely bitwise
+#
+# THE MASK IS POOLED, NOT BUILT (#2754). It used to go through the GP scratch -
+# `movabs r11, 0x8000000000000000 ; movq xmm15, r11 ; xorps xmm0, xmm15` - three
+# instructions, 20 bytes and a general-purpose register at EVERY negation, for one of
+# two values that is the same in every program that negates a float. One pooled entry
+# per width per module serves them all.
+#
+# THE ENTRY IS A 16-BYTE VECTOR, and that is forced rather than chosen. XORPS is the
+# ALIGNED 128-bit form: it reads sixteen bytes and faults on a misaligned operand, so
+# an entry laid out at the float's own width would be neither wide enough nor aligned
+# enough. `const_align(CONST_VEC, 16)` already returns 16, so this is the pool's
+# alignment rule doing the work rather than a local guarantee
 fun encode_float_neg(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 2) {
         ret R.err[bool, str]("encode: float negate missing operands");
@@ -3723,29 +3772,24 @@ fun encode_float_neg(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInst
     val ld: R.Result[bool, str] = emit_float_seed(st, src, work, w);
     if (R.is_err[bool, str](ld)) { ret ld; }
 
-    # materialize the sign-bit mask into FLOAT_SCRATCH1 via the R11 GP scratch.
-    var mov_imm: isa.Inst = isa.inst_blank();
-    mov_imm.opcode = x64.MOVABS;
-    mov_imm.dst    = isa.make_reg(x64.R11, 8);
-    mov_imm.src1   = isa.make_imm(float_sign_mask(w), 8);
-    mov_imm.size   = 8;
-    encode_inst(?mov_imm, buf);
+    # intern the width's sign mask as a 16-byte, 16-aligned vector entry.
+    var img: [16]u8;
+    float_sign_mask_image(w, ?img[0]);
+    val sr: R.Result[intern.StrId, str] = enc.intern_const(st, ?img[0], 16, enc.CONST_VEC);
+    if (R.is_err[intern.StrId, str](sr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sr)); }
 
-    var movq: isa.Inst = isa.inst_blank();
-    movq.opcode = x64.MOVQ;
-    movq.dst    = isa.make_reg(FLOAT_SCRATCH1, 16);
-    movq.src1   = isa.make_reg(x64.R11, 8);
-    movq.size   = 8;
-    encode_inst(?movq, buf);
+    var mem: isa.Operand = isa.make_mem(-1, 0, -1, 0, 16);
+    mem.sym_id = R.unwrap_ok[intern.StrId, str](sr);
 
-    # work ^= FLOAT_SCRATCH1 (flip the sign bit), then store back if the result is
-    # a frame slot.
+    # work ^= [rip + .Lconst.N] (flip the sign bit), then store back if the result
+    # is a frame slot.
     var xorp: isa.Inst = isa.inst_blank();
     xorp.opcode = x64.XORPS;
     xorp.dst    = isa.make_reg(work, 16);
-    xorp.src1   = isa.make_reg(FLOAT_SCRATCH1, 16);
-    xorp.size   = w;
-    encode_inst(?xorp, buf);
+    xorp.src1   = mem;
+    xorp.size   = 16;
+    val xr: R.Result[bool, str] = encode_inst_sym(st, ?xorp);
+    if (R.is_err[bool, str](xr)) { ret xr; }
 
     if (dst.kind == isa.OPK_REG) { ret R.ok[bool, str](true); }
     ret emit_float_store(dst, work, w, buf);
@@ -5579,68 +5623,83 @@ val X64_MNEMONICS: [X64_MNEMONIC_COUNT]iasm.Mnemonic = [X64_MNEMONIC_COUNT]iasm.
 # Covers the 64/32/16/8-bit general-purpose register names the x86-64 inline-asm
 # grammar accepts. It names no vector register, so only a body the parser cannot read
 # at all reaches the vector bank.
-fun x64_reg(name: str, op: *iasm.Operand) bool {
+#
+# compares IN PLACE against `body[lo..hi)`, copying nothing: `x64_operand` calls
+# this before it knows the token's kind at all, and an arbitrarily long symbol
+# name is exactly as valid a token as a register name is invalid one (#2789). a
+# fixed-size scratch buffer at this call site was a length limit nothing below
+# it imposed.
+fun x64_reg_region(body: str, lo: usize, hi: usize, op: *iasm.Operand) bool {
+    val len: usize = hi - lo;
     # 64-bit
-    if (str_equals(name, "rax")) { @op = iasm.op_reg(x64.RAX, 8); ret true; }
-    if (str_equals(name, "rbx")) { @op = iasm.op_reg(x64.RBX, 8); ret true; }
-    if (str_equals(name, "rcx")) { @op = iasm.op_reg(x64.RCX, 8); ret true; }
-    if (str_equals(name, "rdx")) { @op = iasm.op_reg(x64.RDX, 8); ret true; }
-    if (str_equals(name, "rsi")) { @op = iasm.op_reg(x64.RSI, 8); ret true; }
-    if (str_equals(name, "rdi")) { @op = iasm.op_reg(x64.RDI, 8); ret true; }
-    if (str_equals(name, "rbp")) { @op = iasm.op_reg(x64.RBP, 8); ret true; }
-    if (str_equals(name, "rsp")) { @op = iasm.op_reg(x64.RSP, 8); ret true; }
-    if (str_equals(name, "r8"))  { @op = iasm.op_reg(x64.R8,  8); ret true; }
-    if (str_equals(name, "r9"))  { @op = iasm.op_reg(x64.R9,  8); ret true; }
-    if (str_equals(name, "r10")) { @op = iasm.op_reg(x64.R10, 8); ret true; }
-    if (str_equals(name, "r11")) { @op = iasm.op_reg(x64.R11, 8); ret true; }
-    if (str_equals(name, "r12")) { @op = iasm.op_reg(x64.R12, 8); ret true; }
-    if (str_equals(name, "r13")) { @op = iasm.op_reg(x64.R13, 8); ret true; }
-    if (str_equals(name, "r14")) { @op = iasm.op_reg(x64.R14, 8); ret true; }
-    if (str_equals(name, "r15")) { @op = iasm.op_reg(x64.R15, 8); ret true; }
+    if (str_region_equals(body, lo, len, "rax")) { @op = iasm.op_reg(x64.RAX, 8); ret true; }
+    if (str_region_equals(body, lo, len, "rbx")) { @op = iasm.op_reg(x64.RBX, 8); ret true; }
+    if (str_region_equals(body, lo, len, "rcx")) { @op = iasm.op_reg(x64.RCX, 8); ret true; }
+    if (str_region_equals(body, lo, len, "rdx")) { @op = iasm.op_reg(x64.RDX, 8); ret true; }
+    if (str_region_equals(body, lo, len, "rsi")) { @op = iasm.op_reg(x64.RSI, 8); ret true; }
+    if (str_region_equals(body, lo, len, "rdi")) { @op = iasm.op_reg(x64.RDI, 8); ret true; }
+    if (str_region_equals(body, lo, len, "rbp")) { @op = iasm.op_reg(x64.RBP, 8); ret true; }
+    if (str_region_equals(body, lo, len, "rsp")) { @op = iasm.op_reg(x64.RSP, 8); ret true; }
+    if (str_region_equals(body, lo, len, "r8"))  { @op = iasm.op_reg(x64.R8,  8); ret true; }
+    if (str_region_equals(body, lo, len, "r9"))  { @op = iasm.op_reg(x64.R9,  8); ret true; }
+    if (str_region_equals(body, lo, len, "r10")) { @op = iasm.op_reg(x64.R10, 8); ret true; }
+    if (str_region_equals(body, lo, len, "r11")) { @op = iasm.op_reg(x64.R11, 8); ret true; }
+    if (str_region_equals(body, lo, len, "r12")) { @op = iasm.op_reg(x64.R12, 8); ret true; }
+    if (str_region_equals(body, lo, len, "r13")) { @op = iasm.op_reg(x64.R13, 8); ret true; }
+    if (str_region_equals(body, lo, len, "r14")) { @op = iasm.op_reg(x64.R14, 8); ret true; }
+    if (str_region_equals(body, lo, len, "r15")) { @op = iasm.op_reg(x64.R15, 8); ret true; }
     # 32-bit
-    if (str_equals(name, "eax"))  { @op = iasm.op_reg(x64.RAX, 4); ret true; }
-    if (str_equals(name, "ebx"))  { @op = iasm.op_reg(x64.RBX, 4); ret true; }
-    if (str_equals(name, "ecx"))  { @op = iasm.op_reg(x64.RCX, 4); ret true; }
-    if (str_equals(name, "edx"))  { @op = iasm.op_reg(x64.RDX, 4); ret true; }
-    if (str_equals(name, "esi"))  { @op = iasm.op_reg(x64.RSI, 4); ret true; }
-    if (str_equals(name, "edi"))  { @op = iasm.op_reg(x64.RDI, 4); ret true; }
-    if (str_equals(name, "ebp"))  { @op = iasm.op_reg(x64.RBP, 4); ret true; }
-    if (str_equals(name, "esp"))  { @op = iasm.op_reg(x64.RSP, 4); ret true; }
-    if (str_equals(name, "r8d"))  { @op = iasm.op_reg(x64.R8,  4); ret true; }
-    if (str_equals(name, "r9d"))  { @op = iasm.op_reg(x64.R9,  4); ret true; }
-    if (str_equals(name, "r10d")) { @op = iasm.op_reg(x64.R10, 4); ret true; }
-    if (str_equals(name, "r11d")) { @op = iasm.op_reg(x64.R11, 4); ret true; }
-    if (str_equals(name, "r12d")) { @op = iasm.op_reg(x64.R12, 4); ret true; }
-    if (str_equals(name, "r13d")) { @op = iasm.op_reg(x64.R13, 4); ret true; }
-    if (str_equals(name, "r14d")) { @op = iasm.op_reg(x64.R14, 4); ret true; }
-    if (str_equals(name, "r15d")) { @op = iasm.op_reg(x64.R15, 4); ret true; }
+    if (str_region_equals(body, lo, len, "eax"))  { @op = iasm.op_reg(x64.RAX, 4); ret true; }
+    if (str_region_equals(body, lo, len, "ebx"))  { @op = iasm.op_reg(x64.RBX, 4); ret true; }
+    if (str_region_equals(body, lo, len, "ecx"))  { @op = iasm.op_reg(x64.RCX, 4); ret true; }
+    if (str_region_equals(body, lo, len, "edx"))  { @op = iasm.op_reg(x64.RDX, 4); ret true; }
+    if (str_region_equals(body, lo, len, "esi"))  { @op = iasm.op_reg(x64.RSI, 4); ret true; }
+    if (str_region_equals(body, lo, len, "edi"))  { @op = iasm.op_reg(x64.RDI, 4); ret true; }
+    if (str_region_equals(body, lo, len, "ebp"))  { @op = iasm.op_reg(x64.RBP, 4); ret true; }
+    if (str_region_equals(body, lo, len, "esp"))  { @op = iasm.op_reg(x64.RSP, 4); ret true; }
+    if (str_region_equals(body, lo, len, "r8d"))  { @op = iasm.op_reg(x64.R8,  4); ret true; }
+    if (str_region_equals(body, lo, len, "r9d"))  { @op = iasm.op_reg(x64.R9,  4); ret true; }
+    if (str_region_equals(body, lo, len, "r10d")) { @op = iasm.op_reg(x64.R10, 4); ret true; }
+    if (str_region_equals(body, lo, len, "r11d")) { @op = iasm.op_reg(x64.R11, 4); ret true; }
+    if (str_region_equals(body, lo, len, "r12d")) { @op = iasm.op_reg(x64.R12, 4); ret true; }
+    if (str_region_equals(body, lo, len, "r13d")) { @op = iasm.op_reg(x64.R13, 4); ret true; }
+    if (str_region_equals(body, lo, len, "r14d")) { @op = iasm.op_reg(x64.R14, 4); ret true; }
+    if (str_region_equals(body, lo, len, "r15d")) { @op = iasm.op_reg(x64.R15, 4); ret true; }
     # 16-bit
-    if (str_equals(name, "ax")) { @op = iasm.op_reg(x64.RAX, 2); ret true; }
-    if (str_equals(name, "bx")) { @op = iasm.op_reg(x64.RBX, 2); ret true; }
-    if (str_equals(name, "cx")) { @op = iasm.op_reg(x64.RCX, 2); ret true; }
-    if (str_equals(name, "dx")) { @op = iasm.op_reg(x64.RDX, 2); ret true; }
-    if (str_equals(name, "si")) { @op = iasm.op_reg(x64.RSI, 2); ret true; }
-    if (str_equals(name, "di")) { @op = iasm.op_reg(x64.RDI, 2); ret true; }
-    if (str_equals(name, "bp")) { @op = iasm.op_reg(x64.RBP, 2); ret true; }
-    if (str_equals(name, "sp")) { @op = iasm.op_reg(x64.RSP, 2); ret true; }
+    if (str_region_equals(body, lo, len, "ax")) { @op = iasm.op_reg(x64.RAX, 2); ret true; }
+    if (str_region_equals(body, lo, len, "bx")) { @op = iasm.op_reg(x64.RBX, 2); ret true; }
+    if (str_region_equals(body, lo, len, "cx")) { @op = iasm.op_reg(x64.RCX, 2); ret true; }
+    if (str_region_equals(body, lo, len, "dx")) { @op = iasm.op_reg(x64.RDX, 2); ret true; }
+    if (str_region_equals(body, lo, len, "si")) { @op = iasm.op_reg(x64.RSI, 2); ret true; }
+    if (str_region_equals(body, lo, len, "di")) { @op = iasm.op_reg(x64.RDI, 2); ret true; }
+    if (str_region_equals(body, lo, len, "bp")) { @op = iasm.op_reg(x64.RBP, 2); ret true; }
+    if (str_region_equals(body, lo, len, "sp")) { @op = iasm.op_reg(x64.RSP, 2); ret true; }
     # 8-bit low
-    if (str_equals(name, "al"))   { @op = iasm.op_reg(x64.RAX, 1); ret true; }
-    if (str_equals(name, "bl"))   { @op = iasm.op_reg(x64.RBX, 1); ret true; }
-    if (str_equals(name, "cl"))   { @op = iasm.op_reg(x64.RCX, 1); ret true; }
-    if (str_equals(name, "dl"))   { @op = iasm.op_reg(x64.RDX, 1); ret true; }
-    if (str_equals(name, "sil"))  { @op = iasm.op_reg(x64.RSI, 1); ret true; }
-    if (str_equals(name, "dil"))  { @op = iasm.op_reg(x64.RDI, 1); ret true; }
-    if (str_equals(name, "bpl"))  { @op = iasm.op_reg(x64.RBP, 1); ret true; }
-    if (str_equals(name, "spl"))  { @op = iasm.op_reg(x64.RSP, 1); ret true; }
-    if (str_equals(name, "r8b"))  { @op = iasm.op_reg(x64.R8,  1); ret true; }
-    if (str_equals(name, "r9b"))  { @op = iasm.op_reg(x64.R9,  1); ret true; }
-    if (str_equals(name, "r10b")) { @op = iasm.op_reg(x64.R10, 1); ret true; }
-    if (str_equals(name, "r11b")) { @op = iasm.op_reg(x64.R11, 1); ret true; }
-    if (str_equals(name, "r12b")) { @op = iasm.op_reg(x64.R12, 1); ret true; }
-    if (str_equals(name, "r13b")) { @op = iasm.op_reg(x64.R13, 1); ret true; }
-    if (str_equals(name, "r14b")) { @op = iasm.op_reg(x64.R14, 1); ret true; }
-    if (str_equals(name, "r15b")) { @op = iasm.op_reg(x64.R15, 1); ret true; }
+    if (str_region_equals(body, lo, len, "al"))   { @op = iasm.op_reg(x64.RAX, 1); ret true; }
+    if (str_region_equals(body, lo, len, "bl"))   { @op = iasm.op_reg(x64.RBX, 1); ret true; }
+    if (str_region_equals(body, lo, len, "cl"))   { @op = iasm.op_reg(x64.RCX, 1); ret true; }
+    if (str_region_equals(body, lo, len, "dl"))   { @op = iasm.op_reg(x64.RDX, 1); ret true; }
+    if (str_region_equals(body, lo, len, "sil"))  { @op = iasm.op_reg(x64.RSI, 1); ret true; }
+    if (str_region_equals(body, lo, len, "dil"))  { @op = iasm.op_reg(x64.RDI, 1); ret true; }
+    if (str_region_equals(body, lo, len, "bpl"))  { @op = iasm.op_reg(x64.RBP, 1); ret true; }
+    if (str_region_equals(body, lo, len, "spl"))  { @op = iasm.op_reg(x64.RSP, 1); ret true; }
+    if (str_region_equals(body, lo, len, "r8b"))  { @op = iasm.op_reg(x64.R8,  1); ret true; }
+    if (str_region_equals(body, lo, len, "r9b"))  { @op = iasm.op_reg(x64.R9,  1); ret true; }
+    if (str_region_equals(body, lo, len, "r10b")) { @op = iasm.op_reg(x64.R10, 1); ret true; }
+    if (str_region_equals(body, lo, len, "r11b")) { @op = iasm.op_reg(x64.R11, 1); ret true; }
+    if (str_region_equals(body, lo, len, "r12b")) { @op = iasm.op_reg(x64.R12, 1); ret true; }
+    if (str_region_equals(body, lo, len, "r13b")) { @op = iasm.op_reg(x64.R13, 1); ret true; }
+    if (str_region_equals(body, lo, len, "r14b")) { @op = iasm.op_reg(x64.R14, 1); ret true; }
+    if (str_region_equals(body, lo, len, "r15b")) { @op = iasm.op_reg(x64.R15, 1); ret true; }
     ret false;
+}
+
+# `x64_reg_region` for a caller already holding a null-terminated name (the
+# base/index register inside `[base + index*scale + disp]`, declared-clobber
+# decoding, tests) rather than a body region - forwards to the one table above
+# so there is exactly one place register names are spelled.
+fun x64_reg(name: str, op: *iasm.Operand) bool {
+    ret x64_reg_region(name, 0, str_len(name), op);
 }
 
 # the control-register number `name` denotes, or false when it names none (#2590)
@@ -5742,11 +5801,7 @@ fun x64_operand(c: *iasm.Cursor, lo: usize, hi: usize, role: str, op: *iasm.Oper
         ret R.ok[bool, str](true);
     }
 
-    var buf: [128]u8;
-    if (!iasm.copy_region(c.body, lo, hi, ?buf[0], 128)) { ret R.err[bool, str]("encode: malformed inline-asm operand"); }
-    val tok: str = (?buf[0])::str;
-
-    if (x64_reg(tok, op)) { ret R.ok[bool, str](true); }
+    if (x64_reg_region(c.body, lo, hi, op)) { ret R.ok[bool, str](true); }
 
     if (hi - lo >= 3 && c.body[lo] == '['::char && c.body[hi - 1] == ']'::char) {
         ret x64_mem(c, lo, hi, role, op);
@@ -5843,16 +5898,22 @@ fun x64_mem(c: *iasm.Cursor, lo: usize, hi: usize, role: str, op: *iasm.Operand)
         }
         op.scale = scale_val::u8;
     } or {
-        if (!iasm.copy_region(c.body, inner_lo, bi_hi, ?buf[0], 32)) { ret R.err[bool, str]("encode: malformed inline-asm memory operand"); }
+        # NOT a fixed-size copy: the no-star bracket content is either a base register
+        # (always short) or a bare symbol reference (#2788's own repro, `[rip +
+        # _rt_argc]`, is exactly this shape) - and a symbol here is exactly as
+        # unbounded as the top-level operand token this parser used to buffer into 128
+        # bytes (#2789). compared in place, same as `x64_reg_region` everywhere else.
+        # trimmed exactly as `copy_region` trimmed before it - `[rax + 8]`'s base span
+        # is "rax ", trailing space and all, until this strips it the same way.
+        var a: usize = inner_lo;
+        var b: usize = bi_hi;
+        for (a < b && iasm.is_space(c.body[a])) { a = a + 1; }
+        for (b > a && iasm.is_space(c.body[b - 1])) { b = b - 1; }
+
         var base_op: iasm.Operand = iasm.op_none();
-        if (x64_reg((?buf[0])::str, ?base_op)) {
+        if (x64_reg_region(c.body, a, b, ?base_op)) {
             op.reg = base_op.reg;
         } or {
-            var a: usize = inner_lo;
-            var b: usize = bi_hi;
-            for (a < b && iasm.is_space(c.body[a])) { a = a + 1; }
-            for (b > a && iasm.is_space(c.body[b - 1])) { b = b - 1; }
-
             # a bare constant in brackets is an absolute address - the only way to
             # reach a fixed-address ABI, whose slots are not symbols to relocate. it
             # takes no displacement term of its own: the constant IS the address.
@@ -6257,11 +6318,21 @@ fun x64_branch_target(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result
 # whose disp32 the caller patches with a PC32 relocation. An absolute `[constant]`
 # becomes the `MEM_BASE_ABS` form, whose disp32 is the address itself and which no
 # relocation touches.
-fun x64_to_isa(op: *iasm.Operand, size: u8) isa.Operand {
+#
+# `sym` is the interned name of the statement's symbol reference, the same StrId the
+# relocation is pushed against. It rides on the rip-relative operand because the
+# `--emit-asm` printer names the target from `sym_id`, and an operand that carried
+# none rendered whatever string id 0 resolves to - a REAL symbol from the same module,
+# so the output looked trustworthy and named the wrong thing (#2788).
+fun x64_to_isa(op: *iasm.Operand, size: u8, sym: intern.StrId) isa.Operand {
     if (op.kind == iasm.AOP_REG) { ret isa.make_reg(op.reg, size); }
     if (op.kind == iasm.AOP_IMM) { ret isa.make_imm(op.imm, size); }
     if (op.kind == iasm.AOP_MEM) {
-        if ((op.flags & iasm.AOF_MEM_SYM) != 0) { ret isa.make_mem(-1, 0, -1, 0, size); }
+        if ((op.flags & iasm.AOF_MEM_SYM) != 0) {
+            var m: isa.Operand = isa.make_mem(-1, 0, -1, 0, size);
+            m.sym_id = sym::u32;
+            ret m;
+        }
         if ((op.flags & iasm.AOF_MEM_ABS) != 0) { ret isa.make_mem(x64.MEM_BASE_ABS, op.imm::i32, -1, 0, size); }
         ret isa.make_mem(op.reg, op.imm::i32, op.index, op.scale, size);
     }
@@ -6272,7 +6343,13 @@ fun x64_to_isa(op: *iasm.Operand, size: u8) isa.Operand {
 #
 # The single place a parsed x86-64 statement becomes an `isa.Inst`, so an inline-asm
 # instruction and a compiler-selected one are the same value taking the same encoder.
-fun x64_build(item: *iasm.Item) isa.Inst {
+#
+# `sym` is the interned name of the statement's symbol reference (STR_NIL when it has
+# none), threaded onto whichever operand carries it so the Inst DESCRIBES the symbol it
+# relocates against rather than leaving the target to be recovered from the item
+# afterwards. That is what `--emit-asm` renders from, and what the direct-transfer form
+# had nothing of (#2788).
+fun x64_build(item: *iasm.Item, sym: intern.StrId) isa.Inst {
     var mi: isa.Inst = isa.inst_blank();
     mi.opcode = item.code::u16;
     var enc_flags: u16 = 0;
@@ -6284,17 +6361,21 @@ fun x64_build(item: *iasm.Item) isa.Inst {
         ret mi;
     }
     if (pat == X64P_XFER) {
-        # a direct transfer carries its target as a relocation or a local-label fixup,
-        # not as an operand, so it builds like any other branch.
+        # a DIRECT transfer's target is a symbol the linker resolves. the rel32 the
+        # encoder writes is a placeholder either way, so naming the target costs no
+        # bytes (`encode_call` / `encode_jmp` ignore `dst` on the direct arm) and makes
+        # the Inst exactly the shape the compiler-selected `call sym` already builds -
+        # which is why that one always printed its target and this one did not (#2788).
         if ((item.flags & X64F_INDIRECT) == 0) {
             mi.flags = enc_flags;
+            if (item.ref == iasm.AR_SYM) { mi.dst = isa.make_sym(sym::u32, 8); }
             ret mi;
         }
         # `FF /2` and `FF /4` are fixed 64-bit in long mode: neither takes a REX.W nor
         # a width flag.
         mi.size  = 8;
         mi.flags = enc_flags | x64.FLAG_INDIRECT::u16;
-        mi.dst   = x64_to_isa(?item.ops[0], 8);
+        mi.dst   = x64_to_isa(?item.ops[0], 8, sym);
         ret mi;
     }
 
@@ -6302,8 +6383,8 @@ fun x64_build(item: *iasm.Item) isa.Inst {
     # access width and `dx` is always 16-bit, so collapsing them loses the access size.
     if (pat == X64P_PORTIO) {
         mi.flags = enc_flags;
-        mi.dst   = x64_to_isa(?item.ops[0], item.ops[0].size);
-        mi.src1  = x64_to_isa(?item.ops[1], item.ops[1].size);
+        mi.dst   = x64_to_isa(?item.ops[0], item.ops[0].size, sym);
+        mi.src1  = x64_to_isa(?item.ops[1], item.ops[1].size, sym);
         ret mi;
     }
 
@@ -6312,16 +6393,16 @@ fun x64_build(item: *iasm.Item) isa.Inst {
     if (item.code == x64.MOV_CR::u32) {
         mi.size  = 8;
         mi.flags = enc_flags;
-        mi.dst   = x64_to_isa(?item.ops[0], 8);
-        mi.src1  = x64_to_isa(?item.ops[1], 8);
+        mi.dst   = x64_to_isa(?item.ops[0], 8, sym);
+        mi.src1  = x64_to_isa(?item.ops[1], 8, sym);
         ret mi;
     }
 
     val size: u8 = x64_inst_size(item);
     mi.size  = size;
     mi.flags = width_flags_for(size) | enc_flags;
-    mi.dst   = x64_to_isa(?item.ops[0], x64_operand_size(?item.ops[0], size));
-    if (pat == X64P_TWO) { mi.src1 = x64_to_isa(?item.ops[1], x64_operand_size(?item.ops[1], size)); }
+    mi.dst   = x64_to_isa(?item.ops[0], x64_operand_size(?item.ops[0], size), sym);
+    if (pat == X64P_TWO) { mi.src1 = x64_to_isa(?item.ops[1], x64_operand_size(?item.ops[1], size), sym); }
     ret mi;
 }
 
@@ -6361,8 +6442,20 @@ fun x64_operand_size(op: *iasm.Operand, inst_size: u8) u8 {
 }
 
 # emit one parsed x86-64 item
+#
+# A symbol reference is interned ONCE here, before the instruction is built, and the
+# same StrId reaches both the Inst the printer renders and the relocation the linker
+# reads. Interning it only at relocation time is what let the two disagree (#2788).
 fun x64_emit(st: *enc.EncodeState, c: *iasm.Cursor, l: *iasm.Labels, item: *iasm.Item) R.Result[bool, str] {
-    var mi: isa.Inst = x64_build(item);
+    var sym: intern.StrId = intern.STR_NIL;
+    if (item.ref == iasm.AR_SYM) {
+        val name: str = (c.body::usize + item.ref_off)::str;
+        val symr: R.Result[intern.StrId, str] = intern.intern_bytes(st.interner, name, item.ref_len);
+        if (R.is_err[intern.StrId, str](symr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](symr)); }
+        sym = R.unwrap_ok[intern.StrId, str](symr);
+    }
+
+    var mi: isa.Inst = x64_build(item, sym);
 
     val inst_start: usize = st.buf.len;
     val n: i32 = encode_inst(?mi, ?st.buf);
@@ -6373,7 +6466,7 @@ fun x64_emit(st: *enc.EncodeState, c: *iasm.Cursor, l: *iasm.Labels, item: *iasm
         # the displacement is measured from - is always four past the patch site.
         ret iasm.resolve_local(st, c.g, l, (inst_start + (n - 4)::usize)::u32, item.ref_num, item.ref_fwd);
     }
-    if (item.ref == iasm.AR_SYM) { ret x64_emit_sym_ref(st, c, ?mi, item, inst_start, n); }
+    if (item.ref == iasm.AR_SYM) { ret x64_emit_sym_ref(st, ?mi, sym, inst_start, n); }
     ret R.ok[bool, str](true);
 }
 
@@ -6381,17 +6474,15 @@ fun x64_emit(st: *enc.EncodeState, c: *iasm.Cursor, l: *iasm.Labels, item: *iasm
 #
 # The patch site comes from the same `x86_reloc_offset` query the compiler-emitted
 # instructions use: a direct branch relocates its trailing rel32, a rip-relative
-# `[symbol]` its ModR/M disp32 (stepping back over a trailing store immediate).
-fun x64_emit_sym_ref(st: *enc.EncodeState, c: *iasm.Cursor, mi: *isa.Inst, item: *iasm.Item,
+# `[symbol]` its ModR/M disp32 (stepping back over a trailing store immediate). `sym`
+# is the id the Inst was built with, so the name the object relocates against and the
+# name `--emit-asm` prints cannot be two different strings.
+fun x64_emit_sym_ref(st: *enc.EncodeState, mi: *isa.Inst, sym: intern.StrId,
                      inst_start: usize, n: i32) R.Result[bool, str] {
     val patch: i32 = x86_reloc_offset(nil, mi, n);
     if (patch < 0) {
         ret R.err[bool, str]("internal compiler error: inline-asm symbol reference has no relocation field");
     }
-    val name: str = (c.body::usize + item.ref_off)::str;
-    val symr: R.Result[intern.StrId, str] = intern.intern_bytes(st.interner, name, item.ref_len);
-    if (R.is_err[intern.StrId, str](symr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](symr)); }
-    val sym: intern.StrId = R.unwrap_ok[intern.StrId, str](symr);
 
     # PC32: S + A - P, where the addend corrects the patch site to the next ip.
     ret enc.push_reloc(st, (inst_start + patch::usize)::u32, of.RK_PC32, sym, -(n - patch));
@@ -6437,7 +6528,29 @@ fun x64_grammar() iasm.Grammar {
     g.ct_class   = asm_ct_class;
     g.note_bytes = asm_note_bytes;
     g.decl_reg   = x64_decl_reg;
+    g.no_fall    = x64_no_fall;
     ret g;
+}
+
+# true when an x86-64 statement cannot fall through to the next (#2791)
+#
+# `hlt` is the only one the mnemonic table models. It is what `std.system.panic` and
+# `std.system.os.terminate` write after `exit_group`, precisely so the fact that
+# control ends there is stated in an instruction rather than left implicit.
+#
+# `ud2` denotes a trap too but has no mnemonic row, so it is not reachable here and is
+# deliberately not special-cased: this reads the table, and a row is how a mnemonic
+# earns a fact. A raw byte payload answers false, since the compiler does not decode it
+# and a wrong true would delete the caller's continuation.
+fun x64_no_fall(item: *iasm.Item) bool {
+    if (item.kind != iasm.AI_INST) { ret false; }
+    ret item.code == x64.HLT::u32;
+}
+
+# whether control can fall out of an x86-64 inline-asm body (#2791)
+pub fun asm_returns(body: str) bool {
+    var g: iasm.Grammar = x64_grammar();
+    ret iasm.returns(?g, body);
 }
 
 # true when this function's `{name}` measures from RSP - exactly when its frame was
@@ -6677,18 +6790,21 @@ test "mach.lang.target.isa.x64.encode.x64_call_target:indirect_forms_byte_exact"
     mi_want[0] = 0xFF; mi_want[1] = 0x54; mi_want[2] = 0xD8; mi_want[3] = 0x10;
     if (!t_asm_bytes("call [rax + rbx*8 + 16]", ?mi_want[0], 4)) { bad = 1; }
 
-    # a direct call is untouched: it still resolves as a branch target, carrying its
-    # symbol as a relocation rather than as an operand, and takes no indirect flag.
+    # a direct call still resolves as a branch target and takes no indirect flag, and
+    # it NAMES its target: the rel32 is a placeholder either way, so the operand costs
+    # no bytes and is what `--emit-asm` renders. asserting OPK_NONE here is what pinned
+    # the bare `call` the printer used to emit (#2788).
     var g: iasm.Grammar = x64_grammar();
     var c: iasm.Cursor;
     iasm.cursor_init(?c, ?g, "call main", nil, nil, nil, nil);
     var item: iasm.Item;
     if (R.is_err[bool, str](iasm.next(?c, ?item)))                  { ret 1; }
     if (item.ref != iasm.AR_SYM)                                    { bad = 1; }
-    val dm: isa.Inst = x64_build(?item);
+    val dm: isa.Inst = x64_build(?item, 7::intern.StrId);
     if (dm.opcode != x64.CALL)                                      { bad = 1; }
     if ((dm.flags & x64.FLAG_INDIRECT::u16) != 0)                   { bad = 1; }
-    if (dm.dst.kind != isa.OPK_NONE)                                { bad = 1; }
+    if (dm.dst.kind != isa.OPK_SYM)                                 { bad = 1; }
+    if (dm.dst.sym_id != 7)                                         { bad = 1; }
 
     ret bad;
 }
@@ -6820,6 +6936,78 @@ test "mach.lang.target.isa.x64.encode.x64_call_target:refused_forms" {
     if (!t_asm_refused("call [0x100000000]", "32-bit"))         { bad = 1; }
     # an absolute address is the whole operand; it takes no displacement term.
     if (!t_asm_refused("call [0x100018 + 8]", "displacement"))  { bad = 1; }
+
+    ret bad;
+}
+
+# a `lea` naming a symbol far longer than the register-name scratch buffer this
+# operand parser used to copy into (128 bytes here, 64 on arm64/riscv64) must
+# encode exactly as a short-named one does (#2789) - instruction bytes never
+# depend on a symbol's NAME, only its relocation does, so a correctly parsed
+# long operand is byte-identical to a short one, not merely "did not error".
+# `[sym]` rather than a direct `call`/`jmp` target: the latter carries its
+# target as a branch relocation and never reaches this operand parser at all
+# (`x64_build`'s X64P_XFER comment), so it cannot exercise the buffer this
+# issue is about. Also checks the relocation itself carries the FULL long
+# name, unterminated by whatever the old buffer's cap would have truncated it
+# to, and that a genuinely malformed operand (an unterminated `[rax`) still
+# refuses - proving the region-based lookup did not also turn off
+# malformed-operand detection.
+test "mach.lang.target.isa.x64.encode.x64_call_target:long_symbol_operand" {
+    var bad: i32 = 0;
+
+    var alloc1: A.Allocator;
+    page.make(?alloc1);
+    var itn1: intern.Interner = intern.init(?alloc1);
+    var st1: enc.EncodeState;
+    st1.alloc    = ?alloc1;
+    st1.buf      = enc.buf_init(?alloc1);
+    st1.interner = ?itn1;
+    var g1: iasm.Grammar = x64_grammar();
+    var labels1: iasm.Labels;
+    iasm.labels_init(?labels1, ?alloc1);
+    var c1: iasm.Cursor;
+    iasm.cursor_init(?c1, ?g1, "lea rax, [short_sym]", ?alloc1, ?itn1, nil, nil);
+    val r1: R.Result[bool, str] = iasm.run(?st1, ?g1, ?c1, ?labels1);
+    if (R.is_err[bool, str](r1)) { bad = 1; }
+
+    # 134 bytes: past x64's old 128-byte cap and arm64/riscv64's old 64-byte one.
+    val long_name: str =
+        "sym_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    val long_lea: str =
+        "lea rax, [sym_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]";
+    var alloc2: A.Allocator;
+    page.make(?alloc2);
+    var itn2: intern.Interner = intern.init(?alloc2);
+    var st2: enc.EncodeState;
+    st2.alloc    = ?alloc2;
+    st2.buf      = enc.buf_init(?alloc2);
+    st2.interner = ?itn2;
+    var g2: iasm.Grammar = x64_grammar();
+    var labels2: iasm.Labels;
+    iasm.labels_init(?labels2, ?alloc2);
+    var c2: iasm.Cursor;
+    iasm.cursor_init(?c2, ?g2, long_lea, ?alloc2, ?itn2, nil, nil);
+    val r2: R.Result[bool, str] = iasm.run(?st2, ?g2, ?c2, ?labels2);
+    if (R.is_err[bool, str](r2)) { bad = 1; }
+
+    if (st1.buf.len != st2.buf.len) { bad = 1; }
+    or {
+        var i: usize = 0;
+        for (i < st1.buf.len) {
+            if (st1.buf.data[i] != st2.buf.data[i]) { bad = 1; }
+            i = i + 1;
+        }
+    }
+
+    if (st2.reloc_count == 0) { bad = 1; }
+    or {
+        val nm: O.Option[str] = intern.lookup(?itn2, st2.relocs[st2.reloc_count - 1].sym);
+        if (!O.is_some[str](nm)) { bad = 1; }
+        or (!str_equals(O.unwrap[str](nm), long_name)) { bad = 1; }
+    }
+
+    if (!t_asm_refused("lea rax, [rax", "malformed")) { bad = 1; }
 
     ret bad;
 }
@@ -7120,7 +7308,7 @@ test "mach.lang.target.isa.x64.encode.x64_parse:body_to_inst" {
 
     if (R.is_err[bool, str](iasm.next(?c, ?item)))          { ret 1; }
     if (item.kind != iasm.AI_INST)                          { bad = 1; }
-    var mi: isa.Inst = x64_build(?item);
+    var mi: isa.Inst = x64_build(?item, intern.STR_NIL);
     if (mi.opcode != x64.MOV)                               { bad = 1; }
     if (mi.size != 8)                                       { bad = 1; }
     if ((mi.flags & x64.FLAG_REX_W::u16) == 0)              { bad = 1; }
@@ -7131,7 +7319,7 @@ test "mach.lang.target.isa.x64.encode.x64_parse:body_to_inst" {
     if (item.src_off != 0 || item.src_len != 12)            { bad = 1; }
 
     if (R.is_err[bool, str](iasm.next(?c, ?item)))          { ret 1; }
-    mi = x64_build(?item);
+    mi = x64_build(?item, intern.STR_NIL);
     if (mi.opcode != x64.XADD)                              { bad = 1; }
     if ((mi.flags & x64.FLAG_LOCK::u16) == 0)               { bad = 1; }
     if (mi.dst.kind != isa.OPK_MEM)                         { bad = 1; }
@@ -7139,13 +7327,13 @@ test "mach.lang.target.isa.x64.encode.x64_parse:body_to_inst" {
     if (mi.src1.reg != x64.RAX)                             { bad = 1; }
 
     if (R.is_err[bool, str](iasm.next(?c, ?item)))          { ret 1; }
-    if (x64_build(?item).opcode != x64.SYSCALL)             { bad = 1; }
+    if (x64_build(?item, intern.STR_NIL).opcode != x64.SYSCALL)             { bad = 1; }
 
     if (R.is_err[bool, str](iasm.next(?c, ?item)))          { ret 1; }
     if (item.kind != iasm.AI_LABEL || item.ref_num != 1)    { bad = 1; }
 
     if (R.is_err[bool, str](iasm.next(?c, ?item)))          { ret 1; }
-    if (x64_build(?item).opcode != x64.JMP)                 { bad = 1; }
+    if (x64_build(?item, intern.STR_NIL).opcode != x64.JMP)                 { bad = 1; }
     if (item.ref != iasm.AR_LOCAL)                          { bad = 1; }
     if (item.ref_num != 1 || item.ref_fwd)                  { bad = 1; }
 
@@ -8205,6 +8393,85 @@ fun t_accepted_n(r: R.Result[i32, str], buf: *enc.ByteBuf) bool {
     ret R.unwrap_ok[i32, str](r)::usize == buf.len;
 }
 
+# THE FNEG SIGN MASK COMES OUT OF THE CONSTANT POOL, IN ONE INSTRUCTION (#2754)
+#
+# An IEEE-754 negation is a sign-bit flip, and the mask it XORs against is one of two
+# values in every program that negates a float. It used to be rebuilt at EVERY
+# negation through the GP scratch - `movabs r11, mask ; movq xmm15, r11 ; xorps` -
+# three instructions, 20 bytes and a general-purpose register, for a constant. It is
+# now one `xorps work, [rip + .Lconst.N]`.
+#
+# THE ENTRY'S SHAPE IS READ OUT OF THE POOL, not asserted from the interning call.
+# XORPS is the ALIGNED 128-bit form: it reads sixteen bytes and faults on a
+# misaligned operand, so an entry of the float's own width would be wrong twice over.
+# The low lane must be the mask and the high lane must be ZERO - XORPS touches it,
+# and a negation must leave every bit outside the sign exactly as it found it.
+# fneg reads a pooled 16-byte sign mask in one xorps
+test "mach.lang.target.isa.x64.encode:fneg_sign_mask_is_pooled" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    var st: enc.EncodeState;
+    enc.state_blank(?st, ?alloc);
+    st.interner = ?itn;
+    val buf: *enc.ByteBuf = ?st.buf;
+    var f: mir.MirFunction;
+    var bad: i32 = 0;
+
+    # -x with the result already in XMM0: the seed move plus ONE xorps, and no
+    # movabs anywhere in the bytes
+    var ops: [2]mir.MirOperand;
+    ops[0] = xmm_op(x64.XMM0); ops[1] = xmm_op(x64.XMM1);
+    var ng: mir.MirInstr = mir.instr(mir.MIR_FNEG, ?ops[0], 2, 8, 0);
+    buf.len = 0;
+    if (R.is_err[bool, str](encode_float_neg(?st, ?f, ?ng))) { bad = 1; }
+    # movaps/movsd seed (4 bytes: f2 0f 10 c0) then xorps (%rip), %xmm0 (7 bytes:
+    # 0f 57 05 + disp32), which is llvm-mc's encoding of the memory form
+    if (buf.len != 11) { bad = 1; }
+    or {
+        if (buf.data[4] != 0x0F || buf.data[5] != 0x57 || buf.data[6] != 0x05) { bad = 1; }
+    }
+    # exactly one relocation, naming the entry, at the trailing disp32
+    if (st.reloc_count != 1)            { bad = 1; }
+    or {
+        if (st.relocs[0].kind != of.RK_PC32)      { bad = 1; }
+        if (st.relocs[0].offset != 7)             { bad = 1; }
+        if (st.relocs[0].sym != st.consts[0].sym) { bad = 1; }
+    }
+
+    # the entry: 16 bytes, 16-BYTE ALIGNED, mask in the low lane, zeros above
+    if (st.const_count != 1)                                     { bad = 1; }
+    or {
+        if (st.consts[0].len != 16 || st.consts[0].align != 16)  { bad = 1; }
+        if (st.consts[0].kind != enc.CONST_VEC)                  { bad = 1; }
+        or {
+            var i: u32 = 0;
+            for (i < 7) { if (st.consts[0].bytes[i] != 0) { bad = 1; } i = i + 1; }
+            if (st.consts[0].bytes[7] != 0x80)                   { bad = 1; }
+            i = 8;
+            for (i < 16) { if (st.consts[0].bytes[i] != 0) { bad = 1; } i = i + 1; }
+        }
+    }
+
+    # a SECOND negation at the same width shares the entry
+    buf.len = 0;
+    if (R.is_err[bool, str](encode_float_neg(?st, ?f, ?ng))) { bad = 1; }
+    if (st.const_count != 1) { bad = 1; }
+
+    # a negation at the OTHER width is a second entry, with the f32 mask low
+    ng.width = 4;
+    buf.len = 0;
+    if (R.is_err[bool, str](encode_float_neg(?st, ?f, ?ng))) { bad = 1; }
+    if (st.const_count != 2)                                     { bad = 1; }
+    or {
+        if (st.consts[1].len != 16 || st.consts[1].align != 16)  { bad = 1; }
+        if (st.consts[1].bytes[3] != 0x80)                       { bad = 1; }
+        if (st.consts[1].bytes[7] != 0)                          { bad = 1; }
+    }
+
+    ret bad;
+}
+
 # THE FLOAT MEMORY ACCESS HELPERS REFUSE A WIDTH SSE HAS NO SCALAR FORM FOR
 #
 # NOT NAMED BY #2766, WHICH FILED AGAINST AARCH64 AND RISCV64 - x86-64 carries the
@@ -8326,8 +8593,12 @@ test "mach.lang.target.isa.x64.encode:float_access_width_refusals_emit_nothing" 
 test "mach.lang.target.isa.x64.encode:float_width_refusals_emit_nothing" {
     var alloc: A.Allocator;
     page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
     var st: enc.EncodeState;
     enc.state_blank(?st, ?alloc);
+    # the negate arm reaches the constant pool for its sign mask (#2754), and a pool
+    # entry has to be named, so this state carries an interner
+    st.interner = ?itn;
     val buf: *enc.ByteBuf = ?st.buf;
     var f: mir.MirFunction;
     var bad: i32 = 0;
@@ -9121,10 +9392,11 @@ test "mach.lang.target.isa.x64.encode.x64_xfer_target:jmp_indirect_forms_byte_ex
     var item: iasm.Item;
     if (R.is_err[bool, str](iasm.next(?c, ?item)))  { ret 1; }
     if (item.ref != iasm.AR_SYM)                    { bad = 1; }
-    val dm: isa.Inst = x64_build(?item);
+    val dm: isa.Inst = x64_build(?item, 9::intern.StrId);
     if (dm.opcode != x64.JMP)                       { bad = 1; }
     if ((dm.flags & x64.FLAG_INDIRECT::u16) != 0)   { bad = 1; }
-    if (dm.dst.kind != isa.OPK_NONE)                { bad = 1; }
+    if (dm.dst.kind != isa.OPK_SYM)                 { bad = 1; }
+    if (dm.dst.sym_id != 9)                         { bad = 1; }
 
     # and the narrow-register refusal `call` already had applies to `jmp` too.
     if (!t_asm_refused("jmp eax", "64-bit register"))     { bad = 1; }
@@ -9371,5 +9643,44 @@ test "mach.lang.target.isa.x64.encode.portio:classified_for_the_ct_walk" {
     # and none of them is a branch of either kind, so none is refused on that path.
     if (asm_ct_class(x64.IN::u32, 0).cond_flags)  { bad = 1; }
     if (asm_ct_class(x64.RDTSC::u32, 0).cond_reg) { bad = 1; }
+    ret bad;
+}
+
+# an inline-asm body ending in a trap cannot fall through, and everything else can
+# (#2791)
+#
+# THE DIRECTION OF THE CONSERVATISM IS WHAT THIS PINS. A wrong `false` makes lowering
+# drop the caller's continuation, so it deletes live code - the opposite failure from
+# `writes_sp`, where a wrong answer only costs allocation quality. Every case below
+# that is not provably a trap must answer true, and the raw-byte and unparseable rows
+# are the ones that would regress silently if someone later "tightened" this.
+test "mach.lang.target.isa.x64.encode.asm_returns:trap_ends_control" {
+    var bad: i32 = 0;
+
+    # the shape `std.system.panic` and `std.system.os.terminate` write.
+    if (asm_returns("mov eax, 231\nsyscall\nhlt")) { bad = 1; }
+    if (asm_returns("hlt"))                         { bad = 1; }
+
+    # an ordinary body returns, including one containing a syscall: the syscall
+    # wrappers are the overwhelmingly common case and must stay inlinable.
+    if (!asm_returns("mov eax, 1\nsyscall"))  { bad = 1; }
+    if (!asm_returns("nop"))                   { bad = 1; }
+    if (!asm_returns("lock xadd [rcx], rax"))  { bad = 1; }
+
+    # a trap that is not last does not end the body.
+    if (!asm_returns("hlt\nnop")) { bad = 1; }
+
+    # a body defining a numeric local label is not analyzed: a branch can reach past
+    # the trap, so the simple last-statement rule does not hold and it reports return.
+    if (!asm_returns("1:\nhlt")) { bad = 1; }
+
+    # unmodeled cases all report return. a raw byte payload may well BE a trap, but
+    # the compiler does not decode it, and a declaration cannot buy a fact the
+    # compiler acts on.
+    if (!asm_returns(".byte 0xf4"))            { bad = 1; }
+    if (!asm_returns(".byte 0xf4 :: writes()")){ bad = 1; }
+    if (!asm_returns("this is not asm"))       { bad = 1; }
+    if (!asm_returns(""))                      { bad = 1; }
+
     ret bad;
 }
