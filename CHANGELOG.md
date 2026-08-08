@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+#### riscv64 images claimed an instruction set they did not have (#2828)
+`.riscv.attributes` carried an arch string taken from a per-ISA constant. A constant describes what mach's encoder emits, and an image is not what its encoder emits - it is that plus every object linked into it. A mach image containing a clang object built for `rv64gc` claimed no compressed extension and none of the z-extensions it actually held, so a disassembler configured from the image decoded its compressed float loads as `<unknown>`. This is the same class of false claim `e_flags` carried before #2813, one section over.
+
+Nothing states a string now. An image's claims are derived from the two facts that decide them - the resolved ABI and the emitted bytes - and a linked image's are merged from its inputs. `BuildAttributes` no longer has an arch field at all, so a constant is not merely unused but inexpressible.
+
+The merge rule is the arch's, because a union is right for the ISA string and wrong for everything else. Stack alignment must agree or the inputs cannot be linked. Unaligned access is a permission, so the image permits it if any input needed it. A privileged-spec disagreement leaves the image unable to state one, so it states none. A tag mach does not model survives only while every input that states it agrees. No shared layer can know which tag takes which rule, so the seam hands the arch the whole attribute body and reads none of it; the ELF layer keeps only the container, which the ARM EABI defines identically.
+
+`obj.rehome_remap` copies the body rather than aliasing it. Rehoming exists precisely because the source allocator is going away, so a field holding a pointer into it needs a copy and not an assignment - the note on that function now separates the two failure modes, since a missed scalar reverts to zero on the parallel path while a missed pointer segfaults somewhere else entirely.
+
 ## [4.17.0] - 2026-08-08
 
 ### Fixed
