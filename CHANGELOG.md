@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### The IR verifier now checks that a conversion is well-*typed* for its own opcode, not merely well-*formed* (#2808)
+The verifier constrained a conversion's **arity** - `OP_TRUNC` / `OP_SEXT` / `OP_ZEXT` / `OP_BITCAST` all sit in the "exactly one operand" bucket - and `VC_TYPE_AGREE` covered operand agreement for binary ops, branch conditions, load/store/gep bases and `ret` against the signature. Nothing related a conversion's **result width** to its operand's, so it checked that a conversion was well-formed and never that it meant what its opcode says. A width-changing `BITCAST`, a `TRUNC` whose result is *wider* than its operand, a `SEXT` / `ZEXT` whose result is *narrower*, and any of the three at *equal* widths were all accepted.
+
+`instruction.mach` states each of these relations on the opcode itself - `OP_BITCAST` is documented as a "same-size bit reinterpretation" - so every one of them is a self-inconsistency in the IR's own type model. #2373 shipped exactly that: `bitcast i32 %p0: i8`, a four-times width change, with `--verify-ir` exiting 0 on the reproducer, reaching users as a `^i8 -1` widening to `255` and a widened `^u8` reading uninitialized register residue.
+
+New violation class `VC_CONVERT_WIDTH`, and it is **always on** rather than gated behind `--verify-ir`: the widths ride on the instruction and its operand with no dataflow needed, and a conversion is exactly where a front-end classification error lands, so it names the site (function, and `path:line:col`) instead of letting the defect reach codegen.
+
+A width the type table alone cannot state is deliberately **not judged**. `type.bit_width` answers 0 - meaning *unknown*, not zero-width - for a pointer, a function type, an aggregate and void, and a pair with an unknown side is skipped. This is not laxity, it is the arm that makes the rule shippable: a `::` cast between a pointer and an integer lowers to a `BITCAST` whose pointer width is the *target's*, which the verifier does not carry, and guessing it turns correct programs into violations. Removing that guard fails the standard library's own `raw_fill` on the first build, which is how it was confirmed rather than assumed.
+
+Because the rule is always on, its blast radius is proven by a clean self-host plus the whole int corpus on all three register targets, not by a fixture set. Each relation is separately mutation-tested: the backwards direction refused, the right direction clean, varying only the widths.
+
 #### Every static ELF carried two PT_LOAD segments claiming the same address (#2795)
 The static writer mapped the ELF header and program-header table **at** `segs[0].vaddr`; the PIE and dynamic writers mapped them one page **below** it. So every static executable mach has ever produced had two `PT_LOAD` segments covering the same virtual address - the header block and `.text` both at `0x400000` - on all three ELF targets.
 
