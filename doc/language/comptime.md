@@ -67,6 +67,44 @@ A comptime **parameter** is referenced by its bare name (no `$`); every comptime
 position — sema and lowering both defer to the evaluator's single verdict rather
 than each carrying their own.
 
+## Which binding a name denotes
+
+An identifier in the comptime channel denotes the declaration it resolves to,
+under the ordinary scoping rules — never whichever binding happens to share its
+spelling. A block-scoped binding shadows an outer one of the same name here
+exactly as it does at runtime:
+
+```mach
+val N: i64 = 9;
+
+fun f(k: i64) i64 {
+    val N: i64 = k;      # shadows the module constant
+    var xs: [N]i64;      # error: array length is not a comptime constant
+    ret xs[0];
+}
+```
+
+The inner `N` is decided at runtime, so it has no comptime value, and the
+constant it shadows is not what the expression names. Reading such a name in a
+comptime position is refused:
+
+> identifier names a runtime binding, so it has no comptime value
+
+A binding marked `$` — a comptime value parameter, an `$each` loop variable —
+*is* a comptime binding, and shadows an outer name of its own spelling in the
+same way. Inside the `$each` below the name `N` is the element, not the 9:
+
+```mach
+val N:  i64    = 9;
+val ES: [2]i64 = [2]i64{1, 2};
+
+fun g() i64 {
+    var s: i64 = 0;
+    $each N in ES { s = s + N; }   # 3, not 18
+    ret s;
+}
+```
+
 ## What's not in the channel
 
 - No reflection-via-`$<Type>.*` subtree. Types are not first-class
