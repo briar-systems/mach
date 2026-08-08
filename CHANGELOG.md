@@ -99,6 +99,27 @@ Resolve reaches the position through a mechanism that was already there: `bind_c
 
 ### Changed
 
+#### The integration suite is retired, and a linking suite replaces the part the codegen corpus cannot reach (#2903)
+`int/` and `tools/` are deleted. The unified codegen corpus at `test/` answers what the compiler computes - 90 cases through structural validation, golden disassembly against an external decoder, and differential execution against a C reference at both pipelines on every target with an engine - and 109 of the 174 integration cases were asking that same question in a per-project shape that cost a directory tree and minutes of CI each.
+
+The other 65 are not codegen facts and no checksum reaches them: an import table, a GOT or IAT slot, a Mach-O load command and section type, a `PT_GNU_RELRO` span, an archive member selection, a `.symtab`, a raw flat image, and an object, archive or import library that clang, gcc, llvm-ar or mingw produced. Those move to `test/link/`, which asks that one question and refuses everything else.
+
+**The rule the split was made against**: an integration case earns its place only where the property cannot be observed by building and looking on a developer's own machine. Cross-compilation, linking and foreign toolchains qualify. A front-end diagnostic, a comptime fold, a reflection walk, an inline-asm body and an optimizer decision do not, and cases for those are gone rather than moved - the accounting is per case, and the classification of all 174 is in the pull request rather than left to be inferred from what survived.
+
+**One registry.** `test/engines.conf` is now the single source of truth for both suites and for CI. It grows a `cadence` column, and the workflow leg set is generated from it, so registering a target is one row and no workflow edit - which the file's header already promised and CI was the last place to make false. A CI leg is a runner rather than a target row, because the corpus driver already selects every target a host can serve: the five `ubuntu-latest` rows are one job covering all five, not five jobs rebuilding the same compiler. A runner whose rows disagree about cadence is a refusal rather than a silent pick.
+
+**A leg is a machine and a target is what a case builds**, and those are separate axes because a cross-compilation case exists precisely where they differ: `pe-import-claim` runs on `x86_64-linux` and builds `x86_64-windows`, and reading its import table needs no Windows runner. Rows with `engine none` - spirv, mos6502, riscv32 - are targets and never legs. There is no flag that overrides an engine: a run claiming it exercised a leg has to have exercised it, which the old suite's `--runmode` override made negotiable.
+
+**Two lanes that could stop running now cannot.** Checking that every case declares the `[target.<t>]` block each leg builds, and that a pinned run can resolve every git dep any case declares, were separate scripts a workflow step invoked. #2353 and #2729 are each a year of a lane believed to be running that had never once started. Both now run inside the driver before it builds anything.
+
+**The pin source collapses to the repo's own `mach.lock`.** The second lock existed for one dependency of one case that cloned a sibling repository over the network, and an upstream rename in that repository turned every open pull request red (#2831). That case is not in the new suite, and the driver refuses a pinned run naming a dependency the root lock does not record.
+
+Every run of either suite writes a coverage matrix naming the engine behind each cell, and every CI leg uploads both.
+
+Three things kept their behaviour and changed address. `int/observability.md` is `doc/design/test-observability.md`, since the relationship between a defect class and the observation that can see it was never a property of a harness. `int/lib/check-determinism.sh` is `test/determinism.sh`, since it guards the incremental build path rather than integration. And `int/lib/cc.sh`, the host and cross C toolchain resolver every foreign-object case builds through, is `test/link/lib/cc.sh`.
+
+Two measurements lost their guard and say so where they are claimed. `doc/language/secrecy.md` recorded a dudect-style timing harness at `int/ct/`. It ran on demand and never in CI, and it is gone, so the empirical claims there are now marked as measurements taken once. The x86-64 flags table in `x64/encode.mach` was transcribed from a probe run against real hardware, and nothing re-runs that probe. Restoring it belongs in a host-executed unit test, since the experiment only means anything on the ISA it executes on.
+
 #### A refused layout intrinsic now says which position refused it, and why (#2857)
 `a layout intrinsic has no value in this position: it measures a type, which only a type position resolves` was true of every position and is now true of one. A **declaration-scope** `$if` still cannot measure, because it selects which declarations exist and that is decided before any type is laid out, so it says that instead and points at the position that does work. `$offset_of` is named apart, since it is unavailable for a different reason - a field offset is decided at lowering - and a message about type checking would be a stale explanation the moment the resolver exists.
 

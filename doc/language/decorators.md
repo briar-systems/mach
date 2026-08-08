@@ -286,16 +286,18 @@ reached through an array or a nested record. The reason is evidence rather than
 arithmetic: an unaligned **scalar** access is measured on real hardware, and that
 measurement is what `#[packed]` rests on.
 
-The vector measurement now exists too. `int/surface/unaligned-vector` stores and
-loads `i32x4`, `f32x4`, `i32x3` and `f32x3` at deliberately misaligned offsets,
-checks every lane by hand against a byte image rather than through the access being
-measured, and asserts a sentinel in the bytes on both sides of each extent. It is
-**correct in both profiles on every native leg**: `linux-arm64` on `ubuntu-24.04-arm`,
-which is the row that matters because aarch64 has 128-bit forms with alignment
-requirements, plus `linux` and `windows` on x86-64. Nothing faults, no lane is
-dropped, and no neighbouring byte is disturbed. `linux-riscv64` also passes but is
-not evidence: it runs under qemu-user, and riscv64 declares no 128-bit vector
-support, so the access there is a scalar expansion rather than a vector access.
+The vector measurement now exists too. The codegen corpus's `vec/vec_mem` case
+writes `f32x3` and `f32x5` — the two shapes whose size and alignment disagree — into
+packed buffers and records where every write has a live neighbour, folding the
+neighbour after the write so a store too wide by a lane changes the checksum. It
+runs at both pipelines on every target with an execution engine, against a C
+reference the host's own compiler built, so a dropped lane or a disturbed
+neighbouring byte is a differing number rather than a passing run. The row that
+matters is `aarch64-linux` on `ubuntu-24.04-arm`, because aarch64 has 128-bit forms
+with alignment requirements; `x86_64-linux` and `x86_64-windows` carry it too.
+`riscv64-linux` also passes and is not evidence: it runs under qemu-user, and
+riscv64 declares no 128-bit vector support, so the access there is a scalar
+expansion rather than a vector access.
 
 What the refusal still waits on is the other half,
 [#2687](https://github.com/briar-systems/mach/issues/2687) — a lane-dependent vector

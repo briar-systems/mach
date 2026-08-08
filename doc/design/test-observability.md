@@ -6,12 +6,14 @@ for by default. This document records where that is **structurally** blind, whic
 surface can see each of those places instead, and - the question that decides
 where a case belongs - which of them genuinely need an integration test at all.
 
-**This is not documentation of `int/` as it stands.** The harness is going to be
-rebuilt. Nothing here describes its file layout, its case format, its producers,
-or how to add a case, because all of that expires. What does not expire is the
-relationship between a defect class and the observation that can see it: that is
-a property of the defects and of the surfaces, not of any harness, so it is input
-to the replacement rather than a manual for the thing being replaced.
+**This is not documentation of any harness.** Nothing here describes a file
+layout, a case format, a producer, or how to add a case, because all of that
+expires. What does not expire is the relationship between a defect class and the
+observation that can see it: that is a property of the defects and of the
+surfaces. Two suites act on it today - `test/` executes cases against a C anchor
+and diffs golden disassembly, and `test/link/` reads emitted images and links
+foreign objects - and this document is why each of them exists, not a manual for
+either.
 
 Every entry below was paid for once already. The cost was never writing the fix.
 It was the time between the defect existing and anything being able to see it.
@@ -258,7 +260,7 @@ A fixture can exercise a feature end to end, fail closed in principle, and still
 be indistinguishable from several **wrong** implementations, because its inputs
 are at the identity value on every axis at once.
 
-**`int/surface/narrow-stack-args` is the worked example, and it is left exactly as
+**`test/link/cases/narrow-stack-args` is the worked example, and it is left exactly as
 it is - this is a note about it, not a change to it.** It does fail pre-fix and it
 is a real end-to-end guard. But under clang 18 its probe reaches exactly **one**
 pooled constant: at section offset 0, with a zero addend on the high half, four
@@ -278,7 +280,7 @@ where the defect needs two, a gap that happens to equal the constant the code
 wrongly assumes, one spelling of a shared code path, one target of three - each
 makes a wrong implementation and a right one produce identical bytes.
 
-`int/surface/riscv-pcrel-pair` is the answer to this particular one, built
+`test/link/cases/riscv-pcrel-pair` is the answer to this particular one, built
 non-trivial on each axis simultaneously and out of real clang output rather than a
 contrivance: a symbol at a nonzero offset in the same section as another, nonzero
 addends on the high half, hi-to-lo gaps of 4, 6 and 8 bytes, and both the `_I` and
