@@ -74,6 +74,9 @@ pub val SYM_PRIM:     SymKind = 11;
 # a seeded 128-bit vector type name (#1965); `slot` carries the pre-interned
 # semantic vector TypeId directly, not a TypeKind ordinal
 pub val SYM_VECTOR:   SymKind = 12;
+# an image / sampler handle type name (#2794); `slot` carries the interned
+# semantic TYPE_IMAGE TypeId, exactly as SYM_VECTOR carries a vector's
+pub val SYM_IMAGE:    SymKind = 13;
 
 # pub-flag bit, set when the symbol's source decl is `pub`, or when it is
 # re-exported by `fwd`
@@ -223,6 +226,13 @@ rec ResolveContext {
     # use-sites of one spelling share a single Symbol rather than inflating the
     # symbol table per reference.
     vec_cache: map.Map[intern.StrId, SymbolId];
+
+    # image / sampler handle cache: spelling -> the SYM_IMAGE symbol for it (#2794).
+    # its own map rather than a shared one with the vectors, because the two
+    # grammars are separate and a single map named after one of them would read as
+    # a coincidence. filled and read on the same terms: recognised in type position
+    # only, and one Symbol per spelling per module.
+    img_cache: map.Map[intern.StrId, SymbolId];
 
     # caches (origin << 32 | decl) -> SymbolId for already-created
     # SYM_IMPORTED entries, so repeated `print.println` use-sites share one
@@ -483,6 +493,7 @@ fun init_context(
 
     rc.imported_cache = map.init[u64, SymbolId](s.alloc, map.hash_u64, map.eq_u64);
     rc.vec_cache      = map.init[intern.StrId, SymbolId](s.alloc, map.hash_u32, map.eq_u32);
+    rc.img_cache      = map.init[intern.StrId, SymbolId](s.alloc, map.hash_u32, map.eq_u32);
     rc.module_index   = map.init[intern.StrId, SymbolId](s.alloc, map.hash_u32, map.eq_u32);
 
     # every allocation past this point is owned by the context; on a failure
@@ -562,6 +573,7 @@ fun dnit_context(rc: *ResolveContext) {
     }
     map.dnit[u64, SymbolId](?rc.imported_cache);
     map.dnit[intern.StrId, SymbolId](?rc.vec_cache);
+    map.dnit[intern.StrId, SymbolId](?rc.img_cache);
     map.dnit[intern.StrId, SymbolId](?rc.module_index);
 }
 
@@ -857,17 +869,24 @@ pub val TYPE_SPELL_NONE:        TypeSpellStatus = 0;
 pub val TYPE_SPELL_FOUND:       TypeSpellStatus = 1;
 # a well formed vector form the target's vector width does not admit
 pub val TYPE_SPELL_VEC_REFUSED: TypeSpellStatus = 2;
+# a well formed image / sampler handle whose members this cut does not emit
+# (#2794). its own outcome rather than a second use of the vector one, because the
+# two are refused for unrelated reasons and share no payload
+pub val TYPE_SPELL_IMG_REFUSED: TypeSpellStatus = 3;
 
 # what a spelling turned out to be in type position
 # ---
-# status: which of the three cases the spelling fell into
+# status: which of the four cases the spelling fell into
 # sym:    the symbol, when status is TYPE_SPELL_FOUND; SYMBOL_NIL otherwise
 # form:   the shape read, when the spelling was a vector form; only meaningful
 #         when status is TYPE_SPELL_VEC_REFUSED
+# img:    the handle read, when the spelling was one; only meaningful when status
+#         is TYPE_SPELL_IMG_REFUSED
 rec TypeSpelling {
     status: TypeSpellStatus;
     sym:    SymbolId;
     form:   type.VecForm;
+    img:    type.ImgForm;
 }
 
 # the SYM_PRIM or SYM_VECTOR symbol for a type spelling
@@ -909,8 +928,25 @@ fun type_spelling(rc: *ResolveContext, name: intern.StrId) R.Result[TypeSpelling
         ret R.ok[TypeSpelling, str](out);
     }
 
+    # a spelling already resolved to an image / sampler handle in this module.
+    val icached: R.Result[*SymbolId, str] = map.get[intern.StrId, SymbolId](?rc.img_cache, ?name);
+    if (R.is_ok[*SymbolId, str](icached)) {
+        out.status = TYPE_SPELL_FOUND;
+        out.sym    = @R.unwrap_ok[*SymbolId, str](icached);
+        ret R.ok[TypeSpelling, str](out);
+    }
+
     val no: O.Option[str] = intern.lookup(?rc.s.interner, name);
     if (O.is_none[str](no)) { ret R.ok[TypeSpelling, str](out); }
+
+    # the handle grammar is read BEFORE the vector one. The two cannot both claim a
+    # spelling - no handle name contains an `x` splitting a primitive from a lane
+    # count - so the order is not a tie-break, only a fixed one so a future member
+    # of either grammar has a defined winner rather than an accidental one.
+    val ir_out: R.Result[TypeSpelling, str] = image_spelling(rc, name, O.unwrap[str](no), out);
+    if (R.is_err[TypeSpelling, str](ir_out)) { ret ir_out; }
+    out = R.unwrap_ok[TypeSpelling, str](ir_out);
+    if (out.status != TYPE_SPELL_NONE) { ret R.ok[TypeSpelling, str](out); }
 
     val form: type.VecForm = type.vector_form(O.unwrap[str](no), rc.ctx.vector_bits);
     out.form = form;
@@ -934,6 +970,88 @@ fun type_spelling(rc: *ResolveContext, name: intern.StrId) R.Result[TypeSpelling
     out.status = TYPE_SPELL_FOUND;
     out.sym    = sid;
     ret R.ok[TypeSpelling, str](out);
+}
+
+# read `spelling` as an image / sampler handle, interning and caching its symbol
+#
+# Split out of `type_spelling` rather than inlined because the handle grammar has
+# its own refusal outcome, and folding two grammars' outcomes into one ladder was
+# how the vector path came to need a comment explaining which `if` belonged to
+# which question.
+# ---
+# rc:       resolver state for the module being resolved
+# name:     the interned spelling
+# spelling: the spelling's text
+# out:      the outcome so far (status TYPE_SPELL_NONE)
+# ret:      the outcome, or an allocation error
+fun image_spelling(rc: *ResolveContext, name: intern.StrId, spelling: str,
+                   out: TypeSpelling) R.Result[TypeSpelling, str] {
+    var o: TypeSpelling = out;
+    val img: type.ImgForm = type.image_form(spelling);
+    o.img = img;
+    if (img.status == type.IMG_FORM_NONE) { ret R.ok[TypeSpelling, str](o); }
+    if (img.status != type.IMG_FORM_OK) {
+        o.status = TYPE_SPELL_IMG_REFUSED;
+        ret R.ok[TypeSpelling, str](o);
+    }
+
+    val r_tid: R.Result[type.TypeId, str] = type.intern_image(?rc.s.types, img.image);
+    if (R.is_err[type.TypeId, str](r_tid)) { ret R.err[TypeSpelling, str](R.unwrap_err[type.TypeId, str](r_tid)); }
+    val itid: type.TypeId = R.unwrap_ok[type.TypeId, str](r_tid);
+
+    val r_sym: R.Result[SymbolId, str] = add_symbol(rc, SYM_IMAGE, 0, name, id.DECL_NIL, itid::u32, rc.own_module);
+    if (R.is_err[SymbolId, str](r_sym)) { ret R.err[TypeSpelling, str](R.unwrap_err[SymbolId, str](r_sym)); }
+    val sid: SymbolId = R.unwrap_ok[SymbolId, str](r_sym);
+
+    val ins: R.Result[bool, str] = map.insert[intern.StrId, SymbolId](?rc.img_cache, name, sid);
+    if (R.is_err[bool, str](ins)) { ret R.err[TypeSpelling, str](R.unwrap_err[bool, str](ins)); }
+
+    o.status = TYPE_SPELL_FOUND;
+    o.sym    = sid;
+    ret R.ok[TypeSpelling, str](o);
+}
+
+# report a well formed image / sampler handle whose members this cut does not emit
+#
+# NAMES THE MEMBER, not the type. "unsupported type" would leave a reader to guess
+# which of the six operands the emitter objected to, and the whole point of reading
+# the grammar rather than matching a name is that the compiler knows exactly which
+# one. Depth-comparison is the member #2794 puts out of scope by name, and it says
+# so rather than reading as an oversight.
+# ---
+# rc:   resolver state for the module being resolved
+# span: the spelling's source span
+# name: the interned spelling
+# img:  the handle read from it
+# ret:  ok(true), or an allocation error
+fun report_image_refused(rc: *ResolveContext, span: token.Span, name: intern.StrId,
+                         img: type.ImgForm) R.Result[bool, str] {
+    val no: O.Option[str] = intern.lookup(?rc.s.interner, name);
+    if (O.is_none[str](no)) { ret R.ok[bool, str](true); }
+    val spelling: str = O.unwrap[str](no);
+
+    var reason: str = "this image handle is not supported";
+    if (img.reason == type.IMG_REFUSE_DEPTH) {
+        reason = "depth-comparison sampling is out of scope for the first sampled-image cut (#2794): a `shadow` handle is sampled by `OpImageSampleDref*`, which takes a reference value the sampling operation here has no operand for. it is refused rather than emitted as an ordinary image, which would compile and compare nothing";
+    }
+    or (img.reason == type.IMG_REFUSE_MS) {
+        reason = "a multisampled image is not sampled at all: it is FETCHED per sample by `OpImageFetch` with a `Sample` image operand, which is a different instruction with an operand mask this cut does not carry. an `ms` handle sampled as an ordinary one would be an invalid module";
+    }
+    or (img.reason == type.IMG_REFUSE_DIM) {
+        reason = "this dimensionality needs a capability and a sampling path beyond the ones emitted here: `rect` and `buffer` are unnormalized-coordinate and texel-buffer images, and `subpass` is read by `OpImageRead` within a render pass. `1d`, `2d`, `3d` and `cube` are the dimensionalities this cut binds";
+    }
+    or (img.reason == type.IMG_REFUSE_STORAGE) {
+        reason = "a storage image (`image...`) is read and written directly rather than sampled, so it carries an Image Format operand this cut does not spell and needs `OpImageRead` / `OpImageWrite`. a `sampler...` or `texture...` handle is the sampled form";
+    }
+
+    val rm: R.Result[str, str] = format.sprint(rc.s.alloc,
+        "`{}` is spelled as an image handle, and {}", spelling, reason);
+    if (R.is_err[str, str](rm)) { ret R.err[bool, str](R.unwrap_err[str, str](rm)); }
+    val msg: str = R.unwrap_ok[str, str](rm);
+
+    val emit: R.Result[bool, str] = diagnostic.error(?rc.s.diags, rc.a.file_id, span, msg);
+    A.deallocate[char](rc.s.alloc, msg::*char, str_len(msg) + 1);
+    ret emit;
 }
 
 # report a well formed vector spelling the target will not admit
@@ -1104,6 +1222,24 @@ fun reject_vector_named_type(rc: *ResolveContext, kind: SymKind, name_span: toke
     val no: O.Option[str] = intern.lookup(?rc.s.interner, name_id);
     if (O.is_none[str](no)) { ret R.ok[bool, str](true); }
     val spelling: str = O.unwrap[str](no);
+
+    # the image / sampler grammar reserves its spellings on the same terms and for
+    # the same reason (#2794): the form is consulted in type position ahead of
+    # scope, so a `rec sampler2d` would be a declaration nothing could name. A
+    # spelling whose members this cut REFUSES is reserved too - whether a member is
+    # emitted yet is a scope decision, and letting it decide whether a declaration
+    # is legal would make the source break arrive with the member rather than now.
+    if (type.is_image_spelling(spelling)) {
+        val ri: R.Result[str, str] = format.sprint(rc.s.alloc,
+            "`{}` is spelled as an image handle type, so it cannot also name a type; the declaration would be unreachable",
+            spelling);
+        if (R.is_err[str, str](ri)) { ret R.err[bool, str](R.unwrap_err[str, str](ri)); }
+        val imsg: str = R.unwrap_ok[str, str](ri);
+        val iemit: R.Result[bool, str] = diagnostic.error(?rc.s.diags, rc.a.file_id, name_span, imsg);
+        A.deallocate[char](rc.s.alloc, imsg::*char, str_len(imsg) + 1);
+        ret iemit;
+    }
+
     if (!type.is_vector_spelling(spelling)) { ret R.ok[bool, str](true); }
 
     val rm: R.Result[str, str] = format.sprint(rc.s.alloc,
@@ -2946,6 +3082,11 @@ fun bind_type_name_expr(rc: *ResolveContext, eid: id.ExprId) R.Result[bool, str]
         if (sp.status == TYPE_SPELL_VEC_REFUSED) {
             ret report_vector_refused(rc, e.span, name, sp.form);
         }
+        # a well formed image handle whose members this cut does not emit is the
+        # same shape of decision, named for the member rather than the width.
+        if (sp.status == TYPE_SPELL_IMG_REFUSED) {
+            ret report_image_refused(rc, e.span, name, sp.img);
+        }
 
         var sid: SymbolId = sp.sym;
         if (sid == SYMBOL_NIL) { sid = scope_lookup_chain(rc, rc.current_scope, name); }
@@ -3244,6 +3385,10 @@ fun resolve_type_path(rc: *ResolveContext, named: *atype.TypeNamed, full: token.
                 # falling through to scope lookup and an unresolved-name message.
                 if (sp.status == TYPE_SPELL_VEC_REFUSED) {
                     report_vector_refused(rc, full, seg_name, sp.form);
+                    ret SYMBOL_NIL;
+                }
+                if (sp.status == TYPE_SPELL_IMG_REFUSED) {
+                    report_image_refused(rc, full, seg_name, sp.img);
                     ret SYMBOL_NIL;
                 }
                 current_sym = sp.sym;

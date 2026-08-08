@@ -46,6 +46,7 @@ A decorator is written as an attribute:
 #[builtin("name")]   # pipeline built-in variable (global only)
 #[uniform(set, bnd)] # descriptor-bound uniform block, read-only (global only)
 #[storage(set, bnd)] # descriptor-bound storage buffer, read-write (global only)
+#[sampler(set, bnd)] # descriptor-bound image / sampler handle (global only)
 #[spirv_op(set,name)] # the SPIR-V instruction this function is (fun only)
 ```
 
@@ -548,12 +549,12 @@ stage takes the single-invocation default `(1, 1, 1)`; the dimensions are always
 declared in the emitted module, since a compute stage that does not state its
 workgroup size is not one a consumer can dispatch.
 
-### `input(n)` / `output(n)` / `builtin(str)` / `uniform(set, binding)` / `storage(set, binding)` — shader interface
+### `input(n)` / `output(n)` / `builtin(str)` / `uniform(set, binding)` / `storage(set, binding)` / `sampler(set, binding)` — shader interface
 
 A pipeline stage does not receive its inputs or return its results through a call.
 It reads and writes **module-scope variables** that the pipeline binds, and these
-four directives say which kind each variable is. They apply only to module-level
-`val` / `var` bindings, and a variable carries **exactly one** of them — the four
+directives say which kind each variable is. They apply only to module-level
+`val` / `var` bindings, and a variable carries **exactly one** of them — they
 are mutually exclusive.
 
 ```mach
@@ -566,6 +567,8 @@ rec Camera { view: f32x4; proj: f32x4; }
 
 rec Particles { pos: [64]f32x4; }
 #[storage(0, 1)] var particles: Particles;
+
+#[sampler(1, 0)] var albedo: sampler2d;
 ```
 
 `input` and `output` number a **varying** with a location, which is how one
@@ -619,10 +622,53 @@ A compute stage's data path is `storage`: Vulkan forbids the `Output` storage cl
 in a compute execution model, so a compute shader reads and writes buffers rather
 than varyings.
 
+`sampler` binds an **image or sampler handle** by descriptor set and binding, at
+the same descriptor addressing `uniform` and `storage` use, so a host binds one the
+way it binds the others. Its type must be a **handle type** — see
+[types.md](types.md) for the spellings — and a handle type must carry this
+decorator: a handle names a descriptor rather than an object with storage, so one
+with no descriptor address is reachable from no stage. A handle cannot sit behind a
+pointer, inside an array, or in a local binding; each of those is a compile error
+naming why.
+
+Sampling a handle is a `#[spirv_op(...)]` declaration rather than a language form,
+because a sample IS one SPIR-V instruction like `sqrt` and `dot` are:
+
+```mach
+#[spirv_op("core", "OpImageSampleImplicitLod")]
+fun sample(s: sampler2d, uv: f32x2) f32x4;
+
+#[stage("fragment")]
+fun frag_main() {
+    out_colour = sample(albedo, in_uv);
+}
+```
+
+The separately-bound form works the same way, with the instruction that combines
+an image and a sampler declared alongside it:
+
+```mach
+#[spirv_op("core", "OpSampledImage")]
+fun combine(t: texture2d, s: sampler) sampler2d;
+
+#[sampler(1, 0)] var base_tex: texture2d;
+#[sampler(1, 1)] var base_smp: sampler;
+
+#[stage("fragment")]
+fun frag_sep() { out_colour = sample(combine(base_tex, base_smp), in_uv); }
+```
+
+The combined value is handed straight to the sample rather than named: SPIR-V
+requires an `OpSampledImage` result be consumed in the block that produced it,
+which is the same rule that makes a handle-typed local a compile error.
+
 As with `#[stage(...)]`, these are accepted on every target and acted on only by a
 target that forms pipeline stages. On `spirv` each becomes an `OpVariable` in the
 matching storage class, carrying the matching decoration, and the Input and Output
-variables are named in every entry point's interface list.
+variables are named in every entry point's interface list. A `sampler` binding
+becomes an `OpVariable` in the `UniformConstant` class — the one class Vulkan
+permits an image, sampler or sampled-image variable in — carrying `DescriptorSet`
+and `Binding` exactly as a `uniform` does.
 
 ### `spirv_op(set, name)` — a function that *is* a SPIR-V instruction
 
