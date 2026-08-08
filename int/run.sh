@@ -13,9 +13,10 @@
 # WHAT A GOLDEN CANNOT SEE. a golden is a statement about one string, not about the
 # program, the image, or the compiler, so every run-and-compare case is blind in the
 # same ways. int/observability.md maps those classes to the surface that can observe
-# each one, grounded in the defects that cost this repo the time to find them
-# (#2795, #2797, #2766, the darwin native lane, narrow-stack-args). read it before
-# choosing a `run:` mode - it is the companion to lib/produce.sh's producer catalogue.
+# each one, grounded in the defects that cost this repo the time to find them, and
+# states which of them genuinely needed an integration test rather than a unit test
+# (most did not). it describes the defects and the surfaces, not this harness, so it
+# outlives it - read it before adding a case here.
 #
 # the harness is the same on every OS (git-bash on windows, bash on linux/macOS);
 # the only target-specific knowledge it holds is the run-mode looked up per target

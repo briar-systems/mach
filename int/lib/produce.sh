@@ -5,9 +5,10 @@
 # that varies between verification modes; the golden-diff core does not change.
 #
 # CHOOSING ONE. this list says what each producer observes. int/observability.md says
-# what `exec` - the default, and the right first reach - structurally CANNOT observe,
-# and maps each of those classes to the surface that can. most of the producers below
-# exist because of one of its entries, so the two files are meant to be read together.
+# what running a program structurally CANNOT observe, maps each of those classes to
+# the surface that can, and states which of them needed an integration test at all -
+# most of the historical cases did not. most producers below exist because of one of
+# its entries, so read the two together, and read it first before adding a case.
 #
 # producers:
 #   exec        — run the program, observe its stdout (native / qemu).
