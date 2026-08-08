@@ -261,6 +261,25 @@ pub fun emit_module(tgt: *resolved.Target, irmod: *ir.Module,
         ret ur;
     }
 
+    # whole-module well-formedness, before any body is emitted so a refusal precedes
+    # partial emission: the rules here are about the module rather than about one
+    # instruction, and have nowhere else to live.
+    val cgr: R.Result[bool, str] = check_call_graph(?e, mirmod);
+    if (R.is_err[bool, str](cgr)) {
+        emit_dnit(?e, irmod.function_len);
+        types.types_dnit(?tt);
+        spirv.builder_dnit(?b);
+        ret cgr;
+    }
+
+    val sir: R.Result[bool, str] = check_stage_interfaces(?e);
+    if (R.is_err[bool, str](sir)) {
+        emit_dnit(?e, irmod.function_len);
+        types.types_dnit(?tt);
+        spirv.builder_dnit(?b);
+        ret sir;
+    }
+
     var fi: u32 = 0;
     for (fi < mirmod.function_len) {
         val mf: *mir.MirFunction = ?mirmod.functions[fi];
@@ -502,6 +521,12 @@ fun laid_out_struct(e: *Emit, id: type.IrTypeId, relaxed_stride: bool) R.Result[
         members[i] = R.unwrap_ok[u32, str](mr);
         i = i + 1;
     }
+
+    # the offsets about to be decorated are mach's own, so they are checked against
+    # the layout Vulkan requires BEFORE they are emitted, and a block whose members
+    # disagree is refused rather than given a plausible wrong offset (#2746).
+    val lr: R.Result[bool, str] = check_block_layout(e, id, relaxed_stride);
+    if (R.is_err[bool, str](lr)) { ret R.err[u32, str](R.unwrap_err[bool, str](lr)); }
     val struct_id: u32 = types.type_struct(e.tt, ?members[0], n, true);
     if (struct_id == 0) { ret R.err[u32, str]("spirv.emit: could not build a uniform block type"); }
 
@@ -527,6 +552,16 @@ fun laid_out_struct(e: *Emit, id: type.IrTypeId, relaxed_stride: bool) R.Result[
 # the block by `$offset_of` sees what the shader reads. That also means a layout
 # rule Vulkan imposes and mach's layout does not satisfy is refused rather than
 # quietly repacked - repacking would move the members out from under the host.
+#
+# WHICH RULES ARE ENFORCED, so the next reader is not told a guarantee broader than
+# the code (#2746). `std_base_align` states the specification's base alignments and
+# `check_block_layout` holds every emitted member offset to two conditions - a
+# multiple of the member's base alignment, and past the end of the member before it
+# - which together are what std140 and std430 require of a set of offsets. The
+# array stride is held to `required_stride`. The two postures differ only in the
+# 16-byte roundings std140 applies to an array and to a struct. Nothing else is
+# checked because nothing else is a rule: neither layout bounds an offset from
+# above, so a conforming set of offsets is one a Vulkan consumer accepts.
 # ---
 # e:   the emission state
 # id:  the member's IR type
@@ -543,16 +578,26 @@ fun laid_out_type(e: *Emit, id: type.IrTypeId, relaxed_stride: bool) R.Result[u3
         if (R.is_err[u32, str](er)) { ret er; }
         val elem_ty: u32 = R.unwrap_ok[u32, str](er);
         val stride: u32 = type.byte_size(?e.ir.types, t.data.array_.element, e.tgt);
-        # the two block classes differ here, and only here. A UNIFORM block is laid
-        # out to std140-shaped rules, under which an array's stride is rounded up to
-        # 16; mach packs at the element's natural size, so an array of anything
-        # narrower disagrees with what a Vulkan host would write and is refused
-        # rather than repacked - repacking would move the members out from under the
-        # host. A STORAGE buffer is laid out to std430-shaped rules, which use the
-        # element's natural stride, and that is exactly mach's own layout, so every
-        # element width a uniform block has to turn away is legal there.
-        if (!relaxed_stride && (stride % 16) != 0) {
-            ret R.err[u32, str]("an array inside a `#[uniform(...)]` block must have a 16-byte-aligned element in the SPIR-V target: a uniform block's array stride is rounded up to 16, which mach's own layout does not do, so the shader and the host would disagree about where the elements are. an array of a 128-bit vector (`[4]f32x4`) has the right stride already, and a `#[storage(...)]` buffer accepts any element width");
+        # the emitted stride is mach's own element size, and the rule is that a
+        # stride must be a multiple of the array's base alignment and no smaller
+        # than what one element occupies. The two block classes differ only in that
+        # alignment: a UNIFORM block rounds it up to 16 (std140) and a STORAGE
+        # buffer does not (std430), which is why `[8]f32` is legal in one and not
+        # the other. A disagreement is refused rather than repacked - repacking
+        # would move the elements out from under a host writing by `$offset_of`.
+        val want: u32 = required_stride(e, t.data.array_.element, relaxed_stride);
+        if (want == 0) {
+            ret R.err[u32, str](unsupported_ir_type(e, t.data.array_.element,
+                "unsupported uniform block member type in the SPIR-V target"));
+        }
+        if (stride != want) {
+            val ar: R.Result[str, str] = format.sprint(e.alloc,
+                "an array inside a `{}` block needs an element stride of {} bytes in the SPIR-V target, and mach's layout packs it at {}: a block's array stride is rounded up to the element's base alignment, which mach's own layout does not do, so the shader and the host would disagree about where the elements are. pad the element to {} bytes, or use an element that is that wide already (`f32x4`){}",
+                block_role(relaxed_stride), want, stride, want, storage_hint(relaxed_stride));
+            if (R.is_err[str, str](ar)) {
+                ret R.err[u32, str]("an array inside a `#[uniform(...)]` / `#[storage(...)]` block has an element stride mach's layout does not give it");
+            }
+            ret R.err[u32, str](R.unwrap_ok[str, str](ar));
         }
         val arr_id: u32 = types.type_array(e.tt, elem_ty, t.data.array_.count, true);
         if (arr_id == 0) { ret R.err[u32, str]("spirv.emit: could not build a uniform block array type"); }
@@ -567,6 +612,235 @@ fun laid_out_type(e: *Emit, id: type.IrTypeId, relaxed_stride: bool) R.Result[u3
         ret R.err[u32, str]("unsupported uniform block member type in the SPIR-V target");
     }
     ret R.ok[u32, str](mt);
+}
+
+# round `v` up to the next multiple of `a`
+# ---
+# v: the value
+# a: the alignment, which must not be 0
+# ret: the rounded value
+fun round_up_to(v: u32, a: u32) u32 {
+    if (a == 0) { ret v; }
+    ret ((v + a - 1) / a) * a;
+}
+
+# the block posture's name, for a diagnostic
+# ---
+# std430: whether this is a storage buffer rather than a uniform block
+# ret:    the decorator a reader wrote
+fun block_role(std430: bool) str {
+    if (std430) { ret "#[storage(...)]"; }
+    ret "#[uniform(...)]";
+}
+
+# the clause pointing a uniform block at the looser posture, empty for a storage one
+# ---
+# std430: whether this is already a storage buffer
+# ret:    the trailing sentence, or the empty string
+fun storage_hint(std430: bool) str {
+    if (std430) { ret ""; }
+    ret ", and a `#[storage(...)]` buffer accepts any element width where read-write descriptor semantics are acceptable";
+}
+
+# the base alignment SPIR-V's explicit layout rules give a block member
+#
+# These are the std140 (uniform) and std430 (storage) rules from the specification,
+# NOT a description of mach's layout - the whole point of having them is that the
+# two can differ:
+#
+#   scalar          its own size
+#   two-lane vector twice the lane size
+#   three/four-lane four times the lane size
+#   array           the element's, rounded up to 16 under std140
+#   struct          the largest member's, rounded up to 16 under std140
+#
+# mach's layout agrees on scalars and on a vector that FILLS the vector register,
+# and on nothing else. A vector narrower than the register aligns to one lane in
+# mach (#2687), so an `f32x2` or an `f32x3` member is the reachable disagreement in
+# BOTH postures, and a nested record is the reachable disagreement under std140,
+# where mach's max-member alignment is not rounded up to 16.
+# ---
+# e:      the emission state
+# id:     the member's IR type
+# std430: the storage-buffer posture, which drops the 16-byte roundings
+# ret:    the base alignment in bytes, or 0 for a type with no block layout
+fun std_base_align(e: *Emit, id: type.IrTypeId, std430: bool) u32 {
+    val opt: O.Option[*type.IrType] = type.get(?e.ir.types, id);
+    if (O.is_none[*type.IrType](opt)) { ret 0; }
+    val t: *type.IrType = O.unwrap[*type.IrType](opt);
+
+    if (t.kind == type.IRT_STRUCT) {
+        var a: u32 = 1;
+        var i: u32 = 0;
+        for (i < t.data.struct_.field_count) {
+            val ma: u32 = std_base_align(e, t.data.struct_.fields[i], std430);
+            if (ma == 0) { ret 0; }
+            if (ma > a) { a = ma; }
+            i = i + 1;
+        }
+        if (!std430) { ret round_up_to(a, 16); }
+        ret a;
+    }
+    if (t.kind == type.IRT_ARRAY) {
+        val ea: u32 = std_base_align(e, t.data.array_.element, std430);
+        if (ea == 0) { ret 0; }
+        if (!std430) { ret round_up_to(ea, 16); }
+        ret ea;
+    }
+    if (t.kind == type.IRT_VECTOR) {
+        val lane: u32 = type.byte_size(?e.ir.types, t.data.vector_.element, e.tgt);
+        if (t.data.vector_.lanes == 2) { ret 2 * lane; }
+        ret 4 * lane;
+    }
+    if (t.kind == type.IRT_INT || t.kind == type.IRT_FLOAT) {
+        ret type.byte_size(?e.ir.types, id, e.tgt);
+    }
+    ret 0;
+}
+
+# how many bytes a block member occupies, given the offsets this emitter decorates
+#
+# This is not the member's std140 SIZE in the abstract: the offsets inside a nested
+# struct are mach's own, so the extent has to be measured over them and only the
+# trailing round-up to the struct's base alignment is a layout rule. That trailing
+# round-up is exactly the std140 nested-struct rule, and it is what makes a
+# following member's required offset 16 rather than mach's 8.
+# ---
+# e:      the emission state
+# id:     the member's IR type
+# std430: the storage-buffer posture
+# ret:    the extent in bytes, or 0 for a type with no block layout
+fun std_extent(e: *Emit, id: type.IrTypeId, std430: bool) u32 {
+    val opt: O.Option[*type.IrType] = type.get(?e.ir.types, id);
+    if (O.is_none[*type.IrType](opt)) { ret 0; }
+    val t: *type.IrType = O.unwrap[*type.IrType](opt);
+
+    if (t.kind == type.IRT_STRUCT) {
+        val a: u32 = std_base_align(e, id, std430);
+        if (a == 0) { ret 0; }
+        var end: u32 = 0;
+        var i: u32 = 0;
+        for (i < t.data.struct_.field_count) {
+            val me: u32 = std_extent(e, t.data.struct_.fields[i], std430);
+            if (me == 0) { ret 0; }
+            val moff: u32 = type.byte_offset(?e.ir.types, id, i, e.tgt);
+            if (moff + me > end) { end = moff + me; }
+            i = i + 1;
+        }
+        ret round_up_to(end, a);
+    }
+    if (t.kind == type.IRT_ARRAY) {
+        val s: u32 = required_stride(e, t.data.array_.element, std430);
+        if (s == 0) { ret 0; }
+        ret s * t.data.array_.count;
+    }
+    ret type.byte_size(?e.ir.types, id, e.tgt);
+}
+
+# the array stride SPIR-V's explicit layout rules require for an element type
+#
+# A stride is the element's extent rounded up to the ARRAY's base alignment, which
+# under std140 is at least 16 and under std430 is the element's own.
+# ---
+# e:      the emission state
+# elem:   the element's IR type
+# std430: the storage-buffer posture
+# ret:    the required stride in bytes, or 0 for a type with no block layout
+fun required_stride(e: *Emit, elem: type.IrTypeId, std430: bool) u32 {
+    var a: u32 = std_base_align(e, elem, std430);
+    if (a == 0) { ret 0; }
+    if (!std430) { a = round_up_to(a, 16); }
+    val ext: u32 = std_extent(e, elem, std430);
+    if (ext == 0) { ret 0; }
+    ret round_up_to(ext, a);
+}
+
+# check one struct's emitted member offsets against the block layout rules
+#
+# Every member must start at a multiple of its base alignment and past the end of
+# the one before it. Together those two conditions ARE std140 / std430 conformance
+# for a set of offsets: the rules place no upper bound on an offset, only these two
+# lower ones, so a layout satisfying both is one a Vulkan consumer accepts.
+#
+# Only this struct's own members are checked; a nested one is reached through
+# `laid_out_struct` and checks itself.
+# ---
+# e:      the emission state
+# id:     the IR struct type
+# std430: the storage-buffer posture
+# ret:    true when the offsets conform, or a diagnostic naming the member and rule
+fun check_block_layout(e: *Emit, id: type.IrTypeId, std430: bool) R.Result[bool, str] {
+    val opt: O.Option[*type.IrType] = type.get(?e.ir.types, id);
+    if (O.is_none[*type.IrType](opt)) { ret R.ok[bool, str](true); }
+    val t: *type.IrType = O.unwrap[*type.IrType](opt);
+
+    var prev_end: u32 = 0;
+    var i: u32 = 0;
+    for (i < t.data.struct_.field_count) {
+        val fty: type.IrTypeId = t.data.struct_.fields[i];
+        val a: u32 = std_base_align(e, fty, std430);
+        # a member with no block layout at all is refused by `laid_out_type`, which
+        # names the type; there is nothing to add here.
+        if (a == 0) { i = i + 1; cnt; }
+        val off: u32 = type.byte_offset(?e.ir.types, id, i, e.tgt);
+
+        if ((off % a) != 0 || off < prev_end) {
+            var want: u32 = round_up_to(prev_end, a);
+            if (want < round_up_to(off, a)) { want = round_up_to(off, a); }
+            # the two conditions fail for different reasons and a reader needs to be
+            # told which: a misaligned member is the member's own base alignment, and
+            # an overlapping one is the member before it occupying more of the block
+            # than mach's layout gives it.
+            ret R.err[bool, str](layout_refusal(e, std430, i, fty, off, want, a,
+                                                off < prev_end, prev_end));
+        }
+        val ext: u32 = std_extent(e, fty, std430);
+        if (ext == 0) { i = i + 1; cnt; }
+        prev_end = off + ext;
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# the diagnostic for a member mach's layout places where the block rules do not
+# ---
+# e:        the emission state
+# std430:   the storage-buffer posture
+# ix:       the member's index within its block
+# fty:      the member's IR type
+# off:      the offset mach's layout gives it
+# want:     the first offset the block rules allow
+# align:    the member's base alignment under those rules
+# overlaps: whether the member starts inside the one before it
+# prev_end: where the member before it ends under those rules
+# ret:      the composed diagnostic
+fun layout_refusal(e: *Emit, std430: bool, ix: u32, fty: type.IrTypeId, off: u32,
+                   want: u32, align: u32, overlaps: bool, prev_end: u32) str {
+    var why: str = nil;
+    if (overlaps) {
+        val wr: R.Result[str, str] = format.sprint(e.alloc,
+            "the member before it runs to offset {} under those rules and mach's layout ends it sooner, so the two overlap",
+            prev_end);
+        if (R.is_ok[str, str](wr)) { why = R.unwrap_ok[str, str](wr); }
+    }
+    or {
+        val wr: R.Result[str, str] = format.sprint(e.alloc,
+            "a member of this type has a base alignment of {} bytes under those rules and mach's layout does not place it on one",
+            align);
+        if (R.is_ok[str, str](wr)) { why = R.unwrap_ok[str, str](wr); }
+    }
+    if (why == nil) {
+        ret "a member of this block is placed at an offset the SPIR-V block layout rules do not allow";
+    }
+
+    val r: R.Result[str, str] = format.sprint(e.alloc,
+        "member {} of this `{}` block, a {}, is placed at offset {} by mach's layout and the SPIR-V block layout rules require offset {}: {}. the offsets are the host's contract, so this is refused rather than repacked - repacking would move the members out from under a host writing by `$offset_of`. pad the block explicitly so the member lands where the rules put it, or promote a nested record's members into the block{}",
+        ix, block_role(std430), ir_type_spelling(?e.ir.types, e.alloc, fty), off, want,
+        why, storage_hint(std430));
+    if (R.is_err[str, str](r)) {
+        ret "a member of this block is placed at an offset the SPIR-V block layout rules do not allow";
+    }
+    ret R.unwrap_ok[str, str](r);
 }
 
 # compute, per IR function, which interface variables it can reach
@@ -686,6 +960,376 @@ fun iface_slot_of(e: *Emit, name: intern.StrId) u32 {
         i = i + 1;
     }
     ret 0;
+}
+
+# refuse a cycle in the module's static call graph
+#
+# A SPIR-V execution model has no call stack, so a function may not be reachable
+# from itself. That is a rule about the MODULE rather than about any one
+# instruction or function, and it is checked before a single body is emitted so the
+# refusal precedes any partial emission.
+#
+# It is not left to the validator. `spirv-val` scopes its cycle rule to entry
+# points, so a LIBRARY module carrying a cycle validates clean and fails later, in
+# whatever consumer links it into a pipeline, far from the source that caused it.
+#
+# The walk is a genuine cycle detection over the whole graph rather than a
+# self-call test. mach's surface makes a mutual cycle hard to spell today - a
+# forward declaration of a name that is then defined is a duplicate definition -
+# but that is a property of the front end, not one this back end should rely on.
+# ---
+# e:      the emission state
+# mirmod: the lowered MIR module, which carries the call edges
+# ret:    true when the graph is acyclic, or a diagnostic naming the chain
+fun check_call_graph(e: *Emit, mirmod: *mir.MirModule) R.Result[bool, str] {
+    val n: u32 = e.ir.function_len;
+    if (n == 0) { ret R.ok[bool, str](true); }
+
+    val rs: R.Result[*u8, str] = A.allocate[u8](e.alloc, n::usize);
+    if (R.is_err[*u8, str](rs)) { ret R.err[bool, str](R.unwrap_err[*u8, str](rs)); }
+    val state: *u8 = R.unwrap_ok[*u8, str](rs);
+    val rp: R.Result[*u32, str] = A.allocate[u32](e.alloc, n::usize);
+    if (R.is_err[*u32, str](rp)) {
+        A.deallocate[u8](e.alloc, state, n::usize);
+        ret R.err[bool, str](R.unwrap_err[*u32, str](rp));
+    }
+    val path: *u32 = R.unwrap_ok[*u32, str](rp);
+    val rm: R.Result[*u32, str] = A.allocate[u32](e.alloc, n::usize);
+    if (R.is_err[*u32, str](rm)) {
+        A.deallocate[u8](e.alloc, state, n::usize);
+        A.deallocate[u32](e.alloc, path, n::usize);
+        ret R.err[bool, str](R.unwrap_err[*u32, str](rm));
+    }
+    val mfx: *u32 = R.unwrap_ok[*u32, str](rm);
+
+    var i: u32 = 0;
+    for (i < n) { state[i] = 0; path[i] = 0; mfx[i] = IR_FN_NONE; i = i + 1; }
+
+    # the edges live in MIR, so each IR function needs its lowered body's index.
+    var fi: u32 = 0;
+    for (fi < mirmod.function_len) {
+        val mf: *mir.MirFunction = ?mirmod.functions[fi];
+        val fx: u32 = ir_function_index(e.ir, mf.name);
+        if (fx != IR_FN_NONE) { mfx[fx] = fi; }
+        fi = fi + 1;
+    }
+
+    var msg: str = nil;
+    i = 0;
+    for (i < n && msg == nil) {
+        if (state[i] == 0) { msg = cg_visit(e, mirmod, mfx, state, path, 0, i); }
+        i = i + 1;
+    }
+
+    A.deallocate[u8](e.alloc, state, n::usize);
+    A.deallocate[u32](e.alloc, path, n::usize);
+    A.deallocate[u32](e.alloc, mfx, n::usize);
+    if (msg != nil) { ret R.err[bool, str](msg); }
+    ret R.ok[bool, str](true);
+}
+
+# depth-first visit of one call-graph node, reporting the first cycle it closes
+#
+# `state` is the usual three-colour marking: 0 unvisited, 1 on the current path, 2
+# finished. A callee already on the path closes a cycle, and `path` holds the chain
+# that reaches it, which is what makes the diagnostic name the whole loop rather
+# than only its existence.
+# ---
+# e:      the emission state
+# mirmod: the lowered MIR module
+# mfx:    IR function index -> MIR function index, or IR_FN_NONE
+# state:  the per-function colour
+# path:   the current DFS path, `depth` entries deep
+# depth:  the current path length
+# ix:     the IR function to visit
+# ret:    nil when this subtree is acyclic, or the diagnostic
+fun cg_visit(e: *Emit, mirmod: *mir.MirModule, mfx: *u32, state: *u8, path: *u32,
+             depth: u32, ix: u32) str {
+    state[ix] = 1;
+    path[depth] = ix;
+
+    val mi_ix: u32 = mfx[ix];
+    if (mi_ix != IR_FN_NONE) {
+        val mf: *mir.MirFunction = ?mirmod.functions[mi_ix];
+        var bi: u32 = 0;
+        for (bi < mf.block_count) {
+            val blk: *mir.MirBlock = ?mf.blocks[bi];
+            var ii: u32 = 0;
+            for (ii < blk.instr_count) {
+                val mi: *mir.MirInstr = ?blk.instrs[ii];
+                if (mi.opcode == mir.MIR_CALL && mi.operand_count >= 1
+                    && mi.operands[0].kind == mir.MIR_OP_SYM) {
+                    val cx: u32 = ir_function_index(e.ir, mi.operands[0].sym);
+                    # a call to an instruction-mapped function is not an edge: on this
+                    # target it becomes the instruction, and the callee's body is never
+                    # emitted, so it cannot carry the cycle.
+                    if (cx != IR_FN_NONE && !instruction_mapped(e.ir, mi.operands[0].sym)) {
+                        if (state[cx] == 1) { ret cycle_refusal(e, path, depth + 1, cx); }
+                        if (state[cx] == 0) {
+                            val sub: str = cg_visit(e, mirmod, mfx, state, path, depth + 1, cx);
+                            if (sub != nil) { ret sub; }
+                        }
+                    }
+                }
+                ii = ii + 1;
+            }
+            bi = bi + 1;
+        }
+    }
+
+    state[ix] = 2;
+    ret nil;
+}
+
+# the diagnostic for a call-graph cycle, naming the chain that closes it
+# ---
+# e:      the emission state
+# path:   the DFS path
+# depth:  the path's length
+# closes: the function the last edge returns to, which is somewhere on the path
+# ret:    the composed diagnostic
+fun cycle_refusal(e: *Emit, path: *u32, depth: u32, closes: u32) str {
+    var chain: str = ir_fn_spelling(e, closes);
+    var i: u32 = 0;
+    # skip the prefix that leads INTO the cycle: only the loop itself is reported.
+    for (i < depth && path[i] != closes) { i = i + 1; }
+    for (i < depth) {
+        val r: R.Result[str, str] = format.sprint(e.alloc, "{} -> {}", chain,
+                                                  ir_fn_spelling(e, path[i]));
+        if (R.is_err[str, str](r)) { i = depth; cnt; }
+        chain = R.unwrap_ok[str, str](r);
+        i = i + 1;
+    }
+    val r2: R.Result[str, str] = format.sprint(e.alloc,
+        "this call graph is a cycle and the SPIR-V target cannot express it: {}. a SPIR-V execution model has no call stack, so a function may not be reachable from itself. rewrite the recursion as a loop",
+        chain);
+    if (R.is_err[str, str](r2)) {
+        ret "a recursive call is not expressible in the SPIR-V target: a SPIR-V execution model has no call stack, so a function may not be reachable from itself";
+    }
+    ret R.unwrap_ok[str, str](r2);
+}
+
+# the per-stage interface rules: the Flat decoration, and Location span overlap
+#
+# Both are rules Vulkan states PER EXECUTION MODEL, over the set of variables one
+# entry point reaches, so neither can be decided where the variables are declared -
+# `declare_interface` runs before reachability is known. They live here, after
+# `build_iface_uses`, and before any body is emitted.
+#
+# Flat is required on a fragment-stage Input of integer or 64-bit float type: such
+# a value cannot be interpolated, so an undecorated one is an invalid module. It is
+# emitted at most once per variable however many fragment stages reach it, since a
+# repeated decoration is not what the module means to say.
+#
+# Vulkan also FORBIDS Flat on a vertex-stage Input, so one variable cannot serve
+# both: the fragment stage requires the decoration and the vertex stage rejects it,
+# and no module satisfies both. That is refused here rather than resolved, because
+# there is nothing to resolve - a vertex stage's Input is a vertex attribute and a
+# fragment stage's Input is the interpolated output of the stage before it, and one
+# module-scope variable standing for both is the author having conflated two things
+# rather than a shape the emitter could express if it tried harder.
+#
+# A Location is written by the author and emitted verbatim, but mach knows each
+# variable's type and so knows how many locations it consumes; two that overlap
+# within one stage are refused here rather than left to a validator message naming
+# an `OpEntryPoint` operand index.
+# ---
+# e:   the emission state
+# ret: true on success, or a diagnostic naming the variables that collide
+fun check_stage_interfaces(e: *Emit) R.Result[bool, str] {
+    val n: u32 = e.ir.global_len;
+    if (e.iface_len == 0 || n == 0) { ret R.ok[bool, str](true); }
+
+    val rf: R.Result[*u8, str] = A.allocate[u8](e.alloc, n::usize);
+    if (R.is_err[*u8, str](rf)) { ret R.err[bool, str](R.unwrap_err[*u8, str](rf)); }
+    val flat: *u8 = R.unwrap_ok[*u8, str](rf);
+    var i: u32 = 0;
+    for (i < n) { flat[i] = 0; i = i + 1; }
+
+    var msg: str = nil;
+    var fx: u32 = 0;
+    for (fx < e.ir.function_len && msg == nil) {
+        val fn: *ir.Function = ?e.ir.functions[fx];
+        if (fn.stage == ir.STAGE_NONE || (fn.flags & ir.FN_FLAG_EXTERN) != 0) {
+            fx = fx + 1; cnt;
+        }
+        i = 0;
+        for (i < n) {
+            if (e.gslot[i] == 0 || !uses_iface(e, fx, e.gslot[i] - 1)) { i = i + 1; cnt; }
+            if (e.gstorage[i] == spirv.STORAGE_INPUT && needs_flat(?e.ir.types, e.ir.globals[i].ty)) {
+                if (fn.stage == ir.STAGE_FRAGMENT) { flat[i] = flat[i] | 1; }
+                or (fn.stage == ir.STAGE_VERTEX)   { flat[i] = flat[i] | 2; }
+                if (flat[i] == 3) {
+                    msg = flat_conflict(e, i);
+                    i = n; cnt;
+                }
+            }
+            # a Location collision is only a collision within one direction: an input
+            # at location 0 and an output at location 0 are two different spaces.
+            if (e.ir.globals[i].iface == ir.IFACE_INPUT
+                || e.ir.globals[i].iface == ir.IFACE_OUTPUT) {
+                msg = location_overlap(e, fx, i);
+                if (msg != nil) { i = n; cnt; }
+            }
+            i = i + 1;
+        }
+        fx = fx + 1;
+    }
+
+    if (msg == nil) {
+        i = 0;
+        for (i < n) {
+            if ((flat[i] & 1) != 0) { decorate_flat(e, e.gvar_ids[i]); }
+            i = i + 1;
+        }
+    }
+    A.deallocate[u8](e.alloc, flat, n::usize);
+    if (msg != nil) { ret R.err[bool, str](msg); }
+    ret R.ok[bool, str](true);
+}
+
+# the diagnostic for one Input that a vertex stage and a fragment stage both reach
+# and that cannot be decorated to satisfy both
+# ---
+# e:  the emission state
+# gi: the IR global index
+# ret: the composed diagnostic
+fun flat_conflict(e: *Emit, gi: u32) str {
+    val g: *ir.Global = ?e.ir.globals[gi];
+    val r: R.Result[str, str] = format.sprint(e.alloc,
+        "this `#[input({})]` variable, {}, is read by a vertex stage and by a fragment stage, and no SPIR-V module serves both: a fragment stage's integer or 64-bit input MUST carry a Flat decoration because such a value cannot be interpolated, and a vertex stage's input must NOT carry one. declare two variables. the two are different things anyway - a vertex stage's input is a vertex attribute, and a fragment stage's is the interpolated output of the stage before it",
+        g.iface_a, ir_type_spelling(?e.ir.types, e.alloc, g.ty));
+    if (R.is_err[str, str](r)) {
+        ret "an integer or 64-bit `#[input(...)]` cannot be read by a vertex stage and a fragment stage at once: the fragment stage requires a Flat decoration and the vertex stage forbids one";
+    }
+    ret R.unwrap_ok[str, str](r);
+}
+
+# the diagnostic for a Location span that overlaps an earlier variable's, or nil
+#
+# Only globals BEFORE `gi` are compared, so one pair reports once. The comparison is
+# restricted to the same interface role and the same entry point's reachable set,
+# which is what makes a vertex stage's input at location 0 and a fragment stage's
+# input at location 0 two separate assignments rather than a collision.
+# ---
+# e:  the emission state
+# fx: the entry point's IR function index
+# gi: the global being placed
+# ret: nil when the span is free, or the composed diagnostic
+fun location_overlap(e: *Emit, fx: u32, gi: u32) str {
+    val g: *ir.Global = ?e.ir.globals[gi];
+    val lo: u32 = g.iface_a;
+    val span: u32 = location_span(e, g.ty);
+    var j: u32 = 0;
+    for (j < gi) {
+        val o: *ir.Global = ?e.ir.globals[j];
+        if (o.iface != g.iface) { j = j + 1; cnt; }
+        if (e.gslot[j] == 0 || !uses_iface(e, fx, e.gslot[j] - 1)) { j = j + 1; cnt; }
+        val olo: u32 = o.iface_a;
+        val ospan: u32 = location_span(e, o.ty);
+        if (lo < olo + ospan && olo < lo + span) {
+            var what: str = "input";
+            if (g.iface == ir.IFACE_OUTPUT) { what = "output"; }
+            # named by the decorator the author wrote rather than by the variable's
+            # symbol: IR keeps a global's mangled linkage name and no source
+            # spelling, and a mangled name in a diagnostic points nowhere.
+            val fr: R.Result[str, str] = format.sprint(e.alloc,
+                "two `#[{}(...)]` variables overlap in the stage `{}`: `#[{}({})]`, {}, occupies {} location(s) and so runs through location {}, and `#[{}({})]`, {}, starts inside it. a type wider than one location consumes the ones that follow it, so the numbers an author writes have to leave room for the type",
+                what, ir_fn_spelling(e, fx), what, olo,
+                ir_type_spelling(?e.ir.types, e.alloc, o.ty), ospan, olo + ospan - 1,
+                what, lo, ir_type_spelling(?e.ir.types, e.alloc, g.ty));
+            if (R.is_err[str, str](fr)) {
+                ret "two shader interface variables occupy the same location: a type wider than one location consumes the ones that follow it";
+            }
+            ret R.unwrap_ok[str, str](fr);
+        }
+        j = j + 1;
+    }
+    ret nil;
+}
+
+# how many interface locations a type consumes
+#
+# One location is four 32-bit components. A scalar or a vector of 32-bit-or-narrower
+# components fits in one; a 64-bit one takes a location per 16 bytes, so `f64x3`
+# takes two. An aggregate consumes the sum of what its members consume, and an array
+# its element's span times its length, since the flattening is by member and not by
+# byte.
+# ---
+# e:  the emission state
+# id: the interface variable's IR type
+# ret: the number of locations, at least 1
+fun location_span(e: *Emit, id: type.IrTypeId) u32 {
+    val opt: O.Option[*type.IrType] = type.get(?e.ir.types, id);
+    if (O.is_none[*type.IrType](opt)) { ret 1; }
+    val t: *type.IrType = O.unwrap[*type.IrType](opt);
+    if (t.kind == type.IRT_STRUCT) {
+        var total: u32 = 0;
+        var i: u32 = 0;
+        for (i < t.data.struct_.field_count) {
+            total = total + location_span(e, t.data.struct_.fields[i]);
+            i = i + 1;
+        }
+        if (total == 0) { ret 1; }
+        ret total;
+    }
+    if (t.kind == type.IRT_ARRAY) {
+        val es: u32 = location_span(e, t.data.array_.element);
+        if (t.data.array_.count == 0) { ret 1; }
+        ret es * t.data.array_.count;
+    }
+    val bytes: u32 = type.byte_size(?e.ir.types, id, e.tgt);
+    if (bytes <= 16) { ret 1; }
+    ret (bytes + 15) / 16;
+}
+
+# whether a fragment-stage Input of this type must carry a Flat decoration
+#
+# The rule is about the ELEMENT: an integer of any width, and a 64-bit float,
+# cannot be interpolated, and a vector of either inherits that. A 32-bit float is
+# the only interpolable element there is.
+# ---
+# tt: the IR type table
+# id: the interface variable's IR type
+# ret: true when Flat is required
+fun needs_flat(tt: *type.IrTypeTable, id: type.IrTypeId) bool {
+    var lanes: u32     = 0;
+    var bits: u32      = 0;
+    var is_float: bool = false;
+    if (!ir_scalar_shape(tt, id, ?lanes, ?bits, ?is_float)) { ret false; }
+    if (!is_float) { ret true; }
+    ret bits == 64;
+}
+
+# emit the operand-less OpDecorate Flat
+# ---
+# e:      the emission state
+# target: the variable id being decorated
+fun decorate_flat(e: *Emit, target: u32) {
+    var ops: [2]u32;
+    ops[0] = target; ops[1] = spirv.DECOR_FLAT;
+    spirv.inst(e.b, ?e.b.decorations, spirv.OP_DECORATE, ?ops[0], 2);
+}
+
+# an IR function's source name, for a diagnostic
+#
+# `disp` is the bare source spelling and `name` is the mangled linkage symbol. A
+# diagnostic reads at the source, so `disp` is preferred and the mangled form is
+# the fallback for a synthesized function that has no source spelling.
+# ---
+# e:  the emission state
+# ix: the IR function index
+# ret: the source name, or a placeholder when it is not resolvable
+fun ir_fn_spelling(e: *Emit, ix: u32) str {
+    if (ix >= e.ir.function_len) { ret "<unknown function>"; }
+    val fn: *ir.Function = ?e.ir.functions[ix];
+    if (fn.disp != intern.STR_NIL) {
+        val d: O.Option[str] = intern.lookup(e.interner, fn.disp);
+        if (O.is_some[str](d)) { ret O.unwrap[str](d); }
+    }
+    val o: O.Option[str] = intern.lookup(e.interner, fn.name);
+    if (O.is_none[str](o)) { ret "<unknown function>"; }
+    ret O.unwrap[str](o);
 }
 
 # emit a one-operand OpDecorate
@@ -964,7 +1608,9 @@ fun emit_function(e: *Emit, mf: *mir.MirFunction) R.Result[bool, str] {
         ret unsupported(e, "unsupported return type in the SPIR-V target");
     }
     var ptypes: [16]u32;
-    if (irfn.param_count > 16) { ret unsupported(e, "more than 16 parameters is not supported by the SPIR-V target"); }
+    if (irfn.param_count > types.MAX_FN_PARAMS) {
+        ret unsupported(e, "more than 16 parameters is not supported by the SPIR-V target");
+    }
     var pi: u32 = 0;
     for (pi < irfn.param_count) {
         val pt: u32 = ir_value_spv_type(e, irfn.params[pi].ty);
@@ -975,6 +1621,12 @@ fun emit_function(e: *Emit, mf: *mir.MirFunction) R.Result[bool, str] {
         pi = pi + 1;
     }
     val fnty: u32 = types.type_fn(e.tt, ret_ty, ?ptypes[0], irfn.param_count);
+    # a 0 here is a signature the table could not build. It must be reported, not
+    # passed on: `OpFunction` naming type id 0 is the reserved never-valid id, and
+    # the module leaves with no diagnostic and fails in a validator (#2748).
+    if (fnty == 0) {
+        ret unsupported(e, "this signature has no SPIR-V function type in the SPIR-V target");
+    }
 
     val fn_id: u32 = e.fn_ids[fix];
 
@@ -3288,6 +3940,50 @@ test "mach.lang.target.isa.spirv.emit:ir_type_spelling" {
     if (!str_equals(ir_type_spelling(?tt, ?alloc, i32t), "`i32` / `u32`"))       { type.dnit(?tt); ret 1; }
     if (!str_equals(ir_type_spelling(?tt, ?alloc, v3i), "`i32x3` / `u32x3`"))    { type.dnit(?tt); ret 1; }
     if (!str_equals(ir_type_spelling(?tt, ?alloc, arr), "an array"))  { type.dnit(?tt); ret 1; }
+
+    type.dnit(?tt);
+    ret 0;
+}
+
+# the Flat requirement is decided on the ELEMENT class, at every width
+#
+# The rule Vulkan states is that a fragment stage's Input cannot be interpolated
+# unless it is a 32-bit float, so the answer turns on the element and a vector
+# inherits it. The table is asserted directly because the end-to-end case can only
+# show the types it happens to declare, and the interesting half of this predicate
+# is the types it must answer FALSE for: decorating an `f32` varying Flat is not a
+# harmless over-approximation, it changes how the value is shaded.
+test "mach.lang.target.isa.spirv.emit:flat_element_classes" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var tt: type.IrTypeTable;
+    if (O.is_some[str](type.init(?tt, ?alloc))) { ret 1; }
+
+    val f32t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](type.intern_float(?tt, 32));
+    val f64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](type.intern_float(?tt, 64));
+    val i32t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](type.intern_int(?tt, 32));
+    val i8t:  type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](type.intern_int(?tt, 8));
+    val v4f:  type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](type.intern_vector(?tt, f32t, 4));
+    val v3i:  type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](type.intern_vector(?tt, i32t, 3));
+    val v2d:  type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](type.intern_vector(?tt, f64t, 2));
+    val arr:  type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](type.intern_array(?tt, f32t, 4));
+
+    # an integer of any width, and a vector of them.
+    if (!needs_flat(?tt, i32t)) { type.dnit(?tt); ret 1; }
+    if (!needs_flat(?tt, i8t))  { type.dnit(?tt); ret 1; }
+    if (!needs_flat(?tt, v3i))  { type.dnit(?tt); ret 1; }
+
+    # a 64-bit float, and a vector of them.
+    if (!needs_flat(?tt, f64t)) { type.dnit(?tt); ret 1; }
+    if (!needs_flat(?tt, v2d))  { type.dnit(?tt); ret 1; }
+
+    # a 32-bit float is the only interpolable element there is.
+    if (needs_flat(?tt, f32t)) { type.dnit(?tt); ret 1; }
+    if (needs_flat(?tt, v4f))  { type.dnit(?tt); ret 1; }
+
+    # an aggregate has no single element class, so it answers false rather than a
+    # shape of its own; a varying of one is a separate refusal.
+    if (needs_flat(?tt, arr)) { type.dnit(?tt); ret 1; }
 
     type.dnit(?tt);
     ret 0;
