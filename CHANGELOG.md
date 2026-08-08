@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### A wide global is executed and value-checked on the rv32 reference core (#2883)
+The rv32 harness loaded `.text` alone out of the unlinked object image, so no program touching a global could be executed: `.data` was not in the core's memory at all, and a global reference on rv32 is an `auipc` / `lw` pair against `%pcrel_hi` and `%pcrel_lo` that the linker patches, so even with the data present the address would have been zero. That is why the #2867 repair - one native access per lane at successive addends on the same symbol - had no in-tree value check and had to be verified against an external interpreter.
+
+The harness now runs the build through the shipping linker, the same call `mach build` makes for a flat-image format, and loads the whole linked image. The probe is entered at the image base, where a flat image begins execution and where the linker places the entry symbol, so the harness still lays out the arguments itself rather than reaching the function under test through a compiled wrapper that would agree with the compiler by construction. The image loads at the harness's own base rather than the link's, which works because rv32 reaches both code and data pc-relatively.
+
+A wide global is loaded, stored, added and subtracted over the lane-crossing value sweep, with every answer checked against host arithmetic, and with the 32-bit sign boundary held in a second global. The store is checked three ways so a wrong lane addend cannot cancel itself out: read back in the same call, read again in a later call so the value had to reach memory, and followed by a re-read of a neighbouring global that the store must not have damaged.
+
+The remaining eleven probes still run from the unlinked `.text`, because a flat image carries no symbol table and so admits exactly one entry point. That is #2892.
+
 #### An `i64` global compiles on rv32 instead of crashing the compiler (#2867)
 A wide global feeding wide arithmetic on riscv32 killed the compiler with SIGSEGV and no diagnostic, and the same construct without the arithmetic produced a refusal. Both came from one place. Lowering folds a global straight into the access as a symbol operand, so a `MIR_LOAD` or `MIR_STORE` on one carries no memory operand at all, while `legalize` entered its memory path on the opcode alone and then indexed the memory operand it assumed was there. The index was `-1`: one shape read a wild pointer and faulted, the other read one slot past the operand array and refused off whatever it found. The refusal was never a decision.
 
