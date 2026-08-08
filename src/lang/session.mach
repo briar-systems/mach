@@ -52,6 +52,30 @@ pub rec Overlay {
     text: str;
 }
 
+# one logical library name the effective link set provides, and how it provides it
+#
+# The effective link set is the artifact's own `[link.X]` entries, the entries
+# cascaded from dependencies' `export = true`, and the request's own `-l` / path
+# facts. The driver enumerates that set exactly once, when it assembles the link
+# inputs, and records each entry's logical name here. The linker reads it - it is
+# the only account of the whole link the linker has: the dynamic dependency array
+# it is handed carries loader names for the dynamic half and says nothing at all
+# about the static half, so `library` is the one identity that spans both.
+#
+# `is_static` is what makes the record worth keeping. A static input DEFINES
+# symbols; a dynamic one IMPORTS them. An import pinned to a static entry can
+# therefore never bind, and saying so is a different fact from the entry being
+# absent - the two were previously indistinguishable, and the linker reported the
+# second when the first was true (#2800).
+# ---
+# name:      the entry's logical `library` name, as `#[library("...")]` spells it
+# is_static: the entry resolved to an on-disk object/archive rather than a
+#            loader dependency
+pub rec LinkProvider {
+    name:      intern.StrId;
+    is_static: bool;
+}
+
 # top-level driver state shared across every compilation phase
 #
 # Built once over an Allocator and threaded through the pipeline as `*Session`.
@@ -88,6 +112,10 @@ pub rec Overlay {
 #                    compose without either owning the other's storage
 # import_libraries: link-name StrId -> the library StrId an import is pinned to, the
 #                    link-name-keyed projection of export_libraries the linker consults
+# link_providers:   the effective link set's logical library names in link order, each
+#                    marked static or dynamic. the driver's single enumeration of the
+#                    link (own entries, cascaded exports, request facts) records it and
+#                    the linker reads it; see LinkProvider
 # module_sema:      ModuleId -> its *sema.SemaResult, stored opaque as `ptr` to keep
 #                    this leaf module free of a front-end import cycle
 # module_resolve:   ModuleId -> its *resolve.ResolveResult, stored opaque like module_sema
@@ -118,6 +146,10 @@ pub rec Session {
     type_aligns:      map.Map[u32, u32];
     type_packed:      map.Map[u32, u32];
     import_libraries: map.Map[intern.StrId, intern.StrId];
+
+    link_providers:     *LinkProvider;
+    link_provider_len:  u32;
+    link_provider_cap:  u32;
 
     module_sema:     map.Map[module.ModuleId, ptr];
     module_resolve:  map.Map[module.ModuleId, ptr];
@@ -188,6 +220,9 @@ pub fun init(alloc: *A.Allocator) R.Result[Session, str] {
     s.type_aligns      = map.init[u32, u32](alloc, map.hash_u32, map.eq_u32);
     s.type_packed      = map.init[u32, u32](alloc, map.hash_u32, map.eq_u32);
     s.import_libraries = map.init[intern.StrId, intern.StrId](alloc, map.hash_u32, map.eq_u32);
+    s.link_providers     = nil;
+    s.link_provider_len  = 0;
+    s.link_provider_cap  = 0;
     s.module_sema      = map.init[module.ModuleId, ptr](alloc, map.hash_u32, map.eq_u32);
     s.module_resolve   = map.init[module.ModuleId, ptr](alloc, map.hash_u32, map.eq_u32);
     s.module_comptime  = map.init[module.ModuleId, ptr](alloc, map.hash_u32, map.eq_u32);
@@ -311,6 +346,7 @@ pub fun dnit(s: *Session) {
     map.dnit[u32, u32](?s.type_aligns);
     map.dnit[u32, u32](?s.type_packed);
     map.dnit[intern.StrId, intern.StrId](?s.import_libraries);
+    reset_link_providers(s);
     map.dnit[module.ModuleId, ptr](?s.module_sema);
     map.dnit[module.ModuleId, ptr](?s.module_resolve);
     map.dnit[module.ModuleId, ptr](?s.module_comptime);
@@ -360,6 +396,7 @@ pub fun reset_module_registry(s: *Session) {
     map.clear[u32, u32](?s.type_aligns);
     map.clear[u32, u32](?s.type_packed);
     map.clear[intern.StrId, intern.StrId](?s.import_libraries);
+    reset_link_providers(s);
     map.clear[module.ModuleId, ptr](?s.module_sema);
     map.clear[module.ModuleId, ptr](?s.module_resolve);
     map.clear[module.ModuleId, ptr](?s.module_comptime);
@@ -683,6 +720,108 @@ pub fun import_library(s: *Session, name: intern.StrId) O.Option[intern.StrId] {
     ret O.none[intern.StrId]();
 }
 
+# seed capacity of the link-provider array, doubled on demand from there
+val LINK_PROVIDER_SEED_CAP: u32 = 8;
+
+# record that the effective link set provides logical library `name`, static or not
+#
+# Called by the driver's single walk over the link inputs, once per selected
+# entry, in link order - so the array reads back as the link's own account of
+# itself and a diagnostic built from it is stable across runs.
+#
+# A name already present is not appended twice. When the same logical name arrives
+# both static and dynamic (a project that ships a vendored archive and also names
+# the system shared library under one `library` value), the DYNAMIC registration
+# wins: an import pinned to that name can bind, which is the fact a caller asks
+# this registry about. `is_static` therefore means "static and nothing else".
+# ---
+# s:         the session
+# name:      the entry's logical `library` name
+# is_static: the entry resolved to an on-disk object/archive
+# ret:       true on success, or an allocation error growing the array
+pub fun register_link_provider(s: *Session, name: intern.StrId, is_static: bool) R.Result[bool, str] {
+    if (name == intern.STR_NIL) { ret R.ok[bool, str](true); }
+
+    var i: u32 = 0;
+    for (i < s.link_provider_len) {
+        if (s.link_providers[i].name == name) {
+            if (!is_static) { s.link_providers[i].is_static = false; }
+            ret R.ok[bool, str](true);
+        }
+        i = i + 1;
+    }
+
+    if (s.link_provider_len == s.link_provider_cap) {
+        var next: u32 = LINK_PROVIDER_SEED_CAP;
+        if (s.link_provider_cap > 0) { next = s.link_provider_cap * 2; }
+        if (s.link_providers == nil) {
+            val ar: R.Result[*LinkProvider, str] = A.allocate[LinkProvider](s.alloc, next::usize);
+            if (R.is_err[*LinkProvider, str](ar)) {
+                ret R.err[bool, str](R.unwrap_err[*LinkProvider, str](ar));
+            }
+            s.link_providers = R.unwrap_ok[*LinkProvider, str](ar);
+        }
+        or {
+            val gr: R.Result[*LinkProvider, str] = A.reallocate[LinkProvider](
+                s.alloc, s.link_providers, s.link_provider_cap::usize, next::usize);
+            if (R.is_err[*LinkProvider, str](gr)) {
+                ret R.err[bool, str](R.unwrap_err[*LinkProvider, str](gr));
+            }
+            s.link_providers = R.unwrap_ok[*LinkProvider, str](gr);
+        }
+        s.link_provider_cap = next;
+    }
+
+    s.link_providers[s.link_provider_len].name      = name;
+    s.link_providers[s.link_provider_len].is_static = is_static;
+    s.link_provider_len = s.link_provider_len + 1;
+    ret R.ok[bool, str](true);
+}
+
+# how the effective link set provides logical library `name`, or none when the
+# link does not provide it at all
+# ---
+# s:    the session
+# name: the logical library name a `#[library("...")]` or a manifest claim named
+# ret:  some(the provider record) when the link provides it, none otherwise
+pub fun link_provider(s: *Session, name: intern.StrId) O.Option[LinkProvider] {
+    var i: u32 = 0;
+    for (i < s.link_provider_len) {
+        if (s.link_providers[i].name == name) {
+            ret O.some[LinkProvider](s.link_providers[i]);
+        }
+        i = i + 1;
+    }
+    ret O.none[LinkProvider]();
+}
+
+# the effective link set's logical library names, in link order
+# ---
+# s:   the session
+# ret: the provider array (nil when the link names none) and its length
+pub fun link_providers(s: *Session) *LinkProvider { ret s.link_providers; }
+
+# number of logical library names the effective link set provides
+pub fun link_provider_count(s: *Session) u32 { ret s.link_provider_len; }
+
+# release the link-provider array and empty the registry
+#
+# The array holds interned ids and owns no string storage, so releasing it frees
+# everything it holds.
+#
+# The registry describes exactly ONE link, not one build: a session that links
+# several artifacts (a multi-artifact build, `mach test`) must not answer a later
+# link with an earlier one's set, so the driver resets it as it begins assembling
+# each link's inputs, and teardown resets it again.
+pub fun reset_link_providers(s: *Session) {
+    if (s.link_providers != nil && s.link_provider_cap > 0) {
+        A.deallocate[LinkProvider](s.alloc, s.link_providers, s.link_provider_cap::usize);
+    }
+    s.link_providers    = nil;
+    s.link_provider_len = 0;
+    s.link_provider_cap = 0;
+}
+
 # record module `mid`'s `*sema.SemaResult` (passed as an opaque `ptr`)
 #
 # Lets the back-end monomorphizer lower a generic template body against the
@@ -948,6 +1087,95 @@ test "mach.lang.session.overlay:set_get_replace_clear" {
 
     # dnit frees the remaining overlay's owned strings; a clean teardown is the
     # observable (the page allocator faults a leak/double-free).
+    dnit(?s);
+    ret bad;
+}
+
+# the link-provider registry keeps link order, does not double-register a name,
+# lets a dynamic registration upgrade a static one, and empties on reset (#2800)
+#
+# The upgrade rule is the one with teeth: a project that ships a vendored archive
+# AND names the system shared library under one logical value provides that name
+# both ways, and an import pinned to it CAN bind. Answering `is_static` there would
+# refuse a link that works, which is the opposite of the bug being fixed.
+test "mach.lang.session.link_provider:order_dedup_upgrade_reset" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[Session, str] = init(?alloc);
+    if (R.is_err[Session, str](sr)) { ret 1; }
+    var s: Session = R.unwrap_ok[Session, str](sr);
+
+    var bad: i32 = 0;
+
+    val a_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, "alpha");
+    val b_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, "beta");
+    val c_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, "gamma");
+    if (R.is_err[intern.StrId, str](a_r) || R.is_err[intern.StrId, str](b_r)
+        || R.is_err[intern.StrId, str](c_r)) { dnit(?s); ret 1; }
+    val a: intern.StrId = R.unwrap_ok[intern.StrId, str](a_r);
+    val b: intern.StrId = R.unwrap_ok[intern.StrId, str](b_r);
+    val c: intern.StrId = R.unwrap_ok[intern.StrId, str](c_r);
+
+    # an empty registry provides nothing.
+    if (link_provider_count(?s) != 0)               { bad = 1; }
+    if (O.is_some[LinkProvider](link_provider(?s, a))) { bad = 1; }
+
+    # STR_NIL is not a name; registering it records nothing.
+    if (R.is_err[bool, str](register_link_provider(?s, intern.STR_NIL, true))) { dnit(?s); ret 1; }
+    if (link_provider_count(?s) != 0) { bad = 1; }
+
+    # two entries, recorded in the order the link names them.
+    if (R.is_err[bool, str](register_link_provider(?s, a, true)))  { dnit(?s); ret 1; }
+    if (R.is_err[bool, str](register_link_provider(?s, b, false))) { dnit(?s); ret 1; }
+    if (link_provider_count(?s) != 2) { bad = 1; }
+    if (link_providers(?s)[0].name != a || !link_providers(?s)[0].is_static) { bad = 1; }
+    if (link_providers(?s)[1].name != b ||  link_providers(?s)[1].is_static) { bad = 1; }
+
+    # a repeat of a name already present adds no slot and does not downgrade it.
+    if (R.is_err[bool, str](register_link_provider(?s, b, true))) { dnit(?s); ret 1; }
+    if (link_provider_count(?s) != 2) { bad = 1; }
+    if (link_providers(?s)[1].is_static) { bad = 1; }
+
+    # a dynamic registration upgrades a name first seen as static: the link can
+    # bind an import pinned to it, so it must not read back as static-only.
+    if (R.is_err[bool, str](register_link_provider(?s, a, false))) { dnit(?s); ret 1; }
+    if (link_provider_count(?s) != 2) { bad = 1; }
+    val pa: O.Option[LinkProvider] = link_provider(?s, a);
+    if (O.is_none[LinkProvider](pa) || O.unwrap[LinkProvider](pa).is_static) { bad = 1; }
+
+    # a name the link never registered is not provided.
+    if (O.is_some[LinkProvider](link_provider(?s, c))) { bad = 1; }
+
+    # growth past the seed capacity keeps every earlier entry addressable: a link
+    # with more entries than the seed must not lose the ones recorded first.
+    if (R.is_err[bool, str](register_link_provider(?s, c, true)))     { dnit(?s); ret 1; }
+    var fill: [3]u8;
+    fill[0] = 'd';
+    fill[2] = 0;
+    var i: u32 = 0;
+    for (i < 8) {
+        fill[1] = ('0'::u32 + i)::u8;
+        val nr: R.Result[intern.StrId, str] = intern.intern(?s.interner, (?fill[0])::str);
+        if (R.is_err[intern.StrId, str](nr)) { dnit(?s); ret 1; }
+        if (R.is_err[bool, str](register_link_provider(
+                ?s, R.unwrap_ok[intern.StrId, str](nr), true))) { dnit(?s); ret 1; }
+        i = i + 1;
+    }
+    if (link_provider_count(?s) != 11) { bad = 1; }
+    if (link_providers(?s)[0].name != a) { bad = 1; }
+    val pc: O.Option[LinkProvider] = link_provider(?s, c);
+    if (O.is_none[LinkProvider](pc) || !O.unwrap[LinkProvider](pc).is_static) { bad = 1; }
+
+    # reset empties it: the registry describes ONE link, and the next link in the
+    # same session must not be answered from this one's set.
+    reset_link_providers(?s);
+    if (link_provider_count(?s) != 0)                  { bad = 1; }
+    if (O.is_some[LinkProvider](link_provider(?s, a))) { bad = 1; }
+
+    # re-registering after a reset works against a freshly grown array.
+    if (R.is_err[bool, str](register_link_provider(?s, c, false))) { dnit(?s); ret 1; }
+    if (link_provider_count(?s) != 1) { bad = 1; }
+
     dnit(?s);
     ret bad;
 }

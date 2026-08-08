@@ -927,7 +927,7 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     # caller-owned storage, but the result is a VALUE, so the storage ADDRESS rides its
     # own vreg and the value is loaded back out after the call - the result vreg must
     # hold the scalar, not a pointer to it (#2195). Every wide-native convention reaches
-    # CLASS_SRET only for an aggregate (lp64 also for a vector, covered by `ret_mem`),
+    # CLASS_SRET only for an aggregate (the RISC-V family also for a vector, covered by `ret_mem`),
     # so this is false there and the lowering is byte-identical.
     val ret_sret_scalar: bool = rslot.class == abi.CLASS_SRET && !ret_mem;
 
@@ -1012,10 +1012,19 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
             # never as an HFA (members 0), and with no flattened-aggregate descriptor
             # (agg_none): the va_arg read path walks the GP register-save / overflow
             # areas, so the caller and callee stay consistent. SSE-eightbyte, HFA
-            # V-register, and lp64d fa-register passing are for fixed parameters and
+            # V-register, and hard-float fa-register passing are for fixed parameters and
             # returns (the C-FFI boundary), not the varargs tail. is_ext still applies:
             # MS passes an __m128 vararg by reference too, so a tail vector at an ext
             # boundary marshals exactly like a fixed one (#2058).
+            #
+            # THE SCALAR FLOAT FLAG `afl` IS PASSED THROUGH UNCHANGED, which is right
+            # for every convention that reaches here and wrong for one that does not.
+            # Under the RISC-V hard-float members an unnamed float is passed AS IF
+            # INTEGER, unlike a named one -- so a tail float classified here would take
+            # an fa register the callee never reads. That rule is not implemented, and
+            # the RISC-V family accordingly REFUSES a C-variadic call outright rather
+            # than placing one wrongly: `abi_va_model` errors on its nil `va_model`
+            # before this loop's result can be emitted (#2777).
             slot = classify_arg(pidx::i32, asz, aal, afl, 0, aag, avec, is_ext, gp_used, fp_used, 0, 0, abi.agg_none());
             # a platform that passes the WHOLE variadic tail on the stack (Apple arm64,
             # and only there) overrides the convention's placement here: the classifier
@@ -1390,7 +1399,7 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
         ret context.emit_fmov(ctx, mb, mir.op_preg(slot.reg::u32), argop, R.unwrap_ok[u8, str](fw));
     }
     # single GP register scalar argument. a 32-bit value rides a width-4 move so the
-    # backend re-extends it to the register width by its own convention (RV64 lp64
+    # backend re-extends it to the register width by its own convention (the RV64 lp64 family
     # sign-extends a 32-bit register).
     ret context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg::u32), argop, scalar_reg_move_width(ctx.tgt.model.gpr_width, size));
 }
@@ -1462,12 +1471,12 @@ fun spill_vector_to_temp(ctx: *context.LowerCtx, mb: *mir.MirBlock, val_op: mir.
 #
 # THIS ANSWERS FOR ONE REGISTER'S WORTH, AND THAT IS THE WHOLE CONTRACT. A vector
 # wider than the register is refused here, and it is refused because the question is
-# malformed for it rather than because the shape is illegal: an over-width vector
-# realizes as a SPLIT, and a split is already a multi-piece `abi.ParamSlot` that
-# `materialize_pieces` walks - the same mechanism an HFA run and a register-plus-stack
-# aggregate use today. So the extension point for #2727 is each convention's
-# `classify_arg` / `classify_return`, which decide how many pieces a value occupies,
-# and this function is asked once per piece and does not change. Nothing here is
+# malformed for it rather than because the shape is illegal. #2727 answered it where
+# it belongs: each convention's `classify_arg` / `classify_return` gives an
+# over-width vector the MEMORY class, so it arrives as a pointer to its stack image
+# and never asks for a register move width at all. This stays as the backstop for
+# that - a convention that grew a register slot for a shape no register holds would
+# be caught here rather than emitting a move describing half a value. Nothing here is
 # shaped around 12 bytes, around 16, or around "smaller than the register": the
 # quantities are the value's own extent and the target's own register width, which is
 # what a shape neither a multiple nor a divisor of the register (`f32x5`, whose split
@@ -1491,27 +1500,38 @@ fun fp_move_width(ctx: *context.LowerCtx, ty: type.IrTypeId) R.Result[u8, str] {
 }
 
 # capture a value passed / returned in `slot`'s canonical register into `dst` vreg.
-# a vector in a CLASS_FP slot copies at the VECTOR REGISTER's width so the reg-reg move
-# is a MOVAPS / NEON Q move, not a 64-bit MOVSD that drops lanes 2-3 when the vreg does
-# not coalesce onto the incoming register (#2053). every scalar -- GP or float -- keeps
-# the machine-word move it always used, so its codegen is byte-identical.
 #
-# The test is that the value IS a vector, not that it measures 16 bytes: a sub-width
-# vector rides the same whole register and drops the same lanes without it, and an
-# HFA / mixed aggregate that happens to measure 16 never reaches here (it flows by
-# address through `materialize_pieces`).
+# The exact READ twin of `emit_arg_slot`'s register placement, and it takes its width
+# from the same two authorities: a CLASS_FP slot from `fp_move_width` (the VECTOR
+# REGISTER's width for a vector, so the reg-reg move is a MOVAPS / NEON Q move and not
+# a 64-bit MOVSD that drops lanes 2-3 when the vreg does not coalesce onto the incoming
+# register, #2053), and every other slot from `scalar_reg_move_width`. Both are keyed
+# on the VALUE, never on the machine word: the machine word is the width of the
+# REGISTER the value arrives in, which says nothing about how many of its bytes are the
+# value. An f32 arriving in a GP register under RV64 lp64 is what makes the difference
+# observable -- a width-8 capture selects `fmv.d.x`, which moves all 64 raw bits into
+# the float register and so produces a single that is not NaN-boxed, and every
+# subsequent `f`-suffixed operation on it yields NaN (#2777). A width-4 capture selects
+# `fmv.w.x`, which boxes.
+#
+# The vector test is that the value IS a vector, not that it measures 16 bytes: a
+# sub-width vector rides the same whole register and drops the same lanes without it,
+# and an HFA / mixed aggregate that happens to measure 16 never reaches here (it flows
+# by address through `materialize_pieces`).
 fun capture_slot_reg(ctx: *context.LowerCtx, mb: *mir.MirBlock, dst: u32, slot: abi.ParamSlot, ty: type.IrTypeId) R.Result[bool, str] {
-    if (slot.class == abi.CLASS_FP && context.value_is_vector(ctx, ty)) {
+    if (slot.class == abi.CLASS_FP) {
         val fw: R.Result[u8, str] = fp_move_width(ctx, ty);
         if (R.is_err[u8, str](fw)) { ret R.err[bool, str](R.unwrap_err[u8, str](fw)); }
         ret context.emit_fmov(ctx, mb, mir.op_vreg(dst), mir.op_preg(slot.reg::u32), R.unwrap_ok[u8, str](fw));
     }
-    ret context.emit_mov(ctx, mb, mir.op_vreg(dst), mir.op_preg(slot.reg::u32));
+    val size: u64 = type.byte_size(ctx.types, ty, ctx.tgt)::u64;
+    ret context.emit_mov_w(ctx, mb, mir.op_vreg(dst), mir.op_preg(slot.reg::u32),
+                           scalar_reg_move_width(ctx.tgt.model.gpr_width, size));
 }
 
 # the move width for materializing a scalar GP value into its argument / return
 # register. a 32-bit value rides a width-4 move so a backend can re-extend it to the
-# register width by its own convention -- RV64 lp64 holds a 32-bit register
+# register width by its own convention -- the RV64 lp64 family holds a 32-bit register
 # sign-extended, so a directly materialized i32 constant must be re-signed there, and
 # the carried width is what lets it. a scalar WIDER than the machine word rides its
 # own size: on a target whose register is narrower than a scalar (the 8-bit mos6502)
@@ -1902,7 +1922,7 @@ pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.
         # no register wide enough for it, mos6502's every-return-past-one-byte - is a
         # VALUE in a register, so it is STORED at the scalar's own width: memcpy'ing from
         # it would dereference the value as an address (#2195). Every wide-native
-        # convention reaches CLASS_SRET only for an aggregate (lp64 also for a vector),
+        # convention reaches CLASS_SRET only for an aggregate (the RISC-V family also for a vector),
         # so the scalar arm is unreachable there and this is byte-identical.
         if (rag || context.value_is_vector(ctx, rt)) {
             val cr: R.Result[bool, str] = context.copy_aggregate(ctx, mb, mir.op_mem_value(ctx.sret_vreg, 0), rvop, rsz);
@@ -1944,7 +1964,7 @@ pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.
         if (R.is_err[bool, str](mr)) { ret mr; }
     } or (slot.reg >= 0) {
         # scalar GP return: a 32-bit value rides a width-4 move so the backend
-        # re-extends it to the register width by its own convention (RV64 lp64
+        # re-extends it to the register width by its own convention (the RV64 lp64 family
         # sign-extends a 32-bit register).
         val mr: R.Result[bool, str] = context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg::u32), rvop, scalar_reg_move_width(ctx.tgt.model.gpr_width, rsz));
         if (R.is_err[bool, str](mr)) { ret mr; }
@@ -1974,6 +1994,11 @@ fun emit_bare_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock) R.Result[bool, str]
 # stack parameter read one byte. Both halves are pinned at an 8-byte machine word too,
 # where the rule is dead and the widths are exactly what they always were - that column
 # is the byte-identity of every wide-native target.
+#
+# `capture_slot_reg` reads the SAME function for the incoming direction, so the width-4
+# entry is what makes a 4-byte float arriving in a 64-bit GP argument register a 4-byte
+# capture: on RV64 that is the difference between the NaN-boxing `fmv.w.x` and the raw
+# `fmv.d.x` (#2777), and the size-4 answer must NOT depend on the machine word.
 test "mach.lang.be.codegen.mir.abi:scalar_move_widths" {
     # an 8-byte machine word: no scalar exceeds it, so only the 32-bit re-extension
     # case moves the register width and the memory side is the machine word throughout.
@@ -2137,7 +2162,8 @@ test "mach.lang.be.codegen.mir.abi.stack_only_tail_slot:moves_placement_not_form
 # tests the accessor's presence, so the ABI-surface test wires a real signature
 # rather than erasing an unrelated function pointer
 fun probe_arg(index: i32, size: u64, align: u64, is_float: bool, fp_eightbytes: u8,
-              is_aggregate: bool, is_vector: bool, is_ext: bool, gp_used: i32, fp_used: i32,
+              is_aggregate: bool, is_vector: bool, is_ext: bool, is_variadic: bool,
+              gp_used: i32, fp_used: i32,
               hfa_members: u8, hfa_elem: u8, agg: abi.AggLayout) abi.ParamSlot {
     ret abi.make_slot(abi.CLASS_GP, index, -1, 0, size);
 }
@@ -2167,6 +2193,7 @@ test "mach.lang.be.codegen.mir.abi.require_abi:variadic_facts_are_not_call_preco
         0, 0, 0,
         -1, false,
         false, false,
+        0,
         nil
     );
 

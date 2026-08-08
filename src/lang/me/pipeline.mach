@@ -256,14 +256,41 @@ pub fun run(m: *ir.Module, tgt: *target.Target, level: OptLevel, verify_ir: bool
         if (R.is_err[bool, str](res_req)) { ret res_req; }
     }
 
+    # PLACEMENT FIRST (#2727): every vector value this target cannot hold in a vector
+    # register - all of them where there is no vector unit, the over-width shapes
+    # where there is one - becomes a stack slot with per-lane accesses, so no vector
+    # the back end cannot place survives. Runs after all optimization, so it legalizes
+    # the final IR, and the verifier re-checks.
+    #
+    # AHEAD OF THE TWO OPERATOR STAGES BELOW, and the reason is the amount of work
+    # rather than correctness. Both of those rewrite an operator while leaving its
+    # operands and result as vector VALUES; reached first by an over-width shape they
+    # expand it into lane access against a value no register holds, and this stage
+    # then takes that apart again into the memory image it was always going to be -
+    # correct, and enormously more code. MEASURED on `@d = @a + @b` at `i32x8`,
+    # x86-64, release: 169 instructions and a 128-byte frame with this stage first,
+    # 871 instructions and a 1072-byte frame with it last. Both produce the same lanes
+    # on all three legs, so this is not a correctness gate and should not be described
+    # as one. It does leave each stage below with a simpler contract: after this,
+    # every vector in the module fits a register by construction.
+    #
+    # Runs under `require` too, unlike the two below: the lever governs which
+    # OPERATORS may realize as scalar code, and a value's placement is not a choice a
+    # target offers. A vector too wide for a register that is merely copied has no
+    # operator for the lever to refuse and still has to be placed somewhere.
+    val res_place: R.Result[bool, str] = scalarize.run(m, tgt);
+    if (R.is_err[bool, str](res_place)) { ret res_place; }
+    val res_verify_place: R.Result[bool, str] = verify_stage(m, true, ?vc);
+    if (R.is_err[bool, str](res_verify_place)) { ret res_verify_place; }
+
     # realize the operators this target has no packed form for, on a target that DOES
     # have a vector unit (#2726). Vector values stay vectors and keep their packed
     # operators; only the gap operators become per-lane work, so `i32x4 + i32x4` still
     # selects PADDD next to an `i32x4 * i32x4` that does not.
     #
-    # A SIMD-incapable target skips this: `scalarize.run` below rewrites every vector
-    # value and operator, which subsumes it, and doing both would expand the gap ops
-    # twice.
+    # A SIMD-incapable target skips this: the placement stage above has already
+    # rewritten every vector value and operator there, which subsumes it, and doing
+    # both would expand the gap ops twice.
     if (tgt.model.has_v128 && !simd_require) {
         val res_gap: R.Result[bool, str] = scalarize.expand_gap_ops(m, tgt);
         if (R.is_err[bool, str](res_gap)) { ret res_gap; }
@@ -282,23 +309,6 @@ pub fun run(m: *ir.Module, tgt: *target.Target, level: OptLevel, verify_ir: bool
     if (!tgt.model.has_lane_ops && tgt.model.has_v128) {
         val res_verify_lanes: R.Result[bool, str] = verify_stage(m, true, ?vc);
         if (R.is_err[bool, str](res_verify_lanes)) { ret res_verify_lanes; }
-    }
-
-    # whole-module scalarization on a SIMD-incapable target (#2016): every IRT_VECTOR
-    # value and lane-wise operator becomes a defined per-lane scalar form over 16-byte
-    # stack slots, so no vector survives to MIR selection and the per-target isel guard
-    # stays a loud backstop. Runs last, after all optimization, so it legalizes the
-    # final IR; the verifier re-checks.
-    #
-    # The `require` posture has already refused above, so reaching here under it means
-    # nothing scalarizes - but an incapable target scalarizes EVERY operator, so
-    # `require` cannot reach here with a vector operator at all. A no-op on a capable
-    # target, where the gap expansion above is the whole of the scalar realization.
-    if (!tgt.model.has_v128 && !simd_require) {
-        val res_scalarize: R.Result[bool, str] = scalarize.run(m, tgt);
-        if (R.is_err[bool, str](res_scalarize)) { ret res_scalarize; }
-        val res_verify_scalarize: R.Result[bool, str] = verify_stage(m, true, ?vc);
-        if (R.is_err[bool, str](res_verify_scalarize)) { ret res_verify_scalarize; }
     }
 
     # exit verification: full invariant check before the backend takes over.
@@ -345,12 +355,17 @@ fun require_msg(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner, site:
     val on: O.Option[str] = intern.lookup(itn, site.fn_name);
     if (O.is_some[str](on)) { fname = O.unwrap[str](on); }
 
+    # WHICH OF THE TWO CAUSES it was: a missing packed word for the operation, or a
+    # SHAPE past what one packed vector holds. The second covers both ceilings the
+    # authority folds - the register width (`f32x8` on 128 bits, #2727) and a
+    # component count (SPIR-V's four, #2749) - and the message already carries the
+    # lane count and width, so the reader can see which side of the ceiling it is on.
     var why: str = "target has no packed form for this operation at this lane width";
     if (!tgt.model.has_v128) { why = "target has no 128-bit SIMD"; }
     or {
         val cap: u32 = vecform.packed_lanes(tgt, site.lane_bits);
         if (cap != 0 && site.lanes > cap) {
-            why = "target packs no more than the lanes its vector form holds at this lane width";
+            why = "this shape has more lanes than one packed vector holds on this target";
         }
     }
 
@@ -705,7 +720,7 @@ test "mach.lang.me.pipeline.run:simd_require_gate" {
 
     var reg: target.TargetRegistry = target.registry_init();
     if (R.is_err[bool, str](target.register_all(?reg))) { intern.dnit(?itn); ret 1; }
-    val trr: R.Result[resolved.Target, str] = target.select(?reg, "riscv64", "linux", "lp64");
+    val trr: R.Result[resolved.Target, str] = target.select(?reg, "riscv64", "linux", "lp64d");
     if (R.is_err[resolved.Target, str](trr)) { intern.dnit(?itn); ret 1; }
     var rv: resolved.Target = R.unwrap_ok[resolved.Target, str](trr);
 
@@ -776,7 +791,7 @@ test "mach.lang.me.pipeline.run:simd_require_gate" {
     # vector unit. Asserting the aarch64 arm PASSES is what distinguishes a working
     # authority from one that simply refuses everything.
     if (mul_require_refused(?alloc, ?itn, ?reg, "x86_64",  "sysv64") != 1) { code = 1; }
-    if (mul_require_refused(?alloc, ?itn, ?reg, "riscv64", "lp64")   != 1) { code = 1; }
+    if (mul_require_refused(?alloc, ?itn, ?reg, "riscv64", "lp64d")   != 1) { code = 1; }
     if (mul_require_refused(?alloc, ?itn, ?reg, "aarch64", "aapcs64") != 0) { code = 1; }
 
     intern.dnit(?itn);
