@@ -1392,7 +1392,14 @@ fun encode_setcc(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     ret (buf.len - start)::i32;
 }
 
-# encode XORPS xmm,xmm (used to zero an SSE register)
+# encode XORPS in its xmm,xmm form (used to zero an SSE register) and
+# its xmm,mem form (`0F 57 /r` either way, the ModRM byte carrying the difference)
+#
+# The memory form is what lets a float negation read its sign mask straight out of
+# the constant pool (#2754) instead of building it through the GP scratch. XORPS is
+# the ALIGNED 128-bit form, so the memory operand must be 16-byte aligned - which is
+# exactly what `const_align(CONST_VEC, 16)` gives a pool entry, and why the mask is
+# interned as a 16-byte vector rather than at the float's own width
 fun encode_xorps(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     val start: usize = buf.len;
     val dst: *isa.Operand = ?mi.dst;
@@ -1404,6 +1411,13 @@ fun encode_xorps(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
         enc.emit_byte(buf, 0x0F);
         enc.emit_byte(buf, 0x57);
         enc.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (buf.len - start)::i32;
+    }
+    if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_MEM) {
+        emit_rex_mem(buf, 0, dst.reg, src1);
+        enc.emit_byte(buf, 0x0F);
+        enc.emit_byte(buf, 0x57);
+        encode_mem_operand(buf, dst.reg, src1);
         ret (buf.len - start)::i32;
     }
     ret 0;
@@ -3330,6 +3344,9 @@ fun float_alu_opcode(op: mir.MirOpcode, w: u8) u16 {
 # value the allocator placed in the wrong bank - rejected loudly rather than
 # mis-encoded
 fun emit_float_load(st: *enc.EncodeState, op: isa.Operand, xmm: i32, w: u8) R.Result[bool, str] {
+    if (!is_float_width(w)) {
+        ret R.err[bool, str]("internal compiler error: float load has a non-float access width (expected 4 or 8)");
+    }
     if (op.kind != isa.OPK_IMM) { ret emit_float_reg_or_slot_load(op, xmm, w, ?st.buf); }
 
     val cr: R.Result[isa.Operand, str] = float_const_operand(st, op.imm::u64, xmm, w);
@@ -3357,6 +3374,9 @@ fun emit_float_load(st: *enc.EncodeState, op: isa.Operand, xmm: i32, w: u8) R.Re
 # to `encode_float_const_mov` before the generic path can see it, because pooling
 # the constant mints a symbol whose relocation only the encode state can record
 fun emit_float_reg_or_slot_load(op: isa.Operand, xmm: i32, w: u8, buf: *enc.ByteBuf) R.Result[bool, str] {
+    if (!is_float_width(w)) {
+        ret R.err[bool, str]("internal compiler error: float load has a non-float access width (expected 4 or 8)");
+    }
     var mov_op: u16 = x64.MOVSD;
     if (w == 4) { mov_op = x64.MOVSS; }
 
@@ -3406,6 +3426,9 @@ fun emit_float_reg_or_slot_load(op: isa.Operand, xmm: i32, w: u8, buf: *enc.Byte
 # w:        4 for an f32 constant, 8 for an f64
 # ret:      the `[rip + sym]` source operand, or NONE when `zero_reg` now holds it
 fun float_const_operand(st: *enc.EncodeState, bits: u64, zero_reg: i32, w: u8) R.Result[isa.Operand, str] {
+    if (!is_float_width(w)) {
+        ret R.err[isa.Operand, str]("internal compiler error: float constant has a non-float width (expected 4 or 8)");
+    }
     var pattern: u64 = bits;
     if (w == 4) { pattern = bits & 0xFFFFFFFF; }
 
@@ -3587,6 +3610,9 @@ fun float_reg_operand(st: *enc.EncodeState, op: isa.Operand, scratch: i32, w: u8
 # (MOVSS / MOVSD `[rbp + off]` <- reg), mirroring cmach's result store. a non-FP
 # destination is a backend bug, rejected loudly
 fun emit_float_store(dst: isa.Operand, xmm: i32, w: u8, buf: *enc.ByteBuf) R.Result[bool, str] {
+    if (!is_float_width(w)) {
+        ret R.err[bool, str]("internal compiler error: float store has a non-float access width (expected 4 or 8)");
+    }
     var mov_op: u16 = x64.MOVSD;
     if (w == 4) { mov_op = x64.MOVSS; }
 
@@ -3678,17 +3704,52 @@ fun float_sign_mask(w: u8) i64 {
     ret 0x8000000000000000::i64;
 }
 
+# the 16-byte image of a float sign mask, laid out for the aligned
+# XORPS memory form: the width's mask in the low lane, zeros above
+#
+# XORPS is a 128-bit bitwise XOR, so its memory operand is a full 16 bytes whatever
+# the float's own width is. The high lanes must be zero rather than don't-care -
+# XORPS touches them, and a negation must leave everything outside the value's sign
+# bit exactly as it found it.
+# ---
+# w:   4 for an f32 mask, 8 for an f64 mask
+# out: receives the 16-byte little-endian image
+fun float_sign_mask_image(w: u8, out: *u8) {
+    val m: u64 = float_sign_mask(w)::u64;
+    var i: u32 = 0;
+    for (i < 16) {
+        out[i] = 0;
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 8) {
+        out[i] = (m >> (i::u64 * 8::u64))::u8;
+        i = i + 1;
+    }
+}
+
 # materialize a fully-resolved float negation `MIR_FNEG [dst, src]`
 # into its SSE byte sequence, flipping the IEEE-754 sign bit rather than two's-
 # complementing the bit pattern (which the integer MIR_NEG would do). seeds the
 # two-address working register with the value - `dst` itself when the allocator gave
-# the result an XMM register, FLOAT_SCRATCH0 when it spilled it - loads the
-# width-selected sign mask into FLOAT_SCRATCH1 (the mask bits go through the R11 GP
-# scratch then MOVQ, mirroring the immediate operand path of `emit_float_load`, so no
-# float value ever aliases a GP register in the emitted bytes), and XORs the two in
-# place. the width (`mi.width`: 4 for f32, 8 for f64) selects the f32 vs f64 sign
-# mask. XORPS (a 128-bit bitwise XOR) is correct for both widths: the mask only sets
-# the value's sign bit in the low lane and the XOR is purely bitwise
+# the result an XMM register, FLOAT_SCRATCH0 when it spilled it - and XORs it in
+# place against the width-selected sign mask, read straight out of the module's
+# constant pool as `xorps work, [rip + .Lconst.N]`. the width (`mi.width`: 4 for f32,
+# 8 for f64) selects the f32 vs f64 sign mask. XORPS (a 128-bit bitwise XOR) is
+# correct for both widths: the mask only sets the value's sign bit in the low lane
+# and the XOR is purely bitwise
+#
+# THE MASK IS POOLED, NOT BUILT (#2754). It used to go through the GP scratch -
+# `movabs r11, 0x8000000000000000 ; movq xmm15, r11 ; xorps xmm0, xmm15` - three
+# instructions, 20 bytes and a general-purpose register at EVERY negation, for one of
+# two values that is the same in every program that negates a float. One pooled entry
+# per width per module serves them all.
+#
+# THE ENTRY IS A 16-BYTE VECTOR, and that is forced rather than chosen. XORPS is the
+# ALIGNED 128-bit form: it reads sixteen bytes and faults on a misaligned operand, so
+# an entry laid out at the float's own width would be neither wide enough nor aligned
+# enough. `const_align(CONST_VEC, 16)` already returns 16, so this is the pool's
+# alignment rule doing the work rather than a local guarantee
 fun encode_float_neg(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 2) {
         ret R.err[bool, str]("encode: float negate missing operands");
@@ -3711,29 +3772,24 @@ fun encode_float_neg(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInst
     val ld: R.Result[bool, str] = emit_float_seed(st, src, work, w);
     if (R.is_err[bool, str](ld)) { ret ld; }
 
-    # materialize the sign-bit mask into FLOAT_SCRATCH1 via the R11 GP scratch.
-    var mov_imm: isa.Inst = isa.inst_blank();
-    mov_imm.opcode = x64.MOVABS;
-    mov_imm.dst    = isa.make_reg(x64.R11, 8);
-    mov_imm.src1   = isa.make_imm(float_sign_mask(w), 8);
-    mov_imm.size   = 8;
-    encode_inst(?mov_imm, buf);
+    # intern the width's sign mask as a 16-byte, 16-aligned vector entry.
+    var img: [16]u8;
+    float_sign_mask_image(w, ?img[0]);
+    val sr: R.Result[intern.StrId, str] = enc.intern_const(st, ?img[0], 16, enc.CONST_VEC);
+    if (R.is_err[intern.StrId, str](sr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sr)); }
 
-    var movq: isa.Inst = isa.inst_blank();
-    movq.opcode = x64.MOVQ;
-    movq.dst    = isa.make_reg(FLOAT_SCRATCH1, 16);
-    movq.src1   = isa.make_reg(x64.R11, 8);
-    movq.size   = 8;
-    encode_inst(?movq, buf);
+    var mem: isa.Operand = isa.make_mem(-1, 0, -1, 0, 16);
+    mem.sym_id = R.unwrap_ok[intern.StrId, str](sr);
 
-    # work ^= FLOAT_SCRATCH1 (flip the sign bit), then store back if the result is
-    # a frame slot.
+    # work ^= [rip + .Lconst.N] (flip the sign bit), then store back if the result
+    # is a frame slot.
     var xorp: isa.Inst = isa.inst_blank();
     xorp.opcode = x64.XORPS;
     xorp.dst    = isa.make_reg(work, 16);
-    xorp.src1   = isa.make_reg(FLOAT_SCRATCH1, 16);
-    xorp.size   = w;
-    encode_inst(?xorp, buf);
+    xorp.src1   = mem;
+    xorp.size   = 16;
+    val xr: R.Result[bool, str] = encode_inst_sym(st, ?xorp);
+    if (R.is_err[bool, str](xr)) { ret xr; }
 
     if (dst.kind == isa.OPK_REG) { ret R.ok[bool, str](true); }
     ret emit_float_store(dst, work, w, buf);
@@ -8215,6 +8271,175 @@ fun t_accepted_n(r: R.Result[i32, str], buf: *enc.ByteBuf) bool {
     ret R.unwrap_ok[i32, str](r)::usize == buf.len;
 }
 
+# THE FNEG SIGN MASK COMES OUT OF THE CONSTANT POOL, IN ONE INSTRUCTION (#2754)
+#
+# An IEEE-754 negation is a sign-bit flip, and the mask it XORs against is one of two
+# values in every program that negates a float. It used to be rebuilt at EVERY
+# negation through the GP scratch - `movabs r11, mask ; movq xmm15, r11 ; xorps` -
+# three instructions, 20 bytes and a general-purpose register, for a constant. It is
+# now one `xorps work, [rip + .Lconst.N]`.
+#
+# THE ENTRY'S SHAPE IS READ OUT OF THE POOL, not asserted from the interning call.
+# XORPS is the ALIGNED 128-bit form: it reads sixteen bytes and faults on a
+# misaligned operand, so an entry of the float's own width would be wrong twice over.
+# The low lane must be the mask and the high lane must be ZERO - XORPS touches it,
+# and a negation must leave every bit outside the sign exactly as it found it.
+# fneg reads a pooled 16-byte sign mask in one xorps
+test "mach.lang.target.isa.x64.encode:fneg_sign_mask_is_pooled" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    var st: enc.EncodeState;
+    enc.state_blank(?st, ?alloc);
+    st.interner = ?itn;
+    val buf: *enc.ByteBuf = ?st.buf;
+    var f: mir.MirFunction;
+    var bad: i32 = 0;
+
+    # -x with the result already in XMM0: the seed move plus ONE xorps, and no
+    # movabs anywhere in the bytes
+    var ops: [2]mir.MirOperand;
+    ops[0] = xmm_op(x64.XMM0); ops[1] = xmm_op(x64.XMM1);
+    var ng: mir.MirInstr = mir.instr(mir.MIR_FNEG, ?ops[0], 2, 8, 0);
+    buf.len = 0;
+    if (R.is_err[bool, str](encode_float_neg(?st, ?f, ?ng))) { bad = 1; }
+    # movaps/movsd seed (4 bytes: f2 0f 10 c0) then xorps (%rip), %xmm0 (7 bytes:
+    # 0f 57 05 + disp32), which is llvm-mc's encoding of the memory form
+    if (buf.len != 11) { bad = 1; }
+    or {
+        if (buf.data[4] != 0x0F || buf.data[5] != 0x57 || buf.data[6] != 0x05) { bad = 1; }
+    }
+    # exactly one relocation, naming the entry, at the trailing disp32
+    if (st.reloc_count != 1)            { bad = 1; }
+    or {
+        if (st.relocs[0].kind != of.RK_PC32)      { bad = 1; }
+        if (st.relocs[0].offset != 7)             { bad = 1; }
+        if (st.relocs[0].sym != st.consts[0].sym) { bad = 1; }
+    }
+
+    # the entry: 16 bytes, 16-BYTE ALIGNED, mask in the low lane, zeros above
+    if (st.const_count != 1)                                     { bad = 1; }
+    or {
+        if (st.consts[0].len != 16 || st.consts[0].align != 16)  { bad = 1; }
+        if (st.consts[0].kind != enc.CONST_VEC)                  { bad = 1; }
+        or {
+            var i: u32 = 0;
+            for (i < 7) { if (st.consts[0].bytes[i] != 0) { bad = 1; } i = i + 1; }
+            if (st.consts[0].bytes[7] != 0x80)                   { bad = 1; }
+            i = 8;
+            for (i < 16) { if (st.consts[0].bytes[i] != 0) { bad = 1; } i = i + 1; }
+        }
+    }
+
+    # a SECOND negation at the same width shares the entry
+    buf.len = 0;
+    if (R.is_err[bool, str](encode_float_neg(?st, ?f, ?ng))) { bad = 1; }
+    if (st.const_count != 1) { bad = 1; }
+
+    # a negation at the OTHER width is a second entry, with the f32 mask low
+    ng.width = 4;
+    buf.len = 0;
+    if (R.is_err[bool, str](encode_float_neg(?st, ?f, ?ng))) { bad = 1; }
+    if (st.const_count != 2)                                     { bad = 1; }
+    or {
+        if (st.consts[1].len != 16 || st.consts[1].align != 16)  { bad = 1; }
+        if (st.consts[1].bytes[3] != 0x80)                       { bad = 1; }
+        if (st.consts[1].bytes[7] != 0)                          { bad = 1; }
+    }
+
+    ret bad;
+}
+
+# THE FLOAT MEMORY ACCESS HELPERS REFUSE A WIDTH SSE HAS NO SCALAR FORM FOR
+#
+# NOT NAMED BY #2766, WHICH FILED AGAINST AARCH64 AND RISCV64 - x86-64 carries the
+# same defect in the same family and the census found it here. `emit_float_load`,
+# `emit_float_reg_or_slot_load` and `emit_float_store` each read `mov_op = MOVSD; if
+# (w == 4) { mov_op = MOVSS; }`, so EVERY width other than 4 took the eight-byte MOVSD
+# - a 16-byte access moved eight bytes and dropped the high lane, exactly the shape
+# `encode_fp_mov` was fixed for in #2733 one layer up. It was inert only because
+# `encode_fp_mov` returns the vector arm above them; nothing in the helpers said so,
+# and `emit_float_load` is reached separately by the arithmetic and seed paths.
+#
+# `float_const_operand` is here for the same reason: it masks the pattern to 32 bits
+# for width 4 and interns at `w` bytes otherwise, so a 16 would have interned an
+# eight-byte pool entry under a four-byte kind.
+test "mach.lang.target.isa.x64.encode:float_access_width_refusals_emit_nothing" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var st: enc.EncodeState;
+    enc.state_blank(?st, ?alloc);
+    val buf: *enc.ByteBuf = ?st.buf;
+    var bad: i32 = 0;
+
+    val slot: isa.Operand = isa.make_mem(x64.RBX, 16, -1, 0, 8);
+    val xmm0: i32 = isa.regid_make(isa.REG_CLASS_ID_XMM, x64.XMM0);
+
+    # the reg-or-slot load, the one the generic move path reaches with no encode state
+    buf.len = 0;
+    if (!t_refused(emit_float_reg_or_slot_load(slot, xmm0, 16, buf), buf)) { bad = 1; }
+    buf.len = 0;
+    if (!t_refused(emit_float_reg_or_slot_load(slot, xmm0, 32, buf), buf)) { bad = 1; }
+    buf.len = 0;
+    if (!t_refused(emit_float_reg_or_slot_load(slot, xmm0, 1, buf), buf)) { bad = 1; }
+    buf.len = 0;
+    if (!t_refused(emit_float_reg_or_slot_load(slot, xmm0, 0, buf), buf)) { bad = 1; }
+
+    # the two it DOES implement, byte-exact against llvm-mc
+    buf.len = 0;
+    if (!t_accepted(emit_float_reg_or_slot_load(slot, xmm0, 4, buf), buf)) { bad = 1; }
+    if (buf.len != 5) { bad = 1; }
+    or {
+        # movss 16(%rbx), %xmm0 = f3 0f 10 43 10
+        if (buf.data[0] != 0xF3 || buf.data[1] != 0x0F || buf.data[2] != 0x10) { bad = 1; }
+        if (buf.data[3] != 0x43 || buf.data[4] != 0x10) { bad = 1; }
+    }
+    buf.len = 0;
+    if (!t_accepted(emit_float_reg_or_slot_load(slot, xmm0, 8, buf), buf)) { bad = 1; }
+    if (buf.len != 5) { bad = 1; }
+    or {
+        # movsd 16(%rbx), %xmm0 = f2 0f 10 43 10
+        if (buf.data[0] != 0xF2 || buf.data[1] != 0x0F || buf.data[2] != 0x10) { bad = 1; }
+        if (buf.data[3] != 0x43 || buf.data[4] != 0x10) { bad = 1; }
+    }
+
+    # the store side
+    buf.len = 0;
+    if (!t_refused(emit_float_store(slot, xmm0, 16, buf), buf)) { bad = 1; }
+    buf.len = 0;
+    if (!t_refused(emit_float_store(slot, xmm0, 3, buf), buf))  { bad = 1; }
+    buf.len = 0;
+    if (!t_accepted(emit_float_store(slot, xmm0, 4, buf), buf))  { bad = 1; }
+    if (buf.len != 5) { bad = 1; }
+    or {
+        # movss %xmm0, 16(%rbx) = f3 0f 11 43 10
+        if (buf.data[0] != 0xF3 || buf.data[1] != 0x0F || buf.data[2] != 0x11) { bad = 1; }
+        if (buf.data[3] != 0x43 || buf.data[4] != 0x10) { bad = 1; }
+    }
+    buf.len = 0;
+    if (!t_accepted(emit_float_store(slot, xmm0, 8, buf), buf))  { bad = 1; }
+
+    # the state-carrying load, which routes an immediate through the constant pool
+    buf.len = 0;
+    if (!t_refused(emit_float_load(?st, slot, xmm0, 16), buf)) { bad = 1; }
+    buf.len = 0;
+    if (!t_accepted(emit_float_load(?st, slot, xmm0, 8), buf))  { bad = 1; }
+
+    # the constant materialization the pool entry's width comes from. a ZERO pattern is
+    # the one shape that mints no symbol, so the accepted arm needs no interner
+    buf.len = 0;
+    val c16: R.Result[isa.Operand, str] = float_const_operand(?st, 0, xmm0, 16);
+    if (!R.is_err[isa.Operand, str](c16) || buf.len != 0) { bad = 1; }
+    buf.len = 0;
+    val c0: R.Result[isa.Operand, str] = float_const_operand(?st, 0, xmm0, 3);
+    if (!R.is_err[isa.Operand, str](c0) || buf.len != 0) { bad = 1; }
+    buf.len = 0;
+    val c4: R.Result[isa.Operand, str] = float_const_operand(?st, 0, xmm0, 4);
+    if (R.is_err[isa.Operand, str](c4) || buf.len == 0) { bad = 1; }
+
+    ret bad;
+}
+
 # EVERY FLOAT ENCODER REFUSES A WIDTH SSE DOES NOT IMPLEMENT, AND EMITS NOTHING
 #
 # x86-64 gives `encode_fp_mov` three forms - MOVSS, MOVSD and the 16-byte vector arm
@@ -8246,8 +8471,12 @@ fun t_accepted_n(r: R.Result[i32, str], buf: *enc.ByteBuf) bool {
 test "mach.lang.target.isa.x64.encode:float_width_refusals_emit_nothing" {
     var alloc: A.Allocator;
     page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
     var st: enc.EncodeState;
     enc.state_blank(?st, ?alloc);
+    # the negate arm reaches the constant pool for its sign mask (#2754), and a pool
+    # entry has to be named, so this state carries an interner
+    st.interner = ?itn;
     val buf: *enc.ByteBuf = ?st.buf;
     var f: mir.MirFunction;
     var bad: i32 = 0;

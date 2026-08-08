@@ -75,6 +75,14 @@ rec Ctx {
     idx_ty:   ir_type.IrTypeId;
 }
 
+# the most lanes a gap expansion assembles at once
+#
+# The surface bounds a vector at the target's `vector_bits` (128) and the narrowest
+# lane is 8 bits, so sixteen. It sizes the fixed lane buffers below, which is why it
+# is named: #2727 removes that bound, and when it does they become allocations rather
+# than a larger fixed size.
+val MAX_GAP_LANES: u32 = 16;
+
 # a vector type's element type, lane count, and element bit width
 # ---
 # elem:  scalar element IrTypeId
@@ -174,10 +182,16 @@ fun produces_vector(m: *ir.Module, inst: *instruction.Instruction) bool {
 # per-target (#2726): "multiply would scalarize" is not actionable on a target that
 # packs the same multiply one lane width down, so the diagnostic names the width the
 # gap is at.
+#
+# The lane COUNT rides along for the same reason one axis over (#2749). A target may
+# have a packed form for the operation at this lane width and still not for THIS many
+# lanes of it - SPIR-V packs four components and no more - and then naming only the
+# width describes a gap that does not exist.
 pub rec ScalarizeSite {
     fn_name:   intern.StrId;
     op:        instruction.InstrKind;
     lane_bits: u32;
+    lanes:     u32;
 }
 
 # count the lane-wise vector operators in `m` whose realization on `tgt` is per-lane
@@ -217,8 +231,12 @@ pub fun detect(m: *ir.Module, tgt: *target.Target, first: *ScalarizeSite) u32 {
                             first.fn_name   = fn.name;
                             first.op        = inst.kind;
                             first.lane_bits = 0;
+                            first.lanes     = 0;
                             var d: vecform.LaneDesc;
-                            if (vecform.lane_desc(m, inst, ?d)) { first.lane_bits = d.lane_bits; }
+                            if (vecform.lane_desc(m, inst, ?d)) {
+                                first.lane_bits = d.lane_bits;
+                                first.lanes     = d.lanes;
+                            }
                         }
                         count = count + 1;
                     }
@@ -1185,7 +1203,6 @@ fun expand_lane_block(lc: *LaneCtx, blk: *ir.Block, is_entry: bool) R.Result[boo
             if (!R.is_err[bool, str](rr)) { rr = expand_lane_write(lc, blk, cur); }
         }
         or {
-            rewrite_ops(?lc.c, ?fn.instrs[cur::u32]);
             rr = ir.block_append_instr(lc.c.m, blk, cur);
             if (!R.is_err[bool, str](rr) && cur::u32 < lc.c.n && lc.store_at[cur::u32]) {
                 rr = ir.block_append_instr(lc.c.m, blk, lc.slot_alloca[cur::u32]);
@@ -1200,15 +1217,6 @@ fun expand_lane_block(lc: *LaneCtx, blk: *ir.Block, is_entry: bool) R.Result[boo
     }
 
     body_free(?lc.c, old, old_len);
-
-    var p2: u32 = 0;
-    for (p2 < blk.phi_count) {
-        rewrite_ops(?lc.c, ?fn.instrs[blk.phis[p2]::u32]);
-        p2 = p2 + 1;
-    }
-    if (blk.terminator != id.INSTR_NIL) {
-        rewrite_ops(?lc.c, ?fn.instrs[blk.terminator::u32]);
-    }
     ret R.ok[bool, str](true);
 }
 
@@ -1284,6 +1292,7 @@ fun expand_lane_function(m: *ir.Module, fn: *ir.Function, void_ty: ir_type.IrTyp
         if (R.is_err[bool, str](rb)) { lane_ctx_free(m, ?lc); ret rb; }
         bi = bi + 1;
     }
+    rewrite_uses(?lc.c, fn);
 
     lane_ctx_free(m, ?lc);
     ret R.ok[bool, str](true);
@@ -1360,19 +1369,14 @@ fun has_gap_op(m: *ir.Module, fn: *ir.Function, tgt: *target.Target) bool {
 # UMOV / INS) keeps them to its isel; one that cannot has `expand_lane_ops` rewrite
 # them to the vector's memory image immediately after this. So this pass needs no
 # memory machinery of its own and inherits both lowerings for free.
-fun expand_gap_op(c: *Ctx, blk: *ir.Block, cur: id.InstructionId) R.Result[bool, str] {
+fun expand_gap_op(c: *Ctx, tgt: *target.Target, blk: *ir.Block, cur: id.InstructionId) R.Result[bool, str] {
     val fn: *ir.Function = c.fn;
     val ip: *instruction.Instruction = ?fn.instrs[cur::u32];
     val kind: instruction.InstrKind = ip.kind;
     val loc:  source.SrcLoc = ip.loc;
     val vty:  ir_type.IrTypeId = ip.ty;
 
-    if (is_compare_op(kind)) {
-        # no ISA declares a packed-form gap on a lane-wise compare, so the mask
-        # expansion this would need has never been reachable. Declaring one without
-        # writing it is a defined error rather than a wrong mask.
-        ret R.err[bool, str]("scalarize: no per-lane expansion for a gapped vector compare");
-    }
+    if (is_compare_op(kind)) { ret expand_gap_compare(c, tgt, blk, cur); }
     if (!is_binary_op(kind) && !is_unary_op(kind)) {
         ret R.err[bool, str]("scalarize: gap operator is not a lane-wise arithmetic or bitwise op");
     }
@@ -1394,8 +1398,8 @@ fun expand_gap_op(c: *Ctx, blk: *ir.Block, cur: id.InstructionId) R.Result[bool,
 
     # every lane's scalar result, computed before any of them is inserted, so the
     # insert chain is a straight assembly rather than interleaved with the arithmetic.
-    var lanes: [16]value.Value;
-    if (vi.lanes > 16) { ret R.err[bool, str]("scalarize: gap operator has more lanes than any 128-bit vector"); }
+    var lanes: [MAX_GAP_LANES]value.Value;
+    if (vi.lanes > MAX_GAP_LANES) { ret R.err[bool, str]("scalarize: gap operator has more lanes than any 128-bit vector"); }
 
     var k: u32 = 0;
     for (k < vi.lanes) {
@@ -1433,6 +1437,137 @@ fun expand_gap_op(c: *Ctx, blk: *ir.Block, cur: id.InstructionId) R.Result[bool,
     ret R.ok[bool, str](true);
 }
 
+# rewrite a gapped lane-wise COMPARE into per-lane scalar compares assembling mach's
+# same-shape mask, as VALUES rather than through storage
+#
+# The mask contract is the one CMPPS / FCMEQ implement and the whole-module scalarizer
+# already reproduces: a true lane is all-ones at the mask lane width, a false lane all
+# zeros. Per lane that is a scalar compare to a 0/1 boolean, a widening to the mask
+# lane width, and `0 - z`, which is all-ones in two's complement.
+#
+# WHY THIS COULD NOT BE LEFT UNWRITTEN (#2749). It was a defined error, on the ground
+# that no ISA declares a packed-form gap on a compare - true while a gap could only be
+# a missing OPCODE. A lane-count ceiling makes a compare gapped for a reason that has
+# nothing to do with the opcode: SPIR-V has `OpSLessThan` at every lane width and
+# still cannot type sixteen components, so `i8x16 < i8x16` arrives here.
+#
+# TWO ASSEMBLIES, and the choice is the same capability and the same reason as a
+# vector literal's (`me.lower.expr.lower_vector_lit`). A compare's result is a
+# DIFFERENT IR type from its operands whenever the lanes are float - `f32x4 < f32x4`
+# is `u32x4` - so the insert chain the arithmetic path uses cannot seed from an
+# operand there, and a vector-typed zero constant is not an expressible value (#2700).
+# A target that builds a whole vector from its lanes gets `OP_VEC_BUILD`; one that
+# does not gets the insert chain, which is well-typed exactly when the mask type IS
+# the operand type - and it is, for every INTEGER-lane compare, because an IR integer
+# carries no signedness and `u8x16` and `i8x16` are one IR type. That leaves one
+# combination unwritten, a float-lane compare gap on a target with no whole-vector
+# build, which no target has: it is a defined error rather than a wrong mask, exactly
+# as this whole function was before.
+fun expand_gap_compare(c: *Ctx, tgt: *target.Target, blk: *ir.Block, cur: id.InstructionId) R.Result[bool, str] {
+    val fn: *ir.Function = c.fn;
+    val ip: *instruction.Instruction = ?fn.instrs[cur::u32];
+    val kind: instruction.InstrKind = ip.kind;
+    val loc:  source.SrcLoc = ip.loc;
+    val mask_ty: ir_type.IrTypeId = ip.ty;
+
+    if (ip.operand_count < 2) { ret R.err[bool, str]("scalarize: gap compare missing operands"); }
+    val op_ty: ir_type.IrTypeId = ip.operands[0].ty;
+
+    var opi: VInfo;
+    val ro: R.Result[bool, str] = vec_info(c.m, op_ty, ?opi);
+    if (R.is_err[bool, str](ro)) { ret ro; }
+    var mi: VInfo;
+    val rm: R.Result[bool, str] = vec_info(c.m, mask_ty, ?mi);
+    if (R.is_err[bool, str](rm)) { ret rm; }
+    if (opi.lanes != mi.lanes) {
+        ret R.err[bool, str]("scalarize: gap compare mask has a different lane count from its operands");
+    }
+    if (opi.lanes > MAX_GAP_LANES) {
+        ret R.err[bool, str]("scalarize: gap compare has more lanes than any vector this pass builds");
+    }
+
+    val ri8: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?c.m.types, 8);
+    if (R.is_err[ir_type.IrTypeId, str](ri8)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](ri8)); }
+    val i8_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ri8);
+
+    # a signed ordering compare of a sub-word lane sign-extends both operands first,
+    # for the same reason the storage expansion does (#2077): a target whose sub-word
+    # reads zero-extend would otherwise compare a negative lane as a large unsigned
+    # bit pattern and answer `-1 < 0` false.
+    val need_sext: bool = (kind == instruction.OP_CMP_LT_S || kind == instruction.OP_CMP_LE_S) && opi.bits < 32;
+    var ext_ty: ir_type.IrTypeId = ir_type.IRT_NIL;
+    if (need_sext) {
+        val rx: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?c.m.types, 32);
+        if (R.is_err[ir_type.IrTypeId, str](rx)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rx)); }
+        ext_ty = R.unwrap_ok[ir_type.IrTypeId, str](rx);
+    }
+
+    val a: value.Value = resolve(c, ip.operands[0]);
+    val b: value.Value = resolve(c, ip.operands[1]);
+    val secret: bool = ip.operands[0].secret || ip.operands[1].secret;
+
+    var lanes: [MAX_GAP_LANES]value.Value;
+    var k: u32 = 0;
+    for (k < opi.lanes) {
+        val ra: R.Result[value.Value, str] = emit_lane_read(c, blk, a, opi.elem, k, loc);
+        if (R.is_err[value.Value, str](ra)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](ra)); }
+        var la: value.Value = lane_secret(c, R.unwrap_ok[value.Value, str](ra), ip.operands[0].secret);
+        val rb: R.Result[value.Value, str] = emit_lane_read(c, blk, b, opi.elem, k, loc);
+        if (R.is_err[value.Value, str](rb)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](rb)); }
+        var lb: value.Value = lane_secret(c, R.unwrap_ok[value.Value, str](rb), ip.operands[1].secret);
+
+        if (need_sext) {
+            val sa: R.Result[value.Value, str] = emit_unop(c, blk, instruction.OP_SEXT, ext_ty, la, loc);
+            if (R.is_err[value.Value, str](sa)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](sa)); }
+            la = lane_secret(c, R.unwrap_ok[value.Value, str](sa), ip.operands[0].secret);
+            val sb: R.Result[value.Value, str] = emit_unop(c, blk, instruction.OP_SEXT, ext_ty, lb, loc);
+            if (R.is_err[value.Value, str](sb)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](sb)); }
+            lb = lane_secret(c, R.unwrap_ok[value.Value, str](sb), ip.operands[1].secret);
+        }
+
+        val cmp: R.Result[value.Value, str] = emit_binop(c, blk, kind, i8_ty, la, lb, loc);
+        if (R.is_err[value.Value, str](cmp)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](cmp)); }
+        var wide: value.Value = lane_secret(c, R.unwrap_ok[value.Value, str](cmp), secret);
+
+        if (mi.bits != 8) {
+            val z: R.Result[value.Value, str] = emit_unop(c, blk, instruction.OP_ZEXT, mi.elem, wide, loc);
+            if (R.is_err[value.Value, str](z)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](z)); }
+            wide = lane_secret(c, R.unwrap_ok[value.Value, str](z), secret);
+        }
+
+        val neg: R.Result[value.Value, str] = emit_binop(c, blk, instruction.OP_SUB, mi.elem,
+                                                         value.const_int(0, mi.elem), wide, loc);
+        if (R.is_err[value.Value, str](neg)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](neg)); }
+        lanes[k] = lane_secret(c, R.unwrap_ok[value.Value, str](neg), secret);
+        k = k + 1;
+    }
+
+    var acc: value.Value;
+    if (tgt.model.has_vec_build) {
+        val rv: R.Result[value.Value, str] = push(c, blk, instruction.OP_VEC_BUILD, mask_ty, mask_ty,
+                                                  ?lanes[0], opi.lanes, loc);
+        if (R.is_err[value.Value, str](rv)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](rv)); }
+        acc = R.unwrap_ok[value.Value, str](rv);
+    }
+    or {
+        if (mask_ty != op_ty) {
+            ret R.err[bool, str]("scalarize: no per-lane expansion for a gapped float-lane vector compare on a target that cannot build a vector from its lanes");
+        }
+        acc = a;
+        var j: u32 = 0;
+        for (j < opi.lanes) {
+            val rw: R.Result[value.Value, str] = emit_lane_write(c, blk, acc, mask_ty, j, lanes[j], loc);
+            if (R.is_err[value.Value, str](rw)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](rw)); }
+            acc = R.unwrap_ok[value.Value, str](rw);
+            j = j + 1;
+        }
+    }
+
+    c.pval[cur::u32]     = acc;
+    c.pval_set[cur::u32] = true;
+    ret R.ok[bool, str](true);
+}
+
 # a lane read `vec_extract vec, k` yielding the scalar element
 fun emit_lane_read(c: *Ctx, blk: *ir.Block, vec: value.Value, elem_ty: ir_type.IrTypeId, k: u32, loc: source.SrcLoc) R.Result[value.Value, str] {
     var ops: [2]value.Value;
@@ -1451,6 +1586,14 @@ fun emit_lane_write(c: *Ctx, blk: *ir.Block, vec: value.Value, vty: ir_type.IrTy
 }
 
 # rebuild one block, expanding its gap operators in place
+#
+# BODIES ONLY. Operand substitution is a WHOLE-FUNCTION step (`rewrite_gap_uses`)
+# because a use can precede its definition in block order - a loop header's phi names
+# a value the latch produces - so rewriting a block's operands while later blocks are
+# still unexpanded leaves that phi naming an instruction this pass has just dropped
+# (#2749). That was a silent wrong ANSWER on x86-64, not a crash: a loop-carried
+# `i32x4 * i32x4` accumulator came out holding the multiplier, because the phi's back
+# edge still named the deleted multiply and MIR lowering copied an undefined vreg.
 fun expand_gap_block(c: *Ctx, tgt: *target.Target, blk: *ir.Block) R.Result[bool, str] {
     val fn: *ir.Function = c.fn;
 
@@ -1471,10 +1614,9 @@ fun expand_gap_block(c: *Ctx, tgt: *target.Target, blk: *ir.Block) R.Result[bool
         val inst: *instruction.Instruction = ?fn.instrs[cur::u32];
         var rr: R.Result[bool, str] = R.ok[bool, str](true);
         if (is_operator(c.m, inst) && !vecform.realizes_packed(c.m, tgt, inst)) {
-            rr = expand_gap_op(c, blk, cur);
+            rr = expand_gap_op(c, tgt, blk, cur);
         }
         or {
-            rewrite_ops(c, inst);
             rr = ir.block_append_instr(c.m, blk, cur);
         }
         if (R.is_err[bool, str](rr)) { body_free(c, old, old_len); ret rr; }
@@ -1482,14 +1624,42 @@ fun expand_gap_block(c: *Ctx, tgt: *target.Target, blk: *ir.Block) R.Result[bool
     }
 
     body_free(c, old, old_len);
-
-    var p: u32 = 0;
-    for (p < blk.phi_count) {
-        rewrite_ops(c, ?fn.instrs[blk.phis[p]::u32]);
-        p = p + 1;
-    }
-    if (blk.terminator != id.INSTR_NIL) { rewrite_ops(c, ?fn.instrs[blk.terminator::u32]); }
     ret R.ok[bool, str](true);
+}
+
+# point every surviving use in `fn` at the value that replaced its producer
+#
+# THE SUBSTITUTION IS WHOLE-FUNCTION, not per block, and that is the point (#2749).
+# An expansion replaces one instruction's result with an assembled vector, and the
+# uses of that result are not confined to blocks already walked: a loop header's phi
+# names the value the LATCH defines, so its operand is a forward reference no block
+# order can remove - the phi genuinely precedes its own operand.
+#
+# Both vector expansions got this wrong, and neither failed loudly. A loop-carried
+# `i32x4 * i32x4` accumulator on x86-64 came out holding the MULTIPLIER: the phi's
+# back edge still named the deleted multiply, and MIR lowering turned the phi into a
+# copy from a vreg nothing defines. Every straight-line vector test passed.
+#
+# The instructions an expansion emitted itself are already correct - it resolves each
+# operand as it builds them - so re-resolving them here is a no-op: nothing replaces a
+# replacement.
+fun rewrite_uses(c: *Ctx, fn: *ir.Function) {
+    var bi: u32 = 0;
+    for (bi < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[bi];
+        var p: u32 = 0;
+        for (p < blk.phi_count) {
+            rewrite_ops(c, ?fn.instrs[blk.phis[p]::u32]);
+            p = p + 1;
+        }
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            rewrite_ops(c, ?fn.instrs[blk.instructions[ii]::u32]);
+            ii = ii + 1;
+        }
+        if (blk.terminator != id.INSTR_NIL) { rewrite_ops(c, ?fn.instrs[blk.terminator::u32]); }
+        bi = bi + 1;
+    }
 }
 
 # expand one function's gap operators; the function is untouched when it has none
@@ -1520,6 +1690,7 @@ fun expand_gap_function(m: *ir.Module, fn: *ir.Function, tgt: *target.Target,
         if (R.is_err[bool, str](rb)) { ctx_free(m, ?c); ret rb; }
         bi = bi + 1;
     }
+    rewrite_uses(?c, fn);
 
     ctx_free(m, ?c);
     ret R.ok[bool, str](true);

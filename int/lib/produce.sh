@@ -2169,10 +2169,19 @@ produce_debuginfo() {
         ')
         set -- $counts
         printf 'weak_%s_dies=live:%s,dead:%s\n' "$label" "$1" "$2"
+        # a substring match, not equality: once a `.symtab` exists (#2772) a real
+        # symbolizer prefers the ELF symbol table's linkage name over DWARF's
+        # DW_AT_name for the function-name field, so the resolved text is the
+        # mangled form (e.g. `_M7dbgcase7genericN11identI3i64E`), not the bare
+        # source identifier - and the mangling scheme itself is due to change
+        # (the dotted-name rewrite). either way the source identifier is still
+        # IN there, so that is the fact this asserts, printed back as the
+        # semantic label rather than the raw resolved text so the golden names
+        # what was checked instead of freezing today's mangling spelling.
         symbol=missing
         if [ -n "$3" ]; then
             resolved=$("$sym_tool" --obj="$g" "$3" | sed -n '1p')
-            if [ "$resolved" = "$want" ]; then symbol=$resolved; fi
+            case "$resolved" in *"$want"*) symbol=$want ;; esac
         fi
         printf 'weak_%s_symbol=%s\n' "$label" "$symbol"
 
@@ -2202,7 +2211,96 @@ produce_debuginfo() {
     done
 }
 
-# produce_gdb_session <runmode> <target> <nog_binary> <g_binary>
+# produce_symtab <runmode> <target> <binary>
+# the ELF `.symtab` observable (#2772): a PLAIN build (no `-g`, no special flag -
+# the shape a shipped release binary actually has) now carries a real function
+# symbol table, which int/surface/debuginfo cannot speak to at all (DWARF is a
+# `-g`-only concern). requires nm, readelf, and addr2line; a missing tool is a
+# hard error, the same contract produce_debuginfo already uses for its own
+# validators.
+produce_symtab() {
+    b=$3
+    command -v nm >/dev/null 2>&1 || {
+        echo "int: symtab: nm not found (install the 'binutils' package)" >&2; return 2
+    }
+    command -v readelf >/dev/null 2>&1 || {
+        echo "int: symtab: readelf not found (install the 'binutils' package)" >&2; return 2
+    }
+    command -v addr2line >/dev/null 2>&1 || {
+        echo "int: symtab: addr2line not found (install the 'binutils' package)" >&2; return 2
+    }
+
+    sh_out=$(readelf -SW "$b" 2>/dev/null)
+    if printf '%s\n' "$sh_out" | grep -qE '\.symtab +SYMTAB'; then
+        echo "symtab_present=yes"
+    else
+        echo "symtab_present=no"
+    fi
+    if printf '%s\n' "$sh_out" | grep -qE '\.strtab +STRTAB'; then
+        echo "strtab_present=yes"
+    else
+        echo "strtab_present=no"
+    fi
+
+    # `nm` (the standard "does this binary have symbols at all" tool) finds both
+    # the fixture's functions as defined (T) symbols: `main` (an explicit
+    # `#[symbol("main")]`, unmangled) and `burn` (mangled - matched by substring,
+    # not exact name, since the mangling scheme is not this case's concern).
+    nm_out=$(nm "$b" 2>/dev/null)
+    if printf '%s\n' "$nm_out" | grep -qE ' T main$'; then
+        echo "nm_main=defined"
+    else
+        echo "nm_main=missing"
+    fi
+    if printf '%s\n' "$nm_out" | grep -qE ' T .*burn'; then
+        echo "nm_burn=defined"
+    else
+        echo "nm_burn=missing"
+    fi
+
+    # mid-function resolution: the address at burn's st_value PLUS HALF of its
+    # st_size must still resolve to burn - the check `st_size` is right, not just
+    # present, and the one most likely to be skipped (a symbol table with entries
+    # and no real sizes looks fine under `nm` and only fails a profiler later).
+    burn_line=$(readelf -sW "$b" 2>/dev/null | awk '/burn/ && / FUNC / { print; exit }')
+    burn_val=$(printf '%s\n' "$burn_line" | awk '{ print $2 }')
+    burn_size=$(printf '%s\n' "$burn_line" | awk '{ print $3 }')
+    if [ -n "$burn_val" ] && [ -n "$burn_size" ] && [ "$burn_size" -gt 0 ]; then
+        mid=$(( 0x$burn_val + burn_size / 2 ))
+        resolved=$(addr2line -f -e "$b" "$(printf '0x%x' "$mid")" 2>/dev/null | sed -n '1p')
+        case "$resolved" in
+            *burn*) echo "midfunc_resolve=burn" ;;
+            *)      echo "midfunc_resolve=other" ;;
+        esac
+    else
+        echo "midfunc_resolve=no-symbol"
+    fi
+
+    # byte-additivity (the property int/surface/debuginfo's elf_seg_identical
+    # proves for DWARF, here read directly off the load segments rather than
+    # from a before/after diff, since this symbol table is unconditional - there
+    # is no "before" build to compare against): every PT_LOAD's file extent must
+    # end at or before .symtab's file offset, so a loader - which reads only
+    # PT_LOAD - never sees a byte the symbol table touched.
+    # readelf -SW's leading "[ N]" is two whitespace-split fields ("[" and "N]"),
+    # so the section name is $3 and the file offset is $6.
+    symtab_off_hex=$(printf '%s\n' "$sh_out" | awk '$3 == ".symtab" { print $6; exit }')
+    last_load_end=0
+    while read -r typ off _va _pa filesz _memsz _flg _align; do
+        [ "$typ" = "LOAD" ] || continue
+        seg_end=$(( off + filesz ))
+        if [ "$seg_end" -gt "$last_load_end" ]; then last_load_end=$seg_end; fi
+    done <<PHDRS
+$(readelf -lW "$b" 2>/dev/null | awk '/^  LOAD/ { print }')
+PHDRS
+    if [ -n "$symtab_off_hex" ] && [ "$last_load_end" -le "$(( 0x$symtab_off_hex ))" ]; then
+        echo "symtab_after_loadable=yes"
+    else
+        echo "symtab_after_loadable=no"
+    fi
+}
+
+# produce_gdb_session <runmode> <target> <nog_binary> <g_binary> <profile>
 # the BEHAVIOURAL debugger observable (#2756): int/surface/debuginfo proves the `-g`
 # image is structurally valid; it cannot prove gdb reports the right thing when a
 # user actually breaks into it. this producer drives one real `gdb --batch` session
@@ -2228,20 +2326,45 @@ produce_debuginfo() {
 # echo ahead of each fact so the normalizer below can key off it instead of gdb's own
 # formatting, and extracts only the function name and source line from a frame
 # line, never its argument list.
+#
+# THE #2779 PROBES ARE DEBUG-ONLY. Both bugs #2779 fixed are specific to opt0's own
+# location and line-table construction and do not reproduce at opt2 (verified by
+# hand: `dies`/`staysalive` auto-inline at release exactly like `addone` does, and a
+# breakpoint's `next` there steps clean out to the caller frame - a same-frame
+# before/after `v` comparison is meaningless once that happens, the same reason
+# `addone` itself never carried this probe). So the golden this run compares against
+# is now PER-PROFILE (`expect.$profile.txt`, see run.sh), and only a debug-profile
+# session sets the extra breakpoints / walks the extra steps below - a release
+# session's transcript, and its golden, are exactly what they were before #2779.
 produce_gdb_session() {
     g=$4
+    profile=${5:-}
     command -v gdb >/dev/null 2>&1 || {
         echo "int: gdb-session: gdb not found (install the 'gdb' package)" >&2; return 2
     }
 
     gdbtmp=$(mktemp -d)
     script=$gdbtmp/session.gdb
-    cat >"$script" <<'GDBEOF'
+    {
+        cat <<'GDBEOF'
 set debuginfod enabled off
 set pagination off
 break main.mach:11
 break main.mach:20
 break main.mach:27
+GDBEOF
+        # line 22 is accumulate's own `ret total;` (Bug B); lines 39 / 50 are
+        # `dies` / `staysalive`'s `val r: i64 = v + 1;` (Bug A pair). set before
+        # `run` like every other breakpoint so their numbering (4/5/6) is stable
+        # regardless of when execution first reaches them.
+        if [ "$profile" = debug ]; then
+            cat <<'GDBEOF'
+break main.mach:22
+break main.mach:39
+break main.mach:50
+GDBEOF
+        fi
+        cat <<'GDBEOF'
 run
 echo SENTINEL:addone_stop\n
 frame 0
@@ -2264,6 +2387,24 @@ echo SENTINEL:step2\n
 step
 delete 2
 continue
+GDBEOF
+        # Bug B: this `continue` reaches accumulate's OWN ret statement before
+        # deadlocal's breakpoint, iff line 22 resolves to its real address rather
+        # than accumulate's entry (the bug: a duplicate row AT the entry, which
+        # this call already passed long before reaching this line, so a broken
+        # build never stops here at all and falls through straight to deadlocal -
+        # a wrong `accum_ret_stop_func` is exactly as loud a failure as a wrong
+        # `accum_ret_total`).
+        if [ "$profile" = debug ]; then
+            cat <<'GDBEOF'
+echo SENTINEL:accum_ret_stop\n
+frame 0
+echo SENTINEL:accum_ret_total\n
+print total
+continue
+GDBEOF
+        fi
+        cat <<'GDBEOF'
 echo SENTINEL:dead_stop\n
 frame 0
 echo SENTINEL:dead_v\n
@@ -2272,17 +2413,53 @@ echo SENTINEL:dead_unused\n
 print unused
 echo SENTINEL:dead_caller\n
 frame 1
+delete 3
 continue
 GDBEOF
+        # `delete 3` above (line 27, deadlocal's `ret`) before the `continue` that
+        # runs past it: at release, adding `dies` / `staysalive` to this file gives
+        # the optimizer more to fold, and it can unify a fragment of one of their
+        # tail sequences with deadlocal's own - gdb then resolves breakpoint 3 to a
+        # THIRD location inside `main`'s inlined call to `dies`, which stops the
+        # session there instead of letting the program finish (found by hand while
+        # adding these probes: the release transcript went from "exited normally"
+        # to no exit line and empty stdout at all, with no other change). deadlocal
+        # is called exactly once, so this deletion loses no coverage - the same
+        # reasoning `delete 2` already applies to the loop breakpoint above.
+        #
+        # Bug A pair: `next` past `val r = v + 1;` and re-read `v`. `dies` must
+        # report it unavailable once `r`'s storage takes over; `staysalive` - v
+        # read again on its own `ret` line - must keep reading the real value.
+        # Asserted together on purpose (see main.mach): a fix that reported
+        # `<optimized out>` for BOTH would pass either probe run alone.
+        if [ "$profile" = debug ]; then
+            cat <<'GDBEOF'
+echo SENTINEL:dies_v_before\n
+print v
+next
+echo SENTINEL:dies_v_after\n
+print v
+continue
+echo SENTINEL:stays_v_before\n
+print v
+next
+echo SENTINEL:stays_v_after\n
+print v
+continue
+GDBEOF
+        fi
+    } >"$script"
 
     transcript=$gdbtmp/transcript.txt
     gdb --batch -q -x "$script" "$g" >"$transcript" 2>&1
 
     # the program's own stdout is ground truth for the values gdb is asked to read
-    # back: a=addone's result, b=accumulate's, c=deadlocal's. cross-checking it
-    # against the golden's hand-computed values is what would catch a normalizer
-    # bug that made every gdb-side assertion vacuously agree with itself.
-    stdout=$(grep -E '^[abc]=[0-9]+$' "$transcript" | paste -sd, -)
+    # back: a=addone's result, b=accumulate's, c=deadlocal's, d=dies's, e=staysalive's
+    # (main.mach calls all five at both profiles, so this line needs no profile
+    # branch even though only debug walks the gdb-side d/e probes below). cross-
+    # checking it against the golden's hand-computed values is what would catch a
+    # normalizer bug that made every gdb-side assertion vacuously agree with itself.
+    stdout=$(grep -E '^[a-e]=[0-9]+$' "$transcript" | paste -sd, -)
     echo "program_stdout=$stdout"
     if grep -q 'exited normally' "$transcript"; then
         echo "exit=normal"
@@ -2445,21 +2622,21 @@ produce_const_pool() {
 # const_pool_scan — read a `-d -r` disassembly on stdin and print the pool observable
 const_pool_scan() {
     awk '
-    function demangle(s,   i, len, c, out) {
-        if (substr(s, 1, 2) != "_M") { return s }
-        i = 3
-        out = ""
-        while (i <= length(s)) {
-            c = substr(s, i, 1)
-            if (c == "N") { i++; continue }
-            if (c !~ /[0-9]/) { return s }
-            len = 0
-            while (i <= length(s) && substr(s, i, 1) ~ /[0-9]/) { len = len * 10 + substr(s, i, 1); i++ }
-            out = substr(s, i, len)
-            i += len
-        }
-        if (out == "") { return s }
-        return out
+    # strip a mangled name down to its bare identifier plus any `$` argument
+    # list: `std.types.option.unwrap$ptr` -> `unwrap$ptr`. an unmangled symbol
+    # (an `ext` / `#[symbol]` literal, a `.L` local) has no module path to strip
+    # and comes back untouched, which is what keeps `_start` and `main` readable.
+    function demangle(s,   head, i, p) {
+        if (substr(s, 1, 1) == ".") { return s }
+        # a `test "label"` symbol embeds the quoted label, whose own dots are not
+        # path separators; leave it whole rather than cutting inside the quotes.
+        if (index(s, "\"") > 0) { return s }
+        i = index(s, "$")
+        head = (i > 0) ? substr(s, 1, i - 1) : s
+        p = 0
+        for (i = length(head); i >= 1; i--) { if (substr(head, i, 1) == ".") { p = i; break } }
+        if (p == 0) { return s }
+        return substr(s, p + 1)
     }
     /file format/ {
         if      ($0 ~ /x86-64/)   { isa = "x86_64" }
@@ -2574,21 +2751,21 @@ vector_lanes_scan() { emit_scan lanes; }
 #               target's own golden, not an exemption.
 emit_scan() {
     awk -v mode="$1" '
-    function demangle(s,   i, len, c, out) {
-        if (substr(s, 1, 2) != "_M") { return s }
-        i = 3
-        out = ""
-        while (i <= length(s)) {
-            c = substr(s, i, 1)
-            if (c == "N") { i++; continue }
-            if (c !~ /[0-9]/) { return s }
-            len = 0
-            while (i <= length(s) && substr(s, i, 1) ~ /[0-9]/) { len = len * 10 + substr(s, i, 1); i++ }
-            out = substr(s, i, len)
-            i += len
-        }
-        if (out == "") { return s }
-        return out
+    # strip a mangled name down to its bare identifier plus any `$` argument
+    # list: `std.types.option.unwrap$ptr` -> `unwrap$ptr`. an unmangled symbol
+    # (an `ext` / `#[symbol]` literal, a `.L` local) has no module path to strip
+    # and comes back untouched, which is what keeps `_start` and `main` readable.
+    function demangle(s,   head, i, p) {
+        if (substr(s, 1, 1) == ".") { return s }
+        # a `test "label"` symbol embeds the quoted label, whose own dots are not
+        # path separators; leave it whole rather than cutting inside the quotes.
+        if (index(s, "\"") > 0) { return s }
+        i = index(s, "$")
+        head = (i > 0) ? substr(s, 1, i - 1) : s
+        p = 0
+        for (i = length(head); i >= 1; i--) { if (substr(head, i, 1) == ".") { p = i; break } }
+        if (p == 0) { return s }
+        return substr(s, p + 1)
     }
     function packed(m, rest) {
         if (isa == "x86_64") {
@@ -2857,10 +3034,13 @@ produce_varloc_fbreg() {
 }
 
 
-# produce <run> <runmode> <target> <binary> [<g_binary>]
+# produce <run> <runmode> <target> <binary> [<g_binary>] [<profile>]
 # dispatches to the producer named by <run>, forwarding the remaining arguments. the
 # debuginfo producer takes an extra `-g` artifact path run.sh built alongside the
 # default (no-`-g`) one; every other producer inspects the single default artifact.
+# <profile> is appended (not inserted) so every EXISTING producer's positional
+# reading is untouched by its addition; only gdb-session reads it, since only its
+# observable is a real function of the active profile's own codegen (#2779).
 produce() {
     run=$1
     shift
@@ -2888,6 +3068,7 @@ produce() {
         flat-loader) produce_flat_loader "$@" ;;
         built)       produce_built "$@" ;;
         debuginfo)   produce_debuginfo "$@" ;;
+        symtab)      produce_symtab "$@" ;;
         gdb-session) produce_gdb_session "$@" ;;
         spirv-val)   produce_spirv_val "$@" ;;
         spirv-val-vulkan) produce_spirv_val_vulkan "$@" ;;
