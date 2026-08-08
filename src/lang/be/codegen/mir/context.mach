@@ -908,16 +908,18 @@ pub fun mem_at(m: mir.MirOperand, off: i64) mir.MirOperand {
 # destination can be as weakly aligned as 1. OVERLAP cannot arise: the source is a
 # scratch slot minted here and dead after, so it aliases nothing the caller named.
 #
-# THE OVER-WIDTH DIRECTION IS REFUSED, NOT HANDLED. The predicate that selects this
-# path is an inequality, so it is true in both directions, and a vector WIDER than
-# the register (`f32x8`, once #2727 lifts the frontend's bound) would arrive here and
-# be spilled at the register's width into a scratch the object outgrows, then have
-# more bytes copied out of it than were ever written. That is a silent wrong answer,
-# which is the one outcome worth spending a branch to prevent. The over-width value's
-# realization is a SPLIT - N registers, or chunks - and a split is a multi-piece
-# placement, not a wider single move, so it belongs to the caller that decides the
-# placement rather than to this walk. Refused here so the day it becomes reachable is
-# a diagnostic naming the case and not a corrupted value.
+# THE OVER-WIDTH DIRECTION IS REFUSED, NOT HANDLED, AND IS UNREACHABLE (#2727). The
+# predicate that selects this path is an inequality, so it is true in both
+# directions, and a vector WIDER than the register would arrive here and be spilled
+# at the register's width into a scratch the object outgrows, then have more bytes
+# copied out of it than were ever written. That is a silent wrong answer, which is
+# the one outcome worth spending a branch to prevent.
+#
+# Such a value never gets here now: `me.pass.scalarize` places a vector no register
+# holds in memory before the back end sees it, so what reaches this walk is always a
+# register-resident vector with a smaller footprint. This stays as the backstop for
+# that invariant - a diagnostic naming the case rather than a corrupted value - and
+# is the assertion that the placement stage ran, not a gap in it.
 #
 # It lives here rather than in the IR-to-MIR store lowering that first needed it
 # because the ABI boundary needs the very same operation (#2687): an outgoing stack
@@ -937,6 +939,24 @@ pub fun store_subwidth_vector(ctx: *LowerCtx, mb: *mir.MirBlock, dest: mir.MirOp
     val reg_w: u8 = op_width_of(ctx, ty);
     if (mem_w > reg_w) {
         ret R.err[bool, str]("mir.context.store_subwidth_vector: vector wider than the target's vector register; an over-width vector's placement is a split, not a single move");
+    }
+    # THE DIRECT STORE (#2716): when one instruction moves exactly this footprint out
+    # of a vector register, that instruction IS the store - no scratch slot, no chunk
+    # walk, no GP register in the middle. `f32x2` and `i32x2` become one MOVSD or one
+    # `str d`, where they used to be a spill, two chunk copies and a slot.
+    #
+    # ASKED OF THE TARGET, not derived from the size. Whether a width crosses between
+    # a vector register and memory is an instruction-set fact and nothing else
+    # predicts it: 12 bytes is as lane-aligned as 8 and no baseline here moves it.
+    if (isa.moves_vector_memory(?ctx.tgt.model, mem_w::u32)) {
+        val dr: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
+        if (R.is_err[*mir.MirOperand, str](dr)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](dr)); }
+        val dops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](dr);
+        dops[0] = dest;
+        dops[1] = value;
+        var di: mir.MirInstr = mir.instr(mir.MIR_STORE, dops, 2, mem_w, mem_w);
+        di.vec_lane = vec_lane_for_type(ctx, ty);
+        ret push_instr(ctx, mb, di);
     }
     # the scratch is the REGISTER's width and the vector's own alignment, so the
     # whole-register spill into it is a legal aligned access.
@@ -1009,6 +1029,24 @@ pub fun load_subwidth_vector(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.MirOper
     if (mem_w > reg_w) {
         ret R.err[bool, str]("mir.context.load_subwidth_vector: vector wider than the target's vector register; an over-width vector's placement is a split, not a single move");
     }
+    # THE DIRECT LOAD (#2716), the mirror of the store's, and it satisfies BOTH of the
+    # reasons the scratch exists rather than only the obvious one. It reads exactly
+    # the object's own bytes, so an object ending at a page boundary does not fault;
+    # and the lanes past the footprint come back DEFINED ZERO, because zeroing them is
+    # part of what a target promises by declaring the width at all (`movss` / `movsd`
+    # and `ldr s` / `ldr d` all clear the bits above their operand). A width whose
+    # narrow load merged into the destination would leave frame residue in the lanes
+    # the type does not have, which is the leak this path must not open.
+    if (isa.moves_vector_memory(?ctx.tgt.model, mem_w::u32)) {
+        val dr: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
+        if (R.is_err[*mir.MirOperand, str](dr)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](dr)); }
+        val dops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](dr);
+        dops[0] = dst;
+        dops[1] = src;
+        var di: mir.MirInstr = mir.instr(mir.MIR_LOAD, dops, 2, mem_w, mem_w);
+        di.vec_lane = vec_lane_for_type(ctx, ty);
+        ret push_instr(ctx, mb, di);
+    }
     val align: u32 = ir_type.byte_align(ctx.types, ty, ctx.tgt);
     val skr: R.Result[u32, str] = new_vreg(ctx, mir.REG_CLASS_GP);
     if (R.is_err[u32, str](skr)) { ret R.err[bool, str](R.unwrap_err[u32, str](skr)); }
@@ -1068,9 +1106,11 @@ pub fun load_subwidth_vector(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.MirOper
 # It answers true in BOTH directions, deliberately. A vector wider than the register
 # also cannot cross to memory in one move, and it must reach the round-trip helpers
 # so they can refuse it by name rather than have it slip past a `mem_w < reg_w` test
-# into the single-move path and be silently truncated. Whoever implements the
-# over-width realization (#2727) replaces that refusal with the split; the predicate
-# itself already asks the right question and does not change.
+# into the single-move path and be silently truncated. #2727 realized the over-width
+# case UPSTREAM instead - such a value is placed in memory by `me.pass.scalarize` and
+# never reaches the back end as a vector at all - so the refusals are backstops on an
+# invariant rather than a gap. The predicate is unchanged either way, because it
+# always asked the right question.
 #
 # IT IS A FLAT-ADDRESSING QUESTION, and is gated on it (#2744), the same lever #2655
 # used for the float address materialization. Under a logical addressing model a
