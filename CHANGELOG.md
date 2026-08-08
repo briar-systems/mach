@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### Compiler output names functions the way the source spells them, not the way the linker does
+An `ir.Function` has carried two names for a while: `name`, the mangled linkage symbol, and `disp`, the bare source spelling. The house rule is to prefer `disp` and fall back to `name`, and the DWARF `DW_AT_name` producer, the IR verifier, the SPIR-V entry point and the `#[oblivious]` sema diagnostic all followed it. Everything else printed the symbol, so `--emit-ir` read `fn @_M4case4mainN5add32`, the `simd = "require"` refusal read ``in '_M4case4mainN5add32'``, and a regalloc failure, a constant-time refusal, an encoder ICE and every `--emit-asm` function heading did the same. None of those names anything a reader can find in a source file.
+
+The preference now has exactly one definition per layer - `ir.function_display` and `mir.function_display` - and every producer of text a person reads goes through one of them. The mangled symbol survives only where it IS the identity: an object symbol, a relocation, a linker diagnostic, and the `#[oblivious]` note that deliberately names one generic instantiation among many.
+
+Reaching the back end took a real change rather than a lookup: `EncodeFunctionFn`, the constant-time validator and regalloc all take a `mir.MirFunction` and no IR handle, so `MirFunction` now carries `disp` itself, stamped at lowering exactly as `oblivious` and `naked` already are. Widening those interfaces to carry a mid-end structure so a diagnostic could spell a name would have been the wrong direction.
+
+Two dumps keep both names, because in both the symbol is still load-bearing. `--emit-ir` writes `fn @add32(...): i32 symbol "_M4demo4mainN10echoI3i32E"` - source names are not unique across generic instantiations, and the header is where they are told apart. `--emit-asm` writes `# add32 (_M4case4mainN5add32):`, since the listing carries no `.globl` and that comment is the only place a function's identity appears in it. The heading's format is now defined once in `be/codegen/encode.mach` rather than three times, once per ISA printer.
+
+Display only: the compiler was built before and after and used to compile itself for all six targets, and the emitted binaries are byte-identical on every one.
+
+#### `int`'s shell demangler was a third copy of the mangling scheme, and disagreed with the other two
+`int/lib/produce.sh` carried the same ~18-line awk `demangle()` twice, hardcoding the `_M` prefix, the `N` separator and the length-prefixed-run grammar - a transcription of `src/lang/me/lower/mangle.mach` that agreed with it by accident. It mishandled the generic form, returning `unwrapI3ptrE` for `_M3std9allocatorN6unwrapI3ptrE`, and the value-instance `K...E` form did not exist to it at all.
+
+There is now one `_demangle_awk` definition, prepended to both scanners' programs, and a scheme change needs exactly that one shell edit. It parses the module path as the run of length-prefixed segments it is, takes the name as the run after `N`, and drops the `I...E` / `K...E` instance suffix - which is what these per-source-function shape observables want, and is written down as a limit rather than left to be discovered.
+
 #### A C `[step]` cross-builds for its leg instead of silently assuming the host toolchain targets it (#2741)
 `int/surface/narrow-stack-args` and `int/surface/c-variadic` shelled out to the bare host `cc` to build a probe object, which happens to target the leg on every CI runner (each builds natively) but not on a developer cross-building locally - `mach --target linux-arm64` on an x86-64 host still ran the host's x86-64 `cc`, silently linking an x86-64 object into an aarch64 image. That surfaced as `error: relocation 'plt32' to 'float_tail' overflows` on narrow-stack-args and a qemu `Illegal instruction` on c-variadic, neither of which names its actual cause.
 
@@ -30,6 +46,29 @@ That collapses the two rules that existed to compensate for the old reading. `re
 Consolidating them surfaced a disagreement the copies had been hiding. An `$each` loop variable is a **comptime** binding that resolve declares as a `SYM_VAL` bearing the comptime flag, and a rule keyed only on module scope classified it as runtime. The constant index bound consequently declined to decide any index driven by one, so `xs[e]` over an element out of range compiled clean and read past the array. It is now refused. `$` marks a comptime binding whatever its kind, and the rule says so once.
 
 A comptime binding that shadows a module constant still resolves innermost-first, which is the half of this that had to be preserved rather than changed: a `$param` or an `$each` variable named after a module constant denotes the inner one.
+
+#### A `#[uniform(...)]` block's offsets are checked against the SPIR-V layout rules (#2746)
+A descriptor block's member offsets were emitted straight from mach's own record layout, and exactly one of the rules Vulkan imposes on that layout was checked. A block whose members disagreed emitted a module a consumer rejects, with no diagnostic — a `rec` inside a block followed by a scalar produced **overlapping members**, and a `rec` inside a block is the natural way to write a camera or a material.
+
+std140 gives a struct member a base alignment of 16 and rounds its extent up to a multiple of 16; mach aligns a record to its largest member and does not round. A vector narrower than the vector register aligns to one lane in mach, where both std140 and std430 align it to two or four, so an `f32x2` or an `f32x3` member was a reachable disagreement in the **storage** posture too, which had been thought correct by construction.
+
+Every emitted offset is now held to the two conditions the specification states — a multiple of the member's base alignment, and past the end of the member before it — and an array stride to the element's extent rounded up to the array's base alignment. The two postures differ only in the 16-byte roundings std140 applies to an array and to a struct.
+
+A disagreement is **refused, never repacked**, which is the posture the one existing check already took and the reason it gave is the one that matters: the block's layout is the host's contract, and repacking would move the members out from under a host writing by `$offset_of`. The refusal names the member, the offset mach gives it, the offset the rules require, and which of the two conditions failed.
+
+#### A fragment stage's integer or 64-bit input carries its `Flat` decoration (#2747)
+Vulkan requires `Flat` on any fragment-stage `Input` of integer or 64-bit float type, because such a value cannot be interpolated. The emitter declared no `Flat` decoration at all, so every one of those was an invalid module. The decoration is now decided over the set of variables each stage can **reach**, which the per-stage reachability pass already computes.
+
+Vulkan also **forbids** `Flat` on a vertex-stage `Input`, so one module-scope variable read by both a vertex stage and a fragment stage has no valid decoration and is refused rather than decorated for one of them. The two readings are not the same value anyway: a vertex stage's input is a vertex attribute and a fragment stage's is the interpolated output of the stage before it.
+
+A `Location` was emitted verbatim and never checked. mach knows each variable's type and so knows how many locations it consumes, and two whose spans overlap within one stage are now refused naming both, rather than surfacing as a validator message naming an `OpEntryPoint` operand index.
+
+#### Recursion and a 15-parameter signature are refused rather than emitted (#2748)
+There was no whole-module well-formedness stage, so a rule about the module — its call graph, its id validity — had nowhere to live, and two reachable from ordinary source emitted invalid modules silently.
+
+A SPIR-V execution model has no call stack, so a cycle in the static call graph is refused before any body is emitted, naming the chain and saying why. This is checked rather than left to `spirv-val`, whose cycle rule is scoped to entry points: a **library** module carrying a cycle validated clean and would have failed in whatever consumer linked it into a pipeline. One had been sitting green in the integration suite.
+
+The parameter limit was two independent literals that disagreed: `emit_function` refused above 16 while `type_fn`'s fixed operand buffer failed above 14 and returned a 0 nobody read, which reached `OpFunction` as the reserved never-valid id. The limit is now stated once as `types.MAX_FN_PARAMS`, both sites read it, 15 and 16 parameters build and validate, and a 0 from `type_fn` is reported instead of passed on.
 
 ### Changed
 
@@ -58,7 +97,17 @@ The x86-64 read-only growth is the two 16-byte mask entries, one per width, shar
 
 Also fixed while here: `encode.intern_const` refused to check its interner and dereferenced a null one, crashing inside `intern` rather than naming the encoder that asked. It now reports.
 
+
 ## [4.16.0] - 2026-08-08
+
+### Added
+
+#### A real gdb session drives the DWARF the compiler emits (#2756)
+`int/surface/debuginfo` proves the `-g` image is structurally valid (`llvm-dwarfdump --verify` clean, `addr2line` round-trips); it cannot prove the DWARF describes the right thing, because a location list can be valid and still name a register the value has already left. Nothing in the harness drove an actual debugger, so that half of debug info was never checked.
+
+`int/surface/debugger-gdb` now does: one `gdb --batch` session per `opt` level breaks on a call inlined at release only (`#[inline]`, which the debug pipeline's no-inlining-pass makes a real call there instead) and reads its parameter back from whatever register or stack slot the location list names, breaks mid-loop on a local that stays register-resident for the whole loop and reads a running sum this case's own case.conf computes by hand, and confirms a local that is written and never read carries no location at either profile - "optimized out" is the correct answer there, not a gap. A single `step` off a loop body line is asserted to land on the condition check, then back into the body, by source line rather than instruction count.
+
+Scoped to the `linux` leg only: gdb is what a Linux runner carries (no lldb here), and this is the one leg whose result was read by hand against the source. `linux-arm64` runs gdb natively in CI and could plausibly carry this case too, but that leg's session was never exercised or hand-verified, so it - along with `linux-riscv64` (qemu-user has no ptrace story a host gdb can attach through), `windows`, and both `darwin` legs - stays explicitly unverified rather than assumed to work.
 
 ### Added
 
