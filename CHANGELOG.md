@@ -9,22 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-#### Compiler output names functions the way the source spells them, not the way the linker does
-An `ir.Function` has carried two names for a while: `name`, the mangled linkage symbol, and `disp`, the bare source spelling. The house rule is to prefer `disp` and fall back to `name`, and the DWARF `DW_AT_name` producer, the IR verifier, the SPIR-V entry point and the `#[oblivious]` sema diagnostic all followed it. Everything else printed the symbol, so `--emit-ir` read `fn @_M4case4mainN5add32`, the `simd = "require"` refusal read ``in '_M4case4mainN5add32'``, and a regalloc failure, a constant-time refusal, an encoder ICE and every `--emit-asm` function heading did the same. None of those names anything a reader can find in a source file.
-
-The preference now has exactly one definition per layer - `ir.function_display` and `mir.function_display` - and every producer of text a person reads goes through one of them. The mangled symbol survives only where it IS the identity: an object symbol, a relocation, a linker diagnostic, and the `#[oblivious]` note that deliberately names one generic instantiation among many.
-
-Reaching the back end took a real change rather than a lookup: `EncodeFunctionFn`, the constant-time validator and regalloc all take a `mir.MirFunction` and no IR handle, so `MirFunction` now carries `disp` itself, stamped at lowering exactly as `oblivious` and `naked` already are. Widening those interfaces to carry a mid-end structure so a diagnostic could spell a name would have been the wrong direction.
-
-Two dumps keep both names, because in both the symbol is still load-bearing. `--emit-ir` writes `fn @add32(...): i32 symbol "_M4demo4mainN10echoI3i32E"` - source names are not unique across generic instantiations, and the header is where they are told apart. `--emit-asm` writes `# add32 (_M4case4mainN5add32):`, since the listing carries no `.globl` and that comment is the only place a function's identity appears in it. The heading's format is now defined once in `be/codegen/encode.mach` rather than three times, once per ISA printer.
-
-Display only: the compiler was built before and after and used to compile itself for all six targets, and the emitted binaries are byte-identical on every one.
-
-#### `int`'s shell demangler was a third copy of the mangling scheme, and disagreed with the other two
-`int/lib/produce.sh` carried the same ~18-line awk `demangle()` twice, hardcoding the `_M` prefix, the `N` separator and the length-prefixed-run grammar - a transcription of `src/lang/me/lower/mangle.mach` that agreed with it by accident. It mishandled the generic form, returning `unwrapI3ptrE` for `_M3std9allocatorN6unwrapI3ptrE`, and the value-instance `K...E` form did not exist to it at all.
-
-There is now one `_demangle_awk` definition, prepended to both scanners' programs, and a scheme change needs exactly that one shell edit. It parses the module path as the run of length-prefixed segments it is, takes the name as the run after `N`, and drops the `I...E` / `K...E` instance suffix - which is what these per-source-function shape observables want, and is written down as a limit rather than left to be discovered.
-
 #### A C `[step]` cross-builds for its leg instead of silently assuming the host toolchain targets it (#2741)
 `int/surface/narrow-stack-args` and `int/surface/c-variadic` shelled out to the bare host `cc` to build a probe object, which happens to target the leg on every CI runner (each builds natively) but not on a developer cross-building locally - `mach --target linux-arm64` on an x86-64 host still ran the host's x86-64 `cc`, silently linking an x86-64 object into an aarch64 image. That surfaced as `error: relocation 'plt32' to 'float_tail' overflows` on narrow-stack-args and a qemu `Illegal instruction` on c-variadic, neither of which names its actual cause.
 
