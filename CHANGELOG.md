@@ -5,22 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Fixed
-
-#### A constant out-of-bounds index is refused, on every target (#2751)
-`var xs: [4]i32; ret xs[9];` compiled cleanly on x86-64, aarch64 and riscv64, and on SPIR-V emitted an `OpAccessChain` with `%uint_9` into a four-element array that `spirv-val` did not catch either. The length is part of the type and the index is a constant, so the violation was decidable with no analysis at all. It had simply never been asked.
-
-Sema now asks it, keyed on `type.element_count` — the one definition of "how many elements a type holds", the same answer `$length_of` gives. Keying on the count rather than on the syntax is what makes the spellings free: a `def` alias, an array field of a generic instance, an array nested in a record or in another array, and a `^`-qualified array all name the same interned array type, and all get the same refusal. A vector's lane count is a statically known length too and now takes the identical rule and the identical message, replacing the vector-only wording it had before.
-
-The diagnostic names the index, the type and the length: ``index 9 is out of bounds for `[4]i32` of length 4``.
-
-Scope is deliberate. Only a **constant** index against a **fixed** length is checked, which needs no dataflow. A runtime index is not checked, and a pointer is not checked at all — `*T` carries no length to measure against.
-
-Folding the index now decides on **resolution identity** rather than on name text. The comptime environment is keyed by name, so a block-local `var n` that shares its name with a module-level `val n` used to fold to the module constant. That was already visible on the vector path, where `v[n]` with a local `n = 1` was reported as an out-of-bounds lane against a module-level `n = 9`; it now reports the dynamic-lane refusal it should always have given, and an array indexed by such a local is correctly left alone rather than refused. The runtime-binding rule the `$if` gate check already carried is now one shared definition.
+## [4.16.0] - 2026-08-08
 
 ### Added
+
+#### An integer vector multiply works on every target (#2726, #2721)
+`i32x4 * i32x4` was refused at the language level on **every** target, citing x86-64's SSE2 baseline, where `pmulld` is SSE4.1. That refused it on aarch64, whose NEON hardware has the instruction, and on riscv64, which has no vector unit at all and would have lowered it to four ordinary scalar multiplies.
+
+The legality of a vector operation is a **target-independent** fact; only its realization is target-dependent. The rule lived in three places and now consults one authority, `isa.packed_width(model, op, is_float, lane_bits)`, which answers the width of the target's packed form and zero where there is none. Sema no longer asks the question at all, because it is not a legality question. Where a packed form is missing the operation takes the existing per-lane scalar expansion, and `simd = "require"` reports it naming the operation and lane width.
+
+The authority is keyed on **lane width**, never lane count or total width, so splitting a wider-than-register vector into chunks does not change the answer. It declares **gaps rather than presence**, because a presence table would be roughly eighty rows per target and the row that mattered would be the missing one.
+
+Also pinned as part of this: aarch64's NEON integer-multiply arrangements are now byte-exact against the ARM ARM, and a 64-bit lane arrangement reaching the selector is a defined encoder error rather than an emitted `mul v.2d`, which is unallocated. The word's comment previously claimed it was "legal only on .8h", which was wrong in both directions.
 
 #### `$is_secret(T)`, so a reflection walk can act on secrecy instead of refusing it (#2694)
 Every comptime predicate asks about the shape **under** a `^`, so all of them answer false for a secret. `$is_record(^u64)` and `$is_record(u64)` were therefore the same answer, and a `std.derive` walk could only ever meet a secret field as a fallthrough it had to refuse. That is a refusal, not a decision, and it blocked all three things a derive actually wants: a formatter that redacts a secret field, a hash that refuses one (a data-dependent fold is a leak in the shape of a digest), and an equality that selects the constant-time comparison rather than the early-out whose timing is the secret.
@@ -64,6 +60,17 @@ The refusal is sequencing rather than policy, and it was waiting on two conditio
 The refusal itself is unchanged. Its diagnostic and `doc/language/decorators.md` now name what actually remains.
 
 ### Fixed
+
+#### A constant out-of-bounds index is refused, on every target (#2751)
+`var xs: [4]i32; ret xs[9];` compiled cleanly on x86-64, aarch64 and riscv64, and on SPIR-V emitted an `OpAccessChain` with `%uint_9` into a four-element array that `spirv-val` did not catch either. The length is part of the type and the index is a constant, so the violation was decidable with no analysis at all. It had simply never been asked.
+
+Sema now asks it, keyed on `type.element_count` — the one definition of "how many elements a type holds", the same answer `$length_of` gives. Keying on the count rather than on the syntax is what makes the spellings free: a `def` alias, an array field of a generic instance, an array nested in a record or in another array, and a `^`-qualified array all name the same interned array type, and all get the same refusal. A vector's lane count is a statically known length too and now takes the identical rule and the identical message, replacing the vector-only wording it had before.
+
+The diagnostic names the index, the type and the length: ``index 9 is out of bounds for `[4]i32` of length 4``.
+
+Scope is deliberate. Only a **constant** index against a **fixed** length is checked, which needs no dataflow. A runtime index is not checked, and a pointer is not checked at all — `*T` carries no length to measure against.
+
+Folding the index now decides on **resolution identity** rather than on name text. The comptime environment is keyed by name, so a block-local `var n` that shares its name with a module-level `val n` used to fold to the module constant. That was already visible on the vector path, where `v[n]` with a local `n = 1` was reported as an out-of-bounds lane against a module-level `n = 9`; it now reports the dynamic-lane refusal it should always have given, and an array indexed by such a local is correctly left alone rather than refused. The runtime-binding rule the `$if` gate check already carried is now one shared definition.
 
 #### The debug-info validator's warnings are now an observable, not a wall (#2755)
 `int/surface/debuginfo` read `llvm-dwarfdump --verify`'s exit status, which is zero on warnings. So "no diagnostics at all" and "no errors, plus a standing wall of about 200 warnings on every `-g` image" both rendered `dwarfdump_verify=clean`, and the golden recorded the second while claiming the first. That is how a validator stops validating: the next real warning arrives into a stream nobody reads.
@@ -111,6 +118,7 @@ A function whose frame contains an over-aligned slot now gets a prologue that ma
 The decision is recorded once, on `MirFrame`, and every encoder reads it. So is the distance from the stack pointer to the slot region's base, which aarch64 and riscv64 had each been re-deriving for inline-asm `{name}` operands since #2689.
 
 The cost falls only on functions that ask: one masking instruction and up to `N - 16` bytes of frame. A function with nothing over-aligned emits a byte-identical prologue to before.
+
 #### A sub-width vector could not reach a SPIR-V shader's interface, or be declared as a zeroed local (#2744, #2758)
 `#[input(0)] var a: f32x3;` could not be read or written at all. Neither could an `#[output]` or a `#[builtin]` of `f32x2` or `u32x3`, and neither could a local declared without an initializer - `var v: f32x3;` was refused at every **read** of the slot while `var v: f32x3 = a;` beside it was fine. `f32x4` and `f64x2` worked throughout. A vec3 vertex attribute is one of the two live needs #2687 names, and a vertex attribute that cannot be read is not one.
 
