@@ -83,6 +83,26 @@ Every float encoder on every register machine now refuses a width it does not im
 
 The aarch64 calling convention's two `make_slot_hfa(reg, 1, 16, size)` literals are on the same path and are now written as what they are: the **V register** width, not the vector's. A `f32x3` is twelve bytes and rides a whole register, so "correcting" the literal to `size` breaks it - which is measured, not supposed. What the literal did hide is the vector too wide for one register that #2727 makes legal, which would have been handed V0 and a piece describing half of it; those now spill by value and return indirectly.
 
+#### `--emit-ir` shows a float constant, not its truncated integer magnitude (#2753)
+Every float constant in an IR dump rendered as the integer part of its magnitude, so the surface could not show any distinction living below the decimal point, at the top of the range, or at the bottom of it. `1.5` and `1.75` both printed `f1`. A positive infinity printed `f9223372036854775808`, which is also what the finite value 2^63 printed, so an infinity read as a plausible finite number and the two were indistinguishable. The smallest denormal printed `f0`.
+
+The middle end never lost any of this: `me/pass/cse.mach` value-numbers float constants by bit pattern and `me/pass/algebraic.mach` declines to fold `x + 0.0`, precisely so the IR keeps IEEE distinctions apart. Only the view collapsed them, which matters because a dump is what someone reads when they already suspect a float bug and the fraction is the evidence.
+
+Constants now render through `std.format.write_f64` in shortest round-trippable decimal, so `f1.5`, `f1.75`, `f5e-324` and `f9.223372036854776e18` are each themselves, and the non-finite classes spell themselves as `finf`, `f-inf` and `fnan` rather than borrowing an integer. A NaN whose payload is not the canonical quiet one renders its full bit pattern as `fnan:0x…`, since a payload is a distinction the middle end keeps too. Signed zero still renders `f-0` and `f0`, which #2274 established.
+
+The reason recorded in the code for the old rendering - that std had no float formatter - had gone stale; `printer.mach` already imported `std.format`. The unit test that pinned `-1.5` to `f-1` and `2.5` to `f2` was enforcing the defect rather than any intended behaviour, and now pins the real rendering across the IEEE classes, built from bit patterns rather than decimal literals. Objects are byte-identical: this moves nothing but the dump.
+
+#### A riscv64 `-g` local is described where it actually lives (#2759)
+Every `-g` variable in a frame slot was described at the wrong address on riscv64, by exactly the bytes the prologue reserves at the top of the frame. The debug-info producer recorded the raw slot offset while the encoder biases every slot access down past the ra/s0 record and the callee-saved GP and FP areas, so a debugger read `s0 + slot.offset` where the machine had written `s0 - reserved_top + slot.offset`. In a function with callee-saves live that lands in the save area: measured on a fixture with six callee-saved GP and three FP registers, the reservation is 88 bytes, the variable is at `s0 - 104`, and `DW_OP_fbreg -16` pointed at the saved `s0`. Silent, because the value has the variable's type and a plausible magnitude.
+
+One layout fact was derived twice, and the two derivations agreed on x86-64 and aarch64, whose reservation is zero. That is why it went unnoticed, and it is the same shape as #2715, #2725 and #2735.
+
+There is now one derivation. `MirFrame.fp_dist` - the bytes between the frame pointer and the slot region's base - is stamped once by the target's own encoder alongside `base_dist`, its stack-pointer-side twin, and both the encoder's own slot accesses and the `DW_OP_fbreg` offset read it. `frame.slot_offset` no longer takes a caller-supplied bias, so there is no longer a reader that can forget to apply it.
+
+`int/regression/2759-riscv64-fbreg-bias` pins it by crossing the two halves against each other: every `DW_OP_fbreg` offset must name an address the same function's emitted code addresses from the register `DW_AT_frame_base` names. Reading the offset alone cannot see this, since a producer with its own derivation is self-consistent under the bug. The case runs on all three ELF legs, and against the unpatched compiler it is green on x86-64 and aarch64 and red on riscv64 alone.
+
+`.text` is byte-identical with and without `-g` on every target, and `.debug_info` is byte-identical before and after on x86-64 and aarch64.
+
 #### An over-aligned stack local is over-aligned at run time (#2735)
 `#[align(32)]` and above worked on a global and did nothing on a local. The slot's offset was a correct multiple of the requested alignment, but it was measured from the frame pointer, and the only alignment that reaches the frame pointer is the ABI's 16-byte call boundary. So the address was a multiple of 32 exactly when the process stack happened to start on one, which depends on the environment block and therefore changes between runs of the same binary. `$size_of` already reported the padded size, so the storage was sized for a promise the placement did not keep.
 
@@ -91,6 +111,24 @@ A function whose frame contains an over-aligned slot now gets a prologue that ma
 The decision is recorded once, on `MirFrame`, and every encoder reads it. So is the distance from the stack pointer to the slot region's base, which aarch64 and riscv64 had each been re-deriving for inline-asm `{name}` operands since #2689.
 
 The cost falls only on functions that ask: one masking instruction and up to `N - 16` bytes of frame. A function with nothing over-aligned emits a byte-identical prologue to before.
+#### A sub-width vector could not reach a SPIR-V shader's interface, or be declared as a zeroed local (#2744, #2758)
+`#[input(0)] var a: f32x3;` could not be read or written at all. Neither could an `#[output]` or a `#[builtin]` of `f32x2` or `u32x3`, and neither could a local declared without an initializer - `var v: f32x3;` was refused at every **read** of the slot while `var v: f32x3 = a;` beside it was fine. `f32x4` and `f64x2` worked throughout. A vec3 vertex attribute is one of the two live needs #2687 names, and a vertex attribute that cannot be read is not one.
+
+Both were the same lowering. A vector whose memory footprint is narrower than its register cannot cross between the two in one access on a byte-addressed machine, so #2687 routed every such move through a register-width scratch slot walked in 8/4/2/1 chunks - and applied it on **every** target. Under logical addressing there is no register and no byte footprint: a value is one value at one type. Running the round trip there costs three things the target cannot express at all - a scratch slot the vector is not typed at, byte-sized chunk accesses of it, and a reinterpreting load back out - and it destroys the direct symbol reference the emitter reaches an interface variable through.
+
+It is now gated on `MachineModel.flat_addressing`, the same lever #2655 used for the float address materialization that made scalar `f32` varyings unreachable for the same kind of reason. **No machine target changed**, asserted rather than assumed: `int/surface/vector-subwidth` builds byte-identical on linux-x86_64, linux-arm64 and linux-riscv64 in both profiles.
+
+The refusal that reported this was worse than the defect it reported. It keyed on the address's origin and then sent three of the four origins to one sentence about module-scope interface variables, so a program holding no module-scope variable at all was told that a module-scope variable is reachable only when it carries an interface role - sending two readers to a role they had already written. Every origin has its own arm now, and the one for an interface variable that *does* carry a role says what is actually wrong: the access reached the back end as computed addressing rather than as a direct reference, which is a lowering that ran where it should not have and not a limit of the declaration.
+
+#### The `uvec3` compute built-ins were refused on a rule #2687 deleted, and no built-in's type was checked (#2745)
+`#[builtin("global_invocation")]`, `local_invocation` and `workgroup_id` were refused by name, on the ground that SPIR-V specifies them as three-component unsigned vectors and every mach vector is exactly 128 bits, so `u32x3` could not exist. That stopped being true when #2687 landed, which left the diagnostic a false statement about the language and a compute stage unable to know which invocation it is.
+
+The wider hole was that **no** built-in's declared type was checked, at any of the eight. `#[builtin("position")] var p: i32;` was accepted by the emitter and rejected by `spirv-val`, and nothing covered it.
+
+So the refusal inverts into the check its own comment said it wanted. One table gives every built-in the type SPIR-V specifies for it, and a variable declared at anything else is refused by a message naming both the declared type and the required one. Adding a built-in is a row in `builtin_selector`, a row in `builtin_storage` and now a row here, and it cannot be added without the third. Signedness is not checked because nothing can distinguish it: IR carries an integer's width and nothing else, and the emitter writes `OpTypeInt n 0` for both spellings.
+
+`GLSL.std.450 Cross` becomes a row alongside it. It is defined only for three-component float vectors, so it was cut pending exactly this ABI work.
+
 #### Every SPIR-V operation on a sub-width vector was mistyped (#2743)
 A vector narrower than 128 bits reached the SPIR-V target correctly as a type and was computed on as if it had four lanes. `fun add3(a: f32x3, b: f32x3) f32x3 { ret a + b; }` built with no diagnostic and emitted `OpFAdd %v4float` inside a function declared `%v3float`, which the Khronos validator rejects. Arithmetic, bitwise, comparison-to-mask and lane writes were all affected, on every shape that is not exactly one 128-bit register, and a vector literal was the single spelling that failed loudly - as an internal error with no source location, because it is the one site that counted operands.
 

@@ -77,6 +77,13 @@
 #                 not alias live line/location metadata, and live names symbolize.
 #                 requires llvm-dwarfdump, llvm-symbolizer, and readelf; it runs only
 #                 on the ELF debug-info legs, which install them.
+#   varloc-fbreg— build the case with and without `-g` (run.sh builds both) and cross
+#                 the two halves of a frame-slot variable location against each other:
+#                 every `DW_OP_fbreg` offset must name an address the function's own
+#                 emitted code addresses from the same frame-base register. reading
+#                 the offset alone cannot see #2759, because a producer that derives
+#                 it a second way is self-consistent under the bug. requires
+#                 llvm-dwarfdump and llvm-objdump.
 #   spirv-val   — validate every `.spv` module a finished-module target delivered
 #                 with the Khronos validator (spirv-tools), in its universal
 #                 environment. `spirv-val-vulkan` is the same check under the
@@ -2587,6 +2594,140 @@ produce_frame_elision() {
     dis_case_objects frame-elision "$3" | frame_elision_scan
 }
 
+# produce_varloc_fbreg <runmode> <target> <nog_binary> <g_binary>
+# the FRAME-SLOT VARIABLE LOCATION observable (#2759): does a `DW_OP_fbreg` offset name
+# an address the emitted code actually uses for that slot.
+#
+# the offset alone is not evidence. the producer and the encoder each turn one layout
+# fact - the bytes the prologue reserves between the frame pointer and the slot region -
+# into an address, and a producer that derives it a second way is perfectly
+# self-consistent while pointing at the wrong bytes. it agreed with the encoder on
+# x86-64 and aarch64, whose reservation is 0, and was wrong by 16 to 200 bytes on every
+# riscv64 function, which is why nothing saw it. so the observable crosses the two:
+# for each subprogram, every `DW_OP_fbreg` offset must appear as a displacement in some
+# instruction of that same function that names the register `DW_AT_frame_base` names.
+#
+# the two counts are ISA-independent by construction, so the golden is shared:
+#   checked=<n>   offsets crossed. zero would make `unbacked` vacuous, so it is stated
+#   unbacked=<n>  offsets no emitted access backs. the invariant is 0 on every target
+#
+# the displacement set is read coarsely - every integer literal on an instruction line
+# mentioning the frame-base register - because the three ISAs spell a frame access three
+# ways and a large offset is spelled a fourth (materialized into a scratch register
+# first). coarse in the permissive direction only: it can accept an offset it should
+# have rejected, never reject a correct one, and #2759's offsets miss the real set by
+# the whole reservation rather than narrowly. requires llvm-dwarfdump and llvm-objdump.
+produce_varloc_fbreg() {
+    g=$4
+    dd_tool=$(resolve_dwarfdump) || {
+        echo "int: varloc-fbreg: llvm-dwarfdump not found (install the 'llvm' package)" >&2; return 2
+    }
+    od_tool=$(resolve_objdump) || {
+        echo "int: varloc-fbreg: llvm-objdump not found (install the 'llvm' package)" >&2; return 2
+    }
+
+    # one record per subprogram that has a machine range and at least one fbreg
+    # variable: "lo hi framebase-register off,off,..."
+    "$dd_tool" --debug-info "$g" 2>/dev/null | awk '
+        function flush(   i) {
+            if (lo != "" && hi != "" && fb != "" && offs != "") { print lo, hi, fb, offs }
+            lo = ""; hi = ""; fb = ""; offs = ""
+        }
+        /DW_TAG_subprogram/ { flush(); next }
+        # only the subprogram own range: an inlined-subroutine or lexical-block DIE
+        # nested inside it carries a low_pc too, and it is printed after the frame base.
+        /DW_AT_low_pc/  { if (fb == "" && match($0, /0x[0-9a-f]+/)) { lo = substr($0, RSTART, RLENGTH) } next }
+        /DW_AT_high_pc/ { if (fb == "" && match($0, /0x[0-9a-f]+/)) { hi = substr($0, RSTART, RLENGTH) } next }
+        # the DWARF register NUMBER, not the name llvm-dwarfdump prints beside it: it
+        # spells the aarch64 frame pointer W29 while the disassembler spells it x29.
+        /DW_AT_frame_base/ { if (match($0, /DW_OP_reg[0-9]+/)) { fb = substr($0, RSTART + 9, RLENGTH - 9) } next }
+        /DW_OP_fbreg/ {
+            s = $0
+            while (match(s, /DW_OP_fbreg [+-]?[0-9]+/)) {
+                o = substr(s, RSTART, RLENGTH); sub(/^DW_OP_fbreg /, "", o); sub(/^\+/, "", o)
+                offs = (offs == "") ? o : offs "," o
+                s = substr(s, RSTART + RLENGTH)
+            }
+            next
+        }
+        END { flush() }
+    ' > "$g.fns" || return 1
+
+    "$od_tool" -d --no-show-raw-insn "$g" 2>/dev/null > "$g.dis" || return 1
+
+    case "$2" in
+        *riscv64*) fb_isa=riscv64 ;;
+        *arm64*|*aarch64*) fb_isa=aarch64 ;;
+        *) fb_isa=x86_64 ;;
+    esac
+
+    awk -v fns="$g.fns" -v isa="$fb_isa" '
+        function hex2dec(h,   v, i, c, d) {
+            sub(/^0x/, "", h); v = 0
+            for (i = 1; i <= length(h); i++) {
+                c = tolower(substr(h, i, 1)); d = index("0123456789abcdef", c) - 1
+                v = v * 16 + d
+            }
+            return v
+        }
+        # the frame-base register as the disassembler spells it, from the DWARF number.
+        # only two can appear: the frame pointer, and the stack pointer for a function
+        # with no frame record (`dwarf.frame_base_omit_reg`).
+        function disname(n) {
+            if (isa == "riscv64") { if (n == 8)  { return "s0"   } if (n == 2)  { return "sp"   } }
+            if (isa == "aarch64") { if (n == 29) { return "x29"  } if (n == 31) { return "sp"   } }
+            if (isa == "x86_64")  { if (n == 6)  { return "%rbp" } if (n == 7)  { return "%rsp" } }
+            return ""
+        }
+        BEGIN {
+            n = 0
+            while ((getline line < fns) > 0) {
+                split(line, f, " ")
+                r = disname(f[3] + 0)
+                if (r == "") { continue }
+                n++; flo[n] = hex2dec(f[1]); fhi[n] = hex2dec(f[2]); freg[n] = r; foffs[n] = f[4]
+            }
+            close(fns)
+        }
+        # "  4076a0: sd a0, -0x68(s0)"
+        /^[ ]*[0-9a-f]+:/ {
+            addr = $1; sub(/:$/, "", addr); a = hex2dec("0x" addr)
+            for (i = 1; i <= n; i++) {
+                if (a >= flo[i] && a < fhi[i]) {
+                    if (index($0, freg[i]) == 0) { break }
+                    s = $0
+                    while (match(s, /-?0x[0-9a-f]+/)) {
+                        t = substr(s, RSTART, RLENGTH)
+                        neg = (substr(t, 1, 1) == "-")
+                        v = hex2dec(neg ? substr(t, 2) : t); if (neg) { v = -v }
+                        seen[i "/" v] = 1
+                        s = substr(s, RSTART + RLENGTH)
+                    }
+                    break
+                }
+            }
+        }
+        END {
+            checked = 0; unbacked = 0
+            for (i = 1; i <= n; i++) {
+                c = split(foffs[i], o, ",")
+                for (j = 1; j <= c; j++) {
+                    checked++
+                    if (!((i "/" (o[j] + 0)) in seen)) { unbacked++ }
+                }
+            }
+            # the count itself is ISA-dependent (the three back ends put different
+            # variables in slots), so only its being nonzero is stated - without which
+            # `unbacked=0` would be vacuous. the invariant is exact.
+            print "varloc_fbreg_checked=" (checked > 0 ? "nonzero" : "zero")
+            print "varloc_fbreg_unbacked=" unbacked
+        }
+    ' "$g.dis"
+    rc=$?
+    rm -f "$g.fns" "$g.dis"
+    return $rc
+}
+
 
 # produce <run> <runmode> <target> <binary> [<g_binary>]
 # dispatches to the producer named by <run>, forwarding the remaining arguments. the
@@ -2625,6 +2766,7 @@ produce() {
         vector-emit) produce_vector_emit "$@" ;;
         vector-lanes) produce_vector_lanes "$@" ;;
         frame-elision) produce_frame_elision "$@" ;;
+        varloc-fbreg) produce_varloc_fbreg "$@" ;;
         float-emit)  produce_float_emit "$@" ;;
         const-pool)  produce_const_pool "$@" ;;
         *) echo "int: unknown run mode '$run'" >&2; return 2 ;;

@@ -400,8 +400,8 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
     # hold identically on every ELF ISA) and per-build-target for structural producers
     # (their fact is format-specific).
     case "$case_run" in
-        exec|relro-fault|panic-exit|debuginfo) golden="$dir/expect.txt" ;;
-        *)                                     golden="$dir/expect.$build_target.txt" ;;
+        exec|relro-fault|panic-exit|debuginfo|varloc-fbreg) golden="$dir/expect.txt" ;;
+        *)                                                 golden="$dir/expect.$build_target.txt" ;;
     esac
 
     # once per case, not per profile: `dep pull` honors the lock left by the first
@@ -507,12 +507,12 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
                 continue
             fi
 
-            # the debuginfo producer inspects the artifact built with and without `-g`:
+            # a debug-info producer inspects the artifact built with and without `-g`:
             # the default build above is the no-`-g` one; build the `-g` twin here (same
             # compiler / target / profile / flags, plus `-g`) and hand its path to the
             # producer as an extra argument. every other producer inspects only `$bin`.
             gbin=
-            if [ "$case_run" = debuginfo ]; then
+            if [ "$case_run" = debuginfo ] || [ "$case_run" = varloc-fbreg ]; then
                 gbin="$dir/out/int/prog-g$exe"
                 if ! (cd "$dir" && $buildcc build . --target "$build_target" --profile "$profile" $case_build_flags -g -o "out/int/prog-g$exe") >"$tmp/build-g.log" 2>&1; then
                     echo "FAIL $flabel (build -g)"
