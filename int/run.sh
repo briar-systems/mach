@@ -397,11 +397,13 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
     # the golden is shared across build-targets for target-independent observables (exec,
     # the relro-fault guard, and the panic-exit guard, whose outputs are all
     # target-independent; debuginfo, whose two facts — validator-clean and additive —
-    # hold identically on every ELF ISA) and per-build-target for structural producers
-    # (their fact is format-specific).
+    # hold identically on every ELF ISA; gdb-session, whose stop/frame/value facts are
+    # verified by hand to read identically at both opt levels and, were a second ELF
+    # leg ever added to its case.conf, would hold there too) and per-build-target for
+    # structural producers (their fact is format-specific).
     case "$case_run" in
-        exec|relro-fault|panic-exit|debuginfo|varloc-fbreg) golden="$dir/expect.txt" ;;
-        *)                                                 golden="$dir/expect.$build_target.txt" ;;
+        exec|relro-fault|panic-exit|debuginfo|varloc-fbreg|gdb-session) golden="$dir/expect.txt" ;;
+        *)                                                             golden="$dir/expect.$build_target.txt" ;;
     esac
 
     # once per case, not per profile: `dep pull` honors the lock left by the first
@@ -512,7 +514,7 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
             # compiler / target / profile / flags, plus `-g`) and hand its path to the
             # producer as an extra argument. every other producer inspects only `$bin`.
             gbin=
-            if [ "$case_run" = debuginfo ] || [ "$case_run" = varloc-fbreg ]; then
+            if [ "$case_run" = debuginfo ] || [ "$case_run" = varloc-fbreg ] || [ "$case_run" = gdb-session ]; then
                 gbin="$dir/out/int/prog-g$exe"
                 if ! (cd "$dir" && $buildcc build . --target "$build_target" --profile "$profile" $case_build_flags -g -o "out/int/prog-g$exe") >"$tmp/build-g.log" 2>&1; then
                     echo "FAIL $flabel (build -g)"

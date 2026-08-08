@@ -5,7 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [4.16.0] - 2026-08-08
+## [Unreleased]
+
+### Added
+
+#### A real gdb session drives the DWARF the compiler emits (#2756)
+`int/surface/debuginfo` proves the `-g` image is structurally valid (`llvm-dwarfdump --verify` clean, `addr2line` round-trips); it cannot prove the DWARF describes the right thing, because a location list can be valid and still name a register the value has already left. Nothing in the harness drove an actual debugger, so that half of debug info was never checked.
+
+`int/surface/debugger-gdb` now does: one `gdb --batch` session per `opt` level breaks on a call inlined at release only (`#[inline]`, which the debug pipeline's no-inlining-pass makes a real call there instead) and reads its parameter back from whatever register or stack slot the location list names, breaks mid-loop on a local that stays register-resident for the whole loop and reads a running sum this case's own case.conf computes by hand, and confirms a local that is written and never read carries no location at either profile - "optimized out" is the correct answer there, not a gap. A single `step` off a loop body line is asserted to land on the condition check, then back into the body, by source line rather than instruction count.
+
+Scoped to the `linux` leg only: gdb is what a Linux runner carries (no lldb here), and this is the one leg whose result was read by hand against the source. `linux-arm64` runs gdb natively in CI and could plausibly carry this case too, but that leg's session was never exercised or hand-verified, so it - along with `linux-riscv64` (qemu-user has no ptrace story a host gdb can attach through), `windows`, and both `darwin` legs - stays explicitly unverified rather than assumed to work.
 
 ### Added
 
