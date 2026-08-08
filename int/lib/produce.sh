@@ -122,6 +122,13 @@
 #                 vector went to memory (#2236). the same blind spot as vector-emit:
 #                 lane access through a stack round-trip computes the right answer, so
 #                 only the emitted form distinguishes it. needs llvm-objdump.
+#   call-shape  — disassemble the case's own objects and report, per function, how many
+#                 calls its emitted code still makes (#2231). the same blind spot as
+#                 vector-emit, and the sharpest instance of it: a call and the body
+#                 inlined in its place compute the same value by definition, so a
+#                 run-and-compare case cannot tell an inliner that works from one that
+#                 has stopped. reports a COUNT so the `#[noinline]` / undecorated
+#                 opt-outs are pinned by the same numbers. needs llvm-objdump.
 #   float-emit  — disassemble the case's own objects and report, per function, how
 #                 many emitted instructions name the back end's reserved FP scratch
 #                 registers (#2237). the same argument as vector-emit: an encoder
@@ -2840,8 +2847,27 @@ vector_lanes_scan() { emit_scan lanes; }
 #     riscv64 — no 128-bit vector model at all: every vector is scalarized into
 #               ordinary integer loads and stores, so both facts are 0 - the
 #               target's own golden, not an exemption.
+#
+#   calls     — `<function> calls=<count>`, how many calls the emitted code still
+#               makes (#2231). the count, not a boolean, because the opt-out half of
+#               the contract is a SPECIFIC number of surviving calls and a boolean
+#               would let "inlined everything in reach" pass as "inlined what was
+#               asked". only forms that write a link register count, so ordinary
+#               control flow inside a function never contributes:
+#     x86_64  — `call` / `callq`.
+#     aarch64 — `bl` and `blr`; the plain `b` / `b.<cond>` branches do not link.
+#     riscv64 — `jal` / `jalr`; the return renders as `ret` and a tail branch as
+#               `j` / `jr`, neither of which is a call. the two-instruction `call`
+#               pseudo (auipc + jalr) counts once, at its `jalr`.
+#
+# <project-id> is optional and, when given, restricts the report to symbols mangled
+# under that project - the case's OWN functions, excluding the dependency template and
+# `#[inline]` instances its object also holds. a mode whose golden would otherwise move
+# with an unrelated mach-std release passes it; the modes that predate it pass nothing
+# and report every symbol, exactly as before.
 emit_scan() {
-    awk -v mode="$1" '
+    awk -v mode="$1" -v own="${2:-}" '
+    BEGIN { if (own != "") { ownpfx = own "." } }
     # strip a mangled name down to its bare identifier plus any `$` argument
     # list: `std.types.option.unwrap$ptr` -> `unwrap$ptr`. an unmangled symbol
     # (an `ext` / `#[symbol]` literal, a `.L` local) has no module path to strip
@@ -2890,6 +2916,18 @@ emit_scan() {
         if (isa == "x86_64")  { return m ~ /^p(extr|insr)[bwdq]$/ }
         return 0
     }
+    function is_call(m, rest) {
+        # the CALL forms only: a branch that does not write a link register is control
+        # flow inside the function and must not be counted, or the number would move
+        # with every unrelated codegen change instead of with the inline decision.
+        if (isa == "x86_64")  { return m ~ /^call(q|l)?$/ }
+        if (isa == "aarch64") { return m == "bl" || m == "blr" }
+        # riscv64: `jal`/`jalr` write a link register; the return is rendered `ret` and
+        # a tail branch `j`/`jr`, so neither is caught here. the `call` pseudo is two
+        # instructions (auipc + jalr) and is counted once, at its jalr.
+        if (isa == "riscv64") { return m == "jal" || m == "jalr" }
+        return 0
+    }
     function is_vecmem(m, rest) {
         if (isa == "aarch64") {
             if (m !~ /^(ldr|str|ldur|stur|ldp|stp)$/) { return 0 }
@@ -2909,6 +2947,7 @@ emit_scan() {
         if (mode == "fpscratch") { return fp_scratch(m, rest) }
         if (mode == "frame")     { return framed(m, rest) }
         if (mode == "lanes")     { return is_lane(m, rest) }
+        if (mode == "calls")     { return is_call(m, rest) }
         return 0
     }
     /file format/ {
@@ -2922,6 +2961,13 @@ emit_scan() {
         sym = $0
         sub(/^[0-9a-f]+ </, "", sym)
         sub(/>:$/, "", sym)
+        # the ownership test reads the MANGLED name: demangling drops the module path
+        # that says whose function this is. the project id is the leading path
+        # component, so a case with id `case` owns `case.main.mixed` and not
+        # `std.print.printlnf`. a symbol carrying a literal name via #[symbol(...)] has
+        # no project prefix and is excluded too, which is right, since such a function
+        # is named for a foreign ABI rather than by this project.
+        if (own != "" && substr(sym, 1, length(ownpfx)) != ownpfx) { cur = ""; next }
         sym = demangle(sym)
         if (!(sym in count)) { names[++n] = sym; count[sym] = 0; count2[sym] = 0 }
         cur = sym
@@ -2955,6 +3001,7 @@ emit_scan() {
             if (mode == "simd")       { print names[i] " " (count[names[i]] > 0 ? "simd" : "scalar") }
             else if (mode == "frame") { print names[i] " " (count[names[i]] > 0 ? "framed" : "frameless") }
             else if (mode == "lanes") { print names[i] " lane=" (count[names[i]] > 0 ? 1 : 0) " vecmem=" (count2[names[i]] > 0 ? 1 : 0) }
+            else if (mode == "calls") { print names[i] " calls=" count[names[i]] }
             else                      { print names[i] " scratch=" count[names[i]] }
         }
     }
@@ -2970,6 +3017,56 @@ produce_vector_lanes() {
 }
 
 
+
+# produce_call_shape <runmode> <target> <binary>
+# the CALL-SHAPE observable (#2231): for each function of the case's own module, how
+# many calls its emitted code still makes.
+#
+# the same argument as vector-emit, and it is the whole reason this case exists twice.
+# a compiler that stops inlining a cross-module `#[inline]` callee computes every value
+# the sibling exec observable checks, exactly and at both profiles, because a call and
+# an inlined body compute the same thing - that is what makes inlining legal. the only
+# place the feature is visible at all is the number of calls left, so a run-and-compare
+# case is vacuously green against the feature being dead, which is this repo's recurring
+# defect: a result that reports more than it verifies.
+#
+# it also carries the OPT-OUT half in the same numbers rather than a second case. a
+# `#[noinline]` callee and an undecorated one must each still cost a call, so their
+# caller's count is nonzero by design. an implementation that inlined everything in
+# reach would pass a case asserting only `calls=0` somewhere; asserting the exact count
+# per function is what makes "the decorator is a contract, in both directions" the
+# thing being tested.
+#
+# needs llvm-objdump.
+#
+# IT REPORTS THE CASE'S OWN FUNCTIONS AND NOTHING ELSE, which the other emitted-shape
+# producers do not need to do. a case's object holds, besides its own code, one weak
+# body per generic / pack / `#[inline]` instance its call sites named - `printlnf` and
+# `vformat` among them. those are mach-std's, they carry dozens of calls each, and int
+# resolves mach-std to its latest RELEASE, so folding them into the golden would make
+# this case fail on an unrelated standard-library change and say nothing about #2231
+# when it did. the filter is the mangled module prefix of the case's own project id,
+# read from its manifest, so what the golden pins is what the case wrote.
+produce_call_shape() {
+    id=$(case_project_id call-shape "$3") || return 2
+    dis_case_objects call-shape "$3" | call_shape_scan "$id"
+}
+
+# case_project_id <producer> <binary> — the `id` from the case's own manifest, the
+# prefix every symbol the case itself defines is mangled under. same directory walk
+# dis_case_objects does; <producer> only names the caller in diagnostics.
+case_project_id() {
+    _cpi_dir=$(dirname "$(dirname "$(dirname "$2")")")
+    _cpi_id=$(sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$_cpi_dir/mach.toml" | head -1)
+    if [ -z "$_cpi_id" ]; then
+        echo "int: $1: no project id in ${_cpi_dir}/mach.toml" >&2; return 2
+    fi
+    printf '%s\n' "$_cpi_id"
+}
+
+# call_shape_scan <project-id> — `<function> calls=<count>` per function of the case's
+# own project (see emit_scan)
+call_shape_scan() { emit_scan calls "$1"; }
 
 # produce_frame_elision <runmode> <target> <binary>
 # the frame-elision observable (#1940): for each function of the case's own module,
@@ -3171,6 +3268,7 @@ produce() {
         float-emit)  produce_float_emit "$@" ;;
         const-pool)  produce_const_pool "$@" ;;
         asm-symbol)  produce_asm_symbol "$@" ;;
+        call-shape)  produce_call_shape "$@" ;;
         *) echo "int: unknown run mode '$run'" >&2; return 2 ;;
     esac
 }
