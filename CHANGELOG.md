@@ -9,22 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-#### Compiler output names functions the way the source spells them, not the way the linker does
-An `ir.Function` has carried two names for a while: `name`, the mangled linkage symbol, and `disp`, the bare source spelling. The house rule is to prefer `disp` and fall back to `name`, and the DWARF `DW_AT_name` producer, the IR verifier, the SPIR-V entry point and the `#[oblivious]` sema diagnostic all followed it. Everything else printed the symbol, so `--emit-ir` read `fn @_M4case4mainN5add32`, the `simd = "require"` refusal read ``in '_M4case4mainN5add32'``, and a regalloc failure, a constant-time refusal, an encoder ICE and every `--emit-asm` function heading did the same. None of those names anything a reader can find in a source file.
-
-The preference now has exactly one definition per layer - `ir.function_display` and `mir.function_display` - and every producer of text a person reads goes through one of them. The mangled symbol survives only where it IS the identity: an object symbol, a relocation, a linker diagnostic, and the `#[oblivious]` note that deliberately names one generic instantiation among many.
-
-Reaching the back end took a real change rather than a lookup: `EncodeFunctionFn`, the constant-time validator and regalloc all take a `mir.MirFunction` and no IR handle, so `MirFunction` now carries `disp` itself, stamped at lowering exactly as `oblivious` and `naked` already are. Widening those interfaces to carry a mid-end structure so a diagnostic could spell a name would have been the wrong direction.
-
-Two dumps keep both names, because in both the symbol is still load-bearing. `--emit-ir` writes `fn @add32(...): i32 symbol "_M4demo4mainN10echoI3i32E"` - source names are not unique across generic instantiations, and the header is where they are told apart. `--emit-asm` writes `# add32 (_M4case4mainN5add32):`, since the listing carries no `.globl` and that comment is the only place a function's identity appears in it. The heading's format is now defined once in `be/codegen/encode.mach` rather than three times, once per ISA printer.
-
-Display only: the compiler was built before and after and used to compile itself for all six targets, and the emitted binaries are byte-identical on every one.
-
-#### `int`'s shell demangler was a third copy of the mangling scheme, and disagreed with the other two
-`int/lib/produce.sh` carried the same ~18-line awk `demangle()` twice, hardcoding the `_M` prefix, the `N` separator and the length-prefixed-run grammar - a transcription of `src/lang/me/lower/mangle.mach` that agreed with it by accident. It mishandled the generic form, returning `unwrapI3ptrE` for `_M3std9allocatorN6unwrapI3ptrE`, and the value-instance `K...E` form did not exist to it at all.
-
-There is now one `_demangle_awk` definition, prepended to both scanners' programs, and a scheme change needs exactly that one shell edit. It parses the module path as the run of length-prefixed segments it is, takes the name as the run after `N`, and drops the `I...E` / `K...E` instance suffix - which is what these per-source-function shape observables want, and is written down as a limit rather than left to be discovered.
-
 #### A C `[step]` cross-builds for its leg instead of silently assuming the host toolchain targets it (#2741)
 `int/surface/narrow-stack-args` and `int/surface/c-variadic` shelled out to the bare host `cc` to build a probe object, which happens to target the leg on every CI runner (each builds natively) but not on a developer cross-building locally - `mach --target linux-arm64` on an x86-64 host still ran the host's x86-64 `cc`, silently linking an x86-64 object into an aarch64 image. That surfaced as `error: relocation 'plt32' to 'float_tail' overflows` on narrow-stack-args and a qemu `Illegal instruction` on c-variadic, neither of which names its actual cause.
 
@@ -69,6 +53,17 @@ There was no whole-module well-formedness stage, so a rule about the module — 
 A SPIR-V execution model has no call stack, so a cycle in the static call graph is refused before any body is emitted, naming the chain and saying why. This is checked rather than left to `spirv-val`, whose cycle rule is scoped to entry points: a **library** module carrying a cycle validated clean and would have failed in whatever consumer linked it into a pipeline. One had been sitting green in the integration suite.
 
 The parameter limit was two independent literals that disagreed: `emit_function` refused above 16 while `type_fn`'s fixed operand buffer failed above 14 and returned a 0 nobody read, which reached `OpFunction` as the reserved never-valid id. The limit is now stated once as `types.MAX_FN_PARAMS`, both sites read it, 15 and 16 parameters build and validate, and a 0 from `type_fn` is reported instead of passed on.
+
+#### A float or integer memory access refuses a width the target has no form for (#2766)
+A memory access takes a byte width and picks a machine form from it. On aarch64 and riscv64 that pick was a boolean selector with a trailing default, so a width the target has no form for silently got some other form's bytes rather than a diagnostic, the same shape #2733 removed from the float move, negate, arithmetic, compare and conversion encoders, one family over.
+
+riscv64's `fp_mem_funct3` answered 4 with `flw`/`fsw` and **everything else** with `fld`/`fsd`. RV64D has exactly those two float access forms and no vector extension is enabled, so a 16-byte float access had nothing to encode to at all, and it encoded to `fld`, moving eight bytes and losing the other eight. aarch64's `emit_fp_mem` handled 16 in its own arm and then fell through to `use_d = width == 8`, so a 32-byte access took the **S** form and moved four bytes of a slot the surrounding code had already sized at 32.
+
+The fix is a contract change on the access family, not a check at today's callers. The defaulting helpers were shared with the **integer** path, aarch64's `ldst_lo12_kind`, `width_shift` and the three `ldst_base_*` base-word tables were five parallel ladders that each named the narrow widths and each ended in the doubleword row, so validating only the float arms would have left the identical shape live next door under a different name. Each family now comes off **one** form table: aarch64's `int_access` / `fp_access` return a row carrying all three addressing-mode base words, the imm12 shift and the `:lo12:` relocation kind together, and riscv64's `int_mem_funct3` / `fp_mem_funct3` return the funct3 or an error. A width with no row is refused. `emit_mem_access`, `emit_fp_mem` and `mem_access_needs_no_scratch` report rather than emit, and the Q arm that used to sit ahead of the aarch64 default is now the same three lines as S and D, because the difference between them was only ever the row.
+
+The census found the same defect on **x86-64**, which the issue did not name: `emit_float_load`, `emit_float_reg_or_slot_load`, `emit_float_store` and `float_const_operand` each read `mov_op = MOVSD; if (w == 4) { mov_op = MOVSS; }`, so every width other than 4 took the eight-byte MOVSD. It was inert only because `encode_fp_mov` returns its vector arm above them. Nothing in the helpers said so, and `emit_float_load` is reached separately by the arithmetic and seed paths. aarch64's `emit_fp_const` carried the same `use64 = width == 8`.
+
+Every refusal is **driven from a unit test** with a width it must refuse, and the assertion is that the output buffer stayed **empty**, not merely that an error was returned. That distinction is load-bearing here: both `emit_mem_access` implementations materialize an out-of-range offset into the scratch register before the access word, and a folded global emits its `adrp` / `auipc` high half before the low one, so a check placed at the emission point rather than at the top would leave stranded instructions behind the error. Every legitimate width still encodes byte-exactly against `llvm-mc`, including aarch64's Q form at 16 and the sub-word integer forms at 1 and 2 that share the same helpers.
 
 ### Changed
 
