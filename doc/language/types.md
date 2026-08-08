@@ -109,8 +109,10 @@ var z: i32x4;                   # every lane is 0
 ```
 
 **Lane access** `v[i]` reads or writes a single lane. The index must be a
-comptime constant in `[0, lanes)` and is bounds-checked at compile time; a
-dynamic (runtime) lane index is not supported in this increment.
+comptime constant in `[0, lanes)`; a dynamic (runtime) lane index is not
+supported in this increment. The bound is the same compile-time rule an array
+gets, reported the same way — `v[4]` on a `u32x4` is `index 4 is out of bounds
+for `u32x4` of length 4`.
 
 ```mach
 var v: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0};
@@ -143,6 +145,26 @@ val v: i64  = @p;       # dereference reads through it
 val a: [4]i64    = [4]i64{1, 2, 3, 4};
 val g: [2][2]i64 = [2][2]i64{ [2]i64{1, 2}, [2]i64{3, 4} };
 ```
+
+**Constant indices are bounds-checked at compile time.** `N` is part of the
+type, so an index the compiler can fold must land in `[0, N)`:
+
+```mach
+var xs: [4]i32;
+val a: i32 = xs[3];             # ok
+val b: i32 = xs[4];             # error: index 4 is out of bounds for `[4]i32` of length 4
+val c: i32 = xs[-1];            # error: index -1 is out of bounds ...
+```
+
+The rule is keyed on the length the type carries, not on how the array was
+spelled, so a `def` alias, an array field of a generic instance, an array nested
+in a record or in another array, and a `^`-qualified array are all checked the
+same way. It is exactly the length `$length_of` reports
+([comptime-intrinsics.md](comptime-intrinsics.md)), and a vector's lane count
+takes the identical rule.
+
+Only a **constant** index is checked. A runtime index is not, and a pointer is
+not indexed against any length at all — `*T` carries none.
 
 ## Function type
 
