@@ -29,6 +29,7 @@ use std.types.string.str;
 use std.types.string.str_equals;
 use std.types.string.str_join;
 use std.types.string.str_len;
+use std.types.string.str_region_equals;
 use std.types.view.view;
 use std.types.view.view_eq_str;
 
@@ -947,7 +948,7 @@ fun fp_lowered_surface(fb: *dq.FpBuf, a: *ast.Ast, text: str) R.Result[bool, str
     var i: u32 = 0;
     for (i < mod_node.decls_len) {
         val did: id.DeclId = a.decl_ids[mod_node.decls_start + i];
-        val w: R.Result[bool, str] = fp_non_flowing_decl_bodies(fb, a, base, did, ?cursor);
+        val w: R.Result[bool, str] = fp_non_flowing_decl_bodies(fb, a, text, base, did, ?cursor);
         if (R.is_err[bool, str](w)) { ret w; }
         i = i + 1;
     }
@@ -958,7 +959,7 @@ fun fp_lowered_surface(fb: *dq.FpBuf, a: *ast.Ast, text: str) R.Result[bool, str
 # advancing `cursor` past each body. declaration-level comptime branches recurse
 # over every arm: inactive syntax remains part of the surface, but a regular
 # function or test body in any arm still cannot flow into an importer
-fun fp_non_flowing_decl_bodies(fb: *dq.FpBuf, a: *ast.Ast, base: *u8,
+fun fp_non_flowing_decl_bodies(fb: *dq.FpBuf, a: *ast.Ast, text: str, base: *u8,
                                did: id.DeclId, cursor: *usize) R.Result[bool, str] {
     val d_opt: O.Option[*decl.Decl] = ast.get_decl(a, did);
     if (O.is_none[*decl.Decl](d_opt)) {
@@ -966,7 +967,7 @@ fun fp_non_flowing_decl_bodies(fb: *dq.FpBuf, a: *ast.Ast, base: *u8,
     }
     val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
 
-    val bs_o: O.Option[token.Span] = non_flowing_body_span(a, d);
+    val bs_o: O.Option[token.Span] = non_flowing_body_span(a, text, d);
     if (O.is_some[token.Span](bs_o)) {
         val bs: token.Span = O.unwrap[token.Span](bs_o);
         if (bs.offset < @cursor) {
@@ -992,7 +993,7 @@ fun fp_non_flowing_decl_bodies(fb: *dq.FpBuf, a: *ast.Ast, base: *u8,
             if (pool_ix::usize >= a.decl_id_len) {
                 ret R.err[bool, str]("Q_LOWERED_SURFACE: comptime declaration index out of range");
             }
-            val w: R.Result[bool, str] = fp_non_flowing_decl_bodies(fb, a, base, a.decl_ids[pool_ix], cursor);
+            val w: R.Result[bool, str] = fp_non_flowing_decl_bodies(fb, a, text, base, a.decl_ids[pool_ix], cursor);
             if (R.is_err[bool, str](w)) { ret w; }
             di = di + 1;
         }
@@ -1004,10 +1005,19 @@ fun fp_non_flowing_decl_bodies(fb: *dq.FpBuf, a: *ast.Ast, base: *u8,
 # the source span of a body that cannot flow into an importer's IR - the bytes to
 # EXCLUDE from the lowered surface - or none. every test body is module-local and
 # belongs only to the test variant. a function body flows into importers (and stays
-# in the fingerprint) when the function is generic or takes a comptime parameter;
-# otherwise it is emitted extern there and excluded. other declarations and
-# body-less (extern/forward) functions yield none
-fun non_flowing_body_span(a: *ast.Ast, d: *decl.Decl) O.Option[token.Span] {
+# in the fingerprint) when the function is generic, takes a comptime parameter, or
+# carries `#[inline]`; otherwise it is emitted extern there and excluded. other
+# declarations and body-less (extern/forward) functions yield none
+#
+# `#[inline]` IS THE ONE AN AUTHOR CAN TOGGLE, and getting it wrong here is not a
+# missed optimisation. A cross-module `#[inline]` body is monomorphized into every
+# importer (#2231), exactly as a generic body is, so an edit to it must re-lower them.
+# Leaving it excluded would let the fingerprint reproduce identical bytes across a
+# changed atomic body and hand every importer a cached IR module holding the OLD one -
+# a stale-code miscompile that only appears on an incremental build, which is the
+# failure #1859 built this firewall to make impossible. The predicate is therefore the
+# same three-way question the lowering side asks, and the two must stay in step.
+fun non_flowing_body_span(a: *ast.Ast, text: str, d: *decl.Decl) O.Option[token.Span] {
     var body: id.StmtId = id.STMT_NIL;
     if (d.kind == decl.DECL_KIND_TEST) {
         body = d.data.test_.body;
@@ -1019,6 +1029,7 @@ fun non_flowing_body_span(a: *ast.Ast, d: *decl.Decl) O.Option[token.Span] {
             if (a.typed_names[d.data.fun_.params_start + pi].comptime) { ret O.none[token.Span](); }
             pi = pi + 1;
         }
+        if (decl_has_decorator_named(a, text, d, "inline")) { ret O.none[token.Span](); }
         body = d.data.fun_.body;
     }
     if (body == id.STMT_NIL) { ret O.none[token.Span](); }
@@ -1026,6 +1037,22 @@ fun non_flowing_body_span(a: *ast.Ast, d: *decl.Decl) O.Option[token.Span] {
     val st_o: O.Option[*stmt.Stmt] = ast.get_stmt(a, body);
     if (O.is_none[*stmt.Stmt](st_o)) { ret O.none[token.Span](); }
     ret O.some[token.Span](O.unwrap[*stmt.Stmt](st_o).span);
+}
+
+# whether decl `d` carries a `#[...]` decorator whose directive name equals `name`,
+# read against the AST that owns it
+#
+# The lowering side has its own copy of this reading the lowering context's source; the
+# fingerprint runs before lowering and holds only the AST and its text, so it reads
+# them directly rather than reaching for a context that does not exist yet.
+fun decl_has_decorator_named(a: *ast.Ast, text: str, d: *decl.Decl, name: str) bool {
+    var i: u32 = 0;
+    for (i < d.decorators_len) {
+        val dec: *decl.Decorator = ?a.decorators[d.decorators_start + i];
+        if (str_region_equals(text, dec.name.offset, dec.name.len, name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # the Q_LOWER derived compute - lower one module to optimized IR and return it as
