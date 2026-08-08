@@ -29,6 +29,19 @@ The two paths computed one fact in two places and agreed only by accident. The h
 
 ### Added
 
+#### A vector of any lane count compiles on every target, whether or not a vector register can hold it (#2727)
+`f32x5`, `f32x8` and `f32x16` were refused **by name** at the front end on every target: `vector `f32x8` is 256 bits wide, more than this target's 128-bit vector width`. That read a realization fact as a legality rule, and it was incoherent besides — rv64gc has no vector unit at all, scalarizes every vector it is handed, and still refused `f32x8` on the ground of a 128-bit SIMD width it does not have.
+
+The surface now admits `TxN` for any element and any `N` from 2 to 65535, identically on every target. The only refusals left are the degenerate one-lane vector and a lane count past what the compiler represents, and neither mentions a target. `vector_bits` keeps its real job — deciding **how** a shape is realized — and has no say in whether it can be spelled, so a target that gains ymm/zmm/SVE gets better code rather than new spellings.
+
+Realization is decided per value by one authority, `isa.fits_vector_register`. A shape that fits a vector register keeps exactly the codegen it had. One that does not is placed in memory and worked a lane at a time by `me.pass.scalarize` — which stopped being a per-target pass and became a per-value one, so a target with no vector unit (every value claimed) and a target meeting a shape too wide for its register (only that shape claimed) are now the same rule rather than two mechanisms. An `i32x4` next to an `f32x8` still selects one packed instruction.
+
+Layout: `$size_of` is lane-derived at every width (`f32x8` is 32 bytes), and `$align_of` gains a third rung — an over-width vector aligns to the **vector register width**, 16 rather than 32, because it is placed as several register-width pieces and there is no 32-byte vector load for a larger alignment to serve. Every convention (SysV, AAPCS64, win64, lp64) gives an over-width vector the memory class: a hidden pointer in, the indirect-result pointer out.
+
+Verified by lane values rather than by sizes, on all three ELF legs and both profiles: `i32x8`'s eight lanes checked individually after an add (a sum cannot tell a rotation from a correct result), sub/and, the non-power-of-two `i32x5` and `i16x7`, `f64x4`, a **loop-carried** `i32x8` accumulator through a phi, guard fields on both sides of a wide vector and around `i32x5`, `[3]i32x8` strides, and an over-width vector passed to and returned from a call. `f32x8` also compiles and validates on SPIR-V, where the same authority routes it to the `OpTypeArray` realization an over-**count** shape already took. The two fixed 16-lane buffers that the lane-count bound had made safe (`MAX_GAP_LANES`, `MAX_VECTOR_LANES`) are now allocations.
+
+Two diagnostics were wrong in passing and are fixed with it. The build note read `scalarized N vector operations (target has no SIMD)` on x86-64, sending the reader to check a capability the target plainly has — scalarization has been per-operation since #2726 and is now per-shape too, so it reads `with no packed form on this target`. And `simd = "require"` said `target packs no more than the lanes its vector form holds at this lane width` for both a lane-count ceiling and a width one; it now says which of the two causes it was.
+
 #### A sub-width vector crosses to memory in one instruction where the ISA has one, instead of always going through a scratch slot (#2716)
 `i32x2` and `f32x2` cost a stack frame, a 16-byte scratch slot, a whole-register spill and a chunk walk through a GP register to move eight bytes. `copy_i32x2` on x86-64 was 13 instructions and a 32-byte frame; it is now 5 instructions and **no frame**, one `movsd` each way.
 
