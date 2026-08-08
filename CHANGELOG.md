@@ -17,6 +17,33 @@ A static ELF executable (`emit_exec`) now carries `.symtab` + `.strtab` with eve
 Trails every `PT_LOAD` segment exactly like `int/surface/debuginfo`'s DWARF sections already do (`readelf -SW`/`-lW` confirm `.symtab`'s file offset never precedes a loaded segment's end), so a release image's runtime bytes are unchanged - the loader ignores non-allocated sections and a release build stays byte-for-byte the same program, just no longer anonymous to a debugger or profiler reading its container. This is a real, measured trade against the previous byte-identical *header-less* release image, though: a build that carried no section-header table at all now carries one whenever it carries a symbol table (which is every static build now), and the compiler's own release binary - a large, real program with 8,408 function symbols - grew by about 611 KiB (7.3%) for it. `perf record`/`perf report` on a release build built with this change resolves `[.] main` by name where it previously showed a raw address; `addr2line -f` on an address in the middle of a function's body (not just its entry) resolves to that function, proving `st_size` is correct and not merely present.
 
 Scoped to ELF's plain static executable writer (`emit_exec`) for now: a PIE/dynamically-linked executable (`emit_dyn_exec`) and a shared library (`emit_shared`) do not carry a symbol table yet, and neither does Mach-O (`LC_SYMTAB`) or PE/COFF (its own, mostly-obsolete-under-PDB symbol table) - both accept the same `of.SymtabEntry` channel for `of.ExecFn` conformance and ignore it. `of.SymtabEntry` (name, final vaddr, byte size, STB_LOCAL/STB_GLOBAL linkage) is the format-neutral shape a future writer for either reads from, so extending coverage is wiring a serializer, not redesigning the data.
+### Changed
+
+#### BREAKING: linkage names are dotted and readable
+
+Every symbol Mach emits changes spelling. The mangled name is now the source FQN as the source spells it, with generic arguments after a `$`:
+
+```
+_M3std5types6string7str_lenN7str_len   ->  std.types.string.str_len
+_M3std5types6optionN12unwrapI3ptrE     ->  std.types.option.unwrap$ptr
+_M4mach4lang6internN26"intern.roundtrip"  ->  mach.lang.intern."intern.roundtrip"
+```
+
+**What this breaks.** Object files, static libraries and shared libraries built by 4.16.0 or earlier do not link against ones built by this release: every non-`ext`, non-`#[symbol]` symbol has a different name. Rebuild the whole closure. Anything that named a mangled Mach symbol from outside the compiler breaks with it — a C declaration bound to `_M...` by hand, an inline-asm reference to a mangled name, a linker script or `--wrap` naming one, a symbol allowlist, a profiler or crash-report filter matching the `_M` prefix.
+
+**Who should care.** Almost nobody. `ext fun` foreign symbols and `#[symbol("...")]` names are literal and always were, so the entry point, the `_rt_*` runtime symbols, every C import and every hand-written asm target are all untouched. If you never wrote `_M` anywhere, a rebuild is the whole migration.
+
+**The scheme.** The module path and the bare name are joined by `.`, exactly as the source FQN reads, and there is no prefix — a mangled name always contains a `.` and a C identifier never can, so the old `_M` reserved-space guard bought nothing. A generic argument is introduced by a run of `$` whose **length is its nesting depth**, so nothing needs a closing bracket and a shallow instance stays short:
+
+```
+f[Map[Vec[i64], str], u8]  ->  m.f$m.Map$$m.Vec$$$i64$$str$u8
+```
+
+Types spell themselves: `p$u8` is `*u8`, `sec$u32` is `^u32`, `arr4$u8` is `[4]u8`, `fn$$i64$$u8` is `fun(u8) i64`, a record is its own dotted origin FQN, a comptime value is its literal (`tag$7`, `tag$n3`, `true`, `"text"`), and a variadic pack instance carries a `pack` marker before its element list. `.` and `$` are both accepted in an inline-asm symbol name, so every emitted symbol stays nameable from `asm` — which the old scheme also managed, and which a readable scheme has no excuse to lose.
+
+Names did **not** get longer. Over the compiler's own release build — same tree, same profile, 11660 distinct symbols either way — the longest goes from **108 bytes to 105**, and the count over the **63-byte inline-asm operand limit** falls from **1543 to 668**. A length prefix costs one or two digits per path segment where a dot costs one character, and the `_M` goes away, so a dotted name is shorter despite being readable. (That cap is a pre-existing limitation with a misdirecting diagnostic — an over-long operand is refused as "malformed" — and is not touched here.)
+
+Fixing the scheme fixes every reader at once — IR dumps, diagnostics, `--emit-asm` headings, linker messages, `objdump`, `perf`, `DW_AT_linkage_name` — rather than teaching a dozen display sites to substitute a friendlier name one at a time, and the places with no source name to substitute are covered too.
 
 ### Fixed
 
