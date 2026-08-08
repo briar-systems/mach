@@ -128,6 +128,13 @@
 #                 that stages every allocated float operand through scratch computes
 #                 the right answer while emitting twice the instructions, so only a
 #                 shape observable can see it. needs llvm-objdump.
+#   asm-symbol  — pair the symbol names `--emit-asm` PRINTS for an inline-asm
+#                 statement with the ones the OBJECT relocates against, in file
+#                 order (#2788). a printer reading the wrong table produces a valid
+#                 symbol name from the same module, so the text looks trustworthy
+#                 and names the wrong thing; only holding it against the relocation
+#                 tells the two apart. also runs the program, since a reference that
+#                 reached the wrong symbol is a wrong answer too. needs llvm-objdump.
 #
 # build-fails is a run-mode but not a producer: it asserts the compile is REJECTED
 # and takes the compiler's 'error:' diagnostic as the observable. it is handled in
@@ -2592,6 +2599,90 @@ produce_float_emit() {
     dis_case_objects float-emit "$3" | float_emit_scan
 }
 
+# produce_asm_symbol <runmode> <target> <binary>
+# the INLINE-ASM SYMBOL-OPERAND observable (#2788, epic #2288).
+#
+# `--emit-asm` renders from the encoder, and an operand that reached it without the
+# symbol it references printed whatever string id 0 resolves to - a REAL symbol from
+# the same module. A reader chasing a symbol reference was shown a different, real
+# name rather than something obviously broken, so nothing signalled that the output
+# was untrustworthy; the direct-transfer form printed a bare `call` with no operand at
+# all. Both were text-only: the object was correct throughout, which is why nothing
+# that reads the object could see it.
+#
+# So the observable is the PAIR, and it is the pairing that makes this a test rather
+# than a golden of whatever the printer happens to say:
+#
+#   print=<names>   every `iasm_*` name the emitted assembly text mentions, in order
+#   reloc=<names>   every `iasm_*` name the object's relocations name, in order
+#
+# The case gives every inline-asm-referenced symbol a `#[symbol("iasm_...")]` literal
+# linkage name, so both lists are extractable with no knowledge of the ISA or the
+# mangling scheme, and a compiler-emitted reference to the same declaration (which
+# uses the mangled name) can never be counted as an inline-asm one. A printer that
+# names a different real symbol drops a name from `print` while `reloc` keeps it; one
+# that names nothing does the same. Neither can pass by accident.
+#
+# The two lists are not required to be EQUAL, and the golden is per-target because of
+# it: how many instructions spell one reference, and how many relocation records cover
+# them, are both the ISA's business. riscv64 is the case in point - `la sym` is an
+# auipc/addi pair carrying `%pcrel_hi` and `%pcrel_lo`, which is two of each, while
+# `call sym` is an auipc/jalr pair the printer names twice and a single
+# `R_RISCV_CALL_PLT` covers. Both are right; what the pairing catches is a name
+# appearing on one side and not the other.
+#
+# The program's own answer is reported too: the asm loads and calls through those
+# symbols, so a reference that reached the wrong one is a wrong number as well as
+# wrong text, and the two failures are distinguishable in the diff.
+produce_asm_symbol() {
+    runmode=$1
+    target=$2
+    bin=$3
+
+    dir=$(dirname "$(dirname "$(dirname "$bin")")")
+    id=$(sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$dir/mach.toml" | head -1)
+    if [ -z "$id" ]; then
+        echo "int: asm-symbol: no project id in ${dir}/mach.toml" >&2; return 2
+    fi
+    asmdir="$dir/out/int/build/asm/$id"
+    objdir="$dir/out/int/build/obj/$id"
+    if [ ! -d "$asmdir" ]; then
+        echo "int: asm-symbol: no assembly text at $asmdir (the case must pass --emit-asm and pin out = \"out/int/build\")" >&2; return 2
+    fi
+    if [ ! -d "$objdir" ]; then
+        echo "int: asm-symbol: no objects at $objdir" >&2; return 2
+    fi
+    tool=$(resolve_objdump) || {
+        echo "int: asm-symbol: llvm-objdump not found (install the 'llvm' package)" >&2; return 2
+    }
+
+    # comment lines are dropped: `--emit-asm` heads each function with `# <name>:`,
+    # and a DEFINITION of one of these symbols is not a reference to it.
+    printed=$(find "$asmdir" -name '*.s' | sort | while IFS= read -r a; do
+        grep -v '^[[:space:]]*#' "$a" | grep -o 'iasm_[A-Za-z0-9_]*'
+    done | tr '\n' ' ' | sed 's/ *$//')
+
+    related=$(find "$objdir" -name '*.o' | sort | while IFS= read -r o; do
+        "$tool" -r "$o"
+    done | grep -o 'iasm_[A-Za-z0-9_]*' | tr '\n' ' ' | sed 's/ *$//')
+
+    echo "print=$printed"
+    echo "reloc=$related"
+
+    out=$(mktemp)
+    err=$(mktemp)
+    run_captured "$runmode" "$target" "$bin" "$out" "$err" || { rm -f "$out" "$err"; return 1; }
+    if [ "$run_status" -ne 0 ]; then
+        report_run_failure "asm-symbol" "$run_status" "$run_out"
+        [ -s "$err" ] && sed 's/^/    /' "$err" >&2
+        rm -f "$out" "$err"
+        return "$run_status"
+    fi
+    cat "$err" >&2
+    cat "$out"
+    rm -f "$out" "$err"
+}
+
 # produce_const_pool <runmode> <target> <binary>
 # the CONSTANT-POOL observable (#2248, #2700): which pool entries the module holds
 # and which of them each function references.
@@ -3079,6 +3170,7 @@ produce() {
         varloc-fbreg) produce_varloc_fbreg "$@" ;;
         float-emit)  produce_float_emit "$@" ;;
         const-pool)  produce_const_pool "$@" ;;
+        asm-symbol)  produce_asm_symbol "$@" ;;
         *) echo "int: unknown run mode '$run'" >&2; return 2 ;;
     esac
 }
