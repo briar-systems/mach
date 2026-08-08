@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### A comparison result crosses a call and a return boundary on the SPIR-V target (#2910)
+`mix(h, x == x)` compiled for `spirv` handed the `OpIEqual`'s `%bool` straight to an `OpFunctionCall` whose callee declares `%uchar`, and `ret x == x` from a `u8` function returned one out of a `%uchar` function. `spirv-val` rejected both. Neither is float specific: an integer comparison did it too.
+
+A SPIR-V comparison yields an `OpTypeBool`, which is abstract and has no storage layout, so it cannot be an argument or a return value where a byte is declared. Every other target computes a comparison into a 0/1 byte in a register, where the value widens by zero extension and nothing has to be reconciled. The emitter already converted at every position that knows the type it is converting to: a store to a variable, a store through a pointer and a store into a record member all emitted the `OpSelect` that turns the boolean into the declared type's 0 and 1.
+
+The two positions that did not are the two that go through the ABI pre-coloring's nominal register file, and they share one cause. That file is written by moves emitted at the machine word, which cannot type the value, so it already carries an immediate unmaterialized and mints the constant at the use site with the width the declaration asks for. A boolean now rides the same way: the register slot records that it holds one, and the use site - the `OpFunctionCall` that knows the callee's parameter types, or the `OpReturnValue` that knows the function's result type - widens it, or leaves it alone where the declaration is itself a boolean. Comparisons are still typed as booleans, so `OpBranchConditional` keeps receiving the real `%bool` the specification requires there.
+
 #### `$length_of` folds in a comptime gate, and a gate folds the same way in both passes (#2875)
 `$if ($length_of([4]f32) != 4)` was refused, in a function body and at module scope alike, with `` `$offset_of` has no value in a comptime condition `` against an operand that is plainly a fixed array. `$size_of` and `$align_of` had folded in a gate since #2857, so the one layout intrinsic that counts elements was the odd member of the set.
 
