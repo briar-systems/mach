@@ -681,6 +681,10 @@ fun expansion_count(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr) R.R
         ret R.ok[u32, str](dst_lane_count(plan, mi));
     }
     if (op == mir.MIR_MUL) { ret mul_piece_count(alloc, plan, mi); }
+    if (op == mir.MIR_DIV_S || op == mir.MIR_DIV_U ||
+        op == mir.MIR_REM_S || op == mir.MIR_REM_U) {
+        ret divmod_piece_count(alloc, plan, mi);
+    }
     if (mir.is_cmp_opcode(op)) { ret cmp_piece_count(alloc, plan, mi); }
     ret R.err[u32, str](unsupported_message(alloc, op, mi.width));
 }
@@ -885,6 +889,10 @@ fun expand_instr(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: 
     }
     if (op == mir.MIR_MUL) {
         ret expand_mul(alloc, plan, f, mi, dst, cursor);
+    }
+    if (op == mir.MIR_DIV_S || op == mir.MIR_DIV_U ||
+        op == mir.MIR_REM_S || op == mir.MIR_REM_U) {
+        ret expand_divmod(alloc, plan, f, mi, dst, cursor);
     }
     if (mir.is_cmp_opcode(op)) {
         ret expand_cmp(alloc, plan, f, mi, dst, cursor);
@@ -1964,6 +1972,460 @@ fun expand_mul(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *m
     ret R.ok[bool, str](true);
 }
 
+# whether a divide / remainder reads its operands as SIGNED
+fun div_is_signed(op: mir.MirOpcode) bool {
+    ret op == mir.MIR_DIV_S || op == mir.MIR_REM_S;
+}
+
+# whether a divide / remainder wants the REMAINDER rather than the quotient
+#
+# One expansion serves all four opcodes: restoring division computes both, and this
+# picks which one is copied out. A remainder is not a second algorithm.
+fun div_wants_remainder(op: mir.MirOpcode) bool {
+    ret op == mir.MIR_REM_S || op == mir.MIR_REM_U;
+}
+
+# the native-width pieces ONE restoring-division stage costs
+#
+# Read by the count and walked by the emit, so the two cannot drift. The stage is:
+# capture the running dividend's top bit (2), shift the remainder up (shl1) and take
+# that bit into its bottom lane (1), shift the dividend up (shl1), test the remainder
+# against the divisor (`wide_rel_pieces`), complement that to `>=` (1), take the
+# quotient bit into the dividend's bottom lane (1), build the select mask (1), mask
+# the divisor (nl), and subtract it through the borrow chain (`addsub_chain`).
+fun divmod_stage_pieces(nl: u32) u32 {
+    val shl1: u32 = const_shift_pieces(nl, 0, 1, true, false);
+    ret 2 + shl1 + 1 + shl1
+        + wide_rel_pieces(nl, false, false) + 1 + 1 + 1 + nl
+        + addsub_chain_piece_count(nl);
+}
+
+# the pieces the SIGNED wrapper costs around the unsigned core
+#
+# The prologue takes both operands' absolute values through the branchless
+# `(v ^ s) - s` identity, where `s` is the arithmetic shift of the top lane that
+# replicates its sign across a whole lane. The epilogue applies the result's sign the
+# same way: a quotient's sign is the two operands' signs combined, a remainder's is
+# the DIVIDEND's alone, which is what makes truncating division's remainder agree in
+# sign with what it divided.
+# ---
+# nl:  the lane count
+# rem: true when the operation wants the remainder
+# ret: the exact piece count of the signed prologue plus epilogue
+fun divmod_signed_pieces(nl: u32, rem: bool) u32 {
+    val absv: u32 = nl + addsub_chain_piece_count(nl);
+    var total: u32 = 2 + 2 * absv;
+    # a quotient needs its two sign words combined; a remainder reuses the dividend's.
+    if (!rem) { total = total + 1; }
+    ret total + absv;
+}
+
+# the pieces the DIVIDE-BY-ZERO normalization costs
+#
+# An OR reduction over the divisor's lanes (nl - 1 joins), the zero test itself (1),
+# the select mask (1), and a per-lane select between the computed result and the
+# defined one (3 per lane, the same xor/and/xor select the multiply uses).
+fun divmod_zero_fixup_pieces(nl: u32) u32 {
+    ret (nl - 1) + 1 + 1 + 3 * nl;
+}
+
+# the exact piece count of a wide divide / remainder expansion, or a loud error
+#
+# Rejects the shapes the expansion cannot realize before any block is rebuilt, the
+# same shapes `expand_divmod` itself checks.
+# ---
+# plan: the function's lane assignment
+# mi:   the divide / remainder instruction
+# ret:  the exact piece count, or an error naming the unsupported shape
+fun divmod_piece_count(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr) R.Result[u32, str] {
+    val nl: u32 = wide_lane_count(plan, mi);
+    if (mi.operand_count != 3 || nl > MAX_SHIFT_LANES ||
+        mi.operands[0].kind != mir.MIR_OP_VREG || !operand_is_lane_ready(plan, ?mi.operands[0], nl) ||
+        !operand_is_lane_ready(plan, ?mi.operands[1], nl) || !operand_is_lane_ready(plan, ?mi.operands[2], nl)) {
+        ret R.err[u32, str](unsupported_message(alloc, mi.opcode, mi.width));
+    }
+    val bits: u32 = nl * plan.lane_width::u32 * 8;
+    # the core, then the divide-by-zero normalization - whose per-lane select is what
+    # writes the destination, so no separate copy-out is emitted.
+    var total: u32 = bits * divmod_stage_pieces(nl) + divmod_zero_fixup_pieces(nl);
+    if (div_is_signed(mi.opcode)) {
+        total = total + divmod_signed_pieces(nl, div_wants_remainder(mi.opcode));
+    }
+    ret R.ok[u32, str](total);
+}
+
+# allocate `n` fresh native-width lane temporaries into `out`
+fun new_lane_temps(alloc: *A.Allocator, f: *mir.MirFunction, out: *mir.MirOperand, n: u32) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < n) {
+        val r: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](r)) { ret R.err[bool, str](R.unwrap_err[u32, str](r)); }
+        out[i] = mir.op_vreg(R.unwrap_ok[u32, str](r));
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# emit the branchless absolute value `|v| = (v ^ s) - s`, and hand back the sign word
+#
+# `s` is the value's sign replicated across a whole lane - an arithmetic shift of the
+# top lane by one bit less than a lane, the same one-piece trick `emit_sign_fill`
+# uses. For a non-negative value `s` is 0 and the identity is `v - 0`; for a negative
+# one it is all-ones and the identity is `~v + 1`, two's complement negation. No
+# branch, and no dependence on which case it turns out to be.
+# ---
+# v_ops: the `nl` input lane operands
+# out:   receives the `nl` absolute-value lane operands (caller-allocated temporaries)
+# sign:  receives the sign word
+# ret:   ok(true) on success, or an allocation error
+fun emit_wide_abs(alloc: *A.Allocator, f: *mir.MirFunction, src: *mir.MirInstr,
+                  dst: *mir.MirInstr, cursor: *u32,
+                  v_ops: *mir.MirOperand, out: *mir.MirOperand, sign: *mir.MirOperand,
+                  nl: u32, lw: u8) R.Result[bool, str] {
+    val lb: u32 = lw::u32 * 8;
+    val rs: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](rs)) { ret R.err[bool, str](R.unwrap_err[u32, str](rs)); }
+    val s: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rs));
+    val r1: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, mir.MIR_SHR_S, s,
+                                           v_ops[nl - 1], mir.op_imm((lb - 1)::i64), lw);
+    if (R.is_err[bool, str](r1)) { ret r1; }
+    @sign = s;
+
+    var xr: [MAX_SHIFT_LANES]mir.MirOperand;
+    var sb: [MAX_SHIFT_LANES]mir.MirOperand;
+    var i: u32 = 0;
+    for (i < nl) {
+        val rt: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](rt)) { ret R.err[bool, str](R.unwrap_err[u32, str](rt)); }
+        xr[i] = mir.op_vreg(R.unwrap_ok[u32, str](rt));
+        val rx: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, mir.MIR_XOR, xr[i], v_ops[i], s, lw);
+        if (R.is_err[bool, str](rx)) { ret rx; }
+        sb[i] = s;
+        i = i + 1;
+    }
+    ret emit_addsub_chain(alloc, f, src, dst, cursor, out, ?xr[0], ?sb[0], nl, lw, true);
+}
+
+# apply a sign word to a wide value in place: `(v ^ s) - s`, the same identity
+# `emit_wide_abs` uses, run in the other direction
+fun emit_apply_sign(alloc: *A.Allocator, f: *mir.MirFunction, src: *mir.MirInstr,
+                    dst: *mir.MirInstr, cursor: *u32,
+                    v_ops: *mir.MirOperand, out: *mir.MirOperand, s: mir.MirOperand,
+                    nl: u32, lw: u8) R.Result[bool, str] {
+    var xr: [MAX_SHIFT_LANES]mir.MirOperand;
+    var sb: [MAX_SHIFT_LANES]mir.MirOperand;
+    var i: u32 = 0;
+    for (i < nl) {
+        val rt: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](rt)) { ret R.err[bool, str](R.unwrap_err[u32, str](rt)); }
+        xr[i] = mir.op_vreg(R.unwrap_ok[u32, str](rt));
+        val rx: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, mir.MIR_XOR, xr[i], v_ops[i], s, lw);
+        if (R.is_err[bool, str](rx)) { ret rx; }
+        sb[i] = s;
+        i = i + 1;
+    }
+    ret emit_addsub_chain(alloc, f, src, dst, cursor, out, ?xr[0], ?sb[0], nl, lw, true);
+}
+
+# expand a wide divide or remainder into restoring division over the operation's width
+#
+# THE ALGORITHM. Textbook restoring division, the shift-subtract counterpart of the
+# shift-add `expand_mul` above it. A running remainder starts at zero; each stage
+# shifts it up one bit, takes the dividend's top bit into its bottom, and subtracts
+# the divisor when that leaves it large enough - recording a 1 in the quotient when it
+# did. The dividend doubles each stage too, so the bit just consumed vacates the low
+# end and the quotient bit takes its place: quotient and dividend share one register
+# file, which is why no separate quotient value is threaded through the loop.
+#
+# BRANCHLESS FOR THE SAME STRUCTURAL REASON as the multiply and the shift barrel: this
+# pass emits straight-line code into ONE block and cannot build the control-flow edges
+# a data-dependent branch would need, so "subtract or don't" is a mask-and-select. It
+# is NOT for secrecy - `mir.lower`'s #1646 gate already refuses a secret divide operand
+# on every target, since div is unconditionally variable-latency there.
+#
+# THE COST IS HONEST RATHER THAN CHEAP, the same call the multiply already made: one
+# stage per BIT of the operation width, each a wide compare and a borrow chain, with no
+# early exit. An `i64` divide on a 32-bit ALU is on the order of a thousand pieces. That
+# is the price of having the operation at all on a machine whose ALU cannot do it, and
+# the alternative is not a faster expansion, it is a compile error - which is what this
+# pass produced before.
+#
+# SIGNED IS A WRAPPER, NOT A SECOND ALGORITHM: both operands are taken to their
+# absolute values, the unsigned core runs, and the result's sign is applied back. A
+# quotient's sign combines both operands'; a remainder's is the dividend's alone, which
+# is what makes truncating division's `a % b` agree in sign with `a`.
+#
+# TWO EDGE CASES, both inherited rather than chosen. `INT_MIN / -1` overflows in two's
+# complement, and this returns `INT_MIN` - matching what RISC-V's own `div` defines and
+# what the wide-native targets' hardware produces. It is NOT special-cased: it falls out
+# of the sign algebra, because `abs(INT_MIN)` is `INT_MIN` and the two sign words cancel.
+# DIVISION BY ZERO is normalized onto the hardware answer by `emit_divmod_zero_fixup`,
+# for intra-target consistency rather than because the language requires it - see there.
+#
+# SHARED, NOT RV32-SPECIFIC: nothing here reads a target fact, only `plan.lane_width`
+# and the primitives already in this file.
+# ---
+# alloc:  backing allocator for piece operand arrays and lane temporaries
+# plan:   the function's lane assignment
+# f:      the MIR function (for appending temporaries)
+# mi:     the divide / remainder instruction to expand
+# dst:    the rebuilt instruction array
+# cursor: next write index into `dst`; advanced past the emitted pieces
+# ret:    ok(true) on success, or an error naming the unsupported shape
+fun expand_divmod(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *mir.MirInstr,
+                  dst: *mir.MirInstr, cursor: *u32) R.Result[bool, str] {
+    val rc: R.Result[u32, str] = divmod_piece_count(alloc, plan, mi);
+    if (R.is_err[u32, str](rc)) { ret R.err[bool, str](R.unwrap_err[u32, str](rc)); }
+
+    val nl: u32 = wide_lane_count(plan, mi);
+    val lw: u8  = plan.lane_width;
+    val lb: u32 = lw::u32 * 8;
+    val bits: u32 = nl * lb;
+    val signed: bool = div_is_signed(mi.opcode);
+    val want_rem: bool = div_wants_remainder(mi.opcode);
+
+    var num: [MAX_SHIFT_LANES]mir.MirOperand;   # the running dividend, becoming the quotient
+    var den: [MAX_SHIFT_LANES]mir.MirOperand;   # the divisor, constant through the loop
+    var rem: [MAX_SHIFT_LANES]mir.MirOperand;   # the running remainder, zero initially
+    # the ORIGINAL operands, kept past the signed prologue's overwrite: the zero
+    # normalization tests the divisor as written and yields the dividend as written.
+    var od: [MAX_SHIFT_LANES]mir.MirOperand;
+    var on: [MAX_SHIFT_LANES]mir.MirOperand;
+    var i: u32 = 0;
+    for (i < nl) {
+        num[i] = lane_operand(plan, ?mi.operands[1], i);
+        den[i] = lane_operand(plan, ?mi.operands[2], i);
+        on[i]  = num[i];
+        od[i]  = den[i];
+        rem[i] = mir.op_imm(0);
+        i = i + 1;
+    }
+
+    # the signed prologue: both operands to their magnitudes, signs kept for the end.
+    var sa: mir.MirOperand = mir.op_imm(0);
+    var sb: mir.MirOperand = mir.op_imm(0);
+    if (signed) {
+        var an: [MAX_SHIFT_LANES]mir.MirOperand;
+        val ra: R.Result[bool, str] = new_lane_temps(alloc, f, ?an[0], nl);
+        if (R.is_err[bool, str](ra)) { ret ra; }
+        val r1: R.Result[bool, str] = emit_wide_abs(alloc, f, mi, dst, cursor, ?num[0], ?an[0], ?sa, nl, lw);
+        if (R.is_err[bool, str](r1)) { ret r1; }
+
+        var bn: [MAX_SHIFT_LANES]mir.MirOperand;
+        val rb2: R.Result[bool, str] = new_lane_temps(alloc, f, ?bn[0], nl);
+        if (R.is_err[bool, str](rb2)) { ret rb2; }
+        val r2: R.Result[bool, str] = emit_wide_abs(alloc, f, mi, dst, cursor, ?den[0], ?bn[0], ?sb, nl, lw);
+        if (R.is_err[bool, str](r2)) { ret r2; }
+
+        i = 0;
+        for (i < nl) { num[i] = an[i]; den[i] = bn[i]; i = i + 1; }
+    }
+
+    var j: u32 = 0;
+    for (j < bits) {
+        # the running dividend's top bit, captured BEFORE it is shifted away.
+        val rh: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](rh)) { ret R.err[bool, str](R.unwrap_err[u32, str](rh)); }
+        val hs: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rh));
+        val e1: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, mir.MIR_SHR_U, hs,
+                                               num[nl - 1], mir.op_imm((lb - 1)::i64), lw);
+        if (R.is_err[bool, str](e1)) { ret e1; }
+        val rh2: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](rh2)) { ret R.err[bool, str](R.unwrap_err[u32, str](rh2)); }
+        val hb: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rh2));
+        val e2: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, mir.MIR_AND, hb, hs, mir.op_imm(1), lw);
+        if (R.is_err[bool, str](e2)) { ret e2; }
+
+        # remainder <<= 1, then that bit into its bottom lane.
+        var rsh: [MAX_SHIFT_LANES]mir.MirOperand;
+        val rt1: R.Result[bool, str] = new_lane_temps(alloc, f, ?rsh[0], nl);
+        if (R.is_err[bool, str](rt1)) { ret rt1; }
+        val e3: R.Result[bool, str] = emit_const_shift(alloc, f, mi, dst, cursor, ?rem[0], ?rsh[0],
+                                                       nl, lw, 0, 1, true, false, mir.op_imm(0));
+        if (R.is_err[bool, str](e3)) { ret e3; }
+        val rl0: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](rl0)) { ret R.err[bool, str](R.unwrap_err[u32, str](rl0)); }
+        val rlo: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rl0));
+        val e4: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, mir.MIR_OR, rlo, rsh[0], hb, lw);
+        if (R.is_err[bool, str](e4)) { ret e4; }
+        rsh[0] = rlo;
+
+        # dividend <<= 1, vacating the low bit for this stage's quotient bit.
+        var nsh: [MAX_SHIFT_LANES]mir.MirOperand;
+        val rt2: R.Result[bool, str] = new_lane_temps(alloc, f, ?nsh[0], nl);
+        if (R.is_err[bool, str](rt2)) { ret rt2; }
+        val e5: R.Result[bool, str] = emit_const_shift(alloc, f, mi, dst, cursor, ?num[0], ?nsh[0],
+                                                       nl, lw, 0, 1, true, false, mir.op_imm(0));
+        if (R.is_err[bool, str](e5)) { ret e5; }
+
+        # the whole decision: does the shifted remainder reach the divisor.
+        val rlt: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](rlt)) { ret R.err[bool, str](R.unwrap_err[u32, str](rlt)); }
+        val lt: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rlt));
+        val e6: R.Result[bool, str] = emit_wide_rel(alloc, f, mi, dst, cursor, lt, ?rsh[0], ?den[0],
+                                                    nl, lw, false, false);
+        if (R.is_err[bool, str](e6)) { ret e6; }
+        val rge: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](rge)) { ret R.err[bool, str](R.unwrap_err[u32, str](rge)); }
+        val ge: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rge));
+        val e7: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, mir.MIR_XOR, ge, lt, mir.op_imm(1), lw);
+        if (R.is_err[bool, str](e7)) { ret e7; }
+
+        # the quotient bit lands in the vacated low bit of the dividend.
+        val rq: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](rq)) { ret R.err[bool, str](R.unwrap_err[u32, str](rq)); }
+        val qlo: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rq));
+        val e8: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, mir.MIR_OR, qlo, nsh[0], ge, lw);
+        if (R.is_err[bool, str](e8)) { ret e8; }
+        nsh[0] = qlo;
+
+        # `0 - ge` is all-ones exactly when the subtraction is taken: the select mask.
+        val rm: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](rm)) { ret R.err[bool, str](R.unwrap_err[u32, str](rm)); }
+        val mask: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rm));
+        val e9: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, mir.MIR_SUB, mask, mir.op_imm(0), ge, lw);
+        if (R.is_err[bool, str](e9)) { ret e9; }
+
+        var md: [MAX_SHIFT_LANES]mir.MirOperand;
+        i = 0;
+        for (i < nl) {
+            val rd: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](rd)) { ret R.err[bool, str](R.unwrap_err[u32, str](rd)); }
+            md[i] = mir.op_vreg(R.unwrap_ok[u32, str](rd));
+            val rx: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, mir.MIR_AND, md[i], den[i], mask, lw);
+            if (R.is_err[bool, str](rx)) { ret rx; }
+            i = i + 1;
+        }
+
+        var nrem: [MAX_SHIFT_LANES]mir.MirOperand;
+        val rt3: R.Result[bool, str] = new_lane_temps(alloc, f, ?nrem[0], nl);
+        if (R.is_err[bool, str](rt3)) { ret rt3; }
+        val e10: R.Result[bool, str] = emit_addsub_chain(alloc, f, mi, dst, cursor, ?nrem[0], ?rsh[0], ?md[0], nl, lw, true);
+        if (R.is_err[bool, str](e10)) { ret e10; }
+
+        i = 0;
+        for (i < nl) { rem[i] = nrem[i]; num[i] = nsh[i]; i = i + 1; }
+        j = j + 1;
+    }
+
+    # the two results the one loop produced; pick the one this opcode asked for.
+    var res: [MAX_SHIFT_LANES]mir.MirOperand;
+    i = 0;
+    for (i < nl) {
+        res[i] = num[i];
+        if (want_rem) { res[i] = rem[i]; }
+        i = i + 1;
+    }
+
+    var d_ops: [MAX_SHIFT_LANES]mir.MirOperand;
+    i = 0;
+    for (i < nl) { d_ops[i] = lane_operand(plan, ?mi.operands[0], i); i = i + 1; }
+
+    # the signed epilogue: a quotient carries both operands' signs combined, a
+    # remainder carries the dividend's alone. it runs BEFORE the zero normalization
+    # below, because the value that normalization installs is already final - a
+    # divide by zero yields -1 whatever the dividend's sign, so negating it after the
+    # fact would produce 1 on a negative dividend.
+    if (signed) {
+        var s: mir.MirOperand = sa;
+        if (!want_rem) {
+            val rq2: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](rq2)) { ret R.err[bool, str](R.unwrap_err[u32, str](rq2)); }
+            s = mir.op_vreg(R.unwrap_ok[u32, str](rq2));
+            val rs2: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, mir.MIR_XOR, s, sa, sb, lw);
+            if (R.is_err[bool, str](rs2)) { ret rs2; }
+        }
+        var sres: [MAX_SHIFT_LANES]mir.MirOperand;
+        val rst: R.Result[bool, str] = new_lane_temps(alloc, f, ?sres[0], nl);
+        if (R.is_err[bool, str](rst)) { ret rst; }
+        val rap: R.Result[bool, str] = emit_apply_sign(alloc, f, mi, dst, cursor, ?res[0], ?sres[0], s, nl, lw);
+        if (R.is_err[bool, str](rap)) { ret rap; }
+        i = 0;
+        for (i < nl) { res[i] = sres[i]; i = i + 1; }
+    }
+
+    ret emit_divmod_zero_fixup(alloc, f, mi, dst, cursor, ?res[0], ?od[0], ?on[0], ?d_ops[0],
+                               nl, lw, want_rem);
+}
+
+# normalize a DIVIDE BY ZERO onto the answer the hardware targets already give
+#
+# WHY THIS EXISTS, and it is not because the language requires it. Division by zero is
+# undefined at the source level, so any value would satisfy the spec. What would not
+# be satisfactory is riscv64 disagreeing with ITSELF: a native-width divide there is a
+# hardware `div`, which defines an all-ones quotient and the DIVIDEND as remainder,
+# while a wide one comes through this expansion, whose loop drives the zero divisor
+# through the same compare every stage and lands on an all-ones quotient with a
+# WRAPPED remainder. Same target, same source-level operator, two different answers
+# selected by a width the programmer did not choose. A divergence inside one target is
+# worse than an undefined value, because nothing about the program says which path it
+# took.
+#
+# So the wide path is bent to match the narrow one, and the cost is paid only on the
+# wide path - which is already the expanded, thousand-piece one. The all-ones quotient
+# is `-1` at every width and needs no per-signedness case: the signed and unsigned
+# hardware definitions agree on the bit pattern.
+# ---
+# res:   the computed result lanes (post sign fixup)
+# den:   the ORIGINAL divisor lanes, as written
+# num:   the ORIGINAL dividend lanes, as written (the defined remainder)
+# d_ops: the destination lanes
+# rem:   true when the operation wants the remainder
+fun emit_divmod_zero_fixup(alloc: *A.Allocator, f: *mir.MirFunction, src: *mir.MirInstr,
+                           dst: *mir.MirInstr, cursor: *u32,
+                           res: *mir.MirOperand, den: *mir.MirOperand, num: *mir.MirOperand,
+                           d_ops: *mir.MirOperand, nl: u32, lw: u8, rem: bool) R.Result[bool, str] {
+    # the divisor is zero exactly when every lane is, so OR them and test once.
+    var acc: mir.MirOperand = den[0];
+    var i: u32 = 1;
+    for (i < nl) {
+        val ra: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](ra)) { ret R.err[bool, str](R.unwrap_err[u32, str](ra)); }
+        val nx: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](ra));
+        val r1: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, mir.MIR_OR, nx, acc, den[i], lw);
+        if (R.is_err[bool, str](r1)) { ret r1; }
+        acc = nx;
+        i = i + 1;
+    }
+
+    val rz: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](rz)) { ret R.err[bool, str](R.unwrap_err[u32, str](rz)); }
+    val z: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rz));
+    val r2: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, mir.MIR_CMP_EQ, z, acc, mir.op_imm(0), lw);
+    if (R.is_err[bool, str](r2)) { ret r2; }
+
+    val rm: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](rm)) { ret R.err[bool, str](R.unwrap_err[u32, str](rm)); }
+    val mask: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rm));
+    val r3: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, mir.MIR_SUB, mask, mir.op_imm(0), z, lw);
+    if (R.is_err[bool, str](r3)) { ret r3; }
+
+    # per lane: d = res ^ ((res ^ defined) & mask), the same branchless select the
+    # multiply's accumulate uses.
+    i = 0;
+    for (i < nl) {
+        var defined: mir.MirOperand = mir.op_imm(-1);
+        if (rem) { defined = num[i]; }
+
+        val rx: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](rx)) { ret R.err[bool, str](R.unwrap_err[u32, str](rx)); }
+        val x: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rx));
+        val e1: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, mir.MIR_XOR, x, res[i], defined, lw);
+        if (R.is_err[bool, str](e1)) { ret e1; }
+
+        val ry: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](ry)) { ret R.err[bool, str](R.unwrap_err[u32, str](ry)); }
+        val y: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](ry));
+        val e2: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, mir.MIR_AND, y, x, mask, lw);
+        if (R.is_err[bool, str](e2)) { ret e2; }
+
+        val e3: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, mir.MIR_XOR, d_ops[i], res[i], y, lw);
+        if (R.is_err[bool, str](e3)) { ret e3; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
 # whether a comparison is one of the two EQUALITY relations
 #
 # The family split the whole comparison expansion turns on (#2495): equality is
@@ -2108,16 +2570,28 @@ fun cmp_piece_count(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr) R.R
     # first: no lane relation, so no signedness and no `<=` cost anywhere in it.
     if (cmp_is_equality(op)) { ret R.ok[u32, str](2 * nl - 1); }
 
-    val signed: bool = cmp_is_signed(op);
-    # the bottom lane carries the relation itself; every lane above it contributes a
-    # strict less-than plus the three-piece tie-break (equality, gate, join).
-    var total: u32 = cmp_rel_pieces(signed && nl == 1, cmp_is_le(op));
+    ret R.ok[u32, str](wide_rel_pieces(nl, cmp_is_signed(op), cmp_is_le(op)));
+}
+
+# the exact piece count of `emit_wide_rel` over `nl` lanes
+#
+# The bottom lane carries the relation itself; every lane above it contributes a
+# strict less-than plus the three-piece tie-break (equality, gate, join). Walks the
+# SAME lanes in the same order the expansion does, reading `cmp_rel_pieces` for each,
+# rather than restating a closed formula the emit could drift away from.
+# ---
+# nl:     the lane count
+# signed: true when the relation reads its top lane as signed
+# le:     true when the relation admits equality
+# ret:    the exact piece count
+fun wide_rel_pieces(nl: u32, signed: bool, le: bool) u32 {
+    var total: u32 = cmp_rel_pieces(signed && nl == 1, le);
     var i: u32 = 1;
     for (i < nl) {
         total = total + cmp_rel_pieces(signed && i == nl - 1, false) + 3;
         i = i + 1;
     }
-    ret R.ok[u32, str](total);
+    ret total;
 }
 
 # expand a wide comparison into native-width pieces (#2495)
@@ -2226,9 +2700,49 @@ fun expand_cmp_equality(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunctio
 fun expand_cmp_ordered(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *mir.MirInstr,
                        dst: *mir.MirInstr, cursor: *u32) R.Result[bool, str] {
     val nl: u32 = wide_lane_count(plan, mi);
-    val lw: u8  = plan.lane_width;
-    val d:  mir.MirOperand = mi.operands[0];
-    val signed: bool = cmp_is_signed(mi.opcode);
+    var a_ops: [MAX_SHIFT_LANES]mir.MirOperand;
+    var b_ops: [MAX_SHIFT_LANES]mir.MirOperand;
+    var i: u32 = 0;
+    for (i < nl) {
+        a_ops[i] = lane_operand(plan, ?mi.operands[1], i);
+        b_ops[i] = lane_operand(plan, ?mi.operands[2], i);
+        i = i + 1;
+    }
+    ret emit_wide_rel(alloc, f, mi, dst, cursor, mi.operands[0], ?a_ops[0], ?b_ops[0],
+                      nl, plan.lane_width, cmp_is_signed(mi.opcode), cmp_is_le(mi.opcode));
+}
+
+# THE ORDERED WIDE RELATION, over explicit lane arrays rather than a comparison
+# instruction's own operands
+#
+# The lexicographic walk itself, lifted off `expand_cmp_ordered` so a caller that
+# holds lanes it BUILT - rather than lanes it read out of `mi.operands` - can ask the
+# same question. The wide divide's restoring step needs exactly that: its `rem >=u
+# divisor` test compares a running remainder that exists only as temporaries against
+# a lane-read divisor, and re-deriving the walk beside it would be a second copy of
+# the one rule that decides which of two wide values is larger.
+#
+# `wide_rel_pieces` is the matching count, and both are read by `cmp_piece_count` and
+# by the divide's own count, so no caller restates the arithmetic.
+# ---
+# alloc:  backing allocator for piece operand arrays and lane temporaries
+# f:      the MIR function (for appending temporaries)
+# src:    the instruction being replaced (source of loc / inline_site)
+# dst:    the rebuilt instruction array
+# cursor: next write index into `dst`; advanced past the emitted pieces
+# d:      the destination the 0 / 1 result lands in (the native boolean, never split)
+# a_ops:  the `nl` left-hand lane operands, lane 0 least significant
+# b_ops:  the `nl` right-hand lane operands
+# nl:     the lane count
+# lw:     the native lane width in bytes
+# signed: true when the relation reads its TOP lane as signed
+# le:     true when the relation admits equality
+# ret:    ok(true) on success, or an allocation error
+fun emit_wide_rel(alloc: *A.Allocator, f: *mir.MirFunction, src: *mir.MirInstr,
+                  dst: *mir.MirInstr, cursor: *u32, d: mir.MirOperand,
+                  a_ops: *mir.MirOperand, b_ops: *mir.MirOperand,
+                  nl: u32, lw: u8, signed: bool, le: bool) R.Result[bool, str] {
+    val mi: *mir.MirInstr = src;
 
     # the bottom lane: the only lane carrying the relation itself, and signed only
     # when it is also the top lane.
@@ -2239,15 +2753,14 @@ fun expand_cmp_ordered(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction
         res = mir.op_vreg(R.unwrap_ok[u32, str](r0));
     }
     val rb: R.Result[bool, str] = emit_lane_rel(alloc, f, mi, dst, cursor, res,
-                                                lane_operand(plan, ?mi.operands[1], 0),
-                                                lane_operand(plan, ?mi.operands[2], 0), lw,
-                                                signed && nl == 1, cmp_is_le(mi.opcode));
+                                                a_ops[0], b_ops[0], lw,
+                                                signed && nl == 1, le);
     if (R.is_err[bool, str](rb)) { ret rb; }
 
     var i: u32 = 1;
     for (i < nl) {
-        val a: mir.MirOperand = lane_operand(plan, ?mi.operands[1], i);
-        val b: mir.MirOperand = lane_operand(plan, ?mi.operands[2], i);
+        val a: mir.MirOperand = a_ops[i];
+        val b: mir.MirOperand = b_ops[i];
 
         # this lane's own strict less-than: signed at the top lane, unsigned below.
         val rl: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
@@ -2575,8 +3088,139 @@ test "mach.lang.be.codegen.legalize:expands_wide_add_carry_chain" {
     ret 0;
 }
 
-# a wide operation the pass does not legalize (a divide) fails loudly with a
-# diagnostic naming the operation, never silently miscompiling
+# test-only: a function computing `d = a <op> b` at `width`, with both sources
+# defined by wide moves so the plan gives them lanes
+fun t_divmod_fn(alloc: *A.Allocator, f: *mir.MirFunction, b: *mir.MirBlock,
+                op: mir.MirOpcode, width: u8, a: i64, bv: i64) {
+    t_vregs(alloc, f, 3);
+    t_block(alloc, b, 3);
+    var ma: [2]mir.MirOperand;
+    ma[0] = mir.op_vreg(1); ma[1] = mir.op_imm(a);
+    t_instr(alloc, b, 0, mir.MIR_MOV, ?ma[0], 2, width);
+    var mb: [2]mir.MirOperand;
+    mb[0] = mir.op_vreg(2); mb[1] = mir.op_imm(bv);
+    t_instr(alloc, b, 1, mir.MIR_MOV, ?mb[0], 2, width);
+    var dv: [3]mir.MirOperand;
+    dv[0] = mir.op_vreg(0); dv[1] = mir.op_vreg(1); dv[2] = mir.op_vreg(2);
+    t_instr(alloc, b, 2, op, ?dv[0], 3, width);
+    f.blocks = b; f.block_count = 1;
+}
+
+# A WIDE DIVIDE IS LEGALIZED RATHER THAN REFUSED (#2778), and its emitted piece count
+# is exactly what the pass pre-computed for it.
+#
+# The count agreeing with the emit is the load-bearing assertion, not a detail: this
+# pass sizes the rebuilt instruction array from `expansion_count` BEFORE it expands,
+# so a count that disagreed with the emit would overrun the array or leave it short.
+# Asserting the block length equals the two source moves plus `divmod_piece_count`
+# checks both halves against each other at every width below.
+test "mach.lang.be.codegen.legalize:expands_a_wide_divide" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var mach: Machine = t_mach(1, 2);
+
+    # two lanes: 16 bits, so 16 restoring stages.
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    t_divmod_fn(?alloc, ?f, ?b, mir.MIR_DIV_U, 2, 1000, 7);
+
+    var plan: LanePlan;
+    if (R.is_err[bool, str](plan_lanes(?alloc, ?mach, ?f, ?plan))) { ret 1; }
+    val rc: R.Result[u32, str] = divmod_piece_count(?alloc, ?plan, ?b.instrs[2]);
+    if (R.is_err[u32, str](rc)) { ret 1; }
+    val want: u32 = R.unwrap_ok[u32, str](rc);
+    free_plan(?alloc, ?plan);
+
+    if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f))) { ret 1; }
+    # the two wide source moves are two lanes each, then the divide's own pieces.
+    if (b.instr_count != 4 + want) { ret 1; }
+    # every piece is native width, and none is control flow: restoring division is
+    # straight-line for the same structural reason the multiply and the barrel are.
+    var i: u32 = 0;
+    for (i < b.instr_count) {
+        if (b.instrs[i].width != 1)            { ret 1; }
+        if (b.instrs[i].opcode == mir.MIR_BR)  { ret 1; }
+        if (b.instrs[i].opcode == mir.MIR_CBR) { ret 1; }
+        if (b.instrs[i].opcode == mir.MIR_DIV_U || b.instrs[i].opcode == mir.MIR_DIV_S ||
+            b.instrs[i].opcode == mir.MIR_REM_U || b.instrs[i].opcode == mir.MIR_REM_S) { ret 1; }
+        i = i + 1;
+    }
+    if (f.block_count != 1) { ret 1; }
+
+    # THE DIVIDE-BY-ZERO NORMALIZATION IS THE TAIL, and it is what writes the
+    # destination: the last `nl` pieces are the per-lane select, each an XOR into a
+    # destination lane. Asserted structurally because the alternative - riscv64's
+    # narrow path and wide path disagreeing about `x / 0` - is invisible at every
+    # width the hardware happens to cover.
+    val last: u32 = b.instr_count - 1;
+    if (b.instrs[last].opcode != mir.MIR_XOR)         { ret 1; }
+    if (b.instrs[last].operands[0].kind != mir.MIR_OP_VREG) { ret 1; }
+    # and the zero test itself is a compare of the OR-reduced divisor against 0.
+    var saw_zero_test: bool = false;
+    i = 0;
+    for (i < b.instr_count) {
+        if (b.instrs[i].opcode == mir.MIR_CMP_EQ && b.instrs[i].operand_count == 3 &&
+            b.instrs[i].operands[2].kind == mir.MIR_OP_IMM && b.instrs[i].operands[2].imm == 0) {
+            saw_zero_test = true;
+        }
+        i = i + 1;
+    }
+    if (!saw_zero_test) { ret 1; }
+    ret 0;
+}
+
+# all four opcodes legalize, and the two that differ in SIGNEDNESS cost the signed
+# wrapper on top of the shared unsigned core
+#
+# The remainder is not a second algorithm - restoring division computes both results,
+# so `REM` and `DIV` at the same signedness cost the SAME core and differ only in which
+# lane array is copied out. A signed operation pays the abs/apply-sign wrapper, so it
+# costs strictly more than its unsigned twin, and a signed remainder costs one piece
+# less than a signed quotient because it reuses the dividend's sign word instead of
+# combining two.
+test "mach.lang.be.codegen.legalize:divide_family_costs_agree" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var mach: Machine = t_mach(1, 2);
+
+    var du: u32 = 0; var ds: u32 = 0; var ru: u32 = 0; var rs: u32 = 0;
+    var ops: [4]mir.MirOpcode;
+    ops[0] = mir.MIR_DIV_U; ops[1] = mir.MIR_DIV_S;
+    ops[2] = mir.MIR_REM_U; ops[3] = mir.MIR_REM_S;
+    var k: u32 = 0;
+    for (k < 4) {
+        var f: mir.MirFunction;
+        var b: mir.MirBlock;
+        t_divmod_fn(?alloc, ?f, ?b, ops[k], 2, 1000, 7);
+        var plan: LanePlan;
+        if (R.is_err[bool, str](plan_lanes(?alloc, ?mach, ?f, ?plan))) { ret 1; }
+        val rc: R.Result[u32, str] = divmod_piece_count(?alloc, ?plan, ?b.instrs[2]);
+        if (R.is_err[u32, str](rc)) { ret 1; }
+        val n: u32 = R.unwrap_ok[u32, str](rc);
+        free_plan(?alloc, ?plan);
+        if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f))) { ret 1; }
+        if (b.instr_count != 4 + n) { ret 1; }
+        if (k == 0) { du = n; } or (k == 1) { ds = n; } or (k == 2) { ru = n; } or { rs = n; }
+        k = k + 1;
+    }
+
+    # unsigned quotient and unsigned remainder are the same expansion.
+    if (du != ru) { ret 1; }
+    # signed costs the wrapper on top.
+    if (ds <= du) { ret 1; }
+    if (rs <= ru) { ret 1; }
+    # and a signed remainder is exactly one piece cheaper: no sign-word combine.
+    if (ds != rs + 1) { ret 1; }
+    ret 0;
+}
+
+# an operation whose SOURCE operands the plan never split fails loudly with a
+# diagnostic naming it, never silently miscompiling
+#
+# The divide here is legalizable as an OPCODE (#2778) - what it is not is legalizable
+# in this SHAPE: `plan_lanes` splits a vreg by its DEFINING instruction, and these two
+# sources are defined by nothing, so neither has lanes to decompose into. That is the
+# guard being asserted, and the opcode is incidental to it.
 test "mach.lang.be.codegen.legalize:rejects_unsupported_wide_op" {
     var alloc: A.Allocator;
     page.make(?alloc);
