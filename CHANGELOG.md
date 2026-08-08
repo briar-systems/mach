@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### mach's riscv64 objects were not psABI-conformant, so no foreign linker would consume them (#2828)
+A `R_RISCV_PCREL_LO12_I/_S` is required to name a **label at the paired `auipc`**, not the symbol being addressed. mach named the symbol, so `ld.lld` refused every object outright, one error per pair, before resolving anything: `relocation points to a symbol '.Lconst.0' in a different section '.rodata.cst'`. Nothing was wrong at runtime, because mach's own linker and its own producer agreed with each other. That agreement was the problem, and it is the same self-consistency that hid #2797 until a foreign object was used.
+
+riscv64 codegen now mints one `.Lpcrel_hi.N` label per `auipc` and points every low half at it, which is the spelling the psABI states and the only one a foreign linker accepts.
+
+The pairing normalization moved out of the ELF reader and became a **declared seam**: `isa.RelocSeam` gained an optional `normalize_image` hook that the linker runs over every input once, before anything reads a relocation, skipped for a relocatable link. That matters more than where the code sits. The reader only ever saw objects arriving from disk, so an image handed straight from codegen never passed through the chase, and once the low half named a label with a zero addend an unnormalized image would have resolved to a flat zero - reintroducing #2797 from the opposite direction. One rule now applies to every riscv64 image entering the linker regardless of provenance, and the reader's two spellings collapse into one.
+
+Two places fabricated a symbol type rather than reading one, both true only while every text symbol happened to be a function entry: `pack_symbols` OR-ed a function flag into every mark, and the ELF writer fell back to the section kind. A mark now states its own type and an untyped symbol writes `STT_NOTYPE`.
+
+The change also exposed a defect in shared code that had been latent because its precondition was rare. Dropping a duplicate weak function refused whenever **any** symbol sat inside its interval, so the moment every `auipc` in such a body carried a label, no duplicate weak body was ever dropped again, and a `-g` link described a discarded body with a second contradictory DIE. The rule is now that a local nothing names cannot keep anything alive: a local resolves by index rather than by name (#2520), so only a relocation in its own module can reach one, and a debug-sourced relocation does not count (#2572).
+
+Measured rather than estimated: 31 mach objects plus a clang probe went from **228 `PCREL_LO12` errors and no binary** to zero errors, a linked binary, and correct values read back. Objects grow **8056 bytes, 3.00%**, for 215 labels at 37.5 bytes each. The labels are local and never reach an image, so a linked binary carries none of them.
+
+The `.riscv.attributes` section is still stamped from a constant describing what mach's encoder emits rather than what the linked image holds, so a compressed float load can still fail to decode from it. That is the same class of claim one section over, and it is tracked on this issue rather than closed with it.
+
+#### `--emit-asm` printed two different global references identically (#2839)
+`&g.lo` and `&g.hi` printed the same line while the objects relocated against `g` and `g+8`. A reader comparing the printed assembly against the object had no way to see the difference, which is the same failure as #2821 arriving through a different field.
+
+The addend is now carried once, on `isa.Operand` beside the symbol id, and read by the printers. No encoder reads it, exactly as no encoder reads the symbol id, which is what makes the change provably byte-neutral: 1344 files across three targets at both profiles, none differing.
+
+The field holds **what the line must spell**, which is not the operand's offset and not the relocation's addend. Those coincide nearly everywhere and diverge at two real sites, both load-bearing. riscv64's `%pcrel_lo` relocates with its own distance back to the `auipc` folded in, so the pair's constant belongs to the `%pcrel_hi` and the low half must spell none, or it doubles. aarch64's GOT pair always relocates with addend zero, because a GOT relocation cannot carry one and the offset rides a trailing `add` instead, so `:got:g+8` would name an instruction that assembles to different bytes than the object holds. Each such site carries its reason inline.
+
+The ambiguity was demonstrated rather than asserted. With the fix reverted and the new tests in place, every expectation was flipped to the old output and the whole suite passed, which proves the two states genuinely printed the same string.
+
 #### A sub-128-bit vector stored to a global was written from the wrong register bank on aarch64 (#2838)
 `g = a + b` for a global of a vector type narrower than the vector register emitted `str x2` for a sum that was sitting in `v2`. The two registers share an index and nothing else, so the global received whatever the general-purpose register happened to hold, which reads back as stack-address noise rather than as the lanes. Local and stack-record-field destinations were correct throughout, and x86-64 compiled the same source correctly, so the defect was aarch64 with a global destination and nothing else.
 
