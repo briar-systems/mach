@@ -157,6 +157,28 @@ rec Machine {
     mul_hi:     u8;
     stage_lo:   i32;
     stage_hi:   i32;
+    fp_class:   u32;
+}
+
+# sentinel "this machine declares no float register bank" in a Machine's `fp_class`
+val FP_CLASS_NONE: u32 = 0xFFFFFFFF;
+
+# the register class index of the machine's float bank, or FP_CLASS_NONE
+#
+# READ BY ROLE RATHER THAN INDEX. `RC_FLOAT` is the fact the ISA states about itself, so
+# a target with no float bank (mos6502 declares one class, and computes its floats on the
+# integer ALU) answers NONE here without this pass knowing any target's name. The
+# alternative - reading the class off a float OPERAND of the instruction at hand - fails
+# on the one shape that has no float vreg to read: a float CONSTANT converted to a wide
+# integer has an immediate on its float side and a GP destination.
+fun float_class_of(tgt: *target.Target) u32 {
+    if (tgt.model.reg_classes == nil) { ret FP_CLASS_NONE; }
+    var i: u32 = 0;
+    for (i < tgt.model.reg_class_len) {
+        if (tgt.model.reg_classes[i].kind == isa.RC_FLOAT) { ret i; }
+        i = i + 1;
+    }
+    ret FP_CLASS_NONE;
 }
 
 # per-function legalization plan: the lane assignment for every wide vreg
@@ -212,6 +234,7 @@ pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[bool, str] {
     mach.mul_hi     = tgt.model.mul_hi_width::u8;
     mach.stage_lo   = -1;
     mach.stage_hi   = -1;
+    mach.fp_class   = float_class_of(tgt);
     # a register machine declares the reserved scratch pair; a whole-module emitter
     # has no RegMachine at all and never drives a rewrite that needs one.
     if (tgt.arch != nil) {
@@ -289,7 +312,7 @@ fun instr_needs_legalize(f: *mir.MirFunction, mi: *mir.MirInstr, mach: *Machine)
     # A CONVERSION IS THE ONE INSTRUCTION WITH A VALUE IN EACH BANK, so the float-bank
     # exclusion below cannot decide it: excluding it leaves a wide INTEGER side that the
     # planner has already split, naming lane vregs nothing defines (#2860).
-    if (conv_is_wide(f, mi, mach.lane_width)) { ret true; }
+    if (conv_is_wide(mach, mi)) { ret true; }
     if (instr_rides_fp_bank(f, mi)) { ret false; }
     if (mi.width > mach.lane_width || mi.src_width > mach.lane_width) { ret true; }
     if (!mach.var_shift && is_shift(mi.opcode)) { ret true; }
@@ -452,7 +475,7 @@ fun plan_lanes(alloc: *A.Allocator, mach: *Machine, f: *mir.MirFunction, out: *L
             # a float-to-integer conversion's DESTINATION is a wide integer even though
             # the instruction has a float operand, so it is planned here while the
             # bank exclusion still keeps a float destination whole (#2860).
-            val conv_dst: bool = conv_is_wide(f, mi, maw) &&
+            val conv_dst: bool = conv_is_wide(mach, mi) &&
                                  mi.operand_count > 0 &&
                                  mi.operands[0].kind == mir.MIR_OP_VREG &&
                                  !mir.vreg_is_fp(f, mi.operands[0].vreg);
@@ -679,7 +702,7 @@ fun expansion_count(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction,
     val op: mir.MirOpcode = mi.opcode;
     val nl: u32 = wide_lane_count(plan, mi);
 
-    if (conv_is_wide(f, mi, plan.lane_width)) { ret conv_piece_count(alloc, plan, f, mi); }
+    if (conv_is_wide(?plan.mach, mi)) { ret conv_piece_count(alloc, plan, f, mi); }
 
     # a memory access - an explicit load / store, or the move form the ABI placement
     # emits against a stack slot - costs one piece per lane plus the pointer's own
@@ -929,7 +952,7 @@ fun expand_instr(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: 
                  dst: *mir.MirInstr, cursor: *u32) R.Result[bool, str] {
     val op: mir.MirOpcode = mi.opcode;
 
-    if (conv_is_wide(f, mi, plan.lane_width)) {
+    if (conv_is_wide(?plan.mach, mi)) {
         ret conv_run(alloc, plan, f, mi, dst, cursor);
     }
     if (instr_is_memory(mi)) {
@@ -3649,7 +3672,14 @@ fun cv_fp_to_int(cv: *ConvEmit, plan: *LanePlan, mi: *mir.MirInstr) {
     val dlo: mir.MirOperand = lane_operand(plan, ?mi.operands[0], 0);
     val dhi: mir.MirOperand = lane_operand(plan, ?mi.operands[0], 1);
 
+    # a float side that is not already in a register (a converted CONSTANT) is read into
+    # one first, so the arithmetic below names a value the float unit can reread
     var x: mir.MirOperand = mi.operands[1];
+    if (x.kind != mir.MIR_OP_VREG) {
+        val xr: mir.MirOperand = cv_fp(cv);
+        cv2(cv, mir.MIR_MOV, xr, x, mi.src_width, mi.src_width);
+        x = xr;
+    }
     if (mi.src_width == 4) {
         val xe: mir.MirOperand = cv_fp(cv);
         cv2(cv, mir.MIR_FP_EXT, xe, x, 8, 4);
@@ -3758,20 +3788,18 @@ fun conv_int_width(mi: *mir.MirInstr) u8 {
 }
 
 # whether this conversion is one this pass open-codes: an integer side wider than the
-# native ALU, with the float side riding the float bank
+# native ALU, on a machine that has a float bank to build the expansion out of
 #
-# THE FLOAT BANK IS THE CONDITION, not the target name. The expansion is built from
-# native float instructions, so a machine whose floats are integer lane groups has
-# nothing to build it from and keeps the refusal.
-fun conv_is_wide(f: *mir.MirFunction, mi: *mir.MirInstr, lane_width: u8) bool {
+# THE FLOAT BANK IS THE CONDITION, not the target name and not the operand's class. The
+# expansion is built from native float instructions, so a machine whose floats are
+# integer lane groups has nothing to build it from and keeps the refusal. Asking the
+# MACHINE rather than the instruction's float operand is what admits the shape whose
+# float side is a constant, which has no float vreg to ask.
+fun conv_is_wide(mach: *Machine, mi: *mir.MirInstr) bool {
     if (!is_int_fp_conv(mi.opcode)) { ret false; }
     if (mi.operand_count < 2) { ret false; }
-    if (conv_int_width(mi) <= lane_width) { ret false; }
-    val fi: i32 = conv_float_operand(mi.opcode);
-    if (fi < 0) { ret false; }
-    val fo: *mir.MirOperand = ?mi.operands[fi::u32];
-    if (fo.kind != mir.MIR_OP_VREG) { ret false; }
-    ret mir.vreg_is_fp(f, fo.vreg);
+    if (mach.fp_class == FP_CLASS_NONE) { ret false; }
+    ret conv_int_width(mi) > mach.lane_width;
 }
 
 # build the emit context for a conversion, or report why the shape is not one this
@@ -3795,13 +3823,12 @@ fun conv_prepare(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: 
             ret R.err[bool, str](unsupported_message(alloc, mi.opcode, mi.width));
         }
     }
-    val fi: u32 = conv_float_operand(mi.opcode)::u32;
     out.alloc  = alloc;
     out.f      = f;
     out.src    = mi;
     out.dst    = dst;
     out.cursor = cursor;
-    out.fp_cls = f.vregs[mi.operands[fi].vreg].class;
+    out.fp_cls = plan.mach.fp_class;
     out.fail   = false;
     ret R.ok[bool, str](true);
 }
@@ -3906,6 +3933,10 @@ fun t_mach(maw: u8, ptr: u8) Machine {
     m.mul_hi     = 0;
     m.stage_lo   = 6;
     m.stage_hi   = 7;
+    # the 6502 shape again: one register class, so a float rides the integer ALU. the
+    # conversion tests set this themselves, which is also what makes them a control on
+    # every other test here staying on the no-float-bank path it was written for
+    m.fp_class   = FP_CLASS_NONE;
     ret m;
 }
 
@@ -5228,6 +5259,7 @@ test "mach.lang.be.codegen.legalize:open_codes_a_wide_int_float_conversion" {
     page.make(?alloc);
     val fp: u32 = mir.REG_CLASS_GP + 1;
     var mach: Machine = t_mach(4, 4);
+    mach.fp_class = fp;
 
     # i64 -> f64
     var f1: mir.MirFunction;
@@ -5298,6 +5330,7 @@ test "mach.lang.be.codegen.legalize:a_wide_conversion_is_inert_on_a_wide_alu" {
     val before_vregs: u32           = f.vreg_count;
 
     var mach: Machine = t_mach(8, 8);
+    mach.fp_class = fp;
     val r: R.Result[bool, str] = legalize_function(?alloc, ?mach, ?f);
     if (R.is_err[bool, str](r))        { ret 1; }
     if (b.instrs != before_ptr)        { ret 1; }
