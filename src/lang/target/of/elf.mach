@@ -273,6 +273,291 @@ val PHDR_SIZE:       usize = 56;
 val SYM_SIZE:        usize = 24;
 val RELA_SIZE:       usize = 24;
 
+# ------------------------------------------------------------- the class layout
+
+# the on-disk shape of one ELF class (#2861)
+#
+# ELF is TWO formats, not one format with a flag. The class byte in `e_ident` selects
+# structure sizes AND field offsets AND field widths, and in two places it also
+# reorders fields: `Elf32_Phdr` puts `p_flags` after `p_memsz` where `Elf64_Phdr` puts
+# it immediately after `p_type`, and `Elf32_Sym` puts `st_value` / `st_size` BEFORE
+# `st_info` / `st_other` / `st_shndx` where `Elf64_Sym` puts them after. Neither is a
+# width change a generic "write a pointer-sized field" rule would produce.
+#
+# WHY A RECORD AND NOT A BRANCH AT EACH SITE. The writer had fourteen inline copies of
+# the file-header and section-header layout and no shared helper, so a per-site branch
+# would have been fourteen chances to get one field wrong - and the field most likely
+# to be wrong is the one that MOVES rather than the one that narrows, because a wrong
+# width usually corrupts something visible while a wrong offset can land a plausible
+# value in the wrong field. A segment header with correct addresses and `p_flags`
+# written at offset 4 instead of 24 produces an image that loads and then faults
+# somewhere unrelated to the mistake.
+#
+# So the geometry lives in one place: this record says how big the structures are, and
+# the `write_*` helpers below own where every field goes. A caller passes values, never
+# offsets.
+# ---
+# class:        ELFCLASS32 or ELFCLASS64, the byte stamped into e_ident
+# addr_width:   the width in bytes of every address / offset / size field
+# ehdr_size:    Elf32_Ehdr 52, Elf64_Ehdr 64
+# shdr_size:    Elf32_Shdr 40, Elf64_Shdr 64
+# phdr_size:    Elf32_Phdr 32, Elf64_Phdr 56
+# sym_size:     Elf32_Sym 16, Elf64_Sym 24
+# rela_size:    Elf32_Rela 12, Elf64_Rela 24
+# dyn_size:     Elf32_Dyn 8, Elf64_Dyn 16
+# got_entry:    one GOT slot: an address, so it follows `addr_width`
+# struct_align: the alignment the class's structures want in the file (4 / 8)
+pub rec ElfLayout {
+    class:        u8;
+    addr_width:   u32;
+    ehdr_size:    usize;
+    shdr_size:    usize;
+    phdr_size:    usize;
+    sym_size:     usize;
+    rela_size:    usize;
+    dyn_size:     usize;
+    got_entry:    usize;
+    struct_align: usize;
+}
+
+# the ELF64 layout
+pub fun elf64_layout() ElfLayout {
+    var l: ElfLayout;
+    l.class        = ELFCLASS64;
+    l.addr_width   = 8;
+    l.ehdr_size    = 64;
+    l.shdr_size    = 64;
+    l.phdr_size    = 56;
+    l.sym_size     = 24;
+    l.rela_size    = 24;
+    l.dyn_size     = 16;
+    l.got_entry    = 8;
+    l.struct_align = 8;
+    ret l;
+}
+
+# the ELF32 layout
+pub fun elf32_layout() ElfLayout {
+    var l: ElfLayout;
+    l.class        = ELFCLASS32;
+    l.addr_width   = 4;
+    l.ehdr_size    = 52;
+    l.shdr_size    = 40;
+    l.phdr_size    = 32;
+    l.sym_size     = 16;
+    l.rela_size    = 12;
+    l.dyn_size     = 8;
+    l.got_entry    = 4;
+    l.struct_align = 4;
+    ret l;
+}
+
+# the layout a target writes, derived from its pointer width
+#
+# The same authority that decides the class byte decides every structure size, which is
+# the acceptance #2861 asks for: there is no path that can write an Elf64 field into a
+# file stamped ELFCLASS32, because the class byte and the geometry come out of one call.
+pub fun layout_for(tgt_isa: *isa.IsaVTable) ElfLayout {
+    if (tgt_isa.pointer_width == 4) { ret elf32_layout(); }
+    ret elf64_layout();
+}
+
+# the layout a FILE declares, read back from the class byte it was stamped with
+#
+# The reader's counterpart, and it deliberately keys on the byte rather than on the
+# `e_machine` or on any target the caller might have in hand: a reader that decided the
+# layout from the architecture would misparse a file whose class contradicted its arch,
+# which is exactly the file this writer used to produce.
+# ---
+# cls: the e_ident[EI_CLASS] byte
+# out: receives the layout
+# ret: true when the class is one this reader knows
+pub fun layout_from_class(cls: u8, out: *ElfLayout) bool {
+    if (cls == ELFCLASS32) { @out = elf32_layout(); ret true; }
+    if (cls == ELFCLASS64) { @out = elf64_layout(); ret true; }
+    ret false;
+}
+
+# write one address-width field: 4 bytes under ELF32, 8 under ELF64
+fun write_addr(buf: *u8, off: usize, lay: *ElfLayout, v: u64) {
+    if (lay.addr_width == 4) { bin.write_u32_le(buf, off, v::u32); ret; }
+    bin.write_u64_le(buf, off, v);
+}
+
+# read one address-width field
+fun read_addr(buf: *u8, off: usize, lay: *ElfLayout) u64 {
+    if (lay.addr_width == 4) { ret bin.read_u32_le(buf, off)::u64; }
+    ret bin.read_u64_le(buf, off);
+}
+
+# write the ELF file header, from `e_type` onward
+#
+# `e_ident` is written separately by `write_elf_ident`, which owns the class byte. From
+# byte 24 on EVERY field moves between the classes, which is why no caller is allowed
+# to know an offset here.
+#
+#   Elf64: e_entry@24 e_phoff@32 e_shoff@40 (8 each), e_flags@48, e_ehsize@52,
+#          e_phentsize@54, e_phnum@56, e_shentsize@58, e_shnum@60, e_shstrndx@62
+#   Elf32: e_entry@24 e_phoff@28 e_shoff@32 (4 each), e_flags@36, e_ehsize@40,
+#          e_phentsize@42, e_phnum@44, e_shentsize@46, e_shnum@48, e_shstrndx@50
+fun write_ehdr(buf: *u8, lay: *ElfLayout, e_type: u16, e_machine: u16, e_flags: u32,
+               e_entry: u64, e_phoff: u64, e_shoff: u64,
+               e_phnum: u16, e_shnum: u16, e_shstrndx: u16) {
+    bin.write_u16_le(buf, 16, e_type);
+    bin.write_u16_le(buf, 18, e_machine);
+    bin.write_u32_le(buf, 20, 1);                  # e_version = EV_CURRENT
+    val w: usize = lay.addr_width::usize;
+    write_addr(buf, 24,         lay, e_entry);
+    write_addr(buf, 24 + w,     lay, e_phoff);
+    write_addr(buf, 24 + 2 * w, lay, e_shoff);
+    var o: usize = 24 + 3 * w;
+    bin.write_u32_le(buf, o,      e_flags);
+    bin.write_u16_le(buf, o + 4,  lay.ehdr_size::u16);
+    # a header with no program headers declares entsize 0, not the structure size:
+    # `e_phnum == 0` with a nonzero entsize is what a reader flags as inconsistent
+    var phentsize: u16 = 0;
+    if (e_phnum != 0) { phentsize = lay.phdr_size::u16; }
+    bin.write_u16_le(buf, o + 6,  phentsize);
+    bin.write_u16_le(buf, o + 8,  e_phnum);
+    bin.write_u16_le(buf, o + 10, lay.shdr_size::u16);
+    bin.write_u16_le(buf, o + 12, e_shnum);
+    bin.write_u16_le(buf, o + 14, e_shstrndx);
+}
+
+# write one section header, returning the offset just past it
+#
+#   Elf64: name@0 type@4 flags@8 addr@16 offset@24 size@32 link@40 info@44
+#          addralign@48 entsize@56   (flags/addr/offset/size/addralign/entsize 8 wide)
+#   Elf32: name@0 type@4 flags@8 addr@12 offset@16 size@20 link@24 info@28
+#          addralign@32 entsize@36  (all 4 wide)
+fun write_shdr(buf: *u8, off: usize, lay: *ElfLayout,
+               name: u32, stype: u32, flags: u64, addr: u64, offset: u64, size: u64,
+               link: u32, info: u32, addralign: u64, entsize: u64) usize {
+    val w: usize = lay.addr_width::usize;
+    bin.write_u32_le(buf, off,     name);
+    bin.write_u32_le(buf, off + 4, stype);
+    write_addr(buf, off + 8,         lay, flags);
+    write_addr(buf, off + 8 + w,     lay, addr);
+    write_addr(buf, off + 8 + 2 * w, lay, offset);
+    write_addr(buf, off + 8 + 3 * w, lay, size);
+    var o: usize = off + 8 + 4 * w;
+    bin.write_u32_le(buf, o,     link);
+    bin.write_u32_le(buf, o + 4, info);
+    write_addr(buf, o + 8,     lay, addralign);
+    write_addr(buf, o + 8 + w, lay, entsize);
+    ret off + lay.shdr_size;
+}
+
+# write one program header, returning the offset just past it
+#
+# THE ONE FIELD THAT REORDERS RATHER THAN NARROWS:
+#
+#   Elf64: type@0 flags@4 offset@8 vaddr@16 paddr@24 filesz@32 memsz@40 align@48
+#   Elf32: type@0 offset@4 vaddr@8 paddr@12 filesz@16 memsz@20 FLAGS@24 align@28
+#
+# `p_flags` is the segment's read / write / execute permission. Writing it at offset 4
+# under ELF32 puts it where `p_offset` belongs and leaves the permissions zero, which
+# produces a segment the loader maps with no access at all - a fault at the first
+# instruction, nowhere near the mistake. `elf32_phdr_flags_are_not_at_offset_four`
+# pins this specifically.
+fun write_phdr_at(buf: *u8, off: usize, lay: *ElfLayout,
+                  ptype: u32, flags: u32, offset: u64, vaddr: u64, paddr: u64,
+                  filesz: u64, memsz: u64, align: u64) usize {
+    val w: usize = lay.addr_width::usize;
+    bin.write_u32_le(buf, off, ptype);
+    if (lay.addr_width == 8) {
+        bin.write_u32_le(buf, off + 4, flags);
+        write_addr(buf, off + 8,          lay, offset);
+        write_addr(buf, off + 8 + w,      lay, vaddr);
+        write_addr(buf, off + 8 + 2 * w,  lay, paddr);
+        write_addr(buf, off + 8 + 3 * w,  lay, filesz);
+        write_addr(buf, off + 8 + 4 * w,  lay, memsz);
+        write_addr(buf, off + 8 + 5 * w,  lay, align);
+        ret off + lay.phdr_size;
+    }
+    write_addr(buf, off + 4,      lay, offset);
+    write_addr(buf, off + 8,      lay, vaddr);
+    write_addr(buf, off + 12,     lay, paddr);
+    write_addr(buf, off + 16,     lay, filesz);
+    write_addr(buf, off + 20,     lay, memsz);
+    bin.write_u32_le(buf, off + 24, flags);
+    write_addr(buf, off + 28,     lay, align);
+    ret off + lay.phdr_size;
+}
+
+# write one symbol table entry, returning the offset just past it
+#
+# THE SECOND REORDERING:
+#
+#   Elf64: name@0 info@4 other@5 shndx@6 value@8 size@16
+#   Elf32: name@0 value@4 size@8 info@12 other@13 shndx@14
+#
+# The three small fields and the two wide ones swap sides entirely.
+fun write_sym_at(buf: *u8, off: usize, lay: *ElfLayout,
+                 name: u32, info: u8, other: u8, shndx: u16, value: u64, size: u64) usize {
+    bin.write_u32_le(buf, off, name);
+    if (lay.addr_width == 8) {
+        buf[off + 4] = info;
+        buf[off + 5] = other;
+        bin.write_u16_le(buf, off + 6, shndx);
+        write_addr(buf, off + 8,  lay, value);
+        write_addr(buf, off + 16, lay, size);
+        ret off + lay.sym_size;
+    }
+    write_addr(buf, off + 4, lay, value);
+    write_addr(buf, off + 8, lay, size);
+    buf[off + 12] = info;
+    buf[off + 13] = other;
+    bin.write_u16_le(buf, off + 14, shndx);
+    ret off + lay.sym_size;
+}
+
+# write one RELA entry, returning the offset just past it
+#
+# `r_info` PACKS DIFFERENTLY, which is neither a width change nor a reorder:
+#
+#   Elf64: offset@0 (8), info@8 (8) = (sym << 32) | type, addend@16 (8)
+#   Elf32: offset@0 (4), info@4 (4) = (sym <<  8) | (type & 0xFF), addend@8 (4)
+#
+# An ELF32 relocation type is EIGHT BITS. A type number above 255 has no encoding, so
+# it is rejected here rather than silently truncated into a different, valid relocation
+# - which is the failure that would be hardest to trace back.
+# ---
+# ret: the offset just past the entry, or 0 when the type does not fit the class
+fun write_rela_at(buf: *u8, off: usize, lay: *ElfLayout,
+                  r_offset: u64, sym: u32, rtype: u32, addend: i64) usize {
+    if (lay.addr_width == 8) {
+        write_addr(buf, off,      lay, r_offset);
+        write_addr(buf, off + 8,  lay, (sym::u64 << 32) | rtype::u64);
+        write_addr(buf, off + 16, lay, addend::u64);
+        ret off + lay.rela_size;
+    }
+    if (rtype > 0xFF) { ret 0; }
+    write_addr(buf, off,     lay, r_offset);
+    write_addr(buf, off + 4, lay, (sym::u64 << 8) | (rtype & 0xFF)::u64);
+    write_addr(buf, off + 8, lay, addend::u64);
+    ret off + lay.rela_size;
+}
+
+# split a RELA `r_info` into its symbol index and type, by class
+fun rela_info_split(lay: *ElfLayout, info: u64, sym: *u32, rtype: *u32) {
+    if (lay.addr_width == 8) {
+        @sym   = (info >> 32)::u32;
+        @rtype = (info & 0xFFFFFFFF)::u32;
+        ret;
+    }
+    @sym   = (info >> 8)::u32;
+    @rtype = (info & 0xFF)::u32;
+}
+
+# write one dynamic-section entry, returning the offset just past it
+fun write_dyn_at(buf: *u8, off: usize, lay: *ElfLayout, tag: u64, v: u64) usize {
+    val w: usize = lay.addr_width::usize;
+    write_addr(buf, off,     lay, tag);
+    write_addr(buf, off + w, lay, v);
+    ret off + lay.dyn_size;
+}
+
 # the concrete signature the erased `isa.IsaVTable.elf_reloc_type` pointer is cast
 # back to before it is called
 #
@@ -1051,24 +1336,16 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
     }
     var buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
 
+    # the class byte and every structure size come from ONE call, which is the
+    # property #2861 asks for: no path can write an Elf64 field into an ELFCLASS32 file
+    var lay: ElfLayout = layout_for(tgt_isa);
     write_elf_ident(buf, tgt_isa);
 
-    bin.write_u16_le(buf, 16, ET_REL);
-    bin.write_u16_le(buf, 18, tgt_isa.elf_machine::u16);
-    bin.write_u32_le(buf, 20, 1);
-    bin.write_u64_le(buf, 24, 0);
-    bin.write_u64_le(buf, 32, 0);
-    bin.write_u64_le(buf, 40, shdr_offset::u64);
-    bin.write_u32_le(buf, 48, img.machine_flags);
-    bin.write_u16_le(buf, 52, ELF_HEADER_SIZE::u16);
-    bin.write_u16_le(buf, 54, 0);
-    bin.write_u16_le(buf, 56, 0);
-    bin.write_u16_le(buf, 58, SHDR_SIZE::u16);
-    bin.write_u16_le(buf, 60, total_shdr::u16);
     # section-header indices: 0 null, 1..num_secs sections, then .symtab,
     # .strtab, .shstrtab.
     val shstrtab_idx: u16 = (num_secs + 3)::u16;
-    bin.write_u16_le(buf, 62, shstrtab_idx);
+    write_ehdr(buf, ?lay, ET_REL, tgt_isa.elf_machine::u16, img.machine_flags,
+               0, 0, shdr_offset::u64, 0, total_shdr::u16, shstrtab_idx);
 
     # section data
     var sec_offset: usize = ELF_HEADER_SIZE;
@@ -1657,29 +1934,24 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
     }
     var buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
 
+    # the class byte and every structure size come from ONE call, which is the
+    # property #2861 asks for: no path can write an Elf64 field into an ELFCLASS32 file
+    var lay: ElfLayout = layout_for(tgt_isa);
     write_elf_ident(buf, tgt_isa);
 
-    bin.write_u16_le(buf, 16, ET_EXEC);
-    bin.write_u16_le(buf, 18, tgt_isa.elf_machine::u16);
-    bin.write_u32_le(buf, 20, 1);
-    bin.write_u64_le(buf, 24, entry);
-    bin.write_u64_le(buf, 32, phdr_offset::u64);
-    if (has_sht) { bin.write_u64_le(buf, 40, shdr_off::u64); } or { bin.write_u64_le(buf, 40, 0); }
-    bin.write_u32_le(buf, 48, image_options.machine_flags);
-    bin.write_u16_le(buf, 52, ELF_HEADER_SIZE::u16);
-    bin.write_u16_le(buf, 54, PHDR_SIZE::u16);
-    bin.write_u16_le(buf, 56, phdr_count::u16);
-    bin.write_u16_le(buf, 58, SHDR_SIZE::u16);
+    # the section-header table is null + one per segment + attributes(if any) +
+    # one per debug section + .shstrtab; .shstrtab (the section-name string table)
+    # is the last section.
+    var e_shoff: u64 = 0;
+    var e_shnum: u16 = 0;
+    var e_shstrndx: u16 = 0;
     if (has_sht) {
-        # the section-header table is null + one per segment + attributes(if any) +
-        # one per debug section + .shstrtab; .shstrtab (the section-name string table)
-        # is the last section.
-        bin.write_u16_le(buf, 60, sht_count::u16);
-        bin.write_u16_le(buf, 62, (sht_count - 1)::u16);
-    } or {
-        bin.write_u16_le(buf, 60, 0);
-        bin.write_u16_le(buf, 62, 0);
+        e_shoff    = shdr_off::u64;
+        e_shnum    = sht_count::u16;
+        e_shstrndx = (sht_count - 1)::u16;
     }
+    write_ehdr(buf, ?lay, ET_EXEC, tgt_isa.elf_machine::u16, image_options.machine_flags,
+               entry, phdr_offset::u64, e_shoff, phdr_count::u16, e_shnum, e_shstrndx);
 
     var phdr_pos: usize = phdr_offset;
 
@@ -2440,25 +2712,20 @@ fun emit_pie_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
 
     # ELF header: ET_DYN. e_shoff/e_shnum/e_shstrndx name the trailing debug table
     # when present, else 0 (a bare runtime image, not a tooling object).
+    # the class byte and every structure size come from ONE call, which is the
+    # property #2861 asks for: no path can write an Elf64 field into an ELFCLASS32 file
+    var lay: ElfLayout = layout_for(tgt_isa);
     write_elf_ident(buf, tgt_isa);
-    bin.write_u16_le(buf, 16, ET_DYN);
-    bin.write_u16_le(buf, 18, tgt_isa.elf_machine::u16);
-    bin.write_u32_le(buf, 20, 1);
-    bin.write_u64_le(buf, 24, entry);
-    bin.write_u64_le(buf, 32, phdr_offset::u64);
-    if (dsht.present) { bin.write_u64_le(buf, 40, dsht.shdr_off::u64); } or { bin.write_u64_le(buf, 40, 0); }
-    bin.write_u32_le(buf, 48, image_options.machine_flags);
-    bin.write_u16_le(buf, 52, ELF_HEADER_SIZE::u16);
-    bin.write_u16_le(buf, 54, PHDR_SIZE::u16);
-    bin.write_u16_le(buf, 56, phdr_count::u16);
-    bin.write_u16_le(buf, 58, SHDR_SIZE::u16);
+    var e_shoff: u64 = 0;
+    var e_shnum: u16 = 0;
+    var e_shstrndx: u16 = 0;
     if (dsht.present) {
-        bin.write_u16_le(buf, 60, dsht.sht_count::u16);
-        bin.write_u16_le(buf, 62, dsht.shstrndx::u16);
-    } or {
-        bin.write_u16_le(buf, 60, 0);
-        bin.write_u16_le(buf, 62, 0);
+        e_shoff    = dsht.shdr_off::u64;
+        e_shnum    = dsht.sht_count::u16;
+        e_shstrndx = dsht.shstrndx::u16;
     }
+    write_ehdr(buf, ?lay, ET_DYN, tgt_isa.elf_machine::u16, image_options.machine_flags,
+               entry, phdr_offset::u64, e_shoff, phdr_count::u16, e_shnum, e_shstrndx);
 
     # copy the linker's segment bytes into their file offsets.
     copy_segment_bytes(buf, segs, seg_offsets, seg_count);
@@ -2915,25 +3182,21 @@ fun emit_shared(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTa
 
     # ELF header: ET_DYN, no entry point. e_shoff/e_shnum/e_shstrndx name the trailing
     # section table on a -g build, else 0 (a program-headers-only release image).
+    # the class byte and every structure size come from ONE call, which is the
+    # property #2861 asks for: no path can write an Elf64 field into an ELFCLASS32 file
+    var lay: ElfLayout = layout_for(tgt_isa);
     write_elf_ident(buf, tgt_isa);
-    bin.write_u16_le(buf, 16, ET_DYN);
-    bin.write_u16_le(buf, 18, tgt_isa.elf_machine::u16);
-    bin.write_u32_le(buf, 20, 1);
-    bin.write_u64_le(buf, 24, 0);
-    bin.write_u64_le(buf, 32, phdr_offset::u64);
-    if (dsht.present) { bin.write_u64_le(buf, 40, dsht.shdr_off::u64); } or { bin.write_u64_le(buf, 40, 0); }
-    bin.write_u32_le(buf, 48, image_options.machine_flags);
-    bin.write_u16_le(buf, 52, ELF_HEADER_SIZE::u16);
-    bin.write_u16_le(buf, 54, PHDR_SIZE::u16);
-    bin.write_u16_le(buf, 56, phdr_count::u16);
-    bin.write_u16_le(buf, 58, SHDR_SIZE::u16);
+    # a shared object declares no entry point
+    var e_shoff: u64 = 0;
+    var e_shnum: u16 = 0;
+    var e_shstrndx: u16 = 0;
     if (dsht.present) {
-        bin.write_u16_le(buf, 60, dsht.sht_count::u16);
-        bin.write_u16_le(buf, 62, dsht.shstrndx::u16);
-    } or {
-        bin.write_u16_le(buf, 60, 0);
-        bin.write_u16_le(buf, 62, 0);
+        e_shoff    = dsht.shdr_off::u64;
+        e_shnum    = dsht.sht_count::u16;
+        e_shstrndx = dsht.shstrndx::u16;
     }
+    write_ehdr(buf, ?lay, ET_DYN, tgt_isa.elf_machine::u16, image_options.machine_flags,
+               0, phdr_offset::u64, e_shoff, phdr_count::u16, e_shnum, e_shstrndx);
 
     # copy the linker's segment bytes into their file offsets.
     copy_segment_bytes(buf, segs, seg_offsets, seg_count);
@@ -3431,25 +3694,20 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
     # (an ET_DYN/PIE would be relocated by a load bias and invalidate them). glibc
     # loads an ET_EXEC carrying PT_INTERP/PT_DYNAMIC as a classic non-PIE dynamic
     # binary and still resolves the PLT.
+    # the class byte and every structure size come from ONE call, which is the
+    # property #2861 asks for: no path can write an Elf64 field into an ELFCLASS32 file
+    var elay: ElfLayout = layout_for(tgt_isa);
     write_elf_ident(buf, tgt_isa);
-    bin.write_u16_le(buf, 16, ET_EXEC);
-    bin.write_u16_le(buf, 18, tgt_isa.elf_machine::u16);
-    bin.write_u32_le(buf, 20, 1);
-    bin.write_u64_le(buf, 24, entry);
-    bin.write_u64_le(buf, 32, phdr_offset::u64);
-    if (dsht.present) { bin.write_u64_le(buf, 40, dsht.shdr_off::u64); } or { bin.write_u64_le(buf, 40, 0); }
-    bin.write_u32_le(buf, 48, image_options.machine_flags);
-    bin.write_u16_le(buf, 52, ELF_HEADER_SIZE::u16);
-    bin.write_u16_le(buf, 54, PHDR_SIZE::u16);
-    bin.write_u16_le(buf, 56, phdr_count::u16);
-    bin.write_u16_le(buf, 58, SHDR_SIZE::u16);
+    var e_shoff: u64 = 0;
+    var e_shnum: u16 = 0;
+    var e_shstrndx: u16 = 0;
     if (dsht.present) {
-        bin.write_u16_le(buf, 60, dsht.sht_count::u16);
-        bin.write_u16_le(buf, 62, dsht.shstrndx::u16);
-    } or {
-        bin.write_u16_le(buf, 60, 0);
-        bin.write_u16_le(buf, 62, 0);
+        e_shoff    = dsht.shdr_off::u64;
+        e_shnum    = dsht.sht_count::u16;
+        e_shstrndx = dsht.shstrndx::u16;
     }
+    write_ehdr(buf, ?elay, ET_EXEC, tgt_isa.elf_machine::u16, image_options.machine_flags,
+               entry, phdr_offset::u64, e_shoff, phdr_count::u16, e_shnum, e_shstrndx);
 
     # copy the linker's segment bytes into their file offsets.
     copy_segment_bytes(buf, segs, seg_offsets, seg_count);
