@@ -102,7 +102,7 @@ pub rec LowerCtx {
     # selector can read the lane element kind + width a vector op needs. set per IR
     # instruction by the lowering loop alongside cur_loc; VEC_LANE_NONE (0) outside
     # one and for every non-vector instruction, so non-vector code is unaffected.
-    cur_vec_lane: u8;
+    cur_vec_lane: u32;
 
     # the constant-time destination-secrecy SEED of the IR instruction currently being
     # lowered (#1646): true for a store / memzero writing secret storage, stamped onto
@@ -363,19 +363,23 @@ pub fun value_is_vector(ctx: *LowerCtx, ty: ir_type.IrTypeId) bool {
 # the vec_lane MIR descriptor for an IR value type (#1965)
 #
 # VEC_LANE_NONE for a non-vector; otherwise the lane element kind (float vs
-# integer) and byte-width packed for the backend selectors. Signedness is not part
-# of the shape - it rides the consuming opcode.
+# integer), byte-width and COUNT packed for the backend selectors. Signedness is
+# not part of the shape - it rides the consuming opcode.
+#
+# This is the only producer of a lane descriptor outside a test, so the count it
+# supplies is the IR type's own and there is nowhere else for one to be invented.
 # ---
 # ctx: the lowering context
 # ty:  the IR value type
 # ret: the packed vec_lane descriptor
-pub fun vec_lane_for_type(ctx: *LowerCtx, ty: ir_type.IrTypeId) u8 {
+pub fun vec_lane_for_type(ctx: *LowerCtx, ty: ir_type.IrTypeId) u32 {
     var is_float:   bool = false;
     var elem_bytes: u8   = 0;
-    if (!ir_type.vector_lane(ctx.types, ty, ?is_float, ?elem_bytes)) { ret mir.VEC_LANE_NONE; }
+    var lanes:      u32  = 0;
+    if (!ir_type.vector_lane(ctx.types, ty, ?is_float, ?elem_bytes, ?lanes)) { ret mir.VEC_LANE_NONE; }
     var kind: u8 = mir.VEC_LANE_INT;
     if (is_float) { kind = mir.VEC_LANE_FLOAT; }
-    ret mir.vec_lane_make(kind, elem_bytes);
+    ret mir.vec_lane_make(kind, elem_bytes, lanes);
 }
 
 # the vec_lane descriptor for a whole IR instruction (#1965)
@@ -388,10 +392,10 @@ pub fun vec_lane_for_type(ctx: *LowerCtx, ty: ir_type.IrTypeId) u8 {
 # ctx:  the lowering context
 # inst: the IR instruction being lowered
 # ret:  the packed vec_lane descriptor to stamp on its MIR instructions
-pub fun compute_vec_lane(ctx: *LowerCtx, inst: *instruction.Instruction) u8 {
+pub fun compute_vec_lane(ctx: *LowerCtx, inst: *instruction.Instruction) u32 {
     var i: u32 = 0;
     for (i < inst.operand_count) {
-        val d: u8 = vec_lane_for_type(ctx, inst.operands[i].ty);
+        val d: u32 = vec_lane_for_type(ctx, inst.operands[i].ty);
         if (mir.vec_lane_is_vector(d)) { ret d; }
         i = i + 1;
     }
@@ -869,6 +873,241 @@ pub fun push_store_chunk(ctx: *LowerCtx, mb: *mir.MirBlock, mem: mir.MirOperand,
     ret inst2(ctx, mb, mir.MIR_STORE, mem, src, w, w);
 }
 
+# the same memory operand displaced by `off`
+# ---
+# m:   the base memory operand
+# off: the byte displacement to add
+# ret: the displaced operand
+pub fun mem_at(m: mir.MirOperand, off: i64) mir.MirOperand {
+    var o: mir.MirOperand = m;
+    if (o.kind == mir.MIR_OP_MEM) { o.imm = o.imm + off; ret o; }
+    if (o.kind == mir.MIR_OP_SYM) { o.sym_off = o.sym_off + off::i32; ret o; }
+    ret o;
+}
+
+# store a vector whose memory footprint is narrower than its register (#2697)
+#
+# `i32x3` is 16 bytes in a vector register and 12 in memory. Neither width alone is
+# a legal store: at 16 it overruns whatever follows the object - `rec Packed { v:
+# i32x3; guard: i32; }` reads `guard` back as 0 - and at 12 no ISA here can issue
+# the access in one go.
+#
+# So the register is spilled WHOLE to a scratch slot of its own full width, and the
+# object's own bytes are then copied out of that scratch with the same 8/4/2/1
+# chunk walk an aggregate memcpy uses. That walk already runs on every target and is
+# exercised by every aggregate copy, so this adds no new expansion.
+#
+# WHY NOT A DIRECT 8 + 4. It does not generalize. The tail would have to come out of
+# the vector register as lane extracts, and the chunk boundaries do not fall on lane
+# boundaries for every shape: `i16x7` is 14 bytes, whose tail after an 8-byte chunk
+# is 6 bytes spanning lanes 4 through 6, and a 4-byte chunk of it is half of one
+# lane and half of another. The scratch round trip is uniform across every shape,
+# which is what makes it the mechanism rather than the fallback. A direct
+# lane-aligned store for the shapes that admit one is a follow-on.
+#
+# ALIGNMENT is not assumed: the chunk walk is the same one aggregates of every
+# alignment already use, and a sub-width vector aligns to one lane (#2695), so the
+# destination can be as weakly aligned as 1. OVERLAP cannot arise: the source is a
+# scratch slot minted here and dead after, so it aliases nothing the caller named.
+#
+# THE OVER-WIDTH DIRECTION IS REFUSED, NOT HANDLED. The predicate that selects this
+# path is an inequality, so it is true in both directions, and a vector WIDER than
+# the register (`f32x8`, once #2727 lifts the frontend's bound) would arrive here and
+# be spilled at the register's width into a scratch the object outgrows, then have
+# more bytes copied out of it than were ever written. That is a silent wrong answer,
+# which is the one outcome worth spending a branch to prevent. The over-width value's
+# realization is a SPLIT - N registers, or chunks - and a split is a multi-piece
+# placement, not a wider single move, so it belongs to the caller that decides the
+# placement rather than to this walk. Refused here so the day it becomes reachable is
+# a diagnostic naming the case and not a corrupted value.
+#
+# It lives here rather than in the IR-to-MIR store lowering that first needed it
+# because the ABI boundary needs the very same operation (#2687): an outgoing stack
+# argument, and the win64 by-reference marshal temp, both write a register-resident
+# vector into memory that owns only the vector's own bytes. Naming it once is what
+# keeps the two from answering the width question differently.
+# ---
+# ctx:   the lowering context
+# mb:    the destination MIR block
+# dest:  the destination memory operand
+# value: the vector value operand (a vector-register vreg)
+# ty:    the vector's IR type
+# ret:   true on success, or a lowering / allocation error
+pub fun store_subwidth_vector(ctx: *LowerCtx, mb: *mir.MirBlock, dest: mir.MirOperand,
+                              value: mir.MirOperand, ty: ir_type.IrTypeId) R.Result[bool, str] {
+    val mem_w: u8 = mem_width_of(ctx, ty);
+    val reg_w: u8 = op_width_of(ctx, ty);
+    if (mem_w > reg_w) {
+        ret R.err[bool, str]("mir.context.store_subwidth_vector: vector wider than the target's vector register; an over-width vector's placement is a split, not a single move");
+    }
+    # the scratch is the REGISTER's width and the vector's own alignment, so the
+    # whole-register spill into it is a legal aligned access.
+    val align: u32 = ir_type.byte_align(ctx.types, ty, ctx.tgt);
+    val skr: R.Result[u32, str] = new_vreg(ctx, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](skr)) { ret R.err[bool, str](R.unwrap_err[u32, str](skr)); }
+    val sk: u32 = R.unwrap_ok[u32, str](skr);
+    val ar: R.Result[bool, str] = add_alloca_slot(ctx, sk, reg_w::u64, align, ty::u32);
+    if (R.is_err[bool, str](ar)) { ret ar; }
+
+    # spill the register whole into the scratch.
+    val spr: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
+    if (R.is_err[*mir.MirOperand, str](spr)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](spr)); }
+    val spops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](spr);
+    spops[0] = mir.op_mem_slot(sk, 0);
+    spops[1] = value;
+    var sp: mir.MirInstr = mir.instr(mir.MIR_STORE, spops, 2, reg_w, reg_w);
+    sp.vec_lane = vec_lane_for_type(ctx, ty);
+    val psp: R.Result[bool, str] = push_instr(ctx, mb, sp);
+    if (R.is_err[bool, str](psp)) { ret psp; }
+
+    # copy the object's own bytes out of the scratch, 8/4/2/1 at a time.
+    var off: i64 = 0;
+    for (off::u32 < mem_w::u32) {
+        val chunk: u8 = copy_chunk_width((mem_w::u32 - off::u32)::u64);
+
+        val tr: R.Result[u32, str] = new_vreg(ctx, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](tr)) { ret R.err[bool, str](R.unwrap_err[u32, str](tr)); }
+        val tmp: u32 = R.unwrap_ok[u32, str](tr);
+
+        val ld: R.Result[bool, str] = emit_load_from_w(ctx, mb, tmp, mir.op_mem_slot(sk, off), chunk);
+        if (R.is_err[bool, str](ld)) { ret ld; }
+
+        val st: R.Result[bool, str] = push_store_chunk(ctx, mb, mem_at(dest, off), mir.op_vreg(tmp), chunk);
+        if (R.is_err[bool, str](st)) { ret st; }
+
+        off = off + chunk::i64;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# load a vector whose memory footprint is narrower than its register (#2697)
+#
+# The mirror of `store_subwidth_vector`, and it exists for a sharper reason than
+# symmetry: reading a 12-byte object at the register's 16 bytes is not merely
+# sloppy, it reads 4 bytes the object does not own and FAULTS when the object ends
+# at a page boundary. So the object's own bytes are gathered into a scratch slot of
+# the register's full width with the same 8/4/2/1 chunk walk, and the vector is then
+# loaded whole out of the scratch.
+#
+# The scratch is zeroed first, so the bytes past the object's footprint are a
+# defined 0 rather than whatever the frame held. Those lanes are never read by
+# well-typed code - the type has no lane there - but leaving stack residue in a
+# register is how a value that is merely unused becomes a value that leaks.
+#
+# The over-width direction is refused for the reason given at the store twin: a
+# vector larger than the register realizes as a split, which is a multi-piece
+# placement rather than a wider single move.
+# ---
+# ctx:  the lowering context
+# mb:   the destination MIR block
+# dst:  the destination register operand
+# src:  the source memory operand
+# ty:   the vector's IR type
+# ret:  true on success, or a lowering / allocation error
+pub fun load_subwidth_vector(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand,
+                             src: mir.MirOperand, ty: ir_type.IrTypeId) R.Result[bool, str] {
+    val mem_w: u8 = mem_width_of(ctx, ty);
+    val reg_w: u8 = op_width_of(ctx, ty);
+    if (mem_w > reg_w) {
+        ret R.err[bool, str]("mir.context.load_subwidth_vector: vector wider than the target's vector register; an over-width vector's placement is a split, not a single move");
+    }
+    val align: u32 = ir_type.byte_align(ctx.types, ty, ctx.tgt);
+    val skr: R.Result[u32, str] = new_vreg(ctx, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](skr)) { ret R.err[bool, str](R.unwrap_err[u32, str](skr)); }
+    val sk: u32 = R.unwrap_ok[u32, str](skr);
+    val ar: R.Result[bool, str] = add_alloca_slot(ctx, sk, reg_w::u64, align, ty::u32);
+    if (R.is_err[bool, str](ar)) { ret ar; }
+
+    # clear the whole scratch, so the lanes past the object's footprint are a
+    # defined zero rather than frame residue.
+    var zoff: i64 = 0;
+    for (zoff::u32 < reg_w::u32) {
+        val zc: u8 = copy_chunk_width((reg_w::u32 - zoff::u32)::u64);
+        val zs: R.Result[bool, str] = push_store_chunk(ctx, mb, mir.op_mem_slot(sk, zoff), mir.op_imm(0), zc);
+        if (R.is_err[bool, str](zs)) { ret zs; }
+        zoff = zoff + zc::i64;
+    }
+
+    # gather the object's own bytes into the scratch.
+    var off: i64 = 0;
+    for (off::u32 < mem_w::u32) {
+        val chunk: u8 = copy_chunk_width((mem_w::u32 - off::u32)::u64);
+
+        val tr: R.Result[u32, str] = new_vreg(ctx, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](tr)) { ret R.err[bool, str](R.unwrap_err[u32, str](tr)); }
+        val tmp: u32 = R.unwrap_ok[u32, str](tr);
+
+        val ld: R.Result[bool, str] = emit_load_from_w(ctx, mb, tmp, mem_at(src, off), chunk);
+        if (R.is_err[bool, str](ld)) { ret ld; }
+
+        val st: R.Result[bool, str] = push_store_chunk(ctx, mb, mir.op_mem_slot(sk, off), mir.op_vreg(tmp), chunk);
+        if (R.is_err[bool, str](st)) { ret st; }
+
+        off = off + chunk::i64;
+    }
+
+    # read the vector out whole.
+    val fr: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
+    if (R.is_err[*mir.MirOperand, str](fr)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](fr)); }
+    val fops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](fr);
+    fops[0] = dst;
+    fops[1] = mir.op_mem_slot(sk, 0);
+    var fi: mir.MirInstr = mir.instr(mir.MIR_LOAD, fops, 2, reg_w, reg_w);
+    fi.vec_lane = vec_lane_for_type(ctx, ty);
+    ret push_instr(ctx, mb, fi);
+}
+
+# whether a value in `ty` is a vector whose register is wider than its own memory
+# footprint, so every access between the register and memory has to go through the
+# scratch round trip rather than a single sized move
+#
+# The predicate is the INEQUALITY, not "is a vector" and not a size threshold: the
+# ten register-filling shapes answer false and keep the single 16-byte MOVUPS they
+# have always used, so their codegen is byte-identical. It is also not "is 12 bytes":
+# every shape between the machine word and the vector register has the same problem
+# and a target with a different vector register moves the boundary.
+#
+# It answers true in BOTH directions, deliberately. A vector wider than the register
+# also cannot cross to memory in one move, and it must reach the round-trip helpers
+# so they can refuse it by name rather than have it slip past a `mem_w < reg_w` test
+# into the single-move path and be silently truncated. Whoever implements the
+# over-width realization (#2727) replaces that refusal with the split; the predicate
+# itself already asks the right question and does not change.
+#
+# IT IS A FLAT-ADDRESSING QUESTION, and is gated on it (#2744), the same lever #2655
+# used for the float address materialization. Under a logical addressing model a
+# value has no byte footprint and rides in no register: it is one value at one type,
+# and a load or a store of it is one whole-value access at that type. There is
+# nothing there for the round trip to reconcile, and running it anyway costs the
+# three things such a target cannot express - a scratch slot the vector is not typed
+# at, byte-sized chunk accesses of it, and a reinterpreting load back out - which is
+# how a sub-width interface variable and a default-zeroed sub-width local both became
+# unreachable on SPIR-V while their 128-bit siblings worked.
+# ---
+# ctx: the active lowering context
+# ty:  the value's IR type
+# ret: true when the value's register and memory widths disagree
+pub fun subwidth_vector_memory(ctx: *LowerCtx, ty: ir_type.IrTypeId) bool {
+    if (!ctx.tgt.model.flat_addressing) { ret false; }
+    if (!value_is_vector(ctx, ty)) { ret false; }
+    ret mem_width_of(ctx, ty) != op_width_of(ctx, ty);
+}
+
+# the widest 8/4/2/1 chunk that fits in `remaining` bytes
+#
+# The single granularity rule every byte-exact copy in the backend walks by, so an
+# aggregate memcpy, a sub-width vector's scratch round trip, and the scratch zero-fill
+# cannot drift apart on the tail.
+# ---
+# remaining: the bytes left to copy
+# ret:       the chunk width in bytes
+pub fun copy_chunk_width(remaining: u64) u8 {
+    if (remaining >= 8) { ret 8; }
+    if (remaining >= 4) { ret 4; }
+    if (remaining >= 2) { ret 2; }
+    ret 1;
+}
+
 # append a generic binary MIR op `dst <- (a) OP (b)` to a block
 #
 # Driven at the machine word: GEP index scaling is pointer arithmetic over
@@ -975,17 +1214,7 @@ pub fun copy_aggregate(ctx: *LowerCtx, mb: *mir.MirBlock, dst_mem: mir.MirOperan
 
     var off: i64 = 0;
     for (off::u64 < size) {
-        val remaining: u64 = size - off::u64;
-        var chunk: u8 = 1;
-        if (remaining >= 8) {
-            chunk = 8;
-        }
-        or (remaining >= 4) {
-            chunk = 4;
-        }
-        or (remaining >= 2) {
-            chunk = 2;
-        }
+        val chunk: u8 = copy_chunk_width(size - off::u64);
 
         val res_tmp: R.Result[u32, str] = new_vreg(ctx, mir.REG_CLASS_GP);
         if (R.is_err[u32, str](res_tmp)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_tmp)); }

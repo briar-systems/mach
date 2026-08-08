@@ -700,12 +700,13 @@ intrinsic-call ::= comptime-ident call-args         (* $size_of(T), $fields(T), 
 mach-read      ::= comptime-ident { member }        (* $mach.build.os, $mach.arch.x86_64 *)
 ```
 
-- Intrinsic calls (`$size_of(T)`, `$align_of(T)`, `$offset_of(T, field)`,
-  `$type_of(e)`, `$fields(T)`, `$is_record(T)`, `$is_union(T)`,
-  `$is_pointer(T)`, `$type_name(T)`, `$error("msg")`) are syntactically a
-  `comptime-ident` callee with `call-args`.
-- The **type-taking** intrinsics — `$size_of`, `$align_of`, `$offset_of`,
-  `$fields` — parse their **first argument with the `type` production**, not the
+- Intrinsic calls (`$size_of(T)`, `$length_of(T)`, `$align_of(T)`,
+  `$offset_of(T, field)`, `$type_of(e)`, `$fields(T)`, `$is_record(T)`,
+  `$is_union(T)`, `$is_pointer(T)`, `$is_secret(T)`, `$type_name(T)`,
+  `$error("msg")`) are syntactically a `comptime-ident` callee with `call-args`.
+- The **type-taking** intrinsics — `$size_of`, `$length_of`, `$align_of`,
+  `$offset_of`, `$fields`, and the four predicates with `$type_name` — parse their
+  **first argument with the `type` production**, not the
   expression grammar, so the whole type language is spellable there:
   `$fields(Box[T])`, `$size_of(Pair[A, B])`, `$size_of(*T)`, `$size_of([4]u16)`,
   `$size_of(^u32)`, `$fields(mod.Rec)`. Every other argument is an ordinary
@@ -778,8 +779,8 @@ Doc-only (intended surface, not a distinct parser production):
   tag/path set — the parser accepts any `IDENT` / `$`-chain; the closed
   sets are enforced later (see [asm.md](asm.md),
   [comptime-mach.md](comptime-mach.md)).
-- The closed intrinsic set (`$size_of`, `$align_of`, `$offset_of`,
-  `$type_of`, `$fields`, `$is_record`, `$is_union`, `$is_pointer`,
+- The closed intrinsic set (`$size_of`, `$length_of`, `$align_of`, `$offset_of`,
+  `$type_of`, `$fields`, `$is_record`, `$is_union`, `$is_pointer`, `$is_secret`,
   `$type_name`, `$error`) — syntactically indistinguishable from any other
   `comptime-ident` call.
 - The closed decorator directive set (`symbol`, `library`, `inline`, `align`,

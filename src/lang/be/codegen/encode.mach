@@ -39,6 +39,7 @@ use std.types.string.str;
 use std.types.string.str_len;
 
 use std.allocator.page;
+use std.memory;
 
 use A: std.allocator;
 use O: std.types.option;
@@ -65,6 +66,8 @@ use target: mach.lang.target.resolved;
 # symbol_count: number of symbol marks
 # rows:         PC<->source line rows, ordered by ascending `text_offset` (owned)
 # row_count:    number of line rows
+# consts:       interned constant-pool entries the encoder referenced (owned)
+# const_count:  number of pool entries
 pub rec EncoderOutput {
     text:         *u8;
     text_len:     u32;
@@ -78,6 +81,8 @@ pub rec EncoderOutput {
     varloc_count: u32;
     inline_pcs:   *InlinePc;
     inline_pc_count: u32;
+    consts:       *ConstEntry;
+    const_count:  u32;
 }
 
 # one retained PC<->source mapping: a `.text` byte offset and the source location of
@@ -184,6 +189,34 @@ pub rec VarLoc {
 pub val VARLOC_NONE:  u8 = 0;
 pub val VARLOC_REG:   u8 = 1;
 pub val VARLOC_FRAME: u8 = 2;
+
+# the slot offset a VARLOC_FRAME record carries, measured from the register the
+# function's DW_AT_frame_base will name
+#
+# The frame base is the frame pointer, and a slot offset is measured from it - except in
+# a realigned frame (#2735), where the slot region is addressed from the stack pointer
+# and the frame pointer sits a run-time distance above it. There the base named is the
+# stack pointer, so the offset recorded has to be the stack-pointer one, and the two
+# halves are decided together here rather than in the producer, which does not see the
+# frame at all.
+#
+# Both cases read the distance the TARGET stamped rather than re-deriving it: `base_dist`
+# from the stack pointer, `fp_dist` from the frame pointer. A raw `slots[si].offset` is
+# right only where the frame pointer sits immediately above the locals, which is x86-64
+# and aarch64 but not riscv64, whose `s0` is pinned at the frame top above the ra/s0
+# record and the callee-save areas. Reading the raw offset agreed with the encoder on the
+# two targets whose reservation is zero and described every riscv64 local at the wrong
+# address by 16 to 200 bytes (#2759).
+# ---
+# fn: the laid-out function, with `base_dist` and `fp_dist` already stamped by its encoder
+# si: index of the slot in `fn.frame.slots`
+# ret: the offset from the frame base
+fun varloc_slot_off(fn: *mir.MirFunction, si: u32) i64 {
+    if (fn.frame.realign != 0) {
+        ret fn.frame.base_dist::i64 + fn.frame.slots[si].offset;
+    }
+    ret fn.frame.slots[si].offset - fn.frame.fp_dist::i64;
+}
 pub val VARLOC_CMP:   u8 = 3;
 pub val VARLOC_IMM:   u8 = 4;
 
@@ -221,6 +254,49 @@ pub rec SymbolMark {
     name:   intern.StrId;
     offset: u32;
     flags:  u32;
+}
+
+# the KIND half of a constant-pool entry's identity
+#
+# The bytes alone are not the identity. A 4-byte f32 and a 4-byte i32 can hold the
+# same bit pattern while meaning different things, and the kind is what an entry's
+# alignment and any future type-aware consumer are derived from, so it is part of
+# the interning key rather than a label hung off it. Adding a kind is one constant
+# here plus its arm in `const_align`.
+pub val CONST_F32: u8 = 1;
+pub val CONST_F64: u8 = 2;
+pub val CONST_VEC: u8 = 3;
+
+# one interned constant in the module's constant pool
+#
+# The pool exists because a constant wider than an ISA's immediate forms has to
+# live in memory, and rebuilding it from instructions at every use costs more than
+# loading it (#2248, #2700). An entry is a laid-out byte image plus the identity it
+# was interned under; the encoder references it by symbol, and `be.codegen` packs it
+# into a read-only section.
+#
+# `bytes` is pool-owned: the encoder copies the constant in, because the bits it
+# reads are a MIR operand's `imm` field or an ISA-side scratch buffer, neither of
+# which outlives the encode. `be.codegen` copies again into image-owned storage
+# when it packs, and the pool's copy is released with the rest of the encoder
+# output.
+#
+# `len` is the entry's full width, which is not bounded by a register: a constant
+# wider than one register (#2727) is ONE entry, loaded in register-width pieces at
+# offsets into its own symbol. That is why a reference names `(sym, offset)` rather
+# than a symbol alone.
+# ---
+# bytes: the constant's laid-out little-endian byte image (pool-owned)
+# len:   the entry's byte width
+# align: the alignment its section must guarantee, from `const_align`
+# kind:  the CONST_* kind the entry was interned under
+# sym:   the local symbol naming the entry's base
+pub rec ConstEntry {
+    bytes: *u8;
+    len:   u32;
+    align: u32;
+    kind:  u8;
+    sym:   intern.StrId;
 }
 
 # the concrete signature the erased `isa.RegMachine.encode` pointer is cast back to
@@ -960,6 +1036,9 @@ rec BlockOffset {
 # blocks:      resolved block offsets
 # block_count: number of block offsets
 # block_cap:   capacity of `blocks`
+# consts:      the module's constant pool; interned entries the encoder referenced
+# const_count: number of pool entries
+# const_cap:   capacity of `consts`
 # next_block_id:  MIR id of the block physically following the one being emitted -
 #                 its fallthrough successor, set per block by the encode hook so a
 #                 terminator branching to it emits nothing (issue #1936)
@@ -996,6 +1075,9 @@ pub rec EncodeState {
     inline_pcs:  *InlinePc;
     inline_pc_count: u32;
     inline_pc_cap:   u32;
+    consts:      *ConstEntry;
+    const_count: u32;
+    const_cap:   u32;
     last_inline_site: u32;
     next_block_id:  u32;
     has_next_block: bool;
@@ -1151,6 +1233,12 @@ pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirM
         ret R.err[EncoderOutput, str](R.unwrap_err[bool, str](res_shrink));
     }
 
+    val res_pool: R.Result[bool, str] = shrink_consts(?st);
+    if (R.is_err[bool, str](res_pool)) {
+        state_dnit(?st);
+        ret R.err[EncoderOutput, str](R.unwrap_err[bool, str](res_pool));
+    }
+
     var out: EncoderOutput;
     out.text         = st.buf.data;
     out.text_len     = st.buf.len::u32;
@@ -1164,9 +1252,14 @@ pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirM
     out.inline_pc_count = st.inline_pc_count;
     out.varlocs      = st.varlocs;
     out.varloc_count = st.varloc_count;
+    out.consts       = st.consts;
+    out.const_count  = st.const_count;
 
-    # the text, symbol, relocation, line-row, and varloc arrays are transferred to the
-    # output; only the driver-internal fixup and block-offset arrays are released.
+    # the text, symbol, relocation, line-row, varloc, and constant-pool arrays are
+    # transferred to the output; only the driver-internal fixup and block-offset
+    # arrays are released. the pool array's capacity is not carried, so the object
+    # builder frees it by count - which is why `shrink_consts` right-sizes it here,
+    # exactly as `shrink_text` right-sizes the text blob for the same reason.
     scratch_release(?st);
     ret R.ok[EncoderOutput, str](out);
 }
@@ -1251,6 +1344,145 @@ pub fun push_reloc(st: *EncodeState, offset: u32, kind: of.RelocKind, sym: inter
     st.relocs[st.reloc_count].sym    = sym;
     st.relocs[st.reloc_count].addend = addend;
     st.reloc_count = st.reloc_count + 1;
+    ret R.ok[bool, str](true);
+}
+
+# the alignment a constant-pool entry's section must guarantee
+#
+# The ONE place a pool entry's alignment is decided. An encoder that emits an
+# aligned load form reads the guarantee from the entry it is loading rather than
+# re-deriving it from the width at the use site, because a rule stated in three
+# encoders is a rule three encoders can disagree about - which is the shape of
+# #2735 on a different surface.
+#
+# A scalar float is aligned to its own width. A vector is aligned to its width
+# rounded up to a power of two, which is what every aligned vector load form on
+# every target this compiler targets requires, and which stays correct for a
+# constant wider than a register (#2727) because the pieces such a load reads are
+# at power-of-two offsets from an equally aligned base.
+# ---
+# kind: the CONST_* kind the entry is interned under
+# len:  the entry's byte width
+# ret:  the required alignment in bytes
+pub fun const_align(kind: u8, len: u32) u32 {
+    if (kind == CONST_F32) { ret 4; }
+    if (kind == CONST_F64) { ret 8; }
+    var a: u32 = 1;
+    for (a < len) { a = a * 2; }
+    ret a;
+}
+
+# intern one constant into the module's pool and return the symbol naming it
+#
+# Two uses of the same constant share one entry, and the key is the full identity
+# `(kind, len, align, bytes)` rather than the bytes alone: an f32 and an i32 can
+# carry one bit pattern while meaning different things, and an entry's alignment
+# and any type-aware consumer follow from its kind. A key that was only the bytes
+# would silently hand one entry to both.
+#
+# The bit pattern is compared, never the value it denotes: `-0.0` and `+0.0` are
+# equal as floats and distinct as constants, and #2274 is the regression pin for
+# that sign being dropped.
+#
+# Merging is sound here in a way it is not for an ordinary global (#2541): a pool
+# entry has no observable address identity, so nothing in a program can tell that
+# two uses share one. That is also what lets `be.codegen` mark the packed section
+# coalescable, so byte-identical entries from different modules collapse at link.
+# ---
+# st:    the encode state owning the pool
+# bytes: the constant's laid-out little-endian byte image (copied)
+# len:   the constant's byte width
+# kind:  the CONST_* kind to intern under
+# ret:   the local symbol naming the entry's base, or an error string
+pub fun intern_const(st: *EncodeState, bytes: *u8, len: u32, kind: u8) R.Result[intern.StrId, str] {
+    if (len == 0) { ret R.err[intern.StrId, str]("encode: a constant-pool entry has no bytes"); }
+    val align: u32 = const_align(kind, len);
+
+    var i: u32 = 0;
+    for (i < st.const_count) {
+        val e: *ConstEntry = ?st.consts[i];
+        if (e.kind == kind && e.len == len && e.align == align &&
+            memory.raw_equal(e.bytes::ptr, bytes::ptr, len::usize)) {
+            ret R.ok[intern.StrId, str](e.sym);
+        }
+        i = i + 1;
+    }
+
+    if (st.const_count >= st.const_cap) {
+        val res_grow: R.Result[bool, str] = grow_consts(st);
+        if (R.is_err[bool, str](res_grow)) { ret R.err[intern.StrId, str](R.unwrap_err[bool, str](res_grow)); }
+    }
+
+    # the name only has to be unique within the object: a relocation against a
+    # LOCAL symbol resolves against its own module's definition and never by name
+    # across objects (linker.local_symbol_target, #2520), and STB_LOCAL / non-external
+    # / IMAGE_SYM_CLASS_STATIC say the same thing to a foreign linker. a per-module
+    # ordinal is therefore enough, and it keeps the name independent of the bytes so
+    # a constant never leaks into the symbol table.
+    var name: [32]u8;
+    val prefix: str = ".Lconst.";
+    var k: usize = 0;
+    for (k < 8) { name[k] = prefix[k]::u8; k = k + 1; }
+    k = put_decimal(?name[0], k, st.const_count::usize);
+    name[k] = 0;
+    val res_sym: R.Result[intern.StrId, str] = intern.intern(st.interner, (?name[0])::str);
+    if (R.is_err[intern.StrId, str](res_sym)) { ret res_sym; }
+
+    val res_copy: R.Result[*u8, str] = A.allocate[u8](st.alloc, len::usize);
+    if (R.is_err[*u8, str](res_copy)) { ret R.err[intern.StrId, str](R.unwrap_err[*u8, str](res_copy)); }
+    val buf: *u8 = R.unwrap_ok[*u8, str](res_copy);
+    memory.raw_copy(buf::ptr, bytes::ptr, len::usize);
+
+    st.consts[st.const_count].bytes = buf;
+    st.consts[st.const_count].len   = len;
+    st.consts[st.const_count].align = align;
+    st.consts[st.const_count].kind  = kind;
+    st.consts[st.const_count].sym   = R.unwrap_ok[intern.StrId, str](res_sym);
+    st.const_count = st.const_count + 1;
+    ret R.ok[intern.StrId, str](st.consts[st.const_count - 1].sym);
+}
+
+# intern a scalar float bit pattern, the shape every target's float-immediate
+# materialization reaches the pool through
+#
+# `width` is 4 (an f32 pattern in the low 32 bits) or 8 (an f64 pattern), and it
+# selects both the entry kind and how many of `bits`' bytes are laid out - an f32
+# entry is four bytes, not the low four of an eight-byte image, so the entry a
+# 4-byte load reads is exactly the constant and nothing beyond it.
+# ---
+# st:    the encode state owning the pool
+# bits:  the constant's raw IEEE-754 bit pattern
+# width: 4 for an f32, 8 for an f64
+# ret:   the local symbol naming the entry, or an error string
+pub fun intern_float_const(st: *EncodeState, bits: u64, width: u8) R.Result[intern.StrId, str] {
+    var img: [8]u8;
+    var i: u32 = 0;
+    for (i < width::u32) {
+        img[i] = (bits >> (i::u64 * 8::u64))::u8;
+        i = i + 1;
+    }
+    var kind: u8 = CONST_F64;
+    if (width == 4) { kind = CONST_F32; }
+    ret intern_const(st, ?img[0], width::u32, kind);
+}
+
+# grow the constant-pool array, allocating it on first use
+# ---
+# st:  the state whose pool array is grown
+# ret: ok(true) once the array has room, or an allocation error
+fun grow_consts(st: *EncodeState) R.Result[bool, str] {
+    if (st.consts == nil) {
+        val res_alloc: R.Result[*ConstEntry, str] = A.allocate[ConstEntry](st.alloc, DRIVER_INIT_CAP::usize);
+        if (R.is_err[*ConstEntry, str](res_alloc)) { ret R.err[bool, str](R.unwrap_err[*ConstEntry, str](res_alloc)); }
+        st.consts    = R.unwrap_ok[*ConstEntry, str](res_alloc);
+        st.const_cap = DRIVER_INIT_CAP;
+        ret R.ok[bool, str](true);
+    }
+    val new_cap: u32 = st.const_cap * 2;
+    val res_realloc: R.Result[*ConstEntry, str] = A.reallocate[ConstEntry](st.alloc, st.consts, st.const_cap::usize, new_cap::usize);
+    if (R.is_err[*ConstEntry, str](res_realloc)) { ret R.err[bool, str](R.unwrap_err[*ConstEntry, str](res_realloc)); }
+    st.consts    = R.unwrap_ok[*ConstEntry, str](res_realloc);
+    st.const_cap = new_cap;
     ret R.ok[bool, str](true);
 }
 
@@ -1377,7 +1609,7 @@ pub fun push_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction, vr
         or (vr.spill_slot >= 0) {
             var si: u32 = 0;
             for (si < fn.frame.slot_count) {
-                if (fn.frame.slots[si].value == vreg) { kind = VARLOC_FRAME; off = fn.frame.slots[si].offset; }
+                if (fn.frame.slots[si].value == vreg) { kind = VARLOC_FRAME; off = varloc_slot_off(fn, si); }
                 si = si + 1;
             }
         }
@@ -1389,7 +1621,7 @@ pub fun push_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction, vr
             var si: u32 = 0;
             for (si < fn.frame.slot_count) {
                 if (fn.frame.slots[si].value == vreg && fn.frame.slots[si].kind == mir.SLOT_SPILL) {
-                    kind = VARLOC_FRAME; off = fn.frame.slots[si].offset; storage = true;
+                    kind = VARLOC_FRAME; off = varloc_slot_off(fn, si); storage = true;
                 }
                 si = si + 1;
             }
@@ -1457,7 +1689,7 @@ fun cmp_operand_home(fn: *mir.MirFunction, is_imm: bool, vreg: u32, imm: i64,
         for (si < fn.frame.slot_count) {
             if (fn.frame.slots[si].value == vreg) {
                 @out_kind = VARLOC_FRAME;
-                @out_off  = fn.frame.slots[si].offset;
+                @out_off  = varloc_slot_off(fn, si);
             }
             si = si + 1;
         }
@@ -1588,6 +1820,24 @@ fun grow_varlocs(st: *EncodeState) R.Result[bool, str] {
 # m:     the MIR module whose interner the state borrows
 # tgt:   resolved target whose ABI / OS vtables the encode hook reads
 fun state_init(st: *EncodeState, alloc: *A.Allocator, m: *mir.MirModule, tgt: *target.Target) {
+    state_blank(st, alloc);
+    st.interner    = m.interner;
+    st.srcmap      = m.srcmap;
+    st.abi         = tgt.abi;
+    st.os          = tgt.os;
+}
+
+# an encode state with a live text sink and every growable array empty
+#
+# The zero state `state_init` builds on and the one a unit test that drives an
+# encoder directly needs, so a field added to `EncodeState` is initialised in one
+# place rather than in each of them. It names no module and no target: those four
+# borrowed pointers are what `state_init` adds, and a test that reaches one has
+# built a state the encoder would not have produced.
+# ---
+# st:    the state to initialise
+# alloc: backing allocator for every array the state grows
+pub fun state_blank(st: *EncodeState, alloc: *A.Allocator) {
     st.alloc       = alloc;
     st.buf         = buf_init(alloc);
     st.syms        = nil;
@@ -1611,13 +1861,16 @@ fun state_init(st: *EncodeState, alloc: *A.Allocator, m: *mir.MirModule, tgt: *t
     st.inline_pcs  = nil;
     st.inline_pc_count = 0;
     st.inline_pc_cap   = 0;
+    st.consts      = nil;
+    st.const_count = 0;
+    st.const_cap   = 0;
     st.last_inline_site = 0;
     st.next_block_id  = 0;
     st.has_next_block = false;
-    st.interner    = m.interner;
-    st.srcmap      = m.srcmap;
-    st.abi         = tgt.abi;
-    st.os          = tgt.os;
+    st.interner    = nil;
+    st.srcmap      = nil;
+    st.abi         = nil;
+    st.os          = nil;
 }
 
 # release every owned array on the error path, including the text sink and the
@@ -1656,7 +1909,33 @@ fun state_dnit(st: *EncodeState) {
     st.inline_pcs      = nil;
     st.inline_pc_count = 0;
     st.inline_pc_cap   = 0;
+    consts_free(st.alloc, st.consts, st.const_count, st.const_cap);
+    st.consts      = nil;
+    st.const_count = 0;
+    st.const_cap   = 0;
     scratch_release(st);
+}
+
+# release a constant-pool array and every entry's owned byte image
+#
+# The one place pool storage is released, so the encoder's error path and the
+# object builder's post-pack teardown free it identically. `count` bounds the
+# entries whose bytes are live; `cap` bounds the array allocation.
+# ---
+# alloc: the allocator the pool was built on
+# c:     the entry array (nil-safe)
+# count: number of live entries
+# cap:   allocated capacity of the array
+pub fun consts_free(alloc: *A.Allocator, c: *ConstEntry, count: u32, cap: u32) {
+    if (c == nil) { ret; }
+    var i: u32 = 0;
+    for (i < count) {
+        if (c[i].bytes != nil && c[i].len > 0) {
+            A.deallocate[u8](alloc, c[i].bytes, c[i].len::usize);
+        }
+        i = i + 1;
+    }
+    if (cap > 0) { A.deallocate[ConstEntry](alloc, c, cap::usize); }
 }
 
 # release the driver-internal scratch arrays (fixups, block offsets) once their
@@ -1701,6 +1980,31 @@ fun shrink_text(st: *EncodeState) R.Result[bool, str] {
     if (R.is_err[*u8, str](res_shrink)) { ret R.err[bool, str](R.unwrap_err[*u8, str](res_shrink)); }
     st.buf.data = R.unwrap_ok[*u8, str](res_shrink);
     st.buf.cap  = st.buf.len;
+    ret R.ok[bool, str](true);
+}
+
+# right-size the constant-pool array so its allocation length equals its entry
+# count
+#
+# `EncoderOutput` carries a count and no capacity, so the object builder frees the
+# transferred array by that count; the allocation has to match. The same
+# requirement `shrink_text` exists for.
+# ---
+# st:  the state whose pool array is right-sized
+# ret: ok(true) on success, or an allocation error
+fun shrink_consts(st: *EncodeState) R.Result[bool, str] {
+    if (st.consts == nil) { ret R.ok[bool, str](true); }
+    if (st.const_count == 0) {
+        A.deallocate[ConstEntry](st.alloc, st.consts, st.const_cap::usize);
+        st.consts    = nil;
+        st.const_cap = 0;
+        ret R.ok[bool, str](true);
+    }
+    if (st.const_cap == st.const_count) { ret R.ok[bool, str](true); }
+    val res: R.Result[*ConstEntry, str] = A.reallocate[ConstEntry](st.alloc, st.consts, st.const_cap::usize, st.const_count::usize);
+    if (R.is_err[*ConstEntry, str](res)) { ret R.err[bool, str](R.unwrap_err[*ConstEntry, str](res)); }
+    st.consts    = R.unwrap_ok[*ConstEntry, str](res);
+    st.const_cap = st.const_count;
     ret R.ok[bool, str](true);
 }
 
@@ -2075,16 +2379,7 @@ pub fun asm_located_message(st: *EncodeState, loc: source.SrcLoc, msg: str) str 
 # an empty set of mark / reloc / fixup / block / row / varloc arrays, no interner or
 # vtables
 fun t_row_state(alloc: *A.Allocator, st: *EncodeState) {
-    st.alloc = alloc;
-    st.buf = buf_init(alloc);
-    st.syms = nil;   st.sym_count = 0;   st.sym_cap = 0;
-    st.relocs = nil; st.reloc_count = 0; st.reloc_cap = 0;
-    st.fixups = nil; st.fixup_count = 0; st.fixup_cap = 0;
-    st.blocks = nil; st.block_count = 0; st.block_cap = 0;
-    st.rows = nil;   st.row_count = 0;   st.row_cap = 0;
-    st.varlocs = nil; st.varloc_count = 0; st.varloc_cap = 0;
-    st.inline_pcs = nil; st.inline_pc_count = 0; st.inline_pc_cap = 0;
-    st.interner = nil; st.srcmap = nil; st.abi = nil; st.os = nil;
+    state_blank(st, alloc);
 }
 
 # push_row drops a location naming no file, and insert_text (branch relaxation)
@@ -2379,4 +2674,162 @@ test "mach.lang.be.codegen.encode.sink_claim:refuses_a_claim_that_skips_bytes" {
     buf_dnit(?ok_buf);
     buf_dnit(?buf);
     ret bad;
+}
+
+# interning keys on the WHOLE identity - kind, width, alignment, and every byte of
+# the image - not on the bytes alone
+#
+# The kind arm cannot be reached through any front-end program today: only
+# CONST_F32 and CONST_F64 are interned, and their widths already differ, so the
+# width alone separates them. It is exercised here directly, because the member
+# that makes it load-bearing is an eight-byte VECTOR constant - which can carry an
+# f64's exact bit pattern - and a key that dropped the kind would hand both uses
+# one entry with no test anywhere able to see it.
+test "mach.lang.be.codegen.encode.intern_const:key_is_the_whole_identity" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+
+    var st: EncodeState;
+    state_blank(?st, ?alloc);
+    st.interner = ?itn;
+
+    var code: i32 = 0;
+
+    # the same bytes under the same kind intern once, and the second use is handed
+    # the first entry's symbol
+    var a: [8]u8;
+    var b: [8]u8;
+    var k: u32 = 0;
+    for (k < 8) { a[k] = (0x11 * (k + 1))::u8; b[k] = (0x11 * (k + 1))::u8; k = k + 1; }
+
+    val s0: R.Result[intern.StrId, str] = intern_const(?st, ?a[0], 8, CONST_F64);
+    val s1: R.Result[intern.StrId, str] = intern_const(?st, ?b[0], 8, CONST_F64);
+    if (R.is_err[intern.StrId, str](s0) || R.is_err[intern.StrId, str](s1)) { code = 1; }
+    or {
+        if (R.unwrap_ok[intern.StrId, str](s0) != R.unwrap_ok[intern.StrId, str](s1)) { code = 1; }
+        if (st.const_count != 1) { code = 1; }
+    }
+
+    # one byte different is a different constant, however deep in the image
+    var c: [8]u8;
+    k = 0;
+    for (k < 8) { c[k] = a[k]; k = k + 1; }
+    c[7] = c[7] ^ 0x01;
+    val s2: R.Result[intern.StrId, str] = intern_const(?st, ?c[0], 8, CONST_F64);
+    if (R.is_err[intern.StrId, str](s2)) { code = 1; }
+    or {
+        if (R.unwrap_ok[intern.StrId, str](s2) == R.unwrap_ok[intern.StrId, str](s0)) { code = 1; }
+        if (st.const_count != 2) { code = 1; }
+    }
+
+    # the SAME eight bytes under a different KIND is a different entry. this is the
+    # arm no reachable program exercises, and the one an eight-byte vector constant
+    # will land on
+    val s3: R.Result[intern.StrId, str] = intern_const(?st, ?a[0], 8, CONST_VEC);
+    if (R.is_err[intern.StrId, str](s3)) { code = 1; }
+    or {
+        if (R.unwrap_ok[intern.StrId, str](s3) == R.unwrap_ok[intern.StrId, str](s0)) { code = 1; }
+        if (st.const_count != 3) { code = 1; }
+    }
+
+    # every entry keeps its own byte image; the copy is the pool's, not the caller's
+    a[0] = 0xFF;
+    if (st.consts[0].bytes[0] != 0x11) { code = 1; }
+    if (st.consts[0].len != 8 || st.consts[0].kind != CONST_F64) { code = 1; }
+    if (st.consts[2].kind != CONST_VEC) { code = 1; }
+
+    # a zero-length constant is a caller bug, refused rather than interned as an
+    # entry every other zero-length constant would then share
+    if (!R.is_err[intern.StrId, str](intern_const(?st, ?a[0], 0, CONST_F64))) { code = 1; }
+
+    consts_free(?alloc, st.consts, st.const_count, st.const_cap);
+    buf_dnit(?st.buf);
+    intern.dnit(?itn);
+    ret code;
+}
+
+# a float constant is laid out at ITS OWN width, and the bit pattern is compared
+# rather than the value it denotes
+#
+# `-0.0` and `+0.0` are equal as floats and distinct as constants (#2274 is the
+# regression pin for that sign being dropped), so a pool that compared values would
+# hand a `-0.0` use the `+0.0` entry. And an f32 entry is four bytes, not the low
+# four of an eight-byte image: a four-byte load off an f64's image reads the
+# mantissa's low half, which is a different number entirely.
+test "mach.lang.be.codegen.encode.intern_float_const:width_and_bit_pattern" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+
+    var st: EncodeState;
+    state_blank(?st, ?alloc);
+    st.interner = ?itn;
+
+    var code: i32 = 0;
+
+    # 1.5 as an f32 (0x3FC00000) is four bytes, little-endian, and nothing beyond
+    val f32r: R.Result[intern.StrId, str] = intern_float_const(?st, 0x3FC00000, 4);
+    if (R.is_err[intern.StrId, str](f32r)) { code = 1; }
+    or {
+        if (st.const_count != 1)          { code = 1; }
+        if (st.consts[0].len != 4)        { code = 1; }
+        if (st.consts[0].align != 4)      { code = 1; }
+        if (st.consts[0].kind != CONST_F32) { code = 1; }
+        if (st.consts[0].bytes[0] != 0x00) { code = 1; }
+        if (st.consts[0].bytes[1] != 0x00) { code = 1; }
+        if (st.consts[0].bytes[2] != 0xC0) { code = 1; }
+        if (st.consts[0].bytes[3] != 0x3F) { code = 1; }
+    }
+
+    # 0.125 as an f64 is 0x3FC0000000000000: the SAME leading hex digits, eight
+    # bytes, and a distinct entry - the f32 above is not its prefix and must not
+    # match it
+    val f64r: R.Result[intern.StrId, str] = intern_float_const(?st, 0x3FC0000000000000, 8);
+    if (R.is_err[intern.StrId, str](f64r)) { code = 1; }
+    or {
+        if (st.const_count != 2)     { code = 1; }
+        if (st.consts[1].len != 8)   { code = 1; }
+        if (st.consts[1].align != 8) { code = 1; }
+        if (st.consts[1].bytes[7] != 0x3F) { code = 1; }
+        if (st.consts[1].bytes[0] != 0x00) { code = 1; }
+    }
+
+    # -0.0 and +0.0 compare EQUAL as floats and are two entries here
+    val negz: R.Result[intern.StrId, str] = intern_float_const(?st, 0x8000000000000000, 8);
+    val posz: R.Result[intern.StrId, str] = intern_float_const(?st, 0, 8);
+    if (R.is_err[intern.StrId, str](negz) || R.is_err[intern.StrId, str](posz)) { code = 1; }
+    or {
+        if (R.unwrap_ok[intern.StrId, str](negz) == R.unwrap_ok[intern.StrId, str](posz)) { code = 1; }
+        if (st.const_count != 4) { code = 1; }
+        if (st.consts[2].bytes[7] != 0x80) { code = 1; }
+        if (st.consts[3].bytes[7] != 0x00) { code = 1; }
+    }
+
+    consts_free(?alloc, st.consts, st.const_count, st.const_cap);
+    buf_dnit(?st.buf);
+    intern.dnit(?itn);
+    ret code;
+}
+
+# a pool entry's alignment is decided from its kind and width in ONE place, and a
+# vector is aligned to its own width rounded up to a power of two
+#
+# The rule has to hold for a width WIDER THAN A REGISTER (#2727), where the load is
+# several register-width reads at power-of-two offsets from the entry's base: the
+# base's alignment is what makes each of those reads aligned, so it has to be the
+# whole entry's width and not the register's
+test "mach.lang.be.codegen.encode.const_align:one_rule_including_over_width" {
+    var code: i32 = 0;
+    if (const_align(CONST_F32, 4)  != 4)  { code = 1; }
+    if (const_align(CONST_F64, 8)  != 8)  { code = 1; }
+    if (const_align(CONST_VEC, 16) != 16) { code = 1; }
+    # a vector narrower than a full register is aligned to its own width
+    if (const_align(CONST_VEC, 8)  != 8)  { code = 1; }
+    # and one wider than a register is aligned to ITS width, not to 16
+    if (const_align(CONST_VEC, 32) != 32) { code = 1; }
+    if (const_align(CONST_VEC, 64) != 64) { code = 1; }
+    # a non-power-of-two width rounds up, so the guarantee is never weaker than asked
+    if (const_align(CONST_VEC, 12) != 16) { code = 1; }
+    ret code;
 }

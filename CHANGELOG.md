@@ -5,6 +5,171 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.16.0] - 2026-08-08
+
+### Added
+
+#### An integer vector multiply works on every target (#2726, #2721)
+`i32x4 * i32x4` was refused at the language level on **every** target, citing x86-64's SSE2 baseline, where `pmulld` is SSE4.1. That refused it on aarch64, whose NEON hardware has the instruction, and on riscv64, which has no vector unit at all and would have lowered it to four ordinary scalar multiplies.
+
+The legality of a vector operation is a **target-independent** fact; only its realization is target-dependent. The rule lived in three places and now consults one authority, `isa.packed_width(model, op, is_float, lane_bits)`, which answers the width of the target's packed form and zero where there is none. Sema no longer asks the question at all, because it is not a legality question. Where a packed form is missing the operation takes the existing per-lane scalar expansion, and `simd = "require"` reports it naming the operation and lane width.
+
+The authority is keyed on **lane width**, never lane count or total width, so splitting a wider-than-register vector into chunks does not change the answer. It declares **gaps rather than presence**, because a presence table would be roughly eighty rows per target and the row that mattered would be the missing one.
+
+Also pinned as part of this: aarch64's NEON integer-multiply arrangements are now byte-exact against the ARM ARM, and a 64-bit lane arrangement reaching the selector is a defined encoder error rather than an emitted `mul v.2d`, which is unallocated. The word's comment previously claimed it was "legal only on .8h", which was wrong in both directions.
+
+#### `$is_secret(T)`, so a reflection walk can act on secrecy instead of refusing it (#2694)
+Every comptime predicate asks about the shape **under** a `^`, so all of them answer false for a secret. `$is_record(^u64)` and `$is_record(u64)` were therefore the same answer, and a `std.derive` walk could only ever meet a secret field as a fallthrough it had to refuse. That is a refusal, not a decision, and it blocked all three things a derive actually wants: a formatter that redacts a secret field, a hash that refuses one (a data-dependent fold is a leak in the shape of a digest), and an equality that selects the constant-time comparison rather than the early-out whose timing is the secret.
+
+`$is_secret(T)` is the positive question, and it joins the predicate family exactly: comptime-only, one type operand, gate position, answered per instantiation inside a generic. It is the family's one exception to the stripping rule, and the exception is coherent rather than special-cased — the other three ask about the wrapped storage, this one asks about the wrapper. The doc's stripping table names it as such.
+
+The contract is **outermost only**, the same line the shape predicates already draw, so the four cannot disagree about what a type is. `^*u8` is true (the pointer is the secret), `*^u8` is false (a public address to secret storage), `[N]^u8` is false, `^^T` is true because `^^T` collapses to `^T`, and a record with a secret field is false — the field is secret, and `$is_secret(f.type)` is where a walk meets that.
+
+There is deliberately no transitive "contains a secret anywhere" query. Folding it in would make the common case wrong: a formatter gating on a transitive answer would redact a whole record over one field, and could not tell which. Where the transitive question is genuinely wanted through a reference it composes instead, `$is_secret($pointee_of(f.type))`. `$pointee_of(^*U)` stays refused, which is right — `$is_secret` has already answered true there and a walk should stop.
+
+A walk that skips a secret field is pinned by the flow rules rather than by convention: reading one into a public accumulator does not compile, so a gate that answers wrongly is a compile error rather than a silent disclosure. The regression case relies on exactly that.
+
+#### A constant pool, so a float constant is loaded rather than rebuilt (#2248, #2700)
+A constant wider than an ISA's immediate forms has to live in memory somewhere. Every back end here instead rebuilt one from instructions at every use, inside loop bodies included: x86-64 spent `movabs r11 ; movq xmm, r11` (two instructions, 15 bytes, and a general-purpose scratch) because SSE has no immediate form at all, aarch64 spent up to four `movz`/`movk` words plus a bank move, and riscv64 spent `emit_li`'s recursive shift-and-add - five to seven words for an arbitrary `f64`, since its widest immediate is 32 bits.
+
+The pool lives in the **shared encode state**, not in a back end. It interns a constant under its full identity - kind, width, alignment, and every byte - so two uses share one entry while constants that merely resemble each other do not, and bit patterns are compared rather than the values they denote, so `-0.0` and `+0.0` stay distinct. Each entry is packed into its own read-only section with a local symbol and marked coalescable, so byte-identical entries from **different modules** collapse to one placement at link time, reusing the machinery `#[embed]` dedup already had.
+
+Alignment is decided in one place and carried to the section unchanged. No encoder re-derives it, which is what will keep an aligned load legal at a width **wider than a register**, where an entry is read in register-width pieces at power-of-two offsets from its own base.
+
+Pooling is a decision, not a reflex, and the targets disagree on purpose. x86-64 pools every non-zero constant, because with no immediate form the alternative is never cheaper even at a single use, and folds the entry straight into the operation that reads it: `mulsd xmm, [rip + .Lconst.0]`. aarch64 and riscv64 pool only what they cannot build in fewer instructions than a load takes - an all-zero constant reads the zero register in **one** instruction, and a pattern one `movz` or one `lui` builds stays in registers rather than touching memory for the same two instructions.
+
+Measured, on programs that run:
+
+| | before | after |
+|---|---:|---:|
+| five-term Horner loop body, x86-64 | 31 instructions / 164 bytes | 22 / 109 |
+| the same program's wall time | 60.1 ms | **41.9 ms** (1.43x) |
+| a four-constant kernel, x86-64 | 17 instructions | 9 |
+| the same kernel, aarch64 | 25 | 13 |
+| the same kernel, riscv64 | 41 | 13 |
+
+The compiler's own code is not float-heavy, so it barely moves: compiling one source tree with both compilers, `.text` falls 354 bytes for 24 bytes of new `.rodata`, and every one of the 58 float-constant rebuild pairs in its objects is gone. The win is in numeric code, and this is what it is worth there.
+
+### Changed
+
+#### The `#[packed]` vector refusal now waits on one thing, not two (#2728)
+The refusal is sequencing rather than policy, and it was waiting on two conditions: evidence that an unaligned vector access is correct on real silicon, and #2687's aggregate-layout half. The first is now settled.
+
+`int/surface/unaligned-vector` stores and loads `i32x4`, `f32x4`, `i32x3` and `f32x3` at deliberately misaligned offsets. A store probe reassembles every lane from four byte loads and a load probe writes the bytes by hand, so neither reads back through the access it measures, and a sentinel in the bytes on both sides of each extent catches the truncated and over-wide stores a lane check alone cannot see. It is correct in both profiles on every **native** leg: `linux-arm64` on `ubuntu-24.04-arm`, which is the row that matters because aarch64 has 128-bit forms with alignment requirements, plus `linux` and `windows` on x86-64. Nothing faults, no lane is dropped, no neighbour is disturbed. `linux-riscv64` passes and is deliberately not counted: it runs under qemu-user, and riscv64 declares no 128-bit vector support, so the access there is a scalar expansion rather than a vector access.
+
+The refusal itself is unchanged. Its diagnostic and `doc/language/decorators.md` now name what actually remains.
+
+### Fixed
+
+#### A constant out-of-bounds index is refused, on every target (#2751)
+`var xs: [4]i32; ret xs[9];` compiled cleanly on x86-64, aarch64 and riscv64, and on SPIR-V emitted an `OpAccessChain` with `%uint_9` into a four-element array that `spirv-val` did not catch either. The length is part of the type and the index is a constant, so the violation was decidable with no analysis at all. It had simply never been asked.
+
+Sema now asks it, keyed on `type.element_count` — the one definition of "how many elements a type holds", the same answer `$length_of` gives. Keying on the count rather than on the syntax is what makes the spellings free: a `def` alias, an array field of a generic instance, an array nested in a record or in another array, and a `^`-qualified array all name the same interned array type, and all get the same refusal. A vector's lane count is a statically known length too and now takes the identical rule and the identical message, replacing the vector-only wording it had before.
+
+The diagnostic names the index, the type and the length: ``index 9 is out of bounds for `[4]i32` of length 4``.
+
+Scope is deliberate. Only a **constant** index against a **fixed** length is checked, which needs no dataflow. A runtime index is not checked, and a pointer is not checked at all — `*T` carries no length to measure against.
+
+Folding the index now decides on **resolution identity** rather than on name text. The comptime environment is keyed by name, so a block-local `var n` that shares its name with a module-level `val n` used to fold to the module constant. That was already visible on the vector path, where `v[n]` with a local `n = 1` was reported as an out-of-bounds lane against a module-level `n = 9`; it now reports the dynamic-lane refusal it should always have given, and an array indexed by such a local is correctly left alone rather than refused. The runtime-binding rule the `$if` gate check already carried is now one shared definition.
+
+#### The debug-info validator's warnings are now an observable, not a wall (#2755)
+`int/surface/debuginfo` read `llvm-dwarfdump --verify`'s exit status, which is zero on warnings. So "no diagnostics at all" and "no errors, plus a standing wall of about 200 warnings on every `-g` image" both rendered `dwarfdump_verify=clean`, and the golden recorded the second while claiming the first. That is how a validator stops validating: the next real warning arrives into a stream nobody reads.
+
+The case now reads the stream. It reports `errors`, `warnings` or `clean`, and lists each residual warning text with only the per-CU section offset elided, so a failure names itself in the diff. Exactly one class is filtered, with its reason written beside it, and every other warning of any class now fails the case where before none could.
+
+That filtered class is the duplicate itself, and it is deliberate. DWARF 5 §6.2.4 numbers file entries from 0 and §6.2.2 still gives the line state machine's `file` register an initial value of 1, and a single-file compile unit cannot satisfy both. binutils resolves it the way §6.2.2 says: measured on binutils 2.47, `addr2line` reports `mangled line number section (bad file number)` on every compile unit of a table whose only entry is slot 0, including clang's own `-gdwarf-5` output. gcc emits the duplicate and llvm-dwarfdump warns on gcc's output identically. `dwarf.mach` now records that, because the obvious repair trades a cosmetic warning from one validator for a real decode failure in every libbfd consumer. It is also validator-version dependent - llvm-dwarfdump 18 does not report it and 22 does - so leaving it in the observable would have made the golden a statement about the runner's llvm package rather than about the compiler.
+
+#### An unencodable float move produced a wrong move instead of a diagnostic (#2733)
+All three register machines answered a float-move width they do not implement by **substituting 8** and encoding anyway. `if (w != 4 && w != 8) { w = 8; }` sat in x86-64's `encode_fp_mov`, aarch64's `encode_fmov` and riscv64's `encode_fmov` - the same line in the same role on each - so a move the compiler could not encode became an 8-byte move that dropped everything above the low lane, with no error anywhere. A defensive fallback that produces **wrong output** is worse than no fallback: it converts "the compiler was asked something it cannot do" into "the program computes the wrong answer", which is the worst failure a back end has.
+
+It had already cost real debugging. During #2687 three layers each answered one fixed-size ladder, and the middle layer's honest refusal was **masking** this one - widening that refusal alone compiled cleanly and then silently dropped the top lane of every stack-passed vector. That refusal was the only thing standing between this default and a shipped miscompile.
+
+Every float encoder on every register machine now refuses a width it does not implement, and the census turned up two more sites than the issue named. x86-64 carried a **second** silent narrow in `encode_float_const_mov`, where a wrong width pools an f64-sized image of a constant that is not an f64 - and the constant is the value the program computes with. And the float **conversions** on all three targets carried the same substitution in a shape no search for the ladder finds: they read `dw == 8` / `src_w == 4` and took the other form for everything else, with no ladder to grep for. Arithmetic, negate and compare already refused on all three, and are now pinned by the same tests.
+
+**The refusals are driven, not argued.** Each one is called directly from a unit test with a width it must refuse, and the assertion is that the byte sink stayed **empty** - "returned an error" and "emitted nothing" are different properties, and only the second distinguishes a refusal from an emit-then-error. Arguing that no caller reaches a site is exactly what let this sit. x86-64's `encode_fp_mov` reports its backend bugs rather than ending the process itself to make that checkable at all; the process-terminating decision moved to its single caller, unchanged in behaviour.
+
+The aarch64 calling convention's two `make_slot_hfa(reg, 1, 16, size)` literals are on the same path and are now written as what they are: the **V register** width, not the vector's. A `f32x3` is twelve bytes and rides a whole register, so "correcting" the literal to `size` breaks it - which is measured, not supposed. What the literal did hide is the vector too wide for one register that #2727 makes legal, which would have been handed V0 and a piece describing half of it; those now spill by value and return indirectly.
+
+#### `--emit-ir` shows a float constant, not its truncated integer magnitude (#2753)
+Every float constant in an IR dump rendered as the integer part of its magnitude, so the surface could not show any distinction living below the decimal point, at the top of the range, or at the bottom of it. `1.5` and `1.75` both printed `f1`. A positive infinity printed `f9223372036854775808`, which is also what the finite value 2^63 printed, so an infinity read as a plausible finite number and the two were indistinguishable. The smallest denormal printed `f0`.
+
+The middle end never lost any of this: `me/pass/cse.mach` value-numbers float constants by bit pattern and `me/pass/algebraic.mach` declines to fold `x + 0.0`, precisely so the IR keeps IEEE distinctions apart. Only the view collapsed them, which matters because a dump is what someone reads when they already suspect a float bug and the fraction is the evidence.
+
+Constants now render through `std.format.write_f64` in shortest round-trippable decimal, so `f1.5`, `f1.75`, `f5e-324` and `f9.223372036854776e18` are each themselves, and the non-finite classes spell themselves as `finf`, `f-inf` and `fnan` rather than borrowing an integer. A NaN whose payload is not the canonical quiet one renders its full bit pattern as `fnan:0x…`, since a payload is a distinction the middle end keeps too. Signed zero still renders `f-0` and `f0`, which #2274 established.
+
+The reason recorded in the code for the old rendering - that std had no float formatter - had gone stale; `printer.mach` already imported `std.format`. The unit test that pinned `-1.5` to `f-1` and `2.5` to `f2` was enforcing the defect rather than any intended behaviour, and now pins the real rendering across the IEEE classes, built from bit patterns rather than decimal literals. Objects are byte-identical: this moves nothing but the dump.
+
+#### A riscv64 `-g` local is described where it actually lives (#2759)
+Every `-g` variable in a frame slot was described at the wrong address on riscv64, by exactly the bytes the prologue reserves at the top of the frame. The debug-info producer recorded the raw slot offset while the encoder biases every slot access down past the ra/s0 record and the callee-saved GP and FP areas, so a debugger read `s0 + slot.offset` where the machine had written `s0 - reserved_top + slot.offset`. In a function with callee-saves live that lands in the save area: measured on a fixture with six callee-saved GP and three FP registers, the reservation is 88 bytes, the variable is at `s0 - 104`, and `DW_OP_fbreg -16` pointed at the saved `s0`. Silent, because the value has the variable's type and a plausible magnitude.
+
+One layout fact was derived twice, and the two derivations agreed on x86-64 and aarch64, whose reservation is zero. That is why it went unnoticed, and it is the same shape as #2715, #2725 and #2735.
+
+There is now one derivation. `MirFrame.fp_dist` - the bytes between the frame pointer and the slot region's base - is stamped once by the target's own encoder alongside `base_dist`, its stack-pointer-side twin, and both the encoder's own slot accesses and the `DW_OP_fbreg` offset read it. `frame.slot_offset` no longer takes a caller-supplied bias, so there is no longer a reader that can forget to apply it.
+
+`int/regression/2759-riscv64-fbreg-bias` pins it by crossing the two halves against each other: every `DW_OP_fbreg` offset must name an address the same function's emitted code addresses from the register `DW_AT_frame_base` names. Reading the offset alone cannot see this, since a producer with its own derivation is self-consistent under the bug. The case runs on all three ELF legs, and against the unpatched compiler it is green on x86-64 and aarch64 and red on riscv64 alone.
+
+`.text` is byte-identical with and without `-g` on every target, and `.debug_info` is byte-identical before and after on x86-64 and aarch64.
+
+#### An over-aligned stack local is over-aligned at run time (#2735)
+`#[align(32)]` and above worked on a global and did nothing on a local. The slot's offset was a correct multiple of the requested alignment, but it was measured from the frame pointer, and the only alignment that reaches the frame pointer is the ABI's 16-byte call boundary. So the address was a multiple of 32 exactly when the process stack happened to start on one, which depends on the environment block and therefore changes between runs of the same binary. `$size_of` already reported the padded size, so the storage was sized for a promise the placement did not keep.
+
+A function whose frame contains an over-aligned slot now gets a prologue that masks the stack pointer down to the largest alignment that frame needs, and its locals, spills and callee-save area are addressed from there. The frame pointer stays exactly where the ABI put it: incoming stack arguments and the frame record hang off it and belong to the caller, and after a mask only one of the two pointers is still a fixed distance from the caller's stack. Debug info follows the same split: such a function's `DW_AT_frame_base` names the stack pointer, which is the register its recorded offsets are measured from.
+
+The decision is recorded once, on `MirFrame`, and every encoder reads it. So is the distance from the stack pointer to the slot region's base, which aarch64 and riscv64 had each been re-deriving for inline-asm `{name}` operands since #2689.
+
+The cost falls only on functions that ask: one masking instruction and up to `N - 16` bytes of frame. A function with nothing over-aligned emits a byte-identical prologue to before.
+
+#### A sub-width vector could not reach a SPIR-V shader's interface, or be declared as a zeroed local (#2744, #2758)
+`#[input(0)] var a: f32x3;` could not be read or written at all. Neither could an `#[output]` or a `#[builtin]` of `f32x2` or `u32x3`, and neither could a local declared without an initializer - `var v: f32x3;` was refused at every **read** of the slot while `var v: f32x3 = a;` beside it was fine. `f32x4` and `f64x2` worked throughout. A vec3 vertex attribute is one of the two live needs #2687 names, and a vertex attribute that cannot be read is not one.
+
+Both were the same lowering. A vector whose memory footprint is narrower than its register cannot cross between the two in one access on a byte-addressed machine, so #2687 routed every such move through a register-width scratch slot walked in 8/4/2/1 chunks - and applied it on **every** target. Under logical addressing there is no register and no byte footprint: a value is one value at one type. Running the round trip there costs three things the target cannot express at all - a scratch slot the vector is not typed at, byte-sized chunk accesses of it, and a reinterpreting load back out - and it destroys the direct symbol reference the emitter reaches an interface variable through.
+
+It is now gated on `MachineModel.flat_addressing`, the same lever #2655 used for the float address materialization that made scalar `f32` varyings unreachable for the same kind of reason. **No machine target changed**, asserted rather than assumed: `int/surface/vector-subwidth` builds byte-identical on linux-x86_64, linux-arm64 and linux-riscv64 in both profiles.
+
+The refusal that reported this was worse than the defect it reported. It keyed on the address's origin and then sent three of the four origins to one sentence about module-scope interface variables, so a program holding no module-scope variable at all was told that a module-scope variable is reachable only when it carries an interface role - sending two readers to a role they had already written. Every origin has its own arm now, and the one for an interface variable that *does* carry a role says what is actually wrong: the access reached the back end as computed addressing rather than as a direct reference, which is a lowering that ran where it should not have and not a limit of the declaration.
+
+#### The `uvec3` compute built-ins were refused on a rule #2687 deleted, and no built-in's type was checked (#2745)
+`#[builtin("global_invocation")]`, `local_invocation` and `workgroup_id` were refused by name, on the ground that SPIR-V specifies them as three-component unsigned vectors and every mach vector is exactly 128 bits, so `u32x3` could not exist. That stopped being true when #2687 landed, which left the diagnostic a false statement about the language and a compute stage unable to know which invocation it is.
+
+The wider hole was that **no** built-in's declared type was checked, at any of the eight. `#[builtin("position")] var p: i32;` was accepted by the emitter and rejected by `spirv-val`, and nothing covered it.
+
+So the refusal inverts into the check its own comment said it wanted. One table gives every built-in the type SPIR-V specifies for it, and a variable declared at anything else is refused by a message naming both the declared type and the required one. Adding a built-in is a row in `builtin_selector`, a row in `builtin_storage` and now a row here, and it cannot be added without the third. Signedness is not checked because nothing can distinguish it: IR carries an integer's width and nothing else, and the emitter writes `OpTypeInt n 0` for both spellings.
+
+`GLSL.std.450 Cross` becomes a row alongside it. It is defined only for three-component float vectors, so it was cut pending exactly this ABI work.
+
+#### Every SPIR-V operation on a sub-width vector was mistyped (#2743)
+A vector narrower than 128 bits reached the SPIR-V target correctly as a type and was computed on as if it had four lanes. `fun add3(a: f32x3, b: f32x3) f32x3 { ret a + b; }` built with no diagnostic and emitted `OpFAdd %v4float` inside a function declared `%v3float`, which the Khronos validator rejects. Arithmetic, bitwise, comparison-to-mask and lane writes were all affected, on every shape that is not exactly one 128-bit register, and a vector literal was the single spelling that failed loudly - as an internal error with no source location, because it is the one site that counted operands.
+
+The MIR lane descriptor carried an element class and an element byte-width and **derived** the lane count as `16 / element-bytes`. That is the 128-bit assumption #2687 removed from the language, still standing in the one representation it did not reach. It is sound for the ten shapes that are 128 bits and wrong for every other one.
+
+The descriptor now carries the lane count as a supplied fact. It is a `u32` packing the class, the lane width and the count, with sixteen bits of count rather than the four a 128-bit register would need, because the hardest member is the **over**-width vector of #2727 rather than the sub-width one at hand. Its constructor takes the count positionally, so a descriptor cannot be built without one, and the IR type accessor that feeds it now reports the count alongside the class and width for the same reason - a caller holding the width but not the count is exactly the shape that invented one.
+
+**No machine target changed.** x86-64, aarch64 and riscv64 select an instruction from the lane class and width and write a whole register, so none of them ever read a lane count, and all three were correct on the bug. That is why it survived: SPIR-V is the only target that must *name* a vector type, so it is the only place the count is observable, and the eleven `int/surface/spirv-*` cases were 128-bit shapes by construction.
+
+`int/surface/spirv-vector-narrow` covers `f32x2`, `f32x3`, `i32x2` and `u32x3` through arithmetic, bitwise, compare-to-mask, lane read, lane write, construction, control flow and calls, validated by `spirv-val`. The unit test over the descriptor changed too: it asserted `16 / element-bytes` back at itself, which is how a derivation pins its own defect.
+
+#### The pinned integration lane can run (#2729)
+`int/run.sh --deps pin` stopped on the first SPIR-V case on every target, because no lock recorded a commit for `mach-shader`. The lock was not stale, it was the wrong set: the root `mach.lock` is written by `mach dep pull` from the **root manifest**, so it can only ever cover the compiler's own dependency closure, while `int` builds a larger one. Two cases declared a dep the root has no reason to.
+
+So the pin now reads two sources with disjoint coverage. The root `mach.lock` stays authoritative for anything the compiler also builds against, which is what keeps `mach-std` to one place to bump, and the new `int/deps.lock` covers only the difference. `int/lib/update-deps.sh` writes it from what `mach dep pull` resolves, so no ref-to-commit mapping is reimplemented outside the compiler.
+
+The lane failing was the smaller half. `--deps pin` exists because a case floating a ref can change verdict with zero changes in this repo (#2592), and it is what a release gate and a bisect run, yet its inputs were only ever validated by running it, and the one pinned run in CI is the main-cadence darwin gate, whose leg set contains neither case that declares the missing dep. `int/lib/check-deps.sh` now checks the whole condition statically on every PR - coverage, that the two locks stay disjoint, that no pin outlives the case that asked for it, that cases declaring one dep agree about it, and that a branch ref is `branch/main` - and a pinned linux run of the full suite joins the PR lane. Every run also prints the mode and, when pinned, every lock entry it consulted, so a floating run cannot be read afterwards as a pinned one.
+
+#### A sub-width vector can cross a function boundary (#2687)
+4.15.0 shipped `f32x3` working inside a function and refused at every call boundary. Passing or returning one reported `CLASS_FP scalar of unsupported size`, which made the shape unusable in practice: a shader-math or vertex-building library is nothing but functions taking and returning these.
+
+The cause was the same one #2697 fixed one layer down, and there turned out to be **three** layers of it. A value's register width and its memory footprint are different numbers that agreed for every vector until lane-derived layout made them differ, and each layer answered both questions with one fixed-size ladder:
+
+- `op_width_of` fell through to the general-purpose word, losing lanes (fixed in 4.15.0)
+- `fp_move_width` refused outright, which was honest and total
+- `encode_fp_mov` **silently narrowed** a 12-byte move to 8
+
+The middle one was masking the third. Widening it alone compiled and then dropped the top lane of every stack-passed vector with no diagnostic. So the ABI now asks the two questions separately: a register move uses the target's vector width, and every register-to-memory access uses the value's own extent through the scratch round trip, because no ISA here can issue a 12-byte access and the encoder quietly narrows one that claims to.
+
+Classified per target from `MachineModel` facts rather than assumed to follow x86-64, and **nothing is refused**. Apple aarch64 is the case that breaks the obvious fix: it gives a fixed stack argument its natural size, so the slot is exactly 12 bytes with the next argument packed against it.
+
+The SPIR-V half of #2687 remains open.
+
 ## [4.15.0] - 2026-08-07
 
 ### Added
@@ -92,6 +257,26 @@ $each f in $fields(Node) {
 
 Termination is the caller's problem and is stated as such: unlike the by-value walk of #2691, following references does not terminate structurally, since `rec Grow[T] { p: *Grow[*T]; }` has unboundedly many instances reachable through its pointer.
 
+### Changed
+
+#### Vector operation legality is target-independent, so an unpacked lane op scalarizes instead of being refused (#2726)
+`i32x4 * i32x4` was refused at the language level, citing x86-64's SSE2 baseline (`pmulld` is SSE4.1). That refused it on **riscv64** — a target with no vector unit, which scalarizes `i32x4 + i32x4` one line up and would lower the multiply to four ordinary scalar multiplies — and on **aarch64**, whose NEON `MUL` supports `.4s` in hardware. The rule refused work on the targets least able to benefit from the refusal.
+
+The legality of a vector type and of a vector operation are now both target-independent; only the **realization** is target-dependent. Integer `*` is legal at every lane width on every target, and the backend picks the packed form where one exists and the per-lane scalar expansion where one does not.
+
+The rule's three homes collapse onto one authority. `isa.packed_width` answers a realization question — "how wide is this target's packed form for this operation at this lane width, or 0 for none" — declared per ISA beside the other capability facts and reached through the single mid-end door `me.vecform`. **Sema stops asking entirely**, because it was never a legality question. It returns a *width* rather than a bool so #2727 has the number to split by, and it is keyed on the lane width and never the lane count, so a vector wider than the register splits into chunks that each get the same answer.
+
+**`simd = "require"` now applies per operation on every target**, not only where there is no vector unit, and names the lane width:
+
+```
+error: simd = "require": vector multiply on 64-bit lanes in '_M4case4mainN5mul64' would scalarize on aarch64
+       (target has no packed form for this operation at this lane width); set simd = "scalarize" to build with the scalar expansion
+```
+
+A project that set the lever precisely to refuse a silent scalar expansion was previously told nothing about the ones x86-64 and aarch64 perform.
+
+The auto-vectorizer consults the same authority, so it forms a vector multiply only where the target packs one rather than forming one the realization stage would immediately take apart.
+
 ### Fixed
 
 #### An inline-asm `{name}` operand ran out of reach in a large frame (#2689)
@@ -100,6 +285,13 @@ A `{name}` binding was addressed frame-pointer-relative, and on aarch64 the addr
 The reach was not the real defect. The interface itself said *frame-pointer-relative*, freezing one target's addressing choice into the contract every target reads, when which base a `{name}` uses is part of the addressing decision and only the target knows which of its forms reaches. aarch64 and riscv64 now measure from the stack pointer, x86-64 keeps the frame pointer, and asm-bound slots moved to the bottom of the slot region so what separates a `{name}` from its base is the callee-save and outgoing-argument areas, bounded by the ABI rather than by the function.
 
 **New refusal:** an inline-asm body that binds a `{name}` may not write the stack pointer, on targets that measure from it. The displacement is taken once at block entry, so the pointer must still be where it was. The whole block is judged rather than a prefix, because a backward branch reaches an earlier `{name}` again with the moved pointer. Move the stack adjustment out of the block, or drop the `{name}` and stage the address into a register.
+
+#### The NEON integer-multiply arrangement rule was wrong in both directions (#2721)
+`arm64/encode.mach` declared the `MUL (vector)` base word as "legal only on .8h (size 1)". NEON encodes that word at sizes 0/1/2 as `.16b` / `.8h` / `.4s` and leaves size 3 **unallocated**, so the comment forbade three arrangements the hardware has and omitted the one real constraint: there is no `mul v.2d`.
+
+The encoder was not wrong yet, because nothing selected the word at another size. That is exactly the #2037 shape — a base word plus a size field that *looks* general, with nothing pinning what each arrangement encodes — and a widening that trusted the word's apparent generality would emit `0x4EE29C20`, an invalid encoding, rather than refuse.
+
+Each permitted arrangement is now pinned byte-exact against the encoding definition, and `neon_3same_size_ok` makes the hole a fact the compiler enforces: a 64-bit integer lane multiply reaching the selector is a defined error emitting no bytes, proved by driving the selector directly rather than by arguing no caller reaches it.
 
 #### Field stores went through a second layout policy that no decorator could reach (#2715)
 `mir.lower_ir`'s `struct_field_offset` re-derived every field offset with its own `round_up` over each field's alignment, rather than calling `ir_type.byte_offset` like every other offset consumer. So a `#[packed]` record reported correct `$size_of`, `$align_of` and `$offset_of` — those go through the shared layout policy — while the code that actually **read and wrote the fields** placed them at the **natural** offsets, and nothing errored. A record whose fields fit its packed size wrote its last field past the end of its own storage.

@@ -1045,7 +1045,7 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         }
         val argop: mir.MirOperand = R.unwrap_ok[mir.MirOperand, str](aor);
 
-        val er: R.Result[bool, str] = emit_arg_slot(ctx, mb, slot, argop, soff, aag, asz,
+        val er: R.Result[bool, str] = emit_arg_slot(ctx, mb, slot, argop, soff, aag, av.ty,
                                                     natural_stack_slot(ctx.tgt, pidx >= layout.param_count));
         if (R.is_err[bool, str](er)) {
             sig_layout_free(ctx, ?layout);
@@ -1145,7 +1145,7 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     # the result vreg.
     val dst: u32 = context.instr_vreg(ctx, iid);
     if (dst != mir.MIR_VREG_NIL && rslot.class != abi.CLASS_SRET) {
-        val rr: R.Result[bool, str] = emit_ret_slot_to_vreg(ctx, mb, rslot, dst, ret_aggr, ret_size);
+        val rr: R.Result[bool, str] = emit_ret_slot_to_vreg(ctx, mb, rslot, dst, ret_aggr, ret_type);
         if (R.is_err[bool, str](rr)) { ret rr; }
     }
     # an indirect SCALAR return: the callee stored the value into the caller-owned
@@ -1295,13 +1295,16 @@ fun materialize_pieces(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.Para
 # argop:     the lowered argument operand (a storage pointer for an aggregate)
 # stack_off: the slot's outgoing stack base (a STACK slot, or a split's stack chunk)
 # is_aggr:   whether the argument is an aggregate flowing by address
-# size:      the argument's byte size (the copy length for a by-value aggregate)
+# ty:        the argument's IR type, which sizes every memory-touching move (the copy
+#            length for a by-value aggregate) and answers the register width for a
+#            vector, whose two are not the same number
 # natural:   whether the outgoing slot is exactly the value's size, so a narrow scalar
 #            must be stored at its own width or it overwrites the argument packed
 #            against it (the Apple arm64 fixed rule)
 # ret:       ok(true) on success, or a loud error
 fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, argop: mir.MirOperand,
-                  stack_off: i64, is_aggr: bool, size: u64, natural: bool) R.Result[bool, str] {
+                  stack_off: i64, is_aggr: bool, ty: type.IrTypeId, natural: bool) R.Result[bool, str] {
+    val size: u64 = type.byte_size(ctx.types, ty, ctx.tgt)::u64;
     # a register-resident value marshalled by reference (a 128-bit vector at a win64 `ext`
     # boundary, #2058): unlike an aggregate or a scalarized rv64 vector -- already
     # memory-resident, its argop a storage pointer -- the value is in a register, so the
@@ -1310,7 +1313,7 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
     # are exhausted, spilled as an 8-byte pointer (CLASS_VEC_STACK_BYREF).
     if (slot.class == abi.CLASS_VEC_BYREF || slot.class == abi.CLASS_VEC_STACK_BYREF) {
         var addr: u32 = mir.MIR_VREG_NIL;
-        val sr: R.Result[bool, str] = spill_vector_to_temp(ctx, mb, argop, size, ?addr);
+        val sr: R.Result[bool, str] = spill_vector_to_temp(ctx, mb, argop, ty, ?addr);
         if (R.is_err[bool, str](sr)) { ret sr; }
         if (slot.class == abi.CLASS_VEC_STACK_BYREF) {
             val sp: u32 = ctx.tgt.model.stack_ptr_reg::u32;
@@ -1335,6 +1338,14 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
             # the by-value aggregate is copied into the outgoing stack slot from its
             # storage; argop is a pointer to that storage.
             ret context.copy_aggregate(ctx, mb, mir.op_mem_preg(sp, stack_off), argop, size);
+        }
+        # a vector whose register is wider than its footprint writes its own bytes
+        # through the scratch round trip, never in one access: the ISA has no
+        # twelve-byte store, and a store carrying that width is defaulted back down to
+        # the machine word by the encoder - which is how the top lane of a stack-passed
+        # `i32x3` disappeared (#2687). the write twin of `emit_param_slot`'s gather.
+        if (context.subwidth_vector_memory(ctx, ty)) {
+            ret context.store_subwidth_vector(ctx, mb, mir.op_mem_preg(sp, stack_off), argop, ty);
         }
         # the outgoing scalar argument is stored at `[sp + stack_off]`; the stack
         # pointer is fixed after the prologue and points at the base of the outgoing
@@ -1374,7 +1385,7 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
     # for a float-constant immediate) rather than a general-purpose MOV of the GP
     # register that aliases the XMM index.
     if (slot.class == abi.CLASS_FP) {
-        val fw: R.Result[u8, str] = fp_move_width(size);
+        val fw: R.Result[u8, str] = fp_move_width(ctx, ty);
         if (R.is_err[u8, str](fw)) { ret R.err[bool, str](R.unwrap_err[u8, str](fw)); }
         ret context.emit_fmov(ctx, mb, mir.op_preg(slot.reg::u32), argop, R.unwrap_ok[u8, str](fw));
     }
@@ -1388,24 +1399,38 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
 # return the temporary's address in a vreg
 #
 # The win64 ext-boundary marshal (#2058) needs a 128-bit vector's ADDRESS, but the
-# vector is a value in a vector register. This allocates an aligned frame slot (its
-# alignment the vector's own size, so a 16-byte __m128 lands on a 16-byte boundary),
-# stores the whole vector into it at full width (a MOVAPS-class store, the same form
-# `materialize_pieces` uses for an FP chunk), and LEAs the slot address into `out_addr`.
+# vector is a value in a vector register. This allocates a frame slot of the vector's
+# own size at the vector's own alignment (a 16-byte __m128 lands on a 16-byte
+# boundary, which is what the Microsoft convention requires of the temporary it is
+# handed the address of), stores the vector into it at its MEMORY width, and LEAs the
+# slot address into `out_addr`.
+#
+# The alignment is the type's, not its size: they agree for every register-filling
+# vector, and a sub-width one has an alignment that is not its size (an `f32x3` is
+# twelve bytes, four-aligned) - which is not a legal slot alignment at all.
 # ---
 # ctx:      the active lowering context
 # mb:       the MIR block the store / address materialization are appended to
 # val_op:   the vector value operand (a vector-register vreg)
-# size:     the vector's byte size (its temp alignment and store width)
+# ty:       the vector's IR type (the temp's size and alignment, and the store width)
 # out_addr: receives the vreg holding the temporary's address
 # ret:      ok(true) on success, or a loud error
-fun spill_vector_to_temp(ctx: *context.LowerCtx, mb: *mir.MirBlock, val_op: mir.MirOperand, size: u64, out_addr: *u32) R.Result[bool, str] {
+fun spill_vector_to_temp(ctx: *context.LowerCtx, mb: *mir.MirBlock, val_op: mir.MirOperand, ty: type.IrTypeId,
+                         out_addr: *u32) R.Result[bool, str] {
+    val size:  u64 = type.byte_size(ctx.types, ty, ctx.tgt)::u64;
+    val align: u32 = type.byte_align(ctx.types, ty, ctx.tgt);
     val res_key: R.Result[u32, str] = context.new_vreg(ctx, mir.REG_CLASS_GP);
     if (R.is_err[u32, str](res_key)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_key)); }
     val sk: u32 = R.unwrap_ok[u32, str](res_key);
 
-    val sr: R.Result[bool, str] = context.add_spill_slot_aligned(ctx, sk, size, size::u32);
+    val sr: R.Result[bool, str] = context.add_spill_slot_aligned(ctx, sk, size, align);
     if (R.is_err[bool, str](sr)) { ret sr; }
+
+    if (context.subwidth_vector_memory(ctx, ty)) {
+        val ssr: R.Result[bool, str] = context.store_subwidth_vector(ctx, mb, mir.op_mem_slot(sk, 0), val_op, ty);
+        if (R.is_err[bool, str](ssr)) { ret ssr; }
+        ret context.emit_lea_slot(ctx, mb, mir.op_mem_slot(sk, 0), out_addr);
+    }
 
     val st: R.Result[bool, str] = context.emit_store_to_w(ctx, mb, mir.op_mem_slot(sk, 0), val_op, size::u8);
     if (R.is_err[bool, str](st)) { ret st; }
@@ -1413,32 +1438,73 @@ fun spill_vector_to_temp(ctx: *context.LowerCtx, mb: *mir.MirBlock, val_op: mir.
     ret context.emit_lea_slot(ctx, mb, mir.op_mem_slot(sk, 0), out_addr);
 }
 
-# the SSE move width (4 for f32, 8 for f64) for a CLASS_FP scalar of `size` bytes
+# the width of the register move that fills a CLASS_FP slot with `ty`
 #
-# A CLASS_FP slot is always a 4- or 8-byte scalar float; any other size is an
-# ABI-classification bug, reported loudly rather than defaulted to a move width
-# that would silently mis-size the float copy.
+# THE SAME SPLIT #2697 MADE INSIDE A FUNCTION, HERE AT THE CALL BOUNDARY. A vector
+# rides its register WHOLE, so the width of the move is the vector REGISTER's and
+# not the type's: an `f32x3` is twelve bytes in memory and sixteen in a register,
+# and this move touches the register. The memory side of the same value keeps its
+# own twelve bytes, which is what `scalar_mem_move_width` and `copy_aggregate`
+# answer on the stack-passing path.
+#
+# This used to accept the fixed set {4, 8, 16} and refuse everything else. That was
+# indistinguishable from the truth while every vector was exactly sixteen bytes;
+# lane-derived layout (#2695) made a vector's size and its register width differ, and
+# a twelve-byte vector then matched no member of the set. The refusal was honest but
+# total: `fun addv(a: f32x3, b: f32x3) f32x3` could not be compiled at all.
+#
+# Derived from `vector_bits` rather than the constant 16 for the same reason
+# `op_width_of` is: writing 16 would look complete on all five current targets and be
+# wrong on the first one whose vector register differs, which is the shape of the bug
+# being fixed. A non-vector CLASS_FP slot is still a 4- or 8-byte scalar float, any
+# other size being an ABI-classification bug reported loudly rather than defaulted to
+# a move width that would silently mis-size the copy.
+#
+# THIS ANSWERS FOR ONE REGISTER'S WORTH, AND THAT IS THE WHOLE CONTRACT. A vector
+# wider than the register is refused here, and it is refused because the question is
+# malformed for it rather than because the shape is illegal: an over-width vector
+# realizes as a SPLIT, and a split is already a multi-piece `abi.ParamSlot` that
+# `materialize_pieces` walks - the same mechanism an HFA run and a register-plus-stack
+# aggregate use today. So the extension point for #2727 is each convention's
+# `classify_arg` / `classify_return`, which decide how many pieces a value occupies,
+# and this function is asked once per piece and does not change. Nothing here is
+# shaped around 12 bytes, around 16, or around "smaller than the register": the
+# quantities are the value's own extent and the target's own register width, which is
+# what a shape neither a multiple nor a divisor of the register (`f32x5`, whose split
+# has a sub-width tail) needs them to be.
 # ---
-# size: the scalar's byte size
-# ret:  the SSE move width in bytes (4 or 8), or a loud error on an unexpected size
-fun fp_move_width(size: u64) R.Result[u8, str] {
-    if (size == 4)  { ret R.ok[u8, str](4); }
-    if (size == 8)  { ret R.ok[u8, str](8); }
-    # a 128-bit vector rides the vector register whole (#1965): a one-member
-    # short-vector aggregate / SSE-class piece moves at the full 16-byte width, which
-    # each backend's FP move encoder realizes (a NEON Q move, an SSE MOVAPS).
-    if (size == 16) { ret R.ok[u8, str](16); }
-    ret R.err[u8, str]("mir.abi.fp_move_width: CLASS_FP scalar of unsupported size (expected 4, 8, or 16 bytes)");
+# ctx: the active lowering context (supplies the target's vector register width)
+# ty:  the value's IR type
+# ret: the register move width in bytes, or a loud error on an unexpected size
+fun fp_move_width(ctx: *context.LowerCtx, ty: type.IrTypeId) R.Result[u8, str] {
+    val size: u64 = type.byte_size(ctx.types, ty, ctx.tgt)::u64;
+    if (context.value_is_vector(ctx, ty)) {
+        val vw: u64 = (ctx.tgt.model.vector_bits / 8)::u64;
+        if (vw == 0 || size > vw) {
+            ret R.err[u8, str]("mir.abi.fp_move_width: vector wider than the target's vector register; an over-width vector's placement is a multi-piece split the convention classifier must decide");
+        }
+        ret R.ok[u8, str](vw::u8);
+    }
+    if (size == 4) { ret R.ok[u8, str](4); }
+    if (size == 8) { ret R.ok[u8, str](8); }
+    ret R.err[u8, str]("mir.abi.fp_move_width: CLASS_FP scalar of unsupported size (expected 4 or 8 bytes)");
 }
 
 # capture a value passed / returned in `slot`'s canonical register into `dst` vreg.
-# a 128-bit vector (a CLASS_FP slot of 16 bytes) copies at its full 16-byte width so the
-# reg-reg move is a MOVAPS / NEON Q move, not a 64-bit MOVSD that drops lanes 2-3 when
-# the vreg does not coalesce onto the incoming register (#2053). every scalar -- GP or
-# float -- keeps the machine-word move it always used, so its codegen is byte-identical.
-fun capture_slot_reg(ctx: *context.LowerCtx, mb: *mir.MirBlock, dst: u32, slot: abi.ParamSlot, size: u64) R.Result[bool, str] {
-    if (slot.class == abi.CLASS_FP && size == 16) {
-        ret context.emit_fmov(ctx, mb, mir.op_vreg(dst), mir.op_preg(slot.reg::u32), 16);
+# a vector in a CLASS_FP slot copies at the VECTOR REGISTER's width so the reg-reg move
+# is a MOVAPS / NEON Q move, not a 64-bit MOVSD that drops lanes 2-3 when the vreg does
+# not coalesce onto the incoming register (#2053). every scalar -- GP or float -- keeps
+# the machine-word move it always used, so its codegen is byte-identical.
+#
+# The test is that the value IS a vector, not that it measures 16 bytes: a sub-width
+# vector rides the same whole register and drops the same lanes without it, and an
+# HFA / mixed aggregate that happens to measure 16 never reaches here (it flows by
+# address through `materialize_pieces`).
+fun capture_slot_reg(ctx: *context.LowerCtx, mb: *mir.MirBlock, dst: u32, slot: abi.ParamSlot, ty: type.IrTypeId) R.Result[bool, str] {
+    if (slot.class == abi.CLASS_FP && context.value_is_vector(ctx, ty)) {
+        val fw: R.Result[u8, str] = fp_move_width(ctx, ty);
+        if (R.is_err[u8, str](fw)) { ret R.err[bool, str](R.unwrap_err[u8, str](fw)); }
+        ret context.emit_fmov(ctx, mb, mir.op_vreg(dst), mir.op_preg(slot.reg::u32), R.unwrap_ok[u8, str](fw));
     }
     ret context.emit_mov(ctx, mb, mir.op_vreg(dst), mir.op_preg(slot.reg::u32));
 }
@@ -1536,8 +1602,9 @@ fun record_outgoing_size(ctx: *context.LowerCtx, bytes: i64) {
 # slot:    the return value's classified slot
 # dst:     the result vreg, or the result-storage pointer for an aggregate
 # is_aggr: whether the return is an aggregate flowing by address
+# ty:      the return value's IR type (answers the capture move's width)
 # ret:     ok(true) on success, or a loud error
-fun emit_ret_slot_to_vreg(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, dst: u32, is_aggr: bool, size: u64) R.Result[bool, str] {
+fun emit_ret_slot_to_vreg(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, dst: u32, is_aggr: bool, ty: type.IrTypeId) R.Result[bool, str] {
     if (is_aggr) {
         var plan: PiecePlan;
         plan.store      = true;
@@ -1548,7 +1615,7 @@ fun emit_ret_slot_to_vreg(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.P
         plan.stack_ok   = false;
         ret materialize_pieces(ctx, mb, slot, plan);
     }
-    ret capture_slot_reg(ctx, mb, dst, slot, size);
+    ret capture_slot_reg(ctx, mb, dst, slot, ty);
 }
 
 # emit the entry-block ABI pre-coloring for incoming parameters
@@ -1617,7 +1684,7 @@ pub fun lower_params(ctx: *context.LowerCtx, mb: *mir.MirBlock) R.Result[bool, s
         # parameter is out of scope -- its spill-slot store / reconstruction may
         # still be needed even when the pointer vreg is unread -- so it always lowers.
         if (pag || param_has_use(ctx.fn, i)) {
-            val er: R.Result[bool, str] = emit_param_slot(ctx, mb, slot, pv, slot.size, slot.offset, pag);
+            val er: R.Result[bool, str] = emit_param_slot(ctx, mb, slot, pv, pty, slot.offset, pag);
             if (R.is_err[bool, str](er)) {
                 sig_layout_free(ctx, ?layout);
                 ret er;
@@ -1647,12 +1714,14 @@ pub fun lower_params(ctx: *context.LowerCtx, mb: *mir.MirBlock) R.Result[bool, s
 # mb:        the entry MIR block the move(s) are appended to
 # slot:      the parameter's classified slot
 # pv:        the parameter vreg, rebound to a storage pointer for an aggregate
-# size:      the parameter's byte size (the spill-slot size for an aggregate)
+# ty:        the parameter's IR type (the spill-slot size for an aggregate, the stack
+#            access width for a scalar, the register width for a vector)
 # stack_off: the slot's incoming stack base (a STACK slot, or a split's stack chunk)
 # is_aggr:   whether the parameter is an aggregate flowing by address
 # ret:       ok(true) on success, or a loud error
-fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, pv: u32, size: u64,
+fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, pv: u32, ty: type.IrTypeId,
                     stack_off: i64, is_aggr: bool) R.Result[bool, str] {
+    val size: u64 = type.byte_size(ctx.types, ty, ctx.tgt)::u64;
     # incoming stack parameters are addressed off the ISA's frame pointer at the
     # machine model's incoming-argument base (`[fp + incoming_arg_base + off]`): the
     # frame-pointer register is named through the ISA vtable and the base offset
@@ -1675,11 +1744,20 @@ fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSl
         }
         # a scalar stack argument lives above the return address and saved frame
         # pointer, addressed through the physical frame pointer at the running offset.
+        #
+        # a vector whose register is wider than its footprint gathers its own bytes
+        # through a scratch, never in one access: reading the register's width would
+        # take four bytes the incoming slot does not own, and a move carrying the
+        # footprint's width is defaulted back down to the machine word by the encoder.
+        if (context.subwidth_vector_memory(ctx, ty)) {
+            ret context.load_subwidth_vector(ctx, mb, mir.op_vreg(pv),
+                                             mir.op_mem_preg(fp, arg_base + stack_off), ty);
+        }
         # the read is the scalar's own width when that exceeds the machine word, so an
-        # 8-bit target loads all of a wide parameter rather than its low byte.
-        # the read twin of `emit_arg_slot`'s store: a declared parameter is always a
-        # fixed one, so a platform that sizes a fixed stack slot naturally reads exactly
-        # the parameter's own bytes and not the neighbouring argument's.
+        # 8-bit target loads all of a wide parameter rather than its low byte. the read
+        # twin of `emit_arg_slot`'s store: a declared parameter is always a fixed one, so
+        # a platform that sizes a fixed stack slot naturally reads exactly the
+        # parameter's own bytes and not the neighbouring argument's.
         ret context.emit_mov_w(ctx, mb, mir.op_vreg(pv), mir.op_mem_preg(fp, arg_base + stack_off),
                                scalar_mem_move_width(ctx.tgt.model.gpr_width, size,
                                                      natural_stack_slot(ctx.tgt, false)));
@@ -1703,7 +1781,7 @@ fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSl
         plan.stack_ok   = true;
         ret materialize_pieces(ctx, mb, slot, plan);
     }
-    ret capture_slot_reg(ctx, mb, pv, slot, size);
+    ret capture_slot_reg(ctx, mb, pv, slot, ty);
 }
 
 # report whether IR parameter `param_ix` is read anywhere in the function body
@@ -1860,7 +1938,7 @@ pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.
         # the SSE class, so the encoder dispatches the move on operand class and emits
         # MOVSS / MOVSD (or MOVABS + MOVQ for a float-constant immediate) rather than a
         # general-purpose MOV of RAX, which aliases XMM0's index.
-        val fw: R.Result[u8, str] = fp_move_width(rsz);
+        val fw: R.Result[u8, str] = fp_move_width(ctx, rt);
         if (R.is_err[u8, str](fw)) { ret R.err[bool, str](R.unwrap_err[u8, str](fw)); }
         val mr: R.Result[bool, str] = context.emit_fmov(ctx, mb, mir.op_preg(slot.reg::u32), rvop, R.unwrap_ok[u8, str](fw));
         if (R.is_err[bool, str](mr)) { ret mr; }

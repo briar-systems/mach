@@ -177,6 +177,17 @@ naming the type that closes it.
 - `align` does not apply to `def` aliases (transparent, no layout of their
   own).
 
+The alignment holds for **every** object of the type, including a local on the
+stack. An ABI only promises the stack 16 bytes at a call boundary, so a function
+holding a local that asks for more gets a prologue that masks the stack pointer
+down to the largest alignment its frame contains, and addresses its locals and
+spills from there. The cost falls on those functions alone: one masking
+instruction and up to `N - 16` bytes of frame. A function with nothing
+over-aligned emits exactly the prologue it always did.
+
+The frame pointer stays where the ABI put it, so incoming stack arguments, the
+frame record and a stack walk through it are unaffected.
+
 ### `packed` — no padding
 
 Lays a `rec` or `uni` out with no padding: every field sits immediately after the
@@ -258,12 +269,23 @@ an atomic has to a field, and there is no pointer to hand it.
 **Vector fields.** A vector in a packed record is refused for now, including one
 reached through an array or a nested record. The reason is evidence rather than
 arithmetic: an unaligned **scalar** access is measured on real hardware, and that
-measurement is what `#[packed]` rests on, but there is no equivalent measurement for a
-vector — the widest access, the one with alignment-requiring ISA forms, and the case
-where an emulator is least trustworthy about what silicon does.
-[#2687](https://github.com/briar-systems/mach/issues/2687) carries the other half, a
-lane-dependent vector footprint through aggregate layout and ABI classification. This
-is a sequencing decision and is expected to be lifted, not a permanent rule.
+measurement is what `#[packed]` rests on.
+
+The vector measurement now exists too. `int/surface/unaligned-vector` stores and
+loads `i32x4`, `f32x4`, `i32x3` and `f32x3` at deliberately misaligned offsets,
+checks every lane by hand against a byte image rather than through the access being
+measured, and asserts a sentinel in the bytes on both sides of each extent. It is
+**correct in both profiles on every native leg**: `linux-arm64` on `ubuntu-24.04-arm`,
+which is the row that matters because aarch64 has 128-bit forms with alignment
+requirements, plus `linux` and `windows` on x86-64. Nothing faults, no lane is
+dropped, and no neighbouring byte is disturbed. `linux-riscv64` also passes but is
+not evidence: it runs under qemu-user, and riscv64 declares no 128-bit vector
+support, so the access there is a scalar expansion rather than a vector access.
+
+What the refusal still waits on is the other half,
+[#2687](https://github.com/briar-systems/mach/issues/2687) — a lane-dependent vector
+footprint through aggregate layout and ABI classification. This is a sequencing
+decision and is expected to be lifted, not a permanent rule.
 
 **Interface blocks.** `packed` cannot apply to a `#[uniform]` or `#[storage]` block:
 its member offsets are fixed by the std140 / std430 layout rules and emitted as
@@ -553,20 +575,27 @@ stage's outputs line up with the next stage's inputs: the producer's
 `builtin` names a value the pipeline supplies or consumes instead of one a
 location carries. The accepted set is closed:
 
-| Value                 | Meaning                        | Direction |
-|-----------------------|--------------------------------|-----------|
-| `"position"`          | clip-space vertex position     | written   |
-| `"point_size"`        | rasterized point size          | written   |
-| `"vertex_index"`      | index of the current vertex    | read      |
-| `"instance_index"`    | index of the current instance  | read      |
-| `"frag_coord"`        | fragment window coordinate     | read      |
-| `"global_invocation"` | compute global invocation id   | read      |
-| `"local_invocation"`  | compute local invocation id    | read      |
-| `"workgroup_id"`      | compute workgroup id           | read      |
+| Value                 | Meaning                        | Type    | Direction |
+|-----------------------|--------------------------------|---------|-----------|
+| `"position"`          | clip-space vertex position     | `f32x4` | written   |
+| `"point_size"`        | rasterized point size          | `f32`   | written   |
+| `"vertex_index"`      | index of the current vertex    | `u32`   | read      |
+| `"instance_index"`    | index of the current instance  | `u32`   | read      |
+| `"frag_coord"`        | fragment window coordinate     | `f32x4` | read      |
+| `"global_invocation"` | compute global invocation id   | `u32x3` | read      |
+| `"local_invocation"`  | compute local invocation id    | `u32x3` | read      |
+| `"workgroup_id"`      | compute workgroup id           | `u32x3` | read      |
 
 The direction is a property of the built-in, not something you restate — a stage
 writes its position and reads what the pipeline hands it — so there is no
 input/output marker to pair with `builtin`, and none that could disagree with it.
+
+The **type** is a property of the built-in too, and it is a requirement rather
+than a suggestion: the pipeline binds the variable itself, so a wider or narrower
+one is an invalid module rather than a wasteful one. Declaring a built-in at any
+other type is a compile error naming both the declared type and the required one.
+The two integer rows accept `i32` as well as `u32`, because the compiler carries
+an integer's width and not its sign and the emitted type is sign-less either way.
 
 `uniform` binds a read-only block by descriptor set and binding. Its type **must
 be a `rec`**: a uniform is a block with a host-visible layout, and a bare scalar

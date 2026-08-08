@@ -47,11 +47,15 @@
 # DEPENDENCY RESOLUTION. a case declares `ref = "branch/main"` for mach-std, which
 # tracks its latest RELEASE, and the harness resolves it fresh: that is deliberate,
 # and it is what catches a downstream break early. `--deps pin` states the other
-# intent instead, resolving every case to the mach-std commit THIS REPO'S OWN
-# mach.lock records - the one the compiler in the same checkout was built against -
-# so a release-gate run is reproducible and a bisect over mach commits is sound
-# (#2592). the pin is the root lock rather than a file of its own precisely so it
-# cannot rot against the compiler's: bumping the dependency bumps both at once.
+# intent instead, resolving every case to a recorded commit - for mach-std the one
+# THIS REPO'S OWN mach.lock records, which is the one the compiler in the same
+# checkout was built against - so a release-gate run is reproducible and a bisect
+# over mach commits is sound (#2592). mach-std pins to the root lock rather than to
+# a copy precisely so it cannot rot against the compiler's: bumping the dependency
+# bumps both at once. but the root lock is written from the ROOT manifest, so it can
+# only ever cover the compiler's own dependency closure, and int builds a larger
+# one - int/deps.lock covers the difference, today mach-shader. lib/deps.sh holds
+# the full account and lib/check-deps.sh enforces it on every PR (#2729).
 #
 # float resolves ONCE PER RUN, not once per case (#2619). the first case to declare a
 # dep resolves it fresh and every case after it is handed that same commit, so a run
@@ -114,6 +118,7 @@ done
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$here/lib/case.sh"
 . "$here/lib/produce.sh"
+. "$here/lib/deps.sh"
 
 # resolve the compiler to an absolute path; cases are built from their own dirs.
 case "$compiler" in
@@ -136,37 +141,8 @@ if [ ! -f "$compiler" ] && [ -f "$compiler$exe" ]; then
     compiler=$compiler$exe
 fi
 
-# dep_field <toml> <name> <key> — the value of <key> inside the [dep.<name>] table
-# of a mach.toml or mach.lock, or empty when the file, the table, or the key is
-# absent. one reader for both files: they spell the same table differently (a
-# manifest's `git =` is a lock's `url =`) but the table structure is identical, and a
-# second parser for it is the drifting-parallel-enumeration shape this repo already
-# treats as a defect family (see case.sh's header).
-dep_field() {
-    [ -f "$1" ] || return 0
-    awk -v want="$2" -v key="$3" '
-        /^\[/ { in_dep = 0 }
-        /^\[dep\./ {
-            name = $0; sub(/^\[dep\./, "", name); sub(/\]$/, "", name)
-            in_dep = (name == want); next
-        }
-        in_dep && $1 == key && $2 == "=" {
-            v = $0; sub(/^[^=]*=[[:space:]]*"/, "", v); sub(/"[[:space:]]*$/, "", v)
-            print v; exit
-        }
-    ' "$1"
-}
-
-# lock_commit <mach.lock> <name> — the commit mach.lock records for [dep.<name>].
-lock_commit() {
-    dep_field "$1" "$2" commit
-}
-
-# case_deps <case-dir> — the names of the [dep.<name>] tables a case declares.
-case_deps() {
-    awk '/^\[dep\./ { n = $0; sub(/^\[dep\./, "", n); sub(/\]$/, "", n); print n }' \
-        "$1/mach.toml"
-}
+# dep_field, lock_commit, case_deps and the pin sources live in lib/deps.sh, shared
+# with check-deps.sh and update-deps.sh so the three agree on what a lock covers.
 
 # prepare_case_deps <case-dir> — settle what the case's `dep pull` will resolve.
 #
@@ -185,15 +161,13 @@ case_deps() {
 #           the removal a tree that had ever run pinned would keep resolving that pin
 #           silently, which is the defect this issue names, reintroduced locally.
 #
-#   pin   — write the lock from THIS REPO'S OWN mach.lock, so a case resolves the
-#           same mach-std commit the compiler in the same checkout was built against.
-#           deliberately not a new pin file: that would be a second thing to bump and
-#           could rot against the compiler's, where the root lock is already advanced
-#           deliberately and already means "the mach-std this release is built on".
-# root_dep_commit <name> — the commit this repo's own mach.lock records for <name>.
-root_dep_commit() {
-    lock_commit "$root_lock" "$1"
-}
+#   pin   — write the lock from the pin sources, so a case resolves the same commit
+#           the compiler in the same checkout was built against. for mach-std that
+#           is THIS REPO'S OWN mach.lock, deliberately rather than a copy: a copy
+#           would be a second thing to bump and could rot against the compiler's.
+#           int/deps.lock covers only what the root manifest does not declare, which
+#           the root lock therefore cannot record at all - lib/deps.sh's header has
+#           the full account, and #2729 is what that gap cost.
 
 # run_dep_commit <name> — the commit THIS RUN has already resolved for <name>, if any.
 run_dep_commit() {
@@ -256,8 +230,9 @@ prepare_case_deps() {
         fi
         return 0
     fi
-    if ! case_lock_from "$dir" root_dep_commit; then
-        echo "run.sh: --deps pin: mach.lock records no commit for git dep '$missing_dep', declared by ${dir#"$here"/}" >&2
+    if ! case_lock_from "$dir" pin_dep_commit; then
+        echo "run.sh: --deps pin: neither mach.lock nor int/deps.lock records a commit for git dep '$missing_dep', declared by ${dir#"$here"/}" >&2
+        echo "run.sh: run 'bash int/lib/check-deps.sh' to see this without building, and update-deps.sh to fix it" >&2
         return 1
     fi
 }
@@ -353,8 +328,6 @@ if [ -n "$runmode_override" ] && [ "$runmode_override" != "$runmode" ]; then
     runmode=$runmode_override
 fi
 
-root_lock=$here/../mach.lock
-
 # the run's dependency record. every PASS/FAIL line already names the resolved commit
 # (#2387), but a log line is recoverable only from scrollback, and the question this
 # answers - "what did the run that cut this tag actually compile against" - is asked
@@ -369,13 +342,37 @@ mkdir -p "$here/out"
 # run's resolution - float still tracks the tip, it just does so once (#2619).
 run_deps=$here/out/run-deps.txt
 : >"$run_deps"
+
+# name the resolution out loud, to stdout and into the manifest. a run that pinned
+# and a run that floated differ in nothing a reader can see afterwards except this,
+# and #2729 is the case where the pinned lane was believed to be running when it had
+# never once started. under pin, every entry of both locks is listed: which file
+# supplied which commit is the fact that makes a pinned run reproducible later.
+deps_banner() {
+    if [ "$deps_mode" = float ]; then
+        echo "deps: float - every ref resolved fresh by 'mach dep pull', no lock consulted"
+        return 0
+    fi
+    echo "deps: pin - commits taken from mach.lock, then int/deps.lock"
+    for lockpath in "$root_lock" "$int_lock"; do
+        label=mach.lock
+        [ "$lockpath" = "$int_lock" ] && label=int/deps.lock
+        if [ ! -f "$lockpath" ]; then
+            echo "deps:   $label (absent)"
+            continue
+        fi
+        for name in $(dep_names "$lockpath"); do
+            echo "deps:   $label $name@$(lock_commit "$lockpath" "$name")"
+        done
+    done
+}
+
+deps_banner
 {
     echo "# int dependency resolution"
     echo "# target: $target"
     echo "# deps-mode: $deps_mode"
-    if [ "$deps_mode" = pin ]; then
-        echo "# pin source: mach.lock (this repo)"
-    fi
+    deps_banner | sed 's/^deps:/#/'
     echo "# columns: case profile dep@commit..."
 } >"$manifest"
 
@@ -403,8 +400,8 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
     # hold identically on every ELF ISA) and per-build-target for structural producers
     # (their fact is format-specific).
     case "$case_run" in
-        exec|relro-fault|panic-exit|debuginfo) golden="$dir/expect.txt" ;;
-        *)                                     golden="$dir/expect.$build_target.txt" ;;
+        exec|relro-fault|panic-exit|debuginfo|varloc-fbreg) golden="$dir/expect.txt" ;;
+        *)                                                 golden="$dir/expect.$build_target.txt" ;;
     esac
 
     # once per case, not per profile: `dep pull` honors the lock left by the first
@@ -510,12 +507,12 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
                 continue
             fi
 
-            # the debuginfo producer inspects the artifact built with and without `-g`:
+            # a debug-info producer inspects the artifact built with and without `-g`:
             # the default build above is the no-`-g` one; build the `-g` twin here (same
             # compiler / target / profile / flags, plus `-g`) and hand its path to the
             # producer as an extra argument. every other producer inspects only `$bin`.
             gbin=
-            if [ "$case_run" = debuginfo ]; then
+            if [ "$case_run" = debuginfo ] || [ "$case_run" = varloc-fbreg ]; then
                 gbin="$dir/out/int/prog-g$exe"
                 if ! (cd "$dir" && $buildcc build . --target "$build_target" --profile "$profile" $case_build_flags -g -o "out/int/prog-g$exe") >"$tmp/build-g.log" 2>&1; then
                     echo "FAIL $flabel (build -g)"

@@ -77,6 +77,13 @@
 #                 not alias live line/location metadata, and live names symbolize.
 #                 requires llvm-dwarfdump, llvm-symbolizer, and readelf; it runs only
 #                 on the ELF debug-info legs, which install them.
+#   varloc-fbreg— build the case with and without `-g` (run.sh builds both) and cross
+#                 the two halves of a frame-slot variable location against each other:
+#                 every `DW_OP_fbreg` offset must name an address the function's own
+#                 emitted code addresses from the same frame-base register. reading
+#                 the offset alone cannot see #2759, because a producer that derives
+#                 it a second way is self-consistent under the bug. requires
+#                 llvm-dwarfdump and llvm-objdump.
 #   spirv-val   — validate every `.spv` module a finished-module target delivered
 #                 with the Khronos validator (spirv-tools), in its universal
 #                 environment. `spirv-val-vulkan` is the same check under the
@@ -2049,7 +2056,8 @@ elf_seg_identical() {
 # produce_debuginfo <runmode> <target> <nog_binary> <g_binary>
 # the binary-inspection producer for the debuginfo case kind (#2039): asserts, purely
 # host-side over the artifacts run.sh built with and without `-g`, that (1) the
-# standard structural validator accepts the whole `-g` image, (1b) a real consumer
+# standard structural validator accepts the whole `-g` image and which warning classes
+# it reports while doing so, (1b) a real consumer
 # (addr2line, i.e. libbfd) decodes the line table without a diagnostic and resolves the
 # entry point to a name, (2) `-g` is loadable-byte additive, and (3) duplicate generic,
 # comptime-value, and pack instances retain
@@ -2073,10 +2081,41 @@ produce_debuginfo() {
         echo "int: debuginfo: addr2line not found (install 'binutils')" >&2; return 2
     }
 
-    if "$dd_tool" --verify "$g" >/dev/null 2>&1; then
-        echo "dwarfdump_verify=clean"
-    else
+    # --verify EXITS ZERO ON WARNINGS (#2755), so reading only its status collapsed "no
+    # diagnostics at all" onto "no errors, and a wall of warnings". That is how a
+    # validator stops validating: the next real warning lands in a stream nobody reads.
+    # The observable is therefore the stream. `errors` is reported first because an
+    # error subsumes a warning, and each residual warning TEXT is listed - sorted,
+    # deduplicated, with the per-CU `[0x...]` offset elided - so a failure names itself
+    # in the diff instead of reading `warnings`.
+    #
+    # ONE warning class is expected and filtered, with its reason: DWARF 5 §6.2.4
+    # numbers file entries from 0 while §6.2.2 still gives the line state machine's
+    # `file` register an initial value of 1, and binutils resolves that in favour of
+    # §6.2.2. So a single-file CU must declare its source at slot 0 AND at slot 1 or
+    # libbfd rejects the whole section ("mangled line number section (bad file number)",
+    # #2582) - measured on binutils 2.47 against clang's own single-entry `-gdwarf-5`
+    # output as well as ours. gcc emits the duplicate and llvm-dwarfdump warns on gcc's
+    # output identically. It is also validator-version dependent: llvm-dwarfdump 18 does
+    # not report it and 22 does, so leaving it in the stream would make the golden a
+    # statement about the runner's llvm package. Every OTHER warning, of any class,
+    # still fails the case.
+    dd_expected='\.debug_line\[.*\]\.prologue\.file_names\[1\] is a duplicate of file_names\[0\]'
+    dd_out=$("$dd_tool" --verify "$g" 2>&1)
+    # `|| true` because an empty result is the expected outcome of a filter rather than
+    # a failure, and run.sh runs under `set -e`.
+    dd_warn=$(printf '%s\n' "$dd_out" | sed -n 's/^warning: //p' \
+        | { grep -v -E "$dd_expected" || true; } \
+        | sed -e 's/\[0x[0-9a-fA-F]*\]/[]/g' | sort -u)
+    if printf '%s\n' "$dd_out" | grep -q '^error:'; then
         echo "dwarfdump_verify=errors"
+    elif [ -n "$dd_warn" ]; then
+        echo "dwarfdump_verify=warnings"
+    else
+        echo "dwarfdump_verify=clean"
+    fi
+    if [ -n "$dd_warn" ]; then
+        printf '%s\n' "$dd_warn" | while IFS= read -r w; do echo "dwarfdump_warning=$w"; done
     fi
 
     # CONSUMER-SIDE DECODE (#2582). --verify above checks structural and reference
@@ -2196,9 +2235,11 @@ produce_vector_emit() {
     dis_case_objects vector-emit "$3" | vector_emit_scan
 }
 
-# dis_case_objects <producer> <binary>
+# dis_case_objects <producer> <binary> [objdump-flag]
 # disassemble the case's OWN module objects (not its dependencies') to stdout, the
-# shared front half of every emitted-shape producer.
+# shared front half of every emitted-shape producer. the optional third argument is
+# one extra objdump flag - `-r`, for a producer whose observable is which SYMBOL an
+# instruction references rather than which instruction it is.
 #
 # the objects rather than the linked binary: mach's linker emits no symbol table, so
 # per-function attribution exists only before the link. they sit beside the artifact
@@ -2208,6 +2249,7 @@ produce_vector_emit() {
 dis_case_objects() {
     who=$1
     bin=$2
+    extra=${3:-}
     dir=$(dirname "$(dirname "$(dirname "$bin")")")
     id=$(sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$dir/mach.toml" | head -1)
     if [ -z "$id" ]; then
@@ -2221,7 +2263,7 @@ dis_case_objects() {
         echo "int: $who: llvm-objdump not found (install the 'llvm' package)" >&2; return 2
     }
     find "$objdir" -name '*.o' | sort | while IFS= read -r o; do
-        "$tool" -d --no-show-raw-insn "$o"
+        "$tool" -d --no-show-raw-insn ${extra:+"$extra"} "$o"
     done
 }
 
@@ -2243,6 +2285,94 @@ dis_case_objects() {
 # pins the release profile and keeps its kernels under register pressure.
 produce_float_emit() {
     dis_case_objects float-emit "$3" | float_emit_scan
+}
+
+# produce_const_pool <runmode> <target> <binary>
+# the CONSTANT-POOL observable (#2248, #2700): which pool entries the module holds
+# and which of them each function references.
+#
+# the same argument as vector-emit and float-emit. a back end that stops pooling
+# rebuilds every constant from instructions and still computes exactly the right
+# answer, so a run-and-compare case is vacuously green against it; and a pool whose
+# interning key stopped deduplicating emits one entry per USE while every value it
+# loads stays correct. neither is visible in a result, only in the emitted shape.
+#
+# two facts, kept in separate accumulators so neither can mask the other:
+#   entries=<n>       distinct pool entries in the module - the dedup observable. a
+#                     key that stopped merging raises it; one that merged too much
+#                     lowers it, and the sibling exec case then reports a wrong value
+#   <fn> pool=<n>     distinct entries the function references - the pooling
+#                     observable. a back end that reverted to rebuilding drops it to
+#                     zero, and a constant the cost rule declines to pool (a zero,
+#                     or a pattern one instruction builds) never contributes to it
+#
+# a reference is counted by NAME, not by relocation record, so the number means the
+# same thing on all three ISAs: x86-64 spells one reference as a single PC32 against
+# a rip-relative operand, while aarch64 and riscv64 each spell it as a HI/LO
+# relocation pair. needs llvm-objdump.
+produce_const_pool() {
+    dis_case_objects const-pool "$3" -r | const_pool_scan
+}
+
+# const_pool_scan — read a `-d -r` disassembly on stdin and print the pool observable
+const_pool_scan() {
+    awk '
+    function demangle(s,   i, len, c, out) {
+        if (substr(s, 1, 2) != "_M") { return s }
+        i = 3
+        out = ""
+        while (i <= length(s)) {
+            c = substr(s, i, 1)
+            if (c == "N") { i++; continue }
+            if (c !~ /[0-9]/) { return s }
+            len = 0
+            while (i <= length(s) && substr(s, i, 1) ~ /[0-9]/) { len = len * 10 + substr(s, i, 1); i++ }
+            out = substr(s, i, len)
+            i += len
+        }
+        if (out == "") { return s }
+        return out
+    }
+    /file format/ {
+        if      ($0 ~ /x86-64/)   { isa = "x86_64" }
+        else if ($0 ~ /aarch64/)  { isa = "aarch64" }
+        else if ($0 ~ /riscv/)    { isa = "riscv64" }
+        else                      { bad = $0 }
+        # a pool symbol name is per-MODULE, so the same name in two objects is two
+        # entries. qualify every name with the object it came from before counting.
+        obj++
+        next
+    }
+    /^[0-9a-f]+ <.*>:$/ {
+        sym = $0
+        sub(/^[0-9a-f]+ </, "", sym)
+        sub(/>:$/, "", sym)
+        sym = demangle(sym)
+        if (!(sym in seen)) { names[++n] = sym; seen[sym] = 1 }
+        cur = sym
+        next
+    }
+    cur != "" && /R_[A-Z0-9_]+[[:space:]]+\.Lconst\./ {
+        ref = $0
+        sub(/^.*[[:space:]]/, "", ref)
+        sub(/[-+].*$/, "", ref)
+        key = obj ":" ref
+        if (!((cur SUBSEP key) in fnref)) { fnref[cur, key] = 1; fncount[cur]++ }
+        if (!(key in allref))             { allref[key] = 1; entries++ }
+    }
+    END {
+        if (bad != "") { print "int: const-pool: scan hit an unrecognized object format (" bad ")" > "/dev/stderr"; exit 2 }
+        for (i = 2; i <= n; i++) {
+            k = names[i]
+            j = i - 1
+            while (j >= 1 && names[j] > k) { names[j + 1] = names[j]; j-- }
+            names[j + 1] = k
+        }
+        print "arch=" isa
+        print "entries=" entries + 0
+        for (i = 1; i <= n; i++) { print names[i] " pool=" fncount[names[i]] + 0 }
+    }
+    '
 }
 
 # vector_emit_scan — `<function> simd|scalar` per function (see emit_scan)
@@ -2464,6 +2594,140 @@ produce_frame_elision() {
     dis_case_objects frame-elision "$3" | frame_elision_scan
 }
 
+# produce_varloc_fbreg <runmode> <target> <nog_binary> <g_binary>
+# the FRAME-SLOT VARIABLE LOCATION observable (#2759): does a `DW_OP_fbreg` offset name
+# an address the emitted code actually uses for that slot.
+#
+# the offset alone is not evidence. the producer and the encoder each turn one layout
+# fact - the bytes the prologue reserves between the frame pointer and the slot region -
+# into an address, and a producer that derives it a second way is perfectly
+# self-consistent while pointing at the wrong bytes. it agreed with the encoder on
+# x86-64 and aarch64, whose reservation is 0, and was wrong by 16 to 200 bytes on every
+# riscv64 function, which is why nothing saw it. so the observable crosses the two:
+# for each subprogram, every `DW_OP_fbreg` offset must appear as a displacement in some
+# instruction of that same function that names the register `DW_AT_frame_base` names.
+#
+# the two counts are ISA-independent by construction, so the golden is shared:
+#   checked=<n>   offsets crossed. zero would make `unbacked` vacuous, so it is stated
+#   unbacked=<n>  offsets no emitted access backs. the invariant is 0 on every target
+#
+# the displacement set is read coarsely - every integer literal on an instruction line
+# mentioning the frame-base register - because the three ISAs spell a frame access three
+# ways and a large offset is spelled a fourth (materialized into a scratch register
+# first). coarse in the permissive direction only: it can accept an offset it should
+# have rejected, never reject a correct one, and #2759's offsets miss the real set by
+# the whole reservation rather than narrowly. requires llvm-dwarfdump and llvm-objdump.
+produce_varloc_fbreg() {
+    g=$4
+    dd_tool=$(resolve_dwarfdump) || {
+        echo "int: varloc-fbreg: llvm-dwarfdump not found (install the 'llvm' package)" >&2; return 2
+    }
+    od_tool=$(resolve_objdump) || {
+        echo "int: varloc-fbreg: llvm-objdump not found (install the 'llvm' package)" >&2; return 2
+    }
+
+    # one record per subprogram that has a machine range and at least one fbreg
+    # variable: "lo hi framebase-register off,off,..."
+    "$dd_tool" --debug-info "$g" 2>/dev/null | awk '
+        function flush(   i) {
+            if (lo != "" && hi != "" && fb != "" && offs != "") { print lo, hi, fb, offs }
+            lo = ""; hi = ""; fb = ""; offs = ""
+        }
+        /DW_TAG_subprogram/ { flush(); next }
+        # only the subprogram own range: an inlined-subroutine or lexical-block DIE
+        # nested inside it carries a low_pc too, and it is printed after the frame base.
+        /DW_AT_low_pc/  { if (fb == "" && match($0, /0x[0-9a-f]+/)) { lo = substr($0, RSTART, RLENGTH) } next }
+        /DW_AT_high_pc/ { if (fb == "" && match($0, /0x[0-9a-f]+/)) { hi = substr($0, RSTART, RLENGTH) } next }
+        # the DWARF register NUMBER, not the name llvm-dwarfdump prints beside it: it
+        # spells the aarch64 frame pointer W29 while the disassembler spells it x29.
+        /DW_AT_frame_base/ { if (match($0, /DW_OP_reg[0-9]+/)) { fb = substr($0, RSTART + 9, RLENGTH - 9) } next }
+        /DW_OP_fbreg/ {
+            s = $0
+            while (match(s, /DW_OP_fbreg [+-]?[0-9]+/)) {
+                o = substr(s, RSTART, RLENGTH); sub(/^DW_OP_fbreg /, "", o); sub(/^\+/, "", o)
+                offs = (offs == "") ? o : offs "," o
+                s = substr(s, RSTART + RLENGTH)
+            }
+            next
+        }
+        END { flush() }
+    ' > "$g.fns" || return 1
+
+    "$od_tool" -d --no-show-raw-insn "$g" 2>/dev/null > "$g.dis" || return 1
+
+    case "$2" in
+        *riscv64*) fb_isa=riscv64 ;;
+        *arm64*|*aarch64*) fb_isa=aarch64 ;;
+        *) fb_isa=x86_64 ;;
+    esac
+
+    awk -v fns="$g.fns" -v isa="$fb_isa" '
+        function hex2dec(h,   v, i, c, d) {
+            sub(/^0x/, "", h); v = 0
+            for (i = 1; i <= length(h); i++) {
+                c = tolower(substr(h, i, 1)); d = index("0123456789abcdef", c) - 1
+                v = v * 16 + d
+            }
+            return v
+        }
+        # the frame-base register as the disassembler spells it, from the DWARF number.
+        # only two can appear: the frame pointer, and the stack pointer for a function
+        # with no frame record (`dwarf.frame_base_omit_reg`).
+        function disname(n) {
+            if (isa == "riscv64") { if (n == 8)  { return "s0"   } if (n == 2)  { return "sp"   } }
+            if (isa == "aarch64") { if (n == 29) { return "x29"  } if (n == 31) { return "sp"   } }
+            if (isa == "x86_64")  { if (n == 6)  { return "%rbp" } if (n == 7)  { return "%rsp" } }
+            return ""
+        }
+        BEGIN {
+            n = 0
+            while ((getline line < fns) > 0) {
+                split(line, f, " ")
+                r = disname(f[3] + 0)
+                if (r == "") { continue }
+                n++; flo[n] = hex2dec(f[1]); fhi[n] = hex2dec(f[2]); freg[n] = r; foffs[n] = f[4]
+            }
+            close(fns)
+        }
+        # "  4076a0: sd a0, -0x68(s0)"
+        /^[ ]*[0-9a-f]+:/ {
+            addr = $1; sub(/:$/, "", addr); a = hex2dec("0x" addr)
+            for (i = 1; i <= n; i++) {
+                if (a >= flo[i] && a < fhi[i]) {
+                    if (index($0, freg[i]) == 0) { break }
+                    s = $0
+                    while (match(s, /-?0x[0-9a-f]+/)) {
+                        t = substr(s, RSTART, RLENGTH)
+                        neg = (substr(t, 1, 1) == "-")
+                        v = hex2dec(neg ? substr(t, 2) : t); if (neg) { v = -v }
+                        seen[i "/" v] = 1
+                        s = substr(s, RSTART + RLENGTH)
+                    }
+                    break
+                }
+            }
+        }
+        END {
+            checked = 0; unbacked = 0
+            for (i = 1; i <= n; i++) {
+                c = split(foffs[i], o, ",")
+                for (j = 1; j <= c; j++) {
+                    checked++
+                    if (!((i "/" (o[j] + 0)) in seen)) { unbacked++ }
+                }
+            }
+            # the count itself is ISA-dependent (the three back ends put different
+            # variables in slots), so only its being nonzero is stated - without which
+            # `unbacked=0` would be vacuous. the invariant is exact.
+            print "varloc_fbreg_checked=" (checked > 0 ? "nonzero" : "zero")
+            print "varloc_fbreg_unbacked=" unbacked
+        }
+    ' "$g.dis"
+    rc=$?
+    rm -f "$g.fns" "$g.dis"
+    return $rc
+}
+
 
 # produce <run> <runmode> <target> <binary> [<g_binary>]
 # dispatches to the producer named by <run>, forwarding the remaining arguments. the
@@ -2502,7 +2766,9 @@ produce() {
         vector-emit) produce_vector_emit "$@" ;;
         vector-lanes) produce_vector_lanes "$@" ;;
         frame-elision) produce_frame_elision "$@" ;;
+        varloc-fbreg) produce_varloc_fbreg "$@" ;;
         float-emit)  produce_float_emit "$@" ;;
+        const-pool)  produce_const_pool "$@" ;;
         *) echo "int: unknown run mode '$run'" >&2; return 2 ;;
     esac
 }

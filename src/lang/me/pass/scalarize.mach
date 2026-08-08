@@ -31,6 +31,7 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
 
 use A: std.allocator;
 use O: std.types.option;
@@ -45,6 +46,7 @@ use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.source;
 use mach.lang.target;
+use vecform: mach.lang.me.vecform;
 
 # per-function rewrite state, threaded through the expansion helpers
 # ---
@@ -161,30 +163,44 @@ fun produces_vector(m: *ir.Module, inst: *instruction.Instruction) bool {
         || inst.kind == instruction.OP_VEC_INSERT;
 }
 
-# a single would-scalarize site: the operator's opcode and its containing function
+# a single would-scalarize site: the operator, its lane width, and its containing
+# function
 #
 # The shared detection currency between this child's build-time note and the profile
 # lever's (#2017) `require`-mode error, so both name the same operators by
 # construction rather than re-deriving them from two independent walks.
+#
+# The lane width rides along because the shortfall is now per-operation rather than
+# per-target (#2726): "multiply would scalarize" is not actionable on a target that
+# packs the same multiply one lane width down, so the diagnostic names the width the
+# gap is at.
 pub rec ScalarizeSite {
-    fn_name: intern.StrId;
-    op:      instruction.InstrKind;
+    fn_name:   intern.StrId;
+    op:        instruction.InstrKind;
+    lane_bits: u32;
 }
 
-# count the lane-wise vector operators in `m` that would scalarize on a SIMD-incapable
-# target, filling `first` with the earliest one in program order
+# count the lane-wise vector operators in `m` whose realization on `tgt` is per-lane
+# scalar code, filling `first` with the earliest one in program order
 #
 # Read-only: it inspects the IR without transforming it, so the profile lever can
-# call it under `require` (where the pass must not run) and this child calls it to set
-# the note count -- both over the identical operator set. Walks block-listed
-# instructions (the ones the pass would expand); phis / calls / loads / stores carry
-# vectors but are not operators and are not counted.
+# call it under `require` (where the expansion must not run) and this child calls it
+# to set the note count -- both over the identical operator set. Walks block-listed
+# instructions (the ones the expansion would rewrite); phis / calls / loads / stores
+# carry vectors but are not operators and are not counted.
+#
+# The verdict comes from `vecform.realizes_packed` (#2726), the same authority the
+# expansion stages act on, so the count, the note, the `require` error and the actual
+# transformation cannot name different operators. Before this it was implicitly "every
+# operator, because the target has no vector unit"; that is now just the case where the
+# authority reports no packed form for anything.
 # ---
 # m:     the module to inspect
-# first: filled with the first operator's { containing function name, opcode } when
-#        the returned count is > 0; left unset when the count is 0
-# ret:   the number of would-scalarize vector operators in the module
-pub fun detect(m: *ir.Module, first: *ScalarizeSite) u32 {
+# tgt:   the target whose packed forms decide each operator's realization
+# first: filled with the first operator's { containing function, opcode, lane width }
+#        when the returned count is > 0; left unset when the count is 0
+# ret:   the number of scalar-realized vector operators in the module
+pub fun detect(m: *ir.Module, tgt: *target.Target, first: *ScalarizeSite) u32 {
     var count: u32 = 0;
     var fi: u32 = 0;
     for (fi < m.function_len) {
@@ -196,10 +212,13 @@ pub fun detect(m: *ir.Module, first: *ScalarizeSite) u32 {
                 var ii: u32 = 0;
                 for (ii < blk.instr_count) {
                     val inst: *instruction.Instruction = ?fn.instrs[blk.instructions[ii]::u32];
-                    if (is_operator(m, inst)) {
+                    if (is_operator(m, inst) && !vecform.realizes_packed(m, tgt, inst)) {
                         if (count == 0) {
-                            first.fn_name = fn.name;
-                            first.op      = inst.kind;
+                            first.fn_name   = fn.name;
+                            first.op        = inst.kind;
+                            first.lane_bits = 0;
+                            var d: vecform.LaneDesc;
+                            if (vecform.lane_desc(m, inst, ?d)) { first.lane_bits = d.lane_bits; }
                         }
                         count = count + 1;
                     }
@@ -1315,6 +1334,245 @@ pub fun expand_lane_ops(m: *ir.Module, tgt: *target.Target) R.Result[bool, str] 
     ret R.ok[bool, str](true);
 }
 
+# whether `fn` holds any operator this target has no packed form for
+fun has_gap_op(m: *ir.Module, fn: *ir.Function, tgt: *target.Target) bool {
+    var i: u32 = 0;
+    for (i < fn.instr_len) {
+        val inst: *instruction.Instruction = ?fn.instrs[i];
+        if (is_operator(m, inst) && !vecform.realizes_packed(m, tgt, inst)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# rewrite one gap operator into per-lane scalar work, leaving its operands and its
+# result as ordinary vector VALUES
+#
+# `%c = op <N x T> %a, %b` becomes N lane reads of each operand, N scalar `op`s, and
+# an insert chain that assembles the result. The chain is seeded with `%a` rather
+# than a zero vector because a vector-typed constant is not an expressible value
+# (#2700) - and the seed's lanes are all overwritten, since the chain writes every
+# lane, so which vector seeds it cannot affect the result.
+#
+# Built from `OP_VEC_EXTRACT` / `OP_VEC_INSERT` rather than from stack traffic on
+# purpose: both are already legal on every target and already have a realization
+# there. A target that reads and writes a lane in a register (`has_lane_ops`, NEON's
+# UMOV / INS) keeps them to its isel; one that cannot has `expand_lane_ops` rewrite
+# them to the vector's memory image immediately after this. So this pass needs no
+# memory machinery of its own and inherits both lowerings for free.
+fun expand_gap_op(c: *Ctx, blk: *ir.Block, cur: id.InstructionId) R.Result[bool, str] {
+    val fn: *ir.Function = c.fn;
+    val ip: *instruction.Instruction = ?fn.instrs[cur::u32];
+    val kind: instruction.InstrKind = ip.kind;
+    val loc:  source.SrcLoc = ip.loc;
+    val vty:  ir_type.IrTypeId = ip.ty;
+
+    if (is_compare_op(kind)) {
+        # no ISA declares a packed-form gap on a lane-wise compare, so the mask
+        # expansion this would need has never been reachable. Declaring one without
+        # writing it is a defined error rather than a wrong mask.
+        ret R.err[bool, str]("scalarize: no per-lane expansion for a gapped vector compare");
+    }
+    if (!is_binary_op(kind) && !is_unary_op(kind)) {
+        ret R.err[bool, str]("scalarize: gap operator is not a lane-wise arithmetic or bitwise op");
+    }
+
+    var vi: VInfo;
+    val rvi: R.Result[bool, str] = vec_info(c.m, vty, ?vi);
+    if (R.is_err[bool, str](rvi)) { ret rvi; }
+
+    val unary: bool = is_unary_op(kind);
+    if (ip.operand_count < 1)             { ret R.err[bool, str]("scalarize: gap operator missing operands"); }
+    if (!unary && ip.operand_count < 2)   { ret R.err[bool, str]("scalarize: gap operator missing operands"); }
+
+    val a: value.Value = resolve(c, ip.operands[0]);
+    var b: value.Value = a;
+    if (!unary) { b = resolve(c, ip.operands[1]); }
+    val a_secret: bool = ip.operands[0].secret;
+    var b_secret: bool = false;
+    if (!unary) { b_secret = ip.operands[1].secret; }
+
+    # every lane's scalar result, computed before any of them is inserted, so the
+    # insert chain is a straight assembly rather than interleaved with the arithmetic.
+    var lanes: [16]value.Value;
+    if (vi.lanes > 16) { ret R.err[bool, str]("scalarize: gap operator has more lanes than any 128-bit vector"); }
+
+    var k: u32 = 0;
+    for (k < vi.lanes) {
+        val ra: R.Result[value.Value, str] = emit_lane_read(c, blk, a, vi.elem, k, loc);
+        if (R.is_err[value.Value, str](ra)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](ra)); }
+        val av: value.Value = lane_secret(c, R.unwrap_ok[value.Value, str](ra), a_secret);
+
+        var rr: R.Result[value.Value, str] = R.ok[value.Value, str](av);
+        if (unary) {
+            rr = emit_unop(c, blk, kind, vi.elem, av, loc);
+        }
+        or {
+            val rb: R.Result[value.Value, str] = emit_lane_read(c, blk, b, vi.elem, k, loc);
+            if (R.is_err[value.Value, str](rb)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](rb)); }
+            val bv: value.Value = lane_secret(c, R.unwrap_ok[value.Value, str](rb), b_secret);
+            rr = emit_binop(c, blk, kind, vi.elem, av, bv, loc);
+        }
+        if (R.is_err[value.Value, str](rr)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](rr)); }
+        lanes[k] = lane_secret(c, R.unwrap_ok[value.Value, str](rr), a_secret || b_secret);
+        k = k + 1;
+    }
+
+    var acc: value.Value = a;
+    var j: u32 = 0;
+    for (j < vi.lanes) {
+        val ri: R.Result[value.Value, str] = emit_lane_write(c, blk, acc, vty, j, lanes[j], loc);
+        if (R.is_err[value.Value, str](ri)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](ri)); }
+        acc = R.unwrap_ok[value.Value, str](ri);
+        j = j + 1;
+    }
+
+    # every later use of the operator's result names the assembled vector instead.
+    c.pval[cur::u32]     = acc;
+    c.pval_set[cur::u32] = true;
+    ret R.ok[bool, str](true);
+}
+
+# a lane read `vec_extract vec, k` yielding the scalar element
+fun emit_lane_read(c: *Ctx, blk: *ir.Block, vec: value.Value, elem_ty: ir_type.IrTypeId, k: u32, loc: source.SrcLoc) R.Result[value.Value, str] {
+    var ops: [2]value.Value;
+    ops[0] = vec;
+    ops[1] = value.const_int(k::u64, c.idx_ty);
+    ret push(c, blk, instruction.OP_VEC_EXTRACT, elem_ty, vec.ty, ?ops[0], 2, loc);
+}
+
+# a lane write `vec_insert vec, k, v` yielding the whole vector with lane k replaced
+fun emit_lane_write(c: *Ctx, blk: *ir.Block, vec: value.Value, vty: ir_type.IrTypeId, k: u32, v: value.Value, loc: source.SrcLoc) R.Result[value.Value, str] {
+    var ops: [3]value.Value;
+    ops[0] = vec;
+    ops[1] = value.const_int(k::u64, c.idx_ty);
+    ops[2] = v;
+    ret push(c, blk, instruction.OP_VEC_INSERT, vty, vty, ?ops[0], 3, loc);
+}
+
+# rebuild one block, expanding its gap operators in place
+fun expand_gap_block(c: *Ctx, tgt: *target.Target, blk: *ir.Block) R.Result[bool, str] {
+    val fn: *ir.Function = c.fn;
+
+    val old_len: u32 = blk.instr_count;
+    var old: *id.InstructionId = nil;
+    if (old_len > 0) {
+        val ro: R.Result[*id.InstructionId, str] = A.allocate[id.InstructionId](c.m.alloc, old_len::usize);
+        if (R.is_err[*id.InstructionId, str](ro)) { ret R.err[bool, str](R.unwrap_err[*id.InstructionId, str](ro)); }
+        old = R.unwrap_ok[*id.InstructionId, str](ro);
+        var i: u32 = 0;
+        for (i < old_len) { old[i] = blk.instructions[i]; i = i + 1; }
+    }
+    blk.instr_count = 0;
+
+    var oi: u32 = 0;
+    for (oi < old_len) {
+        val cur: id.InstructionId = old[oi];
+        val inst: *instruction.Instruction = ?fn.instrs[cur::u32];
+        var rr: R.Result[bool, str] = R.ok[bool, str](true);
+        if (is_operator(c.m, inst) && !vecform.realizes_packed(c.m, tgt, inst)) {
+            rr = expand_gap_op(c, blk, cur);
+        }
+        or {
+            rewrite_ops(c, inst);
+            rr = ir.block_append_instr(c.m, blk, cur);
+        }
+        if (R.is_err[bool, str](rr)) { body_free(c, old, old_len); ret rr; }
+        oi = oi + 1;
+    }
+
+    body_free(c, old, old_len);
+
+    var p: u32 = 0;
+    for (p < blk.phi_count) {
+        rewrite_ops(c, ?fn.instrs[blk.phis[p]::u32]);
+        p = p + 1;
+    }
+    if (blk.terminator != id.INSTR_NIL) { rewrite_ops(c, ?fn.instrs[blk.terminator::u32]); }
+    ret R.ok[bool, str](true);
+}
+
+# expand one function's gap operators; the function is untouched when it has none
+fun expand_gap_function(m: *ir.Module, fn: *ir.Function, tgt: *target.Target,
+                        void_ty: ir_type.IrTypeId, ptr_ty: ir_type.IrTypeId, idx_ty: ir_type.IrTypeId) R.Result[bool, str] {
+    if (!has_gap_op(m, fn, tgt)) { ret R.ok[bool, str](true); }
+
+    var c: Ctx;
+    c.m       = m;
+    c.fn      = fn;
+    c.n       = fn.instr_len;
+    c.pcount  = 0;      # no parameter is retyped here; keep resolve's param arm inert
+    c.is_vp   = nil;
+    c.void_ty = void_ty;
+    c.ptr_ty  = ptr_ty;
+    c.idx_ty  = idx_ty;
+
+    val rpv: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, c.n::usize);
+    if (R.is_err[*value.Value, str](rpv)) { ret R.err[bool, str](R.unwrap_err[*value.Value, str](rpv)); }
+    c.pval = R.unwrap_ok[*value.Value, str](rpv);
+    val rps: R.Result[*bool, str] = A.zallocate[bool](m.alloc, c.n::usize);
+    if (R.is_err[*bool, str](rps)) { ctx_free(m, ?c); ret R.err[bool, str](R.unwrap_err[*bool, str](rps)); }
+    c.pval_set = R.unwrap_ok[*bool, str](rps);
+
+    var bi: u32 = 0;
+    for (bi < fn.block_count) {
+        val rb: R.Result[bool, str] = expand_gap_block(?c, tgt, ?fn.blocks[bi]);
+        if (R.is_err[bool, str](rb)) { ctx_free(m, ?c); ret rb; }
+        bi = bi + 1;
+    }
+
+    ctx_free(m, ?c);
+    ret R.ok[bool, str](true);
+}
+
+# realize the lane-wise operators `tgt` has no packed form for as per-lane scalar
+# work, on a target that DOES have a vector unit (#2726)
+#
+# The per-OPERATION half of the realization model. `run` below is the per-TARGET half
+# and applies when there is no vector unit at all; this one applies when there is a
+# vector unit but the specific operation has no packed word at the specific lane
+# width - SSE2 packing a 16-bit lane multiply (PMULLW) but no 32-bit one (PMULLD is
+# SSE4.1), NEON packing .16b / .8h / .4s but having no 64-bit lane arrangement.
+#
+# The distinction that makes this different from `run`: VECTOR VALUES SURVIVE. Only
+# the gap operator becomes per-lane work, so `i32x4 + i32x4` still selects one packed
+# instruction next to an `i32x4 * i32x4` that does not, and nothing that already had
+# a packed form pays for the one that did not.
+#
+# Which operators those are comes from `vecform.realizes_packed`, the same authority
+# the `simd = "require"` diagnostic reads, so the build error and the transformation
+# cannot describe different sets.
+# ---
+# m:   the module to legalize in place
+# tgt: the target whose packed forms decide each operator's realization
+# ret: ok(true) on success, or an allocation / internal error
+pub fun expand_gap_ops(m: *ir.Module, tgt: *target.Target) R.Result[bool, str] {
+    if (!tgt.model.has_v128) { ret R.ok[bool, str](true); }
+
+    val rv: R.Result[ir_type.IrTypeId, str] = ir_type.intern_void(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rv)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rv)); }
+    val void_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rv);
+
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rp)); }
+    val ptr_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+
+    val ri: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, tgt.isa.pointer_width * 8);
+    if (R.is_err[ir_type.IrTypeId, str](ri)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](ri)); }
+    val idx_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ri);
+
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        val fn: *ir.Function = ?m.functions[fi];
+        if ((fn.flags & ir.FN_FLAG_EXTERN) == 0 && fn.instr_len > 0) {
+            val rf: R.Result[bool, str] = expand_gap_function(m, fn, tgt, void_ty, ptr_ty, idx_ty);
+            if (R.is_err[bool, str](rf)) { ret rf; }
+        }
+        fi = fi + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
 # scalarize every lane-wise vector value and operator in `m` for a SIMD-incapable
 # target; a no-op on a capable target (`has_v128 == true`)
 #
@@ -1333,7 +1591,7 @@ pub fun run(m: *ir.Module, tgt: *target.Target) R.Result[bool, str] {
     # record the operator count for the note from the same read-only walk the require
     # lever consumes, before any expansion mutates the IR.
     var first: ScalarizeSite;
-    m.vector_ops_scalarized = detect(m, ?first);
+    m.vector_ops_scalarized = detect(m, tgt, ?first);
 
     val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
     if (R.is_err[ir_type.IrTypeId, str](rp)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rp)); }
@@ -1453,13 +1711,146 @@ test "mach.lang.me.pass.scalarize.detect:counts_only_vector_operators" {
     if (R.is_err[value.Value, str](builder.emit_add(?bld, pv0, pv1))) { ir.dnit(?m); ret 1; }
     if (R.is_err[value.Value, str](builder.emit_mul(?bld, pv0, pv1))) { ir.dnit(?m); ret 1; }
 
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ir.dnit(?m); ret 1; }
+    val rt: R.Result[target.Target, str] = target.select_of(?reg, "riscv64", "linux", "lp64", "");
+    if (R.is_err[target.Target, str](rt)) { ir.dnit(?m); ret 1; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](rt);
+
     var site: ScalarizeSite;
-    val n: u32 = detect(?m, ?site);
+    val n: u32 = detect(?m, ?tgt, ?site);
     if (n != 2)                              { ir.dnit(?m); ret 1; }
     if (site.op != instruction.OP_ADD)       { ir.dnit(?m); ret 1; }
+    if (site.lane_bits != 32)                { ir.dnit(?m); ret 1; }
 
     ir.dnit(?m);
     ret 0;
+}
+
+# build a one-function module holding a single lane-wise vector binary operator of
+# `kind` over `lanes` lanes of `elem_bits`-wide integer, and return it
+#
+# Shared by the realization tests below so they all describe the same IR and differ
+# only in the target they hand it to - which is the whole point, since the claim under
+# test is that the TARGET decides the realization and nothing else does.
+fun vec_binop_module(alloc: *A.Allocator, kind: instruction.InstrKind, elem_bits: u32, lanes: u32, out: *ir.Module) bool {
+    val res_m: R.Result[ir.Module, str] = ir.init(alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret false; }
+    @out = R.unwrap_ok[ir.Module, str](res_m);
+
+    val res_e: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?out.types, elem_bits);
+    if (R.is_err[ir_type.IrTypeId, str](res_e)) { ret false; }
+    val elem: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](res_e);
+    val res_v: R.Result[ir_type.IrTypeId, str] = ir_type.intern_vector(?out.types, elem, lanes);
+    if (R.is_err[ir_type.IrTypeId, str](res_v)) { ret false; }
+    val vec: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](res_v);
+
+    val res_fn: R.Result[u32, str] = ir.function_add(out, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_fn)) { ret false; }
+    val fn: *ir.Function = ?out.functions[R.unwrap_ok[u32, str](res_fn)];
+
+    var bld: builder.Builder = builder.init(out);
+    builder.set_function(?bld, fn);
+    val res_blk: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_blk)) { ret false; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](res_blk));
+
+    val pv0: value.Value = value.param(0, vec);
+    val pv1: value.Value = value.param(1, vec);
+    if (kind == instruction.OP_MUL) {
+        if (R.is_err[value.Value, str](builder.emit_mul(?bld, pv0, pv1))) { ret false; }
+        ret true;
+    }
+    if (R.is_err[value.Value, str](builder.emit_add(?bld, pv0, pv1))) { ret false; }
+    ret true;
+}
+
+# select one of the three shipping machine targets by isa name
+fun test_target(reg: *target.TargetRegistry, isa_name: str, out: *target.Target) bool {
+    var abi: str = "sysv64";
+    if (str_equals(isa_name, "aarch64")) { abi = "aapcs64"; }
+    if (str_equals(isa_name, "riscv64")) { abi = "lp64"; }
+    val rt: R.Result[target.Target, str] = target.select_of(reg, isa_name, "linux", abi, "");
+    if (R.is_err[target.Target, str](rt)) { ret false; }
+    @out = R.unwrap_ok[target.Target, str](rt);
+    ret true;
+}
+
+# THE AGREEMENT TEST (#2726): the `simd = "require"` diagnostic and the expansion
+# that actually runs read one authority, so they cannot describe different operators
+#
+# Asserting the gap table against itself would prove nothing - a table always agrees
+# with itself. What is asserted here is a relation between two INDEPENDENT
+# observations of the same module: how many operators `detect` says will scalarize
+# (the number the build error is raised from) and how many operators survive
+# `expand_gap_ops` (what the compiler actually did). They must be N and 0. If the
+# diagnostic over-reported, the expansion would leave the extra operator alone and
+# the post-count would be 0 while a build under `require` had been refused for
+# nothing; if it under-reported, an operator would reach the backend with no packed
+# form to select it.
+#
+# The same `i32x4 * i32x4` is handed to all three targets, so the only variable is
+# the target - which is the contract: legality is target-independent, realization is
+# not.
+test "mach.lang.me.pass.scalarize:require_and_expansion_read_one_authority" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+
+    # i32x4 multiply: no packed form on x86-64 (PMULLD is SSE4.1) or riscv64 (no
+    # vector unit); NEON packs it as MUL.4s.
+    if (gap_agreement(?alloc, ?reg, "x86_64", instruction.OP_MUL, 32, 4) != 1) { ret 1; }
+    if (gap_agreement(?alloc, ?reg, "riscv64", instruction.OP_MUL, 32, 4) != 1) { ret 2; }
+    if (gap_agreement(?alloc, ?reg, "aarch64", instruction.OP_MUL, 32, 4) != 0) { ret 3; }
+
+    # i64x2 multiply: no target has a packed 64-bit lane integer multiply, so all
+    # three scalarize it. This is the shape the aarch64 encoder's backstop covers.
+    if (gap_agreement(?alloc, ?reg, "x86_64", instruction.OP_MUL, 64, 2) != 1) { ret 4; }
+    if (gap_agreement(?alloc, ?reg, "aarch64", instruction.OP_MUL, 64, 2) != 1) { ret 5; }
+    if (gap_agreement(?alloc, ?reg, "riscv64", instruction.OP_MUL, 64, 2) != 1) { ret 6; }
+
+    # i16x8 multiply packs on both capable targets (PMULLW / MUL.8h) and scalarizes
+    # only where there is no vector unit, so the gap is a real per-op fact and not a
+    # blanket refusal of integer multiply.
+    if (gap_agreement(?alloc, ?reg, "x86_64", instruction.OP_MUL, 16, 8) != 0) { ret 7; }
+    if (gap_agreement(?alloc, ?reg, "aarch64", instruction.OP_MUL, 16, 8) != 0) { ret 8; }
+    if (gap_agreement(?alloc, ?reg, "riscv64", instruction.OP_MUL, 16, 8) != 1) { ret 9; }
+
+    # i32x4 ADD packs on both capable targets, so the multiply above is not being
+    # scalarized for being a vector op - it is being scalarized for being THIS op at
+    # THIS lane width.
+    if (gap_agreement(?alloc, ?reg, "x86_64", instruction.OP_ADD, 32, 4) != 0)  { ret 10; }
+    if (gap_agreement(?alloc, ?reg, "aarch64", instruction.OP_ADD, 32, 4) != 0) { ret 11; }
+
+    ret 0;
+}
+
+# the number of operators `detect` reports for one module on one target, checked
+# against what `expand_gap_ops` actually leaves behind
+#
+# Returns the reported count, or a large sentinel when the two observations disagree
+# or the setup fails - so a broken setup can never read as agreement.
+fun gap_agreement(alloc: *A.Allocator, reg: *target.TargetRegistry, isa_name: str,
+                  kind: instruction.InstrKind, elem_bits: u32, lanes: u32) u32 {
+    var tgt: target.Target;
+    if (!test_target(reg, isa_name, ?tgt)) { ret 0xFFFFFFFF; }
+    var m: ir.Module;
+    if (!vec_binop_module(alloc, kind, elem_bits, lanes, ?m)) { ret 0xFFFFFFFF; }
+
+    var site: ScalarizeSite;
+    val before: u32 = detect(?m, ?tgt, ?site);
+
+    # only the capable targets run this stage; an incapable one is `run`'s whole-module
+    # job, so the surviving-operator check does not apply to it.
+    if (tgt.model.has_v128) {
+        if (R.is_err[bool, str](expand_gap_ops(?m, ?tgt))) { ir.dnit(?m); ret 0xFFFFFFFF; }
+        var after: ScalarizeSite;
+        if (detect(?m, ?tgt, ?after) != 0) { ir.dnit(?m); ret 0xFFFFFFFF; }
+    }
+
+    ir.dnit(?m);
+    ret before;
 }
 
 # build a one-function module holding a single lane-wise vector compare of `kind`

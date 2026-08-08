@@ -1197,7 +1197,15 @@ fun emit_mem_access(st: *encode.EncodeState, rt: u32, base: u32, off: i64, width
 pub fun frame_reserved_top(f: *mir.MirFunction) i64 {
     val gp_bytes: u32 = popcount32(f.callee_mask) * 8;
     val fp_bytes: u32 = popcount32(f.callee_mask_fp) * 8;
-    ret (16 + gp_bytes + fp_bytes)::i64;
+    val n: u32 = 16 + gp_bytes + fp_bytes;
+    # in a realigned frame the slot region's base is `sp + total - this`, so BOTH have to
+    # be multiples of the requested alignment for the base to carry it (#2735). the
+    # padding lands between the callee-save areas and the locals, where nothing reads it.
+    if (f.frame.realign != 0) {
+        val rmask: u32 = f.frame.realign - 1;
+        ret ((n + rmask) & ~rmask)::i64;
+    }
+    ret n::i64;
 }
 
 # the frame-pointer (s0) relative offset of the slot a MIR value owns, or none when
@@ -1208,7 +1216,17 @@ pub fun frame_reserved_top(f: *mir.MirFunction) i64 {
 # table is keyed on the slot-owning vreg ids, so a physical-register base (carrying
 # MIR_VREG_NIL) never matches
 fun frame_slot_offset(f: *mir.MirFunction, v: u32) O.Option[i64] {
-    ret codegen_frame.slot_offset(?f.frame, v, frame_reserved_top(f));
+    if (codegen_frame.slots_from_sp(?f.frame)) {
+        ret codegen_frame.slot_sp_offset(?f.frame, v);
+    }
+    ret codegen_frame.slot_offset(?f.frame, v);
+}
+
+# the register a frame slot is addressed from: s0 normally, sp in a realigned frame,
+# where the mask put a run-time distance between the two (#2735)
+fun slot_base_reg(f: *mir.MirFunction) u32 {
+    if (codegen_frame.slots_from_sp(?f.frame)) { ret RSP; }
+    ret RFP;
 }
 
 # the STACK-pointer offset of the slot a MIR value owns, for an inline-asm
@@ -1228,9 +1246,7 @@ fun frame_slot_offset(f: *mir.MirFunction, v: u32) O.Option[i64] {
 # epilogue moves it - a variable-length alloca is refused at lowering, and an asm body
 # that writes sp is refused by the shared `writes_sp` check whenever it binds a `{name}`.
 fun asm_slot_offset(f: *mir.MirFunction, v: u32) O.Option[i64] {
-    val fp_off: O.Option[i64] = codegen_frame.slot_offset(?f.frame, v, frame_reserved_top(f));
-    if (!O.is_some[i64](fp_off)) { ret O.none[i64](); }
-    ret O.some[i64](frame_total(f)::i64 + O.unwrap[i64](fp_off));
+    ret codegen_frame.slot_sp_offset(?f.frame, v);
 }
 
 # a resolved memory operand - a base register, a constant byte displacement folded
@@ -1277,7 +1293,7 @@ fun resolve_mem(f: *mir.MirFunction, op: *mir.MirOperand) R.Result[RvMem, str] {
         if (!O.is_some[i64](slot)) {
             ret R.err[RvMem, str]("encode: value vreg survived in a memory-operand base");
         }
-        m.base = RFP;
+        m.base = slot_base_reg(f);
         m.off  = O.unwrap[i64](slot) + op.imm;
         ret R.ok[RvMem, str](m);
     }
@@ -2103,6 +2119,16 @@ fun req_fpr(op: *mir.MirOperand) R.Result[i32, str] {
     ret R.err[i32, str]("encode: expected a float register operand");
 }
 
+# the scalar float widths this target implements: f32 (S) and f64 (D)
+#
+# The single spelling of the pair every float encoder in this file checks against,
+# so widening the set (#2727 makes over-width vectors legal) is one edit rather than
+# a hunt for open-coded ladders. A width outside it is a compiler bug and each caller
+# refuses on it - never substitutes for it (#2733)
+fun is_float_width(w: u8) bool {
+    ret w == 4 || w == 8;
+}
+
 # true when an operand is a physical register in the float bank. reads the class
 # straight off the composite register id - the seam that lets the move family pick
 # the FP versus GP machine form from the operands alone
@@ -2183,16 +2209,70 @@ fun fmv_f2i_funct7(width: u8) u32 {
     ret F7_FMV_F2I | 1;
 }
 
-# materialize a float-constant bit pattern into float register index `vd`. the bits -
-# a 32-bit pattern for an f32, a 64-bit pattern for an f64 (the shape a float CONSTANT
-# carries through lowering) - are materialized into the GP scratch via `emit_li`, then
-# bit-copied into `vd` with the GP->FP reinterpret (`fmv.w.x` for an f32, `fmv.d.x`
-# for an f64). the RV64 analogue of x86-64's float-constant load (MOVABS R11 + MOVQ
-# xmm); the GP scratch is the reserved encoder register, so a single instruction's
+# the number of instruction words `emit_li` spends on a value, mirroring its own
+# recursion
+#
+# The cost half of the constant-materialization decision, so the decision compares
+# real instruction counts rather than a rule of thumb about widths. It has to track
+# `emit_li` exactly - a count that drifted from the emitter would choose the wrong
+# form silently
+fun li_words(value: i64) u32 {
+    if (value >= -2048 && value <= 2047) { ret 1; }
+    if (value >= -2147483648 && value <= 2147483647) {
+        val v: i32 = value::i32;
+        if ((v::u32 & 0xFFF) == 0) { ret 1; }
+        ret 2;
+    }
+    val lo12: i64 = sext12(value);
+    var n: u32 = li_words((value - lo12) >> 12) + 1;
+    if (lo12 != 0) { n = n + 1; }
+    ret n;
+}
+
+# materialize a float-constant bit pattern into float register index `vd`
+#
+# Three forms, chosen by which is cheapest for the pattern in hand rather than by a
+# blanket rule - RV64, unlike x86-64, can build some constants in fewer instructions
+# than a load takes, so pooling unconditionally would be a pessimisation for those.
+#
+#   - all-zero bits: `fmv.d.x fd, x0` (`fmv.w.x`), ONE instruction reading the zero
+#     register. nothing can beat it, so a zero is never pooled;
+#   - a pattern one `lui` or one `addi` builds: that word plus the `fmv`, two
+#     instructions and no memory reference. an `auipc` + `fld` pair is also two
+#     instructions but touches memory and carries two relocations, so the register
+#     form wins;
+#   - anything else - an arbitrary f64 bit pattern costs `emit_li` five to seven
+#     words on RV64, since its widest immediate is 32 bits and the rest is built by
+#     repeated shift-and-add: the module's constant pool, reached as `auipc t0,
+#     %pcrel_hi(.Lconst.N) ; fld fd, %pcrel_lo(.Lconst.N)(t0)` - two instructions
+#     whatever the pattern.
+#
+# t0 is the reserved encoder scratch in both the register and the pool form, so a
 # materialization never collides with a live value. `width` is 4 (S) or 8 (D)
-fun emit_fp_imm(st: *encode.EncodeState, vd: u32, bits: i64, width: u8) {
-    emit_li(st, SCRATCH, bits);
-    emit_r(st, OPC_OP_FP, RM_RNE, fmv_i2f_funct7(width), vd, SCRATCH, 0);
+fun emit_fp_const(st: *encode.EncodeState, vd: u32, bits: i64, width: u8) R.Result[bool, str] {
+    var pattern: i64 = bits;
+    if (width == 4) { pattern = bits & 0xFFFFFFFF; }
+
+    if (pattern == 0) {
+        emit_r(st, OPC_OP_FP, RM_RNE, fmv_i2f_funct7(width), vd, RZERO, 0);
+        ret R.ok[bool, str](true);
+    }
+    if (li_words(pattern) <= 1) {
+        emit_li(st, SCRATCH, pattern);
+        emit_r(st, OPC_OP_FP, RM_RNE, fmv_i2f_funct7(width), vd, SCRATCH, 0);
+        ret R.ok[bool, str](true);
+    }
+
+    val sr: R.Result[intern.StrId, str] = encode.intern_float_const(st, pattern::u64, width);
+    if (R.is_err[intern.StrId, str](sr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sr)); }
+    val sym: intern.StrId = R.unwrap_ok[intern.StrId, str](sr);
+
+    val hr: R.Result[bool, str] = emit_pcrel_hi(st, SCRATCH, sym, 0);
+    if (R.is_err[bool, str](hr)) { ret hr; }
+    val lo_pos: u32 = st.buf.len::u32;
+    emit_i(st, OPC_LOAD_FP, fp_mem_funct3(width), vd, SCRATCH, 0);
+    note_sym_target(st, sym, isa.SYM_MOD_PCREL_LO);
+    ret encode.push_reloc(st, lo_pos, of.RK_PCREL_LO12_I, sym, 0);
 }
 
 # the float register index a float source operand contributes. a physical float
@@ -2211,7 +2291,8 @@ fun resolve_fp_source(st: *encode.EncodeState, f: *mir.MirFunction, op: *mir.Mir
         ret R.ok[i32, str](scratch::i32);
     }
     if (op.kind == mir.MIR_OP_IMM) {
-        emit_fp_imm(st, scratch, op.imm, width);
+        val cr: R.Result[bool, str] = emit_fp_const(st, scratch, op.imm, width);
+        if (R.is_err[bool, str](cr)) { ret R.err[i32, str](R.unwrap_err[bool, str](cr)); }
         ret R.ok[i32, str](scratch::i32);
     }
     ret req_fpr(op);
@@ -2262,7 +2343,7 @@ fun is_mir_float_conv(op: mir.MirOpcode) bool {
 fun encode_fp_arith(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 3) { ret R.err[bool, str]("encode: float arithmetic missing operands"); }
     val w: u8 = mi.width;
-    if (w != 4 && w != 8) {
+    if (!is_float_width(w)) {
         ret R.err[bool, str]("internal compiler error: float arithmetic has a non-float operand width (expected 4 or 8)");
     }
     val dbl: bool = w == 8;
@@ -2296,7 +2377,7 @@ fun encode_fp_arith(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirIn
 fun encode_fp_neg(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 2) { ret R.err[bool, str]("encode: float negate missing operands"); }
     val w: u8 = mi.width;
-    if (w != 4 && w != 8) {
+    if (!is_float_width(w)) {
         ret R.err[bool, str]("internal compiler error: float negate has a non-float operand width (expected 4 or 8)");
     }
     var f7: u32 = F7_FSGNJ;
@@ -2345,7 +2426,7 @@ fun fp_cmp_relation(cc: u8, out_funct3: *u32, out_swap: *bool, out_invert: *bool
 fun encode_fp_cmp(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 3) { ret R.err[bool, str]("encode: float comparison missing operands"); }
     val w: u8 = mi.width;
-    if (w != 4 && w != 8) {
+    if (!is_float_width(w)) {
         ret R.err[bool, str]("internal compiler error: float comparison has a non-float operand width (expected 4 or 8)");
     }
     var f7: u32 = F7_FCMP;
@@ -2396,6 +2477,12 @@ fun int_to_fp_rm(dbl: bool, src_is_word: bool) u32 {
 # destination width, `mi.src_width` the source width - for FP_TRUNC/EXT both are float
 # widths; for the int<->float forms one side is the integer width and the other the
 # float width
+#
+# THE FLOAT SIDE'S WIDTH IS REFUSED WHEN IT IS NOT 4 OR 8 (#2733), per arm, because
+# which side is the float one depends on the opcode - a check at the top would also
+# reject the integer side's legitimate 1 and 2. this encoder carried no ladder to
+# find: it read `dw == 8` / `sw == 8` and took the S form for everything else, the
+# same substitution `encode_fmov` made in a shape a search for the ladder misses
 fun encode_fp_conv(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 2) { ret R.err[bool, str]("encode: float conversion missing operands"); }
     val op: mir.MirOpcode = mi.opcode;
@@ -2403,6 +2490,9 @@ fun encode_fp_conv(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirIns
     val sw: u8 = mi.src_width;
 
     if (op == mir.MIR_FP_TRUNC || op == mir.MIR_FP_EXT) {
+        if (!is_float_width(dw) || !is_float_width(sw)) {
+            ret R.err[bool, str]("internal compiler error: float conversion has a non-float width on a float side (expected 4 or 8)");
+        }
         val rnr: R.Result[i32, str] = resolve_fp_source(st, f, ?mi.operands[1], FP_SCRATCH, sw);
         if (R.is_err[i32, str](rnr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rnr)); }
         val rn: u32 = R.unwrap_ok[i32, str](rnr)::u32;
@@ -2428,6 +2518,9 @@ fun encode_fp_conv(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirIns
     }
 
     if (op == mir.MIR_SI_TO_FP || op == mir.MIR_UI_TO_FP) {
+        if (!is_float_width(dw)) {
+            ret R.err[bool, str]("internal compiler error: integer-to-float conversion has a non-float result width (expected 4 or 8)");
+        }
         val signed: bool = op == mir.MIR_SI_TO_FP;
         val gpr: R.Result[i32, str] = req_gpr(?mi.operands[1]);
         if (R.is_err[i32, str](gpr)) { ret R.err[bool, str](R.unwrap_err[i32, str](gpr)); }
@@ -2469,6 +2562,9 @@ fun encode_fp_conv(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirIns
     }
 
     # float source -> GP destination (round-toward-zero).
+    if (!is_float_width(sw)) {
+        ret R.err[bool, str]("internal compiler error: float-to-integer conversion has a non-float source width (expected 4 or 8)");
+    }
     val signed: bool = op == mir.MIR_FP_TO_SI;
     val rnr: R.Result[i32, str] = resolve_fp_source(st, f, ?mi.operands[1], FP_SCRATCH, sw);
     if (R.is_err[i32, str](rnr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rnr)); }
@@ -2491,18 +2587,25 @@ fun encode_fp_conv(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirIns
 # CLASS, and spill state:
 #   - immediate source (a float CONSTANT): the bit pattern is materialized into the
 #     destination float register (or f31 then stored for a spilled destination) via
-#     the GP scratch + a GP->FP fmv - see `emit_fp_imm`.
+#     the cheapest form for its bit pattern - see `emit_fp_const`.
 #   - float <- float: `fmv.d` / `fmv.s` (the `fsgnj fd, fn, fn` alias, a float copy).
 #   - float <- GP / GP <- float: the cross-bank `fmv.d.x` / `fmv.w.x` and `fmv.x.d` /
 #     `fmv.x.w` bit reinterprets.
 #   - a spilled side (frame-slot MEM): a float copy round-trips through f31 / an
 #     fld-fsd; a cross-bank bitcast whose float side is spilled is a bit-identical GP
 #     load / store of the slot (the bits are the same in either bank).
-# `mi.width` (4 / 8) selects the S vs D form throughout
+# `mi.width` (4 / 8) selects the S vs D form throughout, and any other width is
+# REFUSED rather than substituted (#2733). RV64D implements exactly S and D; a move
+# carrying anything else is a lowering or regalloc bug, and defaulting it to D used
+# to emit an 8-byte move that dropped everything above the low lane - a miscompile
+# with no diagnostic, which is strictly worse than the honest refusal its float
+# arithmetic / negate / compare siblings already give
 fun encode_fmov(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 2) { ret R.err[bool, str]("encode: fmov missing operands"); }
-    var w: u8 = mi.width;
-    if (w != 4 && w != 8) { w = 8; }
+    val w: u8 = mi.width;
+    if (!is_float_width(w)) {
+        ret R.err[bool, str]("internal compiler error: float move has a non-float operand width (expected 4 or 8)");
+    }
     val dbl: bool = w == 8;
     val dst: *mir.MirOperand = ?mi.operands[0];
     val src: *mir.MirOperand = ?mi.operands[1];
@@ -2510,13 +2613,13 @@ fun encode_fmov(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
     # a float-constant immediate source reaches here as `FMV float <- imm`.
     if (src.kind == mir.MIR_OP_IMM) {
         if (dst.kind == mir.MIR_OP_MEM) {
-            emit_fp_imm(st, FP_SCRATCH, src.imm, w);
+            val cr: R.Result[bool, str] = emit_fp_const(st, FP_SCRATCH, src.imm, w);
+            if (R.is_err[bool, str](cr)) { ret cr; }
             ret emit_fp_slot_store(st, f, dst, FP_SCRATCH, w);
         }
         val rdr: R.Result[i32, str] = req_fpr(dst);
         if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
-        emit_fp_imm(st, R.unwrap_ok[i32, str](rdr)::u32, src.imm, w);
-        ret R.ok[bool, str](true);
+        ret emit_fp_const(st, R.unwrap_ok[i32, str](rdr)::u32, src.imm, w);
     }
 
     if (dst.kind != mir.MIR_OP_MEM && src.kind != mir.MIR_OP_MEM) {
@@ -2621,9 +2724,13 @@ fun align16(n: u32) u32 {
 # each callee-saved register (GP or FP) takes one 8-byte slot. pub so the assembly
 # printer renders the exact reservation the encoder subtracts from sp
 pub fun frame_total(f: *mir.MirFunction) u32 {
-    val gp_bytes: u32 = popcount32(f.callee_mask) * 8;
-    val fp_bytes: u32 = popcount32(f.callee_mask_fp) * 8;
-    ret align16(16 + gp_bytes + fp_bytes + f.frame.size + f.frame.outgoing_size);
+    val reserved: u32 = frame_reserved_top(f)::u32;
+    val n: u32 = align16(reserved + f.frame.size + f.frame.outgoing_size);
+    if (f.frame.realign != 0) {
+        val rmask: u32 = f.frame.realign - 1;
+        ret (n + rmask) & ~rmask;
+    }
+    ret n;
 }
 
 # adjust SP by `delta` bytes (subtract on entry, add on exit). a delta within the
@@ -2683,6 +2790,19 @@ fun save_callee_fp(st: *encode.EncodeState, f: *mir.MirFunction, total: u32, sto
 # the entry stack pointer (so incoming stack arguments sit at `[s0+0]`), and the
 # callee-saved GP registers are saved just below the record
 fun emit_prologue(st: *encode.EncodeState, f: *mir.MirFunction, total: u32) {
+    if (f.frame.realign != 0) {
+        # the record and s0 are placed from the ENTRY stack pointer, before the mask
+        # moves it: s0 must keep pointing at the frame top, because incoming stack
+        # arguments sit at `[s0+0]` and belong to the caller (#2735).
+        emit_mem_access(st, RRA, RSP, 0 - 8, 8, false);           # sd ra, -8(sp)
+        emit_mem_access(st, RFP, RSP, 0 - 16, 8, false);          # sd s0, -16(sp)
+        emit_addi(st, RFP, RSP, 0);                               # addi s0, sp, 0
+        emit_sp_realign(st, f.frame.realign);
+        emit_sp_adjust(st, total, true);
+        save_callee_gp(st, f, total, true);
+        save_callee_fp(st, f, total, true);
+        ret;
+    }
     emit_sp_adjust(st, total, true);
     emit_mem_access(st, RRA, RSP, (total::i64) - 8, 8, false);   # sd ra, total-8(sp)
     emit_mem_access(st, RFP, RSP, (total::i64) - 16, 8, false);  # sd s0, total-16(sp)
@@ -2691,12 +2811,41 @@ fun emit_prologue(st: *encode.EncodeState, f: *mir.MirFunction, total: u32) {
     save_callee_fp(st, f, total, true);
 }
 
+# mask sp down to `realign` bytes, or emit nothing when the frame needs no realignment
+#
+# S0 IS PINNED AT THE ENTRY STACK POINTER AFTERWARDS AND IS DELIBERATELY LEFT THERE
+# (#2735): incoming stack arguments sit at `[s0+0]` and belong to the caller, and after
+# a mask only one of the two pointers is still a fixed distance from the caller's stack.
+# So the slot region moves to sp, and the epilogue's `addi sp, sp, total` is unaffected -
+# the frame is torn down from s0's record, not by undoing the mask.
+#
+# The mask runs BEFORE the reservation, so `sp + total` - the slot region's base once
+# `frame_reserved_top` is subtracted off it - carries the alignment.
+fun emit_sp_realign(st: *encode.EncodeState, realign: u32) {
+    if (realign == 0) { ret; }
+    val m: i64 = 0 - realign::i64;
+    if (m >= -2048) {
+        emit_i(st, OPC_OP_IMM, F3_AND, RSP, RSP, m::u32 & 0xFFF);
+        ret;
+    }
+    emit_li(st, SCRATCH, m);
+    emit_r(st, OPC_OP, F3_AND, F7_ZERO, RSP, RSP, SCRATCH);
+}
+
 # the RISC-V epilogue. it restores the callee-saved GP registers, reloads the ra / s0
 # record, then deallocates the frame with `addi sp, sp, total`. the RET that follows
 # returns through ra
 fun emit_epilogue(st: *encode.EncodeState, f: *mir.MirFunction, total: u32) {
     save_callee_gp(st, f, total, false);
     save_callee_fp(st, f, total, false);
+    if (f.frame.realign != 0) {
+        # the mask is undone by restoring sp from s0, which the mask never touched, so
+        # whatever it discarded is irrelevant. s0 is reloaded last, after sp names it.
+        emit_addi(st, RSP, RFP, 0);                              # addi sp, s0, 0
+        emit_mem_access(st, RRA, RSP, 0 - 8, 8, true);           # ld ra, -8(sp)
+        emit_mem_access(st, RFP, RSP, 0 - 16, 8, true);          # ld s0, -16(sp)
+        ret;
+    }
     emit_mem_access(st, RRA, RSP, (total::i64) - 8, 8, true);    # ld ra, total-8(sp)
     emit_mem_access(st, RFP, RSP, (total::i64) - 16, 8, true);   # ld s0, total-16(sp)
     emit_sp_adjust(st, total, false);
@@ -3075,6 +3224,12 @@ fun encode_function_body(st: *encode.EncodeState, f: *mir.MirFunction) R.Result[
 
     val naked: bool = f.frame.omit;
     val total: u32 = frame_total(f);
+    # the two distances to the slot region's base, stamped before any operand is
+    # resolved. s0 is pinned at the frame TOP here, with the record and the callee-save
+    # areas beneath it, so the base sits `fp_dist` below s0 and `base_dist` above sp.
+    # one derivation, read by the encoder's own accesses and by the DWARF producer.
+    f.frame.fp_dist   = frame_reserved_top(f)::u32;
+    f.frame.base_dist = total - f.frame.fp_dist;
     if (!naked) { emit_prologue(st, f, total); }
     val rp: R.Result[bool, str] = check_accounted(st, fn_base, PROLOGUE_REGION);
     if (R.is_err[bool, str](rp)) { ret rp; }
@@ -4464,6 +4619,9 @@ fun rv_patch(st: *encode.EncodeState, patch_pos: u32, target_off: u32) R.Result[
 #
 # A raw byte payload writes it exactly as it writes every other register - the compiler
 # does not decode the payload - unless the statement declared a set that omits it.
+# riscv64 measures every `{name}` from sp, realigned frame or not (#2689)
+fun rv_slot_from_sp(f: *mir.MirFunction) bool { ret true; }
+
 fun rv_writes_sp(item: *iasm.Item) bool {
     if (item.kind == iasm.AI_LABEL) { ret false; }
     if (item.kind == iasm.AI_BYTES) {
@@ -4496,6 +4654,7 @@ fun rv_grammar() iasm.Grammar {
     g.emit       = rv_emit;
     g.patch      = rv_patch;
     g.slot       = asm_slot_offset;
+    g.slot_sp    = rv_slot_from_sp;
     g.writes_sp  = rv_writes_sp;
     g.all_gp     = 0xFFFFFFFF;
     g.all_fp     = 0xFFFFFFFF;
@@ -4595,7 +4754,15 @@ fun rv_asm_text(st: *encode.EncodeState, f: *mir.MirFunction, l: *iasm.Labels, t
 # emit-level helpers (packers / prologue / epilogue / branch patch) directly
 fun tbuf(st: *encode.EncodeState, alloc: *A.Allocator) {
     page.make(alloc);
-    st.buf = encode.buf_init(alloc);
+    encode.state_blank(st, alloc);
+}
+
+# the same, plus a live interner, for a test whose path mints a constant-pool symbol
+fun tbuf_interned(st: *encode.EncodeState, alloc: *A.Allocator, itn: *intern.Interner) {
+    page.make(alloc);
+    @itn = intern.init(alloc);
+    encode.state_blank(st, alloc);
+    st.interner = itn;
 }
 
 # the R/I/S/U-type packers are byte-exact against `llvm-mc -triple=riscv64
@@ -6546,6 +6713,146 @@ test "mach.lang.target.isa.riscv64.encode:fmov_and_float_memory" {
     ret bad;
 }
 
+# whether an encoder REFUSED and left the sink untouched (test helper)
+#
+# The buffer check is the whole point and is not redundant with the error. "returned
+# an error" and "emitted nothing" are different properties, and a refusal that has
+# already appended bytes is the worse of the two failures: the driver reports the
+# error, the byte sink keeps a half-instruction, and the accounting the sink does on
+# the next claim is what breaks rather than the encoder. Asserting only `is_err`
+# would pass for that. The caller clears `buf.len` before the call, so a non-zero
+# length here is bytes THIS call wrote
+# ---
+# r:   the encoder's result
+# buf: the sink it was given
+# ret: true when it errored and wrote nothing
+fun t_refused(r: R.Result[bool, str], buf: *encode.ByteBuf) bool {
+    if (!R.is_err[bool, str](r)) { ret false; }
+    ret buf.len == 0;
+}
+
+# whether an encoder ACCEPTED a width, so the refusal is not over-broad (test helper)
+# ---
+# r:   the encoder's result
+# buf: the sink it was given
+# ret: true when it succeeded and wrote something
+fun t_accepted(r: R.Result[bool, str], buf: *encode.ByteBuf) bool {
+    if (R.is_err[bool, str](r)) { ret false; }
+    ret buf.len > 0;
+}
+
+# EVERY FLOAT ENCODER REFUSES A WIDTH RV64D DOES NOT IMPLEMENT, AND EMITS NOTHING
+#
+# RV64D has exactly two scalar float forms, S and D. `encode_fmov` used to answer a
+# width outside that pair by SUBSTITUTING 8 (#2733) - so a move the compiler could
+# not encode became an 8-byte move that dropped everything above the low lane, with
+# no diagnostic anywhere. A defensive default that produces wrong output is worse
+# than no default: it converts "the compiler was asked something it cannot do" into
+# "the program computes the wrong answer".
+#
+# THE REFUSALS ARE DRIVEN, NOT ARGUED. The reason this sat is that every layer could
+# point at another and say no caller reaches it, and #2687 showed what that argument
+# is worth: three layers each answered one fixed-size ladder, and widening the middle
+# layer's honest refusal alone compiled cleanly and then silently dropped the top
+# lane of every stack-passed vector. That refusal was the only thing standing between
+# this default and a miscompile. So each encoder is called here with the width it
+# must refuse, and the assertion is on the BYTES, not on a reachability argument.
+#
+# 16 IS THE INTERESTING WIDTH and it is checked on every encoder. riscv64 has no
+# vector form at all, so a 16-byte float value has nothing to encode to here - and
+# #2727, which makes over-width vectors legal, is what starts sending sizes down
+# these paths. Under the old default a 16-byte move emitted `fsd` and lost half the
+# value.
+test "mach.lang.target.isa.riscv64.encode:float_width_refusals_emit_nothing" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    tbuf(?st, ?alloc);
+
+    var ops: [3]mir.MirOperand;
+    ops[0] = fp_op(10); ops[1] = fp_op(11); ops[2] = fp_op(12);
+
+    # the float MOVE, this issue's defect. a register-register float copy is the
+    # cheapest shape it has, so nothing else can account for the bytes
+    var mv: mir.MirInstr = mir.instr(mir.MIR_MOV, ?ops[0], 2, 16, 0);
+    st.buf.len = 0;
+    if (!t_refused(encode_fmov(?st, nil, ?mv), ?st.buf)) { bad = 1; }
+    mv.width = 12; st.buf.len = 0;
+    if (!t_refused(encode_fmov(?st, nil, ?mv), ?st.buf)) { bad = 1; }
+    mv.width = 32; st.buf.len = 0;
+    if (!t_refused(encode_fmov(?st, nil, ?mv), ?st.buf)) { bad = 1; }
+    mv.width = 0;  st.buf.len = 0;
+    if (!t_refused(encode_fmov(?st, nil, ?mv), ?st.buf)) { bad = 1; }
+    mv.width = 1;  st.buf.len = 0;
+    if (!t_refused(encode_fmov(?st, nil, ?mv), ?st.buf)) { bad = 1; }
+
+    # and the two widths it DOES implement still encode, so the refusal is a check
+    # on the unmodelled set rather than on floats
+    mv.width = 4; st.buf.len = 0;
+    if (!t_accepted(encode_fmov(?st, nil, ?mv), ?st.buf)) { bad = 1; }
+    mv.width = 8; st.buf.len = 0;
+    if (!t_accepted(encode_fmov(?st, nil, ?mv), ?st.buf)) { bad = 1; }
+
+    # the arithmetic / negate / compare siblings already refused; they are driven
+    # here too so the census is one test rather than three arguments
+    var ar: mir.MirInstr = mir.instr(mir.MIR_FADD, ?ops[0], 3, 16, 0);
+    st.buf.len = 0;
+    if (!t_refused(encode_fp_arith(?st, nil, ?ar), ?st.buf)) { bad = 1; }
+    ar.width = 4; st.buf.len = 0;
+    if (!t_accepted(encode_fp_arith(?st, nil, ?ar), ?st.buf)) { bad = 1; }
+
+    var ng: mir.MirInstr = mir.instr(mir.MIR_FNEG, ?ops[0], 2, 16, 0);
+    st.buf.len = 0;
+    if (!t_refused(encode_fp_neg(?st, nil, ?ng), ?st.buf)) { bad = 1; }
+    ng.width = 8; st.buf.len = 0;
+    if (!t_accepted(encode_fp_neg(?st, nil, ?ng), ?st.buf)) { bad = 1; }
+
+    var cops: [3]mir.MirOperand;
+    cops[0] = mir.op_preg(10); cops[1] = fp_op(11); cops[2] = fp_op(12);
+    var cm: mir.MirInstr = mir.instr(mir.MIR_FCMP, ?cops[0], 3, 16, mir.FCC_EQ);
+    cm.src_width = mir.FCC_EQ;
+    st.buf.len = 0;
+    if (!t_refused(encode_fp_cmp(?st, nil, ?cm), ?st.buf)) { bad = 1; }
+    cm.width = 8; st.buf.len = 0;
+    if (!t_accepted(encode_fp_cmp(?st, nil, ?cm), ?st.buf)) { bad = 1; }
+
+    # the CONVERSIONS carried no ladder to find. they read `dw == 8` / `sw == 8` and
+    # took the S form for everything else, which is the same substitution in a shape
+    # a search for the ladder misses - and which side is the float one depends on the
+    # opcode, so each arm is driven separately. the integer side's legitimate 1 and 2
+    # must still pass, which is what a check written once at the top would have broken
+    var cv: mir.MirInstr = mir.instr(mir.MIR_FP_TRUNC, ?ops[0], 2, 16, 0);
+    cv.src_width = 8;
+    st.buf.len = 0;
+    if (!t_refused(encode_fp_conv(?st, nil, ?cv), ?st.buf)) { bad = 1; }
+    cv.width = 4; cv.src_width = 16; st.buf.len = 0;
+    if (!t_refused(encode_fp_conv(?st, nil, ?cv), ?st.buf)) { bad = 1; }
+    cv.width = 4; cv.src_width = 8; st.buf.len = 0;
+    if (!t_accepted(encode_fp_conv(?st, nil, ?cv), ?st.buf)) { bad = 1; }
+
+    var i2f: mir.MirInstr = mir.instr(mir.MIR_SI_TO_FP, ?ops[0], 2, 16, 0);
+    ops[0] = fp_op(10); ops[1] = mir.op_preg(11);
+    i2f.src_width = 8;
+    st.buf.len = 0;
+    if (!t_refused(encode_fp_conv(?st, nil, ?i2f), ?st.buf)) { bad = 1; }
+    # a 1-byte INTEGER source is legitimate and must survive the float-side check
+    i2f.width = 8; i2f.src_width = 1; st.buf.len = 0;
+    if (!t_accepted(encode_fp_conv(?st, nil, ?i2f), ?st.buf)) { bad = 1; }
+
+    var f2i: mir.MirInstr = mir.instr(mir.MIR_FP_TO_SI, ?ops[0], 2, 8, 0);
+    ops[0] = mir.op_preg(10); ops[1] = fp_op(11);
+    f2i.src_width = 16;
+    st.buf.len = 0;
+    if (!t_refused(encode_fp_conv(?st, nil, ?f2i), ?st.buf)) { bad = 1; }
+    # a 1-byte INTEGER destination is legitimate on the other side of the same op
+    f2i.width = 1; f2i.src_width = 8; st.buf.len = 0;
+    if (!t_accepted(encode_fp_conv(?st, nil, ?f2i), ?st.buf)) { bad = 1; }
+
+    encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+
 
 # a classifier's value, or a marker no encoding field can hold (test helper)
 #
@@ -7006,4 +7313,111 @@ fun asm_note_bytes(st: *encode.EncodeState, bytes: *u8, n: usize, start: usize) 
         j = j + 1;
     }
     ret encode.note_push(?st.buf, ?note);
+}
+
+# float-constant materialization: `emit_fp_const` picks the CHEAPEST of three forms
+# for a bit pattern - the zero register, one `emit_li` word plus the bank move, or a
+# constant-pool load.
+#
+# the decision matters more on RV64 than anywhere else: its widest immediate is 32
+# bits, so an arbitrary f64 pattern is built by repeated shift-and-add and costs
+# `emit_li` five to seven words. `li_words` has to track `emit_li`'s own recursion
+# exactly - a count that drifted from the emitter would silently choose the wrong
+# form - so the two are checked against each other here rather than against a table.
+#
+# the pooled form's two RELOCATIONS are asserted alongside its words. both immediates
+# are zero placeholders, so a pool load that recorded no relocation encodes to
+# exactly these bytes and loads from the wrong address.
+# float-constant materialization matches llvm-mc
+test "mach.lang.target.isa.riscv64.encode:float_constant_materialization" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    var itn: intern.Interner;
+    tbuf_interned(?st, ?alloc, ?itn);
+
+    # `li_words` agrees with what `emit_li` actually emits, for a spread of patterns
+    # spanning all three of its arms
+    var probe: [6]i64;
+    probe[0] = 7;                        # the 12-bit addi arm
+    probe[1] = 0x12345000;               # the lui-only arm (low twelve bits clear)
+    probe[2] = 0x12345678;               # the lui + addiw arm
+    probe[3] = 0x4000000000000000;       # f64 2.0, the recursive arm
+    probe[4] = 0x3FB999999999999A;       # f64 0.1, the recursive arm at its worst
+    probe[5] = 0x3FC0000000000000;       # f64 0.125
+    var pi: u32 = 0;
+    for (pi < 6) {
+        st.buf.len = 0;
+        emit_li(?st, SCRATCH, probe[pi]);
+        if ((st.buf.len / 4)::u32 != li_words(probe[pi])) { bad = 1; }
+        pi = pi + 1;
+    }
+
+    var ops: [3]mir.MirOperand;
+    var mi: mir.MirInstr = mir.instr(mir.MIR_MOV, ?ops[0], 2, 8, 0);
+
+    # +0.0 -> fa0: fmv.d.x fa0, x0 = 0xf2000553. ONE instruction reading the zero
+    # register, no pool entry and no relocation
+    ops[0] = fp_op(10); ops[1] = mir.op_imm(0);
+    st.buf.len = 0;
+    encode_fmov(?st, nil, ?mi);
+    if (st.buf.len != 4)                     { bad = 1; }
+    if (read_word(?st.buf, 0) != 0xF2000553) { bad = 1; }
+    if (st.const_count != 0)                 { bad = 1; }
+    if (st.reloc_count != 0)                 { bad = 1; }
+
+    # a pattern one `addi` builds stays in the register form: addi t0, x0, 7 ;
+    # fmv.d.x fa0, t0 = 0x00700293 ; 0xf2028553
+    ops[1] = mir.op_imm(7);
+    st.buf.len = 0;
+    encode_fmov(?st, nil, ?mi);
+    if (st.buf.len != 8)                     { bad = 1; }
+    if (read_word(?st.buf, 0) != 0x00700293) { bad = 1; }
+    if (read_word(?st.buf, 4) != 0xF2028553) { bad = 1; }
+    if (st.const_count != 0)                 { bad = 1; }
+
+    # f64 0.1 costs `emit_li` far more than a load, so it pools:
+    #   auipc t0, %pcrel_hi(.Lconst.0) = 0x00000297
+    #   fld fa0, %pcrel_lo(.Lconst.0)(t0) = 0x0002b507
+    ops[1] = mir.op_imm(0x3FB999999999999A);
+    st.buf.len = 0;
+    encode_fmov(?st, nil, ?mi);
+    if (st.buf.len != 8)                     { bad = 1; }
+    if (read_word(?st.buf, 0) != 0x00000297) { bad = 1; }
+    if (read_word(?st.buf, 4) != 0x0002B507) { bad = 1; }
+    if (st.const_count != 1)                 { bad = 1; }
+    if (st.reloc_count != 2)                 { bad = 1; }
+    or {
+        if (st.relocs[0].kind != of.RK_PCREL_HI20)   { bad = 1; }
+        if (st.relocs[1].kind != of.RK_PCREL_LO12_I) { bad = 1; }
+        # both halves name the SAME entry: the linker measures the low half from
+        # the auipc that carries the matching high half
+        if (st.relocs[0].sym != st.relocs[1].sym)  { bad = 1; }
+        if (st.relocs[0].sym != st.consts[0].sym)  { bad = 1; }
+    }
+    if (st.consts[0].len != 8 || st.consts[0].align != 8) { bad = 1; }
+    or {
+        if (st.consts[0].bytes[0] != 0x9A) { bad = 1; }
+        if (st.consts[0].bytes[7] != 0x3F) { bad = 1; }
+    }
+
+    # the same constant again is the same entry
+    st.buf.len = 0;
+    encode_fmov(?st, nil, ?mi);
+    if (st.const_count != 1) { bad = 1; }
+
+    # at f32 width the pooled load is `flw` (funct3 2) rather than `fld`, and the
+    # entry is FOUR bytes: 0x0002a507
+    mi.width = 4;
+    ops[1] = mir.op_imm(0x3DCCCCCD);
+    st.buf.len = 0;
+    encode_fmov(?st, nil, ?mi);
+    if (read_word(?st.buf, 4) != 0x0002A507) { bad = 1; }
+    if (st.const_count != 2)                 { bad = 1; }
+    if (st.consts[1].len != 4 || st.consts[1].align != 4) { bad = 1; }
+
+    encode.consts_free(?alloc, st.consts, st.const_count, st.const_cap);
+    encode.buf_dnit(?st.buf);
+    intern.dnit(?itn);
+    ret bad;
 }
