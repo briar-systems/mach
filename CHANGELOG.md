@@ -22,6 +22,17 @@ Folding the index now decides on **resolution identity** rather than on name tex
 
 ### Added
 
+#### `$is_secret(T)`, so a reflection walk can act on secrecy instead of refusing it (#2694)
+Every comptime predicate asks about the shape **under** a `^`, so all of them answer false for a secret. `$is_record(^u64)` and `$is_record(u64)` were therefore the same answer, and a `std.derive` walk could only ever meet a secret field as a fallthrough it had to refuse. That is a refusal, not a decision, and it blocked all three things a derive actually wants: a formatter that redacts a secret field, a hash that refuses one (a data-dependent fold is a leak in the shape of a digest), and an equality that selects the constant-time comparison rather than the early-out whose timing is the secret.
+
+`$is_secret(T)` is the positive question, and it joins the predicate family exactly: comptime-only, one type operand, gate position, answered per instantiation inside a generic. It is the family's one exception to the stripping rule, and the exception is coherent rather than special-cased — the other three ask about the wrapped storage, this one asks about the wrapper. The doc's stripping table names it as such.
+
+The contract is **outermost only**, the same line the shape predicates already draw, so the four cannot disagree about what a type is. `^*u8` is true (the pointer is the secret), `*^u8` is false (a public address to secret storage), `[N]^u8` is false, `^^T` is true because `^^T` collapses to `^T`, and a record with a secret field is false — the field is secret, and `$is_secret(f.type)` is where a walk meets that.
+
+There is deliberately no transitive "contains a secret anywhere" query. Folding it in would make the common case wrong: a formatter gating on a transitive answer would redact a whole record over one field, and could not tell which. Where the transitive question is genuinely wanted through a reference it composes instead, `$is_secret($pointee_of(f.type))`. `$pointee_of(^*U)` stays refused, which is right — `$is_secret` has already answered true there and a walk should stop.
+
+A walk that skips a secret field is pinned by the flow rules rather than by convention: reading one into a public accumulator does not compile, so a gate that answers wrongly is a compile error rather than a silent disclosure. The regression case relies on exactly that.
+
 #### A constant pool, so a float constant is loaded rather than rebuilt (#2248, #2700)
 A constant wider than an ISA's immediate forms has to live in memory somewhere. Every back end here instead rebuilt one from instructions at every use, inside loop bodies included: x86-64 spent `movabs r11 ; movq xmm, r11` (two instructions, 15 bytes, and a general-purpose scratch) because SSE has no immediate form at all, aarch64 spent up to four `movz`/`movk` words plus a bank move, and riscv64 spent `emit_li`'s recursive shift-and-add - five to seven words for an arbitrary `f64`, since its widest immediate is 32 bits.
 
