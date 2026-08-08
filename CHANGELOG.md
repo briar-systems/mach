@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+#### A comptime identifier names the declaration it resolves to, not the spelling (#2764)
+The comptime environment is keyed by **name**, and `comptime.eval_ident` looked a bare identifier up in it directly. Resolution identity was never consulted, so a binding was matched by what it is called rather than by which declaration it is. A block-local `val N` shadowing a module-level `val N = 9` therefore read back the **module** constant: `var xs: [N]i64;` under a runtime local `N` compiled as `[9]i64`, and the out-of-bounds diagnostic it later raised named a length the source never wrote.
+
+The evaluator now decides each identifier on the symbol the resolver bound to it. Every pass that owns a name-resolution map installs the same hook, and all of them answer from **one** function, `resolve.symbol_is_runtime`.
+
+That collapses the two rules that existed to compensate for the old reading. `resolve.check_gate_shadowing` is **removed**: it caught a case the evaluator would otherwise get wrong, and there is no such case left to catch. The constant index bound (#2751) no longer walks its operand for runtime leaves before folding, because the fold now fails on them by itself. `sema`'s `$if` gate walk keeps its per-kind diagnostics — a reader needs to hear "parameter" for a parameter and "value" for a binding — but delegates the decision.
+
+Consolidating them surfaced a disagreement the copies had been hiding. An `$each` loop variable is a **comptime** binding that resolve declares as a `SYM_VAL` bearing the comptime flag, and a rule keyed only on module scope classified it as runtime. The constant index bound consequently declined to decide any index driven by one, so `xs[e]` over an element out of range compiled clean and read past the array. It is now refused. `$` marks a comptime binding whatever its kind, and the rule says so once.
+
+A comptime binding that shadows a module constant still resolves innermost-first, which is the half of this that had to be preserved rather than changed: a `$param` or an `$each` variable named after a module constant denotes the inner one.
+
 ## [4.16.0] - 2026-08-08
 
 ### Added
