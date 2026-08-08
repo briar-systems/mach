@@ -121,9 +121,11 @@ cast. See [secrecy.md](secrecy.md).
 
 ## SIMD vectors
 
-The seeded 128-bit vector types (see [types.md](types.md)) carry lane-wise
-operators. **Which operators are legal is target-independent.** The table below is
-the whole surface, and it is identical on every target.
+Vector types (see [types.md](types.md)) carry lane-wise operators at every lane
+count, not only the 128-bit shapes. **Which operators are legal is
+target-independent.** The table below is the whole surface, and it is identical on
+every target and at every width — a `f32x8` add is as legal as a `f32x4` one, and
+the two differ only in how they are realized.
 
 | Lane family | `+` `-` | `*` | `/` | `%` | `& \| ^ ~` | `<< >>` | `== != < > <= >=` |
 |---|---|---|---|---|---|---|---|

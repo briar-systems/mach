@@ -68,6 +68,7 @@ use mach.lang.be.codegen.mir;
 use mach.lang.target.isa.spirv;
 use mach.lang.target.isa.spirv.cfg;
 use mach.lang.target.isa.spirv.types;
+use semtype: mach.lang.type;
 
 # the per-module emission state threaded through the walk
 #
@@ -147,6 +148,17 @@ rec Emit {
 #          chain_ty the type it points at. Such a vreg holds an address rather than
 #          a value, so it gets no backing variable and is never loaded as one; the
 #          load or store that consumes it addresses through the chain instead
+# opq_var: for a vreg holding an OPAQUE HANDLE, the descriptor variable it was
+#          loaded from (#2794). SPIR-V forbids storing an image, sampler or
+#          sampled-image object, so such a vreg gets no backing variable and cannot
+#          round-trip through one; every use RE-LOADS from the variable named here,
+#          which also makes the value trivially available in whatever block the use
+#          sits in rather than depending on a definition dominating it
+# opq_ssa: for a vreg holding a COMPUTED handle - the result of combining an image
+#          with a sampler - the id itself, since there is no variable to re-load
+#          from. SPIR-V requires such a result be consumed in the block that
+#          produced it, so carrying the bare id is not a shortcut here but the
+#          only shape the specification permits
 # n:       number of vregs
 rec VMaps {
     type_id: *u32;
@@ -155,6 +167,8 @@ rec VMaps {
     chain_id: *u32;
     chain_ty: *u32;
     chain_sc: *u32;
+    opq_var: *u32;
+    opq_ssa: *u32;
     n:       u32;
 }
 
@@ -414,7 +428,25 @@ fun declare_interface(e: *Emit) R.Result[bool, str] {
         if (g.iface == ir.IFACE_OUTPUT)      { storage = spirv.STORAGE_OUTPUT; }
         or (g.iface == ir.IFACE_UNIFORM)     { storage = spirv.STORAGE_UNIFORM; }
         or (g.iface == ir.IFACE_STORAGE)     { storage = spirv.STORAGE_STORAGE_BUFFER; }
+        # an opaque handle is UniformConstant and only UniformConstant: it is not
+        # memory a shader reads through, it is a name the pipeline binds a descriptor
+        # to, and Vulkan permits an image, sampler or sampled-image variable in no
+        # other class (#2794).
+        or (g.iface == ir.IFACE_SAMPLER)     { storage = spirv.STORAGE_UNIFORM_CONSTANT; }
         or (g.iface == ir.IFACE_BUILTIN)     { storage = builtin_storage(g.iface_a); }
+
+        # the role and the type must agree, and the back end says so rather than
+        # trusting the front end's own check: an `#[input]` of handle type would
+        # otherwise be emitted as an Input-class opaque variable, which no Vulkan
+        # environment accepts, and a `#[sampler]` of an ordinary type as a
+        # UniformConstant block, which is a different descriptor entirely (#2794).
+        val handle: bool = is_image_type(e, g.ty);
+        if (handle && g.iface != ir.IFACE_SAMPLER) {
+            ret R.err[bool, str]("spirv.emit: an image handle carries an interface role other than `#[sampler(set, binding)]`; a handle is bound as a descriptor and reaches no other storage class");
+        }
+        if (!handle && g.iface == ir.IFACE_SAMPLER) {
+            ret R.err[bool, str]("spirv.emit: a `#[sampler(set, binding)]` binding is not of an image handle type; a descriptor-bound block or buffer of an ordinary type is `#[uniform]` or `#[storage]`");
+        }
 
         var value_ty: u32 = 0;
         if (g.iface == ir.IFACE_UNIFORM || g.iface == ir.IFACE_STORAGE) {
@@ -445,7 +477,8 @@ fun declare_interface(e: *Emit) R.Result[bool, str] {
         if (g.iface == ir.IFACE_BUILTIN) {
             decorate(e, var_id, spirv.DECOR_BUILTIN, builtin_selector(g.iface_a));
         }
-        if (g.iface == ir.IFACE_UNIFORM || g.iface == ir.IFACE_STORAGE) {
+        if (g.iface == ir.IFACE_UNIFORM || g.iface == ir.IFACE_STORAGE
+            || g.iface == ir.IFACE_SAMPLER) {
             decorate(e, var_id, spirv.DECOR_DESCRIPTOR_SET, g.iface_a);
             decorate(e, var_id, spirv.DECOR_BINDING, g.iface_b);
         }
@@ -1565,6 +1598,12 @@ fun emit_preamble(e: *Emit) {
     if ((need & spirv.NEED_INT64) != 0)   { emit_cap(e, spirv.CAP_INT64); }
     if ((need & spirv.NEED_FLOAT16) != 0) { emit_cap(e, spirv.CAP_FLOAT16); }
     if ((need & spirv.NEED_FLOAT64) != 0) { emit_cap(e, spirv.CAP_FLOAT64); }
+    # the image dimensionalities that need one beyond Shader (#2794). Accumulated by
+    # `types.type_image` when the type is minted, on exactly the terms the width
+    # capabilities are, so a handle declared but never sampled still declares what
+    # its declaration requires.
+    if ((need & spirv.NEED_SAMPLED_1D) != 0)         { emit_cap(e, spirv.CAP_SAMPLED_1D); }
+    if ((need & spirv.NEED_SAMPLED_CUBE_ARRAY) != 0) { emit_cap(e, spirv.CAP_SAMPLED_CUBE_ARRAY); }
     var mm: [2]u32;
     mm[0] = spirv.ADDRESSING_LOGICAL;
     mm[1] = spirv.MEMORY_GLSL450;
@@ -2166,6 +2205,8 @@ fun build_vmaps(e: *Emit, mf: *mir.MirFunction, irfn: *ir.Function, out: *VMaps)
     out.chain_id = nil;
     out.chain_ty = nil;
     out.chain_sc = nil;
+    out.opq_var = nil;
+    out.opq_ssa = nil;
     if (n == 0) { ret R.ok[bool, str](true); }
 
     val rt: R.Result[*u32, str] = A.allocate[u32](e.alloc, n::usize);
@@ -2186,9 +2227,15 @@ fun build_vmaps(e: *Emit, mf: *mir.MirFunction, irfn: *ir.Function, out: *VMaps)
     val rcs: R.Result[*u32, str] = A.allocate[u32](e.alloc, n::usize);
     if (R.is_err[*u32, str](rcs)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rcs)); }
     out.chain_sc = R.unwrap_ok[*u32, str](rcs);
+    val rov: R.Result[*u32, str] = A.allocate[u32](e.alloc, n::usize);
+    if (R.is_err[*u32, str](rov)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rov)); }
+    out.opq_var = R.unwrap_ok[*u32, str](rov);
+    val ros: R.Result[*u32, str] = A.allocate[u32](e.alloc, n::usize);
+    if (R.is_err[*u32, str](ros)) { ret R.err[bool, str](R.unwrap_err[*u32, str](ros)); }
+    out.opq_ssa = R.unwrap_ok[*u32, str](ros);
 
     var i: u32 = 0;
-    for (i < n) { out.type_id[i] = 0; out.var_id[i] = 0; out.is_bool[i] = false; out.chain_id[i] = 0; out.chain_ty[i] = 0; out.chain_sc[i] = 0; i = i + 1; }
+    for (i < n) { out.type_id[i] = 0; out.var_id[i] = 0; out.is_bool[i] = false; out.chain_id[i] = 0; out.chain_ty[i] = 0; out.chain_sc[i] = 0; out.opq_var[i] = 0; out.opq_ssa[i] = 0; i = i + 1; }
 
     # a vreg fed from a nominal register is typed by the DECLARATION behind that
     # register, never by the move: the ABI pre-coloring is emitted at the machine
@@ -2263,7 +2310,12 @@ fun build_vmaps(e: *Emit, mf: *mir.MirFunction, irfn: *ir.Function, out: *VMaps)
     # emit one OpVariable(Function) per defined vreg, at the entry, and record its id.
     i = 0;
     for (i < n) {
-        if (out.type_id[i] != 0) {
+        # AN OPAQUE HANDLE GETS NO BACKING VARIABLE (#2794). Every other vreg round
+        # trips through a Function-storage variable, which is this emitter's whole
+        # value model; a handle cannot, because SPIR-V forbids storing an image,
+        # sampler or sampled-image object into anything. Its value is carried as an
+        # id, or re-loaded from the descriptor it came from, instead.
+        if (out.type_id[i] != 0 && !types.type_is_opaque(e.tt, out.type_id[i])) {
             val ptr_ty: u32 = types.type_ptr(e.tt, spirv.STORAGE_FUNCTION, out.type_id[i]);
             val var_id: u32 = spirv.alloc_id(e.b);
             var vop: [3]u32;
@@ -2366,6 +2418,24 @@ fun type_computed_defs(e: *Emit, mf: *mir.MirFunction, out: *VMaps, skip_copies:
             # backing variable: the access chain it becomes is consumed directly by
             # the load or store that follows, never loaded as a value.
             if (mi.opcode == mir.MIR_GEP || mi.opcode == mir.MIR_ALLOCA) { ii = ii + 1; cnt; }
+            # A WHOLE-VARIABLE LOAD IS TYPED BY THE VARIABLE, not by the move's
+            # width and register class. The object's own type is the authority -
+            # the store side has always read it this way - and a width plus a class
+            # cannot express every type a variable holds: an opaque image handle
+            # has no width at all, and inferring one gave it an integer type and an
+            # `OpLoad %ulong` from a sampled-image variable, which is a module the
+            # validator rejects and the compiler was happy to write (#2794).
+            if (mi.opcode == mir.MIR_LOAD && mi.operand_count == 2
+                && mi.operands[0].kind == mir.MIR_OP_VREG) {
+                val lv: u32 = mi.operands[0].vreg;
+                val lt: u32 = interface_value_type(e, ?mi.operands[1]);
+                if (lv < out.n && out.type_id[lv] == 0 && lt != 0) {
+                    out.type_id[lv] = lt;
+                    out.is_bool[lv] = false;
+                    ii = ii + 1;
+                    cnt;
+                }
+            }
             if (mir.instr_defines_shape(mi) && mi.operands[0].kind == mir.MIR_OP_VREG) {
                 val v: u32 = mi.operands[0].vreg;
                 if (v < out.n && out.type_id[v] == 0 && !(skip_copies && is_reg_copy(mi))) {
@@ -2447,6 +2517,8 @@ fun vmaps_dnit(e: *Emit, vm: *VMaps) {
     if (vm.type_id != nil) { A.deallocate[u32](e.alloc, vm.type_id, vm.n::usize); }
     if (vm.var_id != nil)  { A.deallocate[u32](e.alloc, vm.var_id, vm.n::usize); }
     if (vm.is_bool != nil) { A.deallocate[bool](e.alloc, vm.is_bool, vm.n::usize); }
+    if (vm.opq_var != nil) { A.deallocate[u32](e.alloc, vm.opq_var, vm.n::usize); }
+    if (vm.opq_ssa != nil) { A.deallocate[u32](e.alloc, vm.opq_ssa, vm.n::usize); }
     if (vm.chain_id != nil) { A.deallocate[u32](e.alloc, vm.chain_id, vm.n::usize); }
     if (vm.chain_ty != nil) { A.deallocate[u32](e.alloc, vm.chain_ty, vm.n::usize); }
     if (vm.chain_sc != nil) { A.deallocate[u32](e.alloc, vm.chain_sc, vm.n::usize); }
@@ -2551,6 +2623,7 @@ fun ir_value_spv_type(e: *Emit, id: type.IrTypeId) u32 {
         if (elem == 0) { ret 0; }
         ret types.type_array(e.tt, elem, t.data.array_.count, false);
     }
+    if (t.kind == type.IRT_IMAGE) { ret image_spv_type(e, t); }
     if (t.kind == type.IRT_STRUCT) {
         val n: u32 = t.data.struct_.field_count;
         if (n == 0 || n > types.MAX_STRUCT_MEMBERS) { ret 0; }
@@ -2565,6 +2638,70 @@ fun ir_value_spv_type(e: *Emit, id: type.IrTypeId) u32 {
         ret types.type_struct(e.tt, ?members[0], n, false);
     }
     ret 0;
+}
+
+# the SPIR-V type an IR image handle names, declaring it on first use (#2794)
+#
+# EVERY OPERAND IS CARRIED ACROSS, none derived: the IR type holds the sampled
+# scalar, dimensionality, depth, arrayedness and multisampledness that `image_form`
+# read from the spelling, and each becomes the `OpTypeImage` operand of the same
+# name. That is what keeps a second dimensionality or an arrayed image a row rather
+# than a second lowering path - and what keeps a defaulted operand from producing a
+# module a validator accepts, describing a different image than the one declared.
+#
+# A bare sampler has no image behind it and is answered first; a combined handle is
+# the sampled-image wrapper over the image the same operands describe.
+# ---
+# e: the emission state
+# t: the IRT_IMAGE type
+# ret: the SPIR-V type id, or 0 when the sampled scalar has no SPIR-V form
+fun image_spv_type(e: *Emit, t: *type.IrType) u32 {
+    if (t.data.image_.form == semtype.IMG_FORM_SAMPLER) { ret types.type_sampler(e.tt); }
+
+    # `isampler2d` and `usampler2d` share one SPIR-V image type, and that is forced
+    # rather than sloppy: this emitter's integers are sign-less throughout, because
+    # SPIR-V puts signedness on the operation rather than on the type. A sample's
+    # result type must have the same component type as the image's sampled type, so
+    # minting a signed `OpTypeInt 32 1` here would disagree with the sign-less vector
+    # every integer result is typed at, and every integer sample would fail
+    # validation. The two spellings stay distinct mach types - which is what decides
+    # the result type a program declares - and agree on the descriptor.
+    var sampled: u32 = types.type_float(e.tt, 32);
+    if (t.data.image_.sampled == semtype.TYPE_I32 || t.data.image_.sampled == semtype.TYPE_U32) {
+        sampled = types.type_int(e.tt, 32);
+    }
+
+    var depth: u32 = 0;
+    if (t.data.image_.depth) { depth = 1; }
+    var arrayed: u32 = 0;
+    if (t.data.image_.arrayed) { arrayed = 1; }
+    var ms: u32 = 0;
+    if (t.data.image_.ms) { ms = 1; }
+
+    val img: u32 = types.type_image(e.tt, sampled, image_dim_operand(t.data.image_.dim),
+                                    depth, arrayed, ms, spirv.IMAGE_SAMPLED_YES);
+    if (img == 0) { ret 0; }
+    if (t.data.image_.form == semtype.IMG_FORM_SAMPLED) { ret types.type_sampled_image(e.tt, img); }
+    ret img;
+}
+
+# the SPIR-V `Dim` operand a mach dimensionality ordinal names
+#
+# The ONE place the two numberings meet, and it lives here rather than in either
+# leaf: `type.IMG_DIM_*` is the front end's, so a dimensionality can be spelled and
+# refused without the front end depending on a back end, and the spec numbers are
+# `spirv`'s. Adding a dimensionality is a row here.
+# ---
+# dim: the mach ordinal (a `semtype.ImageDim`)
+# ret: the SPIR-V Dim operand
+fun image_dim_operand(dim: u8) u32 {
+    if      (dim == semtype.IMG_DIM_1D)      { ret spirv.DIM_1D; }
+    or (dim == semtype.IMG_DIM_3D)           { ret spirv.DIM_3D; }
+    or (dim == semtype.IMG_DIM_CUBE)         { ret spirv.DIM_CUBE; }
+    or (dim == semtype.IMG_DIM_RECT)         { ret spirv.DIM_RECT; }
+    or (dim == semtype.IMG_DIM_BUFFER)       { ret spirv.DIM_BUFFER; }
+    or (dim == semtype.IMG_DIM_SUBPASS)      { ret spirv.DIM_SUBPASS_DATA; }
+    ret spirv.DIM_2D;
 }
 
 # the SPIR-V return type of an IR function: void, or a scalar; 0 when unsupported
@@ -2698,6 +2835,17 @@ fun addressed_memory_refusal(e: *Emit, mf: *mir.MirFunction, op: *mir.MirOperand
     ret R.unwrap_ok[str, str](r);
 }
 
+# whether an IR type is an opaque image / sampler handle (#2794)
+# ---
+# e:   the emission state
+# id:  the IR type id
+# ret: true for an IRT_IMAGE
+fun is_image_type(e: *Emit, id: type.IrTypeId) bool {
+    val opt: O.Option[*type.IrType] = type.get(?e.ir.types, id);
+    if (O.is_none[*type.IrType](opt)) { ret false; }
+    ret O.unwrap[*type.IrType](opt).kind == type.IRT_IMAGE;
+}
+
 # whether an IR type is an aggregate reached by indexing
 # ---
 # e:   the emission state
@@ -2728,6 +2876,18 @@ fun emit_global_load(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *Regs
     val dst: u32 = mi.operands[0].vreg;
     if (dst >= vm.n || vm.type_id[dst] == 0) {
         ret R.err[bool, str]("spirv.emit: interface load result vreg has no type");
+    }
+    # loading an opaque handle emits NOTHING HERE (#2794): the descriptor variable
+    # is recorded on the vreg and each use re-loads from it, which puts the load in
+    # the block that consumes the value rather than in whichever block the mach
+    # source happened to name the binding in. A chain result cannot be a handle -
+    # a handle has no members - so only the whole-variable case can arrive.
+    if (types.type_is_opaque(e.tt, vm.type_id[dst])) {
+        if (chain_ty != 0) {
+            ret unsupported(e, "an image handle reached through a member walk is not supported by the SPIR-V target: a handle has no members, so this is an access chain into something that is not an aggregate");
+        }
+        vm.opq_var[dst] = var_id;
+        ret R.ok[bool, str](true);
     }
     val result: u32 = spirv.alloc_id(e.b);
     var ops: [3]u32;
@@ -3332,6 +3492,19 @@ fun instruction_mapped(irmod: *ir.Module, name: intern.StrId) bool {
 fun read_operand(e: *Emit, vm: *VMaps, preg_val: *Regs, op: *mir.MirOperand, want_ty: u32) u32 {
     if (op.kind == mir.MIR_OP_VREG) {
         val v: u32 = op.vreg;
+        # AN OPAQUE HANDLE has no backing variable to load from (#2794). Read from
+        # the descriptor it came from, freshly at this use site, so the value is
+        # available in whatever block the use sits in; or, for a handle a previous
+        # instruction computed, hand its id straight on - which is what SPIR-V
+        # requires of a combined image-and-sampler result anyway.
+        if (v < vm.n && vm.opq_var[v] != 0) {
+            val fresh: u32 = spirv.alloc_id(e.b);
+            var ol: [3]u32;
+            ol[0] = vm.type_id[v]; ol[1] = fresh; ol[2] = vm.opq_var[v];
+            spirv.inst(e.b, ?e.b.functions, spirv.OP_LOAD, ?ol[0], 3);
+            ret fresh;
+        }
+        if (v < vm.n && vm.opq_ssa[v] != 0) { ret vm.opq_ssa[v]; }
         if (v >= vm.n || vm.var_id[v] == 0) { e.b.err = true; ret 0; }
         val result: u32 = spirv.alloc_id(e.b);
         var lo: [3]u32;
@@ -3411,6 +3584,13 @@ fun immediate(e: *Emit, want_ty: u32, imm: i64) u32 {
 # value: the SSA value id to store
 # ret:   true on success, or an error string
 fun store_vreg(e: *Emit, vm: *VMaps, vreg: u32, value: u32) R.Result[bool, str] {
+    # an opaque handle is RECORDED rather than stored (#2794): SPIR-V forbids
+    # storing an image, sampler or sampled-image object, so the vreg carries the id
+    # and every use reads it back from here.
+    if (vreg < vm.n && vm.type_id[vreg] != 0 && types.type_is_opaque(e.tt, vm.type_id[vreg])) {
+        vm.opq_ssa[vreg] = value;
+        ret R.ok[bool, str](true);
+    }
     if (vreg >= vm.n || vm.var_id[vreg] == 0) {
         ret R.err[bool, str]("spirv.emit: store to an undeclared vreg");
     }
@@ -3666,12 +3846,14 @@ fun emit_vec_build(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr) R.R
     if (given != lanes) {
         ret R.err[bool, str]("spirv.emit: vector build lane count does not match its vector type");
     }
-    # 2 fixed words plus at most MAX_VECTOR_LANES lanes. The bound is the widest
-    # vector the surface admits, not the widest OpTypeVector: a wider shape is
-    # realized as an array and OpCompositeConstruct builds that too (#2749).
-    if (given > types.MAX_VECTOR_LANES) { ret unsupported(e, unsupported_value_type(e, mi)); }
-
-    var ops: [18]u32;
+    # 2 fixed words plus one per lane. NO LANE-COUNT CEILING (#2727): the buffer used
+    # to be a fixed eighteen words guarded by a refusal, sized by the widest vector
+    # the surface could spell rather than by anything SPIR-V bounds - a shape wider
+    # than an OpTypeVector is realized as an array, and OpCompositeConstruct builds
+    # that too (#2749), at whatever length the array has.
+    val ro: R.Result[*u32, str] = A.allocate[u32](e.alloc, (given + 2)::usize);
+    if (R.is_err[*u32, str](ro)) { ret R.err[bool, str](R.unwrap_err[*u32, str](ro)); }
+    val ops: *u32 = R.unwrap_ok[*u32, str](ro);
     ops[0] = vec_ty;
     val result: u32 = spirv.alloc_id(e.b);
     ops[1] = result;
@@ -3680,9 +3862,13 @@ fun emit_vec_build(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr) R.R
         ops[2 + i] = read_operand(e, vm, preg_val, ?mi.operands[1 + i], lane_ty);
         i = i + 1;
     }
-    if (e.b.err) { ret R.err[bool, str]("spirv.emit: unreadable operand in vector build"); }
+    if (e.b.err) {
+        A.deallocate[u32](e.alloc, ops, (given + 2)::usize);
+        ret R.err[bool, str]("spirv.emit: unreadable operand in vector build");
+    }
 
-    spirv.inst(e.b, ?e.b.functions, spirv.OP_COMPOSITE_CONSTRUCT, ?ops[0], 2 + given);
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_COMPOSITE_CONSTRUCT, ops, 2 + given);
+    A.deallocate[u32](e.alloc, ops, (given + 2)::usize);
     ret store_vreg(e, vm, dst, result);
 }
 
