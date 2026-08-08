@@ -296,14 +296,31 @@ def run(out_root, matrix_path, only_targets, only_cases, only_layers, bless):
     return 0 if ok else 1
 
 
+class Built(object):
+    """the case's builds for one target, produced when a layer asks for one.
+
+    building is what the run spends its time on, so a build nothing consumes is the
+    whole cost of a declared-away column. asking here rather than building up front
+    means a skip removes the work as well as the cell, and it keeps one source of
+    truth for which pipelines matter: the layer that reads a build is what causes it.
+    """
+
+    def __init__(self, proj, target, case, logdir):
+        self.proj, self.target, self.case, self.logdir = proj, target, case, logdir
+        self.done = {}
+
+    def get(self, profile):
+        if profile not in self.done:
+            rc, log = self.proj.build(self.case, self.target, profile)
+            name = "%s.%s.%s.log" % (self.case.replace("/", "__"), self.target.name, profile)
+            with open(os.path.join(self.logdir, name), "w", encoding="utf-8") as fh:
+                fh.write(log)
+            self.done[profile] = (rc == 0, log)
+        return self.done[profile]
+
+
 def run_target_case(proj, tools, ref, m, t, case, wanted, skips, logdir, bless, blessed):
-    built = {}
-    for profile in sorted(projectmod.PROFILES):
-        rc, log = proj.build(case, t, profile)
-        name = "%s.%s.%s.log" % (case.replace("/", "__"), t.name, profile)
-        with open(os.path.join(logdir, name), "w", encoding="utf-8") as fh:
-            fh.write(log)
-        built[profile] = (rc == 0, log)
+    built = Built(proj, t, case, logdir)
 
     for layer in wanted:
         whole = config.find_skip(skips, case, layer)
@@ -330,7 +347,7 @@ def layer_a_cells(proj, tools, m, t, case, built, skips):
     for profile in config.LAYER_PROFILES["a"]:
         if cell_skip(m, skips, case, t.name, "a", profile):
             continue
-        ok, log = built[profile]
+        ok, log = built.get(profile)
         if not ok:
             m.add(case, t.name, "a", profile, "FAIL", "", "build failed: " + first_error(log))
             continue
@@ -346,7 +363,7 @@ def layer_a_cells(proj, tools, m, t, case, built, skips):
 def layer_b_cells(proj, tools, m, t, case, built, bless, blessed, skips):
     if cell_skip(m, skips, case, t.name, "b", "o2"):
         return
-    ok, log = built["o2"]
+    ok, log = built.get("o2")
     if not ok:
         m.add(case, t.name, "b", "o2", "FAIL", "", "build failed: " + first_error(log))
         return
@@ -382,7 +399,7 @@ def layer_c_cells(proj, ref, m, t, case, built, skips):
             m.add(case, t.name, "c", profile, "FAIL", engine, err)
         return
     for profile in live:
-        ok, log = built[profile]
+        ok, log = built.get(profile)
         if not ok:
             m.add(case, t.name, "c", profile, "FAIL", engine, "build failed: " + first_error(log))
             continue
