@@ -175,7 +175,7 @@ fun parse_postfix(p: *state.Parser, base: id.ExprId) id.ExprId {
                 lhs = parse_bracket_call(p, lhs);
             }
             or {
-                lhs = parse_index(p, lhs);
+                lhs = parse_bracket_value(p, lhs);
             }
         }
         or (k == token.KIND_DOT) {
@@ -270,6 +270,56 @@ fun parse_bracket_call(p: *state.Parser, callee: id.ExprId) id.ExprId {
         ret parse_generic_call(p, callee);
     }
     ret parse_index(p, callee);
+}
+
+# parses a postfix '[' with NO '(' after its matching ']' - an index
+# `object[expr]` or a generic instance named as a value `f[T, ..]` (#2342)
+#
+# The value form and the callee form are the same spelling, so they run the same
+# two probes and reach the same four outcomes; only the node built differs. The
+# type-only and both readings produce an EXPR_KIND_GENERIC_INSTANCE, whose
+# index_callee carries the alternative INDEX reading when one exists, and resolve
+# picks between them by the object's resolved kind exactly as it does for a
+# provisional bracket call.
+#
+# A type-only payload has no index reading to fall back on (`arr[*i32]` is not a
+# subscript under any parse), so the instance node is built with index_callee
+# EXPR_NIL and resolve reports against an object that names no generic.
+# ---
+# p:      parser state, cursor on the '['
+# object: expression the bracket applies to
+# ret:    ExprId of the resulting index or generic-instance expression
+fun parse_bracket_value(p: *state.Parser, object: id.ExprId) id.ExprId {
+    val idx_probe: id.ExprId = probe_index_payload(p);
+    val ty_ok:     bool      = probe_type_payload(p);
+
+    if (!ty_ok) { ret parse_index(p, object); }
+
+    val open:       token.Span = state.current(p).span;
+    val start_span: token.Span = expr_span_or(p, object, open);
+    val after:      usize      = scan_bracket_close(p, 0);
+    var close_span: token.Span = open;
+    if (after != 0) { close_span = state.peek(p, after - 1).span; }
+
+    var type_args_len:   u32 = 0;
+    val type_args_start: u32 = parse_type_args(p, ?type_args_len);
+
+    var index_callee: id.ExprId = id.EXPR_NIL;
+    if (idx_probe != id.EXPR_NIL) { index_callee = make_index(p, object, idx_probe); }
+
+    var call: expr.ExprCall;
+    call.callee          = object;
+    call.args_start      = 0;
+    call.args_len        = 0;
+    call.type_args_start = type_args_start;
+    call.type_args_len   = type_args_len;
+    call.index_callee    = index_callee;
+
+    var node: expr.Expr;
+    node.span      = state.span_of(start_span, close_span);
+    node.kind      = expr.EXPR_KIND_GENERIC_INSTANCE;
+    node.data.call = call;
+    ret state.push_expr(p, node);
 }
 
 # speculatively reads the current '[...]' payload as a single index expression
@@ -1694,13 +1744,16 @@ test "mach.lang.fe.parser.expr.parse_expr:nested_index_then_call" {
     val eid: id.ExprId = parse_expr(?p);
     var rc: i32 = 0;
     val e: *expr.Expr = O.unwrap[*expr.Expr](ast.get_expr(?a, eid));
-    # `m[i]` is a plain index (no trailing call), so the provisional `[j](` sits
-    # on an index callee; the bracket call still records its index reading.
+    # the outer `[j](` is a provisional bracket call. `m[i]` has no trailing call,
+    # so since #2342 it is provisional too - a generic instance carrying the index
+    # reading - and resolve canonicalizes it to an index once `m` resolves to a
+    # value. before #2342 the parser committed it to an index here.
     if (e.kind != expr.EXPR_KIND_CALL)           { rc = 1; }
     or (e.data.call.index_callee == id.EXPR_NIL) { rc = 1; }
     or {
         val callee: *expr.Expr = O.unwrap[*expr.Expr](ast.get_expr(?a, e.data.call.callee));
-        if (callee.kind != expr.EXPR_KIND_INDEX) { rc = 1; }
+        if (callee.kind != expr.EXPR_KIND_GENERIC_INSTANCE) { rc = 1; }
+        or (callee.data.call.index_callee == id.EXPR_NIL)   { rc = 1; }
     }
     if (diagnostic.has_errors(?diags)) { rc = 1; }
 
@@ -1738,6 +1791,66 @@ test "mach.lang.fe.parser.expr.parse_expr:chained_call_provisional_inner" {
     diagnostic.dnit(?diags);
     ast.dnit(?a);
     lexer.dnit(?stream, ?alloc);
+    ret rc;
+}
+
+# a bracket in VALUE position - no '(' after the ']' - reads by the SAME two
+# probes as the callee form, so `f[i64]` is a generic instance rather than an
+# index (#2342)
+#
+# Each row varies only the payload, which is the property under test: `i64` is
+# both a type and a name, `*i32` is a type and nothing else, and `0` is a value
+# and nothing else. The three must land in three different shapes, so a parser
+# that answered "instance" (or "index") to all of them fails here.
+test "mach.lang.fe.parser.expr.parse_expr:bracket_value_readings" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var rc: i32 = 0;
+
+    # BOTH readings: an instance node that still carries the index fallback.
+    rc = rc | bracket_value_shape(?alloc, "f[i64]", expr.EXPR_KIND_GENERIC_INSTANCE, true, 1);
+    # TYPE ONLY: an instance node with no fallback to canonicalize back to.
+    rc = rc | bracket_value_shape(?alloc, "f[*i32]", expr.EXPR_KIND_GENERIC_INSTANCE, false, 1);
+    # EXPRESSION ONLY: an ordinary index, exactly as before #2342.
+    rc = rc | bracket_value_shape(?alloc, "f[0]", expr.EXPR_KIND_INDEX, false, 0);
+    # several type arguments ride the instance the same way, and a comma ends the
+    # index probe (one subscript is one expression), so there is no fallback.
+    rc = rc | bracket_value_shape(?alloc, "f[i64, u32]", expr.EXPR_KIND_GENERIC_INSTANCE, false, 2);
+    # a trailing '(' is still the CALLEE form, which stays an EXPR_KIND_CALL.
+    rc = rc | bracket_value_shape(?alloc, "f[i64](3)", expr.EXPR_KIND_CALL, true, 1);
+    ret rc;
+}
+
+# parses `text` as one expression and checks the resulting node's shape
+# ---
+# alloc:    allocator for the lexer / ast
+# text:     the expression source
+# kind:     the ExprKind the node must have
+# want_idx: whether an index fallback must be recorded (ignored for an index node)
+# targs:    the type-argument count the node must carry (0 for an index node)
+# ret:      0 when every field matches, else 1
+fun bracket_value_shape(alloc: *A.Allocator, text: str, kind: expr.ExprKind, want_idx: bool, targs: u32) i32 {
+    val res_tokens: R.Result[lexer.TokenStream, str] = lexer.tokenize(text, alloc, 0::source.FileId);
+    if (R.is_err[lexer.TokenStream, str](res_tokens)) { ret 1; }
+    var stream: lexer.TokenStream   = R.unwrap_ok[lexer.TokenStream, str](res_tokens);
+    var a:      ast.Ast             = ast.init(alloc, 0::source.FileId);
+    var diags:  diagnostic.DiagList = diagnostic.init(alloc);
+    var p:      state.Parser        = state.make(?stream, ?a, ?diags);
+
+    val eid: id.ExprId = parse_expr(?p);
+    var rc: i32 = 0;
+    val e: *expr.Expr = O.unwrap[*expr.Expr](ast.get_expr(?a, eid));
+    if (e.kind != kind) { rc = 1; }
+    or (kind != expr.EXPR_KIND_INDEX) {
+        if (e.data.call.type_args_len != targs)                             { rc = 1; }
+        or (want_idx && e.data.call.index_callee == id.EXPR_NIL)            { rc = 1; }
+        or (!want_idx && e.data.call.index_callee != id.EXPR_NIL)           { rc = 1; }
+    }
+    if (diagnostic.has_errors(?diags)) { rc = 1; }
+
+    diagnostic.dnit(?diags);
+    ast.dnit(?a);
+    lexer.dnit(?stream, alloc);
     ret rc;
 }
 

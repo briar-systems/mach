@@ -50,6 +50,19 @@ val x: i64 = identity[i64](42);
 val p: Pair[i64, u8] = make_pair[i64, u8](1, 2u8);
 ```
 
+The same spelling with no call after it **names the instance as a value**. Its
+type is the instantiated signature, so it can be stored, passed, returned, and
+addressed:
+
+```mach
+val f: fun(i64) i64 = identity[i64];   # the i64 instance, as a value
+val p: ptr          = ?identity[i64];  # its address
+ret apply(identity[i64], 42);          # passed as a callback
+```
+
+A generic itself is a template rather than code, so a bare `identity` has no
+address and cannot be a value; only an instance can.
+
 ## Comptime value parameters
 
 A parameter marked with `$name: T` must be supplied with a value the
