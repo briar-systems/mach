@@ -38,6 +38,15 @@ A textured shader emits a **byte-identical module** across the migration: the sa
 
 ### Fixed
 
+#### A SPIR-V value is typed by what defines it, not by a MIR width (#2919, #2920)
+Two modules the compiler wrote while reporting success, and that only the external validator refused. A `for` loop whose counter is 8 or 16 bits allocated the counter as a 64-bit variable while its increment and its bound stayed narrow, so the comparison mixed bit widths. A `:~` between two 16-byte vector types declared an `OpTypeInt 128`, which SPIR-V has no form for, beside an `OpBitcast` that was itself typed as the vector it read rather than as the one it produces.
+
+Both reconstruct a type from a **MIR byte width** at a point where the value's real type lives somewhere else. A phi merge materializes its constant at the machine word because a sub-word write to a machine register leaves the upper bits unspecified, which is a statement about a register file SPIR-V does not have. The emitter already knew a copy is not the source of type truth and skipped register copies, but not immediate ones. A conversion reconstructed its source type unconditionally, and interning a type declares it, so a 16-byte source width put a scalar integer in the module the instruction never read. And `compute_vec_lane` describes an instruction by its first vector operand, which is right for every instruction whose two sides share a shape and wrong for the one whose operand shape is exactly what it discards.
+
+**The emission point now refuses rather than writing an invalid module.** `type_int` and `type_float` return 0 for a width SPIR-V has no type at, on the same terms `type_vector` already returns 0 for a component count no Shader module may declare, and the arithmetic and comparison forms refuse an operand whose own type is not the one its position declares. A width guard alone could not have seen the loop counter, where every individual type was legal and only the pairing was wrong.
+
+Every machine target's output is unchanged byte for byte: 675 objects across linux-x86_64, linux-arm64 and linux-riscv64, plus a vector-reinterpret fixture built for all three, which is the shape the shared lane descriptor touches and which mach's own source does not contain.
+
 #### An aggregate is passed and returned by value on the SPIR-V target (#2914, #2915)
 `fun sum(p: Pair) u32` was refused for `spirv` with an addressed-memory diagnostic, and `fun make() Pair` failed earlier still with a bare `spirv.emit: unreadable move source` that named no opcode, no function and no position. A shader API where a record cannot cross a call in either direction is not a finished one.
 
