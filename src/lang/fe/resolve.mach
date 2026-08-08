@@ -74,6 +74,9 @@ pub val SYM_PRIM:     SymKind = 11;
 # a seeded 128-bit vector type name (#1965); `slot` carries the pre-interned
 # semantic vector TypeId directly, not a TypeKind ordinal
 pub val SYM_VECTOR:   SymKind = 12;
+# an image / sampler handle type name (#2794); `slot` carries the interned
+# semantic TYPE_IMAGE TypeId, exactly as SYM_VECTOR carries a vector's
+pub val SYM_IMAGE:    SymKind = 13;
 
 # pub-flag bit, set when the symbol's source decl is `pub`, or when it is
 # re-exported by `fwd`
@@ -223,6 +226,13 @@ rec ResolveContext {
     # use-sites of one spelling share a single Symbol rather than inflating the
     # symbol table per reference.
     vec_cache: map.Map[intern.StrId, SymbolId];
+
+    # image / sampler handle cache: spelling -> the SYM_IMAGE symbol for it (#2794).
+    # its own map rather than a shared one with the vectors, because the two
+    # grammars are separate and a single map named after one of them would read as
+    # a coincidence. filled and read on the same terms: recognised in type position
+    # only, and one Symbol per spelling per module.
+    img_cache: map.Map[intern.StrId, SymbolId];
 
     # caches (origin << 32 | decl) -> SymbolId for already-created
     # SYM_IMPORTED entries, so repeated `print.println` use-sites share one
@@ -483,6 +493,7 @@ fun init_context(
 
     rc.imported_cache = map.init[u64, SymbolId](s.alloc, map.hash_u64, map.eq_u64);
     rc.vec_cache      = map.init[intern.StrId, SymbolId](s.alloc, map.hash_u32, map.eq_u32);
+    rc.img_cache      = map.init[intern.StrId, SymbolId](s.alloc, map.hash_u32, map.eq_u32);
     rc.module_index   = map.init[intern.StrId, SymbolId](s.alloc, map.hash_u32, map.eq_u32);
 
     # every allocation past this point is owned by the context; on a failure
@@ -524,6 +535,11 @@ fun init_context(
         memory.fill[SymbolId](rc.decl_symbol, SYMBOL_NIL, a.decl_len);
     }
 
+    # install last, once expr_resolved exists: from here on every fold this pass
+    # runs decides an identifier on the declaration bound to it (#2764). cleared by
+    # dnit_context, which every exit from `resolve` reaches, so the borrowed ctx
+    # never keeps a dangling ResolveContext pointer.
+    comptime.set_ident_resolver(ctx, comptime_ident_is_runtime::*u8, rc::ptr);
     ret R.ok[bool, str](true);
 }
 
@@ -531,6 +547,7 @@ fun init_context(
 # ---
 # rc: the context to tear down
 fun dnit_context(rc: *ResolveContext) {
+    if (rc.ctx != nil) { comptime.set_ident_resolver(rc.ctx, nil, nil); }
     var i: u32 = 0;
     for (i < rc.scope_len) {
         val sc: *Scope = ?rc.scopes[i];
@@ -556,6 +573,7 @@ fun dnit_context(rc: *ResolveContext) {
     }
     map.dnit[u64, SymbolId](?rc.imported_cache);
     map.dnit[intern.StrId, SymbolId](?rc.vec_cache);
+    map.dnit[intern.StrId, SymbolId](?rc.img_cache);
     map.dnit[intern.StrId, SymbolId](?rc.module_index);
 }
 
@@ -851,17 +869,24 @@ pub val TYPE_SPELL_NONE:        TypeSpellStatus = 0;
 pub val TYPE_SPELL_FOUND:       TypeSpellStatus = 1;
 # a well formed vector form the target's vector width does not admit
 pub val TYPE_SPELL_VEC_REFUSED: TypeSpellStatus = 2;
+# a well formed image / sampler handle whose members this cut does not emit
+# (#2794). its own outcome rather than a second use of the vector one, because the
+# two are refused for unrelated reasons and share no payload
+pub val TYPE_SPELL_IMG_REFUSED: TypeSpellStatus = 3;
 
 # what a spelling turned out to be in type position
 # ---
-# status: which of the three cases the spelling fell into
+# status: which of the four cases the spelling fell into
 # sym:    the symbol, when status is TYPE_SPELL_FOUND; SYMBOL_NIL otherwise
 # form:   the shape read, when the spelling was a vector form; only meaningful
 #         when status is TYPE_SPELL_VEC_REFUSED
+# img:    the handle read, when the spelling was one; only meaningful when status
+#         is TYPE_SPELL_IMG_REFUSED
 rec TypeSpelling {
     status: TypeSpellStatus;
     sym:    SymbolId;
     form:   type.VecForm;
+    img:    type.ImgForm;
 }
 
 # the SYM_PRIM or SYM_VECTOR symbol for a type spelling
@@ -903,10 +928,27 @@ fun type_spelling(rc: *ResolveContext, name: intern.StrId) R.Result[TypeSpelling
         ret R.ok[TypeSpelling, str](out);
     }
 
+    # a spelling already resolved to an image / sampler handle in this module.
+    val icached: R.Result[*SymbolId, str] = map.get[intern.StrId, SymbolId](?rc.img_cache, ?name);
+    if (R.is_ok[*SymbolId, str](icached)) {
+        out.status = TYPE_SPELL_FOUND;
+        out.sym    = @R.unwrap_ok[*SymbolId, str](icached);
+        ret R.ok[TypeSpelling, str](out);
+    }
+
     val no: O.Option[str] = intern.lookup(?rc.s.interner, name);
     if (O.is_none[str](no)) { ret R.ok[TypeSpelling, str](out); }
 
-    val form: type.VecForm = type.vector_form(O.unwrap[str](no), rc.ctx.vector_bits);
+    # the handle grammar is read BEFORE the vector one. The two cannot both claim a
+    # spelling - no handle name contains an `x` splitting a primitive from a lane
+    # count - so the order is not a tie-break, only a fixed one so a future member
+    # of either grammar has a defined winner rather than an accidental one.
+    val ir_out: R.Result[TypeSpelling, str] = image_spelling(rc, name, O.unwrap[str](no), out);
+    if (R.is_err[TypeSpelling, str](ir_out)) { ret ir_out; }
+    out = R.unwrap_ok[TypeSpelling, str](ir_out);
+    if (out.status != TYPE_SPELL_NONE) { ret R.ok[TypeSpelling, str](out); }
+
+    val form: type.VecForm = type.vector_form(O.unwrap[str](no));
     out.form = form;
     if (form.status == type.VEC_FORM_NONE) { ret R.ok[TypeSpelling, str](out); }
     if (form.status != type.VEC_FORM_OK) {
@@ -930,11 +972,94 @@ fun type_spelling(rc: *ResolveContext, name: intern.StrId) R.Result[TypeSpelling
     ret R.ok[TypeSpelling, str](out);
 }
 
-# report a well formed vector spelling the target will not admit
+# read `spelling` as an image / sampler handle, interning and caching its symbol
 #
-# Names the width that was asked for and the width the target has, so the
-# message is about the vector rather than about an unknown identifier. A
-# degenerate lane count is a different sentence: no target width would admit it.
+# Split out of `type_spelling` rather than inlined because the handle grammar has
+# its own refusal outcome, and folding two grammars' outcomes into one ladder was
+# how the vector path came to need a comment explaining which `if` belonged to
+# which question.
+# ---
+# rc:       resolver state for the module being resolved
+# name:     the interned spelling
+# spelling: the spelling's text
+# out:      the outcome so far (status TYPE_SPELL_NONE)
+# ret:      the outcome, or an allocation error
+fun image_spelling(rc: *ResolveContext, name: intern.StrId, spelling: str,
+                   out: TypeSpelling) R.Result[TypeSpelling, str] {
+    var o: TypeSpelling = out;
+    val img: type.ImgForm = type.image_form(spelling);
+    o.img = img;
+    if (img.status == type.IMG_FORM_NONE) { ret R.ok[TypeSpelling, str](o); }
+    if (img.status != type.IMG_FORM_OK) {
+        o.status = TYPE_SPELL_IMG_REFUSED;
+        ret R.ok[TypeSpelling, str](o);
+    }
+
+    val r_tid: R.Result[type.TypeId, str] = type.intern_image(?rc.s.types, img.image);
+    if (R.is_err[type.TypeId, str](r_tid)) { ret R.err[TypeSpelling, str](R.unwrap_err[type.TypeId, str](r_tid)); }
+    val itid: type.TypeId = R.unwrap_ok[type.TypeId, str](r_tid);
+
+    val r_sym: R.Result[SymbolId, str] = add_symbol(rc, SYM_IMAGE, 0, name, id.DECL_NIL, itid::u32, rc.own_module);
+    if (R.is_err[SymbolId, str](r_sym)) { ret R.err[TypeSpelling, str](R.unwrap_err[SymbolId, str](r_sym)); }
+    val sid: SymbolId = R.unwrap_ok[SymbolId, str](r_sym);
+
+    val ins: R.Result[bool, str] = map.insert[intern.StrId, SymbolId](?rc.img_cache, name, sid);
+    if (R.is_err[bool, str](ins)) { ret R.err[TypeSpelling, str](R.unwrap_err[bool, str](ins)); }
+
+    o.status = TYPE_SPELL_FOUND;
+    o.sym    = sid;
+    ret R.ok[TypeSpelling, str](o);
+}
+
+# report a well formed image / sampler handle whose members this cut does not emit
+#
+# NAMES THE MEMBER, not the type. "unsupported type" would leave a reader to guess
+# which of the six operands the emitter objected to, and the whole point of reading
+# the grammar rather than matching a name is that the compiler knows exactly which
+# one. Depth-comparison is the member #2794 puts out of scope by name, and it says
+# so rather than reading as an oversight.
+# ---
+# rc:   resolver state for the module being resolved
+# span: the spelling's source span
+# name: the interned spelling
+# img:  the handle read from it
+# ret:  ok(true), or an allocation error
+fun report_image_refused(rc: *ResolveContext, span: token.Span, name: intern.StrId,
+                         img: type.ImgForm) R.Result[bool, str] {
+    val no: O.Option[str] = intern.lookup(?rc.s.interner, name);
+    if (O.is_none[str](no)) { ret R.ok[bool, str](true); }
+    val spelling: str = O.unwrap[str](no);
+
+    var reason: str = "this image handle is not supported";
+    if (img.reason == type.IMG_REFUSE_DEPTH) {
+        reason = "depth-comparison sampling is out of scope for the first sampled-image cut (#2794): a `shadow` handle is sampled by `OpImageSampleDref*`, which takes a reference value the sampling operation here has no operand for. it is refused rather than emitted as an ordinary image, which would compile and compare nothing";
+    }
+    or (img.reason == type.IMG_REFUSE_MS) {
+        reason = "a multisampled image is not sampled at all: it is FETCHED per sample by `OpImageFetch` with a `Sample` image operand, which is a different instruction with an operand mask this cut does not carry. an `ms` handle sampled as an ordinary one would be an invalid module";
+    }
+    or (img.reason == type.IMG_REFUSE_DIM) {
+        reason = "this dimensionality needs a capability and a sampling path beyond the ones emitted here: `rect` and `buffer` are unnormalized-coordinate and texel-buffer images, and `subpass` is read by `OpImageRead` within a render pass. `1d`, `2d`, `3d` and `cube` are the dimensionalities this cut binds";
+    }
+    or (img.reason == type.IMG_REFUSE_STORAGE) {
+        reason = "a storage image (`image...`) is read and written directly rather than sampled, so it carries an Image Format operand this cut does not spell and needs `OpImageRead` / `OpImageWrite`. a `sampler...` or `texture...` handle is the sampled form";
+    }
+
+    val rm: R.Result[str, str] = format.sprint(rc.s.alloc,
+        "`{}` is spelled as an image handle, and {}", spelling, reason);
+    if (R.is_err[str, str](rm)) { ret R.err[bool, str](R.unwrap_err[str, str](rm)); }
+    val msg: str = R.unwrap_ok[str, str](rm);
+
+    val emit: R.Result[bool, str] = diagnostic.error(?rc.s.diags, rc.a.file_id, span, msg);
+    A.deallocate[char](rc.s.alloc, msg::*char, str_len(msg) + 1);
+    ret emit;
+}
+
+# report a well formed vector spelling the compiler cannot represent
+#
+# Names the shape rather than reporting an unknown identifier. NEITHER SENTENCE
+# MENTIONS A TARGET (#2727): a vector's legality is target-independent, so the only
+# refusals left are the degenerate lane count and a lane count past what MIR carries,
+# and both read the same on every target.
 # ---
 # rc:   resolver state for the module being resolved
 # span: the spelling's source span
@@ -951,9 +1076,8 @@ fun report_vector_refused(rc: *ResolveContext, span: token.Span, name: intern.St
         "vector `{}` needs at least 2 lanes", spelling);
     if (form.status == type.VEC_FORM_TOO_WIDE) {
         rm = format.sprint(rc.s.alloc,
-            "vector `{}` is {} bits wide, more than this target's {}-bit vector width",
-            spelling, form.lanes::u64 * type.prim_desc(form.element).bits::u64,
-            rc.ctx.vector_bits);
+            "vector `{}` has more than {} lanes, which the compiler cannot represent",
+            spelling, type.MAX_VEC_LANES);
     }
     if (R.is_err[str, str](rm)) { ret R.err[bool, str](R.unwrap_err[str, str](rm)); }
     val msg: str = R.unwrap_ok[str, str](rm);
@@ -1098,6 +1222,24 @@ fun reject_vector_named_type(rc: *ResolveContext, kind: SymKind, name_span: toke
     val no: O.Option[str] = intern.lookup(?rc.s.interner, name_id);
     if (O.is_none[str](no)) { ret R.ok[bool, str](true); }
     val spelling: str = O.unwrap[str](no);
+
+    # the image / sampler grammar reserves its spellings on the same terms and for
+    # the same reason (#2794): the form is consulted in type position ahead of
+    # scope, so a `rec sampler2d` would be a declaration nothing could name. A
+    # spelling whose members this cut REFUSES is reserved too - whether a member is
+    # emitted yet is a scope decision, and letting it decide whether a declaration
+    # is legal would make the source break arrive with the member rather than now.
+    if (type.is_image_spelling(spelling)) {
+        val ri: R.Result[str, str] = format.sprint(rc.s.alloc,
+            "`{}` is spelled as an image handle type, so it cannot also name a type; the declaration would be unreachable",
+            spelling);
+        if (R.is_err[str, str](ri)) { ret R.err[bool, str](R.unwrap_err[str, str](ri)); }
+        val imsg: str = R.unwrap_ok[str, str](ri);
+        val iemit: R.Result[bool, str] = diagnostic.error(?rc.s.diags, rc.a.file_id, name_span, imsg);
+        A.deallocate[char](rc.s.alloc, imsg::*char, str_len(imsg) + 1);
+        ret iemit;
+    }
+
     if (!type.is_vector_spelling(spelling)) { ret R.ok[bool, str](true); }
 
     val rm: R.Result[str, str] = format.sprint(rc.s.alloc,
@@ -1815,17 +1957,14 @@ fun bind_comptime_if(rc: *ResolveContext, branches_start: u32, branches_len: u32
     var bi: u32 = 0;
     for (bi < branches_len) {
         val br: *decl.ComptimeBranch = ?rc.a.comptime_branches[branches_start + bi];
-        # resolve the gate's identifiers before folding it, recording each leaf's
-        # resolution identity, then reject any leaf whose binding the name-keyed
-        # fold would silently misread (a runtime local/param shadowing a comptime
-        # constant). eval failures themselves are reported by
-        # comptime_branch_active; this check covers exactly the case where the
-        # fold SUCCEEDS against the wrong binding.
+        # resolve the gate's identifiers before folding it, so each leaf's
+        # resolution identity is recorded by the time the installed ident resolver
+        # is asked for it. a leaf naming a runtime binding then fails the fold on
+        # identity, and comptime_branch_active reports that failure - there is no
+        # second rule here to keep in step with the evaluator's (#2764).
         if (br.cond != id.EXPR_NIL) {
             val rce: R.Result[bool, str] = bind_expr(rc, br.cond);
             if (R.is_err[bool, str](rce)) { ret rce; }
-            val rcs: R.Result[bool, str] = check_gate_shadowing(rc, br.cond);
-            if (R.is_err[bool, str](rcs)) { ret rcs; }
         }
         val take_r: R.Result[bool, str] = comptime_branch_active(rc, br);
         if (R.is_err[bool, str](take_r)) { ret take_r; }
@@ -1843,72 +1982,47 @@ fun bind_comptime_if(rc: *ResolveContext, branches_start: u32, branches_len: u32
 # whether a resolved symbol denotes a RUNTIME binding, decided on resolution
 # identity rather than on name text
 #
-# ONE definition because the comptime environment is keyed by NAME: a block-local
+# THE definition. The comptime environment is keyed by NAME, so a block-local
 # `val`/`var` or a non-`$` parameter that happens to share a name with a
-# module-level constant folds to that constant, so every site that decides
-# whether an identifier may be folded has to ask the same question. A second
-# enumeration of this rule would drift, and the two sites it serves - the `$if`
-# gate shadowing check and the constant index bound (#2751) - disagree loudly
-# when it does: one miscompiles a gate, the other refuses a legal access.
+# module-level constant would otherwise read back that constant - which is the
+# defect this answers (#2764). `comptime.eval_ident` asks it through the ident
+# resolver every pass installs, so the evaluator, the `$if` gate diagnostics, and
+# the constant index bound (#2751) all decide the same question from this one
+# function rather than from three enumerations of it.
 #
-# Module scope is what makes a `val` foldable, `$` is what makes a parameter
-# foldable, and everything else (a function, an import, a type name) is not a
-# value binding at all and is left to the evaluator.
+# `$` marks a comptime binding whatever its kind: a `$param`, and the `$each` loop
+# variable, which resolve declares as a SYM_VAL bearing SYM_FLAG_COMPTIME and which
+# a rule keyed only on module scope therefore misread as runtime. Module scope is
+# what makes an unmarked `val` foldable, and everything else (a function, an import,
+# a type name) is not a value binding at all and is left to the evaluator.
 # ---
 # sym: the resolved symbol
 # ret: true when the symbol names storage decided at runtime
 pub fun symbol_is_runtime(sym: *Symbol) bool {
+    if ((sym.flags & SYM_FLAG_COMPTIME) != 0) { ret false; }
     if (sym.kind == SYM_VAL || sym.kind == SYM_VAR) {
         ret (sym.flags & SYM_FLAG_MODULE) == 0;
     }
-    if (sym.kind == SYM_PARAM) {
-        ret (sym.flags & SYM_FLAG_COMPTIME) == 0;
-    }
-    ret false;
+    ret sym.kind == SYM_PARAM;
 }
 
-# walks a folded (non-param) `$if` gate and rejects any
-# leaf identifier that resolves to a runtime binding whose NAME also names a
-# comptime constant in the env. the comptime fold is name-keyed, so such a gate
-# folds against the constant while the resolver bound the ident to the runtime
-# local / parameter - a silent wrong-arm miscompile. a runtime ident whose name
-# is not in the env is left alone: the fold fails on it and
-# comptime_branch_active reports that failure, so reporting here would
-# duplicate it. reports at the offending leaf's span
+# the identifier-binding resolver resolve installs on the module's ComptimeCtx (a
+# comptime.IdentBindingFn), so a gate folded during binding reads the declaration
+# the resolver just bound rather than whatever shares the spelling. leaves reach
+# this already recorded: bind_expr runs over a gate before comptime_branch_active
+# folds it. an unrecorded or out-of-range leaf answers false, leaving the evaluator
+# to report the name as not a constant
 # ---
-# rc:  resolver state for the module being resolved
-# eid: the gate expression to walk
-# ret: ok(true), or a reported shadowing error
-fun check_gate_shadowing(rc: *ResolveContext, eid: id.ExprId) R.Result[bool, str] {
-    if (eid == id.EXPR_NIL) { ret R.ok[bool, str](true); }
-    val e_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, eid);
-    if (O.is_none[*expr.Expr](e_opt)) { ret R.ok[bool, str](true); }
-    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
-
-    if (e.kind == expr.EXPR_KIND_BINARY) {
-        val rl: R.Result[bool, str] = check_gate_shadowing(rc, e.data.binary.lhs);
-        if (R.is_err[bool, str](rl)) { ret rl; }
-        ret check_gate_shadowing(rc, e.data.binary.rhs);
-    }
-    if (e.kind == expr.EXPR_KIND_UNARY) {
-        ret check_gate_shadowing(rc, e.data.unary.operand);
-    }
-    if (e.kind != expr.EXPR_KIND_IDENT) { ret R.ok[bool, str](true); }
-
-    if (rc.expr_resolved == nil) { ret R.ok[bool, str](true); }
+# data: the *ResolveContext, erased to a ptr by the installer
+# eid:  the IDENT expression id, valid in this module's ast
+# ret:  true when the identifier names a runtime binding
+fun comptime_ident_is_runtime(data: ptr, eid: id.ExprId) bool {
+    val rc: *ResolveContext = data::*ResolveContext;
+    if (rc == nil || rc.expr_resolved == nil) { ret false; }
+    if (eid == id.EXPR_NIL || eid::u32 >= rc.a.expr_len::u32) { ret false; }
     val sid: SymbolId = rc.expr_resolved[eid];
-    if (sid == SYMBOL_NIL || sid >= rc.sym_len) { ret R.ok[bool, str](true); }
-    val sym: *Symbol = ?rc.symbols[sid];
-
-    if (!symbol_is_runtime(sym)) { ret R.ok[bool, str](true); }
-
-    val id_r: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, e.span);
-    if (R.is_err[intern.StrId, str](id_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](id_r)); }
-    val nc: O.Option[*comptime.NamedConst] = comptime.lookup(rc.ctx, R.unwrap_ok[intern.StrId, str](id_r));
-    if (O.is_none[*comptime.NamedConst](nc)) { ret R.ok[bool, str](true); }
-
-    ret diagnostic.error(?rc.s.diags, rc.a.file_id, e.span,
-        "comptime branch condition references a runtime binding that shadows a comptime constant");
+    if (sid == SYMBOL_NIL || sid >= rc.sym_len) { ret false; }
+    ret symbol_is_runtime(?rc.symbols[sid]);
 }
 
 # reports whether any arm gate of a `$if` chain references a comptime value
@@ -2432,6 +2546,13 @@ fun bind_expr(rc: *ResolveContext, eid: id.ExprId) R.Result[bool, str] {
         if (R.is_err[bool, str](rc_e)) { ret rc_e; }
         ret bind_generic_call(rc, e.data.call.type_args_start, e.data.call.type_args_len, e.data.call.args_start, e.data.call.args_len);
     }
+    if (e.kind == expr.EXPR_KIND_GENERIC_INSTANCE) {
+        # `object[T, ..]` with no call after it (#2342): the bracket reads as a
+        # type-argument list, and possibly also as a subscript. choose now from
+        # the object's resolved kind, exactly as resolve_bracket_call does for
+        # the callee form, and canonicalize before sema sees the node.
+        ret resolve_bracket_value(rc, eid);
+    }
     if (e.kind == expr.EXPR_KIND_INDEX) {
         val ro: R.Result[bool, str] = bind_expr(rc, e.data.index.object);
         if (R.is_err[bool, str](ro)) { ret ro; }
@@ -2587,6 +2708,98 @@ fun resolve_bracket_call(rc: *ResolveContext, eid: id.ExprId) R.Result[bool, str
     e.data.call.type_args_start = 0;
     e.data.call.type_args_len   = 0;
     ret bind_expr_list(rc, args_start, args_len);
+}
+
+# resolves a bracket in VALUE position `object[x]` (EXPR_KIND_GENERIC_INSTANCE)
+# that the parser could not classify: `[x]` read as a type-argument list, and
+# possibly also as an index expression
+#
+# The predicate here is deliberately NOT callee_accepts_type_args. With no `(` to
+# key on, every subscript in the language reaches this path, so the question must
+# be the narrow one - does the object name a FUNCTION declaration, the only thing
+# a value-position instance can denote - rather than the broad "can this take
+# type arguments in callee position". The broad predicate accepts SYM_IMPORTED
+# unconditionally and would rule `mod.ARR[i]`, an imported array indexed by a
+# name, a generic instance.
+#
+# The node is canonicalized to the chosen shape: kept as a generic instance with
+# index_callee cleared, or rewritten in place into the pre-built INDEX node's
+# shape so sema and lowering see an ordinary subscript.
+# ---
+# rc:  resolver state for the module being resolved
+# eid: the bracket-value expression
+# ret: ok(true), or a binding error
+fun resolve_bracket_value(rc: *ResolveContext, eid: id.ExprId) R.Result[bool, str] {
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, eid);
+    if (O.is_none[*expr.Expr](e_opt)) { ret R.err[bool, str]("ExprId out of range"); }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
+
+    val object:          id.ExprId = e.data.call.callee;
+    val index_callee:    id.ExprId = e.data.call.index_callee;
+    val type_args_start: u32       = e.data.call.type_args_start;
+    val type_args_len:   u32       = e.data.call.type_args_len;
+    val span:            token.Span = e.span;
+
+    val ro: R.Result[bool, str] = bind_expr(rc, object);
+    if (R.is_err[bool, str](ro)) { ret ro; }
+
+    if (object_names_function(rc, object)) {
+        e.data.call.index_callee = id.EXPR_NIL;
+        ret bind_generic_call(rc, type_args_start, type_args_len, 0, 0);
+    }
+
+    if (index_callee == id.EXPR_NIL) {
+        # the payload is a type spelling and nothing else (`arr[*i32]`), so there
+        # is no subscript reading to fall back on. report against the object,
+        # which is what the type arguments would have had to name.
+        val re: R.Result[bool, str] = diagnostic.error(?rc.s.diags, rc.a.file_id, span,
+            "type arguments in value position name a generic instance, but this does not name a generic function");
+        if (R.is_err[bool, str](re)) { ret re; }
+        e.kind = expr.EXPR_KIND_ERROR;
+        ret R.ok[bool, str](true);
+    }
+
+    val idx_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, index_callee);
+    if (O.is_none[*expr.Expr](idx_opt)) { ret R.err[bool, str]("ExprId out of range"); }
+    val idxn: *expr.Expr = O.unwrap[*expr.Expr](idx_opt);
+    val rs: R.Result[bool, str] = bind_expr(rc, idxn.data.index.index);
+    if (R.is_err[bool, str](rs)) { ret rs; }
+
+    # rewrite this node into the index reading rather than forwarding to the
+    # pre-built one: `eid` is the id every parent already holds.
+    val idx_payload: expr.ExprIndex = idxn.data.index;
+    e.kind       = expr.EXPR_KIND_INDEX;
+    e.data.index = idx_payload;
+    ret R.ok[bool, str](true);
+}
+
+# true when a value-position bracket's object names a function DECLARATION - the
+# only referent `object[T, ..]` can instantiate
+#
+# A SYM_FUN is a function. A SYM_IMPORTED carries no referent kind, so the origin
+# module's AST is read for the decl's kind, the same discriminator lowering's
+# names_function uses. Everything else - a binding, a parameter, a record or def
+# name, an unresolved name - makes the bracket a subscript.
+# ---
+# rc:     resolver state for the module being resolved
+# object: the resolved object expression
+# ret:    true when `object` names a function declaration
+fun object_names_function(rc: *ResolveContext, object: id.ExprId) bool {
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, object);
+    if (O.is_none[*expr.Expr](e_opt)) { ret false; }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
+    if (e.kind != expr.EXPR_KIND_IDENT && e.kind != expr.EXPR_KIND_MEMBER) { ret false; }
+    if (rc.expr_resolved == nil)                                           { ret false; }
+    val sid: SymbolId = rc.expr_resolved[object];
+    if (sid == SYMBOL_NIL || sid >= rc.sym_len) { ret false; }
+    val sym: *Symbol = ?rc.symbols[sid];
+    if (sym.kind == SYM_FUN)      { ret true; }
+    if (sym.kind != SYM_IMPORTED) { ret false; }
+    val origin_ast: *ast.Ast = session.module_ast(rc.s, sym.origin);
+    if (origin_ast == nil) { ret false; }
+    val opt_d: O.Option[*decl.Decl] = ast.get_decl(origin_ast, sym.decl);
+    if (O.is_none[*decl.Decl](opt_d)) { ret false; }
+    ret O.unwrap[*decl.Decl](opt_d).kind == decl.DECL_KIND_FUN;
 }
 
 # binds a generic call's type arguments and value arguments - the tail shared by
@@ -2968,6 +3181,11 @@ fun bind_type_name_expr(rc: *ResolveContext, eid: id.ExprId) R.Result[bool, str]
         if (sp.status == TYPE_SPELL_VEC_REFUSED) {
             ret report_vector_refused(rc, e.span, name, sp.form);
         }
+        # a well formed image handle whose members this cut does not emit is the
+        # same shape of decision, named for the member rather than the width.
+        if (sp.status == TYPE_SPELL_IMG_REFUSED) {
+            ret report_image_refused(rc, e.span, name, sp.img);
+        }
 
         var sid: SymbolId = sp.sym;
         if (sid == SYMBOL_NIL) { sid = scope_lookup_chain(rc, rc.current_scope, name); }
@@ -3266,6 +3484,10 @@ fun resolve_type_path(rc: *ResolveContext, named: *atype.TypeNamed, full: token.
                 # falling through to scope lookup and an unresolved-name message.
                 if (sp.status == TYPE_SPELL_VEC_REFUSED) {
                     report_vector_refused(rc, full, seg_name, sp.form);
+                    ret SYMBOL_NIL;
+                }
+                if (sp.status == TYPE_SPELL_IMG_REFUSED) {
+                    report_image_refused(rc, full, seg_name, sp.img);
                     ret SYMBOL_NIL;
                 }
                 current_sym = sp.sym;

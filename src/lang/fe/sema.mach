@@ -111,6 +111,15 @@ pub fun sema(
         ret R.err[context.SemaResult, str](R.unwrap_err[bool, str](res_init));
     }
 
+    # install the identifier-binding resolver for the WHOLE pass, not for a window:
+    # every fold this pass runs - an array length in a type position, a `$if` gate,
+    # a constant index bound - has to decide an identifier on the declaration it
+    # resolves to, and a window would leave whichever fold fell outside it reading
+    # by name (#2764). cleared on every exit below so the borrowed ctx never keeps a
+    # dangling `sc` pointer.
+    val scp_ident: *context.SemaContext = ?sc;
+    comptime.set_ident_resolver(ctx, context.comptime_ident_is_runtime::*u8, scp_ident::ptr);
+
     # install the module-member resolver so `comptime.eval` can fold an imported
     # `pub val` referenced in a type position - an array length like `[a.CAP]u8` -
     # exactly as a local `val` folds (#2081). every syntactic type node, including a
@@ -154,6 +163,13 @@ pub fun sema(
     # comparison reads the variants' field tables, which `infer_all_decls` has just
     # finished building, so the rule no longer depends on declaration order.
     infer.check_uni_secrecy_all(?sc);
+
+    # an image handle inside a record or union (#2794). A handle is not a value with
+    # storage, so an aggregate containing one has no layout a descriptor could be
+    # bound at - `OpTypeStruct` may not contain an opaque type at all. Walked here
+    # rather than at a use site, because a field is a declaration in its own right
+    # and the mistake belongs on the line that wrote it.
+    check_image_fields_all(?sc);
 
     # the same rule at every generic INSTANCE this module's annotations reach (#2225).
     # Shares the placement and its reason: the walk reads field tables, so it runs once
@@ -199,6 +215,7 @@ pub fun sema(
         ret R.err[context.SemaResult, str](R.unwrap_err[bool, str](res_reval));
     }
 
+    comptime.set_ident_resolver(ctx, nil, nil);
     ret build_result(?sc);
 }
 
@@ -643,9 +660,12 @@ fun revalidate_one(sc: *context.SemaContext, deps: *context.SemaDeps, origin: se
     val saved_td:  ptr                  = octx.type_data;
     val saved_qfn: *u8                  = octx.query_fn;
     val saved_qd:  ptr                  = octx.query_data;
+    val saved_ifn: *u8                  = octx.ident_fn;
+    val saved_id:  ptr                  = octx.ident_data;
     comptime.set_field_resolver(octx, context.resolve_field_member::*u8, tscp::ptr);
     comptime.set_type_resolver(octx, context.resolve_type_comparison_operand::*u8, tscp::ptr);
     comptime.set_type_query_resolver(octx, infer.resolve_type_query::*u8, tscp::ptr);
+    comptime.set_ident_resolver(octx, context.comptime_ident_is_runtime::*u8, tscp::ptr);
     tsc.inst_site     = site;
     tsc.inst_site_set = true;
     val res: R.Result[bool, str] = infer_stmt(?tsc, d.data.fun_.body, ret_ty);
@@ -653,6 +673,7 @@ fun revalidate_one(sc: *context.SemaContext, deps: *context.SemaDeps, origin: se
     comptime.set_field_resolver(octx, saved_ffn, saved_fd);
     comptime.set_type_resolver(octx, saved_tfn, saved_td);
     comptime.set_type_query_resolver(octx, saved_qfn, saved_qd);
+    comptime.set_ident_resolver(octx, saved_ifn, saved_id);
 
     free_typeids(sc.s.alloc, scratch_expr, oa.expr_len);
     free_typeids(sc.s.alloc, scratch_decl, oa.decl_len);
@@ -972,6 +993,7 @@ fun source_text_of(s: *session.Session, a: *ast.Ast) str {
 # ---
 # sc: the context to tear down
 fun dnit_context(sc: *context.SemaContext) {
+    if (sc.ctx != nil) { comptime.set_ident_resolver(sc.ctx, nil, nil); }
     if (sc.expr_type != nil && sc.a.expr_len > 0) {
         A.deallocate[type.TypeId](sc.s.alloc, sc.expr_type, sc.a.expr_len);
     }
@@ -1276,6 +1298,7 @@ fun infer_one_body(sc: *context.SemaContext, did: id.DeclId) R.Result[bool, str]
     # folds them.
     infer_decorator_args(sc, d);
     validate_decorators(sc, d);
+    check_image_handle_decl(sc, did, d);
 
     if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
         ret infer_bodies_comptime_if(sc, ?d.data.comptime_if);
@@ -1456,8 +1479,9 @@ fun validate_iface_target(sc: *context.SemaContext, d: *decl.Decl, dec: *decl.De
     if (has_decorator(sc, d, "builtin")) { roles = roles + 1; }
     if (has_decorator(sc, d, "uniform")) { roles = roles + 1; }
     if (has_decorator(sc, d, "storage")) { roles = roles + 1; }
+    if (has_decorator(sc, d, "sampler")) { roles = roles + 1; }
     if (roles > 1) {
-        context.report(sc, dec.name, "a shader interface variable carries exactly one role; `input`, `output`, `builtin`, `uniform`, and `storage` are mutually exclusive");
+        context.report(sc, dec.name, "a shader interface variable carries exactly one role; `input`, `output`, `builtin`, `uniform`, `storage`, and `sampler` are mutually exclusive");
     }
 }
 
@@ -1559,6 +1583,121 @@ fun validate_spirv_op(sc: *context.SemaContext, d: *decl.Decl, dec: *decl.Decora
 fun is_align_target(kind: decl.DeclKind) bool {
     ret kind == decl.DECL_KIND_VAL || kind == decl.DECL_KIND_VAR ||
         kind == decl.DECL_KIND_REC || kind == decl.DECL_KIND_UNI;
+}
+
+# whether `t` is an image / sampler handle, or a shape built over one (#2794)
+#
+# A handle is a name for a descriptor, not a value with storage, so putting one
+# behind a pointer or inside an array is a shape logical addressing cannot express -
+# and each of those is a different declaration to refuse, so the question is asked
+# about the whole type rather than about its outermost kind.
+#
+# A RECORD IS NOT WALKED, and that is deliberate rather than a gap: a record's
+# fields are declarations in their own right and are checked where they are written,
+# so walking one here would report the same mistake twice and attribute the second
+# copy to whatever named the record.
+# ---
+# sc: the context
+# t:  the type to test
+# ret: true when a handle is reachable without descending into a record
+fun type_carries_image(sc: *context.SemaContext, t: type.TypeId) bool {
+    if (t == type.TYPE_NIL || t == type.TYPE_ERROR) { ret false; }
+    val opt_type: O.Option[*type.Type] = type.get(?sc.s.types, t);
+    if (O.is_none[*type.Type](opt_type)) { ret false; }
+    val tp: *type.Type = O.unwrap[*type.Type](opt_type);
+    if (tp.kind == type.TYPE_IMAGE)   { ret true; }
+    if (tp.kind == type.TYPE_SECRET)  { ret type_carries_image(sc, tp.data.secret.base); }
+    if (tp.kind == type.TYPE_POINTER) { ret type_carries_image(sc, tp.data.pointer.base); }
+    if (tp.kind == type.TYPE_ARRAY)   { ret type_carries_image(sc, tp.data.array.base); }
+    ret false;
+}
+
+# report every record or union field declared at an image handle type (#2794)
+#
+# A handle names a descriptor rather than an object with storage, and SPIR-V's own
+# rule is flat: a struct must not contain an opaque type. An aggregate holding one
+# therefore has no shape a descriptor could be bound at, in either the combined or
+# the separate form, and it is refused where the field is written rather than at
+# whichever binding later gives the record a descriptor.
+# ---
+# sc: the context
+fun check_image_fields_all(sc: *context.SemaContext) {
+    if (sc.decl_type == nil) { ret; }
+    var d: u32 = 0;
+    for (d < sc.a.decl_len::u32) {
+        val d_opt: O.Option[*decl.Decl] = ast.get_decl(sc.a, d);
+        if (O.is_none[*decl.Decl](d_opt)) { d = d + 1; cnt; }
+        val dd: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+        if (dd.kind == decl.DECL_KIND_REC) {
+            check_image_fields(sc, dd.data.rec_.fields_start, dd.data.rec_.fields_len);
+        }
+        or (dd.kind == decl.DECL_KIND_UNI) {
+            check_image_fields(sc, dd.data.uni_.fields_start, dd.data.uni_.fields_len);
+        }
+        d = d + 1;
+    }
+}
+
+# report each field in `[start, start + len)` declared at an image handle type
+# ---
+# sc:    the context
+# start: start index into ast.typed_names
+# len:   number of fields
+fun check_image_fields(sc: *context.SemaContext, start: u32, len: u32) {
+    var i: u32 = 0;
+    for (i < len) {
+        val tn: *decl.TypedName = ?sc.a.typed_names[start + i];
+        if (type_carries_image(sc, context.resolved_type_of(sc, tn.ty))) {
+            context.report(sc, tn.name,
+                "an image handle cannot be a record or union field: a handle names a descriptor rather than an object with storage, and a SPIR-V struct may not contain one. bind the handle itself with `#[sampler(set, binding)]`");
+        }
+        i = i + 1;
+    }
+}
+
+# report unless an image handle declaration and its interface role agree (#2794)
+#
+# Two directions, because they are two different mistakes. A handle-typed global
+# with no `#[sampler(...)]` binds to nothing: a shader has no general global
+# storage, so the declaration would compile and be unreachable from any stage. A
+# `#[sampler(...)]` on anything else names a descriptor the emitter has no image
+# type to give, and would be emitted as an ordinary uniform of that type - which is
+# a different descriptor, silently.
+# ---
+# sc:  the context
+# did: the decl
+# d:   the decl record
+fun check_image_handle_decl(sc: *context.SemaContext, did: id.DeclId, d: *decl.Decl) {
+    if (sc.decl_type == nil)             { ret; }
+    if (!is_global_binding(d.kind))      { ret; }
+    val ty: type.TypeId = sc.decl_type[did];
+    val carries: bool   = type_carries_image(sc, ty);
+    val marked:  bool   = decl_has_decorator(sc, d, "sampler");
+
+    if (carries && !type.is_image(?sc.s.types, ty)) {
+        context.report(sc, d.span,
+            "an image handle cannot sit behind a pointer or inside an array here: a handle names a descriptor rather than an object with an address, and the logical addressing a shader uses has no pointer to one. declare the handle itself");
+        ret;
+    }
+    if (carries && !marked) {
+        # a handle wearing ANOTHER role is a different mistake from one wearing
+        # none, and gets its own sentence: the author did address it to the
+        # pipeline, just to a storage class no handle may live in.
+        if (has_decorator(sc, d, "input") || has_decorator(sc, d, "output")
+            || has_decorator(sc, d, "builtin") || has_decorator(sc, d, "uniform")
+            || has_decorator(sc, d, "storage")) {
+            context.report(sc, d.span,
+                "an image handle is bound as a descriptor and carries `#[sampler(set, binding)]`; the role on it puts the handle in a storage class no image, sampler, or sampled-image variable may live in");
+            ret;
+        }
+        context.report(sc, d.span,
+            "an image handle binding needs a `#[sampler(set, binding)]` decorator: a shader has no general global storage, so a handle with no descriptor address is reachable from no stage");
+        ret;
+    }
+    if (marked && !carries) {
+        context.report(sc, d.span,
+            "`sampler` decorator applies only to an image handle binding (`sampler2d`, `texture2d`, `sampler`, and their dimensional relatives); a descriptor-bound block or buffer of an ordinary type is `#[uniform(set, binding)]` or `#[storage(set, binding)]`");
+    }
 }
 
 # whether `kind` is a global binding (val / var)
@@ -1765,6 +1904,30 @@ fun validate_one_decorator(sc: *context.SemaContext, d: *decl.Decl, dec: *decl.D
         validate_iface_target(sc, d, dec);
         ret;
     }
+    # `#[sampler(set, binding)]` binds an image handle to a descriptor (#2794). The
+    # ARGUMENT SHAPE is `uniform`'s deliberately: the issue's requirement is that a
+    # sampler is addressed the same way a uniform block is, so nothing new appears at
+    # the descriptor level and a host binding one binds the other identically. What
+    # differs is the TYPE it may sit on, which `check_image_handle_decl` owns - it is
+    # a question about the declared type, and this pass sees decorators.
+    if (decorator_named(sc, dec, "sampler")) {
+        if (dec.args_len != 2) {
+            context.report(sc, dec.name, "`sampler` decorator takes two arguments: the descriptor set and the binding");
+        }
+        or {
+            var si: u32 = 0;
+            for (si < 2) {
+                val seid: id.ExprId = sc.a.expr_ids[dec.args_start + si];
+                if (!type.is_integer(?sc.s.types, decorator_arg_type(sc, seid))) {
+                    context.report(sc, dec.name, "`sampler` descriptor set and binding must be integer comptime expressions");
+                    si = 2; cnt;
+                }
+                si = si + 1;
+            }
+        }
+        validate_iface_target(sc, d, dec);
+        ret;
+    }
     if (decorator_named(sc, dec, "packed")) {
         if (dec.args_len != 0) {
             context.report(sc, dec.name, "`packed` decorator takes no arguments");
@@ -1811,7 +1974,7 @@ fun validate_one_decorator(sc: *context.SemaContext, d: *decl.Decl, dec: *decl.D
         validate_spirv_op(sc, d, dec);
         ret;
     }
-    context.report(sc, dec.name, "unknown decorator; valid directives are symbol, section, inline, noinline, align, packed, library, oblivious, scalar, naked, embed, stage, workgroup, input, output, builtin, uniform, storage, spirv_op");
+    context.report(sc, dec.name, "unknown decorator; valid directives are symbol, section, inline, noinline, align, packed, library, oblivious, scalar, naked, embed, stage, workgroup, input, output, builtin, uniform, storage, sampler, spirv_op");
 }
 
 # validate a `#[naked]` decorator: its argument shape, its target, the decorators it
@@ -2586,26 +2749,25 @@ fun check_comptime_gate(sc: *context.SemaContext, eid: id.ExprId) {
         # evaluator folds directly; leave it to the evaluator.
         if (O.is_none[*resolve.Symbol](opt_sym)) { ret; }
         val sym: *resolve.Symbol = O.unwrap[*resolve.Symbol](opt_sym);
-        if (sym.kind == resolve.SYM_PARAM) {
-            if ((sym.flags & resolve.SYM_FLAG_COMPTIME) == 0) {
+        # whether the name denotes runtime storage is `resolve.symbol_is_runtime`'s
+        # question, asked here exactly as the evaluator asks it, so this gate walk
+        # cannot drift from what `comptime.eval` will actually do with the same leaf
+        # (#2764). only the WORDING is local: the reader needs to hear "parameter"
+        # for a parameter and "value" for a binding.
+        if (resolve.symbol_is_runtime(sym)) {
+            if (sym.kind == resolve.SYM_PARAM) {
                 check.report_named(sc, e.span, "comptime `$if` gate cannot reference runtime parameter '", sym.name, "'", "comptime `$if` gate cannot reference a runtime parameter");
-            }
-            ret;
-        }
-        # a `val` / imported binding is foldable ONLY if it actually resolves to a
-        # comptime constant. a runtime block-local `val n = f();` is SYM_VAL but not
-        # foldable - and the comptime env is name-keyed, so folding it would
-        # spuriously succeed against a same-named MODULE const it shadows (a real
-        # miscompile of the gate). decide on resolution identity first: only a
-        # module-scope val (or an import) reaches the fold test; a block-local val
-        # is rejected outright regardless of any name collision.
-        if (sym.kind == resolve.SYM_VAL || sym.kind == resolve.SYM_IMPORTED) {
-            val is_module: bool = sym.kind == resolve.SYM_IMPORTED
-                                || (sym.flags & resolve.SYM_FLAG_MODULE) != 0;
-            if (!is_module) {
-                check.report_named(sc, e.span, "comptime `$if` gate cannot reference runtime value '", sym.name, "'", "comptime `$if` gate cannot reference a runtime value");
                 ret;
             }
+            check.report_named(sc, e.span, "comptime `$if` gate cannot reference runtime value '", sym.name, "'", "comptime `$if` gate cannot reference a runtime value");
+            ret;
+        }
+        # a comptime parameter is foldable per call site, never here.
+        if (sym.kind == resolve.SYM_PARAM) { ret; }
+        # a `val` / imported binding survives the identity test but is still foldable
+        # only if it actually resolves to a comptime constant, so a module-scope
+        # `val n = f();` is rejected by the fold rather than by the rule above.
+        if (sym.kind == resolve.SYM_VAL || sym.kind == resolve.SYM_IMPORTED) {
             val res_eval: R.Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, eid, ?sc.s.interner);
             if (R.is_err[comptime.CTValue, str](res_eval) && !check.imported_module_const_sym(sc, sym)) {
                 check.report_named(sc, e.span, "comptime `$if` gate cannot reference runtime value '", sym.name, "'", "comptime `$if` gate cannot reference a runtime value");
@@ -2654,6 +2816,18 @@ fun infer_local_decl(sc: *context.SemaContext, did: id.DeclId) R.Result[bool, st
 
     val ty: type.TypeId = infer.infer_decl(sc, did);
     if (sc.decl_type != nil) { sc.decl_type[did] = ty; }
+
+    # a function-local handle is refused (#2794). It is not a scope limit that could
+    # be lifted by teaching the back end more: SPIR-V forbids storing an image,
+    # sampler or sampled-image object at all, so the Function-storage variable a
+    # local lowers to has nothing that may be written into it, and the result of the
+    # instruction that combines an image with a sampler must be consumed in the block
+    # that produced it. Naming the rule here keeps the failure on the declaration
+    # rather than on a validator's verdict about a module the author never asked for.
+    if (type_carries_image(sc, ty)) {
+        context.report(sc, d.span,
+            "an image handle cannot be a local binding: SPIR-V forbids storing an image, sampler, or sampled-image object, so the local's storage has nothing that may be written into it. hand the handle straight to the operation that consumes it instead of naming it first");
+    }
 
     if (d.data.bind.init != id.EXPR_NIL) {
         val actual: type.TypeId = infer.infer_expr(sc, d.data.bind.init);

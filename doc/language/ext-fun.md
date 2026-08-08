@@ -217,6 +217,12 @@ bit-compatible with a C `__m128` parameter:
 - **Every other target** (System V, AAPCS64, RISC-V lp64d): the C convention already
   matches Mach's internal one, so nothing special happens at the boundary.
 
+A vector **wider** than the target's vector register (`f32x8` on any target today)
+has no C convention to follow: it is an AVX/SVE type the baseline does not have, so
+no psABI classifies it. Mach gives it the memory class on every convention — a
+hidden pointer to its storage for an argument, the indirect-result pointer for a
+return — which is the placement it already has internally.
+
 Only a *direct* call to a declared `ext fun` marshals — an ordinary Mach→Mach call
 always keeps the internal convention (a vector in a vector register). A call through
 a function *pointer* does not yet carry the `ext` fact, so it is not covered.

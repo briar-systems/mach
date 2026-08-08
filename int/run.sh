@@ -10,6 +10,14 @@
 # golden. --bless writes the observable to the golden instead of diffing. the exit
 # status is nonzero if any case×target×profile fails.
 #
+# WHAT A GOLDEN CANNOT SEE. a golden is a statement about one string, not about the
+# program, the image, or the compiler, so every run-and-compare case is blind in the
+# same ways. int/observability.md maps those classes to the surface that can observe
+# each one, grounded in the defects that cost this repo the time to find them, and
+# states which of them genuinely needed an integration test rather than a unit test
+# (most did not). it describes the defects and the surfaces, not this harness, so it
+# outlives it - read it before adding a case here.
+#
 # the harness is the same on every OS (git-bash on windows, bash on linux/macOS);
 # the only target-specific knowledge it holds is the run-mode looked up per target
 # from targets.conf, `--runmode` overriding it for this invocation only.
@@ -70,6 +78,12 @@
 # against. the PASS/FAIL lines have carried that since #2387, but a log line only
 # answers the question while the log exists, and "what did the run that cut this tag
 # build against" is asked afterwards. CI uploads the file.
+#
+# NOT SAFE TO RUN CONCURRENTLY. two invocations against one checkout - even for
+# different --target values - race on the same per-case out/ directories and can
+# produce a wrong result, including a spurious PASS. no guard here (this suite is
+# being rebuilt; run isolation belongs in that design, not patched into this
+# one) - run a second target from a second checkout instead.
 #
 # `--runmode qemu` only reaches a leg qemu-user can actually load: qemu_bin() in
 # lib/produce.sh names the ELF-only rule and the three targets that can never
@@ -389,20 +403,18 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
     # (#2353) so the two never disagree about what a case.conf line means.
     read_case_conf "$dir"
     if ! in_list "$target" "$case_allow"; then continue; fi
-    if in_list "$target" "$case_exempt"; then continue; fi
+    if in_list "$target" "$case_exempt"; then
+        # named in the run accounting rather than vanishing silently (mach#2741):
+        # an exempted leg used to leave no trace at all, so a run this leg was
+        # never applicable to and a run it was quietly dropped from looked
+        # identical. the reason itself lives only in case.conf's comment, same as
+        # exempt always has - this just states that a reason exists and where.
+        echo "SKIP $case_id [$target] (exempt, see case.conf)"
+        continue
+    fi
 
     # the mach target to compile: the build-target if set, else the leg itself.
     build_target=${case_build_target:-$target}
-
-    # the golden is shared across build-targets for target-independent observables (exec,
-    # the relro-fault guard, and the panic-exit guard, whose outputs are all
-    # target-independent; debuginfo, whose two facts — validator-clean and additive —
-    # hold identically on every ELF ISA) and per-build-target for structural producers
-    # (their fact is format-specific).
-    case "$case_run" in
-        exec|relro-fault|panic-exit|debuginfo|varloc-fbreg) golden="$dir/expect.txt" ;;
-        *)                                                 golden="$dir/expect.$build_target.txt" ;;
-    esac
 
     # once per case, not per profile: `dep pull` honors the lock left by the first
     # profile, so deciding here is both what makes a case's two profiles agree on one
@@ -412,6 +424,22 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
     for profile in $case_profiles; do
         ran=$((ran + 1))
         label="$case_id [$target/$profile]"
+
+        # the golden is shared across build-targets for target-independent observables
+        # (exec, the relro-fault guard, and the panic-exit guard, whose outputs are all
+        # target-independent; debuginfo and symtab, whose facts hold identically on
+        # every ELF ISA), per-profile for gdb-session (its stop/frame/value facts are
+        # a real function of the active profile's own codegen — opt0's location and
+        # line-table construction is a materially different pipeline from opt2's,
+        # #2779 — rather than of the target ISA/format the build-target axis tracks,
+        # which is why this reads $profile and must live inside this loop rather than
+        # being decided once per case like the other two tiers), and per-build-target
+        # for structural producers (their fact is format-specific).
+        case "$case_run" in
+            exec|relro-fault|panic-exit|debuginfo|varloc-fbreg|symtab) golden="$dir/expect.txt" ;;
+            gdb-session) golden="$dir/expect.$profile.txt" ;;
+            *)           golden="$dir/expect.$build_target.txt" ;;
+        esac
 
         # the build artifact goes under the case's gitignored out/ via a path
         # relative to the case dir: a native windows compiler resolves it against
@@ -512,7 +540,7 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
             # compiler / target / profile / flags, plus `-g`) and hand its path to the
             # producer as an extra argument. every other producer inspects only `$bin`.
             gbin=
-            if [ "$case_run" = debuginfo ] || [ "$case_run" = varloc-fbreg ]; then
+            if [ "$case_run" = debuginfo ] || [ "$case_run" = varloc-fbreg ] || [ "$case_run" = gdb-session ]; then
                 gbin="$dir/out/int/prog-g$exe"
                 if ! (cd "$dir" && $buildcc build . --target "$build_target" --profile "$profile" $case_build_flags -g -o "out/int/prog-g$exe") >"$tmp/build-g.log" 2>&1; then
                     echo "FAIL $flabel (build -g)"
@@ -523,7 +551,7 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
                 fi
             fi
 
-            if produce "$case_run" "$runmode" "$target" "$bin" "$gbin" >"$tmp/out.txt" 2>"$tmp/err.txt"; then
+            if produce "$case_run" "$runmode" "$target" "$bin" "$gbin" "$profile" >"$tmp/out.txt" 2>"$tmp/err.txt"; then
                 prc=0
             else
                 prc=$?

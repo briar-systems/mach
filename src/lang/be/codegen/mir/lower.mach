@@ -610,7 +610,7 @@ fun dst_is_pending_src(dsts: *u32, srcs: *mir.MirOperand, done: *bool, n: u32, v
 
 # the width to materialize an immediate phi-merge source into a GP register. a
 # 32-bit constant rides a width-4 move so the backend re-signs it to its register
-# convention (riscv64 lp64 holds an i32 sign-extended, re-signed from the width);
+# convention (the riscv64 lp64 family holds an i32 sign-extended, re-signed from the width);
 # every other width keeps the full gpr-width move, since a sub-32 store leaves a
 # target's upper register bits unspecified (an x86 `mov al` does not clear them) and
 # a 64-bit value is already register-width. mirrors mir.abi.scalar_reg_move_width,
@@ -669,7 +669,7 @@ fun insert_mov_before_terminator(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mi
     # merge (#2070) - it carries the full vector width so the encoder emits the 16-byte
     # MOVAPS. an immediate source is a MATERIALIZATION of a constant at
     # `imm_merge_width`: a 32-bit constant rides a width-4 move so the backend re-signs
-    # it to its register convention (riscv64 lp64 holds an i32 sign-extended), while
+    # it to its register convention (the riscv64 lp64 family holds an i32 sign-extended), while
     # every other width keeps the full-register move.
     #
     # a value WIDER than the machine word (a scalar on a target whose word is narrower
@@ -699,10 +699,26 @@ fun insert_mov_before_terminator(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mi
     # vec_lane stays VEC_LANE_NONE because the move is a full-width register copy,
     # lane-agnostic even for a vector phi. loc and inline_site are the two genuine
     # overrides: the zero default is loc_nil ({FILE_NIL, 0}, and FILE_NIL is 0), which
-    # would mean "no row" rather than the move's real source line, so both are stamped
-    # from the cursor.
-    mi.loc               = ctx.cur_loc;
-    mi.inline_site       = ctx.cur_inline_site;
+    # would mean "no row" rather than the move's real source line.
+    #
+    # `lower_phis` runs once, AFTER `lower_block` has already lowered every block in
+    # the function (see lower_function): by the time this splice runs, `ctx.cur_loc`
+    # is whatever the LAST statement of the LAST block left it at - the function's own
+    # final statement, for every predecessor block's edge, regardless of where in the
+    # function that predecessor actually is. Stamping from it duplicated the final
+    # `ret`'s line onto the entry block's phi-merge copies (mach#2779 Bug B): `total`'s
+    # and `i`'s zero-initializations, spliced at the end of the loop's own entry block,
+    # both read back as `ret total;`'s line instead of their own.
+    #
+    # `term` - already fetched above, and already carrying the CORRECT location from
+    # when its own block was lowered in the first pass - is the right source instead:
+    # a phi-merge copy conceptually belongs to the edge out of `pred_mb`, and `term`
+    # is that edge's own control-flow instruction (the `for`'s implicit fall-into-loop
+    # branch, a loop-back branch, etc.), stamped with ITS block's real statement while
+    # that block was still the one being lowered - never stale, because it was never
+    # the cursor.
+    mi.loc               = term.loc;
+    mi.inline_site       = term.inline_site;
     mi.writes_secret     = false;   # a phi-elimination move never writes secret storage (#1646)
 
     # grow by one, shift the terminator right, and drop the move into its place.
@@ -1498,7 +1514,7 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
     # register bits undefined; clamp the operation width so the spilled word stays
     # clean (mirrors `set_generic_widths` and the byte-divide promotion).
     val natural_w: u8 = lctx.op_width_of(ctx, inst.ty);
-    val w: u8 = lctx.clamp_alu_width(ctx.tgt.model.gpr_width, natural_w);
+    val w: u8 = lctx.clamp_alu_width(ctx.tgt.model.alu_min_width, natural_w);
 
     var op: mir.MirOpcode = mir.MIR_SHR_U;
     if (inst.kind == instr.OP_SHL)   { op = mir.MIR_SHL; }
@@ -1792,7 +1808,11 @@ fun emit_promote(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, sr
 # lower a non-call IR instruction by mapping its opcode 1:1 to the generic MIR opcode
 #
 # Emits `[dst?, operands...]` at the same opcode number. Branch operands that name
-# block targets become mir.MIR_OP_BLOCK operands.
+# block targets become mir.MIR_OP_BLOCK operands. This is also where the generic
+# opcodes' operand-SHAPE constraints are enforced: a symbol operand is LEA-
+# materialized into a vreg (its address is the rvalue), and a constant landing in a
+# slot `mir.operand_requires_reg` declares register-only is moved into a fresh vreg
+# so no encoder sees an immediate it has no form for.
 # ---
 # ctx:  the per-function lowering context
 # mb:   the destination MIR block
@@ -1839,6 +1859,20 @@ fun lower_generic(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instructi
             if (R.is_err[bool, str](ar)) { ret ar; }
             op = mir.op_vreg(av);
         }
+        # a slot the shared MIR contract declares register-only (the integer source
+        # of an integer-to-float conversion) takes a constant through a fresh value
+        # vreg: two of the three register backends have no immediate form there
+        # (#2812). the move rides the operand's own width - the encoders extend a
+        # sub-word integer source themselves.
+        if (op.kind == mir.MIR_OP_IMM && mir.operand_requires_reg(inst.kind::u32, base + k)) {
+            val cvr: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](cvr)) { ret R.err[bool, str](R.unwrap_err[u32, str](cvr)); }
+            val cv: u32 = R.unwrap_ok[u32, str](cvr);
+            val cw: u8 = lctx.op_width_of(ctx, inst.operands[k].ty);
+            val ce: R.Result[bool, str] = lctx.emit_mov_w(ctx, mb, mir.op_vreg(cv), op, cw);
+            if (R.is_err[bool, str](ce)) { ret ce; }
+            op = mir.op_vreg(cv);
+        }
         ops[base + k] = op;
         k = k + 1;
     }
@@ -1884,7 +1918,7 @@ fun set_generic_widths(ctx: *lctx.LowerCtx, inst: *instr.Instruction, mi: *mir.M
     # leak through the word-width spill into a downstream full-width use. the
     # conversions are excluded: their destination width selects the MOVZX / MOVSX
     # narrow form and is load-bearing, not a clamp candidate.
-    if (is_int_alu_kind(inst.kind)) { dw = lctx.clamp_alu_width(ctx.tgt.model.gpr_width, dw); }
+    if (is_int_alu_kind(inst.kind)) { dw = lctx.clamp_alu_width(ctx.tgt.model.alu_min_width, dw); }
     var sw: u8 = dw;
     if (is_int_conversion_kind(inst.kind) && inst.operand_count >= 1) {
         sw = lctx.op_width_of(ctx, inst.operands[0].ty);
@@ -2379,7 +2413,7 @@ fun lower_load(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction,
         ret lctx.load_subwidth_vector(ctx, mb, ops[0], ops[1], inst.ty);
     }
     var mi: mir.MirInstr = mir.instr(mir.MIR_LOAD, ops, 2,
-                                     lctx.clamp_alu_width(ctx.tgt.model.gpr_width, reg_w), acc_w);
+                                     lctx.clamp_alu_width(ctx.tgt.model.alu_min_width, reg_w), acc_w);
     ret lctx.push_instr(ctx, mb, mi);
 }
 
@@ -2474,7 +2508,7 @@ fun lower_store_aggregate(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.I
     val size: u32 = ir_type.byte_size(ctx.types, inst.operands[0].ty, ctx.tgt);
     var off: i64 = 0;
     for (off::u32 < size) {
-        val chunk: u8 = lctx.copy_chunk_width((size - off::u32)::u64);
+        val chunk: u8 = lctx.copy_chunk_width(ctx.tgt, (size - off::u32)::u64);
 
         val src: mir.MirOperand = agg_pointer_mem(ctx, inst.operands[0], off);
         val dst: mir.MirOperand = agg_pointer_mem(ctx, inst.operands[1], off);
@@ -2543,7 +2577,7 @@ fun lower_memzero(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instructi
 
     var off: i64 = 0;
     for (off::u32 < size) {
-        val chunk: u8 = lctx.copy_chunk_width((size - off::u32)::u64);
+        val chunk: u8 = lctx.copy_chunk_width(ctx.tgt, (size - off::u32)::u64);
 
         val dst: mir.MirOperand = agg_pointer_mem(ctx, inst.operands[0], off);
         val st: R.Result[bool, str] = lctx.push_store_chunk(ctx, mb, dst, mir.op_imm(0), chunk);

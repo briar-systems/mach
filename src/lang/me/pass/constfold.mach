@@ -188,6 +188,36 @@ fun try_fold(m: *ir.Module, inst: *instruction.Instruction, self_id: u32,
         ret false;
     }
 
+    # a float NARROWING of a constant folds into the constant, at its own width
+    # [operand] (#2752)
+    #
+    # A float literal is carried as a comptime f64 bit pattern from the lexer onward,
+    # so an `f64` constant narrowed by an explicit `::f32` reached the back end as a
+    # double-width materialization plus a runtime convert - two instructions and, on
+    # x86-64, an FP scratch register, for a value known at compile time. A
+    # `VAL_CONST_FLOAT` carries its f64 pattern whatever its type says and the width
+    # is taken from the TYPE (`lower_value` narrows through `f64_to_f32_bits` at
+    # width 4, exactly as `pack_globals` does for a module-scope global), so the fold
+    # is a retype: same bits, narrower type.
+    #
+    # The value is unchanged. The narrowing the back end now performs is the same
+    # round-to-nearest-even from the same double the `cvtsd2ss` / `fcvt s,d` /
+    # `fcvt.s.d` performed, so this moves WHEN the rounding happens, not what it
+    # rounds. Nothing downstream can double-round it either: every float fold in this
+    # pass is gated on `is_f64`, so an f32-typed constant is inert here.
+    #
+    # THE WIDENING IS DELIBERATELY NOT FOLDED. An f32-typed constant still carries
+    # the UNROUNDED f64 pattern, so retyping it to f64 would produce the double
+    # nearest the literal where the machine produces the double nearest the f32 -
+    # a value change, not an optimisation. Folding it needs the narrow-then-widen
+    # round trip, which needs a single-to-double conversion `float` does not have.
+    if (k == instruction.OP_FP_TRUNC && inst.operand_count == 1) {
+        val a: value.Value = mutate.rewrite_resolve(rw, inst.operands[0]);
+        if (a.kind != value.VAL_CONST_FLOAT) { ret false; }
+        @out = value.const_float(a.data.float_lit, inst.ty);
+        ret true;
+    }
+
     # integer width conversions [operand].
     if ((k == instruction.OP_TRUNC || k == instruction.OP_SEXT || k == instruction.OP_ZEXT) && inst.operand_count == 1) {
         val a: value.Value = mutate.rewrite_resolve(rw, inst.operands[0]);
@@ -816,6 +846,78 @@ test "mach.lang.me.pass.constfold.try_fold:int_conversions" {
     trunc_inst.aux_ty        = type.IRT_NIL;
     if (try_fold(?m, ?trunc_inst, 0, ?rw, ?out) == false) { ret 1; }
     if (out.data.int_lit != 0xFF)                         { ret 1; }
+
+    mutate.rewrite_dnit(?rw, ?alloc);
+    ret 0;
+}
+
+# A FLOAT NARROWING OF A CONSTANT FOLDS TO THE CONSTANT AT ITS OWN WIDTH, AND THE
+# WIDENING DOES NOT (#2752)
+#
+# The fold is a RETYPE, not a value change: a `VAL_CONST_FLOAT` carries its comptime
+# f64 pattern whatever its type says, and the width is read off the type when the
+# back end materializes it. So the assertion is on both halves - the bits are the
+# ones that went in, and the type is the narrow one. Checking only "it folded" would
+# pass for a fold that silently narrowed the pattern here as well, which would
+# double-round every value that later reaches `pack_globals`.
+#
+# THE WIDENING IS ASSERTED NOT TO FOLD, at the boundary rather than in the middle:
+# an f32-typed constant still carries the UNROUNDED f64 pattern, so retyping it to
+# f64 would produce the double nearest the literal where the machine produces the
+# double nearest the f32. That is a value change, and a test that only checked the
+# narrowing would not have noticed the symmetric-looking arm being added later.
+test "mach.lang.me.pass.constfold.try_fold:float_narrowing" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_module: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_module)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_module);
+    val res_f32: R.Result[type.IrTypeId, str] = type.intern_float(?m.types, 32);
+    if (R.is_err[type.IrTypeId, str](res_f32)) { ret 1; }
+    val f32ty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_f32);
+    val res_f64: R.Result[type.IrTypeId, str] = type.intern_float(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](res_f64)) { ret 1; }
+    val f64ty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_f64);
+
+    var rw: mutate.Rewrite;
+    if (R.is_err[bool, str](mutate.rewrite_init(?rw, ?alloc, 1))) { ret 1; }
+    var out: value.Value;
+
+    # fp_trunc(0.1:f64) -> f32 folds, carrying the SAME f64 pattern at the f32 type
+    var src: value.Value = value.const_float(0.1, f64ty);
+    var tr: instruction.Instruction;
+    tr.kind          = instruction.OP_FP_TRUNC;
+    tr.ty            = f32ty;
+    tr.operands      = ?src;
+    tr.operand_count = 1;
+    tr.operand_cap   = 1;
+    tr.flags         = 0;
+    tr.aux_ty        = type.IRT_NIL;
+    if (try_fold(?m, ?tr, 0, ?rw, ?out) == false)                              { ret 1; }
+    if (out.kind != value.VAL_CONST_FLOAT)                                     { ret 1; }
+    if (out.ty != f32ty)                                                       { ret 1; }
+    if (float.f64_bits(out.data.float_lit) != float.f64_bits(0.1))             { ret 1; }
+    # and the width the back end reads off that type is the single pattern nearest
+    # the literal, which is what the runtime convert produced
+    if (float.f64_to_f32_bits(float.f64_bits(out.data.float_lit)) != 0x3DCCCCCD) { ret 1; }
+
+    # a non-constant operand does not fold
+    var nc: value.Value = value.instr(7, f64ty);
+    var tr2: instruction.Instruction = tr;
+    tr2.operands = ?nc;
+    if (try_fold(?m, ?tr2, 0, ?rw, ?out))                                      { ret 1; }
+
+    # fp_ext(0.1:f32) -> f64 does NOT fold: the operand's pattern is unrounded
+    var fsrc: value.Value = value.const_float(0.1, f32ty);
+    var ex: instruction.Instruction;
+    ex.kind          = instruction.OP_FP_EXT;
+    ex.ty            = f64ty;
+    ex.operands      = ?fsrc;
+    ex.operand_count = 1;
+    ex.operand_cap   = 1;
+    ex.flags         = 0;
+    ex.aux_ty        = type.IRT_NIL;
+    if (try_fold(?m, ?ex, 0, ?rw, ?out))                                       { ret 1; }
 
     mutate.rewrite_dnit(?rw, ?alloc);
     ret 0;

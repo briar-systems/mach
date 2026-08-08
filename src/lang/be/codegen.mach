@@ -34,6 +34,7 @@ use mach.lang.be.codegen.looprotate;
 use mach.lang.be.codegen.mir;
 use mach.lang.be.codegen.mir.lower;
 use mach.lang.be.codegen.regalloc;
+use mach.lang.be.codegen.unit;
 use mach.lang.be.obj;
 use mach.lang.float;
 use mach.lang.intern;
@@ -131,25 +132,37 @@ pub fun no_debug() DebugInfo {
 # s:       shared session; supplies the allocator and interner
 # tgt:     resolved compilation target
 # irmod:   optimised SSA IR module to generate code for
+# deps:    the IR modules this one may draw CODE from - the modules that define a
+#          function it calls across a module boundary, transitively. Read only by
+#          the whole-module fork: a self-contained module has no link step to
+#          resolve a cross-module call later, so the callee's body has to be
+#          emitted into the same output and its IR has to be reachable from here.
+#          A register machine ignores it and may be handed the empty set; it has a
+#          linker, and lowering a module it will not emit would be pure waste
 # asm_out: optional writer for the per-module assembly text (nil = none)
 # dbg:     the build's settled debug-info decision plus the DWARF CU metadata
 # ret:     the populated object image, or an error string from any pipeline stage
 # the concrete signature the erased `isa.ModuleEmitter.emit_module` pointer is cast
-# back to: the whole-module SPIR-V back half. consumes post-lower MIR and writes
-# the finished module bytes through the out-params, bypassing isel / regalloc /
-# frame / encode. the allocator and interner ride the MIR module, so the emitter
-# (composed under `mach.lang.target`) needs no session.
+# back to: the whole-module SPIR-V back half. consumes the lowered EMISSION UNIT
+# and writes the finished module bytes through the out-params, bypassing isel /
+# regalloc / frame / encode. the allocator and interner ride the unit's root MIR
+# module, so the emitter (composed under `mach.lang.target`) needs no session.
+#
+# The unit rather than one module pair is the whole point of the contract: a
+# whole-module emitter has no linker behind it, so every body its output calls has
+# to be present in its input (#2823). A second whole-module target takes the same
+# unit, and a per-module fact a future one needs is a field on `unit.UnitModule`
+# rather than another parameter here.
 # ---
 # arg 0: the resolved target
-# arg 1: the IR module (signatures + linkage)
-# arg 2: the post-lower MIR module (also supplies the allocator + interner)
-# arg 3: receives the owned little-endian module image
-# arg 4: receives the image byte length
+# arg 1: the emission unit (its root is the module being compiled)
+# arg 2: receives the owned little-endian module image
+# arg 3: receives the image byte length
 # ret:   true on success, or a precise error string
-pub def EmitModuleFn: fun(*target.Target, *ir.Module, *mir.MirModule, **u8, *u32) R.Result[bool, str];
+pub def EmitModuleFn: fun(*target.Target, *unit.Unit, **u8, *u32) R.Result[bool, str];
 
 pub fun codegen_module(s: *session.Session, tgt: *target.Target,
-                       irmod: *ir.Module, asm_out: *writer.Writer, dbg: DebugInfo) R.Result[of.ObjectImage, str] {
+                       irmod: *ir.Module, deps: unit.IrSet, asm_out: *writer.Writer, dbg: DebugInfo) R.Result[of.ObjectImage, str] {
     if (s == nil)     { ret R.err[of.ObjectImage, str]("codegen: nil session"); }
     if (tgt == nil)   { ret R.err[of.ObjectImage, str]("codegen: nil target"); }
     if (irmod == nil) { ret R.err[of.ObjectImage, str]("codegen: nil ir module"); }
@@ -166,15 +179,7 @@ pub fun codegen_module(s: *session.Session, tgt: *target.Target,
     # guaranteed non-nil: every stage below reads it, and only a register machine
     # reaches them.
     if (isa.emits_whole_module(tgt.isa)) {
-        # the constant-time enforcement point of this fork (#2159): the emitter is not
-        # mach's machine pipeline, so an `#[oblivious]` contract cannot be validated or
-        # upheld past it and is refused here rather than silently emitted unchecked.
-        # secret-free code and non-oblivious functions are untouched.
-        val res_ct: R.Result[bool, str] = ctvalidate.run(tgt, ?mir_module);
-        if (R.is_err[bool, str](res_ct)) {
-            ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_ct));
-        }
-        ret emit_spirv_image(s, tgt, irmod, ?mir_module);
+        ret whole_module_image(s, tgt, irmod, ?mir_module, deps);
     }
 
     # loop rotation runs on the freshly-lowered MIR, before legalization and
@@ -231,6 +236,100 @@ pub fun codegen_module(s: *session.Session, tgt: *target.Target,
 }
 
 
+# assemble the emission unit and run the whole-module back half over it
+#
+# The whole-module fork's own spine. It does the one thing the register-machine
+# spine never has to: it lowers the modules the root DRAWS CODE FROM as well as
+# the root itself, because the emitter has no linker behind it and every body its
+# output calls must be in its input. The driver decided which modules those are
+# (`deps`); lowering them is codegen's, so a caller that owns the module graph
+# never has to own the pipeline.
+#
+# The root is placed at the head of the unit and the dependencies follow in the
+# order the driver assembled them, which fixes the emitter's walk order and so the
+# emitted module's ids for a given input.
+#
+# The constant-time validator runs over EVERY member, not only the root (#2159):
+# the emitter is not mach's machine pipeline, so an `#[oblivious]` contract cannot
+# be validated or upheld past it, and a body pulled in from another module is
+# emitted into this output on exactly the same terms as one written here.
+# Secret-free code and non-oblivious functions are untouched.
+# ---
+# s:      the shared session
+# tgt:    the resolved target (carries the emit_module hook)
+# irmod:  the root IR module (names the image)
+# mirmod: the root's post-lower MIR module
+# deps:   the IR modules the root may draw called bodies from
+# ret:    the populated object image, or an error string
+fun whole_module_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
+                       mirmod: *mir.MirModule, deps: unit.IrSet) R.Result[of.ObjectImage, str] {
+    var u: unit.Unit;
+    val ru: R.Result[bool, str] = unit.init(s.alloc, deps.len + 1, ?u);
+    if (R.is_err[bool, str](ru)) { ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](ru)); }
+    u.root = 0;
+    u.mods[0].ir  = irmod;
+    u.mods[0].mir = mirmod;
+
+    var i: u32 = 0;
+    for (i < deps.len) {
+        val dm: *ir.Module = deps.mods[i];
+        val rd: R.Result[mir.MirModule, str] = lower.lower_ir(tgt, dm, s.alloc, ?s.interner, ?s.sources);
+        if (R.is_err[mir.MirModule, str](rd)) {
+            unit_release(s, ?u, i);
+            ret R.err[of.ObjectImage, str](R.unwrap_err[mir.MirModule, str](rd));
+        }
+        val rb: R.Result[*mir.MirModule, str] = A.allocate[mir.MirModule](s.alloc, 1::usize);
+        if (R.is_err[*mir.MirModule, str](rb)) {
+            var dead: mir.MirModule = R.unwrap_ok[mir.MirModule, str](rd);
+            mir.dnit_module(?dead);
+            unit_release(s, ?u, i);
+            ret R.err[of.ObjectImage, str](R.unwrap_err[*mir.MirModule, str](rb));
+        }
+        val box: *mir.MirModule = R.unwrap_ok[*mir.MirModule, str](rb);
+        box[0] = R.unwrap_ok[mir.MirModule, str](rd);
+        u.mods[i + 1].ir  = dm;
+        u.mods[i + 1].mir = box;
+        i = i + 1;
+    }
+
+    i = 0;
+    for (i < u.len) {
+        val res_ct: R.Result[bool, str] = ctvalidate.run(tgt, u.mods[i].mir);
+        if (R.is_err[bool, str](res_ct)) {
+            unit_release(s, ?u, deps.len);
+            ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_ct));
+        }
+        i = i + 1;
+    }
+
+    val img: R.Result[of.ObjectImage, str] = emit_spirv_image(s, tgt, irmod, ?u);
+    unit_release(s, ?u, deps.len);
+    ret img;
+}
+
+# release the `n` dependency MIR modules a unit owns, and the unit's table
+#
+# The root's MIR is the caller's and is left alone; every other member was lowered
+# and boxed here, so it is freed here. Called on the error paths with the count
+# lowered so far, and once on the way out.
+# ---
+# s: the shared session (its allocator owns the boxes)
+# u: the unit
+# n: how many dependency members were populated
+fun unit_release(s: *session.Session, u: *unit.Unit, n: u32) {
+    var i: u32 = 0;
+    for (i < n) {
+        val box: *mir.MirModule = u.mods[i + 1].mir;
+        if (box != nil) {
+            mir.dnit_module(box);
+            A.deallocate[mir.MirModule](s.alloc, box, 1::usize);
+            u.mods[i + 1].mir = nil;
+        }
+        i = i + 1;
+    }
+    unit.dnit(s.alloc, u);
+}
+
 # wrap a whole-module emitter's output as a single-section object image
 #
 # The SPIR-V spine produces the finished module bytes rather than encoded machine
@@ -241,14 +340,14 @@ pub fun codegen_module(s: *session.Session, tgt: *target.Target,
 # ---
 # s:      the shared session
 # tgt:    the resolved target (carries the emit_module hook)
-# irmod:  the IR module (names the image)
-# mirmod: the post-lower MIR module the emitter consumes
+# irmod:  the root IR module (names the image)
+# u:      the lowered emission unit the emitter consumes
 # ret:    the populated object image, or an error string
 fun emit_spirv_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
-                     mirmod: *mir.MirModule) R.Result[of.ObjectImage, str] {
+                     u: *unit.Unit) R.Result[of.ObjectImage, str] {
     var bytes: *u8 = nil;
     var len:   u32 = 0;
-    val r: R.Result[bool, str] = tgt.isa.emitter.emit_module::EmitModuleFn(tgt, irmod, mirmod, ?bytes, ?len);
+    val r: R.Result[bool, str] = tgt.isa.emitter.emit_module::EmitModuleFn(tgt, u, ?bytes, ?len);
     if (R.is_err[bool, str](r)) { ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](r)); }
 
     val res_image: R.Result[of.ObjectImage, str] = obj.init(s.alloc, ?s.interner, irmod.name);
@@ -295,6 +394,15 @@ fun pack_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
         ret R.err[of.ObjectImage, str](R.unwrap_err[of.ObjectImage, str](res_image));
     }
     var image: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](res_image);
+
+    # the arch's machine-flags word, derived from the RESOLVED ABI rather than from a
+    # constant in a writer. `float_arg_bits` is the convention's own float-argument
+    # width, so an object's header states the calling convention its code was
+    # actually generated for and cannot drift from it. `false` for compressed: no
+    # register-machine encoder here emits a compressed instruction, so an object mach
+    # writes honestly claims none, and a LINKED image gets the bit from its inputs
+    # instead (#2813).
+    image.machine_flags = isa.machine_flags(tgt.isa, tgt.abi.float_arg_bits, false);
 
     # `#[section("...")]` decorators move individual functions out of the shared
     # `.text` into named sections. build one placement per sectioned function
@@ -477,8 +585,16 @@ fun pack_text(s: *session.Session, image: *of.ObjectImage, enc: *encode.EncoderO
 
 # register every encoder symbol mark against the `.text` section
 #
-# Each mark is a function entry point (or an exposed inline-asm label) defined at
-# a known text offset. A mark naming a defined IR function is given GLOBAL
+# Each mark is an address defined in the encoded text at a known offset. The MARK
+# states what kind of symbol it is and this loop carries that through unchanged: it
+# used to OR in `SYM_OBJ_FLAG_FUNCTION` for every mark, which was true only because
+# every mark happened to be a function entry, and stopped being true the moment
+# riscv64 began defining `.Lpcrel_hi` labels at its `auipc` sites (#2828). A
+# fabricated type is worse than a missing one - a label typed STT_FUNC misleads every
+# consumer that asks what a symbol is, and here it made the psABI pair normalizer
+# refuse to recognize its own labels.
+#
+# A mark naming a defined IR function is given GLOBAL
 # linkage so the whole-program linker can resolve cross-module references to it
 # (every function symbol name is now globally unique - module-path-mangled, or an
 # exempted literal like `main` / `_start` - so global linkage cannot collide). A
@@ -501,7 +617,7 @@ fun pack_symbols(image: *of.ObjectImage, irmod: *ir.Module,
     for (i < enc.symbol_count) {
         val mark: *encode.SymbolMark = ?enc.symbols[i];
 
-        var flags: u32 = mark.flags | of.SYM_OBJ_FLAG_FUNCTION;
+        var flags: u32 = mark.flags;
         if (function_is_defined(irmod, mark.name)) {
             flags = flags | of.SYM_OBJ_FLAG_GLOBAL;
         }
@@ -926,12 +1042,12 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
         if (R.is_err[bool, str](res_sym)) { ret res_sym; }
 
         # an aggregate constant's pointer leaves (a `str` / address-of-global) are
-        # patched at link time: each side-table entry becomes an abs64 relocation
-        # against this global's section, naming the target symbol (an anonymous
-        # rodata global already packed in this same loop). the ELF writer emits a
-        # `.rela.<section>` for any section carrying these.
+        # patched at link time: each side-table entry becomes a pointer-width
+        # absolute relocation against this global's section, naming the target
+        # symbol (an anonymous rodata global already packed in this same loop).
+        # the ELF writer emits a `.rela.<section>` for any section carrying these.
         if (g.init.kind == value.VAL_CONST_AGG) {
-            val res_agg: R.Result[bool, str] = pack_agg_relocs(deferred, ?g.init, sec_idx);
+            val res_agg: R.Result[bool, str] = pack_agg_relocs(deferred, ?g.init, sec_idx, tgt.isa.pointer_width);
             if (R.is_err[bool, str](res_agg)) { ret R.err[bool, str](R.unwrap_err[bool, str](res_agg)); }
         }
         i = i + 1;
@@ -1012,15 +1128,27 @@ fun pack_constpool(s: *session.Session, image: *of.ObjectImage, enc: *encode.Enc
 
 # attach the relocation side-table of an aggregate constant initializer
 #
-# One abs64 relocation per pointer leaf, patching the leaf's byte offset with the
-# address of its target symbol plus the recorded addend. The abstract abs64 kind
-# is format-independent, so no target is needed.
+# One absolute relocation per pointer leaf, patching the leaf's byte offset with
+# the address of its target symbol plus the recorded addend. The relocation's
+# *kind* is target-dependent even though its abstract shape is not: the kind
+# whose patched field matches the target's own pointer width, from
+# `of.abs_kind_for_pointer_width` - RK_ABS64 on every 64-bit-pointer target,
+# RK_ABS16 on mos6502's 2-byte pointers (#2280), and so on for any future
+# narrower-pointer target (#2835). A fixed RK_ABS64 here reached every target
+# whose pointer is not 8 bytes: refused loudly where the applier does not
+# support it (mos6502), silently wrong wherever one does without checking width.
 # ---
-# deferred: out - the recorded relocations, bound once symbols are complete
-# init:     the VAL_CONST_AGG initializer carrying the side-table
-# sec_idx:  index of the section the relocations patch
-# ret:      true on success, or an error string
-fun pack_agg_relocs(deferred: *obj.DeferredRelocs, init: *value.Value, sec_idx: u32) R.Result[bool, str] {
+# deferred:      out - the recorded relocations, bound once symbols are complete
+# init:          the VAL_CONST_AGG initializer carrying the side-table
+# sec_idx:       index of the section the relocations patch
+# pointer_width: the target's pointer width in bytes (isa.IsaVTable.pointer_width)
+# ret:           true on success, or an error string
+fun pack_agg_relocs(deferred: *obj.DeferredRelocs, init: *value.Value, sec_idx: u32,
+                    pointer_width: u32) R.Result[bool, str] {
+    val kind_r: R.Result[of.RelocKind, str] = of.abs_kind_for_pointer_width(pointer_width);
+    if (R.is_err[of.RelocKind, str](kind_r)) { ret R.err[bool, str](R.unwrap_err[of.RelocKind, str](kind_r)); }
+    val kind: of.RelocKind = R.unwrap_ok[of.RelocKind, str](kind_r);
+
     var i: u32 = 0;
     for (i < init.data.agg.reloc_count) {
         val ar: *value.AggReloc = ?init.data.agg.relocs[i];
@@ -1035,7 +1163,7 @@ fun pack_agg_relocs(deferred: *obj.DeferredRelocs, init: *value.Value, sec_idx: 
         var rec: obj.DeferredReloc;
         rec.section      = sec_idx;
         rec.offset       = ar.offset;
-        rec.kind         = of.RK_ABS64;
+        rec.kind         = kind;
         rec.name         = ar.symbol;
         rec.addend       = ar.addend;
         rec.extern_flags = flags;

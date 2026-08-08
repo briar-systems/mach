@@ -527,12 +527,86 @@ pub fun link_mixed(s: *session.Session, tgt: *target.Target,
 # pie_opt_in:   the build opted into a position-independent executable (`--pie`)
 # image_options: format-neutral executable-image options
 # ret:          true once the artifact is written, or an error string
+# the machine-flags word the linked image must carry, checked against every input
+#
+# Two facts with two different owners, which is why this is not a copy of any input's
+# word:
+#
+#   the ABI bits are the TARGET'S. They come from the resolved convention through
+#   `isa.machine_flags`, so the image states the convention it was actually linked
+#   for. Every input that declares a different one is refused by name here rather
+#   than producing an image whose header contradicts half its own bytes - this is
+#   the same disagreement `ld.lld` reports as "different floating-point ABI", and
+#   catching it is the point of the field existing at all.
+#
+#   the feature bits are the INPUTS'. mach's own encoder emits no compressed
+#   instruction, but a linked image also carries whatever its foreign inputs carried,
+#   and the `rv64gc` objects `int/lib/cc.sh` produces do contain them. So they are
+#   OR-ed across the inputs, the way a real linker accumulates them.
+#
+# An arch that declares no flags derivation has no word, and every image of it
+# carries 0 (#2813).
+# ---
+# s:            shared session, for the diagnostic
+# tgt:          the resolved target, owning the ABI bits
+# modules:      the input images, owning the feature bits
+# module_count: number of inputs
+# ret:          the combined word, or the reason an input disagrees
+fun image_machine_flags(s: *session.Session, tgt: *target.Target,
+                        modules: *of.ObjectImage, module_count: u32) R.Result[u32, str] {
+    if (!isa.declares_machine_flags(tgt.isa)) { ret R.ok[u32, str](0); }
+
+    # the bits the ABI axis can occupy, asked of the arch rather than written down
+    # here: it is every bit any float-argument width can set. deriving it keeps the
+    # linker free of one arch's flag layout, and keeps this from becoming a second
+    # place that has to be edited when a variant is added.
+    val abi_mask: u32 = isa.machine_flags(tgt.isa, 0, false)
+                      | isa.machine_flags(tgt.isa, 32, false)
+                      | isa.machine_flags(tgt.isa, 64, false);
+    val abi_bits: u32 = isa.machine_flags(tgt.isa, tgt.abi.float_arg_bits, false) & abi_mask;
+
+    var feature_bits: u32 = 0;
+    var i: u32 = 0;
+    for (i < module_count) {
+        val got: u32 = modules[i].machine_flags;
+        if ((got & abi_mask) != abi_bits) {
+            ret R.err[u32, str](machine_flags_mismatch_message(s, tgt, ?modules[i],
+                                                              got & abi_mask, abi_bits));
+        }
+        # anything outside the ABI axis is a FEATURE the input claims about its own
+        # bytes, including a bit this compiler does not model. accumulate rather than
+        # judge: dropping an unmodelled bit understates the image, and refusing one
+        # would make an unknown extension a link error for no reason.
+        feature_bits = feature_bits | (got & ~abi_mask);
+        i = i + 1;
+    }
+    ret R.ok[u32, str](abi_bits | feature_bits);
+}
+
 fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectImage,
                  module_count: u32, codegen_count: u32,
                  dynlibs: *of.DynLib, dynlib_count: u32,
                  out_path: *u8, name: *u8, mode: LinkMode, pie_opt_in: bool,
                  image_options: of.ImageOptions) R.Result[bool, str] {
     val alloc: *A.Allocator = s.alloc;
+    # put every input into the form the appliers resolve, before anything reads a
+    # relocation, and for EVERY input regardless of provenance: an image parsed from
+    # a foreign `.o` and an image handed straight over from codegen arrive here by
+    # different routes and must leave here the same shape (#2828). Skipped for a
+    # relocatable output, which carries its relocations through unresolved and so
+    # must keep the format's own spelling.
+    if (mode != LINK_RELOCATABLE && modules != nil) {
+        var ni: u32 = 0;
+        for (ni < module_count) {
+            val nr: R.Result[bool, str] = rel.normalize_image(tgt.isa, ?modules[ni]);
+            if (R.is_err[bool, str](nr)) { ret R.err[bool, str](R.unwrap_err[bool, str](nr)); }
+            ni = ni + 1;
+        }
+    }
+    val mf_r: R.Result[u32, str] = image_machine_flags(s, tgt, modules, module_count);
+    if (R.is_err[u32, str](mf_r)) { ret R.err[bool, str](R.unwrap_err[u32, str](mf_r)); }
+    var opts: of.ImageOptions = image_options;
+    opts.machine_flags = R.unwrap_ok[u32, str](mf_r);
     var local_atoms: AtomPlan;
     init_atom_plan(?local_atoms);
     var pre_atoms: *AtomPlan = nil;
@@ -570,7 +644,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     if (!R.unwrap_ok[bool, str](sr)) {
         val linked: R.Result[bool, str] = link_modules_core(
             s, tgt, modules, module_count, codegen_count,
-            dynlibs, dynlib_count, out_path, name, mode, pie_opt_in, image_options,
+            dynlibs, dynlib_count, out_path, name, mode, pie_opt_in, opts,
             pre_atoms);
         free_atom_plan(alloc, ?local_atoms);
         ret linked;
@@ -601,7 +675,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
 
     val linked: R.Result[bool, str] = link_modules_core(
         s, tgt, all, module_count + 1, codegen_count,
-        dynlibs, dynlib_count, out_path, name, mode, pie_opt_in, image_options,
+        dynlibs, dynlib_count, out_path, name, mode, pie_opt_in, opts,
         pre_atoms);
     A.deallocate[of.ObjectImage](alloc, all, (module_count + 1)::usize);
     obj.dnit(?local_imports);
@@ -975,7 +1049,7 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
 
         var emit_r: R.Result[bool, str] = R.ok[bool, str](true);
         if (shared) {
-            emit_r = emit_shared_object(s, tgt, ?out_img, merged, ?groups, modules, module_count, ?sym_locs, ?dyn, out_path);
+            emit_r = emit_shared_object(s, tgt, ?out_img, merged, ?groups, modules, module_count, ?sym_locs, ?dyn, out_path, image_options);
         }
         or (dynamic) {
             emit_r = emit_executable(s, tgt, ?out_img, merged, ?groups, ?sym_locs, ?dyn, out_path, name, image_options);
@@ -1606,19 +1680,37 @@ fun emit_executable(s: *session.Session, tgt: *target.Target, out_img: *of.Objec
     val dbg: *of.Section = R.unwrap_ok[*of.Section, str](dr);
 
     var emit_r: R.Result[bool, str] = R.ok[bool, str](true);
+
+    # `.symtab` (#2772, extended to every dynamic-family image kind by #2807 -
+    # PIE and shared objects previously had no way to carry one at all). built
+    # once and handed to whichever writer runs below.
+    var symtab_count: u32 = 0;
+    val ser: R.Result[*of.SymtabEntry, str] = build_symtab_entries(alloc, out_img, segs, seg_count, ?symtab_count);
+    if (R.is_err[*of.SymtabEntry, str](ser)) {
+        if (dbg != nil && dbg_count > 0) { A.deallocate[of.Section](alloc, dbg, dbg_count::usize); }
+        if (exc != nil && exc_count > 0) { A.deallocate[of.Section](alloc, exc, exc_count::usize); }
+        if (funcs != nil && func_count > 0) { A.deallocate[of.ExecFunction](alloc, funcs, func_count::usize); }
+        free_load_segments(alloc, segs, seg_count);
+        ret R.err[bool, str](R.unwrap_err[*of.SymtabEntry, str](ser));
+    }
+    val symtab: *of.SymtabEntry = R.unwrap_ok[*of.SymtabEntry, str](ser);
+
     if (dyn == nil) {
         emit_r = tgt.of.emit_exec(alloc, ?s.interner, tgt.isa, segs, seg_count,
                                   os_page_size(tgt), os_base_addr(tgt), entry,
                                   funcs, func_count,
-                                  exc, exc_count, dbg, dbg_count, out_path, name, image_options);
+                                  exc, exc_count, dbg, dbg_count,
+                                  symtab, symtab_count, out_path, name, image_options);
     }
     or {
         emit_r = tgt.of.emit_dyn_exec(alloc, ?s.interner, tgt.isa, segs, seg_count,
                                       os_page_size(tgt), os_base_addr(tgt), entry,
                                       funcs, func_count, ?dyn.info, dyn.fixups, dyn.fixup_count,
-                                      exc, exc_count, dbg, dbg_count, out_path, name, image_options);
+                                      exc, exc_count, dbg, dbg_count,
+                                      symtab, symtab_count, out_path, name, image_options);
     }
 
+    if (symtab != nil && symtab_count > 0) { A.deallocate[of.SymtabEntry](alloc, symtab, symtab_count::usize); }
     if (dbg != nil && dbg_count > 0) { A.deallocate[of.Section](alloc, dbg, dbg_count::usize); }
     if (exc != nil && exc_count > 0) { A.deallocate[of.Section](alloc, exc, exc_count::usize); }
     if (funcs != nil && func_count > 0) {
@@ -1653,12 +1745,14 @@ fun emit_executable(s: *session.Session, tgt: *target.Target, out_img: *of.Objec
 # sym_locs:     resolved symbol table, for each export's final address
 # dyn:          the dynamic-link plan + collected base relocations
 # out_path:     null-terminated output file path (its basename is the soname)
+# image_options: format-neutral image options, carrying the machine-flags word the
+#               caller derived from the target and the inputs
 # ret:          true once the shared object is written, or an error string
 fun emit_shared_object(s: *session.Session, tgt: *target.Target, out_img: *of.ObjectImage,
                        merged: *MergedSection, groups: *SectionGroups,
                        modules: *of.ObjectImage, module_count: u32,
                        sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState,
-                       out_path: *u8) R.Result[bool, str] {
+                       out_path: *u8, image_options: of.ImageOptions) R.Result[bool, str] {
     if (tgt.of.emit_shared == nil) {
         ret R.err[bool, str]("link: object format cannot write shared libraries");
     }
@@ -1690,10 +1784,25 @@ fun emit_shared_object(s: *session.Session, tgt: *target.Target, out_img: *of.Ob
     }
     val dbg: *of.Section = R.unwrap_ok[*of.Section, str](dr);
 
+    # `.symtab` (#2772/#2807) - a shared object is the image a profiler most needs
+    # to symbolize, since the interesting frames in a mixed process are usually in
+    # libraries.
+    var symtab_count: u32 = 0;
+    val ser: R.Result[*of.SymtabEntry, str] = build_symtab_entries(alloc, out_img, segs, seg_count, ?symtab_count);
+    if (R.is_err[*of.SymtabEntry, str](ser)) {
+        if (dbg != nil && dbg_count > 0) { A.deallocate[of.Section](alloc, dbg, dbg_count::usize); }
+        if (exports != nil && export_count > 0) { A.deallocate[of.ExportSym](alloc, exports, export_count::usize); }
+        free_load_segments(alloc, segs, seg_count);
+        ret R.err[bool, str](R.unwrap_err[*of.SymtabEntry, str](ser));
+    }
+    val symtab: *of.SymtabEntry = R.unwrap_ok[*of.SymtabEntry, str](ser);
+
     val emit_r: R.Result[bool, str] =
         tgt.of.emit_shared(alloc, ?s.interner, tgt.isa, segs, seg_count, os_page_size(tgt),
-                           exports, export_count, ?dyn.info, dbg, dbg_count, out_path);
+                           exports, export_count, ?dyn.info, dbg, dbg_count,
+                           symtab, symtab_count, out_path, image_options);
 
+    if (symtab != nil && symtab_count > 0) { A.deallocate[of.SymtabEntry](alloc, symtab, symtab_count::usize); }
     if (dbg != nil && dbg_count > 0) { A.deallocate[of.Section](alloc, dbg, dbg_count::usize); }
     if (exports != nil && export_count > 0) { A.deallocate[of.ExportSym](alloc, exports, export_count::usize); }
     free_load_segments(alloc, segs, seg_count);
@@ -2145,6 +2254,152 @@ fun build_exec_functions(alloc: *A.Allocator, out_img: *of.ObjectImage,
 
     @func_count = w;
     ret R.ok[*of.ExecFunction, str](funcs);
+}
+
+# one function symbol mid-way through becoming an `of.SymtabEntry`: still
+# segment-relative (for the address sort and size fill `build_symtab_entries`
+# shares with `build_exec_functions`), not yet resolved to a final vaddr.
+rec SymtabRow {
+    seg_index:  u32;
+    seg_offset: u32;
+    size:       u32;
+    name:       intern.StrId;
+    global:     bool;
+}
+
+# collect defined function symbols into `of.SymtabEntry` records for a
+# `.symtab`-equivalent (#2772): name, final virtual address, byte size, and
+# STB_LOCAL/STB_GLOBAL linkage, sorted with every local entry before every
+# global one (the convention `build_symtab_bytes`'s `sh_info` relies on)
+#
+# Shares its filter, address sort, and next-symbol-in-segment size fill with
+# `build_exec_functions` (which serves a different consumer - PE unwind tables -
+# and keeps no name and no real size). A symbol whose size fills to 0 (aliased
+# at the same address as the next one, or a segment's last symbol with nothing
+# after it in a zero-length tail) is dropped, same as there: a zero-size symtab
+# entry cannot help a profiler attribute anything and only adds noise.
+# ---
+# alloc:       allocator backing the returned array
+# out_img:     the merged image whose symbols are scanned
+# segs:        the laid-out load segments, for bounds and vaddr resolution
+# seg_count:   number of load segments
+# entry_count: out - number of entries produced
+# ret:         the entry array (freed by the caller), or an error string
+fun build_symtab_entries(alloc: *A.Allocator, out_img: *of.ObjectImage,
+                         segs: *of.LoadSegment, seg_count: u32,
+                         entry_count: *u32) R.Result[*of.SymtabEntry, str] {
+    @entry_count = 0;
+    if (out_img.symbol_count == 0) { ret R.ok[*of.SymtabEntry, str](nil); }
+
+    val rr: R.Result[*SymtabRow, str] = A.allocate[SymtabRow](alloc, out_img.symbol_count::usize);
+    if (R.is_err[*SymtabRow, str](rr)) {
+        ret R.err[*of.SymtabEntry, str](R.unwrap_err[*SymtabRow, str](rr));
+    }
+    var rows: *SymtabRow = R.unwrap_ok[*SymtabRow, str](rr);
+    var n: u32 = 0;
+
+    var si: u32 = 0;
+    for (si < out_img.symbol_count) {
+        val sym: *of.Symbol = ?out_img.symbols[si];
+        if ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) == 0)                                { si = si + 1; cnt; }
+        if (sym.section == of.SECTION_EXTERNAL || sym.section >= out_img.section_count) { si = si + 1; cnt; }
+        if (out_img.sections[sym.section].kind != of.SK_TEXT)                           { si = si + 1; cnt; }
+
+        val seg: u32 = segment_index_for(out_img, sym.section);
+        if (seg >= seg_count)                      { si = si + 1; cnt; }
+        if (sym.offset::usize >= segs[seg].filesz) { si = si + 1; cnt; }
+
+        rows[n].seg_index  = seg;
+        rows[n].seg_offset = sym.offset;
+        rows[n].size       = 0;
+        rows[n].name       = sym.name;
+        rows[n].global     = (sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0;
+        n = n + 1;
+        si = si + 1;
+    }
+
+    if (n == 0) {
+        A.deallocate[SymtabRow](alloc, rows, out_img.symbol_count::usize);
+        ret R.ok[*of.SymtabEntry, str](nil);
+    }
+
+    # stable insertion sort by segment then offset - identical to
+    # build_exec_functions's, since both need address order to fill sizes.
+    var i: u32 = 1;
+    for (i < n) {
+        var cur: SymtabRow = rows[i];
+        var j: i32 = i::i32 - 1;
+        for (j >= 0
+             && (rows[j::u32].seg_index > cur.seg_index
+                 || (rows[j::u32].seg_index == cur.seg_index
+                     && rows[j::u32].seg_offset > cur.seg_offset))) {
+            rows[(j + 1)::u32] = rows[j::u32];
+            j = j - 1;
+        }
+        rows[(j + 1)::u32] = cur;
+        i = i + 1;
+    }
+
+    # fill sizes from the next symbol in the same segment (or segment end), and
+    # compact away zero/non-forward ranges - same shape as build_exec_functions.
+    var w: u32 = 0;
+    i = 0;
+    for (i < n) {
+        val seg: u32 = rows[i].seg_index;
+        val cur_off: u32 = rows[i].seg_offset;
+        var next_off: u32 = segs[seg].filesz::u32;
+        if (i + 1 < n && rows[i + 1].seg_index == seg) {
+            next_off = rows[i + 1].seg_offset;
+        }
+        if (next_off > cur_off) {
+            rows[w] = rows[i];
+            rows[w].size = next_off - cur_off;
+            w = w + 1;
+        }
+        i = i + 1;
+    }
+
+    if (w == 0) {
+        A.deallocate[SymtabRow](alloc, rows, out_img.symbol_count::usize);
+        ret R.ok[*of.SymtabEntry, str](nil);
+    }
+
+    val er: R.Result[*of.SymtabEntry, str] = A.allocate[of.SymtabEntry](alloc, w::usize);
+    if (R.is_err[*of.SymtabEntry, str](er)) {
+        A.deallocate[SymtabRow](alloc, rows, out_img.symbol_count::usize);
+        ret R.err[*of.SymtabEntry, str](R.unwrap_err[*of.SymtabEntry, str](er));
+    }
+    var entries: *of.SymtabEntry = R.unwrap_ok[*of.SymtabEntry, str](er);
+
+    # stable partition: every local entry, in address order, before every global
+    # one, in address order - `build_symtab_bytes`'s `sh_info` precondition.
+    var wi: u32 = 0;
+    i = 0;
+    for (i < w) {
+        if (!rows[i].global) {
+            entries[wi].name   = rows[i].name;
+            entries[wi].vaddr  = segs[rows[i].seg_index].vaddr + rows[i].seg_offset::u64;
+            entries[wi].size   = rows[i].size;
+            entries[wi].global = false;
+            wi = wi + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < w) {
+        if (rows[i].global) {
+            entries[wi].name   = rows[i].name;
+            entries[wi].vaddr  = segs[rows[i].seg_index].vaddr + rows[i].seg_offset::u64;
+            entries[wi].size   = rows[i].size;
+            entries[wi].global = true;
+            wi = wi + 1;
+        }
+        i = i + 1;
+    }
+
+    A.deallocate[SymtabRow](alloc, rows, out_img.symbol_count::usize);
+    @entry_count = w;
+    ret R.ok[*of.SymtabEntry, str](entries);
 }
 
 # one run of same-named input sections inside a merged output section
@@ -2801,6 +3056,40 @@ fun atom_resume_offset(dst: u32, end: u32, section_align: u32) u32 {
 }
 
 # physical relocation shape supplied by the active ISA's relocatable-object seam
+# whether a symbol is object-private and named by no relocation in its own module
+#
+# An object-private symbol is resolved by (module, symbol index) and never by name
+# (#2520), so the ONLY thing that can address one is a relocation in the same module.
+# A local no relocation names is therefore unreachable, whatever it sits inside.
+#
+# Relocations sourced from a debug section do not count, for the same reason the atom
+# reference index skips them: debug information DESCRIBES code and must never be what
+# keeps code alive, or the `-g` link retains bodies the plain link discards (#2572).
+#
+# Scans the module's relocations rather than consulting a precomputed set: this is
+# asked only about a symbol that falls inside a duplicate weak body, which is rare,
+# and a set would have to be built for every link to serve those few questions.
+# ---
+# m:  the module owning both the symbol and the relocations that could name it
+# sy: index of the symbol within that module
+# ret: true when the symbol is local and nothing in the module names it
+fun unreferenced_local(m: *of.ObjectImage, sy: u32) bool {
+    if (sy >= m.symbol_count) { ret false; }
+    val sym: *of.Symbol = ?m.symbols[sy];
+    if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0) { ret false; }
+    if (sym.section == of.SECTION_EXTERNAL)        { ret false; }
+    var ri: u32 = 0;
+    for (ri < m.reloc_count) {
+        val r: *of.Relocation = ?m.relocations[ri];
+        if (r.sym == sy
+            && !(r.section < m.section_count && m.sections[r.section].kind == of.SK_DEBUG)) {
+            ret false;
+        }
+        ri = ri + 1;
+    }
+    ret true;
+}
+
 fun atom_reloc_traits(r: *of.Relocation, section: *of.Section,
                       arch: *isa.IsaVTable,
                       codegen_image: bool) rel.RelocTraits {
@@ -3252,16 +3541,25 @@ fun build_atom_plan(s: *session.Session, modules: *of.ObjectImage, module_count:
         if (end <= start) { ci = ci + 1; cnt; }
 
         # a second symbol entry or nonzero extent overlapping the candidate may
-        # remain addressable from live code. The sole exception is COFF's exact
-        # synthetic section anchor for a full COMDAT carrier; relocation
-        # reachability through that anchor is audited below.
+        # remain addressable from live code. Two exceptions: COFF's exact synthetic
+        # section anchor for a full COMDAT carrier, whose relocation reachability is
+        # audited below, and an object-private symbol NOTHING addresses, which cannot
+        # be reached by definition (`unreferenced_local`).
+        #
+        # The second exists because a producer may define interior labels that exist
+        # only to be consumed before this point. riscv64 defines a `.Lpcrel_hi` label
+        # at every `auipc` starting a psABI pair, and the pair collapse rewrites every
+        # reference to one away before the link reads a relocation (#2828); without
+        # this, one such label inside a duplicate weak body kept the whole body alive
+        # and the -g link then described it with a second, contradictory DIE.
         var safe: bool = true;
         var sy: u32 = 0;
         for (sy < modules[cm].symbol_count) {
             if (sy != cy) {
                 val other: *of.Symbol = ?modules[cm].symbols[sy];
                 if (other.section == sym.section
-                    && !atom_is_carrier_anchor(?modules[cm], sym, other, start, end)) {
+                    && !atom_is_carrier_anchor(?modules[cm], sym, other, start, end)
+                    && !unreferenced_local(?modules[cm], sy)) {
                     if (other.offset >= start && other.offset < end) { safe = false; }
                     if (other.size > 0) {
                         val other_end: u64 = other.offset::u64 + other.size::u64;
@@ -4233,17 +4531,20 @@ fun module_weak_function_ref_is_dead(modules: *of.ObjectImage, m: u32, name: int
     ret false;
 }
 
-# whether a relocation is a DWARF code address: a 64-bit absolute patch site in one of
-# the four debug sections that hold executable addresses. the sec_offset references
-# into `.debug_str` / `.debug_loclists` / `.debug_rnglists` are RK_ABS32 and carry
-# section offsets rather than addresses, so the kind alone separates them
+# whether a relocation is a DWARF code address: a pointer-width absolute patch
+# site in one of the four debug sections that hold executable addresses. the
+# sec_offset references into `.debug_str` / `.debug_loclists` / `.debug_rnglists`
+# are RK_ABS32 and carry section offsets rather than addresses, so the kind
+# alone separates them - the target's own pointer-abs kind (#2835), not a fixed
+# RK_ABS64, since a DWARF address is exactly the target's pointer width.
 # ---
-# r:            the relocation to classify
+# r:             the relocation to classify
 # info_sec / line_sec / loclists_sec / rnglists_sec: module-local debug section indices
-# ret:          true when the relocation patches an executable address
+# pointer_width: the target's pointer width in bytes
+# ret:           true when the relocation patches an executable address
 fun is_dwarf_code_address(r: *of.Relocation, info_sec: u32, line_sec: u32,
-                          loclists_sec: u32, rnglists_sec: u32) bool {
-    if (r.kind != of.RK_ABS64) { ret false; }
+                          loclists_sec: u32, rnglists_sec: u32, pointer_width: u32) bool {
+    if (!of.is_pointer_abs_kind(r.kind, pointer_width)) { ret false; }
     ret r.section == info_sec || r.section == line_sec
         || r.section == loclists_sec || r.section == rnglists_sec;
 }
@@ -4465,7 +4766,7 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
         # every reference mach emits is intra-function and so cannot straddle one, but
         # nothing generated that property and nothing would notice it breaking, and the
         # failure is a silently wrong address in debug info (#2620). refuse instead.
-        if (is_dwarf_code_address(r, info_sec, line_sec, loclists_sec, rnglists_sec)
+        if (is_dwarf_code_address(r, info_sec, line_sec, loclists_sec, rnglists_sec, arch.pointer_width)
             && !dwarf_addend_survives_remap(modules, m, r.sym, r.addend, sec_base, atoms)) {
             ret R.err[bool, str](dwarf_addend_message(s, modules, m, target_name, r));
         }
@@ -4507,7 +4808,7 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                 # unrelated body (#2583).
                 if ((r.section == info_sec || r.section == line_sec
                      || r.section == loclists_sec || r.section == rnglists_sec)
-                    && r.kind == of.RK_ABS64
+                    && of.is_pointer_abs_kind(r.kind, arch.pointer_width)
                     && module_weak_function_ref_is_dead(modules, m, target_name, r.addend, sec_base, atoms)) {
                     resolved.vaddr = DWARF_TOMBSTONE_ADDRESS;
                     apply_addend = 0;
@@ -4564,7 +4865,7 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                 # bytes stay as the object left them; the explicit addend rides
                 # the bind stream. ELF/COFF have no such binding and keep the
                 # undefined-symbol error (#2563).
-                if (R.is_ok[u32, str](imp) && r.kind == of.RK_ABS64
+                if (R.is_ok[u32, str](imp) && of.is_pointer_abs_kind(r.kind, arch.pointer_width)
                     && format.id == of.OF_MACHO) {
                     val rec_b: R.Result[bool, str] = dynstate_add_import_addr_fixup(s, dyn,
                         segment_index_for(out_img, out_ix), patch_off,
@@ -4638,12 +4939,13 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
             ret R.err[bool, str](R.unwrap_err[bool, str](pr));
         }
 
-        # PIE: an in-image absolute 64-bit pointer (RK_ABS64) in a loadable section
-        # holds a link-time (bias-zero) address; record its location so the writer
-        # emits a load-time base relocation the loader slides. a non-allocated debug
+        # PIE: an in-image absolute pointer (the target's own pointer-width abs
+        # kind, #2835 - not always RK_ABS64) in a loadable section holds a
+        # link-time (bias-zero) address; record its location so the writer emits
+        # a load-time base relocation the loader slides. a non-allocated debug
         # section is never mapped, so its absolute pointers are read at their
         # link-time value and take no base relocation. PC-relative kinds need none.
-        if (dyn.info.pie && r.kind == of.RK_ABS64
+        if (dyn.info.pie && of.is_pointer_abs_kind(r.kind, arch.pointer_width)
             && is_loadable_kind(out_img.sections[out_ix].kind)) {
             val brr: R.Result[bool, str] = dynstate_add_base_reloc(s, dyn,
                 segment_index_for(out_img, out_ix), patch_off, resolved.vaddr + r.addend::u64);
@@ -5112,7 +5414,8 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
                                                dyn.info.lib_count, want);
                 }
                 if (!O.is_some[u32](li_opt)) {
-                    ret R.err[bool, str](pinned_lib_message(s, cn.canonical, want));
+                    ret R.err[bool, str](
+                        pinned_attribution_message(s, cn.canonical, want));
                 }
                 dyn.info.imports[idx].lib_index = O.unwrap[u32](li_opt);
             }
@@ -6632,28 +6935,138 @@ fun dwarf_addend_message(s: *session.Session, modules: *of.ObjectImage, m: u32,
 }
 
 fun undef_message(s: *session.Session, name: intern.StrId) str {
+    # an undefined symbol carrying a `#[library]` attribution has a more specific
+    # account than "undefined": the link's own answer about the library it named.
+    # routing through the same decision function the dynamic path uses is what makes
+    # the wording a decided fact rather than a consequence of whether this link
+    # happens to have a dynamic dependency (#2800) - without it, the identical
+    # broken program read "undefined symbol" on a static link and "not among the
+    # link's dependencies" the moment any unrelated shared library joined it.
+    val pinned: O.Option[intern.StrId] = session.import_library(s, name);
+    if (O.is_some[intern.StrId](pinned)) {
+        ret pinned_attribution_message(s, name, O.unwrap[intern.StrId](pinned));
+    }
     val nm: O.Option[str] = intern.lookup(?s.interner, name);
     if (O.is_some[str](nm)) { ret join2(s, "undefined symbol: ", O.unwrap[str](nm), "undefined symbol"); }
     ret "undefined symbol";
 }
 
-# build the "import '<sym>' pinned to library '<lib>' not
-# among the link's dependencies" diagnostic for a `$<sym>.library` directive that
-# names a library absent from the manifest `libs` / `-l` dependency set. degrades
-# to the symbol-only form when a name cannot be resolved
+# the diagnostic for an import that named a library through `#[library("...")]`
+# (or a manifest `symbols` claim) and could not be bound to it
+#
+# THE ONE PLACE that decides what a failed pin means, so the two paths that can
+# reach a failed pin - the dynamic import table's bind, and an undefined symbol on
+# a link with no import table at all - cannot disagree about the same program.
+#
+# The decision is made against the session's effective link set: the artifact's own
+# entries, the entries cascaded from dependencies, and the request's own facts.
+# There are exactly two answers, and they are different facts about the manifest:
+#
+#   - the link PROVIDES the library, as a static input. the pin can never bind,
+#     because a static input defines symbols rather than importing them, and the
+#     real fault is that the symbol is in none of them. saying "not among the
+#     link's dependencies" here is simply false, and it is false in the way that
+#     costs most: it points at the manifest when the manifest is right (#2800).
+#   - the link does NOT provide the library at all. the pin names something that
+#     is neither the artifact's own nor any dependency's export, and the refusal
+#     stands - now naming what the link does provide, so the fix is visible.
+# ---
+# s:        shared session holding the interner and the link-provider registry
+# sym_name: interned name of the pinned import
+# lib:      interned logical name it was pinned to
+# ret:      the diagnostic string (degraded if a name cannot be resolved)
+fun pinned_attribution_message(s: *session.Session, sym_name: intern.StrId,
+                               lib: intern.StrId) str {
+    val provider: O.Option[session.LinkProvider] = session.link_provider(s, lib);
+    if (O.is_some[session.LinkProvider](provider)
+        && O.unwrap[session.LinkProvider](provider).is_static) {
+        ret static_provider_message(s, sym_name, lib);
+    }
+    ret pinned_lib_message(s, sym_name, lib);
+}
+
+# build the diagnostic for an import pinned to a library the link provides as a
+# STATIC input
+#
+# Names all three facts a reader needs and no more: that the library IS in the
+# link, what kind of input it is, and that the symbol is therefore undefined. The
+# remedy is not a manifest edit - it is that the archive does not contain the
+# symbol, so the declaration's spelling or the archive's build is wrong.
 # ---
 # s:        shared session holding the interner
+# sym_name: interned name of the pinned import
+# lib:      interned logical name of the static entry it was pinned to
+# ret:      the diagnostic string (degraded if a name cannot be resolved)
+fun static_provider_message(s: *session.Session, sym_name: intern.StrId,
+                            lib: intern.StrId) str {
+    val fallback: str =
+        "import pinned to a library this link provides as a static input, which defines symbols rather than importing them; the symbol is undefined";
+    val sno: O.Option[str] = intern.lookup(?s.interner, sym_name);
+    val lno: O.Option[str] = intern.lookup(?s.interner, lib);
+    if (!O.is_some[str](sno) || !O.is_some[str](lno)) { ret fallback; }
+    val pre: str = join3(s, "import '", O.unwrap[str](sno), "' is pinned to library '", fallback);
+    val mid: str = join3(s, pre, O.unwrap[str](lno),
+        "', which this link provides as a static input", fallback);
+    ret join2(s, mid,
+        ". a static input defines symbols rather than importing them, so nothing binds the import: the symbol is not defined by any object or archive in the link. check the declaration's spelling against the library's own symbols, or that the archive was built with it",
+        fallback);
+}
+
+# build the "import '<sym>' pinned to library '<lib>' not
+# among the link's dependencies" diagnostic for an import attributed to a library
+# the effective link set does not provide at all - neither the artifact's own
+# entries nor any dependency's `export = true`. lists the logical names the link
+# DOES provide, since the refusal is about the set and the set is what the reader
+# has to compare against. degrades to the symbol-only form when a name cannot be
+# resolved
+# ---
+# s:        shared session holding the interner and the link-provider registry
 # sym_name: interned name of the pinned import
 # lib:      interned name of the unknown library it was pinned to
 # ret:      the diagnostic string (degraded if a name cannot be resolved)
 fun pinned_lib_message(s: *session.Session, sym_name: intern.StrId, lib: intern.StrId) str {
+    val fallback: str = "import pinned to a library not among the link's dependencies";
     val sno: O.Option[str] = intern.lookup(?s.interner, sym_name);
     val lno: O.Option[str] = intern.lookup(?s.interner, lib);
-    if (O.is_some[str](sno) && O.is_some[str](lno)) {
-        val pre: str = join3(s, "import '", O.unwrap[str](sno), "' pinned to library '", "import pinned to unknown library");
-        ret join3(s, pre, O.unwrap[str](lno), "' not among the link's dependencies", "import pinned to unknown library");
+    if (!O.is_some[str](sno) || !O.is_some[str](lno)) { ret fallback; }
+    val pre: str = join3(s, "import '", O.unwrap[str](sno), "' pinned to library '", fallback);
+    val head: str = join3(s, pre, O.unwrap[str](lno),
+        "' not among the link's dependencies", fallback);
+    val provided: str = join_link_providers(s);
+    if (str_len(provided) == 0) { ret head; }
+    val sep: str = join2(s, head, "; this link provides: ", head);
+    ret join2(s, sep, provided, sep);
+}
+
+# the logical library names the effective link set provides, in link order,
+# comma-separated, each static entry marked as such
+#
+# Read straight off the driver's one enumeration of the link, so the list is the
+# link's own account of itself and is stable across runs. A static entry is marked
+# because it is a candidate for a `#[library]` spelling and NOT a candidate for a
+# binding, which is exactly the distinction a reader comparing against this list
+# needs to make.
+# ---
+# s:   shared session holding the interner and the registry
+# ret: the joined list, or the empty string when the link names none
+fun join_link_providers(s: *session.Session) str {
+    val provs: *session.LinkProvider = session.link_providers(s);
+    val n: u32 = session.link_provider_count(s);
+    var acc: str = "";
+    var i: u32 = 0;
+    for (i < n) {
+        val nm: O.Option[str] = intern.lookup(?s.interner, provs[i].name);
+        if (!O.is_some[str](nm)) { i = i + 1; cnt; }
+        var piece: str = O.unwrap[str](nm);
+        if (provs[i].is_static) { piece = join2(s, piece, " (static)", piece); }
+        if (str_len(acc) == 0) { acc = piece; }
+        or {
+            val sep: str = join2(s, acc, ", ", acc);
+            acc = join2(s, sep, piece, sep);
+        }
+        i = i + 1;
     }
-    ret "import pinned to a library not among the link's dependencies";
+    ret acc;
 }
 
 # build the diagnostic for a dynamic import with no `#[library]` attribution on a
@@ -6816,6 +7229,59 @@ fun overflow_message(s: *session.Session, kind: of.RelocKind, sym_name: intern.S
 # ret:  the diagnostic string
 fun unsupported_message(s: *session.Session, kind: of.RelocKind) str {
     ret join3(s, "relocation '", of.reloc_kind_name(kind), "' not supported", "relocation not supported");
+}
+
+# name the float-argument convention a machine-flags word encodes, in words
+#
+# Derived by asking the arch which width produces those bits rather than by decoding
+# them here, so this stays true for a variant added later and the linker keeps no
+# picture of any arch's flag layout.
+# ---
+# tgt:      the resolved target, supplying the arch's derivation
+# abi_bits: the ABI-axis bits to name
+# ret:      a human phrase for them
+fun float_abi_phrase(tgt: *target.Target, abi_bits: u32) str {
+    if (abi_bits == isa.machine_flags(tgt.isa, 0, false))  { ret "soft-float"; }
+    if (abi_bits == isa.machine_flags(tgt.isa, 32, false)) { ret "single-precision hard-float"; }
+    if (abi_bits == isa.machine_flags(tgt.isa, 64, false)) { ret "double-precision hard-float"; }
+    ret "an unrecognized float";
+}
+
+# the input image's name for a diagnostic, degrading to a fixed word when it cannot
+# be resolved
+# ---
+# s:   shared session holding the interner
+# img: the image to name
+# ret: the image's name, or a placeholder
+fun module_display_name(s: *session.Session, img: *of.ObjectImage) str {
+    val nm: O.Option[str] = intern.lookup(?s.interner, img.name);
+    if (O.is_some[str](nm)) { ret O.unwrap[str](nm); }
+    ret "<input>";
+}
+
+# build the float-ABI mismatch diagnostic for one disagreeing input
+#
+# Names the offending input, because the whole value of the check is saying WHICH
+# object disagrees. A float-ABI mismatch is not a detail to paper over: the two sides
+# pass float arguments in different registers, so every float crossing that boundary
+# reads back as garbage and the failure presents as a miscompile rather than as a
+# link error. That is exactly the confusion this cost on #2771 and #2797 (#2813).
+# ---
+# s:        shared session holding the interner
+# tgt:      the resolved target
+# img:      the input image that disagrees
+# got:      the input's ABI-axis bits
+# expected: the ABI-axis bits this link targets
+# ret:      the diagnostic string
+fun machine_flags_mismatch_message(s: *session.Session, tgt: *target.Target,
+                                   img: *of.ObjectImage, got: u32, expected: u32) str {
+    val tail: str = join3(s, " ABI, but this link targets '", tgt.abi.name,
+                          "', so every float argument crossing that boundary would read back as garbage",
+                          " ABI the target does not use");
+    val head: str = join3(s, "object '", module_display_name(s, img), "' was built for a ",
+                          "an input object was built for a ");
+    ret join3(s, head, float_abi_phrase(tgt, got), tail,
+              "input object float ABI does not match the target convention");
 }
 
 # build the "undefined entry symbol '<name>'" diagnostic string
@@ -10189,8 +10655,8 @@ test "mach.lang.be.linker.atom_plan:resolution_and_inert_gate" {
     if (R.is_err[session.Session, str](sr)) { ret 1; }
     var s: session.Session = R.unwrap_ok[session.Session, str](sr);
 
-    val dup: intern.StrId = lt_name(?s, "dupI3u64E");
-    val other: intern.StrId = lt_name(?s, "otherI3u64E");
+    val dup: intern.StrId = lt_name(?s, "dup$u64");
+    val other: intern.StrId = lt_name(?s, "other$u64");
     val text: intern.StrId = lt_name(?s, ".text");
     if (dup == intern.STR_NIL || other == intern.STR_NIL || text == intern.STR_NIL) { ret 1; }
 
@@ -10296,8 +10762,8 @@ test "mach.lang.be.linker.atom_plan:copy_remap_and_reloc_liveness" {
     val x64: *isa.IsaVTable = lt_isa(?reg, "x86_64");
     if (x64 == nil) { ret 1; }
 
-    val wa: intern.StrId = lt_name(?s, "waI3u64E");
-    val wb: intern.StrId = lt_name(?s, "wbI3u64E");
+    val wa: intern.StrId = lt_name(?s, "wa$u64");
+    val wb: intern.StrId = lt_name(?s, "wb$u64");
     val head: intern.StrId = lt_name(?s, "head");
     val tail: intern.StrId = lt_name(?s, "tail");
     val dead_ext: intern.StrId = lt_name(?s, "dead_ext");
@@ -10389,17 +10855,25 @@ test "mach.lang.be.linker.atom_plan:copy_remap_and_reloc_liveness" {
     ret 0;
 }
 
-# a second symbol inside a losing function interval keeps that interval live;
-# this is the conservative control for an exposed local/shared label that a live
-# relocation could still address
+# a second symbol inside a losing function interval keeps that interval live WHEN
+# SOMETHING NAMES IT - the conservative control for an exposed local label a live
+# relocation could still address - and does NOT when nothing does. The pair is the
+# test: a local is resolved by index and never by name, so a relocation in its own
+# module is the only thing that can reach one, and a rule that ignored that kept every
+# duplicate weak body alive the moment riscv64 began defining a `.Lpcrel_hi` label at
+# each `auipc` inside one (#2828)
 test "mach.lang.be.linker.atom_plan:shared_symbol_retains_loser" {
     var alloc: A.Allocator;
     page.make(?alloc);
     val sr: R.Result[session.Session, str] = session.init(?alloc);
     if (R.is_err[session.Session, str](sr)) { ret 1; }
     var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val x64: *isa.IsaVTable = lt_isa(?reg, "x86_64");
+    if (x64 == nil) { ret 1; }
 
-    val dup: intern.StrId = lt_name(?s, "dupI3u64E");
+    val dup: intern.StrId = lt_name(?s, "dup$u64");
     val local: intern.StrId = lt_name(?s, "inside_label");
     val text: intern.StrId = lt_name(?s, ".text");
     var a_bytes: [8]u8;
@@ -10420,19 +10894,37 @@ test "mach.lang.be.linker.atom_plan:shared_symbol_retains_loser" {
     b_syms[0].name = dup; b_syms[0].section = 0; b_syms[0].offset = 0;
     b_syms[0].size = 0; b_syms[0].flags = weak_flags;
     b_syms[1].name = local; b_syms[1].section = 0; b_syms[1].offset = 4;
-    b_syms[1].size = 0; b_syms[1].flags = of.SYM_OBJ_FLAG_FUNCTION;
+    b_syms[1].size = 0; b_syms[1].flags = 0;
+
+    # module b names its own interior label from its own text: that reference is what
+    # makes the label reachable, and the label is what makes the body unsafe to drop
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = of.RK_PC32;
+    relocs[0].sym = 1; relocs[0].addend = 0;
 
     var mods: [2]of.ObjectImage;
     mods[0] = lt_image(?s, lt_name(?s, "a"), ?a_sec[0], 1, ?a_syms[0], 1,
                        nil::*of.Relocation, 0);
     mods[1] = lt_image(?s, lt_name(?s, "b"), ?b_sec[0], 1, ?b_syms[0], 2,
-                       nil::*of.Relocation, 0);
+                       ?relocs[0], 1);
     var bases: [2]u32;
     var plan: AtomPlan;
     init_atom_plan(?plan);
     val pr: R.Result[bool, str] =
-        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, x64, ?plan);
     if (R.is_err[bool, str](pr) || plan.active || plan.drop_count != 0) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+
+    # the SAME shape with nothing naming the label: unreachable, so the duplicate body
+    # goes. this is the riscv64 `.Lpcrel_hi` case, whose references are all rewritten
+    # away by the pair collapse before the link reads a relocation
+    init_atom_plan(?plan);
+    mods[1] = lt_image(?s, lt_name(?s, "b"), ?b_sec[0], 1, ?b_syms[0], 2,
+                       nil::*of.Relocation, 0);
+    val ur: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, x64, ?plan);
+    if (R.is_err[bool, str](ur) || !plan.active || plan.drop_count != 1) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
     ret 0;
 }
 
@@ -10446,7 +10938,12 @@ test "mach.lang.be.linker.atom_plan:sized_extent_and_covering_symbol" {
     if (R.is_err[session.Session, str](sr)) { ret 1; }
     var s: session.Session = R.unwrap_ok[session.Session, str](sr);
 
-    val dup: intern.StrId = lt_name(?s, "sizedI3u64E");
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val x64: *isa.IsaVTable = lt_isa(?reg, "x86_64");
+    if (x64 == nil) { ret 1; }
+
+    val dup: intern.StrId = lt_name(?s, "sized$u64");
     val cover: intern.StrId = lt_name(?s, "cover");
     val text: intern.StrId = lt_name(?s, ".text");
     val weak_flags: u32 =
@@ -10472,16 +10969,22 @@ test "mach.lang.be.linker.atom_plan:sized_extent_and_covering_symbol" {
     b_syms[1].name = cover; b_syms[1].section = 0; b_syms[1].offset = 16;
     b_syms[1].size = 0; b_syms[1].flags = 0;
 
+    # module b names `cover` from its own text, so it is a reachable local and the
+    # covering-extent arm below is testing the extent rather than an unreferenced label
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = of.RK_PC32;
+    relocs[0].sym = 1; relocs[0].addend = 0;
+
     var mods: [2]of.ObjectImage;
     mods[0] = lt_image(?s, lt_name(?s, "a"), ?a_sec[0], 1, ?a_syms[0], 1,
                        nil::*of.Relocation, 0);
     mods[1] = lt_image(?s, lt_name(?s, "b"), ?b_sec[0], 1, ?b_syms[0], 2,
-                       nil::*of.Relocation, 0);
+                       ?relocs[0], 1);
     var bases: [2]u32;
     var plan: AtomPlan;
     init_atom_plan(?plan);
     val sized: R.Result[bool, str] =
-        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, x64, ?plan);
     if (R.is_err[bool, str](sized) || !plan.active || plan.drop_count != 1) { ret 1; }
     if (plan.drops[0].start != 0 || plan.drops[0].end != 8
         || plan.sections[1].live_len != 8) { ret 1; }
@@ -10501,7 +11004,7 @@ test "mach.lang.be.linker.atom_plan:sized_extent_and_covering_symbol" {
     b_syms[1].offset = 0;
     b_syms[1].size = 16;
     val covered: R.Result[bool, str] =
-        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, x64, ?plan);
     if (R.is_err[bool, str](covered) || plan.active) { ret 1; }
     ret 0;
 }
@@ -10515,7 +11018,7 @@ test "mach.lang.be.linker.atom_plan:suffix_alignment_grid" {
     if (R.is_err[session.Session, str](sr)) { ret 1; }
     var s: session.Session = R.unwrap_ok[session.Session, str](sr);
 
-    val dup: intern.StrId = lt_name(?s, "alignedI3u64E");
+    val dup: intern.StrId = lt_name(?s, "aligned$u64");
     val head: intern.StrId = lt_name(?s, "aligned_head");
     val tail: intern.StrId = lt_name(?s, "aligned_tail");
     val text: intern.StrId = lt_name(?s, ".text");
@@ -10596,7 +11099,7 @@ test "mach.lang.be.linker.atom_plan:coff_carrier_anchor" {
     val x64: *isa.IsaVTable = lt_isa(?reg, "x86_64");
     if (x64 == nil) { ret 1; }
 
-    val dup: intern.StrId = lt_name(?s, "coffI3u64E");
+    val dup: intern.StrId = lt_name(?s, "coff$u64");
     val text: intern.StrId = lt_name(?s, ".text");
     val data: intern.StrId = lt_name(?s, ".data");
     val weak_flags: u32 =
@@ -10667,7 +11170,7 @@ test "mach.lang.be.linker.atom_plan:debug_crossing_does_not_retain_loser" {
     val x64: *isa.IsaVTable = lt_isa(?reg, "x86_64");
     if (x64 == nil) { ret 1; }
 
-    val dup: intern.StrId = lt_name(?s, "crossI3u64E");
+    val dup: intern.StrId = lt_name(?s, "cross$u64");
     val base: intern.StrId = lt_name(?s, "section_base");
     val tail: intern.StrId = lt_name(?s, "tail");
     val text: intern.StrId = lt_name(?s, ".text");
@@ -10741,7 +11244,7 @@ test "mach.lang.be.linker.atom_plan:anchor_addend_crossing_retains_loser" {
     val arm64: *isa.IsaVTable = lt_isa(?reg, "aarch64");
     if (x64 == nil || arm64 == nil) { ret 1; }
 
-    val dup: intern.StrId = lt_name(?s, "crossI3u64E");
+    val dup: intern.StrId = lt_name(?s, "cross$u64");
     val base: intern.StrId = lt_name(?s, "section_base");
     val tail: intern.StrId = lt_name(?s, "tail");
     val text: intern.StrId = lt_name(?s, ".text");
@@ -10868,7 +11371,7 @@ test "mach.lang.be.linker.atom_plan:rv64_plt_pair_boundary" {
     val rv64: *isa.IsaVTable = lt_isa(?reg, "riscv64");
     if (x64 == nil || arm64 == nil || rv64 == nil) { ret 1; }
 
-    val dup: intern.StrId = lt_name(?s, "rvpairI3u64E");
+    val dup: intern.StrId = lt_name(?s, "rvpair$u64");
     val ext: intern.StrId = lt_name(?s, "callee");
     val text: intern.StrId = lt_name(?s, ".text");
     val weak_flags: u32 =
@@ -10922,6 +11425,80 @@ test "mach.lang.be.linker.atom_plan:rv64_plt_pair_boundary" {
 
 # deferred import-address fixups retain every field the format writer needs,
 # including a negative pc-relative addend
+# a failed pin reports which of two different facts is true, and reports it the
+# same way whichever path reaches it (#2800)
+#
+# The two paths are the whole point. `pinned_attribution_message` is what the
+# dynamic import table calls when a bind misses, and `undef_message` is what a link
+# with no import table at all calls for the same symbol - so the assertion here is
+# that both produce the identical string. Before this, the second said "undefined
+# symbol" and the first said the library was not in the link, for one program,
+# and which one a user saw depended on whether some unrelated shared library
+# happened to be in the link.
+test "mach.lang.be.linker.pinned_attribution_message:static_provider_vs_absent" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var bad: i32 = 0;
+
+    val sym_r:  R.Result[intern.StrId, str] = intern.intern(?s.interner, "provider_valu");
+    val vend_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, "vendored");
+    val shared_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, "shared");
+    val gone_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, "no-such-library");
+    if (R.is_err[intern.StrId, str](sym_r) || R.is_err[intern.StrId, str](vend_r)
+        || R.is_err[intern.StrId, str](shared_r) || R.is_err[intern.StrId, str](gone_r)) {
+        session.dnit(?s); ret 1;
+    }
+    val sym:    intern.StrId = R.unwrap_ok[intern.StrId, str](sym_r);
+    val vend:   intern.StrId = R.unwrap_ok[intern.StrId, str](vend_r);
+    val shared: intern.StrId = R.unwrap_ok[intern.StrId, str](shared_r);
+    val gone:   intern.StrId = R.unwrap_ok[intern.StrId, str](gone_r);
+
+    # the link provides one static entry and one dynamic one.
+    if (R.is_err[bool, str](session.register_link_provider(?s, vend, true))) {
+        session.dnit(?s); ret 1;
+    }
+    if (R.is_err[bool, str](session.register_link_provider(?s, shared, false))) {
+        session.dnit(?s); ret 1;
+    }
+
+    # pinned to the static entry: the library IS in the link, so the message must
+    # say what kind of input it is and that the symbol is undefined - never that
+    # the library is absent.
+    val stat_msg: str = pinned_attribution_message(?s, sym, vend);
+    if (!str_contains(stat_msg, "provides as a static input")) { bad = 1; }
+    if (!str_contains(stat_msg, "defines symbols rather than importing them")) { bad = 1; }
+    if (str_contains(stat_msg, "not among the link's dependencies")) { bad = 1; }
+
+    # pinned to a name the link does not provide at all: the refusal stands, and
+    # names both provided entries so the mismatch is visible.
+    val gone_msg: str = pinned_attribution_message(?s, sym, gone);
+    if (!str_contains(gone_msg, "not among the link's dependencies")) { bad = 1; }
+    if (!str_contains(gone_msg, "this link provides: vendored (static), shared")) { bad = 1; }
+    if (str_contains(gone_msg, "defines symbols rather than importing them")) { bad = 1; }
+
+    # a pinned import reaching the undefined-symbol path gets the SAME message,
+    # so the wording is decided by the attribution and the link set rather than by
+    # whether this link happens to have a dynamic half.
+    if (R.is_err[bool, str](session.register_import_library(?s, sym, vend))) {
+        session.dnit(?s); ret 1;
+    }
+    if (!str_equals(undef_message(?s, sym), stat_msg)) { bad = 1; }
+
+    # an UNattributed undefined symbol is unaffected: it named no library, so
+    # there is no link-set fact to report about it.
+    val plain_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, "plain_sym");
+    if (R.is_err[intern.StrId, str](plain_r)) { session.dnit(?s); ret 1; }
+    if (!str_equals(undef_message(?s, R.unwrap_ok[intern.StrId, str](plain_r)),
+                    "undefined symbol: plain_sym")) { bad = 1; }
+
+    session.dnit(?s);
+    ret bad;
+}
+
 test "mach.lang.be.linker.dynstate_add_import_addr_fixup:preserves_addend" {
     var alloc: A.Allocator;
     page.make(?alloc);

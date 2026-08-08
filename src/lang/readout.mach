@@ -1,16 +1,42 @@
 # build-progress events and the timed phase roll-up behind `mach build -v`/`-vv`
 #
 # Two halves. `Progress` is the event seam: a ctx + fn-pointer pair the build
-# engine and the driver passes emit phase/item/summary events through; a nil
-# Progress makes every emission a no-op, so a plain build stays silent and a
+# engine and the driver passes emit unit/phase/item/summary events through; a
+# nil Progress makes every emission a no-op, so a plain build stays silent and a
 # consumer that wants no narration passes none. `Readout` is the standard
 # renderer behind that seam: it collects the compile phases (load, resolve,
-# sema, lower, codegen, link) as the events arrive. Each phase is bracketed by
-# `phase_begin`/`phase_end`; each module or file inside a phase is timed with
-# `item_begin`/`item`. At `-v` only the per-phase roll-up line prints; at `-vv`
-# every item prints under its phase with a `(slow)` marker on the slowest.
-# `summary` closes a successful build with one recap line. All output is
-# fixed-width ASCII on stderr, multiplatform: timing comes from
+# sema, lower, optimize, codegen, emit, link) as the events arrive. Each phase
+# is bracketed by `phase_begin`/`phase_end`; each module or file inside a phase
+# is timed with `item_begin`/`item`. At `-v` only the per-phase roll-up line
+# prints; at `-vv` every item prints under its phase with a `(slow)` marker on
+# the slowest.
+#
+# Every number this module prints is a claim, so the seam is shaped so that no
+# claim can be approximate (#2816):
+#
+#   - A phase whose work is interleaved inside another phase's span carves its
+#     time out with `span_begin`/`span_end`: the slice is attributed to the
+#     carved phase and deducted from the host's wall, so the two rows stay
+#     exactly disjoint and together still account for the host span. That is
+#     what lets `optimize` have a row of its own while lowering and optimization
+#     run fused per module under one query. A phase that is one contiguous
+#     region needs none of this - its `phase_begin`/`phase_end` wall is its time.
+#   - An item carries a DURATION, not a start instant, so a phase whose work
+#     runs on a pool can report each module's real cost (`item_dur`, from the
+#     worker's own measurement) rather than the cost of collecting its result.
+#   - A phase that ran its items concurrently declares it with `phase_workers`,
+#     and the row says so. Under a pool the items deliberately sum to more than
+#     the row, and a reader must be told that rather than left to assume the
+#     items partition the phase.
+#   - The rows and the recap are a partition, not a sample: the recap prints the
+#     unit's remaining unattributed time as its own `other` row first, so the
+#     rows plus `other` equal the total exactly. A region that nothing times
+#     shows up as `other` growing, instead of silently vanishing.
+#   - The recap's total is the UNIT's wall, measured from `unit_begin`, not the
+#     whole invocation's - a matrix build prints one recap per unit and each
+#     must describe its own unit.
+#
+# All output is fixed-width ASCII on stderr, multiplatform: timing comes from
 # `chrono.monotonic` and durations render through `chrono.format_duration`,
 # with columns aligned by the `{:<N}`/`{:N}` format spec.
 
@@ -33,10 +59,11 @@ pub val PH_SEMA:     u8 = 2;  # type checking per module
 pub val PH_LOWER:    u8 = 3;  # AST -> SSA IR per module
 pub val PH_OPTIMIZE: u8 = 4;  # the optimization pipeline per module
 pub val PH_CODEGEN:  u8 = 5;  # IR -> machine code per module
-pub val PH_LINK:     u8 = 6;  # link / emit the final artifact
+pub val PH_EMIT:     u8 = 6;  # write the per-module on-disk artifacts
+pub val PH_LINK:     u8 = 7;  # link the unit's final artifact
 
 # number of phases (the fixed phase-table length)
-val PHASE_COUNT: u32 = 7;
+val PHASE_COUNT: u32 = 8;
 
 # verbosity levels
 pub val LEVEL_PHASES: u8 = 1;  # -v:  per-phase roll-up + summary
@@ -51,22 +78,46 @@ val DUR_CAP: usize = 24;
 # functions below; the consumer supplies the callbacks (the Readout's are
 # built by `progress`). Every fn pointer must be populated on a live sink.
 # ---
-# ctx:            opaque consumer state handed to each callback
-# fn_phase_begin: a phase started (phase id)
-# fn_item_begin:  an item is starting; returns its start instant (zero when
-#                 item timing is off, so emitters carry no policy)
-# fn_item:        an item completed (phase id, display name, start instant)
-# fn_phase_end:   a phase completed (phase id, item count, singular noun,
-#                 plural noun)
-# fn_summary:     a successful build's recap (artifact path, module count,
-#                 size magnitude, size unit, whether to show the size)
+# ctx:             opaque consumer state handed to each callback
+# fn_unit_begin:   a plan unit started; its recap's clock starts here
+# fn_phase_begin:  a phase started (phase id)
+# fn_phase_carved: the open phase's row comes from carve-outs, not from its own
+#                  wall - so with no carve-outs it took no time
+# fn_item_begin:   an item is starting; returns its start instant
+# fn_item:         an item completed (phase id, display name, its duration)
+# fn_phase_end:    a phase completed (phase id, item count, singular noun,
+#                  plural noun)
+# fn_phase_workers: how many threads the phase ran its items across (1 when
+#                  serial); a phase that never emits this is serial
+# fn_phase_dropped: how many of the phase's items it processed and then excluded
+#                  from the set the phases after it walk
+# fn_span_end:     a slice of the host phase's wall belongs to another phase
+#                  (carved phase id, host phase id, the slice's start instant)
+# fn_summary:      a successful unit's recap (artifact path, module count,
+#                  size magnitude, size unit, whether to show the size)
 pub rec Progress {
-    ctx:            ptr;
-    fn_phase_begin: fun(ptr, u8);
-    fn_item_begin:  fun(ptr) ctime.Time;
-    fn_item:        fun(ptr, u8, str, ctime.Time);
-    fn_phase_end:   fun(ptr, u8, u32, str, str);
-    fn_summary:     fun(ptr, str, u32, i64, str, bool);
+    ctx:              ptr;
+    fn_unit_begin:    fun(ptr);
+    fn_phase_begin:   fun(ptr, u8);
+    fn_phase_carved:  fun(ptr, u8);
+    fn_item_begin:    fun(ptr) ctime.Time;
+    fn_item:          fun(ptr, u8, str, cdur.Duration);
+    fn_phase_end:     fun(ptr, u8, u32, str, str);
+    fn_phase_workers: fun(ptr, u8, u32);
+    fn_phase_dropped: fun(ptr, u8, u32);
+    fn_span_end:      fun(ptr, u8, u8, ctime.Time);
+    fn_summary:       fun(ptr, str, u32, i64, str, bool);
+}
+
+# emit a unit-start event; a nil sink is a no-op
+#
+# The recap's total is measured from here, so a matrix build must fire this once
+# per unit or every recap after the first reports the whole invocation.
+# ---
+# pr: the sink, or nil
+pub fun unit_begin(pr: *Progress) {
+    if (pr == nil) { ret; }
+    pr.fn_unit_begin(pr.ctx);
 }
 
 # emit a phase-start event; a nil sink is a no-op
@@ -78,8 +129,24 @@ pub fun phase_begin(pr: *Progress, ph: u8) {
     pr.fn_phase_begin(pr.ctx, ph);
 }
 
+# declare that phase `ph`'s row is fed by carve-outs rather than by its own
+# wall; a nil sink is a no-op
+#
+# Emitted straight after `phase_begin` by whoever opens such a phase. Without
+# it, a carve-fed phase that received NO slices - a build where every module's
+# optimized IR came from the cache, so nothing was optimized - would fall back
+# to the wall between its own begin and end events, which spans its host's whole
+# phase and would be a large row for work that did not happen.
+# ---
+# pr: the sink, or nil
+# ph: the phase id (a PH_* constant)
+pub fun phase_carved(pr: *Progress, ph: u8) {
+    if (pr == nil) { ret; }
+    pr.fn_phase_carved(pr.ctx, ph);
+}
+
 # capture an item's start instant through the sink; the zero instant when the
-# sink is nil or item timing is off
+# sink is nil
 # ---
 # pr:  the sink, or nil
 # ret: the item's start instant, or the zero instant
@@ -88,7 +155,8 @@ pub fun item_begin(pr: *Progress) ctime.Time {
     ret pr.fn_item_begin(pr.ctx);
 }
 
-# emit an item-completion event; a nil sink is a no-op
+# emit an item-completion event for work that ran on this thread; a nil sink is
+# a no-op
 # ---
 # pr:    the sink, or nil
 # ph:    the phase id (a PH_* constant)
@@ -96,7 +164,21 @@ pub fun item_begin(pr: *Progress) ctime.Time {
 # start: the instant returned by the matching `item_begin`
 pub fun item(pr: *Progress, ph: u8, name: str, start: ctime.Time) {
     if (pr == nil) { ret; }
-    pr.fn_item(pr.ctx, ph, name, start);
+    pr.fn_item(pr.ctx, ph, name, ctime.time_sub(ctime.monotonic(), start));
+}
+
+# emit an item-completion event carrying an already-measured duration
+#
+# For work a worker thread timed: the item's cost is the worker's span, which no
+# clock read on this thread can reconstruct once the pool has joined.
+# ---
+# pr:   the sink, or nil
+# ph:   the phase id (a PH_* constant)
+# name: the item's display name (borrowed; must outlive the phase)
+# d:    the item's measured duration
+pub fun item_dur(pr: *Progress, ph: u8, name: str, d: cdur.Duration) {
+    if (pr == nil) { ret; }
+    pr.fn_item(pr.ctx, ph, name, d);
 }
 
 # emit a phase-completion event; a nil sink is a no-op
@@ -111,7 +193,70 @@ pub fun phase_end(pr: *Progress, ph: u8, count: u32, noun_one: str, noun_many: s
     pr.fn_phase_end(pr.ctx, ph, count, noun_one, noun_many);
 }
 
-# emit a successful build's recap event; a nil sink is a no-op
+# declare that phase `ph` ran its items across `n` threads; a nil sink is a
+# no-op
+#
+# Emitted by whatever opened the pool, once it knows the real worker count. The
+# row prints it, because concurrent items sum to more than the phase's wall and
+# a reader must not read them as a partition of it.
+# ---
+# pr: the sink, or nil
+# ph: the phase id (a PH_* constant)
+# n:  the number of threads that ran the phase's items
+pub fun phase_workers(pr: *Progress, ph: u8, n: u32) {
+    if (pr == nil) { ret; }
+    pr.fn_phase_workers(pr.ctx, ph, n);
+}
+
+# declare that phase `ph` processed `n` items it then excluded from the set the
+# phases after it walk. a nil sink is a no-op
+#
+# The counterpart of `phase_workers`, and it exists for the same reason: to stop a
+# reader drawing a false conclusion from a number that is true. A phase's count is
+# WHAT IT PROCESSED, so a phase that drops part of its output reports more than the
+# next row does, and without this the reader is left to guess where the difference
+# went - or, worse, the count is quietly reported as the survivors and the row then
+# disagrees with the items printed under it at -vv (#2850).
+#
+# `n` is a subset of the count `phase_end` reports, never a separate population.
+# ---
+# pr: the sink, or nil
+# ph: the phase id (a PH_* constant)
+# n:  how many of the phase's items were excluded from the downstream set
+pub fun phase_dropped(pr: *Progress, ph: u8, n: u32) {
+    if (pr == nil) { ret; }
+    pr.fn_phase_dropped(pr.ctx, ph, n);
+}
+
+# open a carve-out span; the zero instant when the sink is nil
+#
+# Never gated on verbosity: a carve-out decides what a `-v` roll-up row says, so
+# the clock has to run whenever a readout exists.
+# ---
+# pr:  the sink, or nil
+# ret: the slice's start instant, or the zero instant
+pub fun span_begin(pr: *Progress) ctime.Time {
+    if (pr == nil) { ret ctime.Time{sec: 0, nsec: 0}; }
+    ret ctime.monotonic();
+}
+
+# close a carve-out span: `start`..now is phase `ph`'s work, done inside phase
+# `host`'s span, and is deducted from `host`'s wall
+#
+# Both phases must be open (`phase_begin` fired, `phase_end` not yet). Slices
+# accumulate, so a phase whose work is interleaved per module across the host's
+# span still ends up with one row holding the sum of its real time.
+# ---
+# pr:    the sink, or nil
+# ph:    the carved phase's id (a PH_* constant)
+# host:  the enclosing phase's id (a PH_* constant)
+# start: the instant returned by the matching `span_begin`
+pub fun span_end(pr: *Progress, ph: u8, host: u8, start: ctime.Time) {
+    if (pr == nil) { ret; }
+    pr.fn_span_end(pr.ctx, ph, host, start);
+}
+
+# emit a successful unit's recap event; a nil sink is a no-op
 # ---
 # pr:       the sink, or nil
 # out:      the produced artifact's path (borrowed)
@@ -133,12 +278,17 @@ pub fun summary(pr: *Progress, out: str, modules: u32, size: i64, unit: str, has
 # ret: a Progress bound to `ro`
 pub fun progress(ro: *Readout) Progress {
     var pr: Progress;
-    pr.ctx            = ro::ptr;
-    pr.fn_phase_begin = ro_phase_begin;
-    pr.fn_item_begin  = ro_item_begin;
-    pr.fn_item        = ro_item;
-    pr.fn_phase_end   = ro_phase_end;
-    pr.fn_summary     = ro_summary;
+    pr.ctx              = ro::ptr;
+    pr.fn_unit_begin    = ro_unit_begin;
+    pr.fn_phase_begin   = ro_phase_begin;
+    pr.fn_phase_carved  = ro_phase_carved;
+    pr.fn_item_begin    = ro_item_begin;
+    pr.fn_item          = ro_item;
+    pr.fn_phase_end     = ro_phase_end;
+    pr.fn_phase_workers = ro_phase_workers;
+    pr.fn_phase_dropped = ro_phase_dropped;
+    pr.fn_span_end      = ro_span_end;
+    pr.fn_summary       = ro_summary;
     ret pr;
 }
 
@@ -153,49 +303,94 @@ rec Item {
 
 # a single phase's accumulator
 # ---
-# items:   the per-item array, grown on demand (only populated at -vv)
-# len:     number of populated items
-# cap:     allocated length of `items`
-# started: the phase's start instant, set by `phase_begin`
+# items:    the per-item array, grown on demand (only populated at -vv)
+# len:      number of populated items
+# cap:      allocated length of `items`
+# started:  the phase's start instant, set by `phase_begin`
+# carved:   time carved out of this phase and attributed elsewhere
+# borrowed: time carved INTO this phase out of some host phase
+# hosted:   this phase's time came from carve-outs rather than its own wall
+# workers:  threads the phase ran its items across (1 = serial)
+# dropped:  items the phase processed and then excluded from the downstream set
 rec Phase {
-    items:   *Item;
-    len:     u32;
-    cap:     u32;
-    started: ctime.Time;
+    items:    *Item;
+    len:      u32;
+    cap:      u32;
+    started:  ctime.Time;
+    carved:   cdur.Duration;
+    borrowed: cdur.Duration;
+    hosted:   bool;
+    workers:  u32;
+    dropped:  u32;
 }
 
 # the build-wide readout state
+#
+# `rows` / `row_count` are the render record: exactly the duration each roll-up
+# line printed, and how many lines each phase produced. They are retained rather
+# than discarded so what the readout SAID can be asserted on directly, without
+# re-deriving the arithmetic a test would then not be checking (#2816).
 # ---
-# level:  verbosity (LEVEL_PHASES or LEVEL_ITEMS); never 0 for a live Readout
-# alloc:  allocator backing the per-phase item arrays
-# start:  the build's start instant, for the summary's total duration
-# phases: the per-phase accumulators, indexed by the PH_* ids
+# level:      verbosity (LEVEL_PHASES or LEVEL_ITEMS); never 0 for a live Readout
+# alloc:      allocator backing the per-phase item arrays
+# start:      the invocation's start instant
+# unit_start: the current plan unit's start instant, for its recap total
+# unit_rows:  the current unit's rendered rows, summed
+# phases:     the per-phase accumulators, indexed by the PH_* ids
+# rows:       the duration each phase's roll-up line reported
+# row_count:  how many roll-up lines each phase produced
+# item_sum:   the phase's items summed - recorded at every verbosity, since it
+#             is the record of what the phase DID, not of what was printed
+# item_count: how many items the phase recorded
+# workers:    the phase's declared thread count, as the row reported it
+# other:      the last recap's unattributed remainder
 pub rec Readout {
-    level:  u8;
-    alloc:  *A.Allocator;
-    start:  ctime.Time;
-    phases: [PHASE_COUNT]Phase;
+    level:      u8;
+    alloc:      *A.Allocator;
+    start:      ctime.Time;
+    unit_start: ctime.Time;
+    unit_rows:  cdur.Duration;
+    phases:     [PHASE_COUNT]Phase;
+    rows:       [PHASE_COUNT]cdur.Duration;
+    row_count:  [PHASE_COUNT]u32;
+    item_sum:   [PHASE_COUNT]cdur.Duration;
+    item_count: [PHASE_COUNT]u32;
+    workers:    [PHASE_COUNT]u32;
+    other:      cdur.Duration;
 }
 
 # initialize a Readout for a build at verbosity `level`
 #
 # `level` is 1 (-v) or 2 (-vv); a plain build never constructs a Readout (the
-# consumer passes a nil Progress instead). The build start instant is captured
-# here.
+# consumer passes a nil Progress instead). The invocation's start instant is
+# captured here, and stands in as the first unit's start until `unit_begin`
+# fires.
 # ---
 # ro:    the Readout to initialize
 # alloc: allocator backing the per-phase item arrays
 # level: verbosity (LEVEL_PHASES or LEVEL_ITEMS)
 pub fun init(ro: *Readout, alloc: *A.Allocator, level: u8) {
-    ro.level = level;
-    ro.alloc = alloc;
-    ro.start = ctime.monotonic();
+    ro.level      = level;
+    ro.alloc      = alloc;
+    ro.start      = ctime.monotonic();
+    ro.unit_start = ro.start;
+    ro.unit_rows  = 0;
+    ro.other      = 0;
     var i: u32 = 0;
     for (i < PHASE_COUNT) {
         val p: *Phase = ?ro.phases[i];
-        p.items = nil;
-        p.len   = 0;
-        p.cap   = 0;
+        p.items    = nil;
+        p.len      = 0;
+        p.cap      = 0;
+        p.carved   = 0;
+        p.borrowed = 0;
+        p.hosted   = false;
+        p.workers  = 1;
+        ro.rows[i]       = 0;
+        ro.row_count[i]  = 0;
+        ro.item_sum[i]   = 0;
+        ro.item_count[i] = 0;
+        ro.workers[i]    = 1;
         i = i + 1;
     }
 }
@@ -215,6 +410,15 @@ pub fun dnit(ro: *Readout) {
     }
 }
 
+# start a plan unit: its recap's clock and its row accounting both restart here
+# ---
+# ctx: the Readout as the sink ctx
+fun ro_unit_begin(ctx: ptr) {
+    val ro: *Readout = ctx::*Readout;
+    ro.unit_start = ctime.monotonic();
+    ro.unit_rows  = 0;
+}
+
 # mark the start of phase `ph`
 # ---
 # ctx: the Readout as the sink ctx
@@ -222,21 +426,73 @@ pub fun dnit(ro: *Readout) {
 fun ro_phase_begin(ctx: ptr, ph: u8) {
     val ro: *Readout = ctx::*Readout;
     val p: *Phase = ?ro.phases[ph];
-    p.len     = 0;
-    p.started = ctime.monotonic();
+    p.len      = 0;
+    p.carved   = 0;
+    p.borrowed = 0;
+    p.hosted   = false;
+    p.workers  = 1;
+    p.dropped  = 0;
+    p.started  = ctime.monotonic();
+    ro.item_sum[ph::u32]   = 0;
+    ro.item_count[ph::u32] = 0;
+    ro.workers[ph::u32]    = 1;
+}
+
+# mark phase `ph` as carve-fed: its row is the sum of the slices attributed to
+# it, which is zero when none were
+# ---
+# ctx: the Readout as the sink ctx
+# ph:  the phase id (a PH_* constant)
+fun ro_phase_carved(ctx: ptr, ph: u8) {
+    val ro: *Readout = ctx::*Readout;
+    ro.phases[ph].hosted = true;
+}
+
+# record how many threads phase `ph` ran its items across
+# ---
+# ctx: the Readout as the sink ctx
+# ph:  the phase id (a PH_* constant)
+# n:   the thread count
+fun ro_phase_workers(ctx: ptr, ph: u8, n: u32) {
+    val ro: *Readout = ctx::*Readout;
+    ro.phases[ph].workers = n;
+}
+
+# record how many of phase `ph`'s items it excluded from the downstream set
+# ---
+# ctx: the Readout as the sink ctx
+# ph:  the phase id (a PH_* constant)
+# n:   the excluded count
+fun ro_phase_dropped(ctx: ptr, ph: u8, n: u32) {
+    val ro: *Readout = ctx::*Readout;
+    ro.phases[ph].dropped = n;
+}
+
+# attribute `start`..now to phase `ph`, out of host phase `host`'s wall
+#
+# `ph` is marked hosted, so its row reports the carved total rather than the
+# wall between its own begin and end events - that wall spans the host's work
+# too, and would double-count it.
+# ---
+# ctx:   the Readout as the sink ctx
+# ph:    the carved phase's id
+# host:  the enclosing phase's id
+# start: the instant returned by the matching span-begin
+fun ro_span_end(ctx: ptr, ph: u8, host: u8, start: ctime.Time) {
+    val ro: *Readout = ctx::*Readout;
+    val d: cdur.Duration = ctime.time_sub(ctime.monotonic(), start);
+    val c: *Phase = ?ro.phases[ph];
+    c.borrowed = c.borrowed + d;
+    c.hosted   = true;
+    val h: *Phase = ?ro.phases[host];
+    h.carved = h.carved + d;
 }
 
 # capture an item's start instant
-#
-# Returns the monotonic clock only at -vv, where per-item durations are shown;
-# at -v it returns the zero instant and `ro_item` ignores it, so item-level
-# timing adds no overhead to a -v build.
 # ---
 # ctx: the Readout as the sink ctx
-# ret: the item's start instant, or the zero instant when item timing is off
+# ret: the item's start instant
 fun ro_item_begin(ctx: ptr) ctime.Time {
-    val ro: *Readout = ctx::*Readout;
-    if (ro.level < LEVEL_ITEMS) { ret ctime.Time{sec: 0, nsec: 0}; }
     ret ctime.monotonic();
 }
 
@@ -246,14 +502,20 @@ fun ro_item_begin(ctx: ptr) ctime.Time {
 # borrowed and must stay valid until the phase-end event renders the phase
 # (interned FQNs and source paths both outlive the build).
 # ---
-# ctx:   the Readout as the sink ctx
-# ph:    the phase id (a PH_* constant)
-# name:  the item's display name (borrowed)
-# start: the instant returned by the matching item-begin event
-fun ro_item(ctx: ptr, ph: u8, name: str, start: ctime.Time) {
+# ctx:  the Readout as the sink ctx
+# ph:   the phase id (a PH_* constant)
+# name: the item's display name (borrowed)
+# d:    the item's measured duration
+#
+# The running sum and count are kept at every verbosity - they cost two adds and
+# are what relates a row to the work under it, which the attribution regression
+# asserts on (#2816). Only the per-item array, which exists to be printed, is
+# gated on -vv.
+fun ro_item(ctx: ptr, ph: u8, name: str, d: cdur.Duration) {
     val ro: *Readout = ctx::*Readout;
+    ro.item_sum[ph::u32]   = ro.item_sum[ph::u32] + d;
+    ro.item_count[ph::u32] = ro.item_count[ph::u32] + 1;
     if (ro.level < LEVEL_ITEMS) { ret; }
-    val d: cdur.Duration = ctime.time_sub(ctime.monotonic(), start);
     val p: *Phase = ?ro.phases[ph];
     if (!ensure_item_cap(ro, p)) { ret; }
     p.items[p.len].name = name;
@@ -264,9 +526,18 @@ fun ro_item(ctx: ptr, ph: u8, name: str, start: ctime.Time) {
 # close phase `ph` and render it
 #
 # Prints the roll-up line `<phase>  <count> <noun>  <dur>` (`noun_one` when
-# `count` is 1, else `noun_many`), and at -vv every recorded item beneath it
-# with the slowest flagged `(slow)`. The phase's wall-clock duration is the
-# span since the phase-begin event. Frees the phase's item array.
+# `count` is 1, else `noun_many`), suffixed `(<n> threads)` when the phase ran
+# its items concurrently - there the items deliberately sum to more than the
+# row, and the suffix is what says so.
+#
+# `count` IS WHAT THE PHASE PROCESSED, never what survived it (#2850). A phase
+# that excludes part of what it processed says so with the second suffix,
+# `(<n> target-gated, not carried forward)`, so the drop between this row and the
+# next is stated rather than left for a reader to notice and guess at. A phase that hosted no carve-out reports
+# the wall since its phase-begin event; a host reports that wall minus what was
+# carved out of it, and a carved phase reports the sum of its own slices - so
+# sibling rows never double-count the same nanosecond. At -vv every recorded
+# item prints beneath, with the slowest flagged `(slow)`. Frees the item array.
 # ---
 # ctx:       the Readout as the sink ctx
 # ph:        the phase id (a PH_* constant)
@@ -276,23 +547,47 @@ fun ro_item(ctx: ptr, ph: u8, name: str, start: ctime.Time) {
 fun ro_phase_end(ctx: ptr, ph: u8, count: u32, noun_one: str, noun_many: str) {
     val ro: *Readout = ctx::*Readout;
     val p: *Phase = ?ro.phases[ph];
-    val elapsed: cdur.Duration = ctime.time_sub(ctime.monotonic(), p.started);
+    var elapsed: cdur.Duration = ctime.time_sub(ctime.monotonic(), p.started) - p.carved;
+    if (p.hosted) { elapsed = p.borrowed; }
+
+    ro.rows[ph::u32]      = elapsed;
+    ro.row_count[ph::u32] = ro.row_count[ph::u32] + 1;
+    ro.workers[ph::u32]   = p.workers;
+    ro.unit_rows          = ro.unit_rows + elapsed;
 
     var dbuf: [DUR_CAP]u8;
     val dstr: str = cdur.format_duration(elapsed, ?dbuf[0], DUR_CAP);
     var noun: str = noun_many;
     if (count == 1) { noun = noun_one; }
-    print.eprintf("{:<9} {:3} {:<8} {:7}\n", phase_label(ph), count::i64, noun, dstr);
+    # the two suffixes are mutually exclusive in practice and are kept separate
+    # rather than composed: a pooled phase drops nothing and a dropping phase runs
+    # serially, and inventing a combined spelling for a shape nothing emits would be
+    # a line no reader has ever seen.
+    if (p.workers > 1) {
+        print.eprintf("{:<9} {:3} {:<8} {:7}  ({} threads)\n", phase_label(ph), count::i64, noun, dstr, p.workers::i64);
+    }
+    or (p.dropped > 0) {
+        print.eprintf("{:<9} {:3} {:<8} {:7}  ({} target-gated, not carried forward)\n",
+                      phase_label(ph), count::i64, noun, dstr, p.dropped::i64);
+    }
+    or {
+        print.eprintf("{:<9} {:3} {:<8} {:7}\n", phase_label(ph), count::i64, noun, dstr);
+    }
 
     if (ro.level >= LEVEL_ITEMS) { render_items(p); }
     free_items(ro, p);
 }
 
-# render a successful build's closing recap line
+# render a successful unit's closing recap
 #
-# `built <out>  <N> modules  [<size> <unit>  ]in <total>` - the size segment is
-# omitted when `has_size` is false (a library / object-only build has no single
-# binary). The total duration spans from `init`.
+# An `other` row first, holding the unit's time that no phase claimed (the plan
+# and step phases, session setup, the teardown between phases): the rows plus
+# `other` are then exactly the total, so the breakdown is a partition rather
+# than a sample, and a region nobody times shows up here instead of vanishing.
+#
+# Then `built <out>  <N> modules  [<size> <unit>  ]in <total>` - the size segment
+# is omitted when `has_size` is false (a library / object-only build has no
+# single binary). The total spans this UNIT, from `unit_begin`.
 # ---
 # ctx:      the Readout as the sink ctx
 # out:      the produced artifact's path (borrowed)
@@ -302,14 +597,22 @@ fun ro_phase_end(ctx: ptr, ph: u8, count: u32, noun_one: str, noun_many: str) {
 # has_size: whether to print the size segment
 fun ro_summary(ctx: ptr, out: str, modules: u32, size: i64, unit: str, has_size: bool) {
     val ro: *Readout = ctx::*Readout;
-    val total: cdur.Duration = ctime.time_sub(ctime.monotonic(), ro.start);
+    val total: cdur.Duration = ctime.time_sub(ctime.monotonic(), ro.unit_start);
+    ro.other = total - ro.unit_rows;
+
+    var obuf: [DUR_CAP]u8;
+    val ostr: str = cdur.format_duration(ro.other, ?obuf[0], DUR_CAP);
+    print.eprintf("{:<9} {:<12} {:7}\n", "other", "-", ostr);
+
     var dbuf: [DUR_CAP]u8;
     val dstr: str = cdur.format_duration(total, ?dbuf[0], DUR_CAP);
+    var mnoun: str = "modules";
+    if (modules == 1) { mnoun = "module"; }
     if (has_size) {
-        print.eprintf("built {}  {} modules  {} {}  in {}\n", out, modules::i64, size, unit, dstr);
+        print.eprintf("built {}  {} {}  {} {}  in {}\n", out, modules::i64, mnoun, size, unit, dstr);
     }
     or {
-        print.eprintf("built {}  {} modules  in {}\n", out, modules::i64, dstr);
+        print.eprintf("built {}  {} {}  in {}\n", out, modules::i64, mnoun, dstr);
     }
 }
 
@@ -347,6 +650,7 @@ fun phase_label(ph: u8) str {
     if (ph == PH_LOWER)    { ret "lower"; }
     if (ph == PH_OPTIMIZE) { ret "optimize"; }
     if (ph == PH_CODEGEN)  { ret "codegen"; }
+    if (ph == PH_EMIT)     { ret "emit"; }
     ret "link";
 }
 

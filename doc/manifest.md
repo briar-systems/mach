@@ -482,6 +482,19 @@ different loader names in one build is an error. A logical name that equals a
 different dependency's canonical loader name is likewise rejected, so
 attribution never depends on requirement order.
 
+A `#[library]` resolves against the **effective** link set: the artifact's own
+referenced entries, plus every entry a dependency exports. A binding project
+therefore names its libraries once and a consumer writing its own `ext fun`
+against them adds nothing but a `dep` entry.
+
+A logical name may belong to an entry that resolves to a **static** input, and
+that is not something an import can bind to: a static input defines symbols
+rather than importing them, so a pin naming one means the symbol must come out of
+that object or archive. When it does, the pin is inert and the link is normal.
+When it does not, the symbol is undefined, and mach says exactly that — naming
+the entry, its kind, and the undefined symbol, rather than claiming the library
+is missing from the link.
+
 `symbols` names the symbols the dependency provides. On a two-level-namespace
 format (PE, Mach-O) every import must identify its provider, and `#[library]` can
 only attribute a symbol your Mach source declares. A **vendored static archive**

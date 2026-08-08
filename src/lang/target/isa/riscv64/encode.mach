@@ -999,22 +999,37 @@ fun note_local_target(st: *encode.EncodeState, number: u64, fwd: bool) {
 # then an `addi` / load / store taking `%pcrel_lo(sym)` - and the two halves take
 # different relocations and different text. The modifier rides the operand carrying
 # the symbol, so each half renders as the assembler would spell it.
+#
+# THE HIGH HALF OWNS THE ADDEND AND THE LOW HALF SPELLS NONE (#2839). The pair
+# materializes ONE address, so exactly one of the two states its constant, and on
+# RISC-V it is the `%pcrel_hi`: `push_pcrel_lo` records the low half's relocation as
+# `hi_addend + the distance back to its auipc`, which is a PAIRING fact rather than a
+# symbol constant, and an assembler reading `%pcrel_lo` takes the offset from the
+# auipc it pairs with. So a caller passes the symbol's offset on the high half and 0
+# on the low one, and 0 there is a statement rather than a gap.
+#
+# Both branches set the field. The memory-operand branch edits three fields of an
+# already-buffered slot in place, so a field it did not set would keep whatever the
+# instruction's own emitter left there rather than a default - which is exactly how a
+# new field goes missing on one path only.
 # ---
-# st:  encoder driver state (its buffer carries the sink)
-# sym: the referenced symbol
-# mod: the relocation modifier the half takes
-fun note_sym_target(st: *encode.EncodeState, sym: intern.StrId, mod: isa.SymModifier) {
+# st:     encoder driver state (its buffer carries the sink)
+# sym:    the referenced symbol
+# mod:    the relocation modifier the half takes
+# addend: the symbol addend this half's text must spell (0 for a half that spells none)
+fun note_sym_target(st: *encode.EncodeState, sym: intern.StrId, mod: isa.SymModifier, addend: i32) {
     val op: *isa.Operand = last_target(st);
     if (op == nil) { ret; }
     if (op.kind == isa.OPK_MEM) {
         # an address field that is part of a memory operand keeps its base register
         # and takes the symbol in place of its displacement
-        op.sym_id  = sym::u32;
-        op.sym_mod = mod;
-        op.disp    = 0;
+        op.sym_id     = sym::u32;
+        op.sym_mod    = mod;
+        op.disp       = 0;
+        op.sym_addend = addend;
         ret;
     }
-    @op = isa.make_sym_mod(sym::u32, 8, mod);
+    @op = isa.make_sym_addend(sym::u32, 8, mod, addend);
 }
 
 # read the 32-bit little-endian word at `pos` in the text sink
@@ -1048,35 +1063,48 @@ fun alu_imm_opcode(width: u8) u32 {
     ret OPC_OP_IMM;
 }
 
-# the load funct3 for an access width. a 32-bit load is the SIGN-extending `lw` to
-# honor the lp64 register convention -- a 32-bit value is held sign-extended to 64
-# bits, the same form the *W ALU ops and a re-signed immediate produce -- so a loaded
-# i32 (a spill reload, a struct field) compares and computes identically to a
-# computed one under a later full-register op. the sub-word i8 / i16 loads stay
-# zero-extending (`lbu` / `lhu`); a widening to 32 / 64 bits is an explicit IR extend.
-# RV64-SPECIFIC: width 8 is `ld`, which an RV32 sibling lacks
-fun load_funct3(width: u8) u32 {
-    if (width == 1) { ret 0x4; }  # lbu
-    if (width == 2) { ret 0x5; }  # lhu
-    if (width == 4) { ret 0x2; }  # lw (RV64: sign-extend to the lp64 32-bit convention)
-    ret 0x3;                       # ld (RV64)
-}
-
-# the store funct3 for an access width. RV64-SPECIFIC: width 8 is `sd`, which an
-# RV32 sibling lacks (its widest store is `sw`, funct3 2)
-fun store_funct3(width: u8) u32 {
-    if (width == 1) { ret 0x0; }  # sb
-    if (width == 2) { ret 0x1; }  # sh
-    if (width == 4) { ret 0x2; }  # sw
-    ret 0x3;                       # sd (RV64)
+# the integer load / store funct3 for an access width and direction
+#
+# THE WIDTH -> FORM DECISION IS MADE ONCE, AND REFUSES. It used to be two ladders
+# (`load_funct3` / `store_funct3`) that named 1, 2 and 4 and answered every other
+# width with the doubleword form, so an access width RV64I has no form for silently
+# moved eight bytes rather than producing a diagnostic (#2766).
+#
+# A 32-bit load is the SIGN-extending `lw` to honor the RV64 register convention -- a
+# 32-bit value is held sign-extended to 64 bits, the same form the *W ALU ops and a
+# re-signed immediate produce -- so a loaded i32 (a spill reload, a struct field)
+# compares and computes identically to a computed one under a later full-register op.
+# The sub-word i8 / i16 loads stay zero-extending (`lbu` / `lhu`); a widening to 32 /
+# 64 bits is an explicit IR extend. RV64-SPECIFIC: width 8 is `ld` / `sd`, which an
+# RV32 sibling lacks (its widest access is `lw` / `sw`).
+# ---
+# width:   the access width in bytes
+# is_load: true for the load direction
+# ret:     the funct3, or an error naming the width RV64I has no integer access for
+fun int_mem_funct3(width: u8, is_load: bool) R.Result[u32, str] {
+    if (width == 1) { if (is_load) { ret R.ok[u32, str](0x4); } ret R.ok[u32, str](0x0); }  # lbu / sb
+    if (width == 2) { if (is_load) { ret R.ok[u32, str](0x5); } ret R.ok[u32, str](0x1); }  # lhu / sh
+    if (width == 4) { if (is_load) { ret R.ok[u32, str](0x2); } ret R.ok[u32, str](0x2); }  # lw  / sw
+    if (width == 8) { if (is_load) { ret R.ok[u32, str](0x3); } ret R.ok[u32, str](0x3); }  # ld  / sd
+    ret R.err[u32, str]("internal compiler error: riscv64 has no integer memory access form for this width (expected 1, 2, 4, or 8)");
 }
 
 # the GP register index a post-regalloc register operand names. only a physical
 # register survives to encode; a surviving virtual register is a register-allocation
 # bug, and a memory operand reaches the dedicated load/store/address paths, so both
 # are rejected loudly here
+#
+# THE CLASS IS CHECKED, NOT ASSUMED (#2838). `regid_index` strips the class tag, so a
+# float operand resolved here would come back as the integer register that ALIASES its
+# index - `fa0` as `a0` - and encode a real instruction over unrelated data. aarch64
+# carried the same unchecked resolver and a lowering change miscompiled through it
+# silently; this target has no such caller today, and the check is what keeps that a
+# fact rather than a coincidence.
 fun req_gpr(op: *mir.MirOperand) R.Result[i32, str] {
     if (op.kind == mir.MIR_OP_PREG) {
+        if (isa.regid_class(op.preg::i32) != isa.REG_CLASS_ID_GP) {
+            ret R.err[i32, str]("internal compiler error: a float register reached a general-purpose operand position");
+        }
         ret R.ok[i32, str](isa.regid_index(op.preg::i32));
     }
     if (op.kind == mir.MIR_OP_VREG) {
@@ -1124,8 +1152,8 @@ fun emit_li(st: *encode.EncodeState, rd: u32, value: i64) {
     if (lo12 != 0) { emit_i(st, OPC_OP_IMM, F3_ADD, rd, rd, lo12::u32 & 0xFFF); }
 }
 
-# re-sign a width-typed integer immediate to the lp64 register convention before it
-# is materialized straight into a register. RV64 lp64 holds a 32-bit value
+# re-sign a width-typed integer immediate to the RV64 register convention before it
+# is materialized straight into a register. RV64 holds a 32-bit value
 # sign-extended to 64 bits regardless of signedness -- the *W ALU ops maintain this
 # for computed values, so a constant moved directly into a register must match, or a
 # later full-register signed op reads a negative i32 as a large positive. a width-4
@@ -1141,7 +1169,7 @@ fun imm_sext_for_width(value: i64, width: u8) i64 {
 
 # the GP register index a source operand contributes. a physical register is used
 # directly; an immediate is materialized into `scratch` (and that index returned),
-# re-signed to the lp64 register convention for its `width` so a 32-bit constant
+# re-signed to the RV64 register convention for its `width` so a 32-bit constant
 # operand matches a *W-computed value under a later full-register op (a slt / sltu /
 # xor compare reads both operands at full width). every other shape is rejected
 # through `req_gpr`
@@ -1170,7 +1198,12 @@ fun emit_addi(st: *encode.EncodeState, rd: u32, rs1: u32, off: i64) {
 # store; a wider `off` is materialized into the scratch register, added to the base,
 # and the access addressed at `[scratch + 0]`. loads use the zero-extending forms, so
 # a sub-word load defines the whole register
-fun emit_mem_access(st: *encode.EncodeState, rt: u32, base: u32, off: i64, width: u8, is_load: bool) {
+fun emit_mem_access(st: *encode.EncodeState, rt: u32, base: u32, off: i64, width: u8, is_load: bool) R.Result[bool, str] {
+    # the form resolves BEFORE the offset materialization, so a refused width leaves
+    # no half sequence in the sink.
+    val f3r: R.Result[u32, str] = int_mem_funct3(width, is_load);
+    if (R.is_err[u32, str](f3r)) { ret R.err[bool, str](R.unwrap_err[u32, str](f3r)); }
+    val f3: u32 = R.unwrap_ok[u32, str](f3r);
     var b: u32 = base;
     var d: i64 = off;
     if (off < -2048 || off > 2047) {
@@ -1180,10 +1213,11 @@ fun emit_mem_access(st: *encode.EncodeState, rt: u32, base: u32, off: i64, width
         d = 0;
     }
     if (is_load) {
-        emit_i(st, OPC_LOAD, load_funct3(width), rt, b, d::u32 & 0xFFF);
-        ret;
+        emit_i(st, OPC_LOAD, f3, rt, b, d::u32 & 0xFFF);
+        ret R.ok[bool, str](true);
     }
-    emit_s(st, OPC_STORE, store_funct3(width), b, rt, d::u32 & 0xFFF);
+    emit_s(st, OPC_STORE, f3, b, rt, d::u32 & 0xFFF);
+    ret R.ok[bool, str](true);
 }
 
 # the bytes the prologue reserves at the top of the frame, just below the frame
@@ -1470,8 +1504,7 @@ fun encode_mov(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) 
         val mr: R.Result[RvMem, str] = resolve_mem(f, src);
         if (R.is_err[RvMem, str](mr)) { ret R.err[bool, str](R.unwrap_err[RvMem, str](mr)); }
         val m: RvMem = R.unwrap_ok[RvMem, str](mr);
-        emit_mem_access(st, rd, m.base, m.off, mi.width, true);
-        ret R.ok[bool, str](true);
+        ret emit_mem_access(st, rd, m.base, m.off, mi.width, true);
     }
     if (src.kind == mir.MIR_OP_IMM) {
         emit_li(st, rd, imm_sext_for_width(src.imm, mi.width));
@@ -1529,8 +1562,7 @@ fun emit_store_mem(st: *encode.EncodeState, f: *mir.MirFunction, dst_mem: *mir.M
         if (R.is_err[i32, str](rr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rr)); }
         rt = R.unwrap_ok[i32, str](rr)::u32;
     }
-    emit_mem_access(st, rt, m.base, m.off, width, false);
-    ret R.ok[bool, str](true);
+    ret emit_mem_access(st, rt, m.base, m.off, width, false);
 }
 
 # emit the high half of a symbol reference - `auipc rd, %pcrel_hi(sym)` with a zero
@@ -1541,14 +1573,95 @@ fun emit_store_mem(st: *encode.EncodeState, f: *mir.MirFunction, dst_mem: *mir.M
 fun emit_pcrel_hi(st: *encode.EncodeState, rd: u32, sym: intern.StrId, addend: i32) R.Result[bool, str] {
     val pos: u32 = st.buf.len::u32;
     emit_u(st, OPC_AUIPC, rd, 0);
-    note_sym_target(st, sym, isa.SYM_MOD_PCREL_HI);
+    note_sym_target(st, sym, isa.SYM_MOD_PCREL_HI, addend);
     ret encode.push_reloc(st, pos, of.RK_PCREL_HI20, sym, addend);
+}
+
+# the object-symbol flags a `%pcrel_hi` label carries: none. it is a local, untyped
+# address inside `.text`, neither a function nor a data object, which is exactly what
+# the psABI's `.Lpcrel_hiN` is and what a foreign linker matches on. `be.codegen`
+# carries a mark's flags through verbatim, so "no flags" survives to the object as
+# STB_LOCAL/STT_NOTYPE rather than being upgraded to a function
+val PCREL_LABEL_FLAGS: u32 = 0;
+
+# record the low half of a pc-relative pair, `<op> rd, %pcrel_lo(sym)(rs1)`, against the
+# `auipc` that materialized the high half
+#
+# A low-12 displacement is measured from its paired auipc's pc, never from its own
+# patch site, so the relocation has to say WHICH auipc - a fact that belongs to this
+# one instruction. It is stated by folding the distance back to that auipc into the
+# addend, so the linker resolves the low half from the relocation alone. Nothing
+# downstream re-derives the pairing from instruction adjacency; a shared auipc, an
+# inline-asm pair with instructions between the halves, and the two-word `la` all
+# state their own distance and all resolve by the same rule (#2797).
+#
+# The pair is found by scanning back for the most recent RK_PCREL_HI20 naming this
+# symbol, and the high half's OWN addend is carried forward rather than re-derived
+# from the operand: the two halves materialize one address, so one of them owns the
+# constant. A low half with no such auipc is refused rather than encoded against a
+# guessed one - that is the shape the encoder cannot recover from silently.
+# ---
+# st:     the encode state holding the relocations recorded so far
+# lo_pos: byte offset of the low instruction's word within `.text`
+# kind:   RK_PCREL_LO12_I or RK_PCREL_LO12_S, per the low instruction's format
+# sym:    the symbol both halves name
+# ret:    ok(true) once recorded, or the reason it could not be
+fun push_pcrel_lo(st: *encode.EncodeState, lo_pos: u32, kind: of.RelocKind,
+                  sym: intern.StrId) R.Result[bool, str] {
+    var i: u32 = st.reloc_count;
+    for (i > 0) {
+        i = i - 1;
+        if (st.relocs[i].kind == of.RK_PCREL_HI20 && st.relocs[i].sym == sym) {
+            val hi_off: u32 = st.relocs[i].offset;
+            val lr: R.Result[intern.StrId, str] = pcrel_hi_label(st, hi_off);
+            if (R.is_err[intern.StrId, str](lr)) {
+                ret R.err[bool, str](R.unwrap_err[intern.StrId, str](lr));
+            }
+            ret encode.push_reloc(st, lo_pos, kind, R.unwrap_ok[intern.StrId, str](lr), 0);
+        }
+    }
+    ret R.err[bool, str]("encode: riscv64 pc-relative low-12 names a symbol no preceding 'auipc rd, %pcrel_hi(sym)' in this .text materialized");
+}
+
+# the local label naming the `auipc` at `hi_off`, defining it on first use
+#
+# One label per auipc, shared by every low half that pairs with it: a second low half
+# reaching the same auipc finds the existing definition rather than defining a rival
+# one at the same offset. The lookup is by OFFSET, not by name, because "which auipc"
+# is what the label means.
+#
+# The name only has to be unique within the object, for the same reason `.Lconst.N`
+# does: a relocation against a LOCAL symbol resolves against its own module's
+# definition through `(module, symbol index)` and never by name across objects
+# (`linker.local_symbol_target`, #2520), and STB_LOCAL says the same thing to a
+# foreign linker. So `.Lpcrel_hi.0` appearing in every object in the link is correct
+# rather than a collision.
+# ---
+# st:     the encode state whose symbol array holds the labels
+# hi_off: byte offset of the auipc within `.text`
+# ret:    the label's interned name, or an allocation error
+fun pcrel_hi_label(st: *encode.EncodeState, hi_off: u32) R.Result[intern.StrId, str] {
+    var i: u32 = 0;
+    for (i < st.sym_count) {
+        if (st.syms[i].offset == hi_off && st.syms[i].flags == PCREL_LABEL_FLAGS
+            && st.syms[i].name != intern.STR_NIL) {
+            ret R.ok[intern.StrId, str](st.syms[i].name);
+        }
+        i = i + 1;
+    }
+    val nr: R.Result[intern.StrId, str] = encode.intern_local_label(st, ".Lpcrel_hi.", st.pcrel_label_count);
+    if (R.is_err[intern.StrId, str](nr)) { ret nr; }
+    val name: intern.StrId = R.unwrap_ok[intern.StrId, str](nr);
+    st.pcrel_label_count = st.pcrel_label_count + 1;
+    val sr: R.Result[bool, str] = encode.push_symbol(st, name, hi_off, PCREL_LABEL_FLAGS);
+    if (R.is_err[bool, str](sr)) { ret R.err[intern.StrId, str](R.unwrap_err[bool, str](sr)); }
+    ret R.ok[intern.StrId, str](name);
 }
 
 # a symbol address as an rvalue (the `la` / lea equivalent) - `auipc rd, %pcrel_hi(sym)`
 # (RK_PCREL_HI20) ; `addi rd, rd, %pcrel_lo(sym)` (RK_PCREL_LO12_I). both immediates are
 # zero placeholders the linker fills from the paired relocations naming the same symbol;
-# the addend is the symbol's own constant only
+# the low half's addend states its own distance back to the auipc (`push_pcrel_lo`)
 fun emit_global_addr(st: *encode.EncodeState, rd: u32, symop: *mir.MirOperand) R.Result[bool, str] {
     if (symop.sym == intern.STR_NIL) {
         ret R.err[bool, str]("encode: address-of has no resolved symbol name");
@@ -1557,8 +1670,8 @@ fun emit_global_addr(st: *encode.EncodeState, rd: u32, symop: *mir.MirOperand) R
     if (R.is_err[bool, str](hr)) { ret hr; }
     val lo_pos: u32 = st.buf.len::u32;
     emit_i(st, OPC_OP_IMM, F3_ADD, rd, rd, 0);   # addi rd, rd, %pcrel_lo(sym)
-    note_sym_target(st, symop.sym, isa.SYM_MOD_PCREL_LO);
-    ret encode.push_reloc(st, lo_pos, of.RK_PCREL_LO12_I, symop.sym, symop.sym_off);
+    note_sym_target(st, symop.sym, isa.SYM_MOD_PCREL_LO, 0);
+    ret push_pcrel_lo(st, lo_pos, of.RK_PCREL_LO12_I, symop.sym);
 }
 
 # a folded-global load - `auipc t0, %pcrel_hi(sym)` (RK_PCREL_HI20) ;
@@ -1570,12 +1683,14 @@ fun emit_global_load(st: *encode.EncodeState, rt: u32, symop: *mir.MirOperand, w
     if (symop.sym == intern.STR_NIL) {
         ret R.err[bool, str]("encode: folded-global load has no resolved symbol name");
     }
+    val f3r: R.Result[u32, str] = int_mem_funct3(width, true);
+    if (R.is_err[u32, str](f3r)) { ret R.err[bool, str](R.unwrap_err[u32, str](f3r)); }
     val hr: R.Result[bool, str] = emit_pcrel_hi(st, SCRATCH, symop.sym, symop.sym_off);
     if (R.is_err[bool, str](hr)) { ret hr; }
     val lo_pos: u32 = st.buf.len::u32;
-    emit_i(st, OPC_LOAD, load_funct3(width), rt, SCRATCH, 0);
-    note_sym_target(st, symop.sym, isa.SYM_MOD_PCREL_LO);
-    ret encode.push_reloc(st, lo_pos, of.RK_PCREL_LO12_I, symop.sym, symop.sym_off);
+    emit_i(st, OPC_LOAD, R.unwrap_ok[u32, str](f3r), rt, SCRATCH, 0);
+    note_sym_target(st, symop.sym, isa.SYM_MOD_PCREL_LO, 0);
+    ret push_pcrel_lo(st, lo_pos, of.RK_PCREL_LO12_I, symop.sym);
 }
 
 # a folded-global store - the value resolves first (the zero register for an immediate
@@ -1587,6 +1702,8 @@ fun emit_global_store(st: *encode.EncodeState, symop: *mir.MirOperand, val_op: *
     if (symop.sym == intern.STR_NIL) {
         ret R.err[bool, str]("encode: folded-global store has no resolved symbol name");
     }
+    val f3r: R.Result[u32, str] = int_mem_funct3(width, false);
+    if (R.is_err[u32, str](f3r)) { ret R.err[bool, str](R.unwrap_err[u32, str](f3r)); }
     var rt: u32 = RZERO;
     if (val_op.kind == mir.MIR_OP_IMM) {
         if (val_op.imm != 0) {
@@ -1601,9 +1718,9 @@ fun emit_global_store(st: *encode.EncodeState, symop: *mir.MirOperand, val_op: *
     val hr: R.Result[bool, str] = emit_pcrel_hi(st, SCRATCH, symop.sym, symop.sym_off);
     if (R.is_err[bool, str](hr)) { ret hr; }
     val lo_pos: u32 = st.buf.len::u32;
-    emit_s(st, OPC_STORE, store_funct3(width), SCRATCH, rt, 0);
-    note_sym_target(st, symop.sym, isa.SYM_MOD_PCREL_LO);
-    ret encode.push_reloc(st, lo_pos, of.RK_PCREL_LO12_S, symop.sym, symop.sym_off);
+    emit_s(st, OPC_STORE, R.unwrap_ok[u32, str](f3r), SCRATCH, rt, 0);
+    note_sym_target(st, symop.sym, isa.SYM_MOD_PCREL_LO, 0);
+    ret push_pcrel_lo(st, lo_pos, of.RK_PCREL_LO12_S, symop.sym);
 }
 
 # a load `[dst, mem]`. a folded-global symbol source emits the auipc-based `la` load
@@ -1611,7 +1728,7 @@ fun emit_global_store(st: *encode.EncodeState, symop: *mir.MirOperand, val_op: *
 # access reads `mi.src_width` bytes (the loaded type's width) - not `mi.width`, which the
 # lowering clamps up to the register-definition width so a sub-word load defines its whole
 # destination - so a u8 / u16 load picks `lbu` / `lhu`, not the word `lwu`. the zero-
-# extending sub-word form (`load_funct3`) still defines the whole destination register
+# extending sub-word form still defines the whole destination register
 fun encode_load(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 2) { ret R.err[bool, str]("encode: load missing operands"); }
     val dst: *mir.MirOperand = ?mi.operands[0];
@@ -1639,8 +1756,7 @@ fun encode_load(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
         val fmr: R.Result[RvMem, str] = resolve_mem(f, src);
         if (R.is_err[RvMem, str](fmr)) { ret R.err[bool, str](R.unwrap_err[RvMem, str](fmr)); }
         val fm: RvMem = R.unwrap_ok[RvMem, str](fmr);
-        emit_fp_mem(st, R.unwrap_ok[i32, str](frd)::u32, fm.base, fm.off, mi.src_width, true);
-        ret R.ok[bool, str](true);
+        ret emit_fp_mem(st, R.unwrap_ok[i32, str](frd)::u32, fm.base, fm.off, mi.src_width, true);
     }
     val rdr: R.Result[i32, str] = req_gpr(dst);
     if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
@@ -1649,8 +1765,7 @@ fun encode_load(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
     val mr: R.Result[RvMem, str] = resolve_mem(f, src);
     if (R.is_err[RvMem, str](mr)) { ret R.err[bool, str](R.unwrap_err[RvMem, str](mr)); }
     val m: RvMem = R.unwrap_ok[RvMem, str](mr);
-    emit_mem_access(st, rd, m.base, m.off, mi.src_width, true);
-    ret R.ok[bool, str](true);
+    ret emit_mem_access(st, rd, m.base, m.off, mi.src_width, true);
 }
 
 # a store `[mem, val]`. a folded-global symbol destination emits the auipc-based `la`
@@ -1710,7 +1825,7 @@ fun is_mir_compare(op: mir.MirOpcode) bool {
 # sub-word operand is first extended - sign-extended for a signed relation,
 # zero-extended for an unsigned relation and for equality (any consistent
 # extension preserves it) - making the full-register compare exact at the
-# operand width. a 4 / 8-byte operand is already canonical under lp64 (lw /
+# operand width. a 4 / 8-byte operand is already canonical under RV64 (lw /
 # addiw sign-extend the 32-bit convention, which sltu reads monotonically) and
 # passes through untouched
 # ---
@@ -1745,7 +1860,7 @@ fun narrow_cmp_source(st: *encode.EncodeState, reg: u32, scratch: u32, width: u8
 # `MIR_SEL_CMP_*` (slt-idiom boolean) and the fused `MIR_SEL_CBR_*` (native
 # conditional branch). each operand resolves through `resolve_source` (a
 # physical register directly, an immediate materialized into its scratch
-# re-signed to the lp64 convention) and then re-narrows through
+# re-signed to the RV64 register convention) and then re-narrows through
 # `narrow_cmp_source` at the compare width, so the full-XLEN primitives both
 # callers emit read exact values at every width. the lhs rides SCRATCH2 and the
 # rhs SCRATCH, preserving operand order for the relation
@@ -1779,7 +1894,7 @@ fun resolve_cmp_sources(st: *encode.EncodeState, lhs_op: *mir.MirOperand, rhs_op
 # / `sltu rd,x0,t` idioms), the less-than relations directly with `slt`/`sltu`, and
 # the less-or-equal relations as the negation of the swapped strict relation. the
 # primitives compare full XLEN registers, so a sub-word operand is first re-narrowed
-# through `narrow_cmp_source`; a 4 / 8-byte operand rides the lp64 register
+# through `narrow_cmp_source`; a 4 / 8-byte operand rides the RV64 register
 # convention directly
 fun encode_compare(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 3) { ret R.err[bool, str]("encode: compare missing operands"); }
@@ -1907,7 +2022,7 @@ fun fused_cbr_funct3(op: mir.MirOpcode, swap: *bool) R.Result[u32, str] {
 # materialized as the NATIVE RV64 fused conditional branch: `bcc lhs, rhs, then ;
 # j else` (the LE relations as the swapped GE). the operands resolve exactly as
 # `encode_compare`'s - a physical register directly, an immediate materialized
-# into the scratch re-signed to the lp64 register convention, a sub-word operand
+# into the scratch re-signed to the RV64 register convention, a sub-word operand
 # re-narrowed through `narrow_cmp_source` - and the branch then compares full
 # XLEN registers exactly as the slt-idiom boolean did, so the fused relation is
 # identical to the split pair at every width. each branch
@@ -1986,9 +2101,9 @@ fun encode_call(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] 
         }
         val pos: u32 = st.buf.len::u32;
         emit_u(st, OPC_AUIPC, RRA, 0);
-        note_sym_target(st, callee.sym, isa.SYM_MOD_PCREL_HI);
+        note_sym_target(st, callee.sym, isa.SYM_MOD_PCREL_HI, callee.sym_off);
         emit_i(st, OPC_JALR, F3_ADD, RRA, RRA, 0);
-        note_sym_target(st, callee.sym, isa.SYM_MOD_PCREL_LO);
+        note_sym_target(st, callee.sym, isa.SYM_MOD_PCREL_LO, 0);
         ret encode.push_reloc(st, pos, of.RK_PLT32, callee.sym, callee.sym_off);
     }
     val rr: R.Result[i32, str] = req_gpr(callee);
@@ -2111,6 +2226,11 @@ fun encode_convert(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, st
 # raw index would - a raw GP index would mis-encode
 fun req_fpr(op: *mir.MirOperand) R.Result[i32, str] {
     if (op.kind == mir.MIR_OP_PREG) {
+        # the mirror of `req_gpr`'s check: an integer register resolved here would name
+        # the float register that aliases its index, the same collision the other way
+        if (isa.regid_class(op.preg::i32) != isa.REG_CLASS_ID_XMM) {
+            ret R.err[i32, str]("internal compiler error: a general-purpose register reached a float operand position");
+        }
         ret R.ok[i32, str](isa.regid_index(op.preg::i32));
     }
     if (op.kind == mir.MIR_OP_VREG) {
@@ -2138,9 +2258,20 @@ fun reg_is_fp(op: *mir.MirOperand) bool {
 
 # the float load / store funct3 for an access width: flw / fsw at 4 bytes, fld / fsd
 # at 8. unlike the integer loads there is no sub-word float access
-fun fp_mem_funct3(width: u8) u32 {
-    if (width == 4) { ret 0x2; }  # flw / fsw
-    ret 0x3;                       # fld / fsd
+#
+# RV64D IMPLEMENTS EXACTLY THOSE TWO, so every other width is REFUSED (#2766). It used
+# to answer 4 with `flw` / `fsw` and EVERYTHING ELSE with `fld` / `fsd`, so a 16-byte
+# float access - which this target has no form for at all, having no vector extension
+# enabled - moved eight bytes and dropped the other eight with no diagnostic. #2727
+# makes over-width vectors legal, which is what starts sending such widths here.
+# ---
+# width:   the access width in bytes
+# is_load: true for the load direction (the funct3 is the same either way)
+# ret:     the funct3, or an error naming the width RV64D has no float access for
+fun fp_mem_funct3(width: u8, is_load: bool) R.Result[u32, str] {
+    if (width == 4) { ret R.ok[u32, str](0x2); }  # flw / fsw
+    if (width == 8) { ret R.ok[u32, str](0x3); }  # fld / fsd
+    ret R.err[u32, str]("internal compiler error: riscv64 has no float memory access form for this width (expected 4 or 8)");
 }
 
 # emit a width-sized float load or store of float register `rt` at `[base + off]`. a
@@ -2148,7 +2279,13 @@ fun fp_mem_funct3(width: u8) u32 {
 # store; a wider `off` is materialized into the GP scratch register, added to the
 # base, and the access addressed at `[scratch + 0]`. `base` is a GP register (s0 for
 # a frame slot, a pointer otherwise); the float analogue of `emit_mem_access`
-fun emit_fp_mem(st: *encode.EncodeState, rt: u32, base: u32, off: i64, width: u8, is_load: bool) {
+#
+# The width is refused by `fp_mem_funct3` BEFORE the offset materialization, so a
+# refused access leaves the sink untouched rather than a stranded `li` / `add` pair.
+fun emit_fp_mem(st: *encode.EncodeState, rt: u32, base: u32, off: i64, width: u8, is_load: bool) R.Result[bool, str] {
+    val f3r: R.Result[u32, str] = fp_mem_funct3(width, is_load);
+    if (R.is_err[u32, str](f3r)) { ret R.err[bool, str](R.unwrap_err[u32, str](f3r)); }
+    val f3: u32 = R.unwrap_ok[u32, str](f3r);
     var b: u32 = base;
     var d: i64 = off;
     if (off < -2048 || off > 2047) {
@@ -2158,10 +2295,11 @@ fun emit_fp_mem(st: *encode.EncodeState, rt: u32, base: u32, off: i64, width: u8
         d = 0;
     }
     if (is_load) {
-        emit_i(st, OPC_LOAD_FP, fp_mem_funct3(width), rt, b, d::u32 & 0xFFF);
-        ret;
+        emit_i(st, OPC_LOAD_FP, f3, rt, b, d::u32 & 0xFFF);
+        ret R.ok[bool, str](true);
     }
-    emit_s(st, OPC_STORE_FP, fp_mem_funct3(width), b, rt, d::u32 & 0xFFF);
+    emit_s(st, OPC_STORE_FP, f3, b, rt, d::u32 & 0xFFF);
+    ret R.ok[bool, str](true);
 }
 
 # store float register `rt` to a frame-slot / pointer MEM destination at float
@@ -2172,8 +2310,7 @@ fun emit_fp_slot_store(st: *encode.EncodeState, f: *mir.MirFunction, memop: *mir
     if (R.is_err[RvMem, str](mr)) { ret R.err[bool, str](R.unwrap_err[RvMem, str](mr)); }
     val m: RvMem = R.unwrap_ok[RvMem, str](mr);
     if (m.has_index) { ret R.err[bool, str]("encode: indexed float spill destination not expected"); }
-    emit_fp_mem(st, rt, m.base, m.off, width, false);
-    ret R.ok[bool, str](true);
+    ret emit_fp_mem(st, rt, m.base, m.off, width, false);
 }
 
 # load a frame-slot / pointer MEM source into float register `rt` at float `width`. the
@@ -2183,8 +2320,7 @@ fun emit_fp_slot_load(st: *encode.EncodeState, f: *mir.MirFunction, memop: *mir.
     if (R.is_err[RvMem, str](mr)) { ret R.err[bool, str](R.unwrap_err[RvMem, str](mr)); }
     val m: RvMem = R.unwrap_ok[RvMem, str](mr);
     if (m.has_index) { ret R.err[bool, str]("encode: indexed float spill source not expected"); }
-    emit_fp_mem(st, rt, m.base, m.off, width, true);
-    ret R.ok[bool, str](true);
+    ret emit_fp_mem(st, rt, m.base, m.off, width, true);
 }
 
 # true when `op` is a spilled FLOAT value: a frame-slot MEM operand whose slot-key vreg
@@ -2267,12 +2403,14 @@ fun emit_fp_const(st: *encode.EncodeState, vd: u32, bits: i64, width: u8) R.Resu
     if (R.is_err[intern.StrId, str](sr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sr)); }
     val sym: intern.StrId = R.unwrap_ok[intern.StrId, str](sr);
 
+    val f3r: R.Result[u32, str] = fp_mem_funct3(width, true);
+    if (R.is_err[u32, str](f3r)) { ret R.err[bool, str](R.unwrap_err[u32, str](f3r)); }
     val hr: R.Result[bool, str] = emit_pcrel_hi(st, SCRATCH, sym, 0);
     if (R.is_err[bool, str](hr)) { ret hr; }
     val lo_pos: u32 = st.buf.len::u32;
-    emit_i(st, OPC_LOAD_FP, fp_mem_funct3(width), vd, SCRATCH, 0);
-    note_sym_target(st, sym, isa.SYM_MOD_PCREL_LO);
-    ret encode.push_reloc(st, lo_pos, of.RK_PCREL_LO12_I, sym, 0);
+    emit_i(st, OPC_LOAD_FP, R.unwrap_ok[u32, str](f3r), vd, SCRATCH, 0);
+    note_sym_target(st, sym, isa.SYM_MOD_PCREL_LO, 0);
+    ret push_pcrel_lo(st, lo_pos, of.RK_PCREL_LO12_I, sym);
 }
 
 # the float register index a float source operand contributes. a physical float
@@ -2287,7 +2425,8 @@ fun resolve_fp_source(st: *encode.EncodeState, f: *mir.MirFunction, op: *mir.Mir
         if (R.is_err[RvMem, str](mr)) { ret R.err[i32, str](R.unwrap_err[RvMem, str](mr)); }
         val m: RvMem = R.unwrap_ok[RvMem, str](mr);
         if (m.has_index) { ret R.err[i32, str]("encode: indexed float spill operand not expected"); }
-        emit_fp_mem(st, scratch, m.base, m.off, width, true);
+        val lr: R.Result[bool, str] = emit_fp_mem(st, scratch, m.base, m.off, width, true);
+        if (R.is_err[bool, str](lr)) { ret R.err[i32, str](R.unwrap_err[bool, str](lr)); }
         ret R.ok[i32, str](scratch::i32);
     }
     if (op.kind == mir.MIR_OP_IMM) {
@@ -2665,7 +2804,8 @@ fun encode_fmov(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
             if (R.is_err[RvMem, str](mr)) { ret R.err[bool, str](R.unwrap_err[RvMem, str](mr)); }
             val m: RvMem = R.unwrap_ok[RvMem, str](mr);
             if (m.has_index) { ret R.err[bool, str]("encode: indexed float spill operand not expected"); }
-            emit_fp_mem(st, FP_SCRATCH, m.base, m.off, w, true);
+            val lr: R.Result[bool, str] = emit_fp_mem(st, FP_SCRATCH, m.base, m.off, w, true);
+            if (R.is_err[bool, str](lr)) { ret lr; }
             ret emit_fp_slot_store(st, f, dst, FP_SCRATCH, w);
         }
         if (reg_is_fp(src)) {
@@ -2687,8 +2827,7 @@ fun encode_fmov(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
         if (R.is_err[RvMem, str](mr)) { ret R.err[bool, str](R.unwrap_err[RvMem, str](mr)); }
         val m: RvMem = R.unwrap_ok[RvMem, str](mr);
         if (m.has_index) { ret R.err[bool, str]("encode: indexed float spill operand not expected"); }
-        emit_fp_mem(st, R.unwrap_ok[i32, str](rdr)::u32, m.base, m.off, w, true);
-        ret R.ok[bool, str](true);
+        ret emit_fp_mem(st, R.unwrap_ok[i32, str](rdr)::u32, m.base, m.off, w, true);
     }
     # FP -> GP bitcast, spilled float source: load the bits into the GP destination.
     val rdr: R.Result[i32, str] = req_gpr(dst);
@@ -2697,8 +2836,7 @@ fun encode_fmov(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
     if (R.is_err[RvMem, str](mr)) { ret R.err[bool, str](R.unwrap_err[RvMem, str](mr)); }
     val m: RvMem = R.unwrap_ok[RvMem, str](mr);
     if (m.has_index) { ret R.err[bool, str]("encode: indexed float spill operand not expected"); }
-    emit_mem_access(st, R.unwrap_ok[i32, str](rdr)::u32, m.base, m.off, w, true);
-    ret R.ok[bool, str](true);
+    ret emit_mem_access(st, R.unwrap_ok[i32, str](rdr)::u32, m.base, m.off, w, true);
 }
 
 # the number of set bits in a 32-bit mask
@@ -2759,6 +2897,8 @@ fun save_callee_gp(st: *encode.EncodeState, f: *mir.MirFunction, total: u32, sto
     for (r < 32) {
         if ((f.callee_mask & (1::u32 << r)) != 0) {
             val off: i64 = (total::i64) - 16 - 8 - (8 * n)::i64;
+            # the literal doubleword the save area is laid out in, which
+            # `int_mem_funct3` implements, so the refusal cannot fire here.
             emit_mem_access(st, r, RSP, off, 8, !store);
             n = n + 1;
         }
@@ -2778,6 +2918,8 @@ fun save_callee_fp(st: *encode.EncodeState, f: *mir.MirFunction, total: u32, sto
     for (r < 32) {
         if ((f.callee_mask_fp & (1::u32 << r)) != 0) {
             val off: i64 = (total::i64) - 16 - gp_bytes - 8 - (8 * n)::i64;
+            # a callee-saved f register saves its full 64 bits, the literal width
+            # `fp_mem_funct3` implements, so the refusal cannot fire here.
             emit_fp_mem(st, r, RSP, off, 8, !store);
             n = n + 1;
         }
@@ -3435,52 +3577,65 @@ fun asm_is_space(c: char) bool {
 # token is not a register. accepts the numeric `xN` spelling and the psABI aliases
 # (zero/ra/sp/gp/tp, t0-t6, s0/fp, s1-s11, a0-a7). the slice-3 inline-asm assembler
 # reuses this resolver; the names are stable psABI facts, not an encoder choice
-fun asm_reg_index(tok: str) i32 {
-    if (str_equals(tok, "zero")) { ret 0; }
-    if (str_equals(tok, "ra"))   { ret 1; }
-    if (str_equals(tok, "sp"))   { ret 2; }
-    if (str_equals(tok, "gp"))   { ret 3; }
-    if (str_equals(tok, "tp"))   { ret 4; }
-    if (str_equals(tok, "t0"))   { ret 5; }
-    if (str_equals(tok, "t1"))   { ret 6; }
-    if (str_equals(tok, "t2"))   { ret 7; }
-    if (str_equals(tok, "s0"))   { ret 8; }
-    if (str_equals(tok, "fp"))   { ret 8; }
-    if (str_equals(tok, "s1"))   { ret 9; }
-    if (str_equals(tok, "a0"))   { ret 10; }
-    if (str_equals(tok, "a1"))   { ret 11; }
-    if (str_equals(tok, "a2"))   { ret 12; }
-    if (str_equals(tok, "a3"))   { ret 13; }
-    if (str_equals(tok, "a4"))   { ret 14; }
-    if (str_equals(tok, "a5"))   { ret 15; }
-    if (str_equals(tok, "a6"))   { ret 16; }
-    if (str_equals(tok, "a7"))   { ret 17; }
-    if (str_equals(tok, "s2"))   { ret 18; }
-    if (str_equals(tok, "s3"))   { ret 19; }
-    if (str_equals(tok, "s4"))   { ret 20; }
-    if (str_equals(tok, "s5"))   { ret 21; }
-    if (str_equals(tok, "s6"))   { ret 22; }
-    if (str_equals(tok, "s7"))   { ret 23; }
-    if (str_equals(tok, "s8"))   { ret 24; }
-    if (str_equals(tok, "s9"))   { ret 25; }
-    if (str_equals(tok, "s10"))  { ret 26; }
-    if (str_equals(tok, "s11"))  { ret 27; }
-    if (str_equals(tok, "t3"))   { ret 28; }
-    if (str_equals(tok, "t4"))   { ret 29; }
-    if (str_equals(tok, "t5"))   { ret 30; }
-    if (str_equals(tok, "t6"))   { ret 31; }
-    if (tok[0] == 'x'::char) {
+#
+# compares IN PLACE against `body[lo..hi)`, copying nothing: a register name is
+# short, but the region handed here is not always one - `rv_operand` calls this
+# before it knows the token's kind at all, and an arbitrarily long symbol name is
+# exactly as valid a token as a register name is invalid one (#2789). a fixed-size
+# scratch buffer at this call site was a length limit nothing below it imposed.
+fun asm_reg_index_region(body: str, lo: usize, hi: usize) i32 {
+    val len: usize = hi - lo;
+    if (str_region_equals(body, lo, len, "zero")) { ret 0; }
+    if (str_region_equals(body, lo, len, "ra"))   { ret 1; }
+    if (str_region_equals(body, lo, len, "sp"))   { ret 2; }
+    if (str_region_equals(body, lo, len, "gp"))   { ret 3; }
+    if (str_region_equals(body, lo, len, "tp"))   { ret 4; }
+    if (str_region_equals(body, lo, len, "t0"))   { ret 5; }
+    if (str_region_equals(body, lo, len, "t1"))   { ret 6; }
+    if (str_region_equals(body, lo, len, "t2"))   { ret 7; }
+    if (str_region_equals(body, lo, len, "s0"))   { ret 8; }
+    if (str_region_equals(body, lo, len, "fp"))   { ret 8; }
+    if (str_region_equals(body, lo, len, "s1"))   { ret 9; }
+    if (str_region_equals(body, lo, len, "a0"))   { ret 10; }
+    if (str_region_equals(body, lo, len, "a1"))   { ret 11; }
+    if (str_region_equals(body, lo, len, "a2"))   { ret 12; }
+    if (str_region_equals(body, lo, len, "a3"))   { ret 13; }
+    if (str_region_equals(body, lo, len, "a4"))   { ret 14; }
+    if (str_region_equals(body, lo, len, "a5"))   { ret 15; }
+    if (str_region_equals(body, lo, len, "a6"))   { ret 16; }
+    if (str_region_equals(body, lo, len, "a7"))   { ret 17; }
+    if (str_region_equals(body, lo, len, "s2"))   { ret 18; }
+    if (str_region_equals(body, lo, len, "s3"))   { ret 19; }
+    if (str_region_equals(body, lo, len, "s4"))   { ret 20; }
+    if (str_region_equals(body, lo, len, "s5"))   { ret 21; }
+    if (str_region_equals(body, lo, len, "s6"))   { ret 22; }
+    if (str_region_equals(body, lo, len, "s7"))   { ret 23; }
+    if (str_region_equals(body, lo, len, "s8"))   { ret 24; }
+    if (str_region_equals(body, lo, len, "s9"))   { ret 25; }
+    if (str_region_equals(body, lo, len, "s10"))  { ret 26; }
+    if (str_region_equals(body, lo, len, "s11"))  { ret 27; }
+    if (str_region_equals(body, lo, len, "t3"))   { ret 28; }
+    if (str_region_equals(body, lo, len, "t4"))   { ret 29; }
+    if (str_region_equals(body, lo, len, "t5"))   { ret 30; }
+    if (str_region_equals(body, lo, len, "t6"))   { ret 31; }
+    if (len >= 2 && body[lo] == 'x'::char) {
         var n: i32 = 0;
-        var i: usize = 1;
-        if (tok[1] == 0) { ret -1; }
-        for (tok[i] != 0) {
-            if (tok[i] < '0'::char || tok[i] > '9'::char) { ret -1; }
-            n = n * 10 + (tok[i]::i32 - '0'::char::i32);
+        var i: usize = lo + 1;
+        for (i < hi) {
+            if (body[i] < '0'::char || body[i] > '9'::char) { ret -1; }
+            n = n * 10 + (body[i]::i32 - '0'::char::i32);
             i = i + 1;
         }
         if (n >= 0 && n < 32) { ret n; }
     }
     ret -1;
+}
+
+# `asm_reg_index_region` for a caller already holding a null-terminated name
+# (declared-clobber decoding, tests) rather than a body region - forwards to the
+# one table above so there is exactly one place register names are spelled.
+fun asm_reg_index(tok: str) i32 {
+    ret asm_reg_index_region(tok, 0, str_len(tok));
 }
 
 # the RV64 inline-assembly grammar
@@ -3962,11 +4117,7 @@ fun rv_operand(c: *iasm.Cursor, lo: usize, hi: usize, op: *iasm.Operand) R.Resul
         ret R.ok[bool, str](true);
     }
 
-    var buf: [64]u8;
-    if (!iasm.copy_region(c.body, lo, hi, ?buf[0], 64)) { ret R.err[bool, str]("encode: malformed inline-asm operand"); }
-    val tok: str = (?buf[0])::str;
-
-    val ri: i32 = asm_reg_index(tok);
+    val ri: i32 = asm_reg_index_region(c.body, lo, hi);
     if (ri >= 0) { @op = iasm.op_reg(ri, 8); ret R.ok[bool, str](true); }
 
     # a relocation modifier `%mod(sym)`, the spelling the printer emits for the two
@@ -4541,10 +4692,12 @@ fun rv_emit_uimm(st: *encode.EncodeState, c: *iasm.Cursor, item: *iasm.Item, opc
 
 # emit the low half of a pc-relative symbol pair, `addi rd, rs1, %pcrel_lo(sym)`
 #
-# The immediate is a zero placeholder the RK_PCREL_LO12_I relocation fills. This
-# backend forms the pair against the symbol itself rather than against the paired
-# `auipc`'s label - the same convention `la` and every compiler-emitted global
-# reference use - so what the printer writes for one half is what this reads back.
+# The immediate is a zero placeholder the RK_PCREL_LO12_I relocation fills. The pair is
+# written against the symbol itself rather than against the paired `auipc`'s label - the
+# same convention `la` uses - so what the printer writes for one half is what this reads
+# back. The auipc need not be the preceding instruction: inline asm is free to put work
+# between the halves, and `push_pcrel_lo` records the actual distance to the auipc this
+# low half pairs with rather than assuming one (#2797).
 fun rv_emit_pcrel_lo(st: *encode.EncodeState, c: *iasm.Cursor, item: *iasm.Item, opcode: u32, f3: u32) R.Result[bool, str] {
     val src: *iasm.Operand = ?item.ops[2];
     if (src.mod != isa.SYM_MOD_PCREL_LO) {
@@ -4555,8 +4708,8 @@ fun rv_emit_pcrel_lo(st: *encode.EncodeState, c: *iasm.Cursor, item: *iasm.Item,
     val sym: intern.StrId = R.unwrap_ok[intern.StrId, str](sr);
     val pos: u32 = st.buf.len::u32;
     emit_i(st, opcode, f3, rv_reg(?item.ops[0]), rv_reg(?item.ops[1]), 0);
-    note_sym_target(st, sym, isa.SYM_MOD_PCREL_LO);
-    ret encode.push_reloc(st, pos, of.RK_PCREL_LO12_I, sym, 0);
+    note_sym_target(st, sym, isa.SYM_MOD_PCREL_LO, 0);
+    ret push_pcrel_lo(st, pos, of.RK_PCREL_LO12_I, sym);
 }
 
 # `la rd, sym` - the pc-relative address-of pair `auipc rd, %pcrel_hi(sym)` then
@@ -4570,8 +4723,8 @@ fun rv_emit_la(st: *encode.EncodeState, c: *iasm.Cursor, item: *iasm.Item) R.Res
     if (R.is_err[bool, str](hr)) { ret hr; }
     val lo_pos: u32 = st.buf.len::u32;
     emit_i(st, OPC_OP_IMM, F3_ADD, rd, rd, 0);
-    note_sym_target(st, sym, isa.SYM_MOD_PCREL_LO);
-    ret encode.push_reloc(st, lo_pos, of.RK_PCREL_LO12_I, sym, 0);
+    note_sym_target(st, sym, isa.SYM_MOD_PCREL_LO, 0);
+    ret push_pcrel_lo(st, lo_pos, of.RK_PCREL_LO12_I, sym);
 }
 
 # a direct call to a symbol - `auipc <link>, 0` then `jalr <ret>, <link>, 0` with a
@@ -4584,9 +4737,9 @@ fun rv_emit_call(st: *encode.EncodeState, c: *iasm.Cursor, item: *iasm.Item, lin
     val sym: intern.StrId = R.unwrap_ok[intern.StrId, str](sr);
     val pos: u32 = st.buf.len::u32;
     emit_u(st, OPC_AUIPC, link, 0);
-    note_sym_target(st, sym, isa.SYM_MOD_PCREL_HI);
+    note_sym_target(st, sym, isa.SYM_MOD_PCREL_HI, 0);
     emit_i(st, OPC_JALR, F3_ADD, ret_reg, link, 0);
-    note_sym_target(st, sym, isa.SYM_MOD_PCREL_LO);
+    note_sym_target(st, sym, isa.SYM_MOD_PCREL_LO, 0);
     ret encode.push_reloc(st, pos, of.RK_PLT32, sym, 0);
 }
 
@@ -4663,7 +4816,24 @@ fun rv_grammar() iasm.Grammar {
     g.ct_class   = asm_ct_class;
     g.note_bytes = asm_note_bytes;
     g.decl_reg   = rv_decl_reg;
+    g.no_fall    = rv_no_fall;
     ret g;
+}
+
+# true when a riscv64 statement cannot fall through to the next (#2791)
+#
+# `ebreak` raises a breakpoint exception, which with no debugger attached terminates
+# the process. It is what `std.system.panic` and `std.system.os.terminate` write after
+# `exit_group` on this target.
+fun rv_no_fall(item: *iasm.Item) bool {
+    if (item.kind != iasm.AI_INST) { ret false; }
+    ret item.code == inst.EBREAK::u32;
+}
+
+# whether control can fall out of a riscv64 inline-asm body (#2791)
+pub fun asm_returns(body: str) bool {
+    var g: iasm.Grammar = rv_grammar();
+    ret iasm.returns(?g, body);
 }
 
 # the register a declared clobber set names, in its bank (#2594)
@@ -4763,6 +4933,25 @@ fun tbuf_interned(st: *encode.EncodeState, alloc: *A.Allocator, itn: *intern.Int
     @itn = intern.init(alloc);
     encode.state_blank(st, alloc);
     st.interner = itn;
+}
+
+# whether `name` is a `%pcrel_hi` label mark defined at text offset `off`
+#
+# The psABI property every low-half assertion below rests on: a low half names a
+# label, and that label sits at the offset its paired `auipc` was written to.
+# ---
+# st:   the encode state holding the symbol marks
+# name: the interned name the low half's relocation carries
+# off:  the text offset the paired high half patches
+# ret:  true when a label mark of that name is defined at that offset
+fun label_at(st: *encode.EncodeState, name: intern.StrId, off: u32) bool {
+    var i: u32 = 0;
+    for (i < st.sym_count) {
+        if (st.syms[i].name == name && st.syms[i].offset == off
+            && st.syms[i].flags == PCREL_LABEL_FLAGS) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # the R/I/S/U-type packers are byte-exact against `llvm-mc -triple=riscv64
@@ -4914,7 +5103,8 @@ test "mach.lang.target.isa.riscv64.encode:mir_subword_load_store_widths" {
     var bad: i32 = 0;
     var st: encode.EncodeState;
     var alloc: A.Allocator;
-    tbuf(?st, ?alloc);
+    var itn: intern.Interner;
+    tbuf_interned(?st, ?alloc, ?itn);
     st.alloc       = ?alloc;
     st.relocs      = nil;
     st.reloc_count = 0;
@@ -4933,7 +5123,7 @@ test "mach.lang.target.isa.riscv64.encode:mir_subword_load_store_widths" {
     st.buf.len = 0; ld.width = 4; ld.src_width = 2; encode_load(?st, nil, ?ld);
     if (read_word(?st.buf, 0) != 0x0005D503) { bad = 1; }
     # u32 load: width 4, src_width 4 -> lw a0,0(a1) = 0x0005a503 (sign-extending, the
-    # lp64 32-bit register convention; a widening to u64 is an explicit IR extend).
+    # RV64 32-bit register convention; a widening to u64 is an explicit IR extend).
     st.buf.len = 0; ld.width = 4; ld.src_width = 4; encode_load(?st, nil, ?ld);
     if (read_word(?st.buf, 0) != 0x0005A503) { bad = 1; }
     # u64 load: width 8, src_width 8 -> ld a0,0(a1) = 0x0005b503.
@@ -5445,7 +5635,8 @@ test "mach.lang.target.isa.riscv64.encode:global_la_sequences" {
     var bad: i32 = 0;
     var st: encode.EncodeState;
     var alloc: A.Allocator;
-    tbuf(?st, ?alloc);
+    var itn: intern.Interner;
+    tbuf_interned(?st, ?alloc, ?itn);
     st.alloc       = ?alloc;
     st.relocs      = nil;
     st.reloc_count = 0;
@@ -5465,7 +5656,10 @@ test "mach.lang.target.isa.riscv64.encode:global_la_sequences" {
         if (st.relocs[0].sym != sym)                 { bad = 1; }
         if (st.relocs[1].kind != of.RK_PCREL_LO12_I) { bad = 1; }
         if (st.relocs[1].offset != 4)                { bad = 1; }
-        if (st.relocs[1].sym != sym)                 { bad = 1; }
+        # the low half names the label at the auipc, never the target (the psABI
+        # spelling), and that label is defined at the high half's offset
+        if (st.relocs[1].sym == sym)                 { bad = 1; }
+        if (!label_at(?st, st.relocs[1].sym, 0))     { bad = 1; }
     }
 
     # folded-global load (width 8): auipc t0,0 (0x00000297) ; ld a0,0(t0) (0x0002B503).
@@ -5669,6 +5863,78 @@ test "mach.lang.target.isa.riscv64.encode:inline_asm_core_forms" {
 
     iasm.labels_dnit(?labels);
     encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# a `call` naming a symbol far longer than the register-name scratch buffer this
+# operand parser used to copy into (64 bytes here, 128 on x64) must encode exactly
+# as a short-named `call` does (#2789) - instruction bytes never depend on a
+# symbol's NAME, only its relocation does, so a correctly parsed long operand is
+# byte-identical to a short one, not merely "did not error". Also checks the
+# relocation itself carries the FULL long name, unterminated by whatever the old
+# buffer's cap would have truncated it to, and that a genuinely malformed operand
+# (unbalanced `off(base)`) still refuses - proving the region-based lookup did not
+# also turn off malformed-operand detection.
+test "mach.lang.target.isa.riscv64.encode:inline_asm_long_symbol_operand" {
+    var bad: i32 = 0;
+
+    var st1: encode.EncodeState;
+    var alloc1: A.Allocator;
+    var interner1: intern.Interner;
+    tasm(?st1, ?alloc1, ?interner1);
+    var labels1: iasm.Labels;
+    iasm.labels_init(?labels1, ?alloc1);
+    var f1: mir.MirFunction;
+    val r1: R.Result[bool, str] = rv_asm_text(?st1, ?f1, ?labels1, "call short_sym");
+    if (R.is_err[bool, str](r1)) { bad = 1; }
+
+    # 134 bytes: past riscv64/arm64's old 64-byte cap and x64's old 128-byte one.
+    val long_name: str =
+        "sym_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    val long_call: str =
+        "call sym_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    var st2: encode.EncodeState;
+    var alloc2: A.Allocator;
+    var interner2: intern.Interner;
+    tasm(?st2, ?alloc2, ?interner2);
+    var labels2: iasm.Labels;
+    iasm.labels_init(?labels2, ?alloc2);
+    var f2: mir.MirFunction;
+    val r2: R.Result[bool, str] = rv_asm_text(?st2, ?f2, ?labels2, long_call);
+    if (R.is_err[bool, str](r2)) { bad = 1; }
+
+    if (st1.buf.len != st2.buf.len) { bad = 1; }
+    or {
+        var i: usize = 0;
+        for (i < st1.buf.len) {
+            if (st1.buf.data[i] != st2.buf.data[i]) { bad = 1; }
+            i = i + 1;
+        }
+    }
+
+    if (st2.reloc_count == 0) { bad = 1; }
+    or {
+        val nm: O.Option[str] = intern.lookup(st2.interner, st2.relocs[st2.reloc_count - 1].sym);
+        if (!O.is_some[str](nm)) { bad = 1; }
+        or (!str_equals(O.unwrap[str](nm), long_name)) { bad = 1; }
+    }
+
+    var st3: encode.EncodeState;
+    var alloc3: A.Allocator;
+    var interner3: intern.Interner;
+    tasm(?st3, ?alloc3, ?interner3);
+    var labels3: iasm.Labels;
+    iasm.labels_init(?labels3, ?alloc3);
+    var f3: mir.MirFunction;
+    val r3: R.Result[bool, str] = rv_asm_text(?st3, ?f3, ?labels3, "ld a0, )(sp");
+    if (R.is_ok[bool, str](r3)) { bad = 1; }
+
+    iasm.labels_dnit(?labels1);
+    encode.buf_dnit(?st1.buf);
+    iasm.labels_dnit(?labels2);
+    encode.buf_dnit(?st2.buf);
+    iasm.labels_dnit(?labels3);
+    encode.buf_dnit(?st3.buf);
     ret bad;
 }
 
@@ -6698,6 +6964,32 @@ test "mach.lang.target.isa.riscv64.encode:fmov_and_float_memory" {
     encode_fmov(?st, nil, ?mi);
     if (read_word(?st.buf, 0) != 0xE2058553) { bad = 1; }
 
+    # the 4-byte forms of the same three moves. The GP->FP one is the load-bearing
+    # case: a single held in an f register must be NaN-BOXED (upper 32 bits all ones),
+    # and only `fmv.w.x` boxes -- `fmv.d.x` moves the raw 64 bits, so every later
+    # `.s` operation on a value whose upper half is not all-ones yields NaN (#2777).
+    # The width is the VALUE's, not the machine word's, which is why a 4-byte float
+    # arriving in a 64-bit GP argument register still has to reach here as width 4.
+    var mw: mir.MirInstr = mir.instr(mir.MIR_MOV, ?ops[0], 2, 4, 0);
+
+    # float copy fa0 <- fa1: fmv.s fa0,fa1 = 0x20b58553
+    st.buf.len = 0;
+    ops[0] = fp_op(10); ops[1] = fp_op(11);
+    encode_fmov(?st, nil, ?mw);
+    if (read_word(?st.buf, 0) != 0x20B58553) { bad = 1; }
+
+    # GP->FP fa0 <- a1: fmv.w.x fa0,a1 = 0xf0058553 (NaN-boxing)
+    st.buf.len = 0;
+    ops[0] = fp_op(10); ops[1] = mir.op_preg(11);
+    encode_fmov(?st, nil, ?mw);
+    if (read_word(?st.buf, 0) != 0xF0058553) { bad = 1; }
+
+    # FP->GP a0 <- fa1: fmv.x.w a0,fa1 = 0xe0058553
+    st.buf.len = 0;
+    ops[0] = mir.op_preg(10); ops[1] = fp_op(11);
+    encode_fmov(?st, nil, ?mw);
+    if (read_word(?st.buf, 0) != 0xE0058553) { bad = 1; }
+
     # the float loads / stores by width: fld/fsd (8), flw/fsw (4) of fa0 at 16(a1)
     st.buf.len = 0;
     emit_fp_mem(?st, 10, 11, 16, 8, true);   # fld fa0,16(a1) = 0x0105b507
@@ -6739,6 +7031,112 @@ fun t_refused(r: R.Result[bool, str], buf: *encode.ByteBuf) bool {
 fun t_accepted(r: R.Result[bool, str], buf: *encode.ByteBuf) bool {
     if (R.is_err[bool, str](r)) { ret false; }
     ret buf.len > 0;
+}
+
+# EVERY MEMORY ACCESS WIDTH RV64 DOES NOT IMPLEMENT IS REFUSED, AND EMITS NOTHING
+#
+# `fp_mem_funct3` used to answer 4 with `flw` / `fsw` and EVERYTHING ELSE with `fld` /
+# `fsd` (#2766). RV64D has exactly those two float access forms and no vector
+# extension is enabled here, so a 16-byte float access had nothing to encode to at all
+# - and it encoded to `fld`, moving eight bytes and losing the other eight, silently.
+# The integer family next door defaulted identically, `load_funct3` / `store_funct3`
+# answering every unnamed width with `ld` / `sd`.
+#
+# THE REFUSALS ARE DRIVEN THROUGH THE HELPERS AND THROUGH THE ENTRY ARMS, and the
+# assertion is that the sink stayed EMPTY. That matters here beyond the general
+# principle: both emitters materialize a wide offset into the scratch register with an
+# `li` + `add` BEFORE the access word, so a check placed at the emission point rather
+# than at the top would leave two stranded instructions behind the error.
+test "mach.lang.target.isa.riscv64.encode:access_width_refusals_emit_nothing" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    tbuf(?st, ?alloc);
+    var f: mir.MirFunction;
+
+    # THE FLOAT ACCESS HELPER. 16 is the width #2766 named: it used to emit `fld` and
+    # move half the value.
+    st.buf.len = 0;
+    if (!t_refused(emit_fp_mem(?st, 10, 11, 16, 16, true), ?st.buf))  { bad = 1; }
+    st.buf.len = 0;
+    if (!t_refused(emit_fp_mem(?st, 10, 11, 16, 16, false), ?st.buf)) { bad = 1; }
+    st.buf.len = 0;
+    if (!t_refused(emit_fp_mem(?st, 10, 11, 16, 32, true), ?st.buf))  { bad = 1; }
+    st.buf.len = 0;
+    if (!t_refused(emit_fp_mem(?st, 10, 11, 16, 1, true), ?st.buf))   { bad = 1; }
+    st.buf.len = 0;
+    if (!t_refused(emit_fp_mem(?st, 10, 11, 16, 2, true), ?st.buf))   { bad = 1; }
+    st.buf.len = 0;
+    if (!t_refused(emit_fp_mem(?st, 10, 11, 16, 0, true), ?st.buf))   { bad = 1; }
+    # AND WITH AN OFFSET OUTSIDE THE 12-BIT IMMEDIATE, which is what the scratch
+    # materialization would have written ahead of the refused access word.
+    st.buf.len = 0;
+    if (!t_refused(emit_fp_mem(?st, 10, 11, 100000, 16, true), ?st.buf)) { bad = 1; }
+
+    # the two float widths RV64D DOES implement, byte-exact against llvm-mc
+    st.buf.len = 0;
+    if (!t_accepted(emit_fp_mem(?st, 10, 11, 16, 4, true), ?st.buf)) { bad = 1; }
+    if (read_word(?st.buf, 0) != 0x0105A507) { bad = 1; }   # flw fa0,16(a1)
+    st.buf.len = 0;
+    emit_fp_mem(?st, 10, 11, 16, 8, true);
+    if (read_word(?st.buf, 0) != 0x0105B507) { bad = 1; }   # fld fa0,16(a1)
+
+    # THE INTEGER ACCESS HELPER, which shares the family and defaulted identically
+    st.buf.len = 0;
+    if (!t_refused(emit_mem_access(?st, 10, 11, 0, 16, true), ?st.buf))  { bad = 1; }
+    st.buf.len = 0;
+    if (!t_refused(emit_mem_access(?st, 10, 11, 0, 16, false), ?st.buf)) { bad = 1; }
+    st.buf.len = 0;
+    if (!t_refused(emit_mem_access(?st, 10, 11, 0, 3, true), ?st.buf))   { bad = 1; }
+    st.buf.len = 0;
+    if (!t_refused(emit_mem_access(?st, 10, 11, 0, 32, true), ?st.buf))  { bad = 1; }
+    st.buf.len = 0;
+    if (!t_refused(emit_mem_access(?st, 10, 11, 100000, 16, true), ?st.buf)) { bad = 1; }
+    # the sub-word forms that share the same helper still encode
+    st.buf.len = 0;
+    emit_mem_access(?st, 10, 11, 0, 1, true);
+    if (read_word(?st.buf, 0) != 0x0005C503) { bad = 1; }   # lbu a0,0(a1)
+    st.buf.len = 0;
+    emit_mem_access(?st, 10, 11, 0, 2, true);
+    if (read_word(?st.buf, 0) != 0x0005D503) { bad = 1; }   # lhu a0,0(a1)
+    st.buf.len = 0;
+    emit_mem_access(?st, 10, 11, 0, 4, true);
+    if (read_word(?st.buf, 0) != 0x0005A503) { bad = 1; }   # lw a0,0(a1)
+    st.buf.len = 0;
+    emit_mem_access(?st, 10, 11, 0, 8, true);
+    if (read_word(?st.buf, 0) != 0x0005B503) { bad = 1; }   # ld a0,0(a1)
+
+    # THE FLOAT ENTRY ARMS, reached the way the back end reaches them, with the
+    # unvalidated `mi.src_width` / `mi.width` #2766 named as the way the width arrives
+    var lops: [2]mir.MirOperand;
+    lops[0] = fp_op(10);
+    lops[1] = mir.op_mem_preg(11, 0);
+    var ld: mir.MirInstr = mir.instr(mir.MIR_LOAD, ?lops[0], 2, 16, 0);
+    ld.src_width = 16; st.buf.len = 0;
+    if (!t_refused(encode_load(?st, ?f, ?ld), ?st.buf)) { bad = 1; }
+    ld.width = 8; ld.src_width = 8; st.buf.len = 0;
+    if (!t_accepted(encode_load(?st, ?f, ?ld), ?st.buf)) { bad = 1; }
+
+    var sops: [2]mir.MirOperand;
+    sops[0] = mir.op_mem_preg(11, 0);
+    sops[1] = fp_op(10);
+    st.buf.len = 0;
+    if (!t_refused(emit_store_mem(?st, ?f, ?sops[0], ?sops[1], 16), ?st.buf)) { bad = 1; }
+    st.buf.len = 0;
+    if (!t_accepted(emit_store_mem(?st, ?f, ?sops[0], ?sops[1], 8), ?st.buf)) { bad = 1; }
+
+    # THE FOLDED-GLOBAL ARMS, where the refusal has to precede the `auipc` high half
+    var sym: mir.MirOperand = mir.op_preg(0);
+    sym.kind = mir.MIR_OP_SYM;
+    sym.sym  = 1;
+    var gv: mir.MirOperand = mir.op_preg(10);
+    st.buf.len = 0;
+    if (!t_refused(emit_global_load(?st, 10, ?sym, 16), ?st.buf)) { bad = 1; }
+    st.buf.len = 0;
+    if (!t_refused(emit_global_store(?st, ?sym, ?gv, 16), ?st.buf)) { bad = 1; }
+
+    encode.buf_dnit(?st.buf);
+    ret bad;
 }
 
 # EVERY FLOAT ENCODER REFUSES A WIDTH RV64D DOES NOT IMPLEMENT, AND EMITS NOTHING
@@ -7390,10 +7788,12 @@ test "mach.lang.target.isa.riscv64.encode:float_constant_materialization" {
     or {
         if (st.relocs[0].kind != of.RK_PCREL_HI20)   { bad = 1; }
         if (st.relocs[1].kind != of.RK_PCREL_LO12_I) { bad = 1; }
-        # both halves name the SAME entry: the linker measures the low half from
-        # the auipc that carries the matching high half
-        if (st.relocs[0].sym != st.relocs[1].sym)  { bad = 1; }
+        # the psABI spelling: the HIGH half names the pool entry, and the LOW half
+        # names a local label defined at the high half's own offset, which is how the
+        # linker (and every other toolchain's) finds the auipc it must measure from
         if (st.relocs[0].sym != st.consts[0].sym)  { bad = 1; }
+        if (st.relocs[1].sym == st.consts[0].sym)  { bad = 1; }
+        if (!label_at(?st, st.relocs[1].sym, st.relocs[0].offset)) { bad = 1; }
     }
     if (st.consts[0].len != 8 || st.consts[0].align != 8) { bad = 1; }
     or {
@@ -7419,5 +7819,24 @@ test "mach.lang.target.isa.riscv64.encode:float_constant_materialization" {
     encode.consts_free(?alloc, st.consts, st.const_count, st.const_cap);
     encode.buf_dnit(?st.buf);
     intern.dnit(?itn);
+    ret bad;
+}
+
+# an inline-asm body ending in a trap cannot fall through, and everything else can
+# (#2791). see the x86-64 twin for why the unmodeled rows must all report return.
+test "mach.lang.target.isa.riscv64.encode.asm_returns:trap_ends_control" {
+    var bad: i32 = 0;
+
+    if (asm_returns("li a7, 94\necall\nebreak")) { bad = 1; }
+    if (asm_returns("ebreak"))                    { bad = 1; }
+
+    if (!asm_returns("li a7, 64\necall")) { bad = 1; }
+    if (!asm_returns("nop"))               { bad = 1; }
+    if (!asm_returns("ebreak\nnop"))      { bad = 1; }
+    if (!asm_returns("1:\nebreak"))       { bad = 1; }
+    if (!asm_returns(".word 0x00100073"))  { bad = 1; }
+    if (!asm_returns("this is not asm"))   { bad = 1; }
+    if (!asm_returns(""))                  { bad = 1; }
+
     ret bad;
 }
