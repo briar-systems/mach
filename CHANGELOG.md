@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### `--pie` and dynamic linking on a loaderless OS are refused by name (#2898)
+`mach build --pie` on a freestanding ELF target failed with `elf: PIE program headers exceed the one-page header reservation (too many load segments)`. That was wrong in both clauses. There were four load segments, not too many, and the reservation was not a page: freestanding declares `page_size = 1` because bare metal has no paging, so the check refused whatever the image contained. On riscv32 a third answer arrived first, the ELF32 dynamic-image message. None of the three named the reason.
+
+The reason is one sentence. A position-independent executable exists to be relocated by a program loader when it maps the image, a dynamically-linked one to have its imports resolved by one, and a shared library to be loaded into something else. `os = "freestanding"` has no loader at all, so each of those is a category mistake in the request rather than a layout that did not fit, and someone passing `--pie` to a bare-metal build should be told which mistake they made rather than shown a segment count:
+
+```
+error: link: a position-independent executable needs a loader to relocate it, and os = "freestanding" has none
+error: link: a dynamically-linked executable needs a loader to resolve it, and os = "freestanding" has none
+error: link: a shared library needs a loader to map it, and os = "freestanding" has none
+```
+
+The refusal reads `os.OsVTable.mapped_by_loader` (#2895) in the linker, at the one line that picks the writer family, so the fact stays in one place and any future no-loader OS inherits it without an object-format writer being touched. It also settles the underflow #2895 left standing: `header_segment_vaddr` frames the header block a page below segment 0, which at a base address of 0 wraps to the top of the address space, and the PIE and dynamic ELF writers still computed it unconditionally. They were kept off it only by the reservation check happening to fail first. With the request refused before a writer is chosen, neither writer is reachable on a loaderless target at all, so the precondition holds by construction rather than by arithmetic accident.
+
+Every linux, darwin and windows image is unchanged byte for byte, `--pie` included, as are freestanding `of = "elf"` and `of = "raw"` static images.
+
 #### A freestanding target can select `of = "elf"` and link, on every architecture (#2895)
 `os = "freestanding"` declares `page_size = 1`, and that is deliberate: bare metal has no paging, so segments carry no alignment obligation and 1 packs them tightly in a flat image. The ELF writer read that length as the size of the one-page reservation the ELF header and the program-header table have to fit inside, so the test was `64 + n*56 <= 1` and every freestanding ELF image was refused no matter how few segments it had. The objects were written correctly; only the link step failed, on x86_64, aarch64, riscv64 and riscv32 alike.
 
