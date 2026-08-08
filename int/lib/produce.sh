@@ -138,6 +138,50 @@
 _produce_lib_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 _flat_loader_bin=
 
+# _demangle_awk — the awk `demangle(s)` function every shape-observable scanner uses,
+# defined ONCE and prepended to each scanner's program.
+#
+# This is a transcription of the mangling scheme, which lives in
+# src/lang/me/lower/mangle.mach. A transcription is a second copy of a rule, and a
+# second copy agrees with the first by accident until it does not - so there is exactly
+# one of it here, and a scheme change needs exactly this one shell edit. Do not inline
+# it back into a scanner.
+#
+# The scheme (mangle.mach's header comment is the authority):
+#   ordinary  `_M<len><seg>...N<len><name>`
+#   generic   `_M<len><seg>...N<len><name>I<encoded type args>E`
+#   value     `_M<len><seg>...N<len><name>K<encoded comptime values>E`
+# The module path is a run of length-prefixed segments; `N` terminates it; the bare
+# source name is the length-prefixed run immediately after it.
+#
+# WHAT IT DOES NOT COVER, deliberately:
+#   - the `I...E` / `K...E` instance suffix is DROPPED, not decoded. every instance of
+#     one generic therefore demangles to the same bare name. these observables count
+#     emitted shape per source function, which is what that collapse gives them; a
+#     scanner that needs to tell two instantiations apart must not use this.
+#   - an `ext fun` or `#[symbol(...)]` name is not mangled at all and has no `_M`
+#     prefix, so it is returned unchanged, which is correct.
+#   - anything that does not parse as the grammar above is returned unchanged rather
+#     than guessed at.
+_demangle_awk='
+    function demangle(s,   i, len) {
+        if (substr(s, 1, 2) != "_M") { return s }
+        i = 3
+        while (i <= length(s) && substr(s, i, 1) ~ /[0-9]/) {
+            len = 0
+            while (i <= length(s) && substr(s, i, 1) ~ /[0-9]/) { len = len * 10 + substr(s, i, 1); i++ }
+            i += len
+        }
+        if (substr(s, i, 1) != "N") { return s }
+        i++
+        if (substr(s, i, 1) !~ /[0-9]/) { return s }
+        len = 0
+        while (i <= length(s) && substr(s, i, 1) ~ /[0-9]/) { len = len * 10 + substr(s, i, 1); i++ }
+        if (len == 0) { return s }
+        return substr(s, i, len)
+    }
+'
+
 # qemu_bin <target> — the qemu-user interpreter for a harness target, keyed by ISA
 # rather than sliced from the name. linux-riscv64's name suffix happens to match its
 # qemu-user binary (qemu-riscv64), but linux-arm64's does not (qemu-aarch64, never
@@ -2316,23 +2360,7 @@ produce_const_pool() {
 
 # const_pool_scan — read a `-d -r` disassembly on stdin and print the pool observable
 const_pool_scan() {
-    awk '
-    function demangle(s,   i, len, c, out) {
-        if (substr(s, 1, 2) != "_M") { return s }
-        i = 3
-        out = ""
-        while (i <= length(s)) {
-            c = substr(s, i, 1)
-            if (c == "N") { i++; continue }
-            if (c !~ /[0-9]/) { return s }
-            len = 0
-            while (i <= length(s) && substr(s, i, 1) ~ /[0-9]/) { len = len * 10 + substr(s, i, 1); i++ }
-            out = substr(s, i, len)
-            i += len
-        }
-        if (out == "") { return s }
-        return out
-    }
+    awk "$_demangle_awk"'
     /file format/ {
         if      ($0 ~ /x86-64/)   { isa = "x86_64" }
         else if ($0 ~ /aarch64/)  { isa = "aarch64" }
@@ -2445,23 +2473,7 @@ vector_lanes_scan() { emit_scan lanes; }
 #               ordinary integer loads and stores, so both facts are 0 - the
 #               target's own golden, not an exemption.
 emit_scan() {
-    awk -v mode="$1" '
-    function demangle(s,   i, len, c, out) {
-        if (substr(s, 1, 2) != "_M") { return s }
-        i = 3
-        out = ""
-        while (i <= length(s)) {
-            c = substr(s, i, 1)
-            if (c == "N") { i++; continue }
-            if (c !~ /[0-9]/) { return s }
-            len = 0
-            while (i <= length(s) && substr(s, i, 1) ~ /[0-9]/) { len = len * 10 + substr(s, i, 1); i++ }
-            out = substr(s, i, len)
-            i += len
-        }
-        if (out == "") { return s }
-        return out
-    }
+    awk -v mode="$1" "$_demangle_awk"'
     function packed(m, rest) {
         if (isa == "x86_64") {
             if (m ~ /^(movup[sd]|movap[sd]|movdq[au])$/) { return 1 }
