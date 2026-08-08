@@ -40,6 +40,10 @@ val x:     i64 = p.x;            # record field
 val first: i64 = a[0];           # array index
 ```
 
+An index the compiler can fold is bounds-checked against a statically known
+length — a fixed array's `N`, a vector's lane count — see
+[types.md](types.md).
+
 ## Function calls
 
 ```mach
