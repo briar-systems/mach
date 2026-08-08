@@ -7,7 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+#### BREAKING: linkage names are dotted and readable
+
+Every symbol Mach emits changes spelling. The mangled name is now the source FQN as the source spells it, with generic arguments after a `$`:
+
+```
+_M3std5types6string7str_lenN7str_len   ->  std.types.string.str_len
+_M3std5types6optionN12unwrapI3ptrE     ->  std.types.option.unwrap$ptr
+_M4mach4lang6internN26"intern.roundtrip"  ->  mach.lang.intern."intern.roundtrip"
+```
+
+**What this breaks.** Object files, static libraries and shared libraries built by 4.16.0 or earlier do not link against ones built by this release: every non-`ext`, non-`#[symbol]` symbol has a different name. Rebuild the whole closure. Anything that named a mangled Mach symbol from outside the compiler breaks with it — a C declaration bound to `_M...` by hand, an inline-asm reference to a mangled name, a linker script or `--wrap` naming one, a symbol allowlist, a profiler or crash-report filter matching the `_M` prefix.
+
+**Who should care.** Almost nobody. `ext fun` foreign symbols and `#[symbol("...")]` names are literal and always were, so the entry point, the `_rt_*` runtime symbols, every C import and every hand-written asm target are all untouched. If you never wrote `_M` anywhere, a rebuild is the whole migration.
+
+**The scheme.** The module path and the bare name are joined by `.`, exactly as the source FQN reads, and there is no prefix — a mangled name always contains a `.` and a C identifier never can, so the old `_M` reserved-space guard bought nothing. A generic argument is introduced by a run of `$` whose **length is its nesting depth**, so nothing needs a closing bracket and a shallow instance stays short:
+
+```
+f[Map[Vec[i64], str], u8]  ->  m.f$m.Map$$m.Vec$$$i64$$str$u8
+```
+
+Types spell themselves: `p$u8` is `*u8`, `sec$u32` is `^u32`, `arr4$u8` is `[4]u8`, `fn$$i64$$u8` is `fun(u8) i64`, a record is its own dotted origin FQN, a comptime value is its literal (`tag$7`, `tag$n3`, `true`, `"text"`), and a variadic pack instance carries a `pack` marker before its element list. `.` and `$` are both accepted in an inline-asm symbol name, so every emitted symbol stays nameable from `asm` — which the old scheme also managed, and which a readable scheme has no excuse to lose.
+
+Names did **not** get longer. Over the compiler's own release build — same tree, same profile, 11660 distinct symbols either way — the longest goes from **108 bytes to 105**, and the count over the **63-byte inline-asm operand limit** falls from **1543 to 668**. A length prefix costs one or two digits per path segment where a dot costs one character, and the `_M` goes away, so a dotted name is shorter despite being readable. (That cap is a pre-existing limitation with a misdirecting diagnostic — an over-long operand is refused as "malformed" — and is not touched here.)
+
+Fixing the scheme fixes every reader at once — IR dumps, diagnostics, `--emit-asm` headings, linker messages, `objdump`, `perf`, `DW_AT_linkage_name` — rather than teaching a dozen display sites to substitute a friendlier name one at a time, and the places with no source name to substitute are covered too.
+
 ### Fixed
+
+#### Compiler output names functions the way the source spells them, not the way the linker does
+An `ir.Function` has carried two names for a while: `name`, the mangled linkage symbol, and `disp`, the bare source spelling. The house rule is to prefer `disp` and fall back to `name`, and the DWARF `DW_AT_name` producer, the IR verifier, the SPIR-V entry point and the `#[oblivious]` sema diagnostic all followed it. Everything else printed the symbol, so `--emit-ir` read `fn @_M4case4mainN5add32`, the `simd = "require"` refusal read ``in '_M4case4mainN5add32'``, and a regalloc failure, a constant-time refusal, an encoder ICE and every `--emit-asm` function heading did the same. None of those names anything a reader can find in a source file.
+
+The preference now has exactly one definition per layer - `ir.function_display` and `mir.function_display` - and every producer of text a person reads goes through one of them. The mangled symbol survives only where it IS the identity: an object symbol, a relocation, a linker diagnostic, and the `#[oblivious]` note that deliberately names one generic instantiation among many.
+
+Reaching the back end took a real change rather than a lookup: `EncodeFunctionFn`, the constant-time validator and regalloc all take a `mir.MirFunction` and no IR handle, so `MirFunction` now carries `disp` itself, stamped at lowering exactly as `oblivious` and `naked` already are. Widening those interfaces to carry a mid-end structure so a diagnostic could spell a name would have been the wrong direction.
+
+Two dumps keep both names, because in both the symbol is still load-bearing. `--emit-ir` writes `fn @add32(...): i32 symbol "_M4demo4mainN10echoI3i32E"` - source names are not unique across generic instantiations, and the header is where they are told apart. `--emit-asm` writes `# add32 (_M4case4mainN5add32):`, since the listing carries no `.globl` and that comment is the only place a function's identity appears in it. The heading's format is now defined once in `be/codegen/encode.mach` rather than three times, once per ISA printer.
+
+Display only: the compiler was built before and after and used to compile itself for all six targets, and the emitted binaries are byte-identical on every one.
+
+#### `int`'s shell demangler was a third copy of the mangling scheme, and disagreed with the other two
+`int/lib/produce.sh` carried the same ~18-line awk `demangle()` twice, hardcoding the `_M` prefix, the `N` separator and the length-prefixed-run grammar - a transcription of `src/lang/me/lower/mangle.mach` that agreed with it by accident. It mishandled the generic form, returning `unwrapI3ptrE` for `_M3std9allocatorN6unwrapI3ptrE`, and the value-instance `K...E` form did not exist to it at all.
+
+There is now one `_demangle_awk` definition, prepended to both scanners' programs, and a scheme change needs exactly that one shell edit. It parses the module path as the run of length-prefixed segments it is, takes the name as the run after `N`, and drops the `I...E` / `K...E` instance suffix - which is what these per-source-function shape observables want, and is written down as a limit rather than left to be discovered.
 
 #### A C `[step]` cross-builds for its leg instead of silently assuming the host toolchain targets it (#2741)
 `int/surface/narrow-stack-args` and `int/surface/c-variadic` shelled out to the bare host `cc` to build a probe object, which happens to target the leg on every CI runner (each builds natively) but not on a developer cross-building locally - `mach --target linux-arm64` on an x86-64 host still ran the host's x86-64 `cc`, silently linking an x86-64 object into an aarch64 image. That surfaced as `error: relocation 'plt32' to 'float_tail' overflows` on narrow-stack-args and a qemu `Illegal instruction` on c-variadic, neither of which names its actual cause.
