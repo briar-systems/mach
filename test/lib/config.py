@@ -42,11 +42,11 @@ def _rows(path):
 
 class Target(object):
     __slots__ = ("name", "isa", "os", "abi", "of", "kind", "entry",
-                 "engine", "engine_cmd", "disasm", "runner", "note")
+                 "engine", "engine_cmd", "disasm", "runner", "cadence", "note")
 
     def __init__(self, fields, note):
         (self.name, self.isa, self.os, self.abi, self.of, self.kind,
-         self.entry, engine, self.disasm, self.runner) = fields
+         self.entry, engine, self.disasm, self.runner, self.cadence) = fields
         if ":" in engine:
             self.engine, self.engine_cmd = engine.split(":", 1)
         else:
@@ -73,16 +73,18 @@ def load_engines(path):
     targets = []
     seen = set()
     for lineno, line in _rows(path):
-        fields = line.split(None, 10)
-        if len(fields) != 11:
-            raise ConfigError("%s:%d: expected 11 columns, got %d" % (path, lineno, len(fields)))
-        t = Target(fields[:10], fields[10])
+        fields = line.split(None, 11)
+        if len(fields) != 12:
+            raise ConfigError("%s:%d: expected 12 columns, got %d" % (path, lineno, len(fields)))
+        t = Target(fields[:11], fields[11])
         if t.entry not in ("hosted", "direct", "freestanding"):
             raise ConfigError("%s:%d: entry must be hosted|direct|freestanding" % (path, lineno))
         if t.kind not in ("bin", "static"):
             raise ConfigError("%s:%d: kind must be bin|static" % (path, lineno))
         if t.engine not in ("native", "qemu", "none"):
             raise ConfigError("%s:%d: engine must be native|qemu:<cmd>|none" % (path, lineno))
+        if t.cadence not in ("pr", "main"):
+            raise ConfigError("%s:%d: cadence must be pr|main" % (path, lineno))
         if t.engine == "qemu" and not t.engine_cmd:
             raise ConfigError("%s:%d: engine qemu needs a command, e.g. qemu:qemu-riscv64" % (path, lineno))
         if t.name in seen:
