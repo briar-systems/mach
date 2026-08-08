@@ -97,6 +97,52 @@ as well as the unrolled body itself — is re-typed per monomorphized instance, 
 a `T` that instantiates to a secret is gated exactly as the secret spelled out
 in full would be.
 
+## Asking about secrecy at comptime
+
+`$is_secret(T)` folds true when `T` is `^`-qualified **at the outermost level**,
+and false otherwise. It is a type predicate like `$is_record` / `$is_union` /
+`$is_pointer`: comptime-only, valid as a `$if` / `$or` gate condition, answered
+per instantiation inside a generic. The full reference is in
+[comptime-intrinsics.md](comptime-intrinsics.md).
+
+It exists because secrecy was otherwise invisible to a library. Every other
+predicate asks about the shape *under* the `^` and so answers false for every
+secret, which makes `$is_record(^u64)` and `$is_record(u64)` the same answer — a
+reflection walk could only ever meet a secret field as a fallthrough it had to
+refuse. `$is_secret` is the positive question, and it is what lets `std.derive`
+decide rather than refuse: a formatter redacts a secret field, a hash refuses one
+(a data-dependent fold is a leak in the shape of a digest), and an equality picks
+the constant-time comparison instead of the early-out whose timing *is* the
+secret.
+
+```mach
+rec Session { id: u64; key: ^[32]u8; }
+
+$each f in $fields(Session) {
+    $if ($is_secret(f.type)) { }            # redact: no read of `key` is emitted
+    $or { render(s.[f]); }
+}
+```
+
+**Outermost only**, the same line the rest of the family draws:
+
+- `^*u8` is secret — the pointer *is* the secret, which is the shape the
+  welded-storage rules exist for
+- `*^u8` is **not** — a public address to secret storage. Ask
+  `$is_secret($pointee_of(f.type))` for the pointee
+- `[N]^u8` is not — a public array whose elements are secret
+- a record with a secret field is not — the **field** is, and that is where a
+  walk meets the question
+
+There is deliberately no transitive "contains a secret anywhere" query. The
+per-field question is the one a walk actually has, and answering the transitive
+one in its place would make the common case wrong: a formatter would redact a
+whole record over one field and could not say which.
+
+Note that a walk which skips a secret field is pinned by the flow rules rather
+than by convention — reading one into a public accumulator does not compile, so a
+walk that gates wrongly is a compile error, not a silent disclosure.
+
 ## Downgrade with `:^`
 
 `:^` is the only way to remove `^`. It produces a new public value and never
@@ -418,6 +464,7 @@ refused rather than assumed.
 ## See also
 
 - [types.md](types.md) — the compound type grammar `^` qualifies
+- [comptime-intrinsics.md](comptime-intrinsics.md) — `$is_secret` and the rest of the type-predicate family
 - [operators.md](operators.md) — the `::` / `:~` casts that preserve secrecy
 - [decorators.md](decorators.md) — the `#[oblivious]` decorator reference
 - [grammar.md](grammar.md) — the formal grammar of `^` and `:^`
