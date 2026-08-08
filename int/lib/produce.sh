@@ -2402,7 +2402,17 @@ produce_symtab() {
     # st_size must still resolve to burn - the check `st_size` is right, not just
     # present, and the one most likely to be skipped (a symbol table with entries
     # and no real sizes looks fine under `nm` and only fails a profiler later).
-    burn_line=$(readelf -sW "$b" 2>/dev/null | awk '/burn/ && / FUNC / { print; exit }')
+    # readelf -sW dumps EVERY symbol table in the file, and a shared object's
+    # `.dynsym` (#2807) carries the same global function with `st_size` always 0
+    # (that table has never had a size writer - out of this case's scope) ahead
+    # of `.symtab` in the listing; matching the first hit anywhere would silently
+    # grab the wrong table's zero-size entry and read as "no symbol" rather than
+    # the real fact under test, so the scan is confined to the `.symtab` table by
+    # its own "Symbol table '.symtab'" banner line.
+    burn_line=$(readelf -sW "$b" 2>/dev/null | awk -v want="'.symtab'" '
+        /^Symbol table / { insym = ($0 ~ want); next }
+        insym && /burn/ && / FUNC / { print; exit }
+    ')
     burn_val=$(printf '%s\n' "$burn_line" | awk '{ print $2 }')
     burn_size=$(printf '%s\n' "$burn_line" | awk '{ print $3 }')
     if [ -n "$burn_val" ] && [ -n "$burn_size" ] && [ "$burn_size" -gt 0 ]; then
