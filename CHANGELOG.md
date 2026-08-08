@@ -110,6 +110,36 @@ Measured on x86-64, release, a loop of 3M iterations over store / load / fetch_a
 Carrying an `asm` body across the clone is the other half, and it is the design from draft PR #2678 rebased onto current `dev` and re-measured: `ir.clone_asm_payload` copies an `OP_ASM`'s `Function.asm_blocks` entry onto the clone, remapping the map key and each `{name}` binding's alloca, and deep-copying the bindings array since `module_dnit` frees it per `OP_ASM`. `instruction:asm_is_at_least_as_conservative_as_call` pins the property the whole change rests on: inlining removes the CALL and leaves the `OP_ASM`, so the ordering an atomic relies on survives only because `is_pure` excludes both.
 
 Two new integration cases, because one of them cannot see the feature: `2231-cross-module-inline-asm` checks every value at both profiles on all three ISAs and passes identically against a compiler that does no cross-module inlining at all, which is the point. `2231-cross-module-inline-shape` reads the **emitted call count** per function through a new `call-shape` producer, and against `dev` it reports `calls=1` on exactly the two lines that are the feature while `#[noinline]` and undecorated callees keep their calls. Memory orderings are untouched and remain sequential consistency everywhere.
+#### BREAKING: `riscv64` is a family of ABIs, `lp64` now means soft float, and the linux default is `lp64d` (#2777)
+
+Mach declared exactly one RISC-V calling convention, named `lp64`. It did not implement lp64. It implemented **lp64d**: a scalar `double` was placed in `fa0`, which is the hard-float rule. The name said soft float and the emitted calls were hard float, so nothing you could read in a manifest described the code that came out, and any judgement about interop made from `abi = "lp64"` was made from a name that was wrong. The riscv64 leg never caught it because it runs under qemu against mach's own code and links nothing foreign, so caller and callee were consistently wrong together.
+
+`abi/lp64.mach` is replaced by `abi/riscv.mach`, which implements the psABI family once. A member is a `RiscvAbi` descriptor of declared facts (XLEN, FLEN, the integer register file size, the argument-register counts) and a single shared classifier reads them, so there is no per-member branch anywhere and adding a member is a descriptor plus a `register` call. Three members ship:
+
+| abi | float arguments |
+|---|---|
+| `lp64` | soft float, every float in an integer register |
+| `lp64f` | `f32` in `fa0`-`fa7`, `f64` in the integer bank |
+| `lp64d` | `f32` and `f64` in `fa0`-`fa7` |
+
+The whole float-argument rule is one comparison against the member's declared FLEN (`width * 8 <= flen_bits`), so soft float is that rule at zero rather than a second code path, and `lp64f` — the member a hard/soft boolean cannot describe at all — costs nothing. `lp64e` and the `ilp32` family are described by the same contract and deliberately **not** registered: each needs a base ISA that does not exist yet (a 16-register RV64E file, or `ARCH_RISCV32`, #2778), and a convention registered without an ISA that can back it would compile and emit calls the hardware cannot make.
+
+**The linux default for riscv64 is now `lp64d`**, which is what `riscv64-linux-gnu` means by "riscv64". This is the interop-correct default: every riscv64 Linux distribution is built on lp64d, so a mach object under any other member passes a double in `a0` where every system library expects it in `fa0` — a mismatch that produces wrong values rather than a link error. Freestanding also defaults to `lp64d`, matching the psABI its ISA declares; a bare-metal image that leaves the FPU off should now spell `abi = "lp64"`, which is finally a real convention rather than a name that emitted hard-float code anyway.
+
+An ABI that needs a float extension the target lacks is now **refused when the target resolves**, naming both sides and both widths, rather than emitting code that cannot execute. The ISA declares what it has (`MachineModel.flen_bits`) and the convention declares what it needs (`AbiVTable.float_arg_bits`), and the gate is those two declared widths compared — so it covers a new convention or a new ISA with no table of names. `lp64q`, which needs the Q extension rv64gc does not have, is refused on this path; `lp64d` composes on the same one.
+
+Manifests spelling `abi = "lp64"` for riscv64 keep building, but now select **soft float** and emit different code. Change them to `abi = "lp64d"` to keep the previous behaviour; every manifest in this repository was updated.
+
+C-variadic calls are **refused on every RISC-V member** rather than placed. The psABI's unnamed-argument rule differs per member (a tail `double` takes `a0` under lp64d where a named one takes `fa0`, and the soft-float members differ again), so implementing it would multiply the family's descriptions rather than add to them, for a call form with no user in mach or mach-std. `RiscvAbi.variadic_float_bits` is declared and carries a sentinel so the rule can be filled in later alongside the others; a refusal is exact and cheap to replace, a wrong placement rule is neither. mach's own `va: ...` parameter pack is a different mechanism, expands at compile time, and is unaffected.
+
+### Fixed
+
+#### A scalar `f32` passed in an integer register read back as `NaN` on riscv64 (#2777)
+
+`capture_slot_reg` took the move width for a value captured out of an incoming argument or return register from the machine word rather than from the value, so an `f32` arriving in `a0` was reinterpreted with `fmv.d.x` (a raw 64-bit move) instead of `fmv.w.x`. RISC-V requires a single-precision value in an `f` register to be NaN-boxed, and the raw move does not box, so every subsequent `fmul.s`/`fadd.s` on it produced `NaN`. The placement side already took its width from the value, so the two directions were asymmetric — which is why `f64` in an integer register was correct (its width happened to equal the machine word) and `f32` in an `fa` register was correct (it never took the integer path).
+
+Only reachable once a soft-float member existed, so it was latent rather than a regression. It is the first defect found by the width-versus-register-width split that #2778 exists to stress.
+
 #### A release build now carries a real ELF `.symtab`, so `perf` and a crash reporter can resolve a function name without a `-g` rebuild (#2772)
 Mach emitted no `.symtab` in any build, release or `-g`: `nm` reported nothing, `perf` could not symbolize a profile, and a crash address from a shipped binary mapped to a function only by rebuilding with `-g` and doing a DWARF lookup against the exact matching build - two ordinary workflows a shipping game needs, neither possible before this.
 
