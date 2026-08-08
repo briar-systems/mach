@@ -42,6 +42,7 @@ use std.sync.atomic;
 use std.sync.thread;
 
 use mach.lang.be.codegen;
+use mach.lang.be.codegen.unit;
 use mach.lang.be.obj;
 use mach.lang.build.outcome;
 use mach.lang.build.qctx;
@@ -67,6 +68,7 @@ use mach.lang.readout;
 use mach.lang.session;
 use src: mach.lang.source;
 use mach.lang.target;
+use mach.lang.target.isa;
 use mach.lang.target.of;
 use mach.lang.type;
 
@@ -1741,6 +1743,166 @@ pub fun run_codegen_pass(p: *project.Project) R.Result[bool, outcome.Fail] {
     ret R.ok[bool, outcome.Fail](true);
 }
 
+# the modules a whole-module target must be able to draw called bodies from
+#
+# THE DRIVER'S HALF OF THE EMISSION UNIT (#2823). A whole-module emitter has no
+# linker behind it: a call leaving the mach module has to be answered by emitting
+# the callee's body into the same output, so the callee's IR must be in codegen's
+# input. Deciding which modules those are is a question about the MODULE GRAPH,
+# which is this layer's to answer; deciding what inside them is emitted is a
+# question about the call graph, which is the emitter's.
+#
+# The closure is over SYMBOLS ACTUALLY REFERENCED, not over imports. Lowering
+# every module a shader can see would pay for the whole import tree on every
+# shader, and the middle end already narrows it for us: a cross-module callee gets
+# a body-less `FN_FLAG_EXTERN` declaration in the referencing module only at the
+# call site that needs it, so the extern declarations ARE the reference set. A
+# genuine foreign import (`ext fun`, `is_import`) is deliberately not followed - no
+# mach module defines it, and a self-contained module cannot call it at all, which
+# the emitter refuses by name.
+#
+# The walk is a fixpoint rather than one pass, because a body pulled in for the
+# root may itself call across another boundary. Output is in the build's topo
+# order, so the unit - and therefore the emitted module's id numbering - is
+# deterministic for a given input.
+#
+# A register-machine target gets the empty set: it has a linker, and lowering a
+# module it will not emit would be waste.
+# ---
+# p:   the active project; supplies the module graph and each module's lowered IR
+# mid: the module being codegen'd - the unit's root, never in the result
+# a:   allocator for the returned arrays; the caller releases with `sources_dnit`
+# ret: the source set to hand codegen, or an allocation error
+pub fun code_sources(p: *project.Project, mid: session.ModuleId, a: *A.Allocator) R.Result[CodeSources, str] {
+    if (!isa.emits_whole_module(p.target.isa)) { ret R.ok[CodeSources, str](sources_empty()); }
+    val n: u32 = p.module_len;
+    if (n == 0) { ret R.ok[CodeSources, str](sources_empty()); }
+
+    val rm: R.Result[*bool, str] = A.allocate[bool](a, n::usize);
+    if (R.is_err[*bool, str](rm)) { ret R.err[CodeSources, str](R.unwrap_err[*bool, str](rm)); }
+    val mark: *bool = R.unwrap_ok[*bool, str](rm);
+    var i: u32 = 0;
+    for (i < n) { mark[i] = false; i = i + 1; }
+    mark[mid::u32] = true;
+
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        i = 0;
+        for (i < n) {
+            if (!mark[i]) { i = i + 1; cnt; }
+            val im: *ir.Module = p.modules[i].ir_module;
+            if (im == nil) { i = i + 1; cnt; }
+            var fi: u32 = 0;
+            for (fi < im.function_len) {
+                val fn: *ir.Function = ?im.functions[fi];
+                if ((fn.flags & ir.FN_FLAG_EXTERN) == 0 || fn.is_import) { fi = fi + 1; cnt; }
+                val def: u32 = definer_of(p, fn.name);
+                if (def != n && !mark[def]) { mark[def] = true; changed = true; }
+                fi = fi + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    var count: u32 = 0;
+    i = 0;
+    for (i < n) { if (mark[i] && i != mid::u32 && p.modules[i].ir_module != nil) { count = count + 1; } i = i + 1; }
+    if (count == 0) {
+        A.deallocate[bool](a, mark, n::usize);
+        ret R.ok[CodeSources, str](sources_empty());
+    }
+
+    var cs: CodeSources = sources_empty();
+    val rs: R.Result[**ir.Module, str] = A.allocate[*ir.Module](a, count::usize);
+    if (R.is_err[**ir.Module, str](rs)) {
+        A.deallocate[bool](a, mark, n::usize);
+        ret R.err[CodeSources, str](R.unwrap_err[**ir.Module, str](rs));
+    }
+    cs.set.mods = R.unwrap_ok[**ir.Module, str](rs);
+    val ri: R.Result[*session.ModuleId, str] = A.allocate[session.ModuleId](a, count::usize);
+    if (R.is_err[*session.ModuleId, str](ri)) {
+        A.deallocate[*ir.Module](a, cs.set.mods, count::usize);
+        A.deallocate[bool](a, mark, n::usize);
+        ret R.err[CodeSources, str](R.unwrap_err[*session.ModuleId, str](ri));
+    }
+    cs.ids = R.unwrap_ok[*session.ModuleId, str](ri);
+    cs.cap = count;
+
+    var ti: u32 = 0;
+    for (ti < p.topo_len) {
+        val tid: u32 = p.topo[ti]::u32;
+        if (mark[tid] && tid != mid::u32 && p.modules[tid].ir_module != nil && cs.set.len < count) {
+            cs.set.mods[cs.set.len] = p.modules[tid].ir_module;
+            cs.ids[cs.set.len]      = p.topo[ti];
+            cs.set.len = cs.set.len + 1;
+        }
+        ti = ti + 1;
+    }
+    A.deallocate[bool](a, mark, n::usize);
+    ret R.ok[CodeSources, str](cs);
+}
+
+# the modules one whole-module emission draws code from, as the driver names them
+#
+# Two views of one answer: `set` is what codegen consumes, `ids` the same members
+# as module ids so the caller can record the incremental dependency on each one's
+# lowered IR. They are parallel and the same length; `cap` is the allocation's
+# length, which equals `set.len` by construction and is what the release frees.
+# ---
+# set: the IR modules, in topo order
+# ids: the same modules' ids, parallel to `set.mods`
+# cap: the arrays' allocated length
+pub rec CodeSources {
+    set: unit.IrSet;
+    ids: *session.ModuleId;
+    cap: u32;
+}
+
+# a source set naming nothing
+pub fun sources_empty() CodeSources {
+    var cs: CodeSources;
+    cs.set = unit.ir_set_empty();
+    cs.ids = nil;
+    cs.cap = 0;
+    ret cs;
+}
+
+# release the arrays `code_sources` returned
+# ---
+# a:  the allocator it was built with
+# cs: the source set (emptied)
+pub fun sources_dnit(a: *A.Allocator, cs: *CodeSources) {
+    if (cs.cap > 0) {
+        if (cs.set.mods != nil) { A.deallocate[*ir.Module](a, cs.set.mods, cs.cap::usize); }
+        if (cs.ids != nil)      { A.deallocate[session.ModuleId](a, cs.ids, cs.cap::usize); }
+    }
+    cs.set.mods = nil;
+    cs.set.len  = 0;
+    cs.ids      = nil;
+    cs.cap      = 0;
+}
+
+# the index of the loaded module that DEFINES a function symbol, or module_len
+#
+# A mach function's link name is module-path mangled and so globally unique, which
+# is what makes a single scan the whole answer: at most one loaded module carries a
+# body for it. A name nothing defines (a foreign symbol, or a module outside this
+# build) reports "none" and is left for the back end to refuse in its own terms.
+# ---
+# p:    the active project
+# name: the interned link name
+# ret:  the module index, or p.module_len when nothing defines it
+fun definer_of(p: *project.Project, name: intern.StrId) u32 {
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        val im: *ir.Module = p.modules[i].ir_module;
+        if (im != nil && unit.defined_index(im, name) != unit.UNIT_NONE) { ret i; }
+        i = i + 1;
+    }
+    ret p.module_len;
+}
+
 # fetch module `mid`'s ObjectImage through Q_CODEGEN - computed fresh when its
 # optimized IR changed, reused otherwise - and borrow it onto the ModuleEntry. the
 # image is owned by the query DB; m.object_image only points at it
@@ -1790,6 +1952,27 @@ pub fun q_codegen_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.R
     val rt: R.Result[bool, str] = query.record_dep(db, query.Q_CODEGEN, key, query.Q_TARGET, 0);
     if (R.is_err[bool, str](rt)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rt)); }
 
+    # a whole-module target emits the bodies it calls across module boundaries into
+    # its own output (#2823), so this module's image depends on the LOWERED IR of
+    # every module it draws one from - not only its own. Without these edges an
+    # incremental build would hand back an image built from a stale copy of a shared
+    # shader helper. Recorded before the staged-image adoption below, so a pooled
+    # build records the same dependency graph a serial one does.
+    val srcs_r: R.Result[CodeSources, str] = code_sources(p, mid, s.alloc);
+    if (R.is_err[CodeSources, str](srcs_r)) { ret R.err[query.QueryOutput, str](R.unwrap_err[CodeSources, str](srcs_r)); }
+    var srcs: CodeSources = R.unwrap_ok[CodeSources, str](srcs_r);
+    var di: u32 = 0;
+    for (di < srcs.set.len) {
+        val dm: *project.ModuleEntry = ?p.modules[srcs.ids[di]::u32];
+        val rd: R.Result[bool, str] = query.record_dep(db, query.Q_CODEGEN, key, query.Q_LOWER,
+                                                       back_half_key(dm.stable_id, test_build(p)));
+        if (R.is_err[bool, str](rd)) {
+            sources_dnit(s.alloc, ?srcs);
+            ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rd));
+        }
+        di = di + 1;
+    }
+
     # the parallel-codegen prelude may already have built this module's image (across
     # a worker pool) and staged it, re-homed onto the session allocator and remapped
     # into the session interner. adopt it as this query's value instead of
@@ -1798,16 +1981,21 @@ pub fun q_codegen_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.R
     val staged: *of.ObjectImage = m.staged_image;
     if (staged != nil) {
         m.staged_image = nil;
+        sources_dnit(s.alloc, ?srcs);
         ret image_handle_encode(alloc, staged);
     }
 
     val dbg_r: R.Result[codegen.DebugInfo, str] = debug_info_of(p);
-    if (R.is_err[codegen.DebugInfo, str](dbg_r)) { ret R.err[query.QueryOutput, str](R.unwrap_err[codegen.DebugInfo, str](dbg_r)); }
+    if (R.is_err[codegen.DebugInfo, str](dbg_r)) {
+        sources_dnit(s.alloc, ?srcs);
+        ret R.err[query.QueryOutput, str](R.unwrap_err[codegen.DebugInfo, str](dbg_r));
+    }
 
     # the serial path's `-vv` item: this is where a module the pool did not build
     # is actually generated, so this is where its cost can be measured (#2816).
     val t_cg: ctime.Time = readout.item_begin(p.events);
-    val res_cg: R.Result[of.ObjectImage, str] = codegen.codegen_module(s, ?p.target, irmod, nil, R.unwrap_ok[codegen.DebugInfo, str](dbg_r));
+    val res_cg: R.Result[of.ObjectImage, str] = codegen.codegen_module(s, ?p.target, irmod, srcs.set, nil, R.unwrap_ok[codegen.DebugInfo, str](dbg_r));
+    sources_dnit(s.alloc, ?srcs);
     if (R.is_err[of.ObjectImage, str](res_cg)) { ret R.err[query.QueryOutput, str](R.unwrap_err[of.ObjectImage, str](res_cg)); }
     readout.item(p.events, readout.PH_CODEGEN, project.fqn_name(p, m.fqn), t_cg);
     var img: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](res_cg);
