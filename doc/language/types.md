@@ -141,53 +141,57 @@ lane-wise operators and the comparison-to-mask rule are in
 vector operator is the `simd` profile lever ([manifest.md](manifest.md),
 [policy.md](policy.md)).
 
-## Image and sampler handles
+## Handles
 
-A shader reads a texture through a **handle**: a name for a descriptor the pipeline
-binds, not a value with storage. Like a vector, a handle type is a **form** rather
-than a fixed list:
+A **handle** is a type whose representation is not the program's: the owning target
+mints it and the pipeline binds it. A shader reads a texture through one.
 
+The language knows only the machinery. A handle is a **bodyless `def`** carrying
+`#[handle(target, constructor, operands...)]`, and which constructors exist, what
+operands each takes, and what an operand means all belong to the named target:
+
+```mach
+#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED)]
+pub def Texture2D;
+
+#[handle("spirv", "sampled_image", Texture2D)]
+pub def Sampler2D;
+
+#[handle("spirv", "sampler")]
+pub def Sampler;
 ```
-[i|u] ("sampler" | "texture" | "image") <dim> ["ms"] ["array"] ["shadow"]
-"sampler"
-```
 
-with `<dim>` one of `1d`, `2d`, `3d`, `cube`, `rect`, `buffer`, `subpass`. The
-leading `i` / `u` picks the scalar texels are sampled as (`f32` by default); the
-suffixes read in GLSL's own order, so `isampler2DMSArray` is `isampler2dmsarray`.
+`def` is the carrier because it already means "this name denotes a type" and
+promises no fields and no storage, which is exactly what a handle is. There is no
+body because the target supplies the definition.
 
-| spelling | what it is |
-|---|---|
-| `sampler2d` | a combined sampled image — one descriptor |
-| `texture2d` | an image with no sampler, bound separately |
-| `sampler` | a sampler with no image, bound separately |
-| `isampler2d` / `usampler2d` | integer-sampled images |
-| `sampler2darray` | array-layer image |
-| `sampler3d`, `sampler1d`, `samplercube`, `samplercubearray` | the other dimensionalities |
+The operands are ordinary comptime constants. One position is not: a constructor
+that composes over another handle takes a **type name**, so `Sampler2D` names the
+image it wraps rather than restating that image's operands and cannot disagree with
+it. That is the only place a decorator argument is read as a type.
 
-Handles are **declared with `#[sampler(set, binding)]`** and nothing else — see
-[decorators.md](decorators.md) for how one is bound and sampled. A handle cannot
-sit behind a pointer, inside an array, or in a local binding: it names a
-descriptor rather than an object with an address, and SPIR-V forbids storing an
-image, sampler or sampled-image object at all.
+Every rule a handle carries follows from the one fact the directive states, and the
+set is fixed and closed rather than varied per declaration:
 
-A handle spelling is recognized only in **type position**, and reserves the name
-against a `rec` / `uni` / `def`, on exactly the terms a vector spelling does.
+- no fields, no indexing, no construction
+- it cannot be a local binding
+- it cannot be a record or union field
+- it cannot sit behind a pointer or inside an array
+- it reaches an operation only by being passed to one, bound as a descriptor
+- its extent is declared by the owning target
 
-Several well-formed spellings are **read and refused by name**, so they cannot be
-half-supported and cannot be claimed later by an unrelated declaration. Each error
-names the member it refused:
+`$size_of` a handle is the target's pointer size: it is a name for a resource, and
+a pointer is the shape every target already has for that. On a target that mints no
+such type the declaration is **inert**: it still denotes a type and still sizes, and
+an operation over it is an undefined symbol at link.
 
-- `...shadow` — depth-comparison sampling, which needs `OpImageSampleDref*` and a
-  reference value.
-- `...ms` — a multisampled image is fetched per sample, not sampled.
-- `rect`, `buffer`, `subpass` — dimensionalities needing further capabilities and
-  a different read path.
-- `image...` — a read-write storage image, which carries an image format and is
-  read and written rather than sampled.
+A target refuses an operand combination its constructor spells but it cannot emit,
+naming the operand rather than the declaration. The SPIR-V target refuses a
+non-zero `Depth`, a non-zero `MS`, a `Dim` past `Cube`, and a `Sampled` other than
+`1`, each with what SPIR-V would need instead.
 
-`$size_of` a handle is the target's pointer size: it is a name for a resource,
-and a pointer is the shape every target already has for that.
+See [decorators.md](decorators.md) for `#[handle]` and `#[sampler(set, binding)]`,
+and the shader library for the handles a SPIR-V target declares.
 
 ## Pointer
 
