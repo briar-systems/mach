@@ -2209,6 +2209,134 @@ produce_debuginfo() {
     done
 }
 
+# produce_gdb_session <runmode> <target> <nog_binary> <g_binary>
+# the BEHAVIOURAL debugger observable (#2756): int/surface/debuginfo proves the `-g`
+# image is structurally valid; it cannot prove gdb reports the right thing when a
+# user actually breaks into it. this producer drives one real `gdb --batch` session
+# over the `-g` artifact and normalizes its transcript into stop/frame/value facts -
+# every one of them read off the fixture by hand before it went into the golden (see
+# int/surface/debugger-gdb/src/main.mach and case.conf for the arithmetic).
+#
+# a missing gdb is a hard error, the same contract produce_debuginfo already uses for
+# its own validators (llvm-dwarfdump, addr2line, ...): every runner this case's
+# case.conf names (`linux` only - see that file for why the others are not) is
+# expected to carry one, so a silent skip would hide a real coverage gap instead of
+# reporting it.
+#
+# gdb's own text is not the observable: it carries a pid in the exit line, a
+# `Breakpoint N` or `Breakpoint N.M` counter that depends on how many candidate
+# addresses gdb resolved for a source line (an inlined body and its dead out-of-line
+# twin both claim the same line, so this varies between profiles for reasons that
+# have nothing to do with correctness), and - a real gap this case does NOT assert
+# on - the caller frame's OWN argument list, which this compiler currently populates
+# from unrelated inlined locals rather than `main`'s real parameters (found while
+# building this case; tracked separately, not asserted here because it is not what
+# #2756 asks this case to prove). the gdb script below prints a `SENTINEL:<name>`
+# echo ahead of each fact so the normalizer below can key off it instead of gdb's own
+# formatting, and extracts only the function name and source line from a frame
+# line, never its argument list.
+produce_gdb_session() {
+    g=$4
+    command -v gdb >/dev/null 2>&1 || {
+        echo "int: gdb-session: gdb not found (install the 'gdb' package)" >&2; return 2
+    }
+
+    gdbtmp=$(mktemp -d)
+    script=$gdbtmp/session.gdb
+    cat >"$script" <<'GDBEOF'
+set debuginfod enabled off
+set pagination off
+break main.mach:11
+break main.mach:20
+break main.mach:27
+run
+echo SENTINEL:addone_stop\n
+frame 0
+echo SENTINEL:addone_v\n
+print v
+echo SENTINEL:addone_caller\n
+frame 1
+continue
+continue
+continue
+continue
+continue
+echo SENTINEL:accum_total\n
+print total
+echo SENTINEL:accum_i\n
+print i
+echo SENTINEL:step1\n
+step
+echo SENTINEL:step2\n
+step
+delete 2
+continue
+echo SENTINEL:dead_stop\n
+frame 0
+echo SENTINEL:dead_v\n
+print v
+echo SENTINEL:dead_unused\n
+print unused
+echo SENTINEL:dead_caller\n
+frame 1
+continue
+GDBEOF
+
+    transcript=$gdbtmp/transcript.txt
+    gdb --batch -q -x "$script" "$g" >"$transcript" 2>&1
+
+    # the program's own stdout is ground truth for the values gdb is asked to read
+    # back: a=addone's result, b=accumulate's, c=deadlocal's. cross-checking it
+    # against the golden's hand-computed values is what would catch a normalizer
+    # bug that made every gdb-side assertion vacuously agree with itself.
+    stdout=$(grep -E '^[abc]=[0-9]+$' "$transcript" | paste -sd, -)
+    echo "program_stdout=$stdout"
+    if grep -q 'exited normally' "$transcript"; then
+        echo "exit=normal"
+    else
+        echo "exit=abnormal"
+    fi
+
+    # state machine over the transcript: a `SENTINEL:<name>` line names the fact the
+    # NEXT matching line carries. frame lines (`_stop`/`_caller`) yield two facts,
+    # function and line, deliberately excluding the argument list (see header). a
+    # `print` result is the text after `$N = `. a `step` target is the source line
+    # number gdb echoes ahead of the line's own text.
+    cur=
+    while IFS= read -r line; do
+        case "$line" in
+            SENTINEL:*) cur=${line#SENTINEL:}; continue ;;
+        esac
+        [ -n "$cur" ] || continue
+        case "$cur" in
+            *_stop|*_caller)
+                m=$(printf '%s\n' "$line" | sed -E -n 's/^#[01]  (0x[0-9a-f]+ in )?([A-Za-z_][A-Za-z0-9_]*) \(.*\) at .*:([0-9]+)$/\2 \3/p')
+                if [ -n "$m" ]; then
+                    echo "${cur}_func=${m% *}"
+                    echo "${cur}_line=${m#* }"
+                    cur=
+                fi
+                ;;
+            step1|step2)
+                m=$(printf '%s\n' "$line" | sed -E -n 's/^([0-9]+)\t.*/\1/p')
+                if [ -n "$m" ]; then
+                    echo "${cur}_line=$m"
+                    cur=
+                fi
+                ;;
+            *)
+                m=$(printf '%s\n' "$line" | sed -E -n 's/^\$[0-9]+ = (.*)$/\1/p')
+                if [ -n "$m" ]; then
+                    echo "${cur}=$m"
+                    cur=
+                fi
+                ;;
+        esac
+    done <"$transcript"
+
+    rm -rf "$gdbtmp"
+}
+
 # resolve_objdump — print an llvm-objdump on PATH, preferring the unversioned name
 # and falling back to the highest-versioned one (ubuntu ships llvm-objdump-NN, from
 # the same `llvm` package as llvm-dwarfdump). llvm-objdump decodes every ISA mach
@@ -2855,6 +2983,7 @@ produce() {
         flat-loader) produce_flat_loader "$@" ;;
         built)       produce_built "$@" ;;
         debuginfo)   produce_debuginfo "$@" ;;
+        gdb-session) produce_gdb_session "$@" ;;
         spirv-val)   produce_spirv_val "$@" ;;
         spirv-val-vulkan) produce_spirv_val_vulkan "$@" ;;
         spirv-shader) produce_spirv_shader "$@" ;;
