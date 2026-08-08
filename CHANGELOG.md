@@ -92,6 +92,13 @@ A SPIR-V execution model has no call stack, so a cycle in the static call graph 
 
 The parameter limit was two independent literals that disagreed: `emit_function` refused above 16 while `type_fn`'s fixed operand buffer failed above 14 and returned a 0 nobody read, which reached `OpFunction` as the reserved never-valid id. The limit is now stated once as `types.MAX_FN_PARAMS`, both sites read it, 15 and 16 parameters build and validate, and a 0 from `type_fn` is reported instead of passed on.
 
+#### A loop-carried vector accumulator through an unpacked operator came out holding the wrong value (#2749)
+The gap expansion (#2726) replaces a vector operator the target has no packed form for with per-lane scalar work and an assembled vector, then points that operator's uses at the assembled value. It rewrote those uses one block at a time, immediately after expanding that block's body. That is correct for every use that follows its definition, and wrong for the one that does not: a loop header's phi names the value the **latch** defines, so its back-edge operand is a forward reference no block order removes.
+
+The phi kept naming the deleted operator. MIR lowering turned the phi edge into a copy from a virtual register nothing defines, and the accumulator came out holding whatever that register happened to be. Measured on x86-64, a loop-carried `i32x4 * i32x4` returned the **multiplier** where the product belonged. aarch64 was right throughout for a reason unrelated to the defect - NEON has `MUL.4s`, so nothing expands there at all - which is why an entire suite of straight-line vector cases passed on every leg while this was live. The lane-access expansion had the identical defect one pass over.
+
+Substitution is now a whole-function step in both passes, after every block has been expanded, because the ordering it needs does not exist.
+
 #### A float or integer memory access refuses a width the target has no form for (#2766)
 A memory access takes a byte width and picks a machine form from it. On aarch64 and riscv64 that pick was a boolean selector with a trailing default, so a width the target has no form for silently got some other form's bytes rather than a diagnostic, the same shape #2733 removed from the float move, negate, arithmetic, compare and conversion encoders, one family over.
 
@@ -102,6 +109,47 @@ The fix is a contract change on the access family, not a check at today's caller
 The census found the same defect on **x86-64**, which the issue did not name: `emit_float_load`, `emit_float_reg_or_slot_load`, `emit_float_store` and `float_const_operand` each read `mov_op = MOVSD; if (w == 4) { mov_op = MOVSS; }`, so every width other than 4 took the eight-byte MOVSD. It was inert only because `encode_fp_mov` returns its vector arm above them. Nothing in the helpers said so, and `emit_float_load` is reached separately by the arithmetic and seed paths. aarch64's `emit_fp_const` carried the same `use64 = width == 8`.
 
 Every refusal is **driven from a unit test** with a width it must refuse, and the assertion is that the output buffer stayed **empty**, not merely that an error was returned. That distinction is load-bearing here: both `emit_mem_access` implementations materialize an out-of-range offset into the scratch register before the access word, and a folded global emits its `adrp` / `auipc` high half before the low one, so a check placed at the emission point rather than at the top would leave stranded instructions behind the error. Every legitimate width still encodes byte-exactly against `llvm-mc`, including aarch64's Q form at 16 and the sub-word integer forms at 1 and 2 that share the same helpers.
+### Changed
+
+#### The realization authority answers a lane-count ceiling as well as a lane width (#2749)
+`isa.packed_width` answers a question keyed on the lane **width**, and a SPIR-V Shader module's constraint is a lane **count**: `OpTypeVector` takes 2, 3 or 4 components at every element type. For 8-bit lanes the authority reported a 128-bit packed form, meaning sixteen lanes, which no Shader module may declare - so the authority and the emitter gave different answers about the same shape, and the emitter refused `i8x16`, `u8x16`, `i16x8` and `u16x8` by name.
+
+Under #2488 a vector type and a lane-wise operator are legal on **every** target and only the realization varies, so a refusal was the wrong answer. The machine model gains `max_vector_lanes`, folded into the authority so no caller consults two facts and picks the wrong one: every machine target declares no ceiling and its answers are unchanged, asserted rather than assumed; SPIR-V declares four, so 8-bit lanes report a 32-bit packed form and a wider shape takes the scalar expansion. The four by-name refusals are deleted rather than left unreachable, and a vector past the ceiling is realized as an `OpTypeArray` of its lanes - the logical-addressing analogue of a machine target splitting a vector across registers.
+
+`simd = "require"` now names the lane count as well as the lane width, because a target can pack the same operation at one count and scalarize it at another.
+
+The vectorizer takes its lane count from the same authority instead of `16 / element-bytes`, so it cannot form a shape the target would immediately take apart again.
+
+#### Sub-word integer arithmetic on SPIR-V produced a module no consumer accepts (#2749)
+The 4-byte ALU floor is a **register machine's** contract: a sub-word operation leaves the bits above its width undefined, and a spill saves the whole word, so computing narrower would persist residue. SPIR-V has no register file, and its arithmetic opcodes are typed - so computing an 8-bit add at 32 bits emitted an `OpIAdd` whose operand and result types disagree, which `spirv-val` rejects. Any `i8` or `i16` arithmetic reached it.
+
+The floor is now a declared model fact (`alu_min_width`) rather than a constant with two derivations layered on it: 4 on a register machine, 1 on the 8-bit 6502 whose word is one byte, and 1 where there is no register file at all. Machine-target output is byte-identical.
+
+A scalar comparison feeding arithmetic is likewise reconciled: SPIR-V's comparison yields a boolean with no numeric representation, which per-lane mask construction needs as a 0/1 value. That is the scalar counterpart of the `OpSelect` widening a lane-wise compare's mask already used.
+
+### Changed
+
+#### A float literal narrowed to `f32` is folded at its own width (#2752)
+A float literal is carried as a comptime `f64` bit pattern from the lexer onward, so an `f64` constant narrowed by an explicit `::f32` reached the back end as a double-width materialization plus a runtime convert. Two instructions, and on x86-64 an FP scratch register, for a value known at compile time. `me.pass.constfold` now folds an `FP_TRUNC` whose operand is a `VAL_CONST_FLOAT` into the constant.
+
+The fold is a **retype**, not a value change. A `VAL_CONST_FLOAT` carries its `f64` pattern whatever its type says, and the back end reads the width off the type: `lower_value` narrows through `f64_to_f32_bits` at width 4, exactly as `pack_globals` already did for a module-scope global. So this moves *when* the round-to-nearest-even happens, not what it rounds, and nothing downstream can double-round it either, because every float fold in the pass is gated on `is_f64` and an `f32`-typed constant is inert there.
+
+The **widening** is deliberately not folded, and a test pins that. An `f32`-typed constant still carries the unrounded `f64` pattern, so retyping it to `f64` would produce the double nearest the literal where the machine produces the double nearest the `f32`. That is a value change, and folding it correctly needs a narrow-then-widen round trip through a single-to-double conversion `float` does not have.
+
+Measured on a six-kernel `f32` micro-benchmark covering the ways a narrowing can arise, release profile, `#[noinline]` on every kernel:
+
+| target | kernel instructions | constant-pool symbols |
+| --- | --- | --- |
+| x86-64 | 30 to 24 | 4 to 3 |
+| aarch64 | 33 to 30 | 2 to 1 |
+| riscv64 | 33 to 30 | 3 to 1 |
+
+`int/surface/float-emit` moves on every target, and the movement is the residual its own commentary already named: `main` goes 2 to 0 on x86-64, which is exactly the `CVTSD2SS` and the scratch load feeding it, and 6 to 4 on aarch64 and riscv64, the same pair spelled as a constant materialization into the FP scratch plus the `FCVT` that read it.
+
+Two things the issue expected turned out not to need changing. The front end already types a suffixed or contextually-typed literal at `f32` directly, so `x * 0.1f32`, `x * 0.1` in an `f32` context and `val k: f32 = 0.1` never produced an `FP_TRUNC` at all; only an explicit `::f32` of an `f64`-typed value did. And `fe.comptime` needed no matching fold, because a `val` initializer, an array element and a record field are already narrowed at their own width when the global is packed, which the emitted `.rodata` bytes confirm.
+
+This also makes the constant pool's four-byte `CONST_F32` entry reachable from source for the first time.
+
 
 ## [4.16.0] - 2026-08-08
 
