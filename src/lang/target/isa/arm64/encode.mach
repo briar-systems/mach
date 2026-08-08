@@ -1603,8 +1603,24 @@ fun emit_movewide_seq(st: *encode.EncodeState, rd: u32, value: u64, use64: bool)
 # physical register survives to encode; a surviving virtual register is a register-
 # allocation bug. a memory operand reaches the dedicated load/store/address paths,
 # never this register-operand resolver, so it too is rejected loudly here
+#
+# THE CLASS IS CHECKED, NOT ASSUMED (#2838). `regid_index` strips the class tag, so a
+# vector operand resolved here would come back as the GP register that ALIASES its
+# index - `v2` as `x2` - and encode a real instruction over unrelated data. That is
+# precisely the failure the composite register id exists to prevent (see `isa.mach`'s
+# note on REG_CLASS_ID_*), and x86-64's `encode_mem_operand` already enforces it for
+# addressing registers. It went unchecked here, and a lowering change that sent a
+# vector value down a general-purpose path (#2716's direct sub-width vector store to a
+# global) was miscompiled silently rather than refused.
+#
+# A caller that legitimately handles both banks dispatches on `reg_is_vec` BEFORE
+# resolving. An unchecked precondition in a resolver is the defect; a stale comment
+# asserting one is how it recurs.
 fun req_gpr(op: *mir.MirOperand) R.Result[i32, str] {
     if (op.kind == mir.MIR_OP_PREG) {
+        if (isa.regid_class(op.preg::i32) != isa.REG_CLASS_ID_GP) {
+            ret R.err[i32, str]("internal compiler error: a float/vector register reached a general-purpose operand position");
+        }
         ret R.ok[i32, str](isa.regid_index(op.preg::i32));
     }
     if (op.kind == mir.MIR_OP_VREG) {
@@ -1846,12 +1862,19 @@ fun emit_global_addr(st: *encode.EncodeState, rd: u32, symop: *mir.MirOperand) R
 # holds the page base; the LDR imm12 is a zero placeholder the linker shifts the
 # low-12 into by the kind's access-width scale (Option B). the zero-extending load
 # form covers a sub-word access exactly as the non-symbol path does
-fun emit_global_load(st: *encode.EncodeState, rt: u32, symop: *mir.MirOperand, width: u8) R.Result[bool, str] {
+#
+# `is_vec` selects the FORM FAMILY, and it is the destination register's BANK rather
+# than anything about the width (#2838): a `ldr D0, [IP0, :lo12:sym]` and a
+# `ldr X0, [IP0, :lo12:sym]` are both eight-byte loads and different instructions. The
+# relocation is the same either way - `:lo12:` scales by the access size, which the
+# two families share per width - so only the base word differs.
+fun emit_global_load(st: *encode.EncodeState, rt: u32, symop: *mir.MirOperand, width: u8, is_vec: bool) R.Result[bool, str] {
     if (symop.sym == intern.STR_NIL) {
         ret R.err[bool, str]("encode: folded-global load has no resolved symbol name");
     }
     # the form resolves BEFORE the ADRP, so a refused width leaves no half sequence.
-    val fr: R.Result[A64Access, str] = int_access(width, true);
+    var fr: R.Result[A64Access, str] = int_access(width, true);
+    if (is_vec) { fr = fp_access(width, true); }
     if (R.is_err[A64Access, str](fr)) { ret R.err[bool, str](R.unwrap_err[A64Access, str](fr)); }
     val a: A64Access = R.unwrap_ok[A64Access, str](fr);
     val ar: R.Result[bool, str] = emit_adrp_reloc(st, SCRATCH0, symop.sym, symop.sym_off);
@@ -1866,18 +1889,37 @@ fun emit_global_load(st: *encode.EncodeState, rt: u32, symop: *mir.MirOperand, w
 # first (the zero register for an immediate 0, IP1 for a non-zero immediate, the
 # value's own register otherwise) so the page-base materialization in IP0 never
 # clobbers it. IP0 / IP1 are reserved scratch, never an allocated value
-fun emit_global_store(st: *encode.EncodeState, symop: *mir.MirOperand, val_op: *mir.MirOperand, width: u8) R.Result[bool, str] {
+#
+# A VECTOR-BANK VALUE TAKES THE SIMD&FP FORM (#2838). Which family this is comes off
+# the value's register CLASS, decided here rather than assumed from the destination
+# kind: #2716 made a sub-width vector store to a global reach this path for the first
+# time, and it was encoded as `str x2` for a value in `v2` - the general-purpose
+# register that aliases the vector register's index. A spilled vector value arrives as
+# its frame slot instead of a register, and loads through the FP scratch first.
+fun emit_global_store(st: *encode.EncodeState, f: *mir.MirFunction, symop: *mir.MirOperand, val_op: *mir.MirOperand, width: u8) R.Result[bool, str] {
     if (symop.sym == intern.STR_NIL) {
         ret R.err[bool, str]("encode: folded-global store has no resolved symbol name");
     }
+    val vec_val: bool = reg_is_vec(val_op) || is_fp_slot(f, val_op);
     # the form resolves BEFORE the value materialization, so a refused width leaves no
     # half sequence.
-    val fr: R.Result[A64Access, str] = int_access(width, false);
+    var fr: R.Result[A64Access, str] = int_access(width, false);
+    if (vec_val) { fr = fp_access(width, false); }
     if (R.is_err[A64Access, str](fr)) { ret R.err[bool, str](R.unwrap_err[A64Access, str](fr)); }
     val a: A64Access = R.unwrap_ok[A64Access, str](fr);
 
     var rt: u32 = ZR;
-    if (val_op.kind == mir.MIR_OP_IMM) {
+    if (vec_val) {
+        if (reg_is_vec(val_op)) {
+            val vr: R.Result[i32, str] = req_vec(val_op);
+            if (R.is_err[i32, str](vr)) { ret R.err[bool, str](R.unwrap_err[i32, str](vr)); }
+            rt = R.unwrap_ok[i32, str](vr)::u32;
+        } or {
+            val lr: R.Result[bool, str] = emit_fp_slot_load(st, f, val_op, FP_SCRATCH0, width);
+            if (R.is_err[bool, str](lr)) { ret lr; }
+            rt = FP_SCRATCH0;
+        }
+    } or (val_op.kind == mir.MIR_OP_IMM) {
         if (val_op.imm != 0) {
             emit_movewide_seq(st, SCRATCH1, val_op.imm::u64, is64(width));
             rt = SCRATCH1;
@@ -1934,11 +1976,19 @@ fun emit_global_addr_got(st: *encode.EncodeState, rd: u32, symop: *mir.MirOperan
 # dereferenced in place at the access width. the destination doubles as the address
 # scratch (the GOT sequence and the value load chain through Rt), so no reserved
 # scratch is spent
-fun emit_global_load_got(st: *encode.EncodeState, rt: u32, symop: *mir.MirOperand, width: u8) R.Result[bool, str] {
+fun emit_global_load_got(st: *encode.EncodeState, rt: u32, symop: *mir.MirOperand, width: u8, is_vec: bool) R.Result[bool, str] {
     # the access form resolves BEFORE the GOT sequence, so a refused width leaves no
     # half sequence.
-    val fr: R.Result[A64Access, str] = int_access(width, true);
+    var fr: R.Result[A64Access, str] = int_access(width, true);
+    if (is_vec) { fr = fp_access(width, true); }
     if (R.is_err[A64Access, str](fr)) { ret R.err[bool, str](R.unwrap_err[A64Access, str](fr)); }
+    # a vector destination cannot double as the address scratch (the GOT sequence is a
+    # GP chain), so the slot address lands in IP0 and the value loads out of it
+    if (is_vec) {
+        val vr: R.Result[bool, str] = emit_global_addr_got(st, SCRATCH0, symop);
+        if (R.is_err[bool, str](vr)) { ret vr; }
+        ret emit_fp_mem(st, rt, SCRATCH0, 0, width, true);
+    }
     val ar: R.Result[bool, str] = emit_global_addr_got(st, rt, symop);
     if (R.is_err[bool, str](ar)) { ret ar; }
     ret emit_mem_access(st, rt, rt, 0, width, true);
@@ -1949,13 +1999,29 @@ fun emit_global_load_got(st: *encode.EncodeState, rt: u32, symop: *mir.MirOperan
 # non-zero immediate, the value's own register otherwise) so materializing the
 # symbol's address into IP0 never clobbers it; then the address is loaded from the
 # GOT slot into IP0 and the value stored through it
-fun emit_global_store_got(st: *encode.EncodeState, symop: *mir.MirOperand, val_op: *mir.MirOperand, width: u8) R.Result[bool, str] {
+fun emit_global_store_got(st: *encode.EncodeState, f: *mir.MirFunction, symop: *mir.MirOperand, val_op: *mir.MirOperand, width: u8) R.Result[bool, str] {
+    val vec_val: bool = reg_is_vec(val_op) || is_fp_slot(f, val_op);
     # the access form resolves BEFORE the value materialization, so a refused width
     # leaves no half sequence.
-    val fr: R.Result[A64Access, str] = int_access(width, false);
+    var fr: R.Result[A64Access, str] = int_access(width, false);
+    if (vec_val) { fr = fp_access(width, false); }
     if (R.is_err[A64Access, str](fr)) { ret R.err[bool, str](R.unwrap_err[A64Access, str](fr)); }
 
     var rt: u32 = ZR;
+    if (vec_val) {
+        if (reg_is_vec(val_op)) {
+            val vr: R.Result[i32, str] = req_vec(val_op);
+            if (R.is_err[i32, str](vr)) { ret R.err[bool, str](R.unwrap_err[i32, str](vr)); }
+            rt = R.unwrap_ok[i32, str](vr)::u32;
+        } or {
+            val lr: R.Result[bool, str] = emit_fp_slot_load(st, f, val_op, FP_SCRATCH0, width);
+            if (R.is_err[bool, str](lr)) { ret lr; }
+            rt = FP_SCRATCH0;
+        }
+        val vr2: R.Result[bool, str] = emit_global_addr_got(st, SCRATCH0, symop);
+        if (R.is_err[bool, str](vr2)) { ret vr2; }
+        ret emit_fp_mem(st, rt, SCRATCH0, 0, width, false);
+    }
     if (val_op.kind == mir.MIR_OP_IMM) {
         if (val_op.imm != 0) {
             emit_movewide_seq(st, SCRATCH1, val_op.imm::u64, is64(width));
@@ -2172,9 +2238,13 @@ fun encode_mov(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) 
 # the zero register; a non-zero immediate is materialized into IP1 first. a symbol
 # destination is a folded-global store: `adrp IP0, sym` + `str Xt, [IP0, :lo12:sym]`
 fun emit_store_mem(st: *encode.EncodeState, f: *mir.MirFunction, dst_mem: *mir.MirOperand, val_op: *mir.MirOperand, width: u8) R.Result[bool, str] {
+    # the value's BANK is settled before the destination kind is, so every destination
+    # arm gets the same answer. it used to be settled only on the arms below this one,
+    # which left the symbol arm encoding a vector value as a general-purpose register
+    # (#2838)
     if (dst_mem.kind == mir.MIR_OP_SYM) {
-        if (dst_mem.sym_got) { ret emit_global_store_got(st, dst_mem, val_op, width); }
-        ret emit_global_store(st, dst_mem, val_op, width);
+        if (dst_mem.sym_got) { ret emit_global_store_got(st, f, dst_mem, val_op, width); }
+        ret emit_global_store(st, f, dst_mem, val_op, width);
     }
     val mr: R.Result[A64Mem, str] = resolve_mem(f, dst_mem);
     if (R.is_err[A64Mem, str](mr)) { ret R.err[bool, str](R.unwrap_err[A64Mem, str](mr)); }
@@ -2238,6 +2308,16 @@ fun encode_load(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
     if (reg_is_vec(dstop)) {
         val rvr: R.Result[i32, str] = req_vec(dstop);
         if (R.is_err[i32, str](rvr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rvr)); }
+        # a global SOURCE reaches here for a vector destination since #2716's direct
+        # sub-width vector load. it used to fall into `resolve_mem`, which refuses a
+        # symbol operand, so the build failed rather than miscompiled - the same
+        # mis-ordering as the store side with the opposite blast radius (#2838)
+        if (src.kind == mir.MIR_OP_SYM) {
+            if (src.sym_got) {
+                ret emit_global_load_got(st, R.unwrap_ok[i32, str](rvr)::u32, src, mi.src_width, true);
+            }
+            ret emit_global_load(st, R.unwrap_ok[i32, str](rvr)::u32, src, mi.src_width, true);
+        }
         val fmr: R.Result[A64Mem, str] = resolve_mem(f, src);
         if (R.is_err[A64Mem, str](fmr)) { ret R.err[bool, str](R.unwrap_err[A64Mem, str](fmr)); }
         val fm: A64Mem = R.unwrap_ok[A64Mem, str](fmr);
@@ -2250,8 +2330,8 @@ fun encode_load(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
     val rd: u32 = R.unwrap_ok[i32, str](rdr)::u32;
 
     if (src.kind == mir.MIR_OP_SYM) {
-        if (src.sym_got) { ret emit_global_load_got(st, rd, src, mi.src_width); }
-        ret emit_global_load(st, rd, src, mi.src_width);
+        if (src.sym_got) { ret emit_global_load_got(st, rd, src, mi.src_width, false); }
+        ret emit_global_load(st, rd, src, mi.src_width, false);
     }
     val mr: R.Result[A64Mem, str] = resolve_mem(f, src);
     if (R.is_err[A64Mem, str](mr)) { ret R.err[bool, str](R.unwrap_err[A64Mem, str](mr)); }
@@ -2389,6 +2469,11 @@ fun reg_is_vec(op: *mir.MirOperand) bool {
 # as a raw index - a raw GP index would mis-encode
 fun req_vec(op: *mir.MirOperand) R.Result[i32, str] {
     if (op.kind == mir.MIR_OP_PREG) {
+        # the mirror of `req_gpr`'s check: a GP register resolved here would name the
+        # vector register that aliases its index, the same collision the other way
+        if (isa.regid_class(op.preg::i32) != isa.REG_CLASS_ID_XMM) {
+            ret R.err[i32, str]("internal compiler error: a general-purpose register reached a float/vector operand position");
+        }
         ret R.ok[i32, str](isa.regid_index(op.preg::i32));
     }
     if (op.kind == mir.MIR_OP_VREG) {
@@ -6248,6 +6333,100 @@ fun t_refused(r: R.Result[bool, str], buf: *encode.ByteBuf) bool {
     ret buf.len == 0;
 }
 
+# A VECTOR VALUE NAMES A VECTOR REGISTER AT EVERY DESTINATION KIND (#2838)
+#
+# The axis here is the DESTINATION KIND, because that is the axis the bank dispatch
+# was missing from. It lived on the pointer-register and frame-slot arms and not on
+# the SYMBOL arm, so a global destination encoded `str x2` for a value in `v2` - the
+# general-purpose register that aliases the vector register's index - and wrote
+# unrelated data to the global. The lane count and the vector shape are irrelevant to
+# it: an `f32x2` and an `f32x4` fail and pass together, and only the destination
+# separates them.
+#
+# THE OBSERVABLE IS BIT 26 OF THE LOAD/STORE WORD, the V bit: 1 names the SIMD&FP
+# register file, 0 the general-purpose one. That is the distinction itself, read off
+# the encoding. A frame-presence or mnemonic-shaped observable cannot see it - the
+# miscompiled store is frameless and is a real `str`, which is exactly how
+# `int/surface/vector-subwidth-direct` stayed green over it.
+#
+# EACH ARM IS ASSERTED IN BOTH DIRECTIONS. A check that only proves the vector case
+# sets the bit would also pass if the bit were set unconditionally, so the same
+# destination is driven with a general-purpose value and the bit must be clear.
+test "mach.lang.target.isa.arm64.encode.store:every_destination_kind_keeps_the_bank" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    tbuf(?st, ?alloc);
+    st.alloc       = ?alloc;
+    st.relocs      = nil;
+    st.reloc_count = 0;
+    st.reloc_cap   = 0;
+    # the emitters consult the function only to classify a spilled float value, and
+    # every value here is a physical register, so an empty frame answers correctly
+    var f: mir.MirFunction;
+
+    val v_bit: u32 = 1 << 26;
+    var vval: mir.MirOperand = tvec(2);
+    var gval: mir.MirOperand = mir.op_preg(2);
+
+    # 1. a POINTER-REGISTER destination - the arm that was always right
+    var pmem: mir.MirOperand = mir.op_mem_preg(1, 0);
+    st.buf.len = 0;
+    emit_store_mem(?st, ?f, ?pmem, ?vval, 8);
+    if ((read_word(?st.buf, 0) & v_bit) == 0) { bad = 1; }
+    st.buf.len = 0;
+    emit_store_mem(?st, ?f, ?pmem, ?gval, 8);
+    if ((read_word(?st.buf, 0) & v_bit) != 0) { bad = 1; }
+
+    # 2. a SYMBOL destination - the arm that lost the dispatch. the store is the
+    # SECOND word; the first is the `adrp` materializing the page base
+    var smem: mir.MirOperand = mir.op_sym(9::intern.StrId, 0);
+    st.buf.len = 0;
+    emit_store_mem(?st, ?f, ?smem, ?vval, 8);
+    if ((read_word(?st.buf, 4) & v_bit) == 0) { bad = 1; }
+    st.buf.len = 0;
+    emit_store_mem(?st, ?f, ?smem, ?gval, 8);
+    if ((read_word(?st.buf, 4) & v_bit) != 0) { bad = 1; }
+
+    # 3. the LOAD direction at a symbol source, which refused to encode at all rather
+    # than miscompiling - the same mis-ordering, caught by `resolve_mem` because that
+    # resolver validates its operand kind where `req_gpr` did not validate its class
+    var lops: [2]mir.MirOperand;
+    lops[0] = tvec(2);
+    lops[1] = mir.op_sym(9::intern.StrId, 0);
+    var ld: mir.MirInstr = mir.instr(mir.MIR_LOAD, ?lops[0], 2, 8, 8);
+    st.buf.len = 0;
+    if (!t_accepted(encode_load(?st, ?f, ?ld), ?st.buf)) { bad = 1; }
+    or { if ((read_word(?st.buf, 4) & v_bit) == 0) { bad = 1; } }
+
+    ret bad;
+}
+
+# THE RESOLVERS REFUSE THE OTHER BANK (#2838)
+#
+# `req_gpr` and `req_vec` were identical but for their error text: both accepted any
+# physical register and returned `regid_index`, which strips the class tag. That is
+# what turned a mis-ordered dispatch into a silent miscompile rather than a build
+# failure, so the check belongs here and not at each call site.
+test "mach.lang.target.isa.arm64.encode.resolvers:reject_the_wrong_bank" {
+    var gp:  mir.MirOperand = mir.op_preg(2);
+    var vec: mir.MirOperand = tvec(2);
+
+    # each resolver accepts its own bank, and returns the WITHIN-BANK index for it
+    val g: R.Result[i32, str] = req_gpr(?gp);
+    if (R.is_err[i32, str](g))              { ret 1; }
+    if (R.unwrap_ok[i32, str](g) != 2)      { ret 1; }
+    val v: R.Result[i32, str] = req_vec(?vec);
+    if (R.is_err[i32, str](v))              { ret 1; }
+    if (R.unwrap_ok[i32, str](v) != 2)      { ret 1; }
+
+    # and refuses the other, rather than returning the aliasing index. both operands
+    # carry index 2, so a resolver that ignored the class would return 2 for all four
+    if (!R.is_err[i32, str](req_gpr(?vec))) { ret 1; }
+    if (!R.is_err[i32, str](req_vec(?gp)))  { ret 1; }
+    ret 0;
+}
+
 # whether an encoder ACCEPTED a width, so the refusal is not over-broad (test helper)
 # ---
 # r:   the encoder's result
@@ -6524,17 +6703,32 @@ test "mach.lang.target.isa.arm64.encode:access_width_refusals_emit_nothing" {
     var sym: mir.MirOperand = mir.op_preg(0);
     sym.kind = mir.MIR_OP_SYM;
     sym.sym  = 1;
+    # the INTEGER family has no sixteen-byte form, and that is what these assert. the
+    # bank is now part of the question (#2838): the same width against the SIMD&FP
+    # family is the Q form and is accepted, so a refusal here has to name a GP value or
+    # it is only measuring which family was picked
+    var sgp: mir.MirOperand = mir.op_preg(0);
     st.buf.len = 0;
-    if (!t_refused(emit_global_load(?st, 0, ?sym, 16), ?st.buf)) { bad = 1; }
+    if (!t_refused(emit_global_load(?st, 0, ?sym, 16, false), ?st.buf)) { bad = 1; }
     st.buf.len = 0;
-    if (!t_refused(emit_global_store(?st, ?sym, ?sops[1], 16), ?st.buf)) { bad = 1; }
+    if (!t_refused(emit_global_store(?st, ?f, ?sym, ?sgp, 16), ?st.buf)) { bad = 1; }
     # and at the pseudo-width, on the direct and the GOT-indirect arms
     st.buf.len = 0;
-    if (!t_refused(emit_global_load(?st, 0, ?sym, 0), ?st.buf))          { bad = 1; }
+    if (!t_refused(emit_global_load(?st, 0, ?sym, 0, false), ?st.buf))     { bad = 1; }
     st.buf.len = 0;
-    if (!t_refused(emit_global_load_got(?st, 0, ?sym, 0), ?st.buf))      { bad = 1; }
+    if (!t_refused(emit_global_load_got(?st, 0, ?sym, 0, false), ?st.buf)) { bad = 1; }
     st.buf.len = 0;
-    if (!t_refused(emit_global_store_got(?st, ?sym, ?sops[1], 0), ?st.buf)) { bad = 1; }
+    if (!t_refused(emit_global_store_got(?st, ?f, ?sym, ?sops[1], 0), ?st.buf)) { bad = 1; }
+    # the pseudo-width is refused on the vector family too, so the new bank arm did not
+    # buy itself a silent default
+    st.buf.len = 0;
+    if (!t_refused(emit_global_load(?st, 0, ?sym, 0, true), ?st.buf)) { bad = 1; }
+    # and the SIMD&FP sixteen-byte form IS available, which is the arm the integer
+    # refusals above would otherwise be mistaken for a width rule
+    st.buf.len = 0;
+    if (!t_accepted(emit_global_store(?st, ?f, ?sym, ?sops[1], 16), ?st.buf)) { bad = 1; }
+    st.buf.len = 0;
+    if (!t_accepted(emit_global_load(?st, 0, ?sym, 16, true), ?st.buf)) { bad = 1; }
 
     # AND THE FLOAT CONSTANT POOL LOAD, whose `use64 = width == 8` was the same shape
     st.buf.len = 0;
@@ -7375,6 +7569,9 @@ test "mach.lang.target.isa.arm64.encode:call_global_emitters_record_relocs_plus_
     var bad: i32 = 0;
     var st: encode.EncodeState;
     var alloc: A.Allocator;
+    # the store emitters consult the function only to classify a spilled float VALUE,
+    # and every value here is a physical register, so an empty frame answers correctly
+    var f: mir.MirFunction;
     tbuf(?st, ?alloc);
     st.alloc       = ?alloc;
     st.relocs      = nil;
@@ -7422,7 +7619,7 @@ test "mach.lang.target.isa.arm64.encode:call_global_emitters_record_relocs_plus_
     # folded-global 8-byte load: adrp x16,sym ; ldr x0,[x16,:lo12:sym] ->
     # 0x90000010 ; 0xf9400200, RK_PAGE21 @16, RK_LDST64_LO12 @20.
     var lo: mir.MirOperand = mir.op_sym(sym, 0);
-    emit_global_load(?st, 0, ?lo, 8);
+    emit_global_load(?st, 0, ?lo, 8, false);
     if (read_word(?st.buf, 16) != 0x90000010) { bad = 1; }
     if (read_word(?st.buf, 20) != 0xF9400200) { bad = 1; }
     if (st.reloc_count != 5)                  { bad = 1; }
@@ -7436,7 +7633,7 @@ test "mach.lang.target.isa.arm64.encode:call_global_emitters_record_relocs_plus_
     # 0x90000010 ; 0xb9000201, RK_PAGE21 @24, RK_LDST32_LO12 @28.
     var so: mir.MirOperand = mir.op_sym(sym, 0);
     var sv: mir.MirOperand = mir.op_preg(1);
-    emit_global_store(?st, ?so, ?sv, 4);
+    emit_global_store(?st, ?f, ?so, ?sv, 4);
     if (read_word(?st.buf, 24) != 0x90000010) { bad = 1; }
     if (read_word(?st.buf, 28) != 0xB9000201) { bad = 1; }
     if (st.reloc_count != 7)                  { bad = 1; }
@@ -7462,6 +7659,7 @@ test "mach.lang.target.isa.arm64.encode:got_indirect_emitters_record_relocs_plus
     var bad: i32 = 0;
     var st: encode.EncodeState;
     var alloc: A.Allocator;
+    var f: mir.MirFunction;
     tbuf(?st, ?alloc);
     st.alloc       = ?alloc;
     st.relocs      = nil;
@@ -7492,7 +7690,7 @@ test "mach.lang.target.isa.arm64.encode:got_indirect_emitters_record_relocs_plus
     # deref carries no reloc.
     var lo: mir.MirOperand = mir.op_sym(sym, 0);
     lo.sym_got = true;
-    emit_global_load_got(?st, 0, ?lo, 8);
+    emit_global_load_got(?st, 0, ?lo, 8, false);
     if (read_word(?st.buf, 8)  != 0x90000000) { bad = 1; }
     if (read_word(?st.buf, 12) != 0xF9400000) { bad = 1; }
     if (read_word(?st.buf, 16) != 0xF9400000) { bad = 1; }
@@ -7509,7 +7707,7 @@ test "mach.lang.target.isa.arm64.encode:got_indirect_emitters_record_relocs_plus
     var so: mir.MirOperand = mir.op_sym(sym, 0);
     so.sym_got = true;
     var sv: mir.MirOperand = mir.op_preg(1);
-    emit_global_store_got(?st, ?so, ?sv, 4);
+    emit_global_store_got(?st, ?f, ?so, ?sv, 4);
     if (read_word(?st.buf, 20) != 0x90000010) { bad = 1; }
     if (read_word(?st.buf, 24) != 0xF9400210) { bad = 1; }
     if (read_word(?st.buf, 28) != 0xB9000201) { bad = 1; }
