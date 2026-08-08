@@ -602,6 +602,118 @@ fun write_symbol(buf: *u8, sym_off: usize, str_off: usize, str_pos: *usize,
     bin.write_u64_le(buf, sym_off + 16, img.symbols[idx].size::u64);
 }
 
+# the serialized `.symtab` + `.strtab` byte pair for an executable's function
+# symbol table (#2772), and the count of leading STB_LOCAL entries the caller
+# needs for `.symtab`'s `sh_info`
+# ---
+# symtab_bytes: the raw Elf64_Sym array (nil when `symtab_count` is 0)
+# symtab_size:  its byte length, `SYM_SIZE * (symtab_count + 1)` (the +1 is the
+#               mandatory reserved null entry at index 0)
+# strtab_bytes: the symbol name string table (nil when `symtab_count` is 0)
+# strtab_size:  its byte length
+# local_count:  number of leading STB_LOCAL entries, INCLUDING the reserved null
+#               entry - this is exactly the `sh_info` value ELF's `.symtab`
+#               convention requires (the index of the first STB_GLOBAL entry)
+rec SymtabBuild {
+    symtab_bytes: *u8;
+    symtab_size:  usize;
+    strtab_bytes: *u8;
+    strtab_size:  usize;
+    local_count:  u32;
+}
+
+# serialize a caller-supplied function symbol list into `.symtab`/`.strtab` bytes
+#
+# `symtab` MUST already be ordered with every `global == false` entry before
+# every `global == true` entry - ELF's own `.symtab` convention (`sh_info` names
+# the first non-local index), not a rule this function enforces. The linker's
+# `build_symtab_entries` is the one caller and sorts that way.
+#
+# Each entry's `st_shndx` names the load segment containing its address (segment
+# `i` is section-header index `i + 1`, matching every other allocated section
+# this writer frames - see the load-segment PROGBITS headers `emit_exec` writes),
+# found by the same linear vaddr-range scan `emit_shared`'s `.dynsym` writer
+# already uses; a table of ~1000 functions against ~4 segments costs nothing
+# next to the allocation and string-table work around it.
+# ---
+# alloc:        allocator backing the two returned buffers (caller frees both)
+# itn:          interner resolving each entry's name
+# symtab:       the local-then-global-sorted function symbol list
+# symtab_count: number of entries (0 is legal: an empty, nil-buffered result)
+# segs:         the load segments an entry's address is matched against
+# seg_count:    number of load segments
+# ret:          the serialized pair, or an allocation-failure error
+fun build_symtab_bytes(alloc: *A.Allocator, itn: *intern.Interner, symtab: *of.SymtabEntry,
+                       symtab_count: u32, segs: *of.LoadSegment, seg_count: u32) R.Result[SymtabBuild, str] {
+    var out: SymtabBuild;
+    out.symtab_bytes = nil; out.symtab_size = 0;
+    out.strtab_bytes = nil; out.strtab_size = 0;
+    out.local_count  = 0;
+    if (symtab_count == 0) { ret R.ok[SymtabBuild, str](out); }
+
+    var strtab_sz: usize = 1;
+    var i: u32 = 0;
+    for (i < symtab_count) {
+        strtab_sz = strtab_sz + str_len(bin.resolve_name(itn, symtab[i].name)) + 1;
+        i = i + 1;
+    }
+    val symtab_sz: usize = SYM_SIZE * (symtab_count::usize + 1);
+
+    val sr: R.Result[*u8, str] = A.zallocate[u8](alloc, symtab_sz);
+    if (R.is_err[*u8, str](sr)) { ret R.err[SymtabBuild, str]("elf: symtab buffer alloc failed"); }
+    val sbuf: *u8 = R.unwrap_ok[*u8, str](sr);
+
+    val tr: R.Result[*u8, str] = A.zallocate[u8](alloc, strtab_sz);
+    if (R.is_err[*u8, str](tr)) {
+        A.deallocate[u8](alloc, sbuf, symtab_sz);
+        ret R.err[SymtabBuild, str]("elf: strtab buffer alloc failed");
+    }
+    val tbuf: *u8 = R.unwrap_ok[*u8, str](tr);
+
+    tbuf[0] = 0;
+    var str_pos: usize = 1;
+    i = 0;
+    for (i < symtab_count) {
+        val name_pos: usize = str_pos;
+        str_pos = str_pos + bin.write_str(tbuf, str_pos, bin.resolve_name(itn, symtab[i].name));
+
+        var shndx: u16 = 1;
+        var sgi: u32 = 0;
+        for (sgi < seg_count) {
+            val sv: u64 = segs[sgi].vaddr;
+            if (symtab[i].vaddr >= sv && symtab[i].vaddr < sv + segs[sgi].memsz::u64) { shndx = (sgi + 1)::u16; }
+            sgi = sgi + 1;
+        }
+
+        var binding: u8 = STB_GLOBAL;
+        if (!symtab[i].global) { binding = STB_LOCAL; out.local_count = out.local_count + 1; }
+
+        val sym_off: usize = SYM_SIZE * (i::usize + 1);
+        bin.write_u32_le(sbuf, sym_off, name_pos::u32);
+        sbuf[sym_off + 4] = (binding << 4) | (STT_FUNC & 0xF);
+        sbuf[sym_off + 5] = 0;
+        bin.write_u16_le(sbuf, sym_off + 6, shndx);
+        bin.write_u64_le(sbuf, sym_off + 8, symtab[i].vaddr);
+        bin.write_u64_le(sbuf, sym_off + 16, symtab[i].size::u64);
+
+        i = i + 1;
+    }
+
+    out.symtab_bytes = sbuf; out.symtab_size = symtab_sz;
+    out.strtab_bytes = tbuf; out.strtab_size = strtab_sz;
+    out.local_count  = out.local_count + 1; # the reserved null entry at index 0 is local
+    ret R.ok[SymtabBuild, str](out);
+}
+
+# release a `SymtabBuild`'s two owned buffers
+# ---
+# alloc: the allocator the buffers came from
+# b:     the built pair to free (a no-op result, e.g. `symtab_count == 0`, frees nothing)
+fun free_symtab_bytes(alloc: *A.Allocator, b: *SymtabBuild) {
+    if (b.symtab_bytes != nil) { A.deallocate[u8](alloc, b.symtab_bytes, b.symtab_size); }
+    if (b.strtab_bytes != nil) { A.deallocate[u8](alloc, b.strtab_bytes, b.strtab_size); }
+}
+
 # a target's ELF build-attributes: the description of the `.riscv.attributes`-style
 # ISA-string section the ELF writer stamps into objects and executables
 #
@@ -1346,10 +1458,15 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
               seg_count: u32, page_size: u64, image_base: u64, entry: u64,
               funcs: *of.ExecFunction,
               func_count: u32, exceptions: *of.Section, exception_count: u32,
-              debug: *of.Section, debug_count: u32, path: *u8, name: *u8,
+              debug: *of.Section, debug_count: u32,
+              symtab: *of.SymtabEntry, symtab_count: u32, path: *u8, name: *u8,
               image_options: of.ImageOptions) R.Result[bool, str] {
     if (tgt_isa == nil) { ret R.err[bool, str]("elf: nil exec isa"); }
     if (path == nil)    { ret R.err[bool, str]("elf: nil exec path"); }
+
+    val sb_r: R.Result[SymtabBuild, str] = build_symtab_bytes(alloc, itn, symtab, symtab_count, segs, seg_count);
+    if (R.is_err[SymtabBuild, str](sb_r)) { ret R.err[bool, str](R.unwrap_err[SymtabBuild, str](sb_r)); }
+    var sb: SymtabBuild = R.unwrap_ok[SymtabBuild, str](sb_r);
 
     # the ELF build-attributes section (the ISA-string `.riscv.attributes` on riscv)
     # the ISA describes, framed in its own minimal section-header table after the load
@@ -1366,7 +1483,10 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
     var seg_offsets: *usize = nil;
     if (seg_count > 0) {
         val ro: R.Result[*usize, str] = A.zallocate[usize](alloc, seg_count::usize);
-        if (R.is_err[*usize, str](ro)) { ret R.err[bool, str]("elf: exec offset table alloc failed"); }
+        if (R.is_err[*usize, str](ro)) {
+            free_symtab_bytes(alloc, ?sb);
+            ret R.err[bool, str]("elf: exec offset table alloc failed");
+        }
         seg_offsets = R.unwrap_ok[*usize, str](ro);
     }
 
@@ -1380,21 +1500,29 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
     }
 
     # frame the load segments with a trailing section-header table when the ISA emits
-    # build attributes OR the linker handed us non-allocated debug sections: one
-    # PROGBITS section per load segment (named by its permissions), the optional
-    # build-attributes section, one non-alloc PROGBITS per debug section, then the
-    # section-name string table. all of it trails the segments outside every PT_LOAD,
-    # so the loader ignores it and the runtime image is unchanged. with neither
-    # attributes nor debug the exe stays section-header-less exactly as before.
-    val has_sht: bool = attr != nil || debug_count > 0;
+    # build attributes, OR the linker handed us non-allocated debug sections, OR it
+    # handed us function symbols for `.symtab` (#2772): one PROGBITS section per load
+    # segment (named by its permissions), the optional build-attributes section, one
+    # non-alloc PROGBITS per debug section, `.symtab` + `.strtab` (if any function
+    # symbols), then the section-name string table. all of it trails the segments
+    # outside every PT_LOAD, so the loader ignores it and the runtime image is
+    # unchanged. with none of the three the exe stays section-header-less exactly as
+    # before - `.symtab` is a NEW reason a release build now gets a header table
+    # where it never did (see build_symtab_entries's header for the size cost this
+    # was measured against).
+    val has_sht: bool = attr != nil || debug_count > 0 || symtab_count > 0;
 
     var attr_off:        usize = 0;
     var attr_sz:         usize = 0;
     var debug_offs:      *usize = nil;
     var debug_name_rels: *usize = nil;
+    var symtab_off:      usize = 0;
+    var strtab_off:      usize = 0;
     var shstr_off:       usize = 0;
     var shstr_sz:        usize = 0;
     var attr_name_rel:   usize = 0;
+    var symtab_name_rel: usize = 0;
+    var strtab_name_rel: usize = 0;
     var shstr_name_rel:  usize = 0;
     var shdr_off:        usize = 0;
     var sht_count:       u32 = 0;
@@ -1411,6 +1539,7 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
             val dro: R.Result[*usize, str] = A.zallocate[usize](alloc, debug_count::usize);
             if (R.is_err[*usize, str](dro)) {
                 if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
+                free_symtab_bytes(alloc, ?sb);
                 ret R.err[bool, str]("elf: exec debug offset table alloc failed");
             }
             debug_offs = R.unwrap_ok[*usize, str](dro);
@@ -1425,9 +1554,21 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
             }
         }
 
+        # .symtab + .strtab: the function symbol table (#2772), trailing the debug
+        # sections. symtab is 8-aligned (Elf64_Sym's own natural alignment); strtab
+        # is a byte blob, alignment 1. non-loaded, exactly like the debug sections.
+        if (sb.symtab_bytes != nil) {
+            total_size = bin.align_up(total_size, 8);
+            symtab_off = total_size;
+            total_size = total_size + sb.symtab_size;
+            strtab_off = total_size;
+            total_size = total_size + sb.strtab_size;
+        }
+
         # .shstrtab: leading nul, one name per load segment, the attributes name (if
-        # any), each debug section name, then ".shstrtab". the per-name offsets are
-        # recomputed in the header-write pass, which walks them in the same order.
+        # any), each debug section name, ".symtab"/".strtab" (if any), then
+        # ".shstrtab". the per-name offsets are recomputed in the header-write pass,
+        # which walks them in the same order.
         shstr_off = total_size;
         shstr_sz  = 1;
         li = 0;
@@ -1444,6 +1585,7 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
             if (R.is_err[*usize, str](dnro)) {
                 if (debug_offs != nil)  { A.deallocate[usize](alloc, debug_offs, debug_count::usize); }
                 if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
+                free_symtab_bytes(alloc, ?sb);
                 ret R.err[bool, str]("elf: exec debug name table alloc failed");
             }
             debug_name_rels = R.unwrap_ok[*usize, str](dnro);
@@ -1454,15 +1596,22 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
                 di = di + 1;
             }
         }
+        if (sb.symtab_bytes != nil) {
+            symtab_name_rel = shstr_sz;
+            shstr_sz = shstr_sz + str_len(".symtab") + 1;
+            strtab_name_rel = shstr_sz;
+            shstr_sz = shstr_sz + str_len(".strtab") + 1;
+        }
         shstr_name_rel = shstr_sz;
         shstr_sz = shstr_sz + str_len(".shstrtab") + 1;
         total_size = total_size + shstr_sz;
 
         shdr_off = bin.align_up(total_size, 8);
         # the section-header table: null + one per segment + attributes(if any) +
-        # one per debug section + .shstrtab.
+        # one per debug section + .symtab/.strtab (if any) + .shstrtab.
         sht_count = seg_count + 1 + debug_count + 1;
         if (attr != nil) { sht_count = sht_count + 1; }
+        if (sb.symtab_bytes != nil) { sht_count = sht_count + 2; }
         total_size = shdr_off + SHDR_SIZE * sht_count::usize;
     }
 
@@ -1471,6 +1620,7 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
         if (debug_name_rels != nil) { A.deallocate[usize](alloc, debug_name_rels, debug_count::usize); }
         if (debug_offs != nil)      { A.deallocate[usize](alloc, debug_offs, debug_count::usize); }
         if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
+        free_symtab_bytes(alloc, ?sb);
         ret R.err[bool, str]("elf: exec buffer alloc failed");
     }
     var buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
@@ -1547,8 +1697,13 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
             di = di + 1;
         }
 
+        if (sb.symtab_bytes != nil) {
+            memory.raw_copy((buf::usize + symtab_off)::ptr, sb.symtab_bytes::ptr, sb.symtab_size);
+            memory.raw_copy((buf::usize + strtab_off)::ptr, sb.strtab_bytes::ptr, sb.strtab_size);
+        }
+
         # .shstrtab: leading nul, one name per load segment, the attributes name (if
-        # any), each debug section name, then ".shstrtab".
+        # any), each debug section name, ".symtab"/".strtab" (if any), then ".shstrtab".
         buf[shstr_off] = 0;
         var np: usize = 1;
         li = 0;
@@ -1562,14 +1717,22 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
             np = np + bin.write_str(buf, shstr_off + np, bin.resolve_name(itn, debug[di].name));
             di = di + 1;
         }
+        if (sb.symtab_bytes != nil) {
+            np = np + bin.write_str(buf, shstr_off + np, ".symtab");
+            np = np + bin.write_str(buf, shstr_off + np, ".strtab");
+        }
         bin.write_str(buf, shstr_off + np, ".shstrtab");
 
         # section headers: [0] reserved null (already zeroed by the zalloc), [1..] a
         # PROGBITS per load segment (mapping the segment's file bytes at its vaddr so
         # external tools disassemble the code), the attributes section (if any), one
-        # non-alloc PROGBITS per debug section, then .shstrtab. per-segment name
-        # offsets walk the same order the names were written above.
+        # non-alloc PROGBITS per debug section, .symtab/.strtab (if any), then
+        # .shstrtab. per-segment name offsets walk the same order the names were
+        # written above. `shidx` tracks the SHT index of the header about to be
+        # written, so `.symtab`'s `sh_link` can name `.strtab`'s index once it is
+        # known - the one field here that is not a plain offset/size/name.
         var hp: usize = shdr_off + SHDR_SIZE;
+        var shidx: u32 = 1;
         var name_cursor: usize = 1;
         li = 0;
         for (li < seg_count) {
@@ -1584,6 +1747,7 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
             bin.write_u64_le(buf, hp + 48, page_size);
             bin.write_u64_le(buf, hp + 56, 0);
             hp = hp + SHDR_SIZE;
+            shidx = shidx + 1;
             name_cursor = name_cursor + str_len(seg_section_name(segs[li].flags)) + 1;
             li = li + 1;
         }
@@ -1600,6 +1764,7 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
             bin.write_u64_le(buf, hp + 48, 1);
             bin.write_u64_le(buf, hp + 56, 0);
             hp = hp + SHDR_SIZE;
+            shidx = shidx + 1;
         }
 
         # non-allocated debug sections: no SHF_ALLOC, no address, own file bytes.
@@ -1618,7 +1783,43 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
             bin.write_u64_le(buf, hp + 48, da::u64);
             bin.write_u64_le(buf, hp + 56, 0);
             hp = hp + SHDR_SIZE;
+            shidx = shidx + 1;
             di = di + 1;
+        }
+
+        # .symtab (SHT_SYMTAB) + .strtab (SHT_STRTAB): `sh_link` names .strtab's own
+        # about-to-be-written index (always `shidx + 1` here, since it immediately
+        # follows), and `sh_info` is `sb.local_count` - the ELF convention every
+        # STB_LOCAL entry (including the reserved null at index 0) must precede every
+        # STB_GLOBAL one, and `build_symtab_bytes`'s caller (`build_symtab_entries`)
+        # sorts that way.
+        if (sb.symtab_bytes != nil) {
+            val strtab_idx: u32 = shidx + 1;
+            bin.write_u32_le(buf, hp, symtab_name_rel::u32);
+            bin.write_u32_le(buf, hp + 4, SHT_SYMTAB);
+            bin.write_u64_le(buf, hp + 8, 0);
+            bin.write_u64_le(buf, hp + 16, 0);
+            bin.write_u64_le(buf, hp + 24, symtab_off::u64);
+            bin.write_u64_le(buf, hp + 32, sb.symtab_size::u64);
+            bin.write_u32_le(buf, hp + 40, strtab_idx);
+            bin.write_u32_le(buf, hp + 44, sb.local_count);
+            bin.write_u64_le(buf, hp + 48, 8);
+            bin.write_u64_le(buf, hp + 56, SYM_SIZE::u64);
+            hp = hp + SHDR_SIZE;
+            shidx = shidx + 1;
+
+            bin.write_u32_le(buf, hp, strtab_name_rel::u32);
+            bin.write_u32_le(buf, hp + 4, SHT_STRTAB);
+            bin.write_u64_le(buf, hp + 8, 0);
+            bin.write_u64_le(buf, hp + 16, 0);
+            bin.write_u64_le(buf, hp + 24, strtab_off::u64);
+            bin.write_u64_le(buf, hp + 32, sb.strtab_size::u64);
+            bin.write_u32_le(buf, hp + 40, 0);
+            bin.write_u32_le(buf, hp + 44, 0);
+            bin.write_u64_le(buf, hp + 48, 1);
+            bin.write_u64_le(buf, hp + 56, 0);
+            hp = hp + SHDR_SIZE;
+            shidx = shidx + 1;
         }
 
         bin.write_u32_le(buf, hp, shstr_name_rel::u32);
@@ -1636,6 +1837,7 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
     if (debug_name_rels != nil) { A.deallocate[usize](alloc, debug_name_rels, debug_count::usize); }
     if (debug_offs != nil)      { A.deallocate[usize](alloc, debug_offs, debug_count::usize); }
     if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
+    free_symtab_bytes(alloc, ?sb);
 
     val res: R.Result[bool, str] = bin.write_atomic(itn, alloc, path, buf, total_size, 0o755,
         "elf: cannot create executable", "elf: could not create executable file",
@@ -6045,7 +6247,8 @@ test "mach.lang.target.of.elf.emit_exec:debug_sections_nonalloc" {
     val em: R.Result[bool, str] = emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 1,
                                             4096, 0x400000, 0x401000,
                                             nil::*of.ExecFunction, 0, nil::*of.Section, 0,
-                                            ?dbg[0], 2, tpath::*u8, "elfdbg"::*u8, of.image_options_default(of.SUBSYSTEM_CONSOLE));
+                                            ?dbg[0], 2, nil::*of.SymtabEntry, 0,
+                                            tpath::*u8, "elfdbg"::*u8, of.image_options_default(of.SUBSYSTEM_CONSOLE));
     if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
 
     val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
