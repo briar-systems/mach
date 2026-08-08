@@ -161,6 +161,11 @@ rec Emit {
     gslot:     *u32;
     iface_use: *u8;
 
+    # per global-table entry, whether a store can reach it (#2879). the absence of
+    # one is what a `NonWritable` decoration states, so this is a PROOF rather than
+    # a search: anything the derivation walk cannot follow reads as written
+    gwrite:    *u8;
+
     # the id each extended instruction set was imported under, indexed by
     # spirvop.SPV_SET_*; 0 means "not imported yet". indexed rather than one field
     # per set so a second set is a row in `spirvop`, not a change here. the import
@@ -330,7 +335,7 @@ pub fun emit_module(tgt: *resolved.Target, u: *unit.Unit,
     e.tgt = tgt; e.u = u; e.root = irmod; e.ir = irmod; e.cur_mi = u.root;
     e.b = ?b; e.tt = ?tt; e.fns = nil; e.fn_len = 0; e.gls = nil; e.gl_len = 0;
     e.gvar_ids = nil; e.gtype_ids = nil; e.gstorage = nil; e.iface_ids = nil; e.iface_len = 0;
-    e.gslot = nil; e.iface_use = nil;
+    e.gslot = nil; e.iface_use = nil; e.gwrite = nil;
     var xi: u32 = 0;
     for (xi < 8) { e.ext_ids[xi] = 0; xi = xi + 1; }
     e.srcmap = mirmod.srcmap; e.cur_fn = nil; e.cur_instr = nil;
@@ -373,6 +378,18 @@ pub fun emit_module(tgt: *resolved.Target, u: *unit.Unit,
         types.types_dnit(?tt);
         spirv.builder_dnit(?b);
         ret gtr;
+    }
+
+    # which descriptors the module stores through is decided before they are
+    # declared, because it is a decoration ON the declaration: `NonWritable` is
+    # emitted with the variable, and the fact it states is about every body in the
+    # closure rather than about the one being emitted (#2879).
+    val wr: R.Result[bool, str] = build_gl_writes(?e);
+    if (R.is_err[bool, str](wr)) {
+        emit_dnit(?e);
+        types.types_dnit(?tt);
+        spirv.builder_dnit(?b);
+        ret wr;
     }
 
     # interface variables are declared before any body, both because a SPIR-V global
@@ -478,6 +495,10 @@ fun emit_dnit(e: *Emit) {
         A.deallocate[u32](e.alloc, e.gstorage, e.gl_len::usize);
     }
     e.gstorage = nil;
+    if (e.gwrite != nil && e.gl_len > 0) {
+        A.deallocate[u8](e.alloc, e.gwrite, e.gl_len::usize);
+    }
+    e.gwrite = nil;
     # the table itself last: every free above is sized by its length.
     if (e.gls != nil && e.gl_len > 0) { A.deallocate[GlobalEnt](e.alloc, e.gls, e.gl_len::usize); }
     e.gls    = nil;
@@ -799,6 +820,193 @@ fun build_gl_table(e: *Emit) R.Result[bool, str] {
     ret R.ok[bool, str](true);
 }
 
+# decide, for every global in the table, whether a store can reach it (#2879)
+#
+# A storage buffer nothing writes is `NonWritable`, and Vulkan reads that
+# decoration to decide whether a stage needs `vertexPipelineStoresAndAtomics`. So
+# the question "does the MODULE ever store through this binding" is worth a pass:
+# it is the common case, it is decidable here, and the answer is free where it is
+# yes and costs a hardware feature where it is wrongly no.
+#
+# THE ANSWER IS ONE-SIDED ON PURPOSE. A wrong "written" costs a decoration. A wrong
+# "not written" is a miscompile - a module that promises the driver something it
+# then does. So the rule is not "find the stores", it is "prove there are none",
+# and everything that is not a proven read counts against the proof. Two positions
+# are reads: the ADDRESS of a load, and the base of an access chain, whose own
+# result is then subject to the same question. Every other appearance of the
+# binding or of a pointer derived from it - a store's destination, a memzero, a
+# call argument, a copy into a vreg this pass does not follow - marks it written,
+# whether or not the emitter would go on to accept the instruction.
+#
+# THE SCAN IS OVER THE EMITTED CLOSURE, the same set every other whole-module
+# decision here is stated about: a function the module drops carries no store a
+# driver can execute. A drawn-in library body is in that closure, so a store from
+# another module counts exactly as a local one does (#2843).
+#
+# It doubles as the enforcement of `#[storage(set, binding, "readonly")]`. Sema
+# refuses the store that is WRITTEN as an assignment, which is the spelling an
+# author reaches for. This refuses a store the emitter can still see after
+# lowering, so the decoration can never be a promise the module breaks.
+# ---
+# e:   the emission state
+# ret: true on success, an allocation error, or the readonly refusal
+fun build_gl_writes(e: *Emit) R.Result[bool, str] {
+    if (e.gl_len == 0) { ret R.ok[bool, str](true); }
+    val rw: R.Result[*u8, str] = A.allocate[u8](e.alloc, e.gl_len::usize);
+    if (R.is_err[*u8, str](rw)) { ret R.err[bool, str](R.unwrap_err[*u8, str](rw)); }
+    e.gwrite = R.unwrap_ok[*u8, str](rw);
+    var i: u32 = 0;
+    for (i < e.gl_len) { e.gwrite[i] = 0; i = i + 1; }
+
+    var fx: u32 = 0;
+    for (fx < e.fn_len) {
+        if (!e.fns[fx].emit) { fx = fx + 1; cnt; }
+        val mf: *mir.MirFunction = fn_mir(e, fx);
+        if (mf == nil) { fx = fx + 1; cnt; }
+        val r: R.Result[bool, str] = scan_fn_writes(e, fx, mf);
+        if (R.is_err[bool, str](r)) { ret r; }
+        fx = fx + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# mark every global one function can store through
+#
+# Two walks. The first gives each vreg the global its pointer was derived from, by
+# following access chains from their base, and iterates to a fixed point because a
+# chain's base may be defined by a later instruction in program order, which a loop
+# makes ordinary. The second asks of every operand carrying such a pointer - or
+# naming a global outright - whether its position is one of the two that only read.
+# ---
+# e:   the emission state
+# fx:  the unit function-table index, for the refusal's function name
+# mf:  the MIR function
+# ret: true on success, an allocation error, or the readonly refusal
+fun scan_fn_writes(e: *Emit, fx: u32, mf: *mir.MirFunction) R.Result[bool, str] {
+    val n: u32 = mf.vreg_count;
+    var origin: *u32 = nil;
+    if (n > 0) {
+        val ro: R.Result[*u32, str] = A.allocate[u32](e.alloc, n::usize);
+        if (R.is_err[*u32, str](ro)) { ret R.err[bool, str](R.unwrap_err[*u32, str](ro)); }
+        origin = R.unwrap_ok[*u32, str](ro);
+        var v: u32 = 0;
+        for (v < n) { origin[v] = GL_NONE; v = v + 1; }
+    }
+
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var bi: u32 = 0;
+        for (bi < mf.block_count) {
+            val blk: *mir.MirBlock = ?mf.blocks[bi];
+            var ii: u32 = 0;
+            for (ii < blk.instr_count) {
+                val mi: *mir.MirInstr = ?blk.instrs[ii];
+                ii = ii + 1;
+                if (mi.opcode != mir.MIR_GEP || mi.operand_count < 2) { cnt; }
+                if (mi.operands[0].kind != mir.MIR_OP_VREG) { cnt; }
+                val dst: u32 = mi.operands[0].vreg;
+                if (origin == nil || dst == mir.MIR_VREG_NIL || dst >= n) { cnt; }
+                val g: u32 = operand_origin(e, origin, n, ?mi.operands[1]);
+                if (g == GL_NONE || origin[dst] == g) { cnt; }
+                # a vreg reached from two bases is followed no further: both are
+                # marked written, since a store through it would reach either.
+                if (origin[dst] != GL_NONE) {
+                    val ra: R.Result[bool, str] = mark_written(e, fx, mi, origin[dst]);
+                    if (R.is_err[bool, str](ra)) { A.deallocate[u32](e.alloc, origin, n::usize); ret ra; }
+                    val rb: R.Result[bool, str] = mark_written(e, fx, mi, g);
+                    if (R.is_err[bool, str](rb)) { A.deallocate[u32](e.alloc, origin, n::usize); ret rb; }
+                    cnt;
+                }
+                origin[dst] = g;
+                changed = true;
+            }
+            bi = bi + 1;
+        }
+    }
+
+    var bi2: u32 = 0;
+    for (bi2 < mf.block_count) {
+        val blk: *mir.MirBlock = ?mf.blocks[bi2];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            var oi: u32 = 0;
+            for (oi < mi.operand_count) {
+                val g: u32 = operand_origin(e, origin, n, ?mi.operands[oi]);
+                if (g == GL_NONE) { oi = oi + 1; cnt; }
+                if (mi.opcode == mir.MIR_LOAD && oi == 1) { oi = oi + 1; cnt; }
+                if (mi.opcode == mir.MIR_GEP && oi < 2)   { oi = oi + 1; cnt; }
+                val rm: R.Result[bool, str] = mark_written(e, fx, mi, g);
+                if (R.is_err[bool, str](rm)) {
+                    if (origin != nil) { A.deallocate[u32](e.alloc, origin, n::usize); }
+                    ret rm;
+                }
+                oi = oi + 1;
+            }
+            ii = ii + 1;
+        }
+        bi2 = bi2 + 1;
+    }
+    if (origin != nil) { A.deallocate[u32](e.alloc, origin, n::usize); }
+    ret R.ok[bool, str](true);
+}
+
+# the global an operand's pointer was derived from, or GL_NONE
+#
+# A symbol operand names its global whatever displacement rides on it, and a
+# register operand names whatever the derivation walk recorded for that vreg. The
+# displacement is deliberately not read: it changes which BYTES an access reaches,
+# never which binding, and this pass answers only the second question.
+# ---
+# e:      the emission state
+# origin: the per-vreg derivation map, or nil for a function with no vregs
+# n:      the map's length
+# op:     the operand
+# ret:    the global-table index, or GL_NONE
+fun operand_origin(e: *Emit, origin: *u32, n: u32, op: *mir.MirOperand) u32 {
+    if (op.kind == mir.MIR_OP_SYM) { ret gl_lookup(e, op.sym); }
+    if (op.kind != mir.MIR_OP_VREG && op.kind != mir.MIR_OP_MEM) { ret GL_NONE; }
+    if (origin == nil || op.vreg == mir.MIR_VREG_NIL || op.vreg >= n) { ret GL_NONE; }
+    ret origin[op.vreg];
+}
+
+# record that a store can reach global `gix`, and refuse it when the binding said
+# it would not be written
+# ---
+# e:   the emission state
+# fx:  the unit function-table index the store sits in
+# mi:  the instruction the store arrived as
+# gix: the global-table index
+# ret: true, or the refusal
+fun mark_written(e: *Emit, fx: u32, mi: *mir.MirInstr, gix: u32) R.Result[bool, str] {
+    if (gix >= e.gl_len || e.gwrite == nil) { ret R.ok[bool, str](true); }
+    if (e.gwrite[gix] != 0) { ret R.ok[bool, str](true); }
+    e.gwrite[gix] = 1;
+    val g: *ir.Global = gl_ir(e, gix);
+    if (g.iface != ir.IFACE_STORAGE || (g.iface_flags & ir.IFACE_FLAG_READONLY) == 0) {
+        ret R.ok[bool, str](true);
+    }
+    val r: R.Result[str, str] = format.sprint(e.alloc,
+        "a store reaches the `#[storage({}, {}, \"readonly\")]` binding{}: the qualifier declares that nothing writes it, which is what lets this module mark the descriptor `NonWritable` and a vertex stage read it without `vertexPipelineStoresAndAtomics`. drop the `\"readonly\"` qualifier to write it",
+        g.iface_a, g.iface_b, gl_mod_prefix(e, gix));
+    if (R.is_err[str, str](r)) {
+        ret R.err[bool, str]("spirv.emit: a store reaches a `\"readonly\"` storage binding");
+    }
+    ret R.err[bool, str](mir.instr_refusal(e.alloc, e.srcmap, ir_fn_spelling(e, fx), mi,
+                                           R.unwrap_ok[str, str](r)));
+}
+
+# whether a store can reach the global at table index `ix`
+# ---
+# e:  the emission state
+# ix: the global-table index
+# ret: true unless the module was proved never to store through it
+fun gl_written(e: *Emit, ix: u32) bool {
+    if (e.gwrite == nil || ix >= e.gl_len) { ret true; }
+    ret e.gwrite[ix] != 0;
+}
+
 # whether any EMITTED function names this global
 #
 # A reference reaches the back end as a symbol operand carrying the global's
@@ -1008,6 +1216,13 @@ fun declare_interface(e: *Emit) R.Result[bool, str] {
             || g.iface == ir.IFACE_SAMPLER) {
             decorate(e, var_id, spirv.DECOR_DESCRIPTOR_SET, g.iface_a);
             decorate(e, var_id, spirv.DECOR_BINDING, g.iface_b);
+        }
+        # a storage buffer no body in the module stores through is NonWritable, which
+        # is what lets a vertex or geometry stage read it without
+        # `vertexPipelineStoresAndAtomics` (#2879). A uniform is read-only by its
+        # storage class and needs nothing said, and a sampler is not memory at all.
+        if (g.iface == ir.IFACE_STORAGE && !gl_written(e, i)) {
+            decorate_bare(e, var_id, spirv.DECOR_NON_WRITABLE);
         }
         # EVERY global an entry point statically uses belongs in its interface list,
         # of any storage class. That is a SPIR-V 1.4 change from the 1.3 rule of
@@ -1721,7 +1936,7 @@ fun check_stage_interfaces(e: *Emit) R.Result[bool, str] {
     if (msg == nil) {
         i = 0;
         for (i < n) {
-            if ((flat[i] & 1) != 0) { decorate_flat(e, e.gvar_ids[i]); }
+            if ((flat[i] & 1) != 0) { decorate_bare(e, e.gvar_ids[i], spirv.DECOR_FLAT); }
             i = i + 1;
         }
     }
@@ -1900,13 +2115,14 @@ fun needs_flat(tt: *type.IrTypeTable, id: type.IrTypeId) bool {
     ret bits == 64;
 }
 
-# emit the operand-less OpDecorate Flat
+# emit an OpDecorate that carries no operand, such as Flat or NonWritable
 # ---
 # e:      the emission state
-# target: the variable id being decorated
-fun decorate_flat(e: *Emit, target: u32) {
+# target: the id being decorated
+# decor:  the decoration
+fun decorate_bare(e: *Emit, target: u32, decor: u32) {
     var ops: [2]u32;
-    ops[0] = target; ops[1] = spirv.DECOR_FLAT;
+    ops[0] = target; ops[1] = decor;
     spirv.inst(e.b, ?e.b.decorations, spirv.OP_DECORATE, ?ops[0], 2);
 }
 

@@ -46,6 +46,7 @@ A decorator is written as an attribute:
 #[builtin("name")]   # pipeline built-in variable (global only)
 #[uniform(set, bnd)] # descriptor-bound uniform block, read-only (global only)
 #[storage(set, bnd)] # descriptor-bound storage buffer, read-write (global only)
+#[storage(set, bnd, "readonly")] # the same buffer, with writes refused
 #[sampler(set, bnd)] # descriptor-bound image / sampler handle (global only)
 #[spirv_op(set,name)] # the SPIR-V instruction this function is (fun only)
 ```
@@ -634,6 +635,27 @@ rules, which use the element's natural stride, and that *is* mach's layout, so
 A compute stage's data path is `storage`: Vulkan forbids the `Output` storage class
 in a compute execution model, so a compute shader reads and writes buffers rather
 than varyings.
+
+`storage` takes **memory qualifiers** after the descriptor pair. There is one,
+`"readonly"`, and it says that nothing writes the binding:
+
+```mach
+rec Palette { columns: [512]f32x4; }
+#[storage(0, 3, "readonly")] var palette: Palette;
+```
+
+A store through a `"readonly"` binding is a compile error on every target, naming
+the line that wrote it. That is what the qualifier buys over what the compiler
+works out on its own: a buffer no body in the module stores through is emitted with
+the SPIR-V `NonWritable` decoration whether or not it is marked, and Vulkan reads
+that decoration to decide whether a stage needs `vertexPipelineStoresAndAtomics`.
+So an accidental write does not produce a wrong module, it produces a **correct one
+that quietly costs a hardware feature**. Marking the binding turns that into a
+diagnostic instead.
+
+The inference is one-sided on purpose. Anything the compiler cannot follow, such as
+the binding's address handed to a function, counts as a write, so a missing
+decoration is possible and a wrong one is not.
 
 `sampler` binds an **image or sampler handle** by descriptor set and binding, at
 the same descriptor addressing `uniform` and `storage` use, so a host binds one the

@@ -18,6 +18,15 @@ mos6502, the other target that legalizes to a narrower ALU, is unaffected: an `i
 
 ### Added
 
+#### A storage binding nothing writes is emitted `NonWritable`, and can say so (#2879)
+A `#[storage(set, binding)]` buffer that a stage only reads was emitted with no `NonWritable` decoration, so every consumer had to enable `vertexPipelineStoresAndAtomics` to read one from a vertex stage. The read-only case is the common one - a joint palette, an instance buffer, a light list - and it is the case where the decoration is free and its absence costs a hardware requirement.
+
+The emitter now decides it from the module. A storage binding no emitted body stores through is decorated `NonWritable`, over the same emitted closure every other whole-module rule here is stated about, so a store from a drawn-in library body counts exactly as a local one does. The analysis is a **proof rather than a search**: two positions read - a load's address and an access chain's base, whose result is then subject to the same question - and every other appearance of the binding or of a pointer derived from it counts as a write. A missing decoration is therefore possible and a wrong one is not.
+
+`#[storage(set, binding, "readonly")]` states it explicitly, and a store through such a binding is a compile error naming the line that wrote it, on every target rather than only on a SPIR-V build. That is what the qualifier buys over the inference: an accidental write does not produce a wrong module, it produces a correct one that quietly widens the pipeline's requirements, and the qualifier turns it into a diagnostic. The emitter refuses a write it can still see after lowering - an address handed somewhere it cannot follow - so the decoration cannot become a promise the module breaks. The memory qualifier rides after the descriptor pair rather than in a second decorator name, so a further qualifier is one accepted spelling and no new interface role.
+
+Everything else is unchanged: of boom's seven shaders, the six with no storage binding are byte-identical, and `skinned_vert` differs by exactly the one decoration.
+
 #### A layout intrinsic can be measured inside a comptime `$if` (#2857)
 `$size_of` and `$align_of` are constants, but they could not appear in a `$if` condition, so the thing most worth asserting about a layout - a **relationship** between two of them - could only be a runtime test. Two records a renderer writes into one slot at a fixed offset must be the same size; if they diverge, one shader reads its colour out of the middle of a matrix, with no diagnostic at any layer. A test catches that only if someone runs the suite. A `$error` catches it in the build that introduced it.
 
