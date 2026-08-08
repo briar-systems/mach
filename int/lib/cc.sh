@@ -19,7 +19,9 @@
 # (native build, including every CI runner), and fall back to a cross-capable
 # `clang -target <triple>` only when it does not (a local cross-build). Either
 # path only ever needs to emit an object (`-c`) - mach does the link itself -
-# so `clang -target` needs no sysroot or cross-linker to be sufficient.
+# so the cross path needs no cross LINKER. It does need the target's libc
+# HEADERS the moment a probe includes one, which is what the riscv64 branch's
+# `--sysroot` supplies; see the triple table below.
 #
 # usage: cc.sh <compiler args...>  (same argv a bare `cc` would take)
 #
@@ -56,15 +58,27 @@ if [ "$(host_isa)" = "$MACH_TARGET_ISA" ] && [ "$(host_os)" = "$MACH_TARGET_OS" 
 fi
 
 # cross build: the host cannot produce this leg's ISA/OS natively, so route
-# through clang with an explicit target triple. compile-only (-c) needs no
-# sysroot or cross-linker for any of these, verified against every
-# targets.conf leg (mach#2741) - only a case that asked cc.sh to LINK a full
-# binary would need one, and none does today.
+# through clang with an explicit target triple.
+#
+# COMPILE-ONLY NEEDS NO CROSS LINKER. It DOES need the target's libc headers as
+# soon as a probe includes one, and this file used to claim otherwise - "needs no
+# sysroot or cross-linker for any of these, verified against every targets.conf
+# leg (mach#2741)". That claim was verified against a set that could not disprove
+# it: `c-variadic` was exempt on linux-riscv64, so no probe that cross-built here
+# had ever included a libc header. Un-exempting it (mach#2771) reached the case
+# that falsifies it, and clang resolved the HOST's /usr/include/stdint.h while
+# targeting riscv64 - failing inside it on a file no case mentions
+# ("bits/libc-header-start.h file not found", a multiarch host's glibc looking for
+# its own arch subdirectory). Silently succeeding would have been worse: an object
+# compiled against the wrong architecture's libc headers, which is the same class
+# of quiet divergence mach#2741 named. So the riscv64 branch names a sysroot, and
+# no branch pretends the headers are free.
 #
 # extend this table exactly when targets.conf gains a leg (same axis
 # check-target-matrix.sh already enforces one block per [target.*] on).
 triple=
 extra=
+sysroot_arg=
 case "$MACH_TARGET_OS-$MACH_TARGET_ISA" in
     linux-x86_64)    triple=x86_64-linux-gnu ;;
     linux-aarch64)   triple=aarch64-linux-gnu ;;
@@ -105,9 +119,27 @@ case "$MACH_TARGET_OS-$MACH_TARGET_ISA" in
     #                                  hits the exact same ADD32/SUB32 pairing.
     # suppressing emission at the compiler is the fix, not teaching mach's reader
     # relocation arithmetic it will never otherwise need (mach#2741).
+    #
+    # ...and a SYSROOT, because this is the one leg CI cross-builds: linux-riscv64
+    # is the only targets.conf row whose runner is not its own ISA, so it is the
+    # only leg whose probes need target libc headers in CI. `--sysroot` alone is
+    # sufficient and is what makes the resolution honest - clang finds
+    # <sysroot>/include and stops searching the host's /usr/include, so a probe
+    # either compiles against riscv64's own headers or fails naming the one it
+    # wanted. The path is where Ubuntu's `libc6-dev-riscv64-cross` installs, which
+    # ci.yml installs on this leg; MACH_RISCV64_SYSROOT overrides it for a host
+    # that keeps its cross headers elsewhere. Absent, the build stops here naming
+    # the package rather than falling back to the host's headers, which is exactly
+    # the silent wrong-headers outcome this exists to prevent.
     linux-riscv64)
         triple=riscv64-linux-gnu
+        sysroot=${MACH_RISCV64_SYSROOT:-/usr/riscv64-linux-gnu}
+        if [ ! -d "$sysroot/include" ]; then
+            echo "cc.sh: cross-building linux-riscv64 needs riscv64 libc headers, and none are at '$sysroot/include' - install Ubuntu's libc6-dev-riscv64-cross (or your distro's riscv64-linux-gnu glibc headers) and point MACH_RISCV64_SYSROOT at it if it lands elsewhere. compiling against the host's headers instead would emit an object built to the wrong architecture's libc (mach#2741, mach#2771)" >&2
+            exit 1
+        fi
         extra="-march=rv64gc -mabi=lp64d -mno-relax -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-jump-tables"
+        sysroot_arg=$sysroot
         ;;
     windows-x86_64)  triple=x86_64-pc-windows-msvc ;;
     darwin-x86_64)   triple=x86_64-apple-darwin ;;
@@ -125,8 +157,10 @@ fi
 
 # $extra is deliberately unquoted: it is always either empty or a fixed set of
 # single-word flags built above, never user input, so word-splitting it here is
-# the intended expansion, not a quoting bug.
-clang -target "$triple" $extra "$@" || exit $?
+# the intended expansion, not a quoting bug. the sysroot is the opposite - it can
+# come from MACH_RISCV64_SYSROOT - so it rides its own quoted expansion, present
+# only for a branch that set one.
+clang -target "$triple" ${sysroot_arg:+--sysroot="$sysroot_arg"} $extra "$@" || exit $?
 
 # the -mabi/-march pin above is a REQUEST, and a toolchain that does not honour it
 # fails silently in the direction that looks like a mach bug: a soft-float probe
