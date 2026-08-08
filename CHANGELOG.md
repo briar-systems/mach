@@ -16,6 +16,35 @@ The operand SHAPES a generic MIR opcode admits are now a stated part of the shar
 
 A deeper, related gap is out of scope here and left as a note rather than a new issue: a provably-constant integer-to-float conversion should arguably fold to a float constant outright at IR build (`si_to_fp f64 100: i8` becoming `100.0`), in which case neither the encoder refusal nor the extra x86-64 instruction would exist on any target.
 
+#### A failed `#[library]` pin said the library was not in the link when it was (#2800)
+`import 'X' pinned to library 'glfw' not among the link's dependencies` was reported for a `glfw` the manifest **did** provide. The linker is handed loader names for the link's dynamic half and bare paths for its static half, so a `source = "local"` entry's logical name never reached it at all, and the only check it could run reported the half it could not see as absent.
+
+The message cost a day of investigation before anything was fixed. It named the manifest, so the report went at the export cascade - which was never broken, and is now pinned by a regression case that passes on the compiler that introduced it. The actual fault was a misspelled entry point (`glfwGetInstanceProcAddr` for GLFW's `glfwGetInstanceProcAddress`), which the message said nothing about.
+
+Which message a user saw was decided by accident, too: the same broken program read `undefined symbol` on a link with no shared library in it and the false `not among the link's dependencies` the moment any unrelated one joined. Two different statements about one program, one of them untrue, selected by something neither of them mentions.
+
+The driver's single walk over the link inputs now records each entry's logical name and whether it resolved static or dynamic, and the linker reads that one account rather than inferring the link from the half it was handed. A failed pin resolves to one of two truthful statements - the library is in the link **as a static input**, which defines symbols rather than importing them, so the symbol is undefined; or the library is genuinely nowhere in the effective link set, in which case the refusal stands and now lists what the link does provide. Both paths that can reach a failed pin call one decision function, so the wording no longer depends on the link's shape: the two int cases that differ only by an unrelated dynamic dependency assert **byte-identical** goldens, and a third holds the genuine refusal so the fix cannot become a blanket permit.
+#### A type mismatch between two same-named types from different modules said `expected P, found P` (#2288)
+A nominal type is interned by `(origin, decl)` and rendered by its bare name, so `rec P` declared in two modules produced exactly this:
+
+```
+error: type mismatch: expected P, found P
+```
+
+The two types are genuinely different and the diagnostic could not show it - the message names the defect and tells the reader nothing about it. That is the failure this epic exists for, arriving in a diagnostic rather than in a dump.
+
+The disambiguation is a property of the **pair**, not of either type, so it lives at the reporting site rather than in the type renderer: qualifying every nominal at every site would make every ordinary diagnostic noisier to fix a case that is rare. When the two renderings collide, the note names each side's defining module instead of the cast advice, which could not apply between two unrelated records anyway:
+
+```
+error: type mismatch: expected P, found P
+  = note: these are two different types that share the name `P`: the first is declared in `dcase.main`, the second in `dcase.lib`
+```
+
+Every diagnostic that names two types routes through **one** decision point, so this is not a patch at one message site. It reaches the assignment mismatch, the `:~` size mismatch (which collapsed the same way - `P (16 bytes) vs P (1 bytes)`), and `incompatible operand types`, whose collision is unreachable today only because aggregate arithmetic and `==` are refused before the message is built. A generic instance is disambiguated too, since `Box[u8]` from two modules renders identically for the same reason.
+
+Found while auditing the surfaces #2288 lists, by producing both sides of each distinction and diffing rather than by reading the printer. The rest of the type renderer came out clean under the same treatment: secret against public (`^u32` / `u32`), generic arguments, vector lane signedness (`i32x4` / `u32x4`), aggregate against scalar at equal width (`[8]u8` / `i64`), packed against unpacked, over-aligned against natural, and function arity all render distinguishably.
+
+Alongside it, `ut_diag_note_has` - the note-reading sibling of the test harness's `ut_diag_has`, which scans a diagnostic's `message` only. A note is a separate field, so until now **no test in the tree could assert anything about a note's text** and every note the compiler attaches was unpinned. That is the same asymmetry #2297 found between `ut_lower_ok` and the sink-reading helpers, arriving through a different door, and it is worth stating plainly: two arms of this change's own test, written against `ut_diag_has` with a bare module name as the needle, passed against the unpatched compiler because some unrelated note in the same compile mentioned that module. They assert the surrounding phrase now, and all five arms fail without the fix.
 #### The IR verifier now checks that a conversion is well-*typed* for its own opcode, not merely well-*formed* (#2808)
 The verifier constrained a conversion's **arity** - `OP_TRUNC` / `OP_SEXT` / `OP_ZEXT` / `OP_BITCAST` all sit in the "exactly one operand" bucket - and `VC_TYPE_AGREE` covered operand agreement for binary ops, branch conditions, load/store/gep bases and `ret` against the signature. Nothing related a conversion's **result width** to its operand's, so it checked that a conversion was well-formed and never that it meant what its opcode says. A width-changing `BITCAST`, a `TRUNC` whose result is *wider* than its operand, a `SEXT` / `ZEXT` whose result is *narrower*, and any of the three at *equal* widths were all accepted.
 
@@ -35,6 +64,13 @@ The static writer mapped the ELF header and program-header table **at** `segs[0]
 The two paths computed one fact in two places and agreed only by accident. The header-segment base is now a single definition all three writers call, and `header_fits_reserved_page` guards the static path too - it never needed the guard before only because it had no reserved page to overrun. The regression test asserts the general property that **no two load segments overlap in virtual address**, over the emitted headers rather than about one specific pair, so it fails closed for whatever the next segment-layout change does.
 
 ### Added
+
+#### aarch64 emits the B and H views of a V register, so a two-byte vector moves in one instruction (#2716)
+`vec_mem_widths` declared 4, 8 and 16 on aarch64 while the architecture also has B and H views of the same V register. The gap was not neutral: declaring 1 and 2 anyway turned an `i8x2` copy into `internal compiler error: aarch64 has no float memory access form for this width`, because the model claimed a capability the encoder did not have. That is what an aspirational declaration produces, and it is why the field describes **what the back end emits** rather than what the ISA has.
+
+The encoder emits them now — `ldr`/`str`, `ldur`/`stur` and the register-offset forms at B and H, every word byte-exact against `llvm-mc -triple=aarch64` and re-checked by disassembling the emitted object — so the declaration grew to match. That order is the rule, never the reverse. `copy_i8x2` goes from a stack frame, a 16-byte scratch slot and a chunk walk to `ldr h0, [x2]` / `str h0, [x1]`.
+
+They join the plain `ldr`/`str` mnemonic rows rather than taking `ldrb`/`ldrh`: those name a W destination and have to say which part of it they wrote, while `ldr b0, [x1]` transfers exactly the register named. The width-refusal test moved with the forms — 1 and 2 are now asserted **accepted** at their exact words, and 0, 12 and 32 stay refused, which is the property that test exists for.
 
 #### A vector of any lane count compiles on every target, whether or not a vector register can hold it (#2727)
 `f32x5`, `f32x8` and `f32x16` were refused **by name** at the front end on every target: `vector `f32x8` is 256 bits wide, more than this target's 128-bit vector width`. That read a realization fact as a legality rule, and it was incoherent besides — rv64gc has no vector unit at all, scalarizes every vector it is handed, and still refused `f32x8` on the ground of a 128-bit SIMD width it does not have.
@@ -57,6 +93,15 @@ Which widths can cross between a **vector register** and memory in one instructi
 The 12-byte shapes stay on the scratch path, and that is the finding rather than a gap: the issue proposed gating on lane alignment, a predicate that is **true for every shape mach can spell** (every lane width is a power of two no greater than 8, so the greedy 8/4/2/1 walk is lane-aligned by induction — its `i16x7` counterexample is arithmetically wrong, the 4-byte chunk at offset 8 covering lanes 4 and 5 exactly). A vacuous guard would have licensed a chunked direct access that neither baseline can encode: `pinsrd`/`pextrd` are SSE4.1 against an SSE2 baseline, and aarch64's single-structure `ld1 {v0.s}[2]` is a form this encoder does not emit yet. Both are pure additions later; until then the round trip covers those shapes, on a declared capability rather than by accident.
 
 Asserted on the emitted code (`int/surface/vector-subwidth-direct`, frame verdicts per shape per leg), because the lanes were already right — a run-and-compare case cannot see this at all.
+#### An adversarial vector-correctness sweep across axes nothing else reaches
+Vectors have shipped three silent miscompiles in recent memory - `f32x3` shipped with no operation ever run through it, `vec_lane_count` carried a 128-bit assumption no CPU backend reads, and #2749 (merged tonight) had both vector-operator expansions substituting a loop-carried phi's uses one block at a time, missing the back-edge operand - and CI was fully green through every one, because the 42 `vector_runtime` cases all cover the ten 128-bit shapes in straight-line code.
+
+`int/surface/vector-carry-and-boundary` puts real lane values through the combinations neither that suite nor the existing `vector-subwidth` / `regression/2749-gap-op-loop-carried` fixtures reach: sub-width and float-lane loop-carried accumulators (including `*`, #2749's own operator, at a shape its fixture never tried), bitwise and comparison-into-mask operators in the carried position, a sub-width vector through two call boundaries as both argument and return, a struct containing a vector returned BY VALUE rather than merely constructed locally, two adjacent vector struct fields with no scalar guard between them, a runtime-indexed array of vectors, and four vector arguments live in one call. Every lane is hand-computed and checked individually, never compared against another target's output - #2749's own bug had two targets agreeing with each other and both being right for reasons unrelated to the defect.
+
+The sweep found no new defect. Only `mul_loop3` (`*`, loop-carried, at `i32x3`) is an actual regression pin against #2749, and only on `linux` (x86-64) - verified by running the case against a compiler built from the commit immediately before #2749's fix merged, where it reads wrong there and correct on `linux-arm64` / `linux-riscv64` (for reasons unrelated to the defect, the same shape #2749's own i32x4 case had, with which targets are "right for the wrong reason" swapped). Every other probe reads correct against that same pre-fix compiler: real coverage of untested combinations, not additional regression pins, and the case's own comments say so rather than implying otherwise.
+
+Over-width shapes (256-bit+) are refused at the front end on the commit this was written against and are not attempted here; #2805 / #2806 are expected to make them legal, and whoever lands that should extend this case's probes to a wide shape rather than add a new one.
+
 #### A shader can bind and sample a texture (#2794)
 The GPU decorator set covered `#[input]`, `#[output]`, `#[builtin]`, `#[uniform]` and `#[storage]`, and none of them declares an image. A shader that reads a texture could not be written at all, which is the remaining blocker for porting boom's shaders off GLSL - every one of them samples a texture.
 
@@ -93,6 +138,36 @@ Measured on x86-64, release, a loop of 3M iterations over store / load / fetch_a
 Carrying an `asm` body across the clone is the other half, and it is the design from draft PR #2678 rebased onto current `dev` and re-measured: `ir.clone_asm_payload` copies an `OP_ASM`'s `Function.asm_blocks` entry onto the clone, remapping the map key and each `{name}` binding's alloca, and deep-copying the bindings array since `module_dnit` frees it per `OP_ASM`. `instruction:asm_is_at_least_as_conservative_as_call` pins the property the whole change rests on: inlining removes the CALL and leaves the `OP_ASM`, so the ordering an atomic relies on survives only because `is_pure` excludes both.
 
 Two new integration cases, because one of them cannot see the feature: `2231-cross-module-inline-asm` checks every value at both profiles on all three ISAs and passes identically against a compiler that does no cross-module inlining at all, which is the point. `2231-cross-module-inline-shape` reads the **emitted call count** per function through a new `call-shape` producer, and against `dev` it reports `calls=1` on exactly the two lines that are the feature while `#[noinline]` and undecorated callees keep their calls. Memory orderings are untouched and remain sequential consistency everywhere.
+#### BREAKING: `riscv64` is a family of ABIs, `lp64` now means soft float, and the linux default is `lp64d` (#2777)
+
+Mach declared exactly one RISC-V calling convention, named `lp64`. It did not implement lp64. It implemented **lp64d**: a scalar `double` was placed in `fa0`, which is the hard-float rule. The name said soft float and the emitted calls were hard float, so nothing you could read in a manifest described the code that came out, and any judgement about interop made from `abi = "lp64"` was made from a name that was wrong. The riscv64 leg never caught it because it runs under qemu against mach's own code and links nothing foreign, so caller and callee were consistently wrong together.
+
+`abi/lp64.mach` is replaced by `abi/riscv.mach`, which implements the psABI family once. A member is a `RiscvAbi` descriptor of declared facts (XLEN, FLEN, the integer register file size, the argument-register counts) and a single shared classifier reads them, so there is no per-member branch anywhere and adding a member is a descriptor plus a `register` call. Three members ship:
+
+| abi | float arguments |
+|---|---|
+| `lp64` | soft float, every float in an integer register |
+| `lp64f` | `f32` in `fa0`-`fa7`, `f64` in the integer bank |
+| `lp64d` | `f32` and `f64` in `fa0`-`fa7` |
+
+The whole float-argument rule is one comparison against the member's declared FLEN (`width * 8 <= flen_bits`), so soft float is that rule at zero rather than a second code path, and `lp64f` — the member a hard/soft boolean cannot describe at all — costs nothing. `lp64e` and the `ilp32` family are described by the same contract and deliberately **not** registered: each needs a base ISA that does not exist yet (a 16-register RV64E file, or `ARCH_RISCV32`, #2778), and a convention registered without an ISA that can back it would compile and emit calls the hardware cannot make.
+
+**The linux default for riscv64 is now `lp64d`**, which is what `riscv64-linux-gnu` means by "riscv64". This is the interop-correct default: every riscv64 Linux distribution is built on lp64d, so a mach object under any other member passes a double in `a0` where every system library expects it in `fa0` — a mismatch that produces wrong values rather than a link error. Freestanding also defaults to `lp64d`, matching the psABI its ISA declares; a bare-metal image that leaves the FPU off should now spell `abi = "lp64"`, which is finally a real convention rather than a name that emitted hard-float code anyway.
+
+An ABI that needs a float extension the target lacks is now **refused when the target resolves**, naming both sides and both widths, rather than emitting code that cannot execute. The ISA declares what it has (`MachineModel.flen_bits`) and the convention declares what it needs (`AbiVTable.float_arg_bits`), and the gate is those two declared widths compared — so it covers a new convention or a new ISA with no table of names. `lp64q`, which needs the Q extension rv64gc does not have, is refused on this path; `lp64d` composes on the same one.
+
+Manifests spelling `abi = "lp64"` for riscv64 keep building, but now select **soft float** and emit different code. Change them to `abi = "lp64d"` to keep the previous behaviour; every manifest in this repository was updated.
+
+C-variadic calls are **refused on every RISC-V member** rather than placed. The psABI's unnamed-argument rule differs per member (a tail `double` takes `a0` under lp64d where a named one takes `fa0`, and the soft-float members differ again), so implementing it would multiply the family's descriptions rather than add to them, for a call form with no user in mach or mach-std. `RiscvAbi.variadic_float_bits` is declared and carries a sentinel so the rule can be filled in later alongside the others; a refusal is exact and cheap to replace, a wrong placement rule is neither. mach's own `va: ...` parameter pack is a different mechanism, expands at compile time, and is unaffected.
+
+### Fixed
+
+#### A scalar `f32` passed in an integer register read back as `NaN` on riscv64 (#2777)
+
+`capture_slot_reg` took the move width for a value captured out of an incoming argument or return register from the machine word rather than from the value, so an `f32` arriving in `a0` was reinterpreted with `fmv.d.x` (a raw 64-bit move) instead of `fmv.w.x`. RISC-V requires a single-precision value in an `f` register to be NaN-boxed, and the raw move does not box, so every subsequent `fmul.s`/`fadd.s` on it produced `NaN`. The placement side already took its width from the value, so the two directions were asymmetric — which is why `f64` in an integer register was correct (its width happened to equal the machine word) and `f32` in an `fa` register was correct (it never took the integer path).
+
+Only reachable once a soft-float member existed, so it was latent rather than a regression. It is the first defect found by the width-versus-register-width split that #2778 exists to stress.
+
 #### A release build now carries a real ELF `.symtab`, so `perf` and a crash reporter can resolve a function name without a `-g` rebuild (#2772)
 Mach emitted no `.symtab` in any build, release or `-g`: `nm` reported nothing, `perf` could not symbolize a profile, and a crash address from a shipped binary mapped to a function only by rebuilding with `-g` and doing a DWARF lookup against the exact matching build - two ordinary workflows a shipping game needs, neither possible before this.
 

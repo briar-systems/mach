@@ -1,0 +1,886 @@
+# mach.lang.target.abi.riscv: the RISC-V psABI calling-convention FAMILY
+#
+# The RISC-V psABI is not one calling convention, it is a family: lp64 / lp64f /
+# lp64d / lp64e on RV64 and ilp32 / ilp32f / ilp32d / ilp32e on RV32. This module
+# implements the family ONCE. A member is a `RiscvAbi` DESCRIPTOR -- a handful of
+# declared facts -- and one shared classifier reads those facts. Adding a member is
+# a descriptor and a `register_*` call; it is never an edit to the classifier, and
+# there is no per-member branch anywhere below.
+#
+# WHAT WAS HERE BEFORE, AND WHY THE SHAPE CHANGED (#2777). This file replaces
+# `abi/lp64.mach`, which declared exactly one convention named "lp64" whose
+# classifier placed a scalar double in `fa0`. That is lp64d's rule, not lp64's:
+# `lp64` is the SOFT-FLOAT member and passes every float in an integer register. So
+# the name and the behaviour disagreed, and a manifest saying `abi = "lp64"` got
+# hard-float code. Nothing read the difference because the riscv64 leg runs under
+# qemu against mach's own code and links nothing foreign.
+#
+# THE FOUR FACTS, and why each is DECLARED rather than assumed. A classifier shaped
+# around lp64 and lp64d alone silently inherits everything those two agree on, and
+# every one of those agreements is false for some other member:
+#
+#   xlen_bits  -- the integer register width. Fixes the register slot width, the
+#                 2*XLEN register-return / by-reference threshold, and the stack
+#                 slot granularity. 64 across the lp64 family, 32 across ilp32,
+#                 where the by-reference threshold is 8 rather than 16.
+#
+#   flen_bits  -- the widest scalar float the FLOAT ARGUMENT bank carries, 0 when
+#                 floats are passed in integer registers. THE WHOLE FLOAT-ARGUMENT
+#                 RULE IS THIS ONE NUMBER: an f`w` rides an fa register exactly when
+#                 `w*8 <= flen_bits`. lp64d is 64 and takes both; lp64f is 32 and
+#                 takes f32 while passing f64 in the integer bank; lp64 is 0 and
+#                 takes neither. Soft float is that rule AT ZERO rather than a
+#                 separate code path beside it, which is what keeps lp64f from being
+#                 a third case nobody wrote.
+#
+#                 NOT THE SAME AS "the target has an FPU". A soft-float ABI on
+#                 hardware WITH D still computes in f0-f31 and still preserves
+#                 fs0-fs11 across a call -- it just does not PASS ARGUMENTS there.
+#                 So this bounds argument placement only, and the callee-saved bank
+#                 below is declared separately and stays full under lp64.
+#
+#   gp_arg_count -- the integer argument registers. 8 (a0-a7) on the I base, and 6
+#                 on the E base, whose integer file is 16 registers rather than 32.
+#                 A classifier reading a constant 8 places a seventh argument in a
+#                 register RV64E does not have.
+#
+#   int_reg_count -- the integer register file size, 32 or 16. Declared here because
+#                 the `e` members are the reason the count is not a constant, and
+#                 because the ISA and the ABI must agree about it before either is
+#                 usable.
+#
+# WHAT IS SHIPPED AND WHAT IS NOT. lp64, lp64f and lp64d are registered and
+# complete. `lp64e` and the whole ilp32 family are DESCRIBED by this contract but
+# deliberately NOT REGISTERED, because each needs a base ISA that does not exist
+# yet: the `e` members need an RV64E/RV32E register file of 16 integer registers,
+# and ilp32 needs ARCH_RISCV32 (#2778). Registering a member whose ISA cannot back
+# it would produce a convention that compiles and emits calls the hardware cannot
+# make, which is the one outcome worth avoiding. The contract is proven against
+# them by `descriptor_facts_are_read` below rather than by a registration that
+# would report a support we do not have.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.string.str;
+
+use R: std.types.result;
+
+use mach.lang.target.abi;
+use mach.lang.target.isa;
+
+# one vtable per registered family member, handed to the registry as borrowed
+# pointers and valid for the process lifetime. three where every other convention
+# module has one, because the family is implemented once and REGISTERED per member
+var lp64_vtable:  abi.AbiVTable;
+var lp64f_vtable: abi.AbiVTable;
+var lp64d_vtable: abi.AbiVTable;
+
+# the declared facts of one member of the RISC-V ABI family
+#
+# Every number the classifier needs that DIFFERS between members. A fact absent here
+# is a fact the classifier may treat as universal across the family, so adding one
+# is how a member that breaks an assumption gets described rather than special-cased.
+# ---
+# id:                    the abi.ABI_* id
+# name:                  the psABI spelling, and the registry key ("lp64d")
+# arch_id:               the isa.ARCH_* base this member requires
+# xlen_bits:             integer register width in bits (64 lp64*, 32 ilp32*)
+# flen_bits:             widest scalar float passed in the fa bank, 0 for soft float
+# int_reg_count:         integer register file size (32 on the I base, 16 on E)
+# gp_arg_count:          integer argument registers (8 on I, 6 on E)
+# fp_arg_count:          float argument registers (8, and unreachable at flen_bits 0)
+# gp_callee_saved_count: callee-saved integer registers
+# fp_callee_saved_count: callee-saved float registers (full even under soft float)
+# variadic_float_bits:   the UNPOPULATED variadic rule; see VARIADIC_RULE_UNDECLARED
+pub rec RiscvAbi {
+    id:                    u32;
+    name:                  str;
+    arch_id:               u32;
+    xlen_bits:             u32;
+    flen_bits:             u32;
+    int_reg_count:         u32;
+    gp_arg_count:          i32;
+    fp_arg_count:          i32;
+    gp_callee_saved_count: i32;
+    fp_callee_saved_count: i32;
+
+    # THE VARIADIC RULE, DECLARED AND DELIBERATELY NOT POPULATED.
+    #
+    # The widest scalar float an UNNAMED (variadic-tail) argument would ride in the
+    # fa bank. It is a fact OF A MEMBER exactly like `flen_bits` beside it, and it is
+    # a separate fact rather than a reuse of that one because the two genuinely
+    # disagree: under lp64d a named double takes fa0 while an unnamed double of the
+    # same type takes a0, so one number cannot answer both questions. The soft-float
+    # members differ again, which is the multiplication this field exists to make
+    # visible rather than to hide.
+    #
+    # Every shipped member sets this to VARIADIC_RULE_UNDECLARED, and the family
+    # REFUSES a C-variadic call (its `va_model` is nil) rather than guessing. mach has
+    # no variadics of its own; the C-variadic `ext fun` CALL form has no user in mach
+    # or mach-std, and whether it survives at all is not settled. Populating a
+    # placement rule for a caller that may not exist would take the family from three
+    # descriptions to eleven, and a wrong rule is far more expensive to find than a
+    # refusal is to replace.
+    #
+    # To fill this in: give it a real width per member, add the reader that consults
+    # it, and give the family a non-nil `va_model` in the same change.
+    variadic_float_bits:   u32;
+}
+
+# the value `variadic_float_bits` carries while the variadic rule is unbuilt
+#
+# Distinct from 0, which is a REAL answer meaning "no unnamed float ever rides the fa
+# bank" and happens to be the correct rule for the hard-float members. A sentinel
+# instead, so that a member left unpopulated cannot be mistaken for a member whose
+# rule was decided and written down.
+pub val VARIADIC_RULE_UNDECLARED: u32 = 0xFFFFFFFF;
+
+# build a family-member descriptor, every fact supplied
+#
+# Positional for the same reason `abi.abi_vtable` is: a member that forgets a fact
+# is an arity error at build time rather than a zero that reads as "32-bit" or
+# "soft float" and places arguments accordingly.
+# ---
+# (parameters mirror `RiscvAbi` field for field)
+# ret: the assembled descriptor
+pub fun rv_abi(id: u32, name: str, arch_id: u32, xlen_bits: u32, flen_bits: u32,
+               int_reg_count: u32, gp_arg_count: i32, fp_arg_count: i32,
+               gp_callee_saved_count: i32, fp_callee_saved_count: i32) RiscvAbi {
+    var v: RiscvAbi;
+    v.id                    = id;
+    v.name                  = name;
+    v.arch_id               = arch_id;
+    v.xlen_bits             = xlen_bits;
+    v.flen_bits             = flen_bits;
+    v.int_reg_count         = int_reg_count;
+    v.gp_arg_count          = gp_arg_count;
+    v.fp_arg_count          = fp_arg_count;
+    v.gp_callee_saved_count = gp_callee_saved_count;
+    v.fp_callee_saved_count = fp_callee_saved_count;
+    # not a constructor parameter: no member has a variadic rule, so there is nothing
+    # for a caller to supply. it becomes a parameter in the change that populates it,
+    # and every member is then forced to answer by the same arity rule as the rest.
+    v.variadic_float_bits   = VARIADIC_RULE_UNDECLARED;
+    ret v;
+}
+
+# canonical RISC-V register numbers. these are architectural and XLEN-independent --
+# a0 is x10 on RV32 and RV64 alike -- so the family carries them directly rather
+# than depending on an ISA implementation having registered first
+pub val REG_A0: i32 = 10;
+pub val REG_A1: i32 = 11;
+pub val REG_S1: i32 = 9;
+pub val REG_S2: i32 = 18;
+
+# required stack alignment in bytes at a call boundary. 16 across the family; the
+# `e` members relax it to 4, which is a fact those descriptors will carry when their
+# base ISA exists rather than a constant edited in place
+pub val STACK_ALIGN: u32 = 16;
+# RISC-V defines no leaf-function red zone, in any member
+pub val RED_ZONE:    u32 = 0;
+
+# ---------------------------------------------------------------- the family members
+
+# lp64: RV64 SOFT FLOAT. every floating-point argument and return rides an INTEGER
+# register. runs on any rv64, including one with no F or D extension at all
+pub fun v_lp64() RiscvAbi {
+    ret rv_abi(abi.ABI_LP64, "lp64", isa.ARCH_RISCV64, 64, 0, 32, 8, 8, 11, 12);
+}
+
+# lp64f: RV64 with SINGLE-precision arguments in fa0-fa7. an f64 still rides the
+# integer bank, which is the case a hard-float / soft-float boolean cannot express.
+# requires the F extension
+pub fun v_lp64f() RiscvAbi {
+    ret rv_abi(abi.ABI_LP64F, "lp64f", isa.ARCH_RISCV64, 64, 32, 32, 8, 8, 11, 12);
+}
+
+# lp64d: RV64 with SINGLE AND DOUBLE precision arguments in fa0-fa7. requires the D
+# extension, and is what `riscv64-linux-gnu` means by "riscv64" -- so it is the
+# linux default (`os.linux.linux_native_abi`) and the one a mach object must use to
+# link against any system library
+pub fun v_lp64d() RiscvAbi {
+    ret rv_abi(abi.ABI_LP64D, "lp64d", isa.ARCH_RISCV64, 64, 64, 32, 8, 8, 11, 12);
+}
+
+# ------------------------------------------------------------------ derived facts
+
+# the integer register width in bytes
+# ---
+# v:   the family member
+# ret: XLEN in bytes (8 for lp64*, 4 for ilp32*)
+pub fun xlen_bytes(v: RiscvAbi) u64 { ret (v.xlen_bits / 8)::u64; }
+
+# the largest aggregate passed or returned in registers; anything larger goes by
+# hidden reference. 2*XLEN across the family, so 16 on lp64* and 8 on ilp32*
+# ---
+# v:   the family member
+# ret: the register-return threshold in bytes
+pub fun max_reg_ret(v: RiscvAbi) u64 { ret 2 * xlen_bytes(v); }
+
+# THE FLOAT-ARGUMENT RULE: whether a float of `width` bytes is passed in the fa bank
+#
+# The whole of the family's float-passing divergence, in one comparison. lp64d
+# (flen 64) takes f32 and f64; lp64f (flen 32) takes f32 and sends f64 to the
+# integer bank; lp64 (flen 0) takes neither. Soft float is not a branch beside this
+# rule, it is this rule at zero -- which is precisely why a fourth member costs
+# nothing.
+# ---
+# v:     the family member
+# width: the scalar float's width in bytes
+# ret:   true when it rides an fa register
+pub fun float_in_fp_bank(v: RiscvAbi, width: u64) bool {
+    if (v.flen_bits == 0) { ret false; }
+    ret (width * 8) <= v.flen_bits::u64;
+}
+
+# the integer argument register for a zero-based index, or -1 past the member's bank
+# ---
+# v:     the family member
+# index: zero-based integer argument-register index
+# ret:   the physical register id, or -1 if out of range
+pub fun gp_param_reg(v: RiscvAbi, index: i32) i32 {
+    if (index < 0)                { ret -1; }
+    if (index >= v.gp_arg_count)  { ret -1; }
+    ret REG_A0 + index;
+}
+
+# the float argument register for a zero-based index, or -1 past the member's bank
+#
+# fa registers are f10-f17; the id is composite (the float class tag in the high
+# byte) so a float pre-coloring carries its bank and is never aliased onto the
+# integer register of the same index.
+# ---
+# v:     the family member
+# index: zero-based float argument-register index
+# ret:   the composite fa register id, or -1 if out of range
+pub fun fp_param_reg(v: RiscvAbi, index: i32) i32 {
+    if (index < 0)               { ret -1; }
+    if (index >= v.fp_arg_count) { ret -1; }
+    ret isa.regid_make(isa.REG_CLASS_ID_XMM, REG_A0 + index);
+}
+
+# count the floating-point leaves of a flattened <=2-leaf aggregate descriptor
+# ---
+# agg: the two-leaf flattened descriptor
+# ret: the number of float leaves (0, 1, or 2)
+fun two_leaf_float_count(agg: abi.AggLayout) u32 {
+    var nf: u32 = 0;
+    var k: u32 = 0;
+    for (k < 2) { if (agg.fields[k].is_float) { nf = nf + 1; } k = k + 1; }
+    ret nf;
+}
+
+# whether every float leaf of a two-leaf descriptor fits the member's fa bank
+#
+# The flatten rules are gated on the SAME width comparison a scalar is, so a
+# `{f64; f64}` struct rides fa0:fa1 under lp64d, falls to the integer convention
+# under lp64f (whose fa registers hold no double), and never flattens under lp64.
+# ---
+# v:   the family member
+# agg: the two-leaf flattened descriptor
+# ret: true when each float leaf is fa-eligible
+fun leaves_fit_fp_bank(v: RiscvAbi, agg: abi.AggLayout) bool {
+    var k: u32 = 0;
+    for (k < 2) {
+        if (agg.fields[k].is_float) {
+            if (!float_in_fp_bank(v, agg.fields[k].width::u64)) { ret false; }
+        }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# build the placement for a <=2-leaf aggregate the uniform-flatten rule did not place
+#
+# Covers the different-width float pair (one fa register each) and the mixed
+# float-plus-integer struct (the float in fa, the integer in a), each leaf loaded
+# from its own field offset at its own width. Shared by argument and return
+# placement so the two can never drift apart.
+# ---
+# agg:  the two-leaf flattened descriptor
+# nf:   the float-leaf count (1 selects the mixed case, 2 the float pair)
+# fp0:  the fa register for the first float leaf
+# fp1:  the fa register for the second float leaf (unused when nf == 1)
+# gp0:  the a register for the integer leaf (unused when nf == 2)
+# size: the aggregate's byte size
+# ret:  the assembled multi-piece ParamSlot
+fun make_two_leaf_slot(agg: abi.AggLayout, nf: u32, fp0: i32, fp1: i32, gp0: i32, size: u64) abi.ParamSlot {
+    var ps: [2]abi.ParamPiece;
+    var fa_used: u32 = 0;
+    var j: u32 = 0;
+    for (j < 2) {
+        if (agg.fields[j].is_float) {
+            var reg: i32 = fp0;
+            if (fa_used != 0) { reg = fp1; }
+            ps[j] = abi.make_piece(abi.PIECE_FP, reg, agg.fields[j].offset::i64, 0, agg.fields[j].width);
+            fa_used = fa_used + 1;
+        } or {
+            ps[j] = abi.make_piece(abi.PIECE_GP, gp0, agg.fields[j].offset::i64, 0, agg.fields[j].width);
+        }
+        j = j + 1;
+    }
+    var class: abi.ParamClass = abi.CLASS_GP;
+    if (nf == 2) { class = abi.CLASS_FP; }
+    ret abi.make_slot_pieces(class, ?ps[0], 2, size);
+}
+
+# ------------------------------------------------------- the shared classifier
+
+# assign registers or a stack slot for one argument, for ANY family member
+#
+# THE ONE CLASSIFIER. Every member routes here with its own descriptor; there is no
+# per-member branch below, only reads of `v`. The placement order is the psABI's:
+# a vector and an over-threshold aggregate go by hidden reference, a flattenable
+# float aggregate rides the fa bank, a <=2-leaf mixed or different-width pair rides
+# the per-piece path, an integer-class aggregate takes one register or a consecutive
+# pair (splitting across the last register and the stack at the boundary), and a
+# scalar takes its bank then the stack.
+#
+# THIS CLASSIFIER ANSWERS FOR A NAMED ARGUMENT ONLY. The psABI's rule for an
+# UNNAMED (variadic-tail) argument differs -- under the hard-float members a tail
+# double rides a0-a7 rather than fa0-fa7 -- and that rule is deliberately not
+# implemented here. The family refuses a C-variadic call instead (a nil `va_model`),
+# so no caller can reach this function with a tail argument and receive a named
+# argument's answer. See `RiscvAbi.variadic_float_bits`.
+# ---
+# v:             the family member's declared facts
+# index:         zero-based logical argument position
+# size:          argument size in bytes
+# align:         argument alignment in bytes
+# is_float:      true if the argument is a scalar float
+# fp_eightbytes: per-eightbyte SSE mask (unused -- RISC-V routes scalars by is_float)
+# is_aggregate:  true if the argument is an aggregate
+# is_vector:     true for a 128-bit SIMD vector; RISC-V has no vector unit in
+#                baseline, so a vector is the memory (by-reference) class
+# is_ext:        true at a declared `ext` boundary; ignored, the family's convention
+#                already matches mach's internal one
+# gp_used:       integer registers already consumed
+# fp_used:       float registers already consumed
+# hfa_members:   homogeneous-float member count (1 or 2 selects the flattening)
+# hfa_elem:      homogeneous-float fundamental member width
+# agg:           the <=2-leaf flattened-aggregate descriptor
+# ret:           the placement decision
+pub fun classify_arg_v(v: RiscvAbi, index: i32, size: u64, align: u64,
+                       is_float: bool, fp_eightbytes: u8, is_aggregate: bool,
+                       is_vector: bool, is_ext: bool,
+                       gp_used: i32, fp_used: i32, hfa_members: u8, hfa_elem: u8,
+                       agg: abi.AggLayout) abi.ParamSlot {
+    val word: u64 = xlen_bytes(v);
+
+    # a 128-bit vector has no register file here: pass it by hidden reference, the
+    # pointer in the next integer register, or on the stack once the bank is spent.
+    if (is_vector) {
+        if (gp_used < v.gp_arg_count) {
+            ret abi.make_slot(abi.CLASS_BYREF, gp_param_reg(v, gp_used), -1, 0, word);
+        }
+        ret abi.make_slot(abi.CLASS_STACK_BYREF, -1, -1, 0, word);
+    }
+
+    if (is_aggregate && size > max_reg_ret(v)) {
+        if (gp_used < v.gp_arg_count) {
+            ret abi.make_slot(abi.CLASS_BYREF, gp_param_reg(v, gp_used), -1, 0, word);
+        }
+        ret abi.make_slot(abi.CLASS_STACK_BYREF, -1, -1, 0, word);
+    }
+
+    # hard-float struct flattening: an aggregate flattening to one or two float
+    # members rides one fa register per member, at its field offset. gated on the
+    # member's own float-width rule, so a {f64; f64} flattens under lp64d and does
+    # not under lp64f, whose fa registers hold no double.
+    if (is_aggregate && (hfa_members == 1 || hfa_members == 2)) {
+        if (float_in_fp_bank(v, hfa_elem::u64)) {
+            if (fp_used + hfa_members::i32 <= v.fp_arg_count) {
+                ret abi.make_slot_hfa(fp_param_reg(v, fp_used), hfa_members, hfa_elem, size);
+            }
+        }
+    }
+
+    # different-width float pair / mixed float+integer struct: a <=2-leaf aggregate
+    # the uniform rule did not place. each falls through to the integer convention
+    # when a needed bank is exhausted or the member cannot carry a leaf's width.
+    if (is_aggregate && agg.field_count == 2 && leaves_fit_fp_bank(v, agg)) {
+        val nf: u32 = two_leaf_float_count(agg);
+        if (nf == 2) {
+            if (fp_used + 2 <= v.fp_arg_count) {
+                ret make_two_leaf_slot(agg, 2, fp_param_reg(v, fp_used), fp_param_reg(v, fp_used + 1), -1, size);
+            }
+        } or (nf == 1) {
+            if (fp_used < v.fp_arg_count && gp_used < v.gp_arg_count) {
+                ret make_two_leaf_slot(agg, 1, fp_param_reg(v, fp_used), -1, gp_param_reg(v, gp_used), size);
+            }
+        }
+    }
+
+    if (is_aggregate) {
+        if (size <= word) {
+            if (gp_used < v.gp_arg_count) {
+                ret abi.make_slot(abi.CLASS_GP, gp_param_reg(v, gp_used), -1, 0, size);
+            }
+            ret abi.make_slot(abi.CLASS_STACK, -1, -1, 0, size);
+        }
+        # one to two words: a consecutive integer pair when two registers remain.
+        if (gp_used + 2 <= v.gp_arg_count) {
+            ret abi.make_slot(abi.CLASS_GP, gp_param_reg(v, gp_used), gp_param_reg(v, gp_used + 1), 0, size);
+        }
+        # exactly one register remains: the boundary rule places the low word in it
+        # and the high word in an outgoing stack slot rather than spilling the whole
+        # aggregate.
+        if (gp_used + 1 == v.gp_arg_count) {
+            var ps: [2]abi.ParamPiece;
+            ps[0] = abi.make_piece(abi.PIECE_GP,    gp_param_reg(v, gp_used), 0, 0, word::u8);
+            ps[1] = abi.make_piece(abi.PIECE_STACK, -1,                       word::i64, 0, word::u8);
+            ret abi.make_slot_pieces(abi.CLASS_GP, ?ps[0], 2, size);
+        }
+        ret abi.make_slot(abi.CLASS_STACK, -1, -1, 0, size);
+    }
+
+    if (is_float) {
+        if (float_in_fp_bank(v, size) && fp_used < v.fp_arg_count) {
+            ret abi.make_slot(abi.CLASS_FP, fp_param_reg(v, fp_used), -1, 0, size);
+        }
+        # the fa bank is unavailable to this float -- because the member is soft
+        # float, because the float is wider than the member carries, or because the
+        # bank is spent. in every one of those cases the psABI passes the raw bits in
+        # an integer argument register, then on the stack.
+        if (gp_used < v.gp_arg_count) {
+            ret abi.make_slot(abi.CLASS_GP, gp_param_reg(v, gp_used), -1, 0, size);
+        }
+        ret abi.make_slot(abi.CLASS_STACK, -1, -1, 0, size);
+    }
+
+    if (gp_used < v.gp_arg_count) {
+        ret abi.make_slot(abi.CLASS_GP, gp_param_reg(v, gp_used), -1, 0, size);
+    }
+    ret abi.make_slot(abi.CLASS_STACK, -1, -1, 0, size);
+}
+
+# assign registers or an sret pointer for a return value, for ANY family member
+#
+# The return side of the same rules, with every bank free. A return is never
+# variadic, so the fa bank is consulted whenever the member's float-width rule
+# admits the value.
+# ---
+# v:             the family member's declared facts
+# size:          return-value size in bytes
+# align:         return-value alignment in bytes
+# is_float:      true if the value is a scalar float
+# fp_eightbytes: per-eightbyte SSE mask (unused)
+# is_aggregate:  true if the value is an aggregate
+# is_vector:     true for a 128-bit SIMD vector return (by hidden reference)
+# hfa_members:   homogeneous-float member count (1 or 2 selects the flattening)
+# hfa_elem:      homogeneous-float fundamental member width
+# agg:           the <=2-leaf flattened-aggregate descriptor
+# ret:           the placement decision
+pub fun classify_return_v(v: RiscvAbi, size: u64, align: u64,
+                          is_float: bool, fp_eightbytes: u8, is_aggregate: bool,
+                          is_vector: bool, hfa_members: u8, hfa_elem: u8,
+                          agg: abi.AggLayout) abi.ParamSlot {
+    val word: u64 = xlen_bytes(v);
+
+    if (size == 0) { ret abi.make_slot(abi.CLASS_GP, -1, -1, 0, 0); }
+
+    if (is_vector)                              { ret abi.make_slot(abi.CLASS_SRET, REG_A0, -1, 0, word); }
+    if (is_aggregate && size > max_reg_ret(v))  { ret abi.make_slot(abi.CLASS_SRET, REG_A0, -1, 0, word); }
+
+    if (is_aggregate && (hfa_members == 1 || hfa_members == 2)) {
+        if (float_in_fp_bank(v, hfa_elem::u64)) {
+            ret abi.make_slot_hfa(fp_param_reg(v, 0), hfa_members, hfa_elem, size);
+        }
+    }
+
+    if (is_aggregate && agg.field_count == 2 && leaves_fit_fp_bank(v, agg)) {
+        val nf: u32 = two_leaf_float_count(agg);
+        if (nf == 2) {
+            ret make_two_leaf_slot(agg, 2, fp_param_reg(v, 0), fp_param_reg(v, 1), -1, size);
+        } or (nf == 1) {
+            ret make_two_leaf_slot(agg, 1, fp_param_reg(v, 0), -1, REG_A0, size);
+        }
+    }
+
+    if (is_aggregate) {
+        if (size <= word) { ret abi.make_slot(abi.CLASS_GP, REG_A0, -1, 0, size); }
+        ret abi.make_slot(abi.CLASS_GP, REG_A0, REG_A1, 0, size);
+    }
+
+    if (is_float && float_in_fp_bank(v, size)) {
+        ret abi.make_slot(abi.CLASS_FP, fp_param_reg(v, 0), -1, 0, size);
+    }
+
+    ret abi.make_slot(abi.CLASS_GP, REG_A0, -1, 0, size);
+}
+
+# fill `out` with the member's integer argument registers, in passing order
+# ---
+# v:   the family member
+# out: caller-owned buffer of at least `v.gp_arg_count` registers
+# ret: the number of registers written
+pub fun gp_param_regs_v(v: RiscvAbi, out: *isa.Register) i32 {
+    var i: i32 = 0;
+    for (i < v.gp_arg_count) {
+        out[i].id   = gp_param_reg(v, i);
+        out[i].size = xlen_bytes(v)::u8;
+        i = i + 1;
+    }
+    ret v.gp_arg_count;
+}
+
+# fill `out` with the member's callee-saved registers across both banks
+#
+# The integer set s1, s2-s11 (x9, x18-x27) then the float set fs0-fs11 (f8, f9,
+# f18-f27). THE FLOAT SET IS FULL EVEN UNDER SOFT FLOAT: lp64 does not pass floats
+# in registers, but it still runs on hardware whose f registers exist and whose
+# psABI still requires fs0-fs11 preserved across a call, and mach still allocates
+# them for float COMPUTATION. Deriving this bank from `flen_bits` would clobber
+# callee state on every soft-float call that did any float arithmetic.
+# ---
+# v:   the family member
+# out: caller-owned buffer of at least the member's callee-saved count
+# ret: the number of registers written
+pub fun callee_saved_v(v: RiscvAbi, out: *isa.Register) i32 {
+    val w: u8 = xlen_bytes(v)::u8;
+    out[0].id   = REG_S1;
+    out[0].size = w;
+    var i: i32 = 0;
+    for (i < v.gp_callee_saved_count - 1) {
+        out[1 + i].id   = REG_S2 + i;
+        out[1 + i].size = w;
+        i = i + 1;
+    }
+    val fbase: i32 = v.gp_callee_saved_count;
+    out[fbase].id       = isa.regid_make(isa.REG_CLASS_ID_XMM, 8);
+    out[fbase].size     = 8;
+    out[fbase + 1].id   = isa.regid_make(isa.REG_CLASS_ID_XMM, 9);
+    out[fbase + 1].size = 8;
+    i = 0;
+    for (i < v.fp_callee_saved_count - 2) {
+        out[fbase + 2 + i].id   = isa.regid_make(isa.REG_CLASS_ID_XMM, 18 + i);
+        out[fbase + 2 + i].size = 8;
+        i = i + 1;
+    }
+    ret v.gp_callee_saved_count + v.fp_callee_saved_count;
+}
+
+# THE FAMILY DECLARES NO VARIADIC MODEL, SO A C-VARIADIC CALL IS REFUSED.
+#
+# Every member registers a NIL `va_model`, which `mir.abi.abi_va_model` already
+# treats as "this convention cannot make a variadic call" and reports as a
+# diagnostic at the call rather than as a silently misplaced argument. That is the
+# whole of the family's variadic support, on purpose.
+#
+# WHY A REFUSAL RATHER THAN A RULE. The psABI's unnamed-argument placement differs
+# per member -- a tail double takes a0 under lp64d where a named one takes fa0, and
+# the soft-float members differ again -- so implementing it multiplies the family's
+# descriptions rather than adding to them. mach has no variadics of its own, and the
+# C-variadic `ext fun` call form it would serve has no user in mach or mach-std. A
+# refusal is exact, cannot be wrong at runtime, and is replaced by populating
+# `RiscvAbi.variadic_float_bits` and returning a real model from here.
+#
+# WHAT THIS DOES NOT AFFECT: mach's own `va: ...` parameter pack. That is expanded
+# at compile time into a fixed-arity call and never reaches the variadic call path,
+# which is why `printlnf` and the rest of the standard library's formatting keep
+# working on every RISC-V target.
+
+# ------------------------------------------------ per-member vtable installation
+
+# THE PER-MEMBER SEAM, and the only thing a new member adds.
+#
+# `AbiVTable`'s operation pointers are plain function pointers with a fixed,
+# architecture-neutral signature and no self parameter, so a shared implementation
+# cannot recover WHICH member it is serving from its arguments. Each member
+# therefore supplies three one-line thunks that name its own descriptor and forward
+# to the shared bodies above. That is the entire per-member cost: the classifier,
+# the flatten rules, the banks and the variadic rule are written once.
+#
+# The alternative -- widening every convention's classifier signature to carry a
+# descriptor pointer -- would push a RISC-V-shaped parameter through the AMD64 and
+# AAPCS64 conventions, which have no family and no descriptor, to spare this file
+# nine thunks. That is the layer rewrite the seam exists to avoid.
+
+fun lp64_classify(size: u64, align: u64, is_float: bool, fpe: u8, is_agg: bool,
+                  gp: i32, fp: i32, hm: u8, he: u8) abi.ParamSlot {
+    ret classify_arg_v(v_lp64(), 0, size, align, is_float, fpe, is_agg, false, false, gp, fp, hm, he, abi.agg_none());
+}
+fun lp64_arg(index: i32, size: u64, align: u64, is_float: bool, fpe: u8, is_agg: bool,
+             is_vec: bool, is_ext: bool, gp: i32, fp: i32, hm: u8, he: u8,
+             agg: abi.AggLayout) abi.ParamSlot {
+    ret classify_arg_v(v_lp64(), index, size, align, is_float, fpe, is_agg, is_vec, is_ext, gp, fp, hm, he, agg);
+}
+fun lp64_ret(size: u64, align: u64, is_float: bool, fpe: u8, is_agg: bool, is_vec: bool,
+             hm: u8, he: u8, agg: abi.AggLayout) abi.ParamSlot {
+    ret classify_return_v(v_lp64(), size, align, is_float, fpe, is_agg, is_vec, hm, he, agg);
+}
+fun lp64_gp_regs(out: *isa.Register) i32 { ret gp_param_regs_v(v_lp64(), out); }
+fun lp64_cs(out: *isa.Register) i32      { ret callee_saved_v(v_lp64(), out); }
+
+fun lp64f_classify(size: u64, align: u64, is_float: bool, fpe: u8, is_agg: bool,
+                   gp: i32, fp: i32, hm: u8, he: u8) abi.ParamSlot {
+    ret classify_arg_v(v_lp64f(), 0, size, align, is_float, fpe, is_agg, false, false, gp, fp, hm, he, abi.agg_none());
+}
+fun lp64f_arg(index: i32, size: u64, align: u64, is_float: bool, fpe: u8, is_agg: bool,
+              is_vec: bool, is_ext: bool, gp: i32, fp: i32, hm: u8, he: u8,
+              agg: abi.AggLayout) abi.ParamSlot {
+    ret classify_arg_v(v_lp64f(), index, size, align, is_float, fpe, is_agg, is_vec, is_ext, gp, fp, hm, he, agg);
+}
+fun lp64f_ret(size: u64, align: u64, is_float: bool, fpe: u8, is_agg: bool, is_vec: bool,
+              hm: u8, he: u8, agg: abi.AggLayout) abi.ParamSlot {
+    ret classify_return_v(v_lp64f(), size, align, is_float, fpe, is_agg, is_vec, hm, he, agg);
+}
+fun lp64f_gp_regs(out: *isa.Register) i32 { ret gp_param_regs_v(v_lp64f(), out); }
+fun lp64f_cs(out: *isa.Register) i32      { ret callee_saved_v(v_lp64f(), out); }
+
+fun lp64d_classify(size: u64, align: u64, is_float: bool, fpe: u8, is_agg: bool,
+                   gp: i32, fp: i32, hm: u8, he: u8) abi.ParamSlot {
+    ret classify_arg_v(v_lp64d(), 0, size, align, is_float, fpe, is_agg, false, false, gp, fp, hm, he, abi.agg_none());
+}
+fun lp64d_arg(index: i32, size: u64, align: u64, is_float: bool, fpe: u8, is_agg: bool,
+              is_vec: bool, is_ext: bool, gp: i32, fp: i32, hm: u8, he: u8,
+              agg: abi.AggLayout) abi.ParamSlot {
+    ret classify_arg_v(v_lp64d(), index, size, align, is_float, fpe, is_agg, is_vec, is_ext, gp, fp, hm, he, agg);
+}
+fun lp64d_ret(size: u64, align: u64, is_float: bool, fpe: u8, is_agg: bool, is_vec: bool,
+              hm: u8, he: u8, agg: abi.AggLayout) abi.ParamSlot {
+    ret classify_return_v(v_lp64d(), size, align, is_float, fpe, is_agg, is_vec, hm, he, agg);
+}
+fun lp64d_gp_regs(out: *isa.Register) i32 { ret gp_param_regs_v(v_lp64d(), out); }
+fun lp64d_cs(out: *isa.Register) i32      { ret callee_saved_v(v_lp64d(), out); }
+
+# install every registered member of the family into `reg`
+#
+# The hidden sret pointer rides a0, the first integer argument register, so
+# `indirect_result_in_argfile` is true across the family. `consumes_agg_layout` is
+# true for every member: the two-leaf descriptor is what the mixed and
+# different-width rules read, and a soft-float member still needs it to REFUSE the
+# flatten rather than to apply it. RISC-V scalarizes 128-bit vectors before
+# allocation, so no vector rides a callee-saved FP register and
+# `fp_callee_saved_full_vector` is moot and set true.
+#
+# `float_arg_bits` is the member's own `flen_bits`, which is what makes the
+# extension check in `target.select_of` a comparison against the ISA's declared
+# FLEN rather than a table of convention names.
+# ---
+# reg: the ABI registry to install into
+# ret: ok(true) on success
+pub fun register(reg: *abi.AbiRegistry) R.Result[bool, str] {
+    val vl:  RiscvAbi = v_lp64();
+    lp64_vtable = abi.abi_vtable(
+        vl.id, vl.name, vl.arch_id,
+        lp64_classify::*u8, lp64_arg::*u8, lp64_ret::*u8,
+        lp64_gp_regs::*u8, lp64_cs::*u8,
+        STACK_ALIGN, RED_ZONE, 0,
+        gp_param_reg(vl, 0), true,
+        true, true,
+        vl.flen_bits,
+        nil
+    );
+    abi.register(reg, ?lp64_vtable);
+
+    val vf: RiscvAbi = v_lp64f();
+    lp64f_vtable = abi.abi_vtable(
+        vf.id, vf.name, vf.arch_id,
+        lp64f_classify::*u8, lp64f_arg::*u8, lp64f_ret::*u8,
+        lp64f_gp_regs::*u8, lp64f_cs::*u8,
+        STACK_ALIGN, RED_ZONE, 0,
+        gp_param_reg(vf, 0), true,
+        true, true,
+        vf.flen_bits,
+        nil
+    );
+    abi.register(reg, ?lp64f_vtable);
+
+    val vd: RiscvAbi = v_lp64d();
+    lp64d_vtable = abi.abi_vtable(
+        vd.id, vd.name, vd.arch_id,
+        lp64d_classify::*u8, lp64d_arg::*u8, lp64d_ret::*u8,
+        lp64d_gp_regs::*u8, lp64d_cs::*u8,
+        STACK_ALIGN, RED_ZONE, 0,
+        gp_param_reg(vd, 0), true,
+        true, true,
+        vd.flen_bits,
+        nil
+    );
+    abi.register(reg, ?lp64d_vtable);
+
+    ret R.ok[bool, str](true);
+}
+
+# ------------------------------------------------------------------------ tests
+
+# THE FLOAT-ARGUMENT RULE IS THE MEMBER'S FLEN, AND NOTHING ELSE.
+#
+# The whole point of the contract: one comparison answers the bank question for
+# every member, and the three members give three different answers for the same
+# f64. If this collapses to "hard float vs soft float", lp64f is the member that
+# breaks, so it is checked at BOTH widths rather than only at the one it shares
+# with a neighbour.
+test "mach.lang.target.abi.riscv.float_in_fp_bank:is_the_declared_flen" {
+    # lp64: soft float takes neither width.
+    if (float_in_fp_bank(v_lp64(), 4))   { ret 1; }
+    if (float_in_fp_bank(v_lp64(), 8))   { ret 1; }
+    # lp64f: f32 in the bank, f64 NOT -- the member a boolean cannot describe.
+    if (!float_in_fp_bank(v_lp64f(), 4)) { ret 1; }
+    if (float_in_fp_bank(v_lp64f(), 8))  { ret 1; }
+    # lp64d: both.
+    if (!float_in_fp_bank(v_lp64d(), 4)) { ret 1; }
+    if (!float_in_fp_bank(v_lp64d(), 8)) { ret 1; }
+    ret 0;
+}
+
+# the same f64 argument lands in a DIFFERENT BANK under each member, from the same
+# classifier with the same inputs. this is the test that would fail if the family
+# collapsed back to one convention
+test "mach.lang.target.abi.riscv.classify_arg_v:same_double_three_banks" {
+    val d: abi.ParamSlot  = classify_arg_v(v_lp64d(), 0, 8, 8, true, 0, false, false, false, 0, 0, 0, 0, abi.agg_none());
+    if (d.class != abi.CLASS_FP)            { ret 1; }
+    if (d.reg   != fp_param_reg(v_lp64d(), 0)) { ret 1; }
+    # lp64f carries f32 but not f64: the double takes an INTEGER register.
+    val f: abi.ParamSlot  = classify_arg_v(v_lp64f(), 0, 8, 8, true, 0, false, false, false, 0, 0, 0, 0, abi.agg_none());
+    if (f.class != abi.CLASS_GP)            { ret 1; }
+    if (f.reg   != REG_A0)                  { ret 1; }
+    # but an f32 under the same member takes fa0.
+    val f32: abi.ParamSlot = classify_arg_v(v_lp64f(), 0, 4, 4, true, 0, false, false, false, 0, 0, 0, 0, abi.agg_none());
+    if (f32.class != abi.CLASS_FP)          { ret 1; }
+    if (f32.reg   != fp_param_reg(v_lp64f(), 0)) { ret 1; }
+    # lp64 is soft float: both widths take integer registers.
+    val s: abi.ParamSlot  = classify_arg_v(v_lp64(), 0, 8, 8, true, 0, false, false, false, 0, 0, 0, 0, abi.agg_none());
+    if (s.class != abi.CLASS_GP)            { ret 1; }
+    if (s.reg   != REG_A0)                  { ret 1; }
+    val s32: abi.ParamSlot = classify_arg_v(v_lp64(), 0, 4, 4, true, 0, false, false, false, 0, 0, 0, 0, abi.agg_none());
+    if (s32.class != abi.CLASS_GP)          { ret 1; }
+    ret 0;
+}
+
+# the family REFUSES a C-variadic call rather than placing one by the named rule
+#
+# The refusal is the shipped behaviour, so it is asserted rather than left to be
+# discovered. Under the hard-float members an unnamed float would take an integer
+# register where a named one takes fa, so classifying a tail argument through
+# `classify_arg_v` would place it wrongly -- and a nil `va_model` is what stops that
+# call from being emitted at all.
+test "mach.lang.target.abi.riscv.register:refuses_c_variadic_rather_than_guessing" {
+    var reg: abi.AbiRegistry = abi.registry_init();
+    val r: R.Result[bool, str] = register(?reg);
+    if (R.is_err[bool, str](r)) { ret 1; }
+    # a NIL va_model is the refusal: `mir.abi.abi_va_model` reports a diagnostic at a
+    # C-variadic call instead of letting one be emitted with named-argument placement.
+    # if a variadic rule is ever populated, this assertion is the thing that fails and
+    # points at the descriptor field that has to be filled in with it.
+    if (lp64_vtable.va_model  != nil) { ret 1; }
+    if (lp64f_vtable.va_model != nil) { ret 1; }
+    if (lp64d_vtable.va_model != nil) { ret 1; }
+    # and the rule really is unpopulated rather than accidentally decided as 0, which
+    # would read as a written-down "no unnamed float rides the fa bank".
+    if (v_lp64d().variadic_float_bits != VARIADIC_RULE_UNDECLARED) { ret 1; }
+    if (v_lp64().variadic_float_bits  != VARIADIC_RULE_UNDECLARED) { ret 1; }
+    ret 0;
+}
+
+# a struct that flattens to two floats rides the fa bank only when the MEMBER can
+# carry the member width. {f64; f64} flattens under lp64d and falls to the integer
+# convention under lp64f, whose fa registers hold no double
+test "mach.lang.target.abi.riscv.classify_arg_v:flatten_gated_on_member_width" {
+    val d: abi.ParamSlot = classify_arg_v(v_lp64d(), 0, 16, 8, false, 0, true, false, false, 0, 0, 2, 8, abi.agg_none());
+    if (d.piece_count   != 2)                    { ret 1; }
+    if (d.pieces[0].reg != fp_param_reg(v_lp64d(), 0)) { ret 1; }
+    # lp64f: the f64 members do not fit the bank, so the integer pair convention.
+    val f: abi.ParamSlot = classify_arg_v(v_lp64f(), 0, 16, 8, false, 0, true, false, false, 0, 0, 2, 8, abi.agg_none());
+    if (f.class           != abi.CLASS_GP) { ret 1; }
+    if (f.pieces[0].reg   != REG_A0)       { ret 1; }
+    if (f.pieces[1].reg   != REG_A1)       { ret 1; }
+    # but a {f32; f32} struct DOES flatten under lp64f.
+    val f32: abi.ParamSlot = classify_arg_v(v_lp64f(), 0, 8, 4, false, 0, true, false, false, 0, 0, 2, 4, abi.agg_none());
+    if (f32.piece_count   != 2)                    { ret 1; }
+    if (f32.pieces[0].reg != fp_param_reg(v_lp64f(), 0)) { ret 1; }
+    # soft float never flattens, at either width.
+    val s: abi.ParamSlot = classify_arg_v(v_lp64(), 0, 8, 4, false, 0, true, false, false, 0, 0, 2, 4, abi.agg_none());
+    if (s.class != abi.CLASS_GP) { ret 1; }
+    ret 0;
+}
+
+# the return side agrees with the argument side about the bank, member by member
+test "mach.lang.target.abi.riscv.classify_return_v:bank_matches_member" {
+    val d: abi.ParamSlot = classify_return_v(v_lp64d(), 8, 8, true, 0, false, false, 0, 0, abi.agg_none());
+    if (d.class != abi.CLASS_FP) { ret 1; }
+    # lp64f returns a double in a0, matching how it PASSES one.
+    val f: abi.ParamSlot = classify_return_v(v_lp64f(), 8, 8, true, 0, false, false, 0, 0, abi.agg_none());
+    if (f.class != abi.CLASS_GP) { ret 1; }
+    if (f.reg   != REG_A0)       { ret 1; }
+    val f32: abi.ParamSlot = classify_return_v(v_lp64f(), 4, 4, true, 0, false, false, 0, 0, abi.agg_none());
+    if (f32.class != abi.CLASS_FP) { ret 1; }
+    val s: abi.ParamSlot = classify_return_v(v_lp64(), 8, 8, true, 0, false, false, 0, 0, abi.agg_none());
+    if (s.class != abi.CLASS_GP) { ret 1; }
+    ret 0;
+}
+
+# THE CONTRACT IS HELD AGAINST THE MEMBERS THAT ARE NOT REGISTERED (#2777).
+#
+# `lp64e` and the ilp32 family cannot be registered yet -- each needs a base ISA
+# that does not exist -- but the classifier must already read their facts from the
+# descriptor rather than from a constant, or adding them later is a rewrite of the
+# layer rather than a drop-in. So the two facts that no SHIPPED member exercises
+# are exercised here directly against descriptors built for those members.
+#
+# To see it fail, replace a `v.gp_arg_count` or a `max_reg_ret(v)` in
+# `classify_arg_v` with the literal 8 or 16 that the shipped members all agree on.
+test "mach.lang.target.abi.riscv.classify_arg_v:descriptor_facts_are_read" {
+    # an ilp32 descriptor: XLEN 32, so the by-reference threshold is 8, not 16, and
+    # a 16-byte aggregate goes by REFERENCE where lp64d passes it in a register pair.
+    val ilp32d: RiscvAbi = rv_abi(abi.ABI_UNKNOWN, "ilp32d", isa.ARCH_RISCV64, 32, 64, 32, 8, 8, 11, 12);
+    if (max_reg_ret(ilp32d) != 8) { ret 1; }
+    val big: abi.ParamSlot = classify_arg_v(ilp32d, 0, 16, 4, false, 0, true, false, false, 0, 0, 0, 0, abi.agg_none());
+    if (big.class != abi.CLASS_BYREF) { ret 1; }
+    # the same 16 bytes under lp64d rides the a0:a1 pair, so the threshold is being
+    # read from the descriptor rather than being a constant both members share.
+    val pair: abi.ParamSlot = classify_arg_v(v_lp64d(), 0, 16, 8, false, 0, true, false, false, 0, 0, 0, 0, abi.agg_none());
+    if (pair.class != abi.CLASS_GP) { ret 1; }
+    if (pair.piece_count != 2)      { ret 1; }
+    # an ilp32 word is 4 bytes, so an 8-byte aggregate is a two-word PAIR here where
+    # lp64d passes it in a single register.
+    val two: abi.ParamSlot = classify_arg_v(ilp32d, 0, 8, 4, false, 0, true, false, false, 0, 0, 0, 0, abi.agg_none());
+    if (two.piece_count != 2) { ret 1; }
+    val one: abi.ParamSlot = classify_arg_v(v_lp64d(), 0, 8, 8, false, 0, true, false, false, 0, 0, 0, 0, abi.agg_none());
+    if (one.piece_count != 1) { ret 1; }
+
+    # an lp64e descriptor: a 16-register integer file gives SIX argument registers,
+    # so the seventh integer argument goes to the STACK where lp64d still has a6.
+    val lp64e: RiscvAbi = rv_abi(abi.ABI_UNKNOWN, "lp64e", isa.ARCH_RISCV64, 64, 0, 16, 6, 0, 2, 0);
+    val a6: abi.ParamSlot = classify_arg_v(lp64e, 6, 8, 8, false, 0, false, false, false, 6, 0, 0, 0, abi.agg_none());
+    if (a6.class != abi.CLASS_STACK) { ret 1; }
+    val ok: abi.ParamSlot = classify_arg_v(v_lp64d(), 6, 8, 8, false, 0, false, false, false, 6, 0, 0, 0, abi.agg_none());
+    if (ok.class != abi.CLASS_GP)    { ret 1; }
+    if (ok.reg   != REG_A0 + 6)      { ret 1; }
+    ret 0;
+}
+
+# every registered member installs under its own name, and the vtable carries the
+# member's own flen as the extension requirement the target resolver checks
+test "mach.lang.target.abi.riscv.register:members_declare_their_own_flen" {
+    var reg: abi.AbiRegistry = abi.registry_init();
+    val r: R.Result[bool, str] = register(?reg);
+    if (R.is_err[bool, str](r))              { ret 1; }
+    if (lp64_vtable.float_arg_bits  != 0)    { ret 1; }
+    if (lp64f_vtable.float_arg_bits != 32)   { ret 1; }
+    if (lp64d_vtable.float_arg_bits != 64)   { ret 1; }
+    if (lp64_vtable.indirect_result_reg != REG_A0) { ret 1; }
+    if (!lp64d_vtable.indirect_result_in_argfile)  { ret 1; }
+    ret 0;
+}
+
+# the register-file accessors fill the canonical banks for a member
+test "mach.lang.target.abi.riscv:register_file_banks" {
+    val v: RiscvAbi = v_lp64d();
+    var gp: [8]isa.Register;
+    if (gp_param_regs_v(v, ?gp[0]) != 8)             { ret 1; }
+    if (gp[0].id != REG_A0 || gp[7].id != REG_A0 + 7) { ret 1; }
+    var cs: [23]isa.Register;
+    if (callee_saved_v(v, ?cs[0]) != 23)             { ret 1; }
+    if (cs[0].id != REG_S1 || cs[10].id != REG_S2 + 9) { ret 1; }
+    if (cs[11].id != isa.regid_make(isa.REG_CLASS_ID_XMM, 8))  { ret 1; }
+    if (cs[22].id != isa.regid_make(isa.REG_CLASS_ID_XMM, 27)) { ret 1; }
+    # the soft-float member preserves the SAME float bank: it does not pass floats
+    # in registers but it still computes in them.
+    var cs2: [23]isa.Register;
+    if (callee_saved_v(v_lp64(), ?cs2[0]) != 23)     { ret 1; }
+    if (cs2[11].id != isa.regid_make(isa.REG_CLASS_ID_XMM, 8)) { ret 1; }
+    ret 0;
+}
