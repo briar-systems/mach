@@ -575,20 +575,27 @@ stage's outputs line up with the next stage's inputs: the producer's
 `builtin` names a value the pipeline supplies or consumes instead of one a
 location carries. The accepted set is closed:
 
-| Value                 | Meaning                        | Direction |
-|-----------------------|--------------------------------|-----------|
-| `"position"`          | clip-space vertex position     | written   |
-| `"point_size"`        | rasterized point size          | written   |
-| `"vertex_index"`      | index of the current vertex    | read      |
-| `"instance_index"`    | index of the current instance  | read      |
-| `"frag_coord"`        | fragment window coordinate     | read      |
-| `"global_invocation"` | compute global invocation id   | read      |
-| `"local_invocation"`  | compute local invocation id    | read      |
-| `"workgroup_id"`      | compute workgroup id           | read      |
+| Value                 | Meaning                        | Type    | Direction |
+|-----------------------|--------------------------------|---------|-----------|
+| `"position"`          | clip-space vertex position     | `f32x4` | written   |
+| `"point_size"`        | rasterized point size          | `f32`   | written   |
+| `"vertex_index"`      | index of the current vertex    | `u32`   | read      |
+| `"instance_index"`    | index of the current instance  | `u32`   | read      |
+| `"frag_coord"`        | fragment window coordinate     | `f32x4` | read      |
+| `"global_invocation"` | compute global invocation id   | `u32x3` | read      |
+| `"local_invocation"`  | compute local invocation id    | `u32x3` | read      |
+| `"workgroup_id"`      | compute workgroup id           | `u32x3` | read      |
 
 The direction is a property of the built-in, not something you restate — a stage
 writes its position and reads what the pipeline hands it — so there is no
 input/output marker to pair with `builtin`, and none that could disagree with it.
+
+The **type** is a property of the built-in too, and it is a requirement rather
+than a suggestion: the pipeline binds the variable itself, so a wider or narrower
+one is an invalid module rather than a wasteful one. Declaring a built-in at any
+other type is a compile error naming both the declared type and the required one.
+The two integer rows accept `i32` as well as `u32`, because the compiler carries
+an integer's width and not its sign and the emitted type is sign-less either way.
 
 `uniform` binds a read-only block by descriptor set and binding. Its type **must
 be a `rec`**: a uniform is a block with a host-visible layout, and a bare scalar

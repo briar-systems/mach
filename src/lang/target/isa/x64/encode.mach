@@ -495,6 +495,16 @@ fun is_sse_alu(opcode: u16) bool {
     ret opcode >= x64.ADDSS && opcode <= x64.DIVSD;
 }
 
+# the scalar float widths this target implements: f32 (SS) and f64 (SD)
+#
+# The single spelling of the pair every float encoder in this file checks against,
+# so widening the set (#2727 makes over-width vectors legal) is one edit rather than
+# a hunt for eight open-coded ladders. A width outside it is a compiler bug and each
+# caller refuses on it - never substitutes for it (#2733)
+fun is_float_width(w: u8) bool {
+    ret w == 4 || w == 8;
+}
+
 # true when an operand is a physical register in the SSE / vector
 # bank. reads the class straight off the composite register id, the seam that lets
 # the move family pick the GP versus SSE machine form from the operands alone
@@ -515,8 +525,20 @@ fun reg_is_xmm(op: *isa.Operand) bool {
 # slot or an immediate on either side encodes uniformly without an SSE mem-mem
 # form (which x86-64 has none of). a float spilled on BOTH sides carries no
 # register operand, so it never reaches here - it is a bit-exact GP mem-mem copy.
-# `mi.size` is the float width (4 -> MOVSS / MOVD, 8 -> MOVSD / MOVQ).
-fun encode_fp_mov(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
+# `mi.size` is the float width (4 -> MOVSS / MOVD, 8 -> MOVSD / MOVQ, 16 -> the
+# vector arm), and any other width is REFUSED rather than substituted (#2733): SSE
+# implements exactly those three here, so a move carrying anything else is a lowering
+# or regalloc bug, and defaulting it to 8 used to emit an 8-byte move that dropped
+# everything above the low lane - a miscompile with no diagnostic, which is strictly
+# worse than the honest refusal float arithmetic / negate / compare already give.
+#
+# IT REPORTS RATHER THAN PANICS, and that is what makes the refusal checkable. every
+# error here is a backend bug that ends the process, but ending it INSIDE the encoder
+# put the refusal out of reach of any test, which is exactly the argument that let the
+# silent default sit. the process-terminating decision lives at the single call site
+# in `encode_mov` instead, so the encoder itself is a pure function of its inputs and
+# a unit test can assert that a refused width emitted no bytes at all
+fun encode_fp_mov(mi: *isa.Inst, buf: *enc.ByteBuf) R.Result[i32, str] {
     val start: usize = buf.len;
     val dst: *isa.Operand = ?mi.dst;
     val src1: *isa.Operand = ?mi.src1;
@@ -527,23 +549,25 @@ fun encode_fp_mov(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     if (mi.size == 16) {
         if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
             emit_movaps_rr(dst.reg, src1.reg, buf);
-            ret (buf.len - start)::i32;
+            ret R.ok[i32, str]((buf.len - start)::i32);
         }
         if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_MEM) {
             emit_movups_load(dst.reg, @src1, buf);
-            ret (buf.len - start)::i32;
+            ret R.ok[i32, str]((buf.len - start)::i32);
         }
         if (dst.kind == isa.OPK_MEM && src1.kind == isa.OPK_REG) {
             emit_movups_store(@dst, src1.reg, buf);
-            ret (buf.len - start)::i32;
+            ret R.ok[i32, str]((buf.len - start)::i32);
         }
         emit_movups_load(FLOAT_SCRATCH0, @src1, buf);
         emit_movups_store(@dst, FLOAT_SCRATCH0, buf);
-        ret (buf.len - start)::i32;
+        ret R.ok[i32, str]((buf.len - start)::i32);
     }
 
-    var w: u8 = mi.size;
-    if (w != 4 && w != 8) { w = 8; }
+    val w: u8 = mi.size;
+    if (!is_float_width(w)) {
+        ret R.err[i32, str]("internal compiler error: float move has a non-float operand width (expected 4, 8 or 16)");
+    }
 
     # a register-register move across banks reinterprets bits with MOVD / MOVQ.
     if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG &&
@@ -553,7 +577,7 @@ fun encode_fp_mov(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
         } or {
             emit_movd_movq_reg(dst.reg, src1.reg, w, false, buf);
         }
-        ret (buf.len - start)::i32;
+        ret R.ok[i32, str]((buf.len - start)::i32);
     }
 
     # a same-bank float move. one side is an XMM register by construction here - the
@@ -565,20 +589,20 @@ fun encode_fp_mov(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     # (it carries no register operand and is a bit-exact GP mem-mem copy).
     #
     # a load/store error means an operand reached here in a bank the move cannot model
-    # (a regalloc / lowering bug); surface its specific message loudly rather than
-    # returning zero bytes the driver would report as the generic "produced no bytes",
-    # matching encode_mem_operand's handling of the same class of backend bug.
+    # (a regalloc / lowering bug); surface its specific message rather than returning
+    # zero bytes the driver would report as the generic "produced no bytes", matching
+    # encode_mem_operand's handling of the same class of backend bug.
     if (reg_is_xmm(dst)) {
         val ld: R.Result[bool, str] = emit_float_reg_or_slot_load(@src1, dst.reg, w, buf);
-        if (R.is_err[bool, str](ld)) { panic(R.unwrap_err[bool, str](ld)::*u8); }
-        ret (buf.len - start)::i32;
+        if (R.is_err[bool, str](ld)) { ret R.err[i32, str](R.unwrap_err[bool, str](ld)); }
+        ret R.ok[i32, str]((buf.len - start)::i32);
     }
     if (!reg_is_xmm(src1)) {
-        panic("encode: a same-bank float move names no SSE register\n");
+        ret R.err[i32, str]("encode: a same-bank float move names no SSE register");
     }
     val st: R.Result[bool, str] = emit_float_store(@dst, src1.reg, w, buf);
-    if (R.is_err[bool, str](st)) { panic(R.unwrap_err[bool, str](st)::*u8); }
-    ret (buf.len - start)::i32;
+    if (R.is_err[bool, str](st)) { ret R.err[i32, str](R.unwrap_err[bool, str](st)); }
+    ret R.ok[i32, str]((buf.len - start)::i32);
 }
 
 # encode MOV in all register/immediate/memory forms. a MOV naming an
@@ -597,8 +621,16 @@ fun encode_mov(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     # slot) is a memory-to-memory move that the GP path would copy at the 8-byte word width,
     # corrupting the high two lanes; the SSE path stages it through the XMM scratch with a
     # 16-byte MOVUPS (#2014).
+    #
+    # the float move reports its backend bugs rather than ending the process itself, so
+    # the one place that ends it is here. every error it can return is an instruction
+    # the encoder cannot model - a width outside {4, 8, 16}, or an operand in a bank the
+    # move has no form for - and continuing past one would emit a plausible wrong
+    # instruction, which is the failure #2733 removed.
     if (reg_is_xmm(dst) || reg_is_xmm(src1) || size == 16) {
-        ret encode_fp_mov(mi, buf);
+        val fp: R.Result[i32, str] = encode_fp_mov(mi, buf);
+        if (R.is_err[i32, str](fp)) { panic(R.unwrap_err[i32, str](fp)::*u8); }
+        ret R.unwrap_ok[i32, str](fp);
     }
 
     if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
@@ -3461,9 +3493,17 @@ fun is_float_const_move(f: *mir.MirFunction, mi: *mir.MirInstr) bool {
 # One `movss` / `movsd` out of the constant pool, or an `XORPS` for a zero. The
 # width comes from the instruction rather than the register, because an XMM
 # register is 16 bytes wide whatever the value in it is
+#
+# THE WIDTH IS REFUSED, NOT DEFAULTED (#2733). This is the second silent narrow on
+# x86-64 and it was not in the issue's census: like `encode_fp_mov` it substituted 8
+# for any width outside {4, 8}, which pools an f64-sized image of a constant that is
+# not an f64 and loads it with MOVSD. the constant is the value the program computes
+# with, so getting its width wrong is a wrong answer rather than a crash
 fun encode_float_const_mov(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
-    var w: u8 = mi.width;
-    if (w != 4 && w != 8) { w = 8; }
+    val w: u8 = mi.width;
+    if (!is_float_width(w)) {
+        ret R.err[bool, str]("internal compiler error: float constant move has a non-float operand width (expected 4 or 8)");
+    }
     ret emit_float_load(st, isa.make_imm(mi.operands[1].imm, w),
                         mi.operands[0].preg::i32, w);
 }
@@ -3588,7 +3628,7 @@ fun encode_float_arith(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirIn
         ret R.err[bool, str]("encode: float arithmetic missing operands");
     }
     val w: u8 = mi.width;
-    if (w != 4 && w != 8) {
+    if (!is_float_width(w)) {
         ret R.err[bool, str]("internal compiler error: float arithmetic has a non-float operand width (expected 4 or 8)");
     }
 
@@ -3651,7 +3691,7 @@ fun encode_float_neg(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInst
         ret R.err[bool, str]("encode: float negate missing operands");
     }
     val w: u8 = mi.width;
-    if (w != 4 && w != 8) {
+    if (!is_float_width(w)) {
         ret R.err[bool, str]("internal compiler error: float negate has a non-float operand width (expected 4 or 8)");
     }
 
@@ -3905,6 +3945,14 @@ fun emit_u64_to_fp(dst: isa.Operand, work: i32, dst_w: u8, cvt_op: u16, buf: *en
 # 64-bit conversion needs a range-fixup sequence x86-64 lacks a single instruction
 # for; the signed form is correct for every value in signed range, which is what the
 # language's reachable conversions produce, and matches the prior selection.
+#
+# THE FLOAT SIDE'S WIDTH IS REFUSED WHEN IT IS NOT 4 OR 8 (#2733), and which side is
+# the float one depends on the opcode - both for FP_TRUNC / FP_EXT, the destination
+# for SI_TO_FP / UI_TO_FP, the source for FP_TO_SI / FP_TO_UI - so the check sits in
+# each arm rather than once at the top, where it would also reject the integer
+# side's legitimate 1 and 2. this encoder carried no ladder at all: it read `dst_w ==
+# 4` / `src_w == 4` and took SD for everything else, which is the same substitution
+# `encode_fp_mov` made in a form a text search for the ladder does not find
 fun encode_float_conv(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 2) {
         ret R.err[bool, str]("encode: float conversion missing operands");
@@ -3916,6 +3964,9 @@ fun encode_float_conv(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirIns
 
     # FP_TRUNC (f64 -> f32) and FP_EXT (f32 -> f64): float on both sides.
     if (op == mir.MIR_FP_TRUNC || op == mir.MIR_FP_EXT) {
+        if (!is_float_width(dst_w) || !is_float_width(src_w)) {
+            ret R.err[bool, str]("internal compiler error: float conversion has a non-float width on a float side (expected 4 or 8)");
+        }
         val rd: R.Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[0], 16);
         if (R.is_err[isa.Operand, str](rd)) { ret R.err[bool, str](R.unwrap_err[isa.Operand, str](rd)); }
         val dst: isa.Operand = R.unwrap_ok[isa.Operand, str](rd);
@@ -3940,6 +3991,9 @@ fun encode_float_conv(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirIns
     # then the REX.W signed CVTSI2SS/SD converts it. an unsigned 64-bit source whose
     # top bit is set has no signed CVT form, so it takes the range-fixup path.
     if (op == mir.MIR_SI_TO_FP || op == mir.MIR_UI_TO_FP) {
+        if (!is_float_width(dst_w)) {
+            ret R.err[bool, str]("internal compiler error: integer-to-float conversion has a non-float result width (expected 4 or 8)");
+        }
         val rd: R.Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[0], 16);
         if (R.is_err[isa.Operand, str](rd)) { ret R.err[bool, str](R.unwrap_err[isa.Operand, str](rd)); }
         val dst: isa.Operand = R.unwrap_ok[isa.Operand, str](rd);
@@ -3963,6 +4017,9 @@ fun encode_float_conv(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirIns
 
     # FP_TO_SI / FP_TO_UI (float -> int): src is float (src_w picks SS / SD), dst is
     # an integer (dst_w sizes the GP store + REX.W of the CVTTSS/SD2SI).
+    if (!is_float_width(src_w)) {
+        ret R.err[bool, str]("internal compiler error: float-to-integer conversion has a non-float source width (expected 4 or 8)");
+    }
     val rd: R.Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[0], dst_w);
     if (R.is_err[isa.Operand, str](rd)) { ret R.err[bool, str](R.unwrap_err[isa.Operand, str](rd)); }
     val dst: isa.Operand = R.unwrap_ok[isa.Operand, str](rd);
@@ -4054,7 +4111,7 @@ fun encode_float_cmp(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInst
     }
     val buf: *enc.ByteBuf = ?st.buf;
     val w: u8 = mi.width;
-    if (w != 4 && w != 8) {
+    if (!is_float_width(w)) {
         ret R.err[bool, str]("internal compiler error: float comparison has a non-float operand width (expected 4 or 8)");
     }
     val cc: u8 = mi.src_width;
@@ -8079,6 +8136,200 @@ test "mach.lang.target.isa.x64.encode.encode_fp_mov:single_instruction_shapes" {
     or (buf.data[4] != 0xF0)  { bad = 1; }
 
     enc.buf_dnit(?buf);
+    ret bad;
+}
+
+# whether an encoder REFUSED and left the sink untouched (test helper)
+#
+# The buffer check is the whole point and is not redundant with the error. "returned
+# an error" and "emitted nothing" are different properties, and a refusal that has
+# already appended bytes is the worse of the two failures: the driver reports the
+# error, the byte sink keeps a half-instruction, and the accounting the sink does on
+# the next claim is what breaks rather than the encoder. Asserting only `is_err`
+# would pass for that. The caller clears `buf.len` before the call, so a non-zero
+# length here is bytes THIS call wrote
+# ---
+# r:   the encoder's result
+# buf: the sink it was given
+# ret: true when it errored and wrote nothing
+fun t_refused(r: R.Result[bool, str], buf: *enc.ByteBuf) bool {
+    if (!R.is_err[bool, str](r)) { ret false; }
+    ret buf.len == 0;
+}
+
+# whether an encoder ACCEPTED a width, so the refusal is not over-broad (test helper)
+# ---
+# r:   the encoder's result
+# buf: the sink it was given
+# ret: true when it succeeded and wrote something
+fun t_accepted(r: R.Result[bool, str], buf: *enc.ByteBuf) bool {
+    if (R.is_err[bool, str](r)) { ret false; }
+    ret buf.len > 0;
+}
+
+# the `encode_fp_mov` pair of the two above, whose result carries a byte count
+# ---
+# r:   the encoder's result
+# buf: the sink it was given
+# ret: true when it errored and wrote nothing
+fun t_refused_n(r: R.Result[i32, str], buf: *enc.ByteBuf) bool {
+    if (!R.is_err[i32, str](r)) { ret false; }
+    ret buf.len == 0;
+}
+
+# and its accepting twin, which also checks the reported count IS the bytes written -
+# a count taken from a stale cursor would read as success while the sink held
+# something else
+# ---
+# r:   the encoder's result
+# buf: the sink it was given
+# ret: true when it succeeded, wrote something, and reported what it wrote
+fun t_accepted_n(r: R.Result[i32, str], buf: *enc.ByteBuf) bool {
+    if (R.is_err[i32, str](r)) { ret false; }
+    if (buf.len == 0)          { ret false; }
+    ret R.unwrap_ok[i32, str](r)::usize == buf.len;
+}
+
+# EVERY FLOAT ENCODER REFUSES A WIDTH SSE DOES NOT IMPLEMENT, AND EMITS NOTHING
+#
+# x86-64 gives `encode_fp_mov` three forms - MOVSS, MOVSD and the 16-byte vector arm
+# - and it used to answer a width outside those by SUBSTITUTING 8 (#2733), so a move
+# the compiler could not encode became an 8-byte move that dropped everything above
+# the low lane with no diagnostic. A defensive default that produces wrong output is
+# worse than no default: it converts "the compiler was asked something it cannot do"
+# into "the program computes the wrong answer".
+#
+# THE REFUSALS ARE DRIVEN, NOT ARGUED. The reason this sat is that every layer could
+# point at another and say no caller reaches it, and #2687 showed what that argument
+# is worth: three layers each answered one fixed-size ladder, and widening the middle
+# layer's honest refusal alone compiled cleanly and then silently dropped the top
+# lane of every stack-passed vector. That refusal was the only thing standing between
+# this default and a miscompile. So each encoder is called here with the width it
+# must refuse, and the assertion is on the BYTES.
+#
+# THE CONSTANT MOVE IS THE SECOND ONE, and it was not in the issue's census: it
+# carried the identical `w = 8` line, where a wrong width pools an f64-sized image of
+# a constant that is not an f64 and loads it with MOVSD. The constant IS the value
+# the program computes with, so getting its width wrong is a wrong answer rather than
+# a crash.
+#
+# 16 SPLITS THE FAMILY, which is why it is checked on both sides. `encode_fp_mov` has
+# a vector arm and must ACCEPT it; the constant move, arithmetic, negate, compare and
+# conversion have no vector form and must REFUSE it. A single check written once for
+# the file would have got one of the two wrong, and #2727 is what starts sending both
+# down these paths.
+test "mach.lang.target.isa.x64.encode:float_width_refusals_emit_nothing" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var st: enc.EncodeState;
+    enc.state_blank(?st, ?alloc);
+    val buf: *enc.ByteBuf = ?st.buf;
+    var f: mir.MirFunction;
+    var bad: i32 = 0;
+
+    # the float MOVE, this issue's defect. driven at the `isa.Inst` level it lives
+    # at - the layer's other bugs end the process, so this one reports instead and is
+    # the reason it can be checked at all
+    var mv: isa.Inst = isa.inst_blank();
+    mv.opcode = x64.MOV;
+    mv.dst    = isa.make_reg(isa.regid_make(isa.REG_CLASS_ID_XMM, x64.XMM3), 16);
+    mv.src1   = isa.make_reg(isa.regid_make(isa.REG_CLASS_ID_XMM, x64.XMM5), 16);
+    mv.size   = 12; buf.len = 0;
+    if (!t_refused_n(encode_fp_mov(?mv, buf), buf)) { bad = 1; }
+    mv.size = 32; buf.len = 0;
+    if (!t_refused_n(encode_fp_mov(?mv, buf), buf)) { bad = 1; }
+    mv.size = 0;  buf.len = 0;
+    if (!t_refused_n(encode_fp_mov(?mv, buf), buf)) { bad = 1; }
+    mv.size = 1;  buf.len = 0;
+    if (!t_refused_n(encode_fp_mov(?mv, buf), buf)) { bad = 1; }
+
+    # the three widths it DOES implement still encode - including the vector arm,
+    # which returns above the scalar check and must not be caught by it
+    mv.size = 4;  buf.len = 0;
+    if (!t_accepted_n(encode_fp_mov(?mv, buf), buf)) { bad = 1; }
+    mv.size = 8;  buf.len = 0;
+    if (!t_accepted_n(encode_fp_mov(?mv, buf), buf)) { bad = 1; }
+    mv.size = 16; buf.len = 0;
+    if (!t_accepted_n(encode_fp_mov(?mv, buf), buf)) { bad = 1; }
+
+    # the float CONSTANT move, the second silent narrow on this target. a zero
+    # constant is the one shape that mints no pool symbol, so the accepted arms need
+    # no interner and the bytes are the bare XORPS
+    var cops: [2]mir.MirOperand;
+    cops[0] = mir.op_preg(isa.regid_make(isa.REG_CLASS_ID_XMM, x64.XMM3)::u32);
+    cops[1] = mir.op_imm(0);
+    var cn: mir.MirInstr = mir.instr(x64.MOV::u32, ?cops[0], 2, 16, 0);
+    buf.len = 0;
+    if (!t_refused(encode_float_const_mov(?st, ?f, ?cn), buf)) { bad = 1; }
+    cn.width = 32; buf.len = 0;
+    if (!t_refused(encode_float_const_mov(?st, ?f, ?cn), buf)) { bad = 1; }
+    cn.width = 0;  buf.len = 0;
+    if (!t_refused(encode_float_const_mov(?st, ?f, ?cn), buf)) { bad = 1; }
+    cn.width = 4;  buf.len = 0;
+    if (!t_accepted(encode_float_const_mov(?st, ?f, ?cn), buf)) { bad = 1; }
+    cn.width = 8;  buf.len = 0;
+    if (!t_accepted(encode_float_const_mov(?st, ?f, ?cn), buf)) { bad = 1; }
+
+    # the arithmetic / negate / compare siblings already refused; they are driven
+    # here too so the census is one test rather than three arguments
+    var aops: [3]mir.MirOperand;
+    aops[0] = xmm_op(x64.XMM2); aops[1] = xmm_op(x64.XMM0); aops[2] = xmm_op(x64.XMM1);
+    var ar: mir.MirInstr = mir.instr(mir.MIR_FMUL, ?aops[0], 3, 16, 0);
+    buf.len = 0;
+    if (!t_refused(encode_float_arith(?st, ?f, ?ar), buf)) { bad = 1; }
+    ar.width = 4; buf.len = 0;
+    if (!t_accepted(encode_float_arith(?st, ?f, ?ar), buf)) { bad = 1; }
+
+    var nops: [2]mir.MirOperand;
+    nops[0] = xmm_op(x64.XMM2); nops[1] = xmm_op(x64.XMM0);
+    var ng: mir.MirInstr = mir.instr(mir.MIR_FNEG, ?nops[0], 2, 16, 0);
+    buf.len = 0;
+    if (!t_refused(encode_float_neg(?st, ?f, ?ng), buf)) { bad = 1; }
+    ng.width = 8; buf.len = 0;
+    if (!t_accepted(encode_float_neg(?st, ?f, ?ng), buf)) { bad = 1; }
+
+    var mops: [3]mir.MirOperand;
+    mops[0] = mir.op_preg(x64.RAX::u32); mops[1] = xmm_op(x64.XMM0); mops[2] = xmm_op(x64.XMM1);
+    var cm: mir.MirInstr = mir.instr(mir.MIR_FCMP, ?mops[0], 3, 16, mir.FCC_GT);
+    buf.len = 0;
+    if (!t_refused(encode_float_cmp(?st, ?f, ?cm), buf)) { bad = 1; }
+    cm.width = 4; buf.len = 0;
+    if (!t_accepted(encode_float_cmp(?st, ?f, ?cm), buf)) { bad = 1; }
+
+    # the CONVERSIONS carried no ladder to find. they read `dst_w == 4` / `src_w == 4`
+    # and took the SD form for everything else, which is the same substitution in a
+    # shape a search for the ladder misses - and which side is the float one depends
+    # on the opcode, so each arm is driven separately. the integer side's legitimate 1
+    # and 2 must still pass, which a check written once at the top would have broken
+    var vops: [2]mir.MirOperand;
+    vops[0] = xmm_op(x64.XMM2); vops[1] = xmm_op(x64.XMM0);
+    var cv: mir.MirInstr = mir.instr(mir.MIR_FP_TRUNC, ?vops[0], 2, 16, 0);
+    cv.src_width = 8; buf.len = 0;
+    if (!t_refused(encode_float_conv(?st, ?f, ?cv), buf)) { bad = 1; }
+    cv.width = 4; cv.src_width = 16; buf.len = 0;
+    if (!t_refused(encode_float_conv(?st, ?f, ?cv), buf)) { bad = 1; }
+    cv.width = 4; cv.src_width = 8; buf.len = 0;
+    if (!t_accepted(encode_float_conv(?st, ?f, ?cv), buf)) { bad = 1; }
+
+    var iops: [2]mir.MirOperand;
+    iops[0] = xmm_op(x64.XMM2); iops[1] = mir.op_preg(x64.RCX::u32);
+    var i2f: mir.MirInstr = mir.instr(mir.MIR_SI_TO_FP, ?iops[0], 2, 16, 0);
+    i2f.src_width = 8; buf.len = 0;
+    if (!t_refused(encode_float_conv(?st, ?f, ?i2f), buf)) { bad = 1; }
+    # a 1-byte INTEGER source is legitimate and must survive the float-side check
+    i2f.width = 8; i2f.src_width = 1; buf.len = 0;
+    if (!t_accepted(encode_float_conv(?st, ?f, ?i2f), buf)) { bad = 1; }
+
+    var fops: [2]mir.MirOperand;
+    fops[0] = mir.op_preg(x64.RCX::u32); fops[1] = xmm_op(x64.XMM0);
+    var f2i: mir.MirInstr = mir.instr(mir.MIR_FP_TO_SI, ?fops[0], 2, 8, 0);
+    f2i.src_width = 16; buf.len = 0;
+    if (!t_refused(encode_float_conv(?st, ?f, ?f2i), buf)) { bad = 1; }
+    # a 1-byte INTEGER destination is legitimate on the other side of the same op
+    f2i.width = 1; f2i.src_width = 8; buf.len = 0;
+    if (!t_accepted(encode_float_conv(?st, ?f, ?f2i), buf)) { bad = 1; }
+
+    enc.buf_dnit(buf);
     ret bad;
 }
 
