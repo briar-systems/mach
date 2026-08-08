@@ -85,6 +85,17 @@ Constants now render through `std.format.write_f64` in shortest round-trippable 
 
 The reason recorded in the code for the old rendering - that std had no float formatter - had gone stale; `printer.mach` already imported `std.format`. The unit test that pinned `-1.5` to `f-1` and `2.5` to `f2` was enforcing the defect rather than any intended behaviour, and now pins the real rendering across the IEEE classes, built from bit patterns rather than decimal literals. Objects are byte-identical: this moves nothing but the dump.
 
+#### A riscv64 `-g` local is described where it actually lives (#2759)
+Every `-g` variable in a frame slot was described at the wrong address on riscv64, by exactly the bytes the prologue reserves at the top of the frame. The debug-info producer recorded the raw slot offset while the encoder biases every slot access down past the ra/s0 record and the callee-saved GP and FP areas, so a debugger read `s0 + slot.offset` where the machine had written `s0 - reserved_top + slot.offset`. In a function with callee-saves live that lands in the save area: measured on a fixture with six callee-saved GP and three FP registers, the reservation is 88 bytes, the variable is at `s0 - 104`, and `DW_OP_fbreg -16` pointed at the saved `s0`. Silent, because the value has the variable's type and a plausible magnitude.
+
+One layout fact was derived twice, and the two derivations agreed on x86-64 and aarch64, whose reservation is zero. That is why it went unnoticed, and it is the same shape as #2715, #2725 and #2735.
+
+There is now one derivation. `MirFrame.fp_dist` - the bytes between the frame pointer and the slot region's base - is stamped once by the target's own encoder alongside `base_dist`, its stack-pointer-side twin, and both the encoder's own slot accesses and the `DW_OP_fbreg` offset read it. `frame.slot_offset` no longer takes a caller-supplied bias, so there is no longer a reader that can forget to apply it.
+
+`int/regression/2759-riscv64-fbreg-bias` pins it by crossing the two halves against each other: every `DW_OP_fbreg` offset must name an address the same function's emitted code addresses from the register `DW_AT_frame_base` names. Reading the offset alone cannot see this, since a producer with its own derivation is self-consistent under the bug. The case runs on all three ELF legs, and against the unpatched compiler it is green on x86-64 and aarch64 and red on riscv64 alone.
+
+`.text` is byte-identical with and without `-g` on every target, and `.debug_info` is byte-identical before and after on x86-64 and aarch64.
+
 #### An over-aligned stack local is over-aligned at run time (#2735)
 `#[align(32)]` and above worked on a global and did nothing on a local. The slot's offset was a correct multiple of the requested alignment, but it was measured from the frame pointer, and the only alignment that reaches the frame pointer is the ABI's 16-byte call boundary. So the address was a multiple of 32 exactly when the process stack happened to start on one, which depends on the environment block and therefore changes between runs of the same binary. `$size_of` already reported the padded size, so the storage was sized for a promise the placement did not keep.
 
