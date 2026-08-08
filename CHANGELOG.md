@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### A failed `#[library]` pin said the library was not in the link when it was (#2800)
+`import 'X' pinned to library 'glfw' not among the link's dependencies` was reported for a `glfw` the manifest **did** provide. The linker is handed loader names for the link's dynamic half and bare paths for its static half, so a `source = "local"` entry's logical name never reached it at all, and the only check it could run reported the half it could not see as absent.
+
+The message cost a day of investigation before anything was fixed. It named the manifest, so the report went at the export cascade - which was never broken, and is now pinned by a regression case that passes on the compiler that introduced it. The actual fault was a misspelled entry point (`glfwGetInstanceProcAddr` for GLFW's `glfwGetInstanceProcAddress`), which the message said nothing about.
+
+Which message a user saw was decided by accident, too: the same broken program read `undefined symbol` on a link with no shared library in it and the false `not among the link's dependencies` the moment any unrelated one joined. Two different statements about one program, one of them untrue, selected by something neither of them mentions.
+
+The driver's single walk over the link inputs now records each entry's logical name and whether it resolved static or dynamic, and the linker reads that one account rather than inferring the link from the half it was handed. A failed pin resolves to one of two truthful statements - the library is in the link **as a static input**, which defines symbols rather than importing them, so the symbol is undefined; or the library is genuinely nowhere in the effective link set, in which case the refusal stands and now lists what the link does provide. Both paths that can reach a failed pin call one decision function, so the wording no longer depends on the link's shape: the two int cases that differ only by an unrelated dynamic dependency assert **byte-identical** goldens, and a third holds the genuine refusal so the fix cannot become a blanket permit.
+
 #### Every static ELF carried two PT_LOAD segments claiming the same address (#2795)
 The static writer mapped the ELF header and program-header table **at** `segs[0].vaddr`; the PIE and dynamic writers mapped them one page **below** it. So every static executable mach has ever produced had two `PT_LOAD` segments covering the same virtual address - the header block and `.text` both at `0x400000` - on all three ELF targets.
 
