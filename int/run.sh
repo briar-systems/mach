@@ -10,6 +10,14 @@
 # golden. --bless writes the observable to the golden instead of diffing. the exit
 # status is nonzero if any case×target×profile fails.
 #
+# WHAT A GOLDEN CANNOT SEE. a golden is a statement about one string, not about the
+# program, the image, or the compiler, so every run-and-compare case is blind in the
+# same ways. int/observability.md maps those classes to the surface that can observe
+# each one, grounded in the defects that cost this repo the time to find them, and
+# states which of them genuinely needed an integration test rather than a unit test
+# (most did not). it describes the defects and the surfaces, not this harness, so it
+# outlives it - read it before adding a case here.
+#
 # the harness is the same on every OS (git-bash on windows, bash on linux/macOS);
 # the only target-specific knowledge it holds is the run-mode looked up per target
 # from targets.conf, `--runmode` overriding it for this invocation only.
@@ -70,6 +78,12 @@
 # against. the PASS/FAIL lines have carried that since #2387, but a log line only
 # answers the question while the log exists, and "what did the run that cut this tag
 # build against" is asked afterwards. CI uploads the file.
+#
+# NOT SAFE TO RUN CONCURRENTLY. two invocations against one checkout - even for
+# different --target values - race on the same per-case out/ directories and can
+# produce a wrong result, including a spurious PASS. no guard here (this suite is
+# being rebuilt; run isolation belongs in that design, not patched into this
+# one) - run a second target from a second checkout instead.
 #
 # `--runmode qemu` only reaches a leg qemu-user can actually load: qemu_bin() in
 # lib/produce.sh names the ELF-only rule and the three targets that can never

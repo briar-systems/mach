@@ -2905,9 +2905,15 @@ produce_riscv_pcrel() {
         echo "int: riscv-pcrel: no probe object at $probe" >&2; return 2
     fi
     "$tool" -d -r --no-show-raw-insn "$probe" | riscv_pcrel_label_scan
-    # --mattr=+c because the linked image's e_flags do not advertise the compressed
-    # extension it contains (mach#2813), and without it every compressed load in the
-    # scan's way decodes as `<unknown>` and the property silently measures nothing
+    # --mattr=+c is still needed, but no longer for the reason it was added. e_flags
+    # now advertises the compressed extension the image contains (mach#2813 fixed
+    # that), and llvm-objdump decodes ordinary compressed instructions from it. The
+    # COMPRESSED FLOAT loads (`c.fld`) additionally need `c` in the `.riscv.attributes`
+    # arch string, which mach still derives from a per-ISA constant describing what
+    # its own encoder emits rather than from what the linked image ended up holding -
+    # the same shape of claim as e_flags was, one section over, and tracked as part of
+    # mach#2828 rather than accepted. Without this flag those loads decode as
+    # `<unknown>` and the property silently measures nothing
     "$tool" -d --mattr=+c --no-show-raw-insn "$bin" | riscv_pcrel_image_scan
 }
 
