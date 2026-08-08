@@ -81,7 +81,6 @@ The census found the same defect on **x86-64**, which the issue did not name: `e
 
 Every refusal is **driven from a unit test** with a width it must refuse, and the assertion is that the output buffer stayed **empty**, not merely that an error was returned. That distinction is load-bearing here: both `emit_mem_access` implementations materialize an out-of-range offset into the scratch register before the access word, and a folded global emits its `adrp` / `auipc` high half before the low one, so a check placed at the emission point rather than at the top would leave stranded instructions behind the error. Every legitimate width still encodes byte-exactly against `llvm-mc`, including aarch64's Q form at 16 and the sub-word integer forms at 1 and 2 that share the same helpers.
 
-
 ## [4.16.0] - 2026-08-08
 
 ### Added
