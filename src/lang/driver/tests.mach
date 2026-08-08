@@ -34,6 +34,7 @@ use mach.lang.be.codegen;
 use mach.lang.be.codegen.unit;
 use mir: mach.lang.be.codegen.mir;
 use mirlower: mach.lang.be.codegen.mir.lower;
+use mach.lang.be.linker;
 use mach.lang.be.obj;
 use mach.lang.build.outcome;
 use mach.lang.build.qctx;
@@ -12732,10 +12733,18 @@ fun ut_rv32_run2(mem: *u8, off: u32, a: u64, b: u64, out: *u64, steps: *u32) boo
 # first and `main` last, because `ut_image_text` returns symbol offsets in ascending
 # order and the sweeps index them positionally.
 #
-# NO FLOATS AND NO GLOBALS. The core models RV32I and M only and refuses a float by
-# name, and the harness loads `.text` alone, so a global would be an address into a
-# section that was never loaded. Both restrictions are the harness being honest about
-# its coverage rather than accidents to work around.
+# NO FLOATS: the core models RV32I and M only, and refuses a float by name rather than
+# skipping it. That is the harness being honest about its coverage rather than an
+# accident to work around, and it is tracked as #2874.
+#
+# NO GLOBALS IN THIS MODULE, which is a property of how it is LOADED rather than of the
+# harness. These probes are entered by symbol offset into the unlinked object image's
+# `.text`, so `.data` is absent and no relocation has been applied. A global is reached
+# instead through the linked-image path below (`ut_rv32_build_linked`), which links the
+# build and loads every allocated section, and where the wide global access #2867
+# repaired is executed and value-checked. Moving these probes onto that path needs the
+# linker to report a symbol's linked address, since a linked flat image carries no
+# symbol table to look one up in (#2892).
 fun ut_rv32_probe_src(buf: *u8) usize {
     var w: usize = 0;
     w = ut_app(buf, w, "fun mul64(a: i64, b: i64) i64 { ret a * b; }\n");
@@ -12913,6 +12922,282 @@ fun ut_rv32_sweep(mem: *u8, offs: *u32) i32 {
 fun ut_rv32_bool(b: bool) u64 {
     if (b) { ret 1; }
     ret 0;
+}
+
+# the value the globals probe's `ga` holds, mirrored from the probe source below
+#
+# Both lanes are non-zero and different, so a lane read from the wrong addend changes
+# the answer rather than reproducing it. The mirror is the oracle: it is written here
+# in host arithmetic and there in Mach, and a drift between them fails the test rather
+# than passing quietly.
+val UT_RV32_GA: u64 = 0x0123456789ABCDEF;
+
+# the value `gn` holds: the 32-bit sign boundary, sign-extended to 64
+#
+# `0xFFFFFFFF80000000`. Its low lane is exactly the sign bit and its high lane is all
+# ones, which is where a lane split that sign-extends the wrong half shows up.
+val UT_RV32_GN: u64 = 0xFFFFFFFF80000000;
+
+# the globals probe, whose entry IS the function under test
+#
+# `_start` is the freestanding entry symbol, and a flat image begins execution at its
+# base, so the linker places this function at the image base and the harness enters it
+# at offset 0 with the psABI it lays out itself. That keeps the property the sweeps
+# above rest on - the harness is the independent party on the calling convention, never
+# a compiled wrapper agreeing with the compiler - while reaching data that only exists
+# once the image is linked.
+#
+# `_start` is declared FIRST because a flat image's entry must be the first function of
+# its own text section; the linker refuses an image that enters anywhere else.
+#
+# The selector arrives in a0 and the operand pair in a1 / a2, which is what ilp32 does:
+# RISC-V imposes no even-odd alignment on a register pair.
+fun ut_rv32_globals_src(buf: *u8) usize {
+    var w: usize = 0;
+    w = ut_app(buf, w, "var ga: i64 = 0x0123456789ABCDEF;\n");
+    w = ut_app(buf, w, "var gn: i64 = -2147483648;\n");
+    w = ut_app(buf, w, "var gb: i64 = 0;\n");
+    w = ut_app(buf, w, "#[symbol(\"_start\")]\n");
+    w = ut_app(buf, w, "fun probe(sel: i32, v: i64) i64 {\n");
+    w = ut_app(buf, w, "    if (sel == 0) { ret ga; }\n");
+    w = ut_app(buf, w, "    if (sel == 1) { gb = v; ret gb; }\n");
+    w = ut_app(buf, w, "    if (sel == 2) { ret ga + v; }\n");
+    w = ut_app(buf, w, "    if (sel == 3) { ret ga - v; }\n");
+    w = ut_app(buf, w, "    if (sel == 4) { ret gb; }\n");
+    w = ut_app(buf, w, "    if (sel == 5) { ret gn; }\n");
+    w = ut_app(buf, w, "    if (sel == 6) { ret gn + v; }\n");
+    w = ut_app(buf, w, "    if (sel == 7) { ret gn - v; }\n");
+    w = ut_app(buf, w, "    ret 0;\n");
+    w = ut_app(buf, w, "}\n");
+    w = ut_app(buf, w, "fun main() i32 { ret 0; }\n");
+    buf[w] = 0;
+    ret w;
+}
+
+# the probe selectors, in the order the probe source tests them
+val UT_RV32_G_LOAD:  u32 = 0;
+val UT_RV32_G_STORE: u32 = 1;
+val UT_RV32_G_ADD:   u32 = 2;
+val UT_RV32_G_SUB:   u32 = 3;
+val UT_RV32_G_READ:  u32 = 4;
+val UT_RV32_G_NLOAD: u32 = 5;
+val UT_RV32_G_NADD:  u32 = 6;
+val UT_RV32_G_NSUB:  u32 = 7;
+
+# link a built rv32 project into a flat image and load the WHOLE image into the core
+#
+# WHY THIS EXISTS AND WHY `ut_image_text` IS NOT ENOUGH (#2883). That helper hands back
+# the first `SK_TEXT` section of the UNLINKED object image, so `.data` is not in the
+# core's memory at all and no relocation has been applied. A global reference on rv32 is
+# `auipc` + `lw` against `%pcrel_hi` / `%pcrel_lo`, both patched at link time, so in an
+# object image the high half's immediate is still zero: even with `.data` loaded the
+# address would be wrong. Nothing about a global could be executed, which is why the
+# #2867 repair had no in-tree value check.
+#
+# The link is the shipping one - `linker.link_images`, the same call `mach build` makes
+# for a flat-image format - so the relocations these probes depend on are applied by the
+# code that applies them in a real build, not by a second implementation here.
+#
+# THE IMAGE IS LOADED AT THE HARNESS'S OWN BASE RATHER THAN THE LINK'S. rv32 reaches
+# both code and data pc-relatively, so the whole image moving together preserves every
+# distance inside it, and the loader stays a copy. An absolute relocation into a global
+# would not survive that, which is why the probes hold scalars.
+# ---
+# p:       the built project, after codegen
+# root:    the scaffold root the image is written into
+# mem:     the reference core's memory image
+# len_out: receives the flat image's byte length
+# ret:     true when the image linked, fit, and loaded
+fun ut_rv32_link_flat(p: *project.Project, root: str, mem: *u8, len_out: *u32) bool {
+    val alloc: *A.Allocator = p.alloc;
+    if (p.emit_len == 0) { ret false; }
+
+    val ir: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](alloc, p.emit_len::usize);
+    if (R.is_err[*of.ObjectImage, str](ir)) { ret false; }
+    val images: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](ir);
+    var missing: bool = false;
+    var i: u32 = 0;
+    for (i < p.emit_len) {
+        val m: *project.ModuleEntry = ?p.modules[(p.topo[i])::u32];
+        if (m.object_image == nil) { missing = true; }
+        or                         { images[i] = @m.object_image; }
+        i = i + 1;
+    }
+
+    var linked: bool = false;
+    val out: str = ut_cc3(alloc, root, "/", "flat.img");
+    if (!missing) {
+        val lr: R.Result[bool, str] = linker.link_images(p.s, ?p.target, images, p.emit_len,
+            nil::*of.DynLib, 0, out::*u8, "rv32probe"::*u8, linker.LINK_EXE, false,
+            of.image_options_default(of.SUBSYSTEM_CONSOLE));
+        linked = R.is_ok[bool, str](lr);
+    }
+    A.deallocate[of.ObjectImage](alloc, images, p.emit_len::usize);
+    if (!linked) { ret false; }
+
+    val br: R.Result[Vector[u8], str] = fs.read_bytes(alloc, out);
+    if (R.is_err[Vector[u8], str](br)) { ret false; }
+    var img: Vector[u8] = R.unwrap_ok[Vector[u8], str](br);
+
+    var ok: bool = img.len > 0 && UT_RV32_CODE::usize + img.len < UT_RV32_STACK::usize;
+    if (ok) {
+        var k: usize = 0;
+        for (k < UT_RV32_MEM) { mem[k] = 0; k = k + 1; }
+        k = 0;
+        for (k < img.len) { mem[UT_RV32_CODE::usize + k] = img.data[k]; k = k + 1; }
+        @len_out = img.len::u32;
+    }
+    vector.dnit[u8](?img);
+    ret ok;
+}
+
+# build `src` for rv32, link it, and load the linked flat image into the core
+#
+# The scaffold root outlives the link because the image is written into it, which is
+# what `ut_ct_edge_project` cannot do - it removes the tree the moment the project is
+# built.
+# ---
+# ret: true when the build, the link and the load all succeeded
+fun ut_rv32_build_linked(s: *session.Session, alloc: *A.Allocator, src: str,
+                         mem: *u8, len_out: *u32) bool {
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = src;
+    val root_r: R.Result[str, str] = ut_scaffold_m(alloc, ut_ct_edge_manifest(), ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](root_r)) { ret false; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var ok: bool = false;
+    val rr: R.Result[bool, str] = driver.setup_registry(?s.registry);
+    if (R.is_ok[bool, str](rr)) {
+        val pr: R.Result[project.Project, outcome.Fail] = driver.build_project(s, root, "rv32");
+        if (R.is_ok[project.Project, outcome.Fail](pr)) {
+            var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+            if (ut_run_codegen_ok(?p) == 0) { ok = ut_rv32_link_flat(?p, root, mem, len_out); }
+            project.dnit_project(?p);
+        }
+    }
+    fs.remove_all(alloc, root);
+    ret ok;
+}
+
+# run the globals probe once: a selector and one 64-bit operand in, one 64-bit out
+fun ut_rv32_run_g(mem: *u8, sel: u32, v: u64, out: *u64, steps: *u32) bool {
+    var args: [3]u32;
+    args[0] = sel;
+    args[1] = (v & 0xFFFFFFFF)::u32;
+    args[2] = (v >> 32)::u32;
+    var lo: u32 = 0;
+    var hi: u32 = 0;
+    if (!ut_rv32_run(mem, 0, ?args[0], 3, ?lo, ?hi, steps)) { ret false; }
+    @out = lo::u64 | (hi::u64 << 32);
+    ret true;
+}
+
+# riscv32 (#2883): a WIDE GLOBAL is loaded, stored, added and subtracted on the
+# reference core, with every answer checked against a host-computed reference
+#
+# WHY THIS TEST EXISTS. #2867 fixed a segfault on an `i64` global feeding wide
+# arithmetic, and the repair makes rv32 decompose a wide global access into one native
+# access per lane at successive addends on the SAME SYMBOL. That is real address
+# arithmetic across a lane boundary and it had no in-tree value check at all: the
+# harness loaded `.text` alone with relocations unapplied, so no program touching a
+# global could be executed and the fix had to be verified against an external
+# interpreter. Nothing in the suite would have noticed a wrong lane addend.
+#
+# WHAT MAKES A WRONG ADDEND VISIBLE RATHER THAN SELF-CANCELLING. A store and a load
+# that are wrong the SAME way agree with each other, so a store-then-read-back probe
+# alone proves nothing. Three things break the symmetry:
+#
+#   - `ga` is read against a constant this file states independently, so its lanes must
+#     come from the addends the symbol actually occupies;
+#   - `ga` is re-read AFTER a store to `gb`, so a store that walks past its own datum
+#     is caught by what it damaged rather than by what it returned;
+#   - `gb` is re-read in a LATER call, so the value has to have reached memory rather
+#     than survived in a register.
+#
+# The operands sweep the lane-crossing patterns the shift sweep uses, and `gn` holds
+# the 32-bit sign boundary so a lane split that sign-extends the wrong half shows up in
+# the add and the subtract as well as in the load.
+test "mach.lang.driver:wide_global_executes_on_an_rv32_core_riscv32" {
+    var bad: i32 = 0;
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val bufr: R.Result[*u8, str] = A.allocate[u8](?alloc, 8192);
+    if (R.is_err[*u8, str](bufr)) { session.dnit(?s); ret 1; }
+    val srcbuf: *u8 = R.unwrap_ok[*u8, str](bufr);
+    ut_rv32_globals_src(srcbuf);
+
+    val memr: R.Result[*u8, str] = A.zallocate[u8](?alloc, UT_RV32_MEM);
+    if (R.is_err[*u8, str](memr)) { session.dnit(?s); ret 1; }
+    val mem: *u8 = R.unwrap_ok[*u8, str](memr);
+
+    var ilen: u32 = 0;
+    if (!ut_rv32_build_linked(?s, ?alloc, srcbuf::str, mem, ?ilen)) { bad = 1; }
+    or { if (ut_rv32_globals_sweep(mem) != 0) { bad = 1; } }
+
+    A.deallocate[u8](?alloc, mem, UT_RV32_MEM);
+    A.deallocate[u8](?alloc, srcbuf, 8192);
+    session.dnit(?s);
+    ret bad;
+}
+
+# drive the globals probe over the value sweep and check each answer
+#
+# Split out of the test body so the build-and-link scaffolding does not bury the
+# assertions, matching `ut_rv32_sweep` next door.
+# ---
+# mem: the loaded linked image
+# ret: 0 when every case answered correctly
+fun ut_rv32_globals_sweep(mem: *u8) i32 {
+    var bad: i32 = 0;
+    var steps: u32 = 0;
+    var got: u64 = 0;
+
+    # the initialized wide global, before anything has written anywhere
+    if (!ut_rv32_run_g(mem, UT_RV32_G_LOAD, 0, ?got, ?steps)) { ret 1; }
+    or (got != UT_RV32_GA)                                    { bad = 1; }
+    if (!ut_rv32_run_g(mem, UT_RV32_G_NLOAD, 0, ?got, ?steps)) { ret 1; }
+    or (got != UT_RV32_GN)                                    { bad = 1; }
+
+    var vi: u32 = 0;
+    for (vi < UT_SHIFT_VALUES) {
+        val v: u64 = ut_shift_value(vi);
+
+        # the wide store, read back in the same call
+        if (!ut_rv32_run_g(mem, UT_RV32_G_STORE, v, ?got, ?steps)) { bad = 1; }
+        or (got != v)                                              { bad = 1; }
+
+        # and read again in a LATER call, so it reached memory rather than a register
+        if (!ut_rv32_run_g(mem, UT_RV32_G_READ, 0, ?got, ?steps)) { bad = 1; }
+        or (got != v)                                             { bad = 1; }
+
+        # the store must not have reached past its own datum: `ga` is unchanged
+        if (!ut_rv32_run_g(mem, UT_RV32_G_LOAD, 0, ?got, ?steps)) { bad = 1; }
+        or (got != UT_RV32_GA)                                    { bad = 1; }
+
+        # a wide global feeding wide arithmetic - the #2867 shape - with the carry and
+        # the borrow crossing the lane boundary
+        if (!ut_rv32_run_g(mem, UT_RV32_G_ADD, v, ?got, ?steps)) { bad = 1; }
+        or (got != UT_RV32_GA + v)                               { bad = 1; }
+        if (!ut_rv32_run_g(mem, UT_RV32_G_SUB, v, ?got, ?steps)) { bad = 1; }
+        or (got != UT_RV32_GA - v)                               { bad = 1; }
+
+        # the same across the 32-bit sign boundary, where the low lane is exactly the
+        # sign bit and the high lane is all ones
+        if (!ut_rv32_run_g(mem, UT_RV32_G_NADD, v, ?got, ?steps)) { bad = 1; }
+        or (got != UT_RV32_GN + v)                                { bad = 1; }
+        if (!ut_rv32_run_g(mem, UT_RV32_G_NSUB, v, ?got, ?steps)) { bad = 1; }
+        or (got != UT_RV32_GN - v)                                { bad = 1; }
+
+        vi = vi + 1;
+    }
+    ret bad;
 }
 
 # mos6502 (#2344): a wide multiply BUILDS AND RUNS, executed on a reference 6502 core
