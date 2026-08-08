@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+#### Every static ELF carried two PT_LOAD segments claiming the same address (#2795)
+The static writer mapped the ELF header and program-header table **at** `segs[0].vaddr`; the PIE and dynamic writers mapped them one page **below** it. So every static executable mach has ever produced had two `PT_LOAD` segments covering the same virtual address - the header block and `.text` both at `0x400000` - on all three ELF targets.
+
+**The image runs correctly**, which is why nothing caught it: the loader maps segments in order and the later mapping wins. It is wrong only to a reader, and mach's linked executables carry no section headers, so program headers are all a reader has. `gdb 17.2` aborts outright at process start; a crash reporter or symbolizer doing the same derivation would have been **silently wrong** instead, which is the worse failure and why this is critical rather than cosmetic.
+
+The two paths computed one fact in two places and agreed only by accident. The header-segment base is now a single definition all three writers call, and `header_fits_reserved_page` guards the static path too - it never needed the guard before only because it had no reserved page to overrun. The regression test asserts the general property that **no two load segments overlap in virtual address**, over the emitted headers rather than about one specific pair, so it fails closed for whatever the next segment-layout change does.
+
 ### Added
 
 #### A release build now carries a real ELF `.symtab`, so `perf` and a crash reporter can resolve a function name without a `-g` rebuild (#2772)
