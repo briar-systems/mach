@@ -214,7 +214,12 @@ def main(argv):
             die("no matrix at %s; run the corpus first" % matrix_path)
         m = matrixmod.Matrix.load(matrix_path)
         cases = sorted({c[0] for c in m.cells})
-        targets = sorted({c[1] for c in m.cells})
+        # engines.conf order, so a replay lays its columns out exactly as the run that
+        # wrote them did. two orderings of one matrix invite reading a cell under the
+        # wrong target, and this matrix's whole job is to say which engine produced what.
+        present = {c[1] for c in m.cells}
+        registry = [t.name for t in config.load_engines(os.path.join(CORPUS, "engines.conf"))]
+        targets = [n for n in registry if n in present] + sorted(present - set(registry))
         used = [l for l in config.LAYERS if any(c[2] == l for c in m.cells)]
         sys.stdout.write(m.render(cases, targets, used) + "\n")
         return 0
