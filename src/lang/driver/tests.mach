@@ -18761,6 +18761,35 @@ fun ut_agg_exec(st: *UtAggEval, w: *u32, n: u32, entry: u32) bool {
             i = i + len; cnt;
         }
 
+        # a widening or narrowing between unsigned integers, which is what reading a
+        # `u8` member into `u32` arithmetic emits. the result is masked to its own
+        # width, so a member that arrived carrying another member's bytes reads back
+        # as those bytes rather than being tidied up here.
+        if (op == spirv.OP_U_CONVERT) {
+            val ty:  u32 = w[i + 1];
+            val res: u32 = w[i + 2];
+            val src: u32 = w[i + 3];
+            if (ty >= UT_AGG_IDS || res >= UT_AGG_IDS || src >= UT_AGG_IDS) { ret false; }
+            if (st.ty_words[ty] != 1) { ret false; }
+            st.val[res * UT_AGG_WORDS] = ut_agg_mask(st, ty, st.val[src * UT_AGG_WORDS]);
+            st.val_ty[res] = ty;
+            i = i + len; cnt;
+        }
+
+        # the whole value moves and only its type changes: the two types describe one
+        # object, so the words are the same words. modelling it as anything narrower
+        # would let a block that lost members on the crossing read back intact.
+        if (op == spirv.OP_COPY_LOGICAL) {
+            val ty:  u32 = w[i + 1];
+            val res: u32 = w[i + 2];
+            val src: u32 = w[i + 3];
+            if (ty >= UT_AGG_IDS || res >= UT_AGG_IDS || src >= UT_AGG_IDS) { ret false; }
+            if (st.val_ty[src] == 0 || st.ty_words[st.val_ty[src]] != st.ty_words[ty]) { ret false; }
+            if (!ut_agg_copy(st, res, 0, src, 0, st.ty_words[ty])) { ret false; }
+            st.val_ty[res] = ty;
+            i = i + len; cnt;
+        }
+
         if (op == spirv.OP_COMPOSITE_EXTRACT) {
             val ty:  u32 = w[i + 1];
             val res: u32 = w[i + 2];
@@ -19086,4 +19115,319 @@ test "mach.lang.driver:a_spirv_backend_refusal_is_located" {
     project.dnit_project(?p);
     session.dnit(?s);
     ret bad;
+}
+
+# one descriptor's storage, seeded before a module runs
+#
+# A descriptor-bound block has no initializer: a host writes it, and nothing in the
+# module says what is in it. Reading one back out of an all-zero block would report
+# the same number whether every member arrived or none did, so the words go in from
+# outside and come back through the shader's own arithmetic.
+# ---
+# set:   the descriptor set
+# bind:  the binding
+# words: the values, one per scalar member in declaration order
+# n:     how many
+rec UtSeed {
+    set:   u32;
+    bind:  u32;
+    words: *u64;
+    n:     u32;
+}
+
+# run a codegen'd module's entry point with descriptor storage seeded, and report the
+# value it leaves in the interface variable decorated `Location loc`
+#
+# The evaluator lays a scalar out as one word, so a seed word per scalar member in
+# declaration order IS the block's contents. A permuted or truncated copy therefore
+# reads back a different number rather than the same total.
+# ---
+# alloc: the allocator backing the evaluator state
+# img:   the codegen'd image
+# loc:   the interface location to read
+# seeds: the descriptors to fill before the entry point runs
+# ns:    how many
+# ret:   the value stored there, or UT_AGG_BAD
+fun ut_spv_read_seeded(alloc: *A.Allocator, img: *of.ObjectImage, loc: u32,
+                       seeds: *UtSeed, ns: u32) u64 {
+    var n: u32 = 0;
+    val w: *u32 = ut_spv_words(img, ?n);
+    if (w == nil || n == 0) { ret UT_AGG_BAD; }
+
+    val ar: R.Result[*UtAggEval, str] = A.allocate[UtAggEval](alloc, 1::usize);
+    if (R.is_err[*UtAggEval, str](ar)) { ret UT_AGG_BAD; }
+    val st: *UtAggEval = R.unwrap_ok[*UtAggEval, str](ar);
+    ut_agg_reset(st);
+
+    var out: u64 = UT_AGG_BAD;
+    val tgt:   u32 = ut_agg_location_var(w, n, loc);
+    val entry: u32 = ut_agg_entry_fn(w, n);
+    var seeded: bool = true;
+    if (ut_agg_prepare(st, w, n)) {
+        var i: u32 = 0;
+        for (i < ns) {
+            val sd: *UtSeed = ?seeds[i];
+            val v: u32 = ut_spv_descriptor_var(w, n, sd.set, sd.bind);
+            if (v == 0 || v >= UT_AGG_IDS || sd.n > UT_AGG_WORDS) { seeded = false; i = ns; cnt; }
+            var k: u32 = 0;
+            for (k < sd.n) { st.val[v * UT_AGG_WORDS + k] = sd.words[k]; k = k + 1; }
+            i = i + 1;
+        }
+    }
+    or { seeded = false; }
+    if (seeded && tgt != 0 && tgt < UT_AGG_IDS && entry != 0 && ut_agg_exec(st, w, n, entry)) {
+        if (st.is_ptr[tgt] && st.ty_words[st.ptr_ty[tgt]] == 1) {
+            out = st.val[st.ptr_blk[tgt] * UT_AGG_WORDS + st.ptr_off[tgt]];
+        }
+    }
+
+    A.deallocate[UtAggEval](alloc, st, 1::usize);
+    ret out;
+}
+
+# the shader the descriptor assertions read: a uniform block and a readonly storage
+# block each handed to a helper whole, each copied whole into a local, and a padded
+# record copied whole between two locals
+#
+# THE SHAPES ARE THE POINT. A descriptor-bound block is stored at its Block-decorated
+# type and reaches a call at the plain one, so it is the only object in the language
+# whose storage type and position type differ. `Plain` is `{u8, u32, u8}`, which has
+# padding both before and after its wide member, so a copy that walked the object by
+# machine word rather than as a value reads a member back out of a neighbour's bytes.
+#
+# EVERY CROSSING HAS AN INLINE CONTROL beside it: the same members, the same weights,
+# read without crossing anything. Asserting the crossing alone would pass just as
+# well if the whole fixture were mis-evaluated.
+fun ut_spv_descriptor_value_src() str {
+    ret "rec Blk { a: u32; b: u32; c: u32; }\nrec Plain { tag: u8; v: u32; tail: u8; }\n\n#[uniform(0, 0)] var ub: Blk;\n#[storage(1, 0, \"readonly\")] var sb: Blk;\n\nfun sum_blk(p: Blk) u32 { ret p.a + p.b * 10 + p.c * 100; }\nfun sum_plain(p: Plain) u32 { ret p.tag::u32 + p.v * 10 + p.tail::u32 * 100; }\n\n#[output(0)] var o_ub: u32;\n#[output(1)] var o_ub_ctl: u32;\n#[output(2)] var o_sb: u32;\n#[output(3)] var o_sb_ctl: u32;\n#[output(4)] var o_ub_copy: u32;\n#[output(5)] var o_rec: u32;\n#[output(6)] var o_rec_ctl: u32;\n\n#[stage(\"vertex\")]\nfun vs() {\n    o_ub = sum_blk(ub);\n    o_ub_ctl = ub.a + ub.b * 10 + ub.c * 100;\n    o_sb = sum_blk(sb);\n    o_sb_ctl = sb.a + sb.b * 10 + sb.c * 100;\n    var l: Blk = ub;\n    o_ub_copy = l.a + l.b * 10 + l.c * 100;\n    var r: Plain;\n    r.tag = ub.a::u8;\n    r.v = ub.b;\n    r.tail = ub.c::u8;\n    var r2: Plain = r;\n    o_rec = sum_plain(r2);\n    o_rec_ctl = r.tag::u32 + r.v * 10 + r.tail::u32 * 100;\n}\n\nfun main() i32 { ret 0; }\n";
+}
+
+# a whole descriptor block reaches a call by value, and a whole record reaches
+# another local, with every member intact (#2922, #2926)
+#
+# WHAT WAS BROKEN, in two places that look like one. A global in a value position had
+# its symbol address materialized into a register before the placement was made,
+# which is a repair for a machine that records no relocation for a move's symbol
+# operand and which destroys the direct reference logical addressing reaches an
+# object through - so a `#[uniform]` block was refused before the whole-object
+# transfer ran at all. Behind that, a block's storage carries its layout decorations
+# and its Block-decorated struct is a DIFFERENT type from the plain one the same
+# record has in a signature, so a load re-derived from the IR type produced an
+# `OpLoad` whose result type did not match its pointer and a module a validator
+# rejects, which the compiler wrote without complaint. The load now reads the
+# variable's own type and `OpCopyLogical` carries the value to the position's.
+#
+# THE VALUES COME FROM OUTSIDE. The blocks are seeded with positional weights and the
+# shader multiplies each member by its decimal place, so a copy that permutes,
+# truncates, or drops a member reads back a different number. `Plain` is padded on
+# both sides of its wide member, which is what a copy that walked machine words
+# rather than the object gets wrong.
+test "mach.lang.driver:a_descriptor_block_crosses_a_call_by_value_on_spirv" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    var texts: [1]str;
+    names[0] = "main.mach"; texts[0] = ut_spv_descriptor_value_src();
+    val pr: R.Result[project.Project, outcome.Fail] = ut_spv_lower(?s, ?alloc, ?names[0], ?texts[0], 1, "", nil, nil, 0);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    var img: of.ObjectImage;
+    var err: str = nil;
+    if (!ut_spv_codegen(?p, ?s, "spvcase.main", ?img, ?err)) {
+        project.dnit_project(?p); session.dnit(?s); ret 1;
+    }
+
+    var uw: [3]u64;
+    uw[0] = 3::u64; uw[1] = 4::u64; uw[2] = 5::u64;
+    var sw: [3]u64;
+    sw[0] = 6::u64; sw[1] = 7::u64; sw[2] = 8::u64;
+    var seeds: [2]UtSeed;
+    seeds[0].set = 0; seeds[0].bind = 0; seeds[0].words = ?uw[0]; seeds[0].n = 3;
+    seeds[1].set = 1; seeds[1].bind = 0; seeds[1].words = ?sw[0]; seeds[1].n = 3;
+
+    var bad: i32 = 0;
+    # the load reads the variable at the type it was DECLARED with, which no value
+    # assertion can see: two identically-shaped types read back the same number
+    var wn: u32 = 0;
+    val ww: *u32 = ut_spv_words(?img, ?wn);
+    if (ww == nil || wn == 0 || !ut_spv_var_loads_typed(ww, wn)) { bad = 1; }
+
+    # 3 + 4*10 + 5*100, the uniform block's members in their declared positions
+    if (ut_spv_read_seeded(?alloc, ?img, 0, ?seeds[0], 2) != 543) { bad = 1; }
+    if (ut_spv_read_seeded(?alloc, ?img, 1, ?seeds[0], 2) != 543) { bad = 1; }
+    # 6 + 7*10 + 8*100, the storage block's, which is a different storage class
+    if (ut_spv_read_seeded(?alloc, ?img, 2, ?seeds[0], 2) != 876) { bad = 1; }
+    if (ut_spv_read_seeded(?alloc, ?img, 3, ?seeds[0], 2) != 876) { bad = 1; }
+    # the same block copied WHOLE into a local and read back from there
+    if (ut_spv_read_seeded(?alloc, ?img, 4, ?seeds[0], 2) != 543) { bad = 1; }
+    # a padded record copied whole between two locals, then handed to a helper
+    if (ut_spv_read_seeded(?alloc, ?img, 5, ?seeds[0], 2) != 543) { bad = 1; }
+    if (ut_spv_read_seeded(?alloc, ?img, 6, ?seeds[0], 2) != 543) { bad = 1; }
+
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# count, over a lowered MIR module, the symbol-address materializations and the
+# whole-object calling-convention transfers
+# ---
+# mm:      the lowered MIR module
+# out_agg: receives the number of MIR_AGG_LOAD / MIR_AGG_STORE instructions
+# ret:     the number of MIR_GEP instructions carrying no index list, which is the
+#          address materialization's flat form
+fun ut_symaddr_and_agg(mm: *mir.MirModule, out_agg: *u32) u32 {
+    var lea: u32 = 0;
+    var ac:  u32 = 0;
+    var fi: u32 = 0;
+    for (fi < mm.function_len) {
+        val mf: *mir.MirFunction = ?mm.functions[fi];
+        var bi: u32 = 0;
+        for (bi < mf.block_count) {
+            val blk: *mir.MirBlock = ?mf.blocks[bi];
+            var ii: u32 = 0;
+            for (ii < blk.instr_count) {
+                val mi: *mir.MirInstr = ?blk.instrs[ii];
+                if (mi.opcode == mir.MIR_GEP && mi.operand_count == 2
+                    && mi.operands[1].kind == mir.MIR_OP_SYM) { lea = lea + 1; }
+                if (mi.opcode == mir.MIR_AGG_LOAD)  { ac = ac + 1; }
+                if (mi.opcode == mir.MIR_AGG_STORE) { ac = ac + 1; }
+                ii = ii + 1;
+            }
+            bi = bi + 1;
+        }
+        fi = fi + 1;
+    }
+    @out_agg = ac;
+    ret lea;
+}
+
+# lower `src` for `tname` to MIR and report (symbol-address materializations, whole
+# object transfers)
+fun ut_symaddr_shape(alloc: *A.Allocator, src: str, tname: str, out_agg: *u32) i64 {
+    val sr: R.Result[session.Session, str] = session.init(alloc);
+    if (R.is_err[session.Session, str](sr)) { ret -1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    val pr: R.Result[project.Project, outcome.Fail] = ut_vec_lower(?s, alloc, src, tname);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret -1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+    var out: i64 = -1;
+    var aggs: u32 = 0;
+    var mi: u32 = 0;
+    for (mi < p.module_len) {
+        val me: *project.ModuleEntry = ?p.modules[mi];
+        if (me.ir_module == nil) { mi = mi + 1; cnt; }
+        val mr: R.Result[mir.MirModule, str] = mirlower.lower_ir(?p.target, me.ir_module, alloc, ?s.interner, ?s.sources);
+        if (R.is_err[mir.MirModule, str](mr)) { mi = mi + 1; cnt; }
+        var mm: mir.MirModule = R.unwrap_ok[mir.MirModule, str](mr);
+        var ac: u32 = 0;
+        val c: u32 = ut_symaddr_and_agg(?mm, ?ac);
+        if (out < 0) { out = 0; }
+        out = out + c::i64;
+        aggs = aggs + ac;
+        mi = mi + 1;
+    }
+    @out_agg = aggs;
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret out;
+}
+
+# materializing a global's address into a register is a BYTE-SPACE repair, gated on
+# the addressing model (#2926)
+#
+# THE FLAT TARGETS ARE THE HALF THAT MATTERS HERE. The materialization exists because
+# a move records no relocation for its operand's symbol, so on a byte-addressed
+# machine the address has to be in a register before the argument is placed. Removing
+# it for everyone, rather than gating it, would take that repair away from three
+# machine conventions at once and the fault would surface as a wrong address rather
+# than as a refusal. So both sides are asserted: a logical-addressing target
+# materializes nothing and carries the object whole, while every flat target still
+# materializes the address and carries no whole-object transfer at all.
+test "mach.lang.driver:a_symbol_address_materializes_only_on_a_flat_target" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+
+    val ssrc: str = "rec P { a: u32; b: u32; }\n#[uniform(0, 0)] var blk: P;\nfun sum(p: P) u32 { ret p.a + p.b * 10; }\n#[output(0)] var o: u32;\n#[stage(\"vertex\")]\nfun vs() { o = sum(blk); }\nfun main() i32 { ret 0; }\n";
+    val nsrc: str = "rec P { a: u32; b: u32; }\nvar g: P;\nfun sum(p: P) u32 { ret p.a + p.b * 10; }\nfun rd() u32 { ret sum(g); }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret rd()::i32; }\n";
+
+    var bad: i32 = 0;
+
+    var sa: u32 = 0;
+    # the block reaches the call as the symbol itself, carried whole
+    if (ut_symaddr_shape(?alloc, ssrc, "spirv", ?sa) != 0) { bad = 1; }
+    if (sa < 1) { bad = 1; }
+
+    var fa: u32 = 0;
+    if (ut_symaddr_shape(?alloc, nsrc, "linux", ?fa)         < 1) { bad = 1; }
+    if (fa != 0) { bad = 1; }
+    if (ut_symaddr_shape(?alloc, nsrc, "linux-arm64", ?fa)   < 1) { bad = 1; }
+    if (fa != 0) { bad = 1; }
+    if (ut_symaddr_shape(?alloc, nsrc, "linux-riscv64", ?fa) < 1) { bad = 1; }
+    if (fa != 0) { bad = 1; }
+
+    ret bad;
+}
+
+# the pointee type of the pointer type an id was declared with, or 0
+#
+# Walks the declarations rather than a cached table so the answer comes from the
+# module as written, which is the whole point of asking it.
+# ---
+# w, n: the instruction words
+# var_id: the OpVariable id
+# ret:  the pointee type id, or 0
+fun ut_spv_var_pointee(w: *u32, n: u32, var_id: u32) u32 {
+    var ptr_ty: u32 = 0;
+    var i: u32 = 0;
+    for (i < n) {
+        val len: u32 = w[i] >> 16;
+        if (len == 0) { ret 0; }
+        if ((w[i] & 0xFFFF) == spirv.OP_VARIABLE && len >= 3 && w[i + 2] == var_id) {
+            ptr_ty = w[i + 1];
+            i = n; cnt;
+        }
+        i = i + len;
+    }
+    if (ptr_ty == 0) { ret 0; }
+    i = 0;
+    for (i < n) {
+        val len: u32 = w[i] >> 16;
+        if (len == 0) { ret 0; }
+        if ((w[i] & 0xFFFF) == spirv.OP_TYPE_POINTER && len == 4 && w[i + 1] == ptr_ty) {
+            ret w[i + 3];
+        }
+        i = i + len;
+    }
+    ret 0;
+}
+
+# whether every `OpLoad` straight off a module-scope variable reads it at the type
+# the variable was declared with
+#
+# THE RULE A VALIDATOR ENFORCES AND A READ-BACK CANNOT SEE. An evaluator reading an
+# object's words answers the same number whichever of two identically-shaped types
+# the load names, so a load at the wrong type is invisible to every value assertion
+# while being a module no driver will accept. A descriptor-bound block is where the
+# two types genuinely differ, which is what makes this worth asking.
+# ---
+# w, n: the instruction words
+# ret:  false when some load names a type its pointer does not hold
+fun ut_spv_var_loads_typed(w: *u32, n: u32) bool {
+    var i: u32 = 0;
+    for (i < n) {
+        val len: u32 = w[i] >> 16;
+        if (len == 0) { ret false; }
+        if ((w[i] & 0xFFFF) == spirv.OP_LOAD && len >= 4) {
+            val pointee: u32 = ut_spv_var_pointee(w, n, w[i + 3]);
+            if (pointee != 0 && pointee != w[i + 1]) { ret false; }
+        }
+        i = i + len;
+    }
+    ret true;
 }
