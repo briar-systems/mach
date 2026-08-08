@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### A freestanding target can select `of = "elf"` and link, on every architecture (#2895)
+`os = "freestanding"` declares `page_size = 1`, and that is deliberate: bare metal has no paging, so segments carry no alignment obligation and 1 packs them tightly in a flat image. The ELF writer read that length as the size of the one-page reservation the ELF header and the program-header table have to fit inside, so the test was `64 + n*56 <= 1` and every freestanding ELF image was refused no matter how few segments it had. The objects were written correctly; only the link step failed, on x86_64, aarch64, riscv64 and riscv32 alike.
+
+Behind the refusal sat a second fault that the refusal was hiding. `header_segment_vaddr` frames the header block one page **below** segment 0, which at a base address of 0 and a page of 1 is `0 - 1` - an underflow to the top of the address space. Relaxing the check alone would have traded a loud link error for a leading `PT_LOAD` mapping the header block at `0xFFFFFFFFFFFFFFFF`: an image that links and is malformed, which is worse.
+
+Both come from applying a loader construct to a target with no loader. The leading `PT_LOAD` covering the header block exists so a **program loader** can read the program headers back out of the mapped image - `PT_PHDR`, PIE self-relocation, dynamic linking. A bare-metal image has none: the reset vector enters at the entry point and nothing parses a header at run time. So a loaderless image now emits no header segment at all, and the header block stays file metadata that is never mapped. That is also the only shape available at base address 0, where there is nothing below segment 0 to map it in.
+
+The gate is a fact the OS states about itself - `os.OsVTable.mapped_by_loader`, carried to the writer through `of.ImageOptions` - and deliberately not `page_size == 1` read as a sentinel. A page size is a length in bytes and whether an image is loader-mapped is a property of the platform; spelling one as the other is the same unit confusion that produced the bug. Every linux, darwin and windows image is unchanged, byte for byte, as is `os = "freestanding"` with `of = "raw"`.
+
 #### An RV64-only mnemonic in an `asm riscv32` body is refused rather than assembled (#2864)
 `ld`, `sd`, `addw` and the rest of the `*W` group do not exist at XLEN 32, and an `asm riscv32` body naming one assembled it anyway. The image carried an instruction the hardware does not implement, so the mistake surfaced as an illegal-instruction trap at run time instead of a diagnostic at build time - a wrong answer through a green build, which is the failure mode this target class exists to catch.
 
