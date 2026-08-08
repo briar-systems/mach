@@ -524,6 +524,11 @@ fun init_context(
         memory.fill[SymbolId](rc.decl_symbol, SYMBOL_NIL, a.decl_len);
     }
 
+    # install last, once expr_resolved exists: from here on every fold this pass
+    # runs decides an identifier on the declaration bound to it (#2764). cleared by
+    # dnit_context, which every exit from `resolve` reaches, so the borrowed ctx
+    # never keeps a dangling ResolveContext pointer.
+    comptime.set_ident_resolver(ctx, comptime_ident_is_runtime::*u8, rc::ptr);
     ret R.ok[bool, str](true);
 }
 
@@ -531,6 +536,7 @@ fun init_context(
 # ---
 # rc: the context to tear down
 fun dnit_context(rc: *ResolveContext) {
+    if (rc.ctx != nil) { comptime.set_ident_resolver(rc.ctx, nil, nil); }
     var i: u32 = 0;
     for (i < rc.scope_len) {
         val sc: *Scope = ?rc.scopes[i];
@@ -1815,17 +1821,14 @@ fun bind_comptime_if(rc: *ResolveContext, branches_start: u32, branches_len: u32
     var bi: u32 = 0;
     for (bi < branches_len) {
         val br: *decl.ComptimeBranch = ?rc.a.comptime_branches[branches_start + bi];
-        # resolve the gate's identifiers before folding it, recording each leaf's
-        # resolution identity, then reject any leaf whose binding the name-keyed
-        # fold would silently misread (a runtime local/param shadowing a comptime
-        # constant). eval failures themselves are reported by
-        # comptime_branch_active; this check covers exactly the case where the
-        # fold SUCCEEDS against the wrong binding.
+        # resolve the gate's identifiers before folding it, so each leaf's
+        # resolution identity is recorded by the time the installed ident resolver
+        # is asked for it. a leaf naming a runtime binding then fails the fold on
+        # identity, and comptime_branch_active reports that failure - there is no
+        # second rule here to keep in step with the evaluator's (#2764).
         if (br.cond != id.EXPR_NIL) {
             val rce: R.Result[bool, str] = bind_expr(rc, br.cond);
             if (R.is_err[bool, str](rce)) { ret rce; }
-            val rcs: R.Result[bool, str] = check_gate_shadowing(rc, br.cond);
-            if (R.is_err[bool, str](rcs)) { ret rcs; }
         }
         val take_r: R.Result[bool, str] = comptime_branch_active(rc, br);
         if (R.is_err[bool, str](take_r)) { ret take_r; }
@@ -1843,72 +1846,47 @@ fun bind_comptime_if(rc: *ResolveContext, branches_start: u32, branches_len: u32
 # whether a resolved symbol denotes a RUNTIME binding, decided on resolution
 # identity rather than on name text
 #
-# ONE definition because the comptime environment is keyed by NAME: a block-local
+# THE definition. The comptime environment is keyed by NAME, so a block-local
 # `val`/`var` or a non-`$` parameter that happens to share a name with a
-# module-level constant folds to that constant, so every site that decides
-# whether an identifier may be folded has to ask the same question. A second
-# enumeration of this rule would drift, and the two sites it serves - the `$if`
-# gate shadowing check and the constant index bound (#2751) - disagree loudly
-# when it does: one miscompiles a gate, the other refuses a legal access.
+# module-level constant would otherwise read back that constant - which is the
+# defect this answers (#2764). `comptime.eval_ident` asks it through the ident
+# resolver every pass installs, so the evaluator, the `$if` gate diagnostics, and
+# the constant index bound (#2751) all decide the same question from this one
+# function rather than from three enumerations of it.
 #
-# Module scope is what makes a `val` foldable, `$` is what makes a parameter
-# foldable, and everything else (a function, an import, a type name) is not a
-# value binding at all and is left to the evaluator.
+# `$` marks a comptime binding whatever its kind: a `$param`, and the `$each` loop
+# variable, which resolve declares as a SYM_VAL bearing SYM_FLAG_COMPTIME and which
+# a rule keyed only on module scope therefore misread as runtime. Module scope is
+# what makes an unmarked `val` foldable, and everything else (a function, an import,
+# a type name) is not a value binding at all and is left to the evaluator.
 # ---
 # sym: the resolved symbol
 # ret: true when the symbol names storage decided at runtime
 pub fun symbol_is_runtime(sym: *Symbol) bool {
+    if ((sym.flags & SYM_FLAG_COMPTIME) != 0) { ret false; }
     if (sym.kind == SYM_VAL || sym.kind == SYM_VAR) {
         ret (sym.flags & SYM_FLAG_MODULE) == 0;
     }
-    if (sym.kind == SYM_PARAM) {
-        ret (sym.flags & SYM_FLAG_COMPTIME) == 0;
-    }
-    ret false;
+    ret sym.kind == SYM_PARAM;
 }
 
-# walks a folded (non-param) `$if` gate and rejects any
-# leaf identifier that resolves to a runtime binding whose NAME also names a
-# comptime constant in the env. the comptime fold is name-keyed, so such a gate
-# folds against the constant while the resolver bound the ident to the runtime
-# local / parameter - a silent wrong-arm miscompile. a runtime ident whose name
-# is not in the env is left alone: the fold fails on it and
-# comptime_branch_active reports that failure, so reporting here would
-# duplicate it. reports at the offending leaf's span
+# the identifier-binding resolver resolve installs on the module's ComptimeCtx (a
+# comptime.IdentBindingFn), so a gate folded during binding reads the declaration
+# the resolver just bound rather than whatever shares the spelling. leaves reach
+# this already recorded: bind_expr runs over a gate before comptime_branch_active
+# folds it. an unrecorded or out-of-range leaf answers false, leaving the evaluator
+# to report the name as not a constant
 # ---
-# rc:  resolver state for the module being resolved
-# eid: the gate expression to walk
-# ret: ok(true), or a reported shadowing error
-fun check_gate_shadowing(rc: *ResolveContext, eid: id.ExprId) R.Result[bool, str] {
-    if (eid == id.EXPR_NIL) { ret R.ok[bool, str](true); }
-    val e_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, eid);
-    if (O.is_none[*expr.Expr](e_opt)) { ret R.ok[bool, str](true); }
-    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
-
-    if (e.kind == expr.EXPR_KIND_BINARY) {
-        val rl: R.Result[bool, str] = check_gate_shadowing(rc, e.data.binary.lhs);
-        if (R.is_err[bool, str](rl)) { ret rl; }
-        ret check_gate_shadowing(rc, e.data.binary.rhs);
-    }
-    if (e.kind == expr.EXPR_KIND_UNARY) {
-        ret check_gate_shadowing(rc, e.data.unary.operand);
-    }
-    if (e.kind != expr.EXPR_KIND_IDENT) { ret R.ok[bool, str](true); }
-
-    if (rc.expr_resolved == nil) { ret R.ok[bool, str](true); }
+# data: the *ResolveContext, erased to a ptr by the installer
+# eid:  the IDENT expression id, valid in this module's ast
+# ret:  true when the identifier names a runtime binding
+fun comptime_ident_is_runtime(data: ptr, eid: id.ExprId) bool {
+    val rc: *ResolveContext = data::*ResolveContext;
+    if (rc == nil || rc.expr_resolved == nil) { ret false; }
+    if (eid == id.EXPR_NIL || eid::u32 >= rc.a.expr_len::u32) { ret false; }
     val sid: SymbolId = rc.expr_resolved[eid];
-    if (sid == SYMBOL_NIL || sid >= rc.sym_len) { ret R.ok[bool, str](true); }
-    val sym: *Symbol = ?rc.symbols[sid];
-
-    if (!symbol_is_runtime(sym)) { ret R.ok[bool, str](true); }
-
-    val id_r: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, e.span);
-    if (R.is_err[intern.StrId, str](id_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](id_r)); }
-    val nc: O.Option[*comptime.NamedConst] = comptime.lookup(rc.ctx, R.unwrap_ok[intern.StrId, str](id_r));
-    if (O.is_none[*comptime.NamedConst](nc)) { ret R.ok[bool, str](true); }
-
-    ret diagnostic.error(?rc.s.diags, rc.a.file_id, e.span,
-        "comptime branch condition references a runtime binding that shadows a comptime constant");
+    if (sid == SYMBOL_NIL || sid >= rc.sym_len) { ret false; }
+    ret symbol_is_runtime(?rc.symbols[sid]);
 }
 
 # reports whether any arm gate of a `$if` chain references a comptime value

@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### A C `[step]` cross-builds for its leg instead of silently assuming the host toolchain targets it (#2741)
+`int/surface/narrow-stack-args` and `int/surface/c-variadic` shelled out to the bare host `cc` to build a probe object, which happens to target the leg on every CI runner (each builds natively) but not on a developer cross-building locally - `mach --target linux-arm64` on an x86-64 host still ran the host's x86-64 `cc`, silently linking an x86-64 object into an aarch64 image. That surfaced as `error: relocation 'plt32' to 'float_tail' overflows` on narrow-stack-args and a qemu `Illegal instruction` on c-variadic, neither of which names its actual cause.
+
+Both cases now build their probe object through `int/lib/cc.sh`, a general contract for any case with a C `[step]`: it uses the host's own `cc` when the host already targets the leg (preserving the point of these cases, which is to catch a *real* toolchain's ABI diverging from mach's model of it - Apple arm64's stack-argument rule, for one), and falls back to `clang -target <triple> -c` otherwise, since mach does the link itself and a cross-compiled object needs no sysroot or cross-linker to satisfy it. A leg cc.sh has no route for (no host match, and clang is missing) fails the step loudly, naming what's missing, rather than surfacing downstream as an opaque link error.
+
+This also lets both cases build for `linux-riscv64` for the first time, previously exempted only because the host-`cc` gap made it impossible; narrow-stack-args passes there cleanly. c-variadic's riscv64 leg stays exempted, but now for a real reason instead of a stale one: every variadic float/double argument comes back as `0`, a genuine mach ABI bug in riscv64's variadic lowering that this cross-build gap had been hiding coverage of (#2771).
+
+`int/run.sh` also now prints a `SKIP <case> [<target>] (exempt, see case.conf)` line for a case's `exempt:` legs, which previously left no trace in the run's output at all - a leg a case never applies to and a leg it was silently excluded from looked identical.
+
+`m`, the bootstrap output `mach build . -o m` (CONTRIBUTING.md's own instruction) produces, is now gitignored.
+
+#### A comptime identifier names the declaration it resolves to, not the spelling (#2764)
+The comptime environment is keyed by **name**, and `comptime.eval_ident` looked a bare identifier up in it directly. Resolution identity was never consulted, so a binding was matched by what it is called rather than by which declaration it is. A block-local `val N` shadowing a module-level `val N = 9` therefore read back the **module** constant: `var xs: [N]i64;` under a runtime local `N` compiled as `[9]i64`, and the out-of-bounds diagnostic it later raised named a length the source never wrote.
+
+The evaluator now decides each identifier on the symbol the resolver bound to it. Every pass that owns a name-resolution map installs the same hook, and all of them answer from **one** function, `resolve.symbol_is_runtime`.
+
+That collapses the two rules that existed to compensate for the old reading. `resolve.check_gate_shadowing` is **removed**: it caught a case the evaluator would otherwise get wrong, and there is no such case left to catch. The constant index bound (#2751) no longer walks its operand for runtime leaves before folding, because the fold now fails on them by itself. `sema`'s `$if` gate walk keeps its per-kind diagnostics — a reader needs to hear "parameter" for a parameter and "value" for a binding — but delegates the decision.
+
+Consolidating them surfaced a disagreement the copies had been hiding. An `$each` loop variable is a **comptime** binding that resolve declares as a `SYM_VAL` bearing the comptime flag, and a rule keyed only on module scope classified it as runtime. The constant index bound consequently declined to decide any index driven by one, so `xs[e]` over an element out of range compiled clean and read past the array. It is now refused. `$` marks a comptime binding whatever its kind, and the rule says so once.
+
+A comptime binding that shadows a module constant still resolves innermost-first, which is the half of this that had to be preserved rather than changed: a `$param` or an `$each` variable named after a module constant denotes the inner one.
+
 #### A float or integer memory access refuses a width the target has no form for (#2766)
 A memory access takes a byte width and picks a machine form from it. On aarch64 and riscv64 that pick was a boolean selector with a trailing default, so a width the target has no form for silently got some other form's bytes rather than a diagnostic, the same shape #2733 removed from the float move, negate, arithmetic, compare and conversion encoders, one family over.
 

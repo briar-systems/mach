@@ -217,6 +217,31 @@ pub val FIELD_SEL_OFFSET: u8 = 2;
 # installs this hook with `set_field_resolver`
 pub def FieldMemberFn: fun(ptr, u32, u32, u8) R.Result[O.Option[CTValue], str];
 
+# decides a bare identifier expression by RESOLUTION IDENTITY: true when the name
+# denotes a runtime binding (a block-local `val`/`var`, a non-`$` parameter), false
+# when it denotes a comptime one or has no resolution at all.
+#
+# The comptime environment is keyed by NAME, so without this the evaluator answers
+# "which declaration is this" by spelling: a block-local `var N` shadowing a
+# module-level `val N` folds to the MODULE constant, silently, with a plausible
+# value (#2764). `eval` owns the identifier dispatch but cannot depend on name
+# resolution without an import cycle, so every pass that owns a resolution map
+# installs this hook with `set_ident_resolver` and answers from the one shared
+# rule, `resolve.symbol_is_runtime`. A context with no hook (the driver's load-time
+# module walk, the editor's single-buffer analysis) sees only module-level names,
+# where no shadowing binding exists to confuse.
+#
+# The first argument is the installer's opaque context; the second is the IDENT
+# expression id, valid in the ast eval is currently walking.
+pub def IdentBindingFn: fun(ptr, id.ExprId) bool;
+
+# surfaced when an identifier resolves to a runtime binding. distinct from the
+# not-in-scope message: the name IS bound, just not to anything with a value
+# before the program runs, and a same-named comptime constant it shadows is not
+# what the expression denotes
+pub val COMPTIME_IDENT_RUNTIME_MSG: str =
+    "identifier names a runtime binding, so it has no comptime value";
+
 # the questions a comptime type query answers about one already-resolved type
 # (#2128). `eval` holds no type universe, so the typed layer installs the answer
 # with `set_type_query_resolver`, the same shape as the field-member hook above.
@@ -321,6 +346,10 @@ pub def FrameMark: u32;
 #                 type-identity token, or nil when no resolver is installed (every
 #                 pass before lowering)
 # type_data:      opaque context passed to type_fn (the *LowerContext)
+# ident_fn:       erased IdentBindingFn deciding whether a bare identifier names a
+#                 runtime binding, or nil when the evaluating pass owns no name
+#                 resolution (the driver's load walk, the editor's host context)
+# ident_data:     opaque context passed to ident_fn (the pass's own context record)
 pub rec ComptimeCtx {
     alloc:          *A.Allocator;
     target_os_id:   u32;
@@ -355,6 +384,8 @@ pub rec ComptimeCtx {
     field_data:     ptr;
     query_fn:       *u8;
     query_data:     ptr;
+    ident_fn:       *u8;
+    ident_data:     ptr;
 }
 
 val INITIAL_CONST_CAP: u32 = 8;
@@ -427,6 +458,10 @@ pub fun init(
     c.type_data      = nil;
     c.field_fn       = nil;
     c.field_data     = nil;
+    c.query_fn       = nil;
+    c.query_data     = nil;
+    c.ident_fn       = nil;
+    c.ident_data     = nil;
     ret c;
 }
 
@@ -479,6 +514,19 @@ pub fun set_field_resolver(c: *ComptimeCtx, fn: *u8, data: ptr) {
 pub fun set_type_query_resolver(c: *ComptimeCtx, fn: *u8, data: ptr) {
     c.query_fn   = fn;
     c.query_data = data;
+}
+
+# install (or clear) the identifier-binding resolver `eval` consults before it
+# folds a bare identifier (#2764). the pass that owns the module's name resolution
+# installs it; passing `nil` for both clears it, which restores the name-keyed
+# reading and is only correct where no local binding can exist
+# ---
+# c:    the comptime context
+# fn:   erased IdentBindingFn, or nil to clear
+# data: opaque context handed back to `fn`
+pub fun set_ident_resolver(c: *ComptimeCtx, fn: *u8, data: ptr) {
+    c.ident_fn   = fn;
+    c.ident_data = data;
 }
 
 # bind the manifest-derived project metadata, the selected
@@ -746,7 +794,7 @@ pub fun eval(
     if (k == expr.EXPR_KIND_UNARY)  { ret eval_unary(c, a, source, ?node.data.unary, interner); }
 
     if (k == expr.EXPR_KIND_IDENT) {
-        val r_id: R.Result[CTValue, str] = eval_ident(c, source, node.span, interner);
+        val r_id: R.Result[CTValue, str] = eval_ident(c, source, e, node.span, interner);
         if (R.is_err[CTValue, str](r_id)) { ret r_id; }
         val v_id: CTValue = R.unwrap_ok[CTValue, str](r_id);
         # a `$each x in ARR` loop variable binds to a CONST_ELEM descriptor; fold a
@@ -2027,15 +2075,28 @@ fun apply_int_shift(op: expr.BinOp, lhs: CTValue, rhs: CTValue) R.Result[CTValue
 # resolves a bare identifier expression (no `$` prefix). language-level
 # boolean literals `true` and `false` are short-circuited; everything else
 # must have been registered as a comptime constant by the driver
+#
+# WHICH declaration the name denotes is decided by the installed ident resolver,
+# never by the name itself (#2764). The environment below is keyed by name, so
+# consulting it first would answer for whichever binding happens to share the
+# spelling - and a block-local binding shadowing a module constant reads back the
+# constant, with no error to say so. The identity question is therefore asked
+# BEFORE the environment is touched, and a runtime binding stops here.
 fun eval_ident(
     c:        *ComptimeCtx,
     source:   str,
+    e:        id.ExprId,
     span:     token.Span,
     interner: *intern.Interner
 ) R.Result[CTValue, str] {
     val text: View = span_text(source, span);
     if (view_eq_str(text, "true"))  { ret bool_value(true); }
     if (view_eq_str(text, "false")) { ret bool_value(false); }
+
+    if (c.ident_fn != nil) {
+        val ident_of: IdentBindingFn = c.ident_fn::IdentBindingFn;
+        if (ident_of(c.ident_data, e)) { ret R.err[CTValue, str](COMPTIME_IDENT_RUNTIME_MSG); }
+    }
 
     val id_r: R.Result[intern.StrId, str] = intern.intern_span(interner, source, span);
     if (R.is_err[intern.StrId, str](id_r)) {
@@ -2118,7 +2179,7 @@ fun eval_const_elem_member(
     val obj: *expr.Expr = O.unwrap[*expr.Expr](obj_opt);
     if (obj.kind != expr.EXPR_KIND_IDENT)                                     { ret O.none[R.Result[CTValue, str]](); }
 
-    val obj_r: R.Result[CTValue, str] = eval_ident(c, source, obj.span, interner);
+    val obj_r: R.Result[CTValue, str] = eval_ident(c, source, object_eid, obj.span, interner);
     if (R.is_err[CTValue, str](obj_r))                                        { ret O.none[R.Result[CTValue, str]](); }
     val ov: CTValue = R.unwrap_ok[CTValue, str](obj_r);
     if (ov.kind != CT_KIND_CONST_ELEM)                                        { ret O.none[R.Result[CTValue, str]](); }
