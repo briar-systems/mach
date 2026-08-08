@@ -31,6 +31,7 @@ use ctime: std.chrono.time;
 use cdur:  std.chrono.duration;
 
 use mach.lang.be.codegen;
+use mach.lang.be.codegen.unit;
 use mir: mach.lang.be.codegen.mir;
 use mirlower: mach.lang.be.codegen.mir.lower;
 use mach.lang.be.obj;
@@ -57,6 +58,7 @@ use mach.lang.readout;
 use mach.lang.session;
 use src: mach.lang.source;
 use mach.lang.target;
+use mach.lang.target.isa.spirv;
 use mach.lang.target.of;
 use mach.lang.type;
 
@@ -5255,7 +5257,7 @@ fun ut_noinline_survives_object(target_name: str) i32 {
                 val callee_name: intern.StrId = ut_single_local_callee_name(m);
                 if (callee_name != intern.STR_NIL) {
                     val cg: R.Result[of.ObjectImage, str] =
-                        codegen.codegen_module(?s, ?p.target, m, nil, codegen.no_debug());
+                        codegen.codegen_module(?s, ?p.target, m, unit.ir_set_empty(), nil, codegen.no_debug());
                     if (R.is_ok[of.ObjectImage, str](cg)) {
                         var image: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](cg);
                         if (ut_has_direct_call_reloc(?image, callee_name)) { bad = 0; }
@@ -5411,7 +5413,7 @@ fun ut_naked_spans(target_name: str, src: str, naked_out: *i64, bare_out: *i64) 
         val me: *project.ModuleEntry = ?p.modules[mid::u32];
         if (me.ir_module != nil) {
             val cg: R.Result[of.ObjectImage, str] =
-                codegen.codegen_module(?s, ?p.target, me.ir_module, nil, codegen.no_debug());
+                codegen.codegen_module(?s, ?p.target, me.ir_module, unit.ir_set_empty(), nil, codegen.no_debug());
             if (R.is_ok[of.ObjectImage, str](cg)) {
                 var image: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](cg);
                 val nk: R.Result[intern.StrId, str] = intern.intern(?s.interner, "nk");
@@ -14205,6 +14207,750 @@ test "mach.lang.driver:asm_that_cannot_return_terminates_its_block" {
     if (ut_asm_fn_terminator(?p, "dies") != 1)  { bad = 1; }
     # an ordinary body returns, and removing its `ret` would be the miscompile.
     if (ut_asm_fn_terminator(?p, "lives") != 2) { bad = 1; }
+
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# --- the SPIR-V emission unit: what a shader's module carries (#2823) ---------
+#
+# These read the EMITTED SPIR-V, in process, off the ObjectImage codegen returns.
+# That is deliberate and it is what makes them unit tests rather than integration
+# ones: the instruction sequence a shader compiles to is this repo's own fact,
+# produced in memory, and nothing outside owns it. A golden diffed after a build
+# would assert the same thing later, localize nothing, and need spirv-tools on the
+# runner to say anything at all.
+#
+# WHAT THEY HAVE TO SEE THAT A VALIDATOR CANNOT. Every wrong outcome available to
+# cross-module emission is a module `spirv-val` accepts: a helper emitted once per
+# entry point that reaches it, an imported module's unreachable functions dragged
+# in with the reachable ones, a call resolved to the wrong same-shaped helper, a
+# drawn-in body published under a linkage export its owning module already
+# publishes. So the assertions are about the functions and the calls between them.
+#
+# IDENTIFYING A FUNCTION BY ITS ARITY is what keeps these readable. A shader
+# module's internal functions carry no name in the emitted module - no entry point,
+# no export, nothing but an id that renumbers whenever anything else changes - so
+# the fixtures give every function in the tree a DISTINCT parameter count, and an
+# arity is then a name. "no five-parameter function in this module" is exactly "the
+# unreachable helper did not come along", stated in the only vocabulary the module
+# itself has.
+
+# the manifest for a spirv fixture: the tuple, one profile, one bin artifact, and
+# optionally one path dependency
+# ---
+# alloc:     allocator for the composed string
+# dep_alias: the dependency's name, or "" for a fixture with none
+# ret:       the mach.toml text
+fun ut_spv_manifest(alloc: *A.Allocator, dep_alias: str) str {
+    val head: str = "[project]\nid = \"spvcase\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.spirv]\nisa = \"spirv\"\nos = \"freestanding\"\nabi = \"spirv\"\n\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n\n[artifact.spvcase]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/spvcase\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+    if (str_len(dep_alias) == 0::usize) { ret head; }
+    val a: str = ut_cc3(alloc, head, "\n[dep.", dep_alias);
+    val b: str = ut_cc3(alloc, a, "]\npath = \"", dep_alias);
+    ret ut_cc3(alloc, b, "\"\n", "");
+}
+
+# the manifest for a spirv path DEPENDENCY: the same tuple, no artifact
+fun ut_spv_dep_manifest(alloc: *A.Allocator, id: str) str {
+    ret ut_cc3(alloc, "[project]\nid = \"", id, "\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.spirv]\nisa = \"spirv\"\nos = \"freestanding\"\nabi = \"spirv\"\n\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n");
+}
+
+# write a project node carrying SEVERAL source files
+#
+# `ut_write_node` writes one, and a dependency that is itself several modules -
+# which is what a transitive draw-in needs - cannot be built from it.
+# ---
+# alloc:         allocator for the composed paths
+# dir:           the node's root, created along with its `src`
+# manifest_text: its mach.toml
+# names/texts:   `n` source file names and bodies
+# ret:           none on success, or the first error
+fun ut_write_node_multi(alloc: *A.Allocator, dir: str, manifest_text: str,
+                        names: *str, texts: *str, n: u32) O.Option[str] {
+    val d1: O.Option[str] = fs.create_dir_all(alloc, dir, 493);
+    if (O.is_some[str](d1)) { ret d1; }
+    val src_dir: str = ut_cc3(alloc, dir, "/", "src");
+    val d2: O.Option[str] = fs.create_dir_all(alloc, src_dir, 493);
+    if (O.is_some[str](d2)) { ret d2; }
+    val mf: str = ut_cc3(alloc, dir, "/", manifest.MANIFEST_FILE);
+    val w0: O.Option[str] = fs.write_bytes(mf, manifest_text, str_len(manifest_text), 420);
+    if (O.is_some[str](w0)) { ret w0; }
+    var i: u32 = 0;
+    for (i < n) {
+        val sf: str = ut_cc3(alloc, src_dir, "/", names[i]);
+        val w: O.Option[str] = fs.write_bytes(sf, texts[i], str_len(texts[i]), 420);
+        if (O.is_some[str](w)) { ret w; }
+        i = i + 1;
+    }
+    ret O.none[str]();
+}
+
+# scaffold a spirv project (optionally with one path dep), load it for the `spirv`
+# target, and run sema + lower so every module's IR is resident
+#
+# Stops after lowering rather than going on to codegen: these tests generate ONE
+# named module at a time and look at what came out, because the emission unit is
+# assembled per module and that is the seam under test.
+# ---
+# s, alloc:    the caller's session and allocator
+# names/texts: the root project's `src` files
+# dep_*:       the dependency node, or dep_n = 0 for a fixture with none
+# ret:         the loaded, lowered project
+fun ut_spv_lower(s: *session.Session, alloc: *A.Allocator,
+                 names: *str, texts: *str, n: u32,
+                 dep_id: str, dep_names: *str, dep_texts: *str, dep_n: u32) R.Result[project.Project, outcome.Fail] {
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "mach_spv_test");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret R.err[project.Project, outcome.Fail](outcome.user(R.unwrap_err[fs.TempFile, str](tf_r))); }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val dup_r: R.Result[str, str] = str_dup(alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[str, str](dup_r)) { ret R.err[project.Project, outcome.Fail](outcome.user(R.unwrap_err[str, str](dup_r))); }
+    val root: str = R.unwrap_ok[str, str](dup_r);
+
+    var alias: str = "";
+    if (dep_n > 0) { alias = dep_id; }
+    val wr: O.Option[str] = ut_write_node_multi(alloc, root, ut_spv_manifest(alloc, alias), names, texts, n);
+    if (O.is_some[str](wr)) { fs.remove_all(alloc, root); ret R.err[project.Project, outcome.Fail](outcome.user(O.unwrap[str](wr))); }
+
+    # the dep node goes at `dep/<alias>`, the MATERIALIZED location the loader reads.
+    # the manifest's `path` names where `mach dep pull` would fetch it from, which
+    # nothing here runs, so writing the node where a pull would have put it is what
+    # makes the dependency resolvable.
+    if (dep_n > 0) {
+        val dep_dir: str = ut_cc3(alloc, root, "/dep/", dep_id);
+        val dw: O.Option[str] = ut_write_node_multi(alloc, dep_dir, ut_spv_dep_manifest(alloc, dep_id), dep_names, dep_texts, dep_n);
+        if (O.is_some[str](dw)) { fs.remove_all(alloc, root); ret R.err[project.Project, outcome.Fail](outcome.user(O.unwrap[str](dw))); }
+    }
+
+    val rr: R.Result[bool, str] = driver.setup_registry(?s.registry);
+    if (R.is_err[bool, str](rr)) { fs.remove_all(alloc, root); ret R.err[project.Project, outcome.Fail](outcome.user(R.unwrap_err[bool, str](rr))); }
+    val pr: R.Result[project.Project, outcome.Fail] = driver.build_project(s, root, "spirv");
+    fs.remove_all(alloc, root);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { ret pr; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    val sr2: R.Result[bool, outcome.Fail] = passes.run_sema_pass(?p);
+    if (R.is_err[bool, outcome.Fail](sr2)) { project.dnit_project(?p); ret R.err[project.Project, outcome.Fail](R.unwrap_err[bool, outcome.Fail](sr2)); }
+    val lr: R.Result[bool, outcome.Fail] = passes.run_lower_pass(?p);
+    if (R.is_err[bool, outcome.Fail](lr)) { project.dnit_project(?p); ret R.err[project.Project, outcome.Fail](R.unwrap_err[bool, outcome.Fail](lr)); }
+    ret R.ok[project.Project, outcome.Fail](p);
+}
+
+# codegen one named module of a lowered spirv project, assembling its emission unit
+# exactly as the build would
+#
+# This is the seam under test as the driver actually drives it: `code_sources`
+# decides which modules the emitter may draw bodies from, and `codegen_module`
+# lowers them and runs the emitter over the unit.
+# ---
+# p, s:    the lowered project and its session
+# fqn:     the module to generate
+# out_img: receives the image on success; untouched on failure
+# out_err: receives the diagnostic on failure; untouched on success
+# ret:     true when codegen succeeded
+fun ut_spv_codegen(p: *project.Project, s: *session.Session, fqn: str,
+                   out_img: *of.ObjectImage, out_err: *str) bool {
+    val mid: session.ModuleId = ut_mid(p, s, fqn);
+    if (mid == session.MODULE_NIL) { @out_err = "module not loaded"; ret false; }
+    val m: *project.ModuleEntry = ?p.modules[mid::u32];
+    if (m.ir_module == nil)      { @out_err = "module has no lowered IR"; ret false; }
+
+    val sr: R.Result[passes.CodeSources, str] = passes.code_sources(p, mid, s.alloc);
+    if (R.is_err[passes.CodeSources, str](sr)) { @out_err = R.unwrap_err[passes.CodeSources, str](sr); ret false; }
+    var srcs: passes.CodeSources = R.unwrap_ok[passes.CodeSources, str](sr);
+
+    val cg: R.Result[of.ObjectImage, str] =
+        codegen.codegen_module(s, ?p.target, m.ir_module, srcs.set, nil, codegen.no_debug());
+    passes.sources_dnit(s.alloc, ?srcs);
+    if (R.is_err[of.ObjectImage, str](cg)) { @out_err = R.unwrap_err[of.ObjectImage, str](cg); ret false; }
+    @out_img = R.unwrap_ok[of.ObjectImage, str](cg);
+    ret true;
+}
+
+# the SPIR-V instruction words of a codegen'd image
+#
+# The emitter's output is the single `.spirv` section, little-endian words. The
+# five-word header is skipped, so `out_n` counts instruction words only.
+# ---
+# img:   the image
+# out_n: receives the word count
+# ret:   the first instruction word, or nil
+fun ut_spv_words(img: *of.ObjectImage, out_n: *u32) *u32 {
+    @out_n = 0;
+    var i: u32 = 0;
+    for (i < img.section_count) {
+        val sec: *of.Section = ?img.sections[i];
+        if (sec.len >= 20 && sec.bytes != nil) {
+            val w: *u32 = sec.bytes::ptr::*u32;
+            @out_n = sec.len / 4 - 5;
+            ret ?w[5];
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# how many instructions of one opcode the stream carries
+# ---
+# w, n:   the instruction words
+# opcode: the SPIR-V opcode
+# ret:    the count
+fun ut_spv_count(w: *u32, n: u32, opcode: u32) u32 {
+    var i: u32 = 0;
+    var c: u32 = 0;
+    for (i < n) {
+        val len: u32 = w[i] >> 16;
+        if (len == 0) { ret c; }
+        if ((w[i] & 0xFFFF) == opcode) { c = c + 1; }
+        i = i + len;
+    }
+    ret c;
+}
+
+# the parameter count of the OpTypeFunction the `fn_ix`-th OpFunction names
+#
+# `OpFunction <result-type> <id> <control> <fn-type>` and
+# `<id> = OpTypeFunction <return-type> <param-types...>`, so the arity is the type's
+# word count less the fixed three. The fixtures give every function in the tree a
+# distinct arity, which is what lets an assertion name one.
+# ---
+# w, n:  the instruction words
+# fn_ix: which OpFunction, in emission order
+# ret:   the arity, or UT_SPV_NO_FN when there is no such function
+fun ut_spv_fn_arity(w: *u32, n: u32, fn_ix: u32) u32 {
+    var i: u32 = 0;
+    var seen: u32 = 0;
+    var ty: u32 = 0;
+    var got: bool = false;
+    for (i < n && !got) {
+        val len: u32 = w[i] >> 16;
+        if (len == 0) { ret UT_SPV_NO_FN; }
+        if ((w[i] & 0xFFFF) == spirv.OP_FUNCTION) {
+            if (seen == fn_ix) { ty = w[i + 4]; got = true; }
+            seen = seen + 1;
+        }
+        i = i + len;
+    }
+    if (!got) { ret UT_SPV_NO_FN; }
+    i = 0;
+    for (i < n) {
+        val len: u32 = w[i] >> 16;
+        if (len == 0) { ret UT_SPV_NO_FN; }
+        if ((w[i] & 0xFFFF) == spirv.OP_TYPE_FUNCTION && w[i + 1] == ty) { ret len - 3; }
+        i = i + len;
+    }
+    ret UT_SPV_NO_FN;
+}
+
+# no OpFunction at that position, or no OpTypeFunction behind the one there is
+val UT_SPV_NO_FN: u32 = 0xFFFFFFFF;
+
+# how many functions of the given arity the module defines
+#
+# A COUNT rather than a presence test, because the duplication this guards against
+# leaves the function present either way: a helper emitted once per entry point
+# that reaches it is there, twice.
+fun ut_spv_arity_count(w: *u32, n: u32, arity: u32) u32 {
+    val fns: u32 = ut_spv_count(w, n, spirv.OP_FUNCTION);
+    var i: u32 = 0;
+    var c: u32 = 0;
+    for (i < fns) {
+        if (ut_spv_fn_arity(w, n, i) == arity) { c = c + 1; }
+        i = i + 1;
+    }
+    ret c;
+}
+
+# whether every OpFunctionCall's callee names a function this module defines
+#
+# The closure assertion, and the one that catches a draw-in stopping a hop short: a
+# call whose callee id has no OpFunction is a module calling into nothing, which is
+# exactly what a self-contained module must never be.
+# ---
+# w, n: the instruction words
+# ret:  true when every call resolves
+fun ut_spv_calls_all_resolve(w: *u32, n: u32) bool {
+    var i: u32 = 0;
+    for (i < n) {
+        val len: u32 = w[i] >> 16;
+        if (len == 0) { ret true; }
+        if ((w[i] & 0xFFFF) == spirv.OP_FUNCTION_CALL) {
+            if (!ut_spv_defines_fn(w, n, w[i + 3])) { ret false; }
+        }
+        i = i + len;
+    }
+    ret true;
+}
+
+# whether some OpFunction in the module carries the given result id
+fun ut_spv_defines_fn(w: *u32, n: u32, id: u32) bool {
+    var i: u32 = 0;
+    for (i < n) {
+        val len: u32 = w[i] >> 16;
+        if (len == 0) { ret false; }
+        if ((w[i] & 0xFFFF) == spirv.OP_FUNCTION && w[i + 2] == id) { ret true; }
+        i = i + len;
+    }
+    ret false;
+}
+
+# the callee id of the first OpFunctionCall inside the `fn_ix`-th OpFunction, or 0
+#
+# "both entry points reach the SAME helper" is a statement about two ids being
+# equal, so an id is what this returns - the only place these tests handle one, and
+# they only ever compare it with another from the same module.
+fun ut_spv_first_callee_in(w: *u32, n: u32, fn_ix: u32) u32 {
+    var i: u32 = 0;
+    var seen: u32 = 0;
+    var started: bool = false;
+    for (i < n) {
+        val len: u32 = w[i] >> 16;
+        if (len == 0) { ret 0; }
+        val op: u32 = w[i] & 0xFFFF;
+        if (op == spirv.OP_FUNCTION) {
+            if (started) { seen = seen + 1; }
+            started = true;
+        }
+        if (op == spirv.OP_FUNCTION_CALL && started && seen == fn_ix) { ret w[i + 3]; }
+        i = i + len;
+    }
+    ret 0;
+}
+
+# the id the `k`-th OpEntryPoint names, or 0
+#
+# `OpEntryPoint <model> <fn> "<name>" <interface...>`, so the function id is the
+# second operand and needs no string decoding.
+fun ut_spv_entry_fn(w: *u32, n: u32, k: u32) u32 {
+    var i: u32 = 0;
+    var seen: u32 = 0;
+    for (i < n) {
+        val len: u32 = w[i] >> 16;
+        if (len == 0) { ret 0; }
+        if ((w[i] & 0xFFFF) == spirv.OP_ENTRY_POINT) {
+            if (seen == k) { ret w[i + 2]; }
+            seen = seen + 1;
+        }
+        i = i + len;
+    }
+    ret 0;
+}
+
+# the position, in emission order, of the OpFunction carrying `id`, or UT_SPV_NO_FN
+fun ut_spv_fn_index_of(w: *u32, n: u32, id: u32) u32 {
+    var i: u32 = 0;
+    var seen: u32 = 0;
+    for (i < n) {
+        val len: u32 = w[i] >> 16;
+        if (len == 0) { ret UT_SPV_NO_FN; }
+        if ((w[i] & 0xFFFF) == spirv.OP_FUNCTION) {
+            if (w[i + 2] == id) { ret seen; }
+            seen = seen + 1;
+        }
+        i = i + len;
+    }
+    ret UT_SPV_NO_FN;
+}
+
+# how many functions carry a LinkageAttributes Export decoration
+#
+# A drawn-in body must never be one of them: its owning module publishes that
+# symbol from its own module, and a second definition of one name is a collision
+# this module would have invented over a function it does not own.
+fun ut_spv_export_count(w: *u32, n: u32) u32 {
+    var i: u32 = 0;
+    var c: u32 = 0;
+    for (i < n) {
+        val len: u32 = w[i] >> 16;
+        if (len == 0) { ret c; }
+        if ((w[i] & 0xFFFF) == spirv.OP_DECORATE && len >= 3
+            && w[i + 2] == spirv.DECOR_LINKAGE_ATTRIBUTES) { c = c + 1; }
+        i = i + len;
+    }
+    ret c;
+}
+
+# the cross-module fixture's root module: two stages reaching one helper chain
+#
+# `#[noinline]` throughout, because the subject is what the EMITTER put in the
+# module and an inliner folding the chain first would leave nothing to look at.
+#
+# Every function in the tree has a distinct arity, which is how the assertions name
+# one: 0 for the stages, 1 for the same-module helper, 2 for the sibling module's
+# reachable function, 3 for the dependency's, 4 for the dependency's own
+# dependency, and 5 and 6 for the two unreachable ones.
+fun ut_spv_root_src() str {
+    ret "use lo: spvcase.local;\nuse tn: shlib.tone;\n\n#[input(0)]  var in_x:  f32;\n#[output(0)] var out_a: f32;\n#[output(1)] var out_b: f32;\n\n#[stage(\"vertex\")]\nfun vert_main() { out_a = shared(in_x); }\n\n#[stage(\"fragment\")]\nfun frag_main() { out_b = shared(in_x); }\n\n#[noinline]\nfun shared(v: f32) f32 { ret tn.curve(lo.scale(v, 2.0), 3.0, 4.0); }\n\nfun main() i32 { ret 0; }\n";
+}
+
+# the SIBLING module: same project, found under its own `src`
+fun ut_spv_local_src() str {
+    ret "#[noinline]\npub fun scale(a: f32, b: f32) f32 { ret a * b; }\n\n#[noinline]\npub fun unused(a: f32, b: f32, c: f32, d: f32, e: f32) f32 { ret a + b + c + d + e; }\n";
+}
+
+# the DEPENDENCY's entry module, which a consumer resolves the dep through
+fun ut_spv_dep_lib_src() str {
+    ret "fwd shlib.tone;\nfwd shlib.base;\n";
+}
+
+# the DEPENDENCY module the shader calls, which itself calls one module further out
+fun ut_spv_dep_tone_src() str {
+    ret "use b: shlib.base;\n\n#[noinline]\npub fun curve(a: f32, c: f32, d: f32) f32 { ret b.gain(a, c, d, 2.0); }\n\n#[noinline]\npub fun never_used(a: f32, b_: f32, c: f32, d: f32, e: f32, f: f32) f32 { ret a + b_ + c + d + e + f; }\n";
+}
+
+# one boundary further out again: nothing in the shader names this module
+fun ut_spv_dep_base_src() str {
+    ret "#[noinline]\npub fun gain(a: f32, b: f32, c: f32, d: f32) f32 { ret a * b + c * d; }\n";
+}
+
+# load and lower the four-module cross-module fixture
+fun ut_spv_fixture(s: *session.Session, alloc: *A.Allocator) R.Result[project.Project, outcome.Fail] {
+    var names: [2]str;
+    var texts: [2]str;
+    names[0] = "main.mach";  texts[0] = ut_spv_root_src();
+    names[1] = "local.mach"; texts[1] = ut_spv_local_src();
+    var dnames: [3]str;
+    var dtexts: [3]str;
+    dnames[0] = "lib.mach";  dtexts[0] = ut_spv_dep_lib_src();
+    dnames[1] = "tone.mach"; dtexts[1] = ut_spv_dep_tone_src();
+    dnames[2] = "base.mach"; dtexts[2] = ut_spv_dep_base_src();
+    ret ut_spv_lower(s, alloc, ?names[0], ?texts[0], 2, "shlib", ?dnames[0], ?dtexts[0], 3);
+}
+
+# a shader emits the bodies it calls across a module boundary, from a sibling module
+# and from a dependency alike (#2823)
+#
+# Before this, the emitter was handed one `ir.Module` and refused any call whose
+# callee was not in it, so a shader project could factor nothing with a body into a
+# shared module: `a call to a function defined outside the module is not yet
+# supported by the SPIR-V target`.
+#
+# The arities carry the assertion. 2 is the sibling module's `scale` and 3 the
+# dependency's `curve`, so their presence is the two boundaries crossed; 4 is
+# `shlib.base.gain`, which THE SHADER NEVER NAMES - it arrives only because the
+# closure the driver walks is a fixpoint, and a one-hop closure would leave `curve`
+# calling a body this module does not define. That last failure mode is caught
+# independently by the resolve check, which is the property `spirv-val` would also
+# have caught and the only one it would.
+test "mach.lang.driver:spirv_emits_a_callee_from_another_module" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val pr: R.Result[project.Project, outcome.Fail] = ut_spv_fixture(?s, ?alloc);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    var bad: i32 = 0;
+    var img: of.ObjectImage;
+    var err: str = nil;
+    if (!ut_spv_codegen(?p, ?s, "spvcase.main", ?img, ?err)) {
+        project.dnit_project(?p); session.dnit(?s); ret 1;
+    }
+    var n: u32 = 0;
+    val w: *u32 = ut_spv_words(?img, ?n);
+    if (w == nil) { obj.dnit(?img); project.dnit_project(?p); session.dnit(?s); ret 1; }
+
+    # the sibling module's `scale`, emitted here as an ordinary OpFunction.
+    if (ut_spv_arity_count(w, n, 2) != 1) { bad = 1; }
+    # the dependency's `curve`, across a `[dep.*]` boundary rather than a file one.
+    if (ut_spv_arity_count(w, n, 3) != 1) { bad = 1; }
+    # `shlib.base.gain`, which this module never names: the closure is transitive.
+    if (ut_spv_arity_count(w, n, 4) != 1) { bad = 1; }
+    # every call names a body this module defines - no call left dangling.
+    if (!ut_spv_calls_all_resolve(w, n))  { bad = 1; }
+    # a shader module declares no linkage, so nothing here is exported.
+    if (ut_spv_export_count(w, n) != 0)   { bad = 1; }
+
+    obj.dnit(?img);
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# only what the entry points reach is emitted, so importing a shared module costs
+# the helpers actually called and nothing else (#2823)
+#
+# The two `pub fun`s nothing reaches - `spvcase.local.unused` at arity 5 and
+# `shlib.tone.never_used` at arity 6 - must be absent from the shader while their
+# own modules still publish them. A shader that dragged its imports' unreachable
+# halves along would validate perfectly and grow without bound.
+#
+# `main` is the same rule applied to the module's OWN functions: it is unreachable
+# from any stage, so the shader carries six functions and not seven.
+test "mach.lang.driver:spirv_omits_what_no_entry_point_reaches" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val pr: R.Result[project.Project, outcome.Fail] = ut_spv_fixture(?s, ?alloc);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    var bad: i32 = 0;
+    var img: of.ObjectImage;
+    var err: str = nil;
+    if (!ut_spv_codegen(?p, ?s, "spvcase.main", ?img, ?err)) {
+        project.dnit_project(?p); session.dnit(?s); ret 1;
+    }
+    var n: u32 = 0;
+    val w: *u32 = ut_spv_words(?img, ?n);
+    if (w == nil) { obj.dnit(?img); project.dnit_project(?p); session.dnit(?s); ret 1; }
+
+    # the sibling module's unreachable `pub fun`.
+    if (ut_spv_arity_count(w, n, 5) != 0) { bad = 1; }
+    # the dependency's unreachable `pub fun`.
+    if (ut_spv_arity_count(w, n, 6) != 0) { bad = 1; }
+    # two stages, one same-module helper, three drawn in: six, with `main` dropped.
+    if (ut_spv_count(w, n, spirv.OP_FUNCTION) != 6) { bad = 1; }
+
+    # and the two are still published by the modules that own them, so this is a
+    # statement about what the SHADER carries, not about the functions vanishing.
+    var lib: of.ObjectImage;
+    if (!ut_spv_codegen(?p, ?s, "spvcase.local", ?lib, ?err)) { bad = 1; }
+    or {
+        var ln: u32 = 0;
+        val lw: *u32 = ut_spv_words(?lib, ?ln);
+        if (lw == nil) { bad = 1; }
+        or {
+            if (ut_spv_count(lw, ln, spirv.OP_FUNCTION) != 2) { bad = 1; }
+            if (ut_spv_arity_count(lw, ln, 5) != 1)           { bad = 1; }
+            if (ut_spv_export_count(lw, ln) != 2)             { bad = 1; }
+        }
+        obj.dnit(?lib);
+    }
+
+    obj.dnit(?img);
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# two entry points reaching one helper emit it ONCE (#2823)
+#
+# A closure walked per entry point rather than once over the emitted set would emit
+# `shared`, `scale`, `curve` and `gain` twice over, and the result would validate -
+# so the count is the assertion, not the presence, and the two entry points are
+# checked to reach the same id rather than merely to reach something.
+test "mach.lang.driver:spirv_shares_one_helper_between_two_entry_points" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val pr: R.Result[project.Project, outcome.Fail] = ut_spv_fixture(?s, ?alloc);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    var bad: i32 = 0;
+    var img: of.ObjectImage;
+    var err: str = nil;
+    if (!ut_spv_codegen(?p, ?s, "spvcase.main", ?img, ?err)) {
+        project.dnit_project(?p); session.dnit(?s); ret 1;
+    }
+    var n: u32 = 0;
+    val w: *u32 = ut_spv_words(?img, ?n);
+    if (w == nil) { obj.dnit(?img); project.dnit_project(?p); session.dnit(?s); ret 1; }
+
+    if (ut_spv_count(w, n, spirv.OP_ENTRY_POINT) != 2) { bad = 1; }
+    # one of each, however many stages reach them.
+    if (ut_spv_arity_count(w, n, 1) != 1) { bad = 1; }
+    if (ut_spv_arity_count(w, n, 2) != 1) { bad = 1; }
+    if (ut_spv_arity_count(w, n, 3) != 1) { bad = 1; }
+    if (ut_spv_arity_count(w, n, 4) != 1) { bad = 1; }
+
+    # and both stages call the SAME id, which is what "shared" means here. Comparing
+    # the ids rather than the counts alone rules out two stages that each got their
+    # own copy of a helper the count then reported once by luck of the fixture.
+    val e0: u32 = ut_spv_entry_fn(w, n, 0);
+    val e1: u32 = ut_spv_entry_fn(w, n, 1);
+    val i0: u32 = ut_spv_fn_index_of(w, n, e0);
+    val i1: u32 = ut_spv_fn_index_of(w, n, e1);
+    if (e0 == 0 || e1 == 0 || e0 == e1)               { bad = 1; }
+    if (i0 == UT_SPV_NO_FN || i1 == UT_SPV_NO_FN)     { bad = 1; }
+    or {
+        val c0: u32 = ut_spv_first_callee_in(w, n, i0);
+        val c1: u32 = ut_spv_first_callee_in(w, n, i1);
+        if (c0 == 0 || c0 != c1) { bad = 1; }
+    }
+
+    obj.dnit(?img);
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# a library module that draws a body in carries it as an INTERNAL function, never as
+# a second export of a symbol its owner already publishes (#2823)
+#
+# `shlib.tone` has no entry point, so it is a library module and publishes its own
+# functions under LinkageAttributes. It also calls `shlib.base.gain`, which it must
+# now emit - there is no SPIR-V import to bind instead. Exporting that copy would
+# put two definitions of one name in front of a consumer linking the pair, a
+# collision this module invented over a function it does not own.
+#
+# So: three functions, two exports. The count is the whole assertion, and it is one
+# `spirv-val` has nothing to say about - a module with a duplicate export is valid
+# on its own and fails only at whatever links it.
+test "mach.lang.driver:spirv_does_not_export_a_drawn_in_body" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val pr: R.Result[project.Project, outcome.Fail] = ut_spv_fixture(?s, ?alloc);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    var bad: i32 = 0;
+    var img: of.ObjectImage;
+    var err: str = nil;
+    if (!ut_spv_codegen(?p, ?s, "shlib.tone", ?img, ?err)) {
+        project.dnit_project(?p); session.dnit(?s); ret 1;
+    }
+    var n: u32 = 0;
+    val w: *u32 = ut_spv_words(?img, ?n);
+    if (w == nil) { obj.dnit(?img); project.dnit_project(?p); session.dnit(?s); ret 1; }
+
+    # a library module: no entry points, and its own two functions published.
+    if (ut_spv_count(w, n, spirv.OP_ENTRY_POINT) != 0) { bad = 1; }
+    # `curve` (3), `never_used` (6), and the drawn-in `gain` (4).
+    if (ut_spv_count(w, n, spirv.OP_FUNCTION) != 3)    { bad = 1; }
+    if (ut_spv_arity_count(w, n, 4) != 1)              { bad = 1; }
+    # two exports, not three: the drawn-in body is not one of them.
+    if (ut_spv_export_count(w, n) != 2)                { bad = 1; }
+    if (!ut_spv_calls_all_resolve(w, n))               { bad = 1; }
+
+    obj.dnit(?img);
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# recursion drawn in across a module boundary is refused BY THE MODULE THAT DRAWS IT
+# IN, naming the cycle and qualifying it with the module it came from (#2823, #2748)
+#
+# The fixture is arranged so the importing shader is the only thing that can catch
+# it. `spvcase.helper` has an entry point of its own, so it is a shader module and
+# emits the closure of its entry points; `step` is outside that closure, so its own
+# module builds CLEAN. Only the module that actually emits `step` sees the cycle -
+# which is the #2748 check having widened along with the emitter, and the arrangement
+# that fails against an emitter which never looked across the boundary.
+#
+# `spirv-val` cannot be the observable: its cycle rule is scoped to entry points, so
+# a module carrying an unreached cycle validates clean, which is how #2748's defect
+# survived eleven releases.
+#
+# The qualification is asserted, not just the refusal: two modules may spell a helper
+# the same way, and a message naming a bare `step` sends the reader to the wrong file.
+test "mach.lang.driver:spirv_refuses_recursion_drawn_in_from_another_module" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [2]str;
+    var texts: [2]str;
+    names[0] = "main.mach";
+    texts[0] = "use h: spvcase.helper;\n\n#[input(0)]  var in_n:  i32;\n#[output(0)] var out_n: i32;\n\n#[stage(\"vertex\")]\nfun vert_main() { out_n = h.step(in_n); }\n\nfun main() i32 { ret 0; }\n";
+    names[1] = "helper.mach";
+    texts[1] = "#[builtin(\"position\")] var position: f32x4;\n\n#[stage(\"vertex\")]\nfun pass() { position = f32x4{0.0, 0.0, 0.0, 1.0}; }\n\n#[noinline]\npub fun step(n: i32) i32 {\n    if (n <= 1) { ret 1; }\n    ret n * step(n - 1);\n}\n";
+    var dn: [1]str;
+    var dt: [1]str;
+    val pr: R.Result[project.Project, outcome.Fail] =
+        ut_spv_lower(?s, ?alloc, ?names[0], ?texts[0], 2, "", ?dn[0], ?dt[0], 0);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    var bad: i32 = 0;
+    var img: of.ObjectImage;
+    var err: str = nil;
+
+    # the DEFINING module is clean: `step` is outside its entry point's closure, so
+    # it never emits it and has no cycle to refuse. Without this the test would pass
+    # against a compiler that simply refused everything.
+    if (!ut_spv_codegen(?p, ?s, "spvcase.helper", ?img, ?err)) { bad = 1; }
+    or { obj.dnit(?img); }
+
+    # the IMPORTING module refuses, because it is the one that emits `step`.
+    var img2: of.ObjectImage;
+    var err2: str = nil;
+    if (ut_spv_codegen(?p, ?s, "spvcase.main", ?img2, ?err2)) {
+        bad = 1;
+        obj.dnit(?img2);
+    }
+    or {
+        if (err2 == nil)                                             { bad = 1; }
+        or {
+            # names recursion rather than falling back to a generic message.
+            if (!ut_str_contains(err2, "cycle"))                     { bad = 1; }
+            if (!ut_str_contains(err2, "has no call stack"))         { bad = 1; }
+            # and qualifies the chain with the module the body came from.
+            if (!ut_str_contains(err2, "spvcase.helper.step -> spvcase.helper.step")) { bad = 1; }
+        }
+    }
+
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# a call to a foreign `ext` import is refused as FOREIGN, not as cross-module (#2823)
+#
+# The other direction. Before this change one message covered every callee with no
+# body in reach, and it said "defined outside the module" - which is now the normal,
+# working case. What is left has to be told apart: a mach function in another module
+# is drawn in, and a foreign symbol never can be, because no mach module defines it
+# and a self-contained module has nothing to bind at load time. The two have
+# different fixes, so asserting the refusal alone would not be enough - the test
+# pins which one it is, and that the superseded wording is gone.
+#
+# `ext fun` parses and resolves cleanly, so this reaches the emitter: a refusal here
+# cannot be a front-end rejection wearing a back-end test's name.
+test "mach.lang.driver:spirv_refuses_a_foreign_ext_call_by_name" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    var texts: [1]str;
+    names[0] = "main.mach";
+    texts[0] = "ext fun host_sqrtf(v: f32) f32;\n\n#[input(0)]  var in_x:  f32;\n#[output(0)] var out_x: f32;\n\n#[stage(\"vertex\")]\nfun vert_main() { out_x = host_sqrtf(in_x); }\n\nfun main() i32 { ret 0; }\n";
+    var dn: [1]str;
+    var dt: [1]str;
+    val pr: R.Result[project.Project, outcome.Fail] =
+        ut_spv_lower(?s, ?alloc, ?names[0], ?texts[0], 1, "", ?dn[0], ?dt[0], 0);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    var bad: i32 = 0;
+    var img: of.ObjectImage;
+    var err: str = nil;
+    if (ut_spv_codegen(?p, ?s, "spvcase.main", ?img, ?err)) {
+        bad = 1;
+        obj.dnit(?img);
+    }
+    or {
+        if (err == nil) { bad = 1; }
+        or {
+            if (!ut_str_contains(err, "host_sqrtf"))          { bad = 1; }
+            if (!ut_str_contains(err, "declared `ext`"))      { bad = 1; }
+            if (!ut_str_contains(err, "self-contained"))      { bad = 1; }
+            # the message this one replaced, which must not come back for a case it
+            # never described correctly.
+            if (ut_str_contains(err, "defined outside the module")) { bad = 1; }
+        }
+    }
 
     project.dnit_project(?p);
     session.dnit(?s);
