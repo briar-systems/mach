@@ -79,6 +79,12 @@
 # answers the question while the log exists, and "what did the run that cut this tag
 # build against" is asked afterwards. CI uploads the file.
 #
+# NOT SAFE TO RUN CONCURRENTLY. two invocations against one checkout - even for
+# different --target values - race on the same per-case out/ directories and can
+# produce a wrong result, including a spurious PASS. no guard here (this suite is
+# being rebuilt; run isolation belongs in that design, not patched into this
+# one) - run a second target from a second checkout instead.
+#
 # `--runmode qemu` only reaches a leg qemu-user can actually load: qemu_bin() in
 # lib/produce.sh names the ELF-only rule and the three targets that can never
 # work under it (#2453) - passing `qemu` for one of those fails loudly with that
