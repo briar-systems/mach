@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+#### A SPIR-V function body truncated its parameters instead of refusing (#2923)
+
+Emitting a function body filled the per-block register file with `for (i < param_count && i < 16)`, so a function reaching that point with more than sixteen parameters had every parameter past the sixteenth silently dropped and read an empty register slot instead. It was unreachable only because `emit_function` refuses first, which made a load-bearing correctness guard look like defensive clamping: any change to that refusal turned it into wrong code with no diagnostic. It now refuses on its own terms.
+
+The bound was also stated in four places rather than one, which is the defect #2748 closed reappearing at the site that fix did not reach. The cross-module call path carried a bare `> 16` rather than the named constant, so the two agreed by construction rather than by checking.
+
+**The constant's own documentation was wrong, and that is what sent the issue at the wrong layer.** It said sixteen came from the emitter assembling signature operands into fixed arrays, so removing the bound read as a buffer resize. The real reason is the argument register bank. `abi/spirv.mach` is an identity convention where the argument at position `i` is classified into register `i`, since SPIR-V passes composites natively and has no frame to spill into, so a parameter position is a physical register id on this target. The shared MIR lowering caps those at `MAX_GP_ARG_REGS`, also sixteen. SPIR-V's own universal limit is 255, and reaching it means decoupling a parameter from the register model rather than widening a buffer.
+
+That shared cap turned out to be unguarded in a way no target owner would expect. `abi_gp_arg_reg` reads a convention's bank into a fixed `[16]isa.Register` and range-checks the index **after** the fill, so a convention publishing a wider bank overruns that array before anything rejects it, from a one-line edit in a target's own file. A test now walks every registered convention against a deliberately oversized scratch and fails if any publishes a wider bank, and it refuses to pass if it checked nothing.
+
 ### Changed
 
 #### The integration suite is retired, and a linking suite replaces the part the codegen corpus cannot reach (#2903)
