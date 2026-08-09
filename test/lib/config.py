@@ -122,11 +122,13 @@ class Source(object):
 
 
 class Tools(object):
-    def __init__(self, tools, flags, cflags, sources):
+    def __init__(self, tools, flags, cflags, sources, undeliverable):
         self.tools = tools
         self.flags = flags
         self.cflags = cflags
         self.sources = sources
+        # {mode: reason} for the reference build modes THIS host cannot run
+        self.undeliverable = undeliverable
         self._checked = {}
 
     def source(self, name):
@@ -183,10 +185,16 @@ def _probe(tool):
 
 
 def load_tools(path):
-    tools, flags, cflags, sources, aliases = {}, {}, {}, {}, []
+    tools, flags, cflags, sources, aliases, nocflags = {}, {}, {}, {}, [], {}
     for lineno, line in _rows(path):
         kind, rest = (line.split(None, 1) + [""])[:2]
-        if kind == "alias":
+        if kind == "no-cflags":
+            f = rest.split(None, 2)
+            if len(f) != 3:
+                raise ConfigError("%s:%d: no-cflags <mode> <host-os> <reason>" % (path, lineno))
+            if f[1] == host_os():
+                nocflags[f[0]] = f[2]
+        elif kind == "alias":
             f = rest.split()
             if len(f) != 3:
                 raise ConfigError("%s:%d: alias <tool> <host-os> <executable>" % (path, lineno))
@@ -220,7 +228,10 @@ def load_tools(path):
         if name not in tools:
             raise ConfigError("%s:%d: alias names '%s', which has no tool row" % (path, lineno, name))
         tools[name].aliases[host] = exe
-    return Tools(tools, flags, cflags, sources)
+    for mode in nocflags:
+        if mode not in cflags:
+            raise ConfigError("%s: no-cflags names mode '%s', which has no cflags row" % (path, mode))
+    return Tools(tools, flags, cflags, sources, nocflags)
 
 
 class Skip(object):

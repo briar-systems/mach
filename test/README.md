@@ -174,6 +174,12 @@ decoder has no build for those hosts at all (#2948).
 Every oracle is pinned, and a pin nothing can install is a wish. Each `tool` row says
 what a version must be, a `source` row says where that version is obtained, and an
 `alias` row says how a host spells the executable when it is not the POSIX name.
+A `no-cflags` row names a reference build mode a host's C toolchain cannot run, with
+a reason, and the driver prints it at startup rather than dropping it in silence. The
+one that exists is `ubsan` on windows, since mingw ships no UBSan runtime: that build
+is a harness self-check over the reference **sources**, which are identical on every
+host, so a toolchain that can run it settles it for every leg.
+
 `run.sh --tools` prints the rows a given selection depends on, which is what
 `ci-tools.sh` installs from, so a workflow never carries a second copy of a version
 and cannot install one thing while the driver demands another.

@@ -304,6 +304,11 @@ def run(out_root, matrix_path, only_targets, only_cases, only_layers, bless):
         sys.stdout.write("tool:     %-16s %s\n" % ("ok" if ok else "MISMATCH", detail))
         if not ok:
             failed_pins.append(detail)
+    # a reference build mode this host's toolchain cannot run is named here rather than
+    # dropped in silence, the same way a SKIPS entry is.
+    for mode, reason in sorted(tools.undeliverable.items()):
+        sys.stdout.write("check:    %-16s not run on this host: %s\n" % (mode, reason))
+
     if failed_pins:
         sys.stderr.write("corpus: refusing to run; tools.lock is not satisfied on this host:\n")
         for d in failed_pins:

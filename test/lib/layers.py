@@ -180,6 +180,8 @@ class Reference(object):
         base = os.path.join(self.dir, case)
         results = {}
         for mode in ("O0", "O2", "ubsan"):
+            if mode in self.tools.undeliverable:
+                continue
             flags = self.tools.cflags.get(mode)
             if flags is None:
                 return None, "tools.lock declares no cflags row for " + mode
@@ -197,7 +199,7 @@ class Reference(object):
         if results["O0"] != results["O2"]:
             return None, "harness defect: reference -O0 says %s and -O2 says %s" % (
                 results["O0"], results["O2"])
-        if results["ubsan"] != results["O0"]:
+        if "ubsan" in results and results["ubsan"] != results["O0"]:
             return None, "harness defect: ubsan reference says %s, plain -O0 says %s" % (
                 results["ubsan"], results["O0"])
         return results, ""
