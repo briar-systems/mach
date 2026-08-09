@@ -251,6 +251,14 @@ pub def IdentBindingFn: fun(ptr, id.ExprId) bool;
 pub val COMPTIME_IDENT_RUNTIME_MSG: str =
     "identifier names a runtime binding, so it has no comptime value";
 
+# surfaced when an identifier names a float constant whose declared width arrives
+# through a type alias. distinct from the not-in-scope message, which said the
+# opposite of the truth twice over: the name IS a comptime constant and it IS in
+# scope, and only its WIDTH is unreadable this early, since no type exists yet to
+# read the alias through. it folds normally anywhere types are known (#2937)
+pub val COMPTIME_ALIAS_FLOAT_MSG: str =
+    "the width of a float constant whose type comes through an alias is not readable before type checking, so it has no comptime value here. spell the type as `f32` or `f64` on the declaration to fold it at this position";
+
 # surfaced when the two operands of a float operation carry different declared
 # widths. mach has no implicit widening, so this is a type error the typed
 # passes report against the source; the evaluator refuses rather than picking a
@@ -402,6 +410,9 @@ pub rec ComptimeCtx {
     defines:        *NamedConst;
     define_len:     u32;
     define_cap:     u32;
+    deferred:       *intern.StrId;
+    deferred_len:   u32;
+    deferred_cap:   u32;
     project_id:     intern.StrId;
     project_ver:    intern.StrId;
     project_name:   intern.StrId;
@@ -481,6 +492,9 @@ pub fun init(
     c.defines        = nil;
     c.define_len     = 0;
     c.define_cap     = 0;
+    c.deferred       = nil;
+    c.deferred_len   = 0;
+    c.deferred_cap   = 0;
     c.project_id     = intern.STR_NIL;
     c.project_ver    = intern.STR_NIL;
     c.project_name   = intern.STR_NIL;
@@ -653,9 +667,62 @@ pub fun dnit(c: *ComptimeCtx) {
     c.entries     = nil;
     c.entries_len = 0;
     c.entries_cap = 0;
+    if (c.deferred != nil && c.deferred_cap > 0) {
+        A.deallocate[intern.StrId](c.alloc, c.deferred, c.deferred_cap::usize);
+    }
     c.defines     = nil;
     c.define_len  = 0;
     c.define_cap  = 0;
+    c.deferred    = nil;
+    c.deferred_len = 0;
+    c.deferred_cap = 0;
+}
+
+# records that `name` IS a comptime constant but could not be folded by a
+# pre-type pass, because its declared float width arrives through a type alias
+#
+# The skip itself is correct: binding the value at f64 would export a constant
+# that disagrees with the one the program computes (#2918). What was wrong is
+# that the skip left no trace, so the use site could only say the name was not a
+# comptime constant in scope - which is false in both halves, and sends the
+# reader looking for a declaration that is right there (#2937).
+# ---
+# c:    the context
+# name: interned identifier of the deferred constant
+# ret:  true on success, or an allocation error
+pub fun defer_float_width(c: *ComptimeCtx, name: intern.StrId) R.Result[bool, str] {
+    if (c.deferred_len == c.deferred_cap) {
+        var new_cap: u32 = c.deferred_cap * 2;
+        if (new_cap == 0) { new_cap = INITIAL_CONST_CAP; }
+        val g: R.Result[*intern.StrId, str] =
+            A.reallocate[intern.StrId](c.alloc, c.deferred, c.deferred_cap::usize, new_cap::usize);
+        if (R.is_err[*intern.StrId, str](g)) {
+            ret R.err[bool, str](R.unwrap_err[*intern.StrId, str](g));
+        }
+        c.deferred     = R.unwrap_ok[*intern.StrId, str](g);
+        c.deferred_cap = new_cap;
+    }
+    c.deferred[c.deferred_len] = name;
+    c.deferred_len = c.deferred_len + 1;
+    ret R.ok[bool, str](true);
+}
+
+# whether `name` was deferred by `defer_float_width` rather than never seen
+#
+# The two are different answers and the caller reports them differently: a
+# deferred name IS a comptime constant, so telling the reader it is not one sends
+# them looking for a declaration that is already there.
+# ---
+# c:    the context
+# name: interned identifier
+# ret:  true when the name was deferred
+pub fun float_width_deferred(c: *ComptimeCtx, name: intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < c.deferred_len) {
+        if (c.deferred[i] == name) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # appends a comptime constant under `name` to the current (innermost)
@@ -2439,6 +2506,9 @@ fun eval_ident(
     val name: intern.StrId = R.unwrap_ok[intern.StrId, str](id_r);
     val nc_opt: O.Option[*NamedConst] = lookup(c, name);
     if (O.is_none[*NamedConst](nc_opt)) {
+        if (float_width_deferred(c, name)) {
+            ret R.err[CTValue, str](COMPTIME_ALIAS_FLOAT_MSG);
+        }
         ret R.err[CTValue, str]("identifier is not a comptime constant in scope");
     }
     ret R.ok[CTValue, str](O.unwrap[*NamedConst](nc_opt).value);
@@ -3739,6 +3809,64 @@ test "mach.lang.fe.comptime.bind:frame_scoping" {
     val fc2: R.Result[bool, str] = frame_close(?c, m2);
     if (R.is_err[bool, str](fc2))      { dnit(?c); ret 1; }
     if (c.entries_len != depth_before) { dnit(?c); ret 1; }
+
+    dnit(?c);
+    ret 0;
+}
+
+# a deferred float constant is reported as deferred, not as absent (#2937)
+#
+# The two messages answer different questions and the reader acts on them
+# differently: "not a comptime constant in scope" sends them to look for a
+# declaration, and for a name deferred here the declaration is already there and
+# correct. Both directions are asserted, because a check that only proves the
+# deferred name gets the new message would also pass if every name got it.
+test "mach.lang.fe.comptime.eval_ident:deferred_float_is_not_absent" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var c: ComptimeCtx = init(?alloc, 0, 0, 0, 0, 0, 8, 128, intern.STR_NIL, intern.STR_NIL);
+    var itn: intern.Interner = intern.init(?alloc);
+
+    val source: str = "ALIASED ABSENT";
+    var s_alias: token.Span;
+    s_alias.offset = 0::usize;
+    s_alias.len    = 7::usize;
+    var s_absent: token.Span;
+    s_absent.offset = 8::usize;
+    s_absent.len    = 6::usize;
+
+    val id_r: R.Result[intern.StrId, str] = intern.intern_span(?itn, source, s_alias);
+    if (R.is_err[intern.StrId, str](id_r)) { dnit(?c); ret 1; }
+    val aliased: intern.StrId = R.unwrap_ok[intern.StrId, str](id_r);
+
+    # before the defer, the aliased name is genuinely absent and says so
+    val r0: R.Result[CTValue, str] = eval_ident(?c, source, id.EXPR_NIL, s_alias, ?itn);
+    if (!R.is_err[CTValue, str](r0))                                              { dnit(?c); ret 1; }
+    if (R.unwrap_err[CTValue, str](r0) == COMPTIME_ALIAS_FLOAT_MSG)               { dnit(?c); ret 1; }
+
+    val d: R.Result[bool, str] = defer_float_width(?c, aliased);
+    if (R.is_err[bool, str](d))            { dnit(?c); ret 1; }
+    if (!float_width_deferred(?c, aliased)) { dnit(?c); ret 1; }
+
+    # after it, the same name reports the reason rather than absence
+    val r1: R.Result[CTValue, str] = eval_ident(?c, source, id.EXPR_NIL, s_alias, ?itn);
+    if (!R.is_err[CTValue, str](r1))                                { dnit(?c); ret 1; }
+    if (R.unwrap_err[CTValue, str](r1) != COMPTIME_ALIAS_FLOAT_MSG) { dnit(?c); ret 1; }
+
+    # a name that was never deferred still reports absence, so the new branch is
+    # keyed on the deferred set rather than firing for everything
+    val r2: R.Result[CTValue, str] = eval_ident(?c, source, id.EXPR_NIL, s_absent, ?itn);
+    if (!R.is_err[CTValue, str](r2))                                { dnit(?c); ret 1; }
+    if (R.unwrap_err[CTValue, str](r2) == COMPTIME_ALIAS_FLOAT_MSG) { dnit(?c); ret 1; }
+
+    # a real binding still wins over the deferred record, since a later pass that
+    # binds the name must not keep reporting the reason it once could not
+    val bv: CTValue = R.unwrap_ok[CTValue, str](int_value(3));
+    val b: R.Result[bool, str] = bind(?c, aliased, bv);
+    if (R.is_err[bool, str](b)) { dnit(?c); ret 1; }
+    val r3: R.Result[CTValue, str] = eval_ident(?c, source, id.EXPR_NIL, s_alias, ?itn);
+    if (R.is_err[CTValue, str](r3))                            { dnit(?c); ret 1; }
+    if (R.unwrap_ok[CTValue, str](r3).data.i != 3)             { dnit(?c); ret 1; }
 
     dnit(?c);
     ret 0;

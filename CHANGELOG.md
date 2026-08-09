@@ -48,6 +48,16 @@ The PE/COFF long section-name form is a slash followed by an ASCII decimal offse
 
 It went unnoticed because nothing external had ever read a mach COFF object. The corpus's `x86_64-windows` column has no goldens on a linux developer host, which declines the target, and its CI leg had never started (#2948), so the first layer A run on that target is what refused. That is the same shape as the ELFCLASS32-on-Elf64 writer that motivated layer A: a format only its own reader had ever checked. The field is now pinned by byte in a unit test, because two readers disagreeing about padding is precisely what stayed invisible.
 
+#### A float constant typed through an alias says why it does not fold (#2937)
+
+`#2918` made a comptime float carry the IEEE width its payload is at, which means the pre-type passes have to read that width from the annotation spelling. That is exact for a literal `f32` or `f64`, because a primitive wins over scope in type position, and it is not readable when the type arrives through a `def` alias: no type exists yet to read the alias through. Such a binding is therefore skipped rather than bound at f64, which would export a constant that disagrees with the one the program computes.
+
+The skip is right. What was wrong is that it left no trace, so a use of the name at that stage reported `identifier is not a comptime constant in scope` - which is false in both halves. `X` is a comptime constant and it is in scope, and only its width is unreadable this early. A reader acting on that message goes looking for a declaration that is already there and already correct.
+
+The pass that skips is the only place that knows why, so it now records the name and the use site reports the reason. Nothing else changes: the value still folds wherever types are known, a name that was never declared still reports absence, and a later pass that does bind the name reports nothing at all.
+
+Following the alias by name in the loading pass would answer sooner and would be wrong: at that stage nothing says which declaration a spelling denotes, and reading a name-keyed table for the answer is the mistake #2764 documents.
+
 #### The compiler was silent both times a pass dropped a value and missed a use (#2930, #2931)
 `#2749` was an `i32x4` accumulator on x86-64 that came out holding the multiplier. `#2917` was a conditional float merge on riscv64 that read its register undefined. Both were silent wrong answers, both were found by running a program, and `--verify-ir` exited 0 on both reproducers. The pass mistake behind them is ordinary. Being undetectable was not.
 
