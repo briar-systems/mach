@@ -3277,15 +3277,25 @@ fun type_computed_defs(e: *Emit, mf: *mir.MirFunction, out: *VMaps, skip_copies:
     ret R.ok[bool, str](true);
 }
 
-# whether an instruction is a register-to-register copy, whose destination type is
-# the source's rather than the move's width
+# whether an instruction is a copy, whose destination type is the copied value's
+# rather than the move's width
+#
+# AN IMMEDIATE SOURCE IS ONE TOO (#2919). A move's width is a register-machine
+# MATERIALIZATION convention, never the value's type: a phi merge's constant rides
+# the machine word because a sub-word register write leaves the upper bits
+# unspecified, which is a statement about a register file SPIR-V does not have.
+# Reading a type off it allocated an `i8` loop counter as a 64-bit variable while
+# every operation on it stayed 8 bits wide, so the module compared and added across
+# widths. The destination is typed by the value copied into it on the other edge
+# instead, and only falls back to the move's width when nothing else defines it.
 # ---
 # mi:  the instruction
-# ret: true for a move or declassify from a virtual or physical register
+# ret: true for a move or declassify from a register or an immediate
 fun is_reg_copy(mi: *mir.MirInstr) bool {
     if (mi.opcode != mir.MIR_MOV && mi.opcode != mir.MIR_DECLASSIFY) { ret false; }
     if (mi.operand_count != 2) { ret false; }
-    ret mi.operands[1].kind == mir.MIR_OP_VREG || mi.operands[1].kind == mir.MIR_OP_PREG;
+    ret mi.operands[1].kind == mir.MIR_OP_VREG || mi.operands[1].kind == mir.MIR_OP_PREG
+     || mi.operands[1].kind == mir.MIR_OP_IMM;
 }
 
 # carry types across register copies to a fixed point
@@ -3833,7 +3843,10 @@ fun emit_access_chain(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *Reg
     if (dst >= vm.n) { ret emit_fail(e, "spirv.emit: access chain result vreg out of range"); }
 
     val count: u32 = mi.operand_count - 3;
-    if (count == 0 || count > 8) {
+    # a leading 0 and no member index names the object itself, so it is the flat
+    # form again with the index list spelled out rather than a chain into anything.
+    if (count == 0) { ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[1])); }
+    if (count > 8) {
         ret unsupported(e, "an access chain of more than 8 levels is not supported by the SPIR-V target");
     }
 
@@ -4607,6 +4620,41 @@ fun read_operand(e: *Emit, vm: *VMaps, preg_val: *Regs, op: *mir.MirOperand, wan
     ret 0;
 }
 
+# whether an operand is read at a type of its own, so a consumer's declared type
+# does not describe it
+#
+# A boolean vreg is NOT one: it has no numeric representation, so what it is read
+# as is whatever the consumer declares (#2749).
+# ---
+# vm:  the per-vreg value maps
+# op:  the operand
+# ret: true when the operand carries its own type
+fun operand_carries_type(vm: *VMaps, op: *mir.MirOperand) bool {
+    if (op.kind != mir.MIR_OP_VREG) { ret false; }
+    if (op.vreg >= vm.n || vm.type_id[op.vreg] == 0) { ret false; }
+    ret !vm.is_bool[op.vreg];
+}
+
+# refuse when a value operand's own type is not the one its position declares
+#
+# SPIR-V requires the operands and the result of an arithmetic, bitwise or
+# comparison instruction to share ONE type, and a vreg operand is loaded at the type
+# its variable was declared with rather than at the declared one - so the two
+# disagreeing is a module the validator rejects and this emitter would otherwise
+# write while reporting success (#2919). The check is here rather than in
+# `read_operand` because it is these positions, not every position, that SPIR-V
+# holds to one type: an access chain's index, for one, may legally be any integer
+# width.
+# ---
+# vm:   the per-vreg value maps
+# op:   the operand
+# want_ty: the type the position declares
+# ret:  true when the operand may be read at `want_ty`
+fun operand_matches_type(vm: *VMaps, op: *mir.MirOperand, want_ty: u32) bool {
+    if (!operand_carries_type(vm, op)) { ret true; }
+    ret vm.type_id[op.vreg] == want_ty;
+}
+
 # materialize a SPIR-V boolean as the 0/1 value of `want_ty`
 #
 # `OpSelect` rather than a conversion opcode: a boolean has no numeric representation
@@ -4692,6 +4740,10 @@ fun emit_binary(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr, op_cod
     val dst: u32 = mi.operands[0].vreg;
     if (dst >= vm.n) { ret emit_fail(e, "spirv.emit: binary result vreg out of range"); }
     val ty: u32 = vm.type_id[dst];
+    if (!operand_matches_type(vm, ?mi.operands[1], ty)
+     || !operand_matches_type(vm, ?mi.operands[2], ty)) {
+        ret emit_fail(e, "spirv.emit: binary instruction mixes operand types");
+    }
     val a: u32 = read_operand(e, vm, preg_val, ?mi.operands[1], ty);
     val b: u32 = read_operand(e, vm, preg_val, ?mi.operands[2], ty);
     if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable operand in binary instruction"); }
@@ -4742,7 +4794,11 @@ fun emit_compare(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr, op_co
     }
     var cbits: u32 = mi.width::u32 * 8;
     if (cbits == 0) { cbits = e.tgt.model.gpr_width * 8; }
-    ret emit_compare_typed(e, vm, preg_val, mi, op_code, types.type_int(e.tt, cbits));
+    val cmp_ty: u32 = types.type_int(e.tt, cbits);
+    if (cmp_ty == 0) {
+        ret unsupported(e, "unsupported comparison width in the SPIR-V target");
+    }
+    ret emit_compare_typed(e, vm, preg_val, mi, op_code, cmp_ty);
 }
 
 # emit a lane-wise vector comparison as mach's unsigned MASK vector
@@ -5013,6 +5069,10 @@ fun emit_compare_typed(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr,
     }
     val dst: u32 = mi.operands[0].vreg;
     if (dst >= vm.n) { ret emit_fail(e, "spirv.emit: comparison result vreg out of range"); }
+    if (!operand_matches_type(vm, ?mi.operands[1], operand_ty)
+     || !operand_matches_type(vm, ?mi.operands[2], operand_ty)) {
+        ret emit_fail(e, "spirv.emit: comparison mixes operand types");
+    }
     val a: u32 = read_operand(e, vm, preg_val, ?mi.operands[1], operand_ty);
     val b: u32 = read_operand(e, vm, preg_val, ?mi.operands[2], operand_ty);
     if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable operand in comparison"); }
@@ -5031,6 +5091,13 @@ fun emit_compare_typed(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr,
 # fixes the class. That only matters for a source that carries no type of its own -
 # an immediate or a nominal register - since a vreg source is loaded at its own
 # declared type.
+#
+# SO IT IS RECONSTRUCTED ONLY WHEN IT IS NEEDED (#2920). Interning a type DECLARES
+# it, so reconstructing one the source never reads still put it in the module: a
+# `:~` between two 16-byte vectors has a 16-byte source width, and reading that as
+# a scalar integer declared an `OpTypeInt 128` beside an otherwise correct
+# `OpBitcast`. SPIR-V has no 128-bit integer, so the module was invalid on a type
+# nothing referenced.
 # ---
 # e:      the emission state
 # vm:     the per-vreg value maps
@@ -5046,14 +5113,15 @@ fun emit_convert(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr,
     }
     val dst: u32 = mi.operands[0].vreg;
     if (dst >= vm.n) { ret emit_fail(e, "spirv.emit: conversion result vreg out of range"); }
-    var sbits: u32 = mi.src_width::u32 * 8;
-    if (sbits == 0) { sbits = e.tgt.model.gpr_width * 8; }
-    var src_ty: u32 = types.type_int(e.tt, sbits);
-    if (src_is_float) {
-        if (sbits != 32 && sbits != 64) {
-            ret unsupported(e, "unsupported float conversion width in the SPIR-V target");
+    var src_ty: u32 = 0;
+    if (!operand_carries_type(vm, ?mi.operands[1])) {
+        var sbits: u32 = mi.src_width::u32 * 8;
+        if (sbits == 0) { sbits = e.tgt.model.gpr_width * 8; }
+        if (src_is_float) { src_ty = types.type_float(e.tt, sbits); }
+        or { src_ty = types.type_int(e.tt, sbits); }
+        if (src_ty == 0) {
+            ret unsupported(e, "unsupported conversion source width in the SPIR-V target");
         }
-        src_ty = types.type_float(e.tt, sbits);
     }
     val a: u32 = read_operand(e, vm, preg_val, ?mi.operands[1], src_ty);
     if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable operand in conversion"); }
