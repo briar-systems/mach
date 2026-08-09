@@ -26,6 +26,7 @@ test/
 
 ```
 run.sh                          # every case, every target this host serves, every layer
+run.sh --runner <label>         # the targets engines.conf assigns to that CI runner
 run.sh --target <t>             # one target (repeatable)
 run.sh --case <group>/<name>    # one case (repeatable), still all layers
 run.sh --layer a|b|c            # one layer (repeatable)
@@ -162,16 +163,27 @@ from those columns. `engine = none` is a public label, not a default, and a targ
 carrying it has no layer C column at all.
 
 Two different questions get asked of this file and it is worth keeping them apart.
-**Can this machine serve a target** is what `run.sh` with no `--target` answers, and
-it is the right question on a developer's machine: run everything the host can do.
 **Which leg carries a target** is what the `runner` column answers, and it is the
-only question CI asks. They are not the same, because a target with `engine none`
-needs no execution host and so passes the first question everywhere. CI therefore
-hands the driver the registry's answer (`ci-legs.sh` reads the column, the workflow
-passes `--target` per leg) rather than letting the driver re-derive a different one.
-Before that, the `spirv` column was recomputed on the windows and arm runners as
-well, which is coverage nobody scheduled and, for spirv, coverage whose pinned
-decoder has no build for those hosts at all (#2948).
+only question CI asks. **Can this machine serve a target** is a different one, and
+on a developer's machine it is the right selector: `run.sh` with no assignment runs
+everything the host can do.
+
+In CI the runner column is the **assignment** and host capability is only a
+**check**. `run.sh --runner <label>` covers exactly the rows the registry gives that
+label, and a row this host cannot serve is a refusal that names the row and the
+reason, never a quiet substitution of some other set. A row the runner does not own
+is named in the run header as `not assigned`, so a leg a run was never applicable to
+and a leg it was dropped from do not look alike.
+
+Capability is checked against layer C only, because that is the layer needing an
+engine: one host decodes and validates every column, which is how a target with no
+runner of its own still gets goldens.
+
+Before this, the driver selected by capability everywhere, and a target with
+`engine none` needs no execution host, so `spirv`, `riscv32` and `mos6502` were
+recomputed on the windows and arm runners as well. That is coverage nobody scheduled
+and, for spirv, coverage whose pinned decoder has no build for those hosts at all
+(#2948). Windows accordingly needs no spirv-tools.
 
 ## tools.lock
 

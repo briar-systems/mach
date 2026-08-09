@@ -3,10 +3,13 @@
 #
 # usage: ci-legs.sh <pr|main>
 #
-# a CI leg is a RUNNER, not a target row. the corpus driver already selects every
-# target a host can serve, so the five ubuntu-latest rows (x86_64-linux,
-# riscv64-linux, riscv32, spirv, mos6502) are one job that covers all five, and a
-# job per row would build the same artifacts five times over.
+# a CI leg is a RUNNER, not a target row, and the runner column is what assigns rows
+# to it: the five ubuntu-latest rows (x86_64-linux, riscv64-linux, riscv32, spirv,
+# mos6502) are one job that covers all five, and a job per row would build the same
+# artifacts five times over.
+#
+# the workflow hands each job its runner LABEL and the driver reads this file itself
+# (`run.sh --runner`), so no step names a target list it could get wrong.
 #
 # prints a compact JSON array the workflow feeds straight to `strategy.matrix.include`:
 #
