@@ -248,6 +248,15 @@ def list_tools(only_targets, only_layers):
     driver then demands cannot drift: a leg that installs from this list and still
     refuses to start is reporting a gap in tools.lock, not a gap between two lists.
     """
+    # `--tools` is a machine interface, so it emits LF and not whatever the host
+    # translates a newline into. python opens stdout in text mode, which on windows
+    # writes CRLF, and the CR rode into the last field of every row: `read` handed
+    # ci-tools.sh a version of "22.1.8\r" and curl answered "URL rejected: Malformed
+    # input to a URL function". stripping it in the reader would be repairing this
+    # here instead.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(newline="\n")
+
     tools = config.load_tools(os.path.join(CORPUS, "tools.lock"))
     all_targets = config.load_engines(os.path.join(CORPUS, "engines.conf"))
     targets, _ = select_targets(all_targets, only_targets)
