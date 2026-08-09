@@ -110,7 +110,11 @@ the reference file holds the translation and nothing else.
 - **No operation in any reference file may be UB in C.** A disagreement must always
   indict mach, never the reference. This is enforced, not asked for: every reference
   is also built with `-fsanitize=undefined -fno-sanitize-recover=all` and run, and
-  any UB aborts the run as a harness defect.
+  any UB aborts the run as a harness defect. That build is a check on the reference
+  **sources**, which are one set of files, so a host whose toolchain can run it
+  settles it for every leg. A host whose cannot says so in a `no-cflags` row and the
+  driver names it at startup: today that is windows, where mingw ships no UBSan
+  runtime.
 - The reference is compiled at both `-O0` and `-O2` and the two must agree with each
   other before either is compared against mach. Disagreement between them fails the
   run as a harness defect, not a mach defect.
