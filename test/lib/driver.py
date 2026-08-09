@@ -33,6 +33,8 @@ USAGE = """usage: run.sh [options]
   --layer a|b|c                restrict to one layer (repeatable)
   --bless [--target <t>]       regenerate layer B goldens, print the diff, never in CI
   --matrix                     print the coverage matrix from the last run
+  --tools                      print the tools.lock rows this selection depends on,
+                               one per line, as `name rule want provider handle`
 
 environment:
   MACH_CORPUS_OUT              output directory (default test/out); every invocation
@@ -181,6 +183,7 @@ def main(argv):
     only_targets, only_cases, only_layers = [], [], []
     bless = False
     show_matrix = False
+    show_tools = False
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -199,12 +202,17 @@ def main(argv):
             bless = True
         elif a == "--matrix":
             show_matrix = True
+        elif a == "--tools":
+            show_tools = True
         elif a in ("-h", "--help"):
             sys.stdout.write(USAGE)
             return 0
         else:
             die("unknown option '%s'\n\n%s" % (a, USAGE))
         i += 1
+
+    if show_tools:
+        return list_tools(only_targets, only_layers)
 
     out_root = os.path.abspath(os.environ.get("MACH_CORPUS_OUT", os.path.join(CORPUS, "out")))
     matrix_path = os.path.join(out_root, "matrix.tsv")
@@ -230,6 +238,29 @@ def main(argv):
 
     with OutLock(out_root):
         return run(out_root, matrix_path, only_targets, only_cases, wanted_layers_arg, bless)
+
+
+def list_tools(only_targets, only_layers):
+    """the pinned rows this selection depends on, for whoever has to install them.
+
+    the same needed_tools the run itself gates on, so what CI installs and what the
+    driver then demands cannot drift: a leg that installs from this list and still
+    refuses to start is reporting a gap in tools.lock, not a gap between two lists.
+    """
+    tools = config.load_tools(os.path.join(CORPUS, "tools.lock"))
+    all_targets = config.load_engines(os.path.join(CORPUS, "engines.conf"))
+    targets, _ = select_targets(all_targets, only_targets)
+    if not targets:
+        die("no target in engines.conf can be served by this host")
+    wanted = only_layers or list(config.LAYERS)
+    skips = {t.name: config.load_skips(os.path.join(CORPUS, "golden"), t.name) for t in targets}
+    for name in needed_tools(targets, wanted, skips):
+        t = tools.get(name)
+        s = tools.source(name)
+        sys.stdout.write("%s %s %s %s %s\n"
+                         % (name, t.rule, t.want,
+                            s.provider if s else "-", s.handle if s else "-"))
+    return 0
 
 
 def run(out_root, matrix_path, only_targets, only_cases, only_layers, bless):

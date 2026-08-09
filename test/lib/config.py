@@ -101,12 +101,25 @@ class Tool(object):
         self.name, self.rule, self.want, self.probe = name, rule, want, probe
 
 
+class Source(object):
+    """where a pinned tool is obtained, when no runner image carries it."""
+
+    __slots__ = ("provider", "handle")
+
+    def __init__(self, provider, handle):
+        self.provider, self.handle = provider, handle
+
+
 class Tools(object):
-    def __init__(self, tools, flags, cflags):
+    def __init__(self, tools, flags, cflags, sources):
         self.tools = tools
         self.flags = flags
         self.cflags = cflags
+        self.sources = sources
         self._checked = {}
+
+    def source(self, name):
+        return self.sources.get(name)
 
     def get(self, name):
         if name not in self.tools:
@@ -155,10 +168,15 @@ def _probe(tool):
 
 
 def load_tools(path):
-    tools, flags, cflags = {}, {}, {}
+    tools, flags, cflags, sources = {}, {}, {}, {}
     for lineno, line in _rows(path):
         kind, rest = (line.split(None, 1) + [""])[:2]
-        if kind == "tool":
+        if kind == "source":
+            f = rest.split()
+            if len(f) != 3:
+                raise ConfigError("%s:%d: source <tool> <provider> <handle>" % (path, lineno))
+            sources[f[0]] = Source(f[1], f[2])
+        elif kind == "tool":
             f = rest.split()
             if len(f) < 4:
                 raise ConfigError("%s:%d: tool <name> <rule> <want> <probe-args...>" % (path, lineno))
@@ -175,7 +193,10 @@ def load_tools(path):
             cflags[f[0]] = f[1:]
         else:
             raise ConfigError("%s:%d: unknown row kind '%s'" % (path, lineno, kind))
-    return Tools(tools, flags, cflags)
+    for name in sources:
+        if name not in tools:
+            raise ConfigError("%s: source names '%s', which has no tool row" % (path, name))
+    return Tools(tools, flags, cflags, sources)
 
 
 class Skip(object):

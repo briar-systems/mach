@@ -157,6 +157,26 @@ Registering a target is one row and nothing else: the driver generates its manif
 from those columns. `engine = none` is a public label, not a default, and a target
 carrying it has no layer C column at all.
 
+Two different questions get asked of this file and it is worth keeping them apart.
+**Can this machine serve a target** is what `run.sh` with no `--target` answers, and
+it is the right question on a developer's machine: run everything the host can do.
+**Which leg carries a target** is what the `runner` column answers, and it is the
+only question CI asks. They are not the same, because a target with `engine none`
+needs no execution host and so passes the first question everywhere. CI therefore
+hands the driver the registry's answer (`ci-legs.sh` reads the column, the workflow
+passes `--target` per leg) rather than letting the driver re-derive a different one.
+Before that, the `spirv` column was recomputed on the windows and arm runners as
+well, which is coverage nobody scheduled and, for spirv, coverage whose pinned
+decoder has no build for those hosts at all (#2948).
+
+## tools.lock
+
+Every oracle is pinned, and a pin nothing can install is a wish. Each `tool` row says
+what a version must be, and a `source` row says where that version is obtained.
+`run.sh --tools` prints the rows a given selection depends on, which is what
+`ci-tools.sh` installs from, so a workflow never carries a second copy of a version
+and cannot install one thing while the driver demands another.
+
 ## Declared skips
 
 `golden/<target>/SKIPS` is where a column says what it cannot cover. One entry per
