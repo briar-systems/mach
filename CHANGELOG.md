@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+#### A cross-platform executable needs one artifact per extension convention (#2959)
+An artifact's `out` is one literal string and every target in `targets` resolves it the same way, so an executable that ships on Windows and anywhere else cannot use `targets = ["*"]`. `bin/app` gives Windows a file it will not run until someone renames it, and `bin/app.exe` gives linux and darwin a binary called `app.exe`. The answer is two stanzas with disjoint `targets` lists, which works today and needed no compiler change: mach does not append an extension behind the author's back, and a template variable for it was considered and rejected as more magic than it buys.
+
+`doc/manifest.md` now says so on the `out` row and in a section that shows the two-stanza form with what it costs. The stanzas differ only in `out` and `targets`, so a `link` or `need` added to one and not the other diverges on Windows alone. Every new target has to be added to the right list by hand, since neither can use `*`. And the artifact name differs between them, so `$bin.name` reads `app` on most platforms and `app-windows` on Windows.
+
+mach's own `mach.toml` had the defect it now documents. It declared `out = "bin/mach"` with `targets = ["*"]`, so a Windows build from the repository's own manifest produced an extensionless `bin/mach`. CI never caught it because every Windows leg passes `-o` explicitly, so the manifest's `out` was never what named the Windows binary and the project worked around its own bug. The manifest is now split, and `mach build . --target windows-x86_64` with no `-o` lands at `bin/mach.exe`.
+
+Splitting mach's own manifest is what found #2961, and is deliberately not part of this change. `mach build` enumerates artifact-by-target cells and filters them, so each platform gets its own stanza with nothing named on the command line, but `mach test` links the whole source tree and answers "which artifact is primary" separately, in more than one place, and only the planner asks whether the artifact supports the target. On a host the first-declared stanza does not declare, a test run refuses. The documentation states that limitation where it recommends the split, and the repository keeps its single artifact until the selection has one owner, rather than shipping a shape its own test command cannot run or the flags that would hide it.
+
 #### The integration suite is retired, and a linking suite replaces the part the codegen corpus cannot reach (#2903)
 `int/` and `tools/` are deleted. The unified codegen corpus at `test/` answers what the compiler computes - 91 cases through structural validation, golden disassembly against an external decoder, and differential execution against a C reference at both pipelines on every target with an engine - and 57 of the 176 integration cases were asking that same question in a per-project shape that cost a directory tree and minutes of CI each. The suite held 176 case directories under 174 distinct names, since `shell` and `step` each existed once under `regression` and once under `surface`.
 

@@ -351,7 +351,7 @@ reads the selected artifact's name.
 |-----------|----------|---------|
 | `kind`    | yes | `"bin"`, `"static"`, or `"shared"` (see below). |
 | `entry`   | yes | Entry source, relative to the project `src` dir (e.g. `main.mach` for `src/main.mach`). The entry module's FQN is `<id>.<entry without .mach>`, `/` turned into `.`. |
-| `out`     | yes | This artifact's output path, **relative to the expanded project `out`** and rooted there automatically — write `bin/demo`, not `{project.out}/bin/demo`. An executable extension, where wanted, is written literally here. |
+| `out`     | yes | This artifact's output path, **relative to the expanded project `out`** and rooted there automatically — write `bin/demo`, not `{project.out}/bin/demo`. An executable extension, where wanted, is written literally here, and it is one string shared by every target in `targets`, so an executable that ships on Windows and elsewhere **cannot use `targets = ["*"]`** (see [One artifact per extension convention](#one-artifact-per-extension-convention)). |
 | `targets` | yes | Array of declared target names this artifact builds for; `["*"]` means every declared target. |
 | `link`    | yes | Array of `[link.X]` names this artifact links (see below). `[]` for none. |
 | `need`    | yes | Array of `[step.X]` names this artifact demands directly, for step outputs that are not themselves link inputs. `[]` for none. |
@@ -368,6 +368,62 @@ reads the selected artifact's name.
 
 Per-target extension or per-target entry is not a per-cell exception table — it is a
 second artifact stanza, so the condition stays visible like everything else.
+
+### One artifact per extension convention
+
+`out` is one literal string, and every target in `targets` resolves it the same way.
+Windows will not execute a file without an executable extension until someone renames
+it by hand, and no other platform wants one, so there is no single `out` that is right
+for both. `bin/app` gives Windows an unrunnable `app`, and `bin/app.exe` gives linux
+and darwin a binary called `app.exe`. An executable that ships on Windows and anywhere
+else therefore cannot use `targets = ["*"]`. It is two artifacts with disjoint
+`targets` lists:
+
+```toml
+[artifact.app]
+kind = "bin"
+entry = "main.mach"
+out = "bin/app"
+targets = ["linux-x86_64", "darwin-aarch64"]
+link = []
+need = []
+
+[artifact.app-windows]
+kind = "bin"
+entry = "main.mach"
+out = "bin/app.exe"
+targets = ["windows-x86_64"]
+link = []
+need = []
+```
+
+This is deliberate rather than a defect, and it costs three things worth knowing before
+you meet them.
+
+The two stanzas differ only in `out` and `targets` and are otherwise duplicates, so
+they drift. A `link` or `need` added to one and not the other changes the build on
+Windows only, which is the platform least likely to be the one in front of you.
+
+Every new target has to be added to the right list by hand, because neither stanza can
+use `*`. Declaring a target and forgetting to list it means that target simply builds
+nothing.
+
+The artifact **name** differs between the two, so `$bin.name` differs by platform: a
+project that reads it sees `app` everywhere and `app-windows` on Windows. Nothing in
+mach's own source reads it, and a project that does needs to expect both.
+
+`mach build` is unaffected by the split: it enumerates artifact-by-target cells and
+builds only the ones that match, so each platform gets its stanza with nothing named on
+the command line. `mach test` is not, today. It links the whole source tree rather than
+one artifact, so it takes the **first declared** artifact as the root of its build, and
+on a host that stanza does not declare it refuses rather than reaching for the other
+one. Until #2961 is fixed, a test run on the platform whose stanza is declared second
+has to name it, as in `mach test . --bin app-windows`.
+
+mach's own `mach.toml` is NOT split yet, deliberately. Splitting it is what found
+#2961, and the repository is not going to ship a shape its own `mach test` cannot run
+on Windows, or the command-line flags that would hide that. It follows once the
+selection is fixed.
 
 ### `subsystem` — the windows console/GUI selector
 
