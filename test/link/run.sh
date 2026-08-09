@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run.sh — the cross-compilation and linking suite.
+# run.sh: the cross-compilation and linking suite.
 #
 # usage: run.sh [--leg <name>]... [--case <name>]... [--deps float|pin] [--bless] [--matrix]
 #

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ci-legs.sh — emit the GitHub Actions matrix for one cadence from engines.conf.
+# ci-legs.sh: emit the GitHub Actions matrix for one cadence from engines.conf.
 #
 # usage: ci-legs.sh <pr|main>
 #

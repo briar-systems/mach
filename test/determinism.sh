@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# determinism.sh — prove the incremental (warm) build path is deterministic.
+# determinism.sh: prove the incremental (warm) build path is deterministic.
 #
 # usage: determinism.sh <compiler> [project-dir]
 #
@@ -7,7 +7,7 @@
 # from-scratch builds. This guards the warm/incremental path the query engine
 # drives: a warm rebuild must produce byte-identical output to a clean build, both
 # with no change (cache reuse is sound) and after a source edit (invalidation is
-# sound — the failure mode #2045 recorded, where an incremental build reflected an
+# sound, the failure mode #2045 recorded, where an incremental build reflected an
 # edit only partially). The edit is a `[project].version` bump: it flows through
 # `$project.version` into the compiler and rides the comptime-input invalidation
 # path, the subtlest one to get right.
