@@ -262,13 +262,18 @@ On a target whose grammar has no flag reader at all, every one of these facts is
 vacuous, and that vacuity is asserted per target rather than assumed: adding an
 aarch64 `cset` later has to state its facts deliberately.
 
-The rows whose facts could wrongly *permit* a leak are measured against the CPU
-rather than asserted from a manual — `int/surface/ct-flags-hardware` runs each
-instruction twice with the flags preset all-set and all-clear and reports what it
-actually defines, preserves, and reads. Three rows are exempt and stay a reasoned
-classification: `popfq`, `iretq` and `syscall` take their flags from the stack,
-the interrupt frame, or a masked prior RFLAGS, and no experiment of that shape can
-tell you where a value came *from*.
+The rows whose facts could wrongly *permit* a leak were measured against the CPU
+rather than asserted from a manual: each instruction was run twice with the flags
+preset all-set and all-clear, and what it actually defines, preserves and reads was
+read off the hardware and written into the table. Three rows are exempt and stay a
+reasoned classification: `popfq`, `iretq` and `syscall` take their flags from the
+stack, the interrupt frame, or a masked prior RFLAGS, and no experiment of that
+shape can tell you where a value came *from*.
+
+**Nothing re-measures the table today.** It is a recorded classification, and a CPU
+whose behaviour stops matching it is a silent divergence. Re-establishing it is a
+job for a unit test that runs the probe on the host it is running on, not for a
+cross-compilation suite: the experiment only means anything on the ISA it executes.
 
 **Memory is the third taint domain**, beside the register set and the flags bit
 (#2706). A secret spilled to the stack and reloaded comes back **secret**:
@@ -401,32 +406,33 @@ preview and has not been audited. Do not build production cryptography on it at
 this version.**
 
 What holds today: the type system checks that the source respects the leakage
-model, `#[oblivious]` carries the obligation through codegen, and the
-translation validator independently re-checks the lowered MIR. The dudect-style
-timing harness at `int/ct/` measures a branchless constant-time reference
-against a deliberately-leaky control and flags the leak with Welch's t-test —
-run it with `bash int/ct/ct.sh`.
+model, `#[oblivious]` carries the obligation through codegen, and the translation
+validator independently re-checks the lowered MIR. All three are static.
 
-**What the timing harness does and does not assure.** The leakage model has
-three channels, and the harness does not cover them uniformly
-(briar-systems/mach#2363):
+**There is no timing measurement in the tree.** A dudect-style harness existed and
+was run on demand, never in CI, because timing measurement is noise-sensitive and
+shared runners are noisy. What it established is recorded below and is not being
+re-established by anything; treat every empirical claim here as a measurement taken
+once rather than a property under guard.
+
+**What a timing harness can and cannot assure.** The leakage model has three
+channels and no single sampling regime covers them (briar-systems/mach#2363):
 
 | channel | assured by |
 |---|---|
-| control-flow trace | the source-level branch gate, plus the harness's latency mode |
-| variable-latency operands | the sema/lowering gates, plus the harness's latency mode |
-| memory-address trace | the source-level **secret-index and secret-address gates**, plus the harness's address mode |
+| control-flow trace | the source-level branch gate; a latency-mode measurement can corroborate |
+| variable-latency operands | the sema/lowering gates; a latency-mode measurement can corroborate |
+| memory-address trace | the source-level **secret-index and secret-address gates**; only an address-mode measurement can corroborate |
 
-The two harness modes need opposite sampling and neither substitutes for the
-other. Latency mode times a large batch of calls per sample, which is what lifts
-a running-time difference above clock resolution. That same batching *hides* an
-address-trace leak: every call in a batch is handed the same input, so after the
-first call both input classes are reading a warm cache line and the single cache
-miss carrying the signal is averaged away. Measured on one function — a
-secret-indexed read over a table larger than the last-level cache — latency mode
-scores |t| ≈ 1–15 across runs (straddling its own threshold, so it neither
-confirms nor denies) while address mode, at one call per sample, scores in the
-hundreds.
+The two modes need opposite sampling and neither substitutes for the other. Latency
+mode times a large batch of calls per sample, which is what lifts a running-time
+difference above clock resolution. That same batching *hides* an address-trace leak:
+every call in a batch is handed the same input, so after the first call both input
+classes are reading a warm cache line and the single cache miss carrying the signal
+is averaged away. Measured on one function — a secret-indexed read over a table
+larger than the last-level cache — latency mode scored |t| ≈ 1–15 across runs
+(straddling its own threshold, so it neither confirmed nor denied) while address
+mode, at one call per sample, scored in the hundreds.
 
 Two consequences worth stating plainly:
 
