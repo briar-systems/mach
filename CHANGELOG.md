@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+#### A whole `#[uniform]` or `#[storage]` block crosses a call by value (#2922, #2926)
+Handing a descriptor-bound block to a helper, `o = from_uniform(block)`, was refused for `spirv`, and so was assigning one whole record to another before #2911 landed. Reading a block's members one at a time worked, which is what made the refusal look like a design position rather than the two lowering faults it was.
+
+The first is an address materialization. A global in a value position had its symbol LEA'd into a register before the argument or return placement was made, which is a repair for a machine whose move records no relocation for a symbol operand. On a logical-addressing target it destroys the only reference the emitter can name, so `MIR_GEP` off a symbol arrived where a whole-object transfer should have. It is now gated on `MachineModel.flat_addressing`, the same axis that gates the float materialization (#2655) and the aggregate member walk (#2649), so the transformation is gated rather than the target. Every machine target's output is byte-identical, object for object, across five targets.
+
+The second was hiding behind the first. A descriptor-bound block's storage is declared with a **Block-decorated struct carrying its member offsets**, which is a different type from the plain struct the same `rec` has in a signature or a local, and the two cannot share an id because the decorations are part of the type's identity. A load that re-derived the type from the IR produced an `OpLoad` whose result type did not match its pointer: a module `spirv-val` rejects and the compiler wrote without complaint, for a whole-block copy that already compiled. A load now reads the variable's own declared type and `OpCopyLogical` carries the value to the type its position or its destination takes, which is the operation SPIR-V defines for exactly that crossing and which is defined only between logically matching types.
+
+One more fault came with them. The emitter's write scan lists the operand positions that only READ, and it listed them for `MIR_LOAD` and `MIR_GEP` alone, so a whole-object read through `MIR_MEMCPY` or `MIR_AGG_LOAD` counted as a store: a `"readonly"` storage block passed by value was refused for being written, and a storage block read whole lost the `NonWritable` decoration that lets a vertex stage read it without `vertexPipelineStoresAndAtomics`.
+
+The refusal's own text is gone with the rule it stated. It said an aggregate assignment lowers to a byte copy, which stopped being true when `MIR_MEMCPY` (#2911) and `MIR_AGG_LOAD` / `MIR_AGG_STORE` (#2914, #2915) gave the target whole-object transfers, and a copy between two objects whose types do not match logically is refused by `emit_memcpy` under the reason that is actually its own.
+
 ### Changed
 
 #### A target owns its own type definitions, and `#[spirv_op]` becomes `#[op]` (#2888)
