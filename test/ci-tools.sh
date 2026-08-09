@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # ci-tools.sh: install the pinned external oracles a leg depends on.
 #
-# usage: ci-tools.sh <target>...
+# usage: ci-tools.sh <runner-label>
+#
+# the runner label is the assignment: engines.conf's runner column says which rows
+# this machine owns, so a workflow names the runner it is already executing on and
+# never a target list it could get wrong.
 #
 # the versions come from test/tools.lock and from nowhere else. the driver decides
 # which rows a leg reaches (`run.sh --tools`) and tools.lock says what each row wants
@@ -22,10 +26,8 @@ set -euo pipefail
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
-[ $# -gt 0 ] || { echo "usage: ci-tools.sh <target>..." >&2; exit 2; }
-
-targets=()
-for t in "$@"; do targets+=(--target "$t"); done
+[ $# -eq 1 ] || { echo "usage: ci-tools.sh <runner-label>" >&2; exit 2; }
+runner=$1
 
 bindir=${MACH_CI_TOOLS_BIN:-$here/../out/ci-tools/bin}
 mkdir -p "$bindir"
@@ -146,6 +148,6 @@ while read -r name exe rule want provider handle; do
         vulkan-sdk) install_vulkan_sdk "$handle" ;;
         *)          echo "ci-tools.sh: tools.lock names provider '$provider' for $name, which this script does not serve" >&2; exit 1 ;;
     esac
-done < <(bash "$here/run.sh" --tools "${targets[@]}")
+done < <(bash "$here/run.sh" --tools --runner "$runner")
 
-echo "ci-tools.sh: installed for ${*}"
+echo "ci-tools.sh: installed for the rows engines.conf assigns to $runner"

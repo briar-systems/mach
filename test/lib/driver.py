@@ -28,6 +28,8 @@ HOST_DIR = {("linux", "x86_64"): "linux-x86_64", ("linux", "aarch64"): "linux-ar
 USAGE = """usage: run.sh [options]
 
   (no options)                 every case, every target this host serves, every layer
+  --runner <label>             the rows engines.conf assigns to that CI runner, which
+                               this host must then be able to serve or the run refuses
   --target <t>                 restrict to one target (repeatable)
   --case <group>/<name>        restrict to one case (repeatable)
   --layer a|b|c                restrict to one layer (repeatable)
@@ -136,29 +138,75 @@ def discover_cases(only):
     return [c for c in found if c in only]
 
 
-def select_targets(all_targets, only):
-    if only:
-        missing = [t for t in only if t not in [x.name for x in all_targets]]
-        if missing:
-            die("no such target in engines.conf: " + ", ".join(missing))
-        return [t for t in all_targets if t.name in only], []
+def unservable(t, system, machine):
+    """why this host cannot execute t, or "" when it can.
+
+    layer C is the only layer that needs an engine. a host with none still decodes
+    and validates, which is what lets one host bless every column's goldens.
+    """
+    if t.engine == "none":
+        return ""
+    if t.engine == "qemu":
+        if shutil.which(t.engine_cmd):
+            return ""
+        return "engines.conf names engine %s, which is not installed on this host" % t.engine_cmd
+    if t.os == system and t.isa == machine:
+        return ""
+    return "engines.conf names engine native, which needs a %s/%s host, and this is %s/%s" % (
+        t.os, t.isa, system, machine)
+
+
+def select_targets(all_targets, only, runner, layers_wanted, check=True):
+    """which rows this run covers, and how that was decided.
+
+    assignment and capability are separate questions and only one of them selects.
+    `--runner` is the assignment CI makes, read straight off the registry's runner
+    column, and `--target` is the one a developer makes by hand. under either,
+    capability is a CHECK: a row assigned to a host that cannot serve it is a refusal
+    naming the row and the reason, never a quiet substitution of some other set.
+    with no assignment the host selects, which is the right question on a developer's
+    machine and the only place a declined row is a normal outcome.
+    """
     system, machine = host_pair()
     machine = "aarch64" if machine == "arm64" else machine
-    chosen, declined = [], []
-    for t in all_targets:
-        if t.engine == "none":
-            chosen.append(t)
-        elif t.engine == "qemu":
-            if shutil.which(t.engine_cmd):
-                chosen.append(t)
+    names = [t.name for t in all_targets]
+
+    if runner:
+        assigned = [t for t in all_targets if t.runner == runner]
+        if not assigned:
+            die("engines.conf assigns no target to runner '%s'; the runner column names %s"
+                % (runner, ", ".join(sorted({t.runner for t in all_targets if t.runner != "-"}))))
+        notes = [("not assigned", t, "engines.conf assigns it to %s"
+                  % (t.runner if t.runner != "-" else "no runner"))
+                 for t in all_targets if t.runner != runner]
+    elif only:
+        missing = [t for t in only if t not in names]
+        if missing:
+            die("no such target in engines.conf: " + ", ".join(missing))
+        assigned = [t for t in all_targets if t.name in only]
+        notes = []
+    else:
+        chosen, notes = [], []
+        for t in all_targets:
+            why = unservable(t, system, machine)
+            if why:
+                notes.append(("not selected", t, why))
             else:
-                declined.append((t, "engine %s is not installed on this host" % t.engine_cmd))
-        elif t.os == system and t.isa == machine:
-            chosen.append(t)
-        else:
-            declined.append((t, "engine native needs a %s/%s runner, this host is %s/%s"
-                             % (t.os, t.isa, system, machine)))
-    return chosen, declined
+                chosen.append(t)
+        return chosen, notes
+
+    # `check=False` is for `--tools`, which is what a runner reads BEFORE it installs
+    # anything: refusing there for want of a tool the caller is about to install would
+    # make the list unobtainable from the machine that needs it.
+    if check and "c" in layers_wanted:
+        refused = [(t, unservable(t, system, machine)) for t in assigned]
+        refused = [(t, why) for t, why in refused if why]
+        if refused:
+            die("this host cannot serve %d row(s) it was assigned, and layer C needs an "
+                "engine:\n%s\ninstall what each row names, or take the row off this "
+                "runner in engines.conf. the driver does not quietly run a different set."
+                % (len(refused), "\n".join("  %-16s %s" % (t.name, why) for t, why in refused)))
+    return assigned, notes
 
 
 def needed_tools(targets, layers_wanted, skips_by_target):
@@ -182,13 +230,19 @@ def needed_tools(targets, layers_wanted, skips_by_target):
 
 def main(argv):
     only_targets, only_cases, only_layers = [], [], []
+    runner = ""
     bless = False
     show_matrix = False
     show_tools = False
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a == "--target":
+        if a == "--runner":
+            i += 1
+            if i >= len(argv):
+                die("--runner needs a value")
+            runner = argv[i]
+        elif a == "--target":
             i += 1
             only_targets.append(argv[i]) if i < len(argv) else die("--target needs a value")
         elif a == "--case":
@@ -212,8 +266,13 @@ def main(argv):
             die("unknown option '%s'\n\n%s" % (a, USAGE))
         i += 1
 
+    # two assignments over one registry is the shape #2948 was: whichever won, the
+    # other would be a claim about coverage nothing produced.
+    if runner and only_targets:
+        die("--runner assigns the rows and so does --target; pass one")
+
     if show_tools:
-        return list_tools(only_targets, only_layers)
+        return list_tools(only_targets, runner, only_layers)
 
     out_root = os.path.abspath(os.environ.get("MACH_CORPUS_OUT", os.path.join(CORPUS, "out")))
     matrix_path = os.path.join(out_root, "matrix.tsv")
@@ -238,10 +297,11 @@ def main(argv):
     wanted_layers_arg = only_layers
 
     with OutLock(out_root):
-        return run(out_root, matrix_path, only_targets, only_cases, wanted_layers_arg, bless)
+        return run(out_root, matrix_path, only_targets, runner, only_cases,
+                   wanted_layers_arg, bless)
 
 
-def list_tools(only_targets, only_layers):
+def list_tools(only_targets, runner, only_layers):
     """the pinned rows this selection depends on, for whoever has to install them.
 
     the same needed_tools the run itself gates on, so what CI installs and what the
@@ -259,10 +319,10 @@ def list_tools(only_targets, only_layers):
 
     tools = config.load_tools(os.path.join(CORPUS, "tools.lock"))
     all_targets = config.load_engines(os.path.join(CORPUS, "engines.conf"))
-    targets, _ = select_targets(all_targets, only_targets)
+    wanted = only_layers or list(config.LAYERS)
+    targets, _ = select_targets(all_targets, only_targets, runner, wanted, check=False)
     if not targets:
         die("no target in engines.conf can be served by this host")
-    wanted = only_layers or list(config.LAYERS)
     skips = {t.name: config.load_skips(os.path.join(CORPUS, "golden"), t.name) for t in targets}
     for name in needed_tools(targets, wanted, skips):
         t = tools.get(name)
@@ -273,7 +333,7 @@ def list_tools(only_targets, only_layers):
     return 0
 
 
-def run(out_root, matrix_path, only_targets, only_cases, only_layers, bless):
+def run(out_root, matrix_path, only_targets, runner, only_cases, only_layers, bless):
     tools = config.load_tools(os.path.join(CORPUS, "tools.lock"))
     all_targets = config.load_engines(os.path.join(CORPUS, "engines.conf"))
     cases = discover_cases(only_cases)
@@ -282,7 +342,7 @@ def run(out_root, matrix_path, only_targets, only_cases, only_layers, bless):
     wanted_layers = only_layers or list(config.LAYERS)
     if bless:
         wanted_layers = ["b"]
-    targets, declined = select_targets(all_targets, only_targets)
+    targets, notes = select_targets(all_targets, only_targets, runner, wanted_layers)
     if not targets:
         die("no target in engines.conf can be served by this host")
 
@@ -294,8 +354,13 @@ def run(out_root, matrix_path, only_targets, only_cases, only_layers, bless):
     sys.stdout.write("out:      %s\n" % out_root)
     sys.stdout.write("cases:    %d   targets: %s   layers: %s\n"
                      % (len(cases), ",".join(t.name for t in targets), "".join(wanted_layers)))
-    for t, why in declined:
-        sys.stdout.write("not selected: %-16s %s\n" % (t.name, why))
+    if runner:
+        sys.stdout.write("runner:   %-16s assignment from engines.conf, not host capability\n"
+                         % runner)
+    # a row this run does not cover is named with the reason, so "never applicable
+    # here" and "quietly dropped" are not the same silence.
+    for kind, t, why in notes:
+        sys.stdout.write("%s: %-16s %s\n" % (kind, t.name, why))
 
     skips = {t.name: config.load_skips(os.path.join(CORPUS, "golden"), t.name) for t in targets}
     failed_pins = []
