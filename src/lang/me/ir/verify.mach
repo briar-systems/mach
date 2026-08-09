@@ -59,7 +59,10 @@ pub val VC_PHI_COVERAGE:    VerifyCheck = 5;
 pub val VC_OPERAND_TYPE:    VerifyCheck = 6;
 # a VAL_CONST_* operand carries a type incompatible with its kind
 pub val VC_CONST_TYPE:      VerifyCheck = 7;
-# a VAL_INSTR operand references a def that does not dominate the use
+# a VAL_INSTR operand references a def that does not dominate the use. a non-phi
+# operand is measured against the using instruction itself. a phi incoming is
+# measured against the END of the predecessor block the pair names, since that is
+# the point the incoming value is live out of
 pub val VC_DOMINANCE:       VerifyCheck = 8;
 # a non-entry block is unreachable (empty preds, referenced nowhere)
 pub val VC_REACHABILITY:    VerifyCheck = 9;
@@ -134,6 +137,26 @@ pub val VC_BITCAST_CLASS:   VerifyCheck = 15;
 # operand with no dataflow needed, and a conversion is exactly where a front-end
 # classification error lands, so it names the site instead of reaching codegen
 pub val VC_CONVERT_WIDTH:   VerifyCheck = 16;
+
+# a VAL_INSTR operand of a live instruction names an instruction no block list of
+# the same function holds - a value some pass detached and left a use of.
+#
+# The instruction POOL retains every instruction a pass ever created, including the
+# ones it detached, so a dangling operand still resolves through `ir.instruction_get`
+# and reads as an ordinary value everywhere downstream. Only the block lists say what
+# reaches the back end, so the live set is the one this is measured against.
+#
+# The back end lowers such an operand into a read of a register nothing ever wrote,
+# which is a silent wrong ANSWER rather than a fault: #2749 (a loop-carried i32x4
+# accumulator that came out holding the multiplier) and #2917 (a conditional float
+# merge that read its register undefined) both shipped that way, and `--verify-ir`
+# exited 0 on both reproducers. A pass that drops an instruction and misses one of its
+# uses is an ordinary mistake, and this is the invariant that makes it loud.
+#
+# Always on and O(instructions): one live-set pass over the block lists per function,
+# then one scan. Unlike VC_DOMINANCE this needs no dominator tree and no reachability,
+# so it holds at every pipeline stage rather than only the post-DCE ones
+pub val VC_DANGLING_OPERAND: VerifyCheck = 17;
 
 # one invariant failure, located as precisely as the failing check allows
 # ---
@@ -269,6 +292,7 @@ pub fun describe(check: VerifyCheck) str {
     if (check == VC_DANGLING_ID)     { ret "dangling id: a block list names an out-of-range instruction id"; }
     if (check == VC_TYPE_AGREE)      { ret "type agreement: operand types violate the opcode's typing contract"; }
     if (check == VC_CALL_ARG_TYPE)   { ret "call argument typing: a call argument's type disagrees with the callee's declared parameter"; }
+    if (check == VC_DANGLING_OPERAND) { ret "dangling operand: an operand names an instruction no block list of this function holds"; }
     if (check == VC_CONVERT_WIDTH)   { ret "conversion width: a conversion's result width contradicts its opcode (a bitcast must keep the width, a truncation must narrow, an extension must widen)"; }
     ret "unknown verification check";
 }
@@ -388,6 +412,9 @@ fun verify_function(m: *ir.Module, fn: *ir.Function, fi: u32, r: *VerifyReport, 
 
     val res_lists: R.Result[bool, str] = check_block_lists(fn, fi, r);
     if (R.is_err[bool, str](res_lists)) { ret res_lists; }
+
+    val res_ops: R.Result[bool, str] = check_operand_defs(fn, fi, r);
+    if (R.is_err[bool, str](res_ops)) { ret res_ops; }
 
     var bi: u32 = 0;
     for (bi < fn.block_count) {
@@ -533,6 +560,102 @@ fun check_block_lists(fn: *ir.Function, fi: u32, r: *VerifyReport) R.Result[bool
 fun check_listed_id(fn: *ir.Function, iid: id.InstructionId, fi: u32, bid: id.BlockId, r: *VerifyReport) R.Result[bool, str] {
     if (iid == id.INSTR_NIL || iid >= fn.instr_len) {
         ret push(r, fi, bid, iid, VC_DANGLING_ID);
+    }
+    ret R.ok[bool, str](true);
+}
+
+# VC_DANGLING_OPERAND: every VAL_INSTR operand of every live instruction must name
+# an instruction that some block list of the same function still holds. the live set
+# is built once from the block lists (phis, body, terminator), then every live
+# instruction's operands are scanned against it.
+#
+# checking the instruction POOL instead would check the wrong set: the pool keeps
+# every instruction a pass ever created, detached ones included, so an operand naming
+# a dropped value resolves there and reads as an ordinary use. an out-of-range operand
+# id is reported here too - no other check looks at operand ids, only at the ids block
+# lists name.
+# ---
+# fn:  the function to check
+# fi:  index of fn into Module.functions
+# r:   the report to record into
+# ret: true on completion, or an allocation error
+fun check_operand_defs(fn: *ir.Function, fi: u32, r: *VerifyReport) R.Result[bool, str] {
+    if (fn.instr_len == 0) { ret R.ok[bool, str](true); }
+    val res_live: R.Result[*u8, str] = A.allocate[u8](r.alloc, fn.instr_len::usize);
+    if (R.is_err[*u8, str](res_live)) { ret R.err[bool, str](R.unwrap_err[*u8, str](res_live)); }
+    val live: *u8 = R.unwrap_ok[*u8, str](res_live);
+    var i: u32 = 0;
+    for (i < fn.instr_len) { live[i] = 0; i = i + 1; }
+
+    var bi: u32 = 0;
+    for (bi < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[bi];
+        var p: u32 = 0;
+        for (p < blk.phi_count) {
+            if (blk.phis[p] < fn.instr_len) { live[blk.phis[p]] = 1; }
+            p = p + 1;
+        }
+        var ix: u32 = 0;
+        for (ix < blk.instr_count) {
+            if (blk.instructions[ix] < fn.instr_len) { live[blk.instructions[ix]] = 1; }
+            ix = ix + 1;
+        }
+        if (blk.terminator != id.INSTR_NIL && blk.terminator < fn.instr_len) {
+            live[blk.terminator] = 1;
+        }
+        bi = bi + 1;
+    }
+
+    var cb: u32 = 0;
+    for (cb < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[cb];
+        var p: u32 = 0;
+        for (p < blk.phi_count) {
+            val rr: R.Result[bool, str] = check_uses_live(fn, live, blk.phis[p], fi, blk.id, r);
+            if (R.is_err[bool, str](rr)) { A.deallocate[u8](r.alloc, live, fn.instr_len::usize); ret rr; }
+            p = p + 1;
+        }
+        var ix: u32 = 0;
+        for (ix < blk.instr_count) {
+            val rr: R.Result[bool, str] = check_uses_live(fn, live, blk.instructions[ix], fi, blk.id, r);
+            if (R.is_err[bool, str](rr)) { A.deallocate[u8](r.alloc, live, fn.instr_len::usize); ret rr; }
+            ix = ix + 1;
+        }
+        if (blk.terminator != id.INSTR_NIL) {
+            val rr: R.Result[bool, str] = check_uses_live(fn, live, blk.terminator, fi, blk.id, r);
+            if (R.is_err[bool, str](rr)) { A.deallocate[u8](r.alloc, live, fn.instr_len::usize); ret rr; }
+        }
+        cb = cb + 1;
+    }
+
+    A.deallocate[u8](r.alloc, live, fn.instr_len::usize);
+    ret R.ok[bool, str](true);
+}
+
+# checks one live instruction's VAL_INSTR operands against the live set. an
+# out-of-range `iid` is the block list's own defect and VC_DANGLING_ID reports it
+# ---
+# fn:   the enclosing function
+# live: per-id live flag buffer, sized by fn.instr_len (1 once a block list holds it)
+# iid:  the using instruction
+# fi:   index of fn into Module.functions
+# bid:  the block holding iid (located on a violation)
+# r:    the report to record into
+# ret:  true on completion, or an allocation error
+fun check_uses_live(fn: *ir.Function, live: *u8, iid: id.InstructionId, fi: u32, bid: id.BlockId, r: *VerifyReport) R.Result[bool, str] {
+    if (iid >= fn.instr_len) { ret R.ok[bool, str](true); }
+    val ins: *instruction.Instruction = ?fn.instrs[iid];
+    var oi: u32 = 0;
+    for (oi < ins.operand_count) {
+        val op: *value.Value = ?ins.operands[oi];
+        if (op.kind == value.VAL_INSTR) {
+            val def_id: id.InstructionId = op.data.instr;
+            if (def_id >= fn.instr_len || live[def_id] == 0) {
+                val rr: R.Result[bool, str] = push(r, fi, bid, iid, VC_DANGLING_OPERAND);
+                if (R.is_err[bool, str](rr)) { ret rr; }
+            }
+        }
+        oi = oi + 1;
     }
     ret R.ok[bool, str](true);
 }
@@ -1373,10 +1496,18 @@ rec DomScratch {
 # use. dominators are computed by the near-linear Cooper-Harvey-Kennedy idom
 # algorithm over the reverse-postorder of the CFG (successors decoded through
 # ir.block_successors); each use is then checked intra-block by ordinal and
-# inter-block by an idom-chain ancestor walk. phi operands are exempt - a phi
-# legitimately uses values defined in predecessor blocks that need not dominate
-# the phi's own block. an operand whose def was never placed in any block (it
-# never executes) cannot dominate any use and is flagged.
+# inter-block by an idom-chain ancestor walk.
+#
+# A phi is not exempt, it is measured at a different point. A phi legitimately uses
+# values defined in predecessor blocks that need not dominate the phi's own block, so
+# each incoming is checked against the END of the predecessor the pair names - the
+# point the value has to be live out of for the edge copy to read it. Measuring an
+# incoming at the phi's own block would reject every ordinary merge, and exempting it
+# is what let a phi carry a use above its definition all the way to the back end.
+#
+# An operand naming an instruction no block list holds is VC_DANGLING_OPERAND's to
+# report: it has no defining block to measure from, and it is caught unconditionally
+# there rather than only in the `full` runs this check rides.
 # ---
 # fn:  the function to check
 # fi:  index of fn into Module.functions
@@ -1398,6 +1529,16 @@ fun check_dominance(fn: *ir.Function, fi: u32, r: *VerifyReport) R.Result[bool, 
     for (bi < n) {
         val blk: *ir.Block = ?fn.blocks[bi];
         val reachable: bool = sc.rpo_num[bi] != RPO_NIL;
+        var p: u32 = 0;
+        for (p < blk.phi_count) {
+            val phi_id: id.InstructionId = blk.phis[p];
+            if (phi_id < fn.instr_len) {
+                val ins: *instruction.Instruction = ?fn.instrs[phi_id];
+                val rr: R.Result[bool, str] = check_phi_incomings_dominate(fn, ins, ?sc, fi, blk.id, phi_id, r);
+                if (R.is_err[bool, str](rr)) { dom_scratch_free(r.alloc, ?sc); ret rr; }
+            }
+            p = p + 1;
+        }
         var ix: u32 = 0;
         for (ix < blk.instr_count) {
             val use_id: id.InstructionId = blk.instructions[ix];
@@ -1630,10 +1771,11 @@ fun index_definitions(fn: *ir.Function, def_block: *u32, def_ord: *u32) {
     }
 }
 
-# checks every VAL_INSTR operand of a non-phi instruction for dominance. an
-# operand whose def was never placed (def_block DEF_BLOCK_NIL) is flagged
-# unconditionally; an inter-block dominance check is run only when the use's block
-# is reachable (an unreachable use block is already a VC_REACHABILITY)
+# checks every VAL_INSTR operand of a non-phi instruction for dominance. an operand
+# whose def was never placed has no defining block to measure from and is
+# VC_DANGLING_OPERAND's, which reports it in every run rather than only the `full`
+# ones. the dominance check is run only when the use's block is reachable (an
+# unreachable use block is already a VC_REACHABILITY)
 # ---
 # fn:            the enclosing function
 # ins:           the using instruction
@@ -1655,17 +1797,53 @@ fun check_operands_dominate(fn: *ir.Function, ins: *instruction.Instruction, use
             val def_id: id.InstructionId = op.data.instr;
             if (def_id < fn.instr_len) {
                 val db: u32 = sc.def_block[def_id];
-                if (db == DEF_BLOCK_NIL) {
-                    val rr: R.Result[bool, str] = push(r, fi, bid, use_id, VC_DOMINANCE);
-                    if (R.is_err[bool, str](rr)) { ret rr; }
-                }
-                or (use_reachable && !def_dominates_use(sc, db, sc.def_ord[def_id], use_block, use_ord)) {
+                if (db != DEF_BLOCK_NIL && use_reachable
+                    && !def_dominates_use(sc, db, sc.def_ord[def_id], use_block, use_ord)) {
                     val rr: R.Result[bool, str] = push(r, fi, bid, use_id, VC_DOMINANCE);
                     if (R.is_err[bool, str](rr)) { ret rr; }
                 }
             }
         }
         oi = oi + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# checks every incoming of one phi against the exit of the predecessor it names. an
+# incoming has to be live out of that edge, so its definition must dominate the
+# predecessor's END: either it is defined in the predecessor itself (every definition
+# there precedes the block's exit) or its block dominates the predecessor.
+#
+# An unreachable predecessor is not judged - it has no dominator relation to read, and
+# VC_REACHABILITY already reports it. An operand with no defining block is
+# VC_DANGLING_OPERAND's, and a malformed pair (a block slot that is not a block id) is
+# VC_PHI_COVERAGE's
+# ---
+# fn:     the enclosing function
+# ins:    the phi whose incomings are checked
+# sc:     the scratch record (def_block/idom/rpo_num populated)
+# fi:     index of fn into Module.functions
+# bid:    the block holding the phi (located on a violation)
+# use_id: the phi's instruction id (located on a violation)
+# r:      the report to record into
+# ret:    true on completion, or an allocation error
+fun check_phi_incomings_dominate(fn: *ir.Function, ins: *instruction.Instruction, sc: *DomScratch, fi: u32, bid: id.BlockId, use_id: id.InstructionId, r: *VerifyReport) R.Result[bool, str] {
+    if (ins.kind != instruction.OP_PHI) { ret R.ok[bool, str](true); }
+    var k: u32 = 0;
+    for (k + 1 < ins.operand_count) {
+        val pred: id.BlockId = ir.block_target(ins.operands[k]);
+        val op: *value.Value = ?ins.operands[k + 1];
+        if (op.kind == value.VAL_INSTR && pred < sc.n && sc.rpo_num[pred] != RPO_NIL) {
+            val def_id: id.InstructionId = op.data.instr;
+            if (def_id < fn.instr_len) {
+                val db: u32 = sc.def_block[def_id];
+                if (db != DEF_BLOCK_NIL && db != pred::u32 && !block_dominates(sc, db, pred::u32)) {
+                    val rr: R.Result[bool, str] = push(r, fi, bid, use_id, VC_DOMINANCE);
+                    if (R.is_err[bool, str](rr)) { ret rr; }
+                }
+            }
+        }
+        k = k + 2;
     }
     ret R.ok[bool, str](true);
 }
@@ -2951,4 +3129,168 @@ test "mach.lang.me.ir.verify.describe_located:spanless_says_so" {
     source.dnit(?smap);
     intern.dnit(?itn);
     ret code;
+}
+
+# detaches an instruction from a block's body list, leaving it in the instruction
+# pool. this is the exact state a pass that drops a value and misses one of its uses
+# leaves behind, and the state every pool-based walk reads as an ordinary instruction
+# ---
+# env: the test environment
+# b:   the block whose body list is edited
+# iid: the instruction to detach
+# ret: true when the id was found and removed
+fun t_drop(env: *TEnv, b: id.BlockId, iid: id.InstructionId) bool {
+    val fn: *ir.Function = ?env.m.functions[0];
+    if (b::u32 >= fn.block_count) { ret false; }
+    val blk: *ir.Block = ?fn.blocks[b::u32];
+    var i: u32 = 0;
+    for (i < blk.instr_count) {
+        if (blk.instructions[i] == iid) {
+            var j: u32 = i;
+            for (j + 1 < blk.instr_count) { blk.instructions[j] = blk.instructions[j + 1]; j = j + 1; }
+            blk.instr_count = blk.instr_count - 1;
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# a use whose definition a pass detached is rejected, and the same module with the
+# definition still listed is accepted. run with `full` clear: a dangling operand is an
+# unconditional invariant, not a post-DCE one
+test "mach.lang.me.ir.verify.check_operand_defs:dropped_def" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    if (b0 != 0) { ret 1; }
+    val c: value.Value = t_ci(?env, 0);
+
+    builder.set_block(?env.bld, b0);
+    val dv: R.Result[value.Value, str] = builder.emit_add(?env.bld, c, c);
+    if (R.is_err[value.Value, str](dv)) { ret 1; }
+    val d: value.Value = R.unwrap_ok[value.Value, str](dv);
+    if (R.is_err[value.Value, str](builder.emit_add(?env.bld, d, c))) { ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret_void(?env.bld)))         { ret 1; }
+
+    # positive control: the same module, well formed, must still pass
+    if (t_total(?env, false, false) != 0) { ret 1; }
+
+    if (!t_drop(?env, b0, d.data.instr)) { ret 1; }
+    if (t_count(?env, false, false, VC_DANGLING_OPERAND) != 1) { ret 1; }
+    ret 0;
+}
+
+# the #2917 shape: a phi incoming naming an instruction the block lists no longer
+# hold. this is the one the old verifier accepted, since dominance skipped phis
+# outright and nothing else looked at operands at all
+test "mach.lang.me.ir.verify.check_operand_defs:dropped_phi_incoming" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    val b1: id.BlockId = t_block(?env);
+    val b2: id.BlockId = t_block(?env);
+    val b3: id.BlockId = t_block(?env);
+    if (b3 != 3) { ret 1; }
+    val c: value.Value = t_ci(?env, 0);
+
+    builder.set_block(?env.bld, b0);
+    if (R.is_err[bool, str](builder.emit_cbr(?env.bld, t_ci(?env, 1), b1, b2))) { ret 1; }
+
+    builder.set_block(?env.bld, b1);
+    val lv: R.Result[value.Value, str] = builder.emit_add(?env.bld, c, c);
+    if (R.is_err[value.Value, str](lv)) { ret 1; }
+    val l: value.Value = R.unwrap_ok[value.Value, str](lv);
+    if (R.is_err[bool, str](builder.emit_br(?env.bld, b3))) { ret 1; }
+
+    builder.set_block(?env.bld, b2);
+    val rv: R.Result[value.Value, str] = builder.emit_add(?env.bld, c, c);
+    if (R.is_err[value.Value, str](rv)) { ret 1; }
+    val rt: value.Value = R.unwrap_ok[value.Value, str](rv);
+    if (R.is_err[bool, str](builder.emit_br(?env.bld, b3))) { ret 1; }
+
+    builder.set_block(?env.bld, b3);
+    val pv: R.Result[value.Value, str] = builder.emit_phi(?env.bld, env.i64ty);
+    if (R.is_err[value.Value, str](pv)) { ret 1; }
+    val p: value.Value = R.unwrap_ok[value.Value, str](pv);
+    if (R.is_err[bool, str](builder.phi_add_incoming(?env.bld, p, b1, l)))  { ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?env.bld, p, b2, rt))) { ret 1; }
+    if (R.is_err[value.Value, str](builder.emit_add(?env.bld, p, c))) { ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret_void(?env.bld)))         { ret 1; }
+
+    # positive control: the well-formed merge passes every check, dominance included
+    if (t_total(?env, true, false) != 0) { ret 1; }
+
+    if (!t_drop(?env, b2, rt.data.instr)) { ret 1; }
+    if (t_count(?env, false, false, VC_DANGLING_OPERAND) != 1) { ret 1; }
+    ret 0;
+}
+
+# a phi incoming is measured at the exit of the predecessor it names: a value defined
+# in the sibling arm is not live out of the other edge, and is rejected. the
+# well-formed merge above is the paired positive control
+test "mach.lang.me.ir.verify.check_dominance:phi_incoming_not_live_out_of_pred" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    val b1: id.BlockId = t_block(?env);
+    val b2: id.BlockId = t_block(?env);
+    val b3: id.BlockId = t_block(?env);
+    if (b3 != 3) { ret 1; }
+    val c: value.Value = t_ci(?env, 0);
+
+    builder.set_block(?env.bld, b0);
+    if (R.is_err[bool, str](builder.emit_cbr(?env.bld, t_ci(?env, 1), b1, b2))) { ret 1; }
+
+    builder.set_block(?env.bld, b1);
+    if (R.is_err[bool, str](builder.emit_br(?env.bld, b3))) { ret 1; }
+
+    builder.set_block(?env.bld, b2);
+    val rv: R.Result[value.Value, str] = builder.emit_add(?env.bld, c, c);
+    if (R.is_err[value.Value, str](rv)) { ret 1; }
+    val rt: value.Value = R.unwrap_ok[value.Value, str](rv);
+    if (R.is_err[bool, str](builder.emit_br(?env.bld, b3))) { ret 1; }
+
+    builder.set_block(?env.bld, b3);
+    val pv: R.Result[value.Value, str] = builder.emit_phi(?env.bld, env.i64ty);
+    if (R.is_err[value.Value, str](pv)) { ret 1; }
+    val p: value.Value = R.unwrap_ok[value.Value, str](pv);
+    # the b1 edge carries a value only the b2 arm defines
+    if (R.is_err[bool, str](builder.phi_add_incoming(?env.bld, p, b1, rt))) { ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?env.bld, p, b2, rt))) { ret 1; }
+    if (R.is_err[value.Value, str](builder.emit_add(?env.bld, p, c))) { ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret_void(?env.bld)))         { ret 1; }
+
+    # the operand is live, so only the dominance check may object
+    if (t_count(?env, true, false, VC_DANGLING_OPERAND) != 0) { ret 1; }
+    if (t_count(?env, true, false, VC_DOMINANCE) != 1)        { ret 1; }
+    ret 0;
+}
+
+# a phi incoming defined in the predecessor itself is live out of that edge whatever
+# its position in the block, so it is accepted at every ordinal
+test "mach.lang.me.ir.verify.check_dominance:phi_incoming_defined_in_pred" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    val b1: id.BlockId = t_block(?env);
+    if (b1 != 1) { ret 1; }
+    val c: value.Value = t_ci(?env, 0);
+
+    builder.set_block(?env.bld, b0);
+    val dv: R.Result[value.Value, str] = builder.emit_add(?env.bld, c, c);
+    if (R.is_err[value.Value, str](dv)) { ret 1; }
+    val d: value.Value = R.unwrap_ok[value.Value, str](dv);
+    if (R.is_err[bool, str](builder.emit_br(?env.bld, b1))) { ret 1; }
+
+    builder.set_block(?env.bld, b1);
+    val pv: R.Result[value.Value, str] = builder.emit_phi(?env.bld, env.i64ty);
+    if (R.is_err[value.Value, str](pv)) { ret 1; }
+    val p: value.Value = R.unwrap_ok[value.Value, str](pv);
+    if (R.is_err[bool, str](builder.phi_add_incoming(?env.bld, p, b0, d))) { ret 1; }
+    if (R.is_err[value.Value, str](builder.emit_add(?env.bld, p, c))) { ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret_void(?env.bld)))         { ret 1; }
+
+    if (t_total(?env, true, false) != 0) { ret 1; }
+    ret 0;
 }

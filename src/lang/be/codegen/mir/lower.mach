@@ -66,8 +66,11 @@
 # secret reaching a branch / index / div / mod / float operand unconstructable, and
 # SEED COMPLETENESS (every secret source marked) is what makes #1648's re-derive sound.
 
+use std.allocator.page;
 use std.collections.map;
+use std.format;
 use std.types.bool.bool;
+use std.types.string.str_contains;
 use std.types.bool.true;
 use std.types.bool.false;
 use std.types.size.usize;
@@ -85,11 +88,13 @@ use mabi: mach.lang.be.codegen.mir.abi;
 use lctx: mach.lang.be.codegen.mir.context;
 use mach.lang.intern;
 use mach.lang.me.ir;
+use mach.lang.me.ir.builder;
 use mach.lang.me.ir.id;
 use instr: mach.lang.me.ir.instruction;
 use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.source;
+use treg: mach.lang.target;
 use target: mach.lang.target.resolved;
 
 # lower an IR module to a parallel MIR module, one MIR function per IR function
@@ -463,6 +468,15 @@ fun lower_block_phis(ctx: *lctx.LowerCtx, fn: *ir.Function, blk: *ir.Block) R.Re
                 }
                 k = k + 2;
             }
+            # out-of-SSA is total: the phi's result vreg has to be defined on EVERY
+            # path into its block, so an edge with no incoming is a malformed input
+            # like the four above it and not a case. lowering it emits no copy and
+            # leaves the merge register read undefined on that path (#2917).
+            if (!found) {
+                err_msg = phi_edge_err(ctx, blk.id::u32, pred_id, dst_vreg);
+                hi = hi + 1;
+                cnt;
+            }
             hi = hi + 1;
         }
 
@@ -478,6 +492,26 @@ fun lower_block_phis(ctx: *lctx.LowerCtx, fn: *ir.Function, blk: *ir.Block) R.Re
     A.deallocate[u8](ctx.alloc, wids, np::usize);
     if (err_msg != nil) { ret R.err[bool, str](err_msg); }
     ret R.ok[bool, str](true);
+}
+
+# build the message for a phi edge that carries no incoming value
+#
+# The pass that dropped the incoming is well upstream of MIR lowering, so the block
+# pair and the merge vreg are the only thread back to it and a static string would
+# name none of them. Built on `ctx.alloc`, the session allocator the error is read on.
+# ---
+# ctx:      the per-function lowering context (supplies the allocator)
+# block_id: the phi's own block
+# pred_id:  the predecessor edge that has no incoming
+# dst_vreg: the phi result's vreg
+# ret:      the formatted message, or a static fallback when formatting fails
+fun phi_edge_err(ctx: *lctx.LowerCtx, block_id: u32, pred_id: u32, dst_vreg: u32) str {
+    val fallback: str = "mir.lower_ir: phi has no incoming value for a predecessor edge";
+    val rj: R.Result[str, str] = format.sprint(ctx.alloc,
+        "mir.lower_ir: phi in block {} has no incoming value for predecessor block {} (result vreg {})",
+        block_id, pred_id, dst_vreg);
+    if (R.is_err[str, str](rj)) { ret fallback; }
+    ret R.unwrap_ok[str, str](rj);
 }
 
 # return the MIR block whose id equals `block_id`, or nil if absent
@@ -3012,4 +3046,106 @@ fun struct_field_type(ctx: *lctx.LowerCtx, struct_ty: ir_type.IrTypeId, ix: u32)
         ret R.err[ir_type.IrTypeId, str]("mir.lower_ir: gep struct field index out of range");
     }
     ret R.ok[ir_type.IrTypeId, str](st.data.struct_.fields[ix]);
+}
+
+# builds a one-function module whose block 3 merges a diamond through an i64 phi, and
+# lowers it for linux-x86_64. `cover_both` selects whether the phi carries an incoming
+# for BOTH predecessor edges or only for block 1, which is the malformed input
+# ---
+# out_err: set to the lowering error message when lowering fails
+# ret:     true when lowering succeeded
+fun t_lower_diamond_phi(alloc: *A.Allocator, cover_both: bool, out_err: *str) bool {
+    out_err[0] = nil;
+
+    var reg: treg.TargetRegistry = treg.registry_init();
+    if (R.is_err[bool, str](treg.register_all(?reg))) { ret false; }
+    val tr: R.Result[target.Target, str] = treg.select(?reg, "x86_64", "linux", "sysv64");
+    if (R.is_err[target.Target, str](tr)) { ret false; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+
+    var itn: intern.Interner  = intern.init(alloc);
+    var smap: source.SourceMap = source.init(alloc);
+
+    val mr: R.Result[ir.Module, str] = ir.init(alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](mr)) { ret false; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](mr);
+
+    val it: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](it)) { ret false; }
+    val i64ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](it);
+    val vt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_void(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](vt)) { ret false; }
+    val voidty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](vt);
+    val sr: R.Result[ir_type.IrTypeId, str] = ir_type.intern_fn(?m.types, voidty, nil, 0, false);
+    if (R.is_err[ir_type.IrTypeId, str](sr)) { ret false; }
+    if (R.is_err[u32, str](ir.function_add(?m, intern.STR_NIL, R.unwrap_ok[ir_type.IrTypeId, str](sr), 0))) { ret false; }
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, ?m.functions[0]);
+    var bids: [4]id.BlockId;
+    var i: u32 = 0;
+    for (i < 4) {
+        val br: R.Result[id.BlockId, str] = builder.new_block(?bld);
+        if (R.is_err[id.BlockId, str](br)) { ret false; }
+        bids[i] = R.unwrap_ok[id.BlockId, str](br);
+        i = i + 1;
+    }
+    val c: value.Value = value.const_int(0, i64ty);
+
+    builder.set_block(?bld, bids[0]);
+    if (R.is_err[bool, str](builder.emit_cbr(?bld, value.const_int(1, i64ty), bids[1], bids[2]))) { ret false; }
+
+    builder.set_block(?bld, bids[1]);
+    val lv: R.Result[value.Value, str] = builder.emit_add(?bld, c, c);
+    if (R.is_err[value.Value, str](lv)) { ret false; }
+    val l: value.Value = R.unwrap_ok[value.Value, str](lv);
+    if (R.is_err[bool, str](builder.emit_br(?bld, bids[3]))) { ret false; }
+
+    builder.set_block(?bld, bids[2]);
+    val rv: R.Result[value.Value, str] = builder.emit_add(?bld, c, c);
+    if (R.is_err[value.Value, str](rv)) { ret false; }
+    val rt: value.Value = R.unwrap_ok[value.Value, str](rv);
+    if (R.is_err[bool, str](builder.emit_br(?bld, bids[3]))) { ret false; }
+
+    builder.set_block(?bld, bids[3]);
+    val pv: R.Result[value.Value, str] = builder.emit_phi(?bld, i64ty);
+    if (R.is_err[value.Value, str](pv)) { ret false; }
+    val p: value.Value = R.unwrap_ok[value.Value, str](pv);
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, p, bids[1], l))) { ret false; }
+    if (cover_both) {
+        if (R.is_err[bool, str](builder.phi_add_incoming(?bld, p, bids[2], rt))) { ret false; }
+    }
+    if (R.is_err[value.Value, str](builder.emit_add(?bld, p, c))) { ret false; }
+    if (R.is_err[bool, str](builder.emit_ret_void(?bld)))         { ret false; }
+
+    val lr: R.Result[mir.MirModule, str] = lower_ir(?tgt, ?m, alloc, ?itn, ?smap);
+    if (R.is_err[mir.MirModule, str](lr)) {
+        out_err[0] = R.unwrap_err[mir.MirModule, str](lr);
+        ret false;
+    }
+    ret true;
+}
+
+# out-of-SSA is total: a phi's result vreg must be defined on every path into its
+# block, so a predecessor edge with no incoming is a malformed input like the four
+# already handled beside it, not a case to lower. it used to emit no copy at all and
+# leave the merge register read undefined on that path, which is how #2917 became a
+# wrong answer instead of a build failure. the message names the block pair and the
+# result vreg because the pass that dropped the incoming is well upstream of here
+test "mach.lang.be.codegen.mir.lower.lower_block_phis:missing_incoming" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var err: str = nil;
+
+    # positive control: the same diamond with both edges covered lowers cleanly
+    if (!t_lower_diamond_phi(?alloc, true, ?err)) { ret 1; }
+
+    if (t_lower_diamond_phi(?alloc, false, ?err)) { ret 1; }
+    if (err == nil)                                  { ret 1; }
+    if (!str_contains(err, "no incoming value"))     { ret 1; }
+    # the phi's own block, the uncovered predecessor, and the merge result
+    if (!str_contains(err, "block 3"))               { ret 1; }
+    if (!str_contains(err, "block 2"))               { ret 1; }
+    if (!str_contains(err, "result vreg"))           { ret 1; }
+    ret 0;
 }
