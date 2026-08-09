@@ -420,7 +420,10 @@ on a host that stanza does not declare it refuses rather than reaching for the o
 one. Until #2961 is fixed, a test run on the platform whose stanza is declared second
 has to name it, as in `mach test . --bin app-windows`.
 
-mach's own `mach.toml` is split this way, for the same reason.
+mach's own `mach.toml` is NOT split yet, deliberately. Splitting it is what found
+#2961, and the repository is not going to ship a shape its own `mach test` cannot run
+on Windows, or the command-line flags that would hide that. It follows once the
+selection is fixed.
 
 ### `subsystem` — the windows console/GUI selector
 
