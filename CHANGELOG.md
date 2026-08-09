@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+#### The integration suite is retired, and a linking suite replaces the part the codegen corpus cannot reach (#2903)
+`int/` and `tools/` are deleted. The unified codegen corpus at `test/` answers what the compiler computes - 91 cases through structural validation, golden disassembly against an external decoder, and differential execution against a C reference at both pipelines on every target with an engine - and 109 of the 174 integration cases were asking that same question in a per-project shape that cost a directory tree and minutes of CI each.
+
+**It catches what it was built for, demonstrated rather than asserted.** `convert/f2u_high` converts floats above 2^31 and 2^63 to unsigned, which is the range the rest of the convert group deliberately stayed below while #2909 was open. Reverting that fix's encoder change and rebuilding makes the case disagree with the C reference at both pipelines while `convert/f2i` stays green, which is the coverage gap and its closure in one measurement. The boundary itself is not probed for evidence: at exactly 2^31 and 2^63 the x86 integer-indefinite value equals the correct answer, so it agrees with a broken lowering and is kept only as a control beside the values above it.
+
+Bringing the corpus up to current `dev` moved six goldens for reasons the compiler changes own: the x86-64 float-to-unsigned expansion (#2909) in `convert/f2i`, `float/special_f32` and `float/special_f64`, the rv64 conditional float merge (#2917) in `vec/vec_scalar_mix`, and comptime floats evaluating at their declared width (#2918) in `comptime/ct_runtime_agree` and `convert/f2f`.
+
+It also found two defects nothing else had. `cmp/branch_nest` built and validated for spirv before 46cd5558 and does not after, and `float/cmp_f32` and `float/cmp_f64` clear the #2910 boundary they were skipped for only to stop at the same merge-slot fault (#2939). `mem/rec_layout` reaches a refused pointer-to-record parameter (#2940) now that #2914 no longer stops it earlier. Twenty spirv skips came out because the defects they named are closed, so 78 of the 91 cases carry that column against 58 before. The four `cmp/cmp_*` cases go back to brace-literal arrays, which they had been written around while #2911 was open, so the mach source and its C reference are line for line again.
+
+The other 65 are not codegen facts and no checksum reaches them: an import table, a GOT or IAT slot, a Mach-O load command and section type, a `PT_GNU_RELRO` span, an archive member selection, a `.symtab`, a raw flat image, and an object, archive or import library that clang, gcc, llvm-ar or mingw produced. Those move to `test/link/`, which asks that one question and refuses everything else.
+
+**The rule the split was made against**: an integration case earns its place only where the property cannot be observed by building and looking on a developer's own machine. Cross-compilation, linking and foreign toolchains qualify. A front-end diagnostic, a comptime fold, a reflection walk, an inline-asm body and an optimizer decision do not, and cases for those are gone rather than moved - the accounting is per case, and the classification of all 174 is in the pull request rather than left to be inferred from what survived.
+
+**One registry.** `test/engines.conf` is now the single source of truth for both suites and for CI. It grows a `cadence` column, and the workflow leg set is generated from it, so registering a target is one row and no workflow edit - which the file's header already promised and CI was the last place to make false. A CI leg is a runner rather than a target row, because the corpus driver already selects every target a host can serve: the five `ubuntu-latest` rows are one job covering all five, not five jobs rebuilding the same compiler. A runner whose rows disagree about cadence is a refusal rather than a silent pick.
+
+**A leg is a machine and a target is what a case builds**, and those are separate axes because a cross-compilation case exists precisely where they differ: `pe-import-claim` runs on `x86_64-linux` and builds `x86_64-windows`, and reading its import table needs no Windows runner. Rows with `engine none` - spirv, mos6502, riscv32 - are targets and never legs. There is no flag that overrides an engine: a run claiming it exercised a leg has to have exercised it, which the old suite's `--runmode` override made negotiable.
+
+**Two lanes that could stop running now cannot.** Checking that every case declares the `[target.<t>]` block each leg builds, and that a pinned run can resolve every git dep any case declares, were separate scripts a workflow step invoked. #2353 and #2729 are each a year of a lane believed to be running that had never once started. Both now run inside the driver before it builds anything.
+
+**The pin source collapses to the repo's own `mach.lock`.** The second lock existed for one dependency of one case that cloned a sibling repository over the network, and an upstream rename in that repository turned every open pull request red (#2831). That case is not in the new suite, and the driver refuses a pinned run naming a dependency the root lock does not record.
+
+Every run of either suite writes a coverage matrix naming the engine behind each cell, and every CI leg uploads both.
+
+Three things kept their behaviour and changed address. `int/observability.md` is `doc/design/test-observability.md`, since the relationship between a defect class and the observation that can see it was never a property of a harness. `int/lib/check-determinism.sh` is `test/determinism.sh`, since it guards the incremental build path rather than integration. And `int/lib/cc.sh`, the host and cross C toolchain resolver every foreign-object case builds through, is `test/link/lib/cc.sh`.
+
+Two measurements lost their guard and say so where they are claimed. `doc/language/secrecy.md` recorded a dudect-style timing harness at `int/ct/`. It ran on demand and never in CI, and it is gone, so the empirical claims there are now marked as measurements taken once. The x86-64 flags table in `x64/encode.mach` was transcribed from a probe run against real hardware, and nothing re-runs that probe. Restoring it belongs in a host-executed unit test, since the experiment only means anything on the ISA it executes on.
+
+## [4.18.0] - 2026-08-08
+
 #### A whole `#[uniform]` or `#[storage]` block crosses a call by value (#2922, #2926)
 Handing a descriptor-bound block to a helper, `o = from_uniform(block)`, was refused for `spirv`, and so was assigning one whole record to another before #2911 landed. Reading a block's members one at a time worked, which is what made the refusal look like a design position rather than the two lowering faults it was.
 
@@ -48,6 +79,30 @@ The four refusals the old grammar carried by name survive, re-keyed to the opera
 A textured shader emits a **byte-identical module** across the migration: the sampled-image fixture built with the old spellings and with the new declarations produces the same 3984 bytes, and `spirv-val --target-env vulkan1.3` accepts both.
 
 ### Fixed
+
+#### A float converted to an unsigned integer is value-preserving across the whole range (#2909)
+
+x86-64 has no unsigned truncating convert, and `encode_float_conv` ignored the destination's signedness, so `MIR_FP_TO_SI` and `MIR_FP_TO_UI` both selected the signed `CVTTSS2SI` / `CVTTSD2SI`. Every source value at or above `2^31` for `::u32`, or `2^63` for `::u64`, exceeded the signed destination range and returned the x86 integer-indefinite value silently. `(3000000000.0::f64)::u32` gave `2147483648` where `doc/language/operators.md` promises a value-preserving conversion wherever the value is representable, and it is.
+
+A sub-64-bit unsigned destination now converts at 64-bit width and the store keeps the low bytes. A 64-bit unsigned destination takes the two-arm sequence: below `2^63` it converts directly, and at or above it converts `x - 2^63` and adds `2^63` back. The boundary is a pooled constant read by both the compare and the subtract, a scratch register holds the biased copy so an allocated source is never written, and a NaN source takes the direct arm because `UCOMIS` sets CF when unordered.
+
+The boundary itself is the trap this hid behind: at exactly `2^31` and exactly `2^63` the indefinite value equals the correct answer, so a test probing only the boundary passes while the entire range above it is wrong. riscv64 was correct throughout, because `fcvt.wu.d` and `fcvt.lu.d` exist and were selected.
+
+#### A comptime float is evaluated at its declared width (#2918)
+
+`CTValue` held a float in a bare `f64` with no width, so every float constant was computed at double precision whatever its declared type, and narrowing happened only at the far end when the constant was emitted at its IR type. A constant and the identical computation performed at run time therefore disagreed: `val B: f32 = A - 16777216.0` folded to `3f800000` where the running program produces `00000000`.
+
+The value now carries the IEEE width its payload is at, beside the signedness the integer side already had. An untyped float literal adopts the context width, so an all-literal `f32` chain is an `f32` chain from its first literal, and every operation reconciles its operands to the shared width and rounds both operands and the result. Rounding once at the end is a different and still-wrong answer: `1.0/3.0*7.0 - 2.0` at `f32` gives `3eaaaaab` rounded once, indistinguishable from rounding nothing, and `3eaaaab0` rounded at each step. Mismatched declared widths are refused rather than folded at a guessed width, since mach has no implicit widening.
+
+#### A conditional float merge is written on both edges on riscv64 (#2917)
+
+The vector placement stage rewrote each block's phi operands and terminator immediately after filling that block, against a replacement map that is only complete once every block is filled. A lane read's replacement is recorded when its own block is walked, so a use in a lower-indexed block kept an identifier that no longer existed, and phi destruction then emitted a copy only for the incoming it could resolve and none for the other edge. The merge register was read unwritten on the not-taken edge, at `-O2` only, on a target with no 128-bit vector unit.
+
+The per-block rewrite is replaced by one whole-function pass after the fill loop, which is the mechanism the gap-operator stage already grew for the same defect class.
+
+#### The IR verifier holds an aggregate bitcast to one size (#2899)
+
+`check_convert_width` judged a bitcast by `type.bit_width`, which answers `0` for pointers, arrays, structs, unions and functions, and bailed on the zero, while the sibling class check asked only that both sides were aggregates. Between them nothing held an aggregate bitcast to one extent, so a 16-byte struct reinterpreted as an 8-byte one passed the verifier and reached codegen. The reason it had stood is that an aggregate's size is a layout answer needing a target, and the verifier was never given one: it now carries `VerifyOpts`, and the equal-size test runs before the zero-width bail so a zero-sized aggregate is judged like any other.
 
 #### A shader built at `-O0` and was refused at `-O2` (#2921)
 Three sequential array loops in one function built cleanly for `spirv` at `-O0` and at `-g`, and `-O2` refused them: `a loop whose exits do not reconverge on one block is not yet supported by the SPIR-V target`. `-O2` is what ships, so a shader that only compiles at `-O0` does not work, and a profile that reorders and simplifies must not turn an expressible function into an inexpressible one.
@@ -220,33 +275,6 @@ The measurement is not new and deliberately is not duplicated: the comptime eval
 Resolve reaches the position through a mechanism that was already there: `bind_comptime_if` defers a chain it cannot fold yet, binding every arm and leaving arm selection to a later pass, which is what a type comparison has always done. A layout gate joins that list rather than introducing a second rule.
 
 ### Changed
-
-#### The integration suite is retired, and a linking suite replaces the part the codegen corpus cannot reach (#2903)
-`int/` and `tools/` are deleted. The unified codegen corpus at `test/` answers what the compiler computes - 91 cases through structural validation, golden disassembly against an external decoder, and differential execution against a C reference at both pipelines on every target with an engine - and 109 of the 174 integration cases were asking that same question in a per-project shape that cost a directory tree and minutes of CI each.
-
-**It catches what it was built for, demonstrated rather than asserted.** `convert/f2u_high` converts floats above 2^31 and 2^63 to unsigned, which is the range the rest of the convert group deliberately stayed below while #2909 was open. Reverting that fix's encoder change and rebuilding makes the case disagree with the C reference at both pipelines while `convert/f2i` stays green, which is the coverage gap and its closure in one measurement. The boundary itself is not probed for evidence: at exactly 2^31 and 2^63 the x86 integer-indefinite value equals the correct answer, so it agrees with a broken lowering and is kept only as a control beside the values above it.
-
-Bringing the corpus up to current `dev` moved six goldens for reasons the compiler changes own: the x86-64 float-to-unsigned expansion (#2909) in `convert/f2i`, `float/special_f32` and `float/special_f64`, the rv64 conditional float merge (#2917) in `vec/vec_scalar_mix`, and comptime floats evaluating at their declared width (#2918) in `comptime/ct_runtime_agree` and `convert/f2f`.
-
-It also found two defects nothing else had. `cmp/branch_nest` built and validated for spirv before 46cd5558 and does not after, and `float/cmp_f32` and `float/cmp_f64` clear the #2910 boundary they were skipped for only to stop at the same merge-slot fault (#2939). `mem/rec_layout` reaches a refused pointer-to-record parameter (#2940) now that #2914 no longer stops it earlier. Twenty spirv skips came out because the defects they named are closed, so 78 of the 91 cases carry that column against 58 before. The four `cmp/cmp_*` cases go back to brace-literal arrays, which they had been written around while #2911 was open, so the mach source and its C reference are line for line again.
-
-The other 65 are not codegen facts and no checksum reaches them: an import table, a GOT or IAT slot, a Mach-O load command and section type, a `PT_GNU_RELRO` span, an archive member selection, a `.symtab`, a raw flat image, and an object, archive or import library that clang, gcc, llvm-ar or mingw produced. Those move to `test/link/`, which asks that one question and refuses everything else.
-
-**The rule the split was made against**: an integration case earns its place only where the property cannot be observed by building and looking on a developer's own machine. Cross-compilation, linking and foreign toolchains qualify. A front-end diagnostic, a comptime fold, a reflection walk, an inline-asm body and an optimizer decision do not, and cases for those are gone rather than moved - the accounting is per case, and the classification of all 174 is in the pull request rather than left to be inferred from what survived.
-
-**One registry.** `test/engines.conf` is now the single source of truth for both suites and for CI. It grows a `cadence` column, and the workflow leg set is generated from it, so registering a target is one row and no workflow edit - which the file's header already promised and CI was the last place to make false. A CI leg is a runner rather than a target row, because the corpus driver already selects every target a host can serve: the five `ubuntu-latest` rows are one job covering all five, not five jobs rebuilding the same compiler. A runner whose rows disagree about cadence is a refusal rather than a silent pick.
-
-**A leg is a machine and a target is what a case builds**, and those are separate axes because a cross-compilation case exists precisely where they differ: `pe-import-claim` runs on `x86_64-linux` and builds `x86_64-windows`, and reading its import table needs no Windows runner. Rows with `engine none` - spirv, mos6502, riscv32 - are targets and never legs. There is no flag that overrides an engine: a run claiming it exercised a leg has to have exercised it, which the old suite's `--runmode` override made negotiable.
-
-**Two lanes that could stop running now cannot.** Checking that every case declares the `[target.<t>]` block each leg builds, and that a pinned run can resolve every git dep any case declares, were separate scripts a workflow step invoked. #2353 and #2729 are each a year of a lane believed to be running that had never once started. Both now run inside the driver before it builds anything.
-
-**The pin source collapses to the repo's own `mach.lock`.** The second lock existed for one dependency of one case that cloned a sibling repository over the network, and an upstream rename in that repository turned every open pull request red (#2831). That case is not in the new suite, and the driver refuses a pinned run naming a dependency the root lock does not record.
-
-Every run of either suite writes a coverage matrix naming the engine behind each cell, and every CI leg uploads both.
-
-Three things kept their behaviour and changed address. `int/observability.md` is `doc/design/test-observability.md`, since the relationship between a defect class and the observation that can see it was never a property of a harness. `int/lib/check-determinism.sh` is `test/determinism.sh`, since it guards the incremental build path rather than integration. And `int/lib/cc.sh`, the host and cross C toolchain resolver every foreign-object case builds through, is `test/link/lib/cc.sh`.
-
-Two measurements lost their guard and say so where they are claimed. `doc/language/secrecy.md` recorded a dudect-style timing harness at `int/ct/`. It ran on demand and never in CI, and it is gone, so the empirical claims there are now marked as measurements taken once. The x86-64 flags table in `x64/encode.mach` was transcribed from a probe run against real hardware, and nothing re-runs that probe. Restoring it belongs in a host-executed unit test, since the experiment only means anything on the ISA it executes on.
 
 #### A refused layout intrinsic now says which position refused it, and why (#2857)
 `a layout intrinsic has no value in this position: it measures a type, which only a type position resolves` was true of every position and is now true of one. A **declaration-scope** `$if` still cannot measure, because it selects which declarations exist and that is decided before any type is laid out, so it says that instead and points at the position that does work. `$offset_of` is named apart, since it is unavailable for a different reason - a field offset is decided at lowering - and a message about type checking would be a stale explanation the moment the resolver exists.
