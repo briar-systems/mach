@@ -45,9 +45,10 @@ esac
 # install covers every llvm-* row a leg reaches rather than one per tool.
 llvm_done=""
 install_llvm() {
-    local major=$1
+    local ver=$1
+    local major=${ver%%.*}
     [ -z "$llvm_done" ] || return 0
-    llvm_done=$major
+    llvm_done=$ver
 
     if [ "$host_os" = linux ]; then
         # llvm.sh adds the apt.llvm.org repository for this distribution and installs
@@ -83,21 +84,8 @@ install_llvm() {
     fi
 
     if [ "$host_os" = windows ]; then
-        # the newest release of the pinned major. the rule in tools.lock is `major`,
-        # which is the project saying a patch release decodes the same bytes the same
-        # way, so resolving the newest 22.x is the pin rather than a relaxation of it.
-        #
-        # no `head` in this pipeline: it closes the pipe early, curl takes SIGPIPE,
-        # and under `set -o pipefail` the assignment fails and `set -e` ends the
-        # script with nothing printed. `sed -n 1p` reads to the end and selects.
-        local releases ver
-        releases=$(curl -fsSL "https://api.github.com/repos/llvm/llvm-project/releases?per_page=100")
-        ver=$(printf '%s' "$releases" | tr ',' '\n' \
-              | sed -n 's/.*"tag_name": *"llvmorg-\('"$major"'\.[0-9][0-9.]*\)".*/\1/p' | sed -n 1p)
-        if [ -z "$ver" ]; then
-            echo "ci-tools.sh: no llvm-project release for major $major" >&2
-            exit 1
-        fi
+        # the release tools.lock names, fetched by name. nothing is resolved at run
+        # time here: the version is in the lock, which is the only place it belongs.
         local dir="clang+llvm-$ver-x86_64-pc-windows-msvc"
         local url="https://github.com/llvm/llvm-project/releases/download/llvmorg-$ver/$dir.tar.xz"
         echo "ci-tools.sh: llvm $ver from $url"
