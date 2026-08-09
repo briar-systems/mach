@@ -86,18 +86,28 @@ install_llvm() {
         # the newest release of the pinned major. the rule in tools.lock is `major`,
         # which is the project saying a patch release decodes the same bytes the same
         # way, so resolving the newest 22.x is the pin rather than a relaxation of it.
-        local tag
-        tag=$(curl -fsSL "https://api.github.com/repos/llvm/llvm-project/releases?per_page=100" \
-              | grep -o '"tag_name": *"llvmorg-'"$major"'\.[0-9.]*"' \
-              | head -1 | sed 's/.*"llvmorg-/llvmorg-/; s/"$//')
-        [ -n "$tag" ] || { echo "ci-tools.sh: no llvm-project release for major $major" >&2; exit 1; }
-        local ver=${tag#llvmorg-}
-        local url="https://github.com/llvm/llvm-project/releases/download/$tag/clang+llvm-$ver-x86_64-pc-windows-msvc.tar.xz"
+        #
+        # no `head` in this pipeline: it closes the pipe early, curl takes SIGPIPE,
+        # and under `set -o pipefail` the assignment fails and `set -e` ends the
+        # script with nothing printed. `sed -n 1p` reads to the end and selects.
+        local releases ver
+        releases=$(curl -fsSL "https://api.github.com/repos/llvm/llvm-project/releases?per_page=100")
+        ver=$(printf '%s' "$releases" | tr ',' '\n' \
+              | sed -n 's/.*"tag_name": *"llvmorg-\('"$major"'\.[0-9][0-9.]*\)".*/\1/p' | sed -n 1p)
+        if [ -z "$ver" ]; then
+            echo "ci-tools.sh: no llvm-project release for major $major" >&2
+            exit 1
+        fi
+        local dir="clang+llvm-$ver-x86_64-pc-windows-msvc"
+        local url="https://github.com/llvm/llvm-project/releases/download/llvmorg-$ver/$dir.tar.xz"
         echo "ci-tools.sh: llvm $ver from $url"
-        curl -fsSL "$url" | tar -xJf - -C "$bindir" --strip-components=2 \
-            "clang+llvm-$ver-x86_64-pc-windows-msvc/bin/llvm-objdump.exe" \
-            "clang+llvm-$ver-x86_64-pc-windows-msvc/bin/llvm-readobj.exe" \
-            "clang+llvm-$ver-x86_64-pc-windows-msvc/bin/llvm-dwarfdump.exe"
+        # to a file and then `tar -xf`: Git Bash's tar is not guaranteed to carry an
+        # xz decompressor for `-J` on a stream, and bsdtar detects the compression
+        # from the archive itself.
+        curl -fsSL -o "$bindir/llvm.tar.xz" "$url"
+        tar -xf "$bindir/llvm.tar.xz" -C "$bindir" --strip-components=2 \
+            "$dir/bin/llvm-objdump.exe" "$dir/bin/llvm-readobj.exe" "$dir/bin/llvm-dwarfdump.exe"
+        rm -f "$bindir/llvm.tar.xz"
         # GITHUB_PATH is read by the runner rather than by bash, so it takes a windows
         # path: an MSYS `/d/a/...` entry resolves for no step, including the bash ones.
         echo "$(cygpath -w "$bindir")" >> "${GITHUB_PATH:-/dev/null}"
@@ -131,10 +141,19 @@ install_vulkan_sdk() {
     echo "$bindir" >> "${GITHUB_PATH:-/dev/null}"
 }
 
-while read -r name rule want provider handle; do
+while read -r name exe rule want provider handle; do
     [ -n "$name" ] || continue
+
+    # the link suite reaches its C compiler through `${CC:-cc}`, so the alias
+    # tools.lock records has to reach it too. exporting it here keeps the lock the one
+    # place a host's spelling is written down, rather than a CC pinned in a workflow.
+    if [ "$name" = cc ] && [ "$exe" != cc ]; then
+        echo "CC=$exe" >> "${GITHUB_ENV:-/dev/null}"
+        echo "ci-tools.sh: cc is spelled $exe on this host, per tools.lock"
+    fi
+
     case "$provider" in
-        -)          echo "ci-tools.sh: $name ($rule $want) comes with the runner" ;;
+        -)          echo "ci-tools.sh: $name ($rule $want) comes with the runner as $exe" ;;
         llvm)       install_llvm "$handle" ;;
         vulkan-sdk) install_vulkan_sdk "$handle" ;;
         *)          echo "ci-tools.sh: tools.lock names provider '$provider' for $name, which this script does not serve" >&2; exit 1 ;;

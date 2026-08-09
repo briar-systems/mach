@@ -7,6 +7,7 @@ a target or a tool is an edit to a reviewed file rather than to this package.
 
 import fnmatch
 import os
+import platform
 import re
 import subprocess
 
@@ -95,10 +96,20 @@ def load_engines(path):
 
 
 class Tool(object):
-    __slots__ = ("name", "rule", "want", "probe")
+    __slots__ = ("name", "rule", "want", "probe", "aliases")
 
     def __init__(self, name, rule, want, probe):
         self.name, self.rule, self.want, self.probe = name, rule, want, probe
+        self.aliases = {}
+
+    def exe(self):
+        """the executable this host spells the row with."""
+        return self.aliases.get(host_os(), self.name)
+
+
+def host_os():
+    system = platform.system().lower()
+    return "windows" if system.startswith(("cygwin", "mingw", "msys")) else system
 
 
 class Source(object):
@@ -126,6 +137,9 @@ class Tools(object):
             raise ConfigError("tool '%s' has no tools.lock row" % name)
         return self.tools[name]
 
+    def exe(self, name):
+        return self.get(name).exe()
+
     def check(self, name):
         """(ok, detail) for one pinned tool, probed at most once per run."""
         if name not in self._checked:
@@ -140,38 +154,44 @@ _DOTTED = re.compile(r"\b(\d+(?:\.\d+)+)")
 
 
 def _probe(tool):
+    exe = tool.exe()
     try:
-        p = subprocess.run([tool.name] + tool.probe, capture_output=True, text=True, timeout=60)
+        p = subprocess.run([exe] + tool.probe, capture_output=True, text=True, timeout=60)
     except FileNotFoundError:
-        return False, "%s is not installed on this host" % tool.name
+        return False, "%s is not installed on this host" % exe
     except OSError as exc:
-        return False, "%s could not be executed: %s" % (tool.name, exc)
+        return False, "%s could not be executed: %s" % (exe, exc)
     text = (p.stdout or "") + (p.stderr or "")
     m = _LABELLED.search(text) or _DOTTED.search(text)
     if not m:
-        return False, "%s printed no parsable version for %s" % (tool.name, " ".join(tool.probe))
+        return False, "%s printed no parsable version for %s" % (exe, " ".join(tool.probe))
     found = next(g for g in m.groups() if g)
     parts = [int(x) for x in found.split(".")]
     want = [int(x) for x in tool.want.split(".")]
     if tool.rule == "major":
         if parts[0] != want[0]:
-            return False, "%s is version %s, tools.lock pins major %s" % (tool.name, found, tool.want)
+            return False, "%s is version %s, tools.lock pins major %s" % (exe, found, tool.want)
     elif tool.rule == "exact":
         if parts[:len(want)] != want:
-            return False, "%s is version %s, tools.lock pins %s" % (tool.name, found, tool.want)
+            return False, "%s is version %s, tools.lock pins %s" % (exe, found, tool.want)
     elif tool.rule == "min":
         if parts < want + [0] * (len(parts) - len(want)):
-            return False, "%s is version %s, tools.lock requires at least %s" % (tool.name, found, tool.want)
+            return False, "%s is version %s, tools.lock requires at least %s" % (exe, found, tool.want)
     else:
         raise ConfigError("unknown rule '%s' for tool %s" % (tool.rule, tool.name))
-    return True, "%s %s" % (tool.name, found)
+    return True, "%s %s" % (exe, found)
 
 
 def load_tools(path):
-    tools, flags, cflags, sources = {}, {}, {}, {}
+    tools, flags, cflags, sources, aliases = {}, {}, {}, {}, []
     for lineno, line in _rows(path):
         kind, rest = (line.split(None, 1) + [""])[:2]
-        if kind == "source":
+        if kind == "alias":
+            f = rest.split()
+            if len(f) != 3:
+                raise ConfigError("%s:%d: alias <tool> <host-os> <executable>" % (path, lineno))
+            aliases.append((lineno, f))
+        elif kind == "source":
             f = rest.split()
             if len(f) != 3:
                 raise ConfigError("%s:%d: source <tool> <provider> <handle>" % (path, lineno))
@@ -196,6 +216,10 @@ def load_tools(path):
     for name in sources:
         if name not in tools:
             raise ConfigError("%s: source names '%s', which has no tool row" % (path, name))
+    for lineno, (name, host, exe) in aliases:
+        if name not in tools:
+            raise ConfigError("%s:%d: alias names '%s', which has no tool row" % (path, lineno, name))
+        tools[name].aliases[host] = exe
     return Tools(tools, flags, cflags, sources)
 
 

@@ -34,7 +34,8 @@ USAGE = """usage: run.sh [options]
   --bless [--target <t>]       regenerate layer B goldens, print the diff, never in CI
   --matrix                     print the coverage matrix from the last run
   --tools                      print the tools.lock rows this selection depends on,
-                               one per line, as `name rule want provider handle`
+                               one per line, as
+                               `name exe rule want provider handle`
 
 environment:
   MACH_CORPUS_OUT              output directory (default test/out); every invocation
@@ -256,10 +257,10 @@ def list_tools(only_targets, only_layers):
     skips = {t.name: config.load_skips(os.path.join(CORPUS, "golden"), t.name) for t in targets}
     for name in needed_tools(targets, wanted, skips):
         t = tools.get(name)
-        s = tools.source(name)
-        sys.stdout.write("%s %s %s %s %s\n"
-                         % (name, t.rule, t.want,
-                            s.provider if s else "-", s.handle if s else "-"))
+        src = tools.source(name)
+        sys.stdout.write("%s %s %s %s %s %s\n"
+                         % (name, t.exe(), t.rule, t.want,
+                            src.provider if src else "-", src.handle if src else "-"))
     return 0
 
 
@@ -302,7 +303,7 @@ def run(out_root, matrix_path, only_targets, only_cases, only_layers, bless):
 
     work = projectmod.Workspace(CORPUS, REPO, out_root, cases, targets, mach)
     work.materialise()
-    ref = oracle.Reference(tools, CORPUS, out_root, tools.get("cc").name)
+    ref = oracle.Reference(tools, CORPUS, out_root, tools.exe("cc"))
     m = matrixmod.Matrix()
     logdir = os.path.join(out_root, "log")
     os.makedirs(logdir, exist_ok=True)

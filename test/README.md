@@ -172,7 +172,8 @@ decoder has no build for those hosts at all (#2948).
 ## tools.lock
 
 Every oracle is pinned, and a pin nothing can install is a wish. Each `tool` row says
-what a version must be, and a `source` row says where that version is obtained.
+what a version must be, a `source` row says where that version is obtained, and an
+`alias` row says how a host spells the executable when it is not the POSIX name.
 `run.sh --tools` prints the rows a given selection depends on, which is what
 `ci-tools.sh` installs from, so a workflow never carries a second copy of a version
 and cannot install one thing while the driver demands another.
