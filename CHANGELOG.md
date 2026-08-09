@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+#### The compiler was silent both times a pass dropped a value and missed a use (#2930, #2931)
+`#2749` was an `i32x4` accumulator on x86-64 that came out holding the multiplier. `#2917` was a conditional float merge on riscv64 that read its register undefined. Both were silent wrong answers, both were found by running a program, and `--verify-ir` exited 0 on both reproducers. The pass mistake behind them is ordinary. Being undetectable was not.
+
+The instruction pool keeps every instruction a pass ever created, detached ones included, so an operand naming a dropped value still resolves and reads as an ordinary use. Only the block lists say what reaches the back end, and nothing measured operands against them. The one check that could have was dominance, which walked block bodies and terminators and never phi lists, and returned early for a phi on top of that, so a phi incoming naming a dropped value was invisible twice over. It also rode the `full` flag, so it ran only in the post-DCE stages.
+
+`VC_DANGLING_OPERAND` now builds the live set once per function from the block lists and scans every live instruction's operands against it. It needs no dominator tree and no reachability, so it is always on and holds at every pipeline stage rather than only some of them. Dominance no longer exempts a phi: an incoming is measured at the END of the predecessor the pair names, which is the point the value has to be live out of for the edge copy to read it.
+
+Phi destruction had the matching hole and is what turned the IR defect into wrong code rather than a build failure. `lower_block_phis` searched a phi's operand pairs for the predecessor edge it was emitting and, finding none, moved on with no copy and no error, while the four other malformed inputs in the same function each fail the build. Out-of-SSA is total, so a merge register that is not defined on every path in is a malformed input rather than a case, and it now errors with the phi's block, the predecessor and the result vreg, since the pass that dropped the incoming is well upstream of MIR lowering.
+
+Both are diagnostic. Object output is byte-identical per target across x86-64, aarch64 and riscv64.
+
 ## [4.18.0] - 2026-08-08
 
 #### A whole `#[uniform]` or `#[storage]` block crosses a call by value (#2922, #2926)
