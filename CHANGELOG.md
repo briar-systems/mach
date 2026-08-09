@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+#### The compiler was silent both times a pass dropped a value and missed a use (#2930, #2931)
+`#2749` was an `i32x4` accumulator on x86-64 that came out holding the multiplier. `#2917` was a conditional float merge on riscv64 that read its register undefined. Both were silent wrong answers, both were found by running a program, and `--verify-ir` exited 0 on both reproducers. The pass mistake behind them is ordinary. Being undetectable was not.
+
+The instruction pool keeps every instruction a pass ever created, detached ones included, so an operand naming a dropped value still resolves and reads as an ordinary use. Only the block lists say what reaches the back end, and nothing measured operands against them. The one check that could have was dominance, which walked block bodies and terminators and never phi lists, and returned early for a phi on top of that, so a phi incoming naming a dropped value was invisible twice over. It also rode the `full` flag, so it ran only in the post-DCE stages.
+
+`VC_DANGLING_OPERAND` now builds the live set once per function from the block lists and scans every live instruction's operands against it. It needs no dominator tree and no reachability, so it is always on and holds at every pipeline stage rather than only some of them. Dominance no longer exempts a phi: an incoming is measured at the END of the predecessor the pair names, which is the point the value has to be live out of for the edge copy to read it.
+
+Phi destruction had the matching hole and is what turned the IR defect into wrong code rather than a build failure. `lower_block_phis` searched a phi's operand pairs for the predecessor edge it was emitting and, finding none, moved on with no copy and no error, while the four other malformed inputs in the same function each fail the build. Out-of-SSA is total, so a merge register that is not defined on every path in is a malformed input rather than a case, and it now errors with the phi's block, the predecessor and the result vreg, since the pass that dropped the incoming is well upstream of MIR lowering.
+
+Both are diagnostic. Object output is byte-identical per target across x86-64, aarch64 and riscv64.
+
+## [4.18.0] - 2026-08-08
+
 #### A whole `#[uniform]` or `#[storage]` block crosses a call by value (#2922, #2926)
 Handing a descriptor-bound block to a helper, `o = from_uniform(block)`, was refused for `spirv`, and so was assigning one whole record to another before #2911 landed. Reading a block's members one at a time worked, which is what made the refusal look like a design position rather than the two lowering faults it was.
 
@@ -49,16 +64,29 @@ A textured shader emits a **byte-identical module** across the migration: the sa
 
 ### Fixed
 
-#### The compiler was silent both times a pass dropped a value and missed a use (#2930, #2931)
-`#2749` was an `i32x4` accumulator on x86-64 that came out holding the multiplier. `#2917` was a conditional float merge on riscv64 that read its register undefined. Both were silent wrong answers, both were found by running a program, and `--verify-ir` exited 0 on both reproducers. The pass mistake behind them is ordinary. Being undetectable was not.
+#### A float converted to an unsigned integer is value-preserving across the whole range (#2909)
 
-The instruction pool keeps every instruction a pass ever created, detached ones included, so an operand naming a dropped value still resolves and reads as an ordinary use. Only the block lists say what reaches the back end, and nothing measured operands against them. The one check that could have was dominance, which walked block bodies and terminators and never phi lists, and returned early for a phi on top of that, so a phi incoming naming a dropped value was invisible twice over. It also rode the `full` flag, so it ran only in the post-DCE stages.
+x86-64 has no unsigned truncating convert, and `encode_float_conv` ignored the destination's signedness, so `MIR_FP_TO_SI` and `MIR_FP_TO_UI` both selected the signed `CVTTSS2SI` / `CVTTSD2SI`. Every source value at or above `2^31` for `::u32`, or `2^63` for `::u64`, exceeded the signed destination range and returned the x86 integer-indefinite value silently. `(3000000000.0::f64)::u32` gave `2147483648` where `doc/language/operators.md` promises a value-preserving conversion wherever the value is representable, and it is.
 
-`VC_DANGLING_OPERAND` now builds the live set once per function from the block lists and scans every live instruction's operands against it. It needs no dominator tree and no reachability, so it is always on and holds at every pipeline stage rather than only some of them. Dominance no longer exempts a phi: an incoming is measured at the END of the predecessor the pair names, which is the point the value has to be live out of for the edge copy to read it.
+A sub-64-bit unsigned destination now converts at 64-bit width and the store keeps the low bytes. A 64-bit unsigned destination takes the two-arm sequence: below `2^63` it converts directly, and at or above it converts `x - 2^63` and adds `2^63` back. The boundary is a pooled constant read by both the compare and the subtract, a scratch register holds the biased copy so an allocated source is never written, and a NaN source takes the direct arm because `UCOMIS` sets CF when unordered.
 
-Phi destruction had the matching hole and is what turned the IR defect into wrong code rather than a build failure. `lower_block_phis` searched a phi's operand pairs for the predecessor edge it was emitting and, finding none, moved on with no copy and no error, while the four other malformed inputs in the same function each fail the build. Out-of-SSA is total, so a merge register that is not defined on every path in is a malformed input rather than a case, and it now errors with the phi's block, the predecessor and the result vreg, since the pass that dropped the incoming is well upstream of MIR lowering.
+The boundary itself is the trap this hid behind: at exactly `2^31` and exactly `2^63` the indefinite value equals the correct answer, so a test probing only the boundary passes while the entire range above it is wrong. riscv64 was correct throughout, because `fcvt.wu.d` and `fcvt.lu.d` exist and were selected.
 
-Both are diagnostic. Object output is byte-identical per target across x86-64, aarch64 and riscv64.
+#### A comptime float is evaluated at its declared width (#2918)
+
+`CTValue` held a float in a bare `f64` with no width, so every float constant was computed at double precision whatever its declared type, and narrowing happened only at the far end when the constant was emitted at its IR type. A constant and the identical computation performed at run time therefore disagreed: `val B: f32 = A - 16777216.0` folded to `3f800000` where the running program produces `00000000`.
+
+The value now carries the IEEE width its payload is at, beside the signedness the integer side already had. An untyped float literal adopts the context width, so an all-literal `f32` chain is an `f32` chain from its first literal, and every operation reconciles its operands to the shared width and rounds both operands and the result. Rounding once at the end is a different and still-wrong answer: `1.0/3.0*7.0 - 2.0` at `f32` gives `3eaaaaab` rounded once, indistinguishable from rounding nothing, and `3eaaaab0` rounded at each step. Mismatched declared widths are refused rather than folded at a guessed width, since mach has no implicit widening.
+
+#### A conditional float merge is written on both edges on riscv64 (#2917)
+
+The vector placement stage rewrote each block's phi operands and terminator immediately after filling that block, against a replacement map that is only complete once every block is filled. A lane read's replacement is recorded when its own block is walked, so a use in a lower-indexed block kept an identifier that no longer existed, and phi destruction then emitted a copy only for the incoming it could resolve and none for the other edge. The merge register was read unwritten on the not-taken edge, at `-O2` only, on a target with no 128-bit vector unit.
+
+The per-block rewrite is replaced by one whole-function pass after the fill loop, which is the mechanism the gap-operator stage already grew for the same defect class.
+
+#### The IR verifier holds an aggregate bitcast to one size (#2899)
+
+`check_convert_width` judged a bitcast by `type.bit_width`, which answers `0` for pointers, arrays, structs, unions and functions, and bailed on the zero, while the sibling class check asked only that both sides were aggregates. Between them nothing held an aggregate bitcast to one extent, so a 16-byte struct reinterpreted as an 8-byte one passed the verifier and reached codegen. The reason it had stood is that an aggregate's size is a layout answer needing a target, and the verifier was never given one: it now carries `VerifyOpts`, and the equal-size test runs before the zero-width bail so a zero-sized aggregate is judged like any other.
 
 #### A shader built at `-O0` and was refused at `-O2` (#2921)
 Three sequential array loops in one function built cleanly for `spirv` at `-O0` and at `-g`, and `-O2` refused them: `a loop whose exits do not reconverge on one block is not yet supported by the SPIR-V target`. `-O2` is what ships, so a shader that only compiles at `-O0` does not work, and a profile that reorders and simplifies must not turn an expressible function into an inexpressible one.
