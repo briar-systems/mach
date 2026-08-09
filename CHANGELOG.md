@@ -58,6 +58,14 @@ The pass that skips is the only place that knows why, so it now records the name
 
 Following the alias by name in the loading pass would answer sooner and would be wrong: at that stage nothing says which declaration a spelling denotes, and reading a name-keyed table for the answer is the mistake #2764 documents.
 
+#### A folded cast records the signedness of the type it casts to (#2935)
+
+`int_ct` in the lowering fold built its `CTValue` without setting `int_unsigned`, and a `var` record default-initialises to zero, so every constant produced by a folded cast claimed to be signed - including a cast to `u64`. The field exists to tell a negative value from a magnitude above i64 range, and those two share a bit pattern, so a wrong answer there is unrecoverable by anything downstream. Its two sibling constructors, `make_int_value` and `ct_float`, each set every discriminating field they own.
+
+It changes no output today, and that is stated rather than assumed. `int_ct` is reachable only from `convert_const_scalar`, whose single caller reads the destination type for signedness rather than the field, and every other reader of `int_unsigned` is fed by `comptime.eval`, which does not route through it. Compiling the tree with a compiler built before and after produces byte-identical objects, 225 of them, on x86-64.
+
+The issue this closes was filed describing a different defect: that a comptime integer is not evaluated at its declared width, so `val X: u8 = 200 + 100` errors rather than wrapping. That does not reproduce. The constant wraps at its declared width and agrees with the same computation at run time, including through division and shift, which are the operations where narrowing once at the end would differ from narrowing at each step. The refusals in the comptime evaluator fire at i64 and u64 range, matching the literal-range rejection they were built beside, and a `u8` computation never reaches them.
+
 #### The compiler was silent both times a pass dropped a value and missed a use (#2930, #2931)
 `#2749` was an `i32x4` accumulator on x86-64 that came out holding the multiplier. `#2917` was a conditional float merge on riscv64 that read its register undefined. Both were silent wrong answers, both were found by running a program, and `--verify-ir` exited 0 on both reproducers. The pass mistake behind them is ordinary. Being undetectable was not.
 
