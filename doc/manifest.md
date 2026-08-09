@@ -412,6 +412,14 @@ The artifact **name** differs between the two, so `$bin.name` differs by platfor
 project that reads it sees `app` everywhere and `app-windows` on Windows. Nothing in
 mach's own source reads it, and a project that does needs to expect both.
 
+`mach build` is unaffected by the split: it enumerates artifact-by-target cells and
+builds only the ones that match, so each platform gets its stanza with nothing named on
+the command line. `mach test` is not, today. It links the whole source tree rather than
+one artifact, so it takes the **first declared** artifact as the root of its build, and
+on a host that stanza does not declare it refuses rather than reaching for the other
+one. Until #2961 is fixed, a test run on the platform whose stanza is declared second
+has to name it, as in `mach test . --bin app-windows`.
+
 mach's own `mach.toml` is split this way, for the same reason.
 
 ### `subsystem` — the windows console/GUI selector
