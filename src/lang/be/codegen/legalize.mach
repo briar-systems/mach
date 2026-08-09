@@ -157,6 +157,28 @@ rec Machine {
     mul_hi:     u8;
     stage_lo:   i32;
     stage_hi:   i32;
+    fp_class:   u32;
+}
+
+# sentinel "this machine declares no float register bank" in a Machine's `fp_class`
+val FP_CLASS_NONE: u32 = 0xFFFFFFFF;
+
+# the register class index of the machine's float bank, or FP_CLASS_NONE
+#
+# READ BY ROLE RATHER THAN INDEX. `RC_FLOAT` is the fact the ISA states about itself, so
+# a target with no float bank (mos6502 declares one class, and computes its floats on the
+# integer ALU) answers NONE here without this pass knowing any target's name. The
+# alternative - reading the class off a float OPERAND of the instruction at hand - fails
+# on the one shape that has no float vreg to read: a float CONSTANT converted to a wide
+# integer has an immediate on its float side and a GP destination.
+fun float_class_of(tgt: *target.Target) u32 {
+    if (tgt.model.reg_classes == nil) { ret FP_CLASS_NONE; }
+    var i: u32 = 0;
+    for (i < tgt.model.reg_class_len) {
+        if (tgt.model.reg_classes[i].kind == isa.RC_FLOAT) { ret i; }
+        i = i + 1;
+    }
+    ret FP_CLASS_NONE;
 }
 
 # per-function legalization plan: the lane assignment for every wide vreg
@@ -212,6 +234,7 @@ pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[bool, str] {
     mach.mul_hi     = tgt.model.mul_hi_width::u8;
     mach.stage_lo   = -1;
     mach.stage_hi   = -1;
+    mach.fp_class   = float_class_of(tgt);
     # a register machine declares the reserved scratch pair; a whole-module emitter
     # has no RegMachine at all and never drives a rewrite that needs one.
     if (tgt.arch != nil) {
@@ -286,6 +309,10 @@ fun function_needs_legalize(f: *mir.MirFunction, mach: *Machine) bool {
 # mach: the machine facts (native lane width, pointer width, shift/multiply capability)
 # ret:  true when the instruction needs legalization
 fun instr_needs_legalize(f: *mir.MirFunction, mi: *mir.MirInstr, mach: *Machine) bool {
+    # A CONVERSION IS THE ONE INSTRUCTION WITH A VALUE IN EACH BANK, so the float-bank
+    # exclusion below cannot decide it: excluding it leaves a wide INTEGER side that the
+    # planner has already split, naming lane vregs nothing defines (#2860).
+    if (conv_is_wide(mach, mi)) { ret true; }
     if (instr_rides_fp_bank(f, mi)) { ret false; }
     if (mi.width > mach.lane_width || mi.src_width > mach.lane_width) { ret true; }
     if (!mach.var_shift && is_shift(mi.opcode)) { ret true; }
@@ -445,7 +472,14 @@ fun plan_lanes(alloc: *A.Allocator, mach: *Machine, f: *mir.MirFunction, out: *L
             # the PLANNER and the needs-legalize GATE read one authority (#2818): a
             # value the gate excludes must get no lanes here, or the plan describes a
             # split the rewriter never performs.
-            if (!instr_rides_fp_bank(f, mi) && mir.instr_defines_shape(mi) &&
+            # a float-to-integer conversion's DESTINATION is a wide integer even though
+            # the instruction has a float operand, so it is planned here while the
+            # bank exclusion still keeps a float destination whole (#2860).
+            val conv_dst: bool = conv_is_wide(mach, mi) &&
+                                 mi.operand_count > 0 &&
+                                 mi.operands[0].kind == mir.MIR_OP_VREG &&
+                                 !mir.vreg_is_fp(f, mi.operands[0].vreg);
+            if ((!instr_rides_fp_bank(f, mi) || conv_dst) && mir.instr_defines_shape(mi) &&
                 !mir.is_cmp_opcode(mi.opcode) &&
                 mi.width > maw && mi.operand_count > 0 &&
                 mi.operands[0].kind == mir.MIR_OP_VREG) {
@@ -550,7 +584,7 @@ fun legalize_block(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, b:
     for (i < n) {
         val mi: *mir.MirInstr = ?b.instrs[i];
         if (instr_needs_legalize(f, mi, ?plan.mach)) {
-            val res_c: R.Result[u32, str] = expansion_count(alloc, plan, mi);
+            val res_c: R.Result[u32, str] = expansion_count(alloc, plan, f, mi);
             if (R.is_err[u32, str](res_c)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_c)); }
             total = total + R.unwrap_ok[u32, str](res_c);
             needs_expand = true;
@@ -663,9 +697,12 @@ fun free_source_operands(alloc: *A.Allocator, mi: *mir.MirInstr) {
 # plan: the function's lane assignment
 # mi:   the wide instruction
 # ret:  the exact piece count, or an error naming the unsupported wide op
-fun expansion_count(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr) R.Result[u32, str] {
+fun expansion_count(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction,
+                    mi: *mir.MirInstr) R.Result[u32, str] {
     val op: mir.MirOpcode = mi.opcode;
     val nl: u32 = wide_lane_count(plan, mi);
+
+    if (conv_is_wide(?plan.mach, mi)) { ret conv_piece_count(alloc, plan, f, mi); }
 
     # a memory access - an explicit load / store, or the move form the ABI placement
     # emits against a stack slot - costs one piece per lane plus the pointer's own
@@ -915,6 +952,9 @@ fun expand_instr(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: 
                  dst: *mir.MirInstr, cursor: *u32) R.Result[bool, str] {
     val op: mir.MirOpcode = mi.opcode;
 
+    if (conv_is_wide(?plan.mach, mi)) {
+        ret conv_run(alloc, plan, f, mi, dst, cursor);
+    }
     if (instr_is_memory(mi)) {
         ret expand_memory(alloc, plan, mi, dst, cursor);
     }
@@ -3288,6 +3328,535 @@ fun expand_trunc(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
     ret R.ok[bool, str](true);
 }
 
+# CONVERTING BETWEEN A WIDE INTEGER AND A FLOAT, OPEN-CODED (#2860)
+#
+# A conversion is the one operation in this pass that is NOT lane-wise and could never
+# be. `(hi, lo) -> f64` is a SINGLE rounding of the combined 64-bit value, not two
+# independent lane conversions recombined afterwards, so the carry-threading model
+# every other expansion here is built on does not apply and none of its machinery is
+# reused. What follows is an arithmetic identity per direction, not a template.
+#
+# WHY OPEN-CODED RATHER THAN A SOFT-FLOAT CALL. The other design is to lower these four
+# to `__floatdidf` / `__fixdfdi` and their twins, which is what every C toolchain does
+# on RV32, is correct by construction, and is a page of code instead of this. It was
+# rejected because it introduces a RUNTIME DEPENDENCY this backend has nowhere else on
+# this target: a freestanding RV32 image - the configuration mach's RISC-V targets exist
+# for - would then need a libgcc-shaped runtime linked in before an `i64 -> f64` worked
+# at all, so the conversion would be missing on exactly the target that wanted it most.
+# The price is that a rounding mistake here is a silent wrong answer rather than a
+# failure, which is why the boundary values are the tested deliverable and why each
+# identity below carries the argument for why it rounds exactly once.
+#
+# THE FOUR IDENTITIES, and the exactness argument each rests on:
+#
+# 1. `i64 -> f64` is `f64(hi) * 2^32 + f64(lo)`, hi read signed and lo unsigned. Each
+#    32-bit lane converts EXACTLY (32 <= 53 mantissa bits), the scaling by 2^32 is
+#    exact (a power of two, and the product is at most 2^63, far inside range), so the
+#    final add is a sum of two exact values and rounds ONCE. Correctly rounded.
+#    `u64 -> f64` is the same with hi read unsigned.
+#
+# 2. `i64 -> f32` may NOT go through the f64 result of (1) and then narrow. That is a
+#    double rounding and it is not innocuous here: a 64-bit integer can land within
+#    half an f64 ulp of an exact f32 midpoint without being one, so the f64 step
+#    delivers the midpoint and ties-to-even then breaks the wrong way. Instead the
+#    value is first ROUNDED TO ODD at a fixed 11-bit granularity when it needs more
+#    than 53 bits (`x >> 11`, with the discarded bits OR-ed back in as a sticky low
+#    bit), which leaves at most 53 significant bits - so (1) converts it exactly - and
+#    at least 42, comfortably above the 26 that make a following round-to-nearest
+#    correct. The discarded weight is restored by scaling with 2^11, exactly. Round to
+#    odd never lands on an f32 midpoint: a midpoint at this magnitude is a multiple of
+#    2^18 and an inexact round-to-odd result is an odd multiple of 2^11, so the tie
+#    that breaks double rounding cannot arise. A value needing 53 bits or fewer skips
+#    the reduction entirely and converts exactly. The signed form takes the magnitude
+#    first and folds the sign into the scale factor, which is exact because rounding
+#    to nearest is symmetric about zero.
+#
+# 3. `f64 -> u64` is the truncating split `hi = trunc(x * 2^-32)`, `lo = trunc((x *
+#    2^-32 - hi) * 2^32)`. Both scalings are powers of two and exact, and subtracting
+#    an integer part from a value below 2^32 is exact, so no rounding happens anywhere
+#    - which it must not, since the result is a truncation and not a rounding at all.
+#    THE SATURATION IS INHERITED RATHER THAN TESTED FOR: the native 32-bit `fcvt` the
+#    two truncations select already saturates and already maps NaN to the destination
+#    maximum, and feeding it an out-of-range or NaN intermediate reproduces the 64-bit
+#    rule in both lanes at once. A negative input drives the high lane to zero and the
+#    low lane to zero the same way. No compare, no select.
+#
+# 4. `f64 -> i64` converts the MAGNITUDE through (3) and then clamps and negates,
+#    because the truncating split above does not decompose for a negative value: the
+#    high lane rounds toward zero while the low lane needs a borrow, and the two
+#    disagree. The magnitude is taken by multiplying by a `+/-1.0` chosen from a single
+#    float compare, exact for every input including NaN and the infinities. The clamp
+#    is against `2^63 - 1` for a positive input and `2^63` for a negative one, which is
+#    what makes NaN and `+inf` land on `INT64_MAX` and `-inf` on `INT64_MIN`.
+#
+# A SOURCE OR DESTINATION FLOAT IS ALWAYS f64 INTERNALLY. An `f32` on either side is
+# widened first (exact, every f32 is an f64) or narrowed last, so there is one
+# expansion per direction rather than four.
+#
+# THIS ARM REQUIRES A FLOAT REGISTER BANK and fires only when the conversion's float
+# side is an FP-class value. A target whose floats ride GP registers (mos6502, whose
+# one register class makes every `f64` an integer lane group) reaches none of this and
+# keeps the refusal in `unsupported_family`: the identities above are built from native
+# float instructions that such a target does not have.
+
+# the state one conversion expansion emits through
+#
+# COUNTING AND EMITTING ARE THE SAME CODE PATH, which is the point of this record. The
+# pass sizes each rebuilt block before it writes it, so an expansion's piece count must
+# agree with what the expansion emits EXACTLY or the write runs off its array. Every
+# other expansion here states its count in a separate function and keeps the two in
+# step by hand, which is tractable for a lane loop and is not for a straight-line
+# sequence of forty pieces with two compile-time branches in it. So `dst` being nil
+# means counting: the same calls run, each advances the cursor, and none of them
+# allocates. The count is then correct by construction rather than by review.
+# ---
+# alloc:  backing allocator for piece operand arrays and temporaries
+# f:      the MIR function (for appending temporary vregs)
+# src:    the conversion being replaced (source of loc / inline_site)
+# dst:    the rebuilt instruction array, or nil while counting
+# cursor: next write index; advanced past every piece
+# fp_cls: the register class of the float bank, read off the conversion's float side
+# fail:   set when an allocation failed; the caller reports it once
+rec ConvEmit {
+    alloc:  *A.Allocator;
+    f:      *mir.MirFunction;
+    src:    *mir.MirInstr;
+    dst:    *mir.MirInstr;
+    cursor: *u32;
+    fp_cls: u32;
+    fail:   bool;
+}
+
+# the float-comparison condition a MIR_FCMP carries in `src_width`, for `lhs < rhs`
+val CONV_FCC_LT: u8 = 2;
+
+# emit (or count) one piece, carrying an independent source width
+#
+# The float conversions are the only pieces here whose operand widths differ on the two
+# sides, and a MIR_FCMP rides its condition code in the same field, so this is the one
+# emitter that does not derive `src_width` from `width`.
+fun cv_emit(cv: *ConvEmit, opcode: mir.MirOpcode, ops: *mir.MirOperand, nops: u32,
+            w: u8, sw: u8) {
+    val ci: u32 = @cv.cursor;
+    @cv.cursor = ci + 1;
+    if (cv.dst == nil || cv.fail) { ret; }
+    var arr: *mir.MirOperand = nil;
+    if (nops > 0) {
+        val res_a: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](cv.alloc, nops::usize);
+        if (R.is_err[*mir.MirOperand, str](res_a)) { cv.fail = true; ret; }
+        arr = R.unwrap_ok[*mir.MirOperand, str](res_a);
+        var j: u32 = 0;
+        for (j < nops) { arr[j] = ops[j]; j = j + 1; }
+    }
+    cv.dst[ci] = mir.instr(opcode, arr, nops, w, sw);
+    val p: *mir.MirInstr = ?cv.dst[ci];
+    p.loc         = cv.src.loc;
+    p.inline_site = cv.src.inline_site;
+}
+
+# emit `d = a op b`
+fun cv3(cv: *ConvEmit, opcode: mir.MirOpcode, d: mir.MirOperand, a: mir.MirOperand,
+        b: mir.MirOperand, w: u8, sw: u8) {
+    var ops: [3]mir.MirOperand;
+    ops[0] = d; ops[1] = a; ops[2] = b;
+    cv_emit(cv, opcode, ?ops[0], 3, w, sw);
+}
+
+# emit `d = op a`
+fun cv2(cv: *ConvEmit, opcode: mir.MirOpcode, d: mir.MirOperand, a: mir.MirOperand,
+        w: u8, sw: u8) {
+    var ops: [2]mir.MirOperand;
+    ops[0] = d; ops[1] = a;
+    cv_emit(cv, opcode, ?ops[0], 2, w, sw);
+}
+
+# a fresh temporary in the given class, or a placeholder while counting
+#
+# The placeholder is never written into a piece, because a nil `dst` writes no piece
+# at all; it exists so the counting walk takes the same branches as the emitting one.
+fun cv_tmp(cv: *ConvEmit, cls: u32) mir.MirOperand {
+    if (cv.dst == nil || cv.fail) { ret mir.op_vreg(mir.MIR_VREG_NIL); }
+    val r: R.Result[u32, str] = new_vreg(cv.alloc, cv.f, cls);
+    if (R.is_err[u32, str](r)) { cv.fail = true; ret mir.op_vreg(mir.MIR_VREG_NIL); }
+    ret mir.op_vreg(R.unwrap_ok[u32, str](r));
+}
+
+fun cv_gp(cv: *ConvEmit) mir.MirOperand { ret cv_tmp(cv, mir.REG_CLASS_GP); }
+fun cv_fp(cv: *ConvEmit) mir.MirOperand { ret cv_tmp(cv, cv.fp_cls); }
+
+# materialize a 32-bit constant into a fresh GP temporary
+#
+# Every constant this expansion needs is materialized rather than ridden as an operand
+# immediate, because the widths involved (a 32-bit mask, a shift count, a saturation
+# limit) do not all fit the immediate field of the target's ALU forms and a per-target
+# judgement about which do belongs nowhere near a target-blind pass.
+fun cv_const(cv: *ConvEmit, v: i64) mir.MirOperand {
+    val d: mir.MirOperand = cv_gp(cv);
+    cv2(cv, mir.MIR_MOV, d, mir.op_imm(v), 4, 4);
+    ret d;
+}
+
+# the exact f64 constant 2^32, built from integers
+#
+# A float CONSTANT would have to be materialized by the target's own constant path,
+# which on a machine with no 64-bit integer register cannot hand a 64-bit pattern to
+# the float bank at all - `fmv.d.x` is the RV64-only instruction this whole change
+# exists because RV32 lacks. Squaring `f64(65536)` needs no such transfer and is exact.
+fun cv_two32(cv: *ConvEmit) mir.MirOperand {
+    val k: mir.MirOperand = cv_const(cv, 65536);
+    val fk: mir.MirOperand = cv_fp(cv);
+    cv2(cv, mir.MIR_UI_TO_FP, fk, k, 8, 4);
+    val s: mir.MirOperand = cv_fp(cv);
+    cv3(cv, mir.MIR_FMUL, s, fk, fk, 8, 8);
+    ret s;
+}
+
+# `d = f64(hi:lo)`, correctly rounded, with `hi` read signed or unsigned
+#
+# Identity (1) of the header. Each lane converts exactly, the scale is exact, so the
+# single add is the only rounding.
+fun cv_pair_to_f64(cv: *ConvEmit, d: mir.MirOperand, two32: mir.MirOperand,
+                   hi: mir.MirOperand, lo: mir.MirOperand, signed_hi: bool) {
+    var hop: mir.MirOpcode = mir.MIR_UI_TO_FP;
+    if (signed_hi) { hop = mir.MIR_SI_TO_FP; }
+    val fhi: mir.MirOperand = cv_fp(cv);
+    cv2(cv, hop, fhi, hi, 8, 4);
+    val flo: mir.MirOperand = cv_fp(cv);
+    cv2(cv, mir.MIR_UI_TO_FP, flo, lo, 8, 4);
+    val t: mir.MirOperand = cv_fp(cv);
+    cv3(cv, mir.MIR_FMUL, t, fhi, two32, 8, 8);
+    cv3(cv, mir.MIR_FADD, d, t, flo, 8, 8);
+}
+
+# copy the conversion's wide integer lanes into fresh GP temporaries
+#
+# The lanes are read once into registers so the arithmetic below never has to care
+# whether the wide operand arrived as a lane-split vreg, an immediate the planner split
+# into lane immediates, or a physical register run. Two pieces, uniformly.
+fun cv_read_lanes(cv: *ConvEmit, plan: *LanePlan, op: *mir.MirOperand,
+                  lo: *mir.MirOperand, hi: *mir.MirOperand) {
+    @lo = cv_gp(cv);
+    cv2(cv, mir.MIR_MOV, @lo, lane_operand(plan, op, 0), 4, 4);
+    @hi = cv_gp(cv);
+    cv2(cv, mir.MIR_MOV, @hi, lane_operand(plan, op, 1), 4, 4);
+}
+
+# `dst = f32-or-f64(hi:lo)` for a 64-bit integer source
+#
+# Identities (1) and (2) of the header. `dw` is the destination float width.
+fun cv_int_to_fp(cv: *ConvEmit, plan: *LanePlan, mi: *mir.MirInstr) {
+    val signed: bool = mi.opcode == mir.MIR_SI_TO_FP;
+    val dw: u8 = mi.width;
+    val dst: mir.MirOperand = mi.operands[0];
+
+    var lo: mir.MirOperand;
+    var hi: mir.MirOperand;
+    cv_read_lanes(cv, plan, ?mi.operands[1], ?lo, ?hi);
+
+    if (dw == 8) {
+        val two32: mir.MirOperand = cv_two32(cv);
+        cv_pair_to_f64(cv, dst, two32, hi, lo, signed);
+        ret;
+    }
+
+    # f32 destination: reduce to at most 53 significant bits by rounding to odd, so the
+    # exact f64 conversion above can carry the value and the final narrowing is the
+    # only rounding.
+    val zero: mir.MirOperand = cv_const(cv, 0);
+    var sm: mir.MirOperand = zero;         # the sign mask, all ones for a negative input
+    var alo: mir.MirOperand = lo;
+    var ahi: mir.MirOperand = hi;
+    if (signed) {
+        sm = cv_gp(cv);
+        cv3(cv, mir.MIR_SHR_S, sm, hi, mir.op_imm(31), 4, 4);
+        val tl: mir.MirOperand = cv_gp(cv);
+        cv3(cv, mir.MIR_XOR, tl, lo, sm, 4, 4);
+        val th: mir.MirOperand = cv_gp(cv);
+        cv3(cv, mir.MIR_XOR, th, hi, sm, 4, 4);
+        val one_if_neg: mir.MirOperand = cv_gp(cv);
+        cv3(cv, mir.MIR_SUB, one_if_neg, zero, sm, 4, 4);
+        alo = cv_gp(cv);
+        cv3(cv, mir.MIR_ADD, alo, tl, one_if_neg, 4, 4);
+        val cy: mir.MirOperand = cv_gp(cv);
+        cv3(cv, mir.MIR_CMP_LT_U, cy, alo, one_if_neg, 4, 4);
+        ahi = cv_gp(cv);
+        cv3(cv, mir.MIR_ADD, ahi, th, cy, 4, 4);
+    }
+
+    val m11: mir.MirOperand = cv_const(cv, 2047);
+    val q: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_AND, q, alo, m11, 4, 4);
+    val sticky: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_CMP_NE, sticky, q, zero, 4, 4);
+    val r1: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_SHR_U, r1, alo, mir.op_imm(11), 4, 4);
+    val r2: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_SHL, r2, ahi, mir.op_imm(21), 4, 4);
+    val r3: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_OR, r3, r1, r2, 4, 4);
+    val rlo: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_OR, rlo, r3, sticky, 4, 4);
+    val rhi: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_SHR_U, rhi, ahi, mir.op_imm(11), 4, 4);
+
+    # the reduction applies only above 2^53, which is exactly `hi >= 2^21`
+    val h21: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_SHR_U, h21, ahi, mir.op_imm(21), 4, 4);
+    val big: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_CMP_NE, big, h21, zero, 4, 4);
+    val bm: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_SUB, bm, zero, big, 4, 4);
+    val nbm: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_XOR, nbm, bm, mir.op_imm(-1), 4, 4);
+
+    val slo: mir.MirOperand = cv_gp(cv);
+    val slo_a: mir.MirOperand = cv_gp(cv);
+    val slo_b: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_AND, slo_a, rlo, bm, 4, 4);
+    cv3(cv, mir.MIR_AND, slo_b, alo, nbm, 4, 4);
+    cv3(cv, mir.MIR_OR, slo, slo_a, slo_b, 4, 4);
+    val shi: mir.MirOperand = cv_gp(cv);
+    val shi_a: mir.MirOperand = cv_gp(cv);
+    val shi_b: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_AND, shi_a, rhi, bm, 4, 4);
+    cv3(cv, mir.MIR_AND, shi_b, ahi, nbm, 4, 4);
+    cv3(cv, mir.MIR_OR, shi, shi_a, shi_b, 4, 4);
+
+    # the scale that restores the discarded weight, carrying the sign: 1 or 2048,
+    # negated when the input was
+    val sk: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_AND, sk, bm, m11, 4, 4);
+    var sc: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_ADD, sc, sk, mir.op_imm(1), 4, 4);
+    if (signed) {
+        val sx: mir.MirOperand = cv_gp(cv);
+        cv3(cv, mir.MIR_XOR, sx, sc, sm, 4, 4);
+        val sn: mir.MirOperand = cv_gp(cv);
+        cv3(cv, mir.MIR_SUB, sn, sx, sm, 4, 4);
+        sc = sn;
+    }
+    val fsc: mir.MirOperand = cv_fp(cv);
+    cv2(cv, mir.MIR_SI_TO_FP, fsc, sc, 8, 4);
+
+    val two32: mir.MirOperand = cv_two32(cv);
+    val d: mir.MirOperand = cv_fp(cv);
+    cv_pair_to_f64(cv, d, two32, shi, slo, false);
+    val p: mir.MirOperand = cv_fp(cv);
+    cv3(cv, mir.MIR_FMUL, p, d, fsc, 8, 8);
+    cv2(cv, mir.MIR_FP_TRUNC, dst, p, 4, 8);
+}
+
+# `(hi, lo) = trunc(x)` for a non-negative `x`, saturating exactly as the native
+# 32-bit conversion does in each lane
+#
+# Identity (3) of the header.
+fun cv_f64_to_pair(cv: *ConvEmit, two32: mir.MirOperand, inv32: mir.MirOperand,
+                   x: mir.MirOperand, hi: mir.MirOperand, lo: mir.MirOperand) {
+    val u: mir.MirOperand = cv_fp(cv);
+    cv3(cv, mir.MIR_FMUL, u, x, inv32, 8, 8);
+    cv2(cv, mir.MIR_FP_TO_UI, hi, u, 4, 8);
+    val fh: mir.MirOperand = cv_fp(cv);
+    cv2(cv, mir.MIR_UI_TO_FP, fh, hi, 8, 4);
+    val frac: mir.MirOperand = cv_fp(cv);
+    cv3(cv, mir.MIR_FSUB, frac, u, fh, 8, 8);
+    val rem: mir.MirOperand = cv_fp(cv);
+    cv3(cv, mir.MIR_FMUL, rem, frac, two32, 8, 8);
+    cv2(cv, mir.MIR_FP_TO_UI, lo, rem, 4, 8);
+}
+
+# `dst = trunc(x)` into a 64-bit lane pair
+#
+# Identities (3) and (4) of the header.
+fun cv_fp_to_int(cv: *ConvEmit, plan: *LanePlan, mi: *mir.MirInstr) {
+    val signed: bool = mi.opcode == mir.MIR_FP_TO_SI;
+    val dlo: mir.MirOperand = lane_operand(plan, ?mi.operands[0], 0);
+    val dhi: mir.MirOperand = lane_operand(plan, ?mi.operands[0], 1);
+
+    # a float side that is not already in a register (a converted CONSTANT) is read into
+    # one first, so the arithmetic below names a value the float unit can reread
+    var x: mir.MirOperand = mi.operands[1];
+    if (x.kind != mir.MIR_OP_VREG) {
+        val xr: mir.MirOperand = cv_fp(cv);
+        cv2(cv, mir.MIR_MOV, xr, x, mi.src_width, mi.src_width);
+        x = xr;
+    }
+    if (mi.src_width == 4) {
+        val xe: mir.MirOperand = cv_fp(cv);
+        cv2(cv, mir.MIR_FP_EXT, xe, x, 8, 4);
+        x = xe;
+    }
+
+    val two32: mir.MirOperand = cv_two32(cv);
+    val one: mir.MirOperand = cv_const(cv, 1);
+    val fone: mir.MirOperand = cv_fp(cv);
+    cv2(cv, mir.MIR_UI_TO_FP, fone, one, 8, 4);
+    val inv32: mir.MirOperand = cv_fp(cv);
+    cv3(cv, mir.MIR_FDIV, inv32, fone, two32, 8, 8);
+
+    if (!signed) {
+        cv_f64_to_pair(cv, two32, inv32, x, dhi, dlo);
+        ret;
+    }
+
+    val zero: mir.MirOperand = cv_const(cv, 0);
+    val fzero: mir.MirOperand = cv_fp(cv);
+    cv2(cv, mir.MIR_UI_TO_FP, fzero, zero, 8, 4);
+    val neg: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_FCMP, neg, x, fzero, 8, CONV_FCC_LT);
+    val dbl: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_SHL, dbl, neg, mir.op_imm(1), 4, 4);
+    val sgn: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_SUB, sgn, one, dbl, 4, 4);
+    val fsgn: mir.MirOperand = cv_fp(cv);
+    cv2(cv, mir.MIR_SI_TO_FP, fsgn, sgn, 8, 4);
+    val ax: mir.MirOperand = cv_fp(cv);
+    cv3(cv, mir.MIR_FMUL, ax, x, fsgn, 8, 8);
+
+    val uh: mir.MirOperand = cv_gp(cv);
+    val ul: mir.MirOperand = cv_gp(cv);
+    cv_f64_to_pair(cv, two32, inv32, ax, uh, ul);
+
+    # clamp the magnitude to 2^63 - 1 when positive and 2^63 when negative, which is
+    # what puts NaN and +inf on INT64_MAX and -inf on INT64_MIN
+    val nm: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_SUB, nm, zero, neg, 4, 4);
+    val lim: mir.MirOperand = cv_const(cv, 0x7FFFFFFF);
+    val mhi: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_ADD, mhi, lim, neg, 4, 4);
+    val mlo: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_XOR, mlo, nm, mir.op_imm(-1), 4, 4);
+
+    val g1: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_CMP_LT_U, g1, mhi, uh, 4, 4);
+    val eqh: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_CMP_EQ, eqh, uh, mhi, 4, 4);
+    val g2: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_CMP_LT_U, g2, mlo, ul, 4, 4);
+    val ge: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_AND, ge, eqh, g2, 4, 4);
+    val over: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_OR, over, g1, ge, 4, 4);
+    val om: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_SUB, om, zero, over, 4, 4);
+    val nom: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_XOR, nom, om, mir.op_imm(-1), 4, 4);
+
+    val ch_a: mir.MirOperand = cv_gp(cv);
+    val ch_b: mir.MirOperand = cv_gp(cv);
+    val ch: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_AND, ch_a, mhi, om, 4, 4);
+    cv3(cv, mir.MIR_AND, ch_b, uh, nom, 4, 4);
+    cv3(cv, mir.MIR_OR, ch, ch_a, ch_b, 4, 4);
+    val cl_a: mir.MirOperand = cv_gp(cv);
+    val cl_b: mir.MirOperand = cv_gp(cv);
+    val cl: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_AND, cl_a, mlo, om, 4, 4);
+    cv3(cv, mir.MIR_AND, cl_b, ul, nom, 4, 4);
+    cv3(cv, mir.MIR_OR, cl, cl_a, cl_b, 4, 4);
+
+    # negate when the input was negative: (v ^ mask) - mask over the pair
+    val th: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_XOR, th, ch, nm, 4, 4);
+    val tl: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_XOR, tl, cl, nm, 4, 4);
+    cv3(cv, mir.MIR_ADD, dlo, tl, neg, 4, 4);
+    val cy: mir.MirOperand = cv_gp(cv);
+    cv3(cv, mir.MIR_CMP_LT_U, cy, dlo, neg, 4, 4);
+    cv3(cv, mir.MIR_ADD, dhi, th, cy, 4, 4);
+}
+
+# whether an opcode converts between an integer and a float
+fun is_int_fp_conv(op: mir.MirOpcode) bool {
+    ret op == mir.MIR_SI_TO_FP || op == mir.MIR_UI_TO_FP ||
+        op == mir.MIR_FP_TO_SI || op == mir.MIR_FP_TO_UI;
+}
+
+# the operand index of a conversion's FLOAT side, or -1 when the opcode has none
+fun conv_float_operand(op: mir.MirOpcode) i32 {
+    if (op == mir.MIR_SI_TO_FP || op == mir.MIR_UI_TO_FP) { ret 0; }
+    if (op == mir.MIR_FP_TO_SI || op == mir.MIR_FP_TO_UI) { ret 1; }
+    ret -1;
+}
+
+# the byte width of a conversion's INTEGER side
+#
+# Which of the two widths is the integer one depends on the direction, and reading the
+# wrong one would ask this pass to legalize on the float side's width.
+fun conv_int_width(mi: *mir.MirInstr) u8 {
+    if (mi.opcode == mir.MIR_SI_TO_FP || mi.opcode == mir.MIR_UI_TO_FP) { ret mi.src_width; }
+    ret mi.width;
+}
+
+# whether this conversion is one this pass open-codes: an integer side wider than the
+# native ALU, on a machine that has a float bank to build the expansion out of
+#
+# THE FLOAT BANK IS THE CONDITION, not the target name and not the operand's class. The
+# expansion is built from native float instructions, so a machine whose floats are
+# integer lane groups has nothing to build it from and keeps the refusal. Asking the
+# MACHINE rather than the instruction's float operand is what admits the shape whose
+# float side is a constant, which has no float vreg to ask.
+fun conv_is_wide(mach: *Machine, mi: *mir.MirInstr) bool {
+    if (!is_int_fp_conv(mi.opcode)) { ret false; }
+    if (mi.operand_count < 2) { ret false; }
+    if (mach.fp_class == FP_CLASS_NONE) { ret false; }
+    ret conv_int_width(mi) > mach.lane_width;
+}
+
+# build the emit context for a conversion, or report why the shape is not one this
+# expansion handles
+fun conv_prepare(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *mir.MirInstr,
+                 dst: *mir.MirInstr, cursor: *u32, out: *ConvEmit) R.Result[bool, str] {
+    # the identities are written for one 64-bit value in two native lanes, and a
+    # machine with a float bank and a narrower ALU than four bytes would need different
+    # ones rather than a longer loop of these
+    if (plan.lane_width != 4 || conv_int_width(mi) != 8) {
+        ret R.err[bool, str](unsupported_message(alloc, mi.opcode, mi.width));
+    }
+    val ii: u32 = 1 - (conv_float_operand(mi.opcode)::u32);
+    if (mi.opcode == mir.MIR_FP_TO_SI || mi.opcode == mir.MIR_FP_TO_UI) {
+        val d: *mir.MirOperand = ?mi.operands[0];
+        if (d.kind != mir.MIR_OP_VREG || plan.lane_base[d.vreg] == LANE_NONE) {
+            ret R.err[bool, str](unsupported_message(alloc, mi.opcode, mi.width));
+        }
+    } or {
+        if (!operand_is_lane_ready(plan, ?mi.operands[ii], 2)) {
+            ret R.err[bool, str](unsupported_message(alloc, mi.opcode, mi.width));
+        }
+    }
+    out.alloc  = alloc;
+    out.f      = f;
+    out.src    = mi;
+    out.dst    = dst;
+    out.cursor = cursor;
+    out.fp_cls = plan.mach.fp_class;
+    out.fail   = false;
+    ret R.ok[bool, str](true);
+}
+
+# run a conversion expansion, emitting into `dst` or counting when `dst` is nil
+fun conv_run(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *mir.MirInstr,
+             dst: *mir.MirInstr, cursor: *u32) R.Result[bool, str] {
+    var cv: ConvEmit;
+    val pr: R.Result[bool, str] = conv_prepare(alloc, plan, f, mi, dst, cursor, ?cv);
+    if (R.is_err[bool, str](pr)) { ret pr; }
+    if (mi.opcode == mir.MIR_SI_TO_FP || mi.opcode == mir.MIR_UI_TO_FP) {
+        cv_int_to_fp(?cv, plan, mi);
+    } or {
+        cv_fp_to_int(?cv, plan, mi);
+    }
+    if (cv.fail) { ret R.err[bool, str]("legalize: out of memory expanding a wide float conversion"); }
+    ret R.ok[bool, str](true);
+}
+
+# the piece count of a conversion expansion: the same walk with nothing written
+fun conv_piece_count(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction,
+                     mi: *mir.MirInstr) R.Result[u32, str] {
+    var n: u32 = 0;
+    val r: R.Result[bool, str] = conv_run(alloc, plan, f, mi, nil, ?n);
+    if (R.is_err[bool, str](r)) { ret R.err[u32, str](R.unwrap_err[bool, str](r)); }
+    ret R.ok[u32, str](n);
+}
+
 # emit one native three-operand (or two-operand) binary piece `d = a op b`
 fun emit_bin(alloc: *A.Allocator, dst: *mir.MirInstr, cursor: *u32, src: *mir.MirInstr,
              opcode: mir.MirOpcode, d: mir.MirOperand, a: mir.MirOperand, b: mir.MirOperand, w: u8) R.Result[bool, str] {
@@ -3336,15 +3905,14 @@ fun unsupported_family(op: mir.MirOpcode) str {
     if (op == mir.MIR_GEP || op == mir.MIR_ALLOCA) {
         ret "legalize: materializing an address wider than one register is not yet legalized on this target";
     }
-    # A CONVERSION IS NOT A LANE-WISE OPERATION, so this pass has no expansion for one
-    # and never will have the same one it has for arithmetic: `(hi, lo) -> f64` is a
-    # single rounding of the combined value, not two independent conversions recombined
-    # afterwards. It is named here rather than falling into the generic prose because
-    # the generic message lands on whatever op consumes the conversion's result - a
-    # later `and`, say - and sends the reader to the wrong instruction entirely.
-    if (op == mir.MIR_SI_TO_FP || op == mir.MIR_UI_TO_FP ||
-        op == mir.MIR_FP_TO_SI || op == mir.MIR_FP_TO_UI) {
-        ret "legalize: converting between a float and an integer wider than one register needs a soft-float helper this target does not have (see briar-systems/mach#2860)";
+    # A CONVERSION IS NOT A LANE-WISE OPERATION, and the open-coded expansion above is
+    # built entirely from native FLOAT instructions, so a machine whose floats ride
+    # integer lane groups (one register class, no float bank) has nothing to build it
+    # from and lands here. It is named rather than falling into the generic prose
+    # because the generic message lands on whatever op consumes the conversion's result
+    # - a later `and`, say - and sends the reader to the wrong instruction entirely.
+    if (is_int_fp_conv(op)) {
+        ret "legalize: converting between a float and an integer wider than one register needs a float register bank this target does not have";
     }
     ret "legalize: operation wider than the target ALU is unsupported";
 }
@@ -3365,6 +3933,10 @@ fun t_mach(maw: u8, ptr: u8) Machine {
     m.mul_hi     = 0;
     m.stage_lo   = 6;
     m.stage_hi   = 7;
+    # the 6502 shape again: one register class, so a float rides the integer ALU. the
+    # conversion tests set this themselves, which is also what makes them a control on
+    # every other test here staying on the no-float-bank path it was written for
+    m.fp_class   = FP_CLASS_NONE;
     ret m;
 }
 
@@ -4626,5 +5198,143 @@ test "mach.lang.be.codegen.legalize:a_float_is_not_split_into_integer_lanes" {
     if (R.is_err[bool, str](sr)) { ret 1; }
     if (sb.instr_count != 8)     { ret 1; }  # eight byte lanes
     if (sf.vreg_count <= 2)      { ret 1; }
+    ret 0;
+}
+
+# test-only: true when some piece of the block still names an integer wider than one
+# lane on either side of a float conversion
+#
+# This is the acceptance criterion of #2860 stated over the IR: an RV64-only `fcvt.d.l`
+# exists only because a conversion carrying an 8-byte integer reached the encoder, so a
+# block with no such piece cannot produce one whatever the encoder does next.
+fun t_has_wide_conv(b: *mir.MirBlock, lw: u8) bool {
+    var i: u32 = 0;
+    for (i < b.instr_count) {
+        val mi: *mir.MirInstr = ?b.instrs[i];
+        if (is_int_fp_conv(mi.opcode) && conv_int_width(mi) > lw) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# test-only: a one-instruction function holding `opcode` over an f64 and an i64, with
+# the float side in a float-bank class and the integer side in GP
+fun t_conv_fn(alloc: *A.Allocator, f: *mir.MirFunction, b: *mir.MirBlock,
+              opcode: mir.MirOpcode, fp_cls: u32, dw: u8, sw: u8) {
+    # v0 the destination, v1 the source, v2 a second integer the source is defined by
+    t_vregs(alloc, f, 3);
+    val fp_is_dst: bool = opcode == mir.MIR_SI_TO_FP || opcode == mir.MIR_UI_TO_FP;
+    if (fp_is_dst) { f.vregs[0].class = fp_cls; }
+    or             { f.vregs[1].class = fp_cls; }
+    t_block(alloc, b, 2);
+    # the integer side must be a value some instruction defines, or the planner has no
+    # width to plan its lanes from
+    var mv: [2]mir.MirOperand;
+    mv[0] = mir.op_vreg(2); mv[1] = mir.op_imm(0x0102030405060708);
+    t_instr(alloc, b, 0, mir.MIR_MOV, ?mv[0], 2, 8);
+    var cv: [2]mir.MirOperand;
+    cv[0] = mir.op_vreg(0);
+    cv[1] = mir.op_vreg(1);
+    if (fp_is_dst) { cv[1] = mir.op_vreg(2); }
+    or             { cv[0] = mir.op_vreg(2); }
+    t_instr(alloc, b, 1, opcode, ?cv[0], 2, dw);
+    b.instrs[1].src_width = sw;
+    f.blocks = b; f.block_count = 1;
+}
+
+# riscv32 (#2860): a conversion between an f64 and a 64-bit integer is OPEN-CODED into
+# native-width pieces, and nothing carrying a wide integer survives to the encoder
+#
+# WHY THIS TEST EXISTS. RV32 has no `fcvt.d.l` / `fcvt.l.d`, because the `L` selector
+# names a 64-bit GP operand and no RV32 register is that wide. The conversion is also
+# the one instruction with a value in EACH register bank, so the float-bank exclusion
+# that keeps an `f64` whole used to exclude the conversion too - leaving a wide integer
+# side the planner had already split into lanes, naming vregs nothing defined.
+#
+# The assertion is not "it expanded" but "no piece names a wide integer across a float
+# conversion", which is the property the missing instruction turns on: an RV64-only
+# `fcvt` is reachable only from a conversion carrying an 8-byte integer.
+test "mach.lang.be.codegen.legalize:open_codes_a_wide_int_float_conversion" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val fp: u32 = mir.REG_CLASS_GP + 1;
+    var mach: Machine = t_mach(4, 4);
+    mach.fp_class = fp;
+
+    # i64 -> f64
+    var f1: mir.MirFunction;
+    var b1: mir.MirBlock;
+    t_conv_fn(?alloc, ?f1, ?b1, mir.MIR_SI_TO_FP, fp, 8, 8);
+    val r1: R.Result[bool, str] = legalize_function(?alloc, ?mach, ?f1);
+    if (R.is_err[bool, str](r1))          { ret 1; }
+    if (t_has_wide_conv(?b1, 4))          { ret 1; }
+    if (b1.instr_count != 11)             { ret 1; }  # two lane moves plus nine pieces
+    # the f64 destination stays whole: it rides the float bank and was never lane-split
+    if (f1.vregs[0].class != fp)          { ret 1; }
+
+    # f64 -> u64
+    var f2: mir.MirFunction;
+    var b2: mir.MirBlock;
+    t_conv_fn(?alloc, ?f2, ?b2, mir.MIR_FP_TO_UI, fp, 8, 8);
+    val r2: R.Result[bool, str] = legalize_function(?alloc, ?mach, ?f2);
+    if (R.is_err[bool, str](r2))          { ret 1; }
+    if (t_has_wide_conv(?b2, 4))          { ret 1; }
+    if (b2.instr_count != 14)             { ret 1; }  # two lane moves plus twelve pieces
+
+    # f64 -> i64 costs the magnitude, the clamp and the negate on top of that
+    var f3: mir.MirFunction;
+    var b3: mir.MirBlock;
+    t_conv_fn(?alloc, ?f3, ?b3, mir.MIR_FP_TO_SI, fp, 8, 8);
+    val r3: R.Result[bool, str] = legalize_function(?alloc, ?mach, ?f3);
+    if (R.is_err[bool, str](r3))          { ret 1; }
+    if (t_has_wide_conv(?b3, 4))          { ret 1; }
+    if (b3.instr_count != 43)             { ret 1; }
+
+    # i64 -> f32 pays the round-to-odd reduction and the sign fold on top of i64 -> f64
+    var f4: mir.MirFunction;
+    var b4: mir.MirBlock;
+    t_conv_fn(?alloc, ?f4, ?b4, mir.MIR_SI_TO_FP, fp, 4, 8);
+    val r4: R.Result[bool, str] = legalize_function(?alloc, ?mach, ?f4);
+    if (R.is_err[bool, str](r4))          { ret 1; }
+    if (t_has_wide_conv(?b4, 4))          { ret 1; }
+    if (b4.instr_count != 44)             { ret 1; }
+
+    # CONTROL: the identical conversion on a machine with NO float bank is still
+    # REFUSED, because the expansion is built from native float instructions such a
+    # target does not have. Without this the test would prove only that the pass stopped
+    # refusing, not that it refuses where it still must.
+    var f5: mir.MirFunction;
+    var b5: mir.MirBlock;
+    t_conv_fn(?alloc, ?f5, ?b5, mir.MIR_SI_TO_FP, mir.REG_CLASS_GP, 8, 8);
+    var m8: Machine = t_mach(1, 2);
+    val r5: R.Result[bool, str] = legalize_function(?alloc, ?m8, ?f5);
+    if (R.is_ok[bool, str](r5))           { ret 1; }
+    ret 0;
+}
+
+# riscv32 (#2860): a wide conversion is INERT on a target whose ALU already covers it
+#
+# The four arms added for rv32 must not perturb any 64-bit target, whose objects this
+# change is required to leave byte-identical. `max_alu_width` 8 makes the integer side
+# native, so the gate never admits the conversion and the function is returned untouched.
+test "mach.lang.be.codegen.legalize:a_wide_conversion_is_inert_on_a_wide_alu" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val fp: u32 = mir.REG_CLASS_GP + 1;
+
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    t_conv_fn(?alloc, ?f, ?b, mir.MIR_SI_TO_FP, fp, 8, 8);
+    val before_ptr:   *mir.MirInstr = b.instrs;
+    val before_count: u32           = b.instr_count;
+    val before_vregs: u32           = f.vreg_count;
+
+    var mach: Machine = t_mach(8, 8);
+    mach.fp_class = fp;
+    val r: R.Result[bool, str] = legalize_function(?alloc, ?mach, ?f);
+    if (R.is_err[bool, str](r))        { ret 1; }
+    if (b.instrs != before_ptr)        { ret 1; }
+    if (b.instr_count != before_count) { ret 1; }
+    if (f.vreg_count != before_vregs)  { ret 1; }
     ret 0;
 }
