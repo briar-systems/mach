@@ -38,8 +38,9 @@ use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.session;
 use mach.lang.source;
-use mach.lang.spirvop;
+use isa: mach.lang.target.isa;
 use target:  mach.lang.target.resolved;
+use mach.lang.float;
 use mach.lang.type;
 
 
@@ -384,6 +385,10 @@ pub fun init_context(
     comptime.set_field_resolver(ctx, resolve_field_member::*u8, lc::ptr);
     # install the type-query resolver so a `$is_record` / `$type_name` gate folds here.
     comptime.set_type_query_resolver(ctx, resolve_type_query::*u8, lc::ptr);
+    # and the layout resolver, so a `$size_of` / `$align_of` gate folds here too
+    # (#2857) - a chain whose arm is selected at monomorphization never reaches
+    # sema's resolver.
+    comptime.set_layout_resolver(ctx, resolve_layout_intrinsic::*u8, lc::ptr);
     # install the identifier-binding resolver so a gate folded here reads the
     # declaration each leaf resolves to rather than its spelling (#2764).
     comptime.set_ident_resolver(ctx, comptime_ident_is_runtime::*u8, lc::ptr);
@@ -470,6 +475,7 @@ pub fun dnit_context(lc: *LowerContext) {
         comptime.set_type_resolver(lc.ctx, nil, nil);
         comptime.set_field_resolver(lc.ctx, nil, nil);
         comptime.set_type_query_resolver(lc.ctx, nil, nil);
+        comptime.set_layout_resolver(lc.ctx, nil, nil);
         comptime.set_ident_resolver(lc.ctx, nil, nil);
     }
     map.dnit[intern.StrId, LocalBinding](?lc.local_names);
@@ -673,6 +679,75 @@ pub fun resolve_type_query(data: ptr, tid: u32, which: u8) R.Result[O.Option[com
     val lc: *LowerContext = data::*LowerContext;
     if (lc == nil) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
     ret infer.answer_type_query(lc.s, tid, which);
+}
+
+# the layout resolver lowering installs so a `$size_of` / `$align_of` / `$length_of`
+# gate folds here as well as in sema (#2857, #2875)
+#
+# LOWERING NEEDS ITS OWN because a `$if` chain does not always fold in sema: a chain
+# gated on a comptime value parameter, or one inside a generic body, has its arm
+# selected here at monomorphization instead - which is why lowering already installs
+# a type-query resolver beside this one. A layout gate reaching that point with no
+# resolver was refused outright, so the sema-side fix alone left the generic case
+# broken.
+#
+# The measurement is `ir_type.byte_size` / `byte_align` over the IR type, the same
+# authority `lower_comptime_intrinsic` reads for a VALUE position two files over.
+# That is what keeps a size folded in a gate equal to the same size folded in an
+# expression: sema's `type_extent` and this both resolve through the one session
+# layout entry (see the note at `lower_type`), so the three cannot disagree.
+#
+# `$length_of` counts elements rather than measuring storage, so it is answered from
+# the SEMA type's `element_count` and never reaches the IR: an element count is a
+# property of the type spelling and is the same on every target, which is exactly
+# what makes reading it here equal to sema's answer.
+#
+# `$offset_of` answers none: it takes a field as its second argument, which this
+# signature does not carry, and sema does not fold it in a gate either.
+# ---
+# data: the erased *LowerContext
+# eid:  the intrinsic call expression, as a raw id
+# ret:  ok(some(v)) measured; ok(none) not answerable here; err on a real failure
+pub fun resolve_layout_intrinsic(data: ptr, eid: u32) R.Result[O.Option[comptime.CTValue], str] {
+    val lc: *LowerContext = data::*LowerContext;
+    if (lc == nil) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
+    val e: id.ExprId = eid::id.ExprId;
+    val src: str = module_source(lc);
+    val is_size:  bool = comptime.is_size_of_call(lc.a, src, e);
+    val is_align: bool = comptime.is_align_of_call(lc.a, src, e);
+    val is_len:   bool = comptime.is_length_of_call(lc.a, src, e);
+    if (!is_size && !is_align && !is_len) {
+        ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]());
+    }
+
+    val arg: id.ExprId = comptime.layout_intrinsic_type_arg(lc.a, e);
+    if (arg == id.EXPR_NIL) {
+        ret R.err[O.Option[comptime.CTValue], str]("a layout intrinsic takes one type argument");
+    }
+    # secret-stripped for the reason every other shape decision here is (#2297):
+    # `^T` occupies exactly `T`'s storage.
+    val op_ty: type.TypeId = type.strip_secret(?lc.s.types, expr_type_of(lc, arg));
+
+    if (is_len) {
+        # the count is read after substitution, so `$length_of(T)` inside a
+        # monomorphized body counts the instance's type argument.
+        val n_opt: O.Option[u32] = type.element_count(?lc.s.types, substitute_type(lc, op_ty));
+        if (O.is_none[u32](n_opt)) {
+            ret R.err[O.Option[comptime.CTValue], str]("`$length_of` expects a fixed array or a vector");
+        }
+        ret R.ok[O.Option[comptime.CTValue], str](
+            O.some[comptime.CTValue](comptime.ct_uint(O.unwrap[u32](n_opt)::u64)));
+    }
+
+    val res_ir: R.Result[ir_type.IrTypeId, str] = lower_type(lc, op_ty);
+    if (R.is_err[ir_type.IrTypeId, str](res_ir)) {
+        ret R.err[O.Option[comptime.CTValue], str](R.unwrap_err[ir_type.IrTypeId, str](res_ir));
+    }
+    val op_ir: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](res_ir);
+
+    var n: u32 = ir_type.byte_size(?lc.m.types, op_ir, lc.tgt);
+    if (is_align) { n = ir_type.byte_align(?lc.m.types, op_ir, lc.tgt); }
+    ret R.ok[O.Option[comptime.CTValue], str](O.some[comptime.CTValue](comptime.ct_uint(n::u64)));
 }
 
 # the field-descriptor member resolver lowering installs on every ComptimeCtx it
@@ -1316,19 +1391,17 @@ pub fun lower_type(lc: *LowerContext, tid: type.TypeId) R.Result[ir_type.IrTypeI
         ret ir_type.intern_vector(?lc.m.types, R.unwrap_ok[ir_type.IrTypeId, str](res_elem), t.data.vector.lanes);
     }
 
-    # an image / sampler handle lowers to an IR handle carrying the same operands
-    # (#2794). Every one is copied across rather than any being re-derived: the back
-    # end declares the SPIR-V type from these fields, and a field defaulted here
-    # would produce a valid module naming a different image.
-    if (k == type.TYPE_IMAGE) {
-        var img: ir_type.IrTypeImage;
-        img.form    = t.data.image.form;
-        img.sampled = t.data.image.sampled;
-        img.dim     = t.data.image.dim;
-        img.depth   = t.data.image.depth;
-        img.arrayed = t.data.image.arrayed;
-        img.ms      = t.data.image.ms;
-        ret ir_type.intern_image(?lc.m.types, img);
+    # a handle lowers to an IR handle carrying the same constructor and the same
+    # operands (#2888). Every one is copied across and none is read: the back end
+    # mints its type from these words, and a word defaulted here would produce a
+    # valid module naming a different thing than the declaration did.
+    #
+    # A composed operand is another handle, and its SEMANTIC TypeId is rewritten to
+    # the IR one here, which is the only reading this layer does: an id means
+    # nothing across universes, and leaving the semantic one in place would hand the
+    # back end a number belonging to a table it cannot see.
+    if (k == type.TYPE_HANDLE) {
+        ret lower_handle_type(lc, rtid, t);
     }
 
     # records, unions, and generic instances all lower to an IR aggregate of their
@@ -1349,6 +1422,54 @@ pub fun lower_type(lc: *LowerContext, tid: type.TypeId) R.Result[ir_type.IrTypeI
     # generic params / errors that survived to here lower to a pointer-width
     # opaque slot so storage sizing still works.
     ret ir_type.intern_ptr(?lc.m.types);
+}
+
+# lower a handle's constructor and operands into an IR handle type
+#
+# The composed operands are the only ones touched: a handle that names another is
+# carried as a TypeId, and a TypeId is meaningless outside the universe that minted
+# it, so each is lowered and the IR id written in its place.
+#
+# WHICH POSITIONS THOSE ARE COMES FROM THE TARGET'S OWN ROW, never from the word
+# sitting there. A literal operand is an ordinary small number and would collide
+# with a TypeId constantly, so a reader that guessed by value would lower a
+# dimensionality as if it were a composed type.
+# ---
+# lc:   the lowering context
+# rtid: the resolved semantic TypeId
+# t:    the semantic type record
+# ret:  the IR handle type id, or an allocation error
+fun lower_handle_type(lc: *LowerContext, rtid: type.TypeId, t: *type.Type) R.Result[ir_type.IrTypeId, str] {
+    val n: u32 = t.data.handle.ops_len;
+    var ops: *ir_type.IrTypeId = nil;
+    if (n > 0) {
+        val r_ops: R.Result[*ir_type.IrTypeId, str] = A.allocate[ir_type.IrTypeId](lc.s.alloc, n::usize);
+        if (R.is_err[*ir_type.IrTypeId, str](r_ops)) {
+            ret R.err[ir_type.IrTypeId, str](R.unwrap_err[*ir_type.IrTypeId, str](r_ops));
+        }
+        ops = R.unwrap_ok[*ir_type.IrTypeId, str](r_ops);
+    }
+
+    val td: *isa.TypeDef = isa.type_def_by_tag(lc.tgt.isa.defs, t.data.handle.ctor);
+
+    var i: u32 = 0;
+    for (i < n) {
+        val w: u32 = type.handle_operand(?lc.s.types, rtid, i);
+        ops[i] = w::ir_type.IrTypeId;
+        if (td != nil && i < td.arity && td.operands[i] != isa.TYPE_OPERAND_WORD) {
+            val inner: R.Result[ir_type.IrTypeId, str] = lower_type(lc, w::type.TypeId);
+            if (R.is_err[ir_type.IrTypeId, str](inner)) {
+                if (ops != nil) { A.deallocate[ir_type.IrTypeId](lc.s.alloc, ops, n::usize); }
+                ret inner;
+            }
+            ops[i] = R.unwrap_ok[ir_type.IrTypeId, str](inner);
+        }
+        i = i + 1;
+    }
+
+    val res: R.Result[ir_type.IrTypeId, str] = ir_type.intern_handle(?lc.m.types, t.data.handle.ctor, ops, n);
+    if (ops != nil) { A.deallocate[ir_type.IrTypeId](lc.s.alloc, ops, n::usize); }
+    ret res;
 }
 
 # lower a nominal (rec / uni) semantic type to an IR struct of its lowered field
@@ -1508,6 +1629,34 @@ pub fun expr_type_of(lc: *LowerContext, eid: id.ExprId) type.TypeId {
     if (eid == id.EXPR_NIL)          { ret type.TYPE_NIL; }
     if (eid::usize >= lc.a.expr_len) { ret type.TYPE_NIL; }
     ret lc.sema_result.expr_type[eid];
+}
+
+# the float width sema fixed for an expression, for handing to the comptime
+# evaluator so a folded float constant rounds at its declared type (#2918)
+#
+# Lowering is the pass that HAS the answer: the alias, the generic substitution
+# and the coercion are all resolved by the time it runs, so it reads the checked
+# type rather than a spelling. FLOAT_W_NONE for a non-float expression.
+# ---
+# lc:  the context
+# eid: AST ExprId
+# ret: the expression's float width, or FLOAT_W_NONE
+pub fun expr_float_width(lc: *LowerContext, eid: id.ExprId) float.FloatWidth {
+    ret float_width_of_type(lc, expr_type_of(lc, eid));
+}
+
+# the float width of a semantic type, under the active generic substitution and
+# through the secret `^` wrapper: a `^f32` rounds at f32 like any other f32
+# ---
+# lc:  the context
+# tid: the semantic type
+# ret: the type's float width, or FLOAT_W_NONE
+pub fun float_width_of_type(lc: *LowerContext, tid: type.TypeId) float.FloatWidth {
+    if (tid == type.TYPE_NIL) { ret float.FLOAT_W_NONE; }
+    val ct: type.TypeId = type.strip_secret(?lc.s.types, substitute_type(lc, tid));
+    val opt_t: O.Option[*type.Type] = type.get(?lc.s.types, ct);
+    if (O.is_none[*type.Type](opt_t)) { ret float.FLOAT_W_NONE; }
+    ret type.float_width_of(O.unwrap[*type.Type](opt_t).kind);
 }
 
 # whether expression `eid` carries the secret `^` qualifier, per sema's flow typing
@@ -1816,11 +1965,13 @@ pub fun ast_source(lc: *LowerContext, a: *ast.Ast) str {
     ret O.unwrap[*source.SourceFile](sf).text;
 }
 
-# read a function decl's `#[spirv_op(set, name)]` into a resolved set tag and opcode
+# read a function decl's `#[op(target, set, name)]` into a resolved set tag and opcode
 #
-# Both arguments are string literals sema has already closed against the same
-# `spirvop` table, so an unrecognized spelling cannot reach here; SPV_SET_NONE
-# covers the decorator being absent, which is every ordinary function.
+# Every argument is a string literal sema has already closed against the SAME table
+# this reads, the selected target's own, so an unrecognized spelling cannot reach
+# here (#2888). `isa.NO_OP_SET` covers the decorator being absent, which is every
+# ordinary function, covers a declaration addressed to another target, and covers a
+# target that publishes no operations at all.
 #
 # The decl and its source text are passed rather than taken from the context
 # because this is read on BOTH sides of a module boundary: on the definition, where
@@ -1830,29 +1981,30 @@ pub fun ast_source(lc: *LowerContext, a: *ast.Ast) str {
 # a:      the AST the decl belongs to
 # src:    that AST's source text
 # d:      the function's decl
+# defs:   the selected target's operation table, or nil
 # out_op: receives the opcode within the set, untouched when there is no decorator
-# ret:    one of spirvop.SPV_SET_*
-pub fun decl_spirv_op(a: *ast.Ast, src: str, d: *adecl.Decl, out_op: *u32) u8 {
-    if (a == nil || d == nil) { ret spirvop.SPV_SET_NONE; }
+# ret:    the target's own tag for the set, or isa.NO_OP_SET
+pub fun decl_target_op(a: *ast.Ast, src: str, d: *adecl.Decl, defs: *isa.TargetDefs, out_op: *u32) u32 {
+    if (a == nil || d == nil) { ret isa.NO_OP_SET; }
     var i: u32 = 0;
     for (i < d.decorators_len) {
         val dec: *adecl.Decorator = ?a.decorators[d.decorators_start + i];
-        if (!str_region_equals(src, dec.name.offset, dec.name.len, "spirv_op")) { i = i + 1; cnt; }
-        if (dec.args_len != 2) { ret spirvop.SPV_SET_NONE; }
-        val opt_set: O.Option[*aexpr.Expr] = ast.get_expr(a, a.expr_ids[dec.args_start]);
-        val opt_nam: O.Option[*aexpr.Expr] = ast.get_expr(a, a.expr_ids[dec.args_start + 1]);
-        if (O.is_none[*aexpr.Expr](opt_set) || O.is_none[*aexpr.Expr](opt_nam)) { ret spirvop.SPV_SET_NONE; }
+        if (!str_region_equals(src, dec.name.offset, dec.name.len, "op")) { i = i + 1; cnt; }
+        if (dec.args_len != 3) { ret isa.NO_OP_SET; }
+        val opt_set: O.Option[*aexpr.Expr] = ast.get_expr(a, a.expr_ids[dec.args_start + 1]);
+        val opt_nam: O.Option[*aexpr.Expr] = ast.get_expr(a, a.expr_ids[dec.args_start + 2]);
+        if (O.is_none[*aexpr.Expr](opt_set) || O.is_none[*aexpr.Expr](opt_nam)) { ret isa.NO_OP_SET; }
         val set_e: *aexpr.Expr = O.unwrap[*aexpr.Expr](opt_set);
         val nam_e: *aexpr.Expr = O.unwrap[*aexpr.Expr](opt_nam);
-        if (set_e.span.len < 2::usize || nam_e.span.len < 2::usize) { ret spirvop.SPV_SET_NONE; }
-        val set_v: u8 = spirvop.set_of(src, set_e.span.offset + 1::usize, set_e.span.len - 2::usize);
-        if (set_v == spirvop.SPV_SET_NONE) { ret spirvop.SPV_SET_NONE; }
-        val op: u32 = spirvop.opcode_of(set_v, src, nam_e.span.offset + 1::usize, nam_e.span.len - 2::usize);
-        if (op == spirvop.SPV_OP_NONE) { ret spirvop.SPV_SET_NONE; }
-        @out_op = op;
-        ret set_v;
+        if (set_e.span.len < 2::usize || nam_e.span.len < 2::usize) { ret isa.NO_OP_SET; }
+        val od: *isa.OpDef = isa.op_def_of_region(defs,
+            src, set_e.span.offset + 1::usize, set_e.span.len - 2::usize,
+            src, nam_e.span.offset + 1::usize, nam_e.span.len - 2::usize);
+        if (od == nil) { ret isa.NO_OP_SET; }
+        @out_op = od.opcode;
+        ret od.set_tag;
     }
-    ret spirvop.SPV_SET_NONE;
+    ret isa.NO_OP_SET;
 }
 
 # emit an OP_DBG_VALUE binding the source variable named by `name_span` (type

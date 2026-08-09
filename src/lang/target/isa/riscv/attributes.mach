@@ -1,0 +1,1043 @@
+# the riscv64 ELF build-attribute body: what an image CLAIMS about itself
+#
+# `.riscv.attributes` carries the claims a consumer decodes an image with - which
+# extensions its instructions come from, what its stack alignment is, whether its
+# loads may be unaligned. The ELF writer owns the CONTAINER those claims sit in (a
+# version byte, a vendor sub-section, a `Tag_File` sub-sub-section), because that
+# container is the same one the ARM EABI defines and nothing in it is arch-specific.
+# This module owns the BODY: the tag/value pairs inside, whose meaning, whose value
+# encoding, and whose merge rule are all RISC-V's.
+#
+# It exists because the arch string was a constant. A constant describes what this
+# compiler's encoder emits, and an image is not what its encoder emits - it is what
+# its encoder emits PLUS every object linked into it. The moment a clang object built
+# for `rv64gc` joined a mach image, the image claimed an instruction set it did not
+# have and omitted one it did, which is exactly the shape of the `e_flags` defect one
+# section over (#2813, #2828). So nothing here states a string: an image's claims are
+# derived from what it holds, and a linked image's are MERGED from its inputs.
+#
+# WHY MERGE RULES ARE NOT ONE RULE. A union is right for the arch string and wrong for
+# everything else. Two objects with different stack alignments cannot be combined at
+# all - the union of 8 and 16 is not a stack alignment, it is a contradiction, and the
+# psABI says refuse. Unaligned access is a permission, so the merged image permits it
+# if any input needed it. A tag this compiler does not model is kept only when every
+# input that states it agrees, because an image may only claim what all of its parts
+# claim. Each of those is a different rule and the test for this module is the
+# DISAGREEMENT cases, since identical inputs exercise the parser and nothing else.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator.page;
+
+use A: std.allocator;
+use R: std.types.result;
+
+# the RISC-V build attribute tags this compiler models
+#
+# `Tag_RISCV_arch` is odd and so carries a null-terminated string; the rest are even
+# and carry an unsigned LEB128. That parity rule is the container format's, not a
+# per-tag table, which is what lets an unknown tag be parsed (and so preserved)
+# without knowing what it means.
+pub val TAG_STACK_ALIGN:       u32 = 4;
+pub val TAG_ARCH:              u32 = 5;
+pub val TAG_UNALIGNED_ACCESS:  u32 = 6;
+pub val TAG_PRIV_SPEC:         u32 = 8;
+pub val TAG_PRIV_SPEC_MINOR:   u32 = 10;
+pub val TAG_PRIV_SPEC_REVISION: u32 = 12;
+
+# the stack alignment every RV64 member in this compiler uses, in bytes. stated here
+# because it is a claim about the frame layout the back end emits, and the frame
+# layout is not free to disagree with it
+pub val RISCV64_STACK_ALIGN: u32 = 16;
+
+# the largest extension count, extension name, and unmodelled-tag count a parsed
+# attribute body may hold. an input past any of these is refused rather than
+# truncated: a silently shortened claim is a wrong claim, and these bounds are far
+# past anything a real toolchain emits (llvm's rv64gc profile parses to 7 extensions)
+val MAX_EXTS:    u32 = 64;
+val MAX_NAME:    u32 = 24;
+val MAX_UNKNOWN: u32 = 16;
+val MAX_UNKNOWN_VALUE: u32 = 64;
+
+# one extension of an ISA string: its name and its two-part version
+# ---
+# name:     the extension's letters, lowercase, without its version
+# name_len: number of valid bytes in `name`
+# major:    the version's major part
+# minor:    the version's minor part (the `p` half)
+pub rec Ext {
+    name:     [24]u8;
+    name_len: u32;
+    major:    u32;
+    minor:    u32;
+}
+
+# a parsed ISA string: its base width and its extensions in canonical order
+# ---
+# xlen:  the register width the string names (32 or 64)
+# exts:  the extensions, the base integer extension first
+# count: number of valid entries in `exts`
+pub rec Arch {
+    xlen:  u32;
+    exts:  [64]Ext;
+    count: u32;
+}
+
+# one attribute this compiler does not model, kept verbatim
+#
+# Preserved rather than dropped because an unmodelled tag is still a true claim about
+# the inputs, and dropping it silently narrows what the image says about itself. Kept
+# only while every input that states it agrees - see `merge_unknown`.
+# ---
+# tag:      the attribute tag number
+# is_str:   whether its value is a string (odd tag) rather than a uleb (even tag)
+# value:    the raw value bytes, as they appeared
+# value_len: number of valid bytes in `value`
+pub rec Unknown {
+    tag:       u32;
+    is_str:    bool;
+    value:     [64]u8;
+    value_len: u32;
+}
+
+# every claim a `.riscv.attributes` body makes, parsed
+#
+# Each modelled tag carries a `has_` flag rather than a sentinel value: "this input
+# said nothing about its stack alignment" and "this input said its stack alignment is
+# zero" are different claims and merge differently, and a sentinel collapses them.
+# ---
+# arch / has_arch:                 the ISA string
+# stack_align / has_stack_align:   stack alignment in bytes
+# unaligned / has_unaligned:       whether unaligned access is permitted
+# priv / has_priv:                 the three privileged-spec tags, in tag order
+# unknown / unknown_count:         attributes this compiler does not model
+pub rec Attrs {
+    arch:            Arch;
+    has_arch:        bool;
+    stack_align:     u32;
+    has_stack_align: bool;
+    unaligned:       u32;
+    has_unaligned:   bool;
+    priv:            [3]u32;
+    has_priv:        [3]bool;
+    unknown:         [16]Unknown;
+    unknown_count:   u32;
+}
+
+# the canonical order of the single-letter standard extensions, from the RISC-V
+# unprivileged spec's "Subset Naming Convention" table. an ISA string that lists them
+# in any other order is legal to READ and wrong to WRITE, so this is the order the
+# serializer emits and has nothing to do with the order an input arrived in
+val SINGLE_ORDER: str = "mafdqlcbkjtpvn";
+
+# clear every claim, so a fresh `Attrs` states nothing rather than stating zeros
+# ---
+# at: the record to reset
+pub fun attrs_blank(at: *Attrs) {
+    at.arch.xlen = 0;
+    at.arch.count = 0;
+    at.has_arch = false;
+    at.stack_align = 0;
+    at.has_stack_align = false;
+    at.unaligned = 0;
+    at.has_unaligned = false;
+    var i: u32 = 0;
+    for (i < 3) { at.priv[i] = 0; at.has_priv[i] = false; i = i + 1; }
+    at.unknown_count = 0;
+}
+
+# whether `c` is an ASCII lowercase letter
+fun is_lower(c: u8) bool { ret c >= 97 && c <= 122; }
+
+# whether `c` is an ASCII digit
+fun is_digit(c: u8) bool { ret c >= 48 && c <= 57; }
+
+# the index of `c` in `SINGLE_ORDER`, or -1 when it is not a single-letter standard
+# extension. drives the serializer's ordering
+fun single_rank(c: u8) i64 {
+    var i: i64 = 0;
+    for (i < 14) {
+        if (SINGLE_ORDER[i::usize]::u8 == c) { ret i; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# compare two extension names bytewise, shorter-first on a common prefix
+# ---
+# ret: negative when a sorts before b, 0 when equal, positive otherwise
+fun name_cmp(a: *Ext, b: *Ext) i64 {
+    var i: u32 = 0;
+    for (i < a.name_len && i < b.name_len) {
+        if (a.name[i] != b.name[i]) { ret (a.name[i]::i64) - (b.name[i]::i64); }
+        i = i + 1;
+    }
+    ret (a.name_len::i64) - (b.name_len::i64);
+}
+
+# whether two extensions name the same extension (version ignored)
+fun same_ext(a: *Ext, b: *Ext) bool { ret name_cmp(a, b) == 0; }
+
+# read an unsigned LEB128 out of `buf`, advancing `pos`
+#
+# Refuses an encoding that runs off the end or past 32 bits rather than wrapping: a
+# truncated attribute body is a corrupt claim, and a wrapped one is a wrong claim.
+# ---
+# buf: the bytes to read from
+# len: their length
+# pos: in/out - the offset to read at, advanced past the value
+# out: out - the decoded value
+# ret: true on success
+fun read_uleb(buf: *u8, len: u32, pos: *u32, out: *u32) bool {
+    var v: u64 = 0;
+    var shift: u32 = 0;
+    var p: u32 = @pos;
+    for (p < len) {
+        val b: u8 = buf[p];
+        p = p + 1;
+        if (shift > 28 && (b & 0x7F) > 15) { ret false; }
+        v = v | (((b & 0x7F)::u64) << shift);
+        if ((b & 0x80) == 0) {
+            @pos = p;
+            @out = v::u32;
+            ret true;
+        }
+        shift = shift + 7;
+        if (shift > 35) { ret false; }
+    }
+    ret false;
+}
+
+# the byte length of `value`'s unsigned LEB128 encoding
+fun uleb_size(value: u32) u32 {
+    var v: u32 = value;
+    var n: u32 = 1;
+    for (v > 127) { v = v >> 7; n = n + 1; }
+    ret n;
+}
+
+# write `value` as an unsigned LEB128 at `pos`, returning the bytes written
+fun write_uleb(buf: *u8, pos: u32, value: u32) u32 {
+    var v: u32 = value;
+    var n: u32 = 0;
+    var more: bool = true;
+    for (more) {
+        var b: u8 = (v & 0x7F)::u8;
+        v = v >> 7;
+        if (v != 0) { b = b | 0x80; } or { more = false; }
+        buf[pos + n] = b;
+        n = n + 1;
+    }
+    ret n;
+}
+
+# parse an ISA string into `out`
+#
+# Accepts both spellings a real toolchain produces: `rv64imafdc` with the single
+# letters run together and no versions, and `rv64i2p1_m2p0_a2p1` with explicit
+# versions and separators. An extension with no stated version parses as 0p0, which
+# the merge then treats as "older than anything stated" so a version-carrying input
+# wins - the alternative, treating it as newest, would let an unversioned string
+# silently downgrade a precise one.
+# ---
+# s:   the string bytes
+# len: their length
+# out: the parsed result
+# ret: true when the whole string parsed
+pub fun parse_arch(s: *u8, len: u32, out: *Arch) bool {
+    out.xlen = 0;
+    out.count = 0;
+    if (len < 5) { ret false; }
+    if (s[0] != 114 || s[1] != 118) { ret false; }
+    var p: u32 = 2;
+    var xlen: u32 = 0;
+    for (p < len && is_digit(s[p])) {
+        xlen = xlen * 10 + (s[p] - 48)::u32;
+        p = p + 1;
+    }
+    if (xlen != 32 && xlen != 64) { ret false; }
+    out.xlen = xlen;
+
+    for (p < len) {
+        if (s[p] == 95) { p = p + 1; cnt; }
+        if (!is_lower(s[p])) { ret false; }
+
+        var e: Ext;
+        e.name_len = 0;
+        e.major = 0;
+        e.minor = 0;
+
+        # a multi-letter extension starts with z, s or x and runs to its version, its
+        # separator, or the end; a single-letter one is exactly one character
+        val multi: bool = s[p] == 122 || s[p] == 115 || s[p] == 120;
+        e.name[0] = s[p];
+        e.name_len = 1;
+        p = p + 1;
+        if (multi) {
+            for (p < len && is_lower(s[p])) {
+                # a trailing letter that begins a version ("...p0") is not a name byte,
+                # but only a digit can precede a version's `p`, so a run of letters is
+                # unambiguous here
+                if (e.name_len >= MAX_NAME) { ret false; }
+                e.name[e.name_len] = s[p];
+                e.name_len = e.name_len + 1;
+                p = p + 1;
+            }
+        }
+
+        if (p < len && is_digit(s[p])) {
+            for (p < len && is_digit(s[p])) {
+                e.major = e.major * 10 + (s[p] - 48)::u32;
+                p = p + 1;
+            }
+            if (p < len && s[p] == 112) {
+                p = p + 1;
+                if (p >= len || !is_digit(s[p])) { ret false; }
+                for (p < len && is_digit(s[p])) {
+                    e.minor = e.minor * 10 + (s[p] - 48)::u32;
+                    p = p + 1;
+                }
+            }
+        }
+
+        if (out.count >= MAX_EXTS) { ret false; }
+        # a repeated extension keeps the higher version rather than appearing twice
+        var dup: bool = false;
+        var i: u32 = 0;
+        for (i < out.count) {
+            if (same_ext(?out.exts[i], ?e)) {
+                dup = true;
+                if (e.major > out.exts[i].major
+                    || (e.major == out.exts[i].major && e.minor > out.exts[i].minor)) {
+                    out.exts[i].major = e.major;
+                    out.exts[i].minor = e.minor;
+                }
+                brk;
+            }
+            i = i + 1;
+        }
+        if (!dup) {
+            out.exts[out.count] = e;
+            out.count = out.count + 1;
+        }
+    }
+    ret true;
+}
+
+# merge `b`'s extensions into `a`: the union, each at the higher version
+#
+# Two images' instruction sets combine by union because the merged image contains
+# both sets of instructions - this is the one tag where a union is the right answer.
+# Version maxing is the same argument at finer grain: an image containing a 2p1 `i`
+# and a 2p0 `i` contains 2p1 instructions.
+#
+# Differing xlen is refused. An rv32 object and an rv64 object do not combine into an
+# image of either width, and a merged string that named one of them would be a claim
+# no consumer could act on.
+# ---
+# a:   the accumulator, updated in place
+# b:   the ISA string being folded in
+# ret: ok(true), or the reason the two cannot combine
+pub fun merge_arch(a: *Arch, b: *Arch) R.Result[bool, str] {
+    if (a.xlen == 0) {
+        @a = @b;
+        ret R.ok[bool, str](true);
+    }
+    if (b.xlen == 0) { ret R.ok[bool, str](true); }
+    if (a.xlen != b.xlen) {
+        ret R.err[bool, str](
+            "link: riscv attribute merge: inputs disagree on register width (rv32 with rv64)");
+    }
+    var i: u32 = 0;
+    for (i < b.count) {
+        var found: bool = false;
+        var j: u32 = 0;
+        for (j < a.count) {
+            if (same_ext(?a.exts[j], ?b.exts[i])) {
+                found = true;
+                if (b.exts[i].major > a.exts[j].major
+                    || (b.exts[i].major == a.exts[j].major
+                        && b.exts[i].minor > a.exts[j].minor)) {
+                    a.exts[j].major = b.exts[i].major;
+                    a.exts[j].minor = b.exts[i].minor;
+                }
+                brk;
+            }
+            j = j + 1;
+        }
+        if (!found) {
+            if (a.count >= MAX_EXTS) {
+                ret R.err[bool, str](
+                    "link: riscv attribute merge: more extensions than the merger can hold");
+            }
+            a.exts[a.count] = b.exts[i];
+            a.count = a.count + 1;
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# fold one unmodelled attribute into the accumulator
+#
+# Kept when no input has stated it, or when every input that states it states the same
+# bytes. Dropped the moment two inputs disagree: this compiler does not know the tag's
+# merge rule, so it cannot pick between them, and emitting either would put a claim on
+# the image that only half its parts support. Dropping is the only answer that is
+# never wrong.
+fun merge_unknown(at: *Attrs, u: *Unknown) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < at.unknown_count) {
+        if (at.unknown[i].tag == u.tag) {
+            var same: bool = at.unknown[i].value_len == u.value_len;
+            var k: u32 = 0;
+            for (same && k < u.value_len) {
+                if (at.unknown[i].value[k] != u.value[k]) { same = false; }
+                k = k + 1;
+            }
+            if (same) { ret R.ok[bool, str](true); }
+            # drop it by moving the last entry down over it
+            at.unknown[i] = at.unknown[at.unknown_count - 1];
+            at.unknown_count = at.unknown_count - 1;
+            ret R.ok[bool, str](true);
+        }
+        i = i + 1;
+    }
+    if (at.unknown_count >= MAX_UNKNOWN) { ret R.ok[bool, str](true); }
+    at.unknown[at.unknown_count] = @u;
+    at.unknown_count = at.unknown_count + 1;
+    ret R.ok[bool, str](true);
+}
+
+# parse one attribute body - a run of `<tag uleb><value>` pairs - into `out`
+#
+# The body is what sits inside the container's `Tag_File` sub-sub-section; the ELF
+# writer owns the container and hands only this over, so nothing here knows what a
+# vendor sub-section is.
+# ---
+# body: the attribute bytes
+# len:  their length
+# out:  the parsed claims
+# ret:  ok(true), or the reason the body could not be read
+pub fun parse_body(body: *u8, len: u32, out: *Attrs) R.Result[bool, str] {
+    attrs_blank(out);
+    if (body == nil || len == 0) { ret R.ok[bool, str](true); }
+    var p: u32 = 0;
+    for (p < len) {
+        var tag: u32 = 0;
+        if (!read_uleb(body, len, ?p, ?tag)) {
+            ret R.err[bool, str]("link: riscv attributes: truncated attribute tag");
+        }
+        # the container's parity rule: an odd tag carries a string, an even tag a uleb
+        val is_str: bool = (tag & 1) == 1;
+        if (is_str) {
+            val start: u32 = p;
+            for (p < len && body[p] != 0) { p = p + 1; }
+            if (p >= len) {
+                ret R.err[bool, str]("link: riscv attributes: unterminated attribute string");
+            }
+            val slen: u32 = p - start;
+            p = p + 1;
+            if (tag == TAG_ARCH) {
+                if (!parse_arch(?body[start], slen, ?out.arch)) {
+                    ret R.err[bool, str](
+                        "link: riscv attributes: Tag_RISCV_arch is not a readable ISA string");
+                }
+                out.has_arch = true;
+            }
+            or {
+                if (slen <= MAX_UNKNOWN_VALUE) {
+                    var u: Unknown;
+                    u.tag = tag;
+                    u.is_str = true;
+                    u.value_len = slen;
+                    var k: u32 = 0;
+                    for (k < slen) { u.value[k] = body[start + k]; k = k + 1; }
+                    val mr: R.Result[bool, str] = merge_unknown(out, ?u);
+                    if (R.is_err[bool, str](mr)) { ret mr; }
+                }
+            }
+            cnt;
+        }
+
+        var v: u32 = 0;
+        if (!read_uleb(body, len, ?p, ?v)) {
+            ret R.err[bool, str]("link: riscv attributes: truncated attribute value");
+        }
+        if (tag == TAG_STACK_ALIGN)           { out.stack_align = v; out.has_stack_align = true; cnt; }
+        if (tag == TAG_UNALIGNED_ACCESS)      { out.unaligned = v;   out.has_unaligned = true;   cnt; }
+        if (tag == TAG_PRIV_SPEC)             { out.priv[0] = v; out.has_priv[0] = true; cnt; }
+        if (tag == TAG_PRIV_SPEC_MINOR)       { out.priv[1] = v; out.has_priv[1] = true; cnt; }
+        if (tag == TAG_PRIV_SPEC_REVISION)    { out.priv[2] = v; out.has_priv[2] = true; cnt; }
+
+        var u2: Unknown;
+        u2.tag = tag;
+        u2.is_str = false;
+        u2.value_len = uleb_size(v);
+        write_uleb(?u2.value[0], 0, v);
+        val mr2: R.Result[bool, str] = merge_unknown(out, ?u2);
+        if (R.is_err[bool, str](mr2)) { ret mr2; }
+    }
+    ret R.ok[bool, str](true);
+}
+
+# fold `b`'s claims into `a`, one merge rule per tag
+#
+# The four rules, and why each is what it is:
+#
+#   arch              UNION at the higher version. the merged image holds both
+#                     instruction sets, so it holds their union
+#   stack_align       must AGREE. the union of two alignments is not an alignment; a
+#                     frame laid out for 8 and read as 16 is a corrupt frame, so two
+#                     inputs that disagree cannot be linked and this refuses rather
+#                     than picking
+#   unaligned_access  the MAXIMUM, which for a 0/1 permission is a logical or. an
+#                     image containing one unaligned access performs unaligned access
+#   priv_spec         must AGREE, and is DROPPED when it does not. unlike stack
+#                     alignment a disagreement here is not fatal - the image simply
+#                     cannot state one privileged spec version - so the honest result
+#                     is to say nothing rather than to refuse or to guess
+#   anything else     kept while every input agrees, dropped otherwise
+# ---
+# a:   the accumulator, updated in place
+# b:   the claims being folded in
+# ret: ok(true), or the reason the two cannot be combined
+pub fun merge_attrs(a: *Attrs, b: *Attrs) R.Result[bool, str] {
+    if (b.has_arch) {
+        val ar: R.Result[bool, str] = merge_arch(?a.arch, ?b.arch);
+        if (R.is_err[bool, str](ar)) { ret ar; }
+        a.has_arch = true;
+    }
+
+    if (b.has_stack_align) {
+        if (a.has_stack_align && a.stack_align != b.stack_align) {
+            ret R.err[bool, str](
+                "link: riscv attribute merge: inputs disagree on Tag_RISCV_stack_align");
+        }
+        a.stack_align = b.stack_align;
+        a.has_stack_align = true;
+    }
+
+    if (b.has_unaligned) {
+        if (!a.has_unaligned || b.unaligned > a.unaligned) { a.unaligned = b.unaligned; }
+        a.has_unaligned = true;
+    }
+
+    var i: u32 = 0;
+    for (i < 3) {
+        if (b.has_priv[i]) {
+            if (a.has_priv[i] && a.priv[i] != b.priv[i]) {
+                # disagreement means the merged image states no privileged spec at all
+                a.has_priv[i] = false;
+                a.priv[i] = 0;
+            }
+            or {
+                a.priv[i] = b.priv[i];
+                a.has_priv[i] = true;
+            }
+        }
+        i = i + 1;
+    }
+
+    var k: u32 = 0;
+    for (k < b.unknown_count) {
+        val ur: R.Result[bool, str] = merge_unknown(a, ?b.unknown[k]);
+        if (R.is_err[bool, str](ur)) { ret ur; }
+        k = k + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# the serialized length of `a`'s ISA string, excluding its terminator
+fun arch_string_size(a: *Arch) u32 {
+    var n: u32 = 2 + decimal_size(a.xlen);
+    var i: u32 = 0;
+    for (i < a.count) {
+        if (i > 0) { n = n + 1; }
+        n = n + a.exts[i].name_len;
+        n = n + decimal_size(a.exts[i].major) + 1 + decimal_size(a.exts[i].minor);
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the number of decimal digits `v` prints as
+fun decimal_size(v: u32) u32 {
+    var n: u32 = 1;
+    var x: u32 = v;
+    for (x > 9) { x = x / 10; n = n + 1; }
+    ret n;
+}
+
+# write `v` in decimal at `pos`, returning the bytes written
+fun write_decimal(buf: *u8, pos: u32, v: u32) u32 {
+    val n: u32 = decimal_size(v);
+    var x: u32 = v;
+    var i: u32 = n;
+    for (i > 0) {
+        i = i - 1;
+        buf[pos + i] = (48 + (x % 10))::u8;
+        x = x / 10;
+    }
+    ret n;
+}
+
+# order `a`'s extensions the way the spec's naming convention requires
+#
+# The base integer extension first, then the single-letter standard extensions in the
+# spec's fixed order, then everything multi-letter alphabetically. An input may list
+# them in any order and remain readable; an OUTPUT that does is a string other tools
+# will read back differently from the one meant, so the canonical order is applied on
+# the way out and never assumed on the way in.
+fun sort_exts(a: *Arch) {
+    var i: u32 = 1;
+    for (i < a.count) {
+        var j: u32 = i;
+        for (j > 0 && ext_before(?a.exts[j], ?a.exts[j - 1])) {
+            var tmp: Ext = a.exts[j];
+            a.exts[j] = a.exts[j - 1];
+            a.exts[j - 1] = tmp;
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+}
+
+# whether `x` sorts before `y` in the spec's naming convention
+fun ext_before(x: *Ext, y: *Ext) bool {
+    val xk: u32 = ext_class(x);
+    val yk: u32 = ext_class(y);
+    if (xk != yk) { ret xk < yk; }
+    if (xk == 1) { ret single_rank(x.name[0]) < single_rank(y.name[0]); }
+    ret name_cmp(x, y) < 0;
+}
+
+# the naming convention's three classes: the base integer extension, the single-letter
+# standard extensions, then everything multi-letter
+fun ext_class(e: *Ext) u32 {
+    if (e.name_len == 1 && (e.name[0] == 105 || e.name[0] == 101)) { ret 0; }
+    if (e.name_len == 1) { ret 1; }
+    ret 2;
+}
+
+# serialize `at` into a freshly allocated attribute body
+#
+# Emits the modelled tags in ascending tag order, which is what every producer does
+# and what makes two equal claim-sets serialize to equal bytes. The caller owns the
+# returned buffer.
+# ---
+# alloc: the allocator the body is taken from
+# at:    the claims to serialize
+# out_len: out - the body's length in bytes
+# ret:   the owned body, or an allocation error
+pub fun serialize(alloc: *A.Allocator, at: *Attrs, out_len: *u32) R.Result[*u8, str] {
+    @out_len = 0;
+    sort_exts(?at.arch);
+
+    var n: u32 = 0;
+    if (at.has_stack_align) { n = n + uleb_size(TAG_STACK_ALIGN) + uleb_size(at.stack_align); }
+    if (at.has_arch)        { n = n + uleb_size(TAG_ARCH) + arch_string_size(?at.arch) + 1; }
+    if (at.has_unaligned)   { n = n + uleb_size(TAG_UNALIGNED_ACCESS) + uleb_size(at.unaligned); }
+    var i: u32 = 0;
+    for (i < 3) {
+        if (at.has_priv[i]) { n = n + uleb_size(priv_tag(i)) + uleb_size(at.priv[i]); }
+        i = i + 1;
+    }
+    var k: u32 = 0;
+    for (k < at.unknown_count) {
+        n = n + uleb_size(at.unknown[k].tag) + at.unknown[k].value_len;
+        if (at.unknown[k].is_str) { n = n + 1; }
+        k = k + 1;
+    }
+    if (n == 0) { ret R.ok[*u8, str](nil); }
+
+    val br: R.Result[*u8, str] = A.allocate[u8](alloc, n::usize);
+    if (R.is_err[*u8, str](br)) { ret br; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](br);
+
+    var p: u32 = 0;
+    if (at.has_stack_align) {
+        p = p + write_uleb(buf, p, TAG_STACK_ALIGN);
+        p = p + write_uleb(buf, p, at.stack_align);
+    }
+    if (at.has_arch) {
+        p = p + write_uleb(buf, p, TAG_ARCH);
+        p = p + write_arch_string(buf, p, ?at.arch);
+        buf[p] = 0;
+        p = p + 1;
+    }
+    if (at.has_unaligned) {
+        p = p + write_uleb(buf, p, TAG_UNALIGNED_ACCESS);
+        p = p + write_uleb(buf, p, at.unaligned);
+    }
+    i = 0;
+    for (i < 3) {
+        if (at.has_priv[i]) {
+            p = p + write_uleb(buf, p, priv_tag(i));
+            p = p + write_uleb(buf, p, at.priv[i]);
+        }
+        i = i + 1;
+    }
+    k = 0;
+    for (k < at.unknown_count) {
+        p = p + write_uleb(buf, p, at.unknown[k].tag);
+        var b: u32 = 0;
+        for (b < at.unknown[k].value_len) {
+            buf[p + b] = at.unknown[k].value[b];
+            b = b + 1;
+        }
+        p = p + at.unknown[k].value_len;
+        if (at.unknown[k].is_str) { buf[p] = 0; p = p + 1; }
+        k = k + 1;
+    }
+
+    @out_len = n;
+    ret R.ok[*u8, str](buf);
+}
+
+# the tag number of privileged-spec slot `i`
+fun priv_tag(i: u32) u32 {
+    if (i == 0) { ret TAG_PRIV_SPEC; }
+    if (i == 1) { ret TAG_PRIV_SPEC_MINOR; }
+    ret TAG_PRIV_SPEC_REVISION;
+}
+
+# write `a` as an ISA string at `pos`, returning the bytes written (no terminator)
+fun write_arch_string(buf: *u8, pos: u32, a: *Arch) u32 {
+    var p: u32 = pos;
+    buf[p] = 114; buf[p + 1] = 118;
+    p = p + 2;
+    p = p + write_decimal(buf, p, a.xlen);
+    var i: u32 = 0;
+    for (i < a.count) {
+        if (i > 0) { buf[p] = 95; p = p + 1; }
+        var k: u32 = 0;
+        for (k < a.exts[i].name_len) { buf[p + k] = a.exts[i].name[k]; k = k + 1; }
+        p = p + a.exts[i].name_len;
+        p = p + write_decimal(buf, p, a.exts[i].major);
+        buf[p] = 112;
+        p = p + 1;
+        p = p + write_decimal(buf, p, a.exts[i].minor);
+        i = i + 1;
+    }
+    ret p - pos;
+}
+
+# add one extension to `a` at an explicit version
+fun push_ext(a: *Arch, name: str, major: u32, minor: u32) {
+    if (a.count >= MAX_EXTS) { ret; }
+    var e: Ext;
+    e.name_len = 0;
+    for (name[e.name_len::usize] != 0) {
+        e.name[e.name_len] = name[e.name_len::usize]::u8;
+        e.name_len = e.name_len + 1;
+    }
+    e.major = major;
+    e.minor = minor;
+    a.exts[a.count] = e;
+    a.count = a.count + 1;
+}
+
+# the attribute body describing what THIS compiler's riscv64 output holds
+#
+# Derived from the emitted bytes, never stated. `has_compressed` decides the `c`
+# extension for the same reason it decides the `EF_RISCV_RVC` header bit: it is a fact
+# about the instructions in the image, and an object mach writes contains none while a
+# linked image contains whatever its inputs contained (#2813).
+#
+# `float_arg_bits` does NOT vary the string, and that is a claim rather than an
+# oversight: this encoder emits F and D instructions for every member of the family,
+# including soft-float lp64, which passes float scalars in integer registers while
+# still computing with the float unit. The parameter is taken because the derivation's
+# inputs are the ABI and the bytes, and an arch whose instruction set did vary with the
+# convention would need it.
+# ---
+# `xlen_bits` is the MACHINE's register width, handed down from the model by the seam.
+# It opens the arch string (`rv32...` / `rv64...`) and is the one part of these claims
+# that is not derived from the emitted bytes, because no sequence of bytes states the
+# width of the register file that runs them. Taking it as a parameter rather than
+# writing 64 is the same correction #2828 made to the extension list beside it.
+# ---
+# alloc:          the allocator the body is taken from
+# xlen_bits:      the machine's integer register width in bits (32 or 64)
+# float_arg_bits: the resolved ABI's float-argument width (0 / 32 / 64)
+# has_compressed: whether the image's bytes contain compressed instructions
+# out_len:        out - the body's length in bytes
+# ret:            the owned body, or an allocation error
+pub fun riscv64_build_attributes(alloc: *A.Allocator, xlen_bits: u32, float_arg_bits: u32,
+                                 has_compressed: bool, out_len: *u32) R.Result[*u8, str] {
+    var at: Attrs;
+    attrs_blank(?at);
+
+    at.arch.xlen = xlen_bits;
+    push_ext(?at.arch, "i", 2, 1);
+    push_ext(?at.arch, "m", 2, 0);
+    push_ext(?at.arch, "a", 2, 1);
+    push_ext(?at.arch, "f", 2, 2);
+    push_ext(?at.arch, "d", 2, 2);
+    if (has_compressed) { push_ext(?at.arch, "c", 2, 0); }
+    at.has_arch = true;
+
+    at.stack_align = RISCV64_STACK_ALIGN;
+    at.has_stack_align = true;
+
+    # this back end emits no unaligned access: every load and store it selects is
+    # naturally aligned for its width, so the image honestly claims none
+    at.unaligned = 0;
+    at.has_unaligned = true;
+
+    ret serialize(alloc, ?at, out_len);
+}
+
+# merge two attribute bodies into a freshly allocated one
+#
+# The linker's fold, called once per input. Either side may be empty, which is what an
+# input carrying no `.riscv.attributes` section looks like and is not an error: an
+# object that claims nothing constrains nothing.
+# ---
+# alloc:   the allocator the result is taken from
+# a / a_len: the accumulated body so far
+# b / b_len: the input body being folded in
+# out_len: out - the result's length in bytes
+# ret:     the owned merged body, or the reason the two cannot be combined
+pub fun riscv64_merge_attributes(alloc: *A.Allocator, a: *u8, a_len: u32,
+                                 b: *u8, b_len: u32, out_len: *u32) R.Result[*u8, str] {
+    var acc: Attrs;
+    val pa: R.Result[bool, str] = parse_body(a, a_len, ?acc);
+    if (R.is_err[bool, str](pa)) { ret R.err[*u8, str](R.unwrap_err[bool, str](pa)); }
+
+    var other: Attrs;
+    val pb: R.Result[bool, str] = parse_body(b, b_len, ?other);
+    if (R.is_err[bool, str](pb)) { ret R.err[*u8, str](R.unwrap_err[bool, str](pb)); }
+
+    val mr: R.Result[bool, str] = merge_attrs(?acc, ?other);
+    if (R.is_err[bool, str](mr)) { ret R.err[*u8, str](R.unwrap_err[bool, str](mr)); }
+
+    ret serialize(alloc, ?acc, out_len);
+}
+
+# build a body holding exactly one arch string, for a test that needs an input
+# spelled the way a foreign toolchain spells it rather than the way this one does
+fun t_arch_body(buf: *u8, s: str) u32 {
+    var p: u32 = 0;
+    p = p + write_uleb(buf, p, TAG_ARCH);
+    var i: usize = 0;
+    for (s[i] != 0) { buf[p + i::u32] = s[i]::u8; i = i + 1; }
+    p = p + i::u32;
+    buf[p] = 0;
+    ret p + 1;
+}
+
+# whether writing `a` produces exactly `want`
+fun t_arch_is_direct(a: *Arch, want: str) bool {
+    var out: [128]u8;
+    val n: u32 = write_arch_string(?out[0], 0, a);
+    var i: u32 = 0;
+    for (i < n) {
+        if (want[i::usize] == 0 || want[i::usize]::u8 != out[i]) { ret false; }
+        i = i + 1;
+    }
+    ret want[n::usize] == 0;
+}
+
+# whether the serialized body `buf` carries `want` as its Tag_RISCV_arch string
+fun t_arch_is(buf: *u8, len: u32, want: str) bool {
+    var at: Attrs;
+    if (R.is_err[bool, str](parse_body(buf, len, ?at))) { ret false; }
+    if (!at.has_arch) { ret false; }
+    ret t_arch_is_direct(?at.arch, want);
+}
+
+# the ISA-string reader takes both spellings a real toolchain produces, and normalizes
+# what it read into the naming convention's order rather than the order it arrived in.
+# the run-together spelling with no versions is what a hand-written `-march` produces
+# and the separated spelling with versions is what llvm writes into the section
+test "mach.lang.target.isa.riscv.attributes.parse_arch:both_spellings_and_ordering" {
+    var a: Arch;
+    if (!parse_arch("rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0"::*u8, 33, ?a)) { ret 1; }
+    if (a.xlen != 64 || a.count != 6) { ret 1; }
+    if (a.exts[0].name[0] != 105 || a.exts[0].major != 2 || a.exts[0].minor != 1) { ret 1; }
+    if (a.exts[5].name[0] != 99 || a.exts[5].major != 2 || a.exts[5].minor != 0) { ret 1; }
+
+    # run together, unversioned, and deliberately out of canonical order. an
+    # unversioned extension reads as 0p0, which is what makes a version-carrying input
+    # win the merge instead of being silently downgraded by one that states nothing
+    var b: Arch;
+    if (!parse_arch("rv64icma"::*u8, 8, ?b)) { ret 1; }
+    if (b.xlen != 64 || b.count != 4) { ret 1; }
+    sort_exts(?b);
+    if (!t_arch_is_direct(?b, "rv64i0p0_m0p0_a0p0_c0p0")) { ret 1; }
+
+    # a multi-letter extension keeps its whole name and its version
+    var z: Arch;
+    if (!parse_arch("rv64i2p1_zicsr2p0_zifencei2p0"::*u8, 29, ?z)) { ret 1; }
+    if (z.count != 3) { ret 1; }
+    sort_exts(?z);
+    if (!t_arch_is_direct(?z, "rv64i2p1_zicsr2p0_zifencei2p0")) { ret 1; }
+
+    # a width this compiler cannot emit, and a string that is not an ISA string
+    var bad: Arch;
+    if (parse_arch("rv128i2p1"::*u8, 9, ?bad))  { ret 1; }
+    if (parse_arch("x86_64"::*u8, 6, ?bad))     { ret 1; }
+    ret 0;
+}
+
+# THE MERGE IS TESTED ON INPUTS THAT DISAGREE. two identical bodies merge to
+# themselves under any rule, including a wrong one, so the cases here are the ways two
+# real objects differ: an extension one has and the other does not, the same extension
+# at two versions, an input that states nothing, and two widths that do not combine
+test "mach.lang.target.isa.riscv.attributes.merge_attributes:disagreeing_inputs" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    # one side has `c` and `zicsr`, the other does not: the union, in canonical order
+    var lhs: [96]u8;
+    var rhs: [96]u8;
+    val ln: u32 = t_arch_body(?lhs[0], "rv64i2p1_m2p0_a2p1_f2p2_d2p2");
+    val rn: u32 = t_arch_body(?rhs[0], "rv64i2p1_c2p0_zicsr2p0");
+    var out_len: u32 = 0;
+    val mr: R.Result[*u8, str] =
+        riscv64_merge_attributes(?alloc, ?lhs[0], ln, ?rhs[0], rn, ?out_len);
+    if (R.is_err[*u8, str](mr)) { ret 1; }
+    if (!t_arch_is(R.unwrap_ok[*u8, str](mr), out_len,
+                   "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0_zicsr2p0")) { ret 1; }
+
+    # the SAME extension at two versions takes the higher, in BOTH directions, so the
+    # answer cannot come from whichever side happened to be the accumulator
+    val an: u32 = t_arch_body(?lhs[0], "rv64i2p0_m2p0");
+    val bn: u32 = t_arch_body(?rhs[0], "rv64i2p1_m1p0");
+    var vlen: u32 = 0;
+    val vr: R.Result[*u8, str] =
+        riscv64_merge_attributes(?alloc, ?lhs[0], an, ?rhs[0], bn, ?vlen);
+    if (R.is_err[*u8, str](vr)) { ret 1; }
+    if (!t_arch_is(R.unwrap_ok[*u8, str](vr), vlen, "rv64i2p1_m2p0")) { ret 1; }
+    var wlen: u32 = 0;
+    val wr: R.Result[*u8, str] =
+        riscv64_merge_attributes(?alloc, ?rhs[0], bn, ?lhs[0], an, ?wlen);
+    if (R.is_err[*u8, str](wr)) { ret 1; }
+    if (!t_arch_is(R.unwrap_ok[*u8, str](wr), wlen, "rv64i2p1_m2p0")) { ret 1; }
+
+    # an input that claims nothing constrains nothing, which is what an object with no
+    # `.riscv.attributes` section looks like and is not an error
+    var elen: u32 = 0;
+    val er: R.Result[*u8, str] =
+        riscv64_merge_attributes(?alloc, ?lhs[0], an, nil, 0, ?elen);
+    if (R.is_err[*u8, str](er)) { ret 1; }
+    if (!t_arch_is(R.unwrap_ok[*u8, str](er), elen, "rv64i2p0_m2p0")) { ret 1; }
+
+    # rv32 and rv64 do not combine into an image of either width
+    val x32: u32 = t_arch_body(?lhs[0], "rv32i2p1");
+    val x64: u32 = t_arch_body(?rhs[0], "rv64i2p1");
+    var xo: u32 = 0;
+    if (!R.is_err[*u8, str](
+            riscv64_merge_attributes(?alloc, ?lhs[0], x32, ?rhs[0], x64, ?xo))) { ret 1; }
+    ret 0;
+}
+
+# the tags whose merge rule is NOT a union, each checked against the rule it has
+# rather than against the union it would be easy to write
+test "mach.lang.target.isa.riscv.attributes.merge_attrs:non_union_tags" {
+    var a: Attrs;
+    var b: Attrs;
+
+    # stack alignment must AGREE. two frames laid out to different alignments cannot be
+    # combined, so this refuses rather than picking one
+    attrs_blank(?a); attrs_blank(?b);
+    a.stack_align = 16; a.has_stack_align = true;
+    b.stack_align = 8;  b.has_stack_align = true;
+    if (!R.is_err[bool, str](merge_attrs(?a, ?b))) { ret 1; }
+
+    # agreeing is fine, and an input that states nothing does not erase one that does
+    attrs_blank(?a); attrs_blank(?b);
+    a.stack_align = 16; a.has_stack_align = true;
+    if (R.is_err[bool, str](merge_attrs(?a, ?b))) { ret 1; }
+    if (!a.has_stack_align || a.stack_align != 16) { ret 1; }
+
+    # unaligned access is a PERMISSION: an image holding one unaligned access performs
+    # unaligned access, so the merge is the maximum and not an agreement check. checked
+    # both ways round, so the answer is the rule and not the argument order
+    attrs_blank(?a); attrs_blank(?b);
+    a.unaligned = 0; a.has_unaligned = true;
+    b.unaligned = 1; b.has_unaligned = true;
+    if (R.is_err[bool, str](merge_attrs(?a, ?b))) { ret 1; }
+    if (!a.has_unaligned || a.unaligned != 1) { ret 1; }
+    attrs_blank(?a); attrs_blank(?b);
+    a.unaligned = 1; a.has_unaligned = true;
+    b.unaligned = 0; b.has_unaligned = true;
+    if (R.is_err[bool, str](merge_attrs(?a, ?b))) { ret 1; }
+    if (a.unaligned != 1) { ret 1; }
+
+    # a privileged-spec disagreement is not fatal, but the merged image cannot state
+    # one: it says nothing rather than picking a side
+    attrs_blank(?a); attrs_blank(?b);
+    a.priv[0] = 1; a.has_priv[0] = true;
+    b.priv[0] = 2; b.has_priv[0] = true;
+    if (R.is_err[bool, str](merge_attrs(?a, ?b))) { ret 1; }
+    if (a.has_priv[0]) { ret 1; }
+
+    # an unmodelled tag survives while every input that states it agrees, and is
+    # dropped the moment two disagree - this compiler does not know its rule, so
+    # emitting either value would put a claim on the image half its parts deny
+    attrs_blank(?a); attrs_blank(?b);
+    a.unknown[0].tag = 14; a.unknown[0].is_str = false;
+    a.unknown[0].value[0] = 7; a.unknown[0].value_len = 1;
+    a.unknown_count = 1;
+    b.unknown[0].tag = 14; b.unknown[0].is_str = false;
+    b.unknown[0].value[0] = 7; b.unknown[0].value_len = 1;
+    b.unknown_count = 1;
+    if (R.is_err[bool, str](merge_attrs(?a, ?b))) { ret 1; }
+    if (a.unknown_count != 1) { ret 1; }
+    b.unknown[0].value[0] = 9;
+    if (R.is_err[bool, str](merge_attrs(?a, ?b))) { ret 1; }
+    if (a.unknown_count != 0) { ret 1; }
+    ret 0;
+}
+
+# what this compiler claims about its OWN output is derived from the bytes, never
+# stated: the same call with and without compressed instructions differs by exactly
+# the `c` extension, which is the fact `EF_RISCV_RVC` reports one section over
+test "mach.lang.target.isa.riscv.attributes.build_attributes:derived_from_bytes" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var plain_len: u32 = 0;
+    val pr: R.Result[*u8, str] = riscv64_build_attributes(?alloc, 64, 64, false, ?plain_len);
+    if (R.is_err[*u8, str](pr)) { ret 1; }
+    if (!t_arch_is(R.unwrap_ok[*u8, str](pr), plain_len,
+                   "rv64i2p1_m2p0_a2p1_f2p2_d2p2")) { ret 1; }
+
+    var comp_len: u32 = 0;
+    val cr: R.Result[*u8, str] = riscv64_build_attributes(?alloc, 64, 64, true, ?comp_len);
+    if (R.is_err[*u8, str](cr)) { ret 1; }
+    if (!t_arch_is(R.unwrap_ok[*u8, str](cr), comp_len,
+                   "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0")) { ret 1; }
+
+    # the soft-float member computes with the float unit even though it passes float
+    # scalars in integer registers, so its instruction set is the same one
+    var soft_len: u32 = 0;
+    val sr: R.Result[*u8, str] = riscv64_build_attributes(?alloc, 64, 0, false, ?soft_len);
+    if (R.is_err[*u8, str](sr)) { ret 1; }
+    if (!t_arch_is(R.unwrap_ok[*u8, str](sr), soft_len,
+                   "rv64i2p1_m2p0_a2p1_f2p2_d2p2")) { ret 1; }
+
+    # THE REGISTER WIDTH IS THE MACHINE'S AND REACHES THE STRING. The same derivation
+    # at XLEN 32 opens `rv32`, which is the whole point of taking it as a parameter:
+    # a constant here would keep claiming rv64 on a machine that is not one.
+    var w32_len: u32 = 0;
+    val wr: R.Result[*u8, str] = riscv64_build_attributes(?alloc, 32, 64, false, ?w32_len);
+    if (R.is_err[*u8, str](wr)) { ret 1; }
+    if (!t_arch_is(R.unwrap_ok[*u8, str](wr), w32_len,
+                   "rv32i2p1_m2p0_a2p1_f2p2_d2p2")) { ret 1; }
+
+    # the whole body round-trips, not just the string: the stack alignment and the
+    # unaligned-access claim are there beside it
+    var at: Attrs;
+    if (R.is_err[bool, str](parse_body(R.unwrap_ok[*u8, str](pr), plain_len, ?at))) { ret 1; }
+    if (!at.has_stack_align || at.stack_align != RISCV64_STACK_ALIGN) { ret 1; }
+    if (!at.has_unaligned || at.unaligned != 0) { ret 1; }
+    ret 0;
+}

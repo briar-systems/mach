@@ -47,7 +47,8 @@ use mach.lang.me.lower.context;
 use mach.lang.me.lower.mangle;
 use mach.lang.session;
 use mach.lang.source;
-use mach.lang.spirvop;
+use isa: mach.lang.target.isa;
+use mach.lang.float;
 use mach.lang.type;
 
 # lower an expression to its rvalue: the loaded value it denotes
@@ -894,9 +895,10 @@ fun stamp_spirv_op(ctx: *context.LowerContext, sym: *resolve.Symbol, v: value.Va
     val opt_d: O.Option[*decl.Decl] = ast.get_decl(origin_ast, sym.decl);
     if (O.is_none[*decl.Decl](opt_d)) { ret; }
     val fi: u32 = v.data.fn_ix;
-    val set_v: u8 = context.decl_spirv_op(origin_ast, context.ast_source(ctx, origin_ast),
-                                          O.unwrap[*decl.Decl](opt_d), ?ctx.m.functions[fi].spv_op);
-    if (set_v != spirvop.SPV_SET_NONE) { ctx.m.functions[fi].spv_set = set_v; }
+    val set_v: u32 = context.decl_target_op(origin_ast, context.ast_source(ctx, origin_ast),
+                                            O.unwrap[*decl.Decl](opt_d), ctx.tgt.isa.defs,
+                                            ?ctx.m.functions[fi].op_code);
+    if (set_v != isa.NO_OP_SET) { ctx.m.functions[fi].op_set = set_v; }
 }
 
 # whether a symbol names a genuine foreign C function import (a declared `ext fun`)
@@ -1712,7 +1714,8 @@ fun fold_const_scalar(ctx: *context.LowerContext, eid: id.ExprId) O.Option[R.Res
 
     if (e.kind != expr.EXPR_KIND_CAST) {
         val res_eval: R.Result[comptime.CTValue, str] =
-            comptime.eval(ctx.ctx, ctx.a, context.module_source(ctx), eid, ?ctx.s.interner);
+            comptime.eval_at_float_width(ctx.ctx, ctx.a, context.module_source(ctx), eid, ?ctx.s.interner,
+                                         context.expr_float_width(ctx, eid));
         if (R.is_err[comptime.CTValue, str](res_eval)) { ret O.none[R.Result[comptime.CTValue, str]](); }
         ret O.some[R.Result[comptime.CTValue, str]](R.ok[comptime.CTValue, str](R.unwrap_ok[comptime.CTValue, str](res_eval)));
     }
@@ -1758,14 +1761,19 @@ fun convert_const_scalar(
     # so the comptime payload already carries those bits unchanged.
     if (reinterpret) { ret R.ok[comptime.CTValue, str](v); }
 
-    if (from_float && to_float) { ret float_ct(v.data.f); }
+    # a float target is the one place a cast changes a float's width, so the
+    # result is taken AT the target width: `X::f32` is the f32, not an f64 that
+    # a later emission step happens to narrow (#2918).
+    val to_fw: float.FloatWidth = context.float_width_of_type(ctx, to_ty);
+
+    if (from_float && to_float) { ret float_ct(v.data.f, to_fw); }
     if (from_float && !to_float) {
         # float -> int truncates toward zero into the target representation.
         ret int_ct(rerepresent_int(v.data.f::i64, to_bits, to_signed));
     }
     if (!from_float && to_float) {
-        # int -> float yields the integer's real value as an f64.
-        ret float_ct(v.data.i::f64);
+        # int -> float yields the integer's real value, rounded to the target.
+        ret float_ct(v.data.i::f64, to_fw);
     }
 
     ret int_ct(rerepresent_int(v.data.i, to_bits, to_signed));
@@ -1800,15 +1808,13 @@ fun int_ct(i: i64) R.Result[comptime.CTValue, str] {
     ret R.ok[comptime.CTValue, str](v);
 }
 
-# wrap a float in a CT_KIND_FLOAT comptime value
+# wrap a float in a CT_KIND_FLOAT comptime value at width `w`
 # ---
 # f:   the float payload
+# w:   the width the value's type fixes
 # ret: the wrapped comptime value
-fun float_ct(f: f64) R.Result[comptime.CTValue, str] {
-    var v: comptime.CTValue;
-    v.kind   = comptime.CT_KIND_FLOAT;
-    v.data.f = f;
-    ret R.ok[comptime.CTValue, str](v);
+fun float_ct(f: f64, w: float.FloatWidth) R.Result[comptime.CTValue, str] {
+    ret R.ok[comptime.CTValue, str](comptime.ct_float(f, w));
 }
 
 # lower a call: the callee rvalue, then each argument rvalue, then an OP_CALL
@@ -2201,7 +2207,9 @@ fun lower_value_callee(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr
 # eid: the argument expression
 # ret: some(folded value) for a compile-time constant, none otherwise
 fun fold_comptime_arg(ctx: *context.LowerContext, eid: id.ExprId) O.Option[comptime.CTValue] {
-    val res_eval: R.Result[comptime.CTValue, str] = comptime.eval(ctx.ctx, ctx.a, context.module_source(ctx), eid, ?ctx.s.interner);
+    val res_eval: R.Result[comptime.CTValue, str] =
+        comptime.eval_at_float_width(ctx.ctx, ctx.a, context.module_source(ctx), eid, ?ctx.s.interner,
+                                     context.expr_float_width(ctx, eid));
     if (R.is_ok[comptime.CTValue, str](res_eval)) {
         ret O.some[comptime.CTValue](R.unwrap_ok[comptime.CTValue, str](res_eval));
     }
@@ -3273,10 +3281,10 @@ fun lower_unary(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) R.Res
 # target type pair (trunc/ext for integers, fp trunc/ext for floats, int<->float
 # CVT). When source and target share a width, the operand's bit pattern already
 # represents the target type (a same-type identity, a signedness flip like
-# i64::u64, or a pointer retype), so it emits a same-size bitcast. A `:~`
-# bit-reinterpret (sema-validated equal size) always emits a same-size bitcast
-# that reinterprets the operand's raw bits as the target type, regardless of int /
-# float category.
+# i64::u64, or a pointer retype), so it goes through `emit_retype`, which emits a
+# same-size bitcast or nothing at all. A `:~` bit-reinterpret (sema-validated equal
+# size) always retypes the operand's raw bits to the target type, regardless of int
+# / float category.
 # ---
 # ctx: per-module lowering context
 # eid: the cast expression
@@ -3306,7 +3314,7 @@ fun lower_cast(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) R.Resu
     if (from_float && to_float) {
         if (to_bits < from_bits) { ret builder.emit_fp_trunc(?ctx.builder, v, dst); }
         if (to_bits > from_bits) { ret builder.emit_fp_ext(?ctx.builder, v, dst); }
-        ret builder.emit_bitcast(?ctx.builder, v, dst);
+        ret emit_retype(ctx, v, dst);
     }
     if (from_float && !to_float) {
         if (to_signed) { ret builder.emit_fp_to_si(?ctx.builder, v, dst); }
@@ -3322,6 +3330,36 @@ fun lower_cast(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) R.Resu
         if (from_signed) { ret builder.emit_sext(?ctx.builder, v, dst); }
         ret builder.emit_zext(?ctx.builder, v, dst);
     }
+    ret emit_retype(ctx, v, dst);
+}
+
+# emit the same-size retype a conversion selector settled on, or nothing when the
+# operand already has the destination type (#2881)
+#
+# The three points where `::` and `:~` conclude "the operand's bits already are the
+# destination's representation" - a same-width float pair, a same-width int/pointer
+# pair, and a `:~` within one representation class. When the operand's IR type IS
+# `dst` the reinterpretation is empty: the IR carries no signedness, so `i64::u64`
+# and `2::u64` both land here with nothing left to describe, and the emitted
+# instruction is a pure identity (`OpBitcast %ulong %ulong_2` in SPIR-V, a coalesced
+# register copy on the machine targets). Handing the operand back drops it.
+#
+# This belongs to conversion SELECTION, not emission, which is why it is not folded
+# inside `builder.emit_bitcast`: the builder's contract is to emit what it is asked
+# for, and the verifier's own width test constructs an identity bitcast on purpose
+# to prove the equal-width case stays clean.
+#
+# Secrecy is unaffected. Sema forbids `::` and `:~` from adding or dropping `^`
+# (`check_secrecy_cast`), so a cast and its operand always agree on taint, and the
+# operand's own `lower_rvalue` has already stamped it; the caller's `stamp_secret`
+# then re-marks that same defining instruction rather than a bitcast in front of it.
+# ---
+# ctx: per-module lowering context
+# v:   the already-lowered operand
+# dst: the destination IR type, the same size as the operand's
+# ret: `v` unchanged when it is already typed `dst`, else a bitcast, or an error
+fun emit_retype(ctx: *context.LowerContext, v: value.Value, dst: ir_type.IrTypeId) R.Result[value.Value, str] {
+    if (v.ty == dst) { ret R.ok[value.Value, str](v); }
     ret builder.emit_bitcast(?ctx.builder, v, dst);
 }
 
@@ -3359,7 +3397,7 @@ fun lower_reinterpret(ctx: *context.LowerContext, v: value.Value, from_ty: type.
 
     val src_agg: bool = is_aggregate_ir(ctx, src);
     val dst_agg: bool = is_aggregate_ir(ctx, dst);
-    if (src_agg == dst_agg) { ret builder.emit_bitcast(?ctx.builder, v, dst); }
+    if (src_agg == dst_agg) { ret emit_retype(ctx, v, dst); }
 
     if (src_agg) {
         # `v` is the aggregate's storage address; read the destination out of it.
@@ -3421,7 +3459,9 @@ fun lower_strip(ctx: *context.LowerContext, e: *expr.Expr) R.Result[value.Value,
 # eid: the comptime-path expression
 # ret: the materialized constant Value, or an error
 fun lower_comptime_path(ctx: *context.LowerContext, eid: id.ExprId) R.Result[value.Value, str] {
-    val res_eval: R.Result[comptime.CTValue, str] = comptime.eval(ctx.ctx, ctx.a, context.module_source(ctx), eid, ?ctx.s.interner);
+    val res_eval: R.Result[comptime.CTValue, str] =
+        comptime.eval_at_float_width(ctx.ctx, ctx.a, context.module_source(ctx), eid, ?ctx.s.interner,
+                                     context.expr_float_width(ctx, eid));
     if (R.is_err[comptime.CTValue, str](res_eval)) { ret R.err[value.Value, str](R.unwrap_err[comptime.CTValue, str](res_eval)); }
     ret const_value_of(ctx, eid, R.unwrap_ok[comptime.CTValue, str](res_eval));
 }
@@ -3831,26 +3871,49 @@ fun ir_type_of_expr(ctx: *context.LowerContext, eid: id.ExprId) R.Result[ir_type
     ret context.lower_type(ctx, context.expr_type_of(ctx, eid));
 }
 
-# the IR integer type used for gep indices and alloca element counts (pointer-width)
+# the bit width an index carries: a machine word on a flat target, an ordinal on a
+# logical one
+#
+# On a flat target an index is scaled by the element size and added to a base
+# address, so it is address arithmetic and must be a full machine word. On a logical
+# one (`MachineModel.flat_addressing` false) nothing is scaled: an index selects a
+# MEMBER, and SPIR-V's OpAccessChain takes it at whatever integer width it is given.
+# Pointer width is meaningless there, and taking it anyway is what made a shader
+# written entirely in u32 declare OpCapability Int64 (#2878) - a hardware requirement
+# for arithmetic the module never performs.
+#
+# 32 rather than the narrowest width that fits, because the SPIR-V capability ladder
+# runs the other way too: an 8- or 16-bit index would declare Int8 or Int16. 32 is
+# the one width a Vulkan environment always has, and it is the conventional width for
+# an access chain index.
 # ---
 # ctx: per-module lowering context
-# ret: the pointer-width IR int type, or an error
-fun index_type(ctx: *context.LowerContext) R.Result[ir_type.IrTypeId, str] {
-    ret ir_type.intern_int(?ctx.m.types, ctx.tgt.isa.pointer_width * 8);
+# ret: the index width in bits
+fun index_bits(ctx: *context.LowerContext) u32 {
+    if (!ctx.tgt.model.flat_addressing) { ret 32; }
+    ret ctx.tgt.isa.pointer_width * 8;
 }
 
-# widen a runtime gep index to the pointer-width machine-word index type
+# the IR integer type used for gep indices and alloca element counts
+# ---
+# ctx: per-module lowering context
+# ret: the index-width IR int type, or an error
+fun index_type(ctx: *context.LowerContext) R.Result[ir_type.IrTypeId, str] {
+    ret ir_type.intern_int(?ctx.m.types, index_bits(ctx));
+}
+
+# widen a runtime gep index to the index-width type
 #
-# A narrower index (e.g. a u8 enum/kind) is extended per its signedness; a pointer-width
-# (or wider) index is left as-is. Without this the back end scales the index's full
-# register while its high bits are undefined, producing a wild address.
+# A narrower index (e.g. a u8 enum/kind) is extended per its signedness; one already
+# at or above the index width is left as-is. Without this a flat target's back end
+# scales the index's full register while its high bits are undefined, producing a
+# wild address.
 #
-# This is the intentional, target-derived index-normalization point: the width is
-# the active target's pointer width (index_type), and the sign/zero extension is
-# chosen here from the semantic signedness. it deliberately stays in the middle-end,
-# not the back end - the IR is signless and OP_GEP carries no per-index signedness,
-# so the back end could not pick sext vs zext; relocating it would regress signed
-# sub-word indices (#1598).
+# This is the intentional, target-derived index-normalization point: the width comes
+# from `index_bits` and the sign/zero extension is chosen here from the semantic
+# signedness. it deliberately stays in the middle-end, not the back end - the IR is
+# signless and OP_GEP carries no per-index signedness, so the back end could not pick
+# sext vs zext; relocating it would regress signed sub-word indices (#1598).
 # ---
 # ctx:    per-module lowering context
 # v:      the index value
@@ -3860,7 +3923,7 @@ fun widen_index(ctx: *context.LowerContext, v: value.Value, sem_ty: type.TypeId)
     val res_xty: R.Result[ir_type.IrTypeId, str] = index_type(ctx);
     if (R.is_err[ir_type.IrTypeId, str](res_xty)) { ret R.err[value.Value, str](R.unwrap_err[ir_type.IrTypeId, str](res_xty)); }
     val xty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](res_xty);
-    if (scalar_bits(ctx, sem_ty) >= ctx.tgt.isa.pointer_width * 8) { ret R.ok[value.Value, str](v); }
+    if (scalar_bits(ctx, sem_ty) >= index_bits(ctx)) { ret R.ok[value.Value, str](v); }
     if (is_signed_type(ctx, sem_ty))    { ret builder.emit_sext(?ctx.builder, v, xty); }
     ret builder.emit_zext(?ctx.builder, v, xty);
 }

@@ -43,12 +43,14 @@ use mach.lang.fe.resolve;
 use mach.lang.fe.sema.check;
 use mach.lang.fe.sema.coerce;
 use mach.lang.fe.sema.context;
+use mach.lang.fe.sema.handle;
 use mach.lang.fe.sema.generics;
 use mach.lang.fe.sema.typename;
 use mach.lang.layout;
 use mach.lang.fe.token;
 use mach.lang.intern;
 use mach.lang.session;
+use mach.lang.source;
 use mach.lang.type;
 
 # seed the field tables of built-in nominal types
@@ -82,7 +84,10 @@ pub fun infer_decl(sc: *context.SemaContext, did: id.DeclId) type.TypeId {
     if (d.kind == decl.DECL_KIND_FUN) { ret infer_fun_sig(sc, ?d.data.fun_); }
     if (d.kind == decl.DECL_KIND_REC) { ret infer_nominal(sc, did, d.data.rec_.name, ?d.data.rec_, type.TYPE_REC); }
     if (d.kind == decl.DECL_KIND_UNI) { ret infer_nominal_uni(sc, did, d.data.uni_.name, ?d.data.uni_, type.TYPE_UNI); }
-    if (d.kind == decl.DECL_KIND_DEF) { ret context.resolved_type_of(sc, d.data.def_.ty); }
+    if (d.kind == decl.DECL_KIND_DEF) {
+        if (d.data.def_.ty == id.TYPE_NIL) { ret handle.type_of(sc, did, d); }
+        ret context.resolved_type_of(sc, d.data.def_.ty);
+    }
     if (d.kind == decl.DECL_KIND_VAL || d.kind == decl.DECL_KIND_VAR) {
         ret infer_binding(sc, ?d.data.bind);
     }
@@ -514,6 +519,56 @@ fun fold_layout_intrinsic(sc: *context.SemaContext, eid: id.ExprId, span: token.
     if (is_align) { n = ext.align; }
     ret O.some[O.Option[comptime.CTValue]](O.some[comptime.CTValue](comptime.ct_uint(n::u64)));
 }
+
+# the comptime channel's door onto `fold_layout_intrinsic` (#2857)
+#
+# ONE MEASUREMENT POLICY, TWO POSITIONS. A type position folds the intrinsic before
+# the evaluator ever sees it; a comptime CONDITION reaches the evaluator, which calls
+# back here. Both go through `fold_layout_intrinsic`, so a size measured in an array
+# length and the same size measured in a `$if` cannot disagree - which they would the
+# moment this grew its own copy of "force the layout, then ask `type_extent`".
+#
+# The failure path reports through sema's sink rather than handing a string back,
+# because the rich diagnostics live there: a layout cycle names the type it could not
+# break, and an unmeasurable operand names the type. Returning a bare string would
+# flatten both. What travels back is only whether an answer exists.
+# ---
+# data: the erased SemaContext
+# eid:  the intrinsic call expression, as a raw id
+# ret:  ok(some(v)) measured; ok(none) not answerable here (`$offset_of`); err when
+#       a diagnostic was already reported against it
+pub fun resolve_layout_intrinsic(data: ptr, eid: u32) R.Result[O.Option[comptime.CTValue], str] {
+    val sc: *context.SemaContext = data::*context.SemaContext;
+    if (sc == nil) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
+    val e: id.ExprId = eid::id.ExprId;
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(sc.a, e);
+    if (O.is_none[*expr.Expr](e_opt)) {
+        ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]());
+    }
+    val span: token.Span = O.unwrap[*expr.Expr](e_opt).span;
+
+    val lay: O.Option[O.Option[comptime.CTValue]] = fold_layout_intrinsic(sc, e, span);
+    # `$offset_of` is not folded here - sema's field-descriptor contract leaves an
+    # offset to lowering - so it falls back to the evaluator's own refusal, which
+    # names that reason rather than this one.
+    if (O.is_none[O.Option[comptime.CTValue]](lay)) {
+        ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]());
+    }
+    val inner: O.Option[comptime.CTValue] = O.unwrap[O.Option[comptime.CTValue]](lay);
+    if (O.is_none[comptime.CTValue](inner)) {
+        ret R.err[O.Option[comptime.CTValue], str](LAYOUT_REPORTED_MSG);
+    }
+    ret R.ok[O.Option[comptime.CTValue], str](
+        O.some[comptime.CTValue](O.unwrap[comptime.CTValue](inner)));
+}
+
+# what a caller prints when the real diagnostic is already on the sink
+#
+# `fold_layout_intrinsic` reports the precise cause itself, so this exists only to
+# keep the evaluator's contract total. It says what happened rather than restating a
+# cause it does not have, because a second guess at the reason beside an accurate one
+# is worse than a pointer to it.
+pub val LAYOUT_REPORTED_MSG: str = "this layout intrinsic could not be measured; see the diagnostic reported against it";
 
 # the by-value nesting depth the forcing walk follows before leaving the rest to the
 # measurement. cycle protection is the ACTIVE marker, not this; the bound only stops
@@ -1364,10 +1419,6 @@ fun report_never_value(sc: *context.SemaContext, eid: id.ExprId, sym: *resolve.S
         check.report_named(sc, span, "`", sym.name, "` is a vector type, not a value; write a literal of that type", "a vector type is not a value");
         ret true;
     }
-    if (sym.kind == resolve.SYM_IMAGE) {
-        check.report_named(sc, span, "`", sym.name, "` is an image handle type, not a value; a handle has no literal - declare a `#[sampler(set, binding)]` binding of it", "an image handle type is not a value");
-        ret true;
-    }
 
     # a local type declaration carries its kind on the symbol; an imported one is
     # uniformly SYM_IMPORTED and is classified by its origin decl.
@@ -1386,6 +1437,13 @@ fun report_never_value(sc: *context.SemaContext, eid: id.ExprId, sym: *resolve.S
         ret true;
     }
     if (dk == decl.DECL_KIND_DEF) {
+        # a handle is a `def` too, and it is a different mistake: there is no aliased
+        # type to reach for, because the program does not own the representation and
+        # so cannot write a value of it at all
+        if (type.is_handle(?sc.s.types, context.decl_type_for(sc, sym))) {
+            check.report_named(sc, span, "`", sym.name, "` is a handle type, not a value; a handle has no literal because the program does not own its representation - declare a binding of it and hand that to an operation", "a handle type is not a value");
+            ret true;
+        }
         check.report_named(sc, span, "`", sym.name, "` is a type alias, not a value; use a value of the aliased type", "a type alias is not a value");
         ret true;
     }
@@ -1853,8 +1911,103 @@ fun infer_assign(sc: *context.SemaContext, b: *expr.ExprBinary, span: token.Span
     val rt: type.TypeId = infer_expr(sc, b.rhs);
     if (lt == type.TYPE_ERROR || rt == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
 
+    check_readonly_storage(sc, b.lhs, span);
     check.check_coercible(sc, lt, b.rhs, rt, span);
     ret lt;
+}
+
+# report an assignment whose destination lives in a `#[storage(..., "readonly")]`
+# binding (#2879)
+#
+# The qualifier's whole point is that an accidental write is a DIAGNOSTIC rather
+# than a silently widened hardware requirement, and this is where the write is
+# written. It is refused for every target, not only for a SPIR-V build: which
+# target a module is compiled for is not a property of its source, so a write that
+# the shader build refuses has to be refused by the CPU build of the same file too.
+#
+# A CHAIN WALK, for the reason `operand_is_packed_field` is one: `b = v`,
+# `b.field = v`, `b.arr[i] = v` and `lib.b.field = v` all store into the binding,
+# and a check that looked only at the outermost expression would catch the first
+# spelling and pass the rest. The question is asked at every link, since a
+# qualified reference resolves at an inner MEMBER rather than at the base
+# identifier.
+# ---
+# sc:   sema context
+# eid:  the assignment's destination expression
+# span: the operator span for the diagnostic
+fun check_readonly_storage(sc: *context.SemaContext, eid: id.ExprId, span: token.Span) {
+    if (eid == id.EXPR_NIL) { ret; }
+    if (expr_names_readonly_storage(sc, eid)) {
+        context.report(sc, span, "cannot store through a `#[storage(set, binding, \"readonly\")]` binding: the qualifier declares that no stage writes it, which is what lets the emitter mark it `NonWritable` and a vertex stage read it without `vertexPipelineStoresAndAtomics`. drop the `\"readonly\"` qualifier to write it");
+        ret;
+    }
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+    if (O.is_none[*expr.Expr](e_opt)) { ret; }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
+    if (e.kind == expr.EXPR_KIND_MEMBER) { check_readonly_storage(sc, e.data.member.object, span); ret; }
+    if (e.kind == expr.EXPR_KIND_INDEX)  { check_readonly_storage(sc, e.data.index.object, span); ret; }
+    if (e.kind == expr.EXPR_KIND_UNARY && e.data.unary.op == expr.UN_DEREF) {
+        check_readonly_storage(sc, e.data.unary.operand, span);
+    }
+}
+
+# whether `eid` names a global binding carrying `#[storage(..., "readonly")]`
+#
+# The decorator is read out of the symbol's ORIGIN AST and matched against that
+# module's source text, so a binding a shader imports from a library is recognized
+# by the same predicate as one declared beside the write (#2843).
+# ---
+# sc:  sema context
+# eid: the expression to test
+# ret: true when it denotes a read-only storage binding
+fun expr_names_readonly_storage(sc: *context.SemaContext, eid: id.ExprId) bool {
+    val so: O.Option[*resolve.Symbol] = context.symbol_for_expr(sc, eid);
+    if (O.is_none[*resolve.Symbol](so)) { ret false; }
+    val sym: *resolve.Symbol = O.unwrap[*resolve.Symbol](so);
+    if (sym.kind != resolve.SYM_VAR && sym.kind != resolve.SYM_VAL
+        && sym.kind != resolve.SYM_IMPORTED) { ret false; }
+    if (sym.decl == id.DECL_NIL) { ret false; }
+
+    val a: *ast.Ast = symbol_ast(sc, sym);
+    if (a == nil) { ret false; }
+    val d_opt: O.Option[*decl.Decl] = ast.get_decl(a, sym.decl);
+    if (O.is_none[*decl.Decl](d_opt)) { ret false; }
+    val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+    if (d.kind != decl.DECL_KIND_VAL && d.kind != decl.DECL_KIND_VAR) { ret false; }
+
+    val src: str = ast_source(sc, a);
+    if (src == nil) { ret false; }
+    var i: u32 = 0;
+    for (i < d.decorators_len) {
+        val dec: *decl.Decorator = ?a.decorators[d.decorators_start + i];
+        if (!str_region_equals(src, dec.name.offset, dec.name.len, "storage")) { i = i + 1; cnt; }
+        var q: u32 = 2;
+        for (q < dec.args_len) {
+            val q_opt: O.Option[*expr.Expr] = ast.get_expr(a, a.expr_ids[dec.args_start + q]);
+            if (O.is_some[*expr.Expr](q_opt)) {
+                val qa: *expr.Expr = O.unwrap[*expr.Expr](q_opt);
+                if (qa.kind == expr.EXPR_KIND_LIT_STR && qa.span.len >= 2::usize
+                    && str_region_equals(src, qa.span.offset + 1::usize, qa.span.len - 2::usize, "readonly")) {
+                    ret true;
+                }
+            }
+            q = q + 1;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the source text an AST was parsed from, or nil when it is not registered
+# ---
+# sc: sema context
+# a:  the AST
+# ret: the module's source text
+fun ast_source(sc: *context.SemaContext, a: *ast.Ast) str {
+    if (a == sc.a) { ret sc.source; }
+    val opt_file: O.Option[*source.SourceFile] = source.get(?sc.s.sources, a.file_id);
+    if (O.is_none[*source.SourceFile](opt_file)) { ret nil; }
+    ret O.unwrap[*source.SourceFile](opt_file).text;
 }
 
 # UNARY: per-operator rules
@@ -3533,10 +3686,6 @@ fun type_for_symbol(sc: *context.SemaContext, sym: *resolve.Symbol, span: token.
     if (sym.kind == resolve.SYM_VECTOR) {
         ret sym.slot::type.TypeId;
     }
-    # an image handle symbol carries its interned TYPE_IMAGE TypeId the same way.
-    if (sym.kind == resolve.SYM_IMAGE) {
-        ret sym.slot::type.TypeId;
-    }
     # the type-source leaf for a generic parameter, and the single place the active
     # substitution is applied on this path (#2168): every composite resolver rebuilds
     # through `resolve_type_ref`, so a leaf-only application substitutes each parameter
@@ -3582,8 +3731,10 @@ fun def_underlying(sc: *context.SemaContext, sym: *resolve.Symbol, span: token.S
         val d_opt: O.Option[*decl.Decl] = ast.get_decl(sc.a, sym.decl);
         if (O.is_none[*decl.Decl](d_opt)) { ret type.TYPE_ERROR; }
         val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
-        if (d.kind != decl.DECL_KIND_DEF)  { ret type.TYPE_ERROR; }
-        if (d.data.def_.ty == id.TYPE_NIL) { ret type.TYPE_ERROR; }
+        if (d.kind != decl.DECL_KIND_DEF) { ret type.TYPE_ERROR; }
+        # a BODYLESS `def` is a target-minted handle, whose definition the owning
+        # target supplies rather than the annotation (#2888)
+        if (d.data.def_.ty == id.TYPE_NIL) { ret handle.type_of(sc, sym.decl, d); }
         ret resolve_type_ref(sc, d.data.def_.ty);
     }
     ret context.decl_type_for(sc, sym);

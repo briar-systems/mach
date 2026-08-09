@@ -47,6 +47,7 @@ use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.expr;
 use mach.lang.fe.ast.id;
+use atype: mach.lang.fe.ast.type;
 use mach.lang.fe.token;
 use mach.lang.float;
 use mach.lang.intern;
@@ -138,10 +139,18 @@ pub val COMPTIME_BARE_IDENT_MSG: str =
 #               travels with the bits - comparison and arithmetic interpret the
 #               payload as the mathematical value it names, so comptime agrees
 #               with runtime value semantics. ignored for the non-int kinds.
+# float_width:  for CT_KIND_FLOAT, the IEEE width `data.f` is carried AT. the
+#               payload is always an f64, but an `f32` value is one the f32
+#               round trip leaves unchanged, so the next operation on it rounds
+#               where the running program rounds instead of accumulating double
+#               precision the declared type never had (#2918). FLOAT_W_NONE is an
+#               untyped literal, which stays at f64 until something declares
+#               otherwise. ignored for the non-float kinds.
 # data:         kind-specific payload
 pub rec CTValue {
     kind:         CTKind;
     int_unsigned: bool;
+    float_width:  float.FloatWidth;
     data: uni {
         i: i64;
         f: f64;
@@ -242,6 +251,13 @@ pub def IdentBindingFn: fun(ptr, id.ExprId) bool;
 pub val COMPTIME_IDENT_RUNTIME_MSG: str =
     "identifier names a runtime binding, so it has no comptime value";
 
+# surfaced when the two operands of a float operation carry different declared
+# widths. mach has no implicit widening, so this is a type error the typed
+# passes report against the source; the evaluator refuses rather than picking a
+# width, because folding at either one names a value the program never computes
+pub val FLOAT_WIDTH_MISMATCH_MSG: str =
+    "float operands have different declared widths; mach has no implicit widening";
+
 # the questions a comptime type query answers about one already-resolved type
 # (#2128). `eval` holds no type universe, so the typed layer installs the answer
 # with `set_type_query_resolver`, the same shape as the field-member hook above.
@@ -257,6 +273,18 @@ pub val TYPE_QUERY_IS_SECRET:  u8 = 4;
 # answers one TYPE_QUERY_* about a TypeId: a bool for the predicates, a string for
 # the name, or none when this context cannot answer (no resolver installed)
 pub def TypeQueryFn: fun(ptr, u32, u8) R.Result[O.Option[CTValue], str];
+
+# the layout-intrinsic resolver `eval` calls to measure `$size_of` / `$align_of` /
+# `$length_of` in a comptime VALUE position (#2857)
+#
+# Takes the call expression rather than a type id, because the measurement needs the
+# intrinsic's own argument resolved against the installing pass's type universe and
+# needs to know WHICH intrinsic was written. The pass that owns layout answers; the
+# evaluator neither measures nor decides what is measurable.
+#
+# ok(none) means "not something this resolver answers", which falls through to the
+# position's own refusal. An err carries a precise message the caller reports.
+pub def LayoutFoldFn: fun(ptr, u32) R.Result[O.Option[CTValue], str];
 
 # surfaced when a type predicate is used where no type query resolver is installed
 pub val COMPTIME_TYPE_QUERY_NO_RESOLVER_MSG: str =
@@ -309,6 +337,12 @@ pub def FrameMark: u32;
 # build_pie:      1 when the build is position-independent (`--pie`), 0 otherwise;
 #                 read by `$mach.build.pie` so the runtime gates its self-relocation
 # pointer_width:  target pointer width in bytes
+# target_defs:    the operations the selected target defines, or nil when it defines
+#                 none. carried here for exactly the reason `pointer_width` and
+#                 `vector_bits` are: it is a target machine fact the frontend needs,
+#                 and the frontend has no target. it is DATA the frontend reads and
+#                 never a call into a back end, which is what lets a declaration
+#                 naming an instruction be checked without `fe` knowing any target
 # vector_bits:    the widest vector the target admits by name, in bits, which
 #                 bounds the `TxN` vector form the resolver reads (#2687). carried
 #                 here for the same reason `pointer_width` is: it is a target
@@ -358,6 +392,7 @@ pub rec ComptimeCtx {
     build_mode_id:  u32;
     build_pie:      u32;
     pointer_width:  u32;
+    target_defs:    *isa.TargetDefs;
     vector_bits:    u32;
     compiler_name:  intern.StrId;
     compiler_ver:   intern.StrId;
@@ -384,6 +419,8 @@ pub rec ComptimeCtx {
     field_data:     ptr;
     query_fn:       *u8;
     query_data:     ptr;
+    layout_fn:      *u8;
+    layout_data:    ptr;
     ident_fn:       *u8;
     ident_data:     ptr;
 }
@@ -434,6 +471,7 @@ pub fun init(
     c.build_mode_id  = build_mode_id;
     c.build_pie      = build_pie;
     c.pointer_width  = pointer_width;
+    c.target_defs    = nil;
     c.vector_bits    = vector_bits;
     c.compiler_name  = compiler_name;
     c.compiler_ver   = compiler_ver;
@@ -460,6 +498,8 @@ pub fun init(
     c.field_data     = nil;
     c.query_fn       = nil;
     c.query_data     = nil;
+    c.layout_fn      = nil;
+    c.layout_data    = nil;
     c.ident_fn       = nil;
     c.ident_data     = nil;
     ret c;
@@ -514,6 +554,34 @@ pub fun set_field_resolver(c: *ComptimeCtx, fn: *u8, data: ptr) {
 pub fun set_type_query_resolver(c: *ComptimeCtx, fn: *u8, data: ptr) {
     c.query_fn   = fn;
     c.query_data = data;
+}
+
+# install the layout resolver `eval` calls to measure a layout intrinsic in a
+# comptime value position (#2857)
+#
+# publish the selected target's operation definitions to the frontend
+#
+# A setter rather than an `init` parameter because it is optional: every target but
+# SPIR-V defines no operations of its own, and a host with no target at all (the
+# editor's single-buffer context) has none to publish.
+# ---
+# c: the comptime context
+# d: the borrowed table, or nil
+pub fun set_target_defs(c: *ComptimeCtx, d: *isa.TargetDefs) {
+    c.target_defs = d;
+}
+
+# Only a pass that has the type universe AND can force a type's layout may install
+# one - in practice sema. Resolve leaves it nil, and a layout intrinsic in a
+# declaration-gating `$if` is refused there with a message saying so, which is the
+# same line the type queries already draw.
+# ---
+# c:    the comptime context
+# fn:   erased LayoutFoldFn, or nil to clear
+# data: opaque context handed back to `fn`
+pub fun set_layout_resolver(c: *ComptimeCtx, fn: *u8, data: ptr) {
+    c.layout_fn   = fn;
+    c.layout_data = data;
 }
 
 # install (or clear) the identifier-binding resolver `eval` consults before it
@@ -762,7 +830,16 @@ fun consts_push(a: *A.Allocator, arr: **NamedConst, len: *u32, cap: *u32, nc: Na
     ret R.ok[bool, str](true);
 }
 
-# evaluates a comptime expression in the given context
+# evaluates a comptime expression in a context that declares no float width
+#
+# Every non-float expression, and every float expression whose value is not
+# being stored into a declared float type - a `$if` condition, a `$assert`, an
+# array length. A float literal in such a position is untyped and stays at f64,
+# which is the type a Mach float literal takes when nothing narrows it.
+#
+# An INITIALIZER for a declared float type must go through
+# `eval_at_float_width` instead, or the chain folds at f64 and disagrees with
+# the same chain at run time (#2918).
 # ---
 # c:        the comptime context (target params + user constants)
 # a:        the ast that owns `e`
@@ -777,6 +854,35 @@ pub fun eval(
     e:        id.ExprId,
     interner: *intern.Interner
 ) R.Result[CTValue, str] {
+    ret eval_at_float_width(c, a, source, e, interner, float.FLOAT_W_NONE);
+}
+
+# evaluates a comptime expression whose float type the context declares
+#
+# `fw` is the width the expression's own declared type fixes, and it reaches
+# every untyped float literal in the tree. That is what makes an `f32` chain
+# round at f32 after EVERY operation, which is what the running program does:
+# rounding once at the end is a different value (#2918), and rounding a literal
+# that a wider binding was going to hold would be wrong in the other direction.
+#
+# Pass `FLOAT_W_NONE` when the context declares no float type; `eval` is that
+# call spelled out.
+# ---
+# c:        the comptime context (target params + user constants)
+# a:        the ast that owns `e`
+# source:   source text covering `e` (for span lookup)
+# e:        expression id to evaluate
+# interner: shared string interner; used to compare identifier text via StrId
+# fw:       the float width the declared type fixes for this expression
+# ret:      a CTValue, or an error message describing why evaluation failed
+pub fun eval_at_float_width(
+    c:        *ComptimeCtx,
+    a:        *ast.Ast,
+    source:   str,
+    e:        id.ExprId,
+    interner: *intern.Interner,
+    fw:       float.FloatWidth
+) R.Result[CTValue, str] {
     if (e == id.EXPR_NIL) { ret R.err[CTValue, str]("missing expression"); }
 
     val n_opt: O.Option[*expr.Expr] = ast.get_expr(a, e);
@@ -785,13 +891,20 @@ pub fun eval(
     val k: expr.ExprKind = node.kind;
 
     if (k == expr.EXPR_KIND_LIT_INT)   { ret eval_lit_int(source, node.span); }
-    if (k == expr.EXPR_KIND_LIT_FLOAT) { ret eval_lit_float(source, node.span); }
+    # the literal's decimal text is decoded exactly, then taken at the declared
+    # width: `16777217.0` in an f32 context IS 16777216.0f, and every later
+    # operation must see that value and not the f64 the digits spell.
+    if (k == expr.EXPR_KIND_LIT_FLOAT) {
+        val r_lit: R.Result[CTValue, str] = eval_lit_float(source, node.span);
+        if (R.is_err[CTValue, str](r_lit)) { ret r_lit; }
+        ret float_value(R.unwrap_ok[CTValue, str](r_lit).data.f, fw);
+    }
     if (k == expr.EXPR_KIND_LIT_CHAR)  { ret eval_lit_char(source, node.span); }
     if (k == expr.EXPR_KIND_LIT_STR)   { ret eval_lit_str(source, node.span, interner); }
     if (k == expr.EXPR_KIND_LIT_NIL)   { ret R.err[CTValue, str]("nil is not comptime-evaluable"); }
 
-    if (k == expr.EXPR_KIND_BINARY) { ret eval_binary(c, a, source, ?node.data.binary, interner); }
-    if (k == expr.EXPR_KIND_UNARY)  { ret eval_unary(c, a, source, ?node.data.unary, interner); }
+    if (k == expr.EXPR_KIND_BINARY) { ret eval_binary(c, a, source, ?node.data.binary, interner, fw); }
+    if (k == expr.EXPR_KIND_UNARY)  { ret eval_unary(c, a, source, ?node.data.unary, interner, fw); }
 
     if (k == expr.EXPR_KIND_IDENT) {
         val r_id: R.Result[CTValue, str] = eval_ident(c, source, e, node.span, interner);
@@ -802,7 +915,7 @@ pub fun eval(
         # yields its constant; a record element (a struct literal) is not a comptime
         # scalar and surfaces the struct-literal rejection, exactly as intended.
         if (v_id.kind == CT_KIND_CONST_ELEM) {
-            ret eval(c, a, source, v_id.data.celem.elem::id.ExprId, interner);
+            ret eval_at_float_width(c, a, source, v_id.data.celem.elem::id.ExprId, interner, fw);
         }
         ret r_id;
     }
@@ -825,7 +938,7 @@ pub fun eval(
         # field-descriptor path since a constant-element object is a plain identifier
         # (not a CT_KIND_FIELD), so the two never collide.
         val cel: O.Option[R.Result[CTValue, str]] =
-            eval_const_elem_member(c, a, source, node.data.member.object, node.data.member.name, interner);
+            eval_const_elem_member(c, a, source, node.data.member.object, node.data.member.name, interner, fw);
         if (O.is_some[R.Result[CTValue, str]](cel)) { ret O.unwrap[R.Result[CTValue, str]](cel); }
         # a `.name` / `.type` / `.offset` projection off a comptime field
         # descriptor (#1473): fires only when the object evaluates to a
@@ -841,17 +954,16 @@ pub fun eval(
     # generic call rejection describes it wrongly and sends the reader hunting for a
     # non-constant operand that is not there (#2316). TYPE positions do not arrive
     # here at all - they fold the intrinsic against forced layout material before
-    # asking the evaluator (#2442) - so what reaches this arm is a position with no
-    # layout to force: a `$if` / `$or` condition, or a `$assert` once it evaluates.
+    # asking the evaluator (#2442) - so what reaches this arm is a `$if` / `$or`
+    # condition or a `$assert`, which since #2857 is measured through the installed
+    # layout resolver rather than refused outright.
     if (k == expr.EXPR_KIND_CALL) {
         # a type predicate answers about the SHAPE of its operand type rather than
         # its storage, so it folds here in the comptime channel - which is where the
         # `$if` gate that consumes it is decided (#2128).
         val q: O.Option[R.Result[CTValue, str]] = eval_type_query(c, a, source, e, interner);
         if (O.is_some[R.Result[CTValue, str]](q)) { ret O.unwrap[R.Result[CTValue, str]](q); }
-        if (is_layout_intrinsic_call(a, source, e)) {
-            ret R.err[CTValue, str]("a layout intrinsic has no value in this position: it measures a type, which only a type position resolves");
-        }
+        if (is_layout_intrinsic_call(a, source, e)) { ret eval_layout_intrinsic(c, a, source, e); }
         ret R.err[CTValue, str]("function calls are not comptime-evaluable");
     }
     if (k == expr.EXPR_KIND_INDEX)      { ret R.err[CTValue, str]("index expressions are not comptime-evaluable"); }
@@ -862,6 +974,54 @@ pub fun eval(
     if (k == expr.EXPR_KIND_ERROR)      { ret R.err[CTValue, str]("expression has a parse error"); }
 
     ret R.err[CTValue, str]("expression is not comptime-evaluable");
+}
+
+# measure a layout intrinsic in a comptime value position, or say why not (#2857)
+#
+# A size is a constant, and the thing worth asserting about a layout is usually a
+# RELATIONSHIP between two of them - `$size_of(A) == $size_of(B)` for two records a
+# renderer writes into one slot, `$size_of(Header) == 64` for a wire format. That is
+# exactly what a `$if` expresses, so refusing the position turned a compile-time
+# invariant into a runtime test that only fires if someone runs the suite.
+#
+# THE MEASUREMENT IS NOT HERE, and deliberately. Measuring needs the type universe
+# and needs to FORCE the operand's layout material, both of which belong to the pass
+# that owns them; this module would otherwise hold a second layout policy that could
+# disagree with sema's. So the resolver answers and this function only routes.
+#
+# WITH NO RESOLVER INSTALLED the answer is a refusal that says WHEN the intrinsic
+# becomes available rather than claiming it has no value anywhere. That case is a
+# `$if` one of whose arms declares something, decided during name resolution where no
+# type has been checked yet (see `comptime_if_declares_nothing`) - the same line the
+# type queries already draw, and stated the same way, because a reader who hits one
+# and then the other should not think they are different rules.
+# ---
+# c:      the comptime context
+# a:      the AST
+# source: the module's source text
+# e:      the intrinsic call expression
+# ret:    the measured constant, or a precise refusal
+fun eval_layout_intrinsic(c: *ComptimeCtx, a: *ast.Ast, source: str, e: id.ExprId) R.Result[CTValue, str] {
+    if (c.layout_fn == nil) {
+        # `$offset_of` is named apart because it is unavailable for a DIFFERENT
+        # reason - sema's field-descriptor contract leaves offsets to lowering - so a
+        # message about type checking would be a stale explanation the moment the
+        # resolver exists.
+        if (is_comptime_call(a, source, e, "offset_of")) {
+            ret R.err[CTValue, str]("`$offset_of` has no value in a comptime condition: a field's offset is decided at lowering, later than any comptime branch");
+        }
+        ret R.err[CTValue, str]("a layout intrinsic is only comptime-evaluable after type checking: an arm of this `$if` declares something, so the gate selects DECLARATIONS and is decided during name resolution, before any type is laid out. a `$if` whose every arm declares nothing is decided during type checking and can measure a type");
+    }
+    val fn: LayoutFoldFn = c.layout_fn::LayoutFoldFn;
+    val r: R.Result[O.Option[CTValue], str] = fn(c.layout_data, e::u32);
+    if (R.is_err[O.Option[CTValue], str](r)) {
+        ret R.err[CTValue, str](R.unwrap_err[O.Option[CTValue], str](r));
+    }
+    val ans: O.Option[CTValue] = R.unwrap_ok[O.Option[CTValue], str](r);
+    if (O.is_none[CTValue](ans)) {
+        ret R.err[CTValue, str]("`$offset_of` has no value in a comptime condition: a field's offset is decided at lowering, later than any comptime branch");
+    }
+    ret R.ok[CTValue, str](O.unwrap[CTValue](ans));
 }
 
 # returns a length-counted view into source covering `span`. the returned view
@@ -1148,10 +1308,10 @@ pub fun eval_lit_float(source: str, span: token.Span) R.Result[CTValue, str] {
 
     val bits: u64 = decimal_to_f64(?mant, dexp + exp, trunc);
 
-    var v: CTValue;
-    v.kind   = CT_KIND_FLOAT;
-    v.data.f = float.bits_f64(bits);
-    ret R.ok[CTValue, str](v);
+    # the literal alone declares no width: the exact f64 decoding is what the
+    # parser stores in the ast, and `eval_at_float_width` is what takes it at the
+    # width its context declares.
+    ret R.ok[CTValue, str](ct_float(float.bits_f64(bits), float.FLOAT_W_NONE));
 }
 
 # parse a character literal `'X'`, including escape sequences
@@ -1296,13 +1456,16 @@ fun hex_digit(c: u8) i64 {
     ret 0 - 1;
 }
 
-# binary-operator dispatch
+# binary-operator dispatch. `fw` is the declared float width of the RESULT, which
+# both operands share: a float operator has one width, and an operand written as
+# an untyped literal takes it
 fun eval_binary(
     c:        *ComptimeCtx,
     a:        *ast.Ast,
     source:   str,
     bin:      *expr.ExprBinary,
-    interner: *intern.Interner
+    interner: *intern.Interner,
+    fw:       float.FloatWidth
 ) R.Result[CTValue, str] {
     if (bin.op == expr.BIN_ASSIGN) { ret R.err[CTValue, str]("assignment is not comptime-evaluable"); }
 
@@ -1322,9 +1485,19 @@ fun eval_binary(
         ret eval_type_comparison(c, a, source, bin, interner);
     }
 
-    val lhs_r: R.Result[CTValue, str] = eval(c, a, source, bin.lhs, interner);
+    # a comparison yields a bool, so the enclosing declared width says nothing
+    # about its operands: their shared float width comes from the operands
+    # themselves, and `apply_compare` / `apply_equality` reconcile it.
+    var operand_fw: float.FloatWidth = fw;
+    if (bin.op == expr.BIN_EQ || bin.op == expr.BIN_NEQ
+     || bin.op == expr.BIN_LT || bin.op == expr.BIN_LEQ
+     || bin.op == expr.BIN_GT || bin.op == expr.BIN_GEQ) {
+        operand_fw = float.FLOAT_W_NONE;
+    }
+
+    val lhs_r: R.Result[CTValue, str] = eval_at_float_width(c, a, source, bin.lhs, interner, operand_fw);
     if (R.is_err[CTValue, str](lhs_r)) { ret lhs_r; }
-    val rhs_r: R.Result[CTValue, str] = eval(c, a, source, bin.rhs, interner);
+    val rhs_r: R.Result[CTValue, str] = eval_at_float_width(c, a, source, bin.rhs, interner, operand_fw);
     if (R.is_err[CTValue, str](rhs_r)) { ret rhs_r; }
 
     val lhs: CTValue = R.unwrap_ok[CTValue, str](lhs_r);
@@ -1340,27 +1513,30 @@ fun eval_binary(
     ret apply_arith(bin.op, lhs, rhs);
 }
 
-# unary-operator dispatch
+# unary-operator dispatch. `fw` is the declared float width of the result, which
+# a `-` operand shares
 fun eval_unary(
     c:        *ComptimeCtx,
     a:        *ast.Ast,
     source:   str,
     un:       *expr.ExprUnary,
-    interner: *intern.Interner
+    interner: *intern.Interner,
+    fw:       float.FloatWidth
 ) R.Result[CTValue, str] {
     if (un.op == expr.UN_ADDR || un.op == expr.UN_DEREF) {
         ret R.err[CTValue, str]("address-of and dereference are not comptime-evaluable");
     }
 
-    val r: R.Result[CTValue, str] = eval(c, a, source, un.operand, interner);
+    val r: R.Result[CTValue, str] = eval_at_float_width(c, a, source, un.operand, interner, fw);
     if (R.is_err[CTValue, str](r)) { ret r; }
     val v: CTValue = R.unwrap_ok[CTValue, str](r);
 
     if (un.op == expr.UN_NEG) {
         if (v.kind == CT_KIND_INT)   { ret ct_negate(v); }
-        # float negation is a sign-bit flip, exact for every operand. `0.0 - x`
+        # float negation is a sign-bit flip, exact for every operand, so it
+        # neither changes nor needs to re-round the operand's width. `0.0 - x`
         # would return `+0.0` for either zero and make `-0.0` unspellable (#2274).
-        if (v.kind == CT_KIND_FLOAT) { ret float_value(float.f64_neg(v.data.f)); }
+        if (v.kind == CT_KIND_FLOAT) { ret float_value(float.f64_neg(v.data.f), v.float_width); }
         ret R.err[CTValue, str]("unary - requires a numeric operand");
     }
     if (un.op == expr.UN_NOT) {
@@ -1501,6 +1677,75 @@ pub fun is_fields_call(a: *ast.Ast, source: str, eid: id.ExprId) bool {
     ret is_comptime_call(a, source, eid, "fields");
 }
 
+# WHEN A DECLARATION-SCOPE `$if` IS DECIDED (#2876)
+#
+# A `$if` chain in declaration position runs at one of two times, and this predicate
+# is the whole rule that picks which:
+#
+#   - a chain in which SOME arm declares something is decided during name
+#     resolution, because what it decides is which declarations exist, and every
+#     later pass reads the declaration set resolution produced. Nothing has a type
+#     yet at that point, so such a gate cannot ask a type question.
+#   - a chain in which NO arm declares anything contributes no name and no type
+#     whichever arm is taken, so nothing downstream depends on deciding it early.
+#     It is decided during type checking instead, where types exist and a gate may
+#     measure one (`$size_of`), compare one, or query one.
+#
+# The visible consequence of the second case is one of ORDER: a reached `$error`
+# under a deferred chain is reported during type checking, so an unrelated
+# resolution error elsewhere in the module is reported before it rather than after.
+#
+# THE QUESTION IS SYNTACTIC AND IS ANSWERED BEFORE ANY ARM IS EVALUATED. Every arm
+# counts, including `$or` and `$else`: one declaring arm anywhere in the chain keeps
+# the WHOLE chain at resolution. Deciding per-arm would make the pass that runs the
+# gate depend on which arm the gate selects, and resolution is the pass that would
+# have to know that. Because a `use` is a declaration, a conditional import is
+# always a resolution-time chain.
+# ---
+# a:              the ast that owns the chain
+# branches_start: first branch index
+# branches_len:   number of branches
+# ret:            true when no arm of the chain declares anything
+pub fun comptime_if_declares_nothing(a: *ast.Ast, branches_start: u32, branches_len: u32) bool {
+    var bi: u32 = 0;
+    for (bi < branches_len) {
+        val branch_ix: u32 = branches_start + bi;
+        if (branch_ix::usize >= a.comptime_branch_len) { ret false; }
+        val br: *decl.ComptimeBranch = ?a.comptime_branches[branch_ix];
+        var di: u32 = 0;
+        for (di < br.body_len) {
+            val pool_ix: u32 = br.body_start + di;
+            if (pool_ix::usize >= a.decl_id_len) { ret false; }
+            if (!decl_declares_nothing(a, a.decl_ids[pool_ix])) { ret false; }
+            di = di + 1;
+        }
+        bi = bi + 1;
+    }
+    ret true;
+}
+
+# whether one declaration-position node introduces no name
+#
+# A bare comptime directive (`$error(...)` / `$warn(...)`) is the shape this exists
+# for. A nested `$if` introduces no name of its own and so is asked the same question
+# about its arms. EVERY OTHER KIND COUNTS AS DECLARING, including a parse-error node,
+# whose contents are unknown - an unrecognised kind must keep its chain at resolution
+# rather than silently qualify it for deferral.
+# ---
+# a:   the ast that owns `did`
+# did: the declaration to classify
+# ret: true when the declaration introduces no name
+fun decl_declares_nothing(a: *ast.Ast, did: id.DeclId) bool {
+    val d_opt: O.Option[*decl.Decl] = ast.get_decl(a, did);
+    if (O.is_none[*decl.Decl](d_opt)) { ret false; }
+    val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+    if (d.kind == decl.DECL_KIND_COMPTIME_ATTR) { ret true; }
+    if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
+        ret comptime_if_declares_nothing(a, d.data.comptime_if.branches_start, d.data.comptime_if.branches_len);
+    }
+    ret false;
+}
+
 # whether `eid` is a LAYOUT intrinsic call - `$size_of(T)`, `$align_of(T)`, or
 # `$offset_of(T, f)` - recognized structurally like the other intrinsic predicates
 #
@@ -1570,6 +1815,58 @@ pub fun fields_type_arg(a: *ast.Ast, eid: id.ExprId) id.ExprId {
 pub rec ArrayLitInfo {
     elems_start: u32;
     elems_len:   u32;
+}
+
+# reads the float width a type ANNOTATION spells, for the passes that run before
+# any type exists
+#
+# The load-time module walk and name resolution both fold module-level `val`
+# initializers, and both need the declared width to fold a float one correctly
+# (#2918) - but neither has a type universe to ask. It does not need one for the
+# primitive spellings: `f32` and `f64` are recognised in type position ahead of
+# scope, so no declaration can make either name anything else, and reading the
+# spelling is exact rather than a guess.
+#
+# `^f32` is an f32 under a secret wrapper, and the wrapper changes where the
+# value may flow, not what it rounds to.
+#
+# FLOAT_W_NONE means the annotation does not spell a float width HERE. For a
+# non-float declaration that is simply true. For a float type reached through an
+# alias it means the width is unreadable this early, which the caller must treat
+# as "cannot fold this float yet" rather than as f64 - see
+# `register_val_for_load`.
+# ---
+# a:      the ast owning `t`
+# source: source text covering `t`
+# t:      the annotation's TypeId
+# ret:    the width the spelling fixes, or FLOAT_W_NONE
+pub fun declared_float_width(a: *ast.Ast, source: str, t: id.TypeId) float.FloatWidth {
+    if (t == id.TYPE_NIL) { ret float.FLOAT_W_NONE; }
+    val opt: O.Option[*atype.Type] = ast.get_type(a, t);
+    if (O.is_none[*atype.Type](opt)) { ret float.FLOAT_W_NONE; }
+    val ty: *atype.Type = O.unwrap[*atype.Type](opt);
+
+    if (ty.kind == atype.TYPE_KIND_SECRET) {
+        ret declared_float_width(a, source, ty.data.secret.inner);
+    }
+    if (ty.kind != atype.TYPE_KIND_NAMED)   { ret float.FLOAT_W_NONE; }
+    if (ty.data.named.args_len != 0)        { ret float.FLOAT_W_NONE; }
+
+    val text: View = span_text(source, ty.data.named.name);
+    if (view_eq_str(text, "f32")) { ret float.FLOAT_W_32; }
+    if (view_eq_str(text, "f64")) { ret float.FLOAT_W_64; }
+    ret float.FLOAT_W_NONE;
+}
+
+# whether a folded value is a float whose declared width the folding pass could
+# not read: the value is a float, but nothing narrowed it, so it is still the
+# f64 the digits spell rather than a value of its declared type
+#
+# The pre-type passes bind only what they can bind correctly, so a value that
+# answers true here is left for a pass that has the type. Binding it anyway
+# would publish a constant that disagrees with the one the program computes.
+pub fun float_width_unread(v: CTValue) bool {
+    ret v.kind == CT_KIND_FLOAT && v.float_width == float.FLOAT_W_NONE;
 }
 
 # extracts the element slice of a binding declaration's array-literal initializer
@@ -1890,9 +2187,15 @@ fun apply_equality(op: expr.BinOp, lhs: CTValue, rhs: CTValue) R.Result[CTValue,
     if (lhs.kind != rhs.kind) {
         ret R.err[CTValue, str]("equality requires operands of the same kind");
     }
+    if (lhs.kind == CT_KIND_FLOAT && !float.widths_agree(lhs.float_width, rhs.float_width)) {
+        ret R.err[CTValue, str](FLOAT_WIDTH_MISMATCH_MSG);
+    }
     var eq: bool = false;
     if (lhs.kind == CT_KIND_INT)   { eq = ct_int_eq(lhs, rhs); }
-    or (lhs.kind == CT_KIND_FLOAT) { eq = lhs.data.f == rhs.data.f; }
+    or (lhs.kind == CT_KIND_FLOAT) {
+        val w: float.FloatWidth = float.unify_width(lhs.float_width, rhs.float_width);
+        eq = float.round_at(lhs.data.f, w) == float.round_at(rhs.data.f, w);
+    }
     or (lhs.kind == CT_KIND_BOOL)  { eq = lhs.data.b == rhs.data.b; }
     or (lhs.kind == CT_KIND_STR)   { eq = lhs.data.s == rhs.data.s; }
     or (lhs.kind == CT_KIND_TYPE)  { eq = lhs.data.t == rhs.data.t; }
@@ -1914,10 +2217,19 @@ fun apply_compare(op: expr.BinOp, lhs: CTValue, rhs: CTValue) R.Result[CTValue, 
         ret bool_value(!ct_int_lt(lhs, rhs));
     }
     if (lhs.kind == CT_KIND_FLOAT) {
-        if (op == expr.BIN_LT)  { ret bool_value(lhs.data.f <  rhs.data.f); }
-        if (op == expr.BIN_LEQ) { ret bool_value(lhs.data.f <= rhs.data.f); }
-        if (op == expr.BIN_GT)  { ret bool_value(lhs.data.f >  rhs.data.f); }
-        ret bool_value(lhs.data.f >= rhs.data.f);
+        # an f32 constant against an untyped literal is an f32 comparison: the
+        # literal is the f32 the running program would have compared against, so
+        # both sides round to the shared width before they are ordered.
+        if (!float.widths_agree(lhs.float_width, rhs.float_width)) {
+            ret R.err[CTValue, str](FLOAT_WIDTH_MISMATCH_MSG);
+        }
+        val w: float.FloatWidth = float.unify_width(lhs.float_width, rhs.float_width);
+        val l: f64 = float.round_at(lhs.data.f, w);
+        val r: f64 = float.round_at(rhs.data.f, w);
+        if (op == expr.BIN_LT)  { ret bool_value(l <  r); }
+        if (op == expr.BIN_LEQ) { ret bool_value(l <= r); }
+        if (op == expr.BIN_GT)  { ret bool_value(l >  r); }
+        ret bool_value(l >= r);
     }
     ret R.err[CTValue, str]("ordered comparison requires numeric operands");
 }
@@ -1925,10 +2237,12 @@ fun apply_compare(op: expr.BinOp, lhs: CTValue, rhs: CTValue) R.Result[CTValue, 
 # the truncated (C `fmod`) floating-point remainder: rem = a - trunc(a / b) * b,
 # taking the sign of the dividend `a`. `::i64` truncates the quotient toward zero,
 # matching the back end's FP_TO_SI lowering, so the comptime fold and the runtime
-# sequence agree bit for bit. the caller guards `b == 0`
-fun float_trunc_rem(a: f64, b: f64) f64 {
-    val q: i64 = (a / b)::i64;
-    ret a - q::f64 * b;
+# sequence agree bit for bit. every intermediate rounds at `w` because that is
+# what the emitted divide / convert / multiply / subtract sequence does at that
+# width. the caller guards `b == 0`
+fun float_trunc_rem(a: f64, b: f64, w: float.FloatWidth) f64 {
+    val q: i64 = float.round_at(a / b, w)::i64;
+    ret float.round_at(a - float.round_at(float.round_at(q::f64, w) * b, w), w);
 }
 
 fun apply_arith(op: expr.BinOp, lhs: CTValue, rhs: CTValue) R.Result[CTValue, str] {
@@ -1936,21 +2250,41 @@ fun apply_arith(op: expr.BinOp, lhs: CTValue, rhs: CTValue) R.Result[CTValue, st
         ret R.err[CTValue, str]("arithmetic requires operands of the same kind");
     }
     if (lhs.kind == CT_KIND_INT)   { ret apply_int_arith(op, lhs, rhs); }
-    if (lhs.kind == CT_KIND_FLOAT) {
-        if (op == expr.BIN_ADD) { ret float_value(lhs.data.f + rhs.data.f); }
-        if (op == expr.BIN_SUB) { ret float_value(lhs.data.f - rhs.data.f); }
-        if (op == expr.BIN_MUL) { ret float_value(lhs.data.f * rhs.data.f); }
-        if (op == expr.BIN_DIV) {
-            if (rhs.data.f == 0.0) { ret R.err[CTValue, str]("float division by zero"); }
-            ret float_value(lhs.data.f / rhs.data.f);
-        }
-        if (op == expr.BIN_MOD) {
-            if (rhs.data.f == 0.0) { ret R.err[CTValue, str]("float modulo by zero"); }
-            ret float_value(float_trunc_rem(lhs.data.f, rhs.data.f));
-        }
-        ret R.err[CTValue, str]("unsupported float operator");
-    }
+    if (lhs.kind == CT_KIND_FLOAT) { ret apply_float_arith(op, lhs, rhs); }
     ret R.err[CTValue, str]("arithmetic requires numeric operands");
+}
+
+# float arithmetic at the operands' shared declared width (#2918)
+#
+# BOTH OPERANDS ARE ROUNDED TO THE SHARED WIDTH BEFORE THE OPERATION, and the
+# result is rounded again. That is the whole of the fix: an f32 chain rounds
+# after every step, exactly as the emitted code does, so a folded constant and
+# the identical run-time computation cannot disagree. Rounding only the final
+# result would give a different value for any chain longer than one operation,
+# and rounding neither is what produced an f32 constant carrying f64 precision.
+#
+# An untyped literal beside a typed operand takes the typed operand's width
+# here, which is where `A * 0.1` at f32 stops multiplying by the f64 `0.1`.
+fun apply_float_arith(op: expr.BinOp, lhs: CTValue, rhs: CTValue) R.Result[CTValue, str] {
+    if (!float.widths_agree(lhs.float_width, rhs.float_width)) {
+        ret R.err[CTValue, str](FLOAT_WIDTH_MISMATCH_MSG);
+    }
+    val w: float.FloatWidth = float.unify_width(lhs.float_width, rhs.float_width);
+    val l: f64 = float.round_at(lhs.data.f, w);
+    val r: f64 = float.round_at(rhs.data.f, w);
+
+    if (op == expr.BIN_ADD) { ret float_value(l + r, w); }
+    if (op == expr.BIN_SUB) { ret float_value(l - r, w); }
+    if (op == expr.BIN_MUL) { ret float_value(l * r, w); }
+    if (op == expr.BIN_DIV) {
+        if (r == 0.0) { ret R.err[CTValue, str]("float division by zero"); }
+        ret float_value(l / r, w);
+    }
+    if (op == expr.BIN_MOD) {
+        if (r == 0.0) { ret R.err[CTValue, str]("float modulo by zero"); }
+        ret float_value(float_trunc_rem(l, r, w), w);
+    }
+    ret R.err[CTValue, str]("unsupported float operator");
 }
 
 # integer arithmetic with value-correct signedness. bitwise ops produce a pure
@@ -2172,7 +2506,8 @@ fun eval_const_elem_member(
     source:      str,
     object_eid:  id.ExprId,
     member_span: token.Span,
-    interner:    *intern.Interner
+    interner:    *intern.Interner,
+    fw:          float.FloatWidth
 ) O.Option[R.Result[CTValue, str]] {
     val obj_opt: O.Option[*expr.Expr] = ast.get_expr(a, object_eid);
     if (O.is_none[*expr.Expr](obj_opt))                                       { ret O.none[R.Result[CTValue, str]](); }
@@ -2203,7 +2538,7 @@ fun eval_const_elem_member(
         val fname_r: R.Result[intern.StrId, str] = intern.intern_span(interner, source, fi.name);
         if (R.is_err[intern.StrId, str](fname_r)) { ret O.some[R.Result[CTValue, str]](R.err[CTValue, str](R.unwrap_err[intern.StrId, str](fname_r))); }
         if (R.unwrap_ok[intern.StrId, str](fname_r) == mname) {
-            ret O.some[R.Result[CTValue, str]](eval(c, a, source, fi.value, interner));
+            ret O.some[R.Result[CTValue, str]](eval_at_float_width(c, a, source, fi.value, interner, fw));
         }
         i = i + 1;
     }
@@ -2553,6 +2888,7 @@ fun arch_tag_for(name: View) R.Result[u32, str] {
     if (view_eq_str(name, "x86_64"))  { ret R.ok[u32, str](isa.ARCH_X86_64); }
     if (view_eq_str(name, "aarch64")) { ret R.ok[u32, str](isa.ARCH_AARCH64); }
     if (view_eq_str(name, "riscv64")) { ret R.ok[u32, str](isa.ARCH_RISCV64); }
+    if (view_eq_str(name, "riscv32")) { ret R.ok[u32, str](isa.ARCH_RISCV32); }
     ret R.err[u32, str]("unknown `$mach.arch.*` tag");
 }
 
@@ -2567,6 +2903,9 @@ fun abi_tag_for(name: View) R.Result[u32, str] {
     if (view_eq_str(name, "lp64"))    { ret R.ok[u32, str](abi.ABI_LP64); }
     if (view_eq_str(name, "lp64f"))   { ret R.ok[u32, str](abi.ABI_LP64F); }
     if (view_eq_str(name, "lp64d"))   { ret R.ok[u32, str](abi.ABI_LP64D); }
+    if (view_eq_str(name, "ilp32"))   { ret R.ok[u32, str](abi.ABI_ILP32); }
+    if (view_eq_str(name, "ilp32f"))  { ret R.ok[u32, str](abi.ABI_ILP32F); }
+    if (view_eq_str(name, "ilp32d"))  { ret R.ok[u32, str](abi.ABI_ILP32D); }
     ret R.err[u32, str]("unknown `$mach.abi.*` tag");
 }
 
@@ -2655,11 +2994,24 @@ fun ct_negate(v: CTValue) R.Result[CTValue, str] {
     ret make_int_value(0 - v.data.i, false);
 }
 
-fun float_value(f: f64) R.Result[CTValue, str] {
+# a CT_KIND_FLOAT value at width `w`, its payload rounded to that width so the
+# stored f64 is exactly a value of the declared type
+fun float_value(f: f64, w: float.FloatWidth) R.Result[CTValue, str] {
+    ret R.ok[CTValue, str](ct_float(f, w));
+}
+
+# a CT_KIND_FLOAT value at width `w`, for a typed pass materializing a float
+# constant it already knows the type of (an explicit cast, a resolver answer)
+# ---
+# f:   the value
+# w:   the width the value's declared type fixes
+# ret: the rounded CT_KIND_FLOAT value
+pub fun ct_float(f: f64, w: float.FloatWidth) CTValue {
     var v: CTValue;
-    v.kind   = CT_KIND_FLOAT;
-    v.data.f = f;
-    ret R.ok[CTValue, str](v);
+    v.kind        = CT_KIND_FLOAT;
+    v.float_width = w;
+    v.data.f      = float.round_at(f, w);
+    ret v;
 }
 
 fun bool_value(b: bool) R.Result[CTValue, str] {
@@ -2848,27 +3200,27 @@ test "mach.lang.fe.comptime.apply_arith:int_min_idiv_traps" {
 
 # float % folds to the truncated (fmod) remainder (#1378)
 test "mach.lang.fe.comptime.apply_arith:float_mod_truncated" {
-    val a: CTValue = R.unwrap_ok[CTValue, str](float_value(5.5));
-    val b: CTValue = R.unwrap_ok[CTValue, str](float_value(3.0));
+    val a: CTValue = R.unwrap_ok[CTValue, str](float_value(5.5, float.FLOAT_W_NONE));
+    val b: CTValue = R.unwrap_ok[CTValue, str](float_value(3.0, float.FLOAT_W_NONE));
     val r: R.Result[CTValue, str] = apply_arith(expr.BIN_MOD, a, b);
     if (R.is_err[CTValue, str](r))                  { ret 1; }
     if (R.unwrap_ok[CTValue, str](r).data.f != 2.5) { ret 1; }
 
     # the result takes the dividend's sign (C fmod): -5.5 % 3.0 = -2.5.
-    val na: CTValue = R.unwrap_ok[CTValue, str](float_value(0.0 - 5.5));
+    val na: CTValue = R.unwrap_ok[CTValue, str](float_value(0.0 - 5.5, float.FLOAT_W_NONE));
     val rn: R.Result[CTValue, str] = apply_arith(expr.BIN_MOD, na, b);
     if (R.is_err[CTValue, str](rn))                          { ret 1; }
     if (R.unwrap_ok[CTValue, str](rn).data.f != (0.0 - 2.5)) { ret 1; }
 
     # lhs < rhs passes the dividend through unchanged.
-    val s:   CTValue = R.unwrap_ok[CTValue, str](float_value(0.45));
-    val one: CTValue = R.unwrap_ok[CTValue, str](float_value(1.0));
+    val s:   CTValue = R.unwrap_ok[CTValue, str](float_value(0.45, float.FLOAT_W_NONE));
+    val one: CTValue = R.unwrap_ok[CTValue, str](float_value(1.0, float.FLOAT_W_NONE));
     val rs: R.Result[CTValue, str] = apply_arith(expr.BIN_MOD, s, one);
     if (R.is_err[CTValue, str](rs))                   { ret 1; }
     if (R.unwrap_ok[CTValue, str](rs).data.f != 0.45) { ret 1; }
 
     # modulo by zero is an error, not a silent fold.
-    val z: CTValue = R.unwrap_ok[CTValue, str](float_value(0.0));
+    val z: CTValue = R.unwrap_ok[CTValue, str](float_value(0.0, float.FLOAT_W_NONE));
     if (!R.is_err[CTValue, str](apply_arith(expr.BIN_MOD, a, z))) { ret 1; }
     ret 0;
 }

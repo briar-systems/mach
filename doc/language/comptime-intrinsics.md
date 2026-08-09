@@ -97,7 +97,8 @@ to where it is measured makes no difference:
 | global `align` | yes |
 | record / union type `align` | yes |
 | array length `[N]T` | yes |
-| `$if` / `$or` condition | **no** |
+| `$if` / `$or` condition, in a function body | yes |
+| `$if` / `$or` condition, in declaration scope | only when no arm of the chain declares anything |
 
 ```mach
 rec Pair { a: u64; b: u64; }
@@ -112,8 +113,13 @@ rec Holder { buf: [$size_of(Pair)]u8; }   # an array length, inside a field type
 in a type one, because a field offset is settled during lowering rather than by the
 front end.
 
-A `$if` / `$or` condition is not a type position and does not get the on-demand
-layout, so a layout intrinsic there is still rejected, and reports why.
+A `$if` / `$or` condition is not a type position, so what it can measure depends on
+when the gate is decided. A gate in a function body, and a gate in declaration scope
+no arm of whose chain declares anything, are both decided during type checking and
+measure normally. A gate in declaration scope some arm of whose chain declares
+something is decided earlier, while names are being resolved and before any type is
+laid out, so a layout intrinsic there is rejected and reports why. See
+[comptime-control.md](comptime-control.md).
 
 **Inside a generic, a predicate is answered per instantiation.** `$is_record(T)`
 in a `fun f[T]()` body is not decided against the template's placeholder — the gate
@@ -584,9 +590,12 @@ $if (!($mach.build.arch == $mach.arch.x86_64)) { $error("expected x86_64"); }
 ```
 
 The composition inherits `$if`'s condition rules, which is the point: the same
-conditions fold there as in any other gate, and the ones that do not — a layout
-intrinsic, a type query over an unbound generic parameter — refuse with their own
-cause rather than through a second surface that could describe them differently.
+conditions fold there as in any other gate, and the ones that do not (a type query
+over an unbound generic parameter, anything asked of a chain that also declares
+something) refuse with their own cause rather than through a second surface that
+could describe them differently. A chain written this way declares nothing, so it is
+decided during type checking and can measure a type; see
+[comptime-control.md](comptime-control.md).
 
 ## See also
 

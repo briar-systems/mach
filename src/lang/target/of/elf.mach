@@ -185,10 +185,6 @@ val ELF_ATTR_VERSION_A: u8 = 'A';
 val ELF_ATTR_TAG_FILE: u32 = 1;
 
 # the RISC-V `Tag_RISCV_arch` build-attribute tag, whose value is the ISA arch string
-# (an NTBS). pub so the riscv64 ISA's `BuildAttributes` descriptor names it; the
-# serializer reads the tag number off the descriptor, never the arch id
-pub val TAG_RISCV_ARCH: u32 = 5;
-
 # the RISC-V ELF `e_flags` bits mach can state. bit 0 says the image contains
 # compressed (C-extension) instructions; bits 2:1 name the float ABI the image's
 # calling convention uses, and a linker refuses to combine two objects that disagree
@@ -265,17 +261,385 @@ val DT_RELA_TAG: u64 = 7;
 # aarch64/riscv64 images so their PLT needs no lazy-resolution trampoline
 val DF_BIND_NOW: u64 = 0x8;
 
-# fixed on-disk sizes of the dynamic-link structures (ELF64)
+# the on-disk sizes the dynamic writers work in
+#
+# These stay ELF64 literals because the dynamic path is ELF64-only: `emit_pie_exec`,
+# `emit_shared` and `emit_dyn_exec` refuse an ELFCLASS32 target outright, since an
+# Elf32 dynamic image needs a 4-byte GOT slot, `Elf32_Dyn`, rv32 PLT stubs and the
+# rv32 dynamic relocation types, none of which exist yet (#2894). Every class-generic
+# path takes its sizes from `ElfLayout` below instead.
 val DYN_SIZE:       usize = 16;
 val GOT_ENTRY_SIZE: usize = 8;
 val PLT_ENTRY_SIZE: usize = 16;
 
-# fixed on-disk structure sizes for ELF64
+# the ELF64 structure sizes the dynamic writers and their tests still lay out by hand
 val ELF_HEADER_SIZE: usize = 64;
 val SHDR_SIZE:       usize = 64;
 val PHDR_SIZE:       usize = 56;
 val SYM_SIZE:        usize = 24;
 val RELA_SIZE:       usize = 24;
+
+# the on-disk shape of one ELF class (#2861)
+#
+# ELF is two formats, not one format with a flag. The class byte in `e_ident` selects
+# structure sizes, field offsets and field widths, and in two places it also reorders
+# fields: `Elf32_Phdr` puts `p_flags` after `p_memsz` where `Elf64_Phdr` puts it
+# immediately after `p_type`, and `Elf32_Sym` puts `st_value` / `st_size` before
+# `st_info` / `st_other` / `st_shndx` where `Elf64_Sym` puts them after. Neither is a
+# width change a generic "write a pointer-sized field" rule would produce.
+#
+# The geometry therefore lives in one record and the `write_*` / `read_*` helpers below
+# own where every field goes, so a caller passes values and never offsets. A field that
+# moves is the dangerous one: a wrong width usually corrupts something visible, while a
+# wrong offset lands a plausible value in the wrong field.
+# ---
+# class:        ELFCLASS32 or ELFCLASS64, the byte stamped into e_ident
+# addr_width:   the width in bytes of every address / offset / size field
+# ehdr_size:    Elf32_Ehdr 52, Elf64_Ehdr 64
+# shdr_size:    Elf32_Shdr 40, Elf64_Shdr 64
+# phdr_size:    Elf32_Phdr 32, Elf64_Phdr 56
+# sym_size:     Elf32_Sym 16, Elf64_Sym 24
+# rela_size:    Elf32_Rela 12, Elf64_Rela 24
+# struct_align: the alignment the class's structures want in the file (4 / 8)
+pub rec ElfLayout {
+    class:        u8;
+    addr_width:   u32;
+    ehdr_size:    usize;
+    shdr_size:    usize;
+    phdr_size:    usize;
+    sym_size:     usize;
+    rela_size:    usize;
+    struct_align: usize;
+}
+
+# the ELF64 layout
+pub fun elf64_layout() ElfLayout {
+    var l: ElfLayout;
+    l.class        = ELFCLASS64;
+    l.addr_width   = 8;
+    l.ehdr_size    = 64;
+    l.shdr_size    = 64;
+    l.phdr_size    = 56;
+    l.sym_size     = 24;
+    l.rela_size    = 24;
+    l.struct_align = 8;
+    ret l;
+}
+
+# the ELF32 layout
+pub fun elf32_layout() ElfLayout {
+    var l: ElfLayout;
+    l.class        = ELFCLASS32;
+    l.addr_width   = 4;
+    l.ehdr_size    = 52;
+    l.shdr_size    = 40;
+    l.phdr_size    = 32;
+    l.sym_size     = 16;
+    l.rela_size    = 12;
+    l.struct_align = 4;
+    ret l;
+}
+
+# the layout a target writes, derived from its pointer width
+#
+# The same authority that decides the class byte decides every structure size, which is
+# the acceptance #2861 asks for: there is no path that can write an Elf64 field into a
+# file stamped ELFCLASS32, because the class byte and the geometry come out of one call.
+pub fun layout_for(tgt_isa: *isa.IsaVTable) ElfLayout {
+    if (tgt_isa.pointer_width == 4) { ret elf32_layout(); }
+    ret elf64_layout();
+}
+
+# the layout a FILE declares, read back from the class byte it was stamped with
+#
+# The reader's counterpart, and it deliberately keys on the byte rather than on the
+# `e_machine` or on any target the caller might have in hand: a reader that decided the
+# layout from the architecture would misparse a file whose class contradicted its arch,
+# which is exactly the file this writer used to produce.
+# ---
+# cls: the e_ident[EI_CLASS] byte
+# out: receives the layout
+# ret: true when the class is one this reader knows
+pub fun layout_from_class(cls: u8, out: *ElfLayout) bool {
+    if (cls == ELFCLASS32) { @out = elf32_layout(); ret true; }
+    if (cls == ELFCLASS64) { @out = elf64_layout(); ret true; }
+    ret false;
+}
+
+# write one address-width field: 4 bytes under ELF32, 8 under ELF64
+fun write_addr(buf: *u8, off: usize, lay: *ElfLayout, v: u64) {
+    if (lay.addr_width == 4) { bin.write_u32_le(buf, off, v::u32); ret; }
+    bin.write_u64_le(buf, off, v);
+}
+
+# read one address-width field
+fun read_addr(buf: *u8, off: usize, lay: *ElfLayout) u64 {
+    if (lay.addr_width == 4) { ret bin.read_u32_le(buf, off)::u64; }
+    ret bin.read_u64_le(buf, off);
+}
+
+# write the ELF file header, from `e_type` onward
+#
+# `e_ident` is written separately by `write_elf_ident`, which owns the class byte. From
+# byte 24 on EVERY field moves between the classes, which is why no caller is allowed
+# to know an offset here.
+#
+#   Elf64: e_entry@24 e_phoff@32 e_shoff@40 (8 each), e_flags@48, e_ehsize@52,
+#          e_phentsize@54, e_phnum@56, e_shentsize@58, e_shnum@60, e_shstrndx@62
+#   Elf32: e_entry@24 e_phoff@28 e_shoff@32 (4 each), e_flags@36, e_ehsize@40,
+#          e_phentsize@42, e_phnum@44, e_shentsize@46, e_shnum@48, e_shstrndx@50
+fun write_ehdr(buf: *u8, lay: *ElfLayout, e_type: u16, e_machine: u16, e_flags: u32,
+               e_entry: u64, e_phoff: u64, e_shoff: u64,
+               e_phnum: u16, e_shnum: u16, e_shstrndx: u16) {
+    bin.write_u16_le(buf, 16, e_type);
+    bin.write_u16_le(buf, 18, e_machine);
+    bin.write_u32_le(buf, 20, 1);                  # e_version = EV_CURRENT
+    val w: usize = lay.addr_width::usize;
+    write_addr(buf, 24,         lay, e_entry);
+    write_addr(buf, 24 + w,     lay, e_phoff);
+    write_addr(buf, 24 + 2 * w, lay, e_shoff);
+    var o: usize = 24 + 3 * w;
+    bin.write_u32_le(buf, o,      e_flags);
+    bin.write_u16_le(buf, o + 4,  lay.ehdr_size::u16);
+    # a header with no program headers declares entsize 0, not the structure size:
+    # `e_phnum == 0` with a nonzero entsize is what a reader flags as inconsistent
+    var phentsize: u16 = 0;
+    if (e_phnum != 0) { phentsize = lay.phdr_size::u16; }
+    bin.write_u16_le(buf, o + 6,  phentsize);
+    bin.write_u16_le(buf, o + 8,  e_phnum);
+    bin.write_u16_le(buf, o + 10, lay.shdr_size::u16);
+    bin.write_u16_le(buf, o + 12, e_shnum);
+    bin.write_u16_le(buf, o + 14, e_shstrndx);
+}
+
+# write one section header, returning the offset just past it
+#
+#   Elf64: name@0 type@4 flags@8 addr@16 offset@24 size@32 link@40 info@44
+#          addralign@48 entsize@56   (flags/addr/offset/size/addralign/entsize 8 wide)
+#   Elf32: name@0 type@4 flags@8 addr@12 offset@16 size@20 link@24 info@28
+#          addralign@32 entsize@36  (all 4 wide)
+fun write_shdr(buf: *u8, off: usize, lay: *ElfLayout,
+               name: u32, stype: u32, flags: u64, addr: u64, offset: u64, size: u64,
+               link: u32, info: u32, addralign: u64, entsize: u64) usize {
+    val w: usize = lay.addr_width::usize;
+    bin.write_u32_le(buf, off,     name);
+    bin.write_u32_le(buf, off + 4, stype);
+    write_addr(buf, off + 8,         lay, flags);
+    write_addr(buf, off + 8 + w,     lay, addr);
+    write_addr(buf, off + 8 + 2 * w, lay, offset);
+    write_addr(buf, off + 8 + 3 * w, lay, size);
+    var o: usize = off + 8 + 4 * w;
+    bin.write_u32_le(buf, o,     link);
+    bin.write_u32_le(buf, o + 4, info);
+    write_addr(buf, o + 8,     lay, addralign);
+    write_addr(buf, o + 8 + w, lay, entsize);
+    ret off + lay.shdr_size;
+}
+
+# write one program header, returning the offset just past it
+#
+# the one field that reorders rather than narrows:
+#
+#   Elf64: type@0 flags@4 offset@8 vaddr@16 paddr@24 filesz@32 memsz@40 align@48
+#   Elf32: type@0 offset@4 vaddr@8 paddr@12 filesz@16 memsz@20 flags@24 align@28
+#
+# `p_flags` is the segment's read / write / execute permission. Writing it at offset 4
+# under ELF32 puts it where `p_offset` belongs and leaves the permissions zero, which
+# produces a segment the loader maps with no access at all - a fault at the first
+# instruction, nowhere near the mistake. `write_phdr_at:elf32_field_order` pins this.
+fun write_phdr_at(buf: *u8, off: usize, lay: *ElfLayout,
+                  ptype: u32, flags: u32, offset: u64, vaddr: u64, paddr: u64,
+                  filesz: u64, memsz: u64, align: u64) usize {
+    val w: usize = lay.addr_width::usize;
+    bin.write_u32_le(buf, off, ptype);
+    if (lay.addr_width == 8) {
+        bin.write_u32_le(buf, off + 4, flags);
+        write_addr(buf, off + 8,          lay, offset);
+        write_addr(buf, off + 8 + w,      lay, vaddr);
+        write_addr(buf, off + 8 + 2 * w,  lay, paddr);
+        write_addr(buf, off + 8 + 3 * w,  lay, filesz);
+        write_addr(buf, off + 8 + 4 * w,  lay, memsz);
+        write_addr(buf, off + 8 + 5 * w,  lay, align);
+        ret off + lay.phdr_size;
+    }
+    write_addr(buf, off + 4,      lay, offset);
+    write_addr(buf, off + 8,      lay, vaddr);
+    write_addr(buf, off + 12,     lay, paddr);
+    write_addr(buf, off + 16,     lay, filesz);
+    write_addr(buf, off + 20,     lay, memsz);
+    bin.write_u32_le(buf, off + 24, flags);
+    write_addr(buf, off + 28,     lay, align);
+    ret off + lay.phdr_size;
+}
+
+# write one symbol table entry, returning the offset just past it
+#
+# the second reordering: the three small fields and the two wide ones swap sides.
+#
+#   Elf64: name@0 info@4 other@5 shndx@6 value@8 size@16
+#   Elf32: name@0 value@4 size@8 info@12 other@13 shndx@14
+fun write_sym_at(buf: *u8, off: usize, lay: *ElfLayout,
+                 name: u32, info: u8, other: u8, shndx: u16, value: u64, size: u64) usize {
+    bin.write_u32_le(buf, off, name);
+    if (lay.addr_width == 8) {
+        buf[off + 4] = info;
+        buf[off + 5] = other;
+        bin.write_u16_le(buf, off + 6, shndx);
+        write_addr(buf, off + 8,  lay, value);
+        write_addr(buf, off + 16, lay, size);
+        ret off + lay.sym_size;
+    }
+    write_addr(buf, off + 4, lay, value);
+    write_addr(buf, off + 8, lay, size);
+    buf[off + 12] = info;
+    buf[off + 13] = other;
+    bin.write_u16_le(buf, off + 14, shndx);
+    ret off + lay.sym_size;
+}
+
+# pack a RELA `r_info` from its symbol index and relocation type
+#
+# neither a width change nor a reorder: the two halves are packed at different
+# shifts, and an Elf32 relocation type is eight bits rather than thirty-two. a type
+# that does not fit is rejected by `reloc_type_fits_class` before any emit begins,
+# so nothing here can truncate one relocation into a different valid one.
+#
+#   Elf64: offset@0 (8), info@8 (8) = (sym << 32) | type, addend@16 (8)
+#   Elf32: offset@0 (4), info@4 (4) = (sym <<  8) | type, addend@8 (4)
+fun rela_info_pack(lay: *ElfLayout, sym: u32, rtype: u32) u64 {
+    if (lay.addr_width == 8) { ret (sym::u64 << 32) | rtype::u64; }
+    ret (sym::u64 << 8) | rtype::u64;
+}
+
+# split a RELA `r_info` into its symbol index and type, by class
+fun rela_info_split(lay: *ElfLayout, info: u64, sym: *u32, rtype: *u32) {
+    if (lay.addr_width == 8) {
+        @sym   = (info >> 32)::u32;
+        @rtype = (info & 0xFFFFFFFF)::u32;
+        ret;
+    }
+    @sym   = (info >> 8)::u32;
+    @rtype = (info & 0xFF)::u32;
+}
+
+# whether an ELF machine relocation type number has an encoding in a class
+#
+# `r_info` gives the type eight bits under Elf32 and thirty-two under Elf64, so a
+# high-numbered type is representable on one class and not the other.
+fun reloc_type_fits_class(lay: *ElfLayout, rtype: u32) bool {
+    if (lay.addr_width == 8) { ret true; }
+    ret rtype <= 0xFF;
+}
+
+# write one RELA entry, returning the offset just past it
+fun write_rela_at(buf: *u8, off: usize, lay: *ElfLayout,
+                  r_offset: u64, sym: u32, rtype: u32, addend: i64) usize {
+    val w: usize = lay.addr_width::usize;
+    write_addr(buf, off,         lay, r_offset);
+    write_addr(buf, off + w,     lay, rela_info_pack(lay, sym, rtype));
+    write_addr(buf, off + 2 * w, lay, addend::u64);
+    ret off + lay.rela_size;
+}
+
+# one section header, read back from a file in the class that file declares
+# ---
+# name:      sh_name, the offset of the section name in the shstrtab
+# stype:     sh_type
+# flags:     sh_flags
+# addr:      sh_addr
+# offset:    sh_offset
+# size:      sh_size
+# link:      sh_link
+# info:      sh_info
+# addralign: sh_addralign
+# entsize:   sh_entsize
+rec ElfShdr {
+    name:      u32;
+    stype:     u32;
+    flags:     u64;
+    addr:      u64;
+    offset:    u64;
+    size:      u64;
+    link:      u32;
+    info:      u32;
+    addralign: u64;
+    entsize:   u64;
+}
+
+# read one section header in the layout the file declares
+fun read_shdr(buf: *u8, off: usize, lay: *ElfLayout) ElfShdr {
+    val w: usize = lay.addr_width::usize;
+    var h: ElfShdr;
+    h.name      = bin.read_u32_le(buf, off);
+    h.stype     = bin.read_u32_le(buf, off + 4);
+    h.flags     = read_addr(buf, off + 8,         lay);
+    h.addr      = read_addr(buf, off + 8 + w,     lay);
+    h.offset    = read_addr(buf, off + 8 + 2 * w, lay);
+    h.size      = read_addr(buf, off + 8 + 3 * w, lay);
+    val o: usize = off + 8 + 4 * w;
+    h.link      = bin.read_u32_le(buf, o);
+    h.info      = bin.read_u32_le(buf, o + 4);
+    h.addralign = read_addr(buf, o + 8,     lay);
+    h.entsize   = read_addr(buf, o + 8 + w, lay);
+    ret h;
+}
+
+# one symbol table entry, read back from a file in the class that file declares
+# ---
+# name:  st_name, the offset of the symbol name in the linked strtab
+# info:  st_info, the packed binding and type
+# other: st_other
+# shndx: st_shndx
+# value: st_value
+# size:  st_size
+rec ElfSym {
+    name:  u32;
+    info:  u8;
+    other: u8;
+    shndx: u16;
+    value: u64;
+    size:  u64;
+}
+
+# read one symbol table entry in the layout the file declares
+fun read_sym(buf: *u8, off: usize, lay: *ElfLayout) ElfSym {
+    var s: ElfSym;
+    s.name = bin.read_u32_le(buf, off);
+    if (lay.addr_width == 8) {
+        s.info  = buf[off + 4];
+        s.other = buf[off + 5];
+        s.shndx = bin.read_u16_le(buf, off + 6);
+        s.value = read_addr(buf, off + 8,  lay);
+        s.size  = read_addr(buf, off + 16, lay);
+        ret s;
+    }
+    s.value = read_addr(buf, off + 4, lay);
+    s.size  = read_addr(buf, off + 8, lay);
+    s.info  = buf[off + 12];
+    s.other = buf[off + 13];
+    s.shndx = bin.read_u16_le(buf, off + 14);
+    ret s;
+}
+
+# read one RELA entry in the layout the file declares
+# ---
+# r_offset: receives the patched offset
+# sym:      receives the symbol table index
+# rtype:    receives the ELF machine relocation type
+# addend:   receives the addend
+fun read_rela(buf: *u8, off: usize, lay: *ElfLayout,
+              r_offset: *u64, sym: *u32, rtype: *u32, addend: *i64) {
+    val w: usize = lay.addr_width::usize;
+    @r_offset = read_addr(buf, off, lay);
+    rela_info_split(lay, read_addr(buf, off + w, lay), sym, rtype);
+    # the Elf32 addend is a signed 32-bit field, so it sign-extends rather than
+    # zero-extending into the width-neutral i64 the image carries
+    if (lay.addr_width == 4) {
+        @addend = bin.read_u32_le(buf, off + 8)::i32::i64;
+        ret;
+    }
+    @addend = bin.read_u64_le(buf, off + 16)::i64;
+}
 
 # the concrete signature the erased `isa.IsaVTable.elf_reloc_type` pointer is cast
 # back to before it is called
@@ -393,6 +757,18 @@ fun unsupported_type_message(itn: *intern.Interner, alloc: *A.Allocator, r_type:
                            r_type, "elf: unsupported relocation type");
 }
 
+# build "elf: relocation type <n> does not fit an ELFCLASS32 r_info" for a machine
+# type wider than the eight bits Elf32 gives it
+# ---
+# itn:    interner backing the message
+# alloc:  allocator backing the message
+# r_type: the unencodable ELF machine relocation type
+# ret:    the diagnostic string
+fun unencodable_type_message(itn: *intern.Interner, alloc: *A.Allocator, r_type: u32) str {
+    ret bin.number_message(itn, alloc, "elf: relocation type does not fit an ELFCLASS32 r_info: ",
+                           r_type::u64, "elf: relocation type does not fit an ELFCLASS32 r_info");
+}
+
 # verify every relocation's abstract kind maps to a width-correct ELF machine type
 #
 # Run up front before any output is allocated, so the error path needs no
@@ -400,38 +776,36 @@ fun unsupported_type_message(itn: *intern.Interner, alloc: *A.Allocator, r_type:
 # ---
 # img:     the object image whose relocations are checked
 # tgt_isa: the target ISA vtable supplying the per-arch forward map
-# ret:     ok(true) when every kind maps, or the first mapping error
-fun validate_reloc_kinds(img: *of.ObjectImage, tgt_isa: *isa.IsaVTable) R.Result[bool, str] {
+# lay:     the class layout the object will be written in
+# ret:     ok(true) when every kind maps and encodes, or the first error
+fun validate_reloc_kinds(img: *of.ObjectImage, tgt_isa: *isa.IsaVTable, lay: *ElfLayout) R.Result[bool, str] {
     var i: u32 = 0;
     for (i < img.reloc_count) {
         val r: R.Result[u32, str] = reloc_type_for(img.interner, img.alloc, img.relocations[i].kind, tgt_isa);
         if (R.is_err[u32, str](r)) { ret R.err[bool, str](R.unwrap_err[u32, str](r)); }
+        # an Elf32 `r_info` gives the type eight bits, so a higher-numbered type has
+        # no encoding in this class and is named here rather than truncated into a
+        # different, valid relocation
+        if (!reloc_type_fits_class(lay, R.unwrap_ok[u32, str](r))) {
+            ret R.err[bool, str](unencodable_type_message(img.interner, img.alloc, R.unwrap_ok[u32, str](r)));
+        }
         i = i + 1;
     }
     ret R.ok[bool, str](true);
 }
 
-# the ELFCLASS for a target, derived from its pointer width: an 8-byte pointer is
-# ELFCLASS64, a 4-byte pointer ELFCLASS32. the writer reads this instead of
-# branching on the arch id, so the class follows the substrate the same way
-# `e_machine` follows `elf_machine`
+# stamp the ELF e_ident: the 4-byte magic, the ELFCLASS, the little-endian data
+# encoding, the current header version, and the System V ABI. bytes 8..15 (EI_PAD)
+# stay zero from the caller's zeroing allocation
+#
+# the class byte comes off the same `ElfLayout` that sizes every structure in the
+# file, so the stamp and the geometry cannot disagree (#2861)
 # ---
-# tgt_isa: the target ISA vtable carrying the pointer width
-# ret:     ELFCLASS32 for a 4-byte pointer, ELFCLASS64 otherwise
-fun elf_class_for(tgt_isa: *isa.IsaVTable) u8 {
-    if (tgt_isa.pointer_width == 4) { ret ELFCLASS32; }
-    ret ELFCLASS64;
-}
-
-# stamp the ELF e_ident: the 4-byte magic, the ELFCLASS (from the target pointer
-# width), the little-endian data encoding, the current header version, and the
-# System V ABI. bytes 8..15 (EI_PAD) stay zero from the caller's zeroing allocation
-# ---
-# buf:     the output buffer (bytes 0..7 are written)
-# tgt_isa: the target ISA vtable supplying the ELFCLASS
-fun write_elf_ident(buf: *u8, tgt_isa: *isa.IsaVTable) {
+# buf: the output buffer (bytes 0..7 are written)
+# lay: the class layout being written
+fun write_elf_ident(buf: *u8, lay: *ElfLayout) {
     buf[0] = 0x7F; buf[1] = 0x45; buf[2] = 0x4C; buf[3] = 0x46;
-    buf[4] = elf_class_for(tgt_isa);
+    buf[4] = lay.class;
     buf[5] = ELFDATA2LSB;
     buf[6] = EV_CURRENT;
     buf[7] = ELFOSABI_NONE;
@@ -573,17 +947,17 @@ fun validate_reloc_symbols(img: *of.ObjectImage) R.Result[bool, str] {
 # is advanced past it, so successive calls pack the string table.
 # ---
 # buf:     the output buffer
-# sym_off: byte offset of this Elf64_Sym entry in `buf`
+# sym_off: byte offset of this symbol entry in `buf`
+# lay:     the class layout placing the entry's fields
 # str_off: base byte offset of the symbol string table in `buf`
 # str_pos: in/out cursor into the string table, advanced past the written name
 # img:     the object image the symbol is drawn from
 # idx:     index of the symbol within the image symbol table
 # binding: the ELF STB_* binding to record (local, global, or weak)
-fun write_symbol(buf: *u8, sym_off: usize, str_off: usize, str_pos: *usize,
+fun write_symbol(buf: *u8, sym_off: usize, lay: *ElfLayout, str_off: usize, str_pos: *usize,
                  img: *of.ObjectImage, idx: u32, binding: u8) {
     val name_pos: usize = @str_pos;
     @str_pos = @str_pos + bin.write_str(buf, str_off + @str_pos, bin.resolve_name(img.interner, img.symbols[idx].name));
-    bin.write_u32_le(buf, sym_off, name_pos::u32);
 
     # the IMAGE says what a symbol is, and a symbol that names no type is STT_NOTYPE,
     # which is what ELF means by "untyped". This used to fall back to the section's
@@ -599,20 +973,17 @@ fun write_symbol(buf: *u8, sym_off: usize, str_off: usize, str_pos: *usize,
     or ((img.symbols[idx].flags & of.SYM_OBJ_FLAG_OBJECT) != 0)   { sym_type = STT_OBJECT; }
 
     val info: u8 = (binding << 4) | (sym_type & 0xF);
-    buf[sym_off + 4] = info;
-    buf[sym_off + 5] = 0;
-    bin.write_u16_le(buf, sym_off + 6, sec_idx);
-    bin.write_u64_le(buf, sym_off + 8, img.symbols[idx].offset::u64);
-    bin.write_u64_le(buf, sym_off + 16, img.symbols[idx].size::u64);
+    write_sym_at(buf, sym_off, lay, name_pos::u32, info, 0, sec_idx,
+                 img.symbols[idx].offset::u64, img.symbols[idx].size::u64);
 }
 
 # the serialized `.symtab` + `.strtab` byte pair for an executable's function
 # symbol table (#2772), and the count of leading STB_LOCAL entries the caller
 # needs for `.symtab`'s `sh_info`
 # ---
-# symtab_bytes: the raw Elf64_Sym array (nil when `symtab_count` is 0)
-# symtab_size:  its byte length, `SYM_SIZE * (symtab_count + 1)` (the +1 is the
-#               mandatory reserved null entry at index 0)
+# symtab_bytes: the raw symbol array (nil when `symtab_count` is 0)
+# symtab_size:  its byte length, one entry per symbol plus the mandatory reserved
+#               null entry at index 0
 # strtab_bytes: the symbol name string table (nil when `symtab_count` is 0)
 # strtab_size:  its byte length
 # local_count:  number of leading STB_LOCAL entries, INCLUDING the reserved null
@@ -642,12 +1013,14 @@ rec SymtabBuild {
 # ---
 # alloc:        allocator backing the two returned buffers (caller frees both)
 # itn:          interner resolving each entry's name
+# lay:          the class layout sizing and placing each entry
 # symtab:       the local-then-global-sorted function symbol list
 # symtab_count: number of entries (0 is legal: an empty, nil-buffered result)
 # segs:         the load segments an entry's address is matched against
 # seg_count:    number of load segments
 # ret:          the serialized pair, or an allocation-failure error
-fun build_symtab_bytes(alloc: *A.Allocator, itn: *intern.Interner, symtab: *of.SymtabEntry,
+fun build_symtab_bytes(alloc: *A.Allocator, itn: *intern.Interner, lay: *ElfLayout,
+                       symtab: *of.SymtabEntry,
                        symtab_count: u32, segs: *of.LoadSegment, seg_count: u32) R.Result[SymtabBuild, str] {
     var out: SymtabBuild;
     out.symtab_bytes = nil; out.symtab_size = 0;
@@ -661,7 +1034,7 @@ fun build_symtab_bytes(alloc: *A.Allocator, itn: *intern.Interner, symtab: *of.S
         strtab_sz = strtab_sz + str_len(bin.resolve_name(itn, symtab[i].name)) + 1;
         i = i + 1;
     }
-    val symtab_sz: usize = SYM_SIZE * (symtab_count::usize + 1);
+    val symtab_sz: usize = lay.sym_size * (symtab_count::usize + 1);
 
     val sr: R.Result[*u8, str] = A.zallocate[u8](alloc, symtab_sz);
     if (R.is_err[*u8, str](sr)) { ret R.err[SymtabBuild, str]("elf: symtab buffer alloc failed"); }
@@ -692,13 +1065,9 @@ fun build_symtab_bytes(alloc: *A.Allocator, itn: *intern.Interner, symtab: *of.S
         var binding: u8 = STB_GLOBAL;
         if (!symtab[i].global) { binding = STB_LOCAL; out.local_count = out.local_count + 1; }
 
-        val sym_off: usize = SYM_SIZE * (i::usize + 1);
-        bin.write_u32_le(sbuf, sym_off, name_pos::u32);
-        sbuf[sym_off + 4] = (binding << 4) | (STT_FUNC & 0xF);
-        sbuf[sym_off + 5] = 0;
-        bin.write_u16_le(sbuf, sym_off + 6, shndx);
-        bin.write_u64_le(sbuf, sym_off + 8, symtab[i].vaddr);
-        bin.write_u64_le(sbuf, sym_off + 16, symtab[i].size::u64);
+        val sym_off: usize = lay.sym_size * (i::usize + 1);
+        write_sym_at(sbuf, sym_off, lay, name_pos::u32, (binding << 4) | (STT_FUNC & 0xF), 0,
+                     shndx, symtab[i].vaddr, symtab[i].size::u64);
 
         i = i + 1;
     }
@@ -722,23 +1091,25 @@ fun free_symtab_bytes(alloc: *A.Allocator, b: *SymtabBuild) {
 # ISA-string section the ELF writer stamps into objects and executables
 #
 # Supplied by the ISA through `IsaVTable.elf_attributes` so the writer never branches
-# on the arch id - it reads the section name, type, vendor, tag, and arch string off
-# this descriptor and serializes the standard ELF build-attributes container. The
-# same container backs the ARM EABI's `.ARM.attributes`, so only the values here are
-# arch-specific. An arch that emits no attributes wires a nil hook and the section is
-# simply absent.
+# on the arch id: it reads the section name, type and vendor off this descriptor and
+# serializes the standard ELF build-attributes container around a body the arch
+# supplies separately. The same container backs the ARM EABI's `.ARM.attributes`, so
+# only the values here are arch-specific. An arch that emits no attributes wires a nil
+# hook and the section is simply absent.
+#
+# THE DESCRIPTOR NAMES THE CONTAINER AND NOTHING INSIDE IT. It used to carry the arch
+# string itself, which made every image of an arch claim the same instruction set no
+# matter what was linked into it - the `e_flags` defect one section over, in the
+# section next door (#2813, #2828). What an image holds is per-image and now travels
+# with the image.
 # ---
 # section:  the attributes section name (e.g. ".riscv.attributes")
 # sht:      the ELF section type (e.g. SHT_RISCV_ATTRIBUTES)
 # vendor:   the vendor sub-section name (e.g. "riscv")
-# arch_tag: the build-attribute tag carrying the arch string (e.g. TAG_RISCV_ARCH)
-# arch:     the ISA arch string (e.g. "rv64i2p1_m2p0_a2p1_f2p2_d2p2")
 pub rec BuildAttributes {
     section:  str;
     sht:      u32;
     vendor:   str;
-    arch_tag: u32;
-    arch:     str;
 }
 
 # the concrete signature the erased `isa.IsaVTable.elf_attributes` pointer is cast
@@ -803,14 +1174,14 @@ fun write_uleb128(buf: *u8, offset: usize, value: u32) usize {
 # the on-disk byte length of the serialized build-attributes section for `attr`
 #
 # The container is a format-version byte, then one vendor sub-section holding a single
-# `Tag_File` sub-sub-section that carries the lone arch-string attribute. Pairs with
+# `Tag_File` sub-sub-section that carries the arch-supplied attribute body. Pairs with
 # `write_build_attributes`, which serializes exactly this many bytes.
 # ---
-# attr: the build-attributes descriptor to measure
-# ret:  the section's byte length
-fun build_attributes_size(attr: *BuildAttributes) usize {
-    # the lone attribute: <arch_tag uleb><arch NTBS>.
-    val attr_data: usize = uleb128_size(attr.arch_tag) + str_len(attr.arch) + 1;
+# attr:     the build-attributes descriptor naming the container
+# body_len: the length of the arch's attribute body, which goes inside `Tag_File`
+# ret:      the section's byte length
+fun build_attributes_size(attr: *BuildAttributes, body_len: u32) usize {
+    val attr_data: usize = body_len::usize;
     # Tag_File sub-sub-section: <tag uleb><u32 length><attribute>; the length covers
     # the tag, the length field, and the attribute bytes.
     val file_subsec: usize = uleb128_size(ELF_ATTR_TAG_FILE) + 4 + attr_data;
@@ -825,18 +1196,27 @@ fun build_attributes_size(attr: *BuildAttributes) usize {
 #
 # Lays out the ELF build-attributes container the RISC-V psABI (and ARM EABI) define:
 # an 'A' format-version byte, a vendor sub-section, and a `Tag_File` sub-sub-section
-# carrying the single arch-string attribute. Writes exactly `build_attributes_size`
+# carrying the arch's attribute body verbatim. Writes exactly `build_attributes_size`
 # bytes.
+#
+# THE BODY IS THE ARCH'S AND IS NOT INTERPRETED HERE. What tags exist, what their
+# values mean, and how two of them combine is RISC-V's business (or ARM's), and the
+# only thing this layer knows is where the body sits inside the container. Before
+# #2828 the body was one attribute built from a constant on the descriptor, which is
+# how an image came to state an instruction set it did not have.
 # ---
-# buf:    the output buffer
-# offset: byte offset to serialize at
-# attr:   the build-attributes descriptor to serialize
-fun write_build_attributes(buf: *u8, offset: usize, attr: *BuildAttributes) {
+# buf:      the output buffer
+# offset:   byte offset to serialize at
+# attr:     the build-attributes descriptor naming the container
+# body:     the arch's attribute body
+# body_len: its length in bytes
+fun write_build_attributes(buf: *u8, offset: usize, attr: *BuildAttributes,
+                           body: *u8, body_len: u32) {
     var p: usize = offset;
     buf[p] = ELF_ATTR_VERSION_A;
     p = p + 1;
 
-    val attr_data:     usize = uleb128_size(attr.arch_tag) + str_len(attr.arch) + 1;
+    val attr_data:     usize = body_len::usize;
     val file_subsec:   usize = uleb128_size(ELF_ATTR_TAG_FILE) + 4 + attr_data;
     val vendor_subsec: usize = 4 + (str_len(attr.vendor) + 1) + file_subsec;
 
@@ -845,14 +1225,13 @@ fun write_build_attributes(buf: *u8, offset: usize, attr: *BuildAttributes) {
     p = p + 4;
     p = p + bin.write_str(buf, p, attr.vendor);
 
-    # Tag_File sub-sub-section: <tag uleb><u32 length><attribute>.
+    # Tag_File sub-sub-section: <tag uleb><u32 length><body>.
     p = p + write_uleb128(buf, p, ELF_ATTR_TAG_FILE);
     bin.write_u32_le(buf, p, file_subsec::u32);
     p = p + 4;
 
-    # the lone attribute: <arch_tag uleb><arch NTBS>.
-    p = p + write_uleb128(buf, p, attr.arch_tag);
-    bin.write_str(buf, p, attr.arch);
+    var i: u32 = 0;
+    for (i < body_len) { buf[p + i::usize] = body[i]; i = i + 1; }
 }
 
 # serialize an ObjectImage to a relocatable ELF64 .o file
@@ -874,6 +1253,10 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
     }
     val alloc: *A.Allocator = img.alloc;
 
+    # the class byte and every structure size come from one call, so no path can
+    # write an Elf64 field into a file stamped ELFCLASS32 (#2861)
+    var lay: ElfLayout = layout_for(tgt_isa);
+
     # resolve every relocation's target symbol before allocating any output, so
     # an unresolved target fails the emit (naming the symbol) with no cleanup.
     val vrs: R.Result[bool, str] = validate_reloc_symbols(img);
@@ -882,15 +1265,18 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
     # map every relocation kind to a machine type up front too, so an unmapped
     # kind fails the emit naming the kind instead of being silently serialized as
     # a 64-bit absolute over a 4-byte field.
-    val vrk: R.Result[bool, str] = validate_reloc_kinds(img, tgt_isa);
+    val vrk: R.Result[bool, str] = validate_reloc_kinds(img, tgt_isa, ?lay);
     if (R.is_err[bool, str](vrk)) { ret R.err[bool, str](R.unwrap_err[bool, str](vrk)); }
 
     # the ELF build-attributes section (the ISA-string `.riscv.attributes` on riscv)
     # is appended after the regular sections, the symtab/strtab/shstrtab, and the rela
     # tables, so it never perturbs their indices. nil for an arch that emits none.
-    val attr: *BuildAttributes = attributes_for(tgt_isa);
+    # the BODY is the image's own claim about itself, not a constant on the
+    # descriptor: an image with nothing to claim gets no section at all (#2828)
+    var attr: *BuildAttributes = attributes_for(tgt_isa);
+    if (img.attributes == nil || img.attributes_len == 0) { attr = nil; }
     var attr_size: usize = 0;
-    if (attr != nil) { attr_size = build_attributes_size(attr); }
+    if (attr != nil) { attr_size = build_attributes_size(attr, img.attributes_len); }
 
     val num_secs:      u32 = img.section_count;
     val num_syms:      u32 = img.symbol_count;
@@ -906,7 +1292,7 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
     # count that would otherwise truncate into a corrupt e_shnum rather than emit a
     # well-formed-looking object with a wrong section count.
     if (total_shdr > 0xFEFF) { ret R.err[bool, str]("elf: section-header count exceeds the ELF e_shnum limit"); }
-    val shdr_table_size: usize = total_shdr::usize * SHDR_SIZE;
+    val shdr_table_size: usize = total_shdr::usize * lay.shdr_size;
 
     # section-name string table: leading nul, section names, the three fixed
     # names, then one ".rela<name>" per relocated section.
@@ -984,7 +1370,7 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
 
     # file layout: header, section data, symtab, strtab, shstrtab, rela tables,
     # section headers.
-    var data_offset: usize = ELF_HEADER_SIZE;
+    var data_offset: usize = lay.ehdr_size;
     s = 0;
     for (s < num_secs) {
         if (img.sections[s].kind != of.SK_BSS) {
@@ -994,8 +1380,8 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
         s = s + 1;
     }
 
-    val symtab_offset: usize = bin.align_up(data_offset, 8);
-    val symtab_size: usize = (num_syms + 1)::usize * SYM_SIZE;
+    val symtab_offset: usize = bin.align_up(data_offset, lay.struct_align);
+    val symtab_size: usize = (num_syms + 1)::usize * lay.sym_size;
     val strtab_offset: usize = symtab_offset + symtab_size;
     val strtab_sz: usize = strtab_size(img);
     val shstrtab_offset: usize = strtab_offset + strtab_sz;
@@ -1014,9 +1400,9 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
     for (s < num_secs) {
         val rc: u32 = count_relocs_for_section(img, s);
         if (rc > 0) {
-            rela_offset = bin.align_up(rela_offset, 8);
+            rela_offset = bin.align_up(rela_offset, lay.struct_align);
             rela_offsets[s] = rela_offset;
-            rela_offset = rela_offset + rc::usize * RELA_SIZE;
+            rela_offset = rela_offset + rc::usize * lay.rela_size;
         }
         s = s + 1;
     }
@@ -1029,7 +1415,7 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
         rela_offset = rela_offset + attr_size;
     }
 
-    val shdr_offset: usize = bin.align_up(rela_offset, 8);
+    val shdr_offset: usize = bin.align_up(rela_offset, lay.struct_align);
     val total_file_size: usize = shdr_offset + shdr_table_size;
 
     val res_buf: R.Result[*u8, str] = A.zallocate[u8](alloc, total_file_size);
@@ -1042,27 +1428,16 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
     }
     var buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
 
-    write_elf_ident(buf, tgt_isa);
+    write_elf_ident(buf, ?lay);
 
-    bin.write_u16_le(buf, 16, ET_REL);
-    bin.write_u16_le(buf, 18, tgt_isa.elf_machine::u16);
-    bin.write_u32_le(buf, 20, 1);
-    bin.write_u64_le(buf, 24, 0);
-    bin.write_u64_le(buf, 32, 0);
-    bin.write_u64_le(buf, 40, shdr_offset::u64);
-    bin.write_u32_le(buf, 48, img.machine_flags);
-    bin.write_u16_le(buf, 52, ELF_HEADER_SIZE::u16);
-    bin.write_u16_le(buf, 54, 0);
-    bin.write_u16_le(buf, 56, 0);
-    bin.write_u16_le(buf, 58, SHDR_SIZE::u16);
-    bin.write_u16_le(buf, 60, total_shdr::u16);
     # section-header indices: 0 null, 1..num_secs sections, then .symtab,
     # .strtab, .shstrtab.
     val shstrtab_idx: u16 = (num_secs + 3)::u16;
-    bin.write_u16_le(buf, 62, shstrtab_idx);
+    write_ehdr(buf, ?lay, ET_REL, tgt_isa.elf_machine::u16, img.machine_flags,
+               0, 0, shdr_offset::u64, 0, total_shdr::u16, shstrtab_idx);
 
     # section data
-    var sec_offset: usize = ELF_HEADER_SIZE;
+    var sec_offset: usize = lay.ehdr_size;
     s = 0;
     for (s < num_secs) {
         if (img.sections[s].kind != of.SK_BSS) {
@@ -1091,7 +1466,7 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
         sym_remap = R.unwrap_ok[*u32, str](res_remap);
     }
 
-    var sym_off: usize = symtab_offset + SYM_SIZE;
+    var sym_off: usize = symtab_offset + lay.sym_size;
     var str_off: usize = strtab_offset;
     buf[str_off] = 0;
     var str_pos: usize = 1;
@@ -1101,8 +1476,8 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
     for (symi < num_syms) {
         if ((img.symbols[symi].flags & of.SYM_OBJ_FLAG_GLOBAL) != 0) { symi = symi + 1; cnt; }
         if (sym_remap != nil)                                        { sym_remap[symi] = elf_idx; }
-        write_symbol(buf, sym_off, str_off, ?str_pos, img, symi, STB_LOCAL);
-        sym_off = sym_off + SYM_SIZE;
+        write_symbol(buf, sym_off, ?lay, str_off, ?str_pos, img, symi, STB_LOCAL);
+        sym_off = sym_off + lay.sym_size;
         elf_idx = elf_idx + 1;
         symi = symi + 1;
     }
@@ -1116,8 +1491,8 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
         # one definition rather than rejecting them as a multiple definition.
         var bind: u8 = STB_GLOBAL;
         if ((img.symbols[symi].flags & of.SYM_OBJ_FLAG_WEAK) != 0) { bind = STB_WEAK; }
-        write_symbol(buf, sym_off, str_off, ?str_pos, img, symi, bind);
-        sym_off = sym_off + SYM_SIZE;
+        write_symbol(buf, sym_off, ?lay, str_off, ?str_pos, img, symi, bind);
+        sym_off = sym_off + lay.sym_size;
         elf_idx = elf_idx + 1;
         symi = symi + 1;
     }
@@ -1133,19 +1508,15 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
             var ri: u32 = 0;
             for (ri < img.reloc_count) {
                 if (img.relocations[ri].section == s) {
-                    bin.write_u64_le(buf, ro, img.relocations[ri].offset::u64);
                     # validate_reloc_symbols proved every reloc resolves, and a
                     # relocated section implies symbols, so sym_remap is non-nil
                     # and the lookup cannot miss; index 0 is never silently used.
                     val rsi: u32 = R.unwrap_ok[u32, str](reloc_sym_index(img, ?img.relocations[ri]));
-                    val elf_sym: u64 = sym_remap[rsi]::u64;
-                    # validate_reloc_kinds proved every kind maps, so the lookup
-                    # cannot miss; index 0 / abs64 is never silently substituted.
+                    # validate_reloc_kinds proved every kind maps and encodes in this
+                    # class, so the lookup cannot miss and the type cannot truncate.
                     val elf_type: u32 = R.unwrap_ok[u32, str](reloc_type_for(img.interner, alloc, img.relocations[ri].kind, tgt_isa));
-                    val r_info: u64 = (elf_sym << 32) | elf_type::u64;
-                    bin.write_u64_le(buf, ro + 8, r_info);
-                    bin.write_u64_le(buf, ro + 16, img.relocations[ri].addend::u64);
-                    ro = ro + RELA_SIZE;
+                    ro = write_rela_at(buf, ro, ?lay, img.relocations[ri].offset::u64,
+                                       sym_remap[rsi], elf_type, img.relocations[ri].addend);
                 }
                 ri = ri + 1;
             }
@@ -1154,15 +1525,17 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
     }
 
     # the build-attributes section data, after the rela tables.
-    if (attr != nil) { write_build_attributes(buf, attr_offset, attr); }
+    if (attr != nil) {
+        write_build_attributes(buf, attr_offset, attr, img.attributes, img.attributes_len);
+    }
 
     # section-header table: null, sections, .symtab, .strtab, .shstrtab, relas, then
     # the build-attributes section last (so the indices above stay fixed).
     var shdr_pos: usize = shdr_offset;
-    memory.raw_zero((buf::usize + shdr_pos)::ptr, SHDR_SIZE);
-    shdr_pos = shdr_pos + SHDR_SIZE;
+    memory.raw_zero((buf::usize + shdr_pos)::ptr, lay.shdr_size);
+    shdr_pos = shdr_pos + lay.shdr_size;
 
-    sec_offset = ELF_HEADER_SIZE;
+    sec_offset = lay.ehdr_size;
     s = 0;
     for (s < num_secs) {
         var this_off: usize = 0;
@@ -1170,21 +1543,10 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
             sec_offset = bin.align_up(sec_offset, img.sections[s].align::usize);
             this_off = sec_offset;
         }
-        bin.write_u32_le(buf, shdr_pos, name_offsets[s]);
-        bin.write_u32_le(buf, shdr_pos + 4, section_type_for(img.sections[s].kind));
-        bin.write_u64_le(buf, shdr_pos + 8, section_flags_for_section(?img.sections[s]));
-        bin.write_u64_le(buf, shdr_pos + 16, 0);
-        if (img.sections[s].kind == of.SK_BSS) {
-            bin.write_u64_le(buf, shdr_pos + 24, 0);
-        } or {
-            bin.write_u64_le(buf, shdr_pos + 24, this_off::u64);
-        }
-        bin.write_u64_le(buf, shdr_pos + 32, img.sections[s].len::u64);
-        bin.write_u32_le(buf, shdr_pos + 40, 0);
-        bin.write_u32_le(buf, shdr_pos + 44, 0);
+        var sh_off: u64 = this_off::u64;
+        if (img.sections[s].kind == of.SK_BSS) { sh_off = 0; }
         var sec_align: usize = img.sections[s].align::usize;
         if (sec_align == 0) { sec_align = 1; }
-        bin.write_u64_le(buf, shdr_pos + 48, sec_align::u64);
         # an SHF_MERGE section's entry size: an embed atom is one whole element, so a
         # reader (mach's own or a foreign linker's) merges it against a byte-identical
         # section and never against part of one.
@@ -1192,8 +1554,11 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
         if ((section_flags_for_section(?img.sections[s]) & SHF_MERGE) != 0) {
             entsize = img.sections[s].len::u64;
         }
-        bin.write_u64_le(buf, shdr_pos + 56, entsize);
-        shdr_pos = shdr_pos + SHDR_SIZE;
+        shdr_pos = write_shdr(buf, shdr_pos, ?lay, name_offsets[s],
+                              section_type_for(img.sections[s].kind),
+                              section_flags_for_section(?img.sections[s]), 0,
+                              sh_off, img.sections[s].len::u64, 0, 0,
+                              sec_align::u64, entsize);
         if (img.sections[s].kind != of.SK_BSS) {
             sec_offset = sec_offset + img.sections[s].len::usize;
         }
@@ -1201,57 +1566,25 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
     }
 
     val symtab_shidx: u32 = 1 + num_secs;
-    bin.write_u32_le(buf, shdr_pos, symtab_name_off);
-    bin.write_u32_le(buf, shdr_pos + 4, SHT_SYMTAB);
-    bin.write_u64_le(buf, shdr_pos + 8, 0);
-    bin.write_u64_le(buf, shdr_pos + 16, 0);
-    bin.write_u64_le(buf, shdr_pos + 24, symtab_offset::u64);
-    bin.write_u64_le(buf, shdr_pos + 32, symtab_size::u64);
-    bin.write_u32_le(buf, shdr_pos + 40, (symtab_shidx + 1)::u32);
-    bin.write_u32_le(buf, shdr_pos + 44, first_global::u32);
-    bin.write_u64_le(buf, shdr_pos + 48, 8);
-    bin.write_u64_le(buf, shdr_pos + 56, SYM_SIZE::u64);
-    shdr_pos = shdr_pos + SHDR_SIZE;
+    shdr_pos = write_shdr(buf, shdr_pos, ?lay, symtab_name_off, SHT_SYMTAB, 0, 0,
+                          symtab_offset::u64, symtab_size::u64,
+                          (symtab_shidx + 1)::u32, first_global::u32,
+                          lay.struct_align::u64, lay.sym_size::u64);
 
-    bin.write_u32_le(buf, shdr_pos, strtab_name_off);
-    bin.write_u32_le(buf, shdr_pos + 4, SHT_STRTAB);
-    bin.write_u64_le(buf, shdr_pos + 8, 0);
-    bin.write_u64_le(buf, shdr_pos + 16, 0);
-    bin.write_u64_le(buf, shdr_pos + 24, strtab_offset::u64);
-    bin.write_u64_le(buf, shdr_pos + 32, strtab_sz::u64);
-    bin.write_u32_le(buf, shdr_pos + 40, 0);
-    bin.write_u32_le(buf, shdr_pos + 44, 0);
-    bin.write_u64_le(buf, shdr_pos + 48, 1);
-    bin.write_u64_le(buf, shdr_pos + 56, 0);
-    shdr_pos = shdr_pos + SHDR_SIZE;
+    shdr_pos = write_shdr(buf, shdr_pos, ?lay, strtab_name_off, SHT_STRTAB, 0, 0,
+                          strtab_offset::u64, strtab_sz::u64, 0, 0, 1, 0);
 
-    bin.write_u32_le(buf, shdr_pos, shstrtab_name_off);
-    bin.write_u32_le(buf, shdr_pos + 4, SHT_STRTAB);
-    bin.write_u64_le(buf, shdr_pos + 8, 0);
-    bin.write_u64_le(buf, shdr_pos + 16, 0);
-    bin.write_u64_le(buf, shdr_pos + 24, shstrtab_offset::u64);
-    bin.write_u64_le(buf, shdr_pos + 32, shstrtab_len::u64);
-    bin.write_u32_le(buf, shdr_pos + 40, 0);
-    bin.write_u32_le(buf, shdr_pos + 44, 0);
-    bin.write_u64_le(buf, shdr_pos + 48, 1);
-    bin.write_u64_le(buf, shdr_pos + 56, 0);
-    shdr_pos = shdr_pos + SHDR_SIZE;
+    shdr_pos = write_shdr(buf, shdr_pos, ?lay, shstrtab_name_off, SHT_STRTAB, 0, 0,
+                          shstrtab_offset::u64, shstrtab_len::u64, 0, 0, 1, 0);
 
     s = 0;
     for (s < num_secs) {
         val rc: u32 = count_relocs_for_section(img, s);
         if (rc > 0) {
-            bin.write_u32_le(buf, shdr_pos, rela_name_offsets[s]);
-            bin.write_u32_le(buf, shdr_pos + 4, SHT_RELA);
-            bin.write_u64_le(buf, shdr_pos + 8, 0);
-            bin.write_u64_le(buf, shdr_pos + 16, 0);
-            bin.write_u64_le(buf, shdr_pos + 24, rela_offsets[s]::u64);
-            bin.write_u64_le(buf, shdr_pos + 32, (rc::usize * RELA_SIZE)::u64);
-            bin.write_u32_le(buf, shdr_pos + 40, symtab_shidx::u32);
-            bin.write_u32_le(buf, shdr_pos + 44, (s + 1)::u32);
-            bin.write_u64_le(buf, shdr_pos + 48, 8);
-            bin.write_u64_le(buf, shdr_pos + 56, RELA_SIZE::u64);
-            shdr_pos = shdr_pos + SHDR_SIZE;
+            shdr_pos = write_shdr(buf, shdr_pos, ?lay, rela_name_offsets[s], SHT_RELA, 0, 0,
+                                  rela_offsets[s]::u64, (rc::usize * lay.rela_size)::u64,
+                                  symtab_shidx::u32, (s + 1)::u32,
+                                  lay.struct_align::u64, lay.rela_size::u64);
         }
         s = s + 1;
     }
@@ -1259,17 +1592,8 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
     # the build-attributes section header: non-alloc (zero flags), byte-aligned, no
     # link/info; its type comes from the descriptor, never the arch id.
     if (attr != nil) {
-        bin.write_u32_le(buf, shdr_pos, attr_name_off);
-        bin.write_u32_le(buf, shdr_pos + 4, attr.sht);
-        bin.write_u64_le(buf, shdr_pos + 8, 0);
-        bin.write_u64_le(buf, shdr_pos + 16, 0);
-        bin.write_u64_le(buf, shdr_pos + 24, attr_offset::u64);
-        bin.write_u64_le(buf, shdr_pos + 32, attr_size::u64);
-        bin.write_u32_le(buf, shdr_pos + 40, 0);
-        bin.write_u32_le(buf, shdr_pos + 44, 0);
-        bin.write_u64_le(buf, shdr_pos + 48, 1);
-        bin.write_u64_le(buf, shdr_pos + 56, 0);
-        shdr_pos = shdr_pos + SHDR_SIZE;
+        shdr_pos = write_shdr(buf, shdr_pos, ?lay, attr_name_off, attr.sht, 0, 0,
+                              attr_offset::u64, attr_size::u64, 0, 0, 1, 0);
     }
 
     if (sym_remap != nil) { A.deallocate[u32](alloc, sym_remap, num_syms::usize); }
@@ -1346,6 +1670,11 @@ pub fun register(reg: *of.OfRegistry) R.Result[bool, str] {
     of.cover_isa(?elf_vtable, isa.ARCH_X86_64);
     of.cover_isa(?elf_vtable, isa.ARCH_AARCH64);
     of.cover_isa(?elf_vtable, isa.ARCH_RISCV64);
+    # riscv32 writes ELFCLASS32: the relocatable object, the static executable and
+    # the reader are all class-generic (#2861). the three dynamic writers refuse an
+    # ELFCLASS32 target by name, so a `--pie`, shared or dynamically linked rv32 link
+    # fails with a diagnostic instead of producing a malformed image (#2894).
+    of.cover_isa(?elf_vtable, isa.ARCH_RISCV32);
 
     of.register(reg, ?elf_vtable);
     ret R.ok[bool, str](true);
@@ -1434,12 +1763,17 @@ fun copy_segment_bytes(buf: *u8, segs: *of.LoadSegment, seg_offsets: *usize, seg
 # write a static ET_EXEC executable, installed in the ELF `of.OfVTable` as its
 # `of.ExecFn`
 #
-# Emits the ELF header, a program-header table, then the loadable segments. The
-# first PT_LOAD always covers the ELF header and the program headers so the loader
-# maps them; each provided segment becomes a page-aligned PT_LOAD at its `vaddr`.
-# The linker computes vaddrs (from the OS base address) and the entry address
-# before calling this. Each segment's file offset is page-aligned so
-# `offset % page == vaddr % page` holds for the loader.
+# Emits the ELF header, a program-header table, then the loadable segments. On a
+# loader-mapped image (`image_options.mapped_by_loader`) the first PT_LOAD covers the
+# ELF header and the program headers so the loader maps them; each provided segment
+# becomes a page-aligned PT_LOAD at its `vaddr`. The linker computes vaddrs (from the
+# OS base address) and the entry address before calling this. Each segment's file
+# offset is page-aligned so `offset % page == vaddr % page` holds for the loader.
+#
+# A bare-metal image has no loader: nothing reads the program headers at run time, so
+# no header segment is emitted and the header block is file metadata that is never
+# mapped. That is also the only shape available at base address 0, where there is no
+# room below segment 0 for one (#2895).
 #
 # `funcs`/`func_count` are accepted for `of.ExecFn` conformance; the static writer
 # emits no unwind table and does not consume them.
@@ -1456,7 +1790,8 @@ fun copy_segment_bytes(buf: *u8, segs: *of.LoadSegment, seg_offsets: *usize, seg
 # func_count: number of entries in funcs (unused; see above)
 # path:       null-terminated output file path
 # name:       product name; accepted for of.ExecFn conformance (ELF does not sign)
-# image_options: accepted for of.ExecFn conformance; ELF has no image options
+# image_options: read for `mapped_by_loader` (whether to map the header block) and
+#             the machine-flags word and build-attribute body
 # ret:        ok(true) on success, or an error string
 fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTable, segs: *of.LoadSegment,
               seg_count: u32, page_size: u64, image_base: u64, entry: u64,
@@ -1468,7 +1803,11 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
     if (tgt_isa == nil) { ret R.err[bool, str]("elf: nil exec isa"); }
     if (path == nil)    { ret R.err[bool, str]("elf: nil exec path"); }
 
-    val sb_r: R.Result[SymtabBuild, str] = build_symtab_bytes(alloc, itn, symtab, symtab_count, segs, seg_count);
+    # the class byte and every structure size come from one call, so no path can
+    # write an Elf64 field into a file stamped ELFCLASS32 (#2861)
+    var lay: ElfLayout = layout_for(tgt_isa);
+
+    val sb_r: R.Result[SymtabBuild, str] = build_symtab_bytes(alloc, itn, ?lay, symtab, symtab_count, segs, seg_count);
     if (R.is_err[SymtabBuild, str](sb_r)) { ret R.err[bool, str](R.unwrap_err[SymtabBuild, str](sb_r)); }
     var sb: SymtabBuild = R.unwrap_ok[SymtabBuild, str](sb_r);
 
@@ -1476,20 +1815,30 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
     # the ISA describes, framed in its own minimal section-header table after the load
     # segments. nil for an arch that emits none, which leaves the static exe
     # section-header-less exactly as before.
-    val attr: *BuildAttributes = attributes_for(tgt_isa);
+    var attr: *BuildAttributes = attributes_for(tgt_isa);
+    if (image_options.attributes == nil || image_options.attributes_len == 0) { attr = nil; }
 
-    val phdr_count: u32 = seg_count + 1;
+    # the leading PT_LOAD covering the header block exists for a LOADER: it is what
+    # lets one read the program headers back out of the mapped image. an image no
+    # loader maps gets no such segment, so the header block stays file metadata
+    # (#2895).
+    val map_headers: bool = image_options.mapped_by_loader;
+
+    var phdr_count: u32 = seg_count;
+    if (map_headers) { phdr_count = seg_count + 1; }
 
     # the same one-page header reservation the PIE and dynamic writers refuse to
     # overrun. the static writer needs it for the same reason and did not have it,
     # because until the header block moved below segment 0 it had no reserved page to
-    # overrun - it simply sat on top of segment 0's address instead.
-    if (!header_fits_reserved_page(phdr_count, page_size)) {
+    # overrun - it simply sat on top of segment 0's address instead. an unmapped
+    # header block overruns nothing: there is no reservation, and the congruence the
+    # reservation preserves is what a loader needs to map segment 0 at its vaddr.
+    if (map_headers && !header_fits_reserved_page(?lay, phdr_count, page_size)) {
         ret R.err[bool, str]("elf: static program headers exceed the one-page header reservation (too many load segments)");
     }
 
-    val phdr_offset: usize = ELF_HEADER_SIZE;
-    val phdr_table_size: usize = phdr_count::usize * PHDR_SIZE;
+    val phdr_offset: usize = lay.ehdr_size;
+    val phdr_table_size: usize = phdr_count::usize * lay.phdr_size;
 
     # per-segment file offsets; the neutral LoadSegment carries no offset field,
     # so the layout is computed into a scratch array indexed by segment.
@@ -1541,7 +1890,7 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
     var sht_count:       u32 = 0;
     if (has_sht) {
         if (attr != nil) {
-            attr_sz    = build_attributes_size(attr);
+            attr_sz    = build_attributes_size(attr, image_options.attributes_len);
             attr_off   = total_size;
             total_size = total_size + attr_sz;
         }
@@ -1619,13 +1968,13 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
         shstr_sz = shstr_sz + str_len(".shstrtab") + 1;
         total_size = total_size + shstr_sz;
 
-        shdr_off = bin.align_up(total_size, 8);
+        shdr_off = bin.align_up(total_size, lay.struct_align);
         # the section-header table: null + one per segment + attributes(if any) +
         # one per debug section + .symtab/.strtab (if any) + .shstrtab.
         sht_count = seg_count + 1 + debug_count + 1;
         if (attr != nil) { sht_count = sht_count + 1; }
         if (sb.symtab_bytes != nil) { sht_count = sht_count + 2; }
-        total_size = shdr_off + SHDR_SIZE * sht_count::usize;
+        total_size = shdr_off + lay.shdr_size * sht_count::usize;
     }
 
     val res_buf: R.Result[*u8, str] = A.zallocate[u8](alloc, total_size);
@@ -1638,57 +1987,39 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
     }
     var buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
 
-    write_elf_ident(buf, tgt_isa);
+    write_elf_ident(buf, ?lay);
 
-    bin.write_u16_le(buf, 16, ET_EXEC);
-    bin.write_u16_le(buf, 18, tgt_isa.elf_machine::u16);
-    bin.write_u32_le(buf, 20, 1);
-    bin.write_u64_le(buf, 24, entry);
-    bin.write_u64_le(buf, 32, phdr_offset::u64);
-    if (has_sht) { bin.write_u64_le(buf, 40, shdr_off::u64); } or { bin.write_u64_le(buf, 40, 0); }
-    bin.write_u32_le(buf, 48, image_options.machine_flags);
-    bin.write_u16_le(buf, 52, ELF_HEADER_SIZE::u16);
-    bin.write_u16_le(buf, 54, PHDR_SIZE::u16);
-    bin.write_u16_le(buf, 56, phdr_count::u16);
-    bin.write_u16_le(buf, 58, SHDR_SIZE::u16);
+    # the section-header table is null + one per segment + attributes(if any) +
+    # one per debug section + .shstrtab; .shstrtab (the section-name string table)
+    # is the last section.
+    var e_shoff: u64 = 0;
+    var e_shnum: u16 = 0;
+    var e_shstrndx: u16 = 0;
     if (has_sht) {
-        # the section-header table is null + one per segment + attributes(if any) +
-        # one per debug section + .shstrtab; .shstrtab (the section-name string table)
-        # is the last section.
-        bin.write_u16_le(buf, 60, sht_count::u16);
-        bin.write_u16_le(buf, 62, (sht_count - 1)::u16);
-    } or {
-        bin.write_u16_le(buf, 60, 0);
-        bin.write_u16_le(buf, 62, 0);
+        e_shoff    = shdr_off::u64;
+        e_shnum    = sht_count::u16;
+        e_shstrndx = (sht_count - 1)::u16;
     }
+    write_ehdr(buf, ?lay, ET_EXEC, tgt_isa.elf_machine::u16, image_options.machine_flags,
+               entry, phdr_offset::u64, e_shoff, phdr_count::u16, e_shnum, e_shstrndx);
 
     var phdr_pos: usize = phdr_offset;
 
-    # leading PT_LOAD covering the ELF header and the program headers.
-    var hdr_vaddr: u64 = entry & ~(page_size - 1);
-    if (seg_count > 0) { hdr_vaddr = header_segment_vaddr(segs[0].vaddr, page_size); }
-    val hdr_filesz: usize = phdr_offset + phdr_table_size;
-    bin.write_u32_le(buf, phdr_pos, PT_LOAD);
-    bin.write_u32_le(buf, phdr_pos + 4, PF_R);
-    bin.write_u64_le(buf, phdr_pos + 8, 0);
-    bin.write_u64_le(buf, phdr_pos + 16, hdr_vaddr);
-    bin.write_u64_le(buf, phdr_pos + 24, hdr_vaddr);
-    bin.write_u64_le(buf, phdr_pos + 32, hdr_filesz::u64);
-    bin.write_u64_le(buf, phdr_pos + 40, hdr_filesz::u64);
-    bin.write_u64_le(buf, phdr_pos + 48, page_size);
-    phdr_pos = phdr_pos + PHDR_SIZE;
+    # leading PT_LOAD covering the ELF header and the program headers, for a loader
+    # to find them at. omitted entirely when nothing maps the image.
+    if (map_headers) {
+        var hdr_vaddr: u64 = entry & ~(page_size - 1);
+        if (seg_count > 0) { hdr_vaddr = header_segment_vaddr(segs[0].vaddr, page_size); }
+        val hdr_filesz: usize = phdr_offset + phdr_table_size;
+        phdr_pos = write_phdr_at(buf, phdr_pos, ?lay, PT_LOAD, PF_R, 0, hdr_vaddr, hdr_vaddr,
+                                 hdr_filesz::u64, hdr_filesz::u64, page_size);
+    }
 
     li = 0;
     for (li < seg_count) {
-        bin.write_u32_le(buf, phdr_pos, PT_LOAD);
-        bin.write_u32_le(buf, phdr_pos + 4, pf_flags_for(segs[li].flags));
-        bin.write_u64_le(buf, phdr_pos + 8, seg_offsets[li]::u64);
-        bin.write_u64_le(buf, phdr_pos + 16, segs[li].vaddr);
-        bin.write_u64_le(buf, phdr_pos + 24, segs[li].vaddr);
-        bin.write_u64_le(buf, phdr_pos + 32, segs[li].filesz::u64);
-        bin.write_u64_le(buf, phdr_pos + 40, segs[li].memsz::u64);
-        bin.write_u64_le(buf, phdr_pos + 48, page_size);
-        phdr_pos = phdr_pos + PHDR_SIZE;
+        phdr_pos = write_phdr_at(buf, phdr_pos, ?lay, PT_LOAD, pf_flags_for(segs[li].flags),
+                                 seg_offsets[li]::u64, segs[li].vaddr, segs[li].vaddr,
+                                 segs[li].filesz::u64, segs[li].memsz::u64, page_size);
 
         if (segs[li].bytes != nil && segs[li].filesz > 0) {
             memory.raw_copy((buf::usize + seg_offsets[li])::ptr, segs[li].bytes::ptr, segs[li].filesz);
@@ -1700,7 +2031,10 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
     # string table, and the section headers, all after the load segments and outside
     # every PT_LOAD.
     if (has_sht) {
-        if (attr != nil) { write_build_attributes(buf, attr_off, attr); }
+        if (attr != nil) {
+            write_build_attributes(buf, attr_off, attr,
+                                   image_options.attributes, image_options.attributes_len);
+        }
 
         var di: u32 = 0;
         for (di < debug_count) {
@@ -1744,39 +2078,22 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
         # written above. `shidx` tracks the SHT index of the header about to be
         # written, so `.symtab`'s `sh_link` can name `.strtab`'s index once it is
         # known - the one field here that is not a plain offset/size/name.
-        var hp: usize = shdr_off + SHDR_SIZE;
+        var hp: usize = shdr_off + lay.shdr_size;
         var shidx: u32 = 1;
         var name_cursor: usize = 1;
         li = 0;
         for (li < seg_count) {
-            bin.write_u32_le(buf, hp, name_cursor::u32);
-            bin.write_u32_le(buf, hp + 4, SHT_PROGBITS);
-            bin.write_u64_le(buf, hp + 8, seg_section_flags(segs[li].flags));
-            bin.write_u64_le(buf, hp + 16, segs[li].vaddr);
-            bin.write_u64_le(buf, hp + 24, seg_offsets[li]::u64);
-            bin.write_u64_le(buf, hp + 32, segs[li].filesz::u64);
-            bin.write_u32_le(buf, hp + 40, 0);
-            bin.write_u32_le(buf, hp + 44, 0);
-            bin.write_u64_le(buf, hp + 48, page_size);
-            bin.write_u64_le(buf, hp + 56, 0);
-            hp = hp + SHDR_SIZE;
+            hp = write_shdr(buf, hp, ?lay, name_cursor::u32, SHT_PROGBITS,
+                            seg_section_flags(segs[li].flags), segs[li].vaddr,
+                            seg_offsets[li]::u64, segs[li].filesz::u64, 0, 0, page_size, 0);
             shidx = shidx + 1;
             name_cursor = name_cursor + str_len(seg_section_name(segs[li].flags)) + 1;
             li = li + 1;
         }
 
         if (attr != nil) {
-            bin.write_u32_le(buf, hp, attr_name_rel::u32);
-            bin.write_u32_le(buf, hp + 4, attr.sht);
-            bin.write_u64_le(buf, hp + 8, 0);
-            bin.write_u64_le(buf, hp + 16, 0);
-            bin.write_u64_le(buf, hp + 24, attr_off::u64);
-            bin.write_u64_le(buf, hp + 32, attr_sz::u64);
-            bin.write_u32_le(buf, hp + 40, 0);
-            bin.write_u32_le(buf, hp + 44, 0);
-            bin.write_u64_le(buf, hp + 48, 1);
-            bin.write_u64_le(buf, hp + 56, 0);
-            hp = hp + SHDR_SIZE;
+            hp = write_shdr(buf, hp, ?lay, attr_name_rel::u32, attr.sht, 0, 0,
+                            attr_off::u64, attr_sz::u64, 0, 0, 1, 0);
             shidx = shidx + 1;
         }
 
@@ -1785,17 +2102,8 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
         for (di < debug_count) {
             var da: u32 = debug[di].align;
             if (da == 0) { da = 1; }
-            bin.write_u32_le(buf, hp, debug_name_rels[di]::u32);
-            bin.write_u32_le(buf, hp + 4, SHT_PROGBITS);
-            bin.write_u64_le(buf, hp + 8, 0);
-            bin.write_u64_le(buf, hp + 16, 0);
-            bin.write_u64_le(buf, hp + 24, debug_offs[di]::u64);
-            bin.write_u64_le(buf, hp + 32, debug[di].len::u64);
-            bin.write_u32_le(buf, hp + 40, 0);
-            bin.write_u32_le(buf, hp + 44, 0);
-            bin.write_u64_le(buf, hp + 48, da::u64);
-            bin.write_u64_le(buf, hp + 56, 0);
-            hp = hp + SHDR_SIZE;
+            hp = write_shdr(buf, hp, ?lay, debug_name_rels[di]::u32, SHT_PROGBITS, 0, 0,
+                            debug_offs[di]::u64, debug[di].len::u64, 0, 0, da::u64, 0);
             shidx = shidx + 1;
             di = di + 1;
         }
@@ -1808,43 +2116,18 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
         # sorts that way.
         if (sb.symtab_bytes != nil) {
             val strtab_idx: u32 = shidx + 1;
-            bin.write_u32_le(buf, hp, symtab_name_rel::u32);
-            bin.write_u32_le(buf, hp + 4, SHT_SYMTAB);
-            bin.write_u64_le(buf, hp + 8, 0);
-            bin.write_u64_le(buf, hp + 16, 0);
-            bin.write_u64_le(buf, hp + 24, symtab_off::u64);
-            bin.write_u64_le(buf, hp + 32, sb.symtab_size::u64);
-            bin.write_u32_le(buf, hp + 40, strtab_idx);
-            bin.write_u32_le(buf, hp + 44, sb.local_count);
-            bin.write_u64_le(buf, hp + 48, 8);
-            bin.write_u64_le(buf, hp + 56, SYM_SIZE::u64);
-            hp = hp + SHDR_SIZE;
+            hp = write_shdr(buf, hp, ?lay, symtab_name_rel::u32, SHT_SYMTAB, 0, 0,
+                            symtab_off::u64, sb.symtab_size::u64, strtab_idx, sb.local_count,
+                            lay.struct_align::u64, lay.sym_size::u64);
             shidx = shidx + 1;
 
-            bin.write_u32_le(buf, hp, strtab_name_rel::u32);
-            bin.write_u32_le(buf, hp + 4, SHT_STRTAB);
-            bin.write_u64_le(buf, hp + 8, 0);
-            bin.write_u64_le(buf, hp + 16, 0);
-            bin.write_u64_le(buf, hp + 24, strtab_off::u64);
-            bin.write_u64_le(buf, hp + 32, sb.strtab_size::u64);
-            bin.write_u32_le(buf, hp + 40, 0);
-            bin.write_u32_le(buf, hp + 44, 0);
-            bin.write_u64_le(buf, hp + 48, 1);
-            bin.write_u64_le(buf, hp + 56, 0);
-            hp = hp + SHDR_SIZE;
+            hp = write_shdr(buf, hp, ?lay, strtab_name_rel::u32, SHT_STRTAB, 0, 0,
+                            strtab_off::u64, sb.strtab_size::u64, 0, 0, 1, 0);
             shidx = shidx + 1;
         }
 
-        bin.write_u32_le(buf, hp, shstr_name_rel::u32);
-        bin.write_u32_le(buf, hp + 4, SHT_STRTAB);
-        bin.write_u64_le(buf, hp + 8, 0);
-        bin.write_u64_le(buf, hp + 16, 0);
-        bin.write_u64_le(buf, hp + 24, shstr_off::u64);
-        bin.write_u64_le(buf, hp + 32, shstr_sz::u64);
-        bin.write_u32_le(buf, hp + 40, 0);
-        bin.write_u32_le(buf, hp + 44, 0);
-        bin.write_u64_le(buf, hp + 48, 1);
-        bin.write_u64_le(buf, hp + 56, 0);
+        write_shdr(buf, hp, ?lay, shstr_name_rel::u32, SHT_STRTAB, 0, 0,
+                   shstr_off::u64, shstr_sz::u64, 0, 0, 1, 0);
     }
 
     if (debug_name_rels != nil) { A.deallocate[usize](alloc, debug_name_rels, debug_count::usize); }
@@ -1866,23 +2149,37 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
 # The PIE and dynamic writers extend the first PT_LOAD down exactly one page to file offset
 # 0 so it covers the ELF header and the program-header table, mapping them at
 # `segs[0].vaddr - page`. That holds the loader's `p_offset == p_vaddr (mod page)`
-# congruence only while the header block fits that one page: `ELF_HEADER_SIZE + phdr_count
-# * PHDR_SIZE <= page` (with a 4 KiB page, `phdr_count <= 72`; a larger max-page raises the
-# bound). A larger table spills onto a second page, pushing the first segment's file offset
-# a page past `hdr_vaddr + page` so segment 0 no longer maps at its vaddr - an image the
-# kernel refuses to exec. The writer refuses at link time instead.
+# congruence only while the header block fits that one page: `ehdr_size + phdr_count *
+# phdr_size <= page` (with a 4 KiB page, an Elf64 image fits 72 headers and an Elf32 one
+# 126; a larger max-page raises both bounds). A larger table spills onto a second page,
+# pushing the first segment's file offset a page past `hdr_vaddr + page` so segment 0 no
+# longer maps at its vaddr - an image the kernel refuses to exec. The writer refuses at
+# link time instead.
+#
+# PRECONDITION, same as `header_segment_vaddr`'s: the image is loader-mapped. Without
+# a loader there is no reserved page and no congruence to preserve (at a no-paging
+# page size of 1 every value is congruent), so the question this asks does not arise
+# and a caller must not ask it - `page_size` is a length in bytes, and comparing a
+# header block against a page size of 1 refuses every image ever built (#2895).
+#
+# HOW EACH CALLER HOLDS IT. The static writer asks only when `mapped_by_loader` says
+# to. The PIE, shared and dynamic writers ask unconditionally, and are entitled to:
+# the linker refuses a position-independent, shared or dynamic request on an OS with
+# no loader before it picks a writer, so none of them runs on an unmapped image at all
+# (#2898).
 # ---
+# lay:        the class layout sizing the header and the program headers
 # phdr_count: the number of program headers the writer will emit
 # page_size:  the segment-alignment page the header block must fit within
 # ret:        true when the header block still fits its one reserved page
-fun header_fits_reserved_page(phdr_count: u32, page_size: u64) bool {
-    ret ELF_HEADER_SIZE + phdr_count::usize * PHDR_SIZE <= page_size::usize;
+fun header_fits_reserved_page(lay: *ElfLayout, phdr_count: u32, page_size: u64) bool {
+    ret lay.ehdr_size + phdr_count::usize * lay.phdr_size <= page_size::usize;
 }
 
 # the virtual address the leading PT_LOAD maps the ELF header and program-header table
 # at: one page below the first load segment's own page
 #
-# ONE DEFINITION FOR ALL THREE WRITERS, and the reason it is a function is that it was
+# one definition for all three writers, and the reason it is a function is that it was
 # not one. The static writer mapped the header block AT `segs[0].vaddr` while the PIE
 # and dynamic writers mapped it a page below, so two PT_LOADs claimed the same virtual
 # address in every static image mach has ever produced. That is a malformed image: a
@@ -1897,6 +2194,18 @@ fun header_fits_reserved_page(phdr_count: u32, page_size: u64) bool {
 # The degenerate no-segment case stays with each caller: a writer's default for an
 # image with nothing to load is not this policy, and folding it in here would invent
 # an answer (a PIE image's `entry` of 0 would underflow a page below zero).
+#
+# PRECONDITION: the image is loader-mapped (`os.OsVTable.mapped_by_loader`), which is
+# what makes a header segment meaningful at all and what puts segment 0 at least one
+# page above zero. A caller that asks this on a bare-metal image at base address 0
+# gets `0 - page`, an underflow to the top of the address space, which is a segment
+# mapped at a wild address rather than a diagnosable failure - so the callers gate on
+# the fact instead of clamping the answer here (#2895).
+#
+# The static writer gates on the fact directly. The PIE and dynamic writers do not
+# need to: a position-independent or dynamically-linked image is a request for a
+# loader, and the linker refuses that request on an OS that states it has none, so
+# those two never run on an unmapped image and the underflow has no caller (#2898).
 # ---
 # first_seg_vaddr: virtual address of the lowest load segment
 # page_size:       the segment-alignment page
@@ -1991,6 +2300,7 @@ rec DebugSht {
 # ---
 # alloc:       allocator backing the plan's offset arrays
 # itn:         interner resolving the debug section names (non-nil when count > 0)
+# lay:         the class layout sizing and aligning the section headers
 # debug:       the non-allocated debug sections
 # debug_count: number of debug sections
 # aux:         the already-emitted allocated sections to also name/locate, or nil
@@ -1999,7 +2309,8 @@ rec DebugSht {
 #              == nil`) when this image carries no function symbol table
 # base:        file offset where the table begins
 # ret:         the layout plan, or an allocation error
-fun debug_sht_plan(alloc: *A.Allocator, itn: *intern.Interner, debug: *of.Section, debug_count: u32,
+fun debug_sht_plan(alloc: *A.Allocator, itn: *intern.Interner, lay: *ElfLayout,
+                   debug: *of.Section, debug_count: u32,
                    aux: *ShtAlloc, aux_count: u32, sb: *SymtabBuild, base: usize) R.Result[DebugSht, str] {
     var p: DebugSht;
     p.present = false;
@@ -2079,12 +2390,12 @@ fun debug_sht_plan(alloc: *A.Allocator, itn: *intern.Interner, debug: *of.Sectio
     p.shstr_sz = sz;
     off = off + sz;
 
-    p.shdr_off = bin.align_up(off, 8);
+    p.shdr_off = bin.align_up(off, lay.struct_align);
     p.sht_count = 1 + aux_count + debug_count + 1;
     if (has_symtab) { p.sht_count = p.sht_count + 2; }
     p.shstrndx = p.sht_count - 1;
     p.present = true;
-    p.added = (p.shdr_off + SHDR_SIZE * p.sht_count::usize) - base;
+    p.added = (p.shdr_off + lay.shdr_size * p.sht_count::usize) - base;
     ret R.ok[DebugSht, str](p);
 }
 
@@ -2097,13 +2408,15 @@ fun debug_sht_plan(alloc: *A.Allocator, itn: *intern.Interner, debug: *of.Sectio
 # ---
 # buf:         the output buffer (sized to include the plan)
 # itn:         interner resolving the debug section names
+# lay:         the class layout placing each section header's fields
 # debug:       the non-allocated debug sections
 # debug_count: number of debug sections
 # aux:         the already-emitted allocated sections to name/locate, or nil
 # aux_count:   number of aux sections (0 for the executable writers)
 # sb:          the built `.symtab`/`.strtab` pair `debug_sht_plan` was given
 # p:           the layout plan from debug_sht_plan
-fun debug_sht_write(buf: *u8, itn: *intern.Interner, debug: *of.Section, debug_count: u32,
+fun debug_sht_write(buf: *u8, itn: *intern.Interner, lay: *ElfLayout,
+                    debug: *of.Section, debug_count: u32,
                     aux: *ShtAlloc, aux_count: u32, sb: *SymtabBuild, p: *DebugSht) {
     if (!p.present) { ret; }
 
@@ -2142,21 +2455,13 @@ fun debug_sht_write(buf: *u8, itn: *intern.Interner, debug: *of.Section, debug_c
     # body already loaded), one non-alloc PROGBITS per debug section, .symtab/.strtab
     # (if any), then .shstrtab. `shidx` tracks the SHT index of the header about to
     # be written, so `.symtab`'s `sh_link` can name `.strtab`'s index once known.
-    var hp: usize = p.shdr_off + SHDR_SIZE;
+    var hp: usize = p.shdr_off + lay.shdr_size;
     var shidx: u32 = 1;
     ai = 0;
     for (ai < aux_count) {
-        bin.write_u32_le(buf, hp, p.aux_name_rels[ai]::u32);
-        bin.write_u32_le(buf, hp + 4, aux[ai].sh_type);
-        bin.write_u64_le(buf, hp + 8, aux[ai].flags);
-        bin.write_u64_le(buf, hp + 16, aux[ai].addr);
-        bin.write_u64_le(buf, hp + 24, aux[ai].off::u64);
-        bin.write_u64_le(buf, hp + 32, aux[ai].size::u64);
-        bin.write_u32_le(buf, hp + 40, aux[ai].link);
-        bin.write_u32_le(buf, hp + 44, aux[ai].info);
-        bin.write_u64_le(buf, hp + 48, 8);
-        bin.write_u64_le(buf, hp + 56, aux[ai].entsize::u64);
-        hp = hp + SHDR_SIZE;
+        hp = write_shdr(buf, hp, lay, p.aux_name_rels[ai]::u32, aux[ai].sh_type,
+                        aux[ai].flags, aux[ai].addr, aux[ai].off::u64, aux[ai].size::u64,
+                        aux[ai].link, aux[ai].info, lay.struct_align::u64, aux[ai].entsize::u64);
         shidx = shidx + 1;
         ai = ai + 1;
     }
@@ -2164,60 +2469,26 @@ fun debug_sht_write(buf: *u8, itn: *intern.Interner, debug: *of.Section, debug_c
     for (di < debug_count) {
         var da: u32 = debug[di].align;
         if (da == 0) { da = 1; }
-        bin.write_u32_le(buf, hp, p.debug_name_rels[di]::u32);
-        bin.write_u32_le(buf, hp + 4, SHT_PROGBITS);
-        bin.write_u64_le(buf, hp + 8, 0);
-        bin.write_u64_le(buf, hp + 16, 0);
-        bin.write_u64_le(buf, hp + 24, p.debug_offs[di]::u64);
-        bin.write_u64_le(buf, hp + 32, debug[di].len::u64);
-        bin.write_u32_le(buf, hp + 40, 0);
-        bin.write_u32_le(buf, hp + 44, 0);
-        bin.write_u64_le(buf, hp + 48, da::u64);
-        bin.write_u64_le(buf, hp + 56, 0);
-        hp = hp + SHDR_SIZE;
+        hp = write_shdr(buf, hp, lay, p.debug_name_rels[di]::u32, SHT_PROGBITS, 0, 0,
+                        p.debug_offs[di]::u64, debug[di].len::u64, 0, 0, da::u64, 0);
         shidx = shidx + 1;
         di = di + 1;
     }
 
     if (sb.symtab_bytes != nil) {
         val strtab_idx: u32 = shidx + 1;
-        bin.write_u32_le(buf, hp, p.symtab_name_rel::u32);
-        bin.write_u32_le(buf, hp + 4, SHT_SYMTAB);
-        bin.write_u64_le(buf, hp + 8, 0);
-        bin.write_u64_le(buf, hp + 16, 0);
-        bin.write_u64_le(buf, hp + 24, p.symtab_off::u64);
-        bin.write_u64_le(buf, hp + 32, sb.symtab_size::u64);
-        bin.write_u32_le(buf, hp + 40, strtab_idx);
-        bin.write_u32_le(buf, hp + 44, sb.local_count);
-        bin.write_u64_le(buf, hp + 48, 8);
-        bin.write_u64_le(buf, hp + 56, SYM_SIZE::u64);
-        hp = hp + SHDR_SIZE;
+        hp = write_shdr(buf, hp, lay, p.symtab_name_rel::u32, SHT_SYMTAB, 0, 0,
+                        p.symtab_off::u64, sb.symtab_size::u64, strtab_idx, sb.local_count,
+                        lay.struct_align::u64, lay.sym_size::u64);
         shidx = shidx + 1;
 
-        bin.write_u32_le(buf, hp, p.strtab_name_rel::u32);
-        bin.write_u32_le(buf, hp + 4, SHT_STRTAB);
-        bin.write_u64_le(buf, hp + 8, 0);
-        bin.write_u64_le(buf, hp + 16, 0);
-        bin.write_u64_le(buf, hp + 24, p.strtab_off::u64);
-        bin.write_u64_le(buf, hp + 32, sb.strtab_size::u64);
-        bin.write_u32_le(buf, hp + 40, 0);
-        bin.write_u32_le(buf, hp + 44, 0);
-        bin.write_u64_le(buf, hp + 48, 1);
-        bin.write_u64_le(buf, hp + 56, 0);
-        hp = hp + SHDR_SIZE;
+        hp = write_shdr(buf, hp, lay, p.strtab_name_rel::u32, SHT_STRTAB, 0, 0,
+                        p.strtab_off::u64, sb.strtab_size::u64, 0, 0, 1, 0);
         shidx = shidx + 1;
     }
 
-    bin.write_u32_le(buf, hp, p.shstr_name_rel::u32);
-    bin.write_u32_le(buf, hp + 4, SHT_STRTAB);
-    bin.write_u64_le(buf, hp + 8, 0);
-    bin.write_u64_le(buf, hp + 16, 0);
-    bin.write_u64_le(buf, hp + 24, p.shstr_off::u64);
-    bin.write_u64_le(buf, hp + 32, p.shstr_sz::u64);
-    bin.write_u32_le(buf, hp + 40, 0);
-    bin.write_u32_le(buf, hp + 44, 0);
-    bin.write_u64_le(buf, hp + 48, 1);
-    bin.write_u64_le(buf, hp + 56, 0);
+    write_shdr(buf, hp, lay, p.shstr_name_rel::u32, SHT_STRTAB, 0, 0,
+               p.shstr_off::u64, p.shstr_sz::u64, 0, 0, 1, 0);
 }
 
 # release the offset arrays a `debug_sht_plan` allocated
@@ -2284,9 +2555,18 @@ fun emit_pie_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
                   dyn: *of.DynamicInfo, debug: *of.Section, debug_count: u32,
                   symtab: *of.SymtabEntry, symtab_count: u32, path: *u8,
                   image_options: of.ImageOptions) R.Result[bool, str] {
+    # the dynamic structures below are laid out in ELF64 throughout: an ELFCLASS32
+    # image needs `Elf32_Dyn`, a 4-byte GOT slot, rv32 PLT stubs and the rv32 dynamic
+    # relocation types, none of which exist yet. refusing by name beats emitting a
+    # file whose class byte contradicts its own dynamic tables (#2861, #2894).
+    var elay: ElfLayout = layout_for(tgt_isa);
+    if (elay.class != ELFCLASS64) {
+        ret R.err[bool, str]("elf: a position-independent image is ELF64-only (an ELFCLASS32 dynamic image is not implemented)");
+    }
+
     val nrel: u32 = dyn.base_reloc_count;
 
-    val sb_r: R.Result[SymtabBuild, str] = build_symtab_bytes(alloc, itn, symtab, symtab_count, segs, seg_count);
+    val sb_r: R.Result[SymtabBuild, str] = build_symtab_bytes(alloc, itn, ?elay, symtab, symtab_count, segs, seg_count);
     if (R.is_err[SymtabBuild, str](sb_r)) { ret R.err[bool, str](R.unwrap_err[SymtabBuild, str](sb_r)); }
     var sb: SymtabBuild = R.unwrap_ok[SymtabBuild, str](sb_r);
 
@@ -2306,7 +2586,7 @@ fun emit_pie_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
     # the first PT_LOAD covers the ELF header + phdr table by extending one page below
     # segment 0; a header block larger than that page would break segment 0's mapping, so
     # refuse rather than emit an image the kernel cannot exec (see #1814).
-    if (!header_fits_reserved_page(phdr_count, page_size)) {
+    if (!header_fits_reserved_page(?elay, phdr_count, page_size)) {
         free_symtab_bytes(alloc, ?sb);
         ret R.err[bool, str]("elf: PIE program headers exceed the one-page header reservation (too many load segments)");
     }
@@ -2396,7 +2676,7 @@ fun emit_pie_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
     # trails the whole image (past the RO structures), outside every PT_LOAD; the
     # runtime image is unchanged and the file stays section-header-less when absent.
     var dsht: DebugSht;
-    val dp: R.Result[DebugSht, str] = debug_sht_plan(alloc, itn, debug, debug_count, aux, aux_count, ?sb, struct_total);
+    val dp: R.Result[DebugSht, str] = debug_sht_plan(alloc, itn, ?elay, debug, debug_count, aux, aux_count, ?sb, struct_total);
     if (R.is_err[DebugSht, str](dp)) {
         if (aux != nil) { A.deallocate[ShtAlloc](alloc, aux, aux_count::usize); }
         free_symtab_bytes(alloc, ?sb);
@@ -2418,25 +2698,17 @@ fun emit_pie_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
 
     # ELF header: ET_DYN. e_shoff/e_shnum/e_shstrndx name the trailing debug table
     # when present, else 0 (a bare runtime image, not a tooling object).
-    write_elf_ident(buf, tgt_isa);
-    bin.write_u16_le(buf, 16, ET_DYN);
-    bin.write_u16_le(buf, 18, tgt_isa.elf_machine::u16);
-    bin.write_u32_le(buf, 20, 1);
-    bin.write_u64_le(buf, 24, entry);
-    bin.write_u64_le(buf, 32, phdr_offset::u64);
-    if (dsht.present) { bin.write_u64_le(buf, 40, dsht.shdr_off::u64); } or { bin.write_u64_le(buf, 40, 0); }
-    bin.write_u32_le(buf, 48, image_options.machine_flags);
-    bin.write_u16_le(buf, 52, ELF_HEADER_SIZE::u16);
-    bin.write_u16_le(buf, 54, PHDR_SIZE::u16);
-    bin.write_u16_le(buf, 56, phdr_count::u16);
-    bin.write_u16_le(buf, 58, SHDR_SIZE::u16);
+    write_elf_ident(buf, ?elay);
+    var e_shoff: u64 = 0;
+    var e_shnum: u16 = 0;
+    var e_shstrndx: u16 = 0;
     if (dsht.present) {
-        bin.write_u16_le(buf, 60, dsht.sht_count::u16);
-        bin.write_u16_le(buf, 62, dsht.shstrndx::u16);
-    } or {
-        bin.write_u16_le(buf, 60, 0);
-        bin.write_u16_le(buf, 62, 0);
+        e_shoff    = dsht.shdr_off::u64;
+        e_shnum    = dsht.sht_count::u16;
+        e_shstrndx = dsht.shstrndx::u16;
     }
+    write_ehdr(buf, ?elay, ET_DYN, tgt_isa.elf_machine::u16, image_options.machine_flags,
+               entry, phdr_offset::u64, e_shoff, phdr_count::u16, e_shnum, e_shstrndx);
 
     # copy the linker's segment bytes into their file offsets.
     copy_segment_bytes(buf, segs, seg_offsets, seg_count);
@@ -2470,7 +2742,7 @@ fun emit_pie_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
     write_pie_phdrs(buf, phdr_offset, phdr_count, segs, seg_offsets, seg_count,
                     ro_off, ro_va, ro_size, dyn_off, dyn_va, dyn_size, dyn, page_size, false);
 
-    debug_sht_write(buf, itn, debug, debug_count, aux, aux_count, ?sb, ?dsht);
+    debug_sht_write(buf, itn, ?elay, debug, debug_count, aux, aux_count, ?sb, ?dsht);
     debug_sht_free(alloc, ?dsht, debug_count, aux_count);
     if (aux != nil) { A.deallocate[ShtAlloc](alloc, aux, aux_count::usize); }
     free_symtab_bytes(alloc, ?sb);
@@ -2711,7 +2983,16 @@ fun emit_shared(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTa
     if (path == nil)    { ret R.err[bool, str]("elf: nil shared path"); }
     if (itn == nil)     { ret R.err[bool, str]("elf: no interner for shared object"); }
 
-    val sb_r: R.Result[SymtabBuild, str] = build_symtab_bytes(alloc, itn, symtab, symtab_count, segs, seg_count);
+    # the dynamic structures below are laid out in ELF64 throughout: an ELFCLASS32
+    # image needs `Elf32_Dyn`, a 4-byte GOT slot, rv32 PLT stubs and the rv32 dynamic
+    # relocation types, none of which exist yet. refusing by name beats emitting a
+    # file whose class byte contradicts its own dynamic tables (#2861, #2894).
+    var elay: ElfLayout = layout_for(tgt_isa);
+    if (elay.class != ELFCLASS64) {
+        ret R.err[bool, str]("elf: a shared object is ELF64-only (an ELFCLASS32 dynamic image is not implemented)");
+    }
+
+    val sb_r: R.Result[SymtabBuild, str] = build_symtab_bytes(alloc, itn, ?elay, symtab, symtab_count, segs, seg_count);
     if (R.is_err[SymtabBuild, str](sb_r)) { ret R.err[bool, str](R.unwrap_err[SymtabBuild, str](sb_r)); }
     var sb: SymtabBuild = R.unwrap_ok[SymtabBuild, str](sb_r);
 
@@ -2744,7 +3025,7 @@ fun emit_shared(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTa
     if (pie_relro_seg(segs, seg_count, dyn) >= 0) { relro_extra = 1; }
     val phdr_count: u32 = seg_count + 4 + relro_extra;
 
-    if (!header_fits_reserved_page(phdr_count, page_size)) {
+    if (!header_fits_reserved_page(?elay, phdr_count, page_size)) {
         free_symtab_bytes(alloc, ?sb);
         ret R.err[bool, str]("elf: shared-object program headers exceed the one-page header reservation (too many load segments)");
     }
@@ -2869,7 +3150,7 @@ fun emit_shared(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTa
     # object carries debug sections (a -g build); it names the debug sections and the
     # allocated sections above. absent (and the image byte-identical) with no debug input.
     var dsht: DebugSht;
-    val dp: R.Result[DebugSht, str] = debug_sht_plan(alloc, itn, debug, debug_count, aux, aux_count, ?sb, struct_total);
+    val dp: R.Result[DebugSht, str] = debug_sht_plan(alloc, itn, ?elay, debug, debug_count, aux, aux_count, ?sb, struct_total);
     if (R.is_err[DebugSht, str](dp)) {
         free_symtab_bytes(alloc, ?sb);
         A.deallocate[ShtAlloc](alloc, aux, aux_count::usize);
@@ -2893,25 +3174,18 @@ fun emit_shared(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTa
 
     # ELF header: ET_DYN, no entry point. e_shoff/e_shnum/e_shstrndx name the trailing
     # section table on a -g build, else 0 (a program-headers-only release image).
-    write_elf_ident(buf, tgt_isa);
-    bin.write_u16_le(buf, 16, ET_DYN);
-    bin.write_u16_le(buf, 18, tgt_isa.elf_machine::u16);
-    bin.write_u32_le(buf, 20, 1);
-    bin.write_u64_le(buf, 24, 0);
-    bin.write_u64_le(buf, 32, phdr_offset::u64);
-    if (dsht.present) { bin.write_u64_le(buf, 40, dsht.shdr_off::u64); } or { bin.write_u64_le(buf, 40, 0); }
-    bin.write_u32_le(buf, 48, image_options.machine_flags);
-    bin.write_u16_le(buf, 52, ELF_HEADER_SIZE::u16);
-    bin.write_u16_le(buf, 54, PHDR_SIZE::u16);
-    bin.write_u16_le(buf, 56, phdr_count::u16);
-    bin.write_u16_le(buf, 58, SHDR_SIZE::u16);
+    write_elf_ident(buf, ?elay);
+    # a shared object declares no entry point
+    var e_shoff: u64 = 0;
+    var e_shnum: u16 = 0;
+    var e_shstrndx: u16 = 0;
     if (dsht.present) {
-        bin.write_u16_le(buf, 60, dsht.sht_count::u16);
-        bin.write_u16_le(buf, 62, dsht.shstrndx::u16);
-    } or {
-        bin.write_u16_le(buf, 60, 0);
-        bin.write_u16_le(buf, 62, 0);
+        e_shoff    = dsht.shdr_off::u64;
+        e_shnum    = dsht.sht_count::u16;
+        e_shstrndx = dsht.shstrndx::u16;
     }
+    write_ehdr(buf, ?elay, ET_DYN, tgt_isa.elf_machine::u16, image_options.machine_flags,
+               0, phdr_offset::u64, e_shoff, phdr_count::u16, e_shnum, e_shstrndx);
 
     # copy the linker's segment bytes into their file offsets.
     copy_segment_bytes(buf, segs, seg_offsets, seg_count);
@@ -3011,7 +3285,7 @@ fun emit_shared(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTa
     write_pie_phdrs(buf, phdr_offset, phdr_count, segs, seg_offsets, seg_count,
                     ro_off, ro_va, ro_size, dyn_off, dyn_va, dyn_size, dyn, page_size, true);
 
-    debug_sht_write(buf, itn, debug, debug_count, aux, aux_count, ?sb, ?dsht);
+    debug_sht_write(buf, itn, ?elay, debug, debug_count, aux, aux_count, ?sb, ?dsht);
     debug_sht_free(alloc, ?dsht, debug_count, aux_count);
     free_symtab_bytes(alloc, ?sb);
 
@@ -3268,6 +3542,15 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
     if (dyn == nil)     { ret R.err[bool, str]("elf: nil dynamic plan"); }
     if (itn == nil)     { ret R.err[bool, str]("elf: no interner for dyn-exec"); }
 
+    # the dynamic structures below are laid out in ELF64 throughout: an ELFCLASS32
+    # image needs `Elf32_Dyn`, a 4-byte GOT slot, rv32 PLT stubs and the rv32 dynamic
+    # relocation types, none of which exist yet. refusing by name beats emitting a
+    # file whose class byte contradicts its own dynamic tables (#2861, #2894).
+    var elay: ElfLayout = layout_for(tgt_isa);
+    if (elay.class != ELFCLASS64) {
+        ret R.err[bool, str]("elf: a dynamically linked executable is ELF64-only (an ELFCLASS32 dynamic image is not implemented)");
+    }
+
     # the per-arch PLT/GOT writers below cover x86_64 (lazy), aarch64, and riscv64
     # (eager). an unsupported ISA is rejected loudly rather than emitting a PLT with
     # no stub encoding for it.
@@ -3292,7 +3575,7 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
 
     val nimp: u32 = func_import_count(dyn);
 
-    val sb_r: R.Result[SymtabBuild, str] = build_symtab_bytes(alloc, itn, symtab, symtab_count, segs, seg_count);
+    val sb_r: R.Result[SymtabBuild, str] = build_symtab_bytes(alloc, itn, ?elay, symtab, symtab_count, segs, seg_count);
     if (R.is_err[SymtabBuild, str](sb_r)) { ret R.err[bool, str](R.unwrap_err[SymtabBuild, str](sb_r)); }
     var sb: SymtabBuild = R.unwrap_ok[SymtabBuild, str](sb_r);
 
@@ -3311,7 +3594,7 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
     # like the PIE writer, the first PT_LOAD covers the ELF header + phdr table by
     # extending one page below segment 0; a header block larger than that page would break
     # segment 0's mapping, so refuse rather than emit an unloadable image (see #1814).
-    if (!header_fits_reserved_page(phdr_count, page_size)) {
+    if (!header_fits_reserved_page(?elay, phdr_count, page_size)) {
         free_symtab_bytes(alloc, ?sb);
         ret R.err[bool, str]("elf: dynamic-exec program headers exceed the one-page header reservation (too many load segments)");
     }
@@ -3383,7 +3666,7 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
     # trails the whole image, outside every PT_LOAD; absent (and the file stays
     # section-header-less) when there are no debug sections.
     var dsht: DebugSht;
-    val dp: R.Result[DebugSht, str] = debug_sht_plan(alloc, itn, debug, debug_count, aux, aux_count, ?sb, struct_total);
+    val dp: R.Result[DebugSht, str] = debug_sht_plan(alloc, itn, ?elay, debug, debug_count, aux, aux_count, ?sb, struct_total);
     if (R.is_err[DebugSht, str](dp)) {
         if (aux != nil) { A.deallocate[ShtAlloc](alloc, aux, aux_count::usize); }
         free_symtab_bytes(alloc, ?sb);
@@ -3409,25 +3692,17 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
     # (an ET_DYN/PIE would be relocated by a load bias and invalidate them). glibc
     # loads an ET_EXEC carrying PT_INTERP/PT_DYNAMIC as a classic non-PIE dynamic
     # binary and still resolves the PLT.
-    write_elf_ident(buf, tgt_isa);
-    bin.write_u16_le(buf, 16, ET_EXEC);
-    bin.write_u16_le(buf, 18, tgt_isa.elf_machine::u16);
-    bin.write_u32_le(buf, 20, 1);
-    bin.write_u64_le(buf, 24, entry);
-    bin.write_u64_le(buf, 32, phdr_offset::u64);
-    if (dsht.present) { bin.write_u64_le(buf, 40, dsht.shdr_off::u64); } or { bin.write_u64_le(buf, 40, 0); }
-    bin.write_u32_le(buf, 48, image_options.machine_flags);
-    bin.write_u16_le(buf, 52, ELF_HEADER_SIZE::u16);
-    bin.write_u16_le(buf, 54, PHDR_SIZE::u16);
-    bin.write_u16_le(buf, 56, phdr_count::u16);
-    bin.write_u16_le(buf, 58, SHDR_SIZE::u16);
+    write_elf_ident(buf, ?elay);
+    var e_shoff: u64 = 0;
+    var e_shnum: u16 = 0;
+    var e_shstrndx: u16 = 0;
     if (dsht.present) {
-        bin.write_u16_le(buf, 60, dsht.sht_count::u16);
-        bin.write_u16_le(buf, 62, dsht.shstrndx::u16);
-    } or {
-        bin.write_u16_le(buf, 60, 0);
-        bin.write_u16_le(buf, 62, 0);
+        e_shoff    = dsht.shdr_off::u64;
+        e_shnum    = dsht.sht_count::u16;
+        e_shstrndx = dsht.shstrndx::u16;
     }
+    write_ehdr(buf, ?elay, ET_EXEC, tgt_isa.elf_machine::u16, image_options.machine_flags,
+               entry, phdr_offset::u64, e_shoff, phdr_count::u16, e_shnum, e_shstrndx);
 
     # copy the linker's segment bytes into their file offsets.
     copy_segment_bytes(buf, segs, seg_offsets, seg_count);
@@ -3489,7 +3764,7 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
     # segments, the RO/PLT/RW synthesized segments, then PT_DYNAMIC.
     write_dyn_phdrs(buf, phdr_offset, ?lay, segs, seg_offsets, seg_count, page_size);
 
-    debug_sht_write(buf, itn, debug, debug_count, aux, aux_count, ?sb, ?dsht);
+    debug_sht_write(buf, itn, ?elay, debug, debug_count, aux, aux_count, ?sb, ?dsht);
     debug_sht_free(alloc, ?dsht, debug_count, aux_count);
     if (aux != nil) { A.deallocate[ShtAlloc](alloc, aux, aux_count::usize); }
     free_symtab_bytes(alloc, ?sb);
@@ -4408,6 +4683,19 @@ fun bad_magic_message(itn: *intern.Interner, alloc: *A.Allocator, buf: *u8) str 
     ret fallback;
 }
 
+# build "elf: unknown ELF class <n>" for a class byte that is neither of the two
+#
+# The class byte decides every offset and width the reader is about to use, so a
+# byte it does not know is refused rather than guessed at.
+# ---
+# itn:   interner backing the message
+# alloc: allocator backing the message
+# cls:   the e_ident[EI_CLASS] byte read from the file
+# ret:   the diagnostic string
+fun bad_class_message(itn: *intern.Interner, alloc: *A.Allocator, cls: u8) str {
+    ret bin.number_message(itn, alloc, "elf: unknown ELF class ", cls::u64, "elf: unknown ELF class");
+}
+
 # true when a section of type `ty` in an object stamped with e_machine `machine`
 # carries ordinary section bytes the reader can copy verbatim, the same as
 # SHT_PROGBITS/SHT_NOBITS. the processor-specific range (SHT_LOPROC..SHT_HIPROC)
@@ -4425,7 +4713,93 @@ fun section_has_bytes(ty: u32, machine: u16) bool {
     ret false;
 }
 
-# parse a relocatable ELF64 object into an ObjectImage
+
+# find the build-attributes section and store its BODY on the image
+#
+# Walks the section-header table for a section whose type is the processor-specific
+# attributes type, then unwraps the container this module owns - the version byte, the
+# vendor sub-section, the `Tag_File` sub-sub-section - and copies out what is inside.
+# What is inside is the ARCH's, and nothing here reads it.
+#
+# A malformed container is skipped rather than refused. An object whose attributes
+# this reader cannot follow still links; it simply contributes no claims, which is the
+# same position as an object that carried none. Refusing would turn a cosmetic section
+# into a link failure.
+# ---
+# alloc:      allocator for the copied body
+# buf:        the whole object image
+# buf_size:   its length
+# lay:        the class layout the file declares
+# e_shoff:    section-header table offset
+# e_shentsize / e_shnum: its stride and entry count
+# out:        the image receiving `attributes` / `attributes_len`
+# ret:        ok(true), or an allocation error
+fun read_build_attributes(alloc: *A.Allocator, buf: *u8, buf_size: usize, lay: *ElfLayout,
+                          e_shoff: usize, e_shentsize: u16, e_shnum: u16,
+                          out: *of.ObjectImage) R.Result[bool, str] {
+    out.attributes = nil;
+    out.attributes_len = 0;
+
+    var si: u32 = 0;
+    for (si < e_shnum::u32) {
+        val sh: ElfShdr = read_shdr(buf, e_shoff + si::usize * e_shentsize::usize, lay);
+        si = si + 1;
+        if (sh.stype != SHT_RISCV_ATTRIBUTES) { cnt; }
+
+        val sec_off: usize = sh.offset::usize;
+        val sec_len: usize = sh.size::usize;
+        if (R.is_err[bool, str](bin.require_region(buf_size, sec_off, sec_len,
+            "elf: build-attributes section out of bounds"))) { cnt; }
+        if (sec_len < 2 || buf[sec_off] != ELF_ATTR_VERSION_A) { cnt; }
+
+        # vendor sub-section: <u32 length><vendor NTBS><Tag_File sub-sub-section>
+        var p: usize = sec_off + 1;
+        val end: usize = sec_off + sec_len;
+        if (p + 4 > end) { cnt; }
+        val vend_len: usize = bin.read_u32_le(buf, p)::usize;
+        if (vend_len < 5 || p + vend_len > end) { cnt; }
+        val vend_end: usize = p + vend_len;
+        p = p + 4;
+        # step over the vendor name; only "riscv" is understood, and another vendor's
+        # sub-section is left alone rather than misread as this one
+        val vstart: usize = p;
+        for (p < vend_end && buf[p] != 0) { p = p + 1; }
+        if (p >= vend_end) { cnt; }
+        val vlen: usize = p - vstart;
+        p = p + 1;
+        if (vlen != 5) { cnt; }
+        if (buf[vstart] != 114 || buf[vstart + 1] != 105 || buf[vstart + 2] != 115
+            || buf[vstart + 3] != 99 || buf[vstart + 4] != 118) { cnt; }
+
+        # Tag_File sub-sub-section: <tag uleb><u32 length><body>. the tag is a single
+        # byte for every value the format defines, so it is compared directly
+        if (p >= vend_end || buf[p]::u32 != ELF_ATTR_TAG_FILE) { cnt; }
+        p = p + 1;
+        if (p + 4 > vend_end) { cnt; }
+        val file_len: usize = bin.read_u32_le(buf, p)::usize;
+        # the length covers the tag byte, itself, and the body
+        if (file_len < 5) { cnt; }
+        val body_len: usize = file_len - 5;
+        p = p + 4;
+        if (p + body_len > vend_end || body_len == 0) { cnt; }
+
+        val br: R.Result[*u8, str] = A.allocate[u8](alloc, body_len);
+        if (R.is_err[*u8, str](br)) { ret R.err[bool, str](R.unwrap_err[*u8, str](br)); }
+        val body: *u8 = R.unwrap_ok[*u8, str](br);
+        var k: usize = 0;
+        for (k < body_len) { body[k] = buf[p + k]; k = k + 1; }
+        out.attributes = body;
+        out.attributes_len = body_len::u32;
+        ret R.ok[bool, str](true);
+    }
+    ret R.ok[bool, str](true);
+}
+
+# parse a relocatable ELF object of either class into an ObjectImage
+#
+# The class comes off the file's own `e_ident[EI_CLASS]` byte and drives every
+# structure size, field offset and field width read below, so an ELFCLASS32 input
+# parses as Elf32 whatever arch it names (#2861).
 #
 # Reads the section, symbol, and relocation tables of a `.o` produced by
 # `emit_object` (or a compatible toolchain) into a fresh `of.ObjectImage` owning
@@ -4441,7 +4815,7 @@ fun section_has_bytes(ty: u32, machine: u16) bool {
 # out:      image to populate (its arrays are allocated here)
 # ret:      ok(true) on success, or an error string
 pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_size: usize, out: *of.ObjectImage) R.Result[bool, str] {
-    if (buf == nil || out == nil || buf_size < ELF_HEADER_SIZE) {
+    if (buf == nil || out == nil || buf_size < 16) {
         ret R.err[bool, str]("elf: object too small");
     }
     if (buf[0] != 0x7F || buf[1] != 0x45 || buf[2] != 0x4C || buf[3] != 0x46) {
@@ -4450,35 +4824,55 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
     if (itn == nil) { ret R.err[bool, str]("elf: no interner for parse"); }
     out.interner = itn;
 
+    # every offset and width below comes from the class the FILE declares, never from
+    # the arch or from any target the caller has in hand: a reader keyed on the arch
+    # would misparse a file whose class contradicted it (#2861)
+    var lay: ElfLayout;
+    if (!layout_from_class(buf[4], ?lay)) { ret R.err[bool, str](bad_class_message(itn, alloc, buf[4])); }
+    if (buf_size < lay.ehdr_size) { ret R.err[bool, str]("elf: object too small"); }
+
     # e_machine selects the per-arch table the reverse relocation map reads, since the
     # psABI relocation numbers collide across architectures (R_RISCV_64 == R_X86_64_PC32).
     val e_machine:   u16   = bin.read_u16_le(buf, 18);
+    # the fixed-width tail of the file header starts after e_entry / e_phoff / e_shoff,
+    # each one address wide
+    val hdr_tail:    usize = 24 + 3 * lay.addr_width::usize;
     # the arch-defined flags word travels with the image so the linker can check its
     # inputs agree and carry the result onto what it writes (#2813)
-    out.machine_flags      = bin.read_u32_le(buf, 48);
-    val e_shoff:     usize = bin.read_u64_le(buf, 40)::usize;
-    val e_shentsize: u16   = bin.read_u16_le(buf, 58);
-    val e_shnum:     u16   = bin.read_u16_le(buf, 60);
-    val e_shstrndx:  u16   = bin.read_u16_le(buf, 62);
+    out.machine_flags      = bin.read_u32_le(buf, hdr_tail);
+    val e_shoff:     usize = read_addr(buf, 24 + 2 * lay.addr_width::usize, ?lay)::usize;
+    val e_shentsize: u16   = bin.read_u16_le(buf, hdr_tail + 10);
+    val e_shnum:     u16   = bin.read_u16_le(buf, hdr_tail + 12);
+    val e_shstrndx:  u16   = bin.read_u16_le(buf, hdr_tail + 14);
     if (e_shoff == 0 || e_shnum == 0) { ret R.err[bool, str]("elf: no section headers"); }
 
     # the section-header table is a run of e_shnum entries of e_shentsize bytes;
-    # each header is read up to offset 56 (sh_entsize), so the stride must cover a
-    # full SHDR_SIZE header and the whole table must lie within the input before any
-    # header field is dereferenced - a truncated or hostile object errors here.
-    if (e_shentsize::usize < SHDR_SIZE) { ret R.err[bool, str]("elf: section header entry too small"); }
+    # every header field is read, so the stride must cover a whole header of this
+    # class and the whole table must lie within the input before any field is
+    # dereferenced - a truncated or hostile object errors here.
+    if (e_shentsize::usize < lay.shdr_size) { ret R.err[bool, str]("elf: section header entry too small"); }
     val vsht: R.Result[bool, str] = bin.require_region(buf_size, e_shoff,
         e_shnum::usize * e_shentsize::usize, "elf: section header table out of bounds");
     if (R.is_err[bool, str](vsht)) { ret R.err[bool, str](R.unwrap_err[bool, str](vsht)); }
+
+    # the build-attributes section, unwrapped from its container into the body the
+    # arch understands. read here rather than admitted as an ordinary section because
+    # it is not one: nothing relocates into it, it is not laid out, and its bytes are
+    # a structured claim rather than content. without this the linker folded only what
+    # this compiler's own objects claimed, so a foreign object's extensions vanished
+    # from the image that contained its instructions (#2828)
+    val vab: R.Result[bool, str] = read_build_attributes(alloc, buf, buf_size, ?lay, e_shoff,
+                                                        e_shentsize, e_shnum, out);
+    if (R.is_err[bool, str](vab)) { ret R.err[bool, str](R.unwrap_err[bool, str](vab)); }
 
     # the section-name string table (offset, size); names are read against this
     # window through bin.cstr_at. validated to lie within the input when present.
     var shstr_off:  usize = 0;
     var have_shstr: bool = false;
     if (e_shstrndx < e_shnum) {
-        val so: usize = e_shoff + e_shstrndx::usize * e_shentsize::usize;
-        shstr_off = bin.read_u64_le(buf, so + 24)::usize;
-        val shstr_size: usize = bin.read_u64_le(buf, so + 32)::usize;
+        val sh: ElfShdr = read_shdr(buf, e_shoff + e_shstrndx::usize * e_shentsize::usize, ?lay);
+        shstr_off = sh.offset::usize;
+        val shstr_size: usize = sh.size::usize;
         val vss: R.Result[bool, str] = bin.require_region(buf_size, shstr_off, shstr_size,
             "elf: section-name string table out of bounds");
         if (R.is_err[bool, str](vss)) { ret R.err[bool, str](R.unwrap_err[bool, str](vss)); }
@@ -4493,23 +4887,22 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
     var symtab_count: u32 = 0;
     var sh: u16 = 0;
     for (sh < e_shnum) {
-        val so: usize = e_shoff + sh::usize * e_shentsize::usize;
-        if (bin.read_u32_le(buf, so + 4) == SHT_SYMTAB) {
-            val symtab_off: usize = bin.read_u64_le(buf, so + 24)::usize;
-            val sz: usize = bin.read_u64_le(buf, so + 32)::usize;
-            val ent: usize = bin.read_u64_le(buf, so + 56)::usize;
-            if (ent > 0) { symtab_count = (sz / ent)::u32; }
-            # the symtab entries actually walked (symtab_count of SYM_SIZE each)
-            # must lie within the input before they are read.
+        val shh: ElfShdr = read_shdr(buf, e_shoff + sh::usize * e_shentsize::usize, ?lay);
+        if (shh.stype == SHT_SYMTAB) {
+            val symtab_off: usize = shh.offset::usize;
+            val ent: usize = shh.entsize::usize;
+            if (ent > 0) { symtab_count = (shh.size::usize / ent)::u32; }
+            # the symtab entries actually walked must lie within the input before
+            # they are read.
             val vsy: R.Result[bool, str] = bin.require_region(buf_size, symtab_off,
-                symtab_count::usize * SYM_SIZE, "elf: symbol table out of bounds");
+                symtab_count::usize * lay.sym_size, "elf: symbol table out of bounds");
             if (R.is_err[bool, str](vsy)) { ret R.err[bool, str](R.unwrap_err[bool, str](vsy)); }
             symtab = (buf::usize + symtab_off)::*u8;
-            val link: u32 = bin.read_u32_le(buf, so + 40);
+            val link: u32 = shh.link;
             if (link < e_shnum::u32) {
-                val lo: usize = e_shoff + link::usize * e_shentsize::usize;
-                strtab_off = bin.read_u64_le(buf, lo + 24)::usize;
-                strtab_size = bin.read_u64_le(buf, lo + 32)::usize;
+                val lh: ElfShdr = read_shdr(buf, e_shoff + link::usize * e_shentsize::usize, ?lay);
+                strtab_off = lh.offset::usize;
+                strtab_size = lh.size::usize;
                 val vst: R.Result[bool, str] = bin.require_region(buf_size, strtab_off, strtab_size,
                     "elf: symbol string table out of bounds");
                 if (R.is_err[bool, str](vst)) { ret R.err[bool, str](R.unwrap_err[bool, str](vst)); }
@@ -4525,10 +4918,9 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
     var rel_n: u32 = 0;
     sh = 0;
     for (sh < e_shnum) {
-        val so: usize = e_shoff + sh::usize * e_shentsize::usize;
-        val ty: u32 = bin.read_u32_le(buf, so + 4);
-        if (section_has_bytes(ty, e_machine)) { sec_n = sec_n + 1; }
-        if (ty == SHT_RELA)                   { rel_n = rel_n + (bin.read_u64_le(buf, so + 32)::usize / RELA_SIZE)::u32; }
+        val shh: ElfShdr = read_shdr(buf, e_shoff + sh::usize * e_shentsize::usize, ?lay);
+        if (section_has_bytes(shh.stype, e_machine)) { sec_n = sec_n + 1; }
+        if (shh.stype == SHT_RELA)                   { rel_n = rel_n + (shh.size::usize / lay.rela_size)::u32; }
         sh = sh + 1;
     }
     val sym_n: u32 = symtab_count;
@@ -4583,14 +4975,14 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
     sh = 0;
     for (sh < e_shnum) {
         sec_map[sh] = -1;
-        val so: usize = e_shoff + sh::usize * e_shentsize::usize;
-        val ty: u32 = bin.read_u32_le(buf, so + 4);
+        val shh: ElfShdr = read_shdr(buf, e_shoff + sh::usize * e_shentsize::usize, ?lay);
+        val ty: u32 = shh.stype;
         if (section_has_bytes(ty, e_machine)) {
-            val flags: u64 = bin.read_u64_le(buf, so + 8);
+            val flags: u64 = shh.flags;
 
             var sec_name: str = "";
             if (have_shstr) {
-                val rnm: R.Result[str, str] = bin.cstr_at(buf, buf_size, shstr_off + bin.read_u32_le(buf, so)::usize);
+                val rnm: R.Result[str, str] = bin.cstr_at(buf, buf_size, shstr_off + shh.name::usize);
                 if (R.is_err[str, str](rnm)) {
                     A.deallocate[i32](alloc, sec_map, e_shnum::usize);
                     ret R.err[bool, str](R.unwrap_err[str, str](rnm));
@@ -4618,21 +5010,21 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
             val idx: u32 = sec_i;
             out.sections[idx].name  = R.unwrap_ok[intern.StrId, str](rin);
             out.sections[idx].kind  = kind;
-            out.sections[idx].align = bin.read_u64_le(buf, so + 48)::u32;
-            out.sections[idx].len   = bin.read_u64_le(buf, so + 32)::u32;
+            out.sections[idx].align = shh.addralign::u32;
+            out.sections[idx].len   = shh.size::u32;
             out.sections[idx].bytes = nil;
             # SHF_MERGE over the whole section is how the writer spells an embed atom;
             # a merge section whose entry size is anything else describes elements this
             # model has no name for, so its content is kept whole and uncoalesced.
             out.sections[idx].flags = 0;
             if ((flags & SHF_MERGE) != 0
-                && bin.read_u64_le(buf, so + 56) == out.sections[idx].len::u64
+                && shh.entsize == out.sections[idx].len::u64
                 && out.sections[idx].len > 0) {
                 out.sections[idx].flags = of.SEC_FLAG_MERGEABLE;
             }
             if (ty != SHT_NOBITS && out.sections[idx].len > 0) {
                 val sz: usize = out.sections[idx].len::usize;
-                val src_off: usize = bin.read_u64_le(buf, so + 24)::usize;
+                val src_off: usize = shh.offset::usize;
                 # the section's sh_offset + sh_size must lie within the input before
                 # its bytes are copied out.
                 if (!bin.region_ok(buf_size, src_off, sz)) {
@@ -4661,14 +5053,11 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
     if (symtab != nil && have_strtab) {
         var si: u32 = 1;
         for (si < sym_n) {
-            val so: usize = si::usize * SYM_SIZE;
-            val st_name:  u32 = bin.read_u32_le(symtab, so);
-            val st_info:  u8  = symtab[so + 4];
-            val st_shndx: u16 = bin.read_u16_le(symtab, so + 6);
-            val st_value: u64 = bin.read_u64_le(symtab, so + 8);
-            val st_size:  u64 = bin.read_u64_le(symtab, so + 16);
+            val sym: ElfSym = read_sym(symtab, si::usize * lay.sym_size, ?lay);
+            val st_info:  u8  = sym.info;
+            val st_shndx: u16 = sym.shndx;
 
-            val rnm: R.Result[str, str] = bin.cstr_at(buf, buf_size, strtab_off + st_name::usize);
+            val rnm: R.Result[str, str] = bin.cstr_at(buf, buf_size, strtab_off + sym.name::usize);
             if (R.is_err[str, str](rnm)) {
                 A.deallocate[i32](alloc, sec_map, e_shnum::usize);
                 ret R.err[bool, str](R.unwrap_err[str, str](rnm));
@@ -4681,8 +5070,8 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
 
             val idx: u32 = sym_i;
             out.symbols[idx].name = R.unwrap_ok[intern.StrId, str](rin);
-            out.symbols[idx].offset = st_value::u32;
-            out.symbols[idx].size = st_size::u32;
+            out.symbols[idx].offset = sym.value::u32;
+            out.symbols[idx].size = sym.size::u32;
             var flags: u32 = 0;
             if ((st_info >> 4) == STB_GLOBAL) { flags = flags | of.SYM_OBJ_FLAG_GLOBAL; }
             # a STB_WEAK symbol is cross-object-visible (GLOBAL) but overridable:
@@ -4709,15 +5098,13 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
     var rel_i: u32 = 0;
     sh = 0;
     for (sh < e_shnum) {
-        val so: usize = e_shoff + sh::usize * e_shentsize::usize;
-        if (bin.read_u32_le(buf, so + 4) == SHT_RELA) {
-            val r_base: usize = bin.read_u64_le(buf, so + 24)::usize;
-            val r_size: usize = bin.read_u64_le(buf, so + 32)::usize;
-            val sh_info: u32 = bin.read_u32_le(buf, so + 44);
-            val count: u32 = (r_size / RELA_SIZE)::u32;
-            # the rela array (count entries of RELA_SIZE) must lie within the input
-            # before any entry is read.
-            if (!bin.region_ok(buf_size, r_base, count::usize * RELA_SIZE)) {
+        val shh: ElfShdr = read_shdr(buf, e_shoff + sh::usize * e_shentsize::usize, ?lay);
+        if (shh.stype == SHT_RELA) {
+            val r_base: usize = shh.offset::usize;
+            val sh_info: u32 = shh.info;
+            val count: u32 = (shh.size::usize / lay.rela_size)::u32;
+            # the rela array must lie within the input before any entry is read.
+            if (!bin.region_ok(buf_size, r_base, count::usize * lay.rela_size)) {
                 A.deallocate[i32](alloc, sec_map, e_shnum::usize);
                 ret R.err[bool, str]("elf: relocation array out of bounds");
             }
@@ -4726,16 +5113,18 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
 
             var ri: u32 = 0;
             for (ri < count) {
-                val ro: usize = r_base + ri::usize * RELA_SIZE;
-                val r_info: u64 = bin.read_u64_le(buf, ro + 8);
-                val r_type: u32 = (r_info & 0xFFFFFFFF)::u32;
-                val r_sym:  u32 = (r_info >> 32)::u32;
+                var r_offset: u64 = 0;
+                var r_sym:  u32 = 0;
+                var r_type: u32 = 0;
+                var r_addend: i64 = 0;
+                read_rela(buf, r_base + ri::usize * lay.rela_size, ?lay,
+                          ?r_offset, ?r_sym, ?r_type, ?r_addend);
 
                 val idx: u32 = rel_i;
                 if (target_sec >= 0) { out.relocations[idx].section = target_sec::u32; }
                 or { out.relocations[idx].section = of.SECTION_EXTERNAL; }
-                out.relocations[idx].offset = bin.read_u64_le(buf, ro)::u32;
-                out.relocations[idx].addend = bin.read_u64_le(buf, ro + 16)::i64;
+                out.relocations[idx].offset = r_offset::u32;
+                out.relocations[idx].addend = r_addend;
                 val rk: R.Result[of.RelocKind, str] = reloc_kind_for(itn, alloc, e_machine, r_type);
                 if (R.is_err[of.RelocKind, str](rk)) {
                     A.deallocate[i32](alloc, sec_map, e_shnum::usize);
@@ -4829,7 +5218,7 @@ fun t_x64_elf_reloc_type(kind: of.RelocKind) u32 {
 }
 
 # a test-only riscv64 forward reloc map, mirroring the production map in
-# target/isa/riscv64/register.mach, duplicated here for the same import-cycle reason as
+# target/isa/riscv/register.mach, duplicated here for the same import-cycle reason as
 # the x86_64 helper above. used by the riscv round-trip test to emit real R_RISCV_*
 # relocations whose numbers collide with x86_64's
 # ---
@@ -4852,7 +5241,7 @@ fun t_riscv_elf_reloc_type(kind: of.RelocKind) u32 {
 var t_riscv_attrs: BuildAttributes;
 
 # the test `elf_attributes` hook, mirroring how the production descriptor is wired in
-# target/isa/riscv64/register.mach, duplicated here for the same import-cycle reason as
+# target/isa/riscv/register.mach, duplicated here for the same import-cycle reason as
 # t_riscv_elf_reloc_type
 # ---
 # ret: the test build-attributes descriptor
@@ -5512,18 +5901,26 @@ test "mach.lang.target.of.elf.write_build_attributes:riscv_arch_layout" {
     attr.section  = ".riscv.attributes";
     attr.sht      = SHT_RISCV_ATTRIBUTES;
     attr.vendor   = "riscv";
-    attr.arch_tag = TAG_RISCV_ARCH;
-    attr.arch     = "rv64i2p0";
 
-    # 'A'(1) + [vendor-len(4) + "riscv\0"(6) + Tag_File(1) + file-len(4) + arch-tag(1)
-    # + "rv64i2p0\0"(9)] = 1 + 25 = 26; the inner Tag_File sub-sub-section is 15.
-    val sz: usize = build_attributes_size(?attr);
+    # the body the ARCH supplies, spelled here as the bytes it would produce for a
+    # lone `Tag_RISCV_arch` (5) of "rv64i2p0": this layer frames it and never reads it
+    var body: [10]u8;
+    body[0] = 5;
+    val archs: str = "rv64i2p0";
+    var bi: u32 = 0;
+    for (archs[bi::usize] != 0) { body[1 + bi] = archs[bi::usize]::u8; bi = bi + 1; }
+    body[1 + bi] = 0;
+    val body_len: u32 = bi + 2;
+
+    # 'A'(1) + [vendor-len(4) + "riscv\0"(6) + Tag_File(1) + file-len(4) + body(10)]
+    # = 1 + 25 = 26; the inner Tag_File sub-sub-section is 15.
+    val sz: usize = build_attributes_size(?attr, body_len);
     if (sz != 26) { ret 1; }
 
     val rb: R.Result[*u8, str] = A.zallocate[u8](?alloc, sz);
     if (R.is_err[*u8, str](rb)) { ret 1; }
     val buf: *u8 = R.unwrap_ok[*u8, str](rb);
-    write_build_attributes(buf, 0, ?attr);
+    write_build_attributes(buf, 0, ?attr, ?body[0], body_len);
 
     var bad: bool = false;
     if (buf[0] != ELF_ATTR_VERSION_A)      { bad = true; }
@@ -5533,7 +5930,7 @@ test "mach.lang.target.of.elf.write_build_attributes:riscv_arch_layout" {
     or (!str_equals(R.unwrap_ok[str, str](rv), "riscv")) { bad = true; }
     if (buf[11]::u32 != ELF_ATTR_TAG_FILE) { bad = true; }
     if (bin.read_u32_le(buf, 12) != 15)    { bad = true; }
-    if (buf[16]::u32 != TAG_RISCV_ARCH)    { bad = true; }
+    if (buf[16]::u32 != 5)                 { bad = true; }
     val ra: R.Result[str, str] = bin.cstr_at(buf, sz, 17);
     if (R.is_err[str, str](ra))                             { bad = true; }
     or (!str_equals(R.unwrap_ok[str, str](ra), "rv64i2p0")) { bad = true; }
@@ -5558,8 +5955,6 @@ test "mach.lang.target.of.elf.emit_object:riscv_attributes_section" {
     t_riscv_attrs.section  = ".riscv.attributes";
     t_riscv_attrs.sht      = SHT_RISCV_ATTRIBUTES;
     t_riscv_attrs.vendor   = "riscv";
-    t_riscv_attrs.arch_tag = TAG_RISCV_ARCH;
-    t_riscv_attrs.arch     = "rv64i2p0_m2p0";
 
     var seam: isa.RelocSeam = t_seam(t_riscv_elf_reloc_type::*u8);
     isa.with_elf_attributes(?seam, t_riscv_attributes::*u8);
@@ -5585,6 +5980,17 @@ test "mach.lang.target.of.elf.emit_object:riscv_attributes_section" {
     img.sections = ?secs[0]; img.section_count = 1;
     img.symbols = ?syms[0]; img.symbol_count = 1;
     img.relocations = nil; img.reloc_count = 0;
+
+    # the body travels WITH THE IMAGE: a lone `Tag_RISCV_arch` (5) naming what this
+    # particular image holds, which is the whole point of the field
+    var body: [16]u8;
+    body[0] = 5;
+    val archs: str = "rv64i2p0_m2p0";
+    var bi: u32 = 0;
+    for (archs[bi::usize] != 0) { body[1 + bi] = archs[bi::usize]::u8; bi = bi + 1; }
+    body[1 + bi] = 0;
+    img.attributes = ?body[0];
+    img.attributes_len = bi + 2;
 
     val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "elf_attr");
     if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
@@ -6367,11 +6773,16 @@ test "mach.lang.target.of.elf.emit_pie_exec:page_align_congruence_64k" {
 # bytes) do not, while a 64 KiB max-page admits far more (the aarch64 case)
 test "mach.lang.target.of.elf.header_fits_reserved_page:one_page_threshold" {
     var bad: bool = false;
-    if (!header_fits_reserved_page(1, 4096))  { bad = true; }
-    if (!header_fits_reserved_page(72, 4096)) { bad = true; }
-    if (header_fits_reserved_page(73, 4096))  { bad = true; }
+    var l64: ElfLayout = elf64_layout();
+    if (!header_fits_reserved_page(?l64, 1, 4096))  { bad = true; }
+    if (!header_fits_reserved_page(?l64, 72, 4096)) { bad = true; }
+    if (header_fits_reserved_page(?l64, 73, 4096))  { bad = true; }
     # a 64 KiB max-page (aarch64) fits the 73-header table that overflows a 4 KiB page.
-    if (!header_fits_reserved_page(73, 65536)) { bad = true; }
+    if (!header_fits_reserved_page(?l64, 73, 65536)) { bad = true; }
+    # the smaller Elf32 header + phdr (52 + 32) fits more headers in the same page
+    var l32: ElfLayout = elf32_layout();
+    if (!header_fits_reserved_page(?l32, 126, 4096)) { bad = true; }
+    if (header_fits_reserved_page(?l32, 127, 4096))  { bad = true; }
     if (bad) { ret 1; }
     ret 0;
 }
@@ -6920,8 +7331,7 @@ test "mach.lang.target.of.elf.emit_exec:load_segments_do_not_overlap" {
     var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
     val tpath: str = fs.temp_path(?tf);
 
-    var opts: of.ImageOptions;
-    opts.subsystem = 0;
+    val opts: of.ImageOptions = of.image_options_default(of.SUBSYSTEM_CONSOLE);
     val em: R.Result[bool, str] = emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 2, 4096, 0x400000, 0x400000,
                                             nil::*of.ExecFunction, 0, nil::*of.Section, 0,
                                             nil::*of.Section, 0, nil::*of.SymtabEntry, 0,
@@ -6936,4 +7346,386 @@ test "mach.lang.target.of.elf.emit_exec:load_segments_do_not_overlap" {
     var bad: i32 = 0;
     if (t_any_load_overlap(?buf)) { bad = 1; }
     ret bad;
+}
+
+# an ELFCLASS32 ISA vtable for the class-layout tests: a 4-byte pointer, which is the
+# only thing that decides the class the writer stamps (#2861)
+# ---
+# id:          the architecture id the vtable reports
+# elf_machine: the `e_machine` the object writer stamps
+# reloc:       the relocatable-object seam, or nil for a test that emits none
+# ret:         a description-only 32-bit vtable
+fun t_isa32(id: u32, elf_machine: u32, reloc: *isa.RelocSeam) isa.IsaVTable {
+    ret isa.machine_isa(id, "test32", elf_machine, 4, nil, nil, reloc);
+}
+
+# `p_flags` is the one program-header field that moves between the classes rather than
+# narrowing, and moving it is silent: an Elf32 segment header with the permissions
+# written at the Elf64 offset (4) leaves p_offset holding them and p_flags zero, so the
+# loader maps the segment with no access at all and the image faults at its first
+# instruction, nowhere near the mistake. this pins both classes' whole field order, and
+# the Elf32_Sym reorder beside it, straight off the emitted bytes
+test "mach.lang.target.of.elf.write_phdr_at:elf32_field_order" {
+    var bad: bool = false;
+
+    var l32: ElfLayout = elf32_layout();
+    var l64: ElfLayout = elf64_layout();
+    if (l32.phdr_size != 32 || l64.phdr_size != 56) { bad = true; }
+    if (l32.ehdr_size != 52 || l32.shdr_size != 40) { bad = true; }
+    if (l32.sym_size  != 16 || l32.rela_size != 12) { bad = true; }
+
+    var b32: [64]u8;
+    var b64: [64]u8;
+    var k: usize = 0;
+    for (k < 64) { b32[k] = 0; b64[k] = 0; k = k + 1; }
+
+    val end32: usize = write_phdr_at(?b32[0], 0, ?l32, PT_LOAD, PF_R | PF_X,
+                                     0x11, 0x22, 0x33, 0x44, 0x55, 0x1000);
+    val end64: usize = write_phdr_at(?b64[0], 0, ?l64, PT_LOAD, PF_R | PF_X,
+                                     0x11, 0x22, 0x33, 0x44, 0x55, 0x1000);
+    if (end32 != 32 || end64 != 56) { bad = true; }
+
+    # Elf32: type@0 offset@4 vaddr@8 paddr@12 filesz@16 memsz@20 flags@24 align@28
+    if (bin.read_u32_le(?b32[0], 0)  != PT_LOAD)         { bad = true; }
+    if (bin.read_u32_le(?b32[0], 4)  != 0x11)            { bad = true; }
+    if (bin.read_u32_le(?b32[0], 8)  != 0x22)            { bad = true; }
+    if (bin.read_u32_le(?b32[0], 12) != 0x33)            { bad = true; }
+    if (bin.read_u32_le(?b32[0], 16) != 0x44)            { bad = true; }
+    if (bin.read_u32_le(?b32[0], 20) != 0x55)            { bad = true; }
+    if (bin.read_u32_le(?b32[0], 24) != (PF_R | PF_X))   { bad = true; }
+    if (bin.read_u32_le(?b32[0], 28) != 0x1000)          { bad = true; }
+
+    # Elf64: type@0 flags@4 offset@8 ...
+    if (bin.read_u32_le(?b64[0], 4)  != (PF_R | PF_X))   { bad = true; }
+    if (bin.read_u64_le(?b64[0], 8)  != 0x11)            { bad = true; }
+
+    # the second reorder: Elf32_Sym puts st_value / st_size before the three small
+    # fields, Elf64_Sym after them.
+    var s32: [32]u8;
+    var s64: [32]u8;
+    k = 0;
+    for (k < 32) { s32[k] = 0; s64[k] = 0; k = k + 1; }
+    val se32: usize = write_sym_at(?s32[0], 0, ?l32, 7, 0x12, 0, 3, 0xAABB, 0xCC);
+    val se64: usize = write_sym_at(?s64[0], 0, ?l64, 7, 0x12, 0, 3, 0xAABB, 0xCC);
+    if (se32 != 16 || se64 != 24)               { bad = true; }
+    if (bin.read_u32_le(?s32[0], 4)  != 0xAABB) { bad = true; }
+    if (bin.read_u32_le(?s32[0], 8)  != 0xCC)   { bad = true; }
+    if (s32[12] != 0x12)                        { bad = true; }
+    if (bin.read_u16_le(?s32[0], 14) != 3)      { bad = true; }
+    if (s64[4] != 0x12)                         { bad = true; }
+    if (bin.read_u64_le(?s64[0], 8)  != 0xAABB) { bad = true; }
+
+    # and `r_info` packs at a different shift in each class
+    if (rela_info_pack(?l32, 0x2B, 0x17) != 0x2B17)       { bad = true; }
+    if (rela_info_pack(?l64, 0x2B, 0x17) != 0x2B00000017) { bad = true; }
+    if (!reloc_type_fits_class(?l32, 0xFF))               { bad = true; }
+    if (reloc_type_fits_class(?l32, 0x100))               { bad = true; }
+    if (!reloc_type_fits_class(?l64, 0x100))              { bad = true; }
+
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+# the ELFCLASS32 twin of the 64-bit round trip: an rv32 relocatable object is written
+# whole in Elf32 geometry - a 52-byte file header, 40-byte section headers, 16-byte
+# symbols and 12-byte relocations - and read back through the same reader, keyed on the
+# class byte the file itself declares, recovering the same sections, symbols and
+# relocations. before #2861 the class byte said ELFCLASS32 and every structure after it
+# was Elf64, so this object did not parse at all
+test "mach.lang.target.of.elf.emit_object:riscv32_round_trip" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var of_reg: of.OfRegistry = of.registry_init();
+    val rr: R.Result[bool, str] = register(?of_reg);
+    if (R.is_err[bool, str](rr)) { ret 1; }
+
+    var seam: isa.RelocSeam = t_seam(t_riscv_elf_reloc_type::*u8);
+    var isa_vt: isa.IsaVTable = t_isa32(isa.ARCH_RISCV32, EM_RISCV::u32, ?seam);
+
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0x13; k = k + 1; }
+    var data_bytes: [4]u8;
+    k = 0;
+    for (k < 4) { data_bytes[k] = 0x5A; k = k + 1; }
+
+    var secs: [2]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 16; secs[0].align = 16;
+    secs[1].name = t_intern(?i, ".data"); secs[1].kind = of.SK_DATA;
+    secs[1].bytes = ?data_bytes[0]; secs[1].len = 4; secs[1].align = 4;
+
+    var syms: [2]of.Symbol;
+    syms[0].name = t_intern(?i, "g"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 16; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name = t_intern(?i, "d"); syms[1].section = 1; syms[1].offset = 0;
+    syms[1].size = 4;  syms[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_OBJECT;
+
+    # a negative addend proves the Elf32 4-byte r_addend is read back sign-extended
+    # rather than as a huge positive number.
+    var relocs: [3]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = of.RK_PCREL_HI20;
+    relocs[0].sym = 1; relocs[0].addend = 0;
+    relocs[1].section = 0; relocs[1].offset = 4; relocs[1].kind = of.RK_PCREL_LO12_I;
+    relocs[1].sym = 1; relocs[1].addend = 0;
+    relocs[2].section = 1; relocs[2].offset = 0; relocs[2].kind = of.RK_ABS32;
+    relocs[2].sym = 0; relocs[2].addend = -8;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "rv32");
+    img.sections = ?secs[0]; img.section_count = 2;
+    img.symbols = ?syms[0]; img.symbol_count = 2;
+    img.relocations = ?relocs[0]; img.reloc_count = 3;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "elf_rv32");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_object(?isa_vt, ?img, tpath::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    var bad: bool = false;
+
+    # the class byte and the geometry agree: this is the whole defect.
+    if (buf.data[4] != ELFCLASS32)                  { bad = true; }
+    if (bin.read_u16_le(buf.data, 40) != 52)        { bad = true; }
+    if (bin.read_u16_le(buf.data, 46) != 40)        { bad = true; }
+    val e_shoff: usize = bin.read_u32_le(buf.data, 32)::usize;
+    if (e_shoff == 0 || e_shoff >= buf.len)         { bad = true; }
+    if (bad) { ret 1; }
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 1; }
+
+    if (out.section_count != 2) { ret 1; }
+    if (out.symbol_count  != 2) { ret 1; }
+    if (out.reloc_count   != 3) { ret 1; }
+
+    var text_i: i32 = -1;
+    var data_i: i32 = -1;
+    var s: u32 = 0;
+    for (s < out.section_count) {
+        if (str_equals(bin.resolve_name(?i, out.sections[s].name), ".text")) { text_i = s::i32; }
+        if (str_equals(bin.resolve_name(?i, out.sections[s].name), ".data")) { data_i = s::i32; }
+        s = s + 1;
+    }
+    if (text_i < 0 || data_i < 0)                     { ret 1; }
+    if (out.sections[text_i::u32].len != 16)          { bad = true; }
+    if (out.sections[text_i::u32].kind != of.SK_TEXT) { bad = true; }
+    if (out.sections[data_i::u32].len != 4)           { bad = true; }
+    if (out.sections[text_i::u32].bytes == nil)       { ret 1; }
+    if (out.sections[data_i::u32].bytes == nil)       { ret 1; }
+    if (out.sections[text_i::u32].bytes[0] != 0x13)   { bad = true; }
+    if (out.sections[data_i::u32].bytes[0] != 0x5A)   { bad = true; }
+
+    # the symbols keep their names, sizes and defining sections across the trip.
+    var saw_g: bool = false;
+    var saw_d: bool = false;
+    var y: u32 = 0;
+    for (y < out.symbol_count) {
+        val nm: str = bin.resolve_name(?i, out.symbols[y].name);
+        if (str_equals(nm, "g")) {
+            saw_g = true;
+            if (out.symbols[y].size != 16)                              { bad = true; }
+            if (out.symbols[y].section != text_i::u32)                  { bad = true; }
+            if ((out.symbols[y].flags & of.SYM_OBJ_FLAG_FUNCTION) == 0) { bad = true; }
+        }
+        if (str_equals(nm, "d")) {
+            saw_d = true;
+            if (out.symbols[y].section != data_i::u32)                  { bad = true; }
+            if ((out.symbols[y].flags & of.SYM_OBJ_FLAG_OBJECT) == 0)   { bad = true; }
+        }
+        y = y + 1;
+    }
+    if (!saw_g || !saw_d) { bad = true; }
+
+    # the relocations keep their kinds, offsets and (signed) addends.
+    var saw_hi: bool = false;
+    var saw_lo: bool = false;
+    var saw_abs: bool = false;
+    var r: u32 = 0;
+    for (r < out.reloc_count) {
+        if (out.relocations[r].kind == of.RK_PCREL_HI20) {
+            saw_hi = true;
+            if (out.relocations[r].offset != 0)            { bad = true; }
+            if (out.relocations[r].section != text_i::u32) { bad = true; }
+        }
+        if (out.relocations[r].kind == of.RK_PCREL_LO12_I) {
+            saw_lo = true;
+            if (out.relocations[r].offset != 4)            { bad = true; }
+        }
+        if (out.relocations[r].kind == of.RK_ABS32) {
+            saw_abs = true;
+            if (out.relocations[r].section != data_i::u32) { bad = true; }
+            if (out.relocations[r].addend != -8)           { bad = true; }
+        }
+        r = r + 1;
+    }
+    if (!saw_hi || !saw_lo || !saw_abs) { bad = true; }
+
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+# an rv32 static executable is ELFCLASS32 through and through: a 52-byte file header
+# naming 32-byte program headers, each carrying its permissions at the Elf32 offset,
+# and the whole image walkable by the Elf32 geometry the class byte declares
+test "mach.lang.target.of.elf.emit_exec:riscv32_static_image" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable = t_isa32(isa.ARCH_RISCV32, EM_RISCV::u32, nil);
+
+    var text: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text[k] = 0x13; k = k + 1; }
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = 0x11000; segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text[0];
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "elf_rv32x");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 1,
+                                            4096, 0x10000, 0x11000,
+                                            nil::*of.ExecFunction, 0, nil::*of.Section, 0,
+                                            nil::*of.Section, 0, nil::*of.SymtabEntry, 0,
+                                            tpath::*u8, "rv32x"::*u8,
+                                            of.image_options_default(of.SUBSYSTEM_CONSOLE));
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    var bad: bool = false;
+    if (buf.data[4] != ELFCLASS32)                     { bad = true; }
+    if (bin.read_u16_le(buf.data, 16) != ET_EXEC)      { bad = true; }
+    if (bin.read_u32_le(buf.data, 24) != 0x11000)      { bad = true; }
+    if (bin.read_u32_le(buf.data, 28) != 52)           { bad = true; }
+    if (bin.read_u16_le(buf.data, 40) != 52)           { bad = true; }
+    if (bin.read_u16_le(buf.data, 42) != 32)           { bad = true; }
+    if (bad) { ret 1; }
+
+    val e_phnum: usize = bin.read_u16_le(buf.data, 44)::usize;
+    # the header-covering PT_LOAD plus the one text segment.
+    if (e_phnum != 2) { ret 1; }
+
+    # every program header's permissions live at the Elf32 offset 24, and the text
+    # segment is the readable/executable one.
+    var saw_text: bool = false;
+    var ph: usize = 0;
+    for (ph < e_phnum) {
+        val po: usize = 52 + ph * 32;
+        if (bin.read_u32_le(buf.data, po) != PT_LOAD) { bad = true; }
+        val fl: u32 = bin.read_u32_le(buf.data, po + 24);
+        if (fl == 0) { bad = true; }
+        if (bin.read_u32_le(buf.data, po + 8) == 0x11000) {
+            saw_text = true;
+            if (fl != (PF_R | PF_X))                      { bad = true; }
+            if (bin.read_u32_le(buf.data, po + 16) != 16) { bad = true; }
+        }
+        ph = ph + 1;
+    }
+    if (!saw_text) { bad = true; }
+
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+# the reader keys on the class byte the file carries, so a byte it does not know is
+# refused by name rather than parsed with guessed offsets
+test "mach.lang.target.of.elf.parse_object:unknown_class_refused" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var buf: [64]u8;
+    var k: usize = 0;
+    for (k < 64) { buf[k] = 0; k = k + 1; }
+    buf[0] = 0x7F; buf[1] = 0x45; buf[2] = 0x4C; buf[3] = 0x46;
+    buf[4] = 7;
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = parse_object(?alloc, ?i, ?buf[0], 64, ?out);
+    if (!R.is_err[bool, str](pr)) { ret 1; }
+    if (!str_contains(R.unwrap_err[bool, str](pr), "unknown ELF class")) { ret 1; }
+
+    var l: ElfLayout;
+    if (layout_from_class(7, ?l))                    { ret 1; }
+    if (!layout_from_class(ELFCLASS32, ?l))          { ret 1; }
+    if (l.addr_width != 4)                           { ret 1; }
+    if (!layout_from_class(ELFCLASS64, ?l))          { ret 1; }
+    if (l.addr_width != 8)                           { ret 1; }
+    ret 0;
+}
+
+# the three dynamic writers lay their structures out in ELF64 throughout, so each one
+# refuses an ELFCLASS32 target by name rather than stamping a class byte that
+# contradicts the tables under it. the static object and executable writers have no
+# such restriction - this is the boundary of #2861's scope, made observable so a later
+# ELF32 dynamic writer (#2894) has a test to delete
+test "mach.lang.target.of.elf:elf32_dynamic_refused" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable = t_isa32(isa.ARCH_RISCV32, EM_RISCV::u32, nil);
+
+    var text: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text[k] = 0x13; k = k + 1; }
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = 0x11000; segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text[0];
+
+    var dyn: of.DynamicInfo;
+    dyn.libs = nil;        dyn.lib_count = 0;
+    dyn.imports = nil;     dyn.import_count = 0;
+    dyn.interp = intern.STR_NIL;
+    dyn.base_relocs = nil; dyn.base_reloc_count = 0;
+    dyn.pie = true;
+
+    val opts: of.ImageOptions = of.image_options_default(of.SUBSYSTEM_CONSOLE);
+    var bad: bool = false;
+
+    val pe: R.Result[bool, str] = emit_pie_exec(?alloc, ?i, ?isa_vt, ?segs[0], 1, 4096, 0x11000,
+                                                ?dyn, nil::*of.Section, 0,
+                                                nil::*of.SymtabEntry, 0, "/dev/null"::*u8, opts);
+    if (!R.is_err[bool, str](pe)) { bad = true; }
+    or (!str_contains(R.unwrap_err[bool, str](pe), "ELF64-only")) { bad = true; }
+
+    val sh: R.Result[bool, str] = emit_shared(?alloc, ?i, ?isa_vt, ?segs[0], 1, 4096,
+                                              nil::*of.ExportSym, 0, ?dyn,
+                                              nil::*of.Section, 0, nil::*of.SymtabEntry, 0,
+                                              "/dev/null"::*u8, opts);
+    if (!R.is_err[bool, str](sh)) { bad = true; }
+    or (!str_contains(R.unwrap_err[bool, str](sh), "ELF64-only")) { bad = true; }
+
+    val dx: R.Result[bool, str] = emit_dyn_exec(?alloc, ?i, ?isa_vt, ?segs[0], 1, 4096,
+                                                0x10000, 0x11000, nil::*of.ExecFunction, 0,
+                                                ?dyn, nil::*of.PltFixup, 0,
+                                                nil::*of.Section, 0, nil::*of.Section, 0,
+                                                nil::*of.SymtabEntry, 0,
+                                                "/dev/null"::*u8, "x"::*u8, opts);
+    if (!R.is_err[bool, str](dx)) { bad = true; }
+    or (!str_contains(R.unwrap_err[bool, str](dx), "ELF64-only")) { bad = true; }
+
+    if (bad) { ret 1; }
+    ret 0;
 }

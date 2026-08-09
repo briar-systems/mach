@@ -17,7 +17,8 @@ asm <isa> {
 ```
 
 - The ISA tag is mandatory. Bare `asm { ... }` does not exist.
-- The tag comes from a closed set: `x86_64`, `aarch64`, `riscv64`. Each has a working assembler that emits native bytes; all three run in CI (riscv64 under qemu, including a self-host smoke — riscv64 is a self-hosting target with a byte-identical fixpoint, #1852).
+- The tag comes from a closed set: `x86_64`, `aarch64`, `riscv64`, `riscv32`. Each has a working assembler that emits native bytes; the first three run in CI (riscv64 under qemu, including a self-host smoke — riscv64 is a self-hosting target with a byte-identical fixpoint, #1852).
+- **The RISC-V tag names the machine, not the family.** An `asm riscv64` block is refused on a riscv32 target and the other way round, so a body reaching the assembler was written for the register width it is being assembled for. Guard the two with `$if ($mach.build.arch == $mach.arch.riscv32)` when a routine needs both. An RV64-only spelling (`ld`, `sd`, the `*W` group, the doubleword atomics) is refused under a `riscv32` tag, naming the instruction and the machine, because each instruction states the register widths it exists at and the assembler reads that rather than a second list of its own.
 - Each line is an instruction in the ISA's native syntax.
 - `#` introduces a line comment: everything from `#` to the end of the line is ignored, whatever it contains (`;`, `{}`, `%`, and so on are all inert inside a comment).
 

@@ -46,8 +46,10 @@ A decorator is written as an attribute:
 #[builtin("name")]   # pipeline built-in variable (global only)
 #[uniform(set, bnd)] # descriptor-bound uniform block, read-only (global only)
 #[storage(set, bnd)] # descriptor-bound storage buffer, read-write (global only)
+#[storage(set, bnd, "readonly")] # the same buffer, with writes refused
 #[sampler(set, bnd)] # descriptor-bound image / sampler handle (global only)
-#[spirv_op(set,name)] # the SPIR-V instruction this function is (fun only)
+#[op(tgt,set,name)]   # the target instruction this function is (bodyless fun only)
+#[handle(tgt,ctor,..)] # the target type this declares (bodyless def only)
 ```
 
 Decorators appear **before** the declaration they target, one per line or
@@ -581,7 +583,7 @@ rec Camera { view: f32x4; proj: f32x4; }
 rec Particles { pos: [64]f32x4; }
 #[storage(0, 1)] var particles: Particles;
 
-#[sampler(1, 0)] var albedo: sampler2d;
+#[sampler(1, 0)] var albedo: Sampler2D;
 ```
 
 `input` and `output` number a **varying** with a location, which is how one
@@ -635,21 +637,41 @@ A compute stage's data path is `storage`: Vulkan forbids the `Output` storage cl
 in a compute execution model, so a compute shader reads and writes buffers rather
 than varyings.
 
-`sampler` binds an **image or sampler handle** by descriptor set and binding, at
-the same descriptor addressing `uniform` and `storage` use, so a host binds one the
-way it binds the others. Its type must be a **handle type** — see
-[types.md](types.md) for the spellings — and a handle type must carry this
-decorator: a handle names a descriptor rather than an object with storage, so one
-with no descriptor address is reachable from no stage. A handle cannot sit behind a
-pointer, inside an array, or in a local binding; each of those is a compile error
-naming why.
+`storage` takes **memory qualifiers** after the descriptor pair. There is one,
+`"readonly"`, and it says that nothing writes the binding:
 
-Sampling a handle is a `#[spirv_op(...)]` declaration rather than a language form,
+```mach
+rec Palette { columns: [512]f32x4; }
+#[storage(0, 3, "readonly")] var palette: Palette;
+```
+
+A store through a `"readonly"` binding is a compile error on every target, naming
+the line that wrote it. That is what the qualifier buys over what the compiler
+works out on its own: a buffer no body in the module stores through is emitted with
+the SPIR-V `NonWritable` decoration whether or not it is marked, and Vulkan reads
+that decoration to decide whether a stage needs `vertexPipelineStoresAndAtomics`.
+So an accidental write does not produce a wrong module, it produces a **correct one
+that quietly costs a hardware feature**. Marking the binding turns that into a
+diagnostic instead.
+
+The inference is one-sided on purpose. Anything the compiler cannot follow, such as
+the binding's address handed to a function, counts as a write, so a missing
+decoration is possible and a wrong one is not.
+
+`sampler` binds a **handle** by descriptor set and binding, at the same descriptor
+addressing `uniform` and `storage` use, so a host binds one the way it binds the
+others. Its type must be a **handle type**, a bodyless `def` carrying `#[handle]`
+(see [types.md](types.md)), and a handle type must carry this decorator: a handle
+names a descriptor rather than an object with storage, so one with no descriptor
+address is reachable from no stage. A handle cannot sit behind a pointer, inside an
+array, or in a local binding, and each of those is a compile error naming why.
+
+Sampling a handle is an `#[op(...)]` declaration rather than a language form,
 because a sample IS one SPIR-V instruction like `sqrt` and `dot` are:
 
 ```mach
-#[spirv_op("core", "OpImageSampleImplicitLod")]
-fun sample(s: sampler2d, uv: f32x2) f32x4;
+#[op("spirv", "core", "OpImageSampleImplicitLod")]
+fun sample(s: Sampler2D, uv: f32x2) f32x4;
 
 #[stage("fragment")]
 fun frag_main() {
@@ -661,11 +683,11 @@ The separately-bound form works the same way, with the instruction that combines
 an image and a sampler declared alongside it:
 
 ```mach
-#[spirv_op("core", "OpSampledImage")]
-fun combine(t: texture2d, s: sampler) sampler2d;
+#[op("spirv", "core", "OpSampledImage")]
+fun combine(t: Texture2D, s: Sampler) Sampler2D;
 
-#[sampler(1, 0)] var base_tex: texture2d;
-#[sampler(1, 1)] var base_smp: sampler;
+#[sampler(1, 0)] var base_tex: Texture2D;
+#[sampler(1, 1)] var base_smp: Sampler;
 
 #[stage("fragment")]
 fun frag_sep() { out_colour = sample(combine(base_tex, base_smp), in_uv); }
@@ -683,7 +705,39 @@ becomes an `OpVariable` in the `UniformConstant` class — the one class Vulkan
 permits an image, sampler or sampled-image variable in — carrying `DescriptorSet`
 and `Binding` exactly as a `uniform` does.
 
-### `spirv_op(set, name)` — a function that *is* a SPIR-V instruction
+### `handle(target, constructor, operands...)` — a type the target mints
+
+A bodyless `def` carrying this directive declares a type whose representation is
+**not the program's**: the owning target mints it and the pipeline binds it.
+
+```mach
+#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED)]
+pub def Texture2D;
+
+#[handle("spirv", "sampled_image", Texture2D)]
+pub def Sampler2D;
+```
+
+The first argument names the target and the second the type constructor within it.
+Both are matched against the target's own definition table rather than evaluated,
+so both must be string literals. Everything after them is **operands to that
+constructor**, never rule knobs: the rules a handle carries are fixed and closed
+(see [types.md](types.md)) and never vary per declaration.
+
+An operand is an ordinary comptime constant, with one exception. A constructor that
+composes over another handle takes a **type name**, and that is the only place a
+decorator argument is read as a type rather than as a value. It exists so a
+composing declaration names what it wraps instead of restating it, which is what
+keeps the two from disagreeing. The named type must be a handle the same target
+mints, with the constructor that position requires.
+
+A declaration addressed to a target this build did not select is **inert**: it
+still denotes a type and still sizes at the target's pointer width, so a library of
+handles compiles on a machine target. A constructor name the selected target does
+not define, an operand count that disagrees with the constructor's, or an operand
+combination the target cannot emit is a compile error at the declaration.
+
+### `op(target, set, name)` — a function that *is* a target instruction
 
 A shader needs `sqrt`, `normalize`, `dot` and `mix`. None of them is an operator,
 and none of them is a call SPIR-V can make: each is one instruction. This directive
@@ -691,20 +745,23 @@ says which one a function is, so that on a `spirv` target a call to it becomes t
 instruction, inline, rather than a call.
 
 ```mach
-#[spirv_op("GLSL.std.450", "Sqrt")]
+#[op("spirv", "GLSL.std.450", "Sqrt")]
 pub fun sqrt(x: f32) f32;
 
-#[spirv_op("GLSL.std.450", "Normalize")]
+#[op("spirv", "GLSL.std.450", "Normalize")]
 pub fun normalize(v: f32x4) f32x4;
 
-#[spirv_op("core", "OpDot")]
+#[op("spirv", "core", "OpDot")]
 pub fun dot(a: f32x4, b: f32x4) f32;
 ```
 
-The first argument names the instruction set and the second the instruction within
-it. Both value sets are closed and checked at compile time, on **every** target —
-the directive is legal everywhere, so a typo caught only where it is acted on would
-go unreported on a CPU build.
+The first argument names the **target**, the second the instruction set, and the
+third the instruction within it. The target is the ISA name the manifest selects
+with, so nothing about this directive is specific to one back end. All three value
+sets are closed and checked at compile time, on **every** target: the directive is
+legal everywhere, so a typo caught only where it is acted on would go unreported on
+a CPU build. The parameter count is checked against the instruction's own operand
+count, which is not uniform across a family that looks it.
 
 | Set              | Meaning                                                     |
 |------------------|-------------------------------------------------------------|
@@ -758,7 +815,8 @@ in it.
 | `builtin`   |  no   |    no     |      yes      |      no       |
 | `uniform`   |  no   |    no     |      yes      |      no       |
 | `storage`   |  no   |    no     |      yes      |      no       |
-| `spirv_op`  |  yes  |    no     |      no       |      no       |
+| `op`        |  yes  |    no     |      no       |      no       |
+| `handle`    |  no   |    no     |      no       |      no       |
 
 The `val` / `var` column is shared, but `embed` accepts only `val` — a `var`
 is refused (see [`embed`](#embedstr--compile-time-file-embedding) above).
@@ -774,5 +832,5 @@ The set is closed. New directives require a compiler change.
 - [asm.md](asm.md) — inline `asm`, the only body a `naked` function may have
 - [val-var.md](val-var.md) — `val` / `var` bindings, and the `embed` exemption to `val`'s initializer requirement
 - [grammar.md](grammar.md#types) — the `[_]` inferred array length `embed` introduces
-- [types.md](types.md) — the SIMD vector types a shader stage computes over and `spirv_op` operates on
+- [types.md](types.md) — the SIMD vector types a shader stage computes over and `op` operates on, and the handle types `handle` declares
 - [../manifest.md](../manifest.md) — the `vectorize` profile key `scalar` opts out of, and content-fingerprinted build inputs (`embed`, `[step]` `in`)

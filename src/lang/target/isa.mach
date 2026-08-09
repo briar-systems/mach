@@ -15,6 +15,8 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_region_equals;
 
 use A: std.allocator;
 use O: std.types.option;
@@ -38,6 +40,13 @@ pub val ARCH_AARCH64: u32 = 2;  # 64-bit arm (aarch64)
 pub val ARCH_RISCV64: u32 = 3;  # 64-bit risc-v (rv64)
 pub val ARCH_MOS6502: u32 = 4;  # MOS 6502 (8-bit)
 pub val ARCH_SPIRV:   u32 = 5;  # spir-v (khronos gpu / compute IR)
+# 32-bit risc-v (rv32). a SEPARATE ARCH ID FROM RV64 RATHER THAN A WIDTH FLAG ON IT
+# (#2778): the two share an instruction encoding and a register numbering but not a
+# machine - the register width, the pointer width, the widest single ALU operation and
+# the calling-convention family all differ - and every seam in this file keys on the
+# arch id, so one id carrying two machines would make every one of them ask a second
+# question it has no way to ask.
+pub val ARCH_RISCV32: u32 = 6;
 
 # pseudo-opcodes shared by every ISA. they occupy the high end of the opcode
 # space so no real machine opcode collides with them. the backend emits these
@@ -531,6 +540,40 @@ pub rec MachineModel {
     # true on every ISA this compiler otherwise targets (x86-64 IMUL, aarch64 MUL,
     # rv64 MUL, and SPIR-V's OpIMul), so the gate is dead everywhere but mos6502.
     has_mul: bool;
+
+    # the width, in bytes, at which this ISA yields the HIGH half of an unsigned
+    # product of two same-width values into an ordinary register, or 0 (#2778). the
+    # companion low half is `has_mul`'s own instruction, so a target declaring this
+    # gets the full 2N-byte product of two N-byte lanes in two instructions.
+    #
+    # THE FACT THAT TURNS A WIDE MULTIPLY FROM O(bits) INTO O(lanes^2).
+    # `be.codegen.legalize` splits a value wider than `max_alu_width` into lanes; with
+    # this declared it multiplies them SCHOOLBOOK, one native product per lane pair,
+    # and without it it falls back to a bit-at-a-time double-and-add over the whole
+    # width. On RV32 that is the difference between four instructions and 64 stages for
+    # one `i64 *`, so this is the fact that makes a 32-bit target usable rather than
+    # merely correct.
+    #
+    # 4 ON RV32 AND 8 ON RV64 - `mulhu` at XLEN either way, which is why the riscv
+    # builder writes the register width here rather than a literal. 0 on mos6502, which
+    # has no multiply of any width, and whose lane products the same pass synthesizes.
+    #
+    # A SELECTION CAPABILITY, NOT AN ISA CENSUS, and the two ISAs where they differ are
+    # the reason to say so. x86-64's high half comes only from the one-operand `MUL`
+    # pinning RDX:RAX, a form the rule engine has no way to express outside the call
+    # barrier; aarch64 has `umulh`, a plain three-operand instruction, but no opcode for
+    # it anywhere in its encoder. BOTH DECLARE 0, and both are honest: this states what
+    # `MIR_MUL_HI_U` selection can realize, and on those two the answer is nothing. It
+    # would also be unread description if they did declare it - their ALU covers every
+    # scalar the language has, so `legalize` never runs there and no consumer could
+    # catch the declaration going wrong. Raising either means adding its opcode, its
+    # rule, and a consumer that observes it, in one change.
+    #
+    # THE CONTRACT A TARGET SIGNS BY DECLARING A NON-ZERO WIDTH: its rule pack admits
+    # `MIR_MUL_HI_U` at that width, which every pack's `generic_opcode_coverage` test
+    # checks by consulting `mir.selection_widening_mul` exactly when this is non-zero -
+    # so the declaration and the rule cannot drift apart.
+    mul_hi_width: u32;
 
     # whether the ISA addresses memory as a FLAT space of bytes reached from a base
     # (#2655). true on every machine target: an address there is an integer, any two
@@ -1115,6 +1158,16 @@ pub rec ModuleEmitter {
 #                 pairs - so the collapse happens once, at link time, for an image
 #                 read from a file and an image handed straight over from codegen
 #                 alike. nil for an arch whose relocations already stand alone
+# build_attributes: OPTIONAL capability - derive the build-attribute BODY describing
+#                 what an image of this arch holds, from the resolved ABI and the
+#                 emitted bytes (cast back to `BuildAttributesFn`). declared together
+#                 with `merge_attributes` or not at all: an arch that can state its
+#                 claims must be able to combine two inputs' claims, or a link states
+#                 one input's
+# merge_attributes: OPTIONAL capability - fold one input's build-attribute body into
+#                 the accumulated one (cast back to `MergeAttributesFn`). the tag
+#                 semantics and the per-tag merge rule are the arch's; a union is not
+#                 the rule for every tag and no shared layer can know which is
 pub rec RelocSeam {
     apply_reloc:    *u8;
     reloc_traits:   *u8;
@@ -1122,6 +1175,298 @@ pub rec RelocSeam {
     elf_attributes: *u8;
     machine_flags:   *u8;
     normalize_image: *u8;
+    build_attributes: *u8;
+    merge_attributes: *u8;
+}
+
+# one operation a target defines, named by a declaration that has no body
+#
+# THE TARGET OWNS THIS, not the front end. A declaration saying which instruction it
+# IS needs two readers that cannot disagree: the front end, to close the value set so
+# a typo is a compile error rather than a module that quietly calls nothing, and the
+# back end, to emit it. Holding the table here means both read one row.
+#
+# The front end reaches it as DATA, never as a call into a back end. It arrives on
+# the comptime context beside `pointer_width` and `vector_bits`, for the reason
+# stated there: it is a target machine fact the front end needs, and the front end
+# has no target.
+# ---
+# The signature is the ARITY and nothing more. Two things a fuller signature could
+# carry are deliberately absent, both for the reason `IsaVTable` gives below: a slot
+# no consumer reads cannot be noticed when it is wrong. Whether an operand is
+# resolved to an id or written as a literal word waits for `OpTypeImage`, which is
+# one id and six literals and the first member that can tell them apart. Operand
+# NAMES wait for a diagnostic that names one, which the arity check does not need.
+#
+# Arity carries a fact the signature must state, because the family looks uniform
+# while it is not: `Reflect` takes two operands and `Refract` three, `FMin` two and
+# `FClamp` three. A declaration whose parameter list disagrees assembles the
+# instruction with the wrong operand count.
+# ---
+# set:     instruction-set name as a declaration spells it, "" for the core set
+# name:    instruction name as a declaration spells it
+# set_tag: the owning target's own tag for the set, opaque here
+# opcode:  the opcode within the set, opaque here
+# arity:   how many operands the instruction takes
+pub rec OpDef {
+    set:     str;
+    name:    str;
+    set_tag: u32;
+    opcode:  u32;
+    arity:   u32;
+}
+
+# an operand position that takes a comptime constant folded to one word
+#
+# Any other value in a constructor's operand list is the TAG of the constructor a
+# type operand at that position must name, which is what keeps a sampler out of the
+# position an image belongs in. A target may not use this value as a constructor tag.
+pub val TYPE_OPERAND_WORD: u32 = 0xFFFFFFFF;
+
+# the absence of a target-type declaration, which is every ordinary type
+pub val NO_TYPE_CTOR: u32 = 0xFFFFFFFF;
+
+# why a target refuses an operand combination its constructor spells but it cannot
+# emit, or nil when it emits every combination
+#
+# The front end owns neither what an operand means nor why one is out of reach, so
+# the reason arrives on the row rather than being derived from a name. It is handed
+# the resolved operands in declaration order: a word position holds the folded word,
+# and a type position holds the constructor tag the named type was declared with.
+pub def TypeRefuseFn: fun(*u32, u32) str;
+
+# one type constructor a target defines, named by a declaration that has no body
+#
+# The same contract as `OpDef` and for the same reason: the front end closes the
+# value set so a misspelled constructor is a compile error rather than a declaration
+# denoting nothing, and the back end mints the type from the same row.
+#
+# THE OPERAND LIST IS THE SIGNATURE, not just its length. `sampled_image` wraps the
+# image it names rather than restating the image's operands, so a declaration cannot
+# disagree with the image it composes over, and that only works if the front end can
+# tell a type operand from a literal one and can tell WHICH type is admissible.
+# ---
+# name:     constructor name as a declaration spells it
+# tag:      the owning target's own tag for the constructor, opaque here
+# operands: one entry per operand: TYPE_OPERAND_WORD, or the constructor tag a type
+#           operand must name
+# arity:    how many operands the constructor takes
+# refuse:   the reason an operand combination is out of reach, or nil
+pub rec TypeDef {
+    name:     str;
+    tag:      u32;
+    operands: *u32;
+    arity:    u32;
+    refuse:   TypeRefuseFn;
+}
+
+# the operations and type constructors a target defines
+# ---
+# ops:        the operation table
+# op_count:   number of operations
+# types:      the type-constructor table
+# type_count: number of type constructors
+pub rec TargetDefs {
+    ops:        *OpDef;
+    op_count:   u32;
+    types:      *TypeDef;
+    type_count: u32;
+}
+
+# the absence of a target-operation declaration, which is every ordinary function
+pub val NO_OP_SET: u32 = 0;
+# no instruction of that name exists in that set
+pub val NO_OPCODE: u32 = 0xFFFFFFFF;
+
+# build one operation row
+# ---
+# set:     instruction-set name as a declaration spells it
+# name:    instruction name as a declaration spells it
+# set_tag: the owning target's own tag for the set
+# opcode:  the opcode within the set
+# arity:   how many operands the instruction takes
+# ret:     the row
+pub fun op_def(set: str, name: str, set_tag: u32, opcode: u32, arity: u32) OpDef {
+    var d: OpDef;
+    d.set     = set;
+    d.name    = name;
+    d.set_tag = set_tag;
+    d.opcode  = opcode;
+    d.arity   = arity;
+    ret d;
+}
+
+# build one type-constructor row
+# ---
+# name:     constructor name as a declaration spells it
+# tag:      the owning target's own tag for the constructor
+# operands: one entry per operand: TYPE_OPERAND_WORD, or a required constructor tag
+# arity:    how many operands the constructor takes
+# refuse:   the reason an operand combination is out of reach, or nil
+# ret:      the row
+pub fun type_def(name: str, tag: u32, operands: *u32, arity: u32, refuse: TypeRefuseFn) TypeDef {
+    var d: TypeDef;
+    d.name     = name;
+    d.tag      = tag;
+    d.operands = operands;
+    d.arity    = arity;
+    d.refuse   = refuse;
+    ret d;
+}
+
+# build a definition table over an operation array and a type-constructor array
+# ---
+# ops:        the operation rows
+# op_count:   number of operation rows
+# types:      the type-constructor rows
+# type_count: number of type-constructor rows
+# ret:        the table
+pub fun target_defs(ops: *OpDef, op_count: u32, types: *TypeDef, type_count: u32) TargetDefs {
+    var t: TargetDefs;
+    t.ops        = ops;
+    t.op_count   = op_count;
+    t.types      = types;
+    t.type_count = type_count;
+    ret t;
+}
+
+# find the type constructor `name` defines, or nil when the target has no such
+# constructor
+#
+# A nil `defs` is an ordinary answer, not an error: it is every target that defines
+# no types of its own, which is all of them but SPIR-V.
+# ---
+# defs: the target's definitions, or nil
+# name: the constructor name as spelled
+# ret:  the matching definition, or nil
+pub fun type_def_of(defs: *TargetDefs, name: str) *TypeDef {
+    ret type_def_of_region(defs, name, 0::usize, str_len(name));
+}
+
+# the same lookup against a SOURCE REGION rather than a whole string
+#
+# The front end holds a decorator's arguments as spans into the module's text, and
+# cutting a string out of one to look it up would allocate on a path that only wants
+# to compare. This is the implementation and `type_def_of` is a wrapper over it, so
+# the two cannot answer differently.
+# ---
+# defs: the target's definitions, or nil
+# src:  text holding the constructor name
+# off:  byte offset of the constructor name's content
+# len:  byte length of the constructor name's content
+# ret:  the matching definition, or nil
+pub fun type_def_of_region(defs: *TargetDefs, src: str, off: usize, len: usize) *TypeDef {
+    if (defs == nil) { ret nil; }
+    var i: u32 = 0;
+    for (i < defs.type_count) {
+        val d: *TypeDef = ?defs.types[i];
+        if (str_region_equals(src, off, len, d.name)) { ret d; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the type constructor a target tag names, or nil
+#
+# The reverse of `type_def_of`, which the operand check needs: a type operand names
+# a declaration, that declaration carries a constructor tag, and the question is
+# which constructor that tag is so a diagnostic can name it.
+# ---
+# defs: the target's definitions, or nil
+# tag:  the constructor tag to look up
+# ret:  the matching definition, or nil
+pub fun type_def_by_tag(defs: *TargetDefs, tag: u32) *TypeDef {
+    if (defs == nil) { ret nil; }
+    var i: u32 = 0;
+    for (i < defs.type_count) {
+        if (defs.types[i].tag == tag) { ret ?defs.types[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# find the operation `set_name`.`op_name` defines, or nil when the target has no
+# such operation
+#
+# A nil `defs` is an ordinary answer, not an error: it is every target that defines
+# no operations of its own, which is all of them but SPIR-V.
+# ---
+# defs:     the target's definitions, or nil
+# set_name: the instruction-set name as spelled
+# op_name:  the instruction name as spelled
+# ret:      the matching definition, or nil
+pub fun op_def_of(defs: *TargetDefs, set_name: str, op_name: str) *OpDef {
+    ret op_def_of_region(defs, set_name, 0::usize, str_len(set_name),
+                         op_name, 0::usize, str_len(op_name));
+}
+
+# the same lookup against SOURCE REGIONS rather than whole strings
+#
+# The front end holds a decorator's arguments as spans into the module's text, and
+# cutting a string out of one to look it up would allocate on a path that only wants
+# to compare. This is the implementation and `op_def_of` is a wrapper over it, so
+# the two cannot answer differently.
+# ---
+# defs:     the target's definitions, or nil
+# set_src:  text holding the set name
+# set_off:  byte offset of the set name's content
+# set_len:  byte length of the set name's content
+# nam_src:  text holding the instruction name
+# nam_off:  byte offset of the instruction name's content
+# nam_len:  byte length of the instruction name's content
+# ret:      the matching definition, or nil
+pub fun op_def_of_region(defs: *TargetDefs, set_src: str, set_off: usize, set_len: usize,
+                         nam_src: str, nam_off: usize, nam_len: usize) *OpDef {
+    if (defs == nil) { ret nil; }
+    var i: u32 = 0;
+    for (i < defs.op_count) {
+        val d: *OpDef = ?defs.ops[i];
+        if (str_region_equals(set_src, set_off, set_len, d.set)
+            && str_region_equals(nam_src, nam_off, nam_len, d.name)) { ret d; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# whether the target defines an instruction set named by a source region
+# ---
+# defs: the target's definitions, or nil
+# src:  text holding the set name
+# off:  byte offset of the set name's content
+# len:  byte length of the set name's content
+# ret:  true when some operation is drawn from that set
+pub fun op_set_exists_region(defs: *TargetDefs, src: str, off: usize, len: usize) bool {
+    if (defs == nil) { ret false; }
+    var i: u32 = 0;
+    for (i < defs.op_count) {
+        if (str_region_equals(src, off, len, defs.ops[i].set)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether the target defines an instruction set by this name
+#
+# Separate from `op_def_of` so a declaration naming a set that does not exist is
+# reported against the SET rather than as an unknown instruction, which is the
+# difference between "there is no GLSL.std.451" and "Normalise is not in
+# GLSL.std.450".
+# ---
+# defs: the target's definitions, or nil
+# name: the set name as spelled
+# ret:  true when some operation is drawn from that set
+pub fun op_set_exists(defs: *TargetDefs, name: str) bool {
+    ret op_set_exists_region(defs, name, 0::usize, str_len(name));
+}
+
+# declare the optional target-defined operation table
+#
+# Absent on every target that defines no operations of its own.
+# ---
+# vt: the ISA contract to extend
+# d:  the borrowed definition table
+pub fun with_defs(vt: *IsaVTable, d: *TargetDefs) {
+    vt.defs = d;
 }
 
 # the ISA runtime-dispatch interface
@@ -1152,6 +1497,8 @@ pub rec RelocSeam {
 #                  family-agnostic DESCRIPTION every shared pre-fork stage reads, so
 #                  a registerless target describes itself honestly (-1 register ids)
 #                  instead of satisfying a machine contract with sentinels
+# defs:            borrowed table of operations this target defines, or nil when it
+#                  defines none. installed by `with_defs`
 pub rec IsaVTable {
     id:              u32;
     name:            str;
@@ -1161,6 +1508,7 @@ pub rec IsaVTable {
     machine:         *RegMachine;
     emitter:         *ModuleEmitter;
     model:           *MachineModel;
+    defs:            *TargetDefs;
 }
 
 # build the register-machine contract, every required slot supplied
@@ -1420,6 +1768,101 @@ pub fun with_normalize_image(s: *RelocSeam, f: *u8) {
     s.normalize_image = f;
 }
 
+# declare the optional build-attribute derivation and merge, which come as a PAIR
+#
+# Taken together because an arch that can state what one image holds and cannot combine
+# two inputs' statements produces a linked image claiming one input's contents, which
+# is worse than claiming nothing. Without both, an image of this arch carries no
+# attributes section, which is the truth for an arch that defines none.
+# ---
+# s:     the relocatable-object contract to extend
+# build: the derivation, erased (`BuildAttributesFn`)
+# merge: the fold, erased (`MergeAttributesFn`)
+pub fun with_attributes(s: *RelocSeam, build: *u8, merge: *u8) {
+    s.build_attributes = build;
+    s.merge_attributes = merge;
+}
+
+# the concrete signature the erased `RelocSeam.build_attributes` pointer is cast back to
+#
+# An allocator, the two facts an image's claims are derived FROM, and an out-length.
+# Naming no object-format type is what lets it be declared here: the back end builds
+# images without importing a writer, and still states what its output holds.
+# ---
+# arg 0: the allocator the returned body is taken from
+# arg 1: the resolved ABI's float-argument width
+# arg 2: whether the image's bytes contain compressed instructions
+# arg 3: out - the body's length in bytes
+# ret:   the owned attribute body, or the reason it could not be built
+pub def BuildAttributesFn: fun(*A.Allocator, u32, u32, bool, *u32) R.Result[*u8, str];
+
+# the concrete signature the erased `RelocSeam.merge_attributes` pointer is cast back to
+# ---
+# arg 0:       the allocator the returned body is taken from
+# arg 1 / 2:   the accumulated body and its length (nil / 0 when nothing yet)
+# arg 3 / 4:   the input body being folded in and its length (nil / 0 when it has none)
+# arg 5:       out - the merged body's length in bytes
+# ret:         the owned merged body, or the reason the two cannot be combined
+pub def MergeAttributesFn: fun(*A.Allocator, *u8, u32, *u8, u32, *u32) R.Result[*u8, str];
+
+# whether this arch derives a build-attribute body at all
+# ---
+# tgt_isa: the target ISA vtable to ask
+# ret:     true when the arch declares the derivation / merge pair
+pub fun declares_attributes(tgt_isa: *IsaVTable) bool {
+    if (tgt_isa == nil)              { ret false; }
+    if (!emits_relocations(tgt_isa)) { ret false; }
+    ret tgt_isa.reloc.build_attributes != nil && tgt_isa.reloc.merge_attributes != nil;
+}
+
+# the build-attribute body describing what an image of this arch holds
+#
+# Dispatches through the `build_attributes` hook, so the arch DERIVES its claims from
+# the ABI and the bytes and no writer carries a string. An arch that declares no hook
+# has no attributes and gets nil, which the writer emits as no section.
+#
+# THE REGISTER WIDTH IS SUPPLIED FROM THE MODEL, NOT LEFT TO THE ARCH (#2778). An arch
+# whose claims name its register width - RISC-V's arch string opens `rv32` or `rv64` -
+# would otherwise write a constant, which is the same false-claim shape #2828 removed
+# from this section one field over: a constant describes the arch the hook was written
+# for rather than the machine being compiled for. The vtable already carries the model,
+# so the fact is read here and the hook is told.
+# ---
+# tgt_isa:        the target ISA vtable supplying the hook and the machine model
+# alloc:          the allocator the body is taken from
+# float_arg_bits: the resolved ABI's float-argument width
+# has_compressed: whether the image's bytes contain compressed instructions
+# out_len:        out - the body's length in bytes
+# ret:            the owned body (nil when the arch has none), or an error
+pub fun build_attributes(tgt_isa: *IsaVTable, alloc: *A.Allocator, float_arg_bits: u32,
+                         has_compressed: bool, out_len: *u32) R.Result[*u8, str] {
+    @out_len = 0;
+    if (!declares_attributes(tgt_isa)) { ret R.ok[*u8, str](nil); }
+    ret tgt_isa.reloc.build_attributes::BuildAttributesFn(alloc, tgt_isa.model.gpr_width * 8,
+                                                         float_arg_bits,
+                                                         has_compressed, out_len);
+}
+
+# fold one input's build-attribute body into the accumulated one
+#
+# Dispatches through the `merge_attributes` hook. An arch that declares none has no
+# attributes to combine, so the accumulator stays empty rather than adopting an input
+# this compiler cannot interpret.
+# ---
+# tgt_isa:   the target ISA vtable supplying the hook
+# alloc:     the allocator the result is taken from
+# acc / acc_len: the accumulated body so far
+# add / add_len: the input body being folded in
+# out_len:   out - the merged body's length in bytes
+# ret:       the owned merged body, or the reason the two cannot be combined
+pub fun merge_attributes(tgt_isa: *IsaVTable, alloc: *A.Allocator, acc: *u8, acc_len: u32,
+                         add: *u8, add_len: u32, out_len: *u32) R.Result[*u8, str] {
+    @out_len = 0;
+    if (!declares_attributes(tgt_isa)) { ret R.ok[*u8, str](nil); }
+    ret tgt_isa.reloc.merge_attributes::MergeAttributesFn(alloc, acc, acc_len,
+                                                          add, add_len, out_len);
+}
+
 # compose an ISA vtable for a REGISTER MACHINE
 #
 # Binds the machine contract and leaves `emitter` nil, so the family is settled by
@@ -1521,6 +1964,7 @@ pub fun arch_id_for(name: str) u32 {
     if (str_equals(name, "x86_64"))  { ret ARCH_X86_64; }
     if (str_equals(name, "aarch64")) { ret ARCH_AARCH64; }
     if (str_equals(name, "riscv64")) { ret ARCH_RISCV64; }
+    if (str_equals(name, "riscv32")) { ret ARCH_RISCV32; }
     if (str_equals(name, "spirv"))   { ret ARCH_SPIRV; }
     if (str_equals(name, "mos6502")) { ret ARCH_MOS6502; }
     ret ARCH_UNKNOWN;
@@ -1534,6 +1978,7 @@ pub fun arch_name_for(id: u32) str {
     if (id == ARCH_X86_64)  { ret "x86_64"; }
     if (id == ARCH_AARCH64) { ret "aarch64"; }
     if (id == ARCH_RISCV64) { ret "riscv64"; }
+    if (id == ARCH_RISCV32) { ret "riscv32"; }
     if (id == ARCH_SPIRV)   { ret "spirv"; }
     if (id == ARCH_MOS6502) { ret "mos6502"; }
     ret "unknown";
@@ -1957,12 +2402,20 @@ test "mach.lang.target.isa.arch_id_for:name_roundtrip" {
     if (arch_id_for("x86_64") != ARCH_X86_64)   { ret 1; }
     if (arch_id_for("aarch64") != ARCH_AARCH64) { ret 1; }
     if (arch_id_for("riscv64") != ARCH_RISCV64) { ret 1; }
-    # the bare "riscv" family name is not a concrete isa; only "riscv64" resolves
+    if (arch_id_for("riscv32") != ARCH_RISCV32) { ret 1; }
+    if (arch_id_for("mos6502") != ARCH_MOS6502) { ret 1; }
+    if (arch_id_for("spirv")   != ARCH_SPIRV)   { ret 1; }
+    # the bare "riscv" family name is not a concrete isa; only the width-bearing
+    # spellings resolve, and the two of them are DIFFERENT ids rather than one
     if (arch_id_for("riscv") != ARCH_UNKNOWN)   { ret 1; }
+    if (ARCH_RISCV32 == ARCH_RISCV64)           { ret 1; }
 
     if (!str_equals(arch_name_for(ARCH_X86_64), "x86_64"))   { ret 1; }
     if (!str_equals(arch_name_for(ARCH_AARCH64), "aarch64")) { ret 1; }
     if (!str_equals(arch_name_for(ARCH_RISCV64), "riscv64")) { ret 1; }
+    if (!str_equals(arch_name_for(ARCH_RISCV32), "riscv32")) { ret 1; }
+    if (!str_equals(arch_name_for(ARCH_MOS6502), "mos6502")) { ret 1; }
+    if (!str_equals(arch_name_for(ARCH_SPIRV),   "spirv"))   { ret 1; }
     if (!str_equals(arch_name_for(ARCH_UNKNOWN), "unknown")) { ret 1; }
     ret 0;
 }
@@ -2095,12 +2548,18 @@ test "mach.lang.target.isa.reloc_seam:required_then_optional" {
     if (s.elf_reloc_type == nil) { ret 1; }
     if (s.elf_attributes != nil)  { ret 1; }
     if (s.normalize_image != nil) { ret 1; }
+    if (s.build_attributes != nil) { ret 1; }
+    if (s.merge_attributes != nil) { ret 1; }
 
     var hook: u8;
     with_elf_attributes(?s, ?hook);
     if (s.elf_attributes == nil) { ret 1; }
     with_normalize_image(?s, ?hook);
     if (s.normalize_image == nil) { ret 1; }
+    # the attributes pair is declared together, so neither half can be left behind
+    with_attributes(?s, ?hook, ?hook);
+    if (s.build_attributes == nil) { ret 1; }
+    if (s.merge_attributes == nil) { ret 1; }
 
     # an arch whose relocatable objects are not ELF passes a deliberate nil for the
     # ELF map and still owes the applier

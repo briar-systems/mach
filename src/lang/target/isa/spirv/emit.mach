@@ -82,7 +82,7 @@ use R: std.types.result;
 
 use mach.lang.intern;
 use mach.lang.source;
-use mach.lang.spirvop;
+use defs: mach.lang.target.isa.spirv.defs;
 use mach.lang.target.resolved;
 use mach.lang.me.ir;
 use mach.lang.me.ir.type;
@@ -118,17 +118,22 @@ use semtype: mach.lang.type;
 # has_entry: whether any function in the ROOT declares a pipeline stage, which
 #           decides whether this is a shader module (entry points, no Linkage) or a
 #           library module (Linkage exports, no entry point)
+# gls:      the unit's globals, flattened into one table exactly as `fns` flattens
+#           its functions - the root's in IR order first, then the globals a drawn-in
+#           body reaches. every per-global array below is indexed by a table index,
+#           NOT by a root IR global index
+# gl_len:   how many entries that table has
 # gtype_ids: the SPIR-V VALUE type each interface variable was declared with, and
 #           gstorage its storage class. An access chain's result is a pointer to a
 #           member of that exact type, and a laid-out block's array members are not
 #           interned, so the declared id has to be remembered rather than rebuilt.
-# gvar_ids: SPIR-V OpVariable id per IR global index, allocated before any body is
+# gvar_ids: SPIR-V OpVariable id per global-table index, allocated before any body is
 #           emitted so a load or store can name a variable declared later (0 for a
 #           global carrying no interface role)
 # iface_ids: the Input / Output variable ids, in declaration order; an entry point
 #           lists the subset of these it can reach
 # iface_len: how many of `iface_ids` are live
-# gslot:    per IR global index, one more than its slot in `iface_ids`, or 0 when
+# gslot:    per global-table index, one more than its slot in `iface_ids`, or 0 when
 #           the global is not entry-point interface
 # iface_use: a (unit function) x (interface slot) matrix, 1 where that function can
 #           reach that variable, transitively through its calls. an entry point
@@ -146,6 +151,8 @@ rec Emit {
     fns:       *FnEnt;
     fn_len:    u32;
     has_entry: bool;
+    gls:       *GlobalEnt;
+    gl_len:    u32;
     gvar_ids:  *u32;
     gtype_ids: *u32;
     gstorage:  *u32;
@@ -154,8 +161,13 @@ rec Emit {
     gslot:     *u32;
     iface_use: *u8;
 
+    # per global-table entry, whether a store can reach it (#2879). the absence of
+    # one is what a `NonWritable` decoration states, so this is a PROOF rather than
+    # a search: anything the derivation walk cannot follow reads as written
+    gwrite:    *u8;
+
     # the id each extended instruction set was imported under, indexed by
-    # spirvop.SPV_SET_*; 0 means "not imported yet". indexed rather than one field
+    # defs.SPV_SET_*; 0 means "not imported yet". indexed rather than one field
     # per set so a second set is a row in `spirvop`, not a change here. the import
     # is minted at the FIRST call that needs it, which is what makes it on demand:
     # a module using none of them carries no OpExtInstImport at all
@@ -214,14 +226,23 @@ rec VMaps {
 # carrying `imm` rather than an id, and the constant is minted at the use site with
 # the width the declaration asks for. A parameter's slot holds its
 # OpFunctionParameter id from the start.
+#
+# A COMPARISON'S RESULT RIDES HERE THE SAME WAY, for the same reason (#2910). It is
+# an `OpTypeBool`, which has no numeric representation and cannot be an argument or a
+# return value where a byte is declared, and the move that pre-colors it carries the
+# machine word rather than the declared type. `is_bool` marks the slot so the use
+# site widens it to whatever the declaration asks for, or leaves it alone where the
+# declaration is itself a boolean.
 # ---
-# val_id: the SSA id held in each register index (0 when empty or pending)
-# imm:    the pending immediate value per register index
-# is_imm: whether the slot holds a pending immediate rather than an id
+# val_id:  the SSA id held in each register index (0 when empty or pending)
+# imm:     the pending immediate value per register index
+# is_imm:  whether the slot holds a pending immediate rather than an id
+# is_bool: whether the slot's id is a boolean awaiting the consumer's type
 rec Regs {
-    val_id: [16]u32;
-    imm:    [16]i64;
-    is_imm: [16]bool;
+    val_id:  [16]u32;
+    imm:     [16]i64;
+    is_imm:  [16]bool;
+    is_bool: [16]bool;
 }
 
 # one defined function the emission unit offers, wherever it came from
@@ -251,6 +272,32 @@ rec FnEnt {
     name:   intern.StrId;
     id:     u32;
     emit:   bool;
+}
+
+# one module-scope global the emission unit offers, wherever it came from
+#
+# The same flattening `FnEnt` performs, applied to the other namespace a body can
+# name (#2843). It is deliberately the same shape rather than a variant of it: the
+# pair (`mi`, `ir_ix`) is again the only place the module boundary stays visible,
+# and again it is visible exactly where it has to be, reading a global's type
+# against the type table that gave its type id meaning.
+#
+# WHY A GLOBAL NEEDS THIS AND A LOCAL DOES NOT. An interface variable is a
+# module-scope `OpVariable` with decorations, and nothing in the emitted module
+# records which mach module the source declaration sat in. So a shared module can
+# own a descriptor set - the pattern a shader library reaches for the moment it
+# owns anything beyond pure functions - and the only thing that ever stopped it was
+# the emitter resolving every global against the root.
+# ---
+# mi:    the unit member this global is declared in
+# ir_ix: its index in that member's IR globals
+# name:  its interned link name, cached so a reference resolves without a nested
+#        walk. module-path mangled and so globally unique, which is what lets a
+#        single linear scan answer for the whole unit
+rec GlobalEnt {
+    mi:    u32;
+    ir_ix: u32;
+    name:  intern.StrId;
 }
 
 # emit a complete SPIR-V module for one lowered emission unit
@@ -295,9 +342,9 @@ pub fun emit_module(tgt: *resolved.Target, u: *unit.Unit,
     var e: Emit;
     e.alloc = mirmod.alloc; e.interner = mirmod.interner;
     e.tgt = tgt; e.u = u; e.root = irmod; e.ir = irmod; e.cur_mi = u.root;
-    e.b = ?b; e.tt = ?tt; e.fns = nil; e.fn_len = 0;
+    e.b = ?b; e.tt = ?tt; e.fns = nil; e.fn_len = 0; e.gls = nil; e.gl_len = 0;
     e.gvar_ids = nil; e.gtype_ids = nil; e.gstorage = nil; e.iface_ids = nil; e.iface_len = 0;
-    e.gslot = nil; e.iface_use = nil;
+    e.gslot = nil; e.iface_use = nil; e.gwrite = nil;
     var xi: u32 = 0;
     for (xi < 8) { e.ext_ids[xi] = 0; xi = xi + 1; }
     e.srcmap = mirmod.srcmap; e.cur_fn = nil; e.cur_instr = nil;
@@ -329,6 +376,29 @@ pub fun emit_module(tgt: *resolved.Target, u: *unit.Unit,
         types.types_dnit(?tt);
         spirv.builder_dnit(?b);
         ret rr;
+    }
+
+    # the global table is built after the emitted closure is known, because a
+    # drawn-in member contributes the globals that closure REACHES and nothing else
+    # (#2843). The root's own are in it either way.
+    val gtr: R.Result[bool, str] = build_gl_table(?e);
+    if (R.is_err[bool, str](gtr)) {
+        emit_dnit(?e);
+        types.types_dnit(?tt);
+        spirv.builder_dnit(?b);
+        ret gtr;
+    }
+
+    # which descriptors the module stores through is decided before they are
+    # declared, because it is a decoration ON the declaration: `NonWritable` is
+    # emitted with the variable, and the fact it states is about every body in the
+    # closure rather than about the one being emitted (#2879).
+    val wr: R.Result[bool, str] = build_gl_writes(?e);
+    if (R.is_err[bool, str](wr)) {
+        emit_dnit(?e);
+        types.types_dnit(?tt);
+        spirv.builder_dnit(?b);
+        ret wr;
     }
 
     # interface variables are declared before any body, both because a SPIR-V global
@@ -414,26 +484,34 @@ fun emit_dnit(e: *Emit) {
     if (e.fns != nil && e.fn_len > 0) { A.deallocate[FnEnt](e.alloc, e.fns, e.fn_len::usize); }
     e.fns    = nil;
     e.fn_len = 0;
-    if (e.gvar_ids != nil && e.root.global_len > 0) {
-        A.deallocate[u32](e.alloc, e.gvar_ids, e.root.global_len::usize);
+    if (e.gvar_ids != nil && e.gl_len > 0) {
+        A.deallocate[u32](e.alloc, e.gvar_ids, e.gl_len::usize);
     }
     e.gvar_ids = nil;
-    if (e.iface_ids != nil && e.root.global_len > 0) {
-        A.deallocate[u32](e.alloc, e.iface_ids, e.root.global_len::usize);
+    if (e.iface_ids != nil && e.gl_len > 0) {
+        A.deallocate[u32](e.alloc, e.iface_ids, e.gl_len::usize);
     }
     e.iface_ids = nil;
-    if (e.gslot != nil && e.root.global_len > 0) {
-        A.deallocate[u32](e.alloc, e.gslot, e.root.global_len::usize);
+    if (e.gslot != nil && e.gl_len > 0) {
+        A.deallocate[u32](e.alloc, e.gslot, e.gl_len::usize);
     }
     e.gslot = nil;
-    if (e.gtype_ids != nil && e.root.global_len > 0) {
-        A.deallocate[u32](e.alloc, e.gtype_ids, e.root.global_len::usize);
+    if (e.gtype_ids != nil && e.gl_len > 0) {
+        A.deallocate[u32](e.alloc, e.gtype_ids, e.gl_len::usize);
     }
     e.gtype_ids = nil;
-    if (e.gstorage != nil && e.root.global_len > 0) {
-        A.deallocate[u32](e.alloc, e.gstorage, e.root.global_len::usize);
+    if (e.gstorage != nil && e.gl_len > 0) {
+        A.deallocate[u32](e.alloc, e.gstorage, e.gl_len::usize);
     }
     e.gstorage = nil;
+    if (e.gwrite != nil && e.gl_len > 0) {
+        A.deallocate[u8](e.alloc, e.gwrite, e.gl_len::usize);
+    }
+    e.gwrite = nil;
+    # the table itself last: every free above is sized by its length.
+    if (e.gls != nil && e.gl_len > 0) { A.deallocate[GlobalEnt](e.alloc, e.gls, e.gl_len::usize); }
+    e.gls    = nil;
+    e.gl_len = 0;
 }
 
 # flatten every defined function in the unit into one table
@@ -569,7 +647,7 @@ fun mark_emitted(e: *Emit) R.Result[bool, str] {
 # ret: true when it has a body to emit and is not an instruction mapping
 fun emittable(e: *Emit, ix: u32) bool {
     val fn: *ir.Function = fn_ir(e, ix);
-    if (fn.spv_set != spirvop.SPV_SET_NONE) { ret false; }
+    if (fn.op_set != defs.SPV_SET_NONE) { ret false; }
     val mf: *mir.MirFunction = fn_mir(e, ix);
     if (mf == nil || mf.block_count == 0)   { ret false; }
     ret true;
@@ -669,6 +747,388 @@ fun fn_mir(e: *Emit, ix: u32) *mir.MirFunction {
     ret ?e.u.mods[e.fns[ix].mi].mir.functions[e.fns[ix].mir_ix];
 }
 
+# flatten the unit's reachable globals into one table (#2843)
+#
+# THE ROOT'S GLOBALS COME FIRST, all of them, in IR order. That is what keeps a
+# module drawing nothing in emitting exactly the bytes it emitted before: the table
+# is then the root's global list with the same indices it always had, and every id
+# minted off it is unchanged.
+#
+# A NON-ROOT MEMBER CONTRIBUTES BY REACHABILITY, NOT BY MEMBERSHIP, which is the
+# same rule the function table already states and is not a convenience here. A
+# shared module may declare a whole descriptor set; a shader importing it for one
+# helper must not inherit the rest, both because the module would grow without
+# bound and because two unrelated libraries could then collide on a binding that
+# neither the shader nor either author ever used. So a member's global is entered
+# only when an EMITTED function names it.
+#
+# The root is exempt from that filter deliberately. Its interface list is the
+# module's pipeline contract, declared whole whether or not a stage happens to read
+# every part of it, and narrowing it here would change what existing shaders emit.
+#
+# ONLY DECLARATIONS ARE ENTERED, never an extern shadow, for the reason the function
+# table states and one more that is specific to globals. A consumer's shadow of
+# someone else's variable is minted by `ensure_extern_global` against the
+# CONSUMER's type table, so its type id means nothing outside that module: reading
+# it as the variable's type would resolve to whatever type sits at the same index
+# there, which is a wrong type silently rather than a failure. The definition is
+# found once, in the module that made it, and every reference resolves to that.
+# ---
+# e:   the emission state
+# ret: true on success, or an allocation error
+fun build_gl_table(e: *Emit) R.Result[bool, str] {
+    var n: u32 = 0;
+    var i0: u32 = 0;
+    for (i0 < e.root.global_len) {
+        if (gl_eligible(?e.root.globals[i0])) { n = n + 1; }
+        i0 = i0 + 1;
+    }
+    var mi: u32 = 0;
+    for (mi < e.u.len) {
+        if (mi == e.u.root) { mi = mi + 1; cnt; }
+        val m: *ir.Module = e.u.mods[mi].ir;
+        var i: u32 = 0;
+        for (i < m.global_len) {
+            if (gl_eligible(?m.globals[i]) && global_is_reached(e, m.globals[i].name)) { n = n + 1; }
+            i = i + 1;
+        }
+        mi = mi + 1;
+    }
+    if (n == 0) { ret R.ok[bool, str](true); }
+
+    val rt: R.Result[*GlobalEnt, str] = A.allocate[GlobalEnt](e.alloc, n::usize);
+    if (R.is_err[*GlobalEnt, str](rt)) { ret R.err[bool, str](R.unwrap_err[*GlobalEnt, str](rt)); }
+    e.gls    = R.unwrap_ok[*GlobalEnt, str](rt);
+    e.gl_len = n;
+
+    var k: u32 = 0;
+    var i2: u32 = 0;
+    for (i2 < e.root.global_len) {
+        if (!gl_eligible(?e.root.globals[i2])) { i2 = i2 + 1; cnt; }
+        e.gls[k].mi    = e.u.root;
+        e.gls[k].ir_ix = i2;
+        e.gls[k].name  = e.root.globals[i2].name;
+        k = k + 1;
+        i2 = i2 + 1;
+    }
+    mi = 0;
+    for (mi < e.u.len) {
+        if (mi == e.u.root) { mi = mi + 1; cnt; }
+        val m: *ir.Module = e.u.mods[mi].ir;
+        var i: u32 = 0;
+        for (i < m.global_len) {
+            if (!gl_eligible(?m.globals[i]) || !global_is_reached(e, m.globals[i].name)) { i = i + 1; cnt; }
+            e.gls[k].mi    = mi;
+            e.gls[k].ir_ix = i;
+            e.gls[k].name  = m.globals[i].name;
+            k = k + 1;
+            i = i + 1;
+        }
+        mi = mi + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# decide, for every global in the table, whether a store can reach it (#2879)
+#
+# A storage buffer nothing writes is `NonWritable`, and Vulkan reads that
+# decoration to decide whether a stage needs `vertexPipelineStoresAndAtomics`. So
+# the question "does the MODULE ever store through this binding" is worth a pass:
+# it is the common case, it is decidable here, and the answer is free where it is
+# yes and costs a hardware feature where it is wrongly no.
+#
+# THE ANSWER IS ONE-SIDED ON PURPOSE. A wrong "written" costs a decoration. A wrong
+# "not written" is a miscompile - a module that promises the driver something it
+# then does. So the rule is not "find the stores", it is "prove there are none",
+# and everything that is not a proven read counts against the proof. Two positions
+# are reads: the ADDRESS of a load, and the base of an access chain, whose own
+# result is then subject to the same question. Every other appearance of the
+# binding or of a pointer derived from it - a store's destination, a memzero, a
+# call argument, a copy into a vreg this pass does not follow - marks it written,
+# whether or not the emitter would go on to accept the instruction.
+#
+# THE SCAN IS OVER THE EMITTED CLOSURE, the same set every other whole-module
+# decision here is stated about: a function the module drops carries no store a
+# driver can execute. A drawn-in library body is in that closure, so a store from
+# another module counts exactly as a local one does (#2843).
+#
+# It doubles as the enforcement of `#[storage(set, binding, "readonly")]`. Sema
+# refuses the store that is WRITTEN as an assignment, which is the spelling an
+# author reaches for. This refuses a store the emitter can still see after
+# lowering, so the decoration can never be a promise the module breaks.
+# ---
+# e:   the emission state
+# ret: true on success, an allocation error, or the readonly refusal
+fun build_gl_writes(e: *Emit) R.Result[bool, str] {
+    if (e.gl_len == 0) { ret R.ok[bool, str](true); }
+    val rw: R.Result[*u8, str] = A.allocate[u8](e.alloc, e.gl_len::usize);
+    if (R.is_err[*u8, str](rw)) { ret R.err[bool, str](R.unwrap_err[*u8, str](rw)); }
+    e.gwrite = R.unwrap_ok[*u8, str](rw);
+    var i: u32 = 0;
+    for (i < e.gl_len) { e.gwrite[i] = 0; i = i + 1; }
+
+    var fx: u32 = 0;
+    for (fx < e.fn_len) {
+        if (!e.fns[fx].emit) { fx = fx + 1; cnt; }
+        val mf: *mir.MirFunction = fn_mir(e, fx);
+        if (mf == nil) { fx = fx + 1; cnt; }
+        val r: R.Result[bool, str] = scan_fn_writes(e, fx, mf);
+        if (R.is_err[bool, str](r)) { ret r; }
+        fx = fx + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# mark every global one function can store through
+#
+# Two walks. The first gives each vreg the global its pointer was derived from, by
+# following access chains from their base, and iterates to a fixed point because a
+# chain's base may be defined by a later instruction in program order, which a loop
+# makes ordinary. The second asks of every operand carrying such a pointer - or
+# naming a global outright - whether its position is one of the two that only read.
+# ---
+# e:   the emission state
+# fx:  the unit function-table index, for the refusal's function name
+# mf:  the MIR function
+# ret: true on success, an allocation error, or the readonly refusal
+fun scan_fn_writes(e: *Emit, fx: u32, mf: *mir.MirFunction) R.Result[bool, str] {
+    val n: u32 = mf.vreg_count;
+    var origin: *u32 = nil;
+    if (n > 0) {
+        val ro: R.Result[*u32, str] = A.allocate[u32](e.alloc, n::usize);
+        if (R.is_err[*u32, str](ro)) { ret R.err[bool, str](R.unwrap_err[*u32, str](ro)); }
+        origin = R.unwrap_ok[*u32, str](ro);
+        var v: u32 = 0;
+        for (v < n) { origin[v] = GL_NONE; v = v + 1; }
+    }
+
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var bi: u32 = 0;
+        for (bi < mf.block_count) {
+            val blk: *mir.MirBlock = ?mf.blocks[bi];
+            var ii: u32 = 0;
+            for (ii < blk.instr_count) {
+                val mi: *mir.MirInstr = ?blk.instrs[ii];
+                ii = ii + 1;
+                if (mi.opcode != mir.MIR_GEP || mi.operand_count < 2) { cnt; }
+                if (mi.operands[0].kind != mir.MIR_OP_VREG) { cnt; }
+                val dst: u32 = mi.operands[0].vreg;
+                if (origin == nil || dst == mir.MIR_VREG_NIL || dst >= n) { cnt; }
+                val g: u32 = operand_origin(e, origin, n, ?mi.operands[1]);
+                if (g == GL_NONE || origin[dst] == g) { cnt; }
+                # a vreg reached from two bases is followed no further: both are
+                # marked written, since a store through it would reach either.
+                if (origin[dst] != GL_NONE) {
+                    val ra: R.Result[bool, str] = mark_written(e, fx, mi, origin[dst]);
+                    if (R.is_err[bool, str](ra)) { A.deallocate[u32](e.alloc, origin, n::usize); ret ra; }
+                    val rb: R.Result[bool, str] = mark_written(e, fx, mi, g);
+                    if (R.is_err[bool, str](rb)) { A.deallocate[u32](e.alloc, origin, n::usize); ret rb; }
+                    cnt;
+                }
+                origin[dst] = g;
+                changed = true;
+            }
+            bi = bi + 1;
+        }
+    }
+
+    var bi2: u32 = 0;
+    for (bi2 < mf.block_count) {
+        val blk: *mir.MirBlock = ?mf.blocks[bi2];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            var oi: u32 = 0;
+            for (oi < mi.operand_count) {
+                val g: u32 = operand_origin(e, origin, n, ?mi.operands[oi]);
+                if (g == GL_NONE) { oi = oi + 1; cnt; }
+                if (operand_only_reads(mi.opcode, oi)) { oi = oi + 1; cnt; }
+                val rm: R.Result[bool, str] = mark_written(e, fx, mi, g);
+                if (R.is_err[bool, str](rm)) {
+                    if (origin != nil) { A.deallocate[u32](e.alloc, origin, n::usize); }
+                    ret rm;
+                }
+                oi = oi + 1;
+            }
+            ii = ii + 1;
+        }
+        bi2 = bi2 + 1;
+    }
+    if (origin != nil) { A.deallocate[u32](e.alloc, origin, n::usize); }
+    ret R.ok[bool, str](true);
+}
+
+# whether an operand position of an opcode can only READ the object it names
+#
+# THE DEFAULT IS WRITTEN, so an opcode reaching a binding through a position nobody
+# listed here is reported as a store rather than passed over. That posture is what
+# makes a missing entry a spurious refusal on a `"readonly"` binding instead of a
+# silently writable descriptor, and every whole-object opcode has a read END and a
+# write end that have to be told apart by position.
+# ---
+# op: the MIR opcode
+# oi: the operand position
+# ret: true when the position only reads
+fun operand_only_reads(op: mir.MirOpcode, oi: u32) bool {
+    if (op == mir.MIR_LOAD)      { ret oi == 1; }
+    if (op == mir.MIR_GEP)       { ret oi < 2; }
+    if (op == mir.MIR_MEMCPY)    { ret oi == 1; }
+    if (op == mir.MIR_AGG_LOAD)  { ret oi == 1; }
+    ret false;
+}
+
+# the global an operand's pointer was derived from, or GL_NONE
+#
+# A symbol operand names its global whatever displacement rides on it, and a
+# register operand names whatever the derivation walk recorded for that vreg. The
+# displacement is deliberately not read: it changes which BYTES an access reaches,
+# never which binding, and this pass answers only the second question.
+# ---
+# e:      the emission state
+# origin: the per-vreg derivation map, or nil for a function with no vregs
+# n:      the map's length
+# op:     the operand
+# ret:    the global-table index, or GL_NONE
+fun operand_origin(e: *Emit, origin: *u32, n: u32, op: *mir.MirOperand) u32 {
+    if (op.kind == mir.MIR_OP_SYM) { ret gl_lookup(e, op.sym); }
+    if (op.kind != mir.MIR_OP_VREG && op.kind != mir.MIR_OP_MEM) { ret GL_NONE; }
+    if (origin == nil || op.vreg == mir.MIR_VREG_NIL || op.vreg >= n) { ret GL_NONE; }
+    ret origin[op.vreg];
+}
+
+# record that a store can reach global `gix`, and refuse it when the binding said
+# it would not be written
+# ---
+# e:   the emission state
+# fx:  the unit function-table index the store sits in
+# mi:  the instruction the store arrived as
+# gix: the global-table index
+# ret: true, or the refusal
+fun mark_written(e: *Emit, fx: u32, mi: *mir.MirInstr, gix: u32) R.Result[bool, str] {
+    if (gix >= e.gl_len || e.gwrite == nil) { ret R.ok[bool, str](true); }
+    if (e.gwrite[gix] != 0) { ret R.ok[bool, str](true); }
+    e.gwrite[gix] = 1;
+    val g: *ir.Global = gl_ir(e, gix);
+    if (g.iface != ir.IFACE_STORAGE || (g.iface_flags & ir.IFACE_FLAG_READONLY) == 0) {
+        ret R.ok[bool, str](true);
+    }
+    val r: R.Result[str, str] = format.sprint(e.alloc,
+        "a store reaches the `#[storage({}, {}, \"readonly\")]` binding{}: the qualifier declares that nothing writes it, which is what lets this module mark the descriptor `NonWritable` and a vertex stage read it without `vertexPipelineStoresAndAtomics`. drop the `\"readonly\"` qualifier to write it",
+        g.iface_a, g.iface_b, gl_mod_prefix(e, gix));
+    if (R.is_err[str, str](r)) {
+        ret R.err[bool, str]("spirv.emit: a store reaches a `\"readonly\"` storage binding");
+    }
+    ret R.err[bool, str](mir.instr_refusal(e.alloc, e.srcmap, ir_fn_spelling(e, fx), mi,
+                                           R.unwrap_ok[str, str](r)));
+}
+
+# whether a store can reach the global at table index `ix`
+# ---
+# e:  the emission state
+# ix: the global-table index
+# ret: true unless the module was proved never to store through it
+fun gl_written(e: *Emit, ix: u32) bool {
+    if (e.gwrite == nil || ix >= e.gl_len) { ret true; }
+    ret e.gwrite[ix] != 0;
+}
+
+# whether any EMITTED function names this global
+#
+# A reference reaches the back end as a symbol operand carrying the global's
+# mangled name, which is the same key `address_origin` resolves against, so asking
+# the question here and answering it there cannot drift.
+#
+# The scan is over the emitted closure rather than the whole unit for the reason
+# `build_gl_table` states: a function the module dropped brings nothing with it.
+# ---
+# e:    the emission state
+# name: the global's interned link name
+# ret:  true when some emitted body carries a symbol operand naming it
+fun global_is_reached(e: *Emit, name: intern.StrId) bool {
+    var fx: u32 = 0;
+    for (fx < e.fn_len) {
+        if (!e.fns[fx].emit) { fx = fx + 1; cnt; }
+        val mf: *mir.MirFunction = fn_mir(e, fx);
+        if (mf == nil) { fx = fx + 1; cnt; }
+        var bi: u32 = 0;
+        for (bi < mf.block_count) {
+            val blk: *mir.MirBlock = ?mf.blocks[bi];
+            var ii: u32 = 0;
+            for (ii < blk.instr_count) {
+                val mi: *mir.MirInstr = ?blk.instrs[ii];
+                var oi: u32 = 0;
+                for (oi < mi.operand_count) {
+                    if (mi.operands[oi].kind == mir.MIR_OP_SYM
+                        && mi.operands[oi].sym == name) { ret true; }
+                    oi = oi + 1;
+                }
+                ii = ii + 1;
+            }
+            bi = bi + 1;
+        }
+        fx = fx + 1;
+    }
+    ret false;
+}
+
+# whether an IR global is a DECLARATION this unit can resolve against
+# ---
+# g:   the IR global
+# ret: false for an extern shadow of a definition that lives elsewhere
+fun gl_eligible(g: *ir.Global) bool {
+    ret !g.is_extern && !g.is_import;
+}
+
+# the IR record behind a global-table entry
+fun gl_ir(e: *Emit, ix: u32) *ir.Global {
+    ret ?e.u.mods[e.gls[ix].mi].ir.globals[e.gls[ix].ir_ix];
+}
+
+# the type table a global-table entry's type ids belong to
+#
+# The whole reason `GlobalEnt` carries `mi`. A global declared in a drawn-in member
+# types against THAT member's table, and reading it against the root's would resolve
+# the id to whatever type happens to sit at the same index there - a wrong type
+# silently, not a failure.
+fun gl_types(e: *Emit, ix: u32) *type.IrTypeTable {
+    ret ?e.u.mods[e.gls[ix].mi].ir.types;
+}
+
+# the global-table index for an interned link name, or GL_NONE
+fun gl_lookup(e: *Emit, name: intern.StrId) u32 {
+    var i: u32 = 0;
+    for (i < e.gl_len) {
+        if (e.gls[i].name == name) { ret i; }
+        i = i + 1;
+    }
+    ret GL_NONE;
+}
+
+# a global named for a diagnostic, qualified by its module when it is not the root's
+#
+# A collision between two modules' declarations is the case this exists for: a
+# message naming two `camera`s helps nobody, and the module path is the only thing
+# that distinguishes them. The root's own globals stay unqualified so an existing
+# single-module diagnostic reads exactly as it did.
+#
+# IR keeps a global's MANGLED name and no source spelling, so the module path is
+# what is available and the variable itself is named by the decorator the author
+# wrote at each call site rather than by its symbol.
+# ---
+# e:  the emission state
+# ix: the global-table index
+# ret: the module path, or "" for a root global
+fun gl_mod_prefix(e: *Emit, ix: u32) str {
+    if (ix >= e.gl_len || e.gls[ix].mi == e.u.root) { ret ""; }
+    val mo: O.Option[str] = intern.lookup(e.interner, e.u.mods[e.gls[ix].mi].ir.name);
+    if (O.is_none[str](mo)) { ret ""; }
+    val q: R.Result[str, str] = format.sprint(e.alloc, ", declared in `{}`", O.unwrap[str](mo));
+    if (R.is_err[str, str](q)) { ret ""; }
+    ret R.unwrap_ok[str, str](q);
+}
+
 # declare one global OpVariable per interface-roled global, with its decorations
 #
 # A shader stage does not receive its inputs or hand back its outputs through a
@@ -684,7 +1144,7 @@ fun fn_mir(e: *Emit, ix: u32) *mir.MirFunction {
 # e:   the emission state
 # ret: true on success, or a precise error string
 fun declare_interface(e: *Emit) R.Result[bool, str] {
-    val n: u32 = e.root.global_len;
+    val n: u32 = e.gl_len;
     if (n == 0) { ret R.ok[bool, str](true); }
 
     val rg: R.Result[*u32, str] = A.allocate[u32](e.alloc, n::usize);
@@ -709,7 +1169,8 @@ fun declare_interface(e: *Emit) R.Result[bool, str] {
 
     i = 0;
     for (i < n) {
-        val g: *ir.Global = ?e.root.globals[i];
+        val g: *ir.Global = gl_ir(e, i);
+        val gt: *type.IrTypeTable = gl_types(e, i);
         if (g.iface == ir.IFACE_NONE) { i = i + 1; cnt; }
 
         # a built-in declared at a type other than the one SPIR-V specifies for it is
@@ -721,7 +1182,7 @@ fun declare_interface(e: *Emit) R.Result[bool, str] {
         # attribute it to, and attributing it to `<unknown function>` would point a
         # reader away from the declaration that is the whole subject.
         if (g.iface == ir.IFACE_BUILTIN) {
-            val br: str = builtin_type_refusal(?e.root.types, e.alloc, g.iface_a, g.ty);
+            val br: str = builtin_type_refusal(gt, e.alloc, g.iface_a, g.ty);
             if (br != nil) { ret R.err[bool, str](br); }
         }
 
@@ -741,7 +1202,7 @@ fun declare_interface(e: *Emit) R.Result[bool, str] {
         # otherwise be emitted as an Input-class opaque variable, which no Vulkan
         # environment accepts, and a `#[sampler]` of an ordinary type as a
         # UniformConstant block, which is a different descriptor entirely (#2794).
-        val handle: bool = is_image_type(e, g.ty);
+        val handle: bool = is_image_type(e, gt, g.ty);
         if (handle && g.iface != ir.IFACE_SAMPLER) {
             ret R.err[bool, str]("spirv.emit: an image handle carries an interface role other than `#[sampler(set, binding)]`; a handle is bound as a descriptor and reaches no other storage class");
         }
@@ -755,11 +1216,11 @@ fun declare_interface(e: *Emit) R.Result[bool, str] {
             # rejects a bare scalar or vector in either class outright, so the mach
             # type has to be a record and the block layout is emitted with it. The two
             # differ in their LAYOUT rules, which `block_type` takes as its posture.
-            val ur: R.Result[u32, str] = block_type(e, g.ty, g.iface == ir.IFACE_STORAGE);
+            val ur: R.Result[u32, str] = block_type(e, gt, g.ty, g.iface == ir.IFACE_STORAGE);
             if (R.is_err[u32, str](ur)) { ret R.err[bool, str](R.unwrap_err[u32, str](ur)); }
             value_ty = R.unwrap_ok[u32, str](ur);
         }
-        or { value_ty = global_spv_type(e, g.ty); }
+        or { value_ty = global_spv_type(e, gt, g.ty); }
         if (value_ty == 0) {
             ret unsupported(e, "unsupported shader interface variable type in the SPIR-V target");
         }
@@ -782,6 +1243,13 @@ fun declare_interface(e: *Emit) R.Result[bool, str] {
             || g.iface == ir.IFACE_SAMPLER) {
             decorate(e, var_id, spirv.DECOR_DESCRIPTOR_SET, g.iface_a);
             decorate(e, var_id, spirv.DECOR_BINDING, g.iface_b);
+        }
+        # a storage buffer no body in the module stores through is NonWritable, which
+        # is what lets a vertex or geometry stage read it without
+        # `vertexPipelineStoresAndAtomics` (#2879). A uniform is read-only by its
+        # storage class and needs nothing said, and a sampler is not memory at all.
+        if (g.iface == ir.IFACE_STORAGE && !gl_written(e, i)) {
+            decorate_bare(e, var_id, spirv.DECOR_NON_WRITABLE);
         }
         # EVERY global an entry point statically uses belongs in its interface list,
         # of any storage class. That is a SPIR-V 1.4 change from the 1.3 rule of
@@ -808,8 +1276,8 @@ fun declare_interface(e: *Emit) R.Result[bool, str] {
 # e:   the emission state
 # id:  the IR type of the uniform global
 # ret: the OpTypeStruct id, or a precise error string
-fun block_type(e: *Emit, id: type.IrTypeId, relaxed_stride: bool) R.Result[u32, str] {
-    val opt: O.Option[*type.IrType] = type.get(?e.root.types, id);
+fun block_type(e: *Emit, gt: *type.IrTypeTable, id: type.IrTypeId, relaxed_stride: bool) R.Result[u32, str] {
+    val opt: O.Option[*type.IrType] = type.get(gt, id);
     if (O.is_none[*type.IrType](opt)) { ret R.err[u32, str]("spirv.emit: uniform global has no IR type"); }
     val t: *type.IrType = O.unwrap[*type.IrType](opt);
     if (t.kind != type.IRT_STRUCT) {
@@ -820,7 +1288,7 @@ fun block_type(e: *Emit, id: type.IrTypeId, relaxed_stride: bool) R.Result[u32, 
         ret R.err[u32, str]("a `#[uniform(...)]` / `#[storage(...)]` block must have between 1 and 16 fields");
     }
 
-    val sr: R.Result[u32, str] = laid_out_struct(e, id, relaxed_stride);
+    val sr: R.Result[u32, str] = laid_out_struct(e, gt, id, relaxed_stride);
     if (R.is_err[u32, str](sr)) { ret sr; }
     val struct_id: u32 = R.unwrap_ok[u32, str](sr);
 
@@ -838,8 +1306,8 @@ fun block_type(e: *Emit, id: type.IrTypeId, relaxed_stride: bool) R.Result[u32, 
 # e:   the emission state
 # id:  the IR struct type
 # ret: the OpTypeStruct id, or a precise error string
-fun laid_out_struct(e: *Emit, id: type.IrTypeId, relaxed_stride: bool) R.Result[u32, str] {
-    val opt: O.Option[*type.IrType] = type.get(?e.root.types, id);
+fun laid_out_struct(e: *Emit, gt: *type.IrTypeTable, id: type.IrTypeId, relaxed_stride: bool) R.Result[u32, str] {
+    val opt: O.Option[*type.IrType] = type.get(gt, id);
     if (O.is_none[*type.IrType](opt)) { ret R.err[u32, str]("spirv.emit: uniform block member has no IR type"); }
     val t: *type.IrType = O.unwrap[*type.IrType](opt);
     val n: u32 = t.data.struct_.field_count;
@@ -850,7 +1318,7 @@ fun laid_out_struct(e: *Emit, id: type.IrTypeId, relaxed_stride: bool) R.Result[
     var members: [16]u32;
     var i: u32 = 0;
     for (i < n) {
-        val mr: R.Result[u32, str] = laid_out_type(e, t.data.struct_.fields[i], relaxed_stride);
+        val mr: R.Result[u32, str] = laid_out_type(e, gt, t.data.struct_.fields[i], relaxed_stride);
         if (R.is_err[u32, str](mr)) { ret mr; }
         members[i] = R.unwrap_ok[u32, str](mr);
         i = i + 1;
@@ -859,7 +1327,7 @@ fun laid_out_struct(e: *Emit, id: type.IrTypeId, relaxed_stride: bool) R.Result[
     # the offsets about to be decorated are mach's own, so they are checked against
     # the layout Vulkan requires BEFORE they are emitted, and a block whose members
     # disagree is refused rather than given a plausible wrong offset (#2746).
-    val lr: R.Result[bool, str] = check_block_layout(e, id, relaxed_stride);
+    val lr: R.Result[bool, str] = check_block_layout(e, gt, id, relaxed_stride);
     if (R.is_err[bool, str](lr)) { ret R.err[u32, str](R.unwrap_err[bool, str](lr)); }
     val struct_id: u32 = types.type_struct(e.tt, ?members[0], n, true);
     if (struct_id == 0) { ret R.err[u32, str]("spirv.emit: could not build a uniform block type"); }
@@ -868,7 +1336,7 @@ fun laid_out_struct(e: *Emit, id: type.IrTypeId, relaxed_stride: bool) R.Result[
     for (i < n) {
         var mops: [4]u32;
         mops[0] = struct_id; mops[1] = i; mops[2] = spirv.DECOR_OFFSET;
-        mops[3] = type.byte_offset(?e.root.types, id, i, e.tgt);
+        mops[3] = type.byte_offset(gt, id, i, e.tgt);
         spirv.inst(e.b, ?e.b.decorations, spirv.OP_MEMBER_DECORATE, ?mops[0], 4);
         i = i + 1;
     }
@@ -900,18 +1368,18 @@ fun laid_out_struct(e: *Emit, id: type.IrTypeId, relaxed_stride: bool) R.Result[
 # e:   the emission state
 # id:  the member's IR type
 # ret: the member type id, or a precise error string
-fun laid_out_type(e: *Emit, id: type.IrTypeId, relaxed_stride: bool) R.Result[u32, str] {
-    val opt: O.Option[*type.IrType] = type.get(?e.root.types, id);
+fun laid_out_type(e: *Emit, gt: *type.IrTypeTable, id: type.IrTypeId, relaxed_stride: bool) R.Result[u32, str] {
+    val opt: O.Option[*type.IrType] = type.get(gt, id);
     if (O.is_none[*type.IrType](opt)) { ret R.err[u32, str]("spirv.emit: uniform block member has no IR type"); }
     val t: *type.IrType = O.unwrap[*type.IrType](opt);
 
-    if (t.kind == type.IRT_STRUCT) { ret laid_out_struct(e, id, relaxed_stride); }
+    if (t.kind == type.IRT_STRUCT) { ret laid_out_struct(e, gt, id, relaxed_stride); }
 
     if (t.kind == type.IRT_ARRAY) {
-        val er: R.Result[u32, str] = laid_out_type(e, t.data.array_.element, relaxed_stride);
+        val er: R.Result[u32, str] = laid_out_type(e, gt, t.data.array_.element, relaxed_stride);
         if (R.is_err[u32, str](er)) { ret er; }
         val elem_ty: u32 = R.unwrap_ok[u32, str](er);
-        val stride: u32 = type.byte_size(?e.root.types, t.data.array_.element, e.tgt);
+        val stride: u32 = type.byte_size(gt, t.data.array_.element, e.tgt);
         # the emitted stride is mach's own element size, and the rule is that a
         # stride must be a multiple of the array's base alignment and no smaller
         # than what one element occupies. The two block classes differ only in that
@@ -919,7 +1387,7 @@ fun laid_out_type(e: *Emit, id: type.IrTypeId, relaxed_stride: bool) R.Result[u3
         # buffer does not (std430), which is why `[8]f32` is legal in one and not
         # the other. A disagreement is refused rather than repacked - repacking
         # would move the elements out from under a host writing by `$offset_of`.
-        val want: u32 = required_stride(e, t.data.array_.element, relaxed_stride);
+        val want: u32 = required_stride(e, gt, t.data.array_.element, relaxed_stride);
         if (want == 0) {
             ret R.err[u32, str]("unsupported uniform block member type in the SPIR-V target");
         }
@@ -940,7 +1408,7 @@ fun laid_out_type(e: *Emit, id: type.IrTypeId, relaxed_stride: bool) R.Result[u3
         ret R.ok[u32, str](arr_id);
     }
 
-    val mt: u32 = global_spv_type(e, id);
+    val mt: u32 = global_spv_type(e, gt, id);
     if (mt == 0) {
         ret R.err[u32, str]("unsupported uniform block member type in the SPIR-V target");
     }
@@ -997,8 +1465,8 @@ fun storage_hint(std430: bool) str {
 # id:     the member's IR type
 # std430: the storage-buffer posture, which drops the 16-byte roundings
 # ret:    the base alignment in bytes, or 0 for a type with no block layout
-fun std_base_align(e: *Emit, id: type.IrTypeId, std430: bool) u32 {
-    val opt: O.Option[*type.IrType] = type.get(?e.root.types, id);
+fun std_base_align(e: *Emit, gt: *type.IrTypeTable, id: type.IrTypeId, std430: bool) u32 {
+    val opt: O.Option[*type.IrType] = type.get(gt, id);
     if (O.is_none[*type.IrType](opt)) { ret 0; }
     val t: *type.IrType = O.unwrap[*type.IrType](opt);
 
@@ -1006,7 +1474,7 @@ fun std_base_align(e: *Emit, id: type.IrTypeId, std430: bool) u32 {
         var a: u32 = 1;
         var i: u32 = 0;
         for (i < t.data.struct_.field_count) {
-            val ma: u32 = std_base_align(e, t.data.struct_.fields[i], std430);
+            val ma: u32 = std_base_align(e, gt, t.data.struct_.fields[i], std430);
             if (ma == 0) { ret 0; }
             if (ma > a) { a = ma; }
             i = i + 1;
@@ -1015,18 +1483,18 @@ fun std_base_align(e: *Emit, id: type.IrTypeId, std430: bool) u32 {
         ret a;
     }
     if (t.kind == type.IRT_ARRAY) {
-        val ea: u32 = std_base_align(e, t.data.array_.element, std430);
+        val ea: u32 = std_base_align(e, gt, t.data.array_.element, std430);
         if (ea == 0) { ret 0; }
         if (!std430) { ret round_up_to(ea, 16); }
         ret ea;
     }
     if (t.kind == type.IRT_VECTOR) {
-        val lane: u32 = type.byte_size(?e.root.types, t.data.vector_.element, e.tgt);
+        val lane: u32 = type.byte_size(gt, t.data.vector_.element, e.tgt);
         if (t.data.vector_.lanes == 2) { ret 2 * lane; }
         ret 4 * lane;
     }
     if (t.kind == type.IRT_INT || t.kind == type.IRT_FLOAT) {
-        ret type.byte_size(?e.root.types, id, e.tgt);
+        ret type.byte_size(gt, id, e.tgt);
     }
     ret 0;
 }
@@ -1043,31 +1511,31 @@ fun std_base_align(e: *Emit, id: type.IrTypeId, std430: bool) u32 {
 # id:     the member's IR type
 # std430: the storage-buffer posture
 # ret:    the extent in bytes, or 0 for a type with no block layout
-fun std_extent(e: *Emit, id: type.IrTypeId, std430: bool) u32 {
-    val opt: O.Option[*type.IrType] = type.get(?e.root.types, id);
+fun std_extent(e: *Emit, gt: *type.IrTypeTable, id: type.IrTypeId, std430: bool) u32 {
+    val opt: O.Option[*type.IrType] = type.get(gt, id);
     if (O.is_none[*type.IrType](opt)) { ret 0; }
     val t: *type.IrType = O.unwrap[*type.IrType](opt);
 
     if (t.kind == type.IRT_STRUCT) {
-        val a: u32 = std_base_align(e, id, std430);
+        val a: u32 = std_base_align(e, gt, id, std430);
         if (a == 0) { ret 0; }
         var end: u32 = 0;
         var i: u32 = 0;
         for (i < t.data.struct_.field_count) {
-            val me: u32 = std_extent(e, t.data.struct_.fields[i], std430);
+            val me: u32 = std_extent(e, gt, t.data.struct_.fields[i], std430);
             if (me == 0) { ret 0; }
-            val moff: u32 = type.byte_offset(?e.root.types, id, i, e.tgt);
+            val moff: u32 = type.byte_offset(gt, id, i, e.tgt);
             if (moff + me > end) { end = moff + me; }
             i = i + 1;
         }
         ret round_up_to(end, a);
     }
     if (t.kind == type.IRT_ARRAY) {
-        val s: u32 = required_stride(e, t.data.array_.element, std430);
+        val s: u32 = required_stride(e, gt, t.data.array_.element, std430);
         if (s == 0) { ret 0; }
         ret s * t.data.array_.count;
     }
-    ret type.byte_size(?e.root.types, id, e.tgt);
+    ret type.byte_size(gt, id, e.tgt);
 }
 
 # the array stride SPIR-V's explicit layout rules require for an element type
@@ -1079,11 +1547,11 @@ fun std_extent(e: *Emit, id: type.IrTypeId, std430: bool) u32 {
 # elem:   the element's IR type
 # std430: the storage-buffer posture
 # ret:    the required stride in bytes, or 0 for a type with no block layout
-fun required_stride(e: *Emit, elem: type.IrTypeId, std430: bool) u32 {
-    var a: u32 = std_base_align(e, elem, std430);
+fun required_stride(e: *Emit, gt: *type.IrTypeTable, elem: type.IrTypeId, std430: bool) u32 {
+    var a: u32 = std_base_align(e, gt, elem, std430);
     if (a == 0) { ret 0; }
     if (!std430) { a = round_up_to(a, 16); }
-    val ext: u32 = std_extent(e, elem, std430);
+    val ext: u32 = std_extent(e, gt, elem, std430);
     if (ext == 0) { ret 0; }
     ret round_up_to(ext, a);
 }
@@ -1102,8 +1570,8 @@ fun required_stride(e: *Emit, elem: type.IrTypeId, std430: bool) u32 {
 # id:     the IR struct type
 # std430: the storage-buffer posture
 # ret:    true when the offsets conform, or a diagnostic naming the member and rule
-fun check_block_layout(e: *Emit, id: type.IrTypeId, std430: bool) R.Result[bool, str] {
-    val opt: O.Option[*type.IrType] = type.get(?e.root.types, id);
+fun check_block_layout(e: *Emit, gt: *type.IrTypeTable, id: type.IrTypeId, std430: bool) R.Result[bool, str] {
+    val opt: O.Option[*type.IrType] = type.get(gt, id);
     if (O.is_none[*type.IrType](opt)) { ret R.ok[bool, str](true); }
     val t: *type.IrType = O.unwrap[*type.IrType](opt);
 
@@ -1111,11 +1579,11 @@ fun check_block_layout(e: *Emit, id: type.IrTypeId, std430: bool) R.Result[bool,
     var i: u32 = 0;
     for (i < t.data.struct_.field_count) {
         val fty: type.IrTypeId = t.data.struct_.fields[i];
-        val a: u32 = std_base_align(e, fty, std430);
+        val a: u32 = std_base_align(e, gt, fty, std430);
         # a member with no block layout at all is refused by `laid_out_type`, which
         # names the type; there is nothing to add here.
         if (a == 0) { i = i + 1; cnt; }
-        val off: u32 = type.byte_offset(?e.root.types, id, i, e.tgt);
+        val off: u32 = type.byte_offset(gt, id, i, e.tgt);
 
         if ((off % a) != 0 || off < prev_end) {
             var want: u32 = round_up_to(prev_end, a);
@@ -1124,10 +1592,10 @@ fun check_block_layout(e: *Emit, id: type.IrTypeId, std430: bool) R.Result[bool,
             # told which: a misaligned member is the member's own base alignment, and
             # an overlapping one is the member before it occupying more of the block
             # than mach's layout gives it.
-            ret R.err[bool, str](layout_refusal(e, std430, i, fty, off, want, a,
+            ret R.err[bool, str](layout_refusal(e, gt, std430, i, fty, off, want, a,
                                                 off < prev_end, prev_end));
         }
-        val ext: u32 = std_extent(e, fty, std430);
+        val ext: u32 = std_extent(e, gt, fty, std430);
         if (ext == 0) { i = i + 1; cnt; }
         prev_end = off + ext;
         i = i + 1;
@@ -1147,7 +1615,7 @@ fun check_block_layout(e: *Emit, id: type.IrTypeId, std430: bool) R.Result[bool,
 # overlaps: whether the member starts inside the one before it
 # prev_end: where the member before it ends under those rules
 # ret:      the composed diagnostic
-fun layout_refusal(e: *Emit, std430: bool, ix: u32, fty: type.IrTypeId, off: u32,
+fun layout_refusal(e: *Emit, gt: *type.IrTypeTable, std430: bool, ix: u32, fty: type.IrTypeId, off: u32,
                    want: u32, align: u32, overlaps: bool, prev_end: u32) str {
     var why: str = nil;
     if (overlaps) {
@@ -1168,7 +1636,7 @@ fun layout_refusal(e: *Emit, std430: bool, ix: u32, fty: type.IrTypeId, off: u32
 
     val r: R.Result[str, str] = format.sprint(e.alloc,
         "member {} of this `{}` block, a {}, is placed at offset {} by mach's layout and the SPIR-V block layout rules require offset {}: {}. the offsets are the host's contract, so this is refused rather than repacked - repacking would move the members out from under a host writing by `$offset_of`. pad the block explicitly so the member lands where the rules put it, or promote a nested record's members into the block{}",
-        ix, block_role(std430), ir_type_spelling(?e.root.types, e.alloc, fty), off, want,
+        ix, block_role(std430), ir_type_spelling(gt, e.alloc, fty), off, want,
         why, storage_hint(std430));
     if (R.is_err[str, str](r)) {
         ret "a member of this block is placed at an offset the SPIR-V block layout rules do not allow";
@@ -1277,12 +1745,9 @@ fun uses_iface(e: *Emit, fn_ix: u32, slot: u32) bool {
 # ret:  slot + 1, or 0 when the name is not entry-point interface
 fun iface_slot_of(e: *Emit, name: intern.StrId) u32 {
     if (e.gslot == nil) { ret 0; }
-    var i: u32 = 0;
-    for (i < e.root.global_len) {
-        if (e.root.globals[i].name == name) { ret e.gslot[i]; }
-        i = i + 1;
-    }
-    ret 0;
+    val gx: u32 = gl_lookup(e, name);
+    if (gx == GL_NONE) { ret 0; }
+    ret e.gslot[gx];
 }
 
 # refuse a cycle in the module's static call graph
@@ -1433,12 +1898,22 @@ fun cycle_refusal(e: *Emit, path: *u32, depth: u32, closes: u32) str {
 # A Location is written by the author and emitted verbatim, but mach knows each
 # variable's type and so knows how many locations it consumes; two that overlap
 # within one stage are refused here rather than left to a validator message naming
-# an `OpEntryPoint` operand index.
+# an `OpEntryPoint` operand index. A descriptor `(set, binding)` pair claimed twice
+# is refused on the same footing.
+#
+# WHY THE COLLISION RULES MATTER MORE ONCE GLOBALS CROSS MODULES (#2843). Within
+# one module two variables at the same location, or the same `(set, binding)`, are
+# a typo an author can see. Across modules they are neither: two shared libraries
+# can each declare `#[uniform(0, 0)]` without either author ever seeing the other,
+# and the shader that imports both is where the conflict first exists. So the
+# checks run over the DRAWN-IN set rather than the root's globals, and each
+# diagnostic names the declaring MODULE - a message naming two `camera`s tells the
+# one person who can act on it nothing about where either lives.
 # ---
 # e:   the emission state
 # ret: true on success, or a diagnostic naming the variables that collide
 fun check_stage_interfaces(e: *Emit) R.Result[bool, str] {
-    val n: u32 = e.root.global_len;
+    val n: u32 = e.gl_len;
     if (e.iface_len == 0 || n == 0) { ret R.ok[bool, str](true); }
 
     val rf: R.Result[*u8, str] = A.allocate[u8](e.alloc, n::usize);
@@ -1458,7 +1933,8 @@ fun check_stage_interfaces(e: *Emit) R.Result[bool, str] {
         i = 0;
         for (i < n) {
             if (e.gslot[i] == 0 || !uses_iface(e, fx, e.gslot[i] - 1)) { i = i + 1; cnt; }
-            if (e.gstorage[i] == spirv.STORAGE_INPUT && needs_flat(?e.root.types, e.root.globals[i].ty)) {
+            val gi: *ir.Global = gl_ir(e, i);
+            if (e.gstorage[i] == spirv.STORAGE_INPUT && needs_flat(gl_types(e, i), gi.ty)) {
                 if (fn.stage == ir.STAGE_FRAGMENT) { flat[i] = flat[i] | 1; }
                 or (fn.stage == ir.STAGE_VERTEX)   { flat[i] = flat[i] | 2; }
                 if (flat[i] == 3) {
@@ -1468,9 +1944,15 @@ fun check_stage_interfaces(e: *Emit) R.Result[bool, str] {
             }
             # a Location collision is only a collision within one direction: an input
             # at location 0 and an output at location 0 are two different spaces.
-            if (e.root.globals[i].iface == ir.IFACE_INPUT
-                || e.root.globals[i].iface == ir.IFACE_OUTPUT) {
+            if (gi.iface == ir.IFACE_INPUT || gi.iface == ir.IFACE_OUTPUT) {
                 msg = location_overlap(e, fx, i);
+                if (msg != nil) { i = n; cnt; }
+            }
+            # a descriptor pair is a claim on the pipeline layout, and two variables
+            # claiming one is a binding the host can satisfy for only one of them.
+            if (gi.iface == ir.IFACE_UNIFORM || gi.iface == ir.IFACE_STORAGE
+                || gi.iface == ir.IFACE_SAMPLER) {
+                msg = descriptor_overlap(e, fx, i);
                 if (msg != nil) { i = n; cnt; }
             }
             i = i + 1;
@@ -1481,7 +1963,7 @@ fun check_stage_interfaces(e: *Emit) R.Result[bool, str] {
     if (msg == nil) {
         i = 0;
         for (i < n) {
-            if ((flat[i] & 1) != 0) { decorate_flat(e, e.gvar_ids[i]); }
+            if ((flat[i] & 1) != 0) { decorate_bare(e, e.gvar_ids[i], spirv.DECOR_FLAT); }
             i = i + 1;
         }
     }
@@ -1494,13 +1976,13 @@ fun check_stage_interfaces(e: *Emit) R.Result[bool, str] {
 # and that cannot be decorated to satisfy both
 # ---
 # e:  the emission state
-# gi: the IR global index
+# gi: the global-table index
 # ret: the composed diagnostic
 fun flat_conflict(e: *Emit, gi: u32) str {
-    val g: *ir.Global = ?e.root.globals[gi];
+    val g: *ir.Global = gl_ir(e, gi);
     val r: R.Result[str, str] = format.sprint(e.alloc,
-        "this `#[input({})]` variable, {}, is read by a vertex stage and by a fragment stage, and no SPIR-V module serves both: a fragment stage's integer or 64-bit input MUST carry a Flat decoration because such a value cannot be interpolated, and a vertex stage's input must NOT carry one. declare two variables. the two are different things anyway - a vertex stage's input is a vertex attribute, and a fragment stage's is the interpolated output of the stage before it",
-        g.iface_a, ir_type_spelling(?e.root.types, e.alloc, g.ty));
+        "this `#[input({})]` variable, {}{}, is read by a vertex stage and by a fragment stage, and no SPIR-V module serves both: a fragment stage's integer or 64-bit input MUST carry a Flat decoration because such a value cannot be interpolated, and a vertex stage's input must NOT carry one. declare two variables. the two are different things anyway - a vertex stage's input is a vertex attribute, and a fragment stage's is the interpolated output of the stage before it",
+        g.iface_a, ir_type_spelling(gl_types(e, gi), e.alloc, g.ty), gl_mod_prefix(e, gi));
     if (R.is_err[str, str](r)) {
         ret "an integer or 64-bit `#[input(...)]` cannot be read by a vertex stage and a fragment stage at once: the fragment stage requires a Flat decoration and the vertex stage forbids one";
     }
@@ -1516,30 +1998,33 @@ fun flat_conflict(e: *Emit, gi: u32) str {
 # ---
 # e:  the emission state
 # fx: the entry point's unit function-table index
-# gi: the global being placed
+# gi: the global-table index of the variable being placed
 # ret: nil when the span is free, or the composed diagnostic
 fun location_overlap(e: *Emit, fx: u32, gi: u32) str {
-    val g: *ir.Global = ?e.root.globals[gi];
+    val g: *ir.Global = gl_ir(e, gi);
     val lo: u32 = g.iface_a;
-    val span: u32 = location_span(e, g.ty);
+    val span: u32 = location_span(e, gl_types(e, gi), g.ty);
     var j: u32 = 0;
     for (j < gi) {
-        val o: *ir.Global = ?e.root.globals[j];
+        val o: *ir.Global = gl_ir(e, j);
         if (o.iface != g.iface) { j = j + 1; cnt; }
         if (e.gslot[j] == 0 || !uses_iface(e, fx, e.gslot[j] - 1)) { j = j + 1; cnt; }
         val olo: u32 = o.iface_a;
-        val ospan: u32 = location_span(e, o.ty);
+        val ospan: u32 = location_span(e, gl_types(e, j), o.ty);
         if (lo < olo + ospan && olo < lo + span) {
             var what: str = "input";
             if (g.iface == ir.IFACE_OUTPUT) { what = "output"; }
             # named by the decorator the author wrote rather than by the variable's
             # symbol: IR keeps a global's mangled linkage name and no source
-            # spelling, and a mangled name in a diagnostic points nowhere.
+            # spelling, and a mangled name in a diagnostic points nowhere. the
+            # declaring MODULE is appended when it is not this one, which is the
+            # only thing that separates two drawn-in variables (#2843).
             val fr: R.Result[str, str] = format.sprint(e.alloc,
-                "two `#[{}(...)]` variables overlap in the stage `{}`: `#[{}({})]`, {}, occupies {} location(s) and so runs through location {}, and `#[{}({})]`, {}, starts inside it. a type wider than one location consumes the ones that follow it, so the numbers an author writes have to leave room for the type",
+                "two `#[{}(...)]` variables overlap in the stage `{}`: `#[{}({})]`, {}{}, occupies {} location(s) and so runs through location {}, and `#[{}({})]`, {}{}, starts inside it. a type wider than one location consumes the ones that follow it, so the numbers an author writes have to leave room for the type",
                 what, ir_fn_spelling(e, fx), what, olo,
-                ir_type_spelling(?e.root.types, e.alloc, o.ty), ospan, olo + ospan - 1,
-                what, lo, ir_type_spelling(?e.root.types, e.alloc, g.ty));
+                ir_type_spelling(gl_types(e, j), e.alloc, o.ty), gl_mod_prefix(e, j),
+                ospan, olo + ospan - 1,
+                what, lo, ir_type_spelling(gl_types(e, gi), e.alloc, g.ty), gl_mod_prefix(e, gi));
             if (R.is_err[str, str](fr)) {
                 ret "two shader interface variables occupy the same location: a type wider than one location consumes the ones that follow it";
             }
@@ -1548,6 +2033,60 @@ fun location_overlap(e: *Emit, fx: u32, gi: u32) str {
         j = j + 1;
     }
     ret nil;
+}
+
+# the diagnostic for a descriptor `(set, binding)` an earlier variable already
+# claims, or nil
+#
+# The same shape as `location_overlap` and for the same reason, over the other
+# namespace a shader binds: a descriptor pair names a slot in the pipeline layout,
+# and a host binds one resource to it. Two variables claiming one pair is not a
+# module a consumer can satisfy - whichever it binds, the other reads the wrong
+# resource - so it is refused rather than emitted for a validator to accept.
+#
+# `spirv-val` does NOT catch this. A module with two variables at the same
+# `(set, binding)` is well-formed SPIR-V; the conflict is with the pipeline layout,
+# which lives outside the module entirely. So this is one of the checks that has to
+# be here or nowhere.
+#
+# UNLIKE a Location, the pair is compared across the interface roles rather than
+# within one: a `#[uniform(0, 0)]` and a `#[storage(0, 0)]` are two descriptor types
+# claiming one slot, which is the same conflict, not two spaces.
+# ---
+# e:  the emission state
+# fx: the entry point's unit function-table index
+# gi: the global-table index of the variable being placed
+# ret: nil when the pair is free, or the composed diagnostic
+fun descriptor_overlap(e: *Emit, fx: u32, gi: u32) str {
+    val g: *ir.Global = gl_ir(e, gi);
+    var j: u32 = 0;
+    for (j < gi) {
+        val o: *ir.Global = gl_ir(e, j);
+        if (o.iface != ir.IFACE_UNIFORM && o.iface != ir.IFACE_STORAGE
+            && o.iface != ir.IFACE_SAMPLER) { j = j + 1; cnt; }
+        if (e.gslot[j] == 0 || !uses_iface(e, fx, e.gslot[j] - 1)) { j = j + 1; cnt; }
+        if (o.iface_a != g.iface_a || o.iface_b != g.iface_b) { j = j + 1; cnt; }
+        val fr: R.Result[str, str] = format.sprint(e.alloc,
+            "two descriptor-bound variables claim the same `(set = {}, binding = {})` in the stage `{}`: `{}`, {}{}, and `{}`, {}{}. a host binds one resource to a descriptor slot, so a pipeline layout can satisfy only one of them and the other would read whatever the first was bound to. give them different bindings",
+            g.iface_a, g.iface_b, ir_fn_spelling(e, fx),
+            descriptor_role(o.iface), ir_type_spelling(gl_types(e, j), e.alloc, o.ty), gl_mod_prefix(e, j),
+            descriptor_role(g.iface), ir_type_spelling(gl_types(e, gi), e.alloc, g.ty), gl_mod_prefix(e, gi));
+        if (R.is_err[str, str](fr)) {
+            ret "two descriptor-bound variables claim the same descriptor set and binding: a pipeline layout can satisfy only one of them";
+        }
+        ret R.unwrap_ok[str, str](fr);
+    }
+    ret nil;
+}
+
+# the decorator an author wrote for one descriptor-bound interface role
+# ---
+# iface: the IR interface role
+# ret:   the decorator's spelling
+fun descriptor_role(iface: u8) str {
+    if (iface == ir.IFACE_STORAGE) { ret "#[storage(...)]"; }
+    if (iface == ir.IFACE_SAMPLER) { ret "#[sampler(...)]"; }
+    ret "#[uniform(...)]";
 }
 
 # how many interface locations a type consumes
@@ -1561,26 +2100,26 @@ fun location_overlap(e: *Emit, fx: u32, gi: u32) str {
 # e:  the emission state
 # id: the interface variable's IR type
 # ret: the number of locations, at least 1
-fun location_span(e: *Emit, id: type.IrTypeId) u32 {
-    val opt: O.Option[*type.IrType] = type.get(?e.root.types, id);
+fun location_span(e: *Emit, gt: *type.IrTypeTable, id: type.IrTypeId) u32 {
+    val opt: O.Option[*type.IrType] = type.get(gt, id);
     if (O.is_none[*type.IrType](opt)) { ret 1; }
     val t: *type.IrType = O.unwrap[*type.IrType](opt);
     if (t.kind == type.IRT_STRUCT) {
         var total: u32 = 0;
         var i: u32 = 0;
         for (i < t.data.struct_.field_count) {
-            total = total + location_span(e, t.data.struct_.fields[i]);
+            total = total + location_span(e, gt, t.data.struct_.fields[i]);
             i = i + 1;
         }
         if (total == 0) { ret 1; }
         ret total;
     }
     if (t.kind == type.IRT_ARRAY) {
-        val es: u32 = location_span(e, t.data.array_.element);
+        val es: u32 = location_span(e, gt, t.data.array_.element);
         if (t.data.array_.count == 0) { ret 1; }
         ret es * t.data.array_.count;
     }
-    val bytes: u32 = type.byte_size(?e.root.types, id, e.tgt);
+    val bytes: u32 = type.byte_size(gt, id, e.tgt);
     if (bytes <= 16) { ret 1; }
     ret (bytes + 15) / 16;
 }
@@ -1603,13 +2142,14 @@ fun needs_flat(tt: *type.IrTypeTable, id: type.IrTypeId) bool {
     ret bits == 64;
 }
 
-# emit the operand-less OpDecorate Flat
+# emit an OpDecorate that carries no operand, such as Flat or NonWritable
 # ---
 # e:      the emission state
-# target: the variable id being decorated
-fun decorate_flat(e: *Emit, target: u32) {
+# target: the id being decorated
+# decor:  the decoration
+fun decorate_bare(e: *Emit, target: u32, decor: u32) {
     var ops: [2]u32;
-    ops[0] = target; ops[1] = spirv.DECOR_FLAT;
+    ops[0] = target; ops[1] = decor;
     spirv.inst(e.b, ?e.b.decorations, spirv.OP_DECORATE, ?ops[0], 2);
 }
 
@@ -1853,12 +2393,9 @@ fun builtin_storage(which: u32) u32 {
 # ret:  the OpVariable id, or 0
 fun global_var_id(e: *Emit, name: intern.StrId) u32 {
     if (e.gvar_ids == nil) { ret 0; }
-    var i: u32 = 0;
-    for (i < e.root.global_len) {
-        if (e.root.globals[i].name == name) { ret e.gvar_ids[i]; }
-        i = i + 1;
-    }
-    ret 0;
+    val gx: u32 = gl_lookup(e, name);
+    if (gx == GL_NONE) { ret 0; }
+    ret e.gvar_ids[gx];
 }
 
 # emit the module preamble: capabilities and the memory model
@@ -2080,11 +2617,8 @@ val ADDR_ALLOCA:  u8 = 2;  # a function-local allocation
 fun address_origin(e: *Emit, mf: *mir.MirFunction, op: *mir.MirOperand, out_ix: *u32) u8 {
     @out_ix = 0;
     if (op.kind == mir.MIR_OP_SYM) {
-        var i: u32 = 0;
-        for (i < e.root.global_len) {
-            if (e.root.globals[i].name == op.sym) { @out_ix = i; ret ADDR_GLOBAL; }
-            i = i + 1;
-        }
+        val gx: u32 = gl_lookup(e, op.sym);
+        if (gx != GL_NONE) { @out_ix = gx; ret ADDR_GLOBAL; }
         ret ADDR_UNKNOWN;
     }
     # a MEM operand's register base rides in `vreg`; a physical-register base leaves
@@ -2206,7 +2740,7 @@ fun emit_node(e: *Emit, mf: *mir.MirFunction, st: *cfg.Structure, ix: u32, is_en
     # position, valid for the whole function.
     var rg: Regs;
     var i: u32 = 0;
-    for (i < 16) { rg.val_id[i] = 0; rg.imm[i] = 0; rg.is_imm[i] = false; i = i + 1; }
+    for (i < 16) { rg.val_id[i] = 0; rg.imm[i] = 0; rg.is_imm[i] = false; rg.is_bool[i] = false; i = i + 1; }
     i = 0;
     for (i < param_count && i < 16) { rg.val_id[i] = param_ids[i]; i = i + 1; }
 
@@ -2298,7 +2832,7 @@ fun emit_terminator(e: *Emit, mf: *mir.MirFunction, st: *cfg.Structure, ix: u32,
         # the condition is materialized ahead of the merge declaration: SPIR-V wants
         # the merge instruction immediately before the branch it describes.
         val cond: u32 = read_condition(e, vm, preg_val, ?term.operands[0]);
-        if (cond == 0) { ret R.err[bool, str]("spirv.emit: unreadable branch condition"); }
+        if (cond == 0) { ret emit_fail(e, "spirv.emit: unreadable branch condition"); }
         emit_merge(e, st, ix, labels);
         var bc: [3]u32;
         bc[0] = cond;
@@ -2317,7 +2851,7 @@ fun emit_terminator(e: *Emit, mf: *mir.MirFunction, st: *cfg.Structure, ix: u32,
             ret R.ok[bool, str](true);
         }
         val rid: u32 = reg_value(e, preg_val, 0, ret_ty);
-        if (rid == 0) { ret R.err[bool, str]("spirv.emit: value return with no pre-colored result"); }
+        if (rid == 0) { ret emit_fail(e, "spirv.emit: value return with no pre-colored result"); }
         var rv: [1]u32;
         rv[0] = rid;
         spirv.inst(e.b, ?e.b.functions, spirv.OP_RETURN_VALUE, ?rv[0], 1);
@@ -2579,7 +3113,7 @@ fun build_vmaps(e: *Emit, mf: *mir.MirFunction, irfn: *ir.Function, out: *VMaps)
                 }
                 if (t != 0 && v < n && out.type_id[v] == 0) {
                     out.type_id[v] = t;
-                    out.is_bool[v] = false;
+                    out.is_bool[v] = types.type_is_bool(e.tt, t);
                 }
             }
             ei = ei + 1;
@@ -2729,7 +3263,7 @@ fun type_computed_defs(e: *Emit, mf: *mir.MirFunction, out: *VMaps, skip_copies:
                 val lt: u32 = interface_value_type(e, ?mi.operands[1]);
                 if (lv < out.n && out.type_id[lv] == 0 && lt != 0) {
                     out.type_id[lv] = lt;
-                    out.is_bool[lv] = false;
+                    out.is_bool[lv] = types.type_is_bool(e.tt, lt);
                     ii = ii + 1;
                     cnt;
                 }
@@ -2761,15 +3295,25 @@ fun type_computed_defs(e: *Emit, mf: *mir.MirFunction, out: *VMaps, skip_copies:
     ret R.ok[bool, str](true);
 }
 
-# whether an instruction is a register-to-register copy, whose destination type is
-# the source's rather than the move's width
+# whether an instruction is a copy, whose destination type is the copied value's
+# rather than the move's width
+#
+# AN IMMEDIATE SOURCE IS ONE TOO (#2919). A move's width is a register-machine
+# MATERIALIZATION convention, never the value's type: a phi merge's constant rides
+# the machine word because a sub-word register write leaves the upper bits
+# unspecified, which is a statement about a register file SPIR-V does not have.
+# Reading a type off it allocated an `i8` loop counter as a 64-bit variable while
+# every operation on it stayed 8 bits wide, so the module compared and added across
+# widths. The destination is typed by the value copied into it on the other edge
+# instead, and only falls back to the move's width when nothing else defines it.
 # ---
 # mi:  the instruction
-# ret: true for a move or declassify from a virtual or physical register
+# ret: true for a move or declassify from a register or an immediate
 fun is_reg_copy(mi: *mir.MirInstr) bool {
     if (mi.opcode != mir.MIR_MOV && mi.opcode != mir.MIR_DECLASSIFY) { ret false; }
     if (mi.operand_count != 2) { ret false; }
-    ret mi.operands[1].kind == mir.MIR_OP_VREG || mi.operands[1].kind == mir.MIR_OP_PREG;
+    ret mi.operands[1].kind == mir.MIR_OP_VREG || mi.operands[1].kind == mir.MIR_OP_PREG
+     || mi.operands[1].kind == mir.MIR_OP_IMM;
 }
 
 # carry types across register copies to a fixed point
@@ -2930,7 +3474,7 @@ fun spv_type_of(e: *Emit, tys: *type.IrTypeTable, id: type.IrTypeId) u32 {
         if (elem == 0) { ret 0; }
         ret types.type_array(e.tt, elem, t.data.array_.count, false);
     }
-    if (t.kind == type.IRT_IMAGE) { ret image_spv_type(e, t); }
+    if (t.kind == type.IRT_HANDLE) { ret handle_spv_type(e, tys, t); }
     if (t.kind == type.IRT_STRUCT) {
         val n: u32 = t.data.struct_.field_count;
         if (n == 0 || n > types.MAX_STRUCT_MEMBERS) { ret 0; }
@@ -2961,72 +3505,70 @@ fun ir_value_spv_type(e: *Emit, id: type.IrTypeId) u32 {
 # e:  the emission state
 # id: the IR type id, in the root's table
 # ret: the SPIR-V type id, or 0
-fun global_spv_type(e: *Emit, id: type.IrTypeId) u32 {
-    ret spv_type_of(e, ?e.root.types, id);
+fun global_spv_type(e: *Emit, gt: *type.IrTypeTable, id: type.IrTypeId) u32 {
+    ret spv_type_of(e, gt, id);
 }
 
-# the SPIR-V type an IR image handle names, declaring it on first use (#2794)
+# the SPIR-V type an IR handle names, declaring it on first use (#2888)
 #
-# EVERY OPERAND IS CARRIED ACROSS, none derived: the IR type holds the sampled
-# scalar, dimensionality, depth, arrayedness and multisampledness that `image_form`
-# read from the spelling, and each becomes the `OpTypeImage` operand of the same
-# name. That is what keeps a second dimensionality or an arrayed image a row rather
-# than a second lowering path - and what keeps a defaulted operand from producing a
-# module a validator accepts, describing a different image than the one declared.
+# THE CONSTRUCTOR TAG DECIDES, and the operands are read positionally off the row
+# this target published, never derived. That is what keeps a further constructor a
+# row in `defs` plus an arm here rather than a second lowering path, and what keeps
+# a defaulted operand from producing a module a validator accepts while describing
+# something the declaration never said.
 #
-# A bare sampler has no image behind it and is answered first; a combined handle is
-# the sampled-image wrapper over the image the same operands describe.
+# `sampled_image` takes the image it wraps as an operand, already lowered to an IR
+# type id, so the two cannot disagree about the image's own operands: there is only
+# one statement of them.
 # ---
-# e: the emission state
-# t: the IRT_IMAGE type
-# ret: the SPIR-V type id, or 0 when the sampled scalar has no SPIR-V form
-fun image_spv_type(e: *Emit, t: *type.IrType) u32 {
-    if (t.data.image_.form == semtype.IMG_FORM_SAMPLER) { ret types.type_sampler(e.tt); }
+# e:  the emission state
+# tys: the type table the operands index
+# t:  the IRT_HANDLE type
+# ret: the SPIR-V type id, or 0 when the handle names no type this target mints
+fun handle_spv_type(e: *Emit, tys: *type.IrTypeTable, t: *type.IrType) u32 {
+    val ctor: u32 = t.data.handle_.ctor;
+    val n:    u32 = t.data.handle_.count;
 
-    # `isampler2d` and `usampler2d` share one SPIR-V image type, and that is forced
-    # rather than sloppy: this emitter's integers are sign-less throughout, because
-    # SPIR-V puts signedness on the operation rather than on the type. A sample's
-    # result type must have the same component type as the image's sampled type, so
-    # minting a signed `OpTypeInt 32 1` here would disagree with the sign-less vector
-    # every integer result is typed at, and every integer sample would fail
-    # validation. The two spellings stay distinct mach types - which is what decides
-    # the result type a program declares - and agree on the descriptor.
-    var sampled: u32 = types.type_float(e.tt, 32);
-    if (t.data.image_.sampled == semtype.TYPE_I32 || t.data.image_.sampled == semtype.TYPE_U32) {
-        sampled = types.type_int(e.tt, 32);
+    if (ctor == defs.SPV_CTOR_SAMPLER) { ret types.type_sampler(e.tt); }
+
+    if (ctor == defs.SPV_CTOR_SAMPLED_IMAGE) {
+        if (n != 1) { ret 0; }
+        val img: u32 = spv_type_of(e, tys, t.data.handle_.operands[0]);
+        if (img == 0) { ret 0; }
+        ret types.type_sampled_image(e.tt, img);
     }
 
-    var depth: u32 = 0;
-    if (t.data.image_.depth) { depth = 1; }
-    var arrayed: u32 = 0;
-    if (t.data.image_.arrayed) { arrayed = 1; }
-    var ms: u32 = 0;
-    if (t.data.image_.ms) { ms = 1; }
+    if (ctor == defs.SPV_CTOR_IMAGE) {
+        if (n != defs.IMAGE_ARITY) { ret 0; }
+        ret types.type_image(e.tt,
+            texel_spv_type(e, t.data.handle_.operands[defs.IMAGE_OP_TEXEL]::u32),
+            t.data.handle_.operands[defs.IMAGE_OP_DIM]::u32,
+            t.data.handle_.operands[defs.IMAGE_OP_DEPTH]::u32,
+            t.data.handle_.operands[defs.IMAGE_OP_ARRAYED]::u32,
+            t.data.handle_.operands[defs.IMAGE_OP_MS]::u32,
+            t.data.handle_.operands[defs.IMAGE_OP_SAMPLED]::u32);
+    }
 
-    val img: u32 = types.type_image(e.tt, sampled, image_dim_operand(t.data.image_.dim),
-                                    depth, arrayed, ms, spirv.IMAGE_SAMPLED_YES);
-    if (img == 0) { ret 0; }
-    if (t.data.image_.form == semtype.IMG_FORM_SAMPLED) { ret types.type_sampled_image(e.tt, img); }
-    ret img;
+    ret 0;
 }
 
-# the SPIR-V `Dim` operand a mach dimensionality ordinal names
+# the SPIR-V type an image's texel-scalar operand names
 #
-# The ONE place the two numberings meet, and it lives here rather than in either
-# leaf: `type.IMG_DIM_*` is the front end's, so a dimensionality can be spelled and
-# refused without the front end depending on a back end, and the spec numbers are
-# `spirv`'s. Adding a dimensionality is a row here.
+# `TEXEL_I32` and `TEXEL_U32` share one SPIR-V type, and that is forced rather than
+# sloppy: this emitter's integers are sign-less throughout, because SPIR-V puts
+# signedness on the operation rather than on the type. A sample's result type must
+# have the same component type as the image's sampled type, so minting a signed
+# `OpTypeInt 32 1` here would disagree with the sign-less vector every integer
+# result is typed at, and every integer sample would fail validation. The two
+# operands stay distinct mach types - which is what decides the result type a
+# program declares - and agree on the descriptor.
 # ---
-# dim: the mach ordinal (a `semtype.ImageDim`)
-# ret: the SPIR-V Dim operand
-fun image_dim_operand(dim: u8) u32 {
-    if      (dim == semtype.IMG_DIM_1D)      { ret spirv.DIM_1D; }
-    or (dim == semtype.IMG_DIM_3D)           { ret spirv.DIM_3D; }
-    or (dim == semtype.IMG_DIM_CUBE)         { ret spirv.DIM_CUBE; }
-    or (dim == semtype.IMG_DIM_RECT)         { ret spirv.DIM_RECT; }
-    or (dim == semtype.IMG_DIM_BUFFER)       { ret spirv.DIM_BUFFER; }
-    or (dim == semtype.IMG_DIM_SUBPASS)      { ret spirv.DIM_SUBPASS_DATA; }
-    ret spirv.DIM_2D;
+# e:     the emission state
+# texel: the texel-scalar operand (defs.TEXEL_*)
+# ret:   the sampled type's SPIR-V id
+fun texel_spv_type(e: *Emit, texel: u32) u32 {
+    if (texel == defs.TEXEL_I32 || texel == defs.TEXEL_U32) { ret types.type_int(e.tt, 32); }
+    ret types.type_float(e.tt, 32);
 }
 
 # the SPIR-V return type of an IR function: void, or a scalar; 0 when unsupported
@@ -3057,6 +3599,9 @@ fun ir_return_spv_type(e: *Emit, irfn: *ir.Function, out_void: *bool) u32 {
 # The same sentinel `unit` uses, and deliberately the same value: `mir_index`
 # reports absence with it and this table stores that answer verbatim.
 val FN_NONE: u32 = unit.UNIT_NONE;
+
+# no global in the emission unit carries the requested name
+val GL_NONE: u32 = unit.UNIT_NONE;
 
 # the diagnostic for a value type the emitter cannot map, naming the mach type
 #
@@ -3100,14 +3645,20 @@ fun interface_target(e: *Emit, op: *mir.MirOperand) u32 {
 #
 # A member walk no longer arrives at all: MIR keeps the GEP's index list on this
 # target (#2649) and the emitter builds an `OpAccessChain` from it, so reading and
-# writing a block member is supported. What is left here is a whole-AGGREGATE copy,
-# which lowers to a byte copy rather than a value load or store, and addressed
-# memory with no interface variable behind it.
+# writing a block member is supported. What is left here is addressed memory with no
+# interface variable behind it, and an interface variable an address was COMPUTED
+# from rather than named.
 #
-# A scalar `f32` / `f64` interface variable used to have an arm here, because the
-# float address materialization was applied on every target and destroyed the
-# direct symbol reference. #2655 gated that on `MachineModel.flat_addressing`, so
-# those shapes reach the whole-variable path and never arrive here at all.
+# An aggregate interface variable is not one of those. A whole record or array
+# crosses to and from a descriptor-bound block as one value at its own type (#2922,
+# #2926), the same OpLoad / OpStore pair every other whole-object transfer on this
+# target is. A copy between two interface variables of DIFFERENT types is refused by
+# `emit_memcpy` under its own name, because the reason there is the type mismatch.
+#
+# An address materialization is a byte-space repair and is gated on
+# `MachineModel.flat_addressing` (#2655, #2926), so a scalar `f32` / `f64` interface
+# variable and an aggregate one in an argument or return position both reach the
+# whole-variable path and never arrive here at all.
 #
 # EVERY ORIGIN GETS ITS OWN ARM, including the two that are not globals (#2744). A
 # local slot reported under the module-scope sentence contradicts the program it is
@@ -3129,16 +3680,13 @@ fun addressed_memory_refusal(e: *Emit, mf: *mir.MirFunction, op: *mir.MirOperand
     if (origin != ADDR_GLOBAL) {
         ret "addressed memory is not yet supported by the SPIR-V target: this access reached the back end as a computed address with no object behind it that the emitter can name, and logical addressing has no general pointer to follow";
     }
-    val g: *ir.Global = ?e.root.globals[gix];
+    val g: *ir.Global = gl_ir(e, gix);
     if (g.iface == ir.IFACE_NONE) {
         ret "a plain module-scope variable is not reachable from the SPIR-V target: a shader has no general global storage, so a module-scope `val` / `var` reaches a stage only by carrying an interface role (`#[input]`, `#[output]`, `#[builtin]`, or `#[uniform]`)";
     }
-    if (is_aggregate_type(e, g.ty)) {
-        ret "copying a whole record or array to or from a shader interface variable is not supported by the SPIR-V target: an aggregate assignment lowers to a byte copy, which addresses the object rather than loading or storing a value of it. reading and writing its MEMBERS individually is supported, and is what a shader wants anyway - a whole-block copy would move the descriptor's contents rather than the values in it";
-    }
     val r: R.Result[str, str] = format.sprint(e.alloc,
-        "this shader interface variable carries a role and is not an aggregate, so it is reachable - but the access reached the back end as COMPUTED ADDRESSING rather than as a direct reference to the variable, which is the one shape the SPIR-V target can name. that is a lowering that ran where it should not have, not a limit of the declaration: the variable is {}",
-        ir_type_spelling(?e.root.types, e.alloc, g.ty));
+        "this shader interface variable carries a role, so it is reachable - but the access reached the back end as COMPUTED ADDRESSING rather than as a direct reference to the variable, which is the one shape the SPIR-V target can name. that is a lowering that ran where it should not have, not a limit of the declaration: the variable is {}",
+        ir_type_spelling(gl_types(e, gix), e.alloc, g.ty));
     if (R.is_err[str, str](r)) {
         ret "this shader interface variable is reachable only as a whole-variable read or write in the SPIR-V target";
     }
@@ -3149,23 +3697,11 @@ fun addressed_memory_refusal(e: *Emit, mf: *mir.MirFunction, op: *mir.MirOperand
 # ---
 # e:   the emission state
 # id:  the IR type id
-# ret: true for an IRT_IMAGE
-fun is_image_type(e: *Emit, id: type.IrTypeId) bool {
-    val opt: O.Option[*type.IrType] = type.get(?e.root.types, id);
+# ret: true for an IRT_HANDLE
+fun is_image_type(e: *Emit, gt: *type.IrTypeTable, id: type.IrTypeId) bool {
+    val opt: O.Option[*type.IrType] = type.get(gt, id);
     if (O.is_none[*type.IrType](opt)) { ret false; }
-    ret O.unwrap[*type.IrType](opt).kind == type.IRT_IMAGE;
-}
-
-# whether an IR type is an aggregate reached by indexing
-# ---
-# e:   the emission state
-# id:  the IR type id
-# ret: true for an array or a struct
-fun is_aggregate_type(e: *Emit, id: type.IrTypeId) bool {
-    val opt: O.Option[*type.IrType] = type.get(?e.root.types, id);
-    if (O.is_none[*type.IrType](opt)) { ret false; }
-    val k: type.IrTypeKind = O.unwrap[*type.IrType](opt).kind;
-    ret k == type.IRT_ARRAY || k == type.IRT_STRUCT;
+    ret O.unwrap[*type.IrType](opt).kind == type.IRT_HANDLE;
 }
 
 # emit an OpLoad of a shader interface variable
@@ -3185,7 +3721,7 @@ fun emit_global_load(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *Regs
     if (var_id == 0) { ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[1])); }
     val dst: u32 = mi.operands[0].vreg;
     if (dst >= vm.n || vm.type_id[dst] == 0) {
-        ret R.err[bool, str]("spirv.emit: interface load result vreg has no type");
+        ret emit_fail(e, "spirv.emit: interface load result vreg has no type");
     }
     # loading an opaque handle emits NOTHING HERE (#2794): the descriptor variable
     # is recorded on the vreg and each use re-loads from it, which puts the load in
@@ -3228,7 +3764,7 @@ fun emit_global_store(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *Reg
     }
     if (var_id == 0) { ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[0])); }
     val value: u32 = read_operand(e, vm, preg_val, ?mi.operands[1], value_ty);
-    if (e.b.err || value == 0) { ret R.err[bool, str]("spirv.emit: unreadable value in an interface store"); }
+    if (e.b.err || value == 0) { ret emit_fail(e, "spirv.emit: unreadable value in an interface store"); }
     var ops: [2]u32;
     ops[0] = var_id; ops[1] = value;
     spirv.inst(e.b, ?e.b.functions, spirv.OP_STORE, ?ops[0], 2);
@@ -3237,20 +3773,67 @@ fun emit_global_store(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *Reg
 
 # the SPIR-V type of the value an interface variable holds, or 0 when the operand
 # does not name one
+#
+# THE TYPE THE VARIABLE WAS DECLARED WITH, which for a descriptor-bound block is the
+# Block-decorated struct rather than the plain struct the same record has elsewhere.
+# An OpLoad's result type must equal its pointer's pointee type, so re-deriving the
+# type from the IR instead produces a module a validator rejects for a block and is
+# indistinguishable for everything else.
 # ---
 # e:   the emission state
 # op:  the address operand
 # ret: the value type id, or 0
 fun interface_value_type(e: *Emit, op: *mir.MirOperand) u32 {
     if (op.kind != mir.MIR_OP_SYM) { ret 0; }
-    var i: u32 = 0;
-    for (i < e.root.global_len) {
-        if (e.root.globals[i].name == op.sym && e.root.globals[i].iface != ir.IFACE_NONE) {
-            ret global_spv_type(e, e.root.globals[i].ty);
-        }
-        i = i + 1;
-    }
-    ret 0;
+    val gx: u32 = gl_lookup(e, op.sym);
+    if (gx == GL_NONE) { ret 0; }
+    val g: *ir.Global = gl_ir(e, gx);
+    if (g.iface == ir.IFACE_NONE) { ret 0; }
+    ret e.gtype_ids[gx];
+}
+
+# the SPIR-V type an interface variable's value takes in an argument / return
+# position, or 0 when the operand does not name one
+#
+# A position's type comes from the SIGNATURE, which is built from IR types, so it is
+# the plain undecorated type. It differs from the variable's own only for a
+# descriptor-bound block, and `whole_value_as` carries the value across.
+# ---
+# e:   the emission state
+# op:  the address operand
+# ret: the position's type id, or 0
+fun interface_position_type(e: *Emit, op: *mir.MirOperand) u32 {
+    if (op.kind != mir.MIR_OP_SYM) { ret 0; }
+    val gx: u32 = gl_lookup(e, op.sym);
+    if (gx == GL_NONE) { ret 0; }
+    val g: *ir.Global = gl_ir(e, gx);
+    if (g.iface == ir.IFACE_NONE) { ret 0; }
+    ret global_spv_type(e, gl_types(e, gx), g.ty);
+}
+
+# carry a whole value from one type to a logically matching one
+#
+# A value is reached at exactly one type, and a descriptor-bound block gives one
+# object two: the Block-decorated struct its storage is declared with, and the plain
+# struct the same record has in a signature and in a function-local. `OpCopyLogical`
+# is the operation defined for that crossing, and it is defined ONLY between
+# logically matching types - which is asked here rather than left to a validator, so
+# a genuine reinterpretation is refused by the caller with its own reason.
+# ---
+# e:       the emission state
+# value:   the value id to carry
+# from_ty: the type it currently has
+# to_ty:   the type wanted
+# ret:     the value id at `to_ty`, or 0 when the two do not match
+fun whole_value_as(e: *Emit, value: u32, from_ty: u32, to_ty: u32) u32 {
+    if (value == 0 || from_ty == 0 || to_ty == 0) { ret 0; }
+    if (from_ty == to_ty) { ret value; }
+    if (!types.logically_match(e.tt, from_ty, to_ty)) { ret 0; }
+    val res: u32 = spirv.alloc_id(e.b);
+    var ops: [3]u32;
+    ops[0] = to_ty; ops[1] = res; ops[2] = value;
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_COPY_LOGICAL, ?ops[0], 3);
+    ret res;
 }
 
 # emit an OpAccessChain for a structural GEP into a shader interface variable
@@ -3301,7 +3884,7 @@ fun emit_access_chain(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *Reg
         if (address_origin(e, mf, ?mi.operands[1], ?gix) != ADDR_GLOBAL) {
             ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[1]));
         }
-        val g: *ir.Global = ?e.root.globals[gix];
+        val g: *ir.Global = gl_ir(e, gix);
         if (g.iface == ir.IFACE_NONE || e.gvar_ids[gix] == 0) {
             ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[1]));
         }
@@ -3316,10 +3899,13 @@ fun emit_access_chain(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *Reg
     }
 
     val dst: u32 = mi.operands[0].vreg;
-    if (dst >= vm.n) { ret R.err[bool, str]("spirv.emit: access chain result vreg out of range"); }
+    if (dst >= vm.n) { ret emit_fail(e, "spirv.emit: access chain result vreg out of range"); }
 
     val count: u32 = mi.operand_count - 3;
-    if (count == 0 || count > 8) {
+    # a leading 0 and no member index names the object itself, so it is the flat
+    # form again with the index list spelled out rather than a chain into anything.
+    if (count == 0) { ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[1])); }
+    if (count > 8) {
         ret unsupported(e, "an access chain of more than 8 levels is not supported by the SPIR-V target");
     }
 
@@ -3349,7 +3935,7 @@ fun emit_access_chain(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *Reg
         }
         k = k + 1;
     }
-    if (e.b.err) { ret R.err[bool, str]("spirv.emit: unreadable index in an access chain"); }
+    if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable index in an access chain"); }
 
     val ptr_ty: u32 = types.type_ptr(e.tt, base_sc, cur);
     val result: u32 = spirv.alloc_id(e.b);
@@ -3407,7 +3993,7 @@ fun chain_storage(vm: *VMaps, op: *mir.MirOperand) u32 {
 # mi:  the MIR_MEMZERO instruction ([dst_mem, size])
 # ret: true on success, or a precise error string
 fun emit_memzero(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, mi: *mir.MirInstr) R.Result[bool, str] {
-    if (mi.operand_count < 1) { ret R.err[bool, str]("spirv.emit: memzero with no destination"); }
+    if (mi.operand_count < 1) { ret emit_fail(e, "spirv.emit: memzero with no destination"); }
     var target_ty: u32 = 0;
     var target: u32 = chain_target(vm, ?mi.operands[0], ?target_ty);
     if (target == 0) {
@@ -3420,6 +4006,160 @@ fun emit_memzero(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, mi: *mir.MirInstr) 
     var ops: [2]u32;
     ops[0] = target; ops[1] = types.const_null(e.tt, target_ty);
     spirv.inst(e.b, ?e.b.functions, spirv.OP_STORE, ?ops[0], 2);
+    ret R.ok[bool, str](true);
+}
+
+# emit the copy of a whole object as an OpLoad of its value followed by an OpStore
+#
+# `MIR_MEMCPY` survives to this target as a whole-object operation (#2911) rather
+# than being expanded into a run of word-sized load / store pairs, which is what
+# makes this expressible: logical addressing reaches an object as one value at one
+# type, and that is exactly what a load and a store of it are. EACH END IS REACHED AT
+# ITS OWN TYPE, which for a descriptor-bound block is the Block-decorated struct, and
+# `whole_value_as` carries the value between the two when they differ by layout
+# alone. A copy between types that do not match logically is a reinterpretation, and
+# there is no pointer to perform one through.
+#
+# The byte count rides along in operand 2 and is deliberately unused here. It sizes
+# the flat expansion and says nothing structural, so consulting it would reintroduce
+# the byte space this form exists to avoid.
+# ---
+# e:   the emission state
+# mf:  the MIR function
+# vm:  the per-vreg value maps
+# mi:  the MIR_MEMCPY instruction ([dst_mem, src_mem, size])
+# ret: true on success, or a precise error string
+fun emit_memcpy(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count < 2) { ret emit_fail(e, "spirv.emit: memcpy with no source or destination"); }
+
+    var dst_ty: u32 = 0;
+    var dst: u32 = chain_target(vm, ?mi.operands[0], ?dst_ty);
+    if (dst == 0) {
+        dst = interface_target(e, ?mi.operands[0]);
+        dst_ty = interface_value_type(e, ?mi.operands[0]);
+    }
+    if (dst == 0 || dst_ty == 0) { ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[0])); }
+
+    var src_ty: u32 = 0;
+    var src: u32 = chain_target(vm, ?mi.operands[1], ?src_ty);
+    if (src == 0) {
+        src = interface_target(e, ?mi.operands[1]);
+        src_ty = interface_value_type(e, ?mi.operands[1]);
+    }
+    if (src == 0 || src_ty == 0) { ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[1])); }
+
+    val value: u32 = spirv.alloc_id(e.b);
+    var lops: [3]u32;
+    lops[0] = src_ty; lops[1] = value; lops[2] = src;
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_LOAD, ?lops[0], 3);
+
+    val stored: u32 = whole_value_as(e, value, src_ty, dst_ty);
+    if (stored == 0) {
+        ret unsupported(e, "copying between two objects of different types is not supported by the SPIR-V target: logical addressing carries an object as a value of its own type, so a copy that reinterprets one type as another has no pointer to perform it through");
+    }
+
+    var sops: [2]u32;
+    sops[0] = dst; sops[1] = stored;
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_STORE, ?sops[0], 2);
+    ret R.ok[bool, str](true);
+}
+
+# emit the read of a whole object into an argument / return position, as one OpLoad
+#
+# `MIR_AGG_LOAD` is the calling-convention form of the same whole-object rule
+# `MIR_MEMCPY` carries for a store (#2914, #2915): the object reaches its position
+# as one value at its own type, which is what an `OpFunctionCall` argument and an
+# `OpReturnValue` both are. The position is the identity convention's nominal
+# register, so the loaded id is recorded there and the call or return that follows
+# in the same block reads it out.
+#
+# THE TYPE COMES FROM THE OBJECT, never from the instruction's width. That is the
+# whole reason the opcode exists rather than a wide `MIR_MOV`: a width field is a
+# byte count, an aggregate outgrows one, and a placement described in bytes is what
+# logical addressing cannot follow.
+# ---
+# e:        the emission state
+# mf:       the MIR function
+# vm:       the per-vreg value maps
+# preg_val: the identity convention's nominal register file
+# mi:       the MIR_AGG_LOAD instruction ([dst_preg, src_mem])
+# ret:      true on success, or a precise error string
+fun emit_agg_load(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count != 2 || mi.operands[0].kind != mir.MIR_OP_PREG) {
+        ret emit_fail(e, "spirv.emit: malformed whole-object load");
+    }
+    val pos: u32 = mi.operands[0].preg;
+    if (pos >= 16) { ret emit_fail(e, "spirv.emit: whole-object load into a position out of range"); }
+
+    var src_ty: u32 = 0;
+    var pos_ty: u32 = 0;
+    var src: u32 = chain_target(vm, ?mi.operands[1], ?src_ty);
+    pos_ty = src_ty;
+    if (src == 0) {
+        src = interface_target(e, ?mi.operands[1]);
+        src_ty = interface_value_type(e, ?mi.operands[1]);
+        pos_ty = interface_position_type(e, ?mi.operands[1]);
+    }
+    if (src == 0 || src_ty == 0) { ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[1])); }
+
+    val loaded: u32 = spirv.alloc_id(e.b);
+    var lops: [3]u32;
+    lops[0] = src_ty; lops[1] = loaded; lops[2] = src;
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_LOAD, ?lops[0], 3);
+
+    val value: u32 = whole_value_as(e, loaded, src_ty, pos_ty);
+    if (value == 0) {
+        ret unsupported(e, "this object cannot be handed to a call or a return by value in the SPIR-V target: the type it is stored at and the type its position takes describe different objects, so no whole value crosses between them");
+    }
+
+    preg_val.val_id[pos]  = value;
+    preg_val.is_imm[pos]  = false;
+    preg_val.is_bool[pos] = false;
+    ret R.ok[bool, str](true);
+}
+
+# emit the write of a whole object out of an argument / return position, as one
+# OpStore
+#
+# The store twin of `emit_agg_load`. The value is read at the POSITION's type and
+# written at the DESTINATION's, which are one type everywhere except a
+# descriptor-bound block, whose storage carries its layout decorations. An object is
+# reached at one type, so a transfer between types that do not match logically would
+# be a reinterpretation, and there is no pointer to perform one through.
+# ---
+# e:        the emission state
+# mf:       the MIR function
+# vm:       the per-vreg value maps
+# preg_val: the identity convention's nominal register file
+# mi:       the MIR_AGG_STORE instruction ([dst_mem, src_preg])
+# ret:      true on success, or a precise error string
+fun emit_agg_store(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count != 2 || mi.operands[1].kind != mir.MIR_OP_PREG) {
+        ret emit_fail(e, "spirv.emit: malformed whole-object store");
+    }
+
+    var dst_ty: u32 = 0;
+    var pos_ty: u32 = 0;
+    var dst: u32 = chain_target(vm, ?mi.operands[0], ?dst_ty);
+    pos_ty = dst_ty;
+    if (dst == 0) {
+        dst = interface_target(e, ?mi.operands[0]);
+        dst_ty = interface_value_type(e, ?mi.operands[0]);
+        pos_ty = interface_position_type(e, ?mi.operands[0]);
+    }
+    if (dst == 0 || dst_ty == 0) { ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[0])); }
+
+    val held: u32 = read_operand(e, vm, preg_val, ?mi.operands[1], pos_ty);
+    if (e.b.err || held == 0) { ret emit_fail(e, "spirv.emit: whole-object store with no value in its position"); }
+
+    val value: u32 = whole_value_as(e, held, pos_ty, dst_ty);
+    if (value == 0) {
+        ret unsupported(e, "this object cannot be written from a call or a return position in the SPIR-V target: the type its position takes and the type it is stored at describe different objects, so no whole value crosses between them");
+    }
+
+    var sops: [2]u32;
+    sops[0] = dst; sops[1] = value;
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_STORE, ?sops[0], 2);
     ret R.ok[bool, str](true);
 }
 
@@ -3449,6 +4189,25 @@ fun by_class(lane_float: bool, int_op: u32, float_op: u32) u32 {
 # msg: the feature description
 # ret: an err result carrying the located message
 fun unsupported(e: *Emit, msg: str) R.Result[bool, str] {
+    ret emit_fail(e, msg);
+}
+
+# raise an emitter INTERNAL error, located the same way a refusal is
+#
+# The same stamping, and it is not decoration: an internal inconsistency is still
+# ABOUT ONE INSTRUCTION, so a reader needs the opcode, the function and the position
+# exactly as much as they do for a declared refusal - more, because there is no
+# feature name to search for instead. `spirv.emit: unreadable move source` was the
+# whole of one such message, and it localized nothing at all (#2915).
+#
+# The split from `unsupported` is in what the CALLER is saying, not in what happens
+# here: one reports a form this target does not carry, the other reports that the
+# emitter was handed something it cannot make sense of. Both are located.
+# ---
+# e:   the emission state, carrying the function / instruction being emitted
+# msg: the error description
+# ret: an err result carrying the located message
+fun emit_fail(e: *Emit, msg: str) R.Result[bool, str] {
     ret R.err[bool, str](mir.instr_refusal(e.alloc, e.srcmap, refusal_fn_name(e),
                                            e.cur_instr, msg));
 }
@@ -3583,6 +4342,11 @@ fun emit_instr(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *Regs, mi: 
     # the allocation's variable was declared at the entry, where SPIR-V requires it.
     if (op == mir.MIR_ALLOCA) { ret R.ok[bool, str](true); }
     if (op == mir.MIR_MEMZERO) { ret emit_memzero(e, mf, vm, mi); }
+    if (op == mir.MIR_MEMCPY) { ret emit_memcpy(e, mf, vm, mi); }
+    # the calling convention's whole-object transfers: an aggregate reaches its
+    # argument / return position as one value, never as a run of chunks.
+    if (op == mir.MIR_AGG_LOAD)  { ret emit_agg_load(e, mf, vm, preg_val, mi); }
+    if (op == mir.MIR_AGG_STORE) { ret emit_agg_store(e, mf, vm, preg_val, mi); }
 
     ret unsupported(e, "instruction is not yet supported by the SPIR-V target");
 }
@@ -3614,7 +4378,7 @@ fun emit_instr(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *Regs, mi: 
 # mi:       the MIR_CALL instruction (operand 0 is the callee)
 # ret:      true on success, or a precise error string
 fun emit_call(e: *Emit, preg_val: *Regs, mi: *mir.MirInstr) R.Result[bool, str] {
-    if (mi.operand_count < 1) { ret R.err[bool, str]("spirv.emit: call with no callee operand"); }
+    if (mi.operand_count < 1) { ret emit_fail(e, "spirv.emit: call with no callee operand"); }
     val callee: *mir.MirOperand = ?mi.operands[0];
     if (callee.kind != mir.MIR_OP_SYM) {
         ret unsupported(e, "a call through a function pointer is not yet supported by the SPIR-V target");
@@ -3626,7 +4390,7 @@ fun emit_call(e: *Emit, preg_val: *Regs, mi: *mir.MirInstr) R.Result[bool, str] 
     # it is written in the bit manipulation a CPU needs, which logical addressing
     # refuses - so its declaration in the calling module is the whole answer.
     val xfn: *ir.Function = ir_function_record(e.ir, callee.sym);
-    if (xfn != nil && xfn.spv_set != spirvop.SPV_SET_NONE) {
+    if (xfn != nil && xfn.op_set != defs.SPV_SET_NONE) {
         ret emit_spirv_op(e, preg_val, xfn);
     }
     if (xfn != nil && xfn.is_import) {
@@ -3676,15 +4440,16 @@ fun emit_call(e: *Emit, preg_val: *Regs, mi: *mir.MirInstr) R.Result[bool, str] 
     i = 0;
     for (i < param_count) {
         val aid: u32 = reg_value(e, preg_val, i, argty[i]);
-        if (aid == 0) { ret R.err[bool, str]("spirv.emit: call argument with no pre-colored value"); }
+        if (aid == 0) { ret emit_fail(e, "spirv.emit: call argument with no pre-colored value"); }
         ops[3 + i] = aid;
         i = i + 1;
     }
     spirv.inst(e.b, ?e.b.functions, spirv.OP_FUNCTION_CALL, ?ops[0], total);
     # the return register, which the result move reads next.
     if (!returns_void) {
-        preg_val.val_id[0] = result;
-        preg_val.is_imm[0] = false;
+        preg_val.val_id[0]  = result;
+        preg_val.is_imm[0]  = false;
+        preg_val.is_bool[0] = types.type_is_bool(e.tt, ret_ty);
     }
     ret R.ok[bool, str](true);
 }
@@ -3768,16 +4533,16 @@ fun unresolved_call_refusal(e: *Emit, name: intern.StrId, fx: u32) str {
 # ---
 # e:        the emission state
 # preg_val: the identity convention's nominal register file
-# fn:       the callee's IR function record, carrying spv_set / spv_op
+# fn:       the callee's IR function record, carrying op_set / op_code
 # ret:      true on success, or a precise error string
 fun emit_spirv_op(e: *Emit, preg_val: *Regs, fn: *ir.Function) R.Result[bool, str] {
     val sig_opt: O.Option[*type.IrType] = type.get(?e.ir.types, fn.sig);
     if (O.is_none[*type.IrType](sig_opt)) {
-        ret R.err[bool, str]("spirv.emit: a `spirv_op` callee has no signature type");
+        ret emit_fail(e, "spirv.emit: a `spirv_op` callee has no signature type");
     }
     val sig: *type.IrType = O.unwrap[*type.IrType](sig_opt);
     if (sig.kind != type.IRT_FN) {
-        ret R.err[bool, str]("spirv.emit: a `spirv_op` callee's signature is not a function type");
+        ret emit_fail(e, "spirv.emit: a `spirv_op` callee's signature is not a function type");
     }
     val argc: u32 = sig.data.fn.param_count;
     # 12 operands is past every instruction in the table (the widest is three) and
@@ -3801,32 +4566,33 @@ fun emit_spirv_op(e: *Emit, preg_val: *Regs, fn: *ir.Function) R.Result[bool, st
     ops[0] = ret_ty;
     val result: u32 = spirv.alloc_id(e.b);
     ops[1] = result;
-    if (fn.spv_set != spirvop.SPV_SET_CORE) {
-        val set_id: u32 = ext_set_id(e, fn.spv_set);
+    if (fn.op_set != defs.SPV_SET_CORE) {
+        val set_id: u32 = ext_set_id(e, fn.op_set);
         if (set_id == 0) {
-            ret R.err[bool, str]("spirv.emit: a `spirv_op` names an instruction set with no import name");
+            ret emit_fail(e, "spirv.emit: a `spirv_op` names an instruction set with no import name");
         }
         ops[2] = set_id;
-        ops[3] = fn.spv_op;
+        ops[3] = fn.op_code;
         base = 4;
     }
 
     var i: u32 = 0;
     for (i < argc) {
         val aid: u32 = reg_value(e, preg_val, i, ir_value_spv_type(e, sig.data.fn.params[i]));
-        if (aid == 0) { ret R.err[bool, str]("spirv.emit: `spirv_op` argument with no pre-colored value"); }
+        if (aid == 0) { ret emit_fail(e, "spirv.emit: `spirv_op` argument with no pre-colored value"); }
         ops[base + i] = aid;
         i = i + 1;
     }
 
     var opcode: u32 = spirv.OP_EXT_INST;
-    if (fn.spv_set == spirvop.SPV_SET_CORE) { opcode = fn.spv_op; }
+    if (fn.op_set == defs.SPV_SET_CORE) { opcode = fn.op_code; }
     spirv.inst(e.b, ?e.b.functions, opcode, ?ops[0], base + argc);
 
     # the return register, which the result move reads next - the same handoff a
     # real OpFunctionCall makes.
-    preg_val.val_id[0] = result;
-    preg_val.is_imm[0] = false;
+    preg_val.val_id[0]  = result;
+    preg_val.is_imm[0]  = false;
+    preg_val.is_bool[0] = types.type_is_bool(e.tt, ret_ty);
     ret R.ok[bool, str](true);
 }
 
@@ -3837,12 +4603,12 @@ fun emit_spirv_op(e: *Emit, preg_val: *Regs, fn: *ir.Function) R.Result[bool, st
 # import name, which is the core set and never reaches here.
 # ---
 # e:   the emission state
-# set: one of spirvop.SPV_SET_*
+# set: one of defs.SPV_SET_*
 # ret: the set's id, or 0
-fun ext_set_id(e: *Emit, set: u8) u32 {
-    if (set::u32 >= 8) { ret 0; }
-    if (e.ext_ids[set::u32] != 0) { ret e.ext_ids[set::u32]; }
-    val name: str = spirvop.set_import_name(set);
+fun ext_set_id(e: *Emit, set: u32) u32 {
+    if (set >= 8) { ret 0; }
+    if (e.ext_ids[set] != 0) { ret e.ext_ids[set]; }
+    val name: str = defs.set_import_name(set::u8);
     if (str_len(name) == 0::usize) { ret 0; }
     val id: u32 = spirv.ext_inst_import(e.b, name);
     e.ext_ids[set::u32] = id;
@@ -3932,6 +4698,41 @@ fun read_operand(e: *Emit, vm: *VMaps, preg_val: *Regs, op: *mir.MirOperand, wan
     ret 0;
 }
 
+# whether an operand is read at a type of its own, so a consumer's declared type
+# does not describe it
+#
+# A boolean vreg is NOT one: it has no numeric representation, so what it is read
+# as is whatever the consumer declares (#2749).
+# ---
+# vm:  the per-vreg value maps
+# op:  the operand
+# ret: true when the operand carries its own type
+fun operand_carries_type(vm: *VMaps, op: *mir.MirOperand) bool {
+    if (op.kind != mir.MIR_OP_VREG) { ret false; }
+    if (op.vreg >= vm.n || vm.type_id[op.vreg] == 0) { ret false; }
+    ret !vm.is_bool[op.vreg];
+}
+
+# refuse when a value operand's own type is not the one its position declares
+#
+# SPIR-V requires the operands and the result of an arithmetic, bitwise or
+# comparison instruction to share ONE type, and a vreg operand is loaded at the type
+# its variable was declared with rather than at the declared one - so the two
+# disagreeing is a module the validator rejects and this emitter would otherwise
+# write while reporting success (#2919). The check is here rather than in
+# `read_operand` because it is these positions, not every position, that SPIR-V
+# holds to one type: an access chain's index, for one, may legally be any integer
+# width.
+# ---
+# vm:   the per-vreg value maps
+# op:   the operand
+# want_ty: the type the position declares
+# ret:  true when the operand may be read at `want_ty`
+fun operand_matches_type(vm: *VMaps, op: *mir.MirOperand, want_ty: u32) bool {
+    if (!operand_carries_type(vm, op)) { ret true; }
+    ret vm.type_id[op.vreg] == want_ty;
+}
+
 # materialize a SPIR-V boolean as the 0/1 value of `want_ty`
 #
 # `OpSelect` rather than a conversion opcode: a boolean has no numeric representation
@@ -3990,7 +4791,7 @@ fun store_vreg(e: *Emit, vm: *VMaps, vreg: u32, value: u32) R.Result[bool, str] 
         ret R.ok[bool, str](true);
     }
     if (vreg >= vm.n || vm.var_id[vreg] == 0) {
-        ret R.err[bool, str]("spirv.emit: store to an undeclared vreg");
+        ret emit_fail(e, "spirv.emit: store to an undeclared vreg");
     }
     var so: [2]u32;
     so[0] = vm.var_id[vreg]; so[1] = value;
@@ -3998,7 +4799,7 @@ fun store_vreg(e: *Emit, vm: *VMaps, vreg: u32, value: u32) R.Result[bool, str] 
     ret R.ok[bool, str](true);
 }
 
-# emit a binary op `dst = a <spv_op> b`, both operands at the result's type
+# emit a binary op `dst = a <op_code> b`, both operands at the result's type
 #
 # Every binary MIR op this handles is same-type in all three positions (the shifts
 # included: a shift count is an integer of the shifted value's width by the time it
@@ -4008,49 +4809,53 @@ fun store_vreg(e: *Emit, vm: *VMaps, vreg: u32, value: u32) R.Result[bool, str] 
 # vm:     the per-vreg value maps
 # preg_val: the identity convention's nominal register file
 # mi:     the MIR instruction ([dst, a, b])
-# spv_op: the SPIR-V opcode
+# op_code: the SPIR-V opcode
 # ret:    true on success, or an error string
-fun emit_binary(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr, spv_op: u32) R.Result[bool, str] {
+fun emit_binary(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr, op_code: u32) R.Result[bool, str] {
     if (mi.operand_count != 3 || mi.operands[0].kind != mir.MIR_OP_VREG) {
-        ret R.err[bool, str]("spirv.emit: malformed binary instruction");
+        ret emit_fail(e, "spirv.emit: malformed binary instruction");
     }
     val dst: u32 = mi.operands[0].vreg;
-    if (dst >= vm.n) { ret R.err[bool, str]("spirv.emit: binary result vreg out of range"); }
+    if (dst >= vm.n) { ret emit_fail(e, "spirv.emit: binary result vreg out of range"); }
     val ty: u32 = vm.type_id[dst];
+    if (!operand_matches_type(vm, ?mi.operands[1], ty)
+     || !operand_matches_type(vm, ?mi.operands[2], ty)) {
+        ret emit_fail(e, "spirv.emit: binary instruction mixes operand types");
+    }
     val a: u32 = read_operand(e, vm, preg_val, ?mi.operands[1], ty);
     val b: u32 = read_operand(e, vm, preg_val, ?mi.operands[2], ty);
-    if (e.b.err) { ret R.err[bool, str]("spirv.emit: unreadable operand in binary instruction"); }
+    if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable operand in binary instruction"); }
     val result: u32 = spirv.alloc_id(e.b);
     var ops: [4]u32;
     ops[0] = vm.type_id[dst]; ops[1] = result; ops[2] = a; ops[3] = b;
-    spirv.inst(e.b, ?e.b.functions, spv_op, ?ops[0], 4);
+    spirv.inst(e.b, ?e.b.functions, op_code, ?ops[0], 4);
     ret store_vreg(e, vm, dst, result);
 }
 
-# emit a unary op `dst = <spv_op> a`, the operand at the result's type
+# emit a unary op `dst = <op_code> a`, the operand at the result's type
 # ---
 # e:      the emission state
 # vm:     the per-vreg value maps
 # preg_val: the identity convention's nominal register file
 # mi:     the MIR instruction ([dst, a])
-# spv_op: the SPIR-V opcode
+# op_code: the SPIR-V opcode
 # ret:    true on success, or an error string
-fun emit_unary(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr, spv_op: u32) R.Result[bool, str] {
+fun emit_unary(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr, op_code: u32) R.Result[bool, str] {
     if (mi.operand_count != 2 || mi.operands[0].kind != mir.MIR_OP_VREG) {
-        ret R.err[bool, str]("spirv.emit: malformed unary instruction");
+        ret emit_fail(e, "spirv.emit: malformed unary instruction");
     }
     val dst: u32 = mi.operands[0].vreg;
-    if (dst >= vm.n) { ret R.err[bool, str]("spirv.emit: unary result vreg out of range"); }
+    if (dst >= vm.n) { ret emit_fail(e, "spirv.emit: unary result vreg out of range"); }
     val a: u32 = read_operand(e, vm, preg_val, ?mi.operands[1], vm.type_id[dst]);
-    if (e.b.err) { ret R.err[bool, str]("spirv.emit: unreadable operand in unary instruction"); }
+    if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable operand in unary instruction"); }
     val result: u32 = spirv.alloc_id(e.b);
     var ops: [3]u32;
     ops[0] = vm.type_id[dst]; ops[1] = result; ops[2] = a;
-    spirv.inst(e.b, ?e.b.functions, spv_op, ?ops[0], 3);
+    spirv.inst(e.b, ?e.b.functions, op_code, ?ops[0], 3);
     ret store_vreg(e, vm, dst, result);
 }
 
-# emit an integer comparison `dst(bool) = a <spv_op> b`
+# emit an integer comparison `dst(bool) = a <op_code> b`
 #
 # The compared operands ride at the comparison width (`mi.width`), while the result
 # is a boolean stored into the destination's bool variable.
@@ -4059,15 +4864,19 @@ fun emit_unary(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr, spv_op:
 # vm:     the per-vreg value maps
 # preg_val: the identity convention's nominal register file
 # mi:     the MIR instruction ([dst, a, b])
-# spv_op: the SPIR-V comparison opcode
+# op_code: the SPIR-V comparison opcode
 # ret:    true on success, or an error string
-fun emit_compare(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr, spv_op: u32) R.Result[bool, str] {
+fun emit_compare(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr, op_code: u32) R.Result[bool, str] {
     if (mir.vec_lane_is_vector(mi.vec_lane)) {
-        ret emit_vector_compare(e, vm, preg_val, mi, spv_op);
+        ret emit_vector_compare(e, vm, preg_val, mi, op_code);
     }
     var cbits: u32 = mi.width::u32 * 8;
     if (cbits == 0) { cbits = e.tgt.model.gpr_width * 8; }
-    ret emit_compare_typed(e, vm, preg_val, mi, spv_op, types.type_int(e.tt, cbits));
+    val cmp_ty: u32 = types.type_int(e.tt, cbits);
+    if (cmp_ty == 0) {
+        ret unsupported(e, "unsupported comparison width in the SPIR-V target");
+    }
+    ret emit_compare_typed(e, vm, preg_val, mi, op_code, cmp_ty);
 }
 
 # emit a lane-wise vector comparison as mach's unsigned MASK vector
@@ -4086,14 +4895,14 @@ fun emit_compare(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr, spv_o
 # vm:       the per-vreg value maps
 # preg_val: the identity convention's nominal register file
 # mi:       the vector comparison instruction ([dst, a, b])
-# spv_op:   the SPIR-V comparison opcode, already class-selected
+# op_code:   the SPIR-V comparison opcode, already class-selected
 # ret:      true on success, or an error string
-fun emit_vector_compare(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr, spv_op: u32) R.Result[bool, str] {
+fun emit_vector_compare(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr, op_code: u32) R.Result[bool, str] {
     if (mi.operand_count != 3 || mi.operands[0].kind != mir.MIR_OP_VREG) {
-        ret R.err[bool, str]("spirv.emit: malformed vector comparison instruction");
+        ret emit_fail(e, "spirv.emit: malformed vector comparison instruction");
     }
     val dst: u32 = mi.operands[0].vreg;
-    if (dst >= vm.n) { ret R.err[bool, str]("spirv.emit: comparison result vreg out of range"); }
+    if (dst >= vm.n) { ret emit_fail(e, "spirv.emit: comparison result vreg out of range"); }
 
     val lanes: u32 = mir.vec_lane_count(mi.vec_lane);
     val operand_ty: u32 = vector_type_of(e, mi.vec_lane, false);
@@ -4105,17 +4914,17 @@ fun emit_vector_compare(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr
 
     val a: u32 = read_operand(e, vm, preg_val, ?mi.operands[1], operand_ty);
     val b: u32 = read_operand(e, vm, preg_val, ?mi.operands[2], operand_ty);
-    if (e.b.err) { ret R.err[bool, str]("spirv.emit: unreadable operand in vector comparison"); }
+    if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable operand in vector comparison"); }
 
     val bvec: u32 = spirv.alloc_id(e.b);
     var cops: [4]u32;
     cops[0] = bvec_ty; cops[1] = bvec; cops[2] = a; cops[3] = b;
-    spirv.inst(e.b, ?e.b.functions, spv_op, ?cops[0], 4);
+    spirv.inst(e.b, ?e.b.functions, op_code, ?cops[0], 4);
 
     val ones: u32 = mask_splat(e, mask_ty, lanes, 0xFFFFFFFF, 0xFFFFFFFF);
     val zeros: u32 = mask_splat(e, mask_ty, lanes, 0, 0);
     if (ones == 0 || zeros == 0) {
-        ret R.err[bool, str]("spirv.emit: could not build a vector comparison mask constant");
+        ret emit_fail(e, "spirv.emit: could not build a vector comparison mask constant");
     }
 
     val result: u32 = spirv.alloc_id(e.b);
@@ -4156,17 +4965,17 @@ fun mask_splat(e: *Emit, vec_ty: u32, lanes: u32, lo: u32, hi: u32) u32 {
 # ret:      true on success, or an error string
 fun emit_vec_extract(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count != 3 || mi.operands[0].kind != mir.MIR_OP_VREG) {
-        ret R.err[bool, str]("spirv.emit: malformed vector extract instruction");
+        ret emit_fail(e, "spirv.emit: malformed vector extract instruction");
     }
     if (mi.operands[2].kind != mir.MIR_OP_IMM) {
         ret unsupported(e, "a runtime vector lane index is not supported by the SPIR-V target");
     }
     val dst: u32 = mi.operands[0].vreg;
-    if (dst >= vm.n) { ret R.err[bool, str]("spirv.emit: vector extract result vreg out of range"); }
+    if (dst >= vm.n) { ret emit_fail(e, "spirv.emit: vector extract result vreg out of range"); }
     val vec_ty: u32 = operand_vector_type(e, vm, mi, ?mi.operands[1]);
     if (vec_ty == 0) { ret unsupported(e, unsupported_value_type(e, mi)); }
     val src: u32 = read_operand(e, vm, preg_val, ?mi.operands[1], vec_ty);
-    if (e.b.err) { ret R.err[bool, str]("spirv.emit: unreadable operand in vector extract"); }
+    if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable operand in vector extract"); }
 
     val result: u32 = spirv.alloc_id(e.b);
     var ops: [4]u32;
@@ -4187,13 +4996,13 @@ fun emit_vec_extract(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr) R
 # ret:      true on success, or an error string
 fun emit_vec_insert(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count != 4 || mi.operands[0].kind != mir.MIR_OP_VREG) {
-        ret R.err[bool, str]("spirv.emit: malformed vector insert instruction");
+        ret emit_fail(e, "spirv.emit: malformed vector insert instruction");
     }
     if (mi.operands[2].kind != mir.MIR_OP_IMM) {
         ret unsupported(e, "a runtime vector lane index is not supported by the SPIR-V target");
     }
     val dst: u32 = mi.operands[0].vreg;
-    if (dst >= vm.n) { ret R.err[bool, str]("spirv.emit: vector insert result vreg out of range"); }
+    if (dst >= vm.n) { ret emit_fail(e, "spirv.emit: vector insert result vreg out of range"); }
     val vec_ty: u32 = vm.type_id[dst];
     if (vec_ty == 0) { ret unsupported(e, unsupported_value_type(e, mi)); }
     var lanes: u32 = 0;
@@ -4202,7 +5011,7 @@ fun emit_vec_insert(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr) R.
 
     val src: u32 = read_operand(e, vm, preg_val, ?mi.operands[1], vec_ty);
     val lane: u32 = read_operand(e, vm, preg_val, ?mi.operands[3], lane_ty);
-    if (e.b.err) { ret R.err[bool, str]("spirv.emit: unreadable operand in vector insert"); }
+    if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable operand in vector insert"); }
 
     val result: u32 = spirv.alloc_id(e.b);
     var ops: [5]u32;
@@ -4230,10 +5039,10 @@ fun emit_vec_insert(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr) R.
 # ret:      true on success, or a precise error string
 fun emit_vec_build(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 2 || mi.operands[0].kind != mir.MIR_OP_VREG) {
-        ret R.err[bool, str]("spirv.emit: malformed vector build instruction");
+        ret emit_fail(e, "spirv.emit: malformed vector build instruction");
     }
     val dst: u32 = mi.operands[0].vreg;
-    if (dst >= vm.n) { ret R.err[bool, str]("spirv.emit: vector build result vreg out of range"); }
+    if (dst >= vm.n) { ret emit_fail(e, "spirv.emit: vector build result vreg out of range"); }
     val vec_ty: u32 = vm.type_id[dst];
     if (vec_ty == 0) { ret unsupported(e, unsupported_value_type(e, mi)); }
     var lanes: u32 = 0;
@@ -4242,7 +5051,7 @@ fun emit_vec_build(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr) R.R
 
     val given: u32 = mi.operand_count - 1;
     if (given != lanes) {
-        ret R.err[bool, str]("spirv.emit: vector build lane count does not match its vector type");
+        ret emit_fail(e, "spirv.emit: vector build lane count does not match its vector type");
     }
     # 2 fixed words plus one per lane. NO LANE-COUNT CEILING (#2727): the buffer used
     # to be a fixed eighteen words guarded by a refusal, sized by the widest vector
@@ -4262,7 +5071,7 @@ fun emit_vec_build(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr) R.R
     }
     if (e.b.err) {
         A.deallocate[u32](e.alloc, ops, (given + 2)::usize);
-        ret R.err[bool, str]("spirv.emit: unreadable operand in vector build");
+        ret emit_fail(e, "spirv.emit: unreadable operand in vector build");
     }
 
     spirv.inst(e.b, ?e.b.functions, spirv.OP_COMPOSITE_CONSTRUCT, ops, 2 + given);
@@ -4311,14 +5120,14 @@ fun emit_float_compare(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr)
         ret unsupported(e, "unsupported float comparison width in the SPIR-V target");
     }
     val cc: u8 = mi.src_width;
-    var spv_op: u32 = spirv.OP_F_ORD_GREATER_THAN_EQUAL;
-    if (cc == mir.FCC_EQ)      { spv_op = spirv.OP_F_ORD_EQUAL; }
-    or (cc == mir.FCC_NE)      { spv_op = spirv.OP_F_UNORD_NOT_EQUAL; }
-    or (cc == mir.FCC_LT)      { spv_op = spirv.OP_F_ORD_LESS_THAN; }
-    or (cc == mir.FCC_LE)      { spv_op = spirv.OP_F_ORD_LESS_THAN_EQUAL; }
-    or (cc == mir.FCC_GT)      { spv_op = spirv.OP_F_ORD_GREATER_THAN; }
+    var op_code: u32 = spirv.OP_F_ORD_GREATER_THAN_EQUAL;
+    if (cc == mir.FCC_EQ)      { op_code = spirv.OP_F_ORD_EQUAL; }
+    or (cc == mir.FCC_NE)      { op_code = spirv.OP_F_UNORD_NOT_EQUAL; }
+    or (cc == mir.FCC_LT)      { op_code = spirv.OP_F_ORD_LESS_THAN; }
+    or (cc == mir.FCC_LE)      { op_code = spirv.OP_F_ORD_LESS_THAN_EQUAL; }
+    or (cc == mir.FCC_GT)      { op_code = spirv.OP_F_ORD_GREATER_THAN; }
     or (cc != mir.FCC_GE)      { ret unsupported(e, "unknown float comparison condition in the SPIR-V target"); }
-    ret emit_compare_typed(e, vm, preg_val, mi, spv_op, types.type_float(e.tt, fbits));
+    ret emit_compare_typed(e, vm, preg_val, mi, op_code, types.type_float(e.tt, fbits));
 }
 
 # emit a comparison whose operands are read at `operand_ty` and whose result is a
@@ -4328,64 +5137,76 @@ fun emit_float_compare(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr)
 # vm:         the per-vreg value maps
 # preg_val:   the identity convention's nominal register file
 # mi:         the MIR instruction ([dst, a, b])
-# spv_op:     the SPIR-V comparison opcode
+# op_code:     the SPIR-V comparison opcode
 # operand_ty: the type both compared operands are read at
 # ret:        true on success, or an error string
 fun emit_compare_typed(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr,
-                       spv_op: u32, operand_ty: u32) R.Result[bool, str] {
+                       op_code: u32, operand_ty: u32) R.Result[bool, str] {
     if (mi.operand_count != 3 || mi.operands[0].kind != mir.MIR_OP_VREG) {
-        ret R.err[bool, str]("spirv.emit: malformed comparison instruction");
+        ret emit_fail(e, "spirv.emit: malformed comparison instruction");
     }
     val dst: u32 = mi.operands[0].vreg;
-    if (dst >= vm.n) { ret R.err[bool, str]("spirv.emit: comparison result vreg out of range"); }
+    if (dst >= vm.n) { ret emit_fail(e, "spirv.emit: comparison result vreg out of range"); }
+    if (!operand_matches_type(vm, ?mi.operands[1], operand_ty)
+     || !operand_matches_type(vm, ?mi.operands[2], operand_ty)) {
+        ret emit_fail(e, "spirv.emit: comparison mixes operand types");
+    }
     val a: u32 = read_operand(e, vm, preg_val, ?mi.operands[1], operand_ty);
     val b: u32 = read_operand(e, vm, preg_val, ?mi.operands[2], operand_ty);
-    if (e.b.err) { ret R.err[bool, str]("spirv.emit: unreadable operand in comparison"); }
+    if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable operand in comparison"); }
     val bool_ty: u32 = types.type_bool(e.tt);
     val result: u32 = spirv.alloc_id(e.b);
     var ops: [4]u32;
     ops[0] = bool_ty; ops[1] = result; ops[2] = a; ops[3] = b;
-    spirv.inst(e.b, ?e.b.functions, spv_op, ?ops[0], 4);
+    spirv.inst(e.b, ?e.b.functions, op_code, ?ops[0], 4);
     ret store_vreg(e, vm, dst, result);
 }
 
-# emit a conversion `dst = <spv_op>(a)`
+# emit a conversion `dst = <op_code>(a)`
 #
 # A conversion is the one shape whose operand type is NOT the result type, so the
 # source side is reconstructed here: `src_width` gives the width and the opcode
 # fixes the class. That only matters for a source that carries no type of its own -
 # an immediate or a nominal register - since a vreg source is loaded at its own
 # declared type.
+#
+# SO IT IS RECONSTRUCTED ONLY WHEN IT IS NEEDED (#2920). Interning a type DECLARES
+# it, so reconstructing one the source never reads still put it in the module: a
+# `:~` between two 16-byte vectors has a 16-byte source width, and reading that as
+# a scalar integer declared an `OpTypeInt 128` beside an otherwise correct
+# `OpBitcast`. SPIR-V has no 128-bit integer, so the module was invalid on a type
+# nothing referenced.
 # ---
 # e:      the emission state
 # vm:     the per-vreg value maps
 # preg_val: the identity convention's nominal register file
 # mi:     the MIR instruction ([dst, a]) carrying the source width in src_width
-# spv_op: the SPIR-V conversion opcode
+# op_code: the SPIR-V conversion opcode
 # src_is_float: whether the source side is read in the float class
 # ret:    true on success, or an error string
 fun emit_convert(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr,
-                 spv_op: u32, src_is_float: bool) R.Result[bool, str] {
+                 op_code: u32, src_is_float: bool) R.Result[bool, str] {
     if (mi.operand_count != 2 || mi.operands[0].kind != mir.MIR_OP_VREG) {
-        ret R.err[bool, str]("spirv.emit: malformed conversion instruction");
+        ret emit_fail(e, "spirv.emit: malformed conversion instruction");
     }
     val dst: u32 = mi.operands[0].vreg;
-    if (dst >= vm.n) { ret R.err[bool, str]("spirv.emit: conversion result vreg out of range"); }
-    var sbits: u32 = mi.src_width::u32 * 8;
-    if (sbits == 0) { sbits = e.tgt.model.gpr_width * 8; }
-    var src_ty: u32 = types.type_int(e.tt, sbits);
-    if (src_is_float) {
-        if (sbits != 32 && sbits != 64) {
-            ret unsupported(e, "unsupported float conversion width in the SPIR-V target");
+    if (dst >= vm.n) { ret emit_fail(e, "spirv.emit: conversion result vreg out of range"); }
+    var src_ty: u32 = 0;
+    if (!operand_carries_type(vm, ?mi.operands[1])) {
+        var sbits: u32 = mi.src_width::u32 * 8;
+        if (sbits == 0) { sbits = e.tgt.model.gpr_width * 8; }
+        if (src_is_float) { src_ty = types.type_float(e.tt, sbits); }
+        or { src_ty = types.type_int(e.tt, sbits); }
+        if (src_ty == 0) {
+            ret unsupported(e, "unsupported conversion source width in the SPIR-V target");
         }
-        src_ty = types.type_float(e.tt, sbits);
     }
     val a: u32 = read_operand(e, vm, preg_val, ?mi.operands[1], src_ty);
-    if (e.b.err) { ret R.err[bool, str]("spirv.emit: unreadable operand in conversion"); }
+    if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable operand in conversion"); }
     val result: u32 = spirv.alloc_id(e.b);
     var ops: [3]u32;
     ops[0] = vm.type_id[dst]; ops[1] = result; ops[2] = a;
-    spirv.inst(e.b, ?e.b.functions, spv_op, ?ops[0], 3);
+    spirv.inst(e.b, ?e.b.functions, op_code, ?ops[0], 3);
     ret store_vreg(e, vm, dst, result);
 }
 
@@ -4402,37 +5223,48 @@ fun emit_convert(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr,
 # mi:       the MIR instruction ([dst, src])
 # ret:      true on success, or an error string
 fun emit_mov(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr) R.Result[bool, str] {
-    if (mi.operand_count != 2) { ret R.err[bool, str]("spirv.emit: malformed move instruction"); }
+    if (mi.operand_count != 2) { ret emit_fail(e, "spirv.emit: malformed move instruction"); }
     val dst: *mir.MirOperand = ?mi.operands[0];
     val src: *mir.MirOperand = ?mi.operands[1];
 
     if (dst.kind == mir.MIR_OP_VREG) {
-        if (dst.vreg >= vm.n) { ret R.err[bool, str]("spirv.emit: move destination vreg out of range"); }
+        if (dst.vreg >= vm.n) { ret emit_fail(e, "spirv.emit: move destination vreg out of range"); }
         val val_id: u32 = read_operand(e, vm, preg_val, src, vm.type_id[dst.vreg]);
-        if (e.b.err) { ret R.err[bool, str]("spirv.emit: unreadable move source"); }
+        if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable move source"); }
         ret store_vreg(e, vm, dst.vreg, val_id);
     }
     if (dst.kind == mir.MIR_OP_PREG) {
-        if (dst.preg >= 16) { ret R.err[bool, str]("spirv.emit: move destination register out of range"); }
+        if (dst.preg >= 16) { ret emit_fail(e, "spirv.emit: move destination register out of range"); }
         # an immediate waits here untyped: the type it takes is the one the callee's
         # parameter or the function's return type declares, not the move's, which the
         # ABI pre-coloring always emits at the machine word in the integer class.
         if (src.kind == mir.MIR_OP_IMM) {
-            preg_val.val_id[dst.preg] = 0;
-            preg_val.imm[dst.preg]    = src.imm;
-            preg_val.is_imm[dst.preg] = true;
+            preg_val.val_id[dst.preg]  = 0;
+            preg_val.imm[dst.preg]     = src.imm;
+            preg_val.is_imm[dst.preg]  = true;
+            preg_val.is_bool[dst.preg] = false;
             ret R.ok[bool, str](true);
         }
+        # a boolean waits here untyped for the same reason an immediate does, and is
+        # read out with `want_ty` 0 so nothing widens it before the use site knows
+        # what the declaration asks for.
+        val boolean: bool = operand_is_bool(vm, preg_val, src);
         val val_id: u32 = read_operand(e, vm, preg_val, src, 0);
-        if (e.b.err) { ret R.err[bool, str]("spirv.emit: unreadable move source"); }
-        preg_val.val_id[dst.preg] = val_id;
-        preg_val.is_imm[dst.preg] = false;
+        if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable move source"); }
+        preg_val.val_id[dst.preg]  = val_id;
+        preg_val.is_imm[dst.preg]  = false;
+        preg_val.is_bool[dst.preg] = boolean;
         ret R.ok[bool, str](true);
     }
     ret unsupported(e, "memory-destination move is not yet supported by the SPIR-V target");
 }
 
-# the SSA value in a nominal register, minting a pending immediate at `want_ty`
+# the SSA value in a nominal register, resolved against the type the consumer declares
+#
+# Both deferrals the register file carries are settled here, because this is the first
+# point that knows `want_ty`: a pending immediate is minted at it, and a boolean is
+# widened to it. A boolean position leaves the boolean alone, which is what a callee
+# declaring an actual `OpTypeBool` parameter needs.
 # ---
 # e:       the emission state
 # rg:      the register file
@@ -4440,8 +5272,23 @@ fun emit_mov(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr) R.Result[
 # want_ty: the SPIR-V type the consumer declares for this position
 # ret:     the SSA value id, or 0 when the register holds nothing
 fun reg_value(e: *Emit, rg: *Regs, k: u32, want_ty: u32) u32 {
-    if (!rg.is_imm[k]) { ret rg.val_id[k]; }
-    ret immediate(e, want_ty, rg.imm[k]);
+    if (rg.is_imm[k]) { ret immediate(e, want_ty, rg.imm[k]); }
+    if (rg.is_bool[k] && rg.val_id[k] != 0 && want_ty != 0 && !types.type_is_bool(e.tt, want_ty)) {
+        ret widen_bool(e, rg.val_id[k], want_ty);
+    }
+    ret rg.val_id[k];
+}
+
+# whether an operand's value is a SPIR-V boolean rather than a number
+# ---
+# vm: the per-vreg value maps
+# rg: the register file
+# op: the operand
+# ret: true for a comparison result, wherever it is currently held
+fun operand_is_bool(vm: *VMaps, rg: *Regs, op: *mir.MirOperand) bool {
+    if (op.kind == mir.MIR_OP_VREG) { ret op.vreg < vm.n && vm.is_bool[op.vreg]; }
+    if (op.kind == mir.MIR_OP_PREG) { ret op.preg < 16 && rg.is_bool[op.preg]; }
+    ret false;
 }
 
 # the `#[builtin]` type table, at every built-in and in both directions

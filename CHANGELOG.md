@@ -5,6 +5,312 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [4.18.0] - 2026-08-08
+
+#### A whole `#[uniform]` or `#[storage]` block crosses a call by value (#2922, #2926)
+Handing a descriptor-bound block to a helper, `o = from_uniform(block)`, was refused for `spirv`, and so was assigning one whole record to another before #2911 landed. Reading a block's members one at a time worked, which is what made the refusal look like a design position rather than the two lowering faults it was.
+
+The first is an address materialization. A global in a value position had its symbol LEA'd into a register before the argument or return placement was made, which is a repair for a machine whose move records no relocation for a symbol operand. On a logical-addressing target it destroys the only reference the emitter can name, so `MIR_GEP` off a symbol arrived where a whole-object transfer should have. It is now gated on `MachineModel.flat_addressing`, the same axis that gates the float materialization (#2655) and the aggregate member walk (#2649), so the transformation is gated rather than the target. Every machine target's output is byte-identical, object for object, across five targets.
+
+The second was hiding behind the first. A descriptor-bound block's storage is declared with a **Block-decorated struct carrying its member offsets**, which is a different type from the plain struct the same `rec` has in a signature or a local, and the two cannot share an id because the decorations are part of the type's identity. A load that re-derived the type from the IR produced an `OpLoad` whose result type did not match its pointer: a module `spirv-val` rejects and the compiler wrote without complaint, for a whole-block copy that already compiled. A load now reads the variable's own declared type and `OpCopyLogical` carries the value to the type its position or its destination takes, which is the operation SPIR-V defines for exactly that crossing and which is defined only between logically matching types.
+
+One more fault came with them. The emitter's write scan lists the operand positions that only READ, and it listed them for `MIR_LOAD` and `MIR_GEP` alone, so a whole-object read through `MIR_MEMCPY` or `MIR_AGG_LOAD` counted as a store: a `"readonly"` storage block passed by value was refused for being written, and a storage block read whole lost the `NonWritable` decoration that lets a vertex stage read it without `vertexPipelineStoresAndAtomics`.
+
+The refusal's own text is gone with the rule it stated. It said an aggregate assignment lowers to a byte copy, which stopped being true when `MIR_MEMCPY` (#2911) and `MIR_AGG_LOAD` / `MIR_AGG_STORE` (#2914, #2915) gave the target whole-object transfers, and a copy between two objects whose types do not match logically is refused by `emit_memcpy` under the reason that is actually its own.
+
+### Changed
+
+#### A target owns its own type definitions, and `#[spirv_op]` becomes `#[op]` (#2888)
+The compiler knew what a sampler was. `src/lang/type.mach` carried a name grammar (`[i|u](sampler|texture|image)<dim>[ms][array][shadow]`), an `ImgForm` reader, a `TypeImage` payload, dimensionality and form enums, and a word list to print a handle back. None of it belonged to a language, and the consequence for a shader library was that it could not add a handle type, could not name a dimensionality, and could not add an instruction without a compiler release.
+
+The operations half of this moved in #2891. This is the types half. `TargetDefs` grows a type-constructor table beside the operation one, with the same contract and the same two readers: the front end closes the value set so a misspelled constructor is a compile error at the declaration, and the back end mints the type from the same row. A row carries an operand LIST rather than just an arity, because a constructor may compose over another type, and an entry is either a literal word or the tag of the constructor a type operand must name. It also carries a refusal hook, which is how a target says why it cannot emit a combination its constructor spells.
+
+A **bodyless `def` carrying `#[handle(target, constructor, operands...)]`** declares a type the owning target mints:
+
+```mach
+#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED)]
+pub def Texture2D;
+
+#[handle("spirv", "sampled_image", Texture2D)]
+pub def Sampler2D;
+```
+
+`def` is the carrier rather than an empty `rec` because it already means "this name denotes a type" and promises no fields and no storage. An empty `rec` promises storage, fields, copyability and nestability, and an attribute retracting all four would make the declaration form assert the opposite of the truth.
+
+`Sampler2D` **names** the image it wraps rather than restating that image's operands, so there is one statement of the shape and the two cannot disagree. That required a real change to how a decorator argument is read, since an argument is an expression position and a bare type name was refused with `` `Inner` is a record type, not a value ``. The change is scoped to this directive and to an argument that names a handle: a type name in `#[align]` is still refused exactly as it was.
+
+The rules a handle carries are fixed and closed, never varied per declaration, and each follows from the one fact the directive states, that the program does not own the representation: no fields, no indexing, no construction, no local binding, no record or union field, no pointer or array around one, and an extent the target declares. On a target that mints no such type the declaration is inert, so a library of handles still compiles for a CPU.
+
+The four refusals the old grammar carried by name survive, re-keyed to the operand that causes each rather than to a spelling, so a depth image, a multisampled image, a `Rect` / `Buffer` / `SubpassData` dimensionality and a storage image are each refused at the declaration with what SPIR-V would need instead. Two further checks close the operand words themselves, which a grammar did not need: an operand is any comptime word a declaration folds, so a value outside the set the target emits would otherwise be written into the module verbatim.
+
+**The name grammar is gone in the same change.** `sampler2d` and its relatives no longer exist, `src/lang/type.mach` loses 495 lines and carries a target-neutral `TYPE_HANDLE` whose payload is a constructor tag and opaque operand words it never reads, and `#[spirv_op(set, name)]` is now `#[op(target, set, name)]` with no alias. Carrying the target as a string in the source rather than in the directive's name is what leaves the front and middle ends unaware of anything but the machinery.
+
+A textured shader emits a **byte-identical module** across the migration: the sampled-image fixture built with the old spellings and with the new declarations produces the same 3984 bytes, and `spirv-val --target-env vulkan1.3` accepts both.
+
+### Fixed
+
+#### A float converted to an unsigned integer is value-preserving across the whole range (#2909)
+
+x86-64 has no unsigned truncating convert, and `encode_float_conv` ignored the destination's signedness, so `MIR_FP_TO_SI` and `MIR_FP_TO_UI` both selected the signed `CVTTSS2SI` / `CVTTSD2SI`. Every source value at or above `2^31` for `::u32`, or `2^63` for `::u64`, exceeded the signed destination range and returned the x86 integer-indefinite value silently. `(3000000000.0::f64)::u32` gave `2147483648` where `doc/language/operators.md` promises a value-preserving conversion wherever the value is representable, and it is.
+
+A sub-64-bit unsigned destination now converts at 64-bit width and the store keeps the low bytes. A 64-bit unsigned destination takes the two-arm sequence: below `2^63` it converts directly, and at or above it converts `x - 2^63` and adds `2^63` back. The boundary is a pooled constant read by both the compare and the subtract, a scratch register holds the biased copy so an allocated source is never written, and a NaN source takes the direct arm because `UCOMIS` sets CF when unordered.
+
+The boundary itself is the trap this hid behind: at exactly `2^31` and exactly `2^63` the indefinite value equals the correct answer, so a test probing only the boundary passes while the entire range above it is wrong. riscv64 was correct throughout, because `fcvt.wu.d` and `fcvt.lu.d` exist and were selected.
+
+#### A comptime float is evaluated at its declared width (#2918)
+
+`CTValue` held a float in a bare `f64` with no width, so every float constant was computed at double precision whatever its declared type, and narrowing happened only at the far end when the constant was emitted at its IR type. A constant and the identical computation performed at run time therefore disagreed: `val B: f32 = A - 16777216.0` folded to `3f800000` where the running program produces `00000000`.
+
+The value now carries the IEEE width its payload is at, beside the signedness the integer side already had. An untyped float literal adopts the context width, so an all-literal `f32` chain is an `f32` chain from its first literal, and every operation reconciles its operands to the shared width and rounds both operands and the result. Rounding once at the end is a different and still-wrong answer: `1.0/3.0*7.0 - 2.0` at `f32` gives `3eaaaaab` rounded once, indistinguishable from rounding nothing, and `3eaaaab0` rounded at each step. Mismatched declared widths are refused rather than folded at a guessed width, since mach has no implicit widening.
+
+#### A conditional float merge is written on both edges on riscv64 (#2917)
+
+The vector placement stage rewrote each block's phi operands and terminator immediately after filling that block, against a replacement map that is only complete once every block is filled. A lane read's replacement is recorded when its own block is walked, so a use in a lower-indexed block kept an identifier that no longer existed, and phi destruction then emitted a copy only for the incoming it could resolve and none for the other edge. The merge register was read unwritten on the not-taken edge, at `-O2` only, on a target with no 128-bit vector unit.
+
+The per-block rewrite is replaced by one whole-function pass after the fill loop, which is the mechanism the gap-operator stage already grew for the same defect class.
+
+#### The IR verifier holds an aggregate bitcast to one size (#2899)
+
+`check_convert_width` judged a bitcast by `type.bit_width`, which answers `0` for pointers, arrays, structs, unions and functions, and bailed on the zero, while the sibling class check asked only that both sides were aggregates. Between them nothing held an aggregate bitcast to one extent, so a 16-byte struct reinterpreted as an 8-byte one passed the verifier and reached codegen. The reason it had stood is that an aggregate's size is a layout answer needing a target, and the verifier was never given one: it now carries `VerifyOpts`, and the equal-size test runs before the zero-width bail so a zero-sized aggregate is judged like any other.
+
+#### A shader built at `-O0` and was refused at `-O2` (#2921)
+Three sequential array loops in one function built cleanly for `spirv` at `-O0` and at `-g`, and `-O2` refused them: `a loop whose exits do not reconverge on one block is not yet supported by the SPIR-V target`. `-O2` is what ships, so a shader that only compiles at `-O0` does not work, and a profile that reorders and simplifies must not turn an expressible function into an inexpressible one.
+
+Two defects, both raised by the same case, and they answer different questions.
+
+The **auto-vectorizer had no business running on a logical-addressing target**. It rewrites an element-wise loop into a runtime-guarded vector copy plus a scalar remainder, and both halves are byte-oriented: the alias guard compares the two ranges' END ADDRESSES, and the fast copy re-reads an element pointer as a packed vector. SPIR-V has neither -- its pointer names one object at exactly one pointee type -- so the rewrite produces IR the back end cannot express at all. The pass asked only `has_v128`, which spirv answers yes because it really does have vector types and vector operators. Having vector registers and addressing memory as bytes are two questions, and the pass now asks both: `flat_addressing` gates the transformation, so every machine target keeps its vectorization byte for byte and the logical one stays scalar.
+
+The **structurizer's loop-merge search was also too weak**, independently. What the versioner produces is a guard picking between two copies of one loop, both branching straight to the block after them. That flow is reducible and every loop in it has exactly one exit, so SPIR-V can express it: neither header dominates the shared block, but a block interposed on a loop's own exit edge is dominated by that header by construction, and the loop reconverges there while the shared block stays the selection's merge. The reconstruction already had that mechanism for a merge block another construct had claimed, and simply did not reach for it here. It refused instead, which is what the reported error was.
+
+The vectorizer's shape is the one the reconstruction met first, so fixing only the structurizer moves the refusal to the access chain rather than removing it, and fixing only the gate leaves a legal shape refused for the next pass that produces one. A gep whose whole index list is a leading `0` also stopped reporting itself as `an access chain of more than 8 levels`, which it never was.
+}
+
+#### A SPIR-V value is typed by what defines it, not by a MIR width (#2919, #2920)
+Two modules the compiler wrote while reporting success, and that only the external validator refused. A `for` loop whose counter is 8 or 16 bits allocated the counter as a 64-bit variable while its increment and its bound stayed narrow, so the comparison mixed bit widths. A `:~` between two 16-byte vector types declared an `OpTypeInt 128`, which SPIR-V has no form for, beside an `OpBitcast` that was itself typed as the vector it read rather than as the one it produces.
+
+Both reconstruct a type from a **MIR byte width** at a point where the value's real type lives somewhere else. A phi merge materializes its constant at the machine word because a sub-word write to a machine register leaves the upper bits unspecified, which is a statement about a register file SPIR-V does not have. The emitter already knew a copy is not the source of type truth and skipped register copies, but not immediate ones. A conversion reconstructed its source type unconditionally, and interning a type declares it, so a 16-byte source width put a scalar integer in the module the instruction never read. And `compute_vec_lane` describes an instruction by its first vector operand, which is right for every instruction whose two sides share a shape and wrong for the one whose operand shape is exactly what it discards.
+
+**The emission point now refuses rather than writing an invalid module.** `type_int` and `type_float` return 0 for a width SPIR-V has no type at, on the same terms `type_vector` already returns 0 for a component count no Shader module may declare, and the arithmetic and comparison forms refuse an operand whose own type is not the one its position declares. A width guard alone could not have seen the loop counter, where every individual type was legal and only the pairing was wrong.
+
+Every machine target's output is unchanged byte for byte: 675 objects across linux-x86_64, linux-arm64 and linux-riscv64, plus a vector-reinterpret fixture built for all three, which is the shape the shared lane descriptor touches and which mach's own source does not contain.
+
+#### An aggregate is passed and returned by value on the SPIR-V target (#2914, #2915)
+`fun sum(p: Pair) u32` was refused for `spirv` with an addressed-memory diagnostic, and `fun make() Pair` failed earlier still with a bare `spirv.emit: unreadable move source` that named no opcode, no function and no position. A shader API where a record cannot cross a call in either direction is not a finished one.
+
+Both come from the shared ABI lowering describing every aggregate placement in **bytes**. An argument was copied into an outgoing stack frame in 8/4/2/1-byte chunks, and a return was materialized into a caller-supplied sret slot and copied out of it. SPIR-V has no frame to build the first in and no pointer to follow for the second, and it never needed either: a composite is passed by value natively, as an `OpFunctionParameter` of the record's own type, and returned by value as an `OpReturnValue` of it.
+
+The lever is the calling convention, which is where every other aggregate placement is already decided. `abi.CLASS_AGG` says the object travels as **one value** in an argument or return position, at its own type, and the spirv convention returns it for an aggregate. It is deliberately not a machine-model property: the addressing model does not settle a calling convention, and sysv64 and win64 already disagree about aggregates on one machine. A future target that passes composites whole declares the class in its own convention file and inherits the whole path.
+
+MIR carries the transfer whole through `MIR_AGG_LOAD` and `MIR_AGG_STORE`, the calling-convention siblings of `MIR_MEMCPY` (#2911). Neither carries a byte count, unlike `MIR_MEMCPY` and `MIR_MEMZERO`, and that is the contract rather than an omission: those two are expanded into a sized run on a flat target, there is no expansion of these anywhere, and a byte count is exactly the fact the class exists in order not to use.
+
+The unlocated internal error was a diagnostic bug in its own right, so it is fixed independently of the feature. Every refusal the SPIR-V emitter raises from inside instruction emission now goes through `mir.instr_refusal`, internal errors and declared unsupported features alike, so each one names its opcode, its function and its source position.
+
+Every machine target's output is unchanged byte for byte: 224 objects each on linux-x86_64, linux-arm64, linux-riscv64 and windows-x86_64, and 225 each on darwin-aarch64 and darwin-x86_64.
+
+#### A comparison result crosses a call and a return boundary on the SPIR-V target (#2910)
+`mix(h, x == x)` compiled for `spirv` handed the `OpIEqual`'s `%bool` straight to an `OpFunctionCall` whose callee declares `%uchar`, and `ret x == x` from a `u8` function returned one out of a `%uchar` function. `spirv-val` rejected both. Neither is float specific: an integer comparison did it too.
+
+A SPIR-V comparison yields an `OpTypeBool`, which is abstract and has no storage layout, so it cannot be an argument or a return value where a byte is declared. Every other target computes a comparison into a 0/1 byte in a register, where the value widens by zero extension and nothing has to be reconciled. The emitter already converted at every position that knows the type it is converting to: a store to a variable, a store through a pointer and a store into a record member all emitted the `OpSelect` that turns the boolean into the declared type's 0 and 1.
+
+The two positions that did not are the two that go through the ABI pre-coloring's nominal register file, and they share one cause. That file is written by moves emitted at the machine word, which cannot type the value, so it already carries an immediate unmaterialized and mints the constant at the use site with the width the declaration asks for. A boolean now rides the same way: the register slot records that it holds one, and the use site - the `OpFunctionCall` that knows the callee's parameter types, or the `OpReturnValue` that knows the function's result type - widens it, or leaves it alone where the declaration is itself a boolean. Comparisons are still typed as booleans, so `OpBranchConditional` keeps receiving the real `%bool` the specification requires there.
+
+#### `$length_of` folds in a comptime gate, and a gate folds the same way in both passes (#2875)
+`$if ($length_of([4]f32) != 4)` was refused, in a function body and at module scope alike, with `` `$offset_of` has no value in a comptime condition `` against an operand that is plainly a fixed array. `$size_of` and `$align_of` had folded in a gate since #2857, so the one layout intrinsic that counts elements was the odd member of the set.
+
+Lowering walks a `$if` chain by evaluating every gate again, so a layout gate is measured twice: once by sema, choosing which arms are type-checked, and once at lowering, choosing which arms become code. Lowering's layout resolver answered `$size_of` and `$align_of` and returned "not mine" for `$length_of`, and the evaluator renders that as `$offset_of`'s refusal. It now answers the count from the operand's `element_count` over the sema type, which is where an element count belongs: how many elements a type holds is a property of the spelling and is the same on every target, unlike a size, which is measured through the IR against the target's layout.
+
+That exposed the second half. Lowering reads the operand's type out of the slot sema stamps on it, and the ordinary sema fold, the path a plain layout gate takes, folded the gate without typing it first, unlike the two folds beside it. So the operand carried no type at lowering, where `$length_of` read no count and `$size_of` silently measured **zero**: `$if ($size_of([4]f32) == 16)` type-checked its true arm in sema and then lowered its false one, with no diagnostic from either pass. A gate sema folds is now a gate sema typed, so the two passes read the same measurement and select the same arm.
+
+#### `--pie` and dynamic linking on a loaderless OS are refused by name (#2898)
+`mach build --pie` on a freestanding ELF target failed with `elf: PIE program headers exceed the one-page header reservation (too many load segments)`. That was wrong in both clauses. There were four load segments, not too many, and the reservation was not a page: freestanding declares `page_size = 1` because bare metal has no paging, so the check refused whatever the image contained. On riscv32 a third answer arrived first, the ELF32 dynamic-image message. None of the three named the reason.
+
+The reason is one sentence. A position-independent executable exists to be relocated by a program loader when it maps the image, a dynamically-linked one to have its imports resolved by one, and a shared library to be loaded into something else. `os = "freestanding"` has no loader at all, so each of those is a category mistake in the request rather than a layout that did not fit, and someone passing `--pie` to a bare-metal build should be told which mistake they made rather than shown a segment count:
+
+```
+error: link: a position-independent executable needs a loader to relocate it, and os = "freestanding" has none
+error: link: a dynamically-linked executable needs a loader to resolve it, and os = "freestanding" has none
+error: link: a shared library needs a loader to map it, and os = "freestanding" has none
+```
+
+The refusal reads `os.OsVTable.mapped_by_loader` (#2895) in the linker, at the one line that picks the writer family, so the fact stays in one place and any future no-loader OS inherits it without an object-format writer being touched. It also settles the underflow #2895 left standing: `header_segment_vaddr` frames the header block a page below segment 0, which at a base address of 0 wraps to the top of the address space, and the PIE and dynamic ELF writers still computed it unconditionally. They were kept off it only by the reservation check happening to fail first. With the request refused before a writer is chosen, neither writer is reachable on a loaderless target at all, so the precondition holds by construction rather than by arithmetic accident.
+
+Every linux, darwin and windows image is unchanged byte for byte, `--pie` included, as are freestanding `of = "elf"` and `of = "raw"` static images.
+
+#### A freestanding target can select `of = "elf"` and link, on every architecture (#2895)
+`os = "freestanding"` declares `page_size = 1`, and that is deliberate: bare metal has no paging, so segments carry no alignment obligation and 1 packs them tightly in a flat image. The ELF writer read that length as the size of the one-page reservation the ELF header and the program-header table have to fit inside, so the test was `64 + n*56 <= 1` and every freestanding ELF image was refused no matter how few segments it had. The objects were written correctly; only the link step failed, on x86_64, aarch64, riscv64 and riscv32 alike.
+
+Behind the refusal sat a second fault that the refusal was hiding. `header_segment_vaddr` frames the header block one page **below** segment 0, which at a base address of 0 and a page of 1 is `0 - 1` - an underflow to the top of the address space. Relaxing the check alone would have traded a loud link error for a leading `PT_LOAD` mapping the header block at `0xFFFFFFFFFFFFFFFF`: an image that links and is malformed, which is worse.
+
+Both come from applying a loader construct to a target with no loader. The leading `PT_LOAD` covering the header block exists so a **program loader** can read the program headers back out of the mapped image - `PT_PHDR`, PIE self-relocation, dynamic linking. A bare-metal image has none: the reset vector enters at the entry point and nothing parses a header at run time. So a loaderless image now emits no header segment at all, and the header block stays file metadata that is never mapped. That is also the only shape available at base address 0, where there is nothing below segment 0 to map it in.
+
+The gate is a fact the OS states about itself - `os.OsVTable.mapped_by_loader`, carried to the writer through `of.ImageOptions` - and deliberately not `page_size == 1` read as a sentinel. A page size is a length in bytes and whether an image is loader-mapped is a property of the platform; spelling one as the other is the same unit confusion that produced the bug. Every linux, darwin and windows image is unchanged, byte for byte, as is `os = "freestanding"` with `of = "raw"`.
+#### A cast that converts nothing emits nothing (#2881)
+`lower_cast` chooses a conversion from the source and target pair and fell through to a bitcast whenever the two shared a width, so a cast whose operand already had the destination type emitted a reinterpretation of a type as itself. In SPIR-V that surfaced as `OpBitcast %ulong %ulong_2`, an instruction with no effect, which is how it was found.
+
+It was never only cosmetic. An identity bitcast is an opaque SSA definition, so the value behind it stops being a constant: `~(0::usize) / 0xFF` in `std.memory.raw_fill` - the byte-splat every `raw_fill` performs - lowered to a runtime `div` on every target, because `0::usize` on a literal already typed `usize` put a bitcast between the constant and the fold. Seventy such divisions disappear from the compiler's own image.
+
+The fold is keyed on the two IR types being EQUAL rather than on their widths matching, which is the distinction that makes it safe: a same-width cast that genuinely reinterprets - an integer and a float, where the bitcast is what carries the general/float register-bank crossing to the backend - has two different IR types and still emits. It sits in the lowerer's conversion selection rather than in `builder.emit_bitcast`, because choosing no instruction is a selection decision and the builder's callers, including the IR verifier's own width test, are entitled to emit exactly what they ask for.
+
+Secrecy is unaffected. `OP_BITCAST` is classified a secret move, so an identity bitcast was a link in the taint chain the `#[oblivious]`-required check reads, but sema forbids `::` and `:~` from adding or dropping `^`, so a cast and its operand always agree on secrecy and the operand's own definition is already stamped. A secret compute reached through an identity cast is still required to declare `#[oblivious]`.
+
+#### An RV64-only mnemonic in an `asm riscv32` body is refused rather than assembled (#2864)
+`ld`, `sd`, `addw` and the rest of the `*W` group do not exist at XLEN 32, and an `asm riscv32` body naming one assembled it anyway. The image carried an instruction the hardware does not implement, so the mistake surfaced as an illegal-instruction trap at run time instead of a diagnostic at build time - a wrong answer through a green build, which is the failure mode this target class exists to catch.
+
+The cause was a split authority. One mnemonic table served both machines and the rows carried no width, so the assembler knew the spelling and the encoder knew the machine and neither asked the other. The fix states the fact once, on the instruction: every `MachOp` declares the register widths it exists at, and both the assembler and the encoder read that. A mnemonic is refused because the instruction it names does not exist here, which is why an alias, a pseudo spelling and a row the suffix decoder synthesizes all inherit the answer without being listed anywhere - `sext.w` and `amoadd.d` are refused on rv32 for the same reason `addiw` is.
+
+The set is per instruction rather than a minimum register width, so an RV32-only form is expressible when one arrives rather than a reshape of the layer. A form the module does not classify admits nothing, so appending an instruction without stating its machines refuses it loudly instead of admitting it everywhere quietly, and a unit test walks the shipping table and the decoder's whole synthesized range to hold that.
+
+The shift-amount field went the same way: it is as wide as the register it shifts, so `slli a0, a1, 32` is refused on rv32, where its sixth bit would have landed in `funct7` and decoded as a different instruction. `slli a0, a1, 31` still assembles, and every RV64-only spelling still assembles under a `riscv64` tag.
+
+`doc/language/asm.md` no longer tells the reader to gate these spellings themselves.
+#### A CI leg no longer fails because an unrelated apt repository is down (#2885)
+`apt-get update` exits non-zero when any configured repository is unreachable, including repositories the job never installs from. The runner image carries Microsoft's and azure-cli's lists preinstalled, and a 403 from them failed `int pinned (linux)` while every Ubuntu repository the job actually reads fetched fine. It cleared on a rerun, which is worse than a hard failure: it teaches everyone reading CI that a red `int pinned` is probably noise.
+
+Package installation moved into one composite action the four sites call. The update's verdict is no longer the step's, and the install's is - a package a leg genuinely needs and cannot find still fails it, loudly, which is the signal the update was standing in for. Dropping the unused third-party lists first would work today at the price of a list of other people's repositories to maintain against a runner image nobody here controls; the install is the check that needs no such list. It lives in the action rather than at each call site so a leg cannot be added under the old shape.
+#### A wide global is executed and value-checked on the rv32 reference core (#2883)
+The rv32 harness loaded `.text` alone out of the unlinked object image, so no program touching a global could be executed: `.data` was not in the core's memory at all, and a global reference on rv32 is an `auipc` / `lw` pair against `%pcrel_hi` and `%pcrel_lo` that the linker patches, so even with the data present the address would have been zero. That is why the #2867 repair - one native access per lane at successive addends on the same symbol - had no in-tree value check and had to be verified against an external interpreter.
+
+The harness now runs the build through the shipping linker, the same call `mach build` makes for a flat-image format, and loads the whole linked image. The probe is entered at the image base, where a flat image begins execution and where the linker places the entry symbol, so the harness still lays out the arguments itself rather than reaching the function under test through a compiled wrapper that would agree with the compiler by construction. The image loads at the harness's own base rather than the link's, which works because rv32 reaches both code and data pc-relatively.
+
+A wide global is loaded, stored, added and subtracted over the lane-crossing value sweep, with every answer checked against host arithmetic, and with the 32-bit sign boundary held in a second global. The store is checked three ways so a wrong lane addend cannot cancel itself out: read back in the same call, read again in a later call so the value had to reach memory, and followed by a re-read of a neighbouring global that the store must not have damaged.
+
+The remaining eleven probes still run from the unlinked `.text`, because a flat image carries no symbol table and so admits exactly one entry point. That is #2892.
+#### An ELFCLASS32 object is now Elf32 all the way down, not a 32-bit class byte on 64-bit bytes (#2861)
+The ELF writer took one thing from the target's pointer width - the class byte in `e_ident` - and then wrote Elf64 structures regardless. Every size, every field offset and every field width after byte 4 was a 64-bit literal. A 4-byte-pointer target therefore produced a file that announced ELFCLASS32 and then contradicted itself in its own header, which is worse than refusing: a reader trusts the class byte and misparses everything after it. The reader half had the same shape, walking Elf64 offsets without ever consulting the class byte it had just read.
+
+The geometry now lives in one record. `ElfLayout` states one class's structure sizes and alignment, `layout_for` derives it from the pointer width on the write side and `layout_from_class` from the class byte on the read side, and a set of `write_*` / `read_*` helpers own where every field goes - callers pass values and never offsets. So the class byte and the geometry come out of one call and cannot disagree.
+
+Two of those fields **move** rather than narrow, which is the part a "write a pointer-sized field" rule would have got wrong while looking right: `Elf32_Phdr` puts `p_flags` after `p_memsz` where `Elf64_Phdr` puts it right after `p_type`, and `Elf32_Sym` puts `st_value` / `st_size` before the three small fields rather than after. A segment header with correct addresses and its permissions written at the 64-bit offset loads with no access at all and faults at the first instruction, nowhere near the mistake. `r_info` is a third case again - neither a width change nor a reorder, but a different packing, with eight bits for the relocation type instead of thirty-two. A type that does not fit is now named before any output is allocated rather than truncated into a different, valid relocation.
+
+DWARF had the same defect one layer up. `address_size` was already derived from the pointer width and `emit_addr` already wrote 4 or 8 bytes, but every relocation attached to those fields was a hardcoded `RK_ABS64` - an 8-byte write over a 4-byte field, corrupting whatever followed it. The kind now comes from `of.abs_kind_for_pointer_width`, the same call the data-pointer path already used, so the relocation width and the field width are one decision.
+
+`riscv32` is registered on the ELF format as a result: an rv32 relocatable object and an rv32 static executable are both accepted by `readelf -a`, `llvm-readobj --all` and `llvm-dwarfdump --verify` with no errors. The three dynamic writers - PIE, shared objects, dynamically linked executables - lay their tables out in ELF64 throughout and now refuse an ELFCLASS32 target by name, because an Elf32 dynamic image needs `Elf32_Dyn`, a 4-byte GOT slot, rv32 PLT stubs and the rv32 dynamic relocation types, none of which exist. That is #2894, and the refusal says so rather than emitting an image that looks valid and is not.
+
+Output is byte-identical on `linux-x86_64`, `linux-arm64` and `linux-riscv64` at debug, `-g`, `--pie` and release.
+
+#### An `i64` global compiles on rv32 instead of crashing the compiler (#2867)
+A wide global feeding wide arithmetic on riscv32 killed the compiler with SIGSEGV and no diagnostic, and the same construct without the arithmetic produced a refusal. Both came from one place. Lowering folds a global straight into the access as a symbol operand, so a `MIR_LOAD` or `MIR_STORE` on one carries no memory operand at all, while `legalize` entered its memory path on the opcode alone and then indexed the memory operand it assumed was there. The index was `-1`: one shape read a wild pointer and faulted, the other read one slot past the operand array and refused off whatever it found. The refusal was never a decision.
+
+The pass now decides that a memory access is one by finding the address, not by reading the opcode, and it recognizes the two forms an address takes: a memory operand walked by displacement, and a symbol walked by addend. So a wide global is no longer refused either - it is legalized like any other fixed base, one native access per lane at successive offsets on the same symbol, which is what a 64-bit value on a 32-bit machine has always cost. An access whose address is neither form falls through to the named refusal for its opcode rather than into an expansion that cannot describe it.
+
+mos6502, the other target that legalizes to a narrower ALU, is unaffected: an `i64` there needs a frame slot and the pass refuses the wide `MIR_ALLOCA` before any access is examined.
+
+### Added
+
+#### A declaration-scope `$if` that declares nothing can ask about a type (#2876)
+`$if ($size_of(MeshUniforms) != 64) { $error("MeshUniforms must be 64 bytes"); }` at module scope was rejected: the gate was folded while names were being resolved, and no type has a layout yet at that point. The layout check people actually want to write - a wire format, a uniform block, two records that share a slot - had nowhere to live except a runtime test that only fires if someone runs the suite.
+
+A declaration-scope `$if` now runs at one of two times, and what its arms contain picks which. A chain some arm of which **declares something** is decided while names are resolved, because what it decides is which declarations exist, and every later stage reads that set - a genuinely circular question to ask a type about, since the type universe is built from the declarations the gate is choosing. A chain no arm of which declares anything contributes no name and no type whichever arm wins, so nothing depends on deciding it early: it is decided during type checking, where its gate measures a type, queries one, or compares one. The measurement runs through the same path a function-body gate uses, so a size measured in one position and the same size measured in another cannot disagree.
+
+Which time applies is decided **syntactically, over every arm** - `$if`, every `$or`, and a trailing `$or {}` - before any gate is evaluated. One declaring arm anywhere keeps the whole chain at the earlier time. A per-arm rule would make the stage that runs the gate depend on which arm the gate selects, which is not knowable at the stage that would have to choose. Because a `use` is a declaration, conditional imports - by far the commonest declaration-scope `$if` - are untouched, as is the refusal a declaring chain gives a type question, now naming the arm that declares as the reason.
+
+The cost is stated rather than left to be discovered: `$if` runs at one of two times depending on its contents, written into `doc/language/comptime-control.md` and onto the deferral itself. The one visible consequence is ordering - a reached `$error` under a deferred chain is reported during type checking, so an unrelated resolution error in the same module is now reported before it rather than after.
+#### The riscv32 float path is executed rather than only emitted (#2874)
+A histogram of a broad rv32 corpus shows `fld`, `fsd`, `fadd.d`, `fsub.s`, `fmul.d`, `fdiv.d`, `fmv.w.x`, `fcvt.w.d`, `fcvt.s.d`, `fcvt.d.w` and `fcvt.d.s`. Not one of them had ever been executed. The reference RV32 core modeled RV32I and M and refused a float **by name** - honest about its coverage rather than skipping what it did not model, which is what made the gap visible instead of silently green - so every float assertion this target had was that codegen emitted something, and none was about what the emitted bytes compute. That is the same shape that let four integer defects sit in rv32 through a passing suite.
+
+The core now models the closed RV32F and RV32D set from the manual: the float register file with its NaN-boxing rule, the loads and stores, the arithmetic, the compares, `fclass`, the sign-injection family, `fmin` and `fmax`, the whole `fcvt` family and the four fused multiply-adds, each written out as the number the manual gives next to the mnemonic it gives, importing nothing from the encoder. The ten RV64-only float opcodes are refused by name, so the core can **say** it met an `fcvt.l.d` on a 32-bit target rather than computing an answer the hardware would have trapped on.
+
+IEEE 754 is the deliverable rather than the instruction count. NaN-boxing is enforced on both sides, so an improperly boxed single-precision operand reads as the canonical quiet NaN as the manual says - the FLEN-versus-XLEN asymmetry that already produced two frame defects on this target. The float-to-integer conversions follow the RISC-V rules rather than the host's, which are undefined exactly where RISC-V is defined: NaN converts to the destination maximum, out-of-range saturates, and a value in (-1, 0] is zero and is not out of range.
+
+An executed sweep runs the conversions, the arithmetic, the compares and the precision changes over both NaNs, both infinities, both zeros, a subnormal, the saturation boundaries and a tie that rounds to even only if the rounding is right, with every answer checked against the host's own float unit and never against mach's riscv64 target. It runs on `ilp32`, `ilp32f` and `ilp32d`, because where an `f64` rides differs across the three, and the probe's own interface is entirely integer so the harness can lay out arguments identically for all of them and still reach the float unit inside.
+
+#### riscv32 converts between a 64-bit integer and a float, open-coded (#2860)
+RV32 has no instruction for it. `fcvt.d.l`, `fcvt.lu.d`, `fcvt.s.l` and the rest of the family name a 64-bit GP operand through their `L` selector, and no RV32 register is that wide, so `i64 -> f64`, `f64 -> u64` and their six siblings had no encoding and were refused by name. `be.codegen.legalize` could not supply one either: it splits a wide integer into native lanes and threads carries between them, and a conversion is a **single rounding of the combined value**, not two lane conversions recombined afterwards, so the model the pass is built on does not apply to it.
+
+The conversion is now open-coded from 32-bit conversions and float arithmetic, rather than lowered to the soft-float helpers (`__floatdidf`, `__fixdfdi` and their twins) a C toolchain would call. The helpers are correct by construction and are a fraction of the code, and they were rejected because they introduce a **runtime dependency this backend has nowhere else on this target**: a freestanding RV32 image, which is the configuration mach's RISC-V targets exist for, would then need a libgcc-shaped runtime linked before an `i64 -> f64` worked at all. The conversion would be missing on exactly the target that wanted it most. The tradeoff is recorded where the expansion is written, because the price of the choice is that a rounding mistake is a silent wrong answer instead of a failure.
+
+Each direction is an identity that rounds exactly once. `i64 -> f64` is `f64(hi) * 2^32 + f64(lo)`: each lane converts exactly, the scale is a power of two, so the closing add is a sum of two exact values. `f64 -> u64` is a truncating split whose two scalings and one subtraction are all exact, and which inherits the saturation and NaN rules **from the native 32-bit `fcvt` in each lane** rather than testing for them, so `NaN` lands on the destination maximum and a negative input on zero without a compare in sight. `f64 -> i64` converts the magnitude that way and then clamps and negates, which is what puts `NaN` and `+inf` on `INT64_MAX` and `-inf` on `INT64_MIN`.
+
+The `f32` forms may **not** take the `f64` result and narrow it. That is a double rounding and it is not innocuous here: a 64-bit integer can round in `f64` to exactly an `f32` midpoint without being one, and ties-to-even then breaks the wrong way. The value is first rounded to odd at a fixed 11-bit granularity when it needs more than 53 bits, which leaves the `f64` carrier exact and makes the narrowing the only rounding. A sweep over values constructed to sit on that midpoint catches the naive version at every exponent from 2^54 up, and passes as written.
+
+The four arms fire only where the conversion's float side rides a float register bank, so mos6502 - one register class, floats in integer lane groups - keeps its refusal, and every 64-bit target is untouched: x86-64, aarch64 and riscv64 objects are byte for byte what they were.
+
+#### A storage binding nothing writes is emitted `NonWritable`, and can say so (#2879)
+A `#[storage(set, binding)]` buffer that a stage only reads was emitted with no `NonWritable` decoration, so every consumer had to enable `vertexPipelineStoresAndAtomics` to read one from a vertex stage. The read-only case is the common one - a joint palette, an instance buffer, a light list - and it is the case where the decoration is free and its absence costs a hardware requirement.
+
+The emitter now decides it from the module. A storage binding no emitted body stores through is decorated `NonWritable`, over the same emitted closure every other whole-module rule here is stated about, so a store from a drawn-in library body counts exactly as a local one does. The analysis is a **proof rather than a search**: two positions read - a load's address and an access chain's base, whose result is then subject to the same question - and every other appearance of the binding or of a pointer derived from it counts as a write. A missing decoration is therefore possible and a wrong one is not.
+
+`#[storage(set, binding, "readonly")]` states it explicitly, and a store through such a binding is a compile error naming the line that wrote it, on every target rather than only on a SPIR-V build. That is what the qualifier buys over the inference: an accidental write does not produce a wrong module, it produces a correct one that quietly widens the pipeline's requirements, and the qualifier turns it into a diagnostic. The emitter refuses a write it can still see after lowering - an address handed somewhere it cannot follow - so the decoration cannot become a promise the module breaks. The memory qualifier rides after the descriptor pair rather than in a second decorator name, so a further qualifier is one accepted spelling and no new interface role.
+
+Everything else is unchanged: of boom's seven shaders, the six with no storage binding are byte-identical, and `skinned_vert` differs by exactly the one decoration.
+
+#### A layout intrinsic can be measured inside a comptime `$if` (#2857)
+`$size_of` and `$align_of` are constants, but they could not appear in a `$if` condition, so the thing most worth asserting about a layout - a **relationship** between two of them - could only be a runtime test. Two records a renderer writes into one slot at a fixed offset must be the same size; if they diverge, one shader reads its colour out of the middle of a matrix, with no diagnostic at any layer. A test catches that only if someone runs the suite. A `$error` catches it in the build that introduced it.
+
+`$if ($size_of(A) != $size_of(B)) { $error("..."); }` now compiles inside a function body, as does a comparison against a literal and an intrinsic folded into a larger expression.
+
+The measurement is not new and deliberately is not duplicated: the comptime evaluator gained a resolver seam, and sema answers it through the same `fold_layout_intrinsic` a type position already used, so a size measured in an array length and the same size measured in a `$if` cannot disagree. Lowering installs its own resolver beside the type-query one it already had, because a chain gated on a comptime parameter or inside a generic body has its arm selected at monomorphization and never reaches sema's.
+
+Resolve reaches the position through a mechanism that was already there: `bind_comptime_if` defers a chain it cannot fold yet, binding every arm and leaving arm selection to a later pass, which is what a type comparison has always done. A layout gate joins that list rather than introducing a second rule.
+
+### Changed
+
+#### A refused layout intrinsic now says which position refused it, and why (#2857)
+`a layout intrinsic has no value in this position: it measures a type, which only a type position resolves` was true of every position and is now true of one. A **declaration-scope** `$if` still cannot measure, because it selects which declarations exist and that is decided before any type is laid out, so it says that instead and points at the position that does work. `$offset_of` is named apart, since it is unavailable for a different reason - a field offset is decided at lowering - and a message about type checking would be a stale explanation the moment the resolver exists.
+
+Two limits are filed rather than left implicit: `$length_of` still does not fold in a gate (#2875), and no declaration-scope gate can see a type at all, which is shared with type queries and comparisons (#2876).
+
+### Changed
+
+#### A target now owns the operations it defines (#2888)
+The compiler knew what a SPIR-V instruction was. `src/lang/spirvop.mach` sat outside the target holding 41 hand-written string comparisons that mapped an instruction name to a number, and the front end read it directly. Adding an instruction meant editing the compiler, so a shader library could not add one at all.
+
+The table now hangs off the ISA vtable and the target fills it. It reaches the front end as data on the comptime context beside `pointer_width`, for the reason stated there: it is a target machine fact the frontend needs, and the frontend has no target. So `fe` names no back end, and unlike before it holds no SPIR-V numbers of its own. `src/lang/spirvop.mach` is gone, and the IR carries the set tag and opcode under target-neutral names.
+
+An instruction's arity is now checked, which nothing did before. The decorator's contract is that operands come from the parameters in order, so a declaration whose parameter list is the wrong length assembled the instruction with the wrong operand count. The family looks uniform and is not: `Reflect` takes two operands where `Refract` takes three, and `FMin` two where `FClamp` takes three.
+
+Emitted output is unchanged. Every machine target is byte-identical, 224 objects each across x86-64, arm64 and riscv64, and the SPIR-V fixtures emit the same bytes.
+
+This is the first piece of #2888. Type constructors, the `#[handle]` and `#[op]` declarations, and the bodyless `def` are not here.
+
+### Fixed
+
+#### A shader indexing with a `u32` no longer requires `shaderInt64` (#2878)
+A SPIR-V module whose arithmetic was entirely 32-bit declared `OpCapability Int64`, because every array index was widened to the target's pointer width before it reached the emitter. That is right for a byte-addressed machine, where an index is scaled by the element size and added to a base address and so must fill a machine word. SPIR-V addresses logically: an `OpAccessChain` index selects a member, nothing scales it, and the widening bought nothing.
+
+It cost a device requirement. `shaderInt64` is an optional feature, so a shader that performed no 64-bit arithmetic was refused outright by `vkCreateShaderModule` on hardware without it, and was invalid usage on hardware with it unless the application had enabled the feature. Downstream this was worked around by requesting the feature unconditionally and refusing to start without it, which narrowed the hardware the application ran on.
+
+The index width is now taken from `MachineModel.flat_addressing`, the same axis that already gates float address materialization and aggregate member walks (#2655), so the transformation is gated rather than the target. A genuinely 64-bit index still declares `Int64`, since that is what the program asked for. Every machine target's output is byte-identical.
+
+
+### Added
+
+#### RV32 is a target (#2778)
+mach compiles for 32-bit RISC-V. `isa = "riscv32"` with `abi = "ilp32"`, `"ilp32f"` or `"ilp32d"` resolves a full machine description, and `$mach.arch.riscv32` and the three `$mach.abi.ilp32*` tags exist so a body can be guarded for it.
+
+Nothing about the RISC-V backend was duplicated to get there. One `build_riscv` fills either arch's vtable, register machine, relocation seam and model from the register width it is handed; the register numbering, the psABI roles, the selection pack, the encoder, the printer and the attribute derivation are shared unchanged. On the convention side the three ilp32 members differ from their lp64 twins in exactly one declared fact, `xlen_bits`, and a test builds each pair and compares every other field rather than asserting that in prose.
+
+The width facts are the machine's and are read as such. `max_alu_width` is 4 on rv32, which puts an `i64` above the ALU and sends it through the same lane-splitting `legalize` pass that serves the 6502's 8-bit one. FLEN stays 64 because rv32gc has the D extension, so a float register is twice the width of an integer one - the pair that a single "word size" gets wrong, and the one the frame layout now reads as two separate strides.
+
+**What rv32 does not do yet, and says so.** The ELF writer stamps ELFCLASS32 from the pointer width while emitting Elf64 structures, so `of.elf` deliberately does not cover this arch and an rv32 linux tuple is refused at resolve time rather than producing a file whose class byte contradicts its layout (#2861). rv32 composes with the `raw` flat image today. Converting between a float and a 64-bit integer has no RV32 instruction and no lowering, so both the encoder and `legalize` refuse it by name with the issue number rather than emitting an RV64 opcode the hardware would trap on (#2860).
+
+#### A shader can use an interface variable declared in another module (#2843)
+#2823 let a shader call a function defined in a shared module, but the shader could not use an **interface variable** one declared. A library that owned anything beyond pure math had nowhere to put its descriptor set: a drawn-in body naming its own module's `#[uniform(...)]` found nothing, and the access was refused as computed addressing.
+
+The cause was that `Emit.root` was the module being compiled and every global resolved against it, so `declare_interface`, `iface_slot_of`, `global_var_id` and the block-layout helpers could only ever see the root's. Globals now flatten into one unit-wide table exactly as functions did, `GlobalEnt` carrying the `(member, index)` pair, and every per-global array is indexed by a table index. A global's type ids are read against **its own module's** type table, which is what the `(member, index)` pair exists to make possible - reading them against the root's would resolve each id to whatever type sits at the same index there, which is a wrong type silently rather than a failure. An extern shadow is never entered in the table for the same reason: it is minted against the consumer's type table, so its type id means nothing outside the module that made it.
+
+A drawn-in module contributes globals by **reachability, not membership**, the rule the function table already stated. A shared module may declare a whole descriptor set, and a shader importing it for one helper does not inherit the rest. The root is exempt: its interface list is the module's pipeline contract, declared whole. Existing single-module shaders emit byte-identical modules.
+
+The driver half closes the module set over cross-module **global** references, not only function ones. A shader that reads a shared module's uniform and calls nothing in it must still draw that module in, and before this it could not resolve the variable at all.
+
+### Fixed
+
+#### riscv64 images claimed an instruction set they did not have (#2828)
+`.riscv.attributes` carried an arch string taken from a per-ISA constant. A constant describes what mach's encoder emits, and an image is not what its encoder emits - it is that plus every object linked into it. A mach image containing a clang object built for `rv64gc` claimed no compressed extension and none of the z-extensions it actually held, so a disassembler configured from the image decoded its compressed float loads as `<unknown>`. This is the same class of false claim `e_flags` carried before #2813, one section over.
+
+Nothing states a string now. An image's claims are derived from the two facts that decide them - the resolved ABI and the emitted bytes - and a linked image's are merged from its inputs. `BuildAttributes` no longer has an arch field at all, so a constant is not merely unused but inexpressible.
+
+The merge rule is the arch's, because a union is right for the ISA string and wrong for everything else. Stack alignment must agree or the inputs cannot be linked. Unaligned access is a permission, so the image permits it if any input needed it. A privileged-spec disagreement leaves the image unable to state one, so it states none. A tag mach does not model survives only while every input that states it agrees. No shared layer can know which tag takes which rule, so the seam hands the arch the whole attribute body and reads none of it; the ELF layer keeps only the container, which the ARM EABI defines identically.
+
+`obj.rehome_remap` copies the body rather than aliasing it. Rehoming exists precisely because the source allocator is going away, so a field holding a pointer into it needs a copy and not an assignment - the note on that function now separates the two failure modes, since a missed scalar reverts to zero on the parallel path while a missed pointer segfaults somewhere else entirely.
+
+#### Two modules could claim one descriptor set and binding with no diagnostic (#2843)
+Within one module a repeated `(set, binding)` is a typo its author can see. Across modules it is neither: two shared libraries can each declare `#[uniform(0, 0)]` without either author seeing the other, and the shader importing both is where the conflict first exists. `spirv-val` does not catch it, because two variables at one pair are well-formed SPIR-V and the conflict is with the pipeline layout, which is not in the module.
+
+The pair is now checked over the set one entry point reaches, across the descriptor roles rather than within one, since a `#[uniform(0, 0)]` and a `#[storage(0, 0)]` are two descriptor types claiming one slot. The Location overlap check widened the same way, and both diagnostics name the declaring **module** when it is not the one being compiled - a message naming two `camera`s tells the one person who can act on it nothing.
+
 ## [4.17.0] - 2026-08-08
 
 ### Fixed

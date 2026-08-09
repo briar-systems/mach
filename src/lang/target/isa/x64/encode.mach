@@ -3826,11 +3826,21 @@ fun emit_gp_store(dst: isa.Operand, gp: i32, w: u8, buf: *enc.ByteBuf) R.Result[
 # emit one register-register SSE conversion `cvt_op dst_reg, src_reg`
 # at the given integer-side byte width (sizes REX.W for the GP operand of a
 # CVTSI2SS/SD / CVTTSS2SI/SD; a float-to-float CVTSS2SD / CVTSD2SS ignores it)
+#
+# the encoding reads only `size` and `flags`, but `--emit-asm` names each operand
+# from the operand's own size, so the GP side carries `int_w` and only the XMM side
+# carries 16. which side is which follows the opcode: CVTSI2SS/SD reads a GP source,
+# CVTTSS/SD2SI writes a GP destination, and the float-to-float forms have neither
 fun emit_cvt_reg(cvt_op: u16, dst_reg: i32, src_reg: i32, int_w: u8, buf: *enc.ByteBuf) {
+    var dst_sz: u8 = 16;
+    var src_sz: u8 = 16;
+    if (cvt_op == x64.CVTSI2SS || cvt_op == x64.CVTSI2SD) { src_sz = int_w; }
+    if (cvt_op == x64.CVTTSS2SI || cvt_op == x64.CVTTSD2SI) { dst_sz = int_w; }
+
     var cvt: isa.Inst = isa.inst_blank();
     cvt.opcode = cvt_op;
-    cvt.dst    = isa.make_reg(dst_reg, 16);
-    cvt.src1   = isa.make_reg(src_reg, 16);
+    cvt.dst    = isa.make_reg(dst_reg, dst_sz);
+    cvt.src1   = isa.make_reg(src_reg, src_sz);
     cvt.size   = int_w;
     cvt.flags  = width_flags(int_w);
     encode_inst(?cvt, buf);
@@ -3983,6 +3993,73 @@ fun emit_u64_to_fp(dst: isa.Operand, work: i32, dst_w: u8, cvt_op: u16, buf: *en
     ret emit_float_store(dst, work, dst_w, buf);
 }
 
+# truncate the float in `src_reg` to an unsigned 64-bit integer
+# left in SCRATCH_REG. SSE2 carries no unsigned truncating convert, and the signed
+# CVTTSS/SD2SI it does carry returns the integer-indefinite value for every source
+# at or above 2^63, so the range is split at that boundary: below it the signed
+# convert is already exact, at or above it the boundary is subtracted off first and
+# 2^63 added back to the integer result, which is exact because the biased value
+# lands in [0, 2^63). the boundary is a pooled constant read as `[rip + .Lconst.N]`
+# by both the compare and the subtract, FLOAT_SCRATCH0 holds the biased copy so an
+# allocated source register is never written, and SCRATCH_REG2 carries the re-add.
+# a NaN source leaves UCOMIS unordered with CF set and so takes the direct arm,
+# keeping the indefinite value the signed convert gives it. the two forward rel32
+# jumps are intra-instruction, patched here from the measured branch lengths
+fun emit_fp_to_u64(st: *enc.EncodeState, src_reg: i32, src_w: u8, cvt_op: u16) R.Result[bool, str] {
+    val buf: *enc.ByteBuf = ?st.buf;
+    var bound_bits: u64 = 0x43E0000000000000;
+    if (src_w == 4) { bound_bits = 0x5F000000; }
+    val br: R.Result[isa.Operand, str] = float_const_operand(st, bound_bits, FLOAT_SCRATCH1, src_w);
+    if (R.is_err[isa.Operand, str](br)) { ret R.err[bool, str](R.unwrap_err[isa.Operand, str](br)); }
+    val bound: isa.Operand = R.unwrap_ok[isa.Operand, str](br);
+
+    var ucom: isa.Inst = isa.inst_blank();
+    ucom.opcode = x64.UCOMISD;
+    if (src_w == 4) { ucom.opcode = x64.UCOMISS; }
+    ucom.dst  = isa.make_reg(src_reg, 16);
+    ucom.src1 = bound;
+    ucom.size = src_w;
+    val ue: R.Result[bool, str] = encode_inst_sym(st, ?ucom);
+    if (R.is_err[bool, str](ue)) { ret ue; }
+
+    var jb: isa.Inst = isa.inst_blank();
+    jb.opcode = x64.JB;
+    jb.dst    = isa.make_label(nil);
+    jb.size   = DEFAULT_OPERAND_SIZE;
+    encode_inst(?jb, buf);
+    val jb_patch: usize = buf.len - 4;
+    val after_jb: usize = buf.len;
+
+    # value >= 2^63: convert the biased value and add the bias back.
+    emit_movaps_rr(FLOAT_SCRATCH0, src_reg, buf);
+    var sub: isa.Inst = isa.inst_blank();
+    sub.opcode = x64.SUBSD;
+    if (src_w == 4) { sub.opcode = x64.SUBSS; }
+    sub.dst  = isa.make_reg(FLOAT_SCRATCH0, 16);
+    sub.src1 = bound;
+    sub.size = src_w;
+    val se: R.Result[bool, str] = encode_inst_sym(st, ?sub);
+    if (R.is_err[bool, str](se)) { ret se; }
+    emit_cvt_reg(cvt_op, x64.SCRATCH_REG, FLOAT_SCRATCH0, 8, buf);
+    emit_gp_ri8(x64.MOV, x64.SCRATCH_REG2, (1::u64 << 63)::i64, buf);
+    emit_gp_rr8(x64.ADD, x64.SCRATCH_REG, x64.SCRATCH_REG2, buf);
+
+    var jmp: isa.Inst = isa.inst_blank();
+    jmp.opcode = x64.JMP;
+    jmp.dst    = isa.make_label(nil);
+    jmp.size   = DEFAULT_OPERAND_SIZE;
+    encode_inst(?jmp, buf);
+    val jmp_patch: usize = buf.len - 4;
+    val after_jmp: usize = buf.len;
+
+    # value < 2^63: the signed conversion is exact.
+    patch_rel32(buf, jb_patch, (buf.len - after_jb)::i32);
+    emit_cvt_reg(cvt_op, x64.SCRATCH_REG, src_reg, 8, buf);
+
+    patch_rel32(buf, jmp_patch, (buf.len - after_jmp)::i32);
+    ret R.ok[bool, str](true);
+}
+
 # materialize a fully-resolved float conversion into its SSE byte
 # sequence. `encode_cvt` names both operands as registers and has no memory form, so
 # an operand the allocator spilled is staged through a scratch register (XMM
@@ -4000,10 +4077,11 @@ fun emit_u64_to_fp(dst: isa.Operand, work: i32, dst_w: u8, cvt_op: u16, buf: *en
 # unsigned 64-bit value >= 2^63 takes a range-fixup path (`emit_u64_to_fp`) since the
 # signed CVTSI2SS/SD has no direct unsigned-64 form.
 #
-# FP_TO_SI / FP_TO_UI map to the signed CVTTSS2SI / CVTTSD2SI: a full unsigned
-# 64-bit conversion needs a range-fixup sequence x86-64 lacks a single instruction
-# for; the signed form is correct for every value in signed range, which is what the
-# language's reachable conversions produce, and matches the prior selection.
+# FP_TO_SI uses the signed CVTTSS2SI / CVTTSD2SI at the destination's own width.
+# FP_TO_UI has no SSE2 instruction of its own, so this target owes the expansion: a
+# sub-64-bit unsigned destination converts at 64-bit width and keeps the low bytes
+# (2^32 - 1 is far inside the signed 64-bit range), and a 64-bit unsigned destination
+# takes the two-arm range fixup in `emit_fp_to_u64`.
 #
 # THE FLOAT SIDE'S WIDTH IS REFUSED WHEN IT IS NOT 4 OR 8 (#2733), and which side is
 # the float one depends on the opcode - both for FP_TRUNC / FP_EXT, the destination
@@ -4091,6 +4169,19 @@ fun encode_float_conv(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirIns
     val src_reg: i32 = R.unwrap_ok[i32, str](sr);
     var cvt_op: u16 = x64.CVTTSD2SI;
     if (src_w == 4) { cvt_op = x64.CVTTSS2SI; }
+
+    if (op == mir.MIR_FP_TO_UI) {
+        if (dst_w >= 8) {
+            val fx: R.Result[bool, str] = emit_fp_to_u64(st, src_reg, src_w, cvt_op);
+            if (R.is_err[bool, str](fx)) { ret fx; }
+        } or {
+            # every value a narrower unsigned destination holds is inside the signed
+            # 64-bit range, so the 64-bit convert is exact and the store truncates.
+            emit_cvt_reg(cvt_op, x64.SCRATCH_REG, src_reg, 8, buf);
+        }
+        ret emit_gp_store(dst, x64.SCRATCH_REG, dst_w, buf);
+    }
+
     emit_cvt_reg(cvt_op, x64.SCRATCH_REG, src_reg, dst_w, buf);
     ret emit_gp_store(dst, x64.SCRATCH_REG, dst_w, buf);
 }
@@ -6711,6 +6802,21 @@ fun u64_to_dec(n: u64, dst: *u8) usize {
 # codegen installs - so a test states the machine bytes a spelling produces rather
 # than a property of an intermediate. A statement needing a relocation is out of
 # scope here: the interner is nil, so only self-contained encodings are asserted.
+# the machine the emit-level tests below encode for, mirroring the width facts
+# `register.mach` states for x86-64. This encoder reads no width from the model - an
+# x86-64 operand carries its own width - but the state still carries one, because an
+# encode state without a machine is not a state the encoder would produce.
+var t_model_x64: isa.MachineModel;
+fun x64_machine() *isa.MachineModel {
+    t_model_x64.pointer_width = 8;
+    t_model_x64.gpr_width     = 8;
+    t_model_x64.max_alu_width = 8;
+    t_model_x64.alu_min_width = 4;
+    t_model_x64.spill_width   = 8;
+    t_model_x64.flen_bits     = 64;
+    ret ?t_model_x64;
+}
+
 # ---
 # body: the inline-asm body text
 # want: the expected encoding, as bytes
@@ -8183,7 +8289,7 @@ test "mach.lang.target.isa.x64.encode.encode_float_arith:two_address_shapes" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var st: enc.EncodeState;
-    enc.state_blank(?st, ?alloc);
+    enc.state_blank(?st, ?alloc, x64_machine());
     val buf: *enc.ByteBuf = ?st.buf;
     var f: mir.MirFunction;
     var bad: i32 = 0;
@@ -8270,7 +8376,7 @@ test "mach.lang.target.isa.x64.encode.encode_float_cmp:operands_in_place" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var st: enc.EncodeState;
-    enc.state_blank(?st, ?alloc);
+    enc.state_blank(?st, ?alloc, x64_machine());
     val buf: *enc.ByteBuf = ?st.buf;
     var f: mir.MirFunction;
     var bad: i32 = 0;
@@ -8428,7 +8534,7 @@ test "mach.lang.target.isa.x64.encode:fneg_sign_mask_is_pooled" {
     page.make(?alloc);
     var itn: intern.Interner = intern.init(?alloc);
     var st: enc.EncodeState;
-    enc.state_blank(?st, ?alloc);
+    enc.state_blank(?st, ?alloc, x64_machine());
     st.interner = ?itn;
     val buf: *enc.ByteBuf = ?st.buf;
     var f: mir.MirFunction;
@@ -8506,7 +8612,7 @@ test "mach.lang.target.isa.x64.encode:float_access_width_refusals_emit_nothing" 
     var alloc: A.Allocator;
     page.make(?alloc);
     var st: enc.EncodeState;
-    enc.state_blank(?st, ?alloc);
+    enc.state_blank(?st, ?alloc, x64_machine());
     val buf: *enc.ByteBuf = ?st.buf;
     var bad: i32 = 0;
 
@@ -8611,7 +8717,7 @@ test "mach.lang.target.isa.x64.encode:float_width_refusals_emit_nothing" {
     page.make(?alloc);
     var itn: intern.Interner = intern.init(?alloc);
     var st: enc.EncodeState;
-    enc.state_blank(?st, ?alloc);
+    enc.state_blank(?st, ?alloc, x64_machine());
     # the negate arm reaches the constant pool for its sign mask (#2754), and a pool
     # entry has to be named, so this state carries an interner
     st.interner = ?itn;
