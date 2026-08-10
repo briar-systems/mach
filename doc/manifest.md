@@ -756,9 +756,9 @@ A build cell is one artifact × one target × one profile.
   you to pick one, naming every candidate.
 - `mach test <path>` selects the first artifact that declares the resolved target as
   its primary context. It links the union of all artifacts' referenced entries plus
-  exported dependency entries, filtered to the native target (tests run on native
-  hardware only). If two artifacts' objects collide on symbols in that union, that is
-  an honest link error — restructure the entries.
+  exported dependency entries, filtered to that target. Foreign-target tests require
+  a compatible `--runner`. If two artifacts' objects collide on symbols in that union,
+  that is an honest link error — restructure the entries.
 
 ### Enumerated cells are filtered; named ones are not
 
