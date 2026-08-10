@@ -412,18 +412,16 @@ The artifact **name** differs between the two, so `$bin.name` differs by platfor
 project that reads it sees `app` everywhere and `app-windows` on Windows. Nothing in
 mach's own source reads it, and a project that does needs to expect both.
 
-`mach build` is unaffected by the split: it enumerates artifact-by-target cells and
-builds only the ones that match, so each platform gets its stanza with nothing named on
-the command line. `mach test` is not, today. It links the whole source tree rather than
-one artifact, so it takes the **first declared** artifact as the root of its build, and
-on a host that stanza does not declare it refuses rather than reaching for the other
-one. Until #2961 is fixed, a test run on the platform whose stanza is declared second
-has to name it, as in `mach test . --bin app-windows`.
+`mach build` enumerates artifact-by-target cells and builds only the ones that match,
+so each platform gets its stanza with nothing named on the command line. `mach test`
+links the whole source tree rather than one artifact, but selects its primary context
+from the first artifact that declares the resolved target, so the same split works
+there. `mach run` selects the target's artifact when exactly one matches; if several
+artifacts can run on that target, it still asks for `--bin` rather than guessing.
 
-mach's own `mach.toml` is NOT split yet, deliberately. Splitting it is what found
-#2961, and the repository is not going to ship a shape its own `mach test` cannot run
-on Windows, or the command-line flags that would hide that. It follows once the
-selection is fixed.
+mach's own `mach.toml` is split this way: an ordinary Windows build produces
+`bin/mach.exe`, and its test run selects `mach-windows` as the primary context without
+a command-line workaround.
 
 ### `subsystem` — the windows console/GUI selector
 
@@ -746,12 +744,14 @@ A build cell is one artifact × one target × one profile.
   with every target in its `targets`. `--bin <name>` / `--lib <name>` narrow to one
   artifact; `--target <name>` selects a declared target; `--profile <name>` selects
   a profile.
-- `mach run <path>` and `mach test <path>` build exactly one artifact; with several
-  declared and no `--bin`/`--lib`, they ask you to pick one, naming every candidate.
-- `mach test` links the union of all artifacts' referenced entries plus exported
-  dependency entries, filtered to the native target (tests run on native hardware
-  only). If two artifacts' objects collide on symbols in that union, that is an
-  honest link error — restructure the entries.
+- `mach run <path>` consumes exactly one artifact. With no `--bin`/`--lib`, it selects
+  one when exactly one artifact declares the resolved target; if several do, it asks
+  you to pick one, naming every candidate.
+- `mach test <path>` selects the first artifact that declares the resolved target as
+  its primary context. It links the union of all artifacts' referenced entries plus
+  exported dependency entries, filtered to the native target (tests run on native
+  hardware only). If two artifacts' objects collide on symbols in that union, that is
+  an honest link error — restructure the entries.
 
 ### Enumerated cells are filtered; named ones are not
 
