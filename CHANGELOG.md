@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.18.3] - 2026-08-10
+
+### Fixed
+
+#### Exported dependencies keep every symbol claim for a shared library (#2975)
+
+The dependency cascade deduplicated link requirements by source, loader name,
+and logical library, but discarded the later requirement in full. When two
+native dependencies imported disjoint symbols from the same system library,
+only the first dependency's claims reached the linker. The missing claims then
+surfaced as unattributed dynamic imports even though both manifests declared
+the library correctly. A Windows application combining GLFW and WASAPI exposed
+the defect through their shared `kernel32.dll` requirement.
+
+Exact duplicate requirements now retain a stable union of their symbol claims.
+Each claim array remains independently owned while dependency manifests are
+released, and allocation failure leaves the retained requirement unchanged.
+The PE cascade regression covers both root-to-dependency and
+dependency-to-dependency collisions on shared DLLs.
+
 ## [4.18.2] - 2026-08-09
 
 ### Fixed
