@@ -105,6 +105,12 @@ fwd impl.page_size;
 
 ## Entrypoint and output
 
+An artifact's `out` is literal across every target it names. A cross-platform
+executable therefore uses disjoint artifacts for extension conventions:
+`out = "bin/app"` for non-Windows targets and `out = "bin/app.exe"` for Windows.
+`mach init` emits that split for binary projects. Do not use one `targets = ["*"]`
+artifact when its output must be directly executable on Windows and elsewhere.
+
 The stdlib provides the platform `_start`, which calls whatever function
 exports the linker symbol `main`. `use std.runtime;` is required to link it in
 even though nothing references it by name:

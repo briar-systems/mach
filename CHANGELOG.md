@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+#### Target-split executables select the right artifact on every host (#2955, #2961, #2981)
+
+Whole-source builds no longer make the first artifact declaration load-bearing.
+The manifest layer now owns primary selection for both current and legacy driver
+paths and chooses the first artifact that declares the resolved target, while an
+explicit artifact remains authoritative and retains the existing incompatibility
+diagnostic. A single-product command such as `mach run` also infers an unnamed
+artifact when exactly one declares the target; multiple runnable artifacts remain
+an ambiguity rather than an order-dependent guess.
+
+`mach init` now demonstrates the extension contract it documents. Binary scaffolds
+use disjoint non-Windows and Windows artifacts, producing `bin/<name>` and
+`bin/<name>.exe` respectively, while library scaffolds keep one all-target artifact.
+mach's own manifest uses the same split, so `mach build .` on Windows produces
+`bin/mach.exe` without an output override and `mach test .` needs no artifact flag.
+
 ## [4.18.3] - 2026-08-10
 
 ### Fixed
