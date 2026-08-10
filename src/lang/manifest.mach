@@ -1404,6 +1404,77 @@ pub fun free_link_claims(alloc: *A.Allocator, items: *LinkRequirement, count: u3
     }
 }
 
+# merge `src`'s symbol claims into an equivalent retained link requirement
+#
+# Dependency and test-link overlays deduplicate the same dynamic library by its
+# source, loader name, and logical identity. Its claims are cumulative: two
+# native dependencies can use disjoint imports from one DLL, and discarding the
+# later requirement must not discard the only attribution for those imports.
+# The destination keeps its order, followed by each new source claim once.
+# ---
+# alloc: allocator owning the destination claim array
+# dst:   retained requirement, updated in place
+# src:   equivalent requirement whose claims remain independently owned
+# ret:   true after the union is stored, or an allocation/count error
+pub fun merge_link_claims(alloc: *A.Allocator, dst: *LinkRequirement,
+                          src: *LinkRequirement) R.Result[bool, str] {
+    var added: u32 = 0;
+    var i: u32 = 0;
+    for (i < src.symbol_count) {
+        var present: bool = false;
+        var j: u32 = 0;
+        for (j < dst.symbol_count) {
+            if (dst.symbols[j] == src.symbols[i]) { present = true; brk; }
+            j = j + 1;
+        }
+        j = 0;
+        for (!present && j < i) {
+            if (src.symbols[j] == src.symbols[i]) { present = true; brk; }
+            j = j + 1;
+        }
+        if (!present) { added = added + 1; }
+        i = i + 1;
+    }
+    if (added == 0) { ret R.ok[bool, str](true); }
+    if (dst.symbol_count > 0xFFFFFFFF - added) {
+        ret R.err[bool, str]("too many merged link symbol claims");
+    }
+
+    val total: u32 = dst.symbol_count + added;
+    val ar: R.Result[*intern.StrId, str] =
+        A.allocate[intern.StrId](alloc, total::usize);
+    if (R.is_err[*intern.StrId, str](ar)) {
+        ret R.err[bool, str](R.unwrap_err[*intern.StrId, str](ar));
+    }
+    val merged: *intern.StrId = R.unwrap_ok[*intern.StrId, str](ar);
+    var written: u32 = 0;
+    for (written < dst.symbol_count) {
+        merged[written] = dst.symbols[written];
+        written = written + 1;
+    }
+    i = 0;
+    for (i < src.symbol_count) {
+        var present: bool = false;
+        var j: u32 = 0;
+        for (j < written) {
+            if (merged[j] == src.symbols[i]) { present = true; brk; }
+            j = j + 1;
+        }
+        if (!present) {
+            merged[written] = src.symbols[i];
+            written = written + 1;
+        }
+        i = i + 1;
+    }
+
+    if (dst.symbols != nil && dst.symbol_count > 0) {
+        A.deallocate[intern.StrId](alloc, dst.symbols, dst.symbol_count::usize);
+    }
+    dst.symbols = merged;
+    dst.symbol_count = total;
+    ret R.ok[bool, str](true);
+}
+
 fun seg_eq(tmpl: str, start: usize, end: usize, lit: str) bool {
     val ll: usize = str_len(lit);
     if (end - start != ll) { ret false; }
@@ -2241,14 +2312,14 @@ pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, m: *Manif
     ret R.ok[BuildUnit, str](u);
 }
 
-fun requirement_in_buf(buf: *LinkRequirement, count: u32, req: *LinkRequirement) bool {
+fun requirement_index(buf: *LinkRequirement, count: u32, req: *LinkRequirement) i64 {
     var i: u32 = 0;
     for (i < count) {
         if (buf[i].source == req.source && buf[i].text == req.text
-            && buf[i].library == req.library) { ret true; }
+            && buf[i].library == req.library) { ret i::i64; }
         i = i + 1;
     }
-    ret false;
+    ret -1;
 }
 
 # resolve the `mach test` link surface (#1964): the union of every artifact's
@@ -2293,9 +2364,19 @@ pub fun resolve_test_libs(alloc: *A.Allocator, itn: *intern.Interner, m: *Manife
                         ret R.err[bool, str](R.unwrap_err[LinkRequirement, str](req_r));
                     }
                     var req: LinkRequirement = R.unwrap_ok[LinkRequirement, str](req_r);
-                    if (!requirement_in_buf(buf, w, ?req)) { buf[w] = req; w = w + 1; }
-                    # a duplicate is dropped here, so its claim copy is released
-                    or { free_link_claims(alloc, ?req, 1); }
+                    val duplicate: i64 = requirement_index(buf, w, ?req);
+                    if (duplicate < 0) { buf[w] = req; w = w + 1; }
+                    or {
+                        val mr: R.Result[bool, str] =
+                            merge_link_claims(alloc, ?buf[duplicate::u32], ?req);
+                        if (R.is_err[bool, str](mr)) {
+                            free_link_claims(alloc, ?req, 1);
+                            free_link_claims(alloc, buf, w);
+                            A.deallocate[LinkRequirement](alloc, buf, max::usize);
+                            ret R.err[bool, str](R.unwrap_err[bool, str](mr));
+                        }
+                        free_link_claims(alloc, ?req, 1);
+                    }
                 }
             }
             li = li + 1;
@@ -3656,6 +3737,57 @@ test "mach.lang.manifest.link_requirement:owns_its_claim_array" {
 
     free_link_claims(?alloc, ?req, 1);
     if (req.symbols != nil || req.symbol_count != 0) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.merge_link_claims:stable_owned_union" {
+    var backing: A.Allocator; var ar: arena.Arena; var alloc: A.Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val a_r: R.Result[intern.StrId, str] = intern.intern(?itn, "A");
+    val b_r: R.Result[intern.StrId, str] = intern.intern(?itn, "B");
+    val c_r: R.Result[intern.StrId, str] = intern.intern(?itn, "C");
+    if (R.is_err[intern.StrId, str](a_r) || R.is_err[intern.StrId, str](b_r)
+        || R.is_err[intern.StrId, str](c_r)) { arena.dnit(?ar); ret 1; }
+    val a: intern.StrId = R.unwrap_ok[intern.StrId, str](a_r);
+    val b: intern.StrId = R.unwrap_ok[intern.StrId, str](b_r);
+    val c: intern.StrId = R.unwrap_ok[intern.StrId, str](c_r);
+
+    val dst_r: R.Result[*intern.StrId, str] = A.allocate[intern.StrId](?alloc, 2::usize);
+    val src_r: R.Result[*intern.StrId, str] = A.allocate[intern.StrId](?alloc, 3::usize);
+    if (R.is_err[*intern.StrId, str](dst_r) || R.is_err[*intern.StrId, str](src_r)) {
+        arena.dnit(?ar); ret 1;
+    }
+    var dst: LinkRequirement;
+    dst.symbols = R.unwrap_ok[*intern.StrId, str](dst_r);
+    dst.symbol_count = 2;
+    dst.symbols[0] = a;
+    dst.symbols[1] = b;
+    var src: LinkRequirement;
+    src.symbols = R.unwrap_ok[*intern.StrId, str](src_r);
+    src.symbol_count = 3;
+    src.symbols[0] = b;
+    src.symbols[1] = c;
+    src.symbols[2] = c;
+    val src_symbols: *intern.StrId = src.symbols;
+
+    val merged: R.Result[bool, str] = merge_link_claims(?alloc, ?dst, ?src);
+    if (R.is_err[bool, str](merged)) { code = 1; }
+    or {
+        if (dst.symbol_count != 3 || dst.symbols[0] != a
+            || dst.symbols[1] != b || dst.symbols[2] != c) { code = 1; }
+        if (src.symbols != src_symbols || src.symbol_count != 3
+            || src.symbols[0] != b || src.symbols[1] != c
+            || src.symbols[2] != c) { code = 1; }
+
+        free_link_claims(?alloc, ?src, 1);
+        if (dst.symbol_count != 3 || dst.symbols[0] != a
+            || dst.symbols[1] != b || dst.symbols[2] != c) { code = 1; }
+    }
+    free_link_claims(?alloc, ?dst, 1);
 
     arena.dnit(?ar);
     ret code;
