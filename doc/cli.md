@@ -84,11 +84,14 @@ mach build <path> [options]
 Compiles the project named by `<path>` — a project directory containing a
 `mach.toml` (e.g. `mach build .`).
 With no `--bin`/`--lib`, it builds every declared artifact for the selected target
-and profile. Every reachable module is driven through sema → lower → optimise →
-codegen to one relocatable object, written under the resolved object tree at
+and profile. Each artifact's module graph is rooted at its `entry`; only that module
+and its transitive `use`/`fwd` dependencies belong to the build cell. Other files
+under `src` may back artifacts for different targets and are not compiled for this
+cell. Every reachable module is driven through sema → lower → optimise → codegen to
+one relocatable object, written under the resolved object tree at
 `<out>/obj/<fqn-as-path>.o`. For a `bin` artifact the objects are linked into the
-resolved artifact path (its `out` template); for a `static`/`shared` library (or
-with `--emit obj`) the objects are the deliverable and nothing is linked.
+resolved artifact path (its `out` template); for a `static`/`shared` library (or with
+`--emit obj`) the objects are the deliverable and nothing is linked.
 
 A target whose object format delivers **finished modules** — SPIR-V, whose object
 output is a complete self-contained module rather than a link input — always
