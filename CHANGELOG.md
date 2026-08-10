@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.18.2] - 2026-08-09
+
 ### Fixed
 
 #### SPIR-V copy-only merge values keep their declared type (#2939, #2969)
