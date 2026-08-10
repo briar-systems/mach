@@ -84,11 +84,14 @@ mach build <path> [options]
 Compiles the project named by `<path>` — a project directory containing a
 `mach.toml` (e.g. `mach build .`).
 With no `--bin`/`--lib`, it builds every declared artifact for the selected target
-and profile. Every reachable module is driven through sema → lower → optimise →
-codegen to one relocatable object, written under the resolved object tree at
+and profile. Each artifact's module graph is rooted at its `entry`; only that module
+and its transitive `use`/`fwd` dependencies belong to the build cell. Other files
+under `src` may back artifacts for different targets and are not compiled for this
+cell. Every reachable module is driven through sema → lower → optimise → codegen to
+one relocatable object, written under the resolved object tree at
 `<out>/obj/<fqn-as-path>.o`. For a `bin` artifact the objects are linked into the
-resolved artifact path (its `out` template); for a `static`/`shared` library (or
-with `--emit obj`) the objects are the deliverable and nothing is linked.
+resolved artifact path (its `out` template); for a `static`/`shared` library (or with
+`--emit obj`) the objects are the deliverable and nothing is linked.
 
 A target whose object format delivers **finished modules** — SPIR-V, whose object
 output is a complete self-contained module rather than a link input — always
@@ -284,10 +287,12 @@ mach run <path> [options] [-- args...]
 
 Executes the binary `mach build` already produced for `<path>` — a post-build
 convenience, **not** a rebuild. The same selection flags (`--target`, `--profile`,
-`--bin`) that narrow a build resolve which artifact to run; its path is read from
-the artifact's `out` template and the existing file is exec'd. When the artifact
-does not exist yet, `mach run` errors and points at `mach build` rather than
-building it.
+`--bin`) that narrow a build resolve which artifact to run. With no artifact flag,
+one is inferred when exactly one artifact declares the resolved target; several
+matching artifacts remain an error that asks for `--bin`/`--lib`. Its path is read
+from the artifact's `out` template and the existing file is exec'd. When the
+artifact does not exist yet, `mach run` errors and points at `mach build` rather
+than building it.
 Arguments after a `--` separator are forwarded to the child as its `argv`. The
 child's exit code becomes this command's exit code.
 
@@ -517,7 +522,8 @@ mach init [dir] [options]
 
 Scaffolds a new project in `[dir]` (default: the current directory). Writes a
 complete `mach.toml` with a `[project]` block, `[target.*]` platforms for
-`linux`/`windows`/`darwin` (on the host ISA), one `[artifact.<id>]`,
+`linux`/`windows`/`darwin` (on the host ISA), extension-correct binary artifacts
+(or one library artifact),
 `[profile.debug]`/`[profile.release]` variants, a `[dep.mach-std]` dependency, a
 starter source file, and `dep/mach-std/` cloned from the declared ref (through
 the same path as `mach dep pull`). Refuses to overwrite an existing `mach.toml`,
@@ -528,7 +534,7 @@ before any file is written, so a refused init leaves nothing behind.
 |----------------|-------|--------|
 | `--name <name>`| name  | project id (default: the directory base name) |
 | `--force`      | —     | scaffold even when `mach.toml`, `src/main.mach`, or `src/lib.mach` already exists |
-| `--lib`        | —     | library layout: write `src/lib.mach` instead of `src/main.mach`, and scaffold a `static` `[artifact.<id>]` instead of a `bin` one |
+| `--lib`        | —     | library layout: write `src/lib.mach` instead of `src/main.mach`, and scaffold one `static` `[artifact.<id>]` instead of the target-split binary artifacts |
 
 The first non-flag argument after `init` is the target directory.
 

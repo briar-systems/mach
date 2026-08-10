@@ -50,6 +50,12 @@ resolves only when that project declares a `[project] module` surface file
 (e.g. a library `glfw` imported as `use glfw;`); `std` does not - always
 import full `std.*` paths.
 
+An artifact build roots its module graph at `[artifact.*].entry` and compiles only
+that module plus its active transitive `use`/`fwd` dependencies. A sibling source
+file is not part of the build cell merely because it is under `[project].src`, so
+one project may hold artifacts for disjoint targets. `mach test` deliberately roots
+at every own-source module so it can collect otherwise-unreferenced tests.
+
 A file reads top-down: module docstring, `use`/`fwd` lines, declarations.
 
 ### `use` - private import
@@ -98,6 +104,12 @@ fwd impl.page_size;
 ```
 
 ## Entrypoint and output
+
+An artifact's `out` is literal across every target it names. A cross-platform
+executable therefore uses disjoint artifacts for extension conventions:
+`out = "bin/app"` for non-Windows targets and `out = "bin/app.exe"` for Windows.
+`mach init` emits that split for binary projects. Do not use one `targets = ["*"]`
+artifact when its output must be directly executable on Windows and elsewhere.
 
 The stdlib provides the platform `_start`, which calls whatever function
 exports the linker symbol `main`. `use std.runtime;` is required to link it in

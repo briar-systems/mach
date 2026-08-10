@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.19.0] - 2026-08-10
+
+### Changed
+
+#### Artifact builds compile only their reachable module graph (#2967)
+
+An ordinary artifact build now roots source discovery at that artifact's `entry`
+and follows its active transitive `use` and `fwd` edges. Unreferenced files and
+entries belonging only to another target no longer have to compile for the selected
+build cell, so one project can contain disjoint host and accelerator artifacts.
+
+`mach test` remains the deliberate whole-source check and collection path, while
+tooling unions continue to root every declared artifact entry. The driver represents
+those three contracts as explicit artifact, test, and union root policies rather
+than independent widening flags.
+
+### Fixed
+
+#### Target-split executables select the right artifact on every host (#2955, #2961, #2981)
+
+Whole-source builds no longer make the first artifact declaration load-bearing.
+The manifest layer now owns primary selection for both current and legacy driver
+paths and chooses the first artifact that declares the resolved target, while an
+explicit artifact remains authoritative and retains the existing incompatibility
+diagnostic. A single-product command such as `mach run` also infers an unnamed
+artifact when exactly one declares the target; multiple runnable artifacts remain
+an ambiguity rather than an order-dependent guess.
+
+`mach init` now demonstrates the extension contract it documents. Binary scaffolds
+use disjoint non-Windows and Windows artifacts, producing `bin/<name>` and
+`bin/<name>.exe` respectively, while library scaffolds keep one all-target artifact.
+mach's own manifest uses the same split, so `mach build .` on Windows produces
+`bin/mach.exe` without an output override and `mach test .` needs no artifact flag.
+
+#### Character literals lower at their coerced integer width (#2982)
+
+Semantic analysis could coerce a character literal into its surrounding integer
+type, but lowering still emitted the literal as `i8`. Wider arithmetic therefore
+reached IR verification with mismatched operands, and a later conversion could be
+classified from the coerced type while operating on the narrower value. Character
+literals now take their IR width from the resolved expression type, matching integer
+and floating-point literal lowering.
+
+#### Final link requirements retain their exact allocation extent (#2977)
+
+Filtering a link requirement's symbol claims now finalizes ownership in one place.
+When shrinking to the exact retained count fails, the build returns an allocation
+error and releases the original buffer instead of recording a pointer with an extent
+the allocator did not create. Successful finalization records the exact allocation
+used by teardown.
+
 ## [4.18.3] - 2026-08-10
 
 ### Fixed

@@ -126,19 +126,18 @@ pub fun build_project(s: *session.Session, project_root: str, target_name: str) 
     sel.want_lib     = false;
     sel.has_artifact = false;
     # the doc/tooling entry: load the graph but never run steps (no shell in a doc pass).
-    ret build_project_impl(s, project_root, ?sel, nil, nil, false, false, false);
+    ret build_project_impl(s, project_root, ?sel, nil, nil, project.ROOT_ARTIFACT, false);
 }
 
 # build_project_impl: the shared build pipeline behind both build_project_sel
 # (single target) and build_project_union (all targets). loads the project's
-# root manifest (`<project_root>/mach.toml`). `for_union` records every
-# manifest target's tuple and flips on the union load walk (see load_config /
-# walk_comptime_if_union). `all_own_src` additionally loads every own-source module
-# as a collection root (see load_all_own_src), for `mach test`. the same phase
-# entries the build engine dispatches individually run here in sequence, so a
-# non-engine flow and an engine unit execute identical pieces.
-fun build_project_impl(s: *session.Session, project_root: str, sel: *manifest.Selection, m: *manifest.Manifest, req: *request.BuildRequest, for_union: bool, all_own_src: bool, run_steps: bool) R.Result[project.Project, outcome.Fail] {
-    val begin_r: R.Result[project.Project, outcome.Fail] = begin_build_impl(s, project_root, sel, m, req, nil, for_union, all_own_src, all_own_src);
+# root manifest (`<project_root>/mach.toml`). `roots` makes the consumer's graph
+# explicit: one selected artifact, the whole own-source test set, or every artifact
+# entry under the tooling union. The same phase entries the build engine dispatches
+# individually run here in sequence, so a non-engine flow and an engine unit execute
+# identical pieces.
+fun build_project_impl(s: *session.Session, project_root: str, sel: *manifest.Selection, m: *manifest.Manifest, req: *request.BuildRequest, roots: project.RootSet, run_steps: bool) R.Result[project.Project, outcome.Fail] {
+    val begin_r: R.Result[project.Project, outcome.Fail] = begin_build_impl(s, project_root, sel, m, req, nil, roots);
     if (R.is_err[project.Project, outcome.Fail](begin_r)) { ret begin_r; }
     var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](begin_r);
 
@@ -189,23 +188,24 @@ pub fun begin_build(s: *session.Session, m: *manifest.Manifest, req: *request.Bu
     sel.artifact     = req.artifact;
     sel.want_lib     = req.want_lib;
     sel.has_artifact = !str_empty(req.artifact);
-    # every engine build front-ends the whole source tree, so `mach build` and
-    # `mach test` agree on whether the project compiles (#2539). `is_test` stays the
-    # narrower fact - it picks the link surface and the back-end work set.
-    ret begin_build_impl(s, req.project_root, ?sel, m, req, ev, false, request.test_goal(req.goal), true);
+    var roots: project.RootSet = project.ROOT_ARTIFACT;
+    if (request.test_goal(req.goal)) { roots = project.ROOT_TEST; }
+    ret begin_build_impl(s, req.project_root, ?sel, m, req, ev, roots);
 }
 
 # the shared open: init + query binding + config synthesis + target entry
 #
-# `is_test` selects the `mach test` link surface (the union of every artifact's
-# libs); `all_own_src` loads every own-source module as a load root. They are
-# independent: a `mach build` loads the whole tree to check it while still linking
-# one artifact.
-fun begin_build_impl(s: *session.Session, project_root: str, sel: *manifest.Selection, m: *manifest.Manifest, req: *request.BuildRequest, ev: *readout.Progress, for_union: bool, is_test: bool, all_own_src: bool) R.Result[project.Project, outcome.Fail] {
+# `roots` is the single source of truth for the consumer's graph. It also selects
+# union configuration and the whole-source test link surface, so independent flags
+# cannot silently widen an artifact build's front-end set again.
+fun begin_build_impl(s: *session.Session, project_root: str, sel: *manifest.Selection, m: *manifest.Manifest, req: *request.BuildRequest, ev: *readout.Progress, roots: project.RootSet) R.Result[project.Project, outcome.Fail] {
     var p: project.Project;
     project.init_project(?p, s);
-    p.events      = ev;
-    p.all_own_src = all_own_src;
+    p.events = ev;
+    p.roots  = roots;
+
+    val for_union: bool = roots == project.ROOT_UNION;
+    val is_test:   bool = roots == project.ROOT_TEST;
 
     # bind the query db's compute context and register Q_PARSE (once per session)
     # before any module loads, so parse_module can route through the engine.
@@ -348,28 +348,28 @@ pub fun run_load_phase(p: *project.Project) R.Result[bool, outcome.Fail] {
         ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[session.ModuleId, str](load_r)));
     }
 
-    # union build (#1505): load every other declared artifact's entry into the same
-    # Project so tooling sees the closure over the whole (target x artifact) matrix,
-    # not just the primary artifact's. dfs_load dedups by FQN, so the primary entry
-    # (also present in union_entries) re-loads as a no-op, as do shared modules.
-    var ei: u32 = 0;
-    for (ei < p.union_entry_count) {
-        val ear: R.Result[session.ModuleId, str] = load.dfs_load(p, p.union_entries[ei]);
-        if (R.is_err[session.ModuleId, str](ear)) {
-            ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[session.ModuleId, str](ear)));
+    # tooling union (#1505): load every other declared artifact's entry so the
+    # Project covers the whole (target x artifact) matrix. dfs_load dedups the
+    # primary entry and shared imports.
+    if (p.roots == project.ROOT_UNION) {
+        var ei: u32 = 0;
+        for (ei < p.union_entry_count) {
+            val ear: R.Result[session.ModuleId, str] = load.dfs_load(p, p.union_entries[ei]);
+            if (R.is_err[session.ModuleId, str](ear)) {
+                ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[session.ModuleId, str](ear)));
+            }
+            ei = ei + 1;
         }
-        ei = ei + 1;
     }
 
     # the artifact closure is settled: everything loaded so far is what this build
-    # emits and links, and the whole-source sweep below only appends past it (#2539).
+    # emits and links. A test-rooted whole-source sweep only appends past it.
     p.emit_len = p.topo_len;
 
-    # root the load at the whole source tree, not the entrypoint's import closure,
-    # so a `pub` module with no in-tree `use` consumer is still checked (#2539) and
-    # still has its tests collected (#1863). dfs_load dedups by FQN, so this only
-    # adds the modules the entry/union walks missed.
-    if (p.all_own_src) {
+    # test collection roots at every own-source module, so a test in a module no
+    # artifact imports is still collected (#1863). Artifact builds deliberately do
+    # not enter this path: their build cell is the selected entry's reachable set.
+    if (p.roots == project.ROOT_TEST) {
         val allsrc_r: R.Result[bool, str] = union.load_all_own_src(p);
         if (R.is_err[bool, str](allsrc_r)) {
             ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](allsrc_r)));
@@ -465,14 +465,14 @@ pub fun load_manifest(s: *session.Session, project_root: str) R.Result[manifest.
 # repeatedly on one long-lived Session: sources dedup by path and dnit_project
 # resets the session's module registries (see dnit_project's reload contract)
 pub fun build_project_sel(s: *session.Session, project_root: str, sel: *manifest.Selection) R.Result[project.Project, outcome.Fail] {
-    ret build_project_impl(s, project_root, sel, nil, nil, false, false, true);
+    ret build_project_impl(s, project_root, sel, nil, nil, project.ROOT_ARTIFACT, true);
 }
 
 # build the module graph for a `mach test` invocation: like build_project_sel, but
 # additionally loads every own-source module under `[project].src` as a collection
 # root, so tests in a module no entrypoint imports are still collected (#1863)
 pub fun build_project_test(s: *session.Session, project_root: str, sel: *manifest.Selection) R.Result[project.Project, outcome.Fail] {
-    ret build_project_impl(s, project_root, sel, nil, nil, false, true, true);
+    ret build_project_impl(s, project_root, sel, nil, nil, project.ROOT_TEST, true);
 }
 
 # build the union of EVERY manifest target's AND artifact's
@@ -494,7 +494,7 @@ pub fun build_project_union(s: *session.Session, project_root: str) R.Result[pro
     sel.artifact     = "";
     sel.want_lib     = false;
     sel.has_artifact = false;
-    ret build_project_impl(s, project_root, ?sel, nil, nil, true, false, false);
+    ret build_project_impl(s, project_root, ?sel, nil, nil, project.ROOT_UNION, false);
 }
 
 # bind the query db's diagnostic hooks and register the front-half kind the load
@@ -523,4 +523,3 @@ fun bind_queries(s: *session.Session) R.Result[bool, str] {
 # the QueryCtx and bridge its session's `diags` sink. a captured snapshot is a heap
 # diagnostic.DiagList the query entry owns and the engine frees through
 # diag_free_hook.
-

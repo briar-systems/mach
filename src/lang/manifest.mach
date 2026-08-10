@@ -1404,6 +1404,44 @@ pub fun free_link_claims(alloc: *A.Allocator, items: *LinkRequirement, count: u3
     }
 }
 
+# finish an overallocated link-requirement buffer as an exact-size owned array
+#
+# Requirement arrays are torn down by their published count, so a successful result
+# must have that exact allocation extent. A failed shrink keeps the original buffer
+# live; release its populated claims and full capacity before surfacing the error.
+# ---
+# alloc:     allocator owning the buffer and its claim arrays
+# items:     overallocated requirement buffer
+# capacity:  allocation extent of `items`
+# count:     populated prefix to retain
+# out_items: receives the exact-size array, or nil on empty/error
+# out_count: receives `count` on success, or zero on empty/error
+# ret:       true once ownership is transferred, or the shrink error after cleanup
+pub fun finish_link_requirements(alloc: *A.Allocator, items: *LinkRequirement,
+                                 capacity: u32, count: u32,
+                                 out_items: **LinkRequirement,
+                                 out_count: *u32) R.Result[bool, str] {
+    @out_items = nil;
+    @out_count = 0;
+    if (count == 0) {
+        A.deallocate[LinkRequirement](alloc, items, capacity::usize);
+        ret R.ok[bool, str](true);
+    }
+    if (count < capacity) {
+        val sr: R.Result[*LinkRequirement, str] =
+            A.reallocate[LinkRequirement](alloc, items, capacity::usize, count::usize);
+        if (R.is_err[*LinkRequirement, str](sr)) {
+            free_link_claims(alloc, items, count);
+            A.deallocate[LinkRequirement](alloc, items, capacity::usize);
+            ret R.err[bool, str](R.unwrap_err[*LinkRequirement, str](sr));
+        }
+        items = R.unwrap_ok[*LinkRequirement, str](sr);
+    }
+    @out_items = items;
+    @out_count = count;
+    ret R.ok[bool, str](true);
+}
+
 # merge `src`'s symbol claims into an equivalent retained link requirement
 #
 # Dependency and test-link overlays deduplicate the same dynamic library by its
@@ -2174,6 +2212,82 @@ pub fun cell_supported(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
     ret R.ok[bool, str](artifact_supports_target(itn, a, rt.target.name));
 }
 
+# find the first artifact that declares the selection's resolved target
+fun first_target_artifact(alloc: *A.Allocator, itn: *intern.Interner,
+                          m: *Manifest, sel: *Selection, count: *u32) *ArtifactDef {
+    @count = 0;
+    var first: *ArtifactDef = nil;
+    val tr: R.Result[ResolvedTarget, str] = resolve_target(alloc, itn, m, sel.target, nil);
+    if (R.is_err[ResolvedTarget, str](tr)) { ret nil; }
+    val rt: ResolvedTarget = R.unwrap_ok[ResolvedTarget, str](tr);
+
+    var i: u32 = 0;
+    for (i < m.artifact_count) {
+        if (artifact_supports_target(itn, ?m.artifacts[i], rt.target.name)) {
+            if (first == nil) { first = ?m.artifacts[i]; }
+            @count = @count + 1;
+        }
+        i = i + 1;
+    }
+    ret first;
+}
+
+# store one resolved artifact as an explicit selection
+fun set_selected_artifact(itn: *intern.Interner, a: *ArtifactDef,
+                          sel: *Selection) R.Result[bool, str] {
+    val name_opt: O.Option[str] = intern.lookup(itn, a.name);
+    if (O.is_none[str](name_opt)) {
+        ret R.err[bool, str]("selected artifact name not interned");
+    }
+    sel.artifact     = O.unwrap[str](name_opt);
+    sel.want_lib     = a.is_lib;
+    sel.has_artifact = true;
+    ret R.ok[bool, str](true);
+}
+
+# select the artifact that supplies a whole-source build's primary context
+#
+# A union or test build spans artifacts but still resolves every module under one
+# artifact context. With no explicit selector, choose the first artifact that
+# declares the resolved target. Falling back to the first declaration when none
+# does preserves `resolve_build_unit`'s existing incompatible-target diagnostic.
+# ---
+# alloc: allocator for target resolution
+# itn:   interner the manifest was parsed into
+# m:     parsed manifest
+# sel:   selection to fill when it has no artifact and the manifest has several
+# ret:   ok(true), or an internal interner error
+pub fun select_primary_artifact(alloc: *A.Allocator, itn: *intern.Interner,
+                                m: *Manifest, sel: *Selection) R.Result[bool, str] {
+    if (sel.has_artifact || m.artifact_count < 2) { ret R.ok[bool, str](true); }
+
+    var count: u32 = 0;
+    var primary: *ArtifactDef = first_target_artifact(alloc, itn, m, sel, ?count);
+    if (primary == nil) { primary = ?m.artifacts[0]; }
+    ret set_selected_artifact(itn, primary, sel);
+}
+
+# select an unnamed artifact when exactly one declares the resolved target
+#
+# Used by commands such as `mach run` that consume one build product. A
+# target-split cross-platform executable resolves without a redundant `--bin`,
+# while several runnable artifacts retain the existing ambiguity diagnostic.
+# ---
+# alloc: allocator for target resolution
+# itn:   interner the manifest was parsed into
+# m:     parsed manifest
+# sel:   selection to fill only when its resolved target has one artifact
+# ret:   ok(true), or an internal interner error
+pub fun select_sole_target_artifact(alloc: *A.Allocator, itn: *intern.Interner,
+                                    m: *Manifest, sel: *Selection) R.Result[bool, str] {
+    if (sel.has_artifact || m.artifact_count < 2) { ret R.ok[bool, str](true); }
+
+    var count: u32 = 0;
+    val sole: *ArtifactDef = first_target_artifact(alloc, itn, m, sel, ?count);
+    if (sole == nil || count != 1) { ret R.ok[bool, str](true); }
+    ret set_selected_artifact(itn, sole, sel);
+}
+
 pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, sel: Selection) R.Result[BuildUnit, str] {
     # a selection with no `--target` lets its artifact pin the target. resolving
     # the artifact twice keeps the resolution order (and so the diagnostic a
@@ -2265,13 +2379,27 @@ pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, m: *Manif
             if (found_l != nil) {
                 if (link_matches_target(itn, found_l, rt.target)) {
                     val req_r: R.Result[LinkRequirement, str] = link_requirement(alloc, itn, found_l, proj_out, ?v);
-                    if (R.is_err[LinkRequirement, str](req_r)) { ret R.err[BuildUnit, str](R.unwrap_err[LinkRequirement, str](req_r)); }
+                    if (R.is_err[LinkRequirement, str](req_r)) {
+                        free_link_claims(alloc, matched_items, match_count);
+                        A.deallocate[LinkRequirement](alloc, matched_items, a.link_count::usize);
+                        ret R.err[BuildUnit, str](R.unwrap_err[LinkRequirement, str](req_r));
+                    }
                     matched_items[match_count] = R.unwrap_ok[LinkRequirement, str](req_r);
                     match_count = match_count + 1;
                 }
             }
             li = li + 1;
         }
+
+        var exact_items: *LinkRequirement = nil;
+        var exact_count: u32 = 0;
+        val fr: R.Result[bool, str] = finish_link_requirements(alloc, matched_items,
+            a.link_count, match_count, ?exact_items, ?exact_count);
+        if (R.is_err[bool, str](fr)) {
+            ret R.err[BuildUnit, str](R.unwrap_err[bool, str](fr));
+        }
+        matched_items = exact_items;
+        match_count = exact_count;
     }
     u.libs      = matched_items;
     u.lib_count = match_count;
@@ -2323,8 +2451,8 @@ fun requirement_index(buf: *LinkRequirement, count: u32, req: *LinkRequirement) 
 }
 
 # resolve the `mach test` link surface (#1964): the union of every artifact's
-# referenced link entries whose filters match target `t` (the native target for a
-# test build), deduplicated, each retained as a typed link requirement. exported dep entries
+# referenced link entries whose filters match resolved target `t`, deduplicated,
+# each retained as a typed link requirement. exported dep entries
 # are added separately by the driver's cascade pass. on success `out_items` and
 # `out_count` receive the union (nil/0 when empty).
 pub fun resolve_test_libs(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, t: *TargetDef,
@@ -2384,18 +2512,7 @@ pub fun resolve_test_libs(alloc: *A.Allocator, itn: *intern.Interner, m: *Manife
         ai = ai + 1;
     }
 
-    if (w == 0) { A.deallocate[LinkRequirement](alloc, buf, max::usize); ret R.ok[bool, str](true); }
-    if (w < max) {
-        val sr: R.Result[*LinkRequirement, str] = A.reallocate[LinkRequirement](alloc, buf, max::usize, w::usize);
-        if (R.is_ok[*LinkRequirement, str](sr)) {
-            @out_items = R.unwrap_ok[*LinkRequirement, str](sr);
-            @out_count = w;
-            ret R.ok[bool, str](true);
-        }
-    }
-    @out_items = buf;
-    @out_count = w;
-    ret R.ok[bool, str](true);
+    ret finish_link_requirements(alloc, buf, max, w, out_items, out_count);
 }
 
 fun artifact_err(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, sel: Selection) str {
@@ -2530,6 +2647,46 @@ fun tinit(backing: *A.Allocator, ar: *arena.Arena, alloc: *A.Allocator, itn: *in
     if (O.is_some[str](arena.make(alloc, ar))) { ret false; }
     @itn   = intern.init(alloc);
     ret true;
+}
+
+# size-checking allocator probe whose one reallocation always fails
+rec LinkFinishAllocProbe {
+    backing: A.Allocator;
+    items: ptr;
+    items_size: usize;
+    claims: ptr;
+    claims_size: usize;
+    realloc_count: u32;
+    items_freed: bool;
+    claims_freed: bool;
+    mismatch: bool;
+}
+
+fun link_finish_probe_allocate(ctx: ptr, size: usize, align: usize) O.Option[ptr] {
+    val p: *LinkFinishAllocProbe = ctx::*LinkFinishAllocProbe;
+    ret p.backing.fn_allocate(p.backing.ctx, size, align);
+}
+
+fun link_finish_probe_reallocate(ctx: ptr, item: ptr, old_size: usize,
+                                 new_size: usize, align: usize) O.Option[ptr] {
+    val p: *LinkFinishAllocProbe = ctx::*LinkFinishAllocProbe;
+    p.realloc_count = p.realloc_count + 1;
+    if (item != p.items || old_size != p.items_size
+        || new_size != $size_of(LinkRequirement)) { p.mismatch = true; }
+    ret O.none[ptr]();
+}
+
+fun link_finish_probe_deallocate(ctx: ptr, item: ptr, size: usize, align: usize) i64 {
+    val p: *LinkFinishAllocProbe = ctx::*LinkFinishAllocProbe;
+    if (item == p.items) {
+        p.items_freed = true;
+        if (size != p.items_size) { p.mismatch = true; }
+    }
+    if (item == p.claims) {
+        p.claims_freed = true;
+        if (size != p.claims_size) { p.mismatch = true; }
+    }
+    ret p.backing.fn_deallocate(p.backing.ctx, item, size, align);
 }
 
 fun tparse(alloc: *A.Allocator, itn: *intern.Interner, src: str) R.Result[Manifest, str] {
@@ -3794,6 +3951,61 @@ test "mach.lang.manifest.merge_link_claims:stable_owned_union" {
     ret code;
 }
 
+# A shrink failure leaves the original allocation live. The finalizer must free
+# its populated claims and the buffer at its full capacity, then publish no result
+# (#2977). The probe rejects the shrink and records the exact sizes passed to free.
+test "mach.lang.manifest.finish_link_requirements:shrink_failure_frees_full_extent" {
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret 1; }
+
+    var probe: LinkFinishAllocProbe;
+    probe.backing       = backing;
+    probe.items         = nil;
+    probe.items_size    = 0;
+    probe.claims        = nil;
+    probe.claims_size   = 0;
+    probe.realloc_count = 0;
+    probe.items_freed   = false;
+    probe.claims_freed  = false;
+    probe.mismatch      = false;
+
+    var alloc: A.Allocator;
+    var probe_ptr: *LinkFinishAllocProbe = ?probe;
+    alloc.ctx           = probe_ptr::ptr;
+    alloc.fn_allocate   = link_finish_probe_allocate;
+    alloc.fn_reallocate = link_finish_probe_reallocate;
+    alloc.fn_deallocate = link_finish_probe_deallocate;
+
+    val br: R.Result[*LinkRequirement, str] = A.allocate[LinkRequirement](?alloc, 2::usize);
+    if (R.is_err[*LinkRequirement, str](br)) { ret 1; }
+    val items: *LinkRequirement = R.unwrap_ok[*LinkRequirement, str](br);
+    probe.items      = items::ptr;
+    probe.items_size = $size_of(LinkRequirement) * 2;
+
+    val cr: R.Result[*intern.StrId, str] = A.allocate[intern.StrId](?alloc, 1::usize);
+    if (R.is_err[*intern.StrId, str](cr)) {
+        A.deallocate[LinkRequirement](?alloc, items, 2::usize);
+        ret 1;
+    }
+    items[0].symbols      = R.unwrap_ok[*intern.StrId, str](cr);
+    items[0].symbol_count = 1;
+    items[0].symbols[0]   = intern.STR_NIL;
+    probe.claims      = items[0].symbols::ptr;
+    probe.claims_size = $size_of(intern.StrId);
+
+    var out_items: *LinkRequirement = items;
+    var out_count: u32 = 0xFFFFFFFF;
+    val fr: R.Result[bool, str] =
+        finish_link_requirements(?alloc, items, 2, 1, ?out_items, ?out_count);
+
+    if (R.is_ok[bool, str](fr)) { ret 1; }
+    if (!str_equals(R.unwrap_err[bool, str](fr), "out of memory")) { ret 1; }
+    if (out_items != nil || out_count != 0) { ret 1; }
+    if (probe.realloc_count != 1 || probe.mismatch) { ret 1; }
+    if (!probe.claims_freed || !probe.items_freed) { ret 1; }
+    ret 0;
+}
+
 test "mach.lang.manifest.parse:link_filter_empty_string_error" {
     var backing: A.Allocator; var ar: arena.Arena; var alloc: A.Allocator; var itn: intern.Interner;
     if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
@@ -3852,6 +4064,72 @@ test "mach.lang.manifest.resolve_build_unit:artifact_target_filter" {
 
         val uw: R.Result[BuildUnit, str] = resolve_build_unit(?alloc, ?itn, ?m, mk_sel("windows", "", "app", false, true));
         if (R.is_ok[BuildUnit, str](uw) || !str_contains(R.unwrap_err[BuildUnit, str](uw), "does not support target")) { code = 1; }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+# a whole-source build roots its context in an artifact that declares the selected
+# target, so splitting a cross-platform executable for Windows does not make
+# declaration order load-bearing (#2961)
+test "mach.lang.manifest.select_primary_artifact:first_target_compatible" {
+    var backing: A.Allocator; var ar: arena.Arena; var alloc: A.Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[target.windows]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets=[\"linux\"]\nlink=[]\nneed=[]\n[artifact.app-windows]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app.exe\"\ntargets=[\"windows\"]\nlink=[]\nneed=[]\n";
+    val mr: R.Result[Manifest, str] = tparse(?alloc, ?itn, src);
+    if (R.is_err[Manifest, str](mr)) { code = 1; }
+    or {
+        var m: Manifest = R.unwrap_ok[Manifest, str](mr);
+
+        var windows: Selection = mk_sel("windows", "", "", false, false);
+        val wr: R.Result[bool, str] = select_primary_artifact(?alloc, ?itn, ?m, ?windows);
+        if (R.is_err[bool, str](wr) || !windows.has_artifact
+            || !str_equals(windows.artifact, "app-windows")) { code = 1; }
+        or {
+            val wu: R.Result[BuildUnit, str] = resolve_build_unit(?alloc, ?itn, ?m, windows);
+            if (R.is_err[BuildUnit, str](wu)) { code = 1; }
+            or {
+                val unit: BuildUnit = R.unwrap_ok[BuildUnit, str](wu);
+                if (!str_equals(idstr(?itn, unit.bin_path), "out/bin/app.exe")) { code = 1; }
+            }
+        }
+
+        var linux: Selection = mk_sel("linux", "", "", false, false);
+        val lr: R.Result[bool, str] = select_primary_artifact(?alloc, ?itn, ?m, ?linux);
+        if (R.is_err[bool, str](lr) || !linux.has_artifact
+            || !str_equals(linux.artifact, "app")) { code = 1; }
+
+        # a single-product consumer reaches the same windows artifact without an
+        # explicit selector when it is the sole artifact for that target
+        var runnable: Selection = mk_sel("windows", "", "", false, false);
+        val rr: R.Result[bool, str] = select_sole_target_artifact(
+            ?alloc, ?itn, ?m, ?runnable);
+        if (R.is_err[bool, str](rr) || !runnable.has_artifact
+            || !str_equals(runnable.artifact, "app-windows")) { code = 1; }
+
+        # an explicit selector remains authoritative, including when it names an
+        # incompatible cell whose diagnostic resolve_build_unit owns
+        var explicit: Selection = mk_sel("windows", "", "app", false, true);
+        val er: R.Result[bool, str] = select_primary_artifact(?alloc, ?itn, ?m, ?explicit);
+        val eu: R.Result[BuildUnit, str] = resolve_build_unit(?alloc, ?itn, ?m, explicit);
+        if (R.is_err[bool, str](er) || !str_equals(explicit.artifact, "app")
+            || R.is_ok[BuildUnit, str](eu)) { code = 1; }
+    }
+
+    # two compatible artifacts remain ambiguous for a single-product consumer;
+    # declaration order is a primary-context tie-breaker, not a `mach run` choice
+    val ambiguous_src: str = sfmt(?alloc, "{}{}", src,
+        "[artifact.tool-windows]\nkind=\"bin\"\nentry=\"tool.mach\"\nout=\"bin/tool.exe\"\ntargets=[\"windows\"]\nlink=[]\nneed=[]\n");
+    val amr: R.Result[Manifest, str] = tparse(?alloc, ?itn, ambiguous_src);
+    if (R.is_err[Manifest, str](amr)) { code = 1; }
+    or {
+        var am: Manifest = R.unwrap_ok[Manifest, str](amr);
+        var ambiguous: Selection = mk_sel("windows", "", "", false, false);
+        val ar_: R.Result[bool, str] = select_sole_target_artifact(
+            ?alloc, ?itn, ?am, ?ambiguous);
+        if (R.is_err[bool, str](ar_) || ambiguous.has_artifact) { code = 1; }
     }
     arena.dnit(?ar);
     ret code;
