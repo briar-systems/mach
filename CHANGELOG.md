@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+#### SPIR-V copy-only merge values keep their declared type (#2939, #2969)
+
+Phi destruction replaces an SSA phi with one `MIR_MOV` into its result on every predecessor edge. Those moves are sized for a physical register, not a typed value: an immediate `i32` edge may use four bytes while a vreg edge uses the eight-byte machine word. The SPIR-V emitter skipped copies while finding type authorities, propagated what it found, then fell back to each move's width. A component made entirely of copies had no authority to propagate and could therefore allocate one merge variable as `i64` while the value stored or compared through it remained `i32`. Mach either wrote a module `spirv-val` rejected or caught its own mismatch and refused a valid shader.
+
+Each source-derived MIR vreg now retains the raw, module-local IR type id of its parameter or instruction result. The metadata is inert for machine targets. SPIR-V consults it only for copy destinations still untyped after concrete definitions and typed sources have propagated, so a comparison result remains a SPIR-V boolean while a copy-only phi component takes its declared numeric type. A second propagation types any synthetic temporary introduced while sequentializing a parallel-copy cycle; move width remains only the last fallback for genuinely synthetic values.
+
+The exact loop-carried integer shader from #2969 now builds, and the three corpus cases quarantined by #2939 are restored to SPIR-V structural validation and golden coverage.
+
 ## [4.18.1] - 2026-08-09
 
 ### Fixed
