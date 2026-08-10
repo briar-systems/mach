@@ -359,6 +359,13 @@ reads the selected artifact's name.
 | `icon` | no | Project-root-relative `.ico` path embedded in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
 | `manifest` | no | Project-root-relative application-manifest path embedded byte-for-byte in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
 
+`entry` is the build cell's source root. The build follows its active `use` and
+`fwd` edges transitively and compiles that reachable module set; another file under
+`src` is not part of the cell merely because it shares the project directory. This
+is what lets one project declare host and accelerator artifacts with disjoint target
+sets. `mach test` is the deliberate whole-source exception: it roots collection at
+every module in the current project's `src` tree.
+
 - **`bin`** links an executable at the resolved `out` path.
 - **`static`** materialises a real `ar` archive at the resolved `out` path — the
   per-module objects with an archive symbol index, the deliverable a consumer links
