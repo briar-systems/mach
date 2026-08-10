@@ -17,6 +17,14 @@ Each source-derived MIR vreg now retains the raw, module-local IR type id of its
 
 The exact loop-carried integer shader from #2969 now builds, and the three corpus cases quarantined by #2939 are restored to SPIR-V structural validation and golden coverage.
 
+#### The darwin corpus legs could never have run (#2965)
+
+`test-main.yml`'s darwin legs take a cross-built binary from the seed job rather than building in place, so they never run the `mach dep pull` a from-source build does, and their checkout has no `dep/`. Every other leg gets that pull for free from its own build, which is why the gap existed only on the two darwin rows and only became visible when those rows started running the codegen corpus at all.
+
+It surfaced as a red leg rather than a quietly smaller run because the corpus refuses to start when a dependency it needs is absent, instead of skipping the cases that need it. That is the behaviour that made a missing step legible as a missing step.
+
+The 4.18.1 release itself was unaffected: CD builds and publishes on the tag and completed with all five binaries, and this is the release-cadence test workflow that runs on the push to `main` beside it.
+
 ## [4.18.1] - 2026-08-09
 
 ### Fixed
