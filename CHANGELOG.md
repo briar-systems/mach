@@ -27,6 +27,15 @@ was vendored, so it refused every ordinary `4.x` requirement under tools such as
 mach-lsp. Root manifests now report `mach` as an unknown project key; dependency
 metadata bearing the removed key is ignored. No replacement is planned here.
 
+### Fixed
+
+#### Vendored frontends retain Mach's compiler version (#2954)
+
+The driver, `$mach.version`, debug-info producer string, and CLI now read one Mach-owned
+release constant instead of the embedding project's `[project].version`. A frontend
+vendored by another tool therefore reports Mach's version rather than its host package's
+version. Release tests pin the constant to Mach's own manifest.
+
 ## [4.19.0] - 2026-08-10
 
 ### Changed
