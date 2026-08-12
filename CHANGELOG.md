@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+#### Vendored frontends retain Mach's compiler version (#2954)
+
+The driver, `$mach.version`, debug-info producer string, and CLI now read one Mach-owned
+release constant instead of the embedding project's `[project].version`. A frontend
+vendored by another tool therefore reports Mach's version rather than its host package's
+version. Release tests pin the constant to Mach's own manifest.
+
 ## [4.19.0] - 2026-08-10
 
 ### Changed
