@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+#### Project manifests no longer declare a minimum Mach version (#2953)
+
+The undocumented `[project].mach` key and its toolchain-version check have been
+removed. The check read the embedding project's version when the compiler frontend
+was vendored, so it refused every ordinary `4.x` requirement under tools such as
+mach-lsp. Root manifests now report `mach` as an unknown project key; dependency
+metadata bearing the removed key is ignored. No replacement is planned here.
+
 ### Fixed
 
 #### Vendored frontends retain Mach's compiler version (#2954)
