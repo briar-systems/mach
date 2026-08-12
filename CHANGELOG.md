@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### Tooling can retain compiler-owned frontend analysis (#2996)
+
+`driver.analyze_project` now runs load, resolve, and sema without executing build
+steps or backend phases, and returns the retained project graph. Optional module
+FQN roots enter the compiler's normal DFS, so open editor buffers outside the
+selected artifact closure receive the same overlays, imports, comptime constants,
+diagnostics, and semantic analysis as ordinary project modules.
+
 ### Changed
 
 #### Project manifests no longer declare a minimum Mach version (#2953)

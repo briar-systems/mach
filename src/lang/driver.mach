@@ -38,6 +38,7 @@ use dwarf: mach.lang.be.codegen.dwarf;
 use mach.lang.build.outcome;
 use mach.lang.build.qctx;
 use mach.lang.build.request;
+use mach.lang.diagnostic;
 use mach.lang.intern;
 use mach.lang.manifest;
 use mach.lang.me.pipeline;
@@ -45,6 +46,7 @@ use mach.lang.query;
 use mach.lang.readout;
 use mach.lang.session;
 use mach.lang.target;
+use mach.lang.target.isa;
 use mach.lang.target.of;
 
 use mach.lang.driver.project;
@@ -193,6 +195,82 @@ pub fun begin_build(s: *session.Session, m: *manifest.Manifest, req: *request.Bu
     ret begin_build_impl(s, req.project_root, ?sel, m, req, ev, roots);
 }
 
+# run the compiler-owned frontend over one selected project and retain its
+# analysis for editor tooling, including optional editor-owned roots
+#
+# This is the load / resolve / sema half of a normal build. It never executes
+# project or dependency steps and never runs lowering, code generation, emission,
+# or linking. `extra_roots` are module FQNs to DFS-load after the artifact closure
+# and before resolve, so an open buffer outside that closure still receives the
+# compiler's exact overlay, import, comptime-constant, resolve, and sema treatment.
+# The returned Project owns its graph arrays; its AST, ResolveResult, and SemaResult
+# pointers borrow query-owned values from `s`.
+#
+# Exactly one returned Project may be live on a Session. Calls on the same Session
+# must be serialized, and the caller must `dnit_project` the prior Project before
+# starting another build or analysis: a later query recomputation may replace the
+# borrowed results. The caller must also `dnit_project` the returned value before
+# `session.dnit`. `m`, `req`, and `extra_roots` are borrowed only for this call.
+#
+# The diagnostic sink is reset before each analysis; cached query diagnostics are
+# replayed into that clean sink. The query context is private to this call and is
+# cleared on every return path. A phase failure tears down the partial Project and
+# resets the Session's per-build module registries before returning the failure.
+# ---
+# s:                persistent session owning the query DB and retained values
+# m:                parsed root manifest used to compose `req`
+# req:              composed request selecting target, profile, and artifact
+# extra_roots:      optional session-interned module FQNs outside the artifact closure
+# extra_root_count: number of FQNs in `extra_roots`; zero accepts nil
+# ret:              retained frontend Project, or the load / resolve / sema failure
+pub fun analyze_project(s: *session.Session, m: *manifest.Manifest, req: *request.BuildRequest,
+                        extra_roots: *intern.StrId, extra_root_count: u32) R.Result[project.Project, outcome.Fail] {
+    if (extra_root_count > 0 && extra_roots == nil) {
+        ret R.err[project.Project, outcome.Fail](outcome.internal(
+            "driver: frontend analysis root count requires a root array"));
+    }
+
+    query.set_ctx(?s.queries, nil);
+    fin { query.set_ctx(?s.queries, nil); }
+
+    diagnostic.dnit(?s.diags);
+    s.diags = diagnostic.init(s.alloc);
+
+    if (isa.registered_count(?s.registry.isa) == 0) {
+        val reg_r: R.Result[bool, str] = setup_registry(?s.registry);
+        if (R.is_err[bool, str](reg_r)) {
+            ret R.err[project.Project, outcome.Fail](outcome.internal(R.unwrap_err[bool, str](reg_r)));
+        }
+    }
+
+    val begin_r: R.Result[project.Project, outcome.Fail] = begin_build(s, m, req, nil);
+    if (R.is_err[project.Project, outcome.Fail](begin_r)) { ret begin_r; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](begin_r);
+
+    var qc: qctx.QueryCtx;
+    qc.s   = s;
+    qc.p   = ?p;
+    qc.req = req;
+    query.set_ctx(?s.queries, (?qc)::ptr);
+
+    val load_r: R.Result[bool, outcome.Fail] =
+        run_load_phase_roots(?p, extra_roots, extra_root_count);
+    if (R.is_err[bool, outcome.Fail](load_r)) {
+        val failure: outcome.Fail = R.unwrap_err[bool, outcome.Fail](load_r);
+        project.dnit_project(?p);
+        ret R.err[project.Project, outcome.Fail](failure);
+    }
+
+    val sema_r: R.Result[bool, outcome.Fail] = passes.run_sema_pass(?p);
+    if (R.is_err[bool, outcome.Fail](sema_r)) {
+        val failure: outcome.Fail = R.unwrap_err[bool, outcome.Fail](sema_r);
+        project.dnit_project(?p);
+        ret R.err[project.Project, outcome.Fail](failure);
+    }
+
+    ret R.ok[project.Project, outcome.Fail](p);
+}
+
 # the shared open: init + query binding + config synthesis + target entry
 #
 # `roots` is the single source of truth for the consumer's graph. It also selects
@@ -329,6 +407,17 @@ pub fun run_dep_steps_phase(p: *project.Project) R.Result[bool, outcome.Fail] {
 # p:   the opened project
 # ret: ok(true), or the first load/resolve failure
 pub fun run_load_phase(p: *project.Project) R.Result[bool, outcome.Fail] {
+    ret run_load_phase_roots(p, nil, 0);
+}
+
+# the shared load / resolve phase with optional compiler-owned frontend roots
+#
+# Extra roots are loaded after the selected artifact closure is recorded in
+# `emit_len`, so they participate in resolve and sema but can never widen a future
+# backend work set. This private entry keeps ordinary build phase dispatch on the
+# no-extra-root contract while `analyze_project` can root open editor buffers.
+fun run_load_phase_roots(p: *project.Project, extra_roots: *intern.StrId,
+                         extra_root_count: u32) R.Result[bool, outcome.Fail] {
     val te: *project.TargetEntry = p.target_entry;
 
     val fp_r: R.Result[bool, str] = dcfg.select_target(p, te);
@@ -365,6 +454,20 @@ pub fun run_load_phase(p: *project.Project) R.Result[bool, outcome.Fail] {
     # the artifact closure is settled: everything loaded so far is what this build
     # emits and links. A test-rooted whole-source sweep only appends past it.
     p.emit_len = p.topo_len;
+
+    # Editor-owned buffers outside the selected artifact closure enter through the
+    # same DFS as every source module. Their overlays, imported pub consts, active
+    # comptime branches, dependency edges and transitive modules are therefore all
+    # established before AST publication, resolve, and sema.
+    var xi: u32 = 0;
+    for (xi < extra_root_count) {
+        val xr: R.Result[session.ModuleId, str] = load.dfs_load(p, extra_roots[xi]);
+        if (R.is_err[session.ModuleId, str](xr)) {
+            ret R.err[bool, outcome.Fail](outcome.user(
+                R.unwrap_err[session.ModuleId, str](xr)));
+        }
+        xi = xi + 1;
+    }
 
     # test collection roots at every own-source module, so a test in a module no
     # artifact imports is still collected (#1863). Artifact builds deliberately do
