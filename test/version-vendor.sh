@@ -45,7 +45,7 @@ abi = "$abi"
 
 [profile.debug]
 opt = 0
-debug = false
+debug = true
 simd = "scalarize"
 
 [artifact.host]
@@ -90,6 +90,14 @@ vendored_cli="$work/vendored-mach"
 "$cc" build . -o "$vendored_cli"
 if [ "$("$vendored_cli" info --version)" != "$compiler_ver" ]; then
     echo "version-vendor.sh: built vendored CLI reports the embedding project version" >&2
+    exit 1
+fi
+if ! readelf --debug-dump=info "$vendored_cli" 2>/dev/null | grep -Fq "DW_AT_producer"; then
+    echo "version-vendor.sh: vendored CLI has no debug producer metadata" >&2
+    exit 1
+fi
+if ! readelf --debug-dump=info "$vendored_cli" 2>/dev/null | grep -F "DW_AT_producer" | grep -Fq "mach $compiler_ver"; then
+    echo "version-vendor.sh: vendored debug producer reports the embedding project version" >&2
     exit 1
 fi
 "$cc" test . --include-deps --filter mach.lang.version
