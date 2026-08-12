@@ -11,6 +11,16 @@ fi
 
 cc=$(realpath "$cc")
 root=$(realpath "$root")
+compiler_ver=$(sed -n 's/^pub val MACH_VERSION: str = "\(.*\)";$/\1/p' "$root/src/lang/version.mach")
+if [ -z "$compiler_ver" ]; then
+    echo "version-vendor.sh: compiler version constant not found" >&2
+    exit 2
+fi
+compiler_major=${compiler_ver%%.*}
+if [ "$("$cc" info --version)" != "$compiler_ver" ]; then
+    echo "version-vendor.sh: vendored CLI reports the embedding project version" >&2
+    exit 1
+fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/src"
@@ -54,9 +64,15 @@ git = "https://github.com/briar-systems/mach-std"
 ref = "branch/main"
 EOF
 
-cat > "$work/src/main.mach" <<'EOF'
+cat > "$work/src/main.mach" <<EOF
 use std.runtime;
 use mach.lang.version;
+
+test "mach.lang.version:vendored_context" {
+    \$if (\$mach.version != "$compiler_ver") { ret 1; }
+    \$if (\$mach.version.major != $compiler_major) { ret 1; }
+    ret 0;
+}
 
 #[symbol("main")]
 fun main() i32 { ret 0; }
