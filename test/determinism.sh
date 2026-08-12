@@ -8,9 +8,8 @@
 # drives: a warm rebuild must produce byte-identical output to a clean build, both
 # with no change (cache reuse is sound) and after a source edit (invalidation is
 # sound, the failure mode #2045 recorded, where an incremental build reflected an
-# edit only partially). The edit is a `[project].version` bump: it flows through
-# `$project.version` into the compiler and rides the comptime-input invalidation
-# path, the subtlest one to get right.
+# edit only partially). The edit is the release version bump: it updates both the
+# Mach-owned compiler version and the matching project manifest value.
 set -eu
 
 cc=${1:-}
@@ -23,7 +22,7 @@ cc=$(realpath "$cc")
 cd "$dir"
 
 work=$(mktemp -d)
-trap 'rm -rf "$work" out; cp "$work/mach.toml.bak" mach.toml 2>/dev/null || true' EXIT
+trap 'rm -rf "$work" out; cp "$work/mach.toml.bak" mach.toml 2>/dev/null || true; cp "$work/version.mach.bak" src/lang/version.mach 2>/dev/null || true' EXIT
 
 # a clean baseline, then a warm no-op rebuild over its populated out/
 rm -rf out
@@ -34,19 +33,26 @@ if ! cmp -s "$work/clean" "$work/warm_noop"; then
     exit 1
 fi
 
-# edit-invalidation: bump [project].version, which $project.version folds into the
-# compiler, then compare a warm rebuild against a clean rebuild of the same edit
+# edit-invalidation: bump the release identity, then compare a warm rebuild
+# against a clean rebuild of the same edit
 cp mach.toml "$work/mach.toml.bak"
+cp src/lang/version.mach "$work/version.mach.bak"
 if ! grep -q '^version = ' mach.toml; then
     echo "::error::no [project].version line to drive the invalidation edit"
     exit 1
 fi
+if ! grep -q '^pub val MACH_VERSION: str = ' src/lang/version.mach; then
+    echo "::error::no compiler version constant to drive the invalidation edit"
+    exit 1
+fi
 sed -i 's/^version = "\(.*\)"/version = "\1-det"/' mach.toml
+sed -i 's/^pub val MACH_VERSION: str = "\(.*\)";/pub val MACH_VERSION: str = "\1-det";/' src/lang/version.mach
 
 "$cc" build . -o "$work/inc_edited"
 rm -rf out
 "$cc" build . -o "$work/clean_edited"
 cp "$work/mach.toml.bak" mach.toml
+cp "$work/version.mach.bak" src/lang/version.mach
 
 if ! cmp -s "$work/inc_edited" "$work/clean_edited"; then
     echo "::error::incremental build after an edit diverged from a clean build (stale invalidation)"
