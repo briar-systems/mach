@@ -49,7 +49,7 @@ debug = false
 simd = "scalarize"
 
 [artifact.host]
-kind = "static"
+kind = "bin"
 entry = "main.mach"
 out = "lib/host"
 targets = ["*"]
@@ -67,6 +67,9 @@ EOF
 cat > "$work/src/main.mach" <<EOF
 use std.runtime;
 use std.types.string.str_equals;
+use std.types.size.usize;
+use std.types.string.str;
+use mach.cli.cmd.dispatch;
 use mach.lang.driver.load;
 use mach.lang.version;
 
@@ -78,9 +81,15 @@ test "mach.lang.version:vendored_context" {
 }
 
 #[symbol("main")]
-fun main() i32 { ret 0; }
+fun main(argc: usize, argv: *str) i64 { ret dispatch(argc, argv); }
 EOF
 
 cd "$work"
 "$cc" dep pull
+vendored_cli="$work/vendored-mach"
+"$cc" build . -o "$vendored_cli"
+if [ "$("$vendored_cli" info --version)" != "$compiler_ver" ]; then
+    echo "version-vendor.sh: built vendored CLI reports the embedding project version" >&2
+    exit 1
+fi
 "$cc" test . --include-deps --filter mach.lang.version
