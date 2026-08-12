@@ -66,9 +66,12 @@ EOF
 
 cat > "$work/src/main.mach" <<EOF
 use std.runtime;
+use std.types.string.str_equals;
+use mach.lang.driver.load;
 use mach.lang.version;
 
 test "mach.lang.version:vendored_context" {
+    if (!str_equals(load.MACH_VERSION, "$compiler_ver")) { ret 1; }
     \$if (\$mach.version != "$compiler_ver") { ret 1; }
     \$if (\$mach.version.major != $compiler_major) { ret 1; }
     ret 0;
