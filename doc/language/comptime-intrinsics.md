@@ -11,6 +11,27 @@ The set is closed; adding a new intrinsic requires a compiler change.
 Return comptime constant unsigned integers. The storage type is whatever
 the binding declares — Mach has no compiler-known `usize`.
 
+A layout measurement is an **untyped comptime integer**, exactly like an integer
+literal: it names a constant the compiler already knows, so putting it in a
+narrower binding is a choice of representation rather than a conversion. It
+adopts the binding's width and signedness, and is **refused** — never truncated —
+when the measured value does not fit:
+
+```mach
+rec Point { x: i64; y: i64; }
+
+val A: u8    = $size_of(Point);   # 16, stored in one byte
+val B: i64   = $size_of(Point);   # the same 16, stored in eight
+val C: usize = $size_of(usize);   # correct at any pointer width
+
+rec Huge { a: [300]u8; }
+val D: u8 = $size_of(Huge);       # error: value 300 is out of range for u8 (0..255)
+```
+
+Without a binding to read a width from — an array length, an `#[align(...)]`
+argument, a comparison against a typed value — the measurement behaves the way a
+literal does in the same position.
+
 ```mach
 $size_of(T)             # byte size of type T
 $length_of(T)           # ELEMENT count of type T
@@ -36,6 +57,12 @@ fun probe[T]() u64 {
 
 `$offset_of`'s **second** argument is the exception: a bare field name, resolved
 against the record's layout, never a type or a value.
+
+`$offset_of` adopts its binding's width like the other three, but its answer is
+decided later than the others': a field's offset is fixed at lowering, so it is
+the one measurement that cannot be read in a `$if` gate, and the check that its
+value fits the binding happens at lowering rather than during type checking. The
+diagnostic is the same either way.
 
 ### `$length_of` — elements, not bytes
 

@@ -88,6 +88,12 @@ pub rec CoerceResult {
     value:   u64;
     negated: bool;
     bounds:  IntBounds;
+
+    # what the out-of-range constant was SPELLED as, so the diagnostic can name it:
+    # true for a literal the author wrote, false for one a fold produced (a layout
+    # measurement, a comptime path). "literal 300" is the wrong noun for
+    # `$size_of(Huge)`, and "value 300" is the weaker one for `300` (#2934).
+    literal: bool;
 }
 
 # a zeroed IntBounds, for results that carry no range
@@ -135,13 +141,14 @@ fun applicable(to: type.TypeId) CoerceResult {
 # negated: whether the literal is negated
 # bounds:  the destination's inclusive value range
 # ret:     a CoerceResult with kind COERCE_OUT_OF_RANGE
-fun out_of_range(to: type.TypeId, value: u64, negated: bool, bounds: IntBounds) CoerceResult {
+fun out_of_range(to: type.TypeId, value: u64, negated: bool, bounds: IntBounds, literal: bool) CoerceResult {
     var r: CoerceResult;
     r.kind    = COERCE_OUT_OF_RANGE;
     r.ty      = to;
     r.value   = value;
     r.negated = negated;
     r.bounds  = bounds;
+    r.literal = literal;
     ret r;
 }
 
@@ -219,10 +226,10 @@ fun coerce_to(sc: *context.SemaContext, eid: id.ExprId, to: type.TypeId, negated
     val e: *expr.Expr = O.unwrap[*expr.Expr](opt_e);
 
     if (e.kind == expr.EXPR_KIND_LIT_INT) {
-        ret coerce_int_literal(sc, eid, e.data.lit_int, to, negated);
+        ret coerce_int_literal(sc, eid, e.data.lit_int, to, negated, true);
     }
     if (e.kind == expr.EXPR_KIND_LIT_CHAR) {
-        ret coerce_int_literal(sc, eid, e.data.lit_char::u64, to, negated);
+        ret coerce_int_literal(sc, eid, e.data.lit_char::u64, to, negated, true);
     }
     if (e.kind == expr.EXPR_KIND_LIT_FLOAT) {
         if (to != type.TYPE_F32 && to != type.TYPE_F64) { ret not_applicable(); }
@@ -238,6 +245,9 @@ fun coerce_to(sc: *context.SemaContext, eid: id.ExprId, to: type.TypeId, negated
     }
     if (e.kind == expr.EXPR_KIND_COMPTIME_IDENT || e.kind == expr.EXPR_KIND_MEMBER) {
         ret coerce_comptime_int_path(sc, eid, to, negated);
+    }
+    if (e.kind == expr.EXPR_KIND_CALL) {
+        ret coerce_layout_intrinsic(sc, eid, to, negated);
     }
     if (e.kind == expr.EXPR_KIND_UNARY) {
         ret coerce_unary(sc, eid, ?e.data.unary, to, negated);
@@ -266,11 +276,11 @@ fun coerce_to(sc: *context.SemaContext, eid: id.ExprId, to: type.TypeId, negated
 # to:      the destination TypeId
 # negated: true when the literal sits under an odd number of unary `-`
 # ret:     COERCED, OUT_OF_RANGE, or NOT_APPLICABLE per the destination
-fun coerce_int_literal(sc: *context.SemaContext, eid: id.ExprId, v: u64, to: type.TypeId, negated: bool) CoerceResult {
+fun coerce_int_literal(sc: *context.SemaContext, eid: id.ExprId, v: u64, to: type.TypeId, negated: bool, literal: bool) CoerceResult {
     val opt_bounds: O.Option[IntBounds] = int_bounds_of(sc, to);
     if (O.is_none[IntBounds](opt_bounds)) { ret not_applicable(); }
     val bounds: IntBounds = O.unwrap[IntBounds](opt_bounds);
-    if (!fits_bounds(v, negated, bounds)) { ret out_of_range(to, v, negated, bounds); }
+    if (!fits_bounds(v, negated, bounds)) { ret out_of_range(to, v, negated, bounds, literal); }
     ret commit(sc, eid, to);
 }
 
@@ -297,12 +307,26 @@ fun coerce_comptime_int_path(sc: *context.SemaContext, eid: id.ExprId, to: type.
     if (R.is_err[comptime.CTValue, str](res_eval)) { ret not_applicable(); }
     val ctval: comptime.CTValue = R.unwrap_ok[comptime.CTValue, str](res_eval);
 
+    ret coerce_ct_int(sc, eid, ctval, to, negated);
+}
+
+# range-check an already-folded comptime integer against `to` and commit
+#
+# The shared tail of every folded-constant arm. The fold already produced a
+# definite value, so its magnitude and sign are derived rather than reading the
+# raw i64 as a u64: a negative signed fold has a real magnitude and an implicit
+# negation that compose with the surrounding unary `-`, and reading it as a
+# near-max u64 would reject values that fit.
+# ---
+# sc:      the active sema context
+# eid:     the expression to retype on success
+# ctval:   the folded constant
+# to:      the destination TypeId
+# negated: true when the expression sits under an odd number of unary `-`
+# ret:     COERCED, OUT_OF_RANGE, or NOT_APPLICABLE per the destination
+fun coerce_ct_int(sc: *context.SemaContext, eid: id.ExprId, ctval: comptime.CTValue, to: type.TypeId, negated: bool) CoerceResult {
     if (ctval.kind != comptime.CT_KIND_INT) { ret not_applicable(); }
 
-    # the path already folded to a definite value, so derive its magnitude and
-    # sign rather than reading the raw i64 as a u64. a negative signed fold has a
-    # real magnitude and an implicit negation that compose with the surrounding
-    # unary `-`; reading it as a near-max u64 would reject values that fit.
     val raw: i64 = ctval.data.i;
     var mag: u64 = raw:~u64;
     var value_negated: bool = false;
@@ -314,7 +338,72 @@ fun coerce_comptime_int_path(sc: *context.SemaContext, eid: id.ExprId, to: type.
     var negated_total: bool = negated;
     if (value_negated) { negated_total = !negated; }
 
-    ret coerce_int_literal(sc, eid, mag, to, negated_total);
+    ret coerce_int_literal(sc, eid, mag, to, negated_total, false);
+}
+
+# coerce a layout intrinsic (`$size_of` / `$align_of` / `$length_of`) to a
+# destination integer type
+#
+# A LAYOUT INTRINSIC IS AN UNTYPED COMPTIME INTEGER, exactly like a literal
+# (#2934/#2946). It measures a constant the compiler already knows, so there is no
+# conversion to perform when it lands in a narrower binding - only a choice of
+# representation, which is the same thing `val x: u8 = 5;` does. Typing it `u64`
+# flat meant `val step: usize = $size_of(usize);` compiled only where `usize`
+# happens to BE `u64`, so mach-std built on lp64 by coincidence and no ilp32
+# target could compile it at all.
+#
+# THE MEASUREMENT IS NOT REPEATED HERE. `comptime.eval` routes a layout intrinsic
+# through the `layout_fn` resolver sema installs, which is the same
+# `fold_layout_intrinsic` an array length and a `$if` gate go through - so a size
+# measured in a binding and the same size measured in a gate cannot disagree.
+#
+# `$offset_of` DECLINES, and not by omission: a field's offset is decided at
+# lowering, later than any fold available here, so the evaluator refuses it and
+# this returns NOT_APPLICABLE. It keeps its `u64` typing and an explicit cast,
+# which is the honest answer while sema has no offset to range-check against.
+# ---
+# sc:      the active sema context
+# eid:     the call expression to coerce
+# to:      the destination TypeId
+# negated: true when the call sits under an odd number of unary `-`
+# ret:     COERCED when the measured constant fits `to`, OUT_OF_RANGE when it
+#          overflows an integer `to`, else NOT_APPLICABLE
+fun coerce_layout_intrinsic(sc: *context.SemaContext, eid: id.ExprId, to: type.TypeId, negated: bool) CoerceResult {
+    # every other call is a runtime value and coerces to nothing
+    if (!comptime.is_layout_intrinsic_call(sc.a, sc.source, eid)) { ret not_applicable(); }
+
+    # a layout measure is an integer and takes no other destination; a float or
+    # pointer slot gets the plain mismatch its own diagnostic describes
+    if (O.is_none[IntBounds](int_bounds_of(sc, to))) { ret not_applicable(); }
+
+    # THE FOLD HERE IS SPECULATIVE AND MUST NOT REPORT. `$size_of(T)` inside a
+    # generic body has no measurable layout until the instantiation supplies `T`,
+    # and an assignability probe is not the place to announce that - the episode
+    # is asking "could this take that type", not "measure this now".
+    val saved_silent: bool = sc.silent;
+    sc.silent = true;
+    val res_eval: R.Result[comptime.CTValue, str] =
+        comptime.eval(sc.ctx, sc.a, sc.source, eid, ?sc.s.interner);
+    sc.silent = saved_silent;
+
+    if (R.is_ok[comptime.CTValue, str](res_eval)) {
+        val ctval: comptime.CTValue = R.unwrap_ok[comptime.CTValue, str](res_eval);
+        if (ctval.kind == comptime.CT_KIND_INT) {
+            ret coerce_ct_int(sc, eid, ctval, to, negated);
+        }
+    }
+
+    # MEASURABLE LATER, NOT NEVER. Two intrinsics reach here: `$size_of(T)` on a
+    # generic parameter, whose layout arrives with the instantiation, and
+    # `$offset_of`, whose answer is decided at lowering by design. Both are still
+    # comptime constants of the width the binding declares, so the type commits
+    # here and the VALUE is range-checked where it is finally known - the lowering
+    # fold refuses a measure too wide for the slot rather than truncating it.
+    #
+    # Declining instead would leave them `u64`, which is exactly the defect: on an
+    # ilp32 target `$size_of(T) * count` against a `usize` count is the mismatch
+    # that stopped mach-std compiling at all (#2934).
+    ret commit(sc, eid, to);
 }
 
 # coerce a unary `-`/`~` node by coercing its operand to `to`
