@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### sema: a comptime pack on a body-less `fun` is refused where it is written (#3002)
+
+`va: ...` and a bare trailing `...` look alike and mean unrelated things. The first
+is a NAMED parameter carrying a mach comptime pack, monomorphized into one instance
+per call-site type list, each taking a mangled name that carries that list. The
+second is the C variadic an import declares. Only the second can cross a foreign
+boundary.
+
+Combining the first with a body-less `fun` compiled clean through codegen and failed
+at LINK, naming a symbol the source never wrote:
+
+```
+error: dynamic import 'raylib.raylib.TextFormat$pack$i32$i32' has no #[library] attribution
+```
+
+It is refused at the declaration now, and the refusal names the form that works.
+That matters more than the refusal: the two reports this came from (#3000, #2968)
+were not blocked by the language - calling a C variadic function has worked since
+v2.0.0 - they were blocked by not knowing the other spelling existed.
+
+Neither correct form moves. `ext fun printf(fmt: *u8, ...) i32;` and
+`fun fold(h: u64, va: ...) u64 { ... }` are both still accepted, which is what keeps
+this a diagnostic rather than a narrowing of the language.
+
 #### link(coff): MSVC's biased REL32 relocations are read (#2992)
 
 Mach defined the x86-64 COFF relocation types 1-4 and 10-11 and skipped **5 through
