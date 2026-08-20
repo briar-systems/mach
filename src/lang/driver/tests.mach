@@ -26,6 +26,10 @@ use std.types.string.str_equals;
 use std.types.string.str_len;
 use std.types.path;
 
+use std.data.toml;
+use std.text.string.str_free;
+use prnt: std.print;
+use iow: std.io.writer;
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
@@ -605,6 +609,11 @@ test "mach.lang.driver:analyze_project_retains_selected_frontend" {
     val sr: R.Result[session.Session, str] = session.init(?alloc);
     if (R.is_err[session.Session, str](sr)) { ret 1; }
     var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val fr: R.Result[fs.File, str] = fs.create("/tmp/leak3001.txt", 0o644);
+    if (R.is_err[fs.File, str](fr)) { ret 1; }
+    val f: fs.File = R.unwrap_ok[fs.File, str](fr);
+    var w: iow.Writer = fs.writer(f);
 
     var names: [4]str;
     names[0] = "alpha.mach"; names[1] = "beta.mach";
@@ -20531,4 +20540,128 @@ fun ut_spv_var_loads_typed(w: *u32, n: u32) bool {
         i = i + len;
     }
     ret true;
+}
+
+
+# an allocator that reports its outstanding byte count, for the steady-state
+# assertions below
+#
+# It delegates every operation to a page-backed allocator and tracks only the net
+# balance, which is what a leak assertion needs: `live` is bytes allocated minus
+# bytes released, so a cycle that returns everything it took leaves it unchanged.
+# A reallocation is a release of the old extent and a take of the new, matching how
+# the containers underneath account for one.
+# ---
+# backing: the real allocator every call is forwarded to
+# live:    outstanding bytes, allocations minus deallocations
+rec LiveBytes {
+    backing: A.Allocator;
+    live:    i64;
+}
+
+fun live_alloc(ctx: ptr, size: usize, align: usize) O.Option[ptr] {
+    val t: *LiveBytes = ctx::*LiveBytes;
+    val r: O.Option[ptr] = t.backing.fn_allocate(t.backing.ctx, size, align);
+    if (O.is_some[ptr](r)) { t.live = t.live + size::i64; }
+    ret r;
+}
+
+fun live_realloc(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) O.Option[ptr] {
+    val t: *LiveBytes = ctx::*LiveBytes;
+    val r: O.Option[ptr] = t.backing.fn_reallocate(t.backing.ctx, p, old_size, new_size, align);
+    if (O.is_some[ptr](r)) { t.live = t.live - old_size::i64 + new_size::i64; }
+    ret r;
+}
+
+fun live_dealloc(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
+    val t: *LiveBytes = ctx::*LiveBytes;
+    t.live = t.live - size::i64;
+    ret t.backing.fn_deallocate(t.backing.ctx, p, size, align);
+}
+
+# install a live-byte-counting allocator over a page allocator
+fun live_bytes_make(t: *LiveBytes, a: *A.Allocator) bool {
+    if (O.is_some[str](page.make(?t.backing))) { ret false; }
+    t.live          = 0;
+    a.ctx           = t::ptr;
+    a.fn_allocate   = live_alloc;
+    a.fn_reallocate = live_realloc;
+    a.fn_deallocate = live_dealloc;
+    ret true;
+}
+
+# A retained session's reload cycle returns to a steady state (#3001).
+#
+# THE ASSERTION IS EXACT, not a threshold. An editor integration runs this cycle
+# once per edit, so any per-cycle residue at all is unbounded growth over a session
+# rather than a constant overhead - a bound would only decide how long the session
+# lasts before it mattered. The first rounds are excluded because session-lifetime
+# storage (the interner, the query DB's retained handles) is legitimately populated
+# on the way in and never released; from the third round on, every allocation the
+# cycle makes must be one the cycle also returns.
+#
+# The cycle here is the LSP's: reload the manifest, analyze the artifact's closure,
+# tear the analysis down, release the manifest. It leaked ~8 KB per round before,
+# 96% of it in the manifest reload rather than the retained analysis the report
+# named - a toml table nothing freed, diagnostic labels rendered on every successful
+# parse, and expanded output paths dropped after interning.
+test "mach.lang.driver:retained_reload_cycle_reaches_steady_state" {
+    var lb: LiveBytes;
+    var alloc: A.Allocator;
+    if (!live_bytes_make(?lb, ?alloc)) { ret 1; }
+
+    var names: [4]str;
+    names[0] = "alpha.mach"; names[1] = "beta.mach";
+    names[2] = "model.mach"; names[3] = "orphan.mach";
+    var texts: [4]str;
+    texts[0] = "fun main() i32 { ret no_such(); }\n";
+    texts[1] = "use ctxcase.model;\nfun main() i32 { var b: model.Box[model.Leaf]; ret model.take[model.Leaf](b); }\n";
+    texts[2] = "pub rec Leaf { n: i32; }\npub rec Box[T] { v: T; }\npub fun take[T](b: Box[T]) i32 { ret 7; }\n";
+    texts[3] = "fun broken() NoSuch { var x: AlsoMissing; ret x; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold_m(
+        ?alloc, ut_manifest_frontend(), ?names[0], ?texts[0], 4);
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { fs.remove_all(?alloc, root); ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var bad:      i32 = 0;
+    var settled:  i64 = 0;
+    var round:    i32 = 0;
+    for (round < 5) {
+        val mr: R.Result[manifest.Manifest, str] = driver.load_manifest(?s, root);
+        if (R.is_err[manifest.Manifest, str](mr)) { bad = 2; brk; }
+        var mf: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](mr);
+
+        var req: request.BuildRequest = request.defaults();
+        req.project_root = root;
+        req.target       = "windows";
+        req.profile      = "release";
+        req.artifact     = "beta";
+        req.want_lib     = false;
+        req.goal         = request.GOAL_OBJECTS;
+        req.opt          = pipeline.OPT_RELEASE;
+        req.pie          = true;
+
+        val pr: R.Result[project.Project, outcome.Fail] =
+            driver.analyze_project(?s, ?mf, ?req, nil, 0);
+        if (R.is_err[project.Project, outcome.Fail](pr)) {
+            manifest.dnit(?mf, ?alloc); bad = 3; brk;
+        }
+        var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+        project.dnit_project(?p);
+        manifest.dnit(?mf, ?alloc);
+
+        # round 2 is the first fully warm one: rounds 0 and 1 still populate
+        # session-lifetime storage.
+        if (round == 2) { settled = lb.live; }
+        if (round > 2 && lb.live != settled) { bad = 4; brk; }
+        round = round + 1;
+    }
+
+    session.dnit(?s);
+    fs.remove_all(?alloc, root);
+    ret bad;
 }
