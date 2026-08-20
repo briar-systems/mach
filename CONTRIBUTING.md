@@ -86,6 +86,10 @@ Mach uses [Semantic Versioning](https://semver.org/) (`vMAJOR.MINOR.PATCH`):
 
 Tags are created on `main` after merging from `dev`. The current pre-1.0 convention treats minor bumps as potentially breaking while the language stabilizes.
 
+A release bump updates both `[project].version` in `mach.toml` and
+`MACH_VERSION` in `src/lang/version.mach`. CI and the tag workflow require the
+two values to match.
+
 ### Release Flow
 
 ```

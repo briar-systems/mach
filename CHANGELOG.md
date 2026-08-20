@@ -5,7 +5,78 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [4.20.0] - 2026-08-20
+
+### Fixed
+
+#### driver: a retained session's reload cycle returns to a steady state (#3001)
+
+`analyze_project` + `dnit_project` on one retained `Session` grew RSS without
+bound, ~7.4 MiB per cycle against a 222-module project. A language server runs that
+cycle once per edit, so the growth was proportional to how long an editing session
+lasted: mach-lsp reached ~550 MiB after 40 edits of one file and kept climbing.
+
+**The report named the retained-analysis path, and 96% of it was the manifest
+reload.** Measuring the two halves separately - the same allocator counting bytes,
+the manifest loaded once outside the loop for one of them - split 7993 bytes per
+round into 7646 in `load_manifest` and 347 in `analyze_project`. Both are fixed;
+the cycle is now byte-for-byte flat.
+
+**The parsed TOML table was never freed.** `load_manifest` parsed `mach.toml` into a
+`toml.Table` and dropped it, because `std.data.toml` had no teardown to call
+(briar-systems/mach-std#474 adds it). `manifest.parse` interns every string it
+keeps, so the `Manifest` borrows nothing from the table and it can be released as
+soon as the parse returns.
+
+**Diagnostics were rendered on the success path.** The manifest parser composed a
+`[target.linux]`-style label for every table it validated, and passed *fully
+rendered error messages* into helpers that use them only on failure - so a
+successful parse built and discarded a complete set of diagnostics. `parse_str_array`
+and `parse_resource_path` now take the label and key and render only when something
+actually fails, which is both the leak fix and the reason the work was pointless to
+begin with.
+
+**Expanded output paths were dropped after interning.** `resolve_build_unit` and
+`check_collisions` expanded `{target.name}`/`{profile.name}` templates, interned the
+result, and leaked the rendering. `join_path_canonical` leaked both of the trimmed
+halves it joins, on every call.
+
+`join_path_canonical` also returned a *borrowed* argument in its two degenerate
+cases and a fresh allocation otherwise, so whether the caller had to free the result
+depended on values no caller can inspect. It now always returns an owned string.
+
+The regression test asserts an **exact** zero, not a threshold: a cycle that runs
+once per keystroke has no such thing as an acceptable per-cycle residue, only a
+longer wait before it matters.
+
+### Added
+
+#### Tooling can retain compiler-owned frontend analysis (#2996)
+
+`driver.analyze_project` now runs load, resolve, and sema without executing build
+steps or backend phases, and returns the retained project graph. Optional module
+FQN roots enter the compiler's normal DFS, so open editor buffers outside the
+selected artifact closure receive the same overlays, imports, comptime constants,
+diagnostics, and semantic analysis as ordinary project modules.
+
+### Changed
+
+#### Project manifests no longer declare a minimum Mach version (#2953)
+
+The undocumented `[project].mach` key and its toolchain-version check have been
+removed. The check read the embedding project's version when the compiler frontend
+was vendored, so it refused every ordinary `4.x` requirement under tools such as
+mach-lsp. Root manifests now report `mach` as an unknown project key; dependency
+metadata bearing the removed key is ignored. No replacement is planned here.
+
+### Fixed
+
+#### Vendored frontends retain Mach's compiler version (#2954)
+
+The driver, `$mach.version`, debug-info producer string, and CLI now read one Mach-owned
+release constant instead of the embedding project's `[project].version`. A frontend
+vendored by another tool therefore reports Mach's version rather than its host package's
+version. Release tests pin the constant to Mach's own manifest.
 
 ## [4.19.0] - 2026-08-10
 

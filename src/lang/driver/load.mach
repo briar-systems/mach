@@ -50,12 +50,13 @@ use mach.lang.readout;
 use mach.lang.session;
 use src: mach.lang.source;
 use mach.lang.target;
+use mach.lang.version;
 
 use mach.lang.driver.project;
 use dq: mach.lang.driver.query;
 
 # the compiler's own version string, recorded into each module's comptime ctx
-pub val MACH_VERSION: str = $project.version;
+pub val MACH_VERSION: str = version.MACH_VERSION;
 
 # seed capacities for the per-build growable arrays (module table, a module's pub
 # const list, a module's dep list)
@@ -335,6 +336,54 @@ pub fun dfs_load(p: *project.Project, fqn: intern.StrId) R.Result[session.Module
     ret R.ok[session.ModuleId, str](mid);
 }
 
+# construct the empty base comptime environment for a module in `p`
+#
+# The load walk owns all later module-local and imported public-constant bindings.
+# Keeping this constructor private ensures tooling cannot mistake a build-only base
+# for a loaded module context: additional editor buffers enter through the driver's
+# extra-root DFS and receive the same bindings as every ordinary module.
+# ---
+# p:   loaded project whose selected target and manifest config seed the context
+# req: settled request that opened `p`; must describe the same build selection
+# ret: an owning module context, or the first define-binding / allocation error
+fun module_context(p: *project.Project, req: *request.BuildRequest) R.Result[comptime.ComptimeCtx, str] {
+    if (p == nil || req == nil || p.target_entry == nil) {
+        ret R.err[comptime.ComptimeCtx, str]("driver: module context requires an opened project and request");
+    }
+
+    var build_mode_id: u32 = comptime.MODE_DEBUG;
+    if (request.release(req)) { build_mode_id = comptime.MODE_RELEASE; }
+    var build_pie: u32 = 0;
+    if (req.pie) { build_pie = 1; }
+
+    var ctx: comptime.ComptimeCtx = comptime.init(
+        p.alloc,
+        p.target.os_id,
+        p.target.arch_id,
+        p.target.abi_id,
+        build_mode_id,
+        build_pie,
+        p.target.isa.pointer_width,
+        p.target.model.vector_bits,
+        p.compiler_name,
+        p.compiler_ver
+    );
+    comptime.set_target_defs(?ctx, p.target.isa.defs);
+    comptime.set_build_context(?ctx,
+        p.config.id, p.config.version, p.config.name, p.config.description,
+        p.target_entry.os_name, p.target_entry.isa_name, p.target_entry.abi_name,
+        p.target_entry.platform_name,
+        p.config.bin_name);
+
+    val bd_r: R.Result[bool, str] = bind_defines(p, ?ctx);
+    if (R.is_err[bool, str](bd_r)) {
+        val message: str = R.unwrap_err[bool, str](bd_r);
+        comptime.dnit(?ctx);
+        ret R.err[comptime.ComptimeCtx, str](message);
+    }
+    ret R.ok[comptime.ComptimeCtx, str](ctx);
+}
+
 # append a fresh ModuleEntry for `fqn` - assigning its stable id, comptime ctx,
 # and manifest defines - and index it in by_fqn
 fun register_module_slot(p: *project.Project, fqn: intern.StrId) R.Result[session.ModuleId, str] {
@@ -362,6 +411,15 @@ fun register_module_slot(p: *project.Project, fqn: intern.StrId) R.Result[sessio
     val sid_r: R.Result[session.StableModuleId, str] = session.stable_module_id(p.s, fqn);
     if (R.is_err[session.StableModuleId, str](sid_r)) { ret R.err[session.ModuleId, str](R.unwrap_err[session.StableModuleId, str](sid_r)); }
 
+    val qctxp: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
+    if (qctxp == nil || qctxp.req == nil) {
+        ret R.err[session.ModuleId, str]("driver: module load has no active build request");
+    }
+    val ctx_r: R.Result[comptime.ComptimeCtx, str] = module_context(p, qctxp.req);
+    if (R.is_err[comptime.ComptimeCtx, str](ctx_r)) {
+        ret R.err[session.ModuleId, str](R.unwrap_err[comptime.ComptimeCtx, str](ctx_r));
+    }
+
     var m: project.ModuleEntry;
     m.fqn               = fqn;
     m.file_id           = 0;
@@ -369,24 +427,7 @@ fun register_module_slot(p: *project.Project, fqn: intern.StrId) R.Result[sessio
     # the AST is borrowed from the session cache; nil until parse_module sets it.
     # teardown never frees m.a, so a never-parsed entry needs no placeholder AST.
     m.a                 = nil;
-    # the active optimization mode for `$mach.build.mode` and the `$mach.build.pie`
-    # bit both come from the settled request: composition already applied the
-    # explicit-flag-over-profile precedence, so the gate matches the pipeline.
-    val ctx: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
-    var build_mode_id: u32 = comptime.MODE_DEBUG;
-    if (request.release(ctx.req)) { build_mode_id = comptime.MODE_RELEASE; }
-    var build_pie: u32 = 0;
-    if (ctx.req.pie) { build_pie = 1; }
-    m.ctx               = comptime.init(p.alloc, p.target.os_id, p.target.arch_id, p.target.abi_id, build_mode_id, build_pie, p.target.isa.pointer_width, p.target.model.vector_bits, p.compiler_name, p.compiler_ver);
-    comptime.set_target_defs(?m.ctx, p.target.isa.defs);
-    # feed the manifest-derived `$project.*`/`$bin.*` roots (the selected target's
-    # declared tuple lives under `$project.target.*`); the target tuple comes from
-    # the selected entry (set before any module loads).
-    comptime.set_build_context(?m.ctx,
-        p.config.id, p.config.version, p.config.name, p.config.description,
-        p.target_entry.os_name, p.target_entry.isa_name, p.target_entry.abi_name,
-        p.target_entry.platform_name,
-        p.config.bin_name);
+    m.ctx               = R.unwrap_ok[comptime.ComptimeCtx, str](ctx_r);
     m.pub_consts        = nil;
     m.pub_const_count   = 0;
     m.pub_const_cap     = 0;
@@ -404,11 +445,6 @@ fun register_module_slot(p: *project.Project, fqn: intern.StrId) R.Result[sessio
     m.target_gated      = false;
     p.modules[p.module_len] = m;
     p.module_len = p.module_len + 1;
-
-    # bind the selected unit's manifest defines (#1191) into this module's ctx so
-    # `$if ($mach.build.NAME)` folds identically in every module of the graph.
-    val bd_r: R.Result[bool, str] = bind_defines(p, ?p.modules[mid::u32].ctx);
-    if (R.is_err[bool, str](bd_r)) { ret R.err[session.ModuleId, str](R.unwrap_err[bool, str](bd_r)); }
 
     val ins_r: R.Result[bool, str] = map.insert[intern.StrId, session.ModuleId](?p.by_fqn, fqn, mid);
     if (R.is_err[bool, str](ins_r)) { ret R.err[session.ModuleId, str](R.unwrap_err[bool, str](ins_r)); }
