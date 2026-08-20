@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+#### sema: a layout intrinsic adopts the width its binding declares (#2934, #2946)
+
+`$size_of` / `$align_of` / `$length_of` / `$offset_of` folded to a flat `u64`, so
+`val POINT_SIZE: i64 = $size_of(Point);` — **the example in
+`doc/language/comptime-intrinsics.md`** — did not compile, and the prose beside it
+promising the binding's width was simply false.
+
+A layout measurement is now an **untyped comptime integer, exactly like an integer
+literal**. It names a constant the compiler already knows, so putting it in a
+narrower binding is a choice of representation rather than a conversion — the same
+thing `val x: u8 = 5;` has always done. It is refused, never truncated, when the
+measured value does not fit.
+
+**This is what stopped every 32-bit target compiling.** `mach-std` selects
+`usize` from `$mach.build.pointer_width`, which was always correct — 4 on
+riscv32 — so `usize` was `u32` there while `$size_of(usize)` stayed `u64`, and
+`memory.mach`'s `val step: usize = $size_of(usize);` failed inside the dependency
+before any user code was reached. On a 64-bit target the two happened to be the
+same type, so mach-std had been compiling **by coincidence**. It now builds for
+riscv32/ilp32 with no change to mach-std itself.
+
+The measurement is not repeated to do this: the coercion folds through the same
+`layout_fn` resolver an array length and a `$if` gate go through, so a size
+measured in a binding and the same size measured in a gate cannot disagree. The
+fold is speculative and stays silent, so `$size_of(T)` inside a generic body — no
+layout until the instantiation supplies `T` — commits the width and is
+range-checked when the instance is checked.
+
+`$offset_of` moves with its siblings but is checked later: a field's offset is
+decided at lowering, so that is where its value is verified against the binding.
+That check is new, and closes a hole it exposed — a 300-byte offset placed in a
+`u8` was previously written as 44, silently.
+
+An out-of-range diagnostic now names what was actually written: `literal 300` for
+a literal, `value 300` for a measurement or a folded comptime path.
+
 ## [4.20.1] - 2026-08-20
 
 ### Fixed
