@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.20.1] - 2026-08-20
+
+### Fixed
+
+#### driver: a reload cycle no longer leaks every dependency's parsed manifest (#3010)
+
+#3001 fixed the retained reload cycle for a project with **no dependencies**. Its
+regression fixture declares no `[dep.*]`, so it never reached dep resolution, the
+cascade scan, or the per-dep export-step walk - each of which parses a
+dependency's `mach.toml` of its own and dropped the table.
+
+The shipped 4.20.0 fix therefore read a clean zero on the fixture and leaked
+**~29.5 KB per cycle on any real project**. Measured on mach itself, 225 modules
+and one `[dep.mach-std]`, through a counting allocator: 29577 bytes per round
+before, zero after.
+
+Four sites: `free_cascade_scratch` released the `tables` array but not the tree
+under each slot, `resolve_dep` released none of its eight return paths, the
+sub-dep scan dropped its table at the end of the block, and the per-dep
+export-step walk plus the two `load_config` entries owned tables they treated as
+borrowed. Three test helpers leaked the same way, which matters because a leaking
+helper can mask a real leak in a counting-allocator test.
+
+**The new fixture declares a real vendored dependency and asserts `dep_count > 0`
+before measuring**, so it cannot quietly degrade into the no-dep fixture it exists
+to complement. That assertion is the actual fix here: the defect was not that four
+teardowns were missed, it was that the only test covering them could not fail.
+
 ## [4.20.0] - 2026-08-20
 
 ### Fixed
