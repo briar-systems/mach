@@ -33,6 +33,27 @@ Neither correct form moves. `ext fun printf(fmt: *u8, ...) i32;` and
 `fun fold(h: u64, va: ...) u64 { ... }` are both still accepted, which is what keeps
 this a diagnostic rather than a narrowing of the language.
 
+#### link(coff): MSVC's biased REL32 relocations are read (#2992)
+
+Mach defined the x86-64 COFF relocation types 1-4 and 10-11 and skipped **5 through
+9**, so linking an ordinary MSVC-built library failed outright:
+
+```
+error: coff: unsupported relocation type 8
+error: coff: unsupported relocation type 5
+```
+
+Those five are `IMAGE_REL_AMD64_REL32_1 .. _5`: plain `REL32` with the target taken
+N bytes past the next instruction byte, which MSVC emits whenever the instruction
+carries an immediate after the displacement field. Nothing exotic - ordinary calls
+and jumps - which is why any library of size hits them, and why the same project
+failed on type 8 against MSVC and type 5 against UCRT.
+
+They are one family with `REL32` rather than five new kinds: the abstract kind and
+the field width are `REL32`'s, and the only difference is the extra term the addend
+loses, read off the type itself. The write side needs nothing - mach never emits a
+biased REL32, it only has to read them.
+
 ## [4.21.0] - 2026-08-20
 
 ### Changed
