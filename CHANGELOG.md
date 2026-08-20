@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.21.1] - 2026-08-20
+
+### Fixed
+
+#### sema: a comptime pack on a body-less `fun` is refused where it is written (#3002)
+
+`va: ...` and a bare trailing `...` look alike and mean unrelated things. The first
+is a NAMED parameter carrying a mach comptime pack, monomorphized into one instance
+per call-site type list, each taking a mangled name that carries that list. The
+second is the C variadic an import declares. Only the second can cross a foreign
+boundary.
+
+Combining the first with a body-less `fun` compiled clean through codegen and failed
+at LINK, naming a symbol the source never wrote:
+
+```
+error: dynamic import 'raylib.raylib.TextFormat$pack$i32$i32' has no #[library] attribution
+```
+
+It is refused at the declaration now, and the refusal names the form that works.
+That matters more than the refusal: the two reports this came from (#3000, #2968)
+were not blocked by the language - calling a C variadic function has worked since
+v2.0.0 - they were blocked by not knowing the other spelling existed.
+
+Neither correct form moves. `ext fun printf(fmt: *u8, ...) i32;` and
+`fun fold(h: u64, va: ...) u64 { ... }` are both still accepted, which is what keeps
+this a diagnostic rather than a narrowing of the language.
+
+#### link(coff): MSVC's biased REL32 relocations are read (#2992)
+
+Mach defined the x86-64 COFF relocation types 1-4 and 10-11 and skipped **5 through
+9**, so linking an ordinary MSVC-built library failed outright:
+
+```
+error: coff: unsupported relocation type 8
+error: coff: unsupported relocation type 5
+```
+
+Those five are `IMAGE_REL_AMD64_REL32_1 .. _5`: plain `REL32` with the target taken
+N bytes past the next instruction byte, which MSVC emits whenever the instruction
+carries an immediate after the displacement field. Nothing exotic - ordinary calls
+and jumps - which is why any library of size hits them, and why the same project
+failed on type 8 against MSVC and type 5 against UCRT.
+
+They are one family with `REL32` rather than five new kinds: the abstract kind and
+the field width are `REL32`'s, and the only difference is the extra term the addend
+loses, read off the type itself. The write side needs nothing - mach never emits a
+biased REL32, it only has to read them.
+
 ## [4.21.0] - 2026-08-20
 
 ### Changed
