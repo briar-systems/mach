@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+#### sema: the C-variadic promotion rule survives monomorphization (#3029)
+
+C promotes anything narrower than `int` to `int` and `f32` to `f64`. Mach adds no
+implicit conversions, so a narrow value in a C-variadic tail is refused with the cast
+named - and that rule was silently skipped whenever the value's type arrived with an
+instantiation:
+
+```mach
+fun log1[A](fmt: *u8, a: A) i32 { ret printf(fmt, a); }
+
+log1[u8]("%d\n", c)     # compiled; printf read 32 bits of a register holding a byte
+```
+
+One line away, the identical value passed directly was refused correctly. The rule
+was only ever decided against the **template parameter** `A`, which is not a narrow
+integer because it is not an integer at all, so it declined.
+
+The cause was a layer out. `record_instance` prunes an instance whose arguments are
+all public scalars - its filter asks whether an argument can reach a *secret* - so
+`log1[u8]` was never recorded, its body never re-visited, and no gate ran for that
+instantiation. Same class as #2465, which added its own clause for `$if
+($is_record(T))`: a rule whose answer differs per instance, for arguments the secrecy
+filters do not care about.
+
+A body that calls a C-variadic function is now recorded, so the tail is re-checked
+against each instance's concrete types. **The filter is precise rather than
+conservative**, and deliberately: recording every generic that calls anything re-infers
+bodies with nothing concrete in them and reports their template-time diagnostics a
+second time, which `generic_instance_reached_through_generic` pins. Promotion-clean
+instantiations are unaffected, and one fixed-arity generic wrapper per arity remains
+the way to wrap a C variadic.
+
+Measured at no cost: 45.57s of build CPU against a 45.72s baseline.
+
 ## [4.22.0] - 2026-08-21
 
 ### Changed
