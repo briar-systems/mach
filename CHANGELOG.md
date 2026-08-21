@@ -41,6 +41,36 @@ pack's elements on any contract.
 
 Measured at no cost: 48.95s of build CPU against a 49.14s baseline.
 
+## [Unreleased]
+
+### Fixed
+
+#### driver: a module path is normalized before overlay and source lookup (#2998)
+
+Module loading composed `<root>/<src>/<name>.mach` verbatim, so a manifest carrying
+`src = "./src"` produced `<root>/./src/beta.mach` while an editor supplies the
+canonical `<root>/src/beta.mach`. The same file, two strings - so the overlay lookup
+missed, the **stale on-disk text was parsed instead**, and the unsaved buffer was
+silently ignored. No error; yesterday's source.
+
+The composed path is normalized once at the single place it is built, using
+`path.clean` from mach-std 0.28.1, so the disk read and `load_source`'s SourceFile
+registration agree on one spelling and one file gets one FileId.
+
+That alone would only have moved the mismatch. The two sides that meet in the overlay
+table pick their spelling **independently** - an editor keys a buffer from a URI it
+decoded, the driver composes a path out of manifest text - so canonicalizing the half
+the compiler controls leaves the editor's half free to disagree. The key is therefore
+canonicalized at the table's own boundary, in `set_overlay`, `clear_overlay` and
+`overlay_get` alike, which makes it canonical by construction rather than by every
+producer happening to agree.
+
+Normalization is purely lexical - no filesystem I/O - which is the right strength for
+comparing two spellings of one path, and keeps it off the syscall path in a loop that
+runs once per module.
+
+Unblocks briar-systems/mach-lsp#141.
+
 ## [4.23.0] - 2026-08-21
 
 ### Fixed
