@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+#### target(riscv32): a 64-bit reinterpret across the register banks is lowered (#2904)
+
+`f64 :~ i64` did not compile on riscv32, and the diagnostic named neither the cause nor
+the instruction that was missing:
+
+```
+error: legalize: operation wider than the target ALU is unsupported (MIR_MOV, 8 bytes wide)
+```
+
+A cross-bank move is as wide as **both** banks. `fmv.x.d` moves all 64 bits between an
+`f` register and a GP one, so it needs a 64-bit GP register and is RV64-only - while
+rv32gc's D extension still puts doubles in `f0-f31`. The write is ordinary and the
+register form does not exist.
+
+The reinterpret is now expanded at MIR lowering into a frame round trip - a store in
+the source's bank and a load in the destination's, since the bits are the same in
+either one:
+
+```
+bits   (f64 :~ i64):  fsd fa0,-0x10(s0)  ->  lw a0,-0x10(s0) ; lw a1,-0xc(s0)
+unbits (i64 :~ f64):  sw a0,-0x10(s0) ; sw a1,-0xc(s0)  ->  fld fa0,-0x10(s0)
+narrow (f32 :~ i32):  fmv.x.w a0, fa0
+```
+
+which is what a C toolchain emits on this target. Nothing downstream needed a new
+clause: the float half is an ordinary float move against a MEM operand, which the
+encoder already handled because a spilled side reaches it the same way, and the integer
+half is an ordinary wide integer move that `be.codegen.legalize` already splits.
+
+**The fact is declared, not derived.** `MachineModel.xbank_widths` names the widths an
+ISA crosses between its float bank and a GP register in one instruction, asked through
+a single accessor the way `vec_mem_widths` is. Deriving it from `flen_bits` and
+`gpr_width` gives the right answer on the riscv members by coincidence and the wrong one
+on x86-64, where a 128-bit XMM would imply a 16-byte crossing `movq` does not perform.
+rv64 keeps `fmv.x.d` / `fmv.d.x`; rv32 declares 4 alone, so `f32 :~ i32` still takes
+`fmv.x.w` and only the 64-bit case goes through memory.
+
+The assumption that let this survive was a comment: *a conversion is the one instruction
+with a value in each bank*. A bit reinterpret is the other, and it is corrected in place
+rather than deleted.
+
+Verified by EXECUTION on the riscv32 reference core, not by matching mnemonics: a
+payload whose halves differ and whose high half has the sign bit set round-trips in both
+directions. A lowering that swapped the halves, read the slot at the wrong offset, or
+sign-extended one of them emits the same instructions and a different value.
+
 ## [4.24.0] - 2026-08-21
 
 ### Added
