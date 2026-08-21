@@ -35,6 +35,11 @@ use std.types.string.str;
 
 use O: std.types.option;
 use R: std.types.result;
+use std.allocator.page;
+use std.types.string.str_contains;
+use A: std.allocator;
+use std.format;
+use of: mach.lang.target.of;
 
 use mach.lang.be.codegen.mir;
 use mach.lang.intern;
@@ -57,6 +62,10 @@ pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[bool, str] {
 
     val align: u32 = stack_align(tgt);
 
+    # the reserve this target's image will actually get, or 0 when nothing bounds it
+    # at compile time. read once: it is a property of the target, not of a function.
+    val reserve: u64 = of.effective_stack_reserve(tgt.of, tgt.stack_reserve);
+
     var fi: u32 = 0;
     for (fi < m.function_len) {
         val func: *mir.MirFunction = ?m.functions[fi];
@@ -65,10 +74,57 @@ pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[bool, str] {
         # layout rather than racing it.
         func.frame.omit = omits_frame(func, tgt.model.frame_ptr_reg::u32,
                                       tgt.model.stack_ptr_reg::u32);
+
+        val over: R.Result[bool, str] = check_frame_fits(m, func, reserve);
+        if (R.is_err[bool, str](over)) { ret over; }
         fi = fi + 1;
     }
 
     ret R.ok[bool, str](true);
+}
+
+# refuse a function whose own frame cannot fit in the image's stack reserve (#2991)
+#
+# A PROOF, NOT AN ESTIMATE, which is why it is an error rather than a warning: one
+# frame against one reserve, no call graph, no input dependence, no false positives.
+# A function whose single frame exceeds the whole stack can never execute, on any
+# input, and mach used to emit it and say nothing - a real program shipped for months
+# needing 1,107,824 bytes against a 1,048,576-byte reserve, dying in its own prologue
+# on every Windows machine while running fine on linux, which hands the main thread
+# eight megabytes and hides it.
+#
+# THE REJECTED ALTERNATIVE is whole-call-graph depth analysis. Recursion and indirect
+# calls make cumulative depth undecidable, and a heuristic that reports chains which
+# cannot happen trains people to ignore the one report that is exact.
+#
+# EQUAL IS REFUSED. A frame exactly the size of the reserve leaves nothing for the
+# caller that entered it, the return address it was called through, or the guard page
+# the OS keeps below - so the boundary is `>=`, and one byte under it builds.
+#
+# A zero reserve means nothing bounds the stack at compile time (an ELF target's is
+# the kernel's), and the check does not run.
+# ---
+# m:       the MIR module, for the interner that names the function
+# func:    the laid-out function
+# reserve: the image's effective stack reserve, or 0 to skip
+# ret:     ok(true) when the frame fits, or the refusal naming function, size, reserve
+fun check_frame_fits(m: *mir.MirModule, func: *mir.MirFunction, reserve: u64) R.Result[bool, str] {
+    if (reserve == 0) { ret R.ok[bool, str](true); }
+    if (func.frame.size::u64 < reserve) { ret R.ok[bool, str](true); }
+
+    var name: str = "<unknown>";
+    if (m.interner != nil) {
+        val o: O.Option[str] = intern.lookup(m.interner, func.name);
+        if (O.is_some[str](o)) { name = O.unwrap[str](o); }
+    }
+
+    val r: R.Result[str, str] = format.sprint(m.alloc,
+        "frame: `{}` needs a {}-byte stack frame, which its target's {}-byte stack reserve cannot hold; raise `stack_reserve` on the target, or move the large locals off the stack",
+        name, func.frame.size::u64, reserve);
+    if (R.is_err[str, str](r)) {
+        ret R.err[bool, str]("frame: a function's stack frame exceeds the target's stack reserve");
+    }
+    ret R.err[bool, str](R.unwrap_ok[str, str](r));
 }
 
 # report whether a function needs no compiler-generated prologue or epilogue
@@ -1166,4 +1222,94 @@ test "mach.lang.be.codegen.frame.run:stamps_the_omission_decision" {
     if (!funcs[0].frame.omit) { ret 1; }
     if (funcs[1].frame.omit)  { ret 1; }
     ret 0;
+}
+
+# The frame-versus-reserve boundary is exact, and a zero reserve does not diagnose (#2991).
+#
+# Tested here rather than through a compiled program because the boundary is the claim:
+# source big enough to produce a frame of EXACTLY the reserve is not something a test
+# can write and keep true, since the frame carries saved registers and padding the
+# author does not control. The refusal is a proof about two numbers, so the two numbers
+# are what it is checked against.
+#
+# EQUAL IS REFUSED. A frame exactly the size of the reserve leaves nothing for the
+# caller that entered it, the return address, or the guard page below - and "one byte
+# under builds" is what keeps the rule a proof rather than a margin someone tuned.
+test "mach.lang.be.codegen.frame.check_frame_fits:boundary_is_exact" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var m: mir.MirModule;
+    m.alloc        = ?alloc;
+    m.interner     = ?i;
+    m.srcmap       = nil;
+    m.functions    = nil;
+    m.function_len = 0;
+    m.function_cap = 0;
+
+    val nr: R.Result[intern.StrId, str] = intern.intern(?i, "fat");
+    if (R.is_err[intern.StrId, str](nr)) { ret 1; }
+
+    var f: mir.MirFunction;
+    f.name = R.unwrap_ok[intern.StrId, str](nr);
+
+    var bad: i32 = 0;
+
+    # one byte under the reserve builds
+    f.frame.size = 1048575;
+    if (R.is_err[bool, str](check_frame_fits(?m, ?f, 1048576)) && bad == 0) { bad = 2; }
+
+    # exactly the reserve is refused
+    f.frame.size = 1048576;
+    if (R.is_ok[bool, str](check_frame_fits(?m, ?f, 1048576)) && bad == 0) { bad = 3; }
+
+    # over it is refused, and the message owes the reader three facts: which function,
+    # how big its frame is, and what it was measured against
+    f.frame.size = 1107824;
+    val over: R.Result[bool, str] = check_frame_fits(?m, ?f, 1048576);
+    if (R.is_ok[bool, str](over)) { bad = 4; }
+    or {
+        val msg: str = R.unwrap_err[bool, str](over);
+        if (!str_contains(msg, "fat")     && bad == 0) { bad = 5; }
+        if (!str_contains(msg, "1107824") && bad == 0) { bad = 6; }
+        if (!str_contains(msg, "1048576") && bad == 0) { bad = 7; }
+    }
+
+    # A ZERO RESERVE IS "NOTHING BOUNDS THIS", not "a reserve of zero". An ELF target's
+    # stack is the kernel's and `ulimit`'s, and a Mach-O image with no stated reserve
+    # takes dyld's default - neither is a number mach put in the image, so neither may
+    # refuse a program that runs.
+    f.frame.size = 999999999;
+    if (R.is_err[bool, str](check_frame_fits(?m, ?f, 0)) && bad == 0) { bad = 8; }
+
+    ret bad;
+}
+
+# The effective reserve prefers what a target STATED over what the format defaults to (#2991).
+#
+# The three cases are ordered, and the order is what makes the check honest: a stated
+# reserve is what the writer will put in the image, a format default is what it puts in
+# when nothing is stated, and 0 means mach chose no number at all and must not pretend
+# otherwise.
+test "mach.lang.be.codegen.frame.effective_stack_reserve:stated_beats_default" {
+    var pe: of.OfVTable;
+    pe.carries_stack_size    = true;
+    pe.default_stack_reserve = 0x100000;
+
+    var elf_vt: of.OfVTable;
+    elf_vt.carries_stack_size    = false;
+    elf_vt.default_stack_reserve = 0;
+
+    var bad: i32 = 0;
+    # stated wins over the format default
+    if (of.effective_stack_reserve(?pe, 0x800000) != 0x800000)   { bad = 1; }
+    # unstated falls to the format default
+    if (of.effective_stack_reserve(?pe, 0) != 0x100000          && bad == 0) { bad = 2; }
+    # a format with no default bounds nothing when nothing is stated
+    if (of.effective_stack_reserve(?elf_vt, 0) != 0             && bad == 0) { bad = 3; }
+    # ...but a stated value still stands: the manifest already refused the key where it
+    # cannot be carried, so reaching here with one means the format carries it
+    if (of.effective_stack_reserve(?elf_vt, 0x800000) != 0x800000 && bad == 0) { bad = 4; }
+    ret bad;
 }

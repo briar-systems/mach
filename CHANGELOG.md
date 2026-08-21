@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+#### codegen: a frame larger than the target's stack reserve is refused (#2991)
+
+A function whose own stack frame is larger than the target's whole stack reserve can
+never execute, on any input. mach emitted it and said nothing.
+
+Both numbers were already in hand at build time - the encoder receives the frame size
+to decide whether to emit a stack probe, the object writer writes the reserve - and
+nothing compared them. A game's `main` needed 1,107,824 bytes against the
+1,048,576-byte Windows reserve, overrunning it by 59,248 bytes before executing a
+statement. The build was clean, the PE was structurally valid, and the image died in
+its own prologue on every Windows machine. It shipped that way for months, because
+linux gives the main thread eight megabytes and hides it.
+
+```
+error: frame: `main` needs a 1107824-byte stack frame, which its target's
+1048576-byte stack reserve cannot hold; raise `stack_reserve` on the target, or move
+the large locals off the stack
+```
+
+An error rather than a warning because it is a PROOF: one frame against one reserve,
+no call graph, no input dependence, no false positives. The rejected alternative is
+whole-call-graph depth analysis - recursion and indirect calls make cumulative depth
+undecidable, and a heuristic that reports chains which cannot happen trains people to
+ignore the one report that is exact.
+
+Equal is refused and one byte under builds: a frame exactly the size of the reserve
+leaves nothing for the caller that entered it, its return address, or the guard page
+below.
+
+The check lives with the frame layout rather than in an encoder, so it is one rule for
+every ISA rather than an x86-64 fact. It reads the reserve the image will actually get:
+what the target stated (#2990), else the format's own default, else nothing. A target
+whose stack the image does not bound - every ELF one, and a Mach-O image with no stated
+reserve, which takes dyld's default - is not checked at all, because a bound mach did
+not choose is not a bound mach may refuse a program against.
+
 ### Added
 
 #### manifest: a target can set the image stack size (#2990)
