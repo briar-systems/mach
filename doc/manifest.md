@@ -152,6 +152,19 @@ format, which carries no stack size in its image headers
 Every declared target is checked, not only the one being built, so the mistake is found
 on the first build rather than whenever someone happens to build that cell.
 
+A function whose own stack frame exceeds the reserve is refused at build time, naming
+the function, its frame size and the reserve:
+
+```
+error: frame: `main` needs a 1107824-byte stack frame, which its target's
+1048576-byte stack reserve cannot hold; raise `stack_reserve` on the target, or move
+the large locals off the stack
+```
+
+That is a proof rather than an estimate - one frame against one reserve, with no call
+graph and no input dependence - so it is an error and has no false positives. Targets
+whose stack is not bounded by the image, such as every ELF target, are not checked.
+
 On Mach-O the value reaches only a **position-independent** image. A non-PIE one enters
 through `LC_UNIXTHREAD`, which has no stacksize member, and a stack size requested for
 such an image is refused at link rather than silently dropped.
