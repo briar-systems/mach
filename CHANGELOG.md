@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### diag: a diagnostic carries its fix as an edit, not only as English (#3023)
+
+A mach diagnostic already tells you what to do about it. `help` carries a spelling
+correction, or `value::Type`. An editor cannot act on prose: to offer a one-keystroke
+fix it has to pattern-match the compiler's English and rebuild the edit from it, which
+couples the quick fix to diagnostic **wording** - every rephrasing upstream breaking it
+silently, with no compile error and no test failure to catch it. mach-lsp declined to
+build that, correctly. The compiler already holds the answer at the point it composes
+the sentence, and threw the structure away.
+
+`Diagnostic` now carries `fixes`, alongside `help` rather than instead of it. Terminal
+rendering is unchanged.
+
+```mach
+pub rec Edit { loc: Location; replacement: str; }
+pub rec Fix  { label: str; edits: *Edit; edit_len: usize; edit_cap: usize; }
+```
+
+**Edits are a list.** They apply together or not at all, and the ordinary cast case
+needs two: `(` before the expression and `)::T` after. Applying half of that produces
+source that does not parse, so a one-span shape would either exclude the case or make
+a consumer correlate two separate fixes and hope. Alternatives - cast the value versus
+change the declaration - stay separate `Fix` entries, because those are a choice a
+person makes rather than one atomic edit.
+
+An empty span is an insertion and an empty replacement is a deletion, both falling out
+of the one shape. A fix always carries at least one edit, since `attach_fix` takes the
+first, so "a fix with nothing to apply" is not a state that exists.
+
+Two producers ship with it:
+
+- an unresolved identifier or type name with a near match replaces the misspelling
+- a no-implicit-widening mismatch inserts the cast, **parenthesizing when it must**
+
+That second one is the whole design in miniature. `::` binds tighter than the binary
+operators, so appending `::i64` to `a + a` yields `a + a::i64` - source that compiles,
+casts the wrong operand, and leaves the original error standing. And the range comes
+from the AST node, not from the diagnostic's span: a reporter picks its span to
+underline what reads best, and a `val` declaration's runs past the initializer to the
+`;`, which put the first draft's insertion after the semicolon.
+
+A cast is offered only when it would actually compile. `::` will reinterpret any two
+same-size values, so between two unrelated records it is legal - and offering it would
+turn a real type error into a silent bit pun. A fix that produces a new error, or a new
+wrong program, is worse than none: the editor's keystroke is taken on trust.
+
+Fixes travel through `clone_tail` and `append_all`, so a cached module's replayed
+diagnostics keep them. Otherwise a quick fix would blink out of an editor on an
+unrelated keystroke, with no error message and nothing for a user to report.
+
+Consumer tracking: briar-systems/mach-lsp#165.
+
 ### Fixed
 
 #### sema: the C-variadic contract follows a call chain, not just one hop (#3031)
