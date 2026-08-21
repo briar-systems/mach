@@ -53,8 +53,42 @@ host_os() {
     esac
 }
 
+# host_cc - the host's own C compiler, by whatever name it answers to.
+#
+# `cc` is the POSIX spelling and every unix runner has one. WINDOWS DOES NOT: neither
+# Git Bash nor the image's Visual Studio install provides that name. CI already works
+# around it by exporting `CC=gcc` from ci-tools.sh ("cc is spelled gcc on this host,
+# per tools.lock"), so the gap only bites a host where nothing sets CC - a developer's
+# own Windows machine, which is where a case is most likely to be run by hand and least
+# likely to have the environment CI builds.
+#
+# gcc and clang accept the same flags a bare `cc` does, so resolving to either needs no
+# argv translation and no case has to know which one answered. MSVC's `cl` does not
+# (`/c`, `/Fo:`), so it is NAMED IN THE FAILURE rather than half-supported: a second
+# flag dialect for one call site is a permanent maintenance cost, and every candidate
+# ahead of it produces the same object for this purpose.
+host_cc() {
+    if [ -n "${CC:-}" ]; then
+        echo "$CC"
+        return 0
+    fi
+    for candidate in cc gcc clang; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    if command -v cl >/dev/null 2>&1; then
+        echo "cc.sh: the only host C compiler on PATH is MSVC 'cl', whose flags are spelled differently from a bare 'cc' ('/c', '/Fo:') - this script passes a case's argv through unchanged. put a gcc or clang on PATH, or set CC to one." >&2
+    else
+        echo "cc.sh: no host C compiler on PATH (tried cc, gcc, clang). a case's [step] that compiles C needs one on every leg that runs it." >&2
+    fi
+    return 1
+}
+
 if [ "$(host_isa)" = "$MACH_TARGET_ISA" ] && [ "$(host_os)" = "$MACH_TARGET_OS" ]; then
-    exec "${CC:-cc}" "$@"
+    hostcc=$(host_cc) || exit 1
+    exec "$hostcc" "$@"
 fi
 
 # cross build: the host cannot produce this leg's ISA/OS natively, so route
