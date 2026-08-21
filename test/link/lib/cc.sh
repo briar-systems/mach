@@ -53,8 +53,43 @@ host_os() {
     esac
 }
 
+# host_cc - the host's own C compiler, by whatever name it answers to.
+#
+# `cc` is the POSIX spelling and every unix runner has one. WINDOWS DOES NOT: neither
+# Git Bash nor the image's Visual Studio install provides a `cc`, and that single
+# missing name is why `c-variadic` carried `skip: x86_64-windows` for so long
+# (mach#3005) - so win64's variadic rule, which duplicates a tail float into the
+# integer register of the same slot, was never executed against a real `va_arg`
+# reader. A rule verified only by the compiler's own unit tests is mach's model of the
+# ABI checked against itself.
+#
+# gcc and clang accept the same flags a bare `cc` does, so resolving to either needs
+# no argv translation and no case has to know which one answered. MSVC's `cl` does not
+# (`/c`, `/Fo:`), so it is NAMED IN THE FAILURE rather than half-supported: a
+# translation layer for one call site would be a second flag dialect to maintain
+# forever, and every candidate ahead of it produces the same object for this purpose.
+host_cc() {
+    if [ -n "${CC:-}" ]; then
+        echo "$CC"
+        return 0
+    fi
+    for candidate in cc gcc clang; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    if command -v cl >/dev/null 2>&1; then
+        echo "cc.sh: the only host C compiler on PATH is MSVC 'cl', whose flags are spelled differently from a bare 'cc' ('/c', '/Fo:') - this script passes a case's argv through unchanged. put a gcc or clang on PATH, or set CC to one." >&2
+    else
+        echo "cc.sh: no host C compiler on PATH (tried cc, gcc, clang). a case's [step] that compiles C needs one on every leg that runs it." >&2
+    fi
+    return 1
+}
+
 if [ "$(host_isa)" = "$MACH_TARGET_ISA" ] && [ "$(host_os)" = "$MACH_TARGET_OS" ]; then
-    exec "${CC:-cc}" "$@"
+    hostcc=$(host_cc) || exit 1
+    exec "$hostcc" "$@"
 fi
 
 # cross build: the host cannot produce this leg's ISA/OS natively, so route
