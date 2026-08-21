@@ -5,6 +5,76 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.22.0] - 2026-08-21
+
+### Changed
+
+#### link: an in-memory link hands back the image and its symbol addresses (#2892)
+
+`linker.link_images_captured` performs the same link `link_images` does - identical
+merge, symbol resolution, relocation patching and layout - and stops one step short
+of the file, handing back the image bytes, the base they were laid out at, and the
+address the link assigned to every symbol.
+
+**Those addresses were computed and then thrown away.** `link_modules_core` builds
+them to populate `.symtab` and discarded them at the write, and a flat image carries
+no symbol table, so the only address a consumer could name in a written one was the
+base - which the entry symbol occupies. One linked image therefore admitted exactly
+one entry point.
+
+That limit had a cost in the rv32 reference-core harness: eleven wide-integer probes
+could not run from a linked image at all and fell back to the UNLINKED `.text`, where
+`.data` is absent and no relocation has been applied, so nothing touching a global
+could be executed. **Every rv32 probe now runs from the linked image**, entered
+directly at the address the link gave it - which is what keeps the harness the
+independent party on the calling convention rather than routing probes through a
+dispatcher that would use the compiler's convention on both sides.
+
+The capture is image-producing formats only: `emit_exec_image` is nil elsewhere and
+the call refuses rather than inventing an answer for a container format, where "the
+bytes" is not a question with one answer. The flat writer's layout and its
+enter-at-the-base rule are now one body shared by the file path and the in-memory
+one, so an image held in memory cannot differ from the one a build would have
+written.
+
+## [Unreleased]
+
+### Fixed
+
+#### link(coff): every deduplicating COMDAT selection is honored, so C++ libraries link (#3024)
+
+Linking any C++ library failed on a symbol no source ever wrote:
+
+```
+msvc:   error: multiple definition of '??_7Fl_Pixmap@@6B@'
+mingw:  error: multiple definition of '_ZTI9Fl_Widget'
+```
+
+Both are **vague-linkage** symbols - an MSVC vftable and a GCC typeinfo. Every
+translation unit that needs one emits its own copy, and the linker keeps one and
+discards the rest. COFF says so with COMDAT, and COMDAT has six *selections*
+describing how to choose.
+
+**Mach honored exactly one of them.** `IMAGE_COMDAT_SELECT_ANY` was the only value
+spelled anywhere in the tree, so a definition under any other selection stayed a
+strong symbol and collided with the next copy. A compiler picks the selection per
+construct, which is why this landed precisely on C++ and why two different
+toolchains failed at the same point in different ways: MSVC spells a vftable
+`LARGEST`, GCC reached mach under another.
+
+`ANY`, `SAME_SIZE`, `EXACT_MATCH` and `LARGEST` all mean "one of N wins" and differ
+only in what they additionally promise about the losers. Mach keeps the first, which
+is what its weak-symbol resolution already does and is observationally identical for
+the definitions these describe - a vtable emitted from one header is the same object
+in every translation unit that emitted it.
+
+`NODUPLICATES` still collides, because that is the selection a compiler picks
+precisely to say a second definition is an error. `ASSOCIATIVE` deduplicates for now
+and is written down as a decision rather than a fallthrough: its real meaning ties a
+section's fate to another COMDAT, which needs section GC to express, and mach
+discards no sections - so the symbol half is correct and the unreferenced-section
+half waits for GC.
+
 ## [4.21.1] - 2026-08-20
 
 ### Fixed
