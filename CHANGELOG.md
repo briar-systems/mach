@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### test: Mach-O gets an external reader on the lane that gates merges (#2957)
+
+`test/engines.conf` gave both darwin rows `main` cadence, so `ci-legs.sh pr` emitted no
+darwin leg and corpus layer A - the step that runs `llvm-readobj` over a mach-produced
+object - ran on a pull request over ELF and COFF only. A change to
+`src/lang/target/of/macho.mach` could reach `dev` with **no external tool having parsed
+its output**; the first external read was the release merge. Between releases mach was
+its own only reader of a format it writes, and darwin is a shipping target.
+
+COFF is why that is not theoretical. `x86_64-windows` had a leg that had never once
+started, so nothing external had read a mach PE either - and the very first layer A run
+found the long section-name form written right-justified and space-padded, which binutils
+tolerates and llvm rejects outright. Every object with a constant pool was unreadable,
+invisible for as long as it was because no external reader had looked (#2952).
+
+The registry gains a `decode` column: a runner that BUILDS AND READS a row on the pr lane
+without executing it. Both darwin rows name `ubuntu-latest`, so their Mach-O objects are
+cross-built and decoded on every pull request while execution stays on the metered mac
+runners at release cadence. The metered-runner reason for that cadence was real and is
+untouched.
+
+**The rule is enforced, not just written down.** `config.py` refuses a registry where a
+`main`-cadence row has no `pr`-cadence reader of its object format, so a future metered
+row is a visible decision rather than an accident.
+
+Demonstrated the way #2952 was: breaking the Mach-O `cputype` turns the x86_64-darwin
+column red on the pr lane and leaves aarch64-darwin green - a selective failure rather
+than a broken harness - and restoring it returns 728 cells green. No new toolchain: the
+llvm tools layer A already requires are the ones that read it.
+
 #### test(link): the c-variadic golden samples both register-slot floats (#3043)
 
 The `floats` line reported `out[0]`, `out[3]` and `out[7]`. On win64 only the first four
@@ -25,6 +55,7 @@ rule had one printed value standing between them and a green run.
 
 `out[7]` stays as the stack-side control - a mutation that moved it too would mean
 something different and worse.
+
 
 ### Fixed
 

@@ -30,6 +30,10 @@ USAGE = """usage: run.sh [options]
   (no options)                 every case, every target this host serves, every layer
   --runner <label>             the rows engines.conf assigns to that CI runner, which
                                this host must then be able to serve or the run refuses
+  --decode <label>             the rows engines.conf assigns that runner for DECODING
+                               only: built and read (layers a and b), never executed,
+                               so a release-cadence format still has an external reader
+                               on the pr lane
   --target <t>                 restrict to one target (repeatable)
   --case <group>/<name>        restrict to one case (repeatable)
   --layer a|b|c                restrict to one layer (repeatable)
@@ -156,7 +160,7 @@ def unservable(t, system, machine):
         t.os, t.isa, system, machine)
 
 
-def select_targets(all_targets, only, runner, layers_wanted, check=True):
+def select_targets(all_targets, only, runner, layers_wanted, check=True, decode=""):
     """which rows this run covers, and how that was decided.
 
     assignment and capability are separate questions and only one of them selects.
@@ -170,6 +174,20 @@ def select_targets(all_targets, only, runner, layers_wanted, check=True):
     system, machine = host_pair()
     machine = "aarch64" if machine == "arm64" else machine
     names = [t.name for t in all_targets]
+
+    # `--decode` is a THIRD assignment, and the narrowest: the rows a pr-cadence runner
+    # reads without executing, so a format whose own leg runs at release cadence still
+    # has an external reader on the lane that gates merges (#2957). It never selects
+    # layer C - these rows are assigned here precisely because this host cannot run
+    # them - so the capability check below does not apply and must not.
+    if decode:
+        assigned = [t for t in all_targets if t.decode == decode]
+        if not assigned:
+            die("engines.conf assigns no target to decode runner '%s'; the decode column names %s"
+                % (decode, ", ".join(sorted({t.decode for t in all_targets if t.decode != "-"})) or "nothing"))
+        notes = [("not assigned", t, "engines.conf gives it no decode row on %s" % decode)
+                 for t in all_targets if t.decode != decode]
+        return assigned, notes
 
     if runner:
         assigned = [t for t in all_targets if t.runner == runner]
@@ -231,6 +249,7 @@ def needed_tools(targets, layers_wanted, skips_by_target):
 def main(argv):
     only_targets, only_cases, only_layers = [], [], []
     runner = ""
+    decode = ""
     bless = False
     show_matrix = False
     show_tools = False
@@ -242,6 +261,11 @@ def main(argv):
             if i >= len(argv):
                 die("--runner needs a value")
             runner = argv[i]
+        elif a == "--decode":
+            i += 1
+            if i >= len(argv):
+                die("--decode needs a value")
+            decode = argv[i]
         elif a == "--target":
             i += 1
             only_targets.append(argv[i]) if i < len(argv) else die("--target needs a value")
@@ -270,6 +294,12 @@ def main(argv):
     # other would be a claim about coverage nothing produced.
     if runner and only_targets:
         die("--runner assigns the rows and so does --target; pass one")
+    if decode and (runner or only_targets):
+        die("--decode assigns the rows and so does %s; pass one"
+            % ("--runner" if runner else "--target"))
+    if decode and "c" in only_layers:
+        die("--decode reads rows this host cannot execute, so it serves layers a and b; "
+            "asking for layer c here would be a claim about coverage nothing produced")
 
     if show_tools:
         return list_tools(only_targets, runner, only_layers)
@@ -298,7 +328,7 @@ def main(argv):
 
     with OutLock(out_root):
         return run(out_root, matrix_path, only_targets, runner, only_cases,
-                   wanted_layers_arg, bless)
+                   wanted_layers_arg, bless, decode)
 
 
 def list_tools(only_targets, runner, only_layers):
@@ -333,7 +363,7 @@ def list_tools(only_targets, runner, only_layers):
     return 0
 
 
-def run(out_root, matrix_path, only_targets, runner, only_cases, only_layers, bless):
+def run(out_root, matrix_path, only_targets, runner, only_cases, only_layers, bless, decode=""):
     tools = config.load_tools(os.path.join(CORPUS, "tools.lock"))
     all_targets = config.load_engines(os.path.join(CORPUS, "engines.conf"))
     cases = discover_cases(only_cases)
@@ -342,7 +372,10 @@ def run(out_root, matrix_path, only_targets, runner, only_cases, only_layers, bl
     wanted_layers = only_layers or list(config.LAYERS)
     if bless:
         wanted_layers = ["b"]
-    targets, notes = select_targets(all_targets, only_targets, runner, wanted_layers)
+    # a decode run reads what it cannot execute, so layer C is not on offer
+    if decode:
+        wanted_layers = [l for l in wanted_layers if l != "c"]
+    targets, notes = select_targets(all_targets, only_targets, runner, wanted_layers, decode=decode)
     if not targets:
         die("no target in engines.conf can be served by this host")
 
