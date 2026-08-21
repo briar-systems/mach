@@ -56,18 +56,17 @@ host_os() {
 # host_cc - the host's own C compiler, by whatever name it answers to.
 #
 # `cc` is the POSIX spelling and every unix runner has one. WINDOWS DOES NOT: neither
-# Git Bash nor the image's Visual Studio install provides a `cc`, and that single
-# missing name is why `c-variadic` carried `skip: x86_64-windows` for so long
-# (mach#3005) - so win64's variadic rule, which duplicates a tail float into the
-# integer register of the same slot, was never executed against a real `va_arg`
-# reader. A rule verified only by the compiler's own unit tests is mach's model of the
-# ABI checked against itself.
+# Git Bash nor the image's Visual Studio install provides that name. CI already works
+# around it by exporting `CC=gcc` from ci-tools.sh ("cc is spelled gcc on this host,
+# per tools.lock"), so the gap only bites a host where nothing sets CC - a developer's
+# own Windows machine, which is where a case is most likely to be run by hand and least
+# likely to have the environment CI builds.
 #
-# gcc and clang accept the same flags a bare `cc` does, so resolving to either needs
-# no argv translation and no case has to know which one answered. MSVC's `cl` does not
-# (`/c`, `/Fo:`), so it is NAMED IN THE FAILURE rather than half-supported: a
-# translation layer for one call site would be a second flag dialect to maintain
-# forever, and every candidate ahead of it produces the same object for this purpose.
+# gcc and clang accept the same flags a bare `cc` does, so resolving to either needs no
+# argv translation and no case has to know which one answered. MSVC's `cl` does not
+# (`/c`, `/Fo:`), so it is NAMED IN THE FAILURE rather than half-supported: a second
+# flag dialect for one call site is a permanent maintenance cost, and every candidate
+# ahead of it produces the same object for this purpose.
 host_cc() {
     if [ -n "${CC:-}" ]; then
         echo "$CC"
