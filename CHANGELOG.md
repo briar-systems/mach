@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+#### sema: the C-variadic contract follows a call chain, not just one hop (#3031)
+
+#3029 made the C promotion rule survive monomorphization for a call one hop from the
+C-variadic callee. Two hops still passed an unpromoted value:
+
+```mach
+fun log1[A](fmt: *u8, a: A)  i32 { ret printf(fmt, a); }
+fun wrap2[A](fmt: *u8, a: A) i32 { ret log1[A](fmt, a); }
+
+wrap2[u8]("%d\n", c)     # compiled
+```
+
+Neither instance was recorded, for two different reasons. `wrap2[u8]`'s arguments are
+public scalars and its body calls no C-variadic callee **directly**; `log1[A]` is
+recorded from `wrap2`'s template but with an abstract argument, and an all-abstract
+instance is pruned. So the concrete `log1[u8]` never existed as a recorded instance -
+the only thing that could create it was a re-validation of `wrap2[u8]`, which was
+itself never recorded.
+
+The reachability walk is transitive now: a body reaches a C-variadic tail if it calls
+one, or calls a function whose body does. A visited set terminates it on recursive and
+mutually recursive call graphs, and exhausting the visit cap answers **no** rather than
+yes - a miss leaves a check unrun on a chain deeper than the cap, while a false
+positive re-infers a body with nothing concrete and duplicates its template-time
+diagnostics.
+
+In the pack mode (#3025) the recursion follows only calls that CARRY a spread, since
+that is how a pack propagates: an ordinary call to a pack function puts none of this
+pack's elements on any contract.
+
+Measured at no cost: 48.95s of build CPU against a 49.14s baseline.
+
 ## [4.23.0] - 2026-08-21
 
 ### Fixed
