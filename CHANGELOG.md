@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### frontend: a C-variadic function is nameable as a type (#3003)
+
+`ext fun printf(fmt: *u8, ...) i32` already parsed. The identical shape written as a
+type did not:
+
+```
+error: C-style variadic `...` was removed in v2.0.0
+```
+
+That message was a leftover. The form was not removed, it was **narrowed** to `ext`
+declarations - so the diagnostic stated a true-in-2.0 thing that is false today, and
+stated it at the one spelling that ought to work. A C-variadic function could not be
+stored in a variable, passed as a callback, or held in a table.
+
+```mach
+def Printf: fun(*u8, ...) i32;
+
+val p: Printf = printf;
+p("%d\n"::*u8, 42);
+```
+
+The flag was already modelled everywhere except the parser that would set it: it is
+part of the interned type's structural identity, hashed and compared, carried through
+to the IR function type, and `check_call` reads it off the **type** rather than off the
+declaration. The ABI layer classifies from the signature too, so an indirect
+C-variadic call needed no backend work at all.
+
+`fun(*u8, ...) i32` and `fun(*u8) i32` stay distinct types and do not unify. A call
+through the first places its tail by the target's variadic rule and a call through the
+second does not, so unifying them would reach a C callee's `va_arg` with arguments laid
+out the ordinary way - a wrong **value** at run time, not a link error.
+
+A leading bare `...` is refused in a type exactly as it is on a declaration, since a
+C-variadic callee finds its tail relative to its last fixed parameter. That is a
+property of the signature, not of where the signature is written.
+
+Verified by executing an indirect call against a real clang-built `va_arg` callee, not
+by diffing an object: the whole failure mode here is a call that links and runs and
+hands the callee the wrong bytes.
+
 ### Fixed
 
 #### sema: the C-variadic contract follows a call chain, not just one hop (#3031)

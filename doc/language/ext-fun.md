@@ -48,6 +48,33 @@ ext fun fcntl(fd: i32, cmd: i32, ...) i32;
 The declared parameters are the *fixed* arity. A call must supply all of them and
 may supply any number of further arguments, including none.
 
+### Naming the signature as a type
+
+The same shape is spellable as a function **type**, so a C-variadic function can be
+stored in a variable, passed as a callback, or held in a table:
+
+```mach
+ext fun printf(fmt: *u8, ...) i32;
+
+def Printf: fun(*u8, ...) i32;
+
+fun main() i32 {
+    val p: Printf = printf;
+    ret p("%d\n"::*u8, 42);
+}
+```
+
+The `...` is part of the type's **identity**, not a modifier on it. `fun(*u8, ...) i32`
+and `fun(*u8) i32` are different types and do not unify: a call through the first
+places its tail by the target's variadic rule and a call through the second does not,
+so mixing them would reach a C callee's `va_arg` with arguments laid out the ordinary
+way — a wrong *value* at run time, not a link error. The same two rules as the
+declaration apply: the `...` is bare and trailing, and at least one fixed parameter
+must precede it.
+
+An indirect call through such a type is checked and placed exactly as a direct one is;
+the tail rule is read off the type, since no declaration is in view at the call.
+
 ### Arguments in the variadic tail
 
 A tail argument has no declared parameter type to check against, so it is checked
