@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [4.24.0] - 2026-08-21
 
 ### Added
 
@@ -102,6 +102,28 @@ by diffing an object: the whole failure mode here is a call that links and runs 
 hands the callee the wrong bytes.
 
 ### Fixed
+
+#### test(link): the c-variadic and narrow-stack-args cases now run on windows (#3005)
+
+Both cases carried `skip: x86_64-windows`, word for word, deferring the same question:
+does the runner expose a bare `cc`? So win64's variadic rule - a tail float duplicated
+into the integer register of its positional slot - and its stack-argument rule were
+checked only by the compiler's own unit tests, which compare mach's model of the ABI
+against itself and cannot catch the model being wrong.
+
+The guess was wrong in both. CI already exports `CC=gcc`. What actually failed was the
+step's own command: a `[step]` cmd runs through the **platform** shell, which on windows
+is `cmd.exe /s /c`, and cmd.exe cannot execute `../../lib/cc.sh`. Every windows run died
+with `'..' is not recognized` before a compiler was ever consulted. The rest of the suite
+already had it right - every `pe-*` case invokes its script as `sh <script>` - and these
+three cc.sh cases were the outliers.
+
+One wrong guess had exempted two cases, so answering it once restored both.
+
+Verified to DISCRIMINATE, not merely run: breaking `float_dup_gp` on a throwaway branch
+fails the case with a golden diff against MinGW's real `va_arg`, while `narrow-stack-args`
+passes under the same mutation. The margin is thinner than the case looks, which is
+tracked separately as #3043.
 
 #### chore(changelog): stray `[Unreleased]` headings stranded inside released sections (#3039)
 
