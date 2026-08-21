@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+#### link: an in-memory link hands back the image and its symbol addresses (#2892)
+
+`linker.link_images_captured` performs the same link `link_images` does - identical
+merge, symbol resolution, relocation patching and layout - and stops one step short
+of the file, handing back the image bytes, the base they were laid out at, and the
+address the link assigned to every symbol.
+
+**Those addresses were computed and then thrown away.** `link_modules_core` builds
+them to populate `.symtab` and discarded them at the write, and a flat image carries
+no symbol table, so the only address a consumer could name in a written one was the
+base - which the entry symbol occupies. One linked image therefore admitted exactly
+one entry point.
+
+That limit had a cost in the rv32 reference-core harness: eleven wide-integer probes
+could not run from a linked image at all and fell back to the UNLINKED `.text`, where
+`.data` is absent and no relocation has been applied, so nothing touching a global
+could be executed. **Every rv32 probe now runs from the linked image**, entered
+directly at the address the link gave it - which is what keeps the harness the
+independent party on the calling convention rather than routing probes through a
+dispatcher that would use the compiler's convention on both sides.
+
+The capture is image-producing formats only: `emit_exec_image` is nil elsewhere and
+the call refuses rather than inventing an answer for a container format, where "the
+bytes" is not a question with one answer. The flat writer's layout and its
+enter-at-the-base rule are now one body shared by the file path and the in-memory
+one, so an image held in memory cannot differ from the one a build would have
+written.
+
 ## [4.21.1] - 2026-08-20
 
 ### Fixed
