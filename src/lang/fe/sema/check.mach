@@ -30,6 +30,7 @@ use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
+use mach.lang.diagnostic;
 use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.expr;
@@ -97,7 +98,140 @@ pub fun check_coercible(sc: *context.SemaContext, expected: type.TypeId, eid: id
     }
     var have: type.TypeId = actual;
     if (cr.kind == coerce.COERCE_COERCED) { have = cr.ty; }
-    ret check_assignable(sc, expected, have, span);
+
+    # the mark is what makes the fix safe to attach: the attach helpers land on the
+    # LAST diagnostic in the sink, so on a `silent` episode - or any path that
+    # declines to report - a fix would ride an unrelated earlier diagnostic.
+    val mark: usize = context.diag_mark(sc);
+    val ok: bool = check_assignable(sc, expected, have, span);
+    if (!ok && context.reported_since(sc, mark)) { attach_cast_fix(sc, expected, have, eid); }
+    ret ok;
+}
+
+# offer `value::Type` as a mechanically applicable fix on the just-reported mismatch
+#
+# THE ONLY PLACE THIS IS ATTACHABLE. `check_assignable` is also reached from
+# `check_return`, whose span covers the whole `ret value;` statement rather than the
+# value, so a cast fix there would wrap the statement and produce garbage. Here the
+# span is the offending expression itself, which is exactly what a cast has to wrap.
+#
+# A COMPOUND EXPRESSION IS PARENTHESIZED. `::` binds tighter than the binary
+# operators, so appending `::i64` to the span of `a + b` yields `a + b::i64`, which
+# casts `b` alone - the fix would compile, change the meaning, and leave the original
+# error in place. Two edits, `(` and `)::T`, are why a fix owns a LIST of edits: they
+# apply together or the source does not parse.
+# ---
+# sc:       the active sema context
+# expected: the destination type the cast targets
+# actual:   the value's type, already literal-coerced
+# eid:      the offending expression; supplies both the range and the parenthesization
+fun attach_cast_fix(sc: *context.SemaContext, expected: type.TypeId, actual: type.TypeId, eid: id.ExprId) {
+    if (!cast_would_compile(sc, actual, expected)) { ret; }
+
+    # THE EXPRESSION'S OWN RANGE, NOT THE DIAGNOSTIC'S. A reporter picks its span to
+    # underline what reads best - a `val` declaration's check hands over a range that
+    # runs past the initializer to the `;` - and an edit placed off that lands outside
+    # the expression it was meant to wrap. The node the fix is ABOUT is the only thing
+    # that knows where it starts and ends.
+    val opt_expr: O.Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+    if (O.is_none[*expr.Expr](opt_expr)) { ret; }
+    val span: token.Span = O.unwrap[*expr.Expr](opt_expr).span;
+    if (span.len == 0) { ret; }
+
+    val ts_r: R.Result[str, str] = type_to_str(sc, expected);
+    if (R.is_err[str, str](ts_r)) { ret; }
+    val ts: str = R.unwrap_ok[str, str](ts_r);
+
+    val label_r: R.Result[str, str] = format.sprint(sc.s.alloc, "cast the value to `{}`", ts);
+    if (R.is_err[str, str](label_r)) { type_str_free(sc, ts); ret; }
+    val label: str = R.unwrap_ok[str, str](label_r);
+
+    var head: token.Span;
+    head.offset = span.offset;
+    head.len    = 0;
+    var tail: token.Span;
+    tail.offset = span.offset + span.len;
+    tail.len    = 0;
+
+    if (expr_binds_tighter_than_cast(O.unwrap[*expr.Expr](opt_expr).kind)) {
+        val sfx_r: R.Result[str, str] = format.sprint(sc.s.alloc, "::{}", ts);
+        if (R.is_ok[str, str](sfx_r)) {
+            val sfx: str = R.unwrap_ok[str, str](sfx_r);
+            diagnostic.attach_fix(?sc.s.diags, label, sc.a.file_id, tail, sfx);
+            A.deallocate[char](sc.s.alloc, sfx, str_len(sfx) + 1);
+        }
+    }
+    or {
+        val sfx_r: R.Result[str, str] = format.sprint(sc.s.alloc, ")::{}", ts);
+        if (R.is_ok[str, str](sfx_r)) {
+            val sfx: str = R.unwrap_ok[str, str](sfx_r);
+            diagnostic.attach_fix(?sc.s.diags, label, sc.a.file_id, head, "(");
+            diagnostic.attach_fix_edit(?sc.s.diags, sc.a.file_id, tail, sfx);
+            A.deallocate[char](sc.s.alloc, sfx, str_len(sfx) + 1);
+        }
+    }
+
+    A.deallocate[char](sc.s.alloc, label, str_len(label) + 1);
+    type_str_free(sc, ts);
+}
+
+# whether `from::to` is a cast that would actually compile
+#
+# A fix that produces a NEW error is worse than no fix at all: the editor's one
+# keystroke would trade a mismatch for `cast: conversion is invalid`. This admits
+# only the numeric conversion the widening advice is about. `::` also reinterprets
+# any two same-size types, but between two unrelated records that is a bit pun, not
+# what a mismatch there means - offering it would launder a real type error into a
+# silent misread of memory.
+# ---
+# sc:   the active sema context
+# from: the value's type
+# to:   the destination type
+# ret:  true when `from::to` is legal and appropriate to suggest
+fun cast_would_compile(sc: *context.SemaContext, from: type.TypeId, to: type.TypeId) bool {
+    if (from == type.TYPE_ERROR || to == type.TYPE_ERROR) { ret false; }
+    if (from == to)                                       { ret false; }
+    if (!is_numeric(sc, from) || !is_numeric(sc, to))     { ret false; }
+
+    # `::` may neither add nor drop a `^` (#1645), so a cast across the secrecy
+    # boundary is refused and must not be offered.
+    if (type.is_secret(?sc.s.types, from) != type.is_secret(?sc.s.types, to)) { ret false; }
+
+    # a secret operand through the variable-latency FP unit is refused outright (#1646)
+    if (type.is_secret(?sc.s.types, from) && cast_is_fp_conversion(sc, from, to)) { ret false; }
+
+    ret true;
+}
+
+# whether an expression of kind `k` binds tighter than `::`, so a cast may be
+# appended to it without parentheses
+#
+# The postfix and primary forms do; the operator forms do not. An unrecognized kind
+# answers false, which costs a pair of redundant parentheses and never changes what
+# the fixed source means - the safe direction to be wrong in, and the direction a new
+# expression kind added later defaults to.
+# ---
+# k:   the expression's kind
+# ret: true when `<expr>::T` parses as a cast of the whole expression
+fun expr_binds_tighter_than_cast(k: expr.ExprKind) bool {
+    if (k == expr.EXPR_KIND_IDENT)            { ret true; }
+    if (k == expr.EXPR_KIND_COMPTIME_IDENT)   { ret true; }
+    if (k == expr.EXPR_KIND_LIT_INT)          { ret true; }
+    if (k == expr.EXPR_KIND_LIT_FLOAT)        { ret true; }
+    if (k == expr.EXPR_KIND_LIT_CHAR)         { ret true; }
+    if (k == expr.EXPR_KIND_LIT_STR)          { ret true; }
+    if (k == expr.EXPR_KIND_LIT_NIL)          { ret true; }
+    if (k == expr.EXPR_KIND_CALL)             { ret true; }
+    if (k == expr.EXPR_KIND_INDEX)            { ret true; }
+    if (k == expr.EXPR_KIND_MEMBER)           { ret true; }
+    if (k == expr.EXPR_KIND_PROJECT)          { ret true; }
+    if (k == expr.EXPR_KIND_CAST)             { ret true; }
+    if (k == expr.EXPR_KIND_STRIP)            { ret true; }
+    if (k == expr.EXPR_KIND_ARRAY_LIT)        { ret true; }
+    if (k == expr.EXPR_KIND_STRUCT_LIT)       { ret true; }
+    if (k == expr.EXPR_KIND_VECTOR_LIT)       { ret true; }
+    if (k == expr.EXPR_KIND_GENERIC_INSTANCE) { ret true; }
+    ret false;
 }
 
 # checks a call against the callee's function signature
