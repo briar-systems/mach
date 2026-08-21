@@ -54,9 +54,16 @@ missed, the **stale on-disk text was parsed instead**, and the unsaved buffer wa
 silently ignored. No error; yesterday's source.
 
 The composed path is normalized once at the single place it is built, using
-`path.clean` from mach-std 0.28.1. That one string is what the overlay lookup, the
-disk read, and `load_source`'s SourceFile registration all take, so the three agree by
-construction rather than by three call sites remembering to.
+`path.clean` from mach-std 0.28.1, so the disk read and `load_source`'s SourceFile
+registration agree on one spelling and one file gets one FileId.
+
+That alone would only have moved the mismatch. The two sides that meet in the overlay
+table pick their spelling **independently** - an editor keys a buffer from a URI it
+decoded, the driver composes a path out of manifest text - so canonicalizing the half
+the compiler controls leaves the editor's half free to disagree. The key is therefore
+canonicalized at the table's own boundary, in `set_overlay`, `clear_overlay` and
+`overlay_get` alike, which makes it canonical by construction rather than by every
+producer happening to agree.
 
 Normalization is purely lexical - no filesystem I/O - which is the right strength for
 comparing two spellings of one path, and keeps it off the syscall path in a loop that
