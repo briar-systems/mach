@@ -62,7 +62,57 @@ pub rec Related {
     label: str;
 }
 
+# one span-and-text replacement within a fix
+#
+# The span may be empty, which makes the edit a pure INSERTION at that offset, and
+# the replacement may be empty, which makes it a pure DELETION. Both fall out of the
+# one shape rather than needing their own kinds, and both are used: a cast fix
+# inserts `::T` after an expression without needing to know the expression's text.
+#
+# Offsets are byte offsets into the file, matching every other span the compiler
+# reports, so a consumer converts them to its own line/character positions through
+# the source registry exactly as it already does for `loc`.
+# ---
+# loc:         the range to replace
+# replacement: owned text to put in its place, possibly empty
+pub rec Edit {
+    loc:         Location;
+    replacement: str;
+}
+
+# one mechanically applicable fix for a diagnostic
+#
+# EDITS ARE A LIST, NOT A SINGLE SPAN, because the edits of one fix must apply
+# together or not at all. Wrapping an expression in a cast is the ordinary case and
+# needs two: `(` before it and `)::T` after. Applying half of that produces source
+# that does not parse, so a one-span shape would either exclude the case or force a
+# consumer to correlate two separate fixes and hope.
+#
+# A fix always carries at least one edit: `attach_fix` takes the first, so a fix with
+# nothing to apply is not a state that exists. Alternatives - cast the value versus
+# change the declared type - are separate Fix entries, since those are choices a
+# person makes rather than one atomic edit.
+# ---
+# label:    owned title, e.g. "cast the value to `i64`"; what an editor lists
+# edits:    growable array of edits applied together
+# edit_len: number of edits stored
+# edit_cap: allocated slots in edits
+pub rec Fix {
+    label:    str;
+    edits:    *Edit;
+    edit_len: usize;
+    edit_cap: usize;
+}
+
 # a single reported diagnostic tied to a primary location in a source file
+#
+# `help` and `fixes` coexist deliberately: `help` is the rendered sentence a person
+# reads in a terminal, `fixes` is the same advice in a form a program can apply. The
+# alternative is an editor pattern-matching the compiler's English and rebuilding the
+# edit from it, which couples the editor to diagnostic WORDING - every rephrasing
+# upstream silently breaking a quick fix downstream, with no compile error and no test
+# to catch it (#3023). A diagnostic whose advice is not mechanical carries no fix, the
+# same way one with no suggestion carries no help.
 # ---
 # severity:    severity level of the diagnostic
 # loc:         primary location the diagnostic is reported at
@@ -72,6 +122,9 @@ pub rec Related {
 # related:     growable array of secondary locations, or nil when none
 # related_len: number of secondary locations stored (presence count)
 # related_cap: allocated slots in related
+# fixes:       growable array of mechanically applicable fixes, or nil when none
+# fix_len:     number of fixes stored
+# fix_cap:     allocated slots in fixes
 pub rec Diagnostic {
     severity:    Severity;
     loc:         Location;
@@ -81,6 +134,9 @@ pub rec Diagnostic {
     related:     *Related;
     related_len: usize;
     related_cap: usize;
+    fixes:       *Fix;
+    fix_len:     usize;
+    fix_cap:     usize;
 }
 
 # owning list of diagnostics collected across one or more phases
@@ -101,6 +157,16 @@ val INITIAL_CAP: usize = 16;
 
 # initial slot count for a diagnostic's related array on its first secondary span
 val INITIAL_RELATED_CAP: usize = 2;
+
+# initial slot count for a diagnostic's fix array on its first fix
+#
+# One, because a diagnostic offering alternatives is the exception: the array grows
+# by doubling when a second fix arrives, and the common case allocates exactly what
+# it uses.
+val INITIAL_FIX_CAP: usize = 1;
+
+# initial slot count for a fix's edit array on its first edit
+val INITIAL_EDIT_CAP: usize = 2;
 
 # construct an empty diagnostic list backed by the given allocator
 # ---
@@ -141,6 +207,23 @@ pub fun dnit(list: *DiagList) {
         }
         if (d.related != nil && d.related_cap > 0) {
             A.deallocate[Related](list.a, d.related, d.related_cap);
+        }
+        var f: usize = 0;
+        for (f < d.fix_len) {
+            val fx: *Fix = ?d.fixes[f];
+            if (fx.label != nil) { str_free(list.a, fx.label); }
+            var e: usize = 0;
+            for (e < fx.edit_len) {
+                if (fx.edits[e].replacement != nil) { str_free(list.a, fx.edits[e].replacement); }
+                e = e + 1;
+            }
+            if (fx.edits != nil && fx.edit_cap > 0) {
+                A.deallocate[Edit](list.a, fx.edits, fx.edit_cap);
+            }
+            f = f + 1;
+        }
+        if (d.fixes != nil && d.fix_cap > 0) {
+            A.deallocate[Fix](list.a, d.fixes, d.fix_cap);
         }
         i = i + 1;
     }
@@ -287,6 +370,145 @@ pub fun attach_related(list: *DiagList, file_id: source.FileId, span: token.Span
     d.related_len = d.related_len + 1;
 }
 
+# attach a mechanically applicable fix, with its first edit, to the most recently
+# recorded diagnostic
+#
+# The first edit is part of construction rather than a follow-up call, so a fix with
+# nothing to apply is not a reachable state. Further edits belonging to the SAME fix
+# go through attach_fix_edit; a second alternative is a second attach_fix.
+#
+# A no-op when the list is empty. Allocation failure is swallowed and leaves the
+# diagnostic without the fix, matching the other attach helpers: a quick fix is an
+# affordance, and losing one must never change what the compiler reports.
+# ---
+# list:        diagnostic list whose last entry receives the fix
+# label:       title an editor lists the fix under (copied)
+# file_id:     identifier of the file the edit applies to
+# span:        range the edit replaces; an empty range inserts at that offset
+# replacement: text to put in the range (copied); empty deletes
+pub fun attach_fix(list: *DiagList, label: str, file_id: source.FileId, span: token.Span, replacement: str) {
+    if (list == nil || list.len == 0) { ret; }
+    val d: *Diagnostic = ?list.items[list.len - 1];
+
+    # an untitled fix is one an editor cannot list, so it is not attached at all
+    val label_owned: str = dup_or_nil(list.a, label);
+    if (label_owned == nil) { ret; }
+
+    var text: str = replacement;
+    if (text == nil) { text = ""; }
+
+    val edits_r: R.Result[*Edit, str] = A.allocate[Edit](list.a, INITIAL_EDIT_CAP);
+    if (R.is_err[*Edit, str](edits_r)) {
+        str_free(list.a, label_owned);
+        ret;
+    }
+    val edits: *Edit = R.unwrap_ok[*Edit, str](edits_r);
+
+    val rep_r: R.Result[str, str] = str_dup(list.a, text);
+    if (R.is_err[str, str](rep_r)) {
+        A.deallocate[Edit](list.a, edits, INITIAL_EDIT_CAP);
+        str_free(list.a, label_owned);
+        ret;
+    }
+
+    if (d.fixes == nil) {
+        val alloc_r: R.Result[*Fix, str] = A.allocate[Fix](list.a, INITIAL_FIX_CAP);
+        if (R.is_err[*Fix, str](alloc_r)) {
+            str_free(list.a, R.unwrap_ok[str, str](rep_r));
+            A.deallocate[Edit](list.a, edits, INITIAL_EDIT_CAP);
+            str_free(list.a, label_owned);
+            ret;
+        }
+        d.fixes   = R.unwrap_ok[*Fix, str](alloc_r);
+        d.fix_cap = INITIAL_FIX_CAP;
+    }
+    or (d.fix_len == d.fix_cap) {
+        val new_cap: usize = d.fix_cap * 2;
+        val grow_r: R.Result[*Fix, str] = A.reallocate[Fix](list.a, d.fixes, d.fix_cap, new_cap);
+        if (R.is_err[*Fix, str](grow_r)) {
+            str_free(list.a, R.unwrap_ok[str, str](rep_r));
+            A.deallocate[Edit](list.a, edits, INITIAL_EDIT_CAP);
+            str_free(list.a, label_owned);
+            ret;
+        }
+        d.fixes   = R.unwrap_ok[*Fix, str](grow_r);
+        d.fix_cap = new_cap;
+    }
+
+    edits[0].loc.file_id  = file_id;
+    edits[0].loc.span     = span;
+    edits[0].replacement  = R.unwrap_ok[str, str](rep_r);
+
+    var fx: Fix;
+    fx.label    = label_owned;
+    fx.edits    = edits;
+    fx.edit_len = 1;
+    fx.edit_cap = INITIAL_EDIT_CAP;
+    d.fixes[d.fix_len] = fx;
+    d.fix_len = d.fix_len + 1;
+}
+
+# append another edit to the most recently attached fix
+#
+# The edits of one fix apply TOGETHER: wrapping an expression in a cast needs a `(`
+# before it and a `)::T` after, and applying either alone produces source that does
+# not parse. A no-op when the last diagnostic carries no fix yet, so a caller cannot
+# strand an edit on nothing.
+#
+# Allocation failure would leave a HALF-APPLICABLE fix, which is worse than no fix at
+# all, so it drops the whole fix rather than the one edit.
+# ---
+# list:        diagnostic list whose last entry's last fix receives the edit
+# file_id:     identifier of the file the edit applies to
+# span:        range the edit replaces; an empty range inserts at that offset
+# replacement: text to put in the range (copied); empty deletes
+pub fun attach_fix_edit(list: *DiagList, file_id: source.FileId, span: token.Span, replacement: str) {
+    if (list == nil || list.len == 0) { ret; }
+    val d: *Diagnostic = ?list.items[list.len - 1];
+    if (d.fix_len == 0) { ret; }
+    val fx: *Fix = ?d.fixes[d.fix_len - 1];
+
+    if (fx.edit_len == fx.edit_cap) {
+        val new_cap: usize = fx.edit_cap * 2;
+        val grow_r: R.Result[*Edit, str] = A.reallocate[Edit](list.a, fx.edits, fx.edit_cap, new_cap);
+        if (R.is_err[*Edit, str](grow_r)) { drop_last_fix(list, d); ret; }
+        fx.edits    = R.unwrap_ok[*Edit, str](grow_r);
+        fx.edit_cap = new_cap;
+    }
+
+    var text: str = replacement;
+    if (text == nil) { text = ""; }
+    val rep_r: R.Result[str, str] = str_dup(list.a, text);
+    if (R.is_err[str, str](rep_r)) { drop_last_fix(list, d); ret; }
+
+    fx.edits[fx.edit_len].loc.file_id = file_id;
+    fx.edits[fx.edit_len].loc.span    = span;
+    fx.edits[fx.edit_len].replacement = R.unwrap_ok[str, str](rep_r);
+    fx.edit_len = fx.edit_len + 1;
+}
+
+# free and remove the last fix on `d`, leaving the diagnostic itself untouched
+#
+# The recovery path for a fix that could not be completed: a partial fix must never
+# reach a consumer, because applying half of one is a source-corrupting edit.
+# ---
+# list: the owning list, for its allocator
+# d:    the diagnostic whose last fix is dropped
+fun drop_last_fix(list: *DiagList, d: *Diagnostic) {
+    if (d.fix_len == 0) { ret; }
+    val fx: *Fix = ?d.fixes[d.fix_len - 1];
+    if (fx.label != nil) { str_free(list.a, fx.label); }
+    var e: usize = 0;
+    for (e < fx.edit_len) {
+        if (fx.edits[e].replacement != nil) { str_free(list.a, fx.edits[e].replacement); }
+        e = e + 1;
+    }
+    if (fx.edits != nil && fx.edit_cap > 0) {
+        A.deallocate[Edit](list.a, fx.edits, fx.edit_cap);
+    }
+    d.fix_len = d.fix_len - 1;
+}
+
 # whether the list holds at least one error-severity diagnostic
 # ---
 # list: the list to scan
@@ -318,6 +540,21 @@ pub fun suggestion_build(a: *A.Allocator, name: str) str {
     ret R.unwrap_ok[str, str](res_join);
 }
 
+# build an owned `replace with `<name>`` fix label for a spelling correction
+#
+# The rendered help reads `did you mean `helper`?`, which is a question; an editor
+# lists a code action by an imperative title. Both come from the same candidate, so
+# they cannot drift apart, but they are spelled for their own audience.
+# ---
+# a:    allocator backing the returned string
+# name: candidate identifier the fix substitutes
+# ret:  the owned label, or nil on failure
+pub fun fix_label_replace(a: *A.Allocator, name: str) str {
+    val res_join: R.Result[str, str] = str_join(a, "replace with `", name, "`");
+    if (R.is_err[str, str](res_join)) { ret nil; }
+    ret R.unwrap_ok[str, str](res_join);
+}
+
 # deep-copy diagnostic `d` into `dst`, duplicating its owned message, optional
 # note/help lines, and every secondary location
 #
@@ -340,6 +577,23 @@ fun copy_into(dst: *DiagList, d: *Diagnostic) R.Result[bool, str] {
     for (r < d.related_len) {
         attach_related(dst, d.related[r].loc.file_id, d.related[r].loc.span, d.related[r].label);
         r = r + 1;
+    }
+
+    # fixes travel with the copy: the query cache replays a cached module's
+    # diagnostics verbatim, and a quick fix that survived the first build but not a
+    # reused one would blink out of an editor on an unrelated keystroke.
+    var f: usize = 0;
+    for (f < d.fix_len) {
+        val fx: *Fix = ?d.fixes[f];
+        if (fx.edit_len > 0) {
+            attach_fix(dst, fx.label, fx.edits[0].loc.file_id, fx.edits[0].loc.span, fx.edits[0].replacement);
+            var e: usize = 1;
+            for (e < fx.edit_len) {
+                attach_fix_edit(dst, fx.edits[e].loc.file_id, fx.edits[e].loc.span, fx.edits[e].replacement);
+                e = e + 1;
+            }
+        }
+        f = f + 1;
     }
     ret R.ok[bool, str](true);
 }
@@ -440,6 +694,9 @@ fun emit(list: *DiagList, severity: Severity, file_id: source.FileId, span: toke
     d.related      = nil;
     d.related_len  = 0;
     d.related_cap  = 0;
+    d.fixes        = nil;
+    d.fix_len      = 0;
+    d.fix_cap      = 0;
     list.items[list.len] = d;
     list.len = list.len + 1;
 
@@ -640,5 +897,102 @@ test "mach.lang.diagnostic.clone_tail:round_trips_via_append_all" {
     dnit(?dst);
     dnit(snap);
     A.deallocate[DiagList](?a, snap, 1);
+    ret bad;
+}
+
+# A fix survives the copy into another list (#3023).
+#
+# `clone_tail` is how a derived query snapshots the diagnostics it produced so a later
+# reused `get` can replay them. A fix that lived through the first build but not a
+# CACHED one would make an editor's quick fix blink out on an unrelated keystroke -
+# a bug with no error message and no reproducible trigger from the user's side.
+test "mach.lang.diagnostic.attach_fix:survives_a_copy" {
+    var a: A.Allocator;
+    page.make(?a);
+    var src: DiagList = init(?a);
+    var dst: DiagList = init(?a);
+
+    var sp: token.Span;
+    sp.offset = 4;
+    sp.len    = 5;
+    error(?src, 1, sp, "unresolved identifier `helpr`");
+    attach_help(?src, "did you mean `helper`?");
+    attach_fix(?src, "replace with `helper`", 1, sp, "helper");
+
+    # a second fix on the same diagnostic, with two edits: the alternatives case and
+    # the multi-edit case at once, which is what growth past INITIAL_FIX_CAP exercises
+    var head: token.Span;
+    head.offset = 4;
+    head.len    = 0;
+    var tail: token.Span;
+    tail.offset = 9;
+    tail.len    = 0;
+    attach_fix(?src, "cast the value to `i64`", 1, head, "(");
+    attach_fix_edit(?src, 1, tail, ")::i64");
+
+    # counts are checked BEFORE anything indexes past them: a shape assertion that
+    # faults instead of failing tells the next reader nothing about what broke
+    var bad: i32 = 0;
+    if (src.items[0].fix_len != 2)           { dnit(?src); dnit(?dst); ret 1; }
+    if (src.items[0].fixes[0].edit_len != 1) { dnit(?src); dnit(?dst); ret 2; }
+    if (src.items[0].fixes[1].edit_len != 2) { dnit(?src); dnit(?dst); ret 3; }
+
+    append_all(?dst, ?src);
+    if (dst.len != 1)                 { dnit(?src); dnit(?dst); ret 4; }
+    if (dst.items[0].fix_len != 2)    { dnit(?src); dnit(?dst); ret 5; }
+    if (!str_equals(dst.items[0].fixes[0].label, "replace with `helper`")        && bad == 0) { bad = 6; }
+    if (!str_equals(dst.items[0].fixes[0].edits[0].replacement, "helper")        && bad == 0) { bad = 7; }
+    if (dst.items[0].fixes[0].edits[0].loc.span.offset != 4                      && bad == 0) { bad = 8; }
+    if (dst.items[0].fixes[0].edits[0].loc.span.len != 5                         && bad == 0) { bad = 9; }
+    if (dst.items[0].fixes[1].edit_len != 2) { dnit(?src); dnit(?dst); ret 10; }
+    if (!str_equals(dst.items[0].fixes[1].edits[1].replacement, ")::i64")        && bad == 0) { bad = 11; }
+
+    # the copy owns its strings: freeing the source must not disturb it
+    dnit(?src);
+    if (!str_equals(dst.items[0].fixes[0].edits[0].replacement, "helper")        && bad == 0) { bad = 12; }
+
+    dnit(?dst);
+    ret bad;
+}
+
+# An edit with no fix to belong to is dropped, not stranded (#3023).
+#
+# attach_fix_edit appends to the LAST fix on the LAST diagnostic. With no fix there
+# is no such thing, and a caller that gets the order wrong must not silently attach
+# its `)::i64` to whatever fix a previous diagnostic happens to carry - which would
+# corrupt a fix that was correct.
+test "mach.lang.diagnostic.attach_fix_edit:needs_a_fix_to_belong_to" {
+    var a: A.Allocator;
+    page.make(?a);
+    var list: DiagList = init(?a);
+
+    var sp: token.Span;
+    sp.offset = 0;
+    sp.len    = 1;
+
+    # a diagnostic that legitimately carries a fix
+    error(?list, 1, sp, "first");
+    attach_fix(?list, "fix the first", 1, sp, "x");
+
+    # a later one that carries none: the stray edit must not reach back
+    error(?list, 1, sp, "second");
+    attach_fix_edit(?list, 1, sp, "STRAY");
+
+    var bad: i32 = 0;
+    if (list.items[1].fix_len != 0)           { dnit(?list); ret 1; }
+    if (list.items[0].fix_len != 1)           { dnit(?list); ret 2; }
+    if (list.items[0].fixes[0].edit_len != 1) { dnit(?list); ret 3; }
+    if (!str_equals(list.items[0].fixes[0].edits[0].replacement, "x") && bad == 0) { bad = 4; }
+
+    # an untitled fix is one no editor could list, so it is refused outright
+    attach_fix(?list, nil, 1, sp, "y");
+    if (list.items[1].fix_len != 0                          && bad == 0) { bad = 5; }
+
+    # an empty replacement is a DELETION, not an absent one, and is kept
+    attach_fix(?list, "delete it", 1, sp, "");
+    if (list.items[1].fix_len != 1)           { dnit(?list); ret 6; }
+    if (str_len(list.items[1].fixes[0].edits[0].replacement) != 0 && bad == 0) { bad = 7; }
+
+    dnit(?list);
     ret bad;
 }
