@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### test: a failed lowering pass counts as an error, so char-width regressions actually regress (#2949)
+
+`ut_lower_clean` reported "no errors" by counting the DIAGNOSTIC SINK after running the
+lowering pass, and discarded the pass's own result. A pass that fails by **returning** an
+error rather than filing a diagnostic - the always-on IR verifier's conversion-width
+refusal, for one - was therefore invisible to it.
+
+The consequence: every `ut_lower_clean` case guarding that class was passing vacuously.
+Reintroducing #2982's defect (`lower_lit_char` stamping every character constant 8 bits
+instead of reading the type sema settled) left the whole suite green, while a real build
+of the same source refused it with exactly the reported error. The fix was correct; there
+was simply nothing holding it.
+
+The helper now treats a failed pass as an error. The guard it exists for fails when the
+defect is reintroduced, which is the property it was always assumed to have.
+
+### Fixed
+
 #### codegen: a frame larger than the target's stack reserve is refused (#2991)
 
 A function whose own stack frame is larger than the target's whole stack reserve can
