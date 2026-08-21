@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### link(macho): an x86_64 SUBTRACTOR relocation pair is parsed and resolved (#2973)
+
+Mach refused a normal Apple Clang x86_64 object outright:
+
+```
+error: macho: unsupported relocation type 5
+```
+
+`macho.mach` defined x86_64 relocation types 0-4 and 6-8 and had no representation for
+`X86_64_RELOC_SUBTRACTOR` at all. Apple Clang emits it constantly as an adjacent
+SUBTRACTOR + UNSIGNED pair - most visibly for a switch jump table, whose entries are
+label differences rather than addresses so the table is position-independent - so a
+vendored C translation unit compiled with `-O2` could simply fail to link.
+
+**The difference is now a first-class relocation.** `RK_DIFF32` / `RK_DIFF64` resolve
+`sym - sym2 + addend`, and `Relocation` gains `sym2`, read only for those kinds so a
+zero-initialized record stays correct everywhere else. Two symbols is the fact rather
+than an encoding detail: folding the pair away in the reader is only right when both
+sides are defined in the object being read, so a reader that folded would be correct
+until the first object that is not a jump table.
+
+The reader mirrors the paired-relocation mechanism `ARM64_RELOC_ADDEND` already used -
+the first entry stashes the subtrahend, the second does the work - including the
+accounting that matters: two entries become ONE record, so the relocation count must
+not count the consumed entry or the image carries a zero-filled trailing relocation.
+
+The linker folds the subtrahend into the addend, since `sym - sym2 + A` is
+`sym + (A - addr(sym2))`, which reuses the existing absolute appliers and their
+overflow checks rather than threading a second target through every ISA. The 32-bit
+form resolves through the SIGNED absolute, because a difference is signed whichever way
+the two labels are ordered.
+
+A difference against a symbol the link does not define is refused with its own message.
+That is correct rather than a limitation: the loader chooses that address, so the
+difference is not a link-time constant and no relocation could make it one.
+
+Malformed pairs are refused individually - a missing second half, a second half that is
+not an UNSIGNED, halves patching different addresses, two SUBTRACTORs in a row - because
+the value written depends on both halves, so guessing at one would silently patch the
+wrong arithmetic.
+
+Mach's own writer emits no SUBTRACTOR, so a difference reaching the Mach-O writer still
+refuses by the existing unsupported-kind path rather than writing something wrong.
+
+### Fixed
+
 #### test: Mach-O gets an external reader on the lane that gates merges (#2957)
 
 `test/engines.conf` gave both darwin rows `main` cadence, so `ci-legs.sh pr` emitted no
