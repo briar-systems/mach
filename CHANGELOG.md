@@ -103,6 +103,27 @@ hands the callee the wrong bytes.
 
 ### Fixed
 
+#### chore(changelog): stray `[Unreleased]` headings stranded inside released sections (#3039)
+
+`CHANGELOG.md` carried `## [Unreleased]` headings *inside* already-released sections -
+between 4.23.0 and 4.22.0, and again between 4.22.0 and 4.21.1. A reader of the
+published 4.23.0 section saw an "Unreleased" heading in the middle of it, above entries
+that shipped in 4.23.0.
+
+The cause was the merge workflow, not the release step. Each pull request prepended its
+own `## [Unreleased]` block rather than appending under the existing one, so several
+accumulated between releases; the release step renames only the first, and every other
+became an orphan.
+
+Repaired by folding each stray into the release above it and merging duplicate `###`
+subsections. Every body line is preserved byte for byte - only headings moved.
+
+A CI check now enforces the invariant: at most one `## [Unreleased]`, and it must be
+the first `## [` heading. It fails on the pull request that adds the second one, while
+the fix is a single heading deletion - rather than at release time, when the two have
+already merged. This class of mistake is invisible in a diff, because each PR's own
+diff looks correct in isolation and the damage exists only in the merged file.
+
 #### sema: the C-variadic contract follows a call chain, not just one hop (#3031)
 
 #3029 made the C promotion rule survive monomorphization for a call one hop from the
@@ -163,6 +184,7 @@ Unblocks briar-systems/mach-lsp#141.
 
 ## [4.23.0] - 2026-08-21
 
+
 ### Fixed
 
 #### sema: the C-variadic promotion rule survives monomorphization (#3029)
@@ -199,7 +221,14 @@ the way to wrap a C variadic.
 
 Measured at no cost: 45.57s of build CPU against a 45.72s baseline.
 
-## [Unreleased]
+#### sema: a comptime container no longer masks the C-variadic filter (#3025)
+
+The instance-recording filter #3029 added answered "yes" for any body holding a `$if`
+or `$each` rather than walking its arms. Every body with a comptime container looked
+like it reached a C-variadic tail; the codegen corpus caught it, refusing
+`fold_pack`'s `u8` element in a body that calls no foreign function at all. The arms
+are walked now. The conservative direction is wrong on this filter in both of its
+uses.
 
 ### Added
 
@@ -233,18 +262,6 @@ rather than on a `va...` inside a wrapper they may not have written.
 The obligation attaches only where the pack actually reaches C. An ordinary mach
 variadic still takes a `u8` element, because entering a pack carries no width
 obligation of its own - the obligation comes entirely from the forwarding.
-
-### Fixed
-
-#### sema: a comptime container no longer masks the C-variadic filter (#3025)
-
-The instance-recording filter #3029 added answered "yes" for any body holding a `$if`
-or `$each` rather than walking its arms. Every body with a comptime container looked
-like it reached a C-variadic tail; the codegen corpus caught it, refusing
-`fold_pack`'s `u8` element in a body that calls no foreign function at all. The arms
-are walked now. The conservative direction is wrong on this filter in both of its
-uses.
-
 ## [4.22.0] - 2026-08-21
 
 ### Changed
@@ -277,7 +294,6 @@ enter-at-the-base rule are now one body shared by the file path and the in-memor
 one, so an image held in memory cannot differ from the one a build would have
 written.
 
-## [Unreleased]
 
 ### Fixed
 
@@ -434,6 +450,7 @@ teardowns were missed, it was that the only test covering them could not fail.
 
 ## [4.20.0] - 2026-08-20
 
+
 ### Fixed
 
 #### driver: a retained session's reload cycle returns to a steady state (#3001)
@@ -476,6 +493,13 @@ The regression test asserts an **exact** zero, not a threshold: a cycle that run
 once per keystroke has no such thing as an acceptable per-cycle residue, only a
 longer wait before it matters.
 
+#### Vendored frontends retain Mach's compiler version (#2954)
+
+The driver, `$mach.version`, debug-info producer string, and CLI now read one Mach-owned
+release constant instead of the embedding project's `[project].version`. A frontend
+vendored by another tool therefore reports Mach's version rather than its host package's
+version. Release tests pin the constant to Mach's own manifest.
+
 ### Added
 
 #### Tooling can retain compiler-owned frontend analysis (#2996)
@@ -495,16 +519,6 @@ removed. The check read the embedding project's version when the compiler fronte
 was vendored, so it refused every ordinary `4.x` requirement under tools such as
 mach-lsp. Root manifests now report `mach` as an unknown project key; dependency
 metadata bearing the removed key is ignored. No replacement is planned here.
-
-### Fixed
-
-#### Vendored frontends retain Mach's compiler version (#2954)
-
-The driver, `$mach.version`, debug-info producer string, and CLI now read one Mach-owned
-release constant instead of the embedding project's `[project].version`. A frontend
-vendored by another tool therefore reports Mach's version rather than its host package's
-version. Release tests pin the constant to Mach's own manifest.
-
 ## [4.19.0] - 2026-08-10
 
 ### Changed
@@ -598,6 +612,7 @@ The 4.18.1 release itself was unaffected: CD builds and publishes on the tag and
 
 ## [4.18.1] - 2026-08-09
 
+
 ### Fixed
 
 #### A SPIR-V function body truncated its parameters instead of refusing (#2923)
@@ -609,6 +624,40 @@ The bound was also stated in four places rather than one, which is the defect #2
 **The constant's own documentation was wrong, and that is what sent the issue at the wrong layer.** It said sixteen came from the emitter assembling signature operands into fixed arrays, so removing the bound read as a buffer resize. The real reason is the argument register bank. `abi/spirv.mach` is an identity convention where the argument at position `i` is classified into register `i`, since SPIR-V passes composites natively and has no frame to spill into, so a parameter position is a physical register id on this target. The shared MIR lowering caps those at `MAX_GP_ARG_REGS`, also sixteen. SPIR-V's own universal limit is 255, and reaching it means decoupling a parameter from the register model rather than widening a buffer.
 
 That shared cap turned out to be unguarded in a way no target owner would expect. `abi_gp_arg_reg` reads a convention's bank into a fixed `[16]isa.Register` and range-checks the index **after** the fill, so a convention publishing a wider bank overruns that array before anything rejects it, from a one-line edit in a target's own file. A test now walks every registered convention against a deliberately oversized scratch and fails if any publishes a wider bank, and it refuses to pass if it checked nothing.
+
+#### A COFF long section name was space-padded, and llvm refused the object (#2952)
+The PE/COFF long section-name form is a slash followed by an ASCII decimal offset into the string table. mach right-justified the decimal in the seven bytes after the slash and padded the left with spaces, so a name over eight bytes came out `"/      4"`. binutils reads that by skipping the spaces. llvm does not: `llvm-readobj` and `llvm-objdump` both answer `invalid section name` and decode nothing, so every `x86_64-windows` object carrying a section name that long was unreadable by the tools the corpus is grounded in while `mach build` reported success. `.rodata.cst` is eleven bytes, so this reached every object with a constant pool.
+
+It went unnoticed because nothing external had ever read a mach COFF object. The corpus's `x86_64-windows` column has no goldens on a linux developer host, which declines the target, and its CI leg had never started (#2948), so the first layer A run on that target is what refused. That is the same shape as the ELFCLASS32-on-Elf64 writer that motivated layer A: a format only its own reader had ever checked. The field is now pinned by byte in a unit test, because two readers disagreeing about padding is precisely what stayed invisible.
+
+#### A float constant typed through an alias says why it does not fold (#2937)
+
+`#2918` made a comptime float carry the IEEE width its payload is at, which means the pre-type passes have to read that width from the annotation spelling. That is exact for a literal `f32` or `f64`, because a primitive wins over scope in type position, and it is not readable when the type arrives through a `def` alias: no type exists yet to read the alias through. Such a binding is therefore skipped rather than bound at f64, which would export a constant that disagrees with the one the program computes.
+
+The skip is right. What was wrong is that it left no trace, so a use of the name at that stage reported `identifier is not a comptime constant in scope` - which is false in both halves. `X` is a comptime constant and it is in scope, and only its width is unreadable this early. A reader acting on that message goes looking for a declaration that is already there and already correct.
+
+The pass that skips is the only place that knows why, so it now records the name and the use site reports the reason. Nothing else changes: the value still folds wherever types are known, a name that was never declared still reports absence, and a later pass that does bind the name reports nothing at all.
+
+Following the alias by name in the loading pass would answer sooner and would be wrong: at that stage nothing says which declaration a spelling denotes, and reading a name-keyed table for the answer is the mistake #2764 documents.
+
+#### A folded cast records the signedness of the type it casts to (#2935)
+
+`int_ct` in the lowering fold built its `CTValue` without setting `int_unsigned`, and a `var` record default-initialises to zero, so every constant produced by a folded cast claimed to be signed - including a cast to `u64`. The field exists to tell a negative value from a magnitude above i64 range, and those two share a bit pattern, so a wrong answer there is unrecoverable by anything downstream. Its two sibling constructors, `make_int_value` and `ct_float`, each set every discriminating field they own.
+
+It changes no output today, and that is stated rather than assumed. `int_ct` is reachable only from `convert_const_scalar`, whose single caller reads the destination type for signedness rather than the field, and every other reader of `int_unsigned` is fed by `comptime.eval`, which does not route through it. Compiling the tree with a compiler built before and after produces byte-identical objects, 225 of them, on x86-64.
+
+The issue this closes was filed describing a different defect: that a comptime integer is not evaluated at its declared width, so `val X: u8 = 200 + 100` errors rather than wrapping. That does not reproduce. The constant wraps at its declared width and agrees with the same computation at run time, including through division and shift, which are the operations where narrowing once at the end would differ from narrowing at each step. The refusals in the comptime evaluator fire at i64 and u64 range, matching the literal-range rejection they were built beside, and a `u8` computation never reaches them.
+
+#### The compiler was silent both times a pass dropped a value and missed a use (#2930, #2931)
+`#2749` was an `i32x4` accumulator on x86-64 that came out holding the multiplier. `#2917` was a conditional float merge on riscv64 that read its register undefined. Both were silent wrong answers, both were found by running a program, and `--verify-ir` exited 0 on both reproducers. The pass mistake behind them is ordinary. Being undetectable was not.
+
+The instruction pool keeps every instruction a pass ever created, detached ones included, so an operand naming a dropped value still resolves and reads as an ordinary use. Only the block lists say what reaches the back end, and nothing measured operands against them. The one check that could have was dominance, which walked block bodies and terminators and never phi lists, and returned early for a phi on top of that, so a phi incoming naming a dropped value was invisible twice over. It also rode the `full` flag, so it ran only in the post-DCE stages.
+
+`VC_DANGLING_OPERAND` now builds the live set once per function from the block lists and scans every live instruction's operands against it. It needs no dominator tree and no reachability, so it is always on and holds at every pipeline stage rather than only some of them. Dominance no longer exempts a phi: an incoming is measured at the END of the predecessor the pair names, which is the point the value has to be live out of for the edge copy to read it.
+
+Phi destruction had the matching hole and is what turned the IR defect into wrong code rather than a build failure. `lower_block_phis` searched a phi's operand pairs for the predecessor edge it was emitting and, finding none, moved on with no copy and no error, while the four other malformed inputs in the same function each fail the build. Out-of-SSA is total, so a merge register that is not defined on every path in is a malformed input rather than a case, and it now errors with the phi's block, the predecessor and the result vreg, since the pass that dropped the incoming is well upstream of MIR lowering.
+
+Both are diagnostic. Object output is byte-identical per target across x86-64, aarch64 and riscv64.
 
 ### Changed
 
@@ -653,42 +702,6 @@ Every run of either suite writes a coverage matrix naming the engine behind each
 Three things kept their behaviour and changed address. `int/observability.md` is `doc/design/test-observability.md`, since the relationship between a defect class and the observation that can see it was never a property of a harness. `int/lib/check-determinism.sh` is `test/determinism.sh`, since it guards the incremental build path rather than integration. And `int/lib/cc.sh`, the host and cross C toolchain resolver every foreign-object case builds through, is `test/link/lib/cc.sh`.
 
 Two measurements lost their guard and say so where they are claimed. `doc/language/secrecy.md` recorded a dudect-style timing harness at `int/ct/`. It ran on demand and never in CI, and it is gone, so the empirical claims there are now marked as measurements taken once. The x86-64 flags table in `x64/encode.mach` was transcribed from a probe run against real hardware, and nothing re-runs that probe. Restoring it belongs in a host-executed unit test, since the experiment only means anything on the ISA it executes on.
-### Fixed
-
-#### A COFF long section name was space-padded, and llvm refused the object (#2952)
-The PE/COFF long section-name form is a slash followed by an ASCII decimal offset into the string table. mach right-justified the decimal in the seven bytes after the slash and padded the left with spaces, so a name over eight bytes came out `"/      4"`. binutils reads that by skipping the spaces. llvm does not: `llvm-readobj` and `llvm-objdump` both answer `invalid section name` and decode nothing, so every `x86_64-windows` object carrying a section name that long was unreadable by the tools the corpus is grounded in while `mach build` reported success. `.rodata.cst` is eleven bytes, so this reached every object with a constant pool.
-
-It went unnoticed because nothing external had ever read a mach COFF object. The corpus's `x86_64-windows` column has no goldens on a linux developer host, which declines the target, and its CI leg had never started (#2948), so the first layer A run on that target is what refused. That is the same shape as the ELFCLASS32-on-Elf64 writer that motivated layer A: a format only its own reader had ever checked. The field is now pinned by byte in a unit test, because two readers disagreeing about padding is precisely what stayed invisible.
-
-#### A float constant typed through an alias says why it does not fold (#2937)
-
-`#2918` made a comptime float carry the IEEE width its payload is at, which means the pre-type passes have to read that width from the annotation spelling. That is exact for a literal `f32` or `f64`, because a primitive wins over scope in type position, and it is not readable when the type arrives through a `def` alias: no type exists yet to read the alias through. Such a binding is therefore skipped rather than bound at f64, which would export a constant that disagrees with the one the program computes.
-
-The skip is right. What was wrong is that it left no trace, so a use of the name at that stage reported `identifier is not a comptime constant in scope` - which is false in both halves. `X` is a comptime constant and it is in scope, and only its width is unreadable this early. A reader acting on that message goes looking for a declaration that is already there and already correct.
-
-The pass that skips is the only place that knows why, so it now records the name and the use site reports the reason. Nothing else changes: the value still folds wherever types are known, a name that was never declared still reports absence, and a later pass that does bind the name reports nothing at all.
-
-Following the alias by name in the loading pass would answer sooner and would be wrong: at that stage nothing says which declaration a spelling denotes, and reading a name-keyed table for the answer is the mistake #2764 documents.
-
-#### A folded cast records the signedness of the type it casts to (#2935)
-
-`int_ct` in the lowering fold built its `CTValue` without setting `int_unsigned`, and a `var` record default-initialises to zero, so every constant produced by a folded cast claimed to be signed - including a cast to `u64`. The field exists to tell a negative value from a magnitude above i64 range, and those two share a bit pattern, so a wrong answer there is unrecoverable by anything downstream. Its two sibling constructors, `make_int_value` and `ct_float`, each set every discriminating field they own.
-
-It changes no output today, and that is stated rather than assumed. `int_ct` is reachable only from `convert_const_scalar`, whose single caller reads the destination type for signedness rather than the field, and every other reader of `int_unsigned` is fed by `comptime.eval`, which does not route through it. Compiling the tree with a compiler built before and after produces byte-identical objects, 225 of them, on x86-64.
-
-The issue this closes was filed describing a different defect: that a comptime integer is not evaluated at its declared width, so `val X: u8 = 200 + 100` errors rather than wrapping. That does not reproduce. The constant wraps at its declared width and agrees with the same computation at run time, including through division and shift, which are the operations where narrowing once at the end would differ from narrowing at each step. The refusals in the comptime evaluator fire at i64 and u64 range, matching the literal-range rejection they were built beside, and a `u8` computation never reaches them.
-
-#### The compiler was silent both times a pass dropped a value and missed a use (#2930, #2931)
-`#2749` was an `i32x4` accumulator on x86-64 that came out holding the multiplier. `#2917` was a conditional float merge on riscv64 that read its register undefined. Both were silent wrong answers, both were found by running a program, and `--verify-ir` exited 0 on both reproducers. The pass mistake behind them is ordinary. Being undetectable was not.
-
-The instruction pool keeps every instruction a pass ever created, detached ones included, so an operand naming a dropped value still resolves and reads as an ordinary use. Only the block lists say what reaches the back end, and nothing measured operands against them. The one check that could have was dominance, which walked block bodies and terminators and never phi lists, and returned early for a phi on top of that, so a phi incoming naming a dropped value was invisible twice over. It also rode the `full` flag, so it ran only in the post-DCE stages.
-
-`VC_DANGLING_OPERAND` now builds the live set once per function from the block lists and scans every live instruction's operands against it. It needs no dominator tree and no reachability, so it is always on and holds at every pipeline stage rather than only some of them. Dominance no longer exempts a phi: an incoming is measured at the END of the predecessor the pair names, which is the point the value has to be live out of for the edge copy to read it.
-
-Phi destruction had the matching hole and is what turned the IR defect into wrong code rather than a build failure. `lower_block_phis` searched a phi's operand pairs for the predecessor edge it was emitting and, finding none, moved on with no copy and no error, while the four other malformed inputs in the same function each fail the build. Out-of-SSA is total, so a merge register that is not defined on every path in is a malformed input rather than a case, and it now errors with the phi's block, the predecessor and the result vreg, since the pass that dropped the incoming is well upstream of MIR lowering.
-
-Both are diagnostic. Object output is byte-identical per target across x86-64, aarch64 and riscv64.
-
 ## [4.18.0] - 2026-08-08
 
 #### A whole `#[uniform]` or `#[storage]` block crosses a call by value (#2922, #2926)
@@ -730,6 +743,22 @@ The four refusals the old grammar carried by name survive, re-keyed to the opera
 **The name grammar is gone in the same change.** `sampler2d` and its relatives no longer exist, `src/lang/type.mach` loses 495 lines and carries a target-neutral `TYPE_HANDLE` whose payload is a constructor tag and opaque operand words it never reads, and `#[spirv_op(set, name)]` is now `#[op(target, set, name)]` with no alias. Carrying the target as a string in the source rather than in the directive's name is what leaves the front and middle ends unaware of anything but the machinery.
 
 A textured shader emits a **byte-identical module** across the migration: the sampled-image fixture built with the old spellings and with the new declarations produces the same 3984 bytes, and `spirv-val --target-env vulkan1.3` accepts both.
+
+#### A refused layout intrinsic now says which position refused it, and why (#2857)
+`a layout intrinsic has no value in this position: it measures a type, which only a type position resolves` was true of every position and is now true of one. A **declaration-scope** `$if` still cannot measure, because it selects which declarations exist and that is decided before any type is laid out, so it says that instead and points at the position that does work. `$offset_of` is named apart, since it is unavailable for a different reason - a field offset is decided at lowering - and a message about type checking would be a stale explanation the moment the resolver exists.
+
+Two limits are filed rather than left implicit: `$length_of` still does not fold in a gate (#2875), and no declaration-scope gate can see a type at all, which is shared with type queries and comparisons (#2876).
+
+#### A target now owns the operations it defines (#2888)
+The compiler knew what a SPIR-V instruction was. `src/lang/spirvop.mach` sat outside the target holding 41 hand-written string comparisons that mapped an instruction name to a number, and the front end read it directly. Adding an instruction meant editing the compiler, so a shader library could not add one at all.
+
+The table now hangs off the ISA vtable and the target fills it. It reaches the front end as data on the comptime context beside `pointer_width`, for the reason stated there: it is a target machine fact the frontend needs, and the frontend has no target. So `fe` names no back end, and unlike before it holds no SPIR-V numbers of its own. `src/lang/spirvop.mach` is gone, and the IR carries the set tag and opcode under target-neutral names.
+
+An instruction's arity is now checked, which nothing did before. The decorator's contract is that operands come from the parameters in order, so a declaration whose parameter list is the wrong length assembled the instruction with the wrong operand count. The family looks uniform and is not: `Reflect` takes two operands where `Refract` takes three, and `FMin` two where `FClamp` takes three.
+
+Emitted output is unchanged. Every machine target is byte-identical, 224 objects each across x86-64, arm64 and riscv64, and the SPIR-V fixtures emit the same bytes.
+
+This is the first piece of #2888. Type constructors, the `#[handle]` and `#[op]` declarations, and the bodyless `def` are not here.
 
 ### Fixed
 
@@ -879,6 +908,27 @@ The pass now decides that a memory access is one by finding the address, not by 
 
 mos6502, the other target that legalizes to a narrower ALU, is unaffected: an `i64` there needs a frame slot and the pass refuses the wide `MIR_ALLOCA` before any access is examined.
 
+#### A shader indexing with a `u32` no longer requires `shaderInt64` (#2878)
+A SPIR-V module whose arithmetic was entirely 32-bit declared `OpCapability Int64`, because every array index was widened to the target's pointer width before it reached the emitter. That is right for a byte-addressed machine, where an index is scaled by the element size and added to a base address and so must fill a machine word. SPIR-V addresses logically: an `OpAccessChain` index selects a member, nothing scales it, and the widening bought nothing.
+
+It cost a device requirement. `shaderInt64` is an optional feature, so a shader that performed no 64-bit arithmetic was refused outright by `vkCreateShaderModule` on hardware without it, and was invalid usage on hardware with it unless the application had enabled the feature. Downstream this was worked around by requesting the feature unconditionally and refusing to start without it, which narrowed the hardware the application ran on.
+
+The index width is now taken from `MachineModel.flat_addressing`, the same axis that already gates float address materialization and aggregate member walks (#2655), so the transformation is gated rather than the target. A genuinely 64-bit index still declares `Int64`, since that is what the program asked for. Every machine target's output is byte-identical.
+
+#### riscv64 images claimed an instruction set they did not have (#2828)
+`.riscv.attributes` carried an arch string taken from a per-ISA constant. A constant describes what mach's encoder emits, and an image is not what its encoder emits - it is that plus every object linked into it. A mach image containing a clang object built for `rv64gc` claimed no compressed extension and none of the z-extensions it actually held, so a disassembler configured from the image decoded its compressed float loads as `<unknown>`. This is the same class of false claim `e_flags` carried before #2813, one section over.
+
+Nothing states a string now. An image's claims are derived from the two facts that decide them - the resolved ABI and the emitted bytes - and a linked image's are merged from its inputs. `BuildAttributes` no longer has an arch field at all, so a constant is not merely unused but inexpressible.
+
+The merge rule is the arch's, because a union is right for the ISA string and wrong for everything else. Stack alignment must agree or the inputs cannot be linked. Unaligned access is a permission, so the image permits it if any input needed it. A privileged-spec disagreement leaves the image unable to state one, so it states none. A tag mach does not model survives only while every input that states it agrees. No shared layer can know which tag takes which rule, so the seam hands the arch the whole attribute body and reads none of it; the ELF layer keeps only the container, which the ARM EABI defines identically.
+
+`obj.rehome_remap` copies the body rather than aliasing it. Rehoming exists precisely because the source allocator is going away, so a field holding a pointer into it needs a copy and not an assignment - the note on that function now separates the two failure modes, since a missed scalar reverts to zero on the parallel path while a missed pointer segfaults somewhere else entirely.
+
+#### Two modules could claim one descriptor set and binding with no diagnostic (#2843)
+Within one module a repeated `(set, binding)` is a typo its author can see. Across modules it is neither: two shared libraries can each declare `#[uniform(0, 0)]` without either author seeing the other, and the shader importing both is where the conflict first exists. `spirv-val` does not catch it, because two variables at one pair are well-formed SPIR-V and the conflict is with the pipeline layout, which is not in the module.
+
+The pair is now checked over the set one entry point reaches, across the descriptor roles rather than within one, since a `#[uniform(0, 0)]` and a `#[storage(0, 0)]` are two descriptor types claiming one slot. The Location overlap check widened the same way, and both diagnostics name the declaring **module** when it is not the one being compiled - a message naming two `camera`s tells the one person who can act on it nothing.
+
 ### Added
 
 #### A declaration-scope `$if` that declares nothing can ask about a type (#2876)
@@ -927,38 +977,6 @@ The measurement is not new and deliberately is not duplicated: the comptime eval
 
 Resolve reaches the position through a mechanism that was already there: `bind_comptime_if` defers a chain it cannot fold yet, binding every arm and leaving arm selection to a later pass, which is what a type comparison has always done. A layout gate joins that list rather than introducing a second rule.
 
-### Changed
-
-#### A refused layout intrinsic now says which position refused it, and why (#2857)
-`a layout intrinsic has no value in this position: it measures a type, which only a type position resolves` was true of every position and is now true of one. A **declaration-scope** `$if` still cannot measure, because it selects which declarations exist and that is decided before any type is laid out, so it says that instead and points at the position that does work. `$offset_of` is named apart, since it is unavailable for a different reason - a field offset is decided at lowering - and a message about type checking would be a stale explanation the moment the resolver exists.
-
-Two limits are filed rather than left implicit: `$length_of` still does not fold in a gate (#2875), and no declaration-scope gate can see a type at all, which is shared with type queries and comparisons (#2876).
-
-### Changed
-
-#### A target now owns the operations it defines (#2888)
-The compiler knew what a SPIR-V instruction was. `src/lang/spirvop.mach` sat outside the target holding 41 hand-written string comparisons that mapped an instruction name to a number, and the front end read it directly. Adding an instruction meant editing the compiler, so a shader library could not add one at all.
-
-The table now hangs off the ISA vtable and the target fills it. It reaches the front end as data on the comptime context beside `pointer_width`, for the reason stated there: it is a target machine fact the frontend needs, and the frontend has no target. So `fe` names no back end, and unlike before it holds no SPIR-V numbers of its own. `src/lang/spirvop.mach` is gone, and the IR carries the set tag and opcode under target-neutral names.
-
-An instruction's arity is now checked, which nothing did before. The decorator's contract is that operands come from the parameters in order, so a declaration whose parameter list is the wrong length assembled the instruction with the wrong operand count. The family looks uniform and is not: `Reflect` takes two operands where `Refract` takes three, and `FMin` two where `FClamp` takes three.
-
-Emitted output is unchanged. Every machine target is byte-identical, 224 objects each across x86-64, arm64 and riscv64, and the SPIR-V fixtures emit the same bytes.
-
-This is the first piece of #2888. Type constructors, the `#[handle]` and `#[op]` declarations, and the bodyless `def` are not here.
-
-### Fixed
-
-#### A shader indexing with a `u32` no longer requires `shaderInt64` (#2878)
-A SPIR-V module whose arithmetic was entirely 32-bit declared `OpCapability Int64`, because every array index was widened to the target's pointer width before it reached the emitter. That is right for a byte-addressed machine, where an index is scaled by the element size and added to a base address and so must fill a machine word. SPIR-V addresses logically: an `OpAccessChain` index selects a member, nothing scales it, and the widening bought nothing.
-
-It cost a device requirement. `shaderInt64` is an optional feature, so a shader that performed no 64-bit arithmetic was refused outright by `vkCreateShaderModule` on hardware without it, and was invalid usage on hardware with it unless the application had enabled the feature. Downstream this was worked around by requesting the feature unconditionally and refusing to start without it, which narrowed the hardware the application ran on.
-
-The index width is now taken from `MachineModel.flat_addressing`, the same axis that already gates float address materialization and aggregate member walks (#2655), so the transformation is gated rather than the target. A genuinely 64-bit index still declares `Int64`, since that is what the program asked for. Every machine target's output is byte-identical.
-
-
-### Added
-
 #### RV32 is a target (#2778)
 mach compiles for 32-bit RISC-V. `isa = "riscv32"` with `abi = "ilp32"`, `"ilp32f"` or `"ilp32d"` resolves a full machine description, and `$mach.arch.riscv32` and the three `$mach.abi.ilp32*` tags exist so a body can be guarded for it.
 
@@ -976,24 +994,8 @@ The cause was that `Emit.root` was the module being compiled and every global re
 A drawn-in module contributes globals by **reachability, not membership**, the rule the function table already stated. A shared module may declare a whole descriptor set, and a shader importing it for one helper does not inherit the rest. The root is exempt: its interface list is the module's pipeline contract, declared whole. Existing single-module shaders emit byte-identical modules.
 
 The driver half closes the module set over cross-module **global** references, not only function ones. A shader that reads a shared module's uniform and calls nothing in it must still draw that module in, and before this it could not resolve the variable at all.
-
-### Fixed
-
-#### riscv64 images claimed an instruction set they did not have (#2828)
-`.riscv.attributes` carried an arch string taken from a per-ISA constant. A constant describes what mach's encoder emits, and an image is not what its encoder emits - it is that plus every object linked into it. A mach image containing a clang object built for `rv64gc` claimed no compressed extension and none of the z-extensions it actually held, so a disassembler configured from the image decoded its compressed float loads as `<unknown>`. This is the same class of false claim `e_flags` carried before #2813, one section over.
-
-Nothing states a string now. An image's claims are derived from the two facts that decide them - the resolved ABI and the emitted bytes - and a linked image's are merged from its inputs. `BuildAttributes` no longer has an arch field at all, so a constant is not merely unused but inexpressible.
-
-The merge rule is the arch's, because a union is right for the ISA string and wrong for everything else. Stack alignment must agree or the inputs cannot be linked. Unaligned access is a permission, so the image permits it if any input needed it. A privileged-spec disagreement leaves the image unable to state one, so it states none. A tag mach does not model survives only while every input that states it agrees. No shared layer can know which tag takes which rule, so the seam hands the arch the whole attribute body and reads none of it; the ELF layer keeps only the container, which the ARM EABI defines identically.
-
-`obj.rehome_remap` copies the body rather than aliasing it. Rehoming exists precisely because the source allocator is going away, so a field holding a pointer into it needs a copy and not an assignment - the note on that function now separates the two failure modes, since a missed scalar reverts to zero on the parallel path while a missed pointer segfaults somewhere else entirely.
-
-#### Two modules could claim one descriptor set and binding with no diagnostic (#2843)
-Within one module a repeated `(set, binding)` is a typo its author can see. Across modules it is neither: two shared libraries can each declare `#[uniform(0, 0)]` without either author seeing the other, and the shader importing both is where the conflict first exists. `spirv-val` does not catch it, because two variables at one pair are well-formed SPIR-V and the conflict is with the pipeline layout, which is not in the module.
-
-The pair is now checked over the set one entry point reaches, across the descriptor roles rather than within one, since a `#[uniform(0, 0)]` and a `#[storage(0, 0)]` are two descriptor types claiming one slot. The Location overlap check widened the same way, and both diagnostics name the declaring **module** when it is not the one being compiled - a message naming two `camera`s tells the one person who can act on it nothing.
-
 ## [4.17.0] - 2026-08-08
+
 
 ### Fixed
 
@@ -1182,6 +1184,114 @@ The static writer mapped the ELF header and program-header table **at** `segs[0]
 
 The two paths computed one fact in two places and agreed only by accident. The header-segment base is now a single definition all three writers call, and `header_fits_reserved_page` guards the static path too - it never needed the guard before only because it had no reserved page to overrun. The regression test asserts the general property that **no two load segments overlap in virtual address**, over the emitted headers rather than about one specific pair, so it fails closed for whatever the next segment-layout change does.
 
+#### A scalar `f32` passed in an integer register read back as `NaN` on riscv64 (#2777)
+
+`capture_slot_reg` took the move width for a value captured out of an incoming argument or return register from the machine word rather than from the value, so an `f32` arriving in `a0` was reinterpreted with `fmv.d.x` (a raw 64-bit move) instead of `fmv.w.x`. RISC-V requires a single-precision value in an `f` register to be NaN-boxed, and the raw move does not box, so every subsequent `fmul.s`/`fadd.s` on it produced `NaN`. The placement side already took its width from the value, so the two directions were asymmetric — which is why `f64` in an integer register was correct (its width happened to equal the machine word) and `f32` in an `fa` register was correct (it never took the integer path).
+
+Only reachable once a soft-float member existed, so it was latent rather than a regression. It is the first defect found by the width-versus-register-width split that #2778 exists to stress.
+
+#### A release build now carries a real ELF `.symtab`, so `perf` and a crash reporter can resolve a function name without a `-g` rebuild (#2772)
+Mach emitted no `.symtab` in any build, release or `-g`: `nm` reported nothing, `perf` could not symbolize a profile, and a crash address from a shipped binary mapped to a function only by rebuilding with `-g` and doing a DWARF lookup against the exact matching build - two ordinary workflows a shipping game needs, neither possible before this.
+
+A static ELF executable (`emit_exec`) now carries `.symtab` + `.strtab` with every defined function's mangled name, final virtual address, and byte size, collected by `build_symtab_entries` from the same merged-symbol data `build_exec_functions` already reads for PE unwind tables, and serialized by `elf.build_symtab_bytes`. Function symbols only, not globals: functions cover profiling and crash triage, and a data symbol table costs more file size for less of either. Sizes are real, not zero-filled - `nm` alone cannot see a `st_size` gap, but a profiler attributing an address *inside* a hot loop can, so this repo's own `int/surface/symtab` case asserts a mid-function address resolves correctly, not just a function's entry point.
+
+Trails every `PT_LOAD` segment exactly like `int/surface/debuginfo`'s DWARF sections already do (`readelf -SW`/`-lW` confirm `.symtab`'s file offset never precedes a loaded segment's end), so a release image's runtime bytes are unchanged - the loader ignores non-allocated sections and a release build stays byte-for-byte the same program, just no longer anonymous to a debugger or profiler reading its container. This is a real, measured trade against the previous byte-identical *header-less* release image, though: a build that carried no section-header table at all now carries one whenever it carries a symbol table (which is every static build now), and the compiler's own release binary - a large, real program with 8,408 function symbols - grew by about 611 KiB (7.3%) for it. `perf record`/`perf report` on a release build built with this change resolves `[.] main` by name where it previously showed a raw address; `addr2line -f` on an address in the middle of a function's body (not just its entry) resolves to that function, proving `st_size` is correct and not merely present.
+
+Scoped to ELF's plain static executable writer (`emit_exec`) for now: a PIE/dynamically-linked executable (`emit_dyn_exec`) and a shared library (`emit_shared`) do not carry a symbol table yet, and neither does Mach-O (`LC_SYMTAB`) or PE/COFF (its own, mostly-obsolete-under-PDB symbol table) - both accept the same `of.SymtabEntry` channel for `of.ExecFn` conformance and ignore it. `of.SymtabEntry` (name, final vaddr, byte size, STB_LOCAL/STB_GLOBAL linkage) is the format-neutral shape a future writer for either reads from, so extending coverage is wiring a serializer, not redesigning the data.
+
+#### `--emit-asm` names the symbol an inline-asm statement actually references, instead of a different real one (#2788)
+On x86-64, `--emit-asm` rendered every symbol operand inside an `asm` block wrongly. A memory operand naming a symbol printed a **different, real symbol from the same module** - `[rip + _rt_argc]` came out as `[rip + dbggdbcase]` - and a direct `call symbol` printed a bare `call` with nothing after it. The emitted object was correct in both cases; only the printed text was wrong.
+
+That matters more than it looks, and it cost real investigation time. `--emit-asm` is what someone reaches for when debugging inline asm, which is exactly the code where falling back on reading the source and assuming the obvious is not available. A bare `call` is at least visibly broken; a plausible wrong symbol name gives a reader no signal at all that the output is untrustworthy - an agent chasing an inlining defect followed the printed operand and had to discover independently that the text disagreed with the object.
+
+The cause was one missing thread, in two places. The inline-asm path interned the referenced symbol's name only at *relocation* time, after the instruction had already been built and encoded, so the `isa.Inst` the printer renders from carried no symbol at all: a rip-relative operand went out with `sym_id` 0 (which resolves to a real interned string, hence a real symbol name), and the direct-transfer form was built with no operand whatsoever. The name is now interned once, before the instruction is built, and the same `StrId` reaches both the Inst the printer renders and the relocation the linker reads - so the printed name and the relocated name cannot be two different strings. Naming the direct transfer's target costs no bytes, because `encode_call` / `encode_jmp` write a placeholder rel32 on the direct arm regardless, and it makes the inline-asm `call sym` exactly the `isa.Inst` the compiler-selected one already built - which is why *that* one always printed its target.
+
+aarch64 and riscv64 were already correct; both already threaded the interned id into the printer notification. That is precisely why the new `int/surface/asm-symbol-operands` case covers all three ELF legs rather than the one that was broken: the printers are separate per ISA, so a fix in one says nothing about the others, and the two that were right now have that pinned. The case pairs the symbol names the assembly text prints with the ones the object's relocations name, in file order, so a printer that regresses to naming a *different real symbol* fails it, not merely one that names nothing - and it runs the program too, since a reference that reached the wrong symbol would be a wrong answer as well as wrong text. Objects are byte-identical across the fix, checked directly.
+
+Two existing unit tests asserted the built instruction had **no** operand for `call main` / `jmp main`. Those pinned the defect, and are now the assertions that it names its target.
+
+#### A C `[step]` cross-builds for its leg instead of silently assuming the host toolchain targets it (#2741)
+`int/surface/narrow-stack-args` and `int/surface/c-variadic` shelled out to the bare host `cc` to build a probe object, which happens to target the leg on every CI runner (each builds natively) but not on a developer cross-building locally - `mach --target linux-arm64` on an x86-64 host still ran the host's x86-64 `cc`, silently linking an x86-64 object into an aarch64 image. That surfaced as `error: relocation 'plt32' to 'float_tail' overflows` on narrow-stack-args and a qemu `Illegal instruction` on c-variadic, neither of which names its actual cause.
+
+Both cases now build their probe object through `int/lib/cc.sh`, a general contract for any case with a C `[step]`: it uses the host's own `cc` when the host already targets the leg (preserving the point of these cases, which is to catch a *real* toolchain's ABI diverging from mach's model of it - Apple arm64's stack-argument rule, for one), and falls back to `clang -target <triple> -c` otherwise, since mach does the link itself and a cross-compiled object needs no sysroot or cross-linker to satisfy it. A leg cc.sh has no route for (no host match, and clang is missing) fails the step loudly, naming what's missing, rather than surfacing downstream as an opaque link error.
+
+This also lets both cases build for `linux-riscv64` for the first time, previously exempted only because the host-`cc` gap made it impossible; narrow-stack-args passes there cleanly. c-variadic's riscv64 leg stays exempted, but now for a real reason instead of a stale one: every variadic float/double argument comes back as `0`, a genuine mach ABI bug in riscv64's variadic lowering that this cross-build gap had been hiding coverage of (#2771).
+
+`int/run.sh` also now prints a `SKIP <case> [<target>] (exempt, see case.conf)` line for a case's `exempt:` legs, which previously left no trace in the run's output at all - a leg a case never applies to and a leg it was silently excluded from looked identical.
+
+`m`, the bootstrap output `mach build . -o m` (CONTRIBUTING.md's own instruction) produces, is now gitignored.
+
+#### A whole-variable load from a shader interface variable is typed by the variable (#2794)
+The SPIR-V emitter typed a loaded value from the move's byte width and register class rather than from the object it read. That agrees with the variable's own type for every shape that has a width, which is why it went unnoticed; it cannot express one that does not, and an opaque image handle has no width at all. Inferring one gave a sampled-image load an integer result type - an `OpLoad %ulong` from a sampled-image variable, which a validator rejects and the compiler was happy to write. The store side had always read the variable's type; the load side now does too.
+
+#### A comptime identifier names the declaration it resolves to, not the spelling (#2764)
+The comptime environment is keyed by **name**, and `comptime.eval_ident` looked a bare identifier up in it directly. Resolution identity was never consulted, so a binding was matched by what it is called rather than by which declaration it is. A block-local `val N` shadowing a module-level `val N = 9` therefore read back the **module** constant: `var xs: [N]i64;` under a runtime local `N` compiled as `[9]i64`, and the out-of-bounds diagnostic it later raised named a length the source never wrote.
+
+The evaluator now decides each identifier on the symbol the resolver bound to it. Every pass that owns a name-resolution map installs the same hook, and all of them answer from **one** function, `resolve.symbol_is_runtime`.
+
+That collapses the two rules that existed to compensate for the old reading. `resolve.check_gate_shadowing` is **removed**: it caught a case the evaluator would otherwise get wrong, and there is no such case left to catch. The constant index bound (#2751) no longer walks its operand for runtime leaves before folding, because the fold now fails on them by itself. `sema`'s `$if` gate walk keeps its per-kind diagnostics — a reader needs to hear "parameter" for a parameter and "value" for a binding — but delegates the decision.
+
+Consolidating them surfaced a disagreement the copies had been hiding. An `$each` loop variable is a **comptime** binding that resolve declares as a `SYM_VAL` bearing the comptime flag, and a rule keyed only on module scope classified it as runtime. The constant index bound consequently declined to decide any index driven by one, so `xs[e]` over an element out of range compiled clean and read past the array. It is now refused. `$` marks a comptime binding whatever its kind, and the rule says so once.
+
+A comptime binding that shadows a module constant still resolves innermost-first, which is the half of this that had to be preserved rather than changed: a `$param` or an `$each` variable named after a module constant denotes the inner one.
+
+#### A `#[uniform(...)]` block's offsets are checked against the SPIR-V layout rules (#2746)
+A descriptor block's member offsets were emitted straight from mach's own record layout, and exactly one of the rules Vulkan imposes on that layout was checked. A block whose members disagreed emitted a module a consumer rejects, with no diagnostic — a `rec` inside a block followed by a scalar produced **overlapping members**, and a `rec` inside a block is the natural way to write a camera or a material.
+
+std140 gives a struct member a base alignment of 16 and rounds its extent up to a multiple of 16; mach aligns a record to its largest member and does not round. A vector narrower than the vector register aligns to one lane in mach, where both std140 and std430 align it to two or four, so an `f32x2` or an `f32x3` member was a reachable disagreement in the **storage** posture too, which had been thought correct by construction.
+
+Every emitted offset is now held to the two conditions the specification states — a multiple of the member's base alignment, and past the end of the member before it — and an array stride to the element's extent rounded up to the array's base alignment. The two postures differ only in the 16-byte roundings std140 applies to an array and to a struct.
+
+A disagreement is **refused, never repacked**, which is the posture the one existing check already took and the reason it gave is the one that matters: the block's layout is the host's contract, and repacking would move the members out from under a host writing by `$offset_of`. The refusal names the member, the offset mach gives it, the offset the rules require, and which of the two conditions failed.
+
+#### A fragment stage's integer or 64-bit input carries its `Flat` decoration (#2747)
+Vulkan requires `Flat` on any fragment-stage `Input` of integer or 64-bit float type, because such a value cannot be interpolated. The emitter declared no `Flat` decoration at all, so every one of those was an invalid module. The decoration is now decided over the set of variables each stage can **reach**, which the per-stage reachability pass already computes.
+
+Vulkan also **forbids** `Flat` on a vertex-stage `Input`, so one module-scope variable read by both a vertex stage and a fragment stage has no valid decoration and is refused rather than decorated for one of them. The two readings are not the same value anyway: a vertex stage's input is a vertex attribute and a fragment stage's is the interpolated output of the stage before it.
+
+A `Location` was emitted verbatim and never checked. mach knows each variable's type and so knows how many locations it consumes, and two whose spans overlap within one stage are now refused naming both, rather than surfacing as a validator message naming an `OpEntryPoint` operand index.
+
+#### Recursion and a 15-parameter signature are refused rather than emitted (#2748)
+There was no whole-module well-formedness stage, so a rule about the module — its call graph, its id validity — had nowhere to live, and two reachable from ordinary source emitted invalid modules silently.
+
+A SPIR-V execution model has no call stack, so a cycle in the static call graph is refused before any body is emitted, naming the chain and saying why. This is checked rather than left to `spirv-val`, whose cycle rule is scoped to entry points: a **library** module carrying a cycle validated clean and would have failed in whatever consumer linked it into a pipeline. One had been sitting green in the integration suite.
+
+The parameter limit was two independent literals that disagreed: `emit_function` refused above 16 while `type_fn`'s fixed operand buffer failed above 14 and returned a 0 nobody read, which reached `OpFunction` as the reserved never-valid id. The limit is now stated once as `types.MAX_FN_PARAMS`, both sites read it, 15 and 16 parameters build and validate, and a 0 from `type_fn` is reported instead of passed on.
+
+#### A dead local's stale value survives past its real live range at opt0, and a `ret` statement's line-table row duplicates at function entry (#2779)
+Two opt0-only debug-info defects `int/surface/debugger-gdb` (#2756) caught by driving a real `gdb` session, neither visible to structural DWARF validation because both artifacts are internally consistent, well-formed DWARF that simply describes the wrong thing.
+
+**A variable's `DW_AT_location` was scoped to its lexical extent, not its true live range.** The opt0 allocator reusing a genuinely-dead local's storage is correct codegen (confirmed by checking the runtime value with no debugger involved), but the DWARF location for that local was never bounded to end where the reuse happens, so a debugger stopped after that point read the new occupant's value as though it were still the old variable's. Root cause: `gather_vars` built a variable's location ranges from its own bindings only, so a variable bound once and never rebound kept a stationary location valid to the function's end regardless of what physically happened to its storage afterward. `bound_storage_reuse` now truncates a range to the point some OTHER variable's binding, in the SAME inline site, claims the identical physical home - a stationary home a debugger could no longer trust past that point now reports unavailable instead. Scoping the search to the same inline site is load-bearing, not an optimization: at opt2 with heavy inlining, two variables in unrelated inline instances can land in the same register with no real relationship, and comparing across sites produced exactly that false positive while building this fix's own regression coverage.
+
+**A `ret <expr>;` statement's line-table row was duplicated at the function's own entry address.** `lower_phis` (out-of-SSA phi elimination) runs once, after every block in the function has already been lowered, and stamped its synthesized merge-copy instructions from `ctx.cur_loc` - a cursor left stale at the function's LAST lowered statement by the time phi elimination ran, for every predecessor block's edge regardless of where in the function that predecessor actually was. `break file:22` on a function whose `ret` genuinely lives at line 22 could silently resolve to its entry instead, with no ambiguity warning, reading whatever was left in an uninitialized register. Fixed by stamping from the predecessor block's own terminator location instead, which was already correct when that block was lowered and never went stale.
+
+`int/surface/debugger-gdb` gained two debug-profile-only probes proving both fixes together, asserted as a pair per each bug's own shape: a variable that genuinely dies mid-function now reports unavailable, while a sibling that stays live keeps reading its real value (a fix that reported "unavailable" for both would pass either probe alone); a second breakpoint on a real `ret` statement resolves to its own address and reads the correct value rather than silently landing at the wrong one. Both bugs are specific to opt0's own location and line-table construction and do not reproduce at opt2, so the case's golden is now per-profile (`expect.debug.txt` / `expect.release.txt`) rather than the one `expect.txt` every other `gdb-session` case still uses.
+
+#### A loop-carried vector accumulator through an unpacked operator came out holding the wrong value (#2749)
+The gap expansion (#2726) replaces a vector operator the target has no packed form for with per-lane scalar work and an assembled vector, then points that operator's uses at the assembled value. It rewrote those uses one block at a time, immediately after expanding that block's body. That is correct for every use that follows its definition, and wrong for the one that does not: a loop header's phi names the value the **latch** defines, so its back-edge operand is a forward reference no block order removes.
+
+The phi kept naming the deleted operator. MIR lowering turned the phi edge into a copy from a virtual register nothing defines, and the accumulator came out holding whatever that register happened to be. Measured on x86-64, a loop-carried `i32x4 * i32x4` returned the **multiplier** where the product belonged. aarch64 was right throughout for a reason unrelated to the defect - NEON has `MUL.4s`, so nothing expands there at all - which is why an entire suite of straight-line vector cases passed on every leg while this was live. The lane-access expansion had the identical defect one pass over.
+
+Substitution is now a whole-function step in both passes, after every block has been expanded, because the ordering it needs does not exist.
+
+#### A float or integer memory access refuses a width the target has no form for (#2766)
+A memory access takes a byte width and picks a machine form from it. On aarch64 and riscv64 that pick was a boolean selector with a trailing default, so a width the target has no form for silently got some other form's bytes rather than a diagnostic, the same shape #2733 removed from the float move, negate, arithmetic, compare and conversion encoders, one family over.
+
+riscv64's `fp_mem_funct3` answered 4 with `flw`/`fsw` and **everything else** with `fld`/`fsd`. RV64D has exactly those two float access forms and no vector extension is enabled, so a 16-byte float access had nothing to encode to at all, and it encoded to `fld`, moving eight bytes and losing the other eight. aarch64's `emit_fp_mem` handled 16 in its own arm and then fell through to `use_d = width == 8`, so a 32-byte access took the **S** form and moved four bytes of a slot the surrounding code had already sized at 32.
+
+The fix is a contract change on the access family, not a check at today's callers. The defaulting helpers were shared with the **integer** path, aarch64's `ldst_lo12_kind`, `width_shift` and the three `ldst_base_*` base-word tables were five parallel ladders that each named the narrow widths and each ended in the doubleword row, so validating only the float arms would have left the identical shape live next door under a different name. Each family now comes off **one** form table: aarch64's `int_access` / `fp_access` return a row carrying all three addressing-mode base words, the imm12 shift and the `:lo12:` relocation kind together, and riscv64's `int_mem_funct3` / `fp_mem_funct3` return the funct3 or an error. A width with no row is refused. `emit_mem_access`, `emit_fp_mem` and `mem_access_needs_no_scratch` report rather than emit, and the Q arm that used to sit ahead of the aarch64 default is now the same three lines as S and D, because the difference between them was only ever the row.
+
+The census found the same defect on **x86-64**, which the issue did not name: `emit_float_load`, `emit_float_reg_or_slot_load`, `emit_float_store` and `float_const_operand` each read `mov_op = MOVSD; if (w == 4) { mov_op = MOVSS; }`, so every width other than 4 took the eight-byte MOVSD. It was inert only because `encode_fp_mov` returns its vector arm above them. Nothing in the helpers said so, and `emit_float_load` is reached separately by the arithmetic and seed paths. aarch64's `emit_fp_const` carried the same `use64 = width == 8`.
+
+Every refusal is **driven from a unit test** with a width it must refuse, and the assertion is that the output buffer stayed **empty**, not merely that an error was returned. That distinction is load-bearing here: both `emit_mem_access` implementations materialize an out-of-range offset into the scratch register before the access word, and a folded global emits its `adrp` / `auipc` high half before the low one, so a check placed at the emission point rather than at the top would leave stranded instructions behind the error. Every legitimate width still encodes byte-exactly against `llvm-mc`, including aarch64's Q form at 16 and the sub-word integer forms at 1 and 2 that share the same helpers.
+
+#### An inline-asm operand longer than a register-name scratch buffer is no longer reported as malformed (#2789)
+Each ISA's inline-asm operand parser copied the operand token into a fixed stack buffer before deciding what kind of operand it was, and reported a **well-formed** operand as malformed when the copy did not fit — `[64]u8` on aarch64 and riscv64, `[128]u8` on x86-64. The copy's only consumer was the register-name lookup on the next line; every other branch (a relocation modifier, an address, an immediate, a bare symbol) already read the source region directly and never touched it. Register names are three or four characters; a mangled symbol is not, and dotted mangling's own measured longest symbol (105 bytes) already exceeds the aarch64/riscv64 buffer today.
+
+The buffer is gone, not enlarged: `asm_reg_index` (riscv64), `a64_reg` (aarch64), and `x64_reg` (x86-64) each now compare the register-name table in place against the source region, mirroring the in-place symbol check (`iasm.is_sym_region`) already sitting one branch below them. x86-64's `[symbol]` memory-operand parser had a second, narrower instance of the same shape one layer down: its no-star bracket-content parser copied into a `[32]u8` meant for a base register, and a bare rip-relative symbol reference (`[rip + <symbol>]`, #2788's own repro shape) passed through the same copy, because x86-64's grammar makes a base register and a bare symbol genuinely ambiguous at that position until one or the other is ruled out. Fixed the same way. aarch64 and riscv64 were checked and do not have this second problem: `off(base)` and `[Xn, ...]` both require a register in the base position syntactically, and a bare symbol reaches a structurally different form (`:mod:sym`) that never touches a register buffer.
+
+Verified per ISA with a symbol well past every old limit: it encodes, and encodes **byte-identically** to a short-named operand (instruction bytes never depend on a symbol's name, only its relocation does), with the relocation itself carrying the full, untruncated name. A genuinely malformed operand still refuses, checked alongside the long-operand case so the two cannot be confused.
+
 ### Added
 
 #### `int/observability.md`: what a behavioural golden can never observe, and which surface can (#2822)
@@ -1303,22 +1413,6 @@ Manifests spelling `abi = "lp64"` for riscv64 keep building, but now select **so
 
 C-variadic calls are **refused on every RISC-V member** rather than placed. The psABI's unnamed-argument rule differs per member (a tail `double` takes `a0` under lp64d where a named one takes `fa0`, and the soft-float members differ again), so implementing it would multiply the family's descriptions rather than add to them, for a call form with no user in mach or mach-std. `RiscvAbi.variadic_float_bits` is declared and carries a sentinel so the rule can be filled in later alongside the others; a refusal is exact and cheap to replace, a wrong placement rule is neither. mach's own `va: ...` parameter pack is a different mechanism, expands at compile time, and is unaffected.
 
-### Fixed
-
-#### A scalar `f32` passed in an integer register read back as `NaN` on riscv64 (#2777)
-
-`capture_slot_reg` took the move width for a value captured out of an incoming argument or return register from the machine word rather than from the value, so an `f32` arriving in `a0` was reinterpreted with `fmv.d.x` (a raw 64-bit move) instead of `fmv.w.x`. RISC-V requires a single-precision value in an `f` register to be NaN-boxed, and the raw move does not box, so every subsequent `fmul.s`/`fadd.s` on it produced `NaN`. The placement side already took its width from the value, so the two directions were asymmetric — which is why `f64` in an integer register was correct (its width happened to equal the machine word) and `f32` in an `fa` register was correct (it never took the integer path).
-
-Only reachable once a soft-float member existed, so it was latent rather than a regression. It is the first defect found by the width-versus-register-width split that #2778 exists to stress.
-
-#### A release build now carries a real ELF `.symtab`, so `perf` and a crash reporter can resolve a function name without a `-g` rebuild (#2772)
-Mach emitted no `.symtab` in any build, release or `-g`: `nm` reported nothing, `perf` could not symbolize a profile, and a crash address from a shipped binary mapped to a function only by rebuilding with `-g` and doing a DWARF lookup against the exact matching build - two ordinary workflows a shipping game needs, neither possible before this.
-
-A static ELF executable (`emit_exec`) now carries `.symtab` + `.strtab` with every defined function's mangled name, final virtual address, and byte size, collected by `build_symtab_entries` from the same merged-symbol data `build_exec_functions` already reads for PE unwind tables, and serialized by `elf.build_symtab_bytes`. Function symbols only, not globals: functions cover profiling and crash triage, and a data symbol table costs more file size for less of either. Sizes are real, not zero-filled - `nm` alone cannot see a `st_size` gap, but a profiler attributing an address *inside* a hot loop can, so this repo's own `int/surface/symtab` case asserts a mid-function address resolves correctly, not just a function's entry point.
-
-Trails every `PT_LOAD` segment exactly like `int/surface/debuginfo`'s DWARF sections already do (`readelf -SW`/`-lW` confirm `.symtab`'s file offset never precedes a loaded segment's end), so a release image's runtime bytes are unchanged - the loader ignores non-allocated sections and a release build stays byte-for-byte the same program, just no longer anonymous to a debugger or profiler reading its container. This is a real, measured trade against the previous byte-identical *header-less* release image, though: a build that carried no section-header table at all now carries one whenever it carries a symbol table (which is every static build now), and the compiler's own release binary - a large, real program with 8,408 function symbols - grew by about 611 KiB (7.3%) for it. `perf record`/`perf report` on a release build built with this change resolves `[.] main` by name where it previously showed a raw address; `addr2line -f` on an address in the middle of a function's body (not just its entry) resolves to that function, proving `st_size` is correct and not merely present.
-
-Scoped to ELF's plain static executable writer (`emit_exec`) for now: a PIE/dynamically-linked executable (`emit_dyn_exec`) and a shared library (`emit_shared`) do not carry a symbol table yet, and neither does Mach-O (`LC_SYMTAB`) or PE/COFF (its own, mostly-obsolete-under-PDB symbol table) - both accept the same `of.SymtabEntry` channel for `of.ExecFn` conformance and ignore it. `of.SymtabEntry` (name, final vaddr, byte size, STB_LOCAL/STB_GLOBAL linkage) is the format-neutral shape a future writer for either reads from, so extending coverage is wiring a serializer, not redesigning the data.
 ### Changed
 
 #### BREAKING: linkage names are dotted and readable
@@ -1359,103 +1453,6 @@ Nothing downstream needed teaching: `lower_stmt_list` already stops at a termina
 
 **This is not the fix for the gdb abort that led here.** That was an overlapping-`PT_LOAD` defect in mach's own ELF writer (#2795), unrelated to control flow.
 
-
-### Fixed
-
-#### `--emit-asm` names the symbol an inline-asm statement actually references, instead of a different real one (#2788)
-On x86-64, `--emit-asm` rendered every symbol operand inside an `asm` block wrongly. A memory operand naming a symbol printed a **different, real symbol from the same module** - `[rip + _rt_argc]` came out as `[rip + dbggdbcase]` - and a direct `call symbol` printed a bare `call` with nothing after it. The emitted object was correct in both cases; only the printed text was wrong.
-
-That matters more than it looks, and it cost real investigation time. `--emit-asm` is what someone reaches for when debugging inline asm, which is exactly the code where falling back on reading the source and assuming the obvious is not available. A bare `call` is at least visibly broken; a plausible wrong symbol name gives a reader no signal at all that the output is untrustworthy - an agent chasing an inlining defect followed the printed operand and had to discover independently that the text disagreed with the object.
-
-The cause was one missing thread, in two places. The inline-asm path interned the referenced symbol's name only at *relocation* time, after the instruction had already been built and encoded, so the `isa.Inst` the printer renders from carried no symbol at all: a rip-relative operand went out with `sym_id` 0 (which resolves to a real interned string, hence a real symbol name), and the direct-transfer form was built with no operand whatsoever. The name is now interned once, before the instruction is built, and the same `StrId` reaches both the Inst the printer renders and the relocation the linker reads - so the printed name and the relocated name cannot be two different strings. Naming the direct transfer's target costs no bytes, because `encode_call` / `encode_jmp` write a placeholder rel32 on the direct arm regardless, and it makes the inline-asm `call sym` exactly the `isa.Inst` the compiler-selected one already built - which is why *that* one always printed its target.
-
-aarch64 and riscv64 were already correct; both already threaded the interned id into the printer notification. That is precisely why the new `int/surface/asm-symbol-operands` case covers all three ELF legs rather than the one that was broken: the printers are separate per ISA, so a fix in one says nothing about the others, and the two that were right now have that pinned. The case pairs the symbol names the assembly text prints with the ones the object's relocations name, in file order, so a printer that regresses to naming a *different real symbol* fails it, not merely one that names nothing - and it runs the program too, since a reference that reached the wrong symbol would be a wrong answer as well as wrong text. Objects are byte-identical across the fix, checked directly.
-
-Two existing unit tests asserted the built instruction had **no** operand for `call main` / `jmp main`. Those pinned the defect, and are now the assertions that it names its target.
-
-#### A C `[step]` cross-builds for its leg instead of silently assuming the host toolchain targets it (#2741)
-`int/surface/narrow-stack-args` and `int/surface/c-variadic` shelled out to the bare host `cc` to build a probe object, which happens to target the leg on every CI runner (each builds natively) but not on a developer cross-building locally - `mach --target linux-arm64` on an x86-64 host still ran the host's x86-64 `cc`, silently linking an x86-64 object into an aarch64 image. That surfaced as `error: relocation 'plt32' to 'float_tail' overflows` on narrow-stack-args and a qemu `Illegal instruction` on c-variadic, neither of which names its actual cause.
-
-Both cases now build their probe object through `int/lib/cc.sh`, a general contract for any case with a C `[step]`: it uses the host's own `cc` when the host already targets the leg (preserving the point of these cases, which is to catch a *real* toolchain's ABI diverging from mach's model of it - Apple arm64's stack-argument rule, for one), and falls back to `clang -target <triple> -c` otherwise, since mach does the link itself and a cross-compiled object needs no sysroot or cross-linker to satisfy it. A leg cc.sh has no route for (no host match, and clang is missing) fails the step loudly, naming what's missing, rather than surfacing downstream as an opaque link error.
-
-This also lets both cases build for `linux-riscv64` for the first time, previously exempted only because the host-`cc` gap made it impossible; narrow-stack-args passes there cleanly. c-variadic's riscv64 leg stays exempted, but now for a real reason instead of a stale one: every variadic float/double argument comes back as `0`, a genuine mach ABI bug in riscv64's variadic lowering that this cross-build gap had been hiding coverage of (#2771).
-
-`int/run.sh` also now prints a `SKIP <case> [<target>] (exempt, see case.conf)` line for a case's `exempt:` legs, which previously left no trace in the run's output at all - a leg a case never applies to and a leg it was silently excluded from looked identical.
-
-`m`, the bootstrap output `mach build . -o m` (CONTRIBUTING.md's own instruction) produces, is now gitignored.
-
-#### A whole-variable load from a shader interface variable is typed by the variable (#2794)
-The SPIR-V emitter typed a loaded value from the move's byte width and register class rather than from the object it read. That agrees with the variable's own type for every shape that has a width, which is why it went unnoticed; it cannot express one that does not, and an opaque image handle has no width at all. Inferring one gave a sampled-image load an integer result type - an `OpLoad %ulong` from a sampled-image variable, which a validator rejects and the compiler was happy to write. The store side had always read the variable's type; the load side now does too.
-
-#### A comptime identifier names the declaration it resolves to, not the spelling (#2764)
-The comptime environment is keyed by **name**, and `comptime.eval_ident` looked a bare identifier up in it directly. Resolution identity was never consulted, so a binding was matched by what it is called rather than by which declaration it is. A block-local `val N` shadowing a module-level `val N = 9` therefore read back the **module** constant: `var xs: [N]i64;` under a runtime local `N` compiled as `[9]i64`, and the out-of-bounds diagnostic it later raised named a length the source never wrote.
-
-The evaluator now decides each identifier on the symbol the resolver bound to it. Every pass that owns a name-resolution map installs the same hook, and all of them answer from **one** function, `resolve.symbol_is_runtime`.
-
-That collapses the two rules that existed to compensate for the old reading. `resolve.check_gate_shadowing` is **removed**: it caught a case the evaluator would otherwise get wrong, and there is no such case left to catch. The constant index bound (#2751) no longer walks its operand for runtime leaves before folding, because the fold now fails on them by itself. `sema`'s `$if` gate walk keeps its per-kind diagnostics — a reader needs to hear "parameter" for a parameter and "value" for a binding — but delegates the decision.
-
-Consolidating them surfaced a disagreement the copies had been hiding. An `$each` loop variable is a **comptime** binding that resolve declares as a `SYM_VAL` bearing the comptime flag, and a rule keyed only on module scope classified it as runtime. The constant index bound consequently declined to decide any index driven by one, so `xs[e]` over an element out of range compiled clean and read past the array. It is now refused. `$` marks a comptime binding whatever its kind, and the rule says so once.
-
-A comptime binding that shadows a module constant still resolves innermost-first, which is the half of this that had to be preserved rather than changed: a `$param` or an `$each` variable named after a module constant denotes the inner one.
-
-#### A `#[uniform(...)]` block's offsets are checked against the SPIR-V layout rules (#2746)
-A descriptor block's member offsets were emitted straight from mach's own record layout, and exactly one of the rules Vulkan imposes on that layout was checked. A block whose members disagreed emitted a module a consumer rejects, with no diagnostic — a `rec` inside a block followed by a scalar produced **overlapping members**, and a `rec` inside a block is the natural way to write a camera or a material.
-
-std140 gives a struct member a base alignment of 16 and rounds its extent up to a multiple of 16; mach aligns a record to its largest member and does not round. A vector narrower than the vector register aligns to one lane in mach, where both std140 and std430 align it to two or four, so an `f32x2` or an `f32x3` member was a reachable disagreement in the **storage** posture too, which had been thought correct by construction.
-
-Every emitted offset is now held to the two conditions the specification states — a multiple of the member's base alignment, and past the end of the member before it — and an array stride to the element's extent rounded up to the array's base alignment. The two postures differ only in the 16-byte roundings std140 applies to an array and to a struct.
-
-A disagreement is **refused, never repacked**, which is the posture the one existing check already took and the reason it gave is the one that matters: the block's layout is the host's contract, and repacking would move the members out from under a host writing by `$offset_of`. The refusal names the member, the offset mach gives it, the offset the rules require, and which of the two conditions failed.
-
-#### A fragment stage's integer or 64-bit input carries its `Flat` decoration (#2747)
-Vulkan requires `Flat` on any fragment-stage `Input` of integer or 64-bit float type, because such a value cannot be interpolated. The emitter declared no `Flat` decoration at all, so every one of those was an invalid module. The decoration is now decided over the set of variables each stage can **reach**, which the per-stage reachability pass already computes.
-
-Vulkan also **forbids** `Flat` on a vertex-stage `Input`, so one module-scope variable read by both a vertex stage and a fragment stage has no valid decoration and is refused rather than decorated for one of them. The two readings are not the same value anyway: a vertex stage's input is a vertex attribute and a fragment stage's is the interpolated output of the stage before it.
-
-A `Location` was emitted verbatim and never checked. mach knows each variable's type and so knows how many locations it consumes, and two whose spans overlap within one stage are now refused naming both, rather than surfacing as a validator message naming an `OpEntryPoint` operand index.
-
-#### Recursion and a 15-parameter signature are refused rather than emitted (#2748)
-There was no whole-module well-formedness stage, so a rule about the module — its call graph, its id validity — had nowhere to live, and two reachable from ordinary source emitted invalid modules silently.
-
-A SPIR-V execution model has no call stack, so a cycle in the static call graph is refused before any body is emitted, naming the chain and saying why. This is checked rather than left to `spirv-val`, whose cycle rule is scoped to entry points: a **library** module carrying a cycle validated clean and would have failed in whatever consumer linked it into a pipeline. One had been sitting green in the integration suite.
-
-The parameter limit was two independent literals that disagreed: `emit_function` refused above 16 while `type_fn`'s fixed operand buffer failed above 14 and returned a 0 nobody read, which reached `OpFunction` as the reserved never-valid id. The limit is now stated once as `types.MAX_FN_PARAMS`, both sites read it, 15 and 16 parameters build and validate, and a 0 from `type_fn` is reported instead of passed on.
-
-#### A dead local's stale value survives past its real live range at opt0, and a `ret` statement's line-table row duplicates at function entry (#2779)
-Two opt0-only debug-info defects `int/surface/debugger-gdb` (#2756) caught by driving a real `gdb` session, neither visible to structural DWARF validation because both artifacts are internally consistent, well-formed DWARF that simply describes the wrong thing.
-
-**A variable's `DW_AT_location` was scoped to its lexical extent, not its true live range.** The opt0 allocator reusing a genuinely-dead local's storage is correct codegen (confirmed by checking the runtime value with no debugger involved), but the DWARF location for that local was never bounded to end where the reuse happens, so a debugger stopped after that point read the new occupant's value as though it were still the old variable's. Root cause: `gather_vars` built a variable's location ranges from its own bindings only, so a variable bound once and never rebound kept a stationary location valid to the function's end regardless of what physically happened to its storage afterward. `bound_storage_reuse` now truncates a range to the point some OTHER variable's binding, in the SAME inline site, claims the identical physical home - a stationary home a debugger could no longer trust past that point now reports unavailable instead. Scoping the search to the same inline site is load-bearing, not an optimization: at opt2 with heavy inlining, two variables in unrelated inline instances can land in the same register with no real relationship, and comparing across sites produced exactly that false positive while building this fix's own regression coverage.
-
-**A `ret <expr>;` statement's line-table row was duplicated at the function's own entry address.** `lower_phis` (out-of-SSA phi elimination) runs once, after every block in the function has already been lowered, and stamped its synthesized merge-copy instructions from `ctx.cur_loc` - a cursor left stale at the function's LAST lowered statement by the time phi elimination ran, for every predecessor block's edge regardless of where in the function that predecessor actually was. `break file:22` on a function whose `ret` genuinely lives at line 22 could silently resolve to its entry instead, with no ambiguity warning, reading whatever was left in an uninitialized register. Fixed by stamping from the predecessor block's own terminator location instead, which was already correct when that block was lowered and never went stale.
-
-`int/surface/debugger-gdb` gained two debug-profile-only probes proving both fixes together, asserted as a pair per each bug's own shape: a variable that genuinely dies mid-function now reports unavailable, while a sibling that stays live keeps reading its real value (a fix that reported "unavailable" for both would pass either probe alone); a second breakpoint on a real `ret` statement resolves to its own address and reads the correct value rather than silently landing at the wrong one. Both bugs are specific to opt0's own location and line-table construction and do not reproduce at opt2, so the case's golden is now per-profile (`expect.debug.txt` / `expect.release.txt`) rather than the one `expect.txt` every other `gdb-session` case still uses.
-
-#### A loop-carried vector accumulator through an unpacked operator came out holding the wrong value (#2749)
-The gap expansion (#2726) replaces a vector operator the target has no packed form for with per-lane scalar work and an assembled vector, then points that operator's uses at the assembled value. It rewrote those uses one block at a time, immediately after expanding that block's body. That is correct for every use that follows its definition, and wrong for the one that does not: a loop header's phi names the value the **latch** defines, so its back-edge operand is a forward reference no block order removes.
-
-The phi kept naming the deleted operator. MIR lowering turned the phi edge into a copy from a virtual register nothing defines, and the accumulator came out holding whatever that register happened to be. Measured on x86-64, a loop-carried `i32x4 * i32x4` returned the **multiplier** where the product belonged. aarch64 was right throughout for a reason unrelated to the defect - NEON has `MUL.4s`, so nothing expands there at all - which is why an entire suite of straight-line vector cases passed on every leg while this was live. The lane-access expansion had the identical defect one pass over.
-
-Substitution is now a whole-function step in both passes, after every block has been expanded, because the ordering it needs does not exist.
-
-#### A float or integer memory access refuses a width the target has no form for (#2766)
-A memory access takes a byte width and picks a machine form from it. On aarch64 and riscv64 that pick was a boolean selector with a trailing default, so a width the target has no form for silently got some other form's bytes rather than a diagnostic, the same shape #2733 removed from the float move, negate, arithmetic, compare and conversion encoders, one family over.
-
-riscv64's `fp_mem_funct3` answered 4 with `flw`/`fsw` and **everything else** with `fld`/`fsd`. RV64D has exactly those two float access forms and no vector extension is enabled, so a 16-byte float access had nothing to encode to at all, and it encoded to `fld`, moving eight bytes and losing the other eight. aarch64's `emit_fp_mem` handled 16 in its own arm and then fell through to `use_d = width == 8`, so a 32-byte access took the **S** form and moved four bytes of a slot the surrounding code had already sized at 32.
-
-The fix is a contract change on the access family, not a check at today's callers. The defaulting helpers were shared with the **integer** path, aarch64's `ldst_lo12_kind`, `width_shift` and the three `ldst_base_*` base-word tables were five parallel ladders that each named the narrow widths and each ended in the doubleword row, so validating only the float arms would have left the identical shape live next door under a different name. Each family now comes off **one** form table: aarch64's `int_access` / `fp_access` return a row carrying all three addressing-mode base words, the imm12 shift and the `:lo12:` relocation kind together, and riscv64's `int_mem_funct3` / `fp_mem_funct3` return the funct3 or an error. A width with no row is refused. `emit_mem_access`, `emit_fp_mem` and `mem_access_needs_no_scratch` report rather than emit, and the Q arm that used to sit ahead of the aarch64 default is now the same three lines as S and D, because the difference between them was only ever the row.
-
-The census found the same defect on **x86-64**, which the issue did not name: `emit_float_load`, `emit_float_reg_or_slot_load`, `emit_float_store` and `float_const_operand` each read `mov_op = MOVSD; if (w == 4) { mov_op = MOVSS; }`, so every width other than 4 took the eight-byte MOVSD. It was inert only because `encode_fp_mov` returns its vector arm above them. Nothing in the helpers said so, and `emit_float_load` is reached separately by the arithmetic and seed paths. aarch64's `emit_fp_const` carried the same `use64 = width == 8`.
-
-Every refusal is **driven from a unit test** with a width it must refuse, and the assertion is that the output buffer stayed **empty**, not merely that an error was returned. That distinction is load-bearing here: both `emit_mem_access` implementations materialize an out-of-range offset into the scratch register before the access word, and a folded global emits its `adrp` / `auipc` high half before the low one, so a check placed at the emission point rather than at the top would leave stranded instructions behind the error. Every legitimate width still encodes byte-exactly against `llvm-mc`, including aarch64's Q form at 16 and the sub-word integer forms at 1 and 2 that share the same helpers.
-
-#### An inline-asm operand longer than a register-name scratch buffer is no longer reported as malformed (#2789)
-Each ISA's inline-asm operand parser copied the operand token into a fixed stack buffer before deciding what kind of operand it was, and reported a **well-formed** operand as malformed when the copy did not fit — `[64]u8` on aarch64 and riscv64, `[128]u8` on x86-64. The copy's only consumer was the register-name lookup on the next line; every other branch (a relocation modifier, an address, an immediate, a bare symbol) already read the source region directly and never touched it. Register names are three or four characters; a mangled symbol is not, and dotted mangling's own measured longest symbol (105 bytes) already exceeds the aarch64/riscv64 buffer today.
-
-The buffer is gone, not enlarged: `asm_reg_index` (riscv64), `a64_reg` (aarch64), and `x64_reg` (x86-64) each now compare the register-name table in place against the source region, mirroring the in-place symbol check (`iasm.is_sym_region`) already sitting one branch below them. x86-64's `[symbol]` memory-operand parser had a second, narrower instance of the same shape one layer down: its no-star bracket-content parser copied into a `[32]u8` meant for a base register, and a bare rip-relative symbol reference (`[rip + <symbol>]`, #2788's own repro shape) passed through the same copy, because x86-64's grammar makes a base register and a bare symbol genuinely ambiguous at that position until one or the other is ruled out. Fixed the same way. aarch64 and riscv64 were checked and do not have this second problem: `off(base)` and `[Xn, ...]` both require a register in the base position syntactically, and a bare symbol reaches a structurally different form (`:mod:sym`) that never touches a register buffer.
-
-Verified per ISA with a symbol well past every old limit: it encodes, and encodes **byte-identically** to a short-named operand (instruction bytes never depend on a symbol's name, only its relocation does), with the relocation itself carrying the full, untruncated name. A genuinely malformed operand still refuses, checked alongside the long-operand case so the two cannot be confused.
-
-### Changed
 #### The realization authority answers a lane-count ceiling as well as a lane width (#2749)
 `isa.packed_width` answers a question keyed on the lane **width**, and a SPIR-V Shader module's constraint is a lane **count**: `OpTypeVector` takes 2, 3 or 4 components at every element type. For 8-bit lanes the authority reported a 128-bit packed form, meaning sixteen lanes, which no Shader module may declare - so the authority and the emitter gave different answers about the same shape, and the emitter refused `i8x16`, `u8x16`, `i16x8` and `u16x8` by name.
 
@@ -1520,7 +1517,6 @@ The x86-64 read-only growth is the two 16-byte mask entries, one per width, shar
 Also fixed while here, both without a separate issue: `encode.intern_const` refused to check its interner and dereferenced a null one, crashing inside `intern` rather than naming the encoder that asked, and now reports instead.
 
 And aarch64's memory-access family no longer carries a **width-0 pseudo-width**. Every entry point in it used to open with `if (w == 0) { w = 8; }`, a convention from when a MIR pseudo could reach an access, which #2766 left in place as the one substitution it did not remove. Nothing reaches it: routing 0 into a refused width instead left the whole aarch64 surface green, the unit suite, every `int` case on `linux-arm64` in both profiles, and the compiler's own source cross-built for `linux-arm64` and `darwin-aarch64` at both optimisation levels. A default nothing exercises is not a safety net, it is a silent doubleword waiting for the first caller that means something else by 0, so 0 is now refused like any other width the target has no form for and the refusal is driven from a test that fails with the fallback restored. `is64` keeps its own 0 rule, which selects an ALU register form rather than a memory form and which a pseudo with no value width legitimately reaches.
-
 ## [4.16.0] - 2026-08-08
 
 ### Added
