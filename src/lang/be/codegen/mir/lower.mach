@@ -96,6 +96,7 @@ use mach.lang.me.ir.value;
 use mach.lang.source;
 use treg: mach.lang.target;
 use target: mach.lang.target.resolved;
+use isa: mach.lang.target.isa;
 
 # lower an IR module to a parallel MIR module, one MIR function per IR function
 # ---
@@ -1097,6 +1098,11 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     # negate to its dedicated SSE lowering before the generic path.
     if (inst.kind == instr.OP_NEG && lctx.value_is_float(ctx, inst.ty)) {
         ret lower_float_neg(ctx, mb, inst, iid);
+    }
+    # a bit reinterpret across the register banks at a width this machine has no
+    # register-to-register form for goes through the frame instead (#2904).
+    if (inst.kind == instr.OP_BITCAST && bitcast_needs_frame(ctx, inst)) {
+        ret lower_bitcast_via_frame(ctx, mb, inst, iid);
     }
     # integer division / remainder needs the dividend / remainder register wiring
     # the active ISA's division form mandates (x86-64 IDIV/DIV reads the dividend
@@ -2169,6 +2175,97 @@ fun lower_float_op(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruct
 # inst: the IR float negate instruction
 # iid:  the IR instruction id
 # ret:  true on success, or a lowering / allocation error
+# whether this `:~` crosses the register banks at a width the target cannot cross in
+# one instruction (#2904)
+#
+# A BIT REINTERPRET IS THE SECOND INSTRUCTION WITH A VALUE IN EACH BANK - a conversion
+# was long treated as the only one. A same-bank `:~` is a register copy and a
+# cross-bank one selects to a plain MOV that the encoder dispatches on operand
+# register CLASS, which is true on every target that HAS the instruction. RV32 is the
+# member that does not: the D extension puts 64-bit doubles in f0-f31 while XLEN stays
+# 4, so `f64 :~ i64` is ordinary to write and `fmv.x.d` is RV64-only. It reached
+# `be.codegen.legalize` as a retagged MIR_MOV, missed the lane split because one side
+# is FP-class, and fell out into a generic width refusal naming an opcode the user
+# never wrote.
+#
+# ASKED OF THE TARGET, not derived from the widths. `flen_bits` and `gpr_width` give
+# the right answer on the riscv members by coincidence and the wrong one on x86-64,
+# where a 128-bit XMM would imply a 16-byte crossing that `movq` does not perform.
+# ---
+# ctx:  the lowering context
+# inst: the OP_BITCAST being lowered
+# ret:  true when the crossing has no register form and must go through memory
+fun bitcast_needs_frame(ctx: *lctx.LowerCtx, inst: *instr.Instruction) bool {
+    if (inst.operand_count < 1) { ret false; }
+
+    val dst_float: bool = lctx.value_is_float(ctx, inst.ty);
+    val src_float: bool = lctx.value_is_float(ctx, inst.operands[0].ty);
+    if (dst_float == src_float) { ret false; }
+
+    # a vector side is a different question and a different path: it rides the vector
+    # register file, whose memory crossings `vec_mem_widths` already answers.
+    if (lctx.value_is_vector(ctx, inst.ty))              { ret false; }
+    if (lctx.value_is_vector(ctx, inst.operands[0].ty))  { ret false; }
+
+    val w: u8 = lctx.op_width_of(ctx, inst.ty);
+    if (w == 0) { ret false; }
+    ret !isa.moves_cross_bank(?ctx.tgt.model, w::u32);
+}
+
+# lower a cross-bank `:~` with no register form into a frame round trip (#2904)
+#
+# A store in the SOURCE's bank followed by a load in the DESTINATION's. The bits are
+# the same in either bank, so the two halves need no conversion between them - which
+# is why this is a reinterpret and not `is_int_fp_conv`'s problem. On rv32 the pair
+# encodes as `fsd` then two `lw`, or two `sw` then `fld`, which is what a C toolchain
+# emits on this target.
+#
+# NOTHING BELOW HERE NEEDS TO KNOW. The float side is an ordinary float move against a
+# MEM operand, which the encoder already handles because a spilled side reaches it the
+# same way. The integer side is an ordinary wide integer move against a MEM operand,
+# which `be.codegen.legalize` already splits into lane-width pieces - so the wide half
+# is legalized by the machinery that was refusing it, with no new clause.
+# ---
+# ctx:  the lowering context
+# mb:   the block to append to
+# inst: the OP_BITCAST being lowered
+# iid:  its instruction id, for the result vreg
+# ret:  true on success, or an allocation error
+fun lower_bitcast_via_frame(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[bool, str] {
+    val dst: u32 = lctx.instr_vreg(ctx, iid);
+    if (dst == mir.MIR_VREG_NIL) {
+        ret R.err[bool, str]("mir.lower_ir: cross-bank reinterpret defines no result vreg");
+    }
+    val w: u8 = lctx.op_width_of(ctx, inst.ty);
+
+    # an internal slot-key vreg owns the storage; it is addressed only as a MEM base,
+    # never register-allocated. the slot is the value's own width and alignment, so
+    # both halves are naturally aligned accesses.
+    val skr: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](skr)) { ret R.err[bool, str](R.unwrap_err[u32, str](skr)); }
+    val sk: u32 = R.unwrap_ok[u32, str](skr);
+
+    val ar: R.Result[bool, str] = lctx.add_spill_slot_aligned(ctx, sk, w::u64, w::u32);
+    if (R.is_err[bool, str](ar)) { ret ar; }
+
+    val sr: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
+    if (R.is_err[*mir.MirOperand, str](sr)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](sr)); }
+    val sops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](sr);
+    sops[0] = mir.op_mem_slot(sk, 0);
+    sops[1] = lctx.lower_value(ctx, inst.operands[0]);
+    var si: mir.MirInstr = mir.instr(mir.MIR_MOV, sops, 2, w, w);
+    val spr: R.Result[bool, str] = lctx.push_instr(ctx, mb, si);
+    if (R.is_err[bool, str](spr)) { ret spr; }
+
+    val lr: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
+    if (R.is_err[*mir.MirOperand, str](lr)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](lr)); }
+    val lops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](lr);
+    lops[0] = mir.op_vreg(dst);
+    lops[1] = mir.op_mem_slot(sk, 0);
+    var li: mir.MirInstr = mir.instr(mir.MIR_MOV, lops, 2, w, w);
+    ret lctx.push_instr(ctx, mb, li);
+}
+
 fun lower_float_neg(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[bool, str] {
     if (inst.operand_count < 1) {
         ret R.err[bool, str]("mir.lower_ir: float negate missing operand");
