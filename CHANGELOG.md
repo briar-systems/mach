@@ -39,6 +39,24 @@ column red on the pr lane and leaves aarch64-darwin green - a selective failure 
 than a broken harness - and restoring it returns 728 cells green. No new toolchain: the
 llvm tools layer A already requires are the ones that read it.
 
+#### test(link): the c-variadic golden samples both register-slot floats (#3043)
+
+The `floats` line reported `out[0]`, `out[3]` and `out[7]`. On win64 only the first four
+POSITIONAL slots have registers, and the two fixed parameters take two of them - so of
+those eight doubles only `out[0]` and `out[1]` ride a register and can expose a broken
+`float_dup_gp`, the rule that duplicates a tail float into the integer register of its
+slot. Eight doubles read like broad coverage of the register/stack boundary and, for
+that rule, were a **one-value check**: `out[1]` is equally broken by the same defect and
+was never printed.
+
+Found by mutation-testing the leg #3005 enabled, not by a failure. Nothing was wrong;
+the margin was simply thinner than the case looked, and the next person to weaken the
+rule had one printed value standing between them and a green run.
+
+`out[7]` stays as the stack-side control - a mutation that moved it too would mean
+something different and worse.
+
+
 ### Fixed
 
 #### test: a failed lowering pass counts as an error, so char-width regressions actually regress (#2949)
