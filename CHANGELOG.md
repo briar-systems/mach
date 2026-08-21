@@ -5,6 +5,90 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.23.0] - 2026-08-21
+
+### Fixed
+
+#### sema: the C-variadic promotion rule survives monomorphization (#3029)
+
+C promotes anything narrower than `int` to `int` and `f32` to `f64`. Mach adds no
+implicit conversions, so a narrow value in a C-variadic tail is refused with the cast
+named - and that rule was silently skipped whenever the value's type arrived with an
+instantiation:
+
+```mach
+fun log1[A](fmt: *u8, a: A) i32 { ret printf(fmt, a); }
+
+log1[u8]("%d\n", c)     # compiled; printf read 32 bits of a register holding a byte
+```
+
+One line away, the identical value passed directly was refused correctly. The rule
+was only ever decided against the **template parameter** `A`, which is not a narrow
+integer because it is not an integer at all, so it declined.
+
+The cause was a layer out. `record_instance` prunes an instance whose arguments are
+all public scalars - its filter asks whether an argument can reach a *secret* - so
+`log1[u8]` was never recorded, its body never re-visited, and no gate ran for that
+instantiation. Same class as #2465, which added its own clause for `$if
+($is_record(T))`: a rule whose answer differs per instance, for arguments the secrecy
+filters do not care about.
+
+A body that calls a C-variadic function is now recorded, so the tail is re-checked
+against each instance's concrete types. **The filter is precise rather than
+conservative**, and deliberately: recording every generic that calls anything re-infers
+bodies with nothing concrete in them and reports their template-time diagnostics a
+second time, which `generic_instance_reached_through_generic` pins. Promotion-clean
+instantiations are unaffected, and one fixed-arity generic wrapper per arity remains
+the way to wrap a C variadic.
+
+Measured at no cost: 45.57s of build CPU against a 45.72s baseline.
+
+## [Unreleased]
+
+### Added
+
+#### sema: a comptime pack can be forwarded into a C-variadic tail (#3025)
+
+Mach has no runtime variadics, so wrapping a C variadic function could only be done
+one fixed arity at a time - a generic wrapper per argument count. `va...` now forwards
+into a C tail, which is what every report that reached for a pack was trying to write:
+
+```mach
+ext fun printf(fmt: *u8, ...) i32;
+
+pub fun logf(fmt: *u8, va: ...) i32 { ret printf(fmt, va...); }
+
+logf("%d %f\n", 1::i32, 2.5);
+```
+
+Lowering already spliced a pack's concrete slots into the flat argument list without
+caring what shape the callee was, so the tail placement goes through the target's
+`VaModel` exactly as a written-out tail does. What was missing was the type rule.
+
+**WHERE THE CONTRACT LANDS IS THE DESIGN.** A C tail promotes anything narrower than
+`int`, and mach adds no implicit conversions - so a `u8`, which may sit in a pack
+perfectly legally, may not enter a C tail. But a pack element is only nameable where
+it ENTERS the pack: `TYPE_PACK` is interned payload-free, so the spread site can see
+no element types at all. The rule is therefore applied at the call that BUILDS the
+pack, beside the secrecy gate that already walks the same elements for the same
+structural reason - which also puts the diagnostic on the author's own argument
+rather than on a `va...` inside a wrapper they may not have written.
+
+The obligation attaches only where the pack actually reaches C. An ordinary mach
+variadic still takes a `u8` element, because entering a pack carries no width
+obligation of its own - the obligation comes entirely from the forwarding.
+
+### Fixed
+
+#### sema: a comptime container no longer masks the C-variadic filter (#3025)
+
+The instance-recording filter #3029 added answered "yes" for any body holding a `$if`
+or `$each` rather than walking its arms. Every body with a comptime container looked
+like it reached a C-variadic tail; the codegen corpus caught it, refusing
+`fold_pack`'s `u8` element in a body that calls no foreign function at all. The arms
+are walked now. The conservative direction is wrong on this filter in both of its
+uses.
+
 ## [4.22.0] - 2026-08-21
 
 ### Changed

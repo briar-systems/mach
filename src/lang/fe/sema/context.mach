@@ -22,6 +22,7 @@ use R: std.types.result;
 use mach.lang.diagnostic;
 use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
+use mach.lang.fe.ast.expr;
 use mach.lang.fe.ast.stmt;
 use mach.lang.fe.ast.id;
 use mach.lang.fe.comptime;
@@ -574,6 +575,271 @@ pub fun arg_triggers_revalidation(sc: *SemaContext, tid: type.TypeId) bool {
 # origin: module declaring the generic
 # did:    the generic declaration
 # ret:    true when the body carries a directive that may need a per-instance answer
+# the ResolveResult for `origin`, or nil when it is unavailable
+#
+# The live one for the module this episode owns - a transient instance context
+# rebinds `sc.rr`, so reading it rather than the session copy keeps a cross-module
+# instance body resolving against the same table its inference used.
+fun module_rr_for(sc: *SemaContext, origin: session.ModuleId) *resolve.ResolveResult {
+    if (origin == sc.own_module) { ret sc.rr; }
+    val p: ptr = session.module_resolve_ptr(sc.s, origin);
+    if (p == nil) { ret nil; }
+    ret p::*resolve.ResolveResult;
+}
+
+# whether a call's callee is a C-variadic declaration
+#
+# Resolution rather than inference: `expr_resolved` names the symbol the callee
+# spells, the symbol names its declaring module and DeclId, and `DeclFun.c_variadic`
+# is the answer. That chain is available before the body has been typed, which is
+# what this filter needs - it runs while deciding whether an instance is worth
+# re-validating at all.
+#
+# An unresolved callee (an indirect call through a value, an error node) answers
+# false. A function VALUE cannot be C-variadic today: the form is `ext`-only and a
+# function type cannot carry it (#3003), so there is nothing to miss.
+# ---
+# sc:         the sema context
+# rr:         the resolve result for the module owning the callee expression
+# callee_eid: the call's callee expression
+# ret:        true when the callee is declared C-variadic
+fun callee_is_c_variadic(sc: *SemaContext, rr: *resolve.ResolveResult, callee_eid: id.ExprId) bool {
+    if (rr == nil || rr.expr_resolved == nil || rr.symbols == nil) { ret false; }
+    if (callee_eid == id.EXPR_NIL || callee_eid >= rr.expr_count)  { ret false; }
+    val sid: resolve.SymbolId = rr.expr_resolved[callee_eid];
+    if (sid == resolve.SYMBOL_NIL || sid >= rr.symbol_count)       { ret false; }
+    val sym: *resolve.Symbol = ?rr.symbols[sid];
+    if (sym.decl == id.DECL_NIL) { ret false; }
+
+    var da: *ast.Ast = sc.a;
+    if (sym.origin != sc.own_module) { da = session.module_ast(sc.s, sym.origin); }
+    if (da == nil) { ret false; }
+
+    val d_opt: O.Option[*decl.Decl] = ast.get_decl(da, sym.decl);
+    if (O.is_none[*decl.Decl](d_opt)) { ret false; }
+    val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+    if (d.kind != decl.DECL_KIND_FUN) { ret false; }
+    ret d.data.fun_.c_variadic;
+}
+
+# whether an expression subtree contains a call to a C-variadic callee
+#
+# TOTAL BY CONSTRUCTION over the expression kinds, and unlike its statement
+# neighbour the conservative default here is FALSE rather than true. The costs are
+# not symmetric: a missed call means a promotion check that never runs, while a
+# spurious one re-validates a body with nothing concrete in it and REPORTS ITS
+# TEMPLATE-TIME DIAGNOSTICS A SECOND TIME (the `generic_instance_reached_through_generic`
+# assertion pins exactly that). So every kind that can hold a child expression is
+# enumerated and recursed; a kind added later is caught by that test rather than by
+# a duplicate-diagnostic report in the field.
+# ---
+# sc:  the sema context
+# a:   the AST owning the expression
+# rr:  the resolve result for that AST's module
+# eid: the expression to inspect
+# ret: true when the subtree calls a C-variadic function
+# whether a call expression has a `va...` spread among its arguments
+fun call_has_spread_arg(a: *ast.Ast, e: *expr.Expr) bool {
+    var i: u32 = 0;
+    for (i < e.data.call.args_len) {
+        val ix: u32 = e.data.call.args_start + i;
+        if (ix::usize < a.expr_id_len) {
+            val ao: O.Option[*expr.Expr] = ast.get_expr(a, a.expr_ids[ix]);
+            if (O.is_some[*expr.Expr](ao)
+                && O.unwrap[*expr.Expr](ao).kind == expr.EXPR_KIND_SPREAD) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun expr_has_c_variadic_call(sc: *SemaContext, a: *ast.Ast, rr: *resolve.ResolveResult, eid: id.ExprId, want_spread: bool) bool {
+    if (eid == id.EXPR_NIL) { ret false; }
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(a, eid);
+    if (O.is_none[*expr.Expr](e_opt)) { ret false; }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
+    val k: expr.ExprKind = e.kind;
+
+    if (k == expr.EXPR_KIND_CALL) {
+        if (callee_is_c_variadic(sc, rr, e.data.call.callee)
+            && (!want_spread || call_has_spread_arg(a, e))) { ret true; }
+        if (expr_has_c_variadic_call(sc, a, rr, e.data.call.callee, want_spread)) { ret true; }
+        var i: u32 = 0;
+        for (i < e.data.call.args_len) {
+            val ix: u32 = e.data.call.args_start + i;
+            if (ix::usize < a.expr_id_len
+                && expr_has_c_variadic_call(sc, a, rr, a.expr_ids[ix], want_spread)) { ret true; }
+            i = i + 1;
+        }
+        ret false;
+    }
+    if (k == expr.EXPR_KIND_BINARY) {
+        if (expr_has_c_variadic_call(sc, a, rr, e.data.binary.lhs, want_spread)) { ret true; }
+        ret expr_has_c_variadic_call(sc, a, rr, e.data.binary.rhs, want_spread);
+    }
+    if (k == expr.EXPR_KIND_UNARY)  { ret expr_has_c_variadic_call(sc, a, rr, e.data.unary.operand, want_spread); }
+    if (k == expr.EXPR_KIND_INDEX)  { ret expr_has_c_variadic_call(sc, a, rr, e.data.index.object, want_spread); }
+    if (k == expr.EXPR_KIND_MEMBER) { ret expr_has_c_variadic_call(sc, a, rr, e.data.member.object, want_spread); }
+    if (k == expr.EXPR_KIND_PROJECT){ ret expr_has_c_variadic_call(sc, a, rr, e.data.project.object, want_spread); }
+    if (k == expr.EXPR_KIND_SPREAD) { ret expr_has_c_variadic_call(sc, a, rr, e.data.spread.inner, want_spread); }
+    if (k == expr.EXPR_KIND_CAST)   { ret expr_has_c_variadic_call(sc, a, rr, e.data.cast.value, want_spread); }
+    if (k == expr.EXPR_KIND_STRIP)  { ret expr_has_c_variadic_call(sc, a, rr, e.data.strip.value, want_spread); }
+    if (k == expr.EXPR_KIND_ARRAY_LIT) {
+        var i: u32 = 0;
+        for (i < e.data.array_lit.elems_len) {
+            val ix: u32 = e.data.array_lit.elems_start + i;
+            if (ix::usize < a.expr_id_len
+                && expr_has_c_variadic_call(sc, a, rr, a.expr_ids[ix], want_spread)) { ret true; }
+            i = i + 1;
+        }
+        ret false;
+    }
+    if (k == expr.EXPR_KIND_VECTOR_LIT) {
+        var i: u32 = 0;
+        for (i < e.data.vector_lit.elems_len) {
+            val ix: u32 = e.data.vector_lit.elems_start + i;
+            if (ix::usize < a.expr_id_len
+                && expr_has_c_variadic_call(sc, a, rr, a.expr_ids[ix], want_spread)) { ret true; }
+            i = i + 1;
+        }
+        ret false;
+    }
+    if (k == expr.EXPR_KIND_STRUCT_LIT) {
+        var i: u32 = 0;
+        for (i < e.data.struct_lit.fields_len) {
+            val ix: u32 = e.data.struct_lit.fields_start + i;
+            if (ix::usize < a.field_init_len
+                && expr_has_c_variadic_call(sc, a, rr, a.field_inits[ix].value, want_spread)) { ret true; }
+            i = i + 1;
+        }
+        ret false;
+    }
+
+    # every remaining kind is a leaf carrying no child expression: the literals,
+    # an IDENT, a COMPTIME_IDENT, a TYPE_REF, a GENERIC_INSTANCE, and ERROR.
+    ret false;
+}
+
+# whether a decl's body contains a call to a C-variadic callee
+#
+# The recording filter for the C-variadic promotion rule (#3029). That rule is
+# decided per instance - a `u8` argument is refused where an `i32` is fine - so a
+# body that can reach a C-variadic tail must be re-validated for every
+# instantiation, exactly as #2465's type-directive bodies must be. Without it the
+# rule is only ever decided against the TEMPLATE parameter, which is not an integer
+# at all, so it declines and a `u8` reaches `printf` through a generic wrapper.
+# ---
+# sc:     the sema context
+# origin: ModuleId declaring the generic
+# did:    the generic function's DeclId
+# ret:    true when the body calls a C-variadic function
+fun decl_body_calls_c_variadic(sc: *SemaContext, origin: session.ModuleId, did: id.DeclId) bool {
+    ret decl_body_reaches_c_variadic(sc, origin, did, false);
+}
+
+# whether a decl's body FORWARDS ITS PACK into a C-variadic tail (#3025)
+#
+# The narrower question `decl_body_calls_c_variadic` answers with `want_spread`. A body
+# that spreads `va...` into a C tail puts every element of that pack on the C
+# promotion contract - a `u8` may sit in a pack legally and may not enter a C tail -
+# and the elements are only nameable where they ENTER the pack, at the call that
+# builds it. So the obligation is checked there, beside the secrecy gate that already
+# walks the same elements for the same structural reason.
+# ---
+# sc:     the sema context
+# origin: ModuleId declaring the pack function
+# did:    the pack function's DeclId
+# ret:    true when the body spreads its pack into a C-variadic call
+pub fun decl_body_spreads_pack_to_c_variadic(sc: *SemaContext, origin: session.ModuleId, did: id.DeclId) bool {
+    ret decl_body_reaches_c_variadic(sc, origin, did, true);
+}
+
+fun decl_body_reaches_c_variadic(sc: *SemaContext, origin: session.ModuleId, did: id.DeclId, want_spread: bool) bool {
+    var a: *ast.Ast = sc.a;
+    if (origin != sc.own_module) { a = session.module_ast(sc.s, origin); }
+    if (a == nil) { ret false; }
+    val rr: *resolve.ResolveResult = module_rr_for(sc, origin);
+    if (rr == nil) { ret false; }
+
+    val d_opt: O.Option[*decl.Decl] = ast.get_decl(a, did);
+    if (O.is_none[*decl.Decl](d_opt)) { ret false; }
+    val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+    if (d.kind != decl.DECL_KIND_FUN)    { ret false; }
+    if (d.data.fun_.body == id.STMT_NIL) { ret false; }
+    ret stmt_calls_c_variadic(sc, a, rr, d.data.fun_.body, want_spread);
+}
+
+# the recursive half of `decl_body_calls_c_variadic`, over one statement
+#
+# Enumerated rather than defaulted, for the reason `expr_has_c_variadic_call` states:
+# a spurious record duplicates a body's template-time diagnostics, so the
+# conservative direction that is right for `stmt_has_type_directive` is wrong here.
+fun stmt_calls_c_variadic(sc: *SemaContext, a: *ast.Ast, rr: *resolve.ResolveResult, sid: id.StmtId, want_spread: bool) bool {
+    if (sid == id.STMT_NIL) { ret false; }
+    val s_opt: O.Option[*stmt.Stmt] = ast.get_stmt(a, sid);
+    if (O.is_none[*stmt.Stmt](s_opt)) { ret false; }
+    val s: *stmt.Stmt = O.unwrap[*stmt.Stmt](s_opt);
+    val k: stmt.StmtKind = s.kind;
+
+    if (k == stmt.STMT_KIND_EXPR) { ret expr_has_c_variadic_call(sc, a, rr, s.data.expr.expr, want_spread); }
+    if (k == stmt.STMT_KIND_RET)  { ret expr_has_c_variadic_call(sc, a, rr, s.data.ret_.value, want_spread); }
+    if (k == stmt.STMT_KIND_DECL) {
+        val dd_opt: O.Option[*decl.Decl] = ast.get_decl(a, s.data.decl.decl);
+        if (O.is_none[*decl.Decl](dd_opt)) { ret false; }
+        val dd: *decl.Decl = O.unwrap[*decl.Decl](dd_opt);
+        if (dd.kind != decl.DECL_KIND_VAL && dd.kind != decl.DECL_KIND_VAR) { ret false; }
+        ret expr_has_c_variadic_call(sc, a, rr, dd.data.bind.init, want_spread);
+    }
+    if (k == stmt.STMT_KIND_IF) {
+        if (expr_has_c_variadic_call(sc, a, rr, s.data.if_.cond, want_spread))   { ret true; }
+        if (stmt_calls_c_variadic(sc, a, rr, s.data.if_.then_block, want_spread)) { ret true; }
+        ret stmt_calls_c_variadic(sc, a, rr, s.data.if_.else_block, want_spread);
+    }
+    if (k == stmt.STMT_KIND_FOR) {
+        if (expr_has_c_variadic_call(sc, a, rr, s.data.for_.cond, want_spread)) { ret true; }
+        ret stmt_calls_c_variadic(sc, a, rr, s.data.for_.body, want_spread);
+    }
+    if (k == stmt.STMT_KIND_FIN) { ret stmt_calls_c_variadic(sc, a, rr, s.data.fin_.body, want_spread); }
+    if (k == stmt.STMT_KIND_BLOCK) {
+        var i: u32 = 0;
+        for (i < s.data.block.stmts_len) {
+            if (stmt_calls_c_variadic(sc, a, rr, a.stmt_ids[s.data.block.stmts_start + i], want_spread)) { ret true; }
+            i = i + 1;
+        }
+        ret false;
+    }
+    # A COMPTIME CONTAINER'S ARMS ARE STATEMENTS LIKE ANY OTHER, and are walked
+    # rather than assumed. Answering `true` here made every body holding a `$each`
+    # look like it reached a C-variadic tail, which put the C promotion contract on
+    # the elements of ordinary mach packs - the codegen corpus's `fold_pack`, whose
+    # `$each x in va` body calls no foreign function at all, was refused for holding
+    # a `u8`. The conservative direction is wrong on this filter in both of its uses.
+    if (k == stmt.STMT_KIND_COMPTIME_IF) {
+        var bi: u32 = 0;
+        for (bi < s.data.comptime_if.branches_len) {
+            val br: *decl.ComptimeBranch = ?a.comptime_branches[s.data.comptime_if.branches_start + bi];
+            var si2: u32 = 0;
+            for (si2 < br.body_len) {
+                if (stmt_calls_c_variadic(sc, a, rr, a.stmt_ids[br.body_start + si2], want_spread)) { ret true; }
+                si2 = si2 + 1;
+            }
+            bi = bi + 1;
+        }
+        ret false;
+    }
+    if (k == stmt.STMT_KIND_COMPTIME_EACH) {
+        var ei: u32 = 0;
+        for (ei < s.data.comptime_each.body_len) {
+            if (stmt_calls_c_variadic(sc, a, rr, a.stmt_ids[s.data.comptime_each.body_start + ei], want_spread)) { ret true; }
+            ei = ei + 1;
+        }
+        ret false;
+    }
+
+    # BRK / CNT / ASM / COMPTIME_ATTR / ERROR carry no call this filter can reach
+    ret false;
+}
+
 fun decl_body_has_type_directive(sc: *SemaContext, origin: session.ModuleId, did: id.DeclId) bool {
     var a: *ast.Ast = sc.a;
     if (origin != sc.own_module) { a = session.module_ast(sc.s, origin); }
@@ -745,6 +1011,11 @@ pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.Dec
     # Without this `probe[u64]` is never recorded, its body never re-visited, and the
     # gate never evaluated for that instance at all.
     if (!any && decl_body_has_type_directive(sc, origin, decl)) { any = true; }
+    # a body reaching a C-variadic tail needs its arguments checked against the C
+    # promotions per instance, for arguments none of the filters above care about
+    # (#3029) - the rule is decided on the concrete type, and pruning the instance
+    # leaves it decided on the template parameter, which is not an integer at all
+    if (!any && decl_body_calls_c_variadic(sc, origin, decl)) { any = true; }
     if (!any) { ret R.ok[u8, str](RECORD_OK); }
 
     if (sc.insts != nil) {
