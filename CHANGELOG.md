@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+
 ### Fixed
 
 #### link(macho): a C common symbol is allocated instead of demanded as an import (#2974)
@@ -49,8 +50,6 @@ definition and a tentative one are not a duplicate-symbol collision; the tentati
 exists precisely to yield to it. A relocatable output allocates nothing either, since it
 carries its symbols through unresolved and the eventual link is where the storage is
 decided.
-
-### Fixed
 
 #### link(macho): an x86_64 SUBTRACTOR relocation pair is parsed and resolved (#2973)
 
@@ -95,8 +94,6 @@ wrong arithmetic.
 
 Mach's own writer emits no SUBTRACTOR, so a difference reaching the Mach-O writer still
 refuses by the existing unsupported-kind path rather than writing something wrong.
-
-### Fixed
 
 #### test: Mach-O gets an external reader on the lane that gates merges (#2957)
 
@@ -145,9 +142,6 @@ rule had one printed value standing between them and a green run.
 `out[7]` stays as the stack-side control - a mutation that moved it too would mean
 something different and worse.
 
-
-### Fixed
-
 #### test: a failed lowering pass counts as an error, so char-width regressions actually regress (#2949)
 
 `ut_lower_clean` reported "no errors" by counting the DIAGNOSTIC SINK after running the
@@ -163,8 +157,6 @@ was simply nothing holding it.
 
 The helper now treats a failed pass as an error. The guard it exists for fails when the
 defect is reintroduced, which is the property it was always assumed to have.
-
-### Fixed
 
 #### codegen: a frame larger than the target's stack reserve is refused (#2991)
 
@@ -201,50 +193,6 @@ what the target stated (#2990), else the format's own default, else nothing. A t
 whose stack the image does not bound - every ELF one, and a Mach-O image with no stated
 reserve, which takes dyld's default - is not checked at all, because a bound mach did
 not choose is not a bound mach may refuse a program against.
-
-### Added
-
-#### manifest: a target can set the image stack size (#2990)
-
-The PE stack reserve was a literal `0x100000`, so a mach project could not ship a
-Windows program needing more than a megabyte of stack. No flag, no workaround, while
-every other linker exposes it (`/STACK`, `--stack`, `-Wl,--stack`) - and mach owns the
-PE it writes.
-
-Found from a real program: a game's `main` needed a 1,107,824-byte frame against the
-1,048,576-byte reserve, so the image died in its own prologue on every Windows machine
-while running fine on linux, which hands the main thread eight megabytes. The stack
-probe was correct throughout. Only the reserve was unreachable.
-
-```toml
-[target.windows]
-isa  = "x86_64"
-os   = "windows"
-abi  = "win64"
-stack_reserve = 0x800000
-stack_commit  = 0x1000
-```
-
-Both optional; omitting them reproduces today's bytes exactly. They sit on the target
-beside `base` because all three are image memory-layout parameters expressible only on
-some object formats - and because a reserve is address space rather than committed
-memory, so a small tool inheriting a large program's reserve costs nothing.
-
-**Only some formats carry one.** PE keeps both in its optional header, Mach-O keeps a
-reserve in `LC_MAIN.stacksize`; ELF has nowhere to put one and a raw flat image has no
-header. Either key on a target whose resolved object format carries none is refused
-when the manifest is read, naming the key, the target and the format - and **every
-declared target is checked, not only the one being built**, because a key checked only
-in the cell being built is a key that silently does nothing until someone builds the
-other cell months later.
-
-On Mach-O the value reaches only a position-independent image. A non-PIE one enters
-through `LC_UNIXTHREAD`, which has no stacksize member, so a stack size requested there
-is refused at link rather than dropped. That is a property of the image SHAPE rather
-than of the format, is not knowable when the manifest is read, and is therefore checked
-in the writer - two facts, two checks, each where its fact is known.
-
-### Fixed
 
 #### target(riscv32): a 64-bit reinterpret across the register banks is lowered (#2904)
 
@@ -292,6 +240,47 @@ payload whose halves differ and whose high half has the sign bit set round-trips
 directions. A lowering that swapped the halves, read the slot at the wrong offset, or
 sign-extended one of them emits the same instructions and a different value.
 
+### Added
+
+#### manifest: a target can set the image stack size (#2990)
+
+The PE stack reserve was a literal `0x100000`, so a mach project could not ship a
+Windows program needing more than a megabyte of stack. No flag, no workaround, while
+every other linker exposes it (`/STACK`, `--stack`, `-Wl,--stack`) - and mach owns the
+PE it writes.
+
+Found from a real program: a game's `main` needed a 1,107,824-byte frame against the
+1,048,576-byte reserve, so the image died in its own prologue on every Windows machine
+while running fine on linux, which hands the main thread eight megabytes. The stack
+probe was correct throughout. Only the reserve was unreachable.
+
+```toml
+[target.windows]
+isa  = "x86_64"
+os   = "windows"
+abi  = "win64"
+stack_reserve = 0x800000
+stack_commit  = 0x1000
+```
+
+Both optional; omitting them reproduces today's bytes exactly. They sit on the target
+beside `base` because all three are image memory-layout parameters expressible only on
+some object formats - and because a reserve is address space rather than committed
+memory, so a small tool inheriting a large program's reserve costs nothing.
+
+**Only some formats carry one.** PE keeps both in its optional header, Mach-O keeps a
+reserve in `LC_MAIN.stacksize`; ELF has nowhere to put one and a raw flat image has no
+header. Either key on a target whose resolved object format carries none is refused
+when the manifest is read, naming the key, the target and the format - and **every
+declared target is checked, not only the one being built**, because a key checked only
+in the cell being built is a key that silently does nothing until someone builds the
+other cell months later.
+
+On Mach-O the value reaches only a position-independent image. A non-PIE one enters
+through `LC_UNIXTHREAD`, which has no stacksize member, so a stack size requested there
+is refused at link rather than dropped. That is a property of the image SHAPE rather
+than of the format, is not knowable when the manifest is read, and is therefore checked
+in the writer - two facts, two checks, each where its fact is known.
 ## [4.24.0] - 2026-08-21
 
 ### Added

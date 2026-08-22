@@ -42,6 +42,22 @@ if [ -n "$first" ]; then
     fi
 fi
 
+# ...and at most one `###` of each kind inside a version block. This is the same
+# defect one level down, and it is the one that actually happened: the outer rule held
+# while six `### Fixed` headings accumulated under one `## [Unreleased]`, because each
+# pull request appended its own section rather than finding the existing one. A reader
+# then has to scan the whole release to know whether they have seen all the fixes.
+dupes=$(awk '
+    /^## \[/ { section = $0; delete seen; next }
+    /^### / { if ($0 in seen) print section " has a repeated \x27" $0 "\x27"; seen[$0] = 1 }
+' "$file")
+if [ -n "$dupes" ]; then
+    echo "check-changelog: $file repeats a subsection inside a release:" >&2
+    echo "$dupes" | sed 's/^/  /' >&2
+    echo "  append an entry under the existing heading; a second one of the same kind splits the release in two." >&2
+    status=1
+fi
+
 if [ "$status" -eq 0 ]; then
     echo "check-changelog: $file ok"
 fi
