@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+#### ct: no test gates on a timing measurement (#3070)
+
+`mach.lang.ct.probe` asserted a constant-time verdict against thresholds over
+measured wall-clock time. That failed the 4.26.0 release gate on `x86_64-darwin`
+and passed a re-run of the identical commit. The null control was flat, so the run
+believed it could discriminate, while its means sat at 126k-159k against the
+probe's 12k-38k: a quiet control at 126k ns certifies nothing about noise at 12k
+ns. The thresholds had been calibrated on one linux box and the relative cost of
+these probes is a microarchitecture property.
+
+The gate is gone rather than recalibrated. A better threshold lowers the
+false-failure rate without bounding it, and a required check that can fail
+nondeterministically is worse than no check. The harness stays and is exercised on
+every run at tiny sample counts, asserting only that it executes and produces
+finite, positive, ordered numbers, which is deterministic and still fails if it
+rots. The measurements themselves are taken deliberately by a person, as
+`doc/language/secrecy.md` now says.
+
+The three deterministic restorations from #2944 are untouched, including the
+x86-64 flags probe.
+
+
 ## [4.26.0] - 2026-08-22
 
 ### Added
