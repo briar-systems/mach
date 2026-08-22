@@ -46,6 +46,7 @@ use mach.lang.fe.sema.check;
 use mach.lang.fe.sema.context;
 use mach.lang.fe.sema.embed;
 use mach.lang.fe.sema.generics;
+use mach.lang.fe.sema.abitype;
 use mach.lang.fe.sema.handle;
 use mach.lang.fe.sema.infer;
 use mach.lang.fe.token;
@@ -1345,6 +1346,7 @@ fun infer_one_body(sc: *context.SemaContext, did: id.DeclId) R.Result[bool, str]
     infer_decorator_args(sc, d);
     validate_decorators(sc, d);
     check_handle_decl(sc, did, d);
+    check_abi_type_placement(sc, did, d);
 
     if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
         ret infer_bodies_comptime_if(sc, ?d.data.comptime_if);
@@ -1793,6 +1795,91 @@ fun check_handle_fields(sc: *context.SemaContext, start: u32, len: u32) {
     }
 }
 
+# whether an ABI type is reachable from `t` without descending into a record (#3004)
+#
+# The `type_carries_handle` walk over the same spine and for the same reason: a
+# pointer to one, an array of one, and a `^` over one are each a different
+# declaration to refuse, so the question is asked about the whole type rather than
+# about its outermost kind. A record is not walked, because its fields are
+# declarations in their own right and are refused where they are written.
+# ---
+# sc: the context
+# t:  the type to test
+# ret: true when an ABI type is reachable without descending into a record
+fun type_carries_abi_type(sc: *context.SemaContext, t: type.TypeId) bool {
+    if (t == type.TYPE_NIL || t == type.TYPE_ERROR) { ret false; }
+    val opt_type: O.Option[*type.Type] = type.get(?sc.s.types, t);
+    if (O.is_none[*type.Type](opt_type)) { ret false; }
+    val tp: *type.Type = O.unwrap[*type.Type](opt_type);
+    if (tp.kind == type.TYPE_ABI)     { ret true; }
+    if (tp.kind == type.TYPE_SECRET)  { ret type_carries_abi_type(sc, tp.data.secret.base); }
+    if (tp.kind == type.TYPE_POINTER) { ret type_carries_abi_type(sc, tp.data.pointer.base); }
+    if (tp.kind == type.TYPE_ARRAY)   { ret type_carries_abi_type(sc, tp.data.array.base); }
+    ret false;
+}
+
+# refuse every placement of an ABI type but the one that is the whole feature (#3004)
+#
+# A `va_list` is a token received from C and handed back to C, so a PARAMETER at the
+# type itself is the one position that means anything. Everything else here is a
+# program taking hold of the value: a field or a global gives it storage of its own,
+# a return position asks mach to originate one, and a pointer or an array asks for an
+# extent to step by. Each is refused on the line that writes it, so the message lands
+# where the misunderstanding is rather than at the call that later fails.
+# ---
+# sc:  the context
+# did: the decl
+# d:   the decl record
+fun check_abi_type_placement(sc: *context.SemaContext, did: id.DeclId, d: *decl.Decl) {
+    if (d.kind == decl.DECL_KIND_REC) {
+        check_abi_type_fields(sc, d.data.rec_.fields_start, d.data.rec_.fields_len);
+        ret;
+    }
+    if (d.kind == decl.DECL_KIND_UNI) {
+        check_abi_type_fields(sc, d.data.uni_.fields_start, d.data.uni_.fields_len);
+        ret;
+    }
+    if (d.kind == decl.DECL_KIND_FUN) {
+        var i: u32 = 0;
+        for (i < d.data.fun_.params_len) {
+            val tn: *decl.TypedName = ?sc.a.typed_names[d.data.fun_.params_start + i];
+            val pty: type.TypeId = context.resolved_type_of(sc, tn.ty);
+            # the parameter AT the type is the whole point; one BEHIND a pointer or
+            # inside an array is not.
+            if (type_carries_abi_type(sc, pty) && !type.is_abi_type(?sc.s.types, pty)) {
+                context.report(sc, tn.name, abitype.exclusion_message());
+            }
+            i = i + 1;
+        }
+        if (type_carries_abi_type(sc, context.resolved_type_of(sc, d.data.fun_.return_type))) {
+            context.report(sc, d.data.fun_.name, abitype.exclusion_message());
+        }
+        ret;
+    }
+    if (is_global_binding(d.kind)) {
+        if (sc.decl_type == nil) { ret; }
+        if (type_carries_abi_type(sc, sc.decl_type[did])) {
+            context.report(sc, d.span, abitype.exclusion_message());
+        }
+    }
+}
+
+# report each field in `[start, start + len)` declared at an ABI type
+# ---
+# sc:    the context
+# start: start index into ast.typed_names
+# len:   number of fields
+fun check_abi_type_fields(sc: *context.SemaContext, start: u32, len: u32) {
+    var i: u32 = 0;
+    for (i < len) {
+        val tn: *decl.TypedName = ?sc.a.typed_names[start + i];
+        if (type_carries_abi_type(sc, context.resolved_type_of(sc, tn.ty))) {
+            context.report(sc, tn.name, abitype.exclusion_message());
+        }
+        i = i + 1;
+    }
+}
+
 # report unless a handle declaration and its interface role agree (#2794)
 #
 # Two directions, because they are two different mistakes. A handle-typed global
@@ -2122,7 +2209,14 @@ fun validate_one_decorator(sc: *context.SemaContext, d: *decl.Decl, dec: *decl.D
         handle.validate(sc, d, dec);
         ret;
     }
-    context.report(sc, dec.name, "unknown decorator; valid directives are symbol, section, inline, noinline, align, packed, library, oblivious, scalar, naked, embed, stage, workgroup, input, output, builtin, uniform, storage, sampler, op, handle");
+    # `#[abi_type(name)]` on a bodyless `def` says the selected target declares this
+    # C type's layout (#3004). The name set is closed here for the reason `op`'s is:
+    # which target a module is built for is not a property of the source.
+    if (decorator_named(sc, dec, abitype.DIRECTIVE)) {
+        abitype.validate(sc, d, dec);
+        ret;
+    }
+    context.report(sc, dec.name, "unknown decorator; valid directives are symbol, section, inline, noinline, align, packed, library, oblivious, scalar, naked, embed, stage, workgroup, input, output, builtin, uniform, storage, sampler, op, handle, abi_type");
 }
 
 # validate a `#[naked]` decorator: its argument shape, its target, the decorators it
@@ -3058,6 +3152,14 @@ fun infer_local_decl(sc: *context.SemaContext, did: id.DeclId) R.Result[bool, st
     if (type_carries_handle(sc, ty)) {
         context.report(sc, d.span,
             "a handle cannot be a local binding: a local is storage the program owns, and a handle's representation is not the program's, so there is nothing that may be written into it. hand the handle straight to the operation that consumes it instead of naming it first");
+    }
+
+    # a local binding of an ABI type, on the same reasoning and refused for the same
+    # reason (#3004): a local is storage the program owns, and naming a `va_list`
+    # first is the copy `va_copy` exists to make, which mach has no way to make
+    # correctly and no reason to.
+    if (type_carries_abi_type(sc, ty)) {
+        context.report(sc, d.span, abitype.exclusion_message());
     }
 
     if (d.data.bind.init != id.EXPR_NIL) {
