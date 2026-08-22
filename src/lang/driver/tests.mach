@@ -21,7 +21,9 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
+use bin: mach.lang.target.of.bin;
 use std.types.string.str;
+use std.types.string.str_contains;
 use std.types.string.str_equals;
 use std.types.string.str_len;
 use std.types.path;
@@ -1417,7 +1419,7 @@ test "mach.lang.driver:unknown_escape_has_location" {
     ret bad;
 }
 
-# a character literal adopts the integer type supplied by its context (#2982)
+# a character literal adopts the integer type supplied by its context (#2982, #2949)
 #
 # sema already rewrites the literal's expression type during coercion. lowering
 # used to ignore that result and stamp every character constant i8, leaving a
@@ -1429,6 +1431,13 @@ test "mach.lang.driver:coerced_char_literal_lowers_at_context_width" {
     if (!ut_lower_clean("fun f() u64 { ret '0'; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
     if (!ut_lower_clean("fun f(v: u64) u8 { ret ('0' + v % 10)::u8; }\nfun main() i32 { ret f(2)::i32; }\n")) { bad = 1; }
     if (!ut_lower_clean("fun f(v: u64) u8 { ret (v % 10 + '0')::u8; }\nfun main() i32 { ret f(2)::i32; }\n")) { bad = 1; }
+    # A WIDENING DESTINATION ON THE MIXED EXPRESSION, which neither case above reaches:
+    # the first has no binary operation and the other two truncate. #2949 reported the
+    # same defect separately and observed it fired for EVERY destination width - `::u64`
+    # included, where sema sees no conversion at all - which is what places the fault on
+    # the source side. Pinning a destination that is not a truncation keeps a later
+    # regression from passing on the narrowing cases alone.
+    if (!ut_lower_clean("fun f(v: u64) u64 { ret ('0' + v)::u64; }\nfun main() i32 { ret f(2)::i32; }\n")) { bad = 1; }
     ret bad;
 }
 
@@ -7201,8 +7210,15 @@ fun ut_lower_errs(text: str) i32 {
         errs = -1;
         val sem: R.Result[bool, outcome.Fail] = passes.run_sema_pass(?p);
         if (R.is_ok[bool, outcome.Fail](sem)) {
-            passes.run_lower_pass(?p);
+            # A FAILED PASS IS AN ERROR EVEN WHEN IT FILED NO DIAGNOSTIC. This used to
+            # discard the lower pass's result and count the sink alone, so a pass that
+            # fails by RETURNING an error - the always-on IR verifier's conversion-width
+            # refusal, for one - read as clean. Every `ut_lower_clean` case guarding that
+            # class was therefore passing vacuously: reintroducing #2982's defect left
+            # the whole suite green while a real build of the same source refused it.
+            val low: R.Result[bool, outcome.Fail] = passes.run_lower_pass(?p);
             errs = ut_count_errors(?s.diags)::i32;
+            if (R.is_err[bool, outcome.Fail](low) && errs == 0) { errs = 1; }
         }
     }
 
@@ -21166,4 +21182,358 @@ test "mach.lang.driver:an_overlay_is_found_through_a_dotted_src_spelling" {
     session.dnit(?s);
     fs.remove_all(?alloc, root);
     ret bad;
+}
+
+# riscv32 (#2904): a 64-bit reinterpret ACROSS THE REGISTER BANKS is lowered through a
+# frame slot and executes to the right bits on the reference core
+#
+# WHY THIS TEST EXISTS. `f64 :~ i64` did not compile on rv32 at all: it reached
+# `be.codegen.legalize` as a retagged MIR_MOV, missed the lane split because one side is
+# FP-class, and fell out into "operation wider than the target ALU is unsupported
+# (MIR_MOV, 8 bytes wide)" - naming an opcode the source never wrote and a width that is
+# not the reason.
+#
+# The reason is that a cross-bank move is as wide as BOTH banks. `fmv.x.d` moves all 64
+# bits between an f register and a GP one, so it needs a 64-bit GP register and is
+# RV64-only, while rv32gc's D extension still puts doubles in f0-f31. So the write is
+# ordinary and the register form does not exist, which is a fact about the instruction
+# set and is now declared as `xbank_widths` rather than derived from FLEN and XLEN.
+#
+# EXECUTED, NOT PATTERN-MATCHED. An instruction-sequence assertion would pass on a
+# lowering that stored the halves in the wrong order, or read the slot at the wrong
+# offset, or sign-extended one half - every one of which is a wrong VALUE and none of
+# which changes which mnemonics appear. The core runs the emitted code and the bits are
+# compared against the input.
+fun ut_rv32_xbank_src() str {
+    ret "#[symbol(\"_start\")]\nfun probe(sel: i32, v: i64) i64 {\n    val f: f64 = v :~ f64;\n    if (sel == 0) { ret f :~ i64; }\n    # a round trip through the float bank and back, so BOTH directions run in one\n    # image and a lowering that is wrong in only one of them cannot pass.\n    if (sel == 1) { val g: f64 = (f :~ i64) :~ f64; ret g :~ i64; }\n    # the width the register form DOES exist at on rv32 (fmv.w.x / fmv.x.w), so a\n    # change that routed everything through memory would still be caught here.\n    val n: i32 = v::i32;\n    val s: f32 = n :~ f32;\n    ret (s :~ i32)::i64;\n}\n";
+}
+
+test "mach.lang.driver:an_rv32_cross_bank_reinterpret_round_trips_on_the_core" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val mr: R.Result[*u8, str] = A.allocate[u8](?alloc, UT_RV32_MEM);
+    if (R.is_err[*u8, str](mr)) { session.dnit(?s); ret 1; }
+    val mem: *u8 = R.unwrap_ok[*u8, str](mr);
+
+    var bad: i32 = 0;
+    var len: u32 = 0;
+    if (!ut_rv32_build_linked(?s, ?alloc, ut_rv32_xbank_src(), "rv32", mem, ?len)) { bad = 2; }
+    or {
+        # a payload whose two halves DIFFER and whose high half has the sign bit set:
+        # a swapped pair, a truncation, or a sign-extended low half each change it.
+        val payload: u64 = 0xC0FFEE0D_DEADBEEF;
+        var steps: u32 = 0;
+
+        var got: u64 = 0;
+        if (!ut_rv32_run_g(mem, 0, payload, ?got, ?steps)) { bad = 3; }
+        or (got != payload)                                { bad = 4; }
+
+        if (bad == 0) {
+            var got2: u64 = 0;
+            if (!ut_rv32_run_g(mem, 1, payload, ?got2, ?steps)) { bad = 5; }
+            or (got2 != payload)                                { bad = 6; }
+        }
+
+        if (bad == 0) {
+            # the 4-byte case takes the REGISTER form (fmv.w.x / fmv.x.w), which rv32
+            # does have - so a change that routed every crossing through memory, or one
+            # that routed none, is caught here rather than passing quietly.
+            #
+            # The expected value is SIGN-EXTENDED: the payload's low word has bit 31
+            # set, and the trailing `::i64` widens a signed `i32`. Reading it back as a
+            # bare 0xDEADBEEF would be asserting the wrong language semantics, not a
+            # narrower check.
+            var got3: u64 = 0;
+            if (!ut_rv32_run_g(mem, 2, payload, ?got3, ?steps)) { bad = 7; }
+            or (got3 != 0xFFFFFFFFDEADBEEF)                     { bad = 8; }
+        }
+    }
+
+    A.deallocate[u8](?alloc, mem, UT_RV32_MEM);
+    session.dnit(?s);
+    ret bad;
+}
+
+# a manifest with a stack key on an ELF target, beside a windows target that can carry one
+fun ut_manifest_stack_elf() str {
+    ret "[project]\nid = \"stk\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.win]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\nstack_reserve = 8388608\n\n[target.lin]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\nstack_reserve = 8388608\n\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n\n[artifact.stk]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/stk\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+}
+
+# a manifest whose stack keys sit only on a windows target
+fun ut_manifest_stack_pe() str {
+    ret "[project]\nid = \"stk\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.win]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\nstack_reserve = 8388608\nstack_commit = 8192\n\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n\n[artifact.stk]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/stk.exe\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+}
+
+# A stack key on a target whose object format carries none is refused AT LOAD (#2990).
+#
+# ELF has nowhere to put a stack size - a linux main thread's stack is the kernel's and
+# `ulimit`'s business - so the key can only ever have done nothing there. The refusal
+# names the key, the target, and the format, because the reader otherwise has to work
+# out which of the three is the surprising one.
+#
+# THE MANIFEST HERE IS VALID FOR THE TARGET SOMEONE WOULD BE BUILDING. `[target.win]`
+# carries the same key legitimately, and the load still fails on `[target.lin]`. That is
+# the point: a key checked only in the cell being built is a key that silently does
+# nothing until someone builds the other cell months later, which is the failure this
+# whole feature exists to end.
+test "mach.lang.driver:a_stack_key_on_a_format_without_one_is_refused_at_load" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = "fun main() i32 { ret 0; }\n";
+
+    var bad: i32 = 0;
+
+    val bad_root_r: R.Result[str, str] = ut_scaffold_m(?alloc, ut_manifest_stack_elf(), ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](bad_root_r)) { session.dnit(?s); ret 2; }
+    val bad_root: str = R.unwrap_ok[str, str](bad_root_r);
+
+    val br: R.Result[manifest.Manifest, str] = driver.load_manifest(?s, bad_root);
+    if (R.is_ok[manifest.Manifest, str](br)) {
+        var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](br);
+        manifest.dnit(?m, ?alloc);
+        bad = 3;
+    }
+    or {
+        val msg: str = R.unwrap_err[manifest.Manifest, str](br);
+        # the three facts the message owes the reader
+        if (!str_contains(msg, "stack_reserve") && bad == 0) { bad = 4; }
+        if (!str_contains(msg, "lin")           && bad == 0) { bad = 5; }
+        if (!str_contains(msg, "elf")           && bad == 0) { bad = 6; }
+    }
+    fs.remove_all(?alloc, bad_root);
+
+    # ...and the same keys on a format that CAN carry them load clean, so the refusal
+    # is about the format rather than about the keys existing.
+    if (bad == 0) {
+        val ok_root_r: R.Result[str, str] = ut_scaffold_m(?alloc, ut_manifest_stack_pe(), ?names[0], ?texts[0], 1);
+        if (R.is_err[str, str](ok_root_r)) { session.dnit(?s); ret 7; }
+        val ok_root: str = R.unwrap_ok[str, str](ok_root_r);
+
+        val orr: R.Result[manifest.Manifest, str] = driver.load_manifest(?s, ok_root);
+        if (R.is_err[manifest.Manifest, str](orr)) { bad = 8; }
+        or {
+            var m2: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](orr);
+            # the parsed values reach the TargetDef rather than being dropped on the way
+            if (m2.target_count != 1)                    { bad = 9; }
+            or (m2.targets[0].stack_reserve != 8388608)  { bad = 10; }
+            or (m2.targets[0].stack_commit  != 8192)     { bad = 11; }
+            manifest.dnit(?m2, ?alloc);
+        }
+        fs.remove_all(?alloc, ok_root);
+    }
+
+    session.dnit(?s);
+    ret bad;
+}
+
+# The manifest key reaches the EMITTED IMAGE, across every layer in between (#2990).
+#
+# WHY THIS EXISTS AS WELL AS THE COFF WRITER TEST. That one constructs `ImageOptions`
+# directly and proves the writer honours them; this one starts from `mach.toml`. The
+# gap between the two is the whole delivery chain - TargetDef, TargetEntry, the
+# resolved Target, and the linker filling the options from it - and a mutation that
+# dropped the value in the linker passed the entire suite while the writer test stayed
+# green. A capability nothing carries end to end is a capability that does not exist.
+test "mach.lang.driver:a_manifest_stack_reserve_reaches_the_linked_pe" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = "#[symbol(\"mainCRTStartup\")]\nfun main() i32 { ret 0; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold_m(?alloc, ut_manifest_stack_pe(), ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret 2; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+    val rr: R.Result[bool, str] = driver.setup_registry(?s.registry);
+    if (R.is_err[bool, str](rr)) { bad = 3; }
+    or {
+        val pr: R.Result[project.Project, outcome.Fail] = driver.build_project(?s, root, "win");
+        if (R.is_err[project.Project, outcome.Fail](pr)) { bad = 4; }
+        or {
+            var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+            if (ut_run_codegen_ok(?p) != 0) { bad = 5; }
+            or {
+                # the resolved target must carry it before the link can
+                if (p.target.stack_reserve != 8388608) { bad = 6; }
+                or (p.target.stack_commit  != 8192)    { bad = 7; }
+                or {
+                    var res: u64 = 0;
+                    var com: u64 = 0;
+                    if (!ut_pe_stack_of(?p, ?res, ?com)) { bad = 8; }
+                    or (res != 8388608)                  { bad = 9; }
+                    or (com != 8192)                     { bad = 10; }
+                }
+            }
+            project.dnit_project(?p);
+        }
+    }
+
+    fs.remove_all(?alloc, root);
+    session.dnit(?s);
+    ret bad;
+}
+
+# link `p`'s objects into a PE image and read its stack reserve and commit out of the
+# PE32+ optional header
+fun ut_pe_stack_of(p: *project.Project, res: *u64, com: *u64) bool {
+    val alloc: *A.Allocator = p.alloc;
+    if (p.emit_len == 0) { ret false; }
+
+    val ir: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](alloc, p.emit_len::usize);
+    if (R.is_err[*of.ObjectImage, str](ir)) { ret false; }
+    val images: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](ir);
+    var missing: bool = false;
+    var i: u32 = 0;
+    for (i < p.emit_len) {
+        val m: *project.ModuleEntry = ?p.modules[(p.topo[i])::u32];
+        if (m.object_image == nil) { missing = true; }
+        or                         { images[i] = @m.object_image; }
+        i = i + 1;
+    }
+
+    # COFF has no in-memory capture path - only `raw` implements `emit_exec_image` -
+    # so the image goes to a temp file and is read straight back.
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "stk_pe");
+    if (R.is_err[fs.TempFile, str](tf_r)) {
+        A.deallocate[of.ObjectImage](alloc, images, p.emit_len::usize);
+        ret false;
+    }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+
+    var linked: bool = false;
+    if (!missing) {
+        val lr: R.Result[bool, str] = linker.link_images(p.s, ?p.target, images,
+            p.emit_len, nil::*of.DynLib, 0, fs.temp_path(?tf)::*u8, "stkprobe"::*u8,
+            linker.LINK_EXE, false, of.image_options_default(of.SUBSYSTEM_CONSOLE));
+        linked = R.is_ok[bool, str](lr);
+    }
+    A.deallocate[of.ObjectImage](alloc, images, p.emit_len::usize);
+    if (!linked) { fs.temp_close_and_remove(?tf); ret false; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret false; }
+    val img: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    var ok: bool = false;
+    if (img.len > 0x100) {
+        val pe_off: usize = bin.read_u32_le(img.data, 0x3C)::usize;
+        # PE signature (4) + COFF header (20) -> the optional header
+        val oh: usize = pe_off + 24;
+        if (oh + 96 + 8 <= img.len) {
+            @res = bin.read_u64_le(img.data, oh + 72);
+            @com = bin.read_u64_le(img.data, oh + 80);
+            ok = true;
+        }
+    }
+    ret ok;
+}
+
+# a manifest with one windows target at the PE default reserve and one that raises it
+fun ut_manifest_stack_two() str {
+    ret "[project]\nid = \"stk\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.small]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\n\n[target.big]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\nstack_reserve = 8388608\n\n[target.lin]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n\n[artifact.stk]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/stk\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+}
+
+# A frame larger than the target's stack reserve fails the build, and raising the
+# reserve makes the same source build (#2991).
+#
+# The function could never execute, on any input: the prologue walks the guard pages
+# correctly right to the end of the reserve and then faults. mach knew both numbers -
+# the encoder receives the frame size to decide whether to probe, the object writer
+# writes the reserve - and never compared them, so a real program shipped for months
+# dying in its own prologue on every Windows machine while running fine on linux,
+# which hands the main thread eight megabytes and hides it.
+#
+# THE THREE CELLS ARE THE WHOLE FEATURE. The same source refuses under the PE default,
+# builds once the target raises the reserve (#2990's lever, which is why that landed
+# first), and is not diagnosed at all on ELF, whose stack is the kernel's and
+# `ulimit`'s rather than a number mach put in the image.
+test "mach.lang.driver:a_frame_larger_than_the_stack_reserve_is_refused" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    # a two-megabyte local, which no reasonable frame layout shrinks under a megabyte
+    texts[0] = "#[symbol(\"mainCRTStartup\")]\nfun main() i32 { var big: [2000000]u8; big[0] = 1; ret big[0]::i32; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold_m(?alloc, ut_manifest_stack_two(), ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret 2; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+    val rr: R.Result[bool, str] = driver.setup_registry(?s.registry);
+    if (R.is_err[bool, str](rr)) { bad = 3; }
+    or {
+        # the PE default reserve refuses it
+        if (!ut_build_names_frame_refusal(?s, root, "small") && bad == 0) { bad = 4; }
+        # the same source, with the reserve raised, builds
+        if (ut_build_fails(?s, root, "big")                  && bad == 0) { bad = 5; }
+        # ELF bounds nothing at compile time, so no frame refusal there. the linux cell
+        # fails on its own entry symbol, which is why the assertion is about the MESSAGE
+        # rather than about success: a frame diagnostic must not be what stopped it.
+        if (ut_build_names_frame_refusal(?s, root, "lin")     && bad == 0) { bad = 6; }
+    }
+
+    fs.remove_all(?alloc, root);
+    session.dnit(?s);
+    ret bad;
+}
+
+# whether building `tgt` fails with the frame-exceeds-reserve refusal, naming the
+# function, its frame size and the reserve
+#
+# It asserts on the MESSAGE rather than on failure, because the linux cell fails for an
+# unrelated reason (its entry symbol) and "the build failed" would pass there while
+# proving the opposite of what this test claims.
+fun ut_build_names_frame_refusal(s: *session.Session, root: str, tgt: str) bool {
+    val msg: str = ut_codegen_fail_msg(s, root, tgt);
+    ret str_contains(msg, "stack reserve cannot hold") && str_contains(msg, "1048576");
+}
+
+# the failure text from building `tgt`, or "" when the build and codegen both succeed
+fun ut_codegen_fail_msg(s: *session.Session, root: str, tgt: str) str {
+    val pr: R.Result[project.Project, outcome.Fail] = driver.build_project(s, root, tgt);
+    if (R.is_err[project.Project, outcome.Fail](pr)) {
+        ret R.unwrap_err[project.Project, outcome.Fail](pr).message;
+    }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+    var out: str = "";
+    val se: R.Result[bool, outcome.Fail] = passes.run_sema_pass(?p);
+    if (R.is_err[bool, outcome.Fail](se)) { out = R.unwrap_err[bool, outcome.Fail](se).message; }
+    or {
+        val le: R.Result[bool, outcome.Fail] = passes.run_lower_pass(?p);
+        if (R.is_err[bool, outcome.Fail](le)) { out = R.unwrap_err[bool, outcome.Fail](le).message; }
+        or {
+            val ce: R.Result[bool, outcome.Fail] = passes.run_codegen_pass(?p);
+            if (R.is_err[bool, outcome.Fail](ce)) { out = R.unwrap_err[bool, outcome.Fail](ce).message; }
+        }
+    }
+    project.dnit_project(?p);
+    ret out;
+}
+
+# whether building `tgt` fails for any reason at all
+fun ut_build_fails(s: *session.Session, root: str, tgt: str) bool {
+    ret str_len(ut_codegen_fail_msg(s, root, tgt)) != 0;
 }

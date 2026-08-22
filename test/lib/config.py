@@ -43,11 +43,11 @@ def _rows(path):
 
 class Target(object):
     __slots__ = ("name", "isa", "os", "abi", "of", "kind", "entry",
-                 "engine", "engine_cmd", "disasm", "runner", "cadence", "note")
+                 "engine", "engine_cmd", "disasm", "runner", "cadence", "decode", "note")
 
     def __init__(self, fields, note):
         (self.name, self.isa, self.os, self.abi, self.of, self.kind,
-         self.entry, engine, self.disasm, self.runner, self.cadence) = fields
+         self.entry, engine, self.disasm, self.runner, self.cadence, self.decode) = fields
         if ":" in engine:
             self.engine, self.engine_cmd = engine.split(":", 1)
         else:
@@ -74,10 +74,10 @@ def load_engines(path):
     targets = []
     seen = set()
     for lineno, line in _rows(path):
-        fields = line.split(None, 11)
-        if len(fields) != 12:
-            raise ConfigError("%s:%d: expected 12 columns, got %d" % (path, lineno, len(fields)))
-        t = Target(fields[:11], fields[11])
+        fields = line.split(None, 12)
+        if len(fields) != 13:
+            raise ConfigError("%s:%d: expected 13 columns, got %d" % (path, lineno, len(fields)))
+        t = Target(fields[:12], fields[12])
         if t.entry not in ("hosted", "direct", "freestanding"):
             raise ConfigError("%s:%d: entry must be hosted|direct|freestanding" % (path, lineno))
         if t.kind not in ("bin", "static"):
@@ -92,7 +92,40 @@ def load_engines(path):
             raise ConfigError("%s:%d: duplicate target name %s" % (path, lineno, t.name))
         seen.add(t.name)
         targets.append(t)
+    _check_pr_reader(path, targets)
     return targets
+
+
+def _check_pr_reader(path, targets):
+    """every object format mach writes is read by an external tool on the pr lane.
+
+    A format defect is introduced on a pull request, and that is where it is cheap to
+    find. COFF is why this is a check rather than a convention: `x86_64-windows` had a
+    leg that had never once started, so nothing external had ever parsed a mach PE, and
+    the very first layer A run over it found a long section-name form that llvm rejected
+    outright - every object with a constant pool unreadable, invisible for as long as
+    it was because no external reader had looked (mach#2952).
+
+    A `main`-cadence row is therefore allowed only when some `pr`-cadence row already
+    reads its format, either by running there itself or by naming a `decode` runner
+    that builds and decodes it. The rule lives here rather than in a comment so a
+    future metered row is a visible decision instead of an accident (mach#2957).
+    """
+    reads_at_pr = set()
+    for t in targets:
+        if t.runner != "-" and t.cadence == "pr":
+            reads_at_pr.add(t.object_format)
+        if t.decode != "-":
+            reads_at_pr.add(t.object_format)
+    for t in targets:
+        if t.runner == "-" or t.cadence == "pr":
+            continue
+        if t.object_format not in reads_at_pr:
+            raise ConfigError(
+                "%s: row %s is main cadence and no pr-cadence row reads the %s format, "
+                "so a defect in it would first be seen at the release merge. give the "
+                "row a `decode` runner that reads it on the pr lane, or move it to pr "
+                "cadence." % (path, t.name, t.object_format))
 
 
 class Tool(object):

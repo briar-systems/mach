@@ -172,6 +172,10 @@ val X86_64_RELOC_SIGNED:   u32 = 1;
 val X86_64_RELOC_BRANCH:   u32 = 2;
 val X86_64_RELOC_GOT_LOAD: u32 = 3;
 val X86_64_RELOC_GOT:      u32 = 4;
+# the subtrahend half of a difference pair: this entry names the symbol SUBTRACTED,
+# and the X86_64_RELOC_UNSIGNED entry that must follow it at the same address names
+# the minuend (#2973)
+val X86_64_RELOC_SUBTRACTOR: u32 = 5;
 val X86_64_RELOC_SIGNED_1: u32 = 6;
 val X86_64_RELOC_SIGNED_2: u32 = 7;
 val X86_64_RELOC_SIGNED_4: u32 = 8;
@@ -1543,6 +1547,12 @@ pub fun register_macho(reg: *of.OfRegistry) R.Result[bool, str] {
     # Mach-O image, position-independent or not, so __TEXT lands on the base and
     # __PAGEZERO spans the whole low region below it (#2599).
     macho_vtable.header_in_first_segment = true;
+    # `LC_MAIN.stacksize` carries a reserve on a PIE image; a non-PIE LC_UNIXTHREAD
+    # image has no such member and is refused by the writer, not here (#2990)
+    macho_vtable.carries_stack_size = true;
+    # `LC_MAIN.stacksize = 0` defers to dyld's default, a number mach does not choose,
+    # so an unstated Mach-O reserve bounds nothing at compile time (#2991)
+    macho_vtable.default_stack_reserve = 0;
     macho_vtable.header_span = header_span;
     macho_vtable.executable_section_location = nil;
 
@@ -1968,6 +1978,24 @@ fun reserved_header_span(segs: *of.LoadSegment, seg_count: u32,
 #             accepted for of.ExecFn conformance and ignored - Mach-O's own
 #             symbol table is `LC_SYMTAB`, not implemented here yet
 # ret:        ok(true) on success, or an error string
+# a Mach-O image that enters through LC_UNIXTHREAD carries no stack size (#2990)
+#
+# `LC_MAIN` has a `stacksize` member and `LC_UNIXTHREAD` does not, so whether THIS
+# image can carry the value depends on its entry shape, not on the format. The
+# manifest check cannot answer it - it runs before a build knows whether the image
+# will be position-independent - so the writer answers it here.
+#
+# It REFUSES rather than dropping the value. A stack size that silently does nothing
+# is the exact failure this key exists to end: a game shipped for months against a
+# reserve it could not reach, because nothing said the number was unreachable.
+# ---
+# opts: the image options carrying the requested sizes
+# ret:  ok(true) when nothing was requested, or the refusal
+fun refuse_unixthread_stack(opts: *of.ImageOptions) R.Result[bool, str] {
+    if (opts.stack_reserve == 0 && opts.stack_commit == 0) { ret R.ok[bool, str](true); }
+    ret R.err[bool, str]("macho: a stack size needs an LC_MAIN entry, and this image enters through LC_UNIXTHREAD; `stack_reserve` / `stack_commit` reach only a position-independent Mach-O image");
+}
+
 fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable, segs: *of.LoadSegment,
               seg_count: u32, page_size: u64, image_base: u64, entry: u64,
               funcs: *of.ExecFunction, func_count: u32,
@@ -1977,6 +2005,10 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
               image_options: of.ImageOptions) R.Result[bool, str] {
     if (isa_vt == nil) { ret R.err[bool, str]("macho: nil exec isa"); }
     if (path == nil)   { ret R.err[bool, str]("macho: nil exec path"); }
+    # this writer's image is static and enters through LC_UNIXTHREAD, which has no
+    # stacksize member (#2990).
+    val su: R.Result[bool, str] = refuse_unixthread_stack(?image_options);
+    if (R.is_err[bool, str](su)) { ret su; }
     val arch_id: u32 = isa_vt.id;
     val ct: R.Result[u32, str] = cpu_type_for(arch_id);
     if (R.is_err[u32, str](ct)) { ret R.err[bool, str](R.unwrap_err[u32, str](ct)); }
@@ -3515,6 +3547,12 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     # in-image absolute pointer. a non-PIE image keeps the fixed-address shape: an
     # LC_UNIXTHREAD entry and no rebase stream.
     val pie: bool = dyn.pie;
+    # a non-PIE image on this path still enters through LC_UNIXTHREAD, which carries
+    # no stacksize; refuse a requested one rather than dropping it (#2990).
+    if (!pie) {
+        val su: R.Result[bool, str] = refuse_unixthread_stack(?image_options);
+        if (R.is_err[bool, str](su)) { ret su; }
+    }
     # the rebase relocations are emitted in a deterministic (segment, offset) order so
     # the signed image is byte-identical across the self-host fixpoint.
     if (pie && dyn.base_reloc_count > 1) {
@@ -3840,11 +3878,14 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
         bin.write_u32_le(buf, lc, LC_MAIN);
         bin.write_u32_le(buf, lc + 4, ENTRY_POINT_CMD_SIZE::u32);
         bin.write_u64_le(buf, lc + 8, entry - lay.text_va);    # entryoff
-        bin.write_u64_le(buf, lc + 16, 0);                     # stacksize
+        # stacksize: the main thread's stack reserve, or 0 to take dyld's default,
+        # which is what every image got before the key existed (#2990)
+        bin.write_u64_le(buf, lc + 16, image_options.stack_reserve);
         lc = lc + ENTRY_POINT_CMD_SIZE;
     }
     or {
         # LC_UNIXTHREAD: the static thread entry, program counter set to the entry.
+        # It carries no stacksize, so a requested one was refused before this ran.
         lc = write_unixthread(buf, lc, arch_id, entry, thread_cmd_size);
     }
 
@@ -4191,6 +4232,23 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
         if ((n_desc & N_WEAK_DEF) != 0) { flags = flags | of.SYM_OBJ_FLAG_WEAK; }
         if ((n_type & N_TYPE) == N_UNDF) {
             flags = flags | of.SYM_OBJ_FLAG_EXTERN;
+            # A COMMON SYMBOL WEARS AN UNDEFINED SYMBOL'S CLOTHES (#2974). N_UNDF with
+            # N_EXT and a NON-ZERO n_value is a tentative definition, and the value is
+            # the requested size rather than an address - the one place in the nlist
+            # encoding where n_value does not mean "where". Apple Clang emits one for
+            # every uninitialized file-scope C global unless the unit is built
+            # `-fno-common`, so reading it as an ordinary import made a vendored C
+            # dependency demand a `#[library]` attribution for storage it was asking
+            # the linker to allocate.
+            #
+            # The alignment is a log2 in n_desc bits 8-11, which is how ld64 spells it.
+            if ((n_type & N_EXT) != 0 && n_value != 0) {
+                flags = flags | of.SYM_OBJ_FLAG_COMMON;
+                out.symbols[si].size = n_value::u32;
+                out.symbols[si].align = 1;
+                val log2a: u32 = (n_desc::u32 >> 8) & 0xF;
+                if (log2a > 0 && log2a < 32) { out.symbols[si].align = 1 << log2a; }
+            }
             # recover the function-ness emit_object encoded in the reference type so
             # the linker can give a dynamic function import its call stub.
             if ((n_desc & REFERENCE_TYPE_MASK) == REFERENCE_FLAG_UNDEFINED_LAZY) { flags = flags | of.SYM_OBJ_FLAG_FUNCTION; }
@@ -4342,6 +4400,11 @@ fun count_relocs(buf: *u8, buf_size: usize, cputype: u32, ncmds: u32) R.Result[u
                     val word: u32 = bin.read_u32_le(buf, reloff + r::usize * RELOC_INFO_SIZE + 4);
                     val r_type: u32 = (word >> 28) & 0xF;
                     if (cputype == CPU_TYPE_ARM64 && r_type == ARM64_RELOC_ADDEND) { r = r + 1; cnt; }
+                    # a SUBTRACTOR pair is TWO entries and ONE neutral relocation, the
+                    # same accounting the ADDEND pair above needs: counting both would
+                    # leave a zero-filled trailing record and over-report reloc_count
+                    # (#2973).
+                    if (cputype == CPU_TYPE_X86_64 && r_type == X86_64_RELOC_SUBTRACTOR) { r = r + 1; cnt; }
                     total = total + 1;
                     r = r + 1;
                 }
@@ -4391,6 +4454,11 @@ fun populate_relocs(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_si
                 val nreloc: u32 = bin.read_u32_le(buf, sh + 60);
                 var pending: i64 = 0;
                 var have_pending: bool = false;
+                # the subtrahend stashed by an X86_64_RELOC_SUBTRACTOR, waiting for the
+                # UNSIGNED entry that completes the pair (#2973)
+                var sub_sym: u32 = 0;
+                var have_sub: bool = false;
+                var sub_addr: u32 = 0;
                 var r: u32 = 0;
                 for (r < nreloc) {
                     val e: usize = reloff + r::usize * RELOC_INFO_SIZE;
@@ -4407,6 +4475,38 @@ fun populate_relocs(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_si
                         have_pending = true;
                         r = r + 1;
                         cnt;
+                    }
+                    # THE SUBTRAHEND ARRIVES FIRST and carries no patch of its own: it
+                    # stashes the symbol to subtract, exactly as ARM64_RELOC_ADDEND above
+                    # stashes an addend, and the next entry does the work (#2973).
+                    if (cputype == CPU_TYPE_X86_64 && r_type == X86_64_RELOC_SUBTRACTOR) {
+                        if (have_sub) {
+                            ret R.err[bool, str]("macho: two X86_64_RELOC_SUBTRACTOR entries in a row; each one pairs with the UNSIGNED that follows it");
+                        }
+                        if (extn == 0) {
+                            ret R.err[bool, str]("macho: X86_64_RELOC_SUBTRACTOR is not symbol-based");
+                        }
+                        if (symnum >= nsyms) { ret R.err[bool, str]("macho: relocation symbol index out of range"); }
+                        if (r_length != 2 && r_length != 3) {
+                            ret R.err[bool, str]("macho: X86_64_RELOC_SUBTRACTOR field is neither 4 nor 8 bytes");
+                        }
+                        sub_sym  = symnum;
+                        sub_addr = address;
+                        have_sub = true;
+                        r = r + 1;
+                        cnt;
+                    }
+                    if (have_sub) {
+                        # the pair is adjacent, at one address, and its second half is an
+                        # UNSIGNED. Anything else is a malformed pair rather than a form
+                        # to guess at: the value written depends on both halves, so a
+                        # mismatched one would silently patch the wrong arithmetic.
+                        if (r_type != X86_64_RELOC_UNSIGNED) {
+                            ret R.err[bool, str]("macho: X86_64_RELOC_SUBTRACTOR is not followed by X86_64_RELOC_UNSIGNED");
+                        }
+                        if (address != sub_addr) {
+                            ret R.err[bool, str]("macho: the halves of an X86_64_RELOC_SUBTRACTOR pair patch different addresses");
+                        }
                     }
                     if (cputype == CPU_TYPE_X86_64 && x64_is_signed(r_type) && pcrel == 0) {
                         ret R.err[bool, str]("macho: x86_64 signed relocation is not pc-relative");
@@ -4452,15 +4552,35 @@ fun populate_relocs(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_si
                         addend = R.unwrap_ok[i64, str](sa);
                     }
 
+                    var out_kind: of.RelocKind = kind;
+                    var out_sym2: u32 = 0;
+                    if (have_sub) {
+                        # the minuend keeps `sym`; the stashed subtrahend becomes `sym2`,
+                        # and the width comes off the UNSIGNED half that writes the field.
+                        if (r_length == 3)      { out_kind = of.RK_DIFF64; }
+                        or (r_length == 2)      { out_kind = of.RK_DIFF32; }
+                        or {
+                            ret R.err[bool, str]("macho: an X86_64_RELOC_SUBTRACTOR pair writes neither 4 nor 8 bytes");
+                        }
+                        out_sym2 = sub_sym;
+                    }
+
                     out.relocations[rel_i].section = sec_i;
                     out.relocations[rel_i].offset  = address;
-                    out.relocations[rel_i].kind    = kind;
+                    out.relocations[rel_i].kind    = out_kind;
                     out.relocations[rel_i].sym     = target;
                     out.relocations[rel_i].addend  = addend;
+                    out.relocations[rel_i].sym2    = out_sym2;
                     rel_i = rel_i + 1;
                     pending = 0;
                     have_pending = false;
+                    sub_sym = 0;
+                    have_sub = false;
+                    sub_addr = 0;
                     r = r + 1;
+                }
+                if (have_sub) {
+                    ret R.err[bool, str]("macho: an X86_64_RELOC_SUBTRACTOR ends the section's relocations with no UNSIGNED to pair with");
                 }
                 sec_i = sec_i + 1;
                 sh = sh + SECTION_64_SIZE;
@@ -7600,4 +7720,315 @@ test "mach.lang.target.of.macho.write_bind_info:abs64_in_place_bind" {
     p = p + 1;
     if (p != end) { ret 1; }
     ret 0;
+}
+
+# emit the same minimal x86_64 object `ts_x64_roundtrip` builds and hand back its bytes
+#
+# Shared by the SUBTRACTOR tests, which need a REAL emitted object to patch rather than
+# a hand-built buffer: everything the parser walks to reach the relocation array - the
+# header, the segment command, the section table, the symbol table - is then genuine,
+# and only the entries under test are synthetic.
+# ---
+# ret: true when the object was emitted and read back into `out`
+fun t_emit_x64_object(alloc: *A.Allocator, i: *intern.Interner, out: *Vector[u8]) bool {
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64);
+
+    var text_bytes: [24]u8;
+    var k: usize = 0;
+    for (k < 24) { text_bytes[k] = 0; k = k + 1; }
+    text_bytes[0] = 0xE8;
+    var data_bytes: [8]u8;
+    k = 0;
+    for (k < 8) { data_bytes[k] = 0; k = k + 1; }
+
+    var secs: [2]of.Section;
+    secs[0].name = t_intern(i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 24; secs[0].align = 16;
+    secs[1].name = t_intern(i, ".data"); secs[1].kind = of.SK_DATA;
+    secs[1].bytes = ?data_bytes[0]; secs[1].len = 8; secs[1].align = 8;
+
+    var syms: [3]of.Symbol;
+    syms[0].name = t_intern(i, "_main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 24; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name = t_intern(i, "g"); syms[1].section = 1; syms[1].offset = 0;
+    syms[1].size = 8; syms[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_OBJECT;
+    syms[2].name = t_intern(i, "ext_func"); syms[2].section = of.SECTION_EXTERNAL;
+    syms[2].offset = 0; syms[2].size = 0; syms[2].flags = of.SYM_OBJ_FLAG_EXTERN;
+
+    var relocs: [3]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 1;  relocs[0].kind = of.RK_PLT32;
+    relocs[0].sym = 2; relocs[0].addend = -4;
+    relocs[1].section = 0; relocs[1].offset = 8;  relocs[1].kind = of.RK_PC32;
+    relocs[1].sym = 1; relocs[1].addend = -4;
+    relocs[2].section = 0; relocs[2].offset = 16; relocs[2].kind = of.RK_ABS64;
+    relocs[2].sym = 1; relocs[2].addend = 0;
+
+    var img: of.ObjectImage;
+    img.alloc = alloc;
+    img.interner = i;
+    img.name = t_intern(i, "test");
+    img.sections = ?secs[0]; img.section_count = 2;
+    img.symbols = ?syms[0]; img.symbol_count = 3;
+    img.relocations = ?relocs[0]; img.reloc_count = 3;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "macho_sub");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret false; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_object(?isa_vt, ?img, tpath::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret false; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret false; }
+    @out = R.unwrap_ok[Vector[u8], str](rb);
+    ret true;
+}
+
+# rewrite one relocation_info entry in an emitted Mach-O buffer
+#
+# The parse side is what #2973 changed, and mach's own writer emits no SUBTRACTOR - so
+# a round trip cannot produce the input under test. Patching the entries of a REAL
+# emitted object is the next best thing and better than a hand-built buffer: every
+# other structure the parser walks to reach the relocations is genuine.
+# ---
+# buf:      the emitted object bytes
+# reloff:   the section's relocation array file offset
+# idx:      which entry to rewrite
+# address:  r_address
+# symnum:   r_symbolnum
+# pcrel:    r_pcrel
+# length:   r_length (log2 of the field width)
+# extn:     r_extern
+# r_type:   the machine relocation type
+fun t_put_reloc(buf: *u8, reloff: usize, idx: u32, address: u32, symnum: u32,
+                pcrel: u32, length: u32, extn: u32, r_type: u32) {
+    val e: usize = reloff + idx::usize * RELOC_INFO_SIZE;
+    bin.write_u32_le(buf, e, address);
+    bin.write_u32_le(buf, e + 4, (symnum & 0xFFFFFF) | (pcrel << 24) | (length << 25)
+                                  | (extn << 27) | (r_type << 28));
+}
+
+# the file offset and count of the first section's relocation array in an emitted
+# object, found by walking the load commands the way the parser does
+fun t_first_reloff(buf: *u8, out_n: *u32) usize {
+    val ncmds: u32 = bin.read_u32_le(buf, 16);
+    var off: usize = MACH_HEADER_64_SIZE;
+    var c: u32 = 0;
+    for (c < ncmds) {
+        val cmd: u32 = bin.read_u32_le(buf, off);
+        val cmdsize: usize = bin.read_u32_le(buf, off + 4)::usize;
+        if (cmd == LC_SEGMENT_64) {
+            val nsects: u32 = bin.read_u32_le(buf, off + 64);
+            if (nsects > 0) {
+                val sh: usize = off + SEGMENT_CMD_64_SIZE;
+                @out_n = bin.read_u32_le(buf, sh + 60);
+                ret bin.read_u32_le(buf, sh + 56)::usize;
+            }
+        }
+        off = off + cmdsize;
+        c = c + 1;
+    }
+    @out_n = 0;
+    ret 0;
+}
+
+# An adjacent SUBTRACTOR + UNSIGNED pair folds into one difference relocation (#2973).
+#
+# Mach 4.18.1 refused a normal Apple Clang x86_64 object with `unsupported relocation
+# type 5`. Apple Clang emits the pair constantly - most visibly for a switch jump
+# table, whose entries are label differences rather than addresses so the table is
+# position-independent - and mach defined types 0-4 and 6-8 with no representation for
+# 5 at all.
+#
+# TWO ENTRIES BECOME ONE RECORD, which is the part with teeth: the minuend keeps `sym`,
+# the subtrahend becomes `sym2`, and `reloc_count` must not count the consumed entry or
+# the image carries a zero-filled trailing relocation. The ARM64_RELOC_ADDEND pair
+# already had that accounting and this one needs the same.
+test "mach.lang.target.of.macho:x64_subtractor_pair_folds_to_a_difference" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var buf: Vector[u8];
+    if (!t_emit_x64_object(?alloc, ?i, ?buf)) { ret 1; }
+
+    var nreloc: u32 = 0;
+    val reloff: usize = t_first_reloff(buf.data, ?nreloc);
+    if (reloff == 0 || nreloc < 2) { ret 2; }
+
+    # entry 0 subtracts symbol 1 (`g`), entry 1 adds symbol 0 (`_main`), both at the
+    # 8-byte field at offset 16 - the shape a jump-table entry has.
+    t_put_reloc(buf.data, reloff, 0, 16, 1, 0, 3, 1, X86_64_RELOC_SUBTRACTOR);
+    t_put_reloc(buf.data, reloff, 1, 16, 0, 0, 3, 1, X86_64_RELOC_UNSIGNED);
+    var z: u32 = 2;
+    for (z < nreloc) {
+        # the remaining entries are harmless absolutes at a distinct address
+        t_put_reloc(buf.data, reloff, z, 0, 0, 0, 3, 1, X86_64_RELOC_UNSIGNED);
+        z = z + 1;
+    }
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 3; }
+
+    var bad: i32 = 0;
+    # the pair produced ONE record, so the count is one below the entry count
+    if (out.reloc_count != nreloc - 1 && bad == 0) { bad = 4; }
+
+    var saw: bool = false;
+    var rj: u32 = 0;
+    for (rj < out.reloc_count) {
+        val rr: *of.Relocation = ?out.relocations[rj];
+        if (rr.kind == of.RK_DIFF64) {
+            saw = true;
+            if (rr.offset != 16 && bad == 0) { bad = 5; }
+            # r_length 3 is the 8-byte field, so the fold must pick the 64-bit form
+            if (!of.is_difference(rr.kind) && bad == 0) { bad = 6; }
+        }
+        rj = rj + 1;
+    }
+    if (!saw && bad == 0) { bad = 7; }
+
+    ret bad;
+}
+
+# A malformed SUBTRACTOR pair is refused rather than guessed at (#2973).
+#
+# The value written depends on BOTH halves, so a pair whose second half is missing, is
+# not an UNSIGNED, or patches a different address would silently produce the wrong
+# arithmetic at the patch site. Each is named separately because each is a different
+# way for a producer to be wrong.
+test "mach.lang.target.of.macho:a_malformed_subtractor_pair_is_refused" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var bad: i32 = 0;
+
+    # a SUBTRACTOR followed by something that is not an UNSIGNED
+    var b1: Vector[u8];
+    if (!t_emit_x64_object(?alloc, ?i, ?b1)) { ret 1; }
+    var n1: u32 = 0;
+    val o1: usize = t_first_reloff(b1.data, ?n1);
+    if (o1 == 0 || n1 < 2) { ret 2; }
+    t_put_reloc(b1.data, o1, 0, 16, 1, 0, 3, 1, X86_64_RELOC_SUBTRACTOR);
+    t_put_reloc(b1.data, o1, 1, 16, 0, 1, 2, 1, X86_64_RELOC_BRANCH);
+    var out1: of.ObjectImage;
+    if (R.is_ok[bool, str](parse_object(?alloc, ?i, b1.data, b1.len, ?out1)) && bad == 0) { bad = 3; }
+
+    # the two halves patching different addresses
+    var b2: Vector[u8];
+    if (!t_emit_x64_object(?alloc, ?i, ?b2)) { ret 4; }
+    var n2: u32 = 0;
+    val o2: usize = t_first_reloff(b2.data, ?n2);
+    if (o2 == 0 || n2 < 2) { ret 5; }
+    t_put_reloc(b2.data, o2, 0, 16, 1, 0, 3, 1, X86_64_RELOC_SUBTRACTOR);
+    t_put_reloc(b2.data, o2, 1, 8,  0, 0, 3, 1, X86_64_RELOC_UNSIGNED);
+    var out2: of.ObjectImage;
+    if (R.is_ok[bool, str](parse_object(?alloc, ?i, b2.data, b2.len, ?out2)) && bad == 0) { bad = 6; }
+
+    # two SUBTRACTOR entries in a row
+    var b3: Vector[u8];
+    if (!t_emit_x64_object(?alloc, ?i, ?b3)) { ret 7; }
+    var n3: u32 = 0;
+    val o3: usize = t_first_reloff(b3.data, ?n3);
+    if (o3 == 0 || n3 < 2) { ret 8; }
+    t_put_reloc(b3.data, o3, 0, 16, 1, 0, 3, 1, X86_64_RELOC_SUBTRACTOR);
+    t_put_reloc(b3.data, o3, 1, 16, 0, 0, 3, 1, X86_64_RELOC_SUBTRACTOR);
+    var out3: of.ObjectImage;
+    if (R.is_ok[bool, str](parse_object(?alloc, ?i, b3.data, b3.len, ?out3)) && bad == 0) { bad = 9; }
+
+    ret bad;
+}
+
+# the file offset and count of an emitted object's symbol table
+fun t_symtab(buf: *u8, out_n: *u32) usize {
+    val ncmds: u32 = bin.read_u32_le(buf, 16);
+    var off: usize = MACH_HEADER_64_SIZE;
+    var c: u32 = 0;
+    for (c < ncmds) {
+        val cmd: u32 = bin.read_u32_le(buf, off);
+        val cmdsize: usize = bin.read_u32_le(buf, off + 4)::usize;
+        if (cmd == LC_SYMTAB) {
+            @out_n = bin.read_u32_le(buf, off + 12);
+            ret bin.read_u32_le(buf, off + 8)::usize;
+        }
+        off = off + cmdsize;
+        c = c + 1;
+    }
+    @out_n = 0;
+    ret 0;
+}
+
+# A tentative definition is read as COMMON, not as an ordinary import (#2974).
+#
+# `N_UNDF | N_EXT` with a NON-ZERO `n_value` is C common storage: the value is the
+# requested SIZE rather than an address, the one place in the nlist encoding where
+# n_value does not mean "where". Read as an ordinary undefined symbol it became a
+# dynamic import, and a native Darwin link of a vendored C dependency failed with
+# `dynamic import _ma_atomic_global_lock has no #[library] attribution` - a message
+# that names the symbol correctly and the problem not at all.
+#
+# Apple Clang emits one for every uninitialized file-scope global unless the unit is
+# compiled `-fno-common`, so this arrives whether or not anyone chose it.
+test "mach.lang.target.of.macho:a_tentative_definition_reads_as_common" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var buf: Vector[u8];
+    if (!t_emit_x64_object(?alloc, ?i, ?buf)) { ret 1; }
+
+    var nsyms: u32 = 0;
+    val symoff: usize = t_symtab(buf.data, ?nsyms);
+    if (symoff == 0 || nsyms == 0) { ret 2; }
+
+    # rewrite the LAST symbol (the external one) into a tentative definition of 40
+    # bytes aligned to 16: n_type = N_UNDF|N_EXT, n_desc alignment log2 in bits 8-11.
+    val so: usize = symoff + (nsyms - 1)::usize * NLIST_64_SIZE;
+    buf.data[so + 4] = N_UNDF | N_EXT;
+    buf.data[so + 5] = 0;
+    bin.write_u16_le(buf.data, so + 6, (4 << 8)::u16);
+    bin.write_u64_le(buf.data, so + 8, 40);
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 3; }
+
+    var bad: i32 = 0;
+    var saw: bool = false;
+    var k: u32 = 0;
+    for (k < out.symbol_count) {
+        val sym: *of.Symbol = ?out.symbols[k];
+        if ((sym.flags & of.SYM_OBJ_FLAG_COMMON) != 0) {
+            saw = true;
+            if (sym.size != 40                                    && bad == 0) { bad = 4; }
+            if (sym.align != 16                                   && bad == 0) { bad = 5; }
+            # still undefined here: the linker is what turns it into storage, and every
+            # consumer meaning "needs resolving" must keep seeing that
+            if ((sym.flags & of.SYM_OBJ_FLAG_EXTERN) == 0         && bad == 0) { bad = 6; }
+            if (sym.section != of.SECTION_EXTERNAL                && bad == 0) { bad = 7; }
+        }
+        k = k + 1;
+    }
+    if (!saw && bad == 0) { bad = 8; }
+
+    # ...and a plain undefined symbol (n_value 0) is NOT common, which is the half that
+    # keeps every existing import working
+    var b2: Vector[u8];
+    if (!t_emit_x64_object(?alloc, ?i, ?b2)) { ret 9; }
+    var n2: u32 = 0;
+    val s2: usize = t_symtab(b2.data, ?n2);
+    if (s2 == 0 || n2 == 0) { ret 10; }
+    var out2: of.ObjectImage;
+    if (R.is_err[bool, str](parse_object(?alloc, ?i, b2.data, b2.len, ?out2))) { ret 11; }
+    var k2: u32 = 0;
+    for (k2 < out2.symbol_count) {
+        if ((out2.symbols[k2].flags & of.SYM_OBJ_FLAG_COMMON) != 0 && bad == 0) { bad = 12; }
+        k2 = k2 + 1;
+    }
+
+    ret bad;
 }

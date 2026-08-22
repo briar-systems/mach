@@ -5,6 +5,282 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.25.0] - 2026-08-21
+
+
+### Fixed
+
+#### link(macho): a C common symbol is allocated instead of demanded as an import (#2974)
+
+An external Mach-O common symbol - `N_UNDF | N_EXT` with a non-zero `n_value` - was read
+as an ordinary undefined import, so a native x86_64 Darwin link of a vendored C
+dependency failed with:
+
+```
+dynamic import _ma_atomic_global_lock has no #[library] attribution
+```
+
+The symbol is a **tentative definition** in the foreign object, not a dylib import.
+Apple Clang emits one for every uninitialized file-scope C global unless the translation
+unit is compiled `-fno-common`, so it arrives whether or not anyone chose it - and the
+message named the symbol correctly and the problem not at all.
+
+`n_value` on such a symbol is the requested SIZE rather than an address, the one place
+in the nlist encoding where it does not mean "where", with the alignment as a log2 in
+`n_desc`. Both are now preserved in the neutral model as `SYM_OBJ_FLAG_COMMON` plus
+`Symbol.align`, alongside `SYM_OBJ_FLAG_EXTERN` - a common IS undefined until the linker
+allocates it, so every consumer that means "needs resolving" keeps working and only the
+one deciding HOW it resolves has to know the difference.
+
+**The allocation belongs to the linker, and arrives as an ordinary input image.** A
+tentative definition asks the linker for storage, and every object declaring the name
+asks for the SAME storage rather than its own - so the commons are gathered once, ahead
+of everything that resolves a symbol, and appended as one synthesized `.bss` input.
+Symbol resolution, dead-stripping and every format's own collection then apply to it
+with no side path, because from that point it is not distinguishable from any other BSS
+definition.
+
+Coalesced by MAX size and alignment, which is the C rule: taking the first size seen
+under-allocates the moment a later unit declares a larger type, and allocating per
+object multiplies the storage and leaves the copies unaliased, so two writers of the
+same name would not see each other.
+
+A real definition of the name wins outright and the common allocates nothing. A strong
+definition and a tentative one are not a duplicate-symbol collision; the tentative one
+exists precisely to yield to it. A relocatable output allocates nothing either, since it
+carries its symbols through unresolved and the eventual link is where the storage is
+decided.
+
+#### link(macho): an x86_64 SUBTRACTOR relocation pair is parsed and resolved (#2973)
+
+Mach refused a normal Apple Clang x86_64 object outright:
+
+```
+error: macho: unsupported relocation type 5
+```
+
+`macho.mach` defined x86_64 relocation types 0-4 and 6-8 and had no representation for
+`X86_64_RELOC_SUBTRACTOR` at all. Apple Clang emits it constantly as an adjacent
+SUBTRACTOR + UNSIGNED pair - most visibly for a switch jump table, whose entries are
+label differences rather than addresses so the table is position-independent - so a
+vendored C translation unit compiled with `-O2` could simply fail to link.
+
+**The difference is now a first-class relocation.** `RK_DIFF32` / `RK_DIFF64` resolve
+`sym - sym2 + addend`, and `Relocation` gains `sym2`, read only for those kinds so a
+zero-initialized record stays correct everywhere else. Two symbols is the fact rather
+than an encoding detail: folding the pair away in the reader is only right when both
+sides are defined in the object being read, so a reader that folded would be correct
+until the first object that is not a jump table.
+
+The reader mirrors the paired-relocation mechanism `ARM64_RELOC_ADDEND` already used -
+the first entry stashes the subtrahend, the second does the work - including the
+accounting that matters: two entries become ONE record, so the relocation count must
+not count the consumed entry or the image carries a zero-filled trailing relocation.
+
+The linker folds the subtrahend into the addend, since `sym - sym2 + A` is
+`sym + (A - addr(sym2))`, which reuses the existing absolute appliers and their
+overflow checks rather than threading a second target through every ISA. The 32-bit
+form resolves through the SIGNED absolute, because a difference is signed whichever way
+the two labels are ordered.
+
+A difference against a symbol the link does not define is refused with its own message.
+That is correct rather than a limitation: the loader chooses that address, so the
+difference is not a link-time constant and no relocation could make it one.
+
+Malformed pairs are refused individually - a missing second half, a second half that is
+not an UNSIGNED, halves patching different addresses, two SUBTRACTORs in a row - because
+the value written depends on both halves, so guessing at one would silently patch the
+wrong arithmetic.
+
+Mach's own writer emits no SUBTRACTOR, so a difference reaching the Mach-O writer still
+refuses by the existing unsupported-kind path rather than writing something wrong.
+
+#### test: Mach-O gets an external reader on the lane that gates merges (#2957)
+
+`test/engines.conf` gave both darwin rows `main` cadence, so `ci-legs.sh pr` emitted no
+darwin leg and corpus layer A - the step that runs `llvm-readobj` over a mach-produced
+object - ran on a pull request over ELF and COFF only. A change to
+`src/lang/target/of/macho.mach` could reach `dev` with **no external tool having parsed
+its output**; the first external read was the release merge. Between releases mach was
+its own only reader of a format it writes, and darwin is a shipping target.
+
+COFF is why that is not theoretical. `x86_64-windows` had a leg that had never once
+started, so nothing external had read a mach PE either - and the very first layer A run
+found the long section-name form written right-justified and space-padded, which binutils
+tolerates and llvm rejects outright. Every object with a constant pool was unreadable,
+invisible for as long as it was because no external reader had looked (#2952).
+
+The registry gains a `decode` column: a runner that BUILDS AND READS a row on the pr lane
+without executing it. Both darwin rows name `ubuntu-latest`, so their Mach-O objects are
+cross-built and decoded on every pull request while execution stays on the metered mac
+runners at release cadence. The metered-runner reason for that cadence was real and is
+untouched.
+
+**The rule is enforced, not just written down.** `config.py` refuses a registry where a
+`main`-cadence row has no `pr`-cadence reader of its object format, so a future metered
+row is a visible decision rather than an accident.
+
+Demonstrated the way #2952 was: breaking the Mach-O `cputype` turns the x86_64-darwin
+column red on the pr lane and leaves aarch64-darwin green - a selective failure rather
+than a broken harness - and restoring it returns 728 cells green. No new toolchain: the
+llvm tools layer A already requires are the ones that read it.
+
+#### test(link): the c-variadic golden samples both register-slot floats (#3043)
+
+The `floats` line reported `out[0]`, `out[3]` and `out[7]`. On win64 only the first four
+POSITIONAL slots have registers, and the two fixed parameters take two of them - so of
+those eight doubles only `out[0]` and `out[1]` ride a register and can expose a broken
+`float_dup_gp`, the rule that duplicates a tail float into the integer register of its
+slot. Eight doubles read like broad coverage of the register/stack boundary and, for
+that rule, were a **one-value check**: `out[1]` is equally broken by the same defect and
+was never printed.
+
+Found by mutation-testing the leg #3005 enabled, not by a failure. Nothing was wrong;
+the margin was simply thinner than the case looked, and the next person to weaken the
+rule had one printed value standing between them and a green run.
+
+`out[7]` stays as the stack-side control - a mutation that moved it too would mean
+something different and worse.
+
+#### test: a failed lowering pass counts as an error, so char-width regressions actually regress (#2949)
+
+`ut_lower_clean` reported "no errors" by counting the DIAGNOSTIC SINK after running the
+lowering pass, and discarded the pass's own result. A pass that fails by **returning** an
+error rather than filing a diagnostic - the always-on IR verifier's conversion-width
+refusal, for one - was therefore invisible to it.
+
+The consequence: every `ut_lower_clean` case guarding that class was passing vacuously.
+Reintroducing #2982's defect (`lower_lit_char` stamping every character constant 8 bits
+instead of reading the type sema settled) left the whole suite green, while a real build
+of the same source refused it with exactly the reported error. The fix was correct; there
+was simply nothing holding it.
+
+The helper now treats a failed pass as an error. The guard it exists for fails when the
+defect is reintroduced, which is the property it was always assumed to have.
+
+#### codegen: a frame larger than the target's stack reserve is refused (#2991)
+
+A function whose own stack frame is larger than the target's whole stack reserve can
+never execute, on any input. mach emitted it and said nothing.
+
+Both numbers were already in hand at build time - the encoder receives the frame size
+to decide whether to emit a stack probe, the object writer writes the reserve - and
+nothing compared them. A game's `main` needed 1,107,824 bytes against the
+1,048,576-byte Windows reserve, overrunning it by 59,248 bytes before executing a
+statement. The build was clean, the PE was structurally valid, and the image died in
+its own prologue on every Windows machine. It shipped that way for months, because
+linux gives the main thread eight megabytes and hides it.
+
+```
+error: frame: `main` needs a 1107824-byte stack frame, which its target's
+1048576-byte stack reserve cannot hold; raise `stack_reserve` on the target, or move
+the large locals off the stack
+```
+
+An error rather than a warning because it is a PROOF: one frame against one reserve,
+no call graph, no input dependence, no false positives. The rejected alternative is
+whole-call-graph depth analysis - recursion and indirect calls make cumulative depth
+undecidable, and a heuristic that reports chains which cannot happen trains people to
+ignore the one report that is exact.
+
+Equal is refused and one byte under builds: a frame exactly the size of the reserve
+leaves nothing for the caller that entered it, its return address, or the guard page
+below.
+
+The check lives with the frame layout rather than in an encoder, so it is one rule for
+every ISA rather than an x86-64 fact. It reads the reserve the image will actually get:
+what the target stated (#2990), else the format's own default, else nothing. A target
+whose stack the image does not bound - every ELF one, and a Mach-O image with no stated
+reserve, which takes dyld's default - is not checked at all, because a bound mach did
+not choose is not a bound mach may refuse a program against.
+
+#### target(riscv32): a 64-bit reinterpret across the register banks is lowered (#2904)
+
+`f64 :~ i64` did not compile on riscv32, and the diagnostic named neither the cause nor
+the instruction that was missing:
+
+```
+error: legalize: operation wider than the target ALU is unsupported (MIR_MOV, 8 bytes wide)
+```
+
+A cross-bank move is as wide as **both** banks. `fmv.x.d` moves all 64 bits between an
+`f` register and a GP one, so it needs a 64-bit GP register and is RV64-only - while
+rv32gc's D extension still puts doubles in `f0-f31`. The write is ordinary and the
+register form does not exist.
+
+The reinterpret is now expanded at MIR lowering into a frame round trip - a store in
+the source's bank and a load in the destination's, since the bits are the same in
+either one:
+
+```
+bits   (f64 :~ i64):  fsd fa0,-0x10(s0)  ->  lw a0,-0x10(s0) ; lw a1,-0xc(s0)
+unbits (i64 :~ f64):  sw a0,-0x10(s0) ; sw a1,-0xc(s0)  ->  fld fa0,-0x10(s0)
+narrow (f32 :~ i32):  fmv.x.w a0, fa0
+```
+
+which is what a C toolchain emits on this target. Nothing downstream needed a new
+clause: the float half is an ordinary float move against a MEM operand, which the
+encoder already handled because a spilled side reaches it the same way, and the integer
+half is an ordinary wide integer move that `be.codegen.legalize` already splits.
+
+**The fact is declared, not derived.** `MachineModel.xbank_widths` names the widths an
+ISA crosses between its float bank and a GP register in one instruction, asked through
+a single accessor the way `vec_mem_widths` is. Deriving it from `flen_bits` and
+`gpr_width` gives the right answer on the riscv members by coincidence and the wrong one
+on x86-64, where a 128-bit XMM would imply a 16-byte crossing `movq` does not perform.
+rv64 keeps `fmv.x.d` / `fmv.d.x`; rv32 declares 4 alone, so `f32 :~ i32` still takes
+`fmv.x.w` and only the 64-bit case goes through memory.
+
+The assumption that let this survive was a comment: *a conversion is the one instruction
+with a value in each bank*. A bit reinterpret is the other, and it is corrected in place
+rather than deleted.
+
+Verified by EXECUTION on the riscv32 reference core, not by matching mnemonics: a
+payload whose halves differ and whose high half has the sign bit set round-trips in both
+directions. A lowering that swapped the halves, read the slot at the wrong offset, or
+sign-extended one of them emits the same instructions and a different value.
+
+### Added
+
+#### manifest: a target can set the image stack size (#2990)
+
+The PE stack reserve was a literal `0x100000`, so a mach project could not ship a
+Windows program needing more than a megabyte of stack. No flag, no workaround, while
+every other linker exposes it (`/STACK`, `--stack`, `-Wl,--stack`) - and mach owns the
+PE it writes.
+
+Found from a real program: a game's `main` needed a 1,107,824-byte frame against the
+1,048,576-byte reserve, so the image died in its own prologue on every Windows machine
+while running fine on linux, which hands the main thread eight megabytes. The stack
+probe was correct throughout. Only the reserve was unreachable.
+
+```toml
+[target.windows]
+isa  = "x86_64"
+os   = "windows"
+abi  = "win64"
+stack_reserve = 0x800000
+stack_commit  = 0x1000
+```
+
+Both optional; omitting them reproduces today's bytes exactly. They sit on the target
+beside `base` because all three are image memory-layout parameters expressible only on
+some object formats - and because a reserve is address space rather than committed
+memory, so a small tool inheriting a large program's reserve costs nothing.
+
+**Only some formats carry one.** PE keeps both in its optional header, Mach-O keeps a
+reserve in `LC_MAIN.stacksize`; ELF has nowhere to put one and a raw flat image has no
+header. Either key on a target whose resolved object format carries none is refused
+when the manifest is read, naming the key, the target and the format - and **every
+declared target is checked, not only the one being built**, because a key checked only
+in the cell being built is a key that silently does nothing until someone builds the
+other cell months later.
+
+On Mach-O the value reaches only a position-independent image. A non-PIE one enters
+through `LC_UNIXTHREAD`, which has no stacksize member, so a stack size requested there
+is refused at link rather than dropped. That is a property of the image SHAPE rather
+than of the format, is not knowable when the manifest is read, and is therefore checked
+in the writer - two facts, two checks, each where its fact is known.
 ## [4.24.0] - 2026-08-21
 
 ### Added

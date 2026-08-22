@@ -13,7 +13,11 @@
 #
 # prints a compact JSON array the workflow feeds straight to `strategy.matrix.include`:
 #
-#   [{"runner":"ubuntu-latest","legs":"x86_64-linux riscv64-linux ...","qemu":"qemu-riscv64"}]
+#   [{"runner":"ubuntu-latest","legs":"x86_64-linux ...","qemu":"qemu-riscv64","decode":"x86_64-darwin aarch64-darwin"}]
+#
+# `decode` names the rows this runner BUILDS AND READS without executing, which is how
+# a release-cadence format keeps an external reader on the lane that gates merges into
+# `dev` (#2957). Empty when the runner reads nothing beyond its own legs.
 #
 # keys avoid hyphens so `matrix.runner` resolves in the GitHub expression context.
 # `legs` is the link suite's leg list for that runner; `qemu` names the interpreters
@@ -35,7 +39,7 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 awk -v want="$cadence" '
     /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
     {
-        name = $1; engine = $8; runner = $10; rowcadence = $11
+        name = $1; engine = $8; runner = $10; rowcadence = $11; dec = $12
         if (runner == "-") next
         if (runner in seen && cad[runner] != rowcadence) {
             printf "ci-legs.sh: runner %s carries cadence %s and %s; one runner is one job, so the rows must agree\n", runner, cad[runner], rowcadence > "/dev/stderr"
@@ -44,6 +48,13 @@ awk -v want="$cadence" '
         }
         seen[runner] = 1
         cad[runner] = rowcadence
+        # a decode assignment is independent of the cadence on this row: it names the
+        # runner that READS this row on the pr lane, which is the whole point when the
+        # row itself executes at release cadence (#2957).
+        if (dec != "-" && want == "pr") {
+            if (dec in decodes) decodes[dec] = decodes[dec] " " name; else decodes[dec] = name
+            if (!(dec in seenr)) { seenr[dec] = 1 }
+        }
         if (rowcadence != want) next
         if (runner in legs) legs[runner] = legs[runner] " " name; else { legs[runner] = name; order[++n] = runner }
         if (engine ~ /^qemu:/) {
@@ -58,7 +69,7 @@ awk -v want="$cadence" '
         for (i = 1; i <= n; i++) {
             r = order[i]
             if (i > 1) printf ","
-            printf "{\"runner\":\"%s\",\"legs\":\"%s\",\"qemu\":\"%s\"}", r, legs[r], (r in qemu ? qemu[r] : "")
+            printf "{\"runner\":\"%s\",\"legs\":\"%s\",\"qemu\":\"%s\",\"decode\":\"%s\"}", r, legs[r], (r in qemu ? qemu[r] : ""), (r in decodes ? decodes[r] : "")
         }
         printf "]\n"
     }

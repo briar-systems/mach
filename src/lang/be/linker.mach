@@ -760,7 +760,233 @@ fun link_modules_nocapture(s: *session.Session, tgt: *target.Target, modules: *o
                      out_path, name, mode, pie_opt_in, image_options, nil::*LinkedImage);
 }
 
+# build one input image holding zero-initialized storage for every C common symbol
+# that no object actually defines (#2974)
+#
+# COALESCED BY MAX, which is the C rule: several translation units may each declare the
+# same tentative definition, and they are asking for ONE object big enough for all of
+# them, not one each. Taking the first size seen would under-allocate whenever a later
+# unit declared a larger type, and allocating per-object would multiply the storage and
+# leave the copies unaliased.
+#
+# A REAL DEFINITION WINS OUTRIGHT and the common is dropped, which is why the scan for
+# definitions runs first. A strong definition and a tentative one are not a duplicate-
+# symbol collision; the tentative one exists precisely to yield to it.
+#
+# Skipped for a relocatable output, which carries its symbols through unresolved: the
+# eventual link is where the storage is decided, and allocating here would turn a
+# tentative definition into a real one that then collides with the real one.
+# ---
+# out: receives the synthesized image when this returns ok(true)
+# ret: ok(true) when storage was synthesized, ok(false) when there was nothing to do
+fun synthesize_common_storage(s: *session.Session, modules: *of.ObjectImage,
+                              module_count: u32, mode: LinkMode,
+                              out: *of.ObjectImage) R.Result[bool, str] {
+    if (mode == LINK_RELOCATABLE || modules == nil || module_count == 0) {
+        ret R.ok[bool, str](false);
+    }
+    val alloc: *A.Allocator = s.alloc;
+
+    # names some object really defines; a common of the same name yields to them
+    var defined: map.Map[intern.StrId, u32] =
+        map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            if (sym.section != of.SECTION_EXTERNAL && sym.section < modules[m].section_count) {
+                if (R.is_err[*u32, str](map.get[intern.StrId, u32](?defined, ?sym.name))) {
+                    val di: R.Result[bool, str] = map.insert[intern.StrId, u32](?defined, sym.name, 0);
+                    if (R.is_err[bool, str](di)) {
+                        map.dnit[intern.StrId, u32](?defined);
+                        ret R.err[bool, str](R.unwrap_err[bool, str](di));
+                    }
+                }
+            }
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+
+    # first occurrence owns the slot, so the layout is module/symbol order and the
+    # output bytes do not depend on map iteration
+    var slot: map.Map[intern.StrId, u32] =
+        map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
+    var names: Vector[intern.StrId] = vector.init[intern.StrId](alloc);
+    var sizes: Vector[u32] = vector.init[u32](alloc);
+    var aligns: Vector[u32] = vector.init[u32](alloc);
+
+    m = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            if ((sym.flags & of.SYM_OBJ_FLAG_COMMON) == 0) { sy = sy + 1; cnt; }
+            if (R.is_ok[*u32, str](map.get[intern.StrId, u32](?defined, ?sym.name))) { sy = sy + 1; cnt; }
+
+            var al: u32 = sym.align;
+            if (al == 0) { al = 1; }
+            val ex: R.Result[*u32, str] = map.get[intern.StrId, u32](?slot, ?sym.name);
+            if (R.is_ok[*u32, str](ex)) {
+                val at: u32 = @R.unwrap_ok[*u32, str](ex);
+                if (sym.size > sizes.data[at]) { sizes.data[at] = sym.size; }
+                if (al > aligns.data[at])      { aligns.data[at] = al; }
+                sy = sy + 1;
+                cnt;
+            }
+            val ins: R.Result[bool, str] = map.insert[intern.StrId, u32](?slot, sym.name, names.len::u32);
+            if (R.is_err[bool, str](ins)) {
+                map.dnit[intern.StrId, u32](?slot);
+                map.dnit[intern.StrId, u32](?defined);
+                vector.dnit[intern.StrId](?names); vector.dnit[u32](?sizes); vector.dnit[u32](?aligns);
+                ret R.err[bool, str](R.unwrap_err[bool, str](ins));
+            }
+            vector.push[intern.StrId](?names, sym.name);
+            vector.push[u32](?sizes, sym.size);
+            vector.push[u32](?aligns, al);
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+    map.dnit[intern.StrId, u32](?slot);
+    map.dnit[intern.StrId, u32](?defined);
+
+    if (names.len == 0) {
+        vector.dnit[intern.StrId](?names); vector.dnit[u32](?sizes); vector.dnit[u32](?aligns);
+        ret R.ok[bool, str](false);
+    }
+
+    # lay the slots out in declaration order, each at its own alignment
+    var total: u64 = 0;
+    var sec_align: u32 = 1;
+    var offs: Vector[u32] = vector.init[u32](alloc);
+    var n: usize = 0;
+    for (n < names.len) {
+        val al: u64 = aligns.data[n]::u64;
+        if (aligns.data[n] > sec_align) { sec_align = aligns.data[n]; }
+        total = (total + al - 1) / al * al;
+        if (total > 0x7FFFFFFF) {
+            vector.dnit[u32](?offs);
+            vector.dnit[intern.StrId](?names); vector.dnit[u32](?sizes); vector.dnit[u32](?aligns);
+            ret R.err[bool, str]("link: common storage exceeds 2 GiB");
+        }
+        vector.push[u32](?offs, total::u32);
+        total = total + sizes.data[n]::u64;
+        n = n + 1;
+    }
+
+    val image_name_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, "<common-storage>");
+    val section_name_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, ".bss");
+    if (R.is_err[intern.StrId, str](image_name_r) || R.is_err[intern.StrId, str](section_name_r)) {
+        vector.dnit[u32](?offs);
+        vector.dnit[intern.StrId](?names); vector.dnit[u32](?sizes); vector.dnit[u32](?aligns);
+        ret R.err[bool, str]("link: could not intern the common storage names");
+    }
+    @out = R.unwrap_ok[of.ObjectImage, str](
+        obj.init(alloc, ?s.interner, R.unwrap_ok[intern.StrId, str](image_name_r)));
+
+    # SK_BSS carries no bytes on disk; the writers zero it, which is exactly what a
+    # tentative definition asks for.
+    var sec: of.Section;
+    sec.name  = R.unwrap_ok[intern.StrId, str](section_name_r);
+    sec.kind  = of.SK_BSS;
+    sec.bytes = nil;
+    sec.len   = total::u32;
+    sec.align = sec_align;
+    val sec_r: R.Result[u32, str] = obj.add_section(out, sec);
+    if (R.is_err[u32, str](sec_r)) {
+        vector.dnit[u32](?offs);
+        vector.dnit[intern.StrId](?names); vector.dnit[u32](?sizes); vector.dnit[u32](?aligns);
+        obj.dnit(out);
+        ret R.err[bool, str](R.unwrap_err[u32, str](sec_r));
+    }
+    val sec_ix: u32 = R.unwrap_ok[u32, str](sec_r);
+
+    n = 0;
+    for (n < names.len) {
+        var osym: of.Symbol;
+        osym.name    = names.data[n];
+        osym.section = sec_ix;
+        osym.offset  = offs.data[n];
+        osym.size    = sizes.data[n];
+        # a definition like any other from here on: GLOBAL so it resolves references
+        # from every object, OBJECT because it is data, and NOT weak - a common that
+        # reached this point is the only definition there is.
+        osym.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_OBJECT;
+        val sa: R.Result[u32, str] = obj.add_symbol(out, osym);
+        if (R.is_err[u32, str](sa)) {
+            vector.dnit[u32](?offs);
+            vector.dnit[intern.StrId](?names); vector.dnit[u32](?sizes); vector.dnit[u32](?aligns);
+            obj.dnit(out);
+            ret R.err[bool, str](R.unwrap_err[u32, str](sa));
+        }
+        n = n + 1;
+    }
+
+    vector.dnit[u32](?offs);
+    vector.dnit[intern.StrId](?names); vector.dnit[u32](?sizes); vector.dnit[u32](?aligns);
+    ret R.ok[bool, str](true);
+}
+
+
+# resolve C common storage, then link (#2974)
+#
+# A tentative definition is not an import and not a section definition: it asks the
+# LINKER for zero-initialized storage, and every object declaring the name asks for the
+# same storage rather than its own. So the allocation belongs here, once, ahead of
+# everything that resolves a symbol - and it arrives as an ordinary input image, which
+# is what keeps symbol resolution, dead-stripping and every format's own collection
+# working on it with no side path.
+#
+# A wrapper rather than a branch inside the body: with the storage appended, the rest
+# of the link cannot tell a common apart from any other BSS definition, and there is
+# exactly one new path through the function instead of one per stage.
 fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectImage,
+                 module_count: u32, codegen_count: u32,
+                 dynlibs: *of.DynLib, dynlib_count: u32,
+                 out_path: *u8, name: *u8, mode: LinkMode, pie_opt_in: bool,
+                 image_options: of.ImageOptions, capture: *LinkedImage) R.Result[bool, str] {
+    val alloc0: *A.Allocator = s.alloc;
+    var commons: of.ObjectImage;
+    val cr: R.Result[bool, str] = synthesize_common_storage(s, modules, module_count, mode, ?commons);
+    if (R.is_err[bool, str](cr)) { ret R.err[bool, str](R.unwrap_err[bool, str](cr)); }
+    if (!R.unwrap_ok[bool, str](cr)) {
+        ret link_modules_with_commons(s, tgt, modules, module_count, codegen_count,
+                                      dynlibs, dynlib_count, out_path, name, mode,
+                                      pie_opt_in, image_options, capture);
+    }
+
+    if (module_count == 0xFFFFFFFF) {
+        obj.dnit(?commons);
+        ret R.err[bool, str]("link: too many input objects to append common storage");
+    }
+    val all_r: R.Result[*of.ObjectImage, str] =
+        A.allocate[of.ObjectImage](alloc0, (module_count + 1)::usize);
+    if (R.is_err[*of.ObjectImage, str](all_r)) {
+        obj.dnit(?commons);
+        ret R.err[bool, str](R.unwrap_err[*of.ObjectImage, str](all_r));
+    }
+    val all: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](all_r);
+    var ci: u32 = 0;
+    for (ci < module_count) {
+        all[ci] = modules[ci];
+        ci = ci + 1;
+    }
+    all[module_count] = commons;
+
+    # the storage is a synthesized input, never a codegen one, so `codegen_count` is
+    # unchanged: the passes that treat the first N images as mach's own must keep
+    # counting the same N.
+    val linked: R.Result[bool, str] = link_modules_with_commons(
+        s, tgt, all, module_count + 1, codegen_count, dynlibs, dynlib_count,
+        out_path, name, mode, pie_opt_in, image_options, capture);
+    A.deallocate[of.ObjectImage](alloc0, all, (module_count + 1)::usize);
+    obj.dnit(?commons);
+    ret linked;
+}
+
+fun link_modules_with_commons(s: *session.Session, tgt: *target.Target, modules: *of.ObjectImage,
                  module_count: u32, codegen_count: u32,
                  dynlibs: *of.DynLib, dynlib_count: u32,
                  out_path: *u8, name: *u8, mode: LinkMode, pie_opt_in: bool,
@@ -792,6 +1018,10 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     # the writers decide what the image header needs to be from the OS's own fact,
     # never from the page size (#2895).
     opts.mapped_by_loader = tgt.os.mapped_by_loader;
+    # the image stack sizes ride the resolved target the same way, so no caller
+    # constructing options has to know about them (#2990). 0 leaves the writer's default.
+    opts.stack_reserve = tgt.stack_reserve;
+    opts.stack_commit  = tgt.stack_commit;
     var local_atoms: AtomPlan;
     init_atom_plan(?local_atoms);
     var pre_atoms: *AtomPlan = nil;
@@ -4710,6 +4940,67 @@ fun patch_relocations(s: *session.Session, out_img: *of.ObjectImage,
 # atoms:         the dead-atom plan, for the live-offset remap
 # out:           out - the symbol and owning-section location, when live
 # ret:           true when the symbol has a live location, false when atom-dropped
+# the final address of a difference relocation's SUBTRAHEND, or an error (#2973)
+#
+# `sym - sym2 + addend` needs both sides resolved, and only the minuend rides the
+# ordinary path. This resolves the other one the same two ways that path does: an
+# object-private definition through its own module's placement, and anything else by
+# the name that won the link.
+#
+# A DIFFERENCE AGAINST A DYNAMIC IMPORT IS REFUSED, and that is correct rather than a
+# limitation: the subtrahend's address is chosen by the loader, so the difference is
+# not a link-time constant and no relocation the writer could emit would make it one.
+# Apple Clang emits this form for label differences inside one object - a switch jump
+# table - where both sides are always defined here.
+# ---
+# ret: ok(the subtrahend's virtual address), or an error naming the symbol
+fun difference_subtrahend_vaddr(s: *session.Session, modules: *of.ObjectImage, m: u32,
+                                sym2: u32, placements: *Placement, sec_base: *u32,
+                                merged_to_out: *u32, out_img: *of.ObjectImage,
+                                format: *of.OfVTable, image_base: u64, atoms: *AtomPlan,
+                                sym_locs: *map.Map[intern.StrId, SymbolLoc]) R.Result[u64, str] {
+    if (sym2 >= modules[m].symbol_count) {
+        ret R.err[u64, str]("link: a difference relocation names a subtrahend outside the module's symbol table");
+    }
+    val sub: *of.Symbol = ?modules[m].symbols[sym2];
+    val sub_name: intern.StrId = sub.name;
+
+    if ((sub.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0 && sub.section != of.SECTION_EXTERNAL) {
+        var t: rel.RelocTarget = rel.target(0, 0, 0);
+        if (!local_symbol_target(modules, m, sym2, placements, sec_base, merged_to_out,
+                                 out_img, format, image_base, atoms, ?t)) {
+            ret R.err[u64, str](undef_message(s, sub_name));
+        }
+        ret R.ok[u64, str](t.vaddr);
+    }
+
+    val rn: R.Result[intern.StrId, str] = resolved_symbol_name(sym_locs, sub_name);
+    if (R.is_err[intern.StrId, str](rn)) {
+        ret R.err[u64, str](R.unwrap_err[intern.StrId, str](rn));
+    }
+    val resolved_name: intern.StrId = R.unwrap_ok[intern.StrId, str](rn);
+    val sl: R.Result[*SymbolLoc, str] = map.get[intern.StrId, SymbolLoc](sym_locs, ?resolved_name);
+    if (R.is_err[*SymbolLoc, str](sl)) {
+        ret R.err[u64, str](difference_import_message(s, sub_name));
+    }
+    ret R.ok[u64, str](R.unwrap_ok[*SymbolLoc, str](sl).vaddr);
+}
+
+# the refusal for a difference whose subtrahend is not defined in this link
+fun difference_import_message(s: *session.Session, name: intern.StrId) str {
+    val n: O.Option[str] = intern.lookup(?s.interner, name);
+    var shown: str = "<unknown>";
+    if (O.is_some[str](n)) { shown = O.unwrap[str](n); }
+    val r: R.Result[str, str] = format.sprint(s.alloc,
+        "link: a difference relocation subtracts `{}`, which this link does not define; the loader chooses its address, so the difference is not a link-time constant",
+        shown);
+    if (R.is_err[str, str](r)) {
+        ret "link: a difference relocation subtracts a symbol this link does not define";
+    }
+    ret R.unwrap_ok[str, str](r);
+}
+
+
 fun local_symbol_target(modules: *of.ObjectImage, m: u32, sy: u32,
                         placements: *Placement, sec_base: *u32, merged_to_out: *u32,
                         out_img: *of.ObjectImage, format: *of.OfVTable,
@@ -5163,8 +5454,24 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
             ri = ri + 1; cnt;
         }
 
+        # A DIFFERENCE FOLDS ITS SUBTRAHEND INTO THE ADDEND (#2973). `sym - sym2 + A`
+        # is `sym + (A - addr(sym2))`, so the absolute applier and its overflow check
+        # do the work and no ISA needs a second target threaded through it. The width
+        # carries over: DIFF32 patches four bytes signed, since a difference is signed
+        # whichever way the two labels are ordered.
+        var apply_kind: of.RelocKind = r.kind;
+        if (of.is_difference(r.kind)) {
+            val sv: R.Result[u64, str] = difference_subtrahend_vaddr(
+                s, modules, m, r.sym2, placements, sec_base, merged_to_out, out_img,
+                format, image_base, atoms, sym_locs);
+            if (R.is_err[u64, str](sv)) { ret R.err[bool, str](R.unwrap_err[u64, str](sv)); }
+            apply_addend = apply_addend - R.unwrap_ok[u64, str](sv)::i64;
+            apply_kind = of.RK_ABS32S;
+            if (r.kind == of.RK_DIFF64) { apply_kind = of.RK_ABS64; }
+        }
+
         val pr: R.Result[bool, str] =
-            apply_one(s, r.kind, dst, patch_off, out_img.sections[out_ix].len, resolved,
+            apply_one(s, apply_kind, dst, patch_off, out_img.sections[out_ix].len, resolved,
                       apply_addend, patch_va, target_name, arch, image_base);
         if (R.is_err[bool, str](pr)) {
             ret R.err[bool, str](R.unwrap_err[bool, str](pr));
@@ -12070,4 +12377,138 @@ test "mach.lang.be.linker.local_got_plan:deduplicates_effective_target" {
     map.dnit[intern.StrId, SymbolLoc](?locs);
     session.dnit(?s);
     ret 0;
+}
+
+# build a one-symbol input image declaring `name` as C common storage
+fun lt_common_module(s: *session.Session, mod_name: str, name: str, size: u32, align: u32) of.ObjectImage {
+    val alloc: *A.Allocator = s.alloc;
+    val mn: R.Result[intern.StrId, str] = intern.intern(?s.interner, mod_name);
+    val sn: R.Result[intern.StrId, str] = intern.intern(?s.interner, name);
+    var img: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](
+        obj.init(alloc, ?s.interner, R.unwrap_ok[intern.StrId, str](mn)));
+    var sym: of.Symbol;
+    sym.name    = R.unwrap_ok[intern.StrId, str](sn);
+    sym.section = of.SECTION_EXTERNAL;
+    sym.offset  = 0;
+    sym.size    = size;
+    sym.align   = align;
+    sym.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_COMMON;
+    obj.add_symbol(?img, sym);
+    ret img;
+}
+
+# Competing tentative definitions coalesce into ONE allocation at the largest size and
+# alignment either asked for (#2974).
+#
+# This is the C rule and the reason the allocation belongs to the linker rather than to
+# any reader: several translation units may each declare the same tentative definition,
+# and they are asking for one object big enough for all of them, not one each. Taking
+# the first size seen under-allocates the moment a later unit declares a larger type,
+# and allocating per object multiplies the storage and leaves the copies unaliased -
+# two writers of `_ma_atomic_global_lock` would then not see each other.
+test "mach.lang.be.linker.synthesize_common_storage:coalesces_to_the_largest_request" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_common_module(?s, "a.o", "_shared", 8, 4);
+    mods[1] = lt_common_module(?s, "b.o", "_shared", 40, 16);
+
+    var bad: i32 = 0;
+    var out: of.ObjectImage;
+    val cr: R.Result[bool, str] = synthesize_common_storage(?s, ?mods[0], 2, LINK_EXE, ?out);
+    if (R.is_err[bool, str](cr)) { bad = 2; }
+    or (!R.unwrap_ok[bool, str](cr)) { bad = 3; }
+    or {
+        # ONE definition, not two
+        if (out.symbol_count != 1                      && bad == 0) { bad = 4; }
+        or (out.section_count != 1                     && bad == 0) { bad = 5; }
+        or {
+            # the largest request wins on both axes
+            if (out.symbols[0].size != 40              && bad == 0) { bad = 6; }
+            if (out.sections[0].len != 40              && bad == 0) { bad = 7; }
+            if (out.sections[0].align != 16            && bad == 0) { bad = 8; }
+            # zero-initialized storage carries no bytes on disk
+            if (out.sections[0].kind != of.SK_BSS      && bad == 0) { bad = 9; }
+            if (out.sections[0].bytes != nil           && bad == 0) { bad = 10; }
+            # and it is an ordinary definition from here on, so every reference
+            # resolves to it through the normal collector
+            if ((out.symbols[0].flags & of.SYM_OBJ_FLAG_GLOBAL) == 0 && bad == 0) { bad = 11; }
+            if ((out.symbols[0].flags & of.SYM_OBJ_FLAG_EXTERN) != 0 && bad == 0) { bad = 12; }
+        }
+        obj.dnit(?out);
+    }
+
+    obj.dnit(?mods[0]);
+    obj.dnit(?mods[1]);
+    session.dnit(?s);
+    ret bad;
+}
+
+# A REAL definition of the name wins outright, and the common allocates nothing (#2974).
+#
+# A strong definition and a tentative one are not a duplicate-symbol collision: the
+# tentative one exists precisely to yield to it. Allocating anyway would put a second
+# object of the same name in the image, and whichever the collector then picked, half
+# the references would reach storage nobody else writes.
+test "mach.lang.be.linker.synthesize_common_storage:a_real_definition_wins" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_common_module(?s, "a.o", "_shared", 40, 16);
+
+    # a module that really defines `_shared` in its own .data
+    val mn: R.Result[intern.StrId, str] = intern.intern(?s.interner, "b.o");
+    val dn: R.Result[intern.StrId, str] = intern.intern(?s.interner, ".data");
+    val sn: R.Result[intern.StrId, str] = intern.intern(?s.interner, "_shared");
+    mods[1] = R.unwrap_ok[of.ObjectImage, str](
+        obj.init(?alloc, ?s.interner, R.unwrap_ok[intern.StrId, str](mn)));
+    var bytes: [8]u8;
+    var z: usize = 0;
+    for (z < 8) { bytes[z] = 0; z = z + 1; }
+    var sec: of.Section;
+    sec.name = R.unwrap_ok[intern.StrId, str](dn);
+    sec.kind = of.SK_DATA;
+    sec.bytes = ?bytes[0];
+    sec.len = 8;
+    sec.align = 8;
+    val si: R.Result[u32, str] = obj.add_section(?mods[1], sec);
+    var dsym: of.Symbol;
+    dsym.name    = R.unwrap_ok[intern.StrId, str](sn);
+    dsym.section = R.unwrap_ok[u32, str](si);
+    dsym.offset  = 0;
+    dsym.size    = 8;
+    dsym.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_OBJECT;
+    obj.add_symbol(?mods[1], dsym);
+
+    var bad: i32 = 0;
+    var out: of.ObjectImage;
+    val cr: R.Result[bool, str] = synthesize_common_storage(?s, ?mods[0], 2, LINK_EXE, ?out);
+    if (R.is_err[bool, str](cr)) { bad = 2; }
+    or (R.unwrap_ok[bool, str](cr)) {
+        # nothing should have been synthesized at all
+        bad = 3;
+        obj.dnit(?out);
+    }
+
+    # ...and a relocatable output allocates nothing either: it carries its symbols
+    # through unresolved, and the eventual link is where the storage is decided.
+    if (bad == 0) {
+        var out2: of.ObjectImage;
+        val rr: R.Result[bool, str] = synthesize_common_storage(?s, ?mods[0], 1, LINK_RELOCATABLE, ?out2);
+        if (R.is_err[bool, str](rr)) { bad = 4; }
+        or (R.unwrap_ok[bool, str](rr)) { bad = 5; obj.dnit(?out2); }
+    }
+
+    obj.dnit(?mods[0]);
+    obj.dnit(?mods[1]);
+    session.dnit(?s);
+    ret bad;
 }

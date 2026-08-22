@@ -152,6 +152,31 @@ pub val RK_GOTPCREL_NORELAX: RelocKind = 22;
 # r_length=3), used by an absolute-immediate or pointer-sized data field.
 pub val RK_GOTPCREL64_NORELAX: RelocKind = 23;
 
+# THE DIFFERENCE OF TWO SYMBOL ADDRESSES, `sym - sym2 + addend`, written at the patch
+# site (#2973). The only kinds that read `Relocation.sym2`.
+#
+# Apple Clang emits this constantly as an adjacent `X86_64_RELOC_SUBTRACTOR` +
+# `X86_64_RELOC_UNSIGNED` pair, most visibly for a switch jump table, whose entries are
+# label differences rather than addresses so the table is position-independent. Mach-O
+# is the one format here that spells a difference as a relocation at all: ELF and COFF
+# either fold it at assembly time or use a dedicated section-relative form.
+#
+# TWO SYMBOLS IS THE FACT, not an encoding detail, which is why this widens the neutral
+# model rather than being folded away in the reader. Folding is only correct when both
+# sides are defined in the object being read, and the pair is well-formed when either
+# side is external - so a reader that folded would be right until the first object that
+# is not a jump table.
+pub val RK_DIFF32: RelocKind = 24;
+pub val RK_DIFF64: RelocKind = 25;
+
+# whether `kind` resolves the difference of two symbols, and therefore reads `sym2`
+# ---
+# kind: the relocation kind
+# ret:  true for the difference forms
+pub fun is_difference(kind: RelocKind) bool {
+    ret kind == RK_DIFF32 || kind == RK_DIFF64;
+}
+
 # object-symbol flags, combined as a bitmask in `Symbol.flags`
 # ---
 # SYM_OBJ_FLAG_GLOBAL:   visible outside the object
@@ -170,6 +195,21 @@ pub val SYM_OBJ_FLAG_OBJECT:   u32 = 0x10;
 pub val SYM_OBJ_FLAG_FALLBACK: u32 = 0x20;
 pub val SYM_OBJ_FLAG_SEARCH:   u32 = 0x40;
 pub val SYM_OBJ_FLAG_ALIAS:    u32 = 0x80;
+# A TENTATIVE DEFINITION - C common storage (#2974). The symbol is not defined in any
+# section here, but it is not an import either: it REQUESTS zero-initialized storage of
+# `size` bytes aligned to `align`, and the linker provides it unless some object carries
+# a real definition of the name, which wins outright.
+#
+# Apple Clang emits one for every uninitialized file-scope C global unless the
+# translation unit is compiled `-fno-common`, so a vendored C dependency carries them
+# whether or not anyone chose to. Read as an ordinary undefined import it produces
+# "dynamic import _x has no #[library] attribution", which names the symbol correctly
+# and the problem not at all.
+#
+# Set together with SYM_OBJ_FLAG_EXTERN, because a common IS undefined until the linker
+# allocates it: every consumer that means "needs resolving" keeps working, and only the
+# one that decides HOW it resolves has to know the difference.
+pub val SYM_OBJ_FLAG_COMMON:   u32 = 0x100;
 
 # sentinel `Symbol.section` value marking an undefined (external) symbol
 pub val SECTION_EXTERNAL: u32 = 0xFFFFFFFF;
@@ -267,6 +307,10 @@ pub rec Symbol {
     size:     u32;
     flags:    u32;
     fallback: u32;
+    # the requested alignment of a COMMON symbol's storage, in bytes; meaningless for
+    # every other symbol, so a zero-initialized record is correct and 0 reads as "no
+    # alignment stated" (#2974)
+    align:    u32;
 }
 
 # one relocation in an object image
@@ -287,12 +331,16 @@ pub rec Symbol {
 # kind:    abstract relocation kind (one of RK_*)
 # sym:     index of the referenced symbol in the image's `symbols` array
 # addend:  constant added to the resolved symbol address
+# sym2:    index of the SUBTRAHEND symbol, read only when `is_difference(kind)` and
+#          meaningless otherwise - a zero-initialized record is therefore correct for
+#          every other kind, which is why this needs no absent sentinel (#2973)
 pub rec Relocation {
     section: u32;
     offset:  u32;
     kind:    RelocKind;
     sym:     u32;
     addend:  i64;
+    sym2:    u32;
 }
 
 # the complete, format-agnostic image the back end builds and the format writer
@@ -733,6 +781,17 @@ pub rec ImageOptions {
     # fact existed, so a caller that constructs options without stating it keeps the
     # loader-mapped shape rather than silently dropping a segment.
     mapped_by_loader: bool;
+
+    # the image's thread stack reserve and commit in bytes, threaded from the target's
+    # manifest keys by the linker (#2990). 0 means UNSET and each writer keeps its
+    # format's conventional default, so an image built without them is byte-identical
+    # to one built before the keys existed.
+    #
+    # A format that carries no stack size ignores both, and a target cannot state them
+    # there at all - `OfVTable.carries_stack_size` refuses the key when the manifest is
+    # read, so a value silently doing nothing is not a reachable state.
+    stack_reserve: u64;
+    stack_commit:  u64;
 }
 
 # make executable-image options with no optional resources
@@ -744,6 +803,8 @@ pub fun image_options_default(subsystem: Subsystem) ImageOptions {
     opts.attributes = nil;
     opts.attributes_len = 0;
     opts.mapped_by_loader = true;
+    opts.stack_reserve = 0;
+    opts.stack_commit  = 0;
     ret opts;
 }
 
@@ -759,6 +820,28 @@ pub fun image_options_flagged(subsystem: Subsystem, flags: u32) ImageOptions {
     var opts: ImageOptions = image_options_default(subsystem);
     opts.machine_flags = flags;
     ret opts;
+}
+
+# the stack reserve an image built for `tgt` will actually get, or 0 when nothing
+# bounds it at compile time (#2991)
+#
+# Three cases, in order. A target that STATES a reserve gets that number - the manifest
+# already refused the key on a format that cannot carry it, so a stated value always
+# reaches the image. Otherwise the format's own default applies, which is PE's 1 MiB.
+# Otherwise nothing does: an ELF target's stack is the kernel's and `ulimit`'s, and a
+# Mach-O image with no stated reserve takes dyld's default, which mach did not choose.
+#
+# 0 MEANS "DO NOT DIAGNOSE", and it is the honest answer rather than a conservative
+# one: a check needs a number mach itself put in the image, and asserting a bound the
+# compiler does not own would refuse programs that run.
+# ---
+# tgt_of:        the resolved object-format vtable
+# stated:        the target's `stack_reserve`, or 0 when unstated
+# ret:           the effective reserve in bytes, or 0 when nothing bounds it
+pub fun effective_stack_reserve(tgt_of: *OfVTable, stated: u64) u64 {
+    if (stated != 0) { ret stated; }
+    if (tgt_of == nil) { ret 0; }
+    ret tgt_of.default_stack_reserve;
 }
 
 # a format writer: serializes an `ObjectImage` to a relocatable object file at
@@ -1158,6 +1241,36 @@ pub rec OfVTable {
     shared_input_ext:    str;
     import_address_prefix: str;
     header_in_first_segment: bool;
+
+    # true when this format's IMAGE HEADERS carry a thread stack size, so a target
+    # may state `stack_reserve` / `stack_commit` (#2990)
+    #
+    # PE carries both in the optional header; Mach-O carries a reserve in
+    # `LC_MAIN.stacksize`. ELF has nowhere to put one - a linux main thread's stack is
+    # the kernel's and `ulimit`'s business - and a raw flat image has no header at all.
+    #
+    # WHAT THIS DOES NOT PROMISE is that every image in this format has the field. A
+    # Mach-O image carries `stacksize` only through LC_MAIN; a non-PIE one enters
+    # through LC_UNIXTHREAD, which has no such member. That is a property of the image
+    # SHAPE rather than of the format, is not known when a manifest is read, and is
+    # refused by the writer instead. Two facts, two checks, each where its fact is
+    # known.
+    carries_stack_size:  bool;
+
+    # the stack reserve THIS WRITER puts in an image whose target states none, or 0
+    # when it states nothing of its own (#2991)
+    #
+    # PE writes a 1 MiB reserve by convention, so every PE image has a bounded stack
+    # mach itself chose and a frame larger than it provably cannot run. Mach-O writes
+    # `LC_MAIN.stacksize = 0`, which means "take dyld's default" - mach does not own
+    # that number, so it declares none and a Mach-O image is only checked against a
+    # reserve its target actually stated.
+    #
+    # SEPARATE FROM `carries_stack_size` because they answer different questions. That
+    # one is whether a target MAY state a reserve; this is what the image gets when it
+    # does not. A format can carry a value it has no default for, which is exactly
+    # Mach-O.
+    default_stack_reserve: u64;
     header_span:         HeaderSpanFn;
     executable_section_location: ExecutableSectionLocationFn;
 }

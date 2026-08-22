@@ -111,6 +111,63 @@ to whichever *declared* target matches the host.
 | `of`  | no       | Object-format override; defers to the os's format when omitted. See [Object-format override](#object-format-override). |
 | `base` | no      | Load-address override (integer). Overrides the os's default base virtual address; defers to it (`0` for `freestanding`) when omitted. |
 | `platform` | no  | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
+| `stack_reserve` | no | Thread stack reserve in bytes. See [Image stack size](#image-stack-size). |
+| `stack_commit` | no | Thread stack commit in bytes. See [Image stack size](#image-stack-size). |
+
+### Image stack size
+
+`stack_reserve` and `stack_commit` set the thread stack an image asks its loader for,
+as byte counts:
+
+```toml
+[target.windows]
+isa = "x86_64"
+os  = "windows"
+abi = "win64"
+stack_reserve = 0x800000        # 8 MiB
+stack_commit  = 0x1000          # 4 KiB
+```
+
+Both are optional. Omitting them keeps the format's conventional default, so an image
+built without them is byte-identical to one built before the keys existed. On PE that
+default is a 1 MiB reserve and a 4 KiB commit.
+
+A **reserve** is address space, not committed memory, so raising it costs nothing until
+the stack is actually used. That is also why these live on the target rather than the
+artifact: two artifacts built for one target share the value, and a small tool
+inheriting a large program's reserve pays nothing for it.
+
+**Only some object formats carry a stack size.** PE keeps both in its optional header
+and Mach-O keeps a reserve in `LC_MAIN.stacksize`. ELF has nowhere to put one — a linux
+main thread's stack is the kernel's and `ulimit`'s business — and a raw flat image has
+no header at all. Either key on a target whose resolved object format carries no stack
+size is refused when the manifest is read, naming the key, the target and the format,
+before anything builds:
+
+```
+error: mach.toml: [target.lin].stack_reserve is not expressible on the `elf` object
+format, which carries no stack size in its image headers
+```
+
+Every declared target is checked, not only the one being built, so the mistake is found
+on the first build rather than whenever someone happens to build that cell.
+
+A function whose own stack frame exceeds the reserve is refused at build time, naming
+the function, its frame size and the reserve:
+
+```
+error: frame: `main` needs a 1107824-byte stack frame, which its target's
+1048576-byte stack reserve cannot hold; raise `stack_reserve` on the target, or move
+the large locals off the stack
+```
+
+That is a proof rather than an estimate - one frame against one reserve, with no call
+graph and no input dependence - so it is an error and has no false positives. Targets
+whose stack is not bounded by the image, such as every ELF target, are not checked.
+
+On Mach-O the value reaches only a **position-independent** image. A non-PIE one enters
+through `LC_UNIXTHREAD`, which has no stacksize member, and a stack size requested for
+such an image is refused at link rather than silently dropped.
 
 ### Accepted tuple values
 

@@ -3423,7 +3423,8 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
     # clears RELOCS_STRIPPED and sets DYNAMIC_BASE.
     val pie: bool = dyn != nil && dyn.pie;
     val header_r: R.Result[bool, str] = write_pe_headers(buf, ?lay, segs, seg_count, entry,
-        pie, itn, dyn, debug, debug_count, image_options.subsystem);
+        pie, itn, dyn, debug, debug_count, image_options.subsystem,
+        image_options.stack_reserve, image_options.stack_commit);
     if (R.is_err[bool, str](header_r)) {
         if (resource_ptr != nil) { rs.dnit(alloc, resource_ptr); }
         A.deallocate[u8](alloc, buf, total_size);
@@ -3924,6 +3925,12 @@ fun write_pe_section_header(buf: *u8, pos: usize, name: str, str_pos: *usize, se
     bin.write_u32_le(buf, pos + 36, chars);
 }
 
+# the conventional PE console stack reserve and commit, used when a target states
+# neither key (#2990). Named rather than repeated so the writer's default and the
+# documentation cannot drift.
+val PE_DEFAULT_STACK_RESERVE: u64 = 0x100000;   # 1 MiB
+val PE_DEFAULT_STACK_COMMIT:  u64 = 0x1000;     # 4 KiB
+
 # write the DOS header + stub, the PE signature, the COFF file
 # header, the PE32+ optional header (ImageBase, alignments, entry, subsystem, the
 # 16 data directories), and the section table. the entry RVA is the program
@@ -3931,7 +3938,7 @@ fun write_pe_section_header(buf: *u8, pos: usize, name: str, str_pos: *usize, se
 # layout fixed are known
 fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count: u32, entry: u64, pie: bool,
                      itn: *intern.Interner, dyn: *of.DynamicInfo, debug: *of.Section, debug_count: u32,
-                     subsystem: of.Subsystem) R.Result[bool, str] {
+                     subsystem: of.Subsystem, stack_reserve: u64, stack_commit: u64) R.Result[bool, str] {
     # DOS header: 'MZ', e_lfanew (offset 0x3C) -> the PE signature. the rest of
     # the DOS stub is left zero - Windows reads only the magic and e_lfanew.
     buf[0] = 'M'; buf[1] = 'Z';
@@ -3996,10 +4003,21 @@ fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count:
     if (pie) { dllchars = dllchars | IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE; }
     bin.write_u16_le(buf, oh + 70, dllchars);
 
-    # stack/heap reserve+commit (PE32+ are 8 bytes each): 1 MiB reserve / 4 KiB
-    # commit for both, the conventional console defaults.
-    bin.write_u64_le(buf, oh + 72, 0x100000); bin.write_u64_le(buf, oh + 80, 0x1000);
-    bin.write_u64_le(buf, oh + 88, 0x100000); bin.write_u64_le(buf, oh + 96, 0x1000);
+    # stack/heap reserve+commit (PE32+ are 8 bytes each). The defaults are the
+    # conventional console ones, 1 MiB reserve / 4 KiB commit, and they are what an
+    # image gets when the manifest states nothing - so omitting the keys reproduces
+    # the bytes this writer emitted before they existed.
+    #
+    # A RESERVE IS ADDRESS SPACE, not committed memory, which is why raising it is
+    # cheap and why the value belongs on the target rather than the artifact (#2990).
+    # The heap pair keeps the literals: mach's runtime does not use the PE heap, so
+    # there is nothing for a project to tune there and no key to reach it.
+    var stack_res: u64 = PE_DEFAULT_STACK_RESERVE;
+    var stack_com: u64 = PE_DEFAULT_STACK_COMMIT;
+    if (stack_reserve != 0) { stack_res = stack_reserve; }
+    if (stack_commit  != 0) { stack_com = stack_commit; }
+    bin.write_u64_le(buf, oh + 72, stack_res); bin.write_u64_le(buf, oh + 80, stack_com);
+    bin.write_u64_le(buf, oh + 88, PE_DEFAULT_STACK_RESERVE); bin.write_u64_le(buf, oh + 96, PE_DEFAULT_STACK_COMMIT);
     bin.write_u32_le(buf, oh + 104, 0);                # LoaderFlags
     bin.write_u32_le(buf, oh + 108, IMAGE_NUMBEROF_DIRECTORY_ENTRIES);
 
@@ -4288,6 +4306,11 @@ pub fun register_coff(reg: *of.OfRegistry) R.Result[bool, str] {
     # the PE writer reserves its own header span inside the first section as
     # prefix padding, so the linker leaves no gap above the image base.
     coff_vtable.header_in_first_segment = false;
+    # the PE32+ optional header carries both the stack reserve and the commit (#2990)
+    coff_vtable.carries_stack_size = true;
+    # every PE image gets a bounded stack this writer chose, so a frame larger than it
+    # provably cannot run and is refused at build time (#2991)
+    coff_vtable.default_stack_reserve = PE_DEFAULT_STACK_RESERVE;
     coff_vtable.executable_section_location = pe_executable_section_location;
 
     # the COFF relocation mapping and writer cover x86-64 only today.
@@ -5680,6 +5703,104 @@ test "mach.lang.target.of.coff.coff_emit_exec:subsystem_selection" {
         b = b + 1;
     }
     ret 0;
+}
+
+# The PE optional header carries the target's stack reserve and commit, and NOTHING
+# ELSE MOVES (#2990).
+#
+# The reserve was a literal `0x100000`, so a mach project could not ship a Windows
+# program needing more than a megabyte of stack - no flag, no workaround, while every
+# other linker exposes it (`/STACK`, `--stack`). A game's `main` needed 1,107,824
+# bytes against that reserve and died in its own prologue on every Windows machine
+# while running fine on linux, which hands the main thread eight megabytes.
+#
+# The byte-for-byte half is the acceptance criterion that matters most: a project that
+# states neither key must get the image it always got. Comparing whole images rather
+# than reading two fields is what proves it - a change that shifted a header, resized
+# a directory, or perturbed alignment would pass a field read and fail here.
+test "mach.lang.target.of.coff.coff_emit_exec:stack_reserve_and_commit" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64);
+
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0x90; k = k + 1; }
+
+    val base:  u64 = 0x140001000;
+    val entry: u64 = base + 4;
+
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = base; segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text_bytes[0];
+
+    # stated nothing: the image every build produced before the keys existed
+    var def_opts: of.ImageOptions = of.image_options_default(of.SUBSYSTEM_CONSOLE);
+    val dr: R.Result[Vector[u8], str] = emit_stack_image(?alloc, ?i, ?isa_vt, ?segs[0], entry, ?def_opts);
+    if (R.is_err[Vector[u8], str](dr)) { ret 1; }
+    val dflt: Vector[u8] = R.unwrap_ok[Vector[u8], str](dr);
+
+    var big_opts: of.ImageOptions = of.image_options_default(of.SUBSYSTEM_CONSOLE);
+    big_opts.stack_reserve = 0x800000;
+    big_opts.stack_commit  = 0x2000;
+    val br: R.Result[Vector[u8], str] = emit_stack_image(?alloc, ?i, ?isa_vt, ?segs[0], entry, ?big_opts);
+    if (R.is_err[Vector[u8], str](br)) { ret 1; }
+    val big: Vector[u8] = R.unwrap_ok[Vector[u8], str](br);
+
+    if (dflt.len != big.len) { ret 2; }
+
+    val pe_off: usize = bin.read_u32_le(dflt.data, 0x3C)::usize;
+    val oh:     usize = pe_off + PE_SIGNATURE_SIZE + COFF_HEADER_SIZE;
+
+    # the default is the conventional console pair, unchanged
+    if (bin.read_u64_le(dflt.data, oh + 72) != PE_DEFAULT_STACK_RESERVE) { ret 3; }
+    if (bin.read_u64_le(dflt.data, oh + 80) != PE_DEFAULT_STACK_COMMIT)  { ret 4; }
+    # ...and the stated pair lands in the stack fields
+    if (bin.read_u64_le(big.data, oh + 72) != 0x800000) { ret 5; }
+    if (bin.read_u64_le(big.data, oh + 80) != 0x2000)   { ret 6; }
+
+    # THE HEAP PAIR IS NOT THE STACK PAIR. They sit next to each other at oh+88/+96 and
+    # take the same shape, so a fix that wrote the wrong offset would still produce a
+    # plausible-looking header; mach's runtime does not use the PE heap and no key
+    # reaches it, so both images must keep the literals.
+    if (bin.read_u64_le(big.data, oh + 88) != PE_DEFAULT_STACK_RESERVE) { ret 7; }
+    if (bin.read_u64_le(big.data, oh + 96) != PE_DEFAULT_STACK_COMMIT)  { ret 8; }
+
+    # every byte outside the two stack fields is identical
+    var b: usize = 0;
+    for (b < dflt.len) {
+        val in_stack: bool = (b >= oh + 72 && b < oh + 88);
+        if (!in_stack && dflt.data[b] != big.data[b]) { ret 9; }
+        b = b + 1;
+    }
+    ret 0;
+}
+
+# emit a one-segment static PE under `opts` and read it back, so the stack test can
+# compare two whole images byte for byte
+fun emit_stack_image(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
+                     segs: *of.LoadSegment, entry: u64, opts: *of.ImageOptions) R.Result[Vector[u8], str] {
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "coff_stack");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret R.err[Vector[u8], str]("temp create failed"); }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+
+    val em: R.Result[bool, str] = coff_emit_exec(alloc, itn, isa_vt, segs, 1,
+                                                 4096, segs[0].vaddr - PE_SECTION_ALIGN,
+                                                 entry, nil, 0,
+                                                 nil::*of.Section, 0, nil::*of.Section, 0,
+                                                 nil::*of.SymtabEntry, 0,
+                                                 fs.temp_path(?tf)::*u8, "coffstack"::*u8,
+                                                 @opts);
+    if (R.is_err[bool, str](em)) {
+        fs.temp_close_and_remove(?tf);
+        ret R.err[Vector[u8], str](R.unwrap_err[bool, str](em));
+    }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    ret rb;
 }
 
 # emit a one-segment static PE under `subsystem` and read it back, so the
