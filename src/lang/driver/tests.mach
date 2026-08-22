@@ -4219,7 +4219,9 @@ test "mach.lang.driver:dep_closure_registers_transitive" {
 # a project declaring a path dep that was never pulled (clean checkout, no dep/,
 # no mach.lock) fails with a diagnostic naming the dep and the fix command, not
 # the bare OS message a raw read failure used to surface with no path or dep
-# attached at all (#2471)
+# attached at all (#2471). the fix command carries the project root the build was
+# aimed at, so running it verbatim realizes the tree this build refused over
+# rather than whichever project the shell stands in (#2936)
 test "mach.lang.driver:dep_unresolved_names_dep_and_fix" {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }
@@ -4248,6 +4250,7 @@ test "mach.lang.driver:dep_unresolved_names_dep_and_fix" {
         if (!ut_str_contains(msg, "'absdep'"))     { bad = 1; }
         if (!ut_str_contains(msg, "not resolved")) { bad = 1; }
         if (!ut_str_contains(msg, "mach dep pull")) { bad = 1; }
+        if (!ut_str_contains(msg, ut_cc3(?alloc, "mach dep pull ", root, ""))) { bad = 1; }
         if (ut_str_contains(msg, "no such file"))  { bad = 1; }
     }
 
@@ -9629,6 +9632,110 @@ test "mach.lang.driver:deep_secrecy_pointer_and_union" {
     # a PUBLIC fn reinterpret (no secret anywhere in either signature) is not over-rejected.
     if (!ut_sema_clean("fun id(x: u32) u32 { ret x; }\nfun f() fun(u32) u32 { ret id :~ fun(u32) u32; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
 
+    ret bad;
+}
+
+# a module of `n` chained records - `R0` carrying `r0`'s fields, each `Ri` wrapping
+# `R(i-1)` - followed by `tail`
+#
+# Built at runtime rather than written out, because the graph sizes that matter to a
+# visited-set bound are in the hundreds. Every link is a DISTINCT nominal a deep type walk
+# must enter, so `n` is exactly the visited-set size that walk needs, and `r0` is where a
+# secret or a back-edge is planted at the FAR end of it.
+# ---
+# alloc: allocator owning the result and every intermediate
+# n:     number of chained records
+# r0:    the field list of `R0`
+# tail:  the module text appended after the chain
+# ret:   the source text, owned by the caller, or none on an allocation failure
+fun ut_chain_src(alloc: *A.Allocator, n: u32, r0: str, tail: str) O.Option[str] {
+    val head: R.Result[str, str] = format.sprint(alloc, "rec R0 {{ {} }}\n", r0);
+    if (R.is_err[str, str](head)) { ret O.none[str](); }
+    var acc: str = R.unwrap_ok[str, str](head);
+
+    var i: u32 = 1;
+    for (i < n) {
+        val next: R.Result[str, str] = format.sprint(alloc, "{}rec R{} {{ a: R{}; }}\n", acc, i, i - 1);
+        A.deallocate[char](alloc, acc::*char, str_len(acc) + 1);
+        if (R.is_err[str, str](next)) { ret O.none[str](); }
+        acc = R.unwrap_ok[str, str](next);
+        i = i + 1;
+    }
+
+    val whole: R.Result[str, str] = format.sprint(alloc, "{}{}", acc, tail);
+    A.deallocate[char](alloc, acc::*char, str_len(acc) + 1);
+    if (R.is_err[str, str](whole)) { ret O.none[str](); }
+    ret O.some[str](R.unwrap_ok[str, str](whole));
+}
+
+# constant-time (#3065): the deep-secret walk is bounded by the ALLOCATOR, not by a
+# constant, so a merely LARGE type graph is not mistaken for a secret one
+#
+# The walk carried a fixed 256-entry visited set and treated a graph that filled it as
+# possibly-secret. That is the safe direction for a walk that has run out of room, but the
+# bound was reachable by an ordinary program: an ECS whose scene record transitively named
+# a dozen-odd component stores crossed it, and every `p::ptr` in it then failed with a
+# diagnostic about a `^` the program did not contain anywhere. Correct code became
+# uncompilable, and the message pointed at a concept the program never used.
+#
+# THE FIRST TWO ARMS ARE A PAIR, and only the pair says anything. A walk that gives up
+# rejects BOTH a public graph and a secret one, so the public arm alone is satisfied by a
+# walk that stopped early, and the secret arm alone by a walk that never ran. Held
+# together they say the walk reached the far end of the graph and read what was there
+test "mach.lang.driver:deep_secret_walk_scales_with_the_type_graph" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var bad: i32 = 0;
+
+    # comfortably past the 256 the visited set used to hold, so a bound reintroduced at
+    # that size - or at the 256-slot power of two the set now grows through - fails here.
+    val n: u32 = 320;
+
+    val tr: R.Result[str, str] = format.sprint(?alloc, "fun e(p: *R{}) ptr {{ ret p::ptr; }}\nfun main() i32 {{ ret 0; }}\n", n - 1);
+    if (R.is_err[str, str](tr)) { ret 1; }
+    val tail: str = R.unwrap_ok[str, str](tr);
+
+    # the back-edge `R0` closes the chain with, named off `n` so the two cannot drift.
+    val br: R.Result[str, str] = format.sprint(?alloc, "a: *R{};", n - 1);
+    if (R.is_err[str, str](br)) { ret 1; }
+    val back: str = R.unwrap_ok[str, str](br);
+
+    # ARM 1 - `n` nominals, no `^` anywhere, erasing a pointer to `ptr`: COMPILES.
+    val pub_src: O.Option[str] = ut_chain_src(?alloc, n, "a: u32;", tail);
+    if (O.is_none[str](pub_src)) { bad = 1; }
+    or {
+        val src: str = O.unwrap[str](pub_src);
+        if (!ut_sema_clean(src)) { bad = 1; }
+        A.deallocate[char](?alloc, src::*char, str_len(src) + 1);
+    }
+
+    # ARM 2 - the same `n` nominals with a real `^` at the FAR END of the chain: still
+    # REJECTED, and by the erasure rule rather than by anything else. Lifting the bound
+    # must not turn the walk into a hole in the rule it guards.
+    val sec_src: O.Option[str] = ut_chain_src(?alloc, n, "a: ^u32;", tail);
+    if (O.is_none[str](sec_src)) { bad = 1; }
+    or {
+        val src: str = O.unwrap[str](sec_src);
+        if (ut_vec_diag(src, "secret-welded pointer cannot be erased") != 0) { bad = 1; }
+        A.deallocate[char](?alloc, src::*char, str_len(src) + 1);
+    }
+
+    # ARM 3 - A CYCLE INSIDE A LARGE GRAPH still terminates: `R0` points back at the
+    # deepest link, so the chain closes on itself and the walk re-enters a nominal it has
+    # already marked. The cycle guard is the whole reason the visited set exists, and a set
+    # REUSED across walks is exactly where a stale mark would break it - a walk that read
+    # the previous walk's marks as its own would cut this graph short rather than walk it,
+    # and one that read none of its own would not come back at all.
+    val cyc_src: O.Option[str] = ut_chain_src(?alloc, n, back, tail);
+    if (O.is_none[str](cyc_src)) { bad = 1; }
+    or {
+        val src: str = O.unwrap[str](cyc_src);
+        if (!ut_sema_clean(src)) { bad = 1; }
+        A.deallocate[char](?alloc, src::*char, str_len(src) + 1);
+    }
+
+    A.deallocate[char](?alloc, back::*char, str_len(back) + 1);
+    A.deallocate[char](?alloc, tail::*char, str_len(tail) + 1);
     ret bad;
 }
 
@@ -16569,6 +16676,186 @@ test "mach.lang.driver:a_target_op_name_belongs_only_to_its_own_set" {
     if (!ut_spv_diag_fired(?alloc, core_in_ext, n)) { ret 1; }
     if (ut_spv_diag_fired(?alloc, ext_ok, n))       { ret 1; }
     if (ut_spv_diag_fired(?alloc, core_ok, n))      { ret 1; }
+    ret 0;
+}
+
+# whether building `src` for `target_name` reports a diagnostic containing `needle`
+#
+# Runs load, sema and lower, and reads the session sink regardless of how the passes
+# came out: every rule under test reports through `context.report`, which records an
+# error and lets the pass return ok, so asserting on the result would pass whether or
+# not the check exists.
+# ---
+# target_name: a target declared in `ut_manifest`
+# src:         the module text, as the project's only source file
+# needle:      substring of the diagnostic being looked for
+# ret:         true when a matching diagnostic fired
+fun ut_va_diag(target_name: str, src: str, needle: str) bool {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret false; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret false; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = src;
+    val root_r: R.Result[str, str] = ut_scaffold_m(?alloc, ut_manifest(), ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret false; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    val rr: R.Result[bool, str] = driver.setup_registry(?s.registry);
+    if (R.is_err[bool, str](rr)) { fs.remove_all(?alloc, root); session.dnit(?s); ret false; }
+    val pr: R.Result[project.Project, outcome.Fail] = driver.build_project(?s, root, target_name);
+    fs.remove_all(?alloc, root);
+    if (R.is_err[project.Project, outcome.Fail](pr)) {
+        val fired_early: bool = ut_diag_has(?s.diags, needle);
+        session.dnit(?s);
+        ret fired_early;
+    }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+    if (R.is_ok[bool, outcome.Fail](passes.run_sema_pass(?p))) {
+        passes.run_lower_pass(?p);
+    }
+    val fired: bool = ut_diag_has(?p.s.diags, needle);
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret fired;
+}
+
+# the `#[abi_type("va_list")]` declaration every `va_list` test is written against
+val UT_VA_PRELUDE: str = "#[abi_type(\"va_list\")]\npub def VaList;\next fun sink(fmt: *u8, ap: VaList) i64;\n";
+
+# `ut_va_diag` over the prelude plus `tail`
+# ---
+# target_name: a target declared in `ut_manifest`
+# tail:        the module text appended to the prelude
+# needle:      substring of the diagnostic being looked for
+# ret:         true when a matching diagnostic fired
+fun ut_va(target_name: str, tail: str, needle: str) bool {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret false; }
+    val rj: R.Result[str, str] = format.sprint(?alloc, "{}{}", UT_VA_PRELUDE, tail);
+    if (R.is_err[str, str](rj)) { ret false; }
+    val src: str = R.unwrap_ok[str, str](rj);
+    val fired: bool = ut_va_diag(target_name, src, needle);
+    A.deallocate[char](?alloc, src::*char, str_len(src) + 1);
+    ret fired;
+}
+
+# the message every refusal of a `va_list` value carries
+val UT_VA_EXCLUDED: str = "cannot be read, constructed, or stored in mach";
+
+# a `va_list`'s extent is the SELECTED TARGET's, and the four platforms do not agree
+# (#3004)
+#
+# THE FACT THE WHOLE FEATURE RESTS ON. AAPCS64 makes `va_list` a 32-byte 8-aligned
+# composite, which is over the sixteen-byte threshold and therefore passed indirectly
+# with the caller owning the copy; every other platform mach binds C on makes it a
+# plain pointer, which the same rules reduce to one register. Spelling either one in
+# mach source is correct on some targets and silent corruption on the rest, which is
+# why the number comes off the target.
+#
+# THE ASSERTION IS A COMPTIME GATE rather than a golden, because the number is what
+# is being pinned: `$size_of` and `$align_of` fold against the selected target, so
+# the same source text measures differently per leg and each arm names the psABI it
+# is asserting.
+#
+# darwin's arm64 is here for the reason it is a separate declaration at all: it
+# composes the very same `aapcs64` convention vtable as linux and disagrees with it
+# outright, so a fact read off the calling convention would give it linux's answer.
+test "mach.lang.driver:a_va_list_extent_comes_from_the_target" {
+    val gate: str = "$if ($size_of(VaList) == 32 && $align_of(VaList) == 8) { $error(\"aapcs64 composite\"); }\n$if ($size_of(VaList) == 8 && $align_of(VaList) == 8) { $error(\"pointer shaped\"); }\nfun main() i32 { ret 0; }\n";
+
+    if (!ut_va("linux-arm64", gate, "aapcs64 composite"))  { ret 1; }
+    if (ut_va("linux-arm64", gate, "pointer shaped"))      { ret 1; }
+
+    if (!ut_va("linux", gate, "pointer shaped"))           { ret 1; }
+    if (ut_va("linux", gate, "aapcs64 composite"))         { ret 1; }
+
+    if (!ut_va("darwin-arm64", gate, "pointer shaped"))    { ret 1; }
+    if (ut_va("darwin-arm64", gate, "aapcs64 composite"))  { ret 1; }
+
+    if (!ut_va("linux-riscv64", gate, "pointer shaped"))   { ret 1; }
+    if (!ut_va("windows", gate, "pointer shaped"))         { ret 1; }
+    ret 0;
+}
+
+# a `va_list` is received as a parameter and handed on, and nothing else (#3004)
+#
+# The scope stated as its exclusion: mach has no `va_arg`, so there is no reading
+# one; it has no runtime variadics, so there is no originating one; and a local, a
+# field or a global would each give the program storage holding a cursor whose
+# meaning is the C library's. Each is refused on the line that writes it.
+#
+# THE CONTROL IS THE PARAMETER FORWARDED STRAIGHT ON, which is the whole difference
+# every arm turns on: naming it, storing it, or returning it is refused and passing
+# it is not. Without the control a compiler that refused the type outright would pass
+# every refusal arm.
+test "mach.lang.driver:a_va_list_may_only_be_forwarded" {
+    val forward: str = "#[symbol(\"trace\")]\npub fun trace(fmt: *u8, ap: VaList) i64 { ret sink(fmt, ap); }\nfun main() i32 { ret 0; }\n";
+    val local:   str = "#[symbol(\"trace\")]\npub fun trace(fmt: *u8, ap: VaList) i64 { val a: VaList = ap; ret sink(fmt, a); }\nfun main() i32 { ret 0; }\n";
+    val field:   str = "rec Box { ap: VaList; }\nfun main() i32 { ret 0; }\n";
+    val field_u: str = "uni Box { ap: VaList; n: i32; }\nfun main() i32 { ret 0; }\n";
+    val global:  str = "var held: VaList;\nfun main() i32 { ret 0; }\n";
+    val behind:  str = "#[symbol(\"trace\")]\npub fun trace(ap: *VaList) i64 { ret 0; }\nfun main() i32 { ret 0; }\n";
+    val made:    str = "ext fun make() VaList;\nfun main() i32 { ret 0; }\n";
+
+    if (ut_va("linux", forward, UT_VA_EXCLUDED))           { ret 1; }
+    if (ut_va("linux-arm64", forward, UT_VA_EXCLUDED))     { ret 1; }
+    if (!ut_va("linux", local, UT_VA_EXCLUDED))            { ret 1; }
+    if (!ut_va("linux", field, UT_VA_EXCLUDED))            { ret 1; }
+    if (!ut_va("linux", field_u, UT_VA_EXCLUDED))          { ret 1; }
+    if (!ut_va("linux", global, UT_VA_EXCLUDED))           { ret 1; }
+    if (!ut_va("linux", behind, UT_VA_EXCLUDED))           { ret 1; }
+    if (!ut_va("linux", made, UT_VA_EXCLUDED))             { ret 1; }
+    ret 0;
+}
+
+# a `va_list` cannot be reinterpreted or cast to anything (#3004)
+#
+# THE REFUSAL THAT HAS TO BE WRITTEN DOWN. Every other way of reading one already
+# fails structurally - it has no fields, it is not a pointer, it has no lanes - but
+# `:~` asks only for two equal sizes, and on the four platforms where a `va_list` is
+# eight bytes `ap :~ ptr` would hand the program the very cursor the type exists to
+# keep out of its hands. Both directions, because reading one out and forging one in
+# are the same rule.
+#
+# THE CONTROL IS THE SAME REINTERPRET BETWEEN TWO ORDINARY EIGHT-BYTE TYPES, so a
+# compiler that had simply stopped folding equal sizes would fail it.
+test "mach.lang.driver:a_va_list_cannot_be_cast" {
+    val out_r: str = "#[symbol(\"trace\")]\npub fun trace(ap: VaList) i64 { ret (ap :~ ptr)::i64; }\nfun main() i32 { ret 0; }\n";
+    val out_c: str = "#[symbol(\"trace\")]\npub fun trace(ap: VaList) i64 { ret (ap :: ptr)::i64; }\nfun main() i32 { ret 0; }\n";
+    val in_r:  str = "#[symbol(\"trace\")]\npub fun trace(fmt: *u8, p: ptr) i64 { ret sink(fmt, p :~ VaList); }\nfun main() i32 { ret 0; }\n";
+    val ok:    str = "#[symbol(\"trace\")]\npub fun trace(p: ptr) i64 { ret (p :~ i64); }\nfun main() i32 { ret 0; }\n";
+
+    if (!ut_va("linux", out_r, UT_VA_EXCLUDED))       { ret 1; }
+    if (!ut_va("linux", out_c, UT_VA_EXCLUDED))       { ret 1; }
+    if (!ut_va("linux", in_r, UT_VA_EXCLUDED))        { ret 1; }
+    if (!ut_va("linux-arm64", out_r, UT_VA_EXCLUDED)) { ret 1; }
+    if (ut_va("linux", ok, UT_VA_EXCLUDED))           { ret 1; }
+    ret 0;
+}
+
+# `#[abi_type]` names a closed set, checked in the front end (#3004)
+#
+# Closed here for the reason `#[op]`'s instruction names are: which target a module is
+# built for is not a property of the source, so a name checked only where it is acted
+# on would go unreported on every other build of the same library.
+#
+# THE CONTROL IS THE ONE NAME THERE IS, so a compiler that refused every `abi_type`
+# declaration would fail it.
+test "mach.lang.driver:an_abi_type_name_is_closed" {
+    val bad:   str = "#[abi_type(\"jmp_buf\")]\npub def JmpBuf;\nfun main() i32 { ret 0; }\n";
+    val body:  str = "#[abi_type(\"va_list\")]\npub def Aliased: ptr;\nfun main() i32 { ret 0; }\n";
+    val nargs: str = "#[abi_type]\npub def Nothing;\nfun main() i32 { ret 0; }\n";
+    val ok:    str = "#[abi_type(\"va_list\")]\npub def VaList;\nfun main() i32 { ret 0; }\n";
+
+    if (!ut_va_diag("linux", bad, "no such ABI type"))                     { ret 1; }
+    if (!ut_va_diag("linux", body, "declaration has no body"))             { ret 1; }
+    if (!ut_va_diag("linux", nargs, "takes exactly one string argument"))  { ret 1; }
+    if (ut_va_diag("linux", ok, "no such ABI type"))                       { ret 1; }
     ret 0;
 }
 

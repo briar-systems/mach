@@ -431,7 +431,7 @@ symlink so the build resolves it by the same vendor layout.
 
 | Action   | Args | Effect |
 |----------|------|--------|
-| `pull`   | — | realise the manifest: clone missing git deps (transitively), link path deps, re-resolve a changed ref, repair checkout-vs-lock drift, write `mach.lock`. Idempotent; safe to re-run. |
+| `pull`   | `[<path>]` | realise the manifest: clone missing git deps (transitively), link path deps, re-resolve a changed ref, repair checkout-vs-lock drift, write `mach.lock`. Idempotent; safe to re-run. |
 | `update` | `<name> \| --all` | the only lock-advancer: re-resolve branch refs to current remote tips. Tag/commit refs are an immutable no-op. Never edits the manifest. |
 | `add`    | `<name> --git <url> [--ref <ref>] \| --path <dir>` | append a `[dep.<name>]` `git`/`path` stanza to the manifest, then `pull`. |
 | `remove` | `<name> [--purge]` | drop the entry from `mach.toml` and `mach.lock`; `--purge` also deletes `dep/<name>/`. |
@@ -439,6 +439,13 @@ symlink so the build resolves it by the same vendor layout.
 
 `sync` is the pre-`pull` name, kept one cycle as a hidden alias that prints a
 deprecation note and runs `pull`.
+
+`pull` takes a project directory, resolved by the same rules as `mach build
+<path>`, and defaults to the current directory when none is given. A path that is
+not a project directory is a hard error, so the dep tree a build refuses over is
+always the dep tree `pull` realises, and the refusal names the root to pass
+(#2936).
+Every other action acts on the current directory's project.
 
 ### Transport policy
 

@@ -5,6 +5,230 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.26.0] - 2026-08-22
+
+### Added
+
+#### test: the four host-executed measurements the integration suite carried are back (#2944)
+
+Retiring the integration suite reclassified 109 of its 174 cases, and four were neither
+a codegen question the corpus answers nor a front-end question a unit test already
+asserts. Each measured something that only means anything on the machine it executes
+on, which is exactly why the corpus cannot carry it: the corpus builds for a target and
+reads what came out, and none of these is a property of the bytes. All four are now
+host-executed unit tests, gated on the host's own os and isa, and a leg that cannot run
+one **declines by name** rather than asserting something it did not measure. The
+decline is a separate `test` declaration rather than a branch inside a shared body,
+because a passing test's captured output is suppressed unless the run asks for it, so
+the name is the readout and it shows in `--list`.
+
+**The x86-64 flags probe.** `mach.lang.target.isa.x64.probe` runs each of the
+twenty-five rows in `x64/encode.mach`'s transcribed table twice, once with RFLAGS
+preset all-set and once all-clear, and compares what the CPU did against the
+transcription. That table is the security surface the `#[oblivious]` inline-asm model
+rests on, and `defines_flags` is the only fact that CLEARS a taint, so a row that drifts
+from the silicon is a permission rather than a refusal. The existing
+`agrees_with_measured_hardware` test makes the transcription bear on the
+classification; this makes it bear on the machine, which is the half that went with the
+suite. The probe now assembles through mach itself rather than through a C compiler, so
+an encoder that folded `shl rax, 0` into a shift-by-one fails here too.
+
+**The dudect-style timing harness.** `mach.lang.ct.probe` and `mach.lang.ct.dudect`
+restore the two-mode measurement, and `doc/language/secrecy.md` cites a harness that
+runs instead of marking its claims as measurements taken once. Every gate is a
+refutation, because that is all a timing measurement can do: each mode carries a
+planted leak that must be detected and a constant-time reference that must not separate
+the way the planted one does, so a mode that has stopped measuring fails through its own
+control rather than reading as a pass. Gates are separations between the class means,
+never `|t|`, which collapses under load while the means do not move, and each gate
+subtracts a null control measured in the same run rather than comparing against a
+constant, so common-mode noise leaves the verdict instead of being absorbed by the
+threshold. That null control also decides whether the run counts: it cannot leak, so any
+separation it shows is the machine rather than the code, and a run in which it separates
+by as much as a leak has to declines, because a differential measurement without
+discriminating power has no verdict in either direction. The address-trace mode samples
+one call at a time over a table larger than the last-level cache, which is the sampling
+latency mode cannot substitute for.
+
+The thresholds were calibrated inside a parallel `mach test`, which is the only
+environment they have to hold in and which the retired shell harness was never run under.
+Doing that surfaced three things the obvious shape gets wrong. The fixed class always led
+its round, and the leading sample absorbs the round's first cache and scheduler
+transition, so a probe that cannot leak still came out 7 to 11 percent slower on that
+class; the order alternates now. Both null controls were far cheaper than the probes they
+bounded, so the cheapest probe in the set was setting the precondition for every other;
+both are cost-matched now. And the address probe read one line per call, which is eighty
+nanoseconds of cache miss inside a sample whose clock overhead is several hundred, so its
+planted leak and its null control overlapped under load; it reads sixteen now, which is
+also what a table-driven cipher does per round.
+
+**The two inline-asm syscall conventions.** `mach.lang.target.isa.asm.host` executes an
+inline-asm body that cannot return, and an inline-asm console write, per os and arch.
+The non-returning half asserts an ABSENCE, since the body ends the test process with
+status 0 and reaching the statement after it is the failure, and a wrong kernel-entry
+number falls into the trap after it, so it fails rather than hangs. The write asserts
+the kernel's own answer rather than the bytes on the console, which is strictly more
+than the golden saw. windows declines both: it has no syscall ABI, and its console
+write goes through a kernel32 import, so its premise fails rather than its expectation.
+
+#### link: a C function taking a `va_list` parameter has a portable binding (#3004)
+
+A C function that takes a `va_list` **parameter** could not be bound, because mach had
+no spelling for the type. The common shape is a logging callback, and it is a fixed
+3-arity function with no `...` in it:
+
+```c
+typedef void (*TraceLogCallback)(int logLevel, const char *text, va_list args);
+```
+
+Binding it needs one thing only: a parameter type that is ABI-correct in that third
+slot, which mach receives, never reads, and hands straight to `vsnprintf`.
+
+`#[abi_type("va_list")]` on a bodyless `def` declares it, and the SELECTED TARGET
+supplies the layout:
+
+```mach
+#[abi_type("va_list")]
+def VaList;
+
+ext fun vsnprintf(buf: *u8, n: usize, fmt: *u8, ap: VaList) i32;
+```
+
+**The layout is declared per (os, architecture), never derived.** `va_list` is a plain
+pointer on System V x86-64, Apple arm64, Microsoft x64 and RISC-V lp64d, and a 32-byte
+8-aligned composite under AAPCS64. Darwin and linux compose the very same `aapcs64`
+convention vtable and disagree about it outright, so no calling convention can answer
+and no machine model implies it - it sits on the os vtable beside the Apple
+variadic-stack rule and for the same reason. An OS listing an architecture it declares
+no layout for is refused at registration rather than defaulted to a pointer: a pointer
+is right four times out of five, which is exactly the shape that ships silent
+corruption on the fifth.
+
+**The scope is forward-only, stated as an exclusion.** There is no `va_start`, no
+`va_arg`, no `va_end`, and no way to construct one. Reading one needs `va_arg`, and
+mach has no callee that walks its own argument tail because it has no runtime
+variadics. A local binding, a record or union field, a global, a return position, a
+pointer or array of one, and a cast in either direction are each refused where they
+are written, naming the exclusion.
+
+### Fixed
+
+#### sema: a large type graph was mistaken for a secret one (#3065)
+
+A program containing no `^` anywhere was rejected for secrecy, once at every pointer
+erasure it performed, with a diagnostic about a concept it never used:
+
+```
+error: cast: a secret-welded pointer cannot be erased to the untyped `ptr`
+  = note: secret memory is reached only through secrecy-typed pointers; erasing `^` to
+    `ptr` would let a public alias read it
+```
+
+The deep-secret walk carried a fixed 256-entry visited set and treated a graph that
+filled it as possibly-secret. **Failing closed is right for a walk that has run out of
+room; the defect was that the room was a constant**, which made the exit reachable by
+program size rather than by the allocator. A game's ECS scene record, which
+transitively names fourteen component stores, crossed it at 257 distinct nominals -
+one over. Adding a fifteenth component to a program is not a secrecy event, and neither
+is any other way of growing a type graph.
+
+The visited set now belongs to the interner that owns the type table every `TypeId`
+indexes, one epoch-stamped slot per `TypeId`, so its capacity grows on the same axis
+the graph does and a walk can only run out of room when the allocator does. Marking and
+testing are O(1), which also retires a linear rescan that made each walk quadratic in
+graph size. A full self-build is about 6% faster.
+
+The rule itself is unchanged: a real `^` anywhere in a graph of any size is still
+found, and a cyclic graph still terminates.
+
+#### abi: a C callee wrote through into the caller's object (#3063)
+
+A C function that overwrites a by-value aggregate parameter overwrote the **mach
+caller's own object**. Silent memory corruption: the call links, returns, and leaves
+the caller's data rewritten.
+
+```mach
+rec Wide { a: i64; b: i64; c: i64; d: i64; }
+ext fun clobber(w: Wide) i64;   # the callee's writes reached the caller's `w`
+```
+
+```
+x86_64-linux    byval intact=1 2 3 4      <- control, correct
+aarch64-linux   byval intact=-1 -2 -3 -4  <- the caller's object was overwritten
+```
+
+AAPCS64, the RISC-V psABI and the Microsoft convention all pass an aggregate too
+large for registers as the address of a copy **the caller allocates**, so the callee
+may overwrite its parameter freely. System V passes one over sixteen bytes by value
+on the stack instead, where the copy already exists - which is why x86-64 is a real
+control rather than a leg that happens to pass.
+
+**Two ends, one copy, and only one of them was mach's.** `CLASS_BYREF` passed the
+address of the argument's own storage, and a mach callee then gave every parameter
+storage of its own and copied the incoming aggregate into it at entry. While both
+ends are mach the two are indistinguishable. A C callee copies nothing, so at an
+`ext` call it was handed mach's object directly.
+
+That is unobservable for a callee which only reads its parameter, which is the
+overwhelmingly common case and is why the defect survived. It needs a callee that
+WRITES to its by-value parameter to show, and a `va_list` is the by-value parameter
+every consumer advances - which is how #3004 found it.
+
+The caller now allocates a frame temporary at the aggregate's own alignment, copies
+into it, and passes the temporary's address. Gated on the `ext` boundary, because
+this is a divergence between two conventions rather than a defect in one: an
+internal call already copies, at the callee, and copying at both ends would add one
+redundant copy per aggregate argument to every mach-to-mach call. Unifying on
+caller-copy internally and dropping the callee-side copy is arguably the cleaner
+model and is a separate decision - it changes the internal convention on every
+target, including the two that were already correct.
+
+#### driver(dep): `mach dep pull` realises the project you name, not the one you are standing in (#2936)
+
+`mach dep pull` accepted a path positional and then ignored it, hardcoding its project
+root to the current directory. A pull aimed at a project you were not standing in
+reported on the current directory instead and materialised nothing for the one named,
+and the build that sent you there refused by naming `mach dep pull` - the command that had
+just no-opped. The advice looped.
+
+The positional now resolves through the same rules `mach build <path>` uses, and a bare
+`mach dep pull` is unchanged. Fixing it exposed a second defect the hardcoded root had
+kept invisible: a path dependency's symlink target was computed from the source path as
+reached from the working directory, while the link is read from inside the project, so a
+pull run from elsewhere wrote a link that dangled. `DepNode` carries both frames now, and
+the link a pull writes is identical whichever directory it ran from.
+
+`update`, `add`, `remove` and `list` remain current-directory-only: their positional is
+already a dependency name, so giving them a project path is a grammar decision tracked
+separately (#3061).
+
+#### test: corpus layer A records a skip for an object format it has no oracle for (#2956)
+
+Layer A handed every format to an external oracle - ELF, COFF and Mach-O to
+`llvm-readobj`, SPIR-V to `spirv-val` - except `raw`, which it passed after asserting
+only that the file existed and was non-empty, which the caller had already checked. That
+is a cell that cannot go red, and the matrix is what the project reads to answer which
+surfaces are covered. `Outcome` carries a third verdict now, so the cell reads `SKIP` and
+the run fails on an uncovered column with no `SKIPS` entry. No target's pass count
+changed.
+
+#### docs(manifest): the accepted-tuple table lists `riscv32` and the RISC-V ABI family (#2947)
+
+The table omitted `riscv32` and five of the nine registered calling conventions, so a
+reader writing a manifest from the doc could not reach RV32 at all and would pick the
+wrong RISC-V ABI: #2777 made `lp64` mean soft float and the linux default `lp64d`, and
+`lp64` was the only RISC-V entry the doc offered. The table now matches what `mach info`
+prints in both directions, and the family is explained where a reader choosing one will
+see it.
+
+#### chore(ci): the artifact actions run on Node.js 24 (#2983)
+
+Twelve jobs across four workflows emitted a deprecation annotation for
+`actions/upload-artifact@v4` and `actions/download-artifact@v4` being forced onto
+Node.js 24. Both are on their current majors now, with the producer and consumer
+pairings checked against the intervening breaking changes.
+
+
 ## [4.25.0] - 2026-08-21
 
 
