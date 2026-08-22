@@ -113,6 +113,34 @@ are written, naming the exclusion.
 
 ### Fixed
 
+#### sema: a large type graph was mistaken for a secret one (#3065)
+
+A program containing no `^` anywhere was rejected for secrecy, once at every pointer
+erasure it performed, with a diagnostic about a concept it never used:
+
+```
+error: cast: a secret-welded pointer cannot be erased to the untyped `ptr`
+  = note: secret memory is reached only through secrecy-typed pointers; erasing `^` to
+    `ptr` would let a public alias read it
+```
+
+The deep-secret walk carried a fixed 256-entry visited set and treated a graph that
+filled it as possibly-secret. **Failing closed is right for a walk that has run out of
+room; the defect was that the room was a constant**, which made the exit reachable by
+program size rather than by the allocator. A game's ECS scene record, which
+transitively names fourteen component stores, crossed it at 257 distinct nominals -
+one over. Adding a fifteenth component to a program is not a secrecy event, and neither
+is any other way of growing a type graph.
+
+The visited set now belongs to the interner that owns the type table every `TypeId`
+indexes, one epoch-stamped slot per `TypeId`, so its capacity grows on the same axis
+the graph does and a walk can only run out of room when the allocator does. Marking and
+testing are O(1), which also retires a linear rescan that made each walk quadratic in
+graph size. A full self-build is about 6% faster.
+
+The rule itself is unchanged: a real `^` anywhere in a graph of any size is still
+found, and a cyclic graph still terminates.
+
 #### abi: a C callee wrote through into the caller's object (#3063)
 
 A C function that overwrites a by-value aggregate parameter overwrote the **mach
