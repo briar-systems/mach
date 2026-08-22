@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### test: the four host-executed measurements the integration suite carried are back (#2944)
+
+Retiring the integration suite reclassified 109 of its 174 cases, and four were neither
+a codegen question the corpus answers nor a front-end question a unit test already
+asserts. Each measured something that only means anything on the machine it executes
+on, which is exactly why the corpus cannot carry it: the corpus builds for a target and
+reads what came out, and none of these is a property of the bytes. All four are now
+host-executed unit tests, gated on the host's own os and isa, and a leg that cannot run
+one **declines by name** rather than asserting something it did not measure. The
+decline is a separate `test` declaration rather than a branch inside a shared body,
+because a passing test's captured output is suppressed unless the run asks for it, so
+the name is the readout and it shows in `--list`.
+
+**The x86-64 flags probe.** `mach.lang.target.isa.x64.probe` runs each of the
+twenty-five rows in `x64/encode.mach`'s transcribed table twice, once with RFLAGS
+preset all-set and once all-clear, and compares what the CPU did against the
+transcription. That table is the security surface the `#[oblivious]` inline-asm model
+rests on, and `defines_flags` is the only fact that CLEARS a taint, so a row that drifts
+from the silicon is a permission rather than a refusal. The existing
+`agrees_with_measured_hardware` test makes the transcription bear on the
+classification; this makes it bear on the machine, which is the half that went with the
+suite. The probe now assembles through mach itself rather than through a C compiler, so
+an encoder that folded `shl rax, 0` into a shift-by-one fails here too.
+
+**The dudect-style timing harness.** `mach.lang.ct.probe` and `mach.lang.ct.dudect`
+restore the two-mode measurement, and `doc/language/secrecy.md` cites a harness that
+runs instead of marking its claims as measurements taken once. Every gate is a
+refutation, because that is all a timing measurement can do: each mode carries a
+planted leak that must be detected and a constant-time reference that must not separate
+the way the planted one does, so a mode that has stopped measuring fails through its own
+control rather than reading as a pass. Gates are separations between the class means,
+never `|t|`, which collapses under load while the means do not move, and each gate
+subtracts a null control measured in the same run rather than comparing against a
+constant, so common-mode noise leaves the verdict instead of being absorbed by the
+threshold. That null control also decides whether the run counts: it cannot leak, so any
+separation it shows is the machine rather than the code, and a run in which it separates
+by as much as a leak has to declines, because a differential measurement without
+discriminating power has no verdict in either direction. The address-trace mode samples
+one call at a time over a table larger than the last-level cache, which is the sampling
+latency mode cannot substitute for.
+
+The thresholds were calibrated inside a parallel `mach test`, which is the only
+environment they have to hold in and which the retired shell harness was never run under.
+Doing that surfaced three things the obvious shape gets wrong. The fixed class always led
+its round, and the leading sample absorbs the round's first cache and scheduler
+transition, so a probe that cannot leak still came out 7 to 11 percent slower on that
+class; the order alternates now. Both null controls were far cheaper than the probes they
+bounded, so the cheapest probe in the set was setting the precondition for every other;
+both are cost-matched now. And the address probe read one line per call, which is eighty
+nanoseconds of cache miss inside a sample whose clock overhead is several hundred, so its
+planted leak and its null control overlapped under load; it reads sixteen now, which is
+also what a table-driven cipher does per round.
+
+**The two inline-asm syscall conventions.** `mach.lang.target.isa.asm.host` executes an
+inline-asm body that cannot return, and an inline-asm console write, per os and arch.
+The non-returning half asserts an ABSENCE, since the body ends the test process with
+status 0 and reaching the statement after it is the failure, and a wrong kernel-entry
+number falls into the trap after it, so it fails rather than hangs. The write asserts
+the kernel's own answer rather than the bytes on the console, which is strictly more
+than the golden saw. windows declines both: it has no syscall ABI, and its console
+write goes through a kernel32 import, so its premise fails rather than its expectation.
+
 ### Fixed
 
 #### abi: a C callee wrote through into the caller's object (#3063)

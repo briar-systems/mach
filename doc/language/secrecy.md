@@ -407,13 +407,46 @@ this version.**
 
 What holds today: the type system checks that the source respects the leakage
 model, `#[oblivious]` carries the obligation through codegen, and the translation
-validator independently re-checks the lowered MIR. All three are static.
+validator independently re-checks the lowered MIR. All three are static. Two
+host-executed measurements sit under them, and each only means anything on the
+machine it runs on, which is why both are unit tests rather than build checks.
 
-**There is no timing measurement in the tree.** A dudect-style harness existed and
-was run on demand, never in CI, because timing measurement is noise-sensitive and
-shared runners are noisy. What it established is recorded below and is not being
-re-established by anything; treat every empirical claim here as a measurement taken
-once rather than a property under guard.
+**The timing harness runs.** `mach.lang.ct.probe` is a dudect-style harness in the
+tree, measured on every `mach test`, and the claims below are what it establishes.
+It works by refutation, because that is all a timing measurement can do: a clean
+score is consistent with a leak the instrument cannot see, so each mode carries a
+*planted* leak that must be detected and a constant-time reference that must not
+separate the way the planted one does. A mode that has stopped measuring therefore
+fails through its own control instead of reading as a pass.
+
+Every gate is a separation between the two class means, never `|t|`. Welch's
+statistic divides by the sample variance, and concurrent load inflates the variance
+without moving the means, so `|t|` collapses under load while the leak is plainly
+still there. Measured at load average 27, six consecutive runs of one binary gave
+`|t|` between 7.51 and 11.24 against a threshold of 10 while the mean ratio never
+fell below 3.4. `|t|` is still reported, because it is the right statistic on a
+quiet box, and it is just not the gate.
+
+A third probe leaks nothing at all and decides whether the run counts. Any
+separation *it* shows is the machine rather than the code, so a run in which it is
+not flat has no discriminating power and **declines** rather than asserting: a
+differential measurement without discriminating power has no verdict in either
+direction, and failing there would be reporting machine load as a compiler
+regression. The consequence to keep in mind is that a permanently noisy runner
+yields a permanently declining harness, which is silence rather than assurance.
+
+**The x86-64 inline-asm flags table is measured, not inferred.** The eighteen-row
+classification the `#[oblivious]` asm model rests on, naming which instructions
+*define* ZF and CF, which merely write them, and which read them, is re-derived on x86-64
+hosts by `mach.lang.target.isa.x64.probe`, which runs each instruction twice with
+RFLAGS preset all-set and all-clear and compares what the CPU did against the
+transcription. `defines_flags` is the only fact that clears a taint, so a row that
+drifts from the silicon is a permission rather than a refusal. Three rows are
+exempt and classified by reasoning instead: `popfq`, `iretq` and `syscall` pass the
+writer probe cleanly and are still not definers, because the flags came from the
+stack, the interrupt frame, or an existing value masked through `IA32_FMASK`, and
+where a value came *from* is structural rather than measurable. A non-x86-64 host
+declines the probe by name.
 
 **What a timing harness can and cannot assure.** The leakage model has three
 channels and no single sampling regime covers them (briar-systems/mach#2363):
