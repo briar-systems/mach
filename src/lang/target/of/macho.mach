@@ -4232,6 +4232,23 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
         if ((n_desc & N_WEAK_DEF) != 0) { flags = flags | of.SYM_OBJ_FLAG_WEAK; }
         if ((n_type & N_TYPE) == N_UNDF) {
             flags = flags | of.SYM_OBJ_FLAG_EXTERN;
+            # A COMMON SYMBOL WEARS AN UNDEFINED SYMBOL'S CLOTHES (#2974). N_UNDF with
+            # N_EXT and a NON-ZERO n_value is a tentative definition, and the value is
+            # the requested size rather than an address - the one place in the nlist
+            # encoding where n_value does not mean "where". Apple Clang emits one for
+            # every uninitialized file-scope C global unless the unit is built
+            # `-fno-common`, so reading it as an ordinary import made a vendored C
+            # dependency demand a `#[library]` attribution for storage it was asking
+            # the linker to allocate.
+            #
+            # The alignment is a log2 in n_desc bits 8-11, which is how ld64 spells it.
+            if ((n_type & N_EXT) != 0 && n_value != 0) {
+                flags = flags | of.SYM_OBJ_FLAG_COMMON;
+                out.symbols[si].size = n_value::u32;
+                out.symbols[si].align = 1;
+                val log2a: u32 = (n_desc::u32 >> 8) & 0xF;
+                if (log2a > 0 && log2a < 32) { out.symbols[si].align = 1 << log2a; }
+            }
             # recover the function-ness emit_object encoded in the reference type so
             # the linker can give a dynamic function import its call stub.
             if ((n_desc & REFERENCE_TYPE_MASK) == REFERENCE_FLAG_UNDEFINED_LAZY) { flags = flags | of.SYM_OBJ_FLAG_FUNCTION; }
@@ -7922,6 +7939,96 @@ test "mach.lang.target.of.macho:a_malformed_subtractor_pair_is_refused" {
     t_put_reloc(b3.data, o3, 1, 16, 0, 0, 3, 1, X86_64_RELOC_SUBTRACTOR);
     var out3: of.ObjectImage;
     if (R.is_ok[bool, str](parse_object(?alloc, ?i, b3.data, b3.len, ?out3)) && bad == 0) { bad = 9; }
+
+    ret bad;
+}
+
+# the file offset and count of an emitted object's symbol table
+fun t_symtab(buf: *u8, out_n: *u32) usize {
+    val ncmds: u32 = bin.read_u32_le(buf, 16);
+    var off: usize = MACH_HEADER_64_SIZE;
+    var c: u32 = 0;
+    for (c < ncmds) {
+        val cmd: u32 = bin.read_u32_le(buf, off);
+        val cmdsize: usize = bin.read_u32_le(buf, off + 4)::usize;
+        if (cmd == LC_SYMTAB) {
+            @out_n = bin.read_u32_le(buf, off + 12);
+            ret bin.read_u32_le(buf, off + 8)::usize;
+        }
+        off = off + cmdsize;
+        c = c + 1;
+    }
+    @out_n = 0;
+    ret 0;
+}
+
+# A tentative definition is read as COMMON, not as an ordinary import (#2974).
+#
+# `N_UNDF | N_EXT` with a NON-ZERO `n_value` is C common storage: the value is the
+# requested SIZE rather than an address, the one place in the nlist encoding where
+# n_value does not mean "where". Read as an ordinary undefined symbol it became a
+# dynamic import, and a native Darwin link of a vendored C dependency failed with
+# `dynamic import _ma_atomic_global_lock has no #[library] attribution` - a message
+# that names the symbol correctly and the problem not at all.
+#
+# Apple Clang emits one for every uninitialized file-scope global unless the unit is
+# compiled `-fno-common`, so this arrives whether or not anyone chose it.
+test "mach.lang.target.of.macho:a_tentative_definition_reads_as_common" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var buf: Vector[u8];
+    if (!t_emit_x64_object(?alloc, ?i, ?buf)) { ret 1; }
+
+    var nsyms: u32 = 0;
+    val symoff: usize = t_symtab(buf.data, ?nsyms);
+    if (symoff == 0 || nsyms == 0) { ret 2; }
+
+    # rewrite the LAST symbol (the external one) into a tentative definition of 40
+    # bytes aligned to 16: n_type = N_UNDF|N_EXT, n_desc alignment log2 in bits 8-11.
+    val so: usize = symoff + (nsyms - 1)::usize * NLIST_64_SIZE;
+    buf.data[so + 4] = N_UNDF | N_EXT;
+    buf.data[so + 5] = 0;
+    bin.write_u16_le(buf.data, so + 6, (4 << 8)::u16);
+    bin.write_u64_le(buf.data, so + 8, 40);
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 3; }
+
+    var bad: i32 = 0;
+    var saw: bool = false;
+    var k: u32 = 0;
+    for (k < out.symbol_count) {
+        val sym: *of.Symbol = ?out.symbols[k];
+        if ((sym.flags & of.SYM_OBJ_FLAG_COMMON) != 0) {
+            saw = true;
+            if (sym.size != 40                                    && bad == 0) { bad = 4; }
+            if (sym.align != 16                                   && bad == 0) { bad = 5; }
+            # still undefined here: the linker is what turns it into storage, and every
+            # consumer meaning "needs resolving" must keep seeing that
+            if ((sym.flags & of.SYM_OBJ_FLAG_EXTERN) == 0         && bad == 0) { bad = 6; }
+            if (sym.section != of.SECTION_EXTERNAL                && bad == 0) { bad = 7; }
+        }
+        k = k + 1;
+    }
+    if (!saw && bad == 0) { bad = 8; }
+
+    # ...and a plain undefined symbol (n_value 0) is NOT common, which is the half that
+    # keeps every existing import working
+    var b2: Vector[u8];
+    if (!t_emit_x64_object(?alloc, ?i, ?b2)) { ret 9; }
+    var n2: u32 = 0;
+    val s2: usize = t_symtab(b2.data, ?n2);
+    if (s2 == 0 || n2 == 0) { ret 10; }
+    var out2: of.ObjectImage;
+    if (R.is_err[bool, str](parse_object(?alloc, ?i, b2.data, b2.len, ?out2))) { ret 11; }
+    var k2: u32 = 0;
+    for (k2 < out2.symbol_count) {
+        if ((out2.symbols[k2].flags & of.SYM_OBJ_FLAG_COMMON) != 0 && bad == 0) { bad = 12; }
+        k2 = k2 + 1;
+    }
 
     ret bad;
 }

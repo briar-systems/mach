@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### link(macho): a C common symbol is allocated instead of demanded as an import (#2974)
+
+An external Mach-O common symbol - `N_UNDF | N_EXT` with a non-zero `n_value` - was read
+as an ordinary undefined import, so a native x86_64 Darwin link of a vendored C
+dependency failed with:
+
+```
+dynamic import _ma_atomic_global_lock has no #[library] attribution
+```
+
+The symbol is a **tentative definition** in the foreign object, not a dylib import.
+Apple Clang emits one for every uninitialized file-scope C global unless the translation
+unit is compiled `-fno-common`, so it arrives whether or not anyone chose it - and the
+message named the symbol correctly and the problem not at all.
+
+`n_value` on such a symbol is the requested SIZE rather than an address, the one place
+in the nlist encoding where it does not mean "where", with the alignment as a log2 in
+`n_desc`. Both are now preserved in the neutral model as `SYM_OBJ_FLAG_COMMON` plus
+`Symbol.align`, alongside `SYM_OBJ_FLAG_EXTERN` - a common IS undefined until the linker
+allocates it, so every consumer that means "needs resolving" keeps working and only the
+one deciding HOW it resolves has to know the difference.
+
+**The allocation belongs to the linker, and arrives as an ordinary input image.** A
+tentative definition asks the linker for storage, and every object declaring the name
+asks for the SAME storage rather than its own - so the commons are gathered once, ahead
+of everything that resolves a symbol, and appended as one synthesized `.bss` input.
+Symbol resolution, dead-stripping and every format's own collection then apply to it
+with no side path, because from that point it is not distinguishable from any other BSS
+definition.
+
+Coalesced by MAX size and alignment, which is the C rule: taking the first size seen
+under-allocates the moment a later unit declares a larger type, and allocating per
+object multiplies the storage and leaves the copies unaliased, so two writers of the
+same name would not see each other.
+
+A real definition of the name wins outright and the common allocates nothing. A strong
+definition and a tentative one are not a duplicate-symbol collision; the tentative one
+exists precisely to yield to it. A relocatable output allocates nothing either, since it
+carries its symbols through unresolved and the eventual link is where the storage is
+decided.
+
+### Fixed
+
 #### link(macho): an x86_64 SUBTRACTOR relocation pair is parsed and resolved (#2973)
 
 Mach refused a normal Apple Clang x86_64 object outright:
