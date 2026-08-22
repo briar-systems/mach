@@ -134,7 +134,10 @@ another layer's output.
 pipelines, plus a third `-g` build. `llvm-readobj --file-header --sections --relocs`
 must parse cleanly, and the class, machine and endianness must match the target.
 SPIR-V goes to `spirv-val` under the environment the module itself declares.
-`llvm-dwarfdump --verify` must pass on the debug build.
+`llvm-dwarfdump --verify` must pass on the debug build. A `raw` flat image has no
+external structural oracle wired for it, so layer A records a skip rather than a
+pass: a target reaching this cell needs a `SKIPS` entry, the same as any other
+declared gap.
 
 **Layer B, golden disassembly.** The release pipeline only, to bound churn. The
 case's own object is disassembled by an **external** decoder and diffed against a
