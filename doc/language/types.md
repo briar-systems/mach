@@ -193,6 +193,49 @@ non-zero `Depth`, a non-zero `MS`, a `Dim` past `Cube`, and a `Sampled` other th
 See [decorators.md](decorators.md) for `#[handle]` and `#[sampler(set, binding)]`,
 and the shader library for the handles a SPIR-V target declares.
 
+## ABI types
+
+An **ABI type** is a C type whose size and alignment come from the **selected
+target** and whose contents the program never reaches. It is a bodyless `def`
+carrying `#[abi_type(name)]`, and `va_list` is the only name:
+
+```mach
+#[abi_type("va_list")]
+pub def VaList;
+```
+
+It exists for the one C type that has no correct spelling in mach source.
+`va_list` is a plain pointer on System V x86-64, Apple arm64, Microsoft x64 and
+RISC-V lp64d, and a 32-byte 8-aligned composite under AAPCS64 — so `ptr` binds
+correctly on four platforms and silently corrupts on the fifth, where the psABI
+passes the composite indirectly with the caller owning the copy.
+
+Unlike a handle, an ABI type is an **aggregate** of the declared extent rather than
+a pointer-shaped name for a resource. That is the whole mechanism: an aggregate over
+16 bytes rides AAPCS64's by-reference path, which makes the caller copy and pass an
+address, and an eight-byte one reduces on every other platform to the single register
+a pointer would have taken.
+
+What a program may do with one is bounded to the opposite end from a handle's:
+
+- it may be a **parameter**, and it may be **passed on** to another function
+- it cannot be read: no fields, no indexing, no cast in either direction
+- it cannot be constructed, and no function may return one
+- it cannot be a local binding, a global, or a record or union field
+- it cannot sit behind a pointer or inside an array
+
+Reading one needs `va_arg`, which mach has no callee shape for: mach has no runtime
+variadics, so nothing walks its own argument tail. `$size_of` and `$align_of`
+answer with the target's declared numbers, which are published psABI facts rather
+than anything about a value.
+
+A target that declares no layout for the named type **refuses** the declaration,
+naming the exclusion. There is no inert outcome, because every default available
+would be a pointer and a pointer is wrong under AAPCS64.
+
+See [ext-fun.md](ext-fun.md) for the binding recipe and
+[decorators.md](decorators.md) for `#[abi_type]`.
+
 ## Pointer
 
 `*T` — pointer to a value of type `T`.

@@ -71,6 +71,46 @@ the kernel's own answer rather than the bytes on the console, which is strictly 
 than the golden saw. windows declines both: it has no syscall ABI, and its console
 write goes through a kernel32 import, so its premise fails rather than its expectation.
 
+#### link: a C function taking a `va_list` parameter has a portable binding (#3004)
+
+A C function that takes a `va_list` **parameter** could not be bound, because mach had
+no spelling for the type. The common shape is a logging callback, and it is a fixed
+3-arity function with no `...` in it:
+
+```c
+typedef void (*TraceLogCallback)(int logLevel, const char *text, va_list args);
+```
+
+Binding it needs one thing only: a parameter type that is ABI-correct in that third
+slot, which mach receives, never reads, and hands straight to `vsnprintf`.
+
+`#[abi_type("va_list")]` on a bodyless `def` declares it, and the SELECTED TARGET
+supplies the layout:
+
+```mach
+#[abi_type("va_list")]
+def VaList;
+
+ext fun vsnprintf(buf: *u8, n: usize, fmt: *u8, ap: VaList) i32;
+```
+
+**The layout is declared per (os, architecture), never derived.** `va_list` is a plain
+pointer on System V x86-64, Apple arm64, Microsoft x64 and RISC-V lp64d, and a 32-byte
+8-aligned composite under AAPCS64. Darwin and linux compose the very same `aapcs64`
+convention vtable and disagree about it outright, so no calling convention can answer
+and no machine model implies it - it sits on the os vtable beside the Apple
+variadic-stack rule and for the same reason. An OS listing an architecture it declares
+no layout for is refused at registration rather than defaulted to a pointer: a pointer
+is right four times out of five, which is exactly the shape that ships silent
+corruption on the fifth.
+
+**The scope is forward-only, stated as an exclusion.** There is no `va_start`, no
+`va_arg`, no `va_end`, and no way to construct one. Reading one needs `va_arg`, and
+mach has no callee that walks its own argument tail because it has no runtime
+variadics. A local binding, a record or union field, a global, a return position, a
+pointer or array of one, and a cast in either direction are each refused where they
+are written, naming the exclusion.
+
 ### Fixed
 
 #### abi: a C callee wrote through into the caller's object (#3063)

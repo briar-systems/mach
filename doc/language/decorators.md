@@ -50,6 +50,7 @@ A decorator is written as an attribute:
 #[sampler(set, bnd)] # descriptor-bound image / sampler handle (global only)
 #[op(tgt,set,name)]   # the target instruction this function is (bodyless fun only)
 #[handle(tgt,ctor,..)] # the target type this declares (bodyless def only)
+#[abi_type("name")]   # a C type whose layout the target declares (bodyless def only)
 ```
 
 Decorators appear **before** the declaration they target, one per line or
@@ -739,6 +740,28 @@ handles compiles on a machine target. A constructor name the selected target doe
 not define, an operand count that disagrees with the constructor's, or an operand
 combination the target cannot emit is a compile error at the declaration.
 
+### `abi_type(name)` — a C type whose layout the target declares
+
+A bodyless `def` carrying this directive declares a C type whose size and alignment
+come from the **selected target** and whose contents the program never reaches.
+
+```mach
+#[abi_type("va_list")]
+pub def VaList;
+```
+
+`va_list` is the only name, and the set is closed in the front end for the reason
+`op`'s instruction names are: which target a module is built for is not a property
+of the source, so a typo checked only where it is acted on would go unreported on
+every other build of the same library. A target that declares no layout for the
+named type refuses the declaration rather than substituting a default.
+
+The type is an opaque aggregate of the declared extent. A value of one may be
+received as a parameter and passed on, and nothing else: a local binding, a record
+or union field, a global, a return position, a pointer or array of one, and a cast
+in either direction are each refused where they are written. See
+[ext-fun.md](ext-fun.md) for the recipe and for why forwarding is the whole scope.
+
 ### `op(target, set, name)` — a function that *is* a target instruction
 
 A shader needs `sqrt`, `normalize`, `dot` and `mix`. None of them is an operator,
@@ -819,6 +842,7 @@ in it.
 | `storage`   |  no   |    no     |      yes      |      no       |
 | `op`        |  yes  |    no     |      no       |      no       |
 | `handle`    |  no   |    no     |      no       |      no       |
+| `abi_type`  |  no   |    no     |      no       |      no       |
 
 The `val` / `var` column is shared, but `embed` accepts only `val` — a `var`
 is refused (see [`embed`](#embedstr--compile-time-file-embedding) above).
