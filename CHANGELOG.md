@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [4.26.0] - 2026-08-22
 
 ### Added
 
@@ -182,6 +182,52 @@ redundant copy per aggregate argument to every mach-to-mach call. Unifying on
 caller-copy internally and dropping the callee-side copy is arguably the cleaner
 model and is a separate decision - it changes the internal convention on every
 target, including the two that were already correct.
+
+#### driver(dep): `mach dep pull` realises the project you name, not the one you are standing in (#2936)
+
+`mach dep pull` accepted a path positional and then ignored it, hardcoding its project
+root to the current directory. A pull aimed at a project you were not standing in
+reported on the current directory instead and materialised nothing for the one named,
+and the build that sent you there refused by naming `mach dep pull` - the command that had
+just no-opped. The advice looped.
+
+The positional now resolves through the same rules `mach build <path>` uses, and a bare
+`mach dep pull` is unchanged. Fixing it exposed a second defect the hardcoded root had
+kept invisible: a path dependency's symlink target was computed from the source path as
+reached from the working directory, while the link is read from inside the project, so a
+pull run from elsewhere wrote a link that dangled. `DepNode` carries both frames now, and
+the link a pull writes is identical whichever directory it ran from.
+
+`update`, `add`, `remove` and `list` remain current-directory-only: their positional is
+already a dependency name, so giving them a project path is a grammar decision tracked
+separately (#3061).
+
+#### test: corpus layer A records a skip for an object format it has no oracle for (#2956)
+
+Layer A handed every format to an external oracle - ELF, COFF and Mach-O to
+`llvm-readobj`, SPIR-V to `spirv-val` - except `raw`, which it passed after asserting
+only that the file existed and was non-empty, which the caller had already checked. That
+is a cell that cannot go red, and the matrix is what the project reads to answer which
+surfaces are covered. `Outcome` carries a third verdict now, so the cell reads `SKIP` and
+the run fails on an uncovered column with no `SKIPS` entry. No target's pass count
+changed.
+
+#### docs(manifest): the accepted-tuple table lists `riscv32` and the RISC-V ABI family (#2947)
+
+The table omitted `riscv32` and five of the nine registered calling conventions, so a
+reader writing a manifest from the doc could not reach RV32 at all and would pick the
+wrong RISC-V ABI: #2777 made `lp64` mean soft float and the linux default `lp64d`, and
+`lp64` was the only RISC-V entry the doc offered. The table now matches what `mach info`
+prints in both directions, and the family is explained where a reader choosing one will
+see it.
+
+#### chore(ci): the artifact actions run on Node.js 24 (#2983)
+
+Twelve jobs across four workflows emitted a deprecation annotation for
+`actions/upload-artifact@v4` and `actions/download-artifact@v4` being forced onto
+Node.js 24. Both are on their current majors now, with the producer and consumer
+pairings checked against the intervening breaking changes.
+
 
 ## [4.25.0] - 2026-08-21
 
