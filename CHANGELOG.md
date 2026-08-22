@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+#### abi: a C callee wrote through into the caller's object (#3063)
+
+A C function that overwrites a by-value aggregate parameter overwrote the **mach
+caller's own object**. Silent memory corruption: the call links, returns, and leaves
+the caller's data rewritten.
+
+```mach
+rec Wide { a: i64; b: i64; c: i64; d: i64; }
+ext fun clobber(w: Wide) i64;   # the callee's writes reached the caller's `w`
+```
+
+```
+x86_64-linux    byval intact=1 2 3 4      <- control, correct
+aarch64-linux   byval intact=-1 -2 -3 -4  <- the caller's object was overwritten
+```
+
+AAPCS64, the RISC-V psABI and the Microsoft convention all pass an aggregate too
+large for registers as the address of a copy **the caller allocates**, so the callee
+may overwrite its parameter freely. System V passes one over sixteen bytes by value
+on the stack instead, where the copy already exists - which is why x86-64 is a real
+control rather than a leg that happens to pass.
+
+**Two ends, one copy, and only one of them was mach's.** `CLASS_BYREF` passed the
+address of the argument's own storage, and a mach callee then gave every parameter
+storage of its own and copied the incoming aggregate into it at entry. While both
+ends are mach the two are indistinguishable. A C callee copies nothing, so at an
+`ext` call it was handed mach's object directly.
+
+That is unobservable for a callee which only reads its parameter, which is the
+overwhelmingly common case and is why the defect survived. It needs a callee that
+WRITES to its by-value parameter to show, and a `va_list` is the by-value parameter
+every consumer advances - which is how #3004 found it.
+
+The caller now allocates a frame temporary at the aggregate's own alignment, copies
+into it, and passes the temporary's address. Gated on the `ext` boundary, because
+this is a divergence between two conventions rather than a defect in one: an
+internal call already copies, at the callee, and copying at both ends would add one
+redundant copy per aggregate argument to every mach-to-mach call. Unifying on
+caller-copy internally and dropping the callee-side copy is arguably the cleaner
+model and is a separate decision - it changes the internal convention on every
+target, including the two that were already correct.
+
 ## [4.25.0] - 2026-08-21
 
 
