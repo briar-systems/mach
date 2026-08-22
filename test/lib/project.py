@@ -168,6 +168,11 @@ class Project(object):
         return os.path.join(self.root, "o", target.name, profile)
 
     def object_path(self, case, target, profile):
+        # a flat-image format (raw) has no relocatable .o container: mach links the
+        # in-memory codegen images straight to the artifact, so the object IS the
+        # artifact and there is no separate obj/ path to expect.
+        if target.object_format == "raw":
+            return self.artifact_path(case, target, profile)
         base = os.path.join(self.outdir(target, profile), "obj", "corpus", "cases", case)
         return base + (".spv" if target.object_format == "spv" else ".o")
 

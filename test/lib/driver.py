@@ -506,7 +506,7 @@ def layer_a_cells(proj, tools, m, t, case, built, skips):
             paths.append(artifact)
         out = oracle.layer_a(tools, t, paths, want_dwarf=(profile == "g" and
                                                           t.object_format in ("elf", "macho")))
-        m.add(case, t.name, "a", profile, "PASS" if out.ok else "FAIL", "", out.detail)
+        m.add(case, t.name, "a", profile, out.status, "", out.detail)
 
 
 def layer_b_cells(proj, tools, m, t, case, built, bless, blessed, skips):
@@ -529,7 +529,7 @@ def layer_b_cells(proj, tools, m, t, case, built, bless, blessed, skips):
             with open(golden, "w", encoding="utf-8") as fh:
                 fh.write(text)
             blessed.append((golden, before, text))
-    m.add(case, t.name, "b", "o2", "PASS" if out.ok else "FAIL", "", out.detail)
+    m.add(case, t.name, "b", "o2", out.status, "", out.detail)
 
 
 def layer_c_cells(proj, ref, m, t, case, built, skips):
