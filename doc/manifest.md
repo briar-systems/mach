@@ -173,9 +173,9 @@ such an image is refused at link rather than silently dropped.
 
 | Axis  | Values |
 |-------|--------|
-| `isa` | `x86_64`, `aarch64`, `riscv64`, `spirv`, `mos6502` |
+| `isa` | `x86_64`, `aarch64`, `riscv64`, `riscv32`, `spirv`, `mos6502` |
 | `os`  | `linux`, `windows`, `darwin`, `freestanding` |
-| `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `spirv`, `mos6502` |
+| `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, `ilp32d`, `spirv`, `mos6502` |
 
 `x86_64`/`linux`/`sysv64` is the primary host and target. `aarch64`-linux builds
 and runs natively in CI on every PR; `riscv64`-linux runs under qemu and
@@ -188,6 +188,22 @@ bare-metal platform such as BareMetal (`bmos`) is a `freestanding` target plus a
 not an os of its own. `spirv` is not a machine at all — it
 emits a finished GPU module rather than machine code (see
 [Finished-module targets](#finished-module-targets)).
+
+`lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, and `ilp32d` are the RISC-V psABI
+calling-convention family, one `abi` per member. The lp64 three target
+`riscv64` and the ilp32 three target `riscv32`; an ilp32 member on a `riscv64`
+target or an lp64 member on `riscv32` is refused at composition, since XLEN is
+part of what the id means. Within each width, the members differ only in how
+floating-point arguments travel: `lp64` and `ilp32` are **soft float** — every
+float argument rides an integer register — while the `f` and `d` suffixes are
+**hard float**, passing `f32` (`f`) or both `f32` and `f64` (`d`) in the
+`fa0`-`fa7` register bank. `lp64d` is what a `riscv64-linux-gnu` toolchain
+means by "riscv64", and is the convention `mach init` scaffolds for a
+`riscv64`/`linux` target; a manifest that wants soft float, or the `f`-only
+convention, must name it explicitly, since `abi` has no default of its own
+(see [Convention, then totality](#convention-then-totality)). `riscv32`
+currently only reaches a `freestanding` target — `mach info targets` lists
+`freestanding-riscv32` and no `linux`/`darwin` riscv32 tuple.
 
 `mach info targets` prints the tuples this binary can actually build; it is
 derived from the same declarations composition reads, so it never advertises a
