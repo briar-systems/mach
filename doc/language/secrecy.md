@@ -411,29 +411,45 @@ validator independently re-checks the lowered MIR. All three are static. Two
 host-executed measurements sit under them, and each only means anything on the
 machine it runs on, which is why both are unit tests rather than build checks.
 
-**The timing harness runs.** `mach.lang.ct.probe` is a dudect-style harness in the
-tree, measured on every `mach test`, and the claims below are what it establishes.
-It works by refutation, because that is all a timing measurement can do: a clean
-score is consistent with a leak the instrument cannot see, so each mode carries a
-*planted* leak that must be detected and a constant-time reference that must not
-separate the way the planted one does. A mode that has stopped measuring therefore
-fails through its own control instead of reading as a pass.
+**The timing harness is a tool, not a gate.** `mach.lang.ct.probe` is a
+dudect-style harness in the tree. `mach test` runs it at deliberately tiny sample
+counts and asserts only that it still executes and produces finite, positive
+numbers, which is a structural claim about the harness rather than a timing claim
+about the machine. **No threshold over a measured time gates anything**, here or
+anywhere else in the suite.
 
-Every gate is a separation between the two class means, never `|t|`. Welch's
+That is deliberate and it is not a gap. A dudect score is a statistic over
+wall-clock time on hardware nobody controls, so any threshold over it has a
+false-failure rate that belongs to the machine rather than to the code. A required
+check that can fail nondeterministically is worse than no check: it teaches a
+reader to re-run a red constant-time result until it turns green. An earlier form
+of this harness did assert on such thresholds, and failed a release gate on
+`x86_64-darwin` and then passed a re-run of the identical commit (#3070).
+
+**So the claims below are measurements, taken deliberately, not properties this
+suite enforces.** Raising the counts in `mach.lang.ct.probe` and reading the
+printed table is how they are re-taken, on a quiet machine, by a person who then
+reads the numbers. Performance and timing work belongs in
+[mach-bench](https://github.com/briar-systems/mach-bench), which is built for it,
+rather than in a correctness suite that must be deterministic.
+
+What such a measurement can establish is bounded. It works by refutation, because
+that is all a timing measurement can do: a clean score is consistent with a leak
+the instrument cannot see, so each mode carries a *planted* leak that must be
+detected and a constant-time reference that must not separate the way the planted
+one does. Read separations between the two class means, never `|t|` -- Welch's
 statistic divides by the sample variance, and concurrent load inflates the variance
 without moving the means, so `|t|` collapses under load while the leak is plainly
 still there. Measured at load average 27, six consecutive runs of one binary gave
 `|t|` between 7.51 and 11.24 against a threshold of 10 while the mean ratio never
-fell below 3.4. `|t|` is still reported, because it is the right statistic on a
-quiet box, and it is just not the gate.
+fell below 3.4.
 
-A third probe leaks nothing at all and decides whether the run counts. Any
+A third probe leaks nothing at all and says whether a run counts at all. Any
 separation *it* shows is the machine rather than the code, so a run in which it is
-not flat has no discriminating power and **declines** rather than asserting: a
-differential measurement without discriminating power has no verdict in either
-direction, and failing there would be reporting machine load as a compiler
-regression. The consequence to keep in mind is that a permanently noisy runner
-yields a permanently declining harness, which is silence rather than assurance.
+not flat has no discriminating power and its verdict means nothing in either
+direction. Note that a flat null is necessary and not sufficient: it must also be
+sampled at a comparable cost to the probe it is bounding, or a quiet control at one
+magnitude certifies nothing about noise at another.
 
 **The x86-64 inline-asm flags table is measured, not inferred.** The eighteen-row
 classification the `#[oblivious]` asm model rests on, naming which instructions
