@@ -18,11 +18,17 @@ MACHINE = {
 }
 
 
-class Outcome(object):
-    __slots__ = ("ok", "detail")
+# the three verdicts a layer can hand back. these are exactly the matrix's own
+# status strings, so a caller threads the verdict through rather than collapsing
+# it back to a pass/fail boolean and losing SKIP on the way.
+PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
 
-    def __init__(self, ok, detail):
-        self.ok, self.detail = ok, detail
+
+class Outcome(object):
+    __slots__ = ("status", "detail")
+
+    def __init__(self, status, detail):
+        self.status, self.detail = status, detail
 
 
 def _run(cmd, **kw):
@@ -35,30 +41,31 @@ def layer_a(tools, target, paths, want_dwarf):
     fmt = target.object_format
     for path in paths:
         if not os.path.exists(path):
-            return Outcome(False, "expected artifact was not produced: " + path)
+            return Outcome(FAIL, "expected artifact was not produced: " + path)
         if os.path.getsize(path) == 0:
-            return Outcome(False, "artifact is empty: " + path)
+            return Outcome(FAIL, "artifact is empty: " + path)
     if fmt == "spv":
         rc, out, err = _run(["spirv-val", paths[-1]])
         if rc != 0:
-            return Outcome(False, "spirv-val rejected the module: " + (err or out).strip())
-        return Outcome(True, "spirv-val accepted %d module(s)" % len(paths))
+            return Outcome(FAIL, "spirv-val rejected the module: " + (err or out).strip())
+        return Outcome(PASS, "spirv-val accepted %d module(s)" % len(paths))
     if fmt == "raw":
-        return Outcome(True, "raw image, %d byte(s)" % os.path.getsize(paths[-1]))
+        return Outcome(SKIP, "raw is a mach-only object format with no external "
+                       "structural oracle wired for it")
     for path in paths:
         rc, out, err = _run(["llvm-readobj", "--file-header", "--sections", "--relocs", path])
         if rc != 0:
-            return Outcome(False, "llvm-readobj could not parse %s: %s" % (path, (err or out).strip()))
+            return Outcome(FAIL, "llvm-readobj could not parse %s: %s" % (path, (err or out).strip()))
         bad = _header_mismatch(fmt, target, out)
         if bad:
-            return Outcome(False, "%s: %s" % (os.path.basename(path), bad))
+            return Outcome(FAIL, "%s: %s" % (os.path.basename(path), bad))
     if want_dwarf:
         rc, out, err = _run(["llvm-dwarfdump", "--verify", paths[-1]])
         if rc != 0:
             tail = [l for l in (out + err).splitlines() if l.strip()][-1:] or ["no output"]
-            return Outcome(False, "llvm-dwarfdump --verify failed: " + tail[0].strip())
-        return Outcome(True, "readobj parsed %d file(s), dwarfdump verified" % len(paths))
-    return Outcome(True, "readobj parsed %d file(s)" % len(paths))
+            return Outcome(FAIL, "llvm-dwarfdump --verify failed: " + tail[0].strip())
+        return Outcome(PASS, "readobj parsed %d file(s), dwarfdump verified" % len(paths))
+    return Outcome(PASS, "readobj parsed %d file(s)" % len(paths))
 
 
 def _header_mismatch(fmt, target, text):
@@ -115,17 +122,17 @@ def disassemble(tools, target, case, path):
 def layer_b(tools, target, case, path, golden_path, bless):
     text, err = disassemble(tools, target, case, path)
     if text is None:
-        return Outcome(False, err), None
+        return Outcome(FAIL, err), None
     if bless:
-        return Outcome(True, "blessed %d line(s)" % text.count("\n")), text
+        return Outcome(PASS, "blessed %d line(s)" % text.count("\n")), text
     if not os.path.exists(golden_path):
-        return Outcome(False, "no golden at %s; run --bless and review the diff" % golden_path), text
+        return Outcome(FAIL, "no golden at %s; run --bless and review the diff" % golden_path), text
     with open(golden_path, "r", encoding="utf-8") as fh:
         want = fh.read()
     if want != text:
-        return Outcome(False, "disassembly differs from the golden at " +
+        return Outcome(FAIL, "disassembly differs from the golden at " +
                        _first_difference(want, text)), text
-    return Outcome(True, "%s matched %d line(s)" % (target.disasm, text.count("\n"))), text
+    return Outcome(PASS, "%s matched %d line(s)" % (target.disasm, text.count("\n"))), text
 
 
 def _first_difference(want, got):
