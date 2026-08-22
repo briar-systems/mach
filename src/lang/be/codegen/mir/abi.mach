@@ -1112,7 +1112,8 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         val argop: mir.MirOperand = R.unwrap_ok[mir.MirOperand, str](aor);
 
         val er: R.Result[bool, str] = emit_arg_slot(ctx, mb, slot, argop, soff, aag, av.ty,
-                                                    natural_stack_slot(ctx.tgt, pidx >= layout.param_count));
+                                                    natural_stack_slot(ctx.tgt, pidx >= layout.param_count),
+                                                    is_ext);
         if (R.is_err[bool, str](er)) {
             sig_layout_free(ctx, ?layout);
             ret er;
@@ -1378,8 +1379,40 @@ fun materialize_pieces(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.Para
 #            against it (the Apple arm64 fixed rule)
 # ret:       ok(true) on success, or a loud error
 fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, argop: mir.MirOperand,
-                  stack_off: i64, is_aggr: bool, ty: type.IrTypeId, natural: bool) R.Result[bool, str] {
+                  stack_off: i64, is_aggr: bool, ty: type.IrTypeId, natural: bool,
+                  is_ext: bool) R.Result[bool, str] {
     val size: u64 = type.byte_size(ctx.types, ty, ctx.tgt)::u64;
+
+    # THE CALLER OWNS THE COPY AT A FOREIGN BOUNDARY (#3004). AAPCS64, the RISC-V
+    # psABI and the Microsoft convention all say the same thing about an aggregate
+    # passed by reference: the CALLER allocates a copy and passes its address, so the
+    # callee may advance or overwrite its parameter without touching the caller's
+    # object. mach's own convention reaches the same semantics from the other end -
+    # a mach callee gives every parameter storage of its own and copies the incoming
+    # aggregate into it at entry - and the two are indistinguishable while both ends
+    # are mach.
+    #
+    # They are not indistinguishable at an `ext` call. A C callee copies nothing, so
+    # handing it the address of mach's own object lets it write through to it. That
+    # is unobservable for a callee that only reads its parameter, which is why it
+    # stood: what made it visible is `va_list`, a by-value parameter every consumer
+    # ADVANCES, so a forwarded one comes back spent.
+    #
+    # Gated on `is_ext` because it is a difference between two conventions rather
+    # than a fix to one: mach->mach already copies, at the callee, and copying at
+    # both ends would be one redundant copy per aggregate argument on every internal
+    # call. `is_ext` is the axis that already carries exactly this kind of divergence
+    # (win64's vector marshal, #2058).
+    if (is_ext && is_aggr && (slot.class == abi.CLASS_BYREF || slot.class == abi.CLASS_STACK_BYREF)) {
+        var owned: u32 = mir.MIR_VREG_NIL;
+        val cr: R.Result[bool, str] = copy_aggregate_to_temp(ctx, mb, argop, ty, ?owned);
+        if (R.is_err[bool, str](cr)) { ret cr; }
+        if (slot.class == abi.CLASS_STACK_BYREF) {
+            val sp: u32 = ctx.tgt.model.stack_ptr_reg::u32;
+            ret context.emit_store_to(ctx, mb, mir.op_mem_preg(sp, stack_off), mir.op_vreg(owned));
+        }
+        ret context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg::u32), mir.op_vreg(owned), ptr_move_width(ctx));
+    }
     # a register-resident value marshalled by reference (a 128-bit vector at a win64 `ext`
     # boundary, #2058): unlike an aggregate or a scalarized rv64 vector -- already
     # memory-resident, its argop a storage pointer -- the value is in a register, so the
@@ -1475,6 +1508,38 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
     # backend re-extends it to the register width by its own convention (the RV64 lp64 family
     # sign-extends a 32-bit register).
     ret context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg::u32), argop, scalar_reg_move_width(ctx.tgt.model.gpr_width, size));
+}
+
+# copy a memory-resident aggregate into a fresh frame temporary at its own alignment
+# and return the temporary's address in a vreg
+#
+# The by-reference twin of `spill_vector_to_temp`: that one exists because the value
+# is in a register and has no address yet, this one because the value HAS an address
+# and the foreign convention requires a different one. Both allocate at the type's
+# own alignment rather than at its size, which for an aggregate is the only number
+# that is a legal slot alignment at all.
+# ---
+# ctx:      the active lowering context
+# mb:       the MIR block the copy / address materialization are appended to
+# src:      the aggregate's storage pointer
+# ty:       the aggregate's IR type (the temp's size and alignment, and the copy length)
+# out_addr: receives the vreg holding the temporary's address
+# ret:      ok(true) on success, or a loud error
+fun copy_aggregate_to_temp(ctx: *context.LowerCtx, mb: *mir.MirBlock, src: mir.MirOperand,
+                           ty: type.IrTypeId, out_addr: *u32) R.Result[bool, str] {
+    val size:  u64 = type.byte_size(ctx.types, ty, ctx.tgt)::u64;
+    val align: u32 = type.byte_align(ctx.types, ty, ctx.tgt);
+    val res_key: R.Result[u32, str] = context.new_vreg(ctx, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](res_key)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_key)); }
+    val sk: u32 = R.unwrap_ok[u32, str](res_key);
+
+    val sr: R.Result[bool, str] = context.add_spill_slot_aligned(ctx, sk, size, align);
+    if (R.is_err[bool, str](sr)) { ret sr; }
+
+    val cr: R.Result[bool, str] = context.copy_aggregate(ctx, mb, mir.op_mem_slot(sk, 0), src, size);
+    if (R.is_err[bool, str](cr)) { ret cr; }
+
+    ret context.emit_lea_slot(ctx, mb, mir.op_mem_slot(sk, 0), out_addr);
 }
 
 # store a register-resident vector to a fresh 16-byte-aligned frame temporary and
