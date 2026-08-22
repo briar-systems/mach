@@ -131,6 +131,107 @@ crash. Mach cannot detect the mistake, because nothing in a fixed-arity declarat
 says the callee is variadic — so **declare every C-variadic callee with `...`**, on
 every target.
 
+## `va_list` parameters
+
+A C function may take a `va_list` as an ordinary **fixed** parameter. The common
+shape is a logging callback:
+
+```c
+typedef void (*TraceLogCallback)(int logLevel, const char *text, va_list args);
+void SetTraceLogCallback(TraceLogCallback callback);
+```
+
+That is a fixed 3-arity function. It has no `...` in it, and binding it needs
+nothing from the C-variadic form above — only a parameter type that is ABI-correct
+in the third slot. Declare that type with `#[abi_type("va_list")]` on a bodyless
+`def`:
+
+```mach
+#[abi_type("va_list")]
+def VaList;
+
+pub def TraceLogCallback: fun(i32, *u8, VaList) i64;
+
+#[library("raylib")]
+ext fun SetTraceLogCallback(cb: TraceLogCallback);
+
+ext fun vsnprintf(buf: *u8, n: usize, fmt: *u8, ap: VaList) i32;
+
+fun trace(level: i32, text: *u8, args: VaList) i64 {
+    var buf: [512]u8;
+    ret vsnprintf(?buf[0], 512, text, args)::i64;
+}
+```
+
+The declaration carries no size of its own. The selected target declares what a
+`va_list` is on that platform, and the same source text binds correctly on every
+one of them. A target that declares none refuses the declaration by name rather
+than guessing.
+
+### Mach can forward one and never read one
+
+The whole scope is **forward-only**: receive an opaque token from C and pass it to
+C. There is no `va_start`, no `va_arg`, no `va_end`, and no way to construct one.
+Each of these is refused where it is written:
+
+```mach
+val saved: VaList = args;   # refused: a local binding
+rec Held { ap: VaList; }    # refused: a record or union field
+var kept: VaList;           # refused: a global
+fun make() VaList { … }     # refused: a return position
+fun peek(ap: *VaList) { … } # refused: behind a pointer
+val raw: ptr = args :~ ptr; # refused: a cast in either direction
+```
+
+Reading one needs `va_arg`, and mach cannot have `va_arg`: it has no runtime
+variadics, so it has no callee that walks its own argument tail. That is not a gap
+waiting to be filled. Constructing a `va_list` is only meaningful for such a
+callee, and mach never needs to originate one — it would call `printf` rather than
+`vprintf`.
+
+One further rule comes from C rather than from mach: **a forwarded `va_list` is
+spent.** Handing one to a function that reads it leaves its value indeterminate,
+exactly as in C, and what actually happens differs per platform — under AAPCS64 the
+type is a composite the caller copies, so each callee walks its own; under System V
+x86-64 it is a pointer into shared state that the callee advances. Forward it once.
+
+### Why the type is declared per target
+
+`va_list` is the one C type mach binds whose shape cannot be written down portably:
+
+| Target | `va_list` in a parameter slot |
+|--------|-------------------------------|
+| **System V x86-64** | `__va_list_tag[1]`, an array type, so a parameter decays to one pointer |
+| **Apple arm64** | `char *` |
+| **Microsoft x64** and **Windows arm64** | `char *` |
+| **RISC-V lp64d** | `void *` |
+| **AAPCS64 linux** | a 32-byte, 8-aligned composite |
+
+On the first four, spelling the parameter `ptr` is already ABI-correct. On
+AAPCS64-linux it is not, and the way it fails is the reason this type exists rather
+than a documented caveat: AAPCS64 passes a composite over 16 bytes indirectly, with
+the **caller** owning the copy, so a `ptr` forwards the received pointer instead of
+a fresh copy and the next callee advances the caller's list. That usually appears to
+work, which is worse than failing.
+
+## Aggregate arguments and the caller's copy
+
+An aggregate too large for registers is passed as an **address of a copy the caller
+allocates** on AAPCS64, under the RISC-V psABI, and under the Microsoft convention.
+The callee treats that memory as its own parameter and may overwrite it, so mach
+materializes a fresh temporary for every such argument at an `ext` boundary and
+passes the temporary's address. A C callee that writes to its by-value parameter
+therefore cannot reach the caller's object:
+
+```mach
+rec Wide { a: i64; b: i64; c: i64; d: i64; }
+ext fun consume(w: Wide) i64;
+```
+
+A Mach→Mach call keeps mach's own convention, where the callee gives every
+parameter storage of its own and copies into it at entry. The two reach the same
+by-value semantics from opposite ends, and only the foreign one is visible here.
+
 ## Symbol name
 
 The declaration names a C declaration, so its linker symbol is whatever the
@@ -340,3 +441,4 @@ definition always wins over a same-named dynamic import.
 - [val-var.md](val-var.md) — `ext val` / `ext var`, the data analogue (foreign data imports)
 - [visibility.md](visibility.md) — `pub` and `ext` modifiers
 - [decorators.md](decorators.md) — `symbol`, `library`, and other codegen decorators
+- [variadics.md](variadics.md) — the comptime pack `...`, which is a Mach calling convention and not this one
