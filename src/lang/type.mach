@@ -15,6 +15,7 @@
 use std.allocator.page;
 use std.collections.map;
 use std.crypto.hash.fnv1a;
+use std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -585,6 +586,10 @@ pub rec FieldTable {
 #                  table and rebuilds any table whose epoch is older, so a record's
 #                  field-type change on a long-lived session refreshes the cached
 #                  layout instead of leaving it stale (#1583)
+# visits:          pool of TypeId-keyed visited sets a graph walk borrows for its cycle
+#                  guard, one per level of nesting, checked out and returned in stack order
+# visits_len:      sets currently borrowed, which is the current nesting depth
+# visits_cap:      allocated sets in visits
 pub rec TypeInterner {
     a: *A.Allocator;
 
@@ -645,6 +650,10 @@ pub rec TypeInterner {
     field_pool_cap: u32;
 
     field_epoch: u32;
+
+    visits:     *VisitSet;
+    visits_len: u32;
+    visits_cap: u32;
 }
 
 # initial capacities for the interner's growable backing arrays
@@ -653,6 +662,9 @@ val INITIAL_PARAMS_CAP:      u32 = 32;
 val INITIAL_INSTANCE_CAP:    u32 = 16;
 val INITIAL_FIELD_TABLE_CAP: u32 = 16;
 val INITIAL_FIELD_POOL_CAP:  u32 = 64;
+# slots in a freshly allocated VisitSet, and sets in a freshly allocated pool
+val INITIAL_VISIT_CAP:       u32 = 64;
+val INITIAL_VISIT_DEPTH:     u32 = 4;
 
 # construct an empty interner with primitives pre-allocated
 # ---
@@ -689,6 +701,10 @@ pub fun init(ti: *TypeInterner, a: *A.Allocator) O.Option[str] {
     ti.field_pool_cap = 0;
 
     ti.field_epoch = 0;
+
+    ti.visits     = nil;
+    ti.visits_len = 0;
+    ti.visits_cap = 0;
 
     ti.dedup       = map.init[Type, TypeId](a, hash_type, eq_type);
     ti.fun_index   = map.init[u64, TypeId](a, map.hash_u64, map.eq_u64);
@@ -783,6 +799,16 @@ pub fun dnit(ti: *TypeInterner) {
     if (ti.field_pool != nil && ti.field_pool_cap > 0) {
         A.deallocate[FieldEntry](ti.a, ti.field_pool, ti.field_pool_cap::usize);
     }
+    if (ti.visits != nil && ti.visits_cap > 0) {
+        var vi: u32 = 0;
+        for (vi < ti.visits_cap) {
+            if (ti.visits[vi].stamp != nil && ti.visits[vi].cap > 0) {
+                A.deallocate[u32](ti.a, ti.visits[vi].stamp, ti.visits[vi].cap::usize);
+            }
+            vi = vi + 1;
+        }
+        A.deallocate[VisitSet](ti.a, ti.visits, ti.visits_cap::usize);
+    }
 
     map.dnit[Type, TypeId](?ti.dedup);
     map.dnit[u64, TypeId](?ti.fun_index);
@@ -815,6 +841,10 @@ pub fun dnit(ti: *TypeInterner) {
     ti.field_pool_cap = 0;
 
     ti.field_epoch = 0;
+
+    ti.visits     = nil;
+    ti.visits_len = 0;
+    ti.visits_cap = 0;
 }
 
 # return a pointer to the Type for a given TypeId, or none when tid is out of
@@ -1085,6 +1115,11 @@ pub fun shape_kind(ti: *TypeInterner, tid: TypeId) TypeKind {
 # Follows `^` (true immediately), a typed pointer's pointee, and an array's
 # element. A nominal rec/uni is a leaf here (its secret fields are welded at the
 # field level), so the walk is over a finite spine and always terminates.
+#
+# `generics.contains_secret_deep` is the DEEP counterpart, recursing INTO nominal field
+# graphs. It lives there rather than here because a generic instance's field table is
+# materialized lazily and must be resolved before it can be walked, which is a dependency
+# `type` cannot reach.
 # ---
 # ti:  the interner
 # tid: the TypeId to inspect
@@ -1099,22 +1134,206 @@ pub fun carries_secret(ti: *TypeInterner, tid: TypeId) bool {
     ret false;
 }
 
-# the cycle guard for the deep-secret walk: the set of nominal TypeIds already on the
-# walk, so a self-referential record graph terminates (#2162)
+# one visited set over the type universe: an epoch stamp per TypeId
 #
-# Reused by `generics.contains_secret_deep`, which is the DEEP counterpart to
-# `carries_secret` (it recurses INTO record / union / generic-instance field graphs).
-# The walk lives in `generics`, not here, because a generic-instance field table is
-# materialized lazily and must be resolved (`ensure_fields`) before it is walked - a
-# dependency `type` cannot reach. `carries_secret` stays the shallow spine predicate
-# (a nominal is a leaf), correct for the welded-storage rules it guards.
+# The epoch is what makes a set reusable without clearing: a mark writes the current
+# epoch, "already visited" is a stamp equal to it, and the next walk to borrow the set
+# just advances the epoch. Both O(1), so a cycle guard costs nothing per node and its
+# capacity is the type universe's rather than a constant.
 # ---
-# seen: distinct nominal / instance TypeIds visited (fixed; a graph larger than this
-#       fails closed - reported as containing a secret - so the walk never under-reports)
-# len:  number of visited entries
-pub rec SecretScan {
-    seen: [256]TypeId;
-    len:  u32;
+# stamp: one epoch slot per TypeId
+# cap:   allocated slots in stamp
+# epoch: the epoch the walk currently holding this set marks with
+rec VisitSet {
+    stamp: *u32;
+    cap:   u32;
+    epoch: u32;
+}
+
+# a graph walk's borrowed visited set: the cycle guard that lets a recursive walk over the
+# type universe terminate on a self-referential record graph (#2162)
+#
+# It replaces the fixed arrays those walks used to carry, whose bounds an ORDINARY program
+# reached (#3065). A merely LARGE type graph exhausted the visited set and took the walk's
+# fail-closed exit, so a program containing no `^` at all was rejected for secrecy, and the
+# message named a concept the program did not use. A visited set sized like the type
+# universe cannot be exhausted by a program's size, only by the allocator - which is the
+# only thing the fail-closed exit should ever be about.
+#
+# Sets are borrowed from the interner's pool in STACK order, because these walks NEST: the
+# generic-union instance walk asks a secrecy question about each variant pair, and that
+# question is a walk of its own. A single shared set would let the inner walk retire the
+# outer walk's marks and unbind its cycle guard, so each depth gets its own set.
+#
+# The interner is the owner because it owns the type table every TypeId indexes: one slot
+# per TypeId is the same shape and grows on the same axis.
+# ---
+# level: the borrowed set's index in the interner's pool, or SCAN_NONE when the borrow
+#        failed - every mark then reports VISIT_FAILED, taking the walk's fail-closed exit
+pub rec TypeScan {
+    level: u32;
+}
+
+# a TypeScan holding no set, because the pool could not be grown
+val SCAN_NONE: u32 = 0xFFFFFFFF;
+
+# the outcome of entering one TypeId on a TypeScan
+#
+# Three states, not a bool: "already visited" and "could not record" demand OPPOSITE
+# answers from the walks that share this guard. A visited node contributes nothing, while
+# an unrecordable one leaves the walk unbounded and must take that walk's fail-closed exit
+# - which is `true` for `generics.contains_secret_deep` and `false` for
+# `generics.deep_all_secret`. Folding the two together would invert one of them.
+pub def VisitMark: u8;
+
+# `tid` was not yet on this walk and is now recorded; descend into it
+pub val VISIT_FRESH:  VisitMark = 0;
+# `tid` is already on this walk; the caller's cycle guard applies
+pub val VISIT_SEEN:   VisitMark = 1;
+# `tid` could not be recorded; the walk is unbounded from here and the caller must fail closed
+pub val VISIT_FAILED: VisitMark = 2;
+
+# borrow a visited set for one walk, retiring every mark the previous borrower left
+#
+# Infallible by design: a pool that cannot be grown binds the scan to SCAN_NONE rather
+# than reporting, so the failure surfaces at the first mark through the fail-closed path
+# the walks already have, and neither entry point needs an error arm of its own.
+# ---
+# ti:   the interner owning the pool
+# scan: the handle to bind to the borrowed set
+pub fun type_scan_begin(ti: *TypeInterner, scan: *TypeScan) {
+    if (O.is_some[str](visits_reserve(ti))) {
+        scan.level = SCAN_NONE;
+        ret;
+    }
+
+    val level: u32 = ti.visits_len;
+    ti.visits_len  = ti.visits_len + 1;
+
+    # epoch 0 means never visited and is what a fresh or re-zeroed slot holds, so the
+    # counter wraps to 1 rather than to 0. Clearing first is what makes the wrap exact:
+    # without it a stamp from four billion walks ago would read as current. One clear per
+    # 2^32 borrows of this set.
+    if (ti.visits[level].epoch == 0xFFFFFFFF) {
+        if (ti.visits[level].stamp != nil && ti.visits[level].cap > 0) {
+            memory.zero[u32](ti.visits[level].stamp, ti.visits[level].cap::usize);
+        }
+        ti.visits[level].epoch = 1;
+    }
+    or {
+        ti.visits[level].epoch = ti.visits[level].epoch + 1;
+    }
+
+    scan.level = level;
+}
+
+# return `scan`'s set to the pool, freeing it for the next walk at this depth
+#
+# The set keeps its array and its epoch, so the next borrower pays neither an allocation
+# nor a clear.
+# ---
+# ti:   the interner owning the pool
+# scan: the handle to release
+pub fun type_scan_end(ti: *TypeInterner, scan: *TypeScan) {
+    if (scan.level == SCAN_NONE) { ret; }
+    ti.visits_len = scan.level;
+    scan.level    = SCAN_NONE;
+}
+
+# enter `tid` on `scan`, reporting whether this walk had already reached it
+# ---
+# ti:   the interner owning the pool
+# scan: the open scan
+# tid:  the TypeId being entered
+# ret:  VISIT_FRESH, VISIT_SEEN, or VISIT_FAILED
+pub fun type_scan_mark(ti: *TypeInterner, scan: *TypeScan, tid: TypeId) VisitMark {
+    if (scan.level == SCAN_NONE) { ret VISIT_FAILED; }
+
+    # a walk materializes generic-instance field tables as it goes, and that interns types,
+    # so a TypeId can be minted MID-WALK and land past the array. The growth belongs here
+    # rather than at `begin`, which cannot know the type count the walk will end at.
+    if (tid >= ti.visits[scan.level].cap) {
+        if (O.is_some[str](visit_reserve(ti, scan.level, tid))) { ret VISIT_FAILED; }
+    }
+
+    val set: *VisitSet = ?ti.visits[scan.level];
+    if (set.stamp[tid] == set.epoch) { ret VISIT_SEEN; }
+    set.stamp[tid] = set.epoch;
+    ret VISIT_FRESH;
+}
+
+# grow the pool so one more set can be borrowed, initializing the new sets empty
+# ---
+# ti:  the interner
+# ret: none once a set is free, or some(error) on allocation failure
+fun visits_reserve(ti: *TypeInterner) O.Option[str] {
+    if (ti.visits_len < ti.visits_cap) { ret O.none[str](); }
+
+    var new_cap: u32 = ti.visits_cap * 2;
+    if (new_cap == 0) { new_cap = INITIAL_VISIT_DEPTH; }
+
+    if (ti.visits == nil) {
+        val res_alloc: R.Result[*VisitSet, str] = A.allocate[VisitSet](ti.a, new_cap::usize);
+        if (R.is_err[*VisitSet, str](res_alloc)) {
+            ret O.some[str](R.unwrap_err[*VisitSet, str](res_alloc));
+        }
+        ti.visits = R.unwrap_ok[*VisitSet, str](res_alloc);
+    }
+    or {
+        val res_realloc: R.Result[*VisitSet, str] = A.reallocate[VisitSet](ti.a, ti.visits, ti.visits_cap::usize, new_cap::usize);
+        if (R.is_err[*VisitSet, str](res_realloc)) {
+            ret O.some[str](R.unwrap_err[*VisitSet, str](res_realloc));
+        }
+        ti.visits = R.unwrap_ok[*VisitSet, str](res_realloc);
+    }
+
+    var i: u32 = ti.visits_cap;
+    for (i < new_cap) {
+        ti.visits[i].stamp = nil;
+        ti.visits[i].cap   = 0;
+        ti.visits[i].epoch = 0;
+        i = i + 1;
+    }
+    ti.visits_cap = new_cap;
+
+    ret O.none[str]();
+}
+
+# grow the set at `level` until `tid` addresses a slot, zeroing the new slots so they read
+# as never visited
+# ---
+# ti:    the interner
+# level: the set's index in the pool
+# tid:   the TypeId that must be addressable
+# ret:   none once the slot exists, or some(error) on allocation failure
+fun visit_reserve(ti: *TypeInterner, level: u32, tid: TypeId) O.Option[str] {
+    val set: *VisitSet = ?ti.visits[level];
+
+    var new_cap: u32 = set.cap;
+    if (new_cap == 0) { new_cap = INITIAL_VISIT_CAP; }
+    for (new_cap <= tid) {
+        new_cap = new_cap * 2;
+    }
+
+    if (set.stamp == nil) {
+        val res_alloc: R.Result[*u32, str] = A.allocate[u32](ti.a, new_cap::usize);
+        if (R.is_err[*u32, str](res_alloc)) {
+            ret O.some[str](R.unwrap_err[*u32, str](res_alloc));
+        }
+        set.stamp = R.unwrap_ok[*u32, str](res_alloc);
+    }
+    or {
+        val res_realloc: R.Result[*u32, str] = A.reallocate[u32](ti.a, set.stamp, set.cap::usize, new_cap::usize);
+        if (R.is_err[*u32, str](res_realloc)) {
+            ret O.some[str](R.unwrap_err[*u32, str](res_realloc));
+        }
+        set.stamp = R.unwrap_ok[*u32, str](res_realloc);
+    }
+
+    memory.zero[u32](?set.stamp[set.cap], (new_cap - set.cap)::usize);
+    set.cap = new_cap;
+
+    ret O.none[str]();
 }
 
 # whether two types place the secret qualifier identically along their spines
