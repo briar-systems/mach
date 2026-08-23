@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### ct: the probe smoke tests asserted positivity a microsecond clock cannot promise (#3092)
+
+The smoke tests #3070 kept in place of the removed timing gate asserted strictly
+positive mean latencies. On `x86_64-darwin` the monotonic clock ticks in
+microseconds, and the smoke batches ran far below one tick, so an all-zero class
+mean was a truthful reading of the instrument - and failed the 4.26.2 release gate
+on scheduling luck, the exact failure mode #3070 exists to forbid. The latency
+smoke now batches `dudect.LATENCY_INNER` calls per sample, the tool's own "well
+above clock resolution" constant, which makes positivity deterministic on every
+supported clock. The address smoke times single calls by design and cannot batch,
+so its check now asserts exactly what the instrument promises at any resolution:
+finite, non-negative, ordered numbers.
+
 #### dist: install.ps1 failed on Windows PowerShell 5.1 (#3086)
 
 The windows install one-liner (`irm https://machlang.org/install.ps1 | iex`) died
