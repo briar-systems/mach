@@ -21,7 +21,24 @@ var counter: i64 = 0;
 var buf:     [256]u8;               # default-initialized to zero
 
 counter = counter + 1;              # var is reassignable
+n = 43;                             # ERROR — `n` is a val
 ```
+
+## Immutability
+
+Assigning to a `val` is a compile-time error, at module scope and inside a function
+alike. So is writing a field or an element of one (`v.field = x`, `v[i] = x`): the
+store lands in the same storage the binding names.
+
+A pointer is the exception that proves the rule — `val p: *T` binds the **address**
+immutably, not the storage it addresses, so `@p = x`, `p.field = x` and `p[i] = x`
+write the pointee and are legal.
+
+The check ends where the address escapes. `?NAME` on a `val` yields a plain `*T` —
+there is deliberately no read-only pointer type — and writing through any pointer
+that reaches a `val`'s storage is **undefined behaviour**: a module-level `val`
+lives in read-only data, so the store typically faults, while a local one may
+silently appear to work. The compiler does not diagnose it.
 
 ## Scope
 

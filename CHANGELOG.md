@@ -5,6 +5,207 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.26.1] - 2026-08-23
+
+### Fixed
+
+#### ct: no test gates on a timing measurement (#3070)
+
+`mach.lang.ct.probe` asserted a constant-time verdict against thresholds over
+measured wall-clock time. That failed the 4.26.0 release gate on `x86_64-darwin`
+and passed a re-run of the identical commit. The null control was flat, so the run
+believed it could discriminate, while its means sat at 126k-159k against the
+probe's 12k-38k: a quiet control at 126k ns certifies nothing about noise at 12k
+ns. The thresholds had been calibrated on one linux box and the relative cost of
+these probes is a microarchitecture property.
+
+The gate is gone rather than recalibrated. A better threshold lowers the
+false-failure rate without bounding it, and a required check that can fail
+nondeterministically is worse than no check. The harness stays and is exercised on
+every run at tiny sample counts, asserting only that it executes and produces
+finite, positive, ordered numbers, which is deterministic and still fails if it
+rots. The measurements themselves are taken deliberately by a person, as
+`doc/language/secrecy.md` now says.
+
+The three deterministic restorations from #2944 are untouched, including the
+x86-64 flags probe.
+
+#### sema: a wide type graph was reported as a mixed-secrecy one (#3080)
+
+A union whose variants place `^` at exactly the same positions was rejected for mixing
+secret and public storage, and a `::` / `:~` between two such types was rejected for
+changing the qualifier - both on graph size alone:
+
+```
+error: union variants must agree on secrecy: overlapping fields are part secret `^`
+       and part public, which would alias the same storage at two classifications
+```
+
+The deep secrecy-placement comparison walks the two types in LOCKSTEP, so its cycle
+guard records PAIRS of nominals. That set held 128 of them behind a linear rescan, and
+a comparison that entered a 129th answered "these two do not place `^` identically".
+The two siblings this release retired (#3065, #3066) reported the checker's own limit
+when they filled; **this one made a substantive claim about the program instead**, so
+the same fixed bound surfaced as a secrecy defect the author had to go looking for and
+could never find. Graph *width* is what reaches it: two 200-field records compared
+field for field enter 201 pairs, while a chain long enough to fill the set is refused
+first by the layout walk's own depth bound.
+
+The pair set now belongs to the interner beside the `TypeId`-keyed one, borrowed in the
+same stack order and retired by the same epoch, keyed by the two ids packed into one
+word - so its capacity is the allocator's, and its membership test is a hash probe
+rather than the rescan that made the comparison quadratic in entered pairs. It stays
+monotone, which is what it always was despite its comment: the set is both the cycle
+guard and a memo of pairs already settled, and every graph that fit under 128 pairs
+gets the answer it got before.
+
+**This completes the fixed-bound walk family.** All three of the secrecy checker's
+graph walks are now sized to the type universe, and none of them can be exhausted by a
+program's size.
+
+The rule itself is unchanged: a genuine placement difference anywhere in a graph of any
+size is still found and still reported as a secrecy violation, and a cyclic graph still
+terminates. A comparison that genuinely cannot be recorded - now only an allocation
+failure - still fails closed, but says so as a limit of the compiler rather than as a
+`^` in the program.
+
+#### sema: a `val` initialised from a module-qualified path was not constant (#3075)
+
+A module-level `val` whose initialiser reached through a module reference was not a
+comptime constant, so it could not be used where one is required:
+
+```mach
+use pkg.inner.sizes;
+
+val CAP: usize = sizes.SLOTS;
+
+rec C { slots: [CAP]u8; }   # error: array length is not a comptime constant
+```
+
+The same constant spelled inline (`[sizes.SLOTS]u8`) folded, and so did a `val`
+initialised from the same constant imported as a bare symbol - which is what made the
+defect read as an array-length problem rather than what it was.
+
+**The divergence was one pass earlier than the diagnostic.** The load walk builds each
+module's comptime environment, folding every module-level `val` initialiser in source
+order and binding the ones that fold; an initialiser that does not fold is deliberately
+skipped, and the requirement is enforced at the use site. It installed no
+module-member resolver, so *every* module-qualified path in an initialiser failed with
+"only comptime-evaluable after name resolution" and the name was never bound. Sema then
+answered the qualified path directly, through the resolver it does install, but
+answered the NAME out of an environment the value had never reached.
+
+The load walk owns the import graph, so it can answer such a path itself, and now does:
+`use` records the local name a module-binding path introduces, and the walk installs a
+resolver that reads the member out of the origin module's export list. Resolution is
+structural - an identifier naming a module reference - because no resolve result exists
+that early, and the export list *is* the visibility guard, since a private `val` is not
+in it. A path that still does not name an exported constant answers nothing and folds
+to the same skip as before, so nothing that used to load stops loading.
+
+The same resolver now covers a declaration-scope `$if` gate at load and in the union
+walk, which had the identical hole.
+
+#### sema: a parenthesised `c1 - c2 * x` as a right operand lost the subtraction (#3073)
+
+An `f32` binary operation whose right operand was a parenthesised
+`floatlit - floatlit * expr` computed the wrong value, silently:
+
+```mach
+fun bad(a: f32, b: f32) f32 { ret a * (3.0 - 2.0 * b); }
+
+# bad(2.0, 0.5) should be 4.0
+#   opt = 2  ->  6.0      (the `- 2.0 * b` term is gone)
+#   opt = 0  ->  garbage
+```
+
+Literal coercion is offered as a *try*: `unify_literals` first offers the whole
+`2.0 * b` subtree the `f64` its untyped `3.0` sibling defaulted to, and falls back
+to coercing `3.0` toward `f32` when that declines. But the descent committed each
+literal **as it was visited**, so `2.0` was retyped `f64` before `b` declined the
+attempt, and the decline left the stale slot behind. Every surrounding node then
+settled correctly at `f32`, so lowering emitted a `mul f64 (f64, f32)` feeding an
+`f32` subtraction - mixed operand widths the backend read as garbage at `-O0` and
+the release fold collapsed into dropping the `- 2.0 * b` term at `-O2`.
+
+The trigger needed exactly that asymmetry. Spelled as the **left** operand (or a
+call argument, a `ret` value, an annotated `val`), the statement-level
+expected-type coercion re-walked the subtree toward `f32` afterward and repaired
+the stale slot by accident; as the right operand of a binary op, the repair walk
+declined at the non-literal left sibling before ever reaching it. The same shape
+in `i32` carried the same stale `2: i64` and returned the right value only because
+integer truncation of a small constant is lossless.
+
+Coercion is now two-phase: a probe pass decides the whole subtree's outcome
+without writing a single `expr_type` slot, and only a whole-tree success runs the
+committing pass. A declined offer - whatever it managed to coerce along the way -
+now leaves the tree exactly as it found it. A regression test asserts the
+guarantee at the IR level: every lowered arithmetic instruction's operands carry
+exactly the instruction's own type.
+
+#### sema: `val` was immutable by documentation only (#3074)
+
+Assigning to a `val` was accepted everywhere. A module-level one compiled clean and
+faulted at runtime, because codegen had placed it in read-only data and nothing along
+the way objected:
+
+```mach
+val i: i32 = 0;
+#[symbol("main")]
+fun entry(argc: i64, argv: **u8) i64 {
+    i = 2;          # no diagnostic; SIGBUS / SIGSEGV when the binary runs
+    ret 0;
+}
+```
+
+A **block-local** `val` was the worse half of the same hole: its storage is an ordinary
+frame slot, so the write succeeded and the binding silently held a second value, with
+no runtime symptom to notice. There was no immutability check in the assignment path at
+all — the language's central distinction between `val` and `var` was enforced by
+nothing.
+
+Sema now refuses a store whose destination is a `val`'s own storage, wherever it lands
+and however it is spelled: the binding itself, a field or element inside it
+(`g.a = v`, `arr[i] = v`), a module-qualified reference (`lib.K = v`), and a `val`
+imported from another module, whose mutability is read from the declaration its origin
+module owns. The diagnostic names the binding and the rule.
+
+Writing **through** a pointer a `val` holds stays legal and is not a special case:
+`val p: *T` binds the address immutably, not the storage it addresses, so `@p`, the
+`p.field` auto-deref and `p[i]` write the pointee and end the walk. Function parameters
+are unaffected — they are mutable bindings, not `val`s.
+
+An owner ruling closes the design question the pointer exemption raised: there will
+be no read-only pointer type, and a write through any pointer that reaches a
+`val`'s storage is undefined behaviour, now stated in `doc/language/val-var.md`
+(#3082).
+
+#### sema: the generic-union instance walk hit a 256-entry wall (#3066)
+
+The walk that checks every generic-union instantiation for mixed secrecy kept its
+visited (nominal, arguments) pairs in a fixed 256-entry set, so a module whose type
+graph reached a 257th nominal got a wall of "cannot prove" diagnostics about the
+checker rather than about the program. The set is now borrowed from the type
+interner and sized to the type universe, the same mechanism the deep-secret walk
+adopted in 4.26.0, so the two walks stay symmetric.
+
+The walk was also worse than quadratic: every annotation opened its own walk, and
+each nominal it entered re-searched its whole reachable field graph for generic
+parameters through another linearly-rescanned set. Membership is now O(1) and the
+generic-parameter answer is memoized per nominal (root-only, retired by field
+epoch), taking a 400-type cyclic fixture from 13.0s of sema to 77ms.
+
+#### fe: a CRLF source file lost its doc component block (#3072)
+
+`is_space` in the doc-comment parser accepted only space and tab, so on a file
+saved with CRLF line endings the `# ---` separator line kept its trailing `\r`,
+measured one byte too long, and was never recognised: the whole block read as
+summary prose with zero components, and every description span kept a stray
+control byte. Editor hover, `mach doc` and the docstring lint all read the same
+spans, so on Windows-authored files every parameter and return description
+silently disappeared. `\r` is now in-line whitespace, and a test pins the LF and
+CRLF forms of one block to identical spans.
+
 ## [4.26.0] - 2026-08-22
 
 ### Added
@@ -228,9 +429,7 @@ Twelve jobs across four workflows emitted a deprecation annotation for
 Node.js 24. Both are on their current majors now, with the producer and consumer
 pairings checked against the intervening breaking changes.
 
-
 ## [4.25.0] - 2026-08-21
-
 
 ### Fixed
 
@@ -706,7 +905,6 @@ Unblocks briar-systems/mach-lsp#141.
 
 ## [4.23.0] - 2026-08-21
 
-
 ### Fixed
 
 #### sema: the C-variadic promotion rule survives monomorphization (#3029)
@@ -815,7 +1013,6 @@ bytes" is not a question with one answer. The flat writer's layout and its
 enter-at-the-base rule are now one body shared by the file path and the in-memory
 one, so an image held in memory cannot differ from the one a build would have
 written.
-
 
 ### Fixed
 
@@ -971,7 +1168,6 @@ to complement. That assertion is the actual fix here: the defect was not that fo
 teardowns were missed, it was that the only test covering them could not fail.
 
 ## [4.20.0] - 2026-08-20
-
 
 ### Fixed
 
@@ -1133,7 +1329,6 @@ It surfaced as a red leg rather than a quietly smaller run because the corpus re
 The 4.18.1 release itself was unaffected: CD builds and publishes on the tag and completed with all five binaries, and this is the release-cadence test workflow that runs on the push to `main` beside it.
 
 ## [4.18.1] - 2026-08-09
-
 
 ### Fixed
 
@@ -1517,7 +1712,6 @@ A drawn-in module contributes globals by **reachability, not membership**, the r
 
 The driver half closes the module set over cross-module **global** references, not only function ones. A shader that reads a shared module's uniform and calls nothing in it must still draw that module in, and before this it could not resolve the variable at all.
 ## [4.17.0] - 2026-08-08
-
 
 ### Fixed
 
@@ -2012,7 +2206,6 @@ Two things the issue expected turned out not to need changing. The front end alr
 
 This also makes the constant pool's four-byte `CONST_F32` entry reachable from source for the first time.
 
-
 #### The FNEG sign mask and aarch64's `fmov` immediate reach the constant pool (#2754)
 Two constant materializations the pool did not reach, both because the ISA form that would consume one was not modelled by the encoder. They are independent and both landed here.
 
@@ -2434,8 +2627,6 @@ Two implementation notes worth carrying:
 
 The lookahead does not absorb real mistakes: a genuinely wrong operand in the same position (`g[nosuchmod.T]`) still reports against the type grammar, a name that is not a `$each` loop variable is reported where it is written, and `type` stays contextual so an ordinary record field called `type` is untouched.
 
-
-
 ### Changed
 
 #### `^` is stripped only where the question is about storage (#2692)
@@ -2500,7 +2691,6 @@ Reachable by any objective-c consumer rather than only unusually large images: #
 
 #### SPIR-V access chains, local allocations, and a dead shuffle constant (#2649)
 A GEP's index list now survives to a logical-addressing target as member ordinals rather than being folded into a byte displacement, so a struct member read lowers to `OpAccessChain` instead of being unrepresentable. Local allocations and a dead shuffle constant were fixed alongside it.
-
 
 ## [4.12.0] - 2026-08-07
 
