@@ -46,6 +46,38 @@ now leaves the tree exactly as it found it. A regression test asserts the
 guarantee at the IR level: every lowered arithmetic instruction's operands carry
 exactly the instruction's own type.
 
+#### sema: `val` was immutable by documentation only (#3074)
+
+Assigning to a `val` was accepted everywhere. A module-level one compiled clean and
+faulted at runtime, because codegen had placed it in read-only data and nothing along
+the way objected:
+
+```mach
+val i: i32 = 0;
+#[symbol("main")]
+fun entry(argc: i64, argv: **u8) i64 {
+    i = 2;          # no diagnostic; SIGBUS / SIGSEGV when the binary runs
+    ret 0;
+}
+```
+
+A **block-local** `val` was the worse half of the same hole: its storage is an ordinary
+frame slot, so the write succeeded and the binding silently held a second value, with
+no runtime symptom to notice. There was no immutability check in the assignment path at
+all — the language's central distinction between `val` and `var` was enforced by
+nothing.
+
+Sema now refuses a store whose destination is a `val`'s own storage, wherever it lands
+and however it is spelled: the binding itself, a field or element inside it
+(`g.a = v`, `arr[i] = v`), a module-qualified reference (`lib.K = v`), and a `val`
+imported from another module, whose mutability is read from the declaration its origin
+module owns. The diagnostic names the binding and the rule.
+
+Writing **through** a pointer a `val` holds stays legal and is not a special case:
+`val p: *T` binds the address immutably, not the storage it addresses, so `@p`, the
+`p.field` auto-deref and `p[i]` write the pointee and end the walk. Function parameters
+are unaffected — they are mutable bindings, not `val`s.
+
 ## [4.26.0] - 2026-08-22
 
 ### Added
