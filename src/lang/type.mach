@@ -640,6 +640,10 @@ pub rec FieldTable {
 #                  guard, one per level of nesting, checked out and returned in stack order
 # visits_len:      sets currently borrowed, which is the current nesting depth
 # visits_cap:      allocated sets in visits
+# gparam:          per-TypeId memo of "this nominal's field graph mentions a generic
+#                  parameter", one GPARAM_* state per TypeId
+# gparam_cap:      allocated slots in gparam
+# gparam_epoch:    the field epoch the memo's contents describe; a bump retires them
 pub rec TypeInterner {
     a: *A.Allocator;
 
@@ -704,6 +708,10 @@ pub rec TypeInterner {
     visits:     *VisitSet;
     visits_len: u32;
     visits_cap: u32;
+
+    gparam:       *u8;
+    gparam_cap:   u32;
+    gparam_epoch: u32;
 }
 
 # initial capacities for the interner's growable backing arrays
@@ -755,6 +763,10 @@ pub fun init(ti: *TypeInterner, a: *A.Allocator) O.Option[str] {
     ti.visits     = nil;
     ti.visits_len = 0;
     ti.visits_cap = 0;
+
+    ti.gparam       = nil;
+    ti.gparam_cap   = 0;
+    ti.gparam_epoch = 0;
 
     ti.dedup       = map.init[Type, TypeId](a, hash_type, eq_type);
     ti.fun_index   = map.init[u64, TypeId](a, map.hash_u64, map.eq_u64);
@@ -859,6 +871,9 @@ pub fun dnit(ti: *TypeInterner) {
         }
         A.deallocate[VisitSet](ti.a, ti.visits, ti.visits_cap::usize);
     }
+    if (ti.gparam != nil && ti.gparam_cap > 0) {
+        A.deallocate[u8](ti.a, ti.gparam, ti.gparam_cap::usize);
+    }
 
     map.dnit[Type, TypeId](?ti.dedup);
     map.dnit[u64, TypeId](?ti.fun_index);
@@ -895,6 +910,10 @@ pub fun dnit(ti: *TypeInterner) {
     ti.visits     = nil;
     ti.visits_len = 0;
     ti.visits_cap = 0;
+
+    ti.gparam       = nil;
+    ti.gparam_cap   = 0;
+    ti.gparam_epoch = 0;
 }
 
 # return a pointer to the Type for a given TypeId, or none when tid is out of
@@ -1382,6 +1401,98 @@ fun visit_reserve(ti: *TypeInterner, level: u32, tid: TypeId) O.Option[str] {
 
     memory.zero[u32](?set.stamp[set.cap], (new_cap - set.cap)::usize);
     set.cap = new_cap;
+
+    ret O.none[str]();
+}
+
+# the memo states for "this nominal's field graph mentions a generic parameter"
+#
+# The property is a function of the field tables alone, so it belongs to the interner that
+# owns them and is answered once per nominal per field epoch rather than recomputed by
+# every walk that asks. Deciding it costs a walk of the whole reachable field graph, and
+# the generic-union instance walk asks it at EVERY nominal it enters, which is what made
+# that walk cubic in graph size (#3066).
+pub def GParamMemo: u8;
+
+# not yet decided at this field epoch
+pub val GPARAM_UNKNOWN: GParamMemo = 0;
+# decided: the field graph mentions no generic parameter
+pub val GPARAM_NO:      GParamMemo = 1;
+# decided: the field graph mentions a generic parameter
+pub val GPARAM_YES:     GParamMemo = 2;
+
+# read the memoized answer for `tid`, or GPARAM_UNKNOWN when there is none
+#
+# A field epoch newer than the memo's retires every entry, because a rebuilt field table
+# can change the answer for any nominal that reaches it (#1583).
+# ---
+# ti:  the interner owning the memo
+# tid: the nominal being asked about
+# ret: GPARAM_UNKNOWN, GPARAM_NO, or GPARAM_YES
+pub fun gparam_memo_get(ti: *TypeInterner, tid: TypeId) GParamMemo {
+    if (ti.gparam_epoch != ti.field_epoch) {
+        if (ti.gparam != nil && ti.gparam_cap > 0) {
+            memory.zero[u8](ti.gparam, ti.gparam_cap::usize);
+        }
+        ti.gparam_epoch = ti.field_epoch;
+    }
+    if (ti.gparam == nil || tid >= ti.gparam_cap) { ret GPARAM_UNKNOWN; }
+    ret ti.gparam[tid];
+}
+
+# record the decided answer for `tid`
+#
+# Only a walk that resolved every field table it reached may record one: an answer read
+# off an absent table is about the checker's timing rather than about the type, and
+# freezing it would outlive the table's arrival. An allocation failure growing the memo
+# simply drops the entry, which costs a recomputation and nothing else.
+# ---
+# ti:       the interner owning the memo
+# tid:      the nominal being recorded
+# mentions: the decided answer
+pub fun gparam_memo_set(ti: *TypeInterner, tid: TypeId, mentions: bool) {
+    if (ti.gparam_epoch != ti.field_epoch) {
+        if (ti.gparam != nil && ti.gparam_cap > 0) {
+            memory.zero[u8](ti.gparam, ti.gparam_cap::usize);
+        }
+        ti.gparam_epoch = ti.field_epoch;
+    }
+    if (tid >= ti.gparam_cap) {
+        if (O.is_some[str](gparam_reserve(ti, tid))) { ret; }
+    }
+    if (mentions) { ti.gparam[tid] = GPARAM_YES; }
+    or           { ti.gparam[tid] = GPARAM_NO; }
+}
+
+# grow the memo until `tid` addresses a slot, zeroing the new slots to GPARAM_UNKNOWN
+# ---
+# ti:  the interner
+# tid: the TypeId that must be addressable
+# ret: none once the slot exists, or some(error) on allocation failure
+fun gparam_reserve(ti: *TypeInterner, tid: TypeId) O.Option[str] {
+    var new_cap: u32 = ti.gparam_cap;
+    if (new_cap == 0) { new_cap = INITIAL_VISIT_CAP; }
+    for (new_cap <= tid) {
+        new_cap = new_cap * 2;
+    }
+
+    if (ti.gparam == nil) {
+        val res_alloc: R.Result[*u8, str] = A.allocate[u8](ti.a, new_cap::usize);
+        if (R.is_err[*u8, str](res_alloc)) {
+            ret O.some[str](R.unwrap_err[*u8, str](res_alloc));
+        }
+        ti.gparam = R.unwrap_ok[*u8, str](res_alloc);
+    }
+    or {
+        val res_realloc: R.Result[*u8, str] = A.reallocate[u8](ti.a, ti.gparam, ti.gparam_cap::usize, new_cap::usize);
+        if (R.is_err[*u8, str](res_realloc)) {
+            ret O.some[str](R.unwrap_err[*u8, str](res_realloc));
+        }
+        ti.gparam = R.unwrap_ok[*u8, str](res_realloc);
+    }
+
+    memory.zero[u8](?ti.gparam[ti.gparam_cap], (new_cap - ti.gparam_cap)::usize);
+    ti.gparam_cap = new_cap;
 
     ret O.none[str]();
 }

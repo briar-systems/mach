@@ -1919,9 +1919,147 @@ fun infer_assign(sc: *context.SemaContext, b: *expr.ExprBinary, span: token.Span
     val rt: type.TypeId = infer_expr(sc, b.rhs);
     if (lt == type.TYPE_ERROR || rt == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
 
+    check_assign_mutable(sc, b.lhs, span);
     check_readonly_storage(sc, b.lhs, span);
     check.check_coercible(sc, lt, b.rhs, rt, span);
     ret lt;
+}
+
+# report an assignment whose destination is the storage of an immutable `val` (#3074)
+#
+# `val` is immutable by declaration, and nothing enforced it: a local `val` was
+# silently reassigned, and a module-level one - which codegen places in read-only
+# data - compiled clean and faulted at runtime with no diagnostic at all. The rule
+# is one rule for every binding, local and module-level alike: the storage a `val`
+# names is written by its initializer and never again.
+#
+# A CHAIN WALK, like `check_readonly_storage`: `x = v`, `x.field = v`, `x.arr[i] = v`
+# and `lib.x.field = v` all store into the binding's own storage, and only the first
+# spelling is a bare identifier. The walk stops at a POINTER object, because the two
+# auto-derefs (`p.field`, `p[i]`) and an explicit `@p` write the POINTEE, not the
+# binding: a `val p: *T` binds the address immutably, not the storage it addresses.
+# ---
+# sc:   sema context
+# eid:  the assignment's destination expression
+# span: the operator span for the diagnostic
+fun check_assign_mutable(sc: *context.SemaContext, eid: id.ExprId, span: token.Span) {
+    val so: O.Option[*resolve.Symbol] = immutable_binding_for_target(sc, eid);
+    if (O.is_none[*resolve.Symbol](so)) { ret; }
+    val sym: *resolve.Symbol = O.unwrap[*resolve.Symbol](so);
+
+    # the destination is the binding itself, or a field / element inside it
+    val direct: bool = symbol_at_expr_is(sc, eid, sym);
+    var prefix: str = "cannot assign into `";
+    if (direct) { prefix = "cannot assign to `"; }
+
+    report_immutable_assign(sc, span, prefix, sym.name);
+}
+
+# the immutable `val` binding a store into `eid` would write, or none
+#
+# Asked at every link of the destination chain, since a module-qualified reference
+# (`lib.x`) resolves at a MEMBER rather than at the base identifier.
+# ---
+# sc:  sema context
+# eid: the destination expression, or one of its objects
+# ret: some(*Symbol) when the store lands in a `val`'s storage, none otherwise
+fun immutable_binding_for_target(sc: *context.SemaContext, eid: id.ExprId) O.Option[*resolve.Symbol] {
+    if (eid == id.EXPR_NIL) { ret O.none[*resolve.Symbol](); }
+
+    val so: O.Option[*resolve.Symbol] = context.symbol_for_expr(sc, eid);
+    if (O.is_some[*resolve.Symbol](so)) {
+        val sym: *resolve.Symbol = O.unwrap[*resolve.Symbol](so);
+        if (symbol_is_val_binding(sc, sym))                              { ret O.some[*resolve.Symbol](sym); }
+        if (sym.kind == resolve.SYM_VAR || sym.kind == resolve.SYM_PARAM) { ret O.none[*resolve.Symbol](); }
+    }
+
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+    if (O.is_none[*expr.Expr](e_opt)) { ret O.none[*resolve.Symbol](); }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
+
+    if (e.kind == expr.EXPR_KIND_MEMBER) { ret binding_through_object(sc, e.data.member.object); }
+    if (e.kind == expr.EXPR_KIND_INDEX)  { ret binding_through_object(sc, e.data.index.object); }
+
+    # a deref, a cast, a call result: the store does not land in a named binding's
+    # own storage, so no `val` is written
+    ret O.none[*resolve.Symbol]();
+}
+
+# continue the walk into a projection's object, unless the projection auto-derefs
+# ---
+# sc:  sema context
+# obj: the object a MEMBER or INDEX projects from
+# ret: some(*Symbol) when the store lands in a `val`'s storage, none otherwise
+fun binding_through_object(sc: *context.SemaContext, obj: id.ExprId) O.Option[*resolve.Symbol] {
+    if (is_pointer_like(sc, type.strip_secret(?sc.s.types, target_expr_type(sc, obj)))) {
+        ret O.none[*resolve.Symbol]();
+    }
+    ret immutable_binding_for_target(sc, obj);
+}
+
+# whether `sym` is a binding declared `val`
+#
+# An imported binding carries its mutability in the declaration the origin module
+# owns, so it is read from that module's AST rather than from the local symbol kind
+# (which is only ever SYM_IMPORTED).
+# ---
+# sc:  sema context
+# sym: the symbol to classify
+# ret: true when a store into it writes immutable storage
+fun symbol_is_val_binding(sc: *context.SemaContext, sym: *resolve.Symbol) bool {
+    if (sym.kind == resolve.SYM_VAL)      { ret true; }
+    if (sym.kind != resolve.SYM_IMPORTED) { ret false; }
+    if (sym.decl == id.DECL_NIL)          { ret false; }
+
+    val a: *ast.Ast = symbol_ast(sc, sym);
+    if (a == nil) { ret false; }
+    val d_opt: O.Option[*decl.Decl] = ast.get_decl(a, sym.decl);
+    if (O.is_none[*decl.Decl](d_opt)) { ret false; }
+    ret O.unwrap[*decl.Decl](d_opt).kind == decl.DECL_KIND_VAL;
+}
+
+# whether `eid` itself resolves to `sym`, distinguishing `x = v` from `x.f = v`
+# ---
+# sc:  sema context
+# eid: the destination expression
+# sym: the immutable binding the walk found
+# ret: true when the destination names the binding directly
+fun symbol_at_expr_is(sc: *context.SemaContext, eid: id.ExprId, sym: *resolve.Symbol) bool {
+    val so: O.Option[*resolve.Symbol] = context.symbol_for_expr(sc, eid);
+    if (O.is_none[*resolve.Symbol](so)) { ret false; }
+    ret O.unwrap[*resolve.Symbol](so) == sym;
+}
+
+# the inferred type of `eid`, TYPE_ERROR for a nil or out-of-range id
+# ---
+# sc:  sema context
+# eid: the expression to read the type of
+# ret: the inferred type, or TYPE_ERROR
+fun target_expr_type(sc: *context.SemaContext, eid: id.ExprId) type.TypeId {
+    if (sc.expr_type == nil)                             { ret type.TYPE_ERROR; }
+    if (eid == id.EXPR_NIL || eid >= sc.a.expr_len::u32) { ret type.TYPE_ERROR; }
+    ret sc.expr_type[eid];
+}
+
+# emit the immutable-assignment diagnostic, naming the binding
+#
+# The note carries the rule rather than the spelling: the mistake is not a typo, it
+# is a binding declared to hold one value being asked to hold another.
+# ---
+# sc:     sema context
+# span:   the operator span
+# prefix: message text up to the opening backtick
+# name:   interned identifier of the `val`
+fun report_immutable_assign(sc: *context.SemaContext, span: token.Span, prefix: str, name: intern.StrId) {
+    val note: str = "a `val` binds its value once, at its declaration; declare it `var` if it must be assigned. a module-level `val` is emitted in read-only storage, so the store would fault at runtime";
+    val res: R.Result[str, str] = format.sprint(sc.s.alloc, "{}{}`: a `val` is immutable", prefix, typename.name_str(sc.s, name));
+    if (R.is_err[str, str](res)) {
+        context.report_note(sc, span, "cannot assign to a `val`: a `val` is immutable", note);
+        ret;
+    }
+    val msg: str = R.unwrap_ok[str, str](res);
+    context.report_note(sc, span, msg, note);
+    A.deallocate[char](sc.s.alloc, msg, str_len(msg) + 1);
 }
 
 # report an assignment whose destination lives in a `#[storage(..., "readonly")]`
