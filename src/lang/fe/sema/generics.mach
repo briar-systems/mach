@@ -37,18 +37,31 @@ use mach.lang.session;
 use mach.lang.source;
 use mach.lang.type;
 
-# the set of nominal TypeIds entered during a single generic-parameter search
+# one generic-parameter search over the field graph
 #
-# A recursive nominal (`rec Node { next: *Node; }`) would otherwise recurse
-# forever; recording each entered nominal lets a re-entry break its own cycle.
+# A recursive nominal (`rec Node { next: *Node; }`) would otherwise recurse forever;
+# recording each entered nominal in `scan` lets a re-entry break its own cycle. The set is
+# borrowed from the interner rather than grown per search, so membership is O(1) instead of
+# a rescan of everything entered so far - the rescan is what made a search quadratic in
+# graph size, and this search runs at every nominal the union-instance walk enters (#3066).
 # ---
-# visited: dynamic array of entered nominal TypeIds
-# len:     number of ids stored
-# cap:     allocated slots
-rec GParamScan {
-    visited: *type.TypeId;
-    len:     u32;
-    cap:     u32;
+# scan:     the borrowed cycle guard, open for the life of the search
+# resolved: false once the search reached a nominal whose field table was unavailable, so
+#           its answer describes the checker's timing and may not be memoized
+rec GParamWalk {
+    scan:     type.TypeScan;
+    resolved: bool;
+}
+
+# open a generic-parameter search, borrowing its cycle guard
+fun gparam_walk_begin(s: *session.Session, w: *GParamWalk) {
+    type.type_scan_begin(?s.types, ?w.scan);
+    w.resolved = true;
+}
+
+# close a generic-parameter search, returning its cycle guard
+fun gparam_walk_end(s: *session.Session, w: *GParamWalk) {
+    type.type_scan_end(?s.types, ?w.scan);
 }
 
 # instantiate a generic declaration with concrete type arguments, producing an
@@ -780,23 +793,28 @@ fun all_secret_walk(s: *session.Session, tid: type.TypeId, scan: *type.TypeScan)
     ret false;
 }
 
-# the number of distinct (nominal, arguments) pairs one walk enters before failing closed
-val UNI_SCAN_CAP: u32 = 256;
-
 # the (nominal, argument-list) pairs entered during one instance union-secrecy walk
 #
 # Keyed by the interned TYPE_INSTANCE the pair denotes, so the same nominal reached
 # under two different argument lists is examined twice (`rec P[T] { a: U[T]; b: U[u32]; }`)
 # while a recursive generic (`rec Node[T] { next: *Node[T]; }`) terminates on its second
-# entry. A graph past the bound fails CLOSED - it reports rather than returning "no
-# violation", which padding the graph would otherwise exploit.
+# entry. Since the key is an interned TypeId, the visited set is the interner's own, whose
+# capacity is the type universe's.
+#
+# It used to be a fixed 256 keys, and a graph past that reported (#3066) - so an ordinary
+# module naming a `^` anywhere and reaching more than 256 nominals got a wall of
+# diagnostics about the checker rather than about the program, and the message said as
+# much. Failing closed is right for a walk out of room; the defect was that the room was a
+# constant. The only exhaustion left is the allocator's.
+#
+# This walk NESTS around the deep-secret walk - `check_uni_variants` asks a secrecy
+# question per variant pair, and each is a walk of its own - which is why the interner
+# hands out one set per level rather than sharing one.
 # ---
-# seen:                the (nominal, args) keys already entered
-# len:                 number of entries
+# scan:                the borrowed visited set, keyed by `nominal_visit_key`
 # unprovable_reported: true once this walk's fail-closed exit has been reported
 rec UniInstScan {
-    seen:                [UNI_SCAN_CAP]type.TypeId;
-    len:                 u32;
+    scan:                type.TypeScan;
     unprovable_reported: bool;
 }
 
@@ -823,13 +841,11 @@ pub fun module_reaches_secret(s: *session.Session, resolved: *type.TypeId, len: 
 
     # ONE visited set across every annotation, not one per annotation: a nominal explored
     # and found secret-free stays secret-free whichever root reached it, so sharing turns
-    # the scan from (annotations x graph) into (distinct types). It grows rather than
-    # capping, because a capped scan would answer "possibly secret" for any large module
+    # the scan from (annotations x graph) into (distinct types). Its capacity is the type
+    # universe's, because a capped scan would answer "possibly secret" for any large module
     # and switch the whole rule on for it - paying far more than the scan saved.
-    var scan: GParamScan;
-    scan.visited = nil;
-    scan.len     = 0;
-    scan.cap     = 0;
+    var scan: type.TypeScan;
+    type.type_scan_begin(?s.types, ?scan);
 
     var found: bool = false;
     var i:     u32  = 0;
@@ -841,19 +857,17 @@ pub fun module_reaches_secret(s: *session.Session, resolved: *type.TypeId, len: 
         i = i + 1;
     }
 
-    if (scan.visited != nil && scan.cap > 0) {
-        A.deallocate[type.TypeId](s.alloc, scan.visited, scan.cap::usize);
-    }
+    type.type_scan_end(?s.types, ?scan);
     ret found;
 }
 
-# the recursive worker for `module_reaches_secret`, threading one growable visited set
+# the recursive worker for `module_reaches_secret`, threading one borrowed visited set
 #
 # The same structural discipline as `secret_deep_walk` - pointer, array, function
 # SIGNATURE, and every field of every aggregate - and the same fail-closed default over
 # the kind space, so an unresolvable table or an unrecognized kind answers "possibly
 # secret" and switches the rule on rather than off.
-fun secret_reach_walk(s: *session.Session, tid: type.TypeId, scan: *GParamScan) bool {
+fun secret_reach_walk(s: *session.Session, tid: type.TypeId, scan: *type.TypeScan) bool {
     if (tid == type.TYPE_NIL || tid == type.TYPE_ERROR) { ret false; }
 
     val opt_t: O.Option[*type.Type] = type.get(?s.types, tid);
@@ -890,8 +904,9 @@ fun secret_reach_walk(s: *session.Session, tid: type.TypeId, scan: *GParamScan) 
     # layout the program may never need - the scan runs on every module, including the
     # overwhelming majority that reach no secret at all and pay only this walk.
     if (k == type.TYPE_INSTANCE) {
-        if (scan_contains(scan, tid)) { ret false; }
-        if (!scan_push(s, scan, tid)) { ret true; }
+        val mark: type.VisitMark = type.type_scan_mark(?s.types, scan, tid);
+        if (mark == type.VISIT_SEEN)   { ret false; }
+        if (mark == type.VISIT_FAILED) { ret true; }
 
         val origin:     session.ModuleId = t.data.instance.target_origin;
         val decl_id:    id.DeclId        = t.data.instance.target_decl;
@@ -911,8 +926,9 @@ fun secret_reach_walk(s: *session.Session, tid: type.TypeId, scan: *GParamScan) 
     }
 
     if (k == type.TYPE_REC || k == type.TYPE_UNI) {
-        if (scan_contains(scan, tid)) { ret false; }
-        if (!scan_push(s, scan, tid)) { ret true; }
+        val mark: type.VisitMark = type.type_scan_mark(?s.types, scan, tid);
+        if (mark == type.VISIT_SEEN)   { ret false; }
+        if (mark == type.VISIT_FAILED) { ret true; }
 
         val opt_tab: O.Option[*type.FieldTable] = type.field_table_for(?s.types, tid);
         if (O.is_none[*type.FieldTable](opt_tab)) { ret true; }
@@ -983,9 +999,10 @@ pub fun check_type_uni_secrecy(sc: *sema.SemaContext, tid: type.TypeId, args: *t
     if (tid == type.TYPE_NIL || tid == type.TYPE_ERROR) { ret; }
 
     var scan: UniInstScan;
-    scan.len                 = 0;
     scan.unprovable_reported = false;
+    type.type_scan_begin(?sc.s.types, ?scan.scan);
     uni_inst_walk(sc, tid, args, arg_len, ?scan, span);
+    type.type_scan_end(?sc.s.types, ?scan.scan);
 }
 
 # the recursive worker: descend `tid` carrying `args`, checking every union nominal
@@ -1159,19 +1176,16 @@ fun uni_inst_walk_nominal(sc: *sema.SemaContext, nom: type.TypeId, args: *type.T
     }
 
     val key: type.TypeId = nominal_visit_key(s, nom, a, n);
-    var i: u32 = 0;
-    for (i < scan.len) {
-        if (scan.seen[i] == key) { ret; }
-        i = i + 1;
-    }
-    # a graph past the bound FAILS CLOSED: it reports rather than answering "no
-    # violation", which padding the graph past the bound would otherwise exploit.
-    if (scan.len >= UNI_SCAN_CAP) {
+    val mark: type.VisitMark = type.type_scan_mark(?s.types, ?scan.scan, key);
+    # this pair was already entered; its own frame checked and descended it.
+    if (mark == type.VISIT_SEEN) { ret; }
+    # a pair the visited set could not record leaves the walk unbounded from here, so it
+    # FAILS CLOSED: it reports rather than answering "no violation", which padding the
+    # graph would otherwise exploit.
+    if (mark == type.VISIT_FAILED) {
         report_unprovable(sc, scan, span);
         ret;
     }
-    scan.seen[scan.len] = key;
-    scan.len = scan.len + 1;
 
     if (generic && nom_kind == type.TYPE_UNI) {
         check_uni_variants(sc, nom, a, n, key, scan, span);
@@ -1283,15 +1297,10 @@ fun subst_or_self(s: *session.Session, tid: type.TypeId, args: *type.TypeId, arg
 
 # whether `tid` is, or structurally contains, a generic parameter (owning the cycle guard)
 fun type_mentions_gparam(s: *session.Session, tid: type.TypeId) bool {
-    var scan: GParamScan;
-    scan.visited = nil;
-    scan.len     = 0;
-    scan.cap     = 0;
-
-    val mentioned: bool = mentions_gparam(s, tid, ?scan);
-    if (scan.visited != nil && scan.cap > 0) {
-        A.deallocate[type.TypeId](s.alloc, scan.visited, scan.cap::usize);
-    }
+    var w: GParamWalk;
+    gparam_walk_begin(s, ?w);
+    val mentioned: bool = mentions_gparam(s, tid, ?w);
+    gparam_walk_end(s, ?w);
     ret mentioned;
 }
 
@@ -1587,47 +1596,69 @@ fun substitute_aggregate(s: *session.Session, t: *type.Type, args: *type.TypeId,
 # a nominal is part of an unspecialized generic body and must be substituted per
 # instance; a fully concrete one need not be. A fresh cycle-guard scan bounds the
 # search against recursive nominals.
+#
+# MEMOIZED on the interner per field epoch, because the answer is a property of `tid`'s
+# field graph rather than of whoever asked: the union-instance walk asks it at every
+# nominal it enters, and every annotation in the module opens a walk of its own, so
+# recomputing it turned one graph traversal into (annotations x graph) of them (#3066).
 # ---
 # s:   the shared session (type universe, allocator)
 # tid: the nominal TypeId to inspect
 # ret: true when any field mentions a generic parameter
 fun nominal_has_gparam(s: *session.Session, tid: type.TypeId) bool {
-    var scan: GParamScan;
-    scan.visited = nil;
-    scan.len     = 0;
-    scan.cap     = 0;
+    val memo: type.GParamMemo = type.gparam_memo_get(?s.types, tid);
+    if (memo == type.GPARAM_YES) { ret true; }
+    if (memo == type.GPARAM_NO)  { ret false; }
 
-    val mentioned: bool = nominal_fields_mention(s, tid, ?scan);
-    if (scan.visited != nil && scan.cap > 0) {
-        A.deallocate[type.TypeId](s.alloc, scan.visited, scan.cap::usize);
-    }
+    var w: GParamWalk;
+    gparam_walk_begin(s, ?w);
+    val mentioned: bool = nominal_fields_mention(s, tid, ?w);
+    val resolved:  bool = w.resolved;
+    gparam_walk_end(s, ?w);
+
+    # ONLY the search's ROOT may be memoized. A nominal met partway through carries the
+    # cycle guard's assumption - a re-entry answers "no" so the recursion terminates - and
+    # that answer is about this search, not about the nominal: `rec A { b: *B; t: T; }` with
+    # `rec B { a: *A; }` decides B "no" while B asked on its own decides "yes". The root
+    # holds because a false root means the whole reachable graph was walked and no
+    # parameter was found in any of it.
+    if (resolved) { type.gparam_memo_set(?s.types, tid, mentioned); }
     ret mentioned;
 }
 
 # whether any field of nominal `tid` mentions a generic parameter
 #
-# Guards against recursive nominals via `scan`: a TypeId already on the search
-# stack yields false here (its own frame examines every field), so a cycle cannot
-# recurse forever. An allocation failure recording the visit degrades to true,
-# forcing a harmless substitution attempt rather than risking a missed one.
+# Guards against recursive nominals via `w.scan`: a TypeId already entered yields false
+# here (the frame that entered it examines every field), so a cycle cannot recurse forever.
+# A visit the guard cannot record degrades to true, forcing a harmless substitution attempt
+# rather than risking a missed one.
 # ---
-# s:    the shared session (type universe, allocator)
-# tid:  the nominal TypeId whose fields are scanned
-# scan: the in-progress cycle guard
-# ret:  true when a field mentions a generic parameter
-fun nominal_fields_mention(s: *session.Session, tid: type.TypeId, scan: *GParamScan) bool {
-    if (scan_contains(scan, tid)) { ret false; }
-    if (!scan_push(s, scan, tid)) { ret true; }
+# s:   the shared session (type universe, allocator)
+# tid: the nominal TypeId whose fields are scanned
+# w:   the in-progress search
+# ret: true when a field mentions a generic parameter
+fun nominal_fields_mention(s: *session.Session, tid: type.TypeId, w: *GParamWalk) bool {
+    val mark: type.VisitMark = type.type_scan_mark(?s.types, ?w.scan, tid);
+    if (mark == type.VISIT_SEEN)   { ret false; }
+    if (mark == type.VISIT_FAILED) {
+        w.resolved = false;
+        ret true;
+    }
 
     val opt_table: O.Option[*type.FieldTable] = type.field_table_for(?s.types, tid);
-    if (O.is_none[*type.FieldTable](opt_table)) { ret false; }
+    if (O.is_none[*type.FieldTable](opt_table)) {
+        # an absent table is not evidence of anything about `tid`; saying so keeps the
+        # answer out of the memo, where it would outlive the table's arrival.
+        w.resolved = false;
+        ret false;
+    }
     val fields_len: u32 = O.unwrap[*type.FieldTable](opt_table).fields_len;
 
     var i: u32 = 0;
     for (i < fields_len) {
         val opt_entry: O.Option[*type.FieldEntry] = type.field_at(?s.types, tid, i);
         if (O.is_some[*type.FieldEntry](opt_entry)) {
-            if (mentions_gparam(s, O.unwrap[*type.FieldEntry](opt_entry).ty, scan)) { ret true; }
+            if (mentions_gparam(s, O.unwrap[*type.FieldEntry](opt_entry).ty, w)) { ret true; }
         }
         i = i + 1;
     }
@@ -1641,11 +1672,11 @@ fun nominal_fields_mention(s: *session.Session, tid: type.TypeId, scan: *GParamS
 # guard so two-plus levels of nested anonymous aggregate are reached without
 # unbounded recursion on a recursive nominal.
 # ---
-# s:    the shared session (type universe, allocator)
-# tid:  the TypeId to inspect
-# scan: the in-progress cycle guard
-# ret:  true when `tid` mentions a generic parameter
-fun mentions_gparam(s: *session.Session, tid: type.TypeId, scan: *GParamScan) bool {
+# s:   the shared session (type universe, allocator)
+# tid: the TypeId to inspect
+# w:   the in-progress search
+# ret: true when `tid` mentions a generic parameter
+fun mentions_gparam(s: *session.Session, tid: type.TypeId, w: *GParamWalk) bool {
     if (tid == type.TYPE_NIL || tid == type.TYPE_ERROR) { ret false; }
 
     val opt_type: O.Option[*type.Type] = type.get(?s.types, tid);
@@ -1653,11 +1684,11 @@ fun mentions_gparam(s: *session.Session, tid: type.TypeId, scan: *GParamScan) bo
     val t: *type.Type = O.unwrap[*type.Type](opt_type);
 
     if (t.kind == type.TYPE_GENERIC_PARAM) { ret true; }
-    if (t.kind == type.TYPE_POINTER)       { ret mentions_gparam(s, t.data.pointer.base, scan); }
-    if (t.kind == type.TYPE_SECRET)        { ret mentions_gparam(s, t.data.secret.base, scan); }
-    if (t.kind == type.TYPE_ARRAY)         { ret mentions_gparam(s, t.data.array.base, scan); }
+    if (t.kind == type.TYPE_POINTER)       { ret mentions_gparam(s, t.data.pointer.base, w); }
+    if (t.kind == type.TYPE_SECRET)        { ret mentions_gparam(s, t.data.secret.base, w); }
+    if (t.kind == type.TYPE_ARRAY)         { ret mentions_gparam(s, t.data.array.base, w); }
     if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI) {
-        ret nominal_fields_mention(s, tid, scan);
+        ret nominal_fields_mention(s, tid, w);
     }
 
     # a SIGNATURE is a position like any other: `rec Box[T] { f: fun(*U[T]) u32; }`
@@ -1668,11 +1699,11 @@ fun mentions_gparam(s: *session.Session, tid: type.TypeId, scan: *GParamScan) bo
         val ret_ty:       type.TypeId = t.data.fn.ret_type;
         val params_start: u32         = t.data.fn.params_start;
         val params_len:   u32         = t.data.fn.params_len;
-        if (mentions_gparam(s, ret_ty, scan)) { ret true; }
+        if (mentions_gparam(s, ret_ty, w)) { ret true; }
         var i: u32 = 0;
         for (i < params_len) {
             val p_opt: O.Option[type.TypeId] = type.get_param(?s.types, params_start + i);
-            if (O.is_some[type.TypeId](p_opt) && mentions_gparam(s, O.unwrap[type.TypeId](p_opt), scan)) { ret true; }
+            if (O.is_some[type.TypeId](p_opt) && mentions_gparam(s, O.unwrap[type.TypeId](p_opt), w)) { ret true; }
             i = i + 1;
         }
         ret false;
@@ -1685,56 +1716,12 @@ fun mentions_gparam(s: *session.Session, tid: type.TypeId, scan: *GParamScan) bo
         for (i < args_len) {
             val opt_arg: O.Option[type.TypeId] = type.get_param(?s.types, args_start + i);
             if (O.is_some[type.TypeId](opt_arg)) {
-                if (mentions_gparam(s, O.unwrap[type.TypeId](opt_arg), scan)) { ret true; }
+                if (mentions_gparam(s, O.unwrap[type.TypeId](opt_arg), w)) { ret true; }
             }
             i = i + 1;
         }
     }
     ret false;
-}
-
-# whether nominal TypeId `tid` is already recorded in `scan`
-# ---
-# scan: the cycle guard to search
-# tid:  the TypeId to look for
-# ret:  true when `tid` is present
-fun scan_contains(scan: *GParamScan, tid: type.TypeId) bool {
-    var i: u32 = 0;
-    for (i < scan.len) {
-        if (scan.visited[i] == tid) { ret true; }
-        i = i + 1;
-    }
-    ret false;
-}
-
-# record nominal TypeId `tid` in `scan`, growing the backing array as needed
-# ---
-# s:    the shared session (allocator)
-# scan: the cycle guard to extend
-# tid:  the TypeId to record
-# ret:  true on success, false only on an allocation failure
-fun scan_push(s: *session.Session, scan: *GParamScan, tid: type.TypeId) bool {
-    if (scan.len == scan.cap) {
-        var new_cap: u32 = scan.cap * 2;
-        if (new_cap == 0) { new_cap = 8; }
-
-        if (scan.visited == nil) {
-            val res_alloc: R.Result[*type.TypeId, str] = A.allocate[type.TypeId](s.alloc, new_cap::usize);
-            if (R.is_err[*type.TypeId, str](res_alloc)) { ret false; }
-            scan.visited = R.unwrap_ok[*type.TypeId, str](res_alloc);
-        }
-        or {
-            val res_realloc: R.Result[*type.TypeId, str] = A.reallocate[type.TypeId](s.alloc, scan.visited, scan.cap::usize, new_cap::usize);
-            if (R.is_err[*type.TypeId, str](res_realloc)) { ret false; }
-            scan.visited = R.unwrap_ok[*type.TypeId, str](res_realloc);
-        }
-
-        scan.cap = new_cap;
-    }
-
-    scan.visited[scan.len] = tid;
-    scan.len = scan.len + 1;
-    ret true;
 }
 
 # intern the identifier text of a name `span` taken from module `ga`'s source
