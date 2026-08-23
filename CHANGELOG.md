@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [4.26.1] - 2026-08-23
 
 ### Fixed
 
@@ -174,6 +174,37 @@ Writing **through** a pointer a `val` holds stays legal and is not a special cas
 `val p: *T` binds the address immutably, not the storage it addresses, so `@p`, the
 `p.field` auto-deref and `p[i]` write the pointee and end the walk. Function parameters
 are unaffected — they are mutable bindings, not `val`s.
+
+An owner ruling closes the design question the pointer exemption raised: there will
+be no read-only pointer type, and a write through any pointer that reaches a
+`val`'s storage is undefined behaviour, now stated in `doc/language/val-var.md`
+(#3082).
+
+#### sema: the generic-union instance walk hit a 256-entry wall (#3066)
+
+The walk that checks every generic-union instantiation for mixed secrecy kept its
+visited (nominal, arguments) pairs in a fixed 256-entry set, so a module whose type
+graph reached a 257th nominal got a wall of "cannot prove" diagnostics about the
+checker rather than about the program. The set is now borrowed from the type
+interner and sized to the type universe, the same mechanism the deep-secret walk
+adopted in 4.26.0, so the two walks stay symmetric.
+
+The walk was also worse than quadratic: every annotation opened its own walk, and
+each nominal it entered re-searched its whole reachable field graph for generic
+parameters through another linearly-rescanned set. Membership is now O(1) and the
+generic-parameter answer is memoized per nominal (root-only, retired by field
+epoch), taking a 400-type cyclic fixture from 13.0s of sema to 77ms.
+
+#### fe: a CRLF source file lost its doc component block (#3072)
+
+`is_space` in the doc-comment parser accepted only space and tab, so on a file
+saved with CRLF line endings the `# ---` separator line kept its trailing `\r`,
+measured one byte too long, and was never recognised: the whole block read as
+summary prose with zero components, and every description span kept a stray
+control byte. Editor hover, `mach doc` and the docstring lint all read the same
+spans, so on Windows-authored files every parameter and return description
+silently disappeared. `\r` is now in-line whitespace, and a test pins the LF and
+CRLF forms of one block to identical spans.
 
 ## [4.26.0] - 2026-08-22
 
