@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### sema: a `val` initialised from a module-qualified path was not constant (#3075)
+
+A module-level `val` whose initialiser reached through a module reference was not a
+comptime constant, so it could not be used where one is required:
+
+```mach
+use pkg.inner.sizes;
+
+val CAP: usize = sizes.SLOTS;
+
+rec C { slots: [CAP]u8; }   # error: array length is not a comptime constant
+```
+
+The same constant spelled inline (`[sizes.SLOTS]u8`) folded, and so did a `val`
+initialised from the same constant imported as a bare symbol - which is what made the
+defect read as an array-length problem rather than what it was.
+
+**The divergence was one pass earlier than the diagnostic.** The load walk builds each
+module's comptime environment, folding every module-level `val` initialiser in source
+order and binding the ones that fold; an initialiser that does not fold is deliberately
+skipped, and the requirement is enforced at the use site. It installed no
+module-member resolver, so *every* module-qualified path in an initialiser failed with
+"only comptime-evaluable after name resolution" and the name was never bound. Sema then
+answered the qualified path directly, through the resolver it does install, but
+answered the NAME out of an environment the value had never reached.
+
+The load walk owns the import graph, so it can answer such a path itself, and now does:
+`use` records the local name a module-binding path introduces, and the walk installs a
+resolver that reads the member out of the origin module's export list. Resolution is
+structural - an identifier naming a module reference - because no resolve result exists
+that early, and the export list *is* the visibility guard, since a private `val` is not
+in it. A path that still does not name an exported constant answers nothing and folds
+to the same skip as before, so nothing that used to load stops loading.
+
+The same resolver now covers a declaration-scope `$if` gate at load and in the union
+walk, which had the identical hole.
+
 #### sema: a parenthesised `c1 - c2 * x` as a right operand lost the subtraction (#3073)
 
 An `f32` binary operation whose right operand was a parenthesised
