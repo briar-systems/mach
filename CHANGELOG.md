@@ -46,6 +46,43 @@ to the same skip as before, so nothing that used to load stops loading.
 The same resolver now covers a declaration-scope `$if` gate at load and in the union
 walk, which had the identical hole.
 
+#### sema: a parenthesised `c1 - c2 * x` as a right operand lost the subtraction (#3073)
+
+An `f32` binary operation whose right operand was a parenthesised
+`floatlit - floatlit * expr` computed the wrong value, silently:
+
+```mach
+fun bad(a: f32, b: f32) f32 { ret a * (3.0 - 2.0 * b); }
+
+# bad(2.0, 0.5) should be 4.0
+#   opt = 2  ->  6.0      (the `- 2.0 * b` term is gone)
+#   opt = 0  ->  garbage
+```
+
+Literal coercion is offered as a *try*: `unify_literals` first offers the whole
+`2.0 * b` subtree the `f64` its untyped `3.0` sibling defaulted to, and falls back
+to coercing `3.0` toward `f32` when that declines. But the descent committed each
+literal **as it was visited**, so `2.0` was retyped `f64` before `b` declined the
+attempt, and the decline left the stale slot behind. Every surrounding node then
+settled correctly at `f32`, so lowering emitted a `mul f64 (f64, f32)` feeding an
+`f32` subtraction - mixed operand widths the backend read as garbage at `-O0` and
+the release fold collapsed into dropping the `- 2.0 * b` term at `-O2`.
+
+The trigger needed exactly that asymmetry. Spelled as the **left** operand (or a
+call argument, a `ret` value, an annotated `val`), the statement-level
+expected-type coercion re-walked the subtree toward `f32` afterward and repaired
+the stale slot by accident; as the right operand of a binary op, the repair walk
+declined at the non-literal left sibling before ever reaching it. The same shape
+in `i32` carried the same stale `2: i64` and returned the right value only because
+integer truncation of a small constant is lossless.
+
+Coercion is now two-phase: a probe pass decides the whole subtree's outcome
+without writing a single `expr_type` slot, and only a whole-tree success runs the
+committing pass. A declined offer - whatever it managed to coerce along the way -
+now leaves the tree exactly as it found it. A regression test asserts the
+guarantee at the IR level: every lowered arithmetic instruction's operands carry
+exactly the instruction's own type.
+
 #### sema: `val` was immutable by documentation only (#3074)
 
 Assigning to a `val` was accepted everywhere. A module-level one compiled clean and
