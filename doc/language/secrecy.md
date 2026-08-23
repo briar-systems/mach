@@ -413,10 +413,11 @@ machine it runs on, which is why both are unit tests rather than build checks.
 
 **The timing harness is a tool, not a gate.** `mach.lang.ct.probe` is a
 dudect-style harness in the tree. `mach test` runs it at deliberately tiny sample
-counts and asserts only that it still executes and produces finite, positive
-numbers, which is a structural claim about the harness rather than a timing claim
-about the machine. **No threshold over a measured time gates anything**, here or
-anywhere else in the suite.
+counts and prints its table; it asserts **nothing about the numbers** - not a
+threshold, not positivity - because even "a mean is positive" proved to be a
+property of the host's clock resolution rather than of the harness (#3092). The
+run can only fail if the harness itself crashes. **No property of a measured time
+gates anything**, here or anywhere else in the suite.
 
 That is deliberate and it is not a gap. A dudect score is a statistic over
 wall-clock time on hardware nobody controls, so any threshold over it has a

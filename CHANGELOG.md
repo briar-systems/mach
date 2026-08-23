@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.26.2] - 2026-08-23
+
+### Fixed
+
+#### ct: no assertion over a timing measurement remains, of any kind (#3092)
+
+The smoke tests #3070 kept in place of the removed timing gate still asserted
+that measured means were finite, positive, ordered numbers - billed as structural
+and deterministic. Positivity was neither: `x86_64-darwin`'s monotonic clock
+ticks in microseconds, the smoke batches ran below one tick, and an all-zero
+class mean was a truthful reading of the instrument that failed the 4.26.2
+release gate on scheduling luck - the exact failure mode #3070 exists to forbid.
+
+The assertions are gone entirely, not recalibrated: the smoke tests now run the
+harness and print its table, and can only fail if the harness itself crashes.
+They remain the documented entry point for taking a real measurement (raise the
+counts, read the table), per `doc/language/secrecy.md`.
+
+#### dist: install.ps1 failed on Windows PowerShell 5.1 (#3086)
+
+The windows install one-liner (`irm https://machlang.org/install.ps1 | iex`) died
+with `Cannot find type [System.Net.Http.HttpClientHandler]` on the shell it is
+most likely pasted into: the latest-tag probe built a `System.Net.Http.HttpClient`,
+and that assembly is not loaded by default on Windows PowerShell 5.1, so the
+installer only ever worked in PowerShell 7. The probe now uses `HttpWebRequest`,
+which every PowerShell loads.
+
+Three more 5.1 gaps closed in the same pass: TLS 1.2 is or'd into the protocol set
+(github refuses older, and 5.1 can start without it), the banner color gates on
+`SupportsVirtualTerminal` (5.1's console would print the escapes literally), and
+the download passes `-UseBasicParsing` and suppresses the progress bar in a child
+scope. Shipped as a hotfix to `main` (#3087), since machlang.org serves the script
+from `main` raw; this release records it.
+
 ## [4.26.1] - 2026-08-23
 
 ### Fixed
