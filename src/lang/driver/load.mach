@@ -447,6 +447,9 @@ fun register_module_slot(p: *project.Project, fqn: intern.StrId) R.Result[sessio
     m.pub_consts        = nil;
     m.pub_const_count   = 0;
     m.pub_const_cap     = 0;
+    m.mod_refs          = nil;
+    m.mod_ref_count     = 0;
+    m.mod_ref_cap       = 0;
     m.deps              = nil;
     m.dep_count         = 0;
     m.dep_cap           = 0;
@@ -948,7 +951,7 @@ fun walk_comptime_if_for_load(p: *project.Project, mid: session.ModuleId, ci: *d
 fun comptime_branch_active_load(p: *project.Project, mid: session.ModuleId, br: *decl.ComptimeBranch, source: str, emit_diag: bool) R.Result[bool, str] {
     if (br.cond == id.EXPR_NIL) { ret R.ok[bool, str](true); }
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
-    val r: R.Result[comptime.CTValue, str] = comptime.eval(?m.ctx, m.a, source, br.cond, ?p.s.interner);
+    val r: R.Result[comptime.CTValue, str] = eval_for_load(p, mid, source, br.cond, float.FLOAT_W_NONE);
     val e_opt: O.Option[*expr.Expr] = ast.get_expr(m.a, br.cond);
     if (O.is_none[*expr.Expr](e_opt)) { ret R.err[bool, str]("comptime branch cond ExprId out of range"); }
     val cond_span: token.Span = O.unwrap[*expr.Expr](e_opt).span;
@@ -1118,11 +1121,56 @@ fun walk_use_for_load(p: *project.Project, mid: session.ModuleId, du: *decl.Decl
     # const merge it no longer needs.
     if (propagate_target_gate(p, mid, dep_mid)) { ret R.ok[bool, str](true); }
 
+    # a path ending AT a module binds a module reference, never a bare const: its
+    # members are reached qualified, and recording the binding is what lets the
+    # load walk fold `alias.CONST` in a later initializer (#3075)
+    if (ut.binds_module) {
+        val name_r: R.Result[intern.StrId, str] = use_bound_name(p, source, du, ut);
+        if (R.is_err[intern.StrId, str](name_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](name_r)); }
+        ret record_mod_ref(p, mid, R.unwrap_ok[intern.StrId, str](name_r), dep_mid);
+    }
+
     if (du.alias.len > 0) {
         ret R.ok[bool, str](true);
     }
 
     ret merge_pub_consts(p, mid, dep_mid, ut.leaf);
+}
+
+# the local name a `use` decl binds: its alias when it spells one, else the
+# path's leaf segment
+fun use_bound_name(p: *project.Project, source: str, du: *decl.DeclUse, ut: UseTarget) R.Result[intern.StrId, str] {
+    if (du.alias.len == 0) { ret R.ok[intern.StrId, str](ut.leaf); }
+    ret intern.intern_span(?p.s.interner, source, du.alias);
+}
+
+# bind `name` to module `dep_mid` in module `mid`'s module-reference table,
+# growing it as needed
+fun record_mod_ref(p: *project.Project, mid: session.ModuleId, name: intern.StrId, dep_mid: session.ModuleId) R.Result[bool, str] {
+    val m: *project.ModuleEntry = ?p.modules[mid::u32];
+    # first binding of a name wins, matching the lookup: a union walk can reach the
+    # same `use` under two targets, and a name bound twice to different modules is
+    # the resolver's duplicate-import error to report
+    if (O.is_some[session.ModuleId](mod_ref_lookup(m, name))) { ret R.ok[bool, str](true); }
+    if (m.mod_refs == nil) {
+        val r: R.Result[*project.ModRef, str] = A.allocate[project.ModRef](p.alloc, INITIAL_DEP_CAP::usize);
+        if (R.is_err[*project.ModRef, str](r)) { ret R.err[bool, str](R.unwrap_err[*project.ModRef, str](r)); }
+        m.mod_refs    = R.unwrap_ok[*project.ModRef, str](r);
+        m.mod_ref_cap = INITIAL_DEP_CAP;
+    }
+    or (m.mod_ref_count == m.mod_ref_cap) {
+        val new_cap: u32 = m.mod_ref_cap * 2;
+        val r: R.Result[*project.ModRef, str] = A.reallocate[project.ModRef](p.alloc, m.mod_refs, m.mod_ref_cap::usize, new_cap::usize);
+        if (R.is_err[*project.ModRef, str](r)) { ret R.err[bool, str](R.unwrap_err[*project.ModRef, str](r)); }
+        m.mod_refs    = R.unwrap_ok[*project.ModRef, str](r);
+        m.mod_ref_cap = new_cap;
+    }
+    var mr: project.ModRef;
+    mr.name   = name;
+    mr.module = dep_mid;
+    m.mod_refs[m.mod_ref_count] = mr;
+    m.mod_ref_count = m.mod_ref_count + 1;
+    ret R.ok[bool, str](true);
 }
 
 # handle one `fwd` re-export during the load walk. a `fwd
@@ -1163,13 +1211,19 @@ fun walk_fwd_for_load(p: *project.Project, mid: session.ModuleId, df: *decl.Decl
 # the resolution of a `use` path into the module to load plus
 # the leaf name an unaliased import binds
 # ---
-# module_fqn: FQN of the module file the path resolves to (longest prefix
-#             of the path naming a real `.mach` file)
-# leaf:       the name an unaliased `use` binds - the trailing symbol
-#             segment when the path ends at a symbol, else the module leaf
+# module_fqn:   FQN of the module file the path resolves to (longest prefix
+#               of the path naming a real `.mach` file)
+# leaf:         the name an unaliased `use` binds - the trailing symbol
+#               segment when the path ends at a symbol, else the module leaf
+# binds_module: whether the path ends AT the module rather than at a symbol inside
+#               it, so the bound name denotes a module and its members are reached
+#               qualified. declared here rather than derived from `module_fqn ==
+#               path`, which is true of the bare-project-id form under a different
+#               spelling
 pub rec UseTarget {
-    module_fqn: intern.StrId;
-    leaf:       intern.StrId;
+    module_fqn:   intern.StrId;
+    leaf:         intern.StrId;
+    binds_module: bool;
 }
 
 # whether the dotted path covers exactly one segment (no `.` separator) - the
@@ -1241,8 +1295,9 @@ fun resolve_use_target(p: *project.Project, source: str, path: token.Span) R.Res
             val fqn_r: R.Result[intern.StrId, str] = compose_module_fqn(p, O.unwrap[str](id_opt), O.unwrap[str](mod_opt));
             if (R.is_err[intern.StrId, str](fqn_r)) { ret R.err[UseTarget, str](R.unwrap_err[intern.StrId, str](fqn_r)); }
             var ut: UseTarget;
-            ut.module_fqn = R.unwrap_ok[intern.StrId, str](fqn_r);
-            ut.leaf       = leaf;
+            ut.module_fqn   = R.unwrap_ok[intern.StrId, str](fqn_r);
+            ut.leaf         = leaf;
+            ut.binds_module = true;
             ret R.ok[UseTarget, str](ut);
         }
     }
@@ -1250,8 +1305,9 @@ fun resolve_use_target(p: *project.Project, source: str, path: token.Span) R.Res
     # the full path is itself a module file: bind it as a module, leaf is its own name.
     if (fqn_names_file(p, full_id)) {
         var ut: UseTarget;
-        ut.module_fqn = full_id;
-        ut.leaf       = leaf;
+        ut.module_fqn   = full_id;
+        ut.leaf         = leaf;
+        ut.binds_module = true;
         ret R.ok[UseTarget, str](ut);
     }
 
@@ -1270,8 +1326,9 @@ fun resolve_use_target(p: *project.Project, source: str, path: token.Span) R.Res
         val pid: intern.StrId = R.unwrap_ok[intern.StrId, str](pid_r);
         if (fqn_names_file(p, pid)) {
             var ut: UseTarget;
-            ut.module_fqn = pid;
-            ut.leaf       = leaf;
+            ut.module_fqn   = pid;
+            ut.leaf         = leaf;
+            ut.binds_module = false;
             ret R.ok[UseTarget, str](ut);
         }
         seg_end = dot - 1;
@@ -1410,15 +1467,118 @@ fun record_dep(p: *project.Project, mid: session.ModuleId, dep_mid: session.Modu
 fun merge_pub_consts(p: *project.Project, mid: session.ModuleId, dep_mid: session.ModuleId, leaf: intern.StrId) R.Result[bool, str] {
     val m:   *project.ModuleEntry = ?p.modules[mid::u32];
     val dep: *project.ModuleEntry = ?p.modules[dep_mid::u32];
+    val v: O.Option[comptime.CTValue] = pub_const_lookup(dep, leaf);
+    if (O.is_none[comptime.CTValue](v)) { ret R.ok[bool, str](true); }
+    ret comptime.bind(?m.ctx, leaf, O.unwrap[comptime.CTValue](v));
+}
+
+# the value module `dep` exports under `name`, or none when it exports no such
+# comptime constant. the export list holds exactly the module's `pub` comptime
+# vals, so a miss here IS the visibility guard: a private `val` is not in it
+fun pub_const_lookup(dep: *project.ModuleEntry, name: intern.StrId) O.Option[comptime.CTValue] {
     var i: u32 = 0;
     for (i < dep.pub_const_count) {
         val pc: *project.PubConst = ?dep.pub_consts[i];
-        if (pc.name == leaf) {
-            ret comptime.bind(?m.ctx, pc.name, pc.value);
-        }
+        if (pc.name == name) { ret O.some[comptime.CTValue](pc.value); }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret O.none[comptime.CTValue]();
+}
+
+# the module a local name denotes in module `m`, or none when the name binds no
+# module reference
+fun mod_ref_lookup(m: *project.ModuleEntry, name: intern.StrId) O.Option[session.ModuleId] {
+    var i: u32 = 0;
+    for (i < m.mod_ref_count) {
+        val mr: *project.ModRef = ?m.mod_refs[i];
+        if (mr.name == name) { ret O.some[session.ModuleId](mr.module); }
+        i = i + 1;
+    }
+    ret O.none[session.ModuleId]();
+}
+
+# what the load walk's member resolver needs to answer a module-qualified path:
+# the project (re-indexed on every call, since loading a module reallocates the
+# entry array) and the module whose expression is being folded
+rec LoadMemberCtx {
+    p:   *project.Project;
+    mid: session.ModuleId;
+}
+
+# the module-qualified member resolver (a comptime.ModuleMemberFn) the load walk
+# installs around its own folds, so `sizes.SLOTS` folds at load exactly as the
+# bare `SLOTS` an unaliased import binds already does (#3075).
+#
+# Without it a module-level `val` whose initializer reached through a module
+# reference never folded, so it was never bound into the module's ComptimeCtx and
+# every later use of the NAME - an array length, a `$if` gate - reported the name
+# as not a comptime constant, while the same qualified path spelled inline folded
+# fine against the resolver sema installs. The load walk owns the import graph, so
+# it can answer the path here from the alias-to-module map `use` records and the
+# dep's own export list, with no dependency on name resolution.
+#
+# Resolution is structural (an IDENT object naming a module reference) because no
+# resolve result exists yet. Anything else - a member of a value, an unknown name,
+# a member the dep does not export - is none, which the evaluator turns into its
+# ordinary "not a module-level constant" refusal; the caller folding an initializer
+# skips the val exactly as it did before, so nothing that used to load stops.
+# ---
+# data: the *LoadMemberCtx, erased to a ptr by the installer
+# eid:  the MEMBER expression id, valid in this module's ast
+# ret:  some(value) when the path names an exported module-level constant, else none
+fun resolve_module_member_const_load(data: ptr, eid: id.ExprId) R.Result[O.Option[comptime.CTValue], str] {
+    val lc: *LoadMemberCtx = data::*LoadMemberCtx;
+    if (lc == nil) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
+    val m: *project.ModuleEntry = ?lc.p.modules[lc.mid::u32];
+    if (m.a == nil) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
+
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(m.a, eid);
+    if (O.is_none[*expr.Expr](e_opt)) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
+    val node: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
+    if (node.kind != expr.EXPR_KIND_MEMBER) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
+
+    val o_opt: O.Option[*expr.Expr] = ast.get_expr(m.a, node.data.member.object);
+    if (O.is_none[*expr.Expr](o_opt)) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
+    val obj: *expr.Expr = O.unwrap[*expr.Expr](o_opt);
+    if (obj.kind != expr.EXPR_KIND_IDENT) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
+
+    val src_opt: O.Option[*src.SourceFile] = src.get(?lc.p.s.sources, m.file_id);
+    if (O.is_none[*src.SourceFile](src_opt)) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
+    val source: str = O.unwrap[*src.SourceFile](src_opt).text;
+
+    val obj_r: R.Result[intern.StrId, str] = intern.intern_span(?lc.p.s.interner, source, obj.span);
+    if (R.is_err[intern.StrId, str](obj_r)) { ret R.err[O.Option[comptime.CTValue], str](R.unwrap_err[intern.StrId, str](obj_r)); }
+    val dep_opt: O.Option[session.ModuleId] = mod_ref_lookup(m, R.unwrap_ok[intern.StrId, str](obj_r));
+    if (O.is_none[session.ModuleId](dep_opt)) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
+
+    val name_r: R.Result[intern.StrId, str] = intern.intern_span(?lc.p.s.interner, source, node.data.member.name);
+    if (R.is_err[intern.StrId, str](name_r)) { ret R.err[O.Option[comptime.CTValue], str](R.unwrap_err[intern.StrId, str](name_r)); }
+
+    val dep: *project.ModuleEntry = ?lc.p.modules[(O.unwrap[session.ModuleId](dep_opt))::u32];
+    ret R.ok[O.Option[comptime.CTValue], str](pub_const_lookup(dep, R.unwrap_ok[intern.StrId, str](name_r)));
+}
+
+# fold one of module `mid`'s own comptime expressions with the load walk's member
+# resolver installed for the duration. the window is the call, not the pass: the
+# resolver context lives on this frame, so the borrowed ctx never keeps a pointer
+# into a frame that has returned
+pub fun eval_for_load(
+    p:      *project.Project,
+    mid:    session.ModuleId,
+    source: str,
+    e:      id.ExprId,
+    fw:     float.FloatWidth
+) R.Result[comptime.CTValue, str] {
+    val m: *project.ModuleEntry = ?p.modules[mid::u32];
+    var lc: LoadMemberCtx;
+    lc.p   = p;
+    lc.mid = mid;
+    val lcp: *LoadMemberCtx = ?lc;
+    comptime.set_member_resolver(?m.ctx, resolve_module_member_const_load::*u8, lcp::ptr);
+    val r: R.Result[comptime.CTValue, str] =
+        comptime.eval_at_float_width(?m.ctx, m.a, source, e, ?p.s.interner, fw);
+    comptime.set_member_resolver(?m.ctx, nil, nil);
+    ret r;
 }
 
 # fold a module-level `val` initializer and, when it is comptime, bind it into the
@@ -1453,7 +1613,7 @@ fun register_val_for_load(p: *project.Project, mid: session.ModuleId, d: *decl.D
     # with it only sometimes (#2918).
     val fw: float.FloatWidth = comptime.declared_float_width(m.a, source, d.data.bind.ty);
     val r_val: R.Result[comptime.CTValue, str] =
-        comptime.eval_at_float_width(?m.ctx, m.a, source, d.data.bind.init, ?p.s.interner, fw);
+        eval_for_load(p, mid, source, d.data.bind.init, fw);
     if (R.is_err[comptime.CTValue, str](r_val)) { ret R.ok[bool, str](true); }
     val v: comptime.CTValue = R.unwrap_ok[comptime.CTValue, str](r_val);
 
