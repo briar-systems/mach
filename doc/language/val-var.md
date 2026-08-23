@@ -34,6 +34,12 @@ A pointer is the exception that proves the rule — `val p: *T` binds the **addr
 immutably, not the storage it addresses, so `@p = x`, `p.field = x` and `p[i] = x`
 write the pointee and are legal.
 
+The check ends where the address escapes. `?NAME` on a `val` yields a plain `*T` —
+there is deliberately no read-only pointer type — and writing through any pointer
+that reaches a `val`'s storage is **undefined behaviour**: a module-level `val`
+lives in read-only data, so the store typically faults, while a local one may
+silently appear to work. The compiler does not diagnose it.
+
 ## Scope
 
 `val` and `var` work at module top level and inside function bodies.
