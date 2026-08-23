@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### ct: no test gates on a timing measurement (#3070)
+
+`mach.lang.ct.probe` asserted a constant-time verdict against thresholds over
+measured wall-clock time. That failed the 4.26.0 release gate on `x86_64-darwin`
+and passed a re-run of the identical commit. The null control was flat, so the run
+believed it could discriminate, while its means sat at 126k-159k against the
+probe's 12k-38k: a quiet control at 126k ns certifies nothing about noise at 12k
+ns. The thresholds had been calibrated on one linux box and the relative cost of
+these probes is a microarchitecture property.
+
+The gate is gone rather than recalibrated. A better threshold lowers the
+false-failure rate without bounding it, and a required check that can fail
+nondeterministically is worse than no check. The harness stays and is exercised on
+every run at tiny sample counts, asserting only that it executes and produces
+finite, positive, ordered numbers, which is deterministic and still fails if it
+rots. The measurements themselves are taken deliberately by a person, as
+`doc/language/secrecy.md` now says.
+
+The three deterministic restorations from #2944 are untouched, including the
+x86-64 flags probe.
+
 #### sema: a wide type graph was reported as a mixed-secrecy one (#3080)
 
 A union whose variants place `^` at exactly the same positions was rejected for mixing
@@ -377,9 +398,7 @@ Twelve jobs across four workflows emitted a deprecation annotation for
 Node.js 24. Both are on their current majors now, with the producer and consumer
 pairings checked against the intervening breaking changes.
 
-
 ## [4.25.0] - 2026-08-21
-
 
 ### Fixed
 
@@ -855,7 +874,6 @@ Unblocks briar-systems/mach-lsp#141.
 
 ## [4.23.0] - 2026-08-21
 
-
 ### Fixed
 
 #### sema: the C-variadic promotion rule survives monomorphization (#3029)
@@ -964,7 +982,6 @@ bytes" is not a question with one answer. The flat writer's layout and its
 enter-at-the-base rule are now one body shared by the file path and the in-memory
 one, so an image held in memory cannot differ from the one a build would have
 written.
-
 
 ### Fixed
 
@@ -1120,7 +1137,6 @@ to complement. That assertion is the actual fix here: the defect was not that fo
 teardowns were missed, it was that the only test covering them could not fail.
 
 ## [4.20.0] - 2026-08-20
-
 
 ### Fixed
 
@@ -1282,7 +1298,6 @@ It surfaced as a red leg rather than a quietly smaller run because the corpus re
 The 4.18.1 release itself was unaffected: CD builds and publishes on the tag and completed with all five binaries, and this is the release-cadence test workflow that runs on the push to `main` beside it.
 
 ## [4.18.1] - 2026-08-09
-
 
 ### Fixed
 
@@ -1666,7 +1681,6 @@ A drawn-in module contributes globals by **reachability, not membership**, the r
 
 The driver half closes the module set over cross-module **global** references, not only function ones. A shader that reads a shared module's uniform and calls nothing in it must still draw that module in, and before this it could not resolve the variable at all.
 ## [4.17.0] - 2026-08-08
-
 
 ### Fixed
 
@@ -2161,7 +2175,6 @@ Two things the issue expected turned out not to need changing. The front end alr
 
 This also makes the constant pool's four-byte `CONST_F32` entry reachable from source for the first time.
 
-
 #### The FNEG sign mask and aarch64's `fmov` immediate reach the constant pool (#2754)
 Two constant materializations the pool did not reach, both because the ISA form that would consume one was not modelled by the encoder. They are independent and both landed here.
 
@@ -2583,8 +2596,6 @@ Two implementation notes worth carrying:
 
 The lookahead does not absorb real mistakes: a genuinely wrong operand in the same position (`g[nosuchmod.T]`) still reports against the type grammar, a name that is not a `$each` loop variable is reported where it is written, and `type` stays contextual so an ordinary record field called `type` is untouched.
 
-
-
 ### Changed
 
 #### `^` is stripped only where the question is about storage (#2692)
@@ -2649,7 +2660,6 @@ Reachable by any objective-c consumer rather than only unusually large images: #
 
 #### SPIR-V access chains, local allocations, and a dead shuffle constant (#2649)
 A GEP's index list now survives to a logical-addressing target as member ordinals rather than being folded into a byte displacement, so a struct member read lowers to `OpAccessChain` instead of being unrepresentable. Local allocations and a dead shuffle constant were fixed alongside it.
-
 
 ## [4.12.0] - 2026-08-07
 
