@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### sema: a wide type graph was reported as a mixed-secrecy one (#3080)
+
+A union whose variants place `^` at exactly the same positions was rejected for mixing
+secret and public storage, and a `::` / `:~` between two such types was rejected for
+changing the qualifier - both on graph size alone:
+
+```
+error: union variants must agree on secrecy: overlapping fields are part secret `^`
+       and part public, which would alias the same storage at two classifications
+```
+
+The deep secrecy-placement comparison walks the two types in LOCKSTEP, so its cycle
+guard records PAIRS of nominals. That set held 128 of them behind a linear rescan, and
+a comparison that entered a 129th answered "these two do not place `^` identically".
+The two siblings this release retired (#3065, #3066) reported the checker's own limit
+when they filled; **this one made a substantive claim about the program instead**, so
+the same fixed bound surfaced as a secrecy defect the author had to go looking for and
+could never find. Graph *width* is what reaches it: two 200-field records compared
+field for field enter 201 pairs, while a chain long enough to fill the set is refused
+first by the layout walk's own depth bound.
+
+The pair set now belongs to the interner beside the `TypeId`-keyed one, borrowed in the
+same stack order and retired by the same epoch, keyed by the two ids packed into one
+word - so its capacity is the allocator's, and its membership test is a hash probe
+rather than the rescan that made the comparison quadratic in entered pairs. It stays
+monotone, which is what it always was despite its comment: the set is both the cycle
+guard and a memo of pairs already settled, and every graph that fit under 128 pairs
+gets the answer it got before.
+
+**This completes the fixed-bound walk family.** All three of the secrecy checker's
+graph walks are now sized to the type universe, and none of them can be exhausted by a
+program's size.
+
+The rule itself is unchanged: a genuine placement difference anywhere in a graph of any
+size is still found and still reported as a secrecy violation, and a cyclic graph still
+terminates. A comparison that genuinely cannot be recorded - now only an allocation
+failure - still fails closed, but says so as a limit of the compiler rather than as a
+`^` in the program.
+
 #### sema: a `val` initialised from a module-qualified path was not constant (#3075)
 
 A module-level `val` whose initialiser reached through a module reference was not a
