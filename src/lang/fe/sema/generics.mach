@@ -572,15 +572,43 @@ fun nominal_overlays(s: *session.Session, tid: type.TypeId) O.Option[bool] {
 
 # a paired cycle guard for the deep secrecy-placement comparison, so two mutually
 # recursive record graphs compared field-for-field terminate (#2165)
+#
+# MONOTONE, not a stack: a pair is recorded on entry and never withdrawn, so the set is
+# both the cycle guard and a memo of the pairs this comparison has already settled. Both
+# readings give the same answer. A pair re-entered while its own frame is still open is
+# assumed equal, the standard coinductive treatment for a lockstep equality walk - a cycle
+# introduces no new placement difference. A pair met again after its frame returned was
+# settled TRUE, because a frame that answered false ends the whole comparison at once, and
+# the answer for a pair depends on nothing but the pair.
+#
+# It held 128 pairs behind a linear rescan, and a comparison that entered a 129th answered
+# "these two types do not place `^` identically" - a substantive claim about the program,
+# reported as a secrecy violation, reachable by graph WIDTH alone (#3080). The set is now
+# borrowed from the interner, so its capacity is the allocator's and its membership test is
+# a hash probe rather than a rescan of everything entered so far.
 # ---
-# a:   the left nominal TypeIds currently on the walk
-# b:   the right nominal TypeIds currently on the walk
-# len: number of pairs on the walk (a graph beyond the bound fails closed)
+# scan:         the borrowed pair set, keyed by the (left, right) nominal pair
+# unrecordable: true once a pair could not be recorded, so the comparison's `false` is
+#               about the checker's room rather than about the program's placement
 rec SecrecyPairScan {
-    a:   [128]type.TypeId;
-    b:   [128]type.TypeId;
-    len: u32;
+    scan:         type.PairScan;
+    unrecordable: bool;
 }
+
+# the outcome of one deep secrecy-placement comparison
+#
+# Three states, not a bool, because the walk's fail-closed exit and a real placement
+# difference demand DIFFERENT diagnostics: one names the program's `^`, the other names the
+# checker's limit. Both reject, so folding them together is safe for the rule and wrong for
+# the reader - that conflation is what made a merely large graph read as a secrecy defect.
+pub def SecrecyVerdict: u8;
+
+# `^` appears at identical positions in both types
+pub val SECRECY_EQUAL:        SecrecyVerdict = 0;
+# the placements differ, or could not be aligned - a fact about the two types
+pub val SECRECY_DIFFERS:      SecrecyVerdict = 1;
+# a pair could not be recorded, so the comparison never completed - a fact about the checker
+pub val SECRECY_UNRECORDABLE: SecrecyVerdict = 2;
 
 # whether types `a` and `b` place the secret qualifier `^` IDENTICALLY through the whole
 # type graph - pointer / array spine AND record / union / generic-instance field graphs
@@ -593,20 +621,32 @@ rec SecrecyPairScan {
 # exactly the same positions in both. A fast path returns true when NEITHER side carries
 # a deep secret (any bit-reinterpret between fully-public types is secrecy-safe, so a
 # public reinterpret / union is never over-rejected); only when a secret is involved does
-# the strict field-for-field walk run - conservatively, failing closed on any structure
-# it cannot align (differing field counts, an unresolvable instance, an over-deep graph),
-# since a reinterpret it cannot prove safe must be rejected. Generic-instance field tables
-# are materialized (`ensure_fields`) so the result is independent of elaboration order.
+# the strict field-for-field walk run - conservatively, reporting SECRECY_DIFFERS for any
+# structure it cannot align (differing field counts, an unresolvable instance, a nest past
+# the layout walk's depth), since a reinterpret it cannot prove safe must be rejected.
+# Generic-instance field tables are materialized (`ensure_fields`) so the result is
+# independent of elaboration order.
 # ---
 # s:   the session
 # a:   the first type
 # b:   the second type
-# ret: true when `a` and `b` carry `^` at identical positions
-pub fun secrecy_structure_equal_deep(s: *session.Session, m: layout.Machine, a: type.TypeId, b: type.TypeId) bool {
-    if (!contains_secret_deep(s, a) && !contains_secret_deep(s, b)) { ret true; }
+# ret: SECRECY_EQUAL when `a` and `b` carry `^` at identical positions, SECRECY_DIFFERS
+#      when they do not, SECRECY_UNRECORDABLE when the comparison could not be completed
+pub fun secrecy_structure_equal_deep(s: *session.Session, m: layout.Machine, a: type.TypeId, b: type.TypeId) SecrecyVerdict {
+    if (!contains_secret_deep(s, a) && !contains_secret_deep(s, b)) { ret SECRECY_EQUAL; }
+
     var scan: SecrecyPairScan;
-    scan.len = 0;
-    ret sse_deep_walk(s, m, a, b, ?scan);
+    scan.unrecordable = false;
+    type.pair_scan_begin(?s.types, ?scan.scan);
+    val equal: bool = sse_deep_walk(s, m, a, b, ?scan);
+    type.pair_scan_end(?s.types, ?scan.scan);
+
+    # an unrecordable pair returns false from its own frame and every frame above it, so
+    # the flag decides the verdict whenever it is set: the `false` it produced carries no
+    # information about placement.
+    if (scan.unrecordable) { ret SECRECY_UNRECORDABLE; }
+    if (equal)             { ret SECRECY_EQUAL; }
+    ret SECRECY_DIFFERS;
 }
 
 # the recursive lockstep worker for `secrecy_structure_equal_deep`
@@ -650,17 +690,18 @@ fun sse_deep_walk(s: *session.Session, m: layout.Machine, a: type.TypeId, b: typ
     val a_nom: bool = ta.kind == type.TYPE_REC || ta.kind == type.TYPE_UNI || ta.kind == type.TYPE_INSTANCE;
     val b_nom: bool = tb.kind == type.TYPE_REC || tb.kind == type.TYPE_UNI || tb.kind == type.TYPE_INSTANCE;
     if (a_nom && b_nom) {
+        val mark: type.VisitMark = type.pair_scan_mark(?s.types, ?scan.scan, sa, sb);
         # a seen pair is assumed equal (coinductive): a cycle introduces no new
         # placement difference, so if the non-cyclic parts match the pair matches.
-        var i: u32 = 0;
-        for (i < scan.len) {
-            if (scan.a[i] == sa && scan.b[i] == sb) { ret true; }
-            i = i + 1;
+        if (mark == type.VISIT_SEEN) { ret true; }
+        # a pair the set could not record leaves the walk unbounded from here, so it FAILS
+        # CLOSED - a comparison that cannot finish must not answer "identical placement".
+        # The flag is what keeps the caller's diagnostic about the checker's room instead
+        # of about the program's `^`.
+        if (mark == type.VISIT_FAILED) {
+            scan.unrecordable = true;
+            ret false;
         }
-        if (scan.len >= 128) { ret false; }
-        scan.a[scan.len] = sa;
-        scan.b[scan.len] = sb;
-        scan.len = scan.len + 1;
 
         if (ta.kind == type.TYPE_INSTANCE) { ensure_fields(s, sa); }
         if (tb.kind == type.TYPE_INSTANCE) { ensure_fields(s, sb); }
@@ -1255,7 +1296,14 @@ fun check_uni_variants(sc: *sema.SemaContext, nom: type.TypeId, args: *type.Type
         val raw: type.TypeId = O.unwrap[*type.FieldEntry](e_opt).ty;
         val ty:  type.TypeId = subst_or_self(s, raw, args, arg_len);
         if (type_mentions_gparam(s, ty)) { ret; }
-        if (!secrecy_structure_equal_deep(s, sema.machine_of(sc), first, ty)) {
+        val verdict: SecrecyVerdict = secrecy_structure_equal_deep(s, sema.machine_of(sc), first, ty);
+        # a comparison the checker could not finish joins this walk's OWN fail-closed exit,
+        # which already says the answer is about the checker rather than about the program.
+        if (verdict == SECRECY_UNRECORDABLE) {
+            report_unprovable(sc, scan, span);
+            ret;
+        }
+        if (verdict == SECRECY_DIFFERS) {
             if (sema.uni_report_mark(sc.uni_reports, key)) {
                 sema.report(sc, span, "union variants must agree on secrecy: this instantiation makes overlapping fields part secret `^` and part public, which would alias the same storage at two classifications");
             }

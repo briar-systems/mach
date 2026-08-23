@@ -640,6 +640,10 @@ pub rec FieldTable {
 #                  guard, one per level of nesting, checked out and returned in stack order
 # visits_len:      sets currently borrowed, which is the current nesting depth
 # visits_cap:      allocated sets in visits
+# pairs:           pool of PAIR-keyed visited sets a lockstep walk borrows, one per level
+#                  of nesting, checked out and returned in stack order
+# pairs_len:       sets currently borrowed, which is the current nesting depth
+# pairs_cap:       allocated sets in pairs
 # gparam:          per-TypeId memo of "this nominal's field graph mentions a generic
 #                  parameter", one GPARAM_* state per TypeId
 # gparam_cap:      allocated slots in gparam
@@ -709,6 +713,10 @@ pub rec TypeInterner {
     visits_len: u32;
     visits_cap: u32;
 
+    pairs:     *PairSet;
+    pairs_len: u32;
+    pairs_cap: u32;
+
     gparam:       *u8;
     gparam_cap:   u32;
     gparam_epoch: u32;
@@ -763,6 +771,10 @@ pub fun init(ti: *TypeInterner, a: *A.Allocator) O.Option[str] {
     ti.visits     = nil;
     ti.visits_len = 0;
     ti.visits_cap = 0;
+
+    ti.pairs     = nil;
+    ti.pairs_len = 0;
+    ti.pairs_cap = 0;
 
     ti.gparam       = nil;
     ti.gparam_cap   = 0;
@@ -871,6 +883,14 @@ pub fun dnit(ti: *TypeInterner) {
         }
         A.deallocate[VisitSet](ti.a, ti.visits, ti.visits_cap::usize);
     }
+    if (ti.pairs != nil && ti.pairs_cap > 0) {
+        var pi: u32 = 0;
+        for (pi < ti.pairs_cap) {
+            map.dnit[u64, u32](?ti.pairs[pi].seen);
+            pi = pi + 1;
+        }
+        A.deallocate[PairSet](ti.a, ti.pairs, ti.pairs_cap::usize);
+    }
     if (ti.gparam != nil && ti.gparam_cap > 0) {
         A.deallocate[u8](ti.a, ti.gparam, ti.gparam_cap::usize);
     }
@@ -910,6 +930,10 @@ pub fun dnit(ti: *TypeInterner) {
     ti.visits     = nil;
     ti.visits_len = 0;
     ti.visits_cap = 0;
+
+    ti.pairs     = nil;
+    ti.pairs_len = 0;
+    ti.pairs_cap = 0;
 
     ti.gparam       = nil;
     ti.gparam_cap   = 0;
@@ -1401,6 +1425,148 @@ fun visit_reserve(ti: *TypeInterner, level: u32, tid: TypeId) O.Option[str] {
 
     memory.zero[u32](?set.stamp[set.cap], (new_cap - set.cap)::usize);
     set.cap = new_cap;
+
+    ret O.none[str]();
+}
+
+# one visited set over PAIRS of TypeIds, epoch-stamped the way a VisitSet is
+#
+# The deep secrecy-placement comparison walks two type graphs in LOCKSTEP, so what it has
+# to remember is a PAIR (#2165). A `VisitSet` cannot express one: there is no TypeId that
+# denotes the pair the way `nominal_visit_key` interns a (nominal, args) pair, and minting
+# a synthetic type per pair would grow the type universe with types no program names. The
+# key is therefore the two ids packed into one u64, and the value is the epoch that
+# recorded it - so a borrow retires the previous borrower's entries by advancing the epoch
+# rather than by clearing the table, and a mark stays O(1) whatever the table has held.
+#
+# Stale entries are left in place deliberately. They cost one slot each and keep every
+# borrow free of a clear; the table therefore grows to the number of DISTINCT pairs the
+# session has ever compared at this depth, which is the work actually done rather than a
+# constant chosen in advance.
+# ---
+# seen:  packed (left, right) key -> the epoch of the walk that entered it
+# epoch: the epoch the walk currently holding this set marks with
+rec PairSet {
+    seen:  map.Map[u64, u32];
+    epoch: u32;
+}
+
+# a lockstep walk's borrowed pair set: the cycle guard for a comparison whose state is a
+# pair of positions rather than one (#3080)
+#
+# The third and last of the fixed-capacity visited sets this walk family carried. Its bound
+# was 128 pairs with a LINEAR membership rescan, and the walk answered "these two types do
+# not place `^` identically" when it filled - so a type graph merely wide enough to enter a
+# 129th pair was reported as a secrecy violation of the program, in a message about `^`
+# rather than about the checker. Borrowed from the interner, its capacity is the
+# allocator's and its membership test is a hash probe.
+#
+# Borrowed in STACK order for the same reason `TypeScan` is: this comparison runs INSIDE
+# the generic-union instance walk, which asks a secrecy question per variant pair, and each
+# question is a comparison of its own.
+# ---
+# level: the borrowed set's index in the interner's pool, or SCAN_NONE when the borrow
+#        failed - every mark then reports VISIT_FAILED, taking the walk's fail-closed exit
+pub rec PairScan {
+    level: u32;
+}
+
+# borrow a pair set for one lockstep walk, retiring every mark the previous borrower left
+#
+# Infallible for the same reason `type_scan_begin` is: a pool that cannot be grown binds
+# the scan to SCAN_NONE and the failure surfaces at the first mark.
+# ---
+# ti:   the interner owning the pool
+# scan: the handle to bind to the borrowed set
+pub fun pair_scan_begin(ti: *TypeInterner, scan: *PairScan) {
+    if (O.is_some[str](pairs_reserve(ti))) {
+        scan.level = SCAN_NONE;
+        ret;
+    }
+
+    val level: u32 = ti.pairs_len;
+    ti.pairs_len   = ti.pairs_len + 1;
+
+    # epoch 0 is what a freshly initialized slot holds and what a cleared table reads as,
+    # so the counter wraps to 1 rather than to 0, and clearing first makes the wrap exact.
+    if (ti.pairs[level].epoch == 0xFFFFFFFF) {
+        map.clear[u64, u32](?ti.pairs[level].seen);
+        ti.pairs[level].epoch = 1;
+    }
+    or {
+        ti.pairs[level].epoch = ti.pairs[level].epoch + 1;
+    }
+
+    scan.level = level;
+}
+
+# return `scan`'s set to the pool, freeing it for the next walk at this depth
+# ---
+# ti:   the interner owning the pool
+# scan: the handle to release
+pub fun pair_scan_end(ti: *TypeInterner, scan: *PairScan) {
+    if (scan.level == SCAN_NONE) { ret; }
+    ti.pairs_len = scan.level;
+    scan.level   = SCAN_NONE;
+}
+
+# enter the pair `(a, b)` on `scan`, reporting whether this walk had already reached it
+# ---
+# ti:   the interner owning the pool
+# scan: the open scan
+# a:    the left TypeId of the pair
+# b:    the right TypeId of the pair
+# ret:  VISIT_FRESH, VISIT_SEEN, or VISIT_FAILED
+pub fun pair_scan_mark(ti: *TypeInterner, scan: *PairScan, a: TypeId, b: TypeId) VisitMark {
+    if (scan.level == SCAN_NONE) { ret VISIT_FAILED; }
+
+    val set: *PairSet = ?ti.pairs[scan.level];
+    var key: u64      = (a::u64 << 32) | b::u64;
+
+    val got: R.Result[*u32, str] = map.get[u64, u32](?set.seen, ?key);
+    if (R.is_ok[*u32, str](got)) {
+        val slot: *u32 = R.unwrap_ok[*u32, str](got);
+        if (slot[0] == set.epoch) { ret VISIT_SEEN; }
+        slot[0] = set.epoch;
+        ret VISIT_FRESH;
+    }
+
+    if (R.is_err[bool, str](map.insert[u64, u32](?set.seen, key, set.epoch))) { ret VISIT_FAILED; }
+    ret VISIT_FRESH;
+}
+
+# grow the pair pool so one more set can be borrowed, initializing the new sets empty
+# ---
+# ti:  the interner
+# ret: none once a set is free, or some(error) on allocation failure
+fun pairs_reserve(ti: *TypeInterner) O.Option[str] {
+    if (ti.pairs_len < ti.pairs_cap) { ret O.none[str](); }
+
+    var new_cap: u32 = ti.pairs_cap * 2;
+    if (new_cap == 0) { new_cap = INITIAL_VISIT_DEPTH; }
+
+    if (ti.pairs == nil) {
+        val res_alloc: R.Result[*PairSet, str] = A.allocate[PairSet](ti.a, new_cap::usize);
+        if (R.is_err[*PairSet, str](res_alloc)) {
+            ret O.some[str](R.unwrap_err[*PairSet, str](res_alloc));
+        }
+        ti.pairs = R.unwrap_ok[*PairSet, str](res_alloc);
+    }
+    or {
+        val res_realloc: R.Result[*PairSet, str] = A.reallocate[PairSet](ti.a, ti.pairs, ti.pairs_cap::usize, new_cap::usize);
+        if (R.is_err[*PairSet, str](res_realloc)) {
+            ret O.some[str](R.unwrap_err[*PairSet, str](res_realloc));
+        }
+        ti.pairs = R.unwrap_ok[*PairSet, str](res_realloc);
+    }
+
+    var i: u32 = ti.pairs_cap;
+    for (i < new_cap) {
+        ti.pairs[i].seen  = map.init[u64, u32](ti.a, map.hash_u64, map.eq_u64);
+        ti.pairs[i].epoch = 0;
+        i = i + 1;
+    }
+    ti.pairs_cap = new_cap;
 
     ret O.none[str]();
 }
