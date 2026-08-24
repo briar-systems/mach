@@ -1034,6 +1034,111 @@ fun free_weak_comdat_image(alloc: *A.Allocator, out: *of.ObjectImage, comdat: *b
 # img:     the object image to serialize
 # path:    null-terminated output file path
 # ret:     ok(true) on success, or an error string
+# the mach-private object section that carries the image's declared frame-unwind
+# records (`of.FrameUnwind`, #3096) across the disk round-trip
+#
+# WHY THE OBJECT MUST CARRY THEM. The build engine's test dispatcher always links
+# from written `.o` files, and the incremental cache feeds warm links the same
+# way, so "the linker consumes in-memory codegen images" is not a path every link
+# takes. A record that lives only in memory silently vanishes on those links and
+# every affected function loses its unwind data - the exact silent-divergence
+# class #3096 removes. The records ride the object the way `machine_flags` and
+# the riscv `attributes` body do: written by this emitter, restored by
+# `coff_parse_object`, invisible to everything else (the parser strips the
+# section after decoding it, so no linked image carries it).
+#
+# Records are keyed by FUNCTION SYMBOL NAME, not by (section, offset) or symbol
+# index: the emit re-partitions sections at weak boundaries (#2125) and the COFF
+# symbol table interleaves section and aux records, so both of those keys would
+# couple this blob to serializer layout that legitimately shifts. A name resolves
+# through the parsed symbol table to wherever the function landed. Function
+# symbol names are unique within a builder-assembled image (`obj.symbol_index`'s
+# contract), which is the only kind of image that carries records.
+#
+# layout (little-endian): u32 version, u32 record count, then per record
+# u32 name_len, u32 step_count, name bytes (padded to 4), and step_count
+# 16-byte steps (u8 kind, u8 reg, u16 zero, u32 end_off, u64 value).
+val MACH_FRAMES_SECTION_NAME: str = ".mach.frames";
+val MACH_FRAMES_VERSION: u32 = 1;
+
+# the function symbol a frame record describes, or SYMBOL_NONE when no defined
+# function symbol sits at the record's (section, offset)
+fun frames_record_symbol(img: *of.ObjectImage, fr: *of.FrameUnwind) u32 {
+    var i: u32 = 0;
+    for (i < img.symbol_count) {
+        val sym: *of.Symbol = ?img.symbols[i];
+        if ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0
+            && sym.section == fr.section && sym.offset == fr.offset) {
+            ret i;
+        }
+        i = i + 1;
+    }
+    ret of.SYMBOL_NONE;
+}
+
+# encode the image's frame-unwind records into a `.mach.frames` section body;
+# a record whose function symbol cannot be found fails the emit loudly (it would
+# otherwise vanish silently on every disk-linked build)
+fun encode_frames_section(alloc: *A.Allocator, img: *of.ObjectImage,
+                          out_bytes: **u8, out_len: *u32) R.Result[bool, str] {
+    @out_bytes = nil;
+    @out_len = 0;
+    if (img.frame_count == 0) { ret R.ok[bool, str](true); }
+
+    var total: usize = 8;
+    var i: u32 = 0;
+    for (i < img.frame_count) {
+        val fr: *of.FrameUnwind = ?img.frames[i];
+        if (fr.step_count > of.FRAME_STEP_CAP) {
+            ret R.err[bool, str]("coff: frame record step count exceeds capacity");
+        }
+        val si: u32 = frames_record_symbol(img, fr);
+        if (si == of.SYMBOL_NONE) {
+            ret R.err[bool, str]("coff: frame record has no defined function symbol");
+        }
+        val nm: str = bin.resolve_name(img.interner, img.symbols[si].name);
+        if (nm == nil) {
+            ret R.err[bool, str]("coff: frame record symbol name did not resolve");
+        }
+        total = total + 8 + bin.align_up(str_len(nm), 4) + fr.step_count::usize * 16;
+        i = i + 1;
+    }
+
+    val rb: R.Result[*u8, str] = A.zallocate[u8](alloc, total);
+    if (R.is_err[*u8, str](rb)) { ret R.err[bool, str]("coff: frame section alloc failed"); }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+    bin.write_u32_le(buf, 0, MACH_FRAMES_VERSION);
+    bin.write_u32_le(buf, 4, img.frame_count);
+    var pos: usize = 8;
+    i = 0;
+    for (i < img.frame_count) {
+        val fr: *of.FrameUnwind = ?img.frames[i];
+        val si: u32 = frames_record_symbol(img, fr);
+        val nm: str = bin.resolve_name(img.interner, img.symbols[si].name);
+        val nlen: usize = str_len(nm);
+        bin.write_u32_le(buf, pos, nlen::u32);
+        bin.write_u32_le(buf, pos + 4, fr.step_count);
+        pos = pos + 8;
+        memory.raw_copy((buf::usize + pos)::ptr, nm::ptr, nlen);
+        pos = pos + bin.align_up(nlen, 4);
+        var k: u32 = 0;
+        for (k < fr.step_count) {
+            buf[pos] = fr.steps[k].kind;
+            buf[pos + 1] = fr.steps[k].reg;
+            bin.write_u16_le(buf, pos + 2, 0);
+            bin.write_u32_le(buf, pos + 4, fr.steps[k].end_off);
+            bin.write_u64_le(buf, pos + 8, fr.steps[k].value);
+            pos = pos + 16;
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+
+    @out_bytes = buf;
+    @out_len = total::u32;
+    ret R.ok[bool, str](true);
+}
+
 fun coff_emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Result[bool, str] {
     if (tgt_isa == nil || img == nil || path == nil) {
         ret R.err[bool, str]("coff: nil writer argument");
@@ -1054,8 +1159,65 @@ fun coff_emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R
         ret R.err[bool, str](R.unwrap_err[bool, str](br));
     }
 
-    val sr: R.Result[bool, str] = coff_serialize_image(?derived, comdat, path);
-    free_weak_comdat_image(alloc, ?derived, comdat);
+    # append the mach-private frame-record section (#3096) so the records survive
+    # the disk round-trip every dispatcher and warm incremental link takes. added
+    # after the weak split so it never participates in COMDAT planning; its bytes
+    # are owned here and freed after serialization (the derived image's own
+    # section bytes alias the source image and are never freed).
+    var fr_bytes: *u8 = nil;
+    var fr_len: u32 = 0;
+    var comdat2: *bool = comdat;
+    val fe: R.Result[bool, str] = encode_frames_section(alloc, img, ?fr_bytes, ?fr_len);
+    if (R.is_err[bool, str](fe)) {
+        free_weak_comdat_image(alloc, ?derived, comdat);
+        ret R.err[bool, str](R.unwrap_err[bool, str](fe));
+    }
+    if (fr_len > 0) {
+        val fnr: R.Result[intern.StrId, str] = intern.intern(img.interner, MACH_FRAMES_SECTION_NAME);
+        if (R.is_err[intern.StrId, str](fnr)) {
+            A.deallocate[u8](alloc, fr_bytes, fr_len::usize);
+            free_weak_comdat_image(alloc, ?derived, comdat);
+            ret R.err[bool, str](R.unwrap_err[intern.StrId, str](fnr));
+        }
+        val n0: u32 = derived.section_count;
+        # grow the comdat flag array first: each grow's failure path must free every
+        # array at the exact size it currently has, and free_weak_comdat_image frees
+        # both by `section_count`, so the count only moves once both grows landed.
+        if (comdat != nil) {
+            val gc: R.Result[*bool, str] = A.reallocate[bool](alloc, comdat, n0::usize, (n0 + 1)::usize);
+            if (R.is_err[*bool, str](gc)) {
+                A.deallocate[u8](alloc, fr_bytes, fr_len::usize);
+                # a failed reallocate leaves the original block live (the pattern
+                # build_exec_functions frees by), so the ordinary teardown applies.
+                free_weak_comdat_image(alloc, ?derived, comdat);
+                ret R.err[bool, str]("coff: frame comdat append failed");
+            }
+            comdat2 = R.unwrap_ok[*bool, str](gc);
+            comdat2[n0] = false;
+        }
+        val gs: R.Result[*of.Section, str] =
+            A.reallocate[of.Section](alloc, derived.sections, n0::usize, (n0 + 1)::usize);
+        if (R.is_err[*of.Section, str](gs)) {
+            A.deallocate[u8](alloc, fr_bytes, fr_len::usize);
+            if (comdat2 != nil) { A.deallocate[bool](alloc, comdat2, (n0 + 1)::usize); }
+            # section_count is still n0 and the failed reallocate left the original
+            # section array live, so the ordinary teardown frees it exactly.
+            free_weak_comdat_image(alloc, ?derived, nil::*bool);
+            ret R.err[bool, str]("coff: frame section append failed");
+        }
+        derived.sections = R.unwrap_ok[*of.Section, str](gs);
+        derived.sections[n0].name  = R.unwrap_ok[intern.StrId, str](fnr);
+        derived.sections[n0].kind  = of.SK_DEBUG;
+        derived.sections[n0].bytes = fr_bytes;
+        derived.sections[n0].len   = fr_len;
+        derived.sections[n0].align = 4;
+        derived.sections[n0].flags = 0;
+        derived.section_count = n0 + 1;
+    }
+
+    val sr: R.Result[bool, str] = coff_serialize_image(?derived, comdat2, path);
+    if (fr_bytes != nil) { A.deallocate[u8](alloc, fr_bytes, fr_len::usize); }
+    free_weak_comdat_image(alloc, ?derived, comdat2);
     ret sr;
 }
 
@@ -1903,6 +2065,13 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
     if (buf == nil || out == nil || buf_size < 4) {
         ret R.err[bool, str]("coff: object too small");
     }
+    # start from a fully zeroed image before any field is set: the caller's slot is
+    # arbitrary heap or arena memory, and a field this parser does not know about -
+    # one added to `of.ObjectImage` after it was written - would otherwise carry
+    # garbage into every consumer that sums or walks it (#3096 shipped a garbage
+    # `frame_count` exactly this way; same field-drop class as #2813/#2828).
+    var blank: of.ObjectImage;
+    @out = blank;
     # /bigobj (#2147) replaces the classic header's first two fields (Machine,
     # NumberOfSections) with a fixed Sig1/Sig2 pair: Sig1 is always
     # IMAGE_FILE_MACHINE_UNKNOWN, a machine type no real object ever carries, and
@@ -2248,6 +2417,132 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
 
     A.deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
     if (R.is_err[bool, str](inf)) { ret R.err[bool, str](R.unwrap_err[bool, str](inf)); }
+
+    # restore the declared frame-unwind records a mach-emitted object carries in
+    # its `.mach.frames` section (#3096), then strip the section (its slot stays,
+    # zero-length, so section ordinals and relocation indices are undisturbed and
+    # no linked image inherits the metadata).
+    val dfr: R.Result[bool, str] = decode_frames_section(alloc, itn, out);
+    if (R.is_err[bool, str](dfr)) { ret R.err[bool, str](R.unwrap_err[bool, str](dfr)); }
+    ret R.ok[bool, str](true);
+}
+
+# decode a parsed image's `.mach.frames` section into `out.frames` and strip it
+#
+# The inverse of `encode_frames_section`: each record's function-symbol name
+# resolves through the parsed symbol table to the (section, offset) the function
+# landed at - however the emit re-partitioned sections (#2125). A malformed blob
+# or an unresolvable name fails the parse loudly: the alternative is a function
+# silently shipping without unwind data, the #3096 failure class. Absent section
+# (every foreign object, every pre-#3096 mach object) is a clean no-op.
+fun decode_frames_section(alloc: *A.Allocator, itn: *intern.Interner,
+                          out: *of.ObjectImage) R.Result[bool, str] {
+    val fname_r: R.Result[intern.StrId, str] = intern.intern(itn, MACH_FRAMES_SECTION_NAME);
+    if (R.is_err[intern.StrId, str](fname_r)) {
+        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](fname_r));
+    }
+    val fname: intern.StrId = R.unwrap_ok[intern.StrId, str](fname_r);
+
+    var fs_i: u32 = 0xFFFFFFFF;
+    var si: u32 = 0;
+    for (si < out.section_count) {
+        if (out.sections[si].name == fname) { fs_i = si; brk; }
+        si = si + 1;
+    }
+    if (fs_i == 0xFFFFFFFF) { ret R.ok[bool, str](true); }
+
+    val sec: *of.Section = ?out.sections[fs_i];
+    val blob: *u8 = sec.bytes;
+    val blen: usize = sec.len::usize;
+    if (blob == nil || blen < 8) { ret R.err[bool, str]("coff: malformed .mach.frames section"); }
+    if (bin.read_u32_le(blob, 0) != MACH_FRAMES_VERSION) {
+        ret R.err[bool, str]("coff: unsupported .mach.frames version");
+    }
+    val count: u32 = bin.read_u32_le(blob, 4);
+    # each record is at least 8 bytes of header, so an absurd count is malformed.
+    if (count::usize > blen / 8) { ret R.err[bool, str]("coff: malformed .mach.frames count"); }
+
+    var frames: *of.FrameUnwind = nil;
+    if (count > 0) {
+        val fa: R.Result[*of.FrameUnwind, str] = A.zallocate[of.FrameUnwind](alloc, count::usize);
+        if (R.is_err[*of.FrameUnwind, str](fa)) { ret R.err[bool, str]("coff: frame record alloc failed"); }
+        frames = R.unwrap_ok[*of.FrameUnwind, str](fa);
+    }
+
+    var pos: usize = 8;
+    var i: u32 = 0;
+    for (i < count) {
+        if (pos + 8 > blen) {
+            A.deallocate[of.FrameUnwind](alloc, frames, count::usize);
+            ret R.err[bool, str]("coff: truncated .mach.frames record");
+        }
+        val nlen: usize = bin.read_u32_le(blob, pos)::usize;
+        val step_count: u32 = bin.read_u32_le(blob, pos + 4);
+        pos = pos + 8;
+        val npad: usize = bin.align_up(nlen, 4);
+        if (step_count > of.FRAME_STEP_CAP || nlen == 0
+            || pos + npad + step_count::usize * 16 > blen) {
+            A.deallocate[of.FrameUnwind](alloc, frames, count::usize);
+            ret R.err[bool, str]("coff: malformed .mach.frames record");
+        }
+
+        # the name bytes are not NUL-terminated in the blob; intern via a bounded copy.
+        val nb: R.Result[*u8, str] = A.allocate[u8](alloc, nlen + 1);
+        if (R.is_err[*u8, str](nb)) {
+            A.deallocate[of.FrameUnwind](alloc, frames, count::usize);
+            ret R.err[bool, str]("coff: frame name alloc failed");
+        }
+        val nbuf: *u8 = R.unwrap_ok[*u8, str](nb);
+        memory.raw_copy(nbuf::ptr, (blob::usize + pos)::ptr, nlen);
+        nbuf[nlen] = 0;
+        val nir: R.Result[intern.StrId, str] = intern.intern(itn, nbuf::str);
+        A.deallocate[u8](alloc, nbuf, nlen + 1);
+        if (R.is_err[intern.StrId, str](nir)) {
+            A.deallocate[of.FrameUnwind](alloc, frames, count::usize);
+            ret R.err[bool, str](R.unwrap_err[intern.StrId, str](nir));
+        }
+        val nid: intern.StrId = R.unwrap_ok[intern.StrId, str](nir);
+        pos = pos + npad;
+
+        var sym: u32 = 0xFFFFFFFF;
+        var sy: u32 = 0;
+        for (sy < out.symbol_count) {
+            if (out.symbols[sy].name == nid
+                && (out.symbols[sy].flags & of.SYM_OBJ_FLAG_FUNCTION) != 0
+                && out.symbols[sy].section != of.SECTION_EXTERNAL
+                && out.symbols[sy].section < out.section_count) {
+                sym = sy;
+                brk;
+            }
+            sy = sy + 1;
+        }
+        if (sym == 0xFFFFFFFF) {
+            A.deallocate[of.FrameUnwind](alloc, frames, count::usize);
+            ret R.err[bool, str]("coff: .mach.frames record names no defined function symbol");
+        }
+
+        frames[i].section    = out.symbols[sym].section;
+        frames[i].offset     = out.symbols[sym].offset;
+        frames[i].step_count = step_count;
+        var k: u32 = 0;
+        for (k < step_count) {
+            frames[i].steps[k].kind    = blob[pos];
+            frames[i].steps[k].reg     = blob[pos + 1];
+            frames[i].steps[k].end_off = bin.read_u32_le(blob, pos + 4);
+            frames[i].steps[k].value   = bin.read_u64_le(blob, pos + 8);
+            pos = pos + 16;
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+
+    out.frames = frames;
+    out.frame_count = count;
+
+    # strip the metadata: the slot stays for ordinal stability, its content goes.
+    A.deallocate[u8](alloc, sec.bytes, sec.len::usize);
+    sec.bytes = nil;
+    sec.len = 0;
     ret R.ok[bool, str](true);
 }
 
@@ -4421,6 +4716,130 @@ test "mach.lang.target.of.coff:emit_parse_round_trip" {
 # so the in-memory image and its re-parsed object are link-equivalent (#1865)
 # `.pdata` round-trips as writer-owned exception metadata rather than ordinary
 # read-only data, preserving the distinction the executable writer needs
+# a declared frame-unwind record survives the object round-trip (#3096): the
+# emit serializes `.mach.frames` name-keyed by function symbol, the parse
+# restores each record at wherever its function landed - including a WEAK
+# function the emit moved into its own COMDAT section (#2125) - and the
+# metadata section itself is stripped to zero length. this is the seam the test
+# dispatcher and every warm incremental link cross: a record that does not
+# round-trip here ships binaries whose functions silently lost their unwind data
+test "mach.lang.target.of.coff:frame_record_round_trip" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64);
+
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0x90; k = k + 1; }
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 16; secs[0].align = 16;
+
+    # a plain function and a defined WEAK one: the weak body is re-homed into a
+    # COMDAT carrier section at emit, so its record must resolve through the
+    # symbol, never through the pre-split (section, offset).
+    var syms: [2]of.Symbol;
+    syms[0].name = t_intern(?i, "deep"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 8; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name = t_intern(?i, "wfn"); syms[1].section = 0; syms[1].offset = 8;
+    syms[1].size = 8;
+    syms[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var frames: [2]of.FrameUnwind;
+    frames[0].section = 0; frames[0].offset = 0; frames[0].step_count = 2;
+    frames[0].steps[0].kind = of.FRAME_STEP_PUSH;  frames[0].steps[0].reg = 5; frames[0].steps[0].end_off = 1;    frames[0].steps[0].value = 0;
+    frames[0].steps[1].kind = of.FRAME_STEP_ALLOC; frames[0].steps[1].reg = 0; frames[0].steps[1].end_off = 0x2D; frames[0].steps[1].value = 0x6040;
+    frames[1].section = 0; frames[1].offset = 8; frames[1].step_count = 2;
+    frames[1].steps[0].kind = of.FRAME_STEP_PUSH; frames[1].steps[0].reg = 5; frames[1].steps[0].end_off = 1; frames[1].steps[0].value = 0;
+    frames[1].steps[1].kind = of.FRAME_STEP_SAVE; frames[1].steps[1].reg = 3; frames[1].steps[1].end_off = 8; frames[1].steps[1].value = 0x18;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "frt");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = ?syms[0]; img.symbol_count = 2;
+    img.frames = ?frames[0]; img.frame_count = 2;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_frt");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: R.Result[bool, str] = coff_emit_object(?isa_vt, ?img, tpath::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 2; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 3; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = coff_parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 4; }
+
+    if (out.frame_count != 2) { ret 5; }
+
+    # each record must sit exactly at its function symbol's parsed location.
+    val deep_id: intern.StrId = t_intern(?i, "deep");
+    val wfn_id: intern.StrId = t_intern(?i, "wfn");
+    var seen_deep: bool = false;
+    var seen_wfn: bool = false;
+    var fi: u32 = 0;
+    for (fi < out.frame_count) {
+        val fr: *of.FrameUnwind = ?out.frames[fi];
+        var sy: u32 = 0;
+        for (sy < out.symbol_count) {
+            val sym: *of.Symbol = ?out.symbols[sy];
+            if ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) == 0) { sy = sy + 1; cnt; }
+            if (sym.section != fr.section || sym.offset != fr.offset) { sy = sy + 1; cnt; }
+            if (sym.name == deep_id) {
+                if (fr.step_count != 2)                          { ret 6; }
+                if (fr.steps[1].kind != of.FRAME_STEP_ALLOC)     { ret 7; }
+                if (fr.steps[1].value != 0x6040)                 { ret 8; }
+                if (fr.steps[1].end_off != 0x2D)                 { ret 9; }
+                seen_deep = true;
+            }
+            if (sym.name == wfn_id) {
+                if (fr.step_count != 2)                      { ret 10; }
+                if (fr.steps[1].kind != of.FRAME_STEP_SAVE)  { ret 11; }
+                if (fr.steps[1].reg != 3)                    { ret 12; }
+                if (fr.steps[1].value != 0x18)               { ret 13; }
+                seen_wfn = true;
+            }
+            sy = sy + 1;
+        }
+        fi = fi + 1;
+    }
+    if (!seen_deep || !seen_wfn) { ret 14; }
+
+    # the weak record really crossed the split: it does not sit in the same parsed
+    # section as the plain one (the carrier is its own COMDAT section).
+    var deep_sec: u32 = 0xFFFFFFFF;
+    var wfn_sec: u32 = 0xFFFFFFFF;
+    var sy2: u32 = 0;
+    for (sy2 < out.symbol_count) {
+        if (out.symbols[sy2].name == deep_id) { deep_sec = out.symbols[sy2].section; }
+        if (out.symbols[sy2].name == wfn_id)  { wfn_sec = out.symbols[sy2].section; }
+        sy2 = sy2 + 1;
+    }
+    if (deep_sec == wfn_sec) { ret 15; }
+
+    # the metadata section was stripped: whatever slot it holds is empty.
+    val frames_id: intern.StrId = t_intern(?i, MACH_FRAMES_SECTION_NAME);
+    var si: u32 = 0;
+    for (si < out.section_count) {
+        if (out.sections[si].name == frames_id) {
+            if (out.sections[si].len != 0 || out.sections[si].bytes != nil) { ret 16; }
+        }
+        si = si + 1;
+    }
+
+    ret 0;
+}
+
 test "mach.lang.target.of.coff:exception_section_round_trip" {
     var alloc: A.Allocator;
     page.make(?alloc);
