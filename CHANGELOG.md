@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.26.3] - 2026-08-23
+
+### Fixed
+
+#### link(pe): the default stack reserve was 1 MiB, an eighth of every other target (#3091)
+
+A windows-x86_64 release build access-violated at a fixed call depth, in a
+function that had already succeeded six times in the same run, while the same
+code ran clean on linux. The reported hypothesis - missing stack probes - was
+investigated and REFUTED: the win64 backend has emitted correct inline per-page
+probes since v1.5.1, verified by disassembling the field binary itself (118
+probe walks, every one page-ordered), and a swept-alignment runtime suite that
+visits all 256 entry-RSP page residues in fresh stack territory now proves the
+discipline on the native windows CI leg every run.
+
+The consistent mechanism is plainer: PE images defaulted to the conventional
+1 MiB `SizeOfStackReserve`, while linux and darwin main threads get 8 MiB. A
+call path whose cumulative frames clear 1 MiB - wider win64 frames, plus
+whatever a GPU driver spends on top - dies on windows and nowhere else, at a
+depth, independent of the code executing: the field signature exactly. The
+default is now 8 MiB on windows too. Reserve is address space, not committed
+memory, so the change costs nothing at runtime; a target can still state its
+own `stack_reserve` (#2990).
+
 ## [4.26.2] - 2026-08-23
 
 ### Fixed
