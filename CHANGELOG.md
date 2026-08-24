@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.26.4] - 2026-08-23
+
+### Fixed
+
+#### of(coff): probed prologues fell out of the unwind-info pattern, understating large-frame .xdata (#3096)
+
+Found during the #3091 investigation: the PE writer synthesized each function's
+`.pdata`/`.xdata` by pattern-matching prologue bytes, and it only knew the
+small-frame shape `push rbp; mov rbp, rsp; sub rsp, imm`. A probed prologue -
+any frame over one page, emitted as the `mov r11, total` page-walk - fell out
+of the pattern after the push, so every such function's unwind record carried
+a bare `UWOP_PUSH_NONVOL RBP`: no allocation, no save codes. Anything that
+unwinds through such a frame - SEH dispatch, `RtlVirtualUnwind`-based stack
+walks, debuggers without full symbols, profilers - recovered an RSP short by
+the whole frame and read wrong non-volatile values. The #3091 field binary had
+123 such frames. Realigned frames (an over-aligned local's `and rsp, -N`)
+fared worse: no record at all.
+
+The fix is the declared-over-derived shape the target axes already use: the
+prologue's facts are known at emission, so the x64 encoder now records them -
+the push, ONE allocation of the total (the probe walk is an implementation
+detail of how RSP moved), the frame-pointer establishment for realigned
+frames, and each callee-save offset - on a per-function record that rides the
+object image through codegen re-homing and the link merge to the PE writer,
+which builds `UNWIND_INFO` from the record. The byte-matcher is deleted: a
+record-less function (frame-omitting leaf, `#[naked]`, foreign code covered by
+its own `.pdata`) contributes no unwind data, never a pattern-matched guess.
+
+The records also survive the disk object round-trip, which is not a corner: the
+test dispatcher always links from written `.o` files and warm incremental links
+do the same, so an in-memory-only record would silently vanish from exactly
+those binaries. The COFF emitter serializes the records into a mach-private
+`.mach.frames` section - name-keyed by function symbol, so the weak COMDAT
+split cannot skew them - and the parser restores and strips it. Getting there
+also surfaced that every object parser filled the caller's image field by
+field, leaving fields it predates as heap garbage; a parsed object's garbage
+`frame_count` summed to a terabyte-scale allocation that linux overcommit
+absorbed and windows commit charging refused. Parsers now zero the whole image
+at entry, closing that field-drop class for good.
+
+A structural test cross-checks every emitted prologue shape's `.xdata` against
+the prologue's own bytes, a round-trip unit test pins the `.o` seam (weak
+function included), and a windows-gated runtime suite has `RtlVirtualUnwind`
+itself recover a probed frame's caller exactly.
+
 ## [4.26.3] - 2026-08-23
 
 ### Fixed

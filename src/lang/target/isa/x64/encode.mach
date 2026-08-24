@@ -2484,13 +2484,32 @@ fun emit_stack_probe(st: *enc.EncodeState, total: usize, page_bytes: usize) {
 # record are addressed from it and belong to the caller, and after a mask only one of the
 # two pointers can still be a fixed distance from the caller's stack.
 # ---
-# st: encoder state whose byte sink the prologue bytes are appended to
-# f:  the laid-out function whose frame facts drive the reservation
-fun emit_prologue(st: *enc.EncodeState, f: *mir.MirFunction) {
+# EVERY PROLOGUE FACT IS DECLARED AS IT IS EMITTED (#3096). Each step below records
+# itself onto the function's `of.FrameUnwind` record through `enc.push_frame_step`,
+# so the object writer that needs unwind data (the PE `.xdata` producer) consumes
+# declared facts instead of re-deriving them from prologue bytes. A fixed-RSP frame
+# records RSP-based facts: the allocation total (the probe walk is one ALLOC step -
+# how RSP got there is an implementation detail) and each save's offset from the
+# final RSP. A REALIGNED frame records only the push and the frame-pointer
+# establishment (FRAME_STEP_SET_FP): after `and rsp, -N` the save slots sit at a
+# masked address with no fixed distance from either RBP or the declared allocation,
+# so no RSP- or FP-relative save offset exists to declare; an unwinder recovers
+# RSP, RBP and the return address through the frame pointer, and the callee-saved
+# VALUES in such a frame stay undeclarable until the prologue saves them before the
+# mask.
+# ---
+# st:      encoder state whose byte sink the prologue bytes are appended to
+# f:       the laid-out function whose frame facts drive the reservation
+# fn_base: `.text` offset of the function entry, for function-relative step offsets
+# ret:     ok(true) on success, or a frame-record recording error
+fun emit_prologue(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32) R.Result[bool, str] {
     val frame_size: u32     = f.frame.size;
     val callee_mask: u32    = f.callee_mask;
     val callee_mask_fp: u32 = f.callee_mask_fp;
     val outgoing_size: u32  = f.frame.outgoing_size;
+
+    val rf: R.Result[bool, str] = enc.push_frame(st, fn_base);
+    if (R.is_err[bool, str](rf)) { ret rf; }
 
     var push_rbp: isa.Inst = isa.inst_blank();
     push_rbp.opcode = x64.PUSH;
@@ -2498,6 +2517,9 @@ fun emit_prologue(st: *enc.EncodeState, f: *mir.MirFunction) {
     push_rbp.size   = 8;
     push_rbp.flags  = x64.FLAG_REX_W;
     emit_inst(st, ?push_rbp);
+    val rs_push: R.Result[bool, str] = enc.push_frame_step(st, of.FRAME_STEP_PUSH, x64.RBP::u8,
+                                                           st.buf.len::u32 - fn_base, 0);
+    if (R.is_err[bool, str](rs_push)) { ret rs_push; }
 
     var mov_rbp: isa.Inst = isa.inst_blank();
     mov_rbp.opcode = x64.MOV;
@@ -2507,7 +2529,15 @@ fun emit_prologue(st: *enc.EncodeState, f: *mir.MirFunction) {
     mov_rbp.flags  = x64.FLAG_REX_W;
     emit_inst(st, ?mov_rbp);
 
-    if (f.frame.realign != 0) {
+    val realigned: bool = f.frame.realign != 0;
+    if (realigned) {
+        # RBP == RSP here, so the frame pointer is established zero bytes above the
+        # stack pointer; from the end of this instruction on, only RBP locates the
+        # frame (the mask below moves RSP by a runtime-dependent amount).
+        val rs_fp: R.Result[bool, str] = enc.push_frame_step(st, of.FRAME_STEP_SET_FP, x64.RBP::u8,
+                                                             st.buf.len::u32 - fn_base, 0);
+        if (R.is_err[bool, str](rs_fp)) { ret rs_fp; }
+
         var and_rsp: isa.Inst = isa.inst_blank();
         and_rsp.opcode = x64.AND;
         and_rsp.dst    = isa.make_reg(x64.RSP, 8);
@@ -2535,6 +2565,15 @@ fun emit_prologue(st: *enc.EncodeState, f: *mir.MirFunction) {
             sub_rsp.flags  = x64.FLAG_REX_W;
             emit_inst(st, ?sub_rsp);
         }
+        # one allocation step for the whole reservation, probe walk or bare
+        # subtraction alike: the unwind fact is how far RSP moved, and its end
+        # offset is past the last instruction that moved it. skipped for a
+        # realigned frame, where FRAME_STEP_SET_FP above supersedes RSP tracking.
+        if (!realigned) {
+            val rs_alloc: R.Result[bool, str] = enc.push_frame_step(st, of.FRAME_STEP_ALLOC, 0,
+                                                                    st.buf.len::u32 - fn_base, total::u64);
+            if (R.is_err[bool, str](rs_alloc)) { ret rs_alloc; }
+        }
     }
 
     val sbase: i32 = slot_base_reg(f);
@@ -2547,6 +2586,14 @@ fun emit_prologue(st: *enc.EncodeState, f: *mir.MirFunction) {
     for (i < ln) {
         if ((callee_mask & (1::u32 << list[i]::u32)) != 0) {
             emit_frame_store(st, list[i], sbase, (sbias - coff::i64)::i32);
+            # the save lands at [rbp - coff] with RSP fixed `total` below RBP, so
+            # its declared frame-base offset is `total - coff`.
+            if (!realigned) {
+                val rs_save: R.Result[bool, str] = enc.push_frame_step(st, of.FRAME_STEP_SAVE, list[i]::u8,
+                                                                       st.buf.len::u32 - fn_base,
+                                                                       (total::i64 - coff::i64)::u64);
+                if (R.is_err[bool, str](rs_save)) { ret rs_save; }
+            }
             coff = coff + 8;
         }
         i = i + 1;
@@ -2560,10 +2607,17 @@ fun emit_prologue(st: *enc.EncodeState, f: *mir.MirFunction) {
     for (x < 16) {
         if ((callee_mask_fp & (1::u32 << x::u32)) != 0) {
             emit_xmm_store(st, x, sbase, (sbias - xoff::i64)::i32);
+            if (!realigned) {
+                val rs_xsave: R.Result[bool, str] = enc.push_frame_step(st, of.FRAME_STEP_SAVE_VEC, x::u8,
+                                                                        st.buf.len::u32 - fn_base,
+                                                                        (total::i64 - xoff::i64)::u64);
+                if (R.is_err[bool, str](rs_xsave)) { ret rs_xsave; }
+            }
             xoff = xoff + 16;
         }
         x = x + 1;
     }
+    ret R.ok[bool, str](true);
 }
 
 # encode the standard x86-64 function epilogue into the `.text`
@@ -2812,7 +2866,10 @@ fun encode_function(st: *enc.EncodeState, f: *mir.MirFunction) R.Result[bool, st
         if (R.is_err[bool, str](rh)) { ret rh; }
     }
 
-    if (!naked) { emit_prologue(st, f); }
+    if (!naked) {
+        val rpl: R.Result[bool, str] = emit_prologue(st, f, fn_base);
+        if (R.is_err[bool, str](rpl)) { ret rpl; }
+    }
     val rp: R.Result[bool, str] = check_accounted(st, PROLOGUE_REGION);
     if (R.is_err[bool, str](rp)) { ret rp; }
 
