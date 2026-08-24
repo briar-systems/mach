@@ -31,10 +31,24 @@ frames, and each callee-save offset - on a per-function record that rides the
 object image through codegen re-homing and the link merge to the PE writer,
 which builds `UNWIND_INFO` from the record. The byte-matcher is deleted: a
 record-less function (frame-omitting leaf, `#[naked]`, foreign code covered by
-its own `.pdata`) contributes no unwind data, never a pattern-matched guess. A
-structural test cross-checks every emitted prologue shape's `.xdata` against
-the prologue's own bytes, and a windows-gated runtime suite has
-`RtlVirtualUnwind` itself recover a probed frame's caller exactly.
+its own `.pdata`) contributes no unwind data, never a pattern-matched guess.
+
+The records also survive the disk object round-trip, which is not a corner: the
+test dispatcher always links from written `.o` files and warm incremental links
+do the same, so an in-memory-only record would silently vanish from exactly
+those binaries. The COFF emitter serializes the records into a mach-private
+`.mach.frames` section - name-keyed by function symbol, so the weak COMDAT
+split cannot skew them - and the parser restores and strips it. Getting there
+also surfaced that every object parser filled the caller's image field by
+field, leaving fields it predates as heap garbage; a parsed object's garbage
+`frame_count` summed to a terabyte-scale allocation that linux overcommit
+absorbed and windows commit charging refused. Parsers now zero the whole image
+at entry, closing that field-drop class for good.
+
+A structural test cross-checks every emitted prologue shape's `.xdata` against
+the prologue's own bytes, a round-trip unit test pins the `.o` seam (weak
+function included), and a windows-gated runtime suite has `RtlVirtualUnwind`
+itself recover a probed frame's caller exactly.
 
 ## [4.26.3] - 2026-08-23
 
