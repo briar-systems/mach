@@ -2628,6 +2628,29 @@ fun free_load_segments(alloc: *A.Allocator, segs: *of.LoadSegment, count: u32) {
 # seg_count:  number of load segments
 # func_count: out - number of function ranges produced
 # ret:        the function-range array (freed by the caller), or an error string
+# whether frame record `a` sorts after `b` in (section, offset) order
+fun frame_key_after(a: *of.FrameUnwind, b: *of.FrameUnwind) bool {
+    if (a.section != b.section) { ret a.section > b.section; }
+    ret a.offset > b.offset;
+}
+
+# binary-search the sorted frame index for the record at (section, offset),
+# returning its index into `out_img.frames` or 0xFFFFFFFF when no function
+# declared one there
+fun frame_find(out_img: *of.ObjectImage, fidx: *u32, section: u32, offset: u32) u32 {
+    if (fidx == nil || out_img.frame_count == 0) { ret 0xFFFFFFFF; }
+    var lo: u32 = 0;
+    var hi: u32 = out_img.frame_count;
+    for (lo < hi) {
+        val mid: u32 = lo + (hi - lo) / 2;
+        val fr: *of.FrameUnwind = ?out_img.frames[fidx[mid]];
+        if (fr.section == section && fr.offset == offset) { ret fidx[mid]; }
+        if (fr.section < section || (fr.section == section && fr.offset < offset)) { lo = mid + 1; }
+        or                                                                         { hi = mid; }
+    }
+    ret 0xFFFFFFFF;
+}
+
 fun build_exec_functions(alloc: *A.Allocator, out_img: *of.ObjectImage,
                          segs: *of.LoadSegment, seg_count: u32,
                          func_count: *u32) R.Result[*of.ExecFunction, str] {
@@ -2640,6 +2663,33 @@ fun build_exec_functions(alloc: *A.Allocator, out_img: *of.ObjectImage,
     }
     var funcs: *of.ExecFunction = R.unwrap_ok[*of.ExecFunction, str](ar);
     var n: u32 = 0;
+
+    # sorted (by section, then offset) index over the merged image's declared
+    # frame-unwind records, so each function symbol's record joins by binary search
+    # rather than a quadratic scan. the records arrive in module emission order,
+    # which is already nearly sorted, so the insertion sort is effectively linear.
+    var fidx: *u32 = nil;
+    if (out_img.frame_count > 0) {
+        val fr: R.Result[*u32, str] = A.allocate[u32](alloc, out_img.frame_count::usize);
+        if (R.is_err[*u32, str](fr)) {
+            A.deallocate[of.ExecFunction](alloc, funcs, out_img.symbol_count::usize);
+            ret R.err[*of.ExecFunction, str](R.unwrap_err[*u32, str](fr));
+        }
+        fidx = R.unwrap_ok[*u32, str](fr);
+        var k: u32 = 0;
+        for (k < out_img.frame_count) { fidx[k] = k; k = k + 1; }
+        k = 1;
+        for (k < out_img.frame_count) {
+            val cur: u32 = fidx[k];
+            var j: i32 = k::i32 - 1;
+            for (j >= 0 && frame_key_after(?out_img.frames[fidx[j::u32]], ?out_img.frames[cur])) {
+                fidx[(j + 1)::u32] = fidx[j::u32];
+                j = j - 1;
+            }
+            fidx[(j + 1)::u32] = cur;
+            k = k + 1;
+        }
+    }
 
     var si: u32 = 0;
     for (si < out_img.symbol_count) {
@@ -2655,9 +2705,23 @@ fun build_exec_functions(alloc: *A.Allocator, out_img: *of.ObjectImage,
         funcs[n].seg_index = seg;
         funcs[n].seg_offset = sym.offset;
         funcs[n].size = 0;
+        # attach the function's declared frame-unwind record, when one exists: the
+        # record was rebased to the same merged (section, offset) as the symbol.
+        funcs[n].step_count = 0;
+        val fmatch: u32 = frame_find(out_img, fidx, sym.section, sym.offset);
+        if (fmatch != 0xFFFFFFFF) {
+            funcs[n].step_count = out_img.frames[fmatch].step_count;
+            var sc: u32 = 0;
+            for (sc < out_img.frames[fmatch].step_count) {
+                funcs[n].steps[sc] = out_img.frames[fmatch].steps[sc];
+                sc = sc + 1;
+            }
+        }
         n = n + 1;
         si = si + 1;
     }
+
+    if (fidx != nil) { A.deallocate[u32](alloc, fidx, out_img.frame_count::usize); }
 
     if (n == 0) {
         A.deallocate[of.ExecFunction](alloc, funcs, out_img.symbol_count::usize);
@@ -4863,6 +4927,59 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
             sy = sy + 1;
         }
         m = m + 1;
+    }
+
+    # carry every declared frame-unwind record onto the output image, rebased to
+    # its merged section exactly as its function's symbol was (#3096). records are
+    # bulk-allocated rather than appended one by one: a record is an order of
+    # magnitude wider than a symbol, so the grow-by-one realloc pattern would copy
+    # quadratically. a parsed foreign image carries no records, so this walks only
+    # the codegen images' declarations.
+    var frame_total: u32 = 0;
+    m = 0;
+    for (m < module_count) { frame_total = frame_total + modules[m].frame_count; m = m + 1; }
+    if (frame_total > 0) {
+        val fa: R.Result[*of.FrameUnwind, str] = A.allocate[of.FrameUnwind](out_img.alloc, frame_total::usize);
+        if (R.is_err[*of.FrameUnwind, str](fa)) { ret R.err[bool, str](R.unwrap_err[*of.FrameUnwind, str](fa)); }
+        var out_frames: *of.FrameUnwind = R.unwrap_ok[*of.FrameUnwind, str](fa);
+        var fn: u32 = 0;
+        m = 0;
+        for (m < module_count) {
+            var fi: u32 = 0;
+            for (fi < modules[m].frame_count) {
+                val ifr: *of.FrameUnwind = ?modules[m].frames[fi];
+                if (ifr.section >= modules[m].section_count) { fi = fi + 1; cnt; }
+                val flat: u32 = sec_base[m] + ifr.section;
+                if (atom_offset_dead(atoms, flat, ifr.offset)) { fi = fi + 1; cnt; }
+                val ki: u32 = placements[flat].merged_index;
+                val out_ix: u32 = merged_to_out[ki];
+                if (out_ix == 0xFFFFFFFF) { fi = fi + 1; cnt; }
+
+                out_frames[fn] = @ifr;
+                out_frames[fn].section = out_ix;
+                out_frames[fn].offset  = placements[flat].offset
+                    + atom_live_offset(atoms, flat, ifr.offset);
+                fn = fn + 1;
+                fi = fi + 1;
+            }
+            m = m + 1;
+        }
+        if (fn == 0) {
+            A.deallocate[of.FrameUnwind](out_img.alloc, out_frames, frame_total::usize);
+        }
+        or {
+            if (fn < frame_total) {
+                val fs: R.Result[*of.FrameUnwind, str] =
+                    A.reallocate[of.FrameUnwind](out_img.alloc, out_frames, frame_total::usize, fn::usize);
+                if (R.is_err[*of.FrameUnwind, str](fs)) {
+                    A.deallocate[of.FrameUnwind](out_img.alloc, out_frames, frame_total::usize);
+                    ret R.err[bool, str](R.unwrap_err[*of.FrameUnwind, str](fs));
+                }
+                out_frames = R.unwrap_ok[*of.FrameUnwind, str](fs);
+            }
+            out_img.frames      = out_frames;
+            out_img.frame_count = fn;
+        }
     }
 
     ret R.ok[bool, str](true);
