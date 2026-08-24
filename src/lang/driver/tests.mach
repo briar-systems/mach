@@ -22276,3 +22276,283 @@ fun ut_codegen_fail_msg(s: *session.Session, root: str, tgt: str) str {
 fun ut_build_fails(s: *session.Session, root: str, tgt: str) bool {
     ret str_len(ut_codegen_fail_msg(s, root, tgt)) != 0;
 }
+
+# a manifest with one windows-x86_64 target, for the #3096 unwind-info fixture
+fun ut_w64uw_manifest() str {
+    ret "[project]\nid = \"w64uw\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.win]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\n\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n\n[artifact.w64uw]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/w64uw\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+}
+
+# the #3096 fixture: one function per emitted allocation shape - an imm8 `sub rsp`
+# (frame <= 128 bytes), an imm32 `sub rsp` (sub-page frame), and the probed
+# page-walk (frame > one page) - plus the entry that keeps them all live
+fun ut_w64uw_src() str {
+    ret "fun probe_small(x: i64) i64 {\n    var buf: [64]u8;\n    buf[0] = x::u8;\n    buf[63] = (x >> 8)::u8;\n    ret buf[0]::i64 + buf[63]::i64;\n}\n\nfun probe_mid(x: i64) i64 {\n    var buf: [4000]u8;\n    buf[0] = x::u8;\n    buf[3999] = (x >> 8)::u8;\n    ret buf[0]::i64 + buf[3999]::i64;\n}\n\nfun probe_big(x: i64) i64 {\n    var buf: [12000]u8;\n    buf[0] = x::u8;\n    buf[11999] = (x >> 8)::u8;\n    ret probe_small(buf[0]::i64) + buf[11999]::i64;\n}\n\n#[symbol(\"mainCRTStartup\")]\nfun start() i32 {\n    ret (probe_big(7) + probe_mid(9))::i32;\n}\n";
+}
+
+# build the #3096 fixture for windows-x86_64 and link it into a PE image, read back
+# as bytes (COFF has no in-memory capture path, so the link goes through a temp file
+# exactly as in ut_pe_stack_of)
+# ---
+# alloc: allocator owning the returned bytes
+# out:   out - the PE image bytes
+# ret:   true when the build and the link both succeeded
+fun ut_w64uw_image(alloc: *A.Allocator, out: *Vector[u8]) bool {
+    val sr: R.Result[session.Session, str] = session.init(alloc);
+    if (R.is_err[session.Session, str](sr)) { ret false; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = ut_w64uw_src();
+    val root_r: R.Result[str, str] = ut_scaffold_m(alloc, ut_w64uw_manifest(), ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret false; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var ok: bool = false;
+    val rr: R.Result[bool, str] = driver.setup_registry(?s.registry);
+    if (R.is_ok[bool, str](rr)) {
+        val pr: R.Result[project.Project, outcome.Fail] = driver.build_project(?s, root, "win");
+        if (R.is_ok[project.Project, outcome.Fail](pr)) {
+            var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+            if (ut_run_codegen_ok(?p) == 0) { ok = ut_w64uw_link(?p, out); }
+            project.dnit_project(?p);
+        }
+    }
+    fs.remove_all(alloc, root);
+    session.dnit(?s);
+    ret ok;
+}
+
+# link the built fixture through the shipping `linker.link_images` into a temp PE
+# file and read the bytes back
+fun ut_w64uw_link(p: *project.Project, out: *Vector[u8]) bool {
+    val alloc: *A.Allocator = p.alloc;
+    if (p.emit_len == 0) { ret false; }
+
+    val ir: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](alloc, p.emit_len::usize);
+    if (R.is_err[*of.ObjectImage, str](ir)) { ret false; }
+    val images: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](ir);
+    var missing: bool = false;
+    var i: u32 = 0;
+    for (i < p.emit_len) {
+        val m: *project.ModuleEntry = ?p.modules[(p.topo[i])::u32];
+        if (m.object_image == nil) { missing = true; }
+        or                         { images[i] = @m.object_image; }
+        i = i + 1;
+    }
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "w64uw_pe");
+    if (R.is_err[fs.TempFile, str](tf_r)) {
+        A.deallocate[of.ObjectImage](alloc, images, p.emit_len::usize);
+        ret false;
+    }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+
+    var linked: bool = false;
+    if (!missing) {
+        val lr: R.Result[bool, str] = linker.link_images(p.s, ?p.target, images,
+            p.emit_len, nil::*of.DynLib, 0, fs.temp_path(?tf)::*u8, "w64uw"::*u8,
+            linker.LINK_EXE, false, of.image_options_default(of.SUBSYSTEM_CONSOLE));
+        linked = R.is_ok[bool, str](lr);
+    }
+    A.deallocate[of.ObjectImage](alloc, images, p.emit_len::usize);
+    if (!linked) { fs.temp_close_and_remove(?tf); ret false; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret false; }
+    @out = R.unwrap_ok[Vector[u8], str](rb);
+    ret true;
+}
+
+# one PE section's placement, for the in-tree reader below
+rec UtPeSec {
+    rva:   u32;
+    vsize: u32;
+    raw:   u32;
+}
+
+# find the PE section named `name` (7 chars or fewer) in the image's section table
+fun ut_pe_find_sec(img: *Vector[u8], name: str, sec: *UtPeSec) bool {
+    if (img.len < 0x40) { ret false; }
+    val b: *u8 = img.data;
+    val pe_off: usize = ut_le32(b, 0x3C)::usize;
+    val nsec: u64 = ut_le16(b, pe_off + 4 + 2);
+    val optsz: u64 = ut_le16(b, pe_off + 4 + 16);
+    var sh: usize = pe_off + 4 + 20 + optsz::usize;
+    val nlen: usize = str_len(name);
+    if (nlen > 7) { ret false; }
+    val np: *u8 = name::*u8;
+    var i: u64 = 0;
+    for (i < nsec) {
+        if (sh + 40 > img.len) { ret false; }
+        var matches: bool = true;
+        var k: usize = 0;
+        for (k < nlen) {
+            if (b[sh + k] != np[k]) { matches = false; }
+            k = k + 1;
+        }
+        if (matches && b[sh + nlen] == 0) {
+            sec.vsize = ut_le32(b, sh + 8)::u32;
+            sec.rva   = ut_le32(b, sh + 12)::u32;
+            sec.raw   = ut_le32(b, sh + 20)::u32;
+            ret true;
+        }
+        sh = sh + 40;
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the file offset of `rva` inside `sec`, or -1 when it lies outside it
+fun ut_pe_sec_off(sec: *UtPeSec, rva: u32) i64 {
+    if (rva < sec.rva) { ret -1; }
+    ret sec.raw::i64 + (rva - sec.rva)::i64;
+}
+
+# EVERY function's `.xdata` declares its full prologue, checked against the
+# prologue bytes themselves (#3096)
+#
+# WHY THIS TEST EXISTS. The PE writer used to synthesize unwind info by
+# pattern-matching prologue bytes, and only knew the small-frame shape
+# `push rbp; mov rbp, rsp; sub rsp, imm`: a probed prologue (any frame over one
+# page - the `mov r11, total` page-walk) fell out of the pattern after the push,
+# so the function's RUNTIME_FUNCTION understated the frame to a bare
+# UWOP_PUSH_NONVOL and anything unwinding through it (SEH dispatch,
+# RtlVirtualUnwind, a profiler) computed a wrong RSP. The encoder now DECLARES
+# each prologue's unwind facts and the writer consumes the record.
+#
+# WHAT MAKES IT UNFAKEABLE. The expected allocation is read from the emitted
+# prologue itself - the `sub rsp, imm` immediate or the probe walk's
+# `mov r11, total` - and the `.xdata` alloc code must equal it EXACTLY, so the
+# assertion is a cross-check of two independent paths (the bytes the encoder
+# emitted vs the record it declared), not a golden constant that drifts with
+# frame layout. Every prologue shape the x64 backend can emit must parse: an
+# unknown shape fails the test rather than being skipped, which is what keeps a
+# future prologue change from silently escaping the check - the role the deleted
+# byte-matcher could only fake, since it was itself the thing under suspicion.
+test "mach.lang.driver:w64_xdata_declares_every_prologue_shape" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+
+    var img: Vector[u8];
+    if (!ut_w64uw_image(?alloc, ?img)) { ret 2; }
+
+    var text_sec: UtPeSec;
+    var pdata_sec: UtPeSec;
+    var xdata_sec: UtPeSec;
+    if (!ut_pe_find_sec(?img, ".text", ?text_sec))   { ret 3; }
+    if (!ut_pe_find_sec(?img, ".pdata", ?pdata_sec)) { ret 4; }
+    if (!ut_pe_find_sec(?img, ".xdata", ?xdata_sec)) { ret 5; }
+
+    val b: *u8 = img.data;
+    val n: u32 = pdata_sec.vsize / 12;
+    # the entry plus the three probe shapes, at least.
+    if (n < 4) { ret 6; }
+
+    var saw_imm8: u32 = 0;
+    var saw_imm32: u32 = 0;
+    var saw_probed: u32 = 0;
+
+    var i: u32 = 0;
+    for (i < n) {
+        val row: usize = pdata_sec.raw::usize + i::usize * 12;
+        val begin: u32 = ut_le32(b, row)::u32;
+        val fin: u32 = ut_le32(b, row + 4)::u32;
+        val uw_rva: u32 = ut_le32(b, row + 8)::u32;
+        if (begin == 0 || fin <= begin) { ret 7; }
+
+        val fo_s: i64 = ut_pe_sec_off(?text_sec, begin);
+        if (fo_s < 0) { ret 8; }
+        val fo: usize = fo_s::usize;
+
+        # ground truth from the prologue bytes: push rbp; mov rbp, rsp; then the
+        # allocation in one of the three emitted forms.
+        if (b[fo] != 0x55)                                                { ret 9; }
+        if (b[fo + 1] != 0x48 || b[fo + 2] != 0x89 || b[fo + 3] != 0xE5)  { ret 10; }
+        var total: u64 = 0;
+        var alloc_end: u32 = 0;
+        if (b[fo + 4] == 0x48 && b[fo + 5] == 0x83 && b[fo + 6] == 0xEC) {
+            total = b[fo + 7]::u64;
+            alloc_end = 8;
+            saw_imm8 = saw_imm8 + 1;
+        }
+        or (b[fo + 4] == 0x48 && b[fo + 5] == 0x81 && b[fo + 6] == 0xEC) {
+            total = ut_le32(b, fo + 7);
+            alloc_end = 11;
+            saw_imm32 = saw_imm32 + 1;
+        }
+        or (b[fo + 4] == 0x49 && b[fo + 5] == 0xC7 && b[fo + 6] == 0xC3) {
+            total = ut_le32(b, fo + 7);
+            # the walk ends at its `sub rsp, r11` (4C 29 DC); find it.
+            var k: u32 = 11;
+            for (k < 64 && alloc_end == 0) {
+                if (b[fo + k::usize] == 0x4C && b[fo + k::usize + 1] == 0x29 && b[fo + k::usize + 2] == 0xDC) {
+                    alloc_end = k + 3;
+                }
+                k = k + 1;
+            }
+            if (alloc_end == 0) { ret 11; }
+            saw_probed = saw_probed + 1;
+        }
+        or { ret 12; }  # a prologue shape this test does not know - teach it, don't skip it
+
+        # the declared record, from .xdata.
+        val xo_s: i64 = ut_pe_sec_off(?xdata_sec, uw_rva);
+        if (xo_s < 0) { ret 13; }
+        val xo: usize = xo_s::usize;
+        if (b[xo] != 0x01)  { ret 14; }  # version 1, no flags
+        val psz: u32 = b[xo + 1]::u32;
+        val cnt: u32 = b[xo + 2]::u32;
+        if (b[xo + 3] != 0) { ret 15; }  # fixed-RSP frames declare no frame register
+        if (psz < alloc_end) { ret 16; }
+
+        var push_rbp_ok: bool = false;
+        var alloc_codes: u32 = 0;
+        var alloc_size: u64 = 0;
+        var alloc_at: u32 = 0;
+        var j: u32 = 0;
+        for (j < cnt) {
+            val slot: usize = xo + 4 + j::usize * 2;
+            val eo: u32 = b[slot]::u32;
+            val op: u8 = b[slot + 1] & 0x0F;
+            val info: u8 = b[slot + 1] >> 4;
+            if (eo > psz) { ret 17; }
+            if (op == 0) {
+                if (info == 5 && eo == 1) { push_rbp_ok = true; }
+            }
+            or (op == 2) {
+                alloc_codes = alloc_codes + 1;
+                alloc_size = (info::u64 + 1) * 8;
+                alloc_at = eo;
+            }
+            or (op == 1) {
+                alloc_codes = alloc_codes + 1;
+                if (info == 0) { alloc_size = ut_le16(b, xo + 4 + (j::usize + 1) * 2) * 8; j = j + 1; }
+                or             { alloc_size = ut_le32(b, xo + 4 + (j::usize + 1) * 2);     j = j + 2; }
+                alloc_at = eo;
+            }
+            or (op == 4 || op == 8) { j = j + 1; }  # SAVE_NONVOL / SAVE_XMM128: one operand slot
+            or (op == 5 || op == 9) { j = j + 2; }  # the far forms: two operand slots
+            or (op == 3) { }                        # SET_FPREG carries no operand slot
+            or { ret 18; }                          # an unwind code this test does not know
+            j = j + 1;
+        }
+
+        if (!push_rbp_ok)          { ret 19; }
+        # THE HEART OF #3096: exactly one allocation code, of exactly the total the
+        # prologue's own bytes moved RSP by, ending where the allocation ended.
+        if (alloc_codes != 1)      { ret 20; }
+        if (alloc_size != total)   { ret 21; }
+        if (alloc_at != alloc_end) { ret 22; }
+
+        i = i + 1;
+    }
+
+    # all three allocation shapes were present and checked.
+    if (saw_imm8 == 0 || saw_imm32 == 0 || saw_probed == 0) { ret 23; }
+
+    vector.dnit[u8](?img);
+    ret 0;
+}
