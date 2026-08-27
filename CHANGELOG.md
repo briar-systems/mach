@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+#### target(linux): dynamic ELF loader and shared inputs ignored the selected ISA (#3104)
+
+Linux dynamic executables now record glibc's ISA-specific interpreter path for
+x86_64, aarch64, and riscv64. ELF shared inputs are also checked against the
+selected target's `e_machine`, so cross-links reject host-architecture libraries
+instead of retaining their SONAME in an invalid target image.
+
 ## [4.26.4] - 2026-08-23
 
 ### Fixed
