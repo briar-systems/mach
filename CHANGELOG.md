@@ -196,6 +196,7 @@ The pin moves from 0.28.1 to 0.37.1.
 
 #### Driver and build
 
+- Root dependency overrides select the realization's source kind, URL and exact selector before verification, including when a transitive edge is visited first (#3138).
 - A required artifact planned under `mach test` was built as a test cell.
 - `--quiet` on `mach build` was ignored.
 - `BuildPlan` borrowed its request.
