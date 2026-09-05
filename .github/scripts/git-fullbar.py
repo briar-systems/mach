@@ -12,9 +12,9 @@ out = root / 'fullbar-evidence'
 out.mkdir(exist_ok=True)
 fixed = root / '.wt/fullbar-fixed'
 base = root / '.wt/fullbar-base'
-commit = 'c846f69bda4f83cf4d3dbea9e0fc24eaf7f2442a'
-base_commit = 'a958714e22ece193af642928bd3d25dc7798be58'
-pin = '565f40abf76275e149eb9ce43ad950fdd992fd20'
+commit = os.environ['AUDIT_COMMIT']
+base_commit = 'b89e87e917af41898c5ed378b374506ba0f42731'
+pins = {'fixed': 'aac7012d2c6b01dfcb7c7d1db677b0d762a4f955', 'base': '565f40abf76275e149eb9ce43ad950fdd992fd20'}
 results = []
 pattern = r'^(\S*/)?(mach|m[0-9A-Za-z]*|A|B|C|D)(\.exe)? (build|test)( |$)'
 
@@ -24,7 +24,7 @@ def census():
         f.write(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) + '\n' + p.stdout)
     assert p.returncode == 1, 'compiler census not empty: ' + p.stdout
 
-def run(name, command, cwd=fixed, counts=None, limit=600, compiler=False):
+def run(name, command, cwd=fixed, counts=None, limit=600, compiler=False, expected=None):
     if compiler:
         census()
     start = time.monotonic()
@@ -41,7 +41,7 @@ def run(name, command, cwd=fixed, counts=None, limit=600, compiler=False):
             code = 124
     body = log.read_text()
     summaries = re.findall(r'(\d+) passed, (\d+) failed, (\d+) total', body)
-    good = code == 0 and (counts is None or summaries == [tuple(map(str, counts))])
+    good = code == 0 and (counts is None or summaries == [tuple(map(str, counts))]) and (expected is None or expected in body)
     result = dict(name=name, code=code, seconds=round(time.monotonic()-start, 3), summaries=summaries, passed=good)
     results.append(result)
     (out / 'results.json').write_text(json.dumps(results, indent=2))
@@ -66,7 +66,7 @@ require('base-checkout', ['git', 'worktree', 'add', '--detach', base, base_commi
 for label, checkout, expected in [('fixed', fixed, commit), ('base', base, base_commit)]:
     require(label + '-pin', ['git', 'submodule', 'update', '--init', 'dep/std'], checkout)
     assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=checkout, text=True).strip() == expected
-    assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=checkout / 'dep/std', text=True).strip() == pin
+    assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=checkout / 'dep/std', text=True).strip() == pins[label]
     require(label + '-clean', ['git', 'diff', '--exit-code'], checkout)
 seed = root / '.mach-seed/mach'
 try:
@@ -74,8 +74,8 @@ try:
     require('A-B', [fixed / 'A', 'build', '.', '-o', 'B'], compiler=True)
     require('B-C', [fixed / 'B', 'build', '.', '-o', 'C'], compiler=True)
     identity('debug-fixpoint', fixed / 'B', fixed / 'C')
-    run('compiler-debug-suite', [fixed / 'B', 'test', '.'], counts=(2458, 0, 2458), compiler=True)
-    run('compiler-release-suite', [fixed / 'B', 'test', '.', '--profile', 'release'], counts=(2458, 0, 2458), compiler=True)
+    run('compiler-debug-suite', [fixed / 'B', 'test', '.'], counts=(2471, 0, 2471), compiler=True)
+    run('compiler-release-suite', [fixed / 'B', 'test', '.', '--profile', 'release'], counts=(2471, 0, 2471), compiler=True)
     require('seed-release-A', [seed, 'build', '.', '--profile', 'release', '-o', 'release-A'], compiler=True)
     require('release-A-B', [fixed / 'release-A', 'build', '.', '--profile', 'release', '-o', 'release-B'], compiler=True)
     require('release-B-C', [fixed / 'release-B', 'build', '.', '--profile', 'release', '-o', 'release-C'], compiler=True)
@@ -84,11 +84,12 @@ try:
     census_lines = (out / 'structural-censuses.log').read_text()
     assert len(re.findall(r'^census .*: ok', census_lines, re.M)) == 9
     gate = out / 'compiler-gate'
-    gate.write_text('#!/bin/bash\nset -euo pipefail\npattern=' + "'" + pattern + "'" + '\nif pgrep -af "$pattern"; then echo "compiler census not empty" >&2; exit 75; fi\nexec "' + str(fixed / 'B') + '" "$@"\n')
+    gate.write_text('#!/bin/bash\nset -euo pipefail\npattern=' + "'" + pattern + "'" + '\ndate -u +census:%Y-%m-%dT%H:%M:%SZ\nif pgrep -af "$pattern"; then echo "compiler census not empty" >&2; exit 75; fi\nexec "' + str(fixed / 'B') + '" "$@"\n')
     gate.chmod(0o755)
     run('determinism', ['bash', 'test/determinism.sh', gate, '.'])
+    run('native-link', ['env', 'MACH_LINK_MACH=' + str(gate), 'bash', 'test/link/run.sh', '--leg', 'x86_64-linux', '--deps', 'pin'], expected='link: 124 pass / 0 fail / 0 skip over 124 cell(s)')
     require('std-build', [fixed / 'B', 'build', '.'], fixed / 'dep/std', compiler=True)
-    run('std-suite', [fixed / 'B', 'test', '.'], fixed / 'dep/std', counts=(1092, 0, 1092), compiler=True)
+    run('std-suite', [fixed / 'B', 'test', '.'], fixed / 'dep/std', counts=(1108, 0, 1108), compiler=True)
     require('baseline-compiler', [seed, 'build', '.', '-o', 'A'], base, compiler=True)
     for target in ['linux-x86_64', 'linux-arm64', 'linux-riscv64']:
         old = 'identity-old-' + target
