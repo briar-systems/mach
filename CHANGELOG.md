@@ -203,6 +203,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 #### Driver and build
 
+- `mach run` validates artifact execution through the native command boundary, allowing Windows executables while retaining Unix execute-permission and native image rejection (#3184).
+
 - Native driver fixtures resolve host executables, compare complete native paths, select a genuinely foreign target and check both sides of target-gated orphan collection (#3176).
 
 - Initialization stops on inventory path allocation failure instead of publishing a file above its intended nested destination (#3171).
