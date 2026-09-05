@@ -795,9 +795,10 @@ Because a step has no filter of its own, the condition for running it lives in t
 link entry that demands it: on a build cell where that entry filters out, the step
 is never demanded and never runs.
 
-A step is cached by content: its `in` contents plus its expanded `argv` fingerprint
-the step (the query engine's `Q_LINK_CONFIG` pattern). An unchanged step whose
-outputs still exist is skipped; change an input or the command and it re-runs.
+A step is cached by content: its declared inputs, resolved executable, expanded
+arguments, and effective environment contribute to its fingerprint. An unchanged
+step whose outputs still exist is skipped. Changing an inherited environment
+value received by the child also invalidates the step.
 
 **Bounding a step.** `timeout_seconds` gives the step a deadline measured from
 the moment it is spawned. When the deadline passes, the step's whole process
@@ -852,9 +853,11 @@ distinct sibling such as `{project.out}/vendor/<library>/`.
 build cell's target tuple as `MACH_TARGET_ISA`, `MACH_TARGET_OS`, and
 `MACH_TARGET_ABI`, so the script `argv` invokes can branch on the target
 without threading it through the template — e.g. `cc --target=$MACH_TARGET_ISA-…`.
-The step's environment is the planner's environment with those three variables
-**replaced**, never appended: a `MACH_TARGET_*` value inherited from an
-enclosing build is overwritten by the cell's own. The same three values are
+The step inherits the planner's environment, then applies its declared `env`
+values, then assigns those three target variables. Names use host identity:
+case-sensitive on Unix and ordinal case-insensitive on Windows, including Unicode
+names. Each name has one value. A `MACH_TARGET_*` value inherited from an enclosing
+build or declared by the step is overwritten by the cell's own. The same three values are
 available in the `argv` templates as the `{target.*}` keys (see
 [Path templates](#path-templates)).
 
