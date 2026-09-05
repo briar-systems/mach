@@ -500,7 +500,7 @@ removed; use -O0 or -O2`).
 
 ## `[artifact.<name>]`
 
-Every artifact is declared explicitly and named by its table key. `$project.name`
+Every artifact is declared explicitly and named by its table key. `$bin.name`
 reads the selected artifact's name.
 
 | Key       | Required | Meaning |
