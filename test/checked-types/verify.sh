@@ -38,8 +38,13 @@ trap 'rm -rf "$work"' EXIT
 git init -q "$work"
 mkdir -p "$work/project" "$work/provider" "$work/std"
 sed 's|path = "provider"|path = "../provider"|' "$here/mach.toml" > "$work/project/mach.toml"
+cat >> "$work/project/mach.toml" <<'EOF'
+
+[dep.std]
+path = "../std"
+EOF
 cp -R "$here/src" "$work/project/"
-sed 's|path = "../../../dep/std"|path = "../std"|' "$here/provider/mach.toml" > "$work/provider/mach.toml"
+cp "$here/provider/mach.toml" "$work/provider/"
 cp -R "$root/src" "$work/provider/"
 cp "$root/dep/std/mach.toml" "$work/std/"
 cp -R "$root/dep/std/src" "$work/std/"
