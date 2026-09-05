@@ -23,7 +23,12 @@ if [ "$("$cc" info --version)" != "$compiler_ver" ]; then
 fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-mkdir -p "$work/src"
+git init -q "$work"
+mkdir -p "$work/project/src" "$work/mach" "$work/std"
+cp "$root/mach.toml" "$work/mach/"
+cp -R "$root/src" "$work/mach/"
+cp "$root/dep/std/mach.toml" "$work/std/"
+cp -R "$root/dep/std/src" "$work/std/"
 
 case "$(uname -m)" in
     x86_64)  isa=x86_64; abi=sysv64 ;;
@@ -31,7 +36,7 @@ case "$(uname -m)" in
     *) echo "version-vendor.sh: unsupported host architecture" >&2; exit 2 ;;
 esac
 
-cat > "$work/mach.toml" <<EOF
+cat > "$work/project/mach.toml" <<EOF
 [project]
 id = "mach-version-vendor-test"
 version = "mach-version-vendor-test"
@@ -57,14 +62,13 @@ link = []
 need = []
 
 [dep.mach]
-path = "$root"
+path = "../mach"
 
 [dep.std]
-git = "https://github.com/briar-systems/mach-std"
-ref = "branch/main"
+path = "../std"
 EOF
 
-cat > "$work/src/main.mach" <<EOF
+cat > "$work/project/src/main.mach" <<EOF
 use std.runtime;
 use std.types.string.str_equals;
 use std.types.size.usize;
@@ -84,10 +88,10 @@ test "mach.lang.version:vendored_context" {
 fun main(argc: usize, argv: *str) i64 { ret dispatch(argc, argv); }
 EOF
 
-cd "$work"
+cd "$work/project"
 "$cc" dep pull
-vendored_cli="$work/vendored-mach"
-"$cc" build . -o "$vendored_cli"
+vendored_cli=./vendored-mach
+"$cc" build . -o vendored-mach
 if [ "$("$vendored_cli" info --version)" != "$compiler_ver" ]; then
     echo "version-vendor.sh: built vendored CLI reports the embedding project version" >&2
     exit 1
