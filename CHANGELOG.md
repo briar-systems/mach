@@ -158,6 +158,7 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 #### Middle end
 
+- Floating remainder preserves negative zero when a negative exact multiple is reduced to zero, matching comptime evaluation at both float widths (#3164).
 - The vectorizer could mutate the function and then decline, and its remainder guard hardcoded a signed compare over a wrapping bound.
 - Loop versioning's disjointness check authorized the fast path on aliasing memory when a bound wrapped.
 - A once-called callee whose address escapes was inlined as free, and a small callee could be duplicated without bound.
