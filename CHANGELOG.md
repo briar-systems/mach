@@ -128,6 +128,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 ### Fixed
 
+- Darwin CI installs the Homebrew LLVM formula selected by the committed oracle major, so a newer Homebrew stable release cannot break the pinned disassembly lane (#3181).
+
 #### Language and frontend
 
 - `?` on a temporary (a call result, literal, cast, operator result, array, record or vector literal, or a field or element of one) is refused, naming the operand kind. It used to compile to a pointer into dead stack.
