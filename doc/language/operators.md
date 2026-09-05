@@ -14,8 +14,9 @@ val q: f32    = 1.5 * 2.0;
 `%` is the remainder. On integers it is the native truncated remainder, taking
 the sign of the dividend (`-7 % 3 == -1`). On floats it is the truncated (C
 `fmod`) remainder `a - trunc(a / b) * b`, likewise taking the sign of the
-dividend (`5.5 % 3.0 == 2.5`, `-5.5 % 3.0 == -2.5`). The exact float result is
-defined for `|a / b| < 2^63`.
+dividend (`5.5 % 3.0 == 2.5`, `-5.5 % 3.0 == -2.5`). For finite operands and a
+nonzero divisor, this applies across the finite operand range, including
+quotients beyond the `i64` range.
 
 ```mach
 val r: f64 = 5.5 % 3.0;      # 2.5
