@@ -7,11 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [4.30.0] - Unreleased
 
-The compatible transition release. Every language and manifest form 4.26.x
-accepted is still accepted, the new forms are accepted beside them, and 4.30.0
-becomes the seed that builds 5.0.0. Two CLI flags are gone, listed under
-"Removed". Everything else that goes away is listed under "Planned for 5.0.0"
-at the end of this section.
+The transition release that becomes the seed for 5.0.0. Replacement language
+and manifest forms ship alongside the legacy forms retained for migration
+until 5.0.0. This is not a guarantee that every previously accepted project
+still builds:
+two CLI flags are removed, compiler and manifest checks reject invalid forms
+that previously passed, and MOS 6502 is unavailable for ordinary builds.
+The "Changed", "Fixed", and "Removed" sections describe those compatibility
+limits, including the refusal to take addresses of temporaries.
 
 ### Added
 
@@ -48,7 +51,7 @@ at the end of this section.
 
 #### Standard library
 
-The pin moves from 0.28.1 to 0.37.1.
+The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 - 0.28.2: `Vector[T]` clears released storage metadata and survives repeated teardown.
 - 0.31.0: libc-free linkage. An ordinary linux binary carries no `PT_INTERP` and no dynamic section, and the compiler adopts the normalized io error surface.
@@ -59,6 +62,7 @@ The pin moves from 0.28.1 to 0.37.1.
 - 0.36.1: `R.void_of`, narrowing a result to `Void`.
 - 0.37.0: the `transaction.prepare` producer returns `Result[Void, str]`. The `ok(false)` abort arm is gone and `err` is the only abort.
 - 0.37.1: `root_remove_tree`, root-anchored recursive removal with a depth bound of 256.
+- 0.37.2: the TOML inline-table conflict path frees its parsed value through a local binding instead of taking the address of a call result. A heap-owning string test covers the release.
 
 ### Changed
 
@@ -197,6 +201,7 @@ The pin moves from 0.28.1 to 0.37.1.
 #### Driver and build
 
 - CI's vendored-version and checked-type fixtures use contained source snapshots at the compiler's std pin, and release additivity builds use project-relative output paths (#3135).
+- Root dependency overrides select the realization's source kind, URL and exact selector before verification, including when a transitive edge is visited first (#3138).
 - A required artifact planned under `mach test` was built as a test cell.
 - `--quiet` on `mach build` was ignored.
 - `BuildPlan` borrowed its request.
@@ -224,7 +229,9 @@ The pin moves from 0.28.1 to 0.37.1.
 - A `mach.lock` file is rejected with a migration diagnostic.
 - `$mach.abi.sysv` is removed. Write `sysv64`.
 - Several targets, profiles, or artifacts with none marked `default = true` are refused.
-- `[project].name`, `description`, `mach` and `[profile].emit_ir`, `emit_asm` are refused.
+- `[project].name`, `description`, `mach` and `[profile.*].emit_ir`, `emit_asm` are refused.
+- `$project.name` and `$project.description` are removed with those manifest keys (#3128).
+- An artifact-less dependency no longer gets an implicit `lib.mach` entry. Declare an explicitly defaulted library artifact.
 - An `#[embed]` path outside the project root is refused.
 - The MOS 6502 target is deleted.
 - `mach dep update` proposes SemVer selection among tagged releases within one major and above every tested floor.
