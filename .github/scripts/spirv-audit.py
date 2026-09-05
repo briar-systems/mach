@@ -51,3 +51,51 @@ for name, compiler in [("seed", seed), ("audit", audit / "A")]:
     subprocess.run(["git", "diff", "--exit-code"], check=True)
     subprocess.run(["git", "diff", "--exit-code"], cwd=audit, check=True)
 (evidence / "results.json").write_text(json.dumps(results, indent=2))
+
+cfg = audit / 'src/lang/target/isa/spirv/cfg.mach'
+pristine = cfg.read_text()
+regression = '''
+test "mach.lang.target.isa.spirv.cfg.analyze:floating_remainder_shared_gate_shape" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var ops: [11]mir.MirOperand;
+    var instrs: [6]mir.MirInstr;
+    t_cbr(?instrs[0], ?ops[0], 1, 2);
+    t_br(?instrs[1], ?ops[3], 5);
+    t_cbr(?instrs[2], ?ops[4], 3, 4);
+    t_cbr(?instrs[3], ?ops[7], 1, 4);
+    t_br(?instrs[4], ?ops[10], 5);
+    t_ret(?instrs[5]);
+    var blocks: [6]mir.MirBlock;
+    var i: u32 = 0;
+    for (i < 6) { t_block(?blocks[i], i, ?instrs[i]); i = i + 1; }
+    var f: mir.MirFunction;
+    f.blocks = ?blocks[0]; f.block_count = 6; f.vreg_count = 1;
+    val r: R.Result[Structure, str] = analyze(?f, ?alloc);
+    if (R.is_err[Structure, str](r)) { ret 1; }
+    var st: Structure = R.unwrap_ok[Structure, str](r);
+    var bad: i32 = 0;
+    print.printlnf("shared gate status={} at={} to={}", st.status, st.at, st.to);
+    if (st.status != CFG_OK) { bad = 2; }
+    dnit(?st);
+    ret bad;
+}
+'''
+try:
+    cfg.write_text('use std.print;\n' + pristine + regression)
+    assert subprocess.run(['pgrep', '-af', pattern]).returncode == 1
+    command = [audit / 'A', 'test', '.', '--filter', 'mach.lang.target.isa.spirv.cfg.analyze:floating_remainder_shared_gate_shape']
+    with (evidence / 'shared-gate.log').open('w') as log:
+        p = subprocess.Popen(command, cwd=audit, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            code = p.wait(timeout=300)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
+            raise AssertionError('shared-gate diagnosis timed out')
+    body = (evidence / 'shared-gate.log').read_text()
+    assert code == 1 and '0 passed, 1 failed, 1 total' in body and '(exit 2)' in body, body
+    print(body, flush=True)
+finally:
+    cfg.write_text(pristine)
+    subprocess.run(['git', 'diff', '--exit-code'], cwd=audit, check=True)
