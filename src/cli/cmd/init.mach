@@ -486,8 +486,12 @@ fun staged_identity_of(t: *txn.Transaction) R.Result[txn.Identity, str] {
     ret R.ok[txn.Identity, str](R.unwrap_ok[txn.Identity, txn.Error](r));
 }
 
-fun sweep_root(a: *A.Allocator, cap: *txn.Root) {
-    txn.recover(a, cap, "");
+fun sweep_root(a: *A.Allocator, cap: *txn.Root) O.Option[str] {
+    val swept: R.Result[usize, txn.Error] = txn.recover(a, cap, "");
+    if (R.is_err[usize, txn.Error](swept)) {
+        ret O.some[str](txn_msg(R.unwrap_err[usize, txn.Error](swept)));
+    }
+    ret O.none[str]();
 }
 
 fun src_dir_rel(a: *A.Allocator, dir_rel: str) R.Result[str, str] {
@@ -574,6 +578,16 @@ fun resolve_commit_cleanup(a: *A.Allocator, cap: *txn.Root, backup_leaf: str) O.
     ret unlink_entry(cap, backup_leaf);
 }
 
+fun finish_committed_cleanup(a: *A.Allocator, root_cap: *txn.Root,
+                            src_cap: *txn.Root, entry_backup: str) O.Option[str] {
+    var failure: O.Option[str] = resolve_commit_cleanup(a, root_cap, BACKUP_MANIFEST);
+    if (O.is_none[str](failure)) { failure = resolve_commit_cleanup(a, src_cap, entry_backup); }
+    if (O.is_none[str](failure)) { failure = sweep_root(a, src_cap); }
+    if (O.is_none[str](failure)) { failure = sweep_root(a, root_cap); }
+    if (O.is_none[str](failure)) { failure = unlink_entry(root_cap, JOURNAL_LEAF); }
+    ret failure;
+}
+
 val OUTPUT_ORIGINAL: i32 = 0;
 val OUTPUT_DONE:     i32 = 1;
 val OUTPUT_ANOMALY:  i32 = -1;
@@ -617,6 +631,12 @@ fun recover_existing(a: *A.Allocator, root: str, dir_rel: str, root_cap: *txn.Ro
     val src_now_r: R.Result[txn.EntryProbe, str] = probe_entry(root_cap, "src");
     if (R.is_err[txn.EntryProbe, str](src_now_r)) { ret R.err[i32, str](R.unwrap_err[txn.EntryProbe, str](src_now_r)); }
     val src_now: txn.EntryProbe = R.unwrap_ok[txn.EntryProbe, str](src_now_r);
+    if (src_now.present && !src_now.is_directory) {
+        ret R.err[i32, str]("init journal: src is no longer a directory");
+    }
+    if (!src_now.present && j.entry_had_identity) {
+        ret R.err[i32, str]("init journal: src is missing for an original entry");
+    }
 
     var have_src_cap: bool = false;
     var src_cap: txn.Root;
@@ -644,26 +664,24 @@ fun recover_existing(a: *A.Allocator, root: str, dir_rel: str, root_cap: *txn.Ro
     }
 
     if (overall_done) {
-        resolve_commit_cleanup(a, root_cap, BACKUP_MANIFEST);
-        if (have_src_cap) {
-            resolve_commit_cleanup(a, ?src_cap, entry_backup);
-            sweep_root(a, ?src_cap);
-            txn.root_dnit(?src_cap);
-        }
-        sweep_root(a, root_cap);
-        unlink_entry(root_cap, JOURNAL_LEAF);
+        val cleanup: O.Option[str] = finish_committed_cleanup(a, root_cap, ?src_cap, entry_backup);
+        txn.root_dnit(?src_cap);
+        if (O.is_some[str](cleanup)) { ret R.err[i32, str](O.unwrap[str](cleanup)); }
         ret R.ok[i32, str](RECOVER_COMPLETED);
     }
 
-    resolve_rollback(a, root_cap, util.PROJECT_CONFIG_NAME, BACKUP_MANIFEST, j.manifest_had_identity);
+    var failure: O.Option[str] = resolve_rollback(a, root_cap, util.PROJECT_CONFIG_NAME, BACKUP_MANIFEST, j.manifest_had_identity);
     if (have_src_cap) {
-        resolve_rollback(a, ?src_cap, entry_leaf, entry_backup, j.entry_had_identity);
-        sweep_root(a, ?src_cap);
+        if (O.is_none[str](failure)) {
+            failure = resolve_rollback(a, ?src_cap, entry_leaf, entry_backup, j.entry_had_identity);
+        }
+        if (O.is_none[str](failure)) { failure = sweep_root(a, ?src_cap); }
         txn.root_dnit(?src_cap);
     }
-    if (j.src_dir_created) { rmdir_entry(root_cap, "src"); }
-    sweep_root(a, root_cap);
-    unlink_entry(root_cap, JOURNAL_LEAF);
+    if (O.is_none[str](failure) && j.src_dir_created) { failure = rmdir_entry(root_cap, "src"); }
+    if (O.is_none[str](failure)) { failure = sweep_root(a, root_cap); }
+    if (O.is_none[str](failure)) { failure = unlink_entry(root_cap, JOURNAL_LEAF); }
+    if (O.is_some[str](failure)) { ret R.err[i32, str](O.unwrap[str](failure)); }
     ret R.ok[i32, str](RECOVER_ROLLED_BACK);
 }
 
@@ -860,7 +878,12 @@ fun run_existing_branch(a: *A.Allocator, root: str, dir_rel: str, id: *u8, is_li
     val entry_commit_err: O.Option[str] = commit_owned(a, ?src_cap, ?entry_pf, entry_probe.present, entry_leaf::str, entry_backup);
     if (O.is_some[str](entry_commit_err)) {
         print.eprint("error: "); print.eprint(O.unwrap[str](entry_commit_err)); print.eprint("\n");
-        recover_existing(a, root, dir_rel, ?root_cap);
+        txn.abort(?manifest_pf);
+        val recovered: R.Result[i32, str] = recover_existing(a, root, dir_rel, ?root_cap);
+        if (R.is_err[i32, str](recovered)) {
+            print.eprint("error: "); print.eprint(R.unwrap_err[i32, str](recovered));
+            print.eprint(" (recovery required; inspect the destination before retrying)\n");
+        }
         txn.root_dnit(?src_cap); txn.root_dnit(?root_cap);
         ret 2;
     }
@@ -868,19 +891,23 @@ fun run_existing_branch(a: *A.Allocator, root: str, dir_rel: str, id: *u8, is_li
     val manifest_commit_err: O.Option[str] = commit_owned(a, ?root_cap, ?manifest_pf, manifest_probe.present, util.PROJECT_CONFIG_NAME, BACKUP_MANIFEST);
     if (O.is_some[str](manifest_commit_err)) {
         print.eprint("error: "); print.eprint(O.unwrap[str](manifest_commit_err)); print.eprint("\n");
-        recover_existing(a, root, dir_rel, ?root_cap);
+        val recovered: R.Result[i32, str] = recover_existing(a, root, dir_rel, ?root_cap);
+        if (R.is_err[i32, str](recovered)) {
+            print.eprint("error: "); print.eprint(R.unwrap_err[i32, str](recovered));
+            print.eprint(" (recovery required; inspect the destination before retrying)\n");
+        }
         txn.root_dnit(?src_cap); txn.root_dnit(?root_cap);
         ret 2;
     }
 
-    resolve_commit_cleanup(a, ?src_cap, entry_backup);
-    resolve_commit_cleanup(a, ?root_cap, BACKUP_MANIFEST);
-    sweep_root(a, ?src_cap);
-    sweep_root(a, ?root_cap);
-    unlink_entry(?root_cap, JOURNAL_LEAF);
-
+    val cleanup: O.Option[str] = finish_committed_cleanup(a, ?root_cap, ?src_cap, entry_backup);
     txn.root_dnit(?src_cap);
     txn.root_dnit(?root_cap);
+    if (O.is_some[str](cleanup)) {
+        print.eprint("error: "); print.eprint(O.unwrap[str](cleanup));
+        print.eprint(" (recovery required; inspect the destination before retrying)\n");
+        ret 2;
+    }
 
     if (!quiet) {
         print.eprint("created project '");
@@ -1942,6 +1969,283 @@ test "mach.cli.cmd.init.recover_existing:rollback_deletes_a_freshly_committed_ou
     ret bad;
 }
 
+
+$if ($mach.build.os == $mach.os.windows) {
+    #[library("kernel32.dll")] #[symbol("MultiByteToWideChar")]
+    ext fun t_recovery_wide(codepage: u32, flags: u32, input: str, length: i32, output: *u16, capacity: i32) i32;
+    #[library("kernel32.dll")] #[symbol("CreateFileW")]
+    ext fun t_recovery_open(path: *u16, access: u32, sharing: u32, security: ptr, creation: u32, flags: u32, template: i64) i64;
+    #[library("kernel32.dll")] #[symbol("CloseHandle")]
+    ext fun t_recovery_close(handle: i64) i32;
+
+    fun t_recovery_deny_delete(a: *A.Allocator, path: str) R.Result[i64, str] {
+        val length: i32 = t_recovery_wide(65001, 8, path, -1, nil, 0);
+        if (length <= 0) { ret R.err[i64, str]("cannot measure the native fixture path"); }
+        val owned: R.Result[*u16, str] = A.allocate[u16](a, length::usize);
+        if (R.is_err[*u16, str](owned)) { ret R.err[i64, str](R.unwrap_err[*u16, str](owned)); }
+        val wide: *u16 = R.unwrap_ok[*u16, str](owned);
+        fin { A.deallocate[u16](a, wide, length::usize); }
+        if (t_recovery_wide(65001, 8, path, -1, wide, length) != length) { ret R.err[i64, str]("cannot encode the native fixture path"); }
+        val handle: i64 = t_recovery_open(wide, 0, 3, nil, 3, 0x80, 0);
+        if (handle == -1) { ret R.err[i64, str]("cannot deny deletion sharing for the fixture"); }
+        ret R.ok[i64, str](handle);
+    }
+}
+
+fun t_recovery_io_case(completed: bool, source_failure: bool) i32 {
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret 1; }
+    var ar: arena.Arena;
+    if (O.is_some[str](arena.init(?ar, ?backing, 0))) { ret 2; }
+    fin { arena.dnit(?ar); }
+    var alloc: A.Allocator;
+    if (O.is_some[str](arena.make(?alloc, ?ar))) { ret 3; }
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_init_recovery_io");
+    if (R.is_err[str, str](root_r)) { ret 4; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    fin { fs.remove_all(?alloc, root); }
+    val toml: str = sfmt_join(?alloc, root, "mach.toml");
+    val src: str = sfmt_join(?alloc, root, "src");
+    val entry: str = sfmt_join(?alloc, src, "root.mach");
+    val journal: str = sfmt_join(?alloc, root, JOURNAL_LEAF);
+    if (str_empty(toml) || str_empty(src) || str_empty(entry) || str_empty(journal)) { ret 5; }
+    if (O.is_some[str](fs.create_dir(src, 0o755))) { ret 6; }
+    if (O.is_some[str](fs.write_bytes(toml, "original"::*u8, 8, FILE_MODE))) { ret 7; }
+    if (O.is_some[str](fs.write_bytes(entry, "orig-src"::*u8, 8, FILE_MODE))) { ret 8; }
+    val cap_r: R.Result[txn.Root, str] = open_root(root, "");
+    if (R.is_err[txn.Root, str](cap_r)) { ret 9; }
+    var cap: txn.Root = R.unwrap_ok[txn.Root, str](cap_r);
+    fin { txn.root_dnit(?cap); }
+    val src_r: R.Result[txn.Root, str] = open_root(root, "src");
+    if (R.is_err[txn.Root, str](src_r)) { ret 10; }
+    var src_cap: txn.Root = R.unwrap_ok[txn.Root, str](src_r);
+    fin { txn.root_dnit(?src_cap); }
+    val prior_r: R.Result[txn.EntryProbe, str] = probe_entry(?cap, "mach.toml");
+    val entry_prior_r: R.Result[txn.EntryProbe, str] = probe_entry(?src_cap, "root.mach");
+    val root_id_r: R.Result[txn.Identity, str] = root_identity_of(?cap);
+    if (R.is_err[txn.EntryProbe, str](prior_r) || R.is_err[txn.EntryProbe, str](entry_prior_r)
+        || R.is_err[txn.Identity, str](root_id_r)) { ret 11; }
+    val prep_r: R.Result[txn.Transaction, str] = stage_absent(?alloc, ?cap, "mach.toml", "fresh"::*u8, 5);
+    if (R.is_err[txn.Transaction, str](prep_r)) { ret 12; }
+    var pf: txn.Transaction = R.unwrap_ok[txn.Transaction, str](prep_r);
+    fin { if (!pf.spent) { txn.abort(?pf); } }
+    val entry_prep_r: R.Result[txn.Transaction, str] = stage_absent(?alloc, ?src_cap, "root.mach", "new-src"::*u8, 7);
+    if (R.is_err[txn.Transaction, str](entry_prep_r)) { ret 13; }
+    var entry_pf: txn.Transaction = R.unwrap_ok[txn.Transaction, str](entry_prep_r);
+    fin { if (!entry_pf.spent) { txn.abort(?entry_pf); } }
+    val new_r: R.Result[txn.Identity, str] = staged_identity_of(?pf);
+    val entry_new_r: R.Result[txn.Identity, str] = staged_identity_of(?entry_pf);
+    if (R.is_err[txn.Identity, str](new_r) || R.is_err[txn.Identity, str](entry_new_r)) { ret 14; }
+    if (R.is_err[R.Void, str](journal_create(?alloc, ?cap, R.unwrap_ok[txn.Identity, str](root_id_r),
+        R.unwrap_ok[txn.EntryProbe, str](prior_r), R.unwrap_ok[txn.Identity, str](new_r),
+        R.unwrap_ok[txn.EntryProbe, str](entry_prior_r), R.unwrap_ok[txn.Identity, str](entry_new_r), false, false))) { ret 15; }
+    if (completed) {
+        if (O.is_some[str](commit_owned(?alloc, ?src_cap, ?entry_pf, true, "root.mach", BACKUP_ENTRY_BIN))) { ret 16; }
+        if (O.is_some[str](commit_owned(?alloc, ?cap, ?pf, true, "mach.toml", BACKUP_MANIFEST))) { ret 17; }
+    }
+    or {
+        if (O.is_some[txn.Error](txn.abort(?entry_pf)) || O.is_some[txn.Error](txn.abort(?pf))) { ret 18; }
+    }
+    var failed_cap: *txn.Root = ?cap;
+    var backup: str = BACKUP_MANIFEST;
+    var final_leaf: str = "mach.toml";
+    if (source_failure) { failed_cap = ?src_cap; backup = BACKUP_ENTRY_BIN; final_leaf = "root.mach"; }
+    if (completed && O.is_some[str](rename_entry(failed_cap, backup, "saved-original"))) { ret 19; }
+    var directory_obstruction: bool = true;
+    $if ($mach.build.os == $mach.os.windows) {
+        if (!completed) { directory_obstruction = false; }
+    }
+    if (directory_obstruction) {
+        if (R.is_err[bool, str](make_dir_entry(failed_cap, backup, DIR_MODE))) { ret 20; }
+    }
+    var held: i64 = -1;
+    fin {
+        $if ($mach.build.os == $mach.os.windows) {
+            if (held != -1) { t_recovery_close(held); }
+        }
+    }
+    $if ($mach.build.os == $mach.os.windows) {
+        if (!completed) {
+            var parent: str = root;
+            var destination: str = toml;
+            if (source_failure) { parent = src; destination = entry; }
+            val backup_path: str = sfmt_join(?alloc, parent, backup);
+            if (str_empty(backup_path) || O.is_some[str](fs.write_bytes(backup_path, "blocked"::*u8, 7, FILE_MODE))) { ret 36; }
+            val denied: R.Result[i64, str] = t_recovery_deny_delete(?alloc, destination);
+            if (R.is_err[i64, str](denied)) { ret 37; }
+            held = R.unwrap_ok[i64, str](denied);
+        }
+    }
+    var injected: O.Option[str] = O.none[str]();
+    if (completed) { injected = resolve_commit_cleanup(?alloc, failed_cap, backup); }
+    or { injected = resolve_rollback(?alloc, failed_cap, final_leaf, backup, true); }
+    if (O.is_none[str](injected)) { ret 21; }
+    val before_r: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, journal);
+    if (R.is_err[Vector[u8], str](before_r)) { ret 22; }
+    var before: Vector[u8] = R.unwrap_ok[Vector[u8], str](before_r);
+    fin { vector.dnit[u8](?before); }
+    val recovered: R.Result[i32, str] = recover_existing(?alloc, root, "", ?cap);
+    if (R.is_ok[i32, str](recovered)) { ret 23; }
+    if (!str_equals(R.unwrap_err[i32, str](recovered), O.unwrap[str](injected))) { ret 24; }
+    val after_r: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, journal);
+    if (R.is_err[Vector[u8], str](after_r)) { ret 25; }
+    var after: Vector[u8] = R.unwrap_ok[Vector[u8], str](after_r);
+    fin { vector.dnit[u8](?after); }
+    if (before.len != after.len) { ret 26; }
+    var i: usize = 0;
+    for (i < before.len) {
+        if (before.data[i] != after.data[i]) { ret 27; }
+        i = i + 1;
+    }
+    val kept: O.Option[str] = t_read_file(?alloc, toml);
+    val kept_entry: O.Option[str] = t_read_file(?alloc, entry);
+    if (O.is_none[str](kept) || !str_equals(O.unwrap[str](kept), if_str(completed, "fresh", "original"))) { ret 28; }
+    if (O.is_none[str](kept_entry) || !str_equals(O.unwrap[str](kept_entry), if_str(completed, "new-src", "orig-src"))) { ret 29; }
+    $if ($mach.build.os == $mach.os.windows) {
+        if (held != -1) {
+            val closed: i32 = t_recovery_close(held);
+            held = -1;
+            if (closed == 0) { ret 38; }
+        }
+    }
+    if (directory_obstruction) {
+        if (O.is_some[str](rmdir_entry(failed_cap, backup))) { ret 30; }
+    }
+    or { if (O.is_some[str](unlink_entry(failed_cap, backup))) { ret 39; } }
+    if (completed && O.is_some[str](rename_entry(failed_cap, "saved-original", backup))) { ret 31; }
+    val retried: R.Result[i32, str] = recover_existing(?alloc, root, "", ?cap);
+    if (R.is_err[i32, str](retried)) { ret 32; }
+    var expected: i32 = RECOVER_ROLLED_BACK;
+    if (completed) { expected = RECOVER_COMPLETED; }
+    if (R.unwrap_ok[i32, str](retried) != expected) { ret 33; }
+    if (fs.exists(journal)) { ret 34; }
+    val backup_now: R.Result[txn.EntryProbe, str] = probe_entry(failed_cap, backup);
+    if (R.is_err[txn.EntryProbe, str](backup_now) || R.unwrap_ok[txn.EntryProbe, str](backup_now).present) { ret 35; }
+    ret 0;
+}
+
+test "mach.cli.cmd.init.recover_existing:manifest_rollback_failure_preserves_journal_for_retry" {
+    ret t_recovery_io_case(false, false);
+}
+
+test "mach.cli.cmd.init.recover_existing:entry_rollback_failure_preserves_journal_for_retry" {
+    ret t_recovery_io_case(false, true);
+}
+
+test "mach.cli.cmd.init.recover_existing:manifest_cleanup_failure_preserves_journal_for_retry" {
+    ret t_recovery_io_case(true, false);
+}
+
+test "mach.cli.cmd.init.recover_existing:entry_cleanup_failure_preserves_journal_for_retry" {
+    ret t_recovery_io_case(true, true);
+}
+
+test "mach.cli.cmd.init.recover_existing:sweep_failure_preserves_journal_for_retry" {
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret 1; }
+    var ar: arena.Arena;
+    if (O.is_some[str](arena.init(?ar, ?backing, 0))) { ret 2; }
+    fin { arena.dnit(?ar); }
+    var alloc: A.Allocator;
+    if (O.is_some[str](arena.make(?alloc, ?ar))) { ret 3; }
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_init_sweep_failure");
+    if (R.is_err[str, str](root_r)) { ret 4; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    fin { fs.remove_all(?alloc, root); }
+    val cap_r: R.Result[txn.Root, str] = open_root(root, "");
+    if (R.is_err[txn.Root, str](cap_r)) { ret 5; }
+    var cap: txn.Root = R.unwrap_ok[txn.Root, str](cap_r);
+    fin { txn.root_dnit(?cap); }
+    val root_id_r: R.Result[txn.Identity, str] = root_identity_of(?cap);
+    if (R.is_err[txn.Identity, str](root_id_r)) { ret 6; }
+    var absent: txn.EntryProbe;
+    var zero: txn.Identity;
+    if (R.is_err[R.Void, str](journal_create(?alloc, ?cap, R.unwrap_ok[txn.Identity, str](root_id_r),
+        absent, zero, absent, zero, false, false))) { ret 7; }
+    var state: fixed.FixedState;
+    var refusing: A.Allocator;
+    var storage: [1]u8;
+    if (O.is_some[*u8](fixed.make(?refusing, ?state, ?storage[0], 0))) { ret 8; }
+    val injected: O.Option[str] = sweep_root(?refusing, ?cap);
+    if (O.is_none[str](injected)) { ret 9; }
+    val recovered: R.Result[i32, str] = recover_existing(?refusing, root, "", ?cap);
+    if (R.is_ok[i32, str](recovered)) { ret 10; }
+    if (!str_equals(R.unwrap_err[i32, str](recovered), O.unwrap[str](injected))) { ret 11; }
+    val journal_r: R.Result[O.Option[InitJournal], str] = journal_read(?alloc, ?cap);
+    if (R.is_err[O.Option[InitJournal], str](journal_r)
+        || O.is_none[InitJournal](R.unwrap_ok[O.Option[InitJournal], str](journal_r))) { ret 12; }
+    val retried: R.Result[i32, str] = recover_existing(?alloc, root, "", ?cap);
+    if (R.is_err[i32, str](retried) || R.unwrap_ok[i32, str](retried) != RECOVER_ROLLED_BACK) { ret 13; }
+    val journal_now: R.Result[txn.EntryProbe, str] = probe_entry(?cap, JOURNAL_LEAF);
+    if (R.is_err[txn.EntryProbe, str](journal_now) || R.unwrap_ok[txn.EntryProbe, str](journal_now).present) { ret 14; }
+    ret 0;
+}
+
+test "mach.cli.cmd.init.recover_existing:replaced_source_directory_preserves_journal_and_backup" {
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret 1; }
+    var ar: arena.Arena;
+    if (O.is_some[str](arena.init(?ar, ?backing, 0))) { ret 2; }
+    fin { arena.dnit(?ar); }
+    var alloc: A.Allocator;
+    if (O.is_some[str](arena.make(?alloc, ?ar))) { ret 3; }
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_init_source_obstruction");
+    if (R.is_err[str, str](root_r)) { ret 4; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    fin { fs.remove_all(?alloc, root); }
+    val src: str = sfmt_join(?alloc, root, "src");
+    val entry: str = sfmt_join(?alloc, src, "root.mach");
+    if (str_empty(src) || str_empty(entry)) { ret 5; }
+    if (O.is_some[str](fs.create_dir(src, DIR_MODE))
+        || O.is_some[str](fs.write_bytes(entry, "original"::*u8, 8, FILE_MODE))) { ret 6; }
+    val cap_r: R.Result[txn.Root, str] = open_root(root, "");
+    if (R.is_err[txn.Root, str](cap_r)) { ret 7; }
+    var cap: txn.Root = R.unwrap_ok[txn.Root, str](cap_r);
+    fin { txn.root_dnit(?cap); }
+    val src_r: R.Result[txn.Root, str] = open_root(root, "src");
+    if (R.is_err[txn.Root, str](src_r)) { ret 8; }
+    var src_cap: txn.Root = R.unwrap_ok[txn.Root, str](src_r);
+    fin { txn.root_dnit(?src_cap); }
+    val prior_r: R.Result[txn.EntryProbe, str] = probe_entry(?src_cap, "root.mach");
+    val root_id_r: R.Result[txn.Identity, str] = root_identity_of(?cap);
+    if (R.is_err[txn.EntryProbe, str](prior_r) || R.is_err[txn.Identity, str](root_id_r)) { ret 9; }
+    var absent: txn.EntryProbe;
+    var zero: txn.Identity;
+    if (R.is_err[R.Void, str](journal_create(?alloc, ?cap, R.unwrap_ok[txn.Identity, str](root_id_r),
+        absent, zero, R.unwrap_ok[txn.EntryProbe, str](prior_r), zero, false, false))) { ret 10; }
+    if (O.is_some[str](rename_entry(?src_cap, "root.mach", BACKUP_ENTRY_BIN))) { ret 11; }
+    txn.root_dnit(?src_cap);
+    if (O.is_some[str](rename_entry(?cap, "src", "saved-src"))) { ret 12; }
+    val missing: R.Result[i32, str] = recover_existing(?alloc, root, "", ?cap);
+    if (R.is_ok[i32, str](missing)) { ret 24; }
+    if (!str_equals(R.unwrap_err[i32, str](missing), "init journal: src is missing for an original entry")) { ret 25; }
+    val missing_journal: R.Result[O.Option[InitJournal], str] = journal_read(?alloc, ?cap);
+    if (R.is_err[O.Option[InitJournal], str](missing_journal)
+        || O.is_none[InitJournal](R.unwrap_ok[O.Option[InitJournal], str](missing_journal))) { ret 26; }
+    if (O.is_some[str](fs.write_bytes(src, "obstruction"::*u8, 11, FILE_MODE))) { ret 13; }
+    val recovered: R.Result[i32, str] = recover_existing(?alloc, root, "", ?cap);
+    if (R.is_ok[i32, str](recovered)) { ret 14; }
+    if (!str_equals(R.unwrap_err[i32, str](recovered), "init journal: src is no longer a directory")) { ret 15; }
+    val journal_r: R.Result[O.Option[InitJournal], str] = journal_read(?alloc, ?cap);
+    if (R.is_err[O.Option[InitJournal], str](journal_r)
+        || O.is_none[InitJournal](R.unwrap_ok[O.Option[InitJournal], str](journal_r))) { ret 16; }
+    val saved: str = sfmt_join(?alloc, root, "saved-src");
+    val backup: str = sfmt_join(?alloc, saved, BACKUP_ENTRY_BIN);
+    if (str_empty(saved) || str_empty(backup)) { ret 17; }
+    val original: O.Option[str] = t_read_file(?alloc, backup);
+    if (O.is_none[str](original) || !str_equals(O.unwrap[str](original), "original")) { ret 18; }
+    val obstruction: O.Option[str] = t_read_file(?alloc, src);
+    if (O.is_none[str](obstruction) || !str_equals(O.unwrap[str](obstruction), "obstruction")) { ret 19; }
+    if (O.is_some[str](unlink_entry(?cap, "src"))
+        || O.is_some[str](rename_entry(?cap, "saved-src", "src"))) { ret 20; }
+    val retried: R.Result[i32, str] = recover_existing(?alloc, root, "", ?cap);
+    if (R.is_err[i32, str](retried) || R.unwrap_ok[i32, str](retried) != RECOVER_ROLLED_BACK) { ret 21; }
+    val restored: O.Option[str] = t_read_file(?alloc, entry);
+    if (O.is_none[str](restored) || !str_equals(O.unwrap[str](restored), "original")) { ret 22; }
+    val journal_now: R.Result[txn.EntryProbe, str] = probe_entry(?cap, JOURNAL_LEAF);
+    if (R.is_err[txn.EntryProbe, str](journal_now) || R.unwrap_ok[txn.EntryProbe, str](journal_now).present) { ret 23; }
+    ret 0;
+}
 
 test "mach.cli.cmd.init.under_remainder:allocation_failure_cannot_drop_the_destination_prefix" {
     var state: fixed.FixedState;
