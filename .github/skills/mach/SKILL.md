@@ -400,8 +400,9 @@ if (is_err[usize, str](r)) { ret r; }
 val n: usize = unwrap_ok[usize, str](r);
 ```
 
-- `str` is `*char` (null-terminated); `std.types.string` provides `str_len`,
-  comparison, and `StrView { data, len }` for length-aware slices.
+- `str` is `*char` (null-terminated). `std.types.string` provides `str_len`
+  and comparison. `std.types.view.View { data, len }` borrows a length-counted
+  slice and owns no storage.
 - No methods, no UFCS: everything is a free function taking an explicit
   receiver (usually a pointer), reached through the module alias -
   `vec.push[T](?v, x)`, not `v.push(x)`.
