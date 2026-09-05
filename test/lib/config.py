@@ -43,11 +43,11 @@ def _rows(path):
 
 class Target(object):
     __slots__ = ("name", "isa", "os", "abi", "of", "kind", "entry",
-                 "engine", "engine_cmd", "disasm", "runner", "cadence", "decode", "note")
+                 "engine", "engine_cmd", "disasm", "runner", "cadence", "decode", "debug", "note")
 
     def __init__(self, fields, note):
         (self.name, self.isa, self.os, self.abi, self.of, self.kind,
-         self.entry, engine, self.disasm, self.runner, self.cadence, self.decode) = fields
+         self.entry, engine, self.disasm, self.runner, self.cadence, self.decode, self.debug) = fields
         if ":" in engine:
             self.engine, self.engine_cmd = engine.split(":", 1)
         else:
@@ -74,10 +74,12 @@ def load_engines(path):
     targets = []
     seen = set()
     for lineno, line in _rows(path):
-        fields = line.split(None, 12)
-        if len(fields) != 13:
-            raise ConfigError("%s:%d: expected 13 columns, got %d" % (path, lineno, len(fields)))
-        t = Target(fields[:12], fields[12])
+        fields = line.split(None, 13)
+        if len(fields) != 14:
+            raise ConfigError("%s:%d: expected 14 columns, got %d" % (path, lineno, len(fields)))
+        t = Target(fields[:13], fields[13])
+        if t.debug not in ("supported", "unsupported"):
+            raise ConfigError("%s:%d: debug must be supported|unsupported" % (path, lineno))
         if t.entry not in ("hosted", "direct", "freestanding"):
             raise ConfigError("%s:%d: entry must be hosted|direct|freestanding" % (path, lineno))
         if t.kind not in ("bin", "static"):
