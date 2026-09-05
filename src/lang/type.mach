@@ -1,21 +1,10 @@
-# semantic type universe shared across sema, middle-end, and backend
-#
-# `TypeInterner` lives on the session next to `intern.Interner`. It owns every
-# `Type` record produced during sema and hands out stable `TypeId` handles;
-# equality of two `TypeId`s is identity equality.
-#
-# Primitive types (`u8`..`f64`, `ptr`) are pre-allocated by `init` and exposed
-# via `prim(kind)`. Compound types are interned by their canonical form: pointer
-# types by base, array types by `(base, count)`, nominal types (`rec`/`uni`) by
-# `(origin, decl)`, generic parameters by `(owner, index)`, function types by a
-# content hash of their signature, and instances by `(origin, decl, args)`.
-# Structural equality of function types is also available via
-# `type_equals_signatures`.
-
 use std.allocator.page;
+use std.chrono.duration;
 use std.collections.map;
 use std.crypto.hash.fnv1a;
+use std.format;
 use std.memory;
+use std.print;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -24,208 +13,133 @@ use std.types.string.str;
 use std.types.string.str_equals;
 use std.types.string.str_len;
 use std.types.string.str_region_equals;
+use std.types.view.View;
+use std.types.view.view_eq_str;
 
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
+use tm: std.chrono.time;
 
 use mach.lang.fe.ast.id;
 use mach.lang.float;
+use mach.lang.handle;
 use mach.lang.intern;
+use mach.lang.layout;
 use mach.lang.module;
 
 pub def TypeId:     u32;
-# sentinel TypeId for the absence of a type - a function with no declared
-# return (void), a bare `ret;`, or a type not yet resolved
 pub val TYPE_NIL:   TypeId = 0xFFFFFFFF;
-# sentinel TypeId for a type that failed to resolve; sema propagates it to
-# degrade gracefully and suppress cascading diagnostics
 pub val TYPE_ERROR: TypeId = 0xFFFFFFFE;
 
-# discriminator for Type.data
 pub def TypeKind: u8;
 
-# primitive type kinds. these have no payload
-pub val TYPE_U8:    TypeKind = 0;   # unsigned 8-bit integer
-pub val TYPE_U16:   TypeKind = 1;   # unsigned 16-bit integer
-pub val TYPE_U32:   TypeKind = 2;   # unsigned 32-bit integer
-pub val TYPE_U64:   TypeKind = 3;   # unsigned 64-bit integer
-pub val TYPE_I8:    TypeKind = 4;   # signed 8-bit integer
-pub val TYPE_I16:   TypeKind = 5;   # signed 16-bit integer
-pub val TYPE_I32:   TypeKind = 6;   # signed 32-bit integer
-pub val TYPE_I64:   TypeKind = 7;   # signed 64-bit integer
-pub val TYPE_F32:   TypeKind = 8;   # 32-bit floating point
-pub val TYPE_F64:   TypeKind = 9;   # 64-bit floating point
-pub val TYPE_PTR:   TypeKind = 10;  # raw pointer (untyped, opaque, address-shaped)
-pub val PRIM_COUNT: u32      = 11;  # number of primitive types
+pub val TYPE_U8:    TypeKind = 0;
+pub val TYPE_U16:   TypeKind = 1;
+pub val TYPE_U32:   TypeKind = 2;
+pub val TYPE_U64:   TypeKind = 3;
+pub val TYPE_I8:    TypeKind = 4;
+pub val TYPE_I16:   TypeKind = 5;
+pub val TYPE_I32:   TypeKind = 6;
+pub val TYPE_I64:   TypeKind = 7;
+pub val TYPE_F32:   TypeKind = 8;
+pub val TYPE_F64:   TypeKind = 9;
+pub val TYPE_PTR:   TypeKind = 10;
+pub val PRIM_COUNT: u32      = 11;
 
-# compound and nominal type kinds. these have a Type.data payload
-pub val TYPE_POINTER:       TypeKind = 11;  # pointer-to-T type payload
-pub val TYPE_ARRAY:         TypeKind = 12;  # fixed-size array type payload
-pub val TYPE_FUN:           TypeKind = 13;  # function type payload
-pub val TYPE_REC:           TypeKind = 14;  # nominal record type payload
-pub val TYPE_UNI:           TypeKind = 15;  # nominal union type payload
-pub val TYPE_GENERIC_PARAM: TypeKind = 16;  # generic parameter placeholder type payload
-pub val TYPE_INSTANCE:      TypeKind = 17;  # concrete instantiation of a generic declaration payload
+pub val TYPE_POINTER:       TypeKind = 11;
+pub val TYPE_ARRAY:         TypeKind = 12;
+pub val TYPE_FUN:           TypeKind = 13;
+pub val TYPE_REC:           TypeKind = 14;
+pub val TYPE_UNI:           TypeKind = 15;
+pub val TYPE_GENERIC_PARAM: TypeKind = 16;
+pub val TYPE_INSTANCE:      TypeKind = 17;
 
-# a comptime variadic pack. the type of a `va: ...` parameter. a
-# payload-free singleton. the pack's element types are fixed per call site and
-# supplied by monomorphization, never carried on the type itself
 pub val TYPE_PACK: TypeKind = 18;
 
-# the `^T` secret qualifier (#1645): the top of the two-point secrecy lattice
-# (public is the bottom). wraps an inner type to mark its data secret for the
-# constant-time guarantee. secrecy has no runtime representation - a `^T` lowers
-# to the same machine shape as `T`; it constrains only sema's flow typing
 pub val TYPE_SECRET: TypeKind = 19;
 
-# a SIMD vector type spelled `<element>x<lanes>` (#1965, generalized in #2687). the
-# portable vector model: any primitive scalar element and any lane count whose total
-# width fits the target's vector register is legal on every target, with a payload
-# carrying the lane scalar kind and lane count. its extent is lane-derived, so
-# `f32x4` is 16 bytes and `f32x3` is 12; whether a lane-wise op is one instruction or
-# a scalar expansion is a backend concern
 pub val TYPE_VECTOR: TypeKind = 20;
 
-# number of PRE-SEEDED vector types. no longer the set of legal vectors, which is the
-# `TxN` form bounded by the target's vector width (#2687): these ten 128-bit shapes
-# are merely interned at session init so they have stable TypeIds
 pub val VEC_COUNT: u32 = 10;
 
-# a type whose representation is not the program's: a handle the owning target
-# mints and the pipeline binds (#2888)
-#
-# It has no value representation a program can construct, read a lane of, or compute
-# on. The only things a program does with one are pass it to an operation and let a
-# target-owned constructor decide what it is. It lays out as a pointer so a target
-# that mints none still has a well defined size for the declaration
 pub val TYPE_HANDLE: TypeKind = 21;
 
-# a C type whose layout the selected TARGET declares and whose contents the program
-# cannot reach (#3004)
-#
-# The one C type mach binds that is neither a scalar it can name nor an aggregate a
-# user can write down: `va_list` is a plain pointer on four of the five platforms
-# mach binds C on and a 32-byte 8-aligned composite on AAPCS64, so no spelling in
-# mach source is correct everywhere and the layout has to come from the target.
-#
-# It IS an aggregate of the declared extent, deliberately, because that is what makes
-# the existing rules right without a special case: an aggregate over 16 bytes rides
-# AAPCS64's by-reference path, which makes the caller copy and pass an address, and
-# an eight-byte one reduces on every other platform to the single register a pointer
-# would have taken. What the program may do with one is bounded to the opposite end:
-# receive it as a parameter and hand it on. There is no reading, no construction, and
-# no storage of its own.
 pub val TYPE_ABI: TypeKind = 22;
 
-# scalar class of a primitive TypeKind, the discriminator of PrimDesc
 pub def PrimClass: u8;
 
-# not a primitive scalar (a compound, nominal, or sentinel kind)
 pub val PRIM_CLASS_NONE:  PrimClass = 0;
-# an integer primitive (u8..i64); signedness lives in PrimDesc.signed
 pub val PRIM_CLASS_INT:   PrimClass = 1;
-# a floating-point primitive (f32, f64)
 pub val PRIM_CLASS_FLOAT: PrimClass = 2;
-# the raw `ptr` primitive; its width is target-defined, so bits is 0 here
 pub val PRIM_CLASS_PTR:   PrimClass = 3;
 
-# the (class, signedness, bit width) of a primitive TypeKind
-#
-# The single source of truth every site that classifies a primitive by its
-# scalar class, signedness, or width derives from, replacing the per-site
-# `(sign, bits, class)` if-ladders. A non-primitive kind yields PRIM_CLASS_NONE
-# with signed false and bits 0.
-# ---
-# class:  PRIM_CLASS_INT / FLOAT / PTR, or PRIM_CLASS_NONE for a non-primitive
-# signed: true for the signed integers (i8..i64), false otherwise
-# bits:   scalar width in bits (8/16/32/64 for int, 32/64 for float, 0 for ptr)
 pub rec PrimDesc {
     class:  PrimClass;
     signed: bool;
     bits:   u32;
 }
 
-# the PrimDesc for a TypeKind
-#
-# The one if-ladder mapping a primitive kind to its scalar facts; every other
-# classifier reads this rather than restating the per-kind constants. A
-# non-primitive kind maps to PRIM_CLASS_NONE.
-# ---
-# kind: the TypeKind to describe
-# ret:  the kind's PrimDesc (PRIM_CLASS_NONE for a non-primitive kind)
+rec PrimSpec {
+    kind:     TypeKind;
+    spelling: str;
+    len:      usize;
+    class:    PrimClass;
+    signed:   bool;
+    bits:     u32;
+}
+
+val PRIM_CATALOG: [PRIM_COUNT]PrimSpec = [PRIM_COUNT]PrimSpec{
+    PrimSpec{ kind: TYPE_U8,  spelling: "u8",  len: 2, class: PRIM_CLASS_INT,   signed: false, bits: 8  },
+    PrimSpec{ kind: TYPE_U16, spelling: "u16", len: 3, class: PRIM_CLASS_INT,   signed: false, bits: 16 },
+    PrimSpec{ kind: TYPE_U32, spelling: "u32", len: 3, class: PRIM_CLASS_INT,   signed: false, bits: 32 },
+    PrimSpec{ kind: TYPE_U64, spelling: "u64", len: 3, class: PRIM_CLASS_INT,   signed: false, bits: 64 },
+    PrimSpec{ kind: TYPE_I8,  spelling: "i8",  len: 2, class: PRIM_CLASS_INT,   signed: true,  bits: 8  },
+    PrimSpec{ kind: TYPE_I16, spelling: "i16", len: 3, class: PRIM_CLASS_INT,   signed: true,  bits: 16 },
+    PrimSpec{ kind: TYPE_I32, spelling: "i32", len: 3, class: PRIM_CLASS_INT,   signed: true,  bits: 32 },
+    PrimSpec{ kind: TYPE_I64, spelling: "i64", len: 3, class: PRIM_CLASS_INT,   signed: true,  bits: 64 },
+    PrimSpec{ kind: TYPE_F32, spelling: "f32", len: 3, class: PRIM_CLASS_FLOAT, signed: false, bits: 32 },
+    PrimSpec{ kind: TYPE_F64, spelling: "f64", len: 3, class: PRIM_CLASS_FLOAT, signed: false, bits: 64 },
+    PrimSpec{ kind: TYPE_PTR, spelling: "ptr", len: 3, class: PRIM_CLASS_PTR,   signed: false, bits: 0  },
+};
+
+fun prim_spec(kind: TypeKind) *PrimSpec {
+    var i: u32 = 0;
+    for (i < PRIM_COUNT) {
+        if (PRIM_CATALOG[i].kind == kind) { ret ?PRIM_CATALOG[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
 pub fun prim_desc(kind: TypeKind) PrimDesc {
+    val spec: *PrimSpec = prim_spec(kind);
     var d: PrimDesc;
-    d.class  = PRIM_CLASS_NONE;
-    d.signed = false;
-    d.bits   = 0;
-
-    if (kind == TYPE_U8)  { d.class = PRIM_CLASS_INT;   d.signed = false; d.bits = 8;  }
-    or (kind == TYPE_U16) { d.class = PRIM_CLASS_INT;   d.signed = false; d.bits = 16; }
-    or (kind == TYPE_U32) { d.class = PRIM_CLASS_INT;   d.signed = false; d.bits = 32; }
-    or (kind == TYPE_U64) { d.class = PRIM_CLASS_INT;   d.signed = false; d.bits = 64; }
-    or (kind == TYPE_I8)  { d.class = PRIM_CLASS_INT;   d.signed = true;  d.bits = 8;  }
-    or (kind == TYPE_I16) { d.class = PRIM_CLASS_INT;   d.signed = true;  d.bits = 16; }
-    or (kind == TYPE_I32) { d.class = PRIM_CLASS_INT;   d.signed = true;  d.bits = 32; }
-    or (kind == TYPE_I64) { d.class = PRIM_CLASS_INT;   d.signed = true;  d.bits = 64; }
-    or (kind == TYPE_F32) { d.class = PRIM_CLASS_FLOAT; d.signed = false; d.bits = 32; }
-    or (kind == TYPE_F64) { d.class = PRIM_CLASS_FLOAT; d.signed = false; d.bits = 64; }
-    or (kind == TYPE_PTR) { d.class = PRIM_CLASS_PTR;   d.signed = false; d.bits = 0;  }
-
+    if (spec == nil) {
+        d.class  = PRIM_CLASS_NONE;
+        d.signed = false;
+        d.bits   = 0;
+        ret d;
+    }
+    d.class  = spec.class;
+    d.signed = spec.signed;
+    d.bits   = spec.bits;
     ret d;
 }
 
-# pointer-to-T type payload
-# ---
-# base: pointee TypeId
 pub rec TypePointer {
     base: TypeId;
 }
 
-# secret-qualifier `^T` payload (#1645)
-#
-# Carries the inner type the qualifier wraps. `^^T` never forms: intern_secret
-# collapses a doubled qualifier, keeping the lattice two-point.
-# ---
-# base: the inner (public-spelled) TypeId the qualifier wraps
 pub rec TypeSecret {
     base: TypeId;
 }
 
-# SIMD vector type payload (#1965)
-#
-# Two vectors are identical iff (element, lanes) match. `element` is one of the ten
-# scalar prim kinds (never `ptr`, which has no scalar bit width); `lanes` is at least
-# 2, and `element bits * lanes` is bounded by the target's vector width (#2687).
-# ---
-# element: lane scalar TypeKind (u8..i64, f32, f64)
-# lanes:   lane count
 pub rec TypeVector {
     element: TypeKind;
     lanes:   u32;
 }
 
-# a target-minted handle type payload (#2888)
-#
-# THE OPERANDS ARE OPAQUE HERE and that is the point: the compiler holds the words a
-# declaration folded and the constructor tag the owning target answered with, and
-# knows the meaning of neither. Adding a handle kind is a row in the target's own
-# table, never a case here.
-#
-# Two handles are identical iff the constructor and every operand word match. A
-# subset would give two declarations that differ in one word a single descriptor,
-# which is a valid module naming the wrong thing. The operands live in the interner's
-# handle-operand pool, which the context-free dedup hash cannot read, so handles are
-# deduped by scanning their own list exactly as instances are.
-#
-# `name` is the spelling the declaration gave, carried for diagnostics only. A
-# handle has a real name a user typed, so a message about one names it rather than
-# reconstructing a spelling.
-# ---
-# name:      interned declaration name (for diagnostics - not load-bearing for identity)
-# ctor:      the owning target's tag for the constructor that mints this type
-# ops_start: index into the interner's handle-operand pool
-# ops_len:   number of operand words
 pub rec TypeHandle {
     name:      intern.StrId;
     ctor:      u32;
@@ -233,22 +147,6 @@ pub rec TypeHandle {
     ops_len:   u32;
 }
 
-# a target-declared C ABI type (#3004)
-#
-# IDENTITY IS THE TAG, and the extent rides along rather than deciding anything. One
-# build has exactly one selected target, so `va_list` names one layout for the whole
-# compilation and two declarations of it in two modules must be the same type or a
-# binding could not be passed across a module boundary. Carrying the extent in the
-# payload keeps every consumer reading the fact off the type instead of re-consulting
-# the target.
-#
-# `name` is the spelling the declaration gave, for diagnostics only, exactly as
-# `TypeHandle.name` is.
-# ---
-# name:  interned declaration name (for diagnostics - not load-bearing for identity)
-# tag:   which C ABI type this is (one of ABI_TYPE_*)
-# size:  the target's declared size in bytes
-# align: the target's declared alignment in bytes
 pub rec TypeAbi {
     name:  intern.StrId;
     tag:   u32;
@@ -256,38 +154,14 @@ pub rec TypeAbi {
     align: u32;
 }
 
-# the tag of the `va_list` ABI type, the only member so far
-#
-# A TAG RATHER THAN A BARE FLAG because the axis this grows along is "a C type whose
-# layout the target declares, and whose contents mach never reads". `jmp_buf` and
-# `fpos_t` are the same shape of thing, and adding one is a tag here plus a row in
-# each os vtable's declaration - never a second directive and never a second type
-# kind.
 pub val ABI_TYPE_VA_LIST: u32 = 0;
 
-# the spelling, lane scalar, and lane count of one seeded vector type
-#
-# The ten shapes the interner pre-seeds at init so they have stable TypeIds. NOT the
-# set of legal vectors: that is the `TxN` form `vector_form` reads, for any element
-# and any lane count (#2687, #2727). Kept as the fixture the regression tests measure
-# the pre-#2687 shapes against.
-# ---
-# name:    source spelling, e.g. "f32x4"
-# element: lane scalar TypeKind
-# lanes:   lane count
 pub rec VecShape {
     name:    str;
     element: TypeKind;
     lanes:   u32;
 }
 
-# the seeded vector shape at ordinal `index`
-#
-# The ten shapes in a fixed order shared between the type interner (which
-# pre-interns them at init) and the resolver (which interns their spellings).
-# ---
-# index: ordinal in [0, VEC_COUNT)
-# ret:   the shape descriptor; a zero-lane VecShape when index is out of range
 pub fun vec_shape(index: u32) VecShape {
     var s: VecShape;
     s.name    = nil;
@@ -308,81 +182,90 @@ pub fun vec_shape(index: u32) VecShape {
     ret s;
 }
 
-# the source spelling of a primitive TypeKind, the inverse of the ordinal
-#
-# The one place a primitive's spelling is written down. The resolver's primitive
-# registry and the `TxN` vector form both read it, so a spelling can never drift
-# between the name a program writes and the element a vector form accepts.
-# ---
-# kind: the primitive TypeKind to spell
-# ret:  the spelling, or nil for a non-primitive kind
 pub fun prim_name(kind: TypeKind) str {
-    if      (kind == TYPE_U8)  { ret "u8";  }
-    or (kind == TYPE_U16) { ret "u16"; }
-    or (kind == TYPE_U32) { ret "u32"; }
-    or (kind == TYPE_U64) { ret "u64"; }
-    or (kind == TYPE_I8)  { ret "i8";  }
-    or (kind == TYPE_I16) { ret "i16"; }
-    or (kind == TYPE_I32) { ret "i32"; }
-    or (kind == TYPE_I64) { ret "i64"; }
-    or (kind == TYPE_F32) { ret "f32"; }
-    or (kind == TYPE_F64) { ret "f64"; }
-    or (kind == TYPE_PTR) { ret "ptr"; }
-    ret nil;
+    val spec: *PrimSpec = prim_spec(kind);
+    if (spec == nil) { ret nil; }
+    ret spec.spelling;
 }
 
-# the IEEE width a primitive float TypeKind is carried at
-#
-# What a typed pass hands the comptime evaluator so a folded float constant
-# rounds where the running program rounds (#2918). FLOAT_W_NONE for every
-# non-float kind, which says the same thing there as it does everywhere else:
-# this type fixes no float width.
-# ---
-# kind: the TypeKind to read
-# ret:  the float width, or FLOAT_W_NONE for a non-float kind
+pub fun prim_spelling_len(kind: TypeKind) usize {
+    val spec: *PrimSpec = prim_spec(kind);
+    if (spec == nil) { ret 0; }
+    ret spec.len;
+}
+
+pub fun prim_from_name(name: str) O.Option[TypeKind] {
+    var i: u32 = 0;
+    for (i < PRIM_COUNT) {
+        if (str_equals(PRIM_CATALOG[i].spelling, name)) { ret O.some[TypeKind](PRIM_CATALOG[i].kind); }
+        i = i + 1;
+    }
+    ret O.none[TypeKind]();
+}
+
+pub fun prim_from_view(name: View) O.Option[TypeKind] {
+    var i: u32 = 0;
+    for (i < PRIM_COUNT) {
+        if (view_eq_str(name, PRIM_CATALOG[i].spelling)) { ret O.some[TypeKind](PRIM_CATALOG[i].kind); }
+        i = i + 1;
+    }
+    ret O.none[TypeKind]();
+}
+
+pub rec IntRange {
+    min_negated: bool;
+    min_mag:     u64;
+    max_mag:     u64;
+}
+
+pub fun int_range(kind: TypeKind) O.Option[IntRange] {
+    val d: PrimDesc = prim_desc(kind);
+    if (d.class != PRIM_CLASS_INT) { ret O.none[IntRange](); }
+
+    var r: IntRange;
+    if (d.signed) {
+        r.min_negated = true;
+        r.min_mag     = 1::u64 << (d.bits - 1)::usize;
+        r.max_mag     = (1::u64 << (d.bits - 1)::usize) - 1;
+        ret O.some[IntRange](r);
+    }
+    r.min_negated = false;
+    r.min_mag     = 0;
+    if (d.bits >= 64) { r.max_mag = 0::u64 - 1; }
+    or                { r.max_mag = (1::u64 << d.bits::usize) - 1; }
+    ret O.some[IntRange](r);
+}
+
+pub fun int_fits(value: u64, negated: bool, r: IntRange) bool {
+    if (negated) {
+        if (!r.min_negated) { ret false; }
+        ret value <= r.min_mag;
+    }
+    ret value <= r.max_mag;
+}
+
+pub fun int_fits_either_sign(value: u64, kind: TypeKind) bool {
+    val opt: O.Option[IntRange] = int_range(kind);
+    if (O.is_none[IntRange](opt)) { ret true; }
+    val r: IntRange = O.unwrap[IntRange](opt);
+    ret int_fits(value, false, r) || int_fits(value, true, r);
+}
+
 pub fun float_width_of(kind: TypeKind) float.FloatWidth {
     if (kind == TYPE_F32) { ret float.FLOAT_W_32; }
     if (kind == TYPE_F64) { ret float.FLOAT_W_64; }
     ret float.FLOAT_W_NONE;
 }
 
-# how reading a spelling as the vector form `<element>x<lanes>` came out
-#
-# Three outcomes rather than two, because "this is not a vector spelling" and
-# "this is a vector no compiler can carry" need different diagnostics: the first
-# falls through to ordinary name resolution, the second must name the vector and the
-# bound it exceeded (#2687).
 pub def VecFormStatus: u8;
 
-# the largest lane count the compiler represents
-#
-# The ONLY bound on a vector spelling, and it is a representation limit rather than a
-# target one (#2727): the lane count is carried as a u16 through MIR (`MirInstr
-# .vec_lane`), so a shape past this cannot be described to the back end at all. It is
-# the same number on every target, which is the point - a `TxN` is legal for any
-# element and any `N >= 2` everywhere, and only its REALIZATION (one packed
-# instruction, a split, or per-lane scalar code) is target-dependent.
-#
-# The digit loop clamps a longer count to `MAX_VEC_LANES + 1`, so an absurd spelling
-# still reports as too wide without the loop carrying an unbounded value.
 pub val MAX_VEC_LANES: u32 = 65535;
 
-# not a vector spelling at all; the caller resolves the name by other means
 pub val VEC_FORM_NONE:      VecFormStatus = 0;
-# a well formed shape
 pub val VEC_FORM_OK:        VecFormStatus = 1;
-# a well formed shape with more lanes than the compiler can represent
 pub val VEC_FORM_TOO_WIDE:  VecFormStatus = 2;
-# a well formed element with a degenerate lane count (0 or 1)
 pub val VEC_FORM_BAD_LANES: VecFormStatus = 3;
 
-
-# the shape a `TxN` spelling denotes
-# ---
-# status:  which of the four outcomes reading the spelling produced
-# element: lane scalar TypeKind; only meaningful when status is not VEC_FORM_NONE
-# lanes:   lane count; only meaningful when status is not VEC_FORM_NONE
-# bits:    element bits times lanes, the shape's total width
 pub rec VecForm {
     status:  VecFormStatus;
     element: TypeKind;
@@ -390,47 +273,10 @@ pub rec VecForm {
     bits:    u32;
 }
 
-# whether `name` is spelled as a vector form at all
-#
-# The declaration guard reads this rather than `vector_form`'s status, because whether
-# a spelling COLLIDES with the vector grammar must not depend on anything else:
-# `rec f32x8` is a landmine on every target, since the very same source is a real
-# vector type. Only OK / TOO_WIDE / BAD_LANES distinguish shapes, never NONE.
-# ---
-# name: the spelling to test
-# ret:  true when `name` parses as `<element>x<lanes>`
 pub fun is_vector_spelling(name: str) bool {
     ret vector_form(name).status != VEC_FORM_NONE;
 }
 
-# read `name` as the vector form `<element>x<lanes>`
-#
-# THE FORM, NOT A TABLE (#2687). A vector type is any primitive scalar element
-# followed by `x` and a lane count. The ten formerly seeded spellings are exactly
-# the forms whose width is 128, so they keep resolving unchanged and are no
-# longer special.
-#
-# THE SHAPE IS TARGET-INDEPENDENT (#2727, decided in #2488). This used to take the
-# target's `vector_bits` and refuse anything wider by name, which made the SURFACE
-# depend on a REALIZATION fact - and incoherently so, since rv64gc has no vector unit
-# at all, scalarizes every vector it is given, and still refused `f32x8` on the
-# ground of a 128-bit SIMD width it does not have. `vector_bits` keeps its job of
-# deciding how a shape is realized (one packed form, a split, or per-lane scalar
-# code) and has no say in whether it can be spelled. A target gaining wider vector
-# registers therefore gets BETTER CODEGEN rather than new spellings, which is the
-# growth axis that fact was introduced for.
-#
-# `ptr` is not a lane element: its width is target-defined rather than a scalar
-# bit count, so no lane count gives it a well defined vector width. A lane count
-# below 2 is refused rather than admitted as a degenerate one-lane vector, which
-# has no register representation and which SPIR-V's OpTypeVector forbids
-# outright.
-#
-# The width product is computed in u64 so an absurd lane count reports as too
-# wide rather than wrapping u32 into a shape that appears to fit.
-# ---
-# name:        the spelling to read
-# ret:         the shape read from the spelling
 pub fun vector_form(name: str) VecForm {
     var f: VecForm;
     f.status  = VEC_FORM_NONE;
@@ -440,11 +286,8 @@ pub fun vector_form(name: str) VecForm {
 
     if (name == nil) { ret f; }
     val n: usize = str_len(name);
-    # the shortest well formed spelling is `u8x2`, so anything shorter cannot be
-    # one. tested before the split so the `n - 1` below never underflows.
     if (n < 4) { ret f; }
 
-    # no primitive spelling contains an `x`, so the first one splits the form.
     var split: usize = 0;
     for (split < n && name[split] != 'x') { split = split + 1; }
     if (split == 0) { ret f; }
@@ -463,8 +306,6 @@ pub fun vector_form(name: str) VecForm {
     }
     if (!found) { ret f; }
 
-    # a strict decimal lane count: digits only, and no leading zero, so a
-    # near-miss identifier stays an ordinary unresolved name.
     if (name[split + 1] == '0') { ret f; }
     var lanes: u64   = 0;
     var i:     usize = split + 1;
@@ -484,35 +325,15 @@ pub fun vector_form(name: str) VecForm {
     if (lanes > MAX_VEC_LANES::u64) { f.status = VEC_FORM_TOO_WIDE; ret f; }
 
     f.bits = (prim_desc(element).bits::u64 * lanes)::u32;
-    # every well formed shape is admitted, at every width. a vector NARROWER than the
-    # register is carried as a register value with a smaller memory footprint (#2697);
-    # one WIDER than the register is placed in memory and realized per lane (#2727).
-    # both were refused by name until the backend could carry them, because the
-    # alternative to a refusal was a miscompile rather than a diagnostic.
     f.status = VEC_FORM_OK;
     ret f;
 }
 
-# fixed-size array type payload
-# ---
-# base:  element TypeId
-# count: element count
 pub rec TypeArray {
     base:  TypeId;
     count: u32;
 }
 
-# function type payload
-# ---
-# ret_type:     return type
-# params_start: index into ti.params for the first parameter type
-# params_len:   number of fixed parameter types
-# c_variadic:   true for the C-variadic signature an `ext fun f(a: T, ...)` declares:
-#               `params_len` is the fixed arity and a call may pass further arguments,
-#               placed by the target's C variadic rules. Part of the signature's
-#               IDENTITY -- two otherwise-equal signatures that differ here call
-#               differently on Apple arm64 -- so it is hashed and matched with the
-#               parameter list
 pub rec TypeFun {
     ret_type:     TypeId;
     params_start: u32;
@@ -520,40 +341,19 @@ pub rec TypeFun {
     c_variadic:   bool;
 }
 
-# nominal (rec / uni / def) reference payload
-#
-# Two nominal types are identical iff they refer to the same declaration site.
-# ---
-# name:   interned identifier (for diagnostics - not load-bearing for identity)
-# origin: ModuleId of the declaring module
-# decl:   DeclId of the declaration in `origin`'s Ast
 pub rec TypeNominal {
     name:   intern.StrId;
     origin: module.ModuleId;
     decl:   id.DeclId;
 }
 
-# placeholder type for a generic parameter as written in a declaration
-# ---
-# name:  interned identifier (for diagnostics)
-# owner: DeclId of the enclosing generic decl (in its module's Ast)
-# index: ordinal among the owner's generic parameters
 pub rec TypeGenericParam {
-    name:  intern.StrId;
-    owner: id.DeclId;
-    index: u32;
+    name:   intern.StrId;
+    origin: module.ModuleId;
+    owner:  id.DeclId;
+    index:  u32;
 }
 
-# concrete instantiation of a generic declaration
-#
-# Two instances are identical if (target_origin, target_decl) match and the
-# args sequences are element-wise equal.
-# ---
-# nominal:       the TYPE_REC / TYPE_UNI this instance specializes, or TYPE_ERROR when the target declaration is not an aggregate
-# target_origin: module that declared the generic
-# target_decl:   declaration in target_origin's Ast
-# args_start:    index into TypeInterner.params
-# args_len:      number of concrete argument types
 pub rec TypeInstance {
     nominal:       TypeId;
     target_origin: module.ModuleId;
@@ -562,10 +362,6 @@ pub rec TypeInstance {
     args_len:      u32;
 }
 
-# tagged union of all type kinds
-# ---
-# kind: which TYPE_* variant is active
-# data: kind-specific payload; primitives use no payload
 pub rec Type {
     kind: TypeKind;
     data: uni {
@@ -582,31 +378,12 @@ pub rec Type {
     };
 }
 
-# one field of a nominal record/union or generic instance
-#
-# Recorded in the session-global field store.
-# ---
-# name: interned field identifier
-# ty:   interned semantic type of the field
 pub rec FieldEntry {
     name: intern.StrId;
     ty:   TypeId;
 }
 
-# the structural field list for one nominal or instance TypeId
-#
-# Fields live in a contiguous slice of the interner's field pool.
-# ---
-# ty:           the TypeId this table describes
-# fields_start: index of the first field in the field pool
-# fields_len:   number of fields
-# epoch:        the build epoch this table was (re)built in. a nominal keeps its
-#               TypeId across rebuilds, but its field TYPES can change (an importer
-#               on a long-lived session must see the current layout), so a builder
-#               rebuilds a table whose epoch predates the current one rather than
-#               reusing the stale layout - while a within-build rebuild request for
-#               an up-to-date table is a no-op (dedup of repeated anon references). a
-#               fresh-session build (the CLI) only ever sees epoch 0 (#1583)
+
 pub rec FieldTable {
     ty:           TypeId;
     fields_start: u32;
@@ -614,46 +391,10 @@ pub rec FieldTable {
     epoch:        u32;
 }
 
-# session-shared interner for the type universe
-# ---
-# a:               allocator backing all owned arrays
-# types:           universe of Type records indexed by TypeId
-# type_len:        number of types stored
-# type_cap:        allocated slots in types
-# params:          pool of TypeIds referenced by TypeFun
-# params_len:      number of TypeIds stored
-# params_cap:      allocated slots in params
-# dedup:           Type to TypeId map; populated for kinds with self-contained payloads
-# prims:           pre-allocated TypeIds for each primitive TypeKind, indexed by kind
-# field_tables:    one FieldTable per nominal / instance TypeId that has a field layout; built once and shared session-wide so any module can resolve a cross-module record's fields
-# field_table_len: number of field tables stored
-# field_table_cap: allocated slots in field_tables
-# field_pool:      contiguous FieldEntry storage backing field_tables
-# field_pool_len:  number of FieldEntries stored
-# field_pool_cap:  allocated slots in field_pool
-# field_epoch:     the current build epoch, bumped once per sema pass by the driver
-#                  (field_epoch_bump). a field-table builder stamps it onto each
-#                  table and rebuilds any table whose epoch is older, so a record's
-#                  field-type change on a long-lived session refreshes the cached
-#                  layout instead of leaving it stale (#1583)
-# visits:          pool of TypeId-keyed visited sets a graph walk borrows for its cycle
-#                  guard, one per level of nesting, checked out and returned in stack order
-# visits_len:      sets currently borrowed, which is the current nesting depth
-# visits_cap:      allocated sets in visits
-# pairs:           pool of PAIR-keyed visited sets a lockstep walk borrows, one per level
-#                  of nesting, checked out and returned in stack order
-# pairs_len:       sets currently borrowed, which is the current nesting depth
-# pairs_cap:       allocated sets in pairs
-# gparam:          per-TypeId memo of "this nominal's field graph mentions a generic
-#                  parameter", one GPARAM_* state per TypeId
-# gparam_cap:      allocated slots in gparam
-# gparam_epoch:    the field epoch the memo's contents describe; a bump retires them
 pub rec TypeInterner {
     a: *A.Allocator;
 
-    types:    *Type;
-    type_len: u32;
-    type_cap: u32;
+    types: handle.StableChunks[Type];
 
     params:     *TypeId;
     params_len: u32;
@@ -661,51 +402,26 @@ pub rec TypeInterner {
 
     dedup: map.Map[Type, TypeId];
 
-    # TYPE_FUN bypasses `dedup` (its params live in the side pool).
-    # A content hash of (ret, params) to TypeId deduplicates structurally
-    # equal function types, collapsing the per-generic-call TYPE_FUN explosion.
-    # A hash collision degrades to a fresh append (the prior non-deduped default),
-    # never to a wrong identity, since the candidate is verified against the
-    # mapped type before reuse.
-    fun_index: map.Map[u64, TypeId];
+    fun_index:      map.Map[u64, TypeId];
+    instance_index: map.Map[u64, TypeId];
 
-    # TYPE_INSTANCE bypasses `dedup` (its args live in the side pool, which the
-    # context-free dedup hash cannot read), so instance TypeIds are tracked in
-    # their own list and deduped by scanning it - O(instances), not O(type_len).
-    instances:     *TypeId;
-    instances_len: u32;
-    instances_cap: u32;
-
-    # TYPE_HANDLE bypasses `dedup` for the same reason TYPE_INSTANCE does: its
-    # operand words live in the side pool below, which the context-free dedup hash
-    # cannot read. Handles are deduped by scanning this list, O(handles).
     handles:     *TypeId;
     handles_len: u32;
     handles_cap: u32;
 
-    # contiguous storage for every handle's operand words. OPAQUE: the compiler
-    # holds the words a declaration folded and knows the meaning of none of them
     handle_ops:     *u32;
     handle_ops_len: u32;
     handle_ops_cap: u32;
 
     prims: [PRIM_COUNT]TypeId;
 
-    # pre-interned TypeIds for the ten seeded vector shapes, indexed by the
-    # ordinal `vec_shape` uses, so a seeded shape has a stable id from init.
     vecs: [VEC_COUNT]TypeId;
 
-    field_tables:    *FieldTable;
-    field_table_len: u32;
-    field_table_cap: u32;
+    field_tables: handle.StableChunks[FieldTable];
 
-    # nominal / instance TypeId -> its index in field_tables, so a field-table
-    # lookup is O(1) rather than a linear scan of every registered table.
     field_index: map.Map[TypeId, u32];
 
-    field_pool:     *FieldEntry;
-    field_pool_len: u32;
-    field_pool_cap: u32;
+    field_pool: handle.StableChunks[FieldEntry];
 
     field_epoch: u32;
 
@@ -722,35 +438,52 @@ pub rec TypeInterner {
     gparam_epoch: u32;
 }
 
-# initial capacities for the interner's growable backing arrays
-val INITIAL_TYPE_CAP:        u32 = 64;
 val INITIAL_PARAMS_CAP:      u32 = 32;
 val INITIAL_INSTANCE_CAP:    u32 = 16;
-val INITIAL_FIELD_TABLE_CAP: u32 = 16;
-val INITIAL_FIELD_POOL_CAP:  u32 = 64;
-# slots in a freshly allocated VisitSet, and sets in a freshly allocated pool
 val INITIAL_VISIT_CAP:       u32 = 64;
 val INITIAL_VISIT_DEPTH:     u32 = 4;
 
-# construct an empty interner with primitives pre-allocated
-# ---
-# ti:  pointer to the interner to populate
-# a:   allocator used for all owned storage
-# ret: none on success (`ti` populated), or some(error) on allocation failure
+fun grow_cap[T](alloc: *A.Allocator, data: **T, cap: *u32, initial: u32) R.Result[R.Void, str] {
+    if (@data == nil) {
+        val res_alloc: R.Result[*T, str] = A.allocate[T](alloc, initial::usize);
+        if (R.is_err[*T, str](res_alloc)) { ret R.err[R.Void, str](R.unwrap_err[*T, str](res_alloc)); }
+        @data = R.unwrap_ok[*T, str](res_alloc);
+        @cap  = initial;
+        ret R.ok_void[str]();
+    }
+    val current: layout.CheckedCount[T] = layout.count[T]((@cap)::usize);
+    val required_r: R.Result[layout.CheckedCount[T], layout.CheckCause] =
+        layout.count_add[T](current, layout.count[T](1::usize));
+    if (R.is_err[layout.CheckedCount[T], layout.CheckCause](required_r)) {
+        ret R.err[R.Void, str]("type: growth count overflow");
+    }
+    val required: layout.CheckedCount[T] = R.unwrap_ok[layout.CheckedCount[T], layout.CheckCause](required_r);
+    val grown_r: R.Result[layout.CheckedCount[T], layout.CheckCause] = layout.count_grow[T](current, required);
+    if (R.is_err[layout.CheckedCount[T], layout.CheckCause](grown_r)) {
+        ret R.err[R.Void, str]("type: growth count overflow");
+    }
+    val new_cap_fits: R.Result[u32, layout.CheckCause] = layout.usize_to_u32(
+        R.unwrap_ok[layout.CheckedCount[T], layout.CheckCause](grown_r).value);
+    if (R.is_err[u32, layout.CheckCause](new_cap_fits)) {
+        ret R.err[R.Void, str]("type: growth capacity exceeds the u32 limit");
+    }
+    val new_cap: u32 = R.unwrap_ok[u32, layout.CheckCause](new_cap_fits);
+    val res_realloc: R.Result[*T, str] = A.reallocate[T](alloc, @data, (@cap)::usize, new_cap::usize);
+    if (R.is_err[*T, str](res_realloc)) { ret R.err[R.Void, str](R.unwrap_err[*T, str](res_realloc)); }
+    @data = R.unwrap_ok[*T, str](res_realloc);
+    @cap  = new_cap;
+    ret R.ok_void[str]();
+}
+
 pub fun init(ti: *TypeInterner, a: *A.Allocator) O.Option[str] {
     ti.a = a;
 
-    ti.types    = nil;
-    ti.type_len = 0;
-    ti.type_cap = 0;
+    ti.types = handle.chunk_init[Type](a);
 
     ti.params     = nil;
     ti.params_len = 0;
     ti.params_cap = 0;
 
-    ti.instances     = nil;
-    ti.instances_len = 0;
-    ti.instances_cap = 0;
     ti.handles     = nil;
     ti.handles_len = 0;
     ti.handles_cap = 0;
@@ -758,13 +491,8 @@ pub fun init(ti: *TypeInterner, a: *A.Allocator) O.Option[str] {
     ti.handle_ops_len = 0;
     ti.handle_ops_cap = 0;
 
-    ti.field_tables    = nil;
-    ti.field_table_len = 0;
-    ti.field_table_cap = 0;
-
-    ti.field_pool     = nil;
-    ti.field_pool_len = 0;
-    ti.field_pool_cap = 0;
+    ti.field_tables = handle.chunk_init[FieldTable](a);
+    ti.field_pool   = handle.chunk_init[FieldEntry](a);
 
     ti.field_epoch = 0;
 
@@ -780,17 +508,10 @@ pub fun init(ti: *TypeInterner, a: *A.Allocator) O.Option[str] {
     ti.gparam_cap   = 0;
     ti.gparam_epoch = 0;
 
-    ti.dedup       = map.init[Type, TypeId](a, hash_type, eq_type);
-    ti.fun_index   = map.init[u64, TypeId](a, map.hash_u64, map.eq_u64);
-    ti.field_index = map.init[TypeId, u32](a, map.hash_u32, map.eq_u32);
-
-    val res_types: R.Result[*Type, str] = A.allocate[Type](a, INITIAL_TYPE_CAP::usize);
-    if (R.is_err[*Type, str](res_types)) {
-        dnit(ti);
-        ret O.some[str](R.unwrap_err[*Type, str](res_types));
-    }
-    ti.types    = R.unwrap_ok[*Type, str](res_types);
-    ti.type_cap = INITIAL_TYPE_CAP;
+    ti.dedup          = map.init[Type, TypeId](a, hash_type, eq_type);
+    ti.fun_index      = map.init[u64, TypeId](a, map.hash_u64, map.eq_u64);
+    ti.instance_index = map.init[u64, TypeId](a, map.hash_u64, map.eq_u64);
+    ti.field_index    = map.init[TypeId, u32](a, map.hash_u32, map.eq_u32);
 
     val res_params: R.Result[*TypeId, str] = A.allocate[TypeId](a, INITIAL_PARAMS_CAP::usize);
     if (R.is_err[*TypeId, str](res_params)) {
@@ -800,9 +521,6 @@ pub fun init(ti: *TypeInterner, a: *A.Allocator) O.Option[str] {
     ti.params     = R.unwrap_ok[*TypeId, str](res_params);
     ti.params_cap = INITIAL_PARAMS_CAP;
 
-    # seed the primitives in kind order. prim(kind) indexes the resulting
-    # prims[] table to recover a primitive's TypeId, so nothing depends on a
-    # primitive's TypeId equaling its kind ordinal.
     var i: u32 = 0;
     for (i < PRIM_COUNT) {
         var t: Type;
@@ -816,9 +534,6 @@ pub fun init(ti: *TypeInterner, a: *A.Allocator) O.Option[str] {
         val tid: TypeId = R.unwrap_ok[TypeId, str](res_append);
         ti.prims[i] = tid;
 
-        # record the primitive in the dedup map so a later intern of the same
-        # primitive returns this TypeId. redundant for primitives, but it keeps
-        # one code path for every kind.
         val res_insert: R.Result[bool, str] = map.insert[Type, TypeId](?ti.dedup, t, tid);
         if (R.is_err[bool, str](res_insert)) {
             dnit(ti);
@@ -828,8 +543,6 @@ pub fun init(ti: *TypeInterner, a: *A.Allocator) O.Option[str] {
         i = i + 1;
     }
 
-    # seed the ten vector shapes so each has a stable TypeId the resolver reads
-    # back through `vec`. intern_vector dedups, so seeding never doubles a shape.
     var vi: u32 = 0;
     for (vi < VEC_COUNT) {
         val sh: VecShape = vec_shape(vi);
@@ -845,16 +558,10 @@ pub fun init(ti: *TypeInterner, a: *A.Allocator) O.Option[str] {
     ret O.none[str]();
 }
 
-# tear down a TypeInterner, freeing every owned array and map and zeroing it
-# back to a clean slate
-# ---
-# ti: the interner to tear down
 pub fun dnit(ti: *TypeInterner) {
     if (ti == nil) { ret; }
 
-    if (ti.types != nil && ti.type_cap > 0) {
-        A.deallocate[Type](ti.a, ti.types, ti.type_cap::usize);
-    }
+    handle.chunk_dnit[Type](?ti.types);
     if (ti.params != nil && ti.params_cap > 0) {
         A.deallocate[TypeId](ti.a, ti.params, ti.params_cap::usize);
     }
@@ -864,15 +571,8 @@ pub fun dnit(ti: *TypeInterner) {
     if (ti.handle_ops != nil && ti.handle_ops_cap > 0) {
         A.deallocate[u32](ti.a, ti.handle_ops, ti.handle_ops_cap::usize);
     }
-    if (ti.instances != nil && ti.instances_cap > 0) {
-        A.deallocate[TypeId](ti.a, ti.instances, ti.instances_cap::usize);
-    }
-    if (ti.field_tables != nil && ti.field_table_cap > 0) {
-        A.deallocate[FieldTable](ti.a, ti.field_tables, ti.field_table_cap::usize);
-    }
-    if (ti.field_pool != nil && ti.field_pool_cap > 0) {
-        A.deallocate[FieldEntry](ti.a, ti.field_pool, ti.field_pool_cap::usize);
-    }
+    handle.chunk_dnit[FieldTable](?ti.field_tables);
+    handle.chunk_dnit[FieldEntry](?ti.field_pool);
     if (ti.visits != nil && ti.visits_cap > 0) {
         var vi: u32 = 0;
         for (vi < ti.visits_cap) {
@@ -897,33 +597,19 @@ pub fun dnit(ti: *TypeInterner) {
 
     map.dnit[Type, TypeId](?ti.dedup);
     map.dnit[u64, TypeId](?ti.fun_index);
+    map.dnit[u64, TypeId](?ti.instance_index);
     map.dnit[TypeId, u32](?ti.field_index);
-
-    ti.types    = nil;
-    ti.type_len = 0;
-    ti.type_cap = 0;
 
     ti.params     = nil;
     ti.params_len = 0;
     ti.params_cap = 0;
 
-    ti.instances     = nil;
-    ti.instances_len = 0;
-    ti.instances_cap = 0;
     ti.handles     = nil;
     ti.handles_len = 0;
     ti.handles_cap = 0;
     ti.handle_ops     = nil;
     ti.handle_ops_len = 0;
     ti.handle_ops_cap = 0;
-
-    ti.field_tables    = nil;
-    ti.field_table_len = 0;
-    ti.field_table_cap = 0;
-
-    ti.field_pool     = nil;
-    ti.field_pool_len = 0;
-    ti.field_pool_cap = 0;
 
     ti.field_epoch = 0;
 
@@ -940,62 +626,32 @@ pub fun dnit(ti: *TypeInterner) {
     ti.gparam_epoch = 0;
 }
 
-# return a pointer to the Type for a given TypeId, or none when tid is out of
-# range
-# ---
-# ti:  the interner
-# tid: TypeId returned by a previous intern call
-# ret: some(*Type) into ti.types (invalidated by a later intern that grows the array), or none
 pub fun get(ti: *TypeInterner, tid: TypeId) O.Option[*Type] {
-    if (tid >= ti.type_len) { ret O.none[*Type](); }
-    ret O.some[*Type](?ti.types[tid]);
+    val r: R.Result[*Type, str] = handle.chunk_get[Type](?ti.types, tid::usize);
+    if (R.is_err[*Type, str](r)) { ret O.none[*Type](); }
+    ret O.some[*Type](R.unwrap_ok[*Type, str](r));
 }
 
-# return the TypeId at `index` in the parameter pool, or none when index is
-# out of range
-# ---
-# ti:    the interner
-# index: pool index (typically `fun.params_start + i`)
-# ret:   some(TypeId) at the given pool slot, or none
+pub fun type_count(ti: *TypeInterner) u32 {
+    ret handle.chunk_count[Type](?ti.types)::u32;
+}
+
 pub fun get_param(ti: *TypeInterner, index: u32) O.Option[TypeId] {
     if (index >= ti.params_len) { ret O.none[TypeId](); }
     ret O.some[TypeId](ti.params[index]);
 }
 
-# return the TypeId for a primitive TypeKind
-# ---
-# ti:   the interner
-# kind: a primitive kind (TYPE_U8 .. TYPE_PTR)
-# ret:  some(TypeId) for a primitive kind, none when kind is not a primitive
 pub fun prim(ti: *TypeInterner, kind: TypeKind) O.Option[TypeId] {
     if (kind >= PRIM_COUNT) { ret O.none[TypeId](); }
     ret O.some[TypeId](ti.prims[kind]);
 }
 
-# whether `tid` is an integer primitive (u8..i64)
-#
-# Reads the kind through the interner, so, unlike a bare `tid == TYPE_U8`
-# ordinal test, it never depends on a primitive's TypeId equaling its kind
-# ordinal. The single shared predicate for sema's infer / check / coerce passes.
-# A secret `^T` is classified by its inner type, so secret integers participate
-# in arithmetic exactly as public ones (the join and gates are layered on top).
-# ---
-# ti:  the interner
-# tid: the TypeId to classify
-# ret: true for u8..u64 and i8..i64
 pub fun is_integer(ti: *TypeInterner, tid: TypeId) bool {
     val opt_type: O.Option[*Type] = get(ti, strip_secret(ti, tid));
     if (O.is_none[*Type](opt_type)) { ret false; }
     ret prim_desc(O.unwrap[*Type](opt_type).kind).class == PRIM_CLASS_INT;
 }
 
-# whether `tid` is an integer or float primitive (u8..f64)
-#
-# A secret `^T` is classified by its inner type.
-# ---
-# ti:  the interner
-# tid: the TypeId to classify
-# ret: true for any integer or float primitive
 pub fun is_numeric(ti: *TypeInterner, tid: TypeId) bool {
     val opt_type: O.Option[*Type] = get(ti, strip_secret(ti, tid));
     if (O.is_none[*Type](opt_type)) { ret false; }
@@ -1003,28 +659,12 @@ pub fun is_numeric(ti: *TypeInterner, tid: TypeId) bool {
     ret c == PRIM_CLASS_INT || c == PRIM_CLASS_FLOAT;
 }
 
-# whether `tid` is a float primitive (f32 or f64)
-#
-# A secret `^T` is classified by its inner type.
-# ---
-# ti:  the interner
-# tid: the TypeId to classify
-# ret: true for f32 or f64
 pub fun is_float(ti: *TypeInterner, tid: TypeId) bool {
     val opt_type: O.Option[*Type] = get(ti, strip_secret(ti, tid));
     if (O.is_none[*Type](opt_type)) { ret false; }
     ret prim_desc(O.unwrap[*Type](opt_type).kind).class == PRIM_CLASS_FLOAT;
 }
 
-# whether `tid` is address-shaped - a raw `ptr`, a typed `*T`, or a function
-# (a code address)
-#
-# Used to relate `nil` and reinterpret casts against pointer and function
-# operands. A secret `^T` is classified by its inner type.
-# ---
-# ti:  the interner
-# tid: the TypeId to classify
-# ret: true for TYPE_PTR / TYPE_POINTER / TYPE_FUN
 pub fun is_pointer_like(ti: *TypeInterner, tid: TypeId) bool {
     val opt_type: O.Option[*Type] = get(ti, strip_secret(ti, tid));
     if (O.is_none[*Type](opt_type)) { ret false; }
@@ -1032,37 +672,18 @@ pub fun is_pointer_like(ti: *TypeInterner, tid: TypeId) bool {
     ret k == TYPE_PTR || k == TYPE_POINTER || k == TYPE_FUN;
 }
 
-# whether `tid` is a secret-qualified type `^T`
-# ---
-# ti:  the interner
-# tid: the TypeId to classify
-# ret: true when `tid`'s kind is TYPE_SECRET
 pub fun is_secret(ti: *TypeInterner, tid: TypeId) bool {
     val opt_type: O.Option[*Type] = get(ti, tid);
     if (O.is_none[*Type](opt_type)) { ret false; }
     ret O.unwrap[*Type](opt_type).kind == TYPE_SECRET;
 }
 
-# whether `tid` is a vector type (#1965)
-#
-# A secret `^T` is classified by its inner type, so a secret vector still reports
-# as a vector for layout and lane classification.
-# ---
-# ti:  the interner
-# tid: the TypeId to classify
-# ret: true when `tid` (or its inner type under `^`) is a vector
 pub fun is_vector(ti: *TypeInterner, tid: TypeId) bool {
     val opt_type: O.Option[*Type] = get(ti, strip_secret(ti, tid));
     if (O.is_none[*Type](opt_type)) { ret false; }
     ret O.unwrap[*Type](opt_type).kind == TYPE_VECTOR;
 }
 
-# the lane scalar TypeKind of a vector type, or TYPE_VECTOR itself when `tid` is
-# not a vector (callers gate on is_vector first)
-# ---
-# ti:  the interner
-# tid: a vector TypeId (secret-stripped internally)
-# ret: the lane scalar kind, or TYPE_VECTOR when `tid` is not a vector
 pub fun vector_element(ti: *TypeInterner, tid: TypeId) TypeKind {
     val opt_type: O.Option[*Type] = get(ti, strip_secret(ti, tid));
     if (O.is_none[*Type](opt_type)) { ret TYPE_VECTOR; }
@@ -1071,11 +692,6 @@ pub fun vector_element(ti: *TypeInterner, tid: TypeId) TypeKind {
     ret t.data.vector.element;
 }
 
-# the lane count of a vector type, or 0 when `tid` is not a vector
-# ---
-# ti:  the interner
-# tid: a vector TypeId (secret-stripped internally)
-# ret: the lane count, or 0 when `tid` is not a vector
 pub fun vector_lanes(ti: *TypeInterner, tid: TypeId) u32 {
     val opt_type: O.Option[*Type] = get(ti, strip_secret(ti, tid));
     if (O.is_none[*Type](opt_type)) { ret 0; }
@@ -1084,27 +700,6 @@ pub fun vector_lanes(ti: *TypeInterner, tid: TypeId) u32 {
     ret t.data.vector.lanes;
 }
 
-# the number of ELEMENTS a type holds, the question `$length_of` asks (#2536)
-#
-# ONE definition because two callers need the identical answer - sema types and
-# folds the intrinsic in a type position, lowering folds it in a value one - and a
-# rule enumerated twice is this codebase's recurring drift bug, the same reason
-# `shape_kind` is shared.
-#
-# Only two kinds have a statically known element count: a fixed array, whose count
-# is written or inferred, and a vector, whose count is its lane count. NONE for
-# everything else, and none is a refusal rather than a zero: a pointer (`str`
-# included) has a length the compiler does not know, and a record has a field count
-# rather than an element count. Answering either with a number would put a plausible
-# wrong value where the caller asked a question with no answer.
-#
-# `^` IS stripped, which puts this with `$size_of` rather than with the shape
-# predicates: how many elements are stored is a storage question, and `^[4]u8`
-# stores four of them.
-# ---
-# ti:  the type interner
-# tid: the type to measure
-# ret: some(count) for an array or a vector, none for everything else
 pub fun element_count(ti: *TypeInterner, tid: TypeId) O.Option[u32] {
     if (tid == TYPE_NIL || tid == TYPE_ERROR) { ret O.none[u32](); }
     val t_opt: O.Option[*Type] = get(ti, strip_secret(ti, tid));
@@ -1115,25 +710,11 @@ pub fun element_count(ti: *TypeInterner, tid: TypeId) O.Option[u32] {
     ret O.none[u32]();
 }
 
-# the TypeId of the seeded vector shape at ordinal `index`
-# ---
-# ti:    the interner
-# index: ordinal in [0, VEC_COUNT)
-# ret:   some(TypeId) for a seeded shape, none when index is out of range
 pub fun vec(ti: *TypeInterner, index: u32) O.Option[TypeId] {
     if (index >= VEC_COUNT) { ret O.none[TypeId](); }
     ret O.some[TypeId](ti.vecs[index]);
 }
 
-# the same-shape unsigned mask vector for a vector comparison result (#1965)
-#
-# A comparison lanes-wise yields all-ones / all-zeros masks in an unsigned vector
-# of the same lane width and count (`f32x4`/`i32x4` -> `u32x4`, `i8x16` ->
-# `u8x16`, and so on).
-# ---
-# ti:  the interner
-# tid: the operand vector TypeId
-# ret: the mask vector TypeId, or an allocation error
 pub fun vector_mask(ti: *TypeInterner, tid: TypeId) R.Result[TypeId, str] {
     val element: TypeKind = vector_element(ti, tid);
     val lanes:   u32      = vector_lanes(ti, tid);
@@ -1148,14 +729,6 @@ pub fun vector_mask(ti: *TypeInterner, tid: TypeId) R.Result[TypeId, str] {
     ret intern_vector(ti, mask_elem, lanes);
 }
 
-# peel one secret qualifier from `tid`, returning the inner type
-#
-# A non-secret type is returned unchanged. `^^T` never forms (intern_secret
-# collapses it), so a single peel is exhaustive.
-# ---
-# ti:  the interner
-# tid: the TypeId to strip
-# ret: the inner type when `tid` is `^T`, else `tid` unchanged
 pub fun strip_secret(ti: *TypeInterner, tid: TypeId) TypeId {
     val opt_type: O.Option[*Type] = get(ti, tid);
     if (O.is_none[*Type](opt_type)) { ret tid; }
@@ -1164,28 +737,6 @@ pub fun strip_secret(ti: *TypeInterner, tid: TypeId) TypeId {
     ret t.data.secret.base;
 }
 
-# the SHAPE kind a comptime type predicate answers over: `tid` with any `^` secret
-# wrapper removed and a generic instance resolved to the kind of the declaration it
-# instantiates (#2128)
-#
-# ONE definition because two callers need the identical answer - sema folds these
-# predicates during arm selection, lowering folds them for a gate deferred to
-# monomorphization - and a shape rule enumerated twice is this codebase's recurring
-# drift bug. Secret is stripped because `^T` is a wrapper over `T`'s storage, so a
-# shape question asked through one is asking about `T` (#2297, #2373). An instance
-# resolves to its nominal because post-#2168 the type a reflection loop meets for
-# `Box[i64]` is a TYPE_INSTANCE, and answering "not a record" there would be useless
-# to exactly the generic code these predicates serve.
-# ---
-# ti:  the type interner
-# tid: the type to classify
-# ret: its shape kind; TYPE_U8 when `tid` names no live type
-#
-# TYPE_U8 is the deliberate answer for a dead id, not a placeholder: every predicate
-# built on this asks `kind == REC` / `== UNI` / `== POINTER`, so a scalar kind makes
-# all of them false. A type that does not exist is not a record, a union, or a
-# reference, and answering with a shape-bearing kind would make it one. There is no
-# "kind of TYPE_NIL" to return - TYPE_NIL is a TypeId sentinel, not a TypeKind.
 pub fun shape_kind(ti: *TypeInterner, tid: TypeId) TypeKind {
     if (tid == TYPE_NIL || tid == TYPE_ERROR) { ret TYPE_U8; }
     val base: TypeId = strip_secret(ti, tid);
@@ -1201,22 +752,13 @@ pub fun shape_kind(ti: *TypeInterner, tid: TypeId) TypeKind {
     ret O.unwrap[*Type](n_opt).kind;
 }
 
-# whether `tid` carries secret data anywhere along its pointer / array / secret
-# spine - the predicate the welded-storage rules use to keep secret memory off
-# the untyped `ptr`
-#
-# Follows `^` (true immediately), a typed pointer's pointee, and an array's
-# element. A nominal rec/uni is a leaf here (its secret fields are welded at the
-# field level), so the walk is over a finite spine and always terminates.
-#
-# `generics.contains_secret_deep` is the DEEP counterpart, recursing INTO nominal field
-# graphs. It lives there rather than here because a generic instance's field table is
-# materialized lazily and must be resolved before it can be walked, which is a dependency
-# `type` cannot reach.
-# ---
-# ti:  the interner
-# tid: the TypeId to inspect
-# ret: true when a secret qualifier appears along the spine
+pub fun is_u8(ti: *TypeInterner, tid: TypeId) bool {
+    if (tid == TYPE_NIL || tid == TYPE_ERROR) { ret false; }
+    val base: TypeId = strip_secret(ti, tid);
+    if (O.is_none[*Type](get(ti, base))) { ret false; }
+    ret shape_kind(ti, base) == TYPE_U8;
+}
+
 pub fun carries_secret(ti: *TypeInterner, tid: TypeId) bool {
     val opt_type: O.Option[*Type] = get(ti, tid);
     if (O.is_none[*Type](opt_type)) { ret false; }
@@ -1227,73 +769,24 @@ pub fun carries_secret(ti: *TypeInterner, tid: TypeId) bool {
     ret false;
 }
 
-# one visited set over the type universe: an epoch stamp per TypeId
-#
-# The epoch is what makes a set reusable without clearing: a mark writes the current
-# epoch, "already visited" is a stamp equal to it, and the next walk to borrow the set
-# just advances the epoch. Both O(1), so a cycle guard costs nothing per node and its
-# capacity is the type universe's rather than a constant.
-# ---
-# stamp: one epoch slot per TypeId
-# cap:   allocated slots in stamp
-# epoch: the epoch the walk currently holding this set marks with
 rec VisitSet {
     stamp: *u32;
     cap:   u32;
     epoch: u32;
 }
 
-# a graph walk's borrowed visited set: the cycle guard that lets a recursive walk over the
-# type universe terminate on a self-referential record graph (#2162)
-#
-# It replaces the fixed arrays those walks used to carry, whose bounds an ORDINARY program
-# reached (#3065). A merely LARGE type graph exhausted the visited set and took the walk's
-# fail-closed exit, so a program containing no `^` at all was rejected for secrecy, and the
-# message named a concept the program did not use. A visited set sized like the type
-# universe cannot be exhausted by a program's size, only by the allocator - which is the
-# only thing the fail-closed exit should ever be about.
-#
-# Sets are borrowed from the interner's pool in STACK order, because these walks NEST: the
-# generic-union instance walk asks a secrecy question about each variant pair, and that
-# question is a walk of its own. A single shared set would let the inner walk retire the
-# outer walk's marks and unbind its cycle guard, so each depth gets its own set.
-#
-# The interner is the owner because it owns the type table every TypeId indexes: one slot
-# per TypeId is the same shape and grows on the same axis.
-# ---
-# level: the borrowed set's index in the interner's pool, or SCAN_NONE when the borrow
-#        failed - every mark then reports VISIT_FAILED, taking the walk's fail-closed exit
 pub rec TypeScan {
     level: u32;
 }
 
-# a TypeScan holding no set, because the pool could not be grown
 val SCAN_NONE: u32 = 0xFFFFFFFF;
 
-# the outcome of entering one TypeId on a TypeScan
-#
-# Three states, not a bool: "already visited" and "could not record" demand OPPOSITE
-# answers from the walks that share this guard. A visited node contributes nothing, while
-# an unrecordable one leaves the walk unbounded and must take that walk's fail-closed exit
-# - which is `true` for `generics.contains_secret_deep` and `false` for
-# `generics.deep_all_secret`. Folding the two together would invert one of them.
 pub def VisitMark: u8;
 
-# `tid` was not yet on this walk and is now recorded; descend into it
 pub val VISIT_FRESH:  VisitMark = 0;
-# `tid` is already on this walk; the caller's cycle guard applies
 pub val VISIT_SEEN:   VisitMark = 1;
-# `tid` could not be recorded; the walk is unbounded from here and the caller must fail closed
 pub val VISIT_FAILED: VisitMark = 2;
 
-# borrow a visited set for one walk, retiring every mark the previous borrower left
-#
-# Infallible by design: a pool that cannot be grown binds the scan to SCAN_NONE rather
-# than reporting, so the failure surfaces at the first mark through the fail-closed path
-# the walks already have, and neither entry point needs an error arm of its own.
-# ---
-# ti:   the interner owning the pool
-# scan: the handle to bind to the borrowed set
 pub fun type_scan_begin(ti: *TypeInterner, scan: *TypeScan) {
     if (O.is_some[str](visits_reserve(ti))) {
         scan.level = SCAN_NONE;
@@ -1303,10 +796,6 @@ pub fun type_scan_begin(ti: *TypeInterner, scan: *TypeScan) {
     val level: u32 = ti.visits_len;
     ti.visits_len  = ti.visits_len + 1;
 
-    # epoch 0 means never visited and is what a fresh or re-zeroed slot holds, so the
-    # counter wraps to 1 rather than to 0. Clearing first is what makes the wrap exact:
-    # without it a stamp from four billion walks ago would read as current. One clear per
-    # 2^32 borrows of this set.
     if (ti.visits[level].epoch == 0xFFFFFFFF) {
         if (ti.visits[level].stamp != nil && ti.visits[level].cap > 0) {
             memory.zero[u32](ti.visits[level].stamp, ti.visits[level].cap::usize);
@@ -1320,31 +809,15 @@ pub fun type_scan_begin(ti: *TypeInterner, scan: *TypeScan) {
     scan.level = level;
 }
 
-# return `scan`'s set to the pool, freeing it for the next walk at this depth
-#
-# The set keeps its array and its epoch, so the next borrower pays neither an allocation
-# nor a clear.
-# ---
-# ti:   the interner owning the pool
-# scan: the handle to release
 pub fun type_scan_end(ti: *TypeInterner, scan: *TypeScan) {
     if (scan.level == SCAN_NONE) { ret; }
     ti.visits_len = scan.level;
     scan.level    = SCAN_NONE;
 }
 
-# enter `tid` on `scan`, reporting whether this walk had already reached it
-# ---
-# ti:   the interner owning the pool
-# scan: the open scan
-# tid:  the TypeId being entered
-# ret:  VISIT_FRESH, VISIT_SEEN, or VISIT_FAILED
 pub fun type_scan_mark(ti: *TypeInterner, scan: *TypeScan, tid: TypeId) VisitMark {
     if (scan.level == SCAN_NONE) { ret VISIT_FAILED; }
 
-    # a walk materializes generic-instance field tables as it goes, and that interns types,
-    # so a TypeId can be minted MID-WALK and land past the array. The growth belongs here
-    # rather than at `begin`, which cannot know the type count the walk will end at.
     if (tid >= ti.visits[scan.level].cap) {
         if (O.is_some[str](visit_reserve(ti, scan.level, tid))) { ret VISIT_FAILED; }
     }
@@ -1355,58 +828,47 @@ pub fun type_scan_mark(ti: *TypeInterner, scan: *TypeScan, tid: TypeId) VisitMar
     ret VISIT_FRESH;
 }
 
-# grow the pool so one more set can be borrowed, initializing the new sets empty
-# ---
-# ti:  the interner
-# ret: none once a set is free, or some(error) on allocation failure
 fun visits_reserve(ti: *TypeInterner) O.Option[str] {
     if (ti.visits_len < ti.visits_cap) { ret O.none[str](); }
 
-    var new_cap: u32 = ti.visits_cap * 2;
-    if (new_cap == 0) { new_cap = INITIAL_VISIT_DEPTH; }
+    val old_cap: u32 = ti.visits_cap;
+    val grown: R.Result[R.Void, str] = grow_cap[VisitSet](ti.a, ?ti.visits, ?ti.visits_cap, INITIAL_VISIT_DEPTH);
+    if (R.is_err[R.Void, str](grown)) { ret O.some[str](R.unwrap_err[R.Void, str](grown)); }
 
-    if (ti.visits == nil) {
-        val res_alloc: R.Result[*VisitSet, str] = A.allocate[VisitSet](ti.a, new_cap::usize);
-        if (R.is_err[*VisitSet, str](res_alloc)) {
-            ret O.some[str](R.unwrap_err[*VisitSet, str](res_alloc));
-        }
-        ti.visits = R.unwrap_ok[*VisitSet, str](res_alloc);
-    }
-    or {
-        val res_realloc: R.Result[*VisitSet, str] = A.reallocate[VisitSet](ti.a, ti.visits, ti.visits_cap::usize, new_cap::usize);
-        if (R.is_err[*VisitSet, str](res_realloc)) {
-            ret O.some[str](R.unwrap_err[*VisitSet, str](res_realloc));
-        }
-        ti.visits = R.unwrap_ok[*VisitSet, str](res_realloc);
-    }
-
-    var i: u32 = ti.visits_cap;
-    for (i < new_cap) {
+    var i: u32 = old_cap;
+    for (i < ti.visits_cap) {
         ti.visits[i].stamp = nil;
         ti.visits[i].cap   = 0;
         ti.visits[i].epoch = 0;
         i = i + 1;
     }
-    ti.visits_cap = new_cap;
 
     ret O.none[str]();
 }
 
-# grow the set at `level` until `tid` addresses a slot, zeroing the new slots so they read
-# as never visited
-# ---
-# ti:    the interner
-# level: the set's index in the pool
-# tid:   the TypeId that must be addressable
-# ret:   none once the slot exists, or some(error) on allocation failure
 fun visit_reserve(ti: *TypeInterner, level: u32, tid: TypeId) O.Option[str] {
     val set: *VisitSet = ?ti.visits[level];
 
-    var new_cap: u32 = set.cap;
-    if (new_cap == 0) { new_cap = INITIAL_VISIT_CAP; }
-    for (new_cap <= tid) {
-        new_cap = new_cap * 2;
+    var base_cap: u32 = set.cap;
+    if (base_cap == 0) { base_cap = INITIAL_VISIT_CAP; }
+
+    val required_r: R.Result[layout.CheckedCount[u32], layout.CheckCause] =
+        layout.count_add[u32](layout.count[u32](tid::usize), layout.count[u32](1::usize));
+    if (R.is_err[layout.CheckedCount[u32], layout.CheckCause](required_r)) {
+        ret O.some[str]("type: visit-set requirement overflow");
     }
+    val required: layout.CheckedCount[u32] = R.unwrap_ok[layout.CheckedCount[u32], layout.CheckCause](required_r);
+    val grown_r: R.Result[layout.CheckedCount[u32], layout.CheckCause] =
+        layout.count_grow[u32](layout.count[u32](base_cap::usize), required);
+    if (R.is_err[layout.CheckedCount[u32], layout.CheckCause](grown_r)) {
+        ret O.some[str]("type: visit-set growth count overflow");
+    }
+    val new_cap_fits: R.Result[u32, layout.CheckCause] = layout.usize_to_u32(
+        R.unwrap_ok[layout.CheckedCount[u32], layout.CheckCause](grown_r).value);
+    if (R.is_err[u32, layout.CheckCause](new_cap_fits)) {
+        ret O.some[str]("type: visit-set capacity exceeds the u32 limit");
+    }
+    val new_cap: u32 = R.unwrap_ok[u32, layout.CheckCause](new_cap_fits);
 
     if (set.stamp == nil) {
         val res_alloc: R.Result[*u32, str] = A.allocate[u32](ti.a, new_cap::usize);
@@ -1429,55 +891,15 @@ fun visit_reserve(ti: *TypeInterner, level: u32, tid: TypeId) O.Option[str] {
     ret O.none[str]();
 }
 
-# one visited set over PAIRS of TypeIds, epoch-stamped the way a VisitSet is
-#
-# The deep secrecy-placement comparison walks two type graphs in LOCKSTEP, so what it has
-# to remember is a PAIR (#2165). A `VisitSet` cannot express one: there is no TypeId that
-# denotes the pair the way `nominal_visit_key` interns a (nominal, args) pair, and minting
-# a synthetic type per pair would grow the type universe with types no program names. The
-# key is therefore the two ids packed into one u64, and the value is the epoch that
-# recorded it - so a borrow retires the previous borrower's entries by advancing the epoch
-# rather than by clearing the table, and a mark stays O(1) whatever the table has held.
-#
-# Stale entries are left in place deliberately. They cost one slot each and keep every
-# borrow free of a clear; the table therefore grows to the number of DISTINCT pairs the
-# session has ever compared at this depth, which is the work actually done rather than a
-# constant chosen in advance.
-# ---
-# seen:  packed (left, right) key -> the epoch of the walk that entered it
-# epoch: the epoch the walk currently holding this set marks with
 rec PairSet {
     seen:  map.Map[u64, u32];
     epoch: u32;
 }
 
-# a lockstep walk's borrowed pair set: the cycle guard for a comparison whose state is a
-# pair of positions rather than one (#3080)
-#
-# The third and last of the fixed-capacity visited sets this walk family carried. Its bound
-# was 128 pairs with a LINEAR membership rescan, and the walk answered "these two types do
-# not place `^` identically" when it filled - so a type graph merely wide enough to enter a
-# 129th pair was reported as a secrecy violation of the program, in a message about `^`
-# rather than about the checker. Borrowed from the interner, its capacity is the
-# allocator's and its membership test is a hash probe.
-#
-# Borrowed in STACK order for the same reason `TypeScan` is: this comparison runs INSIDE
-# the generic-union instance walk, which asks a secrecy question per variant pair, and each
-# question is a comparison of its own.
-# ---
-# level: the borrowed set's index in the interner's pool, or SCAN_NONE when the borrow
-#        failed - every mark then reports VISIT_FAILED, taking the walk's fail-closed exit
 pub rec PairScan {
     level: u32;
 }
 
-# borrow a pair set for one lockstep walk, retiring every mark the previous borrower left
-#
-# Infallible for the same reason `type_scan_begin` is: a pool that cannot be grown binds
-# the scan to SCAN_NONE and the failure surfaces at the first mark.
-# ---
-# ti:   the interner owning the pool
-# scan: the handle to bind to the borrowed set
 pub fun pair_scan_begin(ti: *TypeInterner, scan: *PairScan) {
     if (O.is_some[str](pairs_reserve(ti))) {
         scan.level = SCAN_NONE;
@@ -1487,8 +909,6 @@ pub fun pair_scan_begin(ti: *TypeInterner, scan: *PairScan) {
     val level: u32 = ti.pairs_len;
     ti.pairs_len   = ti.pairs_len + 1;
 
-    # epoch 0 is what a freshly initialized slot holds and what a cleared table reads as,
-    # so the counter wraps to 1 rather than to 0, and clearing first makes the wrap exact.
     if (ti.pairs[level].epoch == 0xFFFFFFFF) {
         map.clear[u64, u32](?ti.pairs[level].seen);
         ti.pairs[level].epoch = 1;
@@ -1500,23 +920,12 @@ pub fun pair_scan_begin(ti: *TypeInterner, scan: *PairScan) {
     scan.level = level;
 }
 
-# return `scan`'s set to the pool, freeing it for the next walk at this depth
-# ---
-# ti:   the interner owning the pool
-# scan: the handle to release
 pub fun pair_scan_end(ti: *TypeInterner, scan: *PairScan) {
     if (scan.level == SCAN_NONE) { ret; }
     ti.pairs_len = scan.level;
     scan.level   = SCAN_NONE;
 }
 
-# enter the pair `(a, b)` on `scan`, reporting whether this walk had already reached it
-# ---
-# ti:   the interner owning the pool
-# scan: the open scan
-# a:    the left TypeId of the pair
-# b:    the right TypeId of the pair
-# ret:  VISIT_FRESH, VISIT_SEEN, or VISIT_FAILED
 pub fun pair_scan_mark(ti: *TypeInterner, scan: *PairScan, a: TypeId, b: TypeId) VisitMark {
     if (scan.level == SCAN_NONE) { ret VISIT_FAILED; }
 
@@ -1535,66 +944,29 @@ pub fun pair_scan_mark(ti: *TypeInterner, scan: *PairScan, a: TypeId, b: TypeId)
     ret VISIT_FRESH;
 }
 
-# grow the pair pool so one more set can be borrowed, initializing the new sets empty
-# ---
-# ti:  the interner
-# ret: none once a set is free, or some(error) on allocation failure
 fun pairs_reserve(ti: *TypeInterner) O.Option[str] {
     if (ti.pairs_len < ti.pairs_cap) { ret O.none[str](); }
 
-    var new_cap: u32 = ti.pairs_cap * 2;
-    if (new_cap == 0) { new_cap = INITIAL_VISIT_DEPTH; }
+    val old_cap: u32 = ti.pairs_cap;
+    val grown: R.Result[R.Void, str] = grow_cap[PairSet](ti.a, ?ti.pairs, ?ti.pairs_cap, INITIAL_VISIT_DEPTH);
+    if (R.is_err[R.Void, str](grown)) { ret O.some[str](R.unwrap_err[R.Void, str](grown)); }
 
-    if (ti.pairs == nil) {
-        val res_alloc: R.Result[*PairSet, str] = A.allocate[PairSet](ti.a, new_cap::usize);
-        if (R.is_err[*PairSet, str](res_alloc)) {
-            ret O.some[str](R.unwrap_err[*PairSet, str](res_alloc));
-        }
-        ti.pairs = R.unwrap_ok[*PairSet, str](res_alloc);
-    }
-    or {
-        val res_realloc: R.Result[*PairSet, str] = A.reallocate[PairSet](ti.a, ti.pairs, ti.pairs_cap::usize, new_cap::usize);
-        if (R.is_err[*PairSet, str](res_realloc)) {
-            ret O.some[str](R.unwrap_err[*PairSet, str](res_realloc));
-        }
-        ti.pairs = R.unwrap_ok[*PairSet, str](res_realloc);
-    }
-
-    var i: u32 = ti.pairs_cap;
-    for (i < new_cap) {
+    var i: u32 = old_cap;
+    for (i < ti.pairs_cap) {
         ti.pairs[i].seen  = map.init[u64, u32](ti.a, map.hash_u64, map.eq_u64);
         ti.pairs[i].epoch = 0;
         i = i + 1;
     }
-    ti.pairs_cap = new_cap;
 
     ret O.none[str]();
 }
 
-# the memo states for "this nominal's field graph mentions a generic parameter"
-#
-# The property is a function of the field tables alone, so it belongs to the interner that
-# owns them and is answered once per nominal per field epoch rather than recomputed by
-# every walk that asks. Deciding it costs a walk of the whole reachable field graph, and
-# the generic-union instance walk asks it at EVERY nominal it enters, which is what made
-# that walk cubic in graph size (#3066).
 pub def GParamMemo: u8;
 
-# not yet decided at this field epoch
 pub val GPARAM_UNKNOWN: GParamMemo = 0;
-# decided: the field graph mentions no generic parameter
 pub val GPARAM_NO:      GParamMemo = 1;
-# decided: the field graph mentions a generic parameter
 pub val GPARAM_YES:     GParamMemo = 2;
 
-# read the memoized answer for `tid`, or GPARAM_UNKNOWN when there is none
-#
-# A field epoch newer than the memo's retires every entry, because a rebuilt field table
-# can change the answer for any nominal that reaches it (#1583).
-# ---
-# ti:  the interner owning the memo
-# tid: the nominal being asked about
-# ret: GPARAM_UNKNOWN, GPARAM_NO, or GPARAM_YES
 pub fun gparam_memo_get(ti: *TypeInterner, tid: TypeId) GParamMemo {
     if (ti.gparam_epoch != ti.field_epoch) {
         if (ti.gparam != nil && ti.gparam_cap > 0) {
@@ -1606,16 +978,6 @@ pub fun gparam_memo_get(ti: *TypeInterner, tid: TypeId) GParamMemo {
     ret ti.gparam[tid];
 }
 
-# record the decided answer for `tid`
-#
-# Only a walk that resolved every field table it reached may record one: an answer read
-# off an absent table is about the checker's timing rather than about the type, and
-# freezing it would outlive the table's arrival. An allocation failure growing the memo
-# simply drops the entry, which costs a recomputation and nothing else.
-# ---
-# ti:       the interner owning the memo
-# tid:      the nominal being recorded
-# mentions: the decided answer
 pub fun gparam_memo_set(ti: *TypeInterner, tid: TypeId, mentions: bool) {
     if (ti.gparam_epoch != ti.field_epoch) {
         if (ti.gparam != nil && ti.gparam_cap > 0) {
@@ -1630,17 +992,27 @@ pub fun gparam_memo_set(ti: *TypeInterner, tid: TypeId, mentions: bool) {
     or           { ti.gparam[tid] = GPARAM_NO; }
 }
 
-# grow the memo until `tid` addresses a slot, zeroing the new slots to GPARAM_UNKNOWN
-# ---
-# ti:  the interner
-# tid: the TypeId that must be addressable
-# ret: none once the slot exists, or some(error) on allocation failure
 fun gparam_reserve(ti: *TypeInterner, tid: TypeId) O.Option[str] {
-    var new_cap: u32 = ti.gparam_cap;
-    if (new_cap == 0) { new_cap = INITIAL_VISIT_CAP; }
-    for (new_cap <= tid) {
-        new_cap = new_cap * 2;
+    var base_cap: u32 = ti.gparam_cap;
+    if (base_cap == 0) { base_cap = INITIAL_VISIT_CAP; }
+
+    val required_r: R.Result[layout.CheckedCount[u8], layout.CheckCause] =
+        layout.count_add[u8](layout.count[u8](tid::usize), layout.count[u8](1::usize));
+    if (R.is_err[layout.CheckedCount[u8], layout.CheckCause](required_r)) {
+        ret O.some[str]("type: gparam memo requirement overflow");
     }
+    val required: layout.CheckedCount[u8] = R.unwrap_ok[layout.CheckedCount[u8], layout.CheckCause](required_r);
+    val grown_r: R.Result[layout.CheckedCount[u8], layout.CheckCause] =
+        layout.count_grow[u8](layout.count[u8](base_cap::usize), required);
+    if (R.is_err[layout.CheckedCount[u8], layout.CheckCause](grown_r)) {
+        ret O.some[str]("type: gparam memo growth count overflow");
+    }
+    val new_cap_fits: R.Result[u32, layout.CheckCause] = layout.usize_to_u32(
+        R.unwrap_ok[layout.CheckedCount[u8], layout.CheckCause](grown_r).value);
+    if (R.is_err[u32, layout.CheckCause](new_cap_fits)) {
+        ret O.some[str]("type: gparam memo capacity exceeds the u32 limit");
+    }
+    val new_cap: u32 = R.unwrap_ok[u32, layout.CheckCause](new_cap_fits);
 
     if (ti.gparam == nil) {
         val res_alloc: R.Result[*u8, str] = A.allocate[u8](ti.a, new_cap::usize);
@@ -1663,17 +1035,6 @@ fun gparam_reserve(ti: *TypeInterner, tid: TypeId) O.Option[str] {
     ret O.none[str]();
 }
 
-# whether two types place the secret qualifier identically along their spines
-#
-# `::` and `:~` may neither add nor drop `^`, so a cast's operand and target must
-# match secret-for-secret at the top level and through every pointer / array
-# step. Differing inner leaf types (e.g. `^u32` vs `^u64`) still match - only the
-# `^` placement is compared, not the underlying shapes the cast itself converts.
-# ---
-# ti:  the interner
-# a:   the first TypeId
-# b:   the second TypeId
-# ret: true when both carry the same secret-qualifier placement along the spine
 pub fun secrecy_structure_equal(ti: *TypeInterner, a: TypeId, b: TypeId) bool {
     val a_secret: bool = is_secret(ti, a);
     val b_secret: bool = is_secret(ti, b);
@@ -1697,13 +1058,6 @@ pub fun secrecy_structure_equal(ti: *TypeInterner, a: TypeId, b: TypeId) bool {
     ret true;
 }
 
-# intern a pointer-to type
-#
-# Returns an existing TypeId when the same base has been interned before.
-# ---
-# ti:   the interner
-# base: pointee TypeId
-# ret:  TypeId for *base, or an allocation error
 pub fun intern_pointer(ti: *TypeInterner, base: TypeId) R.Result[TypeId, str] {
     var t: Type;
     t.kind              = TYPE_POINTER;
@@ -1711,15 +1065,6 @@ pub fun intern_pointer(ti: *TypeInterner, base: TypeId) R.Result[TypeId, str] {
     ret intern_dedup(ti, t);
 }
 
-# intern a secret-qualified type `^base` (#1645)
-#
-# A doubled qualifier collapses (`^^T` interns to `^T`) so the secrecy lattice
-# stays two-point, and a poisoned base poisons the qualifier. Returns an existing
-# TypeId when the same base has been wrapped before.
-# ---
-# ti:   the interner
-# base: the inner TypeId to wrap
-# ret:  TypeId for `^base`, or an allocation error
 pub fun intern_secret(ti: *TypeInterner, base: TypeId) R.Result[TypeId, str] {
     if (base == TYPE_ERROR) { ret R.ok[TypeId, str](TYPE_ERROR); }
     if (is_secret(ti, base)) { ret R.ok[TypeId, str](base); }
@@ -1729,15 +1074,6 @@ pub fun intern_secret(ti: *TypeInterner, base: TypeId) R.Result[TypeId, str] {
     ret intern_dedup(ti, t);
 }
 
-# intern a fixed-size array type
-#
-# Returns an existing TypeId when the same (base, count) pair has been
-# interned before.
-# ---
-# ti:    the interner
-# base:  element TypeId
-# count: element count
-# ret:   TypeId for [count]base, or an allocation error
 pub fun intern_array(ti: *TypeInterner, base: TypeId, count: u32) R.Result[TypeId, str] {
     var t: Type;
     t.kind             = TYPE_ARRAY;
@@ -1746,15 +1082,6 @@ pub fun intern_array(ti: *TypeInterner, base: TypeId, count: u32) R.Result[TypeI
     ret intern_dedup(ti, t);
 }
 
-# intern a vector type (#1965)
-#
-# Returns an existing TypeId when the same (element, lanes) shape has been
-# interned before.
-# ---
-# ti:      the interner
-# element: lane scalar TypeKind
-# lanes:   lane count
-# ret:     TypeId for the vector shape, or an allocation error
 pub fun intern_vector(ti: *TypeInterner, element: TypeKind, lanes: u32) R.Result[TypeId, str] {
     var t: Type;
     t.kind                = TYPE_VECTOR;
@@ -1763,29 +1090,11 @@ pub fun intern_vector(ti: *TypeInterner, element: TypeKind, lanes: u32) R.Result
     ret intern_dedup(ti, t);
 }
 
-# intern a target-minted handle type (#2888)
-#
-# Scans the handle list for a match before appending, exactly as `intern_instance`
-# does and for the same reason: the operand words live in a side pool the
-# context-free dedup hash cannot read.
-#
-# IDENTITY IS THE CONSTRUCTOR AND EVERY OPERAND WORD, never a subset. Two handles
-# that differ in one word are different target types, and interning them together
-# would give one of them the other's descriptor. `name` plays no part, so two
-# declarations of the same shape are one type and a diagnostic keeps whichever name
-# was interned first.
-# ---
-# ti:    the interner
-# name:  the declaration's name, for diagnostics
-# ctor:  the owning target's constructor tag
-# ops:   the operand words, or nil when the constructor takes none
-# count: number of operand words
-# ret:   TypeId for the handle, or an allocation error
 pub fun intern_handle(ti: *TypeInterner, name: intern.StrId, ctor: u32, ops: *u32, count: u32) R.Result[TypeId, str] {
     var i: u32 = 0;
     for (i < ti.handles_len) {
         val tid:  TypeId = ti.handles[i];
-        val cand: *Type  = ?ti.types[tid];
+        val cand: *Type  = R.unwrap_ok[*Type, str](handle.chunk_get[Type](?ti.types, tid::usize));
         if (cand.data.handle.ctor == ctor && cand.data.handle.ops_len == count) {
             var ops_match: bool = true;
             var oi:        u32  = 0;
@@ -1817,39 +1126,19 @@ pub fun intern_handle(ti: *TypeInterner, name: intern.StrId, ctor: u32, ops: *u3
     if (R.is_err[TypeId, str](res_append)) { ret res_append; }
     val tid: TypeId = R.unwrap_ok[TypeId, str](res_append);
 
-    val res_track: R.Result[bool, str] = track_handle(ti, tid);
-    if (R.is_err[bool, str](res_track)) {
-        ret R.err[TypeId, str](R.unwrap_err[bool, str](res_track));
+    val res_track: R.Result[R.Void, str] = track_handle(ti, tid);
+    if (R.is_err[R.Void, str](res_track)) {
+        ret R.err[TypeId, str](R.unwrap_err[R.Void, str](res_track));
     }
     ret R.ok[TypeId, str](tid);
 }
 
-# whether `tid` names a target-minted handle (#2888)
-# ---
-# ti:  the interner
-# tid: the TypeId to test
-# ret: true for a TYPE_HANDLE
 pub fun is_handle(ti: *TypeInterner, tid: TypeId) bool {
     val opt_type: O.Option[*Type] = get(ti, tid);
     if (O.is_none[*Type](opt_type)) { ret false; }
     ret O.unwrap[*Type](opt_type).kind == TYPE_HANDLE;
 }
 
-# intern a target-declared C ABI type (#3004)
-#
-# Ordinary `intern_dedup`: the whole payload is in the type record, so two
-# declarations of the same ABI type against the same target collapse to one TypeId
-# and a binding declared in one module passes where another module declares it.
-# `name` is carried for diagnostics and takes part in identity only in the sense that
-# two declarations spelling one ABI type differently are still one type - the first
-# name interned is the one a message shows, exactly as for a handle.
-# ---
-# ti:    the interner
-# name:  the declaration's name, for diagnostics
-# tag:   which C ABI type this is (one of ABI_TYPE_*)
-# size:  the target's declared size in bytes
-# align: the target's declared alignment in bytes
-# ret:   TypeId for the ABI type, or an allocation error
 pub fun intern_abi_type(ti: *TypeInterner, name: intern.StrId, tag: u32, size: u32,
                         align: u32) R.Result[TypeId, str] {
     var t: Type;
@@ -1861,26 +1150,12 @@ pub fun intern_abi_type(ti: *TypeInterner, name: intern.StrId, tag: u32, size: u
     ret intern_dedup(ti, t);
 }
 
-# whether `tid` is a target-declared C ABI type
-# ---
-# ti:  the interner
-# tid: the TypeId to test
-# ret: true for a TYPE_ABI
 pub fun is_abi_type(ti: *TypeInterner, tid: TypeId) bool {
     val opt_type: O.Option[*Type] = get(ti, tid);
     if (O.is_none[*Type](opt_type)) { ret false; }
     ret O.unwrap[*Type](opt_type).kind == TYPE_ABI;
 }
 
-# the operand word at `index` of the handle at `tid`
-#
-# The pool is the interner's, so a reader outside it cannot index the run itself
-# without restating where the run begins.
-# ---
-# ti:    the interner
-# tid:   the handle TypeId
-# index: which operand
-# ret:   the operand word, or 0 when `tid` is not a handle or `index` is past its run
 pub fun handle_operand(ti: *TypeInterner, tid: TypeId, index: u32) u32 {
     val opt_type: O.Option[*Type] = get(ti, tid);
     if (O.is_none[*Type](opt_type)) { ret 0; }
@@ -1890,22 +1165,30 @@ pub fun handle_operand(ti: *TypeInterner, tid: TypeId, index: u32) u32 {
     ret ti.handle_ops[t.data.handle.ops_start + index];
 }
 
-# copy `len` operand words from `src` into the handle-operand pool, growing it as
-# needed, and return the pool index where the copied run begins
-#
-# `src` may be nil when `len` is 0, which is a constructor that takes no operands.
-# ---
-# ti:  the interner
-# src: pointer to the words to copy
-# len: number of words to copy
-# ret: the start index of the run in ti.handle_ops, or an allocation error
 fun handle_ops_append(ti: *TypeInterner, src: *u32, len: u32) R.Result[u32, str] {
     val start: u32 = ti.handle_ops_len;
 
-    if (ti.handle_ops_len + len > ti.handle_ops_cap) {
-        var new_cap: u32 = ti.handle_ops_cap * 2;
-        if (new_cap == 0) { new_cap = INITIAL_INSTANCE_CAP; }
-        for (new_cap < ti.handle_ops_len + len) { new_cap = new_cap * 2; }
+    val required_r: R.Result[layout.CheckedCount[u32], layout.CheckCause] =
+        layout.count_add[u32](layout.count[u32](ti.handle_ops_len::usize), layout.count[u32](len::usize));
+    if (R.is_err[layout.CheckedCount[u32], layout.CheckCause](required_r)) {
+        ret R.err[u32, str]("type: handle-operand append count overflow");
+    }
+    val required: layout.CheckedCount[u32] = R.unwrap_ok[layout.CheckedCount[u32], layout.CheckCause](required_r);
+
+    if (required.value > ti.handle_ops_cap::usize) {
+        var base_cap: usize = ti.handle_ops_cap::usize;
+        if (base_cap == 0) { base_cap = INITIAL_INSTANCE_CAP::usize; }
+        val grown_r: R.Result[layout.CheckedCount[u32], layout.CheckCause] =
+            layout.count_grow[u32](layout.count[u32](base_cap), required);
+        if (R.is_err[layout.CheckedCount[u32], layout.CheckCause](grown_r)) {
+            ret R.err[u32, str]("type: handle-operand growth count overflow");
+        }
+        val new_cap_fits: R.Result[u32, layout.CheckCause] = layout.usize_to_u32(
+            R.unwrap_ok[layout.CheckedCount[u32], layout.CheckCause](grown_r).value);
+        if (R.is_err[u32, layout.CheckCause](new_cap_fits)) {
+            ret R.err[u32, str]("type: handle-operand capacity exceeds the u32 limit");
+        }
+        val new_cap: u32 = R.unwrap_ok[u32, layout.CheckCause](new_cap_fits);
 
         if (ti.handle_ops == nil) {
             val res_a: R.Result[*u32, str] = A.allocate[u32](ti.a, new_cap::usize);
@@ -1925,59 +1208,31 @@ fun handle_ops_append(ti: *TypeInterner, src: *u32, len: u32) R.Result[u32, str]
         ti.handle_ops[start + i] = src[i];
         i = i + 1;
     }
-    ti.handle_ops_len = start + len;
+    val new_len_fits: R.Result[u32, layout.CheckCause] = layout.usize_to_u32(required.value);
+    if (R.is_err[u32, layout.CheckCause](new_len_fits)) {
+        ret R.err[u32, str]("type: handle-operand length exceeds the u32 limit");
+    }
+    ti.handle_ops_len = R.unwrap_ok[u32, layout.CheckCause](new_len_fits);
     ret R.ok[u32, str](start);
 }
 
-# append `tid` to the handle list, growing it as needed
-# ---
-# ti:  the interner
-# tid: the handle TypeId to track
-# ret: true on success, or an allocation error
-fun track_handle(ti: *TypeInterner, tid: TypeId) R.Result[bool, str] {
+fun track_handle(ti: *TypeInterner, tid: TypeId) R.Result[R.Void, str] {
     if (ti.handles_len == ti.handles_cap) {
-        var new_cap: u32 = ti.handles_cap * 2;
-        if (new_cap == 0) { new_cap = INITIAL_INSTANCE_CAP; }
-
-        if (ti.handles == nil) {
-            val res_a: R.Result[*TypeId, str] = A.allocate[TypeId](ti.a, new_cap::usize);
-            if (R.is_err[*TypeId, str](res_a)) { ret R.err[bool, str](R.unwrap_err[*TypeId, str](res_a)); }
-            ti.handles = R.unwrap_ok[*TypeId, str](res_a);
-        }
-        or {
-            val res_ra: R.Result[*TypeId, str] = A.reallocate[TypeId](ti.a, ti.handles, ti.handles_cap::usize, new_cap::usize);
-            if (R.is_err[*TypeId, str](res_ra)) { ret R.err[bool, str](R.unwrap_err[*TypeId, str](res_ra)); }
-            ti.handles = R.unwrap_ok[*TypeId, str](res_ra);
-        }
-        ti.handles_cap = new_cap;
+        val grown: R.Result[R.Void, str] = grow_cap[TypeId](ti.a, ?ti.handles, ?ti.handles_cap, INITIAL_INSTANCE_CAP);
+        if (R.is_err[R.Void, str](grown)) { ret grown; }
     }
 
     ti.handles[ti.handles_len] = tid;
     ti.handles_len = ti.handles_len + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# intern the comptime variadic pack type, a payload-free singleton
-# ---
-# ti:  the interner
-# ret: the TypeId for a `...` pack, or an allocation error
 pub fun intern_pack(ti: *TypeInterner) R.Result[TypeId, str] {
     var t: Type;
     t.kind = TYPE_PACK;
     ret intern_dedup(ti, t);
 }
 
-# intern a nominal type (rec / uni)
-#
-# Two nominal types intern to the same TypeId iff their (origin, decl) pairs
-# match.
-# ---
-# ti:     the interner
-# name:   interned identifier (diagnostic only)
-# origin: declaring module
-# decl:   declaration in origin's Ast
-# kind:   TYPE_REC or TYPE_UNI
-# ret:    TypeId for the nominal type, or an allocation error
 pub fun intern_nominal(ti: *TypeInterner, name: intern.StrId, origin: module.ModuleId, decl: id.DeclId, kind: TypeKind) R.Result[TypeId, str] {
     var t: Type;
     t.kind                = kind;
@@ -1987,41 +1242,16 @@ pub fun intern_nominal(ti: *TypeInterner, name: intern.StrId, origin: module.Mod
     ret intern_dedup(ti, t);
 }
 
-# intern a generic parameter placeholder
-#
-# Two generic params intern to the same TypeId iff they share an (owner,
-# index) pair.
-# ---
-# ti:    the interner
-# name:  interned identifier (diagnostic only)
-# owner: enclosing generic DeclId
-# index: ordinal among the owner's generic parameters
-# ret:   TypeId for the generic param, or an allocation error
-pub fun intern_generic_param(ti: *TypeInterner, name: intern.StrId, owner: id.DeclId, index: u32) R.Result[TypeId, str] {
+pub fun intern_generic_param(ti: *TypeInterner, name: intern.StrId, origin: module.ModuleId, owner: id.DeclId, index: u32) R.Result[TypeId, str] {
     var t: Type;
-    t.kind                     = TYPE_GENERIC_PARAM;
-    t.data.generic_param.name  = name;
-    t.data.generic_param.owner = owner;
-    t.data.generic_param.index = index;
+    t.kind                      = TYPE_GENERIC_PARAM;
+    t.data.generic_param.name   = name;
+    t.data.generic_param.origin = origin;
+    t.data.generic_param.owner  = owner;
+    t.data.generic_param.index  = index;
     ret intern_dedup(ti, t);
 }
 
-# intern a function type, deduplicating structurally equal signatures through
-# a content-hash index so a generic call's repeated substitute_fun does not
-# grow the universe without bound
-#
-# On a hash hit the candidate is verified against the mapped type before
-# reuse, so a collision degrades to a fresh append (the historical non-deduped
-# default), never to a wrong identity. Structural equivalence is also available
-# via `type_equals_signatures`.
-# ---
-# ti:         the interner
-# ret_type:   return type
-# params:     pointer to a contiguous array of fixed parameter TypeIds
-# count:      number of fixed parameter types
-# c_variadic: true for the C-variadic form (`ext fun f(a: T, ...)`), whose `count` is
-#             the fixed arity; part of the interned identity
-# ret:        the (deduped) TypeId for the function, or an allocation error
 pub fun intern_function(ti: *TypeInterner, ret_type: TypeId, params: *TypeId, count: u32, c_variadic: bool) R.Result[TypeId, str] {
     val h: u64 = hash_fun(ret_type, params, count, c_variadic);
 
@@ -2052,8 +1282,6 @@ pub fun intern_function(ti: *TypeInterner, ret_type: TypeId, params: *TypeId, co
     }
     val tid: TypeId = R.unwrap_ok[TypeId, str](res_append);
 
-    # last-writer-wins on a hash collision: the most recently interned signature
-    # for this hash is the one reused next, so equal signatures still collapse.
     val res_insert: R.Result[bool, str] = map.insert[u64, TypeId](?ti.fun_index, h, tid);
     if (R.is_err[bool, str](res_insert)) {
         ret R.err[TypeId, str](R.unwrap_err[bool, str](res_insert));
@@ -2062,46 +1290,47 @@ pub fun intern_function(ti: *TypeInterner, ret_type: TypeId, params: *TypeId, co
     ret R.ok[TypeId, str](tid);
 }
 
-# intern a generic instantiation `(target_origin, target_decl)<args>`
-#
-# Scans the instance list for a match before appending; on miss, copies args
-# into the params pool, appends a fresh TypeInstance record, and records it in
-# the instance list. TYPE_INSTANCE bypasses the dedup map (its args live in the
-# side pool, which the context-free dedup hash cannot read), so dedup walks the
-# instance list resulting in O(instances), not O(type_len).
-#
-# `nominal` is the declaration's own nominal TypeId, which the instance carries so
-# that any later consumer can recover what it is an instance OF (#2239). It is a
-# function of (target_origin, target_decl), not of the arguments, so it plays no part
-# in identity and a dedup hit keeps the recorded one.
-# ---
-# ti:            the interner
-# nominal:       the TYPE_REC / TYPE_UNI being specialized, or TYPE_ERROR when the target declaration is not an aggregate
-# target_origin: module that declared the generic
-# target_decl:   declaration in target_origin's Ast
-# args:          pointer to a contiguous array of concrete arg types
-# count:         number of argument types
-# ret:           the (deduped) TypeId for the instance, or an allocation error
-pub fun intern_instance(ti: *TypeInterner, nominal: TypeId, target_origin: module.ModuleId, target_decl: id.DeclId, args: *TypeId, count: u32) R.Result[TypeId, str] {
+fun hash_instance(target_origin: module.ModuleId, target_decl: id.DeclId, args: *TypeId, count: u32) u64 {
+    var h: u64 = fnv1a.FNV_INIT;
+    h = fnv1a.step_u8(h, TYPE_INSTANCE::u8);
+    h = fnv1a.step_u32(h, target_origin::u32);
+    h = fnv1a.step_u32(h, target_decl::u32);
+    h = fnv1a.step_u32(h, count);
+
     var i: u32 = 0;
-    for (i < ti.instances_len) {
-        val tid:  TypeId = ti.instances[i];
-        val cand: *Type  = ?ti.types[tid];
-        if (cand.data.instance.target_origin == target_origin
-            && cand.data.instance.target_decl == target_decl
-            && cand.data.instance.args_len == count) {
-            var args_match: bool = true;
-            var ii:         u32  = 0;
-            for (ii < count) {
-                if (ti.params[cand.data.instance.args_start + ii] != args[ii]) {
-                    args_match = false;
-                    brk;
-                }
-                ii = ii + 1;
-            }
-            if (args_match) { ret R.ok[TypeId, str](tid); }
-        }
+    for (i < count) {
+        h = fnv1a.step_u32(h, args[i]::u32);
         i = i + 1;
+    }
+    ret h;
+}
+
+fun instance_matches(ti: *TypeInterner, tid: TypeId, target_origin: module.ModuleId, target_decl: id.DeclId, args: *TypeId, count: u32) bool {
+    val r: R.Result[*Type, str] = handle.chunk_get[Type](?ti.types, tid::usize);
+    if (R.is_err[*Type, str](r)) { ret false; }
+    val cand: *Type = R.unwrap_ok[*Type, str](r);
+    if (cand.kind != TYPE_INSTANCE)                        { ret false; }
+    if (cand.data.instance.target_origin != target_origin) { ret false; }
+    if (cand.data.instance.target_decl != target_decl)     { ret false; }
+    if (cand.data.instance.args_len != count)               { ret false; }
+
+    var i: u32 = 0;
+    for (i < count) {
+        if (ti.params[cand.data.instance.args_start + i] != args[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun intern_instance(ti: *TypeInterner, nominal: TypeId, target_origin: module.ModuleId, target_decl: id.DeclId, args: *TypeId, count: u32) R.Result[TypeId, str] {
+    val h: u64 = hash_instance(target_origin, target_decl, args, count);
+
+    val res_get: R.Result[*TypeId, str] = map.get[u64, TypeId](?ti.instance_index, ?h);
+    if (R.is_ok[*TypeId, str](res_get)) {
+        val existing: TypeId = @R.unwrap_ok[*TypeId, str](res_get);
+        if (instance_matches(ti, existing, target_origin, target_decl, args, count)) {
+            ret R.ok[TypeId, str](existing);
+        }
     }
 
     val res_start: R.Result[u32, str] = params_append(ti, args, count);
@@ -2124,34 +1353,26 @@ pub fun intern_instance(ti: *TypeInterner, nominal: TypeId, target_origin: modul
     }
     val tid: TypeId = R.unwrap_ok[TypeId, str](res_append);
 
-    val res_track: R.Result[bool, str] = track_instance(ti, tid);
-    if (R.is_err[bool, str](res_track)) {
-        ret R.err[TypeId, str](R.unwrap_err[bool, str](res_track));
+    val res_insert: R.Result[bool, str] = map.insert[u64, TypeId](?ti.instance_index, h, tid);
+    if (R.is_err[bool, str](res_insert)) {
+        ret R.err[TypeId, str](R.unwrap_err[bool, str](res_insert));
     }
 
     ret R.ok[TypeId, str](tid);
 }
 
-# structural equivalence for two function types
-#
-# Used by sema where function-type identity is insufficient (signatures can
-# match without being the same interned TypeId).
-# ---
-# ti:  the interner
-# a:   first TypeId; must be TYPE_FUN
-# b:   second TypeId; must be TYPE_FUN
-# ret: true when both have matching return type and parameter sequence
 pub fun type_equals_signatures(ti: *TypeInterner, a: TypeId, b: TypeId) bool {
-    if (a == b)                               { ret true; }
-    if (a >= ti.type_len || b >= ti.type_len) { ret false; }
+    if (a == b) { ret true; }
 
-    val ta: *Type = ?ti.types[a];
-    val tb: *Type = ?ti.types[b];
+    val ra: R.Result[*Type, str] = handle.chunk_get[Type](?ti.types, a::usize);
+    val rb: R.Result[*Type, str] = handle.chunk_get[Type](?ti.types, b::usize);
+    if (R.is_err[*Type, str](ra) || R.is_err[*Type, str](rb)) { ret false; }
+
+    val ta: *Type = R.unwrap_ok[*Type, str](ra);
+    val tb: *Type = R.unwrap_ok[*Type, str](rb);
     if (ta.kind != TYPE_FUN || tb.kind != TYPE_FUN)     { ret false; }
     if (ta.data.fn.ret_type != tb.data.fn.ret_type)     { ret false; }
     if (ta.data.fn.params_len != tb.data.fn.params_len) { ret false; }
-    # the C-variadic flag is part of the signature: a variadic and a fixed-arity
-    # declaration over the same fixed types are DIFFERENT calls on Apple arm64.
     if (ta.data.fn.c_variadic != tb.data.fn.c_variadic) { ret false; }
 
     var i: u32 = 0;
@@ -2164,263 +1385,134 @@ pub fun type_equals_signatures(ti: *TypeInterner, a: TypeId, b: TypeId) bool {
     ret true;
 }
 
-# advance the current build epoch, invalidating every field table built in a
-# prior epoch so the next builder rebuilds it with the current layout
-#
-# The driver calls this once per sema pass; a fresh session never calls it (its
-# single build runs at epoch 0). (#1583)
-# ---
-# ti: the interner
 pub fun field_epoch_bump(ti: *TypeInterner) {
     ti.field_epoch = ti.field_epoch + 1;
 }
 
-# the current build epoch a field-table builder stamps onto a table and compares
-# an existing table's epoch against to decide rebuild vs reuse
-# ---
-# ti:  the interner
-# ret: the current epoch
 pub fun field_epoch(ti: *TypeInterner) u32 {
     ret ti.field_epoch;
 }
 
-# begin a field table for TypeId `ty`, returning its index; fields are appended
-# with field_table_push
-#
-# Reuses `ty`'s existing table slot when present (a rebuild at a newer epoch -
-# the old field-pool slice is abandoned), otherwise appends a fresh slot. The
-# table is stamped with the current epoch.
-# ---
-# ti:  the interner
-# ty:  the TypeId the table describes
-# ret: the table's index, or an allocation error
-pub fun field_table_begin(ti: *TypeInterner, ty: TypeId) R.Result[u32, str] {
-    # rebuild in place: reuse the existing slot so a re-layout does not grow the
-    # table array (the abandoned field-pool slice is the rebuild's only residue).
-    val res_get: R.Result[*u32, str] = map.get[TypeId, u32](?ti.field_index, ?ty);
-    if (R.is_ok[*u32, str](res_get)) {
-        val reuse_idx: u32 = @R.unwrap_ok[*u32, str](res_get);
-        ti.field_tables[reuse_idx].fields_start = ti.field_pool_len;
-        ti.field_tables[reuse_idx].fields_len   = 0;
-        ti.field_tables[reuse_idx].epoch        = ti.field_epoch;
-        ret R.ok[u32, str](reuse_idx);
+pub fun field_table_stage(ti: *TypeInterner, additional: u32) R.Result[u32, str] {
+    val ce_r: R.Result[handle.ChunkEditor[FieldEntry], str] = handle.chunk_edit[FieldEntry](?ti.field_pool);
+    if (R.is_err[handle.ChunkEditor[FieldEntry], str](ce_r)) {
+        ret R.err[u32, str](R.unwrap_err[handle.ChunkEditor[FieldEntry], str](ce_r));
     }
-
-    if (ti.field_table_len == ti.field_table_cap) {
-        var new_cap: u32 = ti.field_table_cap * 2;
-        if (new_cap == 0) { new_cap = INITIAL_FIELD_TABLE_CAP; }
-
-        if (ti.field_tables == nil) {
-            val res_a_tables: R.Result[*FieldTable, str] = A.allocate[FieldTable](ti.a, new_cap::usize);
-            if (R.is_err[*FieldTable, str](res_a_tables)) {
-                ret R.err[u32, str](R.unwrap_err[*FieldTable, str](res_a_tables));
-            }
-            ti.field_tables = R.unwrap_ok[*FieldTable, str](res_a_tables);
-        }
-        or {
-            val res_ra_tables: R.Result[*FieldTable, str] = A.reallocate[FieldTable](ti.a, ti.field_tables, ti.field_table_cap::usize, new_cap::usize);
-            if (R.is_err[*FieldTable, str](res_ra_tables)) {
-                ret R.err[u32, str](R.unwrap_err[*FieldTable, str](res_ra_tables));
-            }
-            ti.field_tables = R.unwrap_ok[*FieldTable, str](res_ra_tables);
-        }
-
-        ti.field_table_cap = new_cap;
+    var ce: handle.ChunkEditor[FieldEntry] = R.unwrap_ok[handle.ChunkEditor[FieldEntry], str](ce_r);
+    val reserve_r: R.Result[R.Void, str] = handle.chunk_reserve[FieldEntry](?ce, additional::usize);
+    handle.chunk_editor_finish[FieldEntry](?ce);
+    if (R.is_err[R.Void, str](reserve_r)) {
+        ret R.err[u32, str](R.unwrap_err[R.Void, str](reserve_r));
     }
-
-    val idx:        u32                 = ti.field_table_len;
-    val res_insert: R.Result[bool, str] = map.insert[TypeId, u32](?ti.field_index, ty, idx);
-    if (R.is_err[bool, str](res_insert)) {
-        ret R.err[u32, str](R.unwrap_err[bool, str](res_insert));
-    }
-
-    var ft: FieldTable;
-    ft.ty           = ty;
-    ft.fields_start = ti.field_pool_len;
-    ft.fields_len   = 0;
-    ft.epoch        = ti.field_epoch;
-    ti.field_tables[idx] = ft;
-    ti.field_table_len   = ti.field_table_len + 1;
-
-    ret R.ok[u32, str](idx);
+    ret R.ok[u32, str](handle.chunk_count[FieldEntry](?ti.field_pool)::u32);
 }
 
-# ensure the field pool has room for `additional` more FieldEntries, growing it
-# if not
-#
-# A table is built by pushing its fields one at a time; reserving the whole run
-# up front means the pushes that follow cannot grow the pool, so they cannot fail
-# partway and leave a half-built table registered at the current epoch (which a
-# later builder would reuse as if complete). Call this before field_table_begin.
-# ---
-# ti:         the interner
-# additional: number of FieldEntry slots the next table will push
-# ret:        true once the pool has room, or an allocation error
-pub fun field_table_reserve(ti: *TypeInterner, additional: u32) R.Result[bool, str] {
-    if (ti.field_pool_len + additional <= ti.field_pool_cap) {
-        ret R.ok[bool, str](true);
-    }
-
-    var new_cap: u32 = ti.field_pool_cap;
-    if (new_cap == 0) { new_cap = INITIAL_FIELD_POOL_CAP; }
-    for (ti.field_pool_len + additional > new_cap) {
-        new_cap = new_cap * 2;
-    }
-
-    if (ti.field_pool == nil) {
-        val res_a_pool: R.Result[*FieldEntry, str] = A.allocate[FieldEntry](ti.a, new_cap::usize);
-        if (R.is_err[*FieldEntry, str](res_a_pool)) {
-            ret R.err[bool, str](R.unwrap_err[*FieldEntry, str](res_a_pool));
-        }
-        ti.field_pool = R.unwrap_ok[*FieldEntry, str](res_a_pool);
-    }
-    or {
-        val res_ra_pool: R.Result[*FieldEntry, str] = A.reallocate[FieldEntry](ti.a, ti.field_pool, ti.field_pool_cap::usize, new_cap::usize);
-        if (R.is_err[*FieldEntry, str](res_ra_pool)) {
-            ret R.err[bool, str](R.unwrap_err[*FieldEntry, str](res_ra_pool));
-        }
-        ti.field_pool = R.unwrap_ok[*FieldEntry, str](res_ra_pool);
-    }
-
-    ti.field_pool_cap = new_cap;
-    ret R.ok[bool, str](true);
-}
-
-# append one `(name, ty)` field to the table at `table_idx`, growing the
-# shared field pool as needed
-#
-# Fields must be pushed contiguously, before any other table is begun.
-# ---
-# ti:        the interner
-# table_idx: index returned by field_table_begin
-# name:      interned field identifier
-# ty:        interned semantic type of the field
-# ret:       true on success, or an allocation error
-pub fun field_table_push(ti: *TypeInterner, table_idx: u32, name: intern.StrId, ty: TypeId) R.Result[bool, str] {
-    if (ti.field_pool_len == ti.field_pool_cap) {
-        var new_cap: u32 = ti.field_pool_cap * 2;
-        if (new_cap == 0) { new_cap = INITIAL_FIELD_POOL_CAP; }
-
-        if (ti.field_pool == nil) {
-            val res_a_pool: R.Result[*FieldEntry, str] = A.allocate[FieldEntry](ti.a, new_cap::usize);
-            if (R.is_err[*FieldEntry, str](res_a_pool)) {
-                ret R.err[bool, str](R.unwrap_err[*FieldEntry, str](res_a_pool));
-            }
-            ti.field_pool = R.unwrap_ok[*FieldEntry, str](res_a_pool);
-        }
-        or {
-            val res_ra_pool: R.Result[*FieldEntry, str] = A.reallocate[FieldEntry](ti.a, ti.field_pool, ti.field_pool_cap::usize, new_cap::usize);
-            if (R.is_err[*FieldEntry, str](res_ra_pool)) {
-                ret R.err[bool, str](R.unwrap_err[*FieldEntry, str](res_ra_pool));
-            }
-            ti.field_pool = R.unwrap_ok[*FieldEntry, str](res_ra_pool);
-        }
-
-        ti.field_pool_cap = new_cap;
-    }
-
+pub fun field_table_stage_push(ti: *TypeInterner, name: intern.StrId, ty: TypeId) R.Result[R.Void, str] {
     var fe: FieldEntry;
     fe.name = name;
     fe.ty   = ty;
-    ti.field_pool[ti.field_pool_len]      = fe;
-    ti.field_pool_len                     = ti.field_pool_len + 1;
-    ti.field_tables[table_idx].fields_len = ti.field_tables[table_idx].fields_len + 1;
 
-    ret R.ok[bool, str](true);
+    val ce_r: R.Result[handle.ChunkEditor[FieldEntry], str] = handle.chunk_edit[FieldEntry](?ti.field_pool);
+    if (R.is_err[handle.ChunkEditor[FieldEntry], str](ce_r)) {
+        ret R.err[R.Void, str](R.unwrap_err[handle.ChunkEditor[FieldEntry], str](ce_r));
+    }
+    var ce: handle.ChunkEditor[FieldEntry] = R.unwrap_ok[handle.ChunkEditor[FieldEntry], str](ce_r);
+    val push_r: R.Result[*FieldEntry, str] = handle.chunk_push[FieldEntry](?ce, fe);
+    handle.chunk_editor_finish[FieldEntry](?ce);
+    if (R.is_err[*FieldEntry, str](push_r)) {
+        ret R.err[R.Void, str](R.unwrap_err[*FieldEntry, str](push_r));
+    }
+    ret R.ok_void[str]();
 }
 
-# the nominal aggregate a TypeId denotes: itself for a `rec` / `uni`, and for a
-# generic instance the nominal it specializes (#2239)
-#
-# A `rec` and a `uni` instantiate to structurally identical TYPE_INSTANCEs - both carry
-# a synthesized field table - so an instance's own kind answers nothing about the
-# aggregate behind it. That link is recorded when the instance is interned, which is the
-# only way it can reach an anonymous nominal (the `uni { ok: T; err: E; }` inside
-# `Result[T, E]`): such a nominal is keyed structurally rather than by a source
-# declaration, so no AST can name it.
-# ---
-# ti:  the interner
-# tid: the TypeId to resolve
-# ret: the nominal's TypeId, or TYPE_ERROR when `tid` denotes no aggregate
+pub fun field_table_publish(ti: *TypeInterner, ty: TypeId, fields_start: u32, fields_len: u32) R.Result[R.Void, str] {
+    val staged: u32 = handle.chunk_count[FieldEntry](?ti.field_pool)::u32;
+    if (fields_start > staged || staged - fields_start < fields_len) {
+        ret R.err[R.Void, str]("field table: staged run does not cover the published field count");
+    }
+
+    val res_get: R.Result[*u32, str] = map.get[TypeId, u32](?ti.field_index, ?ty);
+    if (R.is_ok[*u32, str](res_get)) {
+        val idx: u32 = @R.unwrap_ok[*u32, str](res_get);
+        val slot_r: R.Result[*FieldTable, str] = handle.chunk_get[FieldTable](?ti.field_tables, idx::usize);
+        if (R.is_err[*FieldTable, str](slot_r)) {
+            ret R.err[R.Void, str](R.unwrap_err[*FieldTable, str](slot_r));
+        }
+        val slot: *FieldTable = R.unwrap_ok[*FieldTable, str](slot_r);
+        slot.fields_start = fields_start;
+        slot.fields_len   = fields_len;
+        slot.epoch        = ti.field_epoch;
+        ret R.ok_void[str]();
+    }
+
+    val ce_r: R.Result[handle.ChunkEditor[FieldTable], str] = handle.chunk_edit[FieldTable](?ti.field_tables);
+    if (R.is_err[handle.ChunkEditor[FieldTable], str](ce_r)) {
+        ret R.err[R.Void, str](R.unwrap_err[handle.ChunkEditor[FieldTable], str](ce_r));
+    }
+    var ce: handle.ChunkEditor[FieldTable] = R.unwrap_ok[handle.ChunkEditor[FieldTable], str](ce_r);
+
+    var ft: FieldTable;
+    ft.ty           = ty;
+    ft.fields_start = fields_start;
+    ft.fields_len   = fields_len;
+    ft.epoch        = ti.field_epoch;
+    val push_r: R.Result[*FieldTable, str] = handle.chunk_push[FieldTable](?ce, ft);
+    handle.chunk_editor_finish[FieldTable](?ce);
+    if (R.is_err[*FieldTable, str](push_r)) {
+        ret R.err[R.Void, str](R.unwrap_err[*FieldTable, str](push_r));
+    }
+
+    val idx: u32 = handle.chunk_count[FieldTable](?ti.field_tables)::u32 - 1;
+    val res_insert: R.Result[bool, str] = map.insert[TypeId, u32](?ti.field_index, ty, idx);
+    if (R.is_err[bool, str](res_insert)) {
+        ret R.err[R.Void, str](R.unwrap_err[bool, str](res_insert));
+    }
+
+    ret R.ok_void[str]();
+}
+
 pub fun aggregate_nominal(ti: *TypeInterner, tid: TypeId) TypeId {
     val opt_t: O.Option[*Type] = get(ti, tid);
     if (O.is_none[*Type](opt_t)) { ret TYPE_ERROR; }
     val t: *Type = O.unwrap[*Type](opt_t);
     if (t.kind == TYPE_REC || t.kind == TYPE_UNI) { ret tid; }
-    # an instance over a non-aggregate declaration (a generic `fun` named as a type)
-    # carries no nominal and holds no fields.
     if (t.kind != TYPE_INSTANCE) { ret TYPE_ERROR; }
     ret t.data.instance.nominal;
 }
 
-# whether TypeId `tid` lays out as a union: its fields overlap at offset 0 rather
-# than occupying successive storage
-#
-# Every consumer that places fields must ask this rather than test for TYPE_UNI, since
-# an instance's own kind is TYPE_INSTANCE whichever aggregate it specializes (#2239).
-# ---
-# ti:  the interner
-# tid: the TypeId to classify
-# ret: true when the type's fields overlap
 pub fun is_union(ti: *TypeInterner, tid: TypeId) bool {
     ret nominal_kind_is(ti, tid, TYPE_UNI);
 }
 
-# whether TypeId `tid` lays out as a record: its fields occupy successive storage
-#
-# The counterpart of `is_union`, and subject to the same instance rule (#2239).
-# ---
-# ti:  the interner
-# tid: the TypeId to classify
-# ret: true when the type's fields are placed at distinct offsets
 pub fun is_record(ti: *TypeInterner, tid: TypeId) bool {
     ret nominal_kind_is(ti, tid, TYPE_REC);
 }
 
-# whether the aggregate `tid` denotes is declared with kind `want`
-# ---
-# ti:   the interner
-# tid:  the TypeId to classify
-# want: TYPE_REC or TYPE_UNI
-# ret:  true when the resolved nominal has that kind
 fun nominal_kind_is(ti: *TypeInterner, tid: TypeId, want: TypeKind) bool {
     val opt_nom: O.Option[*Type] = get(ti, aggregate_nominal(ti, tid));
     if (O.is_none[*Type](opt_nom)) { ret false; }
     ret O.unwrap[*Type](opt_nom).kind == want;
 }
 
-# the field table describing nominal or instance TypeId `ty`, or none when
-# none has been registered yet
-# ---
-# ti:  the interner
-# ty:  the TypeId to look up
-# ret: some(*FieldTable) when present, none otherwise
 pub fun field_table_for(ti: *TypeInterner, ty: TypeId) O.Option[*FieldTable] {
     val res_get: R.Result[*u32, str] = map.get[TypeId, u32](?ti.field_index, ?ty);
     if (R.is_err[*u32, str](res_get)) {
         ret O.none[*FieldTable]();
     }
-    ret O.some[*FieldTable](?ti.field_tables[@R.unwrap_ok[*u32, str](res_get)]);
+    val idx: u32 = @R.unwrap_ok[*u32, str](res_get);
+    val slot_r: R.Result[*FieldTable, str] = handle.chunk_get[FieldTable](?ti.field_tables, idx::usize);
+    if (R.is_err[*FieldTable, str](slot_r)) { ret O.none[*FieldTable](); }
+    val ft: *FieldTable = R.unwrap_ok[*FieldTable, str](slot_r);
+    if (ft.epoch != ti.field_epoch) { ret O.none[*FieldTable](); }
+    ret O.some[*FieldTable](ft);
 }
 
-# the number of fields registered for TypeId `ty`, or 0 when no table exists
-# ---
-# ti:  the interner
-# ty:  the TypeId to inspect
-# ret: the field count
 pub fun field_count(ti: *TypeInterner, ty: TypeId) u32 {
     val opt_ft: O.Option[*FieldTable] = field_table_for(ti, ty);
     if (O.is_none[*FieldTable](opt_ft)) { ret 0; }
     ret O.unwrap[*FieldTable](opt_ft).fields_len;
 }
 
-# the `(name, ty)` entry at ordinal `ix` of TypeId `ty`'s table, or none when
-# out of range or no table exists
-# ---
-# ti:  the interner
-# ty:  the TypeId to inspect
-# ix:  the field ordinal
-# ret: some(*FieldEntry) on success, none otherwise
 pub fun field_at(ti: *TypeInterner, ty: TypeId, ix: u32) O.Option[*FieldEntry] {
     val opt_ft: O.Option[*FieldTable] = field_table_for(ti, ty);
     if (O.is_none[*FieldTable](opt_ft)) {
@@ -2432,28 +1524,17 @@ pub fun field_at(ti: *TypeInterner, ty: TypeId, ix: u32) O.Option[*FieldEntry] {
         ret O.none[*FieldEntry]();
     }
 
-    ret O.some[*FieldEntry](?ti.field_pool[ft.fields_start + ix]);
+    val entry_r: R.Result[*FieldEntry, str] = handle.chunk_get[FieldEntry](?ti.field_pool, (ft.fields_start + ix)::usize);
+    if (R.is_err[*FieldEntry, str](entry_r)) { ret O.none[*FieldEntry](); }
+    ret O.some[*FieldEntry](R.unwrap_ok[*FieldEntry, str](entry_r));
 }
 
-# the FieldEntry at ordinal `ix` of an already-fetched table, read straight
-# from the field pool - O(1) with no table re-resolution
-#
-# The caller holds `ft` and guarantees `ix < ft.fields_len`.
-# ---
-# ti:  the interner
-# ft:  a field table previously returned by field_table_for / field_table_begin
-# ix:  the field ordinal, in range [0, ft.fields_len)
-# ret: a borrowed pointer to the field entry
 pub fun field_entry_at(ti: *TypeInterner, ft: *FieldTable, ix: u32) *FieldEntry {
-    ret ?ti.field_pool[ft.fields_start + ix];
+    val entry_r: R.Result[*FieldEntry, str] = handle.chunk_get[FieldEntry](?ti.field_pool, (ft.fields_start + ix)::usize);
+    if (R.is_err[*FieldEntry, str](entry_r)) { ret nil; }
+    ret R.unwrap_ok[*FieldEntry, str](entry_r);
 }
 
-# return the existing TypeId for `t` via the dedup map, or append it and
-# record the mapping
-# ---
-# ti:  the interner
-# t:   the Type to intern (a dedup-eligible kind, not TYPE_FUN / TYPE_INSTANCE)
-# ret: the existing or freshly appended TypeId, or an allocation error
 fun intern_dedup(ti: *TypeInterner, t: Type) R.Result[TypeId, str] {
     val res_get: R.Result[*TypeId, str] = map.get[Type, TypeId](?ti.dedup, ?t);
     if (R.is_ok[*TypeId, str](res_get)) {
@@ -2474,73 +1555,66 @@ fun intern_dedup(ti: *TypeInterner, t: Type) R.Result[TypeId, str] {
     ret R.ok[TypeId, str](tid);
 }
 
-# append `t` to the universe (growing it as needed) and return its fresh
-# TypeId
-# ---
-# ti:  the interner
-# t:   the Type to append
-# ret: the fresh TypeId, or an allocation error
 fun append_type(ti: *TypeInterner, t: Type) R.Result[TypeId, str] {
-    if (ti.type_len == ti.type_cap) {
-        val new_cap: u32 = ti.type_cap * 2;
-        val res_ra_types: R.Result[*Type, str] = A.reallocate[Type](ti.a, ti.types, ti.type_cap::usize, new_cap::usize);
-        if (R.is_err[*Type, str](res_ra_types)) {
-            ret R.err[TypeId, str](R.unwrap_err[*Type, str](res_ra_types));
-        }
-        ti.types    = R.unwrap_ok[*Type, str](res_ra_types);
-        ti.type_cap = new_cap;
-    }
+    val tid: TypeId = handle.chunk_count[Type](?ti.types)::u32;
 
-    val tid: TypeId = ti.type_len;
-    ti.types[ti.type_len] = t;
-    ti.type_len = ti.type_len + 1;
+    val ce_r: R.Result[handle.ChunkEditor[Type], str] = handle.chunk_edit[Type](?ti.types);
+    if (R.is_err[handle.ChunkEditor[Type], str](ce_r)) {
+        ret R.err[TypeId, str](R.unwrap_err[handle.ChunkEditor[Type], str](ce_r));
+    }
+    var ce: handle.ChunkEditor[Type] = R.unwrap_ok[handle.ChunkEditor[Type], str](ce_r);
+
+    val push_r: R.Result[*Type, str] = handle.chunk_push[Type](?ce, t);
+    handle.chunk_editor_finish[Type](?ce);
+    if (R.is_err[*Type, str](push_r)) {
+        ret R.err[TypeId, str](R.unwrap_err[*Type, str](push_r));
+    }
 
     ret R.ok[TypeId, str](tid);
 }
 
-# ensure the parameter pool has room for `need` more TypeIds, growing it if
-# not
-# ---
-# ti:   the interner
-# need: number of additional TypeId slots required
-# ret:  true once the pool has room, or an allocation error
-fun reserve_params(ti: *TypeInterner, need: u32) R.Result[bool, str] {
-    if (ti.params_len + need <= ti.params_cap) {
-        ret R.ok[bool, str](true);
+fun reserve_params(ti: *TypeInterner, need: u32) R.Result[R.Void, str] {
+    val required_r: R.Result[layout.CheckedCount[TypeId], layout.CheckCause] =
+        layout.count_add[TypeId](layout.count[TypeId](ti.params_len::usize), layout.count[TypeId](need::usize));
+    if (R.is_err[layout.CheckedCount[TypeId], layout.CheckCause](required_r)) {
+        ret R.err[R.Void, str]("type: params reservation count overflow");
+    }
+    val required: layout.CheckedCount[TypeId] = R.unwrap_ok[layout.CheckedCount[TypeId], layout.CheckCause](required_r);
+
+    if (required.value <= ti.params_cap::usize) {
+        ret R.ok_void[str]();
     }
 
-    var new_cap: u32 = ti.params_cap;
-    if (new_cap == 0) { new_cap = INITIAL_PARAMS_CAP; }
-    for (ti.params_len + need > new_cap) {
-        new_cap = new_cap * 2;
+    var base_cap: usize = ti.params_cap::usize;
+    if (base_cap == 0) { base_cap = INITIAL_PARAMS_CAP::usize; }
+    val grown_r: R.Result[layout.CheckedCount[TypeId], layout.CheckCause] =
+        layout.count_grow[TypeId](layout.count[TypeId](base_cap), required);
+    if (R.is_err[layout.CheckedCount[TypeId], layout.CheckCause](grown_r)) {
+        ret R.err[R.Void, str]("type: params growth count overflow");
     }
+    val new_cap_fits: R.Result[u32, layout.CheckCause] = layout.usize_to_u32(
+        R.unwrap_ok[layout.CheckedCount[TypeId], layout.CheckCause](grown_r).value);
+    if (R.is_err[u32, layout.CheckCause](new_cap_fits)) {
+        ret R.err[R.Void, str]("type: params capacity exceeds the u32 limit");
+    }
+    val new_cap: u32 = R.unwrap_ok[u32, layout.CheckCause](new_cap_fits);
 
     val res_ra_params: R.Result[*TypeId, str] = A.reallocate[TypeId](ti.a, ti.params, ti.params_cap::usize, new_cap::usize);
     if (R.is_err[*TypeId, str](res_ra_params)) {
-        ret R.err[bool, str](R.unwrap_err[*TypeId, str](res_ra_params));
+        ret R.err[R.Void, str](R.unwrap_err[*TypeId, str](res_ra_params));
     }
     ti.params     = R.unwrap_ok[*TypeId, str](res_ra_params);
     ti.params_cap = new_cap;
 
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# copy `len` TypeIds from `src` into the parameter pool, growing it as needed,
-# and return the pool index where the copied run begins
-#
-# Shared by intern_function and intern_instance, whose side-pool slices are
-# built identically. `src` may be nil when `len` is 0.
-# ---
-# ti:  the interner
-# src: pointer to the TypeIds to copy
-# len: number of TypeIds to copy
-# ret: the start index of the run in ti.params, or an allocation error
 fun params_append(ti: *TypeInterner, src: *TypeId, len: u32) R.Result[u32, str] {
     val start: u32 = ti.params_len;
 
-    val res_reserve: R.Result[bool, str] = reserve_params(ti, len);
-    if (R.is_err[bool, str](res_reserve)) {
-        ret R.err[u32, str](R.unwrap_err[bool, str](res_reserve));
+    val res_reserve: R.Result[R.Void, str] = reserve_params(ti, len);
+    if (R.is_err[R.Void, str](res_reserve)) {
+        ret R.err[u32, str](R.unwrap_err[R.Void, str](res_reserve));
     }
 
     var i: u32 = 0;
@@ -2553,14 +1627,6 @@ fun params_append(ti: *TypeInterner, src: *TypeId, len: u32) R.Result[u32, str] 
     ret R.ok[u32, str](start);
 }
 
-# FNV-1a content hash over a function signature (ret, params), matching the
-# identity `fun_matches` verifies
-# ---
-# ret_type:   return type
-# params:     pointer to a contiguous array of fixed parameter TypeIds
-# count:      number of fixed parameter types
-# c_variadic: the C-variadic flag, hashed with the fixed arity it qualifies
-# ret:        the signature's content hash
 fun hash_fun(ret_type: TypeId, params: *TypeId, count: u32, c_variadic: bool) u64 {
     var h: u64 = fnv1a.FNV_INIT;
     h = fnv1a.step_u8(h, TYPE_FUN::u8);
@@ -2576,20 +1642,11 @@ fun hash_fun(ret_type: TypeId, params: *TypeId, count: u32, c_variadic: bool) u6
     ret h;
 }
 
-# whether the interned TYPE_FUN at `tid` has exactly the given signature
-# (ret, params slice)
-# ---
-# ti:         the interner
-# tid:        TypeId of the candidate (verified to be TYPE_FUN)
-# ret_type:   return type to match
-# params:     pointer to a contiguous array of fixed parameter TypeIds
-# count:      number of fixed parameter types
-# c_variadic: the C-variadic flag to match
-# ret:        true when `tid` is a TYPE_FUN with exactly this signature
 fun fun_matches(ti: *TypeInterner, tid: TypeId, ret_type: TypeId, params: *TypeId, count: u32, c_variadic: bool) bool {
-    if (tid >= ti.type_len) { ret false; }
+    val r: R.Result[*Type, str] = handle.chunk_get[Type](?ti.types, tid::usize);
+    if (R.is_err[*Type, str](r)) { ret false; }
 
-    val t: *Type = ?ti.types[tid];
+    val t: *Type = R.unwrap_ok[*Type, str](r);
     if (t.kind != TYPE_FUN)                 { ret false; }
     if (t.data.fn.ret_type != ret_type)     { ret false; }
     if (t.data.fn.params_len != count)      { ret false; }
@@ -2603,46 +1660,6 @@ fun fun_matches(ti: *TypeInterner, tid: TypeId, ret_type: TypeId, params: *TypeI
     ret true;
 }
 
-# append `tid` to the instance list, growing it as needed
-# ---
-# ti:  the interner
-# tid: the instance TypeId to track
-# ret: true on success, or an allocation error
-fun track_instance(ti: *TypeInterner, tid: TypeId) R.Result[bool, str] {
-    if (ti.instances_len == ti.instances_cap) {
-        var new_cap: u32 = ti.instances_cap * 2;
-        if (new_cap == 0) { new_cap = INITIAL_INSTANCE_CAP; }
-
-        if (ti.instances == nil) {
-            val res_a_instances: R.Result[*TypeId, str] = A.allocate[TypeId](ti.a, new_cap::usize);
-            if (R.is_err[*TypeId, str](res_a_instances)) {
-                ret R.err[bool, str](R.unwrap_err[*TypeId, str](res_a_instances));
-            }
-            ti.instances = R.unwrap_ok[*TypeId, str](res_a_instances);
-        }
-        or {
-            val res_ra_instances: R.Result[*TypeId, str] = A.reallocate[TypeId](ti.a, ti.instances, ti.instances_cap::usize, new_cap::usize);
-            if (R.is_err[*TypeId, str](res_ra_instances)) {
-                ret R.err[bool, str](R.unwrap_err[*TypeId, str](res_ra_instances));
-            }
-            ti.instances = R.unwrap_ok[*TypeId, str](res_ra_instances);
-        }
-
-        ti.instances_cap = new_cap;
-    }
-
-    ti.instances[ti.instances_len] = tid;
-    ti.instances_len = ti.instances_len + 1;
-
-    ret R.ok[bool, str](true);
-}
-
-# structural FNV-1a hash over Type's identity-bearing fields
-#
-# Function types bypass dedup, so this never hashes one.
-# ---
-# p:   pointer to the Type to hash (as `ptr`, per the dedup map's hash signature)
-# ret: the structural hash
 fun hash_type(p: ptr) u64 {
     val t: *Type = p::*Type;
 
@@ -2667,11 +1684,10 @@ fun hash_type(p: ptr) u64 {
         h = fnv1a.step_u32(h, t.data.nominal.decl::u32);
     }
     or (t.kind == TYPE_GENERIC_PARAM) {
+        h = fnv1a.step_u32(h, t.data.generic_param.origin::u32);
         h = fnv1a.step_u32(h, t.data.generic_param.owner::u32);
         h = fnv1a.step_u32(h, t.data.generic_param.index);
     }
-    # the tag and the declared extent, never the spelling: two modules declaring one
-    # ABI type must reach one TypeId or a binding could not cross between them.
     or (t.kind == TYPE_ABI) {
         h = fnv1a.step_u32(h, t.data.abi.tag);
         h = fnv1a.step_u32(h, t.data.abi.size);
@@ -2680,12 +1696,6 @@ fun hash_type(p: ptr) u64 {
     ret h;
 }
 
-# structural equality over two Types' identity-bearing fields; primitives
-# compare by kind alone
-# ---
-# pa:  pointer to the first Type (as `ptr`, per the dedup map's eq signature)
-# pb:  pointer to the second Type
-# ret: true when both Types share the same identity-bearing fields
 fun eq_type(pa: ptr, pb: ptr) bool {
     val a: *Type = pa::*Type;
     val b: *Type = pb::*Type;
@@ -2710,7 +1720,8 @@ fun eq_type(pa: ptr, pb: ptr) bool {
             && a.data.nominal.decl == b.data.nominal.decl;
     }
     if (a.kind == TYPE_GENERIC_PARAM) {
-        ret a.data.generic_param.owner == b.data.generic_param.owner
+        ret a.data.generic_param.origin == b.data.generic_param.origin
+            && a.data.generic_param.owner == b.data.generic_param.owner
             && a.data.generic_param.index == b.data.generic_param.index;
     }
     if (a.kind == TYPE_ABI) {
@@ -2719,12 +1730,9 @@ fun eq_type(pa: ptr, pb: ptr) bool {
             && a.data.abi.align == b.data.abi.align;
     }
 
-    # primitives and TYPE_ERROR are equal by kind alone
     ret true;
 }
 
-# intern_function returns one TypeId for identical signatures and distinct ids
-# when a parameter type differs
 test "mach.lang.type.intern_function:identical_signatures" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -2733,14 +1741,12 @@ test "mach.lang.type.intern_function:identical_signatures" {
 
     val u8_id: TypeId = O.unwrap[TypeId](prim(?ti, TYPE_U8));
 
-    # same signature interned twice -> same TypeId
     val r1: R.Result[TypeId, str] = intern_function(?ti, u8_id, nil, 0, false);
     val r2: R.Result[TypeId, str] = intern_function(?ti, u8_id, nil, 0, false);
     if (R.is_err[TypeId, str](r1))                                    { dnit(?ti); ret 1; }
     if (R.is_err[TypeId, str](r2))                                    { dnit(?ti); ret 1; }
     if (R.unwrap_ok[TypeId, str](r1) != R.unwrap_ok[TypeId, str](r2)) { dnit(?ti); ret 1; }
 
-    # fun(u32)->u8 and fun(u64)->u8 differ because the param types differ
     val u32_id: TypeId = O.unwrap[TypeId](prim(?ti, TYPE_U32));
     val u64_id: TypeId = O.unwrap[TypeId](prim(?ti, TYPE_U64));
     var p32: [1]TypeId;
@@ -2753,10 +1759,6 @@ test "mach.lang.type.intern_function:identical_signatures" {
     if (R.is_err[TypeId, str](r5))                                    { dnit(?ti); ret 1; }
     if (R.unwrap_ok[TypeId, str](r4) == R.unwrap_ok[TypeId, str](r5)) { dnit(?ti); ret 1; }
 
-    # the C-variadic flag is part of the identity: `fun(u32, ...) -> u8` is a
-    # DIFFERENT signature from `fun(u32) -> u8` and is not deduped onto it. that is
-    # the point of interning it - the two lower to different calls on Apple arm64,
-    # where the variadic tail is stack-passed and the fixed parameter is not.
     val rv: R.Result[TypeId, str] = intern_function(?ti, u8_id, ?p32[0], 1, true);
     if (R.is_err[TypeId, str](rv))                                    { dnit(?ti); ret 1; }
     if (R.unwrap_ok[TypeId, str](rv) == R.unwrap_ok[TypeId, str](r4)) { dnit(?ti); ret 1; }
@@ -2767,8 +1769,34 @@ test "mach.lang.type.intern_function:identical_signatures" {
     ret 0;
 }
 
-# intern_instance dedups on (origin, decl, args) and distinguishes a differing
-# arg type and a differing arg count
+test "mach.lang.type.intern_generic_param:dedup_by_origin_owner_index" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var ti: TypeInterner;
+    if (O.is_some[str](init(?ti, ?alloc))) { ret 1; }
+
+    val r1: R.Result[TypeId, str] = intern_generic_param(?ti, intern.STR_NIL, 1::module.ModuleId, 0::id.DeclId, 0);
+    val r2: R.Result[TypeId, str] = intern_generic_param(?ti, intern.STR_NIL, 1::module.ModuleId, 0::id.DeclId, 0);
+    if (R.is_err[TypeId, str](r1))                                    { dnit(?ti); ret 1; }
+    if (R.is_err[TypeId, str](r2))                                    { dnit(?ti); ret 1; }
+    if (R.unwrap_ok[TypeId, str](r1) != R.unwrap_ok[TypeId, str](r2)) { dnit(?ti); ret 1; }
+
+    val r_other_module: R.Result[TypeId, str] = intern_generic_param(?ti, intern.STR_NIL, 2::module.ModuleId, 0::id.DeclId, 0);
+    if (R.is_err[TypeId, str](r_other_module)) { dnit(?ti); ret 1; }
+    if (R.unwrap_ok[TypeId, str](r1) == R.unwrap_ok[TypeId, str](r_other_module)) { dnit(?ti); ret 1; }
+
+    val r_other_owner: R.Result[TypeId, str] = intern_generic_param(?ti, intern.STR_NIL, 1::module.ModuleId, 1::id.DeclId, 0);
+    if (R.is_err[TypeId, str](r_other_owner)) { dnit(?ti); ret 1; }
+    if (R.unwrap_ok[TypeId, str](r1) == R.unwrap_ok[TypeId, str](r_other_owner)) { dnit(?ti); ret 1; }
+
+    val r_other_index: R.Result[TypeId, str] = intern_generic_param(?ti, intern.STR_NIL, 1::module.ModuleId, 0::id.DeclId, 1);
+    if (R.is_err[TypeId, str](r_other_index)) { dnit(?ti); ret 1; }
+    if (R.unwrap_ok[TypeId, str](r1) == R.unwrap_ok[TypeId, str](r_other_index)) { dnit(?ti); ret 1; }
+
+    dnit(?ti);
+    ret 0;
+}
+
 test "mach.lang.type.intern_instance:dedup_by_origin_decl_args" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -2785,21 +1813,18 @@ test "mach.lang.type.intern_instance:dedup_by_origin_decl_args" {
     var a1: [1]TypeId;
     a1[0] = u32_id;
 
-    # same (origin, decl, args) interned twice -> same TypeId
     val r1: R.Result[TypeId, str] = intern_instance(?ti, nom, 1::module.ModuleId, 0::id.DeclId, ?a1[0], 1);
     val r2: R.Result[TypeId, str] = intern_instance(?ti, nom, 1::module.ModuleId, 0::id.DeclId, ?a1[0], 1);
     if (R.is_err[TypeId, str](r1))                                    { dnit(?ti); ret 1; }
     if (R.is_err[TypeId, str](r2))                                    { dnit(?ti); ret 1; }
     if (R.unwrap_ok[TypeId, str](r1) != R.unwrap_ok[TypeId, str](r2)) { dnit(?ti); ret 1; }
 
-    # different arg type -> different TypeId
     var a1u8: [1]TypeId;
     a1u8[0] = u8_id;
     val r3: R.Result[TypeId, str] = intern_instance(?ti, nom, 1::module.ModuleId, 0::id.DeclId, ?a1u8[0], 1);
     if (R.is_err[TypeId, str](r3))                                    { dnit(?ti); ret 1; }
     if (R.unwrap_ok[TypeId, str](r1) == R.unwrap_ok[TypeId, str](r3)) { dnit(?ti); ret 1; }
 
-    # different arg count -> different TypeId
     var a2: [2]TypeId;
     a2[0] = u32_id;
     a2[1] = u8_id;
@@ -2811,8 +1836,6 @@ test "mach.lang.type.intern_instance:dedup_by_origin_decl_args" {
     ret 0;
 }
 
-# an instance is classified by the nominal it specializes, so a `uni` instance reads as
-# a union and a `rec` instance as a record even though both are TYPE_INSTANCE (#2239)
 test "mach.lang.type.is_union:instance_follows_its_nominal" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -2837,7 +1860,6 @@ test "mach.lang.type.is_union:instance_follows_its_nominal" {
     val rec_inst: TypeId = R.unwrap_ok[TypeId, str](ri);
     val uni_inst: TypeId = R.unwrap_ok[TypeId, str](ui);
 
-    # the two instances are indistinguishable by their own kind
     if (O.unwrap[*Type](get(?ti, rec_inst)).kind != TYPE_INSTANCE) { dnit(?ti); ret 1; }
     if (O.unwrap[*Type](get(?ti, uni_inst)).kind != TYPE_INSTANCE) { dnit(?ti); ret 1; }
 
@@ -2849,7 +1871,6 @@ test "mach.lang.type.is_union:instance_follows_its_nominal" {
     if (is_union(?ti, rec_inst))   { dnit(?ti); ret 1; }
     if (is_record(?ti, uni_inst))  { dnit(?ti); ret 1; }
 
-    # the bare nominals answer for themselves, and a primitive is neither
     if (is_union(?ti, uni_nom))  { } or { dnit(?ti); ret 1; }
     if (is_record(?ti, rec_nom)) { } or { dnit(?ti); ret 1; }
     if (is_union(?ti, u32_id))   { dnit(?ti); ret 1; }
@@ -2859,13 +1880,7 @@ test "mach.lang.type.is_union:instance_follows_its_nominal" {
     ret 0;
 }
 
-# `vector_form` reads `<element>x<lanes>` and separates the three outcomes: a well
-# formed shape, a shape with more lanes than the compiler represents, and a spelling
-# that is not a vector at all. the ten formerly seeded spellings are exactly the
-# 128-bit forms, and nothing here consults a target
 test "mach.lang.type.vector_form:reads_the_form_at_every_width" {
-    # every one of the ten shapes the compiler used to seed by name reads back as
-    # itself. this is the regression bar (#2687).
     var vi: u32 = 0;
     for (vi < VEC_COUNT) {
         val sh: VecShape = vec_shape(vi);
@@ -2877,12 +1892,6 @@ test "mach.lang.type.vector_form:reads_the_form_at_every_width" {
         vi = vi + 1;
     }
 
-    # the sub-128 forms. ACCEPTED since #2697 split the register width from the
-    # memory footprint, and read correctly besides - element, lane count and width
-    # are all recovered. Before that they were refused by name rather than accepted
-    # and miscompiled, since carrying one at either single width loses data: at the
-    # memory width the top lane is truncated, at the register width the store
-    # clobbers the next field.
     val v3: VecForm = vector_form("f32x3");
     if (v3.status != VEC_FORM_OK) { ret 1; }
     if (v3.element != TYPE_F32)   { ret 1; }
@@ -2899,9 +1908,6 @@ test "mach.lang.type.vector_form:reads_the_form_at_every_width" {
     if (v2.lanes != 2)            { ret 1; }
     if (v2.bits != 64)            { ret 1; }
 
-    # THE OVER-WIDTH FORMS, which every target refused by name until #2727. The
-    # shape is read exactly, at every width: the realization (a split, or per-lane
-    # scalar code) is the back end's question and this is not where it is asked.
     val w5: VecForm = vector_form("f32x5");
     if (w5.status != VEC_FORM_OK) { ret 1; }
     if (w5.element != TYPE_F32)   { ret 1; }
@@ -2918,21 +1924,14 @@ test "mach.lang.type.vector_form:reads_the_form_at_every_width" {
     if (vector_form("f32x16").bits   != 512)         { ret 1; }
     if (vector_form("i16x7").bits    != 112)         { ret 1; }
 
-    # the largest shape the compiler represents, and the first one past it. the
-    # bound is the u16 lane count MIR carries, not any target's register width.
     if (vector_form("u8x65535").status != VEC_FORM_OK)       { ret 1; }
     if (vector_form("u8x65535").lanes  != MAX_VEC_LANES)     { ret 1; }
     if (vector_form("u8x65536").status != VEC_FORM_TOO_WIDE) { ret 1; }
 
-    # REFUSED: a lane count so large the width product would wrap a u32 still
-    # reports too wide, never a shape that appears to fit.
     if (vector_form("u64x4294967295").status != VEC_FORM_TOO_WIDE) { ret 1; }
 
-    # REFUSED: a degenerate lane count is its own outcome, not a width failure.
     if (vector_form("f32x1").status != VEC_FORM_BAD_LANES) { ret 1; }
 
-    # NOT A VECTOR: these fall through to ordinary name resolution rather than
-    # producing a vector diagnostic.
     if (vector_form(nil).status     != VEC_FORM_NONE) { ret 1; }
     if (vector_form("").status      != VEC_FORM_NONE) { ret 1; }
     if (vector_form("f32").status   != VEC_FORM_NONE) { ret 1; }
@@ -2940,18 +1939,13 @@ test "mach.lang.type.vector_form:reads_the_form_at_every_width" {
     if (vector_form("x4").status    != VEC_FORM_NONE) { ret 1; }
     if (vector_form("f33x4").status != VEC_FORM_NONE) { ret 1; }
     if (vector_form("f32x4y").status != VEC_FORM_NONE) { ret 1; }
-    # a leading zero is not a lane count, so `f32x04` stays an ordinary name.
     if (vector_form("f32x04").status != VEC_FORM_NONE) { ret 1; }
-    # `ptr` has no scalar bit width, so no lane count makes a vector of it.
     if (vector_form("ptrx2").status  != VEC_FORM_NONE) { ret 1; }
-    # a user identifier that merely contains an x is untouched.
     if (vector_form("matrix4").status != VEC_FORM_NONE) { ret 1; }
 
     ret 0;
 }
 
-# `prim_name` round-trips every primitive ordinal to its spelling, so the
-# resolver's registry and the vector form read one table
 test "mach.lang.type.prim_name:spells_every_primitive" {
     if (!str_equals(prim_name(TYPE_U8),  "u8"))  { ret 1; }
     if (!str_equals(prim_name(TYPE_U16), "u16")) { ret 1; }
@@ -2964,7 +1958,6 @@ test "mach.lang.type.prim_name:spells_every_primitive" {
     if (!str_equals(prim_name(TYPE_F32), "f32")) { ret 1; }
     if (!str_equals(prim_name(TYPE_F64), "f64")) { ret 1; }
     if (!str_equals(prim_name(TYPE_PTR), "ptr")) { ret 1; }
-    # every ordinal below PRIM_COUNT has a spelling, and a non-primitive has none
     var k: u32 = 0;
     for (k < PRIM_COUNT) {
         if (prim_name(k::u8) == nil) { ret 1; }
@@ -2974,15 +1967,66 @@ test "mach.lang.type.prim_name:spells_every_primitive" {
     ret 0;
 }
 
-# the ten seeded vector shapes are retrievable through `vec`, intern_vector
-# dedups equal shapes to one TypeId, and distinct shapes stay distinct
+test "mach.lang.type.prim_catalog:complete_unique_ordered_roundtrip" {
+    if (PRIM_COUNT != TYPE_PTR::u32 + 1) { ret 1; }
+
+    var seen: [PRIM_COUNT]bool;
+    var i: u32 = 0;
+    for (i < PRIM_COUNT) { seen[i] = false; i = i + 1; }
+
+    i = 0;
+    for (i < PRIM_COUNT) {
+        val spec: *PrimSpec = ?PRIM_CATALOG[i];
+        if (spec.kind::u32 != i)             { ret 1; }
+        if (seen[spec.kind::u32])            { ret 1; }
+        if (str_equals(spec.spelling, ""))   { ret 1; }
+        if (spec.len != str_len(spec.spelling)) { ret 1; }
+        seen[spec.kind::u32] = true;
+
+        var j: u32 = 0;
+        for (j < i) {
+            val prior: *PrimSpec = ?PRIM_CATALOG[j];
+            if (prior.kind == spec.kind)                 { ret 1; }
+            if (str_equals(prior.spelling, spec.spelling)) { ret 1; }
+            j = j + 1;
+        }
+
+        if (!str_equals(prim_name(spec.kind), spec.spelling)) { ret 1; }
+        if (prim_spelling_len(spec.kind) != spec.len)          { ret 1; }
+        val d: PrimDesc = prim_desc(spec.kind);
+        if (d.class != spec.class)   { ret 1; }
+        if (d.signed != spec.signed) { ret 1; }
+        if (d.bits != spec.bits)     { ret 1; }
+
+        val parsed: O.Option[TypeKind] = prim_from_name(spec.spelling);
+        if (O.is_none[TypeKind](parsed))                { ret 1; }
+        if (O.unwrap[TypeKind](parsed) != spec.kind)    { ret 1; }
+        i = i + 1;
+    }
+
+    if (O.is_some[TypeKind](prim_from_name("")))     { ret 1; }
+    if (O.is_some[TypeKind](prim_from_name("bool"))) { ret 1; }
+    if (prim_name(TYPE_VECTOR) != nil)               { ret 1; }
+    if (prim_spelling_len(TYPE_VECTOR) != 0)         { ret 1; }
+    val nd: PrimDesc = prim_desc(TYPE_VECTOR);
+    if (nd.class != PRIM_CLASS_NONE) { ret 1; }
+    if (nd.signed)                   { ret 1; }
+    if (nd.bits != 0)                { ret 1; }
+
+    i = 0;
+    for (i < PRIM_COUNT) {
+        if (!seen[i]) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
 test "mach.lang.type.intern_vector:seeded_and_dedup" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var ti: TypeInterner;
     if (O.is_some[str](init(?ti, ?alloc))) { ret 1; }
 
-    # every seeded ordinal resolves to a real vector carrying the shape's payload
     var vi: u32 = 0;
     for (vi < VEC_COUNT) {
         val sh:  VecShape          = vec_shape(vi);
@@ -2995,18 +2039,15 @@ test "mach.lang.type.intern_vector:seeded_and_dedup" {
         vi = vi + 1;
     }
 
-    # re-interning f32x4 returns the seeded id (dedup by shape)
     val f0: TypeId = O.unwrap[TypeId](vec(?ti, 0));
     val r_f: R.Result[TypeId, str] = intern_vector(?ti, TYPE_F32, 4);
     if (R.is_err[TypeId, str](r_f))                     { dnit(?ti); ret 1; }
     if (R.unwrap_ok[TypeId, str](r_f) != f0)            { dnit(?ti); ret 1; }
 
-    # a different element at the same lane count is a different type
     val r_i: R.Result[TypeId, str] = intern_vector(?ti, TYPE_I32, 4);
     if (R.is_err[TypeId, str](r_i))                     { dnit(?ti); ret 1; }
     if (R.unwrap_ok[TypeId, str](r_i) == f0)            { dnit(?ti); ret 1; }
 
-    # out-of-range ordinal yields none, and a scalar is not a vector
     if (O.is_some[TypeId](vec(?ti, VEC_COUNT)))         { dnit(?ti); ret 1; }
     if (is_vector(?ti, O.unwrap[TypeId](prim(?ti, TYPE_U8)))) { dnit(?ti); ret 1; }
 
@@ -3014,28 +2055,40 @@ test "mach.lang.type.intern_vector:seeded_and_dedup" {
     ret 0;
 }
 
-# vector_mask maps each shape to the same-lane-count unsigned mask vector
+test "mach.lang.type.is_u8:rejects_missing_types" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var ti: TypeInterner;
+    if (O.is_some[str](init(?ti, ?alloc))) { ret 1; }
+
+    val u8t: TypeId = O.unwrap[TypeId](prim(?ti, TYPE_U8));
+    if (!is_u8(?ti, u8t))        { dnit(?ti); ret 1; }
+    if (is_u8(?ti, TYPE_NIL))    { dnit(?ti); ret 1; }
+    if (is_u8(?ti, TYPE_ERROR))  { dnit(?ti); ret 1; }
+    if (is_u8(?ti, handle.chunk_count[Type](?ti.types)::u32)) { dnit(?ti); ret 1; }
+
+    dnit(?ti);
+    ret 0;
+}
+
 test "mach.lang.type.vector_mask:same_shape_unsigned" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var ti: TypeInterner;
     if (O.is_some[str](init(?ti, ?alloc))) { ret 1; }
 
-    # f32x4 -> u32x4
     val f32x4: TypeId = O.unwrap[TypeId](vec(?ti, 0));
     val u32x4: TypeId = O.unwrap[TypeId](vec(?ti, 8));
     val m0: R.Result[TypeId, str] = vector_mask(?ti, f32x4);
     if (R.is_err[TypeId, str](m0))          { dnit(?ti); ret 1; }
     if (R.unwrap_ok[TypeId, str](m0) != u32x4) { dnit(?ti); ret 1; }
 
-    # i8x16 -> u8x16
     val i8x16: TypeId = O.unwrap[TypeId](vec(?ti, 2));
     val u8x16: TypeId = O.unwrap[TypeId](vec(?ti, 6));
     val m1: R.Result[TypeId, str] = vector_mask(?ti, i8x16);
     if (R.is_err[TypeId, str](m1))          { dnit(?ti); ret 1; }
     if (R.unwrap_ok[TypeId, str](m1) != u8x16) { dnit(?ti); ret 1; }
 
-    # i64x2 -> u64x2
     val i64x2: TypeId = O.unwrap[TypeId](vec(?ti, 5));
     val u64x2: TypeId = O.unwrap[TypeId](vec(?ti, 9));
     val m2: R.Result[TypeId, str] = vector_mask(?ti, i64x2);
@@ -3046,8 +2099,6 @@ test "mach.lang.type.vector_mask:same_shape_unsigned" {
     ret 0;
 }
 
-# type_equals_signatures sees identical signatures as equal, a differing param
-# type as unequal, and a sentinel TypeId as unequal
 test "mach.lang.type.type_equals_signatures:param_and_nil_boundaries" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -3062,7 +2113,6 @@ test "mach.lang.type.type_equals_signatures:param_and_nil_boundaries" {
     var pi64: [1]TypeId;
     pi64[0] = i64_id;
 
-    # fun(i32)->void interned twice -> same TypeId via dedup
     val ra: R.Result[TypeId, str] = intern_function(?ti, TYPE_NIL, ?pi32[0], 1, false);
     val rc: R.Result[TypeId, str] = intern_function(?ti, TYPE_NIL, ?pi32[0], 1, false);
     val rd: R.Result[TypeId, str] = intern_function(?ti, TYPE_NIL, ?pi64[0], 1, false);
@@ -3074,19 +2124,14 @@ test "mach.lang.type.type_equals_signatures:param_and_nil_boundaries" {
     val tid_c: TypeId = R.unwrap_ok[TypeId, str](rc);
     val tid_d: TypeId = R.unwrap_ok[TypeId, str](rd);
 
-    # a vs c: identical signatures -> equal (deduped to same TypeId)
     if (!type_equals_signatures(?ti, tid_a, tid_c))   { dnit(?ti); ret 1; }
-    # a vs d: differ on param type -> not equal
     if (type_equals_signatures(?ti, tid_a, tid_d))    { dnit(?ti); ret 1; }
-    # a vs TYPE_NIL sentinel: not equal (non-FUN or out-of-range)
     if (type_equals_signatures(?ti, tid_a, TYPE_NIL)) { dnit(?ti); ret 1; }
 
     dnit(?ti);
     ret 0;
 }
 
-# is_integer / is_numeric / is_float pin their kind boundaries against a
-# comptime pack, a pointer, and an array
 test "mach.lang.type:numeric_predicate_boundaries" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -3106,26 +2151,19 @@ test "mach.lang.type:numeric_predicate_boundaries" {
     if (R.is_err[TypeId, str](arr_r)) { dnit(?ti); ret 1; }
     val arr_id: TypeId = R.unwrap_ok[TypeId, str](arr_r);
 
-    # a comptime pack is neither integer, numeric, nor float
     if (is_integer(?ti, pack_id)) { dnit(?ti); ret 1; }
     if (is_numeric(?ti, pack_id)) { dnit(?ti); ret 1; }
     if (is_float(?ti, pack_id))   { dnit(?ti); ret 1; }
-    # ptr is not an integer
     if (is_integer(?ti, ptr_id))  { dnit(?ti); ret 1; }
-    # u8 and i64 are integers
     if (!is_integer(?ti, u8_id))  { dnit(?ti); ret 1; }
     if (!is_integer(?ti, i64_id)) { dnit(?ti); ret 1; }
-    # f32 is a float
     if (!is_float(?ti, f32_id))   { dnit(?ti); ret 1; }
-    # array is not an integer
     if (is_integer(?ti, arr_id))  { dnit(?ti); ret 1; }
 
     dnit(?ti);
     ret 0;
 }
 
-# intern_secret dedups, collapses a doubled qualifier, and threads the secret
-# qualifier through the classifier / spine predicates (#1645)
 test "mach.lang.type.intern_secret:dedup_collapse_and_predicates" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -3134,7 +2172,6 @@ test "mach.lang.type.intern_secret:dedup_collapse_and_predicates" {
 
     val u32_id: TypeId = O.unwrap[TypeId](prim(?ti, TYPE_U32));
 
-    # `^u32` interned twice -> one TypeId, distinct from `u32`
     val s1: R.Result[TypeId, str] = intern_secret(?ti, u32_id);
     val s2: R.Result[TypeId, str] = intern_secret(?ti, u32_id);
     if (R.is_err[TypeId, str](s1) || R.is_err[TypeId, str](s2)) { dnit(?ti); ret 1; }
@@ -3142,22 +2179,18 @@ test "mach.lang.type.intern_secret:dedup_collapse_and_predicates" {
     if (sec_u32 != R.unwrap_ok[TypeId, str](s2)) { dnit(?ti); ret 1; }
     if (sec_u32 == u32_id)                       { dnit(?ti); ret 1; }
 
-    # `^^u32` collapses to `^u32` - the lattice is two-point
     val s3: R.Result[TypeId, str] = intern_secret(?ti, sec_u32);
     if (R.is_err[TypeId, str](s3))                  { dnit(?ti); ret 1; }
     if (R.unwrap_ok[TypeId, str](s3) != sec_u32)    { dnit(?ti); ret 1; }
 
-    # is_secret / strip_secret round-trip
     if (!is_secret(?ti, sec_u32))                 { dnit(?ti); ret 1; }
     if (is_secret(?ti, u32_id))                   { dnit(?ti); ret 1; }
     if (strip_secret(?ti, sec_u32) != u32_id)     { dnit(?ti); ret 1; }
     if (strip_secret(?ti, u32_id) != u32_id)      { dnit(?ti); ret 1; }
 
-    # a secret integer is still an integer for arithmetic classification
     if (!is_integer(?ti, sec_u32))                { dnit(?ti); ret 1; }
     if (!is_numeric(?ti, sec_u32))                { dnit(?ti); ret 1; }
 
-    # `*^u32` carries secret along its spine; `*u32` does not
     val pp_sec: R.Result[TypeId, str] = intern_pointer(?ti, sec_u32);
     val pp_pub: R.Result[TypeId, str] = intern_pointer(?ti, u32_id);
     if (R.is_err[TypeId, str](pp_sec) || R.is_err[TypeId, str](pp_pub)) { dnit(?ti); ret 1; }
@@ -3167,8 +2200,6 @@ test "mach.lang.type.intern_secret:dedup_collapse_and_predicates" {
     if (carries_secret(?ti, ptr_pub))             { dnit(?ti); ret 1; }
     if (!carries_secret(?ti, sec_u32))            { dnit(?ti); ret 1; }
 
-    # secrecy_structure_equal: `*^u32` differs from `*u32`, matches itself, and
-    # `^u32` vs `^u64` (same placement, differing leaves) is equal
     val u64_id:  TypeId = O.unwrap[TypeId](prim(?ti, TYPE_U64));
     val sec_u64: R.Result[TypeId, str] = intern_secret(?ti, u64_id);
     if (R.is_err[TypeId, str](sec_u64)) { dnit(?ti); ret 1; }
@@ -3179,4 +2210,425 @@ test "mach.lang.type.intern_secret:dedup_collapse_and_predicates" {
 
     dnit(?ti);
     ret 0;
+}
+
+rec TFieldProbe {
+    backing: A.Allocator;
+    calls:   u32;
+    fail_at: u32;
+}
+
+fun t_field_probe_allocate(ctx: ptr, size: usize, align: usize) O.Option[ptr] {
+    val p: *TFieldProbe = ctx::*TFieldProbe;
+    p.calls = p.calls + 1;
+    if (p.fail_at != 0 && p.calls >= p.fail_at) { ret O.none[ptr](); }
+    ret p.backing.fn_allocate(p.backing.ctx, size, align);
+}
+
+fun t_field_probe_reallocate(ctx: ptr, item: ptr, old_size: usize, new_size: usize, align: usize) O.Option[ptr] {
+    val p: *TFieldProbe = ctx::*TFieldProbe;
+    p.calls = p.calls + 1;
+    if (p.fail_at != 0 && p.calls >= p.fail_at) { ret O.none[ptr](); }
+    ret p.backing.fn_reallocate(p.backing.ctx, item, old_size, new_size, align);
+}
+
+fun t_field_probe_deallocate(ctx: ptr, item: ptr, size: usize, align: usize) i64 {
+    val p: *TFieldProbe = ctx::*TFieldProbe;
+    ret p.backing.fn_deallocate(p.backing.ctx, item, size, align);
+}
+
+fun t_field_probe_make(p: *TFieldProbe, alloc: *A.Allocator) bool {
+    if (O.is_some[str](page.make(?p.backing))) { ret false; }
+    p.calls   = 0;
+    p.fail_at = 0;
+    val self_ptr: *TFieldProbe = p;
+    alloc.ctx           = self_ptr::ptr;
+    alloc.fn_allocate    = t_field_probe_allocate;
+    alloc.fn_reallocate  = t_field_probe_reallocate;
+    alloc.fn_deallocate  = t_field_probe_deallocate;
+    ret true;
+}
+
+test "mach.lang.type.field_table_publish:a_stale_epoch_hides_the_table" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var ti: TypeInterner;
+    if (O.is_some[str](init(?ti, ?alloc))) { ret 1; }
+
+    val ty: TypeId = O.unwrap[TypeId](prim(?ti, TYPE_U32));
+    val name_a: intern.StrId = 1::intern.StrId;
+    val name_b: intern.StrId = 2::intern.StrId;
+    val name_c: intern.StrId = 3::intern.StrId;
+
+    val s1_r: R.Result[u32, str] = field_table_stage(?ti, 2);
+    if (R.is_err[u32, str](s1_r)) { dnit(?ti); ret 1; }
+    val s1: u32 = R.unwrap_ok[u32, str](s1_r);
+    if (R.is_err[R.Void, str](field_table_stage_push(?ti, name_a, ty))) { dnit(?ti); ret 1; }
+    if (field_count(?ti, ty) != 0) { dnit(?ti); ret 1; }
+    if (R.is_err[R.Void, str](field_table_stage_push(?ti, name_b, ty))) { dnit(?ti); ret 1; }
+    if (field_count(?ti, ty) != 0) { dnit(?ti); ret 1; }
+    if (R.is_err[R.Void, str](field_table_publish(?ti, ty, s1, 2))) { dnit(?ti); ret 1; }
+
+    if (field_count(?ti, ty) != 2) { dnit(?ti); ret 1; }
+    val e0: O.Option[*FieldEntry] = field_at(?ti, ty, 0);
+    if (O.is_none[*FieldEntry](e0) || O.unwrap[*FieldEntry](e0).name != name_a) { dnit(?ti); ret 1; }
+    val e1: O.Option[*FieldEntry] = field_at(?ti, ty, 1);
+    if (O.is_none[*FieldEntry](e1) || O.unwrap[*FieldEntry](e1).name != name_b) { dnit(?ti); ret 1; }
+
+    field_epoch_bump(?ti);
+    if (O.is_some[*FieldTable](field_table_for(?ti, ty))) { dnit(?ti); ret 1; }
+    if (field_count(?ti, ty) != 0)                        { dnit(?ti); ret 1; }
+    if (O.is_some[*FieldEntry](field_at(?ti, ty, 0)))     { dnit(?ti); ret 1; }
+
+    val s2_r: R.Result[u32, str] = field_table_stage(?ti, 1);
+    if (R.is_err[u32, str](s2_r)) { dnit(?ti); ret 1; }
+    val s2: u32 = R.unwrap_ok[u32, str](s2_r);
+    if (R.is_err[R.Void, str](field_table_stage_push(?ti, name_c, ty))) { dnit(?ti); ret 1; }
+    if (R.is_err[R.Void, str](field_table_publish(?ti, ty, s2, 1))) { dnit(?ti); ret 1; }
+
+    if (field_count(?ti, ty) != 1) { dnit(?ti); ret 1; }
+    val e2: O.Option[*FieldEntry] = field_at(?ti, ty, 0);
+    if (O.is_none[*FieldEntry](e2) || O.unwrap[*FieldEntry](e2).name != name_c) { dnit(?ti); ret 1; }
+
+    dnit(?ti);
+    ret 0;
+}
+
+test "mach.lang.type.field_table_publish:a_failed_build_never_replaces_the_published_table" {
+    var fail_at: u32 = 1;
+    for (fail_at <= 24) {
+        var probe: TFieldProbe; var pa: A.Allocator;
+        if (!t_field_probe_make(?probe, ?pa)) { ret 1; }
+        var ti: TypeInterner;
+        if (O.is_some[str](init(?ti, ?pa))) { ret 1; }
+
+        val ty: TypeId = O.unwrap[TypeId](prim(?ti, TYPE_U32));
+
+        val g_r: R.Result[u32, str] = field_table_stage(?ti, 2);
+        if (R.is_err[u32, str](g_r)) { dnit(?ti); ret 1; }
+        val g: u32 = R.unwrap_ok[u32, str](g_r);
+        if (R.is_err[R.Void, str](field_table_stage_push(?ti, 1::intern.StrId, ty))) { dnit(?ti); ret 1; }
+        if (R.is_err[R.Void, str](field_table_stage_push(?ti, 2::intern.StrId, ty))) { dnit(?ti); ret 1; }
+        if (R.is_err[R.Void, str](field_table_publish(?ti, ty, g, 2))) { dnit(?ti); ret 1; }
+        if (field_count(?ti, ty) != 2) { dnit(?ti); ret 1; }
+
+        probe.fail_at = probe.calls + fail_at;
+
+        val s_r: R.Result[u32, str] = field_table_stage(?ti, 3);
+        var published: bool = false;
+        if (R.is_ok[u32, str](s_r)) {
+            val s: u32 = R.unwrap_ok[u32, str](s_r);
+            var staged: bool = true;
+            var i: u32 = 0;
+            for (i < 3) {
+                if (R.is_err[R.Void, str](field_table_stage_push(?ti, (10 + i)::intern.StrId, ty))) {
+                    staged = false;
+                    brk;
+                }
+                if (field_count(?ti, ty) != 2) { dnit(?ti); ret 1; }
+                i = i + 1;
+            }
+            if (staged) {
+                published = R.is_ok[R.Void, str](field_table_publish(?ti, ty, s, 3));
+            }
+        }
+
+        if (!published && field_count(?ti, ty) != 2) { dnit(?ti); ret 1; }
+        if (published  && field_count(?ti, ty) != 3) { dnit(?ti); ret 1; }
+
+        probe.fail_at = 0;
+        dnit(?ti);
+        fail_at = fail_at + 1;
+    }
+    ret 0;
+}
+
+rec GrowLoopProbe {
+    allocate_calls:   u32;
+    reallocate_calls: u32;
+}
+
+fun growloop_probe_allocate(ctx: ptr, size: usize, align: usize) O.Option[ptr] {
+    val g: *GrowLoopProbe = ctx::*GrowLoopProbe;
+    g.allocate_calls = g.allocate_calls + 1;
+    ret O.none[ptr]();
+}
+
+fun growloop_probe_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) O.Option[ptr] {
+    val g: *GrowLoopProbe = ctx::*GrowLoopProbe;
+    g.reallocate_calls = g.reallocate_calls + 1;
+    ret O.none[ptr]();
+}
+
+fun growloop_probe_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
+    ret 0;
+}
+
+test "mach.lang.type.visit_reserve:refuses_a_u32_doubling_that_wraps_without_reallocating" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var ti: TypeInterner;
+    if (O.is_some[str](init(?ti, ?alloc))) { ret 1; }
+    if (O.is_some[str](visits_reserve(?ti))) { dnit(?ti); ret 1; }
+
+    var probe: GrowLoopProbe;
+    probe.allocate_calls   = 0;
+    probe.reallocate_calls = 0;
+    var pp: *GrowLoopProbe = ?probe;
+    var pa: A.Allocator;
+    pa.ctx           = pp::ptr;
+    pa.fn_allocate   = growloop_probe_allocate;
+    pa.fn_reallocate = growloop_probe_reallocate;
+    pa.fn_deallocate = growloop_probe_deallocate;
+
+    ti.visits[0].stamp = nil;
+    ti.visits[0].cap   = 0x80000000;
+    ti.visits[0].epoch = 0;
+
+    val real_alloc: *A.Allocator = ti.a;
+    ti.a = ?pa;
+    val res: O.Option[str] = visit_reserve(?ti, 0, 0x80000000::TypeId);
+    ti.a = real_alloc;
+
+    var bad: i32 = 0;
+    if (O.is_none[str](res))          { bad = 1; }
+    if (probe.allocate_calls != 0)    { bad = 2; }
+    if (probe.reallocate_calls != 0)  { bad = 3; }
+
+    ti.visits[0].cap = 0;
+    dnit(?ti);
+    ret bad;
+}
+
+test "mach.lang.type.gparam_reserve:refuses_a_u32_doubling_that_wraps_without_reallocating" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var ti: TypeInterner;
+    if (O.is_some[str](init(?ti, ?alloc))) { ret 1; }
+
+    var probe: GrowLoopProbe;
+    probe.allocate_calls   = 0;
+    probe.reallocate_calls = 0;
+    var pp: *GrowLoopProbe = ?probe;
+    var pa: A.Allocator;
+    pa.ctx           = pp::ptr;
+    pa.fn_allocate   = growloop_probe_allocate;
+    pa.fn_reallocate = growloop_probe_reallocate;
+    pa.fn_deallocate = growloop_probe_deallocate;
+
+    ti.gparam     = nil;
+    ti.gparam_cap = 0x80000000;
+
+    val real_alloc: *A.Allocator = ti.a;
+    ti.a = ?pa;
+    val res: O.Option[str] = gparam_reserve(?ti, 0x80000000::TypeId);
+    ti.a = real_alloc;
+
+    var bad: i32 = 0;
+    if (O.is_none[str](res))          { bad = 1; }
+    if (probe.allocate_calls != 0)    { bad = 2; }
+    if (probe.reallocate_calls != 0)  { bad = 3; }
+
+    ti.gparam_cap = 0;
+    dnit(?ti);
+    ret bad;
+}
+
+test "mach.lang.type.handle_ops_append:refuses_a_u32_doubling_that_wraps_without_reallocating" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var ti: TypeInterner;
+    if (O.is_some[str](init(?ti, ?alloc))) { ret 1; }
+
+    var probe: GrowLoopProbe;
+    probe.allocate_calls   = 0;
+    probe.reallocate_calls = 0;
+    var pp: *GrowLoopProbe = ?probe;
+    var pa: A.Allocator;
+    pa.ctx           = pp::ptr;
+    pa.fn_allocate   = growloop_probe_allocate;
+    pa.fn_reallocate = growloop_probe_reallocate;
+    pa.fn_deallocate = growloop_probe_deallocate;
+
+    var dummy: u32;
+    ti.handle_ops     = nil;
+    ti.handle_ops_len = 1;
+    ti.handle_ops_cap = 0x80000000;
+
+    val real_alloc: *A.Allocator = ti.a;
+    ti.a = ?pa;
+    val res: R.Result[u32, str] = handle_ops_append(?ti, ?dummy, 0x80000000);
+    ti.a = real_alloc;
+
+    var bad: i32 = 0;
+    if (!R.is_err[u32, str](res))     { bad = 1; }
+    if (probe.allocate_calls != 0)    { bad = 2; }
+    if (probe.reallocate_calls != 0)  { bad = 3; }
+
+    ti.handle_ops_cap = 0;
+    ti.handle_ops_len = 0;
+    dnit(?ti);
+    ret bad;
+}
+
+test "mach.lang.type.reserve_params:refuses_a_u32_doubling_that_wraps_without_reallocating" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var ti: TypeInterner;
+    if (O.is_some[str](init(?ti, ?alloc))) { ret 1; }
+
+    var probe: GrowLoopProbe;
+    probe.allocate_calls   = 0;
+    probe.reallocate_calls = 0;
+    var pp: *GrowLoopProbe = ?probe;
+    var pa: A.Allocator;
+    pa.ctx           = pp::ptr;
+    pa.fn_allocate   = growloop_probe_allocate;
+    pa.fn_reallocate = growloop_probe_reallocate;
+    pa.fn_deallocate = growloop_probe_deallocate;
+
+    val old_params: *TypeId = ti.params;
+    val old_cap: u32 = ti.params_cap;
+    ti.params     = nil;
+    ti.params_len = 1;
+    ti.params_cap = 0x80000000;
+
+    val real_alloc: *A.Allocator = ti.a;
+    ti.a = ?pa;
+    val res: R.Result[R.Void, str] = reserve_params(?ti, 0x80000000);
+    ti.a = real_alloc;
+
+    var bad: i32 = 0;
+    if (!R.is_err[R.Void, str](res))    { bad = 1; }
+    if (probe.allocate_calls != 0)    { bad = 2; }
+    if (probe.reallocate_calls != 0)  { bad = 3; }
+
+    ti.params     = old_params;
+    ti.params_cap = old_cap;
+    ti.params_len = 0;
+    dnit(?ti);
+    ret bad;
+}
+
+test "mach.lang.type.grow_cap:refuses_a_u32_capacity_that_cannot_double_before_reallocating" {
+    var probe: GrowLoopProbe;
+    probe.allocate_calls   = 0;
+    probe.reallocate_calls = 0;
+    var pp: *GrowLoopProbe = ?probe;
+    var a: A.Allocator;
+    a.ctx           = pp::ptr;
+    a.fn_allocate   = growloop_probe_allocate;
+    a.fn_reallocate = growloop_probe_reallocate;
+    a.fn_deallocate = growloop_probe_deallocate;
+
+    var dummy: TypeId;
+    var data: *TypeId = ?dummy;
+    var cap: u32 = 0xFFFFFFFF;
+    val res: R.Result[R.Void, str] = grow_cap[TypeId](?a, ?data, ?cap, 16);
+
+    var bad: i32 = 0;
+    if (!R.is_err[R.Void, str](res))    { bad = 1; }
+    if (probe.reallocate_calls != 0)  { bad = 2; }
+    if (cap != 0xFFFFFFFF)            { bad = 3; }
+    ret bad;
+}
+
+test "mach.lang.type.track_handle:refuses_a_handle_count_at_the_u32_sentinel" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var ti: TypeInterner;
+    if (O.is_some[str](init(?ti, ?alloc))) { ret 1; }
+
+    var dummy: TypeId;
+    ti.handles     = ?dummy;
+    ti.handles_len = 0xFFFFFFFF;
+    ti.handles_cap = 0xFFFFFFFF;
+
+    val res: R.Result[R.Void, str] = track_handle(?ti, 0::TypeId);
+    if (!R.is_err[R.Void, str](res))       { ti.handles = nil; ti.handles_len = 0; ti.handles_cap = 0; dnit(?ti); ret 1; }
+    if (ti.handles_len != 0xFFFFFFFF)    { dnit(?ti); ret 1; }
+
+    ti.handles     = nil;
+    ti.handles_len = 0;
+    ti.handles_cap = 0;
+    dnit(?ti);
+    ret 0;
+}
+
+fun intern_distinct_instances(ti: *TypeInterner, first: u32, count: u32) R.Result[R.Void, str] {
+    var i: u32 = first;
+    for (i < first + count) {
+        var arg: TypeId = i::TypeId;
+        val r: R.Result[TypeId, str] = intern_instance(ti, 0::TypeId, 0::module.ModuleId, i::id.DeclId, ?arg, 1);
+        if (R.is_err[TypeId, str](r)) { ret R.err[R.Void, str](R.unwrap_err[TypeId, str](r)); }
+        i = i + 1;
+    }
+    ret R.ok_void[str]();
+}
+
+fun time_intern_fresh(count: u32) i64 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var ti: TypeInterner;
+    if (O.is_some[str](init(?ti, ?alloc))) { ret -1; }
+
+    val start: tm.Time = tm.monotonic();
+    if (R.is_err[R.Void, str](intern_distinct_instances(?ti, 0, count))) { dnit(?ti); ret -1; }
+    val elapsed: duration.Duration = tm.time_sub(tm.monotonic(), start);
+
+    dnit(?ti);
+    ret duration.duration_usec(elapsed);
+}
+
+test "mach.lang.type.intern_instance:cost_stays_near_linear_as_population_grows" {
+    val small: u32 = 3000;
+    val large: u32 = small * 4;
+
+    val us_small: i64 = time_intern_fresh(small);
+    val us_large: i64 = time_intern_fresh(large);
+    if (us_small < 0 || us_large < 0) { ret 1; }
+
+    var pa: A.Allocator;
+    page.make(?pa);
+    val msg: R.Result[str, str] = format.sprint(?pa, "us_small={} us_large={}\n", us_small, us_large);
+    if (R.is_ok[str, str](msg)) { print.eprint(R.unwrap_ok[str, str](msg)); }
+
+    var bad: i32 = 0;
+    if (us_large > (us_small + 2000) * 8) { bad = 1; }
+    ret bad;
+}
+
+test "mach.lang.type:invalid_ids_answer_identically_across_the_query_api" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var ti: TypeInterner;
+    if (O.is_some[str](init(?ti, ?alloc))) { ret 1; }
+
+    var ids: [3]TypeId;
+    ids[0] = TYPE_NIL;
+    ids[1] = TYPE_ERROR;
+    ids[2] = type_count(?ti);
+    var code: i32 = 0;
+    var i: usize = 0;
+    for (i < 3) {
+        val id: TypeId = ids[i];
+        if (O.is_some[*Type](get(?ti, id)))            { code = 1; }
+        if (is_integer(?ti, id) || is_numeric(?ti, id) || is_float(?ti, id)) { code = 1; }
+        if (is_pointer_like(?ti, id) || is_secret(?ti, id) || is_vector(?ti, id)) { code = 1; }
+        if (is_u8(?ti, id) || carries_secret(?ti, id))  { code = 1; }
+        if (is_handle(?ti, id) || is_abi_type(?ti, id)) { code = 1; }
+        if (is_union(?ti, id) || is_record(?ti, id))    { code = 1; }
+        if (vector_element(?ti, id) != TYPE_VECTOR)     { code = 1; }
+        if (vector_lanes(?ti, id) != 0)                 { code = 1; }
+        if (O.is_some[u32](element_count(?ti, id)))     { code = 1; }
+        if (strip_secret(?ti, id) != id)                { code = 1; }
+        if (aggregate_nominal(?ti, id) != TYPE_ERROR)   { code = 1; }
+        if (shape_kind(?ti, id) != TYPE_U8)             { code = 1; }
+        if (O.is_some[*FieldTable](field_table_for(?ti, id))) { code = 1; }
+        if (field_count(?ti, id) != 0)                  { code = 1; }
+        if (O.is_some[*FieldEntry](field_at(?ti, id, 0))) { code = 1; }
+        i = i + 1;
+    }
+    dnit(?ti);
+    ret code;
 }

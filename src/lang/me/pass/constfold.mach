@@ -1,41 +1,3 @@
-# mach.lang.me.pass.constfold: constant folding and propagation
-#
-# A forward pass that evaluates, at the IR level, any pure instruction whose
-# operands are all compile-time constants, then propagates the resulting
-# constant to every use. Three cooperating transforms run per function:
-#
-#   1. fold - an arithmetic, bitwise, comparison, conversion, negation, or not
-#      instruction whose operands are all constants is replaced by the constant
-#      value it computes at runtime. A substitution table (instruction id ->
-#      constant Value) records each result; folding is iterated to a fixpoint so
-#      a chain like `(2 + 3) * 4` collapses fully in one pass.
-#   2. propagate - every operand naming a folded instruction is rewritten to the
-#      folded constant. The dead fold instructions are left in the pool; dce
-#      (which always runs after this pass) drops them.
-#   3. branch simplification - an OP_CBR whose condition folds to a constant is
-#      rewritten to an unconditional OP_BR to the taken target. Predecessor lists
-#      are rebuilt and phi incomings from edges that no longer exist are pruned;
-#      dce's reachability sweep then removes any block left unreachable.
-#
-# Correctness contract: a fold must produce the exact value the program would
-# compute at runtime. Integer results are evaluated in u64 and masked to the
-# result type's bit width (two's-complement wrap), matching the back end, which
-# masks every narrow ALU write to its operand width. Signed operations
-# sign-extend their masked operands first. Float folding is restricted to f64:
-# the IR stores every float constant as an f64 bit pattern, so an f32 fold would
-# not match the f32 rounding the back end performs in hardware.
-#
-# Operations that trap at runtime are never folded - folding one would convert a
-# trapping program into a non-trapping one (or, when evaluated natively, fault
-# the compiler itself). This covers division/remainder by zero and signed
-# division/remainder overflow (INT_MIN / -1, which overflows the native IDIV).
-#
-# Shifts are folded only when the result is target-independent: a count in the
-# range [0, type_width) shifts by exactly that amount on every backend. An
-# out-of-range count is target-defined (x86 masks the count modulo the operation
-# width, other ISAs may mask to the type width or trap), so such a shift is left
-# to the back end rather than folded here.
-
 use std.allocator.page;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -53,66 +15,46 @@ use mach.lang.me.ir;
 use mach.lang.me.ir.builder;
 use mach.lang.me.ir.id;
 use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.opdesc;
 use mach.lang.me.ir.mutate;
 use mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 
-# pass entry: fold, propagate, and simplify branches on every function in the
-# module, iterating to a local fixpoint within each function
-# ---
-# m:   module to mutate in place
-# ret: ok(true) on a successful pass, or the first allocation error
 pub fun run(m: *ir.Module) R.Result[bool, str] {
+    var changed: bool = false;
     var i: u32 = 0;
     for (i < m.function_len) {
         val fn: *ir.Function = ?m.functions[i];
         if ((fn.flags & ir.FN_FLAG_EXTERN) == 0) {
-            val res_fold: R.Result[bool, str] = fold_function(m, fn);
-            if (R.is_err[bool, str](res_fold)) { ret res_fold; }
+            val changed_r: R.Result[bool, str] = fold_function(m, fn);
+            if (R.is_err[bool, str](changed_r)) { ret changed_r; }
+            if (R.unwrap_ok[bool, str](changed_r)) { changed = true; }
         }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok[bool, str](changed);
 }
 
-# folds one function to a local fixpoint, then propagates and simplifies branches
-#
-# The shared rewrite map records each folded instruction id -> the constant Value
-# it produces. Folding repeats until no new instruction folds, then the recorded
-# replacements are applied to every operand and constant-condition branches are
-# simplified.
-# ---
-# m:   module owning the function and the allocator
-# fn:  function to fold in place
-# ret: ok(true) on success, or the first allocation error
 fun fold_function(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
     val ilen: u32 = fn.instr_len;
-    if (ilen == 0) { ret R.ok[bool, str](true); }
+    if (ilen == 0) { ret R.ok[bool, str](false); }
 
     var rw: mutate.Rewrite;
-    val res_init: R.Result[bool, str] = mutate.rewrite_init(?rw, m.alloc, ilen);
-    if (R.is_err[bool, str](res_init)) { ret res_init; }
+    val res_init: R.Result[R.Void, str] = mutate.rewrite_init(?rw, m.alloc, ilen);
+    if (R.is_err[R.Void, str](res_init)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_init)); }
 
-    fold_to_fixpoint(m, fn, ?rw);
+    val folded: bool = fold_to_fixpoint(m, fn, ?rw);
     mutate.rewrite_apply(fn, ?rw);
-    val res_branches: R.Result[bool, str] = simplify_branches(m, fn, ?rw);
+    val branches_changed_r: R.Result[bool, str] = simplify_branches(m, fn, ?rw);
 
     mutate.rewrite_dnit(?rw, m.alloc);
-    ret res_branches;
+    if (R.is_err[bool, str](branches_changed_r)) { ret branches_changed_r; }
+    ret R.ok[bool, str](folded || R.unwrap_ok[bool, str](branches_changed_r));
 }
 
-# sweeps the instruction pool, folding every instruction whose operands resolve
-# to constants, until a sweep folds nothing
-#
-# Each fold records its result in the rewrite map. Because operands are resolved
-# through the map, folding one instruction exposes any later op that consumed it,
-# so a chain like `(2 + 3) * 4` collapses across successive sweeps.
-# ---
-# m:  module owning the function
-# fn: function whose instructions are folded
-# rw: shared rewrite map each fold is recorded into
-fun fold_to_fixpoint(m: *ir.Module, fn: *ir.Function, rw: *mutate.Rewrite) {
+fun fold_to_fixpoint(m: *ir.Module, fn: *ir.Function, rw: *mutate.Rewrite) bool {
     var changed: bool = true;
+    var any: bool = false;
     for (changed) {
         changed = false;
         var i: u32 = 0;
@@ -123,37 +65,23 @@ fun fold_to_fixpoint(m: *ir.Module, fn: *ir.Function, rw: *mutate.Rewrite) {
                 if (try_fold(m, inst, i, rw, ?out)) {
                     mutate.replace_value(rw, i, out);
                     changed = true;
+                    any     = true;
                 }
             }
             i = i + 1;
         }
     }
+    ret any;
 }
 
-# attempts to fold one instruction to a constant value
-#
-# Most opcodes fold only when their resolved operands are all constants of a
-# foldable kind; OP_PHI collapses when its incomings all resolve to one value,
-# which need not be a constant.
-# ---
-# m:       module owning the function
-# inst:    instruction to fold
-# self_id: inst's own id, used to ignore a phi's self-references
-# rw:      shared rewrite map operands are resolved through
-# out:     receives the folded value on success
-# ret:     true when a fold was produced
 fun try_fold(m: *ir.Module, inst: *instruction.Instruction, self_id: u32,
              rw: *mutate.Rewrite, out: *value.Value) bool {
     val k: instruction.InstrKind = inst.kind;
 
-    # phi: collapse to the single value all its incomings resolve to.
     if (k == instruction.OP_PHI) {
         ret fold_phi(inst, self_id, rw, out);
     }
 
-    # binary ops [lhs, rhs]. the int and float arithmetic / comparison opcodes
-    # overlap (one compare opcode rides both an int and a float compare), so the
-    # int vs float path is chosen by the resolved operand kind, not the opcode.
     if ((is_int_binary(k) || is_float_binary(k)) && inst.operand_count == 2) {
         val a: value.Value = mutate.rewrite_resolve(rw, inst.operands[0]);
         val b: value.Value = mutate.rewrite_resolve(rw, inst.operands[1]);
@@ -166,7 +94,6 @@ fun try_fold(m: *ir.Module, inst: *instruction.Instruction, self_id: u32,
         ret false;
     }
 
-    # unary integer negation / not [operand].
     if ((k == instruction.OP_NEG || k == instruction.OP_NOT) && inst.operand_count == 1) {
         val a: value.Value = mutate.rewrite_resolve(rw, inst.operands[0]);
         if (a.kind == value.VAL_CONST_INT) {
@@ -178,9 +105,6 @@ fun try_fold(m: *ir.Module, inst: *instruction.Instruction, self_id: u32,
             @out = value.const_int(r, inst.ty);
             ret true;
         }
-        # float negation rides as OP_NEG on a float operand. it is a sign-bit
-        # flip, not `0.0 - x`, which would return `+0.0` for either zero and drop
-        # the sign the runtime FNEG preserves (#2274).
         if (a.kind == value.VAL_CONST_FLOAT && k == instruction.OP_NEG && is_f64(m, inst.ty)) {
             @out = value.const_float(float.f64_neg(a.data.float_lit), inst.ty);
             ret true;
@@ -188,37 +112,15 @@ fun try_fold(m: *ir.Module, inst: *instruction.Instruction, self_id: u32,
         ret false;
     }
 
-    # a float NARROWING of a constant folds into the constant, at its own width
-    # [operand] (#2752)
-    #
-    # A float literal is carried as a comptime f64 bit pattern from the lexer onward,
-    # so an `f64` constant narrowed by an explicit `::f32` reached the back end as a
-    # double-width materialization plus a runtime convert - two instructions and, on
-    # x86-64, an FP scratch register, for a value known at compile time. A
-    # `VAL_CONST_FLOAT` carries its f64 pattern whatever its type says and the width
-    # is taken from the TYPE (`lower_value` narrows through `f64_to_f32_bits` at
-    # width 4, exactly as `pack_globals` does for a module-scope global), so the fold
-    # is a retype: same bits, narrower type.
-    #
-    # The value is unchanged. The narrowing the back end now performs is the same
-    # round-to-nearest-even from the same double the `cvtsd2ss` / `fcvt s,d` /
-    # `fcvt.s.d` performed, so this moves WHEN the rounding happens, not what it
-    # rounds. Nothing downstream can double-round it either: every float fold in this
-    # pass is gated on `is_f64`, so an f32-typed constant is inert here.
-    #
-    # THE WIDENING IS DELIBERATELY NOT FOLDED. An f32-typed constant still carries
-    # the UNROUNDED f64 pattern, so retyping it to f64 would produce the double
-    # nearest the literal where the machine produces the double nearest the f32 -
-    # a value change, not an optimisation. Folding it needs the narrow-then-widen
-    # round trip, which needs a single-to-double conversion `float` does not have.
     if (k == instruction.OP_FP_TRUNC && inst.operand_count == 1) {
         val a: value.Value = mutate.rewrite_resolve(rw, inst.operands[0]);
         if (a.kind != value.VAL_CONST_FLOAT) { ret false; }
-        @out = value.const_float(a.data.float_lit, inst.ty);
+        val w: float.FloatWidth = float_width(m, inst.ty);
+        if (w == float.FLOAT_W_NONE) { ret false; }
+        @out = value.const_float(float.round_at(a.data.float_lit, w), inst.ty);
         ret true;
     }
 
-    # integer width conversions [operand].
     if ((k == instruction.OP_TRUNC || k == instruction.OP_SEXT || k == instruction.OP_ZEXT) && inst.operand_count == 1) {
         val a: value.Value = mutate.rewrite_resolve(rw, inst.operands[0]);
         if (a.kind != value.VAL_CONST_INT) { ret false; }
@@ -236,25 +138,11 @@ fun try_fold(m: *ir.Module, inst: *instruction.Instruction, self_id: u32,
     ret false;
 }
 
-# collapses a phi whose incoming values all resolve to one value
-#
-# Incomings are resolved through the substitution table and self-references are
-# ignored. A single-incoming phi always collapses; an all-identical
-# multi-incoming phi collapses too. Because every predecessor supplies the same
-# value, that value dominates the phi's block, so replacing the phi with it
-# preserves SSA. A phi with no incomings, or with two distinct incomings, is left
-# untouched.
-# ---
-# inst:    the OP_PHI instruction
-# self_id: the phi's own id, whose self-referencing incomings are ignored
-# rw:      shared rewrite map incomings are resolved through
-# out:     receives the collapsed value on success
-# ret:     true when the phi collapsed to a single value
 fun fold_phi(inst: *instruction.Instruction, self_id: u32,
              rw: *mutate.Rewrite, out: *value.Value) bool {
     var have:   bool = false;
     var common: value.Value;
-    var i: u32 = 1;                     # odd slots carry the incoming values
+    var i: u32 = 1;
     for (i < inst.operand_count) {
         val v: value.Value = mutate.rewrite_resolve(rw, inst.operands[i]);
         val is_self: bool  = v.kind == value.VAL_INSTR && v.data.instr::u32 == self_id;
@@ -274,16 +162,6 @@ fun fold_phi(inst: *instruction.Instruction, self_id: u32,
     ret true;
 }
 
-# true when two operand values denote the same SSA value or identical constant
-#
-# Float constants compare by raw bit pattern, so +0.0 and -0.0 stay distinct;
-# byte-blob and aggregate constants are conservatively treated as unequal. The
-# carried IR type is not compared - two operands naming the same value through
-# differently-typed slots still denote it.
-# ---
-# a:   first operand value
-# b:   second operand value
-# ret: true when a and b denote the same value
 fun values_equal(a: value.Value, b: value.Value) bool {
     if (a.kind != b.kind)                { ret false; }
     if (a.kind == value.VAL_INSTR)       { ret a.data.instr == b.data.instr; }
@@ -296,48 +174,18 @@ fun values_equal(a: value.Value, b: value.Value) bool {
     ret false;
 }
 
-# true for the binary integer / bitwise / comparison opcodes folded here
-# ---
-# k:   instruction opcode
-# ret: true when k is a foldable integer binary opcode
 fun is_int_binary(k: instruction.InstrKind) bool {
-    if (k == instruction.OP_ADD || k == instruction.OP_SUB || k == instruction.OP_MUL)     { ret true; }
-    if (k == instruction.OP_DIV_S || k == instruction.OP_DIV_U)                            { ret true; }
-    if (k == instruction.OP_REM_S || k == instruction.OP_REM_U)                            { ret true; }
-    if (k == instruction.OP_AND || k == instruction.OP_OR || k == instruction.OP_XOR)      { ret true; }
-    if (k == instruction.OP_SHL || k == instruction.OP_SHR_S || k == instruction.OP_SHR_U) { ret true; }
-    ret is_compare(k);
+    ret opdesc.has(k, opdesc.EFF_FOLD_INT | opdesc.EFF_COMPARE);
 }
 
-# true for the binary float opcodes folded here: add, sub, mul, and the
-# comparisons (all f64-only, checked at fold time). Float division is excluded -
-# it is left to runtime to avoid duplicating IEEE special-case handling
-# ---
-# k:   instruction opcode
-# ret: true when k is a foldable float binary opcode
+
 fun is_float_binary(k: instruction.InstrKind) bool {
-    if (k == instruction.OP_ADD || k == instruction.OP_SUB || k == instruction.OP_MUL) { ret true; }
-    ret is_compare(k);
+    ret opdesc.has(k, opdesc.EFF_FOLD_FLOAT | opdesc.EFF_COMPARE);
 }
 
-# folds a binary integer / bitwise / comparison op of two const_int operands
-#
-# A comparison yields an i8 0/1; every other op yields a value of res_ty.
-# Returns false (declining the fold) for a division or remainder by zero, and for
-# a signed division or remainder that would overflow the native IDIV - both trap
-# at runtime, so folding them would drop the trap. An out-of-range shift count is
-# also declined, since its result is target-defined.
-# ---
-# m:      module owning the type table
-# k:      instruction opcode
-# a:      left const_int operand
-# b:      right const_int operand
-# res_ty: the op's result type
-# out:    receives the folded constant on success
-# ret:    true when a fold was produced
+
 fun fold_int_binary(m: *ir.Module, k: instruction.InstrKind, a: value.Value, b: value.Value,
                     res_ty: type.IrTypeId, out: *value.Value) bool {
-    # comparisons evaluate at the operand width and yield an i8 boolean.
     if (is_compare(k)) {
         val w: u32 = int_bits(m, a.ty);
         if (w == 0) { ret false; }
@@ -384,7 +232,6 @@ fun fold_int_binary(m: *ir.Module, k: instruction.InstrKind, a: value.Value, b: 
         r = mask((sa % sb)::u64, bits);
     }
     or (k == instruction.OP_SHL || k == instruction.OP_SHR_S || k == instruction.OP_SHR_U) {
-        # only an in-range count folds to a target-independent result.
         val count: u64 = b.data.int_lit;
         if (count >= bits::u64) { ret false; }
         r = fold_shift(k, x, count, bits);
@@ -395,16 +242,6 @@ fun fold_int_binary(m: *ir.Module, k: instruction.InstrKind, a: value.Value, b: 
     ret true;
 }
 
-# evaluates an in-range integer shift (the caller has already verified
-# `count < bits`, the only range whose result is target-independent). The shifted
-# value is masked to the result width; an arithmetic right shift first
-# sign-extends to the result width so the sign bit fills from the left
-# ---
-# k:     OP_SHL / OP_SHR_S / OP_SHR_U
-# v:     the value being shifted, already masked to `bits`
-# count: the shift count, guaranteed in [0, bits)
-# bits:  result type bit width
-# ret:   the shift result masked to `bits`
 fun fold_shift(k: instruction.InstrKind, v: u64, count: u64, bits: u32) u64 {
     if (k == instruction.OP_SHL) {
         val shifted: u64 = v << count;
@@ -414,25 +251,11 @@ fun fold_shift(k: instruction.InstrKind, v: u64, count: u64, bits: u32) u64 {
         val low: u64 = mask(v, bits);
         ret low >> count;
     }
-    # arithmetic right shift: sign-extend to the result width, shift, re-mask.
     val se: i64 = sext(v, bits)::i64;
     val sr: u64 = (se >> count)::u64;
     ret mask(sr, bits);
 }
 
-# true when a signed division or remainder of sa by sb would overflow the native
-# IDIV at its operation width, i.e. INT_MIN / -1
-#
-# The back end widens a sub-32-bit division to a 32-bit IDIV, so the trapping
-# dividend is the most negative value of max(32, bits) - an i8/i16 operand can
-# never reach it, so those widths never overflow and fold normally. Such a
-# division traps at runtime; folding it would drop the trap (and evaluating it
-# natively faults the compiler at i64), so the fold is declined.
-# ---
-# sa:   signed dividend, sign-extended to i64
-# sb:   signed divisor, sign-extended to i64
-# bits: operand type bit width
-# ret:  true when sa / sb would overflow the native IDIV
 fun div_overflows(sa: i64, sb: i64, bits: u32) bool {
     if (sb != 0 - 1) { ret false; }
     var opbits: u32 = bits;
@@ -441,16 +264,6 @@ fun div_overflows(sa: i64, sb: i64, bits: u32) bool {
     ret sa == opmin;
 }
 
-# evaluates an integer comparison of two `bits`-wide operands
-#
-# Equality and inequality compare the masked bit patterns; the ordered
-# comparisons interpret their operands per the opcode's signedness.
-# ---
-# k:    a comparison opcode
-# a:    left operand bit pattern
-# b:    right operand bit pattern
-# bits: operand bit width
-# ret:  the comparison result
 fun eval_int_compare(k: instruction.InstrKind, a: u64, b: u64, bits: u32) bool {
     val x: u64 = mask(a, bits);
     val y: u64 = mask(b, bits);
@@ -465,24 +278,9 @@ fun eval_int_compare(k: instruction.InstrKind, a: u64, b: u64, bits: u32) bool {
     ret false;
 }
 
-# folds a binary float op (add / sub / mul) or comparison of two const_float
-# operands (f64 only)
-#
-# A comparison yields an i8 boolean of res_ty; arithmetic yields a float of
-# res_ty. Division is never folded - it is excluded from is_float_binary to avoid
-# duplicating IEEE special-case (NaN / inf / signed-zero) handling here.
-# ---
-# m:      module owning the type table
-# k:      instruction opcode
-# a:      left const_float operand
-# b:      right const_float operand
-# res_ty: the op's result type
-# out:    receives the folded constant on success
-# ret:    true when a fold was produced
 fun fold_float_binary(m: *ir.Module, k: instruction.InstrKind, a: value.Value, b: value.Value,
                       res_ty: type.IrTypeId, out: *value.Value) bool {
     if (is_compare(k)) {
-        # both operands must be f64, the only safely foldable float width.
         if (is_f64(m, a.ty) == false) { ret false; }
         val cmp: bool = eval_float_compare(k, a.data.float_lit, b.data.float_lit);
         var rv: u64 = 0;
@@ -503,16 +301,6 @@ fun fold_float_binary(m: *ir.Module, k: instruction.InstrKind, a: value.Value, b
     ret true;
 }
 
-# evaluates a float comparison
-#
-# The IR compare opcodes are shared with the integer forms; on floats the
-# signed/unsigned distinction is irrelevant, so each ordered opcode maps to the
-# corresponding float ordering.
-# ---
-# k:   a comparison opcode
-# a:   left operand
-# b:   right operand
-# ret: the comparison result
 fun eval_float_compare(k: instruction.InstrKind, a: f64, b: f64) bool {
     if (k == instruction.OP_CMP_EQ)                                   { ret a == b; }
     if (k == instruction.OP_CMP_NE)                                   { ret a != b; }
@@ -521,34 +309,17 @@ fun eval_float_compare(k: instruction.InstrKind, a: f64, b: f64) bool {
     ret false;
 }
 
-# true for the comparison opcodes, which yield an i8 boolean
-# ---
-# k:   instruction opcode
-# ret: true when k is a comparison opcode
 fun is_compare(k: instruction.InstrKind) bool {
-    if (k == instruction.OP_CMP_EQ || k == instruction.OP_CMP_NE)     { ret true; }
-    if (k == instruction.OP_CMP_LT_S || k == instruction.OP_CMP_LT_U) { ret true; }
-    if (k == instruction.OP_CMP_LE_S || k == instruction.OP_CMP_LE_U) { ret true; }
-    ret false;
+    ret opdesc.has(k, opdesc.EFF_COMPARE);
 }
 
-# masks v to its low `bits` bits; a width of 64 or more passes v through
-# ---
-# v:    value to mask
-# bits: number of low bits to keep
-# ret:  v with all but its low `bits` bits cleared
+
 fun mask(v: u64, bits: u32) u64 {
     if (bits >= 64) { ret v; }
     val lo_mask: u64 = (1::u64 << bits::u64) - 1;
     ret v & lo_mask;
 }
 
-# sign-extends the low `bits` bits of v to a full u64 (two's complement): if the
-# sign bit is set, the high bits are filled with ones
-# ---
-# v:    value whose low bits are sign-extended
-# bits: width of the source value
-# ret:  the sign-extended value
 fun sext(v: u64, bits: u32) u64 {
     if (bits >= 64) { ret v; }
     val lo:   u64 = mask(v, bits);
@@ -559,11 +330,6 @@ fun sext(v: u64, bits: u32) u64 {
     ret lo;
 }
 
-# bit width of an IRT_INT type, or 0 when tid does not resolve to an integer type
-# ---
-# m:   module owning the type table
-# tid: type id to inspect
-# ret: the integer width, or 0 to signal "do not fold"
 fun int_bits(m: *ir.Module, tid: type.IrTypeId) u32 {
     val opt_ty: O.Option[*type.IrType] = type.get(?m.types, tid);
     if (O.is_none[*type.IrType](opt_ty)) { ret 0; }
@@ -572,11 +338,16 @@ fun int_bits(m: *ir.Module, tid: type.IrTypeId) u32 {
     ret t.data.bits;
 }
 
-# true when tid resolves to a 64-bit IRT_FLOAT, the only float width folded
-# ---
-# m:   module owning the type table
-# tid: type id to inspect
-# ret: true when tid is f64
+fun float_width(m: *ir.Module, tid: type.IrTypeId) float.FloatWidth {
+    val opt_ty: O.Option[*type.IrType] = type.get(?m.types, tid);
+    if (O.is_none[*type.IrType](opt_ty)) { ret float.FLOAT_W_NONE; }
+    val t: *type.IrType = O.unwrap[*type.IrType](opt_ty);
+    if (t.kind != type.IRT_FLOAT) { ret float.FLOAT_W_NONE; }
+    if (t.data.bits == 32) { ret float.FLOAT_W_32; }
+    if (t.data.bits == 64) { ret float.FLOAT_W_64; }
+    ret float.FLOAT_W_NONE;
+}
+
 fun is_f64(m: *ir.Module, tid: type.IrTypeId) bool {
     val opt_ty: O.Option[*type.IrType] = type.get(?m.types, tid);
     if (O.is_none[*type.IrType](opt_ty)) { ret false; }
@@ -585,17 +356,6 @@ fun is_f64(m: *ir.Module, tid: type.IrTypeId) bool {
     ret t.data.bits == 64;
 }
 
-# simplifies every OP_CBR whose condition folded to a constant into an OP_BR to
-# the statically-taken target
-#
-# After any rewrite the predecessor lists are rebuilt and phi incomings whose
-# edge no longer exists are pruned, so the CFG stays consistent for dce's
-# reachability sweep and the verifier.
-# ---
-# m:   module owning the function
-# fn:  function to simplify in place
-# rw:  shared rewrite map the folded condition is resolved through
-# ret: ok(true) on success, or the first allocation error from preds_rebuild
 fun simplify_branches(m: *ir.Module, fn: *ir.Function, rw: *mutate.Rewrite) R.Result[bool, str] {
     var rewrote: bool = false;
     var i: u32 = 0;
@@ -608,7 +368,6 @@ fun simplify_branches(m: *ir.Module, fn: *ir.Function, rw: *mutate.Rewrite) R.Re
                 if (term.kind == instruction.OP_CBR && term.operand_count == 3) {
                     val cond: value.Value = mutate.rewrite_resolve(rw, term.operands[0]);
                     if (cond.kind == value.VAL_CONST_INT) {
-                        # operand 1 is the then-target, operand 2 the else-target.
                         var taken: value.Value = term.operands[2];
                         if (cond.data.int_lit != 0) { taken = term.operands[1]; }
                         term.kind          = instruction.OP_BR;
@@ -622,23 +381,14 @@ fun simplify_branches(m: *ir.Module, fn: *ir.Function, rw: *mutate.Rewrite) R.Re
         i = i + 1;
     }
 
-    if (rewrote == false) { ret R.ok[bool, str](true); }
+    if (rewrote == false) { ret R.ok[bool, str](false); }
 
-    val res_preds: R.Result[bool, str] = ir.preds_rebuild(m, fn);
-    if (R.is_err[bool, str](res_preds)) { ret res_preds; }
+    val res_preds: R.Result[R.Void, str] = ir.preds_rebuild(m, fn);
+    if (R.is_err[R.Void, str](res_preds)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_preds)); }
     prune_dead_phi_incomings(fn);
     ret R.ok[bool, str](true);
 }
 
-# drops any phi incoming whose source block is no longer a predecessor of the
-# phi's block
-#
-# After a CBR is rewritten to a BR, the dropped successor loses an incoming edge;
-# its phis must shed the corresponding incoming so each phi names exactly its
-# live predecessors. Phi operands are [block0, val0, block1, val1, ...] with
-# block ids riding in the block-target const_int encoding.
-# ---
-# fn: function whose phis are pruned in place
 fun prune_dead_phi_incomings(fn: *ir.Function) {
     var i: u32 = 0;
     for (i < fn.block_count) {
@@ -669,11 +419,6 @@ fun prune_dead_phi_incomings(fn: *ir.Function) {
     }
 }
 
-# true when pred is in blk's predecessor list
-# ---
-# blk:  block whose predecessors are searched
-# pred: candidate predecessor block id
-# ret:  true when pred is a predecessor of blk
 fun block_is_pred(blk: *ir.Block, pred: id.BlockId) bool {
     var i: u32 = 0;
     for (i < blk.pred_count) {
@@ -683,18 +428,6 @@ fun block_is_pred(blk: *ir.Block, pred: id.BlockId) bool {
     ret false;
 }
 
-# fills phi (a stack Instruction) with an OP_PHI over n constant incomings in the
-# IR's [block, value, ...] operand layout, pointing at the caller-owned ops array
-# (sized 2*n)
-#
-# The block slots are placeholders - fold_phi reads only the value slots - so the
-# test supplies the values in vals[0..n).
-# ---
-# phi:  instruction to populate
-# ops:  caller-owned operand array, sized 2*n
-# vals: the n incoming values
-# n:    number of incomings
-# ty:   the phi's result type
 fun build_const_phi(phi: *instruction.Instruction, ops: *value.Value, vals: *value.Value,
                     n: u32, ty: type.IrTypeId) {
     var i: u32 = 0;
@@ -712,8 +445,6 @@ fun build_const_phi(phi: *instruction.Instruction, ops: *value.Value, vals: *val
     phi.aux_ty        = type.IRT_NIL;
 }
 
-# INT_MIN / -1 in i64 must not fold: a native idiv on it faults the compiler, and
-# folding would silently drop the runtime trap
 test "mach.lang.me.pass.constfold.fold_int_binary:int_min_div_neg1_i64" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -732,8 +463,6 @@ test "mach.lang.me.pass.constfold.fold_int_binary:int_min_div_neg1_i64" {
     ret 0;
 }
 
-# INT_MIN / -1 in i32: sext makes -2^31/-1 fit in i64, so a naive fold succeeds -
-# but the runtime 32-bit IDIV traps, so the fold must be declined
 test "mach.lang.me.pass.constfold.fold_int_binary:int_min_div_neg1_i32" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -751,7 +480,6 @@ test "mach.lang.me.pass.constfold.fold_int_binary:int_min_div_neg1_i32" {
     ret 0;
 }
 
-# division by zero is never folded; a normal signed division folds exactly
 test "mach.lang.me.pass.constfold.fold_int_binary:div_by_zero_and_signed" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -769,8 +497,6 @@ test "mach.lang.me.pass.constfold.fold_int_binary:div_by_zero_and_signed" {
     ret 0;
 }
 
-# an in-range shift count folds to a target-independent result; an out-of-range
-# count is target-defined and must be left to the back end
 test "mach.lang.me.pass.constfold.fold_int_binary:shift_in_range_only" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -788,7 +514,6 @@ test "mach.lang.me.pass.constfold.fold_int_binary:shift_in_range_only" {
     ret 0;
 }
 
-# sext, zext, and trunc of integer constants fold to the exact masked values
 test "mach.lang.me.pass.constfold.try_fold:int_conversions" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -802,13 +527,10 @@ test "mach.lang.me.pass.constfold.try_fold:int_conversions" {
     if (R.is_err[type.IrTypeId, str](res_i64)) { ret 1; }
     val i64ty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i64);
 
-    # an empty rewrite map: the folded operands are constants, so resolution is a
-    # no-op and try_fold exercises only the conversion folding.
     var rw: mutate.Rewrite;
-    if (R.is_err[bool, str](mutate.rewrite_init(?rw, ?alloc, 1))) { ret 1; }
+    if (R.is_err[R.Void, str](mutate.rewrite_init(?rw, ?alloc, 1))) { ret 1; }
     var out: value.Value;
 
-    # sext(0xFF:i8)->i64 = 0xFFFFFFFFFFFFFFFF (sign bit set in 8-bit)
     var sext_op: value.Value = value.const_int(0xFF, i8ty);
     var sext_inst: instruction.Instruction;
     sext_inst.kind          = instruction.OP_SEXT;
@@ -822,7 +544,6 @@ test "mach.lang.me.pass.constfold.try_fold:int_conversions" {
     if (out.kind != value.VAL_CONST_INT)                 { ret 1; }
     if (out.data.int_lit != 0xFFFFFFFFFFFFFFFF)          { ret 1; }
 
-    # zext(0xFF:i8)->i64 = 0xFF (zero-extends, no sign fill)
     var zext_inst: instruction.Instruction;
     zext_inst.kind          = instruction.OP_ZEXT;
     zext_inst.ty            = i64ty;
@@ -834,7 +555,6 @@ test "mach.lang.me.pass.constfold.try_fold:int_conversions" {
     if (try_fold(?m, ?zext_inst, 0, ?rw, ?out) == false) { ret 1; }
     if (out.data.int_lit != 0xFF)                        { ret 1; }
 
-    # trunc(0x1FF:i64)->i8 = 0xFF (low 8 bits)
     var trunc_op: value.Value = value.const_int(0x1FF, i64ty);
     var trunc_inst: instruction.Instruction;
     trunc_inst.kind          = instruction.OP_TRUNC;
@@ -851,21 +571,6 @@ test "mach.lang.me.pass.constfold.try_fold:int_conversions" {
     ret 0;
 }
 
-# A FLOAT NARROWING OF A CONSTANT FOLDS TO THE CONSTANT AT ITS OWN WIDTH, AND THE
-# WIDENING DOES NOT (#2752)
-#
-# The fold is a RETYPE, not a value change: a `VAL_CONST_FLOAT` carries its comptime
-# f64 pattern whatever its type says, and the width is read off the type when the
-# back end materializes it. So the assertion is on both halves - the bits are the
-# ones that went in, and the type is the narrow one. Checking only "it folded" would
-# pass for a fold that silently narrowed the pattern here as well, which would
-# double-round every value that later reaches `pack_globals`.
-#
-# THE WIDENING IS ASSERTED NOT TO FOLD, at the boundary rather than in the middle:
-# an f32-typed constant still carries the UNROUNDED f64 pattern, so retyping it to
-# f64 would produce the double nearest the literal where the machine produces the
-# double nearest the f32. That is a value change, and a test that only checked the
-# narrowing would not have noticed the symmetric-looking arm being added later.
 test "mach.lang.me.pass.constfold.try_fold:float_narrowing" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -880,10 +585,9 @@ test "mach.lang.me.pass.constfold.try_fold:float_narrowing" {
     val f64ty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_f64);
 
     var rw: mutate.Rewrite;
-    if (R.is_err[bool, str](mutate.rewrite_init(?rw, ?alloc, 1))) { ret 1; }
+    if (R.is_err[R.Void, str](mutate.rewrite_init(?rw, ?alloc, 1))) { ret 1; }
     var out: value.Value;
 
-    # fp_trunc(0.1:f64) -> f32 folds, carrying the SAME f64 pattern at the f32 type
     var src: value.Value = value.const_float(0.1, f64ty);
     var tr: instruction.Instruction;
     tr.kind          = instruction.OP_FP_TRUNC;
@@ -896,18 +600,14 @@ test "mach.lang.me.pass.constfold.try_fold:float_narrowing" {
     if (try_fold(?m, ?tr, 0, ?rw, ?out) == false)                              { ret 1; }
     if (out.kind != value.VAL_CONST_FLOAT)                                     { ret 1; }
     if (out.ty != f32ty)                                                       { ret 1; }
-    if (float.f64_bits(out.data.float_lit) != float.f64_bits(0.1))             { ret 1; }
-    # and the width the back end reads off that type is the single pattern nearest
-    # the literal, which is what the runtime convert produced
+    if (float.f64_bits(out.data.float_lit) != float.f32_bits_to_f64_bits(0x3DCCCCCD)) { ret 1; }
     if (float.f64_to_f32_bits(float.f64_bits(out.data.float_lit)) != 0x3DCCCCCD) { ret 1; }
 
-    # a non-constant operand does not fold
     var nc: value.Value = value.instr(7, f64ty);
     var tr2: instruction.Instruction = tr;
     tr2.operands = ?nc;
     if (try_fold(?m, ?tr2, 0, ?rw, ?out))                                      { ret 1; }
 
-    # fp_ext(0.1:f32) -> f64 does NOT fold: the operand's pattern is unrounded
     var fsrc: value.Value = value.const_float(0.1, f32ty);
     var ex: instruction.Instruction;
     ex.kind          = instruction.OP_FP_EXT;
@@ -923,8 +623,6 @@ test "mach.lang.me.pass.constfold.try_fold:float_narrowing" {
     ret 0;
 }
 
-# a CBR with a constant-true condition becomes a BR to the then-target, and the
-# now-dead else-edge's stale phi incoming is pruned
 test "mach.lang.me.pass.constfold.simplify_branches:prune_stale_phi_incoming" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -957,35 +655,27 @@ test "mach.lang.me.pass.constfold.simplify_branches:prune_stale_phi_incoming" {
     if (R.is_err[id.BlockId, str](res_b2)) { ret 1; }
     val b_else: id.BlockId = R.unwrap_ok[id.BlockId, str](res_b2);
 
-    # entry: CBR(1, b_then, b_else) - condition is always true
     builder.set_block(?bld, entry);
-    if (R.is_err[bool, str](builder.emit_cbr(?bld, value.const_int(1, i64ty), b_then, b_else))) { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_cbr(?bld, value.const_int(1, i64ty), b_then, b_else))) { ret 1; }
 
-    # b_then: phi with only a stale incoming from b_else (b_else never branches here);
-    # emit_ret_void keeps the block structurally valid without consuming the phi.
     builder.set_block(?bld, b_then);
     val res_phi: R.Result[value.Value, str] = builder.emit_phi(?bld, i64ty);
     if (R.is_err[value.Value, str](res_phi)) { ret 1; }
     val phi: value.Value = R.unwrap_ok[value.Value, str](res_phi);
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi, b_else, value.const_int(0, i64ty)))) { ret 1; }
-    if (R.is_err[bool, str](builder.emit_ret_void(?bld)))                                            { ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, phi, b_else, value.const_int(0, i64ty)))) { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret_void(?bld)))                                            { ret 1; }
 
-    # b_else: needs a terminator; branches nowhere near b_then
     builder.set_block(?bld, b_else);
-    if (R.is_err[bool, str](builder.emit_ret_void(?bld))) { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret_void(?bld))) { ret 1; }
 
     if (R.is_err[bool, str](run(?m))) { ret 1; }
 
-    # simplify_branches turns CBR(1)->BR(b_then); preds_rebuild gives b_then
-    # preds={entry only}; prune_dead_phi_incomings drops the b_else pair.
     val phi_id: id.InstructionId = phi.data.instr;
     val phi_inst: *instruction.Instruction = ?fn.instrs[phi_id];
     if (phi_inst.operand_count != 0) { ret 1; }
     ret 0;
 }
 
-# a phi collapses on a single incoming and on all-identical incomings, and is
-# left untouched on distinct incomings
 test "mach.lang.me.pass.constfold.fold_phi:collapse_and_distinct" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -996,12 +686,10 @@ test "mach.lang.me.pass.constfold.fold_phi:collapse_and_distinct" {
     if (R.is_err[type.IrTypeId, str](res_ty)) { ret 1; }
     val ty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_ty);
 
-    # an empty rewrite map: the incomings are constants, never resolved through it.
     var rw: mutate.Rewrite;
-    if (R.is_err[bool, str](mutate.rewrite_init(?rw, ?alloc, 1))) { ret 1; }
+    if (R.is_err[R.Void, str](mutate.rewrite_init(?rw, ?alloc, 1))) { ret 1; }
     var out: value.Value;
 
-    # single incoming 7 -> collapses to 7.
     var v1: [1]value.Value;
     v1[0] = value.const_int(7, ty);
     var ops1: [2]value.Value;
@@ -1010,7 +698,6 @@ test "mach.lang.me.pass.constfold.fold_phi:collapse_and_distinct" {
     if (fold_phi(?phi1, 0xFFFFFFFF, ?rw, ?out) == false)         { ret 1; }
     if (out.kind != value.VAL_CONST_INT || out.data.int_lit != 7) { ret 1; }
 
-    # two identical incomings (9, 9) -> collapses to 9.
     var v2: [2]value.Value;
     v2[0] = value.const_int(9, ty);
     v2[1] = value.const_int(9, ty);
@@ -1020,11 +707,124 @@ test "mach.lang.me.pass.constfold.fold_phi:collapse_and_distinct" {
     if (fold_phi(?phi2, 0xFFFFFFFF, ?rw, ?out) == false) { ret 1; }
     if (out.data.int_lit != 9)                           { ret 1; }
 
-    # distinct incomings (9, 5) -> not folded.
     v2[1] = value.const_int(5, ty);
     build_const_phi(?phi2, ?ops2[0], ?v2[0], 2, ty);
     if (fold_phi(?phi2, 0xFFFFFFFF, ?rw, ?out)) { ret 1; }
 
     mutate.rewrite_dnit(?rw, ?alloc);
+    ret 0;
+}
+
+test "mach.lang.me.pass.constfold.run:reports_no_change_when_nothing_folds" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val ri: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 32);
+    if (R.is_err[type.IrTypeId, str](ri)) { ir.dnit(?m); ret 1; }
+    val i32t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](ri);
+
+    val r_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](r_fn)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](r_fn)];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+    val res_entry: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_entry)) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](res_entry));
+
+    val p0: value.Value = value.param(0, i32t);
+    val p1: value.Value = value.param(1, i32t);
+    val res_add: R.Result[value.Value, str] = builder.emit_add(?bld, p0, p1);
+    if (R.is_err[value.Value, str](res_add)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, R.unwrap_ok[value.Value, str](res_add)))) { ir.dnit(?m); ret 1; }
+
+    val rr: R.Result[bool, str] = run(?m);
+    if (R.is_err[bool, str](rr)) { ir.dnit(?m); ret 1; }
+    val changed: bool = R.unwrap_ok[bool, str](rr);
+    ir.dnit(?m);
+    if (changed != false) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.me.pass.constfold.run:reports_change_when_a_constant_add_folds" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val ri: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 32);
+    if (R.is_err[type.IrTypeId, str](ri)) { ir.dnit(?m); ret 1; }
+    val i32t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](ri);
+
+    val r_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](r_fn)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](r_fn)];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+    val res_entry: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_entry)) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](res_entry));
+
+    val c1: value.Value = value.const_int(2, i32t);
+    val c2: value.Value = value.const_int(3, i32t);
+    val res_add: R.Result[value.Value, str] = builder.emit_add(?bld, c1, c2);
+    if (R.is_err[value.Value, str](res_add)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, R.unwrap_ok[value.Value, str](res_add)))) { ir.dnit(?m); ret 1; }
+
+    val rr: R.Result[bool, str] = run(?m);
+    if (R.is_err[bool, str](rr)) { ir.dnit(?m); ret 1; }
+    val changed: bool = R.unwrap_ok[bool, str](rr);
+    ir.dnit(?m);
+    if (changed != true) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.me.pass.constfold.run:reports_change_when_a_constant_branch_simplifies" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val ri: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 32);
+    if (R.is_err[type.IrTypeId, str](ri)) { ir.dnit(?m); ret 1; }
+    val i32t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](ri);
+
+    val r_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](r_fn)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](r_fn)];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+    val res_e: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    val res_t: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    val res_f: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_e) || R.is_err[id.BlockId, str](res_t) || R.is_err[id.BlockId, str](res_f)) {
+        ir.dnit(?m); ret 1;
+    }
+    val eb: id.BlockId = R.unwrap_ok[id.BlockId, str](res_e);
+    val tb: id.BlockId = R.unwrap_ok[id.BlockId, str](res_t);
+    val fb: id.BlockId = R.unwrap_ok[id.BlockId, str](res_f);
+
+    builder.set_block(?bld, eb);
+    if (R.is_err[R.Void, str](builder.emit_cbr(?bld, value.const_int(1, i32t), tb, fb))) { ir.dnit(?m); ret 1; }
+
+    builder.set_block(?bld, tb);
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, value.const_int(1, i32t)))) { ir.dnit(?m); ret 1; }
+
+    builder.set_block(?bld, fb);
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, value.const_int(0, i32t)))) { ir.dnit(?m); ret 1; }
+
+    val rr: R.Result[bool, str] = run(?m);
+    if (R.is_err[bool, str](rr)) { ir.dnit(?m); ret 1; }
+    val changed: bool = R.unwrap_ok[bool, str](rr);
+    ir.dnit(?m);
+    if (changed != true) { ret 1; }
     ret 0;
 }

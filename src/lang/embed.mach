@@ -1,47 +1,33 @@
-# the compile-time file-embedding store: resolved paths, their content, and the
-# build-input fingerprint each one contributes
-#
-# An `#[embed("path")]` declaration sources a constant's bytes from a file at
-# compile time. The path resolves against the declaring source file's directory,
-# and the content is read once per build into this cache: sema reads its length
-# to size the declared array and the middle end reads its bytes to initialize the
-# global, so the two can never disagree about what was embedded.
-#
-# The cache is also where an embedded file becomes a build input. Every refresh
-# writes the file's status and content digest into the Q_EMBED_FILE input keyed
-# by the resolved path, so `set_input`'s byte-equality cutoff leaves an untouched
-# asset's revision alone (the module reusing its cached sema) and an edited one
-# advances it (invalidating every module that embedded it). A file that fails to
-# read still writes a status, so an asset that appears or disappears invalidates
-# exactly like one whose bytes changed.
-#
-# Sits below the frontend and the middle end - both read it, neither owns it -
-# and depends on no compiler module other than the interner and the query db.
-
 use std.collections.vector;
 use std.collections.vector.Vector;
 use std.crypto.hash.sha256;
 use fs: std.filesystem;
+use txn: std.filesystem.transaction;
 use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_contains_char;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
 
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
-use path: std.types.path;
+use std.types.path;
 
 use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.expr;
 use mach.lang.fe.token;
 use mach.lang.intern;
+use mach.lang.manifest;
 use mach.lang.query;
 
-# why a refresh could not deliver the file's bytes
 pub def EmbedStatus: u8;
 
 pub val EMBED_OK:       EmbedStatus = 0;
@@ -50,18 +36,6 @@ pub val EMBED_IS_DIR:   EmbedStatus = 2;
 pub val EMBED_UNREADABLE: EmbedStatus = 3;
 pub val EMBED_TOO_LARGE:  EmbedStatus = 4;
 
-# one embedded file's cached content and fingerprint
-#
-# `bytes` is owned by the cache and replaced wholesale on a content change; a
-# non-OK `status` leaves it nil with a zero `len`, so a consumer that ignored the
-# status would embed nothing rather than stale bytes.
-# ---
-# path:   the resolved absolute-or-relative path, interned
-# status: EMBED_OK, or why the read failed
-# reason: the OS message behind a non-OK status (borrowed static text)
-# bytes:  the file's content, owned by the cache (nil unless status is OK)
-# len:    number of content bytes
-# digest: sha256 of the content (all zero unless status is OK)
 pub rec EmbedFile {
     path:   intern.StrId;
     status: EmbedStatus;
@@ -71,41 +45,39 @@ pub rec EmbedFile {
     digest: [32]u8;
 }
 
-# the per-session store of every file an `#[embed]` in this build referenced
-# ---
-# alloc:   allocator owning the entry array and every entry's bytes
-# entries: first-seen-ordered array of cached files
-# len:     number of live entries
-# cap:     allocated capacity of the entry array
 pub rec EmbedCache {
     alloc:   *A.Allocator;
     entries: *EmbedFile;
     len:     u32;
     cap:     u32;
+
+    root:      str;
+    reqs:      *manifest.ArtifactReq;
+    req_count: u32;
 }
 
-# seed capacity of the entry array, doubled on demand from there
 val ENTRY_SEED_CAP: u32 = 8;
 
-# the length prefix plus digest a Q_EMBED_FILE input value carries
 val INPUT_LEN: u32 = 33;
 
-# construct an empty cache backed by the given allocator
-# ---
-# alloc: allocator used for the entry array and every entry's content buffer
-# ret:   a new empty cache
 pub fun init(alloc: *A.Allocator) EmbedCache {
     var c: EmbedCache;
     c.alloc   = alloc;
     c.entries = nil;
     c.len     = 0;
     c.cap     = 0;
+    c.root      = "";
+    c.reqs      = nil;
+    c.req_count = 0;
     ret c;
 }
 
-# release every cached content buffer and the entry array itself
-# ---
-# c: the cache to tear down
+pub fun set_path_env(c: *EmbedCache, root: str, reqs: *manifest.ArtifactReq, req_count: u32) {
+    c.root      = root;
+    c.reqs      = reqs;
+    c.req_count = req_count;
+}
+
 pub fun dnit(c: *EmbedCache) {
     if (c.entries == nil || c.cap == 0) {
         c.entries = nil;
@@ -124,12 +96,6 @@ pub fun dnit(c: *EmbedCache) {
     c.cap     = 0;
 }
 
-# the cached entry for `path_id`, or none when this build never refreshed it
-# ---
-# c:       the cache
-# path_id: the interned resolved path
-# ret:     some(*EmbedFile) into the entry array (invalidated by a later refresh
-#          that grows it), or none
 pub fun get(c: *EmbedCache, path_id: intern.StrId) O.Option[*EmbedFile] {
     var i: u32 = 0;
     for (i < c.len) {
@@ -139,18 +105,66 @@ pub fun get(c: *EmbedCache, path_id: intern.StrId) O.Option[*EmbedFile] {
     ret O.none[*EmbedFile]();
 }
 
-# resolve `arg` against the directory holding `decl_file`, yielding the path an
-# `#[embed]` on a declaration in that file names
-#
-# The path is file-relative, so a module reads its own assets by the same
-# spelling wherever the project is checked out. An absolute `arg` is taken as
-# written (path.resolve keeps it), which is what a generated or vendored asset
-# under a manifest-expanded path needs.
-# ---
-# alloc:     allocator for the returned owned path
-# decl_file: on-disk path of the source file carrying the declaration
-# arg:       the decorator's path argument, quotes removed and escapes left as written
-# ret:       the owned resolved path, or an allocation error
+pub fun resolve_arg(alloc: *A.Allocator, c: *EmbedCache, decl_file: str, arg: str) R.Result[str, str] {
+    if (!str_contains_char(arg, '{')) { ret resolve_path(alloc, decl_file, arg); }
+
+    val er: R.Result[str, str] = manifest.expand_artifact_path(alloc, arg, c.reqs, c.req_count,
+        "an `embed` path");
+    if (R.is_err[str, str](er)) { ret er; }
+    val expanded: str = R.unwrap_ok[str, str](er);
+
+    if (str_empty(c.root)) {
+        str_free(alloc, expanded);
+        ret R.err[str, str]("an `embed` path template needs a project root; this build has none");
+    }
+    val jr: R.Result[path.Path, str] = path.resolve(alloc, c.root, expanded);
+    str_free(alloc, expanded);
+    if (R.is_err[path.Path, str](jr)) { ret R.err[str, str](R.unwrap_err[path.Path, str](jr)); }
+    ret R.ok[str, str](R.unwrap_ok[path.Path, str](jr));
+}
+
+pub fun escapes_root(alloc: *A.Allocator, c: *EmbedCache, resolved: str) bool {
+    if (str_empty(c.root)) { ret false; }
+    val root_r: R.Result[path.Path, str] = path.clean(alloc, c.root);
+    if (R.is_err[path.Path, str](root_r)) { ret false; }
+    val root: str = R.unwrap_ok[path.Path, str](root_r);
+    val res_r: R.Result[path.Path, str] = path.clean(alloc, resolved);
+    if (R.is_err[path.Path, str](res_r)) { str_free(alloc, root); ret false; }
+    val target: str = R.unwrap_ok[path.Path, str](res_r);
+
+    var escapes: bool = false;
+    if (!str_equals(target, root)) {
+        val prefix_r: R.Result[path.Path, str] = path.join(alloc, root, "");
+        var inside: bool = false;
+        var rel: str = "";
+        if (R.is_ok[path.Path, str](prefix_r)) {
+            val prefix: str = R.unwrap_ok[path.Path, str](prefix_r);
+            val rl: usize = str_len(root);
+            inside = str_len(target) > rl && target[rl] == path.separator() && str_starts_with(target, root);
+            if (inside) { rel = (target::usize + rl + 1)::str; }
+            str_free(alloc, prefix);
+        }
+        if (!inside) { escapes = true; }
+        or {
+            val dir_r: R.Result[path.Path, str] = path.parent(alloc, rel);
+            if (R.is_ok[path.Path, str](dir_r)) {
+                val dir: str = R.unwrap_ok[path.Path, str](dir_r);
+                val open_r: R.Result[txn.Root, txn.Error] = txn.root_open(root, dir);
+                if (R.is_ok[txn.Root, txn.Error](open_r)) {
+                    var r: txn.Root = R.unwrap_ok[txn.Root, txn.Error](open_r);
+                    txn.root_dnit(?r);
+                } or (R.unwrap_err[txn.Root, txn.Error](open_r).kind == txn.CONTAINMENT) {
+                    escapes = true;
+                }
+                str_free(alloc, dir);
+            }
+        }
+    }
+    str_free(alloc, target);
+    str_free(alloc, root);
+    ret escapes;
+}
+
 pub fun resolve_path(alloc: *A.Allocator, decl_file: str, arg: str) R.Result[str, str] {
     val pr: R.Result[path.Path, str] = path.parent(alloc, decl_file);
     if (R.is_err[path.Path, str](pr)) { ret R.err[str, str](R.unwrap_err[path.Path, str](pr)); }
@@ -162,23 +176,6 @@ pub fun resolve_path(alloc: *A.Allocator, decl_file: str, arg: str) R.Result[str
     ret R.ok[str, str](R.unwrap_ok[path.Path, str](jr));
 }
 
-# re-read the file at `p` into the cache and publish its Q_EMBED_FILE input
-#
-# Called once per build for every path an `#[embed]` names, before the phases
-# that consume it, so the input is current when a cached sema entry revalidates
-# against it. Reading unconditionally is what makes an asset edit visible: a
-# module whose sema was reused never runs the code that would notice the file, so
-# the refresh cannot be deferred to the consumer.
-#
-# A read failure is recorded on the entry rather than returned - the frontend
-# reports it against the declaration that named the path, which this layer cannot
-# see. Only an allocation or query failure is an error here.
-# ---
-# c:   the cache
-# db:  the query db the Q_EMBED_FILE input is published into
-# itn: the interner owning the resolved path
-# p:   the resolved path to read
-# ret: the interned path id keying the entry, or an allocation error
 pub fun refresh(c: *EmbedCache, db: *query.QueryDb, itn: *intern.Interner, p: str) R.Result[intern.StrId, str] {
     val ir: R.Result[intern.StrId, str] = intern.intern(itn, p);
     if (R.is_err[intern.StrId, str](ir)) { ret ir; }
@@ -188,25 +185,15 @@ pub fun refresh(c: *EmbedCache, db: *query.QueryDb, itn: *intern.Interner, p: st
     if (R.is_err[*EmbedFile, str](er)) { ret R.err[intern.StrId, str](R.unwrap_err[*EmbedFile, str](er)); }
     val e: *EmbedFile = R.unwrap_ok[*EmbedFile, str](er);
 
-    val rr: R.Result[bool, str] = read_into(c, e, p);
-    if (R.is_err[bool, str](rr)) { ret R.err[intern.StrId, str](R.unwrap_err[bool, str](rr)); }
+    val rr: R.Result[R.Void, str] = read_into(c, e, p);
+    if (R.is_err[R.Void, str](rr)) { ret R.err[intern.StrId, str](R.unwrap_err[R.Void, str](rr)); }
 
-    val pr: R.Result[bool, str] = publish(db, e);
-    if (R.is_err[bool, str](pr)) { ret R.err[intern.StrId, str](R.unwrap_err[bool, str](pr)); }
+    val pr: R.Result[R.Void, str] = publish(db, e);
+    if (R.is_err[R.Void, str](pr)) { ret R.err[intern.StrId, str](R.unwrap_err[R.Void, str](pr)); }
     ret R.ok[intern.StrId, str](path_id);
 }
 
-# read `p` into entry `e`, classifying a failure rather than propagating it
-#
-# The directory case is separated from a bare open failure because it is the one
-# a caller most often reaches by naming an asset folder, and "is a directory"
-# tells them so where a generic read error would not.
-# ---
-# c:   the cache owning `e`'s buffer
-# e:   the entry to fill
-# p:   the path to read
-# ret: true once the entry reflects the read, or an allocation error
-fun read_into(c: *EmbedCache, e: *EmbedFile, p: str) R.Result[bool, str] {
+fun read_into(c: *EmbedCache, e: *EmbedFile, p: str) R.Result[R.Void, str] {
     val was_ok:  bool = e.status == EMBED_OK;
     val old_len: u32  = e.len;
 
@@ -215,23 +202,20 @@ fun read_into(c: *EmbedCache, e: *EmbedFile, p: str) R.Result[bool, str] {
         zero_digest(e);
         e.status = EMBED_IS_DIR;
         e.reason = "is a directory";
-        ret R.ok[bool, str](true);
+        ret R.ok_void[str]();
     }
     if (!fs.exists(p)) {
         free_bytes(c, e);
         zero_digest(e);
         e.status = EMBED_MISSING;
         e.reason = "no such file or directory";
-        ret R.ok[bool, str](true);
+        ret R.ok_void[str]();
     }
 
-    # array counts and object-section lengths are u32 throughout the compiler;
-    # reject a larger file before reading it rather than truncating its length and
-    # later freeing the cache allocation with the wrong size.
     val mr: R.Result[fs.Metadata, str] = fs.metadata(p);
     if (R.is_ok[fs.Metadata, str](mr) && R.unwrap_ok[fs.Metadata, str](mr).size::u64 > 4294967295) {
         mark_too_large(c, e);
-        ret R.ok[bool, str](true);
+        ret R.ok_void[str]();
     }
 
     val rr: R.Result[Vector[u8], str] = fs.read_bytes(c.alloc, p);
@@ -240,27 +224,21 @@ fun read_into(c: *EmbedCache, e: *EmbedFile, p: str) R.Result[bool, str] {
         zero_digest(e);
         e.status = EMBED_UNREADABLE;
         e.reason = R.unwrap_err[Vector[u8], str](rr);
-        ret R.ok[bool, str](true);
+        ret R.ok_void[str]();
     }
     var buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rr);
-    # the file can grow after the metadata read; keep the same bound at the
-    # authoritative byte count too.
     if (buf.len::u64 > 4294967295) {
         vector.dnit[u8](?buf);
         mark_too_large(c, e);
-        ret R.ok[bool, str](true);
+        ret R.ok_void[str]();
     }
 
     var fresh: [32]u8;
     sha256.hash(buf.data, buf.len, ?fresh[0]);
 
-    # an unchanged file keeps its existing buffer rather than swapping in an equal
-    # one. Not an optimization: lowered IR cached across builds holds a borrowed
-    # pointer into this buffer, and a module whose sema revalidated is never
-    # re-lowered - so reallocating here would leave that IR pointing at freed bytes.
     if (was_ok && old_len == buf.len::u32 && digest_equals(?e.digest[0], ?fresh[0])) {
         vector.dnit[u8](?buf);
-        ret R.ok[bool, str](true);
+        ret R.ok_void[str]();
     }
 
     free_bytes(c, e);
@@ -272,14 +250,11 @@ fun read_into(c: *EmbedCache, e: *EmbedFile, p: str) R.Result[bool, str] {
         i = i + 1;
     }
 
-    # the vector's storage is capacity-sized and freed by its own dnit, so the
-    # content is copied into an exactly-sized cache-owned buffer rather than
-    # adopted; an empty file keeps a nil buffer with a zero length.
     if (buf.len > 0) {
         val ar: R.Result[*u8, str] = A.allocate[u8](c.alloc, buf.len);
         if (R.is_err[*u8, str](ar)) {
             vector.dnit[u8](?buf);
-            ret R.err[bool, str](R.unwrap_err[*u8, str](ar));
+            ret R.err[R.Void, str](R.unwrap_err[*u8, str](ar));
         }
         e.bytes = R.unwrap_ok[*u8, str](ar);
         e.len   = buf.len::u32;
@@ -290,10 +265,9 @@ fun read_into(c: *EmbedCache, e: *EmbedFile, p: str) R.Result[bool, str] {
         }
     }
     vector.dnit[u8](?buf);
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# whether two 32-byte digests are equal
 fun digest_equals(a: *u8, b: *u8) bool {
     var i: u32 = 0;
     for (i < 32) {
@@ -303,15 +277,7 @@ fun digest_equals(a: *u8, b: *u8) bool {
     ret true;
 }
 
-# write entry `e`'s status and digest into its Q_EMBED_FILE input
-#
-# Status leads the value so a file that changes from unreadable to readable moves
-# the input even if the digest of the empty read matched.
-# ---
-# db: the query db
-# e:  the entry to publish
-# ret: true on success, or the query db's error
-fun publish(db: *query.QueryDb, e: *EmbedFile) R.Result[bool, str] {
+fun publish(db: *query.QueryDb, e: *EmbedFile) R.Result[R.Void, str] {
     var value: [33]u8;
     value[0] = e.status;
     var i: u32 = 0;
@@ -322,11 +288,6 @@ fun publish(db: *query.QueryDb, e: *EmbedFile) R.Result[bool, str] {
     ret query.set_input(db, query.Q_EMBED_FILE, e.path::u64, ?value[0], INPUT_LEN);
 }
 
-# the entry for `path_id`, appending a fresh one when this is its first refresh
-# ---
-# c:       the cache
-# path_id: the interned resolved path
-# ret:     the entry, or an allocation error
 fun entry_for(c: *EmbedCache, path_id: intern.StrId) R.Result[*EmbedFile, str] {
     var i: u32 = 0;
     for (i < c.len) {
@@ -334,8 +295,8 @@ fun entry_for(c: *EmbedCache, path_id: intern.StrId) R.Result[*EmbedFile, str] {
         i = i + 1;
     }
 
-    val gr: R.Result[bool, str] = grow(c);
-    if (R.is_err[bool, str](gr)) { ret R.err[*EmbedFile, str](R.unwrap_err[bool, str](gr)); }
+    val gr: R.Result[R.Void, str] = grow(c);
+    if (R.is_err[R.Void, str](gr)) { ret R.err[*EmbedFile, str](R.unwrap_err[R.Void, str](gr)); }
 
     val idx: u32 = c.len;
     var e: EmbedFile;
@@ -350,31 +311,26 @@ fun entry_for(c: *EmbedCache, path_id: intern.StrId) R.Result[*EmbedFile, str] {
     ret R.ok[*EmbedFile, str](?c.entries[idx]);
 }
 
-# ensure the entry array has room for one more, doubling from the seed capacity
-# ---
-# c:   the cache
-# ret: true once there is room, or an allocation error
-fun grow(c: *EmbedCache) R.Result[bool, str] {
-    if (c.len < c.cap) { ret R.ok[bool, str](true); }
+fun grow(c: *EmbedCache) R.Result[R.Void, str] {
+    if (c.len < c.cap) { ret R.ok_void[str](); }
 
     var new_cap: u32 = ENTRY_SEED_CAP;
     if (c.cap > 0) { new_cap = c.cap * 2; }
 
     if (c.entries == nil) {
         val ar: R.Result[*EmbedFile, str] = A.allocate[EmbedFile](c.alloc, new_cap::usize);
-        if (R.is_err[*EmbedFile, str](ar)) { ret R.err[bool, str](R.unwrap_err[*EmbedFile, str](ar)); }
+        if (R.is_err[*EmbedFile, str](ar)) { ret R.err[R.Void, str](R.unwrap_err[*EmbedFile, str](ar)); }
         c.entries = R.unwrap_ok[*EmbedFile, str](ar);
     }
     or {
         val rr: R.Result[*EmbedFile, str] = A.reallocate[EmbedFile](c.alloc, c.entries, c.cap::usize, new_cap::usize);
-        if (R.is_err[*EmbedFile, str](rr)) { ret R.err[bool, str](R.unwrap_err[*EmbedFile, str](rr)); }
+        if (R.is_err[*EmbedFile, str](rr)) { ret R.err[R.Void, str](R.unwrap_err[*EmbedFile, str](rr)); }
         c.entries = R.unwrap_ok[*EmbedFile, str](rr);
     }
     c.cap = new_cap;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# release entry `e`'s content buffer, leaving it empty
 fun free_bytes(c: *EmbedCache, e: *EmbedFile) {
     if (e.bytes != nil && e.len > 0) {
         A.deallocate[u8](c.alloc, e.bytes, e.len::usize);
@@ -383,7 +339,6 @@ fun free_bytes(c: *EmbedCache, e: *EmbedFile) {
     e.len   = 0;
 }
 
-# clear entry `e`'s digest
 fun zero_digest(e: *EmbedFile) {
     var i: u32 = 0;
     for (i < 32) {
@@ -392,7 +347,6 @@ fun zero_digest(e: *EmbedFile) {
     }
 }
 
-# replace an entry with the reported representation of an over-u32 file
 fun mark_too_large(c: *EmbedCache, e: *EmbedFile) {
     free_bytes(c, e);
     zero_digest(e);
@@ -400,17 +354,6 @@ fun mark_too_large(c: *EmbedCache, e: *EmbedFile) {
     e.reason = "file exceeds the maximum embed size of 4294967295 bytes";
 }
 
-# the span of the path text inside decorator `dec`'s string-literal argument, or
-# none when the decorator is not a well-formed `#[embed("...")]`
-#
-# The one place the decorator's argument shape is decoded, so the driver's input
-# refresh, sema's resolution, and lowering's byte lookup can never disagree about
-# which file a declaration names. Quotes are stripped and escapes are left as
-# written, matching `#[symbol]` and `#[section]`.
-# ---
-# a:   the module's Ast (its expression pool)
-# dec: the `embed` decorator
-# ret: some(the inner span), or none
 pub fun path_arg_span(a: *ast.Ast, dec: *decl.Decorator) O.Option[token.Span] {
     if (dec.args_len != 1) { ret O.none[token.Span](); }
     val opt_e: O.Option[*expr.Expr] = ast.get_expr(a, a.expr_ids[dec.args_start]);

@@ -1,22 +1,7 @@
-# `mach doc` - generate reference documentation from first-class doc comments
-#
-# Loads the full module graph through the same driver pipeline as `build`, then
-# walks every module's parsed AST and, for each `pub` declaration, renders the
-# signature from source and the documentation from the decl's first-class `doc`
-# span via mach.lang.fe.doc (summary plus components). That is the same
-# structured doc source the docstring lint and the LSP hover read, so the
-# rendered output stays in lockstep with them and `#[...]` decorator lines are
-# never mistaken for documentation.
-#
-# Each module renders to a Markdown page under `<root>/doc/api/<fqn-as-path>.md`
-# (FQN `a.b.c` -> `doc/api/a/b/c.md`), with an index at `doc/api/README.md`
-# linking every page. The hand-written `doc/language/` material is never touched.
-# Page output is written straight to the filesystem through a Writer; only the
-# run summary goes through std.print.
-
 use std.allocator.arena;
 use std.allocator.page;
 use fs: std.filesystem;
+use io_error: std.io.error;
 use std.io.writer;
 use std.print;
 use std.types.bool.bool;
@@ -26,18 +11,26 @@ use std.types.size.usize;
 use std.types.string;
 use std.types.string.str;
 use std.types.string.str_len;
+use std.types.string.str_contains;
+use std.types.string.str_equals;
 use std.types.string.str_join;
 use std.types.string.str_replace;
 use std.types.path;
+use spath: std.types.path;
+use txn: std.filesystem.transaction;
 
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
 use mach.cli.args;
+use cli_diag: mach.cli.diagnostic;
 use mach.lang.build.outcome;
+use mach.lang.diagnostic;
+use mach.lang.build.request;
 use mach.cli.util;
 use mach.lang.driver;
+use mach.lang.manifest;
 use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.id;
@@ -48,67 +41,36 @@ use mach.lang.intern;
 use mach.lang.session;
 use src: mach.lang.source;
 use mach.lang.target;
+use mach.lang.publication;
 
-# permission bits for a documentation page the CLI creates (octal 0644, rw-r--r--)
 val FILE_MODE: i32 = 420;
 
-# running counts for a documentation run
-# ---
-# modules: number of module pages written
-# entries: number of public entities documented
 rec DocStats {
     modules: u32;
     entries: u32;
 }
 
-# write a null-terminated literal through a writer, ignoring short writes
-# ---
-# w: destination writer
-# s: null-terminated byte string
 fun wr(w: *writer.Writer, s: *u8) {
     writer.write_all(w, s, str_len(s));
 }
 
-# write `len` bytes of `s` through a writer
-# ---
-# w:   destination writer
-# s:   source bytes
-# len: number of bytes to write
 fun wr_n(w: *writer.Writer, s: *u8, len: usize) {
     if (len == 0) { ret; }
     writer.write_all(w, s, len);
 }
 
-# index of the byte just past the current line's content - its '\n' or the
-# terminator - scanning from `pos`
-# ---
-# s:   source text
-# pos: offset to scan from
-# ret: index of the line-ending '\n' or the terminator
 fun line_end(s: *u8, pos: usize) usize {
     var i: usize = pos;
     for (s[i] != 0 && s[i] != '\n') { i = i + 1; }
     ret i;
 }
 
-# index of the first non-space, non-tab byte on the line starting at `pos`,
-# stopping at the line end
-# ---
-# s:   source text
-# pos: offset of the line start
-# ret: index of the first significant byte, or the line end when blank
 fun first_nonspace(s: *u8, pos: usize) usize {
     var i: usize = pos;
     for (s[i] == ' ' || s[i] == '\t') { i = i + 1; }
     ret i;
 }
 
-# whether the bytes at `s[pos..]` begin with the literal `lit`
-# ---
-# s:   source text
-# pos: offset to test
-# lit: null-terminated literal to match
-# ret: true on a full prefix match
 fun starts_with(s: *u8, pos: usize, lit: *u8) bool {
     var i: usize = 0;
     for (lit[i] != 0) {
@@ -118,27 +80,12 @@ fun starts_with(s: *u8, pos: usize, lit: *u8) bool {
     ret true;
 }
 
-# index of the start of the line following the one at `pos`
-# ---
-# s:   source text
-# pos: offset of a line start
-# ret: offset of the next line start, or the terminator index
 fun next_line(s: *u8, pos: usize) usize {
     val e: usize = line_end(s, pos);
     if (s[e] == 0) { ret e; }
     ret e + 1;
 }
 
-# advance past a declaration's leading `#[...]` decorator clauses, and the
-# whitespace between them, to its first real token: the `pub`/`ext` flag or the
-# kind keyword
-#
-# A decl's span starts at the opening `#[` when decorators are present, so this
-# lands the signature renderers on the declaration proper, never on a decorator.
-# ---
-# s:   source text
-# pos: offset of the declaration's first token (its span.offset)
-# ret: offset of the first non-decorator token
 fun skip_decorators(s: *u8, pos: usize) usize {
     var i:  usize = pos;
     var go: bool  = true;
@@ -160,16 +107,6 @@ fun skip_decorators(s: *u8, pos: usize) usize {
     ret i;
 }
 
-# write the byte span `span` of `source` through `w`, stripping the `#`-comment
-# prefix from each wrapped continuation line so a multi-line summary or
-# description renders as clean Markdown prose
-#
-# The first line's content already sits past its `#` (the doc parser trims it),
-# so only lines after an embedded newline are de-commented.
-# ---
-# w:      destination writer
-# source: the source text the span points into
-# span:   byte span to render
 fun write_span_stripped(w: *writer.Writer, source: str, span: token.Span) {
     val s:   *u8   = source::*u8;
     val end: usize = span.offset + span.len;
@@ -194,15 +131,6 @@ fun write_span_stripped(w: *writer.Writer, source: str, span: token.Span) {
     }
 }
 
-# render a declaration's documentation from its first-class doc span through `w`
-#
-# Writes the trimmed summary, then a blank line and each `# name: desc` component
-# on its own line, sourced through mach.lang.fe.doc. Writes nothing when the decl
-# carries no docstring (an empty doc span).
-# ---
-# w:      destination writer
-# source: the source text the doc span points into
-# doc:    the decl's doc-block span
 fun write_doc(w: *writer.Writer, source: str, doc: token.Span) {
     if (doc.len == 0) { ret; }
 
@@ -233,16 +161,6 @@ fun write_doc(w: *writer.Writer, source: str, doc: token.Span) {
     wr(w, "\n");
 }
 
-# write the declaration whose first line starts at `pos` as a fenced `mach` code
-# block, capturing every line up to and including the one that closes the
-# signature with `;` or `{` at the outer brace/paren depth
-#
-# A trailing `{` is rewritten to `;` so the rendered signature omits the body.
-# ---
-# w:   destination writer
-# s:   source text
-# pos: offset of the declaration's first real token (past any decorators)
-# ret: line-start offset just past the declaration's signature
 fun write_signature(w: *writer.Writer, s: *u8, pos: usize) usize {
     wr(w, "```mach\n");
     var line:  usize = pos;
@@ -252,7 +170,6 @@ fun write_signature(w: *writer.Writer, s: *u8, pos: usize) usize {
         val e:     usize = line_end(s, line);
         val begin: usize = first_nonspace(s, line);
 
-        # scan this line for the terminating ';' or opening '{' at depth 0.
         var i:         usize = begin;
         var cut:       usize = e;
         var saw_brace: bool  = false;
@@ -265,7 +182,6 @@ fun write_signature(w: *writer.Writer, s: *u8, pos: usize) usize {
             i = i + 1;
         }
 
-        # trim trailing whitespace so a '{' rewritten to ';' leaves no gap.
         var trimmed: usize = cut;
         for (trimmed > begin && (s[trimmed - 1] == ' ' || s[trimmed - 1] == '\t')) {
             trimmed = trimmed - 1;
@@ -279,13 +195,6 @@ fun write_signature(w: *writer.Writer, s: *u8, pos: usize) usize {
     ret line;
 }
 
-# write a declaration's name for use as a Markdown heading: the decl line with
-# any `pub ` prefix removed and truncated at the first '(', '[', ':', '=', '{',
-# or ';' so only the kind keyword and name remain
-# ---
-# w:   destination writer
-# s:   source text
-# pos: offset of the declaration's first real token (past any decorators)
 fun write_heading(w: *writer.Writer, s: *u8, pos: usize) {
     var begin: usize = first_nonspace(s, pos);
     if (starts_with(s, begin, "pub ")) { begin = begin + 4; }
@@ -303,13 +212,6 @@ fun write_heading(w: *writer.Writer, s: *u8, pos: usize) {
     wr_n(w, ?s[begin], stop - begin);
 }
 
-# render one `pub` declaration to the page: a `##` heading and a fenced
-# signature from source, then its documentation from the decl's first-class
-# doc span
-# ---
-# w:      destination writer
-# source: the module's source text (the decl's spans point into it)
-# d:      the declaration to document
 fun document_decl(w: *writer.Writer, source: str, d: *decl.Decl) {
     val s:   *u8   = source::*u8;
     val sig: usize = skip_decorators(s, d.span.offset);
@@ -322,16 +224,6 @@ fun document_decl(w: *writer.Writer, source: str, d: *decl.Decl) {
     write_doc(w, source, d.doc);
 }
 
-# walk a module-scope decl list, documenting each `pub` declaration and
-# recursing into `$if`/`$or` comptime branches, where target-gated `pub` decls
-# live
-# ---
-# w:      destination writer
-# a:      the module's parsed AST
-# source: the module's source text
-# start:  start index into a.decl_ids of the list
-# len:    number of decls in the list
-# ret:    number of public entities documented
 fun document_decls(w: *writer.Writer, a: *ast.Ast, source: str, start: u32, len: u32) i64 {
     var documented: i64 = 0;
     var i:          u32 = 0;
@@ -359,71 +251,101 @@ fun document_decls(w: *writer.Writer, a: *ast.Ast, source: str, start: u32, len:
     ret documented;
 }
 
-# render one module's page from its parsed AST, documenting every `pub`
-# declaration at module scope
-# ---
-# alloc:    allocator for transient parent paths
-# out_path: full path of the page file to create
-# fqn:      dotted module FQN, used as the page title
-# a:        the module's parsed AST
-# source:   the module's source text
-# ret:      number of public entities documented, or -1 on a filesystem error
+# a writer that remembers a failure
+#
+# the page helpers write through `wr`, which cannot report anything: a write is
+# one statement among many, deep inside the declaration walk, and threading a
+# result out of every one of them would say the same thing eight times. so the
+# failure is latched here instead, at the one seam every write already passes
+# through, and the callback asks once at the end.
+rec CheckedSink {
+    inner:  *writer.Writer;
+    failed: bool;
+}
+
+fun checked_write(ctx: ptr, buf: *u8, len: usize) R.Result[usize, str] {
+    val s: *CheckedSink = ctx::*CheckedSink;
+    val r: R.Result[usize, str] = writer.write(s.inner, buf, len);
+    if (R.is_err[usize, str](r)) { s.failed = true; }
+    ret r;
+}
+
+fun checked_writer(s: *CheckedSink, inner: *writer.Writer) writer.Writer {
+    s.inner  = inner;
+    s.failed = false;
+    var w: writer.Writer;
+    w.ctx     = s::ptr;
+    w.f_write = checked_write;
+    ret w;
+}
+
+rec PageCtx {
+    a:          *ast.Ast;
+    source:     str;
+    fqn:        *u8;
+    documented: i64;
+}
+
+fun write_page(ctx: *PageCtx, dst: *writer.Writer) R.Result[R.Void, str] {
+    var sink: CheckedSink;
+    var cw: writer.Writer = checked_writer(?sink, dst);
+    val w: *writer.Writer = ?cw;
+
+    wr(w, "# ");
+    wr(w, ctx.fqn);
+    wr(w, "\n\n");
+
+    val opt_module: O.Option[*module.Module] = ast.get_module(ctx.a, ctx.a.root_module);
+    if (O.is_some[*module.Module](opt_module)) {
+        val m: *module.Module = O.unwrap[*module.Module](opt_module);
+        ctx.documented = document_decls(w, ctx.a, ctx.source, m.decls_start, m.decls_len);
+    }
+
+    if (sink.failed) { ret R.err[R.Void, str]("failed to write the documentation page"); }
+    ret R.ok_void[str]();
+}
+
+# publish one page whole: a reader never sees a partially generated page, and a
+# crash leaves the previous one intact rather than a truncated replacement
+fun publish_page[C](alloc: *A.Allocator, out_path: str, ctx: *C,
+                    write_cb: fun(*C, *writer.Writer) R.Result[R.Void, str]) bool {
+    ret R.is_ok[R.Void, str](publication.writer[C](nil, alloc, out_path, ctx, write_cb, FILE_MODE,
+        publication.REPLACE, publication.PARENTS_EXIST, "write", "the page could not be published"));
+}
+
 fun document_module(alloc: *A.Allocator, out_path: *u8, fqn: *u8, a: *ast.Ast, source: str) i64 {
     if (O.is_some[str](util.ensure_parents(alloc, out_path::str))) { ret -1; }
 
-    val res_file: R.Result[fs.File, str] = fs.create(out_path, FILE_MODE);
-    if (R.is_err[fs.File, str](res_file)) { ret -1; }
-    var file: fs.File = R.unwrap_ok[fs.File, str](res_file);
+    var ctx: PageCtx;
+    ctx.a          = a;
+    ctx.source     = source;
+    ctx.fqn        = fqn;
+    ctx.documented = 0;
 
-    var w: writer.Writer;
-    w = fs.writer(file);
-
-    wr(?w, "# ");
-    wr(?w, fqn);
-    wr(?w, "\n\n");
-
-    var documented: i64 = 0;
-    val opt_module: O.Option[*module.Module] = ast.get_module(a, a.root_module);
-    if (O.is_some[*module.Module](opt_module)) {
-        val m: *module.Module = O.unwrap[*module.Module](opt_module);
-        documented = document_decls(?w, a, source, m.decls_start, m.decls_len);
-    }
-
-    fs.close(file);
-    ret documented;
+    if (!publish_page[PageCtx](alloc, out_path::str, ?ctx, write_page)) { ret -1; }
+    ret ctx.documented;
 }
 
-# drive the documentation run over a loaded project, writing one page per module
-# under `<api_dir>/<fqn>.md` and an index at `<api_dir>/README.md`
-# ---
-# alloc:   allocator for the generated page paths
-# p:       the loaded project
-# api_dir: output directory for the generated pages
-# stats:   running counts updated as pages are written
-# ret:     0 on success, non-zero on a filesystem error
-fun generate(alloc: *A.Allocator, p: *driver.Project, api_dir: str, stats: *DocStats) i64 {
-    # the output dir (default `doc/api`, or a `--out` several levels deep) may have
-    # no existing parent, so create the whole path, not just the leaf.
-    if (O.is_some[str](fs.create_dir_all(alloc, api_dir, 0o755))) {
-        print.eprint("error: could not create output directory\n");
-        ret 2;
-    }
+rec IndexCtx {
+    alloc:   *A.Allocator;
+    p:       *driver.Project;
+    api_dir: str;
+    stats:   *DocStats;
+    failed:  bool;
+}
 
-    val idx_r: R.Result[str, str] = path.join(alloc, api_dir, "README.md");
-    if (R.is_err[str, str](idx_r)) { ret 2; }
-    val index_path: str = R.unwrap_ok[str, str](idx_r);
+fun write_index(ctx: *IndexCtx, dst: *writer.Writer) R.Result[R.Void, str] {
+    val alloc: *A.Allocator = ctx.alloc;
+    val p: *driver.Project = ctx.p;
+    val api_dir: str = ctx.api_dir;
+    val stats: *DocStats = ctx.stats;
 
-    val res_index: R.Result[fs.File, str] = fs.create(index_path, FILE_MODE);
-    if (R.is_err[fs.File, str](res_index)) {
-        print.eprint("error: could not create the documentation index\n");
-        ret 2;
-    }
-    var index: fs.File = R.unwrap_ok[fs.File, str](res_index);
+    var sink: CheckedSink;
+    var cw: writer.Writer = checked_writer(?sink, dst);
+    val iw: *writer.Writer = ?cw;
 
-    var iw: writer.Writer;
-    iw = fs.writer(index);
-    wr(?iw, "# API reference\n\n");
-    wr(?iw, "generated by `mach doc` from source doc-comments.\n\n");
+    wr(iw, "# API reference\n\n");
+    wr(iw, "generated by `mach doc` from source doc-comments.\n\n");
 
     var i: u32 = 0;
     for (i < p.module_len) {
@@ -437,7 +359,6 @@ fun generate(alloc: *A.Allocator, p: *driver.Project, api_dir: str, stats: *DocS
         if (O.is_none[*src.SourceFile](opt_source)) { i = i + 1; cnt; }
         val source: str = O.unwrap[*src.SourceFile](opt_source).text;
 
-        # the page path is `<api_dir>/<fqn with dots as separators>.md`
         val rel_r: R.Result[str, str] = str_replace(alloc, fqn::str, ".", "/");
         if (R.is_err[str, str](rel_r)) { i = i + 1; cnt; }
         val rel: str = R.unwrap_ok[str, str](rel_r);
@@ -452,59 +373,80 @@ fun generate(alloc: *A.Allocator, p: *driver.Project, api_dir: str, stats: *DocS
             print.eprint("error: failed to write page for ");
             print.eprint(fqn::str);
             print.eprint("\n");
-            fs.close(index);
-            ret 2;
+            ctx.failed = true;
+            ret R.err[R.Void, str]("failed to write a documentation page");
         }
 
-        # index entry: a relative link to the module page.
-        wr(?iw, "- [");
-        wr(?iw, fqn);
-        wr(?iw, "](");
-        wr(?iw, rel);
-        wr(?iw, ".md)\n");
+        wr(iw, "- [");
+        wr(iw, fqn);
+        wr(iw, "](");
+        wr(iw, rel);
+        wr(iw, ".md)\n");
 
         stats.modules = stats.modules + 1;
         stats.entries = stats.entries + documented::u32;
         i = i + 1;
     }
 
-    fs.close(index);
+    if (sink.failed) { ret R.err[R.Void, str]("failed to write the documentation index"); }
+    ret R.ok_void[str]();
+}
+
+fun generate(alloc: *A.Allocator, p: *driver.Project, api_dir: str, stats: *DocStats) i64 {
+    if (O.is_some[str](fs.create_dir_all(alloc, api_dir, 0o755))) {
+        print.eprint("error: could not create output directory\n");
+        ret 2;
+    }
+
+    val idx_r: R.Result[str, str] = path.join(alloc, api_dir, "README.md");
+    if (R.is_err[str, str](idx_r)) { ret 2; }
+    val index_path: str = R.unwrap_ok[str, str](idx_r);
+
+    var ctx: IndexCtx;
+    ctx.alloc   = alloc;
+    ctx.p       = p;
+    ctx.api_dir = api_dir;
+    ctx.stats   = stats;
+    ctx.failed  = false;
+
+    # the index names the pages, so it is published after them and only when
+    # every one of them landed: a reader never follows a link to a missing page
+    if (!publish_page[IndexCtx](alloc, index_path, ?ctx, write_index)) {
+        if (ctx.failed) { ret 2; }
+        print.eprint("error: could not publish the documentation index\n");
+        ret 2;
+    }
     ret 0;
 }
 
-# `mach doc` subcommand entry point: load the project's module graph and
-# generate Markdown reference documentation under `<root>/doc/api`, or a
-# directory given by `--out`
-#
-# Called by cmd.dispatch.
+# `mach doc`: build the project's module graph and write one Markdown page per module plus
+# an index. pages go to `<root>/doc/api/<module path>.md`, or under `--out <dir>` relative
+# to the root, with a README.md index; every `pub` declaration is rendered, documented or
+# not. a summary line prints unless `--quiet`
 # ---
-# argc:  argument count including argv[0]
-# argv:  the argument vector (argc null-terminated byte pointers)
-# marks: consumption record parallel to argv, for the unknown-flag rejector
-# ret:   0 on success, 1 on a user error, 2 on an internal error
-pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
-    val res_config: R.Result[args.CliArgs, str] = args.parse(argc, argv);
-    if (R.is_err[args.CliArgs, str](res_config)) {
+# argv: the full process arguments
+# inv: the parsed invocation for this command
+# ret: 0 success, 1 project or manifest error, 2 allocator, session, registry, or write failure
+pub fun run_typed(argv: **u8, inv: *args.ParsedInvocation) i64 {
+    if (args.reject_unknown_from_invocation(inv, argv, "mach doc")) { ret 1; }
+    val parsed: args.DocInvocation = args.build_doc_invocation(inv);
+    val config_r: R.Result[request.CliArgs, str] = args.build_cli_invocation(args.CMD_DOC, inv, argv);
+    if (R.is_err[request.CliArgs, str](config_r)) {
         print.eprint("error: ");
-        print.eprint(R.unwrap_err[args.CliArgs, str](res_config));
+        print.eprint(R.unwrap_err[request.CliArgs, str](config_r));
         print.eprint("\n");
         ret 1;
     }
-    val config: args.CliArgs = R.unwrap_ok[args.CliArgs, str](res_config);
+    var config: request.CliArgs = R.unwrap_ok[request.CliArgs, str](config_r);
+    var sel: manifest.Selection;
+    val sel_r: R.Result[R.Void, str] = args.selection_from_config(?config, ?sel);
+    if (R.is_err[R.Void, str](sel_r)) {
+        print.eprint("error: ");
+        print.eprint(R.unwrap_err[R.Void, str](sel_r));
+        print.eprint("\n");
+        ret 1;
+    }
 
-    # mark the flags `mach doc` accepts from their tables - the cross-cutting set
-    # (`parse` read their values) and `--out` (doc's own) - then read `--out`'s
-    # value and reject any unrecognized flag before the project-path positional is
-    # resolved.
-    args.mark_cross(marks, argc, argv);
-    args.mark_flags(marks, argc, argv, ?args.DOC_OWN[0], args.DOC_OWN_N);
-    val opt_out: O.Option[*u8] = util.flag_value(argc, argv, "--out");
-    if (util.flag_reject_unknown(argc, argv, marks, 2, "mach doc")) { ret 1; }
-
-    # back the allocation-heavy compile with an arena over the page allocator,
-    # matching build/run/test/check: the page allocator mmaps once per
-    # allocation, so the module-graph build is suballocated through the arena and
-    # reclaimed in a single arena.dnit.
     var backing: A.Allocator;
     if (O.is_some[str](page.make(?backing))) {
         print.eprint("error: failed to initialise allocator\n");
@@ -522,21 +464,19 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         ret 2;
     }
 
-    # resolve the project root from the required positional path
-    # (`mach doc <path>`); see util.resolve_project_root for the rules.
-    val path_index: usize = util.arg_index_positional(argc, argv, marks, 2);
     var arg: *u8 = nil;
-    if (path_index < argc) { arg = argv[path_index]; }
+    if (parsed.has_project) { arg = argv[parsed.project_idx]; }
 
-    val root_r: R.Result[str, str] = util.resolve_project_root(?alloc, arg);
-    if (R.is_err[str, str](root_r)) {
+    val loc_r: R.Result[util.ProjectLocation, str] = util.resolve_project_location(?alloc, arg);
+    if (R.is_err[util.ProjectLocation, str](loc_r)) {
         print.eprint("error: ");
-        print.eprint(R.unwrap_err[str, str](root_r));
+        print.eprint(R.unwrap_err[util.ProjectLocation, str](loc_r));
         print.eprint("\n");
         arena.dnit(?ar);
         ret 1;
     }
-    val root: str = R.unwrap_ok[str, str](root_r);
+    val loc: util.ProjectLocation = R.unwrap_ok[util.ProjectLocation, str](loc_r);
+    val root: str = loc.root;
 
     val res_session: R.Result[session.Session, str] = session.init(?alloc);
     if (R.is_err[session.Session, str](res_session)) {
@@ -546,33 +486,32 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
     }
     var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
 
-    val res_register: R.Result[bool, str] = target.register_all(?s.registry);
-    if (R.is_err[bool, str](res_register)) {
+    val res_register: R.Result[R.Void, str] = driver.setup_registry(?s.registry);
+    if (R.is_err[R.Void, str](res_register)) {
         print.eprint("error: failed to register targets\n");
         session.dnit(?s);
         arena.dnit(?ar);
         ret 2;
     }
 
-    var target_name: *u8 = config.target;
-    if (target_name == nil) { target_name = ""; }
-
-    val res_project: R.Result[driver.Project, outcome.Fail] = driver.build_project(?s, root, target_name);
+    val res_project: R.Result[driver.Project, outcome.Fail] = driver.build_project(?s, root, ?sel);
+    if (diagnostic.len(?s.diags) > 0) {
+        var err_w: writer.Writer = fs.writer(fs.STDERR);
+        cli_diag.flush(?err_w, ?s, ?s.diags);
+    }
     if (R.is_err[driver.Project, outcome.Fail](res_project)) {
-        print.eprint("error: ");
-        print.eprint(R.unwrap_err[driver.Project, outcome.Fail](res_project).message);
-        print.eprint("\n");
+        var f: outcome.Fail = R.unwrap_err[driver.Project, outcome.Fail](res_project);
+        val code: i64 = cli_diag.render_fail(?f);
         session.dnit(?s);
         arena.dnit(?ar);
-        ret 1;
+        ret code;
     }
     var p: driver.Project = R.unwrap_ok[driver.Project, outcome.Fail](res_project);
 
-    # resolve the output directory: --out <dir> (read above) rooted at the project
-    # root, or the default doc/api.
     var leaf: str = "doc/api";
-    if (O.is_some[*u8](opt_out)) { leaf = O.unwrap[*u8](opt_out)::str; }
-    val api_r: R.Result[str, str] = path.join(?alloc, root, leaf);
+    if (parsed.has_out) { leaf = argv[parsed.out_idx]::str; }
+    var api_r: R.Result[str, str] = path.join(?alloc, root, leaf);
+    if (path.is_abs(leaf)) { api_r = path.clone(?alloc, leaf); }
     if (R.is_err[str, str](api_r)) {
         print.eprint("error: out of memory\n");
         session.dnit(?s);
@@ -587,7 +526,7 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
 
     val code: i64 = generate(?alloc, ?p, api_dir, ?stats);
 
-    if (code == 0 && !config.quiet) {
+    if (code == 0 && !parsed.quiet) {
         print.print("documented ");
         print.u64(stats.entries::u64);
         print.print(" public entities across ");
@@ -603,24 +542,12 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
     ret code;
 }
 
-# a fixed in-memory capture buffer for the rendering tests
-# ---
-# buf: destination bytes
-# cap: capacity of buf
-# len: bytes captured so far
 rec Sink {
     buf: *u8;
     cap: usize;
     len: usize;
 }
 
-# Writer callback that appends bytes to a Sink, dropping any overflow past the
-# buffer's capacity
-# ---
-# ctx: the backing Sink, as an opaque pointer
-# buf: bytes to append
-# len: number of bytes offered
-# ret: always Ok(len) so write_all completes
 fun sink_write(ctx: ptr, buf: *u8, len: usize) R.Result[usize, str] {
     val sk: *Sink = ctx::*Sink;
     var i: usize = 0;
@@ -632,10 +559,6 @@ fun sink_write(ctx: ptr, buf: *u8, len: usize) R.Result[usize, str] {
     ret R.ok[usize, str](len);
 }
 
-# a span covering the whole of `s` from offset 0, for the tests
-# ---
-# s:   the source string
-# ret: a span over all of `s`
 fun t_doc_span(s: str) token.Span {
     var sp: token.Span;
     sp.offset = 0;
@@ -643,13 +566,6 @@ fun t_doc_span(s: str) token.Span {
     ret sp;
 }
 
-# render `doc` over `source` through write_doc into a buffer and compare the
-# captured bytes to `expect`
-# ---
-# source: source text the doc span points into
-# doc:    doc-block span to render
-# expect: the exact bytes write_doc should produce
-# ret:    true when the rendered output equals `expect`
 fun t_render_eq(source: str, doc: token.Span, expect: str) bool {
     var buf: [512]u8;
     var sk:  Sink;
@@ -674,17 +590,10 @@ fun t_render_eq(source: str, doc: token.Span, expect: str) bool {
     ret true;
 }
 
-# whether the bytes of `source` at `off` begin with the literal `lit`
-# ---
-# source: source text
-# off:    offset to test
-# lit:    expected literal
-# ret:    true on a prefix match
 fun t_at(source: str, off: usize, lit: str) bool {
     ret string.str_region_equals(source, off, string.str_len(lit), lit);
 }
 
-# summary then components from a first-class doc span
 test "mach.cli.cmd.doc.write_doc:summary_then_components" {
     val source: str = "# sum two integers\n# ---\n# a: first addend\n# b: second addend\n# ret: the sum";
     if (!t_render_eq(source, t_doc_span(source),
@@ -692,14 +601,12 @@ test "mach.cli.cmd.doc.write_doc:summary_then_components" {
     ret 0;
 }
 
-# a summary-only doc renders just the summary
 test "mach.cli.cmd.doc.write_doc:summary_only" {
     val source: str = "# yield the CPU to other threads";
     if (!t_render_eq(source, t_doc_span(source), "yield the CPU to other threads\n\n")) { ret 1; }
     ret 0;
 }
 
-# an empty doc span renders nothing
 test "mach.cli.cmd.doc.write_doc:empty_span" {
     var doc: token.Span;
     doc.offset = 0;
@@ -708,7 +615,6 @@ test "mach.cli.cmd.doc.write_doc:empty_span" {
     ret 0;
 }
 
-# a wrapped component description drops its continuation '#'
 test "mach.cli.cmd.doc.write_doc:wrapped_component" {
     val source: str = "# wrapped\n# ---\n# a: long line\n#    wraps here\n# b: short";
     if (!t_render_eq(source, t_doc_span(source),
@@ -716,7 +622,6 @@ test "mach.cli.cmd.doc.write_doc:wrapped_component" {
     ret 0;
 }
 
-# skip_decorators advances past #[...] to the declaration keyword
 test "mach.cli.cmd.doc.skip_decorators" {
     val own: str = "#[symbol(\"_start\")]\npub fun entry() i64 { ret 0; }";
     if (!t_at(own, skip_decorators(own::*u8, 0), "pub fun")) { ret 1; }
@@ -732,14 +637,182 @@ test "mach.cli.cmd.doc.skip_decorators" {
     ret 0;
 }
 
-# generate creates the full output path when the project has no pre-existing
-# doc/ directory (#1987): a fresh scaffold, then generate into <root>/doc/api,
-# whose <root>/doc parent does not exist yet
+fun t_scratch_project(alloc: *A.Allocator, root_buf: *u8) bool {
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "mach_doc_test");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret false; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tp:   *u8   = fs.temp_path(?tf)::*u8;
+    val tlen: usize = str_len(tp);
+    val fits: bool  = tlen + 1 <= 4096;
+    if (fits) {
+        var j: usize = 0;
+        for (j < tlen) { root_buf[j] = tp[j]; j = j + 1; }
+        root_buf[tlen] = 0;
+    }
+    fs.temp_close_and_remove(?tf);
+    if (!fits) { ret false; }
+
+    val root: str = root_buf::str;
+    val src_dir: str = t_join(alloc, root, "src");
+    if (O.is_some[str](fs.create_dir_all(alloc, root, 493)))    { ret false; }
+    if (O.is_some[str](fs.create_dir_all(alloc, src_dir, 493))) { ret false; }
+
+    val manifest_text: str = "[project]\nid = \"doctest\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n\n[artifact.doctest]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/doctest\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+    val main_text: str = "fun main() i32 { ret 0; }\n";
+    val mf: str = t_join(alloc, root, util.PROJECT_CONFIG_NAME);
+    val mn: str = t_join(alloc, src_dir, "main.mach");
+    if (O.is_some[str](fs.write_bytes(mf, manifest_text::*u8, str_len(manifest_text::*u8), 420))) { ret false; }
+    if (O.is_some[str](fs.write_bytes(mn, main_text::*u8, str_len(main_text::*u8), 420)))         { ret false; }
+    ret true;
+}
+
+test "mach.cli.cmd.doc.run_typed:unknown_flag_is_rejected_but_the_same_project_alone_succeeds" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var root: [4096]u8;
+    if (!t_scratch_project(?alloc, ?root[0])) { fs.remove_all(?alloc, ?root[0]); ret 1; }
+
+    var av_ok: [3]*u8;
+    av_ok[0] = "mach"::*u8; av_ok[1] = "doc"::*u8; av_ok[2] = ?root[0];
+    var a_ok: A.Allocator;
+    if (O.is_some[str](page.make(?a_ok))) { fs.remove_all(?alloc, ?root[0]); ret 1; }
+    val ir_ok: R.Result[args.ParsedInvocation, str] = args.parse_invocation(?a_ok, 3, ?av_ok[0]);
+    if (R.is_err[args.ParsedInvocation, str](ir_ok)) { fs.remove_all(?alloc, ?root[0]); ret 1; }
+    var inv_ok: args.ParsedInvocation = R.unwrap_ok[args.ParsedInvocation, str](ir_ok);
+    val rc_ok: i64 = run_typed(?av_ok[0], ?inv_ok);
+    if (rc_ok != 0) { fs.remove_all(?alloc, ?root[0]); ret 1; }
+
+    var av_bad: [4]*u8;
+    av_bad[0] = "mach"::*u8; av_bad[1] = "doc"::*u8; av_bad[2] = ?root[0]; av_bad[3] = "--bogus"::*u8;
+    var a_bad: A.Allocator;
+    if (O.is_some[str](page.make(?a_bad))) { fs.remove_all(?alloc, ?root[0]); ret 1; }
+    val ir_bad: R.Result[args.ParsedInvocation, str] = args.parse_invocation(?a_bad, 4, ?av_bad[0]);
+    if (R.is_err[args.ParsedInvocation, str](ir_bad)) { fs.remove_all(?alloc, ?root[0]); ret 1; }
+    var inv_bad: args.ParsedInvocation = R.unwrap_ok[args.ParsedInvocation, str](ir_bad);
+    val rc_bad: i64 = run_typed(?av_bad[0], ?inv_bad);
+
+    fs.remove_all(?alloc, ?root[0]);
+    if (rc_bad != 1) { ret 1; }
+    ret 0;
+}
+
+fun t_doc_run(argc: usize, argv: **u8) i64 {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 2; }
+    val ir: R.Result[args.ParsedInvocation, str] = args.parse_invocation(?a, argc, argv);
+    if (R.is_err[args.ParsedInvocation, str](ir)) { ret 2; }
+    var inv: args.ParsedInvocation = R.unwrap_ok[args.ParsedInvocation, str](ir);
+    ret run_typed(argv, ?inv);
+}
+
+fun t_scratch_two_artifacts(alloc: *A.Allocator, root_buf: *u8) bool {
+    if (!t_scratch_project(alloc, root_buf)) { ret false; }
+    val root: str = root_buf::str;
+    val manifest_text: str = "[project]\nid = \"doctest\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[target.windows]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\n\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n\n[artifact.a]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/a\"\ntargets = [\"linux\"]\nlink = []\nneed = []\n\n[artifact.b]\nkind = \"bin\"\nentry = \"win.mach\"\nout = \"bin/b.exe\"\ntargets = [\"windows\"]\nlink = []\nneed = []\n";
+    val win_text: str = "fun main() i32 { ret 1; }\n";
+    val mf: str = t_join(alloc, root, util.PROJECT_CONFIG_NAME);
+    val wn: str = t_join(alloc, t_join(alloc, root, "src"), "win.mach");
+    if (O.is_some[str](fs.write_bytes(mf, manifest_text::*u8, str_len(manifest_text::*u8), 420))) { ret false; }
+    if (O.is_some[str](fs.write_bytes(wn, win_text::*u8, str_len(win_text::*u8), 420)))           { ret false; }
+    ret true;
+}
+
+test "mach.cli.cmd.doc.run_typed:selects_the_artifact_for_the_target_like_build_and_takes_bin_and_lib" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var root: [4096]u8;
+    if (!t_scratch_two_artifacts(?alloc, ?root[0])) { fs.remove_all(?alloc, ?root[0]); ret 1; }
+    var bad: i32 = 0;
+
+    var av: [9]*u8;
+    av[0] = "mach"::*u8; av[1] = "doc"::*u8; av[2] = ?root[0]; av[3] = "--quiet"::*u8;
+
+    av[4] = "--target"::*u8; av[5] = "linux"::*u8;
+    if (t_doc_run(6, ?av[0]) != 0) { bad = 1; }
+    av[5] = "windows"::*u8;
+    if (t_doc_run(6, ?av[0]) != 0) { bad = 2; }
+
+    av[4] = "--bin"::*u8; av[5] = "b"::*u8; av[6] = "--target"::*u8; av[7] = "windows"::*u8;
+    if (t_doc_run(8, ?av[0]) != 0) { bad = 3; }
+    av[5] = "a"::*u8;
+    if (t_doc_run(8, ?av[0]) != 1) { bad = 4; }
+    av[5] = "nonesuch"::*u8;
+    if (t_doc_run(8, ?av[0]) != 1) { bad = 5; }
+
+    av[4] = "--bin"::*u8; av[5] = "a"::*u8; av[6] = "--lib"::*u8; av[7] = "a"::*u8;
+    if (t_doc_run(8, ?av[0]) != 1) { bad = 6; }
+
+    fs.remove_all(?alloc, ?root[0]);
+    ret bad;
+}
+
+test "mach.cli.cmd.doc.build_project:the_first_declared_fallback_records_the_deprecation_warning" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var root: [4096]u8;
+    if (!t_scratch_project(?alloc, ?root[0])) { fs.remove_all(?alloc, ?root[0]); ret 1; }
+    val manifest_text: str = "[project]\nid = \"doctest\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n\n[artifact.first]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/first\"\ntargets = [\"*\"]\nlink = []\nneed = []\n\n[artifact.second]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/second\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+    val mf: str = t_join(?alloc, ?root[0], util.PROJECT_CONFIG_NAME);
+    if (O.is_some[str](fs.write_bytes(mf, manifest_text::*u8, str_len(manifest_text::*u8), 420))) { fs.remove_all(?alloc, ?root[0]); ret 1; }
+
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { fs.remove_all(?alloc, ?root[0]); ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[R.Void, str](driver.setup_registry(?s.registry))) {
+        session.dnit(?s); fs.remove_all(?alloc, ?root[0]); ret 1;
+    }
+    var sel: manifest.Selection;
+    sel.target = "linux"; sel.profile = ""; sel.artifact = ""; sel.want_lib = false; sel.has_artifact = false; sel.legacy_default = false;
+    val pr: R.Result[driver.Project, outcome.Fail] = driver.build_project(?s, ?root[0], ?sel);
+    var bad: i32 = 0;
+    if (R.is_err[driver.Project, outcome.Fail](pr)) { bad = 1; }
+    or {
+        var p: driver.Project = R.unwrap_ok[driver.Project, outcome.Fail](pr);
+        var seen: bool = false;
+        var i: usize = 0;
+        for (i < diagnostic.len(?s.diags)) {
+            val d: *diagnostic.Diagnostic = ?s.diags.items.data[i];
+            if (d.severity == diagnostic.SEVERITY_WARNING
+                && str_contains(d.message, "several artifacts are declared and none is marked `default = true`")) { seen = true; }
+            i = i + 1;
+        }
+        if (!seen) { bad = 2; }
+        driver.dnit_project(?p);
+    }
+    session.dnit(?s);
+    fs.remove_all(?alloc, ?root[0]);
+    ret bad;
+}
+
+test "mach.cli.cmd.doc.run_typed:a_relative_out_is_project_rooted_and_an_absolute_out_is_used_as_given" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var root: [4096]u8;
+    if (!t_scratch_project(?alloc, ?root[0])) { fs.remove_all(?alloc, ?root[0]); ret 1; }
+    var elsewhere: [4096]u8;
+    if (!t_scratch_project(?alloc, ?elsewhere[0])) { fs.remove_all(?alloc, ?root[0]); fs.remove_all(?alloc, ?elsewhere[0]); ret 1; }
+    var bad: i32 = 0;
+
+    var av: [6]*u8;
+    av[0] = "mach"::*u8; av[1] = "doc"::*u8; av[2] = ?root[0]; av[3] = "--quiet"::*u8; av[4] = "--out"::*u8; av[5] = "pages"::*u8;
+    if (t_doc_run(6, ?av[0]) != 0) { bad = 1; }
+    if (!fs.exists(t_join(?alloc, t_join(?alloc, ?root[0], "pages"), "README.md"))) { bad = 2; }
+
+    val abs_out: str = t_join(?alloc, ?elsewhere[0], "api");
+    av[5] = abs_out::*u8;
+    if (t_doc_run(6, ?av[0]) != 0) { bad = 3; }
+    if (!fs.exists(t_join(?alloc, abs_out, "README.md"))) { bad = 4; }
+    if (fs.exists(t_join(?alloc, ?root[0], abs_out))) { bad = 5; }
+
+    fs.remove_all(?alloc, ?root[0]);
+    fs.remove_all(?alloc, ?elsewhere[0]);
+    ret bad;
+}
+
 test "mach.cli.cmd.doc.generate:creates_missing_output_dirs" {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }
 
-    # scaffold a minimal single-target project on disk, with NO doc/ dir.
     val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "mach_doc_test");
     if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
     var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
@@ -772,17 +845,18 @@ test "mach.cli.cmd.doc.generate:creates_missing_output_dirs" {
     val sr: R.Result[session.Session, str] = session.init(?alloc);
     if (R.is_err[session.Session, str](sr)) { fs.remove_all(?alloc, ?root[0]); ret 1; }
     var s: session.Session = R.unwrap_ok[session.Session, str](sr);
-    if (R.is_err[bool, str](target.register_all(?s.registry))) {
+    if (R.is_err[R.Void, str](driver.setup_registry(?s.registry))) {
         session.dnit(?s); fs.remove_all(?alloc, ?root[0]); ret 1;
     }
 
-    val pr: R.Result[driver.Project, outcome.Fail] = driver.build_project(?s, ?root[0], "linux");
+    var sel: manifest.Selection;
+    sel.target = "linux"; sel.profile = ""; sel.artifact = ""; sel.want_lib = false; sel.has_artifact = false; sel.legacy_default = false;
+    val pr: R.Result[driver.Project, outcome.Fail] = driver.build_project(?s, ?root[0], ?sel);
     if (R.is_err[driver.Project, outcome.Fail](pr)) {
         session.dnit(?s); fs.remove_all(?alloc, ?root[0]); ret 1;
     }
     var p: driver.Project = R.unwrap_ok[driver.Project, outcome.Fail](pr);
 
-    # <root>/doc/api - neither doc/ nor doc/api exists yet.
     val api_dir: str = t_join(?alloc, (?root[0])::str, "doc/api");
 
     var stats: DocStats;
@@ -794,16 +868,116 @@ test "mach.cli.cmd.doc.generate:creates_missing_output_dirs" {
     val readme: str = t_join(?alloc, api_dir, "README.md");
     if (!fs.is_file(readme)) { bad = 1; }
 
+    # the index is published whole, so existence is not the property: a
+    # truncated or empty index is exactly what a partial write would leave
+    val idx_r: R.Result[str, str] = fs.read_string(?alloc, readme);
+    if (R.is_err[str, str](idx_r)) { bad = 1; }
+    or {
+        val idx: str = R.unwrap_ok[str, str](idx_r);
+        if (!str_contains(idx, "# API reference"))          { bad = 1; }
+        if (!str_contains(idx, "- [doctest.main](doctest/main.md)")) { bad = 1; }
+    }
+
+    # and the page it links to holds the declaration it was generated for
+    val pagep: str = t_join(?alloc, api_dir, "doctest/main.md");
+    val page_r: R.Result[str, str] = fs.read_string(?alloc, pagep);
+    if (R.is_err[str, str](page_r)) { bad = 1; }
+    or {
+        val pg: str = R.unwrap_ok[str, str](page_r);
+        if (!str_contains(pg, "# doctest.main"))            { bad = 1; }
+        if (!str_contains(pg, "a documented helper"))       { bad = 1; }
+    }
+
     driver.dnit_project(?p);
     session.dnit(?s);
     fs.remove_all(?alloc, ?root[0]);
     ret bad;
 }
 
-# join two path segments, allocated from `a`; the base names the failure case
-# (a test-local convenience mirroring the driver's ut_cc3)
 fun t_join(a: *A.Allocator, base: str, leaf: str) str {
     val r: R.Result[str, str] = path.join(a, base, leaf);
     if (R.is_err[str, str](r)) { ret base; }
     ret R.unwrap_ok[str, str](r);
+}
+
+fun t_failing_write(ctx: ptr, buf: *u8, len: usize) R.Result[usize, str] {
+    ret R.err[usize, str]("injected write failure");
+}
+
+fun t_failing_writer() writer.Writer {
+    var w: writer.Writer;
+    w.ctx     = nil;
+    w.f_write = t_failing_write;
+    ret w;
+}
+
+fun t_always_fails(ctx: *PageCtx, w: *writer.Writer) R.Result[R.Void, str] {
+    ret R.err[R.Void, str]("injected page failure");
+}
+
+# a write that fails deep in the page walk is not silently dropped: `wr` cannot
+# report it, so the sink latches it and the callback reports it once
+test "mach.cli.cmd.doc.write_page:a_failed_write_fails_the_callback" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+
+    var empty: ast.Ast = ast.init(?alloc, 0::src.FileId);
+    var failing: writer.Writer = t_failing_writer();
+
+    var ctx: PageCtx;
+    ctx.a          = ?empty;
+    ctx.source     = "";
+    ctx.fqn        = "m"::*u8;
+    ctx.documented = 0;
+
+    val r: R.Result[R.Void, str] = write_page(?ctx, ?failing);
+    if (R.is_ok[R.Void, str](r)) { ret 1; }
+    ret 0;
+}
+
+# and a callback that reports a failure publishes nothing: the transaction
+# aborts, so the destination keeps whatever it held before
+test "mach.cli.cmd.doc.publish_page:a_failed_callback_leaves_the_destination_alone" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "mach_doc_publish");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val dir: str = t_join(?alloc, fs.temp_path(?tf), "");
+    fs.temp_close_and_remove(?tf);
+    if (O.is_some[str](fs.create_dir_all(?alloc, dir, 493))) { ret 1; }
+
+    var bad: i32 = 0;
+
+    # an existing page the failed publication must not disturb
+    val kept: str = t_join(?alloc, dir, "kept.md");
+    val prior: str = "# previous\n";
+    if (O.is_some[str](fs.write_bytes(kept, prior::*u8, str_len(prior), 420))) { bad = 1; }
+
+    var empty: ast.Ast = ast.init(?alloc, 0::src.FileId);
+    var ctx: PageCtx;
+    ctx.a          = ?empty;
+    ctx.source     = "";
+    ctx.fqn        = "m"::*u8;
+    ctx.documented = 0;
+
+    if (bad == 0 && publish_page[PageCtx](?alloc, kept, ?ctx, t_always_fails)) { bad = 2; }
+
+    # the previous content is still there, whole
+    if (bad == 0) {
+        val back_r: R.Result[str, str] = fs.read_string(?alloc, kept);
+        if (R.is_err[str, str](back_r)) { bad = 3; }
+        or (!str_equals(R.unwrap_ok[str, str](back_r), prior)) { bad = 4; }
+    }
+
+    # a destination that did not exist stays absent rather than appearing empty
+    if (bad == 0) {
+        val fresh: str = t_join(?alloc, dir, "fresh.md");
+        if (publish_page[PageCtx](?alloc, fresh, ?ctx, t_always_fails)) { bad = 5; }
+        or (fs.exists(fresh)) { bad = 6; }
+    }
+
+    fs.remove_all(?alloc, dir);
+    ret bad;
 }

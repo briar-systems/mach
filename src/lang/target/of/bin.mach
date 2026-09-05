@@ -1,17 +1,3 @@
-# shared binary-IO support for the object formats
-#
-# The ELF, COFF, and Mach-O writers - and the linker's executable patcher - all
-# serialize and parse the same little-endian integer fields, write the same
-# null-terminated names, and align the same file/virtual cursors. This module
-# owns that mechanical layer so the format files carry only format knowledge and
-# the three copies of these helpers cannot drift apart.
-#
-# It also owns the bounds-checked side every parser needs: `region_ok` /
-# `require_region` validate a header-derived `offset + len` against the input
-# size before any dereference, and `cstr_at` reads a name only when it is
-# terminated inside the buffer - so a truncated or hostile `.o`/`.a` errors
-# loudly instead of walking off the end of the mapped bytes.
-
 use std.memory;
 use std.format;
 use std.crypto.rand;
@@ -28,26 +14,20 @@ use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 use fs: std.filesystem;
+use io_error: std.io.error;
 use spath: std.types.path;
 
+use txn: std.filesystem.transaction;
 use mach.lang.intern;
+use mach.lang.layout;
 use mach.lang.target.of;
+use mach.lang.publication;
 
-# write `value` as a little-endian u16 into `buf` at `offset`
-# ---
-# buf:    destination buffer
-# offset: byte offset of the field
-# value:  the value to encode
 pub fun write_u16_le(buf: *u8, offset: usize, value: u16) {
     buf[offset]     = (value & 0xFF)::u8;
     buf[offset + 1] = ((value >> 8) & 0xFF)::u8;
 }
 
-# write `value` as a little-endian u32 into `buf` at `offset`
-# ---
-# buf:    destination buffer
-# offset: byte offset of the field
-# value:  the value to encode
 pub fun write_u32_le(buf: *u8, offset: usize, value: u32) {
     buf[offset]     = (value & 0xFF)::u8;
     buf[offset + 1] = ((value >> 8) & 0xFF)::u8;
@@ -55,24 +35,11 @@ pub fun write_u32_le(buf: *u8, offset: usize, value: u32) {
     buf[offset + 3] = ((value >> 24) & 0xFF)::u8;
 }
 
-# write `value` as a little-endian u64 into `buf` at `offset`
-# ---
-# buf:    destination buffer
-# offset: byte offset of the field
-# value:  the value to encode
 pub fun write_u64_le(buf: *u8, offset: usize, value: u64) {
     write_u32_le(buf, offset,     (value & 0xFFFFFFFF)::u32);
     write_u32_le(buf, offset + 4, ((value >> 32) & 0xFFFFFFFF)::u32);
 }
 
-# write `value` as a big-endian u32 into `buf` at `offset`
-#
-# Mach-O is little-endian, but its embedded code-signing structures
-# (SuperBlob / CodeDirectory) are big-endian, so the Mach-O writer needs this form.
-# ---
-# buf:    destination buffer
-# offset: byte offset of the field
-# value:  the value to encode
 pub fun write_u32_be(buf: *u8, offset: usize, value: u32) {
     buf[offset]     = ((value >> 24) & 0xFF)::u8;
     buf[offset + 1] = ((value >> 16) & 0xFF)::u8;
@@ -80,64 +47,29 @@ pub fun write_u32_be(buf: *u8, offset: usize, value: u32) {
     buf[offset + 3] = (value & 0xFF)::u8;
 }
 
-# write `value` as a big-endian u64 into `buf` at `offset`
-# ---
-# buf:    destination buffer
-# offset: byte offset of the field
-# value:  the value to encode
 pub fun write_u64_be(buf: *u8, offset: usize, value: u64) {
     write_u32_be(buf, offset,     ((value >> 32) & 0xFFFFFFFF)::u32);
     write_u32_be(buf, offset + 4, (value & 0xFFFFFFFF)::u32);
 }
 
-# read a little-endian u16 from `buf` at `offset`
-# ---
-# buf:    source buffer
-# offset: byte offset of the field
-# ret:    the decoded value
 pub fun read_u16_le(buf: *u8, offset: usize) u16 {
     ret buf[offset]::u16 | (buf[offset + 1]::u16 << 8);
 }
 
-# read a little-endian u32 from `buf` at `offset`
-# ---
-# buf:    source buffer
-# offset: byte offset of the field
-# ret:    the decoded value
 pub fun read_u32_le(buf: *u8, offset: usize) u32 {
     ret buf[offset]::u32 | (buf[offset + 1]::u32 << 8)
       | (buf[offset + 2]::u32 << 16) | (buf[offset + 3]::u32 << 24);
 }
 
-# read a big-endian u32 from `buf` at `offset`, the form the Mach-O code-signing
-# structures use
-# ---
-# buf:    source buffer
-# offset: byte offset of the field
-# ret:    the decoded value
 pub fun read_u32_be(buf: *u8, offset: usize) u32 {
     ret (buf[offset]::u32 << 24) | (buf[offset + 1]::u32 << 16)
       | (buf[offset + 2]::u32 << 8) | buf[offset + 3]::u32;
 }
 
-# read a little-endian u64 from `buf` at `offset`
-# ---
-# buf:    source buffer
-# offset: byte offset of the field
-# ret:    the decoded value
 pub fun read_u64_le(buf: *u8, offset: usize) u64 {
     ret read_u32_le(buf, offset)::u64 | (read_u32_le(buf, offset + 4)::u64 << 32);
 }
 
-# write `s` as a null-terminated string into `buf` at `offset`, returning the
-# bytes written (name length plus the terminator)
-#
-# A nil name writes a lone terminator.
-# ---
-# buf:    destination buffer
-# offset: byte offset to write at
-# s:      the string to write (nil writes only the terminator)
-# ret:    bytes written, including the terminator
 pub fun write_str(buf: *u8, offset: usize, s: str) usize {
     if (s == nil) {
         buf[offset] = 0;
@@ -149,69 +81,86 @@ pub fun write_str(buf: *u8, offset: usize, s: str) usize {
     ret len + 1;
 }
 
-# align `value` up to the given power-of-two `alignment` (0 leaves it unchanged)
-# ---
-# value:     the value to align
-# alignment: the power-of-two alignment, or 0 for no change
-# ret:       the aligned value
 pub fun align_up(value: usize, alignment: usize) usize {
     if (alignment == 0) { ret value; }
     ret (value + alignment - 1) & ~(alignment - 1);
 }
 
-# align a u64 `value` up to the given power-of-two `alignment` (0 leaves it unchanged)
-# ---
-# value:     the value to align
-# alignment: the power-of-two alignment, or 0 for no change
-# ret:       the aligned value
 pub fun align_up_u64(value: u64, alignment: u64) u64 {
     if (alignment == 0) { ret value; }
     ret (value + alignment - 1) & ~(alignment - 1);
 }
 
-# whether the byte range [offset, offset + len) lies fully within a buffer of
-# `buf_size` bytes
-#
-# Computed without overflow (len <= buf_size - offset) so a wrapped offset + len
-# from a hostile file field can never spuriously pass.
-# ---
-# buf_size: length of the buffer
-# offset:   start of the range to validate
-# len:      length of the range to validate
-# ret:      true when the range lies within the buffer
+pub rec Layout {
+    end:      usize;
+    ok:       bool;
+    culprit:  str;
+    expected: usize;
+    found:    usize;
+}
+
+pub fun layout_init(l: *Layout) {
+    l.end      = 0;
+    l.ok       = true;
+    l.culprit  = "";
+    l.expected = 0;
+    l.found    = 0;
+}
+
+pub fun layout_pad(l: *Layout, name: str, to: usize) {
+    if (!l.ok)      { ret; }
+    if (to < l.end) {
+        l.ok       = false;
+        l.culprit  = name;
+        l.expected = l.end;
+        l.found    = to;
+        ret;
+    }
+    l.end = to;
+}
+
+pub fun layout_region(l: *Layout, name: str, offset: usize, len: usize) {
+    if (!l.ok)          { ret; }
+    if (offset != l.end) {
+        l.ok       = false;
+        l.culprit  = name;
+        l.expected = l.end;
+        l.found    = offset;
+        ret;
+    }
+    l.end = offset + len;
+}
+
+pub fun layout_seal(l: *Layout, a: *A.Allocator, fmt: str, planned: usize) R.Result[R.Void, str] {
+    if (!l.ok) {
+        val r: R.Result[str, str] = format.sprint(a,
+            "{}: the `{}` region starts at byte {} but the regions before it end at byte {}; the writer's layout does not tile the file it planned",
+            fmt, l.culprit, l.found::u64, l.expected::u64);
+        if (R.is_err[str, str](r)) { ret R.err[R.Void, str](LAYOUT_GENERIC); }
+        ret R.err[R.Void, str](R.unwrap_ok[str, str](r));
+    }
+    if (l.end != planned) {
+        val r: R.Result[str, str] = format.sprint(a,
+            "{}: the writer planned a {}-byte file and laid out {} bytes; a planned size and the bytes written must agree exactly, never by truncation or padding",
+            fmt, planned::u64, l.end::u64);
+        if (R.is_err[str, str](r)) { ret R.err[R.Void, str](LAYOUT_GENERIC); }
+        ret R.err[R.Void, str](R.unwrap_ok[str, str](r));
+    }
+    ret R.ok_void[str]();
+}
+
+val LAYOUT_GENERIC: str = "object writer: the planned file size and the bytes laid out disagree";
+
 pub fun region_ok(buf_size: usize, offset: usize, len: usize) bool {
-    if (offset > buf_size)       { ret false; }
-    if (len > buf_size - offset) { ret false; }
-    ret true;
+    ret layout.range_fits[layout.ByteUnit](layout.count[layout.ByteUnit](buf_size),
+        layout.offset[layout.ByteUnit](offset), layout.count[layout.ByteUnit](len));
 }
 
-# require that [offset, offset + len) lies within a `buf_size`-byte buffer,
-# failing with `msg` otherwise
-#
-# The up-front guard every parser table walk uses before dereferencing a
-# header-derived offset.
-# ---
-# buf_size: length of the input buffer
-# offset:   start of the range to validate
-# len:      length of the range to validate
-# msg:      diagnostic returned when the range escapes the buffer
-# ret:      ok(true) when in bounds, or err(msg)
-pub fun require_region(buf_size: usize, offset: usize, len: usize, msg: str) R.Result[bool, str] {
-    if (!region_ok(buf_size, offset, len)) { ret R.err[bool, str](msg); }
-    ret R.ok[bool, str](true);
+pub fun require_region(buf_size: usize, offset: usize, len: usize, msg: str) R.Result[R.Void, str] {
+    if (!region_ok(buf_size, offset, len)) { ret R.err[R.Void, str](msg); }
+    ret R.ok_void[str]();
 }
 
-# read a null-terminated name at `offset` only when it is terminated inside the
-# buffer, returning a borrowed str into `buf`
-#
-# An offset at or past the end, or a run with no terminator before `buf_size`,
-# is an error rather than an off-the-end read. The returned pointer is valid
-# only while `buf` lives; callers intern it.
-# ---
-# buf:      the input buffer
-# buf_size: length of `buf`
-# offset:   byte offset of the name's first character
-# ret:      the borrowed name, or an error string
 pub fun cstr_at(buf: *u8, buf_size: usize, offset: usize) R.Result[str, str] {
     if (offset >= buf_size) { ret R.err[str, str]("bin: string offset out of bounds"); }
     var i: usize = offset;
@@ -222,16 +171,6 @@ pub fun cstr_at(buf: *u8, buf_size: usize, offset: usize) R.Result[str, str] {
     ret R.err[str, str]("bin: unterminated string in object");
 }
 
-# resolve an interned StrId to its backing text, or nil for an absent interner or
-# an out-of-range id
-#
-# The result is a borrowed view into the interner, owned by the caller's session.
-# The object writers resolve every symbol / section / library name through this
-# one helper so their nil-guarding stays uniform.
-# ---
-# itn: interner the id was interned into; nil resolves to nil
-# id:  the interned string id to resolve
-# ret: the backing text, or nil when it cannot be resolved
 pub fun resolve_name(itn: *intern.Interner, id: intern.StrId) str {
     if (itn == nil)           { ret nil; }
     if (id == intern.STR_NIL) { ret nil; }
@@ -240,192 +179,22 @@ pub fun resolve_name(itn: *intern.Interner, id: intern.StrId) str {
     ret nil;
 }
 
-# build the interned diagnostic "<prefix><name>", interned through `itn` so it
-# outlives this call
-#
-# Degrades to `generic` when the name is nil, no interner is available, or
-# interning fails under memory pressure - the caller still fails loudly, just
-# without the offending name. Consolidates the per-format unresolved-symbol /
-# unsupported-kind message builders onto one implementation.
-# ---
-# itn:     interner the diagnostic is interned through (nil -> generic)
-# a:       allocator for the scratch concatenation buffer
-# prefix:  the fixed message prefix (e.g. "elf: unsupported relocation kind: ")
-# name:    the variable suffix to append (nil -> generic)
-# generic: the fallback used when the named form cannot be built
-# ret:     the interned named diagnostic, or `generic`
 pub fun name_message(itn: *intern.Interner, a: *A.Allocator, prefix: str, name: str, generic: str) str {
     if (name == nil || itn == nil) { ret generic; }
     val res_msg: R.Result[str, str] = format.sprint(a, "{}{}", prefix, name);
     if (R.is_err[str, str](res_msg)) { ret generic; }
     val buf: str = R.unwrap_ok[str, str](res_msg);
-    ret message_finish(itn, a, buf, str_len(buf), generic);
+    ret publication.intern_message(itn, a, buf, str_len(buf), generic);
 }
 
-# build the interned diagnostic "<prefix><value>" with `value` in decimal,
-# interned through `itn`
-#
-# Degrades to `generic` like `name_message`. Used to name an unknown machine
-# relocation type a parser cannot map to an abstract kind.
-# ---
-# itn:     interner the diagnostic is interned through (nil -> generic)
-# a:       allocator for the scratch buffer
-# prefix:  the fixed message prefix (e.g. "elf: unsupported relocation type ")
-# value:   the numeric suffix, formatted in decimal
-# generic: the fallback used when the formatted form cannot be built
-# ret:     the interned diagnostic, or `generic`
 pub fun number_message(itn: *intern.Interner, a: *A.Allocator, prefix: str, value: u64, generic: str) str {
     if (itn == nil) { ret generic; }
     val res_msg: R.Result[str, str] = format.sprint(a, "{}{}", prefix, value);
     if (R.is_err[str, str](res_msg)) { ret generic; }
     val buf: str = R.unwrap_ok[str, str](res_msg);
-    ret message_finish(itn, a, buf, str_len(buf), generic);
+    ret publication.intern_message(itn, a, buf, str_len(buf), generic);
 }
 
-# build the interned diagnostic "<op> '<path>': <os_error>" naming a failed
-# output I/O operation, the path it was attempted on, and the OS error
-#
-# All three are in scope at the of-layer writers but used to be discarded.
-# Degrades to `generic` when the interner is unavailable or building fails.
-# ---
-# itn:      interner the diagnostic is interned through (nil -> generic)
-# a:        allocator for the scratch buffer
-# op:       the leading text, e.g. "elf: cannot create" or "elf: write failed on"
-# path:     the output path the operation targeted
-# os_error: the OS error string (e.g. from os.message)
-# generic:  the fallback used when the formatted form cannot be built
-# ret:      the interned diagnostic, or `generic`
-pub fun io_message(itn: *intern.Interner, a: *A.Allocator, op: str, path: str, os_error: str, generic: str) str {
-    if (itn == nil || path == nil) { ret generic; }
-    val res_msg: R.Result[str, str] = format.sprint(a, "{} '{}': {}", op, path, os_error);
-    if (R.is_err[str, str](res_msg)) { ret generic; }
-    val buf: str = R.unwrap_ok[str, str](res_msg);
-    ret message_finish(itn, a, buf, str_len(buf), generic);
-}
-
-# write `buf` to `path` by creating a same-directory temp file and atomically
-# renaming it over `path`, rather than truncating `path` in place
-#
-# Writing in place fails with ETXTBSY when `path` is a binary a process is
-# currently executing (or, for a shared object, has mapped executable) - the
-# self-rebuild case #2475 names. Standard toolchain behavior (gcc/clang/go) is
-# to link to a temp file and rename over the target instead: a running process
-# keeps its unlinked image while `path` serves the new binary on the next
-# invocation, and a build killed mid-write never leaves a half-written file at
-# `path` - the temp file is either renamed whole or removed.
-#
-# The temp file MUST share `path`'s directory: `rename` fails with EXDEV
-# across filesystems, and a build output routinely lands on a different
-# filesystem than the OS temp directory (contrast `fs.temp_create`). The temp
-# name carries no exclusivity guarantee (a single random 64-bit suffix, no
-# O_EXCL retry) - collisions are gcc-`ccXXXXXX`-rare and, unlike `path` itself,
-# a clobbered temp file for a concurrent build of the same output belongs to
-# a build that was already racing this one.
-# ---
-# itn:            interner backing the returned diagnostic
-# a:              allocator for the transient temp-path text
-# path:           final destination path
-# buf:            bytes to write
-# len:            byte length of `buf`
-# mode:           permission bits for the created file
-# create_op:      leading diagnostic text for a temp-file create failure
-# create_generic: fallback text when `create_op` cannot be interned
-# write_op:       leading diagnostic text for a write failure
-# write_generic:  fallback text when `write_op` cannot be interned
-# rename_op:      leading diagnostic text for the final rename failure
-# rename_generic: fallback text when `rename_op` cannot be interned
-# ret:              ok(true) on success, or an interned diagnostic naming `path`
-pub fun write_atomic(itn: *intern.Interner, a: *A.Allocator, path: *u8, buf: *u8, len: usize, mode: i32,
-                      create_op: str, create_generic: str,
-                      write_op: str, write_generic: str,
-                      rename_op: str, rename_generic: str) R.Result[bool, str] {
-    val dir_r: R.Result[Path, str] = spath.parent(a, path::str);
-    if (R.is_err[Path, str](dir_r)) { ret R.err[bool, str](R.unwrap_err[Path, str](dir_r)); }
-    val dir: Path = R.unwrap_ok[Path, str](dir_r);
-
-    val name_r: R.Result[str, str] = format.sprint(a, ".{}.tmp{}", spath.filename(path::str), rand.u64());
-    if (R.is_err[str, str](name_r)) {
-        A.deallocate[u8](a, dir, str_len(dir) + 1);
-        ret R.err[bool, str](R.unwrap_err[str, str](name_r));
-    }
-    val tmp_name: str = R.unwrap_ok[str, str](name_r);
-
-    val tmp_r: R.Result[Path, str] = spath.join(a, dir, tmp_name);
-    A.deallocate[u8](a, dir, str_len(dir) + 1);
-    A.deallocate[u8](a, tmp_name, str_len(tmp_name) + 1);
-    if (R.is_err[Path, str](tmp_r)) { ret R.err[bool, str](R.unwrap_err[Path, str](tmp_r)); }
-    val tmp: Path = R.unwrap_ok[Path, str](tmp_r);
-
-    val res_file: R.Result[fs.File, str] = fs.create(tmp, mode);
-    if (R.is_err[fs.File, str](res_file)) {
-        val cm: str = io_message(itn, a, create_op, path::str, R.unwrap_err[fs.File, str](res_file), create_generic);
-        A.deallocate[u8](a, tmp, str_len(tmp) + 1);
-        ret R.err[bool, str](cm);
-    }
-    var f: fs.File = R.unwrap_ok[fs.File, str](res_file);
-    val res_write: R.Result[usize, str] = fs.write(f, buf, len);
-    fs.close(f);
-    if (R.is_err[usize, str](res_write)) {
-        val cm: str = io_message(itn, a, write_op, path::str, R.unwrap_err[usize, str](res_write), write_generic);
-        fs.remove_file(tmp);
-        A.deallocate[u8](a, tmp, str_len(tmp) + 1);
-        ret R.err[bool, str](cm);
-    }
-    # `fs.write` is one `write(2)` call, not a loop to completion: a short write
-    # (a resource limit, an interrupting signal) returns ok() with a byte count
-    # under `len` rather than an error. Left unchecked, that truncated temp file
-    # would still rename over `path`, replacing a good executable with a broken
-    # one and reporting success.
-    if (R.unwrap_ok[usize, str](res_write) != len) {
-        val cm: str = io_message(itn, a, write_op, path::str, "short write", write_generic);
-        fs.remove_file(tmp);
-        A.deallocate[u8](a, tmp, str_len(tmp) + 1);
-        ret R.err[bool, str](cm);
-    }
-
-    var res_rename: O.Option[str] = fs.rename(tmp, path::str);
-    if (O.is_some[str](res_rename)) {
-        # `rename` replacing an existing destination is POSIX-atomic but not
-        # universal: Windows' underlying MoveFile does not replace an existing
-        # file (mach-std's `os.rename` wraps the non-replacing `MoveFileA`,
-        # briar-systems/mach-std#414), so the first attempt fails here on every
-        # target host whenever `path` already exists - the common case, since
-        # this function exists specifically for REBUILDING an existing output.
-        # Falling back to remove-then-retry recovers the common case at the cost
-        # of a brief window (between the remove and the retry) where `path` does
-        # not exist, rather than a true atomic swap - the best available without
-        # a replacing primitive. If the remove fails, nothing was touched and the
-        # original rename error is reported unchanged.
-        if (O.is_some[str](fs.remove_file(path::str))) {
-            val cm: str = io_message(itn, a, rename_op, path::str, O.unwrap[str](res_rename), rename_generic);
-            fs.remove_file(tmp);
-            A.deallocate[u8](a, tmp, str_len(tmp) + 1);
-            ret R.err[bool, str](cm);
-        }
-        res_rename = fs.rename(tmp, path::str);
-        if (O.is_some[str](res_rename)) {
-            val cm: str = io_message(itn, a, rename_op, path::str, O.unwrap[str](res_rename), rename_generic);
-            fs.remove_file(tmp);
-            A.deallocate[u8](a, tmp, str_len(tmp) + 1);
-            ret R.err[bool, str](cm);
-        }
-    }
-
-    A.deallocate[u8](a, tmp, str_len(tmp) + 1);
-    ret R.ok[bool, str](true);
-}
-
-# count the relocations targeting each section of `img` in one pass, returning a
-# `section_count`-long array (`counts[s]` = relocations patching section `s`)
-#
-# Replaces the per-section linear scan both writers ran in four separate layout
-# passes - O(sections x relocations) - with one O(relocations) tally. A
-# relocation whose section index is out of range is ignored here; the writers
-# validate ranges separately. The caller owns and frees the returned array.
-# ---
-# a:   allocator backing the returned array
-# img: the object image whose relocations are tallied
-# ret: the per-section reloc-count array, or an allocation error
 pub fun reloc_counts(a: *A.Allocator, img: *of.ObjectImage) R.Result[*u32, str] {
     val n: usize = img.section_count::usize;
     val res_counts: R.Result[*u32, str] = A.zallocate[u32](a, n);
@@ -440,44 +209,15 @@ pub fun reloc_counts(a: *A.Allocator, img: *of.ObjectImage) R.Result[*u32, str] 
     ret R.ok[*u32, str](counts);
 }
 
-# terminate, intern, and free a freshly built message buffer, returning the
-# interned string or `generic` on any failure
-#
-# `buf` holds `total` message bytes with room for a terminator at `buf[total]`.
-# The buffer is always freed; the interner owns the surviving copy. Shared tail
-# of the message builders so the intern/free/lookup dance lives in one place.
-# ---
-# itn:     interner the message is interned through
-# a:       allocator that produced `buf`
-# buf:     the message bytes, allocated with room for total + 1
-# total:   message length, excluding the terminator
-# generic: the fallback returned when interning or lookup fails
-# ret:     the interned message, or `generic`
-fun message_finish(itn: *intern.Interner, a: *A.Allocator, buf: *u8, total: usize, generic: str) str {
-    buf[total] = 0;
-    val res_id: R.Result[intern.StrId, str] = intern.intern(itn, buf::str);
-    A.deallocate[u8](a, buf, total + 1);
-    if (R.is_err[intern.StrId, str](res_id)) { ret generic; }
-    val opt_name: O.Option[str] = intern.lookup(itn, R.unwrap_ok[intern.StrId, str](res_id));
-    if (O.is_some[str](opt_name)) { ret O.unwrap[str](opt_name); }
-    ret generic;
-}
-
-# region_ok rejects ranges whose offset + len would wrap u64 and spuriously fit
 test "mach.lang.target.of.bin.region_ok:wrap_around" {
-    # huge offset exceeds buf_size -> false (offset > buf_size guard fires)
     if (region_ok(0x1000, 0xFFFFFFFFFFFFF800::usize, 0x801::usize)) { ret 1; }
-    # offset one past end -> false
     if (region_ok(0x10, 0x11, 0)) { ret 1; }
-    # exact fit: offset + len == buf_size -> true
     if (!region_ok(0x10, 8, 8)) { ret 1; }
-    # one byte over: len exceeds remaining space -> false
     if (region_ok(0x10, 8, 9)) { ret 1; }
     ret 0;
 }
 
-# write_atomic lands the requested bytes at `path`, readable back afterward
-test "mach.lang.target.of.bin.write_atomic:replaces_target_content" {
+test "mach.lang.target.of.bin.publish_bytes:replaces_target_content" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var itn: intern.Interner = intern.init(?alloc);
@@ -491,35 +231,26 @@ test "mach.lang.target.of.bin.write_atomic:replaces_target_content" {
     var content: [4]u8;
     content[0] = 0xDE; content[1] = 0xAD; content[2] = 0xBE; content[3] = 0xEF;
 
-    val wr: R.Result[bool, str] = write_atomic(?itn, ?alloc, dst::*u8, ?content[0], 4, 0o644,
-        "test: create", "test: create failed", "test: write", "test: write failed",
-        "test: rename", "test: rename failed");
-    if (R.is_err[bool, str](wr)) { fs.remove_file(dst); ret 1; }
+    var digest: [32]u8;
+    val wr: R.Result[R.Void, str] = publication.bytes(?itn, ?alloc, dst, ?content[0], 4, 0o644, publication.REPLACE, publication.PARENTS_EXIST, "test: publish", "test: publish failed", ?digest);
+    if (R.is_err[R.Void, str](wr)) { fs.remove_file(dst); ret 1; }
 
-    val or_: R.Result[fs.File, str] = fs.open(dst);
-    if (R.is_err[fs.File, str](or_)) { ret 1; }
-    val rf: fs.File = R.unwrap_ok[fs.File, str](or_);
+    val or_: R.Result[fs.File, io_error.Error] = fs.open(dst);
+    if (R.is_err[fs.File, io_error.Error](or_)) { ret 1; }
+    var rf: fs.File = R.unwrap_ok[fs.File, io_error.Error](or_);
     var readback: [4]u8;
-    val rr: R.Result[usize, str] = fs.read(rf, ?readback[0], 4);
-    fs.close(rf);
+    val rr: R.Result[usize, io_error.Error] = fs.read(rf, ?readback[0], 4);
+    fs.close(?rf);
     fs.remove_file(dst);
-    if (R.is_err[usize, str](rr))              { ret 1; }
-    if (R.unwrap_ok[usize, str](rr) != 4)      { ret 1; }
+    if (R.is_err[usize, io_error.Error](rr))              { ret 1; }
+    if (R.unwrap_ok[usize, io_error.Error](rr) != 4)      { ret 1; }
     if (readback[0] != 0xDE || readback[1] != 0xAD
      || readback[2] != 0xBE || readback[3] != 0xEF) { ret 1; }
 
     ret 0;
 }
 
-# the mechanism #2475 exists for: a handle opened on `path` BEFORE the replace -
-# standing in for a process that `execve`'d the old image - keeps reading the old
-# bytes after `write_atomic` returns, because the rename repoints the directory
-# entry without touching the inode the open handle already resolved to. A fresh
-# open of the same path sees the new content. This is the in-process form of the
-# ETXTBSY repro (#2475): a rebuild that truncated `path` in place would instead
-# corrupt the still-open handle's view, or fail outright while a real execve'd
-# process holds it.
-test "mach.lang.target.of.bin.write_atomic:open_handle_survives_replace" {
+test "mach.lang.target.of.bin.publish_bytes:open_handle_survives_replace" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var itn: intern.Interner = intern.init(?alloc);
@@ -531,45 +262,41 @@ test "mach.lang.target.of.bin.write_atomic:open_handle_survives_replace" {
 
     var old_content: [4]u8;
     old_content[0] = 0x11; old_content[1] = 0x22; old_content[2] = 0x33; old_content[3] = 0x44;
-    val ww: R.Result[usize, str] = fs.write(tf.file, ?old_content[0], 4);
-    if (R.is_err[usize, str](ww)) { fs.temp_close_and_remove(?tf); ret 1; }
+    val ww: R.Result[usize, io_error.Error] = fs.write(tf.file, ?old_content[0], 4);
+    if (R.is_err[usize, io_error.Error](ww)) { fs.temp_close_and_remove(?tf); ret 1; }
 
-    val or_: R.Result[fs.File, str] = fs.open(dst);
-    if (R.is_err[fs.File, str](or_)) { fs.temp_close_and_remove(?tf); ret 1; }
-    val held: fs.File = R.unwrap_ok[fs.File, str](or_);
+    val or_: R.Result[fs.File, io_error.Error] = fs.open(dst);
+    if (R.is_err[fs.File, io_error.Error](or_)) { fs.temp_close_and_remove(?tf); ret 1; }
+    var held: fs.File = R.unwrap_ok[fs.File, io_error.Error](or_);
     fs.temp_close(?tf);
 
     var new_content: [4]u8;
     new_content[0] = 0xAA; new_content[1] = 0xBB; new_content[2] = 0xCC; new_content[3] = 0xDD;
-    val wr: R.Result[bool, str] = write_atomic(?itn, ?alloc, dst::*u8, ?new_content[0], 4, 0o644,
-        "test: create", "test: create failed", "test: write", "test: write failed",
-        "test: rename", "test: rename failed");
-    if (R.is_err[bool, str](wr)) { fs.close(held); fs.remove_file(dst); ret 1; }
+    val wr: R.Result[R.Void, str] = publication.bytes(?itn, ?alloc, dst, ?new_content[0], 4, 0o644, publication.REPLACE, publication.PARENTS_EXIST, "test: publish", "test: publish failed", nil);
+    if (R.is_err[R.Void, str](wr)) { fs.close(?held); fs.remove_file(dst); ret 1; }
 
     var readback_old: [4]u8;
-    val rr_old: R.Result[usize, str] = fs.read(held, ?readback_old[0], 4);
-    fs.close(held);
-    if (R.is_err[usize, str](rr_old)) { fs.remove_file(dst); ret 1; }
+    val rr_old: R.Result[usize, io_error.Error] = fs.read(held, ?readback_old[0], 4);
+    fs.close(?held);
+    if (R.is_err[usize, io_error.Error](rr_old)) { fs.remove_file(dst); ret 1; }
     if (readback_old[0] != 0x11 || readback_old[1] != 0x22
      || readback_old[2] != 0x33 || readback_old[3] != 0x44) { fs.remove_file(dst); ret 1; }
 
-    val or2: R.Result[fs.File, str] = fs.open(dst);
-    if (R.is_err[fs.File, str](or2)) { ret 1; }
-    val fresh: fs.File = R.unwrap_ok[fs.File, str](or2);
+    val or2: R.Result[fs.File, io_error.Error] = fs.open(dst);
+    if (R.is_err[fs.File, io_error.Error](or2)) { ret 1; }
+    var fresh: fs.File = R.unwrap_ok[fs.File, io_error.Error](or2);
     var readback_new: [4]u8;
-    val rr_new: R.Result[usize, str] = fs.read(fresh, ?readback_new[0], 4);
-    fs.close(fresh);
+    val rr_new: R.Result[usize, io_error.Error] = fs.read(fresh, ?readback_new[0], 4);
+    fs.close(?fresh);
     fs.remove_file(dst);
-    if (R.is_err[usize, str](rr_new)) { ret 1; }
+    if (R.is_err[usize, io_error.Error](rr_new)) { ret 1; }
     if (readback_new[0] != 0xAA || readback_new[1] != 0xBB
      || readback_new[2] != 0xCC || readback_new[3] != 0xDD) { ret 1; }
 
     ret 0;
 }
 
-# a destination whose directory does not exist fails cleanly through the
-# caller-supplied create diagnostic, rather than a crash or a silent no-op
-test "mach.lang.target.of.bin.write_atomic:missing_directory_fails_cleanly" {
+test "mach.lang.target.of.bin.publish_bytes:missing_directory_fails_cleanly" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var itn: intern.Interner = intern.init(?alloc);
@@ -577,9 +304,7 @@ test "mach.lang.target.of.bin.write_atomic:missing_directory_fails_cleanly" {
     var buf: [4]u8;
     buf[0] = 1; buf[1] = 2; buf[2] = 3; buf[3] = 4;
 
-    val wr: R.Result[bool, str] = write_atomic(?itn, ?alloc, "/mach-2475-no-such-dir/target"::*u8, ?buf[0], 4, 0o644,
-        "test: create", "test: create failed", "test: write", "test: write failed",
-        "test: rename", "test: rename failed");
-    if (R.is_ok[bool, str](wr)) { ret 1; }
+    val wr: R.Result[R.Void, str] = publication.bytes(?itn, ?alloc, "/mach-2475-no-such-dir/target", ?buf[0], 4, 0o644, publication.REPLACE, publication.PARENTS_EXIST, "test: publish", "test: publish failed", nil);
+    if (R.is_ok[R.Void, str](wr)) { ret 1; }
     ret 0;
 }

@@ -1,15 +1,11 @@
-# dependency resolution: the manifest dep closure, cascade link inputs, and steps
-#
-# Resolves the project's declared `[dep.*]` entries and their transitive closure
-# into the ProjectConfig's DepEntry array (naming any project-id collision with
-# its conflicting sources, refs, and requirer chains), collects the transitive
-# link inputs whose declared target tuple matches the selected target, and
-# parses each dep's own mach.toml. Sits above the load walk it borrows path and
-# diagnostic helpers from, below the config layer that drives it.
-
 use std.data.toml;
+use std.allocator.page;
+use std.collections.sort;
+use std.collections.vector;
+use std.collections.vector.Vector;
 use fs: std.filesystem;
 use std.format;
+use std.process.exec;
 use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -18,6 +14,11 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_empty;
 use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_compare;
+use std.types.string.str_copy_slice;
+use std.types.string.str_starts_with;
+use std.types.path;
 
 use A: std.allocator;
 use O: std.types.option;
@@ -26,48 +27,393 @@ use R: std.types.result;
 use mach.lang.intern;
 use mach.lang.manifest;
 use mach.lang.session;
+use mach.subprocess;
 
 use mach.lang.driver.project;
 use mach.lang.driver.load;
+use txn_fs: std.filesystem.transaction;
+use std.print;
 
-# whether `<root>/<src_dir>/<module_rel>` is an existing file
-fun module_file_present(alloc: *A.Allocator, root: str, src_dir: str, module_rel: str) bool {
+rec GitInspector {
+    program: str;
+}
+
+fun git_inspector_init(alloc: *A.Allocator) R.Result[GitInspector, str] {
+    val rr: R.Result[str, str] = exec.resolve(alloc, "git");
+    if (R.is_err[str, str](rr)) { ret R.err[GitInspector, str]("git not found on PATH; dependency verification requires Git"); }
+    ret R.ok[GitInspector, str](GitInspector{program: R.unwrap_ok[str, str](rr)});
+}
+
+fun git_inspector_dnit(alloc: *A.Allocator, gi: *GitInspector) {
+    str_free(alloc, gi.program);
+    gi.program = nil;
+}
+
+fun captured_text(alloc: *A.Allocator, p: *subprocess.OwnedSubprocess, trim_line_end: bool) R.Result[str, str] {
+    var n: usize = 0;
+    val src: *u8 = subprocess.capture_bytes(p, ?n);
+    for (trim_line_end && n > 0 && (src[n - 1] == '\n' || src[n - 1] == '\r')) { n = n - 1; }
+    val ar: R.Result[*u8, str] = A.allocate[u8](alloc, n + 1);
+    if (R.is_err[*u8, str](ar)) { ret R.err[str, str](R.unwrap_err[*u8, str](ar)); }
+    val out: *u8 = R.unwrap_ok[*u8, str](ar);
+    var i: usize = 0;
+    for (i < n) { out[i] = src[i]; i = i + 1; }
+    out[n] = 0;
+    ret R.ok[str, str](out::str);
+}
+
+fun git_capture_cleanup(alloc: *A.Allocator, temp: *fs.TempFile, child: *subprocess.OwnedSubprocess, release: bool) {
+    if (release) { subprocess.release_capture(alloc, child); }
+    subprocess.dnit(alloc, child);
+    fs.temp_remove(temp);
+    str_free(alloc, fs.temp_path(temp));
+}
+
+fun count_nil_terminated(arr: **u8) usize {
+    if (arr == nil) { ret 0; }
+    var n: usize = 0;
+    for (arr[n] != nil) { n = n + 1; }
+    ret n;
+}
+
+var git_config_env: **u8 = nil;
+
+pub fun set_git_config_env(env: **u8) {
+    git_config_env = env;
+}
+
+fun env_names_git_config(entry: *u8) bool {
+    ret str_starts_with(entry::str, "GIT_CONFIG_COUNT=") || str_starts_with(entry::str, "GIT_CONFIG_KEY_")
+        || str_starts_with(entry::str, "GIT_CONFIG_VALUE_");
+}
+
+fun git_run_capture(alloc: *A.Allocator, gi: *GitInspector, argv: **u8, trim_line_end: bool, extra_env: **u8) R.Result[str, str] {
+    val tr: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "mach_dep_verify");
+    if (R.is_err[fs.TempFile, str](tr)) { ret R.err[str, str](R.unwrap_err[fs.TempFile, str](tr)); }
+    var temp: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tr);
+    if (O.is_some[str](fs.temp_close(?temp))) {
+        fs.temp_remove(?temp);
+        str_free(alloc, fs.temp_path(?temp));
+        ret R.err[str, str]("failed to close dependency verification capture");
+    }
+
+    var child: subprocess.OwnedSubprocess;
+    subprocess.init(?child);
+    val extra_n: usize = count_nil_terminated(extra_env);
+    var config_n: usize = 0;
+    var ci: usize = 0;
+    for (ci < extra_n) { if (env_names_git_config(extra_env[ci])) { config_n = extra_n; } ci = ci + 1; }
+    var forward_n: usize = 0;
+    if (config_n == 0) { forward_n = count_nil_terminated(git_config_env); }
+    val env_ar: R.Result[**u8, str] = A.allocate[*u8](alloc, 5 + extra_n + forward_n);
+    if (R.is_err[**u8, str](env_ar)) {
+        fs.temp_remove(?temp);
+        str_free(alloc, fs.temp_path(?temp));
+        ret R.err[str, str](R.unwrap_err[**u8, str](env_ar));
+    }
+    val git_env: **u8 = R.unwrap_ok[**u8, str](env_ar);
+    git_env[0] = "GIT_CONFIG_NOSYSTEM=1";
+    $if ($mach.build.os == $mach.os.windows) {
+        git_env[1] = "GIT_CONFIG_GLOBAL=NUL";
+    }
+    $or {
+        git_env[1] = "GIT_CONFIG_GLOBAL=/dev/null";
+    }
+    git_env[2] = "GIT_OPTIONAL_LOCKS=0";
+    git_env[3] = "GIT_TERMINAL_PROMPT=0";
+    var ei: usize = 0;
+    for (ei < extra_n) { git_env[4 + ei] = extra_env[ei]; ei = ei + 1; }
+    var fi: usize = 0;
+    for (fi < forward_n) { git_env[4 + extra_n + fi] = git_config_env[fi]; fi = fi + 1; }
+    git_env[4 + extra_n + forward_n] = nil;
+    val sr: R.Result[R.Void, str] = subprocess.spawn_captured(alloc, ?child, gi.program, argv,
+        git_env, fs.temp_path(?temp), 1048576);
+    if (R.is_err[R.Void, str](sr)) {
+        A.deallocate[*u8](alloc, git_env, 5 + extra_n + forward_n);
+        git_capture_cleanup(alloc, ?temp, ?child, false);
+        ret R.err[str, str](R.unwrap_err[R.Void, str](sr));
+    }
+    val wr: R.Result[subprocess.SubprocessTerminal, str] = subprocess.wait(alloc, ?child);
+    if (R.is_err[subprocess.SubprocessTerminal, str](wr)) {
+        subprocess.abandon_capture(?child);
+        A.deallocate[*u8](alloc, git_env, 5 + extra_n + forward_n);
+        git_capture_cleanup(alloc, ?temp, ?child, false);
+        ret R.err[str, str](R.unwrap_err[subprocess.SubprocessTerminal, str](wr));
+    }
+    val terminal: subprocess.SubprocessTerminal = R.unwrap_ok[subprocess.SubprocessTerminal, str](wr);
+    val cr: R.Result[subprocess.CaptureIoResult, str] = subprocess.finish_capture(alloc, ?child, true);
+    A.deallocate[*u8](alloc, git_env, 5 + extra_n + forward_n);
+    if (R.is_err[subprocess.CaptureIoResult, str](cr)) {
+        git_capture_cleanup(alloc, ?temp, ?child, false);
+        ret R.err[str, str](R.unwrap_err[subprocess.CaptureIoResult, str](cr));
+    }
+    val cap: subprocess.CaptureIoResult = R.unwrap_ok[subprocess.CaptureIoResult, str](cr);
+    if (cap.read_failed || cap.write_failed || cap.close_failed || cap.short_read || cap.truncated) {
+        git_capture_cleanup(alloc, ?temp, ?child, true);
+        ret R.err[str, str]("Git dependency inspection output could not be captured completely");
+    }
+    if (terminal.kind != subprocess.STATE_EXITED || terminal.code != 0) {
+        val dbg: R.Result[str, str] = captured_text(alloc, ?child, false);
+        git_capture_cleanup(alloc, ?temp, ?child, true);
+        ret R.err[str, str]("Git dependency inspection command failed");
+    }
+    val out_r: R.Result[str, str] = captured_text(alloc, ?child, trim_line_end);
+    git_capture_cleanup(alloc, ?temp, ?child, true);
+    ret out_r;
+}
+
+fun git_query_mode(alloc: *A.Allocator, gi: *GitInspector, dir: str, args: *str, count: usize,
+                   trim_line_end: bool, extra_env: **u8) R.Result[str, str] {
+    val ar: R.Result[**u8, str] = A.allocate[*u8](alloc, count + 8);
+    if (R.is_err[**u8, str](ar)) { ret R.err[str, str](R.unwrap_err[**u8, str](ar)); }
+    val argv: **u8 = R.unwrap_ok[**u8, str](ar);
+    argv[0] = gi.program::*u8;
+    argv[1] = "-c";
+    argv[2] = "core.fsmonitor=false";
+    argv[3] = "-c";
+    argv[4] = "core.untrackedCache=false";
+    argv[5] = "-C";
+    argv[6] = dir::*u8;
+    var i: usize = 0;
+    for (i < count) { argv[i + 7] = args[i]::*u8; i = i + 1; }
+    argv[count + 7] = nil;
+    val rr: R.Result[str, str] = git_run_capture(alloc, gi, argv, trim_line_end, extra_env);
+    A.deallocate[*u8](alloc, argv, count + 8);
+    ret rr;
+}
+
+fun git_query(alloc: *A.Allocator, gi: *GitInspector, dir: str, args: *str, count: usize) R.Result[str, str] {
+    ret git_query_mode(alloc, gi, dir, args, count, true, nil);
+}
+
+fun git_query_raw(alloc: *A.Allocator, gi: *GitInspector, dir: str, args: *str, count: usize) R.Result[str, str] {
+    ret git_query_mode(alloc, gi, dir, args, count, false, nil);
+}
+
+fun git_op(alloc: *A.Allocator, gi: *GitInspector, dir: str, args: *str, count: usize, extra_env: **u8) R.Result[str, str] {
+    ret git_query_mode(alloc, gi, dir, args, count, true, extra_env);
+}
+
+fun free_name_vector(alloc: *A.Allocator, names: *Vector[str]) {
+    var i: usize = 0;
+    for (i < names.len) { str_free(alloc, names.data[i]); i = i + 1; }
+    vector.dnit[str](names);
+}
+
+fun cmp_dep_name(a: *str, b: *str) i64 { ret str_compare(@a, @b); }
+
+fun symlink_seen(links: *Vector[str], rel: str) bool {
+    var i: usize = 0;
+    for (i < links.len) {
+        if (str_equals(links.data[i], rel)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun git_symlink_target(s: *session.Session, gi: *GitInspector, alias: str, git_dir: str,
+                       git_prefix: str, rel: str) R.Result[str, str] {
+    val spec_r: R.Result[str, str] = format.sprint(s.build_alloc, "HEAD:{}{}", git_prefix, rel);
+    if (R.is_err[str, str](spec_r)) { ret R.err[str, str](R.unwrap_err[str, str](spec_r)); }
+    val spec: str = R.unwrap_ok[str, str](spec_r);
+    var args: [3]str;
+    args[0] = "cat-file"; args[1] = "-p"; args[2] = spec;
+    val raw_r: R.Result[str, str] = git_query_raw(s.build_alloc, gi, git_dir, ?args[0], 3);
+    str_free(s.build_alloc, spec);
+    if (R.is_ok[str, str](raw_r)) { ret raw_r; }
+    val msg_r: R.Result[str, str] = format.sprint(s.build_alloc,
+        "dependency '{}': cannot verify tracked symlink target: {}", alias, R.unwrap_err[str, str](raw_r));
+    if (R.is_err[str, str](msg_r)) { ret R.err[str, str](R.unwrap_err[str, str](raw_r)); }
+    ret R.err[str, str](R.unwrap_ok[str, str](msg_r));
+}
+
+fun git_symlink_tracked(s: *session.Session, gi: *GitInspector, alias: str, git_dir: str,
+                        git_prefix: str, rel: str) R.Result[bool, str] {
+    val mode_r: R.Result[str, str] = git_path_mode(s, gi, alias, git_dir, git_prefix, rel);
+    if (R.is_err[str, str](mode_r)) { ret R.err[bool, str](R.unwrap_err[str, str](mode_r)); }
+    val mode: str = R.unwrap_ok[str, str](mode_r);
+    val tracked: bool = str_equals(mode, "120000");
+    str_free(s.build_alloc, mode);
+    ret R.ok[bool, str](tracked);
+}
+
+fun git_path_mode(s: *session.Session, gi: *GitInspector, alias: str,
+                  git_dir: str, git_prefix: str, rel: str) R.Result[str, str] {
+    val path_r: R.Result[str, str] = format.sprint(s.build_alloc, "{}{}", git_prefix, rel);
+    if (R.is_err[str, str](path_r)) { ret path_r; }
+    val path_text: str = R.unwrap_ok[str, str](path_r);
+    val spec_r: R.Result[str, str] = format.sprint(s.build_alloc, ":(top){}", path_text);
+    str_free(s.build_alloc, path_text);
+    if (R.is_err[str, str](spec_r)) { ret spec_r; }
+    val spec: str = R.unwrap_ok[str, str](spec_r);
+    var args: [5]str;
+    args[0] = "ls-tree"; args[1] = "--format=%(objectmode)"; args[2] = "HEAD";
+    args[3] = "--"; args[4] = spec;
+    val mode_r: R.Result[str, str] = git_query_named(s, gi, alias, git_dir, ?args[0], 5, "nested dependency gitlink");
+    str_free(s.build_alloc, spec);
+    ret mode_r;
+}
+
+fun symlink_target_path(s: *session.Session, root: str, rel: str, target: str) R.Result[str, str] {
+    if (str_empty(target) || target[0] == '/' || target[0] == '\\'
+        || (str_len(target) > 1 && target[1] == ':')) {
+        ret R.err[str, str]("tracked symlink target must be relative");
+    }
+    var base_len: usize = str_len(rel);
+    for (base_len > 0 && rel[base_len - 1] != '/') { base_len = base_len - 1; }
+    val base_r: R.Result[str, str] = str_copy_slice(s.build_alloc, rel, 0, base_len);
+    if (R.is_err[str, str](base_r)) { ret R.err[str, str](R.unwrap_err[str, str](base_r)); }
+    val base: str = R.unwrap_ok[str, str](base_r);
+    val joined_r: R.Result[str, str] = format.sprint(s.build_alloc, "{}/{}{}", root, base, target);
+    str_free(s.build_alloc, base);
+    if (R.is_err[str, str](joined_r)) { ret R.err[str, str](R.unwrap_err[str, str](joined_r)); }
+    val joined: str = R.unwrap_ok[str, str](joined_r);
+    val clean_r: R.Result[path.Path, str] = path.clean(s.build_alloc, joined);
+    str_free(s.build_alloc, joined);
+    if (R.is_err[path.Path, str](clean_r)) { ret R.err[str, str](R.unwrap_err[path.Path, str](clean_r)); }
+    val clean: str = R.unwrap_ok[path.Path, str](clean_r);
+    val prefix_r: R.Result[str, str] = format.sprint(s.build_alloc, "{}/", root);
+    if (R.is_err[str, str](prefix_r)) { str_free(s.build_alloc, clean); ret R.err[str, str](R.unwrap_err[str, str](prefix_r)); }
+    val prefix: str = R.unwrap_ok[str, str](prefix_r);
+    val contained: bool = str_equals(clean, root) || str_starts_with(clean, prefix);
+    str_free(s.build_alloc, prefix);
+    if (!contained) { str_free(s.build_alloc, clean); ret R.err[str, str]("tracked symlink target escapes dependency package"); }
+    ret R.ok[str, str](clean);
+}
+
+fun verify_symlink_chain(s: *session.Session, gi: *GitInspector, alias: str,
+                         git_dir: str, git_prefix: str, root: str, rel: str,
+                         links: *Vector[str]) R.Result[R.Void, str] {
+    if (symlink_seen(links, rel)) { ret R.err[R.Void, str]("tracked symlink cycle in dependency package"); }
+    val copied_r: R.Result[str, str] = str_copy_slice(s.build_alloc, rel, 0, str_len(rel));
+    if (R.is_err[str, str](copied_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](copied_r)); }
+    val pushed_r: R.Result[usize, str] = vector.push[str](links, R.unwrap_ok[str, str](copied_r));
+    if (R.is_err[usize, str](pushed_r)) { str_free(s.build_alloc, R.unwrap_ok[str, str](copied_r)); ret R.err[R.Void, str](R.unwrap_err[usize, str](pushed_r)); }
+
+    val target_r: R.Result[str, str] = git_symlink_target(s, gi, alias, git_dir, git_prefix, rel);
+    if (R.is_err[str, str](target_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](target_r)); }
+    val target: str = R.unwrap_ok[str, str](target_r);
+    val resolved_r: R.Result[str, str] = symlink_target_path(s, root, rel, target);
+    str_free(s.build_alloc, target);
+    if (R.is_err[str, str](resolved_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](resolved_r)); }
+    val resolved: str = R.unwrap_ok[str, str](resolved_r);
+    val meta_r: R.Result[fs.Metadata, str] = fs.metadata_link(resolved);
+    if (R.is_err[fs.Metadata, str](meta_r)) { str_free(s.build_alloc, resolved); ret R.ok_void[str](); }
+    val meta: fs.Metadata = R.unwrap_ok[fs.Metadata, str](meta_r);
+    if (!fs.meta_is_symlink(?meta)) { str_free(s.build_alloc, resolved); ret R.ok_void[str](); }
+    val prefix_r: R.Result[str, str] = format.sprint(s.build_alloc, "{}/", root);
+    if (R.is_err[str, str](prefix_r)) { str_free(s.build_alloc, resolved); ret R.err[R.Void, str](R.unwrap_err[str, str](prefix_r)); }
+    val prefix: str = R.unwrap_ok[str, str](prefix_r);
+    val next_r: R.Result[str, str] = str_copy_slice(s.build_alloc, resolved,
+        str_len(prefix), str_len(resolved) - str_len(prefix));
+    str_free(s.build_alloc, prefix); str_free(s.build_alloc, resolved);
+    if (R.is_err[str, str](next_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](next_r)); }
+    val next: str = R.unwrap_ok[str, str](next_r);
+    val next_tracked_r: R.Result[bool, str] = git_symlink_tracked(s, gi, alias, git_dir, git_prefix, next);
+    if (R.is_err[bool, str](next_tracked_r)) { str_free(s.build_alloc, next); ret R.err[R.Void, str](R.unwrap_err[bool, str](next_tracked_r)); }
+    if (!R.unwrap_ok[bool, str](next_tracked_r)) {
+        str_free(s.build_alloc, next);
+        ret R.ok_void[str]();
+    }
+    val chain_r: R.Result[R.Void, str] = verify_symlink_chain(s, gi, alias, git_dir, git_prefix, root, next, links);
+    str_free(s.build_alloc, next);
+    ret chain_r;
+}
+
+fun verify_realization_symlinks_walk(s: *session.Session, gi: *GitInspector, alias: str,
+                                     git_dir: str, git_prefix: str, root: str, rel: str) R.Result[R.Void, str] {
+    val at_r: R.Result[str, str] = load.join_path(s.build_alloc, root, rel);
+    if (R.is_err[str, str](at_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](at_r)); }
+    val at: str = R.unwrap_ok[str, str](at_r);
+    val names_r: R.Result[Vector[str], str] = fs.read_dir(s.build_alloc, at);
+    str_free(s.build_alloc, at);
+    if (R.is_err[Vector[str], str](names_r)) { ret R.err[R.Void, str](R.unwrap_err[Vector[str], str](names_r)); }
+    var names: Vector[str] = R.unwrap_ok[Vector[str], str](names_r);
+    sort.sort[str](names.data, names.len, cmp_dep_name);
+    var i: usize = 0;
+    for (i < names.len) {
+        val child_r: R.Result[str, str] = format.sprint(s.build_alloc, "{}{}", rel, names.data[i]);
+        if (R.is_err[str, str](child_r)) { free_name_vector(s.build_alloc, ?names); ret R.err[R.Void, str](R.unwrap_err[str, str](child_r)); }
+        val child: str = R.unwrap_ok[str, str](child_r);
+        val path_r: R.Result[str, str] = load.join_path(s.build_alloc, root, child);
+        if (R.is_err[str, str](path_r)) { str_free(s.build_alloc, child); free_name_vector(s.build_alloc, ?names); ret R.err[R.Void, str](R.unwrap_err[str, str](path_r)); }
+        val child_path: str = R.unwrap_ok[str, str](path_r);
+        val meta_r: R.Result[fs.Metadata, str] = fs.metadata_link(child_path);
+        if (R.is_err[fs.Metadata, str](meta_r)) { str_free(s.build_alloc, child_path); str_free(s.build_alloc, child); free_name_vector(s.build_alloc, ?names); ret R.err[R.Void, str](R.unwrap_err[fs.Metadata, str](meta_r)); }
+        val meta: fs.Metadata = R.unwrap_ok[fs.Metadata, str](meta_r);
+        if (fs.meta_is_dir(?meta)) {
+            val mode_r: R.Result[str, str] = git_path_mode(s, gi, alias, git_dir, git_prefix, child);
+            if (R.is_err[str, str](mode_r)) {
+                str_free(s.build_alloc, child_path);
+                str_free(s.build_alloc, child);
+                free_name_vector(s.build_alloc, ?names);
+                ret R.err[R.Void, str](R.unwrap_err[str, str](mode_r));
+            }
+            val mode: str = R.unwrap_ok[str, str](mode_r);
+            if (str_empty(mode) || str_equals(mode, "160000")) {
+                str_free(s.build_alloc, mode);
+                str_free(s.build_alloc, child_path);
+                str_free(s.build_alloc, child);
+                i = i + 1;
+                cnt;
+            }
+            if (!str_equals(mode, "040000")) {
+                str_free(s.build_alloc, mode);
+                str_free(s.build_alloc, child_path);
+                str_free(s.build_alloc, child);
+                free_name_vector(s.build_alloc, ?names);
+                ret R.err[R.Void, str]("dependency directory does not match its committed tree");
+            }
+            str_free(s.build_alloc, mode);
+            str_free(s.build_alloc, child_path);
+            val nested_r: R.Result[str, str] = format.sprint(s.build_alloc, "{}/", child);
+            str_free(s.build_alloc, child);
+            if (R.is_err[str, str](nested_r)) { free_name_vector(s.build_alloc, ?names); ret R.err[R.Void, str](R.unwrap_err[str, str](nested_r)); }
+            val nested: str = R.unwrap_ok[str, str](nested_r);
+            val walk_r: R.Result[R.Void, str] = verify_realization_symlinks_walk(s, gi, alias, git_dir, git_prefix, root, nested);
+            str_free(s.build_alloc, nested);
+            if (R.is_err[R.Void, str](walk_r)) { free_name_vector(s.build_alloc, ?names); ret walk_r; }
+        }
+        or (fs.meta_is_symlink(?meta)) {
+            var links: Vector[str] = vector.init[str](s.build_alloc);
+            var verify_r: R.Result[R.Void, str] = R.ok_void[str]();
+            val tracked_r: R.Result[bool, str] = git_symlink_tracked(s, gi, alias, git_dir, git_prefix, child);
+            if (R.is_err[bool, str](tracked_r)) { verify_r = R.err[R.Void, str](R.unwrap_err[bool, str](tracked_r)); }
+            or (R.unwrap_ok[bool, str](tracked_r)) {
+                verify_r = verify_symlink_chain(s, gi, alias, git_dir, git_prefix, root, child, ?links);
+            }
+            free_name_vector(s.build_alloc, ?links); str_free(s.build_alloc, child_path); str_free(s.build_alloc, child);
+            if (R.is_err[R.Void, str](verify_r)) { free_name_vector(s.build_alloc, ?names); ret verify_r; }
+        }
+        or { str_free(s.build_alloc, child_path); str_free(s.build_alloc, child); }
+        i = i + 1;
+    }
+    free_name_vector(s.build_alloc, ?names);
+    ret R.ok_void[str]();
+}
+
+fun verify_realization_symlinks(s: *session.Session, gi: *GitInspector, alias: str,
+                                git_dir: str, git_prefix: str, root: str) R.Result[R.Void, str] {
+    ret verify_realization_symlinks_walk(s, gi, alias, git_dir, git_prefix, root, "");
+}
+
+fun module_file_present(alloc: *A.Allocator, root: str, src_dir: str, module_rel: str) R.Result[bool, str] {
     val a: R.Result[str, str] = load.join_path(alloc, root, src_dir);
-    if (R.is_err[str, str](a)) { ret false; }
+    if (R.is_err[str, str](a)) { ret R.err[bool, str](R.unwrap_err[str, str](a)); }
     val mid: str = R.unwrap_ok[str, str](a);
     val b: R.Result[str, str] = load.join_path(alloc, mid, module_rel);
     str_free(alloc, mid);
-    if (R.is_err[str, str](b)) { ret false; }
+    if (R.is_err[str, str](b)) { ret R.err[bool, str](R.unwrap_err[str, str](b)); }
     val full: str = R.unwrap_ok[str, str](b);
     val ok_: bool = fs.is_file(full);
     str_free(alloc, full);
-    ret ok_;
+    ret R.ok[bool, str](ok_);
 }
 
-# the provenance of one registered dep, tracked parallel to the resolved DepEntry array
-# so a project-id collision in the closure can name the conflicting sources, refs, and
-# requirer chains rather than silently deduping the loser (#1968).
-# ---
-# source: interned source label ("git <url>" / "path <path>") the requirer declared
-# ref:    interned declared ref, STR_NIL when omitted
-# chain:  interned requirer chain ("<root> -> a -> b") ending at this dep's alias
-rec DepProvenance {
-    source: intern.StrId;
-    ref:    intern.StrId;
-    chain:  intern.StrId;
+pub fun dep_content_conflicts(existing_content: intern.StrId, new_content: intern.StrId) bool {
+    ret existing_content != new_content;
 }
 
-# a re-encountered project id unifies with its prior registration only when both the
-# declared source and ref match exactly; any difference is a hard conflict. the model
-# is exact-ref with no version reconciliation (#1964), so the two legitimate diamonds
-# (same git url+ref, same path) unify and everything else is reported.
-pub fun dep_id_conflicts(existing_source: intern.StrId, existing_ref: intern.StrId,
-                     new_source: intern.StrId, new_ref: intern.StrId) bool {
-    if (existing_source == new_source && existing_ref == new_ref) { ret false; }
-    ret true;
-}
-
-# the text of an interned id, or `default` when the id is STR_NIL or unrecorded.
 fun id_text_or(s: *session.Session, id: intern.StrId, default: str) str {
     if (id == intern.STR_NIL) { ret default; }
     val o: O.Option[str] = intern.lookup(?s.interner, id);
@@ -75,200 +421,238 @@ fun id_text_or(s: *session.Session, id: intern.StrId, default: str) str {
     ret default;
 }
 
-# a dep's declared source as an interned identity+display label: "git <url>" for a git
-# source, "path <path>" for a path source, else "<unknown source>". identity is a StrId
-# compare, so the scheme prefix keeps a git url and an identical path string distinct.
-fun dep_source_label(s: *session.Session, d: *manifest.DepDef) intern.StrId {
+fun dep_source_label(s: *session.Session, d: *manifest.DepDef) R.Result[intern.StrId, str] {
+    var label_r: R.Result[str, str];
     if (d.git != intern.STR_NIL) {
         val u: O.Option[str] = intern.lookup(?s.interner, d.git);
-        if (O.is_some[str](u)) { ret project.intern_unwrap(?s.interner, load.diag_join3(s, "git ", O.unwrap[str](u), "", "git")); }
+        if (O.is_none[str](u)) { ret R.err[intern.StrId, str]("dependency Git source is not interned"); }
+        label_r = format.sprint(s.build_alloc, "git {}", O.unwrap[str](u));
     }
-    if (d.path != intern.STR_NIL) {
+    or (d.path != intern.STR_NIL) {
         val pth: O.Option[str] = intern.lookup(?s.interner, d.path);
-        if (O.is_some[str](pth)) { ret project.intern_unwrap(?s.interner, load.diag_join3(s, "path ", O.unwrap[str](pth), "", "path")); }
+        if (O.is_none[str](pth)) { ret R.err[intern.StrId, str]("dependency path source is not interned"); }
+        label_r = format.sprint(s.build_alloc, "path {}", O.unwrap[str](pth));
     }
-    ret project.intern_unwrap(?s.interner, "<unknown source>");
+    or { ret R.err[intern.StrId, str]("dependency has no source"); }
+    if (R.is_err[str, str](label_r)) { ret R.err[intern.StrId, str](R.unwrap_err[str, str](label_r)); }
+    val label: str = R.unwrap_ok[str, str](label_r);
+    val ir: R.Result[intern.StrId, str] = intern.intern(?s.interner, label);
+    str_free(s.build_alloc, label);
+    ret ir;
 }
 
-# one "<chain> pins <source>[ @ <ref>]" line of a conflict diagnostic.
-fun dep_conflict_edge(s: *session.Session, chain: str, source: str, ref: str) str {
+fun dep_conflict_edge(s: *session.Session, chain: str, source: str, ref: str, content: str) str {
     val base: str = load.diag_join3(s, chain, " pins ", source, chain);
-    if (str_empty(ref)) { ret base; }
-    ret load.diag_join3(s, base, " @ ", ref, base);
+    var selected: str = base;
+    if (!str_empty(ref)) { selected = load.diag_join3(s, base, " @ ", ref, base); }
+    if (str_empty(content)) { ret selected; }
+    ret load.diag_join3(s, selected, " with content ", content, selected);
 }
 
-# render the dependency-conflict diagnostic for one project id reached two incompatible
-# ways: names both full requirer chains and the source/ref each pins, so the fix (fork
-# or upstream) is actionable from the message alone (#1968).
 fun dep_conflict_msg(s: *session.Session, project_id: str,
-                     chain_a: str, source_a: str, ref_a: str,
-                     chain_b: str, source_b: str, ref_b: str) str {
+    chain_a: str, source_a: str, ref_a: str, content_a: str,
+    chain_b: str, source_b: str, ref_b: str, content_b: str) str {
     val head: str = load.diag_join3(s, "dependency conflict: project id '", project_id,
-        "' is required from two incompatible sources:", "dependency conflict: incompatible sources for one project id");
-    val la: str = dep_conflict_edge(s, chain_a, source_a, ref_a);
-    val lb: str = dep_conflict_edge(s, chain_b, source_b, ref_b);
+        "' resolves to different captured content:", "dependency conflict: incompatible content for one project id");
+    val la: str = dep_conflict_edge(s, chain_a, source_a, ref_a, content_a);
+    val lb: str = dep_conflict_edge(s, chain_b, source_b, ref_b, content_b);
     val p1: str = load.diag_join3(s, head, "\n    ", la, head);
     val p2: str = load.diag_join3(s, p1, "\n    ", lb, p1);
     ret load.diag_join3(s, p2, "\n    ",
-        "fork or upstream to reconcile; one project id must resolve to a single source and ref (no version remapping)", p2);
+        "fork or upstream to reconcile; one project id must resolve to one captured content identity", p2);
 }
 
-fun resolve_deps_recursive(p: *project.Project, current_root: str, dep_names: *manifest.DepDef, dep_name_count: u32,
-                           deps: *project.DepEntry, prov: *DepProvenance, dep_count_ptr: *u32, max_deps: usize,
-                           dir_dep: str, requirer_chain: str) R.Result[bool, str] {
+fun discard_dep_entry(alloc: *A.Allocator, entry: *project.DepEntry) {
+    if (entry.direct != nil && entry.direct_count > 0) {
+        A.deallocate[intern.StrId](alloc, entry.direct, entry.direct_count::usize);
+    }
+    manifest.dnit(?entry.manifest, alloc);
+}
+
+fun root_declares(root_m: *manifest.Manifest, name: intern.StrId) bool {
     var i: u32 = 0;
-    for (i < dep_name_count) {
-        val alias_opt: O.Option[str] = intern.lookup(?p.s.interner, dep_names[i].name);
-        if (O.is_none[str](alias_opt)) { ret R.err[bool, str]("dep alias StrId not interned"); }
-        val alias: str = O.unwrap[str](alias_opt);
-
-        val rd: R.Result[project.DepEntry, str] = resolve_dep(p.s, alias, current_root, dir_dep);
-        if (R.is_err[project.DepEntry, str](rd)) { ret R.err[bool, str](R.unwrap_err[project.DepEntry, str](rd)); }
-        val entry: project.DepEntry = R.unwrap_ok[project.DepEntry, str](rd);
-
-        # this dep's declared provenance: its source label, its ref, and the requirer
-        # chain reaching it, so a project-id collision names who required what from where.
-        val src_id: intern.StrId = dep_source_label(p.s, ?dep_names[i]);
-        val ref_id: intern.StrId = dep_names[i].ref;
-        val chain_here: str = load.diag_join3(p.s, requirer_chain, " -> ", alias, alias);
-
-        var exists: bool = false;
-        var j: u32 = 0;
-        for (j < dep_count_ptr[0]) {
-            if (deps[j].project_id == entry.project_id) {
-                if (dep_id_conflicts(prov[j].source, prov[j].ref, src_id, ref_id)) {
-                    val pid: str = id_text_or(p.s, entry.project_id, "?");
-                    ret R.err[bool, str](dep_conflict_msg(p.s, pid,
-                        id_text_or(p.s, prov[j].chain, requirer_chain),
-                        id_text_or(p.s, prov[j].source, "<unknown source>"),
-                        id_text_or(p.s, prov[j].ref, ""),
-                        chain_here,
-                        id_text_or(p.s, src_id, "<unknown source>"),
-                        id_text_or(p.s, ref_id, "")));
-                }
-                exists = true;
-            }
-            j = j + 1;
-        }
-
-        if (!exists) {
-            if (dep_count_ptr[0] >= max_deps::u32) {
-                ret R.err[bool, str]("exceeded maximum dependency limit of 128");
-            }
-            val idx: u32 = dep_count_ptr[0];
-            deps[idx] = entry;
-            prov[idx].source = src_id;
-            prov[idx].ref    = ref_id;
-            prov[idx].chain  = project.intern_unwrap(?p.s.interner, chain_here);
-            dep_count_ptr[0] = dep_count_ptr[0] + 1;
-
-            val dep_root_opt: O.Option[str] = intern.lookup(?p.s.interner, entry.vendor_root);
-            if (O.is_some[str](dep_root_opt)) {
-                val dep_root: str = O.unwrap[str](dep_root_opt);
-                
-                val toml_path_r: R.Result[str, str] = load.join_path(p.alloc, dep_root, manifest.MANIFEST_FILE);
-                if (R.is_ok[str, str](toml_path_r)) {
-                    val toml_path: str = R.unwrap_ok[str, str](toml_path_r);
-                    val tr: R.Result[toml.Table, str] = parse_toml_file(p.alloc, toml_path);
-                    str_free(p.alloc, toml_path);
-                    if (R.is_ok[toml.Table, str](tr)) {
-                        var t: toml.Table = R.unwrap_ok[toml.Table, str](tr);
-                        fin { toml.dnit(p.alloc, ?t); }
-                        val dep_tab: *toml.Table = toml.get_table(?t, "dep");
-                        if (dep_tab != nil) {
-                            val sub_dep_count: usize = toml.table_len(dep_tab);
-                            if (sub_dep_count > 0) {
-                                val res_sub_defs: R.Result[*manifest.DepDef, str] = A.allocate[manifest.DepDef](p.alloc, sub_dep_count);
-                                if (R.is_ok[*manifest.DepDef, str](res_sub_defs)) {
-                                    val sub_defs: *manifest.DepDef = R.unwrap_ok[*manifest.DepDef, str](res_sub_defs);
-                                    var k: usize = 0;
-                                    for (k < sub_dep_count) {
-                                        val sub_alias: str = toml.table_key(dep_tab, k);
-                                        val sub_v: *toml.Value = toml.table_value(dep_tab, k);
-                                        var sub_d: manifest.DepDef;
-                                        sub_d.name = project.intern_unwrap(?p.s.interner, sub_alias);
-                                        sub_d.git = intern.STR_NIL;
-                                        sub_d.path = intern.STR_NIL;
-                                        sub_d.ref = intern.STR_NIL;
-                                        if (sub_v != nil && sub_v.tag == toml.TYPE_TABLE) {
-                                            val sub_sub: *toml.Table = ?sub_v.data.table;
-                                            sub_d.git = project.intern_opt_unwrap(?p.s.interner, toml.get_str(sub_sub, "git"));
-                                            sub_d.path = project.intern_opt_unwrap(?p.s.interner, toml.get_str(sub_sub, "path"));
-                                            sub_d.ref = project.intern_opt_unwrap(?p.s.interner, toml.get_str(sub_sub, "ref"));
-                                        }
-                                        sub_defs[k] = sub_d;
-                                        k = k + 1;
-                                    }
-                                    
-                                    val res_rec: R.Result[bool, str] = resolve_deps_recursive(p, current_root, sub_defs, sub_dep_count::u32, deps, prov, dep_count_ptr, max_deps, dir_dep, chain_here);
-                                    A.deallocate[manifest.DepDef](p.alloc, sub_defs, sub_dep_count);
-                                    if (R.is_err[bool, str](res_rec)) { ret res_rec; }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    for (i < root_m.dep_count) {
+        if (root_m.deps[i].name == name) { ret true; }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret false;
 }
 
-# resolve the project's declared deps and their transitive closure into the
-# ProjectConfig's DepEntry array; a no-dep manifest clears the array
-pub fun resolve_deps(p: *project.Project, m: *manifest.Manifest, project_root: str) R.Result[bool, str] {
-    if (m.dep_count == 0) {
-        p.config.deps      = nil;
-        p.config.dep_count = 0;
-        ret R.ok[bool, str](true);
+fun resolve_dep_edge(p: *project.Project, gi: *GitInspector, root_m: *manifest.Manifest, current_root: str, d: *manifest.DepDef,
+                     deps: *project.DepEntry, active: *bool, dep_count_ptr: *u32, max_deps: usize,
+                     dir_dep: str, requirer_chain: str, from_root: bool) R.Result[u32, str] {
+    val alias_opt: O.Option[str] = intern.lookup(?p.s.interner, d.name);
+    if (O.is_none[str](alias_opt)) { ret R.err[u32, str]("dep alias StrId not interned"); }
+    val alias: str = O.unwrap[str](alias_opt);
+    val chain_r: R.Result[str, str] = format.sprint(p.alloc, "{} -> {}", requirer_chain, alias);
+    if (R.is_err[str, str](chain_r)) { ret R.err[u32, str](R.unwrap_err[str, str](chain_r)); }
+    val chain_here: str = R.unwrap_ok[str, str](chain_r);
+
+    val rd: R.Result[project.DepEntry, str] = resolve_dep(p.s, gi, alias, current_root, dir_dep, d);
+    if (R.is_err[project.DepEntry, str](rd)) {
+        str_free(p.alloc, chain_here);
+        ret R.err[u32, str](R.unwrap_err[project.DepEntry, str](rd));
     }
-    
+    var entry: project.DepEntry = R.unwrap_ok[project.DepEntry, str](rd);
+    val chain_id_r: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, chain_here);
+    if (R.is_err[intern.StrId, str](chain_id_r)) {
+        discard_dep_entry(p.alloc, ?entry);
+        str_free(p.alloc, chain_here);
+        ret R.err[u32, str](R.unwrap_err[intern.StrId, str](chain_id_r));
+    }
+    entry.chain = R.unwrap_ok[intern.StrId, str](chain_id_r);
+    entry.root_declared = from_root;
+    val overridden: bool = from_root || root_declares(root_m, d.name);
+    var j: u32 = 0;
+    for (j < dep_count_ptr[0]) {
+        if (deps[j].project_id == entry.project_id) {
+            if (!overridden) {
+                val esel_r: R.Result[R.Void, str] = requirer_selector_satisfied(p.s, gi, alias, current_root, dir_dep, d, deps[j].content);
+                if (R.is_err[R.Void, str](esel_r)) {
+                    discard_dep_entry(p.alloc, ?entry);
+                    str_free(p.alloc, chain_here);
+                    ret R.err[u32, str](R.unwrap_err[R.Void, str](esel_r));
+                }
+            }
+            if (dep_content_conflicts(deps[j].content, entry.content)) {
+                val pid: str = id_text_or(p.s, entry.project_id, "?");
+                val msg: str = dep_conflict_msg(p.s, pid,
+                    id_text_or(p.s, deps[j].chain, requirer_chain),
+                    id_text_or(p.s, deps[j].source, "<unknown source>"),
+                    id_text_or(p.s, deps[j].ref, ""),
+                    id_text_or(p.s, deps[j].content, ""),
+                    chain_here,
+                    id_text_or(p.s, entry.source, "<unknown source>"),
+                    id_text_or(p.s, entry.ref, ""),
+                    id_text_or(p.s, entry.content, ""));
+                discard_dep_entry(p.alloc, ?entry);
+                str_free(p.alloc, chain_here);
+                ret R.err[u32, str](msg);
+            }
+            if (active[j]) {
+                val msg_r: R.Result[str, str] = format.sprint(p.alloc,
+                    "dependency cycle: {} reaches project '{}' while it is already being resolved",
+                    chain_here, id_text_or(p.s, entry.project_id, "?"));
+                discard_dep_entry(p.alloc, ?entry);
+                str_free(p.alloc, chain_here);
+                if (R.is_err[str, str](msg_r)) { ret R.err[u32, str](R.unwrap_err[str, str](msg_r)); }
+                ret R.err[u32, str](R.unwrap_ok[str, str](msg_r));
+            }
+            discard_dep_entry(p.alloc, ?entry);
+            str_free(p.alloc, chain_here);
+            ret R.ok[u32, str](j);
+        }
+        j = j + 1;
+    }
+
+    if (dep_count_ptr[0] >= max_deps::u32) {
+        discard_dep_entry(p.alloc, ?entry);
+        str_free(p.alloc, chain_here);
+        ret R.err[u32, str]("exceeded maximum dependency limit of 128");
+    }
+    if (!overridden) {
+        val add_sel_r: R.Result[R.Void, str] = requirer_selector_satisfied(p.s, gi, alias, current_root, dir_dep, d, entry.content);
+        if (R.is_err[R.Void, str](add_sel_r)) {
+            discard_dep_entry(p.alloc, ?entry);
+            str_free(p.alloc, chain_here);
+            ret R.err[u32, str](R.unwrap_err[R.Void, str](add_sel_r));
+        }
+    }
+    val idx: u32 = dep_count_ptr[0];
+    deps[idx] = entry;
+    active[idx] = true;
+    dep_count_ptr[0] = dep_count_ptr[0] + 1;
+
+    val child_count: u32 = deps[idx].manifest.dep_count;
+    if (child_count > 0) {
+        val ar: R.Result[*intern.StrId, str] = A.allocate[intern.StrId](p.alloc, child_count::usize);
+        if (R.is_err[*intern.StrId, str](ar)) {
+            str_free(p.alloc, chain_here);
+            ret R.err[u32, str](R.unwrap_err[*intern.StrId, str](ar));
+        }
+        deps[idx].direct = R.unwrap_ok[*intern.StrId, str](ar);
+        deps[idx].direct_count = child_count;
+        var k: u32 = 0;
+        for (k < child_count) {
+            val child_r: R.Result[u32, str] = resolve_dep_edge(p, gi, root_m, current_root,
+                ?deps[idx].manifest.deps[k], deps, active, dep_count_ptr, max_deps, dir_dep, chain_here, false);
+            if (R.is_err[u32, str](child_r)) {
+                str_free(p.alloc, chain_here);
+                ret child_r;
+            }
+            deps[idx].direct[k] = deps[R.unwrap_ok[u32, str](child_r)].project_id;
+            k = k + 1;
+        }
+    }
+    active[idx] = false;
+    str_free(p.alloc, chain_here);
+    ret R.ok[u32, str](idx);
+}
+
+pub fun resolve_deps(p: *project.Project, m: *manifest.Manifest, project_root: str) R.Result[R.Void, str] {
+    if (m.dep_count == 0) {
+        if (p.config.deps != nil && p.config.dep_count > 0) {
+            project.free_dep_entries(p.alloc, p.config.deps, p.config.dep_count, p.config.dep_count::usize);
+        }
+        p.config.deps = nil;
+        p.config.dep_count = 0;
+        ret R.ok_void[str]();
+    }
+
     val max_deps: usize = 128;
     val r: R.Result[*project.DepEntry, str] = A.allocate[project.DepEntry](p.alloc, max_deps);
-    if (R.is_err[*project.DepEntry, str](r)) { ret R.err[bool, str](R.unwrap_err[*project.DepEntry, str](r)); }
+    if (R.is_err[*project.DepEntry, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*project.DepEntry, str](r)); }
     val deps: *project.DepEntry = R.unwrap_ok[*project.DepEntry, str](r);
     var dep_count: u32 = 0;
 
-    # provenance runs parallel to `deps`; it is walk-local (only read to diagnose a
-    # collision) and freed as soon as the closure walk returns.
-    val pr: R.Result[*DepProvenance, str] = A.allocate[DepProvenance](p.alloc, max_deps);
-    if (R.is_err[*DepProvenance, str](pr)) {
+    val ar: R.Result[*bool, str] = A.allocate[bool](p.alloc, max_deps);
+    if (R.is_err[*bool, str](ar)) {
         A.deallocate[project.DepEntry](p.alloc, deps, max_deps);
-        ret R.err[bool, str](R.unwrap_err[*DepProvenance, str](pr));
+        ret R.err[R.Void, str](R.unwrap_err[*bool, str](ar));
     }
-    val prov: *DepProvenance = R.unwrap_ok[*DepProvenance, str](pr);
+    val active: *bool = R.unwrap_ok[*bool, str](ar);
 
     val dir_dep_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.dir_dep);
     if (O.is_none[str](dir_dep_opt)) {
         A.deallocate[project.DepEntry](p.alloc, deps, max_deps);
-        A.deallocate[DepProvenance](p.alloc, prov, max_deps);
-        ret R.err[bool, str]("dep dir StrId not interned");
+        A.deallocate[bool](p.alloc, active, max_deps);
+        ret R.err[R.Void, str]("dep dir StrId not interned");
     }
     val dir_dep: str = O.unwrap[str](dir_dep_opt);
 
-    # the requirer chain roots at the project id (or "root" when unrecorded).
     var root_name: str = "root";
     val rn_o: O.Option[str] = intern.lookup(?p.s.interner, m.id);
     if (O.is_some[str](rn_o) && !str_empty(O.unwrap[str](rn_o))) { root_name = O.unwrap[str](rn_o); }
 
-    val res_rec: R.Result[bool, str] = resolve_deps_recursive(p, project_root, m.deps, m.dep_count, deps, prov, ?dep_count, max_deps, dir_dep, root_name);
-    A.deallocate[DepProvenance](p.alloc, prov, max_deps);
-    if (R.is_err[bool, str](res_rec)) {
-        A.deallocate[project.DepEntry](p.alloc, deps, max_deps);
-        ret res_rec;
+    var gi: GitInspector = GitInspector{program: ""};
+    var root_i: u32 = 0;
+    for (root_i < m.dep_count) {
+        val edge_r: R.Result[u32, str] = resolve_dep_edge(p, ?gi, m, project_root, ?m.deps[root_i],
+            deps, active, ?dep_count, max_deps, dir_dep, root_name, true);
+        if (R.is_err[u32, str](edge_r)) {
+            git_inspector_dnit(p.alloc, ?gi);
+            A.deallocate[bool](p.alloc, active, max_deps);
+            project.free_dep_entries(p.alloc, deps, dep_count, max_deps);
+            ret R.err[R.Void, str](R.unwrap_err[u32, str](edge_r));
+        }
+        root_i = root_i + 1;
     }
+    git_inspector_dnit(p.alloc, ?gi);
+    A.deallocate[bool](p.alloc, active, max_deps);
 
     if (dep_count == 0) {
         A.deallocate[project.DepEntry](p.alloc, deps, max_deps);
+        if (p.config.deps != nil && p.config.dep_count > 0) {
+            project.free_dep_entries(p.alloc, p.config.deps, p.config.dep_count, p.config.dep_count::usize);
+        }
         p.config.deps      = nil;
         p.config.dep_count = 0;
     }
     or {
         val r_shrink: R.Result[*project.DepEntry, str] = A.allocate[project.DepEntry](p.alloc, dep_count::usize);
         if (R.is_err[*project.DepEntry, str](r_shrink)) {
-            A.deallocate[project.DepEntry](p.alloc, deps, max_deps);
-            ret R.err[bool, str](R.unwrap_err[*project.DepEntry, str](r_shrink));
+            project.free_dep_entries(p.alloc, deps, dep_count, max_deps);
+            ret R.err[R.Void, str](R.unwrap_err[*project.DepEntry, str](r_shrink));
         }
         val shrunk: *project.DepEntry = R.unwrap_ok[*project.DepEntry, str](r_shrink);
         var idx: u32 = 0;
@@ -277,125 +661,110 @@ pub fun resolve_deps(p: *project.Project, m: *manifest.Manifest, project_root: s
             idx = idx + 1;
         }
         A.deallocate[project.DepEntry](p.alloc, deps, max_deps);
+        if (p.config.deps != nil && p.config.dep_count > 0) {
+            project.free_dep_entries(p.alloc, p.config.deps, p.config.dep_count, p.config.dep_count::usize);
+        }
         p.config.deps      = shrunk;
         p.config.dep_count = dep_count;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# free resolve_cascade_libs's per-dep scratch: dnit each parsed manifest, then
-# release the manifest/table/alias/order/visited arrays (all sized to `n`)
-fun free_cascade_scratch(alloc: *A.Allocator, manifests: *manifest.Manifest, tables: *toml.Table, aliases: *str, order: *u32, visited: *bool, n: u32) {
-    var i: u32 = 0;
-    for (i < n) { manifest.dnit(?manifests[i], alloc); i = i + 1; }
-    A.deallocate[manifest.Manifest](alloc, manifests, n::usize);
-    # each parsed dep manifest is a per-call tree, not just an array slot: the
-    # slot's storage goes with the array, the tree under it does not (#3001)
-    i = 0;
-    for (i < n) { toml.dnit(alloc, ?tables[i]); i = i + 1; }
-    A.deallocate[toml.Table](alloc, tables, n::usize);
-    A.deallocate[str](alloc, aliases, n::usize);
+fun free_cascade_scratch(alloc: *A.Allocator, order: *u32, state: *u8, n: u32) {
     A.deallocate[u32](alloc, order, n::usize);
-    A.deallocate[bool](alloc, visited, n::usize);
+    A.deallocate[u8](alloc, state, n::usize);
 }
 
-# gather the transitive dependencies' matched link libs into
-# `p.config.cascade_libs` (#1218, #1326). a dependency declares its own
-# `[os.<name>].libs` (matched on the os component) and `[target.*].libs` (matched
-# on the full (isa, os, abi) tuple), and a consumer inherits every such lib for the
-# build it is producing - so a platform link requirement (e.g. `kernel32.dll`)
-# lives once in the providing dependency's manifest. order is topological (a dep's
-# own deps first); within each dep the matching os overlays precede the matching
-# target libs. requirements are deduplicated by source, text, and stable library
-# identity; the consumer's own `own_libs` are excluded, so a shared requirement is
-# never linked twice. an empty result leaves the cascade nil/0, so a build with no
-# inheriting deps is unaffected
-pub fun resolve_cascade_libs(p: *project.Project, project_root: str, isa: str, os: str, abi: str,
-                         own_libs: *manifest.LinkRequirement, own_count: u32) R.Result[bool, str] {
+fun dep_graph_index(p: *project.Project, id: intern.StrId) i64 {
+    var i: u32 = 0;
+    for (i < p.config.dep_count) {
+        if (p.config.deps[i].project_id == id) { ret i::i64; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+fun cascade_dfs(p: *project.Project, state: *u8, order: *u32, order_len: *u32, i: u32) R.Result[R.Void, str] {
+    if (state[i] == 2) { ret R.ok_void[str](); }
+    if (state[i] == 1) { ret R.err[R.Void, str]("dependency graph contains a cycle"); }
+    state[i] = 1;
+    var k: u32 = 0;
+    for (k < p.config.deps[i].direct_count) {
+        val next: i64 = dep_graph_index(p, p.config.deps[i].direct[k]);
+        if (next < 0) { ret R.err[R.Void, str]("verified dependency graph contains an unresolved direct edge"); }
+        val rr: R.Result[R.Void, str] = cascade_dfs(p, state, order, order_len, next::u32);
+        if (R.is_err[R.Void, str](rr)) { ret rr; }
+        k = k + 1;
+    }
+    state[i] = 2;
+    order[@order_len] = i;
+    @order_len = @order_len + 1;
+    ret R.ok_void[str]();
+}
+
+pub fun resolve_cascade_libs(p: *project.Project, isa: str, os: str, abi: str,
+                         own_libs: *manifest.LinkRequirement, own_count: u32) R.Result[R.Void, str] {
+    if (p.config.cascade_libs != nil && p.config.cascade_lib_count > 0) {
+        manifest.free_link_claims(p.alloc, p.config.cascade_libs, p.config.cascade_lib_count);
+        A.deallocate[manifest.LinkRequirement](p.alloc, p.config.cascade_libs, p.config.cascade_lib_count::usize);
+    }
     p.config.cascade_libs      = nil;
     p.config.cascade_lib_count = 0;
     val n: u32 = p.config.dep_count;
-    if (n == 0) { ret R.ok[bool, str](true); }
+    if (n == 0) { ret R.ok_void[str](); }
 
-    val tr: R.Result[*toml.Table, str] = A.allocate[toml.Table](p.alloc, n::usize);
-    if (R.is_err[*toml.Table, str](tr)) { ret R.err[bool, str](R.unwrap_err[*toml.Table, str](tr)); }
-    val tables: *toml.Table = R.unwrap_ok[*toml.Table, str](tr);
-
-    val ar: R.Result[*str, str] = A.allocate[str](p.alloc, n::usize);
-    if (R.is_err[*str, str](ar)) { ret R.err[bool, str](R.unwrap_err[*str, str](ar)); }
-    val aliases: *str = R.unwrap_ok[*str, str](ar);
-
-    val mr: R.Result[*manifest.Manifest, str] = A.allocate[manifest.Manifest](p.alloc, n::usize);
-    if (R.is_err[*manifest.Manifest, str](mr)) { ret R.err[bool, str](R.unwrap_err[*manifest.Manifest, str](mr)); }
-    val manifests: *manifest.Manifest = R.unwrap_ok[*manifest.Manifest, str](mr);
-
+    val ov: R.Result[*u32, str] = A.allocate[u32](p.alloc, n::usize);
+    if (R.is_err[*u32, str](ov)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](ov)); }
+    val order: *u32 = R.unwrap_ok[*u32, str](ov);
+    val vv: R.Result[*u8, str] = A.allocate[u8](p.alloc, n::usize);
+    if (R.is_err[*u8, str](vv)) {
+        A.deallocate[u32](p.alloc, order, n::usize);
+        ret R.err[R.Void, str](R.unwrap_err[*u8, str](vv));
+    }
+    val state: *u8 = R.unwrap_ok[*u8, str](vv);
     var i: u32 = 0;
+    for (i < n) { state[i] = 0; i = i + 1; }
+    var order_len: u32 = 0;
+    i = 0;
     for (i < n) {
-        val vr_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.deps[i].vendor_root);
-        val al_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.deps[i].alias);
-        if (O.is_none[str](vr_opt) || O.is_none[str](al_opt)) { ret R.err[bool, str]("internal: dep metadata not interned"); }
-        aliases[i] = O.unwrap[str](al_opt);
-        val tp_r: R.Result[str, str] = load.join_path(p.alloc, O.unwrap[str](vr_opt), manifest.MANIFEST_FILE);
-        if (R.is_err[str, str](tp_r)) { ret R.err[bool, str](R.unwrap_err[str, str](tp_r)); }
-        val tp: str = R.unwrap_ok[str, str](tp_r);
-        val pr: R.Result[toml.Table, str] = parse_toml_file(p.alloc, tp);
-        str_free(p.alloc, tp);
-        if (R.is_err[toml.Table, str](pr)) { ret R.err[bool, str](R.unwrap_err[toml.Table, str](pr)); }
-        tables[i] = R.unwrap_ok[toml.Table, str](pr);
-
-        # a dependency's manifest: as_root false, parsed permissively for its export
-        # surface only (#1971) -- the dep's totality is enforced on its own root builds.
-        val mf_r: R.Result[manifest.Manifest, str] = manifest.parse(p.alloc, ?p.s.interner, ?tables[i], false);
-        if (R.is_err[manifest.Manifest, str](mf_r)) { ret R.err[bool, str](R.unwrap_err[manifest.Manifest, str](mf_r)); }
-        manifests[i] = R.unwrap_ok[manifest.Manifest, str](mf_r);
-
+        val dr: R.Result[R.Void, str] = cascade_dfs(p, state, order, ?order_len, i);
+        if (R.is_err[R.Void, str](dr)) {
+            free_cascade_scratch(p.alloc, order, state, n);
+            ret dr;
+        }
         i = i + 1;
     }
 
-    val ov: R.Result[*u32, str] = A.allocate[u32](p.alloc, n::usize);
-    if (R.is_err[*u32, str](ov)) { ret R.err[bool, str](R.unwrap_err[*u32, str](ov)); }
-    val order: *u32 = R.unwrap_ok[*u32, str](ov);
-    val vv: R.Result[*bool, str] = A.allocate[bool](p.alloc, n::usize);
-    if (R.is_err[*bool, str](vv)) { ret R.err[bool, str](R.unwrap_err[*bool, str](vv)); }
-    val visited: *bool = R.unwrap_ok[*bool, str](vv);
-    i = 0;
-    for (i < n) { visited[i] = false; i = i + 1; }
-    var order_len: u32 = 0;
-    i = 0;
-    for (i < n) { cascade_dfs(?tables[0], aliases, visited, order, ?order_len, n, i); i = i + 1; }
-
-    # Setup target filters
     var tgt: manifest.TargetDef;
     val res_tgt_isa: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, isa);
-    if (R.is_err[intern.StrId, str](res_tgt_isa)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](res_tgt_isa)); }
+    if (R.is_err[intern.StrId, str](res_tgt_isa)) { free_cascade_scratch(p.alloc, order, state, n); ret R.err[R.Void, str](R.unwrap_err[intern.StrId, str](res_tgt_isa)); }
     tgt.isa = R.unwrap_ok[intern.StrId, str](res_tgt_isa);
 
     val res_tgt_os: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, os);
-    if (R.is_err[intern.StrId, str](res_tgt_os)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](res_tgt_os)); }
+    if (R.is_err[intern.StrId, str](res_tgt_os)) { free_cascade_scratch(p.alloc, order, state, n); ret R.err[R.Void, str](R.unwrap_err[intern.StrId, str](res_tgt_os)); }
     tgt.os = R.unwrap_ok[intern.StrId, str](res_tgt_os);
 
     val res_tgt_abi: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, abi);
-    if (R.is_err[intern.StrId, str](res_tgt_abi)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](res_tgt_abi)); }
+    if (R.is_err[intern.StrId, str](res_tgt_abi)) { free_cascade_scratch(p.alloc, order, state, n); ret R.err[R.Void, str](R.unwrap_err[intern.StrId, str](res_tgt_abi)); }
     tgt.abi = R.unwrap_ok[intern.StrId, str](res_tgt_abi);
 
-    # Calculate max possible matching libs to allocate buffer
     var max: u32 = 0;
     i = 0;
     for (i < n) {
-        val mfd: *manifest.Manifest = ?manifests[i];
+        val mfd: *manifest.Manifest = ?p.config.deps[i].manifest;
         max = max + mfd.link_count;
         i = i + 1;
     }
 
     if (max == 0) {
-        free_cascade_scratch(p.alloc, manifests, tables, aliases, order, visited, n);
-        ret R.ok[bool, str](true);
+        free_cascade_scratch(p.alloc, order, state, n);
+        ret R.ok_void[str]();
     }
 
     val br: R.Result[*manifest.LinkRequirement, str] = A.allocate[manifest.LinkRequirement](p.alloc, max::usize);
     if (R.is_err[*manifest.LinkRequirement, str](br)) {
-        free_cascade_scratch(p.alloc, manifests, tables, aliases, order, visited, n);
-        ret R.err[bool, str](R.unwrap_err[*manifest.LinkRequirement, str](br));
+        free_cascade_scratch(p.alloc, order, state, n);
+        ret R.err[R.Void, str](R.unwrap_err[*manifest.LinkRequirement, str](br));
     }
     val buf: *manifest.LinkRequirement = R.unwrap_ok[*manifest.LinkRequirement, str](br);
     var w: u32 = 0;
@@ -403,31 +772,27 @@ pub fun resolve_cascade_libs(p: *project.Project, project_root: str, isa: str, o
     var oi: u32 = 0;
     for (oi < order_len) {
         val di: u32 = order[oi];
-        val mfd: *manifest.Manifest = ?manifests[di];
+        val mfd: *manifest.Manifest = ?p.config.deps[di].manifest;
 
         var li: u32 = 0;
         for (li < mfd.link_count) {
             val l: *manifest.LinkDef = ?mfd.links[li];
             if (l.export && manifest.link_matches_target(?p.s.interner, l, ?tgt)) {
-                # a `local` entry's path homes against the ROOT project out (#1970): the
-                # exported object lands in the consumer out tree, where the demanding dep
-                # step (run beforehand by execute_dep_steps) writes it. every source
-                # kind keeps its declared semantics and stable attribution identity.
                 val root_out_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.project_out);
                 if (O.is_none[str](root_out_opt)) {
-                    free_cascade_scratch(p.alloc, manifests, tables, aliases, order, visited, n);
+                    free_cascade_scratch(p.alloc, order, state, n);
                     manifest.free_link_claims(p.alloc, buf, w);
                     A.deallocate[manifest.LinkRequirement](p.alloc, buf, max::usize);
-                    ret R.err[bool, str]("internal: project output not interned");
+                    ret R.err[R.Void, str]("internal: project output not interned");
                 }
                 var cv: manifest.TmplVars = cell_tmpl_vars(p);
                 val req_r: R.Result[manifest.LinkRequirement, str] =
                     manifest.link_requirement(p.alloc, ?p.s.interner, l, O.unwrap[str](root_out_opt), ?cv);
                 if (R.is_err[manifest.LinkRequirement, str](req_r)) {
-                    free_cascade_scratch(p.alloc, manifests, tables, aliases, order, visited, n);
+                    free_cascade_scratch(p.alloc, order, state, n);
                     manifest.free_link_claims(p.alloc, buf, w);
                     A.deallocate[manifest.LinkRequirement](p.alloc, buf, max::usize);
-                    ret R.err[bool, str](R.unwrap_err[manifest.LinkRequirement, str](req_r));
+                    ret R.err[R.Void, str](R.unwrap_err[manifest.LinkRequirement, str](req_r));
                 }
                 var req: manifest.LinkRequirement = R.unwrap_ok[manifest.LinkRequirement, str](req_r);
                 val own_duplicate: i64 = requirement_index(own_libs, own_count, ?req);
@@ -440,15 +805,14 @@ pub fun resolve_cascade_libs(p: *project.Project, project_root: str, isa: str, o
                     var retained: *manifest.LinkRequirement = nil;
                     if (own_duplicate >= 0) { retained = ?own_libs[own_duplicate::u32]; }
                     or { retained = ?buf[dep_duplicate::u32]; }
-                    val mr: R.Result[bool, str] =
+                    val mr: R.Result[R.Void, str] =
                         manifest.merge_link_claims(p.alloc, retained, ?req);
-                    if (R.is_err[bool, str](mr)) {
+                    if (R.is_err[R.Void, str](mr)) {
                         manifest.free_link_claims(p.alloc, ?req, 1);
-                        free_cascade_scratch(p.alloc, manifests, tables, aliases,
-                                             order, visited, n);
+                        free_cascade_scratch(p.alloc, order, state, n);
                         manifest.free_link_claims(p.alloc, buf, w);
                         A.deallocate[manifest.LinkRequirement](p.alloc, buf, max::usize);
-                        ret R.err[bool, str](R.unwrap_err[bool, str](mr));
+                        ret mr;
                     }
                     manifest.free_link_claims(p.alloc, ?req, 1);
                 }
@@ -458,45 +822,11 @@ pub fun resolve_cascade_libs(p: *project.Project, project_root: str, isa: str, o
         oi = oi + 1;
     }
 
-    free_cascade_scratch(p.alloc, manifests, tables, aliases, order, visited, n);
+    free_cascade_scratch(p.alloc, order, state, n);
     ret manifest.finish_link_requirements(p.alloc, buf, max, w,
         ?p.config.cascade_libs, ?p.config.cascade_lib_count);
 }
 
-# post-order DFS visiting a dep's own declared deps before the dep
-# itself, so the emitted order is topological (dependencies first) with siblings
-# kept in declaration order. `base` points at the dep manifest table array
-fun cascade_dfs(base: *toml.Table, aliases: *str, visited: *bool, order: *u32, order_len: *u32, n: u32, i: u32) {
-    if (visited[i]) { ret; }
-    visited[i] = true;
-    var j: u32 = 0;
-    for (j < n) {
-        if (j != i && dep_declares(?base[i], aliases[j])) {
-            cascade_dfs(base, aliases, visited, order, order_len, n, j);
-        }
-        j = j + 1;
-    }
-    order[@order_len] = i;
-    @order_len = @order_len + 1;
-}
-
-# whether dep manifest `t` lists `alias` under its own `[deps.*]` or `[dep.*]`
-fun dep_declares(t: *toml.Table, alias: str) bool {
-    var deps_tab: *toml.Table = toml.get_table(t, "dep");
-    if (deps_tab == nil) {
-        deps_tab = toml.get_table(t, "deps");
-    }
-    if (deps_tab == nil) { ret false; }
-    val m: usize = toml.table_len(deps_tab);
-    var k: usize = 0;
-    for (k < m) {
-        if (str_equals(toml.table_key(deps_tab, k), alias)) { ret true; }
-        k = k + 1;
-    }
-    ret false;
-}
-
-# index of a typed link requirement in the first `count` entries of `arr`
 fun requirement_index(arr: *manifest.LinkRequirement, count: u32,
                       req: *manifest.LinkRequirement) i64 {
     if (arr == nil) { ret -1; }
@@ -509,24 +839,6 @@ fun requirement_index(arr: *manifest.LinkRequirement, count: u32,
     ret -1;
 }
 
-# the diagnostic for a dep whose manifest could not be read (#2471)
-#
-# Distinguishes the two real causes: the vendor location itself is missing - an
-# unresolved dep on a clean checkout, where `mach dep pull` is the fix - from a
-# vendor location that exists but whose manifest failed to open or parse for some
-# other reason, where `parse_toml_file`'s message already names the path and the
-# OS error. Naming the dep either way is what the bare passthrough this replaces
-# never did. The advice carries the project root the build was aimed at, because
-# `mach dep pull` acts on the project it is given and a bare one would realize
-# whatever project the shell happens to stand in (#2936).
-# ---
-# s:       session, for interning the returned message
-# alias:   the dep's `[dep.<alias>]` name
-# dep_dir: the dep's vendor root, checked for existence to pick the diagnosis
-# root:    the project root being built, named in the advice so the command is
-#          runnable from where the build was
-# read_err: `parse_toml_file`'s error (path- and OS-message-qualified already)
-# ret:     the owned, interned diagnostic
 fun diag_dep_manifest_error(s: *session.Session, alias: str, dep_dir: str, root: str, read_err: str) str {
     val fallback: str = "dep manifest unreadable; run `mach dep pull`";
     var res_msg: R.Result[str, str];
@@ -549,13 +861,531 @@ fun diag_dep_manifest_error(s: *session.Session, alias: str, dep_dir: str, root:
     ret fallback;
 }
 
-# load a dep's own mach.toml to recover its [project].id and source
-# dir. vendor layout follows doc/dependencies.md:
-# <project_root>/<dir_dep>/<alias>/
-fun resolve_dep(s: *session.Session, alias: str, project_root: str, dir_dep: str) R.Result[project.DepEntry, str] {
+fun git_inspector_require(alloc: *A.Allocator, gi: *GitInspector) R.Result[R.Void, str] {
+    if (!str_empty(gi.program)) { ret R.ok_void[str](); }
+    val ir: R.Result[GitInspector, str] = git_inspector_init(alloc);
+    if (R.is_err[GitInspector, str](ir)) { ret R.err[R.Void, str](R.unwrap_err[GitInspector, str](ir)); }
+    @gi = R.unwrap_ok[GitInspector, str](ir);
+    ret R.ok_void[str]();
+}
+
+fun git_query_named(s: *session.Session, gi: *GitInspector, alias: str, dir: str,
+                    args: *str, count: usize, fact: str) R.Result[str, str] {
+    val qr: R.Result[str, str] = git_query(s.build_alloc, gi, dir, args, count);
+    if (R.is_ok[str, str](qr)) { ret qr; }
+    val mr: R.Result[str, str] = format.sprint(s.build_alloc,
+        "dependency '{}': cannot verify {}: {}", alias, fact, R.unwrap_err[str, str](qr));
+    if (R.is_err[str, str](mr)) { ret R.err[str, str](R.unwrap_err[str, str](qr)); }
+    ret R.err[str, str](R.unwrap_ok[str, str](mr));
+}
+
+fun require_git_root(s: *session.Session, gi: *GitInspector, alias: str, dir: str,
+                     subject: str) R.Result[R.Void, str] {
+    var inside_args: [2]str;
+    inside_args[0] = "rev-parse"; inside_args[1] = "--is-inside-work-tree";
+    val inside_r: R.Result[str, str] = git_query_named(s, gi, alias, dir, ?inside_args[0], 2, subject);
+    if (R.is_err[str, str](inside_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](inside_r)); }
+    val inside: str = R.unwrap_ok[str, str](inside_r);
+    if (!str_equals(inside, "true")) {
+        str_free(s.build_alloc, inside);
+        ret R.err[R.Void, str]("dependency declaring package is not a Git work tree");
+    }
+    str_free(s.build_alloc, inside);
+
+    ret R.ok_void[str]();
+}
+
+val DEP_AUTHORITY_REPO: u8 = 0;
+val DEP_AUTHORITY_NESTED: u8 = 1;
+
+fun project_root_authority(s: *session.Session, gi: *GitInspector, alias: str,
+                           project_root: str) R.Result[u8, str] {
+    var inside_args: [2]str;
+    inside_args[0] = "rev-parse"; inside_args[1] = "--is-inside-work-tree";
+    val inside_r: R.Result[str, str] = git_query(s.build_alloc, gi, project_root, ?inside_args[0], 2);
+    if (R.is_err[str, str](inside_r)) {
+        val nr: R.Result[str, str] = format.sprint(s.build_alloc,
+            "dependency '{}': project root '{}' is not inside a Git repository; dependency realization is verified from Git",
+            alias, project_root);
+        if (R.is_err[str, str](nr)) { ret R.err[u8, str]("project root is not inside a Git repository"); }
+        ret R.err[u8, str](R.unwrap_ok[str, str](nr));
+    }
+    val inside: str = R.unwrap_ok[str, str](inside_r);
+    val is_tree: bool = str_equals(inside, "true");
+    str_free(s.build_alloc, inside);
+    if (!is_tree) {
+        val nr: R.Result[str, str] = format.sprint(s.build_alloc,
+            "dependency '{}': project root '{}' is not inside a Git repository; dependency realization is verified from Git",
+            alias, project_root);
+        if (R.is_err[str, str](nr)) { ret R.err[u8, str]("project root is not inside a Git repository"); }
+        ret R.err[u8, str](R.unwrap_ok[str, str](nr));
+    }
+    val prefix_r: R.Result[str, str] = declaring_prefix(s, gi, alias, project_root);
+    if (R.is_err[str, str](prefix_r)) { ret R.err[u8, str](R.unwrap_err[str, str](prefix_r)); }
+    val prefix: str = R.unwrap_ok[str, str](prefix_r);
+    val nested: bool = !str_empty(prefix);
+    str_free(s.build_alloc, prefix);
+    if (nested) { ret R.ok[u8, str](DEP_AUTHORITY_NESTED); }
+    ret R.ok[u8, str](DEP_AUTHORITY_REPO);
+}
+
+pub fun root_not_repository_root(s: *session.Session, project_root: str) R.Result[str, str] {
+    var gi: GitInspector = GitInspector{program: ""};
+    val er: R.Result[R.Void, str] = git_inspector_require(s.build_alloc, ?gi);
+    if (R.is_err[R.Void, str](er)) { git_inspector_dnit(s.build_alloc, ?gi); ret R.err[str, str](R.unwrap_err[R.Void, str](er)); }
+    var top_args: [2]str;
+    top_args[0] = "rev-parse"; top_args[1] = "--show-toplevel";
+    val top_r: R.Result[str, str] = git_query(s.build_alloc, ?gi, project_root, ?top_args[0], 2);
+    var prefix_r: R.Result[str, str] = R.ok[str, str]("");
+    if (R.is_ok[str, str](top_r)) {
+        var pre_args: [2]str;
+        pre_args[0] = "rev-parse"; pre_args[1] = "--show-prefix";
+        prefix_r = git_query(s.build_alloc, ?gi, project_root, ?pre_args[0], 2);
+    }
+    git_inspector_dnit(s.build_alloc, ?gi);
+    if (R.is_err[str, str](top_r)) { ret R.err[str, str]("project root is not inside a Git repository"); }
+    val top: str = R.unwrap_ok[str, str](top_r);
+    if (R.is_err[str, str](prefix_r)) { str_free(s.build_alloc, top); ret R.err[str, str]("project root prefix is not readable"); }
+    val prefix: str = R.unwrap_ok[str, str](prefix_r);
+    if (str_empty(prefix)) {
+        str_free(s.build_alloc, prefix);
+        str_free(s.build_alloc, top);
+        ret R.ok[str, str]("");
+    }
+    str_free(s.build_alloc, prefix);
+    ret R.ok[str, str](top);
+}
+
+fun declaring_prefix(s: *session.Session, gi: *GitInspector, alias: str, dir: str) R.Result[str, str] {
+    var args: [2]str;
+    args[0] = "rev-parse"; args[1] = "--show-prefix";
+    ret git_query_named(s, gi, alias, dir, ?args[0], 2, "declaring package identity");
+}
+
+fun git_object_id_valid(id: str) bool {
+    val n: usize = str_len(id);
+    if (n != 40 && n != 64) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        val c: u8 = id[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun index_entry_field(s: *session.Session, gi: *GitInspector, alias: str, root: str,
+                      rel: str, field: usize, fact: str) R.Result[str, str] {
+    var args: [4]str;
+    args[0] = "ls-files"; args[1] = "--stage"; args[2] = "--"; args[3] = rel;
+    val q: R.Result[str, str] = git_query_named(s, gi, alias, root, ?args[0], 4, fact);
+    if (R.is_err[str, str](q)) { ret q; }
+    val line: str = R.unwrap_ok[str, str](q);
+    val n: usize = str_len(line);
+    var start_i: usize = 0;
+    var f: usize = 0;
+    for (f < field) {
+        for (start_i < n && line[start_i] != ' ') { start_i = start_i + 1; }
+        if (start_i < n) { start_i = start_i + 1; }
+        f = f + 1;
+    }
+    var end_i: usize = start_i;
+    for (end_i < n && line[end_i] != ' ' && line[end_i] != '\t') { end_i = end_i + 1; }
+    val out: R.Result[str, str] = str_copy_slice(s.build_alloc, line, start_i, end_i - start_i);
+    str_free(s.build_alloc, line);
+    ret out;
+}
+
+fun porcelain_has_worktree_change(text: str) bool {
+    val n: usize = str_len(text);
+    var i: usize = 0;
+    for (i < n) {
+        var j: usize = i;
+        for (j < n && text[j] != '\n') { j = j + 1; }
+        if (j - i >= 2 && text[i + 1] != ' ') { ret true; }
+        i = j + 1;
+    }
+    ret false;
+}
+
+fun require_matches_index(s: *session.Session, gi: *GitInspector, alias: str, root: str,
+                          rel: str, subject: str) R.Result[R.Void, str] {
+    var args: [5]str;
+    args[0] = "status"; args[1] = "--porcelain=v1"; args[2] = "--untracked-files=all";
+    args[3] = "--"; args[4] = rel;
+    val q: R.Result[str, str] = git_query_raw(s.build_alloc, gi, root, ?args[0], 5);
+    if (R.is_err[str, str](q)) {
+        val er: R.Result[str, str] = git_query_named(s, gi, alias, root, ?args[0], 5, subject);
+        if (R.is_err[str, str](er)) { ret R.err[R.Void, str](R.unwrap_err[str, str](er)); }
+        str_free(s.build_alloc, R.unwrap_ok[str, str](er));
+        ret R.ok_void[str]();
+    }
+    val out: str = R.unwrap_ok[str, str](q);
+    val dirty: bool = porcelain_has_worktree_change(out);
+    str_free(s.build_alloc, out);
+    if (!dirty) { ret R.ok_void[str](); }
+    val msg_r: R.Result[str, str] = format.sprint(s.build_alloc,
+        "dependency '{}': '{}' in the working tree does not match what is staged", alias, rel);
+    if (R.is_err[str, str](msg_r)) { ret R.err[R.Void, str]("a dependency record does not match what is staged"); }
+    ret R.err[R.Void, str](R.unwrap_ok[str, str](msg_r));
+}
+
+fun require_tracked(s: *session.Session, gi: *GitInspector, alias: str, root: str,
+                    rel: str, subject: str) R.Result[R.Void, str] {
+    var args: [4]str;
+    args[0] = "ls-files"; args[1] = "--"; args[2] = rel; args[3] = "";
+    val q: R.Result[str, str] = git_query_named(s, gi, alias, root, ?args[0], 3, subject);
+    if (R.is_err[str, str](q)) { ret R.err[R.Void, str](R.unwrap_err[str, str](q)); }
+    val out: str = R.unwrap_ok[str, str](q);
+    val present: bool = !str_empty(out);
+    str_free(s.build_alloc, out);
+    if (present) { ret R.ok_void[str](); }
+    val msg_r: R.Result[str, str] = format.sprint(s.build_alloc,
+        "dependency '{}': '{}' is not staged; `mach dep pull` stages what it realizes", alias, rel);
+    if (R.is_err[str, str](msg_r)) { ret R.err[R.Void, str]("a dependency record is not staged"); }
+    ret R.err[R.Void, str](R.unwrap_ok[str, str](msg_r));
+}
+
+fun verify_declaring_manifest(s: *session.Session, gi: *GitInspector, alias: str,
+                              parent_root: str) R.Result[R.Void, str] {
+    ret require_git_root(s, gi, alias, parent_root, "declaring package identity");
+}
+
+fun verify_parent_gitlink(s: *session.Session, gi: *GitInspector, alias: str,
+                          parent_root: str, dir_dep: str, d: *manifest.DepDef) R.Result[intern.StrId, str] {
+    val manifest_r: R.Result[R.Void, str] = verify_declaring_manifest(s, gi, alias, parent_root);
+    if (R.is_err[R.Void, str](manifest_r)) { ret R.err[intern.StrId, str](R.unwrap_err[R.Void, str](manifest_r)); }
+
+    val gm_tracked: R.Result[R.Void, str] = require_tracked(s, gi, alias, parent_root, ".gitmodules", "staged dependency metadata");
+    if (R.is_err[R.Void, str](gm_tracked)) { ret R.err[intern.StrId, str](R.unwrap_err[R.Void, str](gm_tracked)); }
+    val gm_clean: R.Result[R.Void, str] = require_matches_index(s, gi, alias, parent_root, ".gitmodules", "staged dependency metadata");
+    if (R.is_err[R.Void, str](gm_clean)) { ret R.err[intern.StrId, str](R.unwrap_err[R.Void, str](gm_clean)); }
+
+    val rel_r: R.Result[str, str] = format.sprint(s.build_alloc, "{}/{}", dir_dep, alias);
+    if (R.is_err[str, str](rel_r)) { ret R.err[intern.StrId, str](R.unwrap_err[str, str](rel_r)); }
+    val rel: str = R.unwrap_ok[str, str](rel_r);
+
+    val gm_sha_r: R.Result[str, str] = index_entry_field(s, gi, alias, parent_root, ".gitmodules", 1, "staged dependency metadata");
+    if (R.is_err[str, str](gm_sha_r)) { str_free(s.build_alloc, rel); ret R.err[intern.StrId, str](R.unwrap_err[str, str](gm_sha_r)); }
+    val gm_sha: str = R.unwrap_ok[str, str](gm_sha_r);
+    val modules_spec_r: R.Result[str, str] = format.sprint(s.build_alloc, "--blob={}", gm_sha);
+    str_free(s.build_alloc, gm_sha);
+    if (R.is_err[str, str](modules_spec_r)) { str_free(s.build_alloc, rel); ret R.err[intern.StrId, str](R.unwrap_err[str, str](modules_spec_r)); }
+    val modules_spec: str = R.unwrap_ok[str, str](modules_spec_r);
+
+    val path_key_r: R.Result[str, str] = format.sprint(s.build_alloc, "submodule.{}.path", rel);
+    if (R.is_err[str, str](path_key_r)) {
+        str_free(s.build_alloc, modules_spec); str_free(s.build_alloc, rel);
+        ret R.err[intern.StrId, str](R.unwrap_err[str, str](path_key_r));
+    }
+    val path_key: str = R.unwrap_ok[str, str](path_key_r);
+    var config_args: [4]str;
+    config_args[0] = "config"; config_args[1] = modules_spec;
+    config_args[2] = "--get-all"; config_args[3] = path_key;
+    val path_r: R.Result[str, str] = git_query_named(s, gi, alias, parent_root, ?config_args[0], 4, ".gitmodules path");
+    str_free(s.build_alloc, path_key);
+    if (R.is_err[str, str](path_r)) {
+        str_free(s.build_alloc, modules_spec); str_free(s.build_alloc, rel);
+        ret R.err[intern.StrId, str](R.unwrap_err[str, str](path_r));
+    }
+    val observed_path: str = R.unwrap_ok[str, str](path_r);
+    if (!str_equals(observed_path, rel)) {
+        str_free(s.build_alloc, observed_path);
+        str_free(s.build_alloc, modules_spec); str_free(s.build_alloc, rel);
+        ret R.err[intern.StrId, str]("dependency .gitmodules path does not match its package-owned realization");
+    }
+    str_free(s.build_alloc, observed_path);
+
+    val url_key_r: R.Result[str, str] = format.sprint(s.build_alloc, "submodule.{}.url", rel);
+    if (R.is_err[str, str](url_key_r)) {
+        str_free(s.build_alloc, modules_spec); str_free(s.build_alloc, rel);
+        ret R.err[intern.StrId, str](R.unwrap_err[str, str](url_key_r));
+    }
+    val url_key: str = R.unwrap_ok[str, str](url_key_r);
+    config_args[3] = url_key;
+    val url_r: R.Result[str, str] = git_query_named(s, gi, alias, parent_root, ?config_args[0], 4, ".gitmodules URL");
+    str_free(s.build_alloc, url_key);
+    str_free(s.build_alloc, modules_spec);
+    if (R.is_err[str, str](url_r)) { str_free(s.build_alloc, rel); ret R.err[intern.StrId, str](R.unwrap_err[str, str](url_r)); }
+    val observed_url: str = R.unwrap_ok[str, str](url_r);
+    val source_opt: O.Option[str] = intern.lookup(?s.interner, d.git);
+    if (O.is_none[str](source_opt)) {
+        str_free(s.build_alloc, observed_url); str_free(s.build_alloc, rel);
+        ret R.err[intern.StrId, str]("dependency Git source is not interned");
+    }
+    if (!str_equals(observed_url, O.unwrap[str](source_opt))) {
+        str_free(s.build_alloc, observed_url); str_free(s.build_alloc, rel);
+        ret R.err[intern.StrId, str]("dependency .gitmodules URL does not match manifest source");
+    }
+    str_free(s.build_alloc, observed_url);
+
+    val mode_r: R.Result[str, str] = index_entry_field(s, gi, alias, parent_root, rel, 0, "staged gitlink");
+    if (R.is_err[str, str](mode_r)) { str_free(s.build_alloc, rel); ret R.err[intern.StrId, str](R.unwrap_err[str, str](mode_r)); }
+    val mode_text: str = R.unwrap_ok[str, str](mode_r);
+    val is_gitlink: bool = str_equals(mode_text, "160000");
+    str_free(s.build_alloc, mode_text);
+    if (!is_gitlink) {
+        str_free(s.build_alloc, rel);
+        ret R.err[intern.StrId, str]("dependency path is not a staged gitlink");
+    }
+    val sha_r: R.Result[str, str] = index_entry_field(s, gi, alias, parent_root, rel, 1, "staged gitlink");
+    str_free(s.build_alloc, rel);
+    if (R.is_err[str, str](sha_r)) { ret R.err[intern.StrId, str](R.unwrap_err[str, str](sha_r)); }
+    val gitlink: str = R.unwrap_ok[str, str](sha_r);
+    if (!git_object_id_valid(gitlink)) {
+        str_free(s.build_alloc, gitlink);
+        ret R.err[intern.StrId, str]("dependency path is not a staged gitlink");
+    }
+    val content_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, gitlink);
+    str_free(s.build_alloc, gitlink);
+    ret content_r;
+}
+
+fun selector_satisfied(s: *session.Session, gi: *GitInspector, alias: str, dep_dir: str, ref: str, pin: str) R.Result[R.Void, str] {
+    if (str_empty(ref) || str_starts_with(ref, "branch/")) { ret R.ok_void[str](); }
+    var want: str = "";
+    var owned: bool = false;
+    if (str_starts_with(ref, "commit/")) { want = (?ref[7])::str; }
+    or (str_starts_with(ref, "tag/")) {
+        val spec_r: R.Result[str, str] = format.sprint(s.build_alloc, "refs/tags/{}^{{commit}}", (?ref[4])::str);
+        if (R.is_err[str, str](spec_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](spec_r)); }
+        val spec: str = R.unwrap_ok[str, str](spec_r);
+        var args: [4]str;
+        args[0] = "rev-parse"; args[1] = "--verify"; args[2] = "--quiet"; args[3] = spec;
+        val r: R.Result[str, str] = git_query(s.build_alloc, gi, dep_dir, ?args[0], 4);
+        str_free(s.build_alloc, spec);
+        if (R.is_err[str, str](r)) {
+            val mr: R.Result[str, str] = format.sprint(s.build_alloc,
+                "dependency '{}': exact ref '{}' names a tag the checkout does not have; run `mach dep update {}` or `mach dep pull`", alias, ref, alias);
+            if (R.is_err[str, str](mr)) { ret R.err[R.Void, str]("dependency tag ref is not present in the checkout"); }
+            ret R.err[R.Void, str](R.unwrap_ok[str, str](mr));
+        }
+        want = R.unwrap_ok[str, str](r);
+        owned = true;
+    }
+    or { ret R.err[R.Void, str]("dependency ref kind is invalid"); }
+    val ok: bool = str_equals(want, pin);
+    if (ok) { if (owned) { str_free(s.build_alloc, want); } ret R.ok_void[str](); }
+    val mr: R.Result[str, str] = format.sprint(s.build_alloc,
+        "dependency '{}': exact ref '{}' resolves to '{}' but the realized commit is '{}'; run `mach dep update {}` to re-pin it, or declare the identity at the root to override",
+        alias, ref, want, pin, alias);
+    if (owned) { str_free(s.build_alloc, want); }
+    if (R.is_err[str, str](mr)) { ret R.err[R.Void, str]("dependency exact ref is not satisfied by the realized commit"); }
+    ret R.err[R.Void, str](R.unwrap_ok[str, str](mr));
+}
+
+fun requirer_selector_satisfied(s: *session.Session, gi: *GitInspector, alias: str, project_root: str,
+                                dir_dep: str, d: *manifest.DepDef, content: intern.StrId) R.Result[R.Void, str] {
+    if (d.git == intern.STR_NIL) { ret R.ok_void[str](); }
+    val content_opt: O.Option[str] = intern.lookup(?s.interner, content);
+    if (O.is_none[str](content_opt)) { ret R.ok_void[str](); }
+    val content_text: str = O.unwrap[str](content_opt);
+    if (!str_starts_with(content_text, "git/")) { ret R.ok_void[str](); }
+    val pin: str = (?content_text[4])::str;
+    val ref_opt: O.Option[str] = intern.lookup(?s.interner, d.ref);
+    if (O.is_none[str](ref_opt)) { ret R.ok_void[str](); }
+    val dep_dir_r: R.Result[str, str] = build_dep_root(s.build_alloc, project_root, dir_dep, alias);
+    if (R.is_err[str, str](dep_dir_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](dep_dir_r)); }
+    val dep_dir: str = R.unwrap_ok[str, str](dep_dir_r);
+    val r: R.Result[R.Void, str] = selector_satisfied(s, gi, alias, dep_dir, O.unwrap[str](ref_opt), pin);
+    str_free(s.build_alloc, dep_dir);
+    ret r;
+}
+
+fun verify_git_checkout(s: *session.Session, gi: *GitInspector, alias: str,
+                        parent_root: str, dep_dir: str, dir_dep: str,
+                        d: *manifest.DepDef, authority: u8) R.Result[intern.StrId, str] {
+    var gitlink: str = "";
+    if (authority == DEP_AUTHORITY_REPO) {
+        val gitlink_r: R.Result[intern.StrId, str] = verify_parent_gitlink(s, gi, alias, parent_root, dir_dep, d);
+        if (R.is_err[intern.StrId, str](gitlink_r)) { ret R.err[intern.StrId, str](R.unwrap_err[intern.StrId, str](gitlink_r)); }
+        val gitlink_id: intern.StrId = R.unwrap_ok[intern.StrId, str](gitlink_r);
+        val gitlink_opt: O.Option[str] = intern.lookup(?s.interner, gitlink_id);
+        if (O.is_none[str](gitlink_opt)) { ret R.err[intern.StrId, str]("dependency gitlink is not interned"); }
+        gitlink = O.unwrap[str](gitlink_opt);
+    }
+
+    val child_root_r: R.Result[R.Void, str] = require_git_root(s, gi, alias, dep_dir, "checkout identity");
+    if (R.is_err[R.Void, str](child_root_r)) { ret R.err[intern.StrId, str](R.unwrap_err[R.Void, str](child_root_r)); }
+    val child_prefix_r: R.Result[str, str] = declaring_prefix(s, gi, alias, dep_dir);
+    if (R.is_err[str, str](child_prefix_r)) { ret R.err[intern.StrId, str](R.unwrap_err[str, str](child_prefix_r)); }
+    val child_prefix: str = R.unwrap_ok[str, str](child_prefix_r);
+    if (!str_empty(child_prefix)) {
+        str_free(s.build_alloc, child_prefix);
+        ret R.err[intern.StrId, str]("dependency checkout must be the repository root");
+    }
+    str_free(s.build_alloc, child_prefix);
+
+    var head_args: [2]str;
+    head_args[0] = "rev-parse"; head_args[1] = "HEAD";
+    val head_r: R.Result[str, str] = git_query_named(s, gi, alias, dep_dir, ?head_args[0], 2, "checkout HEAD");
+    if (R.is_err[str, str](head_r)) { ret R.err[intern.StrId, str](R.unwrap_err[str, str](head_r)); }
+    val head: str = R.unwrap_ok[str, str](head_r);
+    if (!str_empty(gitlink) && !str_equals(head, gitlink)) {
+        val mr: R.Result[str, str] = format.sprint(s.build_alloc,
+            "dependency '{}': HEAD mismatch, parent gitlink is '{}' but checkout is '{}'", alias, gitlink, head);
+        str_free(s.build_alloc, head);
+        if (R.is_err[str, str](mr)) { ret R.err[intern.StrId, str]("dependency HEAD does not match parent gitlink"); }
+        ret R.err[intern.StrId, str](R.unwrap_ok[str, str](mr));
+    }
+    var pin: str = gitlink;
+    if (str_empty(pin)) { pin = head; }
+
+    val ref_opt: O.Option[str] = intern.lookup(?s.interner, d.ref);
+    if (O.is_none[str](ref_opt)) {
+        str_free(s.build_alloc, head);
+        ret R.err[intern.StrId, str]("dependency Git ref is not interned");
+    }
+    val ref: str = O.unwrap[str](ref_opt);
+    if (str_starts_with(ref, "commit/")) {
+        if (!str_equals((?ref[7])::str, pin)) {
+            val mr: R.Result[str, str] = format.sprint(s.build_alloc,
+                "dependency '{}': exact commit ref '{}' is not satisfied by the realized commit '{}'",
+                alias, ref, pin);
+            str_free(s.build_alloc, head);
+            if (R.is_err[str, str](mr)) { ret R.err[intern.StrId, str]("dependency commit ref does not match the realized commit"); }
+            ret R.err[intern.StrId, str](R.unwrap_ok[str, str](mr));
+        }
+    }
+    or (str_starts_with(ref, "tag/") || str_starts_with(ref, "branch/")) { }
+    or { str_free(s.build_alloc, head); ret R.err[intern.StrId, str]("dependency ref kind is invalid"); }
+
+    var status_args: [3]str;
+    status_args[0] = "status"; status_args[1] = "--porcelain=v1"; status_args[2] = "--untracked-files=all";
+    val status_r: R.Result[str, str] = git_query_named(s, gi, alias, dep_dir, ?status_args[0], 3, "checkout cleanliness");
+    if (R.is_err[str, str](status_r)) {
+        str_free(s.build_alloc, head);
+        ret R.err[intern.StrId, str](R.unwrap_err[str, str](status_r));
+    }
+    val status: str = R.unwrap_ok[str, str](status_r);
+    if (!str_empty(status)) {
+        val mr: R.Result[str, str] = format.sprint(s.build_alloc,
+            "dependency '{}': checkout is dirty: {}", alias, status);
+        str_free(s.build_alloc, status);
+        str_free(s.build_alloc, head);
+        if (R.is_err[str, str](mr)) { ret R.err[intern.StrId, str]("dependency checkout is dirty"); }
+        ret R.err[intern.StrId, str](R.unwrap_ok[str, str](mr));
+    }
+    str_free(s.build_alloc, status);
+    val links_r: R.Result[R.Void, str] = verify_realization_symlinks(s, gi, alias, dep_dir, "", dep_dir);
+    if (R.is_err[R.Void, str](links_r)) { str_free(s.build_alloc, head); ret R.err[intern.StrId, str](R.unwrap_err[R.Void, str](links_r)); }
+    val content_text_r: R.Result[str, str] = format.sprint(s.build_alloc, "git/{}", pin);
+    str_free(s.build_alloc, head);
+    if (R.is_err[str, str](content_text_r)) { ret R.err[intern.StrId, str](R.unwrap_err[str, str](content_text_r)); }
+    val content_text: str = R.unwrap_ok[str, str](content_text_r);
+    val content_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, content_text);
+    str_free(s.build_alloc, content_text);
+    ret content_r;
+}
+
+fun contained_tree_walk(alloc: *A.Allocator, root: str, rel: str) R.Result[R.Void, str] {
+    val at_r: R.Result[str, str] = load.join_path(alloc, root, rel);
+    if (R.is_err[str, str](at_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](at_r)); }
+    val at: str = R.unwrap_ok[str, str](at_r);
+    val names_r: R.Result[Vector[str], str] = fs.read_dir(alloc, at);
+    str_free(alloc, at);
+    if (R.is_err[Vector[str], str](names_r)) { ret R.err[R.Void, str](R.unwrap_err[Vector[str], str](names_r)); }
+    var names: Vector[str] = R.unwrap_ok[Vector[str], str](names_r);
+    sort.sort[str](names.data, names.len, cmp_dep_name);
+    var i: usize = 0;
+    for (i < names.len) {
+        val child_r: R.Result[str, str] = format.sprint(alloc, "{}{}", rel, names.data[i]);
+        if (R.is_err[str, str](child_r)) { free_name_vector(alloc, ?names); ret R.err[R.Void, str](R.unwrap_err[str, str](child_r)); }
+        val child: str = R.unwrap_ok[str, str](child_r);
+        val full_r: R.Result[str, str] = load.join_path(alloc, root, child);
+        if (R.is_err[str, str](full_r)) { str_free(alloc, child); free_name_vector(alloc, ?names); ret R.err[R.Void, str](R.unwrap_err[str, str](full_r)); }
+        val full: str = R.unwrap_ok[str, str](full_r);
+        val meta_r: R.Result[fs.Metadata, str] = fs.metadata_link(full);
+        if (R.is_err[fs.Metadata, str](meta_r)) { str_free(alloc, full); str_free(alloc, child); free_name_vector(alloc, ?names); ret R.err[R.Void, str](R.unwrap_err[fs.Metadata, str](meta_r)); }
+        val meta: fs.Metadata = R.unwrap_ok[fs.Metadata, str](meta_r);
+        if (fs.meta_is_symlink(?meta)) {
+            str_free(alloc, full); str_free(alloc, child); free_name_vector(alloc, ?names);
+            ret R.err[R.Void, str]("path dependency realization must contain no symlinks");
+        }
+        if (fs.meta_is_dir(?meta)) {
+            str_free(alloc, full);
+            val nested_r: R.Result[str, str] = format.sprint(alloc, "{}/", child);
+            str_free(alloc, child);
+            if (R.is_err[str, str](nested_r)) { free_name_vector(alloc, ?names); ret R.err[R.Void, str](R.unwrap_err[str, str](nested_r)); }
+            val nested: str = R.unwrap_ok[str, str](nested_r);
+            val walk_r: R.Result[R.Void, str] = contained_tree_walk(alloc, root, nested);
+            str_free(alloc, nested);
+            if (R.is_err[R.Void, str](walk_r)) { free_name_vector(alloc, ?names); ret walk_r; }
+        }
+        or { str_free(alloc, full); str_free(alloc, child); }
+        i = i + 1;
+    }
+    free_name_vector(alloc, ?names);
+    ret R.ok_void[str]();
+}
+
+fun verify_path_checkout_nested(s: *session.Session, alias: str, dep_dir: str) R.Result[intern.StrId, str] {
+    val meta_r: R.Result[str, str] = load.join_path(s.build_alloc, dep_dir, ".git");
+    if (R.is_err[str, str](meta_r)) { ret R.err[intern.StrId, str](R.unwrap_err[str, str](meta_r)); }
+    val meta: str = R.unwrap_ok[str, str](meta_r);
+    val has_meta: bool = fs.exists(meta);
+    str_free(s.build_alloc, meta);
+    if (has_meta) { ret R.err[intern.StrId, str]("path dependency realization contains forbidden repository metadata"); }
+    val walk_r: R.Result[R.Void, str] = contained_tree_walk(s.build_alloc, dep_dir, "");
+    if (R.is_err[R.Void, str](walk_r)) { ret R.err[intern.StrId, str](R.unwrap_err[R.Void, str](walk_r)); }
+    val content_text_r: R.Result[str, str] = format.sprint(s.build_alloc, "path/{}", alias);
+    if (R.is_err[str, str](content_text_r)) { ret R.err[intern.StrId, str](R.unwrap_err[str, str](content_text_r)); }
+    val content_text: str = R.unwrap_ok[str, str](content_text_r);
+    val content_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, content_text);
+    str_free(s.build_alloc, content_text);
+    ret content_r;
+}
+
+fun verify_path_checkout(s: *session.Session, gi: *GitInspector, alias: str,
+                         parent_root: str, dep_dir: str, dir_dep: str) R.Result[intern.StrId, str] {
+    val manifest_r: R.Result[R.Void, str] = verify_declaring_manifest(s, gi, alias, parent_root);
+    if (R.is_err[R.Void, str](manifest_r)) { ret R.err[intern.StrId, str](R.unwrap_err[R.Void, str](manifest_r)); }
+
+    val rel_r: R.Result[str, str] = format.sprint(s.build_alloc, "{}/{}", dir_dep, alias);
+    if (R.is_err[str, str](rel_r)) { ret R.err[intern.StrId, str](R.unwrap_err[str, str](rel_r)); }
+    val rel: str = R.unwrap_ok[str, str](rel_r);
+    val tracked_r: R.Result[R.Void, str] = require_tracked(s, gi, alias, parent_root, rel, "staged path dependency");
+    if (R.is_err[R.Void, str](tracked_r)) { str_free(s.build_alloc, rel); ret R.err[intern.StrId, str](R.unwrap_err[R.Void, str](tracked_r)); }
+    val clean_r: R.Result[R.Void, str] = require_matches_index(s, gi, alias, parent_root, rel, "staged path dependency");
+    str_free(s.build_alloc, rel);
+    if (R.is_err[R.Void, str](clean_r)) { ret R.err[intern.StrId, str](R.unwrap_err[R.Void, str](clean_r)); }
+
+    ret verify_path_checkout_nested(s, alias, dep_dir);
+}
+
+fun realized_content(s: *session.Session, gi: *GitInspector, alias: str, parent_root: str,
+                     dep_dir: str, dir_dep: str, d: *manifest.DepDef) R.Result[intern.StrId, str] {
+    val er: R.Result[R.Void, str] = git_inspector_require(s.build_alloc, gi);
+    if (R.is_err[R.Void, str](er)) { ret R.err[intern.StrId, str](R.unwrap_err[R.Void, str](er)); }
+    val auth_r: R.Result[u8, str] = project_root_authority(s, gi, alias, parent_root);
+    if (R.is_err[u8, str](auth_r)) { ret R.err[intern.StrId, str](R.unwrap_err[u8, str](auth_r)); }
+    val authority: u8 = R.unwrap_ok[u8, str](auth_r);
+    if (d.git != intern.STR_NIL) { ret verify_git_checkout(s, gi, alias, parent_root, dep_dir, dir_dep, d, authority); }
+    if (authority == DEP_AUTHORITY_NESTED) { ret verify_path_checkout_nested(s, alias, dep_dir); }
+    ret verify_path_checkout(s, gi, alias, parent_root, dep_dir, dir_dep);
+}
+
+fun resolve_dep(s: *session.Session, gi: *GitInspector, alias: str, project_root: str,
+                dir_dep: str, d: *manifest.DepDef) R.Result[project.DepEntry, str] {
     val dep_dir_r: R.Result[str, str] = build_dep_root(s.build_alloc, project_root, dir_dep, alias);
     if (R.is_err[str, str](dep_dir_r)) { ret R.err[project.DepEntry, str](R.unwrap_err[str, str](dep_dir_r)); }
     val dep_dir: str = R.unwrap_ok[str, str](dep_dir_r);
+
+    if (!fs.exists(dep_dir)) {
+        val msg: str = diag_dep_manifest_error(s, alias, dep_dir, project_root, "dependency directory is missing");
+        str_free(s.build_alloc, dep_dir);
+        ret R.err[project.DepEntry, str](msg);
+    }
+    if (fs.is_symlink(dep_dir) || !fs.is_dir(dep_dir)) {
+        str_free(s.build_alloc, dep_dir);
+        ret R.err[project.DepEntry, str]("dependency realization must be a physical directory, not a symlink or other entry");
+    }
+
+    val content_r: R.Result[intern.StrId, str] = realized_content(s, gi, alias, project_root, dep_dir, dir_dep, d);
+    if (R.is_err[intern.StrId, str](content_r)) {
+        str_free(s.build_alloc, dep_dir);
+        ret R.err[project.DepEntry, str](R.unwrap_err[intern.StrId, str](content_r));
+    }
 
     val toml_path_r: R.Result[str, str] = load.join_path(s.build_alloc, dep_dir, manifest.MANIFEST_FILE);
     if (R.is_err[str, str](toml_path_r)) {
@@ -573,100 +1403,94 @@ fun resolve_dep(s: *session.Session, alias: str, project_root: str, dir_dep: str
     }
     var t: toml.Table = R.unwrap_ok[toml.Table, str](tr);
 
-    val id_str: str = toml.get_str(?t, "project.id");
-    if (str_empty(id_str)) {
-        val msg: str = load.diag_join3(s, "dep '", alias, "' mach.toml is missing [project].id", "dep mach.toml is missing [project].id");
+    val mr: R.Result[manifest.Manifest, str] = manifest.parse(s.build_alloc, ?s.interner, ?t, false);
+    toml.dnit(s.build_alloc, ?t);
+    if (R.is_err[manifest.Manifest, str](mr)) {
+        val msg_r: R.Result[str, str] = format.sprint(s.build_alloc, "dep '{}': {}", alias,
+            R.unwrap_err[manifest.Manifest, str](mr));
         str_free(s.build_alloc, dep_dir);
-        toml.dnit(s.build_alloc, ?t); ret R.err[project.DepEntry, str](msg);
+        if (R.is_err[str, str](msg_r)) { ret R.err[project.DepEntry, str](R.unwrap_err[manifest.Manifest, str](mr)); }
+        ret R.err[project.DepEntry, str](R.unwrap_ok[str, str](msg_r));
     }
+    var parsed: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](mr);
 
     var entry: project.DepEntry;
+    entry.direct = nil;
+    entry.direct_count = 0;
+    entry.chain = intern.STR_NIL;
+    entry.manifest = parsed;
+    entry.project_id = parsed.id;
+    entry.project_dir_src = parsed.src;
+    entry.ref = d.ref;
+    entry.content = R.unwrap_ok[intern.StrId, str](content_r);
 
     val ra: R.Result[intern.StrId, str] = intern.intern(?s.interner, alias);
     if (R.is_err[intern.StrId, str](ra)) {
         str_free(s.build_alloc, dep_dir);
-        toml.dnit(s.build_alloc, ?t); ret R.err[project.DepEntry, str](R.unwrap_err[intern.StrId, str](ra));
+        manifest.dnit(?entry.manifest, s.build_alloc); ret R.err[project.DepEntry, str](R.unwrap_err[intern.StrId, str](ra));
     }
     entry.alias = R.unwrap_ok[intern.StrId, str](ra);
 
-    val rp: R.Result[intern.StrId, str] = intern.intern(?s.interner, id_str);
-    if (R.is_err[intern.StrId, str](rp)) {
+    val source_r: R.Result[intern.StrId, str] = dep_source_label(s, d);
+    if (R.is_err[intern.StrId, str](source_r)) {
         str_free(s.build_alloc, dep_dir);
-        toml.dnit(s.build_alloc, ?t); ret R.err[project.DepEntry, str](R.unwrap_err[intern.StrId, str](rp));
+        manifest.dnit(?entry.manifest, s.build_alloc); ret R.err[project.DepEntry, str](R.unwrap_err[intern.StrId, str](source_r));
     }
-    entry.project_id = R.unwrap_ok[intern.StrId, str](rp);
-
-    # the dep's source dir: `[project].src`, defaulting to "src". resolution is
-    # purely by vendor layout otherwise.
-    val rds: R.Result[intern.StrId, str] = intern_or(?s.interner, toml.get_str(?t, "project.src"), "src");
-    if (R.is_err[intern.StrId, str](rds)) {
-        str_free(s.build_alloc, dep_dir);
-        toml.dnit(s.build_alloc, ?t); ret R.err[project.DepEntry, str](R.unwrap_err[intern.StrId, str](rds));
-    }
-    entry.project_dir_src = R.unwrap_ok[intern.StrId, str](rds);
-
-    # V2 dependency entry resolution:
-    # First, try to get the first [artifact.<name>].entry.
-    # If not found, try [artifact.<name>].entry.
-    # Otherwise, default to "lib.mach".
-    var dep_entry_file: str = "";
-    val arts_tab: *toml.Table = toml.get_table(?t, "artifact");
-    if (arts_tab != nil && toml.table_len(arts_tab) > 0) {
-        val first_art_val: *toml.Value = toml.table_value(arts_tab, 0);
-        if (first_art_val != nil && first_art_val.tag == toml.TYPE_TABLE) {
-            dep_entry_file = toml.get_str(?first_art_val.data.table, "entry");
-        }
-    }
-    if (str_empty(dep_entry_file)) {
-        val libs_tab: *toml.Table = toml.get_table(?t, "lib");
-        if (libs_tab != nil && toml.table_len(libs_tab) > 0) {
-            val first_lib_val: *toml.Value = toml.table_value(libs_tab, 0);
-            if (first_lib_val != nil && first_lib_val.tag == toml.TYPE_TABLE) {
-                dep_entry_file = toml.get_str(?first_lib_val.data.table, "entry");
-            }
-        }
-    }
-    if (str_empty(dep_entry_file)) {
-        val bins_tab: *toml.Table = toml.get_table(?t, "bin");
-        if (bins_tab != nil && toml.table_len(bins_tab) > 0) {
-            val first_bin_val: *toml.Value = toml.table_value(bins_tab, 0);
-            if (first_bin_val != nil && first_bin_val.tag == toml.TYPE_TABLE) {
-                dep_entry_file = toml.get_str(?first_bin_val.data.table, "entry");
-            }
-        }
-    }
-    if (str_empty(dep_entry_file)) {
-        dep_entry_file = "lib.mach";
-    }
+    entry.source = R.unwrap_ok[intern.StrId, str](source_r);
 
     entry.project_module = intern.STR_NIL;
-    val dep_src_text: str = O.unwrap[str](intern.lookup(?s.interner, entry.project_dir_src));
-    if (!str_empty(dep_entry_file)) {
-        if (!module_file_present(s.build_alloc, dep_dir, dep_src_text, dep_entry_file)) {
+    if (parsed.artifact_count == 0) {
+        val default_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, "lib.mach");
+        if (R.is_err[intern.StrId, str](default_r)) {
+            str_free(s.build_alloc, dep_dir);
+            manifest.dnit(?entry.manifest, s.build_alloc);
+            ret R.err[project.DepEntry, str](R.unwrap_err[intern.StrId, str](default_r));
+        }
+        entry.project_module = R.unwrap_ok[intern.StrId, str](default_r);
+    }
+    or {
+        entry.project_module = manifest.canonical_module(?parsed);
+    }
+
+    val dep_src_opt: O.Option[str] = intern.lookup(?s.interner, entry.project_dir_src);
+    if (O.is_none[str](dep_src_opt)) {
+        str_free(s.build_alloc, dep_dir);
+        manifest.dnit(?entry.manifest, s.build_alloc);
+        ret R.err[project.DepEntry, str]("dependency source directory is not interned");
+    }
+    val dep_src_text: str = O.unwrap[str](dep_src_opt);
+    if (entry.project_module != intern.STR_NIL) {
+        val entry_opt: O.Option[str] = intern.lookup(?s.interner, entry.project_module);
+        if (O.is_none[str](entry_opt)) {
+            str_free(s.build_alloc, dep_dir);
+            manifest.dnit(?entry.manifest, s.build_alloc);
+            ret R.err[project.DepEntry, str]("dependency canonical module is not interned");
+        }
+        val dep_entry_file: str = O.unwrap[str](entry_opt);
+        val present_r: R.Result[bool, str] = module_file_present(s.build_alloc, dep_dir, dep_src_text, dep_entry_file);
+        if (R.is_err[bool, str](present_r)) {
+            str_free(s.build_alloc, dep_dir);
+            manifest.dnit(?entry.manifest, s.build_alloc);
+            ret R.err[project.DepEntry, str](R.unwrap_err[bool, str](present_r));
+        }
+        if (!R.unwrap_ok[bool, str](present_r)) {
             val msg: str = load.diag_join_named(s, "dep '", entry.alias, "' mach.toml: default entry names no file", "dep mach.toml: default entry names no file");
             str_free(s.build_alloc, dep_dir);
-            toml.dnit(s.build_alloc, ?t); ret R.err[project.DepEntry, str](msg);
+            manifest.dnit(?entry.manifest, s.build_alloc); ret R.err[project.DepEntry, str](msg);
         }
-        val rmd: R.Result[intern.StrId, str] = intern.intern(?s.interner, dep_entry_file);
-        if (R.is_err[intern.StrId, str](rmd)) {
-            str_free(s.build_alloc, dep_dir);
-            toml.dnit(s.build_alloc, ?t); ret R.err[project.DepEntry, str](R.unwrap_err[intern.StrId, str](rmd));
-        }
-        entry.project_module = R.unwrap_ok[intern.StrId, str](rmd);
     }
 
     val rvr: R.Result[intern.StrId, str] = intern.intern(?s.interner, dep_dir);
     if (R.is_err[intern.StrId, str](rvr)) {
         str_free(s.build_alloc, dep_dir);
-        toml.dnit(s.build_alloc, ?t); ret R.err[project.DepEntry, str](R.unwrap_err[intern.StrId, str](rvr));
+        manifest.dnit(?entry.manifest, s.build_alloc); ret R.err[project.DepEntry, str](R.unwrap_err[intern.StrId, str](rvr));
     }
     entry.vendor_root = R.unwrap_ok[intern.StrId, str](rvr);
 
     str_free(s.build_alloc, dep_dir);
-    toml.dnit(s.build_alloc, ?t); ret R.ok[project.DepEntry, str](entry);
+    ret R.ok[project.DepEntry, str](entry);
 }
 
-# compose a dependency's vendor root path `<project_root>/<dir_dep>/<alias>`
 fun build_dep_root(alloc: *A.Allocator, project_root: str, dir_dep: str, alias: str) R.Result[str, str] {
     val a: R.Result[str, str] = load.join_path(alloc, project_root, dir_dep);
     if (R.is_err[str, str](a)) { ret a; }
@@ -676,39 +1500,1302 @@ fun build_dep_root(alloc: *A.Allocator, project_root: str, dir_dep: str, alias: 
     ret b;
 }
 
-# read `path` and parse its contents into a TOML Table, freeing the file text
-#
-# A read failure is reported with `path` and the OS message attached, never the
-# bare OS message alone (#2471) - every caller propagates this string as its own
-# error, so this is the one place that fixes all of them.
 pub fun parse_toml_file(alloc: *A.Allocator, path: str) R.Result[toml.Table, str] {
-    val rb: R.Result[str, str] = fs.read_string(alloc, path);
-    if (R.is_err[str, str](rb)) {
-        val res_msg: R.Result[str, str] = format.sprint(alloc, "cannot read '{}': {}", path, R.unwrap_err[str, str](rb));
-        if (R.is_err[str, str](res_msg)) { ret R.err[toml.Table, str](R.unwrap_err[str, str](rb)); }
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(alloc, path);
+    if (R.is_err[Vector[u8], str](rb)) {
+        val res_msg: R.Result[str, str] = format.sprint(alloc, "cannot read '{}': {}", path, R.unwrap_err[Vector[u8], str](rb));
+        if (R.is_err[str, str](res_msg)) { ret R.err[toml.Table, str](R.unwrap_err[Vector[u8], str](rb)); }
         ret R.err[toml.Table, str](R.unwrap_ok[str, str](res_msg));
     }
-    val src_text: str = R.unwrap_ok[str, str](rb);
-    val rt: R.Result[toml.Table, str] = toml.parse(alloc, src_text);
-    str_free(alloc, src_text);
+    var src: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+    val source_r: R.Result[R.Void, str] = manifest.validate_source_bytes(src.data, src.len);
+    if (R.is_err[R.Void, str](source_r)) {
+        vector.dnit[u8](?src);
+        ret R.err[toml.Table, str](R.unwrap_err[R.Void, str](source_r));
+    }
+    val reserve_r: R.Result[usize, str] = vector.reserve[u8](?src, 1);
+    if (R.is_err[usize, str](reserve_r)) {
+        vector.dnit[u8](?src);
+        ret R.err[toml.Table, str](R.unwrap_err[usize, str](reserve_r));
+    }
+    src.data[src.len] = 0;
+    val rt: R.Result[toml.Table, str] = toml.parse(alloc, src.data::str);
+    vector.dnit[u8](?src);
     ret rt;
 }
 
-# intern `text`, falling back to `default` when `text` is empty
-fun intern_or(i: *intern.Interner, text: str, default: str) R.Result[intern.StrId, str] {
-    var t: str = text;
-    if (str_empty(t)) { t = default; }
-    ret intern.intern(i, t);
-}
-
-# the closed template-variable set for the active build cell (#1964): the target
-# tuple (name/isa/os/abi) and profile a step path or cmd expands against.
 pub fun cell_tmpl_vars(p: *project.Project) manifest.TmplVars {
     var v: manifest.TmplVars;
-    v.target  = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.name));
-    v.isa     = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.isa_name));
-    v.os      = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.os_name));
-    v.abi     = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.abi_name));
-    v.profile = O.unwrap[str](intern.lookup(?p.s.interner, p.config.profile));
+    v.target    = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.name));
+    v.isa       = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.isa_name));
+    v.os        = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.os_name));
+    v.abi       = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.abi_name));
+    v.profile   = O.unwrap[str](intern.lookup(?p.s.interner, p.config.profile));
+    v.reqs      = p.config.art_reqs;
+    v.req_count = p.config.art_req_count;
     ret v;
+}
+
+val REALIZE_DEP_DIR: str = "dep";
+
+fun git_is_work_tree(alloc: *A.Allocator, gi: *GitInspector, dir: str) bool {
+    var args: [2]str;
+    args[0] = "rev-parse"; args[1] = "--is-inside-work-tree";
+    val r: R.Result[str, str] = git_query(alloc, gi, dir, ?args[0], 2);
+    if (R.is_err[str, str](r)) { ret false; }
+    val v: str = R.unwrap_ok[str, str](r);
+    val ok: bool = str_equals(v, "true");
+    str_free(alloc, v);
+    ret ok;
+}
+
+fun realize_checkout_target(alloc: *A.Allocator, ref: str) R.Result[str, str] {
+    if (str_starts_with(ref, "branch/")) {
+        val name: str = (?ref[7])::str;
+        if (str_empty(name)) { ret R.err[str, str]("empty branch selector"); }
+        ret format.sprint(alloc, "origin/{}", name);
+    }
+    if (str_starts_with(ref, "tag/")) {
+        val name: str = (?ref[4])::str;
+        if (str_empty(name)) { ret R.err[str, str]("empty tag selector"); }
+        ret format.sprint(alloc, "refs/tags/{}", name);
+    }
+    if (str_starts_with(ref, "commit/")) {
+        val name: str = (?ref[7])::str;
+        if (str_empty(name)) { ret R.err[str, str]("empty commit selector"); }
+        ret str_copy_slice(alloc, name, 0, str_len(name));
+    }
+    ret R.err[str, str]("dependency ref must be 'branch/<name>', 'tag/<name>', or 'commit/<id>'");
+}
+
+fun realize_selector_ref(alloc: *A.Allocator, gi: *GitInspector, dep_dir: str, ref: str, extra_env: **u8) R.Result[R.Void, str] {
+    val target_r: R.Result[str, str] = realize_checkout_target(alloc, ref);
+    if (R.is_err[str, str](target_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](target_r)); }
+    val target: str = R.unwrap_ok[str, str](target_r);
+    var args: [2]str;
+    args[0] = "checkout"; args[1] = target;
+    val r: R.Result[str, str] = git_op(alloc, gi, dep_dir, ?args[0], 2, extra_env);
+    str_free(alloc, target);
+    if (R.is_err[str, str](r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](r)); }
+    str_free(alloc, R.unwrap_ok[str, str](r));
+    ret R.ok_void[str]();
+}
+
+pub val ALIAS_KEYS_REJECTED: bool = false;
+
+pub fun check_dep_identity(s: *session.Session, key: str, declared: str, quiet: bool) R.Result[R.Void, str] {
+    if (str_equals(key, declared)) { ret R.ok_void[str](); }
+    if (ALIAS_KEYS_REJECTED) {
+        val msg_r: R.Result[str, str] = format.sprint(s.build_alloc,
+            "[dep.{}] realizes project '{}'; the manifest key, the directory under dep/, and the project id are one name: rename the table to [dep.{}] and the directory to dep/{}",
+            key, declared, declared, declared);
+        if (R.is_err[str, str](msg_r)) { ret R.err[R.Void, str]("dependency manifest id does not match its declared identity"); }
+        ret R.err[R.Void, str](R.unwrap_ok[str, str](msg_r));
+    }
+    if (!quiet) {
+        print.eprint("note: [dep.");
+        print.eprint(key);
+        print.eprint("] realizes project '");
+        print.eprint(declared);
+        print.eprint("'; rename the table to [dep.");
+        print.eprint(declared);
+        print.eprint("] and the directory to dep/");
+        print.eprint(declared);
+        print.eprint(". alias keys are rejected in 5.0.0\n");
+    }
+    ret R.ok_void[str]();
+}
+
+pub fun declared_dep_id(s: *session.Session, dep_full: str) R.Result[str, str] {
+    val toml_path_r: R.Result[str, str] = load.join_path(s.build_alloc, dep_full, manifest.MANIFEST_FILE);
+    if (R.is_err[str, str](toml_path_r)) { ret toml_path_r; }
+    val toml_path: str = R.unwrap_ok[str, str](toml_path_r);
+    val tr: R.Result[toml.Table, str] = parse_toml_file(s.build_alloc, toml_path);
+    str_free(s.build_alloc, toml_path);
+    if (R.is_err[toml.Table, str](tr)) { ret R.err[str, str](R.unwrap_err[toml.Table, str](tr)); }
+    var t: toml.Table = R.unwrap_ok[toml.Table, str](tr);
+    val mr: R.Result[manifest.Manifest, str] = manifest.parse(s.build_alloc, ?s.interner, ?t, false);
+    toml.dnit(s.build_alloc, ?t);
+    if (R.is_err[manifest.Manifest, str](mr)) { ret R.err[str, str](R.unwrap_err[manifest.Manifest, str](mr)); }
+    var parsed: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](mr);
+    val id_opt: O.Option[str] = intern.lookup(?s.interner, parsed.id);
+    if (O.is_none[str](id_opt)) {
+        manifest.dnit(?parsed, s.build_alloc);
+        ret R.err[str, str]("dependency manifest declares no readable project id");
+    }
+    val copy_r: R.Result[str, str] = str_copy_slice(s.build_alloc, O.unwrap[str](id_opt), 0, str_len(O.unwrap[str](id_opt)));
+    manifest.dnit(?parsed, s.build_alloc);
+    ret copy_r;
+}
+
+pub fun verify_dep_manifest_id(s: *session.Session, dep_full: str, id: str) R.Result[R.Void, str] {
+    val toml_path_r: R.Result[str, str] = load.join_path(s.build_alloc, dep_full, manifest.MANIFEST_FILE);
+    if (R.is_err[str, str](toml_path_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](toml_path_r)); }
+    val toml_path: str = R.unwrap_ok[str, str](toml_path_r);
+    val tr: R.Result[toml.Table, str] = parse_toml_file(s.build_alloc, toml_path);
+    str_free(s.build_alloc, toml_path);
+    if (R.is_err[toml.Table, str](tr)) { ret R.err[R.Void, str](R.unwrap_err[toml.Table, str](tr)); }
+    var t: toml.Table = R.unwrap_ok[toml.Table, str](tr);
+    val mr: R.Result[manifest.Manifest, str] = manifest.parse(s.build_alloc, ?s.interner, ?t, false);
+    toml.dnit(s.build_alloc, ?t);
+    if (R.is_err[manifest.Manifest, str](mr)) { ret R.err[R.Void, str](R.unwrap_err[manifest.Manifest, str](mr)); }
+    var parsed: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](mr);
+    val id_opt: O.Option[str] = intern.lookup(?s.interner, parsed.id);
+    if (O.is_none[str](id_opt)) {
+        manifest.dnit(?parsed, s.build_alloc);
+        ret R.err[R.Void, str]("dependency manifest declares no readable project id");
+    }
+    val declared: str = O.unwrap[str](id_opt);
+    val check: R.Result[R.Void, str] = check_dep_identity(s, id, declared, false);
+    manifest.dnit(?parsed, s.build_alloc);
+    ret check;
+}
+
+fun cleanup_partial_dep(s: *session.Session, gi: *GitInspector, root: str, dep_rel: str, dep_full: str,
+                        had_gitmodules_before: bool, extra_env: **u8) {
+    var deinit_args: [4]str;
+    deinit_args[0] = "submodule"; deinit_args[1] = "deinit"; deinit_args[2] = "-f"; deinit_args[3] = dep_rel;
+    val r1: R.Result[str, str] = git_op(s.build_alloc, gi, root, ?deinit_args[0], 4, extra_env);
+    if (R.is_ok[str, str](r1)) { str_free(s.build_alloc, R.unwrap_ok[str, str](r1)); }
+
+    var rm_args: [4]str;
+    rm_args[0] = "rm"; rm_args[1] = "-f"; rm_args[2] = "--cached"; rm_args[3] = dep_rel;
+    val r2: R.Result[str, str] = git_op(s.build_alloc, gi, root, ?rm_args[0], 4, extra_env);
+    if (R.is_ok[str, str](r2)) { str_free(s.build_alloc, R.unwrap_ok[str, str](r2)); }
+
+    fs.remove_all(s.build_alloc, dep_full);
+
+    val internal_r: R.Result[str, str] = format.sprint(s.build_alloc, "{}/.git/modules/{}", root, dep_rel);
+    if (R.is_ok[str, str](internal_r)) {
+        val internal: str = R.unwrap_ok[str, str](internal_r);
+        fs.remove_all(s.build_alloc, internal);
+        str_free(s.build_alloc, internal);
+    }
+
+    if (had_gitmodules_before) {
+        val section_r: R.Result[str, str] = format.sprint(s.build_alloc, "submodule.{}", dep_rel);
+        if (R.is_ok[str, str](section_r)) {
+            val section: str = R.unwrap_ok[str, str](section_r);
+            var cfg_args: [5]str;
+            cfg_args[0] = "config"; cfg_args[1] = "-f"; cfg_args[2] = ".gitmodules";
+            cfg_args[3] = "--remove-section"; cfg_args[4] = section;
+            val r3: R.Result[str, str] = git_op(s.build_alloc, gi, root, ?cfg_args[0], 5, extra_env);
+            if (R.is_ok[str, str](r3)) { str_free(s.build_alloc, R.unwrap_ok[str, str](r3)); }
+            str_free(s.build_alloc, section);
+        }
+        var stage_args: [2]str;
+        stage_args[0] = "add"; stage_args[1] = ".gitmodules";
+        val r4: R.Result[str, str] = git_op(s.build_alloc, gi, root, ?stage_args[0], 2, extra_env);
+        if (R.is_ok[str, str](r4)) { str_free(s.build_alloc, R.unwrap_ok[str, str](r4)); }
+    }
+    or {
+        val gitmodules_path_r: R.Result[str, str] = load.join_path(s.build_alloc, root, ".gitmodules");
+        if (R.is_ok[str, str](gitmodules_path_r)) {
+            val gitmodules_path: str = R.unwrap_ok[str, str](gitmodules_path_r);
+            fs.remove_file(gitmodules_path);
+            str_free(s.build_alloc, gitmodules_path);
+        }
+        var unstage_args: [4]str;
+        unstage_args[0] = "rm"; unstage_args[1] = "-f"; unstage_args[2] = "--cached"; unstage_args[3] = ".gitmodules";
+        val r5: R.Result[str, str] = git_op(s.build_alloc, gi, root, ?unstage_args[0], 4, extra_env);
+        if (R.is_ok[str, str](r5)) { str_free(s.build_alloc, R.unwrap_ok[str, str](r5)); }
+    }
+}
+
+fun realize_git_submodule_env(s: *session.Session, root: str, id: str, url: str, ref: str, extra_env: **u8) R.Result[R.Void, str] {
+    val gi_r: R.Result[GitInspector, str] = git_inspector_init(s.build_alloc);
+    if (R.is_err[GitInspector, str](gi_r)) { ret R.err[R.Void, str](R.unwrap_err[GitInspector, str](gi_r)); }
+    var gi: GitInspector = R.unwrap_ok[GitInspector, str](gi_r);
+
+    val dep_rel_r: R.Result[str, str] = format.sprint(s.build_alloc, "{}/{}", REALIZE_DEP_DIR, id);
+    if (R.is_err[str, str](dep_rel_r)) {
+        git_inspector_dnit(s.build_alloc, ?gi);
+        ret R.err[R.Void, str](R.unwrap_err[str, str](dep_rel_r));
+    }
+    val dep_rel: str = R.unwrap_ok[str, str](dep_rel_r);
+    val dep_full_r: R.Result[str, str] = load.join_path(s.build_alloc, root, dep_rel);
+    if (R.is_err[str, str](dep_full_r)) {
+        str_free(s.build_alloc, dep_rel);
+        git_inspector_dnit(s.build_alloc, ?gi);
+        ret R.err[R.Void, str](R.unwrap_err[str, str](dep_full_r));
+    }
+    val dep_full: str = R.unwrap_ok[str, str](dep_full_r);
+    val gitmodules_path_r: R.Result[str, str] = load.join_path(s.build_alloc, root, ".gitmodules");
+    if (R.is_err[str, str](gitmodules_path_r)) {
+        str_free(s.build_alloc, dep_full); str_free(s.build_alloc, dep_rel);
+        git_inspector_dnit(s.build_alloc, ?gi);
+        ret R.err[R.Void, str](R.unwrap_err[str, str](gitmodules_path_r));
+    }
+    val gitmodules_path: str = R.unwrap_ok[str, str](gitmodules_path_r);
+    val had_gitmodules_before: bool = fs.exists(gitmodules_path);
+    str_free(s.build_alloc, gitmodules_path);
+
+    if (!git_is_work_tree(s.build_alloc, ?gi, root)) {
+        var init_args: [1]str;
+        init_args[0] = "init";
+        val init_r: R.Result[str, str] = git_op(s.build_alloc, ?gi, root, ?init_args[0], 1, extra_env);
+        if (R.is_err[str, str](init_r)) {
+            val err: str = R.unwrap_err[str, str](init_r);
+            val msg_r: R.Result[str, str] = format.sprint(s.build_alloc, "git init: {}", err);
+            str_free(s.build_alloc, dep_full); str_free(s.build_alloc, dep_rel);
+            git_inspector_dnit(s.build_alloc, ?gi);
+            if (R.is_err[str, str](msg_r)) { ret R.err[R.Void, str]("git init failed"); }
+            ret R.err[R.Void, str](R.unwrap_ok[str, str](msg_r));
+        }
+        str_free(s.build_alloc, R.unwrap_ok[str, str](init_r));
+    }
+
+    var add_args: [4]str;
+    add_args[0] = "submodule"; add_args[1] = "add"; add_args[2] = url; add_args[3] = dep_rel;
+    val add_r: R.Result[str, str] = git_op(s.build_alloc, ?gi, root, ?add_args[0], 4, extra_env);
+    if (R.is_err[str, str](add_r)) {
+        val err: str = R.unwrap_err[str, str](add_r);
+        cleanup_partial_dep(s, ?gi, root, dep_rel, dep_full, had_gitmodules_before, extra_env);
+        val msg_r: R.Result[str, str] = format.sprint(s.build_alloc, "git submodule add: {}", err);
+        str_free(s.build_alloc, dep_full); str_free(s.build_alloc, dep_rel);
+        git_inspector_dnit(s.build_alloc, ?gi);
+        if (R.is_err[str, str](msg_r)) { ret R.err[R.Void, str]("git submodule add failed"); }
+        ret R.err[R.Void, str](R.unwrap_ok[str, str](msg_r));
+    }
+    str_free(s.build_alloc, R.unwrap_ok[str, str](add_r));
+
+    val sel_r: R.Result[R.Void, str] = realize_selector_ref(s.build_alloc, ?gi, dep_full, ref, extra_env);
+    if (R.is_err[R.Void, str](sel_r)) {
+        val err: str = R.unwrap_err[R.Void, str](sel_r);
+        cleanup_partial_dep(s, ?gi, root, dep_rel, dep_full, had_gitmodules_before, extra_env);
+        val msg_r: R.Result[str, str] = format.sprint(s.build_alloc, "checkout of '{}': {}", ref, err);
+        str_free(s.build_alloc, dep_full); str_free(s.build_alloc, dep_rel);
+        git_inspector_dnit(s.build_alloc, ?gi);
+        if (R.is_err[str, str](msg_r)) { ret R.err[R.Void, str]("dependency checkout failed"); }
+        ret R.err[R.Void, str](R.unwrap_ok[str, str](msg_r));
+    }
+
+    val id_r: R.Result[R.Void, str] = verify_dep_manifest_id(s, dep_full, id);
+    if (R.is_err[R.Void, str](id_r)) {
+        val err: str = R.unwrap_err[R.Void, str](id_r);
+        cleanup_partial_dep(s, ?gi, root, dep_rel, dep_full, had_gitmodules_before, extra_env);
+        str_free(s.build_alloc, dep_full); str_free(s.build_alloc, dep_rel);
+        git_inspector_dnit(s.build_alloc, ?gi);
+        ret R.err[R.Void, str](err);
+    }
+
+    var stage_args: [4]str;
+    stage_args[0] = "add"; stage_args[1] = "--"; stage_args[2] = ".gitmodules"; stage_args[3] = dep_rel;
+    val stage_r: R.Result[str, str] = git_op(s.build_alloc, ?gi, root, ?stage_args[0], 4, extra_env);
+    if (R.is_err[str, str](stage_r)) {
+        val err: str = R.unwrap_err[str, str](stage_r);
+        cleanup_partial_dep(s, ?gi, root, dep_rel, dep_full, had_gitmodules_before, extra_env);
+        val msg_r: R.Result[str, str] = format.sprint(s.build_alloc, "staging dependency gitlink: {}", err);
+        str_free(s.build_alloc, dep_full); str_free(s.build_alloc, dep_rel);
+        git_inspector_dnit(s.build_alloc, ?gi);
+        if (R.is_err[str, str](msg_r)) { ret R.err[R.Void, str]("staging dependency gitlink failed"); }
+        ret R.err[R.Void, str](R.unwrap_ok[str, str](msg_r));
+    }
+    str_free(s.build_alloc, R.unwrap_ok[str, str](stage_r));
+
+    str_free(s.build_alloc, dep_full);
+    str_free(s.build_alloc, dep_rel);
+    git_inspector_dnit(s.build_alloc, ?gi);
+    ret R.ok_void[str]();
+}
+
+pub fun realize_git_submodule(s: *session.Session, root: str, id: str, url: str, ref: str) R.Result[R.Void, str] {
+    ret realize_git_submodule_env(s, root, id, url, ref, nil);
+}
+
+pub val REALIZE_REPO_ROOT: u8 = 0;
+pub val REALIZE_NESTED:    u8 = 1;
+
+pub fun realization_mode(s: *session.Session, root: str) R.Result[u8, str] {
+    var gi: GitInspector = GitInspector{program: ""};
+    val er: R.Result[R.Void, str] = git_inspector_require(s.build_alloc, ?gi);
+    if (R.is_err[R.Void, str](er)) { ret R.err[u8, str](R.unwrap_err[R.Void, str](er)); }
+    val r: R.Result[u8, str] = project_root_authority(s, ?gi, "project", root);
+    git_inspector_dnit(s.build_alloc, ?gi);
+    if (R.is_err[u8, str](r)) { ret r; }
+    if (R.unwrap_ok[u8, str](r) == DEP_AUTHORITY_REPO) { ret R.ok[u8, str](REALIZE_REPO_ROOT); }
+    ret R.ok[u8, str](REALIZE_NESTED);
+}
+
+pub fun dep_rel_of(alloc: *A.Allocator, id: str) R.Result[str, str] {
+    ret format.sprint(alloc, "{}/{}", REALIZE_DEP_DIR, id);
+}
+
+pub fun dep_full_of(alloc: *A.Allocator, root: str, id: str) R.Result[str, str] {
+    val rel_r: R.Result[str, str] = dep_rel_of(alloc, id);
+    if (R.is_err[str, str](rel_r)) { ret rel_r; }
+    val rel: str = R.unwrap_ok[str, str](rel_r);
+    val full_r: R.Result[str, str] = load.join_path(alloc, root, rel);
+    str_free(alloc, rel);
+    ret full_r;
+}
+
+pub fun staged_gitlink(s: *session.Session, root: str, id: str) R.Result[O.Option[str], str] {
+    var gi: GitInspector = GitInspector{program: ""};
+    val er: R.Result[R.Void, str] = git_inspector_require(s.build_alloc, ?gi);
+    if (R.is_err[R.Void, str](er)) { ret R.err[O.Option[str], str](R.unwrap_err[R.Void, str](er)); }
+    val rel_r: R.Result[str, str] = dep_rel_of(s.build_alloc, id);
+    if (R.is_err[str, str](rel_r)) { git_inspector_dnit(s.build_alloc, ?gi); ret R.err[O.Option[str], str](R.unwrap_err[str, str](rel_r)); }
+    val rel: str = R.unwrap_ok[str, str](rel_r);
+    var args: [4]str;
+    args[0] = "ls-files"; args[1] = "--stage"; args[2] = "--"; args[3] = rel;
+    val q: R.Result[str, str] = git_query(s.build_alloc, ?gi, root, ?args[0], 4);
+    str_free(s.build_alloc, rel);
+    git_inspector_dnit(s.build_alloc, ?gi);
+    if (R.is_err[str, str](q)) { ret R.ok[O.Option[str], str](O.none[str]()); }
+    val line: str = R.unwrap_ok[str, str](q);
+    val prefix: str = "160000 ";
+    if (!str_starts_with(line, prefix)) { str_free(s.build_alloc, line); ret R.ok[O.Option[str], str](O.none[str]()); }
+    val sha_r: R.Result[str, str] = str_copy_slice(s.build_alloc, line, str_len(prefix), 40);
+    str_free(s.build_alloc, line);
+    if (R.is_err[str, str](sha_r)) { ret R.err[O.Option[str], str](R.unwrap_err[str, str](sha_r)); }
+    val sha: str = R.unwrap_ok[str, str](sha_r);
+    if (!git_object_id_valid(sha)) { str_free(s.build_alloc, sha); ret R.ok[O.Option[str], str](O.none[str]()); }
+    ret R.ok[O.Option[str], str](O.some[str](sha));
+}
+
+pub fun staged_paths(s: *session.Session, root: str, rel: str) R.Result[str, str] {
+    var gi: GitInspector = GitInspector{program: ""};
+    val er: R.Result[R.Void, str] = git_inspector_require(s.build_alloc, ?gi);
+    if (R.is_err[R.Void, str](er)) { ret R.err[str, str](R.unwrap_err[R.Void, str](er)); }
+    var args: [4]str;
+    args[0] = "ls-files"; args[1] = "--stage"; args[2] = "--"; args[3] = rel;
+    val q: R.Result[str, str] = git_query_raw(s.build_alloc, ?gi, root, ?args[0], 4);
+    git_inspector_dnit(s.build_alloc, ?gi);
+    if (R.is_err[str, str](q)) { ret R.ok[str, str](""); }
+    ret q;
+}
+
+pub fun own_work_tree(alloc: *A.Allocator, dep_full: str) bool {
+    val marker_r: R.Result[str, str] = load.join_path(alloc, dep_full, ".git");
+    if (R.is_err[str, str](marker_r)) { ret false; }
+    val marker: str = R.unwrap_ok[str, str](marker_r);
+    val present: bool = fs.exists(marker);
+    str_free(alloc, marker);
+    ret present;
+}
+
+fun require_own_work_tree(s: *session.Session, dep_full: str) R.Result[R.Void, str] {
+    if (own_work_tree(s.build_alloc, dep_full)) { ret R.ok_void[str](); }
+    val msg_r: R.Result[str, str] = format.sprint(s.build_alloc,
+        "dependency at '{}' is an uninitialized gitlink, not a checkout of its own; run `mach dep pull` to realize it", dep_full);
+    if (R.is_err[str, str](msg_r)) { ret R.err[R.Void, str]("dependency path is an uninitialized gitlink, not a checkout"); }
+    ret R.err[R.Void, str](R.unwrap_ok[str, str](msg_r));
+}
+
+pub fun initialize_git_submodule(s: *session.Session, root: str, id: str) R.Result[R.Void, str] {
+    var gi: GitInspector = GitInspector{program: ""};
+    val er: R.Result[R.Void, str] = git_inspector_require(s.build_alloc, ?gi);
+    if (R.is_err[R.Void, str](er)) { ret er; }
+    val rel_r: R.Result[str, str] = dep_rel_of(s.build_alloc, id);
+    if (R.is_err[str, str](rel_r)) { git_inspector_dnit(s.build_alloc, ?gi); ret R.err[R.Void, str](R.unwrap_err[str, str](rel_r)); }
+    val rel: str = R.unwrap_ok[str, str](rel_r);
+    var args: [5]str;
+    args[0] = "submodule"; args[1] = "update"; args[2] = "--init"; args[3] = "--"; args[4] = rel;
+    val r: R.Result[str, str] = git_op(s.build_alloc, ?gi, root, ?args[0], 5, nil);
+    str_free(s.build_alloc, rel);
+    git_inspector_dnit(s.build_alloc, ?gi);
+    if (R.is_err[str, str](r)) {
+        val msg_r: R.Result[str, str] = format.sprint(s.build_alloc, "git submodule update --init dep/{}: {}", id, R.unwrap_err[str, str](r));
+        if (R.is_err[str, str](msg_r)) { ret R.err[R.Void, str]("git submodule update --init failed"); }
+        ret R.err[R.Void, str](R.unwrap_ok[str, str](msg_r));
+    }
+    str_free(s.build_alloc, R.unwrap_ok[str, str](r));
+    ret R.ok_void[str]();
+}
+
+pub var stale_lock_notes_printed: usize = 0;
+
+pub fun print_stale_lock_note(alloc: *A.Allocator, root: str) bool {
+    val note: O.Option[str] = stale_lock_note(alloc, root);
+    if (O.is_none[str](note)) { ret false; }
+    print.eprint(O.unwrap[str](note));
+    print.eprint("\n");
+    stale_lock_notes_printed = stale_lock_notes_printed + 1;
+    ret true;
+}
+
+pub fun stale_lock_note(alloc: *A.Allocator, root: str) O.Option[str] {
+    val p_r: R.Result[str, str] = load.join_path(alloc, root, "mach.lock");
+    if (R.is_err[str, str](p_r)) { ret O.none[str](); }
+    val p: str = R.unwrap_ok[str, str](p_r);
+    val present: bool = fs.exists(p);
+    str_free(alloc, p);
+    if (!present) { ret O.none[str](); }
+    ret O.some[str]("note: mach.lock is not read; the committed gitlinks under dep/ are the pins, so delete it. mach.lock is rejected in 5.0.0");
+}
+
+pub fun checkout_commit(s: *session.Session, dep_full: str, commit: str) R.Result[R.Void, str] {
+    val own: R.Result[R.Void, str] = require_own_work_tree(s, dep_full);
+    if (R.is_err[R.Void, str](own)) { ret own; }
+    var gi: GitInspector = GitInspector{program: ""};
+    val er: R.Result[R.Void, str] = git_inspector_require(s.build_alloc, ?gi);
+    if (R.is_err[R.Void, str](er)) { ret er; }
+    var args: [3]str;
+    args[0] = "checkout"; args[1] = "--detach"; args[2] = commit;
+    val r: R.Result[str, str] = git_op(s.build_alloc, ?gi, dep_full, ?args[0], 3, nil);
+    git_inspector_dnit(s.build_alloc, ?gi);
+    if (R.is_err[str, str](r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](r)); }
+    str_free(s.build_alloc, R.unwrap_ok[str, str](r));
+    ret R.ok_void[str]();
+}
+
+pub fun checkout_head(s: *session.Session, dep_full: str) R.Result[str, str] {
+    val own: R.Result[R.Void, str] = require_own_work_tree(s, dep_full);
+    if (R.is_err[R.Void, str](own)) { ret R.err[str, str](R.unwrap_err[R.Void, str](own)); }
+    var gi: GitInspector = GitInspector{program: ""};
+    val er: R.Result[R.Void, str] = git_inspector_require(s.build_alloc, ?gi);
+    if (R.is_err[R.Void, str](er)) { ret R.err[str, str](R.unwrap_err[R.Void, str](er)); }
+    var args: [2]str;
+    args[0] = "rev-parse"; args[1] = "HEAD";
+    val r: R.Result[str, str] = git_query(s.build_alloc, ?gi, dep_full, ?args[0], 2);
+    git_inspector_dnit(s.build_alloc, ?gi);
+    ret r;
+}
+
+fun realize_git_clone_env(s: *session.Session, root: str, id: str, url: str, ref: str,
+                          extra_env: **u8) R.Result[R.Void, str] {
+    val gi_r: R.Result[GitInspector, str] = git_inspector_init(s.build_alloc);
+    if (R.is_err[GitInspector, str](gi_r)) { ret R.err[R.Void, str](R.unwrap_err[GitInspector, str](gi_r)); }
+    var gi: GitInspector = R.unwrap_ok[GitInspector, str](gi_r);
+
+    val dep_full_r: R.Result[str, str] = dep_full_of(s.build_alloc, root, id);
+    if (R.is_err[str, str](dep_full_r)) {
+        git_inspector_dnit(s.build_alloc, ?gi);
+        ret R.err[R.Void, str](R.unwrap_err[str, str](dep_full_r));
+    }
+    val dep_full: str = R.unwrap_ok[str, str](dep_full_r);
+    val dep_root_r: R.Result[str, str] = load.join_path(s.build_alloc, root, REALIZE_DEP_DIR);
+    if (R.is_err[str, str](dep_root_r)) {
+        str_free(s.build_alloc, dep_full);
+        git_inspector_dnit(s.build_alloc, ?gi);
+        ret R.err[R.Void, str](R.unwrap_err[str, str](dep_root_r));
+    }
+    val dep_root: str = R.unwrap_ok[str, str](dep_root_r);
+    if (O.is_some[str](fs.create_dir_all(s.build_alloc, dep_root, 0o755))) {
+        str_free(s.build_alloc, dep_root); str_free(s.build_alloc, dep_full);
+        git_inspector_dnit(s.build_alloc, ?gi);
+        ret R.err[R.Void, str]("cannot create the dependency directory");
+    }
+
+    var clone_args: [3]str;
+    clone_args[0] = "clone"; clone_args[1] = url; clone_args[2] = id;
+    val clone_r: R.Result[str, str] = git_op(s.build_alloc, ?gi, dep_root, ?clone_args[0], 3, extra_env);
+    str_free(s.build_alloc, dep_root);
+    if (R.is_err[str, str](clone_r)) {
+        val err: str = R.unwrap_err[str, str](clone_r);
+        fs.remove_all(s.build_alloc, dep_full);
+        val msg_r: R.Result[str, str] = format.sprint(s.build_alloc, "git clone: {}", err);
+        str_free(s.build_alloc, dep_full);
+        git_inspector_dnit(s.build_alloc, ?gi);
+        if (R.is_err[str, str](msg_r)) { ret R.err[R.Void, str]("git clone failed"); }
+        ret R.err[R.Void, str](R.unwrap_ok[str, str](msg_r));
+    }
+    str_free(s.build_alloc, R.unwrap_ok[str, str](clone_r));
+
+    val sel_r: R.Result[R.Void, str] = realize_selector_ref(s.build_alloc, ?gi, dep_full, ref, extra_env);
+    if (R.is_err[R.Void, str](sel_r)) {
+        val err: str = R.unwrap_err[R.Void, str](sel_r);
+        fs.remove_all(s.build_alloc, dep_full);
+        val msg_r: R.Result[str, str] = format.sprint(s.build_alloc, "checkout of '{}': {}", ref, err);
+        str_free(s.build_alloc, dep_full);
+        git_inspector_dnit(s.build_alloc, ?gi);
+        if (R.is_err[str, str](msg_r)) { ret R.err[R.Void, str]("dependency checkout failed"); }
+        ret R.err[R.Void, str](R.unwrap_ok[str, str](msg_r));
+    }
+
+    val id_r: R.Result[R.Void, str] = verify_dep_manifest_id(s, dep_full, id);
+    if (R.is_err[R.Void, str](id_r)) {
+        val err: str = R.unwrap_err[R.Void, str](id_r);
+        fs.remove_all(s.build_alloc, dep_full);
+        str_free(s.build_alloc, dep_full);
+        git_inspector_dnit(s.build_alloc, ?gi);
+        ret R.err[R.Void, str](err);
+    }
+
+    str_free(s.build_alloc, dep_full);
+    git_inspector_dnit(s.build_alloc, ?gi);
+    ret R.ok_void[str]();
+}
+
+pub fun realize_git_clone(s: *session.Session, root: str, id: str, url: str, ref: str) R.Result[R.Void, str] {
+    ret realize_git_clone_env(s, root, id, url, ref, nil);
+}
+
+pub fun realize_git_dependency(s: *session.Session, root: str, id: str, url: str, ref: str,
+                               mode: u8) R.Result[R.Void, str] {
+    if (mode == REALIZE_REPO_ROOT) { ret realize_git_submodule(s, root, id, url, ref); }
+    ret realize_git_clone(s, root, id, url, ref);
+}
+
+pub fun unrealize_dependency(s: *session.Session, root: str, id: str, mode: u8) R.Result[R.Void, str] {
+    val dep_full_r: R.Result[str, str] = dep_full_of(s.build_alloc, root, id);
+    if (R.is_err[str, str](dep_full_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](dep_full_r)); }
+    val dep_full: str = R.unwrap_ok[str, str](dep_full_r);
+    if (mode == REALIZE_NESTED) {
+        fs.remove_all(s.build_alloc, dep_full);
+        str_free(s.build_alloc, dep_full);
+        ret R.ok_void[str]();
+    }
+    val rel_r: R.Result[str, str] = dep_rel_of(s.build_alloc, id);
+    if (R.is_err[str, str](rel_r)) { str_free(s.build_alloc, dep_full); ret R.err[R.Void, str](R.unwrap_err[str, str](rel_r)); }
+    val rel: str = R.unwrap_ok[str, str](rel_r);
+    var gi: GitInspector = GitInspector{program: ""};
+    val er: R.Result[R.Void, str] = git_inspector_require(s.build_alloc, ?gi);
+    if (R.is_err[R.Void, str](er)) {
+        str_free(s.build_alloc, rel); str_free(s.build_alloc, dep_full);
+        ret er;
+    }
+    cleanup_partial_dep(s, ?gi, root, rel, dep_full, true, nil);
+    git_inspector_dnit(s.build_alloc, ?gi);
+    str_free(s.build_alloc, rel);
+    str_free(s.build_alloc, dep_full);
+    ret R.ok_void[str]();
+}
+
+fun copy_tree(alloc: *A.Allocator, src: str, dst: str, skip_dep_dir: bool) R.Result[R.Void, str] {
+    if (O.is_some[str](fs.create_dir_all(alloc, dst, 0o755))) { ret R.err[R.Void, str]("cannot create the copy destination"); }
+    val names_r: R.Result[Vector[str], str] = fs.read_dir(alloc, src);
+    if (R.is_err[Vector[str], str](names_r)) { ret R.err[R.Void, str](R.unwrap_err[Vector[str], str](names_r)); }
+    var names: Vector[str] = R.unwrap_ok[Vector[str], str](names_r);
+    sort.sort[str](names.data, names.len, cmp_dep_name);
+    var i: usize = 0;
+    var failure: R.Result[R.Void, str] = R.ok_void[str]();
+    for (i < names.len && R.is_ok[R.Void, str](failure)) {
+        val name: str = names.data[i];
+        i = i + 1;
+        if (str_equals(name, ".git")) { cnt; }
+        if (skip_dep_dir && str_equals(name, REALIZE_DEP_DIR)) { cnt; }
+        val from_r: R.Result[str, str] = load.join_path(alloc, src, name);
+        if (R.is_err[str, str](from_r)) { failure = R.err[R.Void, str](R.unwrap_err[str, str](from_r)); cnt; }
+        val from: str = R.unwrap_ok[str, str](from_r);
+        val to_r: R.Result[str, str] = load.join_path(alloc, dst, name);
+        if (R.is_err[str, str](to_r)) { str_free(alloc, from); failure = R.err[R.Void, str](R.unwrap_err[str, str](to_r)); cnt; }
+        val to: str = R.unwrap_ok[str, str](to_r);
+        val meta_r: R.Result[fs.Metadata, str] = fs.metadata_link(from);
+        if (R.is_err[fs.Metadata, str](meta_r)) { failure = R.err[R.Void, str](R.unwrap_err[fs.Metadata, str](meta_r)); }
+        or {
+            val meta: fs.Metadata = R.unwrap_ok[fs.Metadata, str](meta_r);
+            if (fs.meta_is_symlink(?meta)) {
+                failure = R.err[R.Void, str]("path dependency source contains a symlink, which cannot be copied into a contained realization");
+            }
+            or (fs.meta_is_dir(?meta)) { failure = copy_tree(alloc, from, to, false); }
+            or {
+                val bytes_r: R.Result[Vector[u8], str] = fs.read_bytes(alloc, from);
+                if (R.is_err[Vector[u8], str](bytes_r)) { failure = R.err[R.Void, str](R.unwrap_err[Vector[u8], str](bytes_r)); }
+                or {
+                    var bytes: Vector[u8] = R.unwrap_ok[Vector[u8], str](bytes_r);
+                    val w: O.Option[str] = fs.write_bytes(to, bytes.data, bytes.len, 0o644);
+                    vector.dnit[u8](?bytes);
+                    if (O.is_some[str](w)) { failure = R.err[R.Void, str](O.unwrap[str](w)); }
+                }
+            }
+        }
+        str_free(alloc, to);
+        str_free(alloc, from);
+    }
+    free_name_vector(alloc, ?names);
+    ret failure;
+}
+
+pub fun realize_path_dependency(s: *session.Session, root: str, id: str, src_dir: str,
+                                mode: u8) R.Result[R.Void, str] {
+    val dep_full_r: R.Result[str, str] = dep_full_of(s.build_alloc, root, id);
+    if (R.is_err[str, str](dep_full_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](dep_full_r)); }
+    val dep_full: str = R.unwrap_ok[str, str](dep_full_r);
+    if (fs.exists(dep_full)) { fs.remove_all(s.build_alloc, dep_full); }
+    val copy_r: R.Result[R.Void, str] = copy_tree(s.build_alloc, src_dir, dep_full, true);
+    if (R.is_err[R.Void, str](copy_r)) {
+        fs.remove_all(s.build_alloc, dep_full);
+        str_free(s.build_alloc, dep_full);
+        ret copy_r;
+    }
+    val id_r: R.Result[R.Void, str] = verify_dep_manifest_id(s, dep_full, id);
+    if (R.is_err[R.Void, str](id_r)) {
+        fs.remove_all(s.build_alloc, dep_full);
+        str_free(s.build_alloc, dep_full);
+        ret id_r;
+    }
+    str_free(s.build_alloc, dep_full);
+    if (mode == REALIZE_NESTED) { ret R.ok_void[str](); }
+    val rel_r: R.Result[str, str] = dep_rel_of(s.build_alloc, id);
+    if (R.is_err[str, str](rel_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](rel_r)); }
+    val rel: str = R.unwrap_ok[str, str](rel_r);
+    var gi: GitInspector = GitInspector{program: ""};
+    val er: R.Result[R.Void, str] = git_inspector_require(s.build_alloc, ?gi);
+    if (R.is_err[R.Void, str](er)) { str_free(s.build_alloc, rel); ret er; }
+    var stage_args: [3]str;
+    stage_args[0] = "add"; stage_args[1] = "--"; stage_args[2] = rel;
+    val stage_r: R.Result[str, str] = git_op(s.build_alloc, ?gi, root, ?stage_args[0], 3, nil);
+    git_inspector_dnit(s.build_alloc, ?gi);
+    str_free(s.build_alloc, rel);
+    if (R.is_err[str, str](stage_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](stage_r)); }
+    str_free(s.build_alloc, R.unwrap_ok[str, str](stage_r));
+    ret R.ok_void[str]();
+}
+
+pub fun realized_ids(alloc: *A.Allocator, root: str) R.Result[Vector[str], str] {
+    var out: Vector[str] = vector.init[str](alloc);
+    val dep_root_r: R.Result[str, str] = load.join_path(alloc, root, REALIZE_DEP_DIR);
+    if (R.is_err[str, str](dep_root_r)) { ret R.err[Vector[str], str](R.unwrap_err[str, str](dep_root_r)); }
+    val dep_root: str = R.unwrap_ok[str, str](dep_root_r);
+    if (!fs.is_dir(dep_root)) { str_free(alloc, dep_root); ret R.ok[Vector[str], str](out); }
+    val names_r: R.Result[Vector[str], str] = fs.read_dir(alloc, dep_root);
+    str_free(alloc, dep_root);
+    if (R.is_err[Vector[str], str](names_r)) { ret names_r; }
+    var names: Vector[str] = R.unwrap_ok[Vector[str], str](names_r);
+    sort.sort[str](names.data, names.len, cmp_dep_name);
+    ret R.ok[Vector[str], str](names);
+}
+
+pub fun fetch_and_checkout(s: *session.Session, dep_full: str, ref: str) R.Result[R.Void, str] {
+    val own: R.Result[R.Void, str] = require_own_work_tree(s, dep_full);
+    if (R.is_err[R.Void, str](own)) { ret own; }
+    var gi: GitInspector = GitInspector{program: ""};
+    val er: R.Result[R.Void, str] = git_inspector_require(s.build_alloc, ?gi);
+    if (R.is_err[R.Void, str](er)) { ret er; }
+    var fetch_args: [3]str;
+    fetch_args[0] = "fetch"; fetch_args[1] = "--all"; fetch_args[2] = "--tags";
+    val f: R.Result[str, str] = git_op(s.build_alloc, ?gi, dep_full, ?fetch_args[0], 3, nil);
+    if (R.is_err[str, str](f)) {
+        git_inspector_dnit(s.build_alloc, ?gi);
+        ret R.err[R.Void, str](R.unwrap_err[str, str](f));
+    }
+    str_free(s.build_alloc, R.unwrap_ok[str, str](f));
+    val r: R.Result[R.Void, str] = realize_selector_ref(s.build_alloc, ?gi, dep_full, ref, nil);
+    git_inspector_dnit(s.build_alloc, ?gi);
+    ret r;
+}
+
+pub fun stage_dependency(s: *session.Session, root: str, id: str) R.Result[R.Void, str] {
+    val rel_r: R.Result[str, str] = dep_rel_of(s.build_alloc, id);
+    if (R.is_err[str, str](rel_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](rel_r)); }
+    val rel: str = R.unwrap_ok[str, str](rel_r);
+    var gi: GitInspector = GitInspector{program: ""};
+    val er: R.Result[R.Void, str] = git_inspector_require(s.build_alloc, ?gi);
+    if (R.is_err[R.Void, str](er)) { str_free(s.build_alloc, rel); ret er; }
+    var args: [4]str;
+    args[0] = "add"; args[1] = "--"; args[2] = ".gitmodules"; args[3] = rel;
+    val r: R.Result[str, str] = git_op(s.build_alloc, ?gi, root, ?args[0], 4, nil);
+    git_inspector_dnit(s.build_alloc, ?gi);
+    str_free(s.build_alloc, rel);
+    if (R.is_err[str, str](r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](r)); }
+    str_free(s.build_alloc, R.unwrap_ok[str, str](r));
+    ret R.ok_void[str]();
+}
+
+pub rec DepTxn {
+    root:          str;
+    mode:          u8;
+    manifest_path: str;
+    manifest_pre:  str;
+    gm_path:       str;
+    gm_pre:        str;
+    gm_had:        bool;
+    index_pre:     str;
+    dirs_pre:      Vector[str];
+    # the exclusive claim on the project root, held for the whole mutation
+    root_cap:      txn_fs.Root;
+    guard:         txn_fs.Lock;
+}
+
+fun git_dir_of(s: *session.Session, root: str) R.Result[str, str] {
+    var gi: GitInspector = GitInspector{program: ""};
+    val er: R.Result[R.Void, str] = git_inspector_require(s.build_alloc, ?gi);
+    if (R.is_err[R.Void, str](er)) { ret R.err[str, str](R.unwrap_err[R.Void, str](er)); }
+    var args: [2]str;
+    args[0] = "rev-parse"; args[1] = "--absolute-git-dir";
+    val r: R.Result[str, str] = git_query(s.build_alloc, ?gi, root, ?args[0], 2);
+    git_inspector_dnit(s.build_alloc, ?gi);
+    if (R.is_err[str, str](r)) {
+        ret R.err[str, str]("dependency mutation needs the project root inside a Git repository (the writer guard lives in its git directory)");
+    }
+    ret r;
+}
+
+fun txn_index_snapshot(s: *session.Session, root: str) R.Result[str, str] {
+    var gi: GitInspector = GitInspector{program: ""};
+    val er: R.Result[R.Void, str] = git_inspector_require(s.build_alloc, ?gi);
+    if (R.is_err[R.Void, str](er)) { ret R.err[str, str](R.unwrap_err[R.Void, str](er)); }
+    var args: [6]str;
+    args[0] = "ls-files"; args[1] = "--stage"; args[2] = "--";
+    args[3] = REALIZE_DEP_DIR; args[4] = ".gitmodules"; args[5] = "";
+    val q: R.Result[str, str] = git_query_raw(s.build_alloc, ?gi, root, ?args[0], 5);
+    git_inspector_dnit(s.build_alloc, ?gi);
+    if (R.is_err[str, str](q)) { ret R.ok[str, str](""); }
+    ret q;
+}
+
+fun txn_read_or_empty(alloc: *A.Allocator, p: str, had: *bool) str {
+    @had = fs.exists(p);
+    if (!had[0]) { ret ""; }
+    val r: R.Result[str, str] = fs.read_string(alloc, p);
+    if (R.is_err[str, str](r)) { ret ""; }
+    ret R.unwrap_ok[str, str](r);
+}
+
+pub fun txn_begin(s: *session.Session, root: str, mode: u8, label: str) R.Result[DepTxn, str] {
+    var t: DepTxn;
+    t.root = root;
+    t.mode = mode;
+    t.manifest_pre = "";
+    t.gm_pre = "";
+    t.gm_had = false;
+    t.index_pre = "";
+
+    # the claim is an advisory lock rather than a lock FILE, so a mach process
+    # that dies mid-mutation releases it at exit and the next writer simply
+    # proceeds. that is what makes a crashed transaction distinguishable from a
+    # live one, and it is why there is no longer anything for a user to remove
+    # by hand.
+    val gitdir_r: R.Result[str, str] = git_dir_of(s, root);
+    if (R.is_err[str, str](gitdir_r)) { ret R.err[DepTxn, str](R.unwrap_err[str, str](gitdir_r)); }
+    val gitdir: str = R.unwrap_ok[str, str](gitdir_r);
+    val root_r: R.Result[txn_fs.Root, txn_fs.Error] = txn_fs.root_open(gitdir, "");
+    str_free(s.build_alloc, gitdir);
+    if (R.is_err[txn_fs.Root, txn_fs.Error](root_r)) {
+        ret R.err[DepTxn, str](txn_fs.error_message(R.unwrap_err[txn_fs.Root, txn_fs.Error](root_r)));
+    }
+    t.root_cap = R.unwrap_ok[txn_fs.Root, txn_fs.Error](root_r);
+
+    val guard_r: R.Result[txn_fs.Lock, txn_fs.Error] = txn_fs.lock(?t.root_cap);
+    if (R.is_err[txn_fs.Lock, txn_fs.Error](guard_r)) {
+        txn_fs.root_dnit(?t.root_cap);
+        val e: txn_fs.Error = R.unwrap_err[txn_fs.Lock, txn_fs.Error](guard_r);
+        if (e.kind == txn_fs.LOCK_HELD) {
+            ret R.err[DepTxn, str]("another mach process is mutating this project root; retry once it finishes");
+        }
+        ret R.err[DepTxn, str](txn_fs.error_message(e));
+    }
+    t.guard = R.unwrap_ok[txn_fs.Lock, txn_fs.Error](guard_r);
+
+    val mp_r: R.Result[str, str] = load.join_path(s.build_alloc, root, manifest.MANIFEST_FILE);
+    if (R.is_err[str, str](mp_r)) {
+        txn_fs.unlock(?t.guard);
+        txn_fs.root_dnit(?t.root_cap);
+        ret R.err[DepTxn, str](R.unwrap_err[str, str](mp_r));
+    }
+    t.manifest_path = R.unwrap_ok[str, str](mp_r);
+    var had: bool = false;
+    t.manifest_pre = txn_read_or_empty(s.build_alloc, t.manifest_path, ?had);
+
+    val gm_r: R.Result[str, str] = load.join_path(s.build_alloc, root, ".gitmodules");
+    if (R.is_err[str, str](gm_r)) {
+        txn_fs.unlock(?t.guard);
+        txn_fs.root_dnit(?t.root_cap);
+        ret R.err[DepTxn, str](R.unwrap_err[str, str](gm_r));
+    }
+    t.gm_path = R.unwrap_ok[str, str](gm_r);
+    t.gm_pre = txn_read_or_empty(s.build_alloc, t.gm_path, ?t.gm_had);
+
+    if (mode == REALIZE_REPO_ROOT) {
+        val ix: R.Result[str, str] = txn_index_snapshot(s, root);
+        if (R.is_ok[str, str](ix)) { t.index_pre = R.unwrap_ok[str, str](ix); }
+    }
+
+    val dirs_r: R.Result[Vector[str], str] = realized_ids(s.build_alloc, root);
+    if (R.is_err[Vector[str], str](dirs_r)) {
+        txn_fs.unlock(?t.guard);
+        txn_fs.root_dnit(?t.root_cap);
+        ret R.err[DepTxn, str](R.unwrap_err[Vector[str], str](dirs_r));
+    }
+    t.dirs_pre = R.unwrap_ok[Vector[str], str](dirs_r);
+    ret R.ok[DepTxn, str](t);
+}
+
+fun txn_free(s: *session.Session, t: *DepTxn) {
+    if (!str_empty(t.manifest_pre)) { str_free(s.build_alloc, t.manifest_pre); }
+    if (!str_empty(t.gm_pre)) { str_free(s.build_alloc, t.gm_pre); }
+    if (!str_empty(t.index_pre)) { str_free(s.build_alloc, t.index_pre); }
+    free_name_vector(s.build_alloc, ?t.dirs_pre);
+    str_free(s.build_alloc, t.manifest_path);
+    str_free(s.build_alloc, t.gm_path);
+    txn_fs.unlock(?t.guard);
+    txn_fs.root_dnit(?t.root_cap);
+}
+
+pub fun txn_commit(s: *session.Session, t: *DepTxn) {
+    txn_free(s, t);
+}
+
+fun txn_restore_index(s: *session.Session, t: *DepTxn) {
+    var gi: GitInspector = GitInspector{program: ""};
+    val er: R.Result[R.Void, str] = git_inspector_require(s.build_alloc, ?gi);
+    if (R.is_err[R.Void, str](er)) { ret; }
+
+    var list_args: [5]str;
+    list_args[0] = "ls-files"; list_args[1] = "--stage"; list_args[2] = "--"; list_args[3] = REALIZE_DEP_DIR; list_args[4] = ".gitmodules";
+    val staged: R.Result[str, str] = git_query_raw(s.build_alloc, ?gi, t.root, ?list_args[0], 5);
+    if (R.is_ok[str, str](staged)) {
+        val text: str = R.unwrap_ok[str, str](staged);
+        val tn: usize = str_len(text);
+        var li: usize = 0;
+        for (li < tn) {
+            var le: usize = li;
+            for (le < tn && text[le] != '\n') { le = le + 1; }
+            var tab: usize = li;
+            for (tab < le && text[tab] != '\t') { tab = tab + 1; }
+            if (tab < le) {
+                val path_r: R.Result[str, str] = str_copy_slice(s.build_alloc, text, tab + 1, le - tab - 1);
+                if (R.is_ok[str, str](path_r)) {
+                    val rel: str = R.unwrap_ok[str, str](path_r);
+                    var rm_args: [3]str;
+                    rm_args[0] = "update-index"; rm_args[1] = "--force-remove"; rm_args[2] = rel;
+                    val rr: R.Result[str, str] = git_op(s.build_alloc, ?gi, t.root, ?rm_args[0], 3, nil);
+                    if (R.is_ok[str, str](rr)) { str_free(s.build_alloc, R.unwrap_ok[str, str](rr)); }
+                    str_free(s.build_alloc, rel);
+                }
+            }
+            li = le + 1;
+        }
+        str_free(s.build_alloc, text);
+    }
+
+    val n: usize = str_len(t.index_pre);
+    var i: usize = 0;
+    for (i < n) {
+        var j: usize = i;
+        for (j < n && t.index_pre[j] != '\n') { j = j + 1; }
+        val line_r: R.Result[str, str] = str_copy_slice(s.build_alloc, t.index_pre, i, j - i);
+        i = j + 1;
+        if (R.is_err[str, str](line_r)) { cnt; }
+        val line: str = R.unwrap_ok[str, str](line_r);
+        var k: usize = 0;
+        val ln: usize = str_len(line);
+        for (k < ln && line[k] != ' ') { k = k + 1; }
+        var m: usize = k + 1;
+        for (m < ln && line[m] != ' ') { m = m + 1; }
+        var stage_end: usize = m + 1;
+        for (stage_end < ln && line[stage_end] != '\t') { stage_end = stage_end + 1; }
+        if (stage_end >= ln) { str_free(s.build_alloc, line); cnt; }
+        val mode_r: R.Result[str, str] = str_copy_slice(s.build_alloc, line, 0, k);
+        val sha_r: R.Result[str, str] = str_copy_slice(s.build_alloc, line, k + 1, m - k - 1);
+        val path_r: R.Result[str, str] = str_copy_slice(s.build_alloc, line, stage_end + 1, ln - stage_end - 1);
+        str_free(s.build_alloc, line);
+        if (R.is_err[str, str](mode_r) || R.is_err[str, str](sha_r) || R.is_err[str, str](path_r)) { cnt; }
+        val mode_text: str = R.unwrap_ok[str, str](mode_r);
+        val sha: str = R.unwrap_ok[str, str](sha_r);
+        val rel: str = R.unwrap_ok[str, str](path_r);
+        val info_r: R.Result[str, str] = format.sprint(s.build_alloc, "{},{},{}", mode_text, sha, rel);
+        str_free(s.build_alloc, mode_text); str_free(s.build_alloc, sha); str_free(s.build_alloc, rel);
+        if (R.is_err[str, str](info_r)) { cnt; }
+        val info: str = R.unwrap_ok[str, str](info_r);
+        var ui_args: [4]str;
+        ui_args[0] = "update-index"; ui_args[1] = "--add"; ui_args[2] = "--cacheinfo"; ui_args[3] = info;
+        val u: R.Result[str, str] = git_op(s.build_alloc, ?gi, t.root, ?ui_args[0], 4, nil);
+        if (R.is_ok[str, str](u)) { str_free(s.build_alloc, R.unwrap_ok[str, str](u)); }
+        str_free(s.build_alloc, info);
+    }
+    git_inspector_dnit(s.build_alloc, ?gi);
+}
+
+fun txn_dir_was_present(t: *DepTxn, id: str) bool {
+    var i: usize = 0;
+    for (i < t.dirs_pre.len) {
+        if (str_equals(t.dirs_pre.data[i], id)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+pub fun txn_rollback(s: *session.Session, t: *DepTxn) {
+    if (!str_empty(t.manifest_pre)) {
+        fs.write_bytes(t.manifest_path, t.manifest_pre::*u8, str_len(t.manifest_pre), 0o644);
+    }
+    if (t.gm_had) {
+        fs.write_bytes(t.gm_path, t.gm_pre::*u8, str_len(t.gm_pre), 0o644);
+    }
+    or { fs.remove_file(t.gm_path); }
+
+    val now_r: R.Result[Vector[str], str] = realized_ids(s.build_alloc, t.root);
+    if (R.is_ok[Vector[str], str](now_r)) {
+        var now: Vector[str] = R.unwrap_ok[Vector[str], str](now_r);
+        var i: usize = 0;
+        for (i < now.len) {
+            if (!txn_dir_was_present(t, now.data[i])) {
+                val full_r: R.Result[str, str] = dep_full_of(s.build_alloc, t.root, now.data[i]);
+                if (R.is_ok[str, str](full_r)) {
+                    val full: str = R.unwrap_ok[str, str](full_r);
+                    fs.remove_all(s.build_alloc, full);
+                    str_free(s.build_alloc, full);
+                }
+                if (t.mode == REALIZE_REPO_ROOT) {
+                    val internal_r: R.Result[str, str] = format.sprint(s.build_alloc,
+                        "{}/.git/modules/{}/{}", t.root, REALIZE_DEP_DIR, now.data[i]);
+                    if (R.is_ok[str, str](internal_r)) {
+                        val internal: str = R.unwrap_ok[str, str](internal_r);
+                        fs.remove_all(s.build_alloc, internal);
+                        str_free(s.build_alloc, internal);
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        free_name_vector(s.build_alloc, ?now);
+    }
+
+    if (t.mode == REALIZE_REPO_ROOT) { txn_restore_index(s, t); }
+    txn_free(s, t);
+}
+
+fun t_scratch_dir(alloc: *A.Allocator, prefix: str) R.Result[str, str] {
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, prefix);
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret R.err[str, str](R.unwrap_err[fs.TempFile, str](tf_r)); }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val root_r: R.Result[str, str] = str_copy_slice(alloc, fs.temp_path(?tf), 0, str_len(fs.temp_path(?tf)));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[str, str](root_r)) { ret root_r; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    if (O.is_some[str](fs.create_dir(root, 0o755))) { ret R.err[str, str]("cannot create scratch root"); }
+    ret R.ok[str, str](root);
+}
+
+fun t_write_file(alloc: *A.Allocator, dir: str, leaf: str, content: str) O.Option[str] {
+    val path_r: R.Result[str, str] = path.join(alloc, dir, leaf);
+    if (R.is_err[str, str](path_r)) { ret O.some[str](R.unwrap_err[str, str](path_r)); }
+    val p: str = R.unwrap_ok[str, str](path_r);
+    val w: O.Option[str] = fs.write_bytes(p, content::*u8, str_len(content), 420);
+    str_free(alloc, p);
+    ret w;
+}
+
+fun t_make_fixture_repo(alloc: *A.Allocator, gi: *GitInspector, project_id: str) R.Result[str, str] {
+    val dir_r: R.Result[str, str] = t_scratch_dir(alloc, "mach_dep_fixture");
+    if (R.is_err[str, str](dir_r)) { ret dir_r; }
+    val dir: str = R.unwrap_ok[str, str](dir_r);
+
+    var init_args: [3]str;
+    init_args[0] = "init"; init_args[1] = "-b"; init_args[2] = "main";
+    val init_r: R.Result[str, str] = git_op(alloc, gi, dir, ?init_args[0], 3, nil);
+    if (R.is_err[str, str](init_r)) { ret R.err[str, str](R.unwrap_err[str, str](init_r)); }
+    str_free(alloc, R.unwrap_ok[str, str](init_r));
+
+    val toml_r: R.Result[str, str] = format.sprint(alloc,
+        "[project]\nid = \"{}\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out\"\n", project_id);
+    if (R.is_err[str, str](toml_r)) { ret R.err[str, str](R.unwrap_err[str, str](toml_r)); }
+    val toml_text: str = R.unwrap_ok[str, str](toml_r);
+    val wr: O.Option[str] = t_write_file(alloc, dir, "mach.toml", toml_text);
+    str_free(alloc, toml_text);
+    if (O.is_some[str](wr)) { ret R.err[str, str](O.unwrap[str](wr)); }
+
+    var add_args: [2]str;
+    add_args[0] = "add"; add_args[1] = "-A";
+    val add_r: R.Result[str, str] = git_op(alloc, gi, dir, ?add_args[0], 2, nil);
+    if (R.is_err[str, str](add_r)) { ret R.err[str, str](R.unwrap_err[str, str](add_r)); }
+    str_free(alloc, R.unwrap_ok[str, str](add_r));
+
+    var commit_args: [7]str;
+    commit_args[0] = "-c"; commit_args[1] = "user.email=t@t";
+    commit_args[2] = "-c"; commit_args[3] = "user.name=t";
+    commit_args[4] = "commit"; commit_args[5] = "-m"; commit_args[6] = "init";
+    val commit_r: R.Result[str, str] = git_op(alloc, gi, dir, ?commit_args[0], 7, nil);
+    if (R.is_err[str, str](commit_r)) { ret R.err[str, str](R.unwrap_err[str, str](commit_r)); }
+    str_free(alloc, R.unwrap_ok[str, str](commit_r));
+
+    ret R.ok[str, str](dir);
+}
+
+fun t_env_allow_file_protocol(env: **u8) {
+    env[0] = "GIT_CONFIG_COUNT=1";
+    env[1] = "GIT_CONFIG_KEY_0=protocol.file.allow";
+    env[2] = "GIT_CONFIG_VALUE_0=always";
+    env[3] = nil;
+}
+
+test "mach.lang.driver.deps.realize_git_submodule:succeeds_and_stages_gitlink" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val gi_r: R.Result[GitInspector, str] = git_inspector_init(?alloc);
+    if (R.is_err[GitInspector, str](gi_r)) { ret 1; }
+    var gi: GitInspector = R.unwrap_ok[GitInspector, str](gi_r);
+
+    val fixture_r: R.Result[str, str] = t_make_fixture_repo(?alloc, ?gi, "std");
+    if (R.is_err[str, str](fixture_r)) { git_inspector_dnit(?alloc, ?gi); ret 1; }
+    val fixture: str = R.unwrap_ok[str, str](fixture_r);
+
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_dep_realize_root");
+    if (R.is_err[str, str](root_r)) { git_inspector_dnit(?alloc, ?gi); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { git_inspector_dnit(?alloc, ?gi); ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var env: [4]*u8;
+    t_env_allow_file_protocol(?env[0]);
+    val real_r: R.Result[R.Void, str] = realize_git_submodule_env(?s, root, "std", fixture, "branch/main", ?env[0]);
+    var bad: i32 = 0;
+    if (R.is_err[R.Void, str](real_r)) { bad = 1; }
+
+    if (bad == 0) {
+        val dep_full_r: R.Result[str, str] = path.join(?alloc, root, "dep/std");
+        val dep_full: str = R.unwrap_ok[str, str](dep_full_r);
+        if (!fs.is_dir(dep_full)) { bad = 1; }
+        val dep_toml_r: R.Result[str, str] = path.join(?alloc, dep_full, "mach.toml");
+        val dep_toml: str = R.unwrap_ok[str, str](dep_toml_r);
+        if (!fs.exists(dep_toml)) { bad = 1; }
+        str_free(?alloc, dep_toml);
+        str_free(?alloc, dep_full);
+
+        var link_args: [4]str;
+        link_args[0] = "ls-files"; link_args[1] = "--stage"; link_args[2] = "--"; link_args[3] = "dep/std";
+        val link_r: R.Result[str, str] = git_query(?alloc, ?gi, root, ?link_args[0], 4);
+        if (R.is_err[str, str](link_r)) { bad = 1; }
+        or {
+            val link: str = R.unwrap_ok[str, str](link_r);
+            if (!str_starts_with(link, "160000")) { bad = 1; }
+            str_free(?alloc, link);
+        }
+
+        var gm_args: [4]str;
+        gm_args[0] = "ls-files"; gm_args[1] = "--stage"; gm_args[2] = "--"; gm_args[3] = ".gitmodules";
+        val gm_r: R.Result[str, str] = git_query(?alloc, ?gi, root, ?gm_args[0], 4);
+        if (R.is_err[str, str](gm_r)) { bad = 1; }
+        or {
+            val gm: str = R.unwrap_ok[str, str](gm_r);
+            if (str_empty(gm)) { bad = 1; }
+            str_free(?alloc, gm);
+        }
+    }
+
+    session.dnit(?s);
+    fs.remove_all(?alloc, root);
+    fs.remove_all(?alloc, fixture);
+    str_free(?alloc, root);
+    str_free(?alloc, fixture);
+    git_inspector_dnit(?alloc, ?gi);
+    ret bad;
+}
+
+test "mach.lang.driver.deps.realize_git_submodule:alias_key_realizes_at_the_key" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val gi_r: R.Result[GitInspector, str] = git_inspector_init(?alloc);
+    if (R.is_err[GitInspector, str](gi_r)) { ret 1; }
+    var gi: GitInspector = R.unwrap_ok[GitInspector, str](gi_r);
+
+    val fixture_r: R.Result[str, str] = t_make_fixture_repo(?alloc, ?gi, "other");
+    if (R.is_err[str, str](fixture_r)) { git_inspector_dnit(?alloc, ?gi); ret 1; }
+    val fixture: str = R.unwrap_ok[str, str](fixture_r);
+
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_dep_mismatch_root");
+    if (R.is_err[str, str](root_r)) { git_inspector_dnit(?alloc, ?gi); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { git_inspector_dnit(?alloc, ?gi); ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var env: [4]*u8;
+    t_env_allow_file_protocol(?env[0]);
+    val real_r: R.Result[R.Void, str] = realize_git_submodule_env(?s, root, "std", fixture, "branch/main", ?env[0]);
+    var bad: i32 = 0;
+    if (R.is_err[R.Void, str](real_r)) { bad = 1; }
+
+    val dep_full_r: R.Result[str, str] = path.join(?alloc, root, "dep/std");
+    val dep_full: str = R.unwrap_ok[str, str](dep_full_r);
+    if (!fs.is_dir(dep_full)) { bad = 1; }
+    val declared_r: R.Result[str, str] = declared_dep_id(?s, dep_full);
+    if (R.is_err[str, str](declared_r)) { bad = 1; }
+    or (!str_equals(R.unwrap_ok[str, str](declared_r), "other")) { bad = 1; }
+    str_free(?alloc, dep_full);
+
+    val gitmodules_r: R.Result[str, str] = path.join(?alloc, root, ".gitmodules");
+    val gitmodules: str = R.unwrap_ok[str, str](gitmodules_r);
+    if (!fs.exists(gitmodules)) { bad = 1; }
+    str_free(?alloc, gitmodules);
+
+    if (R.is_err[R.Void, str](check_dep_identity(?s, "std", "std", true))) { bad = 1; }
+    if (R.is_err[R.Void, str](check_dep_identity(?s, "mach-std", "std", true))) { bad = 1; }
+
+    session.dnit(?s);
+    fs.remove_all(?alloc, root);
+    fs.remove_all(?alloc, fixture);
+    str_free(?alloc, root);
+    str_free(?alloc, fixture);
+    git_inspector_dnit(?alloc, ?gi);
+    ret bad;
+}
+
+test "mach.lang.driver.deps.realize_git_submodule:failing_clone_leaves_scaffold_intact_and_dep_clean" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val gi_r: R.Result[GitInspector, str] = git_inspector_init(?alloc);
+    if (R.is_err[GitInspector, str](gi_r)) { ret 1; }
+    var gi: GitInspector = R.unwrap_ok[GitInspector, str](gi_r);
+
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_dep_failclone_root");
+    if (R.is_err[str, str](root_r)) { git_inspector_dnit(?alloc, ?gi); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    val scaffold_text: str = "[project]\nid = \"proj\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out\"\n";
+    val write_err: O.Option[str] = t_write_file(?alloc, root, "mach.toml", scaffold_text);
+    var bad: i32 = 0;
+    if (O.is_some[str](write_err)) { bad = 1; }
+
+    val bogus_r: R.Result[str, str] = path.join(?alloc, root, "does-not-exist");
+    val bogus: str = R.unwrap_ok[str, str](bogus_r);
+
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { git_inspector_dnit(?alloc, ?gi); ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var env: [4]*u8;
+    t_env_allow_file_protocol(?env[0]);
+    val real_r: R.Result[R.Void, str] = realize_git_submodule_env(?s, root, "std", bogus, "branch/main", ?env[0]);
+    if (R.is_ok[R.Void, str](real_r)) { bad = 1; }
+
+    val dep_full_r: R.Result[str, str] = path.join(?alloc, root, "dep/std");
+    val dep_full: str = R.unwrap_ok[str, str](dep_full_r);
+    if (fs.exists(dep_full)) { bad = 1; }
+    str_free(?alloc, dep_full);
+
+    val manifest_path_r: R.Result[str, str] = path.join(?alloc, root, "mach.toml");
+    val manifest_path: str = R.unwrap_ok[str, str](manifest_path_r);
+    val read_r: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, manifest_path);
+    if (R.is_err[Vector[u8], str](read_r)) { bad = 1; }
+    or {
+        var v: Vector[u8] = R.unwrap_ok[Vector[u8], str](read_r);
+        if (v.len != str_len(scaffold_text)) { bad = 1; }
+        vector.dnit[u8](?v);
+    }
+    str_free(?alloc, manifest_path);
+
+    session.dnit(?s);
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    str_free(?alloc, bogus);
+    git_inspector_dnit(?alloc, ?gi);
+    ret bad;
+}
+
+fun t_mkdirs(alloc: *A.Allocator, base: str, rel: str) R.Result[str, str] {
+    val p_r: R.Result[str, str] = path.join(alloc, base, rel);
+    if (R.is_err[str, str](p_r)) { ret p_r; }
+    val p: str = R.unwrap_ok[str, str](p_r);
+    if (O.is_some[str](fs.create_dir_all(alloc, p, 0o755))) { str_free(alloc, p); ret R.err[str, str]("cannot create directory"); }
+    ret R.ok[str, str](p);
+}
+
+test "mach.lang.driver.deps.project_root_authority:repo_root_nested_and_absent" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val gi_r: R.Result[GitInspector, str] = git_inspector_init(?alloc);
+    if (R.is_err[GitInspector, str](gi_r)) { ret 1; }
+    var gi: GitInspector = R.unwrap_ok[GitInspector, str](gi_r);
+
+    val outer_r: R.Result[str, str] = t_make_fixture_repo(?alloc, ?gi, "outer");
+    if (R.is_err[str, str](outer_r)) { git_inspector_dnit(?alloc, ?gi); ret 1; }
+    val outer: str = R.unwrap_ok[str, str](outer_r);
+
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { git_inspector_dnit(?alloc, ?gi); ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var bad: i32 = 0;
+
+    val top_r: R.Result[u8, str] = project_root_authority(?s, ?gi, "x", outer);
+    if (R.is_err[u8, str](top_r)) { bad = 1; }
+    or (R.unwrap_ok[u8, str](top_r) != DEP_AUTHORITY_REPO) { bad = 1; }
+
+    val sub_r: R.Result[str, str] = t_mkdirs(?alloc, outer, "cases/one");
+    if (R.is_err[str, str](sub_r)) { bad = 1; }
+    or {
+        val sub: str = R.unwrap_ok[str, str](sub_r);
+        val nested_r: R.Result[u8, str] = project_root_authority(?s, ?gi, "x", sub);
+        if (R.is_err[u8, str](nested_r)) { bad = 1; }
+        or (R.unwrap_ok[u8, str](nested_r) != DEP_AUTHORITY_NESTED) { bad = 1; }
+        str_free(?alloc, sub);
+    }
+
+    val bare_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_dep_no_repo");
+    if (R.is_err[str, str](bare_r)) { bad = 1; }
+    or {
+        val bare: str = R.unwrap_ok[str, str](bare_r);
+        val absent_r: R.Result[u8, str] = project_root_authority(?s, ?gi, "x", bare);
+        if (R.is_ok[u8, str](absent_r)) { bad = 1; }
+        fs.remove_all(?alloc, bare);
+        str_free(?alloc, bare);
+    }
+
+    session.dnit(?s);
+    fs.remove_all(?alloc, outer);
+    str_free(?alloc, outer);
+    git_inspector_dnit(?alloc, ?gi);
+    ret bad;
+}
+
+test "mach.lang.driver.deps.realized_content:nested_project_verifies_checkout" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val gi_r: R.Result[GitInspector, str] = git_inspector_init(?alloc);
+    if (R.is_err[GitInspector, str](gi_r)) { ret 1; }
+    var gi: GitInspector = R.unwrap_ok[GitInspector, str](gi_r);
+
+    val fixture_r: R.Result[str, str] = t_make_fixture_repo(?alloc, ?gi, "std");
+    if (R.is_err[str, str](fixture_r)) { git_inspector_dnit(?alloc, ?gi); ret 1; }
+    val fixture: str = R.unwrap_ok[str, str](fixture_r);
+
+    val outer_r: R.Result[str, str] = t_make_fixture_repo(?alloc, ?gi, "outer");
+    if (R.is_err[str, str](outer_r)) { git_inspector_dnit(?alloc, ?gi); ret 1; }
+    val outer: str = R.unwrap_ok[str, str](outer_r);
+
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { git_inspector_dnit(?alloc, ?gi); ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var bad: i32 = 0;
+    val proj_r: R.Result[str, str] = t_mkdirs(?alloc, outer, "cases/one");
+    if (R.is_err[str, str](proj_r)) { bad = 1; }
+    if (bad == 0) {
+        val proj: str = R.unwrap_ok[str, str](proj_r);
+        val depdir_r: R.Result[str, str] = t_mkdirs(?alloc, proj, "dep");
+        if (R.is_err[str, str](depdir_r)) { bad = 1; }
+        or {
+            val depdir: str = R.unwrap_ok[str, str](depdir_r);
+            var clone_args: [3]str;
+            clone_args[0] = "clone"; clone_args[1] = fixture; clone_args[2] = "std";
+            var env: [4]*u8;
+            t_env_allow_file_protocol(?env[0]);
+            val clone_r: R.Result[str, str] = git_op(?alloc, ?gi, depdir, ?clone_args[0], 3, ?env[0]);
+            if (R.is_err[str, str](clone_r)) { bad = 1; }
+            or { str_free(?alloc, R.unwrap_ok[str, str](clone_r)); }
+            str_free(?alloc, depdir);
+        }
+
+        if (bad == 0) {
+            var d: manifest.DepDef;
+            d.path = intern.STR_NIL;
+            val nr: R.Result[intern.StrId, str] = intern.intern(?s.interner, "std");
+            val ur: R.Result[intern.StrId, str] = intern.intern(?s.interner, fixture);
+            val rr: R.Result[intern.StrId, str] = intern.intern(?s.interner, "branch/main");
+            if (R.is_err[intern.StrId, str](nr) || R.is_err[intern.StrId, str](ur) || R.is_err[intern.StrId, str](rr)) { bad = 1; }
+            or {
+                d.name = R.unwrap_ok[intern.StrId, str](nr);
+                d.git  = R.unwrap_ok[intern.StrId, str](ur);
+                d.ref  = R.unwrap_ok[intern.StrId, str](rr);
+                val dep_full_r: R.Result[str, str] = path.join(?alloc, proj, "dep/std");
+                val dep_full: str = R.unwrap_ok[str, str](dep_full_r);
+                var gi2: GitInspector = GitInspector{program: ""};
+                val content_r: R.Result[intern.StrId, str] = realized_content(?s, ?gi2, "std", proj, dep_full, "dep", ?d);
+                git_inspector_dnit(?alloc, ?gi2);
+                if (R.is_err[intern.StrId, str](content_r)) { bad = 1; }
+                or {
+                    val text_o: O.Option[str] = intern.lookup(?s.interner, R.unwrap_ok[intern.StrId, str](content_r));
+                    if (O.is_none[str](text_o)) { bad = 1; }
+                    or (!str_starts_with(O.unwrap[str](text_o), "git/")) { bad = 1; }
+                }
+                str_free(?alloc, dep_full);
+            }
+        }
+        str_free(?alloc, proj);
+    }
+
+    session.dnit(?s);
+    fs.remove_all(?alloc, outer);
+    fs.remove_all(?alloc, fixture);
+    str_free(?alloc, outer);
+    str_free(?alloc, fixture);
+    git_inspector_dnit(?alloc, ?gi);
+    ret bad;
 }

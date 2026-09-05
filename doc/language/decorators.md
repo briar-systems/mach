@@ -477,7 +477,15 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
 - Exactly one argument, a string literal. Escapes are **not** decoded, matching
   `symbol` and `section` — the path is taken as written.
 - The path resolves relative to the **declaring source file's** directory. An
-  absolute path is taken as written.
+  absolute path is taken as written. The resolved file must lie inside the
+  project root: in 4.30.0 an embed that escapes it (`../../outside.txt` from
+  `src/`) is a **warning** naming the path, and 5.0.0 rejects it. Keep assets
+  under the project.
+- A path holding `{artifact.<id>.out}` names the output of an artifact this one
+  requires through the manifest's `need`, and resolves against the **project
+  root** rather than the declaring file's directory; the required artifact is
+  built first. No other template variable may appear in an `embed` path. See
+  [manifest.md](../manifest.md#artifact-requirements).
 - The annotation must be `[_]u8` or `[N]u8`; the element type must be `u8`.
   `[_]` is an inferred array length, legal **only** on an `#[embed]`
   declaration — written anywhere else it is rejected (see

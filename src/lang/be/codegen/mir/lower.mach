@@ -1,71 +1,3 @@
-# mach.lang.be.codegen.mir.lower: IR-to-MIR translation and out-of-SSA
-#
-# `lower_ir` is the bridge between the target-independent SSA IR
-# (`mach.lang.me.ir`) and the MIR data model (`mach.lang.be.codegen.mir`): it
-# walks an `ir.Module` and produces a parallel `MirModule`, one `MirFunction`
-# per IR function. The translation is deliberately mechanical and
-# target-agnostic (it routes every register name and calling-convention fact
-# through the `tgt.abi` / `tgt.isa` vtables):
-#   - every IR `Block` becomes a `MirBlock` with the same numeric id;
-#   - every SSA result (instruction result or function parameter) is assigned
-#     exactly one fresh virtual register, and every operand reference becomes a
-#     `MIR_OP_VREG` operand naming it;
-#   - inline integer / null constants become `MIR_OP_IMM` operands; globals and
-#     function symbols become `MIR_OP_SYM` operands;
-#   - `OP_CALL` lowers through the active ABI vtable (see `mir.abi`): each
-#     argument is classified and pre-colored into its canonical argument
-#     register or a stack store, followed by a `MIR_CALL` pseudo naming the
-#     callee and a `MIR_CALL_RES` pseudo binding the result vreg;
-#   - `OP_PHI` is eliminated out of SSA: each phi becomes a `MIR_MOV` of its
-#     incoming value into the phi's result vreg, inserted at the end of every
-#     predecessor block before its terminator (see `lower_phis`), so no phi
-#     reaches isel / regalloc / encode.
-#
-# This module owns the generic per-instruction lowering and the out-of-SSA
-# machinery; ABI call/param/ret lowering lives in `mir.abi`, variadic
-# expansion in `mir.va`, and the shared `LowerCtx` and emit primitives in
-# `mir.context`.
-#
-# Constant-time contract (#1646). Two surfaces, deliberately separate:
-#
-#   - GATES (compile-time enforcement): `lower_instr` rejects a secret operand of a
-#     TARGET-DEPENDENT variable-latency op the target cannot do in constant time
-#     (integer multiply, variable shift), driven by the shared `mach.lang.ct` table
-#     over every opcode. It reads the SOUND IR operand taint (`value.Value.secret`,
-#     propagated by carry_secret with `:^`/OP_DECLASSIFY as a barrier). The
-#     always-unsafe class (div/mod, floating point, incl. vectors) is gated at sema.
-#
-#   - SEEDS for #1648 (contract): this module marks only the secret SOURCES on the
-#     lowered MIR - a secret parameter's vreg, and a load / call whose result is secret
-#     (`MirVReg.secret`, set once at ctx_setup); a store / memzero into secret storage
-#     (`MirInstr.writes_secret`, the zeroization seed); and `:^` lowered to an explicit
-#     MIR_DECLASSIFY barrier. It does NOT propagate a per-value taint through transforms
-#     (that model was fragile and non-deterministic). The #1648 validator re-derives
-#     per-instruction taint as a dataflow fixpoint over the LOWERED (target-independent,
-#     pre-selection) MIR - the layer where all three seed kinds and the barrier live -
-#     seeded from these markers, propagating any-secret-operand->secret-result and
-#     STOPPING at each MIR_DECLASSIFY. (isel retags MIR_DECLASSIFY to the concrete move
-#     afterward, so it is a plain register copy at runtime.) Because the seeds sit on
-#     stable sources and #1648 re-derives, no transform can launder the taint.
-#
-#     TRADEOFF (for #1648's designer): validating the LOWERED MIR trusts isel / regalloc
-#     / encode to be timing-preserving - it does NOT independently validate the emitted
-#     machine code. This is sound for #1646's enforcement (the gates already ran on this
-#     same lowered MIR, and the seeds + barrier are intact here), but it means an isel /
-#     regalloc bug that introduced a secret-dependent branch, address, or variable-latency
-#     op would NOT be caught. For true translation-validation of the emitted code, the
-#     seeds (MirVReg.secret, MirInstr.writes_secret) and the MIR_DECLASSIFY barrier must
-#     survive to POST-regalloc MIR - additive per-ISA encode-as-move work (the encoder
-#     dispatches concrete ISA opcodes, so MIR_DECLASSIFY would need an encode-as-move
-#     case and regalloc a copy/def-use handling per arch). That strengthening is left to
-#     be decided when #1648 is designed; the lowered-MIR contract does not foreclose it.
-#
-# INVARIANT for any future backend pass: it must not introduce a secret-dependent
-# branch, select a variable-latency instruction on a secret operand, or drop a
-# zeroizing write to secret storage - the source-level sema gates already make a
-# secret reaching a branch / index / div / mod / float operand unconstructable, and
-# SEED COMPLETENESS (every secret source marked) is what makes #1648's re-derive sound.
-
 use std.allocator.page;
 use std.collections.map;
 use std.format;
@@ -82,7 +14,7 @@ use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
-use ct: mach.lang.ct;
+use mach.lang.ct;
 use mach.lang.be.codegen.mir;
 use mabi: mach.lang.be.codegen.mir.abi;
 use lctx: mach.lang.be.codegen.mir.context;
@@ -91,34 +23,20 @@ use mach.lang.me.ir;
 use mach.lang.me.ir.builder;
 use mach.lang.me.ir.id;
 use instr: mach.lang.me.ir.instruction;
+use mach.lang.me.ir.opdesc;
 use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.source;
 use treg: mach.lang.target;
+use target_testing: mach.lang.target.testing;
 use target: mach.lang.target.resolved;
-use isa: mach.lang.target.isa;
+use mach.lang.target.isa;
 
-# lower an IR module to a parallel MIR module, one MIR function per IR function
-# ---
-# tgt:      resolved compilation target; supplies register classes via `tgt.arch`
-# m:        the source IR module to lower
-# alloc:    allocator for the transient MIR (codegen scratch); a parallel worker
-#           passes a private arena, the serial path the session allocator
-# interner: session interner, recorded on the MIR module so the encoder can
-#           resolve interned strings and intern inline-asm symbol references
-# srcmap:   session source map, borrowed read-only onto the MIR module so encode
-#           diagnostics can name "path:line:col" (#2153)
-# ret:      a populated mir.MirModule (owned, release with `mir.dnit_module`), or
-#           an allocation / lowering error
 pub fun lower_ir(tgt: *target.Target, m: *ir.Module, alloc: *A.Allocator, interner: *intern.Interner, srcmap: *source.SourceMap) R.Result[mir.MirModule, str] {
     if (tgt == nil || m == nil) {
         ret R.err[mir.MirModule, str]("mir.lower_ir: nil target or module");
     }
 
-    # the MirModule and everything reachable from it is transient codegen scratch,
-    # allocated from `alloc` rather than the IR module's own allocator so a parallel
-    # worker can build it in a private arena (the serial path passes the session
-    # allocator, which is m.alloc, leaving behaviour unchanged).
     var mm: mir.MirModule;
     mm.alloc        = alloc;
     mm.interner     = interner;
@@ -141,10 +59,10 @@ pub fun lower_ir(tgt: *target.Target, m: *ir.Module, alloc: *A.Allocator, intern
             mir.dnit_module(?mm);
             ret R.err[mir.MirModule, str](R.unwrap_err[mir.MirFunction, str](lf));
         }
-        val push: R.Result[bool, str] = mir.push_function(?mm, R.unwrap_ok[mir.MirFunction, str](lf));
-        if (R.is_err[bool, str](push)) {
+        val push: R.Result[R.Void, str] = mir.push_function(?mm, R.unwrap_ok[mir.MirFunction, str](lf));
+        if (R.is_err[R.Void, str](push)) {
             mir.dnit_module(?mm);
-            ret R.err[mir.MirModule, str](R.unwrap_err[bool, str](push));
+            ret R.err[mir.MirModule, str](R.unwrap_err[R.Void, str](push));
         }
         fi = fi + 1;
     }
@@ -152,18 +70,6 @@ pub fun lower_ir(tgt: *target.Target, m: *ir.Module, alloc: *A.Allocator, intern
     ret R.ok[mir.MirModule, str](mm);
 }
 
-# lower one IR function into a mir.MirFunction
-#
-# Allocates the vreg table and the per-definition vreg maps, assigns a vreg to
-# every parameter and every non-void instruction result, then translates each
-# block's phis, body, and terminator into MIR instructions.
-# ---
-# tgt:      resolved compilation target; routes register classes and ABI facts
-# m:        the source IR module owning `fn`
-# fn:       the IR function to lower
-# alloc:    allocator for all per-function MIR storage (codegen scratch)
-# interner: session interner, recorded on the context for inline-asm resolution
-# ret:      a populated mir.MirFunction (owned), or an allocation / lowering error
 fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, alloc: *A.Allocator, interner: *intern.Interner) R.Result[mir.MirFunction, str] {
     var mf: mir.MirFunction;
     mf.name                = fn.name;
@@ -185,13 +91,9 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, alloc: 
     mf.frame.omit          = false;
     mf.callee_mask         = 0;
     mf.callee_mask_fp      = 0;
-    # the #[oblivious] seed for #1648: mark the MIR self-describing so the constant-time
-    # validator runs its leakage checks only in a function the source opted in.
     mf.oblivious           = (fn.flags & ir.FN_FLAG_OBLIVIOUS) != 0;
-    # the #[naked] seed for #2198, read by `frame.omits_frame`.
     mf.naked               = (fn.flags & ir.FN_FLAG_NAKED) != 0;
 
-    # extern / body-less functions lower to an empty mir.MirFunction shell.
     if ((fn.flags & ir.FN_FLAG_EXTERN) != 0 || fn.block_count == 0) {
         ret R.ok[mir.MirFunction, str](mf);
     }
@@ -206,6 +108,7 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, alloc: 
     var ctx: lctx.LowerCtx;
     ctx.alloc          = alloc;
     ctx.tgt            = tgt;
+    ctx.layout         = target.layout_machine(tgt);
     ctx.m              = m;
     ctx.types          = ?m.types;
     ctx.fn             = fn;
@@ -225,11 +128,11 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, alloc: 
     ctx.pending_count  = 0;
     ctx.pending_cap    = 0;
 
-    val setup: R.Result[bool, str] = lctx.ctx_setup(?ctx, tgt, fn);
-    if (R.is_err[bool, str](setup)) {
+    val setup: R.Result[R.Void, str] = lctx.ctx_setup(?ctx, tgt, fn);
+    if (R.is_err[R.Void, str](setup)) {
         lctx.ctx_dnit(?ctx);
         mir.dnit_function(alloc, ?mf);
-        ret R.err[mir.MirFunction, str](R.unwrap_err[bool, str](setup));
+        ret R.err[mir.MirFunction, str](R.unwrap_err[R.Void, str](setup));
     }
 
     val rb: R.Result[*mir.MirBlock, str] = A.allocate[mir.MirBlock](alloc, fn.block_count::usize);
@@ -244,43 +147,27 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, alloc: 
     var bi: u32 = 0;
     for (bi < fn.block_count) {
         val is_entry: bool = bi == 0;
-        val lb: R.Result[bool, str] = lower_block(?ctx, fn, ?fn.blocks[bi], is_entry);
-        if (R.is_err[bool, str](lb)) {
+        val lb: R.Result[R.Void, str] = lower_block(?ctx, fn, ?fn.blocks[bi], is_entry);
+        if (R.is_err[R.Void, str](lb)) {
             lctx.ctx_dnit(?ctx);
             mir.dnit_function(alloc, ?mf);
-            ret R.err[mir.MirFunction, str](R.unwrap_err[bool, str](lb));
+            ret R.err[mir.MirFunction, str](R.unwrap_err[R.Void, str](lb));
         }
         bi = bi + 1;
     }
 
-    # out-of-SSA: every block now exists, so the phi merge copies can be inserted
-    # at the predecessor block ends (before their terminators).
-    val lph: R.Result[bool, str] = lower_phis(?ctx, fn);
-    if (R.is_err[bool, str](lph)) {
+    val lph: R.Result[R.Void, str] = lower_phis(?ctx, fn);
+    if (R.is_err[R.Void, str](lph)) {
         lctx.ctx_dnit(?ctx);
         mir.dnit_function(alloc, ?mf);
-        ret R.err[mir.MirFunction, str](R.unwrap_err[bool, str](lph));
+        ret R.err[mir.MirFunction, str](R.unwrap_err[R.Void, str](lph));
     }
 
     lctx.ctx_dnit(?ctx);
     ret R.ok[mir.MirFunction, str](mf);
 }
 
-# lower one IR block into a mir.MirBlock with the same id
-#
-# Copies predecessor ids, translates each body instruction, then the terminator.
-# IR phis are NOT emitted here - they are eliminated out of SSA by `lower_phis`
-# after every block exists, which inserts the merge copies at the predecessor
-# block ends. The block is claimed in `mf` (block_count incremented) the moment
-# its owned pointers are zeroed, so a partially built block left behind by an
-# allocation failure is still reclaimed by `dnit_function` on the cleanup path.
-# ---
-# ctx:      the per-function lowering context
-# fn:       the IR function owning `blk`
-# blk:      the IR block to lower
-# is_entry: true for the entry block, which opens with the ABI param pre-coloring
-# ret:      true on success, or an allocation / lowering error
-fun lower_block(ctx: *lctx.LowerCtx, fn: *ir.Function, blk: *ir.Block, is_entry: bool) R.Result[bool, str] {
+fun lower_block(ctx: *lctx.LowerCtx, fn: *ir.Function, blk: *ir.Block, is_entry: bool) R.Result[R.Void, str] {
     val f: *mir.MirFunction = ctx.f;
     val mb: *mir.MirBlock = ?f.blocks[f.block_count];
     mb.id          = blk.id::u32;
@@ -292,52 +179,39 @@ fun lower_block(ctx: *lctx.LowerCtx, fn: *ir.Function, blk: *ir.Block, is_entry:
     mb.pred_cap    = 0;
     f.block_count = f.block_count + 1;
 
-    val cp: R.Result[bool, str] = copy_preds(ctx, mb, blk);
-    if (R.is_err[bool, str](cp)) { ret cp; }
+    val cp: R.Result[R.Void, str] = copy_preds(ctx, mb, blk);
+    if (R.is_err[R.Void, str](cp)) { ret cp; }
 
-    # the entry block opens with the ABI param pre-coloring: each incoming
-    # parameter is moved out of its canonical argument register (or loaded from
-    # the caller's stack area) into the parameter vreg before any body code runs.
     if (is_entry) {
-        val lp: R.Result[bool, str] = mabi.lower_params(ctx, mb);
-        if (R.is_err[bool, str](lp)) { ret lp; }
+        val lp: R.Result[R.Void, str] = mabi.lower_params(ctx, mb);
+        if (R.is_err[R.Void, str](lp)) { ret lp; }
     }
 
     var ii: u32 = 0;
     for (ii < blk.instr_count) {
-        val ei: R.Result[bool, str] = lower_instr(ctx, fn, mb, blk.instructions[ii]);
-        if (R.is_err[bool, str](ei)) { ret ei; }
+        val ei: R.Result[R.Void, str] = lower_instr(ctx, fn, mb, blk.instructions[ii]);
+        if (R.is_err[R.Void, str](ei)) { ret ei; }
         ii = ii + 1;
     }
 
     if (blk.terminator != id.INSTR_NIL) {
-        val et: R.Result[bool, str] = lower_instr(ctx, fn, mb, blk.terminator);
-        if (R.is_err[bool, str](et)) { ret et; }
+        val et: R.Result[R.Void, str] = lower_instr(ctx, fn, mb, blk.terminator);
+        if (R.is_err[R.Void, str](et)) { ret et; }
     }
 
-    # flush any -g binding that had no following push_instr in this block (an
-    # OP_DBG_VALUE whose next instruction was the terminator on a path that bypasses
-    # push_instr) onto the block's last instruction, so a binding never leaks into the
-    # next block. cleared unconditionally so pending never crosses a block boundary.
     if (ctx.pending_count > 0 && mb.instr_count > 0) {
-        val fl: R.Result[bool, str] = lctx.drain_pending_dbg(ctx, ?mb.instrs[mb.instr_count - 1]);
-        if (R.is_err[bool, str](fl)) { ret fl; }
+        val fl: R.Result[R.Void, str] = lctx.drain_pending_dbg(ctx, ?mb.instrs[mb.instr_count - 1]);
+        if (R.is_err[R.Void, str](fl)) { ret fl; }
     }
     ctx.pending_count = 0;
 
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# copy an IR block's predecessor ids into a mir.MirBlock
-# ---
-# ctx: the per-function lowering context
-# mb:  the destination MIR block
-# blk: the source IR block
-# ret: true on success, or an allocation error
-fun copy_preds(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, blk: *ir.Block) R.Result[bool, str] {
-    if (blk.pred_count == 0) { ret R.ok[bool, str](true); }
+fun copy_preds(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, blk: *ir.Block) R.Result[R.Void, str] {
+    if (blk.pred_count == 0) { ret R.ok_void[str](); }
     val r: R.Result[*u32, str] = A.allocate[u32](ctx.alloc, blk.pred_count::usize);
-    if (R.is_err[*u32, str](r)) { ret R.err[bool, str](R.unwrap_err[*u32, str](r)); }
+    if (R.is_err[*u32, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](r)); }
     mb.preds    = R.unwrap_ok[*u32, str](r);
     mb.pred_cap = blk.pred_count;
     var i: u32 = 0;
@@ -346,76 +220,42 @@ fun copy_preds(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, blk: *ir.Block) R.Result[
         i = i + 1;
     }
     mb.pred_count = blk.pred_count;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# eliminate every IR phi out of SSA by inserting merge copies at predecessor ends
-#
-# Conventional (Cytron-style) phi destruction: a phi in block `S` with result
-# vreg `r` and incoming pairs `(pred, value)` is realized by emitting, at the end
-# of each predecessor block `P` (before its terminator), a
-# `mir.MIR_MOV r <- lctx.lower_value(value)`, so `r` is defined on every path into
-# `S`. After this pass no OP_PHI / mir.MIR_PHI exists; the encoder's mir.MIR_PHI
-# rejection is only a backstop. The result vreg is the ordinary allocatable vreg
-# `lctx.ctx_setup` already assigned to the phi instruction.
-#
-# All phis at the head of `S` execute simultaneously, so the copies along a single
-# edge `P -> S` form one parallel-copy set; `emit_edge_copies` sequentializes it
-# correctly (breaking cycles with a fresh temp) to avoid the lost-copy / swap
-# problem. Phis whose incoming value lowers to itself contribute no copy.
-# ---
-# ctx: the per-function lowering context
-# fn:  the IR function whose phis are being destructed
-# ret: true on success, or an allocation / lowering error
-fun lower_phis(ctx: *lctx.LowerCtx, fn: *ir.Function) R.Result[bool, str] {
+fun lower_phis(ctx: *lctx.LowerCtx, fn: *ir.Function) R.Result[R.Void, str] {
     var bi: u32 = 0;
     for (bi < fn.block_count) {
         val blk: *ir.Block = ?fn.blocks[bi];
         if (blk.phi_count > 0) {
-            val r: R.Result[bool, str] = lower_block_phis(ctx, fn, blk);
-            if (R.is_err[bool, str](r)) { ret r; }
+            val r: R.Result[R.Void, str] = lower_block_phis(ctx, fn, blk);
+            if (R.is_err[R.Void, str](r)) { ret r; }
         }
         bi = bi + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# insert the merge copies for every phi of one successor block `S`
-#
-# For each distinct predecessor block id appearing in `S`'s phis, gathers the
-# per-edge parallel-copy set (one `(phi result vreg, incoming operand)` per phi
-# that has an incoming pair for that predecessor) and emits it, safely
-# sequentialized, at the end of that predecessor's MIR block.
-# ---
-# ctx: the per-function lowering context
-# fn:  the IR function owning `blk`
-# blk: the successor block `S` whose phis are being realized
-# ret: true on success, or an allocation / lowering error
-fun lower_block_phis(ctx: *lctx.LowerCtx, fn: *ir.Function, blk: *ir.Block) R.Result[bool, str] {
-    # scratch parallel-copy set, at most one copy per phi in this block.
+fun lower_block_phis(ctx: *lctx.LowerCtx, fn: *ir.Function, blk: *ir.Block) R.Result[R.Void, str] {
     val np: u32 = blk.phi_count;
     val rd: R.Result[*u32, str] = A.allocate[u32](ctx.alloc, np::usize);
-    if (R.is_err[*u32, str](rd)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rd)); }
+    if (R.is_err[*u32, str](rd)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](rd)); }
     val dsts: *u32 = R.unwrap_ok[*u32, str](rd);
     val rs: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, np::usize);
     if (R.is_err[*mir.MirOperand, str](rs)) {
         A.deallocate[u32](ctx.alloc, dsts, np::usize);
-        ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](rs));
+        ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](rs));
     }
     val srcs: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](rs);
-    # per-copy logical width, parallel to dsts / srcs: the phi result's byte width,
-    # so an immediate incoming value materializes at the constant's true width.
     val rw: R.Result[*u8, str] = A.allocate[u8](ctx.alloc, np::usize);
     if (R.is_err[*u8, str](rw)) {
         A.deallocate[u32](ctx.alloc, dsts, np::usize);
         A.deallocate[mir.MirOperand](ctx.alloc, srcs, np::usize);
-        ret R.err[bool, str](R.unwrap_err[*u8, str](rw));
+        ret R.err[R.Void, str](R.unwrap_err[*u8, str](rw));
     }
     val wids: *u8 = R.unwrap_ok[*u8, str](rw);
 
     var err_msg: str = nil;
-    # iterate the distinct predecessor block ids of `S`. preds were copied from the
-    # IR block, deduped, so each names one edge `P -> S`.
     var pi: u32 = 0;
     for (pi < blk.pred_count && err_msg == nil) {
         val pred_id: u32 = blk.preds[pi]::u32;
@@ -426,21 +266,12 @@ fun lower_block_phis(ctx: *lctx.LowerCtx, fn: *ir.Function, blk: *ir.Block) R.Re
             cnt;
         }
 
-        # critical edge: a phi block always has multiple predecessors, so an edge
-        # `P -> S` is critical when `P` also has multiple successors (a CBR). Placing
-        # this edge's phi copies at the end of `P` would run them on `P`'s other
-        # successor path too, which can corrupt a value the sibling edge's copies
-        # need. Split the edge into a fresh block `B` that branches to `S`, retarget
-        # `P`'s CBR to `B`, and emit this edge's copies into `B` (which ends in an
-        # unconditional branch and so is a safe splice point).
         if (block_ends_in_cbr(pred_mb)) {
             val sr: R.Result[*mir.MirBlock, str] = split_critical_edge(ctx, pred_mb, blk.id::u32);
             if (R.is_err[*mir.MirBlock, str](sr)) { err_msg = R.unwrap_err[*mir.MirBlock, str](sr); pi = pi + 1; cnt; }
             pred_mb = R.unwrap_ok[*mir.MirBlock, str](sr);
         }
 
-        # collect this edge's copies: for each phi, the incoming value paired with
-        # this predecessor, targeting the phi's result vreg.
         var nc: u32 = 0;
         var hi: u32 = 0;
         for (hi < blk.phi_count && err_msg == nil) {
@@ -469,10 +300,6 @@ fun lower_block_phis(ctx: *lctx.LowerCtx, fn: *ir.Function, blk: *ir.Block) R.Re
                 }
                 k = k + 2;
             }
-            # out-of-SSA is total: the phi's result vreg has to be defined on EVERY
-            # path into its block, so an edge with no incoming is a malformed input
-            # like the four above it and not a case. lowering it emits no copy and
-            # leaves the merge register read undefined on that path (#2917).
             if (!found) {
                 err_msg = phi_edge_err(ctx, blk.id::u32, pred_id, dst_vreg);
                 hi = hi + 1;
@@ -482,8 +309,8 @@ fun lower_block_phis(ctx: *lctx.LowerCtx, fn: *ir.Function, blk: *ir.Block) R.Re
         }
 
         if (err_msg == nil && nc > 0) {
-            val r: R.Result[bool, str] = emit_edge_copies(ctx, pred_mb, dsts, srcs, wids, nc);
-            if (R.is_err[bool, str](r)) { err_msg = R.unwrap_err[bool, str](r); }
+            val r: R.Result[R.Void, str] = emit_edge_copies(ctx, pred_mb, dsts, srcs, wids, nc);
+            if (R.is_err[R.Void, str](r)) { err_msg = R.unwrap_err[R.Void, str](r); }
         }
         pi = pi + 1;
     }
@@ -491,21 +318,10 @@ fun lower_block_phis(ctx: *lctx.LowerCtx, fn: *ir.Function, blk: *ir.Block) R.Re
     A.deallocate[u32](ctx.alloc, dsts, np::usize);
     A.deallocate[mir.MirOperand](ctx.alloc, srcs, np::usize);
     A.deallocate[u8](ctx.alloc, wids, np::usize);
-    if (err_msg != nil) { ret R.err[bool, str](err_msg); }
-    ret R.ok[bool, str](true);
+    if (err_msg != nil) { ret R.err[R.Void, str](err_msg); }
+    ret R.ok_void[str]();
 }
 
-# build the message for a phi edge that carries no incoming value
-#
-# The pass that dropped the incoming is well upstream of MIR lowering, so the block
-# pair and the merge vreg are the only thread back to it and a static string would
-# name none of them. Built on `ctx.alloc`, the session allocator the error is read on.
-# ---
-# ctx:      the per-function lowering context (supplies the allocator)
-# block_id: the phi's own block
-# pred_id:  the predecessor edge that has no incoming
-# dst_vreg: the phi result's vreg
-# ret:      the formatted message, or a static fallback when formatting fails
 fun phi_edge_err(ctx: *lctx.LowerCtx, block_id: u32, pred_id: u32, dst_vreg: u32) str {
     val fallback: str = "mir.lower_ir: phi has no incoming value for a predecessor edge";
     val rj: R.Result[str, str] = format.sprint(ctx.alloc,
@@ -515,14 +331,6 @@ fun phi_edge_err(ctx: *lctx.LowerCtx, block_id: u32, pred_id: u32, dst_vreg: u32
     ret R.unwrap_ok[str, str](rj);
 }
 
-# return the MIR block whose id equals `block_id`, or nil if absent
-#
-# MIR block ids mirror the source IR block ids, so a phi's predecessor id selects
-# the predecessor's MIR block directly.
-# ---
-# f:        the MIR function to search
-# block_id: the block id to match
-# ret:      the matching MIR block, or nil when none has that id
 fun mir_block_by_id(f: *mir.MirFunction, block_id: u32) *mir.MirBlock {
     var bi: u32 = 0;
     for (bi < f.block_count) {
@@ -532,34 +340,14 @@ fun mir_block_by_id(f: *mir.MirFunction, block_id: u32) *mir.MirBlock {
     ret nil;
 }
 
-# sequentialize and insert one edge's parallel-copy set into its predecessor
-#
-# The set `{dsts[i] <- srcs[i]}` is spliced into predecessor block `pred_mb`,
-# before its terminator. All `dsts[i]` are distinct phi-result vregs; the
-# `srcs[i]` operands are vregs, immediates, or symbols. The copies are
-# conceptually simultaneous, so a naive in-order emission would clobber a value
-# another copy still needs (the lost-copy / swap problem). Standard resolution:
-# repeatedly emit any copy whose destination is not still needed as a source;
-# when only a dependence cycle remains, break it by saving one destination's live
-# value into a fresh temp vreg and redirecting the copies that read it. A
-# `dst == src` self-copy is dropped.
-# ---
-# ctx:     the per-function lowering context
-# pred_mb: the predecessor block the copies are spliced into
-# dsts:    the per-copy destination vregs (len `n`)
-# srcs:    the per-copy source operands (len `n`)
-# wids:    the per-copy value logical width in bytes (len `n`)
-# n:       the number of copies in the edge set
-# ret:     true on success, or an allocation / lowering error
-fun emit_edge_copies(ctx: *lctx.LowerCtx, pred_mb: *mir.MirBlock, dsts: *u32, srcs: *mir.MirOperand, wids: *u8, n: u32) R.Result[bool, str] {
+fun emit_edge_copies(ctx: *lctx.LowerCtx, pred_mb: *mir.MirBlock, dsts: *u32, srcs: *mir.MirOperand, wids: *u8, n: u32) R.Result[R.Void, str] {
     val re: R.Result[*bool, str] = A.allocate[bool](ctx.alloc, n::usize);
-    if (R.is_err[*bool, str](re)) { ret R.err[bool, str](R.unwrap_err[*bool, str](re)); }
+    if (R.is_err[*bool, str](re)) { ret R.err[R.Void, str](R.unwrap_err[*bool, str](re)); }
     val done: *bool = R.unwrap_ok[*bool, str](re);
 
     var remaining: u32 = 0;
     var i: u32 = 0;
     for (i < n) {
-        # a copy whose source is the destination vreg itself is a no-op.
         if (srcs[i].kind == mir.MIR_OP_VREG && srcs[i].vreg == dsts[i]) {
             done[i] = true;
         } or {
@@ -575,9 +363,9 @@ fun emit_edge_copies(ctx: *lctx.LowerCtx, pred_mb: *mir.MirBlock, dsts: *u32, sr
         var j: u32 = 0;
         for (j < n) {
             if (done[j] == false && !dst_is_pending_src(dsts, srcs, done, n, dsts[j])) {
-                val mv: R.Result[bool, str] = insert_mov_before_terminator(ctx, pred_mb,
+                val mv: R.Result[R.Void, str] = insert_mov_before_terminator(ctx, pred_mb,
                     mir.op_vreg(dsts[j]), srcs[j], wids[j]);
-                if (R.is_err[bool, str](mv)) { err_msg = R.unwrap_err[bool, str](mv); j = n; cnt; }
+                if (R.is_err[R.Void, str](mv)) { err_msg = R.unwrap_err[R.Void, str](mv); j = n; cnt; }
                 done[j] = true;
                 remaining = remaining - 1;
                 progressed = true;
@@ -586,31 +374,17 @@ fun emit_edge_copies(ctx: *lctx.LowerCtx, pred_mb: *mir.MirBlock, dsts: *u32, sr
         }
 
         if (err_msg == nil && progressed == false && remaining > 0) {
-            # only a dependence cycle remains: every pending destination is still
-            # needed as a pending source. Pick one pending copy, save its
-            # destination's live value into a fresh temp, and redirect every pending
-            # copy that reads that destination to read the temp instead. This frees
-            # the destination so the loop resumes.
             var c: u32 = 0;
             for (done[c]) { c = c + 1; }
             val freed: u32 = dsts[c];
             val cls: u32 = ctx.f.vregs[freed].class;
-            # preserve the freed vreg's vector-ness so the save copies the full 16 bytes
-            # of a vector (a gpr-width save would truncate it, #2070).
             val tr: R.Result[u32, str] = lctx.new_vreg_vec(ctx, cls, ctx.f.vregs[freed].vector);
             if (R.is_err[u32, str](tr)) { err_msg = R.unwrap_err[u32, str](tr); cnt; }
             val tmp: u32 = R.unwrap_ok[u32, str](tr);
-            # this temp is a second name for the live phi value, so retain the
-            # source declaration metadata just as class and vector shape are
-            # retained. machine backends ignore it; a logical backend can then
-            # type the parallel-copy component without reading a move width.
             ctx.f.vregs[tmp].ty = ctx.f.vregs[freed].ty;
-            # the cycle-break save is a register-to-register copy of a live value;
-            # insert_mov_before_terminator carries the full register width (16 for a
-            # vector via the temp's preserved flag).
-            val sv: R.Result[bool, str] = insert_mov_before_terminator(ctx, pred_mb,
+            val sv: R.Result[R.Void, str] = insert_mov_before_terminator(ctx, pred_mb,
                 mir.op_vreg(tmp), mir.op_vreg(freed), ctx.tgt.model.gpr_width::u8);
-            if (R.is_err[bool, str](sv)) { err_msg = R.unwrap_err[bool, str](sv); cnt; }
+            if (R.is_err[R.Void, str](sv)) { err_msg = R.unwrap_err[R.Void, str](sv); cnt; }
             var d: u32 = 0;
             for (d < n) {
                 if (done[d] == false && srcs[d].kind == mir.MIR_OP_VREG && srcs[d].vreg == freed) {
@@ -622,21 +396,10 @@ fun emit_edge_copies(ctx: *lctx.LowerCtx, pred_mb: *mir.MirBlock, dsts: *u32, sr
     }
 
     A.deallocate[bool](ctx.alloc, done, n::usize);
-    if (err_msg != nil) { ret R.err[bool, str](err_msg); }
-    ret R.ok[bool, str](true);
+    if (err_msg != nil) { ret R.err[R.Void, str](err_msg); }
+    ret R.ok_void[str]();
 }
 
-# true when vreg `v` is the source of some not-yet-emitted copy in the edge set
-#
-# Emitting a copy into `v` now would destroy a value another pending copy still
-# needs.
-# ---
-# dsts: the per-copy destination vregs (len `n`)
-# srcs: the per-copy source operands (len `n`)
-# done: per-copy emitted flags (len `n`)
-# n:    the number of copies in the edge set
-# v:    the vreg to test as a pending source
-# ret:  true when some not-yet-emitted copy reads `v`
 fun dst_is_pending_src(dsts: *u32, srcs: *mir.MirOperand, done: *bool, n: u32, v: u32) bool {
     var i: u32 = 0;
     for (i < n) {
@@ -648,76 +411,29 @@ fun dst_is_pending_src(dsts: *u32, srcs: *mir.MirOperand, done: *bool, n: u32, v
     ret false;
 }
 
-# the width to materialize an immediate phi-merge source into a GP register. a
-# 32-bit constant rides a width-4 move so the backend re-signs it to its register
-# convention (the riscv64 lp64 family holds an i32 sign-extended, re-signed from the width);
-# every other width keeps the full gpr-width move, since a sub-32 store leaves a
-# target's upper register bits unspecified (an x86 `mov al` does not clear them) and
-# a 64-bit value is already register-width. mirrors mir.abi.scalar_reg_move_width,
-# which clamps argument / return materialization the same way
 fun imm_merge_width(ctx: *lctx.LowerCtx, wid: u8) u8 {
     if (wid == 4) { ret 4; }
-    # a constant WIDER than the machine word (an i16 / i32 immediate on the 8-bit
-    # mos6502, word 1) materializes at the value's own width so the legalizer splits
-    # it into byte lanes; a gpr-width move would set only the low byte. every
-    # wide-native target has a word >= every scalar, so this keeps the machine-word
-    # move there and is byte-identical.
     var w: u8 = ctx.tgt.model.gpr_width::u8;
     if (wid > w) { w = wid; }
     ret w;
 }
 
-# splice a `mir.MIR_MOV (dst) <- (src)` just before a block's terminator
-#
-# A block that is a phi predecessor ends in a branch terminator (the last
-# instruction); the move is spliced ahead of it, preserving the terminator-last
-# ordering that frame.run / encode.run rely on.
-# ---
-# ctx: the per-function lowering context
-# mb:  the block to splice into; must end in a terminator
-# dst: the move destination operand
-# src: the move source operand
-# wid: the value's logical width in bytes; used to size an immediate materialization
-#      and to widen a register copy past the machine word (a wider-than-word scalar,
-#      the mos6502 8-bit case) so the legalizer splits it into byte lanes
-# ret: true on success, or an allocation / lowering error
-fun insert_mov_before_terminator(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mir.MirOperand, wid: u8) R.Result[bool, str] {
+fun insert_mov_before_terminator(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mir.MirOperand, wid: u8) R.Result[R.Void, str] {
     if (mb.instr_count == 0) {
-        ret R.err[bool, str]("mir.lower_ir: phi predecessor block has no terminator");
+        ret R.err[R.Void, str]("mir.lower_ir: phi predecessor block has no terminator");
     }
     val term: *mir.MirInstr = ?mb.instrs[mb.instr_count - 1];
     if (!is_mir_terminator(term.opcode)) {
-        ret R.err[bool, str]("mir.lower_ir: phi predecessor block does not end in a terminator");
+        ret R.err[R.Void, str]("mir.lower_ir: phi predecessor block does not end in a terminator");
     }
 
     val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
-    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](r)); }
+    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](r)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
     ops[0] = dst;
     ops[1] = src;
     var mi: mir.MirInstr = mir.instr(mir.MIR_MOV, ops, 2, 0, 0);
-    # a global / function symbol incoming value is its ADDRESS as an rvalue: a
-    # mir.MIR_MOV of a symbol selects to `mov dst, [sym]` (loading the symbol's
-    # contents), so it is emitted as the address-computing mir.MIR_GEP (`lea dst,
-    # [sym]`) instead - the same LEA-materialization the store / call-arg / return
-    # symbol paths use.
     if (src.kind == mir.MIR_OP_SYM) { mi.opcode = mir.MIR_GEP; }
-    # a register / symbol source transfers a value already in its target-canonical
-    # register form, so a full GPR-width bit copy is width-agnostic for a GP or scalar
-    # float value. a 128-bit vector vreg is the exception: it is 16 bytes, so a
-    # gpr-width copy moves only the low 64 bits and truncates the vector through the
-    # merge (#2070) - it carries the full vector width so the encoder emits the 16-byte
-    # MOVAPS. an immediate source is a MATERIALIZATION of a constant at
-    # `imm_merge_width`: a 32-bit constant rides a width-4 move so the backend re-signs
-    # it to its register convention (the riscv64 lp64 family holds an i32 sign-extended), while
-    # every other width keeps the full-register move.
-    #
-    # a value WIDER than the machine word (a scalar on a target whose word is narrower
-    # than the type - the 8-bit mos6502, word 1, copying an i16 / i32) needs the value's
-    # own width so the width legalizer splits the copy into byte lanes; a gpr-width copy
-    # would move only the low byte and drop the rest. every wide-native target has a
-    # word >= every scalar, so `max(gpr_width, wid)` is `gpr_width` there and this is
-    # byte-identical.
     var copy_w: u8 = ctx.tgt.model.gpr_width::u8;
     if (wid > copy_w) { copy_w = wid; }
     mi.width         = copy_w;
@@ -731,98 +447,44 @@ fun insert_mov_before_terminator(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mi
         mi.width     = 16;
         mi.src_width = 16;
     }
-    # this splice bypasses lctx.push_instr, so the metadata that chokepoint would stamp
-    # has to be settled here. `mir.instr` hands back every metadata field at its zero
-    # default, and for a phi-elimination move each of those defaults is already the
-    # value this site wants: asm_block stays nil (regalloc.flatten reads a non-nil
-    # asm_block as an inline-asm clobber barrier), the dbg-binding list stays empty, and
-    # vec_lane stays VEC_LANE_NONE because the move is a full-width register copy,
-    # lane-agnostic even for a vector phi. loc and inline_site are the two genuine
-    # overrides: the zero default is loc_nil ({FILE_NIL, 0}, and FILE_NIL is 0), which
-    # would mean "no row" rather than the move's real source line.
-    #
-    # `lower_phis` runs once, AFTER `lower_block` has already lowered every block in
-    # the function (see lower_function): by the time this splice runs, `ctx.cur_loc`
-    # is whatever the LAST statement of the LAST block left it at - the function's own
-    # final statement, for every predecessor block's edge, regardless of where in the
-    # function that predecessor actually is. Stamping from it duplicated the final
-    # `ret`'s line onto the entry block's phi-merge copies (mach#2779 Bug B): `total`'s
-    # and `i`'s zero-initializations, spliced at the end of the loop's own entry block,
-    # both read back as `ret total;`'s line instead of their own.
-    #
-    # `term` - already fetched above, and already carrying the CORRECT location from
-    # when its own block was lowered in the first pass - is the right source instead:
-    # a phi-merge copy conceptually belongs to the edge out of `pred_mb`, and `term`
-    # is that edge's own control-flow instruction (the `for`'s implicit fall-into-loop
-    # branch, a loop-back branch, etc.), stamped with ITS block's real statement while
-    # that block was still the one being lowered - never stale, because it was never
-    # the cursor.
     mi.loc               = term.loc;
     mi.inline_site       = term.inline_site;
-    mi.writes_secret     = false;   # a phi-elimination move never writes secret storage (#1646)
+    mi.writes_secret     = false;
 
-    # grow by one, shift the terminator right, and drop the move into its place.
-    val gr: R.Result[bool, str] = lctx.grow_instr(ctx, mb);
-    if (R.is_err[bool, str](gr)) {
+    val gr: R.Result[R.Void, str] = lctx.grow_instr(ctx, mb);
+    if (R.is_err[R.Void, str](gr)) {
         A.deallocate[mir.MirOperand](ctx.alloc, ops, 2::usize);
         ret gr;
     }
     mb.instrs[mb.instr_count] = mb.instrs[mb.instr_count - 1];
     mb.instrs[mb.instr_count - 1] = mi;
     mb.instr_count = mb.instr_count + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# true when a generic MIR opcode ends a block
-#
-# The phi predecessor splice point is just before this instruction.
-# ---
-# o:   the MIR opcode to test
-# ret: true for a branch / conditional branch / return / unreachable
 fun is_mir_terminator(o: mir.MirOpcode) bool {
-    if (o == mir.MIR_BR)          { ret true; }
-    if (o == mir.MIR_CBR)         { ret true; }
-    if (o == mir.MIR_RET)         { ret true; }
-    if (o == mir.MIR_UNREACHABLE) { ret true; }
-    ret false;
+    ret mir.is_terminator(o);
 }
 
-# true when a block's terminator is a conditional branch
-#
-# A CBR means the block has two successors, used to detect critical edges into
-# phi blocks.
-# ---
-# mb:  the block to test
-# ret: true when the block ends in a mir.MIR_CBR
+
 fun block_ends_in_cbr(mb: *mir.MirBlock) bool {
     if (mb.instr_count == 0) { ret false; }
     ret mb.instrs[mb.instr_count - 1].opcode == mir.MIR_CBR;
 }
 
-# ensure the function's block array has room for one more block, growing on demand
-#
-# `lower_function` allocates exactly `fn.block_count` blocks, so any critical-edge
-# split needs this to extend the array.
-# ---
-# ctx: the per-function lowering context
-# ret: true on success, or an allocation error
-fun grow_block(ctx: *lctx.LowerCtx) R.Result[bool, str] {
+fun grow_block(ctx: *lctx.LowerCtx) R.Result[R.Void, str] {
     val f: *mir.MirFunction = ctx.f;
     if (f.block_count >= f.block_cap) {
         var new_cap: u32 = f.block_cap * 2;
         if (new_cap < f.block_count + 1) { new_cap = f.block_count + 1; }
         val r: R.Result[*mir.MirBlock, str] = A.reallocate[mir.MirBlock](ctx.alloc, f.blocks, f.block_cap::usize, new_cap::usize);
-        if (R.is_err[*mir.MirBlock, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirBlock, str](r)); }
+        if (R.is_err[*mir.MirBlock, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirBlock, str](r)); }
         f.blocks    = R.unwrap_ok[*mir.MirBlock, str](r);
         f.block_cap = new_cap;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# a block id one past the current maximum, guaranteed not to collide with any existing id
-# ---
-# f:   the MIR function whose block ids are scanned
-# ret: an unused block id
 fun fresh_block_id(f: *mir.MirFunction) u32 {
     var max_id: u32 = 0;
     var bi: u32 = 0;
@@ -833,25 +495,12 @@ fun fresh_block_id(f: *mir.MirFunction) u32 {
     ret max_id + 1;
 }
 
-# break the critical edge `pred -> succ_id` by inserting a fresh branch block
-#
-# A fresh block `B` is inserted that unconditionally branches to `succ`. `pred`'s
-# CBR target matching `succ_id` is retargeted to `B`, `succ`'s predecessor entry
-# for `pred` is replaced by `B`, and `B`'s sole predecessor is `pred`. `B` is
-# returned so the caller emits this edge's phi merge copies into it - `B` ends in
-# an unconditional branch, so the splice is safe. Block pointers are re-fetched by
-# id after the (possibly reallocating) growth, since growth invalidates them.
-# ---
-# ctx:     the per-function lowering context
-# pred:    the predecessor block whose critical edge is split
-# succ_id: the successor (phi) block id the edge targets
-# ret:     the fresh splice block `B`, or an allocation error
 fun split_critical_edge(ctx: *lctx.LowerCtx, pred: *mir.MirBlock, succ_id: u32) R.Result[*mir.MirBlock, str] {
     val pred_id: u32 = pred.id;
     val new_id:  u32 = fresh_block_id(ctx.f);
 
-    val gr: R.Result[bool, str] = grow_block(ctx);
-    if (R.is_err[bool, str](gr)) { ret R.err[*mir.MirBlock, str](R.unwrap_err[bool, str](gr)); }
+    val gr: R.Result[R.Void, str] = grow_block(ctx);
+    if (R.is_err[R.Void, str](gr)) { ret R.err[*mir.MirBlock, str](R.unwrap_err[R.Void, str](gr)); }
 
     val f: *mir.MirFunction = ctx.f;
     val b: *mir.MirBlock = ?f.blocks[f.block_count];
@@ -863,17 +512,10 @@ fun split_critical_edge(ctx: *lctx.LowerCtx, pred: *mir.MirBlock, succ_id: u32) 
     b.pred_count  = 0;
     b.pred_cap    = 0;
 
-    # B's terminator: an unconditional branch to the merge block.
     val rb: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 1::usize);
     if (R.is_err[*mir.MirOperand, str](rb)) { ret R.err[*mir.MirBlock, str](R.unwrap_err[*mir.MirOperand, str](rb)); }
     val bops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](rb);
     bops[0] = mir.op_block(succ_id);
-    # this splice bypasses lctx.push_instr, so the constructor's cleared metadata IS
-    # the invariant: asm_block nil (regalloc.flatten reads a non-nil one as an
-    # inline-asm clobber barrier), loc nil for a synthesized branch with no source
-    # instruction (the line table attributes it to the surrounding code), inline_site
-    # 0 so it is attributed to the function body, no dbg bindings, and writes_secret
-    # false because a synthesized branch never writes storage (#1646).
     var br: mir.MirInstr = mir.instr(mir.MIR_BR, bops, 1,
                                      ctx.tgt.model.gpr_width::u8, ctx.tgt.model.gpr_width::u8);
 
@@ -884,7 +526,6 @@ fun split_critical_edge(ctx: *lctx.LowerCtx, pred: *mir.MirBlock, succ_id: u32) 
     b.instr_count = 1;
     b.instr_cap   = 1;
 
-    # B's predecessor is `pred`.
     val rp: R.Result[*u32, str] = A.allocate[u32](ctx.alloc, 1::usize);
     if (R.is_err[*u32, str](rp)) { ret R.err[*mir.MirBlock, str](R.unwrap_err[*u32, str](rp)); }
     b.preds      = R.unwrap_ok[*u32, str](rp);
@@ -894,22 +535,12 @@ fun split_critical_edge(ctx: *lctx.LowerCtx, pred: *mir.MirBlock, succ_id: u32) 
 
     f.block_count = f.block_count + 1;
 
-    # retarget pred's CBR edge to succ so it now jumps to B, and replace succ's
-    # predecessor entry for pred with B. both blocks are re-fetched by id since
-    # the growth above may have moved the array.
     retarget_cbr(mir_block_by_id(f, pred_id), succ_id, new_id);
     replace_pred(mir_block_by_id(f, succ_id), pred_id, new_id);
 
     ret R.ok[*mir.MirBlock, str](?f.blocks[f.block_count - 1]);
 }
 
-# rewrite every block-target operand of `mb`'s terminator from `from` to `to`
-#
-# Used to redirect a conditional branch's edge through a freshly split block.
-# ---
-# mb:   the block whose terminator is rewritten; nil and empty blocks are no-ops
-# from: the block id to replace
-# to:   the replacement block id
 fun retarget_cbr(mb: *mir.MirBlock, from: u32, to: u32) {
     if (mb == nil || mb.instr_count == 0) { ret; }
     val term: *mir.MirInstr = ?mb.instrs[mb.instr_count - 1];
@@ -922,13 +553,6 @@ fun retarget_cbr(mb: *mir.MirBlock, from: u32, to: u32) {
     }
 }
 
-# replace the first predecessor entry of `mb` equal to `from` with `to`
-#
-# A split block thereby takes over the original predecessor's edge.
-# ---
-# mb:   the block whose predecessor list is rewritten; nil is a no-op
-# from: the predecessor id to replace
-# to:   the replacement predecessor id
 fun replace_pred(mb: *mir.MirBlock, from: u32, to: u32) {
     if (mb == nil) { ret; }
     var i: u32 = 0;
@@ -938,106 +562,49 @@ fun replace_pred(mb: *mir.MirBlock, from: u32, to: u32) {
     }
 }
 
-# lower one IR instruction into one or more MIR instructions
-#
-# OP_CALL expands into argument / call / result pseudos; OP_PHI is skipped here
-# (phis are eliminated out of SSA by `lower_phis` into predecessor-end copies,
-# never as body instructions); the memory opcodes (alloca / load / store / gep)
-# have dedicated lowerings that form the stack slot and the `[base + disp]` memory
-# operands the slot model resolves; every other opcode maps 1:1 to its generic
-# MIR opcode.
-# ---
-# ctx: the per-function lowering context
-# fn:  the IR function owning the instruction
-# mb:  the destination MIR block
-# iid: the IR instruction id to lower
-# ret: true on success, or a lowering / allocation error
-fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: id.InstructionId) R.Result[bool, str] {
+fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: id.InstructionId) R.Result[R.Void, str] {
     val gi: O.Option[*instr.Instruction] = ir.instruction_get(fn, iid);
     if (!O.is_some[*instr.Instruction](gi)) {
-        ret R.err[bool, str]("mir.lower_ir: dangling instruction id");
+        ret R.err[R.Void, str]("mir.lower_ir: dangling instruction id");
     }
     val inst: *instr.Instruction = O.unwrap[*instr.Instruction](gi);
 
-    # stamp the current source location so every MirInstr this instruction lowers to
-    # (through `push_instr`) carries its origin for the debug line table.
     ctx.cur_loc = inst.loc;
-    # and its inline instance, so lowered instructions carry which inlined expansion
-    # they came from (0 for the function's own body).
     ctx.cur_inline_site = ir.instr_inline_site_of(fn, iid);
-    # and its 128-bit vector lane shape, so a backend selector reads the element kind
-    # + width off each lowered MirInstr. VEC_LANE_NONE for every non-vector op, so
-    # this is inert until a backend lifts its vector guard below.
     ctx.cur_vec_lane = lctx.compute_vec_lane(ctx, inst);
-    # forward the store-secret SEED: a store / memzero whose IR instruction was marked
-    # writing secret storage stamps every MirInstr it lowers to (read only on the store /
-    # memzero opcode by the #1648 re-derive) (#1646). false for every other instruction.
     ctx.cur_writes_secret = (inst.kind == instr.OP_STORE || inst.kind == instr.OP_MEMZERO) && inst.secret;
 
-    # GATE (#1646): reject a secret operand of a variable-latency op the backend would
-    # select on this target, driven by the SHARED ct table over every value-producing
-    # opcode (not a bespoke per-op special-case: a new var-latency op is one table row
-    # plus one opcode->CtOp arm - the generality [11] was missing). The target-dependent
-    # class (integer multiply unless ct_trust_mul, variable shift by a secret count
-    # unless ct_trust_var_shift) is PRIMARY here; the always-unsafe class (floating
-    # point) is a defense-in-depth backstop to the sema gate, so a secret fp op that ever
-    # reached MIR ungated is still caught. Integer div/mod stay sema-only. A float op on
-    # the shared integer opcodes reads as CT_OP_FLOAT via is_float_op (not CT_OP_INT_MUL).
-    # Scalarization carries the taint onto a scalarized vector op's lanes so it trips here.
     var cop: ct.CtOp = opcode_ct_op(inst.kind);
     if (is_float_op(ctx, inst)) { cop = ct.CT_OP_FLOAT; }
     val ccap: ct.CtCap = ct.ct_cap(cop);
     if (ccap != ct.CT_CAP_OK
         && !ct.target_provides(ctx.tgt.model.ct_trust_mul, ctx.tgt.model.ct_trust_var_shift, ccap)
         && instr_has_secret_ct_operand(inst, cop)) {
-        ret R.err[bool, str](secret_ct_op_unsupported(cop));
+        ret R.err[R.Void, str](secret_ct_op_unsupported(cop));
     }
 
-    # a 128-bit vector reaching MIR lowering needs backend selection (#1965): a
-    # target whose backend wires it (aarch64 NEON, x86_64 SSE2, rv64 scalarization)
-    # lets it through to real lowering; a target without selection yet gets a defined
-    # per-target compile error, never an ICE or the silent 8-byte GP clamp
-    # `op_width_of` would otherwise apply. phis are eliminated and dbg-values emit no
-    # code, so neither is the erroring site.
-    if (inst.kind != instr.OP_PHI && inst.kind != instr.OP_DBG_VALUE
+    val route: opdesc.LowerRoute = opdesc.lower_route(inst.kind);
+
+    if (route != opdesc.LOWER_PHI && route != opdesc.LOWER_DBG
         && instr_touches_vector(ctx, inst)) {
         if (!ctx.tgt.model.has_v128) {
-            ret R.err[bool, str](vector_unsupported(ctx));
+            ret R.err[R.Void, str](vector_unsupported(ctx));
         }
-        # a backend that selects packed compute from the generic MIR opcodes (x86-64
-        # SSE2, `vector_compute_generic`) takes a lane-wise compute op (arithmetic /
-        # bitwise / unary not / compare-to-mask) through `lower_generic` directly,
-        # carrying `vec_lane` and bypassing the scalar-specific float / divide / shift
-        # routing below (a vector float divide must not reach the integer `lower_div`);
-        # its isel / encoder select the packed form. load / store / move / call / ret /
-        # gep / alloca fall through to the shared handlers carrying the 16-byte width
-        # the vreg's `vector` flag set. a backend that selects vector ops from the
-        # scalar-shaped handlers in its own isel (aarch64 NEON) falls through here for
-        # every vector op.
         if (ctx.tgt.model.vector_compute_generic && is_vector_compute(inst.kind)) {
             ret lower_generic(ctx, mb, inst, iid);
         }
     }
 
-    if (inst.kind == instr.OP_CALL) {
+    if (route == opdesc.LOWER_CALL) {
         ret mabi.lower_call(ctx, mb, inst, iid);
     }
-    if (inst.kind == instr.OP_RET) {
+    if (route == opdesc.LOWER_RET) {
         ret mabi.lower_ret(ctx, mb, inst);
     }
-    # phis live in `blk.phis`, never the body list, and are eliminated by
-    # `lower_phis`; should one appear here, it is not a body instruction to emit.
-    if (inst.kind == instr.OP_PHI) {
-        ret R.ok[bool, str](true);
+    if (route == opdesc.LOWER_PHI) {
+        ret R.ok_void[str]();
     }
-    # OP_DBG_VALUE is pure debug metadata (present only under -g); it lowers to NO
-    # machine code and emits no instruction, so the MIR stream is identical with and
-    # without -g. Instead it records a pending (iid, vreg) binding that the next lowered
-    # instruction carries in its dbg-binding list (attached at push_instr); the encoder
-    # records a VarLoc at that instruction's PC, and the producer builds per-PC loclists
-    # from those records. Riding a real instruction (never a standalone marker) keeps it
-    # inert to regalloc / frame by construction.
-    if (inst.kind == instr.OP_DBG_VALUE) {
+    if (route == opdesc.LOWER_DBG) {
         var vreg: u32 = mir.MIR_VREG_NIL;
         if (inst.operand_count > 0) {
             val op: mir.MirOperand = lctx.lower_value(ctx, inst.operands[0]);
@@ -1045,109 +612,62 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
         }
         ret lctx.push_pending_dbg(ctx, iid::u32, vreg);
     }
-    if (inst.kind == instr.OP_ALLOCA) {
+    if (route == opdesc.LOWER_ALLOCA) {
         ret lower_alloca(ctx, mb, inst, iid);
     }
-    if (inst.kind == instr.OP_LOAD) {
+    if (route == opdesc.LOWER_LOAD) {
         ret lower_load(ctx, mb, inst, iid);
     }
-    if (inst.kind == instr.OP_STORE) {
+    if (route == opdesc.LOWER_STORE) {
         ret lower_store(ctx, mb, inst);
     }
-    if (inst.kind == instr.OP_MEMZERO) {
+    if (route == opdesc.LOWER_MEMZERO) {
         ret lower_memzero(ctx, mb, inst);
     }
-    if (inst.kind == instr.OP_GEP) {
+    if (route == opdesc.LOWER_GEP) {
         ret lower_gep(ctx, mb, inst, iid);
     }
-    # vector lane access (#2236). only reaches here on a target that selects it
-    # natively - `me.pass.scalarize.expand_lane_ops` has already rewritten these to
-    # the vector's memory image everywhere else - so the opcodes stay out of the
-    # unconditional selection alphabet.
-    if (inst.kind == instr.OP_VEC_EXTRACT) {
+    if (route == opdesc.LOWER_VEC_EXTRACT) {
         ret lower_vec_extract(ctx, mb, inst, iid);
     }
-    if (inst.kind == instr.OP_VEC_INSERT) {
+    if (route == opdesc.LOWER_VEC_INSERT) {
         ret lower_vec_insert(ctx, mb, inst, iid);
     }
-    if (inst.kind == instr.OP_VEC_BUILD) {
+    if (route == opdesc.LOWER_VEC_BUILD) {
         ret lower_vec_build(ctx, mb, inst, iid);
     }
-    # a `:^` declassify (#1646) is an identity at runtime (secrecy has no machine shape):
-    # a register copy of the operand into the result vreg, at the value's width so the
-    # encoder selects the GP or SSE move by operand class. it lowers to the DISTINGUISHABLE
-    # MIR_DECLASSIFY barrier - NOT a plain MIR_MOV - so the #1648 re-derive over the lowered
-    # MIR stops secrecy propagation here (the public result vreg is separate from its secret
-    # source). isel retags it to the concrete move, so it emits identical bytes at runtime.
-    if (inst.kind == instr.OP_DECLASSIFY) {
+    if (route == opdesc.LOWER_DECLASSIFY) {
         val ddst: u32 = lctx.instr_vreg(ctx, iid);
         ret lctx.emit_declassify(ctx, mb, mir.op_vreg(ddst), lctx.lower_value(ctx, inst.operands[0]), lctx.op_width_of(ctx, inst.ty));
     }
-    # scalar floating-point arithmetic / comparison shares the IR integer opcodes
-    # (the front end emits OP_ADD / OP_SUB / OP_MUL / OP_DIV_* / OP_CMP_* for both
-    # int and float operands). a float instruction is dispatched to the dedicated
-    # SSE lowering before the integer division / shift / generic paths, which would
-    # emit the integer ALU / IDIV byte forms and silently miscompile an XMM-classed
-    # value.
     if (is_float_op(ctx, inst)) {
         ret lower_float_op(ctx, mb, inst, iid);
     }
-    # a scalar float negate shares the IR integer OP_NEG opcode; routing it to the
-    # integer path would emit a GP mir.MIR_NEG (two's-complement of the float bit
-    # pattern) instead of flipping the IEEE-754 sign bit. dispatch a float-typed
-    # negate to its dedicated SSE lowering before the generic path.
-    if (inst.kind == instr.OP_NEG && lctx.value_is_float(ctx, inst.ty)) {
+    if (route == opdesc.LOWER_NEG && lctx.value_is_float(ctx, inst.ty)) {
         ret lower_float_neg(ctx, mb, inst, iid);
     }
-    # a bit reinterpret across the register banks at a width this machine has no
-    # register-to-register form for goes through the frame instead (#2904).
-    if (inst.kind == instr.OP_BITCAST && bitcast_needs_frame(ctx, inst)) {
+    if (route == opdesc.LOWER_BITCAST && bitcast_needs_frame(ctx, inst)) {
         ret lower_bitcast_via_frame(ctx, mb, inst, iid);
     }
-    # integer division / remainder needs the dividend / remainder register wiring
-    # the active ISA's division form mandates (x86-64 IDIV/DIV reads the dividend
-    # in RAX and yields the quotient in RAX / remainder in RDX). the accumulator
-    # and high-half registers come from `tgt.model.div_reg` / `div_hi_reg`; an ISA
-    # whose division wires no fixed register reports -1 and `lower_div` errors
-    # loudly rather than emitting an un-pre-colored divide.
-    if (inst.kind == instr.OP_DIV_S || inst.kind == instr.OP_DIV_U ||
-        inst.kind == instr.OP_REM_S || inst.kind == instr.OP_REM_U) {
+    if (route == opdesc.LOWER_DIV) {
         ret lower_div(ctx, mb, inst, iid);
     }
 
-    # a shift (SHL / SHR_S / SHR_U): an ISA whose variable-shift form hard-wires the
-    # count register (x86-64 CL) pre-colors a runtime count into `tgt.model.shift_count_reg`;
-    # an ISA wiring no fixed shift-count register (-1, e.g. AArch64 LSLV/LSRV/ASRV)
-    # passes the count straight through to the three-address register-shift form.
-    if (inst.kind == instr.OP_SHL || inst.kind == instr.OP_SHR_S ||
-        inst.kind == instr.OP_SHR_U) {
+    if (route == opdesc.LOWER_SHIFT) {
         ret lower_shift(ctx, mb, inst, iid);
     }
 
-    # an inline-asm block carries its body + `{name}` bindings in `fn.asm_blocks`
-    # keyed by this instruction id; build the mir.MIR_ASM payload (resolving each
-    # `{name}`'s alloca to its slot vreg) rather than dropping it through the
-    # generic path, which keeps no asm field.
-    if (inst.kind == instr.OP_ASM) {
+    if (route == opdesc.LOWER_ASM) {
         ret lower_asm_instr(ctx, mb, iid);
     }
 
-    # a conditional branch whose condition lowers to a constant immediate (a
-    # comptime-known / folded boolean) cannot drive the encoder's `TEST cond, cond`,
-    # which requires a register. mirror cmach (`emit_cmp_branch` -> `load_operand`):
-    # materialize the immediate into a register first, then branch on it.
-    if (inst.kind == instr.OP_CBR) {
+    if (route == opdesc.LOWER_CBR) {
         ret lower_cbr(ctx, mb, inst, iid);
     }
 
     ret lower_generic(ctx, mb, inst, iid);
 }
 
-# whether an instruction's result or any operand is a 128-bit vector (#1965)
-# ---
-# ctx:  the lowering context
-# inst: the instruction to inspect
-# ret:  true when a vector-typed value flows through the instruction
 fun instr_touches_vector(ctx: *lctx.LowerCtx, inst: *instr.Instruction) bool {
     if (lctx.value_is_vector(ctx, inst.ty)) { ret true; }
     var i: u32 = 0;
@@ -1158,17 +678,6 @@ fun instr_touches_vector(ctx: *lctx.LowerCtx, inst: *instr.Instruction) bool {
     ret false;
 }
 
-# intern an owned scratch string, freeing it, and return the canonical interned copy
-#
-# Takes ownership of `buf` (an exact `str_len + 1` allocation from `ctx.alloc`, as a
-# `str_join` result is): interns a deduped copy, frees `buf`, and returns the interned
-# string so it outlives the scratch. Degrades to `fallback` on any intern / lookup
-# failure.
-# ---
-# ctx:      the lowering context (supplies the allocator and interner)
-# buf:      the owned null-terminated scratch string to intern and free
-# fallback: returned on any intern / lookup failure
-# ret:      the interned copy of `buf`, or `fallback`
 fun intern_owned(ctx: *lctx.LowerCtx, buf: str, fallback: str) str {
     val ir: R.Result[intern.StrId, str] = intern.intern(ctx.interner, buf);
     A.deallocate[u8](ctx.alloc, buf::*u8, str_len(buf) + 1);
@@ -1178,53 +687,20 @@ fun intern_owned(ctx: *lctx.LowerCtx, buf: str, fallback: str) str {
     ret fallback;
 }
 
-# the defined per-target "vectors not yet supported" error, naming the arch
-#
-# Interns the assembled message so it outlives the scratch buffer; degrades to a
-# static target-neutral message on an allocation failure.
-# ---
-# ctx: the lowering context (supplies the target arch name and interner)
-# ret: the owned error message
-# map an IR opcode to its constant-time op class for the shared ct table, by opcode
-# alone (#1646)
-#
-# The floating-point CONVERSION opcodes are their own float-specific opcodes, so they
-# classify as CT_OP_FLOAT here; the shared int opcodes (OP_MUL etc.) that ALSO run on
-# floats are re-classified to CT_OP_FLOAT by the gate via `is_float_op` (fp shares
-# integer opcodes, so a float multiply must not read as CT_OP_INT_MUL). Integer div/mod
-# stay CT_OP_NONE here: they are always-unsafe but enforced at sema (target-independent),
-# so re-gating them at MIR would be redundant. A newly-recognized variable-latency opcode
-# is one arm here plus its ct-table row.
-# ---
-# kind: the IR opcode
-# ret:  the CtOp class, or CT_OP_NONE for a constant-time / sema-gated opcode
 fun opcode_ct_op(kind: instr.InstrKind) ct.CtOp {
-    if (is_fp_convert(kind))  { ret ct.CT_OP_FLOAT; }
-    if (kind == instr.OP_MUL) { ret ct.CT_OP_INT_MUL; }
-    if (kind == instr.OP_SHL || kind == instr.OP_SHR_S || kind == instr.OP_SHR_U) { ret ct.CT_OP_VAR_SHIFT; }
+    val c: opdesc.CtClass = opdesc.ct_class(kind);
+    if (c == opdesc.CTC_INT_MUL)   { ret ct.CT_OP_INT_MUL; }
+    if (c == opdesc.CTC_VAR_SHIFT) { ret ct.CT_OP_VAR_SHIFT; }
+    if (c == opdesc.CTC_FLOAT)     { ret ct.CT_OP_FLOAT; }
     ret ct.CT_OP_NONE;
 }
 
-# whether `kind` is a floating-point conversion opcode (fp<->int, fp widen / narrow)
-# ---
-# kind: the IR opcode
-# ret:  true for the OP_FP_* conversion opcodes
+
 fun is_fp_convert(kind: instr.InstrKind) bool {
-    ret kind == instr.OP_FP_TRUNC || kind == instr.OP_FP_EXT
-     || kind == instr.OP_FP_TO_SI || kind == instr.OP_FP_TO_UI
-     || kind == instr.OP_SI_TO_FP || kind == instr.OP_UI_TO_FP;
+    ret opdesc.has(kind, opdesc.EFF_FP_CONVERT);
 }
 
-# whether the operand the leakage model observes for `cop` is secret (#1646)
-#
-# A shift leaks through its variable COUNT alone - a secret value shifted by a public
-# count is constant-time - so a CT_OP_VAR_SHIFT gate reads operand[1] (the count) only;
-# every other class reads all operands. Block-target operands ride in constant slots and
-# are never secret, so a plain scan is exact.
-# ---
-# inst: the IR instruction to inspect
-# cop:  the operation's CtOp class
-# ret:  true when the leakage-observed operand is secret
+
 fun instr_has_secret_ct_operand(inst: *instr.Instruction, cop: ct.CtOp) bool {
     if (ct.ct_op_gates_count_only(cop)) {
         ret inst.operand_count >= 2 && inst.operands[1].secret;
@@ -1237,92 +713,61 @@ fun instr_has_secret_ct_operand(inst: *instr.Instruction, cop: ct.CtOp) bool {
     ret false;
 }
 
-# the teaching diagnostic for a secret operand of a target-dependent variable-latency
-# op the target cannot perform in constant time (#1646)
-# ---
-# cop: the operation's CtOp class
-# ret: the diagnostic string
 fun secret_ct_op_unsupported(cop: ct.CtOp) str {
     if (cop == ct.CT_OP_VAR_SHIFT) {
         ret "codegen: secret value used as a variable shift count on a target without a barrel shifter; the shift's cycle count leaks the secret amount. shift by a public count, or run on a target whose variable shift is constant-time";
     }
     if (cop == ct.CT_OP_FLOAT) {
-        ret "codegen: secret value used as an operand of a variable-latency floating-point operation; the FP unit's timing can depend on the secret operand. compute on public data, or `:^` to a public value when disclosure is intended";
+        ret "codegen: secret value used as an operand of a variable-latency floating-point operation; the FP unit's timing can depend on the secret operand. compute on public data, or `:>T` to a public value when disclosure is intended";
     }
     ret "codegen: secret value used as an operand of a variable-latency integer multiply; this target documents no data-independent multiply timing, so the product's latency can leak the secret operand. compute the operation branch-free over public data, or run on a target whose DIT/DOITM mode is trusted";
 }
 
-# the target-dependent constant-time gate mechanism (#1646): every value-producing
-# opcode classifies through the shared ct table (generality [11]), and the shift gate
-# observes ONLY the count operand while the multiply gate observes any operand. The
-# shift REJECTION on a no-barrel-shifter target is driven end to end by the driver's
-# `secret_shift_codegen_rejected_mos6502` (#2149); this pins the classification and the
-# count-only observation the gate is built from.
 test "mach.lang.be.codegen.mir.lower.ct_gate:mechanism" {
-    # opcode -> CtOp classification (one table, no bespoke per-op code).
     if (opcode_ct_op(instr.OP_MUL)   != ct.CT_OP_INT_MUL)   { ret 1; }
     if (opcode_ct_op(instr.OP_SHL)   != ct.CT_OP_VAR_SHIFT) { ret 1; }
     if (opcode_ct_op(instr.OP_SHR_S) != ct.CT_OP_VAR_SHIFT) { ret 1; }
     if (opcode_ct_op(instr.OP_SHR_U) != ct.CT_OP_VAR_SHIFT) { ret 1; }
     if (opcode_ct_op(instr.OP_ADD)   != ct.CT_OP_NONE)      { ret 1; }
-    # the fp-convert opcodes classify as CT_OP_FLOAT (always-unsafe, defense-in-depth);
-    # integer div/mod stay CT_OP_NONE at MIR (gated at sema, target-independent).
     if (opcode_ct_op(instr.OP_FP_TO_SI) != ct.CT_OP_FLOAT)  { ret 1; }
     if (opcode_ct_op(instr.OP_FP_EXT)   != ct.CT_OP_FLOAT)  { ret 1; }
     if (opcode_ct_op(instr.OP_SI_TO_FP) != ct.CT_OP_FLOAT)  { ret 1; }
     if (opcode_ct_op(instr.OP_DIV_S)    != ct.CT_OP_NONE)   { ret 1; }
     if (opcode_ct_op(instr.OP_REM_U)    != ct.CT_OP_NONE)   { ret 1; }
 
-    # a shift with a secret COUNT (operand[1]) and a public value (operand[0]).
     var ops: [2]value.Value;
-    ops[0].kind = value.VAL_CONST_INT; ops[0].secret = false;  # the value being shifted
-    ops[1].kind = value.VAL_CONST_INT; ops[1].secret = true;   # the secret count
+    ops[0].kind = value.VAL_CONST_INT; ops[0].secret = false;
+    ops[1].kind = value.VAL_CONST_INT; ops[1].secret = true;
     var shl: instr.Instruction;
     shl.kind          = instr.OP_SHL;
     shl.operands      = ?ops[0];
     shl.operand_count = 2;
 
-    # the count-only gate: a secret shift count IS observed.
     if (!instr_has_secret_ct_operand(?shl, ct.CT_OP_VAR_SHIFT)) { ret 1; }
 
-    # a secret VALUE shifted by a PUBLIC count is constant-time (a fixed shift), so it
-    # is NOT observed - the precision the leakage model requires.
     ops[0].secret = true;
     ops[1].secret = false;
     if (instr_has_secret_ct_operand(?shl, ct.CT_OP_VAR_SHIFT)) { ret 1; }
 
-    # a multiply observes ANY operand (operand[0] is secret now).
     if (!instr_has_secret_ct_operand(?shl, ct.CT_OP_INT_MUL)) { ret 1; }
 
-    # the gate decision: a no-barrel-shifter target does NOT provide the capability, so a
-    # secret shift count gates; a barrel-shifter target provides it, so it does not.
     if (!ct.cap_at_mir(ct.ct_cap(ct.CT_OP_VAR_SHIFT)))                          { ret 1; }
     if (ct.target_provides(false, false, ct.ct_cap(ct.CT_OP_VAR_SHIFT)))        { ret 1; }
     if (!ct.target_provides(false, true, ct.ct_cap(ct.CT_OP_VAR_SHIFT)))        { ret 1; }
     ret 0;
 }
 
-# a sub-word integer constant reaches the backend as its width-masked bits, so a
-# consumer computing above that width re-derives the value they denote: signed
-# re-signs the top bit of the low `width` bytes, unsigned masks to them. widths at
-# or above the machine word - and the width-0 sentinel - denote their raw value
 test "mach.lang.be.codegen.mir.lower.narrow_imm_value" {
-    # i8: 200 denotes -56; 127 and 0 are unchanged; 128 is the sign boundary.
     if (narrow_imm_value(200, 1, true)  != -56)  { ret 1; }
     if (narrow_imm_value(127, 1, true)  != 127)  { ret 1; }
     if (narrow_imm_value(128, 1, true)  != -128) { ret 1; }
     if (narrow_imm_value(0, 1, true)    != 0)    { ret 1; }
-    # u8: the same bits denote themselves.
     if (narrow_imm_value(200, 1, false) != 200)  { ret 1; }
     if (narrow_imm_value(255, 1, false) != 255)  { ret 1; }
-    # i16 / u16 at the same boundaries.
     if (narrow_imm_value(65535, 2, true)  != -1)     { ret 1; }
     if (narrow_imm_value(32768, 2, true)  != -32768) { ret 1; }
     if (narrow_imm_value(65535, 2, false) != 65535)  { ret 1; }
-    # a value already carrying its sign re-derives to itself, so the widening is
-    # idempotent however many times a lowering path applies it.
     if (narrow_imm_value(-56, 1, true)  != -56)  { ret 1; }
-    # 4 and 8 byte widths, and the width-0 machine-word sentinel, pass through.
     if (narrow_imm_value(-56, 4, true)  != -56)  { ret 1; }
     if (narrow_imm_value(-56, 8, true)  != -56)  { ret 1; }
     if (narrow_imm_value(-56, 0, true)  != -56)  { ret 1; }
@@ -1340,41 +785,23 @@ fun vector_unsupported(ctx: *lctx.LowerCtx) str {
     ret intern_owned(ctx, R.unwrap_ok[str, str](jr), fallback);
 }
 
-# lower an IR OP_CBR into a `mir.MIR_CBR [cond, then, else]`
-#
-# The IR operands are `[cond, then_block, else_block]`; the then/else targets ride
-# as mir.MIR_OP_BLOCK operands (per `lctx.lower_operand`). The condition is
-# normally a register-resident boolean and lowers to a vreg operand, used
-# unchanged. When the condition is a constant - a comptime-known / folded boolean
-# reaching the back end as a VAL_CONST_INT - it lowers to a mir.MIR_OP_IMM, which
-# the encoder's `TEST cond, cond` cannot read. Mirror cmach's `emit_cmp_branch`,
-# which routes the condition through `load_operand` (emitting `MOV reg, imm` for an
-# immediate): materialize the immediate into a fresh GP vreg via
-# `mir.MIR_MOV reg <- imm`, then branch on the register so the encoder always sees
-# a register condition.
-# ---
-# ctx:  the per-function lowering context
-# mb:   the destination MIR block
-# inst: the IR OP_CBR instruction
-# iid:  the IR instruction id
-# ret:  true on success, or a lowering / allocation error
-fun lower_cbr(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[bool, str] {
+fun lower_cbr(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[R.Void, str] {
     if (inst.operand_count < 3) {
-        ret R.err[bool, str]("mir.lower_ir: conditional branch missing operands");
+        ret R.err[R.Void, str]("mir.lower_ir: conditional branch missing operands");
     }
 
     var cond: mir.MirOperand = lctx.lower_operand(ctx, inst, 0);
     if (cond.kind == mir.MIR_OP_IMM) {
         val rv: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
-        if (R.is_err[u32, str](rv)) { ret R.err[bool, str](R.unwrap_err[u32, str](rv)); }
+        if (R.is_err[u32, str](rv)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](rv)); }
         val creg: u32 = R.unwrap_ok[u32, str](rv);
-        val mv: R.Result[bool, str] = lctx.emit_mov(ctx, mb, mir.op_vreg(creg), cond);
-        if (R.is_err[bool, str](mv)) { ret mv; }
+        val mv: R.Result[R.Void, str] = lctx.emit_mov(ctx, mb, mir.op_vreg(creg), cond);
+        if (R.is_err[R.Void, str](mv)) { ret mv; }
         cond = mir.op_vreg(creg);
     }
 
     val rop: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 3::usize);
-    if (R.is_err[*mir.MirOperand, str](rop)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](rop)); }
+    if (R.is_err[*mir.MirOperand, str](rop)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](rop)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](rop);
     ops[0] = cond;
     ops[1] = lctx.lower_operand(ctx, inst, 1);
@@ -1382,27 +809,10 @@ fun lower_cbr(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, 
 
     var mi: mir.MirInstr = mir.instr(inst.kind::u32, ops, 3, 0, 0);
     set_generic_widths(ctx, inst, ?mi);
-    # a conditional branch tests its boolean condition, but a bare bool value (e.g.
-    # a struct's `tag` field) reaches the encoder in a register's low byte WITHOUT
-    # being zero-extended - only a comparison result is widened by its MOVZX. test
-    # the condition at its own width (1 byte for a bool, set_generic_widths leaves a
-    # terminator at the machine word), so `TEST` reads only the meaningful low byte
-    # instead of stale upper bits a full-width test would misread as a set condition.
     mi.width = lctx.op_width_of(ctx, inst.operands[0].ty);
     ret lctx.push_instr(ctx, mb, mi);
 }
 
-# build "<prefix><name><suffix>" naming an inline-asm bind, interned to outlive the call
-#
-# Resolves the bind's interned name through the context interner. Degrades to
-# `fallback` on any failure.
-# ---
-# ctx:      the per-function lowering context
-# prefix:   text placed before the resolved name
-# name_id:  interned id of the bind name
-# suffix:   text placed after the resolved name
-# fallback: returned verbatim on any lookup / allocation / intern failure
-# ret:      the interned composed message, or `fallback`
 fun asm_bind_message(ctx: *lctx.LowerCtx, prefix: str, name_id: intern.StrId, suffix: str, fallback: str) str {
     val no: O.Option[str] = intern.lookup(ctx.interner, name_id);
     if (O.is_none[str](no)) { ret fallback; }
@@ -1413,31 +823,21 @@ fun asm_bind_message(ctx: *lctx.LowerCtx, prefix: str, name_id: intern.StrId, su
     ret intern_owned(ctx, R.unwrap_ok[str, str](jr), fallback);
 }
 
-# build a mir.MIR_ASM instruction from the IR `IrAsm` payload bound to this OP_ASM id
-#
-# Resolves the interned ISA / body strings to text and maps each `{name}`
-# binding's alloca instruction id to the slot-owning vreg the encoder later turns
-# into `[rbp + off]`. The payload is heap-owned and freed by `dnit_instr`.
-# ---
-# ctx: the per-function lowering context
-# mb:  the destination MIR block
-# iid: the IR OP_ASM instruction id, keying `fn.asm_blocks`
-# ret: true on success, or a lowering / allocation error
-fun lower_asm_instr(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, iid: id.InstructionId) R.Result[bool, str] {
+fun lower_asm_instr(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, iid: id.InstructionId) R.Result[R.Void, str] {
     var key: id.InstructionId = iid;
     val pr: R.Result[*ir.IrAsm, str] = map.get[id.InstructionId, ir.IrAsm](?ctx.fn.asm_blocks, ?key);
     if (R.is_err[*ir.IrAsm, str](pr)) {
-        ret R.err[bool, str]("mir.lower_ir: OP_ASM instruction has no asm payload");
+        ret R.err[R.Void, str]("mir.lower_ir: OP_ASM instruction has no asm payload");
     }
     val src: *ir.IrAsm = R.unwrap_ok[*ir.IrAsm, str](pr);
 
     val isa_opt: O.Option[str] = intern.lookup(ctx.interner, src.isa);
-    if (!O.is_some[str](isa_opt)) { ret R.err[bool, str]("mir.lower_ir: inline-asm ISA tag not interned"); }
+    if (!O.is_some[str](isa_opt)) { ret R.err[R.Void, str]("mir.lower_ir: inline-asm ISA tag not interned"); }
     val body_opt: O.Option[str] = intern.lookup(ctx.interner, src.body);
-    if (!O.is_some[str](body_opt)) { ret R.err[bool, str]("mir.lower_ir: inline-asm body not interned"); }
+    if (!O.is_some[str](body_opt)) { ret R.err[R.Void, str]("mir.lower_ir: inline-asm body not interned"); }
 
     val rp: R.Result[*mir.MirAsm, str] = A.allocate[mir.MirAsm](ctx.alloc, 1::usize);
-    if (R.is_err[*mir.MirAsm, str](rp)) { ret R.err[bool, str](R.unwrap_err[*mir.MirAsm, str](rp)); }
+    if (R.is_err[*mir.MirAsm, str](rp)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirAsm, str](rp)); }
     val payload: *mir.MirAsm = R.unwrap_ok[*mir.MirAsm, str](rp);
     payload.isa        = O.unwrap[str](isa_opt);
     payload.body       = O.unwrap[str](body_opt);
@@ -1448,21 +848,18 @@ fun lower_asm_instr(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, iid: id.InstructionI
         val rb: R.Result[*mir.MirAsmBind, str] = A.allocate[mir.MirAsmBind](ctx.alloc, src.bind_count::usize);
         if (R.is_err[*mir.MirAsmBind, str](rb)) {
             A.deallocate[mir.MirAsm](ctx.alloc, payload, 1::usize);
-            ret R.err[bool, str](R.unwrap_err[*mir.MirAsmBind, str](rb));
+            ret R.err[R.Void, str](R.unwrap_err[*mir.MirAsmBind, str](rb));
         }
         payload.binds = R.unwrap_ok[*mir.MirAsmBind, str](rb);
         var k: u32 = 0;
         for (k < src.bind_count) {
-            # a `{name}` local is the addressable storage behind an alloca; bind
-            # to its slot-key vreg (which owns the frame slot) when the referenced
-            # instruction is an alloca, else to the value's own vreg.
             var vreg: u32 = lctx.slot_key_vreg(ctx, src.binds[k].instr);
             if (vreg == mir.MIR_VREG_NIL) { vreg = lctx.instr_vreg(ctx, src.binds[k].instr); }
             if (vreg == mir.MIR_VREG_NIL) {
                 val msg: str = asm_bind_message(ctx, "inline-asm local '", src.binds[k].name, "' has no addressable storage slot", "inline-asm local has no addressable storage slot");
                 A.deallocate[mir.MirAsmBind](ctx.alloc, payload.binds, src.bind_count::usize);
                 A.deallocate[mir.MirAsm](ctx.alloc, payload, 1::usize);
-                ret R.err[bool, str](msg);
+                ret R.err[R.Void, str](msg);
             }
             payload.binds[k] = mir.asm_bind(src.binds[k].name, vreg, src.binds[k].secret);
             k = k + 1;
@@ -1473,48 +870,15 @@ fun lower_asm_instr(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, iid: id.InstructionI
     var mi: mir.MirInstr = mir.instr(mir.MIR_ASM, nil, 0, 0, 0);
     mi.asm_block     = payload;
 
-    val push: R.Result[bool, str] = lctx.push_instr(ctx, mb, mi);
-    if (R.is_err[bool, str](push)) {
+    val push: R.Result[R.Void, str] = lctx.push_instr(ctx, mb, mi);
+    if (R.is_err[R.Void, str](push)) {
         if (payload.binds != nil) { A.deallocate[mir.MirAsmBind](ctx.alloc, payload.binds, payload.bind_count::usize); }
         A.deallocate[mir.MirAsm](ctx.alloc, payload, 1::usize);
         ret push;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# canonicalize a sub-word right shift's value operand to its declared width
-#
-# The `mir.ALU_MIN_WIDTH` contract computes a sub-word ALU op at the ALU floor and
-# leaves the register bits ABOVE the declared width undefined, requiring every
-# consumer that needs the narrow value to re-narrow it. A right shift is such a
-# consumer, and the only ALU one that was never enrolled (#2357): it moves high bits
-# DOWN into the result, so residue above the declared width lands inside the value -
-# `(0 - a) >> 7` at u8 shifted a full 0xFFFFFFFF and read 255 where the u8 answer is
-# 1. Extending the value into a fresh vreg first makes the floor-width shift exact at
-# the declared width, and leaves the result defined across the whole floor, so the
-# producer half of the contract still holds.
-#
-# ONLY THE RIGHT SHIFTS NEED THIS. An operation is input-sensitive exactly when its
-# low N result bits depend on operand bits above N. For OP_SHL, and for ADD / SUB /
-# MUL / AND / OR / XOR / NOT / NEG, they do not - carries and borrows propagate only
-# upward and the bitwise ops are bit-independent - so those stay exact on a dirty
-# operand and are left alone. The other two input-sensitive classes were already
-# enrolled: the divides promote both operands in `lower_div`, and a comparison keeps
-# its true operand width in `set_generic_widths` for the per-ISA `narrow_cmp_source`.
-# The shift COUNT needs no canonicalization either: every ISA masks it to the low
-# log2(register-width) bits, which a narrow count already holds exactly.
-#
-# The extension is chosen by the OPCODE, which is where the IR carries signedness -
-# OP_SHR_U zero-extends and OP_SHR_S sign-extends, each matching the fill its own
-# shift performs - so no signedness needs to enter the IR type.
-# ---
-# ctx:       the per-function lowering context
-# mb:        the destination MIR block
-# inst:      the IR shift instruction
-# value:     the lowered value operand (IR operand 0)
-# natural_w: the shift's declared type width in bytes
-# w:         the clamped operation width the shift executes at
-# ret:       the operand the shift should read, or a lowering / allocation error
 fun narrow_shift_value(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction,
                        value: mir.MirOperand, natural_w: u8, w: u8) R.Result[mir.MirOperand, str] {
     if (inst.kind == instr.OP_SHL) { ret R.ok[mir.MirOperand, str](value); }
@@ -1524,40 +888,20 @@ fun narrow_shift_value(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Inst
     if (R.is_err[u32, str](vr)) { ret R.err[mir.MirOperand, str](R.unwrap_err[u32, str](vr)); }
     val v: u32 = R.unwrap_ok[u32, str](vr);
 
-    val pr: R.Result[bool, str] = emit_promote(ctx, mb, mir.op_vreg(v), value, w, natural_w,
+    val pr: R.Result[R.Void, str] = emit_promote(ctx, mb, mir.op_vreg(v), value, w, natural_w,
                                                inst.kind == instr.OP_SHR_S);
-    if (R.is_err[bool, str](pr)) { ret R.err[mir.MirOperand, str](R.unwrap_err[bool, str](pr)); }
+    if (R.is_err[R.Void, str](pr)) { ret R.err[mir.MirOperand, str](R.unwrap_err[R.Void, str](pr)); }
     ret R.ok[mir.MirOperand, str](mir.op_vreg(v));
 }
 
-# lower an integer OP_SHL / OP_SHR_S / OP_SHR_U into a three-address generic shift
-#
-# Emits `mir.MIR_SHL/SHR_S/SHR_U [dst, value, count]`. The IR operands are
-# `[value, count]`. Operand 0 (`dst`) is a pure def, so the register allocator
-# treats it cleanly (the encoder materializes the two-address
-# `MOV dst, value ; shift dst, count` byte form). A constant count rides as an
-# immediate; a runtime count is pre-colored into RCX (the only register the x86-64
-# variable-shift form reads, as CL) by a preceding `mir.MIR_MOV RCX <- count`,
-# mirroring the division's RAX:RDX pre-coloring. A function with a register-count
-# shift reserves RCX from allocation (see `regalloc.function_has_reg_shift`) so no
-# live value collides with the count.
-# ---
-# ctx:  the per-function lowering context
-# mb:   the destination MIR block
-# inst: the IR shift instruction
-# iid:  the IR instruction id
-# ret:  true on success, or a lowering / allocation error
-fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[bool, str] {
+fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[R.Void, str] {
     if (inst.operand_count < 2) {
-        ret R.err[bool, str]("mir.lower_ir: shift missing value or count operand");
+        ret R.err[R.Void, str]("mir.lower_ir: shift missing value or count operand");
     }
     val dst: u32 = lctx.instr_vreg(ctx, iid);
     if (dst == mir.MIR_VREG_NIL) {
-        ret R.err[bool, str]("mir.lower_ir: shift defines no result vreg");
+        ret R.err[R.Void, str]("mir.lower_ir: shift defines no result vreg");
     }
-    # a sub-word shift result, like any narrow GP ALU write, leaves the upper
-    # register bits undefined; clamp the operation width so the spilled word stays
-    # clean (mirrors `set_generic_widths` and the byte-divide promotion).
     val natural_w: u8 = lctx.op_width_of(ctx, inst.ty);
     val w: u8 = lctx.clamp_alu_width(ctx.tgt.model.alu_min_width, natural_w);
 
@@ -1568,35 +912,22 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
     val raw: mir.MirOperand = lctx.lower_value(ctx, inst.operands[0]);
     val count: mir.MirOperand = lctx.lower_value(ctx, inst.operands[1]);
 
-    # a RIGHT shift reads bits above the declared width, so its value operand is
-    # canonicalized to that width first; a left shift and a full-width shift pass
-    # through untouched.
     val rv: R.Result[mir.MirOperand, str] = narrow_shift_value(ctx, mb, inst, raw, natural_w, w);
-    if (R.is_err[mir.MirOperand, str](rv)) { ret R.err[bool, str](R.unwrap_err[mir.MirOperand, str](rv)); }
+    if (R.is_err[mir.MirOperand, str](rv)) { ret R.err[R.Void, str](R.unwrap_err[mir.MirOperand, str](rv)); }
     val value: mir.MirOperand = R.unwrap_ok[mir.MirOperand, str](rv);
 
     var count_op: mir.MirOperand = count;
     if (count.kind != mir.MIR_OP_IMM) {
-        # an ISA whose variable-shift form hard-wires the count register (x86-64 CL,
-        # `shift_count_reg >= 0`) pre-colors the runtime count into it and references it
-        # so the encoder selects the `shift r/m, CL` form; the register is reserved from
-        # allocation for the whole function, so the move cannot clobber a live value. an
-        # ISA wiring no fixed shift-count register (`shift_count_reg < 0`, e.g. AArch64
-        # LSLV/LSRV/ASRV, which read the count from any GP register) passes the count
-        # straight through to the three-address register-shift form - mirroring the
-        # division's `div_reg < 0` three-address path.
         val cnt_reg: i32 = ctx.tgt.model.shift_count_reg;
         if (cnt_reg >= 0) {
-            val mc: R.Result[bool, str] = lctx.emit_mov_w(ctx, mb, mir.op_preg(cnt_reg::u32), count, w);
-            if (R.is_err[bool, str](mc)) { ret mc; }
+            val mc: R.Result[R.Void, str] = lctx.emit_mov_w(ctx, mb, mir.op_preg(cnt_reg::u32), count, w);
+            if (R.is_err[R.Void, str](mc)) { ret mc; }
             count_op = mir.op_preg(cnt_reg::u32);
         }
     }
 
-    # the three-address shift: operand 0 is the pure-def destination, operand 1 the
-    # value shifted, operand 2 the count (immediate or CL). the opcode survives isel.
     val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 3::usize);
-    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](r)); }
+    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](r)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
     ops[0] = mir.op_vreg(dst);
     ops[1] = value;
@@ -1605,57 +936,14 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
     ret lctx.push_instr(ctx, mb, mi);
 }
 
-# lower an integer OP_DIV_* / OP_REM_*
-#
-# An ISA whose division form
-# hard-wires the dividend / quotient accumulator and the high-half / remainder
-# register (`div_reg >= 0`, x86-64 RAX:RDX) takes the pre-coloring path below; an ISA
-# that wires no fixed division register (`div_reg < 0`, e.g. AArch64 SDIV/UDIV, which
-# write a normal destination register) takes the generic three-address path
-# (`lower_div_three_address`).
-#
-# the pre-coloring path lowers into the x86-64 RAX:RDX division sequence with explicit
-# register pre-coloring, mirroring the call/return ABI
-# pre-coloring approach. the IR operands are `[a, b]` (dividend, divisor). the
-# emitted sequence is, in order:
-#   - `mir.MIR_MOV RAX <- a` - the dividend occupies the accumulator;
-#   - the divide pseudo `mir.MIR_DIV_S/DIV_U/REM_S/REM_U [RAX, b]` - operand 0 is the
-#     implicit RAX dividend/result register (so the register allocator reads a
-#     non-defining barrier whose operand 1 is the divisor use), operand 1 is the
-#     divisor `b`. the opcode survives instruction selection unchanged; the encoder
-#     materializes the dividend high-half setup (CWD/CDQ/CQO sign-extension for the
-#     signed forms, `XOR RDX, RDX` zero-extension for the unsigned forms) followed
-#     by the single-operand `IDIV b` / `DIV b`;
-#   - `mir.MIR_MOV dst <- RAX` for a division, or `mir.MIR_MOV dst <- RDX` for a remainder
-#     - the quotient lands in RAX and the remainder in RDX.
-# the divide clobbers RAX and RDX; regalloc keeps both out of allocation for any
-# function that divides (they are caller-saved, so no prologue cost), so no live
-# value or the divisor `b` can collide with the dividend wiring. the operation
-# width (2/4/8 bytes - a byte divide is promoted to 32 bits below) is carried on
-# the divide so the encoder selects the matching sign-extension opcode and sets
-# REX.W / the 0x66 prefix.
-# ---
-# ctx:  the per-function lowering context
-# mb:   the destination MIR block
-# inst: the IR division / remainder instruction
-# iid:  the IR instruction id
-# ret:  true on success, or a lowering / allocation error
-fun lower_div(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[bool, str] {
+fun lower_div(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[R.Void, str] {
     if (inst.operand_count < 2) {
-        ret R.err[bool, str]("mir.lower_ir: division missing dividend or divisor operand");
+        ret R.err[R.Void, str]("mir.lower_ir: division missing dividend or divisor operand");
     }
-    # floating-point division never reaches here: `lower_instr` dispatches every
-    # float arithmetic / comparison op to `lower_float_op` (which emits mir.MIR_FDIV)
-    # before this integer-division path.
     val dst: u32 = lctx.instr_vreg(ctx, iid);
     if (dst == mir.MIR_VREG_NIL) {
-        ret R.err[bool, str]("mir.lower_ir: division defines no result vreg");
+        ret R.err[R.Void, str]("mir.lower_ir: division defines no result vreg");
     }
-    # the ISA's division form hard-wires the dividend / quotient accumulator and the
-    # high-half / remainder register (x86-64 RAX:RDX). an ISA wiring no fixed
-    # division register (`div_reg < 0` / `div_hi_reg < 0`, e.g. AArch64 SDIV/UDIV)
-    # lowers to the generic three-address divide the per-ISA encoder realizes, rather
-    # than this pre-coloring path.
     val acc_reg: i32 = ctx.tgt.model.div_reg;
     val hi_reg:  i32 = ctx.tgt.model.div_hi_reg;
     if (acc_reg < 0 || hi_reg < 0) {
@@ -1663,12 +951,6 @@ fun lower_div(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, 
     }
     val signed: bool = inst.kind == instr.OP_DIV_S || inst.kind == instr.OP_REM_S;
 
-    # x86-64 has no 8-bit dividend high register (a byte divide puts the dividend
-    # in AX and the remainder in AH, not RDX), so a byte division is promoted to a
-    # 32-bit divide: both operands are extended to 32 bits, the divide runs at
-    # width 4 (remainder in EDX, quotient in EAX), and the result move truncates
-    # back to the byte destination. 16/32/64-bit divisions run at their natural
-    # width with the remainder in (R)DX.
     val natural_w: u8 = lctx.op_width_of(ctx, inst.ty);
     var w: u8 = natural_w;
     if (w < 4) { w = 4; }
@@ -1676,41 +958,28 @@ fun lower_div(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, 
     val dividend: mir.MirOperand = lctx.lower_value(ctx, inst.operands[0]);
     val divisor:  mir.MirOperand = lctx.lower_value(ctx, inst.operands[1]);
 
-    # the dividend occupies the accumulator (x86-64 RAX) before the divide. a
-    # promoted byte dividend is widened into it; otherwise it is a plain width-w move.
-    val mr: R.Result[bool, str] = emit_promote(ctx, mb, mir.op_preg(acc_reg::u32), dividend, w, natural_w, signed);
-    if (R.is_err[bool, str](mr)) { ret mr; }
+    val mr: R.Result[R.Void, str] = emit_promote(ctx, mb, mir.op_preg(acc_reg::u32), dividend, w, natural_w, signed);
+    if (R.is_err[R.Void, str](mr)) { ret mr; }
 
-    # the divisor must live in a register or memory - x86-64 IDIV / DIV has no
-    # immediate divisor form - so an immediate divisor is materialized into a fresh
-    # value vreg. a promoted byte divisor is likewise widened into a fresh vreg. a
-    # register / memory divisor at the natural width is used directly.
     var div_op: mir.MirOperand = divisor;
     if (natural_w < w || divisor.kind == mir.MIR_OP_IMM) {
         val bvr: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
-        if (R.is_err[u32, str](bvr)) { ret R.err[bool, str](R.unwrap_err[u32, str](bvr)); }
+        if (R.is_err[u32, str](bvr)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](bvr)); }
         val bv: u32 = R.unwrap_ok[u32, str](bvr);
-        val ex: R.Result[bool, str] = emit_promote(ctx, mb, mir.op_vreg(bv), divisor, w, natural_w, signed);
-        if (R.is_err[bool, str](ex)) { ret ex; }
+        val ex: R.Result[R.Void, str] = emit_promote(ctx, mb, mir.op_vreg(bv), divisor, w, natural_w, signed);
+        if (R.is_err[R.Void, str](ex)) { ret ex; }
         div_op = mir.op_vreg(bv);
     }
 
-    # the divide itself: operand 0 is the implicit accumulator dividend/result
-    # register (x86-64 RAX) and operand 1 is the divisor. the opcode survives
-    # instruction selection; the encoder materializes the high-half setup + IDIV/DIV.
     val rop: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
-    if (R.is_err[*mir.MirOperand, str](rop)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](rop)); }
+    if (R.is_err[*mir.MirOperand, str](rop)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](rop)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](rop);
     ops[0] = mir.op_preg(acc_reg::u32);
     ops[1] = div_op;
     var mi: mir.MirInstr = mir.instr(inst.kind::u32, ops, 2, w, w);
-    val pd: R.Result[bool, str] = lctx.push_instr(ctx, mb, mi);
-    if (R.is_err[bool, str](pd)) { ret pd; }
+    val pd: R.Result[R.Void, str] = lctx.push_instr(ctx, mb, mi);
+    if (R.is_err[R.Void, str](pd)) { ret pd; }
 
-    # the quotient lands in the accumulator (x86-64 RAX) and the remainder in the
-    # high-half register (RDX); move the canonical result register into the result
-    # vreg. the move is driven at the destination's natural width, truncating a
-    # promoted byte result.
     var res_reg: i32 = acc_reg;
     if (inst.kind == instr.OP_REM_S || inst.kind == instr.OP_REM_U) {
         res_reg = hi_reg;
@@ -1718,31 +987,8 @@ fun lower_div(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, 
     ret lctx.emit_mov_w(ctx, mb, mir.op_vreg(dst), mir.op_preg(res_reg::u32), natural_w);
 }
 
-# lower an integer division / remainder on an ISA with no fixed division register
-#
-# For an ISA wiring no fixed division register (`div_reg < 0`, e.g. AArch64
-# SDIV/UDIV, which write a normal destination register), emits a clean
-# three-address divide `[dst, dividend, divisor]` carrying the OP_DIV_* / OP_REM_*
-# kind and the operation width; instruction selection rewrites it to the per-ISA
-# selection-output sentinel and the encoder materializes the quotient / remainder
-# plus the defined division-by-zero and signed-overflow traps. Operand 0 is a pure
-# def the register allocator reads directly (no RAX/RDX pre-coloring). Mirrors the
-# pre-coloring path's operand handling - a narrower-than-32-bit operand is promoted
-# to the divide width (the encoder's divides have only 32- and 64-bit forms) and an
-# immediate operand is materialized into a value vreg (so both operands reach the
-# divide in a register, which the SDIV/UDIV and the trap checks require; a
-# constant-zero divisor thus lands in a register and still traps). The destination
-# IS the divide result, so a promoted narrow result needs no truncating move (a
-# consumer reads its low bytes).
-# ---
-# ctx:  the per-function lowering context
-# mb:   the destination MIR block
-# inst: the IR division / remainder instruction
-# iid:  the IR instruction id
-# dst:  the result vreg, already resolved by the caller
-# ret:  true on success, or a lowering / allocation error
 fun lower_div_three_address(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction,
-                            iid: id.InstructionId, dst: u32) R.Result[bool, str] {
+                            iid: id.InstructionId, dst: u32) R.Result[R.Void, str] {
     val signed: bool = inst.kind == instr.OP_DIV_S || inst.kind == instr.OP_REM_S;
 
     val natural_w: u8 = lctx.op_width_of(ctx, inst.ty);
@@ -1752,35 +998,28 @@ fun lower_div_three_address(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr
     val dividend: mir.MirOperand = lctx.lower_value(ctx, inst.operands[0]);
     val divisor:  mir.MirOperand = lctx.lower_value(ctx, inst.operands[1]);
 
-    # the dividend reaches the divide in a register at the divide width: a promoted
-    # narrow value is widened into a fresh vreg, an immediate is materialized into one,
-    # and a register already at the divide width is used directly.
     var n_op: mir.MirOperand = dividend;
     if (natural_w < w || dividend.kind == mir.MIR_OP_IMM) {
         val nvr: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
-        if (R.is_err[u32, str](nvr)) { ret R.err[bool, str](R.unwrap_err[u32, str](nvr)); }
+        if (R.is_err[u32, str](nvr)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](nvr)); }
         val nv: u32 = R.unwrap_ok[u32, str](nvr);
-        val ne: R.Result[bool, str] = emit_promote(ctx, mb, mir.op_vreg(nv), dividend, w, natural_w, signed);
-        if (R.is_err[bool, str](ne)) { ret ne; }
+        val ne: R.Result[R.Void, str] = emit_promote(ctx, mb, mir.op_vreg(nv), dividend, w, natural_w, signed);
+        if (R.is_err[R.Void, str](ne)) { ret ne; }
         n_op = mir.op_vreg(nv);
     }
 
-    # the divisor likewise reaches the divide in a register at the divide width.
     var m_op: mir.MirOperand = divisor;
     if (natural_w < w || divisor.kind == mir.MIR_OP_IMM) {
         val mvr: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
-        if (R.is_err[u32, str](mvr)) { ret R.err[bool, str](R.unwrap_err[u32, str](mvr)); }
+        if (R.is_err[u32, str](mvr)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](mvr)); }
         val mv: u32 = R.unwrap_ok[u32, str](mvr);
-        val me: R.Result[bool, str] = emit_promote(ctx, mb, mir.op_vreg(mv), divisor, w, natural_w, signed);
-        if (R.is_err[bool, str](me)) { ret me; }
+        val me: R.Result[R.Void, str] = emit_promote(ctx, mb, mir.op_vreg(mv), divisor, w, natural_w, signed);
+        if (R.is_err[R.Void, str](me)) { ret me; }
         m_op = mir.op_vreg(mv);
     }
 
-    # the three-address divide: operand 0 the pure-def destination, operand 1 the
-    # dividend, operand 2 the divisor. the OP_DIV_*/OP_REM_* opcode survives isel
-    # (rewritten to the selection-output sentinel) into the encoder.
     val rop: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 3::usize);
-    if (R.is_err[*mir.MirOperand, str](rop)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](rop)); }
+    if (R.is_err[*mir.MirOperand, str](rop)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](rop)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](rop);
     ops[0] = mir.op_vreg(dst);
     ops[1] = n_op;
@@ -1789,20 +1028,6 @@ fun lower_div_three_address(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr
     ret lctx.push_instr(ctx, mb, mi);
 }
 
-# the VALUE a width-masked narrow immediate denotes at `width`
-#
-# An integer constant of a sub-word type reaches the backend carrying its RAW
-# `width`-byte bit pattern, not its value: i8 `-56` arrives as 200. Widening it
-# with a plain move would therefore promote the bits rather than the number, so a
-# consumer computing above the narrow width (a promoted divide, a right shift) must
-# re-derive what the constant means first - sign-extending the top bit for a signed
-# interpretation, masking to the width for an unsigned one. Wider widths, and the
-# documented width-0 machine-word sentinel, already denote their raw value.
-# ---
-# imm:    the operand's raw immediate bits
-# width:  the width in bytes the constant is masked to
-# signed: true to re-sign the low `width` bytes, false to mask to them
-# ret:    the value the constant denotes at `width`
 fun narrow_imm_value(imm: i64, width: u8, signed: bool) i64 {
     if (width == 0 || width >= 8) { ret imm; }
     val bits: u32 = width::u32 * 8;
@@ -1814,26 +1039,8 @@ fun narrow_imm_value(imm: i64, width: u8, signed: bool) i64 {
     ret (v | ~m)::i64;
 }
 
-# move `src` into `dst` at `dst_w` bytes, widening from `src_w` when narrower
-#
-# A register / memory source narrower than the destination is sign-extended
-# (`signed`, MOVSX) or zero-extended (MOVZX); at equal width it is a plain move. An
-# immediate has no MOVSX/MOVZX encoding, so it widens by re-deriving the value its
-# width-masked bits denote (`narrow_imm_value`) and moving that at `dst_w` - moving
-# the raw bits instead would compute on 200 where the source said i8 `-56`. Used to
-# load a division's dividend into RAX, to widen a promoted byte divisor into a value
-# vreg, and to canonicalize a narrow right shift's value operand.
-# ---
-# ctx:    the per-function lowering context
-# mb:     the destination MIR block
-# dst:    the destination operand
-# src:    the source operand
-# dst_w:  the destination width in bytes
-# src_w:  the source width in bytes
-# signed: true to sign-extend a narrow source, false to zero-extend
-# ret:    true on success, or a lowering / allocation error
 fun emit_promote(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mir.MirOperand,
-                 dst_w: u8, src_w: u8, signed: bool) R.Result[bool, str] {
+                 dst_w: u8, src_w: u8, signed: bool) R.Result[R.Void, str] {
     if (src_w >= dst_w) {
         ret lctx.emit_mov_w(ctx, mb, dst, src, dst_w);
     }
@@ -1841,7 +1048,7 @@ fun emit_promote(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, sr
         ret lctx.emit_mov_w(ctx, mb, dst, mir.op_imm(narrow_imm_value(src.imm, src_w, signed)), dst_w);
     }
     val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
-    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](r)); }
+    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](r)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
     ops[0] = dst;
     ops[1] = src;
@@ -1850,28 +1057,7 @@ fun emit_promote(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, sr
     ret lctx.push_instr(ctx, mb, mi);
 }
 
-# lower a non-call IR instruction by mapping its opcode 1:1 to the generic MIR opcode
-#
-# Emits `[dst?, operands...]` at the same opcode number. Branch operands that name
-# block targets become mir.MIR_OP_BLOCK operands. This is also where the generic
-# opcodes' operand-SHAPE constraints are enforced: a symbol operand is LEA-
-# materialized into a vreg (its address is the rvalue), and a constant landing in a
-# slot `mir.operand_requires_reg` declares register-only is moved into a fresh vreg
-# so no encoder sees an immediate it has no form for.
-# ---
-# ctx:  the per-function lowering context
-# mb:   the destination MIR block
-# inst: the IR instruction to lower
-# iid:  the IR instruction id
-# ret:  true on success, or a lowering / allocation error
-fun lower_generic(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[bool, str] {
-    # scalar floating-point arithmetic / comparison shares the IR integer opcodes
-    # (OP_ADD / OP_SUB / OP_MUL / OP_CMP_* operate on both int and float operands),
-    # but a float instruction never reaches here: `lower_instr` dispatches it to
-    # `lower_float_op` (emitting the dedicated mir.MIR_FADD / FSUB / FMUL / FDIV / FCMP
-    # SSE opcodes) before the generic path. the float CONVERSIONS (FP_TRUNC / FP_EXT
-    # / FP_TO_SI / SI_TO_FP / ...) carry their own opcodes and SSE encoders and DO
-    # ride this generic path unchanged.
+fun lower_generic(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[R.Void, str] {
     val dst: u32 = lctx.instr_vreg(ctx, iid);
     val has_dst: bool = dst != mir.MIR_VREG_NIL;
     var total: u32 = inst.operand_count;
@@ -1880,7 +1066,7 @@ fun lower_generic(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instructi
     var ops: *mir.MirOperand = nil;
     if (total > 0) {
         val rop: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, total::usize);
-        if (R.is_err[*mir.MirOperand, str](rop)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](rop)); }
+        if (R.is_err[*mir.MirOperand, str](rop)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](rop)); }
         ops = R.unwrap_ok[*mir.MirOperand, str](rop);
     }
 
@@ -1893,29 +1079,19 @@ fun lower_generic(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instructi
     var k: u32 = 0;
     for (k < inst.operand_count) {
         var op: mir.MirOperand = lctx.lower_operand(ctx, inst, k);
-        # a global / function symbol operand is its ADDRESS as an rvalue; left as a
-        # bare mir.MIR_OP_SYM the encoder would load `[sym]` into this ALU / compare /
-        # bitcast slot (the symbol's contents) instead of its address. LEA-
-        # materialize it into a vreg first, mirroring the store / call-arg / return
-        # symbol paths.
         if (op.kind == mir.MIR_OP_SYM) {
             var av: u32 = mir.MIR_VREG_NIL;
-            val ar: R.Result[bool, str] = lctx.addr_to_vreg(ctx, mb, op, ?av);
-            if (R.is_err[bool, str](ar)) { ret ar; }
+            val ar: R.Result[R.Void, str] = lctx.addr_to_vreg(ctx, mb, op, ?av);
+            if (R.is_err[R.Void, str](ar)) { ret ar; }
             op = mir.op_vreg(av);
         }
-        # a slot the shared MIR contract declares register-only (the integer source
-        # of an integer-to-float conversion) takes a constant through a fresh value
-        # vreg: two of the three register backends have no immediate form there
-        # (#2812). the move rides the operand's own width - the encoders extend a
-        # sub-word integer source themselves.
         if (op.kind == mir.MIR_OP_IMM && mir.operand_requires_reg(inst.kind::u32, base + k)) {
             val cvr: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
-            if (R.is_err[u32, str](cvr)) { ret R.err[bool, str](R.unwrap_err[u32, str](cvr)); }
+            if (R.is_err[u32, str](cvr)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](cvr)); }
             val cv: u32 = R.unwrap_ok[u32, str](cvr);
             val cw: u8 = lctx.op_width_of(ctx, inst.operands[k].ty);
-            val ce: R.Result[bool, str] = lctx.emit_mov_w(ctx, mb, mir.op_vreg(cv), op, cw);
-            if (R.is_err[bool, str](ce)) { ret ce; }
+            val ce: R.Result[R.Void, str] = lctx.emit_mov_w(ctx, mb, mir.op_vreg(cv), op, cw);
+            if (R.is_err[R.Void, str](ce)) { ret ce; }
             op = mir.op_vreg(cv);
         }
         ops[base + k] = op;
@@ -1927,24 +1103,6 @@ fun lower_generic(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instructi
     ret lctx.push_instr(ctx, mb, mi);
 }
 
-# derive the destination and source operand widths for a 1:1-lowered instruction
-#
-# Stamps the widths onto the MIR instruction. The result width is the
-# instruction's own result type, except:
-#   - a width-changing integer conversion (TRUNC / SEXT / ZEXT) keeps the
-#     destination width from the result type but takes its source width from operand
-#     0, so the encoder's MOVZX / MOVSX selects the narrow / wide source form;
-#   - a comparison (CMP_*) yields an i8 result but the CMP operates at the compared
-#     operand width, so both widths come from operand 0;
-#   - the float conversions (FP_TO_SI / SI_TO_FP family) carry their true result and
-#     operand-0 widths so the SSE conversion encoder selects the SS-vs-SD float form
-#     from the float side and sizes the GP integer side for REX.W (`set_conv_widths`);
-#   - a void-result terminator / branch has no natural width and rides at the word
-#     width, which only sizes its address-sized fields.
-# ---
-# ctx:  the per-function lowering context
-# inst: the source IR instruction
-# mi:   the MIR instruction to stamp the widths onto
 fun set_generic_widths(ctx: *lctx.LowerCtx, inst: *instr.Instruction, mi: *mir.MirInstr) {
     if (is_float_kind(ctx, inst)) {
         set_conv_widths(ctx, inst, mi);
@@ -1957,12 +1115,7 @@ fun set_generic_widths(ctx: *lctx.LowerCtx, inst: *instr.Instruction, mi: *mir.M
         ret;
     }
     var dw: u8 = ctx.tgt.model.gpr_width::u8;
-    if (!instr.is_terminator(inst.kind)) { dw = lctx.op_width_of(ctx, inst.ty); }
-    # a register-writing integer ALU result must be defined across the full width
-    # it is later spilled / reloaded at, or a sub-word op's undefined upper bits
-    # leak through the word-width spill into a downstream full-width use. the
-    # conversions are excluded: their destination width selects the MOVZX / MOVSX
-    # narrow form and is load-bearing, not a clamp candidate.
+    if (!opdesc.is_terminator(inst.kind)) { dw = lctx.op_width_of(ctx, inst.ty); }
     if (is_int_alu_kind(inst.kind)) { dw = lctx.clamp_alu_width(ctx.tgt.model.alu_min_width, dw); }
     var sw: u8 = dw;
     if (is_int_conversion_kind(inst.kind) && inst.operand_count >= 1) {
@@ -1972,19 +1125,6 @@ fun set_generic_widths(ctx: *lctx.LowerCtx, inst: *instr.Instruction, mi: *mir.M
     mi.src_width = sw;
 }
 
-# stamp the destination and source widths of a float conversion
-#
-# Covers FP_TO_SI / FP_TO_UI / SI_TO_FP / UI_TO_FP / FP_TRUNC / FP_EXT. `mi.width`
-# is the result-type width and `mi.src_width` is operand 0's width. The SSE
-# conversion encoder reads the FLOAT side of the pair (the side whose type is f32 /
-# f64, determined from the concrete opcode) to pick the single-precision SS vs
-# double SD form, and sizes the GP integer side from its own width for REX.W. An
-# FP_TRUNC / FP_EXT has float on both sides; its single opcode needs no width
-# selection, so the carried widths only document the operand sizes.
-# ---
-# ctx:  the per-function lowering context
-# inst: the source IR conversion instruction
-# mi:   the MIR instruction to stamp the widths onto
 fun set_conv_widths(ctx: *lctx.LowerCtx, inst: *instr.Instruction, mi: *mir.MirInstr) {
     var dw: u8 = lctx.op_width_of(ctx, inst.ty);
     var sw: u8 = dw;
@@ -1993,77 +1133,26 @@ fun set_conv_widths(ctx: *lctx.LowerCtx, inst: *instr.Instruction, mi: *mir.MirI
     mi.src_width = sw;
 }
 
-# true for the integer arithmetic / bitwise opcodes materialized by a GP ALU write
-#
-# Covers ADD / SUB / MUL / NEG / AND / OR / XOR / NOT and the shifts. A sub-word
-# write of one of these leaves the upper register bits undefined, so its result
-# width is clamped to `mir.ALU_MIN_WIDTH`. The divisions are excluded - `lower_div`
-# already promotes a byte divide to 32 bits.
-# ---
-# k:   the IR instruction kind to test
-# ret: true for an integer ALU / bitwise / shift opcode
 fun is_int_alu_kind(k: instr.InstrKind) bool {
-    ret k == instr.OP_ADD || k == instr.OP_SUB || k == instr.OP_MUL ||
-        k == instr.OP_NEG || k == instr.OP_AND || k == instr.OP_OR ||
-        k == instr.OP_XOR || k == instr.OP_NOT ||
-        k == instr.OP_SHL || k == instr.OP_SHR_S || k == instr.OP_SHR_U;
+    ret opdesc.has(k, opdesc.EFF_INT_ALU);
 }
 
-# true for the IR comparison opcodes whose CMP operates at the operand width
-#
-# The compare runs at the operand width rather than the i8 result width.
-# ---
-# k:   the IR instruction kind to test
-# ret: true for a comparison opcode
+
 fun is_compare_kind(k: instr.InstrKind) bool {
-    ret k == instr.OP_CMP_EQ || k == instr.OP_CMP_NE ||
-        k == instr.OP_CMP_LT_S || k == instr.OP_CMP_LT_U ||
-        k == instr.OP_CMP_LE_S || k == instr.OP_CMP_LE_U;
+    ret opdesc.has(k, opdesc.EFF_COMPARE);
 }
 
-# true for a lane-wise vector compute op that the x86_64 arm routes generically
-# rather than one of the memory / call / return ops that keep their dedicated handler.
-# a vector value flows to the generic lowering as its shared opcode carrying `vec_lane`;
-# the x64 isel / encoder select the packed SSE2 form from that descriptor (#2014). shifts
-# are rejected at sema (#2030) so none reach here, but routing them generically keeps the
-# isel loud backstop the single place a stray vector shift errors.
-# ---
-# k:   the IR instruction opcode
-# ret: true for a lane-wise compute op
+
 fun is_vector_compute(k: instr.InstrKind) bool {
-    if (k == instr.OP_ADD || k == instr.OP_SUB || k == instr.OP_MUL) { ret true; }
-    if (k == instr.OP_DIV_S || k == instr.OP_DIV_U ||
-        k == instr.OP_REM_S || k == instr.OP_REM_U) { ret true; }
-    if (k == instr.OP_AND || k == instr.OP_OR || k == instr.OP_XOR || k == instr.OP_NOT) { ret true; }
-    if (k == instr.OP_SHL || k == instr.OP_SHR_S || k == instr.OP_SHR_U) { ret true; }
-    if (is_compare_kind(k)) { ret true; }
-    ret false;
+    ret opdesc.has(k, opdesc.EFF_VEC_COMPUTE);
 }
 
-# true for the width-changing integer conversions (TRUNC / SEXT / ZEXT)
-#
-# Their source operand width differs from the destination width, so the encoder
-# must size the source operand independently. The float conversions are excluded -
-# their operand widths are driven by the float encoders.
-# ---
-# k:   the IR instruction kind to test
-# ret: true for an integer conversion opcode
+
 fun is_int_conversion_kind(k: instr.InstrKind) bool {
-    ret k == instr.OP_TRUNC || k == instr.OP_SEXT || k == instr.OP_ZEXT;
+    ret opdesc.has(k, opdesc.EFF_INT_CONVERSION);
 }
 
-# true for a scalar float arithmetic / comparison sharing an IR integer opcode
-#
-# Covers OP_ADD / OP_SUB / OP_MUL / OP_DIV_* and OP_CMP_*. These select to SSE
-# forms in `lower_float_op` rather than the integer ALU / IDIV / CMP byte forms,
-# which would miscompile an XMM-classed value. The float CONVERSIONS (FP_TRUNC /
-# FP_EXT / FP_TO_SI / FP_TO_UI / SI_TO_FP / UI_TO_FP) carry their own opcodes and
-# SSE encoders and ride the generic path, so they are NOT claimed here. An op is
-# float when its result or first operand is a float type.
-# ---
-# ctx:  the per-function lowering context
-# inst: the IR instruction to test
-# ret:  true for a float-typed arithmetic / comparison op
+
 fun is_float_op(ctx: *lctx.LowerCtx, inst: *instr.Instruction) bool {
     val k: instr.InstrKind = inst.kind;
     var shared: bool = false;
@@ -2076,14 +1165,6 @@ fun is_float_op(ctx: *lctx.LowerCtx, inst: *instr.Instruction) bool {
     ret false;
 }
 
-# the SSE operation width (4 for f32, 8 for f64) of a float arithmetic / comparison
-#
-# An arithmetic op takes it from its own float result type; a comparison's result
-# is i8, so it takes the width from the compared float operand (operand 0).
-# ---
-# ctx:  the per-function lowering context
-# inst: the IR float arithmetic / comparison instruction
-# ret:  the SSE operation width in bytes
 fun float_op_width(ctx: *lctx.LowerCtx, inst: *instr.Instruction) u8 {
     if (is_compare_kind(inst.kind) && inst.operand_count >= 1) {
         ret lctx.op_width_of(ctx, inst.operands[0].ty);
@@ -2091,15 +1172,6 @@ fun float_op_width(ctx: *lctx.LowerCtx, inst: *instr.Instruction) u8 {
     ret lctx.op_width_of(ctx, inst.ty);
 }
 
-# the FCC_* float-comparison condition code realizing an IR compare opcode
-#
-# The front end emits only the EQ / NE / LT / LE forms (GT / GE are canonicalized
-# to LT / LE with swapped operands), and a float compare is unordered-aware via
-# UNSIGNED SETcc, so signedness is irrelevant: OP_CMP_LT_S and OP_CMP_LT_U both
-# map to mir.FCC_LT.
-# ---
-# k:   the IR comparison opcode
-# ret: the matching FCC_* float condition code
 fun float_cmp_cc(k: instr.InstrKind) u8 {
     if (k == instr.OP_CMP_EQ)                             { ret mir.FCC_EQ; }
     if (k == instr.OP_CMP_NE)                             { ret mir.FCC_NE; }
@@ -2107,33 +1179,17 @@ fun float_cmp_cc(k: instr.InstrKind) u8 {
     ret mir.FCC_LE;
 }
 
-# lower a scalar float arithmetic / comparison to its dedicated SSE MIR opcode
-#
-# Emits mir.MIR_FADD / FSUB / FMUL / FDIV for the four arithmetic ops, or
-# mir.MIR_FCMP for a comparison. The opcode survives instruction selection and the
-# encoder materializes the SSE byte sequence (operands loaded into XMM scratch, the
-# SSE op, the result stored back) - mirroring cmach's `emit_float_op` /
-# `emit_float_cmp`. The operation width (4 for f32, 8 for f64) rides on `mi.width`
-# so the encoder selects the SS vs SD form; a mir.MIR_FCMP also carries its FCC_*
-# condition on `mi.src_width`. The layout is `[dst, lhs, rhs]` like the generic
-# three-address ALU / compare forms.
-# ---
-# ctx:  the per-function lowering context
-# mb:   the destination MIR block
-# inst: the IR float arithmetic / comparison instruction
-# iid:  the IR instruction id
-# ret:  true on success, or a lowering / allocation error
-fun lower_float_op(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[bool, str] {
+fun lower_float_op(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[R.Void, str] {
     if (inst.operand_count < 2) {
-        ret R.err[bool, str]("mir.lower_ir: float op missing operand");
+        ret R.err[R.Void, str]("mir.lower_ir: float op missing operand");
     }
     val dst: u32 = lctx.instr_vreg(ctx, iid);
     if (dst == mir.MIR_VREG_NIL) {
-        ret R.err[bool, str]("mir.lower_ir: float op defines no result vreg");
+        ret R.err[R.Void, str]("mir.lower_ir: float op defines no result vreg");
     }
 
     val rop: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 3::usize);
-    if (R.is_err[*mir.MirOperand, str](rop)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](rop)); }
+    if (R.is_err[*mir.MirOperand, str](rop)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](rop)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](rop);
     ops[0] = mir.op_vreg(dst);
     ops[1] = lctx.lower_value(ctx, inst.operands[0]);
@@ -2141,8 +1197,6 @@ fun lower_float_op(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruct
 
     val w: u8 = float_op_width(ctx, inst);
 
-    # a float compare rides its condition code in src_width; every other float op
-    # keeps the operand width.
     val k: instr.InstrKind = inst.kind;
     var op: mir.MirOpcode = mir.MIR_FDIV;
     var sw: u8 = w;
@@ -2161,40 +1215,6 @@ fun lower_float_op(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruct
     ret lctx.push_instr(ctx, mb, mi);
 }
 
-# lower a scalar float negation (a float-typed OP_NEG) to the dedicated mir.MIR_FNEG
-#
-# The opcode survives instruction selection and the encoder flips the IEEE-754 sign
-# bit on the XMM value (XORPS with a width-selected sign mask) rather than the
-# integer mir.MIR_NEG, which would two's-complement the whole bit pattern and
-# produce garbage. Operand layout is `[dst, src]` like a float MOV; the operation
-# width (4 for f32, 8 for f64) rides on `mi.width` so the encoder selects the f32
-# vs f64 sign-bit mask.
-# ---
-# ctx:  the per-function lowering context
-# mb:   the destination MIR block
-# inst: the IR float negate instruction
-# iid:  the IR instruction id
-# ret:  true on success, or a lowering / allocation error
-# whether this `:~` crosses the register banks at a width the target cannot cross in
-# one instruction (#2904)
-#
-# A BIT REINTERPRET IS THE SECOND INSTRUCTION WITH A VALUE IN EACH BANK - a conversion
-# was long treated as the only one. A same-bank `:~` is a register copy and a
-# cross-bank one selects to a plain MOV that the encoder dispatches on operand
-# register CLASS, which is true on every target that HAS the instruction. RV32 is the
-# member that does not: the D extension puts 64-bit doubles in f0-f31 while XLEN stays
-# 4, so `f64 :~ i64` is ordinary to write and `fmv.x.d` is RV64-only. It reached
-# `be.codegen.legalize` as a retagged MIR_MOV, missed the lane split because one side
-# is FP-class, and fell out into a generic width refusal naming an opcode the user
-# never wrote.
-#
-# ASKED OF THE TARGET, not derived from the widths. `flen_bits` and `gpr_width` give
-# the right answer on the riscv members by coincidence and the wrong one on x86-64,
-# where a 128-bit XMM would imply a 16-byte crossing that `movq` does not perform.
-# ---
-# ctx:  the lowering context
-# inst: the OP_BITCAST being lowered
-# ret:  true when the crossing has no register form and must go through memory
 fun bitcast_needs_frame(ctx: *lctx.LowerCtx, inst: *instr.Instruction) bool {
     if (inst.operand_count < 1) { ret false; }
 
@@ -2202,8 +1222,6 @@ fun bitcast_needs_frame(ctx: *lctx.LowerCtx, inst: *instr.Instruction) bool {
     val src_float: bool = lctx.value_is_float(ctx, inst.operands[0].ty);
     if (dst_float == src_float) { ret false; }
 
-    # a vector side is a different question and a different path: it rides the vector
-    # register file, whose memory crossings `vec_mem_widths` already answers.
     if (lctx.value_is_vector(ctx, inst.ty))              { ret false; }
     if (lctx.value_is_vector(ctx, inst.operands[0].ty))  { ret false; }
 
@@ -2212,53 +1230,31 @@ fun bitcast_needs_frame(ctx: *lctx.LowerCtx, inst: *instr.Instruction) bool {
     ret !isa.moves_cross_bank(?ctx.tgt.model, w::u32);
 }
 
-# lower a cross-bank `:~` with no register form into a frame round trip (#2904)
-#
-# A store in the SOURCE's bank followed by a load in the DESTINATION's. The bits are
-# the same in either bank, so the two halves need no conversion between them - which
-# is why this is a reinterpret and not `is_int_fp_conv`'s problem. On rv32 the pair
-# encodes as `fsd` then two `lw`, or two `sw` then `fld`, which is what a C toolchain
-# emits on this target.
-#
-# NOTHING BELOW HERE NEEDS TO KNOW. The float side is an ordinary float move against a
-# MEM operand, which the encoder already handles because a spilled side reaches it the
-# same way. The integer side is an ordinary wide integer move against a MEM operand,
-# which `be.codegen.legalize` already splits into lane-width pieces - so the wide half
-# is legalized by the machinery that was refusing it, with no new clause.
-# ---
-# ctx:  the lowering context
-# mb:   the block to append to
-# inst: the OP_BITCAST being lowered
-# iid:  its instruction id, for the result vreg
-# ret:  true on success, or an allocation error
-fun lower_bitcast_via_frame(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[bool, str] {
+fun lower_bitcast_via_frame(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[R.Void, str] {
     val dst: u32 = lctx.instr_vreg(ctx, iid);
     if (dst == mir.MIR_VREG_NIL) {
-        ret R.err[bool, str]("mir.lower_ir: cross-bank reinterpret defines no result vreg");
+        ret R.err[R.Void, str]("mir.lower_ir: cross-bank reinterpret defines no result vreg");
     }
     val w: u8 = lctx.op_width_of(ctx, inst.ty);
 
-    # an internal slot-key vreg owns the storage; it is addressed only as a MEM base,
-    # never register-allocated. the slot is the value's own width and alignment, so
-    # both halves are naturally aligned accesses.
     val skr: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
-    if (R.is_err[u32, str](skr)) { ret R.err[bool, str](R.unwrap_err[u32, str](skr)); }
+    if (R.is_err[u32, str](skr)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](skr)); }
     val sk: u32 = R.unwrap_ok[u32, str](skr);
 
-    val ar: R.Result[bool, str] = lctx.add_spill_slot_aligned(ctx, sk, w::u64, w::u32);
-    if (R.is_err[bool, str](ar)) { ret ar; }
+    val ar: R.Result[R.Void, str] = lctx.add_spill_slot_aligned(ctx, sk, w::u64, w::u32);
+    if (R.is_err[R.Void, str](ar)) { ret ar; }
 
     val sr: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
-    if (R.is_err[*mir.MirOperand, str](sr)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](sr)); }
+    if (R.is_err[*mir.MirOperand, str](sr)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](sr)); }
     val sops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](sr);
     sops[0] = mir.op_mem_slot(sk, 0);
     sops[1] = lctx.lower_value(ctx, inst.operands[0]);
     var si: mir.MirInstr = mir.instr(mir.MIR_MOV, sops, 2, w, w);
-    val spr: R.Result[bool, str] = lctx.push_instr(ctx, mb, si);
-    if (R.is_err[bool, str](spr)) { ret spr; }
+    val spr: R.Result[R.Void, str] = lctx.push_instr(ctx, mb, si);
+    if (R.is_err[R.Void, str](spr)) { ret spr; }
 
     val lr: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
-    if (R.is_err[*mir.MirOperand, str](lr)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](lr)); }
+    if (R.is_err[*mir.MirOperand, str](lr)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](lr)); }
     val lops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](lr);
     lops[0] = mir.op_vreg(dst);
     lops[1] = mir.op_mem_slot(sk, 0);
@@ -2266,17 +1262,17 @@ fun lower_bitcast_via_frame(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr
     ret lctx.push_instr(ctx, mb, li);
 }
 
-fun lower_float_neg(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[bool, str] {
+fun lower_float_neg(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[R.Void, str] {
     if (inst.operand_count < 1) {
-        ret R.err[bool, str]("mir.lower_ir: float negate missing operand");
+        ret R.err[R.Void, str]("mir.lower_ir: float negate missing operand");
     }
     val dst: u32 = lctx.instr_vreg(ctx, iid);
     if (dst == mir.MIR_VREG_NIL) {
-        ret R.err[bool, str]("mir.lower_ir: float negate defines no result vreg");
+        ret R.err[R.Void, str]("mir.lower_ir: float negate defines no result vreg");
     }
 
     val rop: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
-    if (R.is_err[*mir.MirOperand, str](rop)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](rop)); }
+    if (R.is_err[*mir.MirOperand, str](rop)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](rop)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](rop);
     ops[0] = mir.op_vreg(dst);
     ops[1] = lctx.lower_value(ctx, inst.operands[0]);
@@ -2287,115 +1283,64 @@ fun lower_float_neg(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruc
     ret lctx.push_instr(ctx, mb, mi);
 }
 
-# true when an instruction's width is driven by the float encoders
-#
-# True when the result or first operand is a float, or the opcode is a float
-# conversion, so its width must not be re-sized by the integer base-width carrier.
-# The float conversions, scalar float arithmetic, and float comparisons all reach
-# lowering through the generic path.
-# ---
-# ctx:  the per-function lowering context
-# inst: the IR instruction to test
-# ret:  true when the instruction's width is float-driven
 fun is_float_kind(ctx: *lctx.LowerCtx, inst: *instr.Instruction) bool {
-    if (inst.kind == instr.OP_FP_TO_SI || inst.kind == instr.OP_FP_TO_UI ||
-        inst.kind == instr.OP_SI_TO_FP || inst.kind == instr.OP_UI_TO_FP ||
-        inst.kind == instr.OP_FP_TRUNC || inst.kind == instr.OP_FP_EXT) {
-        ret true;
-    }
+    if (opdesc.has(inst.kind, opdesc.EFF_FP_CONVERT)) { ret true; }
     if (lctx.value_is_float(ctx, inst.ty))                                        { ret true; }
     if (inst.operand_count >= 1 && lctx.value_is_float(ctx, inst.operands[0].ty)) { ret true; }
     ret false;
 }
 
-# lower an OP_ALLOCA into a stack-slot reservation plus address materialization
-#
-# The instruction's `aux_ty` is the allocated ELEMENT type (the result type and
-# Value are the untyped pointer); operand 0 is the element count. A fresh internal
-# slot-key vreg owns a mir.SLOT_ALLOCA frame slot sized `element_size * count` and
-# is used only as the LEA base, so regalloc never register-allocates it and the
-# encoder resolves it to `[rbp + offset]`. The emitted
-# `mir.MIR_ALLOCA (result) <- [slot]` selects to `LEA result, [rbp + offset]`,
-# leaving the allocation's address in the result vreg as an ordinary pointer for
-# downstream uses.
-# ---
-# ctx:  the per-function lowering context
-# mb:   the destination MIR block
-# inst: the IR OP_ALLOCA instruction
-# iid:  the IR instruction id
-# ret:  true on success, or a lowering / allocation error
-fun lower_alloca(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[bool, str] {
+fun lower_alloca(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[R.Void, str] {
     if (inst.operand_count == 0) {
-        ret R.err[bool, str]("mir.lower_ir: alloca with no count operand");
+        ret R.err[R.Void, str]("mir.lower_ir: alloca with no count operand");
     }
     val cv: value.Value = inst.operands[0];
     if (cv.kind != value.VAL_CONST_INT) {
-        ret R.err[bool, str]("variable-length alloca is not supported; use a constant size");
+        ret R.err[R.Void, str]("variable-length alloca is not supported; use a constant size");
     }
     val count: u64 = cv.data.int_lit;
 
-    # the element type rides on `aux_ty`; size and align the slot from it. the
-    # allocated region is `count` contiguous elements.
-    val elem_size: u32  = ir_type.byte_size(ctx.types, inst.aux_ty, ctx.tgt);
-    val elem_align: u32 = ir_type.byte_align(ctx.types, inst.aux_ty, ctx.tgt);
+    val elem_size: u32  = ir_type.byte_size_for_machine(ctx.types, inst.aux_ty, ctx.layout);
+    val elem_align: u32 = ir_type.byte_align_for_machine(ctx.types, inst.aux_ty, ctx.layout);
     val total: u64 = elem_size::u64 * count;
 
     val dst: u32 = lctx.instr_vreg(ctx, iid);
     if (dst == mir.MIR_VREG_NIL) {
-        ret R.err[bool, str]("mir.lower_ir: alloca defines no result vreg");
+        ret R.err[R.Void, str]("mir.lower_ir: alloca defines no result vreg");
     }
 
-    # an internal slot-key vreg owns the storage; it is addressed only as a MEM
-    # base, never register-allocated.
     val skr: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
-    if (R.is_err[u32, str](skr)) { ret R.err[bool, str](R.unwrap_err[u32, str](skr)); }
+    if (R.is_err[u32, str](skr)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](skr)); }
     val sk: u32 = R.unwrap_ok[u32, str](skr);
 
-    val ar: R.Result[bool, str] = lctx.add_alloca_slot(ctx, sk, total, elem_align, inst.aux_ty::u32);
-    if (R.is_err[bool, str](ar)) { ret ar; }
+    val ar: R.Result[R.Void, str] = lctx.add_alloca_slot(ctx, sk, total, elem_align, inst.aux_ty::u32);
+    if (R.is_err[R.Void, str](ar)) { ret ar; }
 
-    # record the slot-key vreg under this alloca's instruction id so an
-    # inline-asm `{name}` binding referencing the alloca resolves to its slot.
     if (ctx.slot_key_vregs != nil && iid::u32 < ctx.instr_count) {
         ctx.slot_key_vregs[iid::u32] = sk;
     }
 
     val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
-    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](r)); }
+    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](r)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
     ops[0] = mir.op_vreg(dst);
     ops[1] = mir.op_mem_slot(sk, 0);
-    # the alloca selects to a LEA computing a pointer-sized address.
     var mi: mir.MirInstr = mir.instr(mir.MIR_ALLOCA, ops, 2,
                                      ctx.tgt.model.gpr_width::u8, ctx.tgt.model.gpr_width::u8);
     ret lctx.push_instr(ctx, mb, mi);
 }
 
-# lower an OP_VEC_EXTRACT into `mir.MIR_VEC_EXTRACT (dst) <- (vector), #lane`
-#
-# `width` is the LANE element's byte width (the destination scalar's), while
-# `vec_lane` - stamped at the shared `push_instr` chokepoint from the operand's
-# vector type - carries the source arrangement. The encoder needs both: the element
-# size selects the machine form and the immediate selects the position. The
-# destination's register bank follows its IR type, so an integer lane lands in the
-# general bank and a float lane in the float/vector bank without a special case.
-# ---
-# ctx:  the per-function lowering context
-# mb:   the destination MIR block
-# inst: the IR OP_VEC_EXTRACT instruction
-# iid:  the IR instruction id
-# ret:  true on success, or a lowering / allocation error
-fun lower_vec_extract(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[bool, str] {
+fun lower_vec_extract(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[R.Void, str] {
     val dst: u32 = lctx.instr_vreg(ctx, iid);
     if (dst == mir.MIR_VREG_NIL) {
-        ret R.err[bool, str]("mir.lower_ir: vector lane read defines no result vreg");
+        ret R.err[R.Void, str]("mir.lower_ir: vector lane read defines no result vreg");
     }
     if (inst.operands[1].kind != value.VAL_CONST_INT) {
-        ret R.err[bool, str]("mir.lower_ir: vector lane index is not a constant");
+        ret R.err[R.Void, str]("mir.lower_ir: vector lane index is not a constant");
     }
 
     val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 3::usize);
-    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](r)); }
+    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](r)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
     ops[0] = mir.op_vreg(dst);
     ops[1] = lctx.lower_value(ctx, inst.operands[0]);
@@ -2405,29 +1350,17 @@ fun lower_vec_extract(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instr
     ret lctx.push_instr(ctx, mb, mi);
 }
 
-# lower an OP_VEC_INSERT into `mir.MIR_VEC_INSERT (dst) <- (vector), #lane, (value)`
-#
-# The IR opcode is functional - a new vector rather than a mutation - so the source
-# vector stays a pure use here and isel ties the destination to it on a target whose
-# machine form writes in place. `width` is the vector's and `src_width` the written
-# lane element's, the pair the encoder reads to size the insert.
-# ---
-# ctx:  the per-function lowering context
-# mb:   the destination MIR block
-# inst: the IR OP_VEC_INSERT instruction
-# iid:  the IR instruction id
-# ret:  true on success, or a lowering / allocation error
-fun lower_vec_insert(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[bool, str] {
+fun lower_vec_insert(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[R.Void, str] {
     val dst: u32 = lctx.instr_vreg(ctx, iid);
     if (dst == mir.MIR_VREG_NIL) {
-        ret R.err[bool, str]("mir.lower_ir: vector lane write defines no result vreg");
+        ret R.err[R.Void, str]("mir.lower_ir: vector lane write defines no result vreg");
     }
     if (inst.operands[1].kind != value.VAL_CONST_INT) {
-        ret R.err[bool, str]("mir.lower_ir: vector lane index is not a constant");
+        ret R.err[R.Void, str]("mir.lower_ir: vector lane index is not a constant");
     }
 
     val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 4::usize);
-    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](r)); }
+    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](r)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
     ops[0] = mir.op_vreg(dst);
     ops[1] = lctx.lower_value(ctx, inst.operands[0]);
@@ -2438,34 +1371,18 @@ fun lower_vec_insert(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instru
     ret lctx.push_instr(ctx, mb, mi);
 }
 
-# lower an OP_VEC_BUILD into `mir.MIR_VEC_BUILD (dst) <- (lane0), (lane1), ...`
-#
-# One operand per lane, in lane order, so the operand count is the vector's lane
-# count rather than a constant. `width` is the vector's; there is no single source
-# width to record, because every lane is the element's, which `vec_lane` already
-# carries.
-#
-# Reachable only where `MachineModel.has_vec_build` is set - `lower_vector_lit`
-# assembles a literal through storage on every other target, so the opcode is never
-# formed there at all.
-# ---
-# ctx:  the per-function lowering context
-# mb:   the destination MIR block
-# inst: the IR OP_VEC_BUILD instruction
-# iid:  the IR instruction id
-# ret:  true on success, or a lowering / allocation error
-fun lower_vec_build(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[bool, str] {
+fun lower_vec_build(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[R.Void, str] {
     val dst: u32 = lctx.instr_vreg(ctx, iid);
     if (dst == mir.MIR_VREG_NIL) {
-        ret R.err[bool, str]("mir.lower_ir: vector build defines no result vreg");
+        ret R.err[R.Void, str]("mir.lower_ir: vector build defines no result vreg");
     }
     if (inst.operand_count == 0) {
-        ret R.err[bool, str]("mir.lower_ir: vector build with no lanes");
+        ret R.err[R.Void, str]("mir.lower_ir: vector build with no lanes");
     }
 
     val n: u32 = inst.operand_count + 1;
     val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, n::usize);
-    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](r)); }
+    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](r)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
     ops[0] = mir.op_vreg(dst);
     var i: u32 = 0;
@@ -2478,73 +1395,28 @@ fun lower_vec_build(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruc
     ret lctx.push_instr(ctx, mb, mi);
 }
 
-# lower an OP_LOAD into `mir.MIR_LOAD (dst) <- [ptr]`
-#
-# Operand 0 is the pointer; a pointer that lowers to a vreg becomes the MEM base
-# (so an alloca address resolves to `[rbp + offset]` and a runtime pointer to
-# `[reg]`), while a symbol / immediate pointer is left as a plain operand for the
-# encoder to form its own reference. The result vreg is the loaded value.
-#
-# A FLOAT load is a plain mir.MIR_MOV whose result is an XMM-class vreg; the encoder
-# dispatches it on operand class and materializes a MOVSS / MOVSD off the resolved
-# operand WITHOUT recording a symbol relocation (that path has no patch-site hook).
-# A global / function symbol pointer must therefore be LEA-materialized into a GP
-# base vreg first (the LEA carries the relocation through the generic path), so the
-# float load addresses `[base]` rather than an unrelocated `[rip+sym]` that would
-# read the wrong address. An integer load keeps the symbol operand: its generic
-# encoding records the relocation directly.
-#
-# That is a FLAT-ADDRESSING repair and is gated on it (#2655). Under a logical
-# addressing model there is no `[rip+sym]` to leave unrelocated and no address to
-# materialize: a variable IS its pointer, at one pointee type, and rewriting the
-# operand to `[base + 0]` only destroys the direct reference the target reaches it
-# through. Applying it there made a scalar float interface variable unencodable in
-# either direction while an integer or vector one worked, from identical IR.
-# ---
-# ctx:  the per-function lowering context
-# mb:   the destination MIR block
-# inst: the IR OP_LOAD instruction
-# iid:  the IR instruction id
-# ret:  true on success, or a lowering / allocation error
-fun lower_load(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[bool, str] {
+fun lower_load(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[R.Void, str] {
     if (inst.operand_count == 0) {
-        ret R.err[bool, str]("mir.lower_ir: load with no pointer operand");
+        ret R.err[R.Void, str]("mir.lower_ir: load with no pointer operand");
     }
     val dst: u32 = lctx.instr_vreg(ctx, iid);
     if (dst == mir.MIR_VREG_NIL) {
-        ret R.err[bool, str]("mir.lower_ir: load defines no result vreg");
+        ret R.err[R.Void, str]("mir.lower_ir: load defines no result vreg");
     }
     var mem: mir.MirOperand = lctx.mem_operand_of(ctx, inst.operands[0]);
     if (ctx.tgt.model.flat_addressing && mem.kind == mir.MIR_OP_SYM && lctx.value_is_float(ctx, inst.ty)) {
         var base: u32 = mir.MIR_VREG_NIL;
-        val ar: R.Result[bool, str] = lctx.addr_to_vreg(ctx, mb, mem, ?base);
-        if (R.is_err[bool, str](ar)) { ret R.err[bool, str](R.unwrap_err[bool, str](ar)); }
+        val ar: R.Result[R.Void, str] = lctx.addr_to_vreg(ctx, mb, mem, ?base);
+        if (R.is_err[R.Void, str](ar)) { ret ar; }
         mem = mir.op_mem_value(base, 0);
     }
     val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
-    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](r)); }
+    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](r)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
     ops[0] = mir.op_vreg(dst);
     ops[1] = mem;
-    # the load accesses memory at the loaded result type's width (`src_width`) but
-    # must DEFINE the full register it lands in (`width`): a sub-word load of a
-    # scalar leaves the upper register bits undefined, and a downstream wider use
-    # (e.g. a mixed-width integer compare reading the value at the other operand's
-    # width) would read that garbage. clamping the destination width to
-    # `mir.ALU_MIN_WIDTH` - the same full-register-definition invariant `lctx.clamp_alu_width`
-    # gives a sub-word ALU result - makes the backend zero-extend the load into a
-    # clean register (a wider load keeps its own width, so width == src_width there).
-    #
-    # The two widths are now asked as two questions (#2697). The ACCESS touches the
-    # type's own bytes, so a 12-byte `i32x3` reads 12; the REGISTER it lands in is
-    # the vector register, so it is defined at 16. They coincide for every scalar
-    # and for a full-width vector, which is why one question sufficed until
-    # lane-derived layout made them differ.
     val acc_w: u8 = lctx.mem_width_of(ctx, inst.ty);
     val reg_w: u8 = lctx.op_width_of(ctx, inst.ty);
-    # the mirror of the store: a vector narrower than its register cannot be read in
-    # one access either, and over-reading to the register's width would fault at a
-    # page boundary rather than merely read rubbish.
     if (lctx.subwidth_vector_memory(ctx, inst.ty)) {
         ret lctx.load_subwidth_vector(ctx, mb, ops[0], ops[1], inst.ty);
     }
@@ -2553,72 +1425,34 @@ fun lower_load(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction,
     ret lctx.push_instr(ctx, mb, mi);
 }
 
-# lower an OP_STORE into `mir.MIR_STORE [ptr] <- (value)`
-#
-# The IR operand order is `[value, ptr]`; the MIR destination (operand 0) is the
-# pointer's MEM reference and operand 1 is the stored value, matching the store
-# convention the ABI lowering and the encoder share (operand 0 = memory
-# destination). A store whose value is an aggregate is a storage-to-storage copy:
-# the value operand is the source aggregate's storage pointer (aggregates flow by
-# address - see the lower-expr aggregate-rvalue rules), so it is expanded into a
-# sized memcpy rather than a single scalar store.
-# ---
-# ctx:  the per-function lowering context
-# mb:   the destination MIR block
-# inst: the IR OP_STORE instruction
-# ret:  true on success, or a lowering / allocation error
-fun lower_store(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction) R.Result[bool, str] {
+fun lower_store(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction) R.Result[R.Void, str] {
     if (inst.operand_count < 2) {
-        ret R.err[bool, str]("mir.lower_ir: store missing value or pointer operand");
+        ret R.err[R.Void, str]("mir.lower_ir: store missing value or pointer operand");
     }
     if (lctx.value_is_aggregate(ctx, inst.operands[0].ty)) {
         ret lower_store_aggregate(ctx, mb, inst);
     }
-    # the stored scalar value. a global / function symbol lowers to its address as
-    # an rvalue (`mir.op_sym`), and x86-64 cannot store a 64-bit symbol address straight
-    # to memory (the encoder's mem-to-mem split would load the symbol's contents, not
-    # its address) - so a symbol value is LEA-materialized into a register first,
-    # mirroring the aggregate / by-reference / sret paths.
     var stored: mir.MirOperand = lctx.lower_value(ctx, inst.operands[0]);
     if (stored.kind == mir.MIR_OP_SYM) {
         var addr: u32 = mir.MIR_VREG_NIL;
-        val ar: R.Result[bool, str] = lctx.addr_to_vreg(ctx, mb, stored, ?addr);
-        if (R.is_err[bool, str](ar)) { ret ar; }
+        val ar: R.Result[R.Void, str] = lctx.addr_to_vreg(ctx, mb, stored, ?addr);
+        if (R.is_err[R.Void, str](ar)) { ret ar; }
         stored = mir.op_vreg(addr);
     }
-    # a FLOAT store is a plain mir.MIR_MOV whose stored value is an XMM-class vreg; the
-    # encoder dispatches it on operand class and records no symbol relocation for its
-    # destination MEM. a global symbol destination must therefore be LEA-materialized
-    # into a GP base vreg first (so the store addresses `[base]`), mirroring the
-    # float-load path; an integer store keeps the symbol destination and relocates
-    # through the generic encoding. gated on flat addressing for the same reason the
-    # load is (#2655).
     var dest: mir.MirOperand = lctx.mem_operand_of(ctx, inst.operands[1]);
     if (ctx.tgt.model.flat_addressing && dest.kind == mir.MIR_OP_SYM && lctx.value_is_float(ctx, inst.operands[0].ty)) {
         var dbase: u32 = mir.MIR_VREG_NIL;
-        val dr: R.Result[bool, str] = lctx.addr_to_vreg(ctx, mb, dest, ?dbase);
-        if (R.is_err[bool, str](dr)) { ret R.err[bool, str](R.unwrap_err[bool, str](dr)); }
+        val dr: R.Result[R.Void, str] = lctx.addr_to_vreg(ctx, mb, dest, ?dbase);
+        if (R.is_err[R.Void, str](dr)) { ret dr; }
         dest = mir.op_mem_value(dbase, 0);
     }
     val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
-    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](r)); }
+    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](r)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
     ops[0] = dest;
     ops[1] = stored;
-    # the store accesses memory at the stored value's type width (IR operand 0);
-    # the store result is void, so the value type is the only width carrier.
-    #
-    # The ACCESS is the type's own footprint and the SOURCE is the register the
-    # value rides in (#2697). For a sub-register-width vector these differ: an
-    # `i32x3` is 16 bytes in a vector register and 12 in memory, and storing it at
-    # the register's width overruns whatever follows - `rec Packed { v: i32x3;
-    # guard: i32; }` reads `guard` back as 0. A store whose access width the ISA
-    # cannot issue in one go is split by `be.codegen.legalize`.
     val st_w: u8 = lctx.mem_width_of(ctx, inst.operands[0].ty);
     val src_w: u8 = lctx.op_width_of(ctx, inst.operands[0].ty);
-    # a sub-register-width vector cannot be stored in one access: the register is
-    # wider than the object, and writing the register's width overruns the
-    # neighbour.
     if (lctx.subwidth_vector_memory(ctx, inst.operands[0].ty)) {
         ret lctx.store_subwidth_vector(ctx, mb, ops[0], ops[1], inst.operands[0].ty);
     }
@@ -2626,32 +1460,12 @@ fun lower_store(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
     ret lctx.push_instr(ctx, mb, mi);
 }
 
-# expand an OP_STORE of an aggregate into a memcpy between two storage pointers
-#
-# Both IR operands are pointers to storage (operand 0 = source aggregate address,
-# operand 1 = destination address), matching the by-address convention aggregate
-# rvalues flow under. The copy walks the aggregate in 8-byte chunks, finishing any
-# 4/2/1-byte tail, emitting a `mir.MIR_LOAD scratch <- [src + off]` /
-# `mir.MIR_STORE [dst + off] <- scratch` pair per chunk. A fresh scratch vreg per
-# chunk keeps each load/store independent for the register allocator. A zero-sized
-# aggregate copies nothing.
-# ---
-# ctx:  the per-function lowering context
-# mb:   the destination MIR block
-# inst: the IR OP_STORE instruction with aggregate operands
-# ret:  true on success, or a lowering / allocation error
-fun lower_store_aggregate(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction) R.Result[bool, str] {
-    val size: u32 = ir_type.byte_size(ctx.types, inst.operands[0].ty, ctx.tgt);
+fun lower_store_aggregate(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction) R.Result[R.Void, str] {
+    val size: u32 = ir_type.byte_size_for_machine(ctx.types, inst.operands[0].ty, ctx.layout);
 
-    # a logical-addressing target keeps the whole-object form (#2911), for the same
-    # reason MIR_MEMZERO does: the chunk run below is sized for the machine word, so
-    # a chunk spans member boundaries and every access it makes is an address INTO
-    # the storage rather than a name for the object. There is no structural access
-    # that expresses either, and the intent cannot be recovered from the run
-    # afterwards.
     if (!ctx.tgt.model.flat_addressing) {
         val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 3::usize);
-        if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](r)); }
+        if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](r)); }
         val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
         ops[0] = agg_pointer_mem(ctx, inst.operands[1], 0);
         ops[1] = agg_pointer_mem(ctx, inst.operands[0], 0);
@@ -2669,59 +1483,38 @@ fun lower_store_aggregate(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.I
         val dst: mir.MirOperand = agg_pointer_mem(ctx, inst.operands[1], off);
 
         val tr: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
-        if (R.is_err[u32, str](tr)) { ret R.err[bool, str](R.unwrap_err[u32, str](tr)); }
+        if (R.is_err[u32, str](tr)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](tr)); }
         val tmp: u32 = R.unwrap_ok[u32, str](tr);
 
         val ldr: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
-        if (R.is_err[*mir.MirOperand, str](ldr)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](ldr)); }
+        if (R.is_err[*mir.MirOperand, str](ldr)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](ldr)); }
         val ldops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](ldr);
         ldops[0] = mir.op_vreg(tmp);
         ldops[1] = src;
         var ld: mir.MirInstr = mir.instr(mir.MIR_LOAD, ldops, 2, chunk, chunk);
-        val pl: R.Result[bool, str] = lctx.push_instr(ctx, mb, ld);
-        if (R.is_err[bool, str](pl)) { ret pl; }
+        val pl: R.Result[R.Void, str] = lctx.push_instr(ctx, mb, ld);
+        if (R.is_err[R.Void, str](pl)) { ret pl; }
 
-        val st: R.Result[bool, str] = lctx.push_store_chunk(ctx, mb, dst, mir.op_vreg(tmp), chunk);
-        if (R.is_err[bool, str](st)) { ret st; }
+        val st: R.Result[R.Void, str] = lctx.push_store_chunk(ctx, mb, dst, mir.op_vreg(tmp), chunk);
+        if (R.is_err[R.Void, str](st)) { ret st; }
 
         off = off + chunk::i64;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# expand an OP_MEMZERO into a sized zero-fill of the destination aggregate's storage
-#
-# Operand 0 is the destination pointer and `aux_ty` is the pointee aggregate type
-# whose `byte_size` is the byte count to clear (operand 0 is an untyped IRT_PTR, so
-# the size cannot come from its `.ty` - it must come from `aux_ty`). Mirrors
-# `lower_store_aggregate`, but each chunk stores an immediate 0 (`MOV [mem], 0`)
-# rather than a value loaded from a source - no scratch register and no source
-# read. The fill walks 8/4/2/1-byte chunks so a 4/2/1-byte tail clears exactly its
-# bytes without writing past the aggregate. A zero-sized aggregate clears nothing.
-# ---
-# ctx:  the per-function lowering context
-# mb:   the destination MIR block
-# inst: the IR OP_MEMZERO instruction
-# ret:  true on success, or a lowering / allocation error
-fun lower_memzero(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction) R.Result[bool, str] {
+fun lower_memzero(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction) R.Result[R.Void, str] {
     if (inst.operand_count < 1) {
-        ret R.err[bool, str]("mir.lower_ir: memzero missing destination pointer operand");
+        ret R.err[R.Void, str]("mir.lower_ir: memzero missing destination pointer operand");
     }
     if (inst.aux_ty == ir_type.IRT_NIL) {
-        ret R.err[bool, str]("mir.lower_ir: memzero is missing its pointee type");
+        ret R.err[R.Void, str]("mir.lower_ir: memzero is missing its pointee type");
     }
-    val size: u32 = ir_type.byte_size(ctx.types, inst.aux_ty, ctx.tgt);
+    val size: u32 = ir_type.byte_size_for_machine(ctx.types, inst.aux_ty, ctx.layout);
 
-    # a logical-addressing target keeps the whole-object form (#2669). The chunked
-    # store run below is a byte-space expansion: its stores are sized for the
-    # machine, not for the object, so an 8-byte chunk over a `f32x4` spans two lanes
-    # and there is no structural access that names it. Recovering the intent from
-    # such a run afterwards would mean pattern-matching the chunking strategy, which
-    # breaks silently on partial zeroing, an interleaved store, or a change of chunk
-    # widths - so the intent is kept rather than reconstructed.
     if (!ctx.tgt.model.flat_addressing) {
         val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
-        if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](r)); }
+        if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](r)); }
         val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
         ops[0] = agg_pointer_mem(ctx, inst.operands[0], 0);
         ops[1] = mir.op_imm(size::i64);
@@ -2735,27 +1528,14 @@ fun lower_memzero(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instructi
         val chunk: u8 = lctx.copy_chunk_width(ctx.tgt, (size - off::u32)::u64);
 
         val dst: mir.MirOperand = agg_pointer_mem(ctx, inst.operands[0], off);
-        val st: R.Result[bool, str] = lctx.push_store_chunk(ctx, mb, dst, mir.op_imm(0), chunk);
-        if (R.is_err[bool, str](st)) { ret st; }
+        val st: R.Result[R.Void, str] = lctx.push_store_chunk(ctx, mb, dst, mir.op_imm(0), chunk);
+        if (R.is_err[R.Void, str](st)) { ret st; }
 
         off = off + chunk::i64;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# form the MEM operand addressing an aggregate's storage at a byte displacement
-#
-# Given the IR Value naming the storage pointer: a pointer that lowers to a value
-# vreg (an alloca result or runtime pointer) becomes a value-vreg `[base + disp]`
-# MEM operand; a global aggregate lowers to a symbol whose storage is addressed
-# `[rip + sym + disp]`, the displacement riding in the symbol addend. Matches
-# `lctx.mem_operand_of`'s base disambiguation, extended with the displacement the
-# per-chunk copy needs.
-# ---
-# ctx:  the per-function lowering context
-# v:    the IR Value naming the aggregate's storage pointer
-# disp: the byte displacement into the storage
-# ret:  the MEM operand addressing `storage + disp`
 fun agg_pointer_mem(ctx: *lctx.LowerCtx, v: value.Value, disp: i64) mir.MirOperand {
     val op: mir.MirOperand = lctx.lower_value(ctx, v);
     if (op.kind == mir.MIR_OP_VREG) { ret mir.op_mem_value(op.vreg, disp); }
@@ -2767,52 +1547,25 @@ fun agg_pointer_mem(ctx: *lctx.LowerCtx, v: value.Value, disp: i64) mir.MirOpera
     ret op;
 }
 
-# lower an OP_GEP into `mir.MIR_GEP (dst) <- [base + index*scale + disp]`
-#
-# Selected to LEA, folding the index walk into the effective address. The IR
-# operands are `[base, idx0, idx1, ...]` and the instruction's `aux_ty` is the
-# source pointee type the walk starts from (the base pointer itself is untyped, so
-# element/field sizes come from `aux_ty` via `ir_type.byte_size`). The walk follows
-# the standard getelementptr model: index 0 strides over `aux_ty`, and each later
-# index descends one aggregate level (an array element stride, or a constant
-# struct-field offset). Constant index contributions fold into the displacement; at
-# most one runtime index folds into the SIB `index*scale` term, and a scale that is
-# not 1/2/4/8 (or a second runtime index) is materialized into a register with
-# explicit mir.MIR_MUL / mir.MIR_ADD before the LEA.
-# ---
-# ctx:  the per-function lowering context
-# mb:   the destination MIR block
-# inst: the IR OP_GEP instruction
-# iid:  the IR instruction id
-# ret:  true on success, or a lowering / allocation error
-fun lower_gep(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[bool, str] {
+fun lower_gep(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[R.Void, str] {
     if (inst.operand_count == 0) {
-        ret R.err[bool, str]("mir.lower_ir: gep with no base operand");
+        ret R.err[R.Void, str]("mir.lower_ir: gep with no base operand");
     }
     val dst: u32 = lctx.instr_vreg(ctx, iid);
     if (dst == mir.MIR_VREG_NIL) {
-        ret R.err[bool, str]("mir.lower_ir: gep defines no result vreg");
+        ret R.err[R.Void, str]("mir.lower_ir: gep defines no result vreg");
     }
 
     val base: mir.MirOperand = lctx.mem_operand_of(ctx, inst.operands[0]);
 
-    # the index walk needs the source pointee type to size each level; a GEP that
-    # carries indices but no source type is a lowering bug, not silently foldable.
     if (inst.operand_count > 1 && inst.aux_ty == ir_type.IRT_NIL) {
-        ret R.err[bool, str]("mir.lower_ir: gep with indices is missing its source pointee type");
+        ret R.err[R.Void, str]("mir.lower_ir: gep with indices is missing its source pointee type");
     }
 
-    # a logical-addressing target reaches a member by ORDINAL, not by byte, so the
-    # walk is kept rather than folded (#2649). the fold below is a byte-space
-    # transformation and is not merely slower there, it is unrecoverable: an offset
-    # does not determine an ordinal, because unions overlap, a nested aggregate
-    # shares an offset with its first member, and padding belongs to no member.
     if (!ctx.tgt.model.flat_addressing) {
         ret lower_gep_structural(ctx, mb, inst, dst, base);
     }
 
-    # walk the indices, accumulating a constant displacement and at most one
-    # scaled runtime index. a struct level needs a constant field ordinal.
     var disp:      i64 = 0;
     var idx_vreg:  u32 = mir.MIR_VREG_NIL;
     var idx_scale: u8  = 0;
@@ -2823,124 +1576,76 @@ fun lower_gep(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, 
         val v: value.Value = inst.operands[k];
         val is_first: bool = k == 1;
 
-        # determine the stride for this level and the type one level deeper. the
-        # first index strides over the source pointee `cur_ty` without descending;
-        # subsequent indices descend into the array element / struct field.
         var stride:    u64 = 0;
         var is_struct: bool = false;
         if (is_first) {
-            stride = ir_type.byte_size(ctx.types, cur_ty, ctx.tgt)::u64;
+            stride = ir_type.byte_size_for_machine(ctx.types, cur_ty, ctx.layout)::u64;
         } or {
             val ct_opt: O.Option[*ir_type.IrType] = ir_type.get(ctx.types, cur_ty);
             if (!O.is_some[*ir_type.IrType](ct_opt)) {
-                ret R.err[bool, str]("mir.lower_ir: gep index walks off a non-aggregate type");
+                ret R.err[R.Void, str]("mir.lower_ir: gep index walks off a non-aggregate type");
             }
             val ct: *ir_type.IrType = O.unwrap[*ir_type.IrType](ct_opt);
             if (ct.kind == ir_type.IRT_ARRAY) {
-                stride = ir_type.byte_size(ctx.types, ct.data.array_.element, ctx.tgt)::u64;
+                stride = ir_type.byte_size_for_machine(ctx.types, ct.data.array_.element, ctx.layout)::u64;
                 cur_ty = ct.data.array_.element;
             } or (ct.kind == ir_type.IRT_VECTOR) {
-                # a vector indexes by LANE, at the element's stride: its storage is
-                # exactly `lanes` elements end to end, the same walk an array of the
-                # element type takes. Vector storage is allocated at the vector's own
-                # type rather than reshaped to `[lanes]elem` (#2640), so this is the
-                # level a lane address descends through.
-                stride = ir_type.byte_size(ctx.types, ct.data.vector_.element, ctx.tgt)::u64;
+                stride = ir_type.byte_size_for_machine(ctx.types, ct.data.vector_.element, ctx.layout)::u64;
                 cur_ty = ct.data.vector_.element;
             } or (ct.kind == ir_type.IRT_STRUCT || ct.kind == ir_type.IRT_UNION) {
                 is_struct = true;
             } or {
-                ret R.err[bool, str]("mir.lower_ir: gep index into a non-aggregate type");
+                ret R.err[R.Void, str]("mir.lower_ir: gep index into a non-aggregate type");
             }
         }
 
         if (is_struct) {
-            # struct-field index: must be a constant ordinal; fold its byte offset.
             if (v.kind != value.VAL_CONST_INT) {
-                ret R.err[bool, str]("mir.lower_ir: gep struct field index must be constant");
+                ret R.err[R.Void, str]("mir.lower_ir: gep struct field index must be constant");
             }
             val field_ix: u32 = v.data.int_lit::u32;
             val fo: R.Result[i64, str] = struct_field_offset(ctx, cur_ty, field_ix);
-            if (R.is_err[i64, str](fo)) { ret R.err[bool, str](R.unwrap_err[i64, str](fo)); }
+            if (R.is_err[i64, str](fo)) { ret R.err[R.Void, str](R.unwrap_err[i64, str](fo)); }
             disp = disp + R.unwrap_ok[i64, str](fo);
             val ft: R.Result[ir_type.IrTypeId, str] = struct_field_type(ctx, cur_ty, field_ix);
-            if (R.is_err[ir_type.IrTypeId, str](ft)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](ft)); }
+            if (R.is_err[ir_type.IrTypeId, str](ft)) { ret R.err[R.Void, str](R.unwrap_err[ir_type.IrTypeId, str](ft)); }
             cur_ty = R.unwrap_ok[ir_type.IrTypeId, str](ft);
             k = k + 1;
             cnt;
         }
 
         if (v.kind == value.VAL_CONST_INT) {
-            # constant array / pointer index: fold the scaled offset.
             disp = disp + (v.data.int_lit * stride)::i64;
             k = k + 1;
             cnt;
         }
 
-        # runtime index: fold into the SIB index*scale when possible, else
-        # materialize the scaling explicitly. the chosen scale rides back through
-        # `?new_scale`, and the new accumulator vreg is the result.
         var new_scale: u8 = 0;
         val ir: R.Result[u32, str] = fold_runtime_index(ctx, mb, lctx.lower_value(ctx, v), stride, idx_vreg, idx_scale, ?new_scale);
-        if (R.is_err[u32, str](ir)) { ret R.err[bool, str](R.unwrap_err[u32, str](ir)); }
+        if (R.is_err[u32, str](ir)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](ir)); }
         idx_vreg  = R.unwrap_ok[u32, str](ir);
         idx_scale = new_scale;
         k = k + 1;
     }
 
-    # form the folded MEM operand from the base, carrying the scaled index.
     val mem: R.Result[mir.MirOperand, str] = fold_gep_mem(ctx, mb, base, idx_vreg, idx_scale, disp);
-    if (R.is_err[mir.MirOperand, str](mem)) { ret R.err[bool, str](R.unwrap_err[mir.MirOperand, str](mem)); }
+    if (R.is_err[mir.MirOperand, str](mem)) { ret R.err[R.Void, str](R.unwrap_err[mir.MirOperand, str](mem)); }
 
     val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
-    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](r)); }
+    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](r)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
     ops[0] = mir.op_vreg(dst);
     ops[1] = R.unwrap_ok[mir.MirOperand, str](mem);
-    # the GEP selects to a LEA computing a pointer-sized effective address.
     var mi: mir.MirInstr = mir.instr(mir.MIR_GEP, ops, 2,
                                      ctx.tgt.model.gpr_width::u8, ctx.tgt.model.gpr_width::u8);
     ret lctx.push_instr(ctx, mb, mi);
 }
 
-# lower an OP_GEP structurally, keeping its index list, for a logical-addressing
-# target (#2649)
-#
-# The flat form above folds the whole walk into `[base + index*scale + disp]`,
-# because on a byte-addressed machine that IS the address. Under a logical
-# addressing model a pointer names one object at one pointee type and a member is
-# reached by its ORDINAL, so the walk has to survive lowering: the emitter builds an
-# `OpAccessChain` from exactly these indices.
-#
-# THE OPERAND LAYOUT IS THE CONTRACT. A structural GEP is
-# `[dst, base, idx0, idx1, ...]` - `operand_count > 2` - where the indices are the
-# IR GEP's own index operands in order, unchanged and unscaled, following the
-# standard getelementptr model (index 0 strides over the source pointee type, each
-# later index descends one level). A flat GEP stays `[dst, mem]` at
-# `operand_count == 2`, so a consumer distinguishes the two by the count alone and
-# every machine target's lowering is bit-for-bit what it was.
-#
-# The source pointee type is NOT carried here. It is recoverable at the consumer
-# from what the base names - a global's declared type, or the `MirSlot.ty` of the
-# frame slot a local base's `MIR_ALLOCA` defines - and duplicating it into the
-# operand list would be a second source of truth for a fact the base already fixes.
-#
-# That was only half true when this was written: the global path held, but
-# `lower_alloca` measured `aux_ty` into a size and an align and then discarded the
-# id, so a local base fixed nothing (#2673). `MirSlot` carries the id now, which is
-# what makes the sentence above true of both kinds of base rather than one.
-# ---
-# ctx:  the per-function lowering context
-# mb:   the destination MIR block
-# inst: the IR OP_GEP instruction
-# dst:  the destination vreg
-# base: the lowered base operand
-# ret:  true on success, or a lowering / allocation error
 fun lower_gep_structural(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction,
-                         dst: u32, base: mir.MirOperand) R.Result[bool, str] {
+                         dst: u32, base: mir.MirOperand) R.Result[R.Void, str] {
     val n: usize = (inst.operand_count + 1)::usize;
     val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, n);
-    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](r)); }
+    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](r)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
     ops[0] = mir.op_vreg(dst);
     ops[1] = base;
@@ -2954,23 +1659,6 @@ fun lower_gep_structural(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.In
     ret lctx.push_instr(ctx, mb, mi);
 }
 
-# combine one runtime GEP index into the running scaled-index accumulator
-#
-# With no accumulator yet and a hardware-legal scale, the index rides the SIB
-# `index*scale` term directly and `@scale_out` records that scale. Otherwise the
-# scaling is materialized - `t = index * stride` (mir.MIR_MUL) - and either becomes
-# the accumulator (scale 1) or is added into it (`acc = acc + t`, mir.MIR_ADD), with
-# `@scale_out` set to 1. A non-vreg index operand is a lowering bug (indices are
-# i64 values), rejected loudly.
-# ---
-# ctx:       the per-function lowering context
-# mb:        the destination MIR block
-# idxop:     the lowered runtime index operand (must be a vreg)
-# stride:    the byte stride of this index level
-# acc:       the current accumulator vreg, or mir.MIR_VREG_NIL when none
-# acc_scale: the SIB scale the current accumulator still rides (1 when folded)
-# scale_out: receives the SIB scale the returned accumulator rides
-# ret:       the updated accumulator vreg, or a lowering / allocation error
 fun fold_runtime_index(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, idxop: mir.MirOperand, stride: u64,
                        acc: u32, acc_scale: u8, scale_out: *u8) R.Result[u32, str] {
     if (idxop.kind != mir.MIR_OP_VREG) {
@@ -2983,75 +1671,46 @@ fun fold_runtime_index(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, idxop: mir.MirOpe
         ret R.ok[u32, str](idxv);
     }
 
-    # materialize `t = idxv * stride`.
     val tr: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
     if (R.is_err[u32, str](tr)) { ret R.err[u32, str](R.unwrap_err[u32, str](tr)); }
     val t: u32 = R.unwrap_ok[u32, str](tr);
-    val mr: R.Result[bool, str] = lctx.emit_bin(ctx, mb, mir.MIR_MUL, t, mir.op_vreg(idxv), mir.op_imm(stride::i64));
-    if (R.is_err[bool, str](mr)) { ret R.err[u32, str](R.unwrap_err[bool, str](mr)); }
+    val mr: R.Result[R.Void, str] = lctx.emit_bin(ctx, mb, mir.MIR_MUL, t, mir.op_vreg(idxv), mir.op_imm(stride::i64));
+    if (R.is_err[R.Void, str](mr)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](mr)); }
 
     if (acc == mir.MIR_VREG_NIL) {
         @scale_out = 1;
         ret R.ok[u32, str](t);
     }
 
-    # accumulate `acc = acc * acc_scale + t`. when the existing accumulator still
-    # rode a SIB scale, fold that scale in first so the combined index is scale 1.
     var acc_term: u32 = acc;
     if (acc_scale > 1) {
         val sr: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
         if (R.is_err[u32, str](sr)) { ret R.err[u32, str](R.unwrap_err[u32, str](sr)); }
         acc_term = R.unwrap_ok[u32, str](sr);
-        val smr: R.Result[bool, str] = lctx.emit_bin(ctx, mb, mir.MIR_MUL, acc_term, mir.op_vreg(acc), mir.op_imm(acc_scale::i64));
-        if (R.is_err[bool, str](smr)) { ret R.err[u32, str](R.unwrap_err[bool, str](smr)); }
+        val smr: R.Result[R.Void, str] = lctx.emit_bin(ctx, mb, mir.MIR_MUL, acc_term, mir.op_vreg(acc), mir.op_imm(acc_scale::i64));
+        if (R.is_err[R.Void, str](smr)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](smr)); }
     }
     val ar: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
     if (R.is_err[u32, str](ar)) { ret R.err[u32, str](R.unwrap_err[u32, str](ar)); }
     val sum: u32 = R.unwrap_ok[u32, str](ar);
-    val adr: R.Result[bool, str] = lctx.emit_bin(ctx, mb, mir.MIR_ADD, sum, mir.op_vreg(acc_term), mir.op_vreg(t));
-    if (R.is_err[bool, str](adr)) { ret R.err[u32, str](R.unwrap_err[bool, str](adr)); }
+    val adr: R.Result[R.Void, str] = lctx.emit_bin(ctx, mb, mir.MIR_ADD, sum, mir.op_vreg(acc_term), mir.op_vreg(t));
+    if (R.is_err[R.Void, str](adr)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](adr)); }
     @scale_out = 1;
     ret R.ok[u32, str](sum);
 }
 
-# true when a byte stride is a hardware SIB scale (1, 2, 4, or 8)
-# ---
-# s:   the byte stride to test
-# ret: true for 1, 2, 4, or 8
 fun is_sib_scale(s: u64) bool {
     ret s == 1 || s == 2 || s == 4 || s == 8;
 }
 
-# build the final folded MEM operand for a GEP
-#
-# Combines the base operand, the scaled runtime index (mir.MIR_VREG_NIL when none),
-# and the constant displacement. A value-vreg base carries the index in the SIB
-# position; a symbol base with only a constant offset folds into `sym_off` (a pure
-# `[rip+sym+off]` reference), and a symbol base with a runtime index
-# LEA-materializes the symbol address into a value vreg first (`lctx.addr_to_vreg`)
-# so the scaled index has a register base to ride. A constant-address base (a null
-# or integer pointer, e.g. a `null` argument inlined into a pointer parameter the
-# callee GEPs) materializes the constant into a value vreg and indexes
-# `[base + idx*scale + disp]` off it.
-# ---
-# ctx:       the per-function lowering context
-# mb:        the destination MIR block
-# base:      the lowered base operand (mem, symbol, or immediate address)
-# idx_vreg:  the scaled runtime index vreg, or mir.MIR_VREG_NIL when none
-# idx_scale: the SIB scale for `idx_vreg`
-# disp:      the constant byte displacement folded into the address
-# ret:       the folded MEM operand, or a lowering / allocation error
 fun fold_gep_mem(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, base: mir.MirOperand, idx_vreg: u32, idx_scale: u8, disp: i64) R.Result[mir.MirOperand, str] {
     var o: mir.MirOperand = base;
     if (base.kind == mir.MIR_OP_IMM) {
-        # the base is a compile-time address; MOV it into a value vreg so the LEA /
-        # load / store has a register base to fold the constant displacement and the
-        # optional scaled index against.
         val vr: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
         if (R.is_err[u32, str](vr)) { ret R.err[mir.MirOperand, str](R.unwrap_err[u32, str](vr)); }
         val vbase: u32 = R.unwrap_ok[u32, str](vr);
-        val mv: R.Result[bool, str] = lctx.emit_mov(ctx, mb, mir.op_vreg(vbase), mir.op_imm(base.imm));
-        if (R.is_err[bool, str](mv)) { ret R.err[mir.MirOperand, str](R.unwrap_err[bool, str](mv)); }
+        val mv: R.Result[R.Void, str] = lctx.emit_mov(ctx, mb, mir.op_vreg(vbase), mir.op_imm(base.imm));
+        if (R.is_err[R.Void, str](mv)) { ret R.err[mir.MirOperand, str](R.unwrap_err[R.Void, str](mv)); }
         var m: mir.MirOperand = mir.op_mem_value(vbase, disp);
         if (idx_vreg != mir.MIR_VREG_NIL) {
             m.index         = idx_vreg;
@@ -3061,9 +1720,6 @@ fun fold_gep_mem(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, base: mir.MirOperand, i
         ret R.ok[mir.MirOperand, str](m);
     }
     if (base.kind == mir.MIR_OP_MEM) {
-        # a value-pointer / physical-register / frame-slot-key base all fold the
-        # constant displacement into `imm`; the encoder resolves a slot key to
-        # `[rbp + off]` and can still carry the SIB index alongside.
         o.imm = base.imm + disp;
         if (idx_vreg != mir.MIR_VREG_NIL) {
             o.index         = idx_vreg;
@@ -3077,14 +1733,9 @@ fun fold_gep_mem(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, base: mir.MirOperand, i
             o.sym_off = base.sym_off + disp::i32;
             ret R.ok[mir.MirOperand, str](o);
         }
-        # runtime index against a global: there is no register in a `[rip+sym]`
-        # reference to scale the index into, so LEA the symbol address (carrying
-        # its `sym_off`) into a value vreg and index `[base + idx*scale + disp]`
-        # off that register, the same materialization `lctx.addr_to_vreg` performs for
-        # by-reference aggregate placement.
         var sbase: u32 = mir.MIR_VREG_NIL;
-        val ar: R.Result[bool, str] = lctx.addr_to_vreg(ctx, mb, base, ?sbase);
-        if (R.is_err[bool, str](ar)) { ret R.err[mir.MirOperand, str](R.unwrap_err[bool, str](ar)); }
+        val ar: R.Result[R.Void, str] = lctx.addr_to_vreg(ctx, mb, base, ?sbase);
+        if (R.is_err[R.Void, str](ar)) { ret R.err[mir.MirOperand, str](R.unwrap_err[R.Void, str](ar)); }
         var m: mir.MirOperand = mir.op_mem_value(sbase, disp);
         m.index         = idx_vreg;
         m.scale         = idx_scale;
@@ -3094,23 +1745,6 @@ fun fold_gep_mem(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, base: mir.MirOperand, i
     ret R.err[mir.MirOperand, str]("mir.lower_ir: gep base is neither a memory nor a symbol reference");
 }
 
-# byte offset of field `ix` within an IRT_STRUCT
-#
-# The arithmetic is `ir_type.byte_offset`, the one shared layout policy every other
-# offset consumer already reads. This function used to re-derive it here with its own
-# round_up over each field's alignment, which is how a `#[packed]` record (#2715) came
-# to have correct `$offset_of` answers and stores placed at the NATURAL offsets: the
-# intrinsics went through the shared policy, the code generation went through this
-# copy, and neither could tell it was disagreeing with the other. There is no second
-# layout policy for a decorator to have to be taught twice.
-#
-# The shape checks stay: they name a malformed GEP the verifier should have caught,
-# which is a different question from where a well-formed field sits.
-# ---
-# ctx:       the per-function lowering context
-# struct_ty: the IR struct / union type id
-# ix:        the field ordinal
-# ret:       the field's byte offset, or a lowering error
 fun struct_field_offset(ctx: *lctx.LowerCtx, struct_ty: ir_type.IrTypeId, ix: u32) R.Result[i64, str] {
     val st_opt: O.Option[*ir_type.IrType] = ir_type.get(ctx.types, struct_ty);
     if (!O.is_some[*ir_type.IrType](st_opt)) {
@@ -3129,15 +1763,9 @@ fun struct_field_offset(ctx: *lctx.LowerCtx, struct_ty: ir_type.IrTypeId, ix: u3
     if (ix >= st.data.struct_.field_count) {
         ret R.err[i64, str]("mir.lower_ir: gep struct field index out of range");
     }
-    ret R.ok[i64, str](ir_type.byte_offset(ctx.types, struct_ty, ix, ctx.tgt)::i64);
+    ret R.ok[i64, str](ir_type.byte_offset_for_machine(ctx.types, struct_ty, ix, ctx.layout)::i64);
 }
 
-# the IR type of field `ix` within an IRT_STRUCT or IRT_UNION
-# ---
-# ctx:       the per-function lowering context
-# struct_ty: the IR struct / union type id
-# ix:        the field ordinal
-# ret:       the field's IR type id, or a lowering error
 fun struct_field_type(ctx: *lctx.LowerCtx, struct_ty: ir_type.IrTypeId, ix: u32) R.Result[ir_type.IrTypeId, str] {
     val st_opt: O.Option[*ir_type.IrType] = ir_type.get(ctx.types, struct_ty);
     if (!O.is_some[*ir_type.IrType](st_opt)) {
@@ -3150,17 +1778,12 @@ fun struct_field_type(ctx: *lctx.LowerCtx, struct_ty: ir_type.IrTypeId, ix: u32)
     ret R.ok[ir_type.IrTypeId, str](st.data.struct_.fields[ix]);
 }
 
-# builds a one-function module whose block 3 merges a diamond through an i64 phi, and
-# lowers it for linux-x86_64. `cover_both` selects whether the phi carries an incoming
-# for BOTH predecessor edges or only for block 1, which is the malformed input
-# ---
-# out_err: set to the lowering error message when lowering fails
-# ret:     true when lowering succeeded
 fun t_lower_diamond_phi(alloc: *A.Allocator, cover_both: bool, out_err: *str) bool {
     out_err[0] = nil;
 
     var reg: treg.TargetRegistry = treg.registry_init();
-    if (R.is_err[bool, str](treg.register_all(?reg))) { ret false; }
+    fin { treg.registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](treg.register_all(?reg, target_testing.debug_descriptor))) { ret false; }
     val tr: R.Result[target.Target, str] = treg.select(?reg, "x86_64", "linux", "sysv64");
     if (R.is_err[target.Target, str](tr)) { ret false; }
     var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
@@ -3195,30 +1818,30 @@ fun t_lower_diamond_phi(alloc: *A.Allocator, cover_both: bool, out_err: *str) bo
     val c: value.Value = value.const_int(0, i64ty);
 
     builder.set_block(?bld, bids[0]);
-    if (R.is_err[bool, str](builder.emit_cbr(?bld, value.const_int(1, i64ty), bids[1], bids[2]))) { ret false; }
+    if (R.is_err[R.Void, str](builder.emit_cbr(?bld, value.const_int(1, i64ty), bids[1], bids[2]))) { ret false; }
 
     builder.set_block(?bld, bids[1]);
     val lv: R.Result[value.Value, str] = builder.emit_add(?bld, c, c);
     if (R.is_err[value.Value, str](lv)) { ret false; }
     val l: value.Value = R.unwrap_ok[value.Value, str](lv);
-    if (R.is_err[bool, str](builder.emit_br(?bld, bids[3]))) { ret false; }
+    if (R.is_err[R.Void, str](builder.emit_br(?bld, bids[3]))) { ret false; }
 
     builder.set_block(?bld, bids[2]);
     val rv: R.Result[value.Value, str] = builder.emit_add(?bld, c, c);
     if (R.is_err[value.Value, str](rv)) { ret false; }
     val rt: value.Value = R.unwrap_ok[value.Value, str](rv);
-    if (R.is_err[bool, str](builder.emit_br(?bld, bids[3]))) { ret false; }
+    if (R.is_err[R.Void, str](builder.emit_br(?bld, bids[3]))) { ret false; }
 
     builder.set_block(?bld, bids[3]);
     val pv: R.Result[value.Value, str] = builder.emit_phi(?bld, i64ty);
     if (R.is_err[value.Value, str](pv)) { ret false; }
     val p: value.Value = R.unwrap_ok[value.Value, str](pv);
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, p, bids[1], l))) { ret false; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, p, bids[1], l))) { ret false; }
     if (cover_both) {
-        if (R.is_err[bool, str](builder.phi_add_incoming(?bld, p, bids[2], rt))) { ret false; }
+        if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, p, bids[2], rt))) { ret false; }
     }
     if (R.is_err[value.Value, str](builder.emit_add(?bld, p, c))) { ret false; }
-    if (R.is_err[bool, str](builder.emit_ret_void(?bld)))         { ret false; }
+    if (R.is_err[R.Void, str](builder.emit_ret_void(?bld)))         { ret false; }
 
     val lr: R.Result[mir.MirModule, str] = lower_ir(?tgt, ?m, alloc, ?itn, ?smap);
     if (R.is_err[mir.MirModule, str](lr)) {
@@ -3228,24 +1851,16 @@ fun t_lower_diamond_phi(alloc: *A.Allocator, cover_both: bool, out_err: *str) bo
     ret true;
 }
 
-# out-of-SSA is total: a phi's result vreg must be defined on every path into its
-# block, so a predecessor edge with no incoming is a malformed input like the four
-# already handled beside it, not a case to lower. it used to emit no copy at all and
-# leave the merge register read undefined on that path, which is how #2917 became a
-# wrong answer instead of a build failure. the message names the block pair and the
-# result vreg because the pass that dropped the incoming is well upstream of here
 test "mach.lang.be.codegen.mir.lower.lower_block_phis:missing_incoming" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var err: str = nil;
 
-    # positive control: the same diamond with both edges covered lowers cleanly
     if (!t_lower_diamond_phi(?alloc, true, ?err)) { ret 1; }
 
     if (t_lower_diamond_phi(?alloc, false, ?err)) { ret 1; }
     if (err == nil)                                  { ret 1; }
     if (!str_contains(err, "no incoming value"))     { ret 1; }
-    # the phi's own block, the uncovered predecessor, and the merge result
     if (!str_contains(err, "block 3"))               { ret 1; }
     if (!str_contains(err, "block 2"))               { ret 1; }
     if (!str_contains(err, "result vreg"))           { ret 1; }

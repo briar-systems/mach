@@ -1,19 +1,9 @@
-# x86-64 ISA vtable registration
-#
-# this is the composition seam for the x86-64 backend: it imports the ISA
-# definitions (`x64`), the selection rule pack (`x64.rules`), and the byte
-# encoder (`x64.encode`), and wires their entry points into an `IsaVTable`
-# installed in the process-global registry. it lives in its own module - apart
-# from the `x64` definitions the rules/encode modules import - so wiring the
-# children into the parent does not close an import cycle.
-
 use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.bool.false;
 use std.types.string.str;
 
 use R: std.types.result;
-
 use mach.lang.target.isa;
 use mach.lang.target.isa.x64;
 use mach.lang.target.isa.x64.encode;
@@ -21,78 +11,35 @@ use mach.lang.target.isa.x64.reloc;
 use mach.lang.target.isa.x64.rules;
 use mach.lang.target.of;
 use mach.lang.target.of.elf;
+use mach.lang.be.codegen.mir;
 
-# process-global storage for the x86-64 vtable and its register classes. written
-# once by `register_x64` and referenced (borrowed) by the vtable installed into
-# the ISA registry; lives for the lifetime of the process
-var x64_vtable:  isa.IsaVTable;
-var x64_classes: [3]isa.RegClass;
+fun frame_saved(mask: u32) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < 32) {
+        if ((mask & (1::u32 << i)) != 0) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
 
-# process-global storage for the x86-64 register-machine contract - the machine
-# back half's entry points and register identities. borrowed by the installed
-# vtable's `machine` payload for the process lifetime
-var x64_machine: isa.RegMachine;
+fun frame_align_up(n: u32, align: u32) u32 {
+    if (align == 0) { ret n; }
+    val mask: u32 = align - 1;
+    ret (n + mask) & ~mask;
+}
 
-# process-global storage for the x86-64 relocatable-object contract - the ELF
-# relocation forward map and the link-time relocation applier. borrowed by the
-# installed vtable's `reloc` payload for the process lifetime
-var x64_reloc: isa.RelocSeam;
+fun x64_frame_dist(model: *isa.MachineModel, func: *mir.MirFunction, base_dist: *u32, fp_dist: *u32) {
+    val gp_bytes: u32 = frame_saved(func.callee_mask) * 8;
+    var base: u32 = frame_align_up(func.frame.size + gp_bytes, 16);
+    base = base + frame_saved(func.callee_mask_fp) * 16;
+    base = frame_align_up(base, 16);
+    var total: u32 = base + func.frame.outgoing_size;
+    total = frame_align_up(total, func.frame.realign);
+    @base_dist = total;
+    @fp_dist   = 0;
+}
 
-# process-global storage for the x86-64 machine-model template. written once by
-# `register_x64` and pointed to by the vtable's `model` field; `target.select`
-# copies it by value and overlays the selected abi's stack scalars. lives for the
-# process lifetime. its register-file pointers borrow the same per-arch arrays the
-# vtable does (`x64_classes`, `x64_reload_scratch_regs`, `x64_reserved_regs`)
-var x64_model: isa.MachineModel;
-
-# the registers the allocator must never assign: the stack pointer (RSP) and the
-# frame pointer (RBP), both owned by the frame pass. referenced (borrowed) by the
-# `reserved_regs` field of the installed ISA vtable; lives for the process
-# lifetime. filled by `register_x64`
-var x64_reserved_regs: [2]isa.Register;
-
-# the lane-wise operations the SSE2 baseline has no packed form for (#2726).
-# borrowed by the model's `packed_gaps`; filled by `register_x64`
-#
-# Integer multiply only, and only at the widths SSE2 misses. The baseline packs a
-# 16-bit lane multiply as PMULLW (`66 0F D5`), and nothing else: the 32-bit form
-# PMULLD is `66 0F 38 40`, on the SSE4.1 opcode map and off the baseline; the 64-bit
-# form PMULLQ has no legacy encoding at all (AVX512DQ); and no generation of SSE has
-# an 8-bit packed multiply.
-#
-# Only rows something CONSULTS are declared. Integer divide has no packed form here
-# either, but no lowering asks, and a row nothing reads is the shape that let
-# `fp_scratch_reg` declare one register while the encoder used another - every
-# target supplies it, the check passes, and nothing can notice it is wrong.
-var x64_packed_gaps: [3]isa.PackedGap;
-
-# the caller-saved GP registers the allocator reserves from value allocation and
-# draws spill-reload temporaries from (R8/R9/R10). a single high-pressure
-# instruction can reload its memory base, scaled index, and value operands at
-# once, so three temporaries cover the worst case. R11 (`SCRATCH_REG`) is held
-# back from this pool: the encoder claims it for the mem-mem split, so a reload
-# temporary placed there would be clobbered. the remaining non-argument
-# caller-saved GP registers - RAX (div / return) and RDX/RCX (div-high / shift
-# count) - carry fixed roles too, so the pool has no choice but to include R8/R9,
-# which SysV also passes the 5th/6th GP arguments in. the allocator handles that
-# overlap generically: in the entry block it keeps such a register busy until the
-# argument's capture MOV (see `reload_temp` in be.codegen.regalloc), so a reload
-# temporary never clobbers a still-live incoming argument. referenced (borrowed)
-# by the `reload_scratch_regs` field of the installed vtable; lives for the
-# process lifetime. filled by `register_x64`
-var x64_reload_scratch_regs: [3]isa.Register;
-
-# map an abstract relocation kind to its x86_64 ELF machine relocation type
-#
-# The forward half of the x86_64 ELF relocation seam: the ELF object writer reads
-# it through `IsaVTable.elf_reloc_type` instead of branching on the arch id, so
-# x86_64 owns its own R_X86_64_* numbers (drawn from the ELF format module, the
-# single source the reverse parse map shares). A kind x86_64 has no width-correct
-# ELF type for returns 0 (R_X86_64_NONE, never a real emitted relocation), which
-# the writer turns into the unsupported-kind error.
-# ---
-# kind: the abstract relocation kind to map
-# ret:  the x86_64 ELF reloc type, or 0 when x86_64 has none for this kind
 fun x64_elf_reloc_type(kind: of.RelocKind) u32 {
     if (kind == of.RK_ABS64)    { ret elf.R_X86_64_64; }
     if (kind == of.RK_PC32)     { ret elf.R_X86_64_PC32; }
@@ -103,34 +50,12 @@ fun x64_elf_reloc_type(kind: of.RelocKind) u32 {
     ret 0;
 }
 
-# the DWARF register number of the first XMM register (XMM0)
-#
-# the System V AMD64 psABI numbers XMM0..XMM15 contiguously from 17 (Figure 3.36),
-# so XMM<n> is `DWARF_XMM0 + n`.
 val DWARF_XMM0: i32 = 17;
 
-# the CodeView CV_AMD64_* register enumerators (Microsoft's `CV_HREG_e` from
-# cvconst.h, as mirrored by LLVM's `llvm/include/llvm/DebugInfo/CodeView/CodeView.h`
-# `enum class RegisterId`). Only the anchors the mapping derives from are named: the
-# 64-bit GP registers occupy one contiguous block in CodeView's own register order
-# (RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP, R8..R15) starting at CV_AMD64_RAX, and
-# the 128-bit XMM registers split into two blocks, XMM0..XMM7 and XMM8..XMM15
-val CV_AMD64_RAX:  i32 = 328;  # first 64-bit GP register, in CodeView order (not encoder order)
-val CV_AMD64_XMM0: i32 = 154;  # first of the XMM0..XMM7 block
-val CV_AMD64_XMM8: i32 = 252;  # first of the XMM8..XMM15 block
+val CV_AMD64_RAX:  i32 = 328;
+val CV_AMD64_XMM0: i32 = 154;
+val CV_AMD64_XMM8: i32 = 252;
 
-# map a physical x86-64 register id to its DWARF register number
-#
-# The x86-64 half of the per-ISA DWARF register seam (#1693): a debug-info producer
-# reads it through `RegMachine.dwarf_reg` so DWARF variable locations and
-# `DW_AT_frame_base` name the ISA's DWARF numbers rather than the encoder's physical
-# ids. The numbering is the System V AMD64 psABI "DWARF Register Number Mapping"
-# (Figure 3.36): the low eight GP registers are PERMUTED away from their ModRM/REX
-# ids (rax=0, rdx=1, rcx=2, rbx=3, rsi=4, rdi=5, rbp=6, rsp=7), R8..R15 map
-# identically (8..15), and XMM0..XMM15 map to 17..32. The frame pointer rbp is 6.
-# ---
-# regid: composite physical register id (class tag in the high byte, index low)
-# ret:   the DWARF register number, or -1 for an id x86-64 assigns no number
 fun x64_dwarf_reg(regid: i32) i32 {
     val cls: i32 = isa.regid_class(regid);
     val idx: i32 = isa.regid_index(regid);
@@ -144,13 +69,11 @@ fun x64_dwarf_reg(regid: i32) i32 {
         if (idx == x64.RDI) { ret 5; }
         if (idx == x64.RBP) { ret 6; }
         if (idx == x64.RSP) { ret 7; }
-        # R8..R15 (physical 8..15) carry the same DWARF number as their id
         if (idx >= x64.R8 && idx <= x64.R15) { ret idx; }
         ret -1;
     }
 
     if (cls == isa.REG_CLASS_ID_XMM) {
-        # XMM0..XMM15 -> 17..32
         if (idx >= x64.XMM0 && idx <= x64.XMM15) { ret DWARF_XMM0 + idx; }
         ret -1;
     }
@@ -158,20 +81,6 @@ fun x64_dwarf_reg(regid: i32) i32 {
     ret -1;
 }
 
-# map a physical x86-64 register id to its CodeView register number
-#
-# The x86-64 half of the per-ISA CodeView register seam (#1693): the COFF/CodeView
-# producer reads it through `RegMachine.cv_reg` so CodeView debug records name the
-# ISA's `CV_AMD64_*` numbers. The 64-bit GP registers sit in one contiguous
-# CodeView block from CV_AMD64_RAX in CodeView's own order (rax, rbx, rcx, rdx, rsi,
-# rdi, rbp, rsp, r8..r15) - a different order from both the encoder ids and the
-# DWARF numbering - so the low eight map by name and R8..R15 (whose CodeView ordinal
-# 8..15 equals their encoder id) fold into the block arithmetic. The 128-bit XMM
-# registers split into two blocks, XMM0..XMM7 at CV_AMD64_XMM0 and XMM8..XMM15 at
-# CV_AMD64_XMM8. The frame pointer rbp is CV_AMD64_RBP (334).
-# ---
-# regid: composite physical register id (class tag in the high byte, index low)
-# ret:   the CodeView register number, or -1 for an id x86-64 assigns no number
 fun x64_cv_reg(regid: i32) i32 {
     val cls: i32 = isa.regid_class(regid);
     val idx: i32 = isa.regid_index(regid);
@@ -185,7 +94,6 @@ fun x64_cv_reg(regid: i32) i32 {
         if (idx == x64.RDI) { ret CV_AMD64_RAX + 5; }
         if (idx == x64.RBP) { ret CV_AMD64_RAX + 6; }
         if (idx == x64.RSP) { ret CV_AMD64_RAX + 7; }
-        # R8..R15 (encoder id 8..15) share the CodeView ordinal 8..15
         if (idx >= x64.R8 && idx <= x64.R15) { ret CV_AMD64_RAX + idx; }
         ret -1;
     }
@@ -199,40 +107,17 @@ fun x64_cv_reg(regid: i32) i32 {
     ret -1;
 }
 
-# build and install the x86-64 ISA vtable
-#
-# x86-64 is a REGISTER MACHINE, so it fills the `isa.RegMachine` contract: the
-# three register classes (gpr 64x16, xmm 128x14 with XMM14/XMM15 held back as FP
-# scratch, flags 64x1), the reserved registers (RSP/RBP), the GP scratch identities
-# (R11/R10), the frame/stack pointers (RBP/RSP) the shared lowering names
-# when forming stack memory operands, and the fixed division accumulator /
-# high-half (RAX/RDX) and variable-shift count (RCX) registers the IDIV/DIV and
-# shift forms hard-wire. It is the only ISA that wires all four optional
-# capabilities (asm printer, clobber analyzer, DWARF and CodeView numberings).
-# Idempotent: the registry entry is write-once. Must be invoked at compiler startup
-# before `target.select` requests an x86-64 target.
-#
-# The `select` and `encode` entry points are the x86-64 selection rule pack
-# (`x64/rules.mach`) and byte encoder (`x64/encode.mach`), stored type-erased
-# (`*u8`) and cast back to their `SelectFn` / `EncodeFn` signatures by the shared
-# `be.codegen.isel` / `be.codegen.encode` dispatchers. All x86-64 selection and
-# encoding logic lives under this module and is reached only through these slots;
-# the shared backend drivers carry no x86-64 knowledge.
-# ---
-# reg: the ISA registry to install the vtable into
-# ret: true on success
-pub fun register_x64(reg: *isa.IsaRegistry) R.Result[bool, str] {
+pub fun register_x64(reg: *isa.IsaRegistry) R.Result[R.Void, str] {
+    var x64_classes: [3]isa.RegClass;
+    var x64_model: isa.MachineModel;
+    var x64_reserved_regs: [2]isa.Register;
+    var x64_packed_gaps: [3]isa.PackedGap;
+    var x64_reload_scratch_regs: [3]isa.Register;
+
     x64_classes[0].name      = "gpr";
     x64_classes[0].kind      = isa.RC_GENERAL;
     x64_classes[0].len       = 16;
 
-    # the SSE bank exposes only XMM0-XMM13 (count 14) to the allocator. XMM14 and
-    # XMM15 are held back as the two fixed scratch registers the float-op encoder
-    # loads operands into before an SSE arithmetic / comparison, so a live float vreg
-    # can never occupy one and be clobbered by the expansion - the SSE analogue of
-    # holding R10/R11 back from the GP value pool for the encoder's reload / mem-mem
-    # scratch. this count IS the reservation: the encoder names the pair privately
-    # (`FLOAT_SCRATCH0` / `FLOAT_SCRATCH1`) and the vtable declares neither (#2365).
     x64_classes[1].name      = "xmm";
     x64_classes[1].kind      = isa.RC_FLOAT;
     x64_classes[1].len       = 14;
@@ -253,95 +138,62 @@ pub fun register_x64(reg: *isa.IsaRegistry) R.Result[bool, str] {
     x64_reload_scratch_regs[2].id   = x64.R10;
     x64_reload_scratch_regs[2].size = 8;
 
-    # the register-machine contract. every required slot is a parameter, so omitting
-    # one is a build-time arity error rather than a nil slot found at runtime.
-    # x86-64 `push rbp; mov rbp, rsp` saves the frame pointer at [rbp+0] and the
-    # return address at [rbp+8], so the first incoming stack argument sits at [rbp+16].
-    x64_machine = isa.reg_machine(
-        rules.select::*u8,
-        encode.encode_x64::*u8,
+    var x64_machine: isa.RegMachine = isa.reg_machine(
+        rules.select,
+        encode.encode_x64,
         rules.is_reg_move,
+        rules.is_trap_terminator,
         ?x64_reserved_regs[0], 2,
         ?x64_reload_scratch_regs[0], 3,
         x64.SCRATCH_REG, x64.SCRATCH_REG2,
         x64.FRAME_REG, x64.STACK_REG, 16,
         x64.RAX, x64.RDX, x64.RCX
     );
-    # every optional capability: x86-64 is the only ISA that wires all four.
-    isa.with_asm_printer(?x64_machine, encode.encode_x64_asm::*u8);
-    isa.with_asm_clobbers(?x64_machine, encode.asm_clobbers);
-    isa.with_asm_returns(?x64_machine, encode.asm_returns);
-
-    isa.with_asm_ct_scan(?x64_machine, encode.asm_ct_scan);
-    # per-ISA debug-info register maps: x86-64 owns both a DWARF and a CodeView
-    # numbering (the only shipped ISA Windows targets).
+    isa.with_assembly(?x64_machine, encode.encode_x64_asm, encode.asm_clobbers,
+                      encode.asm_returns, encode.asm_ct_scan);
     isa.with_dwarf_regs(?x64_machine, x64_dwarf_reg);
     isa.with_codeview_regs(?x64_machine, x64_cv_reg);
+    isa.with_frame_dist(?x64_machine, x64_frame_dist);
 
-    # the relocatable-object contract: x86-64 names its relocations in an ELF object
-    # and resolves them at link time, and both halves are declared here rather than
-    # attached to the vtable afterwards by a subsystem that knows the arch's name.
-    # no build-attributes descriptor: x86-64 emits none.
-    x64_reloc = isa.reloc_seam(reloc.apply_reloc::*u8, reloc.reloc_traits::*u8,
-                               x64_elf_reloc_type::*u8);
+    var x64_reloc: isa.RelocSeam = isa.reloc_seam(
+        reloc.apply_reloc, reloc.reloc_traits, x64_elf_reloc_type
+    );
+    isa.with_local_got_kinds(?x64_reloc, reloc.is_local_got_kind);
 
-    # elf_machine 62 is EM_X86_64
-    x64_vtable = isa.machine_isa(isa.ARCH_X86_64, "x86_64", 62, 8,
-                                 ?x64_model, ?x64_machine, ?x64_reloc);
+    var x64_vtable: isa.IsaVTable = isa.machine_isa(
+        isa.ARCH_X86_64, isa.arch_name_for(isa.ARCH_X86_64), 62, 8,
+        ?x64_model, ?x64_machine, ?x64_reloc
+    );
 
-    # the machine-model template: every value equals today's reality so the stages
-    # preserve behavior when they are rewired to read it. widths are in bytes; the
-    # register-file pointers borrow the same per-arch arrays the vtable does; the
-    # stack scalars stay 0 here and are overlaid by `target.select` from the abi.
     x64_model.pointer_width   = 8;
     x64_model.max_alu_width = 8;
-    # the register-machine ALU floor: a sub-word op computes at 4 bytes so its result
-    # fully defines the register it spills through (#2749)
     x64_model.alu_min_width = 4;
     x64_model.gpr_width       = 8;
     x64_model.spill_width     = 8;
-    # a 32-bit `mov` (89 /r with no REX.W) zero-extends into the full 64-bit
-    # register, so `mov %eax,%eax` is a real zero-extension; the 16- and 8-bit forms
-    # (66 89 /r, 88 /r) preserve the bits above them, so those self-moves are inert.
     x64_model.endianness      = isa.ENDIAN_LITTLE;
-    # SSE2 scalar doubles ride xmm0-15, so the scalar float bank is 64 bits wide.
     x64_model.flen_bits       = 64;
-    # SSE2 128-bit vector unit is baseline on x86-64 (#1965).
     x64_model.has_v128        = true;
     x64_model.vector_bits     = isa.VECTOR_BITS_128;
-    # no lane-count ceiling: this vector unit is described completely by its register
-    # width, so the lane count follows from the width and the lane size (#2749)
     x64_model.max_vector_lanes = isa.VECTOR_LANES_UNBOUNDED;
-    # MOVSS / MOVSD / MOVUPS cross between an XMM register and memory at 4, 8 and 16
-    # bytes, and the two narrow forms zero the lanes above their operand on a load,
-    # which is the contract this field carries (#2716). 12 is deliberately absent:
-    # covering it needs `pinsrd` / `pextrd`, which are SSE4.1 and this baseline is
-    # SSE2, so a 12-byte vector still takes the scratch round trip.
     x64_model.vec_mem_widths  = isa.VEC_MEM_4_8_16;
-    # `movd` / `movq` cross between an XMM and a GP register at 4 and 8 (#2904). NOT 16,
-    # despite the XMM being 128 bits: `movq` moves the low half and no instruction moves
-    # a whole XMM into GP registers.
     x64_model.xbank_widths    = isa.XBANK_4_8;
     x64_packed_gaps[0].op = isa.VEC_OP_MUL; x64_packed_gaps[0].is_float = false; x64_packed_gaps[0].lane_bits = 8;
     x64_packed_gaps[1].op = isa.VEC_OP_MUL; x64_packed_gaps[1].is_float = false; x64_packed_gaps[1].lane_bits = 32;
     x64_packed_gaps[2].op = isa.VEC_OP_MUL; x64_packed_gaps[2].is_float = false; x64_packed_gaps[2].lane_bits = 64;
     x64_model.packed_gaps     = ?x64_packed_gaps[0];
     x64_model.packed_gap_len  = 3;
-    # SSE2 packed compute selects from the generic MIR opcodes carrying vec_lane,
-    # so the shared lowerer routes vector compute through the generic path (#2014).
     x64_model.vector_compute_generic = true;
-    # integer multiply is gated on secrets by default (#1646): Intel DOITM makes it
-    # data-independent only when explicitly enabled, so the static contract stays
-    # conservative until the mode is wired.
     x64_model.ct_trust_mul    = false;
-    x64_model.has_var_shift = true;        # SHL/SHR/SAR by CL is a single instruction (#2217)
-    x64_model.has_mul = true;              # IMUL (#2344)
-    # 0 despite the silicon: the high half comes only from the one-operand MUL pinning
-    # RDX:RAX, which no rule form expresses, and nothing here could observe the
-    # declaration since max_alu_width already covers every scalar (#2778).
+    x64_model.has_var_shift = true;
+    x64_model.has_mul = true;
+    x64_model.has_float = x64.HAS_FLOAT;
     x64_model.mul_hi_width = 0;
-    x64_model.flat_addressing = true;      # a byte-addressed linear space (#2655)
-    x64_model.ct_trust_var_shift = true;   # SHL/SHR by CL is single-instruction constant-time (#1646)
+    x64_model.flat_addressing = true;
+    x64_model.index_width          = 64;
+    x64_model.vector_op_bytes      = 16;
+    x64_model.vectors_in_registers = true;
+    x64_model.auto_vectorize       = true;
+    x64_model.ct_trust_var_shift = true;
 
     x64_model.reg_classes     = ?x64_classes[0];
     x64_model.reg_class_len   = 3;
@@ -358,14 +210,9 @@ pub fun register_x64(reg: *isa.IsaRegistry) R.Result[bool, str] {
     x64_model.red_zone          = 0;
     x64_model.shadow_space      = 0;
 
-    isa.register(reg, ?x64_vtable);
-
-    ret R.ok[bool, str](true);
+    ret isa.register(reg, ?x64_vtable);
 }
 
-# the x86_64 forward reloc map produces the right R_X86_64_* number for each kind
-# it supports, and 0 (R_X86_64_NONE) for a kind it has no width-correct ELF type
-# for (RK_ADDR32NB is COFF-only; the aarch64 page/lo12 kinds are not x86_64's)
 test "mach.lang.target.isa.x64.register.x64_elf_reloc_type:forward_map" {
     if (x64_elf_reloc_type(of.RK_ABS64)    != elf.R_X86_64_64)       { ret 1; }
     if (x64_elf_reloc_type(of.RK_PC32)     != elf.R_X86_64_PC32)     { ret 1; }
@@ -374,16 +221,11 @@ test "mach.lang.target.isa.x64.register.x64_elf_reloc_type:forward_map" {
     if (x64_elf_reloc_type(of.RK_ABS32S)   != elf.R_X86_64_32S)      { ret 1; }
     if (x64_elf_reloc_type(of.RK_ABS32)    != elf.R_X86_64_32)       { ret 1; }
 
-    # a kind x86_64 has no ELF type for maps to 0, the writer's unsupported signal.
     if (x64_elf_reloc_type(of.RK_ADDR32NB) != 0) { ret 1; }
     if (x64_elf_reloc_type(of.RK_PAGE21)   != 0) { ret 1; }
     ret 0;
 }
 
-# x64_dwarf_reg reproduces the System V AMD64 psABI DWARF numbering (Figure 3.36):
-# the low eight GP registers are permuted away from their encoder ids, R8..R15 map
-# identically, and XMM0..XMM15 map to 17..32. The stack pointer rsp (7) and frame
-# pointer rbp (6) are the load-bearing entries a DWARF frame base names
 test "mach.lang.target.isa.x64.register.x64_dwarf_reg:psabi_numbers" {
     if (x64_dwarf_reg(x64.RAX) != 0) { ret 1; }
     if (x64_dwarf_reg(x64.RDX) != 1) { ret 1; }
@@ -396,24 +238,16 @@ test "mach.lang.target.isa.x64.register.x64_dwarf_reg:psabi_numbers" {
     if (x64_dwarf_reg(x64.R8)  != 8) { ret 1; }
     if (x64_dwarf_reg(x64.R15) != 15) { ret 1; }
 
-    # the frame pointer's DWARF number is what DW_AT_frame_base names
     if (x64_dwarf_reg(x64.FRAME_REG) != 6) { ret 1; }
 
-    # XMM0..XMM15 are composite ids (the SSE class tag in the high byte) -> 17..32
     if (x64_dwarf_reg(isa.regid_make(isa.REG_CLASS_ID_XMM, x64.XMM0))  != 17) { ret 1; }
     if (x64_dwarf_reg(isa.regid_make(isa.REG_CLASS_ID_XMM, x64.XMM15)) != 32) { ret 1; }
 
-    # an id x86-64 assigns no DWARF number returns -1
     if (x64_dwarf_reg(isa.regid_make(isa.REG_CLASS_ID_GP, 16))  != -1) { ret 1; }
     if (x64_dwarf_reg(isa.regid_make(isa.REG_CLASS_ID_XMM, 16)) != -1) { ret 1; }
     ret 0;
 }
 
-# x64_cv_reg reproduces the CodeView CV_AMD64_* numbering (cvconst.h / LLVM
-# CodeView.h): the 64-bit GP registers sit in a contiguous block from 328 in
-# CodeView's own order, and XMM0..XMM7 / XMM8..XMM15 map to 154..161 / 252..259.
-# The stack pointer rsp (335) and frame pointer rbp (334) are the load-bearing
-# entries a CodeView frame record names
 test "mach.lang.target.isa.x64.register.x64_cv_reg:cvconst_numbers" {
     if (x64_cv_reg(x64.RAX) != 328) { ret 1; }
     if (x64_cv_reg(x64.RBX) != 329) { ret 1; }
@@ -426,16 +260,13 @@ test "mach.lang.target.isa.x64.register.x64_cv_reg:cvconst_numbers" {
     if (x64_cv_reg(x64.R8)  != 336) { ret 1; }
     if (x64_cv_reg(x64.R15) != 343) { ret 1; }
 
-    # the frame pointer's CodeView number is what a frame record names
     if (x64_cv_reg(x64.FRAME_REG) != 334) { ret 1; }
 
-    # the two XMM blocks: XMM0..XMM7 = 154..161, XMM8..XMM15 = 252..259
     if (x64_cv_reg(isa.regid_make(isa.REG_CLASS_ID_XMM, x64.XMM0))  != 154) { ret 1; }
     if (x64_cv_reg(isa.regid_make(isa.REG_CLASS_ID_XMM, x64.XMM7))  != 161) { ret 1; }
     if (x64_cv_reg(isa.regid_make(isa.REG_CLASS_ID_XMM, x64.XMM8))  != 252) { ret 1; }
     if (x64_cv_reg(isa.regid_make(isa.REG_CLASS_ID_XMM, x64.XMM15)) != 259) { ret 1; }
 
-    # an id x86-64 assigns no CodeView number returns -1
     if (x64_cv_reg(isa.regid_make(isa.REG_CLASS_ID_GP, 16)) != -1) { ret 1; }
     ret 0;
 }

@@ -1,26 +1,11 @@
-# RISC-V (RV64) ISA vtable registration
-#
-# The composition seam for the RV64 backend: it imports the ISA definitions
-# (`riscv`) and the byte encoder (`riscv.encode`) and wires a machine
-# description into an `IsaVTable` installed in the registry. It mirrors
-# `isa.x64.register` and `isa.arm64.register`, living in its own module so wiring the
-# children (the encoder, and the future selector) into the parent does not close an
-# import cycle.
-#
-# The machine description carries the instruction selector (`select`), the byte
-# encoder (`encode`), the inline-asm clobber analyzer (`asm_clobbers`), and the
-# assembly printer (`emit_asm`); the relocatable-object contract carries the ELF
-# relocation forward map (`elf_reloc_type`), the link-time relocation applier
-# (`apply_reloc`, from `riscv.reloc`), and the ELF build-attributes descriptor.
-
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.string.str;
 use std.types.string.str_equals;
 
+use O: std.types.option;
 use R: std.types.result;
-
 use mach.lang.target.isa;
 use mach.lang.target.isa.riscv;
 use mach.lang.target.isa.riscv.encode;
@@ -29,87 +14,42 @@ use mach.lang.target.isa.riscv.reloc;
 use mach.lang.target.isa.riscv.rules;
 use mach.lang.target.of;
 use mach.lang.target.of.elf;
+use mach.lang.be.codegen.mir;
 
-# process-global storage for the RV64 vtable and its register classes. written
-# once by `register_riscv64` and borrowed by the vtable installed into the ISA
-# registry; lives for the process lifetime. RISC-V has no condition-flags register
-# (branches compare two GP registers directly), so the model declares only the two
-# real banks - gpr and fpr - and no RC_FLAGS class
-var riscv64_vtable:  isa.IsaVTable;
-var riscv64_classes: [2]isa.RegClass;
+fun frame_saved(mask: u32) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < 32) {
+        if ((mask & (1::u32 << i)) != 0) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
 
-# process-global storage for the riscv64 register-machine contract. borrowed by
-# the installed vtable's `machine` payload for the process lifetime
-var riscv64_machine: isa.RegMachine;
+fun frame_align_up(n: u32, align: u32) u32 {
+    if (align == 0) { ret n; }
+    val mask: u32 = align - 1;
+    ret (n + mask) & ~mask;
+}
 
-# process-global storage for the riscv64 relocatable-object contract - the ELF
-# relocation forward map, the link-time relocation applier, and the build-attributes
-# descriptor. borrowed by the installed vtable's `reloc` payload for the process
-# lifetime
-var riscv64_reloc: isa.RelocSeam;
+fun riscv_frame_dist(model: *isa.MachineModel, func: *mir.MirFunction, base_dist: *u32, fp_dist: *u32) {
+    val flen_bytes: u32 = model.flen_bits / 8;
+    val gp_bytes: u32 = frame_saved(func.callee_mask) * model.gpr_width;
+    val fp_bytes: u32 = frame_saved(func.callee_mask_fp) * flen_bytes;
+    var reserved: u32 = (2 * model.gpr_width) + gp_bytes + fp_bytes;
+    reserved = frame_align_up(reserved, func.frame.realign);
+    var total: u32 = frame_align_up(reserved + func.frame.size + func.frame.outgoing_size, 16);
+    total = frame_align_up(total, func.frame.realign);
+    @fp_dist   = reserved;
+    @base_dist = total - reserved;
+}
 
-# process-global storage for the RV64 machine-model template. written once by
-# `register_riscv64` and pointed to by the vtable's `model` field; `target.select`
-# copies it by value and overlays the selected abi's stack scalars. lives for the
-# process lifetime. its register-file pointers borrow the same per-arch arrays the
-# vtable does (`riscv64_classes`, `riscv64_reload_scratch_regs`,
-# `riscv64_reserved_regs`)
-var riscv64_model: isa.MachineModel;
+val RISCV_ELF_ATTRIBUTES: elf.BuildAttributes = elf.BuildAttributes{
+    section: ".riscv.attributes",
+    sht: elf.SHT_RISCV_ATTRIBUTES,
+    vendor: "riscv"
+};
 
-
-# process-global storage for the RV64 ELF build-attributes descriptor. written once by
-# `register_riscv64` and returned by the `elf_attributes` hook as a borrowed pointer
-# for the process lifetime; its string fields are immutable `str` constants
-var riscv64_attrs: elf.BuildAttributes;
-
-# the registers the allocator must never assign: the hardwired-zero register (x0),
-# the return-address / link register (ra), the stack pointer (sp), the global and
-# thread pointers (gp / tp, fixed by the startup environment), and the frame
-# pointer (s0/fp). borrowed by the vtable's `reserved_regs` field; lives for the
-# process lifetime. filled by `register_riscv64`
-var riscv64_reserved_regs: [6]isa.Register;
-
-# the integer temporaries (t2/t3/t4) the allocator reserves from value allocation
-# and draws spill-reload temporaries from. a single high-pressure instruction can
-# reload its memory base, scaled index, and value operands at once, so three
-# temporaries cover the worst case. these are caller-saved temporaries distinct
-# from t0/t1 (`scratch_reg` / `scratch_reg2`), which the encoder claims for address
-# materialization and two-register lowering. borrowed by the vtable's
-# `reload_scratch_regs` field; lives for the process lifetime. filled by
-# `register_riscv64`
-var riscv64_reload_scratch_regs: [3]isa.Register;
-
-# the same storage again for RV32 (#2778)
-#
-# TWO ARCHES, TWO SETS, ONE BUILDER. The vtable, the register machine, the seam and
-# the model are borrowed by the registry for the process lifetime, and a multi-target
-# build has both arches resolved at once, so the two cannot share one set of globals.
-# What they DO share is `build_riscv` below, which fills either set from the width
-# facts it is handed - so an RV32 target is a different set of numbers rather than a
-# second copy of the wiring.
-var riscv32_vtable:  isa.IsaVTable;
-var riscv32_classes: [2]isa.RegClass;
-var riscv32_machine: isa.RegMachine;
-var riscv32_reloc:   isa.RelocSeam;
-var riscv32_model:   isa.MachineModel;
-var riscv32_attrs:   elf.BuildAttributes;
-var riscv32_reserved_regs:       [6]isa.Register;
-var riscv32_reload_scratch_regs: [3]isa.Register;
-
-# map an abstract relocation kind to its riscv64 ELF machine relocation type
-#
-# The forward half of the riscv64 ELF relocation seam: the ELF object writer reads it
-# through `IsaVTable.elf_reloc_type` instead of branching on the arch id, so riscv64
-# owns its own R_RISCV_* numbers (drawn from the ELF format module, the single source
-# the reverse parse map shares). RK_ABS64 maps to the width-specific R_RISCV_64 and
-# RK_ABS32 to R_RISCV_32 (the 32-bit absolute DWARF cross-section refs use); RK_PLT32
-# to R_RISCV_CALL_PLT (the auipc + jalr call pair); the pc-relative load-address
-# idiom's RK_PCREL_HI20 / RK_PCREL_LO12_I / RK_PCREL_LO12_S to their R_RISCV_PCREL_*
-# types. A kind riscv64 has no width-correct ELF type for returns 0 (R_RISCV_NONE),
-# which the writer turns into the unsupported-kind error.
-# ---
-# kind: the abstract relocation kind to map
-# ret:  the riscv64 ELF reloc type, or 0 when riscv64 has none for this kind
 fun riscv64_elf_reloc_type(kind: of.RelocKind) u32 {
     if (kind == of.RK_ABS64)        { ret elf.R_RISCV_64; }
     if (kind == of.RK_PC32)         { ret elf.R_RISCV_32_PCREL; }
@@ -121,54 +61,6 @@ fun riscv64_elf_reloc_type(kind: of.RelocKind) u32 {
     ret 0;
 }
 
-# the RV64 ELF build-attributes descriptor
-#
-# The riscv64 half of the build-attributes seam: the ELF writer reads it through
-# `IsaVTable.elf_attributes` instead of branching on the arch id, the attributes
-# analogue of `elf_reloc_type`. It names the `.riscv.attributes` section, its
-# SHT_RISCV_ATTRIBUTES type, the `riscv` vendor, and `Tag_RISCV_arch` carrying the
-# arch string. Returns the process-lifetime descriptor `register_riscv64` filled.
-# ---
-# ret: the RV64 build-attributes descriptor
-fun riscv64_elf_attributes() *elf.BuildAttributes {
-    ret ?riscv64_attrs;
-}
-
-# the RV32 twin of `riscv64_elf_attributes`
-#
-# The container is identical - same section name, same section type, same vendor -
-# and the two hooks exist only because the hook is a plain function pointer with no
-# self parameter, so it cannot be told which member's storage to return. The BODY the
-# container carries is what differs between the two, and that is derived per image
-# from the machine rather than stored here (#2828).
-# ---
-# ret: the RV32 build-attributes descriptor
-fun riscv32_elf_attributes() *elf.BuildAttributes {
-    ret ?riscv32_attrs;
-}
-
-# the ELF `e_flags` word for a riscv64 image, derived from the two facts that decide
-# it rather than stated as a constant
-#
-# THE FLOAT BITS ARE THE ABI'S, NOT THIS FUNCTION'S. `float_arg_bits` arrives from
-# the resolved `abi.AbiVTable`, which for this family is the member's own
-# `flen_bits` (lp64 0, lp64f 32, lp64d 64). So the header cannot disagree with the
-# convention the code was actually compiled for - there is no second table of
-# convention names here to drift from the first. Any other width is refused rather
-# than rounded to the nearest ABI, because a header that guesses is what #2813 was.
-#
-# THE RVC BIT IS THE BYTES', NOT THE ARCH STRING'S. This encoder emits no compressed
-# instruction (see `INSTR_WIDTH`), so an object mach writes honestly claims none -
-# and the derived arch string correspondingly omits `c`. A LINKED image is a different
-# question: it carries whatever its inputs carried, and a clang object built for the
-# `rv64gc` profile `test/link/lib/cc.sh` pins does contain compressed instructions. So the
-# caller passes what is actually in the bytes, and the linker ORs it across inputs
-# the way a real linker does. Claiming it from the arch string instead would be the
-# same class of mistake in the other direction.
-# ---
-# float_arg_bits: the resolved ABI's float-argument width (0 / 32 / 64)
-# has_compressed: whether this image's bytes contain compressed instructions
-# ret:            the `e_flags` word
 fun riscv64_machine_flags(float_arg_bits: u32, has_compressed: bool) u32 {
     var flags: u32 = elf.EF_RISCV_FLOAT_ABI_SOFT;
     if (float_arg_bits == 32) { flags = elf.EF_RISCV_FLOAT_ABI_SINGLE; }
@@ -177,35 +69,18 @@ fun riscv64_machine_flags(float_arg_bits: u32, has_compressed: bool) u32 {
     ret flags;
 }
 
-# the DWARF register number of the first floating-point register (f0)
-#
-# the RISC-V ELF psABI numbers the F/D registers f0..f31 contiguously from 32, so
-# f<n> is `DWARF_F0 + n`.
 val DWARF_F0: i32 = 32;
 
-# map a physical riscv64 register id to its DWARF register number
-#
-# The riscv64 half of the per-ISA DWARF register seam (#1693): a debug-info producer
-# reads it through `RegMachine.dwarf_reg` so DWARF variable locations and
-# `DW_AT_frame_base` name riscv64's DWARF numbers. The numbering is the RISC-V ELF
-# psABI "DWARF Register Numbers" table: the integer registers x0..x31 map identically
-# to 0..31 and the floating-point registers f0..f31 map to 32..63. The frame pointer
-# s0/fp is x8 (8), the return address ra is x1 (1), and the stack pointer sp is x2 (2).
-# ---
-# regid: composite physical register id (class tag in the high byte, index low)
-# ret:   the DWARF register number, or -1 for an id riscv64 assigns no number
 fun riscv64_dwarf_reg(regid: i32) i32 {
     val cls: i32 = isa.regid_class(regid);
     val idx: i32 = isa.regid_index(regid);
 
     if (cls == isa.REG_CLASS_ID_GP) {
-        # x0..x31 -> 0..31, identity
         if (idx >= riscv.X0 && idx <= riscv.X31) { ret idx; }
         ret -1;
     }
 
     if (cls == isa.REG_CLASS_ID_XMM) {
-        # f0..f31 -> 32..63
         if (idx >= riscv.F0 && idx <= riscv.F31) { ret DWARF_F0 + idx; }
         ret -1;
     }
@@ -213,93 +88,27 @@ fun riscv64_dwarf_reg(regid: i32) i32 {
     ret -1;
 }
 
-# build and install the RV64 ISA vtable
-#
-# Sets the architecture and register-class names, fills the two register classes
-# (gpr 64x32 for x0-x31, fpr 64x30 for f0-f29 with f30/f31 held back as FP
-# scratch), and populates the vtable with the pointer width (8 bytes / 64 bits),
-# the EM_RISCV ELF machine type (243), the reserved registers (zero/ra/sp/gp/tp/fp),
-# the reload-scratch pool (t2/t3/t4), the scratch identities (t0/t1 and the
-# composite f31 FP scratch), the frame/stack pointers (fp/sp), and -1 for the
-# division / shift register identities (RV64 wires none: div / rem write a normal
-# destination and a variable shift rides any register). Installs the result into
-# `reg`. Idempotent: the registry entry is write-once. Must run at compiler startup
-# before `target.select` requests a riscv64 target.
-#
-# Wires the instruction selector (`select`), the byte encoder (`encode`), the
-# inline-asm clobber analyzer (`asm_clobbers`), and the assembly printer
-# (`emit_asm`), plus the relocatable-object contract: the ELF relocation forward map
-# (`elf_reloc_type`), the relocation applier (`apply_reloc`), and the ELF
-# build-attributes descriptor. RV64 is the only arch that declares the last of
-# these.
-# ---
-# reg: the ISA registry to install the vtable into
-# ret: true on success
-pub fun register_riscv64(reg: *isa.IsaRegistry) R.Result[bool, str] {
-    ret build_riscv(reg, isa.ARCH_RISCV64, "riscv64", 8,
-                    ?riscv64_vtable, ?riscv64_classes[0], ?riscv64_machine,
-                    ?riscv64_reloc, ?riscv64_model, ?riscv64_attrs, riscv64_elf_attributes::*u8,
-                    ?riscv64_reserved_regs[0], ?riscv64_reload_scratch_regs[0]);
+pub fun register_riscv64(reg: *isa.IsaRegistry) R.Result[R.Void, str] {
+    ret build_riscv(reg, isa.ARCH_RISCV64, isa.arch_name_for(isa.ARCH_RISCV64), 8,
+                    ?RISCV_ELF_ATTRIBUTES);
 }
 
-# build and install the RV32 ISA vtable
-#
-# The same wiring as `register_riscv64` against a different machine: `build_riscv`
-# holds the whole description and this states the four facts that differ - the arch
-# id, the name, the register width in bytes, and the storage it owns. Everything else
-# about RISC-V is width-independent, which is the claim #2778 exists to make good on,
-# and it is a claim this file can only make by NOT having a second copy of the wiring
-# to drift from the first.
-#
-# Must run at compiler startup before `target.select` requests a riscv32 target.
-# ---
-# reg: the ISA registry to install the vtable into
-# ret: true on success
-pub fun register_riscv32(reg: *isa.IsaRegistry) R.Result[bool, str] {
-    ret build_riscv(reg, isa.ARCH_RISCV32, "riscv32", 4,
-                    ?riscv32_vtable, ?riscv32_classes[0], ?riscv32_machine,
-                    ?riscv32_reloc, ?riscv32_model, ?riscv32_attrs, riscv32_elf_attributes::*u8,
-                    ?riscv32_reserved_regs[0], ?riscv32_reload_scratch_regs[0]);
+pub fun register_riscv32(reg: *isa.IsaRegistry) R.Result[R.Void, str] {
+    ret build_riscv(reg, isa.ARCH_RISCV32, isa.arch_name_for(isa.ARCH_RISCV32), 4,
+                    ?RISCV_ELF_ATTRIBUTES);
 }
 
-# fill and install one RISC-V arch member's vtable, register machine, seam and model
-#
-# THE WIDTH IS THE ONLY PARAMETER, and that is the point. Every other line below is
-# shared between RV32 and RV64: the register numbering, the psABI roles, the reserved
-# set, the scratch identities, the selection pack, the encoder, the printer, the
-# clobber and constant-time analyzers, the DWARF map, the relocation seam and the
-# attribute derivation are all XLEN-independent. `xw` decides the pointer width, the
-# four model widths and the declared register sizes, and nothing else branches.
-# ---
-# reg:      the ISA registry to install into
-# arch_id:  the member's canonical arch id
-# name:     the member's target name, as a manifest spells it
-# xw:       XLEN in bytes (8 for rv64, 4 for rv32)
-# vt:       process-global vtable storage this member owns
-# classes:  process-global register-class storage (2 entries: gpr, fpr)
-# machine:  process-global register-machine storage
-# seam:     process-global relocation-seam storage
-# model:    process-global machine-model storage
-# attrs:    process-global ELF build-attributes descriptor storage
-# attrs_hook: erased `elf_attributes` hook returning THIS member's `attrs`
-# reserved: process-global reserved-register storage (6 entries)
-# reload:   process-global reload-scratch storage (3 entries)
-# ret:      true on success
 fun build_riscv(reg: *isa.IsaRegistry, arch_id: u32, name: str, xw: u32,
-                vt: *isa.IsaVTable, classes: *isa.RegClass, machine: *isa.RegMachine,
-                seam: *isa.RelocSeam, model: *isa.MachineModel, attrs: *elf.BuildAttributes,
-                attrs_hook: *u8,
-                reserved: *isa.Register, reload: *isa.Register) R.Result[bool, str] {
+                elf_attributes: *of.ElfAttributes) R.Result[R.Void, str] {
+    var classes: [2]isa.RegClass;
+    var model: isa.MachineModel;
+    var reserved: [6]isa.Register;
+    var reload: [3]isa.Register;
+
     classes[0].name      = "gpr";
     classes[0].kind      = isa.RC_GENERAL;
     classes[0].len       = riscv.GPR_COUNT::u32;
 
-    # the fpr bank exposes f0-f29 (count 30) to the allocator. f30 and f31
-    # (ft10 / ft11) are held back as the two fixed FP scratch registers the float-op
-    # encoder routes spilled operands through, so a live float vreg can never occupy
-    # one and be clobbered. the F/D extension registers are 64 bits wide under
-    # lp64d, the same width as the integer registers - unlike x86-64 / AArch64 whose
-    # 128-bit vector bank the shared float-bank lookup keys on by width.
     classes[1].name      = "fpr";
     classes[1].kind      = isa.RC_FLOAT;
     classes[1].len       = riscv.FPR_COUNT::u32;
@@ -324,131 +133,67 @@ fun build_riscv(reg: *isa.IsaRegistry, arch_id: u32, name: str, xw: u32,
     reload[2].id   = riscv.T4;
     reload[2].size = xw::u8;
 
-    # the register-machine contract. the FP scratch pair (f31 primary, f30 for the
-    # both-sources-spilled binary float case) is not part of it: `encode.mach` names
-    # them privately and `riscv64_classes[1].len` keeps the allocator off them, so no
-    # declared id can drift from the one the encoder uses (#2365). the RV64 frame
-    # discipline sets s0/fp to the canonical frame
-    # address (the stack pointer at entry) and saves ra / old-fp below it, so incoming
-    # stack arguments sit at [fp+0] - unlike x86-64 / AArch64, whose saved frame record
-    # pushes the first to [fp+16]. RV64 div / divu / rem / remu write a normal
-    # destination register and a shift count rides the low bits of any register, so no
-    # fixed division / shift register is wired: -1 for all three.
-    @machine = isa.reg_machine(
-        rules.select::*u8,
-        encode.encode_riscv64::*u8,
+    var machine: isa.RegMachine = isa.reg_machine(
+        rules.select,
+        encode.encode_riscv64,
         rules.is_reg_move,
-        reserved, 6,
-        reload, 3,
+        rules.is_trap_terminator,
+        ?reserved[0], 6,
+        ?reload[0], 3,
         riscv.SCRATCH_REG, riscv.SCRATCH_REG2,
         riscv.FP, riscv.SP, 0,
         -1, -1, -1
     );
-    # the printer is the encoder's own sink (#2193), so the `.s` renders the
-    # instruction stream that was emitted rather than a second MIR-level walk.
-    isa.with_asm_printer(machine, encode.encode_riscv64_asm::*u8);
-    isa.with_asm_clobbers(machine, encode.asm_clobbers);
-    isa.with_asm_returns(machine, encode.asm_returns);
+    isa.with_assembly(?machine, encode.encode_riscv64_asm, encode.asm_clobbers,
+                      encode.asm_returns, encode.asm_ct_scan);
+    isa.with_dwarf_regs(?machine, riscv64_dwarf_reg);
+    isa.with_frame_dist(?machine, riscv_frame_dist);
 
-    isa.with_asm_ct_scan(machine, encode.asm_ct_scan);
-    # the per-ISA DWARF register map (#1693). riscv64 has no CodeView numbering (no
-    # Windows target), so `with_codeview_regs` is not called.
-    isa.with_dwarf_regs(machine, riscv64_dwarf_reg);
+    var seam: isa.RelocSeam = isa.reloc_seam(
+        reloc.apply_reloc, reloc.reloc_traits, riscv64_elf_reloc_type
+    );
+    isa.with_elf_attributes(?seam, elf_attributes);
+    isa.with_machine_flags(?seam, riscv64_machine_flags);
+    isa.with_normalize_image(?seam, reloc.resolve_riscv_pcrel_pairs);
+    isa.with_resolve_reloc_operand(?seam, reloc.resolve_riscv_reloc_operand);
+    isa.with_attributes(?seam, attributes.riscv64_build_attributes,
+                        attributes.riscv64_merge_attributes);
 
-    # the ELF build-attributes descriptor: the writer stamps a `.riscv.attributes`
-    # ISA-string section from it so external tools decode imafd with no manual
-    # `--mattr`.
-    attrs.section  = ".riscv.attributes";
-    attrs.sht      = elf.SHT_RISCV_ATTRIBUTES;
-    attrs.vendor   = "riscv";
+    var vt: isa.IsaVTable = isa.machine_isa(
+        arch_id, name, 243, xw, ?model, ?machine, ?seam
+    );
 
-    # the relocatable-object contract: riscv64 names its relocations in an ELF object
-    # and resolves them at link time, and both halves are declared here rather than
-    # attached to the vtable afterwards by a subsystem that knows the arch's name.
-    @seam = isa.reloc_seam(reloc.apply_reloc::*u8, reloc.reloc_traits::*u8,
-                                   riscv64_elf_reloc_type::*u8);
-    isa.with_elf_attributes(seam, attrs_hook);
-    # the `e_flags` derivation, declared beside the arch string because the two are
-    # claims about the same ISA and have to agree about the C extension
-    isa.with_machine_flags(seam, riscv64_machine_flags::*u8);
-    # the psABI hi/lo pair collapse, which every riscv64 image needs before anything
-    # resolves a relocation in it
-    isa.with_normalize_image(seam, reloc.resolve_riscv_pcrel_pairs::*u8);
-    # the build-attribute body: what an image HOLDS, derived and merged rather than
-    # stated, for the same reason `e_flags` is (#2828)
-    isa.with_attributes(seam, attributes.riscv64_build_attributes::*u8,
-                        attributes.riscv64_merge_attributes::*u8);
-
-    # elf_machine 243 is EM_RISCV, which RV32 and RV64 SHARE. the two are told apart in
-    # an ELF file by the class byte (ELFCLASS32 / ELFCLASS64), which the writer derives
-    # from this vtable's pointer width - so the width below is what distinguishes them
-    # and there is no second place stating it
-    @vt = isa.machine_isa(arch_id, name, 243, xw, model, machine, seam);
-
-    # the machine-model template the shared stages read. widths are in bytes; the
-    # register-file pointers borrow the same per-arch arrays the vtable does; the
-    # stack scalars stay 0 here and are overlaid by `target.select` from the abi.
-    #
-    # these four width fields are the ONLY per-member values in the machine
-    # description - everything else (the register file, roles, capability flags) is
-    # XLEN-independent, which is what lets both members share this function.
-    #
-    # `max_alu_width` IS THE REGISTER WIDTH, and on RV32 that makes an i64 wider than
-    # the ALU: `be.codegen.legalize` then splits it into two 4-byte lanes and threads
-    # the carry, exactly as it does for mos6502's 1-byte ALU. That path is why RV32
-    # needs no 64-bit integer arithmetic in this encoder.
     model.pointer_width = xw;
     model.max_alu_width = xw;
-    # the register-machine ALU floor: a sub-word op computes at 4 bytes so its result
-    # fully defines the register it spills through (#2749). NOT derived from the word
-    # width - the model's own comment says so - and 4 on both members.
     model.alu_min_width = 4;
     model.gpr_width     = xw;
     model.spill_width   = xw;
-    # a register move is `addi rd, rs, 0` at XLEN whatever the MIR width (encode.mach
-    # never consults it on that path): RV64 has no sub-word register write, and
-    # narrowing is explicit (sext.w / a shift pair). so no move extends anything and
-    # a self-move is inert at every width.
     model.endianness      = isa.ENDIAN_LITTLE;
-    # the D extension is in the `gc` baseline of BOTH members, so f0-f31 hold scalar
-    # doubles on rv32gc exactly as on rv64gc. this is independent of `has_v128` below,
-    # which stays false - and on rv32 it is the field that makes FLEN exceed XLEN,
-    # which is the pair the frame layout and the `ilp32d` convention both turn on.
     model.flen_bits       = 64;
-    # rv64gc has no 128-bit vector unit (the V extension is out of baseline), so
-    # vector ops scalarize before MIR lowering and none reaches the vector path.
     model.has_v128        = false;
     model.vector_bits     = isa.VECTOR_BITS_128;
-    # no lane-count ceiling: this vector unit is described completely by its register
-    # width, so the lane count follows from the width and the lane size (#2749)
     model.max_vector_lanes = isa.VECTOR_LANES_UNBOUNDED;
-    # no vector register file, so nothing crosses between one and memory (#2716)
     model.vec_mem_widths  = isa.VEC_MEM_NONE;
-    # THE CROSS-BANK PAIR IS AS WIDE AS BOTH BANKS (#2904). `fmv.w.x` / `fmv.x.w` exist
-    # on both members; `fmv.d.x` / `fmv.x.d` move all 64 bits between an f register and
-    # a GP one, so they need a 64-bit GP register and are RV64-only. On rv32 the D
-    # extension still puts doubles in f0-f31 - `flen_bits` above says so - which is
-    # exactly what makes `f64 :~ i64` ordinary to write here and impossible to encode
-    # in a register pair. Declaring 4 alone routes it through the frame.
     model.xbank_widths    = isa.XBANK_4;
     if (xw == 8) { model.xbank_widths = isa.XBANK_4_8; }
     model.vector_compute_generic = false;
-    # integer multiply is gated on secrets (#1646): rv64 documents no data-independent
-    # timing mode, so a secret multiply is always a variable-latency leak here.
     model.ct_trust_mul = false;
-    model.has_var_shift = true;        # SLL / SRL / SRA read the count from a register (#2217)
-    model.has_mul = true;              # MUL, the M extension (#2344)
-    # MULHU, the same M extension, at XLEN either way: 4 on RV32 and 8 on RV64. the
-    # register width rather than a literal, because the parameter IS the fact (#2778).
+    model.has_var_shift = true;
+    model.has_mul = true;
+    model.has_float = riscv.HAS_FLOAT;
     model.mul_hi_width = xw;
-    model.flat_addressing = true;      # a byte-addressed linear space (#2655)
-    model.ct_trust_var_shift = true;   # rv64 SLL/SRL variable shift is constant-time (#1646)
+    model.flat_addressing = true;
+    model.index_width          = xw * 8;
+    model.vector_op_bytes      = 16;
+    model.vectors_in_registers = true;
+    model.auto_vectorize       = true;
+    model.ct_trust_var_shift = true;
 
-    model.reg_classes     = classes;
+    model.reg_classes     = ?classes[0];
     model.reg_class_len   = 2;
     model.frame_ptr_reg   = riscv.FP;
     model.stack_ptr_reg   = riscv.SP;
-    model.reserved_regs   = reserved;
+    model.reserved_regs   = ?reserved[0];
     model.reserved_len    = 6;
     model.div_reg         = -1;
     model.div_hi_reg      = -1;
@@ -459,16 +204,9 @@ fun build_riscv(reg: *isa.IsaRegistry, arch_id: u32, name: str, xw: u32,
     model.red_zone          = 0;
     model.shadow_space      = 0;
 
-    isa.register(reg, vt);
-
-    ret R.ok[bool, str](true);
+    ret isa.register(reg, ?vt);
 }
 
-# the riscv64 forward reloc map produces the right R_RISCV_* number for each kind it
-# supports - R_RISCV_64 for the absolute data pointer (the rv64 width), R_RISCV_CALL_PLT
-# for the direct call pair, and the R_RISCV_PCREL_* types for the auipc-based load-
-# address idiom - and 0 (R_RISCV_NONE) for a kind it has no width-correct ELF type for
-# (the x86_64 GOT / 32S and the aarch64 page / lo12 kinds are not riscv64's)
 test "mach.lang.target.isa.riscv.register.riscv64_elf_reloc_type:forward_map" {
     if (riscv64_elf_reloc_type(of.RK_ABS64)        != elf.R_RISCV_64)           { ret 1; }
     if (riscv64_elf_reloc_type(of.RK_PC32)         != elf.R_RISCV_32_PCREL)     { ret 1; }
@@ -478,7 +216,6 @@ test "mach.lang.target.isa.riscv.register.riscv64_elf_reloc_type:forward_map" {
     if (riscv64_elf_reloc_type(of.RK_PCREL_LO12_S) != elf.R_RISCV_PCREL_LO12_S) { ret 1; }
     if (riscv64_elf_reloc_type(of.RK_ABS32)        != elf.R_RISCV_32)           { ret 1; }
 
-    # a kind riscv64 has no ELF type for maps to 0, the writer's unsupported signal.
     if (riscv64_elf_reloc_type(of.RK_GOTPCREL) != 0) { ret 1; }
     if (riscv64_elf_reloc_type(of.RK_ABS32S)   != 0) { ret 1; }
     if (riscv64_elf_reloc_type(of.RK_PAGE21)   != 0) { ret 1; }
@@ -486,89 +223,64 @@ test "mach.lang.target.isa.riscv.register.riscv64_elf_reloc_type:forward_map" {
     ret 0;
 }
 
-# register_riscv64 wires the ELF build-attributes descriptor (#1673): the installed
-# vtable's `elf_attributes` hook returns a `.riscv.attributes` descriptor naming the
-# riscv vendor, the SHT_RISCV_ATTRIBUTES type, Tag_RISCV_arch, and the imafd arch
-# string the backend's M / A / F / D instructions need, so external tools decode the
-# full instruction set with no manual `--mattr`
 test "mach.lang.target.isa.riscv.register.register_riscv64:build_attributes" {
     var reg: isa.IsaRegistry = isa.registry_init();
-    if (R.is_err[bool, str](register_riscv64(?reg))) { ret 1; }
+    fin { isa.registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_riscv64(?reg))) { ret 1; }
 
-    # register_riscv64 filled the descriptor and wired the hook on the vtable.
+    val registered: O.Option[*isa.IsaVTable] = isa.lookup(?reg, isa.arch_name_for(isa.ARCH_RISCV64));
+    if (O.is_none[*isa.IsaVTable](registered)) { ret 1; }
+    val riscv64_vtable: *isa.IsaVTable = O.unwrap[*isa.IsaVTable](registered);
     if (riscv64_vtable.reloc == nil)                { ret 1; }
-    if (riscv64_vtable.reloc.elf_attributes == nil) { ret 1; }
-    val attr: *elf.BuildAttributes = riscv64_elf_attributes();
+    if (!riscv64_vtable.reloc.has_elf || !riscv64_vtable.reloc.elf.has_attributes) { ret 1; }
+    val attr: *elf.BuildAttributes = ?riscv64_vtable.reloc.elf.attributes;
     if (!str_equals(attr.section, ".riscv.attributes")) { ret 1; }
     if (attr.sht != elf.SHT_RISCV_ATTRIBUTES)           { ret 1; }
     if (!str_equals(attr.vendor, "riscv"))              { ret 1; }
 
-    # the descriptor names the CONTAINER and nothing inside it. what an image claims
-    # is per-image and comes from the derivation hook, which is declared as a pair
-    # with the merge so a link can never state one input's claims as the image's
-    if (riscv64_vtable.reloc.build_attributes == nil) { ret 1; }
-    if (riscv64_vtable.reloc.merge_attributes == nil) { ret 1; }
-    if (!isa.declares_attributes(?riscv64_vtable))    { ret 1; }
+    if (riscv64_vtable.reloc.normalize == nil)       { ret 1; }
+    if (riscv64_vtable.reloc.resolve_operand == nil) { ret 1; }
+    if (riscv64_vtable.reloc.elf.build_attributes == nil) { ret 1; }
+    if (riscv64_vtable.reloc.elf.merge_attributes == nil) { ret 1; }
+    if (!isa.declares_attributes(riscv64_vtable))    { ret 1; }
     ret 0;
 }
 
-# ONE BUILDER MUST WIRE ITS TWO MEMBERS ALIKE
-#
-# `build_riscv` fills either arch's storage from the width it is handed, so the two
-# members can differ in their WIDTHS and in nothing else. A setter inside it that
-# names a module global instead of its parameter still compiles, still passes every
-# rv64 test - because rv64 is the member whose globals those are - and silently leaves
-# the other member's machine half-built. That is exactly what happened between #2778
-# and this fix: five capability setters and the two register files named
-# `riscv64_*` inside the shared builder, so the rv32 register machine had no assembly
-# printer, no inline-asm clobber analyser, no `asm_returns`, no constant-time scanner
-# and no DWARF register map, and pointed at rv64's reserved-register array.
-#
-# THE ASYMMETRY IS THE ASSERTION. Checking rv32's hooks against a hand-written list
-# would restate the builder; checking them against RV64'S proves the builder wired
-# both members from the same lines, which is the property that was broken. A capability
-# added to one member and not the other now fails here rather than at a user's build.
 test "mach.lang.target.isa.riscv.register.build_riscv:both_members_are_wired_alike" {
     var reg: isa.IsaRegistry = isa.registry_init();
-    if (R.is_err[bool, str](register_riscv64(?reg))) { ret 1; }
-    if (R.is_err[bool, str](register_riscv32(?reg))) { ret 1; }
+    fin { isa.registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_riscv64(?reg))) { ret 1; }
+    if (R.is_err[R.Void, str](register_riscv32(?reg))) { ret 1; }
 
-    val m64: *isa.RegMachine = riscv64_vtable.machine;
-    val m32: *isa.RegMachine = riscv32_vtable.machine;
+    val v64: O.Option[*isa.IsaVTable] = isa.lookup(?reg, isa.arch_name_for(isa.ARCH_RISCV64));
+    val v32: O.Option[*isa.IsaVTable] = isa.lookup(?reg, isa.arch_name_for(isa.ARCH_RISCV32));
+    if (O.is_none[*isa.IsaVTable](v64) || O.is_none[*isa.IsaVTable](v32)) { ret 1; }
+    val m64: *isa.RegMachine = O.unwrap[*isa.IsaVTable](v64).machine;
+    val m32: *isa.RegMachine = O.unwrap[*isa.IsaVTable](v32).machine;
     if (m64 == nil || m32 == nil) { ret 1; }
-    # the two machines are DISTINCT objects, or the rest of this test is vacuous
     if (m64 == m32) { ret 1; }
 
-    # every capability either both members have or neither does
-    if ((m64.emit_asm == nil)     != (m32.emit_asm == nil))     { ret 1; }
-    if ((m64.asm_clobbers == nil) != (m32.asm_clobbers == nil)) { ret 1; }
-    if ((m64.asm_returns == nil)  != (m32.asm_returns == nil))  { ret 1; }
-    if ((m64.asm_ct_scan == nil)  != (m32.asm_ct_scan == nil))  { ret 1; }
+    if (m64.has_assembly != m32.has_assembly)                    { ret 1; }
+    if ((m64.assembly.emit == nil) != (m32.assembly.emit == nil)) { ret 1; }
+    if ((m64.assembly.clobbers == nil) != (m32.assembly.clobbers == nil)) { ret 1; }
+    if ((m64.assembly.returns == nil) != (m32.assembly.returns == nil)) { ret 1; }
+    if ((m64.assembly.ct_scan == nil) != (m32.assembly.ct_scan == nil)) { ret 1; }
     if ((m64.dwarf_reg == nil)    != (m32.dwarf_reg == nil))    { ret 1; }
     if ((m64.cv_reg == nil)       != (m32.cv_reg == nil))       { ret 1; }
     if ((m64.select == nil)       != (m32.select == nil))       { ret 1; }
     if ((m64.encode == nil)       != (m32.encode == nil))       { ret 1; }
-    # and rv32 really does have them, so "alike" cannot be satisfied by both being nil
-    if (m32.emit_asm == nil || m32.asm_clobbers == nil || m32.dwarf_reg == nil) { ret 1; }
+    if (!m32.has_assembly || m32.assembly.emit == nil || m32.assembly.clobbers == nil || m32.dwarf_reg == nil) { ret 1; }
 
-    # each member's register files are ITS OWN storage, not a borrow of the other's -
-    # the reserved list carries a declared width, so a shared array would report one
-    # member's registers as the other's size
     if (m64.reserved_regs == m32.reserved_regs)             { ret 1; }
     if (m64.reload_scratch_regs == m32.reload_scratch_regs) { ret 1; }
     if (m64.reserved_reg_count != m32.reserved_reg_count)   { ret 1; }
     if (m32.reserved_regs[0].size != 4) { ret 1; }
     if (m64.reserved_regs[0].size != 8) { ret 1; }
-    # the same register ids, because the numbering is architectural
     if (m32.reserved_regs[0].id != m64.reserved_regs[0].id) { ret 1; }
     if (m32.scratch_reg != m64.scratch_reg)                 { ret 1; }
     ret 0;
 }
 
-# riscv64_dwarf_reg reproduces the RISC-V psABI DWARF numbering: the integer
-# registers x0..x31 map identically (0..31) and the float registers f0..f31 map to
-# 32..63. The frame pointer s0/fp (x8 -> 8), return address ra (x1 -> 1), and stack
-# pointer sp (x2 -> 2) are the load-bearing entries a DWARF frame base names
 test "mach.lang.target.isa.riscv.register.riscv64_dwarf_reg:psabi_numbers" {
     if (riscv64_dwarf_reg(riscv.X0)  != 0)  { ret 1; }
     if (riscv64_dwarf_reg(riscv.RA)  != 1)  { ret 1; }
@@ -576,14 +288,11 @@ test "mach.lang.target.isa.riscv.register.riscv64_dwarf_reg:psabi_numbers" {
     if (riscv64_dwarf_reg(riscv.FP)  != 8)  { ret 1; }
     if (riscv64_dwarf_reg(riscv.X31) != 31) { ret 1; }
 
-    # the frame pointer s0/fp (x8) is what DW_AT_frame_base names
     if (riscv64_dwarf_reg(riscv.FRAME_REG) != 8) { ret 1; }
 
-    # f0..f31 are composite ids (the float class tag in the high byte) -> 32..63
     if (riscv64_dwarf_reg(isa.regid_make(isa.REG_CLASS_ID_XMM, riscv.F0))  != 32) { ret 1; }
     if (riscv64_dwarf_reg(isa.regid_make(isa.REG_CLASS_ID_XMM, riscv.F31)) != 63) { ret 1; }
 
-    # an id riscv64 assigns no DWARF number returns -1
     if (riscv64_dwarf_reg(isa.regid_make(isa.REG_CLASS_ID_GP, 32)) != -1) { ret 1; }
     ret 0;
 }

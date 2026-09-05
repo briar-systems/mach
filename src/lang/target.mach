@@ -1,24 +1,9 @@
-# compose a Target from per-dimension instruction-set, ABI, os, and object-format vtables
-#
-# A `Target` bundles the four orthogonal target dimensions - instruction set,
-# ABI, operating system, and object format - as borrowed vtable pointers plus
-# their derived comptime identity ids. The middle end and back end dispatch
-# through the vtables and never branch on the ids.
-#
-# A `TargetRegistry` bundles the four per-dimension registries; the session (or
-# driver) owns one, `register_all` installs every implementation into it, and
-# `select_of` composes a Target from it by name: it looks up the isa, os, abi, and
-# object-format vtables under the names the manifest spells. The object format is
-# the one substrate with a derived default - an empty of name defers to
-# `default_of_name`, the os's `default_of` for a register machine and the
-# finished-module format for a whole-module emitter, so `select` (the common case)
-# is `select_of` with no override. The legacy os/arch/abi/of ids are derived from
-# the resolved vtables' `.id` fields and kept on the Target, so the id readers and
-# the comptime tag space are unaffected by the name-based composition.
-
 use std.allocator.page;
+use std.system.panic.panic;
 use fs: std.filesystem;
-use format: std.format;
+use std.encoding.binary;
+use std.format;
+use std.print;
 use std.collections.vector;
 use std.collections.vector.Vector;
 use std.types.bool.bool;
@@ -36,6 +21,8 @@ use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
+use fp: mach.lang.build.fingerprint;
+use mach.lang.be.codegen.debug_input;
 use mach.lang.intern;
 use mach.lang.target.abi;
 use mach.lang.target.abi.aapcs64;
@@ -55,36 +42,20 @@ use mach.lang.target.of.coff;
 use mach.lang.target.of.elf;
 use mach.lang.target.of.macho;
 use mach.lang.target.of.raw;
-use spv: mach.lang.target.of.spv;
+use mach.lang.target.of.spv;
 use mach.lang.target.os;
 use mach.lang.target.os.darwin;
 use mach.lang.target.os.freestanding;
 use mach.lang.target.os.linux;
 use mach.lang.target.os.windows;
 use mach.lang.target.resolved;
+use target_testing: mach.lang.target.testing;
 
-# byte order of a target's scalar storage, re-exported from the isa layer so
-# consumers can spell them as `target.ENDIAN_LITTLE` / `target.ENDIAN_BIG`.
 fwd isa.ENDIAN_LITTLE;
 fwd isa.ENDIAN_BIG;
 
-# the resolved-target record, re-exported from the leaf `target.resolved` module
-# so consumers can spell it as `target.Target`. it lives there (not here) so the
-# concrete backends can name a `*Target` without importing this composition
-# root, which would close an import cycle.
 fwd resolved.Target;
 
-# the operating-system id of the host this compiler binary was built for
-#
-# folds the `$mach.build.os` comptime read into the matching `os.OS_*` id.
-# resolving inside a function body keeps the read an ordinary runtime load,
-# sidestepping the comptime-only fold path a global initializer would take.
-# consumers that analyze code in isolation (the editor / LSP, which has no
-# project-selected target) seed a neutral comptime context from the host ids so
-# `$if ($mach.build.os == $mach.os.linux)` evaluates against the running
-# compiler's target rather than an unknown placeholder.
-# ---
-# ret: the host os id, in the same space as os.OS_*
 pub fun host_os_id() u32 {
     $if ($mach.build.os == $mach.os.linux)   { ret os.OS_LINUX; }
     $or ($mach.build.os == $mach.os.darwin)  { ret os.OS_DARWIN; }
@@ -92,11 +63,6 @@ pub fun host_os_id() u32 {
     $or                                      { ret os.OS_UNKNOWN; }
 }
 
-# the architecture id of the host this compiler binary was built for
-#
-# folds the `$mach.build.arch` comptime read into the matching `isa.ARCH_*` id.
-# ---
-# ret: the host architecture id, in the same space as isa.ARCH_*
 pub fun host_arch_id() u32 {
     $if ($mach.build.arch == $mach.arch.x86_64)  { ret isa.ARCH_X86_64; }
     $or ($mach.build.arch == $mach.arch.aarch64) { ret isa.ARCH_AARCH64; }
@@ -104,23 +70,10 @@ pub fun host_arch_id() u32 {
     $or                                          { ret isa.ARCH_UNKNOWN; }
 }
 
-# the pointer width, in bits, of the host this compiler binary was built for
-# ---
-# ret: the host pointer width in bits
 pub fun host_pointer_width() u32 {
     ret ($mach.build.pointer_width)::u32;
 }
 
-# the `va_list` layout of the host this compiler binary was built for (#3004)
-#
-# Reads the OS implementations' OWN declarations rather than restating them, so the
-# editor's target-less context and a real build cannot disagree about what a
-# `va_list` is on this machine. Parallels `host_os_id` / `host_arch_id`: the os is
-# folded from the build and the architecture comes from `host_arch_id`, and no
-# registry is brought up, because the editor seeds a buffer's context before one
-# exists.
-# ---
-# ret: the host platform's declared layout, or none when it declares none
 pub fun host_va_list() O.Option[os.VaList] {
     $if ($mach.build.os == $mach.os.linux)   { ret linux.linux_va_list(host_arch_id()); }
     $or ($mach.build.os == $mach.os.darwin)  { ret darwin.darwin_va_list(host_arch_id()); }
@@ -128,59 +81,27 @@ pub fun host_va_list() O.Option[os.VaList] {
     $or                                      { ret freestanding.freestanding_va_list(host_arch_id()); }
 }
 
-# the abi id of the host this compiler binary was built for
-#
-# folds the `$mach.build.abi` comptime read into the matching `abi.ABI_*` id, so
-# the editor's neutral comptime context resolves `$mach.build.abi` against the
-# running compiler's own convention rather than a placeholder. parallels
-# `host_os_id` / `host_arch_id`: a pure host fact read from the build, not an
-# (os, arch) -> abi composition switch.
-# ---
-# ret: the host abi id, in the same space as abi.ABI_*
 pub fun host_abi_id() u32 {
-    $if ($mach.build.abi == $mach.abi.sysv)    { ret abi.ABI_SYSV; }
-    $or ($mach.build.abi == $mach.abi.win64)   { ret abi.ABI_WIN64; }
-    $or ($mach.build.abi == $mach.abi.aapcs64) { ret abi.ABI_AAPCS64; }
-    # every member of the RISC-V family, not just one. this chain folds the abi the
-    # compiler was ITSELF built with, so a member missing here reports ABI_UNKNOWN
-    # for a compiler that is running perfectly well -- and a zero-`[target.*]`
-    # manifest then synthesizes `native` with the abi name "unknown", which resolves
-    # to nothing. that was live the moment the riscv64 default moved to lp64d
-    # (#2777): a riscv64 self-host builds under lp64d and would have folded here to
-    # ABI_UNKNOWN.
-    $or ($mach.build.abi == $mach.abi.lp64)    { ret abi.ABI_LP64; }
-    $or ($mach.build.abi == $mach.abi.lp64f)   { ret abi.ABI_LP64F; }
-    $or ($mach.build.abi == $mach.abi.lp64d)   { ret abi.ABI_LP64D; }
-    $or                                        { ret abi.ABI_UNKNOWN; }
+    ret ($mach.build.abi)::u32;
 }
 
-# the session/driver-owned bundle of the four per-dimension registries
-#
-# `register_all` installs every implementation into it and `select` composes a
-# Target from it, so the registration-before-selection ordering is an ordinary
-# init dependency on this owned value rather than a process-global invariant.
-# ---
-# isa:   instruction-set vtable registry
-# os:    operating-system vtable registry
-# abi:   calling-convention vtable registry
-# of:    object-format vtable registry
-# debug: debug-info producer vtable registry; populated post-hoc by the be-layer
-#        `dwarf.register_debug_hooks` (its producers live in the back end). the last
-#        dimension wired after registration rather than declared at it - the ISA
-#        relocation packers stopped being (#2244). it stays post-hoc because the
-#        target layer must register a model's identity without the back end present,
-#        so `of.debug_hooks_complete` enforces the pairing at bring-up instead (#2295)
 pub rec TargetRegistry {
     isa:   isa.IsaRegistry;
     os:    os.OsRegistry;
     abi:   abi.AbiRegistry;
     of:    of.OfRegistry;
     debug: of.DebugRegistry;
+    state: u8;
+    version: u32;
 }
 
-# construct a fresh TargetRegistry with every per-dimension slot empty
-# ---
-# ret: a zeroed TargetRegistry, ready for register_all
+pub def DebugDescriptorProvider: fun() R.Result[of.DebugVTable, str];
+
+val REGISTRY_FRESH:    u8 = 0;
+val REGISTRY_BUILDING: u8 = 1;
+val REGISTRY_READY:    u8 = 2;
+val REGISTRY_VERSION: u32 = 1;
+
 pub fun registry_init() TargetRegistry {
     var reg: TargetRegistry;
     reg.isa   = isa.registry_init();
@@ -188,97 +109,243 @@ pub fun registry_init() TargetRegistry {
     reg.abi   = abi.registry_init();
     reg.of    = of.registry_init();
     reg.debug = of.debug_registry_init();
+    reg.state = REGISTRY_FRESH;
+    reg.version = 0;
     ret reg;
 }
 
-# install every target-component implementation into `reg`
-#
-# composes the four orthogonal dimensions by invoking each implementation's
-# registering entry point: the x86-64, AArch64, and RISC-V (RV64) ISAs, the SysV /
-# Win64 / AAPCS64 / lp64d ABIs, the ELF / COFF / Mach-O / raw object formats, and
-# the Linux / Darwin / Windows / freestanding operating systems. The AArch64 and
-# RISC-V backends and the non-Linux stubs are registered so `select` reports an
-# unsupported pair rather than a missing registration; they fail loudly only when
-# their selection or encoding paths are reached. The RISC-V ISA is the slice-1
-# machine description: it composes and resolves but wires no codegen hooks yet.
-# Must be called once at startup, before any `select` against `reg`.
-# Every registrar is idempotent, so a redundant call is harmless. No interner is
-# needed: vtable string fields are immutable `str` constants, interned at the
-# point of use in the linker and object-format consumers.
-# ---
-# reg: the target registry to install every implementation into
-# ret: ok(true) once every implementation is registered, or the first error
-pub fun register_all(reg: *TargetRegistry) R.Result[bool, str] {
-    var res: R.Result[bool, str] = x64.register_x64(?reg.isa);
-    if (R.is_err[bool, str](res)) { ret res; }
-    res = arm64.register_arm64(?reg.isa);
-    if (R.is_err[bool, str](res)) { ret res; }
-    res = riscv.register_riscv64(?reg.isa);
-    if (R.is_err[bool, str](res)) { ret res; }
-    res = riscv.register_riscv32(?reg.isa);
-    if (R.is_err[bool, str](res)) { ret res; }
-    res = spirv.register_spirv(?reg.isa);
-    if (R.is_err[bool, str](res)) { ret res; }
-    res = m6502.register_mos6502(?reg.isa);
-    if (R.is_err[bool, str](res)) { ret res; }
-
-    res = sysv.register(?reg.abi);
-    if (R.is_err[bool, str](res)) { ret res; }
-    res = win64.register_win64(?reg.abi);
-    if (R.is_err[bool, str](res)) { ret res; }
-    res = aapcs64.register(?reg.abi);
-    if (R.is_err[bool, str](res)) { ret res; }
-    res = rvabi.register(?reg.abi);
-    if (R.is_err[bool, str](res)) { ret res; }
-    res = sabi.register(?reg.abi);
-    if (R.is_err[bool, str](res)) { ret res; }
-    res = mos6502.register(?reg.abi);
-    if (R.is_err[bool, str](res)) { ret res; }
-
-    res = elf.register(?reg.of);
-    if (R.is_err[bool, str](res)) { ret res; }
-    res = coff.register_coff(?reg.of);
-    if (R.is_err[bool, str](res)) { ret res; }
-    res = macho.register_macho(?reg.of);
-    if (R.is_err[bool, str](res)) { ret res; }
-    res = raw.register(?reg.of);
-    if (R.is_err[bool, str](res)) { ret res; }
-    res = spv.register(?reg.of);
-    if (R.is_err[bool, str](res)) { ret res; }
-
-    res = linux.register_linux(?reg.os);
-    if (R.is_err[bool, str](res)) { ret res; }
-    res = darwin.register_darwin(?reg.os);
-    if (R.is_err[bool, str](res)) { ret res; }
-    res = windows.register_windows(?reg.os);
-    if (R.is_err[bool, str](res)) { ret res; }
-    res = freestanding.register_freestanding(?reg.os);
-    if (R.is_err[bool, str](res)) { ret res; }
-
-    # the debug-model identities resolve at select time; the be-layer registrar
-    # wires each model's produce hook onto them post-hoc (driver.setup_registry).
-    of.debug_register_identities(?reg.debug);
-
-    ret R.ok[bool, str](true);
+pub fun registry_dnit(reg: *TargetRegistry) {
+    if (reg == nil) { ret; }
+    isa.registry_dnit(?reg.isa);
+    os.registry_dnit(?reg.os);
+    abi.registry_dnit(?reg.abi);
+    of.registry_dnit(?reg.of);
+    of.debug_registry_dnit(?reg.debug);
+    reg.state = REGISTRY_FRESH;
+    reg.version = 0;
 }
 
-# compose a Target from `reg` by name, with an explicit object-format override
-#
-# looks up the isa, os, and abi vtables under their names and resolves the object
-# format under `of_name` when it is non-empty, falling back to `default_of_name`
-# when `of_name` is empty. derives the legacy os/arch/abi/of ids from the resolved
-# vtables' `.id` fields. allocates nothing - every vtable pointer is borrowed.
-# fails if any required implementation is not registered in `reg` under the
-# requested name. the of axis is the one substrate with a derived default; isa,
-# os, and abi are always spelled explicitly.
-# ---
-# reg:      the target registry populated by register_all
-# isa_name: instruction-set name (e.g. "x86_64", "aarch64")
-# os_name:  operating-system name (e.g. "linux", "windows")
-# abi_name: calling-convention name (e.g. "sysv64", "win64", "aapcs64")
-# of_name:  object-format name (e.g. "elf", "raw"), or "" for the derived default
-# ret:      the composed Target, or an error describing the missing piece
+fun registry_empty(reg: *TargetRegistry) bool {
+    ret reg != nil && reg.isa.count == 0 && reg.os.count == 0 && reg.abi.count == 0
+        && reg.of.count == 0 && reg.debug.count == 0;
+}
+
+fun isa_identity(reg: *TargetRegistry, name: str, id: u32) bool {
+    val found: O.Option[*isa.IsaVTable] = isa.lookup(?reg.isa, name);
+    ret O.is_some[*isa.IsaVTable](found) && O.unwrap[*isa.IsaVTable](found).id == id;
+}
+
+fun os_identity(reg: *TargetRegistry, name: str, id: u32) bool {
+    val found: O.Option[*os.OsVTable] = os.lookup(?reg.os, name);
+    ret O.is_some[*os.OsVTable](found) && O.unwrap[*os.OsVTable](found).id == id;
+}
+
+fun abi_identity(reg: *TargetRegistry, name: str, id: u32) bool {
+    val found: O.Option[*abi.AbiVTable] = abi.lookup(?reg.abi, name);
+    ret O.is_some[*abi.AbiVTable](found) && O.unwrap[*abi.AbiVTable](found).id == id;
+}
+
+fun of_identity(reg: *TargetRegistry, name: str, id: u32) bool {
+    val found: O.Option[*of.OfVTable] = of.lookup(?reg.of, name);
+    ret O.is_some[*of.OfVTable](found) && O.unwrap[*of.OfVTable](found).id == id;
+}
+
+fun production_registry_complete(reg: *TargetRegistry) bool {
+    if (reg == nil) { ret false; }
+    if (R.is_err[R.Void, str](isa.registry_validate(?reg.isa))
+        || R.is_err[R.Void, str](os.registry_validate(?reg.os))
+        || R.is_err[R.Void, str](abi.registry_validate(?reg.abi))
+        || R.is_err[R.Void, str](of.registry_validate(?reg.of))
+        || R.is_err[R.Void, str](of.debug_registry_validate(?reg.debug))) { ret false; }
+    if (isa.registered_count(?reg.isa) < 6
+        || !isa_identity(reg, "x86_64", isa.ARCH_X86_64)
+        || !isa_identity(reg, "aarch64", isa.ARCH_AARCH64)
+        || !isa_identity(reg, "riscv64", isa.ARCH_RISCV64)
+        || !isa_identity(reg, "riscv32", isa.ARCH_RISCV32)
+        || !isa_identity(reg, "spirv", isa.ARCH_SPIRV)
+        || !isa_identity(reg, "mos6502", isa.ARCH_MOS6502)) { ret false; }
+    if (os.registered_count(?reg.os) < 4
+        || !os_identity(reg, "linux", os.OS_LINUX)
+        || !os_identity(reg, "darwin", os.OS_DARWIN)
+        || !os_identity(reg, "windows", os.OS_WINDOWS)
+        || !os_identity(reg, "freestanding", os.OS_FREESTANDING)) { ret false; }
+    if (abi.registered_count(?reg.abi) < 11
+        || !abi_identity(reg, "sysv64", abi.ABI_SYSV)
+        || !abi_identity(reg, "win64", abi.ABI_WIN64)
+        || !abi_identity(reg, "aapcs64", abi.ABI_AAPCS64)
+        || !abi_identity(reg, "lp64", abi.ABI_LP64)
+        || !abi_identity(reg, "lp64f", abi.ABI_LP64F)
+        || !abi_identity(reg, "lp64d", abi.ABI_LP64D)
+        || !abi_identity(reg, "ilp32", abi.ABI_ILP32)
+        || !abi_identity(reg, "ilp32f", abi.ABI_ILP32F)
+        || !abi_identity(reg, "ilp32d", abi.ABI_ILP32D)
+        || !abi_identity(reg, "spirv", abi.ABI_SPIRV)
+        || !abi_identity(reg, "mos6502", abi.ABI_UNKNOWN)) { ret false; }
+    if (of.registered_count(?reg.of) < 5
+        || !of_identity(reg, "elf", of.OF_ELF)
+        || !of_identity(reg, "coff", of.OF_COFF)
+        || !of_identity(reg, "macho", of.OF_MACHO)
+        || !of_identity(reg, "raw", of.OF_RAW)
+        || !of_identity(reg, "spv", of.OF_SPV)) { ret false; }
+    if (of.debug_registered_count(?reg.debug) == 0
+        || R.is_err[R.Void, str](of.debug_hooks_complete(?reg.debug))) { ret false; }
+    var i: u32 = 0;
+    for (i < of.registered_count(?reg.of)) {
+        val fmt_o: O.Option[*of.OfVTable] = of.registered(?reg.of, i);
+        if (O.is_none[*of.OfVTable](fmt_o)) { ret false; }
+        val fmt: *of.OfVTable = O.unwrap[*of.OfVTable](fmt_o);
+        if (!str_empty(fmt.default_debug)) {
+            val dbg_o: O.Option[*of.DebugVTable] = of.debug_lookup(?reg.debug, fmt.default_debug);
+            if (O.is_none[*of.DebugVTable](dbg_o)) { ret false; }
+            val dbg: *of.DebugVTable = O.unwrap[*of.DebugVTable](dbg_o);
+            if (dbg.produce == nil) { ret false; }
+            if (str_equals(fmt.default_debug, "dwarf") && dbg.id != of.DBG_DWARF) { ret false; }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun register_all(reg: *TargetRegistry, debug_provider: DebugDescriptorProvider) R.Result[R.Void, str] {
+    if (reg == nil || debug_provider == nil) {
+        ret R.err[R.Void, str]("target: register_all requires a registry and debug descriptor provider");
+    }
+    if (reg.state == REGISTRY_READY) {
+        if (reg.version == REGISTRY_VERSION && production_registry_complete(reg)) {
+            ret R.ok_void[str]();
+        }
+        ret R.err[R.Void, str]("target: published registry invariants do not match this catalog version");
+    }
+    if (reg.state != REGISTRY_FRESH || !registry_empty(reg)) {
+        ret R.err[R.Void, str]("target: register_all refuses a partial or foreign registry");
+    }
+    reg.state = REGISTRY_BUILDING;
+    var res: R.Result[R.Void, str] = x64.register_x64(?reg.isa);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+    res = arm64.register_arm64(?reg.isa);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+    res = riscv.register_riscv64(?reg.isa);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+    res = riscv.register_riscv32(?reg.isa);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+    res = spirv.register_spirv(?reg.isa);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+    res = m6502.register_mos6502(?reg.isa);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+
+    res = sysv.register(?reg.abi);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+    res = win64.register_win64(?reg.abi);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+    res = aapcs64.register(?reg.abi);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+    res = rvabi.register(?reg.abi);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+    res = sabi.register(?reg.abi);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+    res = mos6502.register(?reg.abi);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+
+    res = elf.register(?reg.of);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+    res = coff.register_coff(?reg.of);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+    res = macho.register_macho(?reg.of);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+    res = raw.register(?reg.of);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+    res = spv.register(?reg.of);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+
+    res = linux.register_linux(?reg.os);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+    res = darwin.register_darwin(?reg.os);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+    res = windows.register_windows(?reg.os);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+    res = freestanding.register_freestanding(?reg.os);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+
+    val debug_r: R.Result[of.DebugVTable, str] = debug_provider();
+    if (R.is_err[of.DebugVTable, str](debug_r)) {
+        val debug_err: str = R.unwrap_err[of.DebugVTable, str](debug_r);
+        registry_dnit(reg);
+        ret R.err[R.Void, str](debug_err);
+    }
+    var debug_descriptor: of.DebugVTable = R.unwrap_ok[of.DebugVTable, str](debug_r);
+    res = of.debug_register(?reg.debug, ?debug_descriptor);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+    res = of.debug_hooks_complete(?reg.debug);
+    if (R.is_err[R.Void, str](res)) { registry_dnit(reg); ret res; }
+    if (!production_registry_complete(reg)) {
+        registry_dnit(reg);
+        ret R.err[R.Void, str]("target: registrar did not construct the complete production registry");
+    }
+
+    reg.version = REGISTRY_VERSION;
+    reg.state = REGISTRY_READY;
+
+    ret R.ok_void[str]();
+}
+
+pub rec TargetRequest {
+    isa_name:      str;
+    os_name:       str;
+    abi_name:      str;
+    of_name:       str;
+    base:          u64;
+    stack_reserve: u64;
+    stack_commit:  u64;
+    env_name:      str;
+    label:         str;
+}
+
+pub fun target_request(isa_name: str, os_name: str, abi_name: str) TargetRequest {
+    var r: TargetRequest;
+    r.isa_name      = isa_name;
+    r.os_name       = os_name;
+    r.abi_name      = abi_name;
+    r.of_name       = "";
+    r.base          = 0;
+    r.stack_reserve = 0;
+    r.stack_commit  = 0;
+    ret r;
+}
+
+pub fun with_of(req: *TargetRequest, of_name: str) {
+    req.of_name = of_name;
+}
+
+pub fun with_env(req: *TargetRequest, env_name: str, label: str) {
+    req.env_name = env_name;
+    req.label    = label;
+}
+
+pub fun with_image(req: *TargetRequest, base: u64, stack_reserve: u64, stack_commit: u64) {
+    req.base          = base;
+    req.stack_reserve = stack_reserve;
+    req.stack_commit  = stack_commit;
+}
+
 pub fun select_of(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: str, of_name: str) R.Result[resolved.Target, str] {
+    var req: TargetRequest = target_request(isa_name, os_name, abi_name);
+    with_of(?req, of_name);
+    ret resolve(reg, ?req);
+}
+
+pub fun resolve(reg: *TargetRegistry, req: *TargetRequest) R.Result[resolved.Target, str] {
+    if (reg == nil || req == nil) {
+        ret R.err[resolved.Target, str]("target: resolve requires a registry and target request");
+    }
+    if (reg.state != REGISTRY_READY || reg.version != REGISTRY_VERSION
+        || !production_registry_complete(reg)) {
+        ret R.err[resolved.Target, str]("target: resolve requires a published registry at the current catalog version");
+    }
+    val isa_name: str = req.isa_name;
+    val os_name:  str = req.os_name;
+    val abi_name: str = req.abi_name;
+    val of_name:  str = req.of_name;
+
     val opt_os_vt: O.Option[*os.OsVTable] = os.lookup(?reg.os, os_name);
     if (O.is_none[*os.OsVTable](opt_os_vt)) {
         var nb: [256]u8;
@@ -300,9 +367,6 @@ pub fun select_of(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: s
     val arch_vt: *isa.IsaVTable = O.unwrap[*isa.IsaVTable](opt_arch_vt);
     val abi_vt:  *abi.AbiVTable = O.unwrap[*abi.AbiVTable](opt_abi_vt);
 
-    # an explicit of name selects the object format directly; an empty name defers
-    # to the (os, isa) default, so deriving the of stays the default and a
-    # spelled-out name overrides it without disturbing the other axes.
     var of_sel: str = of_name;
     if (str_empty(of_sel)) {
         val opt_def: O.Option[str] = default_of_name(reg, os_vt, arch_vt);
@@ -319,12 +383,6 @@ pub fun select_of(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: s
 
     val of_vt: *of.OfVTable = O.unwrap[*of.OfVTable](opt_of_vt);
 
-    # the joint capability of the resolved tuple: a calling convention is per-ISA,
-    # an object format relocates and writes only the ISAs it declares, an OS links
-    # and loads only its supported formats, and an ISA emits only with a wired
-    # codegen. `tuple_capability` is the single predicate `mach info targets` reads
-    # too, so an unfilled joint cell fails here naming the missing capability, not
-    # deep in codegen or link. per-dimension "not registered" errors above stand.
     val cap: u32 = tuple_capability(os_vt, arch_vt, abi_vt, of_vt);
     if (cap != TUPLE_OK) {
         ret R.err[resolved.Target, str](tuple_capability_message(cap, os_vt, arch_vt, abi_vt, of_vt));
@@ -332,41 +390,31 @@ pub fun select_of(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: s
 
     var t: resolved.Target;
     t.os      = os_vt;
-    # no manifest base override by default; the driver overwrites this from the
-    # selected target's `base`, and the linker falls back to os_vt.base_addr when 0.
-    t.base    = 0;
-    # likewise unset by default; the driver overwrites both from the selected
-    # target's manifest keys and each image writer keeps its own default at 0 (#2990)
-    t.stack_reserve = 0;
-    t.stack_commit  = 0;
+    val env_r: R.Result[u32, str] = resolve_environment(arch_vt, req);
+    if (R.is_err[u32, str](env_r)) { ret R.err[resolved.Target, str](R.unwrap_err[u32, str](env_r)); }
+    t.env_id      = R.unwrap_ok[u32, str](env_r);
+    t.env_profile = isa.environment_profile(arch_vt, t.env_id);
+    t.env_name    = req.env_name;
+    t.base    = req.base;
+    t.stack_reserve = req.stack_reserve;
+    t.stack_commit  = req.stack_commit;
     t.isa     = arch_vt;
-    # the register-machine contract, or nil for a whole-module emitter. every stage
-    # that reads it runs after `codegen_module` forks on `isa.emits_whole_module`.
+    isa.object_target(arch_vt, ?t.object);
     t.arch    = arch_vt.machine;
     t.abi     = abi_vt;
     t.of      = of_vt;
 
-    # the platform C-variadic placement rule for THIS (os, isa) pair. neither vtable
-    # holds it alone: darwin and linux compose the same "aapcs64" convention, and
-    # darwin's x86_64 keeps SysV's ordinary rule, so it is the os's per-architecture
-    # answer, resolved once here for the call lowering to read.
     t.variadic_args_on_stack = os.variadic_stack_for(os_vt, arch_vt.id);
 
-    # the platform FIXED stack-argument granularity rule for THIS (os, isa) pair, on the
-    # same axis and for the same reason: Apple arm64 gives a stack-passed fixed argument
-    # its natural size where the AAPCS64 vtable darwin and linux share rounds it up to
-    # eight bytes. resolved beside the variadic fact, never merged with it - Apple keeps
-    # the eight-byte minimum for its variadic tail.
     t.fixed_args_natural_size = os.natural_stack_args_for(os_vt, arch_vt.id);
 
-    # the platform's `va_list` shape for THIS (os, isa) pair, on the same axis again:
-    # darwin's arm64 `va_list` is a `char *` and linux's is AAPCS64's 32-byte composite,
-    # from the one convention vtable both compose. A platform that declares none leaves
-    # both scalars 0, which the `#[abi_type("va_list")]` declaration refuses by name
-    # rather than reading as a pointer.
     var vl_size:  u32 = 0;
     var vl_align: u32 = 0;
-    val vl: O.Option[os.VaList] = os.va_list_for(os_vt, arch_vt.id);
+    val vl_r: R.Result[O.Option[os.VaList], str] = os.va_list_checked_for(os_vt, arch_vt.id);
+    if (R.is_err[O.Option[os.VaList], str](vl_r)) {
+        ret R.err[resolved.Target, str](R.unwrap_err[O.Option[os.VaList], str](vl_r));
+    }
+    val vl: O.Option[os.VaList] = R.unwrap_ok[O.Option[os.VaList], str](vl_r);
     if (O.is_some[os.VaList](vl)) {
         vl_size  = O.unwrap[os.VaList](vl).size;
         vl_align = O.unwrap[os.VaList](vl).align;
@@ -374,20 +422,24 @@ pub fun select_of(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: s
     t.va_list_size  = vl_size;
     t.va_list_align = vl_align;
 
-    # derive the legacy identity ids from the resolved vtables; the ~89 id-readers
-    # and the comptime tag space keep reading these unchanged.
     t.os_id   = t.os.id;
     t.arch_id = t.isa.id;
     t.abi_id  = t.abi.id;
 
-    # resolve the debug-info producer the object format declares by name (elf /
-    # mach-o -> "dwarf"). an EMPTY declaration (coff / raw) legitimately leaves
-    # `debug` nil: the tuple carries no debug model and `-g` emits nothing. a
-    # NON-EMPTY declaration whose producer misses the registry is a wiring bug -
-    # a `-g` build would otherwise succeed with zero debug info - so it fails
-    # loudly here, naming the missing producer and the live registry. the
-    # be-layer registrar installs the producer's hooks post-hoc, so the resolved
-    # vtable may still carry a nil `produce` (codegen rejects that at dispatch).
+    val page_r: R.Result[u64, str] = os.page_size_checked_for(os_vt, arch_vt.id);
+    if (R.is_err[u64, str](page_r)) { ret R.err[resolved.Target, str](R.unwrap_err[u64, str](page_r)); }
+    t.page_size = R.unwrap_ok[u64, str](page_r);
+
+    val fp_r: R.Result[O.Option[os.FsPolicy], str] = os.fs_policy_checked_for(os_vt, arch_vt.id);
+    if (R.is_err[O.Option[os.FsPolicy], str](fp_r)) {
+        ret R.err[resolved.Target, str](R.unwrap_err[O.Option[os.FsPolicy], str](fp_r));
+    }
+    val fp_opt: O.Option[os.FsPolicy] = R.unwrap_ok[O.Option[os.FsPolicy], str](fp_r);
+    if (O.is_none[os.FsPolicy](fp_opt)) {
+        ret R.err[resolved.Target, str](no_fs_policy_message(os_vt, arch_vt));
+    }
+    t.fs_policy = O.unwrap[os.FsPolicy](fp_opt);
+
     t.debug    = nil;
     t.debug_id = of.DBG_UNKNOWN;
     if (!str_empty(of_vt.default_debug)) {
@@ -398,11 +450,22 @@ pub fun select_of(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: s
         }
         t.debug    = O.unwrap[*of.DebugVTable](opt_dbg);
         t.debug_id = t.debug.id;
+        var debug_target: debug_input.DebugTarget;
+        debug_target.arch_id = arch_vt.id;
+        debug_target.os_id   = os_vt.id;
+        debug_target.abi_id  = abi_vt.id;
+        debug_target.of_id   = of_vt.id;
+        debug_target.dwarf_reg = nil;
+        debug_target.cv_reg    = nil;
+        if (arch_vt.machine != nil) {
+            debug_target.dwarf_reg = arch_vt.machine.dwarf_reg;
+            debug_target.cv_reg    = arch_vt.machine.cv_reg;
+        }
+        if (t.debug.supports == nil || !t.debug.supports(?debug_target)) {
+            ret R.err[resolved.Target, str]("target: selected debug model is incompatible with the target tuple");
+        }
     }
 
-    # assemble the machine model: copy the isa's model template by value, then
-    # overlay the selected abi's stack scalars (these vary by convention - sysv vs
-    # win64 - so the per-arch template leaves them 0 and select fills them here).
     val model_tmpl: *isa.MachineModel = t.isa.model;
     t.model              = @model_tmpl;
     t.model.stack_align  = t.abi.stack_align;
@@ -412,22 +475,139 @@ pub fun select_of(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: s
     ret R.ok[resolved.Target, str](t);
 }
 
-# the object format a target defaults to when the manifest spells no `of`
-#
-# A REGISTER MACHINE's codegen output is relocatable machine text, and which
-# container carries it is the os's business, so the os's `default_of` answers.
-# A WHOLE-MODULE EMITTER's output is a finished module: no os container carries
-# it and no linker consumes it, so the os has nothing to say and the format is
-# the registered one that declares its object output a finished artifact and
-# covers this instruction set (#2245). Both arms read only self-declarations -
-# the same ones `tuple_capability` reads - so a second whole-module family
-# resolves here with no edit.
-# ---
-# reg:    the target registry to search
-# os_vt:  the resolved operating-system vtable
-# isa_vt: the resolved instruction-set vtable
-# ret:    the default object-format name, or none when a whole-module emitter has
-#         no finished-module format registered for it
+pub val TARGET_FINGERPRINT_VERSION: u8 = 2;
+
+fun b2u8(b: bool) u8 {
+    if (b) { ret 1; }
+    ret 0;
+}
+
+pub fun fingerprint(t: *resolved.Target, e: *binary.Encoder) bool {
+    var ok: bool = true;
+
+    ok = ok && fp.write_domain_str(e, fp.DOMAIN_ARCH, TARGET_FINGERPRINT_VERSION, t.env_name);
+
+    ok = ok && fp.write_domain_u8(e, fp.DOMAIN_ARCH, isa.ARCH_CATALOG_VERSION, isa.arch_fingerprint_tag(t.arch_id));
+    ok = ok && fp.write_domain_str(e, fp.DOMAIN_ARCH, TARGET_FINGERPRINT_VERSION, t.isa.name);
+
+    ok = ok && fp.write_domain_u8(e, fp.DOMAIN_ABI, abi.ABI_CATALOG_VERSION, abi.abi_fingerprint_tag(t.abi_id));
+    ok = ok && fp.write_domain_str(e, fp.DOMAIN_ABI, TARGET_FINGERPRINT_VERSION, t.abi.name);
+
+    ok = ok && fp.write_domain_u8(e, fp.DOMAIN_OS, os.OS_CATALOG_VERSION, os.os_fingerprint_tag(t.os_id));
+    ok = ok && fp.write_domain_str(e, fp.DOMAIN_OS, TARGET_FINGERPRINT_VERSION, t.os.name);
+
+    ok = ok && fp.write_domain_u8(e, fp.DOMAIN_OF, of.OF_FORMAT_CATALOG_VERSION, of.of_fingerprint_tag(t.of.id));
+    ok = ok && fp.write_domain_str(e, fp.DOMAIN_OF, TARGET_FINGERPRINT_VERSION, t.of.name);
+
+    ok = ok && fp.write_domain_u32(e, fp.DOMAIN_DEBUG, TARGET_FINGERPRINT_VERSION, t.debug_id);
+
+    var backend_kind: u8 = 0;
+    if (isa.emits_whole_module(t.isa)) { backend_kind = 1; }
+    ok = ok && fp.write_domain_u8(e, fp.DOMAIN_BACKEND, TARGET_FINGERPRINT_VERSION, backend_kind);
+
+    ok = ok && fp.write_domain_u64(e, fp.DOMAIN_IMAGE, TARGET_FINGERPRINT_VERSION, t.base);
+    ok = ok && fp.write_domain_u64(e, fp.DOMAIN_IMAGE, TARGET_FINGERPRINT_VERSION, t.page_size);
+    ok = ok && fp.write_domain_u64(e, fp.DOMAIN_IMAGE, TARGET_FINGERPRINT_VERSION, t.stack_reserve);
+    ok = ok && fp.write_domain_u64(e, fp.DOMAIN_IMAGE, TARGET_FINGERPRINT_VERSION, t.stack_commit);
+    ok = ok && fp.write_domain_u8(e, fp.DOMAIN_IMAGE, TARGET_FINGERPRINT_VERSION, b2u8(t.variadic_args_on_stack));
+    ok = ok && fp.write_domain_u8(e, fp.DOMAIN_IMAGE, TARGET_FINGERPRINT_VERSION, b2u8(t.fixed_args_natural_size));
+    ok = ok && fp.write_domain_u32(e, fp.DOMAIN_IMAGE, TARGET_FINGERPRINT_VERSION, t.va_list_size);
+    ok = ok && fp.write_domain_u32(e, fp.DOMAIN_IMAGE, TARGET_FINGERPRINT_VERSION, t.va_list_align);
+
+    ok = ok && fingerprint_model(?t.model, e);
+    ok = ok && fingerprint_fs_policy(?t.fs_policy, e);
+
+    ret ok;
+}
+
+fun fingerprint_fs_policy(p: *os.FsPolicy, e: *binary.Encoder) bool {
+    var ok: bool = true;
+    val d: fp.Domain = fp.DOMAIN_FS_POLICY;
+    val v: u8 = TARGET_FINGERPRINT_VERSION;
+
+    ok = ok && fp.write_domain_str(e, d, v, p.sysroot);
+    ok = ok && fp.write_domain_str(e, d, v, p.toolchain_root);
+    ok = ok && fp.write_domain_str(e, d, v, p.dynamic_interpreter);
+    ok = ok && fp.write_domain_str(e, d, v, p.platform_lib);
+    ok = ok && fp.write_domain_u32(e, d, v, p.libdir_len);
+
+    var li: u32 = 0;
+    for (li < p.libdir_len) {
+        ok = ok && fp.write_domain_str(e, d, v, p.libdirs[li]);
+        li = li + 1;
+    }
+
+    ret ok;
+}
+
+fun fingerprint_model(m: *isa.MachineModel, e: *binary.Encoder) bool {
+    var ok: bool = true;
+    val d: fp.Domain = fp.DOMAIN_TARGET_MODEL;
+    val v: u8 = TARGET_FINGERPRINT_VERSION;
+
+    ok = ok && fp.write_domain_u32(e, d, v, m.pointer_width);
+    ok = ok && fp.write_domain_u32(e, d, v, m.gpr_width);
+    ok = ok && fp.write_domain_u32(e, d, v, m.max_alu_width);
+    ok = ok && fp.write_domain_u32(e, d, v, m.alu_min_width);
+    ok = ok && fp.write_domain_u32(e, d, v, m.spill_width);
+    ok = ok && fp.write_domain_u8(e, d, v, m.endianness);
+    ok = ok && fp.write_domain_u32(e, d, v, m.reg_class_len);
+
+    var ci: u32 = 0;
+    for (ci < m.reg_class_len) {
+        ok = ok && fp.write_domain_u8(e, d, v, m.reg_classes[ci].kind);
+        ok = ok && fp.write_domain_u32(e, d, v, m.reg_classes[ci].len);
+        ci = ci + 1;
+    }
+
+    ok = ok && fp.write_domain_u32(e, d, v, m.frame_ptr_reg::u32);
+    ok = ok && fp.write_domain_u32(e, d, v, m.stack_ptr_reg::u32);
+    ok = ok && fp.write_domain_u32(e, d, v, m.reserved_len::u32);
+
+    var ri: i32 = 0;
+    for (ri < m.reserved_len) {
+        ok = ok && fp.write_domain_u32(e, d, v, m.reserved_regs[ri].id::u32);
+        ok = ok && fp.write_domain_u8(e, d, v, m.reserved_regs[ri].size);
+        ri = ri + 1;
+    }
+
+    ok = ok && fp.write_domain_u32(e, d, v, m.div_reg::u32);
+    ok = ok && fp.write_domain_u32(e, d, v, m.div_hi_reg::u32);
+    ok = ok && fp.write_domain_u32(e, d, v, m.shift_count_reg::u32);
+    ok = ok && fp.write_domain_u64(e, d, v, m.incoming_arg_base::u64);
+    ok = ok && fp.write_domain_u32(e, d, v, m.stack_align);
+    ok = ok && fp.write_domain_u32(e, d, v, m.red_zone);
+    ok = ok && fp.write_domain_u32(e, d, v, m.shadow_space);
+    ok = ok && fp.write_domain_u8(e, d, v, b2u8(m.has_v128));
+    ok = ok && fp.write_domain_u32(e, d, v, m.vector_bits);
+    ok = ok && fp.write_domain_u32(e, d, v, m.max_vector_lanes);
+    ok = ok && fp.write_domain_u8(e, d, v, b2u8(m.vector_compute_generic));
+    ok = ok && fp.write_domain_u8(e, d, v, b2u8(m.has_lane_ops));
+    ok = ok && fp.write_domain_u8(e, d, v, b2u8(m.has_vec_build));
+    ok = ok && fp.write_domain_u32(e, d, v, m.vec_mem_widths);
+    ok = ok && fp.write_domain_u32(e, d, v, m.xbank_widths);
+    ok = ok && fp.write_domain_u8(e, d, v, b2u8(m.ct_trust_mul));
+    ok = ok && fp.write_domain_u8(e, d, v, b2u8(m.has_var_shift));
+    ok = ok && fp.write_domain_u8(e, d, v, b2u8(m.has_mul));
+    ok = ok && fp.write_domain_u8(e, d, v, b2u8(m.has_float));
+    ok = ok && fp.write_domain_u32(e, d, v, m.mul_hi_width);
+    ok = ok && fp.write_domain_u8(e, d, v, b2u8(m.flat_addressing));
+    ok = ok && fp.write_domain_u8(e, d, v, b2u8(m.ct_trust_var_shift));
+    ok = ok && fp.write_domain_u32(e, d, v, m.packed_gap_len);
+
+    var gi: u32 = 0;
+    for (gi < m.packed_gap_len) {
+        ok = ok && fp.write_domain_u32(e, d, v, m.packed_gaps[gi].op);
+        ok = ok && fp.write_domain_u8(e, d, v, b2u8(m.packed_gaps[gi].is_float));
+        ok = ok && fp.write_domain_u32(e, d, v, m.packed_gaps[gi].lane_bits);
+        gi = gi + 1;
+    }
+
+    ok = ok && fp.write_domain_u32(e, d, v, m.flen_bits);
+
+    ret ok;
+}
+
 fun default_of_name(reg: *TargetRegistry, os_vt: *os.OsVTable, isa_vt: *isa.IsaVTable) O.Option[str] {
     if (!isa.emits_whole_module(isa_vt)) { ret O.some[str](os_vt.default_of); }
 
@@ -443,15 +623,6 @@ fun default_of_name(reg: *TargetRegistry, os_vt: *os.OsVTable, isa_vt: *isa.IsaV
     ret O.none[str]();
 }
 
-# the diagnostic for a whole-module emitter with no finished-module object format
-#
-# A wiring failure, not a user error: the ISA declares it emits finished modules
-# but no registered format carries one for it, so nothing could hold the output.
-# Names the instruction set with its own `name` field, page-allocated through
-# str_join like the tuple diagnostics.
-# ---
-# isa_vt: the resolved instruction-set vtable
-# ret:    the diagnostic message
 fun no_module_format_message(isa_vt: *isa.IsaVTable) str {
     val fb: str = "instruction set emits whole modules, but no registered object format carries one";
     var alloc: A.Allocator;
@@ -461,86 +632,58 @@ fun no_module_format_message(isa_vt: *isa.IsaVTable) str {
     ret R.unwrap_ok[str, str](r);
 }
 
-# compose a Target from `reg` by name, using the tuple's default object format
-#
-# the common case: defers to `select_of` with an empty of name, so the object
-# format is derived through `default_of_name`. isa, os, and abi are spelled
-# explicitly; the of axis follows the os, or the isa for a whole-module emitter.
-# ---
-# reg:      the target registry populated by register_all
-# isa_name: instruction-set name (e.g. "x86_64", "aarch64")
-# os_name:  operating-system name (e.g. "linux", "windows")
-# abi_name: calling-convention name (e.g. "sysv64", "win64", "aapcs64")
-# ret:      the composed Target, or an error describing the missing piece
 pub fun select(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: str) R.Result[resolved.Target, str] {
     ret select_of(reg, isa_name, os_name, abi_name, "");
 }
 
-# joint-capability codes for `tuple_capability`: TUPLE_OK, or the first joint cell
-# of a resolved (os, isa, abi, of) tuple that is unfilled. these are the facts the
-# four independent dimension registries cannot express on their own
-pub val TUPLE_OK:           u32 = 0;  # composes and emits end-to-end
-pub val TUPLE_NO_CODEGEN:   u32 = 1;  # the isa has no instruction selector / encoder
-pub val TUPLE_ABI_MISMATCH: u32 = 2;  # the calling convention does not target the isa
-pub val TUPLE_OS_NO_OF:     u32 = 3;  # the os cannot link / load the object format
-pub val TUPLE_OF_UNCOVERED: u32 = 4;  # the object format does not cover the isa's relocations
-pub val TUPLE_OF_SHAPE:     u32 = 5;  # the of's emission shape does not match the isa's back-half family
-pub val TUPLE_OS_NO_ISA:    u32 = 6;  # the os does not run on the isa
-# the calling convention passes floating-point arguments in a float register wider
-# than the instruction set's float register file holds (#2777). NOT a preference
-# and not a performance choice: `lp64d` places a double in fa0, so naming it on a
-# target whose FLEN is 32 (F but not D) asks for an instruction the hardware does
-# not have. refused when the target RESOLVES, so the error names the abi and the
-# isa rather than surfacing later as a float argument that arrived wrong
-pub val TUPLE_ABI_NEEDS_FLOAT: u32 = 7;
+pub fun artifact_naming(tgt: *resolved.Target, kind: of.ArtifactOutputKind) R.Result[of.ArtifactName, str] {
+    if (tgt == nil || tgt.of == nil || tgt.os == nil) {
+        ret R.err[of.ArtifactName, str]("artifact naming: target has no selected object format");
+    }
+    ret of.artifact_naming(tgt.of, tgt.os.name, kind);
+}
 
-# the joint capability of a fully-resolved (os, isa, abi, of) tuple
-#
-# TUPLE_OK when this compiler can compose and emit the tuple end-to-end, else the
-# first unfilled joint cell (a TUPLE_* code). The single predicate that answers
-# for the tuple rather than one axis: `select_of` turns a non-OK code into a named
-# diagnostic, and `mach info targets` keeps a tuple only when some (abi, of) yields
-# TUPLE_OK. Every fact is self-declared on a vtable - the isa's wired codegen, the
-# abi's target isa, the os's architectures and supported formats, the of's isa
-# coverage and emission shape - so a new target flows through here with no edit.
-# ---
-# os_vt:  the resolved operating-system vtable
-# isa_vt: the resolved instruction-set vtable
-# abi_vt: the resolved calling-convention vtable
-# of_vt:  the resolved object-format vtable
-# ret:    TUPLE_OK, or the first failing TUPLE_* code
+pub val TUPLE_OK:           u32 = 0;
+val COMPLETE_TUPLE_CENSUS:  u32 = 30;
+pub val TUPLE_NO_CODEGEN:   u32 = 1;
+pub val TUPLE_ABI_MISMATCH: u32 = 2;
+pub val TUPLE_OS_NO_OF:     u32 = 3;
+pub val TUPLE_OF_UNCOVERED: u32 = 4;
+pub val TUPLE_OF_SHAPE:     u32 = 5;
+pub val TUPLE_OS_NO_ISA:    u32 = 6;
+pub val TUPLE_ABI_NEEDS_FLOAT: u32 = 7;
+pub val TUPLE_TARGET_UNAVAILABLE: u32 = 8;
+
+rec TupleCapabilitySpec {
+    code:  u32;
+    label: str;
+}
+
+val TUPLE_CAPABILITY_N: usize = 9;
+val TUPLE_CAPABILITIES: [TUPLE_CAPABILITY_N]TupleCapabilitySpec = [TUPLE_CAPABILITY_N]TupleCapabilitySpec{
+    TupleCapabilitySpec{ code: TUPLE_OK,             label: "ok" },
+    TupleCapabilitySpec{ code: TUPLE_NO_CODEGEN,      label: "no_codegen" },
+    TupleCapabilitySpec{ code: TUPLE_ABI_MISMATCH,    label: "abi_mismatch" },
+    TupleCapabilitySpec{ code: TUPLE_OS_NO_OF,        label: "os_no_of" },
+    TupleCapabilitySpec{ code: TUPLE_OF_UNCOVERED,    label: "of_uncovered" },
+    TupleCapabilitySpec{ code: TUPLE_OF_SHAPE,        label: "of_shape" },
+    TupleCapabilitySpec{ code: TUPLE_OS_NO_ISA,       label: "os_no_isa" },
+    TupleCapabilitySpec{ code: TUPLE_ABI_NEEDS_FLOAT, label: "abi_needs_float" },
+    TupleCapabilitySpec{ code: TUPLE_TARGET_UNAVAILABLE, label: "target_unavailable" },
+};
+
 pub fun tuple_capability(os_vt: *os.OsVTable, isa_vt: *isa.IsaVTable, abi_vt: *abi.AbiVTable, of_vt: *of.OfVTable) u32 {
+    if (isa_vt.id == isa.ARCH_MOS6502)       { ret TUPLE_TARGET_UNAVAILABLE; }
     if (!isa.has_codegen(isa_vt))            { ret TUPLE_NO_CODEGEN; }
     if (!abi.covers_isa(abi_vt, isa_vt.id))  { ret TUPLE_ABI_MISMATCH; }
-    # the convention's float-argument requirement against the isa's float register
-    # file. both sides are DECLARED widths, so a new convention or a new isa is
-    # covered by this comparison without an entry in any table of names.
     if (abi_vt.float_arg_bits > isa_vt.model.flen_bits) { ret TUPLE_ABI_NEEDS_FLOAT; }
     if (!os.supports_isa(os_vt, isa_vt.id))  { ret TUPLE_OS_NO_ISA; }
     if (!os.supports_of(os_vt, of_vt.name))  { ret TUPLE_OS_NO_OF; }
     if (!of.covers_isa(of_vt, isa_vt.id))    { ret TUPLE_OF_UNCOVERED; }
-    # the two back-half families and the two object shapes pair off exactly. a
-    # whole-module emitter hands over a finished module, which only a
-    # finished-module format can carry and no linker consumes; a register machine
-    # hands over machine text, which a finished-module format has no section to
-    # hold. either crossing composes a tuple that emits nothing, which is how
-    # `freestanding-spirv` came to be advertised while defaulting to `raw` (#2245).
     if (isa.emits_whole_module(isa_vt) != of_vt.object_is_artifact) { ret TUPLE_OF_SHAPE; }
     ret TUPLE_OK;
 }
 
-# build the named diagnostic for a non-OK `tuple_capability` code
-#
-# Names the missing joint capability with the vtables' own `name` fields verbatim,
-# never a convention-reconstructed spelling. Used on select_of's terminal error
-# path (page-allocated through str_join).
-# ---
-# code:   a non-OK TUPLE_* code from tuple_capability
-# os_vt:  the resolved operating-system vtable
-# isa_vt: the resolved instruction-set vtable
-# abi_vt: the resolved calling-convention vtable
-# of_vt:  the resolved object-format vtable
-# ret:    the diagnostic message
 fun tuple_capability_message(code: u32, os_vt: *os.OsVTable, isa_vt: *isa.IsaVTable, abi_vt: *abi.AbiVTable, of_vt: *of.OfVTable) str {
     var alloc: A.Allocator;
     val alloc_failed: bool = O.is_some[str](page.make(?alloc));
@@ -560,9 +703,6 @@ fun tuple_capability_message(code: u32, os_vt: *os.OsVTable, isa_vt: *isa.IsaVTa
         ret R.unwrap_ok[str, str](r);
     }
     if (code == TUPLE_ABI_NEEDS_FLOAT) {
-        # name BOTH sides and both widths: the whole point is that the reader can see
-        # which of the two to change, and a message naming only the convention sends
-        # them to the manifest when the answer may be the target.
         val fb: str = "calling convention passes floats in a float register the instruction set does not have";
         if (alloc_failed) { ret fb; }
         val r: R.Result[str, str] = format.sprint(?alloc,
@@ -592,37 +732,142 @@ fun tuple_capability_message(code: u32, os_vt: *os.OsVTable, isa_vt: *isa.IsaVTa
         if (R.is_err[str, str](r)) { ret fb; }
         ret R.unwrap_ok[str, str](r);
     }
-    # TUPLE_OF_SHAPE - name which side of the pairing the tuple crossed
-    var emits: str = "linkable objects";
-    var takes: str = "finished modules";
-    if (isa.emits_whole_module(isa_vt)) {
-        emits = "finished modules";
-        takes = "linkable objects";
+    if (code == TUPLE_OF_SHAPE) {
+        var emits: str = "linkable objects";
+        var takes: str = "finished modules";
+        if (isa.emits_whole_module(isa_vt)) {
+            emits = "finished modules";
+            takes = "linkable objects";
+        }
+        val fb: str = "object format's emission shape does not match the instruction set's";
+        if (alloc_failed) { ret fb; }
+        val r: R.Result[str, str] = str_join(?alloc, "instruction set '", isa_vt.name, "' emits ", emits, ", but object format '", of_vt.name, "' carries ", takes);
+        if (R.is_err[str, str](r)) { ret fb; }
+        ret R.unwrap_ok[str, str](r);
     }
-    val fb: str = "object format's emission shape does not match the instruction set's";
-    if (alloc_failed) { ret fb; }
-    val r: R.Result[str, str] = str_join(?alloc, "instruction set '", isa_vt.name, "' emits ", emits, ", but object format '", of_vt.name, "' carries ", takes);
-    if (R.is_err[str, str](r)) { ret fb; }
-    ret R.unwrap_ok[str, str](r);
+    if (code == TUPLE_TARGET_UNAVAILABLE) {
+        ret "target 'mos6502' remains unavailable pending its complete implementation and evidence";
+    }
+    panic("target: tuple_capability_message called with an undeclared capability code\n");
+    ret "";
 }
 
-# dimension selectors for `registered_names`
-val DIM_ISA:   u32 = 0;  # instruction-set registry
-val DIM_OS:    u32 = 1;  # operating-system registry
-val DIM_ABI:   u32 = 2;  # calling-convention registry
-val DIM_OF:    u32 = 3;  # object-format registry
-val DIM_DEBUG: u32 = 4;  # debug-info-producer registry
+fun t_debug_provider_failure() R.Result[of.DebugVTable, str] {
+    ret R.err[of.DebugVTable, str]("injected debug descriptor failure");
+}
 
-# copy `s` into `buf` at `off`, bounded by `cap - 1`, returning the new offset
-#
-# The bounded appender behind `registered_names`: a name that would overflow the
-# diagnostic scratch is truncated rather than written past the buffer.
-# ---
-# buf: destination buffer
-# cap: capacity of buf
-# off: current write offset
-# s:   string to append
-# ret: the offset past the copied bytes
+fun t_incomplete_debug_provider() R.Result[of.DebugVTable, str] {
+    var descriptor: of.DebugVTable;
+    descriptor.id = of.DBG_DWARF;
+    descriptor.name = "dwarf";
+    descriptor.produce = nil;
+    descriptor.supports = nil;
+    ret R.ok[of.DebugVTable, str](descriptor);
+}
+
+test "mach.lang.target.register_all:publishes_once_and_is_idempotent" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+    if (reg.state != REGISTRY_READY || reg.version != REGISTRY_VERSION) { ret 1; }
+
+    val isa_count: u32 = reg.isa.count;
+    val os_count: u32 = reg.os.count;
+    val abi_count: u32 = reg.abi.count;
+    val of_count: u32 = reg.of.count;
+    val debug_count: u32 = reg.debug.count;
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+    if (reg.isa.count != isa_count || reg.os.count != os_count || reg.abi.count != abi_count
+        || reg.of.count != of_count || reg.debug.count != debug_count) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.register_all:rejects_partial_state_without_destroying_it" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](x64.register_x64(?reg.isa))) { ret 1; }
+    val count: u32 = reg.isa.count;
+    if (R.is_ok[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+    if (reg.state != REGISTRY_FRESH || reg.version != 0 || reg.isa.count != count) { ret 1; }
+    if (O.is_none[*isa.IsaVTable](isa.lookup(?reg.isa, "x86_64"))) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.register_all:provider_failure_rolls_back_and_allows_retry" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    if (R.is_ok[R.Void, str](register_all(?reg, t_debug_provider_failure))) { ret 1; }
+    if (reg.state != REGISTRY_FRESH || reg.version != 0 || !registry_empty(?reg)) { ret 1; }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.register_all:incomplete_descriptor_rolls_back_and_allows_retry" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    if (R.is_ok[R.Void, str](register_all(?reg, t_incomplete_debug_provider))) { ret 1; }
+    if (reg.state != REGISTRY_FRESH || reg.version != 0 || !registry_empty(?reg)) { ret 1; }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.resolve:requires_a_published_registry_and_complete_request" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    var req: TargetRequest = target_request("x86_64", "linux", "sysv64");
+    if (R.is_ok[resolved.Target, str](resolve(nil, ?req))) { ret 1; }
+    if (R.is_ok[resolved.Target, str](resolve(?reg, nil))) { ret 1; }
+    if (R.is_ok[resolved.Target, str](resolve(?reg, ?req))) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.resolve:rejects_debug_and_isa_capability_mismatch" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+    val arch_o: O.Option[*isa.IsaVTable] = isa.lookup(?reg.isa, "x86_64");
+    if (O.is_none[*isa.IsaVTable](arch_o)) { ret 1; }
+    val arch_vt: *isa.IsaVTable = O.unwrap[*isa.IsaVTable](arch_o);
+    if (arch_vt.machine == nil || arch_vt.machine.dwarf_reg == nil) { ret 1; }
+    arch_vt.machine.dwarf_reg = nil;
+
+    var req: TargetRequest = target_request("x86_64", "linux", "sysv64");
+    if (R.is_ok[resolved.Target, str](resolve(?reg, ?req))) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.tuple_capability_catalog:complete_unique_ordered" {
+    if (TUPLE_CAPABILITIES[0].code != TUPLE_OK)             { ret 1; }
+    if (TUPLE_CAPABILITIES[1].code != TUPLE_NO_CODEGEN)      { ret 1; }
+    if (TUPLE_CAPABILITIES[2].code != TUPLE_ABI_MISMATCH)    { ret 1; }
+    if (TUPLE_CAPABILITIES[3].code != TUPLE_OS_NO_OF)        { ret 1; }
+    if (TUPLE_CAPABILITIES[4].code != TUPLE_OF_UNCOVERED)    { ret 1; }
+    if (TUPLE_CAPABILITIES[5].code != TUPLE_OF_SHAPE)        { ret 1; }
+    if (TUPLE_CAPABILITIES[6].code != TUPLE_OS_NO_ISA)       { ret 1; }
+    if (TUPLE_CAPABILITIES[7].code != TUPLE_ABI_NEEDS_FLOAT) { ret 1; }
+    if (TUPLE_CAPABILITIES[8].code != TUPLE_TARGET_UNAVAILABLE) { ret 1; }
+
+    var i: usize = 0;
+    for (i < TUPLE_CAPABILITY_N) {
+        var j: usize = 0;
+        for (j < TUPLE_CAPABILITY_N) {
+            if (i != j) {
+                if (TUPLE_CAPABILITIES[i].code == TUPLE_CAPABILITIES[j].code) { ret 1; }
+                if (str_equals(TUPLE_CAPABILITIES[i].label, TUPLE_CAPABILITIES[j].label)) { ret 1; }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+val DIM_ISA:   u32 = 0;
+val DIM_OS:    u32 = 1;
+val DIM_ABI:   u32 = 2;
+val DIM_OF:    u32 = 3;
+val DIM_DEBUG: u32 = 4;
+
 fun buf_put(buf: *u8, cap: usize, off: usize, s: str) usize {
     var i: usize = 0;
     val n: usize = str_len(s);
@@ -635,19 +880,6 @@ fun buf_put(buf: *u8, cap: usize, off: usize, s: str) usize {
     ret o;
 }
 
-# format the registered names of one target dimension into `buf` as "a, b, c"
-#
-# The unregistered-name diagnostic lists the live registry - reflecting what this
-# build actually supports - rather than a hardcoded expected list, so a newly
-# registered (or dropped) implementation needs no edit here. Enumerates through the
-# same `registered_count` / `registered` pair `mach info` reads. Null-terminates
-# `buf` and returns it as a str borrowing the caller's buffer.
-# ---
-# reg: the populated target registry to enumerate
-# dim: which dimension to list (DIM_*)
-# buf: caller-owned scratch buffer the list is written into
-# cap: capacity of buf
-# ret: buf as a str
 fun registered_names(reg: *TargetRegistry, dim: u32, buf: *u8, cap: usize) str {
     var count: u32 = 0;
     if (dim == DIM_ISA)     { count = isa.registered_count(?reg.isa); }
@@ -674,19 +906,49 @@ fun registered_names(reg: *TargetRegistry, dim: u32, buf: *u8, cap: usize) str {
     ret buf::str;
 }
 
-# build the "no <noun> implementation registered for '<name>' (registered: <list>)"
-# diagnostic for an unregistered dimension name
-#
-# The named-cell analogue of `tuple_capability_message` for the per-dimension
-# lookup failures: it names the requested value and lists the live registry, so the
-# hint is at least as precise as a manifest-side pre-check without duplicating the
-# name tables. Page-allocated through str_join; degrades to a static message on
-# allocation failure.
-# ---
-# noun:  the dimension noun ("os", "isa", "abi", "object-format")
-# name:  the requested-but-unregistered name
-# names: the comma-joined registered names (from `registered_names`)
-# ret:   the diagnostic message
+fun no_fs_policy_message(os_vt: *os.OsVTable, arch_vt: *isa.IsaVTable) str {
+    var alloc: A.Allocator;
+    val alloc_failed: bool = O.is_some[str](page.make(?alloc));
+    val fb: str = "no file-system policy declared for the requested target";
+    if (alloc_failed) { ret fb; }
+    val r: R.Result[str, str] = str_join(?alloc, "no file-system policy declared for '", arch_vt.name, "-", os_vt.name, "'");
+    if (R.is_err[str, str](r)) { ret fb; }
+    ret R.unwrap_ok[str, str](r);
+}
+
+fun resolve_environment(arch_vt: *isa.IsaVTable, req: *TargetRequest) R.Result[u32, str] {
+    if (str_empty(req.env_name)) { ret R.ok[u32, str](isa.ENV_NONE); }
+    var label: str = req.label;
+    if (str_empty(label)) { label = req.isa_name; }
+    if (arch_vt.env_count == 0) {
+        ret R.err[u32, str](environment_message(label, req.env_name, arch_vt, "defines no environments; remove `env`"));
+    }
+    val id: u32 = isa.environment_lookup(arch_vt, req.env_name);
+    if (id == isa.ENV_NONE) {
+        ret R.err[u32, str](environment_message(label, req.env_name, arch_vt, "does not define it"));
+    }
+    ret R.ok[u32, str](id);
+}
+
+fun environment_message(label: str, env: str, arch_vt: *isa.IsaVTable, why: str) str {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret "mach.toml: `env` names an environment the target's isa does not define"; }
+    var known: str = "";
+    var i: u32 = 0;
+    for (i < arch_vt.env_count) {
+        val piece: R.Result[str, str] = format.sprint(?alloc, "{}{}{}", known, arch_vt.envs[i].name, ", ");
+        if (R.is_ok[str, str](piece)) { known = R.unwrap_ok[str, str](piece); }
+        i = i + 1;
+    }
+    if (arch_vt.env_count == 0) { known = "none, "; }
+    val r: R.Result[str, str] = format.sprint(?alloc, "mach.toml: [target.{}] env = \"{}\": isa '{}' {} (known: {})", label, env, arch_vt.name, why, known);
+    if (R.is_err[str, str](r)) { ret "mach.toml: `env` names an environment the target's isa does not define"; }
+    val msg: str = R.unwrap_ok[str, str](r);
+    val n: usize = str_len(msg);
+    if (n >= 3) { msg[n - 3] = ')'::u8; msg[n - 2] = 0; }
+    ret msg;
+}
+
 fun unregistered_message(noun: str, name: str, names: str) str {
     var alloc: A.Allocator;
     val alloc_failed: bool = O.is_some[str](page.make(?alloc));
@@ -697,22 +959,17 @@ fun unregistered_message(noun: str, name: str, names: str) str {
     ret R.unwrap_ok[str, str](r);
 }
 
-# enumeration helpers (registered_count / registered) must agree with the
-# name-keyed lookups after register_all, and report none past the count. the
-# `mach info` capability surface reads the registries through exactly this pair
 test "mach.lang.target:registry_enumeration_agrees_with_lookup" {
     var reg: TargetRegistry = registry_init();
-    val res_reg: R.Result[bool, str] = register_all(?reg);
-    if (R.is_err[bool, str](res_reg)) { ret 1; }
+    fin { registry_dnit(?reg); }
+    val res_reg: R.Result[R.Void, str] = register_all(?reg, target_testing.debug_descriptor);
+    if (R.is_err[R.Void, str](res_reg)) { ret 1; }
 
-    # the supported implementations are all enumerable.
     if (isa.registered_count(?reg.isa) < 2) { ret 1; }
     if (os.registered_count(?reg.os)   < 3) { ret 1; }
     if (abi.registered_count(?reg.abi) < 2) { ret 1; }
     if (of.registered_count(?reg.of)   < 3) { ret 1; }
 
-    # every enumerated isa entry is present and agrees with name-keyed lookup;
-    # one past the count, enumeration reports none.
     var i: u32 = 0;
     val isa_len: u32 = isa.registered_count(?reg.isa);
     for (i < isa_len) {
@@ -726,24 +983,10 @@ test "mach.lang.target:registry_enumeration_agrees_with_lookup" {
     ret 0;
 }
 
-# EVERY REGISTERED ISA THAT CLAIMS ELF CAN ALSO RESOLVE ITS OWN RELOCATIONS.
-#
-# `machine_isa` takes the relocatable-object seam as a required parameter, so an
-# arch cannot FORGET one - but it may still pass a deliberate nil, and passing nil
-# while declaring an ELF machine type is a lie: the ELF writer would name
-# relocations in the object that the linker then has nothing to apply. That
-# pairing is the runtime half of the guarantee the arity check starts, and it is
-# the one #2244 lost when the applier was attached by matching a name string.
-#
-# The converse binds too. A whole-module emitter has no seam parameter at all, so
-# the family cannot express one; asserting it here proves the constructor really
-# leaves the slot clear rather than reading whatever the frame held.
-#
-# to see it fail, pass nil for a required hook in any arch's `isa.reloc_seam` call
-# (say `riscv/register.mach`) and re-run: this test alone reports the count.
 test "mach.lang.target:elf_capable_isa_declares_a_reloc_seam" {
     var reg: TargetRegistry = registry_init();
-    if (R.is_err[bool, str](register_all(?reg))) { ret 1; }
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
 
     val len: u32 = isa.registered_count(?reg.isa);
     if (len == 0) { ret 1; }
@@ -754,16 +997,14 @@ test "mach.lang.target:elf_capable_isa_declares_a_reloc_seam" {
     for (i < len) {
         val vt: *isa.IsaVTable = O.unwrap[*isa.IsaVTable](isa.registered(?reg.isa, i));
 
-        # an ELF machine type is a claim to emit ELF relocatable objects, so the
-        # seam and all of its required members must be there to back it.
         if (vt.elf_machine != 0) {
             if (!isa.emits_relocations(vt))      { unpaired = unpaired + 1; }
-            or (vt.reloc.apply_reloc == nil)     { unpaired = unpaired + 1; }
-            or (vt.reloc.reloc_traits == nil)    { unpaired = unpaired + 1; }
-            or (vt.reloc.elf_reloc_type == nil)  { unpaired = unpaired + 1; }
+            or (vt.reloc.apply == nil)           { unpaired = unpaired + 1; }
+            or (vt.reloc.traits == nil)          { unpaired = unpaired + 1; }
+            or (!vt.reloc.has_elf)                { unpaired = unpaired + 1; }
+            or (vt.reloc.elf.reloc_type == nil)   { unpaired = unpaired + 1; }
         }
 
-        # a whole-module emitter carries no relocations at all
         if (isa.emits_whole_module(vt) && isa.emits_relocations(vt)) { unpaired = unpaired + 1; }
 
         if (isa.emits_relocations(vt)) { seams = seams + 1; }
@@ -772,104 +1013,128 @@ test "mach.lang.target:elf_capable_isa_declares_a_reloc_seam" {
 
     if (unpaired != 0) { ret unpaired::i32; }
 
-    # x86_64, aarch64, riscv64, riscv32 (#2778) and mos6502 (#2280 - its RK_ABS16 JSR
-    # relocation, resolved directly against the raw flat image rather than through ELF)
-    # declare one; spirv (finished module) does not.
-    #
-    # THE LITERAL IS A TRIPWIRE, NOT A DERIVED FACT, and that is deliberate. Counting
-    # the ELF-capable vtables and comparing the result against itself would assert
-    # nothing - the loop above already proves each seam is COMPLETE, and this line
-    # exists to make a target gaining or losing the capability stop a human. Updating
-    # it is the point at which someone confirms the new arch really does emit
-    # relocatable objects, so it is maintained by hand on purpose.
     if (seams != 5) { ret 1; }
     ret 0;
 }
 
-# A CONVENTION THAT NEEDS A FLOAT EXTENSION THE TARGET LACKS IS REFUSED (#2777).
-#
-# `lp64q` is a real RISC-V psABI member: it passes quad-precision floats in the fa
-# bank and so requires the Q extension. rv64gc has D and not Q, so the pair does not
-# compose, and the whole point is that this is refused when the TARGET RESOLVES
-# rather than surfacing later as a float argument that arrived wrong.
-#
-# The check is two DECLARED widths compared, so it needs no table of convention
-# names: a convention asking for more than the instruction set has is refused
-# whichever pair it is. That is why lp64d (64) against rv64gc (64) composes on the
-# same code path this refuses lp64q (128) on.
-#
-# To see it fail, drop the `float_arg_bits > flen_bits` clause from
-# `tuple_capability` -- mach would then accept lp64q and emit quad-precision moves
-# rv64gc cannot execute.
 test "mach.lang.target.tuple_capability:refuses_abi_needing_absent_float_extension" {
     var reg: TargetRegistry = registry_init();
-    val res_reg: R.Result[bool, str] = register_all(?reg);
-    if (R.is_err[bool, str](res_reg)) { ret 1; }
+    fin { registry_dnit(?reg); }
+    val res_reg: R.Result[R.Void, str] = register_all(?reg, target_testing.debug_descriptor);
+    if (R.is_err[R.Void, str](res_reg)) { ret 1; }
 
     val opt_isa: O.Option[*isa.IsaVTable] = isa.lookup(?reg.isa, "riscv64");
     if (!O.is_some[*isa.IsaVTable](opt_isa)) { ret 1; }
     val isa_vt: *isa.IsaVTable = O.unwrap[*isa.IsaVTable](opt_isa);
-    # the ISA's declared supply: rv64gc carries the D extension, so 64-bit doubles.
     if (isa_vt.model.flen_bits != 64) { ret 1; }
 
-    # a hypothetical lp64q, asking for 128-bit float argument registers. only
-    # `arch_id` and `float_arg_bits` are read here; the rest are placeholders.
     var quad: abi.AbiVTable = abi.abi_vtable(
         abi.ABI_UNKNOWN, "lp64q", isa.ARCH_RISCV64,
-        nil, nil, nil, nil, nil,
+        nil, nil, nil, nil,
         16, 0, 0,
         -1, false,
         false, false,
         128, 8,
         nil
     );
-    # the os / of vtables are never dereferenced: the float check precedes every
-    # check that reads them, which is itself the ordering under test.
     if (tuple_capability(nil, isa_vt, ?quad, nil) != TUPLE_ABI_NEEDS_FLOAT) { ret 1; }
 
-    # and the same comparison ADMITS the member the target can actually run, so the
-    # gate is a width comparison rather than a blanket refusal of the family.
     val opt_abi: O.Option[*abi.AbiVTable] = abi.lookup(?reg.abi, "lp64d");
     if (!O.is_some[*abi.AbiVTable](opt_abi)) { ret 1; }
     val d_vt: *abi.AbiVTable = O.unwrap[*abi.AbiVTable](opt_abi);
     if (d_vt.float_arg_bits != 64) { ret 1; }
-    # a real (linux, riscv64, lp64d) tuple composes end to end.
     val ok: R.Result[resolved.Target, str] = select(?reg, "riscv64", "linux", "lp64d");
     if (R.is_err[resolved.Target, str](ok)) { ret 1; }
-    # as does the soft-float member, which asks for no float registers at all.
     val soft: R.Result[resolved.Target, str] = select(?reg, "riscv64", "linux", "lp64");
     if (R.is_err[resolved.Target, str](soft)) { ret 1; }
     ret 0;
 }
 
-# selecting a Linux/AArch64 target composes a full Target: the AArch64 ISA vtable
-# (with non-nil select/encode entry points) and the AAPCS64 ABI vtable resolve
-# and bind. the backend selection/encoding fail loudly only when reached, never
-# at composition
+test "mach.lang.target.tuple_capability:refuses_a_standard_abi_a_narrower_isa_model_cannot_give" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    val res_reg: R.Result[R.Void, str] = register_all(?reg, target_testing.debug_descriptor);
+    if (R.is_err[R.Void, str](res_reg)) { ret 1; }
+
+    val opt_isa: O.Option[*isa.IsaVTable] = isa.lookup(?reg.isa, "riscv64");
+    if (!O.is_some[*isa.IsaVTable](opt_isa)) { ret 1; }
+    val real_isa: *isa.IsaVTable = O.unwrap[*isa.IsaVTable](opt_isa);
+
+    val opt_abi: O.Option[*abi.AbiVTable] = abi.lookup(?reg.abi, "lp64d");
+    if (!O.is_some[*abi.AbiVTable](opt_abi)) { ret 1; }
+    val d_vt: *abi.AbiVTable = O.unwrap[*abi.AbiVTable](opt_abi);
+    if (d_vt.float_arg_bits != 64) { ret 1; }
+
+    var narrow: isa.IsaVTable = @real_isa;
+    narrow.model.flen_bits = 0;
+    if (tuple_capability(nil, ?narrow, d_vt, nil) != TUPLE_ABI_NEEDS_FLOAT) { ret 1; }
+
+    var mid: isa.IsaVTable = @real_isa;
+    mid.model.flen_bits = 32;
+    if (tuple_capability(nil, ?mid, d_vt, nil) != TUPLE_ABI_NEEDS_FLOAT) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.tuple_capability:refuses_an_isa_with_no_registered_code_generator" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    val res_reg: R.Result[R.Void, str] = register_all(?reg, target_testing.debug_descriptor);
+    if (R.is_err[R.Void, str](res_reg)) { ret 1; }
+
+    val opt_isa: O.Option[*isa.IsaVTable] = isa.lookup(?reg.isa, "riscv64");
+    if (!O.is_some[*isa.IsaVTable](opt_isa)) { ret 1; }
+    val real_isa: *isa.IsaVTable = O.unwrap[*isa.IsaVTable](opt_isa);
+    if (!isa.has_codegen(real_isa)) { ret 1; }
+
+    var stub: isa.IsaVTable = @real_isa;
+    stub.machine = nil;
+    stub.emitter = nil;
+    if (isa.has_codegen(?stub)) { ret 1; }
+
+    if (tuple_capability(nil, ?stub, nil, nil) != TUPLE_NO_CODEGEN) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.tuple_capability:refuses_an_isa_the_operating_system_does_not_run" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    val res_reg: R.Result[R.Void, str] = register_all(?reg, target_testing.debug_descriptor);
+    if (R.is_err[R.Void, str](res_reg)) { ret 1; }
+
+    val opt_isa: O.Option[*isa.IsaVTable] = isa.lookup(?reg.isa, "riscv64");
+    if (!O.is_some[*isa.IsaVTable](opt_isa)) { ret 1; }
+    val riscv_vt: *isa.IsaVTable = O.unwrap[*isa.IsaVTable](opt_isa);
+
+    val opt_abi: O.Option[*abi.AbiVTable] = abi.lookup(?reg.abi, "lp64d");
+    if (!O.is_some[*abi.AbiVTable](opt_abi)) { ret 1; }
+    val d_vt: *abi.AbiVTable = O.unwrap[*abi.AbiVTable](opt_abi);
+
+    val opt_os: O.Option[*os.OsVTable] = os.lookup(?reg.os, "windows");
+    if (!O.is_some[*os.OsVTable](opt_os)) { ret 1; }
+    val win_vt: *os.OsVTable = O.unwrap[*os.OsVTable](opt_os);
+    if (os.supports_isa(win_vt, isa.ARCH_RISCV64)) { ret 1; }
+
+    if (tuple_capability(win_vt, riscv_vt, d_vt, nil) != TUPLE_OS_NO_ISA) { ret 1; }
+    ret 0;
+}
+
 test "mach.lang.target.select:linux_aarch64" {
     var reg: TargetRegistry = registry_init();
-    val res_reg: R.Result[bool, str] = register_all(?reg);
-    if (R.is_err[bool, str](res_reg)) { ret 1; }
+    fin { registry_dnit(?reg); }
+    val res_reg: R.Result[R.Void, str] = register_all(?reg, target_testing.debug_descriptor);
+    if (R.is_err[R.Void, str](res_reg)) { ret 1; }
 
-    # the SysV / Win64 / AAPCS64 / spirv / mos6502 registrations plus the SIX RISC-V
-    # family members (lp64 / lp64f / lp64d on rv64, ilp32 / ilp32f / ilp32d on rv32)
-    # bring the ABI registry to eleven conventions. the RISC-V family is why this count
-    # grows without a new module, and the count is checked because `abi.register`
-    # DROPS a vtable past `ABI_REGISTRY_CAP` silently - a convention that had been
-    # registered would then resolve to "no such abi" (#2777).
     if (abi.registered_count(?reg.abi) != 11) { ret 1; }
 
     val res_target: R.Result[resolved.Target, str] = select(?reg, "aarch64", "linux", "aapcs64");
     if (R.is_err[resolved.Target, str](res_target)) { ret 1; }
     val t: resolved.Target = R.unwrap_ok[resolved.Target, str](res_target);
 
-    # the ISA vtable resolved and exposes the AArch64 backend entry points.
     if (t.arch == nil)                 { ret 1; }
     if (t.isa.id != isa.ARCH_AARCH64) { ret 1; }
     if (t.arch.select == nil)          { ret 1; }
     if (t.arch.encode == nil)          { ret 1; }
 
-    # the ABI resolved to AAPCS64 (not silently the x86-64 SysV vtable).
     if (t.abi == nil)                { ret 1; }
     if (t.abi.id != abi.ABI_AAPCS64) { ret 1; }
     if (t.abi.arg_passing == nil)    { ret 1; }
@@ -878,41 +1143,121 @@ test "mach.lang.target.select:linux_aarch64" {
     ret 0;
 }
 
-# THE C-VARIADIC STACK RULE IS RESOLVED PER (OS, ISA), NOT PER CONVENTION (#2575).
-#
-# Apple arm64 passes the whole variadic tail on the stack; the AAPCS64 base standard
-# does not. Both targets compose the SAME "aapcs64" vtable, so the convention cannot
-# carry the answer - and darwin's own x86_64 keeps SysV's ordinary rule, so the OS
-# cannot carry it alone either. Only the pair decides, which is why it is resolved
-# here and read off the target rather than branched on in the call lowering.
-#
-# All four cells are asserted, because getting any ONE of them wrong is silent: a
-# variadic argument placed on the wrong side of this line is a wrong VALUE at the
-# callee, not a link error.
+test "mach.lang.target.select:fs_policy_is_per_tuple_not_shared_across_linux_architectures" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    val res_reg: R.Result[R.Void, str] = register_all(?reg, target_testing.debug_descriptor);
+    if (R.is_err[R.Void, str](res_reg)) { ret 1; }
+
+    val res_x64: R.Result[resolved.Target, str] = select(?reg, "x86_64", "linux", "sysv64");
+    if (R.is_err[resolved.Target, str](res_x64)) { ret 1; }
+    val tx64: resolved.Target = R.unwrap_ok[resolved.Target, str](res_x64);
+
+    val res_a64: R.Result[resolved.Target, str] = select(?reg, "aarch64", "linux", "aapcs64");
+    if (R.is_err[resolved.Target, str](res_a64)) { ret 1; }
+    val ta64: resolved.Target = R.unwrap_ok[resolved.Target, str](res_a64);
+
+    val res_r64: R.Result[resolved.Target, str] = select(?reg, "riscv64", "linux", "lp64d");
+    if (R.is_err[resolved.Target, str](res_r64)) { ret 1; }
+    val tr64: resolved.Target = R.unwrap_ok[resolved.Target, str](res_r64);
+
+    var bad: bool = false;
+    if (!str_equals(tx64.fs_policy.dynamic_interpreter, "/lib64/ld-linux-x86-64.so.2"))       { bad = true; }
+    if (!str_equals(ta64.fs_policy.dynamic_interpreter, "/lib/ld-linux-aarch64.so.1"))        { bad = true; }
+    if (!str_equals(tr64.fs_policy.dynamic_interpreter, "/lib/ld-linux-riscv64-lp64d.so.1"))  { bad = true; }
+
+    if (str_equals(tx64.fs_policy.dynamic_interpreter, ta64.fs_policy.dynamic_interpreter)) { bad = true; }
+    if (str_equals(tx64.fs_policy.dynamic_interpreter, tr64.fs_policy.dynamic_interpreter)) { bad = true; }
+    if (str_equals(ta64.fs_policy.dynamic_interpreter, tr64.fs_policy.dynamic_interpreter)) { bad = true; }
+
+    if (!str_equals(tx64.fs_policy.libdirs[2], "/lib/x86_64-linux-gnu"))  { bad = true; }
+    if (!str_equals(ta64.fs_policy.libdirs[0], "/lib/aarch64-linux-gnu")) { bad = true; }
+    if (!str_equals(tr64.fs_policy.libdirs[0], "/lib/riscv64-linux-gnu")) { bad = true; }
+
+    var li: u32 = 0;
+    for (li < ta64.fs_policy.libdir_len) {
+        if (str_equals(ta64.fs_policy.libdirs[li], "/lib/x86_64-linux-gnu")
+            || str_equals(ta64.fs_policy.libdirs[li], "/usr/lib/x86_64-linux-gnu")
+            || str_equals(ta64.fs_policy.libdirs[li], "/lib64")
+            || str_equals(ta64.fs_policy.libdirs[li], "/usr/lib64")) { bad = true; }
+        li = li + 1;
+    }
+
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.select:darwin_and_windows_and_freestanding_declare_no_dynamic_interpreter" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    val res_reg: R.Result[R.Void, str] = register_all(?reg, target_testing.debug_descriptor);
+    if (R.is_err[R.Void, str](res_reg)) { ret 1; }
+    var bad: bool = false;
+
+    val res_dw: R.Result[resolved.Target, str] = select(?reg, "x86_64", "darwin", "sysv64");
+    if (R.is_err[resolved.Target, str](res_dw)) { bad = true; }
+    or (!str_empty(R.unwrap_ok[resolved.Target, str](res_dw).fs_policy.dynamic_interpreter)) { bad = true; }
+
+    val res_win: R.Result[resolved.Target, str] = select(?reg, "x86_64", "windows", "win64");
+    if (R.is_err[resolved.Target, str](res_win)) { bad = true; }
+    or (!str_empty(R.unwrap_ok[resolved.Target, str](res_win).fs_policy.dynamic_interpreter)) { bad = true; }
+
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.fingerprint_fs_policy:isolated_to_declared_policy_fields" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var bad: bool = false;
+
+    var pa: os.FsPolicy;
+    pa.sysroot = "";
+    pa.toolchain_root = "";
+    pa.dynamic_interpreter = "/lib64/ld-linux-x86-64.so.2";
+    pa.platform_lib = "";
+    pa.libdirs[0] = "/lib64";
+    pa.libdir_len = 1;
+
+    var pb: os.FsPolicy = pa;
+    pb.dynamic_interpreter = "/lib/ld-linux-aarch64.so.1";
+
+    var ea: binary.Encoder = binary.encoder(?alloc, binary.LITTLE);
+    var eb: binary.Encoder = binary.encoder(?alloc, binary.LITTLE);
+    if (!fingerprint_fs_policy(?pa, ?ea)) { bad = true; }
+    if (!fingerprint_fs_policy(?pb, ?eb)) { bad = true; }
+    if (fp_bytes_equal(?ea, ?eb)) { bad = true; }
+    if (ea.len == 0) { bad = true; }
+
+    var ea2: binary.Encoder = binary.encoder(?alloc, binary.LITTLE);
+    if (!fingerprint_fs_policy(?pa, ?ea2)) { bad = true; }
+    if (!fp_bytes_equal(?ea, ?ea2)) { bad = true; }
+
+    binary.encoder_dnit(?ea);
+    binary.encoder_dnit(?eb);
+    binary.encoder_dnit(?ea2);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
 test "mach.lang.target.select:c_variadic_stack_is_per_os_and_isa" {
     var reg: TargetRegistry = registry_init();
-    if (R.is_err[bool, str](register_all(?reg))) { ret 1; }
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
 
-    # darwin + aarch64: the divergence.
     val da: R.Result[resolved.Target, str] = select(?reg, "aarch64", "darwin", "aapcs64");
     if (R.is_err[resolved.Target, str](da))                                     { ret 1; }
     if (!R.unwrap_ok[resolved.Target, str](da).variadic_args_on_stack)          { ret 1; }
 
-    # linux + aarch64: the SAME convention vtable, WITHOUT the divergence. this pair
-    # is the whole reason the fact cannot live on the abi vtable.
     val la: R.Result[resolved.Target, str] = select(?reg, "aarch64", "linux", "aapcs64");
     if (R.is_err[resolved.Target, str](la))                                     { ret 1; }
     if (R.unwrap_ok[resolved.Target, str](la).variadic_args_on_stack)           { ret 1; }
-    # and they really are the same convention, so nothing else could have told them apart.
     if (R.unwrap_ok[resolved.Target, str](da).abi != R.unwrap_ok[resolved.Target, str](la).abi) { ret 1; }
 
-    # darwin + x86_64: the SAME os, WITHOUT the divergence - Darwin adopts SysV there
-    # unchanged. this pair is why the fact cannot live on the os vtable alone.
     val dx: R.Result[resolved.Target, str] = select(?reg, "x86_64", "darwin", "sysv64");
     if (R.is_err[resolved.Target, str](dx))                                     { ret 1; }
     if (R.unwrap_ok[resolved.Target, str](dx).variadic_args_on_stack)           { ret 1; }
 
-    # linux + x86_64: neither.
     val lx: R.Result[resolved.Target, str] = select(?reg, "x86_64", "linux", "sysv64");
     if (R.is_err[resolved.Target, str](lx))                                     { ret 1; }
     if (R.unwrap_ok[resolved.Target, str](lx).variadic_args_on_stack)           { ret 1; }
@@ -920,81 +1265,86 @@ test "mach.lang.target.select:c_variadic_stack_is_per_os_and_isa" {
     ret 0;
 }
 
-# THE FIXED STACK-ARGUMENT SIZE RULE IS RESOLVED PER (OS, ISA) TOO, AND IS A SEPARATE
-# FACT FROM THE VARIADIC ONE (#2598).
-#
-# Apple arm64 gives a stack-passed FIXED argument its natural size and alignment; the
-# AAPCS64 base standard rounds every one up to eight bytes. Same axis as the variadic
-# rule above and same reason it cannot live on either vtable alone, so the same four
-# cells are asserted: getting one wrong places an argument at an offset the callee does
-# not read, a wrong VALUE rather than a link error.
 test "mach.lang.target.select:fixed_stack_arg_size_is_per_os_and_isa" {
     var reg: TargetRegistry = registry_init();
-    if (R.is_err[bool, str](register_all(?reg))) { ret 1; }
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
 
-    # darwin + aarch64: the divergence.
     val da: R.Result[resolved.Target, str] = select(?reg, "aarch64", "darwin", "aapcs64");
     if (R.is_err[resolved.Target, str](da))                                      { ret 1; }
     if (!R.unwrap_ok[resolved.Target, str](da).fixed_args_natural_size)          { ret 1; }
 
-    # linux + aarch64: the SAME convention vtable, WITHOUT it.
     val la: R.Result[resolved.Target, str] = select(?reg, "aarch64", "linux", "aapcs64");
     if (R.is_err[resolved.Target, str](la))                                      { ret 1; }
     if (R.unwrap_ok[resolved.Target, str](la).fixed_args_natural_size)           { ret 1; }
 
-    # darwin + x86_64: the SAME os, WITHOUT it - SysV's eight-byte slot is unchanged.
     val dx: R.Result[resolved.Target, str] = select(?reg, "x86_64", "darwin", "sysv64");
     if (R.is_err[resolved.Target, str](dx))                                      { ret 1; }
     if (R.unwrap_ok[resolved.Target, str](dx).fixed_args_natural_size)           { ret 1; }
 
-    # linux + x86_64: neither.
     val lx: R.Result[resolved.Target, str] = select(?reg, "x86_64", "linux", "sysv64");
     if (R.is_err[resolved.Target, str](lx))                                      { ret 1; }
     if (R.unwrap_ok[resolved.Target, str](lx).fixed_args_natural_size)           { ret 1; }
 
-    # and the two facts are independent: darwin-aarch64 carries BOTH, and carrying both
-    # is what makes the fixed and variadic rules differ from each other there.
     if (!R.unwrap_ok[resolved.Target, str](da).variadic_args_on_stack)           { ret 1; }
 
     ret 0;
 }
 
-# selecting a Linux/RISC-V (RV64) target composes the machine description: the
-# riscv64 ISA vtable (EM_RISCV, 64-bit, gpr + fpr banks, no flags bank) and the
-# lp64d ABI vtable resolve and bind. as of slice 3 the instruction selector and the
-# byte encoder are both wired - composition stays clean and the riscv64 codegen path
-# selects and encodes. this asserts the description + selector + encoder wiring
+test "mach.lang.target.backend_target:uses_resolved_image_base_and_arch_page_size" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { registry_dnit(?reg); ret 1; }
+
+    var bad: bool = false;
+    var req: TargetRequest = target_request("aarch64", "linux", "aapcs64");
+    with_image(?req, 0x12345000, 0, 0);
+    val lr: R.Result[resolved.Target, str] = resolve(?reg, ?req);
+    if (R.is_err[resolved.Target, str](lr)) { bad = true; }
+    or {
+        var lt: resolved.Target = R.unwrap_ok[resolved.Target, str](lr);
+        val lv: isa.BackendTarget = resolved.backend_target(?lt);
+        if (lv.os.image_base != 0x12345000) { bad = true; }
+        if (lv.os.page_size != 65536)       { bad = true; }
+    }
+
+    val dr: R.Result[resolved.Target, str] = select(?reg, "aarch64", "darwin", "aapcs64");
+    if (R.is_err[resolved.Target, str](dr)) { bad = true; }
+    or {
+        var dt: resolved.Target = R.unwrap_ok[resolved.Target, str](dr);
+        val dv: isa.BackendTarget = resolved.backend_target(?dt);
+        if (dv.os.image_base != darwin.DARWIN_BASE_ADDR) { bad = true; }
+        if (dv.os.page_size != 16384)                    { bad = true; }
+    }
+
+    registry_dnit(?reg);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
 test "mach.lang.target.select:linux_riscv64" {
     var reg: TargetRegistry = registry_init();
-    val res_reg: R.Result[bool, str] = register_all(?reg);
-    if (R.is_err[bool, str](res_reg)) { ret 1; }
+    fin { registry_dnit(?reg); }
+    val res_reg: R.Result[R.Void, str] = register_all(?reg, target_testing.debug_descriptor);
+    if (R.is_err[R.Void, str](res_reg)) { ret 1; }
 
     val res_target: R.Result[resolved.Target, str] = select_of(?reg, "riscv64", "linux", "lp64d", "");
     if (R.is_err[resolved.Target, str](res_target)) { ret 1; }
     val t: resolved.Target = R.unwrap_ok[resolved.Target, str](res_target);
 
-    # the ISA vtable resolved to the RV64 machine description.
     if (t.arch == nil)                 { ret 1; }
     if (t.isa.id != isa.ARCH_RISCV64) { ret 1; }
-    if (t.isa.elf_machine != 243)     { ret 1; }  # EM_RISCV
-    # the pointer-width fields are in bytes: 8 bytes = 64-bit.
+    if (t.isa.elf_machine != 243)     { ret 1; }
     if (t.isa.pointer_width != 8)     { ret 1; }
 
-    # slice 3 wires the instruction selector alongside the byte encoder, so the
-    # riscv64 codegen path both selects and encodes.
     if (t.arch.select == nil) { ret 1; }
     if (t.arch.encode == nil) { ret 1; }
 
-    # the machine model carries the RV64 widths and exactly the gpr + fpr banks: no
-    # flags bank, since RISC-V has no condition-flags register.
     if (t.model.pointer_width != 8)              { ret 1; }
     if (t.model.gpr_width != 8)                  { ret 1; }
     if (t.model.endianness != isa.ENDIAN_LITTLE) { ret 1; }
     if (t.model.reg_class_len != 2)              { ret 1; }
 
-    # locate the two banks by role, never by a magic index. the gpr bank exposes 32
-    # integer registers (x0-x31); the fpr bank exposes 30 (f0-f29, f30/f31 held back
-    # as FP scratch).
     var gp_len: u32 = 0;
     var fp_len: u32 = 0;
     var ci: u32 = 0;
@@ -1006,7 +1356,6 @@ test "mach.lang.target.select:linux_riscv64" {
     if (gp_len != 32) { ret 1; }
     if (fp_len != 30) { ret 1; }
 
-    # x0 (the hardwired zero register) is reserved and never allocatable.
     var x0_reserved: bool = false;
     var ri: i32 = 0;
     for (ri < t.model.reserved_len) {
@@ -1015,76 +1364,50 @@ test "mach.lang.target.select:linux_riscv64" {
     }
     if (!x0_reserved) { ret 1; }
 
-    # the frame / stack pointer role ids are s0/fp (x8) and sp (x2).
     if (t.model.frame_ptr_reg != 8) { ret 1; }
     if (t.model.stack_ptr_reg != 2) { ret 1; }
 
-    # the lp64d ABI resolved (not silently the SysV vtable) and classifies the first
-    # integer / float argument into a0 (x10) / fa0 (composite f10) and the integer
-    # return into a0.
     if (t.abi == nil)            { ret 1; }
     if (t.abi.id != abi.ABI_LP64D) { ret 1; }
-    val arg: abi.ArgPassingFn = t.abi.arg_passing::abi.ArgPassingFn;
-    val ai: abi.ParamSlot = arg(0, 8, 8, false, 0, false, false, false, 0, 0, 0, 0, abi.agg_none());
+    val arg: abi.ArgPassingFn = t.abi.arg_passing;
+    val ai: abi.ParamSlot = arg(0, 8, 8, false, 0, false, false, 0, 0, 0, 0, abi.agg_none());
     if (ai.class != abi.CLASS_GP) { ret 1; }
-    if (ai.reg != 10)             { ret 1; }  # a0 = x10
-    val af: abi.ParamSlot = arg(0, 8, 8, true, 0, false, false, false, 0, 0, 0, 0, abi.agg_none());
+    if (ai.reg != 10)             { ret 1; }
+    val af: abi.ParamSlot = arg(0, 8, 8, true, 0, false, false, 0, 0, 0, 0, abi.agg_none());
     if (af.class != abi.CLASS_FP)                                  { ret 1; }
-    if (af.reg != isa.regid_make(isa.REG_CLASS_ID_XMM, 10))        { ret 1; }  # fa0 = f10
-    val rp: abi.RetPassingFn = t.abi.ret_passing::abi.RetPassingFn;
+    if (af.reg != isa.regid_make(isa.REG_CLASS_ID_XMM, 10))        { ret 1; }
+    val rp: abi.RetPassingFn = t.abi.ret_passing;
     val rr: abi.ParamSlot = rp(8, 8, false, 0, false, false, 0, 0, abi.agg_none());
     if (rr.class != abi.CLASS_GP) { ret 1; }
-    if (rr.reg != 10)             { ret 1; }  # a0 = x10
+    if (rr.reg != 10)             { ret 1; }
 
     ret 0;
 }
 
-# selecting a freestanding RV32 target composes the RV32 machine description (#2778)
-#
-# THE SAME ISA, A DIFFERENT MACHINE, and this test is written to tell those apart.
-# Everything the register file describes is asserted to be IDENTICAL to rv64's -
-# thirty-two integer registers, thirty allocatable float registers, x0 reserved, s0
-# and sp in their psABI roles - while every WIDTH is asserted to be four. A wiring
-# mistake that pointed rv32 at rv64's model would pass every register assertion and
-# fail every width one, which is exactly the discrimination worth having.
-#
-# FREESTANDING RATHER THAN LINUX, and that is a statement about #2861 rather than a
-# convenience: the ELF writer stamps ELFCLASS32 from the pointer width while emitting
-# Elf64 structures, so `of.elf` deliberately does not cover this arch and an rv32
-# linux tuple is refused. The raw flat image is what rv32 can honestly produce today.
 test "mach.lang.target.select:riscv32_freestanding_raw" {
     var reg: TargetRegistry = registry_init();
-    val res_reg: R.Result[bool, str] = register_all(?reg);
-    if (R.is_err[bool, str](res_reg)) { ret 1; }
+    fin { registry_dnit(?reg); }
+    val res_reg: R.Result[R.Void, str] = register_all(?reg, target_testing.debug_descriptor);
+    if (R.is_err[R.Void, str](res_reg)) { ret 1; }
 
     val res_target: R.Result[resolved.Target, str] = select(?reg, "riscv32", "freestanding", "ilp32d");
     if (R.is_err[resolved.Target, str](res_target)) { ret 1; }
     val t: resolved.Target = R.unwrap_ok[resolved.Target, str](res_target);
 
-    # the ISA resolved to RV32, which shares EM_RISCV with RV64 and is told apart by
-    # its pointer width - the same width the ELF class byte would be derived from.
     if (t.arch == nil)                { ret 1; }
     if (t.isa.id != isa.ARCH_RISCV32) { ret 1; }
-    if (t.isa.elf_machine != 243)     { ret 1; }  # EM_RISCV, shared with rv64
+    if (t.isa.elf_machine != 243)     { ret 1; }
     if (t.isa.pointer_width != 4)     { ret 1; }
     if (t.arch.select == nil)         { ret 1; }
     if (t.arch.encode == nil)         { ret 1; }
 
-    # EVERY WIDTH IS FOUR. `max_alu_width` at 4 is what puts an i64 above the ALU and
-    # sends it through `be.codegen.legalize`'s lane split.
     if (t.model.pointer_width != 4) { ret 1; }
     if (t.model.gpr_width     != 4) { ret 1; }
     if (t.model.max_alu_width != 4) { ret 1; }
     if (t.model.spill_width   != 4) { ret 1; }
-    # ... and the ALU FLOOR IS STILL FOUR, because it is a declared fact about
-    # sub-word residue rather than something derived from the word width.
     if (t.model.alu_min_width != 4) { ret 1; }
-    # ... and FLEN IS STILL EIGHT. rv32gc has the D extension, so a float register is
-    # twice the width of an integer one. this is the pair a single "word size" breaks.
     if (t.model.flen_bits != 64) { ret 1; }
 
-    # the register file is RV64's, unchanged: the numbering and roles are
-    # architectural, not width-derived.
     if (t.model.reg_class_len != 2) { ret 1; }
     var gp_len: u32 = 0;
     var fp_len: u32 = 0;
@@ -1099,78 +1422,58 @@ test "mach.lang.target.select:riscv32_freestanding_raw" {
     if (t.model.frame_ptr_reg != 8) { ret 1; }
     if (t.model.stack_ptr_reg != 2) { ret 1; }
 
-    # THE TWO MODELS ARE SEPARATE STORAGE. registering rv32 must not have overwritten
-    # rv64's template, which one shared set of globals would have done silently.
     val res64: R.Result[resolved.Target, str] = select_of(?reg, "riscv64", "linux", "lp64d", "");
     if (R.is_err[resolved.Target, str](res64)) { ret 1; }
     val t64: resolved.Target = R.unwrap_ok[resolved.Target, str](res64);
     if (t64.model.gpr_width != 8) { ret 1; }
     if (t.model.gpr_width   != 4) { ret 1; }
 
-    # the ilp32d convention resolved, and its argument slot is FOUR bytes wide - read
-    # from the member's XLEN rather than from a constant, so a0 still carries the
-    # first integer argument while a two-register aggregate now straddles a0/a1 at +4.
     if (t.abi == nil)               { ret 1; }
     if (t.abi.id != abi.ABI_ILP32D) { ret 1; }
     if (t.abi.arg_slot_granularity != 4) { ret 1; }
-    val arg: abi.ArgPassingFn = t.abi.arg_passing::abi.ArgPassingFn;
-    val ai: abi.ParamSlot = arg(0, 4, 4, false, 0, false, false, false, 0, 0, 0, 0, abi.agg_none());
+    val arg: abi.ArgPassingFn = t.abi.arg_passing;
+    val ai: abi.ParamSlot = arg(0, 4, 4, false, 0, false, false, 0, 0, 0, 0, abi.agg_none());
     if (ai.class != abi.CLASS_GP) { ret 1; }
-    if (ai.reg != 10)             { ret 1; }  # a0 = x10
-    # a double still rides fa0 under ilp32d, on a machine whose integer registers
-    # could not hold it - the whole reason FLEN is its own fact.
-    val af: abi.ParamSlot = arg(0, 8, 8, true, 0, false, false, false, 0, 0, 0, 0, abi.agg_none());
+    if (ai.reg != 10)             { ret 1; }
+    val af: abi.ParamSlot = arg(0, 8, 8, true, 0, false, false, 0, 0, 0, 0, abi.agg_none());
     if (af.class != abi.CLASS_FP)                           { ret 1; }
     if (af.reg != isa.regid_make(isa.REG_CLASS_ID_XMM, 10)) { ret 1; }
 
-    # the raw flat image is the format, and freestanding named it.
     if (t.of == nil)                         { ret 1; }
     if (!str_equals(t.os.default_of, "raw")) { ret 1; }
 
     ret 0;
 }
 
-# AN RV32 LINUX TARGET IS REFUSED BY NAME UNTIL THE ELF32 WRITER EXISTS (#2861)
-#
-# The refusal is the honest statement of what mach can do: `of.elf` covers rv64 and
-# not rv32, because `elf_class_for` would stamp ELFCLASS32 from the 4-byte pointer
-# width while every structure the writer emits is Elf64. A file whose class byte
-# contradicts its layout is worse for a reader than no file, so the tuple is refused
-# at resolve time rather than producing one.
-#
-# This test is the thing that will FAIL when #2861 lands, which is the point: it is a
-# tripwire on a deliberate gap, not a permanent property.
-test "mach.lang.target.select:riscv32_linux_is_refused_until_elf32" {
+test "mach.lang.target.select:riscv32_linux_is_refused_because_linux_does_not_list_the_isa" {
     var reg: TargetRegistry = registry_init();
-    if (R.is_err[bool, str](register_all(?reg))) { ret 1; }
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
 
-    val res: R.Result[resolved.Target, str] = select(?reg, "riscv32", "linux", "ilp32d");
-    if (!R.is_err[resolved.Target, str](res)) { ret 1; }
-
-    # and it is refused for the RIGHT reason - the object format, not a missing arch
-    # or a missing convention, both of which exist.
     val isa_opt: O.Option[*isa.IsaVTable] = isa.lookup(?reg.isa, "riscv32");
     if (O.is_none[*isa.IsaVTable](isa_opt)) { ret 1; }
     val abi_opt: O.Option[*abi.AbiVTable] = abi.lookup(?reg.abi, "ilp32d");
     if (O.is_none[*abi.AbiVTable](abi_opt)) { ret 1; }
+
+    val res: R.Result[resolved.Target, str] = select(?reg, "riscv32", "linux", "ilp32d");
+    if (!R.is_err[resolved.Target, str](res)) { ret 1; }
+    val diag: str = R.unwrap_err[resolved.Target, str](res);
+    if (!str_contains(diag, "does not run on instruction set")) { ret 1; }
+    if (!str_contains(diag, "linux"))   { ret 1; }
+    if (!str_contains(diag, "riscv32")) { ret 1; }
     ret 0;
 }
 
-# selecting an x86-64 freestanding target composes a full Target: the freestanding
-# os resolves the raw object format through its `default_of`, binds the flat-image
-# executable writer, and names `_start` as the entry symbol. the sysv64 ABI
-# resolves on the os-independent ABI axis. this proves the bare-metal substrates
-# compose without a hosted OS
 test "mach.lang.target.select:x86_64_freestanding_raw" {
     var reg: TargetRegistry = registry_init();
-    val res_reg: R.Result[bool, str] = register_all(?reg);
-    if (R.is_err[bool, str](res_reg)) { ret 1; }
+    fin { registry_dnit(?reg); }
+    val res_reg: R.Result[R.Void, str] = register_all(?reg, target_testing.debug_descriptor);
+    if (R.is_err[R.Void, str](res_reg)) { ret 1; }
 
     val res_target: R.Result[resolved.Target, str] = select(?reg, "x86_64", "freestanding", "sysv64");
     if (R.is_err[resolved.Target, str](res_target)) { ret 1; }
     val t: resolved.Target = R.unwrap_ok[resolved.Target, str](res_target);
 
-    # the freestanding os resolved and names the raw default object format.
     if (t.os == nil)                                 { ret 1; }
     if (t.os.id != os.OS_FREESTANDING)               { ret 1; }
     if (!str_equals(t.os.entry_symbol, "_start"))    { ret 1; }
@@ -1178,13 +1481,10 @@ test "mach.lang.target.select:x86_64_freestanding_raw" {
     if (t.os.base_addr != 0)                         { ret 1; }
     if (t.os.page_size != 1)                         { ret 1; }
 
-    # the object format resolved to raw, with the flat-image executable writer
-    # bound and the object/dynamic writers left as unsupported stubs.
     if (t.of == nil)            { ret 1; }
     if (t.of.id != of.OF_RAW)   { ret 1; }
     if (t.of.emit_exec == nil)  { ret 1; }
 
-    # the ABI resolved on the os-independent axis.
     if (t.abi == nil)             { ret 1; }
     if (t.abi.id != abi.ABI_SYSV) { ret 1; }
     if (t.arch == nil)            { ret 1; }
@@ -1193,14 +1493,11 @@ test "mach.lang.target.select:x86_64_freestanding_raw" {
     ret 0;
 }
 
-# every os declares the prefix its C toolchain gives a C identifier, and Darwin is
-# the one that gives it an underscore. an `ext` declaration names a C declaration,
-# so its link name carries this prefix - a Darwin build that emitted the bare name
-# would never bind the `_`-prefixed symbol a C object defines (#2521)
 test "mach.lang.target.select:os_declares_its_c_symbol_prefix" {
     var reg: TargetRegistry = registry_init();
-    val res_reg: R.Result[bool, str] = register_all(?reg);
-    if (R.is_err[bool, str](res_reg)) { ret 1; }
+    fin { registry_dnit(?reg); }
+    val res_reg: R.Result[R.Void, str] = register_all(?reg, target_testing.debug_descriptor);
+    if (R.is_err[R.Void, str](res_reg)) { ret 1; }
 
     val r_dar: R.Result[resolved.Target, str] = select(?reg, "x86_64", "darwin", "sysv64");
     if (R.is_err[resolved.Target, str](r_dar)) { ret 1; }
@@ -1220,65 +1517,48 @@ test "mach.lang.target.select:os_declares_its_c_symbol_prefix" {
     ret 0;
 }
 
-# the object format is selectable by name independently of the os: select_of with
-# an explicit name overrides the os default, an empty name (and the 4-arg select
-# wrapper) falls back to it, and an unregistered name fails with the same contract
-# as the other axes. this exercises the of-by-name mechanism in isolation
 test "mach.lang.target.select_of:object_format_chosen_by_name" {
     var reg: TargetRegistry = registry_init();
-    val res_reg: R.Result[bool, str] = register_all(?reg);
-    if (R.is_err[bool, str](res_reg)) { ret 1; }
+    fin { registry_dnit(?reg); }
+    val res_reg: R.Result[R.Void, str] = register_all(?reg, target_testing.debug_descriptor);
+    if (R.is_err[R.Void, str](res_reg)) { ret 1; }
 
-    # an explicit "elf" overrides the freestanding os default of "raw".
     val r_elf: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "freestanding", "sysv64", "elf");
     if (R.is_err[resolved.Target, str](r_elf))                       { ret 1; }
     if (R.unwrap_ok[resolved.Target, str](r_elf).of.id != of.OF_ELF) { ret 1; }
 
-    # an empty of name defers to the os default, resolving to raw.
     val r_def: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "freestanding", "sysv64", "");
     if (R.is_err[resolved.Target, str](r_def))                       { ret 1; }
     if (R.unwrap_ok[resolved.Target, str](r_def).of.id != of.OF_RAW) { ret 1; }
 
-    # the 4-arg select wrapper is exactly the empty-of case.
     val r_wrap: R.Result[resolved.Target, str] = select(?reg, "x86_64", "freestanding", "sysv64");
     if (R.is_err[resolved.Target, str](r_wrap))                       { ret 1; }
     if (R.unwrap_ok[resolved.Target, str](r_wrap).of.id != of.OF_RAW) { ret 1; }
 
-    # an unregistered of name fails, mirroring the isa/os/abi unregistered contract.
     val r_bad: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "freestanding", "sysv64", "bogus");
     if (!R.is_err[resolved.Target, str](r_bad)) { ret 1; }
 
     ret 0;
 }
 
-# a whole-module emitter takes its object format from the ISA, not the os: the
-# same freestanding os that defaults a register machine to the flat `raw` image
-# resolves spirv to `spv`, the format declaring a finished-module object. that is
-# the whole of #2245 - before it, a default manifest resolved spirv to raw, which
-# refuses object output, so the advertised target could emit nothing at all
 test "mach.lang.target.select:spirv_defaults_to_the_finished_module_format" {
     var reg: TargetRegistry = registry_init();
-    if (R.is_err[bool, str](register_all(?reg))) { ret 1; }
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
 
-    # no `of` spelled - exactly what a manifest naming only isa/os/abi gets.
     val r: R.Result[resolved.Target, str] = select(?reg, "spirv", "freestanding", "spirv");
     if (R.is_err[resolved.Target, str](r)) { ret 1; }
     val t: resolved.Target = R.unwrap_ok[resolved.Target, str](r);
 
-    # the isa is the whole-module family, and the os would have said "raw".
     if (!isa.emits_whole_module(t.isa))      { ret 1; }
     if (!str_equals(t.os.default_of, "raw")) { ret 1; }
 
-    # yet the resolved format is spv: a finished-module object written as `.spv`,
-    # which is what makes the build deliver the module tree instead of linking.
     if (t.of == nil)                          { ret 1; }
     if (t.of.id != of.OF_SPV)                 { ret 1; }
     if (!t.of.object_is_artifact)             { ret 1; }
     if (!str_equals(t.of.object_ext, "spv"))  { ret 1; }
     if (t.of.emit_object == nil)              { ret 1; }
 
-    # the derivation is confined to the whole-module family: a register machine on
-    # the same os still follows the os, and a spelled-out `of` still overrides.
     val rm: R.Result[resolved.Target, str] = select(?reg, "x86_64", "freestanding", "sysv64");
     if (R.is_err[resolved.Target, str](rm))                        { ret 1; }
     if (R.unwrap_ok[resolved.Target, str](rm).of.id != of.OF_RAW)  { ret 1; }
@@ -1289,17 +1569,11 @@ test "mach.lang.target.select:spirv_defaults_to_the_finished_module_format" {
     ret 0;
 }
 
-# the two back-half families and the two object shapes pair off exactly, and
-# crossing them fails at composition rather than deep in emit. an ISA that hands
-# over a finished module cannot be written into a flat image or a relocatable
-# container, and a register machine's machine text has no place in a
-# finished-module format. the error names both sides and which shape each carries
 test "mach.lang.target.select_of:rejects_crossed_emission_shapes" {
     var reg: TargetRegistry = registry_init();
-    if (R.is_err[bool, str](register_all(?reg))) { ret 1; }
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
 
-    # a whole-module emitter into the flat image the os would otherwise default
-    # to: `raw` lays out load segments over machine text there is none of.
     val rw: R.Result[resolved.Target, str] = select_of(?reg, "spirv", "freestanding", "spirv", "raw");
     if (!R.is_err[resolved.Target, str](rw)) { ret 1; }
     val mw: str = R.unwrap_err[resolved.Target, str](rw);
@@ -1307,31 +1581,24 @@ test "mach.lang.target.select_of:rejects_crossed_emission_shapes" {
     if (!str_contains(mw, "raw"))             { ret 1; }
     if (!str_contains(mw, "finished modules")) { ret 1; }
 
-    # and into a relocatable container, which would hand a linker a module.
     val re: R.Result[resolved.Target, str] = select_of(?reg, "spirv", "freestanding", "spirv", "elf");
     if (!R.is_err[resolved.Target, str](re)) { ret 1; }
 
-    # the reverse crossing: a register machine into the finished-module format,
-    # which has no section for machine text.
     val rr: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "freestanding", "sysv64", "spv");
     if (!R.is_err[resolved.Target, str](rr)) { ret 1; }
 
     ret 0;
 }
 
-# the of-by-name path end to end: selecting freestanding with an explicit "raw" of
-# composes the flat-image writer, and emitting a one-segment program through the
-# composed writer produces a flat image - the segment's raw bytes, no container,
-# entered at the image base. this ties the name-selected of substrate to a real
-# emitted artifact (os=freestanding, of=raw, no std)
 test "mach.lang.target.select_of:freestanding_raw_emits_flat_image" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var itn: intern.Interner = intern.init(?alloc);
 
     var reg: TargetRegistry = registry_init();
-    val res_reg: R.Result[bool, str] = register_all(?reg);
-    if (R.is_err[bool, str](res_reg)) { ret 1; }
+    fin { registry_dnit(?reg); }
+    val res_reg: R.Result[R.Void, str] = register_all(?reg, target_testing.debug_descriptor);
+    if (R.is_err[R.Void, str](res_reg)) { ret 1; }
 
     val res_target: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "freestanding", "sysv64", "raw");
     if (R.is_err[resolved.Target, str](res_target)) { ret 1; }
@@ -1340,7 +1607,6 @@ test "mach.lang.target.select_of:freestanding_raw_emits_flat_image" {
     if (t.of.id != of.OF_RAW)  { ret 1; }
     if (t.of.emit_exec == nil) { ret 1; }
 
-    # one executable segment at the freestanding image base (0), entered at base.
     var code_bytes: [4]u8;
     code_bytes[0] = 0xEB; code_bytes[1] = 0xFE; code_bytes[2] = 0x90; code_bytes[3] = 0x90;
     var segs: [1]of.LoadSegment;
@@ -1352,21 +1618,19 @@ test "mach.lang.target.select_of:freestanding_raw_emits_flat_image" {
     var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
     val tpath: str = fs.temp_path(?tf);
 
-    # enter at the image base; the raw writer rejects any other entry.
-    val em: R.Result[bool, str] =
-        t.of.emit_exec(?alloc, ?itn, t.isa, ?segs[0], 1, t.os.page_size,
+    val em: R.Result[R.Void, str] =
+        t.of.emit_exec(?alloc, ?itn, ?t.object, ?segs[0], 1, t.os.page_size,
                        t.os.base_addr, t.os.base_addr, nil::*of.ExecFunction, 0,
                        nil::*of.Section, 0, nil::*of.Section, 0,
                        nil::*of.SymtabEntry, 0,
                        tpath::*u8, "selraw"::*u8, of.image_options_default(of.SUBSYSTEM_CONSOLE));
-    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+    if (R.is_err[R.Void, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
 
     val rr: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
     fs.temp_close_and_remove(?tf);
     if (R.is_err[Vector[u8], str](rr)) { ret 1; }
     var b: Vector[u8] = R.unwrap_ok[Vector[u8], str](rr);
 
-    # a flat image: exactly the segment bytes, no ELF magic, no header.
     if (b.len != 4)        { vector.dnit[u8](?b); ret 1; }
     if (b.data[0] == 0x7F) { vector.dnit[u8](?b); ret 1; }
     if (b.data[0] != 0xEB) { vector.dnit[u8](?b); ret 1; }
@@ -1376,13 +1640,11 @@ test "mach.lang.target.select_of:freestanding_raw_emits_flat_image" {
     ret 0;
 }
 
-# selecting windows/aarch64 fails at composition: coff declares x86_64 coverage
-# only, so the joint (of, isa) cell is unfilled. the error names the object format
-# and the instruction set rather than surfacing later in codegen or link
 test "mach.lang.target.select_of:rejects_object_format_uncovered_isa" {
     var reg: TargetRegistry = registry_init();
-    val res_reg: R.Result[bool, str] = register_all(?reg);
-    if (R.is_err[bool, str](res_reg)) { ret 1; }
+    fin { registry_dnit(?reg); }
+    val res_reg: R.Result[R.Void, str] = register_all(?reg, target_testing.debug_descriptor);
+    if (R.is_err[R.Void, str](res_reg)) { ret 1; }
 
     val r: R.Result[resolved.Target, str] = select(?reg, "aarch64", "windows", "aapcs64");
     if (!R.is_err[resolved.Target, str](r)) { ret 1; }
@@ -1392,13 +1654,11 @@ test "mach.lang.target.select_of:rejects_object_format_uncovered_isa" {
     ret 0;
 }
 
-# selecting an x86_64 target with an aarch64 calling convention fails at
-# composition: a convention is per-ISA, so the joint (isa, abi) cell is unfilled.
-# the error names the convention's real instruction set and the requested one
 test "mach.lang.target.select_of:rejects_abi_isa_mismatch" {
     var reg: TargetRegistry = registry_init();
-    val res_reg: R.Result[bool, str] = register_all(?reg);
-    if (R.is_err[bool, str](res_reg)) { ret 1; }
+    fin { registry_dnit(?reg); }
+    val res_reg: R.Result[R.Void, str] = register_all(?reg, target_testing.debug_descriptor);
+    if (R.is_err[R.Void, str](res_reg)) { ret 1; }
 
     val r: R.Result[resolved.Target, str] = select(?reg, "x86_64", "linux", "aapcs64");
     if (!R.is_err[resolved.Target, str](r)) { ret 1; }
@@ -1408,13 +1668,11 @@ test "mach.lang.target.select_of:rejects_abi_isa_mismatch" {
     ret 0;
 }
 
-# selecting an ELF object format on Windows fails at composition: the Windows
-# entry/runtime contract is COFF-coupled, so the (os, of) cell is unfilled. the
-# error names the operating system and the object format
 test "mach.lang.target.select_of:rejects_os_unsupported_of" {
     var reg: TargetRegistry = registry_init();
-    val res_reg: R.Result[bool, str] = register_all(?reg);
-    if (R.is_err[bool, str](res_reg)) { ret 1; }
+    fin { registry_dnit(?reg); }
+    val res_reg: R.Result[R.Void, str] = register_all(?reg, target_testing.debug_descriptor);
+    if (R.is_err[R.Void, str](res_reg)) { ret 1; }
 
     val r: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "windows", "win64", "elf");
     if (!R.is_err[resolved.Target, str](r)) { ret 1; }
@@ -1424,13 +1682,10 @@ test "mach.lang.target.select_of:rejects_os_unsupported_of" {
     ret 0;
 }
 
-# the has_v128 SIMD capability fact is a declared MachineModel field reading true
-# on x86_64 (SSE2) and aarch64 (NEON) and false on rv64gc (no vector unit until
-# the V extension), the single fact #2016's scalarize gate and #2017's require
-# gate both consume (#1965)
 test "mach.lang.target.select:has_v128_capability" {
     var reg: TargetRegistry = registry_init();
-    if (R.is_err[bool, str](register_all(?reg))) { ret 1; }
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
 
     val tx: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "linux", "sysv64", "");
     if (R.is_err[resolved.Target, str](tx)) { ret 1; }
@@ -1447,13 +1702,10 @@ test "mach.lang.target.select:has_v128_capability" {
     ret 0;
 }
 
-# vector_bits is the width bound the `TxN` form resolves against, declared by
-# every target including the two with no vector unit at all. a target that
-# scalarizes still has a vector width, so this is independent of has_v128 and
-# must never be derived from it (#2687)
 test "mach.lang.target.select:vector_bits_bound" {
     var reg: TargetRegistry = registry_init();
-    if (R.is_err[bool, str](register_all(?reg))) { ret 1; }
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
 
     val tx: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "linux", "sysv64", "");
     if (R.is_err[resolved.Target, str](tx)) { ret 1; }
@@ -1463,9 +1715,6 @@ test "mach.lang.target.select:vector_bits_bound" {
     if (R.is_err[resolved.Target, str](ta)) { ret 1; }
     if (R.unwrap_ok[resolved.Target, str](ta).model.vector_bits != 128) { ret 1; }
 
-    # the two targets with has_v128 false still declare the width: they admit
-    # every 128-bit spelling and scalarize it, so a 0 here would refuse names
-    # that compile correctly today.
     val tr: R.Result[resolved.Target, str] = select_of(?reg, "riscv64", "linux", "lp64d", "");
     if (R.is_err[resolved.Target, str](tr)) { ret 1; }
     if (R.unwrap_ok[resolved.Target, str](tr).model.has_v128)            { ret 1; }
@@ -1474,15 +1723,10 @@ test "mach.lang.target.select:vector_bits_bound" {
     ret 0;
 }
 
-# the lane-count ceiling every target declares (#2749). every MACHINE target declares
-# none, so its packed answers follow from `vector_bits` and the lane size alone and
-# are exactly what they were before the axis existed. SPIR-V declares four, because a
-# Shader module's `OpTypeVector` is bounded by a component count at every element
-# type. asserted against the registered models rather than assumed, since the whole
-# risk of adding the axis is a machine target quietly acquiring a ceiling.
 test "mach.lang.target.select:vector_lane_ceiling" {
     var reg: TargetRegistry = registry_init();
-    if (R.is_err[bool, str](register_all(?reg))) { ret 1; }
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
 
     val tx: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "linux", "sysv64", "");
     if (R.is_err[resolved.Target, str](tx)) { ret 1; }
@@ -1506,21 +1750,16 @@ test "mach.lang.target.select:vector_lane_ceiling" {
     if (R.is_err[resolved.Target, str](ts)) { ret 1; }
     val ms: isa.MachineModel = R.unwrap_ok[resolved.Target, str](ts).model;
     if (ms.max_vector_lanes != 4)                                   { ret 1; }
-    # sixteen 8-bit lanes is what `vector_bits` alone would have claimed; the ceiling
-    # is what makes the authority agree with what the module may actually declare
     if (isa.packed_lane_cap(?ms, 8)  != 4)                          { ret 1; }
     if (isa.packed_width(?ms, isa.VEC_OP_ADD, false, 8)  != 32)     { ret 1; }
     if (isa.packed_width(?ms, isa.VEC_OP_ADD, false, 32) != 128)    { ret 1; }
     ret 0;
 }
 
-# the ALU floor every target declares (#2749). 4 on a register machine, where a
-# sub-word result has to fully define the register it spills through; 1 where there is
-# no such register - the 8-bit 6502's word, and SPIR-V's absent register file, whose
-# typed opcodes reject a 32-bit result built from 8-bit operands
 test "mach.lang.target.select:alu_min_width" {
     var reg: TargetRegistry = registry_init();
-    if (R.is_err[bool, str](register_all(?reg))) { ret 1; }
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
 
     val tx: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "linux", "sysv64", "");
     if (R.is_err[resolved.Target, str](tx)) { ret 1; }
@@ -1540,24 +1779,20 @@ test "mach.lang.target.select:alu_min_width" {
     ret 0;
 }
 
-# a 128-bit vector classifies as one SSE-class value under SysV (#2014): a single XMM
-# argument register (not the two-eightbyte split an all-float aggregate takes) and XMM0
-# for the return, both at the full 16-byte width
 test "mach.lang.target.select:classify_vector_sse_class" {
     var reg: TargetRegistry = registry_init();
-    if (R.is_err[bool, str](register_all(?reg))) { ret 1; }
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
     val tx: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "linux", "sysv64", "");
     if (R.is_err[resolved.Target, str](tx)) { ret 1; }
     val t: resolved.Target = R.unwrap_ok[resolved.Target, str](tx);
 
-    # a 16-byte vector argument: one XMM register, size 16 (is_vector true, not aggregate).
-    val arg: abi.ArgPassingFn = t.abi.arg_passing::abi.ArgPassingFn;
-    val a: abi.ParamSlot = arg(0, 16, 16, false, 0, false, true, false, 0, 0, 0, 0, abi.agg_none());
+    val arg: abi.ArgPassingFn = t.abi.arg_passing;
+    val a: abi.ParamSlot = arg(0, 16, 16, false, 0, false, true, 0, 0, 0, 0, abi.agg_none());
     if (a.class != abi.CLASS_FP) { ret 1; }
     if (a.size != 16)            { ret 1; }
 
-    # a 16-byte vector return: XMM0, size 16.
-    val rp: abi.RetPassingFn = t.abi.ret_passing::abi.RetPassingFn;
+    val rp: abi.RetPassingFn = t.abi.ret_passing;
     val r: abi.ParamSlot = rp(16, 16, false, 0, false, true, 0, 0, abi.agg_none());
     if (r.class != abi.CLASS_FP) { ret 1; }
     if (r.size != 16)            { ret 1; }
@@ -1565,21 +1800,11 @@ test "mach.lang.target.select:classify_vector_sse_class" {
     ret 0;
 }
 
-# select_of resolves the object format's declared debug model onto the target's
-# `debug` vtable: elf declares "dwarf", so a registered producer binds and
-# `debug_id` is DBG_DWARF; coff declares no model, so `debug` stays nil and -g emits
-# nothing. the be-layer registrar installs the real producer post-hoc, so this stubs
-# one to prove the resolution in isolation
 test "mach.lang.target.select_of:resolves_debug_model" {
     var reg: TargetRegistry = registry_init();
-    if (R.is_err[bool, str](register_all(?reg))) { ret 1; }
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
 
-    # stand in for the be-layer dwarf producer the driver wires post-hoc.
-    var dw: of.DebugVTable;
-    dw.id = of.DBG_DWARF; dw.name = "dwarf"; dw.produce = nil;
-    of.debug_register(?reg.debug, ?dw);
-
-    # elf declares default_debug "dwarf": the producer resolves onto the target.
     val te: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "linux", "sysv64", "elf");
     if (R.is_err[resolved.Target, str](te)) { ret 1; }
     val et: resolved.Target = R.unwrap_ok[resolved.Target, str](te);
@@ -1587,7 +1812,6 @@ test "mach.lang.target.select_of:resolves_debug_model" {
     if (et.debug_id != of.DBG_DWARF) { ret 1; }
     if (et.debug.id != of.DBG_DWARF) { ret 1; }
 
-    # coff declares no debug model: the target carries no producer.
     val tc: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "windows", "win64", "coff");
     if (R.is_err[resolved.Target, str](tc)) { ret 1; }
     val ct: resolved.Target = R.unwrap_ok[resolved.Target, str](tc);
@@ -1596,37 +1820,481 @@ test "mach.lang.target.select_of:resolves_debug_model" {
     ret 0;
 }
 
-# every registered convention's DECLARED granularity is the one its classifier
-# actually places a pair at
-#
-# `AbiVTable.arg_slot_granularity` and the `word` a classifier hands to
-# `make_slot_pair` are two spellings of one fact, and two spellings that must agree is
-# a shape this codebase has been bitten by. They agree by construction - each
-# convention feeds both from one constant or one descriptor field - and this checks it
-# rather than trusting it, so a convention wired later that sets one and forgets the
-# other fails at `mach test .` instead of at a call boundary.
-#
-# A convention that never builds a GP pair is skipped by the probe rather than
-# asserted about: it declares a granularity for completeness and no path consumes it.
 test "mach.lang.target.abi_vtable:granularity_matches_its_classifier" {
     var reg: TargetRegistry = registry_init();
-    if (R.is_err[bool, str](register_all(?reg))) { ret 1; }
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
 
     var i: u32 = 0;
     for (i < reg.abi.count) {
-        val vt: *abi.AbiVTable = reg.abi.entries[i];
+        val vt: *abi.AbiVTable = ?reg.abi.entries[i];
         if (vt.arg_slot_granularity == 0) { ret 1; }
         if (vt.arg_passing == nil)        { i = i + 1; cnt; }
 
-        # a 16-byte aggregate is the shape these conventions place in a GP pair
-        val fn: abi.ArgPassingFn = vt.arg_passing::abi.ArgPassingFn;
+        val fn: abi.ArgPassingFn = vt.arg_passing;
         var agg: abi.AggLayout;
         agg.field_count = 0;
-        val slot: abi.ParamSlot = fn(0, 16, 8, false, 0, true, false, false, 0, 0, 0, 0, agg);
+        val slot: abi.ParamSlot = fn(0, 16, 8, false, 0, true, false, 0, 0, 0, 0, agg);
         if (slot.piece_count == 2 && slot.pieces[1].kind == abi.PIECE_GP) {
             if (slot.pieces[1].src_off != vt.arg_slot_granularity::i64) { ret 1; }
         }
         i = i + 1;
     }
+    ret 0;
+}
+
+
+
+test "mach.lang.target.resolve:bakes_image_overrides_into_construction" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+
+    var req: TargetRequest = target_request("x86_64", "freestanding", "sysv64");
+    with_image(?req, 0x400000, 0x100000, 0x1000);
+    val r: R.Result[resolved.Target, str] = resolve(?reg, ?req);
+    if (R.is_err[resolved.Target, str](r)) { ret 1; }
+    val t: resolved.Target = R.unwrap_ok[resolved.Target, str](r);
+    if (t.base != 0x400000)          { ret 1; }
+    if (t.stack_reserve != 0x100000) { ret 1; }
+    if (t.stack_commit  != 0x1000)   { ret 1; }
+
+    var req2: TargetRequest = target_request("x86_64", "freestanding", "sysv64");
+    val r2: R.Result[resolved.Target, str] = resolve(?reg, ?req2);
+    if (R.is_err[resolved.Target, str](r2)) { ret 1; }
+    val t2: resolved.Target = R.unwrap_ok[resolved.Target, str](r2);
+    if (t2.base != 0)          { ret 1; }
+    if (t2.stack_reserve != 0) { ret 1; }
+    if (t2.stack_commit  != 0) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.select_of:is_a_zero_image_request_to_resolve" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+
+    val a: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "linux", "sysv64", "elf");
+    if (R.is_err[resolved.Target, str](a)) { ret 1; }
+    val ta: resolved.Target = R.unwrap_ok[resolved.Target, str](a);
+
+    var req: TargetRequest = target_request("x86_64", "linux", "sysv64");
+    with_of(?req, "elf");
+    val b: R.Result[resolved.Target, str] = resolve(?reg, ?req);
+    if (R.is_err[resolved.Target, str](b)) { ret 1; }
+    val tb: resolved.Target = R.unwrap_ok[resolved.Target, str](b);
+
+    if (ta.isa != tb.isa) { ret 1; }
+    if (ta.abi != tb.abi) { ret 1; }
+    if (ta.of  != tb.of)  { ret 1; }
+    if (ta.base != tb.base || ta.base != 0) { ret 1; }
+    ret 0;
+}
+
+fun fp_bytes_equal(a: *binary.Encoder, b: *binary.Encoder) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (a.data[i] != b.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+test "mach.lang.target.fingerprint:stable_across_two_encodings_of_the_same_target" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+
+    val ra: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "linux", "sysv64", "elf");
+    val rb: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "linux", "sysv64", "elf");
+    if (R.is_err[resolved.Target, str](ra) || R.is_err[resolved.Target, str](rb)) { ret 1; }
+    var ta: resolved.Target = R.unwrap_ok[resolved.Target, str](ra);
+    var tb: resolved.Target = R.unwrap_ok[resolved.Target, str](rb);
+
+    var ea: binary.Encoder = binary.encoder(?alloc, binary.LITTLE);
+    var eb: binary.Encoder = binary.encoder(?alloc, binary.LITTLE);
+    if (!fingerprint(?ta, ?ea)) { ret 1; }
+    if (!fingerprint(?tb, ?eb)) { ret 1; }
+    if (!fp_bytes_equal(?ea, ?eb)) { ret 1; }
+    if (ea.len == 0) { ret 1; }
+
+    binary.encoder_dnit(?ea);
+    binary.encoder_dnit(?eb);
+    ret 0;
+}
+
+test "mach.lang.target.fingerprint:sensitive_to_arch_abi_os_of_debug_backend_and_image" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+
+    val base: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "linux", "sysv64", "elf");
+    if (R.is_err[resolved.Target, str](base)) { ret 1; }
+    var tbase: resolved.Target = R.unwrap_ok[resolved.Target, str](base);
+    var ebase: binary.Encoder = binary.encoder(?alloc, binary.LITTLE);
+    if (!fingerprint(?tbase, ?ebase)) { ret 1; }
+
+    var td_page: resolved.Target = tbase;
+    td_page.page_size = tbase.page_size * 2;
+    var e_page: binary.Encoder = binary.encoder(?alloc, binary.LITTLE);
+    if (!fingerprint(?td_page, ?e_page)) { ret 1; }
+    if (fp_bytes_equal(?ebase, ?e_page)) { ret 1; }
+
+    val diff_arch: R.Result[resolved.Target, str] = select_of(?reg, "aarch64", "linux", "aapcs64", "elf");
+    if (R.is_err[resolved.Target, str](diff_arch)) { ret 1; }
+    var td_arch: resolved.Target = R.unwrap_ok[resolved.Target, str](diff_arch);
+    var e_arch: binary.Encoder = binary.encoder(?alloc, binary.LITTLE);
+    if (!fingerprint(?td_arch, ?e_arch)) { ret 1; }
+    if (fp_bytes_equal(?ebase, ?e_arch)) { ret 1; }
+
+    val diff_of: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "freestanding", "sysv64", "raw");
+    val same_of: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "freestanding", "sysv64", "elf");
+    if (R.is_err[resolved.Target, str](diff_of) || R.is_err[resolved.Target, str](same_of)) { ret 1; }
+    var td_of: resolved.Target = R.unwrap_ok[resolved.Target, str](diff_of);
+    var ts_of: resolved.Target = R.unwrap_ok[resolved.Target, str](same_of);
+    var e_of_raw: binary.Encoder = binary.encoder(?alloc, binary.LITTLE);
+    var e_of_elf: binary.Encoder = binary.encoder(?alloc, binary.LITTLE);
+    if (!fingerprint(?td_of, ?e_of_raw)) { ret 1; }
+    if (!fingerprint(?ts_of, ?e_of_elf)) { ret 1; }
+    if (fp_bytes_equal(?e_of_raw, ?e_of_elf)) { ret 1; }
+
+    val diff_os: R.Result[resolved.Target, str] = select_of(?reg, "x86_64", "darwin", "sysv64", "");
+    if (R.is_err[resolved.Target, str](diff_os)) { ret 1; }
+    var td_os: resolved.Target = R.unwrap_ok[resolved.Target, str](diff_os);
+    var e_os: binary.Encoder = binary.encoder(?alloc, binary.LITTLE);
+    if (!fingerprint(?td_os, ?e_os)) { ret 1; }
+    if (fp_bytes_equal(?ebase, ?e_os)) { ret 1; }
+
+    val diff_backend: R.Result[resolved.Target, str] = select_of(?reg, "spirv", "freestanding", "spirv", "spv");
+    if (R.is_err[resolved.Target, str](diff_backend)) { ret 1; }
+    var td_backend: resolved.Target = R.unwrap_ok[resolved.Target, str](diff_backend);
+    var e_backend: binary.Encoder = binary.encoder(?alloc, binary.LITTLE);
+    if (!fingerprint(?td_backend, ?e_backend)) { ret 1; }
+    if (fp_bytes_equal(?ebase, ?e_backend)) { ret 1; }
+
+    var req_a: TargetRequest = target_request("x86_64", "freestanding", "sysv64");
+    with_image(?req_a, 0x400000, 0, 0);
+    var req_b: TargetRequest = target_request("x86_64", "freestanding", "sysv64");
+    with_image(?req_b, 0x500000, 0, 0);
+    val ria: R.Result[resolved.Target, str] = resolve(?reg, ?req_a);
+    val rib: R.Result[resolved.Target, str] = resolve(?reg, ?req_b);
+    if (R.is_err[resolved.Target, str](ria) || R.is_err[resolved.Target, str](rib)) { ret 1; }
+    var tia: resolved.Target = R.unwrap_ok[resolved.Target, str](ria);
+    var tib: resolved.Target = R.unwrap_ok[resolved.Target, str](rib);
+    var e_ia: binary.Encoder = binary.encoder(?alloc, binary.LITTLE);
+    var e_ib: binary.Encoder = binary.encoder(?alloc, binary.LITTLE);
+    if (!fingerprint(?tia, ?e_ia)) { ret 1; }
+    if (!fingerprint(?tib, ?e_ib)) { ret 1; }
+    if (fp_bytes_equal(?e_ia, ?e_ib)) { ret 1; }
+
+    binary.encoder_dnit(?ebase);
+    binary.encoder_dnit(?e_page);
+    binary.encoder_dnit(?e_arch);
+    binary.encoder_dnit(?e_of_raw);
+    binary.encoder_dnit(?e_of_elf);
+    binary.encoder_dnit(?e_os);
+    binary.encoder_dnit(?e_backend);
+    binary.encoder_dnit(?e_ia);
+    binary.encoder_dnit(?e_ib);
+    ret 0;
+}
+
+test "mach.lang.target.fingerprint_model:sensitive_to_every_declared_field" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+
+    var base: isa.MachineModel;
+    base.pointer_width = 8; base.gpr_width = 8; base.max_alu_width = 8;
+    base.alu_min_width = 4; base.spill_width = 8; base.endianness = isa.ENDIAN_LITTLE;
+    base.reg_class_len = 0; base.frame_ptr_reg = 6; base.stack_ptr_reg = 7;
+    base.reserved_len = 0; base.div_reg = -1; base.div_hi_reg = -1; base.shift_count_reg = -1;
+    base.incoming_arg_base = 16; base.stack_align = 16; base.red_zone = 128; base.shadow_space = 0;
+    base.has_v128 = true; base.vector_bits = 128; base.max_vector_lanes = isa.VECTOR_LANES_UNBOUNDED;
+    base.vector_compute_generic = false; base.has_lane_ops = true; base.has_vec_build = true;
+    base.vec_mem_widths = isa.VEC_MEM_ALL_128; base.xbank_widths = isa.XBANK_4_8;
+    base.ct_trust_mul = true; base.has_var_shift = true; base.has_mul = true; base.has_float = true;
+    base.mul_hi_width = 8; base.flat_addressing = false; base.ct_trust_var_shift = true;
+    base.packed_gap_len = 0; base.flen_bits = 64;
+
+    val eb0: binary.Encoder = fp_encode_model(?alloc, ?base);
+    if (eb0.len == 0) { ret 1; }
+
+    var m: isa.MachineModel = base; m.pointer_width      = 4; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.gpr_width          = 4; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.max_alu_width      = 4; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.alu_min_width      = 1; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.spill_width        = 4; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.endianness         = isa.ENDIAN_BIG; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.frame_ptr_reg      = 5; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.stack_ptr_reg      = 4; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.div_reg            = 0; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.div_hi_reg         = 0; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.shift_count_reg    = 0; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.incoming_arg_base  = 0; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.stack_align        = 8; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.red_zone           = 0; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.shadow_space       = 32; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.has_v128           = false; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.vector_bits        = 256; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.max_vector_lanes   = 4; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.vector_compute_generic = true; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.has_lane_ops       = false; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.has_vec_build      = false; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.vec_mem_widths     = isa.VEC_MEM_NONE; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.xbank_widths       = isa.XBANK_NONE; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.ct_trust_mul       = false; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.has_var_shift      = false; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.has_mul            = false; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.has_float          = false; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.mul_hi_width       = 4; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.flat_addressing    = true; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.ct_trust_var_shift = false; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    m = base; m.flen_bits          = 32; if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+
+    var rc: [1]isa.RegClass;
+    rc[0].name = "gpr"; rc[0].kind = isa.RC_GENERAL; rc[0].len = 16;
+    m = base; m.reg_class_len = 1; m.reg_classes = ?rc[0];
+    if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+    var rc2: [1]isa.RegClass;
+    rc2[0].name = "gpr"; rc2[0].kind = isa.RC_GENERAL; rc2[0].len = 8;
+    var m2: isa.MachineModel = base; m2.reg_class_len = 1; m2.reg_classes = ?rc2[0];
+    if (fp_model_equal_pair(?alloc, ?m, ?m2)) { ret 1; }
+
+    var rr: [1]isa.Register;
+    rr[0].id = 0; rr[0].size = 8;
+    m = base; m.reserved_len = 1; m.reserved_regs = ?rr[0];
+    if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+
+    var pg: [1]isa.PackedGap;
+    pg[0].op = isa.VEC_OP_MUL; pg[0].is_float = false; pg[0].lane_bits = 32;
+    m = base; m.packed_gap_len = 1; m.packed_gaps = ?pg[0];
+    if (fp_model_equal(?alloc, ?base, ?m)) { ret 1; }
+
+    ret 0;
+}
+
+fun fp_encode_model(alloc: *A.Allocator, m: *isa.MachineModel) binary.Encoder {
+    var e: binary.Encoder = binary.encoder(alloc, binary.LITTLE);
+    val ok: bool = fingerprint_model(m, ?e);
+    if (!ok) { panic("fp_encode_model: encoding failed\n"); }
+    ret e;
+}
+
+fun fp_model_equal(alloc: *A.Allocator, a: *isa.MachineModel, b: *isa.MachineModel) bool {
+    ret fp_model_equal_pair(alloc, a, b);
+}
+
+fun fp_model_equal_pair(alloc: *A.Allocator, a: *isa.MachineModel, b: *isa.MachineModel) bool {
+    var ea: binary.Encoder = fp_encode_model(alloc, a);
+    var eb: binary.Encoder = fp_encode_model(alloc, b);
+    val eq: bool = fp_bytes_equal(?ea, ?eb);
+    binary.encoder_dnit(?ea);
+    binary.encoder_dnit(?eb);
+    ret eq;
+}
+
+test "mach.lang.target.artifact_naming:every_registered_object_format_has_a_total_object_and_executable_row" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+
+    var bad: i32 = 0;
+    var i: u32 = 0;
+    for (i < reg.of.count) {
+        val vt: *of.OfVTable = ?reg.of.entries[i];
+
+        val obj_r: R.Result[of.ArtifactName, str] = of.artifact_naming(vt, "linux", of.ARTIFACT_OBJECT);
+        if (R.is_err[of.ArtifactName, str](obj_r)) { bad = 1; }
+        or {
+            val an: of.ArtifactName = R.unwrap_ok[of.ArtifactName, str](obj_r);
+            if (str_len(an.suffix) > 0 && an.suffix[0] != '.') { bad = 1; }
+        }
+
+        val exe_linux_r: R.Result[of.ArtifactName, str] = of.artifact_naming(vt, "linux", of.ARTIFACT_EXECUTABLE);
+        if (R.is_err[of.ArtifactName, str](exe_linux_r)) { bad = 1; }
+        val exe_win_r: R.Result[of.ArtifactName, str] = of.artifact_naming(vt, "windows", of.ARTIFACT_EXECUTABLE);
+        if (R.is_err[of.ArtifactName, str](exe_win_r)) { bad = 1; }
+        or {
+            val an: of.ArtifactName = R.unwrap_ok[of.ArtifactName, str](exe_win_r);
+            if (!vt.object_is_artifact && !vt.produces_image && !str_equals(an.suffix, ".exe")) { bad = 1; }
+        }
+        i = i + 1;
+    }
+    ret bad;
+}
+
+test "mach.lang.target.artifact_naming:elf_coff_macho_conventional_names" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+
+    var bad: i32 = 0;
+
+    val elf_o: O.Option[*of.OfVTable] = of.lookup(?reg.of, "elf");
+    if (O.is_none[*of.OfVTable](elf_o)) { ret 1; }
+    val elf_vt: *of.OfVTable = O.unwrap[*of.OfVTable](elf_o);
+    val elf_static: of.ArtifactName = R.unwrap_ok[of.ArtifactName, str](of.artifact_naming(elf_vt, "linux", of.ARTIFACT_STATIC_LIB));
+    if (!str_equals(elf_static.prefix, "lib") || !str_equals(elf_static.suffix, ".a")) { bad = 1; }
+    val elf_shared: of.ArtifactName = R.unwrap_ok[of.ArtifactName, str](of.artifact_naming(elf_vt, "linux", of.ARTIFACT_SHARED_LIB));
+    if (!str_equals(elf_shared.prefix, "lib") || !str_equals(elf_shared.suffix, ".so")) { bad = 1; }
+
+    val macho_o: O.Option[*of.OfVTable] = of.lookup(?reg.of, "macho");
+    if (O.is_none[*of.OfVTable](macho_o)) { ret 1; }
+    val macho_vt: *of.OfVTable = O.unwrap[*of.OfVTable](macho_o);
+    val macho_shared: of.ArtifactName = R.unwrap_ok[of.ArtifactName, str](of.artifact_naming(macho_vt, "darwin", of.ARTIFACT_SHARED_LIB));
+    if (!str_equals(macho_shared.prefix, "lib") || !str_equals(macho_shared.suffix, ".dylib")) { bad = 1; }
+
+    val coff_o: O.Option[*of.OfVTable] = of.lookup(?reg.of, "coff");
+    if (O.is_none[*of.OfVTable](coff_o)) { ret 1; }
+    val coff_vt: *of.OfVTable = O.unwrap[*of.OfVTable](coff_o);
+    val coff_static_win: of.ArtifactName = R.unwrap_ok[of.ArtifactName, str](of.artifact_naming(coff_vt, "windows", of.ARTIFACT_STATIC_LIB));
+    if (!str_empty(coff_static_win.prefix) || !str_equals(coff_static_win.suffix, ".lib")) { bad = 1; }
+    val coff_shared: of.ArtifactName = R.unwrap_ok[of.ArtifactName, str](of.artifact_naming(coff_vt, "windows", of.ARTIFACT_SHARED_LIB));
+    if (!str_empty(coff_shared.prefix) || !str_equals(coff_shared.suffix, ".dll")) { bad = 1; }
+    val coff_exe: of.ArtifactName = R.unwrap_ok[of.ArtifactName, str](of.artifact_naming(coff_vt, "windows", of.ARTIFACT_EXECUTABLE));
+    if (!str_equals(coff_exe.suffix, ".exe")) { bad = 1; }
+
+    ret bad;
+}
+
+test "mach.lang.target.artifact_naming:flat_image_and_finished_module_formats_refuse_archive_and_shared_forms" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+
+    var bad: i32 = 0;
+
+    val raw_o: O.Option[*of.OfVTable] = of.lookup(?reg.of, "raw");
+    if (O.is_none[*of.OfVTable](raw_o)) { ret 1; }
+    val raw_vt: *of.OfVTable = O.unwrap[*of.OfVTable](raw_o);
+    if (R.is_ok[of.ArtifactName, str](of.artifact_naming(raw_vt, "freestanding", of.ARTIFACT_STATIC_LIB))) { bad = 1; }
+    if (R.is_ok[of.ArtifactName, str](of.artifact_naming(raw_vt, "freestanding", of.ARTIFACT_SHARED_LIB))) { bad = 1; }
+    val raw_exe: of.ArtifactName = R.unwrap_ok[of.ArtifactName, str](of.artifact_naming(raw_vt, "freestanding", of.ARTIFACT_EXECUTABLE));
+    if (!str_empty(raw_exe.prefix) || !str_empty(raw_exe.suffix)) { bad = 1; }
+
+    val spv_o: O.Option[*of.OfVTable] = of.lookup(?reg.of, "spv");
+    if (O.is_none[*of.OfVTable](spv_o)) { ret 1; }
+    val spv_vt: *of.OfVTable = O.unwrap[*of.OfVTable](spv_o);
+    if (R.is_ok[of.ArtifactName, str](of.artifact_naming(spv_vt, "freestanding", of.ARTIFACT_STATIC_LIB))) { bad = 1; }
+    if (R.is_ok[of.ArtifactName, str](of.artifact_naming(spv_vt, "freestanding", of.ARTIFACT_SHARED_LIB))) { bad = 1; }
+    val spv_exe: of.ArtifactName = R.unwrap_ok[of.ArtifactName, str](of.artifact_naming(spv_vt, "freestanding", of.ARTIFACT_EXECUTABLE));
+    if (!str_equals(spv_exe.suffix, ".spv")) { bad = 1; }
+    val spv_obj: of.ArtifactName = R.unwrap_ok[of.ArtifactName, str](of.artifact_naming(spv_vt, "freestanding", of.ARTIFACT_OBJECT));
+    if (!str_equals(spv_obj.suffix, ".spv")) { bad = 1; }
+
+    ret bad;
+}
+
+test "mach.lang.target.artifact_naming:compatibility_key_matches_only_the_same_object_format" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+
+    val elf_o: O.Option[*of.OfVTable] = of.lookup(?reg.of, "elf");
+    val coff_o: O.Option[*of.OfVTable] = of.lookup(?reg.of, "coff");
+    if (O.is_none[*of.OfVTable](elf_o) || O.is_none[*of.OfVTable](coff_o)) { ret 1; }
+    val elf_vt: *of.OfVTable = O.unwrap[*of.OfVTable](elf_o);
+    val coff_vt: *of.OfVTable = O.unwrap[*of.OfVTable](coff_o);
+
+    val a: of.ArtifactName = R.unwrap_ok[of.ArtifactName, str](of.artifact_naming(elf_vt, "linux", of.ARTIFACT_OBJECT));
+    val b: of.ArtifactName = R.unwrap_ok[of.ArtifactName, str](of.artifact_naming(elf_vt, "linux", of.ARTIFACT_EXECUTABLE));
+    val c: of.ArtifactName = R.unwrap_ok[of.ArtifactName, str](of.artifact_naming(coff_vt, "windows", of.ARTIFACT_OBJECT));
+
+    if (!str_equals(a.key, b.key)) { ret 1; }
+    if (str_equals(a.key, c.key)) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.select_of:every_capable_tuple_is_selectable_and_the_census_is_stable" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+
+    var capable:    u32 = 0;
+    var selectable: u32 = 0;
+    var oi: u32 = 0;
+    for (oi < os.registered_count(?reg.os)) {
+        val os_vt: *os.OsVTable = O.unwrap[*os.OsVTable](os.registered(?reg.os, oi));
+        var ii: u32 = 0;
+        for (ii < isa.registered_count(?reg.isa)) {
+            val isa_vt: *isa.IsaVTable = O.unwrap[*isa.IsaVTable](isa.registered(?reg.isa, ii));
+            var ai: u32 = 0;
+            for (ai < abi.registered_count(?reg.abi)) {
+                val abi_vt: *abi.AbiVTable = O.unwrap[*abi.AbiVTable](abi.registered(?reg.abi, ai));
+                var fi: u32 = 0;
+                for (fi < of.registered_count(?reg.of)) {
+                    val of_vt: *of.OfVTable = O.unwrap[*of.OfVTable](of.registered(?reg.of, fi));
+                    if (tuple_capability(os_vt, isa_vt, abi_vt, of_vt) == TUPLE_OK) {
+                        capable = capable + 1;
+                        val r: R.Result[resolved.Target, str] = select_of(?reg, isa_vt.name, os_vt.name, abi_vt.name, of_vt.name);
+                        if (R.is_ok[resolved.Target, str](r)) { selectable = selectable + 1; }
+                    }
+                    fi = fi + 1;
+                }
+                ai = ai + 1;
+            }
+            ii = ii + 1;
+        }
+        oi = oi + 1;
+    }
+    if (capable == 0)          { ret 1; }
+    if (selectable != capable) { ret 2; }
+    if (capable != COMPLETE_TUPLE_CENSUS) { print.printf("complete-target census: {} capable tuples, expected {}\n", capable, COMPLETE_TUPLE_CENSUS); ret 3; }
+    ret 0;
+}
+
+test "mach.lang.target.registry:every_isa_declares_its_index_and_vector_axes" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+    var ii: u32 = 0;
+    for (ii < isa.registered_count(?reg.isa)) {
+        val isa_vt: *isa.IsaVTable = O.unwrap[*isa.IsaVTable](isa.registered(?reg.isa, ii));
+        val m: *isa.MachineModel = isa_vt.model;
+        if (m.index_width == 0)                       { ret 2; }
+        if (m.has_v128 && m.vector_op_bytes == 0)     { ret 3; }
+        if (m.auto_vectorize && !m.vectors_in_registers) { ret 4; }
+        ii = ii + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.target.resolve:env_is_member_owned_and_unknown_or_undefined_values_are_refused" {
+    var reg: TargetRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+
+    var gpu: TargetRequest = target_request("spirv", "freestanding", "spirv");
+    with_env(?gpu, "vulkan1.2", "gpu");
+    val ok: R.Result[resolved.Target, str] = resolve(?reg, ?gpu);
+    if (R.is_err[resolved.Target, str](ok)) { ret 2; }
+    val t: resolved.Target = R.unwrap_ok[resolved.Target, str](ok);
+    if (t.env_id != 2 || !str_equals(t.env_name, "vulkan1.2") || t.env_profile != 2) { ret 3; }
+    val view: isa.BackendTarget = resolved.backend_target(?t);
+    if (view.identity.env_id != 2 || !str_equals(view.identity.env_name, "vulkan1.2")) { ret 4; }
+
+    var none: TargetRequest = target_request("spirv", "freestanding", "spirv");
+    val plain: R.Result[resolved.Target, str] = resolve(?reg, ?none);
+    if (R.is_err[resolved.Target, str](plain) || R.unwrap_ok[resolved.Target, str](plain).env_id != isa.ENV_NONE) { ret 5; }
+
+    var bogus: TargetRequest = target_request("spirv", "freestanding", "spirv");
+    with_env(?bogus, "vulkan9.9", "gpu");
+    val rejected: R.Result[resolved.Target, str] = resolve(?reg, ?bogus);
+    if (R.is_ok[resolved.Target, str](rejected)) { ret 6; }
+    val msg: str = R.unwrap_err[resolved.Target, str](rejected);
+    if (!str_contains(msg, "[target.gpu]") || !str_contains(msg, "vulkan9.9") || !str_contains(msg, "vulkan1.0")
+        || !str_contains(msg, "vulkan1.3") || !str_contains(msg, "does not define")) { ret 7; }
+
+    var cpu: TargetRequest = target_request("x86_64", "linux", "sysv64");
+    with_env(?cpu, "vulkan1.2", "host");
+    val undefined: R.Result[resolved.Target, str] = resolve(?reg, ?cpu);
+    if (R.is_ok[resolved.Target, str](undefined)) { ret 8; }
+    val umsg: str = R.unwrap_err[resolved.Target, str](undefined);
+    if (!str_contains(umsg, "[target.host]") || !str_contains(umsg, "defines no environments")) { ret 9; }
     ret 0;
 }

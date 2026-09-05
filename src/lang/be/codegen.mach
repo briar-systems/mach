@@ -1,17 +1,3 @@
-# drive an optimised SSA IR module through the shared backend pipeline into an object image
-#
-# Drives an optimised SSA `ir.Module` through the shared, target-agnostic
-# backend pipeline and packs the result into a format-agnostic
-# `of.ObjectImage`. The pipeline lowers the IR into a target-aware MIR, selects
-# concrete instructions, allocates registers, lays out stack frames, encodes
-# machine bytes, and finally builds the object image from the encoded text plus
-# the module's globals.
-#
-# Only instruction selection and encoding are target-specific, and both reach
-# their per-arch tables through the `target.Target` vtables; every driver stage
-# here is shared across architectures. This module is the compute body of
-# `Q_CODEGEN`: one `ir.Module` produces exactly one `of.ObjectImage`.
-
 use std.io.writer;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -19,12 +5,15 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.memory;
+use std.allocator.page;
+use std.system.os;
 
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
 use mach.lang.be.codegen.ctvalidate;
+use mach.lang.be.codegen.debug_input;
 use mach.lang.be.codegen.dwarf;
 use mach.lang.be.codegen.encode;
 use mach.lang.be.codegen.frame;
@@ -37,7 +26,9 @@ use mach.lang.be.codegen.regalloc;
 use mach.lang.be.codegen.unit;
 use mach.lang.be.obj;
 use mach.lang.float;
+use mach.lang.fe.sema.generics;
 use mach.lang.intern;
+use mach.lang.layout;
 use mach.lang.me.ir;
 use mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
@@ -46,52 +37,36 @@ use mach.lang.source;
 use mach.lang.target;
 use mach.lang.target.isa;
 use mach.lang.target.of;
+use reloc: mach.lang.target.of.reloc;
+use mach.lang.target.resolved;
+use semtype: mach.lang.type;
 
-# a function moved out of `.text` by a `#[section("...")]` decorator
-#
-# The function's [text_start, text_end) byte range in the encoder blob is copied
-# into the named section `sec` and excised from `.text`. A mark or relocation at
-# offset O within the range is re-homed to (sec, O - text_start); every
-# `.text`-resident site below the range shifts down by the range's length.
-# ---
-# text_start: first byte of the function's range in the encoder blob
-# text_end:   one past the function's last byte in the encoder blob
-# sec:        index of the named section the range was copied into
 rec SectionPlacement {
     text_start: u32;
     text_end:   u32;
+    name:       intern.StrId;
     sec:        u32;
 }
 
-# the section index and in-section offset a text site is re-homed to
-# ---
-# sec: index of the section the site lands in
-# off: byte offset of the site within that section
 rec PlacedSite {
     sec: u32;
     off: u32;
 }
 
-# the build's settled debug-info decision plus the DWARF compilation-unit
-# metadata, handed to codegen by its driver
-#
-# `emit` gates the debug producer; when off, `producer` and `comp_dir` are
-# STR_NIL and non-debug output is unchanged. `producer` is the interned
-# DW_AT_producer string ("<name> <version>"); `comp_dir` the interned
-# DW_AT_comp_dir (the project root).
-# ---
-# emit:     produce the DWARF debug sections
-# producer: interned DW_AT_producer string; STR_NIL when emit is off
-# comp_dir: interned DW_AT_comp_dir; STR_NIL when emit is off
+rec TextLayout {
+    placements:     *SectionPlacement;
+    placement_count: u32;
+    placement_cap:   u32;
+    text_len:        u32;
+    text_sec:        u32;
+}
+
 pub rec DebugInfo {
     emit:     bool;
     producer: intern.StrId;
     comp_dir: intern.StrId;
 }
 
-# a DebugInfo carrying no debug intent, for callers that never emit debug info
-# ---
-# ret: the empty (off) DebugInfo
 pub fun no_debug() DebugInfo {
     var d: DebugInfo;
     d.emit     = false;
@@ -100,69 +75,11 @@ pub fun no_debug() DebugInfo {
     ret d;
 }
 
-# generate an object image for one optimised IR module
-#
-# Runs the shared backend pipeline end to end:
-#   1. lower    - `lower.lower_ir` translates each IR function into MIR with
-#                 virtual registers and abstract ABI markers.
-#   2. isel     - `isel.run` selects concrete target instructions for every MIR
-#                 opcode through the active ISA's selection table.
-#   3. regalloc - `regalloc.run` resolves virtual registers to physical ones (or
-#                 spill slots) per the ISA register classes and ABI.
-#   4. frame    - `frame.run` lays out the stack frame and records the spill-slot
-#                 offsets the encoder consumes for `[rbp + disp]` operands.
-#   5. encode   - `encode.run` walks the resolved MIR and emits the `.text`
-#                 bytes, function/label symbol marks, and a pending-relocation
-#                 list, optionally rendering the `.s` artifact as it goes.
-#   6. pack     - the encoded text, its symbols and relocations, and the
-#                 module's globals are assembled into an `of.ObjectImage` via the
-#                 `be.obj` builder.
-#
-# Stages 2-4 mutate the MIR in place (each `run` returns a status, not a fresh
-# module); the encoder reads it without mutating it. The returned image owns its
-# section / symbol / relocation arrays and is freed with `obj.dnit`.
-#
-# `asm_out`, when non-nil, receives the `--emit-asm` debug artifact. It is not a
-# separate pass over the MIR: it is handed to `encode.run`, which renders each
-# machine instruction as the encoder emits it, so the `.s` describes the same
-# instruction stream that becomes the `.o` and cannot drift from it. A nil writer
-# encodes normally; an ISA with no printer fails loudly naming itself, rather than
-# leaving behind an empty file (#2187).
-# ---
-# s:       shared session; supplies the allocator and interner
-# tgt:     resolved compilation target
-# irmod:   optimised SSA IR module to generate code for
-# deps:    the IR modules this one may draw CODE from - the modules that define a
-#          function it calls across a module boundary, transitively. Read only by
-#          the whole-module fork: a self-contained module has no link step to
-#          resolve a cross-module call later, so the callee's body has to be
-#          emitted into the same output and its IR has to be reachable from here.
-#          A register machine ignores it and may be handed the empty set; it has a
-#          linker, and lowering a module it will not emit would be pure waste
-# asm_out: optional writer for the per-module assembly text (nil = none)
-# dbg:     the build's settled debug-info decision plus the DWARF CU metadata
-# ret:     the populated object image, or an error string from any pipeline stage
-# the concrete signature the erased `isa.ModuleEmitter.emit_module` pointer is cast
-# back to: the whole-module SPIR-V back half. consumes the lowered EMISSION UNIT
-# and writes the finished module bytes through the out-params, bypassing isel /
-# regalloc / frame / encode. the allocator and interner ride the unit's root MIR
-# module, so the emitter (composed under `mach.lang.target`) needs no session.
-#
-# The unit rather than one module pair is the whole point of the contract: a
-# whole-module emitter has no linker behind it, so every body its output calls has
-# to be present in its input (#2823). A second whole-module target takes the same
-# unit, and a per-module fact a future one needs is a field on `unit.UnitModule`
-# rather than another parameter here.
-# ---
-# arg 0: the resolved target
-# arg 1: the emission unit (its root is the module being compiled)
-# arg 2: receives the owned little-endian module image
-# arg 3: receives the image byte length
-# ret:   true on success, or a precise error string
-pub def EmitModuleFn: fun(*target.Target, *unit.Unit, **u8, *u32) R.Result[bool, str];
+pub def EmitModuleFn: isa.EmitModuleFn;
 
 pub fun codegen_module(s: *session.Session, tgt: *target.Target,
-                       irmod: *ir.Module, deps: unit.IrSet, asm_out: *writer.Writer, dbg: DebugInfo) R.Result[of.ObjectImage, str] {
+                       irmod: *ir.Module, deps: unit.IrSet, asm_out: *writer.Writer,
+                       placement_policy: u32, dbg: DebugInfo) R.Result[of.ObjectImage, str] {
     if (s == nil)     { ret R.err[of.ObjectImage, str]("codegen: nil session"); }
     if (tgt == nil)   { ret R.err[of.ObjectImage, str]("codegen: nil target"); }
     if (irmod == nil) { ret R.err[of.ObjectImage, str]("codegen: nil ir module"); }
@@ -173,99 +90,71 @@ pub fun codegen_module(s: *session.Session, tgt: *target.Target,
     }
     var mir_module: mir.MirModule = R.unwrap_ok[mir.MirModule, str](res_lower);
 
-    # spine fork: a target whose isa carries the whole-module family payload (spir-v)
-    # bypasses the machine back half entirely - no isel / regalloc / frame / encode.
-    # this is also the point past which `tgt.arch` (the register-machine contract) is
-    # guaranteed non-nil: every stage below reads it, and only a register machine
-    # reaches them.
     if (isa.emits_whole_module(tgt.isa)) {
-        ret whole_module_image(s, tgt, irmod, ?mir_module, deps);
+        val res_whole: R.Result[of.ObjectImage, str] = whole_module_image(s, tgt, irmod, ?mir_module, deps);
+        mir.dnit_module(?mir_module);
+        ret res_whole;
     }
 
-    # loop rotation runs on the freshly-lowered MIR, before legalization and
-    # instruction selection: it rewrites only the CFG (a preheader guard duplicating
-    # the loop test), so the reverse-postorder layout in regalloc lays the rotated
-    # loop out with one taken branch per iteration (#1937).
-    val res_looprotate: R.Result[bool, str] = looprotate.run(tgt, ?mir_module);
-    if (R.is_err[bool, str](res_looprotate)) {
-        ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_looprotate));
+    val res_looprotate: R.Result[R.Void, str] = looprotate.run(tgt, ?mir_module);
+    if (R.is_err[R.Void, str](res_looprotate)) {
+        mir.dnit_module(?mir_module);
+        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_looprotate));
     }
 
-    # the constant-time translation validator (#1648): re-derive the secret taint from the
-    # #1646 seeds over the LOWERED, TARGET-INDEPENDENT MIR - after loop rotation (so a rotated
-    # loop's cloned vregs, which carry their seed, are seen) and before width legalization (a
-    # narrow-ALU target splits a wide secret value into fresh lane vregs that do NOT carry the
-    # seed, so the intact seeds live only here) - and reject a secret reaching a branch, an
-    # address, or a forbidden variable-latency op in any #[oblivious] function. This is the
-    # same layer the compile-time gate in `mir.lower` reads, so the two enforcement points
-    # never drift; legalization is a constant-time-preserving width splitter, and isel /
-    # regalloc / encode are trusted timing-preserving. Pure analysis: a module with no
-    # oblivious function is untouched.
-    val res_ctvalidate: R.Result[bool, str] = ctvalidate.run(tgt, ?mir_module);
-    if (R.is_err[bool, str](res_ctvalidate)) {
-        ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_ctvalidate));
+    val res_ctvalidate: R.Result[R.Void, str] = ctvalidate.run(tgt, ?mir_module);
+    if (R.is_err[R.Void, str](res_ctvalidate)) {
+        mir.dnit_module(?mir_module);
+        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_ctvalidate));
     }
 
-    val res_legalize: R.Result[bool, str] = legalize.run(tgt, ?mir_module);
-    if (R.is_err[bool, str](res_legalize)) {
-        ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_legalize));
+    val res_legalize: R.Result[R.Void, str] = legalize.run(tgt, ?mir_module);
+    if (R.is_err[R.Void, str](res_legalize)) {
+        mir.dnit_module(?mir_module);
+        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_legalize));
     }
 
-    val res_isel: R.Result[bool, str] = isel.run(tgt, ?mir_module);
-    if (R.is_err[bool, str](res_isel)) {
-        ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_isel));
+    val res_isel: R.Result[R.Void, str] = isel.run(tgt, ?mir_module);
+    if (R.is_err[R.Void, str](res_isel)) {
+        mir.dnit_module(?mir_module);
+        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_isel));
     }
 
-    val res_regalloc: R.Result[bool, str] = regalloc.run(tgt, ?mir_module);
-    if (R.is_err[bool, str](res_regalloc)) {
-        ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_regalloc));
+    val res_regalloc: R.Result[R.Void, str] = regalloc.run(tgt, ?mir_module);
+    if (R.is_err[R.Void, str](res_regalloc)) {
+        mir.dnit_module(?mir_module);
+        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_regalloc));
     }
 
-    val res_frame: R.Result[bool, str] = frame.run(tgt, ?mir_module);
-    if (R.is_err[bool, str](res_frame)) {
-        ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_frame));
+    val res_order: R.Result[R.Void, str] = compute_emission_order_module(?mir_module, tgt, resolve_placement_policy(placement_policy));
+    if (R.is_err[R.Void, str](res_order)) {
+        mir.dnit_module(?mir_module);
+        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_order));
+    }
+
+    val res_frame: R.Result[R.Void, str] = frame.run(tgt, ?mir_module);
+    if (R.is_err[R.Void, str](res_frame)) {
+        mir.dnit_module(?mir_module);
+        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_frame));
     }
 
     val res_encode: R.Result[encode.EncoderOutput, str] = encode.run(tgt, ?mir_module, asm_out);
     if (R.is_err[encode.EncoderOutput, str](res_encode)) {
+        mir.dnit_module(?mir_module);
         ret R.err[of.ObjectImage, str](R.unwrap_err[encode.EncoderOutput, str](res_encode));
     }
     val enc: encode.EncoderOutput = R.unwrap_ok[encode.EncoderOutput, str](res_encode);
 
-    ret pack_image(s, tgt, irmod, ?mir_module, ?enc, dbg);
+    val res_pack: R.Result[of.ObjectImage, str] = pack_image(s, tgt, irmod, ?mir_module, ?enc, dbg);
+    mir.dnit_module(?mir_module);
+    ret res_pack;
 }
 
-
-# assemble the emission unit and run the whole-module back half over it
-#
-# The whole-module fork's own spine. It does the one thing the register-machine
-# spine never has to: it lowers the modules the root DRAWS CODE FROM as well as
-# the root itself, because the emitter has no linker behind it and every body its
-# output calls must be in its input. The driver decided which modules those are
-# (`deps`); lowering them is codegen's, so a caller that owns the module graph
-# never has to own the pipeline.
-#
-# The root is placed at the head of the unit and the dependencies follow in the
-# order the driver assembled them, which fixes the emitter's walk order and so the
-# emitted module's ids for a given input.
-#
-# The constant-time validator runs over EVERY member, not only the root (#2159):
-# the emitter is not mach's machine pipeline, so an `#[oblivious]` contract cannot
-# be validated or upheld past it, and a body pulled in from another module is
-# emitted into this output on exactly the same terms as one written here.
-# Secret-free code and non-oblivious functions are untouched.
-# ---
-# s:      the shared session
-# tgt:    the resolved target (carries the emit_module hook)
-# irmod:  the root IR module (names the image)
-# mirmod: the root's post-lower MIR module
-# deps:   the IR modules the root may draw called bodies from
-# ret:    the populated object image, or an error string
 fun whole_module_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
                        mirmod: *mir.MirModule, deps: unit.IrSet) R.Result[of.ObjectImage, str] {
     var u: unit.Unit;
-    val ru: R.Result[bool, str] = unit.init(s.alloc, deps.len + 1, ?u);
-    if (R.is_err[bool, str](ru)) { ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](ru)); }
+    val ru: R.Result[R.Void, str] = unit.init(s.alloc, deps.len + 1, ?u);
+    if (R.is_err[R.Void, str](ru)) { ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](ru)); }
     u.root = 0;
     u.mods[0].ir  = irmod;
     u.mods[0].mir = mirmod;
@@ -294,10 +183,10 @@ fun whole_module_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Modu
 
     i = 0;
     for (i < u.len) {
-        val res_ct: R.Result[bool, str] = ctvalidate.run(tgt, u.mods[i].mir);
-        if (R.is_err[bool, str](res_ct)) {
+        val res_ct: R.Result[R.Void, str] = ctvalidate.run(tgt, u.mods[i].mir);
+        if (R.is_err[R.Void, str](res_ct)) {
             unit_release(s, ?u, deps.len);
-            ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_ct));
+            ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_ct));
         }
         i = i + 1;
     }
@@ -307,15 +196,219 @@ fun whole_module_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Modu
     ret img;
 }
 
-# release the `n` dependency MIR modules a unit owns, and the unit's table
-#
-# The root's MIR is the caller's and is left alone; every other member was lowered
-# and boxed here, so it is freed here. Called on the error paths with the count
-# lowered so far, and once on the way out.
-# ---
-# s: the shared session (its allocator owns the boxes)
-# u: the unit
-# n: how many dependency members were populated
+val EMIT_ORDER_NIL: u32 = 0xFFFFFFFF;
+
+pub val PLACEMENT_POLICY_VERSION: u32 = 1;
+
+pub fun resolve_placement_policy(requested: u32) u32 {
+    if (requested == 0) { ret PLACEMENT_POLICY_VERSION; }
+    ret requested;
+}
+
+fun compute_emission_order_module(m: *mir.MirModule, tgt: *target.Target, policy: u32) R.Result[R.Void, str] {
+    if (policy != PLACEMENT_POLICY_VERSION) { ret R.err[R.Void, str]("codegen: unknown placement policy version"); }
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        val f: *mir.MirFunction = ?m.functions[fi];
+        if (f.block_count > 0) {
+            val co: R.Result[R.Void, str] = compute_emission_order(m.alloc, f);
+            if (R.is_err[R.Void, str](co)) { ret co; }
+            val pp: R.Result[R.Void, str] = apply_placement_policy(m.alloc, f, tgt);
+            if (R.is_err[R.Void, str](pp)) { ret pp; }
+        }
+        fi = fi + 1;
+    }
+    ret R.ok_void[str]();
+}
+
+fun block_is_trap_terminated(f: *mir.MirFunction, block_idx: u32, tgt: *target.Target) bool {
+    val blk: *mir.MirBlock = ?f.blocks[block_idx];
+    if (blk.instr_count == 0) { ret false; }
+    val term: *mir.MirInstr = ?blk.instrs[blk.instr_count - 1];
+    if (tgt == nil || tgt.arch == nil || tgt.arch.is_trap_terminator == nil) { ret false; }
+    ret tgt.arch.is_trap_terminator(term.opcode::u32);
+}
+
+fun apply_placement_policy(alloc: *A.Allocator, f: *mir.MirFunction, tgt: *target.Target) R.Result[R.Void, str] {
+    val n: u32 = f.block_count;
+    if (n <= 1) { ret R.ok_void[str](); }
+
+    val rh: R.Result[*u32, str] = A.allocate[u32](alloc, n::usize);
+    if (R.is_err[*u32, str](rh)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](rh)); }
+    val hot: *u32 = R.unwrap_ok[*u32, str](rh);
+
+    val rc: R.Result[*u32, str] = A.allocate[u32](alloc, n::usize);
+    if (R.is_err[*u32, str](rc)) {
+        A.deallocate[u32](alloc, hot, n::usize);
+        ret R.err[R.Void, str](R.unwrap_err[*u32, str](rc));
+    }
+    val cold: *u32 = R.unwrap_ok[*u32, str](rc);
+
+    var hot_n:  u32 = 0;
+    var cold_n: u32 = 0;
+    var i: u32 = 0;
+    for (i < n) {
+        val bi: u32 = f.emit_order[i];
+        if (i > 0 && block_is_trap_terminated(f, bi, tgt)) {
+            cold[cold_n] = bi;
+            cold_n = cold_n + 1;
+        }
+        or {
+            hot[hot_n] = bi;
+            hot_n = hot_n + 1;
+        }
+        i = i + 1;
+    }
+
+    var w: u32 = 0;
+    var j: u32 = 0;
+    for (j < hot_n)  { f.emit_order[w] = hot[j];  w = w + 1; j = j + 1; }
+    j = 0;
+    for (j < cold_n) { f.emit_order[w] = cold[j]; w = w + 1; j = j + 1; }
+
+    A.deallocate[u32](alloc, hot, n::usize);
+    A.deallocate[u32](alloc, cold, n::usize);
+    ret R.ok_void[str]();
+}
+
+fun compute_emission_order(alloc: *A.Allocator, f: *mir.MirFunction) R.Result[R.Void, str] {
+    val n: u32 = f.block_count;
+
+    var max_id: u32 = 0;
+    var mi: u32 = 0;
+    for (mi < n) {
+        if (f.blocks[mi].id > max_id) { max_id = f.blocks[mi].id; }
+        mi = mi + 1;
+    }
+    val idx_cap: u32 = max_id + 1;
+    val ri: R.Result[*u32, str] = A.allocate[u32](alloc, idx_cap::usize);
+    if (R.is_err[*u32, str](ri)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](ri)); }
+    val idx: *u32 = R.unwrap_ok[*u32, str](ri);
+    var j: u32 = 0;
+    for (j < idx_cap) { idx[j] = EMIT_ORDER_NIL; j = j + 1; }
+    var k: u32 = 0;
+    for (k < n) { idx[f.blocks[k].id] = k; k = k + 1; }
+
+    val rv: R.Result[*bool, str] = A.allocate[bool](alloc, n::usize);
+    if (R.is_err[*bool, str](rv)) {
+        A.deallocate[u32](alloc, idx, idx_cap::usize);
+        ret R.err[R.Void, str](R.unwrap_err[*bool, str](rv));
+    }
+    val visited: *bool = R.unwrap_ok[*bool, str](rv);
+    var i: u32 = 0;
+    for (i < n) { visited[i] = false; i = i + 1; }
+
+    val rs: R.Result[*u32, str] = A.allocate[u32](alloc, n::usize);
+    if (R.is_err[*u32, str](rs)) {
+        A.deallocate[u32](alloc, idx, idx_cap::usize);
+        A.deallocate[bool](alloc, visited, n::usize);
+        ret R.err[R.Void, str](R.unwrap_err[*u32, str](rs));
+    }
+    val stack: *u32 = R.unwrap_ok[*u32, str](rs);
+
+    val re: R.Result[*u32, str] = A.allocate[u32](alloc, n::usize);
+    if (R.is_err[*u32, str](re)) {
+        A.deallocate[u32](alloc, idx, idx_cap::usize);
+        A.deallocate[bool](alloc, visited, n::usize);
+        A.deallocate[u32](alloc, stack, n::usize);
+        ret R.err[R.Void, str](R.unwrap_err[*u32, str](re));
+    }
+    val succ_ix: *u32 = R.unwrap_ok[*u32, str](re);
+
+    val rp: R.Result[*u32, str] = A.allocate[u32](alloc, n::usize);
+    if (R.is_err[*u32, str](rp)) {
+        A.deallocate[u32](alloc, idx, idx_cap::usize);
+        A.deallocate[bool](alloc, visited, n::usize);
+        A.deallocate[u32](alloc, stack, n::usize);
+        A.deallocate[u32](alloc, succ_ix, n::usize);
+        ret R.err[R.Void, str](R.unwrap_err[*u32, str](rp));
+    }
+    val post: *u32 = R.unwrap_ok[*u32, str](rp);
+    var post_count: u32 = 0;
+
+    val ro: R.Result[*u32, str] = A.allocate[u32](alloc, n::usize);
+    if (R.is_err[*u32, str](ro)) {
+        A.deallocate[u32](alloc, idx, idx_cap::usize);
+        A.deallocate[bool](alloc, visited, n::usize);
+        A.deallocate[u32](alloc, stack, n::usize);
+        A.deallocate[u32](alloc, succ_ix, n::usize);
+        A.deallocate[u32](alloc, post, n::usize);
+        ret R.err[R.Void, str](R.unwrap_err[*u32, str](ro));
+    }
+    val order: *u32 = R.unwrap_ok[*u32, str](ro);
+
+    var sp: u32 = 0;
+    stack[0]    = 0;
+    succ_ix[0]  = 0;
+    visited[0]  = true;
+    sp = sp + 1;
+
+    for (sp > 0) {
+        val top: u32 = sp - 1;
+        val b: u32 = stack[top];
+        val next: u32 = emission_next_unvisited_succ(f, b, ?succ_ix[top], visited, idx, idx_cap);
+        if (next == EMIT_ORDER_NIL) {
+            post[post_count] = b;
+            post_count = post_count + 1;
+            sp = sp - 1;
+        } or {
+            visited[next]  = true;
+            stack[sp]      = next;
+            succ_ix[sp]    = 0;
+            sp = sp + 1;
+        }
+    }
+
+    var oi: u32 = 0;
+    var pk: u32 = post_count;
+    for (pk > 0) {
+        pk = pk - 1;
+        order[oi] = post[pk];
+        oi = oi + 1;
+    }
+    var bi: u32 = 0;
+    for (bi < n) {
+        if (!visited[bi]) {
+            order[oi] = bi;
+            oi = oi + 1;
+        }
+        bi = bi + 1;
+    }
+
+    A.deallocate[u32](alloc, idx, idx_cap::usize);
+    A.deallocate[bool](alloc, visited, n::usize);
+    A.deallocate[u32](alloc, stack, n::usize);
+    A.deallocate[u32](alloc, succ_ix, n::usize);
+    A.deallocate[u32](alloc, post, n::usize);
+
+    f.emit_order = order;
+    ret R.ok_void[str]();
+}
+
+fun emission_next_unvisited_succ(f: *mir.MirFunction, b: u32, six: *u32, visited: *bool,
+                                 idx: *u32, idx_cap: u32) u32 {
+    val blk: *mir.MirBlock = ?f.blocks[b];
+    if (blk.instr_count == 0) { ret EMIT_ORDER_NIL; }
+
+    val term: *mir.MirInstr = ?blk.instrs[blk.instr_count - 1];
+    for (@six < term.operand_count) {
+        val op: *mir.MirOperand = ?term.operands[@six];
+        @six = @six + 1;
+        if (op.kind == mir.MIR_OP_BLOCK) {
+            val tgt_idx: u32 = emission_block_index_of(idx, idx_cap, op.imm::u32);
+            if (tgt_idx != EMIT_ORDER_NIL && !visited[tgt_idx]) {
+                ret tgt_idx;
+            }
+        }
+    }
+    ret EMIT_ORDER_NIL;
+}
+
+fun emission_block_index_of(idx: *u32, idx_cap: u32, bid: u32) u32 {
+    if (bid >= idx_cap) { ret EMIT_ORDER_NIL; }
+    ret idx[bid];
+}
+
 fun unit_release(s: *session.Session, u: *unit.Unit, n: u32) {
     var i: u32 = 0;
     for (i < n) {
@@ -330,25 +423,21 @@ fun unit_release(s: *session.Session, u: *unit.Unit, n: u32) {
     unit.dnit(s.alloc, u);
 }
 
-# wrap a whole-module emitter's output as a single-section object image
-#
-# The SPIR-V spine produces the finished module bytes rather than encoded machine
-# text; this dispatches the erased emitter and packs the bytes into a one-section
-# (".spirv") object image the of.spv writer emits verbatim. No symbols or
-# relocations - a SPIR-V module is self-contained. The bytes are session-allocated
-# and adopted by the image (obj.dnit frees them).
-# ---
-# s:      the shared session
-# tgt:    the resolved target (carries the emit_module hook)
-# irmod:  the root IR module (names the image)
-# u:      the lowered emission unit the emitter consumes
-# ret:    the populated object image, or an error string
+fun finish_codegen_image(image: of.ObjectImage) R.Result[of.ObjectImage, str] {
+    val valid: R.Result[R.Void, str] = of.validate_owned_object_or_dnit(?image);
+    if (R.is_err[R.Void, str](valid)) {
+        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](valid));
+    }
+    ret R.ok[of.ObjectImage, str](image);
+}
+
 fun emit_spirv_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
                      u: *unit.Unit) R.Result[of.ObjectImage, str] {
     var bytes: *u8 = nil;
     var len:   u32 = 0;
-    val r: R.Result[bool, str] = tgt.isa.emitter.emit_module::EmitModuleFn(tgt, u, ?bytes, ?len);
-    if (R.is_err[bool, str](r)) { ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](r)); }
+    var backend_target: isa.BackendTarget = resolved.backend_target(tgt);
+    val r: R.Result[R.Void, str] = tgt.isa.emitter.emit_module(s.alloc, ?backend_target, u, ?bytes, ?len);
+    if (R.is_err[R.Void, str](r)) { ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](r)); }
 
     val res_image: R.Result[of.ObjectImage, str] = obj.init(s.alloc, ?s.interner, irmod.name);
     if (R.is_err[of.ObjectImage, str](res_image)) { ret res_image; }
@@ -356,6 +445,7 @@ fun emit_spirv_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module
 
     val res_name: R.Result[intern.StrId, str] = intern.intern(?s.interner, ".spirv");
     if (R.is_err[intern.StrId, str](res_name)) {
+        if (bytes != nil && len > 0) { A.deallocate[u8](s.alloc, bytes, len::usize); }
         obj.dnit(?image);
         ret R.err[of.ObjectImage, str](R.unwrap_err[intern.StrId, str](res_name));
     }
@@ -365,190 +455,256 @@ fun emit_spirv_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module
     sec.bytes = bytes;
     sec.len   = len;
     sec.align = 4;
-    val res_sec: R.Result[u32, str] = obj.add_section(?image, sec);
+    sec.flags = 0;
+    val res_sec: R.Result[u32, str] = obj.install_section(?image, ?sec);
     if (R.is_err[u32, str](res_sec)) {
         obj.dnit(?image);
         ret R.err[of.ObjectImage, str](R.unwrap_err[u32, str](res_sec));
     }
-    ret R.ok[of.ObjectImage, str](image);
+    ret finish_codegen_image(image);
 }
 
-# build the object image from the encoder output and the module's globals
-#
-# Moves each `#[section("...")]` function into its named section, builds `.text`
-# from the remaining non-sectioned bytes, registers every symbol mark against
-# its section, attaches the encoder's relocations, then materialises each module
-# global into a data / rodata / bss section with its defining symbol. On any
-# builder failure the partially built image is torn down before returning.
-# ---
-# s:     shared session; supplies the allocator and interner
-# tgt:   resolved target; supplies type sizes for bss global layout
-# irmod: IR module whose globals are packed alongside the encoded text
-# enc:   encoder output for the module's `.text`
-# dbg:   the build's settled debug-info decision plus the DWARF CU metadata
-# ret:   the populated object image, or an error string
+pub fun prepare_debug_types(s: *session.Session) R.Result[R.Void, str] {
+    if (s == nil) {
+        ret R.err[R.Void, str]("codegen: cannot prepare debug types without a session");
+    }
+    var tid: u32 = 0;
+    for (tid < semtype.type_count(?s.types)) {
+        val type_id: semtype.TypeId = tid::semtype.TypeId;
+        val ot: O.Option[*semtype.Type] = semtype.get(?s.types, type_id);
+        if (O.is_some[*semtype.Type](ot)
+            && O.unwrap[*semtype.Type](ot).kind == semtype.TYPE_INSTANCE) {
+            generics.ensure_fields(s, type_id);
+            val oft: O.Option[*semtype.FieldTable] = semtype.field_table_for(?s.types, type_id);
+            if (O.is_none[*semtype.FieldTable](oft)
+                || O.unwrap[*semtype.FieldTable](oft).epoch != semtype.field_epoch(?s.types)) {
+                ret R.err[R.Void, str]("codegen: failed to finalize generic type fields for debug production");
+            }
+        }
+        tid = tid + 1;
+    }
+    ret R.ok_void[str]();
+}
+
+fun debug_types_ready(s: *session.Session) bool {
+    if (s == nil) { ret false; }
+    var tid: u32 = 0;
+    for (tid < semtype.type_count(?s.types)) {
+        val type_id: semtype.TypeId = tid::semtype.TypeId;
+        val ot: O.Option[*semtype.Type] = semtype.get(?s.types, type_id);
+        if (O.is_some[*semtype.Type](ot)
+            && O.unwrap[*semtype.Type](ot).kind == semtype.TYPE_INSTANCE) {
+            val oft: O.Option[*semtype.FieldTable] = semtype.field_table_for(?s.types, type_id);
+            if (O.is_none[*semtype.FieldTable](oft)
+                || O.unwrap[*semtype.FieldTable](oft).epoch != semtype.field_epoch(?s.types)) { ret false; }
+        }
+        tid = tid + 1;
+    }
+    ret true;
+}
+
+fun encoder_output_dnit(s: *session.Session, enc: *encode.EncoderOutput) {
+    if (enc.text != nil && enc.text_len > 0) {
+        A.deallocate[u8](s.alloc, enc.text, enc.text_len::usize);
+    }
+    enc.text     = nil;
+    enc.text_len = 0;
+    encode.consts_free(s.alloc, enc.consts, enc.const_count, enc.const_count);
+    enc.consts      = nil;
+    enc.const_count = 0;
+    if (enc.symbols != nil && enc.symbol_count > 0) {
+        A.deallocate[encode.SymbolMark](s.alloc, enc.symbols, enc.symbol_count::usize);
+    }
+    enc.symbols      = nil;
+    enc.symbol_count = 0;
+    if (enc.relocations != nil && enc.reloc_count > 0) {
+        A.deallocate[encode.PendingReloc](s.alloc, enc.relocations, enc.reloc_count::usize);
+    }
+    enc.relocations = nil;
+    enc.reloc_count = 0;
+    if (enc.rows != nil && enc.row_count > 0) {
+        A.deallocate[encode.LineRow](s.alloc, enc.rows, enc.row_count::usize);
+    }
+    enc.rows      = nil;
+    enc.row_count = 0;
+    if (enc.varlocs != nil && enc.varloc_count > 0) {
+        A.deallocate[encode.VarLoc](s.alloc, enc.varlocs, enc.varloc_count::usize);
+    }
+    enc.varlocs      = nil;
+    enc.varloc_count = 0;
+    if (enc.inline_pcs != nil && enc.inline_pc_count > 0) {
+        A.deallocate[encode.InlinePc](s.alloc, enc.inline_pcs, enc.inline_pc_count::usize);
+    }
+    enc.inline_pcs      = nil;
+    enc.inline_pc_count = 0;
+    if (enc.frames != nil && enc.frame_count > 0) {
+        A.deallocate[of.FrameUnwind](s.alloc, enc.frames, enc.frame_count::usize);
+    }
+    enc.frames      = nil;
+    enc.frame_count = 0;
+}
+
 fun pack_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
                mirmod: *mir.MirModule, enc: *encode.EncoderOutput, dbg: DebugInfo) R.Result[of.ObjectImage, str] {
+    val res_output: R.Result[R.Void, str] = validate_encoder_output(enc);
+    if (R.is_err[R.Void, str](res_output)) {
+        encoder_output_dnit(s, enc);
+        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_output));
+    }
+
+    val res_layout: R.Result[TextLayout, str] = build_text_layout(s, irmod, enc);
+    if (R.is_err[TextLayout, str](res_layout)) {
+        encoder_output_dnit(s, enc);
+        ret R.err[of.ObjectImage, str](R.unwrap_err[TextLayout, str](res_layout));
+    }
+    var text_layout: TextLayout = R.unwrap_ok[TextLayout, str](res_layout);
+
     val res_image: R.Result[of.ObjectImage, str] = obj.init(s.alloc, ?s.interner, irmod.name);
     if (R.is_err[of.ObjectImage, str](res_image)) {
+        text_layout_dnit(s, ?text_layout);
+        encoder_output_dnit(s, enc);
         ret R.err[of.ObjectImage, str](R.unwrap_err[of.ObjectImage, str](res_image));
     }
     var image: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](res_image);
 
-    # the arch's machine-flags word, derived from the RESOLVED ABI rather than from a
-    # constant in a writer. `float_arg_bits` is the convention's own float-argument
-    # width, so an object's header states the calling convention its code was
-    # actually generated for and cannot drift from it. `false` for compressed: no
-    # register-machine encoder here emits a compressed instruction, so an object mach
-    # writes honestly claims none, and a LINKED image gets the bit from its inputs
-    # instead (#2813).
     image.machine_flags = isa.machine_flags(tgt.isa, tgt.abi.float_arg_bits, false);
 
-    # and the build-attribute body, from the same two facts and for the same reason:
-    # what this object CLAIMS about its instruction set has to be what it holds. the
-    # `false` is the compressed question again - this encoder emits none, and a linked
-    # image merges the claims of whatever was linked into it instead (#2828)
     var attr_len: u32 = 0;
     val attr_r: R.Result[*u8, str] = isa.build_attributes(tgt.isa, s.alloc,
                                                          tgt.abi.float_arg_bits, false, ?attr_len);
     if (R.is_err[*u8, str](attr_r)) {
+        text_layout_dnit(s, ?text_layout);
+        encoder_output_dnit(s, enc);
+        obj.dnit(?image);
         ret R.err[of.ObjectImage, str](R.unwrap_err[*u8, str](attr_r));
     }
     image.attributes = R.unwrap_ok[*u8, str](attr_r);
     image.attributes_len = attr_len;
 
-    # `#[section("...")]` decorators move individual functions out of the shared
-    # `.text` into named sections. build one placement per sectioned function
-    # (creating its section and copying the sectioned bytes out of the encoder
-    # blob) first, so pack_text can then assemble `.text` from the remaining
-    # non-sectioned bytes. the list is empty when no function is sectioned, in
-    # which case `.text` adopts the encoder blob whole and symbols / relocations
-    # all land in `.text` exactly as before.
-    var placements:      *SectionPlacement = nil;
-    var placement_count: u32               = 0;
-    val res_placements: R.Result[bool, str] = build_section_placements(s, ?image, irmod, enc, ?placements, ?placement_count);
-    if (R.is_err[bool, str](res_placements)) {
-        # the encoder blob was never adopted into a section; release it (the nil
-        # guard mirrors obj.dnit) before tearing the partial image down.
-        if (enc.text != nil) { A.deallocate[u8](s.alloc, enc.text, enc.text_len::usize); }
+    val res_sections: R.Result[R.Void, str] = apply_text_layout(s, ?image, enc, ?text_layout);
+    if (R.is_err[R.Void, str](res_sections)) {
+        text_layout_dnit(s, ?text_layout);
+        encoder_output_dnit(s, enc);
         obj.dnit(?image);
-        ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_placements));
+        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_sections));
     }
 
-    val res_text: R.Result[u32, str] = pack_text(s, ?image, enc, placements, placement_count);
+    val res_text: R.Result[u32, str] = pack_text(s, ?image, enc, ?text_layout);
     if (R.is_err[u32, str](res_text)) {
-        if (placements != nil) { A.deallocate[SectionPlacement](s.alloc, placements, enc.symbol_count::usize); }
+        text_layout_dnit(s, ?text_layout);
+        encoder_output_dnit(s, enc);
         obj.dnit(?image);
         ret R.err[of.ObjectImage, str](R.unwrap_err[u32, str](res_text));
     }
     val text_sec: u32 = R.unwrap_ok[u32, str](res_text);
+    text_layout.text_sec = text_sec;
 
-    val res_symbols: R.Result[bool, str] = pack_symbols(?image, irmod, enc, text_sec, placements, placement_count);
-    if (R.is_err[bool, str](res_symbols)) {
-        if (placements != nil) { A.deallocate[SectionPlacement](s.alloc, placements, enc.symbol_count::usize); }
+    val res_symbols: R.Result[R.Void, str] = pack_symbols(?image, irmod, enc, ?text_layout);
+    if (R.is_err[R.Void, str](res_symbols)) {
+        text_layout_dnit(s, ?text_layout);
+        encoder_output_dnit(s, enc);
         obj.dnit(?image);
-        ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_symbols));
+        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_symbols));
     }
 
-    val res_frames: R.Result[bool, str] = pack_frames(?image, enc, text_sec, placements, placement_count);
-    if (R.is_err[bool, str](res_frames)) {
-        if (placements != nil) { A.deallocate[SectionPlacement](s.alloc, placements, enc.symbol_count::usize); }
+    val res_frames: R.Result[R.Void, str] = pack_frames(?image, enc, ?text_layout);
+    if (R.is_err[R.Void, str](res_frames)) {
+        text_layout_dnit(s, ?text_layout);
+        encoder_output_dnit(s, enc);
         obj.dnit(?image);
-        ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_frames));
+        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_frames));
     }
 
-    # relocations are recorded by target name and bound to symbol indices only
-    # after pack_globals, because a global's aggregate initializer may point at a
-    # global that pass has not packed yet. binding also declares any target no
-    # pass defined, which is what makes it genuinely external.
     var deferred: obj.DeferredRelocs = obj.deferred_init(s.alloc);
 
-    val res_relocs: R.Result[bool, str] = pack_relocs(?deferred, enc, text_sec, placements, placement_count);
-    # re-home the retained PC<->source rows the same way symbols are, while the
-    # placements are still live, so the #1699 line producer reads final section
-    # offsets. infallible (in-place offset math), so no error to thread.
-    pack_rows(enc, placements, placement_count, text_sec);
-    if (placements != nil) { A.deallocate[SectionPlacement](s.alloc, placements, enc.symbol_count::usize); }
-    if (R.is_err[bool, str](res_relocs)) {
+    val res_relocs: R.Result[R.Void, str] = pack_relocs(tgt, ?deferred, enc, ?text_layout);
+    if (R.is_err[R.Void, str](res_relocs)) {
+        text_layout_dnit(s, ?text_layout);
         obj.deferred_dnit(?deferred);
+        encoder_output_dnit(s, enc);
         obj.dnit(?image);
-        ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_relocs));
+        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_relocs));
+    }
+    pack_rows(enc, ?text_layout);
+    text_layout_dnit(s, ?text_layout);
+
+    val res_globals: R.Result[R.Void, str] = pack_globals(s, tgt, ?image, ?deferred, irmod);
+    if (R.is_err[R.Void, str](res_globals)) {
+        obj.deferred_dnit(?deferred);
+        encoder_output_dnit(s, enc);
+        obj.dnit(?image);
+        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_globals));
     }
 
-    val res_globals: R.Result[bool, str] = pack_globals(s, tgt, ?image, ?deferred, irmod);
-    if (R.is_err[bool, str](res_globals)) {
-        obj.deferred_dnit(?deferred);
-        obj.dnit(?image);
-        ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_globals));
-    }
-
-    # the constant pool defines the local symbols the encoder's own relocations
-    # name, so it must be packed before binding - a pool symbol with no definition
-    # would be declared external and the reference would leave the object. the pool
-    # bytes are released either way: they are encoder-owned, and the image took its
-    # own copy.
-    val res_pool: R.Result[bool, str] = pack_constpool(s, ?image, enc);
+    val res_pool: R.Result[R.Void, str] = pack_constpool(s, ?image, enc);
     encode.consts_free(s.alloc, enc.consts, enc.const_count, enc.const_count);
     enc.consts      = nil;
     enc.const_count = 0;
-    if (R.is_err[bool, str](res_pool)) {
+    if (R.is_err[R.Void, str](res_pool)) {
         obj.deferred_dnit(?deferred);
+        encoder_output_dnit(s, enc);
         obj.dnit(?image);
-        ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_pool));
+        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_pool));
     }
 
-    val res_bind: R.Result[bool, str] = obj.flush_deferred(?image, ?deferred);
+    val res_bind: R.Result[R.Void, str] = obj.flush_deferred(?image, ?deferred);
     obj.deferred_dnit(?deferred);
-    if (R.is_err[bool, str](res_bind)) {
+    if (R.is_err[R.Void, str](res_bind)) {
+        encoder_output_dnit(s, enc);
         obj.dnit(?image);
-        ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_bind));
+        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_bind));
     }
 
-    # when `-g` is on and the target resolved a debug-info producer (elf / mach-o ->
-    # DWARF; nil for coff / raw), dispatch through its vtable: the producer writes the
-    # .debug_abbrev/.debug_info/.debug_line/.debug_loclists sections from the encoder's
-    # re-homed PC<->source rows, per-PC variable-location records, and the packed
-    # function symbols. off without `-g` or a nil `debug`, so non-debug output and a
-    # non-DWARF target are unchanged. the erased `produce` is cast back to its
-    # `dwarf.ProduceFn` signature, exactly as the linker casts `apply_reloc`. the
-    # vtable registers with `produce` nil until the be-layer registrar wires it
-    # (`dwarf.register_debug_hooks`), so a wiring failure is rejected loudly here
-    # - like isel.run's nil-select path - rather than dispatched into a segfault.
     if (dbg.emit && tgt.debug != nil) {
         if (tgt.debug.produce == nil) {
+            encoder_output_dnit(s, enc);
             obj.dnit(?image);
             ret R.err[of.ObjectImage, str]("codegen: debug producer registered no produce hook");
         }
-        val res_dwarf: R.Result[bool, str] = tgt.debug.produce::dwarf.ProduceFn(s, tgt, irmod, mirmod, ?image, enc.rows, enc.row_count, enc.varlocs, enc.varloc_count, enc.inline_pcs, enc.inline_pc_count, dbg.producer, dbg.comp_dir, text_sec);
-        if (R.is_err[bool, str](res_dwarf)) {
+        if (!debug_types_ready(s)) {
+            encoder_output_dnit(s, enc);
             obj.dnit(?image);
-            ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_dwarf));
+            ret R.err[of.ObjectImage, str]("codegen: debug type view was not finalized before code generation");
+        }
+        var req: of.DebugProduceRequest;
+        req.program.alloc         = s.alloc;
+        req.program.interner      = ?s.interner;
+        req.program.types         = ?s.types;
+        req.program.sources       = ?s.sources;
+        req.program.type_aligns   = ?s.type_aligns;
+        req.program.type_packed   = ?s.type_packed;
+        req.program.field_epoch   = semtype.field_epoch(?s.types);
+        req.program.ir_module     = irmod;
+        req.program.mir_module    = mirmod;
+        req.program.layout        = layout.machine(tgt.model.pointer_width, tgt.model.vector_bits);
+        req.program.pointer_width = tgt.isa.pointer_width;
+        req.program.dwarf_reg     = tgt.arch.dwarf_reg;
+        req.program.frame_ptr_reg = tgt.arch.frame_ptr_reg;
+        req.program.stack_ptr_reg = tgt.arch.stack_ptr_reg;
+        req.image = ?image;
+        req.rows = enc.rows;
+        req.row_count = enc.row_count;
+        req.varlocs = enc.varlocs;
+        req.varloc_count = enc.varloc_count;
+        req.inline_pcs = enc.inline_pcs;
+        req.inline_pc_count = enc.inline_pc_count;
+        req.producer = dbg.producer;
+        req.comp_dir = dbg.comp_dir;
+        req.text_section = text_sec;
+        val res_dwarf: R.Result[R.Void, str] = tgt.debug.produce(?req);
+        if (R.is_err[R.Void, str](res_dwarf)) {
+            encoder_output_dnit(s, enc);
+            obj.dnit(?image);
+            ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_dwarf));
         }
     }
 
-    ret R.ok[of.ObjectImage, str](image);
+    encoder_output_dnit(s, enc);
+    ret finish_codegen_image(image);
 }
 
-# assemble the `.text` section from the non-sectioned functions
-#
-# With no `#[section("...")]` decorator (`count == 0`) the encoder blob is
-# adopted whole and emission is byte-for-byte unchanged. Otherwise each
-# sectioned function's [start, end) range - already copied into its named
-# section by build_section_placements - is excised and the remaining bytes are
-# packed contiguously into a fresh image-owned buffer; the now-orphaned encoder
-# blob is released. A module whose every function is sectioned yields an empty
-# `.text` (nil bytes, length 0). pack_text is the last reader of `enc.text`, so
-# it owns the blob's disposition: adopt it (default path) or free it
-# (repartition path).
-# ---
-# s:          session, for interning the section name and allocating the buffer
-# image:      object image being built
-# enc:        encoder output supplying the text bytes (adopted or freed here)
-# placements: the sectioned-function ranges to excise, in increasing text offset
-# count:      number of placements (0 = default path, adopt the blob unchanged)
-# ret:        the new section's index, or an error string
 fun pack_text(s: *session.Session, image: *of.ObjectImage, enc: *encode.EncoderOutput,
-              placements: *SectionPlacement, count: u32) R.Result[u32, str] {
+              text_layout: *TextLayout) R.Result[u32, str] {
     val res_name: R.Result[intern.StrId, str] = intern.intern(?s.interner, ".text");
     if (R.is_err[intern.StrId, str](res_name)) {
         ret R.err[u32, str](R.unwrap_err[intern.StrId, str](res_name));
@@ -558,16 +714,19 @@ fun pack_text(s: *session.Session, image: *of.ObjectImage, enc: *encode.EncoderO
     sec.name  = R.unwrap_ok[intern.StrId, str](res_name);
     sec.kind  = of.SK_TEXT;
     sec.align = 16;
+    sec.flags = 0;
 
-    if (count == 0) {
+    if (text_layout.placement_count == 0) {
         sec.bytes = enc.text;
         sec.len   = enc.text_len;
-        ret obj.add_section(image, sec);
+        val res_add: R.Result[u32, str] = obj.install_section(image, ?sec);
+        enc.text     = nil;
+        enc.text_len = 0;
+        ret res_add;
     }
 
-    val new_len: u32 = enc.text_len - total_excised(placements, count);
+    val new_len: u32 = enc.text_len - total_excised(text_layout.placements, text_layout.placement_count);
     if (new_len == 0) {
-        # every function is sectioned: `.text` carries no bytes.
         sec.bytes = nil;
         sec.len   = 0;
     }
@@ -575,18 +734,17 @@ fun pack_text(s: *session.Session, image: *of.ObjectImage, enc: *encode.EncoderO
         val res_buf: R.Result[*u8, str] = A.allocate[u8](s.alloc, new_len::usize);
         if (R.is_err[*u8, str](res_buf)) {
             A.deallocate[u8](s.alloc, enc.text, enc.text_len::usize);
+            enc.text     = nil;
+            enc.text_len = 0;
             ret R.err[u32, str](R.unwrap_err[*u8, str](res_buf));
         }
         val buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
 
-        # copy the gaps between the excised ranges in order; placements are
-        # recorded in increasing text offset, so one forward walk packs `.text`
-        # contiguously.
         var write_pos: u32 = 0;
         var prev_end:  u32 = 0;
         var i: u32 = 0;
-        for (i < count) {
-            val p: *SectionPlacement = ?placements[i];
+        for (i < text_layout.placement_count) {
+            val p: *SectionPlacement = ?text_layout.placements[i];
             var ii: u32 = prev_end;
             for (ii < p.text_start) { buf[write_pos] = enc.text[ii]; write_pos = write_pos + 1; ii = ii + 1; }
             prev_end = p.text_end;
@@ -594,45 +752,27 @@ fun pack_text(s: *session.Session, image: *of.ObjectImage, enc: *encode.EncoderO
         }
         var ii: u32 = prev_end;
         for (ii < enc.text_len) { buf[write_pos] = enc.text[ii]; write_pos = write_pos + 1; ii = ii + 1; }
+        if (write_pos != new_len) {
+            A.deallocate[u8](s.alloc, buf, new_len::usize);
+            A.deallocate[u8](s.alloc, enc.text, enc.text_len::usize);
+            enc.text     = nil;
+            enc.text_len = 0;
+            ret R.err[u32, str]("codegen: text layout copy did not match its planned extent");
+        }
 
         sec.bytes = buf;
         sec.len   = new_len;
     }
 
     A.deallocate[u8](s.alloc, enc.text, enc.text_len::usize);
-    ret obj.add_section(image, sec);
+    enc.text     = nil;
+    enc.text_len = 0;
+    val res_add: R.Result[u32, str] = obj.install_section(image, ?sec);
+    ret res_add;
 }
 
-# register every encoder symbol mark against the `.text` section
-#
-# Each mark is an address defined in the encoded text at a known offset. The MARK
-# states what kind of symbol it is and this loop carries that through unchanged: it
-# used to OR in `SYM_OBJ_FLAG_FUNCTION` for every mark, which was true only because
-# every mark happened to be a function entry, and stopped being true the moment
-# riscv64 began defining `.Lpcrel_hi` labels at its `auipc` sites (#2828). A
-# fabricated type is worse than a missing one - a label typed STT_FUNC misleads every
-# consumer that asks what a symbol is, and here it made the psABI pair normalizer
-# refuse to recognize its own labels.
-#
-# A mark naming a defined IR function is given GLOBAL
-# linkage so the whole-program linker can resolve cross-module references to it
-# (every function symbol name is now globally unique - module-path-mangled, or an
-# exempted literal like `main` / `_start` - so global linkage cannot collide). A
-# mark with no matching IR function (an exposed inline-asm label) stays local. A
-# function carrying `FN_FLAG_WEAK` (a monomorphized generic instance emitted into
-# every using object) is additionally marked WEAK so the linker collapses the
-# duplicates to one definition.
-# ---
-# image:           object image being built
-# irmod:           IR module supplying each function's linkage
-# enc:             encoder output supplying the symbol marks
-# text_sec:        index of the `.text` section the marks are defined in
-# placements:      the sectioned-function ranges, in increasing text offset
-# placement_count: number of placements
-# ret:             true on success, or an error string
 fun pack_symbols(image: *of.ObjectImage, irmod: *ir.Module,
-                 enc: *encode.EncoderOutput, text_sec: u32,
-                 placements: *SectionPlacement, placement_count: u32) R.Result[bool, str] {
+                 enc: *encode.EncoderOutput, text_layout: *TextLayout) R.Result[R.Void, str] {
     var i: u32 = 0;
     for (i < enc.symbol_count) {
         val mark: *encode.SymbolMark = ?enc.symbols[i];
@@ -645,76 +785,49 @@ fun pack_symbols(image: *of.ObjectImage, irmod: *ir.Module,
             flags = flags | of.SYM_OBJ_FLAG_WEAK;
         }
 
-        val site: PlacedSite = site_placed(placements, placement_count, text_sec, mark.offset);
+        val site: PlacedSite = text_layout_place(text_layout, mark.offset);
 
         var sym: of.Symbol;
         sym.name    = mark.name;
         sym.section = site.sec;
         sym.offset  = site.off;
-        sym.size    = 0;
+        sym.size    = mark.size;
         sym.flags   = flags;
+        sym.fallback = of.SYMBOL_NONE;
+        sym.align    = 1;
 
         val res_sym: R.Result[u32, str] = obj.add_symbol(image, sym);
         if (R.is_err[u32, str](res_sym)) {
-            ret R.err[bool, str](R.unwrap_err[u32, str](res_sym));
+            ret R.err[R.Void, str](R.unwrap_err[u32, str](res_sym));
         }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# carry every declared frame-unwind record onto the image, re-homed to its final
-# section and offset exactly as its function's symbol mark is (#3096)
-#
-# The encoder keyed each record by the function's `.text`-blob entry offset, the
-# same key the entry `SymbolMark` carries, so `site_placed` resolves both to the
-# same (section, offset) and the record stays beside the code it describes - a
-# `#[section("...")]` function's record moves with it.
-# ---
-# image:           object image the records are appended to
-# enc:             encoder output supplying the frame records
-# text_sec:        index of the `.text` section a non-sectioned function stays in
-# placements:      the sectioned-function ranges, in increasing text offset
-# placement_count: number of placements
-# ret:             true on success, or an allocation error
-fun pack_frames(image: *of.ObjectImage, enc: *encode.EncoderOutput, text_sec: u32,
-                placements: *SectionPlacement, placement_count: u32) R.Result[bool, str] {
+fun pack_frames(image: *of.ObjectImage, enc: *encode.EncoderOutput,
+                text_layout: *TextLayout) R.Result[R.Void, str] {
     var i: u32 = 0;
     for (i < enc.frame_count) {
-        val site: PlacedSite = site_placed(placements, placement_count, text_sec, enc.frames[i].offset);
+        val site: PlacedSite = text_layout_place(text_layout, enc.frames[i].offset);
         var fr: of.FrameUnwind = enc.frames[i];
         fr.section = site.sec;
         fr.offset  = site.off;
-        val res_fr: R.Result[bool, str] = obj.add_frame(image, ?fr);
-        if (R.is_err[bool, str](res_fr)) { ret res_fr; }
+        val res_fr: R.Result[R.Void, str] = obj.add_frame(image, ?fr);
+        if (R.is_err[R.Void, str](res_fr)) { ret res_fr; }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# record every pending relocation from the encoder against its section
-#
-# The encoder tags each relocation with its abstract kind (`of.RK_*`) and the
-# interned target-symbol name; the format writer maps the kind to its machine
-# type at emit time. The symbol target is unchanged (resolved by the linker), so
-# a cross-section call from a re-homed site just works. A target this image never
-# defines - a symbol named only from an inline-asm body, like the entry `main`
-# called from the runtime `_start` asm - is declared a STT_FUNC extern when the
-# records bind.
-# ---
-# deferred:        out - the recorded relocations, bound once symbols are complete
-# enc:             encoder output supplying the pending relocations
-# text_sec:        index of the `.text` section a non-sectioned site patches
-# placements:      the sectioned-function ranges, in increasing text offset
-# placement_count: number of placements
-# ret:             true on success, or an error string
-fun pack_relocs(deferred: *obj.DeferredRelocs, enc: *encode.EncoderOutput,
-                text_sec: u32, placements: *SectionPlacement, placement_count: u32) R.Result[bool, str] {
+fun pack_relocs(tgt: *target.Target, deferred: *obj.DeferredRelocs, enc: *encode.EncoderOutput,
+                text_layout: *TextLayout) R.Result[R.Void, str] {
+    val batch_base: u32 = deferred.count;
     var i: u32 = 0;
     for (i < enc.reloc_count) {
         val pr: *encode.PendingReloc = ?enc.relocations[i];
 
-        val site: PlacedSite = site_placed(placements, placement_count, text_sec, pr.offset);
+        val site: PlacedSite = text_layout_place(text_layout, pr.offset);
 
         var rec: obj.DeferredReloc;
         rec.section      = site.sec;
@@ -723,89 +836,53 @@ fun pack_relocs(deferred: *obj.DeferredRelocs, enc: *encode.EncoderOutput,
         rec.name         = pr.sym;
         rec.addend       = pr.addend::i64;
         rec.extern_flags = of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_GLOBAL;
+        rec.pair         = 0;
+        if (pr.pair != 0) {
+            if (pr.pair > enc.reloc_count) {
+                ret R.err[R.Void, str]("codegen: encoder relocation pair index is out of range");
+            }
+            rec.pair = batch_base + pr.pair;
+        }
 
-        val res_rel: R.Result[bool, str] = obj.defer_relocation(deferred, rec);
-        if (R.is_err[bool, str](res_rel)) {
-            ret R.err[bool, str](R.unwrap_err[bool, str](res_rel));
+        val res_rel: R.Result[R.Void, str] =
+            obj.defer_relocation_for_target(deferred, rec, tgt, of.SK_TEXT, true);
+        if (R.is_err[R.Void, str](res_rel)) {
+            ret res_rel;
         }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# re-home every retained PC<->source line row into its final section and offset,
-# the line-table analogue of pack_symbols / pack_relocs
-#
-# Each row's encoder-blob `text_offset` resolves through `site_placed` exactly as a
-# symbol mark does: a row inside a `#[section("...")]` function moves to that
-# function's named section at its section-relative offset, and a `.text`-resident
-# row keeps `.text` and shifts down by the excised ranges below it. With no
-# sectioned function the rows keep `.text` (section index `text_sec`) and their
-# offsets are unchanged, matching the byte-for-byte default path. Rebases the rows
-# in place; the #1699 line-table producer reads the final `(sec, text_offset, loc)`.
-# ---
-# enc:             encoder output whose rows are re-homed in place
-# placements:      the sectioned-function ranges, in increasing text offset
-# placement_count: number of placements
-# text_sec:        index of the `.text` section a non-sectioned row stays in
-fun pack_rows(enc: *encode.EncoderOutput, placements: *SectionPlacement, placement_count: u32, text_sec: u32) {
+fun pack_rows(enc: *encode.EncoderOutput, text_layout: *TextLayout) {
     var i: u32 = 0;
     for (i < enc.row_count) {
-        val site: PlacedSite = site_placed(placements, placement_count, text_sec, enc.rows[i].text_offset);
+        val site: PlacedSite = text_layout_place(text_layout, enc.rows[i].text_offset);
         enc.rows[i].sec         = site.sec;
         enc.rows[i].text_offset = site.off;
         i = i + 1;
     }
-    # variable-location records re-home identically (the #1705 loclist producer reads
-    # the final (sec, text_offset) to bound each range).
     var v: u32 = 0;
     for (v < enc.varloc_count) {
         val old_start: u32 = enc.varlocs[v].text_offset;
-        val vsite: PlacedSite = site_placed(placements, placement_count, text_sec, old_start);
+        val vsite: PlacedSite = text_layout_place(text_layout, old_start);
         enc.varlocs[v].sec         = vsite.sec;
         enc.varlocs[v].text_offset = vsite.off;
-        # a bounded compare range lies within one instruction, so it moves
-        # wholesale with its start; re-home the end by the same displacement.
         if (enc.varlocs[v].end_offset != 0) {
-            enc.varlocs[v].end_offset = vsite.off + (enc.varlocs[v].end_offset - old_start);
+            val vend: PlacedSite = text_layout_place(text_layout, enc.varlocs[v].end_offset - 1);
+            enc.varlocs[v].end_offset = vend.off + 1;
         }
         v = v + 1;
     }
-    # inline-instance transitions re-home identically (the #1707 inlined_subroutine
-    # producer reads the final (sec, text_offset) to bound each instance range).
     var ip: u32 = 0;
     for (ip < enc.inline_pc_count) {
-        val ipsite: PlacedSite = site_placed(placements, placement_count, text_sec, enc.inline_pcs[ip].text_offset);
+        val ipsite: PlacedSite = text_layout_place(text_layout, enc.inline_pcs[ip].text_offset);
         enc.inline_pcs[ip].sec         = ipsite.sec;
         enc.inline_pcs[ip].text_offset = ipsite.off;
         ip = ip + 1;
     }
 }
 
-# materialise every module global into the image
-#
-# A global with an initializer becomes a `.rodata` (immutable) or `.data`
-# (mutable) section; one with no initializer becomes a zero-filled `.bss` entry
-# sized from its type. Each global gets a defining symbol pointing at its
-# section; a global defined in another module is declared as an undefined extern
-# instead.
-# ---
-# s:     session, for interning section names
-# tgt:   resolved target; supplies type sizes for bss global layout
-# image: object image being built
-# irmod: IR module whose globals are packed
-# ret:   true on success, or an error string
-# copy a borrowed initializer byte image into an image-owned buffer
-#
-# The image owns every section buffer (obj.dnit frees them by `len`), so a
-# borrowed source must be copied before it becomes a section's `bytes`. A nil
-# or empty source passes through unchanged: obj.dnit never frees a nil/empty
-# buffer, and the bss/data routing keys on the pointer, which is preserved.
-# ---
-# image: the image whose allocator owns the copy
-# src:   the borrowed bytes, or nil
-# len:   number of bytes
-# ret:   the owned copy (or the original nil/empty pointer), or an allocation error
 fun section_bytes_copy(image: *of.ObjectImage, src: *u8, len: u32) R.Result[*u8, str] {
     if (src == nil || len == 0) { ret R.ok[*u8, str](src); }
     val res_buf: R.Result[*u8, str] = A.allocate[u8](image.alloc, len::usize);
@@ -815,19 +892,7 @@ fun section_bytes_copy(image: *of.ObjectImage, src: *u8, len: u32) R.Result[*u8,
     ret R.ok[*u8, str](buf);
 }
 
-# add global `g`'s defining symbol, pointing at section `sec_idx`
-#
-# A named user global is given GLOBAL linkage - its name is module-path-mangled
-# and globally unique, so it resolves cross-object without collision (mirroring
-# every defined function). Only a compiler-synthesized anonymous data global
-# (`is_local`, a string / byte-blob literal) stays object-private.
-# ---
-# image:   object image being built
-# g:       the global being defined
-# sec_idx: index of the section holding its bytes
-# sec_len: the symbol's size in bytes
-# ret:     true on success, or an error string
-fun add_global_symbol(image: *of.ObjectImage, g: *ir.Global, sec_idx: u32, sec_len: u32) R.Result[bool, str] {
+fun add_global_symbol(image: *of.ObjectImage, g: *ir.Global, sec_idx: u32, sec_len: u32) R.Result[R.Void, str] {
     var flags: u32 = of.SYM_OBJ_FLAG_OBJECT;
     if (!g.is_local) { flags = flags | of.SYM_OBJ_FLAG_GLOBAL; }
 
@@ -837,30 +902,14 @@ fun add_global_symbol(image: *of.ObjectImage, g: *ir.Global, sec_idx: u32, sec_l
     sym.offset  = 0;
     sym.size    = sec_len;
     sym.flags   = flags;
+    sym.fallback = of.SYMBOL_NONE;
+    sym.align    = 1;
 
     val res: R.Result[u32, str] = obj.add_symbol(image, sym);
-    if (R.is_err[u32, str](res)) { ret R.err[bool, str](R.unwrap_err[u32, str](res)); }
-    ret R.ok[bool, str](true);
+    if (R.is_err[u32, str](res)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](res)); }
+    ret R.ok_void[str]();
 }
 
-# the index of a section already packed for an earlier `#[embed]` global whose
-# bytes, length, section name, and kind all match, or -1 when there is none
-#
-# Scans the globals packed before index `upto`, so the match is against sections
-# this loop has already added and the first embed of a given content owns the
-# placement. Content is compared in full rather than by digest: the digest lives
-# in the frontend's cache and the equality that matters here is of the bytes about
-# to be written.
-# ---
-# image:    object image being built
-# irmod:    the IR module being packed
-# upto:     index of the global currently being packed
-# bytes:    its initializer bytes
-# len:      their length
-# sec_name: the interned section name it would use
-# kind:     the section kind it would use
-# align:    the alignment it requires
-# ret:      the matching section index, or -1
 fun embed_section_of(image: *of.ObjectImage, irmod: *ir.Module, upto: u32, bytes: *u8, len: u32,
                      sec_name: intern.StrId, kind: of.SectionKind, align: u32) i64 {
     var j: u32 = 0;
@@ -882,11 +931,6 @@ fun embed_section_of(image: *of.ObjectImage, irmod: *ir.Module, upto: u32, bytes
     ret -1;
 }
 
-# the index of the section the symbol named `name` defines, or -1
-# ---
-# image: object image being built
-# name:  the interned symbol name
-# ret:   the section index, or -1
 fun section_index_of(image: *of.ObjectImage, name: intern.StrId) i64 {
     var i: u32 = 0;
     for (i < image.symbol_count) {
@@ -897,78 +941,40 @@ fun section_index_of(image: *of.ObjectImage, name: intern.StrId) i64 {
 }
 
 fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImage,
-                 deferred: *obj.DeferredRelocs, irmod: *ir.Module) R.Result[bool, str] {
+                 deferred: *obj.DeferredRelocs, irmod: *ir.Module) R.Result[R.Void, str] {
+    val machine: layout.Machine = resolved.layout_machine(tgt);
     var i: u32 = 0;
     for (i < irmod.global_len) {
         val g: *ir.Global = ?irmod.globals[i];
 
-        # a global `val`/`var` defined in another module is declared here as an
-        # undefined external symbol (no section, no storage) - the data analog of
-        # an extern function. the defining module exports the definition; the
-        # linker binds this object's relocations to it.
         if (g.is_extern) {
-            # GLOBAL binding is required: an undefined symbol the linker resolves
-            # against another object's definition cannot be local. without it the
-            # ELF writer emits STB_LOCAL and the reference fails to bind. matches
-            # the extern function decls and the deferred-relocation binding.
             val flags: u32 = of.SYM_OBJ_FLAG_OBJECT | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_GLOBAL;
-            val res_extern: R.Result[bool, str] = image_extern_symbol_add(image, g.name, flags);
-            if (R.is_err[bool, str](res_extern)) { ret res_extern; }
+            val res_extern: R.Result[R.Void, str] = image_extern_symbol_add(image, g.name, flags);
+            if (R.is_err[R.Void, str](res_extern)) { ret res_extern; }
             i = i + 1;
             cnt;
         }
 
-        # both constant-initializer byte images arrive BORROWED - a
-        # VAL_CONST_BYTES points at interner-owned literal bytes and a
-        # VAL_CONST_AGG blob is owned by the IR module (ir.dnit frees it) - while
-        # the image owns every section buffer it carries (obj.dnit frees them).
-        # copy at this boundary: a warm session finalizing a replaced Q_CODEGEN
-        # image must never free interner storage or double-free the module's blob.
         var bytes: *u8 = nil;
         var len:   u32 = 0;
         if (g.init.kind == value.VAL_CONST_BYTES) {
             val res_copy: R.Result[*u8, str] = section_bytes_copy(image, g.init.data.bytes.ptr, g.init.data.bytes.len);
-            if (R.is_err[*u8, str](res_copy)) { ret R.err[bool, str](R.unwrap_err[*u8, str](res_copy)); }
+            if (R.is_err[*u8, str](res_copy)) { ret R.err[R.Void, str](R.unwrap_err[*u8, str](res_copy)); }
             bytes = R.unwrap_ok[*u8, str](res_copy);
             len   = g.init.data.bytes.len;
         }
         or (g.init.kind == value.VAL_CONST_AGG) {
-            # a pre-serialized aggregate constant carries its laid-out blob and a
-            # relocation side-table for its pointer leaves. the blob lands in
-            # .data/.rodata like any byte image; the relocations are attached to
-            # the new section below.
             val res_copy: R.Result[*u8, str] = section_bytes_copy(image, g.init.data.agg.bytes, g.init.data.agg.len);
-            if (R.is_err[*u8, str](res_copy)) { ret R.err[bool, str](R.unwrap_err[*u8, str](res_copy)); }
+            if (R.is_err[*u8, str](res_copy)) { ret R.err[R.Void, str](R.unwrap_err[*u8, str](res_copy)); }
             bytes = R.unwrap_ok[*u8, str](res_copy);
             len   = g.init.data.agg.len;
         }
         or (g.init.kind == value.VAL_CONST_INT || g.init.kind == value.VAL_CONST_FLOAT) {
-            # a scalar constant initializer is materialized into its type-sized
-            # little-endian byte image so it lands in .data/.rodata. without this
-            # it falls through to a zero-filled .bss section and the initializer
-            # value is silently lost - every initialized scalar global would read
-            # as 0. `int_lit` aliases the value's raw bits (the IR Value's data is
-            # a union), so it is the bit source for both int and float.
-            #
-            # this kind also legitimately carries the compact zero placeholder the
-            # middle end emits for a global with no explicit initializer (or one
-            # that folds to zero): `me.lower.decl.lower_global` lowers it as
-            # `const_int(0, <full storage type>)`, so for `var buf: [256]u8;` it is
-            # a VAL_CONST_INT 0 whose type is the whole 256-byte aggregate. the
-            # eight-byte size bound below is therefore a real dispatch, not a guard
-            # to harden: a 1..8 byte value is serialized into .data/.rodata; an
-            # aggregate-sized (or void) zero placeholder must reach the bytes==nil
-            # .bss fall-through. only a NON-zero bit pattern at an unrepresentable
-            # size would silently drop a real value, and that alone is a loud error.
-            val gsz: u32 = type.byte_size(?irmod.types, g.ty, tgt);
+            val gsz: u32 = type.byte_size_for_machine(?irmod.types, g.ty, machine);
             if (gsz > 0 && gsz <= 8) {
-                # image-owned like every section buffer (obj.dnit frees by len).
                 val res_bytes: R.Result[*u8, str] = A.allocate[u8](image.alloc, gsz::usize);
-                if (R.is_err[*u8, str](res_bytes)) { ret R.err[bool, str](R.unwrap_err[*u8, str](res_bytes)); }
+                if (R.is_err[*u8, str](res_bytes)) { ret R.err[R.Void, str](R.unwrap_err[*u8, str](res_bytes)); }
                 bytes = R.unwrap_ok[*u8, str](res_bytes);
-                # a comptime float is always an f64 bit pattern; a 32-bit float
-                # global must carry the IEEE-754 single pattern of its own width,
-                # not the low 4 bytes of the f64 (which would corrupt the value).
                 var bits: u64 = g.init.data.int_lit;
                 if (g.init.kind == value.VAL_CONST_FLOAT && is_f32_type(?irmod.types, g.ty)) {
                     bits = float.f64_to_f32_bits(bits)::u64;
@@ -981,19 +987,10 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
                 len = gsz;
             }
             or (g.init.data.int_lit != 0) {
-                # a non-zero bit pattern at a zero/over-eight size is the only case
-                # the .bss fall-through would silently drop (a zero placeholder is
-                # routed there correctly); that is an IR-classification bug, reported
-                # loudly rather than dropped.
-                ret R.err[bool, str]("be.codegen.pack_globals: non-zero scalar constant global initializer has unsupported size (expected 1..8 bytes)");
+                ret R.err[R.Void, str]("be.codegen.pack_globals: non-zero scalar constant global initializer has unsupported size (expected 1..8 bytes)");
             }
         }
 
-        # a global with an initializer is initialized data and belongs in
-        # .data/.rodata; only one with no initializer is a zero-filled .bss
-        # reservation. An empty embed has a nil, zero-length byte image but is
-        # still a present read-only initializer, which its explicit IR flag keeps
-        # out of bss.
         var kind:  of.SectionKind = of.SK_BSS;
         var sname: str            = ".bss";
         if (bytes != nil || g.is_embed) {
@@ -1001,13 +998,6 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
                 kind  = of.SK_DATA;
                 sname = ".data";
             }
-            # a read-only global whose initializer carries a base relocation (a
-            # pointer leaf - `str`, `&global`, function pointer) is relocated
-            # constant data: it routes to `.data.rel.ro`, kept read-only in the
-            # final image but re-protected via RELRO after `--pie` self-relocation,
-            # rather than forcing the whole `.rodata` writable. only the aggregate
-            # initializer carries a relocation side-table; every other constant
-            # (scalar, byte blob, null) is pure `.rodata`.
             or (g.init.kind == value.VAL_CONST_AGG && g.init.data.agg.reloc_count > 0) {
                 kind  = of.SK_RELRO;
                 sname = ".data.rel.ro";
@@ -1018,52 +1008,33 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
             }
         }
 
-        # a `#[section("...")]` decorator overrides the default section name (the
-        # data/rodata/bss kind is kept, so an over-named bss stays zero-filled).
         var sec_name: intern.StrId = g.section;
         if (sec_name == intern.STR_NIL) {
             val res_name: R.Result[intern.StrId, str] = intern.intern(?s.interner, sname);
             if (R.is_err[intern.StrId, str](res_name)) {
-                ret R.err[bool, str](R.unwrap_err[intern.StrId, str](res_name));
+                ret R.err[R.Void, str](R.unwrap_err[intern.StrId, str](res_name));
             }
             sec_name = R.unwrap_ok[intern.StrId, str](res_name);
         }
 
-        # a section's length is the global's in-memory size. for initialized data
-        # that is the initializer byte count; a zero-initialized bss global has no
-        # initializer bytes, so its size comes from the global's type - without
-        # this the section would reserve zero bytes and every bss global would
-        # collapse onto the section's base address.
         var sec_len: u32 = len;
         if (kind == of.SK_BSS) {
-            sec_len = type.byte_size(?irmod.types, g.ty, tgt);
+            sec_len = type.byte_size_for_machine(?irmod.types, g.ty, machine);
         }
 
-        # the section is aligned to the strictest of: the 8-byte default, the
-        # global's own type alignment (which an `#[align(...)]` decorator on the
-        # type can raise - natural alignment never exceeds 8, so un-decorated
-        # globals stay at 8), and an `#[align(...)]` decorator on the global
-        # itself.
         var sec_align: u32 = 8;
-        val tya: u32 = type.byte_align(?irmod.types, g.ty, tgt);
+        val tya: u32 = type.byte_align_for_machine(?irmod.types, g.ty, machine);
         if (tya > sec_align)     { sec_align = tya; }
         if (g.align > sec_align) { sec_align = g.align; }
 
-        # two `#[embed]` globals naming byte-identical files share one placement
-        # (#2507): the section is emitted once and both symbols point at it. Sound
-        # only for embedded data - a named object's address is otherwise its own,
-        # and merging two ordinary globals would make `?A == ?B` observably true -
-        # so the scan is gated on `is_embed` at both ends. Alignment is part of the
-        # match: a stricter `#[align(...)]` on the second global would otherwise
-        # silently inherit the first section's weaker one.
         if (g.is_embed) {
             val dup: i64 = embed_section_of(image, irmod, i, bytes, sec_len, sec_name, kind, sec_align);
             if (dup >= 0) {
                 if (bytes != nil && sec_len > 0) {
                     A.deallocate[u8](image.alloc, bytes, sec_len::usize);
                 }
-                val res_alias: R.Result[bool, str] = add_global_symbol(image, g, dup::u32, sec_len);
-                if (R.is_err[bool, str](res_alias)) { ret res_alias; }
+                val res_alias: R.Result[R.Void, str] = add_global_symbol(image, g, dup::u32, sec_len);
+                if (R.is_err[R.Void, str](res_alias)) { ret res_alias; }
                 i = i + 1;
                 cnt;
             }
@@ -1075,68 +1046,33 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
         sec.bytes = bytes;
         sec.len   = sec_len;
         sec.align = sec_align;
-        # the section is one embed atom, which is what lets the final linker
-        # coalesce it with a byte-identical atom from ANOTHER module (#2541). the
-        # intra-module scan above already handled this module's own duplicates.
         sec.flags = 0;
         if (g.is_embed) { sec.flags = of.SEC_FLAG_MERGEABLE; }
 
-        val res_section: R.Result[u32, str] = obj.add_section(image, sec);
+        val res_section: R.Result[u32, str] = obj.install_section(image, ?sec);
         if (R.is_err[u32, str](res_section)) {
-            ret R.err[bool, str](R.unwrap_err[u32, str](res_section));
+            ret R.err[R.Void, str](R.unwrap_err[u32, str](res_section));
         }
         val sec_idx: u32 = R.unwrap_ok[u32, str](res_section);
 
-        val res_sym: R.Result[bool, str] = add_global_symbol(image, g, sec_idx, sec_len);
-        if (R.is_err[bool, str](res_sym)) { ret res_sym; }
+        val res_sym: R.Result[R.Void, str] = add_global_symbol(image, g, sec_idx, sec_len);
+        if (R.is_err[R.Void, str](res_sym)) { ret res_sym; }
 
-        # an aggregate constant's pointer leaves (a `str` / address-of-global) are
-        # patched at link time: each side-table entry becomes a pointer-width
-        # absolute relocation against this global's section, naming the target
-        # symbol (an anonymous rodata global already packed in this same loop).
-        # the ELF writer emits a `.rela.<section>` for any section carrying these.
         if (g.init.kind == value.VAL_CONST_AGG) {
-            val res_agg: R.Result[bool, str] = pack_agg_relocs(deferred, ?g.init, sec_idx, tgt.isa.pointer_width);
-            if (R.is_err[bool, str](res_agg)) { ret R.err[bool, str](R.unwrap_err[bool, str](res_agg)); }
+            val res_agg: R.Result[R.Void, str] = pack_agg_relocs(tgt, deferred, ?g.init, sec_idx, tgt.isa.pointer_width);
+            if (R.is_err[R.Void, str](res_agg)) { ret res_agg; }
         }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# materialize the encoder's constant pool into read-only sections
-#
-# The encoder interns a constant it could not (or should not) rebuild from
-# instructions and references it by a local symbol; this is where that symbol
-# acquires a definition. One section per entry, each with the entry's own
-# alignment and its defining local symbol at offset 0.
-#
-# One section PER ENTRY rather than one packed pool section, because a pool entry
-# has no observable address identity and so is exactly the coalescable atom
-# `SEC_FLAG_MERGEABLE` describes: marked that way, byte-identical entries from
-# different modules collapse to one placement at link time (#2541), which a
-# monolithic pool section could never do. The intra-module dedup already happened
-# at interning.
-#
-# The alignment is the entry's, decided once in `encode.const_align`, and is
-# carried here unmodified. Nothing in this pass re-derives it from the width, and
-# neither does any encoder: an aligned load is legal because the section
-# guarantees what the entry asked for.
-#
-# The symbol is LOCAL. A relocation against it resolves inside its own module and
-# never by name across objects, which is what makes a per-module ordinal a
-# sufficient name.
-# ---
-# s:     session, for interning the section name
-# image: object image being built
-# enc:   encoder output carrying the interned pool entries
-# ret:   true on success, or an error string
-fun pack_constpool(s: *session.Session, image: *of.ObjectImage, enc: *encode.EncoderOutput) R.Result[bool, str] {
-    if (enc.const_count == 0) { ret R.ok[bool, str](true); }
+fun pack_constpool(s: *session.Session, image: *of.ObjectImage, enc: *encode.EncoderOutput) R.Result[R.Void, str] {
+    if (enc.const_count == 0) { ret R.ok_void[str](); }
 
     val res_name: R.Result[intern.StrId, str] = intern.intern(?s.interner, ".rodata.cst");
     if (R.is_err[intern.StrId, str](res_name)) {
-        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](res_name));
+        ret R.err[R.Void, str](R.unwrap_err[intern.StrId, str](res_name));
     }
     val sec_name: intern.StrId = R.unwrap_ok[intern.StrId, str](res_name);
 
@@ -1144,11 +1080,8 @@ fun pack_constpool(s: *session.Session, image: *of.ObjectImage, enc: *encode.Enc
     for (i < enc.const_count) {
         val e: *encode.ConstEntry = ?enc.consts[i];
 
-        # the pool's bytes are encoder-owned and released with the rest of the
-        # encoder output; the image owns every section buffer it carries. copy at
-        # this boundary for the same reason pack_globals does.
         val res_copy: R.Result[*u8, str] = section_bytes_copy(image, e.bytes, e.len);
-        if (R.is_err[*u8, str](res_copy)) { ret R.err[bool, str](R.unwrap_err[*u8, str](res_copy)); }
+        if (R.is_err[*u8, str](res_copy)) { ret R.err[R.Void, str](R.unwrap_err[*u8, str](res_copy)); }
 
         var sec: of.Section;
         sec.name  = sec_name;
@@ -1158,8 +1091,10 @@ fun pack_constpool(s: *session.Session, image: *of.ObjectImage, enc: *encode.Enc
         sec.align = e.align;
         sec.flags = of.SEC_FLAG_MERGEABLE;
 
-        val res_sec: R.Result[u32, str] = obj.add_section(image, sec);
-        if (R.is_err[u32, str](res_sec)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_sec)); }
+        val res_sec: R.Result[u32, str] = obj.install_section(image, ?sec);
+        if (R.is_err[u32, str](res_sec)) {
+            ret R.err[R.Void, str](R.unwrap_err[u32, str](res_sec));
+        }
 
         var sym: of.Symbol;
         sym.name    = e.sym;
@@ -1167,45 +1102,26 @@ fun pack_constpool(s: *session.Session, image: *of.ObjectImage, enc: *encode.Enc
         sym.offset  = 0;
         sym.size    = e.len;
         sym.flags   = of.SYM_OBJ_FLAG_OBJECT;
+        sym.fallback = of.SYMBOL_NONE;
+        sym.align    = e.align;
 
         val res_sym: R.Result[u32, str] = obj.add_symbol(image, sym);
-        if (R.is_err[u32, str](res_sym)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_sym)); }
+        if (R.is_err[u32, str](res_sym)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](res_sym)); }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# attach the relocation side-table of an aggregate constant initializer
-#
-# One absolute relocation per pointer leaf, patching the leaf's byte offset with
-# the address of its target symbol plus the recorded addend. The relocation's
-# *kind* is target-dependent even though its abstract shape is not: the kind
-# whose patched field matches the target's own pointer width, from
-# `of.abs_kind_for_pointer_width` - RK_ABS64 on every 64-bit-pointer target,
-# RK_ABS16 on mos6502's 2-byte pointers (#2280), and so on for any future
-# narrower-pointer target (#2835). A fixed RK_ABS64 here reached every target
-# whose pointer is not 8 bytes: refused loudly where the applier does not
-# support it (mos6502), silently wrong wherever one does without checking width.
-# ---
-# deferred:      out - the recorded relocations, bound once symbols are complete
-# init:          the VAL_CONST_AGG initializer carrying the side-table
-# sec_idx:       index of the section the relocations patch
-# pointer_width: the target's pointer width in bytes (isa.IsaVTable.pointer_width)
-# ret:           true on success, or an error string
-fun pack_agg_relocs(deferred: *obj.DeferredRelocs, init: *value.Value, sec_idx: u32,
-                    pointer_width: u32) R.Result[bool, str] {
+fun pack_agg_relocs(tgt: *target.Target, deferred: *obj.DeferredRelocs, init: *value.Value, sec_idx: u32,
+                    pointer_width: u32) R.Result[R.Void, str] {
     val kind_r: R.Result[of.RelocKind, str] = of.abs_kind_for_pointer_width(pointer_width);
-    if (R.is_err[of.RelocKind, str](kind_r)) { ret R.err[bool, str](R.unwrap_err[of.RelocKind, str](kind_r)); }
+    if (R.is_err[of.RelocKind, str](kind_r)) { ret R.err[R.Void, str](R.unwrap_err[of.RelocKind, str](kind_r)); }
     val kind: of.RelocKind = R.unwrap_ok[of.RelocKind, str](kind_r);
 
     var i: u32 = 0;
     for (i < init.data.agg.reloc_count) {
         val ar: *value.AggReloc = ?init.data.agg.relocs[i];
 
-        # a leaf may name a symbol packed later in this same pass, or one defined
-        # in another module entirely; either way the record binds after every
-        # defining pass has run. the leaf's own flavour picks the flags the target
-        # is declared with if it turns out to be the cross-module case.
         var flags: u32 = of.SYM_OBJ_FLAG_OBJECT | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_GLOBAL;
         if (ar.is_fn) { flags = of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_GLOBAL; }
 
@@ -1216,78 +1132,188 @@ fun pack_agg_relocs(deferred: *obj.DeferredRelocs, init: *value.Value, sec_idx: 
         rec.name         = ar.symbol;
         rec.addend       = ar.addend;
         rec.extern_flags = flags;
+        rec.pair         = 0;
 
-        val res_rel: R.Result[bool, str] = obj.defer_relocation(deferred, rec);
-        if (R.is_err[bool, str](res_rel)) { ret R.err[bool, str](R.unwrap_err[bool, str](res_rel)); }
+        val res_rel: R.Result[R.Void, str] =
+            obj.defer_relocation_for_target(deferred, rec, tgt, of.SK_DATA, true);
+        if (R.is_err[R.Void, str](res_rel)) { ret res_rel; }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# create a named section for every sectioned defined function and record its
-# placement
-#
-# Writes the owned placement array (sized to the mark count, freed by the caller)
-# and the entry count through the out-params; an empty result means no function
-# is sectioned and emission is byte-for-byte unchanged.
-# ---
-# s:         session, for allocating the placement array and the section buffers
-# image:     object image being built
-# irmod:     IR module supplying each function's section decorator
-# enc:       encoder output supplying the symbol marks and text bytes
-# out_buf:   receives the owned placement array (nil when nothing is sectioned)
-# out_count: receives the number of placements
-# ret:       true on success, or an error string
-fun build_section_placements(s: *session.Session, image: *of.ObjectImage, irmod: *ir.Module,
-                             enc: *encode.EncoderOutput, out_buf: **SectionPlacement, out_count: *u32) R.Result[bool, str] {
-    @out_buf   = nil;
-    @out_count = 0;
-    if (enc.symbol_count == 0) { ret R.ok[bool, str](true); }
+fun encoder_span_valid[T](items: *T, count: u32) bool {
+    ret (items == nil) == (count == 0);
+}
 
-    val res_buf: R.Result[*SectionPlacement, str] = A.allocate[SectionPlacement](s.alloc, enc.symbol_count::usize);
-    if (R.is_err[*SectionPlacement, str](res_buf)) { ret R.err[bool, str](R.unwrap_err[*SectionPlacement, str](res_buf)); }
-    val buf: *SectionPlacement = R.unwrap_ok[*SectionPlacement, str](res_buf);
+fun validate_encoder_output(enc: *encode.EncoderOutput) R.Result[R.Void, str] {
+    if (enc == nil) { ret R.err[R.Void, str]("codegen: nil encoder output"); }
+    if (!encoder_span_valid[u8](enc.text, enc.text_len)
+        || !encoder_span_valid[encode.SymbolMark](enc.symbols, enc.symbol_count)
+        || !encoder_span_valid[encode.PendingReloc](enc.relocations, enc.reloc_count)
+        || !encoder_span_valid[encode.LineRow](enc.rows, enc.row_count)
+        || !encoder_span_valid[encode.VarLoc](enc.varlocs, enc.varloc_count)
+        || !encoder_span_valid[encode.InlinePc](enc.inline_pcs, enc.inline_pc_count)
+        || !encoder_span_valid[encode.ConstEntry](enc.consts, enc.const_count)
+        || !encoder_span_valid[of.FrameUnwind](enc.frames, enc.frame_count)) {
+        ret R.err[R.Void, str]("codegen: encoder output has a noncanonical collection view");
+    }
+    var i: u32 = 0;
+    for (i < enc.reloc_count) {
+        if (!of.reloc_kind_valid(enc.relocations[i].kind)) {
+            ret R.err[R.Void, str]("codegen: encoder output has an unknown relocation kind");
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < enc.const_count) {
+        val e: *encode.ConstEntry = ?enc.consts[i];
+        if (e.bytes == nil || e.len == 0 || e.align == 0 || (e.align & (e.align - 1)) != 0
+            || e.kind < encode.CONST_F32 || e.kind > encode.CONST_VEC) {
+            ret R.err[R.Void, str]("codegen: encoder output has an invalid constant-pool entry");
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < enc.frame_count) {
+        val fr: *of.FrameUnwind = ?enc.frames[i];
+        if (fr.step_count > of.FRAME_STEP_CAP) {
+            ret R.err[R.Void, str]("codegen: encoder output has too many unwind steps");
+        }
+        var k: u32 = 0;
+        for (k < fr.step_count) {
+            if (fr.steps[k].kind < of.FRAME_STEP_PUSH || fr.steps[k].kind > of.FRAME_STEP_SAVE_VEC) {
+                ret R.err[R.Void, str]("codegen: encoder output has an unknown unwind step");
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret R.ok_void[str]();
+}
 
-    var count: u32 = 0;
+fun build_text_layout(s: *session.Session, irmod: *ir.Module,
+                      enc: *encode.EncoderOutput) R.Result[TextLayout, str] {
+    var text_layout: TextLayout;
+    text_layout.placements      = nil;
+    text_layout.placement_count = 0;
+    text_layout.placement_cap   = 0;
+    text_layout.text_len        = enc.text_len;
+    text_layout.text_sec        = of.SECTION_EXTERNAL;
+
+    if (enc.symbol_count > 0) {
+        val res_buf: R.Result[*SectionPlacement, str] = A.allocate[SectionPlacement](s.alloc, enc.symbol_count::usize);
+        if (R.is_err[*SectionPlacement, str](res_buf)) {
+            ret R.err[TextLayout, str](R.unwrap_err[*SectionPlacement, str](res_buf));
+        }
+        text_layout.placements = R.unwrap_ok[*SectionPlacement, str](res_buf);
+        text_layout.placement_cap = enc.symbol_count;
+    }
+
     var i: u32 = 0;
     for (i < enc.symbol_count) {
         val mark: *encode.SymbolMark = ?enc.symbols[i];
         if (function_is_defined(irmod, mark.name)) {
             val sname: intern.StrId = function_section_name(irmod, mark.name);
             if (sname != intern.STR_NIL) {
-                val start: u32 = mark.offset;
-                val end:   u32 = next_func_entry_offset(irmod, enc, i);
-                val res_sec: R.Result[u32, str] = func_section_add(s, image, sname, enc, start, end);
-                if (R.is_err[u32, str](res_sec)) {
-                    A.deallocate[SectionPlacement](s.alloc, buf, enc.symbol_count::usize);
-                    ret R.err[bool, str](R.unwrap_err[u32, str](res_sec));
+                val planned: R.Result[R.Void, str] = section_placement_plan(
+                    text_layout.placements, ?text_layout.placement_count, text_layout.placement_cap,
+                    sname, mark.offset, mark.size, enc.text_len);
+                if (R.is_err[R.Void, str](planned)) {
+                    text_layout_dnit(s, ?text_layout);
+                    ret R.err[TextLayout, str](R.unwrap_err[R.Void, str](planned));
                 }
-                buf[count] = SectionPlacement{text_start: start, text_end: end, sec: R.unwrap_ok[u32, str](res_sec)};
-                count = count + 1;
             }
         }
         i = i + 1;
     }
-    @out_buf   = buf;
-    @out_count = count;
-    ret R.ok[bool, str](true);
+
+    if (text_layout.placement_count == 0 && text_layout.placements != nil) {
+        A.deallocate[SectionPlacement](s.alloc, text_layout.placements, text_layout.placement_cap::usize);
+        text_layout.placements    = nil;
+        text_layout.placement_cap = 0;
+    }
+
+    val valid: R.Result[R.Void, str] = validate_text_metadata(?text_layout, enc);
+    if (R.is_err[R.Void, str](valid)) {
+        text_layout_dnit(s, ?text_layout);
+        ret R.err[TextLayout, str](R.unwrap_err[R.Void, str](valid));
+    }
+    ret R.ok[TextLayout, str](text_layout);
 }
 
-# copy one sectioned function's bytes into a fresh named section
-#
-# Copies the encoder blob's [start, end) bytes into an image-owned buffer,
-# appends a text-kind section named `sname`, and returns its index. Same-named
-# sections from sibling functions are concatenated by the linker.
-# ---
-# s:     session, for allocating the section buffer
-# image: object image being built
-# sname: interned name of the section to create
-# enc:   encoder output supplying the text bytes
-# start: first byte of the function's range in the encoder blob
-# end:   one past the function's last byte in the encoder blob
-# ret:   the new section's index, or an error string
+fun text_layout_dnit(s: *session.Session, text_layout: *TextLayout) {
+    if (text_layout.placements != nil && text_layout.placement_cap > 0) {
+        A.deallocate[SectionPlacement](s.alloc, text_layout.placements, text_layout.placement_cap::usize);
+    }
+    text_layout.placements      = nil;
+    text_layout.placement_count = 0;
+    text_layout.placement_cap   = 0;
+    text_layout.text_len        = 0;
+    text_layout.text_sec        = of.SECTION_EXTERNAL;
+}
+
+fun apply_text_layout(s: *session.Session, image: *of.ObjectImage, enc: *encode.EncoderOutput,
+                      text_layout: *TextLayout) R.Result[R.Void, str] {
+    var i: u32 = 0;
+    for (i < text_layout.placement_count) {
+        val res_sec: R.Result[u32, str] = func_section_add(
+            s, image, text_layout.placements[i].name, enc,
+            text_layout.placements[i].text_start, text_layout.placements[i].text_end);
+        if (R.is_err[u32, str](res_sec)) {
+            ret R.err[R.Void, str](R.unwrap_err[u32, str](res_sec));
+        }
+        text_layout.placements[i].sec = R.unwrap_ok[u32, str](res_sec);
+        i = i + 1;
+    }
+    ret R.ok_void[str]();
+}
+
+fun section_placement_plan(placements: *SectionPlacement, count: *u32, cap: u32,
+                           name: intern.StrId, start: u32, size: u32,
+                           text_len: u32) R.Result[R.Void, str] {
+    if (placements == nil || count == nil) {
+        ret R.err[R.Void, str]("codegen: section placement plan has no storage");
+    }
+    if (size == 0) {
+        ret R.err[R.Void, str]("codegen: a sectioned function has an empty encoded extent");
+    }
+    if (@count >= cap) {
+        ret R.err[R.Void, str]("codegen: section placement plan exceeds its capacity");
+    }
+    if (start > text_len || size > text_len - start) {
+        ret R.err[R.Void, str]("codegen: a sectioned function lies outside encoded text");
+    }
+    val end: u32 = start + size;
+    var insert: u32 = 0;
+    for (insert < @count && placements[insert].text_start < start) {
+        insert = insert + 1;
+    }
+    if (insert > 0 && placements[insert - 1].text_end > start) {
+        ret R.err[R.Void, str]("codegen: sectioned function extents overlap");
+    }
+    if (insert < @count && end > placements[insert].text_start) {
+        ret R.err[R.Void, str]("codegen: sectioned function extents overlap");
+    }
+    var i: u32 = @count;
+    for (i > insert) {
+        placements[i] = placements[i - 1];
+        i = i - 1;
+    }
+    placements[insert].text_start = start;
+    placements[insert].text_end = end;
+    placements[insert].name = name;
+    placements[insert].sec = of.SECTION_EXTERNAL;
+    @count = @count + 1;
+    ret R.ok_void[str]();
+}
+
 fun func_section_add(s: *session.Session, image: *of.ObjectImage, sname: intern.StrId,
                      enc: *encode.EncoderOutput, start: u32, end: u32) R.Result[u32, str] {
+    if (s == nil || image == nil || enc == nil || enc.text == nil
+        || start >= end || end > enc.text_len) {
+        ret R.err[u32, str]("codegen: invalid function-section extent");
+    }
     val len: u32 = end - start;
     val res_buf: R.Result[*u8, str] = A.allocate[u8](s.alloc, len::usize);
     if (R.is_err[*u8, str](res_buf)) { ret R.err[u32, str](R.unwrap_err[*u8, str](res_buf)); }
@@ -1301,59 +1327,39 @@ fun func_section_add(s: *session.Session, image: *of.ObjectImage, sname: intern.
     sec.bytes = buf;
     sec.len   = len;
     sec.align = 16;
-    ret obj.add_section(image, sec);
+    sec.flags = 0;
+    val res_add: R.Result[u32, str] = obj.install_section(image, ?sec);
+    ret res_add;
 }
 
-# add an undefined external symbol named `name` to the image's symbol table
-#
-# Every undefined symbol shares the same shape - no section, no storage - and
-# differs only in its linkage flags, so every extern-declaration site routes
-# through here.
-# ---
-# image: object image being built
-# name:  interned symbol name to declare undefined
-# flags: linkage flags (SYM_OBJ_FLAG_* - object vs function, global vs local)
-# ret:   true on success, or an error string
-fun image_extern_symbol_add(image: *of.ObjectImage, name: intern.StrId, flags: u32) R.Result[bool, str] {
+fun image_extern_symbol_add(image: *of.ObjectImage, name: intern.StrId, flags: u32) R.Result[R.Void, str] {
     var sym: of.Symbol;
     sym.name    = name;
     sym.section = of.SECTION_EXTERNAL;
     sym.offset  = 0;
     sym.size    = 0;
     sym.flags   = flags;
+    sym.fallback = of.SYMBOL_NONE;
+    sym.align    = 1;
 
     val res_sym: R.Result[u32, str] = obj.add_symbol(image, sym);
-    if (R.is_err[u32, str](res_sym)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_sym)); }
-    ret R.ok[bool, str](true);
+    if (R.is_err[u32, str](res_sym)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](res_sym)); }
+    ret R.ok_void[str]();
 }
 
-# resolve the section and offset an encoder-blob site maps to after excision
-#
-# A site inside a sectioned function is re-homed to that function's named section
-# at the rebased offset; a `.text`-resident site keeps the `.text` section and
-# shifts down by the sectioned ranges excised below it (zero shift, unchanged,
-# when nothing is sectioned).
-# ---
-# placements: the sectioned-function ranges, in increasing text offset
-# count:      number of placements
-# text_sec:   index of the `.text` section a non-sectioned site stays in
-# offset:     the site's offset in the encoder blob
-# ret:        the resolved section index and in-section offset
-fun site_placed(placements: *SectionPlacement, count: u32, text_sec: u32, offset: u32) PlacedSite {
-    val opt_pl: O.Option[*SectionPlacement] = placement_for(placements, count, offset);
+fun text_layout_place(text_layout: *TextLayout, offset: u32) PlacedSite {
+    val opt_pl: O.Option[*SectionPlacement] = placement_for(
+        text_layout.placements, text_layout.placement_count, offset);
     if (O.is_some[*SectionPlacement](opt_pl)) {
         val p: *SectionPlacement = O.unwrap[*SectionPlacement](opt_pl);
         ret PlacedSite{sec: p.sec, off: offset - p.text_start};
     }
-    ret PlacedSite{sec: text_sec, off: rebased_text_offset(placements, count, offset)};
+    ret PlacedSite{
+        sec: text_layout.text_sec,
+        off: rebased_text_offset(text_layout.placements, text_layout.placement_count, offset),
+    };
 }
 
-# the placement whose text range contains `offset`, or none
-# ---
-# placements: the sectioned-function ranges to search
-# count:      number of placements
-# offset:     the encoder-blob offset to locate
-# ret:        the containing placement, or none
 fun placement_for(placements: *SectionPlacement, count: u32, offset: u32) O.Option[*SectionPlacement] {
     var i: u32 = 0;
     for (i < count) {
@@ -1364,13 +1370,131 @@ fun placement_for(placements: *SectionPlacement, count: u32, offset: u32) O.Opti
     ret O.none[*SectionPlacement]();
 }
 
-# the summed byte length of every sectioned-function range
-#
-# The rebuilt `.text` is exactly this much shorter than the encoder blob.
-# ---
-# placements: the sectioned-function ranges
-# count:      number of placements
-# ret:        the total excised byte length
+fun text_layout_source_site(text_layout: *TextLayout, offset: u32,
+                            allow_end: bool) R.Result[PlacedSite, str] {
+    if (text_layout == nil
+        || (text_layout.placement_count > 0 && text_layout.placements == nil)) {
+        ret R.err[PlacedSite, str]("codegen: text layout has no placement storage");
+    }
+    if (offset > text_layout.text_len || (!allow_end && offset == text_layout.text_len)) {
+        ret R.err[PlacedSite, str]("codegen: encoded text point lies outside its source extent");
+    }
+    var i: u32 = 0;
+    for (i < text_layout.placement_count) {
+        val p: *SectionPlacement = ?text_layout.placements[i];
+        if (offset >= p.text_start && offset < p.text_end) {
+            ret R.ok[PlacedSite, str](PlacedSite{sec: i + 1, off: offset - p.text_start});
+        }
+        i = i + 1;
+    }
+    ret R.ok[PlacedSite, str](PlacedSite{
+        sec: 0,
+        off: rebased_text_offset(text_layout.placements, text_layout.placement_count, offset),
+    });
+}
+
+fun text_layout_validate_range(text_layout: *TextLayout, start: u32,
+                               end: u32) R.Result[R.Void, str] {
+    if (start >= end || start >= text_layout.text_len || end > text_layout.text_len) {
+        ret R.err[R.Void, str]("codegen: encoded text range lies outside its source extent");
+    }
+    val res_first: R.Result[PlacedSite, str] = text_layout_source_site(text_layout, start, false);
+    if (R.is_err[PlacedSite, str](res_first)) {
+        ret R.err[R.Void, str](R.unwrap_err[PlacedSite, str](res_first));
+    }
+    val res_last: R.Result[PlacedSite, str] = text_layout_source_site(text_layout, end - 1, false);
+    if (R.is_err[PlacedSite, str](res_last)) {
+        ret R.err[R.Void, str](R.unwrap_err[PlacedSite, str](res_last));
+    }
+    val first: PlacedSite = R.unwrap_ok[PlacedSite, str](res_first);
+    val last:  PlacedSite = R.unwrap_ok[PlacedSite, str](res_last);
+    if (first.sec != last.sec || last.off < first.off
+        || last.off - first.off != end - start - 1) {
+        ret R.err[R.Void, str]("codegen: encoded text range crosses an output-section boundary");
+    }
+    ret R.ok_void[str]();
+}
+
+fun validate_text_metadata(text_layout: *TextLayout,
+                           enc: *encode.EncoderOutput) R.Result[R.Void, str] {
+    var i: u32 = 0;
+    for (i < enc.symbol_count) {
+        val mark: *encode.SymbolMark = ?enc.symbols[i];
+        if (mark.offset > text_layout.text_len
+            || mark.size > text_layout.text_len - mark.offset) {
+            ret R.err[R.Void, str]("codegen: encoded symbol lies outside text");
+        }
+        if (mark.size == 0) {
+            val point: R.Result[PlacedSite, str] = text_layout_source_site(text_layout, mark.offset, true);
+            if (R.is_err[PlacedSite, str](point)) {
+                ret R.err[R.Void, str]("codegen: encoded symbol lies outside text");
+            }
+        }
+        or {
+            val range: R.Result[R.Void, str] = text_layout_validate_range(
+                text_layout, mark.offset, mark.offset + mark.size);
+            if (R.is_err[R.Void, str](range)) {
+                ret R.err[R.Void, str]("codegen: encoded symbol crosses an output-section boundary");
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < enc.frame_count) {
+        val point: R.Result[PlacedSite, str] = text_layout_source_site(
+            text_layout, enc.frames[i].offset, true);
+        if (R.is_err[PlacedSite, str](point)) {
+            ret R.err[R.Void, str]("codegen: unwind frame lies outside text");
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < enc.reloc_count) {
+        val point: R.Result[PlacedSite, str] = text_layout_source_site(
+            text_layout, enc.relocations[i].offset, false);
+        if (R.is_err[PlacedSite, str](point)) {
+            ret R.err[R.Void, str]("codegen: relocation lies outside text");
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < enc.row_count) {
+        val point: R.Result[PlacedSite, str] = text_layout_source_site(
+            text_layout, enc.rows[i].text_offset, true);
+        if (R.is_err[PlacedSite, str](point)) {
+            ret R.err[R.Void, str]("codegen: line row lies outside text");
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < enc.varloc_count) {
+        val vl: *encode.VarLoc = ?enc.varlocs[i];
+        val point: R.Result[PlacedSite, str] = text_layout_source_site(
+            text_layout, vl.text_offset, false);
+        if (R.is_err[PlacedSite, str](point)) {
+            ret R.err[R.Void, str]("codegen: variable location starts outside text");
+        }
+        if (vl.end_offset != 0) {
+            val range: R.Result[R.Void, str] = text_layout_validate_range(
+                text_layout, vl.text_offset, vl.end_offset);
+            if (R.is_err[R.Void, str](range)) {
+                ret R.err[R.Void, str]("codegen: variable location range crosses an output-section boundary");
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < enc.inline_pc_count) {
+        val point: R.Result[PlacedSite, str] = text_layout_source_site(
+            text_layout, enc.inline_pcs[i].text_offset, false);
+        if (R.is_err[PlacedSite, str](point)) {
+            ret R.err[R.Void, str]("codegen: inline PC lies outside text");
+        }
+        i = i + 1;
+    }
+    ret R.ok_void[str]();
+}
+
 fun total_excised(placements: *SectionPlacement, count: u32) u32 {
     var sum: u32 = 0;
     var i: u32 = 0;
@@ -1382,18 +1506,6 @@ fun total_excised(placements: *SectionPlacement, count: u32) u32 {
     ret sum;
 }
 
-# where a `.text`-resident site at encoder-blob `offset` lands once every
-# sectioned range below it is excised
-#
-# Each sectioned range lies entirely below or entirely above a non-sectioned
-# site, so the shift is the summed length of the ranges ending at or before
-# `offset`. With no sectioned function the shift is zero and the offset is
-# returned unchanged.
-# ---
-# placements: the sectioned-function ranges
-# count:      number of placements
-# offset:     the site's offset in the encoder blob
-# ret:        the offset rebased into the excised `.text`
 fun rebased_text_offset(placements: *SectionPlacement, count: u32, offset: u32) u32 {
     var shift: u32 = 0;
     var i: u32 = 0;
@@ -1405,36 +1517,6 @@ fun rebased_text_offset(placements: *SectionPlacement, count: u32, offset: u32) 
     ret offset - shift;
 }
 
-# the encoder-blob offset of the first function-entry mark after `mark_ix`, or
-# the total text length when `mark_ix` marks the last function
-#
-# Marks are emitted in increasing offset order, so this bounds the function at
-# `mark_ix`.
-# ---
-# irmod:   IR module whose functions resolve a mark to a definition
-# enc:     encoder output supplying the symbol marks
-# mark_ix: index of the mark whose following entry is sought
-# ret:     the next function-entry offset, or enc.text_len
-fun next_func_entry_offset(irmod: *ir.Module, enc: *encode.EncoderOutput, mark_ix: u32) u32 {
-    var i: u32 = mark_ix + 1;
-    for (i < enc.symbol_count) {
-        val mark: *encode.SymbolMark = ?enc.symbols[i];
-        if (function_is_defined(irmod, mark.name)) { ret mark.offset; }
-        i = i + 1;
-    }
-    ret enc.text_len;
-}
-
-# the IR module's defined (non-extern) function named `name`, or none
-#
-# All functions of the name are checked: a forward call lowered before its target
-# appends an extern stub of the same name, so the defined entry may not be the
-# first match. The name is "defined here" when some entry of the name carries a
-# body; that single definition is returned.
-# ---
-# irmod: IR module whose functions are searched
-# name:  the symbol name to match against function names
-# ret:   the defined function, or none when only extern stubs (or nothing) match
 fun function_defined_get(irmod: *ir.Module, name: intern.StrId) O.Option[*ir.Function] {
     var i: u32 = 0;
     for (i < irmod.function_len) {
@@ -1447,25 +1529,10 @@ fun function_defined_get(irmod: *ir.Module, name: intern.StrId) O.Option[*ir.Fun
     ret O.none[*ir.Function]();
 }
 
-# true when the IR module defines a (non-extern) function named `name`
-#
-# Such a mark gets GLOBAL linkage; a mark with no matching defined IR function
-# (an inline-asm label, or a name only referenced through an extern stub) stays
-# local.
-# ---
-# irmod: IR module whose functions are searched
-# name:  the symbol name to match against function names
-# ret:   true when some function of that name is defined (has a body)
 fun function_is_defined(irmod: *ir.Module, name: intern.StrId) bool {
     ret O.is_some[*ir.Function](function_defined_get(irmod, name));
 }
 
-# the object section name a `#[section("...")]` decorator places the defined
-# function `name` in, or STR_NIL for the default `.text`
-# ---
-# irmod: IR module whose functions are searched
-# name:  the symbol name to match against function names
-# ret:   the decorator's interned section name, or STR_NIL
 fun function_section_name(irmod: *ir.Module, name: intern.StrId) intern.StrId {
     val opt_fn: O.Option[*ir.Function] = function_defined_get(irmod, name);
     if (O.is_none[*ir.Function](opt_fn)) { ret intern.STR_NIL; }
@@ -1473,14 +1540,6 @@ fun function_section_name(irmod: *ir.Module, name: intern.StrId) intern.StrId {
     ret fn.section;
 }
 
-# true when the IR module defines a function named `name` with `FN_FLAG_WEAK` set
-#
-# A weak definition is a monomorphized generic instance emitted into every using
-# object, deduped to one by the linker through weak linkage.
-# ---
-# irmod: IR module whose functions are searched
-# name:  the symbol name to match against function names
-# ret:   true when the named function is a weak (instance) definition
 fun function_is_weak(irmod: *ir.Module, name: intern.StrId) bool {
     val opt_fn: O.Option[*ir.Function] = function_defined_get(irmod, name);
     if (O.is_none[*ir.Function](opt_fn)) { ret false; }
@@ -1488,11 +1547,6 @@ fun function_is_weak(irmod: *ir.Module, name: intern.StrId) bool {
     ret (fn.flags & ir.FN_FLAG_WEAK) != 0;
 }
 
-# true when IR type `id` is a 32-bit float
-# ---
-# types: IR type table the id resolves against
-# id:    the IR type id to test
-# ret:   true when `id` resolves to a 32-bit float type
 fun is_f32_type(types: *type.IrTypeTable, id: type.IrTypeId) bool {
     val opt_type: O.Option[*type.IrType] = type.get(types, id);
     if (O.is_none[*type.IrType](opt_type)) { ret false; }
@@ -1500,11 +1554,36 @@ fun is_f32_type(types: *type.IrTypeTable, id: type.IrTypeId) bool {
     ret t.kind == type.IRT_FLOAT && t.data.bits == 32;
 }
 
-# pack_rows re-homes each retained PC<->source row into its final section and offset
-# under `#[section(...)]` excision: a row inside the sectioned range moves to that
-# section at its section-relative offset, and a `.text` row after the excised range
-# shifts down by its length - the same site_placed mapping symbols use, so a row's
-# final offset matches the final `.text`
+test "mach.lang.be.codegen.section_placement_plan:sorts_and_rejects_invalid_extents" {
+    var placements: [3]SectionPlacement;
+    var count: u32 = 0;
+    if (R.is_err[R.Void, str](section_placement_plan(?placements[0], ?count, 3,
+        3::intern.StrId, 16, 4, 32))) { ret 1; }
+    if (R.is_err[R.Void, str](section_placement_plan(?placements[0], ?count, 3,
+        1::intern.StrId, 0, 8, 32))) { ret 2; }
+    if (R.is_err[R.Void, str](section_placement_plan(?placements[0], ?count, 3,
+        2::intern.StrId, 8, 8, 32))) { ret 3; }
+    if (count != 3) { ret 4; }
+    if (placements[0].text_start != 0 || placements[0].text_end != 8
+        || placements[0].name != 1::intern.StrId) { ret 5; }
+    if (placements[1].text_start != 8 || placements[1].text_end != 16
+        || placements[1].name != 2::intern.StrId) { ret 6; }
+    if (placements[2].text_start != 16 || placements[2].text_end != 20
+        || placements[2].name != 3::intern.StrId) { ret 7; }
+
+    var bad_count: u32 = count;
+    if (R.is_ok[R.Void, str](section_placement_plan(?placements[0], ?bad_count, 3,
+        4::intern.StrId, 20, 1, 32))) { ret 8; }
+    bad_count = 1;
+    if (R.is_ok[R.Void, str](section_placement_plan(?placements[0], ?bad_count, 3,
+        4::intern.StrId, 7, 2, 32))) { ret 9; }
+    if (R.is_ok[R.Void, str](section_placement_plan(?placements[0], ?bad_count, 3,
+        4::intern.StrId, 31, 2, 32))) { ret 10; }
+    if (R.is_ok[R.Void, str](section_placement_plan(?placements[0], ?bad_count, 3,
+        4::intern.StrId, 20, 0, 32))) { ret 11; }
+    ret 0;
+}
+
 test "mach.lang.be.codegen.pack_rows:rehomes_sectioned_and_text" {
     var rows: [3]encode.LineRow;
     rows[0].text_offset = 0;  rows[0].sec = 0; rows[0].loc = source.loc(1, 100);
@@ -1515,28 +1594,187 @@ test "mach.lang.be.codegen.pack_rows:rehomes_sectioned_and_text" {
     enc.rows      = ?rows[0];
     enc.row_count = 3;
 
-    # one sectioned function occupying the encoder blob range [8, 16), homed to section 5.
     var pls: [1]SectionPlacement;
     pls[0].text_start = 8; pls[0].text_end = 16; pls[0].sec = 5;
+    var text_layout: TextLayout;
+    text_layout.placements      = ?pls[0];
+    text_layout.placement_count = 1;
+    text_layout.placement_cap   = 1;
+    text_layout.text_len        = 24;
+    text_layout.text_sec        = 1;
 
-    pack_rows(?enc, ?pls[0], 1, 1);
+    pack_rows(?enc, ?text_layout);
 
-    # blob 0: `.text`, nothing excised below -> section 1, offset unchanged.
     if (enc.rows[0].sec != 1 || enc.rows[0].text_offset != 0)  { ret 1; }
-    # blob 10: inside [8, 16) -> section 5 at offset 10 - 8 = 2.
     if (enc.rows[1].sec != 5 || enc.rows[1].text_offset != 2)  { ret 1; }
-    # blob 20: `.text` after the 8-byte excised range -> section 1 at offset 20 - 8 = 12.
     if (enc.rows[2].sec != 1 || enc.rows[2].text_offset != 12) { ret 1; }
     ret 0;
 }
 
-# embed dedup: an embed global whose bytes, length, section, kind, and alignment
-# all match an already-packed embed reuses that section; content, section, and
-# alignment differences each keep it separate (#2507)
-#
-# Structural, so it holds for every object format: the decision is made against
-# the format-neutral ObjectImage, before any writer sees it. That matters for the
-# targets whose emission cannot be executed on the build host.
+fun t_pair_traits(kind: of.RelocKind, section_kind: of.SectionKind,
+                  codegen_image: bool) R.Result[reloc.RelocTraits, reloc.RelocError] {
+    if (kind != of.RK_PCREL_HI20 && kind != of.RK_PCREL_LO12_I) {
+        ret R.err[reloc.RelocTraits, reloc.RelocError](reloc.RELOC_UNSUPPORTED);
+    }
+    ret R.ok[reloc.RelocTraits, reloc.RelocError](
+        reloc.traits(4, reloc.RELOC_ADDEND_SYMBOL, 0, 0));
+}
+
+test "mach.lang.be.codegen.pack_relocs:carries_the_encoder_pair_index_to_the_image" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    fin { session.dnit(?s); }
+
+    val hi_name: R.Result[intern.StrId, str] = intern.intern(?s.interner, "pair_target");
+    val lo_name: R.Result[intern.StrId, str] = intern.intern(?s.interner, ".Lpcrel_hi.0");
+    val img_name: R.Result[intern.StrId, str] = intern.intern(?s.interner, "pairs.o");
+    if (R.is_err[intern.StrId, str](hi_name) || R.is_err[intern.StrId, str](lo_name)
+        || R.is_err[intern.StrId, str](img_name)) { ret 2; }
+
+    var relocations: [2]encode.PendingReloc;
+    relocations[0].offset = 0; relocations[0].kind = of.RK_PCREL_HI20;
+    relocations[0].sym = R.unwrap_ok[intern.StrId, str](hi_name);
+    relocations[0].addend = 0; relocations[0].pair = 0;
+    relocations[1].offset = 4; relocations[1].kind = of.RK_PCREL_LO12_I;
+    relocations[1].sym = R.unwrap_ok[intern.StrId, str](lo_name);
+    relocations[1].addend = 0; relocations[1].pair = 1;
+
+    var text: [8]u8;
+    var enc: encode.EncoderOutput;
+    enc.text        = ?text[0];
+    enc.text_len    = 8;
+    enc.relocations = ?relocations[0];
+    enc.reloc_count = 2;
+
+    var text_layout: TextLayout;
+    text_layout.placements      = nil;
+    text_layout.placement_count = 0;
+    text_layout.placement_cap   = 0;
+    text_layout.text_len        = 8;
+    text_layout.text_sec        = 1;
+
+    var seam: isa.RelocSeam = isa.reloc_seam(nil, t_pair_traits, nil);
+    var machine: isa.RegMachine = t_placement_machine();
+    var model: isa.MachineModel;
+    var vt: isa.IsaVTable = isa.machine_isa(isa.ARCH_UNKNOWN, "pairprobe", 0, 8,
+                                            ?model, ?machine, ?seam);
+    var tgt: resolved.Target;
+    tgt.isa = ?vt;
+
+    var deferred: obj.DeferredRelocs = obj.deferred_init(?alloc);
+    fin { obj.deferred_dnit(?deferred); }
+
+    if (R.is_err[R.Void, str](pack_relocs(?tgt, ?deferred, ?enc, ?text_layout))) { ret 3; }
+    if (deferred.count != 2)         { ret 4; }
+    if (deferred.items[0].pair != 0) { ret 5; }
+    if (deferred.items[1].pair != 1) { ret 6; }
+
+    var image: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](
+        obj.init(?alloc, ?s.interner, R.unwrap_ok[intern.StrId, str](img_name)));
+    var standin: of.Relocation;
+    standin.section = 0; standin.offset = 0; standin.kind = of.RK_ABS64;
+    standin.sym = 0; standin.addend = 0; standin.sym2 = of.SYMBOL_NONE; standin.pair = 0;
+    if (R.is_err[R.Void, str](obj.add_relocation(?image, standin))) { ret 7; }
+
+    if (R.is_err[R.Void, str](obj.flush_deferred(?image, ?deferred))) { ret 8; }
+    if (image.reloc_count != 3)          { ret 9; }
+    if (image.relocations[1].pair != 0)  { ret 10; }
+    if (image.relocations[2].pair != 2)  { ret 11; }
+    if (image.relocations[image.relocations[2].pair - 1].kind != of.RK_PCREL_HI20) { ret 12; }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.text_layout:preflights_points_and_half_open_ranges" {
+    var placements: [1]SectionPlacement;
+    placements[0].text_start = 8;
+    placements[0].text_end   = 16;
+    placements[0].sec        = 5;
+
+    var text_layout: TextLayout;
+    text_layout.placements      = ?placements[0];
+    text_layout.placement_count = 1;
+    text_layout.placement_cap   = 1;
+    text_layout.text_len        = 24;
+    text_layout.text_sec        = 1;
+
+    var symbols: [3]encode.SymbolMark;
+    symbols[0].offset = 0;  symbols[0].size = 8;
+    symbols[1].offset = 8;  symbols[1].size = 8;
+    symbols[2].offset = 16; symbols[2].size = 8;
+
+    var frames: [1]of.FrameUnwind;
+    frames[0].offset = 24;
+    frames[0].step_count = 0;
+
+    var relocations: [1]encode.PendingReloc;
+    relocations[0].offset = 8;
+    relocations[0].kind = of.RK_PC32;
+
+    var rows: [2]encode.LineRow;
+    rows[0].text_offset = 0;
+    rows[1].text_offset = 24;
+
+    var varlocs: [2]encode.VarLoc;
+    varlocs[0].text_offset = 8;  varlocs[0].end_offset = 16;
+    varlocs[1].text_offset = 16; varlocs[1].end_offset = 20;
+
+    var inline_pcs: [1]encode.InlinePc;
+    inline_pcs[0].text_offset = 15;
+
+    var text: [24]u8;
+    var enc: encode.EncoderOutput;
+    enc.text            = ?text[0];
+    enc.text_len        = 24;
+    enc.symbols         = ?symbols[0];
+    enc.symbol_count    = 3;
+    enc.frames          = ?frames[0];
+    enc.frame_count     = 1;
+    enc.relocations     = ?relocations[0];
+    enc.reloc_count     = 1;
+    enc.rows            = ?rows[0];
+    enc.row_count       = 2;
+    enc.varlocs         = ?varlocs[0];
+    enc.varloc_count    = 2;
+    enc.inline_pcs      = ?inline_pcs[0];
+    enc.inline_pc_count = 1;
+
+    if (R.is_err[R.Void, str](validate_encoder_output(?enc))) { ret 1; }
+    if (R.is_err[R.Void, str](validate_text_metadata(?text_layout, ?enc))) { ret 2; }
+
+    varlocs[0].end_offset = 17;
+    if (R.is_ok[R.Void, str](validate_text_metadata(?text_layout, ?enc))) { ret 3; }
+    varlocs[0].end_offset = 7;
+    if (R.is_ok[R.Void, str](validate_text_metadata(?text_layout, ?enc))) { ret 4; }
+    varlocs[0].end_offset = 16;
+
+    rows[1].text_offset = 25;
+    if (R.is_ok[R.Void, str](validate_text_metadata(?text_layout, ?enc))) { ret 5; }
+    rows[1].text_offset = 24;
+
+    inline_pcs[0].text_offset = 24;
+    if (R.is_ok[R.Void, str](validate_text_metadata(?text_layout, ?enc))) { ret 6; }
+    inline_pcs[0].text_offset = 15;
+
+    symbols[0].offset = 4;
+    if (R.is_ok[R.Void, str](validate_text_metadata(?text_layout, ?enc))) { ret 7; }
+    symbols[0].offset = 0;
+
+    relocations[0].offset = 24;
+    if (R.is_ok[R.Void, str](validate_text_metadata(?text_layout, ?enc))) { ret 8; }
+    relocations[0].offset = 8;
+
+    pack_rows(?enc, ?text_layout);
+    if (rows[0].sec != 1 || rows[0].text_offset != 0
+        || rows[1].sec != 1 || rows[1].text_offset != 16) { ret 9; }
+    if (varlocs[0].sec != 5 || varlocs[0].text_offset != 0 || varlocs[0].end_offset != 8
+        || varlocs[1].sec != 1 || varlocs[1].text_offset != 8 || varlocs[1].end_offset != 12) { ret 10; }
+    if (inline_pcs[0].sec != 5 || inline_pcs[0].text_offset != 7) { ret 11; }
+    ret 0;
+}
+
 test "mach.lang.be.codegen.embed_section_of:shares_only_on_a_full_match" {
     val rodata: intern.StrId = 7::intern.StrId;
     val other:  intern.StrId = 9::intern.StrId;
@@ -1546,7 +1784,6 @@ test "mach.lang.be.codegen.embed_section_of:shares_only_on_a_full_match" {
     var xyz: [3]u8;
     xyz[0] = 'x'; xyz[1] = 'y'; xyz[2] = 'z';
 
-    # the image already holds the first embed's placement, plus its defining symbol.
     var secs: [1]of.Section;
     secs[0].name  = rodata;
     secs[0].kind  = of.SK_RODATA;
@@ -1577,24 +1814,17 @@ test "mach.lang.be.codegen.embed_section_of:shares_only_on_a_full_match" {
     var irmod: ir.Module;
     irmod.globals = ?globals[0];
 
-    # identical in every axis: shares the placement.
     if (embed_section_of(?image, ?irmod, 1, ?abc[0], 3, rodata, of.SK_RODATA, 8) != 0) { ret 1; }
 
-    # different content of the same length: its own placement.
     if (embed_section_of(?image, ?irmod, 1, ?xyz[0], 3, rodata, of.SK_RODATA, 8) != -1) { ret 1; }
 
-    # a stricter alignment must not inherit the existing section's weaker one.
     if (embed_section_of(?image, ?irmod, 1, ?abc[0], 3, rodata, of.SK_RODATA, 64) != -1) { ret 1; }
 
-    # a `#[section(...)]` override puts it elsewhere.
     if (embed_section_of(?image, ?irmod, 1, ?abc[0], 3, other, of.SK_RODATA, 8) != -1) { ret 1; }
 
-    # a non-embed global is never a dedup candidate, however identical its bytes.
     globals[0].is_embed = false;
     if (embed_section_of(?image, ?irmod, 1, ?abc[0], 3, rodata, of.SK_RODATA, 8) != -1) { ret 1; }
 
-    # an empty embed is still a present read-only initializer, and two empty
-    # embeds share the same zero-length placement without dereferencing nil.
     globals[0].is_embed       = true;
     globals[0].init           = value.const_bytes(nil, 0, 0::type.IrTypeId);
     secs[0].bytes              = nil;
@@ -1602,5 +1832,473 @@ test "mach.lang.be.codegen.embed_section_of:shares_only_on_a_full_match" {
     syms[0].size               = 0;
     if (embed_section_of(?image, ?irmod, 1, nil, 0, rodata, of.SK_RODATA, 8) != 0) { ret 1; }
 
+    ret 0;
+}
+
+test "mach.lang.be.codegen.pack_symbols:function_size_survives_an_intervening_gap" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+
+    var itn: intern.Interner = intern.init(?alloc);
+
+    val ir_r: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](ir_r)) { ret 1; }
+    var irmod: ir.Module = R.unwrap_ok[ir.Module, str](ir_r);
+
+    val na: R.Result[intern.StrId, str] = intern.intern(?itn, "fn_a");
+    val nb: R.Result[intern.StrId, str] = intern.intern(?itn, "fn_b");
+    if (R.is_err[intern.StrId, str](na) || R.is_err[intern.StrId, str](nb)) { ir.dnit(?irmod); ret 1; }
+
+    var marks: [2]encode.SymbolMark;
+    marks[0].name   = R.unwrap_ok[intern.StrId, str](na);
+    marks[0].offset = 0;
+    marks[0].size   = 10;
+    marks[0].flags  = of.SYM_OBJ_FLAG_FUNCTION;
+    marks[1].name   = R.unwrap_ok[intern.StrId, str](nb);
+    marks[1].offset = 20;
+    marks[1].size   = 8;
+    marks[1].flags  = of.SYM_OBJ_FLAG_FUNCTION;
+
+    var enc: encode.EncoderOutput;
+    enc.symbols      = ?marks[0];
+    enc.symbol_count = 2;
+
+    var image: of.ObjectImage = of.object_image_init(?alloc, nil, intern.STR_NIL);
+    var text_layout: TextLayout;
+    text_layout.placements      = nil;
+    text_layout.placement_count = 0;
+    text_layout.placement_cap   = 0;
+    text_layout.text_len        = 28;
+    text_layout.text_sec        = 0;
+
+    val pr: R.Result[R.Void, str] = pack_symbols(?image, ?irmod, ?enc, ?text_layout);
+    ir.dnit(?irmod);
+    if (R.is_err[R.Void, str](pr)) { obj.dnit(?image); ret 1; }
+
+    var bad: i32 = 0;
+    if (image.symbol_count != 2)          { bad = 1; }
+    if (image.symbols[0].offset != 0)     { bad = 2; }
+    if (image.symbols[0].size != 10)      { bad = 3; }
+    if (image.symbols[1].offset != 20)    { bad = 4; }
+    if (image.symbols[1].size != 8)       { bad = 5; }
+    obj.dnit(?image);
+    ret bad;
+}
+
+rec CgTrackEntry {
+    p:    ptr;
+    size: usize;
+    live: bool;
+}
+
+rec CgTracker {
+    entries:  *CgTrackEntry;
+    cap:      u32;
+    count:    u32;
+    live:     u32;
+    mismatch: bool;
+}
+
+fun cg_track_record(t: *CgTracker, p: ptr, size: usize) {
+    if (t.count >= t.cap) { ret; }
+    t.entries[t.count].p    = p;
+    t.entries[t.count].size = size;
+    t.entries[t.count].live = true;
+    t.count = t.count + 1;
+    t.live  = t.live + 1;
+}
+
+fun cg_track_find(t: *CgTracker, p: ptr) i64 {
+    var i: u32 = 0;
+    for (i < t.count) {
+        if (t.entries[i].live && t.entries[i].p == p) { ret i::i64; }
+        i = i + 1;
+    }
+    ret 0 - 1;
+}
+
+fun cg_track_allocate(ctx: ptr, size: usize, align: usize) O.Option[ptr] {
+    val t: *CgTracker = ctx::*CgTracker;
+    val p: ptr = os.allocate(size);
+    if (p == nil) { ret O.none[ptr](); }
+    memory.raw_fill(p, 0xAA, size);
+    cg_track_record(t, p, size);
+    ret O.some[ptr](p);
+}
+
+fun cg_track_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
+    if (p == nil || size == 0) { ret 0; }
+    val t: *CgTracker = ctx::*CgTracker;
+    val idx: i64 = cg_track_find(t, p);
+    if (idx < 0) { t.mismatch = true; ret 0; }
+    if (t.entries[idx::u32].size != size) { t.mismatch = true; }
+    t.entries[idx::u32].live = false;
+    t.live = t.live - 1;
+    ret os.deallocate(p, size);
+}
+
+fun cg_track_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) O.Option[ptr] {
+    if (p == nil) { ret cg_track_allocate(ctx, new_size, align); }
+    val t: *CgTracker = ctx::*CgTracker;
+    val idx: i64 = cg_track_find(t, p);
+    if (idx < 0) { t.mismatch = true; }
+    or { if (t.entries[idx::u32].size != old_size) { t.mismatch = true; } }
+    val np: ptr = os.reallocate(p, old_size, new_size);
+    if (np == nil) { ret O.none[ptr](); }
+    if (new_size > old_size) { memory.raw_fill((np::usize + old_size)::ptr, 0xAA, new_size - old_size); }
+    if (idx < 0) { cg_track_record(t, np, new_size); }
+    or {
+        t.entries[idx::u32].p    = np;
+        t.entries[idx::u32].size = new_size;
+    }
+    ret O.some[ptr](np);
+}
+
+test "mach.lang.be.codegen.encoder_output_dnit:frees_the_complete_exact_owner" {
+    var page_alloc: A.Allocator;
+    page.make(?page_alloc);
+
+    var tracker: CgTracker;
+    val res_entries: R.Result[*CgTrackEntry, str] = A.allocate[CgTrackEntry](?page_alloc, 64::usize);
+    if (R.is_err[*CgTrackEntry, str](res_entries)) { ret 1; }
+    tracker.entries  = R.unwrap_ok[*CgTrackEntry, str](res_entries);
+    tracker.cap      = 64;
+    tracker.count    = 0;
+    tracker.live     = 0;
+    tracker.mismatch = false;
+
+    var tp: *CgTracker = ?tracker;
+    var alloc: A.Allocator;
+    alloc.ctx           = tp::ptr;
+    alloc.fn_allocate   = cg_track_allocate;
+    alloc.fn_reallocate = cg_track_reallocate;
+    alloc.fn_deallocate = cg_track_deallocate;
+
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var enc: encode.EncoderOutput;
+    val rtext: R.Result[*u8, str] = A.allocate[u8](?alloc, 11::usize);
+    if (R.is_err[*u8, str](rtext)) { session.dnit(?s); ret 1; }
+    enc.text = R.unwrap_ok[*u8, str](rtext);
+    enc.text_len = 11;
+
+    val rconsts: R.Result[*encode.ConstEntry, str] = A.allocate[encode.ConstEntry](?alloc, 1::usize);
+    if (R.is_err[*encode.ConstEntry, str](rconsts)) { session.dnit(?s); ret 1; }
+    enc.consts = R.unwrap_ok[*encode.ConstEntry, str](rconsts);
+    enc.const_count = 1;
+    val rconst_bytes: R.Result[*u8, str] = A.allocate[u8](?alloc, 13::usize);
+    if (R.is_err[*u8, str](rconst_bytes)) { session.dnit(?s); ret 1; }
+    enc.consts[0].bytes = R.unwrap_ok[*u8, str](rconst_bytes);
+    enc.consts[0].len = 13;
+
+    val rsym: R.Result[*encode.SymbolMark, str] = A.allocate[encode.SymbolMark](?alloc, 2::usize);
+    if (R.is_err[*encode.SymbolMark, str](rsym)) { session.dnit(?s); ret 1; }
+    enc.symbols = R.unwrap_ok[*encode.SymbolMark, str](rsym);
+    enc.symbol_count = 2;
+
+    val rrel: R.Result[*encode.PendingReloc, str] = A.allocate[encode.PendingReloc](?alloc, 3::usize);
+    if (R.is_err[*encode.PendingReloc, str](rrel)) { session.dnit(?s); ret 1; }
+    enc.relocations = R.unwrap_ok[*encode.PendingReloc, str](rrel);
+    enc.reloc_count = 3;
+
+    val rrow: R.Result[*encode.LineRow, str] = A.allocate[encode.LineRow](?alloc, 4::usize);
+    if (R.is_err[*encode.LineRow, str](rrow)) { session.dnit(?s); ret 1; }
+    enc.rows = R.unwrap_ok[*encode.LineRow, str](rrow);
+    enc.row_count = 4;
+
+    val rvl: R.Result[*encode.VarLoc, str] = A.allocate[encode.VarLoc](?alloc, 5::usize);
+    if (R.is_err[*encode.VarLoc, str](rvl)) { session.dnit(?s); ret 1; }
+    enc.varlocs = R.unwrap_ok[*encode.VarLoc, str](rvl);
+    enc.varloc_count = 5;
+
+    val rip: R.Result[*encode.InlinePc, str] = A.allocate[encode.InlinePc](?alloc, 6::usize);
+    if (R.is_err[*encode.InlinePc, str](rip)) { session.dnit(?s); ret 1; }
+    enc.inline_pcs = R.unwrap_ok[*encode.InlinePc, str](rip);
+    enc.inline_pc_count = 6;
+
+    val rfr: R.Result[*of.FrameUnwind, str] = A.allocate[of.FrameUnwind](?alloc, 7::usize);
+    if (R.is_err[*of.FrameUnwind, str](rfr)) { session.dnit(?s); ret 1; }
+    enc.frames = R.unwrap_ok[*of.FrameUnwind, str](rfr);
+    enc.frame_count = 7;
+
+    encoder_output_dnit(?s, ?enc);
+
+    if (enc.text != nil || enc.text_len != 0)                  { session.dnit(?s); ret 1; }
+    if (enc.consts != nil || enc.const_count != 0)             { session.dnit(?s); ret 1; }
+    if (enc.symbols != nil || enc.symbol_count != 0)         { session.dnit(?s); ret 1; }
+    if (enc.relocations != nil || enc.reloc_count != 0)      { session.dnit(?s); ret 1; }
+    if (enc.rows != nil || enc.row_count != 0)                { session.dnit(?s); ret 1; }
+    if (enc.varlocs != nil || enc.varloc_count != 0)          { session.dnit(?s); ret 1; }
+    if (enc.inline_pcs != nil || enc.inline_pc_count != 0)    { session.dnit(?s); ret 1; }
+    if (enc.frames != nil || enc.frame_count != 0)            { session.dnit(?s); ret 1; }
+
+    session.dnit(?s);
+
+    if (tracker.mismatch)  { ret 1; }
+    if (tracker.live != 0) { ret 1; }
+
+    A.deallocate[CgTrackEntry](?page_alloc, tracker.entries, 64::usize);
+    ret 0;
+}
+
+fun t_placement_fixture(alloc: *A.Allocator) mir.MirFunction {
+    var f: mir.MirFunction;
+    val rb: R.Result[*mir.MirBlock, str] = A.zallocate[mir.MirBlock](alloc, 4::usize);
+    f.blocks      = R.unwrap_ok[*mir.MirBlock, str](rb);
+    f.block_count = 4;
+
+    val ro0: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](alloc, 2::usize);
+    val ops0: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](ro0);
+    ops0[0] = mir.op_block(1);
+    ops0[1] = mir.op_block(2);
+    val ri0: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](alloc, 1::usize);
+    val instrs0: *mir.MirInstr = R.unwrap_ok[*mir.MirInstr, str](ri0);
+    instrs0[0] = mir.instr(mir.MIR_CBR, ops0, 2, 0, 0);
+    f.blocks[0].id          = 0;
+    f.blocks[0].instrs      = instrs0;
+    f.blocks[0].instr_count = 1;
+
+    val ro1: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](alloc, 1::usize);
+    val ops1: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](ro1);
+    ops1[0] = mir.op_block(3);
+    val ri1: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](alloc, 1::usize);
+    val instrs1: *mir.MirInstr = R.unwrap_ok[*mir.MirInstr, str](ri1);
+    instrs1[0] = mir.instr(mir.MIR_BR, ops1, 1, 0, 0);
+    f.blocks[1].id          = 1;
+    f.blocks[1].instrs      = instrs1;
+    f.blocks[1].instr_count = 1;
+
+    val ri2: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](alloc, 1::usize);
+    val instrs2: *mir.MirInstr = R.unwrap_ok[*mir.MirInstr, str](ri2);
+    instrs2[0] = mir.instr(mir.MIR_UNREACHABLE, nil, 0, 0, 0);
+    f.blocks[2].id          = 2;
+    f.blocks[2].instrs      = instrs2;
+    f.blocks[2].instr_count = 1;
+
+    val ri3: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](alloc, 1::usize);
+    val instrs3: *mir.MirInstr = R.unwrap_ok[*mir.MirInstr, str](ri3);
+    instrs3[0] = mir.instr(mir.MIR_RET, nil, 0, 0, 0);
+    f.blocks[3].id          = 3;
+    f.blocks[3].instrs      = instrs3;
+    f.blocks[3].instr_count = 1;
+
+    ret f;
+}
+
+fun t_is_trap_stub(opcode: u32) bool {
+    ret opcode == mir.MIR_UNREACHABLE::u32;
+}
+
+fun t_is_reg_move_stub(opcode: u32) bool {
+    ret false;
+}
+
+fun t_placement_machine() isa.RegMachine {
+    ret isa.reg_machine(nil, nil, t_is_reg_move_stub, t_is_trap_stub,
+                        nil, 0, nil, 0,
+                        -1, -1,
+                        -1, -1, 0,
+                        -1, -1, -1);
+}
+
+test "mach.lang.be.codegen.apply_placement_policy:sinks_unreachable_block_after_hot_chain" {
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret 1; }
+
+    var machine: isa.RegMachine = t_placement_machine();
+    var tgt: target.Target;
+    tgt.arch = ?machine;
+    var f: mir.MirFunction = t_placement_fixture(?backing);
+    if (R.is_err[R.Void, str](compute_emission_order(?backing, ?f))) { ret 1; }
+
+    if (f.emit_order[0] != 0) { ret 1; }
+    if (f.emit_order[1] != 2) { ret 1; }
+    if (f.emit_order[2] != 1) { ret 1; }
+    if (f.emit_order[3] != 3) { ret 1; }
+
+    if (R.is_err[R.Void, str](apply_placement_policy(?backing, ?f, ?tgt))) { ret 1; }
+
+    if (f.emit_order[0] != 0) { ret 1; }
+    if (f.emit_order[1] != 1) { ret 1; }
+    if (f.emit_order[2] != 3) { ret 1; }
+    if (f.emit_order[3] != 2) { ret 1; }
+
+    ret 0;
+}
+
+test "mach.lang.be.codegen.apply_placement_policy:idempotent_on_an_already_placed_order" {
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret 1; }
+
+    var machine: isa.RegMachine = t_placement_machine();
+    var tgt: target.Target;
+    tgt.arch = ?machine;
+    var f: mir.MirFunction = t_placement_fixture(?backing);
+    if (R.is_err[R.Void, str](compute_emission_order(?backing, ?f))) { ret 1; }
+    if (R.is_err[R.Void, str](apply_placement_policy(?backing, ?f, ?tgt))) { ret 1; }
+    if (R.is_err[R.Void, str](apply_placement_policy(?backing, ?f, ?tgt))) { ret 1; }
+
+    if (f.emit_order[0] != 0) { ret 1; }
+    if (f.emit_order[1] != 1) { ret 1; }
+    if (f.emit_order[2] != 3) { ret 1; }
+    if (f.emit_order[3] != 2) { ret 1; }
+
+    ret 0;
+}
+
+fun t_placement_cold_entry_fixture(alloc: *A.Allocator) mir.MirFunction {
+    var f: mir.MirFunction;
+    val rb: R.Result[*mir.MirBlock, str] = A.zallocate[mir.MirBlock](alloc, 2::usize);
+    f.blocks      = R.unwrap_ok[*mir.MirBlock, str](rb);
+    f.block_count = 2;
+
+    val ri0: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](alloc, 1::usize);
+    val instrs0: *mir.MirInstr = R.unwrap_ok[*mir.MirInstr, str](ri0);
+    instrs0[0] = mir.instr(mir.MIR_UNREACHABLE, nil, 0, 0, 0);
+    f.blocks[0].id          = 0;
+    f.blocks[0].instrs      = instrs0;
+    f.blocks[0].instr_count = 1;
+
+    val ri1: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](alloc, 1::usize);
+    val instrs1: *mir.MirInstr = R.unwrap_ok[*mir.MirInstr, str](ri1);
+    instrs1[0] = mir.instr(mir.MIR_RET, nil, 0, 0, 0);
+    f.blocks[1].id          = 1;
+    f.blocks[1].instrs      = instrs1;
+    f.blocks[1].instr_count = 1;
+
+    ret f;
+}
+
+test "mach.lang.be.codegen.apply_placement_policy:never_moves_the_entry_out_of_first_position" {
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret 1; }
+
+    var machine: isa.RegMachine = t_placement_machine();
+    var tgt: target.Target;
+    tgt.arch = ?machine;
+    var f: mir.MirFunction = t_placement_cold_entry_fixture(?backing);
+    if (R.is_err[R.Void, str](compute_emission_order(?backing, ?f))) { ret 1; }
+    if (f.emit_order[0] != 0) { ret 1; }
+    if (f.emit_order[1] != 1) { ret 1; }
+
+    if (R.is_err[R.Void, str](apply_placement_policy(?backing, ?f, ?tgt))) { ret 1; }
+    if (f.emit_order[0] != 0) { ret 1; }
+    if (f.emit_order[1] != 1) { ret 1; }
+
+    ret 0;
+}
+
+fun t_emit_order_block2(alloc: *A.Allocator, id0: u32, id1: u32, id2: u32,
+                        pos1: u32, pos2: u32, first: u32, second: u32) mir.MirFunction {
+    var f: mir.MirFunction;
+    val rb: R.Result[*mir.MirBlock, str] = A.zallocate[mir.MirBlock](alloc, 3::usize);
+    f.blocks      = R.unwrap_ok[*mir.MirBlock, str](rb);
+    f.block_count = 3;
+
+    val ro: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](alloc, 2::usize);
+    val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](ro);
+    ops[0] = mir.op_block(first);
+    ops[1] = mir.op_block(second);
+
+    val ri: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](alloc, 1::usize);
+    val instrs: *mir.MirInstr = R.unwrap_ok[*mir.MirInstr, str](ri);
+    instrs[0] = mir.instr(mir.MIR_CBR, ops, 2, 0, 0);
+
+    f.blocks[0].id          = id0;
+    f.blocks[0].instrs      = instrs;
+    f.blocks[0].instr_count = 1;
+    f.blocks[pos1].id       = id1;
+    f.blocks[pos1].instr_count = 0;
+    f.blocks[pos2].id       = id2;
+    f.blocks[pos2].instr_count = 0;
+
+    ret f;
+}
+
+test "mach.lang.be.codegen.compute_emission_order:follows_operand_visit_order" {
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret 1; }
+
+    var fa: mir.MirFunction = t_emit_order_block2(?backing, 0, 1, 2, 1, 2, 1, 2);
+    if (R.is_err[R.Void, str](compute_emission_order(?backing, ?fa))) { ret 1; }
+    if (fa.emit_order[0] != 0) { ret 1; }
+    if (fa.emit_order[1] != 2) { ret 1; }
+    if (fa.emit_order[2] != 1) { ret 1; }
+
+    var fb: mir.MirFunction = t_emit_order_block2(?backing, 0, 1, 2, 1, 2, 2, 1);
+    if (R.is_err[R.Void, str](compute_emission_order(?backing, ?fb))) { ret 1; }
+    if (fb.emit_order[0] != 0) { ret 1; }
+    if (fb.emit_order[1] != 1) { ret 1; }
+    if (fb.emit_order[2] != 2) { ret 1; }
+
+    ret 0;
+}
+
+test "mach.lang.be.codegen.compute_emission_order:insensitive_to_block_id_and_array_position" {
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret 1; }
+
+    var fa: mir.MirFunction = t_emit_order_block2(?backing, 0, 1, 2, 1, 2, 1, 2);
+    if (R.is_err[R.Void, str](compute_emission_order(?backing, ?fa))) { ret 1; }
+    if (fa.blocks[fa.emit_order[0]].id != 0) { ret 1; }
+    if (fa.blocks[fa.emit_order[1]].id != 2) { ret 1; }
+    if (fa.blocks[fa.emit_order[2]].id != 1) { ret 1; }
+
+    var fb: mir.MirFunction = t_emit_order_block2(?backing, 0, 9, 4, 2, 1, 9, 4);
+    if (R.is_err[R.Void, str](compute_emission_order(?backing, ?fb))) { ret 1; }
+    if (fb.blocks[fb.emit_order[0]].id != 0) { ret 1; }
+    if (fb.blocks[fb.emit_order[1]].id != 4) { ret 1; }
+    if (fb.blocks[fb.emit_order[2]].id != 9) { ret 1; }
+
+    var fc: mir.MirFunction = t_emit_order_block2(?backing, 0, 9, 4, 1, 2, 9, 4);
+    if (R.is_err[R.Void, str](compute_emission_order(?backing, ?fc))) { ret 1; }
+    if (fc.blocks[fc.emit_order[0]].id != 0) { ret 1; }
+    if (fc.blocks[fc.emit_order[1]].id != 4) { ret 1; }
+    if (fc.blocks[fc.emit_order[2]].id != 9) { ret 1; }
+
+    ret 0;
+}
+
+test "mach.lang.be.codegen.finish_codegen_image:publishes_only_valid_owned_images" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var itn: intern.Interner = intern.init(?alloc);
+
+    val empty_r: R.Result[of.ObjectImage, str] = obj.init(?alloc, ?itn, intern.STR_NIL);
+    if (R.is_err[of.ObjectImage, str](empty_r)) { intern.dnit(?itn); ret 1; }
+    val published_r: R.Result[of.ObjectImage, str] =
+        finish_codegen_image(R.unwrap_ok[of.ObjectImage, str](empty_r));
+    if (R.is_err[of.ObjectImage, str](published_r)) { intern.dnit(?itn); ret 1; }
+    var published: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](published_r);
+    obj.dnit(?published);
+
+    val malformed_r: R.Result[of.ObjectImage, str] = obj.init(?alloc, ?itn, intern.STR_NIL);
+    if (R.is_err[of.ObjectImage, str](malformed_r)) { intern.dnit(?itn); ret 1; }
+    var malformed: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](malformed_r);
+    val bytes_r: R.Result[*u8, str] = A.allocate[u8](?alloc, 4::usize);
+    if (R.is_err[*u8, str](bytes_r)) { obj.dnit(?malformed); intern.dnit(?itn); ret 1; }
+    var sec: of.Section;
+    sec.name = intern.STR_NIL;
+    sec.kind = of.SK_TEXT;
+    sec.bytes = R.unwrap_ok[*u8, str](bytes_r);
+    sec.len = 4;
+    sec.align = 3;
+    sec.flags = 0;
+    if (R.is_err[u32, str](obj.install_section(?malformed, ?sec))) {
+        obj.dnit(?malformed);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val rejected: R.Result[of.ObjectImage, str] = finish_codegen_image(malformed);
+    if (R.is_ok[of.ObjectImage, str](rejected)) {
+        var unexpected: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](rejected);
+        obj.dnit(?unexpected);
+        intern.dnit(?itn);
+        ret 1;
+    }
+
+    intern.dnit(?itn);
     ret 0;
 }

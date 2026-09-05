@@ -1,21 +1,3 @@
-# the composed intent for one build invocation: `BuildRequest`, its composition,
-# and its serialized identity
-#
-# A request carries decisions, not ingredients: `compose` owns all precedence
-# (manifest default < profile < invoker), so every field is the settled answer
-# and no field records how it was decided. Per-unit facts - an expanded output
-# template, a link token resolved against a target's library directories - stay
-# plan-side and are never stored here. The CLI composes a request per build
-# unit; a matrix cell derivation or an embedding consumer (LSP, tooling)
-# constructs one through the same helper or directly. Immutable once composed.
-#
-# The compose seam: composition consumes the parsed `manifest.Manifest` plus
-# the interner it was interned into - not the driver's ProjectConfig, which is
-# a per-unit synthesis produced DURING project build and so cannot exist before
-# the request that drives it. The manifest is loaded once by the command layer
-# and handed forward: compose reads it here, the driver builds the project from
-# the same parsed value, and nothing downstream re-parses it.
-
 use std.allocator.page;
 use std.collections.vector;
 use std.collections.vector.Vector;
@@ -38,53 +20,16 @@ use O: std.types.option;
 use R: std.types.result;
 use sys: std.system.os;
 
+use mach.lang.build.fingerprint;
 use mach.lang.build.outcome;
 use mach.lang.intern;
 use mach.lang.manifest;
 use mach.lang.me.pipeline;
 use mach.lang.target.of;
 
-# the parsed command line shared across subcommands - the raw invoker choices
-# `compose` settles into a BuildRequest
-#
-# The record lives here so composition never reaches above the lang layer; the
-# parser that fills it from argv stays in the CLI's args module (the one module
-# that reads argv), which re-exports this type under its old spelling.
-# ---
-# verbosity:   readout detail level: 0 plain, 1 (`-v`), 2 (`-vv`)
-# quiet:       --quiet / -q was passed; suppress non-error output
-# verify_ir:   --verify-ir was passed; run the IR verifier after each optimization pass
-# target:      selected target name (nil when --target was not given)
-# output:      -o override for the linked binary path, rooted at the project
-#              root (nil = use the target's `binary` from mach.toml)
-# emit_asm:    --emit-asm was passed; emit per-module human-readable assembly
-#              text (`.s`) alongside each object, for debugging / transparency
-# emit_ir:     --emit-ir was passed; emit per-module human-readable SSA IR text
-#              (`.ir`) alongside each object - the final post-pipeline IR the
-#              object is built from, so it varies with the optimization level
-# profile:     --profile <name> selected build profile (nil when not given)
-# bin:         --bin <name> narrows a build to one `kind = "bin"` artifact (nil
-#              when not given)
-# lib:         --lib <name> narrows a build to one library artifact (nil
-#              when not given)
-# all_targets: --all-targets was passed; build every declared target rather
-#              than the manifest default
-# pie:         --pie was passed; emit a position-independent (ET_DYN) executable
-# subsystem:   raw `--subsystem` value (nil when not given); compose validates it
-# g:           -g was passed; force debug-info emission on for this invocation
-# opt_set:     an explicit `-O0`/`-O1`/`-O2` was passed (a per-invocation
-#              override that wins over the profile's `opt`)
-# opt_release: the explicit level names the release pipeline (`-O1`/`-O2`)
-# jobs:        raw `--jobs` value (nil when not given); compose validates it
-# include_deps: --include-deps was passed; widen test collection to dependency
-#              modules
-# link_tokens: link-input tokens (`-l` values and bare link-file path
-#              positionals) in invocation order
-# lib_dirs:    `-L` link search directories in invocation order
 pub rec CliArgs {
     verbosity:   u8;
     quiet:       bool;
-    verify_ir:   bool;
     target:      *u8;
     output:      *u8;
     emit_asm:    bool;
@@ -104,15 +49,6 @@ pub rec CliArgs {
     lib_dirs:     Vector[*u8];
 }
 
-# whether a link-input token denotes an explicit file path rather than a bare
-# `-l`-style library name
-#
-# A token is treated as a path when it contains a '/' (any directory component)
-# or names an object, archive, or target-format shared library. The `.obj` and
-# `.lib` spellings are the conventional COFF equivalents of `.o` and `.a`.
-# ---
-# tok: the token to classify
-# ret: true when `tok` is an explicit link-file path
 pub fun is_object_path(tok: *u8) bool {
     if (tok == nil || str_empty(tok::str)) { ret false; }
     if (path.has_separator(tok::str))      { ret true; }
@@ -124,7 +60,6 @@ pub fun is_object_path(tok: *u8) bool {
         || str_ends_with(tok::str, ".so") || str_contains(tok::str, ".so.");
 }
 
-# whether `text` ends in `suffix`, folding ASCII letter case
 fun ascii_suffix_equals(text: *u8, suffix: *u8) bool {
     val text_len: usize = str_len(text::str);
     val suffix_len: usize = str_len(suffix::str);
@@ -143,78 +78,80 @@ fun ascii_suffix_equals(text: *u8, suffix: *u8) bool {
     ret true;
 }
 
-# the `--subsystem` selection, before any artifact is bound
-#
-# `compose` validates the flag but cannot settle it: an invocation may name a
-# whole matrix, so no artifact - and therefore no manifest `subsystem` key - is
-# resolved yet. The planner binds each cell's artifact and settles the flag
-# against it, the same split `-o` takes against the artifact's `out` template.
 pub def SubsystemFlag: u8;
 
 pub val SUBSYSTEM_FLAG_NONE:    SubsystemFlag = 0;
 pub val SUBSYSTEM_FLAG_CONSOLE: SubsystemFlag = 1;
 pub val SUBSYSTEM_FLAG_GUI:     SubsystemFlag = 2;
 
-# what the build produces
+rec SubsystemFlagSpec {
+    flag:            SubsystemFlag;
+    resolved:        of.Subsystem;
+    fingerprint_tag: u8;
+}
+
+val SUBSYSTEM_FLAG_N: usize = 2;
+val SUBSYSTEM_FLAGS: [SUBSYSTEM_FLAG_N]SubsystemFlagSpec = [SUBSYSTEM_FLAG_N]SubsystemFlagSpec{
+    SubsystemFlagSpec{ flag: SUBSYSTEM_FLAG_CONSOLE, resolved: of.SUBSYSTEM_CONSOLE, fingerprint_tag: 1 },
+    SubsystemFlagSpec{ flag: SUBSYSTEM_FLAG_GUI,     resolved: of.SUBSYSTEM_GUI,     fingerprint_tag: 2 },
+};
+
+pub fun subsystem_flag_from_name(name: str) O.Option[SubsystemFlag] {
+    val parsed: O.Option[of.Subsystem] = of.subsystem_from_name(name);
+    if (O.is_none[of.Subsystem](parsed)) { ret O.none[SubsystemFlag](); }
+    val s: of.Subsystem = O.unwrap[of.Subsystem](parsed);
+    var i: usize = 0;
+    for (i < SUBSYSTEM_FLAG_N) {
+        if (SUBSYSTEM_FLAGS[i].resolved == s) { ret O.some[SubsystemFlag](SUBSYSTEM_FLAGS[i].flag); }
+        i = i + 1;
+    }
+    ret O.none[SubsystemFlag]();
+}
+
+pub fun subsystem_from_flag(f: SubsystemFlag) O.Option[of.Subsystem] {
+    var i: usize = 0;
+    for (i < SUBSYSTEM_FLAG_N) {
+        if (SUBSYSTEM_FLAGS[i].flag == f) { ret O.some[of.Subsystem](SUBSYSTEM_FLAGS[i].resolved); }
+        i = i + 1;
+    }
+    ret O.none[of.Subsystem]();
+}
+
 pub def BuildGoal: u8;
 
-# link the selected artifact
 pub val GOAL_EXECUTE:   BuildGoal = 0;
 
-# per-module objects only
 pub val GOAL_OBJECTS:   BuildGoal = 1;
 
-# test dispatcher + artifact list
 pub val GOAL_TESTS:     BuildGoal = 2;
 
-# collect tests, build nothing
 pub val GOAL_TEST_LIST: BuildGoal = 3;
 
-# one link input as the invoker spelled it; the planner resolves it
-# ---
-# text: the token verbatim (`-l` value, or a bare link-file path)
+rec BuildGoalSpec {
+    goal:        BuildGoal;
+    display:     str;
+    emit_name:   str;
+    fingerprint_tag: u8;
+}
+
+val BUILD_GOAL_CATALOG_VERSION: u8 = 1;
+
+val BUILD_GOAL_N: usize = 4;
+val BUILD_GOALS: [BUILD_GOAL_N]BuildGoalSpec = [BUILD_GOAL_N]BuildGoalSpec{
+    BuildGoalSpec{ goal: GOAL_EXECUTE,   display: "executable", emit_name: "exe", fingerprint_tag: 1 },
+    BuildGoalSpec{ goal: GOAL_OBJECTS,   display: "objects",    emit_name: "obj", fingerprint_tag: 2 },
+    BuildGoalSpec{ goal: GOAL_TESTS,     display: "tests",      emit_name: "",    fingerprint_tag: 3 },
+    BuildGoalSpec{ goal: GOAL_TEST_LIST, display: "test list",  emit_name: "",    fingerprint_tag: 4 },
+};
+
+pub val EMIT_HELP: str = "obj | exe (default exe; obj stops at the objects)";
+
+pub val EMIT_ERROR: str = "--emit expects 'obj' or 'exe'";
+
 pub rec LinkToken {
     text: str;
 }
 
-# the complete intent for one build invocation
-#
-# Composed by the CLI, a matrix cell derivation, or an embedding consumer
-# (LSP, tooling). Every field is a settled decision. Immutable once composed;
-# owned by the request arena.
-# ---
-# project_root: resolved absolute project root directory
-# target:       selected target name; empty selects the manifest default
-# profile:      selected profile name; empty selects the manifest default
-# artifact:     selected artifact name; empty selects the manifest default
-# want_lib:     the named artifact is a library (disambiguates a name)
-# all_targets:  build every declared target rather than the manifest default
-# goal:         what the build produces
-# opt:          settled optimization pipeline level (explicit `-O*` wins, else
-#               the profile's `opt`, else the debug pipeline)
-# debug:        emit debug info (`-g` wins, else the profile's `debug`)
-# pie:          emit a position-independent executable (`--pie`)
-# subsystem_flag: the invocation's `--subsystem` selection, unsettled until a cell
-#               binds an artifact (see SubsystemFlag)
-# subsystem:    the settled environment this cell's executable declares it runs
-#               under; `for_cell` installs what the planner resolved, and only the
-#               PE writer consumes it. console on the invocation request, which
-#               binds no artifact
-# simd:         the profile's resolved SIMD strictness posture
-# vectorize:    the profile's resolved auto-vectorization lever
-# float_reassoc: the profile's resolved permission to reassociate float arithmetic
-# verify_ir:    run the IR verifier after each optimization pass
-# jobs:         concrete codegen worker count; compose settles >= 1 (explicit
-#               `--jobs`, else the host CPU count). 0 is the serial-incremental
-#               posture the driver-internal default requests carry (tooling,
-#               doc, and union builds never fan out)
-# emit_ir:      emit per-module `.ir` SSA text (flag or profile default)
-# emit_asm:     emit per-module `.s` assembly text (flag or profile default)
-# out:          requested artifact path (`-o`); empty selects the manifest template
-# link_tokens:  link inputs in invocation order (`-l` values and bare link-file
-#               path positionals)
-# lib_dirs:     `-L` link search directories in invocation order
-# include_deps: widen test collection to dependency modules
 pub rec BuildRequest {
     project_root: str;
 
@@ -222,6 +159,7 @@ pub rec BuildRequest {
     profile:      str;
     artifact:     str;
     want_lib:     bool;
+    artifact_by_table_order: bool;
     all_targets:  bool;
 
     goal:         BuildGoal;
@@ -234,8 +172,8 @@ pub rec BuildRequest {
     simd:          manifest.SimdMode;
     vectorize:     bool;
     float_reassoc: bool;
-    verify_ir:    bool;
     jobs:         u32;
+    placement_policy: u32;
 
     emit_ir:      bool;
     emit_asm:     bool;
@@ -247,14 +185,6 @@ pub rec BuildRequest {
     include_deps: bool;
 }
 
-# a zeroed request: manifest-default selection, execute goal, debug pipeline,
-# no emissions, empty link inputs, serial (jobs 0)
-#
-# The driver-internal baseline for tooling entries (doc, union, driver tests)
-# that build without a CLI invocation; `compose` starts from it too. The vector
-# fields are zeroed, not initialized - a default request is read, never grown.
-# ---
-# ret: the zeroed request
 pub fun defaults() BuildRequest {
     var r: BuildRequest;
     r.project_root = "";
@@ -262,6 +192,7 @@ pub fun defaults() BuildRequest {
     r.profile      = "";
     r.artifact     = "";
     r.want_lib     = false;
+    r.artifact_by_table_order = false;
     r.all_targets  = false;
     r.goal         = GOAL_EXECUTE;
     r.opt          = pipeline.OPT_DEBUG;
@@ -272,8 +203,8 @@ pub fun defaults() BuildRequest {
     r.simd          = manifest.SIMD_SCALARIZE;
     r.vectorize     = true;
     r.float_reassoc = false;
-    r.verify_ir    = false;
     r.jobs         = 0;
+    r.placement_policy = 0;
     r.emit_ir      = false;
     r.emit_asm     = false;
     r.out          = "";
@@ -289,44 +220,31 @@ pub fun defaults() BuildRequest {
     ret r;
 }
 
-# whether a goal is a test build (dispatcher or collection)
-# ---
-# g:   the goal to classify
-# ret: true for GOAL_TESTS and GOAL_TEST_LIST
 pub fun test_goal(g: BuildGoal) bool {
     ret g == GOAL_TESTS || g == GOAL_TEST_LIST;
 }
 
-# whether the request settled on the release pipeline
-# ---
-# r:   the request
-# ret: true when `opt` names the release pipeline
+pub fun goal_from_emit_name(name: str) O.Option[BuildGoal] {
+    var i: usize = 0;
+    for (i < BUILD_GOAL_N) {
+        if (!str_empty(BUILD_GOALS[i].emit_name) && str_equals(BUILD_GOALS[i].emit_name, name)) {
+            ret O.some[BuildGoal](BUILD_GOALS[i].goal);
+        }
+        i = i + 1;
+    }
+    ret O.none[BuildGoal]();
+}
+
+pub fun goal_name(goal: BuildGoal) str {
+    val spec: *BuildGoalSpec = goal_spec(goal);
+    if (spec == nil) { ret "unknown"; }
+    ret spec.display;
+}
+
 pub fun release(r: *BuildRequest) bool {
     ret r.opt == pipeline.OPT_RELEASE;
 }
 
-# compose the settled request for one build invocation
-#
-# Applies ALL precedence: an explicit `-O*` wins over the profile's `opt`,
-# `-g` over the profile's `debug`, an explicit `--jobs` over the host CPU
-# count; emissions are the flag OR the profile default. Only the profile is
-# resolved here - it is invocation-wide, shared by every cell. The artifact and
-# target selection stays unresolved: an invocation can name a whole matrix, so
-# binding it to one build unit here would be a category error (#2474). The
-# planner resolves each cell and raises selection errors with the same text.
-# For a test goal with no named artifact, a multi-artifact manifest settles on
-# the first artifact that declares the resolved target (the whole-source test
-# build still links them all).
-# ---
-# a:    allocator backing the request's link-input vectors and the transient
-#       profile resolution
-# itn:  the interner the manifest was parsed into
-# m:    the parsed root manifest, loaded once and handed forward
-# cli:  the parsed command line
-# root: resolved absolute project root directory
-# goal: what the build produces
-# sel:  the invocation's selection (from the flags, or one enumerated matrix cell)
-# ret:  the settled request, or the failure to render
 pub fun compose(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
                 cli: *CliArgs, root: str, goal: BuildGoal,
                 sel: *manifest.Selection) R.Result[BuildRequest, outcome.Fail] {
@@ -335,37 +253,18 @@ pub fun compose(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
     r.all_targets  = cli.all_targets;
     r.goal         = goal;
 
-    # a whole-source test build of a multi-artifact manifest is not the ambiguity
-    # a plain build raises. the manifest owns which compatible artifact supplies
-    # its primary context, shared with the legacy/tooling driver path (#2961).
-    var esel: manifest.Selection = @sel;
-    if (test_goal(goal)) {
-        val psr: R.Result[bool, str] = manifest.select_primary_artifact(a, itn, m, ?esel);
-        if (R.is_err[bool, str](psr)) {
-            ret R.err[BuildRequest, outcome.Fail](
-                outcome.internal(R.unwrap_err[bool, str](psr)));
-        }
-    }
-    r.target   = esel.target;
-    r.profile  = esel.profile;
-    r.artifact = esel.artifact;
-    r.want_lib = esel.want_lib;
+    r.target   = sel.target;
+    r.profile  = sel.profile;
+    r.artifact = sel.artifact;
+    r.want_lib = sel.want_lib;
+    r.artifact_by_table_order = false;
 
-    # the profile resolution: every decision below is profile-derived, and the
-    # profile is invocation-wide - the same for every cell the planner
-    # enumerates. Resolving the *selection* here would bind the invocation to one
-    # artifact before the matrix exists, which is what made a multi-artifact
-    # `mach build` unreachable (#2474); the planner owns selection resolution and
-    # raises the identical text per cell.
-    val pr_r: R.Result[manifest.ResolvedProfile, str] = manifest.resolve_profile(a, itn, m, esel.profile);
+    val pr_r: R.Result[manifest.ResolvedProfile, str] = manifest.resolve_profile(a, itn, m, sel.profile);
     if (R.is_err[manifest.ResolvedProfile, str](pr_r)) {
         ret R.err[BuildRequest, outcome.Fail](outcome.user(R.unwrap_err[manifest.ResolvedProfile, str](pr_r)));
     }
     val pf: manifest.ResolvedProfile = R.unwrap_ok[manifest.ResolvedProfile, str](pr_r);
 
-    # optimization: an explicit CLI `-O*` is a per-invocation override that wins
-    # outright; absent one the profile's `opt` decides, else the debug pipeline
-    # (what the bootstrap uses, kept fixpoint-stable).
     if (cli.opt_set) {
         if (cli.opt_release) { r.opt = pipeline.OPT_RELEASE; }
     }
@@ -376,25 +275,19 @@ pub fun compose(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
     r.debug     = cli.g || pf.debug;
     r.pie       = cli.pie;
 
-    # `--subsystem` is validated here and settled by the planner, which is the
-    # first place an artifact (and its manifest key) is bound.
     if (cli.subsystem != nil) {
         val ss: str = cli.subsystem::str;
-        if (str_equals(ss, "console"))  { r.subsystem_flag = SUBSYSTEM_FLAG_CONSOLE; }
-        or (str_equals(ss, "gui"))      { r.subsystem_flag = SUBSYSTEM_FLAG_GUI; }
-        or {
+        val flag: O.Option[SubsystemFlag] = subsystem_flag_from_name(ss);
+        if (O.is_none[SubsystemFlag](flag)) {
             ret R.err[BuildRequest, outcome.Fail](outcome.user("--subsystem expects \"console\" or \"gui\""));
         }
+        r.subsystem_flag = O.unwrap[SubsystemFlag](flag);
     }
 
     r.simd          = pf.simd;
     r.vectorize     = pf.vectorize;
     r.float_reassoc = pf.float_reassoc;
-    r.verify_ir = cli.verify_ir;
 
-    # worker count: an explicit `--jobs` wins (a positive integer); absent it
-    # the host CPU count, and 1 when that cannot be determined. always >= 1;
-    # the driver clamps it down to the module count.
     if (cli.jobs != nil) {
         val jv: i64 = parse_jobs(cli.jobs);
         if (jv < 1) {
@@ -408,8 +301,8 @@ pub fun compose(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
         if (nc > 1) { r.jobs = nc::u32; }
     }
 
-    r.emit_ir  = cli.emit_ir  || pf.emit_ir;
-    r.emit_asm = cli.emit_asm || pf.emit_asm;
+    r.emit_ir  = cli.emit_ir;
+    r.emit_asm = cli.emit_asm;
     if (cli.output != nil) { r.out = cli.output::str; }
 
     r.link_tokens = vector.init[LinkToken](a);
@@ -437,37 +330,17 @@ pub fun compose(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
     ret R.ok[BuildRequest, outcome.Fail](r);
 }
 
-# derive one matrix cell's request from the invocation request
-#
-# A cell differs from the invocation in its selection - the (target, artifact)
-# pair the planner enumerated - and in the decisions that selection settles.
-# Every other settled decision - the profile and everything it decided, the
-# codegen levels, the link inputs - applies to every cell unchanged, so the
-# derivation is a copy with those swapped. The vectors are shared with the base
-# request (the cell never grows them).
-#
-# `subsystem` is the artifact-derived half: the invocation carries only the
-# `--subsystem` flag, since no artifact is bound until the planner resolves the
-# cell, and the planner hands the settled value back here.
-# ---
-# base:      the invocation's composed request
-# target:    the cell's target selector (empty selects the manifest default)
-# artifact:  the cell's artifact selector
-# want_lib:  the artifact selector names a library
-# subsystem: the environment the cell's executable declares it runs under, as the
-#            planner settled it (`--subsystem` over the artifact's key)
-# ret:       the cell's request
 pub fun for_cell(base: *BuildRequest, target: str, artifact: str, want_lib: bool,
-                 subsystem: of.Subsystem) BuildRequest {
+                 subsystem: of.Subsystem, goal: BuildGoal) BuildRequest {
     var r: BuildRequest = @base;
     r.target    = target;
     r.artifact  = artifact;
     r.want_lib  = want_lib;
     r.subsystem = subsystem;
+    r.goal      = goal;
     ret r;
 }
 
-# parse a positive decimal `--jobs` value, or -1 when empty, non-decimal, or absurd
 fun parse_jobs(s: *u8) i64 {
     if (s == nil || s[0] == 0) { ret -1; }
     var v: i64 = 0;
@@ -481,43 +354,8 @@ fun parse_jobs(s: *u8) i64 {
     ret v;
 }
 
-# the sha256 digest size of a request identity, in bytes
 pub val HASH_SIZE: usize = 32;
 
-# serialize the request's compilation-semantics fields into `e`
-#
-# Exactly the settled fields whose change alters what SOME cached derived query
-# would compute - the field subset a query family consumes. A change to any of
-# them must invalidate the derived pipeline; a change to a field NOT written here
-# must not. The membership contract, field by field:
-#
-#   project_root  IN  - roots every module's FQN and the debug comp_dir; the
-#                       build's identity.
-#   target        IN  - selects the ISA/OS/ABI the whole graph compiles for.
-#   profile       IN  - the profile identity behind the settled opt/debug/simd.
-#   artifact      IN  - selects which graph (and entry) the unit compiles.
-#   want_lib      IN  - disambiguates the artifact selection.
-#   all_targets   IN  - widens the selection to every declared target.
-#   goal          IN  - the test-mode variant of the back half keys off it.
-#   opt           IN  - the optimization pipeline; changes every module's IR.
-#   debug         IN  - `-g` toggles debug-info emission into every object.
-#   pie           IN  - folds into `$mach.build.pie`, forking resolve/lower.
-#   simd          IN  - the SIMD strictness posture the lower pipeline reads.
-#   verify_ir     IN  - the IR-verifier toggle (also its own Q_LOWER_FLAGS input).
-#   include_deps  IN  - widens the compiled unit to dependency modules.
-#
-# Deliberately OUT (written only by request_hash, never here): `jobs` (codegen
-# worker count - pure scheduling, consumed by the parallel prelude, never a
-# compute); `emit_ir` / `emit_asm` (per-module `.ir` / `.s` side artifacts dumped
-# from the already-computed IR, a plan-level concern); `out` and the link inputs
-# `link_tokens` / `lib_dirs` (they reach the build through Q_LINK_CONFIG, never a
-# per-module compute); `subsystem` / `subsystem_flag` (a header field the
-# executable writer stamps at link time - no module's object differs, so it too
-# reaches the build through Q_LINK_CONFIG).
-#
-# request_hash writes these first, then the OUT fields; semantic_hash writes only
-# these. A new request field MUST be placed deliberately: here when it changes a
-# compile, in write_request_extra when it does not.
 fun write_semantic_fields(e: *binary.Encoder, r: *BuildRequest) bool {
     var ok: bool = true;
     ok = ok && hs(e, r.project_root);
@@ -526,37 +364,40 @@ fun write_semantic_fields(e: *binary.Encoder, r: *BuildRequest) bool {
     ok = ok && hs(e, r.artifact);
     ok = ok && hb(e, r.want_lib);
     ok = ok && hb(e, r.all_targets);
-    ok = ok && R.is_ok[usize, str](binary.write_u8(e, r.goal));
+    ok = ok && write_goal(e, r.goal);
     ok = ok && R.is_ok[usize, str](binary.write_u8(e, r.opt));
     ok = ok && hb(e, r.debug);
     ok = ok && hb(e, r.pie);
     ok = ok && R.is_ok[usize, str](binary.write_u8(e, r.simd));
     ok = ok && hb(e, r.vectorize);
     ok = ok && hb(e, r.float_reassoc);
-    ok = ok && hb(e, r.verify_ir);
     ok = ok && hb(e, r.include_deps);
     ret ok;
 }
 
-# serialize the build-identity-only fields into `e`: the fields request_hash
-# covers BEYOND the compilation semantics
-#
-# Scheduling (`jobs`), the per-module side emissions (`emit_ir` / `emit_asm`,
-# plan-level), the output path (`out`), the executable's declared subsystem, and
-# the link inputs (`link_tokens` / `lib_dirs`, which reach the build through
-# Q_LINK_CONFIG, never a per-module compute). A change to any of them re-links or
-# re-emits but never re-resolves, re-types, re-lowers, or re-codegens a module -
-# so semantic_hash omits them and request_hash appends them after the semantic
-# fields. Only the settled `subsystem` is written: `subsystem_flag` is one of its
-# two inputs, so folding it too would key the identity on provenance rather than
-# on what the writer stamps.
+fun goal_spec(goal: BuildGoal) *BuildGoalSpec {
+    var i: usize = 0;
+    for (i < BUILD_GOAL_N) {
+        if (BUILD_GOALS[i].goal == goal) { ret ?BUILD_GOALS[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun write_goal(e: *binary.Encoder, goal: BuildGoal) bool {
+    val spec: *BuildGoalSpec = goal_spec(goal);
+    if (spec == nil) { ret false; }
+    ret fingerprint.write_domain_u8(e, fingerprint.DOMAIN_BUILD_GOAL, BUILD_GOAL_CATALOG_VERSION, spec.fingerprint_tag);
+}
+
 fun write_request_extra(e: *binary.Encoder, r: *BuildRequest) bool {
     var ok: bool = true;
     ok = ok && R.is_ok[usize, str](binary.write_u32(e, r.jobs));
     ok = ok && hb(e, r.emit_ir);
     ok = ok && hb(e, r.emit_asm);
     ok = ok && hs(e, r.out);
-    ok = ok && R.is_ok[usize, str](binary.write_u8(e, r.subsystem));
+    ok = ok && fingerprint.write_domain_u8(e, fingerprint.DOMAIN_SUBSYSTEM,
+        of.SUBSYSTEM_CATALOG_VERSION, of.subsystem_fingerprint_tag(r.subsystem));
     ok = ok && R.is_ok[usize, str](binary.write_u32(e, r.link_tokens.len::u32));
     var ti: usize = 0;
     for (ti < r.link_tokens.len) {
@@ -572,25 +413,7 @@ fun write_request_extra(e: *binary.Encoder, r: *BuildRequest) bool {
     ret ok;
 }
 
-# hash the request's settled fields into a 32-byte build-identity digest
-#
-# The full identity: serializes every settled field that alters what the build
-# would do (little-endian via std.encoding.binary, strings length-prefixed) - the
-# compilation-semantics fields (write_semantic_fields) followed by the
-# build-identity-only fields (write_request_extra) - and hashes the bytes with
-# sha256. Because fields are settled values, the key reflects effective
-# configuration: any change from either the manifest or the command line that
-# changes the build changes the key. Presentation (readout verbosity, quiet) is
-# not a request field at all - it reaches the engine through the `readout.Progress`
-# sink `execute` takes directly, so it never enters this identity. This is the
-# build's whole identity; the Q_TARGET cache fold keys on semantic_hash, the
-# semantic subset.
-# ---
-# a:      allocator for the transient serialization buffer
-# r:      the request to hash
-# digest: receives the 32-byte digest (HASH_SIZE bytes)
-# ret:    ok(true), or a serialization allocation error
-pub fun request_hash(a: *A.Allocator, r: *BuildRequest, digest: *u8) R.Result[bool, str] {
+pub fun request_hash(a: *A.Allocator, r: *BuildRequest, digest: *u8) R.Result[R.Void, str] {
     var e: binary.Encoder = binary.encoder(a, binary.LITTLE);
 
     var ok: bool = true;
@@ -599,56 +422,37 @@ pub fun request_hash(a: *A.Allocator, r: *BuildRequest, digest: *u8) R.Result[bo
 
     if (!ok) {
         binary.encoder_dnit(?e);
-        ret R.err[bool, str]("out of memory");
+        ret R.err[R.Void, str]("out of memory");
     }
     sha256.hash(e.data, e.len, digest);
     binary.encoder_dnit(?e);
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# hash the request's compilation-semantics fields into a 32-byte digest
-#
-# The cache key for the semantic query family: serializes exactly the fields whose
-# change must invalidate a derived compute (write_semantic_fields), through the
-# same std.encoding.binary writer request_hash uses, and hashes with sha256. It
-# omits the build-identity-only fields (scheduling, side emissions, output path,
-# link inputs) that request_hash also covers, so a request differing only in one of
-# them - a jobs-only flip, an added `-l`, a new `-o` - reproduces an identical
-# digest and leaves the warm back half valid. Q_TARGET folds this rather than the
-# full request_hash so those non-semantic changes stop over-invalidating the graph.
-# ---
-# a:      allocator for the transient serialization buffer
-# r:      the request to hash
-# digest: receives the 32-byte digest (HASH_SIZE bytes)
-# ret:    ok(true), or a serialization allocation error
-pub fun semantic_hash(a: *A.Allocator, r: *BuildRequest, digest: *u8) R.Result[bool, str] {
+pub fun semantic_hash(a: *A.Allocator, r: *BuildRequest, digest: *u8) R.Result[R.Void, str] {
     var e: binary.Encoder = binary.encoder(a, binary.LITTLE);
 
     if (!write_semantic_fields(?e, r)) {
         binary.encoder_dnit(?e);
-        ret R.err[bool, str]("out of memory");
+        ret R.err[R.Void, str]("out of memory");
     }
     sha256.hash(e.data, e.len, digest);
     binary.encoder_dnit(?e);
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# append a length-prefixed string to the identity serialization
 fun hs(e: *binary.Encoder, s: str) bool {
     val n: usize = str_len(s);
     if (R.is_err[usize, str](binary.write_u32(e, n::u32))) { ret false; }
     ret R.is_ok[usize, str](binary.write_bytes(e, s::*u8, n));
 }
 
-# append a bool to the identity serialization
 fun hb(e: *binary.Encoder, v: bool) bool {
     var b: u8 = 0;
     if (v) { b = 1; }
     ret R.is_ok[usize, str](binary.write_u8(e, b));
 }
 
-# bare shared-library filenames are explicit CLI inputs, while a plain library
-# name remains a `-l`-style token
 test "mach.lang.build.request.is_object_path:shared_library_suffixes" {
     if (!is_object_path("libfoo.so"::*u8))    { ret 1; }
     if (!is_object_path("libfoo.so.3"::*u8))  { ret 1; }
@@ -666,9 +470,6 @@ test "mach.lang.build.request.is_object_path:shared_library_suffixes" {
     ret 0;
 }
 
-# a cell derivation swaps the selection and the subsystem the planner settled for
-# it; every other settled decision and the shared link-input vectors carry over
-# unchanged
 test "mach.lang.build.request.for_cell:swaps_selection_only" {
     var base: BuildRequest = defaults();
     base.project_root = "/r";
@@ -678,7 +479,7 @@ test "mach.lang.build.request.for_cell:swaps_selection_only" {
     base.debug        = true;
     base.jobs         = 7;
 
-    val c: BuildRequest = for_cell(?base, "tb", "libb", true, of.SUBSYSTEM_GUI);
+    val c: BuildRequest = for_cell(?base, "tb", "libb", true, of.SUBSYSTEM_GUI, base.goal);
     if (!str_equals(c.target, "tb"))       { ret 1; }
     if (!str_equals(c.artifact, "libb"))   { ret 1; }
     if (!c.want_lib)                       { ret 1; }
@@ -688,12 +489,110 @@ test "mach.lang.build.request.for_cell:swaps_selection_only" {
     if (c.jobs != 7)                       { ret 1; }
     if (!str_equals(c.project_root, "/r")) { ret 1; }
 
-    # the base is untouched: it binds no artifact, so it settles no subsystem.
     if (base.subsystem != of.SUBSYSTEM_CONSOLE) { ret 1; }
     ret 0;
 }
 
-# whether two HASH_SIZE-byte digests are byte-equal
+test "mach.lang.build.request.build_goal_catalog:complete_unique_ordered_roundtrip" {
+    if (BUILD_GOAL_CATALOG_VERSION != 1)               { ret 1; }
+    if (BUILD_GOAL_N != GOAL_TEST_LIST::usize + 1)     { ret 1; }
+
+    var seen: [BUILD_GOAL_N]bool;
+    var i: usize = 0;
+    for (i < BUILD_GOAL_N) { seen[i] = false; i = i + 1; }
+
+    var emit_count: usize = 0;
+    i = 0;
+    for (i < BUILD_GOAL_N) {
+        val spec: *BuildGoalSpec = ?BUILD_GOALS[i];
+        if (spec.goal::usize >= BUILD_GOAL_N)           { ret 1; }
+        if (seen[spec.goal::usize])                     { ret 1; }
+        if (str_empty(spec.display))                    { ret 1; }
+        if (spec.fingerprint_tag != (i + 1)::u8)        { ret 1; }
+        if (!str_equals(goal_name(spec.goal), spec.display)) { ret 1; }
+        seen[spec.goal::usize] = true;
+
+        var j: usize = 0;
+        for (j < i) {
+            val prior: *BuildGoalSpec = ?BUILD_GOALS[j];
+            if (prior.goal == spec.goal)                       { ret 1; }
+            if (prior.fingerprint_tag == spec.fingerprint_tag) { ret 1; }
+            if (str_equals(prior.display, spec.display))       { ret 1; }
+            if (!str_empty(spec.emit_name)
+                && str_equals(prior.emit_name, spec.emit_name)) { ret 1; }
+            j = j + 1;
+        }
+
+        if (!str_empty(spec.emit_name)) {
+            val parsed: O.Option[BuildGoal] = goal_from_emit_name(spec.emit_name);
+            if (O.is_none[BuildGoal](parsed))                  { ret 1; }
+            if (O.unwrap[BuildGoal](parsed) != spec.goal)      { ret 1; }
+            if (!str_contains(EMIT_HELP, spec.emit_name))      { ret 1; }
+            if (!str_contains(EMIT_ERROR, spec.emit_name))     { ret 1; }
+            emit_count = emit_count + 1;
+        }
+        i = i + 1;
+    }
+
+    if (emit_count != 2)                                  { ret 1; }
+    if (O.is_some[BuildGoal](goal_from_emit_name("tests"))) { ret 1; }
+    if (O.is_some[BuildGoal](goal_from_emit_name("")))      { ret 1; }
+    if (!str_equals(goal_name(255::BuildGoal), "unknown"))  { ret 1; }
+    i = 0;
+    for (i < BUILD_GOAL_N) {
+        if (!seen[i]) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.build.request.subsystem_flag_catalog:complete_unique_and_tracks_target_catalog" {
+    var seen: [SUBSYSTEM_FLAG_N]bool;
+    var i: usize = 0;
+    for (i < SUBSYSTEM_FLAG_N) { seen[i] = false; i = i + 1; }
+
+    i = 0;
+    for (i < SUBSYSTEM_FLAG_N) {
+        val spec: *SubsystemFlagSpec = ?SUBSYSTEM_FLAGS[i];
+        if (spec.flag == SUBSYSTEM_FLAG_NONE)       { ret 1; }
+        val slot: usize = spec.flag::usize - 1;
+        if (slot >= SUBSYSTEM_FLAG_N)                { ret 1; }
+        if (seen[slot])                              { ret 1; }
+        seen[slot] = true;
+
+        if (spec.fingerprint_tag != of.subsystem_fingerprint_tag(spec.resolved)) { ret 1; }
+
+        var j: usize = 0;
+        for (j < i) {
+            val prior: *SubsystemFlagSpec = ?SUBSYSTEM_FLAGS[j];
+            if (prior.flag == spec.flag)         { ret 1; }
+            if (prior.resolved == spec.resolved) { ret 1; }
+            j = j + 1;
+        }
+
+        val name: str = of.subsystem_name(spec.resolved);
+        val parsed: O.Option[SubsystemFlag] = subsystem_flag_from_name(name);
+        if (O.is_none[SubsystemFlag](parsed))                 { ret 1; }
+        if (O.unwrap[SubsystemFlag](parsed) != spec.flag)     { ret 1; }
+
+        val resolved: O.Option[of.Subsystem] = subsystem_from_flag(spec.flag);
+        if (O.is_none[of.Subsystem](resolved))                { ret 1; }
+        if (O.unwrap[of.Subsystem](resolved) != spec.resolved) { ret 1; }
+        i = i + 1;
+    }
+
+    if (O.is_some[SubsystemFlag](subsystem_flag_from_name("")))       { ret 1; }
+    if (O.is_some[SubsystemFlag](subsystem_flag_from_name("bogus")))  { ret 1; }
+    if (O.is_some[of.Subsystem](subsystem_from_flag(SUBSYSTEM_FLAG_NONE))) { ret 1; }
+
+    i = 0;
+    for (i < SUBSYSTEM_FLAG_N) {
+        if (!seen[i]) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
 fun dig_eq(a: *u8, b: *u8) bool {
     var i: usize = 0;
     for (i < HASH_SIZE) {
@@ -703,10 +602,48 @@ fun dig_eq(a: *u8, b: *u8) bool {
     ret true;
 }
 
-# the semantic hash omits the scheduling / emission / output / link-input fields:
-# a jobs-only flip (and an emit / out flip) reproduces an identical digest while
-# the full request_hash diverges, and a real compilation-semantics change (opt,
-# pie) still diverges - the exact contract the Q_TARGET fold keys on
+test "mach.lang.build.request.semantic_hash:distinguishes_every_build_goal" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+
+    var digests: [BUILD_GOAL_N][32]u8;
+    var i: usize = 0;
+    for (i < BUILD_GOAL_N) {
+        var req: BuildRequest = defaults();
+        req.goal = BUILD_GOALS[i].goal;
+        if (R.is_err[R.Void, str](semantic_hash(?alloc, ?req, ?digests[i][0]))) { ret 1; }
+
+        var j: usize = 0;
+        for (j < i) {
+            if (dig_eq(?digests[j][0], ?digests[i][0])) { ret 1; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.build.request.request_hash:distinguishes_every_subsystem" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+
+    var digests: [SUBSYSTEM_FLAG_N][32]u8;
+    var i: usize = 0;
+    for (i < SUBSYSTEM_FLAG_N) {
+        var req: BuildRequest = defaults();
+        req.subsystem = SUBSYSTEM_FLAGS[i].resolved;
+        if (R.is_err[R.Void, str](request_hash(?alloc, ?req, ?digests[i][0]))) { ret 1; }
+
+        var j: usize = 0;
+        for (j < i) {
+            if (dig_eq(?digests[j][0], ?digests[i][0])) { ret 1; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
 test "mach.lang.build.request.semantic_hash:omits_nonsemantic_fields" {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }
@@ -716,49 +653,43 @@ test "mach.lang.build.request.semantic_hash:omits_nonsemantic_fields" {
     ra.opt          = pipeline.OPT_DEBUG;
 
     var base: [32]u8;
-    if (R.is_err[bool, str](semantic_hash(?alloc, ?ra, ?base[0]))) { ret 1; }
+    if (R.is_err[R.Void, str](semantic_hash(?alloc, ?ra, ?base[0]))) { ret 1; }
 
-    # a jobs-only flip is a semantic no-op, but the full identity diverges.
     var rb: BuildRequest = ra;
     rb.jobs = ra.jobs + 8;
     var d: [32]u8;
-    if (R.is_err[bool, str](semantic_hash(?alloc, ?rb, ?d[0]))) { ret 1; }
+    if (R.is_err[R.Void, str](semantic_hash(?alloc, ?rb, ?d[0]))) { ret 1; }
     if (!dig_eq(?base[0], ?d[0])) { ret 1; }
 
     var rqa: [32]u8;
     var rqb: [32]u8;
-    if (R.is_err[bool, str](request_hash(?alloc, ?ra, ?rqa[0]))) { ret 1; }
-    if (R.is_err[bool, str](request_hash(?alloc, ?rb, ?rqb[0]))) { ret 1; }
+    if (R.is_err[R.Void, str](request_hash(?alloc, ?ra, ?rqa[0]))) { ret 1; }
+    if (R.is_err[R.Void, str](request_hash(?alloc, ?rb, ?rqb[0]))) { ret 1; }
     if (dig_eq(?rqa[0], ?rqb[0])) { ret 1; }
 
-    # side emissions and the output path are semantic no-ops too.
     rb = ra;
     rb.emit_ir  = true;
     rb.emit_asm = true;
     rb.out      = "/tmp/out.bin";
-    if (R.is_err[bool, str](semantic_hash(?alloc, ?rb, ?d[0]))) { ret 1; }
+    if (R.is_err[R.Void, str](semantic_hash(?alloc, ?rb, ?d[0]))) { ret 1; }
     if (!dig_eq(?base[0], ?d[0])) { ret 1; }
 
-    # the declared subsystem is a link-time header field: no module's object
-    # differs, so it is a semantic no-op while the full identity still diverges.
     rb = ra;
     rb.subsystem = of.SUBSYSTEM_GUI;
-    if (R.is_err[bool, str](semantic_hash(?alloc, ?rb, ?d[0]))) { ret 1; }
+    if (R.is_err[R.Void, str](semantic_hash(?alloc, ?rb, ?d[0]))) { ret 1; }
     if (!dig_eq(?base[0], ?d[0])) { ret 1; }
-    if (R.is_err[bool, str](request_hash(?alloc, ?ra, ?rqa[0]))) { ret 1; }
-    if (R.is_err[bool, str](request_hash(?alloc, ?rb, ?rqb[0]))) { ret 1; }
+    if (R.is_err[R.Void, str](request_hash(?alloc, ?ra, ?rqa[0]))) { ret 1; }
+    if (R.is_err[R.Void, str](request_hash(?alloc, ?rb, ?rqb[0]))) { ret 1; }
     if (dig_eq(?rqa[0], ?rqb[0])) { ret 1; }
 
-    # a compilation-semantics change still diverges: opt.
     rb = ra;
     rb.opt = pipeline.OPT_RELEASE;
-    if (R.is_err[bool, str](semantic_hash(?alloc, ?rb, ?d[0]))) { ret 1; }
+    if (R.is_err[R.Void, str](semantic_hash(?alloc, ?rb, ?d[0]))) { ret 1; }
     if (dig_eq(?base[0], ?d[0])) { ret 1; }
 
-    # and pie.
     rb = ra;
     rb.pie = true;
-    if (R.is_err[bool, str](semantic_hash(?alloc, ?rb, ?d[0]))) { ret 1; }
+    if (R.is_err[R.Void, str](semantic_hash(?alloc, ?rb, ?d[0]))) { ret 1; }
     if (dig_eq(?base[0], ?d[0])) { ret 1; }
     ret 0;
 }

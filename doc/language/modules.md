@@ -16,13 +16,19 @@ syntactically uniform regardless of where it appears.
 ## Bare project-id imports
 
 A one-segment `use`/`fwd` path equal to a resolvable project id — a dependency's
-id or the current project's own id — resolves to that project's declared
-`[project].module` (the manifest names the surface file). So a library `glfw`
-that declares `module = "glfw.mach"` is imported as `use glfw;`, equivalent to
-naming the full path to its surface module. A bare import of a project that
-declares no module is an error directing you to a full path or to add the key;
-longer paths are unaffected. See
-[manifest.md](../manifest.md#bare-project-id-imports).
+id or the current project's own id — binds that project's **public module**,
+the module its artifacts enter at. For a dependency that is the `entry` its
+artifacts share: `std` declares one `static` artifact with
+`entry = "lib/libstd.mach"`, so `use std;` binds the module `std.lib.libstd`.
+For the current project it is the selected artifact's entry. A dependency
+whose artifacts name different entries has no single public module, and a
+bare import of it is an error (`project 'x' has no public module because its
+artifacts name different entries; import a full path, or give every
+[artifact.*] table in its manifest the same entry`). Longer paths are
+unaffected. A dependency that declares no artifact at all falls back to
+`lib.mach` (`dep 'lib1' mach.toml: default entry names no file` when that
+file is absent); the fallback is removed in 5.0.0, so a library should
+declare its artifact.
 
 ## Shadow-module pattern
 

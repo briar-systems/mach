@@ -1,14 +1,3 @@
-# the module-graph load walk: FQN/path composition, the DFS, and parse/exports
-#
-# Composes a module's fully-qualified name into a source path, DFS-walks the
-# import graph from the entry module in topological (post-order) order, and
-# routes each module through the Q_PARSE and Q_EXPORTS query computes. During
-# the walk it evaluates `$if` gates against an incrementally-built ComptimeCtx
-# (including the union-build variant), binds manifest defines, records
-# dependency edges, snapshots pub comptime consts, and pushes each finished
-# module onto the topo order. Sits above the leaf query primitives and depends
-# on no sibling submodule other than `project` and `query`.
-
 use std.collections.map;
 use std.format;
 use fs: std.filesystem;
@@ -22,6 +11,7 @@ use std.types.view.View;
 use std.types.path;
 use std.types.string.str;
 use std.types.string.str_ends_with;
+use std.types.string.str_equals;
 use std.types.string.str_len;
 use std.types.view.view;
 use std.types.view.view_eq_str;
@@ -31,7 +21,6 @@ use O: std.types.option;
 use R: std.types.result;
 use ctime: std.chrono.time;
 
-use mach.lang.build.qctx;
 use mach.lang.build.request;
 use mach.lang.diagnostic;
 use mach.lang.fe.ast;
@@ -42,6 +31,7 @@ use mach.lang.fe.ast.module;
 use mach.lang.fe.comptime;
 use mach.lang.fe.lexer;
 use mach.lang.fe.parser;
+use mach.lang.fe.parser.state;
 use mach.lang.fe.resolve;
 use mach.lang.fe.token;
 use mach.lang.float;
@@ -51,23 +41,21 @@ use mach.lang.readout;
 use mach.lang.session;
 use src: mach.lang.source;
 use mach.lang.target;
+use mach.lang.target.isa;
 use mach.lang.version;
 
 use mach.lang.driver.project;
 use dq: mach.lang.driver.query;
+use mach.lang.fail;
 
-# the compiler's own version string, recorded into each module's comptime ctx
 pub val MACH_VERSION: str = version.MACH_VERSION;
 
-# seed capacities for the per-build growable arrays (module table, a module's pub
-# const list, a module's dep list)
 pub val INITIAL_MODULE_CAP: u32 = 16;
 
 val INITIAL_PUB_CAP:    u32 = 4;
 
 val INITIAL_DEP_CAP:    u32 = 4;
 
-# compute the entrypoint module's FQN: `<project.id>.<entrypoint stripped of .mach>`
 pub fun entry_module_fqn(p: *project.Project, t: *project.TargetEntry) R.Result[intern.StrId, str] {
     val ep_opt: O.Option[str] = intern.lookup(?p.s.interner, t.entrypoint);
     if (O.is_none[str](ep_opt)) { ret R.err[intern.StrId, str]("entrypoint StrId not interned"); }
@@ -76,19 +64,15 @@ pub fun entry_module_fqn(p: *project.Project, t: *project.TargetEntry) R.Result[
     val id_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.id);
     if (O.is_none[str](id_opt)) { ret R.err[intern.StrId, str]("project id StrId not interned"); }
 
-    ret compose_module_fqn(p, O.unwrap[str](id_opt), ep_text);
+    ret compose_module_fqn(p.alloc, ?p.s.interner, O.unwrap[str](id_opt), ep_text);
 }
 
-# build `<id>.<rel stripped of .mach, with `/`/`\` turned
-# into `.`>` and intern it. shared by the entrypoint FQN and bare project-id
-# `use`/`fwd` resolution, so a project's `[project].module` resolves to the same
-# canonical FQN a full path to that file would name
-pub fun compose_module_fqn(p: *project.Project, id_text: str, rel_text: str) R.Result[intern.StrId, str] {
+pub fun compose_module_fqn(alloc: *A.Allocator, itn: *intern.Interner, id_text: str, rel_text: str) R.Result[intern.StrId, str] {
     val rel_stripped: View = strip_mach_suffix(rel_text);
 
     val id_len: usize = str_len(id_text);
     val total:  usize = id_len + 1 + rel_stripped.len;
-    val r_buf: R.Result[*u8, str] = A.allocate[u8](p.alloc, total);
+    val r_buf: R.Result[*u8, str] = A.allocate[u8](alloc, total);
     if (R.is_err[*u8, str](r_buf)) { ret R.err[intern.StrId, str](R.unwrap_err[*u8, str](r_buf)); }
     val buf: *u8 = R.unwrap_ok[*u8, str](r_buf);
 
@@ -106,12 +90,11 @@ pub fun compose_module_fqn(p: *project.Project, id_text: str, rel_text: str) R.R
         j = j + 1;
     }
 
-    val r: R.Result[intern.StrId, str] = intern.intern_bytes(?p.s.interner, buf::str, k);
-    A.deallocate[u8](p.alloc, buf, total);
+    val r: R.Result[intern.StrId, str] = intern.intern_bytes(itn, buf::str, k);
+    A.deallocate[u8](alloc, buf, total);
     ret r;
 }
 
-# a view over `s` with a trailing `.mach` removed, or all of `s` when it has none
 fun strip_mach_suffix(s: str) View {
     val suffix: str = ".mach";
     val s_len: usize = str_len(s);
@@ -119,9 +102,6 @@ fun strip_mach_suffix(s: str) View {
     ret view(s::*char, s_len - str_len(suffix));
 }
 
-# resolve an FQN like "std.types.bool" against the
-# project config and return an allocated absolute file path. caller frees
-# with str_free
 fun fqn_to_file_path(p: *project.Project, fqn: intern.StrId) R.Result[str, str] {
     val fqn_opt: O.Option[str] = intern.lookup(?p.s.interner, fqn);
     if (O.is_none[str](fqn_opt)) { ret R.err[str, str]("module FQN StrId not interned"); }
@@ -181,7 +161,6 @@ fun fqn_to_file_path(p: *project.Project, fqn: intern.StrId) R.Result[str, str] 
     ret R.err[str, str]("no project or dep matches the head segment of the module path");
 }
 
-# compose "<root>/<src_dir>/<dotted-tail-with-slashes>.mach"
 fun build_module_path(alloc: *A.Allocator, root: str, src_dir: str, dotted_tail: View) R.Result[str, str] {
     val root_len: usize = str_len(root);
     val src_len:  usize = str_len(src_dir);
@@ -213,27 +192,12 @@ fun build_module_path(alloc: *A.Allocator, root: str, src_dir: str, dotted_tail:
     k = k + 5;
     buf[k] = 0;
 
-    # NORMALIZE ONCE, HERE (#2998). This is the single place a module's file path is
-    # composed, and its three consumers - the overlay lookup, the disk read, and the
-    # SourceFile registration `load_source` performs - all take the string this
-    # returns. A manifest's `src = "./src"` otherwise composes `<root>/./src/f.mach`
-    # while an editor supplies the canonical `<root>/src/f.mach`, and the two do not
-    # compare equal: the unsaved buffer is silently missed and the stale on-disk file
-    # is parsed instead.
-    #
-    # Lexical only - `path.clean` performs no filesystem I/O - which is the right
-    # strength for an identity comparison between two spellings of the same path, and
-    # keeps this off the syscall path in a loop that runs once per module.
     val cr: R.Result[path.Path, str] = path.clean(alloc, buf::str);
     A.deallocate[u8](alloc, buf, total);
     if (R.is_err[path.Path, str](cr)) { ret R.err[str, str](R.unwrap_err[path.Path, str](cr)); }
     ret R.ok[str, str](R.unwrap_ok[path.Path, str](cr));
 }
 
-# build `<a><b><c>` interned on the session, returning a borrowed
-# view valid for the session's lifetime. the module-load walk returns bare error
-# strings that surface before the diagnostic flush, so these name the offending
-# entity inline. returns the static `fallback` on any allocation/intern failure
 pub fun diag_join3(s: *session.Session, a: str, b: str, c: str, fallback: str) str {
     val res_msg: R.Result[str, str] = format.sprint(s.alloc, "{}{}{}", a, b, c);
     if (R.is_err[str, str](res_msg)) { ret fallback; }
@@ -248,67 +212,71 @@ pub fun diag_join3(s: *session.Session, a: str, b: str, c: str, fallback: str) s
     ret fallback;
 }
 
-# diag_join3 with the middle drawn from an interned id's text;
-# falls back to the static message when the id has no recorded text
 pub fun diag_join_named(s: *session.Session, prefix: str, name_id: intern.StrId, suffix: str, fallback: str) str {
     val no: O.Option[str] = intern.lookup(?s.interner, name_id);
     if (O.is_none[str](no)) { ret fallback; }
     ret diag_join3(s, prefix, O.unwrap[str](no), suffix, fallback);
 }
 
-# join two path segments with a single '/' separator and return an owned str
 pub fun join_path(alloc: *A.Allocator, a: str, b: str) R.Result[str, str] {
-    val a_len: usize = str_len(a);
-    val b_len: usize = str_len(b);
-    val total: usize = a_len + 1 + b_len + 1;
-    val r_buf: R.Result[*u8, str] = A.allocate[u8](alloc, total);
-    if (R.is_err[*u8, str](r_buf)) { ret R.err[str, str](R.unwrap_err[*u8, str](r_buf)); }
-    val buf: *u8 = R.unwrap_ok[*u8, str](r_buf);
-
-    var k: usize = 0;
-    var j: usize = 0;
-    for (j < a_len) { buf[k] = a[j]; k = k + 1; j = j + 1; }
-    if (k > 0 && buf[k - 1] != '/') { buf[k] = '/'; k = k + 1; }
-    j = 0;
-    for (j < b_len) { buf[k] = b[j]; k = k + 1; j = j + 1; }
-    buf[k] = 0;
-
-    ret R.ok[str, str](buf::str);
+    ret path.join(alloc, a, b);
 }
 
-# grow the load-status array to at least `needed` slots, seeding the new slots
-# LOAD_NEW
-fun ensure_load_status_capacity(p: *project.Project, needed: u32) R.Result[bool, str] {
-    if (p.load_cap >= needed) { ret R.ok[bool, str](true); }
+fun ensure_load_status_capacity(p: *project.Project, needed: u32) R.Result[R.Void, str] {
+    if (p.load_cap >= needed) { ret R.ok_void[str](); }
     var new_cap: u32 = p.load_cap;
     if (new_cap == 0) { new_cap = INITIAL_MODULE_CAP; }
     for (new_cap < needed) { new_cap = new_cap * 2; }
 
     if (p.load_status == nil) {
         val r: R.Result[*project.LoadStatus, str] = A.allocate[project.LoadStatus](p.alloc, new_cap::usize);
-        if (R.is_err[*project.LoadStatus, str](r)) { ret R.err[bool, str](R.unwrap_err[*project.LoadStatus, str](r)); }
+        if (R.is_err[*project.LoadStatus, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*project.LoadStatus, str](r)); }
         p.load_status = R.unwrap_ok[*project.LoadStatus, str](r);
     }
     or {
         val r: R.Result[*project.LoadStatus, str] = A.reallocate[project.LoadStatus](p.alloc, p.load_status, p.load_cap::usize, new_cap::usize);
-        if (R.is_err[*project.LoadStatus, str](r)) { ret R.err[bool, str](R.unwrap_err[*project.LoadStatus, str](r)); }
+        if (R.is_err[*project.LoadStatus, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*project.LoadStatus, str](r)); }
         p.load_status = R.unwrap_ok[*project.LoadStatus, str](r);
     }
     var i: u32 = p.load_cap;
     for (i < new_cap) { p.load_status[i] = project.LOAD_NEW; i = i + 1; }
     p.load_cap = new_cap;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# DFS-load a module identified by its FQN. returns its ModuleId.
-# if the module is already in flight, reports a cycle and returns an error
+fun mark_tuple_reachable(p: *project.Project, mid: session.ModuleId) R.Result[bool, str] {
+    if (!p.union || p.union_tuple_count == 0) { ret R.ok[bool, str](false); }
+    val m: *project.ModuleEntry = ?p.modules[mid::u32];
+    if (m.tuple_reachable == nil) {
+        val ar: R.Result[*bool, str] = A.allocate[bool](p.alloc, p.union_tuple_count::usize);
+        if (R.is_err[*bool, str](ar)) { ret R.err[bool, str](R.unwrap_err[*bool, str](ar)); }
+        m.tuple_reachable = R.unwrap_ok[*bool, str](ar);
+        m.tuple_reach_count = p.union_tuple_count;
+        var z: u32 = 0;
+        for (z < m.tuple_reach_count) { m.tuple_reachable[z] = false; z = z + 1; }
+    }
+    var changed: bool = false;
+    var ti: u32 = 0;
+    for (ti < m.tuple_reach_count) {
+        if ((p.union_tuple_filter == nil || p.union_tuple_filter[ti]) && !m.tuple_reachable[ti]) {
+            m.tuple_reachable[ti] = true;
+            changed = true;
+        }
+        ti = ti + 1;
+    }
+    ret R.ok[bool, str](changed);
+}
+
 pub fun dfs_load(p: *project.Project, fqn: intern.StrId) R.Result[session.ModuleId, str] {
     val existing_r: R.Result[*session.ModuleId, str] = map.get[intern.StrId, session.ModuleId](?p.by_fqn, ?fqn);
     if (R.is_ok[*session.ModuleId, str](existing_r)) {
         val mid: session.ModuleId = @R.unwrap_ok[*session.ModuleId, str](existing_r);
+        val changed_r: R.Result[bool, str] = mark_tuple_reachable(p, mid);
+        if (R.is_err[bool, str](changed_r)) { ret R.err[session.ModuleId, str](R.unwrap_err[bool, str](changed_r)); }
         if (p.load_status[mid::u32] == project.LOAD_LOADING) {
             ret R.err[session.ModuleId, str](diag_join_named(p.s, "circular module dependency: '", fqn, "' is already being loaded", "circular module dependency"));
         }
+        if (R.unwrap_ok[bool, str](changed_r)) { p.modules[mid::u32].load_outcome = comptime.GATE_DEFERRED; }
         ret R.ok[session.ModuleId, str](mid);
     }
 
@@ -316,51 +284,37 @@ pub fun dfs_load(p: *project.Project, fqn: intern.StrId) R.Result[session.Module
     if (R.is_err[session.ModuleId, str](mid_r)) { ret mid_r; }
     val mid: session.ModuleId = R.unwrap_ok[session.ModuleId, str](mid_r);
 
-    val cap_r: R.Result[bool, str] = ensure_load_status_capacity(p, mid::u32 + 1);
-    if (R.is_err[bool, str](cap_r)) { ret R.err[session.ModuleId, str](R.unwrap_err[bool, str](cap_r)); }
-    p.load_status[mid::u32] = project.LOAD_LOADING;
+    val changed_r: R.Result[bool, str] = mark_tuple_reachable(p, mid);
+    if (R.is_err[bool, str](changed_r)) { ret R.err[session.ModuleId, str](R.unwrap_err[bool, str](changed_r)); }
 
-    # the load phase times each module's read + lex + parse as one item; the
-    # walk that follows recurses into dependencies, so it is timed separately.
     val t_load: ctime.Time = readout.item_begin(p.events);
-    val parse_r: R.Result[bool, str] = parse_module(p, mid, fqn);
-    if (R.is_err[bool, str](parse_r)) {
-        ret R.err[session.ModuleId, str](R.unwrap_err[bool, str](parse_r));
+    val parse_r: R.Result[R.Void, str] = parse_module(p, mid, fqn);
+    if (R.is_err[R.Void, str](parse_r)) {
+        ret R.err[session.ModuleId, str](R.unwrap_err[R.Void, str](parse_r));
     }
     readout.item(p.events, readout.PH_LOAD, project.fqn_name(p, fqn), t_load);
 
-    val walk_r: R.Result[bool, str] = walk_module_for_load(p, mid);
-    if (R.is_err[bool, str](walk_r)) {
-        ret R.err[session.ModuleId, str](R.unwrap_err[bool, str](walk_r));
+    val saved_gated: bool = p.in_gated_decl_walk;
+    p.in_gated_decl_walk = false;
+    val walk_r: R.Result[comptime.GateOutcome, str] = walk_module_for_load(p, mid);
+    p.in_gated_decl_walk = saved_gated;
+    if (R.is_err[comptime.GateOutcome, str](walk_r)) {
+        ret R.err[session.ModuleId, str](R.unwrap_err[comptime.GateOutcome, str](walk_r));
     }
+    (?p.modules[mid::u32]).load_outcome = R.unwrap_ok[comptime.GateOutcome, str](walk_r);
 
     p.load_status[mid::u32] = project.LOAD_DONE;
 
-    # a target-gated orphan (its load-time `$error` guard fired under this target)
-    # is kept out of the topo set: resolve / sema / lower / codegen all walk topo,
-    # so the module is never touched and its guard never fires. it is excluded from
-    # test collection with a per-run note (#1873). nothing depends on an orphan, so
-    # leaving it out of topo is safe.
     if ((?p.modules[mid::u32]).target_gated) {
         ret R.ok[session.ModuleId, str](mid);
     }
 
-    val topo_r: R.Result[bool, str] = topo_push(p, mid);
-    if (R.is_err[bool, str](topo_r)) { ret R.err[session.ModuleId, str](R.unwrap_err[bool, str](topo_r)); }
+    val topo_r: R.Result[R.Void, str] = topo_push(p, mid);
+    if (R.is_err[R.Void, str](topo_r)) { ret R.err[session.ModuleId, str](R.unwrap_err[R.Void, str](topo_r)); }
 
     ret R.ok[session.ModuleId, str](mid);
 }
 
-# construct the empty base comptime environment for a module in `p`
-#
-# The load walk owns all later module-local and imported public-constant bindings.
-# Keeping this constructor private ensures tooling cannot mistake a build-only base
-# for a loaded module context: additional editor buffers enter through the driver's
-# extra-root DFS and receive the same bindings as every ordinary module.
-# ---
-# p:   loaded project whose selected target and manifest config seed the context
-# req: settled request that opened `p`; must describe the same build selection
-# ret: an owning module context, or the first define-binding / allocation error
 fun module_context(p: *project.Project, req: *request.BuildRequest) R.Result[comptime.ComptimeCtx, str] {
     if (p == nil || req == nil || p.target_entry == nil) {
         ret R.err[comptime.ComptimeCtx, str]("driver: module context requires an opened project and request");
@@ -380,29 +334,32 @@ fun module_context(p: *project.Project, req: *request.BuildRequest) R.Result[com
         build_pie,
         p.target.isa.pointer_width,
         p.target.model.vector_bits,
+        p.target.model.has_float,
         p.compiler_name,
         p.compiler_ver
     );
+    comptime.set_diagnostics(?ctx, ?p.s.diags);
     comptime.set_target_defs(?ctx, p.target.isa.defs);
     comptime.set_va_list(?ctx, p.target.va_list_size, p.target.va_list_align);
+    comptime.set_union_build(?ctx, p.union);
     comptime.set_build_context(?ctx,
         p.config.id, p.config.version, p.config.name, p.config.description,
         p.target_entry.os_name, p.target_entry.isa_name, p.target_entry.abi_name,
         p.target_entry.platform_name,
         p.config.bin_name);
 
-    val bd_r: R.Result[bool, str] = bind_defines(p, ?ctx);
-    if (R.is_err[bool, str](bd_r)) {
-        val message: str = R.unwrap_err[bool, str](bd_r);
+    val bd_r: R.Result[R.Void, str] = bind_defines(p, ?ctx);
+    if (R.is_err[R.Void, str](bd_r)) {
+        val message: str = R.unwrap_err[R.Void, str](bd_r);
         comptime.dnit(?ctx);
         ret R.err[comptime.ComptimeCtx, str](message);
     }
     ret R.ok[comptime.ComptimeCtx, str](ctx);
 }
 
-# append a fresh ModuleEntry for `fqn` - assigning its stable id, comptime ctx,
-# and manifest defines - and index it in by_fqn
 fun register_module_slot(p: *project.Project, fqn: intern.StrId) R.Result[session.ModuleId, str] {
+    val mid: session.ModuleId = p.module_len;
+
     if (p.module_len == p.module_cap) {
         var new_cap: u32 = p.module_cap;
         if (new_cap == 0) { new_cap = INITIAL_MODULE_CAP; }
@@ -419,19 +376,14 @@ fun register_module_slot(p: *project.Project, fqn: intern.StrId) R.Result[sessio
         }
         p.module_cap = new_cap;
     }
-    val mid: session.ModuleId = p.module_len;
 
-    # the build-stable identity for this FQN (session-assigned, persisted across
-    # rebuilds) - the discovery-order `mid` above reshuffles on a graph reshape,
-    # this does not (#1579).
+    val cap_r: R.Result[R.Void, str] = ensure_load_status_capacity(p, mid::u32 + 1);
+    if (R.is_err[R.Void, str](cap_r)) { ret R.err[session.ModuleId, str](R.unwrap_err[R.Void, str](cap_r)); }
+
     val sid_r: R.Result[session.StableModuleId, str] = session.stable_module_id(p.s, fqn);
     if (R.is_err[session.StableModuleId, str](sid_r)) { ret R.err[session.ModuleId, str](R.unwrap_err[session.StableModuleId, str](sid_r)); }
 
-    val qctxp: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
-    if (qctxp == nil || qctxp.req == nil) {
-        ret R.err[session.ModuleId, str]("driver: module load has no active build request");
-    }
-    val ctx_r: R.Result[comptime.ComptimeCtx, str] = module_context(p, qctxp.req);
+    val ctx_r: R.Result[comptime.ComptimeCtx, str] = module_context(p, ?p.req);
     if (R.is_err[comptime.ComptimeCtx, str](ctx_r)) {
         ret R.err[session.ModuleId, str](R.unwrap_err[comptime.ComptimeCtx, str](ctx_r));
     }
@@ -440,8 +392,6 @@ fun register_module_slot(p: *project.Project, fqn: intern.StrId) R.Result[sessio
     m.fqn               = fqn;
     m.file_id           = 0;
     m.stable_id         = R.unwrap_ok[session.StableModuleId, str](sid_r);
-    # the AST is borrowed from the session cache; nil until parse_module sets it.
-    # teardown never frees m.a, so a never-parsed entry needs no placeholder AST.
     m.a                 = nil;
     m.ctx               = R.unwrap_ok[comptime.ComptimeCtx, str](ctx_r);
     m.pub_consts        = nil;
@@ -450,11 +400,19 @@ fun register_module_slot(p: *project.Project, fqn: intern.StrId) R.Result[sessio
     m.mod_refs          = nil;
     m.mod_ref_count     = 0;
     m.mod_ref_cap       = 0;
+    m.const_imports     = nil;
+    m.const_import_count = 0;
+    m.const_import_cap   = 0;
     m.deps              = nil;
     m.dep_count         = 0;
     m.dep_cap           = 0;
     m.resolve_result    = nil;
     m.resolved          = false;
+    m.gate_result       = nil;
+    m.tuple_gates       = nil;
+    m.tuple_gate_count  = 0;
+    m.tuple_reachable   = nil;
+    m.tuple_reach_count = 0;
     m.sema_result       = nil;
     m.ir_module         = nil;
     m.object_image      = nil;
@@ -462,37 +420,35 @@ fun register_module_slot(p: *project.Project, fqn: intern.StrId) R.Result[sessio
     m.staged_home       = nil;
     m.staged_image      = nil;
     m.target_gated      = false;
-    p.modules[p.module_len] = m;
-    p.module_len = p.module_len + 1;
+    m.load_outcome      = comptime.GATE_ACTIVE;
+    m.load_walk_count   = 0;
 
     val ins_r: R.Result[bool, str] = map.insert[intern.StrId, session.ModuleId](?p.by_fqn, fqn, mid);
-    if (R.is_err[bool, str](ins_r)) { ret R.err[session.ModuleId, str](R.unwrap_err[bool, str](ins_r)); }
+    if (R.is_err[bool, str](ins_r)) {
+        comptime.dnit(?m.ctx);
+        ret R.err[session.ModuleId, str](R.unwrap_err[bool, str](ins_r));
+    }
+
+    p.modules[mid::u32] = m;
+    p.module_len = p.module_len + 1;
+    p.load_status[mid::u32] = project.LOAD_LOADING;
     ret R.ok[session.ModuleId, str](mid);
 }
 
-# bind every selected-unit manifest define (#1191) into a freshly
-# initialised module ctx. each entry is `NAME` (a comptime bool flag, `true`) or
-# `NAME=VALUE` where VALUE is a comptime literal - `true`/`false` (bool), an
-# integer literal (int), else a string. an empty define list is a strict no-op, so
-# a manifest declaring no defines stays fixpoint-stable
-fun bind_defines(p: *project.Project, ctx: *comptime.ComptimeCtx) R.Result[bool, str] {
-    if (p.config.define_count == 0) { ret R.ok[bool, str](true); }
+fun bind_defines(p: *project.Project, ctx: *comptime.ComptimeCtx) R.Result[R.Void, str] {
+    if (p.config.define_count == 0) { ret R.ok_void[str](); }
     var i: u32 = 0;
     for (i < p.config.define_count) {
         val s_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.defines[i]);
-        if (O.is_none[str](s_opt)) { ret R.err[bool, str]("define StrId not interned"); }
-        val r: R.Result[bool, str] = bind_one_define(p, ctx, O.unwrap[str](s_opt));
-        if (R.is_err[bool, str](r)) { ret r; }
+        if (O.is_none[str](s_opt)) { ret R.err[R.Void, str]("define StrId not interned"); }
+        val r: R.Result[R.Void, str] = bind_one_define(p, ctx, O.unwrap[str](s_opt));
+        if (R.is_err[R.Void, str](r)) { ret r; }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# parse a single `NAME` / `NAME=VALUE` define and bind it as a
-# named comptime constant. the value typing is explicit: no `=` is a bool `true`
-# flag; `true`/`false` is a bool; a decimal/`0x`/`0b`/`0o` integer literal is an
-# int; anything else is a string
-fun bind_one_define(p: *project.Project, ctx: *comptime.ComptimeCtx, s: str) R.Result[bool, str] {
+fun bind_one_define(p: *project.Project, ctx: *comptime.ComptimeCtx, s: str) R.Result[R.Void, str] {
     val n: usize = str_len(s);
     var eq: usize = n;
     var k: usize = 0;
@@ -500,35 +456,30 @@ fun bind_one_define(p: *project.Project, ctx: *comptime.ComptimeCtx, s: str) R.R
         if (s[k] == '=') { eq = k; brk; }
         k = k + 1;
     }
-    if (eq == 0) { ret R.err[bool, str](diag_join3(p.s, "mach.toml: define '", s, "' has an empty name", "mach.toml: a define has an empty name")); }
+    if (eq == 0) { ret R.err[R.Void, str](diag_join3(p.s, "mach.toml: define '", s, "' has an empty name", "mach.toml: a define has an empty name")); }
 
     val name_r: R.Result[intern.StrId, str] = intern.intern_bytes(?p.s.interner, s, eq);
-    if (R.is_err[intern.StrId, str](name_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](name_r)); }
+    if (R.is_err[intern.StrId, str](name_r)) { ret R.err[R.Void, str](R.unwrap_err[intern.StrId, str](name_r)); }
     val name_id: intern.StrId = R.unwrap_ok[intern.StrId, str](name_r);
 
     var v: comptime.CTValue;
     v.int_unsigned = false;
+    v.int_width    = 0;
 
     if (eq == n) {
-        v.kind   = comptime.CT_KIND_BOOL;
-        v.data.b = true;
+        v = comptime.ct_u8(1);
     }
     or {
         val vstart: usize = eq + 1;
         val vlen:   usize = n - vstart;
         var iv: i64 = 0;
-        if (define_value_is(s, vstart, vlen, "true")) {
-            v.kind = comptime.CT_KIND_BOOL; v.data.b = true;
-        }
-        or (define_value_is(s, vstart, vlen, "false")) {
-            v.kind = comptime.CT_KIND_BOOL; v.data.b = false;
-        }
-        or (parse_define_int(s, vstart, vlen, ?iv)) {
-            v.kind = comptime.CT_KIND_INT; v.data.i = iv;
+        if (parse_define_int(s, vstart, vlen, ?iv)) {
+            if (iv == 0 || iv == 1) { v = comptime.ct_u8(iv::u8); }
+            or { v.kind = comptime.CT_KIND_INT; v.data.i = iv; }
         }
         or {
             val vr: R.Result[intern.StrId, str] = intern.intern_bytes(?p.s.interner, (s::usize + vstart)::str, vlen);
-            if (R.is_err[intern.StrId, str](vr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](vr)); }
+            if (R.is_err[intern.StrId, str](vr)) { ret R.err[R.Void, str](R.unwrap_err[intern.StrId, str](vr)); }
             v.kind = comptime.CT_KIND_STR; v.data.s = R.unwrap_ok[intern.StrId, str](vr);
         }
     }
@@ -536,22 +487,6 @@ fun bind_one_define(p: *project.Project, ctx: *comptime.ComptimeCtx, s: str) R.R
     ret comptime.bind_define(ctx, name_id, v);
 }
 
-# whether the value substring s[start, start+len) equals `lit`
-fun define_value_is(s: str, start: usize, len: usize, lit: str) bool {
-    if (len != str_len(lit)) { ret false; }
-    var i: usize = 0;
-    for (i < len) {
-        if (s[start + i] != lit[i]::u8) { ret false; }
-        i = i + 1;
-    }
-    ret true;
-}
-
-# parse the value substring s[start, start+len) as an integer
-# literal (optional leading `-`, optional `0x`/`0b`/`0o` base prefix, digit
-# separators `_`), writing the i64 into `out` and returning true. a value that is
-# not a clean integer returns false so the caller treats it as a string. an
-# out-of-range value also returns false (a string is the honest fallback)
 fun parse_define_int(s: str, start: usize, len: usize, out: *i64) bool {
     if (len == 0) { ret false; }
     var i: usize = 0;
@@ -588,8 +523,6 @@ fun parse_define_int(s: str, start: usize, len: usize, out: *i64) bool {
     }
     if (!saw_digit) { ret false; }
 
-    # reject a magnitude that has no i64 representation (the string fallback keeps
-    # it honest rather than wrapping).
     val signed_max: u64 = 0x7FFFFFFFFFFFFFFF;
     if (neg) {
         if (value > signed_max + 1) { ret false; }
@@ -601,17 +534,11 @@ fun parse_define_int(s: str, start: usize, len: usize, out: *i64) bool {
     ret true;
 }
 
-# resolve `fqn` to a file, load its source into the session, and route the parse
-# through Q_PARSE, borrowing the cached AST onto the module
-fun parse_module(p: *project.Project, mid: session.ModuleId, fqn: intern.StrId) R.Result[bool, str] {
+fun parse_module(p: *project.Project, mid: session.ModuleId, fqn: intern.StrId) R.Result[R.Void, str] {
     val path_r: R.Result[str, str] = fqn_to_file_path(p, fqn);
-    if (R.is_err[str, str](path_r)) { ret R.err[bool, str](R.unwrap_err[str, str](path_r)); }
+    if (R.is_err[str, str](path_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](path_r)); }
     val file_path: str = R.unwrap_ok[str, str](path_r);
 
-    # an active overlay shadows the on-disk content: use the live unsaved buffer
-    # text as the source input instead of reading the file, so a long-lived session
-    # builds over unsaved edits (#1588). the overlay text is borrowed from the
-    # session (never freed here); a disk read is owned and freed below.
     var text: str = nil;
     var text_owned: bool = false;
     val ov: O.Option[str] = session.overlay_get(p.s, file_path);
@@ -622,88 +549,72 @@ fun parse_module(p: *project.Project, mid: session.ModuleId, fqn: intern.StrId) 
         val text_r: R.Result[str, str] = fs.read_string(p.alloc, file_path);
         if (R.is_err[str, str](text_r)) {
             str_free(p.alloc, file_path);
-            ret R.err[bool, str](R.unwrap_err[str, str](text_r));
+            ret R.err[R.Void, str](R.unwrap_err[str, str](text_r));
         }
         text = R.unwrap_ok[str, str](text_r);
         text_owned = true;
     }
 
-    # load_source mirrors the text into the Q_FILE_TEXT input; an unchanged file's
-    # input keeps its last_changed (byte-equality cutoff), so the Q_PARSE entry
-    # below stays valid and its AST is reused without re-parsing.
     val fid_r: R.Result[src.FileId, str] = session.load_source(p.s, file_path, text);
     str_free(p.alloc, file_path);
     if (text_owned) { str_free(p.alloc, text); }
-    if (R.is_err[src.FileId, str](fid_r)) { ret R.err[bool, str](R.unwrap_err[src.FileId, str](fid_r)); }
+    if (R.is_err[src.FileId, str](fid_r)) { ret R.err[R.Void, str](R.unwrap_err[src.FileId, str](fid_r)); }
     val file_id: src.FileId = R.unwrap_ok[src.FileId, str](fid_r);
 
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
     m.file_id = file_id;
 
-    # route the parse through the query engine: Q_PARSE reads Q_FILE_TEXT and
-    # returns the AST as an opaque handle. an unchanged file revalidates and
-    # reuses its cached AST; an edited file recomputes (re-lex + re-parse). the
-    # query DB owns the AST through the Q_PARSE finalizer; m.a only borrows it.
-    val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_PARSE, file_id::u64);
-    if (R.is_err[*query.QueryEntry, str](e_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](e_r)); }
-    val a: *ast.Ast = ast_handle_decode(R.unwrap_ok[*query.QueryEntry, str](e_r));
-    if (a == nil) { ret R.err[bool, str]("Q_PARSE produced no AST handle"); }
+    val e_r: R.Result[*query.QueryEntry, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_PARSE, file_id::u64);
+    if (R.is_err[*query.QueryEntry, fail.Fail](e_r)) { ret R.err[R.Void, str](R.unwrap_err[*query.QueryEntry, fail.Fail](e_r).message); }
+    val a: *ast.Ast = ast_handle_decode(R.unwrap_ok[*query.QueryEntry, fail.Fail](e_r));
+    if (a == nil) { ret R.err[R.Void, str]("Q_PARSE produced no AST handle"); }
     m.a = a;
-    ret R.ok[bool, str](true);
+    ret comptime.prepare_gates(?m.ctx, a.expr_len::u32, a.decl_len::u32);
 }
 
-# the Q_PARSE derived compute - lex + parse one file into a heap
-# AST and return it as an opaque handle. reaches the session (sources, interner,
-# diagnostics, allocator) through db.ctx, and records the Q_FILE_TEXT dep so a
-# text edit invalidates the entry. the returned handle owns the AST; the engine
-# frees it through q_parse_finalize
-pub fun q_parse_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, str] {
-    val ctx: *qctx.QueryCtx = db.ctx::*qctx.QueryCtx;
-    if (ctx == nil) { ret R.err[query.QueryOutput, str]("Q_PARSE: query db has no context"); }
-    val s: *session.Session = ctx.s;
+pub fun q_parse_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, fail.Fail] {
+    val db: *query.QueryDb = ?p.s.queries;
+    val s: *session.Session = p.s;
     val file_id: src.FileId = key::u32;
 
-    val rd: R.Result[bool, str] = query.record_dep(db, query.Q_PARSE, key, query.Q_FILE_TEXT, key);
-    if (R.is_err[bool, str](rd)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rd)); }
+    val rd: R.Result[R.Void, str] = query.record_dep(db, query.Q_PARSE, key, query.Q_FILE_TEXT, key);
+    if (R.is_err[R.Void, str](rd)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rd))); }
 
     val file_opt: O.Option[*src.SourceFile] = src.get(?s.sources, file_id);
-    if (O.is_none[*src.SourceFile](file_opt)) { ret R.err[query.QueryOutput, str]("Q_PARSE: FileId not registered with the session"); }
+    if (O.is_none[*src.SourceFile](file_opt)) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_PARSE: FileId not registered with the session")); }
     val file: *src.SourceFile = O.unwrap[*src.SourceFile](file_opt);
 
     val tok_r: R.Result[lexer.TokenStream, str] = lexer.tokenize(file.text, alloc, file_id);
-    if (R.is_err[lexer.TokenStream, str](tok_r)) { ret R.err[query.QueryOutput, str](R.unwrap_err[lexer.TokenStream, str](tok_r)); }
+    if (R.is_err[lexer.TokenStream, str](tok_r)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[lexer.TokenStream, str](tok_r))); }
     var stream: lexer.TokenStream = R.unwrap_ok[lexer.TokenStream, str](tok_r);
 
     val ar: R.Result[*ast.Ast, str] = A.allocate[ast.Ast](alloc, 1::usize);
     if (R.is_err[*ast.Ast, str](ar)) {
         lexer.dnit(?stream, alloc);
-        ret R.err[query.QueryOutput, str](R.unwrap_err[*ast.Ast, str](ar));
+        ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[*ast.Ast, str](ar)));
     }
     val a: *ast.Ast = R.unwrap_ok[*ast.Ast, str](ar);
     a[0] = ast.init(alloc, file_id);
 
-    val le_r: R.Result[bool, str] = lexer.emit_diagnostics(?stream, ?s.diags);
-    if (R.is_err[bool, str](le_r)) {
+    val le_r: R.Result[R.Void, str] = lexer.emit_diagnostics(?stream, ?s.diags);
+    if (R.is_err[R.Void, str](le_r)) {
         ast.dnit(a);
         A.deallocate[ast.Ast](alloc, a, 1::usize);
         lexer.dnit(?stream, alloc);
-        ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](le_r));
+        ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](le_r)));
     }
-    val fatal: bool = parser.parse(?stream, a, ?s.diags);
+    val parse_r: R.Result[bool, state.ParseFail] = parser.parse(?stream, a, ?s.diags);
     lexer.dnit(?stream, alloc);
-    # a fatal allocation failure leaves the AST incomplete; refuse to publish it
-    # (the parser already emitted the OOM diagnostic onto the sink).
-    if (fatal) {
+    if (R.is_err[bool, state.ParseFail](parse_r)) {
         ast.dnit(a);
         A.deallocate[ast.Ast](alloc, a, 1::usize);
-        ret R.err[query.QueryOutput, str]("out of memory while parsing module");
+        val f: state.ParseFail = R.unwrap_err[bool, state.ParseFail](parse_r);
+        ret R.err[query.QueryOutput, fail.Fail](fail.message(f.message));
     }
 
-    ret ast_handle_encode(alloc, a);
+    ret fail.lift[query.QueryOutput](ast_handle_encode(alloc, a));
 }
 
-# release the AST a Q_PARSE handle owns, called by the engine
-# before it frees the handle buffer (on recompute, invalidate, and dnit)
 pub fun q_parse_finalize(value: *u8, value_len: u32, alloc: *A.Allocator) {
     if (value == nil || value_len::usize < $size_of(ptr)) { ret; }
     val slot: *ptr = value::ptr::*ptr;
@@ -713,9 +624,6 @@ pub fun q_parse_finalize(value: *u8, value_len: u32, alloc: *A.Allocator) {
     A.deallocate[ast.Ast](alloc, a, 1::usize);
 }
 
-# wrap a heap AST pointer as a pointer-sized opaque handle
-# buffer - the Q_PARSE query value. heavy pointer-graph artifacts live in the
-# byte-buffer DB as handles, never serialized (#1580)
 fun ast_handle_encode(alloc: *A.Allocator, a: *ast.Ast) R.Result[query.QueryOutput, str] {
     val n: u32 = $size_of(ptr)::u32;
     val rb: R.Result[*u8, str] = A.allocate[u8](alloc, n::usize);
@@ -733,39 +641,17 @@ fun ast_handle_encode(alloc: *A.Allocator, a: *ast.Ast) R.Result[query.QueryOutp
     ret R.ok[query.QueryOutput, str](out);
 }
 
-# read the AST pointer back out of a Q_PARSE handle entry, or
-# nil when the entry carries no value
 fun ast_handle_decode(e: *query.QueryEntry) *ast.Ast {
     if (e.value == nil || e.value_len::usize < $size_of(ptr)) { ret nil; }
     val slot: *ptr = e.value::ptr::*ptr;
     ret slot[0]::*ast.Ast;
 }
 
-# the Q_EXPORTS derived compute - a deterministic byte
-# fingerprint of one module's RESOLVED public surface (#1581/#1582). reads the
-# module's ResolveResult through Q_RESOLVE (recording the dep) and fingerprints
-# exactly what an importer's resolution binds against: per pub symbol, its kind,
-# name, originating DeclId, build-stable origin, and (for a `fwd`/`use` module
-# re-export) the build-stable target the alias names. this is the surface
-# build_module_exports hands a dependent resolve, so the fingerprint changes iff a
-# dependent's resolution could change - including a re-exported dep whose own kind
-# shifted without this module's text changing (the syntactic fingerprint missed
-# that). a private-only edit re-runs Q_RESOLVE but leaves the pub surface identical,
-# so this reproduces identical bytes and the engine's output early-cutoff firewalls
-# importers. build-stable ids (not per-build ModuleIds) keep the bytes reshape-
-# stable. a plain byte-valued derived kind (early-cutoff ON), keyed by StableModuleId
-pub fun q_exports_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, str] {
-    val ctx: *qctx.QueryCtx = db.ctx::*qctx.QueryCtx;
-    if (ctx == nil) { ret R.err[query.QueryOutput, str]("Q_EXPORTS: query db has no context"); }
-    val s: *session.Session = ctx.s;
-
-    val e_r: R.Result[*query.QueryEntry, str] = query.get(db, query.Q_RESOLVE, key);
-    if (R.is_err[*query.QueryEntry, str](e_r)) { ret R.err[query.QueryOutput, str](R.unwrap_err[*query.QueryEntry, str](e_r)); }
-    val rr: *resolve.ResolveResult = dq.resolve_handle_decode(R.unwrap_ok[*query.QueryEntry, str](e_r));
-    if (rr == nil) { ret R.err[query.QueryOutput, str]("Q_EXPORTS: module has no resolve result"); }
-
-    val rd: R.Result[bool, str] = query.record_dep(db, query.Q_EXPORTS, key, query.Q_RESOLVE, key);
-    if (R.is_err[bool, str](rd)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rd)); }
+pub fun q_exports_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, fail.Fail] {
+    val e_r: R.Result[*query.QueryEntry, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_RESOLVE, key);
+    if (R.is_err[*query.QueryEntry, fail.Fail](e_r)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[*query.QueryEntry, fail.Fail](e_r).message)); }
+    val rr: *resolve.ResolveResult = dq.resolve_handle_decode(R.unwrap_ok[*query.QueryEntry, fail.Fail](e_r));
+    if (rr == nil) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_EXPORTS: module has no resolve result")); }
 
     var fb: dq.FpBuf;
     fb.alloc = alloc;
@@ -773,133 +659,165 @@ pub fun q_exports_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.R
     fb.len   = 0;
     fb.cap   = 0;
 
-    val wr: R.Result[bool, str] = fp_pub_surface(?fb, rr);
-    if (R.is_err[bool, str](wr)) {
+    val wr: R.Result[R.Void, str] = fp_pub_surface(?fb, rr);
+    if (R.is_err[R.Void, str](wr)) {
         if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](alloc, fb.buf, fb.cap::usize); }
-        ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](wr));
+        ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](wr)));
     }
 
-    ret dq.fp_take(?fb);
+    ret fail.lift[query.QueryOutput](dq.fp_take(?fb));
 }
 
-# append the resolved pub surface of `rr` to the fingerprint - the
-# pub symbols occupy indices [0, pub_count) in source-deterministic order. each
-# symbol contributes the exact tuple build_module_exports exposes to a dependent
-# resolve (kind, name, decl, origin, slot), with origin/slot in build-stable space.
-# the resolved pub comptime constant VALUES are appended too (rr.pub_const_fp): an
-# importer's resolution forks on them via `$if` over imported consts, but they are
-# not in the symbol identities, so they must enter the firewall fingerprint (#1582)
-fun fp_pub_surface(fb: *dq.FpBuf, rr: *resolve.ResolveResult) R.Result[bool, str] {
-    val pc: R.Result[bool, str] = dq.fp_u32(fb, rr.pub_count);
-    if (R.is_err[bool, str](pc)) { ret pc; }
-    if (rr.symbols == nil)       { ret R.ok[bool, str](true); }
+fun fp_pub_surface(fb: *dq.FpBuf, rr: *resolve.ResolveResult) R.Result[R.Void, str] {
+    val pc: R.Result[R.Void, str] = dq.fp_u32(fb, rr.pub_count);
+    if (R.is_err[R.Void, str](pc)) { ret pc; }
+    if (rr.symbols == nil)       { ret R.ok_void[str](); }
     var i: u32 = 0;
     for (i < rr.pub_count) {
         val sym: *resolve.Symbol = ?rr.symbols[i];
-        val rk: R.Result[bool, str] = dq.fp_u8(fb, sym.kind::u8);             if (R.is_err[bool, str](rk)) { ret rk; }
-        val rn: R.Result[bool, str] = dq.fp_u32(fb, sym.name::u32);          if (R.is_err[bool, str](rn)) { ret rn; }
-        val rdl: R.Result[bool, str] = dq.fp_u32(fb, sym.decl::u32);         if (R.is_err[bool, str](rdl)) { ret rdl; }
-        val ro: R.Result[bool, str] = dq.fp_u32(fb, sym.origin_stable::u32); if (R.is_err[bool, str](ro)) { ret ro; }
-        # SYM_USE's slot is a module reference (its build-stable twin); every other
-        # kind's slot is a build-independent index - fingerprint each in its own space.
+        val rk: R.Result[R.Void, str] = dq.fp_u8(fb, sym.kind::u8);             if (R.is_err[R.Void, str](rk)) { ret rk; }
+        val rn: R.Result[R.Void, str] = dq.fp_u32(fb, sym.name::u32);          if (R.is_err[R.Void, str](rn)) { ret rn; }
+        val rdl: R.Result[R.Void, str] = dq.fp_u32(fb, sym.decl::u32);         if (R.is_err[R.Void, str](rdl)) { ret rdl; }
+        val ro: R.Result[R.Void, str] = dq.fp_u32(fb, sym.origin_stable::u32); if (R.is_err[R.Void, str](ro)) { ret ro; }
         var slot_fp: u32 = sym.slot;
         if (sym.kind == resolve.SYM_USE) { slot_fp = sym.slot_stable::u32; }
-        val rs: R.Result[bool, str] = dq.fp_u32(fb, slot_fp);                if (R.is_err[bool, str](rs)) { ret rs; }
+        val rs: R.Result[R.Void, str] = dq.fp_u32(fb, slot_fp);                if (R.is_err[R.Void, str](rs)) { ret rs; }
         i = i + 1;
     }
 
-    # append the pub comptime constant value fingerprint (length-prefixed).
-    val rl: R.Result[bool, str] = dq.fp_u32(fb, rr.pub_const_fp_len);
-    if (R.is_err[bool, str](rl)) { ret rl; }
+    val rl: R.Result[R.Void, str] = dq.fp_u32(fb, rr.pub_const_fp_len);
+    if (R.is_err[R.Void, str](rl)) { ret rl; }
     var b: u32 = 0;
     for (b < rr.pub_const_fp_len) {
-        val rb: R.Result[bool, str] = dq.fp_u8(fb, rr.pub_const_fp[b]);
-        if (R.is_err[bool, str](rb)) { ret rb; }
+        val rb: R.Result[R.Void, str] = dq.fp_u8(fb, rr.pub_const_fp[b]);
+        if (R.is_err[R.Void, str](rb)) { ret rb; }
         b = b + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# walk the module's decls in source order,
-# recursively loading each active `use` target, evaluating `$if`
-# predicates against the running ComptimeCtx, and registering pub comptime
-# val initializers for export
-fun walk_module_for_load(p: *project.Project, mid: session.ModuleId) R.Result[bool, str] {
+fun walk_module_for_load(p: *project.Project, mid: session.ModuleId) R.Result[comptime.GateOutcome, str] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
     val m_opt: O.Option[*module.Module] = ast.get_module(m.a, m.a.root_module);
-    if (O.is_none[*module.Module](m_opt)) { ret R.err[bool, str]("module root not set on Ast"); }
+    if (O.is_none[*module.Module](m_opt)) { ret R.err[comptime.GateOutcome, str]("module root not set on Ast"); }
     val mod_node: *module.Module = O.unwrap[*module.Module](m_opt);
-    ret walk_decl_list_for_load(p, mid, mod_node.decls_start, mod_node.decls_len);
+    val r: R.Result[comptime.GateOutcome, str] = walk_decl_list_for_load(p, mid, mod_node.decls_start, mod_node.decls_len);
+    (?p.modules[mid::u32]).load_walk_count = (?p.modules[mid::u32]).load_walk_count + 1;
+    ret r;
 }
 
-# load-walk every decl in `[start, start + len)` of module `mid`
-fun walk_decl_list_for_load(p: *project.Project, mid: session.ModuleId, start: u32, len: u32) R.Result[bool, str] {
+pub fun resume_deferred_gates(p: *project.Project) R.Result[bool, str] {
+    var changed: bool = false;
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val mid: session.ModuleId = p.topo[i];
+        var m: *project.ModuleEntry = ?p.modules[mid::u32];
+        if (m.load_outcome == comptime.GATE_DEFERRED) {
+            val before_modules: u32 = p.module_len;
+            val saved_filter: *bool = p.union_tuple_filter;
+            if (p.union) { p.union_tuple_filter = m.tuple_reachable; }
+            val saved_gated: bool = p.in_gated_decl_walk;
+            p.in_gated_decl_walk = false;
+            val wr: R.Result[comptime.GateOutcome, str] = walk_module_for_load(p, mid);
+            p.in_gated_decl_walk = saved_gated;
+            p.union_tuple_filter = saved_filter;
+            if (R.is_err[comptime.GateOutcome, str](wr)) {
+                ret R.err[bool, str](R.unwrap_err[comptime.GateOutcome, str](wr));
+            }
+            val outcome: comptime.GateOutcome = R.unwrap_ok[comptime.GateOutcome, str](wr);
+            m = ?p.modules[mid::u32];
+            m.load_outcome = outcome;
+            if (outcome != comptime.GATE_DEFERRED || p.module_len != before_modules) { changed = true; }
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](changed);
+}
+
+pub fun deferred_gate_count(p: *project.Project) u32 {
+    var count: u32 = 0;
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        if (p.modules[p.topo[i]::u32].load_outcome == comptime.GATE_DEFERRED) {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    ret count;
+}
+
+fun walk_decl_list_for_load(p: *project.Project, mid: session.ModuleId, start: u32, len: u32) R.Result[comptime.GateOutcome, str] {
+    var deferred: bool = false;
     var i: u32 = 0;
     for (i < len) {
         val did: id.DeclId = (?p.modules[mid::u32]).a.decl_ids[start + i];
-        val r: R.Result[bool, str] = walk_one_decl_for_load(p, mid, did);
-        if (R.is_err[bool, str](r)) { ret r; }
+        val r: R.Result[comptime.GateOutcome, str] = walk_one_decl_for_load(p, mid, did);
+        if (R.is_err[comptime.GateOutcome, str](r)) { ret r; }
+        val outcome: comptime.GateOutcome = R.unwrap_ok[comptime.GateOutcome, str](r);
+        if (outcome == comptime.GATE_DEFERRED) { deferred = true; }
+        or (outcome != comptime.GATE_ACTIVE)   { ret r; }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    if (deferred) { ret R.ok[comptime.GateOutcome, str](comptime.GATE_DEFERRED); }
+    ret R.ok[comptime.GateOutcome, str](comptime.GATE_ACTIVE);
 }
 
-# dispatch one decl during the load walk: recurse a `$if`, load a `use`/`fwd`
-# target, or register a pub comptime `val`
-fun walk_one_decl_for_load(p: *project.Project, mid: session.ModuleId, did: id.DeclId) R.Result[bool, str] {
+fun walk_one_decl_for_load(p: *project.Project, mid: session.ModuleId, did: id.DeclId) R.Result[comptime.GateOutcome, str] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
     val d_opt: O.Option[*decl.Decl] = ast.get_decl(m.a, did);
-    if (O.is_none[*decl.Decl](d_opt)) { ret R.err[bool, str]("DeclId out of range during walk"); }
+    if (O.is_none[*decl.Decl](d_opt)) { ret R.err[comptime.GateOutcome, str]("DeclId out of range during walk"); }
     val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
 
     if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
-        ret walk_comptime_if_for_load(p, mid, ?d.data.comptime_if);
+        ret walk_comptime_if_for_load(p, mid, did, ?d.data.comptime_if);
+    }
+    if (comptime.load_walked(?m.ctx, did)
+        && !(p.union && (d.kind == decl.DECL_KIND_USE || d.kind == decl.DECL_KIND_FWD))) {
+        ret R.ok[comptime.GateOutcome, str](comptime.GATE_ACTIVE);
     }
     if (d.kind == decl.DECL_KIND_USE) {
-        ret walk_use_for_load(p, mid, ?d.data.use_);
+        val r: R.Result[R.Void, str] = walk_use_for_load(p, mid, ?d.data.use_);
+        ret finish_decl_walk(p, mid, did, r);
     }
     if (d.kind == decl.DECL_KIND_FWD) {
-        ret walk_fwd_for_load(p, mid, ?d.data.fwd_);
+        val r: R.Result[R.Void, str] = walk_fwd_for_load(p, mid, ?d.data.fwd_);
+        ret finish_decl_walk(p, mid, did, r);
     }
     if (d.kind == decl.DECL_KIND_VAL) {
-        ret register_val_for_load(p, mid, d, did);
+        val r: R.Result[R.Void, str] = register_val_for_load(p, mid, d, did);
+        ret finish_decl_walk(p, mid, did, r);
     }
     if (d.kind == decl.DECL_KIND_COMPTIME_ATTR) {
-        ret walk_comptime_attr_for_load(p, mid, ?d.data.comptime_attr);
+        val r: R.Result[R.Void, str] = walk_comptime_attr_for_load(p, mid, ?d.data.comptime_attr);
+        ret finish_decl_walk(p, mid, did, r);
     }
-    ret R.ok[bool, str](true);
+    comptime.mark_load_walked(?(?p.modules[mid::u32]).ctx, did);
+    ret R.ok[comptime.GateOutcome, str](comptime.GATE_ACTIVE);
 }
 
-# a top-level comptime directive reached on a live path during an orphan's load walk
-#
-# Only meaningful while load_all_own_src loads orphan roots: a reached `$error`
-# guard is the module's self-declaration that it is not compilable for the selected
-# target, so the module is flagged target-gated and later excluded from the test
-# build (#1873). The guard is not evaluated into a diagnostic here. A reachable
-# module (loading_orphans false) is left untouched, so sema keeps its live `$error`
-# a fatal build error.
-fun walk_comptime_attr_for_load(p: *project.Project, mid: session.ModuleId, ca: *decl.DeclComptimeAttr) R.Result[bool, str] {
-    if (!p.loading_orphans)       { ret R.ok[bool, str](true); }
-    if (ca.target == id.EXPR_NIL) { ret R.ok[bool, str](true); }
+fun finish_decl_walk(p: *project.Project, mid: session.ModuleId, did: id.DeclId, r: R.Result[R.Void, str]) R.Result[comptime.GateOutcome, str] {
+    if (R.is_err[R.Void, str](r)) {
+        ret R.err[comptime.GateOutcome, str](R.unwrap_err[R.Void, str](r));
+    }
+    comptime.mark_load_walked(?(?p.modules[mid::u32]).ctx, did);
+    ret R.ok[comptime.GateOutcome, str](comptime.GATE_ACTIVE);
+}
+
+fun walk_comptime_attr_for_load(p: *project.Project, mid: session.ModuleId, ca: *decl.DeclComptimeAttr) R.Result[R.Void, str] {
+    if (!p.loading_orphans)       { ret R.ok_void[str](); }
+    if (ca.target == id.EXPR_NIL) { ret R.ok_void[str](); }
 
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
     val src_opt: O.Option[*src.SourceFile] = src.get(?p.s.sources, m.file_id);
-    if (O.is_none[*src.SourceFile](src_opt)) { ret R.err[bool, str]("module file_id not found in SourceMap"); }
+    if (O.is_none[*src.SourceFile](src_opt)) { ret R.err[R.Void, str]("module file_id not found in SourceMap"); }
     val source: str = O.unwrap[*src.SourceFile](src_opt).text;
 
     if (comptime.is_error_call(m.a, source, ca.target)) {
         m.target_gated = true;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# propagate transitive target-gating across a load-time dependency edge
-#
-# While loading orphan roots, a module that depends (`use` / `fwd`) on a
-# target-gated module is itself not compilable for the selected target - a
-# platform backend that imports its gated OS/ISA layer, say - so it is gated too
-# and excluded from the test build (#1873). Returns whether `mid` is now gated, so
-# the caller can skip work a to-be-excluded module does not need.
 fun propagate_target_gate(p: *project.Project, mid: session.ModuleId, dep_mid: session.ModuleId) bool {
     if (!p.loading_orphans)                       { ret false; }
     if (!(?p.modules[dep_mid::u32]).target_gated) { ret false; }
@@ -907,327 +825,452 @@ fun propagate_target_gate(p: *project.Project, mid: session.ModuleId, dep_mid: s
     ret true;
 }
 
-# load-walk a `$if` chain: every some-target branch in union mode, else the first
-# branch active under the selected target
-#
-# A chain no arm of which declares anything is walked SILENTLY (#2876). Such a chain
-# is decided during type checking, not here, so a gate this walk cannot fold is not
-# this walk's to refuse - it selects no arm and moves on. The walk still runs, rather
-# than being skipped, because a target-tuple gate folds fine here and an `$error`
-# under it is how an orphan module declares itself unbuildable for this target
-# (#1873).
-fun walk_comptime_if_for_load(p: *project.Project, mid: session.ModuleId, ci: *decl.DeclComptimeIf) R.Result[bool, str] {
+fun walk_comptime_if_for_load(p: *project.Project, mid: session.ModuleId, did: id.DeclId, ci: *decl.DeclComptimeIf) R.Result[comptime.GateOutcome, str] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
+    if (!p.union && comptime.load_walked(?m.ctx, did)) { ret R.ok[comptime.GateOutcome, str](comptime.GATE_ACTIVE); }
     val src_opt: O.Option[*src.SourceFile] = src.get(?p.s.sources, m.file_id);
-    if (O.is_none[*src.SourceFile](src_opt)) { ret R.err[bool, str]("module file_id not found in SourceMap"); }
+    if (O.is_none[*src.SourceFile](src_opt)) { ret R.err[comptime.GateOutcome, str]("module file_id not found in SourceMap"); }
     val source: str = O.unwrap[*src.SourceFile](src_opt).text;
 
     val emit_diag: bool = !comptime.comptime_if_declares_nothing(m.a, ci.branches_start, ci.branches_len);
 
-    # union build (#1391): load every branch taken by SOME manifest target, not
-    # just the selected target's branch (see walk_comptime_if_union).
-    if (p.union) { ret walk_comptime_if_union(p, mid, ci, source, emit_diag); }
+    if (!emit_diag && !p.loading_orphans) {
+        comptime.mark_load_walked(?m.ctx, did);
+        ret R.ok[comptime.GateOutcome, str](comptime.GATE_ACTIVE);
+    }
 
-    # single-target build: the first branch active under the selected target wins.
+    if (p.union) { ret walk_comptime_if_union(p, mid, did, ci, source, emit_diag); }
+
     var bi: u32 = 0;
     for (bi < ci.branches_len) {
         val br: *decl.ComptimeBranch = ?m.a.comptime_branches[ci.branches_start + bi];
-        val take_r: R.Result[bool, str] = comptime_branch_active_load(p, mid, br, source, emit_diag);
-        if (R.is_err[bool, str](take_r)) { ret take_r; }
-        if (R.unwrap_ok[bool, str](take_r)) {
-            ret walk_decl_list_for_load(p, mid, br.body_start, br.body_len);
+        val take_r: R.Result[comptime.GateOutcome, str] = comptime_branch_active_load(p, mid, br, source, emit_diag, true);
+        if (R.is_err[comptime.GateOutcome, str](take_r)) { ret take_r; }
+        val outcome: comptime.GateOutcome = R.unwrap_ok[comptime.GateOutcome, str](take_r);
+        if (outcome == comptime.GATE_DEFERRED) { ret take_r; }
+        if (outcome == comptime.GATE_REJECTED || outcome == comptime.GATE_FAILED
+         || outcome == comptime.GATE_AWAITING_LAYOUT) {
+            comptime.mark_load_walked(?(?p.modules[mid::u32]).ctx, did);
+            ret take_r;
+        }
+        if (outcome == comptime.GATE_ACTIVE) {
+            val saved_gated: bool = p.in_gated_decl_walk;
+            p.in_gated_decl_walk = true;
+            val wr: R.Result[comptime.GateOutcome, str] = walk_decl_list_for_load(p, mid, br.body_start, br.body_len);
+            p.in_gated_decl_walk = saved_gated;
+            if (R.is_err[comptime.GateOutcome, str](wr)) { ret wr; }
+            val child: comptime.GateOutcome = R.unwrap_ok[comptime.GateOutcome, str](wr);
+            if (child == comptime.GATE_DEFERRED) { ret wr; }
+            comptime.mark_load_walked(?(?p.modules[mid::u32]).ctx, did);
+            ret wr;
         }
         bi = bi + 1;
     }
-    ret R.ok[bool, str](true);
+    comptime.mark_load_walked(?(?p.modules[mid::u32]).ctx, did);
+    ret R.ok[comptime.GateOutcome, str](comptime.GATE_ACTIVE);
 }
 
-# whether a `$if`-chain branch's condition is active
-# under the module's CURRENT comptime ctx (its target tuple). An else branch
-# (`cond == EXPR_NIL`) is always active. A malformed / non-bool condition reports
-# a diagnostic and reads as inactive - but only when `emit_diag` is true, so the
-# union walk (which re-evaluates under every target) reports a bad cond once,
-# under the default tuple, not once per target
-fun comptime_branch_active_load(p: *project.Project, mid: session.ModuleId, br: *decl.ComptimeBranch, source: str, emit_diag: bool) R.Result[bool, str] {
-    if (br.cond == id.EXPR_NIL) { ret R.ok[bool, str](true); }
+fun comptime_branch_active_load(p: *project.Project, mid: session.ModuleId, br: *decl.ComptimeBranch, source: str, emit_diag: bool, use_build_state: bool) R.Result[comptime.GateOutcome, str] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
-    val r: R.Result[comptime.CTValue, str] = eval_for_load(p, mid, source, br.cond, float.FLOAT_W_NONE);
-    val e_opt: O.Option[*expr.Expr] = ast.get_expr(m.a, br.cond);
-    if (O.is_none[*expr.Expr](e_opt)) { ret R.err[bool, str]("comptime branch cond ExprId out of range"); }
-    val cond_span: token.Span = O.unwrap[*expr.Expr](e_opt).span;
-    if (R.is_err[comptime.CTValue, str](r)) {
-        if (emit_diag) {
-            val de: R.Result[bool, str] = diagnostic.error(?p.s.diags, m.file_id, cond_span, R.unwrap_err[comptime.CTValue, str](r));
-            if (R.is_err[bool, str](de)) { ret de; }
+    var terminal: bool = false;
+    if (!(p.union && !use_build_state) && m.load_walk_count > 0) {
+        val pending_r: R.Result[bool, str] = has_deferred_dependency(p, mid);
+        if (R.is_err[bool, str](pending_r)) {
+            ret R.err[comptime.GateOutcome, str](R.unwrap_err[bool, str](pending_r));
         }
-        ret R.ok[bool, str](false);
+        terminal = !R.unwrap_ok[bool, str](pending_r);
     }
-    val v: comptime.CTValue = R.unwrap_ok[comptime.CTValue, str](r);
-    if (v.kind != comptime.CT_KIND_BOOL) {
-        if (emit_diag) {
-            val de: R.Result[bool, str] = diagnostic.error(?p.s.diags, m.file_id, cond_span, "comptime branch condition must be a bool");
-            if (R.is_err[bool, str](de)) { ret de; }
+
+    var lc: LoadMemberCtx;
+    lc.p   = p;
+    lc.mid = mid;
+    val caps_r: R.Result[comptime.PhaseCapabilities[LoadMemberCtx], str] =
+        comptime.loading_capabilities[LoadMemberCtx](resolve_module_member_const_load);
+    if (R.is_err[comptime.PhaseCapabilities[LoadMemberCtx], str](caps_r)) {
+        ret R.err[comptime.GateOutcome, str](R.unwrap_err[comptime.PhaseCapabilities[LoadMemberCtx], str](caps_r));
+    }
+    val vr: R.Result[comptime.GateVerdict, str] = comptime.evaluate_gate[LoadMemberCtx](
+        ?m.ctx, ?lc, R.unwrap_ok[comptime.PhaseCapabilities[LoadMemberCtx], str](caps_r),
+        m.a, source, br.cond, ?p.s.interner,
+        comptime.GATE_SCOPE_DECL, use_build_state, terminal);
+    if (R.is_err[comptime.GateVerdict, str](vr)) {
+        ret R.err[comptime.GateOutcome, str](R.unwrap_err[comptime.GateVerdict, str](vr));
+    }
+    val v: comptime.GateVerdict = R.unwrap_ok[comptime.GateVerdict, str](vr);
+
+    if (v.outcome == comptime.GATE_ACTIVE || v.outcome == comptime.GATE_INACTIVE) {
+        ret R.ok[comptime.GateOutcome, str](v.outcome);
+    }
+    if (v.outcome == comptime.GATE_AWAITING_LAYOUT) {
+        if (!emit_diag) { ret R.ok[comptime.GateOutcome, str](comptime.GATE_AWAITING_LAYOUT); }
+        val committed_r: R.Result[bool, str] = diagnostic.gate_error(?p.s.gate_diags, ?p.s.diags, ?p.s.interner, m.file_id, v.span, v.message);
+        if (R.is_err[bool, str](committed_r)) { ret R.err[comptime.GateOutcome, str](R.unwrap_err[bool, str](committed_r)); }
+        ret R.ok[comptime.GateOutcome, str](comptime.GATE_FAILED);
+    }
+    if (v.outcome == comptime.GATE_REJECTED) {
+        if (emit_diag && str_len(v.message) > 0) {
+            val committed_r: R.Result[bool, str] = diagnostic.gate_error(?p.s.gate_diags, ?p.s.diags, ?p.s.interner, m.file_id, v.span, v.message);
+            if (R.is_err[bool, str](committed_r)) { ret R.err[comptime.GateOutcome, str](R.unwrap_err[bool, str](committed_r)); }
         }
-        ret R.ok[bool, str](false);
+        ret R.ok[comptime.GateOutcome, str](comptime.GATE_REJECTED);
     }
-    ret R.ok[bool, str](v.data.b);
+    if (v.outcome == comptime.GATE_FAILED) {
+        if (emit_diag && v.depends != intern.STR_NIL) {
+            val committed_r: R.Result[bool, str] = diagnostic.gate_error_named(?p.s.gate_diags, ?p.s.diags, ?p.s.interner, m.file_id, v.span, v.depends, v.message);
+            if (R.is_err[bool, str](committed_r)) { ret R.err[comptime.GateOutcome, str](R.unwrap_err[bool, str](committed_r)); }
+        }
+        or (emit_diag) {
+            val committed_r: R.Result[bool, str] = diagnostic.gate_error(?p.s.gate_diags, ?p.s.diags, ?p.s.interner, m.file_id, v.span, v.message);
+            if (R.is_err[bool, str](committed_r)) { ret R.err[comptime.GateOutcome, str](R.unwrap_err[bool, str](committed_r)); }
+        }
+        ret R.ok[comptime.GateOutcome, str](comptime.GATE_FAILED);
+    }
+    ret R.ok[comptime.GateOutcome, str](comptime.GATE_DEFERRED);
 }
 
-# index of the first branch in the `$if` chain active under
-# the module's current comptime ctx, or `branches_len` when none is (no else).
-# The union walk calls this once per manifest target (swapping the ctx tuple in
-# beforehand): that target's taken branch is its first active one
-fun first_active_branch(p: *project.Project, mid: session.ModuleId, ci: *decl.DeclComptimeIf, source: str, emit_diag: bool) R.Result[u32, str] {
+fun has_deferred_dependency(p: *project.Project, mid: session.ModuleId) R.Result[bool, str] {
+    if (p.module_len == 0) { ret R.ok[bool, str](false); }
+    val vr: R.Result[*bool, str] = A.allocate[bool](p.alloc, p.module_len::usize);
+    if (R.is_err[*bool, str](vr)) { ret R.err[bool, str](R.unwrap_err[*bool, str](vr)); }
+    val visited: *bool = R.unwrap_ok[*bool, str](vr);
+    var i: u32 = 0;
+    for (i < p.module_len) { visited[i] = false; i = i + 1; }
+    val pending: bool = deferred_dependency_visit(p, mid, visited);
+    A.deallocate[bool](p.alloc, visited, p.module_len::usize);
+    ret R.ok[bool, str](pending);
+}
+
+fun deferred_dependency_visit(p: *project.Project, mid: session.ModuleId, visited: *bool) bool {
+    if (mid::u32 >= p.module_len || visited[mid::u32]) { ret false; }
+    visited[mid::u32] = true;
+    val m: *project.ModuleEntry = ?p.modules[mid::u32];
+    var i: u32 = 0;
+    for (i < m.dep_count) {
+        val dep: session.ModuleId = m.deps[i];
+        if (dep::u32 < p.module_len && p.modules[dep::u32].load_outcome == comptime.GATE_DEFERRED) { ret true; }
+        if (deferred_dependency_visit(p, dep, visited)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun first_active_branch(p: *project.Project, mid: session.ModuleId, ci: *decl.DeclComptimeIf, source: str, emit_diag: bool, use_build_state: bool) R.Result[comptime.GateSelection, str] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
     var bi: u32 = 0;
     for (bi < ci.branches_len) {
         val br: *decl.ComptimeBranch = ?m.a.comptime_branches[ci.branches_start + bi];
-        val a_r: R.Result[bool, str] = comptime_branch_active_load(p, mid, br, source, emit_diag);
-        if (R.is_err[bool, str](a_r))    { ret R.err[u32, str](R.unwrap_err[bool, str](a_r)); }
-        if (R.unwrap_ok[bool, str](a_r)) { ret R.ok[u32, str](bi); }
+        val a_r: R.Result[comptime.GateOutcome, str] = comptime_branch_active_load(p, mid, br, source, emit_diag, use_build_state);
+        if (R.is_err[comptime.GateOutcome, str](a_r)) { ret R.err[comptime.GateSelection, str](R.unwrap_err[comptime.GateOutcome, str](a_r)); }
+        val outcome: comptime.GateOutcome = R.unwrap_ok[comptime.GateOutcome, str](a_r);
+        if (outcome != comptime.GATE_INACTIVE) {
+            ret R.ok[comptime.GateSelection, str](comptime.gate_selection(outcome, bi));
+        }
         bi = bi + 1;
     }
-    ret R.ok[u32, str](ci.branches_len);
+    ret R.ok[comptime.GateSelection, str](comptime.gate_selection(comptime.GATE_INACTIVE, ci.branches_len));
 }
 
-# load-walk a `$if` chain in union mode - load every
-# branch taken by SOME manifest target. Each target's taken branch is its first
-# active one (computed under that target's tuple, swapped into the module ctx and
-# restored after); the union of those branches is walked. Diagnostics fire only
-# under the default (selected) tuple. Modules pulled in by a non-default target's
-# branch thus land in the Project - visible to workspace-wide tooling - and still
-# resolve under the default ctx ("default target's branches win"). The default
-# tuple is the module's existing ctx; `union_tuples` covers every manifest target
-# (re-checking the default there is harmless)
-fun walk_comptime_if_union(p: *project.Project, mid: session.ModuleId, ci: *decl.DeclComptimeIf, source: str, emit_diag: bool) R.Result[bool, str] {
+fun walk_comptime_if_union(p: *project.Project, mid: session.ModuleId, did: id.DeclId, ci: *decl.DeclComptimeIf, source: str, emit_diag: bool) R.Result[comptime.GateOutcome, str] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
     val n: u32 = ci.branches_len;
-    if (n == 0) { ret R.ok[bool, str](true); }
+    if (n == 0) {
+        comptime.mark_load_walked(?(?p.modules[mid::u32]).ctx, did);
+        ret R.ok[comptime.GateOutcome, str](comptime.GATE_ACTIVE);
+    }
 
     val tk_r: R.Result[*bool, str] = A.allocate[bool](p.alloc, n::usize);
-    if (R.is_err[*bool, str](tk_r)) { ret R.err[bool, str](R.unwrap_err[*bool, str](tk_r)); }
+    if (R.is_err[*bool, str](tk_r)) { ret R.err[comptime.GateOutcome, str](R.unwrap_err[*bool, str](tk_r)); }
     val taken: *bool = R.unwrap_ok[*bool, str](tk_r);
     var z: u32 = 0;
     for (z < n) { taken[z] = false; z = z + 1; }
 
-    # default tuple (the module's current ctx = selected target), WITH diagnostics.
-    val d_r: R.Result[u32, str] = first_active_branch(p, mid, ci, source, emit_diag);
-    if (R.is_err[u32, str](d_r)) { A.deallocate[bool](p.alloc, taken, n::usize); ret R.err[bool, str](R.unwrap_err[u32, str](d_r)); }
-    val d_idx: u32 = R.unwrap_ok[u32, str](d_r);
-    if (d_idx < n) { taken[d_idx] = true; }
+    val branch_count: usize = n::usize;
+    val tuple_count: usize = p.union_tuple_count::usize;
+    val usize_max: usize = ~(0::usize);
+    if (tuple_count != 0 && branch_count > usize_max / tuple_count) {
+        A.deallocate[bool](p.alloc, taken, n::usize);
+        ret R.err[comptime.GateOutcome, str]("union gate coverage size overflow");
+    }
+    val coverage_len: usize = branch_count * tuple_count;
+    val cr: R.Result[*bool, str] = A.allocate[bool](p.alloc, coverage_len);
+    if (R.is_err[*bool, str](cr)) {
+        A.deallocate[bool](p.alloc, taken, n::usize);
+        ret R.err[comptime.GateOutcome, str](R.unwrap_err[*bool, str](cr));
+    }
+    val coverage: *bool = R.unwrap_ok[*bool, str](cr);
+    var zi: usize = 0;
+    for (zi < coverage_len) { coverage[zi] = false; zi = zi + 1; }
 
-    # every other manifest target: swap its tuple into the ctx, no diagnostics.
-    val s_os_id: u32 = m.ctx.target_os_id;
-    val s_arch:  u32 = m.ctx.target_arch_id;
-    val s_pw:    u32 = m.ctx.pointer_width;
-    val s_os:  intern.StrId = m.ctx.target_os;
-    val s_isa: intern.StrId = m.ctx.target_isa;
-    val s_abi: intern.StrId = m.ctx.target_abi;
-    # INVARIANT: m.ctx is the same object resolve uses afterward, with the default
-    # target tuple. A leaked non-default tuple would silently corrupt resolve with
-    # no diagnostic. So each iteration restores the default tuple IMMEDIATELY after
-    # the eval - before the result is inspected or any error returns. Do not add a
-    # return between the override and the restore below.
+    val s_os_id: u32 = m.ctx.env.target_os_id;
+    val s_arch:  u32 = m.ctx.env.target_arch_id;
+    val s_abi_id: u32 = m.ctx.env.target_abi_id;
+    val s_pw:    u32 = m.ctx.env.pointer_width;
+    val s_vb:    u32 = m.ctx.env.vector_bits;
+    val s_has_float: bool = m.ctx.env.has_float;
+    val s_defs: *isa.TargetDefs = m.ctx.env.target_defs;
+    val s_va_size: u32 = m.ctx.env.va_list_size;
+    val s_va_align: u32 = m.ctx.env.va_list_align;
+    val s_os:  intern.StrId = m.ctx.env.target_os;
+    val s_isa: intern.StrId = m.ctx.env.target_isa;
+    val s_abi: intern.StrId = m.ctx.env.target_abi;
+    val s_platform: intern.StrId = m.ctx.env.target_platform;
     var ti: u32 = 0;
     for (ti < p.union_tuple_count) {
-        m.ctx.target_os_id   = p.union_tuples[ti].os_id;
-        m.ctx.target_arch_id = p.union_tuples[ti].arch_id;
-        m.ctx.pointer_width  = p.union_tuples[ti].pointer_width;
-        m.ctx.target_os      = p.union_tuples[ti].os_name;
-        m.ctx.target_isa     = p.union_tuples[ti].isa_name;
-        m.ctx.target_abi     = p.union_tuples[ti].abi_name;
-        val a_r: R.Result[u32, str] = first_active_branch(p, mid, ci, source, false);
-        m.ctx.target_os_id   = s_os_id;
-        m.ctx.target_arch_id = s_arch;
-        m.ctx.pointer_width  = s_pw;
-        m.ctx.target_os      = s_os;
-        m.ctx.target_isa     = s_isa;
-        m.ctx.target_abi     = s_abi;
-        if (R.is_err[u32, str](a_r)) { A.deallocate[bool](p.alloc, taken, n::usize); ret R.err[bool, str](R.unwrap_err[u32, str](a_r)); }
-        val idx: u32 = R.unwrap_ok[u32, str](a_r);
-        if (idx < n) { taken[idx] = true; }
+        if (p.union_tuple_filter != nil && !p.union_tuple_filter[ti]) { ti = ti + 1; cnt; }
+        m.ctx.env.target_os_id   = p.union_tuples[ti].os_id;
+        m.ctx.env.target_arch_id = p.union_tuples[ti].arch_id;
+        m.ctx.env.target_abi_id  = p.union_tuples[ti].abi_id;
+        m.ctx.env.pointer_width  = p.union_tuples[ti].pointer_width;
+        m.ctx.env.vector_bits    = p.union_tuples[ti].vector_bits;
+        m.ctx.env.has_float      = p.union_tuples[ti].has_float;
+        m.ctx.env.target_defs    = p.union_tuples[ti].target_defs;
+        m.ctx.env.va_list_size   = p.union_tuples[ti].va_list_size;
+        m.ctx.env.va_list_align  = p.union_tuples[ti].va_list_align;
+        m.ctx.env.target_os      = p.union_tuples[ti].os_name;
+        m.ctx.env.target_isa     = p.union_tuples[ti].isa_name;
+        m.ctx.env.target_abi     = p.union_tuples[ti].abi_name;
+        m.ctx.env.target_platform = p.union_tuples[ti].platform_name;
+        val a_r: R.Result[comptime.GateSelection, str] = first_active_tuple_branch(p, mid, ti, ci, source, emit_diag);
+        m.ctx.env.target_os_id   = s_os_id;
+        m.ctx.env.target_arch_id = s_arch;
+        m.ctx.env.target_abi_id  = s_abi_id;
+        m.ctx.env.pointer_width  = s_pw;
+        m.ctx.env.vector_bits    = s_vb;
+        m.ctx.env.has_float      = s_has_float;
+        m.ctx.env.target_defs    = s_defs;
+        m.ctx.env.va_list_size   = s_va_size;
+        m.ctx.env.va_list_align  = s_va_align;
+        m.ctx.env.target_os      = s_os;
+        m.ctx.env.target_isa     = s_isa;
+        m.ctx.env.target_abi     = s_abi;
+        m.ctx.env.target_platform = s_platform;
+        if (R.is_err[comptime.GateSelection, str](a_r)) {
+            A.deallocate[bool](p.alloc, coverage, coverage_len);
+            A.deallocate[bool](p.alloc, taken, n::usize);
+            ret R.err[comptime.GateOutcome, str](R.unwrap_err[comptime.GateSelection, str](a_r));
+        }
+        val selection: comptime.GateSelection = R.unwrap_ok[comptime.GateSelection, str](a_r);
+        if (selection.outcome == comptime.GATE_DEFERRED) {
+            A.deallocate[bool](p.alloc, coverage, coverage_len);
+            A.deallocate[bool](p.alloc, taken, n::usize);
+            ret R.ok[comptime.GateOutcome, str](comptime.GATE_DEFERRED);
+        }
+        if (selection.outcome == comptime.GATE_REJECTED || selection.outcome == comptime.GATE_FAILED
+         || selection.outcome == comptime.GATE_AWAITING_LAYOUT) {
+            A.deallocate[bool](p.alloc, coverage, coverage_len);
+            A.deallocate[bool](p.alloc, taken, n::usize);
+            comptime.mark_load_walked(?(?p.modules[mid::u32]).ctx, did);
+            ret R.ok[comptime.GateOutcome, str](selection.outcome);
+        }
+        if (selection.outcome == comptime.GATE_ACTIVE && selection.branch < n) {
+            taken[selection.branch] = true;
+            coverage[selection.branch::usize * tuple_count + ti::usize] = true;
+        }
         ti = ti + 1;
     }
 
-    # snapshot every taken branch's (body_start, body_len) BEFORE recursing.
-    # walk_decl_list_for_load loads modules, which can reallocate(p.modules) and
-    # move the array out from under `m` - so `m`, `ci`, and any `br` deref'd
-    # through `m.a.comptime_branches` dangle the moment a body's `use` grows the
-    # module pool. read them all here, while `m` is still live, into plain locals.
-    val bs_r: R.Result[*u32, str] = A.allocate[u32](p.alloc, n::usize);
-    if (R.is_err[*u32, str](bs_r)) { A.deallocate[bool](p.alloc, taken, n::usize); ret R.err[bool, str](R.unwrap_err[*u32, str](bs_r)); }
-    val body_start: *u32 = R.unwrap_ok[*u32, str](bs_r);
-    val bl_r: R.Result[*u32, str] = A.allocate[u32](p.alloc, n::usize);
-    if (R.is_err[*u32, str](bl_r)) { A.deallocate[u32](p.alloc, body_start, n::usize); A.deallocate[bool](p.alloc, taken, n::usize); ret R.err[bool, str](R.unwrap_err[*u32, str](bl_r)); }
-    val body_len: *u32 = R.unwrap_ok[*u32, str](bl_r);
-    var sn: u32 = 0;
     var bi: u32 = 0;
     for (bi < n) {
         if (taken[bi]) {
-            val br: *decl.ComptimeBranch = ?m.a.comptime_branches[ci.branches_start + bi];
-            body_start[sn] = br.body_start;
-            body_len[sn]   = br.body_len;
-            sn = sn + 1;
+            val br: *decl.ComptimeBranch = ?(?p.modules[mid::u32]).a.comptime_branches[ci.branches_start + bi];
+            val saved_filter: *bool = p.union_tuple_filter;
+            p.union_tuple_filter = ?coverage[bi::usize * tuple_count];
+            val saved_gated: bool = p.in_gated_decl_walk;
+            p.in_gated_decl_walk = true;
+            val w: R.Result[comptime.GateOutcome, str] = walk_decl_list_for_load(p, mid, br.body_start, br.body_len);
+            p.in_gated_decl_walk = saved_gated;
+            p.union_tuple_filter = saved_filter;
+            if (R.is_err[comptime.GateOutcome, str](w)) {
+                A.deallocate[bool](p.alloc, coverage, coverage_len);
+                A.deallocate[bool](p.alloc, taken, n::usize);
+                ret w;
+            }
+            val child: comptime.GateOutcome = R.unwrap_ok[comptime.GateOutcome, str](w);
+            if (child != comptime.GATE_ACTIVE) {
+                if (child != comptime.GATE_DEFERRED) { comptime.mark_load_walked(?(?p.modules[mid::u32]).ctx, did); }
+                A.deallocate[bool](p.alloc, coverage, coverage_len);
+                A.deallocate[bool](p.alloc, taken, n::usize);
+                ret w;
+            }
         }
         bi = bi + 1;
     }
-
-    # walk every taken branch's body into the load graph, from the snapshot - no
-    # `m`/`ci`/`br` deref survives the reallocating recursion.
-    var si: u32 = 0;
-    for (si < sn) {
-        val w: R.Result[bool, str] = walk_decl_list_for_load(p, mid, body_start[si], body_len[si]);
-        if (R.is_err[bool, str](w)) {
-            A.deallocate[u32](p.alloc, body_len, n::usize);
-            A.deallocate[u32](p.alloc, body_start, n::usize);
-            A.deallocate[bool](p.alloc, taken, n::usize);
-            ret w;
-        }
-        si = si + 1;
-    }
-    A.deallocate[u32](p.alloc, body_len, n::usize);
-    A.deallocate[u32](p.alloc, body_start, n::usize);
+    A.deallocate[bool](p.alloc, coverage, coverage_len);
     A.deallocate[bool](p.alloc, taken, n::usize);
-    ret R.ok[bool, str](true);
+    comptime.mark_load_walked(?(?p.modules[mid::u32]).ctx, did);
+    ret R.ok[comptime.GateOutcome, str](comptime.GATE_ACTIVE);
 }
 
-# handle one `use` decl during the load walk: interns
-# its dotted path, DFS-loads the target module, records the dependency
-# edge, and merges only the in-scope pub consts into this module's
-# comptime ctx. under the no-splat import convention an aliased import
-# (`use ALIAS: PATH;`) binds a module reference and brings nothing into
-# bare comptime scope, while a bare import (`use PATH;`) binds the single
-# leaf name - so only the dep pub const whose name matches the leaf is
-# registered
-fun walk_use_for_load(p: *project.Project, mid: session.ModuleId, du: *decl.DeclUse) R.Result[bool, str] {
-    if (du.path.len == 0) { ret R.ok[bool, str](true); }
+fun first_active_tuple_branch(p: *project.Project, mid: session.ModuleId, ti: u32, ci: *decl.DeclComptimeIf, source: str, emit_diag: bool) R.Result[comptime.GateSelection, str] {
+    val m: *project.ModuleEntry = ?p.modules[mid::u32];
+    val typed: bool = m.tuple_gates != nil && ti < m.tuple_gate_count;
+    var bi: u32 = 0;
+    for (bi < ci.branches_len) {
+        val br: *decl.ComptimeBranch = ?m.a.comptime_branches[ci.branches_start + bi];
+        if (br.cond == id.EXPR_NIL) {
+            ret R.ok[comptime.GateSelection, str](comptime.gate_selection(comptime.GATE_ACTIVE, bi));
+        }
+        if (typed) {
+            val tg: *project.TupleGateResult = ?m.tuple_gates[ti];
+            if (br.cond >= tg.state_count) { ret R.err[comptime.GateSelection, str]("union tuple gate ExprId out of range"); }
+            val state: comptime.GateState = tg.states[br.cond];
+            if (state == comptime.GATE_STATE_TRUE) {
+                ret R.ok[comptime.GateSelection, str](comptime.gate_selection(comptime.GATE_ACTIVE, bi));
+            }
+            if (state == comptime.GATE_STATE_REJECTED) {
+                ret R.ok[comptime.GateSelection, str](comptime.gate_selection(comptime.GATE_REJECTED, bi));
+            }
+            if (state == comptime.GATE_STATE_UNKNOWN) {
+                ret R.ok[comptime.GateSelection, str](comptime.gate_selection(comptime.GATE_DEFERRED, bi));
+            }
+        }
+        or {
+            val nts: R.Result[bool, str] = comptime.gate_needs_typed_selection(m.a, source, br.cond);
+            if (R.is_err[bool, str](nts)) {
+                ret R.err[comptime.GateSelection, str](R.unwrap_err[bool, str](nts));
+            }
+            if (R.unwrap_ok[bool, str](nts)) {
+                ret R.ok[comptime.GateSelection, str](comptime.gate_selection(comptime.GATE_DEFERRED, bi));
+            }
+            val ar: R.Result[comptime.GateOutcome, str] = comptime_branch_active_load(p, mid, br, source, emit_diag, false);
+            if (R.is_err[comptime.GateOutcome, str](ar)) {
+                ret R.err[comptime.GateSelection, str](R.unwrap_err[comptime.GateOutcome, str](ar));
+            }
+            val outcome: comptime.GateOutcome = R.unwrap_ok[comptime.GateOutcome, str](ar);
+            if (outcome != comptime.GATE_INACTIVE) {
+                ret R.ok[comptime.GateSelection, str](comptime.gate_selection(outcome, bi));
+            }
+        }
+        bi = bi + 1;
+    }
+    ret R.ok[comptime.GateSelection, str](comptime.gate_selection(comptime.GATE_INACTIVE, ci.branches_len));
+}
+
+fun walk_use_for_load(p: *project.Project, mid: session.ModuleId, du: *decl.DeclUse) R.Result[R.Void, str] {
+    if (du.path.len == 0) { ret R.ok_void[str](); }
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
     val src_opt: O.Option[*src.SourceFile] = src.get(?p.s.sources, m.file_id);
-    if (O.is_none[*src.SourceFile](src_opt)) { ret R.err[bool, str]("module file_id not found in SourceMap"); }
+    if (O.is_none[*src.SourceFile](src_opt)) { ret R.err[R.Void, str]("module file_id not found in SourceMap"); }
     val source: str = O.unwrap[*src.SourceFile](src_opt).text;
 
     val tgt_r: R.Result[UseTarget, str] = resolve_use_target(p, source, du.path);
-    if (R.is_err[UseTarget, str](tgt_r)) { ret R.err[bool, str](R.unwrap_err[UseTarget, str](tgt_r)); }
+    if (R.is_err[UseTarget, str](tgt_r)) { ret R.err[R.Void, str](R.unwrap_err[UseTarget, str](tgt_r)); }
     val ut: UseTarget = R.unwrap_ok[UseTarget, str](tgt_r);
 
     val dep_r: R.Result[session.ModuleId, str] = dfs_load(p, ut.module_fqn);
-    if (R.is_err[session.ModuleId, str](dep_r)) { ret R.err[bool, str](R.unwrap_err[session.ModuleId, str](dep_r)); }
+    if (R.is_err[session.ModuleId, str](dep_r)) { ret R.err[R.Void, str](R.unwrap_err[session.ModuleId, str](dep_r)); }
     val dep_mid: session.ModuleId = R.unwrap_ok[session.ModuleId, str](dep_r);
 
-    val record_r: R.Result[bool, str] = record_dep(p, mid, dep_mid);
-    if (R.is_err[bool, str](record_r)) { ret record_r; }
+    val record_r: R.Result[R.Void, str] = record_dep(p, mid, dep_mid);
+    if (R.is_err[R.Void, str](record_r)) { ret record_r; }
 
-    # a gated dependency gates the importer too; it is excluded, so skip the pub
-    # const merge it no longer needs.
-    if (propagate_target_gate(p, mid, dep_mid)) { ret R.ok[bool, str](true); }
+    if (propagate_target_gate(p, mid, dep_mid)) { ret R.ok_void[str](); }
 
-    # a path ending AT a module binds a module reference, never a bare const: its
-    # members are reached qualified, and recording the binding is what lets the
-    # load walk fold `alias.CONST` in a later initializer (#3075)
     if (ut.binds_module) {
         val name_r: R.Result[intern.StrId, str] = use_bound_name(p, source, du, ut);
-        if (R.is_err[intern.StrId, str](name_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](name_r)); }
+        if (R.is_err[intern.StrId, str](name_r)) { ret R.err[R.Void, str](R.unwrap_err[intern.StrId, str](name_r)); }
         ret record_mod_ref(p, mid, R.unwrap_ok[intern.StrId, str](name_r), dep_mid);
     }
 
     if (du.alias.len > 0) {
-        ret R.ok[bool, str](true);
+        ret R.ok_void[str]();
     }
 
-    ret merge_pub_consts(p, mid, dep_mid, ut.leaf);
+    val rec_r: R.Result[R.Void, str] = record_const_import(p, mid, ut.leaf, dep_mid, du.path);
+    if (R.is_err[R.Void, str](rec_r)) { ret rec_r; }
+    ret merge_pub_consts(p, mid, dep_mid, ut.leaf, du.path);
 }
 
-# the local name a `use` decl binds: its alias when it spells one, else the
-# path's leaf segment
+fun record_const_import(p: *project.Project, mid: session.ModuleId, name: intern.StrId, dep_mid: session.ModuleId, span: token.Span) R.Result[R.Void, str] {
+    val m: *project.ModuleEntry = ?p.modules[mid::u32];
+    var i: u32 = 0;
+    for (i < m.const_import_count) {
+        if (m.const_imports[i].name == name && m.const_imports[i].module == dep_mid) { ret R.ok_void[str](); }
+        i = i + 1;
+    }
+    if (m.const_imports == nil) {
+        val r: R.Result[*project.ModRef, str] = A.allocate[project.ModRef](p.alloc, INITIAL_DEP_CAP::usize);
+        if (R.is_err[*project.ModRef, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*project.ModRef, str](r)); }
+        m.const_imports    = R.unwrap_ok[*project.ModRef, str](r);
+        m.const_import_cap = INITIAL_DEP_CAP;
+    }
+    or (m.const_import_count == m.const_import_cap) {
+        val new_cap: u32 = m.const_import_cap * 2;
+        val r: R.Result[*project.ModRef, str] = A.reallocate[project.ModRef](p.alloc, m.const_imports, m.const_import_cap::usize, new_cap::usize);
+        if (R.is_err[*project.ModRef, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*project.ModRef, str](r)); }
+        m.const_imports    = R.unwrap_ok[*project.ModRef, str](r);
+        m.const_import_cap = new_cap;
+    }
+    var ci: project.ModRef;
+    ci.name   = name;
+    ci.module = dep_mid;
+    ci.span   = span;
+    m.const_imports[m.const_import_count] = ci;
+    m.const_import_count = m.const_import_count + 1;
+    ret R.ok_void[str]();
+}
+
 fun use_bound_name(p: *project.Project, source: str, du: *decl.DeclUse, ut: UseTarget) R.Result[intern.StrId, str] {
     if (du.alias.len == 0) { ret R.ok[intern.StrId, str](ut.leaf); }
     ret intern.intern_span(?p.s.interner, source, du.alias);
 }
 
-# bind `name` to module `dep_mid` in module `mid`'s module-reference table,
-# growing it as needed
-fun record_mod_ref(p: *project.Project, mid: session.ModuleId, name: intern.StrId, dep_mid: session.ModuleId) R.Result[bool, str] {
+fun record_mod_ref(p: *project.Project, mid: session.ModuleId, name: intern.StrId, dep_mid: session.ModuleId) R.Result[R.Void, str] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
-    # first binding of a name wins, matching the lookup: a union walk can reach the
-    # same `use` under two targets, and a name bound twice to different modules is
-    # the resolver's duplicate-import error to report
-    if (O.is_some[session.ModuleId](mod_ref_lookup(m, name))) { ret R.ok[bool, str](true); }
+    if (O.is_some[session.ModuleId](mod_ref_lookup(m, name))) { ret R.ok_void[str](); }
     if (m.mod_refs == nil) {
         val r: R.Result[*project.ModRef, str] = A.allocate[project.ModRef](p.alloc, INITIAL_DEP_CAP::usize);
-        if (R.is_err[*project.ModRef, str](r)) { ret R.err[bool, str](R.unwrap_err[*project.ModRef, str](r)); }
+        if (R.is_err[*project.ModRef, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*project.ModRef, str](r)); }
         m.mod_refs    = R.unwrap_ok[*project.ModRef, str](r);
         m.mod_ref_cap = INITIAL_DEP_CAP;
     }
     or (m.mod_ref_count == m.mod_ref_cap) {
         val new_cap: u32 = m.mod_ref_cap * 2;
         val r: R.Result[*project.ModRef, str] = A.reallocate[project.ModRef](p.alloc, m.mod_refs, m.mod_ref_cap::usize, new_cap::usize);
-        if (R.is_err[*project.ModRef, str](r)) { ret R.err[bool, str](R.unwrap_err[*project.ModRef, str](r)); }
+        if (R.is_err[*project.ModRef, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*project.ModRef, str](r)); }
         m.mod_refs    = R.unwrap_ok[*project.ModRef, str](r);
         m.mod_ref_cap = new_cap;
     }
+    var zero_span: token.Span;
+    zero_span.offset = 0;
+    zero_span.len    = 0;
     var mr: project.ModRef;
     mr.name   = name;
     mr.module = dep_mid;
+    mr.span   = zero_span;
     m.mod_refs[m.mod_ref_count] = mr;
     m.mod_ref_count = m.mod_ref_count + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# handle one `fwd` re-export during the load walk. a `fwd
-# PATH;` whose PATH is a bare FQN re-publishes a pub symbol of the module that
-# FQN names - a dependency edge on that module exactly like `use`. the load walk
-# must DFS-load the target and record the edge so the resolver's dep-set check
-# sees it; without this a library entrypoint that only `fwd`-re-exports its
-# sibling modules never loads them and resolve rejects the re-export as not in
-# the dep set. a PATH whose prefix is instead a local `use`-alias (e.g.
-# `fwd map.hash_str;`) is left untouched: the alias's own `use` already loaded
-# the module and recorded the edge, and `resolve_use_target` - which only
-# resolves real `.mach` files - correctly reports such a prefix as no module,
-# the resolver's scope-first prefix lookup handling it later. unlike `use`, a
-# `fwd` brings nothing into bare comptime scope, so no pub consts are merged
-fun walk_fwd_for_load(p: *project.Project, mid: session.ModuleId, df: *decl.DeclFwd) R.Result[bool, str] {
-    if (df.path.len == 0) { ret R.ok[bool, str](true); }
+fun walk_fwd_for_load(p: *project.Project, mid: session.ModuleId, df: *decl.DeclFwd) R.Result[R.Void, str] {
+    if (df.path.len == 0) { ret R.ok_void[str](); }
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
     val src_opt: O.Option[*src.SourceFile] = src.get(?p.s.sources, m.file_id);
-    if (O.is_none[*src.SourceFile](src_opt)) { ret R.err[bool, str]("module file_id not found in SourceMap"); }
+    if (O.is_none[*src.SourceFile](src_opt)) { ret R.err[R.Void, str]("module file_id not found in SourceMap"); }
     val source: str = O.unwrap[*src.SourceFile](src_opt).text;
 
     val tgt_r: R.Result[UseTarget, str] = resolve_use_target(p, source, df.path);
-    if (R.is_err[UseTarget, str](tgt_r)) { ret R.ok[bool, str](true); }
+    if (R.is_err[UseTarget, str](tgt_r)) { ret R.ok_void[str](); }
     val ut: UseTarget = R.unwrap_ok[UseTarget, str](tgt_r);
 
     val dep_r: R.Result[session.ModuleId, str] = dfs_load(p, ut.module_fqn);
-    if (R.is_err[session.ModuleId, str](dep_r)) { ret R.err[bool, str](R.unwrap_err[session.ModuleId, str](dep_r)); }
+    if (R.is_err[session.ModuleId, str](dep_r)) { ret R.err[R.Void, str](R.unwrap_err[session.ModuleId, str](dep_r)); }
     val dep_mid: session.ModuleId = R.unwrap_ok[session.ModuleId, str](dep_r);
 
-    val record_r: R.Result[bool, str] = record_dep(p, mid, dep_mid);
-    if (R.is_err[bool, str](record_r)) { ret record_r; }
+    val record_r: R.Result[R.Void, str] = record_dep(p, mid, dep_mid);
+    if (R.is_err[R.Void, str](record_r)) { ret record_r; }
 
-    # forwarding a gated module's surface gates this module too (#1873).
     propagate_target_gate(p, mid, dep_mid);
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# the resolution of a `use` path into the module to load plus
-# the leaf name an unaliased import binds
-# ---
-# module_fqn:   FQN of the module file the path resolves to (longest prefix
-#               of the path naming a real `.mach` file)
-# leaf:         the name an unaliased `use` binds - the trailing symbol
-#               segment when the path ends at a symbol, else the module leaf
-# binds_module: whether the path ends AT the module rather than at a symbol inside
-#               it, so the bound name denotes a module and its members are reached
-#               qualified. declared here rather than derived from `module_fqn ==
-#               path`, which is true of the bare-project-id form under a different
-#               spelling
 pub rec UseTarget {
     module_fqn:   intern.StrId;
     leaf:         intern.StrId;
     binds_module: bool;
 }
 
-# whether the dotted path covers exactly one segment (no `.` separator) - the
-# shape a bare project-id import takes
 fun span_single_segment(source: str, path: token.Span) bool {
     var k: usize = path.offset;
     val end: usize = path.offset + path.len;
@@ -1238,10 +1281,6 @@ fun span_single_segment(source: str, path: token.Span) bool {
     ret true;
 }
 
-# resolve a bare project id against this project and its
-# direct deps. on a match sets `out_found` and reports the project's declared
-# module (`out_module`, STR_NIL when the project declares none). project ids and
-# the path id share one interner, so StrId equality is the lookup
 fun project_module_lookup(p: *project.Project, id: intern.StrId, out_found: *bool, out_module: *intern.StrId) {
     @out_found  = false;
     @out_module = intern.STR_NIL;
@@ -1261,13 +1300,6 @@ fun project_module_lookup(p: *project.Project, id: intern.StrId, out_found: *boo
     }
 }
 
-# split a dotted `use`/`fwd` path into the module it names and the leaf it binds.
-# Per use.md a path may end at a module (the whole path is a file) or at a symbol
-# inside a module (the trailing segments name symbols, not files). The module is
-# the longest dotted prefix whose `fqn_to_file_path` resolves to an existing file;
-# any trailing segment is a symbol, and an unaliased import binds the final path
-# segment as its leaf. Resolution interns the full path first so an exact module
-# file short-circuits before any prefix probing
 fun resolve_use_target(p: *project.Project, source: str, path: token.Span) R.Result[UseTarget, str] {
     val full_r: R.Result[intern.StrId, str] = intern.intern_span(?p.s.interner, source, path);
     if (R.is_err[intern.StrId, str](full_r)) { ret R.err[UseTarget, str](R.unwrap_err[intern.StrId, str](full_r)); }
@@ -1277,22 +1309,18 @@ fun resolve_use_target(p: *project.Project, source: str, path: token.Span) R.Res
     if (R.is_err[intern.StrId, str](leaf_r)) { ret R.err[UseTarget, str](R.unwrap_err[intern.StrId, str](leaf_r)); }
     val leaf: intern.StrId = R.unwrap_ok[intern.StrId, str](leaf_r);
 
-    # a one-segment path equal to a resolvable project id (a dependency's manifest
-    # id or this project's own id) names that project's declared `[project].module`
-    # (#1326). paths of length 2 or more are unchanged; a single segment is
-    # unresolvable as a file, so this interception is purely additive.
     if (span_single_segment(source, path)) {
         var found:  bool = false;
         var mod_id: intern.StrId = intern.STR_NIL;
         project_module_lookup(p, full_id, ?found, ?mod_id);
         if (found) {
             if (mod_id == intern.STR_NIL) {
-                ret R.err[UseTarget, str](diag_join_named(p.s, "project '", full_id, "' declares no module; import a full path or add one to its manifest", "project declares no module; import a full path or add one to its manifest"));
+                ret R.err[UseTarget, str](diag_join_named(p.s, "project '", full_id, "' has no public module because its artifacts name different entries; import a full path, or give every [artifact.*] table in its manifest the same entry", "project has no public module because its artifacts name different entries; import a full path, or give every [artifact.*] table in its manifest the same entry"));
             }
             val id_opt:  O.Option[str] = intern.lookup(?p.s.interner, full_id);
             val mod_opt: O.Option[str] = intern.lookup(?p.s.interner, mod_id);
             if (O.is_none[str](id_opt) || O.is_none[str](mod_opt)) { ret R.err[UseTarget, str]("internal: project id/module not interned"); }
-            val fqn_r: R.Result[intern.StrId, str] = compose_module_fqn(p, O.unwrap[str](id_opt), O.unwrap[str](mod_opt));
+            val fqn_r: R.Result[intern.StrId, str] = compose_module_fqn(p.alloc, ?p.s.interner, O.unwrap[str](id_opt), O.unwrap[str](mod_opt));
             if (R.is_err[intern.StrId, str](fqn_r)) { ret R.err[UseTarget, str](R.unwrap_err[intern.StrId, str](fqn_r)); }
             var ut: UseTarget;
             ut.module_fqn   = R.unwrap_ok[intern.StrId, str](fqn_r);
@@ -1302,7 +1330,6 @@ fun resolve_use_target(p: *project.Project, source: str, path: token.Span) R.Res
         }
     }
 
-    # the full path is itself a module file: bind it as a module, leaf is its own name.
     if (fqn_names_file(p, full_id)) {
         var ut: UseTarget;
         ut.module_fqn   = full_id;
@@ -1311,7 +1338,6 @@ fun resolve_use_target(p: *project.Project, source: str, path: token.Span) R.Res
         ret R.ok[UseTarget, str](ut);
     }
 
-    # otherwise trim trailing segments until a prefix names a real file.
     val end: usize = path.offset + path.len;
     var seg_end: usize = end;
     for (seg_end > path.offset) {
@@ -1336,19 +1362,9 @@ fun resolve_use_target(p: *project.Project, source: str, path: token.Span) R.Res
     ret R.err[UseTarget, str](unresolvable_use_msg(p, source, path, full_id));
 }
 
-# the diagnostic for a `use`/`fwd` path that resolves to no module file. a
-# multi-segment path whose ROOT segment names neither this project nor any
-# declared dependency names an undeclared dependency root - report that and name
-# the root, so a `use std.*` in a project with no mach-std dep reads as the
-# missing declaration it is rather than a generic "does not name a module". a
-# single-segment path, or one whose root is known (a real project/dep whose
-# submodule is simply absent), keeps the generic text
 fun unresolvable_use_msg(p: *project.Project, source: str, path: token.Span, full_id: intern.StrId) str {
     val generic: str = diag_join_named(p.s, "use path '", full_id, "' does not name a module", "use path does not name a module");
 
-    # the root segment: the path up to the first '.'. a single-segment path has no
-    # root/leaf split, so it keeps the generic message (its bare-project-id lookup
-    # already handles the one-segment case).
     var root_end: usize = path.offset;
     val end: usize = path.offset + path.len;
     for (root_end < end && source[root_end] != '.') { root_end = root_end + 1; }
@@ -1361,8 +1377,6 @@ fun unresolvable_use_msg(p: *project.Project, source: str, path: token.Span, ful
     if (R.is_err[intern.StrId, str](root_r)) { ret generic; }
     val root_id: intern.StrId = R.unwrap_ok[intern.StrId, str](root_r);
 
-    # a known root (this project or a declared dep) means the root is fine and the
-    # named submodule is simply absent - the generic message is right there.
     var found:  bool = false;
     var mod_id: intern.StrId = intern.STR_NIL;
     project_module_lookup(p, root_id, ?found, ?mod_id);
@@ -1371,9 +1385,6 @@ fun unresolvable_use_msg(p: *project.Project, source: str, path: token.Span, ful
     ret diag_undeclared_root(p.s, full_id, root_id);
 }
 
-# compose the undeclared-root diagnostic, interpolating both the full path and its
-# root segment into one interner-owned message (mirrors diag_join3's intern-and-
-# return dance so the returned str outlives the transient format buffer)
 fun diag_undeclared_root(s: *session.Session, full_id: intern.StrId, root_id: intern.StrId) str {
     val fallback: str = "use path names an undeclared module root";
     val fo: O.Option[str] = intern.lookup(?s.interner, full_id);
@@ -1395,7 +1406,6 @@ fun diag_undeclared_root(s: *session.Session, full_id: intern.StrId, root_id: in
     ret fallback;
 }
 
-# true when an FQN resolves to an existing `.mach` file
 fun fqn_names_file(p: *project.Project, fqn: intern.StrId) bool {
     val path_r: R.Result[str, str] = fqn_to_file_path(p, fqn);
     if (R.is_err[str, str](path_r)) { ret false; }
@@ -1405,14 +1415,6 @@ fun fqn_names_file(p: *project.Project, fqn: intern.StrId) bool {
     ret ok_;
 }
 
-# intern the trailing `.`-separated segment of a dotted path
-# span. an unaliased `use PATH;` binds this leaf name, so it scopes which
-# dep pub const becomes visible in the importer's comptime ctx
-# ---
-# i:      shared interner
-# source: source text covering `path`
-# path:   span over the full dotted module path
-# ret:    StrId for the final segment, or an allocation error
 fun leaf_name(i: *intern.Interner, source: str, path: token.Span) R.Result[intern.StrId, str] {
     var seg_start: usize = path.offset;
     var k: usize = path.offset;
@@ -1427,66 +1429,138 @@ fun leaf_name(i: *intern.Interner, source: str, path: token.Span) R.Result[inter
     ret intern.intern_span(i, source, leaf_span);
 }
 
-# record a `mid -> dep_mid` dependency edge, growing the module's dep array and
-# skipping a duplicate
-fun record_dep(p: *project.Project, mid: session.ModuleId, dep_mid: session.ModuleId) R.Result[bool, str] {
+fun record_dep(p: *project.Project, mid: session.ModuleId, dep_mid: session.ModuleId) R.Result[R.Void, str] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
     var i: u32 = 0;
     for (i < m.dep_count) {
-        if (m.deps[i] == dep_mid) { ret R.ok[bool, str](true); }
+        if (m.deps[i] == dep_mid) { ret R.ok_void[str](); }
         i = i + 1;
     }
     if (m.deps == nil) {
         val r: R.Result[*session.ModuleId, str] = A.allocate[session.ModuleId](p.alloc, INITIAL_DEP_CAP::usize);
-        if (R.is_err[*session.ModuleId, str](r)) { ret R.err[bool, str](R.unwrap_err[*session.ModuleId, str](r)); }
+        if (R.is_err[*session.ModuleId, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*session.ModuleId, str](r)); }
         m.deps    = R.unwrap_ok[*session.ModuleId, str](r);
         m.dep_cap = INITIAL_DEP_CAP;
     }
     or (m.dep_count == m.dep_cap) {
         val new_cap: u32 = m.dep_cap * 2;
         val r: R.Result[*session.ModuleId, str] = A.reallocate[session.ModuleId](p.alloc, m.deps, m.dep_cap::usize, new_cap::usize);
-        if (R.is_err[*session.ModuleId, str](r)) { ret R.err[bool, str](R.unwrap_err[*session.ModuleId, str](r)); }
+        if (R.is_err[*session.ModuleId, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*session.ModuleId, str](r)); }
         m.deps    = R.unwrap_ok[*session.ModuleId, str](r);
         m.dep_cap = new_cap;
     }
     m.deps[m.dep_count] = dep_mid;
     m.dep_count = m.dep_count + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# register the dep's pub consts that the importer
-# brought into scope. an unaliased `use PATH;` binds the single leaf name,
-# so only the dep const named `leaf` is copied into the importer's ctx -
-# never a blanket merge
-# ---
-# p:       project
-# mid:     importing module id
-# dep_mid: imported module id
-# leaf:    interned leaf name bound by the unaliased `use`
-# ret:     true on success, or an allocation error
-fun merge_pub_consts(p: *project.Project, mid: session.ModuleId, dep_mid: session.ModuleId, leaf: intern.StrId) R.Result[bool, str] {
+fun gated_const_message(s: *session.Session, name: intern.StrId, dep_fqn: intern.StrId) str {
+    val fallback: str = "tuple-dependent public constants are not yet supported in union builds";
+    val no: O.Option[str] = intern.lookup(?s.interner, name);
+    val fo: O.Option[str] = intern.lookup(?s.interner, dep_fqn);
+    if (O.is_none[str](no) || O.is_none[str](fo)) { ret fallback; }
+
+    val res_msg: R.Result[str, str] = format.sprint(s.alloc,
+        "tuple-dependent public constants are not yet supported in union builds: '{}' in module '{}' is bound under a per-target-tuple condition",
+        O.unwrap[str](no), O.unwrap[str](fo));
+    if (R.is_err[str, str](res_msg)) { ret fallback; }
+    val buf: str = R.unwrap_ok[str, str](res_msg);
+
+    val ir: R.Result[intern.StrId, str] = intern.intern(?s.interner, buf);
+    str_free(s.alloc, buf);
+    if (R.is_err[intern.StrId, str](ir)) { ret fallback; }
+
+    val nm: O.Option[str] = intern.lookup(?s.interner, R.unwrap_ok[intern.StrId, str](ir));
+    if (O.is_some[str](nm)) { ret O.unwrap[str](nm); }
+    ret fallback;
+}
+
+pub fun check_gated_const_imports(p: *project.Project) R.Result[R.Void, str] {
+    if (!p.union) { ret R.ok_void[str](); }
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        val m: *project.ModuleEntry = ?p.modules[i];
+        var j: u32 = 0;
+        for (j < m.const_import_count) {
+            val ci: *project.ModRef = ?m.const_imports[j];
+            val dep: *project.ModuleEntry = ?p.modules[ci.module::u32];
+            val v: O.Option[*project.PubConst] = pub_const_lookup(dep, ci.name);
+            if (O.is_none[*project.PubConst](v)) { j = j + 1; cnt; }
+            val pc: *project.PubConst = O.unwrap[*project.PubConst](v);
+            if (pc.gated) {
+                val msg: str = gated_const_message(p.s, ci.name, dep.fqn);
+                val committed_r: R.Result[bool, str] = diagnostic.gate_error(?p.s.gate_diags, ?p.s.diags, ?p.s.interner, m.file_id, ci.span, msg);
+                if (R.is_err[bool, str](committed_r)) { ret R.void_of[bool, str](committed_r); }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret R.ok_void[str]();
+}
+
+fun merge_pub_consts(p: *project.Project, mid: session.ModuleId, dep_mid: session.ModuleId, leaf: intern.StrId, span: token.Span) R.Result[R.Void, str] {
     val m:   *project.ModuleEntry = ?p.modules[mid::u32];
     val dep: *project.ModuleEntry = ?p.modules[dep_mid::u32];
-    val v: O.Option[comptime.CTValue] = pub_const_lookup(dep, leaf);
-    if (O.is_none[comptime.CTValue](v)) { ret R.ok[bool, str](true); }
-    ret comptime.bind(?m.ctx, leaf, O.unwrap[comptime.CTValue](v));
+    val v: O.Option[*project.PubConst] = pub_const_lookup(dep, leaf);
+    if (O.is_none[*project.PubConst](v)) { ret R.ok_void[str](); }
+    val pc: *project.PubConst = O.unwrap[*project.PubConst](v);
+    if (pc.gated && p.union) {
+        val msg: str = gated_const_message(p.s, leaf, dep.fqn);
+        ret R.void_of[bool, str](diagnostic.gate_error(?p.s.gate_diags, ?p.s.diags, ?p.s.interner, m.file_id, span, msg));
+    }
+    ret comptime.bind(?m.ctx, leaf, pc.value);
 }
 
-# the value module `dep` exports under `name`, or none when it exports no such
-# comptime constant. the export list holds exactly the module's `pub` comptime
-# vals, so a miss here IS the visibility guard: a private `val` is not in it
-fun pub_const_lookup(dep: *project.ModuleEntry, name: intern.StrId) O.Option[comptime.CTValue] {
+pub fun remerge_tuple_pub_consts(p: *project.Project, mid: session.ModuleId, ti: u32) R.Result[bool, str] {
+    val m: *project.ModuleEntry = ?p.modules[mid::u32];
+    var bound: u32 = 0;
+    var i: u32 = 0;
+    for (i < m.const_import_count) {
+        val ci: *project.ModRef = ?m.const_imports[i];
+        if (O.is_some[comptime.NamedConst](comptime.lookup(?m.ctx, ci.name))) {
+            bound = bound + 1;
+            i = i + 1;
+            cnt;
+        }
+        val dep: *project.ModuleEntry = ?p.modules[ci.module::u32];
+        val v: O.Option[*project.PubConst] = pub_const_lookup(dep, ci.name);
+        if (O.is_none[*project.PubConst](v)) { i = i + 1; cnt; }
+        val pc: *project.PubConst = O.unwrap[*project.PubConst](v);
+        if (pc.gated && p.union) {
+            val msg: str = gated_const_message(p.s, ci.name, dep.fqn);
+            val committed_r: R.Result[bool, str] = diagnostic.gate_error(?p.s.gate_diags, ?p.s.diags, ?p.s.interner, m.file_id, ci.span, msg);
+            if (R.is_err[bool, str](committed_r)) { ret R.err[bool, str](R.unwrap_err[bool, str](committed_r)); }
+            bound = bound + 1;
+            i = i + 1;
+            cnt;
+        }
+        val br: R.Result[R.Void, str] = comptime.bind(?m.ctx, ci.name, pc.value);
+        if (R.is_err[R.Void, str](br)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](br)); }
+        bound = bound + 1;
+        i = i + 1;
+    }
+    var changed: bool = false;
+    if (m.tuple_gates != nil && ti < m.tuple_gate_count) {
+        val tg: *project.TupleGateResult = ?m.tuple_gates[ti];
+        if (bound > tg.merged_const_count) {
+            tg.merged_const_count = bound;
+            changed = true;
+        }
+    }
+    ret R.ok[bool, str](changed);
+}
+
+fun pub_const_lookup(dep: *project.ModuleEntry, name: intern.StrId) O.Option[*project.PubConst] {
     var i: u32 = 0;
     for (i < dep.pub_const_count) {
         val pc: *project.PubConst = ?dep.pub_consts[i];
-        if (pc.name == name) { ret O.some[comptime.CTValue](pc.value); }
+        if (pc.name == name) { ret O.some[*project.PubConst](pc); }
         i = i + 1;
     }
-    ret O.none[comptime.CTValue]();
+    ret O.none[*project.PubConst]();
 }
 
-# the module a local name denotes in module `m`, or none when the name binds no
-# module reference
 fun mod_ref_lookup(m: *project.ModuleEntry, name: intern.StrId) O.Option[session.ModuleId] {
     var i: u32 = 0;
     for (i < m.mod_ref_count) {
@@ -1497,37 +1571,12 @@ fun mod_ref_lookup(m: *project.ModuleEntry, name: intern.StrId) O.Option[session
     ret O.none[session.ModuleId]();
 }
 
-# what the load walk's member resolver needs to answer a module-qualified path:
-# the project (re-indexed on every call, since loading a module reallocates the
-# entry array) and the module whose expression is being folded
 rec LoadMemberCtx {
     p:   *project.Project;
     mid: session.ModuleId;
 }
 
-# the module-qualified member resolver (a comptime.ModuleMemberFn) the load walk
-# installs around its own folds, so `sizes.SLOTS` folds at load exactly as the
-# bare `SLOTS` an unaliased import binds already does (#3075).
-#
-# Without it a module-level `val` whose initializer reached through a module
-# reference never folded, so it was never bound into the module's ComptimeCtx and
-# every later use of the NAME - an array length, a `$if` gate - reported the name
-# as not a comptime constant, while the same qualified path spelled inline folded
-# fine against the resolver sema installs. The load walk owns the import graph, so
-# it can answer the path here from the alias-to-module map `use` records and the
-# dep's own export list, with no dependency on name resolution.
-#
-# Resolution is structural (an IDENT object naming a module reference) because no
-# resolve result exists yet. Anything else - a member of a value, an unknown name,
-# a member the dep does not export - is none, which the evaluator turns into its
-# ordinary "not a module-level constant" refusal; the caller folding an initializer
-# skips the val exactly as it did before, so nothing that used to load stops.
-# ---
-# data: the *LoadMemberCtx, erased to a ptr by the installer
-# eid:  the MEMBER expression id, valid in this module's ast
-# ret:  some(value) when the path names an exported module-level constant, else none
-fun resolve_module_member_const_load(data: ptr, eid: id.ExprId) R.Result[O.Option[comptime.CTValue], str] {
-    val lc: *LoadMemberCtx = data::*LoadMemberCtx;
+fun resolve_module_member_const_load(lc: *LoadMemberCtx, eid: id.ExprId) R.Result[O.Option[comptime.CTValue], str] {
     if (lc == nil) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
     val m: *project.ModuleEntry = ?lc.p.modules[lc.mid::u32];
     if (m.a == nil) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
@@ -1555,97 +1604,82 @@ fun resolve_module_member_const_load(data: ptr, eid: id.ExprId) R.Result[O.Optio
     if (R.is_err[intern.StrId, str](name_r)) { ret R.err[O.Option[comptime.CTValue], str](R.unwrap_err[intern.StrId, str](name_r)); }
 
     val dep: *project.ModuleEntry = ?lc.p.modules[(O.unwrap[session.ModuleId](dep_opt))::u32];
-    ret R.ok[O.Option[comptime.CTValue], str](pub_const_lookup(dep, R.unwrap_ok[intern.StrId, str](name_r)));
+    val name: intern.StrId = R.unwrap_ok[intern.StrId, str](name_r);
+    val v: O.Option[*project.PubConst] = pub_const_lookup(dep, name);
+    if (O.is_none[*project.PubConst](v)) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
+    val pc: *project.PubConst = O.unwrap[*project.PubConst](v);
+    if (pc.gated && lc.p.union) {
+        val msg: str = gated_const_message(lc.p.s, name, dep.fqn);
+        val committed_r: R.Result[bool, str] = diagnostic.gate_error(?lc.p.s.gate_diags, ?lc.p.s.diags, ?lc.p.s.interner, m.file_id, node.data.member.name, msg);
+        if (R.is_err[bool, str](committed_r)) { ret R.err[O.Option[comptime.CTValue], str](R.unwrap_err[bool, str](committed_r)); }
+        ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]());
+    }
+    ret R.ok[O.Option[comptime.CTValue], str](O.some[comptime.CTValue](pc.value));
 }
 
-# fold one of module `mid`'s own comptime expressions with the load walk's member
-# resolver installed for the duration. the window is the call, not the pass: the
-# resolver context lives on this frame, so the borrowed ctx never keeps a pointer
-# into a frame that has returned
 pub fun eval_for_load(
     p:      *project.Project,
     mid:    session.ModuleId,
     source: str,
     e:      id.ExprId,
     fw:     float.FloatWidth
-) R.Result[comptime.CTValue, str] {
+) R.Result[comptime.CTValue, comptime.EvalFail] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
     var lc: LoadMemberCtx;
     lc.p   = p;
     lc.mid = mid;
     val lcp: *LoadMemberCtx = ?lc;
-    comptime.set_member_resolver(?m.ctx, resolve_module_member_const_load::*u8, lcp::ptr);
-    val r: R.Result[comptime.CTValue, str] =
-        comptime.eval_at_float_width(?m.ctx, m.a, source, e, ?p.s.interner, fw);
-    comptime.set_member_resolver(?m.ctx, nil, nil);
-    ret r;
+    val caps_r: R.Result[comptime.PhaseCapabilities[LoadMemberCtx], str] =
+        comptime.loading_capabilities[LoadMemberCtx](resolve_module_member_const_load);
+    if (R.is_err[comptime.PhaseCapabilities[LoadMemberCtx], str](caps_r)) {
+        var f: comptime.EvalFail;
+        f.kind    = comptime.EVAL_FAIL_REJECTED;
+        f.message = R.unwrap_err[comptime.PhaseCapabilities[LoadMemberCtx], str](caps_r);
+        ret R.err[comptime.CTValue, comptime.EvalFail](f);
+    }
+    val caps: comptime.PhaseCapabilities[LoadMemberCtx] =
+        R.unwrap_ok[comptime.PhaseCapabilities[LoadMemberCtx], str](caps_r);
+    ret comptime.evaluate_at_float_width[LoadMemberCtx](?m.ctx, lcp, caps, m.a, source, e, ?p.s.interner, fw);
 }
 
-# fold a module-level `val` initializer and, when it is comptime, bind it into the
-# ctx (exporting it when pub). a non-foldable initializer is skipped, not an error
-fun register_val_for_load(p: *project.Project, mid: session.ModuleId, d: *decl.Decl, _did: id.DeclId) R.Result[bool, str] {
-    if (d.data.bind.name.len == 0)       { ret R.ok[bool, str](true); }
-    if (d.data.bind.init == id.EXPR_NIL) { ret R.ok[bool, str](true); }
+fun register_val_for_load(p: *project.Project, mid: session.ModuleId, d: *decl.Decl, _did: id.DeclId) R.Result[R.Void, str] {
+    if (d.data.bind.name.len == 0)       { ret R.ok_void[str](); }
+    if (d.data.bind.init == id.EXPR_NIL) { ret R.ok_void[str](); }
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
     val src_opt: O.Option[*src.SourceFile] = src.get(?p.s.sources, m.file_id);
-    if (O.is_none[*src.SourceFile](src_opt)) { ret R.err[bool, str]("module file_id not found in SourceMap"); }
+    if (O.is_none[*src.SourceFile](src_opt)) { ret R.err[R.Void, str]("module file_id not found in SourceMap"); }
     val source: str = O.unwrap[*src.SourceFile](src_opt).text;
 
     val r_id: R.Result[intern.StrId, str] = intern.intern_span(?p.s.interner, source, d.data.bind.name);
     if (R.is_err[intern.StrId, str](r_id)) {
-        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](r_id));
+        ret R.err[R.Void, str](R.unwrap_err[intern.StrId, str](r_id));
     }
     val name_id: intern.StrId = R.unwrap_ok[intern.StrId, str](r_id);
 
-    # a module-level `val` need not be a comptime constant: only those whose
-    # initializer folds are registered into the comptime ctx (so `$if`
-    # predicates and intrinsics can read them). a non-foldable initializer
-    # (e.g. a runtime constant such as `os.OS_LINUX` accessed through an alias)
-    # is DELIBERATELY skipped here - NOT an error. cmach folds module `val`s
-    # lazily and likewise never rejects one at its definition site; a genuine
-    # comptime-context requirement is enforced at the USE site, where comptime
-    # evaluation errors "identifier is not a comptime constant in scope" if the
-    # name was never registered. do not promote this skip to a hard
-    # definition-site error.
-    #
-    # A FLOAT initializer folds at the width the annotation spells, so an `f32`
-    # constant is the f32 the program computes rather than an f64 that agrees
-    # with it only sometimes (#2918).
     val fw: float.FloatWidth = comptime.declared_float_width(m.a, source, d.data.bind.ty);
-    val r_val: R.Result[comptime.CTValue, str] =
+    val r_val: R.Result[comptime.CTValue, comptime.EvalFail] =
         eval_for_load(p, mid, source, d.data.bind.init, fw);
-    if (R.is_err[comptime.CTValue, str](r_val)) { ret R.ok[bool, str](true); }
-    val v: comptime.CTValue = R.unwrap_ok[comptime.CTValue, str](r_val);
+    if (R.is_err[comptime.CTValue, comptime.EvalFail](r_val)) { ret R.ok_void[str](); }
+    val v: comptime.CTValue = comptime.apply_declared_int_type(m.a, source, d.data.bind.ty,
+        R.unwrap_ok[comptime.CTValue, comptime.EvalFail](r_val));
 
-    # a float whose declared width the annotation did not spell (a float type
-    # reached through an alias) is a float this pass cannot fold correctly: no
-    # type exists yet to read the alias through. skipped by the same rule as a
-    # non-foldable initializer above, and bound at lowering, where the type is
-    # known - never bound here at f64, which would export a constant that
-    # disagrees with the one the program computes.
-    #
-    # THE SKIP IS RECORDED rather than silent. It is the only place that knows
-    # why this name has no value yet, and dropping that left the use site able to
-    # say only that the name was not a comptime constant in scope - which is
-    # false in both halves and sends the reader looking for a declaration that is
-    # already there (#2937).
-    if (comptime.float_width_unread(v)) { ret comptime.defer_float_width(?m.ctx, name_id); }
+    if (comptime.float_width_unread(v)) {
+        ret comptime.defer_float_width(?m.ctx, name_id);
+    }
 
-    val rr: R.Result[bool, str] = comptime.bind(?m.ctx, name_id, v);
-    if (R.is_err[bool, str](rr)) { ret rr; }
+    val rr: R.Result[R.Void, str] = comptime.bind_gated(?m.ctx, name_id, v, p.in_gated_decl_walk);
+    if (R.is_err[R.Void, str](rr)) { ret rr; }
 
     val is_pub: bool = (d.flags & decl.DECL_FLAG_PUB) != 0;
     if (is_pub) { ret add_pub_const(p, m, name_id, v); }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# append a `(name, value)` pub comptime constant to module `m`'s export list,
-# growing it as needed
-fun add_pub_const(p: *project.Project, m: *project.ModuleEntry, name: intern.StrId, value: comptime.CTValue) R.Result[bool, str] {
+fun add_pub_const(p: *project.Project, m: *project.ModuleEntry, name: intern.StrId, value: comptime.CTValue) R.Result[R.Void, str] {
     if (m.pub_consts == nil) {
         val r: R.Result[*project.PubConst, str] = A.allocate[project.PubConst](p.alloc, INITIAL_PUB_CAP::usize);
         if (R.is_err[*project.PubConst, str](r)) {
-            ret R.err[bool, str](R.unwrap_err[*project.PubConst, str](r));
+            ret R.err[R.Void, str](R.unwrap_err[*project.PubConst, str](r));
         }
         m.pub_consts   = R.unwrap_ok[*project.PubConst, str](r);
         m.pub_const_cap = INITIAL_PUB_CAP;
@@ -1654,7 +1688,7 @@ fun add_pub_const(p: *project.Project, m: *project.ModuleEntry, name: intern.Str
         val new_cap: u32 = m.pub_const_cap * 2;
         val r: R.Result[*project.PubConst, str] = A.reallocate[project.PubConst](p.alloc, m.pub_consts, m.pub_const_cap::usize, new_cap::usize);
         if (R.is_err[*project.PubConst, str](r)) {
-            ret R.err[bool, str](R.unwrap_err[*project.PubConst, str](r));
+            ret R.err[R.Void, str](R.unwrap_err[*project.PubConst, str](r));
         }
         m.pub_consts   = R.unwrap_ok[*project.PubConst, str](r);
         m.pub_const_cap = new_cap;
@@ -1662,57 +1696,168 @@ fun add_pub_const(p: *project.Project, m: *project.ModuleEntry, name: intern.Str
     var pc: project.PubConst;
     pc.name  = name;
     pc.value = value;
+    pc.gated = p.in_gated_decl_walk;
     m.pub_consts[m.pub_const_count] = pc;
     m.pub_const_count = m.pub_const_count + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# append `mid` to the topological order, growing the topo array as needed
-fun topo_push(p: *project.Project, mid: session.ModuleId) R.Result[bool, str] {
+pub fun rebuild_topo(p: *project.Project, emit_roots: *session.ModuleId, emit_root_count: u32) R.Result[R.Void, str] {
+    if (p.module_len == 0) { p.topo_len = 0; ret R.ok_void[str](); }
+    val ir: R.Result[*bool, str] = A.allocate[bool](p.alloc, p.module_len::usize);
+    if (R.is_err[*bool, str](ir)) { ret R.err[R.Void, str](R.unwrap_err[*bool, str](ir)); }
+    val included: *bool = R.unwrap_ok[*bool, str](ir);
+    val sr: R.Result[*u8, str] = A.allocate[u8](p.alloc, p.module_len::usize);
+    if (R.is_err[*u8, str](sr)) {
+        A.deallocate[bool](p.alloc, included, p.module_len::usize);
+        ret R.err[R.Void, str](R.unwrap_err[*u8, str](sr));
+    }
+    val state: *u8 = R.unwrap_ok[*u8, str](sr);
+    val er: R.Result[*bool, str] = A.allocate[bool](p.alloc, p.module_len::usize);
+    if (R.is_err[*bool, str](er)) {
+        A.deallocate[u8](p.alloc, state, p.module_len::usize);
+        A.deallocate[bool](p.alloc, included, p.module_len::usize);
+        ret R.err[R.Void, str](R.unwrap_err[*bool, str](er));
+    }
+    val emitted: *bool = R.unwrap_ok[*bool, str](er);
+    var i: u32 = 0;
+    for (i < p.module_len) { included[i] = false; emitted[i] = false; state[i] = 0; i = i + 1; }
+    i = 0;
+    for (i < p.topo_len) { included[p.topo[i]::u32] = true; i = i + 1; }
+    i = 0;
+    for (i < emit_root_count) {
+        mark_emitted_deps(p, emit_roots[i], emitted);
+        i = i + 1;
+    }
+
+    val tr: R.Result[*session.ModuleId, str] = A.allocate[session.ModuleId](p.alloc, p.module_len::usize);
+    if (R.is_err[*session.ModuleId, str](tr)) {
+        A.deallocate[bool](p.alloc, emitted, p.module_len::usize);
+        A.deallocate[u8](p.alloc, state, p.module_len::usize);
+        A.deallocate[bool](p.alloc, included, p.module_len::usize);
+        ret R.err[R.Void, str](R.unwrap_err[*session.ModuleId, str](tr));
+    }
+    val ordered: *session.ModuleId = R.unwrap_ok[*session.ModuleId, str](tr);
+    var ordered_len: u32 = 0;
+    i = 0;
+    for (i < p.topo_len) {
+        val mid: session.ModuleId = p.topo[i];
+        if (!emitted[mid::u32]) { i = i + 1; cnt; }
+        val vr: R.Result[R.Void, str] = topo_visit(p, mid, included, state, ordered, ?ordered_len);
+        if (R.is_err[R.Void, str](vr)) {
+            A.deallocate[session.ModuleId](p.alloc, ordered, p.module_len::usize);
+            A.deallocate[bool](p.alloc, emitted, p.module_len::usize);
+            A.deallocate[u8](p.alloc, state, p.module_len::usize);
+            A.deallocate[bool](p.alloc, included, p.module_len::usize);
+            ret vr;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < p.topo_len) {
+        val mid: session.ModuleId = p.topo[i];
+        if (emitted[mid::u32]) { i = i + 1; cnt; }
+        val vr: R.Result[R.Void, str] = topo_visit(p, mid, included, state, ordered, ?ordered_len);
+        if (R.is_err[R.Void, str](vr)) {
+            A.deallocate[session.ModuleId](p.alloc, ordered, p.module_len::usize);
+            A.deallocate[bool](p.alloc, emitted, p.module_len::usize);
+            A.deallocate[u8](p.alloc, state, p.module_len::usize);
+            A.deallocate[bool](p.alloc, included, p.module_len::usize);
+            ret vr;
+        }
+        i = i + 1;
+    }
+
+    if (p.topo != nil && p.topo_cap > 0) {
+        A.deallocate[session.ModuleId](p.alloc, p.topo, p.topo_cap::usize);
+    }
+    p.topo = ordered;
+    p.topo_len = ordered_len;
+    p.topo_cap = p.module_len;
+    p.emit_len = 0;
+    for (p.emit_len < p.topo_len && emitted[p.topo[p.emit_len]::u32]) {
+        p.emit_len = p.emit_len + 1;
+    }
+    A.deallocate[bool](p.alloc, emitted, p.module_len::usize);
+    A.deallocate[u8](p.alloc, state, p.module_len::usize);
+    A.deallocate[bool](p.alloc, included, p.module_len::usize);
+    ret R.ok_void[str]();
+}
+
+fun mark_emitted_deps(p: *project.Project, mid: session.ModuleId, emitted: *bool) {
+    if (mid::u32 >= p.module_len || emitted[mid::u32]) { ret; }
+    emitted[mid::u32] = true;
+    val m: *project.ModuleEntry = ?p.modules[mid::u32];
+    var i: u32 = 0;
+    for (i < m.dep_count) {
+        mark_emitted_deps(p, m.deps[i], emitted);
+        i = i + 1;
+    }
+}
+
+fun topo_visit(p: *project.Project, mid: session.ModuleId, included: *bool, state: *u8,
+               ordered: *session.ModuleId, ordered_len: *u32) R.Result[R.Void, str] {
+    if (mid::u32 >= p.module_len || !included[mid::u32]) { ret R.ok_void[str](); }
+    if (state[mid::u32] == 2) { ret R.ok_void[str](); }
+    if (state[mid::u32] == 1) { ret R.err[R.Void, str]("circular module dependency through a deferred comptime gate"); }
+    state[mid::u32] = 1;
+    val m: *project.ModuleEntry = ?p.modules[mid::u32];
+    var i: u32 = 0;
+    for (i < m.dep_count) {
+        val vr: R.Result[R.Void, str] = topo_visit(p, m.deps[i], included, state, ordered, ordered_len);
+        if (R.is_err[R.Void, str](vr)) { ret vr; }
+        i = i + 1;
+    }
+    state[mid::u32] = 2;
+    ordered[@ordered_len] = mid;
+    @ordered_len = @ordered_len + 1;
+    ret R.ok_void[str]();
+}
+
+fun topo_push(p: *project.Project, mid: session.ModuleId) R.Result[R.Void, str] {
     if (p.topo == nil) {
         val r: R.Result[*session.ModuleId, str] = A.allocate[session.ModuleId](p.alloc, INITIAL_MODULE_CAP::usize);
-        if (R.is_err[*session.ModuleId, str](r)) { ret R.err[bool, str](R.unwrap_err[*session.ModuleId, str](r)); }
+        if (R.is_err[*session.ModuleId, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*session.ModuleId, str](r)); }
         p.topo     = R.unwrap_ok[*session.ModuleId, str](r);
         p.topo_cap = INITIAL_MODULE_CAP;
     }
     or (p.topo_len == p.topo_cap) {
         val new_cap: u32 = p.topo_cap * 2;
         val r: R.Result[*session.ModuleId, str] = A.reallocate[session.ModuleId](p.alloc, p.topo, p.topo_cap::usize, new_cap::usize);
-        if (R.is_err[*session.ModuleId, str](r)) { ret R.err[bool, str](R.unwrap_err[*session.ModuleId, str](r)); }
+        if (R.is_err[*session.ModuleId, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*session.ModuleId, str](r)); }
         p.topo     = R.unwrap_ok[*session.ModuleId, str](r);
         p.topo_cap = new_cap;
     }
     p.topo[p.topo_len] = mid;
     p.topo_len = p.topo_len + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# publish every loaded module's AST and FQN to the
-# session's ModuleId-indexed registries. the modules array is stable past the
-# load pass, so the borrowed pointers remain valid for the rest of the build.
-# the FQN registry lets the back-end mangler name a cross-module symbol against
-# its defining module
-pub fun register_module_asts(p: *project.Project) R.Result[bool, str] {
+pub fun register_module_asts(p: *project.Project) R.Result[R.Void, str] {
     var i: u32 = 0;
     for (i < p.module_len) {
         val m: *project.ModuleEntry = ?p.modules[i];
-        val r: R.Result[bool, str] = session.register_module_ast(p.s, i, m.a);
-        if (R.is_err[bool, str](r)) { ret r; }
-        val rf: R.Result[bool, str] = session.register_module_fqn(p.s, i, m.fqn);
-        if (R.is_err[bool, str](rf)) { ret rf; }
-        # record this build's StableModuleId -> ModuleId so a reused ResolveResult
-        # remaps its stale ModuleIds into this build's numbering (#1582).
-        val rs: R.Result[bool, str] = session.register_stable_mid(p.s, m.stable_id, i);
-        if (R.is_err[bool, str](rs)) { ret rs; }
-        # publish this module's current per-build ModuleId as the Q_MODULE_NUMBER
-        # input, keyed by its stable id. set_input's early-cutoff leaves last_changed
-        # untouched when the number is unchanged (a content-only edit), and advances
-        # it on a graph reshape that renumbers the module - the signal Q_SEMA depends
-        # on to re-type-check a module whose interned type identities went stale (#1583).
+        val r: R.Result[R.Void, str] = session.register_module_identity(p.s, i, m.a, m.fqn, m.stable_id);
+        if (R.is_err[R.Void, str](r)) { unpublish_modules(p, i); ret r; }
+
         var num: u32 = i::u32;
-        val rn: R.Result[bool, str] = query.set_input(?p.s.queries, query.Q_MODULE_NUMBER, m.stable_id::u64, (?num)::*u8, 4);
-        if (R.is_err[bool, str](rn)) { ret rn; }
+        val rn: R.Result[R.Void, str] = query.set_input(?p.s.queries, query.Q_MODULE_NUMBER, m.stable_id::u64, (?num)::*u8, 4);
+        if (R.is_err[R.Void, str](rn)) {
+            session.unregister_module_identity(p.s, i, m.stable_id);
+            unpublish_modules(p, i);
+            ret rn;
+        }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
+}
+
+fun unpublish_modules(p: *project.Project, published: u32) {
+    var j: u32 = 0;
+    for (j < published) {
+        val m: *project.ModuleEntry = ?p.modules[j];
+        session.unregister_module_identity(p.s, j, m.stable_id);
+        query.invalidate(?p.s.queries, query.Q_MODULE_NUMBER, m.stable_id::u64);
+        j = j + 1;
+    }
 }

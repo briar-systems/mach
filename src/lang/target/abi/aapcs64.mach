@@ -1,85 +1,14 @@
-# mach.lang.target.abi.aapcs64: AArch64 AAPCS64 calling convention
-#
-# Implements `abi.AbiVTable` and self-registers under `abi.ABI_AAPCS64`. Owns the
-# AAPCS64 classification of parameters and return values -- the scalar
-# one-register rule, the <=16-byte aggregate one/two-GP-register rule, and the
-# >16-byte by-reference rule -- plus the GP/FP/callee-saved register files, the
-# 16-byte stack alignment, and no red zone. The GP and FP argument banks advance
-# independently (the NGRN and NSRN cursors of the psABI).
-#
-# A scalar or a <=16-byte integer aggregate is placed in GP registers. A
-# Homogeneous Floating-point / Short-Vector Aggregate (HFA/HVA -- a composite of
-# 1-4 members all of one fundamental FP type) rides a run of consecutive V
-# registers (V0-V7). A >16-byte non-HFA aggregate is passed by hidden reference
-# and returned through the dedicated X8 indirect-result register, which rides
-# OUTSIDE the X0-X7 argument file (`indirect_result_in_argfile` is false) so the
-# real arguments still start at X0. The HFA descriptor (member count and
-# fundamental width) is computed by the backend and threaded through
-# `classify_arg` / `classify_return`.
-#
-# The vtable's classify/arg/ret function pointers are type-erased (`*u8`); a
-# consumer casts each back to the neutral signature declared in `abi`. The full
-# AArch64 `va_list` variadic model is deferred: `va_model` returns a register-save
-# placeholder sufficient for non-variadic call lowering.
-#
-# Documented simplifications (each diverges only on the narrow domain noted; none
-# is reached by the signatures mach's own code and tests exercise):
-#
-#   - NGRN/NSRN saturation (psABI C.4 / C.13). When a register-eligible argument is
-#     passed on the stack because its required register run did not fit, the psABI
-#     sets that bank's next-register cursor to 8, forcing every later argument of
-#     the same bank onto the stack too. mach advances each cursor only by the
-#     registers a slot actually consumes (`advance_arg_cursors` in `mir.abi`), so it
-#     does NOT saturate: after such a spill a later, smaller same-bank argument can
-#     still back-fill a register the psABI leaves unused. Diverges only for a
-#     signature that spills a register-eligible argument (an HFA/HVA, or a 9-16 byte
-#     GP aggregate whose run does not fit) AHEAD of a later same-bank argument small
-#     enough to occupy a still-free register; safe for any signature without that
-#     spill-then-backfill tail.
-#
-#   - C.10 even-register-pair alignment. The psABI rounds NGRN up to the next even
-#     number before placing a 16-byte-aligned composite in a GP register pair (so a
-#     pair starts X0:X1 / X2:X3 / ..., never an odd boundary). `classify_arg` places
-#     a 9-16 byte aggregate in the next consecutive GP pair without that rounding
-#     (the `align` argument is ignored on that path). Diverges only for a >8-byte
-#     integer aggregate with 16-byte alignment -- reachable only through an
-#     `#[align(16)]` decorator, since the natural alignment of mach's fundamentals
-#     never exceeds 8 -- classified at an odd NGRN; safe for every naturally-aligned
-#     aggregate.
-#
-#   - Variadic-tail classification. The AAPCS64 BASE STANDARD classifies a variadic
-#     argument exactly like a named one, so the classifier below is complete for it and
-#     is what linux/aarch64 uses for a C-variadic call's tail unchanged.
-#
-#     APPLE'S ARM64 ABI DIVERGES: it passes every argument in the variadic tail on the
-#     stack, with no register phase (#2575). That divergence is NOT expressed here,
-#     because this one vtable is composed for darwin and linux alike and so cannot tell
-#     them apart. It is a platform fact the os vtable declares per architecture
-#     (`os.variadic_stack`), which `target.select` resolves onto the target and the
-#     shared call lowering applies by moving this classifier's placement to the stack
-#     (`mir.abi.stack_only_tail_slot`). Placement only: a by-reference tail argument
-#     stays by reference, with its hidden pointer on the stack.
-
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.string.str;
 
+use O: std.types.option;
 use R: std.types.result;
 
 use mach.lang.target.abi;
 use mach.lang.target.isa;
 
-# the AAPCS64 ABI vtable. populated by `register` on first call and handed out as a
-# borrowed pointer to the registry. its classify/arg/ret function pointers are
-# stored type-erased (`*u8`); consumers cast them back to
-# `ClassifyFn`/`ArgPassingFn`/`RetPassingFn`
-var aapcs64_vtable: abi.AbiVTable;
-
-# canonical AArch64 general-purpose register numbers used by the AAPCS64
-# convention. these are the same physical-register ids the aarch64 ISA exposes;
-# they are fixed by the architecture, so the ABI carries them directly rather than
-# depending on the ISA implementation being registered first
 pub val REG_X0:  i32 = 0;
 pub val REG_X1:  i32 = 1;
 pub val REG_X2:  i32 = 2;
@@ -88,10 +17,6 @@ pub val REG_X4:  i32 = 4;
 pub val REG_X5:  i32 = 5;
 pub val REG_X6:  i32 = 6;
 pub val REG_X7:  i32 = 7;
-# the indirect-result register: the caller passes the address of the result
-# storage for a >16-byte (sret) return here. it rides OUTSIDE the X0-X7 argument
-# file (`indirect_result_in_argfile` is false), so the call / callee lowering
-# place and read the hidden pointer in X8 and the real arguments still start at X0
 pub val REG_X8:  i32 = 8;
 pub val REG_X19: i32 = 19;
 pub val REG_X20: i32 = 20;
@@ -104,48 +29,22 @@ pub val REG_X26: i32 = 26;
 pub val REG_X27: i32 = 27;
 pub val REG_X28: i32 = 28;
 
-# number of GP registers available for argument passing (X0-X7)
 pub val GP_PARAM_COUNT:        i32 = 8;
-# number of FP / vector registers available for argument passing (V0-V7)
 pub val FP_PARAM_COUNT:        i32 = 8;
-# number of callee-saved GP registers (X19-X28)
 pub val GP_CALLEE_SAVED_COUNT: i32 = 10;
-# number of callee-saved FP registers (V8-V15; the psABI preserves only their low
-# 64 bits, modeled here as whole-register callee saves)
 pub val FP_CALLEE_SAVED_COUNT: i32 = 8;
-# total callee-saved registers across both banks
 pub val CALLEE_SAVED_COUNT:    i32 = 18;
 
-# required stack alignment in bytes at a call boundary
 pub val STACK_ALIGN: u32 = 16;
-# AArch64 defines no leaf-function red zone
 pub val RED_ZONE:    u32 = 0;
-# largest aggregate size in bytes passed/returned in registers; anything larger is
-# passed/returned by hidden reference
-#
-# `Result[T, str]` crossing this boundary at 24 -> 16 bytes reclassified it from X8 sret
-# to the X0:X1 pair here exactly as under SysV; see the measurement recorded at
-# `sysv.MAX_REG_RET` (#2293).
 pub val MAX_REG_RET: u64 = 16;
 
-# local aliases of the neutral vtable function signatures (`mach.lang.target.abi`).
-# the shared typedefs live in the abi module so a consumer typing any convention's
-# erased vtable pointer never routes through this concrete convention; aapcs64
-# keeps these names for its own use and self-registration
 pub def ClassifyFn:   abi.ClassifyFn;
 pub def ArgPassingFn: abi.ArgPassingFn;
 pub def RetPassingFn: abi.RetPassingFn;
 pub def RegFileFn:    abi.RegFileFn;
 pub def VaModelFn:    abi.VaModelFn;
 
-# return the GP argument register for a given argument-register index, or -1 when
-# the index is past the eight GP argument registers (X0-X7)
-# ---
-# index: zero-based GP argument-register index
-# ret:   the physical register id, or -1 if out of range
-# AAPCS64's argument-slot granularity: one 8-byte general-purpose chunk, and so the
-# offset of the second register's bytes within a 9-16 byte aggregate pair. fixed by
-# the procedure call standard rather than derived from the register file
 pub val WORD: u32 = 8;
 
 pub fun gp_param_reg(index: i32) i32 {
@@ -154,105 +53,25 @@ pub fun gp_param_reg(index: i32) i32 {
     ret index;
 }
 
-# return the FP/vector argument register for a given argument-register index, or
-# -1 past V7
-#
-# V registers are numbered identically to their index within the vector bank; the
-# returned id is composite (the vector class tag in the high byte) so a float
-# pre-coloring carries its bank.
-# ---
-# index: zero-based FP argument-register index
-# ret:   the composite V register id, or -1 if out of range
 pub fun fp_param_reg(index: i32) i32 {
     if (index < 0)               { ret -1; }
     if (index >= FP_PARAM_COUNT) { ret -1; }
     ret isa.regid_make(isa.REG_CLASS_ID_XMM, index);
 }
 
-# the byte width of one V register, and so of the single piece a short vector rides
-#
-# THIS IS A REGISTER WIDTH, NOT A VALUE WIDTH, and the distinction is the whole
-# reason it is named here. Both vector paths below spelled it as a bare literal 16
-# beside the real `size`, which reads as a claim that every vector IS sixteen bytes -
-# it is not: `f32x3` is twelve and `f32x2` is eight, and both correctly ride a whole
-# V register with a 16-byte transfer. Writing it as a literal made the two paths look
-# like the fixed-size ladders #2733 removed from the encoders, and a reader
-# "correcting" them to `size` breaks every vector narrower than a Q register - which
-# is measured, not supposed: it fails the codegen corpus's `call/call_mixed` and `vec/` cases on the twelve-byte
-# `i32x3` argument.
-#
-# What the literal DOES hide is the case it cannot serve: a vector wider than a V
-# register has no one-register form at all, and #2727 makes those legal. Each path
-# below now decides that explicitly instead of handing out V0 and a piece describing
-# sixteen bytes of a value twice that long (#2733)
 val VEC_REG_BYTES: u8 = 16;
 
-# classify one value into an AAPCS64 placement decision
-#
-# This is the body behind the erased `AbiVTable.classify` pointer; it treats the
-# value as the first argument and routes through `classify_arg`. Returns are
-# routed separately through `classify_return`.
-# ---
-# size:          value size in bytes
-# align:         value alignment in bytes
-# is_float:      true if the value is FP-eligible
-# fp_eightbytes: per-eightbyte SSE mask (unused -- AAPCS64 routes FP through HFA)
-# is_aggregate:  true if the value is an aggregate
-# gp_used:       GP registers already consumed
-# fp_used:       FP registers already consumed
-# hfa_members:   HFA member count (1-4), or 0 if the value is not an HFA
-# hfa_elem:      HFA fundamental member width in bytes (0 if not an HFA)
-# ret:           the placement decision
 pub fun classify(size: u64, align: u64, is_float: bool, fp_eightbytes: u8,
                  is_aggregate: bool, gp_used: i32, fp_used: i32,
                  hfa_members: u8, hfa_elem: u8) abi.ParamSlot {
-    ret classify_arg(0, size, align, is_float, fp_eightbytes, is_aggregate, false, false, gp_used, fp_used, hfa_members, hfa_elem, abi.agg_none());
+    ret classify_arg(0, size, align, is_float, fp_eightbytes, is_aggregate, false, gp_used, fp_used, hfa_members, hfa_elem, abi.agg_none());
 }
 
-# assign registers or a stack slot for one argument (AAPCS64)
-#
-# An HFA/HVA (a homogeneous aggregate of 1-4 same-typed FP members, reported by
-# the backend through `hfa_members` / `hfa_elem`) rides a run of consecutive V
-# registers when the whole run fits in the remaining V bank; otherwise the WHOLE
-# aggregate spills to the stack by value (the AAPCS64 all-or-memory rule -- members
-# are never split across registers and stack). This is checked before the
-# by-reference rule, since a 4xf64 HFA is 32 bytes yet still register-passed.
-# Scalars take one GP register (or one V register for a float) until that bank is
-# exhausted, then spill to the stack. A non-HFA aggregate of <=8 bytes takes one
-# GP register; a 9-16 byte one takes a consecutive GP register pair; either spills
-# to the stack by value when the GP bank lacks the register(s) it needs. A non-HFA
-# aggregate larger than 16 bytes is passed by hidden reference -- the caller copies
-# it to memory and passes the pointer in the next GP register (CLASS_BYREF), or,
-# when the GP bank is exhausted, passes that pointer on the stack
-# (CLASS_STACK_BYREF). This classifier is AArch64-specific by selection:
-# `target.select` only composes the AAPCS64 vtable for an aarch64 (os, arch) pair.
-# ---
-# index:         zero-based logical argument position
-# size:          argument size in bytes
-# align:         argument alignment in bytes
-# is_float:      true if the argument goes in an FP register (scalar floats)
-# fp_eightbytes: per-eightbyte SSE mask (unused -- AAPCS64 routes FP through HFA)
-# is_aggregate:  true if the argument is an aggregate
-# is_vector:     true for a 128-bit SIMD vector (#1965): placed in a single V
-#                register as a one-member short-vector aggregate
-# is_ext:        true at a declared `ext` boundary (#2058); ignored under AAPCS64, whose
-#                convention already matches mach's internal one
-# gp_used:       GP registers already consumed
-# fp_used:       FP registers already consumed
-# hfa_members:   HFA member count (1-4), or 0 if the argument is not an HFA
-# hfa_elem:      HFA fundamental member width in bytes (0 if not an HFA)
-# agg:           the flattened-aggregate descriptor (lp64d-only; unused under AAPCS64)
-# ret:           the placement decision
 pub fun classify_arg(index: i32, size: u64, align: u64,
-                     is_float: bool, fp_eightbytes: u8, is_aggregate: bool, is_vector: bool, is_ext: bool,
+                     is_float: bool, fp_eightbytes: u8, is_aggregate: bool, is_vector: bool,
                      gp_used: i32, fp_used: i32, hfa_members: u8, hfa_elem: u8,
                      agg: abi.AggLayout) abi.ParamSlot {
     if (is_aggregate && hfa_members > 0) {
-        # the run fits only if every member lands in the remaining V bank; otherwise
-        # the whole aggregate goes to the stack by value (all-or-memory). the psABI
-        # additionally saturates NSRN to 8 on this spill (C.4); mach does not (see the
-        # NGRN/NSRN simplification in the module header), so a later smaller FP
-        # argument may still back-fill a V register the psABI leaves unused.
         if (fp_used + hfa_members::i32 <= FP_PARAM_COUNT) {
             ret abi.make_slot_hfa(fp_param_reg(fp_used), hfa_members, hfa_elem, size);
         }
@@ -260,8 +79,6 @@ pub fun classify_arg(index: i32, size: u64, align: u64,
     }
 
     if (is_aggregate && size > MAX_REG_RET) {
-        # >16 bytes: passed by reference. the pointer rides the next GP register, or
-        # the stack (as an 8-byte pointer) once the GP bank is exhausted.
         if (gp_used < GP_PARAM_COUNT) {
             ret abi.make_slot(abi.CLASS_BYREF, gp_param_reg(gp_used), 0, 8);
         }
@@ -275,28 +92,12 @@ pub fun classify_arg(index: i32, size: u64, align: u64,
             }
             ret abi.make_slot(abi.CLASS_STACK, -1, 0, size);
         }
-        # 9-16 bytes: a consecutive GP register pair, or spill by value if two GP
-        # registers do not remain. the psABI rounds NGRN up to the next even number
-        # first when `align` is 16 (C.10) and saturates NGRN to 8 on the spill (C.13);
-        # mach applies neither (see the C.10 and NGRN/NSRN simplifications in the
-        # module header), so the pair starts at the next register regardless of a
-        # 16-byte alignment, and a later smaller GP argument may back-fill X7.
         if (gp_used + 2 <= GP_PARAM_COUNT) {
             ret abi.make_slot_pair(abi.CLASS_GP, gp_param_reg(gp_used), gp_param_reg(gp_used + 1), 0, size, WORD);
         }
         ret abi.make_slot(abi.CLASS_STACK, -1, 0, size);
     }
 
-    # a short vector is a one-member Homogeneous Short-Vector Aggregate: it rides a
-    # single V register (V0-V7) as one whole-register member, or spills to the stack
-    # by value once the V bank is exhausted. the neutral driver reports it via
-    # `is_vector` (hfa_members stays 0, since a vector is not a struct of FP
-    # fundamentals). a vector WIDER than a V register has no one-register form, so it
-    # takes the MEMORY class the convention gives any composite over sixteen bytes:
-    # a hidden pointer in the next integer register, or on the stack once that bank is
-    # exhausted (#2727). It used to spill by value here, which was unreachable while
-    # the surface refused the shape and is not what the mid-end hands over now - a
-    # vector no register holds arrives as a pointer to its stack image.
     if (is_vector) {
         if (size <= VEC_REG_BYTES::u64) {
             if (fp_used < FP_PARAM_COUNT) {
@@ -323,29 +124,6 @@ pub fun classify_arg(index: i32, size: u64, align: u64,
     ret abi.make_slot(abi.CLASS_STACK, -1, 0, size);
 }
 
-# assign registers or an sret pointer for a return value (AAPCS64)
-#
-# A zero-size (void) return yields CLASS_GP with reg=-1. A scalar returns in X0,
-# or V0 for a float. An HFA/HVA returns in the V0..V(members-1) run. A non-HFA
-# aggregate of <=8 bytes returns in X0; a 9-16 byte one returns in the X0:X1 pair.
-# A non-HFA aggregate larger than 16 bytes is returned through the dedicated X8
-# indirect-result register (CLASS_SRET, reg=X8) -- the caller passes the
-# result-storage address in X8 and the callee reads it there, leaving X0-X7 for
-# the real arguments. The HFA check precedes the >16-byte sret rule (a 4xf64 HFA
-# is 32 bytes yet returns in V0-V3). This classifier is AArch64-specific by
-# selection -- the AAPCS64 vtable is only composed for an aarch64 target.
-# ---
-# size:          return-value size in bytes
-# align:         return-value alignment in bytes
-# is_float:      true if the value is returned in an FP register (scalar floats)
-# fp_eightbytes: per-eightbyte SSE mask (unused -- AAPCS64 routes FP through HFA)
-# is_aggregate:  true if the value is an aggregate
-# is_vector:     true for a 128-bit SIMD vector (#1965): returned in V0 as a
-#                one-member short-vector aggregate
-# hfa_members:   HFA member count (1-4), or 0 if the value is not an HFA
-# hfa_elem:      HFA fundamental member width in bytes (0 if not an HFA)
-# agg:           the flattened-aggregate descriptor (lp64d-only; unused under AAPCS64)
-# ret:           the placement decision
 pub fun classify_return(size: u64, align: u64,
                         is_float: bool, fp_eightbytes: u8, is_aggregate: bool, is_vector: bool,
                         hfa_members: u8, hfa_elem: u8, agg: abi.AggLayout) abi.ParamSlot {
@@ -353,7 +131,6 @@ pub fun classify_return(size: u64, align: u64,
         ret abi.make_slot(abi.CLASS_GP, -1, 0, 0);
     }
 
-    # an HFA/HVA returns in V0..V(members-1); a return always has the full V bank.
     if (is_aggregate && hfa_members > 0) {
         ret abi.make_slot_hfa(fp_param_reg(0), hfa_members, hfa_elem, size);
     }
@@ -369,9 +146,6 @@ pub fun classify_return(size: u64, align: u64,
         ret abi.make_slot_pair(abi.CLASS_GP, REG_X0, REG_X1, 0, size, WORD);
     }
 
-    # a short vector returns in V0 (a one-member short-vector aggregate) as one whole-
-    # register member. a vector WIDER than a V register has no return-register form,
-    # so it takes the indirect-result path any over-size aggregate takes.
     if (is_vector) {
         if (size <= VEC_REG_BYTES::u64) {
             ret abi.make_slot_hfa(fp_param_reg(0), 1, VEC_REG_BYTES, size);
@@ -386,14 +160,6 @@ pub fun classify_return(size: u64, align: u64,
     ret abi.make_slot(abi.CLASS_GP, REG_X0, 0, size);
 }
 
-# fill `out` with the general-purpose argument registers, in passing order
-#
-# Writes `out[0..GP_PARAM_COUNT)` with X0-X7 (each 8 bytes wide). The caller owns
-# `out`, which must hold at least `GP_PARAM_COUNT` registers; the count is returned
-# so the caller holds the (regs, count) pair.
-# ---
-# out: caller-owned buffer of at least GP_PARAM_COUNT registers
-# ret: the number of registers written (GP_PARAM_COUNT)
 pub fun gp_param_regs(out: *isa.Register) i32 {
     var i: i32 = 0;
     for (i < GP_PARAM_COUNT) {
@@ -404,16 +170,6 @@ pub fun gp_param_regs(out: *isa.Register) i32 {
     ret GP_PARAM_COUNT;
 }
 
-# fill `out` with the callee-saved registers across both banks
-#
-# Writes `out[0..CALLEE_SAVED_COUNT)` with the GP set X19-X28 (8 bytes each) then
-# the FP set V8-V15 (composite vector ids, 16 bytes each). A callee that touches
-# any of these must preserve it across the call; regalloc routes each to its bank
-# by the composite-id class tag. The caller owns `out`, which must hold at least
-# `CALLEE_SAVED_COUNT` registers.
-# ---
-# out: caller-owned buffer of at least CALLEE_SAVED_COUNT registers
-# ret: the number of registers written (CALLEE_SAVED_COUNT)
 pub fun callee_saved(out: *isa.Register) i32 {
     var i: i32 = 0;
     for (i < GP_CALLEE_SAVED_COUNT) {
@@ -430,144 +186,93 @@ pub fun callee_saved(out: *isa.Register) i32 {
     ret CALLEE_SAVED_COUNT;
 }
 
-# return the AAPCS64 call-side variadic-ABI model
-#
-# AArch64 encodes no caller vector-count register, so `vector_count_reg` is -1 (the
-# pre-call vector-count move is never emitted) and `float_dup_gp` is false. An
-# UNNAMED float rides the V bank exactly like a named one, so the unnamed width is
-# the named 64 -- Apple's "the whole tail goes on the stack" divergence is a
-# TARGET fact (`Target.variadic_args_on_stack`), applied after this placement, and
-# is not this convention's rule. The full AArch64 `va_list` callee surface is a
-# separate, deferred concern; nothing here carries it.
-# ---
-# ret: the AAPCS64 call-side variadic model
 pub fun va_model() abi.VaModel {
     ret abi.va_model_make(abi.VA_MODEL_REG_SAVE, false, -1, 64);
 }
 
-# build the AAPCS64 AbiVTable and install it into `reg`
-#
-# Sets the convention name ("aapcs64") as an immutable `str` constant, wires the
-# type-erased classify/arg/ret operation pointers and the GP argument-register
-# and callee-saved register-file accessors, sets the 16-byte stack alignment, no
-# red zone, and no shadow space, and registers it under `abi.ABI_AAPCS64` so
-# `target.select` can find it through `abi.lookup`. Idempotent: the registry entry
-# is write-once.
-# ---
-# reg: the ABI registry to install the vtable into
-# ret: ok(true) on success
-pub fun register(reg: *abi.AbiRegistry) R.Result[bool, str] {
-    # AAPCS64 reserves no caller shadow space -- stack arguments start at [sp+0].
+pub fun register(reg: *abi.AbiRegistry) R.Result[R.Void, str] {
     val shadow_space: u32 = 0;
-    # the hidden sret pointer rides the dedicated X8 indirect-result register,
-    # OUTSIDE the X0-X7 argument file -- so `classify_signature` leaves gp_used = 0
-    # and the real arguments still start at X0.
     val indirect_result_reg: i32 = REG_X8;
-    # AAPCS64 ignores the flattened-aggregate descriptor (the lp64d hard-float rules).
     val consumes_agg_layout: bool = false;
-    # AAPCS64 preserves only the low 64 bits of the callee-saved V8-V15; a 128-bit
-    # vector's upper half is caller-saved, so one live across a call must be spilled.
     val fp_callee_saved_full_vector: bool = false;
-    # the D registers carry both f32 and f64 arguments in the V bank.
     val float_arg_bits: u32 = 64;
 
-    aapcs64_vtable = abi.abi_vtable(
-        abi.ABI_AAPCS64, "aapcs64", isa.ARCH_AARCH64,
-        classify::*u8, classify_arg::*u8, classify_return::*u8,
-        gp_param_regs::*u8, callee_saved::*u8,
+    var aapcs64_vtable: abi.AbiVTable = abi.abi_vtable(
+        abi.ABI_AAPCS64, abi.abi_name_for(abi.ABI_AAPCS64), isa.ARCH_AARCH64,
+        classify_arg, classify_return,
+        gp_param_regs, callee_saved,
         STACK_ALIGN, RED_ZONE, shadow_space,
         indirect_result_reg, false,
         consumes_agg_layout, fp_callee_saved_full_vector,
         float_arg_bits, WORD,
-        va_model::*u8
+        va_model
     );
+    abi.with_legacy_classifier(?aapcs64_vtable, classify);
 
-    abi.register(reg, ?aapcs64_vtable);
-    ret R.ok[bool, str](true);
+    ret abi.register(reg, ?aapcs64_vtable);
 }
 
-# a scalar integer takes a GP register; a float takes a V register
 test "mach.lang.target.abi.aapcs64.classify_arg:scalar_register_banks" {
-    val i: abi.ParamSlot = classify_arg(0, 8, 8, false, 0, false, false, false, 0, 0, 0, 0, abi.agg_none());
+    val i: abi.ParamSlot = classify_arg(0, 8, 8, false, 0, false, false, 0, 0, 0, 0, abi.agg_none());
     if (i.class != abi.CLASS_GP) { ret 1; }
     if (i.reg != REG_X0)         { ret 1; }
-    val f: abi.ParamSlot = classify_arg(0, 8, 8, true, 0, false, false, false, 0, 0, 0, 0, abi.agg_none());
+    val f: abi.ParamSlot = classify_arg(0, 8, 8, true, 0, false, false, 0, 0, 0, 0, abi.agg_none());
     if (f.class != abi.CLASS_FP)  { ret 1; }
     if (f.reg != fp_param_reg(0)) { ret 1; }
     ret 0;
 }
 
-# a 16-byte integer aggregate rides a consecutive GP pair; an 8-byte one a single
-# GP register
 test "mach.lang.target.abi.aapcs64.classify_arg:integer_aggregate_gp" {
-    val s: abi.ParamSlot = classify_arg(0, 16, 8, false, 0, true, false, false, 0, 0, 0, 0, abi.agg_none());
+    val s: abi.ParamSlot = classify_arg(0, 16, 8, false, 0, true, false, 0, 0, 0, 0, abi.agg_none());
     if (s.class != abi.CLASS_GP)    { ret 1; }
     if (s.piece_count   != 2)       { ret 1; }
     if (s.pieces[0].reg != REG_X0)  { ret 1; }
     if (s.pieces[1].reg != REG_X1)  { ret 1; }
-    val o: abi.ParamSlot = classify_arg(0, 8, 8, false, 0, true, false, false, 0, 0, 0, 0, abi.agg_none());
+    val o: abi.ParamSlot = classify_arg(0, 8, 8, false, 0, true, false, 0, 0, 0, 0, abi.agg_none());
     if (o.class != abi.CLASS_GP)    { ret 1; }
     if (o.piece_count   != 1)       { ret 1; }
     if (o.pieces[0].reg != REG_X0)  { ret 1; }
     ret 0;
 }
 
-# a >16-byte non-HFA aggregate is passed by reference, on the stack once the GP
-# bank is exhausted
 test "mach.lang.target.abi.aapcs64.classify_arg:large_aggregate_byref" {
-    # a GP register remains: the hidden pointer rides it.
-    val s: abi.ParamSlot = classify_arg(0, 32, 8, false, 0, true, false, false, 0, 0, 0, 0, abi.agg_none());
+    val s: abi.ParamSlot = classify_arg(0, 32, 8, false, 0, true, false, 0, 0, 0, 0, abi.agg_none());
     if (s.class != abi.CLASS_BYREF) { ret 1; }
     if (s.reg   != REG_X0)          { ret 1; }
-    # GP bank exhausted: the pointer is passed on the stack.
-    val e: abi.ParamSlot = classify_arg(0, 32, 8, false, 0, true, false, false, 8, 0, 0, 0, abi.agg_none());
+    val e: abi.ParamSlot = classify_arg(0, 32, 8, false, 0, true, false, 8, 0, 0, 0, abi.agg_none());
     if (e.class != abi.CLASS_STACK_BYREF) { ret 1; }
     ret 0;
 }
 
-# an HFA rides a consecutive V run; all-or-memory spills the whole aggregate when
-# the run cannot fit
 test "mach.lang.target.abi.aapcs64.classify_arg:hfa_v_run" {
-    # struct { f32, f32 } -> 2 members of 4 bytes in V0:V1.
-    val s: abi.ParamSlot = classify_arg(0, 8, 4, false, 0, true, false, false, 0, 0, 2, 4, abi.agg_none());
+    val s: abi.ParamSlot = classify_arg(0, 8, 4, false, 0, true, false, 0, 0, 2, 4, abi.agg_none());
     if (s.piece_count     != 2)               { ret 1; }
     if (s.pieces[0].reg   != fp_param_reg(0)) { ret 1; }
     if (s.pieces[0].width != 4)               { ret 1; }
     if (s.pieces[1].reg   != fp_param_reg(1)) { ret 1; }
     if (s.size != 8)                          { ret 1; }
-    # a 4xf64 HFA is 32 bytes yet still rides V0..V3 (HFA precedes the byref rule).
-    val q: abi.ParamSlot = classify_arg(0, 32, 8, false, 0, true, false, false, 0, 0, 4, 8, abi.agg_none());
+    val q: abi.ParamSlot = classify_arg(0, 32, 8, false, 0, true, false, 0, 0, 4, 8, abi.agg_none());
     if (q.piece_count     != 4)               { ret 1; }
     if (q.pieces[0].reg   != fp_param_reg(0)) { ret 1; }
     if (q.pieces[0].width != 8)               { ret 1; }
     if (q.pieces[3].reg   != fp_param_reg(3)) { ret 1; }
-    # the run starts at the next free V register (NSRN cursor honored).
-    val a: abi.ParamSlot = classify_arg(0, 8, 4, false, 0, true, false, false, 0, 5, 2, 4, abi.agg_none());
+    val a: abi.ParamSlot = classify_arg(0, 8, 4, false, 0, true, false, 0, 5, 2, 4, abi.agg_none());
     if (a.pieces[0].reg != fp_param_reg(5)) { ret 1; }
-    # all-or-memory: a 3-member HFA cannot fit when only two V registers remain, so
-    # the WHOLE aggregate spills by value (no partial V placement).
-    val m: abi.ParamSlot = classify_arg(0, 12, 4, false, 0, true, false, false, 0, 6, 3, 4, abi.agg_none());
+    val m: abi.ParamSlot = classify_arg(0, 12, 4, false, 0, true, false, 0, 6, 3, 4, abi.agg_none());
     if (m.class != abi.CLASS_STACK) { ret 1; }
     ret 0;
 }
 
-# a 128-bit vector is a one-member short-vector aggregate (HVA): a single V
-# register as an argument, back-filling the next free V; V0 as a return; and a
-# by-value stack spill once the V bank is exhausted. the member width is the full 16
-# bytes (a single Q register), distinct from an f32/f64-member HFA.
 test "mach.lang.target.abi.aapcs64.classify_arg:short_vector_hva" {
-    val v: abi.ParamSlot = classify_arg(0, 16, 16, false, 0, false, true, false, 0, 0, 0, 0, abi.agg_none());
+    val v: abi.ParamSlot = classify_arg(0, 16, 16, false, 0, false, true, 0, 0, 0, 0, abi.agg_none());
     if (v.class != abi.CLASS_FP)  { ret 1; }
     if (v.reg != fp_param_reg(0)) { ret 1; }
     if (v.piece_count != 1)       { ret 1; }
     if (v.pieces[0].width != 16)  { ret 1; }
-    # rides the next free V register after prior FP/vector args.
-    val v2: abi.ParamSlot = classify_arg(1, 16, 16, false, 0, false, true, false, 0, 3, 0, 0, abi.agg_none());
+    val v2: abi.ParamSlot = classify_arg(1, 16, 16, false, 0, false, true, 0, 3, 0, 0, abi.agg_none());
     if (v2.reg != fp_param_reg(3)) { ret 1; }
-    # the whole V bank consumed -> spill by value.
-    val vs: abi.ParamSlot = classify_arg(2, 16, 16, false, 0, false, true, false, 0, 8, 0, 0, abi.agg_none());
+    val vs: abi.ParamSlot = classify_arg(2, 16, 16, false, 0, false, true, 0, 8, 0, 0, abi.agg_none());
     if (vs.class != abi.CLASS_STACK) { ret 1; }
-    # a vector returns in V0 as a 16-byte one-member HVA.
     val r: abi.ParamSlot = classify_return(16, 16, false, 0, false, true, 0, 0, abi.agg_none());
     if (r.class != abi.CLASS_FP)  { ret 1; }
     if (r.reg != fp_param_reg(0)) { ret 1; }
@@ -575,33 +280,15 @@ test "mach.lang.target.abi.aapcs64.classify_arg:short_vector_hva" {
     ret 0;
 }
 
-# A SHORT VECTOR'S PIECE IS A WHOLE V REGISTER, AND ONE TOO WIDE FOR ONE GETS NONE
-#
-# The piece width is the REGISTER width, not the value's: a `f32x2` is eight bytes
-# and a `f32x3` twelve, and both correctly ride one V register with a 16-byte
-# transfer. Both are pinned here because the literal 16 the two paths used to carry
-# reads as "every vector is sixteen bytes", and the obvious "fix" - passing `size` -
-# breaks exactly these two. The regression it would cause is real and was measured:
-# the codegen corpus's `call/call_mixed` and `vec/` cases fail on the twelve-byte `i32x3` argument.
-#
-# WHAT THE LITERAL ACTUALLY HID is the case one V register cannot serve. #2727 makes
-# vectors wider than a register legal, and under the literal a 32-byte one would have
-# been handed V0 and a piece describing the first sixteen bytes of it - the slot and
-# its piece disagreeing about how much of the value exists, which is the #2733 shape
-# in the ABI layer rather than the encoder. An over-width vector now takes the
-# by-reference memory class this convention gives any composite over sixteen bytes:
-# the mid-end has already placed such a value in memory and hands over a pointer to
-# it, so a by-value stack slot would describe a value the caller does not hold.
 test "mach.lang.target.abi.aapcs64.classify:vector_piece_is_a_whole_v_register" {
-    # an 8-byte vector and a 12-byte one each ride ONE V register, whole.
-    val d: abi.ParamSlot = classify_arg(0, 8, 8, false, 0, false, true, false, 0, 0, 0, 0, abi.agg_none());
+    val d: abi.ParamSlot = classify_arg(0, 8, 8, false, 0, false, true, 0, 0, 0, 0, abi.agg_none());
     if (d.class != abi.CLASS_FP)  { ret 1; }
     if (d.reg != fp_param_reg(0)) { ret 1; }
     if (d.piece_count != 1)       { ret 1; }
     if (d.pieces[0].width != 16)  { ret 1; }
     if (d.size != 8)              { ret 1; }
 
-    val t: abi.ParamSlot = classify_arg(0, 12, 16, false, 0, false, true, false, 0, 0, 0, 0, abi.agg_none());
+    val t: abi.ParamSlot = classify_arg(0, 12, 16, false, 0, false, true, 0, 0, 0, 0, abi.agg_none());
     if (t.class != abi.CLASS_FP) { ret 1; }
     if (t.piece_count != 1)      { ret 1; }
     if (t.pieces[0].width != 16) { ret 1; }
@@ -612,15 +299,12 @@ test "mach.lang.target.abi.aapcs64.classify:vector_piece_is_a_whole_v_register" 
     if (dr.pieces[0].width != 16) { ret 1; }
     if (dr.size != 12)            { ret 1; }
 
-    # a 32-byte vector does not fit one V register: no register slot, however empty
-    # the bank. an argument goes by hidden pointer; a return takes the indirect result.
-    val w: abi.ParamSlot = classify_arg(0, 32, 16, false, 0, false, true, false, 0, 0, 0, 0, abi.agg_none());
+    val w: abi.ParamSlot = classify_arg(0, 32, 16, false, 0, false, true, 0, 0, 0, 0, abi.agg_none());
     if (w.class != abi.CLASS_BYREF) { ret 1; }
     if (w.reg != gp_param_reg(0))   { ret 1; }
     if (w.size != 8)                { ret 1; }
 
-    # and once the integer bank is exhausted the POINTER spills, not the value.
-    val ws: abi.ParamSlot = classify_arg(0, 32, 16, false, 0, false, true, false, GP_PARAM_COUNT, 0, 0, 0, abi.agg_none());
+    val ws: abi.ParamSlot = classify_arg(0, 32, 16, false, 0, false, true, GP_PARAM_COUNT, 0, 0, 0, abi.agg_none());
     if (ws.class != abi.CLASS_STACK_BYREF) { ret 1; }
     if (ws.size != 8)                      { ret 1; }
 
@@ -630,22 +314,18 @@ test "mach.lang.target.abi.aapcs64.classify:vector_piece_is_a_whole_v_register" 
     ret 0;
 }
 
-# the GP and FP argument banks advance independently
 test "mach.lang.target.abi.aapcs64.classify_arg:banks_independent" {
-    # seven GP registers used: a scalar integer still has X7, a float still has V0.
-    val i: abi.ParamSlot = classify_arg(0, 8, 8, false, 0, false, false, false, 7, 0, 0, 0, abi.agg_none());
+    val i: abi.ParamSlot = classify_arg(0, 8, 8, false, 0, false, false, 7, 0, 0, 0, abi.agg_none());
     if (i.class != abi.CLASS_GP) { ret 1; }
     if (i.reg != REG_X7)         { ret 1; }
-    val f: abi.ParamSlot = classify_arg(0, 8, 8, true, 0, false, false, false, 7, 0, 0, 0, abi.agg_none());
+    val f: abi.ParamSlot = classify_arg(0, 8, 8, true, 0, false, false, 7, 0, 0, 0, abi.agg_none());
     if (f.class != abi.CLASS_FP)  { ret 1; }
     if (f.reg != fp_param_reg(0)) { ret 1; }
-    # GP exhausted spills an integer to the stack; the FP bank is untouched.
-    val s: abi.ParamSlot = classify_arg(0, 8, 8, false, 0, false, false, false, 8, 0, 0, 0, abi.agg_none());
+    val s: abi.ParamSlot = classify_arg(0, 8, 8, false, 0, false, false, 8, 0, 0, 0, abi.agg_none());
     if (s.class != abi.CLASS_STACK) { ret 1; }
     ret 0;
 }
 
-# scalar and small-aggregate returns place X0 / V0 / X0:X1
 test "mach.lang.target.abi.aapcs64.classify_return:scalar_and_small_aggregate" {
     val v: abi.ParamSlot = classify_return(0, 0, false, 0, false, false, 0, 0, abi.agg_none());
     if (v.class != abi.CLASS_GP || v.reg != -1) { ret 1; }
@@ -658,39 +338,33 @@ test "mach.lang.target.abi.aapcs64.classify_return:scalar_and_small_aggregate" {
     ret 0;
 }
 
-# an HFA return rides the V0 run, before the sret rule
 test "mach.lang.target.abi.aapcs64.classify_return:hfa_before_sret" {
-    # struct { f32, f32, f32 } returns in V0:V1:V2.
     val s: abi.ParamSlot = classify_return(12, 4, false, 0, true, false, 3, 4, abi.agg_none());
     if (s.piece_count     != 3)               { ret 1; }
     if (s.pieces[0].reg   != fp_param_reg(0)) { ret 1; }
     if (s.pieces[0].width != 4)               { ret 1; }
     if (s.pieces[2].reg   != fp_param_reg(2)) { ret 1; }
-    # a 4xf64 HFA is 32 bytes yet returns in V0..V3, not via X8 sret.
     val q: abi.ParamSlot = classify_return(32, 8, false, 0, true, false, 4, 8, abi.agg_none());
     if (q.piece_count != 4)       { ret 1; }
-    # a >16-byte non-HFA aggregate still returns via the X8 indirect-result register.
     val r: abi.ParamSlot = classify_return(32, 8, false, 0, true, false, 0, 0, abi.agg_none());
     if (r.class != abi.CLASS_SRET || r.reg != REG_X8) { ret 1; }
     ret 0;
 }
 
-# the indirect-result pointer rides X8 outside the argument file
 test "mach.lang.target.abi.aapcs64.register:indirect_result_x8" {
     var reg: abi.AbiRegistry = abi.registry_init();
-    val r: R.Result[bool, str] = register(?reg);
-    if (R.is_err[bool, str](r)) { ret 1; }
-    # AAPCS64 uses the dedicated X8 indirect-result register, OUTSIDE the X0-X7
-    # argument file, so classify_signature leaves gp_used = 0 and X0 stays free for
-    # the first real argument.
+    fin { abi.registry_dnit(?reg); }
+    val r: R.Result[R.Void, str] = register(?reg);
+    if (R.is_err[R.Void, str](r)) { ret 1; }
+    val found: O.Option[*abi.AbiVTable] = abi.lookup(?reg, abi.abi_name_for(abi.ABI_AAPCS64));
+    if (O.is_none[*abi.AbiVTable](found)) { ret 1; }
+    val aapcs64_vtable: *abi.AbiVTable = O.unwrap[*abi.AbiVTable](found);
     if (aapcs64_vtable.indirect_result_reg != REG_X8) { ret 1; }
     if (aapcs64_vtable.indirect_result_in_argfile)    { ret 1; }
-    # X8 is NOT in the GP argument file (X0-X7).
     if (gp_param_reg(REG_X8) != -1) { ret 1; }
     ret 0;
 }
 
-# the register-file accessors fill the canonical banks
 test "mach.lang.target.abi.aapcs64:register_file_banks" {
     var gp: [8]isa.Register;
     if (gp_param_regs(?gp[0]) != GP_PARAM_COUNT)  { ret 1; }

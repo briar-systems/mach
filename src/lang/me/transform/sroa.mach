@@ -1,75 +1,3 @@
-# mach.lang.me.transform.sroa: scalar replacement of aggregates (#2205)
-#
-# Decomposes a small aggregate whose address never escapes into one stack slot per
-# field, so mem2reg can promote each field to an SSA register instead of leaving
-# the whole record in memory. `Result` / `Option` are records, so before this pass
-# every fallible stdlib call paid an alloca, a memzero, and a load/store round trip
-# per use; after it a register-sized payload and its tag reach registers.
-#
-# The pass rewrites storage, never values: it creates per-field slots, retargets the
-# existing field loads/stores onto them, expands a whole-aggregate memzero / copy
-# into per-field traffic, and erases the original slot. It builds no phis -- an
-# aggregate phi and every slot feeding it form one partition that shares a single set
-# of field slots, so the address merge becomes a merge of the slots' contents, and
-# the mem2reg run that follows turns those slots into the scalar phis.
-#
-# A union field is the one member that does not decompose: its members share storage,
-# so per-member slots would break the reinterpretation a union exists to express. It
-# becomes ONE slot instead, whenever every member is a scalar covering the whole cell
-# (`union_leaf_ty`) -- then every store writes all of it and every load reads all of
-# it, so the bits one member reads are exactly the bits another wrote, and a member
-# access naming a different type than the cell's is a plain bit reinterpret. This is
-# what carries `Result[T, E]`, whose payload is an anonymous `uni`, into registers.
-#
-# ESCAPE CONDITION (the whole legality argument). A candidate is an OP_ALLOCA of a
-# struct / array type (never a union: its fields overlap) with a constant count of
-# one, or an OP_PHI of that same type, whose whole type tree splits to scalars.
-# Splitting is legal only when every reference to the candidate is one of:
-#
-#   - the base of an OP_GEP whose first two indices are the constants `0, k` with
-#     `k` a valid field ordinal, and whose own result is used only as a load
-#     pointer, a store pointer, or the base of a further gep that stays inside the
-#     field (a constant zero first index over the field's own type -- or, over a
-#     union field, a gep naming one of its members, which resolves to the cell's own
-#     address and is retargeted onto the cell's slot);
-#   - an OP_MEMZERO of the whole slot (alloca candidates only);
-#   - the pointer of a whole-aggregate OP_STORE (a copy into the slot) whose stored
-#     value is an address of the same aggregate type;
-#   - the value of a whole-aggregate OP_STORE whose destination is itself a
-#     candidate being split (so the destination has no observable padding, which a
-#     per-field copy would otherwise stop writing);
-#   - an incoming value of a candidate OP_PHI of the same partition;
-#   - an OP_DBG_VALUE operand, which is debug metadata and never a real address
-#     escape (treating it as one would make a `-g` build decline where a release
-#     build splits, breaking -g additivity).
-#
-# Anything else escapes and the candidate stays in memory: `?x` address-of (the raw
-# slot pointer reaching a call, a return, or a comparison), a `::` / `:~` reinterpret
-# (an OP_BITCAST of the slot), an inline-asm `{name}` binding, a by-value aggregate
-# argument, a store to a global, any gep whose indices are not constant field
-# ordinals, and a field address that is strided over rather than dereferenced (`?a[0]`
-# handed to a callee that indexes it). `$fields` / `v.[f]` reflection projection
-# resolves its ordinal at comptime and lowers to exactly the constant gep above, so it
-# splits and keeps its field's secrecy rather than defeating the analysis. Escape is
-# propagated over the whole phi partition and to the source of every whole-aggregate
-# copy, to a fixpoint.
-#
-# A phi partition carries two extra rules, both there to make one shared slot set
-# stand in for the several addresses the phi merges. The phi itself must be read-only
-# and local: every use of it lies in its own block, and that block writes no member,
-# so the shared slots are read exactly where the merge selected an incoming. And each
-# incoming slot must be self-contained: all of its own references lie in the one
-# block that defines it, and no other member's defining block is reachable from it
-# without passing the phi -- so on any path reaching the phi, the last member written
-# into the shared slots is exactly the one the phi selects.
-#
-# Secrecy (#1646) is monotone across the rewrite. Existing loads and stores are
-# retargeted, never rebuilt, so they keep their own taint; every instruction the pass
-# synthesizes for a candidate that touches secret storage is marked secret, so a `^T`
-# field cannot be laundered public by being moved into its own slot.
-#
-# Release pipeline only. A debug (`-O0`) build never runs it and stays byte-identical.
-
 use std.allocator.page;
 use std.collections.map;
 use std.types.bool.bool;
@@ -85,8 +13,11 @@ use R: std.types.result;
 use mach.lang.intern;
 use mach.lang.me.ir;
 use mach.lang.me.ir.builder;
+use mach.lang.me.ir.effect;
 use mach.lang.me.ir.id;
 use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.opdesc;
+use mach.lang.me.ir.refs;
 use mach.lang.me.ir.mutate;
 use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
@@ -94,74 +25,20 @@ use mach.lang.me.pass.dce;
 use mach.lang.me.pass.mem2reg;
 use mach.lang.source;
 use mach.lang.target;
-use isa: mach.lang.target.isa;
+use target_testing: mach.lang.target.testing;
+use mach.lang.target.isa;
 use mach.lang.target.resolved;
 
-# sentinel for an unset entry in a u32 index map
 val NONE_U32: u32 = 0xFFFFFFFF;
 
-# largest field count a split aggregate may have; bounds both the per-candidate slot
-# work and the register pressure a fully promoted record can create
 val MAX_FIELDS: u32 = 8;
 
-# largest byte footprint a split aggregate may have; keeps the pass on the small
-# records the `Result` / `Option` idiom is built from rather than on buffers
 val MAX_BYTES: u32 = 64;
 
-# how deep a nested aggregate may be before it is left whole
 val MAX_DEPTH: u32 = 4;
 
-# how many times a function is re-split; one round peels one level of nesting, so
-# this must cover the deepest aggregate the depth bound admits
 val MAX_ROUNDS: u32 = MAX_DEPTH + 1;
 
-# per-function working state
-#
-# Instruction-indexed maps are sized to the instruction pool snapshot taken at entry
-# (`pool_len`); candidate-indexed maps are sized to the same bound, since a function
-# cannot hold more candidates than instructions. Every owned array is freed in
-# `state_dnit` by its allocation size.
-# ---
-# alloc:      backing allocator (the module's)
-# m:          module under mutation
-# fn:         function being split
-# tgt:        target, consulted for aggregate byte sizes
-# pool_len:   snapshot of fn.instr_len at entry; sizes the instruction-indexed maps
-# instr_block: instruction id -> owning block, filled from the block lists (the
-#             liveness source of truth); BLOCK_NIL marks a pool ghost every sweep skips
-# cand_of:    instruction id -> candidate index, or NONE_U32
-# gep_of:     instruction id -> the candidate index a field gep addresses, or NONE_U32
-# gep_field:  instruction id -> the field ordinal a field gep selects
-# uni_gep:    instruction id -> whether the gep names a member of a split union field
-#             rather than the field itself; it carries the field's own ordinal in
-#             gep_field, since every union member sits at the cell's own address
-# erase:      instruction id -> whether the rewrite superseded the instruction
-# cand_id:    per-candidate defining instruction id
-# cand_ty:    per-candidate aggregate type
-# cand_phi:   per-candidate: true for an OP_PHI candidate, false for an OP_ALLOCA
-# cand_nf:    per-candidate field count
-# cand_root:  per-candidate union-find parent (phi partitions)
-# cand_out:   per-candidate escape flag
-# cand_secret: per-candidate secrecy taint, joined over every reference
-# cand_home:  the block holding the candidate's references (its phi-incoming operands
-#             aside), or BLOCK_NIL before the first is seen
-# cand_local: whether every one of those references really is in cand_home
-# cand_slot:  start offset into `slots`, shared across a partition, or NONE_U32 when
-#             the candidate is not split
-# cand_count: number of candidates
-# cand_cap:   allocation size of every candidate-indexed array
-# block_count: the function's block count; sizes visit / queue
-# visit:      per-block scratch mark for the inter-member reachability walk
-# queue:      per-block scratch worklist for the same walk
-# slots:      flattened per-partition field slot pointer Values
-# slot_total: allocation size of `slots`
-# ptr_ty:     the untyped IR pointer an alloca and a gep produce
-# void_ty:    the void a store and a memzero carry
-# i64_ty:     the type the synthesized index and count constants ride in
-# int_ty:     interned integers of 1, 2, 4 and 8 bytes indexed by log2 of the byte
-#             width, or IRT_NIL where the width did not intern; the storage type of a
-#             union cell some member covers only part of, and the intermediate a
-#             narrow member's value is widened through
 rec State {
     alloc: *A.Allocator;
     m:     *ir.Module;
@@ -202,30 +79,19 @@ rec State {
     int_ty:  [4]ir_type.IrTypeId;
 }
 
-# run scalar replacement over every defined function in `m`
-#
-# Repeats per function until no further candidate splits. A round both peels one level
-# of nesting -- splitting `{i8, {i64, ptr}}` yields an `i8` slot mem2reg can promote and
-# a `{i64, ptr}` slot the next round splits again -- and frees candidates the previous
-# round's rewrite unblocked: the source of a whole-aggregate copy is only reachable by
-# field gep once that copy has been expanded, so it first becomes splittable a round
-# after its destination did.
-# ---
-# m:   module to transform in place
-# tgt: target, consulted for aggregate byte sizes
-# ret: ok(true) when any aggregate was split, ok(false) when none, or the first error
 pub fun run(m: *ir.Module, tgt: *target.Target) R.Result[bool, str] {
     var changed: bool = false;
     var f: u32 = 0;
     for (f < m.function_len) {
         val fn: *ir.Function = ?m.functions[f];
-        if ((fn.flags & ir.FN_FLAG_EXTERN) == 0 && fn.block_count > 0) {
+        if ((fn.flags & ir.FN_FLAG_EXTERN) == 0 && fn.block_count > 0
+            && !effect.function_has_volatile(fn)) {
             var round: u32 = 0;
             var more: bool = true;
             for (more && round < MAX_ROUNDS) {
-                val res: R.Result[bool, str] = split_function(m, fn, tgt);
-                if (R.is_err[bool, str](res)) { ret res; }
-                more = R.unwrap_ok[bool, str](res);
+                val changed_r: R.Result[bool, str] = split_function(m, fn, tgt);
+                if (R.is_err[bool, str](changed_r)) { ret changed_r; }
+                more = R.unwrap_ok[bool, str](changed_r);
                 if (more) { changed = true; }
                 round = round + 1;
             }
@@ -235,26 +101,16 @@ pub fun run(m: *ir.Module, tgt: *target.Target) R.Result[bool, str] {
     ret R.ok[bool, str](changed);
 }
 
-# one split round over a single function: collect candidates, classify escapes to a
-# fixpoint, then materialise the field slots and rewrite every reference
-# ---
-# m:   module under mutation
-# fn:  function to split
-# tgt: target, consulted for aggregate byte sizes
-# ret: ok(true) when at least one aggregate split, ok(false) when none, or an error
 fun split_function(m: *ir.Module, fn: *ir.Function, tgt: *target.Target) R.Result[bool, str] {
     var st: State;
     state_init(?st, m, fn, tgt);
 
-    val res_maps: R.Result[bool, str] = state_alloc(?st);
-    if (R.is_err[bool, str](res_maps)) { state_dnit(?st); ret res_maps; }
+    val res_maps: R.Result[R.Void, str] = state_alloc(?st);
+    if (R.is_err[R.Void, str](res_maps)) { state_dnit(?st); ret R.err[bool, str](R.unwrap_err[R.Void, str](res_maps)); }
     if (st.pool_len == 0) { state_dnit(?st); ret R.ok[bool, str](false); }
 
-    # the integer widths a union cell's storage and its narrow members ride in are
-    # interned up front: classification decides splittability from them, and it runs
-    # before the rewrite that would otherwise be the first to need a type
-    val res_ints: R.Result[bool, str] = intern_int_widths(?st);
-    if (R.is_err[bool, str](res_ints)) { state_dnit(?st); ret res_ints; }
+    val res_ints: R.Result[R.Void, str] = intern_int_widths(?st);
+    if (R.is_err[R.Void, str](res_ints)) { state_dnit(?st); ret R.err[bool, str](R.unwrap_err[R.Void, str](res_ints)); }
 
     map_instr_blocks(?st);
     collect_candidates(?st);
@@ -270,18 +126,12 @@ fun split_function(m: *ir.Module, fn: *ir.Function, tgt: *target.Target) R.Resul
     val survivors: u32 = assign_slots(?st);
     if (survivors == 0) { state_dnit(?st); ret R.ok[bool, str](false); }
 
-    val res_rw: R.Result[bool, str] = rewrite(?st);
+    val res_rw: R.Result[R.Void, str] = rewrite(?st);
     state_dnit(?st);
-    if (R.is_err[bool, str](res_rw)) { ret res_rw; }
+    if (R.is_err[R.Void, str](res_rw)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_rw)); }
     ret R.ok[bool, str](true);
 }
 
-# zero a working state so a partially built one is still safe to tear down
-# ---
-# st:  state to initialise in place
-# m:   module under mutation (also the allocator source)
-# fn:  function being split
-# tgt: target, consulted for aggregate byte sizes
 fun state_init(st: *State, m: *ir.Module, fn: *ir.Function, tgt: *target.Target) {
     st.alloc = m.alloc;
     st.m     = m;
@@ -322,26 +172,17 @@ fun state_init(st: *State, m: *ir.Module, fn: *ir.Function, tgt: *target.Target)
     for (w < 4) { st.int_ty[w] = ir_type.IRT_NIL; w = w + 1; }
 }
 
-# intern the 1-, 2-, 4- and 8-byte integers into `int_ty`
-# ---
-# st:  state whose int_ty table is filled
-# ret: ok(true) once interned, or the first error
-fun intern_int_widths(st: *State) R.Result[bool, str] {
+fun intern_int_widths(st: *State) R.Result[R.Void, str] {
     var w: u32 = 0;
     for (w < 4) {
         val r: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?st.m.types, 8 << w);
-        if (R.is_err[ir_type.IrTypeId, str](r)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](r)); }
+        if (R.is_err[ir_type.IrTypeId, str](r)) { ret R.err[R.Void, str](R.unwrap_err[ir_type.IrTypeId, str](r)); }
         st.int_ty[w] = R.unwrap_ok[ir_type.IrTypeId, str](r);
         w = w + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# the interned integer of `bytes` bytes, or IRT_NIL when that is not a scalar width
-# ---
-# st:    state with int_ty filled
-# bytes: the byte width to name
-# ret:   the integer type, or IRT_NIL
 fun int_of_bytes(st: *State, bytes: u32) ir_type.IrTypeId {
     if (bytes == 1) { ret st.int_ty[0]; }
     if (bytes == 2) { ret st.int_ty[1]; }
@@ -350,36 +191,32 @@ fun int_of_bytes(st: *State, bytes: u32) ir_type.IrTypeId {
     ret ir_type.IRT_NIL;
 }
 
-# allocate and clear every instruction- and candidate-indexed map
-# ---
-# st:  state with pool_len already set
-# ret: ok(true) once every map is live, or the first allocation error
-fun state_alloc(st: *State) R.Result[bool, str] {
+fun state_alloc(st: *State) R.Result[R.Void, str] {
     val n: u32 = st.pool_len;
-    if (n == 0) { ret R.ok[bool, str](true); }
+    if (n == 0) { ret R.ok_void[str](); }
 
     val r_ib: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](st.alloc, n::usize);
-    if (R.is_err[*id.BlockId, str](r_ib)) { ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](r_ib)); }
+    if (R.is_err[*id.BlockId, str](r_ib)) { ret R.err[R.Void, str](R.unwrap_err[*id.BlockId, str](r_ib)); }
     st.instr_block = R.unwrap_ok[*id.BlockId, str](r_ib);
 
     val r_co: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
-    if (R.is_err[*u32, str](r_co)) { ret R.err[bool, str](R.unwrap_err[*u32, str](r_co)); }
+    if (R.is_err[*u32, str](r_co)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](r_co)); }
     st.cand_of = R.unwrap_ok[*u32, str](r_co);
 
     val r_go: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
-    if (R.is_err[*u32, str](r_go)) { ret R.err[bool, str](R.unwrap_err[*u32, str](r_go)); }
+    if (R.is_err[*u32, str](r_go)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](r_go)); }
     st.gep_of = R.unwrap_ok[*u32, str](r_go);
 
     val r_gf: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
-    if (R.is_err[*u32, str](r_gf)) { ret R.err[bool, str](R.unwrap_err[*u32, str](r_gf)); }
+    if (R.is_err[*u32, str](r_gf)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](r_gf)); }
     st.gep_field = R.unwrap_ok[*u32, str](r_gf);
 
     val r_ug: R.Result[*bool, str] = A.allocate[bool](st.alloc, n::usize);
-    if (R.is_err[*bool, str](r_ug)) { ret R.err[bool, str](R.unwrap_err[*bool, str](r_ug)); }
+    if (R.is_err[*bool, str](r_ug)) { ret R.err[R.Void, str](R.unwrap_err[*bool, str](r_ug)); }
     st.uni_gep = R.unwrap_ok[*bool, str](r_ug);
 
     val r_er: R.Result[*bool, str] = A.allocate[bool](st.alloc, n::usize);
-    if (R.is_err[*bool, str](r_er)) { ret R.err[bool, str](R.unwrap_err[*bool, str](r_er)); }
+    if (R.is_err[*bool, str](r_er)) { ret R.err[R.Void, str](R.unwrap_err[*bool, str](r_er)); }
     st.erase = R.unwrap_ok[*bool, str](r_er);
 
     var i: u32 = 0;
@@ -394,62 +231,59 @@ fun state_alloc(st: *State) R.Result[bool, str] {
     }
 
     val r_ci: R.Result[*id.InstructionId, str] = A.allocate[id.InstructionId](st.alloc, n::usize);
-    if (R.is_err[*id.InstructionId, str](r_ci)) { ret R.err[bool, str](R.unwrap_err[*id.InstructionId, str](r_ci)); }
+    if (R.is_err[*id.InstructionId, str](r_ci)) { ret R.err[R.Void, str](R.unwrap_err[*id.InstructionId, str](r_ci)); }
     st.cand_id = R.unwrap_ok[*id.InstructionId, str](r_ci);
 
     val r_ct: R.Result[*ir_type.IrTypeId, str] = A.allocate[ir_type.IrTypeId](st.alloc, n::usize);
-    if (R.is_err[*ir_type.IrTypeId, str](r_ct)) { ret R.err[bool, str](R.unwrap_err[*ir_type.IrTypeId, str](r_ct)); }
+    if (R.is_err[*ir_type.IrTypeId, str](r_ct)) { ret R.err[R.Void, str](R.unwrap_err[*ir_type.IrTypeId, str](r_ct)); }
     st.cand_ty = R.unwrap_ok[*ir_type.IrTypeId, str](r_ct);
 
     val r_cp: R.Result[*bool, str] = A.allocate[bool](st.alloc, n::usize);
-    if (R.is_err[*bool, str](r_cp)) { ret R.err[bool, str](R.unwrap_err[*bool, str](r_cp)); }
+    if (R.is_err[*bool, str](r_cp)) { ret R.err[R.Void, str](R.unwrap_err[*bool, str](r_cp)); }
     st.cand_phi = R.unwrap_ok[*bool, str](r_cp);
 
     val r_cn: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
-    if (R.is_err[*u32, str](r_cn)) { ret R.err[bool, str](R.unwrap_err[*u32, str](r_cn)); }
+    if (R.is_err[*u32, str](r_cn)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](r_cn)); }
     st.cand_nf = R.unwrap_ok[*u32, str](r_cn);
 
     val r_cr: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
-    if (R.is_err[*u32, str](r_cr)) { ret R.err[bool, str](R.unwrap_err[*u32, str](r_cr)); }
+    if (R.is_err[*u32, str](r_cr)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](r_cr)); }
     st.cand_root = R.unwrap_ok[*u32, str](r_cr);
 
     val r_cx: R.Result[*bool, str] = A.allocate[bool](st.alloc, n::usize);
-    if (R.is_err[*bool, str](r_cx)) { ret R.err[bool, str](R.unwrap_err[*bool, str](r_cx)); }
+    if (R.is_err[*bool, str](r_cx)) { ret R.err[R.Void, str](R.unwrap_err[*bool, str](r_cx)); }
     st.cand_out = R.unwrap_ok[*bool, str](r_cx);
 
     val r_cs: R.Result[*bool, str] = A.allocate[bool](st.alloc, n::usize);
-    if (R.is_err[*bool, str](r_cs)) { ret R.err[bool, str](R.unwrap_err[*bool, str](r_cs)); }
+    if (R.is_err[*bool, str](r_cs)) { ret R.err[R.Void, str](R.unwrap_err[*bool, str](r_cs)); }
     st.cand_secret = R.unwrap_ok[*bool, str](r_cs);
 
     val r_ch: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](st.alloc, n::usize);
-    if (R.is_err[*id.BlockId, str](r_ch)) { ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](r_ch)); }
+    if (R.is_err[*id.BlockId, str](r_ch)) { ret R.err[R.Void, str](R.unwrap_err[*id.BlockId, str](r_ch)); }
     st.cand_home = R.unwrap_ok[*id.BlockId, str](r_ch);
 
     val r_ck: R.Result[*bool, str] = A.allocate[bool](st.alloc, n::usize);
-    if (R.is_err[*bool, str](r_ck)) { ret R.err[bool, str](R.unwrap_err[*bool, str](r_ck)); }
+    if (R.is_err[*bool, str](r_ck)) { ret R.err[R.Void, str](R.unwrap_err[*bool, str](r_ck)); }
     st.cand_local = R.unwrap_ok[*bool, str](r_ck);
 
     val r_cl: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
-    if (R.is_err[*u32, str](r_cl)) { ret R.err[bool, str](R.unwrap_err[*u32, str](r_cl)); }
+    if (R.is_err[*u32, str](r_cl)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](r_cl)); }
     st.cand_slot = R.unwrap_ok[*u32, str](r_cl);
 
     st.cand_cap = n;
 
     val bn: u32 = st.block_count;
     val r_vi: R.Result[*bool, str] = A.allocate[bool](st.alloc, bn::usize);
-    if (R.is_err[*bool, str](r_vi)) { ret R.err[bool, str](R.unwrap_err[*bool, str](r_vi)); }
+    if (R.is_err[*bool, str](r_vi)) { ret R.err[R.Void, str](R.unwrap_err[*bool, str](r_vi)); }
     st.visit = R.unwrap_ok[*bool, str](r_vi);
 
     val r_qu: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](st.alloc, bn::usize);
-    if (R.is_err[*id.BlockId, str](r_qu)) { ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](r_qu)); }
+    if (R.is_err[*id.BlockId, str](r_qu)) { ret R.err[R.Void, str](R.unwrap_err[*id.BlockId, str](r_qu)); }
     st.queue = R.unwrap_ok[*id.BlockId, str](r_qu);
 
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# free every owned array by its allocation size; safe partway through construction
-# ---
-# st: state to tear down
 fun state_dnit(st: *State) {
     val n: u32 = st.pool_len;
     if (st.instr_block != nil) { A.deallocate[id.BlockId](st.alloc, st.instr_block, n::usize); }
@@ -478,10 +312,6 @@ fun state_dnit(st: *State) {
     if (st.slots != nil) { A.deallocate[value.Value](st.alloc, st.slots, st.slot_total::usize); }
 }
 
-# fill instr_block from the block lists: every listed phi, body instruction, and
-# terminator maps to its owning block; unlisted pool entries stay BLOCK_NIL
-# ---
-# st: state with instr_block allocated and cleared
 fun map_instr_blocks(st: *State) {
     val fn: *ir.Function = st.fn;
     var b: u32 = 0;
@@ -506,15 +336,6 @@ fun map_instr_blocks(st: *State) {
     }
 }
 
-# the number of independently addressable fields of a splittable aggregate type, or
-# 0 when the type is not one
-#
-# A union is deliberately excluded: its fields share storage, so per-field slots
-# would break the reinterpretation a union exists to express.
-# ---
-# st: state (for the module's type table)
-# ty: the type to measure
-# ret: field count for a struct, element count for an array, 0 otherwise
 fun agg_field_count(st: *State, ty: ir_type.IrTypeId) u32 {
     val opt: O.Option[*ir_type.IrType] = ir_type.get(?st.m.types, ty);
     if (O.is_none[*ir_type.IrType](opt)) { ret 0; }
@@ -524,12 +345,6 @@ fun agg_field_count(st: *State, ty: ir_type.IrTypeId) u32 {
     ret 0;
 }
 
-# the type of field `k` of a splittable aggregate, or IRT_NIL when out of range
-# ---
-# st: state (for the module's type table)
-# ty: the aggregate type
-# k:  the field ordinal
-# ret: the field's type, or IRT_NIL
 fun agg_field_type(st: *State, ty: ir_type.IrTypeId, k: u32) ir_type.IrTypeId {
     val opt: O.Option[*ir_type.IrType] = ir_type.get(?st.m.types, ty);
     if (O.is_none[*ir_type.IrType](opt)) { ret ir_type.IRT_NIL; }
@@ -545,39 +360,15 @@ fun agg_field_type(st: *State, ty: ir_type.IrTypeId, k: u32) ir_type.IrTypeId {
     ret ir_type.IRT_NIL;
 }
 
-# whether `ty` is a small enough struct / array to split, all the way down
-#
-# Bounded on field count and byte footprint so the pass stays on the small records
-# the `Result` / `Option` idiom builds from rather than on buffers, and on depth so a
-# nested record is fully peeled within the round budget.
-#
-# The recursion is the load-bearing part: a field that is itself an aggregate becomes
-# a slot of aggregate type for one round, and only splits again on the next if it too
-# is splittable. Admitting a field this pass could NOT split would leave that slot
-# whole, and an aggregate slot whose every use is a whole-slot copy looks promotable
-# to mem2reg -- which would merge its addresses into a phi and substitute a
-# `const_null` on an undefined path, an aggregate-typed operand that is not
-# address-producing. Requiring the whole tree to be splittable means every slot this
-# pass finally leaves behind is a scalar.
-# ---
-# st: state (for the module's type table and target)
-# ty: the candidate type
-# ret: true when the type may be split
 fun splittable_ty(st: *State, ty: ir_type.IrTypeId) bool {
     ret splittable_at(st, ty, 0);
 }
 
-# `splittable_ty` at nesting depth `depth`
-# ---
-# st:    state (for the module's type table and target)
-# ty:    the type to classify
-# depth: how many levels of nesting are already above `ty`
-# ret:   true when the type, and every type under it, may be split
 fun splittable_at(st: *State, ty: ir_type.IrTypeId, depth: u32) bool {
     if (depth >= MAX_DEPTH)                                      { ret false; }
     val nf: u32 = agg_field_count(st, ty);
     if (nf == 0 || nf > MAX_FIELDS)                              { ret false; }
-    if (ir_type.byte_size(?st.m.types, ty, st.tgt) > MAX_BYTES)  { ret false; }
+    if (ir_type.byte_size_for_machine(?st.m.types, ty, resolved.layout_machine(st.tgt)) > MAX_BYTES)  { ret false; }
     var k: u32 = 0;
     for (k < nf) {
         val ft: ir_type.IrTypeId = agg_field_type(st, ty, k);
@@ -588,38 +379,13 @@ fun splittable_at(st: *State, ty: ir_type.IrTypeId, depth: u32) bool {
     ret true;
 }
 
-# the scalar storage type a union field's single slot is held in, or IRT_NIL when the
-# union must stay in memory
-#
-# A union cannot be split the way a struct is -- its members share storage, and
-# per-member slots would break the reinterpretation a union exists to express. It can
-# still become ONE slot, provided every member is a scalar the cell can be read and
-# written whole through.
-#
-# When every member is exactly the cell's width, the slot's storage type is one of the
-# members -- the first integer, else the first pointer, else member 0 -- so the cell
-# stays in the general-purpose bank whenever any member already is, and at least one
-# member accesses it with no reinterpret at all. `uni{ptr, ptr}` needs none;
-# `uni{i64, ptr}` (a `Result[i64, str]` payload) needs one only on the pointer side.
-#
-# A member narrower than the cell (`uni{i8, ptr}`, a `Result[bool, str]` payload) is
-# admitted too, and then the storage type is the whole cell's integer: a narrow store
-# has to leave the bytes it does not cover as they were, which only an integer cell can
-# express -- read, clear the member's bits, or the widened value back in. That is why
-# the narrow form needs a little-endian target: it identifies the member at offset zero
-# with the cell integer's LOW bits, which is a byte-order fact rather than a layout one.
-# Every registered target is little-endian today, so this condition never declines.
-# ---
-# st: state (for the module's type table, target and interned integers)
-# ty: the field type to classify
-# ret: the storage type of the union's slot, or IRT_NIL when it is not a leaf
 fun union_leaf_ty(st: *State, ty: ir_type.IrTypeId) ir_type.IrTypeId {
     val opt: O.Option[*ir_type.IrType] = ir_type.get(?st.m.types, ty);
     if (O.is_none[*ir_type.IrType](opt)) { ret ir_type.IRT_NIL; }
     val t: *ir_type.IrType = O.unwrap[*ir_type.IrType](opt);
     if (t.kind != ir_type.IRT_UNION) { ret ir_type.IRT_NIL; }
 
-    val size: u32 = ir_type.byte_size(?st.m.types, ty, st.tgt);
+    val size: u32 = ir_type.byte_size_for_machine(?st.m.types, ty, resolved.layout_machine(st.tgt));
     var pick: ir_type.IrTypeId = ir_type.IRT_NIL;
     var rank: u32 = 3;
     var narrow: bool = false;
@@ -627,31 +393,17 @@ fun union_leaf_ty(st: *State, ty: ir_type.IrTypeId) ir_type.IrTypeId {
     for (k < t.data.struct_.field_count) {
         val mt: ir_type.IrTypeId = t.data.struct_.fields[k];
         if (!scalar_field(st, mt)) { ret ir_type.IRT_NIL; }
-        # a union's size is its widest member rounded up to its alignment, so a member
-        # is never wider than the cell and `<` versus `==` covers every case
-        if (ir_type.byte_size(?st.m.types, mt, st.tgt) < size) { narrow = true; }
+        if (ir_type.byte_size_for_machine(?st.m.types, mt, resolved.layout_machine(st.tgt)) < size) { narrow = true; }
         or {
             if (storage_rank(st, mt) < rank) { pick = mt; rank = storage_rank(st, mt); }
         }
         k = k + 1;
     }
     if (!narrow) { ret pick; }
-    # UNREACHABLE TODAY, AND NOT DEAD. Every registered isa declares ENDIAN_LITTLE, so no
-    # build reaches this and deleting it changes no test -- but the narrow form rests on
-    # it: a member at offset zero is the cell integer's low bits only under that byte
-    # order, and the mask, the widening and the truncation all read it that way. A
-    # big-endian isa would need the member's bits shifted into place instead, and without
-    # this condition it would silently get the little-endian formula.
     if (st.tgt.model.endianness != isa.ENDIAN_LITTLE) { ret ir_type.IRT_NIL; }
     ret int_of_bytes(st, size);
 }
 
-# the preference order `union_leaf_ty` picks a union's storage type by: an integer
-# first, then a pointer, then anything else
-# ---
-# st: state (for the module's type table)
-# ft: the member type to rank
-# ret: 0 for an integer, 1 for a pointer, 2 otherwise
 fun storage_rank(st: *State, ft: ir_type.IrTypeId) u32 {
     val opt: O.Option[*ir_type.IrType] = ir_type.get(?st.m.types, ft);
     if (O.is_none[*ir_type.IrType](opt)) { ret 2; }
@@ -661,11 +413,6 @@ fun storage_rank(st: *State, ft: ir_type.IrTypeId) u32 {
     ret 2;
 }
 
-# the member count of a union type, or 0 when `ty` is not one
-# ---
-# st: state (for the module's type table)
-# ty: the type to measure
-# ret: the union's member count
 fun union_member_count(st: *State, ty: ir_type.IrTypeId) u32 {
     val opt: O.Option[*ir_type.IrType] = ir_type.get(?st.m.types, ty);
     if (O.is_none[*ir_type.IrType](opt)) { ret 0; }
@@ -674,16 +421,6 @@ fun union_member_count(st: *State, ty: ir_type.IrTypeId) u32 {
     ret t.data.struct_.field_count;
 }
 
-# the type field `k`'s own slot is allocated at, and every whole-field zero fill and
-# copy moves it in
-#
-# A struct or array field's slot holds the field type itself; a union field's slot
-# holds the one scalar `union_leaf_ty` chose to stand in for the whole cell.
-# ---
-# st: state (for the module's type table and target)
-# ty: the aggregate type being split
-# k:  the field ordinal
-# ret: the slot's type
 fun slot_ty(st: *State, ty: ir_type.IrTypeId, k: u32) ir_type.IrTypeId {
     val ft: ir_type.IrTypeId = agg_field_type(st, ty, k);
     val ut: ir_type.IrTypeId = union_leaf_ty(st, ft);
@@ -691,14 +428,6 @@ fun slot_ty(st: *State, ty: ir_type.IrTypeId, k: u32) ir_type.IrTypeId {
     ret ft;
 }
 
-# whether a field type is a scalar a slot can hold in a register
-#
-# A vector is deliberately not one: its zero is not an integer constant, so the
-# zeroing store a split memzero becomes would be ill-typed.
-# ---
-# st: state (for the module's type table)
-# ft: the field type
-# ret: true for an integer, a float, or a pointer
 fun scalar_field(st: *State, ft: ir_type.IrTypeId) bool {
     val opt: O.Option[*ir_type.IrType] = ir_type.get(?st.m.types, ft);
     if (O.is_none[*ir_type.IrType](opt)) { ret false; }
@@ -706,10 +435,6 @@ fun scalar_field(st: *State, ft: ir_type.IrTypeId) bool {
     ret k == ir_type.IRT_INT || k == ir_type.IRT_FLOAT || k == ir_type.IRT_PTR;
 }
 
-# gather the split candidates in pool-id order: every live aggregate alloca with a
-# constant count of one, and every live aggregate phi
-# ---
-# st: state whose cand_* arrays and cand_of map are populated
 fun collect_candidates(st: *State) {
     val fn: *ir.Function = st.fn;
     var i: u32 = 0;
@@ -720,7 +445,6 @@ fun collect_candidates(st: *State) {
         var ty: ir_type.IrTypeId = ir_type.IRT_NIL;
         var is_phi: bool = false;
         if (inst.kind == instruction.OP_ALLOCA) {
-            # a variable count keeps the slot whole: its fields are not a fixed set
             if (inst.operand_count >= 1 && inst.operands[0].kind == value.VAL_CONST_INT
                 && inst.operands[0].data.int_lit == 1) {
                 ty = inst.aux_ty;
@@ -749,11 +473,6 @@ fun collect_candidates(st: *State) {
     }
 }
 
-# the partition representative of candidate `c`, with path halving
-# ---
-# st: state with cand_root populated
-# c:  the candidate index
-# ret: the representative candidate index
 fun find_root(st: *State, c: u32) u32 {
     var x: u32 = c;
     for (st.cand_root[x] != x) {
@@ -763,24 +482,12 @@ fun find_root(st: *State, c: u32) u32 {
     ret x;
 }
 
-# merge the partitions of two candidates
-# ---
-# st: state with cand_root populated
-# a:  first candidate index
-# b:  second candidate index
 fun union_roots(st: *State, a: u32, b: u32) {
     val ra: u32 = find_root(st, a);
     val rb: u32 = find_root(st, b);
     if (ra != rb) { st.cand_root[rb] = ra; }
 }
 
-# union every phi candidate with its incoming allocas, rejecting a phi whose
-# incomings are not all alloca candidates of the same aggregate type
-#
-# A phi merges addresses, so its incomings must be storage this pass owns end to
-# end; a phi of phis, of a call's return storage, or of a global is left alone.
-# ---
-# st: state whose cand_root is linked and cand_out marks unsplittable phis
 fun link_phi_partitions(st: *State) {
     val fn: *ir.Function = st.fn;
     var c: u32 = 0;
@@ -807,43 +514,20 @@ fun link_phi_partitions(st: *State) {
     }
 }
 
-# whether a value names storage by address (the only thing a whole-aggregate copy
-# may read from or write to)
-# ---
-# v:   the value to classify
-# ret: true for an instruction result, a parameter, or a global
 fun is_address_value(v: value.Value) bool {
     ret v.kind == value.VAL_INSTR || v.kind == value.VAL_PARAM || v.kind == value.VAL_GLOBAL;
 }
 
-# join a candidate's secrecy taint with `s`
-# ---
-# st: state with cand_secret populated
-# c:  the candidate index
-# s:  the taint to join in
 fun taint(st: *State, c: u32, s: bool) {
     if (s) { st.cand_secret[c] = true; }
 }
 
-# record that a reference to candidate `c` sits in block `b`, clearing the
-# candidate's locality the moment a second block shows up
-# ---
-# st: state with cand_home / cand_local populated
-# c:  the candidate index
-# b:  the referencing block
 fun note_home(st: *State, c: u32, b: id.BlockId) {
     if (b == id.BLOCK_NIL) { ret; }
     if (st.cand_home[c] == id.BLOCK_NIL) { st.cand_home[c] = b; ret; }
     if (st.cand_home[c] != b)            { st.cand_local[c] = false; }
 }
 
-# the single classification sweep: decide, for every reference to a candidate,
-# whether it is a decomposable use or an escape, and record each field gep
-#
-# Also joins each reference's secrecy into the candidate, so a slot that ever
-# carries secret data taints every instruction the rewrite synthesizes for it.
-# ---
-# st: state whose cand_out / cand_secret / gep_of / gep_field are populated
 fun classify_references(st: *State) {
     val fn: *ir.Function = st.fn;
     var i: u32 = 0;
@@ -851,12 +535,8 @@ fun classify_references(st: *State) {
         if (st.instr_block[i] == id.BLOCK_NIL) { i = i + 1; cnt; }
         val inst: *instruction.Instruction = ?fn.instrs[i];
 
-        # an inline-asm `{name}` binding addresses the slot as [rbp + offset] at
-        # encode time, so its storage must survive as one contiguous object
         if (inst.kind == instruction.OP_ASM) { mark_asm_binds(st, i::id.InstructionId); }
 
-        # a dbg-value naming a slot is debug metadata, never an address escape:
-        # counting it would make a -g build decline where a release build splits
         if (inst.kind == instruction.OP_DBG_VALUE) { i = i + 1; cnt; }
 
         var o: u32 = 0;
@@ -867,8 +547,6 @@ fun classify_references(st: *State) {
                 if (c != NONE_U32) {
                     taint(st, c, op.secret);
                     taint(st, c, inst.secret);
-                    # a phi-incoming operand lives in the phi's block by construction,
-                    # so it is not part of the referencing member's locality
                     if (inst.kind != instruction.OP_PHI) { note_home(st, c, st.instr_block[i]); }
                     if (!classify_one(st, c, i::id.InstructionId, inst, o)) { st.cand_out[c] = true; }
                 }
@@ -879,14 +557,6 @@ fun classify_references(st: *State) {
     }
 }
 
-# classify one reference to candidate `c` at operand `o` of instruction `inst`
-# ---
-# st:   state (gep_of / gep_field are written for an accepted field gep)
-# c:    the referenced candidate
-# iid:  the referencing instruction's id
-# inst: the referencing instruction
-# o:    the operand slot naming the candidate
-# ret:  true when the reference is decomposable, false when the address escapes
 fun classify_one(st: *State, c: u32, iid: id.InstructionId, inst: *instruction.Instruction, o: u32) bool {
     if (inst.kind == instruction.OP_GEP && o == 0) {
         if (inst.operand_count < 3)                          { ret false; }
@@ -895,17 +565,12 @@ fun classify_one(st: *State, c: u32, iid: id.InstructionId, inst: *instruction.I
         if (inst.operands[2].kind != value.VAL_CONST_INT)    { ret false; }
         val k: u64 = inst.operands[2].data.int_lit;
         if (k >= st.cand_nf[c]::u64)                         { ret false; }
-        # a union field is one cell, not a tree: a walk continuing past it within the
-        # same gep addresses part of the cell, which one whole-cell slot cannot stand
-        # in for. its members are named by a chained gep instead, which
-        # `mark_union_member_geps` resolves onto the cell's own address
         if (inst.operand_count > 3
             && union_leaf_ty(st, agg_field_type(st, st.cand_ty[c], k::u32)) != ir_type.IRT_NIL) { ret false; }
         st.gep_of[iid::u32]    = c;
         st.gep_field[iid::u32] = k::u32;
         ret true;
     }
-    # a phi's storage is a snapshot, so it is only ever read: no zero fill, no copy in
     if (inst.kind == instruction.OP_MEMZERO && o == 0) { ret st.cand_phi[c] == false; }
     if (inst.kind == instruction.OP_STORE && inst.operand_count >= 2) {
         if (o == 1) {
@@ -914,8 +579,6 @@ fun classify_one(st: *State, c: u32, iid: id.InstructionId, inst: *instruction.I
             ret is_address_value(inst.operands[0]);
         }
         if (o == 0) {
-            # a copy out only stays whole-slot faithful when the destination is itself
-            # decomposed, so no padding byte it stops writing is ever observable
             if (inst.operands[0].ty != st.cand_ty[c])            { ret false; }
             val d: value.Value = inst.operands[1];
             if (d.kind != value.VAL_INSTR)                       { ret false; }
@@ -926,7 +589,7 @@ fun classify_one(st: *State, c: u32, iid: id.InstructionId, inst: *instruction.I
         }
         ret false;
     }
-    if (inst.kind == instruction.OP_PHI && (o % 2) == 1) {
+    if (opdesc.operand_role(inst.kind, o) == opdesc.ROLE_PHI_VALUE) {
         val pc: u32 = st.cand_of[iid::u32];
         if (pc == NONE_U32 || st.cand_phi[pc] == false) { ret false; }
         ret find_root(st, pc) == find_root(st, c);
@@ -934,20 +597,6 @@ fun classify_one(st: *State, c: u32, iid: id.InstructionId, inst: *instruction.I
     ret false;
 }
 
-# tag every gep that names a member of a split union field
-#
-# `classify_references` has already tagged the direct field geps, so a union member gep
-# is exactly a three-index gep based on one of those whose field is a union leaf. Every
-# member of a union starts at the cell's own address, so the member gep resolves to the
-# same address as the field gep it is chained onto: it carries the same candidate and
-# the same field ordinal, is retargeted onto the same slot, and only the load or store
-# on the far side has to reinterpret the cell's bits as the member's type.
-#
-# This runs as its own sweep rather than inside `classify_gep_uses`, which validates a
-# gep's uses when it reaches the *using* instruction -- a use at a lower pool id than
-# the member gep it reads would be walked past before the tag existed.
-# ---
-# st: state whose gep_of / gep_field / uni_gep are written for each member gep
 fun mark_union_member_geps(st: *State) {
     val fn: *ir.Function = st.fn;
     var i: u32 = 0;
@@ -980,13 +629,6 @@ fun mark_union_member_geps(st: *State) {
     }
 }
 
-# mark every candidate bound by an OP_ASM's `{name}` list as escaped
-#
-# The bindings live in the asm payload rather than the instruction's operands, so
-# escape analysis must consult them explicitly.
-# ---
-# st:     state whose cand_out is written
-# asm_id: the OP_ASM instruction whose bindings to scan
 fun mark_asm_binds(st: *State, asm_id: id.InstructionId) {
     var key: id.InstructionId = asm_id;
     val res: R.Result[*ir.IrAsm, str] = map.get[id.InstructionId, ir.IrAsm](?st.fn.asm_blocks, ?key);
@@ -1002,15 +644,6 @@ fun mark_asm_binds(st: *State, asm_id: id.InstructionId) {
     }
 }
 
-# check what each accepted field gep's own result feeds
-#
-# A field address may only be dereferenced or descended into further; anything else
-# (a call argument, a return, a bitcast, a comparison) is the field address escaping,
-# which for an array element also defeats the adjacency a caller may rely on. A gep
-# on a phi candidate is stricter still: the merge is only faithful while the shared
-# slots are read, so the address may not be stored through.
-# ---
-# st: state whose cand_out is written for a candidate with an escaping field address
 fun classify_gep_uses(st: *State) {
     val fn: *ir.Function = st.fn;
     var i: u32 = 0;
@@ -1037,21 +670,6 @@ fun classify_gep_uses(st: *State) {
     }
 }
 
-# whether one use of a field gep keeps its owner splittable
-#
-# A gep addressing a union field -- the field gep itself, or a chained gep naming one
-# of its members, which is the same address -- is stricter: the cell's slot holds one
-# register-sized scalar, so an access must cover all of it. There is no partial form of
-# a whole-cell store, and a narrower load would read bytes the slot does not model.
-# ---
-# st:   state
-# c:    the candidate the gep addresses
-# gid:  the field gep's instruction id
-# uid:  the using instruction's id
-# inst: the using instruction
-# o:    the operand slot naming the gep
-# ret:  true when the use is a plain dereference, or a further descent that stays
-#       inside the field
 fun gep_use_ok(st: *State, c: u32, gid: id.InstructionId, uid: id.InstructionId, inst: *instruction.Instruction, o: u32) bool {
     val cell: bool = union_leaf_ty(st, agg_field_type(st, st.cand_ty[c], st.gep_field[gid::u32])) != ir_type.IRT_NIL;
     if (inst.kind == instruction.OP_LOAD && o == 0) {
@@ -1067,53 +685,19 @@ fun gep_use_ok(st: *State, c: u32, gid: id.InstructionId, uid: id.InstructionId,
     ret false;
 }
 
-# whether an access through a gep addressing a union cell is one the slot can carry
-#
-# The slot holds one scalar, so the access must be a scalar too, and no wider than the
-# cell. A full-width access transfers through a bit cast; a narrower one needs the
-# cell's own integer to mask and widen through, which `union_leaf_ty` guarantees is the
-# storage type whenever the union has a narrow member -- but an access narrower than
-# every member (loading an `i8` out of a `uni{i64, ptr}`) can still land on a cell whose
-# storage is a member's type, and that has no masking form.
-# ---
-# st:  state
-# c:   the candidate the gep addresses
-# gid: the gep's instruction id
-# at:  the access type (a load's result type, or a store's value type)
-# ret: true when the slot can carry the access
 fun union_access_ok(st: *State, c: u32, gid: id.InstructionId, at: ir_type.IrTypeId) bool {
     if (!scalar_field(st, at)) { ret false; }
     val ft: ir_type.IrTypeId = agg_field_type(st, st.cand_ty[c], st.gep_field[gid::u32]);
-    val cell: u32 = ir_type.byte_size(?st.m.types, ft, st.tgt);
-    val acc: u32  = ir_type.byte_size(?st.m.types, at, st.tgt);
+    val cell: u32 = ir_type.byte_size_for_machine(?st.m.types, ft, resolved.layout_machine(st.tgt));
+    val acc: u32  = ir_type.byte_size_for_machine(?st.m.types, at, resolved.layout_machine(st.tgt));
     if (acc > cell) { ret false; }
     if (acc == cell) { ret true; }
     if (union_leaf_ty(st, ft) != int_of_bytes(st, cell)) { ret false; }
     ret int_of_bytes(st, acc) != ir_type.IRT_NIL;
 }
 
-# whether a gep chained onto a field gep still addresses only that field
-#
-# Splitting moves a field to a slot of its own, so the bytes that used to follow it
-# belong to a different object afterwards. A chained gep keeps its meaning exactly
-# when it starts at the field (a constant zero first index) and walks the field's own
-# type -- `s.inner.x` does, and stays splittable. A gep that strides over the field
-# (`p[i]` on a `*T` taken with `?s.f`) does not: it reached a sibling before the
-# split and would reach unrelated storage after, so the field address has escaped.
-# ---
-# st:   state
-# c:    the candidate the field gep addresses
-# gid:  the field gep's instruction id
-# uid:  the chained gep's instruction id
-# inst: the chained gep
-# ret:  true when the chained gep stays inside the field
 fun gep_stays_in_field(st: *State, c: u32, gid: id.InstructionId, uid: id.InstructionId, inst: *instruction.Instruction) bool {
     val ft: ir_type.IrTypeId = agg_field_type(st, st.cand_ty[c], st.gep_field[gid::u32]);
-    # a union field is one cell rather than a tree to descend: `mark_union_member_geps`
-    # tagged the geps that name a member, all of which resolve to the cell's own
-    # address. any other gep addresses part of the cell, which one slot cannot stand in
-    # for -- including a gep chained onto a member gep, which is never tagged because
-    # tagging refuses a member gep for a base
     if (union_leaf_ty(st, ft) != ir_type.IRT_NIL)     { ret st.uni_gep[uid::u32]; }
     if (inst.operand_count < 2)                       { ret false; }
     if (inst.operands[1].kind != value.VAL_CONST_INT) { ret false; }
@@ -1121,22 +705,6 @@ fun gep_stays_in_field(st: *State, c: u32, gid: id.InstructionId, uid: id.Instru
     ret inst.aux_ty == ft;
 }
 
-# enforce the two rules that let one shared slot set stand in for the several
-# addresses an aggregate phi merges
-#
-# The phi must be read-only and local: every reference to it (its own uses and the
-# uses of its field geps) sits in the phi's block, and that block writes no member of
-# the partition -- so the shared slots are read exactly where the merge selected an
-# incoming, with nothing overwriting them first.
-#
-# Each incoming slot must be self-contained: `cand_local` says every one of its
-# references is in the one block that defines it, and no other member's defining
-# block is reachable from it without passing the phi. Together these make the last
-# member written into the shared slots, on any path reaching the phi, exactly the one
-# the phi names for that edge.
-# ---
-# st: state whose cand_out is written for a partition the sharing would not be
-#     faithful over
 fun check_partitions(st: *State) {
     var c: u32 = 0;
     for (c < st.cand_count) {
@@ -1169,18 +737,6 @@ fun check_partitions(st: *State) {
     }
 }
 
-# whether block `to` is reachable from block `from` without passing through a block
-# that holds one of the partition's phis
-#
-# A phi block is a sink: once control reaches the merge, the phi has already selected
-# its incoming and the shared slots have been read, so what happens beyond it cannot
-# make the selection stale.
-# ---
-# st:   state (visit / queue are its scratch arrays)
-# from: the block to search out of
-# to:   the block being looked for
-# root: the partition whose phi blocks stop the walk
-# ret:  true when `to` is reached
 fun reaches_between(st: *State, from: id.BlockId, to: id.BlockId, root: u32) bool {
     var i: u32 = 0;
     for (i < st.block_count) { st.visit[i] = false; i = i + 1; }
@@ -1199,11 +755,6 @@ fun reaches_between(st: *State, from: id.BlockId, to: id.BlockId, root: u32) boo
     ret false;
 }
 
-# enqueue the not-yet-visited successors of `b` onto the reachability worklist
-# ---
-# st:   state (visit / queue are its scratch arrays)
-# b:    the block whose successors to enqueue
-# tail: the worklist's end offset, advanced per enqueued block
 fun push_successors(st: *State, b: id.BlockId, tail: *u32) {
     var s0: id.BlockId = id.BLOCK_NIL;
     var s1: id.BlockId = id.BLOCK_NIL;
@@ -1212,11 +763,6 @@ fun push_successors(st: *State, b: id.BlockId, tail: *u32) {
     if (n >= 2) { push_block(st, s1, tail); }
 }
 
-# enqueue one block if it is in range and unvisited
-# ---
-# st:   state (visit / queue are its scratch arrays)
-# b:    the block to enqueue
-# tail: the worklist's end offset, advanced when the block is enqueued
 fun push_block(st: *State, b: id.BlockId, tail: *u32) {
     if (b == id.BLOCK_NIL || b::u32 >= st.block_count) { ret; }
     if (st.visit[b::u32]) { ret; }
@@ -1225,12 +771,6 @@ fun push_block(st: *State, b: id.BlockId, tail: *u32) {
     @tail = @tail + 1;
 }
 
-# whether block `b` holds a phi candidate of partition `root`
-# ---
-# st:   state
-# b:    the block to test
-# root: the partition representative
-# ret:  true when a member phi lives in `b`
 fun is_partition_phi_block(st: *State, b: id.BlockId, root: u32) bool {
     var c: u32 = 0;
     for (c < st.cand_count) {
@@ -1240,13 +780,6 @@ fun is_partition_phi_block(st: *State, b: id.BlockId, root: u32) bool {
     ret false;
 }
 
-# whether block `b` writes storage belonging to candidate `c`'s partition
-# ---
-# st: state
-# b:  the block to scan
-# c:  a candidate naming the partition
-# ret: true when the block holds a memzero, a whole-slot copy, or a field store to a
-#      member of the partition
 fun block_writes_partition(st: *State, b: id.BlockId, c: u32) bool {
     val fn: *ir.Function = st.fn;
     val root: u32 = find_root(st, c);
@@ -1274,19 +807,12 @@ fun block_writes_partition(st: *State, b: id.BlockId, c: u32) bool {
     ret false;
 }
 
-# propagate escapes to a fixpoint: over each phi partition (an address merge is only
-# as splittable as every slot feeding it) and from a whole-aggregate copy's
-# destination back to its source
-# ---
-# st: state whose cand_out is closed under both rules
 fun propagate_escapes(st: *State) {
     val fn: *ir.Function = st.fn;
     var changed: bool = true;
     for (changed) {
         changed = false;
 
-        # a partition splits whole or not at all: push every member's escape up to
-        # the representative, then pull the representative's back down
         var c: u32 = 0;
         for (c < st.cand_count) {
             if (st.cand_out[c]) { st.cand_out[find_root(st, c)] = true; }
@@ -1301,7 +827,6 @@ fun propagate_escapes(st: *State) {
             d = d + 1;
         }
 
-        # a copy out is only faithful into a destination that is itself decomposed
         var i: u32 = 0;
         for (i < st.pool_len) {
             if (st.instr_block[i] == id.BLOCK_NIL) { i = i + 1; cnt; }
@@ -1324,14 +849,6 @@ fun propagate_escapes(st: *State) {
     }
 }
 
-# lay out the flattened field-slot table, one set of slots per surviving partition
-#
-# Every member of a phi partition shares one set, which is what turns the address
-# merge into a merge of the slots' contents; a lone alloca is its own partition and
-# gets its own set.
-# ---
-# st:  state whose cand_slot offsets and `slots` array are sized
-# ret: the number of candidates that will be split
 fun assign_slots(st: *State) u32 {
     var total: u32 = 0;
     var live: u32 = 0;
@@ -1355,79 +872,52 @@ fun assign_slots(st: *State) u32 {
     ret live;
 }
 
-# an insertion point for the rewrite's synthesized traffic
-#
-# The pass emits into blocks that already carry a terminator, which the construction
-# cursor (`ir.builder`) refuses, so it appends to the pool and to the block body
-# directly -- the same post-construction path mem2reg uses to birth a phi. A block's
-# body excludes its terminator, so an append always lands before it, on the edge.
-# ---
-# bid: the block new instructions are appended to
-# loc: the source location stamped onto them, carried from the instruction they replace
 rec Cursor {
     bid: id.BlockId;
     loc: source.SrcLoc;
 }
 
-# materialise the field slots, expand every whole-aggregate operation into per-field
-# traffic, retarget every field gep, and erase the superseded instructions
-# ---
-# st:  state with the surviving candidate set finalised
-# ret: ok(true) once the function is rewritten, or the first error
-fun rewrite(st: *State) R.Result[bool, str] {
+fun rewrite(st: *State) R.Result[R.Void, str] {
     val r_slots: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, st.slot_total::usize);
-    if (R.is_err[*value.Value, str](r_slots)) { ret R.err[bool, str](R.unwrap_err[*value.Value, str](r_slots)); }
+    if (R.is_err[*value.Value, str](r_slots)) { ret R.err[R.Void, str](R.unwrap_err[*value.Value, str](r_slots)); }
     st.slots = R.unwrap_ok[*value.Value, str](r_slots);
 
-    val r_types: R.Result[bool, str] = intern_types(st);
-    if (R.is_err[bool, str](r_types)) { ret r_types; }
+    val r_types: R.Result[R.Void, str] = intern_types(st);
+    if (R.is_err[R.Void, str](r_types)) { ret r_types; }
 
-    val r_alloc: R.Result[bool, str] = emit_field_slots(st);
-    if (R.is_err[bool, str](r_alloc)) { ret r_alloc; }
+    val r_alloc: R.Result[R.Void, str] = emit_field_slots(st);
+    if (R.is_err[R.Void, str](r_alloc)) { ret r_alloc; }
 
     var rw: mutate.Rewrite;
-    val r_rw: R.Result[bool, str] = mutate.rewrite_init(?rw, st.alloc, st.fn.instr_len);
-    if (R.is_err[bool, str](r_rw)) { ret r_rw; }
+    val r_rw: R.Result[R.Void, str] = mutate.rewrite_init(?rw, st.alloc, st.fn.instr_len);
+    if (R.is_err[R.Void, str](r_rw)) { ret r_rw; }
 
-    val r_body: R.Result[bool, str] = rewrite_blocks(st, ?rw);
-    if (R.is_err[bool, str](r_body)) { mutate.rewrite_dnit(?rw, st.alloc); ret r_body; }
+    val r_body: R.Result[R.Void, str] = rewrite_blocks(st, ?rw);
+    if (R.is_err[R.Void, str](r_body)) { mutate.rewrite_dnit(?rw, st.alloc); ret r_body; }
 
     mutate.rewrite_apply(st.fn, ?rw);
     mutate.rewrite_dnit(?rw, st.alloc);
 
-    ret mutate.erase_marked(st.m, st.fn, st::ptr, erase_test);
+    val changed_r: R.Result[bool, str] = mutate.erase_marked[State](st.m, st.fn, st, erase_test);
+    if (R.is_err[bool, str](changed_r)) { ret R.err[R.Void, str](R.unwrap_err[bool, str](changed_r)); }
+    ret R.ok_void[str]();
 }
 
-# intern the three types every synthesized instruction needs
-# ---
-# st:  state whose ptr_ty / void_ty / i64_ty are filled
-# ret: ok(true) once interned, or the first error
-fun intern_types(st: *State) R.Result[bool, str] {
+fun intern_types(st: *State) R.Result[R.Void, str] {
     val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?st.m.types);
-    if (R.is_err[ir_type.IrTypeId, str](rp)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rp)); }
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ret R.err[R.Void, str](R.unwrap_err[ir_type.IrTypeId, str](rp)); }
     st.ptr_ty = R.unwrap_ok[ir_type.IrTypeId, str](rp);
 
     val rv: R.Result[ir_type.IrTypeId, str] = ir_type.intern_void(?st.m.types);
-    if (R.is_err[ir_type.IrTypeId, str](rv)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rv)); }
+    if (R.is_err[ir_type.IrTypeId, str](rv)) { ret R.err[R.Void, str](R.unwrap_err[ir_type.IrTypeId, str](rv)); }
     st.void_ty = R.unwrap_ok[ir_type.IrTypeId, str](rv);
 
     val ri: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?st.m.types, 64);
-    if (R.is_err[ir_type.IrTypeId, str](ri)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](ri)); }
+    if (R.is_err[ir_type.IrTypeId, str](ri)) { ret R.err[R.Void, str](R.unwrap_err[ir_type.IrTypeId, str](ri)); }
     st.i64_ty = R.unwrap_ok[ir_type.IrTypeId, str](ri);
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# append one instruction to the pool and to the cursor's block body
-# ---
-# st:     state
-# cur:    the insertion point
-# kind:   the opcode
-# ty:     the result type
-# ops:    a freshly allocated operand array the instruction takes ownership of
-# n:      its length
-# aux_ty: the opcode's auxiliary type, or IRT_NIL
-# secret: the constant-time taint to stamp
-# ret:    the new instruction's id, or an allocation error
 fun emit(st: *State, cur: *Cursor, kind: instruction.InstrKind, ty: ir_type.IrTypeId,
          ops: *value.Value, n: u32, aux_ty: ir_type.IrTypeId, secret: bool) R.Result[id.InstructionId, str] {
     var inst: instruction.Instruction;
@@ -1445,18 +935,11 @@ fun emit(st: *State, cur: *Cursor, kind: instruction.InstrKind, ty: ir_type.IrTy
     if (R.is_err[id.InstructionId, str](r)) { ret r; }
     val iid: id.InstructionId = R.unwrap_ok[id.InstructionId, str](r);
 
-    val ra: R.Result[bool, str] = ir.block_append_instr(st.m, ?st.fn.blocks[cur.bid::u32], iid);
-    if (R.is_err[bool, str](ra)) { ret R.err[id.InstructionId, str](R.unwrap_err[bool, str](ra)); }
+    val ra: R.Result[R.Void, str] = ir.block_append_instr(st.m, ?st.fn.blocks[cur.bid::u32], iid);
+    if (R.is_err[R.Void, str](ra)) { ret R.err[id.InstructionId, str](R.unwrap_err[R.Void, str](ra)); }
     ret R.ok[id.InstructionId, str](iid);
 }
 
-# emit `alloca ft, 1` naming one field's storage
-# ---
-# st:     state
-# cur:    the insertion point
-# ft:     the field type sizing the slot
-# secret: the taint to stamp
-# ret:    the slot's pointer value, or an error
 fun emit_slot(st: *State, cur: *Cursor, ft: ir_type.IrTypeId, secret: bool) R.Result[value.Value, str] {
     val r: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, 1::usize);
     if (R.is_err[*value.Value, str](r)) { ret R.err[value.Value, str](R.unwrap_err[*value.Value, str](r)); }
@@ -1470,34 +953,18 @@ fun emit_slot(st: *State, cur: *Cursor, ft: ir_type.IrTypeId, secret: bool) R.Re
     ret R.ok[value.Value, str](v);
 }
 
-# emit `store v, ptr`
-# ---
-# st:     state
-# cur:    the insertion point
-# v:      the stored value
-# ptr:    the destination address
-# secret: the taint to stamp
-# ret:    ok(true), or an allocation error
-fun emit_store(st: *State, cur: *Cursor, v: value.Value, ptr: value.Value, secret: bool) R.Result[bool, str] {
+fun emit_store(st: *State, cur: *Cursor, v: value.Value, ptr: value.Value, secret: bool) R.Result[R.Void, str] {
     val r: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, 2::usize);
-    if (R.is_err[*value.Value, str](r)) { ret R.err[bool, str](R.unwrap_err[*value.Value, str](r)); }
+    if (R.is_err[*value.Value, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*value.Value, str](r)); }
     val ops: *value.Value = R.unwrap_ok[*value.Value, str](r);
     ops[0] = v;
     ops[1] = ptr;
     val ri: R.Result[id.InstructionId, str] = emit(st, cur, instruction.OP_STORE, st.void_ty, ops, 2,
                                                   ir_type.IRT_NIL, secret || v.secret);
-    if (R.is_err[id.InstructionId, str](ri)) { ret R.err[bool, str](R.unwrap_err[id.InstructionId, str](ri)); }
-    ret R.ok[bool, str](true);
+    if (R.is_err[id.InstructionId, str](ri)) { ret R.err[R.Void, str](R.unwrap_err[id.InstructionId, str](ri)); }
+    ret R.ok_void[str]();
 }
 
-# emit `load ty, ptr`
-# ---
-# st:     state
-# cur:    the insertion point
-# ptr:    the address to read
-# ty:     the loaded type
-# secret: the taint to stamp
-# ret:    the loaded value, or an allocation error
 fun emit_load(st: *State, cur: *Cursor, ptr: value.Value, ty: ir_type.IrTypeId, secret: bool) R.Result[value.Value, str] {
     val r: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, 1::usize);
     if (R.is_err[*value.Value, str](r)) { ret R.err[value.Value, str](R.unwrap_err[*value.Value, str](r)); }
@@ -1510,15 +977,6 @@ fun emit_load(st: *State, cur: *Cursor, ptr: value.Value, ty: ir_type.IrTypeId, 
     ret R.ok[value.Value, str](v);
 }
 
-# emit `bitcast to, v`, reinterpreting a union cell's bits as a member's type or the
-# other way round
-# ---
-# st:     state
-# cur:    the insertion point
-# v:      the value to reinterpret
-# to:     the type to reinterpret it as
-# secret: the taint to stamp
-# ret:    the reinterpreted value, or an allocation error
 fun emit_bitcast(st: *State, cur: *Cursor, v: value.Value, to: ir_type.IrTypeId, secret: bool) R.Result[value.Value, str] {
     val r: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, 1::usize);
     if (R.is_err[*value.Value, str](r)) { ret R.err[value.Value, str](R.unwrap_err[*value.Value, str](r)); }
@@ -1532,15 +990,6 @@ fun emit_bitcast(st: *State, cur: *Cursor, v: value.Value, to: ir_type.IrTypeId,
     ret R.ok[value.Value, str](out);
 }
 
-# emit a one-operand conversion (`trunc` / `zext`) narrowing or widening `v` to `to`
-# ---
-# st:     state
-# cur:    the insertion point
-# kind:   OP_TRUNC or OP_ZEXT
-# v:      the value to convert
-# to:     the integer type to convert it to
-# secret: the taint to stamp
-# ret:    the converted value, or an allocation error
 fun emit_convert(st: *State, cur: *Cursor, kind: instruction.InstrKind, v: value.Value,
                  to: ir_type.IrTypeId, secret: bool) R.Result[value.Value, str] {
     val r: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, 1::usize);
@@ -1555,15 +1004,6 @@ fun emit_convert(st: *State, cur: *Cursor, kind: instruction.InstrKind, v: value
     ret R.ok[value.Value, str](out);
 }
 
-# emit a two-operand integer op (`and` / `or`) over `a` and `b`
-# ---
-# st:     state
-# cur:    the insertion point
-# kind:   OP_AND or OP_OR
-# a:      the left operand, whose type the result takes
-# b:      the right operand
-# secret: the taint to stamp
-# ret:    the resulting value, or an allocation error
 fun emit_binary(st: *State, cur: *Cursor, kind: instruction.InstrKind, a: value.Value,
                 b: value.Value, secret: bool) R.Result[value.Value, str] {
     val r: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, 2::usize);
@@ -1579,33 +1019,16 @@ fun emit_binary(st: *State, cur: *Cursor, kind: instruction.InstrKind, a: value.
     ret R.ok[value.Value, str](out);
 }
 
-# emit `memzero ptr` over a nested aggregate field
-# ---
-# st:     state
-# cur:    the insertion point
-# ptr:    the field slot to zero
-# ft:     the aggregate field type sizing the fill
-# secret: the taint to stamp
-# ret:    ok(true), or an allocation error
-fun emit_memzero(st: *State, cur: *Cursor, ptr: value.Value, ft: ir_type.IrTypeId, secret: bool) R.Result[bool, str] {
+fun emit_memzero(st: *State, cur: *Cursor, ptr: value.Value, ft: ir_type.IrTypeId, secret: bool) R.Result[R.Void, str] {
     val r: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, 1::usize);
-    if (R.is_err[*value.Value, str](r)) { ret R.err[bool, str](R.unwrap_err[*value.Value, str](r)); }
+    if (R.is_err[*value.Value, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*value.Value, str](r)); }
     val ops: *value.Value = R.unwrap_ok[*value.Value, str](r);
     ops[0] = ptr;
     val ri: R.Result[id.InstructionId, str] = emit(st, cur, instruction.OP_MEMZERO, st.void_ty, ops, 1, ft, secret);
-    if (R.is_err[id.InstructionId, str](ri)) { ret R.err[bool, str](R.unwrap_err[id.InstructionId, str](ri)); }
-    ret R.ok[bool, str](true);
+    if (R.is_err[id.InstructionId, str](ri)) { ret R.err[R.Void, str](R.unwrap_err[id.InstructionId, str](ri)); }
+    ret R.ok_void[str]();
 }
 
-# emit `gep base, 0, k` naming field `k` of the aggregate at `base`
-# ---
-# st:     state
-# cur:    the insertion point
-# base:   the aggregate's address
-# ty:     the aggregate type the index walk starts from
-# k:      the field ordinal
-# secret: the taint to stamp
-# ret:    the field's address, or an allocation error
 fun emit_field_gep(st: *State, cur: *Cursor, base: value.Value, ty: ir_type.IrTypeId, k: u32, secret: bool) R.Result[value.Value, str] {
     val r: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, 3::usize);
     if (R.is_err[*value.Value, str](r)) { ret R.err[value.Value, str](R.unwrap_err[*value.Value, str](r)); }
@@ -1620,17 +1043,7 @@ fun emit_field_gep(st: *State, cur: *Cursor, base: value.Value, ty: ir_type.IrTy
     ret R.ok[value.Value, str](v);
 }
 
-# create one alloca per field of every surviving candidate, at the front of the
-# entry block
-#
-# An alloca is a static frame-slot reservation plus an address materialisation, so
-# entry placement is equivalent to placing each slot where its aggregate was, and it
-# is the only placement that also dominates the incoming edges a phi candidate's
-# snapshot slots are written on.
-# ---
-# st: state whose `slots` table is filled
-# ret: ok(true) once every slot exists and the entry body is reordered, or an error
-fun emit_field_slots(st: *State) R.Result[bool, str] {
+fun emit_field_slots(st: *State) R.Result[R.Void, str] {
     val before: u32 = st.fn.blocks[0].instr_count;
     var cur: Cursor;
     cur.bid = 0::id.BlockId;
@@ -1643,7 +1056,7 @@ fun emit_field_slots(st: *State) R.Result[bool, str] {
         for (k < st.cand_nf[c]) {
             val ft: ir_type.IrTypeId = slot_ty(st, st.cand_ty[c], k);
             val r: R.Result[value.Value, str] = emit_slot(st, ?cur, ft, partition_secret(st, c));
-            if (R.is_err[value.Value, str](r)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r)); }
+            if (R.is_err[value.Value, str](r)) { ret R.err[R.Void, str](R.unwrap_err[value.Value, str](r)); }
             st.slots[st.cand_slot[c] + k] = R.unwrap_ok[value.Value, str](r);
             k = k + 1;
         }
@@ -1653,14 +1066,6 @@ fun emit_field_slots(st: *State) R.Result[bool, str] {
     ret rotate_to_front(st, 0::id.BlockId, before);
 }
 
-# whether any member of `c`'s partition ever carries secret data
-#
-# The slots are shared, so their taint is the join over the partition: a secret
-# reaching one member's storage reaches the storage every member reads.
-# ---
-# st:  state
-# c:   a candidate naming the partition
-# ret: true when any member is tainted
 fun partition_secret(st: *State, c: u32) bool {
     val root: u32 = find_root(st, c);
     var d: u32 = 0;
@@ -1671,23 +1076,12 @@ fun partition_secret(st: *State, c: u32) bool {
     ret false;
 }
 
-# move the instructions appended past `before` to the front of block `bid`, keeping
-# both groups' relative order
-#
-# A slot must dominate every use already in the entry body; this is a permutation of
-# the block's list, never a removal, so the single-erase-path contract on
-# `mutate.erase_marked` is untouched.
-# ---
-# st:     state
-# bid:    the block to reorder
-# before: the instruction count the block had before the appends
-# ret:    ok(true) once reordered, or an allocation error
-fun rotate_to_front(st: *State, bid: id.BlockId, before: u32) R.Result[bool, str] {
+fun rotate_to_front(st: *State, bid: id.BlockId, before: u32) R.Result[R.Void, str] {
     val blk: *ir.Block = ?st.fn.blocks[bid::u32];
-    if (blk.instr_count == before) { ret R.ok[bool, str](true); }
+    if (blk.instr_count == before) { ret R.ok_void[str](); }
 
     val r: R.Result[*id.InstructionId, str] = A.allocate[id.InstructionId](st.alloc, blk.instr_count::usize);
-    if (R.is_err[*id.InstructionId, str](r)) { ret R.err[bool, str](R.unwrap_err[*id.InstructionId, str](r)); }
+    if (R.is_err[*id.InstructionId, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*id.InstructionId, str](r)); }
     val tmp: *id.InstructionId = R.unwrap_ok[*id.InstructionId, str](r);
 
     var w: u32 = 0;
@@ -1699,52 +1093,33 @@ fun rotate_to_front(st: *State, bid: id.BlockId, before: u32) R.Result[bool, str
     for (z < blk.instr_count) { blk.instructions[z] = tmp[z]; z = z + 1; }
 
     A.deallocate[id.InstructionId](st.alloc, tmp, blk.instr_count::usize);
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# rewrite every block: expand the whole-aggregate operations, retarget the field
-# geps, and append each phi candidate's incoming-edge copies
-# ---
-# st: state
-# rw: rewrite map collecting the field-gep replacements
-# ret: ok(true) once every block is rewritten, or the first error
-fun rewrite_blocks(st: *State, rw: *mutate.Rewrite) R.Result[bool, str] {
+fun rewrite_blocks(st: *State, rw: *mutate.Rewrite) R.Result[R.Void, str] {
     var bi: u32 = 0;
     for (bi < st.fn.block_count) {
-        val res: R.Result[bool, str] = rewrite_block(st, rw, bi::id.BlockId);
-        if (R.is_err[bool, str](res)) { ret res; }
+        val res: R.Result[R.Void, str] = rewrite_block(st, rw, bi::id.BlockId);
+        if (R.is_err[R.Void, str](res)) { ret res; }
         bi = bi + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# rewrite one block
-#
-# Each old instruction's replacement traffic is appended to the block, then the body
-# is re-laid so every appended group sits immediately before the instruction it
-# replaces; the superseded originals stay in the list and are dropped by the single
-# erase path afterwards.
-# ---
-# st:  state
-# rw:  rewrite map collecting the field-gep replacements
-# bid: the block to rewrite
-# ret: ok(true) once the block is rewritten, or the first error
-fun rewrite_block(st: *State, rw: *mutate.Rewrite, bid: id.BlockId) R.Result[bool, str] {
+fun rewrite_block(st: *State, rw: *mutate.Rewrite, bid: id.BlockId) R.Result[R.Void, str] {
     val old_n: u32 = st.fn.blocks[bid::u32].instr_count;
-    if (old_n == 0) { ret R.ok[bool, str](true); }
+    if (old_n == 0) { ret R.ok_void[str](); }
 
-    # snapshot the body: appending to the block grows the same array underneath
     val r_old: R.Result[*id.InstructionId, str] = A.allocate[id.InstructionId](st.alloc, old_n::usize);
-    if (R.is_err[*id.InstructionId, str](r_old)) { ret R.err[bool, str](R.unwrap_err[*id.InstructionId, str](r_old)); }
+    if (R.is_err[*id.InstructionId, str](r_old)) { ret R.err[R.Void, str](R.unwrap_err[*id.InstructionId, str](r_old)); }
     val old: *id.InstructionId = R.unwrap_ok[*id.InstructionId, str](r_old);
     var s: u32 = 0;
     for (s < old_n) { old[s] = st.fn.blocks[bid::u32].instructions[s]; s = s + 1; }
 
-    # per old instruction, how many replacement instructions were appended for it
     val r_cnt: R.Result[*u32, str] = A.allocate[u32](st.alloc, old_n::usize);
     if (R.is_err[*u32, str](r_cnt)) {
         A.deallocate[id.InstructionId](st.alloc, old, old_n::usize);
-        ret R.err[bool, str](R.unwrap_err[*u32, str](r_cnt));
+        ret R.err[R.Void, str](R.unwrap_err[*u32, str](r_cnt));
     }
     val added: *u32 = R.unwrap_ok[*u32, str](r_cnt);
 
@@ -1752,39 +1127,30 @@ fun rewrite_block(st: *State, rw: *mutate.Rewrite, bid: id.BlockId) R.Result[boo
     var ix: u32 = 0;
     for (ix < old_n && err == nil) {
         val at: u32 = st.fn.blocks[bid::u32].instr_count;
-        val res: R.Result[bool, str] = rewrite_instr(st, rw, bid, old[ix]);
-        if (R.is_err[bool, str](res)) { err = R.unwrap_err[bool, str](res); }
+        val res: R.Result[R.Void, str] = rewrite_instr(st, rw, bid, old[ix]);
+        if (R.is_err[R.Void, str](res)) { err = R.unwrap_err[R.Void, str](res); }
         or { added[ix] = st.fn.blocks[bid::u32].instr_count - at; }
         ix = ix + 1;
     }
 
     if (err == nil) {
-        val res: R.Result[bool, str] = relayout_block(st, bid, old, old_n, added);
-        if (R.is_err[bool, str](res)) { err = R.unwrap_err[bool, str](res); }
+        val res: R.Result[R.Void, str] = relayout_block(st, bid, old, old_n, added);
+        if (R.is_err[R.Void, str](res)) { err = R.unwrap_err[R.Void, str](res); }
     }
 
     A.deallocate[id.InstructionId](st.alloc, old, old_n::usize);
     A.deallocate[u32](st.alloc, added, old_n::usize);
-    if (err != nil) { ret R.err[bool, str](err); }
-    ret R.ok[bool, str](true);
+    if (err != nil) { ret R.err[R.Void, str](err); }
+    ret R.ok_void[str]();
 }
 
-# re-lay a rewritten block's body so each appended group precedes the instruction it
-# replaces, restoring program order
-# ---
-# st:    state
-# bid:   the block to re-lay
-# old:   the body snapshot taken before the appends
-# old_n: its length
-# added: per old instruction, how many replacements were appended for it
-# ret:   ok(true) once the body is re-laid, or an allocation error
-fun relayout_block(st: *State, bid: id.BlockId, old: *id.InstructionId, old_n: u32, added: *u32) R.Result[bool, str] {
+fun relayout_block(st: *State, bid: id.BlockId, old: *id.InstructionId, old_n: u32, added: *u32) R.Result[R.Void, str] {
     val blk: *ir.Block = ?st.fn.blocks[bid::u32];
     val total: u32 = blk.instr_count;
-    if (total == old_n) { ret R.ok[bool, str](true); }
+    if (total == old_n) { ret R.ok_void[str](); }
 
     val r: R.Result[*id.InstructionId, str] = A.allocate[id.InstructionId](st.alloc, total::usize);
-    if (R.is_err[*id.InstructionId, str](r)) { ret R.err[bool, str](R.unwrap_err[*id.InstructionId, str](r)); }
+    if (R.is_err[*id.InstructionId, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*id.InstructionId, str](r)); }
     val plan: *id.InstructionId = R.unwrap_ok[*id.InstructionId, str](r);
 
     var w: u32 = 0;
@@ -1801,21 +1167,11 @@ fun relayout_block(st: *State, bid: id.BlockId, old: *id.InstructionId, old_n: u
     for (z < total) { blk.instructions[z] = plan[z]; z = z + 1; }
 
     A.deallocate[id.InstructionId](st.alloc, plan, total::usize);
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# rewrite one instruction of a block being split
-#
-# Appends the replacement traffic for a memzero or a whole-aggregate copy, retargets
-# a field gep onto its slot, and marks each superseded original for erasure.
-# ---
-# st:  state
-# rw:  rewrite map collecting the field-gep replacements
-# bid: the instruction's block
-# iid: the instruction to rewrite
-# ret: ok(true) once handled (possibly as a no-op), or the first error
-fun rewrite_instr(st: *State, rw: *mutate.Rewrite, bid: id.BlockId, iid: id.InstructionId) R.Result[bool, str] {
-    if (iid::u32 >= st.pool_len) { ret R.ok[bool, str](true); }
+fun rewrite_instr(st: *State, rw: *mutate.Rewrite, bid: id.BlockId, iid: id.InstructionId) R.Result[R.Void, str] {
+    if (iid::u32 >= st.pool_len) { ret R.ok_void[str](); }
     val inst: *instruction.Instruction = ?st.fn.instrs[iid::u32];
     var cur: Cursor;
     cur.bid = bid;
@@ -1840,7 +1196,7 @@ fun rewrite_instr(st: *State, rw: *mutate.Rewrite, bid: id.BlockId, iid: id.Inst
             st.erase[iid::u32] = true;
             ret expand_memzero(st, ?cur, c, inst.secret);
         }
-        ret R.ok[bool, str](true);
+        ret R.ok_void[str]();
     }
 
     if (inst.kind == instruction.OP_STORE && inst.operand_count >= 2) {
@@ -1850,17 +1206,9 @@ fun rewrite_instr(st: *State, rw: *mutate.Rewrite, bid: id.BlockId, iid: id.Inst
             ret expand_copy(st, ?cur, dc, inst.operands[0], inst.secret);
         }
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# the gep addressing a split union cell that a value names, or NONE_U32
-#
-# Both the field gep and a chained member gep resolve to the cell's own address, so
-# either one puts the access on the reinterpreting path.
-# ---
-# st: state
-# v:  the address operand to resolve
-# ret: the gep's instruction id, or NONE_U32
 fun union_access_at(st: *State, v: value.Value) u32 {
     if (v.kind != value.VAL_INSTR)        { ret NONE_U32; }
     if (v.data.instr::u32 >= st.pool_len) { ret NONE_U32; }
@@ -1871,136 +1219,90 @@ fun union_access_at(st: *State, v: value.Value) u32 {
     ret gid;
 }
 
-# read a union cell's slot and reinterpret it as the member the load names
-#
-# The load already had its pointer retargeted onto the cell's slot, so when the member
-# it names is the slot's own storage type there is nothing left to do. Otherwise the
-# cell is read whole and narrowed to the access: a `trunc` first when the member is
-# narrower (its bits are the cell integer's low ones), then a bit cast when the result
-# is not already the access type. The original load is superseded by the result.
-# ---
-# st:   state
-# rw:   rewrite map collecting the substitution
-# cur:  the insertion point
-# iid:  the load's instruction id
-# inst: the load
-# gid:  the gep it reads through
-# ret:  ok(true) once rewritten, or the first error
 fun reinterpret_load(st: *State, rw: *mutate.Rewrite, cur: *Cursor, iid: id.InstructionId,
-                     inst: *instruction.Instruction, gid: u32) R.Result[bool, str] {
+                     inst: *instruction.Instruction, gid: u32) R.Result[R.Void, str] {
     val c: u32 = st.gep_of[gid];
     val sty: ir_type.IrTypeId = slot_ty(st, st.cand_ty[c], st.gep_field[gid]);
-    if (inst.ty == sty) { ret R.ok[bool, str](true); }
+    if (inst.ty == sty) { ret R.ok_void[str](); }
 
     val slot: value.Value = st.slots[st.cand_slot[c] + st.gep_field[gid]];
     val tainted: bool = inst.secret || st.cand_secret[c];
+    val inst_ty: ir_type.IrTypeId = inst.ty;
     val r_load: R.Result[value.Value, str] = emit_load(st, cur, slot, sty, tainted);
-    if (R.is_err[value.Value, str](r_load)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_load)); }
+    if (R.is_err[value.Value, str](r_load)) { ret R.err[R.Void, str](R.unwrap_err[value.Value, str](r_load)); }
     var cur_v: value.Value = R.unwrap_ok[value.Value, str](r_load);
 
-    val acc: u32 = ir_type.byte_size(?st.m.types, inst.ty, st.tgt);
-    if (acc < ir_type.byte_size(?st.m.types, sty, st.tgt)) {
+    val acc: u32 = ir_type.byte_size_for_machine(?st.m.types, inst_ty, resolved.layout_machine(st.tgt));
+    if (acc < ir_type.byte_size_for_machine(?st.m.types, sty, resolved.layout_machine(st.tgt))) {
         val r_tr: R.Result[value.Value, str] = emit_convert(st, cur, instruction.OP_TRUNC, cur_v,
                                                             int_of_bytes(st, acc), tainted);
-        if (R.is_err[value.Value, str](r_tr)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_tr)); }
+        if (R.is_err[value.Value, str](r_tr)) { ret R.err[R.Void, str](R.unwrap_err[value.Value, str](r_tr)); }
         cur_v = R.unwrap_ok[value.Value, str](r_tr);
     }
-    if (cur_v.ty != inst.ty) {
-        val r_cast: R.Result[value.Value, str] = emit_bitcast(st, cur, cur_v, inst.ty, tainted);
-        if (R.is_err[value.Value, str](r_cast)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_cast)); }
+    if (cur_v.ty != inst_ty) {
+        val r_cast: R.Result[value.Value, str] = emit_bitcast(st, cur, cur_v, inst_ty, tainted);
+        if (R.is_err[value.Value, str](r_cast)) { ret R.err[R.Void, str](R.unwrap_err[value.Value, str](r_cast)); }
         cur_v = R.unwrap_ok[value.Value, str](r_cast);
     }
 
     mutate.replace_value(rw, iid, cur_v);
     st.erase[iid::u32] = true;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# write a stored member back through the union cell's slot
-#
-# A member the width of the cell is bit-cast and stored whole. A narrower one must leave
-# the bytes it does not cover exactly as they were -- the very thing the memory form did
-# for free -- so it is widened into the cell integer and merged in: read the cell, clear
-# the member's bits, or the widened value back. In the shape this exists for, the cell
-# was zero-filled a moment earlier, and the later simplification passes fold the read,
-# the mask and the merge away, leaving only the widening.
-# ---
-# st:   state
-# cur:  the insertion point
-# iid:  the store's instruction id
-# inst: the store
-# gid:  the gep it writes through
-# ret:  ok(true) once rewritten, or the first error
 fun reinterpret_store(st: *State, cur: *Cursor, iid: id.InstructionId,
-                      inst: *instruction.Instruction, gid: u32) R.Result[bool, str] {
+                      inst: *instruction.Instruction, gid: u32) R.Result[R.Void, str] {
     val c: u32 = st.gep_of[gid];
     val sty: ir_type.IrTypeId = slot_ty(st, st.cand_ty[c], st.gep_field[gid]);
     val v: value.Value = inst.operands[0];
-    if (v.ty == sty) { ret R.ok[bool, str](true); }
+    if (v.ty == sty) { ret R.ok_void[str](); }
 
     val slot: value.Value = st.slots[st.cand_slot[c] + st.gep_field[gid]];
     val tainted: bool = inst.secret || v.secret || st.cand_secret[c];
-    val acc: u32 = ir_type.byte_size(?st.m.types, v.ty, st.tgt);
-    val cell: u32 = ir_type.byte_size(?st.m.types, sty, st.tgt);
+    val acc: u32 = ir_type.byte_size_for_machine(?st.m.types, v.ty, resolved.layout_machine(st.tgt));
+    val cell: u32 = ir_type.byte_size_for_machine(?st.m.types, sty, resolved.layout_machine(st.tgt));
 
     var cur_v: value.Value = v;
     if (acc < cell) {
         if (cur_v.ty != int_of_bytes(st, acc)) {
             val r_ci: R.Result[value.Value, str] = emit_bitcast(st, cur, cur_v, int_of_bytes(st, acc), tainted);
-            if (R.is_err[value.Value, str](r_ci)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_ci)); }
+            if (R.is_err[value.Value, str](r_ci)) { ret R.err[R.Void, str](R.unwrap_err[value.Value, str](r_ci)); }
             cur_v = R.unwrap_ok[value.Value, str](r_ci);
         }
         val r_z: R.Result[value.Value, str] = emit_convert(st, cur, instruction.OP_ZEXT, cur_v, sty, tainted);
-        if (R.is_err[value.Value, str](r_z)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_z)); }
+        if (R.is_err[value.Value, str](r_z)) { ret R.err[R.Void, str](R.unwrap_err[value.Value, str](r_z)); }
         cur_v = R.unwrap_ok[value.Value, str](r_z);
 
         val r_old: R.Result[value.Value, str] = emit_load(st, cur, slot, sty, tainted);
-        if (R.is_err[value.Value, str](r_old)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_old)); }
+        if (R.is_err[value.Value, str](r_old)) { ret R.err[R.Void, str](R.unwrap_err[value.Value, str](r_old)); }
         val keep: value.Value = value.const_int(~((1::u64 << (acc * 8)) - 1), sty);
         val r_and: R.Result[value.Value, str] = emit_binary(st, cur, instruction.OP_AND,
                                                             R.unwrap_ok[value.Value, str](r_old), keep, tainted);
-        if (R.is_err[value.Value, str](r_and)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_and)); }
+        if (R.is_err[value.Value, str](r_and)) { ret R.err[R.Void, str](R.unwrap_err[value.Value, str](r_and)); }
         val r_or: R.Result[value.Value, str] = emit_binary(st, cur, instruction.OP_OR,
                                                            R.unwrap_ok[value.Value, str](r_and), cur_v, tainted);
-        if (R.is_err[value.Value, str](r_or)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_or)); }
+        if (R.is_err[value.Value, str](r_or)) { ret R.err[R.Void, str](R.unwrap_err[value.Value, str](r_or)); }
         cur_v = R.unwrap_ok[value.Value, str](r_or);
     }
     or {
         val r_cast: R.Result[value.Value, str] = emit_bitcast(st, cur, cur_v, sty, tainted);
-        if (R.is_err[value.Value, str](r_cast)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_cast)); }
+        if (R.is_err[value.Value, str](r_cast)) { ret R.err[R.Void, str](R.unwrap_err[value.Value, str](r_cast)); }
         cur_v = R.unwrap_ok[value.Value, str](r_cast);
     }
 
-    val r_store: R.Result[bool, str] = emit_store(st, cur, cur_v, slot, tainted);
-    if (R.is_err[bool, str](r_store)) { ret r_store; }
+    val r_store: R.Result[R.Void, str] = emit_store(st, cur, cur_v, slot, tainted);
+    if (R.is_err[R.Void, str](r_store)) { ret r_store; }
     st.erase[iid::u32] = true;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# the candidate a value names, or NONE_U32
-# ---
-# st: state
-# v:  the value to resolve
-# ret: the candidate index, or NONE_U32
 fun candidate_at(st: *State, v: value.Value) u32 {
     if (v.kind != value.VAL_INSTR)         { ret NONE_U32; }
     if (v.data.instr::u32 >= st.pool_len)  { ret NONE_U32; }
     ret st.cand_of[v.data.instr::u32];
 }
 
-# point a field gep at its candidate's slot
-#
-# A two-index gep names the field itself, so its uses are rewritten straight to the
-# slot and the gep is dropped. A deeper gep keeps descending, so it is retargeted in
-# place: the slot becomes its base, the field ordinal is consumed, and the field type
-# becomes the pointee its remaining indices walk.
-# ---
-# st:  state
-# rw:  rewrite map collecting the two-index replacements
-# gid: the gep's instruction id
-# c:   the candidate it addresses
-# ret: ok(true) once retargeted, or an allocation error
-fun retarget_gep(st: *State, rw: *mutate.Rewrite, gid: id.InstructionId, c: u32) R.Result[bool, str] {
+fun retarget_gep(st: *State, rw: *mutate.Rewrite, gid: id.InstructionId, c: u32) R.Result[R.Void, str] {
     val inst: *instruction.Instruction = ?st.fn.instrs[gid::u32];
     val k: u32 = st.gep_field[gid::u32];
     val slot: value.Value = st.slots[st.cand_slot[c] + k];
@@ -2008,12 +1310,12 @@ fun retarget_gep(st: *State, rw: *mutate.Rewrite, gid: id.InstructionId, c: u32)
     if (inst.operand_count == 3) {
         mutate.replace_value(rw, gid, slot);
         st.erase[gid::u32] = true;
-        ret R.ok[bool, str](true);
+        ret R.ok_void[str]();
     }
 
     val n: u32 = inst.operand_count - 1;
     val r: R.Result[ir.OperandArray, str] = ir.operands_alloc(st.m, n);
-    if (R.is_err[ir.OperandArray, str](r))  { ret R.err[bool, str](R.unwrap_err[ir.OperandArray, str](r)); }
+    if (R.is_err[ir.OperandArray, str](r))  { ret R.err[R.Void, str](R.unwrap_err[ir.OperandArray, str](r)); }
     val arr: ir.OperandArray = R.unwrap_ok[ir.OperandArray, str](r);
     arr.ops[0] = slot;
     arr.ops[1] = inst.operands[1];
@@ -2023,47 +1325,28 @@ fun retarget_gep(st: *State, rw: *mutate.Rewrite, gid: id.InstructionId, c: u32)
 
     ir.instr_replace_operands(st.m, inst, arr);
     inst.aux_ty = agg_field_type(st, st.cand_ty[c], k);
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# expand a whole-slot zero fill into one zeroing store per field
-# ---
-# st:     state
-# cur:    the insertion point
-# c:      the candidate being zeroed
-# secret: the memzero's secrecy taint
-# ret:    ok(true) once every field is zeroed, or the first error
-fun expand_memzero(st: *State, cur: *Cursor, c: u32, secret: bool) R.Result[bool, str] {
+fun expand_memzero(st: *State, cur: *Cursor, c: u32, secret: bool) R.Result[R.Void, str] {
     val tainted: bool = secret || st.cand_secret[c];
     var k: u32 = 0;
     for (k < st.cand_nf[c]) {
         val ft: ir_type.IrTypeId = slot_ty(st, st.cand_ty[c], k);
         val slot: value.Value = st.slots[st.cand_slot[c] + k];
         if (ir_type.is_aggregate(?st.m.types, ft)) {
-            val r: R.Result[bool, str] = emit_memzero(st, cur, slot, ft, tainted);
-            if (R.is_err[bool, str](r)) { ret r; }
+            val r: R.Result[R.Void, str] = emit_memzero(st, cur, slot, ft, tainted);
+            if (R.is_err[R.Void, str](r)) { ret r; }
         } or {
-            val r: R.Result[bool, str] = emit_store(st, cur, zero_of(st, ft), slot, tainted);
-            if (R.is_err[bool, str](r)) { ret r; }
+            val r: R.Result[R.Void, str] = emit_store(st, cur, zero_of(st, ft), slot, tainted);
+            if (R.is_err[R.Void, str](r)) { ret r; }
         }
         k = k + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# expand a whole-aggregate copy into `dst`'s slots into one field copy per field
-#
-# The source is read from its own slots when it is itself being split, and through a
-# fresh field gep otherwise -- a copy already dereferences the source at exactly this
-# point, so reading its fields here is as safe as the copy it replaces.
-# ---
-# st:     state
-# cur:    the insertion point
-# dst:    the destination candidate
-# src:    the copied aggregate's address
-# secret: the copy's secrecy taint
-# ret:    ok(true) once every field is copied, or the first error
-fun expand_copy(st: *State, cur: *Cursor, dst: u32, src: value.Value, secret: bool) R.Result[bool, str] {
+fun expand_copy(st: *State, cur: *Cursor, dst: u32, src: value.Value, secret: bool) R.Result[R.Void, str] {
     val tainted: bool = secret || src.secret || st.cand_secret[dst];
     val sc: u32 = candidate_at(st, src);
     var k: u32 = 0;
@@ -2073,43 +1356,26 @@ fun expand_copy(st: *State, cur: *Cursor, dst: u32, src: value.Value, secret: bo
             from = st.slots[st.cand_slot[sc] + k];
         } or {
             val r: R.Result[value.Value, str] = emit_field_gep(st, cur, src, st.cand_ty[dst], k, tainted);
-            if (R.is_err[value.Value, str](r)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r)); }
+            if (R.is_err[value.Value, str](r)) { ret R.err[R.Void, str](R.unwrap_err[value.Value, str](r)); }
             from = R.unwrap_ok[value.Value, str](r);
         }
-        val res: R.Result[bool, str] = copy_field(st, cur, st.slots[st.cand_slot[dst] + k],
+        val res: R.Result[R.Void, str] = copy_field(st, cur, st.slots[st.cand_slot[dst] + k],
                                                   from, slot_ty(st, st.cand_ty[dst], k), tainted);
-        if (R.is_err[bool, str](res)) { ret res; }
+        if (R.is_err[R.Void, str](res)) { ret res; }
         k = k + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# copy one field from `from` into the slot `slot`
-#
-# A scalar field is a load / store pair; an aggregate field is a whole-aggregate
-# store, which the next split round decomposes in turn.
-# ---
-# st:      state
-# cur:     the insertion point
-# slot:    the destination field slot
-# from:    the source field's address
-# ft:      the field type
-# tainted: whether the traffic carries secret data
-# ret:     ok(true) once copied, or the first error
-fun copy_field(st: *State, cur: *Cursor, slot: value.Value, from: value.Value, ft: ir_type.IrTypeId, tainted: bool) R.Result[bool, str] {
+fun copy_field(st: *State, cur: *Cursor, slot: value.Value, from: value.Value, ft: ir_type.IrTypeId, tainted: bool) R.Result[R.Void, str] {
     if (ir_type.is_aggregate(?st.m.types, ft)) {
         ret emit_store(st, cur, value.retype(from, ft), slot, tainted);
     }
     val r_load: R.Result[value.Value, str] = emit_load(st, cur, from, ft, tainted);
-    if (R.is_err[value.Value, str](r_load)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_load)); }
+    if (R.is_err[value.Value, str](r_load)) { ret R.err[R.Void, str](R.unwrap_err[value.Value, str](r_load)); }
     ret emit_store(st, cur, R.unwrap_ok[value.Value, str](r_load), slot, tainted);
 }
 
-# the zero constant of a scalar field type
-# ---
-# st: state
-# ft: the field type
-# ret: the typed zero the field's zeroing store writes
 fun zero_of(st: *State, ft: ir_type.IrTypeId) value.Value {
     if (ir_type.is_float_scalar(?st.m.types, ft)) { ret value.const_float(0.0, ft); }
     val opt: O.Option[*ir_type.IrType] = ir_type.get(?st.m.types, ft);
@@ -2119,41 +1385,22 @@ fun zero_of(st: *State, ft: ir_type.IrTypeId) value.Value {
     ret value.const_int(0, ft);
 }
 
-# the erase predicate `mutate.erase_marked` drives: the split aggregates themselves
-# plus every instruction the rewrite superseded
-# ---
-# ctx: a *State
-# iid: the instruction id to test
-# ret: true when the instruction is to be dropped
-fun erase_test(ctx: ptr, iid: id.InstructionId) bool {
-    val st: *State = ctx::*State;
+fun erase_test(st: *State, iid: id.InstructionId) bool {
     if (iid::u32 >= st.pool_len) { ret false; }
     if (st.erase[iid::u32])      { ret true; }
     val c: u32 = st.cand_of[iid::u32];
     ret c != NONE_U32 && st.cand_out[c] == false;
 }
 
-# select the host-shaped target the tests measure aggregate sizes against
-# (test helper)
-# ---
-# reg: registry to populate in place
-# out: receives the resolved target
-# ret: 0 on success, 1 on failure
 fun ut_target(reg: *target.TargetRegistry, out: *resolved.Target) i32 {
     @reg = target.registry_init();
-    if (R.is_err[bool, str](target.register_all(reg))) { ret 1; }
+    if (R.is_err[R.Void, str](target.register_all(reg, target_testing.debug_descriptor))) { ret 1; }
     val r: R.Result[resolved.Target, str] = target.select(reg, "x86_64", "linux", "sysv64");
     if (R.is_err[resolved.Target, str](r)) { ret 1; }
     @out = R.unwrap_ok[resolved.Target, str](r);
     ret 0;
 }
 
-# count the live instructions of `kind` across every block list of `fn`, the block
-# lists being the liveness source of truth (test helper)
-# ---
-# fn:   the function to scan
-# kind: the opcode to tally
-# ret:  the number of live instructions of that opcode
 fun ut_count(fn: *ir.Function, kind: instruction.InstrKind) u32 {
     var n: u32 = 0;
     var b: u32 = 0;
@@ -2174,11 +1421,6 @@ fun ut_count(fn: *ir.Function, kind: instruction.InstrKind) u32 {
     ret n;
 }
 
-# the operand of `fn`'s first live OP_RET, or a null value when it has none
-# (test helper)
-# ---
-# fn:  the function to scan
-# ret: the returned Value
 fun ut_ret_value(fn: *ir.Function) value.Value {
     var b: u32 = 0;
     for (b < fn.block_count) {
@@ -2192,11 +1434,6 @@ fun ut_ret_value(fn: *ir.Function) value.Value {
     ret value.const_null(ir_type.IRT_NIL);
 }
 
-# intern `{i8, i64}`, the two-field record the split tests build over (test helper)
-# ---
-# m:   the module owning the type table
-# out: receives the record type
-# ret: 0 on success, 1 on failure
 fun ut_rec2(m: *ir.Module, out: *ir_type.IrTypeId) i32 {
     val r8: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 8);
     if (R.is_err[ir_type.IrTypeId, str](r8)) { ret 1; }
@@ -2211,14 +1448,6 @@ fun ut_rec2(m: *ir.Module, out: *ir_type.IrTypeId) i32 {
     ret 0;
 }
 
-# emit `gep base, 0, k` against the aggregate `ty` (test helper)
-# ---
-# b:    the construction cursor
-# m:    the module owning the type table
-# base: the aggregate's address
-# ty:   the aggregate type
-# k:    the field ordinal
-# ret:  the field address, or an error
 fun ut_gep(b: *builder.Builder, m: *ir.Module, base: value.Value, ty: ir_type.IrTypeId, k: u64) R.Result[value.Value, str] {
     val r: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
     if (R.is_err[ir_type.IrTypeId, str](r)) { ret R.err[value.Value, str](R.unwrap_err[ir_type.IrTypeId, str](r)); }
@@ -2229,17 +1458,11 @@ fun ut_gep(b: *builder.Builder, m: *ir.Module, base: value.Value, ty: ir_type.Ir
     ret builder.emit_gep(b, base, ty, ?idx[0], 2);
 }
 
-# a non-escaping record local reaches registers: `{i8, i64}` built by a memzero plus
-# per-field stores and then read back is split into two slots, both promoted, so no
-# alloca and no memzero survive and the returned payload IS the stored parameter --
-# the #2205 acceptance criterion, checked by counts
-#
-# Disabling the pass (an early `ret R.ok[bool, str](false)` in `run`) leaves 1 alloca
-# and 1 memzero, and the return value stays a load, so this test fails.
 test "mach.lang.me.transform.sroa.run:splits_a_local_record_into_registers" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
     var tgt: resolved.Target;
     if (ut_target(?reg, ?tgt) != 0) { ret 1; }
 
@@ -2270,22 +1493,21 @@ test "mach.lang.me.transform.sroa.run:splits_a_local_record_into_registers" {
     val ra: R.Result[value.Value, str] = builder.emit_alloca(?b, rec, value.const_int(1, i64t));
     if (R.is_err[value.Value, str](ra)) { ir.dnit(?m); ret 1; }
     val s: value.Value = R.unwrap_ok[value.Value, str](ra);
-    if (R.is_err[bool, str](builder.emit_memzero(?b, s, rec))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_memzero(?b, s, rec))) { code = 1; }
 
     val g0: R.Result[value.Value, str] = ut_gep(?b, ?m, s, rec, 0);
     if (R.is_err[value.Value, str](g0)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_store(?b, value.const_int(1, i8t), R.unwrap_ok[value.Value, str](g0)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?b, value.const_int(1, i8t), R.unwrap_ok[value.Value, str](g0)))) { code = 1; }
     val g1: R.Result[value.Value, str] = ut_gep(?b, ?m, s, rec, 1);
     if (R.is_err[value.Value, str](g1)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_store(?b, value.param(0, i64t), R.unwrap_ok[value.Value, str](g1)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?b, value.param(0, i64t), R.unwrap_ok[value.Value, str](g1)))) { code = 1; }
 
     val h1: R.Result[value.Value, str] = ut_gep(?b, ?m, s, rec, 1);
     if (R.is_err[value.Value, str](h1)) { ir.dnit(?m); ret 1; }
     val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](h1), i64t);
     if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
 
-    # before: one aggregate slot, one whole-slot zero fill.
     if (ut_count(fn, instruction.OP_ALLOCA)  != 1) { code = 1; }
     if (ut_count(fn, instruction.OP_MEMZERO) != 1) { code = 1; }
 
@@ -2295,7 +1517,6 @@ test "mach.lang.me.transform.sroa.run:splits_a_local_record_into_registers" {
     if (R.is_err[bool, str](mem2reg.run(?m))) { code = 1; }
     if (R.is_err[bool, str](dce.run(?m)))     { code = 1; }
 
-    # after: nothing in memory, and the payload flows straight from the parameter.
     if (ut_count(fn, instruction.OP_ALLOCA)  != 0) { code = 1; }
     if (ut_count(fn, instruction.OP_MEMZERO) != 0) { code = 1; }
     if (ut_count(fn, instruction.OP_LOAD)    != 0) { code = 1; }
@@ -2308,13 +1529,6 @@ test "mach.lang.me.transform.sroa.run:splits_a_local_record_into_registers" {
     ret code;
 }
 
-# the type of field `k` of an aggregate, read straight from the module's type table
-# (test helper)
-# ---
-# m:   the module owning the type table
-# ty:  the aggregate type
-# k:   the field ordinal
-# ret: the field's type, or IRT_NIL
 fun ut_field_type(m: *ir.Module, ty: ir_type.IrTypeId, k: u32) ir_type.IrTypeId {
     val opt: O.Option[*ir_type.IrType] = ir_type.get(?m.types, ty);
     if (O.is_none[*ir_type.IrType](opt)) { ret ir_type.IRT_NIL; }
@@ -2324,18 +1538,6 @@ fun ut_field_type(m: *ir.Module, ty: ir_type.IrTypeId, k: u32) ir_type.IrTypeId 
     ret t.data.struct_.fields[k];
 }
 
-# open a fresh function whose body is `s = alloca rec; memzero s; store p0 -> s.1`,
-# leaving the construction cursor in its entry block so the caller can append the use
-# under test and a terminator (test helper)
-#
-# The stored parameter is typed as the field, so an aggregate field takes a proper
-# whole-field copy rather than a mis-typed scalar store.
-# ---
-# m:    the module to add the function to
-# b:    the construction cursor, positioned on the new function's entry block
-# rec:  the record type of the local
-# slot: receives the local's slot pointer
-# ret:  the new function's index, or NONE_U32 on failure
 fun ut_build_local(m: *ir.Module, b: *builder.Builder, rec: ir_type.IrTypeId, slot: *value.Value) u32 {
     val r64: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
     if (R.is_err[ir_type.IrTypeId, str](r64)) { ret NONE_U32; }
@@ -2355,23 +1557,19 @@ fun ut_build_local(m: *ir.Module, b: *builder.Builder, rec: ir_type.IrTypeId, sl
     val ra: R.Result[value.Value, str] = builder.emit_alloca(b, rec, value.const_int(1, i64t));
     if (R.is_err[value.Value, str](ra)) { ret NONE_U32; }
     @slot = R.unwrap_ok[value.Value, str](ra);
-    if (R.is_err[bool, str](builder.emit_memzero(b, @slot, rec))) { ret NONE_U32; }
+    if (R.is_err[R.Void, str](builder.emit_memzero(b, @slot, rec))) { ret NONE_U32; }
 
     val g1: R.Result[value.Value, str] = ut_gep(b, m, @slot, rec, 1);
     if (R.is_err[value.Value, str](g1)) { ret NONE_U32; }
-    if (R.is_err[bool, str](builder.emit_store(b, value.param(0, ft), R.unwrap_ok[value.Value, str](g1)))) { ret NONE_U32; }
+    if (R.is_err[R.Void, str](builder.emit_store(b, value.param(0, ft), R.unwrap_ok[value.Value, str](g1)))) { ret NONE_U32; }
     ret ix;
 }
 
-# every form that can defeat the analysis really does, and each leaves its record
-# whole: a `::` / `:~` reinterpret of the slot (an OP_BITCAST), a gep whose field
-# index is not a constant, the slot crossing the ABI boundary as a by-value return,
-# and a field address itself escaping into a call. All four in one module, so the
-# pass must decline every one of them rather than the module as a whole
 test "mach.lang.me.transform.sroa.run:declines_each_defeating_form" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
     var tgt: resolved.Target;
     if (ut_target(?reg, ?tgt) != 0) { ret 1; }
 
@@ -2399,27 +1597,23 @@ test "mach.lang.me.transform.sroa.run:declines_each_defeating_form" {
     var b: builder.Builder = builder.init(?m);
     var slot: value.Value;
 
-    # a `:~` reinterpret of the record's storage
     val f_cast: u32 = ut_build_local(?m, ?b, rec, ?slot);
     if (f_cast == NONE_U32) { ir.dnit(?m); ret 1; }
     if (R.is_err[value.Value, str](builder.emit_bitcast(?b, slot, ptrt))) { code = 1; }
-    if (R.is_err[bool, str](builder.emit_ret_void(?b)))                   { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret_void(?b)))                   { code = 1; }
 
-    # a gep whose field ordinal is a run-time value
     val f_var: u32 = ut_build_local(?m, ?b, rec, ?slot);
     if (f_var == NONE_U32) { ir.dnit(?m); ret 1; }
     var idx: [2]value.Value;
     idx[0] = value.const_int(0, i64t);
     idx[1] = value.param(0, i64t);
     if (R.is_err[value.Value, str](builder.emit_gep(?b, slot, rec, ?idx[0], 2))) { code = 1; }
-    if (R.is_err[bool, str](builder.emit_ret_void(?b)))                          { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret_void(?b)))                          { code = 1; }
 
-    # the record crossing the ABI boundary as a by-value return
     val f_ret: u32 = ut_build_local(?m, ?b, rec, ?slot);
     if (f_ret == NONE_U32) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_ret(?b, value.retype(slot, rec)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?b, value.retype(slot, rec)))) { code = 1; }
 
-    # a field address escaping into a call
     val f_field: u32 = ut_build_local(?m, ?b, rec, ?slot);
     if (f_field == NONE_U32) { ir.dnit(?m); ret 1; }
     val g0: R.Result[value.Value, str] = ut_gep(?b, ?m, slot, rec, 0);
@@ -2427,7 +1621,7 @@ test "mach.lang.me.transform.sroa.run:declines_each_defeating_form" {
     var args: [1]value.Value;
     args[0] = R.unwrap_ok[value.Value, str](g0);
     if (R.is_err[value.Value, str](builder.emit_call(?b, callee, ?args[0], 1, voidt))) { code = 1; }
-    if (R.is_err[bool, str](builder.emit_ret_void(?b)))                                { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret_void(?b)))                                { code = 1; }
 
     val rs: R.Result[bool, str] = run(?m, ?tgt);
     if (R.is_err[bool, str](rs))         { code = 1; }
@@ -2442,23 +1636,11 @@ test "mach.lang.me.transform.sroa.run:declines_each_defeating_form" {
     ret code;
 }
 
-# a field address that is strided over, not just dereferenced, keeps its record whole
-#
-# `?a[0]` handed to a callee that indexes it (`p[i]`) inlines to a gep chained onto
-# the field gep whose first index is a run-time value. Before the split that reaches
-# the next element; after it, unrelated storage -- so the field address has escaped.
-# This is the self-host miscompile the shape caused: the SysV classifier's
-# `mark_eightbyte_range(?classes[0], ...)` writes `classes[1]` through exactly it, and
-# splitting the pair left the second eightbyte's class unwritten, so a `{i8, f64}`
-# return was marshalled in RAX:RDX instead of RAX:XMM0.
-#
-# The counterpart in the same module is a chained gep that DOES stay inside the field
-# (`s.inner.x`, a constant zero first index over the field's own type), which must
-# still split -- so the rule is a containment test, not a ban on chaining.
 test "mach.lang.me.transform.sroa.run:declines_a_strided_field_address" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
     var tgt: resolved.Target;
     if (ut_target(?reg, ?tgt) != 0) { ret 1; }
 
@@ -2489,7 +1671,6 @@ test "mach.lang.me.transform.sroa.run:declines_a_strided_field_address" {
     var b: builder.Builder = builder.init(?m);
     var slot: value.Value;
 
-    # `?a[0]` then `p[i]`: the chained gep strides over the field
     val f_stride: u32 = ut_build_local(?m, ?b, pair, ?slot);
     if (f_stride == NONE_U32) { ir.dnit(?m); ret 1; }
     val g0: R.Result[value.Value, str] = ut_gep(?b, ?m, slot, pair, 0);
@@ -2498,24 +1679,22 @@ test "mach.lang.me.transform.sroa.run:declines_a_strided_field_address" {
     stride[0] = value.param(0, i64t);
     val rs1: R.Result[value.Value, str] = builder.emit_gep(?b, R.unwrap_ok[value.Value, str](g0), i8t, ?stride[0], 1);
     if (R.is_err[value.Value, str](rs1)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_store(?b, value.const_int(7, i8t), R.unwrap_ok[value.Value, str](rs1)))) { code = 1; }
-    if (R.is_err[bool, str](builder.emit_ret_void(?b))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?b, value.const_int(7, i8t), R.unwrap_ok[value.Value, str](rs1)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret_void(?b))) { code = 1; }
 
-    # `s.inner.x`: the chained gep starts at the field and walks the field's own type
     val f_nested: u32 = ut_build_local(?m, ?b, nested, ?slot);
     if (f_nested == NONE_U32) { ir.dnit(?m); ret 1; }
     val g1: R.Result[value.Value, str] = ut_gep(?b, ?m, slot, nested, 1);
     if (R.is_err[value.Value, str](g1)) { ir.dnit(?m); ret 1; }
     val g1x: R.Result[value.Value, str] = ut_gep(?b, ?m, R.unwrap_ok[value.Value, str](g1), inner, 1);
     if (R.is_err[value.Value, str](g1x)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_store(?b, value.const_int(9, i64t), R.unwrap_ok[value.Value, str](g1x)))) { code = 1; }
-    if (R.is_err[bool, str](builder.emit_ret_void(?b))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?b, value.const_int(9, i64t), R.unwrap_ok[value.Value, str](g1x)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret_void(?b))) { code = 1; }
 
     val rr: R.Result[bool, str] = run(?m, ?tgt);
     if (R.is_err[bool, str](rr))          { code = 1; }
     or { if (!R.unwrap_ok[bool, str](rr)) { code = 1; } }
 
-    # the strided pair stays whole; the nested record splits to scalars.
     if (ut_count(?m.functions[f_stride], instruction.OP_ALLOCA) != 1) { code = 1; }
     if (ut_count(?m.functions[f_nested], instruction.OP_ALLOCA) != 3) { code = 1; }
 
@@ -2523,14 +1702,11 @@ test "mach.lang.me.transform.sroa.run:declines_a_strided_field_address" {
     ret code;
 }
 
-# a `^T` field survives the split: a secret value stored into a record field and read
-# back is still secret once the field lives in its own slot. The slot itself carries
-# the taint, and the value reaching the return does too -- the split cannot launder a
-# secret public (#1646)
 test "mach.lang.me.transform.sroa.run:preserves_a_secret_field" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
     var tgt: resolved.Target;
     if (ut_target(?reg, ?tgt) != 0) { ret 1; }
 
@@ -2558,14 +1734,13 @@ test "mach.lang.me.transform.sroa.run:preserves_a_secret_field" {
     val ra: R.Result[value.Value, str] = builder.emit_alloca(?b, rec, value.const_int(1, i64t));
     if (R.is_err[value.Value, str](ra)) { ir.dnit(?m); ret 1; }
     val s: value.Value = R.unwrap_ok[value.Value, str](ra);
-    if (R.is_err[bool, str](builder.emit_memzero(?b, s, rec))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_memzero(?b, s, rec))) { code = 1; }
 
-    # a `^u32`-shaped payload: the stored value carries the taint, so the store does too
     var secret_v: value.Value = value.param(0, i64t);
     secret_v.secret = true;
     val g1: R.Result[value.Value, str] = ut_gep(?b, ?m, s, rec, 1);
     if (R.is_err[value.Value, str](g1)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_store(?b, secret_v, R.unwrap_ok[value.Value, str](g1)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?b, secret_v, R.unwrap_ok[value.Value, str](g1)))) { code = 1; }
 
     val h1: R.Result[value.Value, str] = ut_gep(?b, ?m, s, rec, 1);
     if (R.is_err[value.Value, str](h1)) { ir.dnit(?m); ret 1; }
@@ -2574,13 +1749,12 @@ test "mach.lang.me.transform.sroa.run:preserves_a_secret_field" {
     var loaded: value.Value = R.unwrap_ok[value.Value, str](rl);
     fn.instrs[loaded.data.instr::u32].secret = true;
     loaded.secret = true;
-    if (R.is_err[bool, str](builder.emit_ret(?b, loaded))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?b, loaded))) { code = 1; }
 
     val rs: R.Result[bool, str] = run(?m, ?tgt);
     if (R.is_err[bool, str](rs))          { code = 1; }
     or { if (!R.unwrap_ok[bool, str](rs)) { code = 1; } }
 
-    # the field's own slot carries the taint...
     var tainted_slots: u32 = 0;
     var i: u32 = 0;
     for (i < fn.instr_len) {
@@ -2589,7 +1763,6 @@ test "mach.lang.me.transform.sroa.run:preserves_a_secret_field" {
     }
     if (tainted_slots == 0) { code = 1; }
 
-    # ...and the value reaching the return is still secret after promotion.
     if (R.is_err[bool, str](mem2reg.run(?m))) { code = 1; }
     if (R.is_err[bool, str](dce.run(?m)))     { code = 1; }
     if (ut_count(fn, instruction.OP_ALLOCA) != 0) { code = 1; }
@@ -2599,15 +1772,11 @@ test "mach.lang.me.transform.sroa.run:preserves_a_secret_field" {
     ret code;
 }
 
-# the `Result` / `Option` idiom: two records built in opposite arms, merged by an
-# aggregate phi, then read. The partition shares one slot set, so the address merge
-# becomes a scalar phi over the fields and nothing is left in memory
-#
-# Disabling the pass leaves both slots, both zero fills, and the aggregate phi.
 test "mach.lang.me.transform.sroa.run:splits_an_aggregate_phi_partition" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
     var tgt: resolved.Target;
     if (ut_target(?reg, ?tgt) != 0) { ret 1; }
 
@@ -2642,44 +1811,40 @@ test "mach.lang.me.transform.sroa.run:splits_an_aggregate_phi_partition" {
     var code: i32 = 0;
     var arm: [2]value.Value;
 
-    # entry: branch on the parameter into the two arms
     builder.set_block(?b, blocks[0]);
     val rcmp: R.Result[value.Value, str] = builder.emit_cmp_eq(?b, value.param(0, i64t), value.const_int(0, i64t));
     if (R.is_err[value.Value, str](rcmp)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_cbr(?b, R.unwrap_ok[value.Value, str](rcmp), blocks[1], blocks[2]))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_cbr(?b, R.unwrap_ok[value.Value, str](rcmp), blocks[1], blocks[2]))) { code = 1; }
 
-    # each arm builds its own record and branches to the merge
     var a: u32 = 0;
     for (a < 2) {
         builder.set_block(?b, blocks[1 + a]);
         val ra: R.Result[value.Value, str] = builder.emit_alloca(?b, rec, value.const_int(1, i64t));
         if (R.is_err[value.Value, str](ra)) { ir.dnit(?m); ret 1; }
         arm[a] = R.unwrap_ok[value.Value, str](ra);
-        if (R.is_err[bool, str](builder.emit_memzero(?b, arm[a], rec))) { code = 1; }
+        if (R.is_err[R.Void, str](builder.emit_memzero(?b, arm[a], rec))) { code = 1; }
         val g0: R.Result[value.Value, str] = ut_gep(?b, ?m, arm[a], rec, 0);
         if (R.is_err[value.Value, str](g0)) { ir.dnit(?m); ret 1; }
-        if (R.is_err[bool, str](builder.emit_store(?b, value.const_int(a::u64, i8t), R.unwrap_ok[value.Value, str](g0)))) { code = 1; }
+        if (R.is_err[R.Void, str](builder.emit_store(?b, value.const_int(a::u64, i8t), R.unwrap_ok[value.Value, str](g0)))) { code = 1; }
         val g1: R.Result[value.Value, str] = ut_gep(?b, ?m, arm[a], rec, 1);
         if (R.is_err[value.Value, str](g1)) { ir.dnit(?m); ret 1; }
-        if (R.is_err[bool, str](builder.emit_store(?b, value.const_int(10 + a::u64, i64t), R.unwrap_ok[value.Value, str](g1)))) { code = 1; }
-        if (R.is_err[bool, str](builder.emit_br(?b, blocks[3]))) { code = 1; }
+        if (R.is_err[R.Void, str](builder.emit_store(?b, value.const_int(10 + a::u64, i64t), R.unwrap_ok[value.Value, str](g1)))) { code = 1; }
+        if (R.is_err[R.Void, str](builder.emit_br(?b, blocks[3]))) { code = 1; }
         a = a + 1;
     }
 
-    # merge: phi the two records' addresses, then read the payload back
     builder.set_block(?b, blocks[3]);
     val rphi: R.Result[value.Value, str] = builder.emit_phi(?b, rec);
     if (R.is_err[value.Value, str](rphi)) { ir.dnit(?m); ret 1; }
     val phi: value.Value = R.unwrap_ok[value.Value, str](rphi);
-    if (R.is_err[bool, str](builder.phi_add_incoming(?b, phi, blocks[1], value.retype(arm[0], rec)))) { code = 1; }
-    if (R.is_err[bool, str](builder.phi_add_incoming(?b, phi, blocks[2], value.retype(arm[1], rec)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?b, phi, blocks[1], value.retype(arm[0], rec)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?b, phi, blocks[2], value.retype(arm[1], rec)))) { code = 1; }
     val hp: R.Result[value.Value, str] = ut_gep(?b, ?m, phi, rec, 1);
     if (R.is_err[value.Value, str](hp)) { ir.dnit(?m); ret 1; }
     val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](hp), i64t);
     if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
 
-    # before: two slots, two zero fills, one aggregate phi.
     if (ut_count(fn, instruction.OP_ALLOCA)  != 2) { code = 1; }
     if (ut_count(fn, instruction.OP_MEMZERO) != 2) { code = 1; }
     if (ut_count(fn, instruction.OP_PHI)     != 1) { code = 1; }
@@ -2690,7 +1855,6 @@ test "mach.lang.me.transform.sroa.run:splits_an_aggregate_phi_partition" {
     if (R.is_err[bool, str](mem2reg.run(?m))) { code = 1; }
     if (R.is_err[bool, str](dce.run(?m)))     { code = 1; }
 
-    # after: nothing in memory, and the payload is a scalar phi of the two constants.
     if (ut_count(fn, instruction.OP_ALLOCA)  != 0) { code = 1; }
     if (ut_count(fn, instruction.OP_MEMZERO) != 0) { code = 1; }
     if (ut_count(fn, instruction.OP_LOAD)    != 0) { code = 1; }
@@ -2707,14 +1871,6 @@ test "mach.lang.me.transform.sroa.run:splits_an_aggregate_phi_partition" {
     ret code;
 }
 
-# intern `{i8, uni{...}}`, the tagged-payload record shape `Result[T, E]` lowers to
-# (test helper)
-# ---
-# m:   the module owning the type table
-# a:   the union's first member type
-# b:   the union's second member type
-# out: receives the record type
-# ret: 0 on success, 1 on failure
 fun ut_tagged(m: *ir.Module, a: ir_type.IrTypeId, b: ir_type.IrTypeId, out: *ir_type.IrTypeId) i32 {
     var members: [2]ir_type.IrTypeId;
     members[0] = a;
@@ -2733,29 +1889,12 @@ fun ut_tagged(m: *ir.Module, a: ir_type.IrTypeId, b: ir_type.IrTypeId, out: *ir_
     ret 0;
 }
 
-# emit `gep (gep base, 0, 1), 0, k`: the address of member `k` of the union payload of
-# a `ut_tagged` record (test helper)
-# ---
-# b:    the construction cursor
-# m:    the module owning the type table
-# base: the record's address
-# ty:   the record type
-# k:    the union member ordinal
-# ret:  the member's address, or an error
 fun ut_member_gep(b: *builder.Builder, m: *ir.Module, base: value.Value, ty: ir_type.IrTypeId, k: u64) R.Result[value.Value, str] {
     val gf: R.Result[value.Value, str] = ut_gep(b, m, base, ty, 1);
     if (R.is_err[value.Value, str](gf)) { ret gf; }
     ret ut_gep(b, m, R.unwrap_ok[value.Value, str](gf), ut_field_type(m, ty, 1), k);
 }
 
-# open a fresh function whose entry block holds `s = alloca ty; memzero s`, leaving the
-# cursor there for the caller to append the body under test (test helper)
-# ---
-# m:    the module to add the function to
-# b:    the construction cursor, positioned on the new function's entry block
-# ty:   the record type of the local
-# slot: receives the local's slot pointer
-# ret:  the new function's index, or NONE_U32 on failure
 fun ut_open_local(m: *ir.Module, b: *builder.Builder, ty: ir_type.IrTypeId, slot: *value.Value) u32 {
     val r64: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
     if (R.is_err[ir_type.IrTypeId, str](r64)) { ret NONE_U32; }
@@ -2772,33 +1911,21 @@ fun ut_open_local(m: *ir.Module, b: *builder.Builder, ty: ir_type.IrTypeId, slot
     val ra: R.Result[value.Value, str] = builder.emit_alloca(b, ty, value.const_int(1, R.unwrap_ok[ir_type.IrTypeId, str](r64)));
     if (R.is_err[value.Value, str](ra)) { ret NONE_U32; }
     @slot = R.unwrap_ok[value.Value, str](ra);
-    if (R.is_err[bool, str](builder.emit_memzero(b, @slot, ty))) { ret NONE_U32; }
+    if (R.is_err[R.Void, str](builder.emit_memzero(b, @slot, ty))) { ret NONE_U32; }
     ret ix;
 }
 
-# the instruction a value names, or nil when it names something else (test helper)
-# ---
-# fn: the function owning the pool
-# v:  the value to resolve
-# ret: the defining instruction, or nil
 fun ut_def(fn: *ir.Function, v: value.Value) *instruction.Instruction {
     if (v.kind != value.VAL_INSTR)     { ret nil; }
     if (v.data.instr >= fn.instr_len)  { ret nil; }
     ret ?fn.instrs[v.data.instr::u32];
 }
 
-# a `Result`-shaped record -- a tag beside an anonymous union payload -- reaches
-# registers: the union is one cell rather than per-member slots, so the record splits
-# into a tag slot and a cell slot and mem2reg promotes both. Nothing stays in memory and
-# the payload read back IS the stored parameter
-#
-# Refusing the union field in `splittable_at` leaves 1 alloca and 1 memzero, and so does
-# dropping `mark_union_member_geps` (the member gep then reads as a descent into the
-# field, which no whole-cell slot can stand in for): either way this test fails
 test "mach.lang.me.transform.sroa.run:splits_a_tagged_union_payload_into_registers" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
     var tgt: resolved.Target;
     if (ut_target(?reg, ?tgt) != 0) { ret 1; }
 
@@ -2828,17 +1955,17 @@ test "mach.lang.me.transform.sroa.run:splits_a_tagged_union_payload_into_registe
 
     val gt: R.Result[value.Value, str] = ut_gep(?b, ?m, slot, rec, 0);
     if (R.is_err[value.Value, str](gt)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_store(?b, value.const_int(1, i8t), R.unwrap_ok[value.Value, str](gt)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?b, value.const_int(1, i8t), R.unwrap_ok[value.Value, str](gt)))) { code = 1; }
 
     val gp: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot, rec, 0);
     if (R.is_err[value.Value, str](gp)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_store(?b, value.param(0, i64t), R.unwrap_ok[value.Value, str](gp)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?b, value.param(0, i64t), R.unwrap_ok[value.Value, str](gp)))) { code = 1; }
 
     val hp: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot, rec, 0);
     if (R.is_err[value.Value, str](hp)) { ir.dnit(?m); ret 1; }
     val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](hp), i64t);
     if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
 
     if (ut_count(fn, instruction.OP_ALLOCA) != 1) { code = 1; }
 
@@ -2860,18 +1987,11 @@ test "mach.lang.me.transform.sroa.run:splits_a_tagged_union_payload_into_registe
     ret code;
 }
 
-# a member read at a type other than the cell's storage comes back through a bit
-# reinterpret, so the value is the stored bits rather than a converted number: the cell
-# of `uni{i64, ptr}` is its i64 member, so the pointer written into it is bit-cast in
-# and the i64 read out is the cast itself
-#
-# Dropping the reinterpret in `reinterpret_store` returns the pointer parameter under an
-# i64 use, which is the ill-typed operand the verifier's VC_TYPE_AGREE catches; this
-# test names the cast directly, so it fails either way
 test "mach.lang.me.transform.sroa.run:reinterprets_a_member_of_another_type" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
     var tgt: resolved.Target;
     if (ut_target(?reg, ?tgt) != 0) { ret 1; }
 
@@ -2898,13 +2018,13 @@ test "mach.lang.me.transform.sroa.run:reinterprets_a_member_of_another_type" {
 
     val gp: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot, rec, 1);
     if (R.is_err[value.Value, str](gp)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_store(?b, value.param(0, ptrt), R.unwrap_ok[value.Value, str](gp)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?b, value.param(0, ptrt), R.unwrap_ok[value.Value, str](gp)))) { code = 1; }
 
     val hp: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot, rec, 0);
     if (R.is_err[value.Value, str](hp)) { ir.dnit(?m); ret 1; }
     val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](hp), i64t);
     if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
 
     val rs: R.Result[bool, str] = run(?m, ?tgt);
     if (R.is_err[bool, str](rs))              { code = 1; }
@@ -2928,18 +2048,11 @@ test "mach.lang.me.transform.sroa.run:reinterprets_a_member_of_another_type" {
     ret code;
 }
 
-# writing a member narrower than the cell leaves the bytes it does not cover exactly as
-# they were: an `i8` member of an eight-byte cell is widened and merged into the cell
-# under a mask, so a subsequent whole-cell read sees the earlier value in its upper
-# seven bytes and the narrow member in its lowest
-#
-# Storing the widened value straight into the cell -- the obvious simplification --
-# clears those seven bytes, and the returned value is then the zext rather than the or;
-# this test names the mask and the merge, so either shortcut fails it
 test "mach.lang.me.transform.sroa.run:a_narrow_member_preserves_its_cell" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
     var tgt: resolved.Target;
     if (ut_target(?reg, ?tgt) != 0) { ret 1; }
 
@@ -2966,17 +2079,17 @@ test "mach.lang.me.transform.sroa.run:a_narrow_member_preserves_its_cell" {
 
     val gw: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot, rec, 0);
     if (R.is_err[value.Value, str](gw)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_store(?b, value.param(0, i64t), R.unwrap_ok[value.Value, str](gw)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?b, value.param(0, i64t), R.unwrap_ok[value.Value, str](gw)))) { code = 1; }
 
     val gn: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot, rec, 1);
     if (R.is_err[value.Value, str](gn)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_store(?b, value.param(1, i8t), R.unwrap_ok[value.Value, str](gn)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?b, value.param(1, i8t), R.unwrap_ok[value.Value, str](gn)))) { code = 1; }
 
     val hw: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot, rec, 0);
     if (R.is_err[value.Value, str](hw)) { ir.dnit(?m); ret 1; }
     val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](hw), i64t);
     if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
 
     val rs: R.Result[bool, str] = run(?m, ?tgt);
     if (R.is_err[bool, str](rs))              { code = 1; }
@@ -2985,7 +2098,6 @@ test "mach.lang.me.transform.sroa.run:a_narrow_member_preserves_its_cell" {
 
     if (ut_count(fn, instruction.OP_ALLOCA) != 0) { code = 1; }
 
-    # ret = or(and(p0, 0xFFFFFFFFFFFFFF00), zext(p1))
     val merge: *instruction.Instruction = ut_def(fn, ut_ret_value(fn));
     if (merge == nil) { code = 1; ir.dnit(?m); ret code; }
     if (merge.kind != instruction.OP_OR || merge.operand_count != 2) { code = 1; ir.dnit(?m); ret code; }
@@ -3016,16 +2128,11 @@ test "mach.lang.me.transform.sroa.run:a_narrow_member_preserves_its_cell" {
     ret code;
 }
 
-# an access narrower than a cell whose storage is not an integer keeps the record whole:
-# `uni{ptr, ptr}` holds its cell in a pointer, and there is no masking form that could
-# merge a byte into one
-#
-# Admitting it (dropping the storage-is-the-cell-integer condition in
-# `union_access_ok`) splits the record and the alloca disappears, failing this test
 test "mach.lang.me.transform.sroa.run:declines_a_narrow_access_to_a_pointer_cell" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
     var tgt: resolved.Target;
     if (ut_target(?reg, ?tgt) != 0) { ret 1; }
 
@@ -3054,7 +2161,7 @@ test "mach.lang.me.transform.sroa.run:declines_a_narrow_access_to_a_pointer_cell
     if (R.is_err[value.Value, str](gp)) { ir.dnit(?m); ret 1; }
     val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](gp), i8t);
     if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
 
     val rs: R.Result[bool, str] = run(?m, ?tgt);
     if (R.is_err[bool, str](rs))         { code = 1; }
@@ -3065,18 +2172,6 @@ test "mach.lang.me.transform.sroa.run:declines_a_narrow_access_to_a_pointer_cell
     ret code;
 }
 
-# build `{i8, uni{a, b}}`, open a local of it, and append one load through a member gep
-# plus a return of it (test helper)
-#
-# The decline cases differ only in the union's members, the member ordinal and the access
-# type, so they share this body and check the same thing: the record stayed whole.
-# ---
-# m:      the module to build in
-# a:      the union's first member type
-# b:      the union's second member type
-# member: the member ordinal the gep names
-# at:     the type the load reads the member at
-# ret:    the function's index, or NONE_U32 on failure
 fun ut_tagged_probe(m: *ir.Module, a: ir_type.IrTypeId, b: ir_type.IrTypeId, member: u64, at: ir_type.IrTypeId) u32 {
     var rec: ir_type.IrTypeId;
     if (ut_tagged(m, a, b, ?rec) != 0) { ret NONE_U32; }
@@ -3090,22 +2185,15 @@ fun ut_tagged_probe(m: *ir.Module, a: ir_type.IrTypeId, b: ir_type.IrTypeId, mem
     if (R.is_err[value.Value, str](g)) { ret NONE_U32; }
     val rl: R.Result[value.Value, str] = builder.emit_load(?bl, R.unwrap_ok[value.Value, str](g), at);
     if (R.is_err[value.Value, str](rl)) { ret NONE_U32; }
-    if (R.is_err[bool, str](builder.emit_ret(?bl, R.unwrap_ok[value.Value, str](rl)))) { ret NONE_U32; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?bl, R.unwrap_ok[value.Value, str](rl)))) { ret NONE_U32; }
     ret ix;
 }
 
-# four shapes no union cell can hold, each of which must leave its record in memory: an
-# access wider than the cell, an access that is itself an aggregate (which in this IR is
-# an address rather than a value, so there is nothing to reinterpret), a member ordinal
-# past the union's end, and a member that is itself an aggregate
-#
-# Each is a distinct condition, and dropping any one of them splits the record whose case
-# it covers -- the record's alloca is then replaced by its slots, so the count under test
-# moves off 1 and this fails
 test "mach.lang.me.transform.sroa.run:declines_four_shapes_no_cell_can_hold" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
     var tgt: resolved.Target;
     if (ut_target(?reg, ?tgt) != 0) { ret 1; }
 
@@ -3130,16 +2218,12 @@ test "mach.lang.me.transform.sroa.run:declines_four_shapes_no_cell_can_hold" {
     if (R.is_err[ir_type.IrTypeId, str](rpair)) { ir.dnit(?m); ret 1; }
     val pair: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rpair);
 
-    # an eight-byte read of a one-byte cell
     val f_wide: u32 = ut_tagged_probe(?m, i8t, i8t, 0, i64t);
     if (f_wide == NONE_U32) { ir.dnit(?m); ret 1; }
-    # a read of the cell at an aggregate type, which names an address here, not a value
     val f_read: u32 = ut_tagged_probe(?m, i64t, i64t, 0, pair);
     if (f_read == NONE_U32) { ir.dnit(?m); ret 1; }
-    # a member ordinal past a two-member union
     val f_ord: u32 = ut_tagged_probe(?m, i64t, i64t, 2, i64t);
     if (f_ord == NONE_U32) { ir.dnit(?m); ret 1; }
-    # a member that is itself a record, which no scalar slot can hold
     val f_agg: u32 = ut_tagged_probe(?m, pair, i64t, 1, i64t);
     if (f_agg == NONE_U32) { ir.dnit(?m); ret 1; }
 
@@ -3157,21 +2241,11 @@ test "mach.lang.me.transform.sroa.run:declines_four_shapes_no_cell_can_hold" {
     ret code;
 }
 
-# reading a narrow member back is the truncation matching the widening its store used, so
-# the value that comes out is the member's own bits rather than the whole cell's
-#
-# Built over `{i8, uni{i8, ptr}}`, the exact shape `Result[bool, str]` lowers to and the
-# one the compiler is written on. Its narrow member comes FIRST, so a storage type picked
-# member-by-member without noticing the narrowing would land on the `i8` and give an
-# eight-byte cell a one-byte slot -- with no truncation left to name, since the member
-# would then already be the storage type
-#
-# Reinterpreting instead of truncating would be a bit cast between two different widths;
-# this test names the truncation, so dropping either it or the narrowing check fails here
 test "mach.lang.me.transform.sroa.run:reads_a_narrow_member_by_truncation" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
     var tgt: resolved.Target;
     if (ut_target(?reg, ?tgt) != 0) { ret 1; }
 
@@ -3198,13 +2272,13 @@ test "mach.lang.me.transform.sroa.run:reads_a_narrow_member_by_truncation" {
 
     val gn: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot, rec, 0);
     if (R.is_err[value.Value, str](gn)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_store(?b, value.param(0, i8t), R.unwrap_ok[value.Value, str](gn)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?b, value.param(0, i8t), R.unwrap_ok[value.Value, str](gn)))) { code = 1; }
 
     val hn: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot, rec, 0);
     if (R.is_err[value.Value, str](hn)) { ir.dnit(?m); ret 1; }
     val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](hn), i8t);
     if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
 
     val rs: R.Result[bool, str] = run(?m, ?tgt);
     if (R.is_err[bool, str](rs))              { code = 1; }
@@ -3223,19 +2297,11 @@ test "mach.lang.me.transform.sroa.run:reads_a_narrow_member_by_truncation" {
     ret code;
 }
 
-# a gep that reaches a union field and keeps walking keeps the record whole: within the
-# field gep itself, chained onto a member gep, or walking some other aggregate from the
-# field's address. Only a gep naming a member of the union itself resolves to the cell,
-# and the third case is the one that says why -- an ordinal of another type lands
-# somewhere the cell's slot is not
-#
-# Accepting any of the three retargets the gep onto the cell's slot: the first two lose
-# only promotion, the third lands at the wrong address. All three split the record and
-# replace its alloca with two slots, so the count moves off 1 and this fails
 test "mach.lang.me.transform.sroa.run:declines_a_gep_walking_past_a_union_field" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
     var tgt: resolved.Target;
     if (ut_target(?reg, ?tgt) != 0) { ret 1; }
 
@@ -3256,7 +2322,6 @@ test "mach.lang.me.transform.sroa.run:declines_a_gep_walking_past_a_union_field"
     var code: i32 = 0;
     var b: builder.Builder = builder.init(?m);
 
-    # `gep s, 0, 1, 0`: the walk continues into the union within one gep
     var slot: value.Value;
     val ix_one: u32 = ut_open_local(?m, ?b, rec, ?slot);
     if (ix_one == NONE_U32) { ir.dnit(?m); ret 1; }
@@ -3270,9 +2335,8 @@ test "mach.lang.me.transform.sroa.run:declines_a_gep_walking_past_a_union_field"
     if (R.is_err[value.Value, str](gd)) { ir.dnit(?m); ret 1; }
     val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](gd), i64t);
     if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
 
-    # and one chained onto a member gep, which tagging refuses to reach past
     var slot2: value.Value;
     val ix_two: u32 = ut_open_local(?m, ?b, rec, ?slot2);
     if (ix_two == NONE_U32) { ir.dnit(?m); ret 1; }
@@ -3284,10 +2348,8 @@ test "mach.lang.me.transform.sroa.run:declines_a_gep_walking_past_a_union_field"
     if (R.is_err[value.Value, str](gp)) { ir.dnit(?m); ret 1; }
     val rl2: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](gp), i64t);
     if (R.is_err[value.Value, str](rl2)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl2)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl2)))) { code = 1; }
 
-    # and one that walks a DIFFERENT aggregate from the union field's address: its second
-    # index is an ordinal of that type, so it lands somewhere the cell's slot is not
     var struct_fields: [2]ir_type.IrTypeId;
     struct_fields[0] = i64t;
     struct_fields[1] = i64t;
@@ -3306,7 +2368,7 @@ test "mach.lang.me.transform.sroa.run:declines_a_gep_walking_past_a_union_field"
     if (R.is_err[value.Value, str](go)) { ir.dnit(?m); ret 1; }
     val rl3: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](go), i64t);
     if (R.is_err[value.Value, str](rl3)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl3)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl3)))) { code = 1; }
 
     val rs: R.Result[bool, str] = run(?m, ?tgt);
     if (R.is_err[bool, str](rs))         { code = 1; }
@@ -3319,13 +2381,11 @@ test "mach.lang.me.transform.sroa.run:declines_a_gep_walking_past_a_union_field"
     ret code;
 }
 
-# a bare union local is never split -- with no field it could give a slot of its own,
-# there is nothing to decompose -- and neither is an array past the field bound, which
-# keeps the pass on small records rather than buffers
 test "mach.lang.me.transform.sroa.run:declines_a_union_and_an_oversized_array" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
     var tgt: resolved.Target;
     if (ut_target(?reg, ?tgt) != 0) { ret 1; }
 
@@ -3354,11 +2414,11 @@ test "mach.lang.me.transform.sroa.run:declines_a_union_and_an_oversized_array" {
 
     val f_uni: u32 = ut_build_local(?m, ?b, uni, ?slot);
     if (f_uni == NONE_U32) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_ret_void(?b))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret_void(?b))) { code = 1; }
 
     val f_arr: u32 = ut_build_local(?m, ?b, arr, ?slot);
     if (f_arr == NONE_U32) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_ret_void(?b))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret_void(?b))) { code = 1; }
 
     val rs: R.Result[bool, str] = run(?m, ?tgt);
     if (R.is_err[bool, str](rs))         { code = 1; }
@@ -3371,13 +2431,11 @@ test "mach.lang.me.transform.sroa.run:declines_a_union_and_an_oversized_array" {
     ret code;
 }
 
-# a record whose address genuinely escapes stays whole: passing the slot pointer to a
-# call is exactly the `?x` address-of form, and the slot, its zero fill and its
-# load/store traffic all survive untouched
 test "mach.lang.me.transform.sroa.run:declines_when_the_address_escapes" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
     var tgt: resolved.Target;
     if (ut_target(?reg, ?tgt) != 0) { ret 1; }
 
@@ -3415,13 +2473,12 @@ test "mach.lang.me.transform.sroa.run:declines_when_the_address_escapes" {
     val ra: R.Result[value.Value, str] = builder.emit_alloca(?b, rec, value.const_int(1, i64t));
     if (R.is_err[value.Value, str](ra)) { ir.dnit(?m); ret 1; }
     val s: value.Value = R.unwrap_ok[value.Value, str](ra);
-    if (R.is_err[bool, str](builder.emit_memzero(?b, s, rec))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_memzero(?b, s, rec))) { code = 1; }
 
     val g1: R.Result[value.Value, str] = ut_gep(?b, ?m, s, rec, 1);
     if (R.is_err[value.Value, str](g1)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_store(?b, value.param(0, i64t), R.unwrap_ok[value.Value, str](g1)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?b, value.param(0, i64t), R.unwrap_ok[value.Value, str](g1)))) { code = 1; }
 
-    # the slot pointer itself crosses a call boundary: the address escapes.
     var args: [1]value.Value;
     args[0] = s;
     if (R.is_err[value.Value, str](builder.emit_call(?b, value.fn(callee_ix, ptrt), ?args[0], 1, voidt))) { code = 1; }
@@ -3430,13 +2487,12 @@ test "mach.lang.me.transform.sroa.run:declines_when_the_address_escapes" {
     if (R.is_err[value.Value, str](h1)) { ir.dnit(?m); ret 1; }
     val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](h1), i64t);
     if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
 
     val rs: R.Result[bool, str] = run(?m, ?tgt);
     if (R.is_err[bool, str](rs))          { code = 1; }
     or { if (R.unwrap_ok[bool, str](rs))  { code = 1; } }
 
-    # untouched: the slot, its zero fill, and its field traffic all stand.
     if (ut_count(fn, instruction.OP_ALLOCA)  != 1) { code = 1; }
     if (ut_count(fn, instruction.OP_MEMZERO) != 1) { code = 1; }
     if (ut_count(fn, instruction.OP_LOAD)    != 1) { code = 1; }
@@ -3446,19 +2502,11 @@ test "mach.lang.me.transform.sroa.run:declines_when_the_address_escapes" {
     ret code;
 }
 
-# the read-only-and-local phi rule is load-bearing: a merge block that writes a member
-# of the partition after the phi has already selected its incoming makes one shared
-# slot set unfaithful, because the write lands in the storage BOTH arms would read.
-#
-# This is the same shape as `splits_an_aggregate_phi_partition`, with one store added
-# to the merge block. With the rule in force the partition is declined and both slots
-# keep their storage; dropping the `check_partitions` call collapses them onto one
-# shared slot set and the alloca count falls to zero, which is the miscompile the rule
-# exists to prevent (#2276).
 test "mach.lang.me.transform.sroa.run:declines_a_phi_whose_merge_writes_a_member" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
     var tgt: resolved.Target;
     if (ut_target(?reg, ?tgt) != 0) { ret 1; }
 
@@ -3496,7 +2544,7 @@ test "mach.lang.me.transform.sroa.run:declines_a_phi_whose_merge_writes_a_member
     builder.set_block(?b, blocks[0]);
     val rcmp: R.Result[value.Value, str] = builder.emit_cmp_eq(?b, value.param(0, i64t), value.const_int(0, i64t));
     if (R.is_err[value.Value, str](rcmp)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_cbr(?b, R.unwrap_ok[value.Value, str](rcmp), blocks[1], blocks[2]))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_cbr(?b, R.unwrap_ok[value.Value, str](rcmp), blocks[1], blocks[2]))) { code = 1; }
 
     var a: u32 = 0;
     for (a < 2) {
@@ -3504,49 +2552,40 @@ test "mach.lang.me.transform.sroa.run:declines_a_phi_whose_merge_writes_a_member
         val ra: R.Result[value.Value, str] = builder.emit_alloca(?b, rec, value.const_int(1, i64t));
         if (R.is_err[value.Value, str](ra)) { ir.dnit(?m); ret 1; }
         arm[a] = R.unwrap_ok[value.Value, str](ra);
-        if (R.is_err[bool, str](builder.emit_memzero(?b, arm[a], rec))) { code = 1; }
+        if (R.is_err[R.Void, str](builder.emit_memzero(?b, arm[a], rec))) { code = 1; }
         val g0: R.Result[value.Value, str] = ut_gep(?b, ?m, arm[a], rec, 0);
         if (R.is_err[value.Value, str](g0)) { ir.dnit(?m); ret 1; }
-        if (R.is_err[bool, str](builder.emit_store(?b, value.const_int(a::u64, i8t), R.unwrap_ok[value.Value, str](g0)))) { code = 1; }
+        if (R.is_err[R.Void, str](builder.emit_store(?b, value.const_int(a::u64, i8t), R.unwrap_ok[value.Value, str](g0)))) { code = 1; }
         val g1: R.Result[value.Value, str] = ut_gep(?b, ?m, arm[a], rec, 1);
         if (R.is_err[value.Value, str](g1)) { ir.dnit(?m); ret 1; }
-        if (R.is_err[bool, str](builder.emit_store(?b, value.const_int(10 + a::u64, i64t), R.unwrap_ok[value.Value, str](g1)))) { code = 1; }
-        if (R.is_err[bool, str](builder.emit_br(?b, blocks[3]))) { code = 1; }
+        if (R.is_err[R.Void, str](builder.emit_store(?b, value.const_int(10 + a::u64, i64t), R.unwrap_ok[value.Value, str](g1)))) { code = 1; }
+        if (R.is_err[R.Void, str](builder.emit_br(?b, blocks[3]))) { code = 1; }
         a = a + 1;
     }
 
-    # merge: phi the two addresses, then OVERWRITE arm 0's payload before reading
-    # through the phi. one shared slot set cannot express this -- the write would be
-    # visible on the arm that selected the other record.
     builder.set_block(?b, blocks[3]);
     val rphi: R.Result[value.Value, str] = builder.emit_phi(?b, rec);
     if (R.is_err[value.Value, str](rphi)) { ir.dnit(?m); ret 1; }
     val phi: value.Value = R.unwrap_ok[value.Value, str](rphi);
-    if (R.is_err[bool, str](builder.phi_add_incoming(?b, phi, blocks[1], value.retype(arm[0], rec)))) { code = 1; }
-    if (R.is_err[bool, str](builder.phi_add_incoming(?b, phi, blocks[2], value.retype(arm[1], rec)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?b, phi, blocks[1], value.retype(arm[0], rec)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?b, phi, blocks[2], value.retype(arm[1], rec)))) { code = 1; }
 
     val gw: R.Result[value.Value, str] = ut_gep(?b, ?m, arm[0], rec, 1);
     if (R.is_err[value.Value, str](gw)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_store(?b, value.const_int(77, i64t), R.unwrap_ok[value.Value, str](gw)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?b, value.const_int(77, i64t), R.unwrap_ok[value.Value, str](gw)))) { code = 1; }
 
     val hp: R.Result[value.Value, str] = ut_gep(?b, ?m, phi, rec, 1);
     if (R.is_err[value.Value, str](hp)) { ir.dnit(?m); ret 1; }
     val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](hp), i64t);
     if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
 
-    # before: two slots, two zero fills, one aggregate phi.
     if (ut_count(fn, instruction.OP_ALLOCA)  != 2) { code = 1; }
     if (ut_count(fn, instruction.OP_MEMZERO) != 2) { code = 1; }
 
     val rs: R.Result[bool, str] = run(?m, ?tgt);
     if (R.is_err[bool, str](rs)) { code = 1; }
 
-    # declined: both records keep their own storage, so the overwrite stays confined
-    # to arm 0. The zero fills are the discriminating observable -- splitting expands
-    # a whole-slot memzero into per-field stores, so a split leaves none, while the
-    # alloca count alone cannot tell "declined" from "split" (a two-field record's
-    # shared slot set is itself two allocas).
     if (ut_count(fn, instruction.OP_MEMZERO) != 2) { code = 1; }
     if (ut_count(fn, instruction.OP_ALLOCA)  != 2) { code = 1; }
 

@@ -321,7 +321,7 @@ is walked). A `fun(...)` type may carry a trailing `...` for FFI only.
 and be stored but may never reach an observable position: a branch or loop
 condition, the left operand of `&&`/`||`, a memory index, or a `/`/`%`
 operand - each is a compile error. Public flows up to secret implicitly; the
-**only** downgrade is the explicit strip cast `x:^` (or `x:^T`). Any operation
+**only** downgrade is the explicit strip cast `x:>T` (the result type is required; `x:^` and `x:^T` are deprecated spellings accepted through 4.30.0). Any operation
 with a secret operand yields a secret result; `uni` variants must agree on
 secrecy; a secret-welded pointer (`*^T`) cannot be erased to `ptr`. Also
 rejected: a secret float operand, a secret integer multiply or variable shift
@@ -360,7 +360,7 @@ it. `nil` with no context types as `*u8`; `var cb: fun(u32) = nil;` is legal.
 - Logical `&& || !` - short-circuit, `u8` operands and result.
 - Pointer: `?expr` address-of, `@p` dereference (`@p = x;` writes through).
 - Casts (postfix): `expr::T` value conversion (resize, int↔float);
-  `expr:~T` bit reinterpret (same byte size required); `expr:^` strips the
+  `expr:~T` bit reinterpret (same byte size required); `expr:>T` strips the
   secret qualifier (the only one that can).
 - Assignment `=` is an expression form used in statement position;
   right-associative, lowest precedence.
@@ -464,7 +464,7 @@ $mach.compiler.name / .version              # live
 
 $mach.os.linux    .darwin   .windows  .freestanding
 $mach.arch.x86_64 .aarch64  .riscv64
-$mach.abi.sysv    .win64    .aapcs64  .lp64
+$mach.abi.sysv64  .win64    .aapcs64  .lp64
 $mach.mode.debug  .release
 ```
 

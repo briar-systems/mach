@@ -1,15 +1,3 @@
-# middle-end pass pipeline
-#
-# Runs the canonical optimisation sequence over an `ir.Module` in place and
-# returns the same module, mutated. The pipeline shape is fixed by optimisation
-# level; passes are not user-pluggable.
-#
-# `run` is invoked by the Q_LOWER compute path immediately after lowering,
-# before the module is published as the query result, so unoptimised IR is
-# never observed elsewhere. The verifier runs before and after the level's
-# stages; a post-pipeline verification failure is an internal compiler error
-# (a pass bug), surfaced as the returned err.
-
 use std.allocator.page;
 use std.format;
 use std.types.bool.bool;
@@ -43,324 +31,195 @@ use mach.lang.me.transform.sroa;
 use mach.lang.me.transform.vectorize;
 use mach.lang.source;
 use mach.lang.target;
-use vecform: mach.lang.me.vecform;
+use target_testing: mach.lang.target.testing;
+use mach.lang.me.vecform;
 use mach.lang.target.resolved;
 
-# optimisation level selecting the pipeline's stage sequence
 pub def OptLevel: u8;
 
-# debug optimisation (`-O0`): the always-on sequence (mem2reg, constfold, dce).
-# the default for `mach build`
 pub val OPT_DEBUG:   OptLevel = 0;
-# release optimisation (`-O1`+): the always-on sequence plus inline, then a late
-# algebraic / local-CSE / constfold / dce sweep over the inlined bodies
 pub val OPT_RELEASE: OptLevel = 1;
 
-# drive the middle-end pipeline over `m` at the requested level
-#
-# Always verifies before and after the level's stages. A non-empty report from
-# either run is folded into the returned err, which the driver surfaces as an
-# internal compiler error. When `verify_ir` is set, the verifier also runs after
-# every pass with the opt-in aggregate-representation checks enabled.
-# ---
-# m:            module to optimise in place
-# tgt:          target, consulted by the cost-model passes (inline)
-# level:        selects the stage sequence (debug vs release)
-# verify_ir:    run the verifier after every pass, with representation checks on
-# vectorize_enabled: the resolved `[profile.X] vectorize` opt-out lever (#2141); when
-#               false the element-wise auto-vectorization pass is skipped even on a
-#               capable target (release output stays scalar)
-# simd_require: the resolved `[profile.X] simd == "require"` posture (#2017); on an
-#               incapable target it turns a would-scalarize vector op into a build
-#               error at the same gate where the scalarize pass would otherwise run
-# float_reassoc: the resolved `[profile.X] float_reassoc` lever (#2160); when true the
-#               vectorizer may reassociate a float reduction into lane partials. false
-#               (the default) keeps every float reduction scalar and IEEE-strict
-# itn:          interner, naming the site on the require-error path and the module
-#               and function on a verifier failure
-# srcmap:       source map, resolving the offending instruction's SrcLoc to
-#               path:line:col on a verifier failure; nil when unavailable
-# ret:          ok(true) on a clean pipeline, or an internal-compiler-error / a
-#               require-mode build-error message
-pub fun run(m: *ir.Module, tgt: *target.Target, level: OptLevel, verify_ir: bool, vectorize_enabled: bool, simd_require: bool, float_reassoc: bool, itn: *intern.Interner, srcmap: *source.SourceMap) R.Result[bool, str] {
+pub rec VectorizeEnabledOption { v: bool; }
+pub rec SimdRequireOption      { v: bool; }
+pub rec FloatReassocOption     { v: bool; }
+
+pub rec PipelineRequest {
+    module:            *ir.Module;
+    target:            *target.Target;
+    level:             OptLevel;
+    vectorize_enabled: VectorizeEnabledOption;
+    simd_require:      SimdRequireOption;
+    float_reassoc:     FloatReassocOption;
+    interner:          *intern.Interner;
+    source_map:        *source.SourceMap;
+}
+
+pub fun run(req: *PipelineRequest) R.Result[bool, str] {
+    if (req.module == nil)   { ret R.err[bool, str]("pipeline request: module is required"); }
+    if (req.target == nil)   { ret R.err[bool, str]("pipeline request: target is required"); }
+    if (req.interner == nil) { ret R.err[bool, str]("pipeline request: interner is required"); }
+
+    ret run_impl(req.module, req.target, req.level, req.vectorize_enabled.v,
+                 req.simd_require.v, req.float_reassoc.v, req.interner, req.source_map);
+}
+
+fun run_impl(m: *ir.Module, tgt: *target.Target, level: OptLevel, vectorize_enabled: bool, simd_require: bool, float_reassoc: bool, itn: *intern.Interner, srcmap: *source.SourceMap) R.Result[bool, str] {
     var vc: VerifyCtx;
-    vc.verify_ir = verify_ir;
     vc.tgt       = tgt;
     vc.itn       = itn;
     vc.srcmap    = srcmap;
 
-    # entry verification sanity-checks the lowered input. reachability and
-    # dominance are not enforced here: freshly-lowered IR still carries the
-    # unreachable blocks the lowerer parks after terminators, which dce removes
-    # below. the representation checks stay opt-in via verify_stage; the
-    # always-on entry/exit runs keep repr=false until a clean self-host promotes
-    # them.
-    val res_verify_in: R.Result[bool, str] = run_verify(m, false, false, ?vc);
-    if (R.is_err[bool, str](res_verify_in)) { ret res_verify_in; }
+    var changed: bool = false;
 
-    # mem2reg always runs: code generation expects mostly-SSA input.
-    val res_mem2reg: R.Result[bool, str] = mem2reg.run(m);
-    if (R.is_err[bool, str](res_mem2reg)) { ret res_mem2reg; }
-    val res_verify_mem2reg: R.Result[bool, str] = verify_stage(m, false, ?vc);
-    if (R.is_err[bool, str](res_verify_mem2reg)) { ret res_verify_mem2reg; }
+    val res_verify_in: R.Result[R.Void, str] = run_verify(m, false, true, ?vc);
+    if (R.is_err[R.Void, str](res_verify_in)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_in)); }
 
-    # constfold always runs: with locals in SSA after mem2reg, constant operands
-    # are exposed, so folding/propagation and constant-branch simplification fire
-    # before dce sweeps the dead fold instructions and newly-unreachable blocks.
-    # it produces the exact runtime value, so it is correct at every level.
-    val res_constfold: R.Result[bool, str] = constfold.run(m);
-    if (R.is_err[bool, str](res_constfold)) { ret res_constfold; }
-    val res_verify_constfold: R.Result[bool, str] = verify_stage(m, false, ?vc);
-    if (R.is_err[bool, str](res_verify_constfold)) { ret res_verify_constfold; }
+    val mem2reg_changed_r: R.Result[bool, str] = mem2reg.run(m);
+    if (R.is_err[bool, str](mem2reg_changed_r)) { ret mem2reg_changed_r; }
+    if (R.unwrap_ok[bool, str](mem2reg_changed_r)) { changed = true; }
+    val res_verify_mem2reg: R.Result[R.Void, str] = verify_stage(m, false, ?vc);
+    if (R.is_err[R.Void, str](res_verify_mem2reg)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_mem2reg)); }
 
-    # dce always runs: beyond cleaning dead values, its reachability sweep
-    # removes the unreachable blocks lowering left behind, so the back end
-    # receives a connected CFG at every optimisation level. the CFG is connected
-    # afterward, so reachability/dominance hold (full=true).
-    val res_dce: R.Result[bool, str] = dce.run(m);
-    if (R.is_err[bool, str](res_dce)) { ret res_dce; }
-    val res_verify_dce: R.Result[bool, str] = verify_stage(m, true, ?vc);
-    if (R.is_err[bool, str](res_verify_dce)) { ret res_verify_dce; }
+    val constfold_changed_r: R.Result[bool, str] = constfold.run(m);
+    if (R.is_err[bool, str](constfold_changed_r)) { ret constfold_changed_r; }
+    if (R.unwrap_ok[bool, str](constfold_changed_r)) { changed = true; }
+    val res_verify_constfold: R.Result[R.Void, str] = verify_stage(m, false, ?vc);
+    if (R.is_err[R.Void, str](res_verify_constfold)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_constfold)); }
+
+    val dce_changed_r: R.Result[bool, str] = dce.run(m);
+    if (R.is_err[bool, str](dce_changed_r)) { ret dce_changed_r; }
+    if (R.unwrap_ok[bool, str](dce_changed_r)) { changed = true; }
+    val res_verify_dce: R.Result[R.Void, str] = verify_stage(m, true, ?vc);
+    if (R.is_err[R.Void, str](res_verify_dce)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_dce)); }
 
     if (level == OPT_RELEASE) {
-        # inline single-use and small functions. inlining a non-returning callee
-        # leaves the continuation block with no predecessors until the late dce
-        # sweeps it, so reachability/dominance are not yet enforced (full=false);
-        # they are re-checked after the late dce below.
-        val res_inline: R.Result[bool, str] = inline.run(m, tgt);
-        if (R.is_err[bool, str](res_inline)) { ret res_inline; }
-        val res_verify_inline: R.Result[bool, str] = verify_stage(m, false, ?vc);
-        if (R.is_err[bool, str](res_verify_inline)) { ret res_verify_inline; }
+        val inline_changed_r: R.Result[bool, str] = inline.run(m, tgt, nil);
+        if (R.is_err[bool, str](inline_changed_r)) { ret inline_changed_r; }
+        if (R.unwrap_ok[bool, str](inline_changed_r)) { changed = true; }
+        val res_verify_inline: R.Result[R.Void, str] = verify_stage(m, false, ?vc);
+        if (R.is_err[R.Void, str](res_verify_inline)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_inline)); }
 
-        # post-inline mem2reg: a caller alloca whose address escaped into a call
-        # is non-promotable before inlining, but once the callee is inlined its
-        # uses become plain load/store and it becomes promotable. promotion is
-        # idempotent on already-SSA code, and mem2reg reads block lists as the
-        # liveness source of truth, so inline's unlinked pool ghosts don't poison
-        # escape analysis.
-        val res_mem2reg2: R.Result[bool, str] = mem2reg.run(m);
-        if (R.is_err[bool, str](res_mem2reg2)) { ret res_mem2reg2; }
-        val res_verify_mem2reg2: R.Result[bool, str] = verify_stage(m, false, ?vc);
-        if (R.is_err[bool, str](res_verify_mem2reg2)) { ret res_verify_mem2reg2; }
+        val mem2reg2_changed_r: R.Result[bool, str] = mem2reg.run(m);
+        if (R.is_err[bool, str](mem2reg2_changed_r)) { ret mem2reg2_changed_r; }
+        if (R.unwrap_ok[bool, str](mem2reg2_changed_r)) { changed = true; }
+        val res_verify_mem2reg2: R.Result[R.Void, str] = verify_stage(m, false, ?vc);
+        if (R.is_err[R.Void, str](res_verify_mem2reg2)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_mem2reg2)); }
 
-        # post-inline constfold: inlining substitutes constant arguments into
-        # callee bodies, exposing fresh folding opportunities. a constant-branch
-        # simplification here can strand a predecessor-less block that the late
-        # dce removes, so reachability is not yet enforced (full=false).
-        val res_constfold2: R.Result[bool, str] = constfold.run(m);
-        if (R.is_err[bool, str](res_constfold2)) { ret res_constfold2; }
-        val res_verify_constfold2: R.Result[bool, str] = verify_stage(m, false, ?vc);
-        if (R.is_err[bool, str](res_verify_constfold2)) { ret res_verify_constfold2; }
+        val constfold2_changed_r: R.Result[bool, str] = constfold.run(m);
+        if (R.is_err[bool, str](constfold2_changed_r)) { ret constfold2_changed_r; }
+        if (R.unwrap_ok[bool, str](constfold2_changed_r)) { changed = true; }
+        val res_verify_constfold2: R.Result[R.Void, str] = verify_stage(m, false, ?vc);
+        if (R.is_err[R.Void, str](res_verify_constfold2)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_constfold2)); }
 
-        # a reachability sweep before the split stage. inlining a non-returning callee
-        # and the constant-branch simplification above both strand predecessor-less
-        # blocks, and the mem2reg that finishes the split renames only reachable
-        # blocks -- an unreachable predecessor would leave a phi one incoming short of
-        # its block's predecessor multiset. the CFG is connected afterward (full=true).
-        val res_dce_pre: R.Result[bool, str] = dce.run(m);
-        if (R.is_err[bool, str](res_dce_pre)) { ret res_dce_pre; }
-        val res_verify_dce_pre: R.Result[bool, str] = verify_stage(m, true, ?vc);
-        if (R.is_err[bool, str](res_verify_dce_pre)) { ret res_verify_dce_pre; }
+        val dce_pre_changed_r: R.Result[bool, str] = dce.run(m);
+        if (R.is_err[bool, str](dce_pre_changed_r)) { ret dce_pre_changed_r; }
+        if (R.unwrap_ok[bool, str](dce_pre_changed_r)) { changed = true; }
+        val res_verify_dce_pre: R.Result[R.Void, str] = verify_stage(m, true, ?vc);
+        if (R.is_err[R.Void, str](res_verify_dce_pre)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_dce_pre)); }
 
-        # scalar replacement of aggregates (#2205): decompose every small record /
-        # array local whose address never escapes into per-field slots, so the
-        # `Result` / `Option` idiom stops round-tripping through memory. It leaves
-        # the field slots as plain load/store traffic, so a third mem2reg promotes
-        # them (and builds the scalar phis the shared slots of a split aggregate phi
-        # imply) before the late simplification sweep folds the copies away.
-        val res_sroa: R.Result[bool, str] = sroa.run(m, tgt);
-        if (R.is_err[bool, str](res_sroa)) { ret res_sroa; }
-        if (R.unwrap_ok[bool, str](res_sroa)) {
-            val res_verify_sroa: R.Result[bool, str] = verify_stage(m, true, ?vc);
-            if (R.is_err[bool, str](res_verify_sroa)) { ret res_verify_sroa; }
+        val sroa_changed_r: R.Result[bool, str] = sroa.run(m, tgt);
+        if (R.is_err[bool, str](sroa_changed_r)) { ret sroa_changed_r; }
+        if (R.unwrap_ok[bool, str](sroa_changed_r)) {
+            changed = true;
+            val res_verify_sroa: R.Result[R.Void, str] = verify_stage(m, true, ?vc);
+            if (R.is_err[R.Void, str](res_verify_sroa)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_sroa)); }
 
-            val res_mem2reg3: R.Result[bool, str] = mem2reg.run(m);
-            if (R.is_err[bool, str](res_mem2reg3)) { ret res_mem2reg3; }
-            val res_verify_mem2reg3: R.Result[bool, str] = verify_stage(m, false, ?vc);
-            if (R.is_err[bool, str](res_verify_mem2reg3)) { ret res_verify_mem2reg3; }
+            val mem2reg3_changed_r: R.Result[bool, str] = mem2reg.run(m);
+            if (R.is_err[bool, str](mem2reg3_changed_r)) { ret mem2reg3_changed_r; }
+            if (R.unwrap_ok[bool, str](mem2reg3_changed_r)) { changed = true; }
+            val res_verify_mem2reg3: R.Result[R.Void, str] = verify_stage(m, false, ?vc);
+            if (R.is_err[R.Void, str](res_verify_mem2reg3)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_mem2reg3)); }
         }
 
-        # algebraic simplification: peephole identities (x+0, x*1, x&x, x^x, ...)
-        # the all-constant cases constfold cannot reach. value-preserving by
-        # construction (integer-only where float semantics differ).
-        val res_algebraic: R.Result[bool, str] = algebraic.run(m);
-        if (R.is_err[bool, str](res_algebraic)) { ret res_algebraic; }
-        val res_verify_algebraic: R.Result[bool, str] = verify_stage(m, false, ?vc);
-        if (R.is_err[bool, str](res_verify_algebraic)) { ret res_verify_algebraic; }
+        val algebraic_changed_r: R.Result[bool, str] = algebraic.run(m);
+        if (R.is_err[bool, str](algebraic_changed_r)) { ret algebraic_changed_r; }
+        if (R.unwrap_ok[bool, str](algebraic_changed_r)) { changed = true; }
+        val res_verify_algebraic: R.Result[R.Void, str] = verify_stage(m, false, ?vc);
+        if (R.is_err[R.Void, str](res_verify_algebraic)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_algebraic)); }
 
-        # local CSE: within each block, share a redundant pure computation with
-        # the earlier identical one. inlining frequently duplicates address and
-        # arithmetic expressions across a call boundary, which this collapses.
-        val res_cse: R.Result[bool, str] = cse.run(m);
-        if (R.is_err[bool, str](res_cse)) { ret res_cse; }
-        val res_verify_cse: R.Result[bool, str] = verify_stage(m, false, ?vc);
-        if (R.is_err[bool, str](res_verify_cse)) { ret res_verify_cse; }
+        val cse_changed_r: R.Result[bool, str] = cse.run(m);
+        if (R.is_err[bool, str](cse_changed_r)) { ret cse_changed_r; }
+        if (R.unwrap_ok[bool, str](cse_changed_r)) { changed = true; }
+        val res_verify_cse: R.Result[R.Void, str] = verify_stage(m, false, ?vc);
+        if (R.is_err[R.Void, str](res_verify_cse)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_cse)); }
 
-        # second constfold: algebra/CSE expose constants (e.g. x*0 -> 0) and may
-        # feed a constant condition to a branch; fold and simplify before dce.
-        val res_constfold3: R.Result[bool, str] = constfold.run(m);
-        if (R.is_err[bool, str](res_constfold3)) { ret res_constfold3; }
-        val res_verify_constfold3: R.Result[bool, str] = verify_stage(m, false, ?vc);
-        if (R.is_err[bool, str](res_verify_constfold3)) { ret res_verify_constfold3; }
+        val constfold3_changed_r: R.Result[bool, str] = constfold.run(m);
+        if (R.is_err[bool, str](constfold3_changed_r)) { ret constfold3_changed_r; }
+        if (R.unwrap_ok[bool, str](constfold3_changed_r)) { changed = true; }
+        val res_verify_constfold3: R.Result[R.Void, str] = verify_stage(m, false, ?vc);
+        if (R.is_err[R.Void, str](res_verify_constfold3)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_constfold3)); }
 
-        # late dce: sweep up now-dead calls, branches, and the instructions left
-        # dead by simplification / CSE. the CFG is connected again afterward
-        # (full=true).
-        val res_dce2: R.Result[bool, str] = dce.run(m);
-        if (R.is_err[bool, str](res_dce2)) { ret res_dce2; }
-        val res_verify_dce2: R.Result[bool, str] = verify_stage(m, true, ?vc);
-        if (R.is_err[bool, str](res_verify_dce2)) { ret res_verify_dce2; }
+        val dce2_changed_r: R.Result[bool, str] = dce.run(m);
+        if (R.is_err[bool, str](dce2_changed_r)) { ret dce2_changed_r; }
+        if (R.unwrap_ok[bool, str](dce2_changed_r)) { changed = true; }
+        val res_verify_dce2: R.Result[R.Void, str] = verify_stage(m, true, ?vc);
+        if (R.is_err[R.Void, str](res_verify_dce2)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_dce2)); }
 
-        # loop-invariant code motion (#2204): lift work that does not change across a
-        # loop's iterations -- invariant loads, address arithmetic and the invariant
-        # leading walk of an indexed gep -- into the loop's preheader, so it is computed
-        # once per loop entry instead of once per iteration. Runs before vectorization so
-        # an invariant scalar operand is already available in the preheader. Relocates
-        # instructions between existing blocks (plus at most one gep per split) without
-        # touching the CFG, so reachability/dominance still hold (full=true).
-        val res_licm: R.Result[bool, str] = licm.run(m, tgt);
-        if (R.is_err[bool, str](res_licm)) { ret res_licm; }
-        val res_verify_licm: R.Result[bool, str] = verify_stage(m, true, ?vc);
-        if (R.is_err[bool, str](res_verify_licm)) { ret res_verify_licm; }
+        val licm_changed_r: R.Result[bool, str] = licm.run(m, tgt);
+        if (R.is_err[bool, str](licm_changed_r)) { ret licm_changed_r; }
+        if (R.unwrap_ok[bool, str](licm_changed_r)) { changed = true; }
+        val res_verify_licm: R.Result[R.Void, str] = verify_stage(m, true, ?vc);
+        if (R.is_err[R.Void, str](res_verify_licm)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_licm)); }
 
-        # element-wise loop vectorization (#2141): on a capable target, recognize
-        # counted unit-stride element-wise maps that dependence analysis proves
-        # independent and rewrite them to runtime-guarded 128-bit vector loops with a
-        # scalar remainder. This is the first codegen-changing release pass, so output
-        # is intentionally not byte-identical for vectorizable loops; rv64
-        # (has_v128 == false) never enters and stays scalar.
         if (tgt.model.has_v128 && vectorize_enabled) {
-            val res_vec: R.Result[bool, str] = vectorize.run(m, tgt, float_reassoc);
-            if (R.is_err[bool, str](res_vec)) { ret res_vec; }
-            if (R.unwrap_ok[bool, str](res_vec)) {
-                val res_dce_vec: R.Result[bool, str] = dce.run(m);
-                if (R.is_err[bool, str](res_dce_vec)) { ret res_dce_vec; }
-                val res_verify_vec: R.Result[bool, str] = verify_stage(m, true, ?vc);
-                if (R.is_err[bool, str](res_verify_vec)) { ret res_verify_vec; }
+            val vec_changed_r: R.Result[bool, str] = vectorize.run(m, tgt, float_reassoc);
+            if (R.is_err[bool, str](vec_changed_r)) { ret vec_changed_r; }
+            if (R.unwrap_ok[bool, str](vec_changed_r)) {
+                changed = true;
+                val dce_vec_changed_r: R.Result[bool, str] = dce.run(m);
+                if (R.is_err[bool, str](dce_vec_changed_r)) { ret dce_vec_changed_r; }
+                val res_verify_vec: R.Result[R.Void, str] = verify_stage(m, true, ?vc);
+                if (R.is_err[R.Void, str](res_verify_vec)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_vec)); }
             }
         }
     }
 
-    # THE SIMD LEVER, asked once for the whole module and before anything is rewritten
-    # (#2726). `require` means a vector operator that would realize as per-lane scalar
-    # code is a build error rather than a silent expansion, and that is now a
-    # per-OPERATION question on every target rather than a per-target one: SSE2 has no
-    # 32-bit lane integer multiply and NEON no 64-bit one, so a capable target
-    # scalarizes too, and the lever has to see it.
-    #
-    # Placed ahead of both realization stages so nothing has been expanded yet when it
-    # fires - the error describes the IR the front end produced, not a half-legalized
-    # form. On the `scalarize` posture the expansions below run and the note tallies
-    # them.
     if (simd_require) {
-        val res_req: R.Result[bool, str] = require_check(m, tgt, itn);
-        if (R.is_err[bool, str](res_req)) { ret res_req; }
+        val res_req: R.Result[R.Void, str] = require_check(m, tgt, itn);
+        if (R.is_err[R.Void, str](res_req)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_req)); }
     }
 
-    # PLACEMENT FIRST (#2727): every vector value this target cannot hold in a vector
-    # register - all of them where there is no vector unit, the over-width shapes
-    # where there is one - becomes a stack slot with per-lane accesses, so no vector
-    # the back end cannot place survives. Runs after all optimization, so it legalizes
-    # the final IR, and the verifier re-checks.
-    #
-    # AHEAD OF THE TWO OPERATOR STAGES BELOW, and the reason is the amount of work
-    # rather than correctness. Both of those rewrite an operator while leaving its
-    # operands and result as vector VALUES; reached first by an over-width shape they
-    # expand it into lane access against a value no register holds, and this stage
-    # then takes that apart again into the memory image it was always going to be -
-    # correct, and enormously more code. MEASURED on `@d = @a + @b` at `i32x8`,
-    # x86-64, release: 169 instructions and a 128-byte frame with this stage first,
-    # 871 instructions and a 1072-byte frame with it last. Both produce the same lanes
-    # on all three legs, so this is not a correctness gate and should not be described
-    # as one. It does leave each stage below with a simpler contract: after this,
-    # every vector in the module fits a register by construction.
-    #
-    # Runs under `require` too, unlike the two below: the lever governs which
-    # OPERATORS may realize as scalar code, and a value's placement is not a choice a
-    # target offers. A vector too wide for a register that is merely copied has no
-    # operator for the lever to refuse and still has to be placed somewhere.
-    val res_place: R.Result[bool, str] = scalarize.run(m, tgt);
-    if (R.is_err[bool, str](res_place)) { ret res_place; }
-    val res_verify_place: R.Result[bool, str] = verify_stage(m, true, ?vc);
-    if (R.is_err[bool, str](res_verify_place)) { ret res_verify_place; }
+    val place_changed_r: R.Result[bool, str] = scalarize.run(m, tgt);
+    if (R.is_err[bool, str](place_changed_r)) { ret place_changed_r; }
+    if (R.unwrap_ok[bool, str](place_changed_r)) { changed = true; }
+    val res_verify_place: R.Result[R.Void, str] = verify_stage(m, true, ?vc);
+    if (R.is_err[R.Void, str](res_verify_place)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_place)); }
 
-    # realize the operators this target has no packed form for, on a target that DOES
-    # have a vector unit (#2726). Vector values stay vectors and keep their packed
-    # operators; only the gap operators become per-lane work, so `i32x4 + i32x4` still
-    # selects PADDD next to an `i32x4 * i32x4` that does not.
-    #
-    # A SIMD-incapable target skips this: the placement stage above has already
-    # rewritten every vector value and operator there, which subsumes it, and doing
-    # both would expand the gap ops twice.
     if (tgt.model.has_v128 && !simd_require) {
-        val res_gap: R.Result[bool, str] = scalarize.expand_gap_ops(m, tgt);
-        if (R.is_err[bool, str](res_gap)) { ret res_gap; }
-        val res_verify_gap: R.Result[bool, str] = verify_stage(m, true, ?vc);
-        if (R.is_err[bool, str](res_verify_gap)) { ret res_verify_gap; }
+        val gap_changed_r: R.Result[bool, str] = scalarize.expand_gap_ops(m, tgt);
+        if (R.is_err[bool, str](gap_changed_r)) { ret gap_changed_r; }
+        if (R.unwrap_ok[bool, str](gap_changed_r)) { changed = true; }
+        val res_verify_gap: R.Result[R.Void, str] = verify_stage(m, true, ?vc);
+        if (R.is_err[R.Void, str](res_verify_gap)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_gap)); }
     }
 
-    # vector lane access is legalized ahead of the SIMD gate (#2236): a target that
-    # keeps vectors but has no lane-access form (x86-64 today) has every
-    # OP_VEC_EXTRACT / OP_VEC_INSERT rewritten to the vector's memory image here. a
-    # target selecting lane access natively keeps them to its isel, and a SIMD-
-    # incapable one has the scalarizer below expand them against the slots it already
-    # reserves - so this is inert for both, and only the middle case pays.
-    val res_lanes: R.Result[bool, str] = scalarize.expand_lane_ops(m, tgt);
-    if (R.is_err[bool, str](res_lanes)) { ret res_lanes; }
+    val lanes_changed_r: R.Result[bool, str] = scalarize.expand_lane_ops(m, tgt);
+    if (R.is_err[bool, str](lanes_changed_r)) { ret lanes_changed_r; }
+    if (R.unwrap_ok[bool, str](lanes_changed_r)) { changed = true; }
     if (!tgt.model.has_lane_ops && tgt.model.has_v128) {
-        val res_verify_lanes: R.Result[bool, str] = verify_stage(m, true, ?vc);
-        if (R.is_err[bool, str](res_verify_lanes)) { ret res_verify_lanes; }
+        val res_verify_lanes: R.Result[R.Void, str] = verify_stage(m, true, ?vc);
+        if (R.is_err[R.Void, str](res_verify_lanes)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_lanes)); }
     }
 
-    # exit verification: full invariant check before the backend takes over.
-    ret run_verify(m, true, false, ?vc);
+    val res_verify_out: R.Result[R.Void, str] = run_verify(m, true, true, ?vc);
+    if (R.is_err[R.Void, str](res_verify_out)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_verify_out)); }
+    ret R.ok[bool, str](changed);
 }
 
-# the `require`-posture enforcement (#2017): reject the first vector operator whose
-# realization on this target is per-lane scalar code, using the shared detection so
-# the error names exactly the sites the scalarize-posture note would tally. clean
-# (ok) for a module with no scalar-realized operators, so a vectorless build - or one
-# whose every operator has a packed form - is never rejected.
-#
-# Runs on EVERY target now, not only a SIMD-incapable one (#2726). A capable target
-# still has per-operation gaps (SSE2 has no 32-bit lane integer multiply, NEON no
-# 64-bit one), and those scalarize exactly as an incapable target's operators do, so
-# the lever a project sets to refuse a silent scalar expansion has to see them.
-# ---
-# m:   the module about to be handed to the back end
-# tgt: the target whose packed forms decide each operator's realization
-# itn: interner, to resolve the offending function's name
-# ret: ok(true) when nothing scalarizes, or the require build-error string
-fun require_check(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner) R.Result[bool, str] {
+fun require_check(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner) R.Result[R.Void, str] {
     var site: scalarize.ScalarizeSite;
     val count: u32 = scalarize.detect(m, tgt, ?site);
-    if (count == 0) { ret R.ok[bool, str](true); }
-    ret R.err[bool, str](require_msg(m, tgt, itn, ?site));
+    if (count == 0) { ret R.ok_void[str](); }
+    ret R.err[R.Void, str](require_msg(m, tgt, itn, ?site));
 }
 
-# assemble the precise require-mode error naming the offending operator, its SHAPE,
-# its containing function, and the arch, plus the actionable fix
-#
-# The lane width is load-bearing rather than decoration: on a capable target the
-# shortfall is per-operation, so "vector multiply would scalarize on x86_64" without
-# it reads as a claim about every multiply, when the same multiply at 16-bit lanes
-# packs as PMULLW.
-#
-# The lane COUNT is load-bearing for the same reason (#2749). Where a target bounds
-# its packed form by a component count, the same operation at the same lane width
-# packs at four lanes and scalarizes at sixteen, so a message naming only the width
-# describes a gap the target does not have and sends the reader to look for one.
 fun require_msg(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner, site: *scalarize.ScalarizeSite) str {
     val op: str = vecform.vec_op_name(vecform.vec_op_of(site.op));
     var fname: str = "<anonymous>";
     val on: O.Option[str] = intern.lookup(itn, site.fn_name);
     if (O.is_some[str](on)) { fname = O.unwrap[str](on); }
 
-    # WHICH OF THE TWO CAUSES it was: a missing packed word for the operation, or a
-    # SHAPE past what one packed vector holds. The second covers both ceilings the
-    # authority folds - the register width (`f32x8` on 128 bits, #2727) and a
-    # component count (SPIR-V's four, #2749) - and the message already carries the
-    # lane count and width, so the reader can see which side of the ceiling it is on.
     var why: str = "target has no packed form for this operation at this lane width";
     if (!tgt.model.has_v128) { why = "target has no 128-bit SIMD"; }
     or {
@@ -377,79 +236,92 @@ fun require_msg(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner, site:
     ret R.unwrap_ok[str, str](rj);
 }
 
-# everything the verifier needs beyond the module itself: the --verify-ir gate and
-# the two tables a failure is localized through
-#
-# Bundled rather than passed positionally because every stage in `run` forwards the
-# same three values unchanged, and a verifier diagnostic that grows a new input
-# should not mean editing twenty call sites again.
-# ---
-# verify_ir: gate, run the verifier after every pass with representation checks on
-# tgt:       resolved target the verifier's layout-dependent checks measure against
-# itn:       interner resolving the module and function names in a failure message
-# srcmap:    source map resolving the offending instruction's SrcLoc to
-#            path:line:col, or nil when the caller has none
 rec VerifyCtx {
-    verify_ir: bool;
     tgt:       *target.Target;
     itn:       *intern.Interner;
     srcmap:    *source.SourceMap;
 }
 
-# run the per-stage verifier when `verify_ir` is set, otherwise pass clean
-#
-# Threads the optional --verify-ir checks that run after each pass. These always
-# enable `repr`, since the aggregate-representation checks are exactly the opt-in
-# work `verify_ir` gates.
-# ---
-# m:    module to verify in place
-# full: enforce reachability/dominance invariants (only valid after dce)
-# vc:   the gate and the localization tables
-# ret:  ok(true) when skipped or clean, or the verifier's err
-fun verify_stage(m: *ir.Module, full: bool, vc: *VerifyCtx) R.Result[bool, str] {
-    if (vc.verify_ir) {
-        ret run_verify(m, full, true, vc);
-    }
-    ret R.ok[bool, str](true);
+fun verify_stage(m: *ir.Module, full: bool, vc: *VerifyCtx) R.Result[R.Void, str] {
+    ret run_verify(m, full, true, vc);
 }
 
-# run the verifier over `m`, mapping a non-empty report into an err
-#
-# A clean module yields ok(true). The err describes the first violated check and
-# localizes it to the module, function, and source location it fired in - a
-# verifier failure is a compiler bug, and without that location every occurrence of
-# a given check reads identically no matter which function is at fault (#2538).
-# `full` enforces the post-dce reachability/dominance invariants; `repr` enables the
-# opt-in aggregate-representation checks.
-# ---
-# m:    module to verify in place
-# full: enforce reachability/dominance invariants (only valid after dce)
-# repr: enable aggregate-representation checks
-# vc:   the localization tables the message is rendered through
-# ret:  ok(true) on a clean module, or an err naming and locating the first violation
-fun run_verify(m: *ir.Module, full: bool, repr: bool, vc: *VerifyCtx) R.Result[bool, str] {
+fun run_verify(m: *ir.Module, full: bool, repr: bool, vc: *VerifyCtx) R.Result[R.Void, str] {
     val res_report: R.Result[verify.VerifyReport, str] =
         verify.verify_module_ext(m, m.alloc, verify.opts(vc.tgt, full, repr));
     if (R.is_err[verify.VerifyReport, str](res_report)) {
-        ret R.err[bool, str](R.unwrap_err[verify.VerifyReport, str](res_report));
+        ret R.err[R.Void, str](R.unwrap_err[verify.VerifyReport, str](res_report));
     }
     var report: verify.VerifyReport = R.unwrap_ok[verify.VerifyReport, str](res_report);
     if (report.len == 0) {
         verify.dnit_report(?report);
-        ret R.ok[bool, str](true);
+        ret R.ok_void[str]();
     }
-    # internal compiler error: report the first violated invariant. the message is
-    # built on the module allocator, so the driver re-homes it before releasing it.
     val msg: str = verify.describe_located(m, ?report.violations[0], vc.itn, vc.srcmap, m.alloc);
     verify.dnit_report(?report);
-    ret R.err[bool, str](msg);
+    ret R.err[R.Void, str](msg);
 }
 
-# an instruction's source location survives the always-on pipeline: mem2reg
-# promotes an alloca (rewriting a use of the surviving add) and constfold folds a
-# constant into its other operand, yet the add keeps the loc it lowered with. This
-# is the debug-info invariant the shared Rewrite map exists to guarantee -- RAUW
-# rewrites operands, never the loc a surviving instruction carries
+fun t_ready_request() PipelineRequest {
+    var req: PipelineRequest;
+    req.module            = nil;
+    req.target             = nil;
+    req.level               = OPT_DEBUG;
+    req.vectorize_enabled   = VectorizeEnabledOption{ v: false };
+    req.simd_require        = SimdRequireOption{ v: false };
+    req.float_reassoc       = FloatReassocOption{ v: false };
+    req.interner            = nil;
+    req.source_map          = nil;
+    ret req;
+}
+
+test "mach.lang.me.pipeline.run:rejects_a_request_missing_module" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var itn: intern.Interner = intern.init(?alloc);
+    var rv: target.Target;
+
+    var req: PipelineRequest = t_ready_request();
+    req.target   = ?rv;
+    req.interner = ?itn;
+    if (R.is_ok[bool, str](run(?req))) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.me.pipeline.run:rejects_a_request_missing_target" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var itn: intern.Interner = intern.init(?alloc);
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+    var req: PipelineRequest = t_ready_request();
+    req.module   = ?m;
+    req.interner = ?itn;
+    val rc: bool = R.is_ok[bool, str](run(?req));
+    ir.dnit(?m);
+    if (rc) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.me.pipeline.run:rejects_a_request_missing_interner" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+    var rv: target.Target;
+
+    var req: PipelineRequest = t_ready_request();
+    req.module = ?m;
+    req.target  = ?rv;
+    val rc: bool = R.is_ok[bool, str](run(?req));
+    ir.dnit(?m);
+    if (rc) { ret 1; }
+    ret 0;
+}
+
 test "mach.lang.me.pipeline.loc:survives_mem2reg_constfold_dce" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -473,41 +345,35 @@ test "mach.lang.me.pipeline.loc:survives_mem2reg_constfold_dce" {
 
     val p0: value.Value = value.param(0, i64t);
 
-    # a promotable local: alloca + store(p0) + load. mem2reg removes all three and
-    # rewrites the load's uses to p0.
     val res_slot: R.Result[value.Value, str] = builder.emit_alloca(?bld, i64t, value.const_int(1, i64t));
     if (R.is_err[value.Value, str](res_slot)) { ir.dnit(?m); ret 1; }
     val slot: value.Value = R.unwrap_ok[value.Value, str](res_slot);
-    if (R.is_err[bool, str](builder.emit_store(?bld, p0, slot))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?bld, p0, slot))) { ir.dnit(?m); ret 1; }
     val res_load: R.Result[value.Value, str] = builder.emit_load(?bld, slot, i64t);
     if (R.is_err[value.Value, str](res_load)) { ir.dnit(?m); ret 1; }
     val x: value.Value = R.unwrap_ok[value.Value, str](res_load);
 
-    # a constant expression constfold collapses to 5, then propagates into the add.
     val res_k: R.Result[value.Value, str] = builder.emit_add(?bld, value.const_int(2, i64t), value.const_int(3, i64t));
     if (R.is_err[value.Value, str](res_k)) { ir.dnit(?m); ret 1; }
     val k: value.Value = R.unwrap_ok[value.Value, str](res_k);
 
-    # the surviving instruction, stamped with a distinctive location.
     builder.set_loc(?bld, source.loc(9, 500));
     val res_s: R.Result[value.Value, str] = builder.emit_add(?bld, x, k);
     if (R.is_err[value.Value, str](res_s)) { ir.dnit(?m); ret 1; }
     val s: value.Value = R.unwrap_ok[value.Value, str](res_s);
     val s_id: id.InstructionId = s.data.instr;
 
-    if (R.is_err[bool, str](builder.emit_ret(?bld, s))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, s))) { ir.dnit(?m); ret 1; }
 
     if (R.is_err[bool, str](mem2reg.run(?m)))   { ir.dnit(?m); ret 1; }
     if (R.is_err[bool, str](constfold.run(?m))) { ir.dnit(?m); ret 1; }
     if (R.is_err[bool, str](dce.run(?m)))       { ir.dnit(?m); ret 1; }
 
-    # the add survived with its opcode and its exact source location.
     val surviving: *instruction.Instruction = ?fn.instrs[s_id::u32];
     if (surviving.kind != instruction.OP_ADD)   { ir.dnit(?m); ret 1; }
     if (surviving.loc.file != 9)                { ir.dnit(?m); ret 1; }
     if (surviving.loc.offset != 500)            { ir.dnit(?m); ret 1; }
 
-    # and the passes really ran: operand 0 was promoted to p0, operand 1 folded to 5.
     if (surviving.operands[0].kind != value.VAL_PARAM)     { ir.dnit(?m); ret 1; }
     if (surviving.operands[0].data.param_ix != 0)          { ir.dnit(?m); ret 1; }
     if (surviving.operands[1].kind != value.VAL_CONST_INT) { ir.dnit(?m); ret 1; }
@@ -517,11 +383,6 @@ test "mach.lang.me.pipeline.loc:survives_mem2reg_constfold_dce" {
     ret 0;
 }
 
-# a debug value survives the always-on pipeline with a recovered expression: a
-# promoted local feeds `add x, 4` bound by a dbg-value and used nowhere else, so dce
-# drops the add and salvages the dbg-value onto the promoted parameter with a +4
-# recovery step. this is the value-tracking invariant #1696 adds on top of the loc
-# invariant above -- verified by IR inspection, not a textual dump
 test "mach.lang.me.pipeline.dbg:salvages_folded_add_to_expression" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -545,36 +406,32 @@ test "mach.lang.me.pipeline.dbg:salvages_folded_add_to_expression" {
 
     val p0: value.Value = value.param(0, i64t);
 
-    # a promotable local: alloca + store(p0) + load. mem2reg rewrites the load to p0.
     val res_slot: R.Result[value.Value, str] = builder.emit_alloca(?bld, i64t, value.const_int(1, i64t));
     if (R.is_err[value.Value, str](res_slot)) { ir.dnit(?m); ret 1; }
     val slot: value.Value = R.unwrap_ok[value.Value, str](res_slot);
-    if (R.is_err[bool, str](builder.emit_store(?bld, p0, slot))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?bld, p0, slot))) { ir.dnit(?m); ret 1; }
     val res_load: R.Result[value.Value, str] = builder.emit_load(?bld, slot, i64t);
     if (R.is_err[value.Value, str](res_load)) { ir.dnit(?m); ret 1; }
     val x: value.Value = R.unwrap_ok[value.Value, str](res_load);
 
-    # x + 4, tracked by a debug value and used by nothing else, so dce drops it.
     val res_s: R.Result[value.Value, str] = builder.emit_add(?bld, x, value.const_int(4, i64t));
     if (R.is_err[value.Value, str](res_s)) { ir.dnit(?m); ret 1; }
     val s: value.Value = R.unwrap_ok[value.Value, str](res_s);
-    if (R.is_err[bool, str](builder.emit_dbg_value(?bld, s, intern.STR_NIL, i64t, semtype.TYPE_NIL, false, 0))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_dbg_value(?bld, s, intern.STR_NIL, i64t, semtype.TYPE_NIL, false, 0))) { ir.dnit(?m); ret 1; }
     val dbg_id: id.InstructionId = (fn.instr_len - 1)::id.InstructionId;
 
-    if (R.is_err[bool, str](builder.emit_ret(?bld, p0))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, p0))) { ir.dnit(?m); ret 1; }
 
     if (R.is_err[bool, str](mem2reg.run(?m)))   { ir.dnit(?m); ret 1; }
     if (R.is_err[bool, str](constfold.run(?m))) { ir.dnit(?m); ret 1; }
     if (R.is_err[bool, str](dce.run(?m)))       { ir.dnit(?m); ret 1; }
 
-    # the debug value now binds the promoted parameter directly...
     val dbg: *instruction.Instruction = ?fn.instrs[dbg_id::u32];
     if (dbg.kind != instruction.OP_DBG_VALUE)    { ir.dnit(?m); ret 1; }
     if (dbg.operand_count != 1)                  { ir.dnit(?m); ret 1; }
     if (dbg.operands[0].kind != value.VAL_PARAM) { ir.dnit(?m); ret 1; }
     if (dbg.operands[0].data.param_ix != 0)      { ir.dnit(?m); ret 1; }
 
-    # ...with a +4 recovery expression pooled for it.
     val eid: ir.DbgExprId = ir.dbg_expr_id(fn, dbg_id);
     if (eid == ir.DBG_EXPR_IDENTITY)             { ir.dnit(?m); ret 1; }
     val opt: O.Option[*ir.DbgExpr] = ir.dbg_expr_get(fn, eid);
@@ -588,10 +445,6 @@ test "mach.lang.me.pipeline.dbg:salvages_folded_add_to_expression" {
     ret 0;
 }
 
-# an unrecoverable defining instruction degrades to no location: `mul x, 3` bound by
-# a dbg-value and used nowhere else is dropped by dce, and since a multiply is not a
-# constant offset the dbg-value's operand becomes the null idiom (optimized out)
-# rather than a stale value, and no expression is pooled
 test "mach.lang.me.pipeline.dbg:marks_unrecoverable_optimized_out" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -618,25 +471,23 @@ test "mach.lang.me.pipeline.dbg:marks_unrecoverable_optimized_out" {
     val res_slot: R.Result[value.Value, str] = builder.emit_alloca(?bld, i64t, value.const_int(1, i64t));
     if (R.is_err[value.Value, str](res_slot)) { ir.dnit(?m); ret 1; }
     val slot: value.Value = R.unwrap_ok[value.Value, str](res_slot);
-    if (R.is_err[bool, str](builder.emit_store(?bld, p0, slot))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?bld, p0, slot))) { ir.dnit(?m); ret 1; }
     val res_load: R.Result[value.Value, str] = builder.emit_load(?bld, slot, i64t);
     if (R.is_err[value.Value, str](res_load)) { ir.dnit(?m); ret 1; }
     val x: value.Value = R.unwrap_ok[value.Value, str](res_load);
 
-    # x * 3 is not a constant offset of a single value, so it is unrecoverable.
     val res_s: R.Result[value.Value, str] = builder.emit_mul(?bld, x, value.const_int(3, i64t));
     if (R.is_err[value.Value, str](res_s)) { ir.dnit(?m); ret 1; }
     val s: value.Value = R.unwrap_ok[value.Value, str](res_s);
-    if (R.is_err[bool, str](builder.emit_dbg_value(?bld, s, intern.STR_NIL, i64t, semtype.TYPE_NIL, false, 0))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_dbg_value(?bld, s, intern.STR_NIL, i64t, semtype.TYPE_NIL, false, 0))) { ir.dnit(?m); ret 1; }
     val dbg_id: id.InstructionId = (fn.instr_len - 1)::id.InstructionId;
 
-    if (R.is_err[bool, str](builder.emit_ret(?bld, p0))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, p0))) { ir.dnit(?m); ret 1; }
 
     if (R.is_err[bool, str](mem2reg.run(?m)))   { ir.dnit(?m); ret 1; }
     if (R.is_err[bool, str](constfold.run(?m))) { ir.dnit(?m); ret 1; }
     if (R.is_err[bool, str](dce.run(?m)))       { ir.dnit(?m); ret 1; }
 
-    # the debug value is optimized out: a null operand, no pooled expression.
     val dbg: *instruction.Instruction = ?fn.instrs[dbg_id::u32];
     if (dbg.kind != instruction.OP_DBG_VALUE)          { ir.dnit(?m); ret 1; }
     if (dbg.operand_count != 1)                        { ir.dnit(?m); ret 1; }
@@ -647,10 +498,6 @@ test "mach.lang.me.pipeline.dbg:marks_unrecoverable_optimized_out" {
     ret 0;
 }
 
-# many dbg-values salvaged in one function grow the expression pool past its initial
-# capacity: sixteen `add p0, k` values, each bound by a debug value and used nowhere
-# else, are all dropped by dce and each rebased onto p0 with a +k expression. this
-# exercises the pool's geometric growth (a real function has many tracked locals)
 test "mach.lang.me.pipeline.dbg:salvage_grows_expression_pool" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -674,25 +521,23 @@ test "mach.lang.me.pipeline.dbg:salvage_grows_expression_pool" {
 
     val p0: value.Value = value.param(0, i64t);
 
-    # sixteen distinct `p0 + k` values, each tracked by a debug value and dead.
     var first_dbg: u32 = 0;
     var k: u64 = 1;
     for (k <= 16) {
         val res_s: R.Result[value.Value, str] = builder.emit_add(?bld, p0, value.const_int(k, i64t));
         if (R.is_err[value.Value, str](res_s)) { ir.dnit(?m); ret 1; }
         val s: value.Value = R.unwrap_ok[value.Value, str](res_s);
-        if (R.is_err[bool, str](builder.emit_dbg_value(?bld, s, intern.STR_NIL, i64t, semtype.TYPE_NIL, false, 0))) { ir.dnit(?m); ret 1; }
+        if (R.is_err[R.Void, str](builder.emit_dbg_value(?bld, s, intern.STR_NIL, i64t, semtype.TYPE_NIL, false, 0))) { ir.dnit(?m); ret 1; }
         if (k == 1) { first_dbg = fn.instr_len - 1; }
         k = k + 1;
     }
 
-    if (R.is_err[bool, str](builder.emit_ret(?bld, p0))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, p0))) { ir.dnit(?m); ret 1; }
 
     if (R.is_err[bool, str](mem2reg.run(?m)))   { ir.dnit(?m); ret 1; }
     if (R.is_err[bool, str](constfold.run(?m))) { ir.dnit(?m); ret 1; }
     if (R.is_err[bool, str](dce.run(?m)))       { ir.dnit(?m); ret 1; }
 
-    # the first debug value binds p0 with a +1 expression (the pool survived growth).
     val dbg_id: id.InstructionId = first_dbg::id.InstructionId;
     val dbg: *instruction.Instruction = ?fn.instrs[dbg_id::u32];
     if (dbg.kind != instruction.OP_DBG_VALUE)    { ir.dnit(?m); ret 1; }
@@ -710,12 +555,6 @@ test "mach.lang.me.pipeline.dbg:salvage_grows_expression_pool" {
     ret 0;
 }
 
-# #2017: the single SIMD gate in the pipeline over #2016's shared detection. On an
-# incapable target under `require`, a live would-scalarize vector operator is a
-# precise build error naming the op, function, and arch (the gate short-circuits
-# before exit verification); a vectorless module proceeds cleanly under `require`.
-# Inert on a capable target (the `has_v128` dispatch guard) is exercised end-to-end
-# by the driver build path.
 test "mach.lang.me.pipeline.run:simd_require_gate" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -723,7 +562,8 @@ test "mach.lang.me.pipeline.run:simd_require_gate" {
     var code: i32 = 0;
 
     var reg: target.TargetRegistry = target.registry_init();
-    if (R.is_err[bool, str](target.register_all(?reg))) { intern.dnit(?itn); ret 1; }
+    fin { target.registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](target.register_all(?reg, target_testing.debug_descriptor))) { intern.dnit(?itn); ret 1; }
     val trr: R.Result[resolved.Target, str] = target.select(?reg, "riscv64", "linux", "lp64d");
     if (R.is_err[resolved.Target, str](trr)) { intern.dnit(?itn); ret 1; }
     var rv: resolved.Target = R.unwrap_ok[resolved.Target, str](trr);
@@ -732,7 +572,6 @@ test "mach.lang.me.pipeline.run:simd_require_gate" {
     if (R.is_err[intern.StrId, str](rfn)) { intern.dnit(?itn); ret 1; }
     val kname: intern.StrId = R.unwrap_ok[intern.StrId, str](rfn);
 
-    # module 1: a live vector add in 'kernel' (returned, so dce keeps it)
     val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
     if (R.is_err[ir.Module, str](rm)) { intern.dnit(?itn); ret 1; }
     var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
@@ -751,10 +590,18 @@ test "mach.lang.me.pipeline.run:simd_require_gate" {
     builder.set_block(?b, R.unwrap_ok[id.BlockId, str](rb));
     val radd: R.Result[value.Value, str] = builder.emit_add(?b, value.param(0, vec), value.param(1, vec));
     if (R.is_err[value.Value, str](radd)) { code = 1; }
-    or { if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](radd)))) { code = 1; } }
+    or { if (R.is_err[R.Void, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](radd)))) { code = 1; } }
 
-    # require + incapable + vector -> a precise error naming op, function, and arch
-    val e1: R.Result[bool, str] = run(?m, ?rv, OPT_DEBUG, false, true, true, false, ?itn, nil);
+    var preq1: PipelineRequest;
+    preq1.module            = ?m;
+    preq1.target             = ?rv;
+    preq1.level               = OPT_DEBUG;
+    preq1.vectorize_enabled   = VectorizeEnabledOption{ v: true };
+    preq1.simd_require        = SimdRequireOption{ v: true };
+    preq1.float_reassoc       = FloatReassocOption{ v: false };
+    preq1.interner            = ?itn;
+    preq1.source_map          = nil;
+    val e1: R.Result[bool, str] = run(?preq1);
     if (R.is_ok[bool, str](e1)) { code = 1; }
     or {
         val msg: str = R.unwrap_err[bool, str](e1);
@@ -762,15 +609,10 @@ test "mach.lang.me.pipeline.run:simd_require_gate" {
         if (!str_contains(msg, "add"))               { code = 1; }
         if (!str_contains(msg, "kernel"))            { code = 1; }
         if (!str_contains(msg, "riscv64"))           { code = 1; }
-        # the SHAPE is part of the shortfall: the lane width because the same operation
-        # can pack at one width and scalarize at another (#2726), and the lane count
-        # because it can pack at one count and scalarize at another (#2749). naming the
-        # operation alone does not say what to change.
         if (!str_contains(msg, "4 lanes of 32 bits")) { code = 1; }
     }
     ir.dnit(?m);
 
-    # module 2: no vectors -> `require` proceeds cleanly through the exit verifier
     val rm2: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
     if (R.is_err[ir.Module, str](rm2)) { intern.dnit(?itn); ret 1; }
     var m2: ir.Module = R.unwrap_ok[ir.Module, str](rm2);
@@ -782,18 +624,19 @@ test "mach.lang.me.pipeline.run:simd_require_gate" {
     val rb2: R.Result[id.BlockId, str] = builder.new_block(?b2);
     if (R.is_err[id.BlockId, str](rb2)) { ir.dnit(?m2); intern.dnit(?itn); ret 1; }
     builder.set_block(?b2, R.unwrap_ok[id.BlockId, str](rb2));
-    if (R.is_err[bool, str](builder.emit_ret_void(?b2))) { code = 1; }
-    if (R.is_err[bool, str](run(?m2, ?rv, OPT_DEBUG, false, true, true, false, ?itn, nil))) { code = 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret_void(?b2))) { code = 1; }
+    var preq2: PipelineRequest;
+    preq2.module            = ?m2;
+    preq2.target             = ?rv;
+    preq2.level               = OPT_DEBUG;
+    preq2.vectorize_enabled   = VectorizeEnabledOption{ v: true };
+    preq2.simd_require        = SimdRequireOption{ v: true };
+    preq2.float_reassoc       = FloatReassocOption{ v: false };
+    preq2.interner            = ?itn;
+    preq2.source_map          = nil;
+    if (R.is_err[bool, str](run(?preq2))) { code = 1; }
     ir.dnit(?m2);
 
-    # A CAPABLE TARGET IS NOT EXEMPT (#2726). The lever used to be reachable only where
-    # `has_v128` was false, so a project that set `require` to refuse a silent scalar
-    # expansion was told nothing about the expansions x86-64 and aarch64 perform for
-    # the operations their ISAs do not pack. These three modules are the same i32x4
-    # multiply handed to the three shipping targets, and the verdicts differ only by
-    # what each target can encode: SSE2 has no PMULLD, NEON has MUL.4s, riscv64 has no
-    # vector unit. Asserting the aarch64 arm PASSES is what distinguishes a working
-    # authority from one that simply refuses everything.
     if (mul_require_refused(?alloc, ?itn, ?reg, "x86_64",  "sysv64") != 1) { code = 1; }
     if (mul_require_refused(?alloc, ?itn, ?reg, "riscv64", "lp64d")   != 1) { code = 1; }
     if (mul_require_refused(?alloc, ?itn, ?reg, "aarch64", "aapcs64") != 0) { code = 1; }
@@ -802,12 +645,6 @@ test "mach.lang.me.pipeline.run:simd_require_gate" {
     ret code;
 }
 
-# build a module holding one live `i32x4 * i32x4` in 'kernel', run the pipeline for
-# the named target under `simd = "require"`, and report whether it was refused
-#
-# 1 when the build is refused (the multiply realizes as scalar code there), 0 when it
-# is accepted (a packed form exists), and 2 on any setup failure so a broken setup can
-# never read as either verdict.
 fun mul_require_refused(alloc: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry, isa_name: str, abi_name: str) i32 {
     val trr: R.Result[resolved.Target, str] = target.select(reg, isa_name, "linux", abi_name);
     if (R.is_err[resolved.Target, str](trr)) { ret 2; }
@@ -836,10 +673,88 @@ fun mul_require_refused(alloc: *A.Allocator, itn: *intern.Interner, reg: *target
 
     val rmul: R.Result[value.Value, str] = builder.emit_mul(?b, value.param(0, vec), value.param(1, vec));
     if (R.is_err[value.Value, str](rmul)) { ir.dnit(?m); ret 2; }
-    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rmul)))) { ir.dnit(?m); ret 2; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rmul)))) { ir.dnit(?m); ret 2; }
 
-    val res: R.Result[bool, str] = run(?m, ?rv, OPT_DEBUG, false, true, true, false, itn, nil);
+    var preq3: PipelineRequest;
+    preq3.module            = ?m;
+    preq3.target             = ?rv;
+    preq3.level               = OPT_DEBUG;
+    preq3.vectorize_enabled   = VectorizeEnabledOption{ v: true };
+    preq3.simd_require        = SimdRequireOption{ v: true };
+    preq3.float_reassoc       = FloatReassocOption{ v: false };
+    preq3.interner            = itn;
+    preq3.source_map          = nil;
+    val changed_r: R.Result[bool, str] = run(?preq3);
     ir.dnit(?m);
-    if (R.is_err[bool, str](res)) { ret 1; }
+    if (R.is_err[bool, str](changed_r)) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.me.pipeline.run:reports_the_change_a_pass_made" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    fin { intern.dnit(?itn); }
+
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](target.register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+    val trr: R.Result[resolved.Target, str] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (R.is_err[resolved.Target, str](trr)) { ret 1; }
+    var rv: resolved.Target = R.unwrap_ok[resolved.Target, str](trr);
+
+    val rfn: R.Result[intern.StrId, str] = intern.intern(?itn, "f");
+    if (R.is_err[intern.StrId, str](rfn)) { ret 1; }
+    val fname: intern.StrId = R.unwrap_ok[intern.StrId, str](rfn);
+
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+    fin { ir.dnit(?m); }
+    val ri: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 32);
+    if (R.is_err[ir_type.IrTypeId, str](ri)) { ret 1; }
+    val i32_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ri);
+    val rfa: R.Result[u32, str] = ir.function_add(?m, fname, i32_ty, 0);
+    if (R.is_err[u32, str](rfa)) { ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rfa)];
+    var b: builder.Builder = builder.init(?m);
+    builder.set_function(?b, fn);
+    val rb: R.Result[id.BlockId, str] = builder.new_block(?b);
+    if (R.is_err[id.BlockId, str](rb)) { ret 1; }
+    builder.set_block(?b, R.unwrap_ok[id.BlockId, str](rb));
+    val radd: R.Result[value.Value, str] = builder.emit_add(?b,
+        value.const_int(2, i32_ty), value.const_int(3, i32_ty));
+    if (R.is_err[value.Value, str](radd)) { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](radd)))) { ret 1; }
+
+    var preq: PipelineRequest = t_ready_request();
+    preq.module   = ?m;
+    preq.target   = ?rv;
+    preq.interner = ?itn;
+    val e: R.Result[bool, str] = run(?preq);
+    if (R.is_err[bool, str](e))         { ret 1; }
+    if (!R.unwrap_ok[bool, str](e))     { ret 1; }
+
+    val rm2: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm2)) { ret 1; }
+    var m2: ir.Module = R.unwrap_ok[ir.Module, str](rm2);
+    fin { ir.dnit(?m2); }
+    val rfa2: R.Result[u32, str] = ir.function_add(?m2, fname, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rfa2)) { ret 1; }
+    val fn2: *ir.Function = ?m2.functions[R.unwrap_ok[u32, str](rfa2)];
+    var b2: builder.Builder = builder.init(?m2);
+    builder.set_function(?b2, fn2);
+    val rb2: R.Result[id.BlockId, str] = builder.new_block(?b2);
+    if (R.is_err[id.BlockId, str](rb2)) { ret 1; }
+    builder.set_block(?b2, R.unwrap_ok[id.BlockId, str](rb2));
+    if (R.is_err[R.Void, str](builder.emit_ret_void(?b2))) { ret 1; }
+
+    var preq2: PipelineRequest = t_ready_request();
+    preq2.module   = ?m2;
+    preq2.target   = ?rv;
+    preq2.interner = ?itn;
+    val e2: R.Result[bool, str] = run(?preq2);
+    if (R.is_err[bool, str](e2))      { ret 1; }
+    if (R.unwrap_ok[bool, str](e2))   { ret 1; }
     ret 0;
 }

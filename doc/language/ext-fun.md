@@ -95,7 +95,7 @@ log(fmt, c::i32, f::f64);    # correct
 An argument of 32 bits or wider passes as written: `i32`/`u32`, `i64`/`u64`, `f64`,
 any pointer, and a record or vector passed by value. A **secret** (`^T`) may not
 enter a variadic tail: the callee is foreign code that prints or logs the value, so
-it is an observation boundary — declassify with `:^` first.
+it is an observation boundary — declassify with `:>T` first.
 
 ### Per-target argument passing
 
@@ -428,12 +428,18 @@ are both included; a name that cannot be resolved is a hard error.
 
 ### Scope
 
-Loose `.o` relocatable objects and static `.a` archives are linked **statically**
-(a `.a` contributes every one of its member objects — all members are pulled, not
-just those satisfying an undefined symbol). A shared `.so`, `.dylib`, framework,
+Loose `.o` relocatable objects and static `.a` archives are linked **statically**.
+An archive contributes only the members that define a symbol left undefined by
+the objects and members before it, selected to a fixed point within that
+archive, so a vendored archive costs the binary exactly the members it uses (see
+[cli.md](../cli.md#static-vs-dynamic-resolution)). A shared `.so`, `.dylib`, framework,
 or `.dll` is a **dynamic** dependency: its format-specific canonical loader name
-is recorded and undefined `ext` functions become run-time imports. A static
-definition always wins over a same-named dynamic import.
+is recorded and undefined `ext` functions become run-time imports. A shared
+input is validated before it is recorded: a `.so` that is not a loadable ELF
+shared object for the selected architecture (a linker script, a
+foreign-architecture file) is refused (`'<file>' is not a loadable ELF shared
+object for the selected architecture`). A static definition always wins over a
+same-named dynamic import.
 
 ## See also
 

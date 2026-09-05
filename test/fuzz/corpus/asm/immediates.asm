@@ -1,0 +1,12 @@
+mov rax, 0
+mov rax, 9223372036854775807
+mov rax, -9223372036854775808
+mov rax, 18446744073709551615
+mov rax, 0xFFFFFFFFFFFFFFFF
+mov rax, 99999999999999999999999999999999
+mov rax, -0
+mov rax, +1
+mov rax, 0x
+mov rax, --1
+mov eax, 4294967296
+mov al, 256

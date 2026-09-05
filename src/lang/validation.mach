@@ -1,0 +1,1260 @@
+use std.allocator.page;
+use std.crypto.hash.sha256;
+use std.encoding.binary;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+use O: std.types.option;
+use R: std.types.result;
+
+use mach.subprocess;
+use cnc: std.sync.cancel;
+
+pub def ValidationGateResultKind: u8;
+
+pub val RESULT_PASS:                    ValidationGateResultKind = 0;
+pub val RESULT_SEMANTIC_MISMATCH:       ValidationGateResultKind = 1;
+pub val RESULT_UNSUPPORTED_INPUT:       ValidationGateResultKind = 2;
+pub val RESULT_TOOL_UNAVAILABLE:        ValidationGateResultKind = 3;
+pub val RESULT_INFRASTRUCTURE_FAILURE:  ValidationGateResultKind = 4;
+pub val RESULT_RESOURCE_EXHAUSTION:     ValidationGateResultKind = 5;
+pub val RESULT_INVALID_INJECTION:       ValidationGateResultKind = 6;
+
+pub def ValidationCause: u8;
+
+pub val CAUSE_PASS:                 ValidationCause = 0;
+pub val CAUSE_MISMATCH:             ValidationCause = 1;
+pub val CAUSE_UNSUPPORTED:          ValidationCause = 2;
+pub val CAUSE_TOOL_UNAVAILABLE:     ValidationCause = 3;
+pub val CAUSE_INVALID_INJECTOR:     ValidationCause = 4;
+pub val CAUSE_UNREACHED_INJECTION:  ValidationCause = 5;
+pub val CAUSE_ORACLE_TIMEOUT:       ValidationCause = 6;
+pub val CAUSE_ORACLE_OUTPUT_LIMIT:  ValidationCause = 7;
+pub val CAUSE_ORACLE_CANCELED:      ValidationCause = 8;
+pub val CAUSE_ORACLE_SPAWN_FAILURE: ValidationCause = 9;
+pub val CAUSE_ORACLE_CAPTURE:       ValidationCause = 10;
+pub val CAUSE_ORACLE_SIGNAL:        ValidationCause = 11;
+pub val CAUSE_ORACLE_EXIT:          ValidationCause = 12;
+pub val CAUSE_INVALID_TERMINAL:     ValidationCause = 13;
+pub val CAUSE_MALFORMED_OUTPUT:     ValidationCause = 14;
+
+pub rec ValidationGateId {
+    namespace: str;
+    name:      str;
+    version:   u32;
+}
+
+pub rec ValidationGateResult {
+    kind:            ValidationGateResultKind;
+    cause:           ValidationCause;
+    detail_identity: str;
+}
+
+pub fun gate_id_valid(id: *ValidationGateId) bool {
+    ret id != nil && str_len(id.namespace) > 0 && str_len(id.name) > 0 && id.version > 0;
+}
+
+pub fun gate_result_valid(r: *ValidationGateResult) bool {
+    if (r == nil || r.kind > RESULT_INVALID_INJECTION || r.cause > CAUSE_MALFORMED_OUTPUT) {
+        ret false;
+    }
+    if (r.kind == RESULT_PASS) { ret r.cause == CAUSE_PASS; }
+    if (r.kind == RESULT_SEMANTIC_MISMATCH) { ret r.cause == CAUSE_MISMATCH; }
+    if (r.kind == RESULT_UNSUPPORTED_INPUT) { ret r.cause == CAUSE_UNSUPPORTED; }
+    if (r.kind == RESULT_TOOL_UNAVAILABLE) { ret r.cause == CAUSE_TOOL_UNAVAILABLE; }
+    if (r.kind == RESULT_RESOURCE_EXHAUSTION) {
+        ret r.cause == CAUSE_ORACLE_TIMEOUT || r.cause == CAUSE_ORACLE_OUTPUT_LIMIT;
+    }
+    if (r.kind == RESULT_INVALID_INJECTION) { ret r.cause == CAUSE_UNREACHED_INJECTION; }
+    ret r.cause == CAUSE_INVALID_INJECTOR || r.cause == CAUSE_ORACLE_CANCELED
+        || r.cause == CAUSE_ORACLE_SPAWN_FAILURE || r.cause == CAUSE_ORACLE_CAPTURE
+        || r.cause == CAUSE_ORACLE_SIGNAL || r.cause == CAUSE_ORACLE_EXIT
+        || r.cause == CAUSE_INVALID_TERMINAL || r.cause == CAUSE_MALFORMED_OUTPUT;
+}
+
+pub fun gate_result(kind: ValidationGateResultKind, cause: ValidationCause,
+                    detail_identity: str) ValidationGateResult {
+    ret ValidationGateResult{kind: kind, cause: cause, detail_identity: detail_identity};
+}
+
+pub def InjectionDomain: u8;
+
+pub val INJECTION_ALLOCATION: InjectionDomain = 0;
+pub val INJECTION_READ:       InjectionDomain = 1;
+pub val INJECTION_WRITE:      InjectionDomain = 2;
+pub val INJECTION_CLOCK:      InjectionDomain = 3;
+pub val INJECTION_SCHEDULE:   InjectionDomain = 4;
+
+pub def InjectionEffect: u8;
+
+pub val INJECT_FAIL:        InjectionEffect = 0;
+pub val INJECT_SHORT:       InjectionEffect = 1;
+pub val INJECT_INTERRUPTED: InjectionEffect = 2;
+
+pub rec Injection {
+    domain:      InjectionDomain;
+    effect:      InjectionEffect;
+    ordinal:     u64;
+    observed:    u64;
+    short_limit: usize;
+    reached:     bool;
+    valid:       bool;
+}
+
+pub fun injection(domain: InjectionDomain, effect: InjectionEffect,
+                  ordinal: u64, short_limit: usize) Injection {
+    var valid: bool = ordinal > 0 && domain <= INJECTION_SCHEDULE && effect <= INJECT_INTERRUPTED;
+    if (effect == INJECT_SHORT && domain != INJECTION_READ && domain != INJECTION_WRITE) {
+        valid = false;
+    }
+    if (effect == INJECT_INTERRUPTED && domain != INJECTION_READ && domain != INJECTION_WRITE) {
+        valid = false;
+    }
+    ret Injection{
+        domain: domain, effect: effect, ordinal: ordinal, observed: 0,
+        short_limit: short_limit, reached: false, valid: valid,
+    };
+}
+
+pub fun injection_hit(i: *Injection, domain: InjectionDomain) bool {
+    if (i == nil || !i.valid || domain != i.domain) {
+        if (i != nil) { i.valid = false; }
+        ret false;
+    }
+    i.observed = i.observed + 1;
+    if (i.observed == i.ordinal) {
+        i.reached = true;
+        ret true;
+    }
+    ret false;
+}
+
+pub fun injection_result(i: *Injection) ValidationGateResult {
+    if (i == nil || !i.valid) {
+        ret gate_result(RESULT_INFRASTRUCTURE_FAILURE, CAUSE_INVALID_INJECTOR, "invalid-injector");
+    }
+    if (!i.reached) {
+        ret gate_result(RESULT_INVALID_INJECTION, CAUSE_UNREACHED_INJECTION, "unreached-injection");
+    }
+    ret gate_result(RESULT_PASS, CAUSE_PASS, "reached-injection");
+}
+
+pub def IoAttemptKind: u8;
+
+pub val IO_COMPLETE:    IoAttemptKind = 0;
+pub val IO_SHORT:       IoAttemptKind = 1;
+pub val IO_INTERRUPTED: IoAttemptKind = 2;
+pub val IO_FAILED:      IoAttemptKind = 3;
+
+pub rec IoAttempt {
+    kind:  IoAttemptKind;
+    bytes: usize;
+}
+
+pub fun io_attempt(i: *Injection, domain: InjectionDomain, requested: usize) IoAttempt {
+    if (i == nil || (domain != INJECTION_READ && domain != INJECTION_WRITE)) {
+        if (i != nil) { i.valid = false; }
+        ret IoAttempt{kind: IO_FAILED, bytes: 0};
+    }
+    if (!injection_hit(i, domain)) { ret IoAttempt{kind: IO_COMPLETE, bytes: requested}; }
+    if (i.effect == INJECT_FAIL) { ret IoAttempt{kind: IO_FAILED, bytes: 0}; }
+    if (i.effect == INJECT_INTERRUPTED) { ret IoAttempt{kind: IO_INTERRUPTED, bytes: 0}; }
+    if (requested == 0) {
+        i.valid = false;
+        ret IoAttempt{kind: IO_FAILED, bytes: 0};
+    }
+    var n: usize = i.short_limit;
+    if (n >= requested) { n = requested - 1; }
+    ret IoAttempt{kind: IO_SHORT, bytes: n};
+}
+
+pub rec ControlledClock {
+    now_ns: u64;
+    valid:  bool;
+}
+
+pub rec Deadline {
+    at_ns: u64;
+    valid: bool;
+}
+
+pub fun clock(start_ns: u64) ControlledClock {
+    ret ControlledClock{now_ns: start_ns, valid: true};
+}
+
+pub fun clock_set(c: *ControlledClock, now_ns: u64) bool {
+    if (c == nil || !c.valid || now_ns < c.now_ns) {
+        if (c != nil) { c.valid = false; }
+        ret false;
+    }
+    c.now_ns = now_ns;
+    ret true;
+}
+
+pub fun clock_advance(c: *ControlledClock, elapsed_ns: u64) bool {
+    if (c == nil || !c.valid || c.now_ns + elapsed_ns < c.now_ns) {
+        if (c != nil) { c.valid = false; }
+        ret false;
+    }
+    c.now_ns = c.now_ns + elapsed_ns;
+    ret true;
+}
+
+pub fun deadline(c: *ControlledClock, budget_ns: u64) Deadline {
+    if (c == nil || !c.valid || c.now_ns + budget_ns < c.now_ns) {
+        ret Deadline{at_ns: 0, valid: false};
+    }
+    ret Deadline{at_ns: c.now_ns + budget_ns, valid: true};
+}
+
+pub fun deadline_expired(c: *ControlledClock, d: *Deadline) bool {
+    if (c == nil || d == nil || !c.valid || !d.valid) { ret true; }
+    ret c.now_ns >= d.at_ns;
+}
+
+pub rec SeedControl {
+    initial: u64;
+    state:   u64;
+    draws:   u64;
+}
+
+pub fun seed_control(seed: u64) SeedControl {
+    ret SeedControl{initial: seed, state: seed, draws: 0};
+}
+
+pub fun seed_next(s: *SeedControl) u64 {
+    s.state = s.state * 6364136223846793005 + 1442695040888963407;
+    s.draws = s.draws + 1;
+    var z: u64 = s.state;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EB;
+    ret z ^ (z >> 31);
+}
+
+pub rec BoundedSchedule {
+    seed:      SeedControl;
+    limit:     u64;
+    steps:     u64;
+    exhausted: bool;
+    valid:     bool;
+}
+
+pub fun bounded_schedule(seed: u64, limit: u64) BoundedSchedule {
+    ret BoundedSchedule{
+        seed: seed_control(seed), limit: limit, steps: 0,
+        exhausted: false, valid: limit > 0,
+    };
+}
+
+pub fun schedule_next(s: *BoundedSchedule, choices: u32, selected: *u32) bool {
+    if (s == nil || selected == nil || !s.valid || choices == 0) {
+        if (s != nil) { s.valid = false; }
+        ret false;
+    }
+    if (s.steps >= s.limit) {
+        s.exhausted = true;
+        ret false;
+    }
+    @selected = (seed_next(?s.seed) % choices::u64)::u32;
+    s.steps = s.steps + 1;
+    ret true;
+}
+
+pub rec Replay {
+    choices:   *u32;
+    count:     usize;
+    cursor:    usize;
+    exhausted: bool;
+    mismatch:  bool;
+    valid:     bool;
+}
+
+pub fun replay(choices: *u32, count: usize) Replay {
+    ret Replay{
+        choices: choices, count: count, cursor: 0, exhausted: false,
+        mismatch: false, valid: choices != nil || count == 0,
+    };
+}
+
+pub fun replay_next(r: *Replay, bound: u32, selected: *u32) bool {
+    if (r == nil || selected == nil || !r.valid || bound == 0) {
+        if (r != nil) { r.valid = false; }
+        ret false;
+    }
+    if (r.cursor >= r.count) {
+        r.exhausted = true;
+        ret false;
+    }
+    val choice: u32 = r.choices[r.cursor];
+    r.cursor = r.cursor + 1;
+    if (choice >= bound) {
+        r.mismatch = true;
+        ret false;
+    }
+    @selected = choice;
+    ret true;
+}
+
+pub fun replay_exact(r: *Replay) bool {
+    ret r != nil && r.valid && !r.exhausted && !r.mismatch && r.cursor == r.count;
+}
+
+pub rec Minimizer {
+    low:       u64;
+    high:      u64;
+    candidate: u64;
+    attempts:  u64;
+    limit:     u64;
+    waiting:   bool;
+    exhausted: bool;
+    valid:     bool;
+}
+
+pub fun minimizer(failing_value: u64, limit: u64) Minimizer {
+    ret Minimizer{
+        low: 0, high: failing_value, candidate: failing_value,
+        attempts: 0, limit: limit, waiting: false,
+        exhausted: false, valid: limit > 0,
+    };
+}
+
+pub fun minimize_next(m: *Minimizer, candidate: *u64) bool {
+    if (m == nil || candidate == nil || !m.valid || m.waiting) {
+        if (m != nil) { m.valid = false; }
+        ret false;
+    }
+    if (m.low >= m.high) { ret false; }
+    if (m.attempts >= m.limit) {
+        m.exhausted = true;
+        ret false;
+    }
+    m.candidate = m.low + (m.high - m.low) / 2;
+    m.attempts = m.attempts + 1;
+    m.waiting = true;
+    @candidate = m.candidate;
+    ret true;
+}
+
+pub fun minimize_observe(m: *Minimizer, still_fails: bool) bool {
+    if (m == nil || !m.valid || !m.waiting) {
+        if (m != nil) { m.valid = false; }
+        ret false;
+    }
+    if (still_fails) { m.high = m.candidate; }
+    or { m.low = m.candidate + 1; }
+    m.waiting = false;
+    ret true;
+}
+
+pub fun minimized_value(m: *Minimizer) u64 {
+    if (m == nil) { ret 0; }
+    ret m.high;
+}
+
+pub rec ResourceLimits {
+    time_ns:     u64;
+    output_bytes: u64;
+    steps:       u64;
+}
+
+pub rec OracleProfile {
+    adapter_version:     u32;
+    tool_identity:       str;
+    tool_version:        str;
+    invocation_identity: str;
+    environment_identity: str;
+    input_identity:      str;
+}
+
+pub rec OracleInput {
+    profile:         OracleProfile;
+    limits:          ResourceLimits;
+    tool_available:  bool;
+    supported:       bool;
+    requested:       cnc.Reason;
+    terminal:        subprocess.SubprocessTerminal;
+    capture:         subprocess.CaptureIoResult;
+    parsed:          bool;
+    matches:         bool;
+    output_identity: str;
+}
+
+pub rec OracleObservation {
+    profile:         OracleProfile;
+    limits:          ResourceLimits;
+    tool_available:  bool;
+    supported:       bool;
+    requested:       cnc.Reason;
+    terminal:        subprocess.SubprocessTerminal;
+    capture:         subprocess.CaptureIoResult;
+    parsed:          bool;
+    matches:         bool;
+    output_identity: str;
+    result:          ValidationGateResult;
+}
+
+fun oracle_result(i: *OracleInput) ValidationGateResult {
+    if (!i.supported) { ret gate_result(RESULT_UNSUPPORTED_INPUT, CAUSE_UNSUPPORTED, "unsupported-input"); }
+    if (!i.tool_available) { ret gate_result(RESULT_TOOL_UNAVAILABLE, CAUSE_TOOL_UNAVAILABLE, "tool-unavailable"); }
+    if (i.terminal.kind == subprocess.STATE_SPAWN_FAILURE) {
+        ret gate_result(RESULT_INFRASTRUCTURE_FAILURE, CAUSE_ORACLE_SPAWN_FAILURE, "oracle-spawn-failed");
+    }
+    if (i.requested == cnc.TIMED_OUT) {
+        ret gate_result(RESULT_RESOURCE_EXHAUSTION, CAUSE_ORACLE_TIMEOUT, "oracle-timeout");
+    }
+    if (i.requested == cnc.CANCELLED) {
+        ret gate_result(RESULT_INFRASTRUCTURE_FAILURE, CAUSE_ORACLE_CANCELED, "oracle-canceled");
+    }
+    if (i.requested != cnc.ACTIVE) {
+        ret gate_result(RESULT_INFRASTRUCTURE_FAILURE, CAUSE_INVALID_TERMINAL, "invalid-lifecycle-request");
+    }
+    if (i.capture.truncated) {
+        ret gate_result(RESULT_RESOURCE_EXHAUSTION, CAUSE_ORACLE_OUTPUT_LIMIT, "oracle-output-limit");
+    }
+    if (i.capture.read_failed || i.capture.write_failed || i.capture.close_failed
+        || i.capture.short_read || !i.capture.closed || !i.capture.owned) {
+        ret gate_result(RESULT_INFRASTRUCTURE_FAILURE, CAUSE_ORACLE_CAPTURE, "oracle-capture-failed");
+    }
+    if (i.terminal.kind == subprocess.STATE_SIGNALED) {
+        ret gate_result(RESULT_INFRASTRUCTURE_FAILURE, CAUSE_ORACLE_SIGNAL, "oracle-signaled");
+    }
+    if (i.terminal.kind != subprocess.STATE_EXITED) {
+        ret gate_result(RESULT_INFRASTRUCTURE_FAILURE, CAUSE_INVALID_TERMINAL, "invalid-terminal-state");
+    }
+    if (i.terminal.code != 0) {
+        ret gate_result(RESULT_INFRASTRUCTURE_FAILURE, CAUSE_ORACLE_EXIT, "oracle-nonzero-exit");
+    }
+    if (!i.parsed) { ret gate_result(RESULT_INFRASTRUCTURE_FAILURE, CAUSE_MALFORMED_OUTPUT, "malformed-oracle-output"); }
+    if (!i.matches) { ret gate_result(RESULT_SEMANTIC_MISMATCH, CAUSE_MISMATCH, "semantic-mismatch"); }
+    ret gate_result(RESULT_PASS, CAUSE_PASS, "oracle-pass");
+}
+
+pub fun observe_oracle(i: *OracleInput) OracleObservation {
+    ret OracleObservation{
+        profile: i.profile, limits: i.limits,
+        tool_available: i.tool_available, supported: i.supported,
+        requested: i.requested, terminal: i.terminal, capture: i.capture,
+        parsed: i.parsed, matches: i.matches,
+        output_identity: i.output_identity, result: oracle_result(i),
+    };
+}
+
+fun complete_capture() subprocess.CaptureIoResult {
+    ret subprocess.CaptureIoResult{
+        bytes: 4, truncated: false, short_read: false, read_failed: false,
+        write_failed: false, close_failed: false, closed: true, owned: true,
+    };
+}
+
+fun base_oracle() OracleInput {
+    ret OracleInput{
+        profile: OracleProfile{
+            adapter_version: 1, tool_identity: "tool-sha256", tool_version: "1.0",
+            invocation_identity: "argv-sha256", environment_identity: "env-sha256",
+            input_identity: "input-sha256",
+        },
+        limits: ResourceLimits{time_ns: 100, output_bytes: 16, steps: 4},
+        tool_available: true, supported: true, requested: cnc.ACTIVE,
+        terminal: subprocess.SubprocessTerminal{kind: subprocess.STATE_EXITED, code: 0},
+        capture: complete_capture(), parsed: true, matches: true,
+        output_identity: "output-sha256",
+    };
+}
+
+pub val VALIDATION_EVIDENCE_SCHEMA: u16 = 2;
+
+pub rec Reproducibility {
+    seed:              u64;
+    schedule_identity: str;
+    replay_identity:   str;
+}
+
+pub rec EvidenceInput {
+    gate:                 ValidationGateId;
+    adapter_version:      u32;
+    input_identity:       str;
+    reproducibility:      Reproducibility;
+    injection:            Injection;
+    tool_identity:        str;
+    tool_version:         str;
+    invocation_identity:  str;
+    environment_identity: str;
+    limits:               ResourceLimits;
+    tool_available:       bool;
+    supported:            bool;
+    requested:            cnc.Reason;
+    terminal:             subprocess.SubprocessTerminal;
+    capture:              subprocess.CaptureIoResult;
+    parsed:               bool;
+    matches:              bool;
+    output_identity:      str;
+    observation_identity: str;
+    result:               ValidationGateResult;
+}
+
+pub rec ValidationEvidenceView {
+    schema:               u16;
+    gate:                 ValidationGateId;
+    adapter_version:      u32;
+    input_identity:       str;
+    reproducibility:      Reproducibility;
+    injection:            Injection;
+    tool_identity:        str;
+    tool_version:         str;
+    invocation_identity:  str;
+    environment_identity: str;
+    limits:               ResourceLimits;
+    tool_available:       bool;
+    supported:            bool;
+    requested:            cnc.Reason;
+    terminal:             subprocess.SubprocessTerminal;
+    capture:              subprocess.CaptureIoResult;
+    parsed:               bool;
+    matches:              bool;
+    output_identity:      str;
+    observation_identity: str;
+    result:               ValidationGateResult;
+}
+
+rec EvidenceStore {
+    alloc:    *A.Allocator;
+    data:     *u8;
+    len:      usize;
+    capacity: usize;
+}
+
+pub def ValidationEvidence: ptr;
+
+fun evidence_input_valid(i: *EvidenceInput) bool {
+    if (i == nil || !gate_id_valid(?i.gate) || !gate_result_valid(?i.result)) { ret false; }
+    if (i.adapter_version == 0 || str_len(i.input_identity) == 0) { ret false; }
+    if (str_len(i.reproducibility.schedule_identity) == 0
+        || str_len(i.reproducibility.replay_identity) == 0) { ret false; }
+    if (i.injection.domain > INJECTION_SCHEDULE || i.injection.effect > INJECT_INTERRUPTED) { ret false; }
+    if (!i.injection.valid) {
+        if (i.injection.reached || i.result.kind != RESULT_INFRASTRUCTURE_FAILURE
+            || i.result.cause != CAUSE_INVALID_INJECTOR) { ret false; }
+    }
+    or (i.injection.ordinal == 0) { ret false; }
+    if (i.injection.valid && i.injection.observed < i.injection.ordinal
+        && i.injection.reached) { ret false; }
+    if (i.injection.valid && i.injection.observed >= i.injection.ordinal
+        && !i.injection.reached) { ret false; }
+    if (i.injection.valid && i.injection.reached && i.result.kind == RESULT_INVALID_INJECTION) { ret false; }
+    if (i.injection.valid && !i.injection.reached && i.result.kind != RESULT_INVALID_INJECTION) { ret false; }
+    if (str_len(i.tool_identity) == 0 || str_len(i.tool_version) == 0
+        || str_len(i.invocation_identity) == 0 || str_len(i.environment_identity) == 0
+        || str_len(i.output_identity) == 0 || str_len(i.observation_identity) == 0
+        || str_len(i.result.detail_identity) == 0) { ret false; }
+    if (i.requested > cnc.INVALID || i.terminal.kind > subprocess.STATE_REAPED) { ret false; }
+    var oracle: OracleInput;
+    oracle.profile = OracleProfile{
+        adapter_version: i.adapter_version, tool_identity: i.tool_identity,
+        tool_version: i.tool_version, invocation_identity: i.invocation_identity,
+        environment_identity: i.environment_identity, input_identity: i.input_identity,
+    };
+    oracle.limits = i.limits;
+    oracle.tool_available = i.tool_available;
+    oracle.supported = i.supported;
+    oracle.requested = i.requested;
+    oracle.terminal = i.terminal;
+    oracle.capture = i.capture;
+    oracle.parsed = i.parsed;
+    oracle.matches = i.matches;
+    oracle.output_identity = i.output_identity;
+    val expected: ValidationGateResult = oracle_result(?oracle);
+    if (i.injection.valid && i.injection.reached
+        && (expected.kind != i.result.kind || expected.cause != i.result.cause)) { ret false; }
+    ret true;
+}
+
+fun ew_u8(e: *binary.Encoder, v: u8) bool {
+    ret R.is_ok[usize, str](binary.write_u8(e, v));
+}
+
+fun ew_u16(e: *binary.Encoder, v: u16) bool {
+    ret R.is_ok[usize, str](binary.write_u16(e, v));
+}
+
+fun ew_u32(e: *binary.Encoder, v: u32) bool {
+    ret R.is_ok[usize, str](binary.write_u32(e, v));
+}
+
+fun ew_u64(e: *binary.Encoder, v: u64) bool {
+    ret R.is_ok[usize, str](binary.write_u64(e, v));
+}
+
+fun ew_bool(e: *binary.Encoder, v: bool) bool {
+    var b: u8 = 0;
+    if (v) { b = 1; }
+    ret ew_u8(e, b);
+}
+
+fun ew_str(e: *binary.Encoder, v: str) bool {
+    ret R.is_ok[usize, str](binary.write_str(e, v));
+}
+
+fun ew_reason(e: *binary.Encoder, v: cnc.Reason) bool {
+    ret ew_u8(e, v::u8);
+}
+
+fun encode_evidence_payload(e: *binary.Encoder, i: *EvidenceInput) bool {
+    var ok: bool = true;
+    ok = ok && ew_u16(e, VALIDATION_EVIDENCE_SCHEMA);
+    ok = ok && ew_str(e, i.gate.namespace);
+    ok = ok && ew_str(e, i.gate.name);
+    ok = ok && ew_u32(e, i.gate.version);
+    ok = ok && ew_u32(e, i.adapter_version);
+    ok = ok && ew_str(e, i.input_identity);
+    ok = ok && ew_u64(e, i.reproducibility.seed);
+    ok = ok && ew_str(e, i.reproducibility.schedule_identity);
+    ok = ok && ew_str(e, i.reproducibility.replay_identity);
+    ok = ok && ew_u8(e, i.injection.domain);
+    ok = ok && ew_u8(e, i.injection.effect);
+    ok = ok && ew_u64(e, i.injection.ordinal);
+    ok = ok && ew_u64(e, i.injection.observed);
+    ok = ok && ew_u64(e, i.injection.short_limit::u64);
+    ok = ok && ew_bool(e, i.injection.reached);
+    ok = ok && ew_bool(e, i.injection.valid);
+    ok = ok && ew_str(e, i.tool_identity);
+    ok = ok && ew_str(e, i.tool_version);
+    ok = ok && ew_str(e, i.invocation_identity);
+    ok = ok && ew_str(e, i.environment_identity);
+    ok = ok && ew_u64(e, i.limits.time_ns);
+    ok = ok && ew_u64(e, i.limits.output_bytes);
+    ok = ok && ew_u64(e, i.limits.steps);
+    ok = ok && ew_bool(e, i.tool_available);
+    ok = ok && ew_bool(e, i.supported);
+    ok = ok && ew_reason(e, i.requested);
+    ok = ok && ew_u8(e, i.terminal.kind);
+    ok = ok && ew_u32(e, i.terminal.code::u32);
+    ok = ok && ew_u64(e, i.capture.bytes::u64);
+    ok = ok && ew_bool(e, i.capture.truncated);
+    ok = ok && ew_bool(e, i.capture.short_read);
+    ok = ok && ew_bool(e, i.capture.read_failed);
+    ok = ok && ew_bool(e, i.capture.write_failed);
+    ok = ok && ew_bool(e, i.capture.close_failed);
+    ok = ok && ew_bool(e, i.capture.closed);
+    ok = ok && ew_bool(e, i.capture.owned);
+    ok = ok && ew_bool(e, i.parsed);
+    ok = ok && ew_bool(e, i.matches);
+    ok = ok && ew_str(e, i.output_identity);
+    ok = ok && ew_str(e, i.observation_identity);
+    ok = ok && ew_u8(e, i.result.kind);
+    ok = ok && ew_u8(e, i.result.cause);
+    ok = ok && ew_str(e, i.result.detail_identity);
+    ret ok;
+}
+
+fun er_u8(d: *binary.Decoder, out: *u8) bool {
+    val r: R.Result[u8, str] = binary.read_u8(d);
+    if (R.is_err[u8, str](r)) { ret false; }
+    @out = R.unwrap_ok[u8, str](r);
+    ret true;
+}
+
+fun er_u16(d: *binary.Decoder, out: *u16) bool {
+    val r: R.Result[u16, str] = binary.read_u16(d);
+    if (R.is_err[u16, str](r)) { ret false; }
+    @out = R.unwrap_ok[u16, str](r);
+    ret true;
+}
+
+fun er_u32(d: *binary.Decoder, out: *u32) bool {
+    val r: R.Result[u32, str] = binary.read_u32(d);
+    if (R.is_err[u32, str](r)) { ret false; }
+    @out = R.unwrap_ok[u32, str](r);
+    ret true;
+}
+
+fun er_u64(d: *binary.Decoder, out: *u64) bool {
+    val r: R.Result[u64, str] = binary.read_u64(d);
+    if (R.is_err[u64, str](r)) { ret false; }
+    @out = R.unwrap_ok[u64, str](r);
+    ret true;
+}
+
+fun er_bool(d: *binary.Decoder, out: *bool) bool {
+    var b: u8 = 0;
+    if (!er_u8(d, ?b) || b > 1) { ret false; }
+    @out = b == 1;
+    ret true;
+}
+
+fun er_str(d: *binary.Decoder, out: *str) bool {
+    val r: R.Result[str, str] = binary.read_str(d);
+    if (R.is_err[str, str](r)) { ret false; }
+    @out = R.unwrap_ok[str, str](r);
+    ret true;
+}
+
+fun er_reason(d: *binary.Decoder, out: *cnc.Reason) bool {
+    var b: u8 = 0;
+    if (!er_u8(d, ?b)) { ret false; }
+    @out = b::i64;
+    ret true;
+}
+
+fun decode_evidence_payload(data: *u8, len: usize,
+                            out: *ValidationEvidenceView) R.Result[R.Void, str] {
+    var d: binary.Decoder = binary.decoder(data, len, binary.LITTLE);
+    if (!er_u16(?d, ?out.schema)) { ret R.err[R.Void, str]("truncated evidence schema"); }
+    if (out.schema != VALIDATION_EVIDENCE_SCHEMA) {
+        ret R.err[R.Void, str]("unsupported evidence schema");
+    }
+    if (!er_str(?d, ?out.gate.namespace) || !er_str(?d, ?out.gate.name)
+        || !er_u32(?d, ?out.gate.version) || !er_u32(?d, ?out.adapter_version)
+        || !er_str(?d, ?out.input_identity)
+        || !er_u64(?d, ?out.reproducibility.seed)
+        || !er_str(?d, ?out.reproducibility.schedule_identity)
+        || !er_str(?d, ?out.reproducibility.replay_identity)
+        || !er_u8(?d, ?out.injection.domain) || !er_u8(?d, ?out.injection.effect)
+        || !er_u64(?d, ?out.injection.ordinal) || !er_u64(?d, ?out.injection.observed)) {
+        ret R.err[R.Void, str]("truncated evidence identity");
+    }
+    var short_limit: u64 = 0;
+    if (!er_u64(?d, ?short_limit) || !er_bool(?d, ?out.injection.reached)
+        || !er_bool(?d, ?out.injection.valid)
+        || !er_str(?d, ?out.tool_identity) || !er_str(?d, ?out.tool_version)
+        || !er_str(?d, ?out.invocation_identity) || !er_str(?d, ?out.environment_identity)
+        || !er_u64(?d, ?out.limits.time_ns) || !er_u64(?d, ?out.limits.output_bytes)
+        || !er_u64(?d, ?out.limits.steps)
+        || !er_bool(?d, ?out.tool_available) || !er_bool(?d, ?out.supported)
+        || !er_reason(?d, ?out.requested)
+        || !er_u8(?d, ?out.terminal.kind)) {
+        ret R.err[R.Void, str]("truncated evidence profile");
+    }
+    if (short_limit::usize::u64 != short_limit) {
+        ret R.err[R.Void, str]("evidence short limit exceeds platform size");
+    }
+    out.injection.short_limit = short_limit::usize;
+    var code: u32 = 0;
+    var capture_bytes: u64 = 0;
+    if (!er_u32(?d, ?code) || !er_u64(?d, ?capture_bytes)
+        || !er_bool(?d, ?out.capture.truncated) || !er_bool(?d, ?out.capture.short_read)
+        || !er_bool(?d, ?out.capture.read_failed) || !er_bool(?d, ?out.capture.write_failed)
+        || !er_bool(?d, ?out.capture.close_failed) || !er_bool(?d, ?out.capture.closed)
+        || !er_bool(?d, ?out.capture.owned)
+        || !er_bool(?d, ?out.parsed) || !er_bool(?d, ?out.matches)
+        || !er_str(?d, ?out.output_identity)
+        || !er_str(?d, ?out.observation_identity) || !er_u8(?d, ?out.result.kind)
+        || !er_u8(?d, ?out.result.cause) || !er_str(?d, ?out.result.detail_identity)) {
+        ret R.err[R.Void, str]("truncated evidence observation");
+    }
+    if (capture_bytes::usize::u64 != capture_bytes) {
+        ret R.err[R.Void, str]("evidence capture size exceeds platform size");
+    }
+    out.terminal.code = code::i32;
+    out.capture.bytes = capture_bytes::usize;
+    if (binary.remaining(?d) != 0) { ret R.err[R.Void, str]("trailing evidence bytes"); }
+    var checked: EvidenceInput;
+    checked.gate = out.gate;
+    checked.adapter_version = out.adapter_version;
+    checked.input_identity = out.input_identity;
+    checked.reproducibility = out.reproducibility;
+    checked.injection = out.injection;
+    checked.tool_identity = out.tool_identity;
+    checked.tool_version = out.tool_version;
+    checked.invocation_identity = out.invocation_identity;
+    checked.environment_identity = out.environment_identity;
+    checked.limits = out.limits;
+    checked.tool_available = out.tool_available;
+    checked.supported = out.supported;
+    checked.requested = out.requested;
+    checked.terminal = out.terminal;
+    checked.capture = out.capture;
+    checked.parsed = out.parsed;
+    checked.matches = out.matches;
+    checked.output_identity = out.output_identity;
+    checked.observation_identity = out.observation_identity;
+    checked.result = out.result;
+    if (!evidence_input_valid(?checked)) { ret R.err[R.Void, str]("invalid evidence field"); }
+    ret R.ok_void[str]();
+}
+
+fun digest_equal(a: *u8, b: *u8) bool {
+    var different: u8 = 0;
+    var i: usize = 0;
+    for (i < sha256.DIGEST_SIZE) {
+        different = different | (a[i] ^ b[i]);
+        i = i + 1;
+    }
+    ret different == 0;
+}
+
+pub fun evidence_validate_bytes(data: *u8, len: usize,
+                                out: *ValidationEvidenceView) R.Result[R.Void, str] {
+    if (data == nil || out == nil || len < 42) { ret R.err[R.Void, str]("truncated evidence"); }
+    if (data[0] != 'M' || data[1] != 'A' || data[2] != 'C' || data[3] != 'H'
+        || data[4] != 'V' || data[5] != 'E' || data[6] != '0' || data[7] != '1') {
+        ret R.err[R.Void, str]("invalid evidence envelope");
+    }
+    val payload: *u8 = ?data[40];
+    val payload_len: usize = len - 40;
+    if (binary.get_uint(payload, 2, binary.LITTLE)::u16 != VALIDATION_EVIDENCE_SCHEMA) {
+        ret R.err[R.Void, str]("unsupported evidence schema");
+    }
+    var digest: [32]u8;
+    sha256.hash(payload, payload_len, ?digest[0]);
+    if (!digest_equal(?data[8], ?digest[0])) {
+        ret R.err[R.Void, str]("evidence content identity mismatch");
+    }
+    ret decode_evidence_payload(payload, payload_len, out);
+}
+
+pub fun evidence_build(a: *A.Allocator, input: *EvidenceInput) R.Result[ValidationEvidence, str] {
+    if (a == nil || !evidence_input_valid(input)) {
+        ret R.err[ValidationEvidence, str]("invalid evidence input");
+    }
+    var payload: binary.Encoder = binary.encoder(a, binary.LITTLE);
+    if (!encode_evidence_payload(?payload, input)) {
+        binary.encoder_dnit(?payload);
+        ret R.err[ValidationEvidence, str]("evidence allocation failed");
+    }
+    var digest: [32]u8;
+    sha256.hash(payload.data, payload.len, ?digest[0]);
+    var envelope: binary.Encoder = binary.encoder(a, binary.LITTLE);
+    var ok: bool = R.is_ok[usize, str](binary.write_bytes(?envelope, "MACHVE01"::*u8, 8));
+    ok = ok && R.is_ok[usize, str](binary.write_bytes(?envelope, ?digest[0], 32));
+    ok = ok && R.is_ok[usize, str](binary.write_bytes(?envelope, payload.data, payload.len));
+    binary.encoder_dnit(?payload);
+    if (!ok) {
+        binary.encoder_dnit(?envelope);
+        ret R.err[ValidationEvidence, str]("evidence allocation failed");
+    }
+    val sr: R.Result[*EvidenceStore, *u8] = A.allocate[EvidenceStore](a, 1);
+    if (R.is_err[*EvidenceStore, *u8](sr)) {
+        binary.encoder_dnit(?envelope);
+        ret R.err[ValidationEvidence, str]("evidence allocation failed");
+    }
+    val store: *EvidenceStore = R.unwrap_ok[*EvidenceStore, *u8](sr);
+    store.alloc = a;
+    store.data = envelope.data;
+    store.len = envelope.len;
+    store.capacity = envelope.cap;
+    envelope.data = nil;
+    envelope.len = 0;
+    envelope.cap = 0;
+    ret R.ok[ValidationEvidence, str](store::ptr);
+}
+
+pub fun evidence_open(a: *A.Allocator, data: *u8,
+                      len: usize) R.Result[ValidationEvidence, str] {
+    if (a == nil) { ret R.err[ValidationEvidence, str]("allocator is nil"); }
+    var view: ValidationEvidenceView;
+    val vr: R.Result[R.Void, str] = evidence_validate_bytes(data, len, ?view);
+    if (R.is_err[R.Void, str](vr)) {
+        ret R.err[ValidationEvidence, str](R.unwrap_err[R.Void, str](vr));
+    }
+    val br: R.Result[*u8, *u8] = A.allocate[u8](a, len);
+    if (R.is_err[*u8, *u8](br)) { ret R.err[ValidationEvidence, str]("evidence allocation failed"); }
+    val bytes: *u8 = R.unwrap_ok[*u8, *u8](br);
+    memory.copy[u8](bytes, data, len);
+    val sr: R.Result[*EvidenceStore, *u8] = A.allocate[EvidenceStore](a, 1);
+    if (R.is_err[*EvidenceStore, *u8](sr)) {
+        A.deallocate[u8](a, bytes, len);
+        ret R.err[ValidationEvidence, str]("evidence allocation failed");
+    }
+    val store: *EvidenceStore = R.unwrap_ok[*EvidenceStore, *u8](sr);
+    store.alloc = a;
+    store.data = bytes;
+    store.len = len;
+    store.capacity = len;
+    ret R.ok[ValidationEvidence, str](store::ptr);
+}
+
+pub fun evidence_copy(a: *A.Allocator, e: ValidationEvidence,
+                      len: *usize) R.Result[*u8, str] {
+    if (a == nil || e == nil || len == nil) { ret R.err[*u8, str]("invalid evidence copy"); }
+    val store: *EvidenceStore = e::*EvidenceStore;
+    val br: R.Result[*u8, *u8] = A.allocate[u8](a, store.len);
+    if (R.is_err[*u8, *u8](br)) { ret R.err[*u8, str]("evidence allocation failed"); }
+    val bytes: *u8 = R.unwrap_ok[*u8, *u8](br);
+    memory.copy[u8](bytes, store.data, store.len);
+    @len = store.len;
+    ret R.ok[*u8, str](bytes);
+}
+
+pub fun evidence_content_identity(e: ValidationEvidence, digest: *u8) bool {
+    if (e == nil || digest == nil) { ret false; }
+    val store: *EvidenceStore = e::*EvidenceStore;
+    var view: ValidationEvidenceView;
+    if (R.is_err[R.Void, str](evidence_validate_bytes(store.data, store.len, ?view))) { ret false; }
+    memory.copy[u8](digest, ?store.data[8], sha256.DIGEST_SIZE);
+    ret true;
+}
+
+pub fun evidence_release(e: *ValidationEvidence) R.Result[R.Void, str] {
+    if (e == nil || @e == nil) { ret R.ok_void[str](); }
+    val opaque: ValidationEvidence = @e;
+    val store: *EvidenceStore = opaque::*EvidenceStore;
+    val bytes: R.Result[bool, *u8] = A.deallocate[u8](store.alloc, store.data, store.capacity);
+    if (R.is_err[bool, *u8](bytes)) { ret R.err[R.Void, str]("evidence release failed"); }
+    val released: R.Result[bool, *u8] = A.deallocate[EvidenceStore](store.alloc, store, 1);
+    if (R.is_err[bool, *u8](released)) { ret R.err[R.Void, str]("evidence release failed"); }
+    @e = nil;
+    ret R.ok_void[str]();
+}
+
+fun evidence_input() EvidenceInput {
+    var oracle: OracleInput = base_oracle();
+    var reached: Injection = injection(INJECTION_READ, INJECT_SHORT, 1, 2);
+    injection_hit(?reached, INJECTION_READ);
+    ret EvidenceInput{
+        gate: ValidationGateId{namespace: "parser", name: "external-oracle", version: 1},
+        adapter_version: oracle.profile.adapter_version,
+        input_identity: oracle.profile.input_identity,
+        reproducibility: Reproducibility{
+            seed: 17, schedule_identity: "schedule-sha256", replay_identity: "replay-sha256",
+        },
+        injection: reached,
+        tool_identity: oracle.profile.tool_identity,
+        tool_version: oracle.profile.tool_version,
+        invocation_identity: oracle.profile.invocation_identity,
+        environment_identity: oracle.profile.environment_identity,
+        limits: oracle.limits,
+        tool_available: oracle.tool_available,
+        supported: oracle.supported,
+        requested: oracle.requested,
+        terminal: oracle.terminal,
+        capture: oracle.capture,
+        parsed: oracle.parsed,
+        matches: oracle.matches,
+        output_identity: oracle.output_identity,
+        observation_identity: "observation-sha256",
+        result: observe_oracle(?oracle).result,
+    };
+}
+
+test "mach.lang.validation:gate_result_kinds_are_distinct_and_ids_are_typed" {
+    var seen: [7]bool;
+    var i: usize = 0;
+    for (i < 7) { seen[i] = false; i = i + 1; }
+    var kinds: [7]ValidationGateResultKind = [7]ValidationGateResultKind{
+        RESULT_PASS, RESULT_SEMANTIC_MISMATCH, RESULT_UNSUPPORTED_INPUT,
+        RESULT_TOOL_UNAVAILABLE, RESULT_INFRASTRUCTURE_FAILURE,
+        RESULT_RESOURCE_EXHAUSTION, RESULT_INVALID_INJECTION,
+    };
+    i = 0;
+    for (i < 7) {
+        if (kinds[i] >= 7 || seen[kinds[i]::usize]) { ret 1; }
+        seen[kinds[i]::usize] = true;
+        i = i + 1;
+    }
+    var id: ValidationGateId = ValidationGateId{namespace: "parser", name: "oracle", version: 1};
+    if (!gate_id_valid(?id)) { ret 1; }
+    id.version = 0;
+    if (gate_id_valid(?id)) { ret 1; }
+    var contradictory: ValidationGateResult = gate_result(
+        RESULT_PASS, CAUSE_MALFORMED_OUTPUT, "contradictory-result");
+    if (gate_result_valid(?contradictory)) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.validation:injection_ordinal_is_exact_and_reports_reach" {
+    var reached: Injection = injection(INJECTION_ALLOCATION, INJECT_FAIL, 2, 0);
+    injection_hit(?reached, INJECTION_ALLOCATION);
+    injection_hit(?reached, INJECTION_ALLOCATION);
+    injection_hit(?reached, INJECTION_ALLOCATION);
+    if (injection_result(?reached).kind != RESULT_PASS || reached.observed != 3) { ret 1; }
+    var unreached: Injection = injection(INJECTION_ALLOCATION, INJECT_FAIL, 2, 0);
+    injection_hit(?unreached, INJECTION_ALLOCATION);
+    if (injection_result(?unreached).kind != RESULT_INVALID_INJECTION) { ret 1; }
+    var invalid: Injection = injection(INJECTION_ALLOCATION, INJECT_SHORT, 1, 0);
+    if (injection_result(?invalid).kind != RESULT_INFRASTRUCTURE_FAILURE) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.validation:io_faults_are_exact_and_domain_checked" {
+    var short_i: Injection = injection(INJECTION_READ, INJECT_SHORT, 2, 3);
+    val whole: IoAttempt = io_attempt(?short_i, INJECTION_READ, 8);
+    val short: IoAttempt = io_attempt(?short_i, INJECTION_READ, 8);
+    if (whole.kind != IO_COMPLETE || whole.bytes != 8) { ret 1; }
+    if (short.kind != IO_SHORT || short.bytes != 3 || !short_i.reached) { ret 1; }
+    var interrupt: Injection = injection(INJECTION_WRITE, INJECT_INTERRUPTED, 1, 0);
+    if (io_attempt(?interrupt, INJECTION_WRITE, 8).kind != IO_INTERRUPTED) { ret 1; }
+    var failed: Injection = injection(INJECTION_READ, INJECT_FAIL, 1, 0);
+    if (io_attempt(?failed, INJECTION_READ, 8).kind != IO_FAILED) { ret 1; }
+    var bad_zero: Injection = injection(INJECTION_READ, INJECT_SHORT, 1, 0);
+    if (io_attempt(?bad_zero, INJECTION_READ, 0).kind != IO_FAILED || bad_zero.valid) { ret 1; }
+    var wrong: Injection = injection(INJECTION_READ, INJECT_FAIL, 1, 0);
+    io_attempt(?wrong, INJECTION_WRITE, 8);
+    if (wrong.valid) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.validation:clock_deadline_is_manual_and_overflow_checked" {
+    var c: ControlledClock = clock(10);
+    var d: Deadline = deadline(?c, 5);
+    if (deadline_expired(?c, ?d)) { ret 1; }
+    if (!clock_advance(?c, 5) || !deadline_expired(?c, ?d)) { ret 1; }
+    if (clock_set(?c, 14) || c.valid) { ret 1; }
+    var end: ControlledClock = clock(0xffffffffffffffff);
+    if (deadline(?end, 1).valid || clock_advance(?end, 1)) { ret 1; }
+    var clock_fault: Injection = injection(INJECTION_CLOCK, INJECT_FAIL, 1, 0);
+    var schedule_fault: Injection = injection(INJECTION_SCHEDULE, INJECT_FAIL, 1, 0);
+    if (!injection_hit(?clock_fault, INJECTION_CLOCK)
+        || !injection_hit(?schedule_fault, INJECTION_SCHEDULE)) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.validation:scheduling_seed_and_replay_are_bounded_and_exact" {
+    var a: BoundedSchedule = bounded_schedule(7, 2);
+    var b: BoundedSchedule = bounded_schedule(7, 2);
+    var a0: u32 = 0;
+    var a1: u32 = 0;
+    var b0: u32 = 0;
+    var b1: u32 = 0;
+    if (!schedule_next(?a, 5, ?a0) || !schedule_next(?a, 3, ?a1)) { ret 1; }
+    if (!schedule_next(?b, 5, ?b0) || !schedule_next(?b, 3, ?b1)) { ret 1; }
+    if (a0 != b0 || a1 != b1 || schedule_next(?a, 1, ?a0) || !a.exhausted) { ret 1; }
+    var choices: [2]u32 = [2]u32{a0, a1};
+    var r: Replay = replay(?choices[0], 2);
+    if (!replay_next(?r, 5, ?b0) || !replay_next(?r, 3, ?b1) || !replay_exact(?r)) { ret 1; }
+    var short: Replay = replay(?choices[0], 1);
+    replay_next(?short, 5, ?b0);
+    if (replay_next(?short, 3, ?b1) || !short.exhausted || replay_exact(?short)) { ret 1; }
+    var bad: [1]u32 = [1]u32{4};
+    var mismatch: Replay = replay(?bad[0], 1);
+    if (replay_next(?mismatch, 4, ?b0) || !mismatch.mismatch) { ret 1; }
+    var invalid: BoundedSchedule = bounded_schedule(1, 1);
+    if (schedule_next(?invalid, 0, ?a0) || invalid.valid) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.validation:minimization_is_deterministic_bounded_and_protocol_checked" {
+    var m: Minimizer = minimizer(100, 16);
+    var candidate: u64 = 0;
+    for (minimize_next(?m, ?candidate)) {
+        minimize_observe(?m, candidate >= 37);
+    }
+    if (!m.valid || m.exhausted || minimized_value(?m) != 37) { ret 1; }
+    var bounded: Minimizer = minimizer(100, 1);
+    if (!minimize_next(?bounded, ?candidate)) { ret 1; }
+    minimize_observe(?bounded, true);
+    if (minimize_next(?bounded, ?candidate) || !bounded.exhausted) { ret 1; }
+    var protocol: Minimizer = minimizer(10, 2);
+    if (minimize_observe(?protocol, true) || protocol.valid) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.validation:oracle_mapping_keeps_every_terminal_class_distinct" {
+    var i: OracleInput = base_oracle();
+    var observed: OracleObservation = observe_oracle(?i);
+    if (observed.result.kind != RESULT_PASS || observed.result.cause != CAUSE_PASS) { ret 1; }
+    i.matches = false;
+    observed = observe_oracle(?i);
+    if (observed.result.kind != RESULT_SEMANTIC_MISMATCH
+        || observed.result.cause != CAUSE_MISMATCH) { ret 1; }
+    i = base_oracle(); i.supported = false;
+    observed = observe_oracle(?i);
+    if (observed.result.kind != RESULT_UNSUPPORTED_INPUT
+        || observed.result.cause != CAUSE_UNSUPPORTED) { ret 1; }
+    i = base_oracle(); i.tool_available = false;
+    observed = observe_oracle(?i);
+    if (observed.result.kind != RESULT_TOOL_UNAVAILABLE
+        || observed.result.cause != CAUSE_TOOL_UNAVAILABLE) { ret 1; }
+    i = base_oracle(); i.requested = cnc.TIMED_OUT;
+    observed = observe_oracle(?i);
+    if (observed.result.kind != RESULT_RESOURCE_EXHAUSTION
+        || observed.result.cause != CAUSE_ORACLE_TIMEOUT) { ret 1; }
+    i = base_oracle(); i.requested = cnc.CANCELLED;
+    observed = observe_oracle(?i);
+    if (observed.result.kind != RESULT_INFRASTRUCTURE_FAILURE
+        || observed.result.cause != CAUSE_ORACLE_CANCELED) { ret 1; }
+    i = base_oracle(); i.requested = cnc.DESTROYED;
+    observed = observe_oracle(?i);
+    if (observed.result.kind != RESULT_INFRASTRUCTURE_FAILURE
+        || observed.result.cause != CAUSE_INVALID_TERMINAL) { ret 1; }
+    i = base_oracle();
+    i.terminal.kind = subprocess.STATE_SPAWN_FAILURE;
+    observed = observe_oracle(?i);
+    if (observed.result.kind != RESULT_INFRASTRUCTURE_FAILURE
+        || observed.result.cause != CAUSE_ORACLE_SPAWN_FAILURE) { ret 1; }
+    i = base_oracle(); i.terminal.kind = subprocess.STATE_SIGNALED; i.terminal.code = 9;
+    observed = observe_oracle(?i);
+    if (observed.result.kind != RESULT_INFRASTRUCTURE_FAILURE
+        || observed.result.cause != CAUSE_ORACLE_SIGNAL) { ret 1; }
+    i = base_oracle(); i.terminal.code = 1;
+    observed = observe_oracle(?i);
+    if (observed.result.kind != RESULT_INFRASTRUCTURE_FAILURE
+        || observed.result.cause != CAUSE_ORACLE_EXIT) { ret 1; }
+    i = base_oracle(); i.capture.truncated = true;
+    observed = observe_oracle(?i);
+    if (observed.result.kind != RESULT_RESOURCE_EXHAUSTION
+        || observed.result.cause != CAUSE_ORACLE_OUTPUT_LIMIT) { ret 1; }
+    i = base_oracle(); i.capture.read_failed = true;
+    observed = observe_oracle(?i);
+    if (observed.result.kind != RESULT_INFRASTRUCTURE_FAILURE
+        || observed.result.cause != CAUSE_ORACLE_CAPTURE) { ret 1; }
+    i = base_oracle(); i.capture.write_failed = true;
+    if (observe_oracle(?i).result.kind != RESULT_INFRASTRUCTURE_FAILURE) { ret 1; }
+    i = base_oracle(); i.capture.close_failed = true;
+    if (observe_oracle(?i).result.kind != RESULT_INFRASTRUCTURE_FAILURE) { ret 1; }
+    i = base_oracle(); i.capture.short_read = true;
+    if (observe_oracle(?i).result.kind != RESULT_INFRASTRUCTURE_FAILURE) { ret 1; }
+    i = base_oracle(); i.capture.closed = false;
+    if (observe_oracle(?i).result.cause != CAUSE_ORACLE_CAPTURE) { ret 1; }
+    i = base_oracle(); i.capture.owned = false;
+    if (observe_oracle(?i).result.cause != CAUSE_ORACLE_CAPTURE) { ret 1; }
+    i = base_oracle(); i.terminal.kind = subprocess.STATE_RUNNING;
+    if (observe_oracle(?i).result.cause != CAUSE_INVALID_TERMINAL) { ret 1; }
+    i = base_oracle(); i.parsed = false;
+    observed = observe_oracle(?i);
+    if (observed.result.kind != RESULT_INFRASTRUCTURE_FAILURE
+        || observed.result.cause != CAUSE_MALFORMED_OUTPUT) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.validation:evidence_is_opaque_content_addressed_and_round_trips" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var input: EvidenceInput = evidence_input();
+    val built: R.Result[ValidationEvidence, str] = evidence_build(?alloc, ?input);
+    if (R.is_err[ValidationEvidence, str](built)) { ret 1; }
+    var evidence: ValidationEvidence = R.unwrap_ok[ValidationEvidence, str](built);
+    var first_digest: [32]u8;
+    if (!evidence_content_identity(evidence, ?first_digest[0])) { ret 1; }
+    var bytes_len: usize = 0;
+    val copied: R.Result[*u8, str] = evidence_copy(?alloc, evidence, ?bytes_len);
+    if (R.is_err[*u8, str](copied)) { ret 1; }
+    val bytes: *u8 = R.unwrap_ok[*u8, str](copied);
+    var view: ValidationEvidenceView;
+    if (R.is_err[R.Void, str](evidence_validate_bytes(bytes, bytes_len, ?view))) { ret 1; }
+    if (view.schema != VALIDATION_EVIDENCE_SCHEMA || view.gate.version != 1
+        || view.reproducibility.seed != 17 || view.injection.ordinal != 1
+        || !view.injection.reached || view.result.kind != RESULT_PASS
+        || !str_equals(view.tool_identity, "tool-sha256")
+        || !str_equals(view.output_identity, "output-sha256")) { ret 1; }
+    val opened: R.Result[ValidationEvidence, str] = evidence_open(?alloc, bytes, bytes_len);
+    if (R.is_err[ValidationEvidence, str](opened)) { ret 1; }
+    var reopened: ValidationEvidence = R.unwrap_ok[ValidationEvidence, str](opened);
+    var second_digest: [32]u8;
+    if (!evidence_content_identity(reopened, ?second_digest[0])
+        || !digest_equal(?first_digest[0], ?second_digest[0])) { ret 1; }
+    A.deallocate[u8](?alloc, bytes, bytes_len);
+    if (R.is_err[R.Void, str](evidence_release(?reopened)) || reopened != nil) { ret 1; }
+    if (R.is_err[R.Void, str](evidence_release(?evidence)) || evidence != nil) { ret 1; }
+    if (R.is_err[R.Void, str](evidence_release(?evidence))) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.validation:evidence_identity_covers_reproducibility_oracle_and_result" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var base: EvidenceInput = evidence_input();
+    val ar: R.Result[ValidationEvidence, str] = evidence_build(?alloc, ?base);
+    if (R.is_err[ValidationEvidence, str](ar)) { ret 1; }
+    var a: ValidationEvidence = R.unwrap_ok[ValidationEvidence, str](ar);
+    var altered: EvidenceInput = evidence_input();
+    altered.reproducibility.replay_identity = "different-replay-sha256";
+    altered.environment_identity = "different-env-sha256";
+    altered.output_identity = "different-output-sha256";
+    altered.matches = false;
+    altered.result = gate_result(RESULT_SEMANTIC_MISMATCH, CAUSE_MISMATCH, "different-result-sha256");
+    val br: R.Result[ValidationEvidence, str] = evidence_build(?alloc, ?altered);
+    if (R.is_err[ValidationEvidence, str](br)) { ret 1; }
+    var b: ValidationEvidence = R.unwrap_ok[ValidationEvidence, str](br);
+    var da: [32]u8;
+    var db: [32]u8;
+    if (!evidence_content_identity(a, ?da[0]) || !evidence_content_identity(b, ?db[0])) { ret 1; }
+    if (digest_equal(?da[0], ?db[0])) { ret 1; }
+    var replay_changed: EvidenceInput = evidence_input();
+    replay_changed.reproducibility.replay_identity = "different-replay-sha256";
+    replay_changed.environment_identity = altered.environment_identity;
+    replay_changed.output_identity = altered.output_identity;
+    replay_changed.matches = false;
+    replay_changed.result = altered.result;
+    val cr: R.Result[ValidationEvidence, str] = evidence_build(?alloc, ?replay_changed);
+    if (R.is_err[ValidationEvidence, str](cr)) { ret 1; }
+    var c: ValidationEvidence = R.unwrap_ok[ValidationEvidence, str](cr);
+    var dc: [32]u8;
+    if (!evidence_content_identity(c, ?dc[0]) || !digest_equal(?db[0], ?dc[0])) { ret 1; }
+    evidence_release(?c);
+    evidence_release(?b);
+    evidence_release(?a);
+    ret 0;
+}
+
+test "mach.lang.validation:evidence_rejects_partial_unknown_and_tampered_records" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var input: EvidenceInput = evidence_input();
+    val er: R.Result[ValidationEvidence, str] = evidence_build(?alloc, ?input);
+    if (R.is_err[ValidationEvidence, str](er)) { ret 1; }
+    var evidence: ValidationEvidence = R.unwrap_ok[ValidationEvidence, str](er);
+    var n: usize = 0;
+    val cr: R.Result[*u8, str] = evidence_copy(?alloc, evidence, ?n);
+    if (R.is_err[*u8, str](cr)) { ret 1; }
+    val bytes: *u8 = R.unwrap_ok[*u8, str](cr);
+    var view: ValidationEvidenceView;
+    if (R.is_ok[R.Void, str](evidence_validate_bytes(bytes, 8, ?view))) { ret 1; }
+    bytes[0] = 'X';
+    if (R.is_ok[R.Void, str](evidence_validate_bytes(bytes, n, ?view))) { ret 1; }
+    bytes[0] = 'M';
+    bytes[40] = 3;
+    val schema: R.Result[R.Void, str] = evidence_validate_bytes(bytes, n, ?view);
+    if (R.is_ok[R.Void, str](schema)
+        || !str_equals(R.unwrap_err[R.Void, str](schema), "unsupported evidence schema")) { ret 1; }
+    bytes[40] = 2;
+    bytes[n - 1] = 1;
+    val tampered: R.Result[R.Void, str] = evidence_validate_bytes(bytes, n, ?view);
+    if (R.is_ok[R.Void, str](tampered)
+        || !str_equals(R.unwrap_err[R.Void, str](tampered), "evidence content identity mismatch")) { ret 1; }
+    A.deallocate[u8](?alloc, bytes, n);
+    evidence_release(?evidence);
+    input.adapter_version = 0;
+    if (R.is_ok[ValidationEvidence, str](evidence_build(?alloc, ?input))) { ret 1; }
+    input = evidence_input();
+    input.injection = injection(INJECTION_READ, INJECT_FAIL, 0, 0);
+    input.result = gate_result(
+        RESULT_INFRASTRUCTURE_FAILURE, CAUSE_INVALID_INJECTOR, "invalid-injector");
+    val invalid_er: R.Result[ValidationEvidence, str] = evidence_build(?alloc, ?input);
+    if (R.is_err[ValidationEvidence, str](invalid_er)) { ret 1; }
+    var invalid_evidence: ValidationEvidence = R.unwrap_ok[ValidationEvidence, str](invalid_er);
+    if (R.is_err[R.Void, str](evidence_release(?invalid_evidence))) { ret 1; }
+    input = evidence_input();
+    input.injection = injection(INJECTION_READ, INJECT_FAIL, 2, 0);
+    injection_hit(?input.injection, INJECTION_READ);
+    input.result = gate_result(
+        RESULT_INVALID_INJECTION, CAUSE_UNREACHED_INJECTION, "unreached-injection");
+    val unreached_er: R.Result[ValidationEvidence, str] = evidence_build(?alloc, ?input);
+    if (R.is_err[ValidationEvidence, str](unreached_er)) { ret 1; }
+    var unreached_evidence: ValidationEvidence = R.unwrap_ok[ValidationEvidence, str](unreached_er);
+    if (R.is_err[R.Void, str](evidence_release(?unreached_evidence))) { ret 1; }
+    var ordinal: u64 = 1;
+    var failures: u64 = 0;
+    var completed: bool = false;
+    for (ordinal < 16 && !completed) {
+        var failing: T.Testing;
+        if (O.is_some[str](T.make(?failing))) { ret 1; }
+        T.fail_at_ordinal(?failing, ordinal::usize);
+        input = evidence_input();
+        val attempt: R.Result[ValidationEvidence, str] = evidence_build(T.allocator_of(?failing), ?input);
+        if (R.is_err[ValidationEvidence, str](attempt)) {
+            if (T.attempt_count(?failing) < ordinal::usize) { T.dnit(?failing); ret 1; }
+            failures = failures + 1;
+        }
+        or {
+            if (T.attempt_count(?failing) >= ordinal::usize) { T.dnit(?failing); ret 1; }
+            var made: ValidationEvidence = R.unwrap_ok[ValidationEvidence, str](attempt);
+            if (R.is_err[R.Void, str](evidence_release(?made))) { T.dnit(?failing); ret 1; }
+            completed = true;
+        }
+        if (T.tracking_exhausted(?failing)) { T.dnit(?failing); ret 1; }
+        # whichever way it went, nothing it allocated may still be outstanding
+        if (T.leaked(?failing) || T.double_free_count(?failing) != 0) { T.dnit(?failing); ret 1; }
+        T.dnit(?failing);
+        ordinal = ordinal + 1;
+    }
+    if (!completed || failures < 3) { ret 1; }
+    ret 0;
+}

@@ -1,20 +1,11 @@
-# `mach clean <path>` - remove the project's build output directory trees
-#
-# Resolves the project root from the required path (a project directory, or a
-# manifest file directly) and removes the static directory prefix of each of the
-# manifest's `out`/`obj`/`ir`/`asm` path templates - the leading `/`-separated
-# components before the first `{...}` placeholder, so the whole output tree goes
-# regardless of target or profile. A project that relocates its output
-# (`out = "build/..."`) is cleaned at that root. Only the manifest is read: no
-# module graph is loaded and nothing under the dependency dir is touched. Removal
-# is idempotent, so cleaning an already-clean project is a no-op.
-#
-# Exit codes: 0 on success (including nothing to remove), 1 on a missing project or
-# an unparseable manifest, 2 on an allocator or io failure.
-
 use std.allocator.arena;
 use std.allocator.page;
+use std.collections.sort;
+use std.collections.vector;
+use std.collections.vector.Vector;
 use fs: std.filesystem;
+use txn: std.filesystem.transaction;
+use os: std.system.os;
 use std.print;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -22,6 +13,10 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+use std.types.string.str_starts_with;
+use std.types.string.str_compare;
 use std.types.string.str_copy_slice;
 use std.types.path;
 
@@ -30,22 +25,40 @@ use O: std.types.option;
 use R: std.types.result;
 use std.data.toml;
 
+use mach.cli.args;
 use mach.cli.util;
 use mach.lang.intern;
 use mach.lang.manifest;
 
-# `mach clean` subcommand entry point
-#
-# Rejects any flag (the command takes none), resolves the project root from the
-# optional path positional, and removes each declared output tree. A missing
-# mach.toml is the standard no-project error.
+# what a clean entry names
+pub def EntryKind: u8;
+
+# a directory tree
+pub val ENTRY_DIR:  EntryKind = 0;
+# a single file
+pub val ENTRY_FILE: EntryKind = 1;
+
+# one path `mach clean` removes
 # ---
-# argc:  argument count including argv[0]
-# argv:  the argument vector (argc null-terminated byte pointers)
-# marks: consumption record parallel to argv, for the unknown-flag rejector
-# ret:   0 on success, 1 on a missing/unparseable project, 2 on an io failure
-pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
-    if (util.flag_reject_unknown(argc, argv, marks, 2, "mach clean")) { ret 1; }
+# rel: the path relative to the project root, as the manifest templates expand it
+# kind: ENTRY_DIR or ENTRY_FILE
+pub rec CleanEntry {
+    rel:  str;
+    kind: EntryKind;
+}
+
+# `mach clean`: remove every output path the manifest can produce for every declared target
+# and profile. the obj, ir, asm, and test roots and the binary path of each artifact cell
+# are collected, sorted, collapsed under their ancestors, and removed inside the project
+# root; a path that escapes the root or crosses a symlink is refused. a missing path is
+# not an error; "nothing to clean" prints when nothing was removed
+# ---
+# argv: the full process arguments
+# inv: the parsed invocation for this command
+# ret: 0 success, 1 manifest error, 2 allocator, read, or removal failure
+pub fun run_typed(argv: **u8, inv: *args.ParsedInvocation) i64 {
+    if (args.reject_unknown_from_invocation(inv, argv, "mach clean")) { ret 1; }
+    val parsed: args.CleanInvocation = args.build_clean_invocation(inv);
 
     var backing: A.Allocator;
     if (O.is_some[str](page.make(?backing))) {
@@ -64,36 +77,24 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         ret 2;
     }
 
-    # resolve the project root from the required positional path;
-    # see util.resolve_project_root for the rules.
-    val pix: usize = util.arg_index_positional(argc, argv, marks, 2);
     var arg: *u8 = nil;
-    if (pix < argc) { arg = argv[pix]; }
+    if (parsed.has_project) { arg = argv[parsed.project_idx]; }
 
-    val root_r: R.Result[str, str] = util.resolve_project_root(?a, arg);
-    if (R.is_err[str, str](root_r)) {
+    val loc_r: R.Result[util.ProjectLocation, str] = util.resolve_project_location(?a, arg);
+    if (R.is_err[util.ProjectLocation, str](loc_r)) {
         print.eprint("error: ");
-        print.eprint(R.unwrap_err[str, str](root_r));
+        print.eprint(R.unwrap_err[util.ProjectLocation, str](loc_r));
         print.eprint("\n");
         arena.dnit(?ar);
         ret 1;
     }
+    val loc: util.ProjectLocation = R.unwrap_ok[util.ProjectLocation, str](loc_r);
 
-    val code: i64 = clean_project(?a, R.unwrap_ok[str, str](root_r));
+    val code: i64 = clean_project(?a, loc.root);
     arena.dnit(?ar);
     ret code;
 }
 
-# read the project's root manifest and remove each distinct output-directory
-# tree its templates declare, rooted under `root`
-#
-# The four templates are read for their static prefixes only; parsing the manifest
-# validates it as a real project. Every allocation is suballocated through the
-# caller's arena and reclaimed when it is torn down.
-# ---
-# a:    arena-backed allocator for the manifest read and parse
-# root: the resolved project root directory (null-terminated)
-# ret:  0 on success, 1 on an unparseable manifest, 2 on an io failure
 fun clean_project(a: *A.Allocator, root: *u8) i64 {
     val mp_r: R.Result[str, str] = path.join(a, root, util.PROJECT_CONFIG_NAME);
     if (R.is_err[str, str](mp_r)) {
@@ -103,15 +104,30 @@ fun clean_project(a: *A.Allocator, root: *u8) i64 {
     }
     val manifest_path: str = R.unwrap_ok[str, str](mp_r);
 
-    val text_r: R.Result[str, str] = fs.read_string(a, manifest_path);
-    if (R.is_err[str, str](text_r)) {
+    val bytes_r: R.Result[Vector[u8], str] = fs.read_bytes(a, manifest_path);
+    if (R.is_err[Vector[u8], str](bytes_r)) {
         print.eprint("error: cannot read '");
         print.eprint(manifest_path);
         print.eprintln("'");
         ret 2;
     }
 
-    val tbl_r: R.Result[toml.Table, str] = toml.parse(a, R.unwrap_ok[str, str](text_r));
+    var bytes: Vector[u8] = R.unwrap_ok[Vector[u8], str](bytes_r);
+    val source_r: R.Result[R.Void, str] = manifest.validate_source_bytes(bytes.data, bytes.len);
+    if (R.is_err[R.Void, str](source_r)) {
+        print.eprint("error: ");
+        print.eprintln(R.unwrap_err[R.Void, str](source_r));
+        vector.dnit[u8](?bytes);
+        ret 1;
+    }
+    val reserve_r: R.Result[usize, str] = vector.reserve[u8](?bytes, 1);
+    if (R.is_err[usize, str](reserve_r)) {
+        vector.dnit[u8](?bytes);
+        ret 2;
+    }
+    bytes.data[bytes.len] = 0;
+    val tbl_r: R.Result[toml.Table, str] = toml.parse(a, bytes.data::str);
+    vector.dnit[u8](?bytes);
     if (R.is_err[toml.Table, str](tbl_r)) {
         print.eprint("error: mach.toml: ");
         print.eprintln(R.unwrap_err[toml.Table, str](tbl_r));
@@ -128,9 +144,34 @@ fun clean_project(a: *A.Allocator, root: *u8) i64 {
     }
     var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](man_r);
 
+    val plan_r: R.Result[Vector[CleanEntry], str] = build_clean_plan(a, ?itn, ?m);
+    if (R.is_err[Vector[CleanEntry], str](plan_r)) {
+        print.eprint("error: ");
+        print.eprintln(R.unwrap_err[Vector[CleanEntry], str](plan_r));
+        manifest.dnit(?m, a);
+        ret 1;
+    }
+    var plan: Vector[CleanEntry] = R.unwrap_ok[Vector[CleanEntry], str](plan_r);
+
+    val root_r: R.Result[txn.Root, txn.Error] = txn.root_open(root::str, "");
+    if (R.is_err[txn.Root, txn.Error](root_r)) {
+        print.eprint("error: cannot open the project root for cleaning: ");
+        print.eprintln(txn.error_message(R.unwrap_err[txn.Root, txn.Error](root_r)));
+        vector.dnit[CleanEntry](?plan);
+        manifest.dnit(?m, a);
+        ret 2;
+    }
+    var anchor: txn.Root = R.unwrap_ok[txn.Root, txn.Error](root_r);
+
     var removed: usize = 0;
     var code:    i64   = 0;
-    code = clean_template(a, root, ?itn, m.out_tmpl, ?removed, code);
+    var i: usize = 0;
+    for (i < plan.len) {
+        code = execute_entry(?anchor, ?plan.data[i], ?removed, code);
+        i = i + 1;
+    }
+    txn.root_dnit(?anchor);
+    vector.dnit[CleanEntry](?plan);
 
     if (removed == 0 && code == 0) { print.println("nothing to clean"); }
 
@@ -138,97 +179,472 @@ fun clean_project(a: *A.Allocator, root: *u8) i64 {
     ret code;
 }
 
-# remove the static output-directory prefix of one template, reporting it
-#
-# The tree is the template's leading static components joined under `root`; an
-# existence check before removal keeps a shared root (the default `out/`, named by
-# all four templates) reported once and makes the whole command idempotent. A
-# template with no static prefix (a leading placeholder) is skipped, so the project
-# root is never a removal target.
-# ---
-# a:       allocator for the removal's transient child paths
-# root:    the resolved project root directory (null-terminated)
-# itn:     interner the template id resolves against
-# tmpl_id: interned template whose static prefix is removed
-# removed: running count of trees actually removed, incremented on a removal
-# code:    the exit code so far, returned unless this removal fails
-# ret:     `code`, or 2 when the removal fails
-fun clean_template(a: *A.Allocator, root: *u8, itn: *intern.Interner, tmpl_id: intern.StrId, removed: *usize, code: i64) i64 {
-    val opt: O.Option[str] = intern.lookup(itn, tmpl_id);
-    if (O.is_none[str](opt)) { ret code; }
+fun target_selectors(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest) R.Result[Vector[str], str] {
+    var v: Vector[str] = vector.init[str](a);
+    if (m.target_count == 0) {
+        val pr: R.Result[usize, str] = vector.push[str](?v, "");
+        if (R.is_err[usize, str](pr)) { ret R.err[Vector[str], str](R.unwrap_err[usize, str](pr)); }
+        ret R.ok[Vector[str], str](v);
+    }
+    var i: u32 = 0;
+    for (i < m.target_count) {
+        val opt: O.Option[str] = intern.lookup(itn, m.targets[i].name);
+        if (O.is_some[str](opt)) {
+            val pr: R.Result[usize, str] = vector.push[str](?v, O.unwrap[str](opt));
+            if (R.is_err[usize, str](pr)) { ret R.err[Vector[str], str](R.unwrap_err[usize, str](pr)); }
+        }
+        i = i + 1;
+    }
+    ret R.ok[Vector[str], str](v);
+}
+
+fun profile_selectors(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest) R.Result[Vector[str], str] {
+    var v: Vector[str] = vector.init[str](a);
+    if (m.profile_count == 0) {
+        val pr0: R.Result[usize, str] = vector.push[str](?v, "debug");
+        if (R.is_err[usize, str](pr0)) { ret R.err[Vector[str], str](R.unwrap_err[usize, str](pr0)); }
+        val pr1: R.Result[usize, str] = vector.push[str](?v, "release");
+        if (R.is_err[usize, str](pr1)) { ret R.err[Vector[str], str](R.unwrap_err[usize, str](pr1)); }
+        ret R.ok[Vector[str], str](v);
+    }
+    var i: u32 = 0;
+    for (i < m.profile_count) {
+        val opt: O.Option[str] = intern.lookup(itn, m.profiles[i].name);
+        if (O.is_some[str](opt)) {
+            val pr: R.Result[usize, str] = vector.push[str](?v, O.unwrap[str](opt));
+            if (R.is_err[usize, str](pr)) { ret R.err[Vector[str], str](R.unwrap_err[usize, str](pr)); }
+        }
+        i = i + 1;
+    }
+    ret R.ok[Vector[str], str](v);
+}
+
+fun push_entry(v: *Vector[CleanEntry], rel: str, kind: EntryKind) O.Option[str] {
+    if (str_empty(rel)) { ret O.none[str](); }
+    var e: CleanEntry;
+    e.rel  = rel;
+    e.kind = kind;
+    val pr: R.Result[usize, str] = vector.push[CleanEntry](v, e);
+    if (R.is_err[usize, str](pr)) { ret O.some[str](R.unwrap_err[usize, str](pr)); }
+    ret O.none[str]();
+}
+
+fun push_id_entry(itn: *intern.Interner, v: *Vector[CleanEntry], id: intern.StrId, kind: EntryKind) O.Option[str] {
+    val opt: O.Option[str] = intern.lookup(itn, id);
+    if (O.is_none[str](opt)) { ret O.none[str](); }
+    ret push_entry(v, O.unwrap[str](opt), kind);
+}
+
+fun push_test_root_entry(a: *A.Allocator, itn: *intern.Interner, v: *Vector[CleanEntry], id: intern.StrId) O.Option[str] {
+    val opt: O.Option[str] = intern.lookup(itn, id);
+    if (O.is_none[str](opt)) { ret O.none[str](); }
     val tmpl: str = O.unwrap[str](opt);
 
-    val plen: usize = static_prefix_len(tmpl);
-    if (plen == 0) { ret code; }
+    val n: usize = str_len(tmpl);
+    var last_sep: i64 = -1;
+    var i: usize = 0;
+    for (i < n) {
+        if (tmpl[i] == '/'::u8) { last_sep = i::i64; }
+        i = i + 1;
+    }
+    if (last_sep < 0) { ret O.none[str](); }
 
-    # the '/'-separated static prefix, copied for reporting and the join, then
-    # rooted at the project directory.
-    val rel_r: R.Result[str, str] = str_copy_slice(a, tmpl, 0, plen);
-    if (R.is_err[str, str](rel_r)) { ret code; }
-    val rel: str = R.unwrap_ok[str, str](rel_r);
+    val parent_r: R.Result[str, str] = str_copy_slice(a, tmpl, 0, last_sep::usize);
+    if (R.is_err[str, str](parent_r)) { ret O.some[str](R.unwrap_err[str, str](parent_r)); }
+    ret push_entry(v, R.unwrap_ok[str, str](parent_r), ENTRY_DIR);
+}
 
-    val abs_r: R.Result[str, str] = path.join(a, root::str, rel);
-    if (R.is_err[str, str](abs_r)) { ret code; }
-    val abs_str: str = R.unwrap_ok[str, str](abs_r);
+fun build_clean_plan(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest) R.Result[Vector[CleanEntry], str] {
+    var raw: Vector[CleanEntry] = vector.init[CleanEntry](a);
 
-    if (!fs.exists(abs_str)) { ret code; }
+    val targets_r: R.Result[Vector[str], str] = target_selectors(a, itn, m);
+    if (R.is_err[Vector[str], str](targets_r)) { ret R.err[Vector[CleanEntry], str](R.unwrap_err[Vector[str], str](targets_r)); }
+    var targets: Vector[str] = R.unwrap_ok[Vector[str], str](targets_r);
 
-    val rr: O.Option[str] = fs.remove_all(a, abs_str);
-    if (O.is_some[str](rr)) {
-        print.eprint("error: cannot remove '");
-        print.eprint(rel);
-        print.eprint("': ");
-        print.eprintln(O.unwrap[str](rr));
-        ret 2;
+    val profiles_r: R.Result[Vector[str], str] = profile_selectors(a, itn, m);
+    if (R.is_err[Vector[str], str](profiles_r)) { ret R.err[Vector[CleanEntry], str](R.unwrap_err[Vector[str], str](profiles_r)); }
+    var profiles: Vector[str] = R.unwrap_ok[Vector[str], str](profiles_r);
+
+    var ti: usize = 0;
+    for (ti < targets.len) {
+        val tname: str = targets.data[ti];
+        var pi: usize = 0;
+        for (pi < profiles.len) {
+            val pname: str = profiles.data[pi];
+            val err: O.Option[str] = plan_cells_for(a, itn, m, tname, pname, ?raw);
+            if (O.is_some[str](err)) { ret R.err[Vector[CleanEntry], str](O.unwrap[str](err)); }
+            pi = pi + 1;
+        }
+        ti = ti + 1;
     }
 
+    val collapsed_r: R.Result[Vector[CleanEntry], str] = normalize_and_collapse(a, ?raw);
+    vector.dnit[CleanEntry](?raw);
+    ret collapsed_r;
+}
+
+fun plan_cells_for(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
+                   tname: str, pname: str, raw: *Vector[CleanEntry]) O.Option[str] {
+    var target_id: intern.StrId = intern.STR_NIL;
+    var have_target_id: bool = false;
+    if (m.target_count > 0) {
+        val tid_r: R.Result[intern.StrId, str] = intern.intern(itn, tname);
+        if (R.is_err[intern.StrId, str](tid_r)) { ret O.some[str](R.unwrap_err[intern.StrId, str](tid_r)); }
+        target_id = R.unwrap_ok[intern.StrId, str](tid_r);
+        have_target_id = true;
+    }
+
+    var ai: u32 = 0;
+    for (ai < m.artifact_count) {
+        val art: *manifest.ArtifactDef = ?m.artifacts[ai];
+
+        if (have_target_id && !manifest.artifact_supports_target(itn, art, target_id)) {
+            ai = ai + 1;
+            cnt;
+        }
+
+        val name_opt: O.Option[str] = intern.lookup(itn, art.name);
+        if (O.is_none[str](name_opt)) { ai = ai + 1; cnt; }
+
+        var sel: manifest.Selection;
+        sel.target       = tname;
+        sel.profile      = pname;
+        sel.artifact      = O.unwrap[str](name_opt);
+        sel.want_lib     = art.is_lib;
+        sel.has_artifact = true;
+
+        val ur: R.Result[manifest.BuildUnit, str] = manifest.resolve_build_unit(a, itn, m, sel);
+        if (R.is_err[manifest.BuildUnit, str](ur)) {
+            if (!have_target_id) { ai = ai + 1; cnt; }
+            ret O.some[str](R.unwrap_err[manifest.BuildUnit, str](ur));
+        }
+        val bu: manifest.BuildUnit = R.unwrap_ok[manifest.BuildUnit, str](ur);
+
+        var err: O.Option[str] = push_id_entry(itn, raw, bu.obj_root, ENTRY_DIR);
+        if (O.is_some[str](err)) { ret err; }
+        err = push_id_entry(itn, raw, bu.ir_root, ENTRY_DIR);
+        if (O.is_some[str](err)) { ret err; }
+        err = push_id_entry(itn, raw, bu.asm_root, ENTRY_DIR);
+        if (O.is_some[str](err)) { ret err; }
+        err = push_test_root_entry(a, itn, raw, bu.test_root);
+        if (O.is_some[str](err)) { ret err; }
+        err = push_id_entry(itn, raw, bu.bin_path, ENTRY_FILE);
+        if (O.is_some[str](err)) { ret err; }
+
+        ai = ai + 1;
+    }
+    ret O.none[str]();
+}
+
+fun cmp_entry(x: *CleanEntry, y: *CleanEntry) i64 {
+    ret str_compare(x.rel, y.rel);
+}
+
+fun is_ancestor(anc: str, cand: str) bool {
+    val al: usize = str_len(anc);
+    val cl: usize = str_len(cand);
+    if (al >= cl) { ret false; }
+    if (!str_starts_with(cand, anc)) { ret false; }
+    ret cand[al] == '/'::u8;
+}
+
+fun normalize_and_collapse(a: *A.Allocator, raw: *Vector[CleanEntry]) R.Result[Vector[CleanEntry], str] {
+    var out: Vector[CleanEntry] = vector.init[CleanEntry](a);
+    if (raw.len == 0) { ret R.ok[Vector[CleanEntry], str](out); }
+
+    sort.sort[CleanEntry](raw.data, raw.len, cmp_entry);
+
+    var i: usize = 0;
+    for (i < raw.len) {
+        val cur: CleanEntry = raw.data[i];
+        if (out.len > 0) {
+            val last: CleanEntry = out.data[out.len - 1];
+            if (str_equals(cur.rel, last.rel)) { i = i + 1; cnt; }
+            if (last.kind == ENTRY_DIR && is_ancestor(last.rel, cur.rel)) { i = i + 1; cnt; }
+        }
+        val pr: R.Result[usize, str] = vector.push[CleanEntry](?out, cur);
+        if (R.is_err[usize, str](pr)) {
+            vector.dnit[CleanEntry](?out);
+            ret R.err[Vector[CleanEntry], str](R.unwrap_err[usize, str](pr));
+        }
+        i = i + 1;
+    }
+    ret R.ok[Vector[CleanEntry], str](out);
+}
+
+fun execute_entry(anchor: *txn.Root, e: *CleanEntry, removed: *usize, code: i64) i64 {
+    val rr: R.Result[usize, txn.Error] = txn.root_remove_tree(anchor, e.rel);
+    if (R.is_err[usize, txn.Error](rr)) {
+        val err: txn.Error = R.unwrap_err[usize, txn.Error](rr);
+        if (err.kind == txn.IO && err.code == os.ENOENT) { ret code; }
+        print.eprint("error: cannot remove clean target '");
+        print.eprint(e.rel);
+        print.eprint("': ");
+        if (err.kind == txn.CONTAINMENT) { print.eprintln("it escapes the project root or is reached through a symlink"); }
+        or { print.eprintln(txn.error_message(err)); }
+        ret 2;
+    }
+    if (R.unwrap_ok[usize, txn.Error](rr) == 0) { ret code; }
+
     print.print("removed ");
-    print.println(rel);
+    print.println(e.rel);
     @removed = @removed + 1;
     ret code;
 }
 
-# the byte length of a path template's static directory prefix: the leading run of
-# complete `/`-separated components containing no `{...}` placeholder
-#
-# `out/{target}/{profile}/bin/{name}{ext}` -> 3 (`out`); a template whose first
-# component holds a placeholder -> 0, so a value expanding into the project root is
-# never a removal target.
-# ---
-# tmpl: the path template text
-# ret:  the byte length of the static directory prefix, 0 when there is none
-fun static_prefix_len(tmpl: str) usize {
-    val n: usize = str_len(tmpl);
-    var end:       usize = 0;      # end offset of the last complete static component
-    var seg_start: usize = 0;
-    var seg_brace: bool  = false;
-    var i: usize = 0;
-    for (i <= n) {
-        if (i == n || tmpl[i] == '/') {
-            if (seg_brace)     { ret end; }   # first component holding a placeholder
-            if (i > seg_start) { end = i;  }   # a non-empty static component
-            seg_start = i + 1;
-            seg_brace = false;
-        }
-        or (tmpl[i] == '{') { seg_brace = true; }
-        i = i + 1;
-    }
-    ret end;
+test "mach.cli.cmd.clean.clean_project:refuses_symlink_ancestor_escape" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?a, "mach_clean_escape");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val base_r: R.Result[str, str] = str_copy_slice(?a, fs.temp_path(?tf), 0, str_len(fs.temp_path(?tf)));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[str, str](base_r)) { ret 1; }
+    val base: str = R.unwrap_ok[str, str](base_r);
+
+    val root_r: R.Result[str, str] = path.join(?a, base, "proj");
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    val outside_r: R.Result[str, str] = path.join(?a, base, "outside");
+    if (R.is_err[str, str](outside_r)) { ret 1; }
+    val outside: str = R.unwrap_ok[str, str](outside_r);
+    val outside_x_r: R.Result[str, str] = path.join(?a, outside, "x");
+    if (R.is_err[str, str](outside_x_r)) { ret 1; }
+    val outside_x: str = R.unwrap_ok[str, str](outside_x_r);
+
+    if (O.is_some[str](fs.create_dir_all(?a, root, 0o755))
+        || O.is_some[str](fs.create_dir_all(?a, outside_x, 0o755))) { ret 1; }
+
+    val sentinel_r: R.Result[str, str] = path.join(?a, outside_x, "sentinel");
+    if (R.is_err[str, str](sentinel_r)) { ret 1; }
+    val sentinel: str = R.unwrap_ok[str, str](sentinel_r);
+    if (O.is_some[str](fs.write_bytes(sentinel, "s"::*u8, 1, 0o600))) { ret 1; }
+
+    val toml_path_r: R.Result[str, str] = path.join(?a, root, "mach.toml");
+    if (R.is_err[str, str](toml_path_r)) { ret 1; }
+    val toml_path: str = R.unwrap_ok[str, str](toml_path_r);
+    val body: str = "[project]\nid = \"escapetest\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out\"\n\n[artifact.escapetest]\nkind = \"bin\"\nentry = \"src/main.mach\"\nout = \"x\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+    if (O.is_some[str](fs.write_bytes(toml_path, body::*u8, str_len(body), 0o644))) { ret 1; }
+
+    val link_r: R.Result[str, str] = path.join(?a, root, "out");
+    if (R.is_err[str, str](link_r)) { ret 1; }
+    val link: str = R.unwrap_ok[str, str](link_r);
+    if (O.is_some[str](fs.symlink(outside, link))) { ret 1; }
+
+    val rc: i64 = clean_project(?a, root::*u8);
+    val survived: bool = fs.exists(sentinel);
+
+    fs.remove_file(link);
+    fs.remove_all(?a, root);
+    fs.remove_all(?a, outside);
+
+    if (rc == 0)    { ret 1; }
+    if (!survived)  { ret 2; }
+    ret 0;
 }
 
-# the static prefix is the leading run of placeholder-free components: the whole
-# output root regardless of target/profile, empty when a placeholder leads (so the
-# project root is never removed)
-test "mach.cli.cmd.clean.static_prefix:template_shapes" {
-    var code: i32 = 0;
-    if (static_prefix_len("out/{target}/{profile}/bin/{name}{ext}") != 3) { code = 1; }  # "out"
-    if (static_prefix_len("out/{target}/{profile}/obj") != 3)             { code = 1; }  # "out"
-    if (static_prefix_len("build/{target}/obj") != 5)                     { code = 1; }  # "build"
-    if (static_prefix_len("bin/{name}{ext}") != 3)                        { code = 1; }  # "bin"
-    if (static_prefix_len("out/x/{target}") != 5)                         { code = 1; }  # "out/x"
-    if (static_prefix_len("cache") != 5)                                  { code = 1; }  # fully static dir
-    if (static_prefix_len("out/") != 3)                                   { code = 1; }  # trailing slash
-    if (static_prefix_len("{target}/obj") != 0)                           { code = 1; }  # leading placeholder
-    if (static_prefix_len("") != 0)                                       { code = 1; }  # empty
-    ret code;
+test "mach.cli.cmd.clean.is_ancestor:segment_boundary_not_string_prefix" {
+    var bad: i32 = 0;
+    if (!is_ancestor("out", "out/x"))          { bad = 1; }
+    if (!is_ancestor("out", "out/x/y"))        { bad = 1; }
+    if (is_ancestor("out", "out2/x"))          { bad = 1; }
+    if (is_ancestor("out", "out"))             { bad = 1; }
+    if (is_ancestor("out/x", "out"))           { bad = 1; }
+    if (is_ancestor("", "out"))                { bad = 1; }
+    ret bad;
+}
+
+test "mach.cli.cmd.clean.normalize_and_collapse:dedups_and_collapses_descendants_only_under_a_dir_ancestor" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+
+    var raw: Vector[CleanEntry] = vector.init[CleanEntry](?a);
+    push_entry(?raw, "out/x/obj", ENTRY_DIR);
+    push_entry(?raw, "out/x/obj", ENTRY_DIR);
+    push_entry(?raw, "out/x/obj/leftover", ENTRY_DIR);
+    push_entry(?raw, "out/x/ir", ENTRY_DIR);
+    push_entry(?raw, "out/x/bin/name", ENTRY_FILE);
+    push_entry(?raw, "out/x/bin/name/nested", ENTRY_DIR);
+    push_entry(?raw, "out/y/obj", ENTRY_DIR);
+
+    val out_r: R.Result[Vector[CleanEntry], str] = normalize_and_collapse(?a, ?raw);
+    if (R.is_err[Vector[CleanEntry], str](out_r)) { ret 1; }
+    val out: Vector[CleanEntry] = R.unwrap_ok[Vector[CleanEntry], str](out_r);
+
+    if (out.len != 5) { ret 2; }
+
+    var saw_obj_leftover: bool = false;
+    var saw_bin_nested:   bool = false;
+    var i: usize = 0;
+    for (i < out.len) {
+        if (str_equals(out.data[i].rel, "out/x/obj/leftover")) { saw_obj_leftover = true; }
+        if (str_equals(out.data[i].rel, "out/x/bin/name/nested")) { saw_bin_nested = true; }
+        i = i + 1;
+    }
+    if (saw_obj_leftover)  { ret 3; }
+    if (!saw_bin_nested)   { ret 4; }
+    ret 0;
+}
+
+test "mach.cli.cmd.clean.execute_entry:removes_declared_root_and_leaves_a_near_miss_neighbour" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?a, "mach_clean_precision");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val root: str = fs.temp_path(?tf);
+    fs.temp_close_and_remove(?tf);
+    if (O.is_some[str](fs.create_dir_all(?a, root, 0o755))) { ret 1; }
+
+    val declared_r: R.Result[str, str] = path.join(?a, root, "out");
+    if (R.is_err[str, str](declared_r)) { ret 1; }
+    val declared: str = R.unwrap_ok[str, str](declared_r);
+    if (O.is_some[str](fs.create_dir_all(?a, declared, 0o755))) { ret 1; }
+
+    val near_miss_r: R.Result[str, str] = path.join(?a, root, "out-user-data");
+    if (R.is_err[str, str](near_miss_r)) { ret 1; }
+    val near_miss: str = R.unwrap_ok[str, str](near_miss_r);
+    if (O.is_some[str](fs.create_dir_all(?a, near_miss, 0o755))) { ret 1; }
+    val near_miss_file_r: R.Result[str, str] = path.join(?a, near_miss, "keep.txt");
+    if (R.is_err[str, str](near_miss_file_r)) { ret 1; }
+    val near_miss_file: str = R.unwrap_ok[str, str](near_miss_file_r);
+    if (O.is_some[str](fs.write_bytes(near_miss_file, "keep"::*u8, 4, 0o600))) { ret 1; }
+
+    var removed: usize = 0;
+    var e: CleanEntry;
+    e.rel  = "out";
+    e.kind = ENTRY_DIR;
+    val anchor_r: R.Result[txn.Root, txn.Error] = txn.root_open(root, "");
+    if (R.is_err[txn.Root, txn.Error](anchor_r)) { ret 1; }
+    var anchor: txn.Root = R.unwrap_ok[txn.Root, txn.Error](anchor_r);
+    val code: i64 = execute_entry(?anchor, ?e, ?removed, 0);
+    txn.root_dnit(?anchor);
+
+    var bad: i32 = 0;
+    if (code != 0)             { bad = 1; }
+    if (removed != 1)          { bad = 1; }
+    if (fs.exists(declared))   { bad = 1; }
+    if (!fs.exists(near_miss_file)) { bad = 1; }
+
+    fs.remove_all(?a, root);
+    ret bad;
+}
+
+test "mach.cli.cmd.clean.build_clean_plan:dynamic_first_out_template_still_cleans" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?a, "mach_clean_dynfirst");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val root: str = fs.temp_path(?tf);
+    fs.temp_close_and_remove(?tf);
+    if (O.is_some[str](fs.create_dir_all(?a, root, 0o755))) { ret 1; }
+
+    val toml_path_r: R.Result[str, str] = path.join(?a, root, "mach.toml");
+    if (R.is_err[str, str](toml_path_r)) { ret 1; }
+    val toml_path: str = R.unwrap_ok[str, str](toml_path_r);
+    val body: str = "[project]\nid = \"dynfirst\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"{target.name}-out\"\n\n[artifact.dynfirst]\nkind = \"bin\"\nentry = \"src/main.mach\"\nout = \"bin/name\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+    if (O.is_some[str](fs.write_bytes(toml_path, body::*u8, str_len(body), 0o644))) { ret 1; }
+
+    val out_dir_r: R.Result[str, str] = path.join(?a, root, "native-out");
+    if (R.is_err[str, str](out_dir_r)) { ret 1; }
+    val out_dir: str = R.unwrap_ok[str, str](out_dir_r);
+    val obj_dir_r: R.Result[str, str] = path.join(?a, out_dir, "obj");
+    if (R.is_err[str, str](obj_dir_r)) { ret 1; }
+    val obj_dir: str = R.unwrap_ok[str, str](obj_dir_r);
+    if (O.is_some[str](fs.create_dir_all(?a, obj_dir, 0o755))) { ret 1; }
+
+    val rc: i64 = clean_project(?a, root::*u8);
+
+    var bad: i32 = 0;
+    if (rc != 0)          { bad = 1; }
+    if (fs.exists(obj_dir)) { bad = 1; }
+
+    fs.remove_all(?a, root);
+    ret bad;
+}
+
+test "mach.cli.cmd.clean.build_clean_plan:unsupported_target_artifact_pairs_are_skipped_not_errored" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?a, "mach_clean_multitarget");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val root: str = fs.temp_path(?tf);
+    fs.temp_close_and_remove(?tf);
+    if (O.is_some[str](fs.create_dir_all(?a, root, 0o755))) { ret 1; }
+
+    val toml_path_r: R.Result[str, str] = path.join(?a, root, "mach.toml");
+    if (R.is_err[str, str](toml_path_r)) { ret 1; }
+    val toml_path: str = R.unwrap_ok[str, str](toml_path_r);
+    val body: str = "[project]\nid = \"multitarget\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[target.windows]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\n\n[artifact.linuxonly]\nkind = \"bin\"\nentry = \"src/main.mach\"\nout = \"bin/name\"\ntargets = [\"linux\"]\nlink = []\nneed = []\n";
+    if (O.is_some[str](fs.write_bytes(toml_path, body::*u8, str_len(body), 0o644))) { ret 1; }
+
+    val linux_obj_r: R.Result[str, str] = path.join(?a, root, "out/linux/obj");
+    if (R.is_err[str, str](linux_obj_r)) { ret 1; }
+    val linux_obj: str = R.unwrap_ok[str, str](linux_obj_r);
+    if (O.is_some[str](fs.create_dir_all(?a, linux_obj, 0o755))) { ret 1; }
+
+    val windows_dir_r: R.Result[str, str] = path.join(?a, root, "out/windows");
+    if (R.is_err[str, str](windows_dir_r)) { ret 1; }
+    val windows_dir: str = R.unwrap_ok[str, str](windows_dir_r);
+
+    val rc: i64 = clean_project(?a, root::*u8);
+
+    var bad: i32 = 0;
+    if (rc != 0)                { bad = 1; }
+    if (fs.exists(linux_obj))   { bad = 1; }
+    if (fs.exists(windows_dir)) { bad = 1; }
+
+    fs.remove_all(?a, root);
+    ret bad;
+}
+
+test "mach.cli.cmd.clean.execute_entry:a_dotdot_target_is_refused_through_the_root_capability" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?a, "mach_clean_dotdot");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val base_r: R.Result[str, str] = str_copy_slice(?a, fs.temp_path(?tf), 0, str_len(fs.temp_path(?tf)));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[str, str](base_r)) { ret 1; }
+    val base: str = R.unwrap_ok[str, str](base_r);
+    val root_r: R.Result[str, str] = path.join(?a, base, "proj");
+    val outside_r: R.Result[str, str] = path.join(?a, base, "outside");
+    if (R.is_err[str, str](root_r) || R.is_err[str, str](outside_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    val outside: str = R.unwrap_ok[str, str](outside_r);
+    if (O.is_some[str](fs.create_dir_all(?a, root, 0o755)) || O.is_some[str](fs.create_dir_all(?a, outside, 0o755))) { ret 1; }
+    val sentinel_r: R.Result[str, str] = path.join(?a, outside, "sentinel");
+    if (R.is_err[str, str](sentinel_r)) { ret 1; }
+    val sentinel: str = R.unwrap_ok[str, str](sentinel_r);
+    if (O.is_some[str](fs.write_bytes(sentinel, "s"::*u8, 1, 0o600))) { ret 1; }
+
+    val anchor_r: R.Result[txn.Root, txn.Error] = txn.root_open(root, "");
+    if (R.is_err[txn.Root, txn.Error](anchor_r)) { ret 1; }
+    var anchor: txn.Root = R.unwrap_ok[txn.Root, txn.Error](anchor_r);
+    var removed: usize = 0;
+    var e: CleanEntry;
+    e.rel  = "../outside";
+    e.kind = ENTRY_DIR;
+    val code: i64 = execute_entry(?anchor, ?e, ?removed, 0);
+    var f: CleanEntry;
+    f.rel  = "../outside/sentinel";
+    f.kind = ENTRY_FILE;
+    val code_file: i64 = execute_entry(?anchor, ?f, ?removed, 0);
+    txn.root_dnit(?anchor);
+    val survived: bool = fs.exists(sentinel);
+    fs.remove_all(?a, base);
+    if (code != 2 || code_file != 2) { ret 1; }
+    if (removed != 0)                { ret 1; }
+    if (!survived)                   { ret 2; }
+    ret 0;
 }

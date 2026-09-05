@@ -1,81 +1,4 @@
-# mach.lang.me.lower.mangle: back-end symbol mangling
-#
-# The single chokepoint that turns a source identifier into the linkage name
-# the back end emits for a function or data global. An ordinary symbol is
-# qualified by its defining module's path so two modules' identically-named
-# `pub` declarations (e.g. `init` in dozens of modules) become distinct global
-# symbols; a symbol carrying an export override (an `ext fun` foreign symbol or
-# a `#[symbol(...)]` entry / runtime decorator) keeps its literal name so inline
-# asm and the OS entry point resolve against the exact name written in source.
-#
-# THE SCHEME IS READ BY PEOPLE. A linkage name is what a disassembler, a linker
-# error, a profiler and a core dump all show, so it spells the source FQN as the
-# source spells it and adds structure only where the source has structure:
-#
-#   ordinary:  `std.types.string.str_len`
-#   generic:   `std.types.option.unwrap$ptr`
-#   value:     `mach.lang.bits.rotate$7`
-#   pack:      `std.format.print$pack$i64$std.types.string.str`
-#   test:      `mach.lang.intern."mach.lang.intern.roundtrip"`
-#
-# NO PREFIX. The old `_M` sat in C's reserved identifier space so a mangled name
-# could not collide with a user's C symbol. It is redundant here: a mangled name
-# always contains at least one `.` (the module path is never empty - it falls
-# back to `main` - and the bare name always follows a `.`), and a C identifier
-# admits no `.`, so no mangled name can equal any C identifier, nor any `ext fun`
-# link name, which is a C identifier by construction. Only an explicit
-# `#[symbol("a.b")]` could collide, and that was equally true of `_M` before.
-# Dropping it also buys two bytes against the 64-byte inline-asm operand cap.
-#
-# `$` INTRODUCES A GENERIC ARGUMENT. It is the one character free of the
-# inline-asm grammar on all three ISAs (`[`/`]` open a memory operand, `(`/`)`
-# are riscv64 memory syntax, `,` separates operands, `:` and `%` are relocation
-# modifiers), it cannot appear in a source identifier, and it echoes the
-# comptime sigil - a generic instantiation is comptime. `.` and `$` are both
-# accepted by `mach.lang.target.isa.asm.is_sym_char`, so every mangled name,
-# generic or not, stays nameable from inline asm.
-#
-# ARGUMENTS ARE A DEPTH-TAGGED PREORDER WALK. Each argument is introduced by a
-# run of `$` whose LENGTH IS ITS DEPTH in the argument tree: 1 for an argument of
-# the symbol itself, 2 for an argument of a depth-1 generic, and so on. A run
-# shorter than the current depth closes the lists in between, so nothing needs a
-# closing bracket:
-#
-#   f[Map[Vec[i64], str], u8]  ->  m.f$m.Map$$m.Vec$$$i64$$str$u8
-#
-# One token per node, four PAIRWISE DISJOINT lexical classes, each of fixed
-# arity, which is what makes the encoding injective - the property WEAK
-# deduplication depends on, since two instances sharing a name share a body:
-#
-#   primitive leaf   one of `u8 i8 u16 i16 u32 i32 u64 i64 f32 f64 ptr`
-#   nominal leaf     `<origin-module-path>.<name>`, ALWAYS dotted; may be
-#                    followed by its generic arguments at depth+1
-#   reserved head    dotless, disjoint from the primitive set, fixed arity:
-#                      `p`       `*T`, operand is the next slot at the SAME depth
-#                      `sec`     `^T`, likewise
-#                      `arr<N>`  `[N]T`, element is the next slot at the same depth
-#                      `fn`      function type; opens ret then params at depth+1
-#                      `pack`    the pack-element marker (see pack_instance_name)
-#   value literal    `<decimal>` / `n<decimal>` / `true` / `false` /
-#                    `fx<16 hex>` / `"<escaped bytes>"`
-#
-# A left-to-right scan therefore reconstructs the tree with no lookahead: the
-# run length fixes the node's parent, and the token's class fixes its arity.
-# Distinct type trees give distinct byte strings. The value class is disjoint
-# from the three type classes (a value token starts with a digit or a quote, or
-# is one of `n<digits>` / `true` / `false` / `fx<hex>`, none of which is a
-# primitive name, a reserved head, or dotted), so a value instance can never
-# collide with a type instance of the same function - a collision would silently
-# merge two different WEAK bodies.
-#
-# The origin path on a nominal is what makes it globally unique; without it two
-# modules' same-named records would collide inside an argument list.
-#
-# imach's names need not be byte-identical to any other compiler's - only
-# self-consistent: a definition (keyed on its own module FQN) and every
-# reference to it (keyed on the referent's origin FQN) flow through the same
-# functions with the same inputs, so they agree byte-for-byte.
-
+use std.allocator.page;
 use std.format;
 use std.memory;
 use std.types.size.usize;
@@ -98,101 +21,60 @@ use mach.lang.intern;
 use mach.lang.session;
 use mach.lang.source;
 use mach.lang.type;
+use mach.lang.fail;
 
-# the pack-element marker, written once at depth 1 between a pack instance's
-# generic type-arguments and its element type-list
 val PACK_MARK: str = "pack";
 
-# the linkage name the back end emits for a function or global
-#
-# Returns the export override verbatim when one is set (so `ext fun` foreign
-# symbols and `#[symbol(...)]` entry / runtime decorators stay literal),
-# otherwise produces the module-path-qualified mangled name.
-# ---
-# s:      shared session (interner)
-# fqn:    FQN StrId of the defining module (its own for a definition, the
-#         referent's origin for a reference)
-# bare:   source identifier StrId
-# export: some(name) for an exempted symbol kept literal, none to mangle
-# ret:    the linkage-name StrId, or an allocation error
 pub fun linkage_name(
     s:      *session.Session,
     fqn:    intern.StrId,
     bare:   intern.StrId,
     export: O.Option[intern.StrId]
-) R.Result[intern.StrId, str] {
+) R.Result[intern.StrId, fail.Fail] {
     if (O.is_some[intern.StrId](export)) {
-        ret R.ok[intern.StrId, str](O.unwrap[intern.StrId](export));
+        ret R.ok[intern.StrId, fail.Fail](O.unwrap[intern.StrId](export));
     }
     ret mangle(s, fqn, bare, nil, 0);
 }
 
-# the linkage name of a generic instance
-#
-# The mangled base name with its type-argument sequence appended, each argument
-# introduced by one `$`, so distinct argument sequences (e.g. `allocate[u8]` vs
-# `allocate[u32]`) name distinct, correctly-typed symbols. An instance is never
-# exempted, so no export hook.
-# ---
-# s:         shared session (interner, type universe)
-# fqn:       FQN StrId of the generic's defining (origin) module
-# bare:      generic's source identifier StrId
-# args:      pointer to the concrete type-argument sequence
-# arg_count: number of type arguments (must be > 0)
-# ret:       the instance linkage-name StrId, or an allocation error
 pub fun instance_name(
     s:         *session.Session,
     fqn:       intern.StrId,
     bare:      intern.StrId,
     args:      *type.TypeId,
     arg_count: u32
-) R.Result[intern.StrId, str] {
+) R.Result[intern.StrId, fail.Fail] {
     ret mangle(s, fqn, bare, args, arg_count);
 }
 
-# the linkage name of a comptime value-parameter instance
-#
-# The mangled base name with its folded comptime-value sequence appended, so
-# distinct value sequences (e.g. `apply(0,..)` vs `apply(1,..)`) name distinct
-# symbols. A value literal's lexical class is disjoint from every type token's,
-# so a value instance can never collide with a type instance (which would
-# silently merge two different WEAK bodies). An instance is never exempted, so
-# no export hook.
-# ---
-# s:       shared session (interner)
-# fqn:     FQN StrId of the function's defining (origin) module
-# bare:    function's source identifier StrId
-# vals:    pointer to the folded comptime-value sequence
-# val_len: number of comptime values (must be > 0)
-# ret:     the value-instance linkage-name StrId, or an allocation error
 pub fun value_instance_name(
     s:       *session.Session,
     fqn:     intern.StrId,
     bare:    intern.StrId,
     vals:    *comptime.CTValue,
     val_len: u32
-) R.Result[intern.StrId, str] {
+) R.Result[intern.StrId, fail.Fail] {
     val path: str = module_path_get(s, fqn);
 
-    val res_name: R.Result[str, str] = bare_name_get(s, bare);
-    if (R.is_err[str, str](res_name)) {
-        ret R.err[intern.StrId, str](R.unwrap_err[str, str](res_name));
+    val res_name: R.Result[str, fail.Fail] = bare_name_get(s, bare);
+    if (R.is_err[str, fail.Fail](res_name)) {
+        ret R.err[intern.StrId, fail.Fail](R.unwrap_err[str, fail.Fail](res_name));
     }
-    val name: str = R.unwrap_ok[str, str](res_name);
+    val name: str = R.unwrap_ok[str, fail.Fail](res_name);
 
     var suffix_len: usize = 0;
     var i: u32 = 0;
     for (i < val_len) {
-        val rv: R.Result[usize, str] = encoded_value_len(s, ?vals[i]);
-        if (R.is_err[usize, str](rv)) { ret R.err[intern.StrId, str](R.unwrap_err[usize, str](rv)); }
-        suffix_len = suffix_len + 1 + R.unwrap_ok[usize, str](rv);
+        val rv: R.Result[usize, fail.Fail] = encoded_value_len(s, ?vals[i]);
+        if (R.is_err[usize, fail.Fail](rv)) { ret R.err[intern.StrId, fail.Fail](R.unwrap_err[usize, fail.Fail](rv)); }
+        suffix_len = suffix_len + 1 + R.unwrap_ok[usize, fail.Fail](rv);
         i = i + 1;
     }
 
     val total: usize = base_len(path, name) + suffix_len;
     val res_buf: R.Result[*u8, str] = A.allocate[u8](s.alloc, total);
     if (R.is_err[*u8, str](res_buf)) {
-        ret R.err[intern.StrId, str](R.unwrap_err[*u8, str](res_buf));
+        ret R.err[intern.StrId, fail.Fail](fail.message(R.unwrap_err[*u8, str](res_buf)));
     }
     val buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
 
@@ -200,37 +82,15 @@ pub fun value_instance_name(
     i = 0;
     for (i < val_len) {
         buf[k] = '$'; k = k + 1;
-        val wv: R.Result[usize, str] = write_encoded_value(s, buf, k, ?vals[i]);
-        if (R.is_err[usize, str](wv)) { ret R.err[intern.StrId, str](R.unwrap_err[usize, str](wv)); }
-        k = R.unwrap_ok[usize, str](wv);
+        val wv: R.Result[usize, fail.Fail] = write_encoded_value(s, buf, k, ?vals[i]);
+        if (R.is_err[usize, fail.Fail](wv)) { ret R.err[intern.StrId, fail.Fail](R.unwrap_err[usize, fail.Fail](wv)); }
+        k = R.unwrap_ok[usize, fail.Fail](wv);
         i = i + 1;
     }
 
     ret mangle_finish(s, buf, k, total);
 }
 
-# the linkage name of a comptime variadic-pack instance
-#
-# A pack-tailed function is monomorphized on `(generic type-args x pack element
-# types)` (#2251), so the name carries both keys: the generic type-arguments
-# exactly as a generic instance writes them (absent when the function declares
-# no type parameters), then the `pack` marker, then the pack element type-list.
-# Distinct type-lists (`sum(i64,i64)` vs `sum(f64)`) and distinct type-argument
-# lists (`sink[u32]` vs `sink[^u32]`) therefore name distinct symbols. `pack` is
-# a reserved head word no type token can spell, so it can neither be mistaken
-# for an argument nor let a pack instance collide with a plain generic instance
-# or a value instance (either would silently merge two different WEAK bodies).
-# Both lists encode through the same injective `write_encoded_type`. An instance
-# is never exempted, so no export hook.
-# ---
-# s:        shared session (interner, type universe)
-# fqn:      FQN StrId of the function's defining (origin) module
-# bare:     function's source identifier StrId
-# args:     pointer to the generic type-argument sequence (nil when arg_len is 0)
-# arg_len:  number of generic type arguments (0 for a non-generic pack tail)
-# types:    pointer to the pack element type-list
-# type_len: number of pack element types
-# ret:      the pack-instance linkage-name StrId, or an allocation error
 pub fun pack_instance_name(
     s:        *session.Session,
     fqn:      intern.StrId,
@@ -239,141 +99,103 @@ pub fun pack_instance_name(
     arg_len:  u32,
     types:    *type.TypeId,
     type_len: u32
-) R.Result[intern.StrId, str] {
+) R.Result[intern.StrId, fail.Fail] {
     val path: str = module_path_get(s, fqn);
 
-    val res_name: R.Result[str, str] = bare_name_get(s, bare);
-    if (R.is_err[str, str](res_name)) {
-        ret R.err[intern.StrId, str](R.unwrap_err[str, str](res_name));
+    val res_name: R.Result[str, fail.Fail] = bare_name_get(s, bare);
+    if (R.is_err[str, fail.Fail](res_name)) {
+        ret R.err[intern.StrId, fail.Fail](R.unwrap_err[str, fail.Fail](res_name));
     }
-    val name: str = R.unwrap_ok[str, str](res_name);
+    val name: str = R.unwrap_ok[str, fail.Fail](res_name);
 
-    val ra: R.Result[usize, str] = arg_list_len(s, args, arg_len);
-    if (R.is_err[usize, str](ra)) { ret R.err[intern.StrId, str](R.unwrap_err[usize, str](ra)); }
-    val rt: R.Result[usize, str] = arg_list_len(s, types, type_len);
-    if (R.is_err[usize, str](rt)) { ret R.err[intern.StrId, str](R.unwrap_err[usize, str](rt)); }
+    val ra: R.Result[usize, fail.Fail] = arg_list_len(s, args, arg_len);
+    if (R.is_err[usize, fail.Fail](ra)) { ret R.err[intern.StrId, fail.Fail](R.unwrap_err[usize, fail.Fail](ra)); }
+    val rt: R.Result[usize, fail.Fail] = arg_list_len(s, types, type_len);
+    if (R.is_err[usize, fail.Fail](rt)) { ret R.err[intern.StrId, fail.Fail](R.unwrap_err[usize, fail.Fail](rt)); }
 
     val total: usize = base_len(path, name)
-                     + R.unwrap_ok[usize, str](ra)
+                     + R.unwrap_ok[usize, fail.Fail](ra)
                      + 1 + str_len(PACK_MARK)
-                     + R.unwrap_ok[usize, str](rt);
+                     + R.unwrap_ok[usize, fail.Fail](rt);
     val res_buf: R.Result[*u8, str] = A.allocate[u8](s.alloc, total);
     if (R.is_err[*u8, str](res_buf)) {
-        ret R.err[intern.StrId, str](R.unwrap_err[*u8, str](res_buf));
+        ret R.err[intern.StrId, fail.Fail](fail.message(R.unwrap_err[*u8, str](res_buf)));
     }
     val buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
 
     var k: usize = base_write(buf, path, name);
-    val wa: R.Result[usize, str] = write_arg_list(s, buf, k, args, arg_len);
-    if (R.is_err[usize, str](wa)) { ret R.err[intern.StrId, str](R.unwrap_err[usize, str](wa)); }
-    k = R.unwrap_ok[usize, str](wa);
+    val wa: R.Result[usize, fail.Fail] = write_arg_list(s, buf, k, args, arg_len);
+    if (R.is_err[usize, fail.Fail](wa)) { ret R.err[intern.StrId, fail.Fail](R.unwrap_err[usize, fail.Fail](wa)); }
+    k = R.unwrap_ok[usize, fail.Fail](wa);
 
     buf[k] = '$'; k = k + 1;
     k = write_str(buf, k, PACK_MARK);
 
-    val wt: R.Result[usize, str] = write_arg_list(s, buf, k, types, type_len);
-    if (R.is_err[usize, str](wt)) { ret R.err[intern.StrId, str](R.unwrap_err[usize, str](wt)); }
-    k = R.unwrap_ok[usize, str](wt);
+    val wt: R.Result[usize, fail.Fail] = write_arg_list(s, buf, k, types, type_len);
+    if (R.is_err[usize, fail.Fail](wt)) { ret R.err[intern.StrId, fail.Fail](R.unwrap_err[usize, fail.Fail](wt)); }
+    k = R.unwrap_ok[usize, fail.Fail](wt);
 
     ret mangle_finish(s, buf, k, total);
 }
 
-# assemble `<module-path>.<name>[$<arg>...]` and intern it
-#
-# The argument list is present only when `arg_count > 0`, so the same routine
-# serves both an ordinary symbol and a generic type instance.
-# ---
-# s:         shared session (interner, type universe)
-# fqn:       FQN StrId of the defining (or referent's origin) module
-# bare:      source identifier StrId
-# args:      pointer to the type-argument sequence (nil when arg_count is 0)
-# arg_count: number of type arguments (0 for an ordinary symbol)
-# ret:       the linkage-name StrId, or an allocation error
 fun mangle(
     s:         *session.Session,
     fqn:       intern.StrId,
     bare:      intern.StrId,
     args:      *type.TypeId,
     arg_count: u32
-) R.Result[intern.StrId, str] {
+) R.Result[intern.StrId, fail.Fail] {
     val path: str = module_path_get(s, fqn);
 
-    val res_name: R.Result[str, str] = bare_name_get(s, bare);
-    if (R.is_err[str, str](res_name)) {
-        ret R.err[intern.StrId, str](R.unwrap_err[str, str](res_name));
+    val res_name: R.Result[str, fail.Fail] = bare_name_get(s, bare);
+    if (R.is_err[str, fail.Fail](res_name)) {
+        ret R.err[intern.StrId, fail.Fail](R.unwrap_err[str, fail.Fail](res_name));
     }
-    val name: str = R.unwrap_ok[str, str](res_name);
+    val name: str = R.unwrap_ok[str, fail.Fail](res_name);
 
-    val ra: R.Result[usize, str] = arg_list_len(s, args, arg_count);
-    if (R.is_err[usize, str](ra)) { ret R.err[intern.StrId, str](R.unwrap_err[usize, str](ra)); }
+    val ra: R.Result[usize, fail.Fail] = arg_list_len(s, args, arg_count);
+    if (R.is_err[usize, fail.Fail](ra)) { ret R.err[intern.StrId, fail.Fail](R.unwrap_err[usize, fail.Fail](ra)); }
 
-    val total: usize = base_len(path, name) + R.unwrap_ok[usize, str](ra);
+    val total: usize = base_len(path, name) + R.unwrap_ok[usize, fail.Fail](ra);
     val res_buf: R.Result[*u8, str] = A.allocate[u8](s.alloc, total);
     if (R.is_err[*u8, str](res_buf)) {
-        ret R.err[intern.StrId, str](R.unwrap_err[*u8, str](res_buf));
+        ret R.err[intern.StrId, fail.Fail](fail.message(R.unwrap_err[*u8, str](res_buf)));
     }
     val buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
 
     var k: usize = base_write(buf, path, name);
-    val wa: R.Result[usize, str] = write_arg_list(s, buf, k, args, arg_count);
-    if (R.is_err[usize, str](wa)) { ret R.err[intern.StrId, str](R.unwrap_err[usize, str](wa)); }
-    k = R.unwrap_ok[usize, str](wa);
+    val wa: R.Result[usize, fail.Fail] = write_arg_list(s, buf, k, args, arg_count);
+    if (R.is_err[usize, fail.Fail](wa)) { ret R.err[intern.StrId, fail.Fail](R.unwrap_err[usize, fail.Fail](wa)); }
+    k = R.unwrap_ok[usize, fail.Fail](wa);
 
     ret mangle_finish(s, buf, k, total);
 }
 
-# measured byte length of a depth-1 argument list, separators included
-#
-# Every top-level argument costs its own `$` plus its encoding. A zero-length
-# list costs nothing, which is what leaves an ordinary symbol a bare FQN.
-# ---
-# s:   shared session (type universe)
-# ids: pointer to the type sequence (nil when n is 0)
-# n:   number of types
-# ret: byte length of the list, or the first unencodable type's error
-fun arg_list_len(s: *session.Session, ids: *type.TypeId, n: u32) R.Result[usize, str] {
+fun arg_list_len(s: *session.Session, ids: *type.TypeId, n: u32) R.Result[usize, fail.Fail] {
     var total: usize = 0;
     var i: u32 = 0;
     for (i < n) {
-        val r: R.Result[usize, str] = encoded_type_len(s, ids[i], 1);
-        if (R.is_err[usize, str](r)) { ret r; }
-        total = total + 1 + R.unwrap_ok[usize, str](r);
+        val r: R.Result[usize, fail.Fail] = encoded_type_len(s, ids[i], 1);
+        if (R.is_err[usize, fail.Fail](r)) { ret r; }
+        total = total + 1 + R.unwrap_ok[usize, fail.Fail](r);
         i = i + 1;
     }
-    ret R.ok[usize, str](total);
+    ret R.ok[usize, fail.Fail](total);
 }
 
-# write a depth-1 argument list into `buf` at offset `k`
-# ---
-# s:   shared session (type universe)
-# buf: destination buffer
-# k:   write offset
-# ids: pointer to the type sequence (nil when n is 0)
-# n:   number of types
-# ret: the new offset, or the first unencodable type's error
-fun write_arg_list(s: *session.Session, buf: *u8, k: usize, ids: *type.TypeId, n: u32) R.Result[usize, str] {
+fun write_arg_list(s: *session.Session, buf: *u8, k: usize, ids: *type.TypeId, n: u32) R.Result[usize, fail.Fail] {
     var w: usize = k;
     var i: u32 = 0;
     for (i < n) {
         buf[w] = '$'; w = w + 1;
-        val r: R.Result[usize, str] = write_encoded_type(s, buf, w, ids[i], 1);
-        if (R.is_err[usize, str](r)) { ret r; }
-        w = R.unwrap_ok[usize, str](r);
+        val r: R.Result[usize, fail.Fail] = write_encoded_type(s, buf, w, ids[i], 1);
+        if (R.is_err[usize, fail.Fail](r)) { ret r; }
+        w = R.unwrap_ok[usize, fail.Fail](r);
         i = i + 1;
     }
-    ret R.ok[usize, str](w);
+    ret R.ok[usize, fail.Fail](w);
 }
 
-# the dotted module path an FQN StrId interns to
-#
-# Falls back to "main" when the id is nil or empty: the root module carries no
-# interned path, and every reference into it must agree on the same fallback.
-# The result is never empty, which is what guarantees every mangled name carries
-# at least one `.` and so cannot be a C identifier.
-# ---
-# s:   shared session (interner)
-# fqn: the module-FQN StrId
-# ret: the module path, never empty
 fun module_path_get(s: *session.Session, fqn: intern.StrId) str {
     val opt_path: O.Option[str] = intern.lookup(?s.interner, fqn);
     if (O.is_some[str](opt_path)) {
@@ -383,169 +205,76 @@ fun module_path_get(s: *session.Session, fqn: intern.StrId) str {
     ret "main";
 }
 
-# the source bytes of an interned identifier, or an error when it was never
-# interned
-#
-# Unlike a module FQN, which tolerates a miss and falls back to "main", a
-# missing bare name is a real internal inconsistency the caller must surface.
-# ---
-# s:   shared session (interner)
-# id:  the identifier StrId to resolve
-# ret: the interned bytes, or an error string
-fun bare_name_get(s: *session.Session, id: intern.StrId) R.Result[str, str] {
+fun bare_name_get(s: *session.Session, id: intern.StrId) R.Result[str, fail.Fail] {
     val opt_name: O.Option[str] = intern.lookup(?s.interner, id);
     if (O.is_none[str](opt_name)) {
-        ret R.err[str, str]("mangle: bare name not interned");
+        ret R.err[str, fail.Fail](fail.message("mangle: bare name not interned"));
     }
-    ret R.ok[str, str](O.unwrap[str](opt_name));
+    ret R.ok[str, fail.Fail](O.unwrap[str](opt_name));
 }
 
-# the source bytes an id interns to, or "" when it was never interned
-#
-# Used where a missing name encodes as a zero-length, still-injective segment
-# rather than an error (nominal names, comptime string values).
-# ---
-# s:   shared session (interner)
-# id:  the StrId to resolve
-# ret: the interned bytes, or ""
 fun interned_or_empty(s: *session.Session, id: intern.StrId) str {
     val opt: O.Option[str] = intern.lookup(?s.interner, id);
     if (O.is_some[str](opt)) { ret O.unwrap[str](opt); }
     ret "";
 }
 
-# the TypeId at a side-pool parameter slot, or TYPE_NIL when out of range
-#
-# Keeps type encoding total over a malformed instance: a missing slot degrades
-# to void rather than aborting.
-# ---
-# s:   shared session (type universe)
-# idx: absolute index into the type interner's parameter pool
-# ret: the slot's TypeId, or TYPE_NIL
 fun param_at(s: *session.Session, idx: u32) type.TypeId {
     val opt: O.Option[type.TypeId] = type.get_param(?s.types, idx);
     if (O.is_some[type.TypeId](opt)) { ret O.unwrap[type.TypeId](opt); }
     ret type.TYPE_NIL;
 }
 
-# byte length of the `<module-path>.<name>` base every mangled name opens with
-# ---
-# path: resolved module path
-# name: bare identifier
-# ret:  base byte length
 fun base_len(path: str, name: str) usize {
     ret str_len(path) + 1 + str_len(name);
 }
 
-# write the `<module-path>.<name>` base into `buf`
-#
-# Always writes from offset 0, so callers begin every name with this and then
-# append arguments at the returned offset.
-# ---
-# buf:  destination buffer (sized through base_len)
-# path: resolved module path
-# name: bare identifier
-# ret:  offset just past the bare name
 fun base_write(buf: *u8, path: str, name: str) usize {
     var k: usize = write_str(buf, 0, path);
     buf[k] = '.'; k = k + 1;
     ret write_str(buf, k, name);
 }
 
-# intern the assembled bytes, free the buffer, and return the StrId
-#
-# The single exit shared by every mangler.
-# ---
-# s:     shared session (interner)
-# buf:   the assembled name buffer
-# k:     number of bytes written into buf
-# total: buf's allocated size, freed before returning
-# ret:   the interned linkage-name StrId, or an allocation error
-fun mangle_finish(s: *session.Session, buf: *u8, k: usize, total: usize) R.Result[intern.StrId, str] {
+fun mangle_finish(s: *session.Session, buf: *u8, k: usize, total: usize) R.Result[intern.StrId, fail.Fail] {
     val res_id: R.Result[intern.StrId, str] = intern.intern_bytes(?s.interner, buf::str, k);
     A.deallocate[u8](s.alloc, buf, total);
-    ret res_id;
+    ret fail.lift[intern.StrId](res_id);
 }
 
-# measured byte length of one folded comptime value's encoding
-#
-# Pairs with write_encoded_value. The encoding is injective: distinct values map
-# to distinct byte sequences, the WEAK dedup correctness requirement. Every form
-# is lexically disjoint from every type token, so the value and type argument
-# namespaces cannot collide.
-#   INT   `<decimal>` / `n<decimal>` for a negative (no type token starts with a
-#         digit, and `n<digits>` is neither a primitive nor a reserved head)
-#   BOOL  `true` / `false`
-#   STR   `"<bytes>"` with `\` and `"` escaped, so the quotes delimit any content
-#   FLOAT `fx<16-hex-of-raw-f64-bits>` - the RAW bits, since a rendered decimal
-#         is not guaranteed to separate two distinct f64s
-# ---
-# s:   shared session (interner)
-# v:   pointer to the folded comptime value
-# ret: byte length of v's encoding, or an error naming the unencodable kind
-fun encoded_value_len(s: *session.Session, v: *comptime.CTValue) R.Result[usize, str] {
+fun encoded_value_len(s: *session.Session, v: *comptime.CTValue) R.Result[usize, fail.Fail] {
     if (v.kind == comptime.CT_KIND_INT) {
-        if (v.data.i < 0) { ret R.ok[usize, str](1 + decimal_len(negate_u64(v.data.i))); }
-        ret R.ok[usize, str](decimal_len(v.data.i::u64));
+        if (v.data.i < 0) { ret R.ok[usize, fail.Fail](1 + decimal_len(negate_u64(v.data.i))); }
+        ret R.ok[usize, fail.Fail](decimal_len(v.data.i::u64));
     }
-    if (v.kind == comptime.CT_KIND_BOOL) {
-        if (v.data.b) { ret R.ok[usize, str](4); }
-        ret R.ok[usize, str](5);
-    }
-    if (v.kind == comptime.CT_KIND_FLOAT) { ret R.ok[usize, str](2 + 16); }
+    if (v.kind == comptime.CT_KIND_FLOAT) { ret R.ok[usize, fail.Fail](2 + 16); }
     if (v.kind == comptime.CT_KIND_STR) {
-        ret R.ok[usize, str](2 + escaped_len(interned_or_empty(s, v.data.s)));
+        ret R.ok[usize, fail.Fail](2 + escaped_len(interned_or_empty(s, v.data.s)));
     }
-    ret R.err[usize, str](unencodable_value_msg(v.kind));
+    ret R.err[usize, fail.Fail](fail.message(unencodable_value_msg(v.kind)));
 }
 
-# write one folded comptime value's encoding into `buf` at offset `k`
-# ---
-# s:   shared session (interner)
-# buf: destination buffer
-# k:   write offset
-# v:   pointer to the folded comptime value
-# ret: the new offset
-fun write_encoded_value(s: *session.Session, buf: *u8, k: usize, v: *comptime.CTValue) R.Result[usize, str] {
+fun write_encoded_value(s: *session.Session, buf: *u8, k: usize, v: *comptime.CTValue) R.Result[usize, fail.Fail] {
     if (v.kind == comptime.CT_KIND_INT) {
         if (v.data.i < 0) {
             buf[k] = 'n';
-            ret R.ok[usize, str](write_decimal(buf, k + 1, negate_u64(v.data.i)));
+            ret R.ok[usize, fail.Fail](write_decimal(buf, k + 1, negate_u64(v.data.i)));
         }
-        ret R.ok[usize, str](write_decimal(buf, k, v.data.i::u64));
-    }
-    if (v.kind == comptime.CT_KIND_BOOL) {
-        if (v.data.b) { ret R.ok[usize, str](write_str(buf, k, "true")); }
-        ret R.ok[usize, str](write_str(buf, k, "false"));
+        ret R.ok[usize, fail.Fail](write_decimal(buf, k, v.data.i::u64));
     }
     if (v.kind == comptime.CT_KIND_FLOAT) {
         buf[k] = 'f'; buf[k + 1] = 'x';
-        # the RAW IEEE-754 bit pattern, not a numeric float->u64 truncation (which
-        # would collapse 1.5 / 1.9 / 1.99 onto the same key and merge their weak
-        # bodies). f64_bits reinterprets the bits via a union.
-        ret R.ok[usize, str](write_hex_u64(buf, k + 2, float.f64_bits(v.data.f)));
+        ret R.ok[usize, fail.Fail](write_hex_u64(buf, k + 2, float.f64_bits(v.data.f)));
     }
     if (v.kind == comptime.CT_KIND_STR) {
-        ret R.ok[usize, str](write_escaped(buf, k, interned_or_empty(s, v.data.s)));
+        ret R.ok[usize, fail.Fail](write_escaped(buf, k, interned_or_empty(s, v.data.s)));
     }
-    ret R.err[usize, str](unencodable_value_msg(v.kind));
+    ret R.err[usize, fail.Fail](fail.message(unencodable_value_msg(v.kind)));
 }
 
-# the magnitude of a negative i64 as a u64
-#
-# Written as `~x + 1` rather than `0 - x` so i64's most negative value, whose
-# magnitude does not fit in an i64, still measures and renders exactly.
-# ---
-# x:   a negative i64
-# ret: its absolute value
 fun negate_u64(x: i64) u64 {
     ret (~(x::u64)) + 1;
 }
 
-# byte length of a comptime string's quoted body, escapes included
-# ---
-# text: the raw bytes
-# ret:  byte length once `\` and `"` are escaped
 fun escaped_len(text: str) usize {
     val n: usize = str_len(text);
     var total: usize = 0;
@@ -558,15 +287,6 @@ fun escaped_len(text: str) usize {
     ret total;
 }
 
-# write a comptime string as a quoted, escaped token into `buf` at offset `k`
-#
-# Escaping `\` and `"` is what keeps the closing quote unambiguous, so the token
-# stays injective over arbitrary byte content.
-# ---
-# buf:  destination buffer
-# k:    write offset
-# text: the raw bytes
-# ret:  the new offset
 fun write_escaped(buf: *u8, k: usize, text: str) usize {
     val n: usize = str_len(text);
     var w: usize = k;
@@ -581,18 +301,6 @@ fun write_escaped(buf: *u8, k: usize, text: str) usize {
     ret w;
 }
 
-# the internal-error text for a comptime value kind the mangler cannot encode
-#
-# A mangled name is an IDENTITY, so an encoder that cannot represent its input
-# must say so rather than emit a placeholder: every unencodable value collapsing
-# onto one token makes the name non-injective, and two distinct instances then
-# share one WEAK symbol for the linker to merge (#2303). Reaching here is an
-# invariant break - a value instance is keyed by values comptime evaluation has
-# already folded to INT / FLOAT / BOOL / STR - so the text names the kind that
-# arrived, which is what identifies the pass that let it through.
-# ---
-# kind: the CT_KIND_* discriminant that has no encoding
-# ret:  the internal-error message
 fun unencodable_value_msg(kind: comptime.CTKind) str {
     if (kind == comptime.CT_KIND_TYPE)       { ret "mangle: a comptime TYPE value cannot key a value instance"; }
     if (kind == comptime.CT_KIND_FIELD)      { ret "mangle: a comptime FIELD value cannot key a value instance"; }
@@ -601,14 +309,6 @@ fun unencodable_value_msg(kind: comptime.CTKind) str {
     ret "mangle: unfolded comptime value cannot key a value instance";
 }
 
-# write `n` as exactly 16 fixed-width lowercase hex digits into `buf` at `k`
-#
-# A fixed width keeps the FLOAT encoding self-delimiting.
-# ---
-# buf: destination buffer
-# k:   write offset
-# n:   the 64-bit value to render
-# ret: the new offset (always k + 16)
 fun write_hex_u64(buf: *u8, k: usize, n: u64) usize {
     var w: usize = k;
     var shift: i32 = 60;
@@ -622,33 +322,14 @@ fun write_hex_u64(buf: *u8, k: usize, n: u64) usize {
     ret w;
 }
 
-# measured byte length of a semantic type's encoding at nesting depth `depth`
-#
-# Pairs with write_encoded_type; the two must agree on exactly which types have
-# an encoding, so both dispatch over the same kind set and both FAIL on the same
-# input rather than one sizing a type the other cannot write.
-#
-# `depth` is the node's own depth in the argument tree. It is a LENGTH here, not
-# just a position: every nested child costs `depth + 1` separator bytes, and a
-# same-depth operand (`p`, `sec`, `arr<N>`) costs `depth`.
-# ---
-# s:     shared session (type universe)
-# tid:   the TypeId to measure
-# depth: the node's nesting depth (1 for a top-level argument)
-# ret:   byte length of tid's encoding, or an error naming the unencodable type
-fun encoded_type_len(s: *session.Session, tid: type.TypeId, depth: usize) R.Result[usize, str] {
-    if (tid == type.TYPE_NIL || tid == type.TYPE_ERROR) { ret R.err[usize, str](unencodable_type_msg(s, tid)); }
+fun encoded_type_len(s: *session.Session, tid: type.TypeId, depth: usize) R.Result[usize, fail.Fail] {
+    if (tid == type.TYPE_NIL || tid == type.TYPE_ERROR) { ret R.err[usize, fail.Fail](fail.message(unencodable_type_msg(s, tid))); }
     val opt_t: O.Option[*type.Type] = type.get(?s.types, tid);
-    if (O.is_none[*type.Type](opt_t)) { ret R.err[usize, str](unencodable_type_msg(s, tid)); }
+    if (O.is_none[*type.Type](opt_t)) { ret R.err[usize, fail.Fail](fail.message(unencodable_type_msg(s, tid))); }
     val t: *type.Type = O.unwrap[*type.Type](opt_t);
     val kind: type.TypeKind = t.kind;
 
-    if (kind == type.TYPE_U8  || kind == type.TYPE_I8)  { ret R.ok[usize, str](2); }
-    if (kind == type.TYPE_U16 || kind == type.TYPE_I16) { ret R.ok[usize, str](3); }
-    if (kind == type.TYPE_U32 || kind == type.TYPE_I32) { ret R.ok[usize, str](3); }
-    if (kind == type.TYPE_U64 || kind == type.TYPE_I64) { ret R.ok[usize, str](3); }
-    if (kind == type.TYPE_F32 || kind == type.TYPE_F64) { ret R.ok[usize, str](3); }
-    if (kind == type.TYPE_PTR)                          { ret R.ok[usize, str](3); }
+    if (kind::u32 < type.PRIM_COUNT) { ret R.ok[usize, fail.Fail](type.prim_spelling_len(kind)); }
 
     if (kind == type.TYPE_POINTER) { ret modifier_len(s, 1, t.data.pointer.base, depth); }
     if (kind == type.TYPE_SECRET)  { ret modifier_len(s, 3, t.data.secret.base, depth); }
@@ -656,49 +337,19 @@ fun encoded_type_len(s: *session.Session, tid: type.TypeId, depth: usize) R.Resu
         ret modifier_len(s, 3 + decimal_len(t.data.array.count::u64), t.data.array.base, depth);
     }
     if (kind == type.TYPE_REC || kind == type.TYPE_UNI) {
-        ret R.ok[usize, str](nominal_len(s, t.data.nominal.origin, t.data.nominal.name));
+        ret R.ok[usize, fail.Fail](nominal_len(s, t.data.nominal.origin, t.data.nominal.name));
     }
     if (kind == type.TYPE_INSTANCE) { ret instance_enc_len(s, t, depth); }
     if (kind == type.TYPE_FUN)      { ret fun_enc_len(s, t, depth); }
-    ret R.err[usize, str](unencodable_type_msg(s, tid));
+    ret R.err[usize, fail.Fail](fail.message(unencodable_type_msg(s, tid)));
 }
 
-# measured byte length of a same-depth modifier (`p`, `sec`, `arr<N>`)
-#
-# The head word, the `$` run reintroducing its operand at the SAME depth, and
-# the operand itself. A modifier does not nest its operand: its arity is fixed
-# at one, so nothing has to be closed and `*u8` stays the two-token `p$u8`
-# rather than paying a depth level.
-# ---
-# s:      shared session (type universe)
-# head:   byte length of the head word
-# base:   the operand's TypeId
-# depth:  the modifier's own nesting depth
-# ret:    total byte length, or the operand's error
-fun modifier_len(s: *session.Session, head: usize, base: type.TypeId, depth: usize) R.Result[usize, str] {
-    val r: R.Result[usize, str] = encoded_type_len(s, base, depth);
-    if (R.is_err[usize, str](r)) { ret r; }
-    ret R.ok[usize, str](head + depth + R.unwrap_ok[usize, str](r));
+fun modifier_len(s: *session.Session, head: usize, base: type.TypeId, depth: usize) R.Result[usize, fail.Fail] {
+    val r: R.Result[usize, fail.Fail] = encoded_type_len(s, base, depth);
+    if (R.is_err[usize, fail.Fail](r)) { ret r; }
+    ret R.ok[usize, fail.Fail](head + depth + R.unwrap_ok[usize, fail.Fail](r));
 }
 
-# the internal-error text for a type the mangler has no encoding for
-#
-# A mangled name is an IDENTITY. Writing a placeholder byte for a type the encoder
-# cannot represent produces a name that LOOKS well-formed and is not injective -
-# every unencodable type collapses onto the same token, so two distinct instances
-# receive one WEAK symbol and the linker merges bodies that were never the same
-# (#2303, the mechanism behind the #2302 cluster).
-#
-# Reaching here is a PRECONDITION break, not a case to handle: every type the
-# mangler sees has been through sema, and since #2302 no unsubstituted generic
-# parameter is lowered at all. The message therefore names the type as sema would
-# spell it, so the report identifies the construct rather than a kind number.
-# Rendering is total (`typename` degrades to a placeholder) and every allocation
-# path falls back to a fixed string, so producing the diagnostic cannot itself fail.
-# ---
-# s:   shared session (type universe, interner, allocator)
-# tid: the type with no encoding
-# ret: the internal-error message
 fun unencodable_type_msg(s: *session.Session, tid: type.TypeId) str {
     val fallback: str = "mangle: type has no mangling encoding";
     if (tid == type.TYPE_NIL)   { ret "mangle: nil type has no mangling encoding"; }
@@ -713,8 +364,6 @@ fun unencodable_type_msg(s: *session.Session, tid: type.TypeId) str {
     if (R.is_err[str, str](rm)) { ret fallback; }
     val owned: str = R.unwrap_ok[str, str](rm);
 
-    # intern the text so the returned error outlives the scratch buffer, mirroring
-    # how the monomorphizer returns its instantiation-chain message.
     val id_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, owned);
     typename.type_str_free(s, owned);
     if (R.is_err[intern.StrId, str](id_r)) { ret fallback; }
@@ -723,41 +372,18 @@ fun unencodable_type_msg(s: *session.Session, tid: type.TypeId) str {
     ret O.unwrap[str](text);
 }
 
-# write a semantic type's encoding into `buf` at offset `k`
-# ---
-# s:     shared session (type universe)
-# buf:   destination buffer
-# k:     write offset
-# tid:   the TypeId to encode
-# depth: the node's nesting depth (1 for a top-level argument)
-# ret:   the new offset, or an error naming the unencodable type
-fun write_encoded_type(s: *session.Session, buf: *u8, k: usize, tid: type.TypeId, depth: usize) R.Result[usize, str] {
-    if (tid == type.TYPE_NIL || tid == type.TYPE_ERROR) { ret R.err[usize, str](unencodable_type_msg(s, tid)); }
+fun write_encoded_type(s: *session.Session, buf: *u8, k: usize, tid: type.TypeId, depth: usize) R.Result[usize, fail.Fail] {
+    if (tid == type.TYPE_NIL || tid == type.TYPE_ERROR) { ret R.err[usize, fail.Fail](fail.message(unencodable_type_msg(s, tid))); }
     val opt_t: O.Option[*type.Type] = type.get(?s.types, tid);
-    if (O.is_none[*type.Type](opt_t)) { ret R.err[usize, str](unencodable_type_msg(s, tid)); }
+    if (O.is_none[*type.Type](opt_t)) { ret R.err[usize, fail.Fail](fail.message(unencodable_type_msg(s, tid))); }
     val t: *type.Type = O.unwrap[*type.Type](opt_t);
     val kind: type.TypeKind = t.kind;
 
-    if (kind == type.TYPE_U8)  { ret R.ok[usize, str](write_str(buf, k, "u8")); }
-    if (kind == type.TYPE_I8)  { ret R.ok[usize, str](write_str(buf, k, "i8")); }
-    if (kind == type.TYPE_U16) { ret R.ok[usize, str](write_str(buf, k, "u16")); }
-    if (kind == type.TYPE_I16) { ret R.ok[usize, str](write_str(buf, k, "i16")); }
-    if (kind == type.TYPE_U32) { ret R.ok[usize, str](write_str(buf, k, "u32")); }
-    if (kind == type.TYPE_I32) { ret R.ok[usize, str](write_str(buf, k, "i32")); }
-    if (kind == type.TYPE_U64) { ret R.ok[usize, str](write_str(buf, k, "u64")); }
-    if (kind == type.TYPE_I64) { ret R.ok[usize, str](write_str(buf, k, "i64")); }
-    if (kind == type.TYPE_F32) { ret R.ok[usize, str](write_str(buf, k, "f32")); }
-    if (kind == type.TYPE_F64) { ret R.ok[usize, str](write_str(buf, k, "f64")); }
-    if (kind == type.TYPE_PTR) { ret R.ok[usize, str](write_str(buf, k, "ptr")); }
+    if (kind::u32 < type.PRIM_COUNT) { ret R.ok[usize, fail.Fail](write_str(buf, k, type.prim_name(kind))); }
 
     if (kind == type.TYPE_POINTER) {
         ret write_modifier(s, buf, k, "p", t.data.pointer.base, depth);
     }
-    # `^T` encodes as `sec$<enc(T)>` (#2251). secrecy has no runtime
-    # representation, but it does change the body a monomorphized instance emits
-    # -- a secret operand carries the #1646 taint through codegen -- so erasing it
-    # here made the instance name non-injective and collapsed two distinct bodies
-    # onto one WEAK symbol.
     if (kind == type.TYPE_SECRET) {
         ret write_modifier(s, buf, k, "sec", t.data.secret.base, depth);
     }
@@ -768,38 +394,19 @@ fun write_encoded_type(s: *session.Session, buf: *u8, k: usize, tid: type.TypeId
         ret write_encoded_type(s, buf, w, t.data.array.base, depth);
     }
     if (kind == type.TYPE_REC || kind == type.TYPE_UNI) {
-        ret R.ok[usize, str](write_nominal(s, buf, k, t.data.nominal.origin, t.data.nominal.name));
+        ret R.ok[usize, fail.Fail](write_nominal(s, buf, k, t.data.nominal.origin, t.data.nominal.name));
     }
     if (kind == type.TYPE_INSTANCE) { ret write_instance_enc(s, buf, k, t, depth); }
     if (kind == type.TYPE_FUN)      { ret write_fun_enc(s, buf, k, t, depth); }
-    ret R.err[usize, str](unencodable_type_msg(s, tid));
+    ret R.err[usize, fail.Fail](fail.message(unencodable_type_msg(s, tid)));
 }
 
-# write a same-depth modifier and its operand into `buf` at offset `k`
-# ---
-# s:     shared session (type universe)
-# buf:   destination buffer
-# k:     write offset
-# head:  the reserved head word
-# base:  the operand's TypeId
-# depth: the modifier's own nesting depth
-# ret:   the new offset, or the operand's error
-fun write_modifier(s: *session.Session, buf: *u8, k: usize, head: str, base: type.TypeId, depth: usize) R.Result[usize, str] {
+fun write_modifier(s: *session.Session, buf: *u8, k: usize, head: str, base: type.TypeId, depth: usize) R.Result[usize, fail.Fail] {
     var w: usize = write_str(buf, k, head);
     w = write_dollars(buf, w, depth);
     ret write_encoded_type(s, buf, w, base, depth);
 }
 
-# write `n` `$` bytes into `buf` at offset `k`
-#
-# The run length IS the nesting depth of the node that follows, which is what
-# lets a shallower run close every list between it and the current depth without
-# a closing bracket.
-# ---
-# buf: destination buffer
-# k:   write offset
-# n:   run length
-# ret: the new offset
 fun write_dollars(buf: *u8, k: usize, n: usize) usize {
     var w: usize = k;
     var i: usize = 0;
@@ -811,31 +418,11 @@ fun write_dollars(buf: *u8, k: usize, n: usize) usize {
     ret w;
 }
 
-# measured byte length of a nominal record / union encoding
-#
-# A named record / union encodes as `<origin-module-path>.<name>`. The origin
-# path makes the name globally unique - without it, two modules' same-named
-# records would collide in the argument encoding - and it is also what keeps
-# every nominal token dotted, the property that separates it from a primitive
-# name and from a reserved head word.
-# ---
-# s:      shared session (interner)
-# origin: ModuleId of the declaring module
-# name:   the nominal's interned identifier
-# ret:    byte length of the nominal encoding
 fun nominal_len(s: *session.Session, origin: session.ModuleId, name: intern.StrId) usize {
     val path: str = module_path_get(s, session.module_fqn(s, origin));
     ret str_len(path) + 1 + str_len(interned_or_empty(s, name));
 }
 
-# write a nominal record / union encoding into `buf` at offset `k`
-# ---
-# s:      shared session (interner)
-# buf:    destination buffer
-# k:      write offset
-# origin: ModuleId of the declaring module
-# name:   the nominal's interned identifier
-# ret:    the new offset
 fun write_nominal(s: *session.Session, buf: *u8, k: usize, origin: session.ModuleId, name: intern.StrId) usize {
     val path: str = module_path_get(s, session.module_fqn(s, origin));
     var w: usize = write_str(buf, k, path);
@@ -843,17 +430,7 @@ fun write_nominal(s: *session.Session, buf: *u8, k: usize, origin: session.Modul
     ret write_str(buf, w, interned_or_empty(s, name));
 }
 
-# measured byte length of a generic instance encoding
-#
-# An instance encodes as its generic nominal name (name recovered from the
-# generic's declaration in its origin AST) followed by its arguments, each at
-# `depth + 1`.
-# ---
-# s:     shared session (interner, type universe)
-# t:     pointer to the TYPE_INSTANCE Type
-# depth: the instance's own nesting depth
-# ret:   byte length of the instance encoding
-fun instance_enc_len(s: *session.Session, t: *type.Type, depth: usize) R.Result[usize, str] {
+fun instance_enc_len(s: *session.Session, t: *type.Type, depth: usize) R.Result[usize, fail.Fail] {
     val origin: session.ModuleId = t.data.instance.target_origin;
     val gname:  intern.StrId     = generic_decl_name(s, origin, t.data.instance.target_decl);
 
@@ -862,23 +439,15 @@ fun instance_enc_len(s: *session.Session, t: *type.Type, depth: usize) R.Result[
     val alen:   u32 = t.data.instance.args_len;
     var i: u32 = 0;
     for (i < alen) {
-        val ra: R.Result[usize, str] = encoded_type_len(s, param_at(s, astart + i), depth + 1);
-        if (R.is_err[usize, str](ra)) { ret ra; }
-        total = total + depth + 1 + R.unwrap_ok[usize, str](ra);
+        val ra: R.Result[usize, fail.Fail] = encoded_type_len(s, param_at(s, astart + i), depth + 1);
+        if (R.is_err[usize, fail.Fail](ra)) { ret ra; }
+        total = total + depth + 1 + R.unwrap_ok[usize, fail.Fail](ra);
         i = i + 1;
     }
-    ret R.ok[usize, str](total);
+    ret R.ok[usize, fail.Fail](total);
 }
 
-# write a generic instance encoding into `buf` at offset `k`
-# ---
-# s:     shared session (interner, type universe)
-# buf:   destination buffer
-# k:     write offset
-# t:     pointer to the TYPE_INSTANCE Type
-# depth: the instance's own nesting depth
-# ret:   the new offset
-fun write_instance_enc(s: *session.Session, buf: *u8, k: usize, t: *type.Type, depth: usize) R.Result[usize, str] {
+fun write_instance_enc(s: *session.Session, buf: *u8, k: usize, t: *type.Type, depth: usize) R.Result[usize, fail.Fail] {
     val origin: session.ModuleId = t.data.instance.target_origin;
     val gname:  intern.StrId     = generic_decl_name(s, origin, t.data.instance.target_decl);
 
@@ -888,25 +457,14 @@ fun write_instance_enc(s: *session.Session, buf: *u8, k: usize, t: *type.Type, d
     var i: u32 = 0;
     for (i < alen) {
         w = write_dollars(buf, w, depth + 1);
-        val ra: R.Result[usize, str] = write_encoded_type(s, buf, w, param_at(s, astart + i), depth + 1);
-        if (R.is_err[usize, str](ra)) { ret ra; }
-        w = R.unwrap_ok[usize, str](ra);
+        val ra: R.Result[usize, fail.Fail] = write_encoded_type(s, buf, w, param_at(s, astart + i), depth + 1);
+        if (R.is_err[usize, fail.Fail](ra)) { ret ra; }
+        w = R.unwrap_ok[usize, fail.Fail](ra);
         i = i + 1;
     }
-    ret R.ok[usize, str](w);
+    ret R.ok[usize, fail.Fail](w);
 }
 
-# the interned identifier of a generic record / union / function declaration
-#
-# Reads the declaration's name span from its origin module's AST and re-interns
-# it in the session interner so it is comparable across modules. Returns
-# STR_NIL when the origin AST or declaration is unavailable; the name then
-# encodes as a zero-length segment, still injective per (origin, decl).
-# ---
-# s:      shared session (interner, sources)
-# origin: ModuleId of the declaring module
-# gdecl:  DeclId of the generic declaration in origin's AST
-# ret:    the interned name StrId, or STR_NIL
 fun generic_decl_name(s: *session.Session, origin: session.ModuleId, gdecl: id.DeclId) intern.StrId {
     val ga: *ast.Ast = session.module_ast(s, origin);
     if (ga == nil) { ret intern.STR_NIL; }
@@ -930,78 +488,47 @@ fun generic_decl_name(s: *session.Session, origin: session.ModuleId, gdecl: id.D
     ret R.unwrap_ok[intern.StrId, str](res_id);
 }
 
-# measured byte length of a function-type encoding
-#
-# A function type encodes as the reserved head `fn` followed by its return type
-# and then each parameter, all at `depth + 1`.
-# ---
-# s:     shared session (type universe)
-# t:     pointer to the TYPE_FUN Type
-# depth: the function type's own nesting depth
-# ret:   byte length of the function-type encoding
-fun fun_enc_len(s: *session.Session, t: *type.Type, depth: usize) R.Result[usize, str] {
-    val rr: R.Result[usize, str] = encoded_type_len(s, t.data.fn.ret_type, depth + 1);
-    if (R.is_err[usize, str](rr)) { ret rr; }
-    var total: usize = 2 + depth + 1 + R.unwrap_ok[usize, str](rr);
+fun fun_enc_len(s: *session.Session, t: *type.Type, depth: usize) R.Result[usize, fail.Fail] {
+    val rr: R.Result[usize, fail.Fail] = encoded_type_len(s, t.data.fn.ret_type, depth + 1);
+    if (R.is_err[usize, fail.Fail](rr)) { ret rr; }
+    var total: usize = 2 + depth + 1 + R.unwrap_ok[usize, fail.Fail](rr);
     val pstart: u32 = t.data.fn.params_start;
     val plen:   u32 = t.data.fn.params_len;
     var i: u32 = 0;
     for (i < plen) {
-        val rp: R.Result[usize, str] = encoded_type_len(s, param_at(s, pstart + i), depth + 1);
-        if (R.is_err[usize, str](rp)) { ret rp; }
-        total = total + depth + 1 + R.unwrap_ok[usize, str](rp);
+        val rp: R.Result[usize, fail.Fail] = encoded_type_len(s, param_at(s, pstart + i), depth + 1);
+        if (R.is_err[usize, fail.Fail](rp)) { ret rp; }
+        total = total + depth + 1 + R.unwrap_ok[usize, fail.Fail](rp);
         i = i + 1;
     }
-    ret R.ok[usize, str](total);
+    ret R.ok[usize, fail.Fail](total);
 }
 
-# write a function-type encoding into `buf` at offset `k`
-# ---
-# s:     shared session (type universe)
-# buf:   destination buffer
-# k:     write offset
-# t:     pointer to the TYPE_FUN Type
-# depth: the function type's own nesting depth
-# ret:   the new offset
-fun write_fun_enc(s: *session.Session, buf: *u8, k: usize, t: *type.Type, depth: usize) R.Result[usize, str] {
+fun write_fun_enc(s: *session.Session, buf: *u8, k: usize, t: *type.Type, depth: usize) R.Result[usize, fail.Fail] {
     var w: usize = write_str(buf, k, "fn");
     w = write_dollars(buf, w, depth + 1);
-    val rr: R.Result[usize, str] = write_encoded_type(s, buf, w, t.data.fn.ret_type, depth + 1);
-    if (R.is_err[usize, str](rr)) { ret rr; }
-    w = R.unwrap_ok[usize, str](rr);
+    val rr: R.Result[usize, fail.Fail] = write_encoded_type(s, buf, w, t.data.fn.ret_type, depth + 1);
+    if (R.is_err[usize, fail.Fail](rr)) { ret rr; }
+    w = R.unwrap_ok[usize, fail.Fail](rr);
     val pstart: u32 = t.data.fn.params_start;
     val plen:   u32 = t.data.fn.params_len;
     var i: u32 = 0;
     for (i < plen) {
         w = write_dollars(buf, w, depth + 1);
-        val rp: R.Result[usize, str] = write_encoded_type(s, buf, w, param_at(s, pstart + i), depth + 1);
-        if (R.is_err[usize, str](rp)) { ret rp; }
-        w = R.unwrap_ok[usize, str](rp);
+        val rp: R.Result[usize, fail.Fail] = write_encoded_type(s, buf, w, param_at(s, pstart + i), depth + 1);
+        if (R.is_err[usize, fail.Fail](rp)) { ret rp; }
+        w = R.unwrap_ok[usize, fail.Fail](rp);
         i = i + 1;
     }
-    ret R.ok[usize, str](w);
+    ret R.ok[usize, fail.Fail](w);
 }
 
-# copy a str's bytes into `buf` at offset `k`
-# ---
-# buf:  destination buffer
-# k:    write offset
-# text: the bytes to copy
-# ret:  the new offset
 fun write_str(buf: *u8, k: usize, text: str) usize {
     val n: usize = str_len(text);
     memory.raw_copy((buf::usize + k)::ptr, text::ptr, n);
     ret k + n;
 }
 
-# number of base-10 digits in `n` (1 for 0)
-#
-# Measured over a u64, not a usize: an array count or a comptime int carries the
-# full 64 bits, and a narrower usize on a non-64-bit host would mis-size the
-# buffer the writer then overruns.
-# ---
-# n:   the value to measure
-# ret: digit count
 fun decimal_len(n: u64) usize {
     if (n == 0) { ret 1; }
     var len: usize = 0;
@@ -1013,12 +540,6 @@ fun decimal_len(n: u64) usize {
     ret len;
 }
 
-# write the base-10 digits of `n` into `buf` at offset `k`
-# ---
-# buf: destination buffer
-# k:   write offset
-# n:   the value to render
-# ret: the new offset
 fun write_decimal(buf: *u8, k: usize, n: u64) usize {
     if (n == 0) { buf[k] = '0'; ret k + 1; }
     var tmp: [24]u8;
@@ -1039,21 +560,12 @@ fun write_decimal(buf: *u8, k: usize, n: u64) usize {
     ret w;
 }
 
-# every comptime kind a value instance can be keyed by has an encoding, and every
-# kind that cannot key one names itself rather than sharing a token
-#
-# The four folded kinds are what `write_encoded_value` encodes; the other four are
-# comptime-only carriers that never key an instance. A shared message across them
-# would put two distinct causes behind one string - the diagnostic-fidelity failure
-# #2288 collects - and here that is the very non-injectivity this encoder exists to
-# prevent, one layer up.
 test "mach.lang.me.lower.mangle.unencodable_value_msg" {
     val t: str = unencodable_value_msg(comptime.CT_KIND_TYPE);
     val f: str = unencodable_value_msg(comptime.CT_KIND_FIELD);
     val p: str = unencodable_value_msg(comptime.CT_KIND_PACK_ELEM);
     val c: str = unencodable_value_msg(comptime.CT_KIND_CONST_ELEM);
 
-    # each names its own kind: no two share a message.
     if (str_equals(t, f)) { ret 1; }
     if (str_equals(t, p)) { ret 1; }
     if (str_equals(t, c)) { ret 1; }
@@ -1061,8 +573,6 @@ test "mach.lang.me.lower.mangle.unencodable_value_msg" {
     if (str_equals(f, c)) { ret 1; }
     if (str_equals(p, c)) { ret 1; }
 
-    # an ENCODABLE kind never reaches the message; if one ever does it falls to the
-    # unfolded text, pinned here as distinct from the four named ones.
     val u: str = unencodable_value_msg(comptime.CT_KIND_INT);
     if (str_equals(u, t)) { ret 1; }
     if (str_equals(u, f)) { ret 1; }
@@ -1071,30 +581,16 @@ test "mach.lang.me.lower.mangle.unencodable_value_msg" {
     ret 0;
 }
 
-# the magnitude of i64's most negative value renders exactly
-#
-# `0 - x` on an i64 leaves INT64_MIN unchanged, so a value instance keyed on it
-# would have measured and written a different digit run than one keyed on any
-# other negative - or, worse, the same one as its own positive counterpart. The
-# unsigned complement is what makes the INT encoding a bijection over all of i64.
 test "mach.lang.me.lower.mangle.negate_u64" {
     if (negate_u64(-1) != 1)                     { ret 1; }
     if (negate_u64(-9) != 9)                     { ret 1; }
     if (negate_u64(-2147483648) != 2147483648)   { ret 1; }
-    # INT64_MIN, whose magnitude does not fit in an i64.
     val min: i64 = -9223372036854775807 - 1;
     if (negate_u64(min) != (1::u64 << 63::u64))  { ret 1; }
     if (decimal_len(negate_u64(min)) != 19)      { ret 1; }
     ret 0;
 }
 
-# a comptime string's quoted token is injective over content that contains the
-# delimiters themselves
-#
-# Without escaping, `a"b` and `a` + `b` as two separate values would be
-# indistinguishable once written, and two distinct value instances would share
-# one WEAK symbol. The measured length and the written length must also agree
-# byte-for-byte or the writer overruns its own buffer.
 test "mach.lang.me.lower.mangle.escaped_string" {
     var buf: [64]u8;
 
@@ -1103,7 +599,6 @@ test "mach.lang.me.lower.mangle.escaped_string" {
     if (escaped_len("a\\b") != 4)    { ret 1; }
     if (escaped_len("\"\\") != 4)    { ret 1; }
 
-    # the writer adds exactly the two quotes the measurement's caller accounts for.
     if (write_escaped(?buf[0], 0, "abc") != 2 + escaped_len("abc"))    { ret 1; }
     if (write_escaped(?buf[0], 0, "a\"b") != 2 + escaped_len("a\"b"))  { ret 1; }
     if (write_escaped(?buf[0], 0, "a\\b") != 2 + escaped_len("a\\b"))  { ret 1; }
@@ -1112,4 +607,37 @@ test "mach.lang.me.lower.mangle.escaped_string" {
     buf[n] = 0;
     if (!str_equals((?buf[0])::str, "\"a\\\"b\"")) { ret 1; }
     ret 0;
+}
+
+test "mach.lang.me.lower.mangle.encoded_type:agrees_with_prim_catalog" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var buf: [8]u8;
+    var code: i32 = 0;
+    var k: u32 = 0;
+    for (k < type.PRIM_COUNT) {
+        val kind: type.TypeKind = k::type.TypeKind;
+        val expect: str = type.prim_name(kind);
+        val expect_len: usize = type.prim_spelling_len(kind);
+
+        val rl: R.Result[usize, fail.Fail] = encoded_type_len(?s, k::type.TypeId, 0);
+        if (R.is_err[usize, fail.Fail](rl))                    { code = 1; }
+        or {
+            if (R.unwrap_ok[usize, fail.Fail](rl) != expect_len) { code = 1; }
+        }
+
+        val rw: R.Result[usize, fail.Fail] = write_encoded_type(?s, ?buf[0], 0, k::type.TypeId, 0);
+        if (R.is_err[usize, fail.Fail](rw)) { code = 1; }
+        or {
+            val w: usize = R.unwrap_ok[usize, fail.Fail](rw);
+            buf[w] = 0;
+            if (!str_equals((?buf[0])::str, expect)) { code = 1; }
+        }
+        k = k + 1;
+    }
+    ret code;
 }

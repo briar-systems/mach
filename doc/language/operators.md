@@ -81,7 +81,7 @@ positive zero for either zero.
 
 ## Pointer
 
-- `?expr` — address-of; produces a pointer to the operand.
+- `?place` — address-of; produces a pointer to the operand. The operand must be a place: a binding, a field, an element, or a dereference (a field or element reached through a pointer counts). Taking the address of a call result, a literal, a cast, an operator result, or any other temporary is an error naming the operand kind.
 - `@ptr` — dereference; reads through the pointer.
 
 ```mach
@@ -90,6 +90,17 @@ var p: *i64 = ?x;
 @p = 11;                    # write through
 val v: i64  = @p;           # read through
 ```
+
+```mach
+val b: *i64 = ?g();         # error: cannot take the address of a call result
+val c: *i64 = ?42;          # error: cannot take the address of a literal
+val d: *u64 = ?(x::u64);    # error: cannot take the address of a cast result
+val e: *i64 = ?(x + 1);     # error: cannot take the address of an operator result
+```
+
+Each of those reads, in full, `cannot take the address of a call result: `?`
+applies to a place (a binding, a field, an element, or a dereference)`. Bind
+the temporary to a `var` and take that binding's address.
 
 ## Cast
 
@@ -116,7 +127,7 @@ val f: f64 = b:~f64;            # 1.5                (bits read back as a float)
 ```
 
 Neither `::` nor `:~` may add or drop the `^` secret qualifier, and neither can
-erase a secret-welded pointer to `ptr`. The only downgrade is the `:^` strip
+erase a secret-welded pointer to `ptr`. The only downgrade is the `:>T` strip
 cast. See [secrecy.md](secrecy.md).
 
 ## SIMD vectors
@@ -186,4 +197,4 @@ val z: i32x4 = (m & n) ^ n;    # lane-wise bitwise on integer lanes
 
 - [expressions.md](expressions.md) — how operators compose into expressions
 - [types.md](types.md) — which types support which operators
-- [secrecy.md](secrecy.md) — the `^` secret qualifier and the `:^` strip cast
+- [secrecy.md](secrecy.md) — the `^` secret qualifier and the `:>T` strip cast

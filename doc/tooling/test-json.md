@@ -30,16 +30,16 @@ human readability, which do not matter for a machine stream.
 
 ### Paths and ordering
 
-`file`, `exe`, and `output` are emitted exactly as the compiler references them
-— relative to the working directory the run was invoked from (the same form the
-human readout prints, e.g. `./src/...`), unless a path was configured as
-absolute. Resolve them against that cwd.
+`file`, `exe`, and `output` are emitted exactly as the compiler references them,
+which is the form the human readout prints: rooted at the project path as it
+was given on the command line (`src/root.mach` for `mach test .`, an absolute
+path for `mach test /abs/project`). Resolve a relative one against the working
+directory the run was invoked from.
 
-`test` events arrive in **completion order** — each is emitted the moment its
-test process finalizes, so a slow test never delays results that finished before
-it. Consumers that want collection (declaration) order sort by `index`, which is
-the stable per-test dispatch index. `run_start` always precedes every `test`,
-and `summary` always follows every `test`.
+`test` events arrive in **collection order**, the same deterministic order as
+the human readout, regardless of completion order; `index` is the stable
+per-test dispatch index and equals that position. `run_start` always precedes
+every `test`, and `summary` always follows every `test`.
 
 ## Versioning
 
@@ -62,7 +62,7 @@ Emitted once, before any `test` event.
 | `tests`  | int    | number of tests selected for the run |
 
 ```json
-{"schema":1,"event":"run_start","tests":438}
+{"schema":1,"event":"run_start","tests":2}
 ```
 
 ### `test`
@@ -80,6 +80,7 @@ order as the human readout), regardless of completion order.
 | `line`        | int           | 1-based source line of the `test` keyword |
 | `kind`        | string        | outcome (see below) |
 | `code`        | int           | exit code (`kind` = `exit`) or signal number (`kind` = `signal`); `0` otherwise |
+| `timeout_seconds` | int       | the bound the test exceeded (`kind` = `timeout`); `0` otherwise |
 | `duration_ns` | int           | wall time of the test process, in nanoseconds |
 | `index`       | int           | the test's collection-order dispatch index (`<exe> <index>` reruns exactly this test; sort by it for declaration order) |
 | `exe`         | string        | the dispatcher executable path |
@@ -93,11 +94,12 @@ order as the human readout), regardless of completion order.
 | `exit`   | exited non-zero; `code` carries the exit code |
 | `signal` | killed by a signal; `code` carries the signal number |
 | `spawn`  | the test executable could not be spawned |
+| `timeout`| exceeded `--timeout_seconds`; `timeout_seconds` carries the bound |
 | `other`  | neither exited nor signaled (should not occur) |
 
 `output` references the on-disk capture file holding the test's full stdout and
 stderr. It is a path for a `test` whose capture file persists — every failure
-(`exit`, `signal`, `other`) — and `null` otherwise: a `pass` file is unlinked on
+(`exit`, `signal`, `timeout`, `other`) — and `null` otherwise: a `pass` file is unlinked on
 completion, and a `spawn` failure never produced one. The file is the complete
 output (unlike the human readout's 64KB inline excerpt).
 
@@ -108,8 +110,9 @@ composed to fit exactly, so `output` is never `null` for a failure on account of
 path length.
 
 ```json
-{"schema":1,"event":"test","label":"mach.cli.util.path_into:absolute_and_relative","module":"mach.cli.util","file":"./src/cli/util.mach","line":427,"kind":"pass","code":0,"duration_ns":489607,"index":12,"exe":"./out/linux-x86_64/debug/test/mach","output":null}
-{"schema":1,"event":"test","label":"builds:cyclic_import","module":"mach.lang.driver","file":"./src/lang/driver.mach","line":142,"kind":"exit","code":1,"duration_ns":146002310,"index":37,"exe":"./out/linux-x86_64/debug/test/mach","output":"./out/linux-x86_64/debug/test/log/37.log"}
+{"schema":1,"event":"test","label":"adds","module":"p1.root","file":"src/root.mach","line":10,"kind":"pass","code":0,"timeout_seconds":0,"duration_ns":257163,"index":0,"exe":"./out/linux-x86_64/debug/test/p1","output":null}
+{"schema":1,"event":"test","label":"fails on purpose","module":"p1.root","file":"src/root.mach","line":11,"kind":"exit","code":3,"timeout_seconds":0,"duration_ns":278743,"index":1,"exe":"./out/linux-x86_64/debug/test/p1","output":"./out/linux-x86_64/debug/test/log/1.log"}
+{"schema":1,"event":"test","label":"spins","module":"p1.root","file":"src/root.mach","line":4,"kind":"timeout","code":0,"timeout_seconds":1,"duration_ns":1000881714,"index":0,"exe":"./out/linux-x86_64/debug/test/p1","output":"./out/linux-x86_64/debug/test/log/0.log"}
 ```
 
 ### `summary`
@@ -124,10 +127,26 @@ Emitted once, after every `test` event.
 | `failed`      | int    | number of non-passing tests |
 | `total`       | int    | number of tests run |
 | `duration_ns` | int    | the run's wall time, in nanoseconds |
+| `mismatch`    | int    | tests that exited non-zero or were signaled |
+| `unsupported` | int    | tests whose input the gate could not accept |
+| `target_unavailable` | int | tests whose tool or target was unavailable |
+| `infrastructure_failure` | int | tests that failed for a harness reason |
+| `resource_exhaustion` | int | tests that exhausted a bound, including a timeout |
+| `timed_out`   | int    | tests that exceeded `--timeout_seconds` |
+| `invalid_injection` | int | tests whose injected fault was never reached |
+
+`failed` counts every non-passing test, so a timed-out test is in both `failed`
+and `timed_out`, and it exits the suite `1` like any other failure. The exit
+code is `2` when `infrastructure_failure` is nonzero, otherwise `1` when
+`failed` is nonzero, otherwise `0`; read `timed_out` to separate the class.
 
 ```json
-{"schema":1,"event":"summary","passed":437,"failed":1,"total":438,"duration_ns":268000000}
+{"schema":1,"event":"summary","passed":1,"failed":1,"total":2,"duration_ns":629807,"mismatch":1,"unsupported":0,"target_unavailable":0,"infrastructure_failure":0,"resource_exhaustion":0,"timed_out":0,"invalid_injection":0}
+{"schema":1,"event":"summary","passed":0,"failed":1,"total":1,"duration_ns":1001365600,"mismatch":0,"unsupported":0,"target_unavailable":0,"infrastructure_failure":0,"resource_exhaustion":1,"timed_out":1,"invalid_injection":0}
 ```
+
+The second line is a run whose one test timed out: it counts under `failed`,
+`timed_out`, and `resource_exhaustion`.
 
 ### `case`
 
@@ -146,7 +165,8 @@ because `--list` does not build the dispatcher.
 | `index`  | int    | the test's dispatch index |
 
 ```json
-{"schema":1,"event":"case","label":"mach.cli.util.path_into:absolute_and_relative","module":"mach.cli.util","file":"./src/cli/util.mach","line":427,"index":12}
+{"schema":1,"event":"case","label":"adds","module":"p1.root","file":"src/root.mach","line":10,"index":0}
+{"schema":1,"event":"case","label":"fails on purpose","module":"p1.root","file":"src/root.mach","line":11,"index":1}
 ```
 
 ## Stream shape

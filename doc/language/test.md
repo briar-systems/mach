@@ -75,8 +75,9 @@ in the example above.
 ### Collection across modules
 
 Tests are not tied to a single file. Every `test` declaration in every
-module of the current project is collected, and `mach test` builds and runs
-one standalone executable per test in place of the project's normal `main`.
+module of the current project is collected, and `mach test` builds one
+dispatcher executable in place of the project's normal entry and runs each
+test through it in its own process.
 
 By default collection is scoped to the current project's own modules: tests
 declared in dependency modules are excluded, so a library's own suite never
@@ -86,71 +87,97 @@ in-tree. `--filter` narrows the run by test name in either mode.
 
 ## The `mach test` workflow
 
-`mach test` builds one standalone executable per `test` declaration, spawns
-each as its own process, captures its output, and renders a per-module readout —
-collapsing all-passing modules to a single roll-up line and expanding any
-module with a failure to show the failing test's captured output and location:
+`mach test <path>` is `mach build` with a different goal: it builds one test
+**dispatcher** executable covering every collected test, then runs each
+selected test as its own process (`<exe> <index>`), captures its output, times
+it, and renders a per-module readout — collapsing all-passing modules to a
+single roll-up line and expanding any module with a failure to show the
+failing test's captured output and location. The full flag reference is in
+[cli.md](../cli.md#mach-test); the options that select and shape a run are:
 
 ```
-usage: mach test [options]
-
-build the project's tests and run them.
-
-options:
-  --filter <pattern>  run only tests whose name contains <pattern>
-  --include-deps      also run tests declared in dependency modules
-  --list              list the collected tests and exit
-  -v                  list every test, grouped by module, with durations
-
-exit: 0 all passed, 1 any failed, 2 build/internal error
+--jobs <n>               run up to n test processes at once (default: host CPUs)
+--filter <substr>        run only tests whose label contains the substring
+--include-deps           also run tests declared in dependency modules
+--list                   list the collected tests and exit
+--format <human|json>    the live readout, or an NDJSON event stream
+--runner <cmd>           launch each test through a host-side command
+--timeout_seconds <n>    terminate a test and its process group after n seconds
 ```
 
 A roll-up is `<module>  <ok> ok[  <fail> FAIL]  <duration>`. Each expanded
-failure shows `file:line`, the exit code (`(exit N)`) or signal (`(signal N)`),
-and the child's captured stdout indented beneath; a passing test stays quiet.
-The run closes with a summary that re-lists every failure.
+failure shows `file:line`, the exit code (`(exit N)`), signal (`(signal N)`)
+or `(timed out after <n>s)`, the child's captured output indented beneath, and
+the exact `rerun:` command; a passing test stays quiet. The run closes with a
+summary that re-lists every failure:
 
-The command itself does two things:
+```
+failures:
+  fails on purpose  src/root.mach:11  (exit 3)
 
-1. **Build.** It runs the normal build pipeline with the test-runner entry
-   point. A build failure (or a missing test binary) makes `mach test`
-   exit `2` without running anything.
-2. **Run.** It execs the produced test binary, forwarding `--filter
-   <pattern>` and `--list` through to the binary as its own arguments so
-   the runner can select or enumerate tests itself.
+1 passed, 1 failed, 2 total  (1ms)
+```
 
-The exit code of `mach test` follows the runner:
+The exit code of `mach test`:
 
 - `0` — every test that ran passed.
-- `1` — at least one test failed (also returned if the binary is killed by
-  a signal rather than exiting normally).
-- `2` — a build or internal error before the tests could run.
+- `1` — at least one test failed, was killed by a signal, or timed out; also a
+  user error such as an unknown flag.
+- `2` — a build or internal error before the tests could run, or a test that
+  failed for an infrastructure reason (the harness, not the test).
 
 `--list` enumerates the collected tests and exits without running them.
-`--filter <pattern>` restricts the run (or the `--list` output) to tests
-whose label contains the given pattern.
+`--filter <substr>` selects at run time; the built dispatcher is identical
+regardless of filter. `--emit` is rejected under `mach test`
+(`--emit is not applicable to 'test'; test always builds its internal test
+dispatcher`).
+
+### Timeouts
+
+`--timeout_seconds <n>` bounds each spawned test process independently, from
+its own spawn, on its whole process group, so a process the test started dies
+with it. A test that exceeds the bound is the distinct outcome **timed out**:
+it renders as `(timed out after <n>s)`, is counted separately on the summary
+line, and is still a failing test for the exit code, so the suite exits `1`.
+
+```
+failures:
+  spins  src/root.mach:4  (timed out after 1s)
+
+0 passed, 1 failed (1 timed out), 1 total  (1.0s)
+```
+
+`<n>` is a positive integer number of seconds with no default: omitting the
+flag leaves every test unbounded.
+
+### JSON output
+
+`--format json` replaces the readout with one JSON object per line on stdout
+(`run_start`, one `test` per result, `summary`; `case` under `--list`), with
+build diagnostics kept on stderr. A timed-out test reports `"kind":"timeout"`
+with its bound in `timeout_seconds`. The schema is versioned and documented in
+[tooling/test-json.md](../tooling/test-json.md).
 
 ## The runner
 
-For each collected test the compiler (`mach.lang.me.lower.testrunner`)
-synthesizes a tiny IR module whose `main` is `ret <test>();` — a signature-only
-extern for the test symbol plus a two-instruction body — codegen'd into one extra
-object that links with the project's objects into a standalone executable for
-that test. In a test build the project's own `main` is neutralised (turned into a
-body-less extern) so the synthesized `main` is the sole program entry, and an
-executable is always linked — even for a library target.
+The compiler (`mach.lang.me.lower.testrunner`) lowers every collected test to
+a zero-parameter, `i32`-returning function under a compiler-private symbol
+that never collides with, reserves, or rewrites a user symbol, and synthesizes
+one dispatcher object whose entry selects a test by its index argument. That
+object links with the project's objects into a single executable, even for a
+library artifact; in a test build the project's own entry is neutralised so
+the dispatcher is the sole program entry.
 
-`mach test` itself spawns each per-test executable, captures the child's stdout,
-times it, and reads its exit status, then renders the per-module readout
-described above (a roll-up per module, expanded failures with captured output
-and `file:line`, a closing failure summary) and returns `0` when every selected
-test passed and `1` otherwise. `--list` / `--filter` select or enumerate which
-tests are built and run; `-v` lists every test with its duration.
+`mach test` then keeps up to `--jobs` children in flight, each spawned as
+`<exe> <index>`, captures each child's stdout and stderr to a per-test file
+under `log/` beside the dispatcher (a passing test's file is removed on the
+spot, a failing test's file stays), and reads its exit status. Results render
+in collection order regardless of completion order.
 
 Tests live inline alongside the code they cover: write `test "..." { }`
 declarations directly in the relevant `src/` module, or group them under
-`src/test/`. The runner collects every `FN_FLAG_TEST` across modules, so
-src-local tests are discovered automatically with no separate corpus project.
+`src/test/`. Every test declaration across the project's modules is collected
+automatically, with no separate corpus project.
 
 ## See also
 
@@ -159,3 +186,5 @@ src-local tests are discovered automatically with no separate corpus project.
   statements a test body uses
 - [files.md](files.md) — project layout the build (and `mach test`)
   discovers
+- [../cli.md](../cli.md#mach-test) — every `mach test` flag
+- [../tooling/test-json.md](../tooling/test-json.md) — the `--format json` schema

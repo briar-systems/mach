@@ -1,44 +1,3 @@
-# RISC-V (RV64) assembly text renderer - renders the encoder's own instruction stream
-#
-# This is the text half of the riscv64 ISA's `emit_asm` operation. It does NOT walk
-# the MIR: `encode.encode_riscv64_asm` runs the ordinary encoder with an
-# `enc.AsmSink` attached, and the encoder notifies the sink once for every machine
-# instruction it emits, immediately after emitting it. Each line of the `.s` is
-# therefore one instruction the encoder really produced, in the order it produced it.
-#
-# What this module may read is correspondingly narrow: the `isa.Inst` the encoder
-# built, and nothing else. Same type x86-64's printer renders, so there is one
-# representation of "what did this MIR become" and nothing for a second one to
-# disagree with (#2212). The structure reaches it from the instruction-format
-# packers - `pack_r` / `pack_i` / ... each receive every field of the word as an
-# argument, and `riscv.encode` classifies those arguments into a concrete
-# `inst.MachOp` at the packer - so no RV64 decoder exists anywhere.
-#
-# UNLIKE x86-64, notifications are BUFFERED and rendered when the function's layout
-# is final. RV64's branch relaxation rewrites an over-range conditional into an
-# inverted guard plus a `jal`, and an over-range `jal` into an `auipc` / `jalr`
-# trampoline, AFTER the whole function is emitted - so an instruction's first form is
-# not always its last. The relaxation pass edits the buffered notifications exactly
-# as it edits the text, and rendering happens once afterwards, so a `.s` line is the
-# instruction that ended up in the object rather than the one first planned.
-#
-# The previous printer was a second, independent renderer walking the post-regalloc
-# MIR, so a MIR macro-op the encoder expands into several machine instructions
-# printed as a single pseudo-mnemonic line - `cbr.lt_s a2, a0, .2, .3` standing in
-# for a `blt` plus a `j`, `add a2, a2, 1` for an `addi`, a `j .1` that existed in no
-# object, the register saves and the whole epilogue absent. It accounted for 49,380
-# of 102,503 emitted instructions and every module diverged (#2187). Rendering from
-# the encoder makes that class of divergence unrepresentable.
-#
-# NO PSEUDO-INSTRUCTIONS. The text names the instruction that was encoded: `addi a0,
-# zero, 5`, not `li a0, 5`; `jalr zero, 0(ra)`, not `ret`. A pseudo spelling hides
-# which real instruction - or how many - the encoder chose, which is the property
-# this artifact exists to show.
-#
-# An opcode with no mnemonic, or an operand shape that does not render, is a hard
-# error naming the opcode. Silent degradation is what let the old divergence go
-# unnoticed, so there is no fallback text anywhere in this module.
-
 use std.allocator.page;
 use std.format;
 use std.io.writer;
@@ -58,303 +17,178 @@ use mach.lang.intern;
 use mach.lang.target.isa;
 use mach.lang.target.isa.riscv.inst;
 
-# render one function's buffered notifications
-#
-# Called once the function's layout is final - after branch relaxation has settled -
-# so every line names the instruction that ended up in the object.
-# ---
-# buf: the encoder byte sink carrying the assembly sink
-# ret: true on success, or the first write error
-pub fun render_notes(buf: *enc.ByteBuf) R.Result[bool, str] {
+pub fun render_notes(buf: *enc.ByteBuf) R.Result[R.Void, str] {
     val out: *writer.Writer = buf.asm.out;
     val count: u32 = enc.note_count(buf);
     var i: u32 = 0;
     for (i < count) {
-        val res: R.Result[bool, str] = render_note(out, buf.asm.interner, enc.note_at(buf, i));
-        if (R.is_err[bool, str](res)) { ret res; }
+        val res: R.Result[R.Void, str] = render_note(out, buf.asm.interner, enc.note_at(buf, i));
+        if (R.is_err[R.Void, str](res)) { ret res; }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# render one buffered notification
-# ---
-# out:      destination writer
-# interner: resolves function and symbol ids to their source names
-# n:        the notification to render
-# ret:      true on success, or the first write error
-fun render_note(out: *writer.Writer, interner: *intern.Interner, n: *enc.AsmNote) R.Result[bool, str] {
+fun render_note(out: *writer.Writer, interner: *intern.Interner, n: *enc.AsmNote) R.Result[R.Void, str] {
     if (n.kind == enc.ASM_NOTE_FUNC) {
-        val res_open: R.Result[bool, str] = emit_str(out, "\n# ");
-        if (R.is_err[bool, str](res_open)) { ret res_open; }
-        val res_name: R.Result[bool, str] = emit_name(out, interner, n.name);
-        if (R.is_err[bool, str](res_name)) { ret res_name; }
+        val res_open: R.Result[R.Void, str] = emit_str(out, "\n# ");
+        if (R.is_err[R.Void, str](res_open)) { ret res_open; }
+        val res_name: R.Result[R.Void, str] = emit_name(out, interner, n.name);
+        if (R.is_err[R.Void, str](res_name)) { ret res_name; }
         ret emit_str(out, ":\n");
     }
     if (n.kind == enc.ASM_NOTE_BLOCK) {
-        val res_label: R.Result[bool, str] = emit_block(out, n.id);
-        if (R.is_err[bool, str](res_label)) { ret res_label; }
+        val res_label: R.Result[R.Void, str] = emit_block(out, n.id);
+        if (R.is_err[R.Void, str](res_label)) { ret res_label; }
         ret emit_str(out, ":\n");
     }
     if (n.kind == enc.ASM_NOTE_BYTES) {
-        # the accounting claim already happened when this note was pushed
-        # (`note_push`); only the text remains to be written (#2493).
         ret enc.render_bytes_text(out, ?n.bytes[0], enc.ASM_NOTE_BYTES_WIDTH);
     }
     ret render_inst(out, interner, ?n.inst);
 }
 
-# render `<mnemonic> <operands>` for one machine instruction
-#
-# An atomic's acquire / release ordering rides the mnemonic because that is where an
-# assembler spells it, and because the ordering IS the operation's guarantee: an
-# `amoswap.d.rl` rendered as `amoswap.d` reads as a plain exchange.
-# ---
-# out:      destination writer
-# interner: resolves symbol ids to their source names
-# mi:       the machine instruction to render
-# ret:      true on success, or the first error
-fun render_inst(out: *writer.Writer, interner: *intern.Interner, mi: *isa.Inst) R.Result[bool, str] {
-    val res_indent: R.Result[bool, str] = emit_str(out, "  ");
-    if (R.is_err[bool, str](res_indent)) { ret res_indent; }
+fun render_inst(out: *writer.Writer, interner: *intern.Interner, mi: *isa.Inst) R.Result[R.Void, str] {
+    val res_indent: R.Result[R.Void, str] = emit_str(out, "  ");
+    if (R.is_err[R.Void, str](res_indent)) { ret res_indent; }
 
     val mnem: str = mnemonic(mi.opcode::inst.MachOp);
     if (mnem == nil) {
-        ret R.err[bool, str]("--emit-asm: no riscv64 mnemonic for the emitted opcode");
+        ret R.err[R.Void, str]("--emit-asm: no riscv64 mnemonic for the emitted opcode");
     }
-    val res_mnem: R.Result[bool, str] = emit_str(out, mnem);
-    if (R.is_err[bool, str](res_mnem)) { ret res_mnem; }
-    val res_order: R.Result[bool, str] = emit_str(out, ordering_suffix(mi.flags));
-    if (R.is_err[bool, str](res_order)) { ret res_order; }
+    val res_mnem: R.Result[R.Void, str] = emit_str(out, mnem);
+    if (R.is_err[R.Void, str](res_mnem)) { ret res_mnem; }
+    val res_order: R.Result[R.Void, str] = emit_str(out, ordering_suffix(mi.flags));
+    if (R.is_err[R.Void, str](res_order)) { ret res_order; }
 
-    val res_ops: R.Result[bool, str] = render_operands(out, interner, mi);
-    if (R.is_err[bool, str](res_ops)) { ret res_ops; }
-    val res_rm: R.Result[bool, str] = emit_str(out, rounding_operand(mi.opcode::inst.MachOp));
-    if (R.is_err[bool, str](res_rm)) { ret res_rm; }
+    val res_ops: R.Result[R.Void, str] = render_operands(out, interner, mi);
+    if (R.is_err[R.Void, str](res_ops)) { ret res_ops; }
+    val res_rm: R.Result[R.Void, str] = emit_str(out, rounding_operand(mi.opcode::inst.MachOp));
+    if (R.is_err[R.Void, str](res_rm)) { ret res_rm; }
     ret emit_str(out, "\n");
 }
 
-# the explicit rounding-mode operand a float conversion spells
-#
-# The rounding mode is a FIELD OF THE WORD, and an assembler fills it from the operand
-# or, when there is none, from the form's default - which for the float-to-integer
-# converts is the DYNAMIC mode read out of `fcsr`. This encoder emits those converts
-# round-toward-zero, mach's defined cast rule, so a line printed without the operand
-# reassembles to a different instruction than the one beside it in the object and
-# disagrees with every disassembly of it. Naming the mode is what makes the two agree.
-#
-# Only that family needs one. The float arithmetic and the remaining converts already
-# encode the mode the assembler defaults to for their form - dynamic where the result
-# may round, round-to-nearest where it cannot - so an operand there would be noise.
-# ---
-# op:  the concrete instruction
-# ret: the trailing operand text, empty for a form that needs none
 fun rounding_operand(op: inst.MachOp) str {
     if (op >= inst.FCVT_W_S && op <= inst.FCVT_LU_D) { ret ", rtz"; }
     ret "";
 }
 
-# render an instruction's operands, left to right
-#
-# ONE riscv64 SYNTAX RULE lives here: a store's destination is its memory operand,
-# but RISC-V writes the transferred register first (`sd a0, 8(sp)`), so a memory
-# destination is rendered after its source. Everything else is the operand order the
-# encoder built.
-# ---
-# out:      destination writer
-# interner: resolves symbol ids to their source names
-# mi:       the instruction whose operands are rendered
-# ret:      true on success, or an error naming an unrenderable shape
-fun render_operands(out: *writer.Writer, interner: *intern.Interner, mi: *isa.Inst) R.Result[bool, str] {
+fun render_operands(out: *writer.Writer, interner: *intern.Interner, mi: *isa.Inst) R.Result[R.Void, str] {
     if (mi.dst.kind == isa.OPK_MEM) {
         var printed: u32 = 0;
         val res_src: R.Result[u32, str] = render_operand(out, interner, mi, ?mi.src1, printed);
-        if (R.is_err[u32, str](res_src)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_src)); }
+        if (R.is_err[u32, str](res_src)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](res_src)); }
         printed = R.unwrap_ok[u32, str](res_src);
         val res_dst: R.Result[u32, str] = render_operand(out, interner, mi, ?mi.dst, printed);
-        if (R.is_err[u32, str](res_dst)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_dst)); }
-        ret R.ok[bool, str](true);
+        if (R.is_err[u32, str](res_dst)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](res_dst)); }
+        ret R.ok_void[str]();
     }
 
     var printed: u32 = 0;
     val res_dst: R.Result[u32, str] = render_operand(out, interner, mi, ?mi.dst, printed);
-    if (R.is_err[u32, str](res_dst)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_dst)); }
+    if (R.is_err[u32, str](res_dst)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](res_dst)); }
     printed = R.unwrap_ok[u32, str](res_dst);
 
     val res_src1: R.Result[u32, str] = render_operand(out, interner, mi, ?mi.src1, printed);
-    if (R.is_err[u32, str](res_src1)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_src1)); }
+    if (R.is_err[u32, str](res_src1)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](res_src1)); }
     printed = R.unwrap_ok[u32, str](res_src1);
 
     val res_src2: R.Result[u32, str] = render_operand(out, interner, mi, ?mi.src2, printed);
-    if (R.is_err[u32, str](res_src2)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_src2)); }
-    ret R.ok[bool, str](true);
+    if (R.is_err[u32, str](res_src2)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](res_src2)); }
+    ret R.ok_void[str]();
 }
 
-# render one operand, prefixed by the right separator for its position
-# ---
-# out:      destination writer
-# interner: resolves symbol ids to their source names
-# mi:       the owning instruction (supplies the label flavour)
-# op:       the operand to render
-# printed:  how many operands have been rendered already
-# ret:      the new rendered-operand count, or an error
 fun render_operand(out: *writer.Writer, interner: *intern.Interner, mi: *isa.Inst,
                    op: *isa.Operand, printed: u32) R.Result[u32, str] {
     if (op.kind == isa.OPK_NONE) { ret R.ok[u32, str](printed); }
 
     var sep: str = ", ";
     if (printed == 0) { sep = " "; }
-    val res_sep: R.Result[bool, str] = emit_str(out, sep);
-    if (R.is_err[bool, str](res_sep)) { ret R.err[u32, str](R.unwrap_err[bool, str](res_sep)); }
+    val res_sep: R.Result[R.Void, str] = emit_str(out, sep);
+    if (R.is_err[R.Void, str](res_sep)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](res_sep)); }
 
-    val res: R.Result[bool, str] = render_operand_body(out, interner, mi, op);
-    if (R.is_err[bool, str](res)) { ret R.err[u32, str](R.unwrap_err[bool, str](res)); }
+    val res: R.Result[R.Void, str] = render_operand_body(out, interner, mi, op);
+    if (R.is_err[R.Void, str](res)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](res)); }
     ret R.ok[u32, str](printed + 1);
 }
 
-# render an operand's text
-#
-# A register names its psABI mnemonic in its own bank - the composite register id
-# carries its class, so a float id prints `fa0` without the opcode being consulted. A
-# memory operand renders `<displacement>(<base>)`, RISC-V's address syntax, where the
-# displacement may itself be a modified symbol reference (`%pcrel_lo(sym)(t0)`).
-# ---
-# out:      destination writer
-# interner: resolves symbol ids to their source names
-# mi:       the owning instruction
-# op:       the operand to render
-# ret:      true on success, or an error naming the unrenderable shape
 fun render_operand_body(out: *writer.Writer, interner: *intern.Interner, mi: *isa.Inst,
-                        op: *isa.Operand) R.Result[bool, str] {
+                        op: *isa.Operand) R.Result[R.Void, str] {
     if (op.kind == isa.OPK_REG)   { ret emit_str(out, reg_name(op.reg)); }
     if (op.kind == isa.OPK_IMM)   { ret emit_i64(out, op.imm); }
     if (op.kind == isa.OPK_SYM)   { ret emit_sym(out, interner, op); }
     if (op.kind == isa.OPK_LABEL) { ret emit_target(out, interner, mi, op); }
     if (op.kind == isa.OPK_MEM) {
-        val res_disp: R.Result[bool, str] = emit_mem_disp(out, interner, mi, op);
-        if (R.is_err[bool, str](res_disp)) { ret res_disp; }
-        val res_open: R.Result[bool, str] = emit_str(out, "(");
-        if (R.is_err[bool, str](res_open)) { ret res_open; }
-        val res_base: R.Result[bool, str] = emit_str(out, reg_name(op.base));
-        if (R.is_err[bool, str](res_base)) { ret res_base; }
+        val res_disp: R.Result[R.Void, str] = emit_mem_disp(out, interner, mi, op);
+        if (R.is_err[R.Void, str](res_disp)) { ret res_disp; }
+        val res_open: R.Result[R.Void, str] = emit_str(out, "(");
+        if (R.is_err[R.Void, str](res_open)) { ret res_open; }
+        val res_base: R.Result[R.Void, str] = emit_str(out, reg_name(op.base));
+        if (R.is_err[R.Void, str](res_base)) { ret res_base; }
         ret emit_str(out, ")");
     }
-    ret R.err[bool, str]("--emit-asm: riscv64 instruction operand has no renderable kind");
+    ret R.err[R.Void, str]("--emit-asm: riscv64 instruction operand has no renderable kind");
 }
 
-# render a memory operand's displacement
-#
-# A plain access prints its byte displacement. An access reaching a global through
-# the low half of a pc-relative pair prints the modified symbol instead, and a
-# relaxed far jump's trampoline the modified block its target lies in - in both cases
-# the encoded displacement is a placeholder the linker or the branch patcher fills,
-# so the name is what identifies the target.
-# ---
-# out:      destination writer
-# interner: resolves symbol ids to their source names
-# mi:       the owning instruction (its flags say whether the target is a block)
-# op:       the memory operand
-# ret:      true on success, or the first write error
-fun emit_mem_disp(out: *writer.Writer, interner: *intern.Interner, mi: *isa.Inst, op: *isa.Operand) R.Result[bool, str] {
+fun emit_mem_disp(out: *writer.Writer, interner: *intern.Interner, mi: *isa.Inst, op: *isa.Operand) R.Result[R.Void, str] {
     if (op.sym_mod == isa.SYM_MOD_NONE) { ret emit_i64(out, op.disp::i64); }
     if ((mi.flags & inst.FLAG_TARGET_BLOCK) == 0) { ret emit_sym(out, interner, op); }
 
-    val res_open: R.Result[bool, str] = emit_str(out, modifier_text(op.sym_mod));
-    if (R.is_err[bool, str](res_open)) { ret res_open; }
-    val res_blk: R.Result[bool, str] = emit_block(out, op.imm::u32);
-    if (R.is_err[bool, str](res_blk)) { ret res_blk; }
+    val res_open: R.Result[R.Void, str] = emit_str(out, modifier_text(op.sym_mod));
+    if (R.is_err[R.Void, str](res_open)) { ret res_open; }
+    val res_blk: R.Result[R.Void, str] = emit_block(out, op.imm::u32);
+    if (R.is_err[R.Void, str](res_blk)) { ret res_blk; }
     ret emit_str(out, ")");
 }
 
-# render a branch target
-#
-# A block-target branch names its destination block (`.N`). The two targets that name
-# no block mark themselves in the instruction's flags: an inline-asm numeric local
-# label carries its number and direction (`1f` / `1b`), and a relaxation-internal
-# guard carries the byte distance it skips (`.+8`). A relaxed far trampoline names
-# its block under a pc-relative modifier, exactly as an assembler would spell it.
-# ---
-# out:      destination writer
-# interner: resolves symbol ids to their source names
-# mi:       the owning instruction (its flags carry the label flavour)
-# op:       the label operand to render
-# ret:      true on success, or the write error
-fun emit_target(out: *writer.Writer, interner: *intern.Interner, mi: *isa.Inst, op: *isa.Operand) R.Result[bool, str] {
+fun emit_target(out: *writer.Writer, interner: *intern.Interner, mi: *isa.Inst, op: *isa.Operand) R.Result[R.Void, str] {
     if ((mi.flags & inst.FLAG_LABEL_SKIP) != 0) {
-        val res_dot: R.Result[bool, str] = emit_str(out, ".+");
-        if (R.is_err[bool, str](res_dot)) { ret res_dot; }
+        val res_dot: R.Result[R.Void, str] = emit_str(out, ".+");
+        if (R.is_err[R.Void, str](res_dot)) { ret res_dot; }
         ret emit_i64(out, op.imm);
     }
     if ((mi.flags & inst.FLAG_LABEL_LOCAL) != 0 && op.sym_mod == isa.SYM_MOD_NONE) {
-        val res_num: R.Result[bool, str] = emit_u64(out, op.imm::u64);
-        if (R.is_err[bool, str](res_num)) { ret res_num; }
+        val res_num: R.Result[R.Void, str] = emit_u64(out, op.imm::u64);
+        if (R.is_err[R.Void, str](res_num)) { ret res_num; }
         if ((mi.flags & inst.FLAG_LABEL_FWD) != 0) { ret emit_str(out, "f"); }
         ret emit_str(out, "b");
     }
     if (op.sym_mod == isa.SYM_MOD_NONE) { ret emit_block(out, op.imm::u32); }
 
-    val res_open: R.Result[bool, str] = emit_str(out, modifier_text(op.sym_mod));
-    if (R.is_err[bool, str](res_open)) { ret res_open; }
-    val res_blk: R.Result[bool, str] = emit_block(out, op.imm::u32);
-    if (R.is_err[bool, str](res_blk)) { ret res_blk; }
+    val res_open: R.Result[R.Void, str] = emit_str(out, modifier_text(op.sym_mod));
+    if (R.is_err[R.Void, str](res_open)) { ret res_open; }
+    val res_blk: R.Result[R.Void, str] = emit_block(out, op.imm::u32);
+    if (R.is_err[R.Void, str](res_blk)) { ret res_blk; }
     ret emit_str(out, ")");
 }
 
-# render a symbol reference under its relocation modifier
-#
-# riscv64 reaches a symbol through an instruction pair whose halves take different
-# relocations, so the modifier is what makes each line assemble back to the
-# instruction it came from.
-# ---
-# out:      destination writer
-# interner: the interner that resolves the id to text
-# op:       the symbol-carrying operand
-# ret:      true on success, or an error
-fun emit_sym(out: *writer.Writer, interner: *intern.Interner, op: *isa.Operand) R.Result[bool, str] {
+fun emit_sym(out: *writer.Writer, interner: *intern.Interner, op: *isa.Operand) R.Result[R.Void, str] {
     if (op.sym_mod == isa.SYM_MOD_NONE) {
-        val res_bare: R.Result[bool, str] = emit_name(out, interner, op.sym_id::intern.StrId);
-        if (R.is_err[bool, str](res_bare)) { ret res_bare; }
+        val res_bare: R.Result[R.Void, str] = emit_name(out, interner, op.sym_id::intern.StrId);
+        if (R.is_err[R.Void, str](res_bare)) { ret res_bare; }
         ret emit_addend(out, op.sym_addend);
     }
-    val res_open: R.Result[bool, str] = emit_str(out, modifier_text(op.sym_mod));
-    if (R.is_err[bool, str](res_open)) { ret res_open; }
-    val res_name: R.Result[bool, str] = emit_name(out, interner, op.sym_id::intern.StrId);
-    if (R.is_err[bool, str](res_name)) { ret res_name; }
-    # INSIDE THE PARENS, because the modifier applies to the whole address: an
-    # assembler reads `%pcrel_hi(g+8)` and would read `%pcrel_hi(g)+8` as an
-    # arithmetic expression on the relocated value, which is a different thing
-    val res_add: R.Result[bool, str] = emit_addend(out, op.sym_addend);
-    if (R.is_err[bool, str](res_add)) { ret res_add; }
+    val res_open: R.Result[R.Void, str] = emit_str(out, modifier_text(op.sym_mod));
+    if (R.is_err[R.Void, str](res_open)) { ret res_open; }
+    val res_name: R.Result[R.Void, str] = emit_name(out, interner, op.sym_id::intern.StrId);
+    if (R.is_err[R.Void, str](res_name)) { ret res_name; }
+    val res_add: R.Result[R.Void, str] = emit_addend(out, op.sym_addend);
+    if (R.is_err[R.Void, str](res_add)) { ret res_add; }
     ret emit_str(out, ")");
 }
 
-# append a symbol reference's addend as `+N` / `-N`, or nothing when it is zero
-#
-# The offset half of naming an address (#2839). Without it `&g.lo` and `&g.hi`
-# rendered the identical line while the objects relocated against `g` and `g+8`, so
-# the `.s` said two functions computed the same address. A ZERO ADDEND PRINTS
-# NOTHING rather than `+0`, because `g` is the spelling an assembler produces for the
-# same relocation and the artifact has to match what the object holds.
-# ---
-# out:    destination writer
-# addend: the addend to spell
-# ret:    true on success, or the first write error
-fun emit_addend(out: *writer.Writer, addend: i32) R.Result[bool, str] {
-    if (addend == 0) { ret R.ok[bool, str](true); }
+fun emit_addend(out: *writer.Writer, addend: i32) R.Result[R.Void, str] {
+    if (addend == 0) { ret R.ok_void[str](); }
     if (addend < 0) {
-        val res_neg: R.Result[bool, str] = emit_str(out, "-");
-        if (R.is_err[bool, str](res_neg)) { ret res_neg; }
+        val res_neg: R.Result[R.Void, str] = emit_str(out, "-");
+        if (R.is_err[R.Void, str](res_neg)) { ret res_neg; }
         ret emit_i64(out, 0 - addend::i64);
     }
-    val res_pos: R.Result[bool, str] = emit_str(out, "+");
-    if (R.is_err[bool, str](res_pos)) { ret res_pos; }
+    val res_pos: R.Result[R.Void, str] = emit_str(out, "+");
+    if (R.is_err[R.Void, str](res_pos)) { ret res_pos; }
     ret emit_i64(out, addend::i64);
 }
 
-# the RISC-V assembler spelling of a relocation modifier, with its opening paren
-# ---
-# mod: the modifier (one of isa.SYM_MOD_*)
-# ret: the opening text, or an empty string for no modifier
 fun modifier_text(mod: isa.SymModifier) str {
     if (mod == isa.SYM_MOD_PCREL_HI) { ret "%pcrel_hi("; }
     if (mod == isa.SYM_MOD_PCREL_LO) { ret "%pcrel_lo("; }
@@ -363,10 +197,6 @@ fun modifier_text(mod: isa.SymModifier) str {
     ret "";
 }
 
-# the acquire / release suffix an atomic's flags spell
-# ---
-# flags: the instruction's flags
-# ret:   the suffix, empty for an unordered access
 fun ordering_suffix(flags: u16) str {
     val aq: bool = (flags & inst.FLAG_AQ) != 0;
     val rl: bool = (flags & inst.FLAG_RL) != 0;
@@ -376,33 +206,17 @@ fun ordering_suffix(flags: u16) str {
     ret "";
 }
 
-# render a block's local label `.N`
-# ---
-# out: destination writer
-# id:  the block id
-# ret: true on success, or the first write error
-fun emit_block(out: *writer.Writer, id: u32) R.Result[bool, str] {
-    val res_dot: R.Result[bool, str] = emit_str(out, ".");
-    if (R.is_err[bool, str](res_dot)) { ret res_dot; }
+fun emit_block(out: *writer.Writer, id: u32) R.Result[R.Void, str] {
+    val res_dot: R.Result[R.Void, str] = emit_str(out, ".");
+    if (R.is_err[R.Void, str](res_dot)) { ret res_dot; }
     ret emit_u64(out, id::u64);
 }
 
-# the psABI mnemonic a composite register id names, in its own bank
-#
-# The id carries its class, so a float register names `fa0` regardless of the opcode
-# and never aliases the integer register of the same index.
-# ---
-# id:  the composite register id
-# ret: the psABI register name
 fun reg_name(id: i32) str {
     if (isa.regid_class(id) == isa.REG_CLASS_ID_XMM) { ret fp_name(isa.regid_index(id)::u32); }
     ret gp_name(id::u32);
 }
 
-# the RISC-V psABI integer-register mnemonic for a register index (x0-x31)
-# ---
-# idx: the integer register index
-# ret: the psABI name, or `x?` for an out-of-range index
 pub fun gp_name(idx: u32) str {
     if (idx == 0)  { ret "zero"; }
     if (idx == 1)  { ret "ra"; }
@@ -439,10 +253,6 @@ pub fun gp_name(idx: u32) str {
     ret "x?";
 }
 
-# the RISC-V psABI float-register mnemonic for a register index (f0-f31)
-# ---
-# idx: the float register index
-# ret: the psABI name, or `f?` for an out-of-range index
 pub fun fp_name(idx: u32) str {
     if (idx == 0)  { ret "ft0"; }
     if (idx == 1)  { ret "ft1"; }
@@ -479,15 +289,6 @@ pub fun fp_name(idx: u32) str {
     ret "f?";
 }
 
-# the mnemonic for a concrete RV64 machine instruction, or nil when unmapped
-#
-# Total over the instruction surface by construction: an unmapped opcode returns nil
-# and the caller fails the build, never placeholder text. A form that reaches the
-# encoder without being named here breaks the render rather than printing something
-# an assembler would reject.
-# ---
-# op:  the concrete instruction to name
-# ret: the mnemonic text, or nil for an opcode with no mapping
 pub fun mnemonic(op: inst.MachOp) str {
     if (op == inst.ADD)  { ret "add"; }
     if (op == inst.SUB)  { ret "sub"; }
@@ -654,66 +455,35 @@ pub fun mnemonic(op: inst.MachOp) str {
     ret nil;
 }
 
-# write a string, mapping a format error to the bool/str result shape
-# ---
-# out: destination writer
-# s:   the string to write
-# ret: true on success, or the write error
-fun emit_str(out: *writer.Writer, s: str) R.Result[bool, str] {
+fun emit_str(out: *writer.Writer, s: str) R.Result[R.Void, str] {
     val res_write: R.Result[usize, str] = format.write_str(out, s);
-    if (R.is_err[usize, str](res_write)) { ret R.err[bool, str](R.unwrap_err[usize, str](res_write)); }
-    ret R.ok[bool, str](true);
+    if (R.is_err[usize, str](res_write)) { ret R.err[R.Void, str](R.unwrap_err[usize, str](res_write)); }
+    ret R.ok_void[str]();
 }
 
-# write an unsigned integer
-# ---
-# out: destination writer
-# n:   the value to write
-# ret: true on success, or the write error
-fun emit_u64(out: *writer.Writer, n: u64) R.Result[bool, str] {
+fun emit_u64(out: *writer.Writer, n: u64) R.Result[R.Void, str] {
     val res_write: R.Result[usize, str] = format.write_u64(out, n);
-    if (R.is_err[usize, str](res_write)) { ret R.err[bool, str](R.unwrap_err[usize, str](res_write)); }
-    ret R.ok[bool, str](true);
+    if (R.is_err[usize, str](res_write)) { ret R.err[R.Void, str](R.unwrap_err[usize, str](res_write)); }
+    ret R.ok_void[str]();
 }
 
-# write a signed integer
-# ---
-# out: destination writer
-# n:   the value to write
-# ret: true on success, or the write error
-fun emit_i64(out: *writer.Writer, n: i64) R.Result[bool, str] {
+fun emit_i64(out: *writer.Writer, n: i64) R.Result[R.Void, str] {
     val res_write: R.Result[usize, str] = format.write_i64(out, n);
-    if (R.is_err[usize, str](res_write)) { ret R.err[bool, str](R.unwrap_err[usize, str](res_write)); }
-    ret R.ok[bool, str](true);
+    if (R.is_err[usize, str](res_write)) { ret R.err[R.Void, str](R.unwrap_err[usize, str](res_write)); }
+    ret R.ok_void[str]();
 }
 
-# write an interned name, failing when the id does not resolve
-# ---
-# out:      destination writer
-# interner: the interner that resolves the id to text
-# id:       the interned string id to write
-# ret:      true on success, or an error
-fun emit_name(out: *writer.Writer, interner: *intern.Interner, id: intern.StrId) R.Result[bool, str] {
+fun emit_name(out: *writer.Writer, interner: *intern.Interner, id: intern.StrId) R.Result[R.Void, str] {
     val opt_name: O.Option[str] = intern.lookup(interner, id);
     if (O.is_none[str](opt_name)) {
-        ret R.err[bool, str]("--emit-asm: a symbol name did not resolve in the interner");
+        ret R.err[R.Void, str]("--emit-asm: a symbol name did not resolve in the interner");
     }
     ret emit_str(out, O.unwrap[str](opt_name));
 }
 
-# a fixed capture buffer the rendering tests write into, and its writer
-#
-# The renderer's only output is a `writer.Writer`, so testing what it renders means
-# supplying one; this is the smallest possible in-memory sink.
 var test_sink_buf: [4096]u8;
 var test_sink_len: usize = 0;
 
-# append to the capture buffer, matching `writer.WriteFun`
-# ---
-# ctx: unused; the buffer is module state
-# buf: bytes to append
-# len: number of bytes
-# ret: the byte count, always accepted
 pub fun test_sink_write(ctx: ptr, buf: *u8, len: usize) R.Result[usize, str] {
     var i: usize = 0;
     for (i < len) {
@@ -726,22 +496,15 @@ pub fun test_sink_write(ctx: ptr, buf: *u8, len: usize) R.Result[usize, str] {
     ret R.ok[usize, str](len);
 }
 
-# discard everything the capture buffer holds
 pub fun test_sink_reset() {
     test_sink_len = 0;
 }
 
-# the text the capture buffer holds, NUL-terminated
-# ---
-# ret: the captured text
 pub fun test_sink_text() str {
     test_sink_buf[test_sink_len] = 0;
     ret (?test_sink_buf[0])::str;
 }
 
-# the psABI register mnemonics name each bank's roles, so a rendered operand reads as
-# the assembler spells it and an out-of-range index degrades to a marker rather than
-# an invented name
 test "mach.lang.target.isa.riscv.printer.names:abi_mnemonics" {
     if (!str_equals(gp_name(0), "zero"))  { ret 1; }
     if (!str_equals(gp_name(1), "ra"))    { ret 1; }
@@ -761,16 +524,6 @@ test "mach.lang.target.isa.riscv.printer.names:abi_mnemonics" {
     ret 0;
 }
 
-# a float conversion names the rounding mode it encodes, so the line reassembles to
-# the word it came from
-#
-# The mode is a field of the word and an assembler fills it from this operand or,
-# without one, from the form's default. The float-to-integer converts default to the
-# DYNAMIC mode, and this encoder emits them round-toward-zero, so the line without the
-# operand named a different instruction than the one in the object - `objdump` prints
-# `fcvt.w.s a0,fa0,rtz` for the same four bytes. The int-to-float direction is the
-# control: it encodes the mode its form already defaults to and takes no operand, so a
-# printer appending one unconditionally would be wrong in the other direction.
 test "mach.lang.target.isa.riscv.printer.render_inst:rounding_mode_is_named" {
     var w: writer.Writer;
     w.ctx     = nil;
@@ -785,7 +538,7 @@ test "mach.lang.target.isa.riscv.printer.render_inst:rounding_mode_is_named" {
     f2i.dst    = a0;
     f2i.src1   = fa0;
     test_sink_reset();
-    if (R.is_err[bool, str](render_inst(?w, nil, ?f2i)))         { ret 1; }
+    if (R.is_err[R.Void, str](render_inst(?w, nil, ?f2i)))         { ret 1; }
     if (!str_equals(test_sink_text(), "  fcvt.w.s a0, fa0, rtz\n")) { ret 1; }
 
     var i2f: isa.Inst = isa.inst_blank();
@@ -794,74 +547,44 @@ test "mach.lang.target.isa.riscv.printer.render_inst:rounding_mode_is_named" {
     i2f.dst    = fa0;
     i2f.src1   = a0;
     test_sink_reset();
-    if (R.is_err[bool, str](render_inst(?w, nil, ?i2f)))      { ret 1; }
+    if (R.is_err[R.Void, str](render_inst(?w, nil, ?i2f)))      { ret 1; }
     if (!str_equals(test_sink_text(), "  fcvt.s.w fa0, a0\n")) { ret 1; }
 
-    # the whole float-to-integer family names it, not just the one form
     if (!str_equals(rounding_operand(inst.FCVT_LU_D), ", rtz")) { ret 1; }
     if (!str_equals(rounding_operand(inst.FCVT_W_D), ", rtz"))  { ret 1; }
-    # and nothing outside it does - a float add takes the dynamic mode it defaults to
     if (!str_equals(rounding_operand(inst.FADD_D), ""))   { ret 1; }
     if (!str_equals(rounding_operand(inst.FCVT_S_D), "")) { ret 1; }
     if (!str_equals(rounding_operand(inst.FMV_X_W), "")) { ret 1; }
     ret 0;
 }
 
-# every concrete instruction the encoder can emit names a real RV64 mnemonic, and an
-# opcode outside the surface names none - a form reaching the encoder unnamed breaks
-# the render rather than printing text no assembler would accept
 test "mach.lang.target.isa.riscv.printer.mnemonic:opcode_names" {
-    # the RV64 word forms are distinct instructions, not width variants of a name
     if (!str_equals(mnemonic(inst.ADD), "add"))     { ret 1; }
     if (!str_equals(mnemonic(inst.ADDW), "addw"))   { ret 1; }
     if (!str_equals(mnemonic(inst.ADDI), "addi"))   { ret 1; }
     if (!str_equals(mnemonic(inst.ADDIW), "addiw")) { ret 1; }
 
-    # the forms the old MIR-level printer collapsed into pseudo-mnemonics
     if (!str_equals(mnemonic(inst.JAL), "jal"))   { ret 1; }
     if (!str_equals(mnemonic(inst.JALR), "jalr")) { ret 1; }
     if (!str_equals(mnemonic(inst.BLT), "blt"))   { ret 1; }
     if (!str_equals(mnemonic(inst.SD), "sd"))     { ret 1; }
     if (!str_equals(mnemonic(inst.LD), "ld"))     { ret 1; }
 
-    # the float bank spells its precision, and a cross-bank reinterpret its direction
     if (!str_equals(mnemonic(inst.FADD_D), "fadd.d"))     { ret 1; }
     if (!str_equals(mnemonic(inst.FSGNJN_S), "fsgnjn.s")) { ret 1; }
     if (!str_equals(mnemonic(inst.FCVT_W_D), "fcvt.w.d")) { ret 1; }
     if (!str_equals(mnemonic(inst.FMV_X_W), "fmv.x.w"))   { ret 1; }
 
-    # an atomic names its width; the ordering rides the flags, not the table
     if (!str_equals(mnemonic(inst.AMOADD_D), "amoadd.d")) { ret 1; }
     if (!str_equals(mnemonic(inst.LR_W), "lr.w"))         { ret 1; }
     if (!str_equals(ordering_suffix(inst.FLAG_AQ), ".aq")) { ret 1; }
     if (!str_equals(ordering_suffix(inst.FLAG_AQ | inst.FLAG_RL), ".aqrl")) { ret 1; }
     if (!str_equals(ordering_suffix(0), "")) { ret 1; }
 
-    # an opcode outside the surface has no name, so the render fails rather than
-    # inventing one
     if (mnemonic(inst.MOP_NONE) != nil) { ret 1; }
     ret 0;
 }
 
-# TWO DIFFERENT ADDRESSES INSIDE ONE OBJECT RENDER AS TWO DIFFERENT LINES (#2839)
-#
-# `&g.lo` and `&g.hi` lower to the same symbol at addends 0 and 8, and the objects
-# relocate against `g` and `g+8` (`R_RISCV_PCREL_HI20 g` versus `g+0x8`). The
-# rendering dropped the addend, so both functions printed the identical
-# `auipc a0, %pcrel_hi(g)` - the `.s` stating that two functions compute the same
-# address, which is a wrong claim rather than a missing detail.
-#
-# ASSERTING THE PAIR IS THE POINT. A test that only checked the addend "is printed"
-# would say nothing about the collapse, so both lines are named exactly and the
-# zero-addend one is pinned to have no `+0`.
-#
-# THE OFFSET GOES INSIDE THE PARENS, and only on the HIGH half. `%pcrel_hi(g+8)` is
-# what an assembler reads back, and `%pcrel_hi(g)+8` would be arithmetic on the relocated
-# value, a different thing. And the low half spells NOTHING, because the pair
-# materializes one address and the high half owns its constant - `push_pcrel_lo`
-# records the low half's relocation as the high addend plus its own distance back to
-# the auipc, which is a pairing fact and not a symbol offset. A `%pcrel_lo(g+8)` here
-# would double-count the constant, so the zero is load bearing and is asserted.
 test "mach.lang.target.isa.riscv.printer.render_inst:a_symbol_addend_is_part_of_the_address" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -874,31 +597,27 @@ test "mach.lang.target.isa.riscv.printer.render_inst:a_symbol_addend_is_part_of_
     w.ctx     = nil;
     w.f_write = test_sink_write;
 
-    # the high half of `&g.lo` and of `&g.hi`.
     var hi_lo: isa.Inst = isa.inst_blank();
     hi_lo.opcode = inst.AUIPC::u16;
     hi_lo.size   = 8;
     hi_lo.dst    = isa.make_reg(10, 8);
     hi_lo.src1   = isa.make_sym_addend(g::u32, 8, isa.SYM_MOD_PCREL_HI, 0);
     test_sink_reset();
-    if (R.is_err[bool, str](render_inst(?w, ?itn, ?hi_lo)))                { intern.dnit(?itn); ret 1; }
+    if (R.is_err[R.Void, str](render_inst(?w, ?itn, ?hi_lo)))                { intern.dnit(?itn); ret 1; }
     if (!str_equals(test_sink_text(), "  auipc a0, %pcrel_hi(g)\n"))       { intern.dnit(?itn); ret 1; }
 
     var hi_hi: isa.Inst = hi_lo;
     hi_hi.src1 = isa.make_sym_addend(g::u32, 8, isa.SYM_MOD_PCREL_HI, 8);
     test_sink_reset();
-    if (R.is_err[bool, str](render_inst(?w, ?itn, ?hi_hi)))                { intern.dnit(?itn); ret 1; }
+    if (R.is_err[R.Void, str](render_inst(?w, ?itn, ?hi_hi)))                { intern.dnit(?itn); ret 1; }
     if (!str_equals(test_sink_text(), "  auipc a0, %pcrel_hi(g+8)\n"))     { intern.dnit(?itn); ret 1; }
 
-    # a negative addend spells its own sign rather than a `+-8`.
     var hi_neg: isa.Inst = hi_lo;
     hi_neg.src1 = isa.make_sym_addend(g::u32, 8, isa.SYM_MOD_PCREL_HI, 0 - 8);
     test_sink_reset();
-    if (R.is_err[bool, str](render_inst(?w, ?itn, ?hi_neg)))               { intern.dnit(?itn); ret 1; }
+    if (R.is_err[R.Void, str](render_inst(?w, ?itn, ?hi_neg)))               { intern.dnit(?itn); ret 1; }
     if (!str_equals(test_sink_text(), "  auipc a0, %pcrel_hi(g-8)\n"))     { intern.dnit(?itn); ret 1; }
 
-    # THE LOW HALF OF BOTH SPELLS NO ADDEND. Its own relocation carries one, and it is
-    # not this symbol's offset - the high half already stated that.
     var lo_half: isa.Inst = isa.inst_blank();
     lo_half.opcode = inst.ADDI::u16;
     lo_half.size   = 8;
@@ -906,11 +625,9 @@ test "mach.lang.target.isa.riscv.printer.render_inst:a_symbol_addend_is_part_of_
     lo_half.src1   = isa.make_reg(10, 8);
     lo_half.src2   = isa.make_sym_addend(g::u32, 8, isa.SYM_MOD_PCREL_LO, 0);
     test_sink_reset();
-    if (R.is_err[bool, str](render_inst(?w, ?itn, ?lo_half)))              { intern.dnit(?itn); ret 1; }
+    if (R.is_err[R.Void, str](render_inst(?w, ?itn, ?lo_half)))              { intern.dnit(?itn); ret 1; }
     if (!str_equals(test_sink_text(), "  addi a0, a0, %pcrel_lo(g)\n"))    { intern.dnit(?itn); ret 1; }
 
-    # an unmodified reference carries its addend too - the field is the reference's,
-    # not the modifier's.
     var bare: isa.Inst = isa.inst_blank();
     bare.opcode = inst.AUIPC::u16;
     bare.size   = 8;
@@ -918,7 +635,7 @@ test "mach.lang.target.isa.riscv.printer.render_inst:a_symbol_addend_is_part_of_
     bare.src1   = isa.make_sym(g::u32, 8);
     bare.src1.sym_addend = 8;
     test_sink_reset();
-    if (R.is_err[bool, str](render_inst(?w, ?itn, ?bare)))                 { intern.dnit(?itn); ret 1; }
+    if (R.is_err[R.Void, str](render_inst(?w, ?itn, ?bare)))                 { intern.dnit(?itn); ret 1; }
     if (!str_equals(test_sink_text(), "  auipc a0, g+8\n"))                { intern.dnit(?itn); ret 1; }
 
     intern.dnit(?itn);

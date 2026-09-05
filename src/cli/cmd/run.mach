@@ -1,26 +1,18 @@
-# `mach run` - execute the already-built artifact for the project
-#
-# Locates the binary `mach build` produced for the same selection and executes
-# it, forwarding any arguments after a `--` separator to the child as its argv.
-# This is a post-`mach build` convenience: it does NOT build. When the artifact
-# does not exist yet it errors and points at `mach build` rather than silently
-# building. The child inherits the parent's environment, and its exit code
-# becomes this subcommand's exit code. `--emit obj` is rejected, since running a
-# relocatable object is not meaningful. `--runner <cmd>` executes the binary as
-# `<cmd> <binary> <args...>` instead of exec'ing it directly - the host-side
-# launcher for foreign-target artifacts (e.g. wine for a windows target). Absent
-# the flag, the binary is exec'd directly and a spawn failure reports exactly
-# that.
-
 use std.allocator.arena;
 use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
 use fs: std.filesystem;
 use std.print;
 use std.process.env;
-use std.process.exec;
 use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.path;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
 
 use A: std.allocator;
 use O: std.types.option;
@@ -29,23 +21,23 @@ use R: std.types.result;
 use mach.cli.args;
 use mach.cli.util;
 use mach.lang.driver;
+use dcfg: mach.lang.driver.config;
 use mach.lang.manifest;
+use mach.subprocess;
 
-# `mach run` subcommand entry point
-#
-# Resolves the selected artifact's output path from the manifest, requires it to
-# already exist on disk, then execs it forwarding the post-`--` arguments. Called
-# by cmd.dispatch.
+# `mach run`: execute the project's already-built binary, forwarding the arguments after
+# `--` to it. `--emit` and build-only options are refused; `--runner <cmd>` executes
+# `<cmd> <binary> <args>` instead, which is required when the target is not runnable on
+# this host; `--timeout_seconds <n>` runs the program in its own process group and
+# terminates it after n seconds
 # ---
-# argc:  argument count including argv[0]
-# argv:  the argument vector (argc null-terminated byte pointers)
-# marks: consumption record parallel to argv, for the unknown-flag rejector
-# ret:   the child's exit code, 1 on a resolution or user error, 2 on internal error
-pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
-    # the resolution sees only the args before `--`; everything after is the
-    # child's argv. clip the count here so a post-`--` `--emit` is the program's
-    # argument, not a flag this command rejects.
-    val sep: usize = util.arg_separator_index(argc, argv);
+# argv: the full process arguments
+# inv: the parsed invocation for this command
+# ret: the program's exit code; 128 plus the signal number when it was killed by a signal;
+#  3 when the timeout expired; 1 for a usage error, a missing or non-executable artifact,
+#  or a spawn or wait failure; 2 out of memory
+pub fun run_typed(argv: **u8, inv: *args.ParsedInvocation) i64 {
+    val sep: usize = inv.sep_idx;
 
     val opt_emit: O.Option[str] = util.flag_value(sep, argv, "--emit");
     if (O.is_some[str](opt_emit)) {
@@ -53,9 +45,6 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         ret 1;
     }
 
-    # the resolved artifact path is suballocated through one arena over a page
-    # allocator. a direct exec never returns, so the arena is reclaimed only on the
-    # error and runner paths, where `arena.dnit` runs after the path is last used.
     var backing: A.Allocator;
     if (O.is_some[str](page.make(?backing))) {
         print.eprint("error: failed to initialise allocator\n");
@@ -73,72 +62,78 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         ret 2;
     }
 
-    # the same CLI flags (`--target`/`--profile`/`--bin`/...) that narrow a build
-    # narrow the artifact here, so `mach run` resolves the exact path `mach build`
-    # produced. the args are read clipped at `--` so a forwarded flag never leaks
-    # into the selection.
-    val res_cfg: R.Result[args.CliArgs, str] = args.parse(sep, argv);
-    if (R.is_err[args.CliArgs, str](res_cfg)) {
-        print.eprint("error: ");
-        print.eprint(R.unwrap_err[args.CliArgs, str](res_cfg));
-        print.eprint("\n");
+    val parsed: args.RunInvocation = args.build_run_invocation(inv);
+
+    val inert: O.Option[*u8] = reject_inert(sep, argv, inv.marks);
+    if (O.is_some[*u8](inert)) {
+        print.eprintf("error: option '{}' is not applicable to 'run'; run executes an existing artifact\n",
+            O.unwrap[*u8](inert)::str);
         arena.dnit(?ar);
         ret 1;
     }
-    val config: args.CliArgs = R.unwrap_ok[args.CliArgs, str](res_cfg);
-
-    # `mach run` executes a pre-built artifact and does not build, so the
-    # cross-cutting and `-O<n>` flags are accepted (marked) but have no effect;
-    # `--runner` is its own. mark the tables it accepts, then read `--runner`'s
-    # value and reject any other unrecognized flag before the project-path
-    # positional is resolved. `--emit` was already rejected above.
-    args.mark_cross(marks, sep, argv);
-    args.mark_flags(marks, sep, argv, ?args.OPT[0], args.OPT_N);
-    args.mark_flags(marks, sep, argv, ?args.RUN_OWN[0], args.RUN_OWN_N);
-    val opt_runner: O.Option[*u8] = util.flag_value(sep, argv, "--runner");
-    if (util.flag_reject_unknown(sep, argv, marks, 2, "mach run")) {
+    if (args.reject_unknown_from_invocation(inv, argv, "mach run")) {
         arena.dnit(?ar);
         ret 1;
     }
 
-    # resolve the project root from the required positional path
-    # (`mach run <path>`); see util.resolve_project_root for the rules.
-    val pix: usize = util.arg_index_positional(sep, argv, marks, 2);
+    if (parsed.output_seen && !parsed.has_output) {
+        print.eprint("error: -o requires a value\n");
+        arena.dnit(?ar);
+        ret 1;
+    }
+
+    var timeout_seconds: i64 = 0;
+    if (parsed.has_timeout) {
+        timeout_seconds = parse_seconds(argv[parsed.timeout_idx]);
+        if (timeout_seconds < 1) {
+            print.eprint("error: --timeout_seconds expects a positive integer number of seconds\n");
+            arena.dnit(?ar);
+            ret 1;
+        }
+    }
+    var output: *u8 = nil;
+    if (parsed.has_output) { output = argv[parsed.output_idx]; }
+
+    val pix: usize = inv.positional_idx;
     var arg: *u8 = nil;
-    if (pix < sep) { arg = argv[pix]; }
+    if (inv.has_positional && pix < sep) { arg = argv[pix]; }
 
-    val root_r: R.Result[str, str] = util.resolve_project_root(?alloc, arg);
-    if (R.is_err[str, str](root_r)) {
+    val loc_r: R.Result[util.ProjectLocation, str] = util.resolve_project_location(?alloc, arg);
+    if (R.is_err[util.ProjectLocation, str](loc_r)) {
         print.eprint("error: ");
-        print.eprint(R.unwrap_err[str, str](root_r));
+        print.eprint(R.unwrap_err[util.ProjectLocation, str](loc_r));
         print.eprint("\n");
         arena.dnit(?ar);
         ret 1;
     }
-    val root: str = R.unwrap_ok[str, str](root_r);
+    val loc: util.ProjectLocation = R.unwrap_ok[util.ProjectLocation, str](loc_r);
+    val root: str = loc.root;
 
     var sel: manifest.Selection;
-    val res_sel: R.Result[bool, str] = args.selection_from_config(?config, ?sel);
-    if (R.is_err[bool, str](res_sel)) {
+    var target_name: *u8 = "";
+    if (parsed.has_target) { target_name = argv[parsed.target_idx]; }
+    var profile_name: *u8 = "";
+    if (parsed.has_profile) { profile_name = argv[parsed.profile_idx]; }
+    var artifact_name: *u8  = "";
+    var has_artifact:  bool = false;
+    if (parsed.has_bin) { artifact_name = argv[parsed.bin_idx]; has_artifact = true; }
+    sel.profile      = profile_name::str;
+    sel.target       = target_name::str;
+    sel.artifact     = artifact_name::str;
+    sel.want_lib     = false;
+    sel.has_artifact = has_artifact;
+
+    val res_ra: R.Result[dcfg.RunArtifact, str] = driver.resolve_run_artifact(?alloc, root, ?sel, output);
+    if (R.is_err[dcfg.RunArtifact, str](res_ra)) {
         print.eprint("error: ");
-        print.eprint(R.unwrap_err[bool, str](res_sel));
+        print.eprint(R.unwrap_err[dcfg.RunArtifact, str](res_ra));
         print.eprint("\n");
         arena.dnit(?ar);
         ret 1;
     }
+    val ra: dcfg.RunArtifact = R.unwrap_ok[dcfg.RunArtifact, str](res_ra);
+    val output_path: str = ra.path;
 
-    val res_path: R.Result[str, str] = driver.resolve_artifact_path(?alloc, root, ?sel);
-    if (R.is_err[str, str](res_path)) {
-        print.eprint("error: ");
-        print.eprint(R.unwrap_err[str, str](res_path));
-        print.eprint("\n");
-        arena.dnit(?ar);
-        ret 1;
-    }
-    val output_path: str = R.unwrap_ok[str, str](res_path);
-
-    # a post-build execute, not a rebuild: when the artifact is absent point at
-    # `mach build` instead of silently producing it.
     if (!fs.is_file(output_path)) {
         print.eprint("error: no built artifact at '");
         print.eprint(output_path);
@@ -147,12 +142,9 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         ret 1;
     }
 
-    # `--runner <cmd>` (read above, before `--`, like every other flag): execute the
-    # binary as `<cmd> <binary> <args...>`. resolved to a concrete path up front
-    # since execve does no PATH search.
     var runner: *u8 = nil;
-    if (O.is_some[*u8](opt_runner)) {
-        val name: *u8 = O.unwrap[*u8](opt_runner);
+    if (parsed.has_runner) {
+        val name: *u8 = argv[parsed.runner_idx];
         val res_runner: R.Result[*u8, str] = util.resolve_cmd(?alloc, name);
         if (R.is_err[*u8, str](res_runner)) {
             print.eprint("error: --runner '");
@@ -165,12 +157,25 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         }
         runner = R.unwrap_ok[*u8, str](res_runner);
     }
+    or {
+        if (!ra.host_runnable) {
+            print.eprintf("error: target '{}' is not runnable on this host; pass --runner\n", ra.target_name);
+            arena.dnit(?ar);
+            ret 1;
+        }
+        val meta_r: R.Result[fs.Metadata, str] = fs.metadata(output_path);
+        if (R.is_err[fs.Metadata, str](meta_r) || (R.unwrap_ok[fs.Metadata, str](meta_r).mode & 0o111) == 0) {
+            print.eprint("error: built artifact '");
+            print.eprint(output_path);
+            print.eprint("' is not executable\n");
+            arena.dnit(?ar);
+            ret 1;
+        }
+    }
 
     var fwd_len: usize = 0;
-    if (sep < argc) { fwd_len = argc - sep - 1; }
+    if (sep < inv.argc) { fwd_len = inv.argc - sep - 1; }
 
-    # child argv: [runner?, binary, forwarded..., nil]. the runner, when given,
-    # occupies one leading slot.
     var lead: usize = 0;
     if (runner != nil) { lead = 1; }
 
@@ -192,26 +197,398 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
     }
     child_argv[lead + 1 + fwd_len] = nil;
 
-    # exec the runner when present, otherwise the built binary directly.
     var exe: *u8 = output_path;
     if (runner != nil) { exe = runner; }
 
-    # the child inherits the parent's environment unmodified.
-    val res_exec: R.Result[exec.ExitStatus, str] = exec.run(exe::str, child_argv, env.environ());
-    if (R.is_err[exec.ExitStatus, str](res_exec)) {
+    var child: subprocess.OwnedSubprocess;
+    subprocess.init(?child);
+    var res_spawn: R.Result[R.Void, str];
+    if (timeout_seconds > 0) {
+        res_spawn = subprocess.spawn_grouped(?alloc, ?child, exe::str, child_argv, env.environ());
+    }
+    or {
+        res_spawn = subprocess.spawn(?alloc, ?child, exe::str, child_argv, env.environ());
+    }
+    if (R.is_err[R.Void, str](res_spawn)) {
         if (runner != nil) { print.eprint("error: failed to execute the runner\n"); }
         or                 { print.eprint("error: failed to execute the built binary\n"); }
         arena.dnit(?ar);
         ret 1;
     }
-    val status: exec.ExitStatus = R.unwrap_ok[exec.ExitStatus, str](res_exec);
+
+    var res_wait: R.Result[subprocess.SubprocessTerminal, str];
+    if (timeout_seconds > 0) {
+        subprocess.bound_seconds(?child, timeout_seconds);
+        val wr: R.Result[*subprocess.OwnedSubprocess, str] =
+            subprocess.wait_any(?alloc, ?child, 1, nil, nil);
+        if (R.is_err[*subprocess.OwnedSubprocess, str](wr)) {
+            res_wait = R.err[subprocess.SubprocessTerminal, str](
+                R.unwrap_err[*subprocess.OwnedSubprocess, str](wr));
+        }
+        or { res_wait = R.ok[subprocess.SubprocessTerminal, str](child.terminal); }
+    }
+    or {
+        res_wait = subprocess.wait(?alloc, ?child);
+    }
+    if (R.is_err[subprocess.SubprocessTerminal, str](res_wait)) {
+        print.eprint("error: failed to wait for the executed process\n");
+        subprocess.cancel(?alloc, ?child, 0);
+        subprocess.dnit(?alloc, ?child);
+        arena.dnit(?ar);
+        ret 1;
+    }
+    val expired: bool = subprocess.expired(?child);
+    val terminal: subprocess.SubprocessTerminal =
+        R.unwrap_ok[subprocess.SubprocessTerminal, str](res_wait);
+    subprocess.dnit(?alloc, ?child);
     arena.dnit(?ar);
 
-    if (exec.exited(status)) {
-        ret exec.code(status)::i64;
+    if (expired) {
+        print.eprintf("error: the program exceeded --timeout_seconds {} and its process group was terminated\n",
+            timeout_seconds);
+        ret 3;
     }
-    if (exec.signaled(status)) {
-        ret 128 + exec.signal(status)::i64;
+    if (terminal.kind == subprocess.STATE_EXITED) {
+        ret terminal.code::i64;
+    }
+    if (terminal.kind == subprocess.STATE_SIGNALED) {
+        ret 128 + terminal.code::i64;
     }
     ret 1;
+}
+
+fun parse_seconds(s: *u8) i64 {
+    if (s == nil || s[0] == 0) { ret -1; }
+    var v: i64 = 0;
+    var i: usize = 0;
+    for (s[i] != 0) {
+        if (s[i] < '0' || s[i] > '9') { ret -1; }
+        v = v * 10 + (s[i] - '0')::i64;
+        if (v > 65536) { ret -1; }
+        i = i + 1;
+    }
+    ret v;
+}
+
+fun o_missing_value(sep: usize, argv: **u8, output: *u8) bool {
+    ret util.flag_exists(sep, argv, "-o") && output == nil;
+}
+
+fun t_run(argc: usize, argv: **u8) i64 {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 2; }
+    val ir: R.Result[args.ParsedInvocation, str] = args.parse_invocation(?a, argc, argv);
+    if (R.is_err[args.ParsedInvocation, str](ir)) { ret 2; }
+    var inv: args.ParsedInvocation = R.unwrap_ok[args.ParsedInvocation, str](ir);
+    ret run_typed(argv, ?inv);
+}
+
+fun reject_inert(sep: usize, argv: **u8, marks: *bool) O.Option[*u8] {
+    var i: usize = 2;
+    for (i < sep) {
+        if (!marks[i]) {
+            val tok: *u8 = argv[i];
+            if (args.flag_in_table(tok, ?args.RDO[0], args.RDO_N)
+                || args.flag_in_table(tok, ?args.CGEN[0], args.CGEN_N)
+                || args.flag_in_table(tok, ?args.OPT[0], args.OPT_N)) {
+                ret O.some[*u8](tok);
+            }
+        }
+        i = i + 1;
+    }
+    ret O.none[*u8]();
+}
+
+fun t_rejects_alone(tok: *u8) bool {
+    var argv: [3]*u8;
+    argv[0] = "mach"; argv[1] = "run"; argv[2] = tok;
+    var marks: [3]bool;
+    marks[0] = false; marks[1] = false; marks[2] = false;
+    ret O.is_some[*u8](reject_inert(3, ?argv[0], ?marks[0]));
+}
+
+test "mach.cli.cmd.run.reject_inert:every_readout_codegen_and_opt_spelling_rejected" {
+    var bad: i32 = 0;
+
+    var i: usize = 0;
+    for (i < args.RDO_N) {
+        if (!t_rejects_alone(args.RDO[i].name::*u8)) { bad = 1; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < args.CGEN_N) {
+        if (!t_rejects_alone(args.CGEN[i].name::*u8)) { bad = 1; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < args.OPT_N) {
+        if (!t_rejects_alone(args.OPT[i].name::*u8)) { bad = 1; }
+        i = i + 1;
+    }
+
+    ret bad;
+}
+
+test "mach.cli.cmd.run.reject_inert:run_selectors_and_runner_are_never_rejected" {
+    var argv: [7]*u8;
+    argv[0] = "mach"; argv[1] = "run"; argv[2] = "--target"; argv[3] = "linux-x86_64";
+    argv[4] = "--profile"; argv[5] = "--runner"; argv[6] = "wine";
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    val ir: R.Result[args.ParsedInvocation, str] = args.parse_invocation(?a, 7, ?argv[0]);
+    if (R.is_err[args.ParsedInvocation, str](ir)) { ret 1; }
+    val inv: args.ParsedInvocation = R.unwrap_ok[args.ParsedInvocation, str](ir);
+
+    if (O.is_some[*u8](reject_inert(7, ?argv[0], inv.marks))) { ret 1; }
+    ret 0;
+}
+
+test "mach.cli.cmd.run.reject_inert:subsystem_value_never_reclassified" {
+    var argv: [4]*u8;
+    argv[0] = "mach"; argv[1] = "run"; argv[2] = "--subsystem"; argv[3] = "console";
+    var marks: [4]bool;
+    var i: usize = 0;
+    for (i < 4) { marks[i] = false; i = i + 1; }
+
+    val r: O.Option[*u8] = reject_inert(4, ?argv[0], ?marks[0]);
+    if (O.is_none[*u8](r)) { ret 1; }
+    if (!str_equals(O.unwrap[*u8](r)::str, "--subsystem")) { ret 2; }
+    ret 0;
+}
+
+test "mach.cli.cmd.run.reject_inert:first_offending_token_in_input_order" {
+    var argv: [6]*u8;
+    argv[0] = "mach"; argv[1] = "run"; argv[2] = "."; argv[3] = "-g";
+    argv[4] = "--pie"; argv[5] = "-v";
+    var marks: [6]bool;
+    var i: usize = 0;
+    for (i < 6) { marks[i] = false; i = i + 1; }
+
+    val r: O.Option[*u8] = reject_inert(6, ?argv[0], ?marks[0]);
+    if (O.is_none[*u8](r)) { ret 1; }
+    if (!str_equals(O.unwrap[*u8](r)::str, "-g")) { ret 2; }
+    ret 0;
+}
+
+test "mach.cli.cmd.run.reject_inert:post_separator_tokens_stay_opaque" {
+    var argv: [5]*u8;
+    argv[0] = "mach"; argv[1] = "run"; argv[2] = "."; argv[3] = "--"; argv[4] = "-v";
+    val sep: usize = util.arg_separator_index(5, ?argv[0]);
+    var marks: [5]bool;
+    var i: usize = 0;
+    for (i < 5) { marks[i] = false; i = i + 1; }
+
+    if (O.is_some[*u8](reject_inert(sep, ?argv[0], ?marks[0]))) { ret 1; }
+    ret 0;
+}
+
+test "mach.cli.cmd.run.run:rejects_every_inert_option_before_effects" {
+    var bad: i32 = 0;
+
+    var alone: [3]*u8;
+    alone[0] = "mach"; alone[1] = "run"; alone[2] = "-g";
+    if (t_run(3, ?alone[0]) != 1) { bad = 1; }
+
+    var with_project: [4]*u8;
+    with_project[0] = "mach"; with_project[1] = "run"; with_project[2] = "."; with_project[3] = "--emit-ir";
+    if (t_run(4, ?with_project[0]) != 1) { bad = 1; }
+
+    var subsystem_value: [4]*u8;
+    subsystem_value[0] = "mach"; subsystem_value[1] = "run"; subsystem_value[2] = "--subsystem"; subsystem_value[3] = "console";
+    if (t_run(4, ?subsystem_value[0]) != 1) { bad = 1; }
+
+    var duplicate: [5]*u8;
+    duplicate[0] = "mach"; duplicate[1] = "run"; duplicate[2] = "-v"; duplicate[3] = "."; duplicate[4] = "-vv";
+    if (t_run(5, ?duplicate[0]) != 1) { bad = 1; }
+
+    ret bad;
+}
+
+test "mach.cli.cmd.run.o_missing_value:distinguishes_absent_from_valueless" {
+    var argv_absent: [2]*u8;
+    argv_absent[0] = "mach"; argv_absent[1] = "run";
+    if (o_missing_value(2, ?argv_absent[0], nil)) { ret 1; }
+
+    var argv_present: [3]*u8;
+    argv_present[0] = "mach"; argv_present[1] = "run"; argv_present[2] = "-o";
+    if (!o_missing_value(3, ?argv_present[0], nil)) { ret 2; }
+
+    var argv_valued: [4]*u8;
+    argv_valued[0] = "mach"; argv_valued[1] = "run"; argv_valued[2] = "-o"; argv_valued[3] = "out/bin";
+    if (o_missing_value(4, ?argv_valued[0], argv_valued[3])) { ret 3; }
+    ret 0;
+}
+
+fun t_scratch_runnable(a: *A.Allocator, root_buf: *u8) bool {
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(a, "mach_run_cmd_smoke");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret false; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tp:   *u8   = fs.temp_path(?tf)::*u8;
+    val tlen: usize = str_len(tp);
+    val fits: bool  = tlen + 1 <= 4096;
+    if (fits) {
+        var j: usize = 0;
+        for (j < tlen) { root_buf[j] = tp[j]; j = j + 1; }
+        root_buf[tlen] = 0;
+    }
+    fs.temp_close_and_remove(?tf);
+    if (!fits) { ret false; }
+
+    val root: str = root_buf::str;
+    val body: str = "[project]\nid = \"runsmoke\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out\"\n\n[artifact.runsmoke]\nkind = \"bin\"\nentry = \"src/main.mach\"\nout = \"bin/runsmoke\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+    if (O.is_some[str](fs.create_dir_all(a, root, 0o755))) { ret false; }
+    val toml_path: str = t_join(a, root, "mach.toml");
+    if (O.is_some[str](fs.write_bytes(toml_path, body::*u8, str_len(body), 0o644))) { ret false; }
+
+    val bin_dir: str = t_join(a, root, "out/bin");
+    if (O.is_some[str](fs.create_dir_all(a, bin_dir, 0o755))) { ret false; }
+    val bin_path: str = t_join(a, bin_dir, "runsmoke");
+
+    val res_bytes: R.Result[Vector[u8], str] = fs.read_bytes(a, "/bin/true"::str);
+    if (R.is_err[Vector[u8], str](res_bytes)) { ret false; }
+    var bytes: Vector[u8] = R.unwrap_ok[Vector[u8], str](res_bytes);
+    if (O.is_some[str](fs.write_bytes(bin_path, bytes.data, bytes.len, 0o755))) { vector.dnit[u8](?bytes); ret false; }
+    vector.dnit[u8](?bytes);
+    ret true;
+}
+
+fun t_join(a: *A.Allocator, base: str, leaf: str) str {
+    val r: R.Result[str, str] = path.join(a, base, leaf);
+    if (R.is_err[str, str](r)) { ret base; }
+    ret R.unwrap_ok[str, str](r);
+}
+
+test "mach.cli.cmd.run.run:lib_is_not_a_run_option_but_the_same_project_alone_succeeds" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    var root: [4096]u8;
+    if (!t_scratch_runnable(?a, ?root[0])) { fs.remove_all(?a, ?root[0]); ret 1; }
+
+    var av_ok: [3]*u8;
+    av_ok[0] = "mach"::*u8; av_ok[1] = "run"::*u8; av_ok[2] = ?root[0];
+    val rc_ok: i64 = t_run(3, ?av_ok[0]);
+    if (rc_ok != 0) { fs.remove_all(?a, ?root[0]); ret 1; }
+
+    var av_bad: [7]*u8;
+    av_bad[0] = "mach"::*u8; av_bad[1] = "run"::*u8; av_bad[2] = ?root[0];
+    av_bad[3] = "--bin"::*u8; av_bad[4] = "x"::*u8; av_bad[5] = "--lib"::*u8; av_bad[6] = "y"::*u8;
+    val rc_bad: i64 = t_run(7, ?av_bad[0]);
+
+    fs.remove_all(?a, ?root[0]);
+    if (rc_bad != 1) { ret 1; }
+    ret 0;
+}
+
+test "mach.cli.cmd.run.run:o_present_with_no_value_is_rejected_but_the_same_project_alone_succeeds" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    var root: [4096]u8;
+    if (!t_scratch_runnable(?a, ?root[0])) { fs.remove_all(?a, ?root[0]); ret 1; }
+
+    var av_ok: [3]*u8;
+    av_ok[0] = "mach"::*u8; av_ok[1] = "run"::*u8; av_ok[2] = ?root[0];
+    val rc_ok: i64 = t_run(3, ?av_ok[0]);
+    if (rc_ok != 0) { fs.remove_all(?a, ?root[0]); ret 1; }
+
+    var av_bad: [4]*u8;
+    av_bad[0] = "mach"::*u8; av_bad[1] = "run"::*u8; av_bad[2] = ?root[0]; av_bad[3] = "-o"::*u8;
+    val rc_bad: i64 = t_run(4, ?av_bad[0]);
+
+    fs.remove_all(?a, ?root[0]);
+    if (rc_bad != 1) { ret 1; }
+    ret 0;
+}
+
+test "mach.cli.cmd.run.run:rejects_a_library_only_selection_before_launch" {
+    val body: str = "[project]\nid = \"runlibonly\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out\"\n\n[artifact.runlibonly]\nkind = \"static\"\nentry = \"src/lib.mach\"\nout = \"lib/runlibonly.a\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?a, "mach_run_cmd_lib");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val root: str = fs.temp_path(?tf);
+    fs.temp_close_and_remove(?tf);
+    if (O.is_some[str](fs.create_dir_all(?a, root, 0o755))) { ret 1; }
+    val toml_path_r: R.Result[str, str] = path.join(?a, root, "mach.toml");
+    if (R.is_err[str, str](toml_path_r)) { ret 1; }
+    val toml_path: str = R.unwrap_ok[str, str](toml_path_r);
+    if (O.is_some[str](fs.write_bytes(toml_path, body::*u8, str_len(body), 0o644))) { ret 1; }
+
+    var argv: [3]*u8;
+    argv[0] = "mach"; argv[1] = "run"; argv[2] = root::*u8;
+
+    val rc: i64 = t_run(3, ?argv[0]);
+    fs.remove_all(?a, root);
+    if (rc != 1) { ret 1; }
+    ret 0;
+}
+
+test "mach.cli.cmd.run.run:rejects_a_foreign_target_without_a_runner" {
+    val body: str = "[project]\nid = \"runforeign\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out\"\n\n[target.windows]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\n\n[artifact.runforeign]\nkind = \"bin\"\nentry = \"src/main.mach\"\nout = \"bin/runforeign.exe\"\ntargets = [\"windows\"]\nlink = []\nneed = []\n";
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?a, "mach_run_cmd_foreign");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val root: str = fs.temp_path(?tf);
+    fs.temp_close_and_remove(?tf);
+    if (O.is_some[str](fs.create_dir_all(?a, root, 0o755))) { ret 1; }
+    val toml_path_r: R.Result[str, str] = path.join(?a, root, "mach.toml");
+    if (R.is_err[str, str](toml_path_r)) { ret 1; }
+    val toml_path: str = R.unwrap_ok[str, str](toml_path_r);
+    if (O.is_some[str](fs.write_bytes(toml_path, body::*u8, str_len(body), 0o644))) { ret 1; }
+
+    val bin_dir_r: R.Result[str, str] = path.join(?a, root, "out/bin");
+    if (R.is_err[str, str](bin_dir_r)) { ret 1; }
+    val bin_dir: str = R.unwrap_ok[str, str](bin_dir_r);
+    if (O.is_some[str](fs.create_dir_all(?a, bin_dir, 0o755))) { ret 1; }
+    val bin_path_r: R.Result[str, str] = path.join(?a, bin_dir, "runforeign.exe");
+    if (R.is_err[str, str](bin_path_r)) { ret 1; }
+    val bin_path: str = R.unwrap_ok[str, str](bin_path_r);
+    if (O.is_some[str](fs.write_bytes(bin_path, "MZ"::*u8, 2, 0o755))) { ret 1; }
+
+    var argv: [5]*u8;
+    argv[0] = "mach"; argv[1] = "run"; argv[2] = root::*u8; argv[3] = "--target"; argv[4] = "windows"::*u8;
+
+    val rc: i64 = t_run(5, ?argv[0]);
+    fs.remove_all(?a, root);
+    if (rc != 1) { ret 1; }
+    ret 0;
+}
+
+test "mach.cli.cmd.run.run:rejects_a_host_target_artifact_missing_execute_permission" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    val body: str = "[project]\nid = \"runnoexec\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out\"\n\n[artifact.runnoexec]\nkind = \"bin\"\nentry = \"src/main.mach\"\nout = \"bin/runnoexec\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?a, "mach_run_cmd_noexec");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val root: str = fs.temp_path(?tf);
+    fs.temp_close_and_remove(?tf);
+    if (O.is_some[str](fs.create_dir_all(?a, root, 0o755))) { ret 1; }
+    val toml_path_r: R.Result[str, str] = path.join(?a, root, "mach.toml");
+    if (R.is_err[str, str](toml_path_r)) { ret 1; }
+    val toml_path: str = R.unwrap_ok[str, str](toml_path_r);
+    if (O.is_some[str](fs.write_bytes(toml_path, body::*u8, str_len(body), 0o644))) { ret 1; }
+
+    val bin_dir_r: R.Result[str, str] = path.join(?a, root, "out/bin");
+    if (R.is_err[str, str](bin_dir_r)) { ret 1; }
+    val bin_dir: str = R.unwrap_ok[str, str](bin_dir_r);
+    if (O.is_some[str](fs.create_dir_all(?a, bin_dir, 0o755))) { ret 1; }
+    val bin_path_r: R.Result[str, str] = path.join(?a, bin_dir, "runnoexec");
+    if (R.is_err[str, str](bin_path_r)) { ret 1; }
+    val bin_path: str = R.unwrap_ok[str, str](bin_path_r);
+    if (O.is_some[str](fs.write_bytes(bin_path, "not executable"::*u8, 14, 0o644))) { ret 1; }
+
+    var argv: [3]*u8;
+    argv[0] = "mach"; argv[1] = "run"; argv[2] = root::*u8;
+
+    val rc: i64 = t_run(3, ?argv[0]);
+    fs.remove_all(?a, root);
+    if (rc != 1) { ret 1; }
+    ret 0;
 }

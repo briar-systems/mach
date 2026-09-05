@@ -1,32 +1,3 @@
-# mach.lang.me.pass.cse: local common-subexpression elimination
-#
-# A forward pass that, within each basic block, replaces a redundant pure
-# instruction -- one whose opcode, flags, result type, auxiliary type, and
-# operand list exactly match an earlier instruction in the same block -- with a
-# reference to that earlier result. The redundant instruction is left in the
-# pool with its uses rewritten away; dce then removes it.
-#
-# The transform is LOCAL: an expression is only reused within the single block
-# that first computed it. Within one block there is no intervening control flow,
-# so two instructions with identical (resolved) operands provably compute the
-# same value. Operands are compared after applying the running substitution, so
-# `b = a + 1; c = a + 1; d = b + c` canonicalizes `c` to `b` and then matches
-# the two `b` operands of `d`.
-#
-# CORRECTNESS CONTRACT: only PURE, value-producing opcodes are candidates
-# (`instruction.is_pure`). This excludes loads (an intervening store may change
-# the loaded value), stores, calls, alloca, phis, terminators, inline asm, and
-# the variadic intrinsics. Two candidates are equal only when their opcode, flag
-# word, result type, auxiliary type, operand count, and every (resolved) operand
-# match exactly -- so a no-signed-wrap add never merges with a wrapping add, and
-# a GEP only merges with a GEP walking the same source pointee type. Division and
-# remainder ARE pure, but CSE of two identical divisions is value-preserving (a
-# trap on division by zero happens identically for both, and merging removes only
-# the second, still-trapping, computation if the first is reached); a
-# divide-by-zero never miscompiles because the surviving instruction performs the
-# same operation. Because matching is by exact value identity, a substitution
-# never changes which value an operand names -- it only shares an equal one.
-
 use std.allocator.page;
 use std.crypto.hash.fnv1a;
 use std.types.bool.bool;
@@ -43,26 +14,13 @@ use mach.lang.float;
 use mach.lang.intern;
 use mach.lang.me.ir;
 use mach.lang.me.ir.builder;
+use mach.lang.me.ir.effect;
 use mach.lang.me.ir.id;
 use mach.lang.me.ir.instruction;
 use mach.lang.me.ir.mutate;
 use mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 
-# per-block hash table of canonical CSE candidates
-#
-# Buckets chain candidate instruction ids that share a structural hash. The table
-# is reused across blocks and invalidated in O(1) between them by bumping
-# `epoch`: a bucket is live only while its `stamp` equals the current `epoch`.
-# `chain` links the candidates within a bucket, indexed by instruction id. Owns
-# all three arrays.
-# ---
-# bucket: head candidate id per bucket, valid where stamp[idx] == epoch
-# stamp:  epoch a bucket was last written in
-# chain:  next candidate id in the same bucket, per instruction id
-# mask:   bucket index mask (bucket count is a power of two, mask is count - 1)
-# epoch:  current block's epoch
-# len:    number of instruction slots (sizes the chain array)
 rec SeenTable {
     bucket: *id.InstructionId;
     stamp:  *u32;
@@ -72,43 +30,29 @@ rec SeenTable {
     len:    u32;
 }
 
-# run local CSE on every non-extern function in the module
-# ---
-# m:   module to transform in place
-# ret: ok(true) on success, or the first allocation error encountered
 pub fun run(m: *ir.Module) R.Result[bool, str] {
+    var changed: bool = false;
     var i: u32 = 0;
     for (i < m.function_len) {
         val fn: *ir.Function = ?m.functions[i];
         if ((fn.flags & ir.FN_FLAG_EXTERN) == 0) {
-            val res_fn: R.Result[bool, str] = cse_function(m, fn);
-            if (R.is_err[bool, str](res_fn)) { ret res_fn; }
+            val changed_r: R.Result[bool, str] = cse_function(m, fn);
+            if (R.is_err[bool, str](changed_r)) { ret changed_r; }
+            if (R.unwrap_ok[bool, str](changed_r)) { changed = true; }
         }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok[bool, str](changed);
 }
 
-# run local CSE on one function
-#
-# Each block is processed independently: instructions are visited in program
-# order and a candidate matching an earlier in-block candidate records a
-# substitution, found through the per-block hash table (a block of n candidates
-# costs O(n) rather than O(n^2) against a linear scan). The table is invalidated
-# between blocks by bumping its epoch. After all blocks, recorded substitutions
-# are applied to every operand in the function.
-# ---
-# m:   module owning the allocator and function
-# fn:  function to transform in place
-# ret: ok(true) on success, or the first allocation error encountered
 fun cse_function(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
     val ilen: u32 = fn.instr_len;
-    if (ilen == 0) { ret R.ok[bool, str](true); }
+    if (ilen == 0) { ret R.ok[bool, str](false); }
 
     var subst: mutate.Rewrite;
-    val res_subst: R.Result[bool, str] = mutate.rewrite_init(?subst, m.alloc, ilen);
-    if (R.is_err[bool, str](res_subst)) {
-        ret res_subst;
+    val res_subst: R.Result[R.Void, str] = mutate.rewrite_init(?subst, m.alloc, ilen);
+    if (R.is_err[R.Void, str](res_subst)) {
+        ret R.err[bool, str](R.unwrap_err[R.Void, str](res_subst));
     }
 
     var seen: SeenTable;
@@ -129,20 +73,9 @@ fun cse_function(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
 
     seen_dnit(?seen, m.alloc);
     mutate.rewrite_dnit(?subst, m.alloc);
-    ret R.ok[bool, str](true);
+    ret R.ok[bool, str](any);
 }
 
-# process one block: walk its instructions in order, matching each pure candidate
-# against an already-seen canonical (recording a substitution to that canonical's
-# result) or recording it as a new canonical. A candidate's structural hash
-# selects a bucket whose short chain of distinct canonicals is checked for an
-# exact match
-# ---
-# fn:    function the block belongs to
-# blk:   block to process
-# subst: substitution table to record merges into
-# seen:  per-block candidate hash table, freshly invalidated for this block
-# ret:   true if any substitution was recorded
 fun cse_block(fn: *ir.Function, blk: *ir.Block, subst: *mutate.Rewrite, seen: *SeenTable) bool {
     var any: bool = false;
     var i: u32 = 0;
@@ -162,7 +95,6 @@ fun cse_block(fn: *ir.Function, blk: *ir.Block, subst: *mutate.Rewrite, seen: *S
                     if (O.is_some[*instruction.Instruction](opt_cand)) {
                         val cand: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_cand);
                         if (instrs_equal(inst, cand, subst)) {
-                            # redundant: reuse the canonical candidate's result.
                             mutate.replace_value(subst, iid, value.instr(cur, inst.ty));
                             matched = true;
                             any     = true;
@@ -179,28 +111,10 @@ fun cse_block(fn: *ir.Function, blk: *ir.Block, subst: *mutate.Rewrite, seen: *S
     ret any;
 }
 
-# true when an instruction is a CSE candidate: a pure, value-producing opcode
-# with no volatile flag
-#
-# Pure already excludes loads/stores/calls/alloca/phi/terminators/asm/va_*; the
-# volatile guard is belt-and-braces (volatile rides on loads/stores, which are
-# not pure, but the check costs nothing).
-# ---
-# inst: instruction to test
-# ret:  true if it may participate in CSE
 fun is_candidate(inst: *instruction.Instruction) bool {
-    if (instruction.is_pure(inst.kind) == false)             { ret false; }
-    if ((inst.flags & instruction.INSTR_FLAG_VOLATILE) != 0) { ret false; }
-    ret true;
+    ret effect.cse_safe(inst);
 }
 
-# structural hash of a candidate matching instrs_equal: opcode, flag word, result
-# type, auxiliary type, operand count, and every operand resolved through the
-# substitution table. Two candidates instrs_equal therefore hash alike
-# ---
-# inst:  candidate instruction
-# subst: substitution table used to resolve operands
-# ret:   the candidate's structural hash
 fun hash_candidate(inst: *instruction.Instruction, subst: *mutate.Rewrite) u64 {
     var h: u64 = fnv1a.FNV_INIT;
     h = fnv1a.step_u8(h, inst.kind::u8);
@@ -216,16 +130,6 @@ fun hash_candidate(inst: *instruction.Instruction, subst: *mutate.Rewrite) u64 {
     ret h;
 }
 
-# fold a resolved operand value into the running hash by the same identity
-# values_equal compares: kind plus the kind's payload
-#
-# VAL_CONST_NULL hashes by kind alone; byte-blob / aggregate constants (which
-# values_equal never treats as equal) hash by kind alone too, so they share a
-# bucket but never match.
-# ---
-# h:   running hash
-# v:   resolved operand value to fold in
-# ret: the updated hash
 fun hash_value(h: u64, v: value.Value) u64 {
     var hv: u64 = fnv1a.step_u8(h, v.kind::u8);
     if (v.kind == value.VAL_INSTR)       { ret fnv1a.step_u32(hv, v.data.instr::u32); }
@@ -237,28 +141,10 @@ fun hash_value(h: u64, v: value.Value) u64 {
     ret hv;
 }
 
-# fold a 64-bit value into the hash as its low then high 32-bit halves
-#
-# fnv1a exposes only 8- and 32-bit steps.
-# ---
-# h:   running hash
-# v:   64-bit value to fold in
-# ret: the updated hash
 fun step_u64(h: u64, v: u64) u64 {
     ret fnv1a.step_u32(fnv1a.step_u32(h, v::u32), (v >> 32)::u32);
 }
 
-# true when two candidate instructions compute the same value: identical opcode,
-# flag word, result type, auxiliary type, operand count, and every operand equal
-# by value identity after resolving each through the substitution table
-#
-# The substitution resolution canonicalizes operands that were themselves CSE'd,
-# so transitively-equal expressions match.
-# ---
-# a:     first candidate
-# b:     second candidate
-# subst: substitution table used to resolve operands
-# ret:   true if a and b denote the same value
 fun instrs_equal(a: *instruction.Instruction, b: *instruction.Instruction, subst: *mutate.Rewrite) bool {
     if (a.kind          != b.kind)          { ret false; }
     if (a.flags         != b.flags)         { ret false; }
@@ -275,22 +161,6 @@ fun instrs_equal(a: *instruction.Instruction, b: *instruction.Instruction, subst
     ret true;
 }
 
-# true when two operand values are the exact same SSA value or the same constant
-# literal
-#
-# Instruction results match by id; parameters by index; integer / null constants
-# by payload; globals / functions by index. Float constants match by their raw
-# 64-bit IEEE-754 pattern, NOT numeric `==`: `+0.0` and `-0.0` are numerically
-# equal but bit-distinct, so `x + 0.0` and `x + (-0.0)` (which differ in the sign
-# of zero they produce for `x = -0.0`) must not be value-numbered alike; comparing
-# bits also keeps distinct NaN payloads distinct. Byte-blob constants are
-# conservatively treated as unequal (a pointer-identity match on a borrowed blob
-# is not worth the risk). The carried IR type need not match -- two operands
-# naming the same value through differently-typed slots still denote it.
-# ---
-# a:   first operand value
-# b:   second operand value
-# ret: true if a and b denote the same value
 fun values_equal(a: value.Value, b: value.Value) bool {
     if (a.kind != b.kind)               { ret false; }
     if (a.kind == value.VAL_INSTR)      { ret a.data.instr == b.data.instr; }
@@ -305,26 +175,12 @@ fun values_equal(a: value.Value, b: value.Value) bool {
     ret false;
 }
 
-# smallest power of two >= n (at least 1)
-# ---
-# n:   minimum bucket count
-# ret: the table size, a power of two
 fun round_pow2(n: u32) u32 {
     var p: u32 = 1;
     for (p < n) { p = p * 2; }
     ret p;
 }
 
-# allocate and clear a candidate hash table for `len` instruction slots
-#
-# Bucket count is the smallest power of two >= len. `stamp` is cleared so the
-# first block's epoch (1) invalidates every bucket; `chain` is left uninitialized
-# because every slot is written when its candidate is recorded, before any read.
-# ---
-# s:   hash table to initialize in place
-# a:   allocator backing the three arrays
-# len: number of instruction slots
-# ret: none on success, or some(error) on allocation failure
 fun seen_init(s: *SeenTable, a: *A.Allocator, len: u32) O.Option[str] {
     val tsize: u32 = round_pow2(len);
 
@@ -358,10 +214,6 @@ fun seen_init(s: *SeenTable, a: *A.Allocator, len: u32) O.Option[str] {
     ret O.none[str]();
 }
 
-# free a candidate hash table's arrays and zero it
-# ---
-# s: hash table to tear down
-# a: allocator the arrays were allocated from
 fun seen_dnit(s: *SeenTable, a: *A.Allocator) {
     val tsize: u32 = s.mask + 1;
     A.deallocate[id.InstructionId](a, s.bucket, tsize::usize);
@@ -375,45 +227,25 @@ fun seen_dnit(s: *SeenTable, a: *A.Allocator) {
     s.len    = 0;
 }
 
-# begin a new block, invalidating every prior bucket in O(1) by bumping the epoch
-# ---
-# s: hash table to advance
 fun seen_block_begin(s: *SeenTable) {
     s.epoch = s.epoch + 1;
 }
 
-# head candidate id of bucket `idx`, or INSTR_NIL when the bucket predates this block
-# ---
-# s:   hash table to read
-# idx: bucket index
-# ret: the bucket's head candidate id, or id.INSTR_NIL if stale or empty
 fun seen_head(s: *SeenTable, idx: u32) id.InstructionId {
     if (s.stamp[idx] == s.epoch) { ret s.bucket[idx]; }
     ret id.INSTR_NIL;
 }
 
-# next candidate id after `iid` in its bucket chain
-# ---
-# s:   hash table to read
-# iid: current candidate id
-# ret: the following candidate id, or id.INSTR_NIL at the chain's end
 fun seen_next(s: *SeenTable, iid: id.InstructionId) id.InstructionId {
     ret s.chain[iid::u32];
 }
 
-# prepend candidate `iid` as the new head of bucket `idx` for this block
-# ---
-# s:   hash table to mutate
-# idx: bucket index
-# iid: candidate id to record
 fun seen_add(s: *SeenTable, idx: u32, iid: id.InstructionId) {
     s.chain[iid::u32] = seen_head(s, idx);
     s.bucket[idx]     = iid;
     s.stamp[idx]      = s.epoch;
 }
 
-# within-block dedup merges identical adds, while the epoch boundary prevents the
-# same expression in a later block from merging across blocks
 test "mach.lang.me.pass.cse.run:within_block_dedup" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -443,7 +275,6 @@ test "mach.lang.me.pass.cse.run:within_block_dedup" {
     val p0: value.Value = value.param(0, i64ty);
     val p1: value.Value = value.param(1, i64ty);
 
-    # block A: add_1(p0,p1), add_2(p0,p1) -- same, will be merged; mul(add_2, p0); br(blk_b)
     builder.set_block(?bld, blk_a);
     val res_add_1: R.Result[value.Value, str] = builder.emit_add(?bld, p0, p1);
     if (R.is_err[value.Value, str](res_add_1)) { ir.dnit(?m); ret 1; }
@@ -454,24 +285,21 @@ test "mach.lang.me.pass.cse.run:within_block_dedup" {
     val res_mul: R.Result[value.Value, str] = builder.emit_mul(?bld, add_2, p0);
     if (R.is_err[value.Value, str](res_mul)) { ir.dnit(?m); ret 1; }
     val mul: value.Value = R.unwrap_ok[value.Value, str](res_mul);
-    if (R.is_err[bool, str](builder.emit_br(?bld, blk_b))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_br(?bld, blk_b))) { ir.dnit(?m); ret 1; }
 
-    # block B: add_3(p0,p1) -- same expression but different epoch; ret(add_3)
     builder.set_block(?bld, blk_b);
     val res_add_3: R.Result[value.Value, str] = builder.emit_add(?bld, p0, p1);
     if (R.is_err[value.Value, str](res_add_3)) { ir.dnit(?m); ret 1; }
     val add_3: value.Value = R.unwrap_ok[value.Value, str](res_add_3);
-    if (R.is_err[bool, str](builder.emit_ret(?bld, add_3))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, add_3))) { ir.dnit(?m); ret 1; }
 
     if (R.is_err[bool, str](run(?m))) { ir.dnit(?m); ret 1; }
 
-    # add_2 merged to add_1; mul's first operand rewritten to add_1.
     val mul_inst: *instruction.Instruction = ?fn.instrs[mul.data.instr];
     val mul_op0: value.Value = mul_inst.operands[0];
     if (mul_op0.kind != value.VAL_INSTR)        { ir.dnit(?m); ret 1; }
     if (mul_op0.data.instr != add_1.data.instr) { ir.dnit(?m); ret 1; }
 
-    # add_3 is in a different epoch; the ret still references add_3 directly.
     val ret_iid: id.InstructionId = fn.blocks[blk_b::u32].terminator;
     val ret_inst: *instruction.Instruction = ?fn.instrs[ret_iid];
     val ret_op0: value.Value = ret_inst.operands[0];
@@ -479,5 +307,81 @@ test "mach.lang.me.pass.cse.run:within_block_dedup" {
     if (ret_op0.data.instr != add_3.data.instr) { ir.dnit(?m); ret 1; }
 
     ir.dnit(?m);
+    ret 0;
+}
+
+test "mach.lang.me.pass.cse.run:reports_no_change_when_nothing_is_redundant" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val ri: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 32);
+    if (R.is_err[type.IrTypeId, str](ri)) { ir.dnit(?m); ret 1; }
+    val i32t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](ri);
+
+    val r_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](r_fn)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](r_fn)];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+    val res_entry: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_entry)) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](res_entry));
+
+    val p0: value.Value = value.param(0, i32t);
+    val p1: value.Value = value.param(1, i32t);
+    val res_add: R.Result[value.Value, str] = builder.emit_add(?bld, p0, p1);
+    if (R.is_err[value.Value, str](res_add)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, R.unwrap_ok[value.Value, str](res_add)))) { ir.dnit(?m); ret 1; }
+
+    val rr: R.Result[bool, str] = run(?m);
+    if (R.is_err[bool, str](rr)) { ir.dnit(?m); ret 1; }
+    val changed: bool = R.unwrap_ok[bool, str](rr);
+    ir.dnit(?m);
+    if (changed != false) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.me.pass.cse.run:reports_change_when_a_duplicate_expression_is_eliminated" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val ri: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 32);
+    if (R.is_err[type.IrTypeId, str](ri)) { ir.dnit(?m); ret 1; }
+    val i32t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](ri);
+
+    val r_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](r_fn)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](r_fn)];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+    val res_entry: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_entry)) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](res_entry));
+
+    val p0: value.Value = value.param(0, i32t);
+    val p1: value.Value = value.param(1, i32t);
+    val res_a: R.Result[value.Value, str] = builder.emit_add(?bld, p0, p1);
+    if (R.is_err[value.Value, str](res_a)) { ir.dnit(?m); ret 1; }
+    val a: value.Value = R.unwrap_ok[value.Value, str](res_a);
+    val res_b: R.Result[value.Value, str] = builder.emit_add(?bld, p0, p1);
+    if (R.is_err[value.Value, str](res_b)) { ir.dnit(?m); ret 1; }
+    val b: value.Value = R.unwrap_ok[value.Value, str](res_b);
+    val res_sum: R.Result[value.Value, str] = builder.emit_add(?bld, a, b);
+    if (R.is_err[value.Value, str](res_sum)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, R.unwrap_ok[value.Value, str](res_sum)))) { ir.dnit(?m); ret 1; }
+
+    val rr: R.Result[bool, str] = run(?m);
+    if (R.is_err[bool, str](rr)) { ir.dnit(?m); ret 1; }
+    val changed: bool = R.unwrap_ok[bool, str](rr);
+    ir.dnit(?m);
+    if (changed != true) { ret 1; }
     ret 0;
 }

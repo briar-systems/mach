@@ -1,25 +1,3 @@
-# mach.lang.me.analysis.dependence: cross-iteration memory-dependence analysis
-#
-# Over a counted loop recognized by `mach.lang.me.analysis.loops`, decide whether
-# the loop is a unit-stride element-wise map -- `dst[c+i] = f(src0[c'+i], ...)` --
-# carrying no cross-iteration memory dependence, and collect its memory accesses.
-#
-# The verdict is deliberately conservative (child 1's lesson): a positive
-# INDEPENDENT verdict is returned ONLY when every memory access in the loop is a
-# non-volatile load/store through `gep(base, idx)` over a loop-invariant base, where
-# `idx` is AFFINE in the loop's induction variable at UNIT stride (`off + iv` for a
-# loop-invariant `off`, #2312), and the loop carries no register recurrence beyond
-# the induction variable and its secondary add-recurrences, and no opaque memory
-# effect (call / asm / memzero). Anything unproven is DEPENDENT.
-#
-# A DEPENDENT verdict means "do not vectorize". An INDEPENDENT verdict means "safe
-# to vectorize IF the runtime alias check discharges base aliasing" -- distinct
-# pointer bases cannot be proven disjoint at compile time (mach has no `restrict`),
-# so the caller pairs this with the runtime alias guard in the versioning module.
-#
-# This module is a callable analysis; it is not wired into the pipeline (nothing
-# imports it there), so it does not affect emitted code.
-
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -33,25 +11,11 @@ use R: std.types.result;
 use mach.lang.me.ir;
 use mach.lang.me.ir.id;
 use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.opdesc;
 use mach.lang.me.ir.value;
 use ir_type: mach.lang.me.ir.type;
-use loops: mach.lang.me.analysis.loops;
+use mach.lang.me.analysis.loops;
 
-# one recognized affine memory access `base[off + iv]` in a counted loop
-# ---
-# instr:     the load or store instruction
-# gep:       the OP_GEP computing `base[off + iv]` that the access dereferences
-# base:      the loop-invariant base pointer (the gep's first operand)
-# off:       the loop-invariant ELEMENT offset the index is shifted by, in the
-#            induction variable's type. `base[iv]` carries the constant 0; any other
-#            offset shifts the whole accessed window, so every range the alias guard
-#            derives must add it
-# stride_ty: the gep's source pointee type -- the per-element stride, reused to
-#            compute the accessed byte range for the alias guard
-# elem_ty:   the loaded / stored value type
-# bytes:     the contiguous element footprint in bytes -- the gep stride and the
-#            access width, which INDEPENDENT requires to be equal (an exact tiling)
-# is_store:  true for a store, false for a load
 pub rec MemAccess {
     instr:     id.InstructionId;
     gep:       id.InstructionId;
@@ -63,22 +27,10 @@ pub rec MemAccess {
     is_store:  bool;
 }
 
-# the dependence verdict for a loop
 pub def DepVerdict: u8;
-# unit-stride offset-0 element-wise map, no cross-iteration dependence: safe to
-# vectorize once base aliasing is discharged by the runtime alias guard
 pub val DEP_INDEPENDENT: DepVerdict = 0;
-# a proven or unprovable cross-iteration dependence / opaque effect: do not vectorize
 pub val DEP_DEPENDENT:   DepVerdict = 1;
 
-# the memory-dependence analysis of one counted loop
-# ---
-# alloc:        allocator backing `accesses`
-# verdict:      DEP_INDEPENDENT or DEP_DEPENDENT
-# accesses:     the recognized element-wise accesses, meaningful only when the
-#               verdict is DEP_INDEPENDENT (owned)
-# access_count: number of accesses
-# access_cap:   allocated capacity of `accesses`
 pub rec DepInfo {
     alloc:        *A.Allocator;
     verdict:      DepVerdict;
@@ -87,18 +39,6 @@ pub rec DepInfo {
     access_cap:   u32;
 }
 
-# analyze loop `loop_ix` for cross-iteration memory dependence
-#
-# Never mutates `fn`. Returns a DepInfo whose verdict is DEP_INDEPENDENT only for
-# the proven unit-stride offset-0 element-wise shape; every other loop (including a
-# non-counted one) is DEP_DEPENDENT. Allocation failure is the only err.
-# ---
-# fn:      the function
-# la:      the loop analysis for `fn`
-# loop_ix: index into la.loops
-# types:   the module's IR type table, for the target-independent scalar footprints
-# alloc:   allocator for the accesses array
-# ret:     the dependence info, or an allocation error
 pub fun analyze_dependence(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, types: *ir_type.IrTypeTable, alloc: *A.Allocator) R.Result[DepInfo, str] {
     var d: DepInfo;
     d.alloc        = alloc;
@@ -110,16 +50,12 @@ pub fun analyze_dependence(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u
     if (loop_ix >= la.loop_len) { ret R.ok[DepInfo, str](d); }
     val lp: *loops.Loop = ?la.loops[loop_ix];
 
-    # only a counted loop with a unit-stride induction variable is a candidate.
     if (!lp.is_counted) { ret R.ok[DepInfo, str](d); }
     if (lp.iv.step.kind != value.VAL_CONST_INT) { ret R.ok[DepInfo, str](d); }
     if (lp.iv.step.data.int_lit != 1) { ret R.ok[DepInfo, str](d); }
 
-    # the header carries only induction variables; non-header phis may join paths
-    # within one iteration but must not feed themselves across a backedge
     if (!ivs_only_recurrence(fn, la, loop_ix)) { ret R.ok[DepInfo, str](d); }
 
-    # upper-bound the accesses array by the loop's instruction count.
     var total: u32 = 0;
     var bi: u32 = 0;
     for (bi < lp.body_len) {
@@ -133,8 +69,6 @@ pub fun analyze_dependence(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u
         d.access_cap = total;
     }
 
-    # walk every body instruction; any opaque effect or non-element-wise access
-    # forces the conservative DEPENDENT verdict.
     bi = 0;
     for (bi < lp.body_len) {
         val blk: *ir.Block = ?fn.blocks[lp.body[bi]::u32];
@@ -159,21 +93,6 @@ pub fun analyze_dependence(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u
         bi = bi + 1;
     }
 
-    # every pair of accesses to the SAME base must have an identical footprint, and --
-    # once either of them writes -- an identical element offset.
-    #
-    # equal bytes with stride == width already enforced per access means the same
-    # per-iteration address window; a same-base pair with differing widths (an i8 load
-    # and an i64 store on `a`) is a genuine cross-iteration RAW the guard cannot fix
-    # (the ranges are not disjoint, they coincide).
-    #
-    # equal offsets make that window the SAME element in every iteration -- a
-    # distance-0 self dependence, which vectorizes. Any other offset relation is a
-    # nonzero cross-iteration distance, and admitting affine indices (#2312) is what
-    # made that reachable: `a[i] = a[i-1]` is same-base at offsets 0 and -1. The
-    # runtime alias guard cannot discharge it, because the two ranges are not two
-    # objects that might overlap -- they are the same storage at a shift. Two READS at
-    # different offsets carry no dependence at all and stay admitted.
     var i: u32 = 0;
     for (i < d.access_count) {
         var j: u32 = i + 1;
@@ -193,19 +112,6 @@ pub fun analyze_dependence(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u
     ret R.ok[DepInfo, str](d);
 }
 
-# structural equality of two values by kind and payload: same instruction /
-# parameter / global / function reference, or the same inline constant (floats by
-# bit pattern, so -0.0 and NaN behave). Borrowed byte-blob and serialized aggregate
-# constants compare unequal. Ignores the `ty` field: identity is the referent, not
-# the use-site stamp. The single value-identity predicate the auto-vectorization
-# modules share (dependence's same-base check, versioning's alias-pairing); it lives
-# here rather than in ir/value.mach so this feature stays dormant / byte-identical
-# until child 3 wires the vectorizer in (an emitted ir/value.mach helper would grow
-# the compiler binary). Mirrors the private copies in constfold / cse.
-# ---
-# a:   first value
-# b:   second value
-# ret: true when a and b denote the same value
 pub fun equal(a: value.Value, b: value.Value) bool {
     if (a.kind != b.kind)                { ret false; }
     if (a.kind == value.VAL_INSTR)       { ret a.data.instr == b.data.instr; }
@@ -218,9 +124,6 @@ pub fun equal(a: value.Value, b: value.Value) bool {
     ret false;
 }
 
-# the byte footprint of a scalar integer / float type, target-independently (bits /
-# 8); 0 for any other type (pointer, aggregate, vector, void, sub-byte), which is
-# not a vectorizable element and forces a DEPENDENT verdict
 fun scalar_bytes(types: *ir_type.IrTypeTable, id: ir_type.IrTypeId) u32 {
     val opt: O.Option[*ir_type.IrType] = ir_type.get(types, id);
     if (O.is_none[*ir_type.IrType](opt)) { ret 0; }
@@ -229,7 +132,6 @@ fun scalar_bytes(types: *ir_type.IrTypeTable, id: ir_type.IrTypeId) u32 {
     ret 0;
 }
 
-# a fresh conservative DEPENDENT verdict with no accesses
 fun dependent(alloc: *A.Allocator) R.Result[DepInfo, str] {
     var d: DepInfo;
     d.alloc        = alloc;
@@ -240,9 +142,6 @@ fun dependent(alloc: *A.Allocator) R.Result[DepInfo, str] {
     ret R.ok[DepInfo, str](d);
 }
 
-# release the accesses array
-# ---
-# d: the dependence info to tear down
 pub fun dep_dnit(d: *DepInfo) {
     if (d.accesses != nil && d.access_cap > 0) {
         A.deallocate[MemAccess](d.alloc, d.accesses, d.access_cap::usize);
@@ -252,16 +151,6 @@ pub fun dep_dnit(d: *DepInfo) {
     d.access_cap   = 0;
 }
 
-# true when the loop carries only its primary and secondary induction variables
-#
-# non-header phis may join paths within one iteration. A phi whose block dominates
-# an incoming predecessor instead has a back edge, as at a nested-loop header, and is
-# another recurrence that this loop's vector transform cannot scale.
-# ---
-# fn:      function containing the loop
-# la:      loop analysis for `fn`
-# loop_ix: loop to inspect
-# ret:     true when every recurrence is a supported induction variable
 pub fun ivs_only_recurrence(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32) bool {
     val lp: *loops.Loop = ?la.loops[loop_ix];
     var bi: u32 = 0;
@@ -288,7 +177,6 @@ pub fun ivs_only_recurrence(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: 
     ret true;
 }
 
-# true when `pid` has no back-edge incoming to its block
 fun same_iteration_phi(fn: *ir.Function, la: *loops.LoopAnalysis, bid: id.BlockId, pid: id.InstructionId) bool {
     val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, pid);
     if (O.is_none[*instruction.Instruction](opt)) { ret false; }
@@ -303,30 +191,12 @@ fun same_iteration_phi(fn: *ir.Function, la: *loops.LoopAnalysis, bid: id.BlockI
     ret true;
 }
 
-# true when block `blk` carries phi `pid`
 fun header_has_phi(blk: *ir.Block, pid: id.InstructionId) bool {
     var i: u32 = 0;
     for (i < blk.phi_count) { if (blk.phis[i] == pid) { ret true; } i = i + 1; }
     ret false;
 }
 
-# the address shape of an element-wise access: `base + iv * elem`, reached through
-# either admitted gep form, with the per-element stride type resolved
-#
-# `gep(base, iv)` indexes a pointer directly (a pointer parameter), and its source
-# pointee type IS the element. `gep(base, 0, iv)` is an array indexed in place (a
-# module-scope or local array, which never decays to a pointer): the leading 0
-# selects the array itself and the second index descends into it, so the stride is
-# the array's ELEMENT type, not the array type the gep carries. Both denote the same
-# addresses; refusing the second is what kept module-scope arrays out of the
-# vectorizer (#2201).
-# ---
-# gep:       the OP_GEP to decompose
-# types:     the module's IR type table
-# out_base:  receives the base pointer operand
-# out_idx:   receives the index operand
-# out_sty:   receives the per-element stride type
-# ret:       true when the gep is one of the two admitted forms
 fun gep_elem_shape(gep: *instruction.Instruction, types: *ir_type.IrTypeTable, out_base: *value.Value, out_idx: *value.Value, out_sty: *ir_type.IrTypeId) bool {
     if (gep.kind != instruction.OP_GEP) { ret false; }
     if (gep.operand_count == 2) {
@@ -347,35 +217,17 @@ fun gep_elem_shape(gep: *instruction.Instruction, types: *ir_type.IrTypeTable, o
     ret true;
 }
 
-# the affine form of a loop index: `off + stride * iv`
-#
-# `stride` is a two's-complement element count, so a backwards index carries the
-# wrapped negative and the only stride a contiguous vector access admits is 1.
-# ---
-# off:    the loop-invariant element offset -- a constant, or a value defined outside
-#         the loop (which therefore dominates the preheader, and so any guard block
-#         spliced in front of it)
-# stride: elements advanced per iteration of the loop's induction variable
 rec AffineIndex {
     off:    value.Value;
     stride: u64;
 }
 
-# the recursion bound on the affine walk: an index is a shallow expression over the
-# induction variable, and bounding the descent keeps a pathological operand DAG from
-# costing exponential time. Exceeding it declines the access, never mis-reads it.
 val AFFINE_DEPTH: u32 = 8;
 
-# true when `v` is the integer constant zero, the additive identity the offset
-# algebra folds through
 fun is_zero_const(v: value.Value) bool {
     ret v.kind == value.VAL_CONST_INT && v.data.int_lit == 0;
 }
 
-# the sum of two affine forms. Strides add; the offsets must combine WITHOUT
-# synthesizing arithmetic (nothing here may emit into the function), so one must be
-# zero or both must be constants -- an `inv1 + inv2 + iv` index declines rather than
-# growing an add the guard would have to materialize.
 fun affine_add(x: *AffineIndex, y: *AffineIndex, out: *AffineIndex) bool {
     out.stride = x.stride + y.stride;
     if (is_zero_const(x.off)) { out.off = y.off; ret true; }
@@ -387,7 +239,6 @@ fun affine_add(x: *AffineIndex, y: *AffineIndex, out: *AffineIndex) bool {
     ret false;
 }
 
-# the additive inverse of an affine form, for the right operand of a subtract
 fun affine_negate(x: *AffineIndex, out: *AffineIndex) bool {
     out.stride = 0 - x.stride;
     if (is_zero_const(x.off)) { out.off = x.off; ret true; }
@@ -395,7 +246,6 @@ fun affine_negate(x: *AffineIndex, out: *AffineIndex) bool {
     ret false;
 }
 
-# an affine form scaled by a compile-time constant
 fun affine_scale(x: *AffineIndex, k: u64, out: *AffineIndex) bool {
     out.stride = x.stride * k;
     if (is_zero_const(x.off)) { out.off = x.off; ret true; }
@@ -403,15 +253,6 @@ fun affine_scale(x: *AffineIndex, k: u64, out: *AffineIndex) bool {
     ret false;
 }
 
-# the affine form of a header phi that is itself an add-recurrence `{init, +, c}`
-# over a loop-invariant `init` and a constant `c` -- a SECONDARY induction variable,
-# the shape a loop with its own cursor produces (`t = base; ...; t = t + 1`).
-#
-# At the loop's k-th iteration such a phi holds `init + k*c` while the induction
-# variable holds `iv_init + k`, so the phi is `(init - c*iv_init) + c*iv`. That
-# offset must fold without emitting anything, which it does when the induction
-# variable starts at zero (the canonical form the loop rotation produces) or when
-# both `init` and `iv_init` are constants.
 fun secondary_iv(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, pid: id.InstructionId, out: *AffineIndex) bool {
     val lp: *loops.Loop = ?la.loops[loop_ix];
     if (pid::u32 >= la.instr_count || la.instr_block[pid::u32] != lp.header) { ret false; }
@@ -432,16 +273,9 @@ fun secondary_iv(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, pid: i
         j = j + 1;
     }
     if (!got_init || !got_upd) { ret false; }
-    # the offset this returns is handed to the alias guard, which materializes it in a
-    # block that dominates the loop, so it must be loop-invariant. That holds for a
-    # preheader-incoming value by dominance, which is why no test kills this check and
-    # it survives its own mutation; it is the AffineIndex contract stated where the
-    # offset is produced rather than left to the reader to re-derive. Untested is not
-    # unjustified -- do not remove it for being untested.
     if (!loops.is_invariant(la, loop_ix, init)) { ret false; }
     if (upd.kind != value.VAL_INSTR) { ret false; }
 
-    # the latch value must be `phi + c` for a constant c
     val uopt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, upd.data.instr);
     if (O.is_none[*instruction.Instruction](uopt)) { ret false; }
     val u: *instruction.Instruction = O.unwrap[*instruction.Instruction](uopt);
@@ -454,13 +288,6 @@ fun secondary_iv(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, pid: i
     }
     if (step.kind != value.VAL_CONST_INT) { ret false; }
 
-    # the `- c*iv_init` correction is what makes the returned form EXACT rather than
-    # merely usable. No test kills it, and the reason is worth writing down: at unit
-    # stride -- the only stride an access is admitted at -- dropping it shifts every
-    # window in the loop by the same `iv_init` elements, and a common translation
-    # changes neither pairwise disjointness nor offset equality, which is all the two
-    # consumers ask. The next consumer to read `off` absolutely rather than relatively
-    # is the one it protects, so keep the form honest to its own contract.
     out.stride = step.data.int_lit;
     val iv_init: value.Value = lp.iv.init;
     if (is_zero_const(iv_init)) { out.off = init; ret true; }
@@ -471,31 +298,14 @@ fun secondary_iv(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, pid: i
     ret false;
 }
 
-# decompose index `v` into `off + stride * iv` over loop `loop_ix`, or decline
-#
-# The single rule the access classifier keys on, replacing the syntactic "the index
-# IS the induction-variable phi" test that declined every offset index (#2312). Its
-# leaves are the induction variable, anything the loop leaves unchanged, and a
-# secondary add-recurrence; its interior nodes are the affine operators (add,
-# subtract, and multiply by a constant). Nothing here mutates `fn` or emits.
-# ---
-# fn:      the function
-# la:      the loop analysis for `fn`
-# loop_ix: index into la.loops
-# v:       the index value to decompose
-# depth:   remaining recursion budget (see AFFINE_DEPTH)
-# out:     receives the affine form on success
-# ret:     true when `v` is affine in the loop's induction variable
 fun affine_index(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, v: value.Value, depth: u32, out: *AffineIndex) bool {
     val lp: *loops.Loop = ?la.loops[loop_ix];
 
-    # the induction variable itself is `0 + 1*iv`
     if (v.kind == value.VAL_INSTR && v.data.instr == lp.iv.phi) {
         out.off    = value.const_int(0, v.ty);
         out.stride = 1;
         ret true;
     }
-    # anything the loop does not change is a pure offset, whatever computed it
     if (loops.is_invariant(la, loop_ix, v)) {
         out.off    = v;
         out.stride = 0;
@@ -528,15 +338,10 @@ fun affine_index(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, v: val
     ret false;
 }
 
-# classify a load/store as an element-wise `base[off + iv]` access, filling `out` on
-# success. requires: non-volatile; the pointer is a gep of one of the two element
-# shapes whose index is affine in the induction variable at unit stride, and whose
-# base is loop-invariant.
 fun classify_access(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, iid: id.InstructionId, inst: *instruction.Instruction, types: *ir_type.IrTypeTable, out: *MemAccess) bool {
     if ((inst.flags & instruction.INSTR_FLAG_VOLATILE) != 0) { ret false; }
     val is_store: bool = inst.kind == instruction.OP_STORE;
 
-    # the pointer operand: LOAD = [ptr], STORE = [value, ptr]
     var ptr: value.Value;
     if (is_store) {
         if (inst.operand_count < 2) { ret false; }
@@ -556,32 +361,15 @@ fun classify_access(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, iid
     var stride_ty: ir_type.IrTypeId;
     if (!gep_elem_shape(gep, types, ?base, ?idx, ?stride_ty)) { ret false; }
     val lp: *loops.Loop = ?la.loops[loop_ix];
-    # the index must be affine in the induction variable at UNIT stride: only a
-    # stride of exactly one element makes consecutive iterations land on adjacent
-    # storage, which is what a vector access over the lane group reads and writes
     var ax: AffineIndex;
     if (!affine_index(fn, la, loop_ix, idx, AFFINE_DEPTH, ?ax)) { ret false; }
     if (ax.stride != 1) { ret false; }
-    # the offset is added to the induction variable's own range to derive the alias
-    # guard's endpoints, so it must carry that arithmetic's type. Unit stride makes the
-    # index the induction variable plus an offset, so this holds by construction and no
-    # test kills it: it is the precondition of that add, asserted where the offset is
-    # accepted rather than where it is emitted two modules away. What fires it is a new
-    # affine rule that widens or narrows its operand -- a sign or zero extension in the
-    # index, say -- which is exactly the change that must not silently reach the guard.
     if (ax.off.ty != lp.iv.init.ty) { ret false; }
-    # base must be loop-invariant
     if (!loops.is_invariant(la, loop_ix, base)) { ret false; }
 
-    # a store produces no value, so its element type is the stored value's type;
-    # a load's element type is its own result type
     var elem_ty: ir_type.IrTypeId = inst.ty;
     if (is_store) { elem_ty = inst.operands[0].ty; }
 
-    # the access must exactly tile memory: the gep's per-index stride equals the
-    # access width, both a supported scalar footprint. a wider-than-stride access
-    # (a 1-byte stride feeding an 8-byte store) overlaps its own windows across
-    # iterations; a narrower one leaves gaps -- neither is a contiguous unit map.
     val stride_bytes: u32 = scalar_bytes(types, stride_ty);
     val width_bytes:  u32 = scalar_bytes(types, elem_ty);
     if (stride_bytes == 0 || width_bytes == 0) { ret false; }
@@ -602,9 +390,6 @@ use std.allocator.page;
 use mach.lang.intern;
 use mach.lang.me.ir.builder;
 
-# build a counted-loop skeleton (entry -> header -> body -> exit) with an i64
-# induction variable `{0, +, 1}` tested `iv < param0`; the caller fills `body` and
-# wires the iv's body-incoming + `br header`. Returns 0 on success.
 fun mk_skeleton(m: *ir.Module, bld: *builder.Builder, i64t: ir_type.IrTypeId, o_entry: *id.BlockId, o_header: *id.BlockId, o_body: *id.BlockId, o_exit: *id.BlockId, o_iv: *value.Value) i32 {
     val re: R.Result[id.BlockId, str] = builder.new_block(bld);
     if (R.is_err[id.BlockId, str](re)) { ret 1; }
@@ -622,7 +407,7 @@ fun mk_skeleton(m: *ir.Module, bld: *builder.Builder, i64t: ir_type.IrTypeId, o_
     val n: value.Value = value.param(0, i64t);
 
     builder.set_block(bld, entry);
-    if (R.is_err[bool, str](builder.emit_br(bld, header))) { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_br(bld, header))) { ret 1; }
 
     builder.set_block(bld, header);
     val rphi: R.Result[value.Value, str] = builder.emit_phi(bld, i64t);
@@ -630,27 +415,23 @@ fun mk_skeleton(m: *ir.Module, bld: *builder.Builder, i64t: ir_type.IrTypeId, o_
     val iv: value.Value = R.unwrap_ok[value.Value, str](rphi);
     val rc: R.Result[value.Value, str] = builder.emit_cmp_lt_s(bld, iv, n);
     if (R.is_err[value.Value, str](rc)) { ret 1; }
-    if (R.is_err[bool, str](builder.emit_cbr(bld, R.unwrap_ok[value.Value, str](rc), body, exit))) { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_cbr(bld, R.unwrap_ok[value.Value, str](rc), body, exit))) { ret 1; }
 
     builder.set_block(bld, exit);
-    if (R.is_err[bool, str](builder.emit_ret_void(bld))) { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret_void(bld))) { ret 1; }
 
-    if (R.is_err[bool, str](builder.phi_add_incoming(bld, iv, entry, value.const_int(0, i64t)))) { ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(bld, iv, entry, value.const_int(0, i64t)))) { ret 1; }
 
     @o_entry = entry; @o_header = header; @o_body = body; @o_exit = exit; @o_iv = iv;
     ret 0;
 }
 
-# emit `dst[iv] = ...` style access geps in the body; helper to keep tests terse:
-# gep(base, iv) with an i64 element stride.
 fun body_gep(bld: *builder.Builder, base: value.Value, iv: value.Value, i64t: ir_type.IrTypeId) R.Result[value.Value, str] {
     var ix: [1]value.Value;
     ix[0] = iv;
     ret builder.emit_gep(bld, base, i64t, ?ix[0], 1);
 }
 
-# a nested-loop header phi is a recurrence of the outer loop even though it is not
-# in the outer header
 test "mach.lang.me.analysis.dependence:nested_recurrence_declines" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -691,33 +472,33 @@ test "mach.lang.me.analysis.dependence:nested_recurrence_declines" {
     val one: value.Value = value.const_int(1, i64t);
 
     builder.set_block(?bld, entry);
-    if (R.is_err[bool, str](builder.emit_br(?bld, outer_h))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_br(?bld, outer_h))) { ir.dnit(?m); ret 1; }
 
     builder.set_block(?bld, outer_h);
     val rpo: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
     if (R.is_err[value.Value, str](rpo)) { ir.dnit(?m); ret 1; }
     val phi_o: value.Value = R.unwrap_ok[value.Value, str](rpo);
-    if (R.is_err[bool, str](builder.emit_br(?bld, inner_h))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_br(?bld, inner_h))) { ir.dnit(?m); ret 1; }
 
     builder.set_block(?bld, inner_h);
     val rpi: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
     if (R.is_err[value.Value, str](rpi)) { ir.dnit(?m); ret 1; }
     val phi_i: value.Value = R.unwrap_ok[value.Value, str](rpi);
-    if (R.is_err[bool, str](builder.emit_cbr(?bld, value.param(0, i8t), inner_body, outer_latch))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_cbr(?bld, value.param(0, i8t), inner_body, outer_latch))) { ir.dnit(?m); ret 1; }
 
     builder.set_block(?bld, inner_body);
-    if (R.is_err[bool, str](builder.emit_br(?bld, inner_h))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_br(?bld, inner_h))) { ir.dnit(?m); ret 1; }
 
     builder.set_block(?bld, outer_latch);
     val ruo: R.Result[value.Value, str] = builder.emit_add(?bld, phi_o, one);
     if (R.is_err[value.Value, str](ruo)) { ir.dnit(?m); ret 1; }
     val upd_o: value.Value = R.unwrap_ok[value.Value, str](ruo);
-    if (R.is_err[bool, str](builder.emit_br(?bld, outer_h))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_br(?bld, outer_h))) { ir.dnit(?m); ret 1; }
 
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi_o, entry, zero))) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi_o, outer_latch, upd_o))) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi_i, outer_h, zero))) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi_i, inner_body, one))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, phi_o, entry, zero))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, phi_o, outer_latch, upd_o))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, phi_i, outer_h, zero))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, phi_i, inner_body, one))) { ir.dnit(?m); ret 1; }
 
     var code: i32 = 0;
     val ra: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, ?alloc);
@@ -738,8 +519,6 @@ test "mach.lang.me.analysis.dependence:nested_recurrence_declines" {
     ret code;
 }
 
-# an element-wise `a[i] = b[i] + c[i]` over three distinct pointer-parameter bases
-# with unit stride carries no cross-iteration dependence: INDEPENDENT, three accesses.
 test "mach.lang.me.analysis.dependence:elementwise_independent" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -778,12 +557,12 @@ test "mach.lang.me.analysis.dependence:elementwise_independent" {
     if (R.is_err[value.Value, str](rs)) { ir.dnit(?m); ret 1; }
     val rga: R.Result[value.Value, str] = body_gep(?bld, a, iv, i64t);
     if (R.is_err[value.Value, str](rga)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_store(?bld, R.unwrap_ok[value.Value, str](rs), R.unwrap_ok[value.Value, str](rga)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?bld, R.unwrap_ok[value.Value, str](rs), R.unwrap_ok[value.Value, str](rga)))) { ir.dnit(?m); ret 1; }
     val ru: R.Result[value.Value, str] = builder.emit_add(?bld, iv, value.const_int(1, i64t));
     if (R.is_err[value.Value, str](ru)) { ir.dnit(?m); ret 1; }
     val upd: value.Value = R.unwrap_ok[value.Value, str](ru);
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, iv, body, upd))) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, iv, body, upd))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
 
     var code: i32 = 0;
     val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, ?alloc);
@@ -800,8 +579,6 @@ test "mach.lang.me.analysis.dependence:elementwise_independent" {
     ret code;
 }
 
-# a loop-carried access `a[i] = a[i-1]` (load index iv-1, not iv) is a cross-iteration
-# dependence: DEPENDENT.
 test "mach.lang.me.analysis.dependence:loop_carried_dependent" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -833,11 +610,11 @@ test "mach.lang.me.analysis.dependence:loop_carried_dependent" {
     if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
     val rgd: R.Result[value.Value, str] = body_gep(?bld, a, iv, i64t);
     if (R.is_err[value.Value, str](rgd)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_store(?bld, R.unwrap_ok[value.Value, str](rl), R.unwrap_ok[value.Value, str](rgd)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?bld, R.unwrap_ok[value.Value, str](rl), R.unwrap_ok[value.Value, str](rgd)))) { ir.dnit(?m); ret 1; }
     val ru: R.Result[value.Value, str] = builder.emit_add(?bld, iv, value.const_int(1, i64t));
     if (R.is_err[value.Value, str](ru)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, iv, body, R.unwrap_ok[value.Value, str](ru)))) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, iv, body, R.unwrap_ok[value.Value, str](ru)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
 
     var code: i32 = 0;
     val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, ?alloc);
@@ -853,10 +630,6 @@ test "mach.lang.me.analysis.dependence:loop_carried_dependent" {
     ret code;
 }
 
-# build an `s = s OP a[i]` reduction over an f64 array into a fresh module and run
-# analyze_reduction over it under the given reassociation permission. Returns 0 when
-# the verdict matches `want_ok`, 1 otherwise (including any construction failure), and
-# on a positive verdict also checks the recovered op / floatness / lane count.
 fun float_reduction_verdict(op: instruction.InstrKind, float_reassoc: bool, want_ok: bool) i32 {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -881,13 +654,11 @@ fun float_reduction_verdict(op: instruction.InstrKind, float_reassoc: bool, want
     var entry: id.BlockId; var header: id.BlockId; var body: id.BlockId; var exit: id.BlockId; var iv: value.Value;
     if (mk_skeleton(?m, ?bld, i64t, ?entry, ?header, ?body, ?exit, ?iv) != 0) { ir.dnit(?m); ret 1; }
 
-    # the f64 accumulator phi, the loop's second recurrence
     builder.set_block(?bld, header);
     val racc: R.Result[value.Value, str] = builder.emit_phi(?bld, f64t);
     if (R.is_err[value.Value, str](racc)) { ir.dnit(?m); ret 1; }
     val acc: value.Value = R.unwrap_ok[value.Value, str](racc);
 
-    # body: `s = s OP a[i]` over an f64-strided load
     val a: value.Value = value.param(1, ptrt);
     builder.set_block(?bld, body);
     var ix: [1]value.Value;
@@ -897,8 +668,6 @@ fun float_reduction_verdict(op: instruction.InstrKind, float_reassoc: bool, want
     val rl: R.Result[value.Value, str] = builder.emit_load(?bld, R.unwrap_ok[value.Value, str](rg), f64t);
     if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
     val ld: value.Value = R.unwrap_ok[value.Value, str](rl);
-    # exactly ONE update op: a second one would be another in-loop use of the
-    # accumulator and would decline for that reason rather than for the op
     var racu: R.Result[value.Value, str];
     if (op == instruction.OP_MUL)      { racu = builder.emit_mul(?bld, acc, ld); }
     or (op == instruction.OP_SUB)      { racu = builder.emit_sub(?bld, acc, ld); }
@@ -907,10 +676,10 @@ fun float_reduction_verdict(op: instruction.InstrKind, float_reassoc: bool, want
     val acc_upd: value.Value = R.unwrap_ok[value.Value, str](racu);
     val ru: R.Result[value.Value, str] = builder.emit_add(?bld, iv, value.const_int(1, i64t));
     if (R.is_err[value.Value, str](ru)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, iv, body, R.unwrap_ok[value.Value, str](ru)))) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, acc, entry, value.const_float(0.0, f64t)))) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, acc, body, acc_upd))) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, iv, body, R.unwrap_ok[value.Value, str](ru)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, acc, entry, value.const_float(0.0, f64t)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, acc, body, acc_upd))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
 
     var code: i32 = 0;
     val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, ?alloc);
@@ -933,11 +702,6 @@ fun float_reduction_verdict(op: instruction.InstrKind, float_reassoc: bool, want
     ret code;
 }
 
-# the `float_reassoc` gate (#2160). A float accumulator is a reduction candidate ONLY
-# with the caller's reassociation permission: without it the same loop is refused, so
-# an IEEE-strict build cannot reach the reassociating transform by any route. With it,
-# add and multiply are admitted (both associative with an exact IEEE identity) and
-# subtract is still refused (not associative at all, at any rounding).
 test "mach.lang.me.analysis.dependence:float_reduction_gated" {
     var code: i32 = 0;
     if (float_reduction_verdict(instruction.OP_ADD, false, false) != 0) { code = 1; }
@@ -949,8 +713,6 @@ test "mach.lang.me.analysis.dependence:float_reduction_gated" {
     ret code;
 }
 
-# a reduction loop carries a second header phi (the accumulator) beyond the induction
-# variable: conservatively DEPENDENT (child 4 handles reductions).
 test "mach.lang.me.analysis.dependence:reduction_dependent" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -972,7 +734,6 @@ test "mach.lang.me.analysis.dependence:reduction_dependent" {
     var entry: id.BlockId; var header: id.BlockId; var body: id.BlockId; var exit: id.BlockId; var iv: value.Value;
     if (mk_skeleton(?m, ?bld, i64t, ?entry, ?header, ?body, ?exit, ?iv) != 0) { ir.dnit(?m); ret 1; }
 
-    # add a second header phi (accumulator) -> two recurrences
     builder.set_block(?bld, header);
     val racc: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
     if (R.is_err[value.Value, str](racc)) { ir.dnit(?m); ret 1; }
@@ -989,10 +750,10 @@ test "mach.lang.me.analysis.dependence:reduction_dependent" {
     val acc_upd: value.Value = R.unwrap_ok[value.Value, str](racu);
     val ru: R.Result[value.Value, str] = builder.emit_add(?bld, iv, value.const_int(1, i64t));
     if (R.is_err[value.Value, str](ru)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, iv, body, R.unwrap_ok[value.Value, str](ru)))) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, acc, entry, value.const_int(0, i64t)))) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, acc, body, acc_upd))) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, iv, body, R.unwrap_ok[value.Value, str](ru)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, acc, entry, value.const_int(0, i64t)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, acc, body, acc_upd))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
 
     var code: i32 = 0;
     val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, ?alloc);
@@ -1008,9 +769,6 @@ test "mach.lang.me.analysis.dependence:reduction_dependent" {
     ret code;
 }
 
-# two accesses to the SAME base with different element widths (an i8 store and an
-# i64 store on `a`) are not the same per-iteration address window -- a genuine
-# cross-iteration overlap the alias guard cannot fix: DEPENDENT.
 test "mach.lang.me.analysis.dependence:same_base_diff_width_dependent" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -1040,15 +798,15 @@ test "mach.lang.me.analysis.dependence:same_base_diff_width_dependent" {
     var ix8: [1]value.Value; ix8[0] = iv;
     val rg8: R.Result[value.Value, str] = builder.emit_gep(?bld, a, i8t, ?ix8[0], 1);
     if (R.is_err[value.Value, str](rg8)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_store(?bld, value.const_int(0, i8t), R.unwrap_ok[value.Value, str](rg8)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?bld, value.const_int(0, i8t), R.unwrap_ok[value.Value, str](rg8)))) { ir.dnit(?m); ret 1; }
     var ix64: [1]value.Value; ix64[0] = iv;
     val rg64: R.Result[value.Value, str] = builder.emit_gep(?bld, a, i64t, ?ix64[0], 1);
     if (R.is_err[value.Value, str](rg64)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_store(?bld, value.const_int(0, i64t), R.unwrap_ok[value.Value, str](rg64)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?bld, value.const_int(0, i64t), R.unwrap_ok[value.Value, str](rg64)))) { ir.dnit(?m); ret 1; }
     val ru: R.Result[value.Value, str] = builder.emit_add(?bld, iv, value.const_int(1, i64t));
     if (R.is_err[value.Value, str](ru)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, iv, body, R.unwrap_ok[value.Value, str](ru)))) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, iv, body, R.unwrap_ok[value.Value, str](ru)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
 
     var code: i32 = 0;
     val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, ?alloc);
@@ -1064,8 +822,6 @@ test "mach.lang.me.analysis.dependence:same_base_diff_width_dependent" {
     ret code;
 }
 
-# a wider-than-stride access (a 1-byte gep stride feeding an 8-byte store) overlaps
-# its own window across iterations, so it is not a contiguous unit map: DEPENDENT.
 test "mach.lang.me.analysis.dependence:wider_than_stride_dependent" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -1095,12 +851,11 @@ test "mach.lang.me.analysis.dependence:wider_than_stride_dependent" {
     var ix: [1]value.Value; ix[0] = iv;
     val rg: R.Result[value.Value, str] = builder.emit_gep(?bld, a, i8t, ?ix[0], 1);
     if (R.is_err[value.Value, str](rg)) { ir.dnit(?m); ret 1; }
-    # store an 8-byte value through a 1-byte-stride gep
-    if (R.is_err[bool, str](builder.emit_store(?bld, value.const_int(0, i64t), R.unwrap_ok[value.Value, str](rg)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_store(?bld, value.const_int(0, i64t), R.unwrap_ok[value.Value, str](rg)))) { ir.dnit(?m); ret 1; }
     val ru: R.Result[value.Value, str] = builder.emit_add(?bld, iv, value.const_int(1, i64t));
     if (R.is_err[value.Value, str](ru)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, iv, body, R.unwrap_ok[value.Value, str](ru)))) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, iv, body, R.unwrap_ok[value.Value, str](ru)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
 
     var code: i32 = 0;
     val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, ?alloc);
@@ -1116,33 +871,6 @@ test "mach.lang.me.analysis.dependence:wider_than_stride_dependent" {
     ret code;
 }
 
-# the recognized reduction idiom of a counted loop (#2142): a loop whose ONLY
-# cross-iteration recurrence besides the induction variable is a single accumulator
-# phi updated `acc = acc OP rv` with an ASSOCIATIVE op, over loads of contiguous
-# unit-stride arrays and no stores.
-#
-# For an INTEGER accumulator the op must also be EXACT (add/xor/or/and), so partial-sum
-# vectorization is bit-identical to the scalar reduction; that is unconditional. For a
-# FLOAT accumulator (add/mul) reassociation changes IEEE rounding, so it is recognized
-# only when the caller passes `float_reassoc` -- the resolved `[profile.X]
-# float_reassoc` lever (#2160). With the lever off a float reduction is not a
-# reduction at all as far as this analysis is concerned, and stays scalar.
-# ---
-# ok:           true when the loop is a vectorizable reduction
-# op:           the reduction opcode (OP_ADD / OP_XOR / OP_OR / OP_AND, or float
-#               OP_ADD / OP_MUL)
-# acc_phi:      the accumulator header phi
-# acc_update:   the `acc OP rv` instruction (the accumulator's latch value)
-# acc_init:     the accumulator's preheader-incoming value (the user's initial value)
-# rv:           the per-iteration reduction value (acc_update's non-accumulator operand)
-# elem_ty:      the accumulator's scalar element type (every load matches it)
-# is_float:     whether that element type is a float scalar
-# bytes:        its byte width
-# lanes:        the 128-bit lane count (16 / bytes), always >= 2
-# accesses:     the loop's loads, all base[iv] of `elem_ty` (owned)
-# access_count: number of loads
-# access_cap:   allocated capacity of `accesses`
-# alloc:        the allocator `accesses` was taken from
 pub rec ReductionInfo {
     ok:           bool;
     op:           instruction.InstrKind;
@@ -1160,7 +888,6 @@ pub rec ReductionInfo {
     alloc:        *A.Allocator;
 }
 
-# a fresh "not a reduction" result
 fun reduction_none(alloc: *A.Allocator) ReductionInfo {
     var ri: ReductionInfo;
     ri.ok           = false;
@@ -1180,9 +907,6 @@ fun reduction_none(alloc: *A.Allocator) ReductionInfo {
     ret ri;
 }
 
-# release a reduction result's loads array
-# ---
-# ri: the reduction info to tear down
 pub fun reduction_dnit(ri: *ReductionInfo) {
     if (ri.accesses != nil && ri.access_cap > 0) {
         A.deallocate[MemAccess](ri.alloc, ri.accesses, ri.access_cap::usize);
@@ -1192,46 +916,17 @@ pub fun reduction_dnit(ri: *ReductionInfo) {
     ri.access_cap   = 0;
 }
 
-# the reduction opcodes admitted for an accumulator of the given kind.
-#
-# INTEGER: the associative AND exact ops (add, xor, or, and). Subtract is excluded
-# (not associative) and integer multiply is excluded because no baseline vector
-# integer-multiply exists to reduce with.
-#
-# FLOAT: add and multiply -- associative in real arithmetic, and each has an EXACT
-# IEEE identity element to seed the idle lanes with (see reduction_identity), so the
-# only property the vectorized form gives up is associativity. Subtract and divide are
-# not associative and stay out; min/max are not reductions this analysis recognizes.
 fun is_reduction_op(k: instruction.InstrKind, is_float: bool) bool {
-    if (is_float) {
-        if (k == instruction.OP_ADD) { ret true; }
-        if (k == instruction.OP_MUL) { ret true; }
-        ret false;
-    }
-    if (k == instruction.OP_ADD) { ret true; }
-    if (k == instruction.OP_XOR) { ret true; }
-    if (k == instruction.OP_OR)  { ret true; }
-    if (k == instruction.OP_AND) { ret true; }
-    ret false;
+    if (is_float) { ret opdesc.has(k, opdesc.EFF_REDUCE_FLOAT); }
+    ret opdesc.has(k, opdesc.EFF_REDUCE_INT);
 }
 
-# recognize loop `loop_ix` as a vectorizable reduction; never mutates `fn`
-# ---
-# fn:            the function
-# la:            the loop analysis for `fn`
-# loop_ix:       index into la.loops
-# types:         the module's IR type table
-# alloc:         allocator for the loads array
-# float_reassoc: permission to treat float add / multiply as associative (#2160). false
-#                declines every float accumulator, leaving it IEEE-strict and scalar
-# ret:           the reduction info (ok == false when not a reduction), or an alloc error
+
 pub fun analyze_reduction(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, types: *ir_type.IrTypeTable, alloc: *A.Allocator, float_reassoc: bool) R.Result[ReductionInfo, str] {
     if (loop_ix >= la.loop_len) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
     val lp: *loops.Loop = ?la.loops[loop_ix];
     if (!lp.is_counted) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
     if (lp.iv.step.kind != value.VAL_CONST_INT || lp.iv.step.data.int_lit != 1) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
-    # the induction variable and exactly ONE accumulator are the only recurrences: the
-    # header carries exactly two phis, and no other loop block carries any phi
     var acc_phi: id.InstructionId = id.INSTR_NIL;
     var bi: u32 = 0;
     for (bi < lp.body_len) {
@@ -1251,7 +946,6 @@ pub fun analyze_reduction(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u3
     }
     if (acc_phi == id.INSTR_NIL) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
 
-    # the accumulator phi: exactly two incomings (preheader init, latch update)
     val popt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, acc_phi);
     if (O.is_none[*instruction.Instruction](popt)) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
     val phi: *instruction.Instruction = O.unwrap[*instruction.Instruction](popt);
@@ -1270,15 +964,10 @@ pub fun analyze_reduction(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u3
     }
     if (!got_init || !got_upd || upd_val.kind != value.VAL_INSTR) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
 
-    # the accumulator's kind decides which ops are associative enough to admit. a float
-    # accumulator needs the caller's reassociation permission; without it the loop is
-    # not a reduction candidate at all and stays IEEE-strict scalar.
     val elem_ty:  ir_type.IrTypeId = phi.ty;
     val is_float: bool = ir_type.is_float_scalar(types, elem_ty);
     if (is_float && !float_reassoc) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
 
-    # the update must be `acc OP rv`, OP associative for that kind, one operand the
-    # accumulator phi and the other the reduction value
     val uopt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, upd_val.data.instr);
     if (O.is_none[*instruction.Instruction](uopt)) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
     val upd: *instruction.Instruction = O.unwrap[*instruction.Instruction](uopt);
@@ -1293,17 +982,11 @@ pub fun analyze_reduction(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u3
     }
     if (rv.kind != value.VAL_INSTR) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
 
-    # the accumulator's ONLY in-loop use must be its own update: any other in-loop use
-    # would make the recurrence non-linear (and the live-out rewrite would mis-fire).
-    # any out-of-loop use is fine (the reduction result).
     if (!acc_used_only_by(fn, la, loop_ix, acc_phi, upd_val.data.instr)) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
 
-    # the accumulator element must be a scalar of 1..8 bytes giving a lane count >= 2
     val w: u32 = scalar_bytes(types, elem_ty);
     if (w == 0 || w > 8 || (16 / w) < 2) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
 
-    # collect the loads (base[iv], element type == accumulator type); reject any store
-    # or opaque effect (a pure reduction has no store, so no aliasing hazard exists)
     var ri: ReductionInfo = reduction_none(alloc);
     var total: u32 = 0;
     bi = 0;
@@ -1329,22 +1012,6 @@ pub fun analyze_reduction(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u3
             if (inst.kind == instruction.OP_LOAD) {
                 var acc: MemAccess;
                 if (!classify_access(fn, la, loop_ix, iid, inst, types, ?acc)) { reduction_dnit(?ri); ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
-                # every load must be the accumulator's OWN width. A narrower element
-                # means the lane count changes between the load and the accumulate --
-                # four i32 lanes feed two i64 lanes -- and the transform below has one
-                # vector type for the whole tree, so relaxing this alone rewrites a
-                # 4-byte-strided load as a 16-byte one and reinterprets four elements
-                # as two. That is a silent wrong answer, not a declined loop: measured
-                # on a 64-element i32 sum, `0` against the scalar's `13280` (#2347).
-                #
-                # Deleting this check changes NO test, because the reduction value of a
-                # widening sum is the cast itself and supported_vector_op admits no
-                # conversion, so build_vset refuses it one gate later. That makes this
-                # rule untested but not unjustified: it is the width contract the
-                # single-vector-type transform relies on, and the gate that actually
-                # holds today is a different one. Widening needs a lane-widening
-                # convert in the IR and in both capable back ends, which do not have
-                # one -- see #2347. Do not remove it for being untested.
                 if (acc.elem_ty != elem_ty) { reduction_dnit(?ri); ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
                 ri.accesses[ri.access_count] = acc;
                 ri.access_count = ri.access_count + 1;
@@ -1368,10 +1035,6 @@ pub fun analyze_reduction(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u3
     ret R.ok[ReductionInfo, str](ri);
 }
 
-# true when the accumulator phi `acc` is used by no in-loop instruction other than
-# its update `upd` (its result may still be used freely outside the loop). Loop
-# blocks (header + body) are scanned; an operand naming `acc` anywhere but `upd`
-# means the recurrence is non-linear and the reduction is declined.
 fun acc_used_only_by(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, acc: id.InstructionId, upd: id.InstructionId) bool {
     val lp: *loops.Loop = ?la.loops[loop_ix];
     var bi: u32 = 0;
@@ -1393,16 +1056,11 @@ fun acc_used_only_by(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, ac
     ret true;
 }
 
-# true unless instruction `iid` (other than the permitted `upd`, or a pure debug
-# value) has an operand naming `acc`
 fun instr_uses_only(fn: *ir.Function, iid: id.InstructionId, acc: id.InstructionId, upd: id.InstructionId) bool {
     if (iid == upd) { ret true; }
     val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, iid);
     if (O.is_none[*instruction.Instruction](opt)) { ret true; }
     val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt);
-    # a debug-value is pure -g metadata: its reference to the accumulator neither
-    # affects the recurrence nor emitted code, so it is not a disqualifying use (and
-    # counting it would make the reduction decline under -g -- a -g additivity break)
     if (inst.kind == instruction.OP_DBG_VALUE) { ret true; }
     var o: u32 = 0;
     for (o < inst.operand_count) {

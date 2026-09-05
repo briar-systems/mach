@@ -1,33 +1,3 @@
-# machine-code encoding dispatcher to the active ISA's encoder
-#
-# Byte encoding is target-specific: turning a fully-resolved (post-isel, post-
-# regalloc, post-frame) `MirModule` into the exact bytes a CPU executes is an
-# ISA's business. This module owns no x86-64 (or any other arch's) opcode,
-# register, or encoding knowledge; it dispatches each MIR module to the active
-# ISA's `encode` operation through the `isa` vtable, exactly as the shared `isel`
-# dispatcher reaches the ISA's `select`. Adding a new architecture is implementing
-# `target/isa/<arch>` and registering its `encode` entry point - no edit here.
-#
-# What this module DOES own is the target-agnostic output shape every ISA's
-# encoder fills: the per-module `EncoderOutput` (encoded `.text` bytes, function
-# symbol marks, and pending relocations) plus its `SymbolMark` and `PendingReloc`
-# elements. The code-generation driver (`be.codegen`) packs these into an
-# `of.ObjectImage`, and the per-arch encoder (e.g. `target/isa/x64/encode.mach`)
-# allocates and populates them. Keeping the records here lets the driver and every
-# ISA agree on one common output without depending on any specific architecture.
-#
-# It also owns the ISA-agnostic two-pass encoder driver every architecture's
-# encoder runs over a module: `encode_driver` initialises an `EncodeState`
-# (the growable text `ByteBuf` plus the symbol / relocation / branch-fixup /
-# block-offset arrays), walks every function through an ISA-supplied per-function
-# encode hook (recording marks, relocs, fixups, and block offsets via the shared
-# `push_*` helpers), patches every intra-module branch in pass 2 through an
-# ISA-supplied per-branch patch hook, right-sizes the text, and assembles the
-# `EncoderOutput`. The two `EncodeHooks` are the only per-ISA seams: how one
-# function's bytes are emitted (opcodes, prologue/epilogue, relocation offsets)
-# and how one resolved branch displacement is written into the text. No opcode,
-# register, displacement-width, or byte-encoding knowledge lives here.
-
 use std.format;
 use std.io.writer;
 use std.system.panic.panic;
@@ -39,6 +9,7 @@ use std.types.string.str;
 use std.types.string.str_len;
 
 use std.allocator.page;
+use std.collections.map;
 use std.memory;
 
 use A: std.allocator;
@@ -46,297 +17,48 @@ use O: std.types.option;
 use R: std.types.result;
 
 use mach.lang.be.codegen.mir;
+use mach.lang.be.codegen.encoding;
 use mach.lang.intern;
+use mach.lang.layout;
 use mach.lang.source;
-use mach.lang.target.abi;
 use mach.lang.target.isa;
 use mach.lang.target.of;
-use tos: mach.lang.target.os;
 use target: mach.lang.target.resolved;
 
-# the per-module result an ISA's encoder produces: the encoded `.text` bytes plus
-# the symbol marks and pending relocations the object builder packs into an
-# `of.ObjectImage`
-# ---
-# text:         encoded `.text` bytes (owned; freed by the object builder once packed)
-# text_len:     number of valid bytes in `text`
-# relocations:  pending relocations naming cross-function / symbol references (owned)
-# reloc_count:  number of relocations
-# symbols:      symbol marks, one per function entry (owned)
-# symbol_count: number of symbol marks
-# rows:         PC<->source line rows, ordered by ascending `text_offset` (owned)
-# row_count:    number of line rows
-# consts:       interned constant-pool entries the encoder referenced (owned)
-# const_count:  number of pool entries
-pub rec EncoderOutput {
-    text:         *u8;
-    text_len:     u32;
-    relocations:  *PendingReloc;
-    reloc_count:  u32;
-    symbols:      *SymbolMark;
-    symbol_count: u32;
-    rows:         *LineRow;
-    row_count:    u32;
-    varlocs:      *VarLoc;
-    varloc_count: u32;
-    inline_pcs:   *InlinePc;
-    inline_pc_count: u32;
-    consts:       *ConstEntry;
-    const_count:  u32;
-    frames:       *of.FrameUnwind;
-    frame_count:  u32;
-}
+pub def EncoderOutput: encoding.EncoderOutput;
+pub def LineRow:       encoding.LineRow;
+pub def InlinePc:      encoding.InlinePc;
+pub def VarLoc:        encoding.VarLoc;
 
-# one retained PC<->source mapping: a `.text` byte offset and the source location of
-# the instruction that begins there
-#
-# The encoder appends one per instruction with a valid source location, in
-# ascending `text_offset` order. `insert_text` (branch relaxation) keeps
-# `text_offset` correct while the text grows; codegen's `#[section(...)]` re-homing
-# (`pack_rows`) then assigns each row's final `sec` and rebases `text_offset` into
-# that section. Until re-homing every row is relative to the single encoder `.text`
-# blob and `sec` is 0. The source `loc` (file + byte offset) resolves to a 1-based
-# line/column via `source.position`; the #1699 `.debug_line` / CodeView producer
-# consumes it. The row never affects the emitted bytes.
-# ---
-# text_offset: byte offset of the instruction within its owning section (`.text`
-#              blob-relative until re-homing rebases it)
-# sec:         owning object-section index, assigned by codegen re-homing (0 while
-#              the row is still relative to the single encoder blob)
-# loc:         source location (file + byte offset) the instruction lowered from
-pub rec LineRow {
-    text_offset: u32;
-    sec:         u32;
-    loc:         source.SrcLoc;
-}
+pub val VARLOC_NONE:  u8 = encoding.VARLOC_NONE;
+pub val VARLOC_REG:   u8 = encoding.VARLOC_REG;
+pub val VARLOC_FRAME: u8 = encoding.VARLOC_FRAME;
 
-# one inline-instance transition: at `text_offset` the active inline instance becomes
-# `inline_site` (0 = the function's own body, else a 1-based ir.Function inline-site id).
-# The encoder appends one only when the instance CHANGES between consecutive
-# instructions, in ascending `text_offset` order, so a record governs `[text_offset,
-# next_offset)`. insert_text keeps `text_offset` correct through branch relaxation, and
-# pack re-homes it exactly like a LineRow. The DWARF inlined_subroutine producer (#1707)
-# groups these into per-instance `.text` ranges; nothing else reads them and they never
-# affect the emitted bytes.
-# ---
-# text_offset: `.text` byte offset where this instance becomes active
-# sec:         owning section index after re-homing (0 until then)
-# inline_site: the 1-based inline instance now active, or 0 for the function body
-pub rec InlinePc {
-    text_offset: u32;
-    sec:         u32;
-    inline_site: u32;
-}
-
-# a source-variable location record: at `.text` offset `text_offset`, the variable
-# bound by OP_DBG_VALUE `iid` lives at the raw home `(kind, reg | off)`. The producer
-# joins `iid` to the IR variable identity and orders records by offset to build the
-# per-PC ranges of a `.debug_loclists` entry (#1705). `text_offset` / `sec` (and a
-# nonzero `end_offset`) re-home exactly like a LineRow (insert_text shift,
-# site_placed re-home) so a range stays correct across branch relaxation and
-# `#[section]` excision.
-#
-# A VARLOC_CMP record is the fused-condition COMPUTED VALUE: the variable is the
-# relation `cc(lhs, rhs)` evaluated over the two operand homes, observable only
-# while the fused compare-and-branch executes - `end_offset` bounds the range to
-# that instruction's byte extent (a plain record's range instead runs to the
-# variable's next binding, the linear rule, and carries `end_offset` 0). the
-# operand homes ride `(sub_lhs, reg, off)` / `(sub_rhs, reg2, off2)`, each one
-# of VARLOC_REG (register id), VARLOC_FRAME (spill-slot offset holding the
-# machine-word value), or VARLOC_IMM (the constant's raw bits in off / off2);
-# `cmp_rel` + `cmp_signed` + `cmp_width` digest the relation so the producer
-# needs no MIR opcode knowledge.
-# ---
-# text_offset: `.text` byte offset where this binding becomes live
-# sec:         owning object-section index (re-homed from 0 by codegen)
-# iid:         source OP_DBG_VALUE instruction id (joins the IR dbg-var identity)
-# kind:        VARLOC_NONE / VARLOC_REG / VARLOC_FRAME / VARLOC_CMP
-# reg:         physical register id when kind == VARLOC_REG; the lhs operand's
-#              register for a VARLOC_CMP with sub_lhs VARLOC_REG
-# off:         frame-base offset when kind == VARLOC_FRAME; the lhs operand's
-#              frame offset or immediate bits for a VARLOC_CMP
-# off_storage: true when a VARLOC_FRAME slot holds the value's storage directly (a
-#              register-passed aggregate reconstructed into a slot it owns, #1954), so an
-#              aggregate location addresses the slot without the byref pointer deref; false
-#              for a regalloc spill, whose slot holds the value (a pointer, for an aggregate)
-# end_offset:  explicit exclusive range end for a VARLOC_CMP (0 = linear rule)
-# sub_lhs:     lhs operand home kind for a VARLOC_CMP (REG / FRAME / IMM)
-# sub_rhs:     rhs operand home kind for a VARLOC_CMP (REG / FRAME / IMM)
-# reg2:        rhs operand register for a VARLOC_CMP with sub_rhs VARLOC_REG
-# off2:        rhs operand frame offset or immediate bits for a VARLOC_CMP
-# cmp_rel:     the relation (one of CMPREL_*) for a VARLOC_CMP
-# cmp_signed:  true for a signed relation (selects the width interpretation)
-# cmp_width:   the compare width in bytes (0 reads as the machine word)
-pub rec VarLoc {
-    text_offset: u32;
-    sec:         u32;
-    iid:         u32;
-    kind:        u8;
-    reg:         i32;
-    off:         i64;
-    off_storage: bool;
-    end_offset:  u32;
-    sub_lhs:     u8;
-    sub_rhs:     u8;
-    reg2:        i32;
-    off2:        i64;
-    cmp_rel:     u8;
-    cmp_signed:  bool;
-    cmp_width:   u8;
-}
-
-# a variable-location record's home kind. VARLOC_CMP is the fused-condition
-# computed value (see VarLoc); VARLOC_IMM appears only as a VARLOC_CMP operand
-# sub-home, never as a record's own kind
-pub val VARLOC_NONE:  u8 = 0;
-pub val VARLOC_REG:   u8 = 1;
-pub val VARLOC_FRAME: u8 = 2;
-
-# the slot offset a VARLOC_FRAME record carries, measured from the register the
-# function's DW_AT_frame_base will name
-#
-# The frame base is the frame pointer, and a slot offset is measured from it - except in
-# a realigned frame (#2735), where the slot region is addressed from the stack pointer
-# and the frame pointer sits a run-time distance above it. There the base named is the
-# stack pointer, so the offset recorded has to be the stack-pointer one, and the two
-# halves are decided together here rather than in the producer, which does not see the
-# frame at all.
-#
-# Both cases read the distance the TARGET stamped rather than re-deriving it: `base_dist`
-# from the stack pointer, `fp_dist` from the frame pointer. A raw `slots[si].offset` is
-# right only where the frame pointer sits immediately above the locals, which is x86-64
-# and aarch64 but not riscv64, whose `s0` is pinned at the frame top above the ra/s0
-# record and the callee-save areas. Reading the raw offset agreed with the encoder on the
-# two targets whose reservation is zero and described every riscv64 local at the wrong
-# address by 16 to 200 bytes (#2759).
-# ---
-# fn: the laid-out function, with `base_dist` and `fp_dist` already stamped by its encoder
-# si: index of the slot in `fn.frame.slots`
-# ret: the offset from the frame base
 fun varloc_slot_off(fn: *mir.MirFunction, si: u32) i64 {
     if (fn.frame.realign != 0) {
         ret fn.frame.base_dist::i64 + fn.frame.slots[si].offset;
     }
     ret fn.frame.slots[si].offset - fn.frame.fp_dist::i64;
 }
-pub val VARLOC_CMP:   u8 = 3;
-pub val VARLOC_IMM:   u8 = 4;
+pub val VARLOC_CMP:   u8 = encoding.VARLOC_CMP;
+pub val VARLOC_IMM:   u8 = encoding.VARLOC_IMM;
 
-# the digested relation a VARLOC_CMP compares with (`cmp_signed` carries the
-# signedness separately; only EQ / NE / LT / LE exist - lowering canonicalizes
-# GT / GE by swapping operands)
-pub val CMPREL_EQ: u8 = 0;
-pub val CMPREL_NE: u8 = 1;
-pub val CMPREL_LT: u8 = 2;
-pub val CMPREL_LE: u8 = 3;
+pub val CMPREL_EQ: u8 = encoding.CMPREL_EQ;
+pub val CMPREL_NE: u8 = encoding.CMPREL_NE;
+pub val CMPREL_LT: u8 = encoding.CMPREL_LT;
+pub val CMPREL_LE: u8 = encoding.CMPREL_LE;
 
-# one relocation the encoder leaves for the object writer to resolve
-#
-# `kind` is an abstract relocation kind (`of.RK_*`); `sym` is the interned
-# target-symbol name; `offset` is the patch site within `.text`.
-# ---
-# offset: byte offset of the patch site within the `.text` section
-# kind:   abstract relocation kind (one of of.RK_*)
-# sym:    interned name of the referenced symbol
-# addend: constant added to the resolved symbol address
-pub rec PendingReloc {
-    offset: u32;
-    kind:   of.RelocKind;
-    sym:    intern.StrId;
-    addend: i32;
-}
+pub def PendingReloc: encoding.PendingReloc;
+pub def SymbolMark:   encoding.SymbolMark;
 
-# a symbol defined in the encoded `.text` at a known offset: a function entry
-# point or an exposed inline-asm label
-# ---
-# name:   interned symbol name
-# offset: byte offset of the symbol within the `.text` section
-# flags:  object-symbol flags carried through to `of.Symbol.flags`
-pub rec SymbolMark {
-    name:   intern.StrId;
-    offset: u32;
-    flags:  u32;
-}
+pub val CONST_F32: u8 = encoding.CONST_F32;
+pub val CONST_F64: u8 = encoding.CONST_F64;
+pub val CONST_VEC: u8 = encoding.CONST_VEC;
 
-# the KIND half of a constant-pool entry's identity
-#
-# The bytes alone are not the identity. A 4-byte f32 and a 4-byte i32 can hold the
-# same bit pattern while meaning different things, and the kind is what an entry's
-# alignment and any future type-aware consumer are derived from, so it is part of
-# the interning key rather than a label hung off it. Adding a kind is one constant
-# here plus its arm in `const_align`.
-pub val CONST_F32: u8 = 1;
-pub val CONST_F64: u8 = 2;
-pub val CONST_VEC: u8 = 3;
+pub def ConstEntry: encoding.ConstEntry;
 
-# one interned constant in the module's constant pool
-#
-# The pool exists because a constant wider than an ISA's immediate forms has to
-# live in memory, and rebuilding it from instructions at every use costs more than
-# loading it (#2248, #2700). An entry is a laid-out byte image plus the identity it
-# was interned under; the encoder references it by symbol, and `be.codegen` packs it
-# into a read-only section.
-#
-# `bytes` is pool-owned: the encoder copies the constant in, because the bits it
-# reads are a MIR operand's `imm` field or an ISA-side scratch buffer, neither of
-# which outlives the encode. `be.codegen` copies again into image-owned storage
-# when it packs, and the pool's copy is released with the rest of the encoder
-# output.
-#
-# `len` is the entry's full width, which is not bounded by a register: a constant
-# wider than one register (#2727) is ONE entry, loaded in register-width pieces at
-# offsets into its own symbol. That is why a reference names `(sym, offset)` rather
-# than a symbol alone.
-# ---
-# bytes: the constant's laid-out little-endian byte image (pool-owned)
-# len:   the entry's byte width
-# align: the alignment its section must guarantee, from `const_align`
-# kind:  the CONST_* kind the entry was interned under
-# sym:   the local symbol naming the entry's base
-pub rec ConstEntry {
-    bytes: *u8;
-    len:   u32;
-    align: u32;
-    kind:  u8;
-    sym:   intern.StrId;
-}
-
-# the concrete signature the erased `isa.RegMachine.encode` pointer is cast back to
-# before it is called
-#
-# The vtable stores `encode` type-erased (`*u8`) because its signature names
-# `target.Target`, `mir.MirModule`, and this module's `EncoderOutput`, each of
-# which imports `isa` - a typed field there would invert that dependency and form
-# an import cycle. This dispatcher already imports `target` and `mir` and declares
-# `EncoderOutput`, so it declares the cast-back type locally and casts the erased
-# pointer to it, exactly as `isel` casts `isa.select` back to its `SelectFn` and
-# `mir` casts `abi.arg_passing` back to its concrete signature. The structurally
-# identical typedef the x86-64 encoder exposes describes the same contract from
-# the impl side; the structural fn-pointer cast binds them. The allocator is
-# threaded explicitly for parity with `isel.SelectFn` and so the per-arch encoder
-# has a backing allocator without reaching into the module.
-# ---
-# a:   backing allocator for the encoder's output arrays
-# tgt: resolved compilation target
-# m:   the fully-resolved MIR module (post isel / regalloc / frame)
-# ret: the populated EncoderOutput (owned arrays), or an error naming the failure
-pub def EncodeFn: fun(*A.Allocator, *target.Target, *mir.MirModule) R.Result[EncoderOutput, str];
-
-# encode a fully-resolved MIR module into `.text` bytes, symbol marks, and pending
-# relocations
-#
-# Dispatches the whole module to the active ISA's `encode` operation, reached
-# through `tgt.arch.encode`. Carries no architecture-specific knowledge - the
-# encoder the ISA registered owns the byte, opcode, register, and
-# prologue/epilogue/relocation machinery. Fails loudly when the target has no ISA
-# vtable or the ISA registered no `encode` operation (an unsupported
-# architecture), and propagates any encoding error from the per-arch encoder.
-# ---
-# tgt:     resolved compilation target; its `arch` vtable supplies the encoder
-# m:       the fully-resolved MIR module to encode
-# asm_out: optional writer receiving the assembly text this encode renders
-# ret:     the populated EncoderOutput (owned arrays), or an error string
-pub fun run(tgt: *target.Target, m: *mir.MirModule, asm_out: *writer.Writer) R.Result[EncoderOutput, str] {
+pub fun run(tgt: *target.Target, m: *mir.MirModule,
+            asm_out: *writer.Writer) R.Result[EncoderOutput, str] {
     if (tgt == nil) { ret R.err[EncoderOutput, str]("encode: nil target"); }
     if (m == nil)   { ret R.err[EncoderOutput, str]("encode: nil mir module"); }
     if (tgt.arch == nil) {
@@ -347,63 +69,19 @@ pub fun run(tgt: *target.Target, m: *mir.MirModule, asm_out: *writer.Writer) R.R
     }
 
     if (asm_out != nil) {
-        # an ISA with no printer refuses rather than no-ops: the caller has already
-        # created the `.s`, so a silent skip leaves an empty file claiming to be the
-        # emitted code (#2187). an ISA whose printer is not written yet registers its
-        # own refusal, which names itself and its tracking issue.
-        if (tgt.arch.emit_asm == nil) {
+        if (!tgt.arch.has_assembly) {
             ret R.err[EncoderOutput, str]("--emit-asm: the target architecture registered no assembly printer");
         }
-        val emit_asm: EmitAsmFn = tgt.arch.emit_asm::EmitAsmFn;
-        ret emit_asm(m.alloc, tgt, m, asm_out);
+        var backend_target: isa.BackendTarget = target.backend_target(tgt);
+        ret tgt.arch.assembly.emit(m.alloc, ?backend_target, m, asm_out);
     }
 
-    val encode: EncodeFn = tgt.arch.encode::EncodeFn;
-    ret encode(m.alloc, tgt, m);
+    var backend_target: isa.BackendTarget = target.backend_target(tgt);
+    ret tgt.arch.encode(m.alloc, ?backend_target, m);
 }
 
-# the concrete signature the erased `isa.RegMachine.emit_asm` pointer is cast back
-# to before it is called
-#
-# The vtable stores `emit_asm` type-erased (`*u8`) for the same import-cycle
-# reason as `encode`: its signature names `target.Target` and `mir.MirModule`,
-# both of which import `isa`. This dispatcher already imports `target` and `mir`,
-# so it declares the cast-back type locally and casts the erased pointer to it,
-# exactly as `run` casts `encode` back to `EncodeFn`.
-#
-# This is an ENCODE, not a separate print pass: the ISA runs its ordinary encoder
-# with an `AsmSink` attached to the byte buffer, so the text is rendered from the
-# machine instructions the encoder actually emits and cannot describe anything
-# else. It returns the same `EncoderOutput` the plain path does; `--emit-asm`
-# reaches it through an already-throwaway codegen pass, so the object-producing
-# build never takes this branch and its bytes are untouched.
-#
-# An ISA whose printer is not implemented registers a refusal here rather than
-# leaving the slot nil, so the failure names the architecture (#2187).
-# ---
-# a:   backing allocator for the encoder's output arrays
-# tgt: resolved compilation target
-# m:   the fully-resolved MIR module (post isel / regalloc / frame)
-# out: destination writer the assembly text is written into
-# ret: the populated EncoderOutput (owned arrays), or an error naming the failure
-pub def EmitAsmFn: fun(*A.Allocator, *target.Target, *mir.MirModule, *writer.Writer) R.Result[EncoderOutput, str];
-
-# initial capacity of a freshly grown encoder byte buffer
 val BYTEBUF_INIT_CAP: usize = 256;
 
-# a growable byte sink the encoders write machine code into
-#
-# The back end drains `data[0..len]` into the object image's `.text` section
-# after every function is encoded; keeping the growth bookkeeping here lets
-# `of.Section` stay a finalized container. The sink is ISA-general - it carries
-# no opcode or width knowledge, so every architecture's encoder writes its bytes
-# through the same buffer.
-# ---
-# data:  backing byte array (nil until the first byte is appended)
-# len:   number of bytes written
-# cap:   allocated capacity
-# alloc: allocator backing `data`
-# asm:   optional assembly-text sink; nil on an object-producing encode
 pub rec ByteBuf {
     data:  *u8;
     len:   usize;
@@ -412,67 +90,6 @@ pub rec ByteBuf {
     asm:   *AsmSink;
 }
 
-# the assembly-text side-channel an encoder renders `--emit-asm` through
-#
-# The `.s` artifact is a rendering of the encoder's own instruction stream, not a
-# second walk over the MIR: an ISA notifies this sink once per machine instruction
-# it emits, immediately after emitting it, and the sink renders that instruction's
-# text. One notification per emitted instruction - never per MIR opcode, since a
-# MIR macro-op expands to several machine instructions and collapsing them is
-# exactly the divergence this replaced (#2187).
-#
-# `accounted` is the totality guard: the end of the last byte range an instruction
-# notification claimed. A notification claims `[start, ByteBuf.len)` and DECLARES its
-# own `start`, which must be exactly where the previous claim ended - so the claims
-# tile the text, each byte belongs to exactly one instruction, and a notification an
-# emitting path never sent cannot be absorbed by the next one (#2250). A claim that
-# does not begin at the cursor leaves the cursor where it is, so the bytes it skipped
-# stay unclaimed and `sink_unaccounted` reports them; the caller fails loudly naming
-# the opcode responsible. A printer that silently skips an instruction is therefore
-# not expressible - the bytes it failed to render are still counted.
-#
-# Declaring the start is what a running high-water mark could not do. `accounted` used
-# to be assigned `ByteBuf.len` outright, which made a claim cover everything back to
-# the last one: a dropped notification in the MIDDLE of a sequence was swallowed by
-# its successor, and only a miss at the very END of a MIR opcode was caught.
-#
-# `mi` is the MIR instruction currently being encoded, set by the ISA around each
-# dispatch. A renderer reads it only to name what the machine operand cannot carry
-# (a call's target symbol, a branch's block label - `mir_to_operand` erases both),
-# never to choose a mnemonic or an operand.
-#
-# A notification may be RENDERED IMMEDIATELY or BUFFERED. An architecture whose
-# instruction's first form is its last renders on the spot and needs nothing more
-# than `sink_claim`. One whose final form is settled later - RISC-V, whose branch
-# relaxation rewrites an over-range conditional into an inverted guard plus a jump
-# after the whole function is laid out - buffers its notifications as `AsmNote`s
-# here, lets the relaxation pass edit them exactly as it edits the text, and renders
-# once the layout is final. Streaming such a target would print the instruction it
-# first planned rather than the one the object holds, which is the divergence this
-# whole mechanism exists to make unrepresentable (#2187).
-#
-# The note offsets are one more table that must stay consistent with the text, so
-# they live beside the block / fixup / symbol / relocation tables `insert_text`
-# already shifts rather than in ISA-private memory that a future shift path could
-# forget. A target that renders as it goes never pushes a note and pays nothing.
-# ---
-# The buffer is backed by the owning `ByteBuf`'s allocator, so buffering costs the
-# sink no extra construction argument and a target that never pushes a note never
-# allocates.
-# ---
-# out:        destination writer for the rendered text
-# accounted:  end of the last byte range an instruction notification claimed
-# failed:     a write error occurred; the first one is kept in `err`
-# err:        the first write error, empty until `failed`
-# mi:         the MIR instruction being encoded, for symbol / label annotation
-# interner:   resolves symbol ids to their source names
-# notes:      buffered notifications, in emission order (nil until the first push)
-# note_count: number of buffered notifications
-# note_cap:   capacity of `notes`
-# note_insts: how many of the buffered notifications are one instruction-word wide
-#             (ASM_NOTE_INST and ASM_NOTE_BYTES alike)
-# claims:     instruction notifications accepted, buffered and streamed alike
-# refused:    notifications whose declared start was not where the last claim ended
 pub rec AsmSink {
     out:        *writer.Writer;
     accounted:  usize;
@@ -488,37 +105,13 @@ pub rec AsmSink {
     refused:    u32;
 }
 
-# what one buffered notification stands for
-pub val ASM_NOTE_INST:  u8 = 0;  # one emitted machine instruction
-pub val ASM_NOTE_FUNC:  u8 = 1;  # a function's heading; emits no bytes
-pub val ASM_NOTE_BLOCK: u8 = 2;  # a block's local label; emits no bytes
-pub val ASM_NOTE_BYTES: u8 = 3;  # one instruction-word-wide slice of a raw-byte
-                                  # directive's payload (`bytes`, `ASM_NOTE_BYTES_WIDTH`
-                                  # of them valid)
+pub val ASM_NOTE_INST:  u8 = 0;
+pub val ASM_NOTE_FUNC:  u8 = 1;
+pub val ASM_NOTE_BLOCK: u8 = 2;
+pub val ASM_NOTE_BYTES: u8 = 3;
 
-# the payload width one buffered `ASM_NOTE_BYTES` note carries
-#
-# A printer that buffers its notifications accounts a directive exactly as it
-# accounts an instruction - one note per instruction-word's worth of bytes - so a
-# directive wider than one word is pushed as several notes, each this wide (#2493).
-# Every fixed-width ISA that buffers (today, only riscv64) emits four-byte words, so
-# one constant serves; a buffering target with a different fixed width would need
-# its own note kind rather than stretching this one.
 pub val ASM_NOTE_BYTES_WIDTH: usize = 4;
 
-# one buffered notification: a machine instruction the encoder emitted, a function /
-# block heading, or a slice of a raw-byte directive's payload
-#
-# `off` is the instruction's `.text` offset, kept correct by `insert_text` exactly
-# as the block and fixup offsets are, so a relaxation pass can find the note whose
-# text it is about to rewrite after any number of earlier growths.
-# ---
-# kind:  ASM_NOTE_INST / ASM_NOTE_FUNC / ASM_NOTE_BLOCK / ASM_NOTE_BYTES
-# off:   `.text` byte offset of the note's first byte (ASM_NOTE_INST, ASM_NOTE_BYTES)
-# inst:  the emitted machine instruction (ASM_NOTE_INST)
-# name:  the function's interned name (ASM_NOTE_FUNC)
-# id:    the block id (ASM_NOTE_BLOCK)
-# bytes: the payload slice, `ASM_NOTE_BYTES_WIDTH` bytes (ASM_NOTE_BYTES)
 pub rec AsmNote {
     kind:  u8;
     off:   u32;
@@ -528,14 +121,8 @@ pub rec AsmNote {
     bytes: [ASM_NOTE_BYTES_WIDTH]u8;
 }
 
-# initial capacity of a sink's note buffer
 val ASM_NOTE_INIT_CAP: u32 = 64;
 
-# construct a sink rendering into `out`
-# ---
-# out:      destination writer the assembly text is written into
-# interner: resolves symbol ids to their source names
-# ret:      an armed sink with nothing yet accounted
 pub fun sink_init(out: *writer.Writer, interner: *intern.Interner) AsmSink {
     var s: AsmSink;
     s.out        = out;
@@ -553,9 +140,6 @@ pub fun sink_init(out: *writer.Writer, interner: *intern.Interner) AsmSink {
     ret s;
 }
 
-# construct a cleared instruction notification
-# ---
-# ret: an ASM_NOTE_INST note with an empty instruction
 pub fun note_blank() AsmNote {
     var n: AsmNote;
     n.kind = ASM_NOTE_INST;
@@ -566,24 +150,12 @@ pub fun note_blank() AsmNote {
     ret n;
 }
 
-# buffer one notification, claiming the bytes it covers
-#
-# An instruction note claims its byte range exactly as an immediate render does, and
-# it needs no separate start: `AsmNote.off` is already the instruction's first byte,
-# so the note itself declares where its claim begins and the tiling check falls out
-# of the buffered path for free. `ASM_NOTE_BYTES` claims the same way - it is a
-# directive's payload, but it is exactly one instruction-word wide, so it counts
-# against `note_insts` (and the totality check built on it) identically (#2493).
-# ---
-# buf: the encoder byte sink carrying the assembly sink
-# n:   the notification to buffer
-# ret: true on success, or an allocation error
-pub fun note_push(buf: *ByteBuf, n: *AsmNote) R.Result[bool, str] {
-    if (!sink_active(buf)) { ret R.ok[bool, str](true); }
+pub fun note_push(buf: *ByteBuf, n: *AsmNote) R.Result[R.Void, str] {
+    if (!sink_active(buf)) { ret R.ok_void[str](); }
     val s: *AsmSink = buf.asm;
     if (s.note_count >= s.note_cap) {
-        val res_grow: R.Result[bool, str] = grow_notes(s, buf.alloc);
-        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+        val res_grow: R.Result[R.Void, str] = grow_notes(s, buf.alloc);
+        if (R.is_err[R.Void, str](res_grow)) { ret res_grow; }
     }
     s.notes[s.note_count] = @n;
     s.note_count = s.note_count + 1;
@@ -591,38 +163,21 @@ pub fun note_push(buf: *ByteBuf, n: *AsmNote) R.Result[bool, str] {
         s.note_insts = s.note_insts + 1;
         sink_claim(buf, n.off::usize);
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# insert one notification after the note at `idx`
-#
-# The relaxation counterpart of writing an instruction into a gap `insert_text` just
-# opened: the new word is a real emitted instruction and must be rendered as one.
-#
-# Its bytes did not arrive at the end of the text, so this is not a sequential claim
-# and the tiling cursor cannot check a start against it. What it checks instead is
-# just as exact: the gap the caller opened must be exactly the `nbytes` this
-# notification covers, so the cursor and the text end the operation back in step. An
-# insertion that grew the text by more than one notification's worth, or a
-# notification for a gap nobody opened, breaks the equality.
-# ---
-# buf:    the encoder byte sink carrying the assembly sink
-# idx:    the note the new one follows
-# n:      the notification to insert (its `off` is already set)
-# nbytes: the size of the instruction inserted into the text
-# ret:    true on success, or an allocation error
-pub fun note_insert_after(buf: *ByteBuf, idx: u32, n: *AsmNote, nbytes: u32) R.Result[bool, str] {
-    if (!sink_active(buf)) { ret R.ok[bool, str](true); }
+pub fun note_insert_after(buf: *ByteBuf, idx: u32, n: *AsmNote, nbytes: u32) R.Result[R.Void, str] {
+    if (!sink_active(buf)) { ret R.ok_void[str](); }
     val s: *AsmSink = buf.asm;
     if (idx >= s.note_count) {
-        ret R.err[bool, str]("--emit-asm: an instruction notification was inserted after an unknown one");
+        ret R.err[R.Void, str]("--emit-asm: an instruction notification was inserted after an unknown one");
     }
     if (n.kind == ASM_NOTE_INST && s.accounted + nbytes::usize != buf.len) {
-        ret R.err[bool, str]("--emit-asm: an inserted instruction notification does not cover the text gap that was opened for it");
+        ret R.err[R.Void, str]("--emit-asm: an inserted instruction notification does not cover the text gap that was opened for it");
     }
     if (s.note_count >= s.note_cap) {
-        val res_grow: R.Result[bool, str] = grow_notes(s, buf.alloc);
-        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+        val res_grow: R.Result[R.Void, str] = grow_notes(s, buf.alloc);
+        if (R.is_err[R.Void, str](res_grow)) { ret res_grow; }
     }
     var i: u32 = s.note_count;
     val at: u32 = idx + 1;
@@ -637,37 +192,20 @@ pub fun note_insert_after(buf: *ByteBuf, idx: u32, n: *AsmNote, nbytes: u32) R.R
         s.claims     = s.claims + 1;
         s.accounted  = buf.len;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# the number of buffered notifications
-# ---
-# buf: the encoder byte sink
-# ret: the note count, or 0 when no sink is buffering
 pub fun note_count(buf: *ByteBuf) u32 {
     if (!sink_active(buf)) { ret 0; }
     ret buf.asm.note_count;
 }
 
-# the buffered notification at `idx`, or nil
-# ---
-# buf: the encoder byte sink
-# idx: the note index
-# ret: the note, or nil when the index is out of range
 pub fun note_at(buf: *ByteBuf, idx: u32) *AsmNote {
     if (!sink_active(buf)) { ret nil; }
     if (idx >= buf.asm.note_count) { ret nil; }
     ret ?buf.asm.notes[idx];
 }
 
-# the index of the buffered instruction whose bytes begin at `off`, or -1
-#
-# A relaxation pass works in `.text` offsets; this is how it reaches the note whose
-# instruction it is rewriting.
-# ---
-# buf: the encoder byte sink
-# off: the `.text` offset to look up
-# ret: the note index, or -1 when no instruction begins there
 pub fun note_index_at(buf: *ByteBuf, off: u32) i32 {
     if (!sink_active(buf)) { ret -1; }
     val s: *AsmSink = buf.asm;
@@ -679,37 +217,17 @@ pub fun note_index_at(buf: *ByteBuf, off: u32) i32 {
     ret -1;
 }
 
-# drop every buffered notification, keeping the allocated capacity
-#
-# Called once a function's notes have been rendered, so the buffer is reused across
-# functions rather than reallocated per function.
-# ---
-# buf: the encoder byte sink
 pub fun notes_reset(buf: *ByteBuf) {
     if (buf == nil || buf.asm == nil) { ret; }
     buf.asm.note_count = 0;
     buf.asm.note_insts = 0;
 }
 
-# how many buffered notifications are one instruction-word wide
-#
-# A fixed-width ISA turns this into a whole-function totality check - emitted bytes
-# must equal this count times the instruction width - which covers the out-of-sequence
-# growth a relaxation pass produces, where the per-claim tiling in `sink_claim` has no
-# sequential cursor to check against. A raw-byte directive's payload is not an
-# instruction, but it is exactly one word wide per `ASM_NOTE_BYTES` note, so it counts
-# here too rather than opening a blind spot the totality check cannot see (#2493).
-# ---
-# buf: the encoder byte sink
-# ret: the instruction-word-notification count, or 0 when no sink is buffering
 pub fun note_inst_count(buf: *ByteBuf) u32 {
     if (!sink_active(buf)) { ret 0; }
     ret buf.asm.note_insts;
 }
 
-# release a sink's note buffer
-# ---
-# buf: the encoder byte sink; safe when no sink or no buffer was ever used
 pub fun notes_free(buf: *ByteBuf) {
     if (buf == nil || buf.asm == nil) { ret; }
     val s: *AsmSink = buf.asm;
@@ -721,32 +239,42 @@ pub fun notes_free(buf: *ByteBuf) {
     s.note_insts = 0;
 }
 
-# double a sink's note-buffer capacity
-# ---
-# s:     the sink whose buffer grows
-# alloc: the owning byte sink's allocator
-# ret:   true on success, or an allocation error
-fun grow_notes(s: *AsmSink, alloc: *A.Allocator) R.Result[bool, str] {
-    var new_cap: u32 = ASM_NOTE_INIT_CAP;
-    if (s.note_cap > 0) { new_cap = s.note_cap * 2; }
-    val res_realloc: R.Result[*AsmNote, str] =
-        A.reallocate[AsmNote](alloc, s.notes, s.note_cap::usize, new_cap::usize);
-    if (R.is_err[*AsmNote, str](res_realloc)) {
-        ret R.err[bool, str](R.unwrap_err[*AsmNote, str](res_realloc));
+fun grow_cap[T](alloc: *A.Allocator, data: **T, cap: *u32, init_cap: u32) R.Result[R.Void, str] {
+    if (@data == nil) {
+        val res_alloc: R.Result[*T, str] = A.allocate[T](alloc, init_cap::usize);
+        if (R.is_err[*T, str](res_alloc)) { ret R.err[R.Void, str](R.unwrap_err[*T, str](res_alloc)); }
+        @data = R.unwrap_ok[*T, str](res_alloc);
+        @cap  = init_cap;
+        ret R.ok_void[str]();
     }
-    s.notes    = R.unwrap_ok[*AsmNote, str](res_realloc);
-    s.note_cap = new_cap;
-    ret R.ok[bool, str](true);
+    val current: layout.CheckedCount[T] = layout.count[T]((@cap)::usize);
+    val required_r: R.Result[layout.CheckedCount[T], layout.CheckCause] =
+        layout.count_add[T](current, layout.count[T](1::usize));
+    if (R.is_err[layout.CheckedCount[T], layout.CheckCause](required_r)) {
+        ret R.err[R.Void, str]("encode: growth count overflow");
+    }
+    val required: layout.CheckedCount[T] = R.unwrap_ok[layout.CheckedCount[T], layout.CheckCause](required_r);
+    val grown_r: R.Result[layout.CheckedCount[T], layout.CheckCause] = layout.count_grow[T](current, required);
+    if (R.is_err[layout.CheckedCount[T], layout.CheckCause](grown_r)) {
+        ret R.err[R.Void, str]("encode: growth count overflow");
+    }
+    val new_cap_fits: R.Result[u32, layout.CheckCause] = layout.usize_to_u32(
+        R.unwrap_ok[layout.CheckedCount[T], layout.CheckCause](grown_r).value);
+    if (R.is_err[u32, layout.CheckCause](new_cap_fits)) {
+        ret R.err[R.Void, str]("encode: growth capacity exceeds the u32 limit");
+    }
+    val new_cap: u32 = R.unwrap_ok[u32, layout.CheckCause](new_cap_fits);
+    val res_realloc: R.Result[*T, str] = A.reallocate[T](alloc, @data, (@cap)::usize, new_cap::usize);
+    if (R.is_err[*T, str](res_realloc)) { ret R.err[R.Void, str](R.unwrap_err[*T, str](res_realloc)); }
+    @data = R.unwrap_ok[*T, str](res_realloc);
+    @cap  = new_cap;
+    ret R.ok_void[str]();
 }
 
-# record a write failure so the encode driver can report it
-#
-# The per-instruction notification runs where no error can be returned (byte
-# emission is on the encoder's hot path), so the first failure is latched here and
-# raised once the module finishes rather than silently truncating the artifact.
-# ---
-# buf: the encoder byte sink
-# msg: the failure to report
+fun grow_notes(s: *AsmSink, alloc: *A.Allocator) R.Result[R.Void, str] {
+    ret grow_cap[AsmNote](alloc, ?s.notes, ?s.note_cap, ASM_NOTE_INIT_CAP);
+}
+
 pub fun sink_fail(buf: *ByteBuf, msg: str) {
     if (buf == nil || buf.asm == nil) { ret; }
     if (buf.asm.failed) { ret; }
@@ -754,32 +282,11 @@ pub fun sink_fail(buf: *ByteBuf, msg: str) {
     buf.asm.err    = msg;
 }
 
-# whether a buffer is rendering assembly text
-# ---
-# buf: the encoder byte sink
-# ret: true when a sink is attached and has not failed
 pub fun sink_active(buf: *ByteBuf) bool {
     if (buf == nil || buf.asm == nil) { ret false; }
     ret !buf.asm.failed;
 }
 
-# claim `[start, ByteBuf.len)` for one instruction notification
-#
-# Called by an ISA immediately after it renders one emitted instruction, with the
-# `.text` offset that instruction's first byte went to. Declaring the start is the
-# whole of the guard: the claim is accepted only when it begins exactly where the
-# previous one ended, so consecutive notifications tile the text and no notification
-# can stand for two instructions.
-#
-# A claim that does not begin at the cursor is REFUSED - the cursor stays put, so the
-# bytes between it and this claim remain unclaimed and `sink_unaccounted` keeps
-# reporting them until the ISA's own guard fails the build naming the opcode. A claim
-# that covers no bytes is refused for the same reason: a notification that describes
-# an instruction the encoder did not emit is the mirror image of the same defect and
-# would otherwise leave the counts looking healthy.
-# ---
-# buf:   the encoder byte sink whose sink is advanced
-# start: `.text` offset of the notified instruction's first byte
 pub fun sink_claim(buf: *ByteBuf, start: usize) {
     if (buf == nil || buf.asm == nil) { ret; }
     val s: *AsmSink = buf.asm;
@@ -791,122 +298,59 @@ pub fun sink_claim(buf: *ByteBuf, start: usize) {
     s.claims    = s.claims + 1;
 }
 
-# write a raw-byte directive's payload as `  .byte 0x.., 0x.., ...\n`
-#
-# THE ONE PLACE `.byte` TEXT IS PRODUCED. A directive renders identically on every
-# target - it is a payload, not an instruction - so putting the text here rather than
-# in each printer means a target cannot render it differently, and a target added
-# later inherits it rather than reimplementing it (#2467).
-#
-# Pure text: no sink accounting. `render_bytes_directive` wraps this for a printer
-# that renders on the spot, claiming the bytes in the same call it writes them; one
-# that BUFFERS its notifications (riscv64, #2493) claims them once at push time and
-# calls this directly when the buffered note is replayed, so the claim is never made
-# twice for the same bytes.
-# ---
-# out:   destination writer
-# bytes: the payload
-# n:     number of payload bytes
-# ret:   true on success, or the first write error
-pub fun render_bytes_text(out: *writer.Writer, bytes: *u8, n: usize) R.Result[bool, str] {
+pub fun render_bytes_text(out: *writer.Writer, bytes: *u8, n: usize) R.Result[R.Void, str] {
     val ri: R.Result[usize, str] = format.write_str(out, "  .byte ");
-    if (R.is_err[usize, str](ri)) { ret R.err[bool, str](R.unwrap_err[usize, str](ri)); }
+    if (R.is_err[usize, str](ri)) { ret R.err[R.Void, str](R.unwrap_err[usize, str](ri)); }
     var i: usize = 0;
     for (i < n) {
         if (i > 0) {
             val rc: R.Result[usize, str] = format.write_str(out, ", ");
-            if (R.is_err[usize, str](rc)) { ret R.err[bool, str](R.unwrap_err[usize, str](rc)); }
+            if (R.is_err[usize, str](rc)) { ret R.err[R.Void, str](R.unwrap_err[usize, str](rc)); }
         }
         val rb: R.Result[usize, str] = format.write_str(out, "0x");
-        if (R.is_err[usize, str](rb)) { ret R.err[bool, str](R.unwrap_err[usize, str](rb)); }
+        if (R.is_err[usize, str](rb)) { ret R.err[R.Void, str](R.unwrap_err[usize, str](rb)); }
         var hex: [3]u8;
         hex[0] = hex_digit((bytes[i] >> 4) & 0xF);
         hex[1] = hex_digit(bytes[i] & 0xF);
         hex[2] = 0;
         val rh: R.Result[usize, str] = format.write_str(out, (?hex[0])::str);
-        if (R.is_err[usize, str](rh)) { ret R.err[bool, str](R.unwrap_err[usize, str](rh)); }
+        if (R.is_err[usize, str](rh)) { ret R.err[R.Void, str](R.unwrap_err[usize, str](rh)); }
         i = i + 1;
     }
     val rn: R.Result[usize, str] = format.write_str(out, "\n");
-    if (R.is_err[usize, str](rn)) { ret R.err[bool, str](R.unwrap_err[usize, str](rn)); }
-    ret R.ok[bool, str](true);
+    if (R.is_err[usize, str](rn)) { ret R.err[R.Void, str](R.unwrap_err[usize, str](rn)); }
+    ret R.ok_void[str]();
 }
 
-# render a raw-byte directive's payload into the sink and account for its bytes
-#
-# The per-ISA half is only WHEN to call this: a printer that renders on the spot
-# (x86-64, aarch64) calls it as the bytes are emitted, so the directive lands in
-# program order and is accounted in the same call. A printer that buffers its
-# notifications for a later pass (riscv64) claims the bytes at push time instead
-# (`ASM_NOTE_BYTES`) and calls `render_bytes_text` directly when it replays them,
-# never this function (#2493).
-# ---
-# buf:   the encoder byte sink carrying the assembly sink
-# bytes: the payload
-# n:     number of payload bytes
-# start: `.text` offset of the payload's first byte
-# ret:   true on success, or the first write error
-pub fun render_bytes_directive(buf: *ByteBuf, bytes: *u8, n: usize, start: usize) R.Result[bool, str] {
-    if (!sink_active(buf)) { ret R.ok[bool, str](true); }
-    val res: R.Result[bool, str] = render_bytes_text(buf.asm.out, bytes, n);
-    if (R.is_err[bool, str](res)) { ret res; }
+pub fun render_bytes_directive(buf: *ByteBuf, bytes: *u8, n: usize, start: usize) R.Result[R.Void, str] {
+    if (!sink_active(buf)) { ret R.ok_void[str](); }
+    val res: R.Result[R.Void, str] = render_bytes_text(buf.asm.out, bytes, n);
+    if (R.is_err[R.Void, str](res)) { ret res; }
     sink_claim(buf, start);
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# one lowercase hex digit for a nibble
 fun hex_digit(v: u8) u8 {
     if (v < 10) { ret 48 + v; }
     ret 87 + v;
 }
 
-# the number of instruction notifications this sink accepted
-#
-# Counts buffered and streamed claims alike, so a caller that needs "did this
-# emitting path notify at all" can take a difference across it on every target,
-# including one whose printer renders on the spot and buffers nothing.
-# ---
-# buf: the encoder byte sink
-# ret: the accepted-claim count, or 0 when no sink is attached
 pub fun sink_claims(buf: *ByteBuf) u32 {
     if (!sink_active(buf)) { ret 0; }
     ret buf.asm.claims;
 }
 
-# the number of emitted bytes no instruction notification has claimed
-#
-# Non-zero means an ISA appended bytes without rendering them, or rendered them under
-# a notification that did not begin where the last one ended, so the artifact would
-# under-report the code the encoder produced. The caller turns this into a loud error
-# naming the offending opcode rather than emitting a short `.s`.
-#
-# `accounted` is only ever advanced to `buf.len` by an accepted claim, and the text
-# buffer only grows while a function is being encoded, so `accounted <= buf.len`
-# holds throughout. The equal case is the common one (everything claimed); the
-# comparison is written `<=` rather than `==` because the subtraction below is
-# unsigned.
-# ---
-# buf: the encoder byte sink
-# ret: the unclaimed byte count, or 0 when the sink is inactive
 pub fun sink_unaccounted(buf: *ByteBuf) usize {
     if (!sink_active(buf)) { ret 0; }
     if (buf.len <= buf.asm.accounted) { ret 0; }
     ret buf.len - buf.asm.accounted;
 }
 
-# record the MIR instruction an ISA is about to encode, for symbol / label naming
-# ---
-# buf: the encoder byte sink
-# mi:  the MIR instruction being encoded, or nil to clear
 pub fun sink_set_mir(buf: *ByteBuf, mi: *mir.MirInstr) {
     if (buf == nil || buf.asm == nil) { ret; }
     buf.asm.mi = mi;
 }
 
-# construct an empty encoder byte buffer
-# ---
-# alloc: allocator backing the buffer's storage
-# ret:   an empty ByteBuf
 pub fun buf_init(alloc: *A.Allocator) ByteBuf {
     var buf: ByteBuf;
     buf.data  = nil;
@@ -917,9 +361,6 @@ pub fun buf_init(alloc: *A.Allocator) ByteBuf {
     ret buf;
 }
 
-# free a byte buffer's backing storage
-# ---
-# buf: buffer to destroy; safe on nil
 pub fun buf_dnit(buf: *ByteBuf) {
     if (buf == nil) { ret; }
     if (buf.data != nil && buf.cap > 0) {
@@ -930,17 +371,17 @@ pub fun buf_dnit(buf: *ByteBuf) {
     buf.cap = 0;
 }
 
-# append a single byte to the buffer, growing it if needed
-#
-# An allocation failure while growing is fatal (`panic`): byte emission is on the
-# encoder's hot path and does not thread an error through every write.
-# ---
-# buf:  buffer to append to
-# byte: byte to append
 pub fun emit_byte(buf: *ByteBuf, byte: u8) {
     if (buf.len >= buf.cap) {
         var new_cap: usize = BYTEBUF_INIT_CAP;
-        if (buf.cap > 0) { new_cap = buf.cap * 2; }
+        if (buf.cap > 0) {
+            val doubled: R.Result[layout.CheckedCount[layout.ByteUnit], layout.CheckCause] =
+                layout.count_mul[layout.ByteUnit](layout.count[layout.ByteUnit](buf.cap), 2::usize);
+            if (R.is_err[layout.CheckedCount[layout.ByteUnit], layout.CheckCause](doubled)) {
+                panic("encode: byte buffer capacity overflow\n");
+            }
+            new_cap = R.unwrap_ok[layout.CheckedCount[layout.ByteUnit], layout.CheckCause](doubled).value;
+        }
         val res_realloc: R.Result[*u8, str] = A.reallocate[u8](buf.alloc, buf.data, buf.cap, new_cap);
         if (R.is_err[*u8, str](res_realloc)) {
             panic("encode: byte buffer realloc failed\n");
@@ -952,19 +393,11 @@ pub fun emit_byte(buf: *ByteBuf, byte: u8) {
     buf.len = buf.len + 1;
 }
 
-# append a 16-bit value to the buffer, little-endian
-# ---
-# buf:   buffer to append to
-# value: value to append, low byte first
 pub fun emit_u16(buf: *ByteBuf, value: u16) {
     emit_byte(buf, (value & 0xFF)::u8);
     emit_byte(buf, ((value >> 8) & 0xFF)::u8);
 }
 
-# append a 32-bit value to the buffer, little-endian
-# ---
-# buf:   buffer to append to
-# value: value to append, low byte first
 pub fun emit_u32(buf: *ByteBuf, value: u32) {
     emit_byte(buf, (value & 0xFF)::u8);
     emit_byte(buf, ((value >> 8) & 0xFF)::u8);
@@ -972,31 +405,13 @@ pub fun emit_u32(buf: *ByteBuf, value: u32) {
     emit_byte(buf, ((value >> 24) & 0xFF)::u8);
 }
 
-# append a 64-bit value to the buffer, little-endian
-# ---
-# buf:   buffer to append to
-# value: value to append, low 32 bits first
 pub fun emit_u64(buf: *ByteBuf, value: u64) {
     emit_u32(buf, (value & 0xFFFFFFFF)::u32);
     emit_u32(buf, ((value >> 32) & 0xFFFFFFFF)::u32);
 }
 
-# initial capacity for the encoder driver's symbol, relocation, fixup, and
-# block-offset arrays
 val DRIVER_INIT_CAP: u32 = 16;
 
-# a single pending branch fixup recorded in pass 1 and patched in pass 2
-#
-# An intra-module branch whose displacement field is at `patch_pos` and whose
-# target is block `target_block` within the function based at `fn_text_base`. The
-# field's width and how a resolved displacement is written into it are
-# ISA-specific (the `EncodeHooks.patch_branch` hook), so this record names only
-# the offsets the shared driver resolves.
-# ---
-# patch_pos:    byte offset of the displacement field within `.text`
-# next_ip:      byte offset of the instruction following the branch within `.text`
-# target_block: destination MIR block id (function-local)
-# fn_text_base: text offset of the owning function's first block
 pub rec BranchFixup {
     patch_pos:    u32;
     next_ip:      u32;
@@ -1004,69 +419,28 @@ pub rec BranchFixup {
     fn_text_base: u32;
 }
 
-# one resolved block start: a function-local block id paired with its `.text`
-# offset, used to compute branch displacements in pass 2
-# ---
-# fn_text_base: text offset of the owning function's first block
-# block_id:     function-local MIR block id
-# offset:       byte offset of the block's first instruction within `.text`
 rec BlockOffset {
     fn_text_base: u32;
     block_id:     u32;
     offset:       u32;
 }
 
-# mutable bookkeeping shared across the encoder driver's two passes
-#
-# Owns the growable text / symbol / relocation / fixup / block-offset arrays until
-# `encode_driver` either transfers the text, symbol, and relocation arrays into
-# the returned `EncoderOutput` or frees everything on error. Carries no
-# architecture-specific state - every field is ISA-general bookkeeping the shared
-# driver and every ISA's encode hook populate through the `push_*` helpers.
-# ---
-# alloc:       backing allocator for every owned array
-# buf:         text byte sink
-# syms:        symbol marks
-# sym_count:   number of symbol marks
-# sym_cap:     capacity of `syms`
-# pcrel_label_count: per-module ordinal for `%pcrel_hi` labels
-# relocs:      pending relocations
-# reloc_count: number of relocations
-# reloc_cap:   capacity of `relocs`
-# fixups:      pending branch fixups
-# fixup_count: number of fixups
-# fixup_cap:   capacity of `fixups`
-# blocks:      resolved block offsets
-# block_count: number of block offsets
-# block_cap:   capacity of `blocks`
-# consts:      the module's constant pool; interned entries the encoder referenced
-# const_count: number of pool entries
-# const_cap:   capacity of `consts`
-# next_block_id:  MIR id of the block physically following the one being emitted -
-#                 its fallthrough successor, set per block by the encode hook so a
-#                 terminator branching to it emits nothing (issue #1936)
-# has_next_block: false while emitting the final (fallthrough-less) block, so the
-#                 fallthrough check never fires on a terminator with no successor
-# interner:    session interner; resolves inline-asm `{name}` binding names and
-#              interns symbol names referenced from inline asm into relocations
-# srcmap:      session source map, borrowed off the MIR module so an inline-asm
-#              diagnostic can name its statement's "path:line:col" (#2153); nil
-#              in unit-test states, degrading the location prefix away
-# abi:         target ABI vtable (frame / argument model the encode hook reads)
-# os:          target OS vtable (stack-probe / commit model the encode hook reads)
+pub rec RelocPairSite {
+    reloc_index: u32;
+    label:       intern.StrId;
+}
+
 pub rec EncodeState {
     alloc:       *A.Allocator;
     buf:         ByteBuf;
     syms:        *SymbolMark;
     sym_count:   u32;
     sym_cap:     u32;
-    # ordinal for `%pcrel_hi` labels, per module. separate from `sym_count` because
-    # it names labels only, so the spelling of one does not shift when an unrelated
-    # symbol is added
     pcrel_label_count: u32;
     relocs:      *PendingReloc;
     reloc_count: u32;
     reloc_cap:   u32;
+    reloc_pair_sites: map.Map[u64, RelocPairSite];
     fixups:      *BranchFixup;
     fixup_count: u32;
     fixup_cap:   u32;
@@ -1085,8 +459,6 @@ pub rec EncodeState {
     consts:      *ConstEntry;
     const_count: u32;
     const_cap:   u32;
-    # per-function frame-unwind records (#3096): one opened per emitted prologue,
-    # its steps appended as the prologue instructions are emitted
     frames:      *of.FrameUnwind;
     frame_count: u32;
     frame_cap:   u32;
@@ -1095,108 +467,63 @@ pub rec EncodeState {
     has_next_block: bool;
     interner:    *intern.Interner;
     srcmap:      *source.SourceMap;
-    abi:         *abi.AbiVTable;
-    os:          *tos.OsVTable;
-
-    # the machine this encode is emitting for, and the authority on every WIDTH the
-    # encoder would otherwise take from a literal (#2778)
-    #
-    # An encoder chooses a form by width constantly - the register-width ALU group
-    # versus a narrower one, which memory access exists, how wide a shift-amount
-    # field is, what one saved register costs in the frame - and each of those is a
-    # question about the MACHINE, not about the value. Reading them from `gpr_width`
-    # / `flen_bits` / `pointer_width` here is what lets one encoder serve two widths
-    # of the same ISA rather than one encoder per width.
-    #
-    # Borrowed from the resolved `target.Target`, which outlives the encode.
     model:       *isa.MachineModel;
+    callee_saved: isa.RegFileFn;
+    base_addr:    u64;
+    page_size:    u64;
+    stack_probe:  bool;
 }
 
-# the per-function encode hook: emit one function's machine code into the shared
-# `EncodeState`
-#
-# Emits the prologue, the instruction stream, and the epilogue, recording its
-# entry `SymbolMark`, every block's `.text` offset (`push_block`), each
-# cross-function / global symbol reference as a `PendingReloc` (`push_reloc`), and
-# each intra-module branch as a `BranchFixup` (`push_fixup`) for pass 2. Owns all
-# opcode, register, relocation-offset, and prologue/epilogue knowledge; the driver
-# supplies only the shared state.
-# ---
-# st:  the shared encode state (text sink + mark / reloc / fixup / block arrays)
-# f:   the function to encode
-# ret: ok(true) on success, or an error string from the per-arch encoder
-pub def EncodeFunctionFn: fun(*EncodeState, *mir.MirFunction) R.Result[bool, str];
+pub def EncodeFunctionFn: fun(*EncodeState, *mir.MirFunction) R.Result[R.Void, str];
 
-# the per-branch patch hook: write the resolved displacement of one pass-1
-# `BranchFixup` into its `.text` field now that its target block's offset is known
-#
-# Owns the ISA's branch encoding - the field width and the byte / bitfield layout
-# (x86-64 overwrites a 4-byte rel32; AArch64 inserts an imm26 / imm19 into a
-# 32-bit instruction word) and the displacement convention (relative to `next_ip`,
-# the branch start, etc.). The driver resolves `target_off` and leaves the
-# displacement computation and the write to the hook.
-# ---
-# st:         the shared encode state (its `buf` holds the text being patched)
-# fx:         the fixup to patch (its `patch_pos` / `next_ip` name the site)
-# target_off: the `.text` offset of the branch's resolved target block
-# ret:        ok(true) on success, or an error string (e.g. an out-of-range site)
-pub def PatchBranchFn: fun(*EncodeState, *BranchFixup, u32) R.Result[bool, str];
+pub def PatchBranchFn: fun(*EncodeState, *BranchFixup, u32) R.Result[R.Void, str];
 
-# the per-ISA seam of the shared two-pass encoder driver
-#
-# An architecture's encoder supplies one of each and calls `encode_driver`; the
-# driver owns everything else (state lifetime, the function loop, pass-2 block
-# resolution, text right-sizing, and output assembly). These two are the only
-# operations that carry opcode / register / displacement knowledge.
-# ---
-# encode_function: emit one function's bytes into the shared state (pass 1)
-# patch_branch:    write one resolved branch displacement into the text (pass 2)
 pub rec EncodeHooks {
     encode_function: EncodeFunctionFn;
     patch_branch:    PatchBranchFn;
 }
 
-# the ISA-agnostic two-pass encoder driver every architecture runs over a
-# fully-resolved MIR module to produce its `EncoderOutput`
-#
-# Initialises an `EncodeState` (empty text sink and mark / reloc / fixup / block
-# arrays, threading the module interner and the target ABI / OS vtables), then
-# runs pass 1 - walking every function in layout order through the ISA's
-# `encode_function` hook, which appends bytes and records symbol marks, pending
-# relocations, branch fixups, and block offsets through the shared `push_*`
-# helpers. Pass 2 resolves every recorded `BranchFixup`'s target block offset and
-# hands it to the ISA's `patch_branch` hook to write the displacement. The text is
-# then right-sized (so the object builder's free-by-length matches the allocation)
-# and transferred, with the symbol and relocation arrays, into the returned
-# `EncoderOutput`; the driver-internal fixup and block arrays are released. On any
-# error every owned array is freed and the error propagated. Carries no
-# architecture-specific knowledge - the two hooks own all of it.
-# ---
-# alloc: backing allocator for the encoder's output arrays (threaded for parity
-#        with `EncodeFn`; the dispatcher hands the module allocator)
-# tgt:   resolved compilation target; supplies the ABI / OS vtables the hook reads
-# m:     the fully-resolved MIR module (post isel / regalloc / frame)
-# hooks: the per-ISA encode / patch operations
-# ret:   the populated `EncoderOutput` (owned arrays), or an error string
-pub fun encode_driver(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirModule, hooks: *EncodeHooks) R.Result[EncoderOutput, str] {
+pub fun encode_driver(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.MirModule, hooks: *EncodeHooks) R.Result[EncoderOutput, str] {
     ret encode_driver_asm(alloc, tgt, m, hooks, nil);
 }
 
-# encode a module, optionally rendering the assembly text as it goes
-#
-# The body `encode_driver` delegates to. When `asm_out` is non-nil an `AsmSink` is
-# attached to the text buffer for the whole run, so the ISA's per-instruction
-# notifications render into it; the sink never influences a byte, so both paths
-# encode identically. A write failure recorded on the sink is reported here rather
-# than silently truncating the artifact.
-# ---
-# alloc:   backing allocator for the encoder's output arrays
-# tgt:     resolved compilation target
-# m:       the fully-resolved MIR module (post isel / regalloc / frame)
-# hooks:   the per-ISA encode / patch operations
-# asm_out: optional writer receiving the rendered assembly text
-# ret:     the populated `EncoderOutput` (owned arrays), or an error string
-pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirModule,
+fun apply_emission_order_module(alloc: *A.Allocator, m: *mir.MirModule) R.Result[R.Void, str] {
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        val ao: R.Result[R.Void, str] = apply_emission_order(alloc, ?m.functions[fi]);
+        if (R.is_err[R.Void, str](ao)) { ret ao; }
+        fi = fi + 1;
+    }
+    ret R.ok_void[str]();
+}
+
+fun apply_emission_order(alloc: *A.Allocator, f: *mir.MirFunction) R.Result[R.Void, str] {
+    val n: u32 = f.block_count;
+    if (n <= 1 || f.emit_order == nil) { ret R.ok_void[str](); }
+
+    val rt: R.Result[*mir.MirBlock, str] = A.allocate[mir.MirBlock](alloc, n::usize);
+    if (R.is_err[*mir.MirBlock, str](rt)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirBlock, str](rt)); }
+    val tmp: *mir.MirBlock = R.unwrap_ok[*mir.MirBlock, str](rt);
+
+    var i: u32 = 0;
+    for (i < n) {
+        tmp[i] = f.blocks[f.emit_order[i]];
+        i = i + 1;
+    }
+    i = 0;
+    for (i < n) {
+        f.blocks[i] = tmp[i];
+        i = i + 1;
+    }
+    A.deallocate[mir.MirBlock](alloc, tmp, n::usize);
+
+    i = 0;
+    for (i < n) { f.emit_order[i] = i; i = i + 1; }
+
+    ret R.ok_void[str]();
+}
+
+pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.MirModule,
                           hooks: *EncodeHooks, asm_out: *writer.Writer) R.Result[EncoderOutput, str] {
     if (tgt == nil)   { ret R.err[EncoderOutput, str]("encode: nil target"); }
     if (m == nil)     { ret R.err[EncoderOutput, str]("encode: nil mir module"); }
@@ -1208,6 +535,9 @@ pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirM
         ret R.err[EncoderOutput, str]("encode: ISA supplied no per-branch patch hook");
     }
 
+    val res_layout: R.Result[R.Void, str] = apply_emission_order_module(alloc, m);
+    if (R.is_err[R.Void, str](res_layout)) { ret R.err[EncoderOutput, str](R.unwrap_err[R.Void, str](res_layout)); }
+
     var st: EncodeState;
     state_init(?st, alloc, m, tgt);
 
@@ -1216,15 +546,16 @@ pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirM
 
     var fi: u32 = 0;
     for (fi < m.function_len) {
-        # each function starts in its own body (inline instance 0); reset the transition
-        # tracker so a function whose last instruction was inlined does not suppress the
-        # next function's opening transition (inline-site ids are per-function).
         st.last_inline_site = 0;
-        val res_encode: R.Result[bool, str] = hooks.encode_function(?st, ?m.functions[fi]);
-        if (R.is_err[bool, str](res_encode)) {
+        val pre_sym_count: u32 = st.sym_count;
+        val res_encode: R.Result[R.Void, str] = hooks.encode_function(?st, ?m.functions[fi]);
+        if (R.is_err[R.Void, str](res_encode)) {
             notes_free(?st.buf);
             state_dnit(?st);
-            ret R.err[EncoderOutput, str](R.unwrap_err[bool, str](res_encode));
+            ret R.err[EncoderOutput, str](R.unwrap_err[R.Void, str](res_encode));
+        }
+        if (st.sym_count > pre_sym_count) {
+            st.syms[pre_sym_count].size = st.buf.len::u32 - st.syms[pre_sym_count].offset;
         }
         fi = fi + 1;
     }
@@ -1234,10 +565,6 @@ pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirM
         state_dnit(?st);
         ret R.err[EncoderOutput, str](sink.err);
     }
-    # a refused claim normally leaves a byte gap the ISA's own per-opcode guard has
-    # already failed the build over, naming it. the one shape that leaves no gap is a
-    # notification re-claiming bytes an earlier one covered - "exactly one" broken from
-    # the other side - so the count is the backstop that keeps it from passing.
     if (sink.refused > 0) {
         notes_free(?st.buf);
         state_dnit(?st);
@@ -1246,22 +573,59 @@ pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirM
     }
     notes_free(?st.buf);
 
-    val res_patch: R.Result[bool, str] = patch_branches(?st, hooks);
-    if (R.is_err[bool, str](res_patch)) {
+    map.dnit[u64, RelocPairSite](?st.reloc_pair_sites);
+    val res_patch: R.Result[R.Void, str] = patch_branches(?st, hooks);
+    if (R.is_err[R.Void, str](res_patch)) {
         state_dnit(?st);
-        ret R.err[EncoderOutput, str](R.unwrap_err[bool, str](res_patch));
+        ret R.err[EncoderOutput, str](R.unwrap_err[R.Void, str](res_patch));
     }
 
-    val res_shrink: R.Result[bool, str] = shrink_text(?st);
-    if (R.is_err[bool, str](res_shrink)) {
+    val res_shrink: R.Result[R.Void, str] = shrink_text(?st);
+    if (R.is_err[R.Void, str](res_shrink)) {
         state_dnit(?st);
-        ret R.err[EncoderOutput, str](R.unwrap_err[bool, str](res_shrink));
+        ret R.err[EncoderOutput, str](R.unwrap_err[R.Void, str](res_shrink));
     }
 
-    val res_pool: R.Result[bool, str] = shrink_consts(?st);
-    if (R.is_err[bool, str](res_pool)) {
+    val res_pool: R.Result[R.Void, str] = shrink_consts(?st);
+    if (R.is_err[R.Void, str](res_pool)) {
         state_dnit(?st);
-        ret R.err[EncoderOutput, str](R.unwrap_err[bool, str](res_pool));
+        ret R.err[EncoderOutput, str](R.unwrap_err[R.Void, str](res_pool));
+    }
+
+    val res_syms: R.Result[R.Void, str] = shrink_syms(?st);
+    if (R.is_err[R.Void, str](res_syms)) {
+        state_dnit(?st);
+        ret R.err[EncoderOutput, str](R.unwrap_err[R.Void, str](res_syms));
+    }
+
+    val res_relocs: R.Result[R.Void, str] = shrink_relocs(?st);
+    if (R.is_err[R.Void, str](res_relocs)) {
+        state_dnit(?st);
+        ret R.err[EncoderOutput, str](R.unwrap_err[R.Void, str](res_relocs));
+    }
+
+    val res_rows: R.Result[R.Void, str] = shrink_rows(?st);
+    if (R.is_err[R.Void, str](res_rows)) {
+        state_dnit(?st);
+        ret R.err[EncoderOutput, str](R.unwrap_err[R.Void, str](res_rows));
+    }
+
+    val res_varlocs: R.Result[R.Void, str] = shrink_varlocs(?st);
+    if (R.is_err[R.Void, str](res_varlocs)) {
+        state_dnit(?st);
+        ret R.err[EncoderOutput, str](R.unwrap_err[R.Void, str](res_varlocs));
+    }
+
+    val res_inline_pcs: R.Result[R.Void, str] = shrink_inline_pcs(?st);
+    if (R.is_err[R.Void, str](res_inline_pcs)) {
+        state_dnit(?st);
+        ret R.err[EncoderOutput, str](R.unwrap_err[R.Void, str](res_inline_pcs));
+    }
+
+    val res_frames: R.Result[R.Void, str] = shrink_frames(?st);
+    if (R.is_err[R.Void, str](res_frames)) {
+        state_dnit(?st);
+        ret R.err[EncoderOutput, str](R.unwrap_err[R.Void, str](res_frames));
     }
 
     var out: EncoderOutput;
@@ -1282,29 +646,10 @@ pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirM
     out.frames       = st.frames;
     out.frame_count  = st.frame_count;
 
-    # the text, symbol, relocation, line-row, varloc, and constant-pool arrays are
-    # transferred to the output; only the driver-internal fixup and block-offset
-    # arrays are released. the pool array's capacity is not carried, so the object
-    # builder frees it by count - which is why `shrink_consts` right-sizes it here,
-    # exactly as `shrink_text` right-sizes the text blob for the same reason.
     scratch_release(?st);
     ret R.ok[EncoderOutput, str](out);
 }
 
-# determine whether an instruction names an intra-module branch target (a
-# `MIR_OP_BLOCK` operand) or a relocatable symbol (a `MIR_OP_SYM` operand)
-#
-# Reports the first block id and the first interned symbol name through the
-# out-parameters and stops as soon as both are found. MIR-level and ISA-agnostic
-# - it reads only the generic operand model, so every architecture's encode hook
-# uses it to drive fixup / relocation recording.
-# ---
-# mi:           the instruction to inspect
-# target_block: out - the referenced block id (0 when none)
-# has_block:    out - true when a MIR_OP_BLOCK operand was found
-# sym:          out - the referenced interned symbol name (STR_NIL when none)
-# has_sym:      out - true when a MIR_OP_SYM operand was found
-# sym_addend:   out - the symbol operand's constant offset
 pub fun classify_refs(mi: *mir.MirInstr, target_block: *u32, has_block: *bool,
                       sym: *intern.StrId, has_sym: *bool, sym_addend: *i32) {
     @has_block    = false;
@@ -1334,134 +679,117 @@ pub fun classify_refs(mi: *mir.MirInstr, target_block: *u32, has_block: *bool,
     }
 }
 
-# append a symbol mark, growing the symbol array on demand
-# ---
-# st:     the encode state whose symbol array receives the mark
-# name:   interned symbol name
-# offset: byte offset of the symbol within `.text`
-# flags:  object-symbol flags
-# ret:    ok(true) on success, or an allocation error
-pub fun push_symbol(st: *EncodeState, name: intern.StrId, offset: u32, flags: u32) R.Result[bool, str] {
+pub fun push_symbol(st: *EncodeState, name: intern.StrId, offset: u32, flags: u32) R.Result[R.Void, str] {
     if (st.sym_count >= st.sym_cap) {
-        val res_grow: R.Result[bool, str] = grow_symbols(st);
-        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+        val res_grow: R.Result[R.Void, str] = grow_symbols(st);
+        if (R.is_err[R.Void, str](res_grow)) { ret res_grow; }
     }
     st.syms[st.sym_count].name   = name;
     st.syms[st.sym_count].offset = offset;
+    st.syms[st.sym_count].size   = 0;
     st.syms[st.sym_count].flags  = flags;
     st.sym_count = st.sym_count + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# open a frame-unwind record for the function whose prologue is about to be
-# emitted (#3096), growing the frame array on demand
-#
-# The record is keyed by the function's `.text` offset - the same key its entry
-# `SymbolMark` carries - so the object builder can re-home it beside the symbol.
-# Steps are appended through `push_frame_step` while the prologue is emitted.
-# ---
-# st:     the encode state whose frame array receives the record
-# offset: byte offset of the function entry within `.text`
-# ret:    ok(true) on success, or an allocation error
-pub fun push_frame(st: *EncodeState, offset: u32) R.Result[bool, str] {
+pub fun push_frame(st: *EncodeState, offset: u32) R.Result[R.Void, str] {
     if (st.frame_count >= st.frame_cap) {
-        val res_grow: R.Result[bool, str] = grow_frames(st);
-        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+        val res_grow: R.Result[R.Void, str] = grow_frames(st);
+        if (R.is_err[R.Void, str](res_grow)) { ret res_grow; }
     }
     st.frames[st.frame_count].section    = 0;
     st.frames[st.frame_count].offset     = offset;
     st.frames[st.frame_count].step_count = 0;
     st.frame_count = st.frame_count + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# append one prologue step to the frame-unwind record `push_frame` opened last
-#
-# The step capacity is sized to the widest prologue any ISA emits, so exhausting
-# it is an encoder defect and fails the encode loudly rather than shipping an
-# understated record - the silent-understatement failure mode is the one #3096
-# exists to remove.
-# ---
-# st:      the encode state whose open frame record receives the step
-# kind:    one of of.FRAME_STEP_*
-# reg:     ISA register number (unused for FRAME_STEP_ALLOC)
-# end_off: function-relative byte offset just past the step's instruction(s)
-# value:   the step's byte quantity (alloc size / save offset / frame bias)
-# ret:     ok(true) on success, or an error when no record is open or it is full
-pub fun push_frame_step(st: *EncodeState, kind: u8, reg: u8, end_off: u32, value: u64) R.Result[bool, str] {
+pub fun push_frame_step(st: *EncodeState, kind: u8, reg: u8, end_off: u32, value: u64) R.Result[R.Void, str] {
     if (st.frame_count == 0) {
-        ret R.err[bool, str]("encode: frame step recorded with no open frame record");
+        ret R.err[R.Void, str]("encode: frame step recorded with no open frame record");
     }
     val fr: *of.FrameUnwind = ?st.frames[st.frame_count - 1];
     if (fr.step_count >= of.FRAME_STEP_CAP) {
-        ret R.err[bool, str]("encode: frame record step capacity exceeded");
+        ret R.err[R.Void, str]("encode: frame record step capacity exceeded");
     }
     fr.steps[fr.step_count].kind    = kind;
     fr.steps[fr.step_count].reg     = reg;
     fr.steps[fr.step_count].end_off = end_off;
     fr.steps[fr.step_count].value   = value;
     fr.step_count = fr.step_count + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# grow the frame-record array, allocating it on first use
-# ---
-# st:  the state whose frame array is grown
-# ret: ok(true) once the array has room, or an allocation error
-fun grow_frames(st: *EncodeState) R.Result[bool, str] {
-    if (st.frames == nil) {
-        val res_alloc: R.Result[*of.FrameUnwind, str] = A.allocate[of.FrameUnwind](st.alloc, DRIVER_INIT_CAP::usize);
-        if (R.is_err[*of.FrameUnwind, str](res_alloc)) { ret R.err[bool, str](R.unwrap_err[*of.FrameUnwind, str](res_alloc)); }
-        st.frames    = R.unwrap_ok[*of.FrameUnwind, str](res_alloc);
-        st.frame_cap = DRIVER_INIT_CAP;
-        ret R.ok[bool, str](true);
-    }
-    val new_cap: u32 = st.frame_cap * 2;
-    val res_realloc: R.Result[*of.FrameUnwind, str] = A.reallocate[of.FrameUnwind](st.alloc, st.frames, st.frame_cap::usize, new_cap::usize);
-    if (R.is_err[*of.FrameUnwind, str](res_realloc)) { ret R.err[bool, str](R.unwrap_err[*of.FrameUnwind, str](res_realloc)); }
-    st.frames    = R.unwrap_ok[*of.FrameUnwind, str](res_realloc);
-    st.frame_cap = new_cap;
-    ret R.ok[bool, str](true);
+fun grow_frames(st: *EncodeState) R.Result[R.Void, str] {
+    ret grow_cap[of.FrameUnwind](st.alloc, ?st.frames, ?st.frame_cap, DRIVER_INIT_CAP);
 }
 
-# append a pending relocation, growing the relocation array on demand
-# ---
-# st:     the encode state whose relocation array receives the entry
-# offset: byte offset of the patch site within `.text`
-# kind:   abstract relocation kind (one of of.RK_*)
-# sym:    interned name of the referenced symbol
-# addend: constant added to the resolved symbol address
-# ret:    ok(true) on success, or an allocation error
-pub fun push_reloc(st: *EncodeState, offset: u32, kind: of.RelocKind, sym: intern.StrId, addend: i32) R.Result[bool, str] {
+pub fun push_reloc(st: *EncodeState, offset: u32, kind: of.RelocKind, sym: intern.StrId, addend: i32) R.Result[R.Void, str] {
     if (st.reloc_count >= st.reloc_cap) {
-        val res_grow: R.Result[bool, str] = grow_relocs(st);
-        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+        val res_grow: R.Result[R.Void, str] = grow_relocs(st);
+        if (R.is_err[R.Void, str](res_grow)) { ret res_grow; }
     }
     st.relocs[st.reloc_count].offset = offset;
     st.relocs[st.reloc_count].kind   = kind;
     st.relocs[st.reloc_count].sym    = sym;
     st.relocs[st.reloc_count].addend = addend;
+    st.relocs[st.reloc_count].pair   = 0;
     st.reloc_count = st.reloc_count + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# the alignment a constant-pool entry's section must guarantee
-#
-# The ONE place a pool entry's alignment is decided. An encoder that emits an
-# aligned load form reads the guarantee from the entry it is loading rather than
-# re-deriving it from the width at the use site, because a rule stated in three
-# encoders is a rule three encoders can disagree about - which is the shape of
-# #2735 on a different surface.
-#
-# A scalar float is aligned to its own width. A vector is aligned to its width
-# rounded up to a power of two, which is what every aligned vector load form on
-# every target this compiler targets requires, and which stays correct for a
-# constant wider than a register (#2727) because the pieces such a load reads are
-# at power-of-two offsets from an equally aligned base.
-# ---
-# kind: the CONST_* kind the entry is interned under
-# len:  the entry's byte width
-# ret:  the required alignment in bytes
+pub fun bind_reloc_pair(st: *EncodeState, low_index: u32, high_index: u32) R.Result[R.Void, str] {
+    if (low_index >= st.reloc_count || high_index >= st.reloc_count) {
+        ret R.err[R.Void, str]("encode: relocation pair index is out of range");
+    }
+    if (low_index == high_index) {
+        ret R.err[R.Void, str]("encode: a relocation cannot pair with itself");
+    }
+    st.relocs[low_index].pair = high_index + 1;
+    ret R.ok_void[str]();
+}
+
+fun reloc_pair_key(high_kind: of.RelocKind, sym: intern.StrId) u64 {
+    ret (high_kind::u64 << 32) | sym::u64;
+}
+
+pub fun bind_reloc_pair_site(st: *EncodeState, high_kind: of.RelocKind,
+                             sym: intern.StrId, reloc_index: u32) R.Result[R.Void, str] {
+    if (sym == intern.STR_NIL) {
+        ret R.err[R.Void, str]("encode: relocation pair has no target symbol");
+    }
+    if (reloc_index >= st.reloc_count
+        || st.relocs[reloc_index].kind != high_kind
+        || st.relocs[reloc_index].sym != sym) {
+        ret R.err[R.Void, str]("encode: relocation pair site does not identify its high relocation");
+    }
+    val key: u64 = reloc_pair_key(high_kind, sym);
+    var site: RelocPairSite;
+    site.reloc_index = reloc_index;
+    site.label       = intern.STR_NIL;
+    val inserted: R.Result[bool, str] =
+        map.insert[u64, RelocPairSite](?st.reloc_pair_sites, key, site);
+    if (R.is_err[bool, str](inserted)) {
+        ret R.err[R.Void, str](R.unwrap_err[bool, str](inserted));
+    }
+    ret R.ok_void[str]();
+}
+
+pub fun reloc_pair_site(st: *EncodeState, high_kind: of.RelocKind,
+                        sym: intern.StrId) R.Result[*RelocPairSite, str] {
+    val key: u64 = reloc_pair_key(high_kind, sym);
+    val found: R.Result[*RelocPairSite, str] =
+        map.get[u64, RelocPairSite](?st.reloc_pair_sites, ?key);
+    if (R.is_err[*RelocPairSite, str](found)) { ret found; }
+    val site: *RelocPairSite = R.unwrap_ok[*RelocPairSite, str](found);
+    if (site.reloc_index >= st.reloc_count
+        || st.relocs[site.reloc_index].kind != high_kind
+        || st.relocs[site.reloc_index].sym != sym) {
+        ret R.err[*RelocPairSite, str]("encode: relocation pair site no longer identifies its high relocation");
+    }
+    ret found;
+}
+
 pub fun const_align(kind: u8, len: u32) u32 {
     if (kind == CONST_F32) { ret 4; }
     if (kind == CONST_F64) { ret 8; }
@@ -1470,34 +798,8 @@ pub fun const_align(kind: u8, len: u32) u32 {
     ret a;
 }
 
-# intern one constant into the module's pool and return the symbol naming it
-#
-# Two uses of the same constant share one entry, and the key is the full identity
-# `(kind, len, align, bytes)` rather than the bytes alone: an f32 and an i32 can
-# carry one bit pattern while meaning different things, and an entry's alignment
-# and any type-aware consumer follow from its kind. A key that was only the bytes
-# would silently hand one entry to both.
-#
-# The bit pattern is compared, never the value it denotes: `-0.0` and `+0.0` are
-# equal as floats and distinct as constants, and #2274 is the regression pin for
-# that sign being dropped.
-#
-# Merging is sound here in a way it is not for an ordinary global (#2541): a pool
-# entry has no observable address identity, so nothing in a program can tell that
-# two uses share one. That is also what lets `be.codegen` mark the packed section
-# coalescable, so byte-identical entries from different modules collapse at link.
-# ---
-# st:    the encode state owning the pool
-# bytes: the constant's laid-out little-endian byte image (copied)
-# len:   the constant's byte width
-# kind:  the CONST_* kind to intern under
-# ret:   the local symbol naming the entry's base, or an error string
 pub fun intern_const(st: *EncodeState, bytes: *u8, len: u32, kind: u8) R.Result[intern.StrId, str] {
     if (len == 0) { ret R.err[intern.StrId, str]("encode: a constant-pool entry has no bytes"); }
-    # an entry has to be NAMED to be referenced, so a state with no interner cannot
-    # hold one. reported rather than dereferenced: an encoder reaching the pool
-    # without an interner is a driver-wiring bug, and crashing inside `intern` says
-    # nothing about which encoder asked
     if (st.interner == nil) {
         ret R.err[intern.StrId, str]("encode: the constant pool needs an interner to name its entries");
     }
@@ -1514,16 +816,10 @@ pub fun intern_const(st: *EncodeState, bytes: *u8, len: u32, kind: u8) R.Result[
     }
 
     if (st.const_count >= st.const_cap) {
-        val res_grow: R.Result[bool, str] = grow_consts(st);
-        if (R.is_err[bool, str](res_grow)) { ret R.err[intern.StrId, str](R.unwrap_err[bool, str](res_grow)); }
+        val res_grow: R.Result[R.Void, str] = grow_consts(st);
+        if (R.is_err[R.Void, str](res_grow)) { ret R.err[intern.StrId, str](R.unwrap_err[R.Void, str](res_grow)); }
     }
 
-    # the name only has to be unique within the object: a relocation against a
-    # LOCAL symbol resolves against its own module's definition and never by name
-    # across objects (linker.local_symbol_target, #2520), and STB_LOCAL / non-external
-    # / IMAGE_SYM_CLASS_STATIC say the same thing to a foreign linker. a per-module
-    # ordinal is therefore enough, and it keeps the name independent of the bytes so
-    # a constant never leaks into the symbol table.
     var name: [32]u8;
     val prefix: str = ".Lconst.";
     var k: usize = 0;
@@ -1547,19 +843,6 @@ pub fun intern_const(st: *EncodeState, bytes: *u8, len: u32, kind: u8) R.Result[
     ret R.ok[intern.StrId, str](st.consts[st.const_count - 1].sym);
 }
 
-# intern a per-module local label name, `<prefix><ordinal>`
-#
-# The one place a local label's NAME is spelled. A local symbol's name only has to be
-# unique within its own object: a relocation against one resolves through `(module,
-# symbol index)` and never by name across objects (`linker.local_symbol_target`,
-# #2520), and STB_LOCAL says the same thing to a foreign linker. So a per-module
-# ordinal is enough, and the same ordinal appearing in every object is correct rather
-# than a collision.
-# ---
-# st:      the encode state supplying the interner
-# prefix:  the label prefix, including its trailing dot
-# ordinal: the per-module ordinal to append
-# ret:     the interned name, or an interning error
 pub fun intern_local_label(st: *EncodeState, prefix: str, ordinal: u32) R.Result[intern.StrId, str] {
     var name: [64]u8;
     val plen: usize = str_len(prefix);
@@ -1573,18 +856,6 @@ pub fun intern_local_label(st: *EncodeState, prefix: str, ordinal: u32) R.Result
     ret intern.intern(st.interner, (?name[0])::str);
 }
 
-# intern a scalar float bit pattern, the shape every target's float-immediate
-# materialization reaches the pool through
-#
-# `width` is 4 (an f32 pattern in the low 32 bits) or 8 (an f64 pattern), and it
-# selects both the entry kind and how many of `bits`' bytes are laid out - an f32
-# entry is four bytes, not the low four of an eight-byte image, so the entry a
-# 4-byte load reads is exactly the constant and nothing beyond it.
-# ---
-# st:    the encode state owning the pool
-# bits:  the constant's raw IEEE-754 bit pattern
-# width: 4 for an f32, 8 for an f64
-# ret:   the local symbol naming the entry, or an error string
 pub fun intern_float_const(st: *EncodeState, bits: u64, width: u8) R.Result[intern.StrId, str] {
     var img: [8]u8;
     var i: u32 = 0;
@@ -1597,75 +868,35 @@ pub fun intern_float_const(st: *EncodeState, bits: u64, width: u8) R.Result[inte
     ret intern_const(st, ?img[0], width::u32, kind);
 }
 
-# grow the constant-pool array, allocating it on first use
-# ---
-# st:  the state whose pool array is grown
-# ret: ok(true) once the array has room, or an allocation error
-fun grow_consts(st: *EncodeState) R.Result[bool, str] {
-    if (st.consts == nil) {
-        val res_alloc: R.Result[*ConstEntry, str] = A.allocate[ConstEntry](st.alloc, DRIVER_INIT_CAP::usize);
-        if (R.is_err[*ConstEntry, str](res_alloc)) { ret R.err[bool, str](R.unwrap_err[*ConstEntry, str](res_alloc)); }
-        st.consts    = R.unwrap_ok[*ConstEntry, str](res_alloc);
-        st.const_cap = DRIVER_INIT_CAP;
-        ret R.ok[bool, str](true);
-    }
-    val new_cap: u32 = st.const_cap * 2;
-    val res_realloc: R.Result[*ConstEntry, str] = A.reallocate[ConstEntry](st.alloc, st.consts, st.const_cap::usize, new_cap::usize);
-    if (R.is_err[*ConstEntry, str](res_realloc)) { ret R.err[bool, str](R.unwrap_err[*ConstEntry, str](res_realloc)); }
-    st.consts    = R.unwrap_ok[*ConstEntry, str](res_realloc);
-    st.const_cap = new_cap;
-    ret R.ok[bool, str](true);
+fun grow_consts(st: *EncodeState) R.Result[R.Void, str] {
+    ret grow_cap[ConstEntry](st.alloc, ?st.consts, ?st.const_cap, DRIVER_INIT_CAP);
 }
 
-# append a branch fixup, growing the fixup array on demand
-# ---
-# st:           the encode state whose fixup array receives the entry
-# patch_pos:    byte offset of the displacement field within `.text`
-# next_ip:      byte offset of the instruction following the branch
-# target_block: destination MIR block id (function-local)
-# fn_text_base: text offset of the owning function's first block
-# ret:          ok(true) on success, or an allocation error
-pub fun push_fixup(st: *EncodeState, patch_pos: u32, next_ip: u32, target_block: u32, fn_text_base: u32) R.Result[bool, str] {
+pub fun push_fixup(st: *EncodeState, patch_pos: u32, next_ip: u32, target_block: u32, fn_text_base: u32) R.Result[R.Void, str] {
     if (st.fixup_count >= st.fixup_cap) {
-        val res_grow: R.Result[bool, str] = grow_fixups(st);
-        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+        val res_grow: R.Result[R.Void, str] = grow_fixups(st);
+        if (R.is_err[R.Void, str](res_grow)) { ret res_grow; }
     }
     st.fixups[st.fixup_count].patch_pos    = patch_pos;
     st.fixups[st.fixup_count].next_ip      = next_ip;
     st.fixups[st.fixup_count].target_block = target_block;
     st.fixups[st.fixup_count].fn_text_base = fn_text_base;
     st.fixup_count = st.fixup_count + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# append a resolved block offset, growing the block-offset array on demand
-# ---
-# st:           the encode state whose block-offset array receives the entry
-# fn_text_base: text offset of the owning function's first block
-# block_id:     function-local MIR block id
-# offset:       byte offset of the block's first instruction within `.text`
-# ret:          ok(true) on success, or an allocation error
-pub fun push_block(st: *EncodeState, fn_text_base: u32, block_id: u32, offset: u32) R.Result[bool, str] {
+pub fun push_block(st: *EncodeState, fn_text_base: u32, block_id: u32, offset: u32) R.Result[R.Void, str] {
     if (st.block_count >= st.block_cap) {
-        val res_grow: R.Result[bool, str] = grow_blocks(st);
-        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+        val res_grow: R.Result[R.Void, str] = grow_blocks(st);
+        if (R.is_err[R.Void, str](res_grow)) { ret res_grow; }
     }
     st.blocks[st.block_count].fn_text_base = fn_text_base;
     st.blocks[st.block_count].block_id     = block_id;
     st.blocks[st.block_count].offset       = offset;
     st.block_count = st.block_count + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# record which block physically follows block index `bi` in `f`'s layout, the
-# fallthrough successor a terminator can reach with no branch. the ISA encode hook
-# calls this at the top of each block iteration, before emitting that block's
-# instructions, so its terminator sees the correct successor. the final block has
-# no fallthrough, so the marker is cleared (issue #1936)
-# ---
-# st: the encode state whose fallthrough marker is set
-# f:  the function being emitted
-# bi: index of the block about to be emitted
 pub fun set_fallthrough(st: *EncodeState, f: *mir.MirFunction, bi: u32) {
     if (bi + 1 < f.block_count) {
         st.has_next_block = true;
@@ -1676,57 +907,24 @@ pub fun set_fallthrough(st: *EncodeState, f: *mir.MirFunction, bi: u32) {
     }
 }
 
-# true when a terminator branching to `target_block` reaches the fallthrough
-# successor recorded by `set_fallthrough`, so its jump is redundant and emits
-# nothing. only the not-taken / unconditional edge is ever tested this way; a
-# conditional's taken edge always keeps its jump (issue #1936)
-# ---
-# st:           the encode state carrying the current fallthrough marker
-# target_block: the branch edge's destination block id
-# ret:          true when the edge falls through to the next block in layout order
 pub fun branch_falls_through(st: *EncodeState, target_block: u32) bool {
     ret st.has_next_block && st.next_block_id == target_block;
 }
 
-# append a PC<->source line row, growing the row array on demand
-#
-# Called by an ISA encoder for each instruction that carries a source location, at
-# the `.text` offset where its bytes begin. A location naming no file
-# (`source.loc_nil()`, a compiler-synthesized instruction) is dropped so its byte
-# range is attributed to the preceding row's line. The row survives into
-# `EncoderOutput` and is kept correct under `insert_text` relaxation and codegen
-# re-homing.
-# ---
-# st:          the encode state whose row array receives the entry
-# text_offset: byte offset of the instruction's first byte within `.text`
-# loc:         the instruction's source location
-# ret:         ok(true) on success (or a dropped nil location), or an allocation error
-pub fun push_row(st: *EncodeState, text_offset: u32, loc: source.SrcLoc) R.Result[bool, str] {
-    if (!source.loc_is_valid(loc)) { ret R.ok[bool, str](true); }
+pub fun push_row(st: *EncodeState, text_offset: u32, loc: source.SrcLoc) R.Result[R.Void, str] {
+    if (!source.loc_is_valid(loc)) { ret R.ok_void[str](); }
     if (st.row_count >= st.row_cap) {
-        val res_grow: R.Result[bool, str] = grow_rows(st);
-        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+        val res_grow: R.Result[R.Void, str] = grow_rows(st);
+        if (R.is_err[R.Void, str](res_grow)) { ret res_grow; }
     }
     st.rows[st.row_count].text_offset = text_offset;
     st.rows[st.row_count].sec         = 0;
     st.rows[st.row_count].loc         = loc;
     st.row_count = st.row_count + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# record a variable-location record for a source-variable binding `(iid, vreg)` that
-# becomes live at `text_offset`. The vreg's post-regalloc home (assigned register or
-# spill slot) becomes the raw home the producer maps to a DWARF location. A NIL vreg or
-# a vreg with neither home is an optimized-out binding (VARLOC_NONE), which the producer
-# renders as a gap
-# ---
-# st:          the encode state
-# text_offset: `.text` offset where the binding becomes live
-# fn:          the MIR function owning the vreg (its vregs / frame give the home)
-# vreg:        the bound value's vreg, or mir.MIR_VREG_NIL for no home
-# iid:         the source OP_DBG_VALUE instruction id
-# ret:         ok(true), or an allocation error
-pub fun push_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction, vreg: u32, iid: u32) R.Result[bool, str] {
+pub fun push_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction, vreg: u32, iid: u32) R.Result[R.Void, str] {
     var kind: u8  = VARLOC_NONE;
     var reg:  i32 = 0;
     var off:  i64 = 0;
@@ -1745,10 +943,6 @@ pub fun push_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction, vr
             }
         }
         or {
-            # a register-passed aggregate parameter is reconstructed into a mir.SLOT_SPILL
-            # slot it owns; regalloc excludes the slot-owner vreg, so it has no assigned
-            # register and no regalloc spill. the slot holds the aggregate's bytes, so the
-            # binding is a direct frame location addressing that storage (#1954).
             var si: u32 = 0;
             for (si < fn.frame.slot_count) {
                 if (fn.frame.slots[si].value == vreg && fn.frame.slots[si].kind == mir.SLOT_SPILL) {
@@ -1760,8 +954,8 @@ pub fun push_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction, vr
     }
 
     if (st.varloc_count >= st.varloc_cap) {
-        val res_grow: R.Result[bool, str] = grow_varlocs(st);
-        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+        val res_grow: R.Result[R.Void, str] = grow_varlocs(st);
+        if (R.is_err[R.Void, str](res_grow)) { ret res_grow; }
     }
     st.varlocs[st.varloc_count].text_offset = text_offset;
     st.varlocs[st.varloc_count].sec         = 0;
@@ -1772,11 +966,9 @@ pub fun push_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction, vr
     st.varlocs[st.varloc_count].off_storage = storage;
     varloc_clear_cmp(?st.varlocs[st.varloc_count]);
     st.varloc_count = st.varloc_count + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# zero a record's compare payload (a plain binding carries none; the fields are
-# read only under kind VARLOC_CMP but must not be garbage)
 fun varloc_clear_cmp(vl: *VarLoc) {
     vl.end_offset = 0;
     vl.sub_lhs    = VARLOC_NONE;
@@ -1788,16 +980,6 @@ fun varloc_clear_cmp(vl: *VarLoc) {
     vl.cmp_width  = 0;
 }
 
-# resolve one fused-compare operand to its VARLOC sub-home: an immediate is its
-# raw bits (VARLOC_IMM), a register-assigned vreg its register, a spilled vreg
-# its frame slot (holding the machine-word value), and anything else - a vreg
-# with no home - VARLOC_NONE, which degrades the whole record
-# ---
-# fn:      the MIR function owning the vreg table and frame
-# is_imm:  true when the operand is an immediate
-# vreg:    the operand vreg (when not an immediate)
-# imm:     the immediate's raw bits (when is_imm)
-# out_kind/out_reg/out_off: the resolved sub-home
 fun cmp_operand_home(fn: *mir.MirFunction, is_imm: bool, vreg: u32, imm: i64,
                      out_kind: *u8, out_reg: *i32, out_off: *i64) {
     @out_kind = VARLOC_NONE;
@@ -1827,19 +1009,7 @@ fun cmp_operand_home(fn: *mir.MirFunction, is_imm: bool, vreg: u32, imm: i64,
     }
 }
 
-# record a fused-condition computed-value location for a compare binding (see
-# VarLoc's VARLOC_CMP contract). both operand homes must resolve - a homeless
-# operand degrades the record to a plain optimized-out binding, keeping the gap
-# semantics rather than describing a half-computable value. the range stays open
-# (`end_offset` 0) until the fused terminator's encoder closes it at the
-# instruction's byte end via `close_cmp_varlocs`
-# ---
-# st:          the encode state
-# text_offset: `.text` offset where the fused terminator begins
-# fn:          the MIR function owning the operand vregs
-# bind:        the compare binding (cmp_op nonzero)
-# ret:         ok(true), or an allocation error
-pub fun push_cmp_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction, bind: *mir.MirDbgBinding) R.Result[bool, str] {
+pub fun push_cmp_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction, bind: *mir.MirDbgBinding) R.Result[R.Void, str] {
     var lk: u8 = VARLOC_NONE; var lr: i32 = 0; var lo: i64 = 0;
     var rk: u8 = VARLOC_NONE; var rr: i32 = 0; var ro: i64 = 0;
     cmp_operand_home(fn, bind.lhs_is_imm, bind.vreg, bind.imm, ?lk, ?lr, ?lo);
@@ -1854,8 +1024,8 @@ pub fun push_cmp_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction
     or (bind.cmp_op == mir.MIR_SEL_CBR_LE_S || bind.cmp_op == mir.MIR_SEL_CBR_LE_U)   { rel = CMPREL_LE; }
 
     if (st.varloc_count >= st.varloc_cap) {
-        val res_grow: R.Result[bool, str] = grow_varlocs(st);
-        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+        val res_grow: R.Result[R.Void, str] = grow_varlocs(st);
+        if (R.is_err[R.Void, str](res_grow)) { ret res_grow; }
     }
     val vl: *VarLoc = ?st.varlocs[st.varloc_count];
     vl.text_offset = text_offset;
@@ -1874,19 +1044,9 @@ pub fun push_cmp_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction
     vl.cmp_signed  = mir.is_signed_cmp(bind.cmp_op);
     vl.cmp_width   = bind.cmp_width;
     st.varloc_count = st.varloc_count + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# close every still-open VARLOC_CMP record the fused terminator at
-# `instr_start` pushed, bounding its range to the instruction's byte extent
-# `[instr_start, instr_end)` - the only PCs where the computed relation is
-# observable. called by each arch's fused-terminator encoder once the branch's
-# last byte is emitted; records of other instructions are never touched (the
-# backward walk stops at the first record of an earlier offset)
-# ---
-# st:          the encode state
-# instr_start: the fused terminator's first byte offset (its records' offset)
-# instr_end:   the offset one past the terminator's last byte
 pub fun close_cmp_varlocs(st: *EncodeState, instr_start: u32, instr_end: u32) {
     var i: u32 = st.varloc_count;
     for (i > 0) {
@@ -1897,87 +1057,41 @@ pub fun close_cmp_varlocs(st: *EncodeState, instr_start: u32, instr_end: u32) {
     }
 }
 
-# record a VarLoc for every `-g` source-variable binding attached to `mi`, at the
-# instruction's current `.text` start offset (`st.buf.len`). Called by each ISA encoder
-# at the top of `encode_mir_instr`, before the instruction's bytes are emitted, so the
-# binding's PC is the instruction's start - the same position a standalone marker would
-# have produced. A no-op for the common instruction with no bindings
-# ---
-# st: the encode state
-# fn: the MIR function owning the vregs
-# mi: the instruction whose attached bindings are recorded
-# ret: ok(true), or an allocation error
-pub fun emit_var_bindings(st: *EncodeState, fn: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
-    if (mi.dbg_binding_count == 0) { ret R.ok[bool, str](true); }
+pub fun emit_var_bindings(st: *EncodeState, fn: *mir.MirFunction, mi: *mir.MirInstr) R.Result[R.Void, str] {
+    if (mi.dbg_binding_count == 0) { ret R.ok_void[str](); }
     val at: u32 = st.buf.len::u32;
     var i: u32 = 0;
     for (i < mi.dbg_binding_count) {
         val bind: *mir.MirDbgBinding = ?mi.dbg_bindings[i];
-        # a fused-condition compare binding records the computed relation; a
-        # plain binding the vreg's post-regalloc home.
-        var r: R.Result[bool, str] = R.ok[bool, str](true);
+        var r: R.Result[R.Void, str] = R.ok_void[str]();
         if (bind.cmp_op != 0) { r = push_cmp_varloc(st, at, fn, bind); }
         or                    { r = push_varloc(st, at, fn, bind.vreg, bind.iid); }
-        if (R.is_err[bool, str](r)) { ret r; }
+        if (R.is_err[R.Void, str](r)) { ret r; }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# grow the variable-location array, allocating it on first use
-# ---
-# st:  the state whose varloc array is grown
-# ret: ok(true) once the array has room, or an allocation error
-fun grow_varlocs(st: *EncodeState) R.Result[bool, str] {
-    if (st.varlocs == nil) {
-        val res_alloc: R.Result[*VarLoc, str] = A.allocate[VarLoc](st.alloc, DRIVER_INIT_CAP::usize);
-        if (R.is_err[*VarLoc, str](res_alloc)) { ret R.err[bool, str](R.unwrap_err[*VarLoc, str](res_alloc)); }
-        st.varlocs   = R.unwrap_ok[*VarLoc, str](res_alloc);
-        st.varloc_cap = DRIVER_INIT_CAP;
-        ret R.ok[bool, str](true);
-    }
-    val new_cap: u32 = st.varloc_cap * 2;
-    val res_realloc: R.Result[*VarLoc, str] = A.reallocate[VarLoc](st.alloc, st.varlocs, st.varloc_cap::usize, new_cap::usize);
-    if (R.is_err[*VarLoc, str](res_realloc)) { ret R.err[bool, str](R.unwrap_err[*VarLoc, str](res_realloc)); }
-    st.varlocs   = R.unwrap_ok[*VarLoc, str](res_realloc);
-    st.varloc_cap = new_cap;
-    ret R.ok[bool, str](true);
+fun grow_varlocs(st: *EncodeState) R.Result[R.Void, str] {
+    ret grow_cap[VarLoc](st.alloc, ?st.varlocs, ?st.varloc_cap, DRIVER_INIT_CAP);
 }
 
-# initialise an encode state with empty output arrays for one driver run
-# ---
-# st:    the state to populate in place
-# alloc: backing allocator for every owned array (and the text sink)
-# m:     the MIR module whose interner the state borrows
-# tgt:   resolved target whose ABI / OS vtables the encode hook reads
-fun state_init(st: *EncodeState, alloc: *A.Allocator, m: *mir.MirModule, tgt: *target.Target) {
+fun state_init(st: *EncodeState, alloc: *A.Allocator, m: *mir.MirModule, tgt: *isa.BackendTarget) {
     state_blank(st, alloc, ?tgt.model);
     st.interner    = m.interner;
     st.srcmap      = m.srcmap;
-    st.abi         = tgt.abi;
-    st.os          = tgt.os;
+    st.callee_saved = tgt.abi.callee_saved;
+    st.base_addr    = tgt.os.image_base;
+    st.page_size    = tgt.os.page_size;
+    st.stack_probe  = tgt.os.stack_probe;
 }
 
-# an encode state with a live text sink and every growable array empty
-#
-# The zero state `state_init` builds on and the one a unit test that drives an
-# encoder directly needs, so a field added to `EncodeState` is initialised in one
-# place rather than in each of them. It names no module and no OS: those borrowed
-# pointers are what `state_init` adds, and a test that reaches one has built a state
-# the encoder would not have produced.
-#
-# THE MACHINE IS A PARAMETER, NOT A DEFAULT (#2778). Every width the encoder picks a
-# form by is read from `model`, so a state that did not carry one would read every
-# width as zero and select silently wrong forms rather than failing. Taking it
-# positionally makes a test that forgets to say which machine it is encoding for an
-# ARITY ERROR at build time - the same reason `abi.abi_vtable` and `abi.riscv.rv_abi`
-# are positional - instead of a state the encoder would never have produced.
-# ---
-# st:    the state to initialise
-# alloc: backing allocator for every array the state grows
-# model: the machine being encoded for; every width decision is read from it
 pub fun state_blank(st: *EncodeState, alloc: *A.Allocator, model: *isa.MachineModel) {
     st.model       = model;
+    st.callee_saved = nil;
+    st.base_addr    = 0;
+    st.page_size    = 0;
+    st.stack_probe  = false;
     st.alloc       = alloc;
     st.buf         = buf_init(alloc);
     st.syms        = nil;
@@ -1987,6 +1101,7 @@ pub fun state_blank(st: *EncodeState, alloc: *A.Allocator, model: *isa.MachineMo
     st.relocs      = nil;
     st.reloc_count = 0;
     st.reloc_cap   = 0;
+    st.reloc_pair_sites = map.init[u64, RelocPairSite](alloc, map.hash_u64, map.eq_u64);
     st.fixups      = nil;
     st.fixup_count = 0;
     st.fixup_cap   = 0;
@@ -2013,14 +1128,8 @@ pub fun state_blank(st: *EncodeState, alloc: *A.Allocator, model: *isa.MachineMo
     st.has_next_block = false;
     st.interner    = nil;
     st.srcmap      = nil;
-    st.abi         = nil;
-    st.os          = nil;
 }
 
-# release every owned array on the error path, including the text sink and the
-# symbol / relocation arrays that would otherwise transfer into `EncoderOutput`
-# ---
-# st: the state to tear down
 fun state_dnit(st: *EncodeState) {
     buf_dnit(?st.buf);
     if (st.syms != nil && st.sym_cap > 0) {
@@ -2067,16 +1176,6 @@ fun state_dnit(st: *EncodeState) {
     scratch_release(st);
 }
 
-# release a constant-pool array and every entry's owned byte image
-#
-# The one place pool storage is released, so the encoder's error path and the
-# object builder's post-pack teardown free it identically. `count` bounds the
-# entries whose bytes are live; `cap` bounds the array allocation.
-# ---
-# alloc: the allocator the pool was built on
-# c:     the entry array (nil-safe)
-# count: number of live entries
-# cap:   allocated capacity of the array
 pub fun consts_free(alloc: *A.Allocator, c: *ConstEntry, count: u32, cap: u32) {
     if (c == nil) { ret; }
     var i: u32 = 0;
@@ -2089,12 +1188,8 @@ pub fun consts_free(alloc: *A.Allocator, c: *ConstEntry, count: u32, cap: u32) {
     if (cap > 0) { A.deallocate[ConstEntry](alloc, c, cap::usize); }
 }
 
-# release the driver-internal scratch arrays (fixups, block offsets) once their
-# pass-2 work is done; the text / symbol / relocation arrays survive into
-# `EncoderOutput`
-# ---
-# st: the state whose scratch arrays are freed
 fun scratch_release(st: *EncodeState) {
+    map.dnit[u64, RelocPairSite](?st.reloc_pair_sites);
     if (st.fixups != nil && st.fixup_cap > 0) {
         A.deallocate[BranchFixup](st.alloc, st.fixups, st.fixup_cap::usize);
     }
@@ -2109,91 +1204,210 @@ fun scratch_release(st: *EncodeState) {
     st.block_cap   = 0;
 }
 
-# shrink the text byte sink so its backing allocation length equals the number of
-# bytes written
-#
-# The object builder frees the transferred `.text` buffer by its `len`, so the
-# allocation must be exactly `len` bytes wide. A no-op when the buffer is already
-# exact, empty, or unallocated.
-# ---
-# st:  the state whose text sink is right-sized
-# ret: ok(true) on success, or an allocation error
-fun shrink_text(st: *EncodeState) R.Result[bool, str] {
-    if (st.buf.data == nil) { ret R.ok[bool, str](true); }
+fun shrink_text(st: *EncodeState) R.Result[R.Void, str] {
+    if (st.buf.data == nil) { ret R.ok_void[str](); }
     if (st.buf.len == 0) {
         A.deallocate[u8](st.alloc, st.buf.data, st.buf.cap);
         st.buf.data = nil;
         st.buf.cap  = 0;
-        ret R.ok[bool, str](true);
+        ret R.ok_void[str]();
     }
-    if (st.buf.cap == st.buf.len) { ret R.ok[bool, str](true); }
+    if (st.buf.cap == st.buf.len) { ret R.ok_void[str](); }
     val res_shrink: R.Result[*u8, str] = A.reallocate[u8](st.alloc, st.buf.data, st.buf.cap, st.buf.len);
-    if (R.is_err[*u8, str](res_shrink)) { ret R.err[bool, str](R.unwrap_err[*u8, str](res_shrink)); }
+    if (R.is_err[*u8, str](res_shrink)) { ret R.err[R.Void, str](R.unwrap_err[*u8, str](res_shrink)); }
     st.buf.data = R.unwrap_ok[*u8, str](res_shrink);
     st.buf.cap  = st.buf.len;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# right-size the constant-pool array so its allocation length equals its entry
-# count
-#
-# `EncoderOutput` carries a count and no capacity, so the object builder frees the
-# transferred array by that count; the allocation has to match. The same
-# requirement `shrink_text` exists for.
-# ---
-# st:  the state whose pool array is right-sized
-# ret: ok(true) on success, or an allocation error
-fun shrink_consts(st: *EncodeState) R.Result[bool, str] {
-    if (st.consts == nil) { ret R.ok[bool, str](true); }
+fun shrink_consts(st: *EncodeState) R.Result[R.Void, str] {
+    if (st.consts == nil) { ret R.ok_void[str](); }
     if (st.const_count == 0) {
         A.deallocate[ConstEntry](st.alloc, st.consts, st.const_cap::usize);
         st.consts    = nil;
         st.const_cap = 0;
-        ret R.ok[bool, str](true);
+        ret R.ok_void[str]();
     }
-    if (st.const_cap == st.const_count) { ret R.ok[bool, str](true); }
+    if (st.const_cap == st.const_count) { ret R.ok_void[str](); }
     val res: R.Result[*ConstEntry, str] = A.reallocate[ConstEntry](st.alloc, st.consts, st.const_cap::usize, st.const_count::usize);
-    if (R.is_err[*ConstEntry, str](res)) { ret R.err[bool, str](R.unwrap_err[*ConstEntry, str](res)); }
+    if (R.is_err[*ConstEntry, str](res)) { ret R.err[R.Void, str](R.unwrap_err[*ConstEntry, str](res)); }
     st.consts    = R.unwrap_ok[*ConstEntry, str](res);
     st.const_cap = st.const_count;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# pass 2: resolve each recorded intra-module branch fixup's target block offset
-# and hand it to the ISA's `patch_branch` hook, which writes the displacement
-#
-# The displacement convention and field layout are the hook's; the driver only
-# resolves block offsets in the shared block-offset table.
-# ---
-# st:    the state holding the recorded fixups and block offsets
-# hooks: the per-ISA encode / patch operations
-# ret:   ok(true) on success, or an error from a lookup or the patch hook
-fun patch_branches(st: *EncodeState, hooks: *EncodeHooks) R.Result[bool, str] {
-    if (st.buf.data == nil) { ret R.ok[bool, str](true); }
+fun shrink_syms(st: *EncodeState) R.Result[R.Void, str] {
+    if (st.syms == nil) { ret R.ok_void[str](); }
+    if (st.sym_count == 0) {
+        A.deallocate[SymbolMark](st.alloc, st.syms, st.sym_cap::usize);
+        st.syms    = nil;
+        st.sym_cap = 0;
+        ret R.ok_void[str]();
+    }
+    if (st.sym_cap == st.sym_count) { ret R.ok_void[str](); }
+    val res: R.Result[*SymbolMark, str] = A.reallocate[SymbolMark](st.alloc, st.syms, st.sym_cap::usize, st.sym_count::usize);
+    if (R.is_err[*SymbolMark, str](res)) { ret R.err[R.Void, str](R.unwrap_err[*SymbolMark, str](res)); }
+    st.syms    = R.unwrap_ok[*SymbolMark, str](res);
+    st.sym_cap = st.sym_count;
+    ret R.ok_void[str]();
+}
+
+fun shrink_relocs(st: *EncodeState) R.Result[R.Void, str] {
+    if (st.relocs == nil) { ret R.ok_void[str](); }
+    if (st.reloc_count == 0) {
+        A.deallocate[PendingReloc](st.alloc, st.relocs, st.reloc_cap::usize);
+        st.relocs    = nil;
+        st.reloc_cap = 0;
+        ret R.ok_void[str]();
+    }
+    if (st.reloc_cap == st.reloc_count) { ret R.ok_void[str](); }
+    val res: R.Result[*PendingReloc, str] = A.reallocate[PendingReloc](st.alloc, st.relocs, st.reloc_cap::usize, st.reloc_count::usize);
+    if (R.is_err[*PendingReloc, str](res)) { ret R.err[R.Void, str](R.unwrap_err[*PendingReloc, str](res)); }
+    st.relocs    = R.unwrap_ok[*PendingReloc, str](res);
+    st.reloc_cap = st.reloc_count;
+    ret R.ok_void[str]();
+}
+
+fun shrink_rows(st: *EncodeState) R.Result[R.Void, str] {
+    if (st.rows == nil) { ret R.ok_void[str](); }
+    if (st.row_count == 0) {
+        A.deallocate[LineRow](st.alloc, st.rows, st.row_cap::usize);
+        st.rows    = nil;
+        st.row_cap = 0;
+        ret R.ok_void[str]();
+    }
+    if (st.row_cap == st.row_count) { ret R.ok_void[str](); }
+    val res: R.Result[*LineRow, str] = A.reallocate[LineRow](st.alloc, st.rows, st.row_cap::usize, st.row_count::usize);
+    if (R.is_err[*LineRow, str](res)) { ret R.err[R.Void, str](R.unwrap_err[*LineRow, str](res)); }
+    st.rows    = R.unwrap_ok[*LineRow, str](res);
+    st.row_cap = st.row_count;
+    ret R.ok_void[str]();
+}
+
+fun shrink_varlocs(st: *EncodeState) R.Result[R.Void, str] {
+    if (st.varlocs == nil) { ret R.ok_void[str](); }
+    if (st.varloc_count == 0) {
+        A.deallocate[VarLoc](st.alloc, st.varlocs, st.varloc_cap::usize);
+        st.varlocs    = nil;
+        st.varloc_cap = 0;
+        ret R.ok_void[str]();
+    }
+    if (st.varloc_cap == st.varloc_count) { ret R.ok_void[str](); }
+    val res: R.Result[*VarLoc, str] = A.reallocate[VarLoc](st.alloc, st.varlocs, st.varloc_cap::usize, st.varloc_count::usize);
+    if (R.is_err[*VarLoc, str](res)) { ret R.err[R.Void, str](R.unwrap_err[*VarLoc, str](res)); }
+    st.varlocs    = R.unwrap_ok[*VarLoc, str](res);
+    st.varloc_cap = st.varloc_count;
+    ret R.ok_void[str]();
+}
+
+fun shrink_inline_pcs(st: *EncodeState) R.Result[R.Void, str] {
+    if (st.inline_pcs == nil) { ret R.ok_void[str](); }
+    if (st.inline_pc_count == 0) {
+        A.deallocate[InlinePc](st.alloc, st.inline_pcs, st.inline_pc_cap::usize);
+        st.inline_pcs    = nil;
+        st.inline_pc_cap = 0;
+        ret R.ok_void[str]();
+    }
+    if (st.inline_pc_cap == st.inline_pc_count) { ret R.ok_void[str](); }
+    val res: R.Result[*InlinePc, str] = A.reallocate[InlinePc](st.alloc, st.inline_pcs, st.inline_pc_cap::usize, st.inline_pc_count::usize);
+    if (R.is_err[*InlinePc, str](res)) { ret R.err[R.Void, str](R.unwrap_err[*InlinePc, str](res)); }
+    st.inline_pcs    = R.unwrap_ok[*InlinePc, str](res);
+    st.inline_pc_cap = st.inline_pc_count;
+    ret R.ok_void[str]();
+}
+
+fun shrink_frames(st: *EncodeState) R.Result[R.Void, str] {
+    if (st.frames == nil) { ret R.ok_void[str](); }
+    if (st.frame_count == 0) {
+        A.deallocate[of.FrameUnwind](st.alloc, st.frames, st.frame_cap::usize);
+        st.frames    = nil;
+        st.frame_cap = 0;
+        ret R.ok_void[str]();
+    }
+    if (st.frame_cap == st.frame_count) { ret R.ok_void[str](); }
+    val res: R.Result[*of.FrameUnwind, str] = A.reallocate[of.FrameUnwind](st.alloc, st.frames, st.frame_cap::usize, st.frame_count::usize);
+    if (R.is_err[*of.FrameUnwind, str](res)) { ret R.err[R.Void, str](R.unwrap_err[*of.FrameUnwind, str](res)); }
+    st.frames    = R.unwrap_ok[*of.FrameUnwind, str](res);
+    st.frame_cap = st.frame_count;
+    ret R.ok_void[str]();
+}
+
+test "mach.lang.be.codegen.encode.shrink_arrays:cap_equals_count_after_shrink" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var st: EncodeState;
+    t_row_state(?alloc, ?st);
+
+    val rsym: R.Result[*SymbolMark, str] = A.allocate[SymbolMark](?alloc, 8::usize);
+    if (R.is_err[*SymbolMark, str](rsym)) { ret 1; }
+    st.syms = R.unwrap_ok[*SymbolMark, str](rsym);
+    st.sym_cap = 8;
+    st.sym_count = 3;
+
+    val rrel: R.Result[*PendingReloc, str] = A.allocate[PendingReloc](?alloc, 8::usize);
+    if (R.is_err[*PendingReloc, str](rrel)) { ret 1; }
+    st.relocs = R.unwrap_ok[*PendingReloc, str](rrel);
+    st.reloc_cap = 8;
+    st.reloc_count = 2;
+
+    val rrow: R.Result[*LineRow, str] = A.allocate[LineRow](?alloc, 8::usize);
+    if (R.is_err[*LineRow, str](rrow)) { ret 1; }
+    st.rows = R.unwrap_ok[*LineRow, str](rrow);
+    st.row_cap = 8;
+    st.row_count = 4;
+
+    val rvl: R.Result[*VarLoc, str] = A.allocate[VarLoc](?alloc, 8::usize);
+    if (R.is_err[*VarLoc, str](rvl)) { ret 1; }
+    st.varlocs = R.unwrap_ok[*VarLoc, str](rvl);
+    st.varloc_cap = 8;
+    st.varloc_count = 1;
+
+    val rip: R.Result[*InlinePc, str] = A.allocate[InlinePc](?alloc, 8::usize);
+    if (R.is_err[*InlinePc, str](rip)) { ret 1; }
+    st.inline_pcs = R.unwrap_ok[*InlinePc, str](rip);
+    st.inline_pc_cap = 8;
+    st.inline_pc_count = 0;
+
+    val rfr: R.Result[*of.FrameUnwind, str] = A.allocate[of.FrameUnwind](?alloc, 8::usize);
+    if (R.is_err[*of.FrameUnwind, str](rfr)) { ret 1; }
+    st.frames = R.unwrap_ok[*of.FrameUnwind, str](rfr);
+    st.frame_cap = 8;
+    st.frame_count = 5;
+
+    if (R.is_err[R.Void, str](shrink_syms(?st)))       { state_dnit(?st); ret 1; }
+    if (R.is_err[R.Void, str](shrink_relocs(?st)))     { state_dnit(?st); ret 1; }
+    if (R.is_err[R.Void, str](shrink_rows(?st)))       { state_dnit(?st); ret 1; }
+    if (R.is_err[R.Void, str](shrink_varlocs(?st)))    { state_dnit(?st); ret 1; }
+    if (R.is_err[R.Void, str](shrink_inline_pcs(?st))) { state_dnit(?st); ret 1; }
+    if (R.is_err[R.Void, str](shrink_frames(?st)))     { state_dnit(?st); ret 1; }
+
+    if (st.sym_cap != st.sym_count)                    { state_dnit(?st); ret 1; }
+    if (st.reloc_cap != st.reloc_count)                { state_dnit(?st); ret 1; }
+    if (st.row_cap != st.row_count)                    { state_dnit(?st); ret 1; }
+    if (st.varloc_cap != st.varloc_count)              { state_dnit(?st); ret 1; }
+    if (st.inline_pc_cap != 0 || st.inline_pcs != nil) { state_dnit(?st); ret 1; }
+    if (st.frame_cap != st.frame_count)                { state_dnit(?st); ret 1; }
+
+    state_dnit(?st);
+    ret 0;
+}
+
+fun patch_branches(st: *EncodeState, hooks: *EncodeHooks) R.Result[R.Void, str] {
+    if (st.buf.data == nil) { ret R.ok_void[str](); }
     var i: u32 = 0;
     for (i < st.fixup_count) {
         val fx: *BranchFixup = ?st.fixups[i];
         val res_off: R.Result[u32, str] = block_offset(st, fx.fn_text_base, fx.target_block);
-        if (R.is_err[u32, str](res_off)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_off)); }
+        if (R.is_err[u32, str](res_off)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](res_off)); }
         val target_off: u32 = R.unwrap_ok[u32, str](res_off);
-        val res_patch: R.Result[bool, str] = hooks.patch_branch(st, fx, target_off);
-        if (R.is_err[bool, str](res_patch)) { ret R.err[bool, str](R.unwrap_err[bool, str](res_patch)); }
+        val res_patch: R.Result[R.Void, str] = hooks.patch_branch(st, fx, target_off);
+        if (R.is_err[R.Void, str](res_patch)) { ret res_patch; }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# resolve a function-local block id to its `.text` offset
-#
-# An unrecorded target is a backend bug (a branch to a block the encoder never
-# emitted), rejected loudly rather than resolved to offset 0 (which would be a
-# branch into the first function's middle). Public so an ISA's branch-relaxation
-# pass can resolve a branch's current target offset while it grows the text.
-# ---
-# st:       the state holding the recorded block offsets
-# fn_base:  text offset of the owning function's first block
-# block_id: the function-local block id to resolve
-# ret:      the block's `.text` offset, or an error when it was never recorded
 pub fun block_offset(st: *EncodeState, fn_base: u32, block_id: u32) R.Result[u32, str] {
     var i: u32 = 0;
     for (i < st.block_count) {
@@ -2205,46 +1419,38 @@ pub fun block_offset(st: *EncodeState, fn_base: u32, block_id: u32) R.Result[u32
     ret R.err[u32, str]("encode: branch target block was never recorded");
 }
 
-# open an `nbytes` gap at byte offset `pos` in the encoded text and keep every
-# recorded offset consistent
-#
-# Shifts the bytes in `[pos, len)` up by `nbytes` (growing the sink as needed),
-# zero-fills the opened gap, and advances by `nbytes` every recorded offset at or
-# past `pos`: block offsets, branch-fixup patch / next-ip / function-base fields,
-# symbol-mark offsets, relocation offsets, and line-row text offsets. This is the ISA-general mechanism a
-# branch-relaxation pass uses to grow an out-of-range branch into a longer
-# sequence while leaving the fixup, block, symbol, and relocation tables pointing
-# at the right instructions. An entry strictly before `pos` is untouched, so the
-# relaxing branch's own placeholder word (emitted before the gap) keeps its
-# position while the instructions after it slide down. The function's own base
-# offset shifts only when the whole function sits at or past `pos`, so opening a
-# gap inside a function leaves its base put and moves only the blocks after the
-# gap.
-# ---
-# st:     the encode state whose text and offset tables are adjusted
-# pos:    byte offset at which the gap opens
-# nbytes: width of the gap (the number of bytes the tail slides down)
-# ret:    ok(true) on success, or an allocation error from growing the sink
-pub fun insert_text(st: *EncodeState, pos: u32, nbytes: u32) R.Result[bool, str] {
-    if (nbytes == 0) { ret R.ok[bool, str](true); }
+pub fun insert_text(st: *EncodeState, pos: u32, nbytes: u32) R.Result[R.Void, str] {
+    if (nbytes == 0) { ret R.ok_void[str](); }
     val p: usize = pos::usize;
     val n: usize = nbytes::usize;
     if (p > st.buf.len) {
-        ret R.err[bool, str]("encode: text-gap offset is past the end of the buffer");
+        ret R.err[R.Void, str]("encode: text-gap offset is past the end of the buffer");
     }
 
-    val need: usize = st.buf.len + n;
+    val need_r: R.Result[layout.CheckedCount[layout.ByteUnit], layout.CheckCause] =
+        layout.count_add[layout.ByteUnit](layout.count[layout.ByteUnit](st.buf.len), layout.count[layout.ByteUnit](n));
+    if (R.is_err[layout.CheckedCount[layout.ByteUnit], layout.CheckCause](need_r)) {
+        ret R.err[R.Void, str]("encode: text-gap size overflow");
+    }
+    val need: usize = R.unwrap_ok[layout.CheckedCount[layout.ByteUnit], layout.CheckCause](need_r).value;
     if (need > st.buf.cap) {
-        var new_cap: usize = BYTEBUF_INIT_CAP;
-        if (st.buf.cap > 0) { new_cap = st.buf.cap; }
-        for (new_cap < need) { new_cap = new_cap * 2; }
+        var new_cap_c: layout.CheckedCount[layout.ByteUnit] = layout.count[layout.ByteUnit](BYTEBUF_INIT_CAP);
+        if (st.buf.cap > 0) { new_cap_c = layout.count[layout.ByteUnit](st.buf.cap); }
+        for (new_cap_c.value < need) {
+            val doubled_r: R.Result[layout.CheckedCount[layout.ByteUnit], layout.CheckCause] =
+                layout.count_mul[layout.ByteUnit](new_cap_c, 2::usize);
+            if (R.is_err[layout.CheckedCount[layout.ByteUnit], layout.CheckCause](doubled_r)) {
+                ret R.err[R.Void, str]("encode: text buffer growth capacity overflow");
+            }
+            new_cap_c = R.unwrap_ok[layout.CheckedCount[layout.ByteUnit], layout.CheckCause](doubled_r);
+        }
+        val new_cap: usize = new_cap_c.value;
         val res_realloc: R.Result[*u8, str] = A.reallocate[u8](st.buf.alloc, st.buf.data, st.buf.cap, new_cap);
-        if (R.is_err[*u8, str](res_realloc)) { ret R.err[bool, str](R.unwrap_err[*u8, str](res_realloc)); }
+        if (R.is_err[*u8, str](res_realloc)) { ret R.err[R.Void, str](R.unwrap_err[*u8, str](res_realloc)); }
         st.buf.data = R.unwrap_ok[*u8, str](res_realloc);
         st.buf.cap  = new_cap;
     }
 
-    # slide the tail down, copying high-to-low so overlapping ranges stay intact.
     var i: usize = st.buf.len;
     for (i > p) {
         i = i - 1;
@@ -2280,9 +1486,6 @@ pub fun insert_text(st: *EncodeState, pos: u32, nbytes: u32) R.Result[bool, str]
         if (st.relocs[ri].offset >= pos) { st.relocs[ri].offset = st.relocs[ri].offset + nbytes; }
         ri = ri + 1;
     }
-    # a frame record's steps are function-relative and a gap never opens inside a
-    # prologue (relaxation patches branches, and no prologue holds one), so only
-    # the function-start offset shifts.
     var fri: u32 = 0;
     for (fri < st.frame_count) {
         if (st.frames[fri].offset >= pos) { st.frames[fri].offset = st.frames[fri].offset + nbytes; }
@@ -2296,7 +1499,6 @@ pub fun insert_text(st: *EncodeState, pos: u32, nbytes: u32) R.Result[bool, str]
     var vli: u32 = 0;
     for (vli < st.varloc_count) {
         if (st.varlocs[vli].text_offset >= pos) { st.varlocs[vli].text_offset = st.varlocs[vli].text_offset + nbytes; }
-        # a bounded compare range's end shifts with the text like its start.
         if (st.varlocs[vli].end_offset != 0 && st.varlocs[vli].end_offset >= pos) {
             st.varlocs[vli].end_offset = st.varlocs[vli].end_offset + nbytes;
         }
@@ -2307,10 +1509,6 @@ pub fun insert_text(st: *EncodeState, pos: u32, nbytes: u32) R.Result[bool, str]
         if (st.inline_pcs[ipi].text_offset >= pos) { st.inline_pcs[ipi].text_offset = st.inline_pcs[ipi].text_offset + nbytes; }
         ipi = ipi + 1;
     }
-    # a buffered assembly notification names the instruction at an offset, so it
-    # shifts with the text exactly as the block and fixup offsets do; a note left
-    # behind would have the relaxation pass rewrite the wrong instruction on its next
-    # iteration and the artifact would name a form the object does not hold.
     if (st.buf.asm != nil) {
         var ni: u32 = 0;
         for (ni < st.buf.asm.note_count) {
@@ -2318,153 +1516,47 @@ pub fun insert_text(st: *EncodeState, pos: u32, nbytes: u32) R.Result[bool, str]
             ni = ni + 1;
         }
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# grow the symbol-mark array, allocating it on first use
-# ---
-# st:  the state whose symbol array is grown
-# ret: ok(true) once the array has room, or an allocation error
-fun grow_symbols(st: *EncodeState) R.Result[bool, str] {
-    if (st.syms == nil) {
-        val res_alloc: R.Result[*SymbolMark, str] = A.allocate[SymbolMark](st.alloc, DRIVER_INIT_CAP::usize);
-        if (R.is_err[*SymbolMark, str](res_alloc)) { ret R.err[bool, str](R.unwrap_err[*SymbolMark, str](res_alloc)); }
-        st.syms    = R.unwrap_ok[*SymbolMark, str](res_alloc);
-        st.sym_cap = DRIVER_INIT_CAP;
-        ret R.ok[bool, str](true);
-    }
-    val new_cap: u32 = st.sym_cap * 2;
-    val res_realloc: R.Result[*SymbolMark, str] = A.reallocate[SymbolMark](st.alloc, st.syms, st.sym_cap::usize, new_cap::usize);
-    if (R.is_err[*SymbolMark, str](res_realloc)) { ret R.err[bool, str](R.unwrap_err[*SymbolMark, str](res_realloc)); }
-    st.syms    = R.unwrap_ok[*SymbolMark, str](res_realloc);
-    st.sym_cap = new_cap;
-    ret R.ok[bool, str](true);
+fun grow_symbols(st: *EncodeState) R.Result[R.Void, str] {
+    ret grow_cap[SymbolMark](st.alloc, ?st.syms, ?st.sym_cap, DRIVER_INIT_CAP);
 }
 
-# grow the relocation array, allocating it on first use
-# ---
-# st:  the state whose relocation array is grown
-# ret: ok(true) once the array has room, or an allocation error
-fun grow_relocs(st: *EncodeState) R.Result[bool, str] {
-    if (st.relocs == nil) {
-        val res_alloc: R.Result[*PendingReloc, str] = A.allocate[PendingReloc](st.alloc, DRIVER_INIT_CAP::usize);
-        if (R.is_err[*PendingReloc, str](res_alloc)) { ret R.err[bool, str](R.unwrap_err[*PendingReloc, str](res_alloc)); }
-        st.relocs    = R.unwrap_ok[*PendingReloc, str](res_alloc);
-        st.reloc_cap = DRIVER_INIT_CAP;
-        ret R.ok[bool, str](true);
-    }
-    val new_cap: u32 = st.reloc_cap * 2;
-    val res_realloc: R.Result[*PendingReloc, str] = A.reallocate[PendingReloc](st.alloc, st.relocs, st.reloc_cap::usize, new_cap::usize);
-    if (R.is_err[*PendingReloc, str](res_realloc)) { ret R.err[bool, str](R.unwrap_err[*PendingReloc, str](res_realloc)); }
-    st.relocs    = R.unwrap_ok[*PendingReloc, str](res_realloc);
-    st.reloc_cap = new_cap;
-    ret R.ok[bool, str](true);
+fun grow_relocs(st: *EncodeState) R.Result[R.Void, str] {
+    ret grow_cap[PendingReloc](st.alloc, ?st.relocs, ?st.reloc_cap, DRIVER_INIT_CAP);
 }
 
-# grow the branch-fixup array, allocating it on first use
-# ---
-# st:  the state whose fixup array is grown
-# ret: ok(true) once the array has room, or an allocation error
-fun grow_fixups(st: *EncodeState) R.Result[bool, str] {
-    if (st.fixups == nil) {
-        val res_alloc: R.Result[*BranchFixup, str] = A.allocate[BranchFixup](st.alloc, DRIVER_INIT_CAP::usize);
-        if (R.is_err[*BranchFixup, str](res_alloc)) { ret R.err[bool, str](R.unwrap_err[*BranchFixup, str](res_alloc)); }
-        st.fixups    = R.unwrap_ok[*BranchFixup, str](res_alloc);
-        st.fixup_cap = DRIVER_INIT_CAP;
-        ret R.ok[bool, str](true);
-    }
-    val new_cap: u32 = st.fixup_cap * 2;
-    val res_realloc: R.Result[*BranchFixup, str] = A.reallocate[BranchFixup](st.alloc, st.fixups, st.fixup_cap::usize, new_cap::usize);
-    if (R.is_err[*BranchFixup, str](res_realloc)) { ret R.err[bool, str](R.unwrap_err[*BranchFixup, str](res_realloc)); }
-    st.fixups    = R.unwrap_ok[*BranchFixup, str](res_realloc);
-    st.fixup_cap = new_cap;
-    ret R.ok[bool, str](true);
+fun grow_fixups(st: *EncodeState) R.Result[R.Void, str] {
+    ret grow_cap[BranchFixup](st.alloc, ?st.fixups, ?st.fixup_cap, DRIVER_INIT_CAP);
 }
 
-# grow the block-offset array, allocating it on first use
-# ---
-# st:  the state whose block-offset array is grown
-# ret: ok(true) once the array has room, or an allocation error
-fun grow_blocks(st: *EncodeState) R.Result[bool, str] {
-    if (st.blocks == nil) {
-        val res_alloc: R.Result[*BlockOffset, str] = A.allocate[BlockOffset](st.alloc, DRIVER_INIT_CAP::usize);
-        if (R.is_err[*BlockOffset, str](res_alloc)) { ret R.err[bool, str](R.unwrap_err[*BlockOffset, str](res_alloc)); }
-        st.blocks    = R.unwrap_ok[*BlockOffset, str](res_alloc);
-        st.block_cap = DRIVER_INIT_CAP;
-        ret R.ok[bool, str](true);
-    }
-    val new_cap: u32 = st.block_cap * 2;
-    val res_realloc: R.Result[*BlockOffset, str] = A.reallocate[BlockOffset](st.alloc, st.blocks, st.block_cap::usize, new_cap::usize);
-    if (R.is_err[*BlockOffset, str](res_realloc)) { ret R.err[bool, str](R.unwrap_err[*BlockOffset, str](res_realloc)); }
-    st.blocks    = R.unwrap_ok[*BlockOffset, str](res_realloc);
-    st.block_cap = new_cap;
-    ret R.ok[bool, str](true);
+fun grow_blocks(st: *EncodeState) R.Result[R.Void, str] {
+    ret grow_cap[BlockOffset](st.alloc, ?st.blocks, ?st.block_cap, DRIVER_INIT_CAP);
 }
 
-# grow the line-row array, allocating it on first use
-# ---
-# st:  the state whose row array is grown
-# ret: ok(true) once the array has room, or an allocation error
-fun grow_rows(st: *EncodeState) R.Result[bool, str] {
-    if (st.rows == nil) {
-        val res_alloc: R.Result[*LineRow, str] = A.allocate[LineRow](st.alloc, DRIVER_INIT_CAP::usize);
-        if (R.is_err[*LineRow, str](res_alloc)) { ret R.err[bool, str](R.unwrap_err[*LineRow, str](res_alloc)); }
-        st.rows    = R.unwrap_ok[*LineRow, str](res_alloc);
-        st.row_cap = DRIVER_INIT_CAP;
-        ret R.ok[bool, str](true);
-    }
-    val new_cap: u32 = st.row_cap * 2;
-    val res_realloc: R.Result[*LineRow, str] = A.reallocate[LineRow](st.alloc, st.rows, st.row_cap::usize, new_cap::usize);
-    if (R.is_err[*LineRow, str](res_realloc)) { ret R.err[bool, str](R.unwrap_err[*LineRow, str](res_realloc)); }
-    st.rows    = R.unwrap_ok[*LineRow, str](res_realloc);
-    st.row_cap = new_cap;
-    ret R.ok[bool, str](true);
+fun grow_rows(st: *EncodeState) R.Result[R.Void, str] {
+    ret grow_cap[LineRow](st.alloc, ?st.rows, ?st.row_cap, DRIVER_INIT_CAP);
 }
 
-# grow the inline-pc transition array, allocating it on first use
-# ---
-# st:  the state whose inline-pc array is grown
-# ret: ok(true) once the array has room, or an allocation error
-fun grow_inline_pcs(st: *EncodeState) R.Result[bool, str] {
-    if (st.inline_pcs == nil) {
-        val res_alloc: R.Result[*InlinePc, str] = A.allocate[InlinePc](st.alloc, DRIVER_INIT_CAP::usize);
-        if (R.is_err[*InlinePc, str](res_alloc)) { ret R.err[bool, str](R.unwrap_err[*InlinePc, str](res_alloc)); }
-        st.inline_pcs    = R.unwrap_ok[*InlinePc, str](res_alloc);
-        st.inline_pc_cap = DRIVER_INIT_CAP;
-        ret R.ok[bool, str](true);
-    }
-    val new_cap: u32 = st.inline_pc_cap * 2;
-    val res_realloc: R.Result[*InlinePc, str] = A.reallocate[InlinePc](st.alloc, st.inline_pcs, st.inline_pc_cap::usize, new_cap::usize);
-    if (R.is_err[*InlinePc, str](res_realloc)) { ret R.err[bool, str](R.unwrap_err[*InlinePc, str](res_realloc)); }
-    st.inline_pcs    = R.unwrap_ok[*InlinePc, str](res_realloc);
-    st.inline_pc_cap = new_cap;
-    ret R.ok[bool, str](true);
+fun grow_inline_pcs(st: *EncodeState) R.Result[R.Void, str] {
+    ret grow_cap[InlinePc](st.alloc, ?st.inline_pcs, ?st.inline_pc_cap, DRIVER_INIT_CAP);
 }
 
-# record that at `text_offset` the active inline instance becomes `inline_site`. Only a
-# CHANGE from the previously active instance appends a record, so a run of instructions
-# in one instance forms a single range `[text_offset, next_offset)`. Called for every
-# instruction at its first byte; a no-op for the common body-to-body (0) run.
-# ---
-# st:          the encode state
-# text_offset: `.text` offset of the instruction being encoded
-# inline_site: the instruction's inline instance (0 = function body)
-# ret:         ok(true), or an allocation error
-pub fun push_inline_pc(st: *EncodeState, text_offset: u32, inline_site: u32) R.Result[bool, str] {
-    if (inline_site == st.last_inline_site) { ret R.ok[bool, str](true); }
+pub fun push_inline_pc(st: *EncodeState, text_offset: u32, inline_site: u32) R.Result[R.Void, str] {
+    if (inline_site == st.last_inline_site) { ret R.ok_void[str](); }
     if (st.inline_pc_count >= st.inline_pc_cap) {
-        val res_grow: R.Result[bool, str] = grow_inline_pcs(st);
-        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+        val res_grow: R.Result[R.Void, str] = grow_inline_pcs(st);
+        if (R.is_err[R.Void, str](res_grow)) { ret res_grow; }
     }
     st.inline_pcs[st.inline_pc_count].text_offset = text_offset;
     st.inline_pcs[st.inline_pc_count].sec         = 0;
     st.inline_pcs[st.inline_pc_count].inline_site = inline_site;
     st.inline_pc_count  = st.inline_pc_count + 1;
     st.last_inline_site = inline_site;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# write `n` in decimal into `buf` starting at `at`, returning the next position
 fun put_decimal(buf: *u8, at: usize, n: usize) usize {
     var digits: [20]u8;
     var d: usize = 0;
@@ -2484,19 +1576,6 @@ fun put_decimal(buf: *u8, at: usize, n: usize) usize {
     ret k;
 }
 
-# prefix an inline-asm diagnostic with its statement's source position
-#
-# Resolves `loc` through the state's source map to "path:line:col: <msg>",
-# interned into the session interner so the located message outlives the encode
-# (a parallel worker's message is additionally re-homed at the pool boundary).
-# Returns `msg` unchanged when the state carries no source map or interner (the
-# encoder unit tests' minimal states), the loc names no file (a synthetic MIR),
-# or building the prefixed text fails - the diagnostic itself is never lost.
-# ---
-# st:  the encode state (source map + interner)
-# loc: the erring instruction's source location
-# msg: the diagnostic text to prefix
-# ret: "path:line:col: <msg>" when resolvable, else `msg`
 pub fun asm_located_message(st: *EncodeState, loc: source.SrcLoc, msg: str) str {
     if (st.srcmap == nil || st.interner == nil) { ret msg; }
     if (!source.loc_is_valid(loc)) { ret msg; }
@@ -2505,7 +1584,6 @@ pub fun asm_located_message(st: *EncodeState, loc: source.SrcLoc, msg: str) str 
     val file: *source.SourceFile = O.unwrap[*source.SourceFile](fo);
     val pos: source.Position = source.position(file, loc.offset);
 
-    # "<path>:<line>:<col>: <msg>" - two u64s render in at most 20 digits each.
     val lp: usize = str_len(file.path);
     val lm: usize = str_len(msg);
     val total_cap: usize = lp + 1 + 20 + 1 + 20 + 2 + lm + 1;
@@ -2534,12 +1612,6 @@ pub fun asm_located_message(st: *EncodeState, loc: source.SrcLoc, msg: str) str 
     ret msg;
 }
 
-# a 64-bit register machine for the tests in this file
-#
-# The bookkeeping these tests exercise - line rows, varlocs, text insertion, constant
-# interning - reads no width at all, so any consistent machine serves. It is still
-# stated rather than left nil, because `state_blank` takes the machine positionally
-# precisely so that no state exists without one.
 var t_model: isa.MachineModel;
 fun t_machine() *isa.MachineModel {
     t_model.pointer_width = 8;
@@ -2551,16 +1623,10 @@ fun t_machine() *isa.MachineModel {
     ret ?t_model;
 }
 
-# a minimal encode state for the row / varloc / insert_text unit tests: a text sink and
-# an empty set of mark / reloc / fixup / block / row / varloc arrays, no interner or
-# vtables
 fun t_row_state(alloc: *A.Allocator, st: *EncodeState) {
     state_blank(st, alloc, t_machine());
 }
 
-# push_row drops a location naming no file, and insert_text (branch relaxation)
-# advances every line row at or past the gap while leaving earlier rows put - so a
-# row's text_offset keeps pointing at its instruction after the text grows
 test "mach.lang.be.codegen.encode.insert_text:shifts_line_rows" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -2568,27 +1634,22 @@ test "mach.lang.be.codegen.encode.insert_text:shifts_line_rows" {
     var st: EncodeState;
     t_row_state(?alloc, ?st);
 
-    # a 12-byte placeholder .text so insert_text has bytes to slide.
     var i: u32 = 0;
     for (i < 12) { emit_byte(?st.buf, 0x90); i = i + 1; }
 
-    # three real rows at 0 / 4 / 8, plus a nil-location row that must be dropped.
-    val r0: R.Result[bool, str] = push_row(?st, 0, source.loc(1, 100)); if (R.is_err[bool, str](r0)) { ret 1; }
-    val r1: R.Result[bool, str] = push_row(?st, 4, source.loc(1, 200)); if (R.is_err[bool, str](r1)) { ret 1; }
-    val rn: R.Result[bool, str] = push_row(?st, 4, source.loc_nil());   if (R.is_err[bool, str](rn)) { ret 1; }
-    val r2: R.Result[bool, str] = push_row(?st, 8, source.loc(1, 300)); if (R.is_err[bool, str](r2)) { ret 1; }
+    val r0: R.Result[R.Void, str] = push_row(?st, 0, source.loc(1, 100)); if (R.is_err[R.Void, str](r0)) { ret 1; }
+    val r1: R.Result[R.Void, str] = push_row(?st, 4, source.loc(1, 200)); if (R.is_err[R.Void, str](r1)) { ret 1; }
+    val rn: R.Result[R.Void, str] = push_row(?st, 4, source.loc_nil());   if (R.is_err[R.Void, str](rn)) { ret 1; }
+    val r2: R.Result[R.Void, str] = push_row(?st, 8, source.loc(1, 300)); if (R.is_err[R.Void, str](r2)) { ret 1; }
     if (st.row_count != 3) { buf_dnit(?st.buf); ret 1; }
 
-    # open a 4-byte gap at offset 4 (as a relaxed branch would).
-    val it: R.Result[bool, str] = insert_text(?st, 4, 4);
-    if (R.is_err[bool, str](it)) { buf_dnit(?st.buf); ret 1; }
+    val it: R.Result[R.Void, str] = insert_text(?st, 4, 4);
+    if (R.is_err[R.Void, str](it)) { buf_dnit(?st.buf); ret 1; }
 
     var code: i32 = 0;
-    # the row before the gap is untouched; the rows at/after it advance by 4.
     if (st.rows[0].text_offset != 0)  { code = 1; }
     if (st.rows[1].text_offset != 8)  { code = 1; }
     if (st.rows[2].text_offset != 12) { code = 1; }
-    # the source locations ride along unchanged.
     if (st.rows[1].loc.offset != 200) { code = 1; }
 
     buf_dnit(?st.buf);
@@ -2596,10 +1657,6 @@ test "mach.lang.be.codegen.encode.insert_text:shifts_line_rows" {
     ret code;
 }
 
-# push_varloc resolves a source-variable binding's vreg to its post-regalloc home: an
-# assigned register (VARLOC_REG), a spill slot (VARLOC_FRAME), or - for a vreg with
-# neither, a value referenced only by debug and left dead by regalloc - VARLOC_NONE (an
-# optimized-out binding), never a stale register id or a panic
 test "mach.lang.be.codegen.encode.push_varloc:reg_frame_dead" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -2608,8 +1665,6 @@ test "mach.lang.be.codegen.encode.push_varloc:reg_frame_dead" {
     var st: EncodeState;
     t_row_state(?alloc, ?st);
 
-    # vreg 0 -> physical register 7; vreg 1 -> spill slot at frame offset -16;
-    # vreg 2 -> no home (dead).
     var vregs: [3]mir.MirVReg;
     vregs[0].id = 0; vregs[0].class = 0; vregs[0].spill_slot = -1; vregs[0].assigned = 7;
     vregs[1].id = 1; vregs[1].class = 0; vregs[1].spill_slot = 0;  vregs[1].assigned = mir.MIR_VREG_NIL;
@@ -2623,9 +1678,9 @@ test "mach.lang.be.codegen.encode.push_varloc:reg_frame_dead" {
     fn.frame.slots = ?slots[0]; fn.frame.slot_count = 1; fn.frame.slot_cap = 1;
     fn.frame.size = 0; fn.frame.align = 0; fn.frame.outgoing_size = 0;
 
-    val ra: R.Result[bool, str] = push_varloc(?st, 0, ?fn, 0, 100); if (R.is_err[bool, str](ra)) { code = 1; }
-    val rb: R.Result[bool, str] = push_varloc(?st, 4, ?fn, 1, 101); if (R.is_err[bool, str](rb)) { code = 1; }
-    val rc: R.Result[bool, str] = push_varloc(?st, 8, ?fn, 2, 102); if (R.is_err[bool, str](rc)) { code = 1; }
+    val ra: R.Result[R.Void, str] = push_varloc(?st, 0, ?fn, 0, 100); if (R.is_err[R.Void, str](ra)) { code = 1; }
+    val rb: R.Result[R.Void, str] = push_varloc(?st, 4, ?fn, 1, 101); if (R.is_err[R.Void, str](rb)) { code = 1; }
+    val rc: R.Result[R.Void, str] = push_varloc(?st, 8, ?fn, 2, 102); if (R.is_err[R.Void, str](rc)) { code = 1; }
 
     if (st.varloc_count != 3) { code = 1; }
     if (st.varlocs[0].kind != VARLOC_REG || st.varlocs[0].reg != 7 || st.varlocs[0].iid != 100) { code = 1; }
@@ -2637,12 +1692,6 @@ test "mach.lang.be.codegen.encode.push_varloc:reg_frame_dead" {
     ret code;
 }
 
-# a fused-condition compare binding records the computed relation over both
-# operand homes (register / spill slot / immediate), digested for the producer
-# (relation + signedness + width), and close_cmp_varlocs bounds each such record
-# to the fused terminator's byte extent while a plain record at the same offset
-# keeps its linear-rule 0. a compare binding with a homeless operand degrades to
-# a plain optimized-out record
 test "mach.lang.be.codegen.encode.push_cmp_varloc:homes_digest_and_close" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -2651,7 +1700,6 @@ test "mach.lang.be.codegen.encode.push_cmp_varloc:homes_digest_and_close" {
     var st: EncodeState;
     t_row_state(?alloc, ?st);
 
-    # vreg 0 -> register 7; vreg 1 -> spill slot at -16; vreg 2 -> no home.
     var vregs: [3]mir.MirVReg;
     vregs[0].id = 0; vregs[0].class = 0; vregs[0].spill_slot = -1; vregs[0].assigned = 7;
     vregs[1].id = 1; vregs[1].class = 0; vregs[1].spill_slot = 0;  vregs[1].assigned = mir.MIR_VREG_NIL;
@@ -2665,31 +1713,27 @@ test "mach.lang.be.codegen.encode.push_cmp_varloc:homes_digest_and_close" {
     fn.frame.slots = ?slots[0]; fn.frame.slot_count = 1; fn.frame.slot_cap = 1;
     fn.frame.size = 0; fn.frame.align = 0; fn.frame.outgoing_size = 0;
 
-    # unsigned i16 less-than of (reg vreg 0) against (imm 40000), bound at PC 12.
     var bind: mir.MirDbgBinding;
     bind.iid = 100; bind.cmp_op = mir.MIR_SEL_CBR_LT_U; bind.cmp_width = 2;
     bind.lhs_is_imm = false; bind.vreg = 0; bind.imm = 0;
     bind.rhs_is_imm = true;  bind.vreg2 = mir.MIR_VREG_NIL; bind.imm2 = 40000;
-    val ra: R.Result[bool, str] = push_cmp_varloc(?st, 12, ?fn, ?bind);
-    if (R.is_err[bool, str](ra)) { code = 1; }
+    val ra: R.Result[R.Void, str] = push_cmp_varloc(?st, 12, ?fn, ?bind);
+    if (R.is_err[R.Void, str](ra)) { code = 1; }
 
-    # signed le of (spilled vreg 1) against (reg vreg 0), same terminator.
     bind.iid = 101; bind.cmp_op = mir.MIR_SEL_CBR_LE_S; bind.cmp_width = 8;
     bind.lhs_is_imm = false; bind.vreg = 1;
     bind.rhs_is_imm = false; bind.vreg2 = 0;
-    val rb: R.Result[bool, str] = push_cmp_varloc(?st, 12, ?fn, ?bind);
-    if (R.is_err[bool, str](rb)) { code = 1; }
+    val rb: R.Result[R.Void, str] = push_cmp_varloc(?st, 12, ?fn, ?bind);
+    if (R.is_err[R.Void, str](rb)) { code = 1; }
 
-    # a plain binding at the same offset stays open under the linear rule.
-    val rp: R.Result[bool, str] = push_varloc(?st, 12, ?fn, 0, 102);
-    if (R.is_err[bool, str](rp)) { code = 1; }
+    val rp: R.Result[R.Void, str] = push_varloc(?st, 12, ?fn, 0, 102);
+    if (R.is_err[R.Void, str](rp)) { code = 1; }
 
-    # a compare whose operand has no home degrades to a plain optimized-out gap.
     bind.iid = 103; bind.cmp_op = mir.MIR_SEL_CBR_EQ; bind.cmp_width = 4;
     bind.lhs_is_imm = false; bind.vreg = 2;
     bind.rhs_is_imm = true;  bind.imm2 = 0;
-    val rd: R.Result[bool, str] = push_cmp_varloc(?st, 12, ?fn, ?bind);
-    if (R.is_err[bool, str](rd)) { code = 1; }
+    val rd: R.Result[R.Void, str] = push_cmp_varloc(?st, 12, ?fn, ?bind);
+    if (R.is_err[R.Void, str](rd)) { code = 1; }
 
     close_cmp_varlocs(?st, 12, 20);
 
@@ -2717,10 +1761,6 @@ test "mach.lang.be.codegen.encode.push_cmp_varloc:homes_digest_and_close" {
     ret code;
 }
 
-# push_varloc resolves a register-passed aggregate parameter - a vreg with no assigned
-# register and no regalloc spill, but owning the mir.SLOT_SPILL slot its bytes are
-# reconstructed into - to a direct frame location (VARLOC_FRAME with off_storage set), so
-# the parameter is locatable rather than silently omitted (#1954)
 test "mach.lang.be.codegen.encode.push_varloc:slot_spill_owner_is_direct_frame" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -2729,8 +1769,6 @@ test "mach.lang.be.codegen.encode.push_varloc:slot_spill_owner_is_direct_frame" 
     var st: EncodeState;
     t_row_state(?alloc, ?st);
 
-    # vreg 0 owns a mir.SLOT_SPILL slot at -32 (its reconstructed aggregate bytes): no
-    # assigned register and no regalloc spill.
     var vregs: [1]mir.MirVReg;
     vregs[0].id = 0; vregs[0].class = 0; vregs[0].spill_slot = -1; vregs[0].assigned = mir.MIR_VREG_NIL;
 
@@ -2742,11 +1780,9 @@ test "mach.lang.be.codegen.encode.push_varloc:slot_spill_owner_is_direct_frame" 
     fn.frame.slots = ?slots[0]; fn.frame.slot_count = 1; fn.frame.slot_cap = 1;
     fn.frame.size = 0; fn.frame.align = 0; fn.frame.outgoing_size = 0;
 
-    val r: R.Result[bool, str] = push_varloc(?st, 0, ?fn, 0, 200); if (R.is_err[bool, str](r)) { code = 1; }
+    val r: R.Result[R.Void, str] = push_varloc(?st, 0, ?fn, 0, 200); if (R.is_err[R.Void, str](r)) { code = 1; }
 
     if (st.varloc_count != 1) { code = 1; }
-    # a direct frame location at the slot offset, flagged storage so the producer omits the
-    # byref pointer deref.
     if (st.varlocs[0].kind != VARLOC_FRAME || st.varlocs[0].off != -32 || !st.varlocs[0].off_storage) { code = 1; }
 
     if (st.varlocs != nil && st.varloc_cap > 0) { A.deallocate[VarLoc](?alloc, st.varlocs, st.varloc_cap::usize); }
@@ -2754,9 +1790,6 @@ test "mach.lang.be.codegen.encode.push_varloc:slot_spill_owner_is_direct_frame" 
     ret code;
 }
 
-# the `--emit-asm` totality guard: bytes an ISA emits without notifying the sink
-# stay visible, so an unrendered emission path is reported rather than silently
-# dropped from the artifact (#2187)
 test "mach.lang.be.codegen.encode.sink_unaccounted:tracks_unrendered_bytes" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -2767,27 +1800,20 @@ test "mach.lang.be.codegen.encode.sink_unaccounted:tracks_unrendered_bytes" {
 
     var bad: i32 = 0;
 
-    # nothing emitted yet, nothing outstanding
     if (sink_unaccounted(?buf) != 0) { bad = 1; }
 
-    # three bytes emitted with no notification: all three are unaccounted, which is
-    # what makes a printer that skips an instruction impossible to ship quietly
     emit_byte(?buf, 0x90);
     emit_byte(?buf, 0x90);
     emit_byte(?buf, 0x90);
     if (sink_unaccounted(?buf) != 3) { bad = 1; }
 
-    # rendering that instruction clears the debt
     sink_claim(?buf, 0);
     if (sink_unaccounted(?buf) != 0) { bad = 1; }
 
-    # and the next unrendered emission is counted on its own, not cumulatively
     emit_byte(?buf, 0xCC);
     emit_byte(?buf, 0xCC);
     if (sink_unaccounted(?buf) != 2) { bad = 1; }
 
-    # a buffer with no sink attached never reports a debt, so an object-producing
-    # encode is unaffected by any of this
     var plain: ByteBuf = buf_init(?alloc);
     emit_byte(?plain, 0x90);
     if (sink_unaccounted(?plain) != 0) { bad = 1; }
@@ -2797,15 +1823,6 @@ test "mach.lang.be.codegen.encode.sink_unaccounted:tracks_unrendered_bytes" {
     ret bad;
 }
 
-# the blind spot #2250 closed: a notification dropped in the MIDDLE of a sequence is
-# not absorbed by the next one
-#
-# A claim declares the offset its instruction started at, so the successor of a
-# dropped notification claims a range that does not begin at the cursor. The claim is
-# refused, the skipped bytes stay outstanding, and the ISA's per-opcode guard fails
-# the build. A running high-water mark could not tell the two cases apart: it moved to
-# the buffer end either way and only a miss at the very end of a MIR opcode survived
-# to be seen.
 test "mach.lang.be.codegen.encode.sink_claim:refuses_a_claim_that_skips_bytes" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -2816,19 +1833,14 @@ test "mach.lang.be.codegen.encode.sink_claim:refuses_a_claim_that_skips_bytes" {
 
     var bad: i32 = 0;
 
-    # two four-byte instructions, only the second notified - the shape a dropped
-    # notification takes mid-sequence.
     emit_u32(?buf, 0xD503201F);
     emit_u32(?buf, 0xD503201F);
     sink_claim(?buf, 4);
 
-    # the claim is refused, so the first instruction's bytes are still outstanding and
-    # nothing was counted as rendered
     if (sink_unaccounted(?buf) != 8) { bad = 1; }
     if (sink_claims(?buf) != 0)      { bad = 1; }
     if (sink.refused != 1)           { bad = 1; }
 
-    # the same two instructions, both notified, tile the text exactly
     var ok_buf: ByteBuf = buf_init(?alloc);
     var ok_sink: AsmSink = sink_init(nil, nil);
     ok_buf.asm = ?ok_sink;
@@ -2841,8 +1853,6 @@ test "mach.lang.be.codegen.encode.sink_claim:refuses_a_claim_that_skips_bytes" {
     if (sink_claims(?ok_buf) != 2)      { bad = 1; }
     if (ok_sink.refused != 0)           { bad = 1; }
 
-    # a notification covering no bytes is refused too: it would describe an
-    # instruction the encoder never emitted
     sink_claim(?ok_buf, 8);
     if (sink_claims(?ok_buf) != 2) { bad = 1; }
     if (ok_sink.refused != 1)      { bad = 1; }
@@ -2852,15 +1862,6 @@ test "mach.lang.be.codegen.encode.sink_claim:refuses_a_claim_that_skips_bytes" {
     ret bad;
 }
 
-# interning keys on the WHOLE identity - kind, width, alignment, and every byte of
-# the image - not on the bytes alone
-#
-# The kind arm cannot be reached through any front-end program today: only
-# CONST_F32 and CONST_F64 are interned, and their widths already differ, so the
-# width alone separates them. It is exercised here directly, because the member
-# that makes it load-bearing is an eight-byte VECTOR constant - which can carry an
-# f64's exact bit pattern - and a key that dropped the kind would hand both uses
-# one entry with no test anywhere able to see it.
 test "mach.lang.be.codegen.encode.intern_const:key_is_the_whole_identity" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -2872,8 +1873,6 @@ test "mach.lang.be.codegen.encode.intern_const:key_is_the_whole_identity" {
 
     var code: i32 = 0;
 
-    # the same bytes under the same kind intern once, and the second use is handed
-    # the first entry's symbol
     var a: [8]u8;
     var b: [8]u8;
     var k: u32 = 0;
@@ -2887,7 +1886,6 @@ test "mach.lang.be.codegen.encode.intern_const:key_is_the_whole_identity" {
         if (st.const_count != 1) { code = 1; }
     }
 
-    # one byte different is a different constant, however deep in the image
     var c: [8]u8;
     k = 0;
     for (k < 8) { c[k] = a[k]; k = k + 1; }
@@ -2899,9 +1897,6 @@ test "mach.lang.be.codegen.encode.intern_const:key_is_the_whole_identity" {
         if (st.const_count != 2) { code = 1; }
     }
 
-    # the SAME eight bytes under a different KIND is a different entry. this is the
-    # arm no reachable program exercises, and the one an eight-byte vector constant
-    # will land on
     val s3: R.Result[intern.StrId, str] = intern_const(?st, ?a[0], 8, CONST_VEC);
     if (R.is_err[intern.StrId, str](s3)) { code = 1; }
     or {
@@ -2909,14 +1904,11 @@ test "mach.lang.be.codegen.encode.intern_const:key_is_the_whole_identity" {
         if (st.const_count != 3) { code = 1; }
     }
 
-    # every entry keeps its own byte image; the copy is the pool's, not the caller's
     a[0] = 0xFF;
     if (st.consts[0].bytes[0] != 0x11) { code = 1; }
     if (st.consts[0].len != 8 || st.consts[0].kind != CONST_F64) { code = 1; }
     if (st.consts[2].kind != CONST_VEC) { code = 1; }
 
-    # a zero-length constant is a caller bug, refused rather than interned as an
-    # entry every other zero-length constant would then share
     if (!R.is_err[intern.StrId, str](intern_const(?st, ?a[0], 0, CONST_F64))) { code = 1; }
 
     consts_free(?alloc, st.consts, st.const_count, st.const_cap);
@@ -2925,14 +1917,6 @@ test "mach.lang.be.codegen.encode.intern_const:key_is_the_whole_identity" {
     ret code;
 }
 
-# a float constant is laid out at ITS OWN width, and the bit pattern is compared
-# rather than the value it denotes
-#
-# `-0.0` and `+0.0` are equal as floats and distinct as constants (#2274 is the
-# regression pin for that sign being dropped), so a pool that compared values would
-# hand a `-0.0` use the `+0.0` entry. And an f32 entry is four bytes, not the low
-# four of an eight-byte image: a four-byte load off an f64's image reads the
-# mantissa's low half, which is a different number entirely.
 test "mach.lang.be.codegen.encode.intern_float_const:width_and_bit_pattern" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -2944,7 +1928,6 @@ test "mach.lang.be.codegen.encode.intern_float_const:width_and_bit_pattern" {
 
     var code: i32 = 0;
 
-    # 1.5 as an f32 (0x3FC00000) is four bytes, little-endian, and nothing beyond
     val f32r: R.Result[intern.StrId, str] = intern_float_const(?st, 0x3FC00000, 4);
     if (R.is_err[intern.StrId, str](f32r)) { code = 1; }
     or {
@@ -2958,9 +1941,6 @@ test "mach.lang.be.codegen.encode.intern_float_const:width_and_bit_pattern" {
         if (st.consts[0].bytes[3] != 0x3F) { code = 1; }
     }
 
-    # 0.125 as an f64 is 0x3FC0000000000000: the SAME leading hex digits, eight
-    # bytes, and a distinct entry - the f32 above is not its prefix and must not
-    # match it
     val f64r: R.Result[intern.StrId, str] = intern_float_const(?st, 0x3FC0000000000000, 8);
     if (R.is_err[intern.StrId, str](f64r)) { code = 1; }
     or {
@@ -2971,7 +1951,6 @@ test "mach.lang.be.codegen.encode.intern_float_const:width_and_bit_pattern" {
         if (st.consts[1].bytes[0] != 0x00) { code = 1; }
     }
 
-    # -0.0 and +0.0 compare EQUAL as floats and are two entries here
     val negz: R.Result[intern.StrId, str] = intern_float_const(?st, 0x8000000000000000, 8);
     val posz: R.Result[intern.StrId, str] = intern_float_const(?st, 0, 8);
     if (R.is_err[intern.StrId, str](negz) || R.is_err[intern.StrId, str](posz)) { code = 1; }
@@ -2988,24 +1967,129 @@ test "mach.lang.be.codegen.encode.intern_float_const:width_and_bit_pattern" {
     ret code;
 }
 
-# a pool entry's alignment is decided from its kind and width in ONE place, and a
-# vector is aligned to its own width rounded up to a power of two
-#
-# The rule has to hold for a width WIDER THAN A REGISTER (#2727), where the load is
-# several register-width reads at power-of-two offsets from the entry's base: the
-# base's alignment is what makes each of those reads aligned, so it has to be the
-# whole entry's width and not the register's
 test "mach.lang.be.codegen.encode.const_align:one_rule_including_over_width" {
     var code: i32 = 0;
     if (const_align(CONST_F32, 4)  != 4)  { code = 1; }
     if (const_align(CONST_F64, 8)  != 8)  { code = 1; }
     if (const_align(CONST_VEC, 16) != 16) { code = 1; }
-    # a vector narrower than a full register is aligned to its own width
     if (const_align(CONST_VEC, 8)  != 8)  { code = 1; }
-    # and one wider than a register is aligned to ITS width, not to 16
     if (const_align(CONST_VEC, 32) != 32) { code = 1; }
     if (const_align(CONST_VEC, 64) != 64) { code = 1; }
-    # a non-power-of-two width rounds up, so the guarantee is never weaker than asked
     if (const_align(CONST_VEC, 12) != 16) { code = 1; }
     ret code;
+}
+
+rec EncodeGrowthProbe {
+    reallocate_calls: u32;
+    allocate_calls:   u32;
+}
+
+fun encode_growth_probe_allocate(ctx: ptr, size: usize, align: usize) O.Option[ptr] {
+    val g: *EncodeGrowthProbe = ctx::*EncodeGrowthProbe;
+    g.allocate_calls = g.allocate_calls + 1;
+    ret O.none[ptr]();
+}
+
+fun encode_growth_probe_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) O.Option[ptr] {
+    val g: *EncodeGrowthProbe = ctx::*EncodeGrowthProbe;
+    g.reallocate_calls = g.reallocate_calls + 1;
+    ret O.none[ptr]();
+}
+
+fun encode_growth_probe_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
+    ret 0;
+}
+
+test "mach.lang.be.codegen.encode.grow_cap:refuses_u32_capacity_overflow_before_reallocating" {
+    var probe: EncodeGrowthProbe;
+    probe.reallocate_calls = 0;
+    probe.allocate_calls   = 0;
+    var pp: *EncodeGrowthProbe = ?probe;
+    var alloc: A.Allocator;
+    alloc.ctx           = pp::ptr;
+    alloc.fn_allocate   = encode_growth_probe_allocate;
+    alloc.fn_reallocate = encode_growth_probe_reallocate;
+    alloc.fn_deallocate = encode_growth_probe_deallocate;
+
+    var dummy: SymbolMark;
+    var data: *SymbolMark = ?dummy;
+    var cap: u32 = 0xFFFFFFFF;
+
+    val r: R.Result[R.Void, str] = grow_cap[SymbolMark](?alloc, ?data, ?cap, DRIVER_INIT_CAP);
+
+    var bad: i32 = 0;
+    if (!R.is_err[R.Void, str](r))      { bad = 1; }
+    if (probe.reallocate_calls != 0)  { bad = 2; }
+    if (probe.allocate_calls != 0)    { bad = 3; }
+    if (cap != 0xFFFFFFFF)            { bad = 4; }
+    ret bad;
+}
+
+test "mach.lang.be.codegen.encode.grow_cap:allocates_the_seed_capacity_when_empty" {
+    var probe: EncodeGrowthProbe;
+    probe.reallocate_calls = 0;
+    probe.allocate_calls   = 0;
+    var pp: *EncodeGrowthProbe = ?probe;
+    var alloc: A.Allocator;
+    alloc.ctx           = pp::ptr;
+    alloc.fn_allocate   = encode_growth_probe_allocate;
+    alloc.fn_reallocate = encode_growth_probe_reallocate;
+    alloc.fn_deallocate = encode_growth_probe_deallocate;
+
+    var data: *SymbolMark = nil;
+    var cap: u32 = 0;
+
+    val r: R.Result[R.Void, str] = grow_cap[SymbolMark](?alloc, ?data, ?cap, DRIVER_INIT_CAP);
+
+    var bad: i32 = 0;
+    if (!R.is_err[R.Void, str](r))      { bad = 1; }
+    if (probe.allocate_calls != 1)    { bad = 2; }
+    if (probe.reallocate_calls != 0)  { bad = 3; }
+    ret bad;
+}
+
+test "mach.lang.be.codegen.encode.insert_text:refuses_growth_capacity_overflow_before_reallocating" {
+    var probe: EncodeGrowthProbe;
+    probe.reallocate_calls = 0;
+    probe.allocate_calls   = 0;
+    var pp: *EncodeGrowthProbe = ?probe;
+    var alloc: A.Allocator;
+    alloc.ctx           = pp::ptr;
+    alloc.fn_allocate   = encode_growth_probe_allocate;
+    alloc.fn_reallocate = encode_growth_probe_reallocate;
+    alloc.fn_deallocate = encode_growth_probe_deallocate;
+
+    var st: EncodeState;
+    t_row_state(?alloc, ?st);
+
+    val huge: usize = (~(0::usize) / 2) + 1;
+    st.buf.cap = huge;
+    st.buf.len = huge;
+
+    val r: R.Result[R.Void, str] = insert_text(?st, 0, 1);
+
+    var bad: i32 = 0;
+    if (!R.is_err[R.Void, str](r))      { bad = 1; }
+    if (probe.reallocate_calls != 0)  { bad = 2; }
+    if (probe.allocate_calls != 0)    { bad = 3; }
+    ret bad;
+}
+
+test "mach.lang.be.codegen.encode.emit_byte:doubling_is_still_exact_at_ordinary_scale" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var buf: ByteBuf = buf_init(?alloc);
+    var i: usize = 0;
+    for (i < (BYTEBUF_INIT_CAP * 3)) { emit_byte(?buf, 0xAB); i = i + 1; }
+
+    var bad: i32 = 0;
+    if (buf.len != BYTEBUF_INIT_CAP * 3) { bad = 1; }
+    var j: usize = 0;
+    for (j < buf.len) {
+        if (buf.data[j] != 0xAB) { bad = 2; }
+        j = j + 1;
+    }
+    buf_dnit(?buf);
+    ret bad;
 }

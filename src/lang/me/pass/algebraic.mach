@@ -1,45 +1,3 @@
-# mach.lang.me.pass.algebraic: algebraic simplification (peephole identities)
-#
-# A forward pass that rewrites a pure arithmetic / bitwise / shift instruction
-# whose result is fixed by an algebraic identity into the operand (or constant)
-# the identity yields, without evaluating any non-constant operand. It
-# complements constfold: constfold collapses all-constant expressions, while
-# this pass simplifies an expression one of whose operands is a constant
-# identity element, or whose two operands are the same SSA value.
-#
-# The mechanism uses the shared `mutate.Rewrite` map. For each instruction a
-# replacement Value may be recorded (instruction id -> Value); `rewrite_apply`
-# then rewrites every operand naming a simplified instruction to its replacement,
-# and the now-dead instructions are left for dce. Because a replacement can itself
-# name an instruction result, the table is iterated to a fixpoint so a chain
-# collapses.
-#
-# CORRECTNESS CONTRACT: every rewrite must preserve the exact runtime value for
-# all operand values. The pass is INTEGER-ONLY where float semantics differ:
-#
-#   - `x + 0`, `0 + x`, `x - 0`           -> x          (int only; float +0.0/-0.0)
-#   - `x * 1`, `1 * x`                    -> x          (int only)
-#   - `x * 0`, `0 * x`                    -> 0          (int only; float NaN/inf)
-#   - `x - x`                             -> 0          (int only; float NaN)
-#   - `x & x`, `x | x`                    -> x
-#   - `x ^ x`                             -> 0
-#   - `x & 0`, `0 & x`                    -> 0
-#   - `x | 0`, `0 | x`, `x ^ 0`, `0 ^ x`  -> x
-#   - `x & ~0`, `~0 & x`                  -> x          (all-ones mask)
-#   - `x | ~0`, `~0 | x`                  -> ~0
-#   - `x << 0`, `x >> 0`                  -> x
-#   - `0 << c`, `0 >> c`                  -> 0
-#   - `x / 1` (signed/unsigned)           -> x
-#   - `x % 1` (signed/unsigned)           -> 0
-#   - `-(-x)`, `~(~x)`                    -> x          (double negation)
-#
-# Float operands are never simplified: `x + 0.0` is not `x` for `x == -0.0`,
-# `x * 0.0` is NaN for `x` infinite/NaN, and `x - x` is NaN for `x == NaN`. The
-# integer/float opcodes overlap, so each rewrite first confirms the result type
-# resolves to an IRT_INT (`is_int`); a float-typed instruction is left untouched.
-# Division/remainder by a non-one constant is never simplified; only the exact
-# identities `/ 1` and `% 1` fire (never `/ 0`, which traps at runtime).
-
 use std.allocator.page;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -53,69 +11,53 @@ use R: std.types.result;
 
 use mach.lang.intern;
 use mach.lang.me.ir;
+use mach.lang.me.ir.builder;
+use mach.lang.me.ir.id;
 use mach.lang.me.ir.mutate;
 use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.opdesc;
 use mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 
-# run the pass over every non-extern function in the module in place
-# ---
-# m:   module to mutate in place
-# ret: ok(true) on success, or the first allocation error
 pub fun run(m: *ir.Module) R.Result[bool, str] {
+    var changed: bool = false;
     var i: u32 = 0;
     for (i < m.function_len) {
         val fn: *ir.Function = ?m.functions[i];
         if ((fn.flags & ir.FN_FLAG_EXTERN) == 0) {
-            val res_simplify: R.Result[bool, str] = simplify_function(m, fn);
-            if (R.is_err[bool, str](res_simplify)) {
-                ret res_simplify;
+            val changed_r: R.Result[bool, str] = simplify_function(m, fn);
+            if (R.is_err[bool, str](changed_r)) {
+                ret changed_r;
             }
+            if (R.unwrap_ok[bool, str](changed_r)) { changed = true; }
         }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok[bool, str](changed);
 }
 
-# simplify one function in place via a per-instruction substitution table
-#
-# The table is driven to a fixpoint (operands are resolved through it first, so a
-# chain of simplifications collapses across sweeps), then applied to every
-# operand. The dead defining instructions are left for dce.
-# ---
-# m:   module owning the function and its type / allocator state
-# fn:  function to simplify in place
-# ret: ok(true) on success, or the table allocation error
 fun simplify_function(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
     val ilen: u32 = fn.instr_len;
     if (ilen == 0) {
-        ret R.ok[bool, str](true);
+        ret R.ok[bool, str](false);
     }
 
     var st: mutate.Rewrite;
-    val res_init: R.Result[bool, str] = mutate.rewrite_init(?st, m.alloc, ilen);
-    if (R.is_err[bool, str](res_init)) {
-        ret res_init;
+    val res_init: R.Result[R.Void, str] = mutate.rewrite_init(?st, m.alloc, ilen);
+    if (R.is_err[R.Void, str](res_init)) {
+        ret R.err[bool, str](R.unwrap_err[R.Void, str](res_init));
     }
 
-    simplify_to_fixpoint(m, fn, ?st);
+    val any: bool = simplify_to_fixpoint(m, fn, ?st);
     mutate.rewrite_apply(fn, ?st);
 
     mutate.rewrite_dnit(?st, m.alloc);
-    ret R.ok[bool, str](true);
+    ret R.ok[bool, str](any);
 }
 
-# sweep the instruction pool to a fixpoint, recording every new simplification
-#
-# Each sweep simplifies every not-yet-simplified instruction whose resolved
-# operands now match an identity. Sweeps repeat until one changes nothing, so a
-# simplification that unlocks another is always picked up.
-# ---
-# m:  module owning the function's type state
-# fn: function whose instructions are simplified
-# st: substitution table to populate
-fun simplify_to_fixpoint(m: *ir.Module, fn: *ir.Function, st: *mutate.Rewrite) {
+fun simplify_to_fixpoint(m: *ir.Module, fn: *ir.Function, st: *mutate.Rewrite) bool {
     var changed: bool = true;
+    var any: bool = false;
     for (changed) {
         changed = false;
         var i: u32 = 0;
@@ -126,31 +68,19 @@ fun simplify_to_fixpoint(m: *ir.Module, fn: *ir.Function, st: *mutate.Rewrite) {
                 if (simplify_instruction(m, fn, inst, st, ?out)) {
                     mutate.replace_value(st, i, out);
                     changed = true;
+                    any     = true;
                 }
             }
             i = i + 1;
         }
     }
+    ret any;
 }
 
-# try to simplify one instruction via an algebraic identity
-#
-# Only integer-typed pure arithmetic / bitwise / shift opcodes are considered;
-# the unary double-negation forms handle OP_NEG / OP_NOT. Operands are resolved
-# through the table before matching.
-# ---
-# m:    module owning the function's type state
-# fn:   function the instruction belongs to (for inner-instruction lookup)
-# inst: instruction to simplify
-# st:   substitution table operands are resolved through
-# out:  receives the replacement Value on a successful rewrite
-# ret:  true when a rewrite fired and `out` was written
 fun simplify_instruction(m: *ir.Module, fn: *ir.Function, inst: *instruction.Instruction,
                          st: *mutate.Rewrite, out: *value.Value) bool {
     val k: instruction.InstrKind = inst.kind;
 
-    # unary double negation: -(-x) -> x, ~(~x) -> x. integer only; float negation
-    # flips the sign bit, observable on -0.0, so it is never collapsed.
     if ((k == instruction.OP_NEG || k == instruction.OP_NOT) && inst.operand_count == 1) {
         if (is_int(m, inst.ty) == false) {
             ret false;
@@ -164,8 +94,6 @@ fun simplify_instruction(m: *ir.Module, fn: *ir.Function, inst: *instruction.Ins
             ret false;
         }
         val inner: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_inner);
-        # the inner op must be the same negation and integer-typed; its operand is
-        # then the original value, returned with this result's type.
         if (inner.kind == k && inner.operand_count == 1 && is_int(m, inner.ty)) {
             val src: value.Value = mutate.rewrite_resolve(st, inner.operands[0]);
             @out = value.retype(src, inst.ty);
@@ -174,7 +102,6 @@ fun simplify_instruction(m: *ir.Module, fn: *ir.Function, inst: *instruction.Ins
         ret false;
     }
 
-    # binary identities on [lhs, rhs], integer result types only.
     if (is_simplifiable_binary(k) && inst.operand_count == 2) {
         if (is_int(m, inst.ty) == false) {
             ret false;
@@ -187,32 +114,11 @@ fun simplify_instruction(m: *ir.Module, fn: *ir.Function, inst: *instruction.Ins
     ret false;
 }
 
-# test whether `k` is a binary opcode this pass recognises identities for
-# ---
-# k:   opcode to classify
-# ret: true for the add / sub / mul, div, rem, and / or / xor, and shift opcodes
 fun is_simplifiable_binary(k: instruction.InstrKind) bool {
-    if (k == instruction.OP_ADD || k == instruction.OP_SUB || k == instruction.OP_MUL)     { ret true; }
-    if (k == instruction.OP_DIV_S || k == instruction.OP_DIV_U)                            { ret true; }
-    if (k == instruction.OP_REM_S || k == instruction.OP_REM_U)                            { ret true; }
-    if (k == instruction.OP_AND || k == instruction.OP_OR || k == instruction.OP_XOR)      { ret true; }
-    if (k == instruction.OP_SHL || k == instruction.OP_SHR_S || k == instruction.OP_SHR_U) { ret true; }
-    ret false;
+    ret opdesc.has(k, opdesc.EFF_FOLD_INT);
 }
 
-# apply the binary identities for opcode `k` on resolved operands a, b
-#
-# The replacement is one of the operands (the surviving operand) or a fresh
-# integer constant (0 / all-ones). The result type `res_ty` must be an IRT_INT;
-# a non-integer width declines the rewrite.
-# ---
-# m:      module owning the type state
-# k:      binary opcode to apply identities for
-# a:      resolved left operand
-# b:      resolved right operand
-# res_ty: integer result type the replacement is retyped to
-# out:    receives the replacement Value on a successful rewrite
-# ret:    true when a rewrite fired and `out` was written
+
 fun simplify_binary(m: *ir.Module, k: instruction.InstrKind, a: value.Value, b: value.Value,
                     res_ty: type.IrTypeId, out: *value.Value) bool {
     val bits: u32 = int_bits(m, res_ty);
@@ -229,19 +135,16 @@ fun simplify_binary(m: *ir.Module, k: instruction.InstrKind, a: value.Value, b: 
     val same:   bool = is_same_value(a, b);
 
     if (k == instruction.OP_ADD) {
-        # x + 0 -> x, 0 + x -> x
         if (b_zero) { @out = value.retype(a, res_ty); ret true; }
         if (a_zero) { @out = value.retype(b, res_ty); ret true; }
         ret false;
     }
     if (k == instruction.OP_SUB) {
-        # x - 0 -> x, x - x -> 0
         if (b_zero) { @out = value.retype(a, res_ty); ret true; }
         if (same)   { @out = value.const_int(0, res_ty); ret true; }
         ret false;
     }
     if (k == instruction.OP_MUL) {
-        # x * 1 -> x, 1 * x -> x, x * 0 -> 0, 0 * x -> 0
         if (b_one)  { @out = value.retype(a, res_ty); ret true; }
         if (a_one)  { @out = value.retype(b, res_ty); ret true; }
         if (b_zero) { @out = value.const_int(0, res_ty); ret true; }
@@ -249,17 +152,14 @@ fun simplify_binary(m: *ir.Module, k: instruction.InstrKind, a: value.Value, b: 
         ret false;
     }
     if (k == instruction.OP_DIV_S || k == instruction.OP_DIV_U) {
-        # x / 1 -> x (division by zero is never an identity and traps).
         if (b_one) { @out = value.retype(a, res_ty); ret true; }
         ret false;
     }
     if (k == instruction.OP_REM_S || k == instruction.OP_REM_U) {
-        # x % 1 -> 0 (every integer is divisible by one).
         if (b_one) { @out = value.const_int(0, res_ty); ret true; }
         ret false;
     }
     if (k == instruction.OP_AND) {
-        # x & x -> x, x & 0 -> 0, x & ~0 -> x
         if (same)   { @out = value.retype(a, res_ty); ret true; }
         if (b_zero) { @out = value.const_int(0, res_ty); ret true; }
         if (a_zero) { @out = value.const_int(0, res_ty); ret true; }
@@ -268,7 +168,6 @@ fun simplify_binary(m: *ir.Module, k: instruction.InstrKind, a: value.Value, b: 
         ret false;
     }
     if (k == instruction.OP_OR) {
-        # x | x -> x, x | 0 -> x, x | ~0 -> ~0
         if (same)   { @out = value.retype(a, res_ty); ret true; }
         if (b_zero) { @out = value.retype(a, res_ty); ret true; }
         if (a_zero) { @out = value.retype(b, res_ty); ret true; }
@@ -277,14 +176,12 @@ fun simplify_binary(m: *ir.Module, k: instruction.InstrKind, a: value.Value, b: 
         ret false;
     }
     if (k == instruction.OP_XOR) {
-        # x ^ x -> 0, x ^ 0 -> x
         if (same)   { @out = value.const_int(0, res_ty); ret true; }
         if (b_zero) { @out = value.retype(a, res_ty); ret true; }
         if (a_zero) { @out = value.retype(b, res_ty); ret true; }
         ret false;
     }
     if (k == instruction.OP_SHL || k == instruction.OP_SHR_S || k == instruction.OP_SHR_U) {
-        # x << 0 -> x, x >> 0 -> x, 0 << c -> 0, 0 >> c -> 0
         if (b_zero) { @out = value.retype(a, res_ty); ret true; }
         if (a_zero) { @out = value.const_int(0, res_ty); ret true; }
         ret false;
@@ -292,33 +189,14 @@ fun simplify_binary(m: *ir.Module, k: instruction.InstrKind, a: value.Value, b: 
     ret false;
 }
 
-# test whether a resolved operand is the integer constant 0
-#
-# Zero is the additive / xor / or identity and the multiplicative / and
-# annihilator.
-# ---
-# v:   value to test
-# ret: true when v is the VAL_CONST_INT 0
 fun is_int_zero(v: value.Value) bool {
     ret v.kind == value.VAL_CONST_INT && v.data.int_lit == 0;
 }
 
-# test whether a resolved operand is the integer constant 1
-# ---
-# v:   value to test
-# ret: true when v is the VAL_CONST_INT 1 (the multiplicative identity)
 fun is_int_one(v: value.Value) bool {
     ret v.kind == value.VAL_CONST_INT && v.data.int_lit == 1;
 }
 
-# test whether a resolved operand is the all-ones constant for a `bits`-wide int
-#
-# Only the low `bits` bits are compared, so a wider literal still matches its
-# mask. All ones is the bitwise `and` identity and the `or` annihilator.
-# ---
-# v:    value to test
-# bits: integer width to compare within
-# ret:  true when v's low `bits` bits are all set
 fun is_int_all_ones(v: value.Value, bits: u32) bool {
     if (v.kind != value.VAL_CONST_INT) {
         ret false;
@@ -326,10 +204,6 @@ fun is_int_all_ones(v: value.Value, bits: u32) bool {
     ret mask(v.data.int_lit, bits) == all_ones(bits);
 }
 
-# compute the all-ones bit pattern for a `bits`-wide integer
-# ---
-# bits: integer width in bits (>= 64 yields the full 64-bit pattern)
-# ret:  2^bits - 1, the low `bits` bits set
 fun all_ones(bits: u32) u64 {
     if (bits >= 64) {
         ret 0xFFFFFFFFFFFFFFFF;
@@ -337,11 +211,6 @@ fun all_ones(bits: u32) u64 {
     ret (1::u64 << bits::u64) - 1;
 }
 
-# mask `v` to its low `bits` bits (a 64-bit width passes `v` through unchanged)
-# ---
-# v:    value to mask
-# bits: integer width to keep
-# ret:  v with all but its low `bits` bits cleared
 fun mask(v: u64, bits: u32) u64 {
     if (bits >= 64) {
         ret v;
@@ -350,16 +219,6 @@ fun mask(v: u64, bits: u32) u64 {
     ret v & m;
 }
 
-# test whether two resolved operands name the exact same SSA value
-#
-# Same-value operands evaluate identically at runtime. Only instruction results
-# and parameters are treated as same; an all-constant expression is constfold's
-# job. Two VAL_INSTR match iff they name the same instruction id, two VAL_PARAM
-# iff the same parameter index.
-# ---
-# a:   first resolved operand
-# b:   second resolved operand
-# ret: true when a and b are provably the same SSA value
 fun is_same_value(a: value.Value, b: value.Value) bool {
     if (a.kind != b.kind) {
         ret false;
@@ -373,23 +232,10 @@ fun is_same_value(a: value.Value, b: value.Value) bool {
     ret false;
 }
 
-# test whether `tid` resolves to an IRT_INT type (the only types simplified here)
-# ---
-# m:   module owning the type table
-# tid: IR type id to classify
-# ret: true when tid is an integer type
 fun is_int(m: *ir.Module, tid: type.IrTypeId) bool {
     ret int_bits(m, tid) != 0;
 }
 
-# get the bit width of an IRT_INT type, or 0 when `tid` is not an integer type
-#
-# A zero width signals the caller to decline the rewrite, since every valid
-# integer type has a nonzero width.
-# ---
-# m:   module owning the type table
-# tid: IR type id to measure
-# ret: the integer width in bits, or 0 for a non-integer / unresolved id
 fun int_bits(m: *ir.Module, tid: type.IrTypeId) u32 {
     val opt_t: O.Option[*type.IrType] = type.get(?m.types, tid);
     if (O.is_none[*type.IrType](opt_t)) {
@@ -402,8 +248,6 @@ fun int_bits(m: *ir.Module, tid: type.IrTypeId) u32 {
     ret t.data.bits;
 }
 
-# binary identity rewrites: sub self -> 0, and / or with the all-ones mask,
-# xor self -> 0, and mul by zero -> 0
 test "mach.lang.me.pass.algebraic.simplify_binary:identities" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -426,7 +270,6 @@ test "mach.lang.me.pass.algebraic.simplify_binary:identities" {
     val ones: value.Value = value.const_int(0xFFFFFFFF, i32ty);
     var out:  value.Value;
 
-    # sub(p0, p0) -> 0 (x - x)
     if (simplify_binary(?m, instruction.OP_SUB, p0, p0, i32ty, ?out) == false) {
         ir.dnit(?m);
         ret 1;
@@ -436,7 +279,6 @@ test "mach.lang.me.pass.algebraic.simplify_binary:identities" {
         ret 1;
     }
 
-    # and(p0, ~0) -> p0 (all-ones mask is the AND identity)
     if (simplify_binary(?m, instruction.OP_AND, p0, ones, i32ty, ?out) == false) {
         ir.dnit(?m);
         ret 1;
@@ -446,7 +288,6 @@ test "mach.lang.me.pass.algebraic.simplify_binary:identities" {
         ret 1;
     }
 
-    # or(p0, ~0) -> ~0 (all-ones is the OR annihilator)
     if (simplify_binary(?m, instruction.OP_OR, p0, ones, i32ty, ?out) == false) {
         ir.dnit(?m);
         ret 1;
@@ -456,7 +297,6 @@ test "mach.lang.me.pass.algebraic.simplify_binary:identities" {
         ret 1;
     }
 
-    # xor(p0, p0) -> 0 (x ^ x)
     if (simplify_binary(?m, instruction.OP_XOR, p0, p0, i32ty, ?out) == false) {
         ir.dnit(?m);
         ret 1;
@@ -466,7 +306,6 @@ test "mach.lang.me.pass.algebraic.simplify_binary:identities" {
         ret 1;
     }
 
-    # mul(p0, 0) -> 0 (zero annihilator)
     if (simplify_binary(?m, instruction.OP_MUL, p0, zero, i32ty, ?out) == false) {
         ir.dnit(?m);
         ret 1;
@@ -477,5 +316,74 @@ test "mach.lang.me.pass.algebraic.simplify_binary:identities" {
     }
 
     ir.dnit(?m);
+    ret 0;
+}
+
+test "mach.lang.me.pass.algebraic.run:reports_no_change_when_nothing_simplifies" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val ri: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 32);
+    if (R.is_err[type.IrTypeId, str](ri)) { ir.dnit(?m); ret 1; }
+    val i32t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](ri);
+
+    val r_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](r_fn)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](r_fn)];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+    val res_entry: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_entry)) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](res_entry));
+
+    val p0: value.Value = value.param(0, i32t);
+    val p1: value.Value = value.param(1, i32t);
+    val res_add: R.Result[value.Value, str] = builder.emit_add(?bld, p0, p1);
+    if (R.is_err[value.Value, str](res_add)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, R.unwrap_ok[value.Value, str](res_add)))) { ir.dnit(?m); ret 1; }
+
+    val rr: R.Result[bool, str] = run(?m);
+    if (R.is_err[bool, str](rr)) { ir.dnit(?m); ret 1; }
+    val changed: bool = R.unwrap_ok[bool, str](rr);
+    ir.dnit(?m);
+    if (changed != false) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.me.pass.algebraic.run:reports_change_when_a_self_xor_simplifies" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val ri: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 32);
+    if (R.is_err[type.IrTypeId, str](ri)) { ir.dnit(?m); ret 1; }
+    val i32t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](ri);
+
+    val r_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](r_fn)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](r_fn)];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+    val res_entry: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_entry)) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](res_entry));
+
+    val p0: value.Value = value.param(0, i32t);
+    val res_xor: R.Result[value.Value, str] = builder.emit_xor(?bld, p0, p0);
+    if (R.is_err[value.Value, str](res_xor)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, R.unwrap_ok[value.Value, str](res_xor)))) { ir.dnit(?m); ret 1; }
+
+    val rr: R.Result[bool, str] = run(?m);
+    if (R.is_err[bool, str](rr)) { ir.dnit(?m); ret 1; }
+    val changed: bool = R.unwrap_ok[bool, str](rr);
+    ir.dnit(?m);
+    if (changed != true) { ret 1; }
     ret 0;
 }

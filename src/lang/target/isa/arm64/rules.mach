@@ -1,64 +1,3 @@
-# AArch64 (A64) instruction-selection rule pack
-#
-# The aarch64 contribution to the shared rule engine (`be.codegen.rules`): a data
-# table describing how every generic MIR opcode selects on A64, plus the thin
-# wrappers the ISA vtable's `select` / `is_reg_move` slots bind. The shared engine
-# interprets the table per instruction - first admitting rule wins - and fails
-# loudly on any opcode the table does not model, so selection stays total.
-#
-# The A64 ALU is three-address (`Rd, Rn, Rm`), so the integer binary ops retag in
-# place to a concrete three-address opcode rather than surviving as a two-address
-# sentinel: register allocation keys an instruction's def/use shape on its operands
-# (operand 0 a pure def), not its opcode, so a concrete three-address form is read
-# correctly. The scalar rules are 1:1 - the operand list already matches the
-# machine form and only the opcode changes - so a scalar-only block retags in place
-# and is never rebuilt.
-#
-# A handful of generic opcodes survive selection with a high selection-output
-# sentinel (`mir.MIR_SEL_*`) so the encoder can materialize a short byte sequence
-# from them without confusing the generic opcode with a concrete A64 opcode of the
-# same low value:
-#   - the comparison family (`MIR_CMP_* -> MIR_SEL_CMP_*`): the encoder lowers it
-#     to `SUBS XZR, lhs, rhs ; CSET dst, cc`, keeping operand 0 a clean boolean def
-#     the register allocator reads correctly.
-#   - the conditional branch (`MIR_CBR -> MIR_SEL_CBR`): the encoder lowers it to
-#     `CBNZ cond, then ; B else`, keeping both block targets and the condition on
-#     one terminator so the allocator reads the condition as a use and resolves
-#     both successor edges for liveness. the pack declares all six comparison
-#     conditions in `fused_cbr_ccs`, so the engine's compare-and-branch fusion
-#     collapses a single-consumer `CMP ; CBR` pair into one `mir.MIR_SEL_CBR_*`
-#     terminator ahead of selection; those survivors pass through and the encoder
-#     materializes `SUBS XZR ; B.cc then ; B else` directly.
-#   - the division / remainder family (`MIR_DIV_*`/`MIR_REM_*` -> `MIR_SEL_DIV_*`/
-#     `MIR_SEL_REM_*`): a clean three-address `[dst, dividend, divisor]` op (A64
-#     wires no fixed division register) the encoder lowers to `SDIV`/`UDIV` (+
-#     `MSUB` for a remainder) under the defined division-by-zero / signed-overflow
-#     trap checks.
-#
-# The memory opcodes, the call / phi pseudos, the scalar float arithmetic /
-# comparison / negate family, the integer and float conversions, and inline asm all
-# pass through unchanged: their generic opcode values sit above the concrete A64
-# opcode space, so the encoder dispatches them directly and the register allocator
-# reads operand 0 as a clean def (or the memory destination for a store). The
-# float-bank guard routes a float register copy and a `:~` reinterpret touching the
-# float / vector bank to the concrete FMOV; a same-bank GP<->GP reinterpret stays
-# MIR_BITCAST, the plain register copy the integer conversion encoder handles.
-#
-# THE NEON PART: aarch64 is the one arch that selects the vector opcode here rather
-# than deferring it to the encoder. A vector-typed instruction (`vec_lane != 0`)
-# takes a `GATE_VECTOR` rule that precedes the scalar rule for the same generic
-# opcode, so a scalar op of that value is untouched and a vector op never reaches
-# the scalar rule. The vector data-processing ops retag one-to-one to a concrete
-# `VEC_*` opcode read off the lane shape; the vector ordering compares
-# (`MIR_CMP_LT_*`/`MIR_CMP_LE_*`) expand to a single swapped piece, normalizing the
-# generic LT/LE into the NEON GT/GE form (`a < b` == `b > a`, the only vector
-# compare NEON provides) with the signed-vs-unsigned form and the float routing
-# read from the lane. Vector shift and remainder have no NEON form and expand to a
-# loud selection error rather than falling through to a scalar opcode. A vector
-# move / load / store / GEP / lane op is not a data-processing op, carries no
-# `GATE_VECTOR` rule, and falls to the scalar rule, which the encoder handles at
-# the 128-bit width.
-
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -76,107 +15,46 @@ use mach.lang.be.codegen.rules;
 use mach.lang.source;
 use mach.lang.target.isa;
 use mach.lang.target.isa.arm64;
-use target: mach.lang.target.resolved;
 
-# the concrete signature the erased `isa.RegMachine.select` pointer is cast back to,
-# matching the shared `be.codegen.isel.SelectFn`
-#
-# The vtable stores `select` type-erased (`*u8`); the shared dispatcher casts it
-# back to this type before calling it.
-# ---
-# a:   backing allocator (threaded for the shared SelectFn contract; the vector
-#      compares expand, so a block carrying one is rebuilt through this allocator)
-# tgt: resolved compilation target (must be AArch64)
-# f:   the MIR function to select instructions for; mutated in place
-# ret: ok(true) on success, or an error naming the failure
-pub def SelectFn: fun(*A.Allocator, *target.Target, *mir.MirFunction) R.Result[bool, str];
+pub val RULE_COUNT: usize = 87;
 
-# the number of rules in the pack: 20 NEON vector rules ahead of the 53 scalar
-# rules covering every generic opcode that can reach aarch64 selection, plus the
-# six fused compare-and-branch survivors. the coverage test pins it so a rule
-# added to the table and this count cannot drift apart
-pub val RULE_COUNT: usize = 85;
-
-# the number of post-selection plain register-copy opcodes: the concrete GP move
-# (`orr xd, xzr, xn`), the concrete float move (`fmov`), and the generic
-# `mir.MIR_MOV` the reload / store moves regalloc splices after selection keep
 pub val COPY_OPCODE_COUNT: usize = 3;
 
-# the number of comparison opcodes the engine's compare-and-branch fusion combines
 pub val FUSED_CC_COUNT: usize = 6;
 
-# select concrete AArch64 instructions for one MIR function
-#
-# The AArch64 implementation behind the ISA vtable's `select` slot, reached only
-# through `tgt.arch.select` by the shared `be.codegen.isel.run` dispatcher: a
-# one-line binding of the aarch64 rule pack to the shared engine.
-# ---
-# a:   backing allocator (a block containing a vector compare is rebuilt through it)
-# tgt: resolved compilation target (must be AArch64)
-# f:   the MIR function to select instructions for; mutated in place
-# ret: ok(true) on success, or an error naming the failure
-pub fun select(a: *A.Allocator, tgt: *target.Target, f: *mir.MirFunction) R.Result[bool, str] {
-    ret rules.select(?PACK, a, tgt, f);
+pub fun select(a: *A.Allocator, tgt: *isa.BackendTarget, f: *mir.MirFunction) R.Result[R.Void, str] {
+    ret rules.select(?PACK, a, f);
 }
 
-# classify a post-selection opcode as an aarch64 plain register move
-#
-# A `mir.MIR_MOV` selects to `arm64.MOV` (GP, `orr xd, xzr, xn`) or `arm64.FMOV`
-# (float), and the reload / store moves regalloc splices after selection stay
-# generic `mir.MIR_MOV`; all three are plain full-width copies. The shared
-# copy-hygiene passes further gate on operand shape and equal source/destination
-# width. This is the aarch64 implementation behind the ISA vtable's `is_reg_move`
-# slot.
-# ---
-# opcode: the concrete post-selection opcode to classify
-# ret:    true when the opcode is a plain register-move form
 pub fun is_reg_move(opcode: u32) bool {
     ret rules.is_reg_move(?PACK, opcode);
 }
 
-# emit one NEON compare piece with the lhs and rhs (operands 1 and 2) swapped,
-# leaving the destination (operand 0) in place
-#
-# The single-piece expansion behind every vector ordering compare: it normalizes a
-# generic LT/LE to the NEON GT/GE form (`a < b` == `b > a`, the only vector compare
-# NEON provides) by reordering the operands, which a retag cannot do. `emit` copies
-# every identity field (width, `vec_lane`, `loc`, ...) from the source, so only the
-# operand order and the opcode differ. A generic compare is always `[dst, lhs,
-# rhs]` (three operands).
-# ---
-# builder: the expansion's write cursor (its `source` is the compare being replaced)
-# opcode:  the concrete NEON compare opcode for the emitted piece
-# ret:     ok(true) on success, or the allocation error `emit` returned
-fun emit_swapped_cmp(builder: *rules.ExpansionBuilder, opcode: u32) R.Result[bool, str] {
+pub fun is_trap_terminator(opcode: u32) bool {
+    ret opcode == arm64.BRK::u32;
+}
+
+fun emit_swapped_cmp(builder: *rules.ExpansionBuilder, opcode: u32) R.Result[R.Void, str] {
     var ops: [3]mir.MirOperand;
     ops[0] = builder.source.operands[0];
     ops[1] = builder.source.operands[2];
     ops[2] = builder.source.operands[1];
     val res: R.Result[*mir.MirInstr, str] = rules.emit(builder, opcode, ?ops[0], 3);
     if (R.is_err[*mir.MirInstr, str](res)) {
-        ret R.err[bool, str](R.unwrap_err[*mir.MirInstr, str](res));
+        ret R.err[R.Void, str](R.unwrap_err[*mir.MirInstr, str](res));
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# the swap expander for a signed vector less-than: `a < b` -> `b > a` (VEC_CMGT)
-fun expand_vec_cmp_lt_s(builder: *rules.ExpansionBuilder) R.Result[bool, str] {
+fun expand_vec_cmp_lt_s(builder: *rules.ExpansionBuilder) R.Result[R.Void, str] {
     ret emit_swapped_cmp(builder, arm64.VEC_CMGT::u32);
 }
 
-# the swap expander for a signed vector less-or-equal: `a <= b` -> `b >= a`
-# (VEC_CMGE)
-fun expand_vec_cmp_le_s(builder: *rules.ExpansionBuilder) R.Result[bool, str] {
+fun expand_vec_cmp_le_s(builder: *rules.ExpansionBuilder) R.Result[R.Void, str] {
     ret emit_swapped_cmp(builder, arm64.VEC_CMGE::u32);
 }
 
-# the swap expander for an unsigned vector less-than
-#
-# A float operand is not "signed", so its ordering compare arrives in the generic
-# `_U` form, but the NEON float compare (FCMGT) is the one true ordered compare:
-# route a float lane to VEC_CMGT and only a genuine integer lane to the unsigned
-# VEC_CMHI. both swap the operands (`a < b` -> `b > a`).
-fun expand_vec_cmp_lt_u(builder: *rules.ExpansionBuilder) R.Result[bool, str] {
+fun expand_vec_cmp_lt_u(builder: *rules.ExpansionBuilder) R.Result[R.Void, str] {
     var opcode: u32 = arm64.VEC_CMHI::u32;
     if (mir.vec_lane_kind(builder.source.vec_lane) == mir.VEC_LANE_FLOAT) {
         opcode = arm64.VEC_CMGT::u32;
@@ -184,10 +62,7 @@ fun expand_vec_cmp_lt_u(builder: *rules.ExpansionBuilder) R.Result[bool, str] {
     ret emit_swapped_cmp(builder, opcode);
 }
 
-# the swap expander for an unsigned vector less-or-equal: a float lane routes to
-# the ordered VEC_CMGE, a genuine integer lane to the unsigned VEC_CMHS; both swap
-# the operands (`a <= b` -> `b >= a`)
-fun expand_vec_cmp_le_u(builder: *rules.ExpansionBuilder) R.Result[bool, str] {
+fun expand_vec_cmp_le_u(builder: *rules.ExpansionBuilder) R.Result[R.Void, str] {
     var opcode: u32 = arm64.VEC_CMHS::u32;
     if (mir.vec_lane_kind(builder.source.vec_lane) == mir.VEC_LANE_FLOAT) {
         opcode = arm64.VEC_CMGE::u32;
@@ -195,33 +70,20 @@ fun expand_vec_cmp_le_u(builder: *rules.ExpansionBuilder) R.Result[bool, str] {
     ret emit_swapped_cmp(builder, opcode);
 }
 
-# the expander for a vector shift or remainder: a loud selection error
-#
-# #2030 removed per-lane shifts at sema and there is no vector `%` or integer `/`,
-# so no vector shift / remainder should reach selection. This is the loud backstop,
-# never a scalar-opcode fall-through, if one still does. It errors before emitting a
-# piece, so the engine propagates the message and never reaches the piece-count
-# check its `expansion_length` of 1 would otherwise gate.
-fun expand_vec_unsupported(builder: *rules.ExpansionBuilder) R.Result[bool, str] {
-    ret R.err[bool, str]("codegen: unsupported vector operation on aarch64");
+fun expand_vec_unsupported(builder: *rules.ExpansionBuilder) R.Result[R.Void, str] {
+    ret R.err[R.Void, str]("codegen: unsupported vector operation on aarch64");
 }
 
-# the aarch64 rule pack's rule table, ordered by match priority
-#
-# Table order is match priority: every `GATE_VECTOR` rule precedes the scalar rule
-# for the same generic opcode, so a vector instruction takes the NEON rule and a
-# scalar instruction (or a vector move / load / lane op with no NEON rule) falls to
-# the scalar rule. Within the scalar block only the two guarded rules (the
-# float-bank MOV and BITCAST) depend on order, each preceding its unguarded
-# fallback.
+fun guard_int_vec_lane(f: *mir.MirFunction, mi: *mir.MirInstr) bool {
+    ret mir.vec_lane_kind(mi.vec_lane) == mir.VEC_LANE_INT;
+}
+
 pub val RULES: [RULE_COUNT]rules.Rule = [RULE_COUNT]rules.Rule{
-    # NEON vector data-processing ops (vec_lane != 0). the arithmetic / logical ops
-    # retag one-to-one to a concrete VEC_* opcode; the encoder reads the float-vs-int
-    # form and the arrangement from vec_lane. VEC_MUL is int-only (.8h); VEC_DIV is
-    # float-only. these precede the scalar rules for the same generic opcode.
     rules.Rule{ op: mir.MIR_ADD,   gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_RETAG, to: arm64.VEC_ADD::u32, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_SUB,   gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_RETAG, to: arm64.VEC_SUB::u32, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_MUL,   gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_RETAG, to: arm64.VEC_MUL::u32, expand: nil, expansion_length: 0 },
+    rules.Rule{ op: mir.MIR_DIV_U, gate: rules.GATE_VECTOR, guard: guard_int_vec_lane, kind: rules.RULE_EXPAND, to: 0, expand: expand_vec_unsupported, expansion_length: 1 },
+    rules.Rule{ op: mir.MIR_DIV_S, gate: rules.GATE_VECTOR, guard: guard_int_vec_lane, kind: rules.RULE_EXPAND, to: 0, expand: expand_vec_unsupported, expansion_length: 1 },
     rules.Rule{ op: mir.MIR_DIV_U, gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_RETAG, to: arm64.VEC_DIV::u32, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_DIV_S, gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_RETAG, to: arm64.VEC_DIV::u32, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_AND,   gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_RETAG, to: arm64.VEC_AND::u32, expand: nil, expansion_length: 0 },
@@ -229,33 +91,20 @@ pub val RULES: [RULE_COUNT]rules.Rule = [RULE_COUNT]rules.Rule{
     rules.Rule{ op: mir.MIR_XOR,   gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_RETAG, to: arm64.VEC_EOR::u32, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_NOT,   gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_RETAG, to: arm64.VEC_NOT::u32, expand: nil, expansion_length: 0 },
 
-    # the vector equality compares retag one-to-one (no operand swap): the encoder
-    # reads FCMEQ / CMEQ from the lane, and VEC_CMNE is a CMEQ then a NOT.
     rules.Rule{ op: mir.MIR_CMP_EQ, gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_RETAG, to: arm64.VEC_CMEQ::u32, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_CMP_NE, gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_RETAG, to: arm64.VEC_CMNE::u32, expand: nil, expansion_length: 0 },
 
-    # the vector ordering compares expand to a single swapped piece, normalizing the
-    # generic LT/LE to the NEON GT/GE form (`a < b` == `b > a`), the only vector
-    # compare NEON provides. the unsigned forms route a float lane to the ordered
-    # float compare and a genuine integer lane to the unsigned integer compare.
     rules.Rule{ op: mir.MIR_CMP_LT_S, gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_EXPAND, to: 0, expand: expand_vec_cmp_lt_s, expansion_length: 1 },
     rules.Rule{ op: mir.MIR_CMP_LT_U, gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_EXPAND, to: 0, expand: expand_vec_cmp_lt_u, expansion_length: 1 },
     rules.Rule{ op: mir.MIR_CMP_LE_S, gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_EXPAND, to: 0, expand: expand_vec_cmp_le_s, expansion_length: 1 },
     rules.Rule{ op: mir.MIR_CMP_LE_U, gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_EXPAND, to: 0, expand: expand_vec_cmp_le_u, expansion_length: 1 },
 
-    # vector shift and remainder have no NEON form (#2030 removed per-lane shifts at
-    # sema; there is no vector `%` or integer `/`). a loud selection error, never a
-    # scalar-opcode fall-through, if one still reaches selection.
     rules.Rule{ op: mir.MIR_SHL,   gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_EXPAND, to: 0, expand: expand_vec_unsupported, expansion_length: 1 },
     rules.Rule{ op: mir.MIR_SHR_S, gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_EXPAND, to: 0, expand: expand_vec_unsupported, expansion_length: 1 },
     rules.Rule{ op: mir.MIR_SHR_U, gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_EXPAND, to: 0, expand: expand_vec_unsupported, expansion_length: 1 },
     rules.Rule{ op: mir.MIR_REM_S, gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_EXPAND, to: 0, expand: expand_vec_unsupported, expansion_length: 1 },
     rules.Rule{ op: mir.MIR_REM_U, gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_EXPAND, to: 0, expand: expand_vec_unsupported, expansion_length: 1 },
 
-    # the three-address integer binary ALU ops retag to a concrete A64 three-address
-    # opcode: operand 0 stays a pure def and the encoder packs one `op Rd, Rn, Rm`
-    # word (folding an immediate right operand into the immediate form or
-    # materializing it through a scratch).
     rules.Rule{ op: mir.MIR_ADD, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: arm64.ADD::u32, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_SUB, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: arm64.SUB::u32, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_MUL, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: arm64.MUL::u32, expand: nil, expansion_length: 0 },
@@ -263,55 +112,27 @@ pub val RULES: [RULE_COUNT]rules.Rule = [RULE_COUNT]rules.Rule{
     rules.Rule{ op: mir.MIR_OR,  gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: arm64.ORR::u32, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_XOR, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: arm64.EOR::u32, expand: nil, expansion_length: 0 },
 
-    # the shifts retag to a single A64 shift opcode (no x86-64 CL constraint): the
-    # encoder selects the register variant (LSLV/LSRV/ASRV) or the immediate variant
-    # (UBFM/SBFM alias) from operand 2's kind.
     rules.Rule{ op: mir.MIR_SHL,   gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: arm64.LSL::u32, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_SHR_U, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: arm64.LSR::u32, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_SHR_S, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: arm64.ASR::u32, expand: nil, expansion_length: 0 },
 
-    # division / remainder survive selection as a three-address `[dst, dividend,
-    # divisor]` instruction (operand 0 a pure def), lifted to a high SELECTION-
-    # OUTPUT sentinel so the encoder never confuses the generic opcode with a
-    # concrete A64 opcode of the same low value (MIR_REM_U = 6 = arm64.ORR). the
-    # encoder materializes the SDIV / UDIV (+ MSUB for a remainder) and the defined
-    # division-by-zero / signed-overflow trap checks from the sentinel.
     rules.Rule{ op: mir.MIR_DIV_S, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: mir.MIR_SEL_DIV_S, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_DIV_U, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: mir.MIR_SEL_DIV_U, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_REM_S, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: mir.MIR_SEL_REM_S, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_REM_U, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: mir.MIR_SEL_REM_U, expand: nil, expansion_length: 0 },
 
-    # negate and complement are single A64 instructions (no x86-64 multi-instruction
-    # expansion): NEG is `sub Rd, XZR, Rm` and NOT is `mvn Rd, Rm` (`orn Rd, XZR,
-    # Rm`). the encoder supplies the XZR operand from the surviving `[dst, src]`.
     rules.Rule{ op: mir.MIR_NEG, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: arm64.NEG::u32, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_NOT, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: arm64.MVN::u32, expand: nil, expansion_length: 0 },
 
-    # the register-to-register / ABI pre-coloring move selects to a plain MOV (`orr
-    # Rd, XZR, Rm` for a register source, a MOVZ/MOVK sequence for an immediate). a
-    # FLOAT move - either operand a float vreg or a vector-class pre-color - selects
-    # to FMOV instead, whose encoder emits the S/D `fmov` and dispatches the spilled
-    # frame-slot forms by register class, so a float copy never mis-encodes as a GP
-    # move of the aliasing register index. the spill reload / store moves regalloc
-    # inserts after selection keep the generic MIR_MOV (the GP encoder handles their
-    # frame-slot operand). the float-bank guard precedes its plain-MOV fallback.
     rules.Rule{ op: mir.MIR_MOV, gate: rules.GATE_ANY, guard: rules.guard_fp_bank_move, kind: rules.RULE_RETAG, to: arm64.FMOV::u32, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_MOV, gate: rules.GATE_ANY, guard: nil,                        kind: rules.RULE_RETAG, to: arm64.MOV::u32,  expand: nil, expansion_length: 0 },
-    # a declassify barrier is a register copy: same FP/GP retag as MIR_MOV (#1646).
     rules.Rule{ op: mir.MIR_DECLASSIFY, gate: rules.GATE_ANY, guard: rules.guard_fp_bank_move, kind: rules.RULE_RETAG, to: arm64.FMOV::u32, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_DECLASSIFY, gate: rules.GATE_ANY, guard: nil,                        kind: rules.RULE_RETAG, to: arm64.MOV::u32,  expand: nil, expansion_length: 0 },
 
-    # control flow. an unconditional branch selects to B; a return to RET; an
-    # unreachable terminator to a `brk #0` trap.
     rules.Rule{ op: mir.MIR_BR,          gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: arm64.B::u32,   expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_RET,         gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: arm64.RET::u32, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_UNREACHABLE, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: arm64.BRK::u32, expand: nil, expansion_length: 0 },
 
-    # the comparison family survives selection as a single `[dst, lhs, rhs]`
-    # instruction lifted to a high SELECTION-OUTPUT sentinel so the encoder never
-    # confuses it with a concrete A64 opcode of the same low value; the encoder
-    # materializes the `SUBS XZR, lhs, rhs ; CSET dst, cc` byte sequence, reading
-    # the condition (and its signedness) from the opcode.
     rules.Rule{ op: mir.MIR_CMP_EQ,   gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: mir.MIR_SEL_CMP_EQ,   expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_CMP_NE,   gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: mir.MIR_SEL_CMP_NE,   expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_CMP_LT_S, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: mir.MIR_SEL_CMP_LT_S, expand: nil, expansion_length: 0 },
@@ -319,18 +140,8 @@ pub val RULES: [RULE_COUNT]rules.Rule = [RULE_COUNT]rules.Rule{
     rules.Rule{ op: mir.MIR_CMP_LE_S, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: mir.MIR_SEL_CMP_LE_S, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_CMP_LE_U, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: mir.MIR_SEL_CMP_LE_U, expand: nil, expansion_length: 0 },
 
-    # the conditional branch survives selection as a single
-    # `[cond, then_block, else_block]` instruction (high sentinel): the allocator
-    # reads `cond` as a use and both block operands as the two successor edges; the
-    # encoder materializes the `CBNZ cond, then ; B else` byte sequence.
     rules.Rule{ op: mir.MIR_CBR, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_RETAG, to: mir.MIR_SEL_CBR, expand: nil, expansion_length: 0 },
 
-    # the fused compare-and-branch terminators the engine's combine produces for
-    # the conditions declared in `fused_cbr_ccs` pass through as `[lhs, rhs,
-    # then_block, else_block]` survivors; the encoder materializes `SUBS XZR,
-    # lhs, rhs ; B.cc then ; B else`, dropping the CSET boolean and the CBNZ of
-    # the split pair. scalar-gated: the combine never fuses a vector lane, so a
-    # vector instruction can never take these arms.
     rules.Rule{ op: mir.MIR_SEL_CBR_EQ,   gate: rules.GATE_SCALAR, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_SEL_CBR_NE,   gate: rules.GATE_SCALAR, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_SEL_CBR_LT_S, gate: rules.GATE_SCALAR, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
@@ -338,41 +149,19 @@ pub val RULES: [RULE_COUNT]rules.Rule = [RULE_COUNT]rules.Rule{
     rules.Rule{ op: mir.MIR_SEL_CBR_LE_S, gate: rules.GATE_SCALAR, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_SEL_CBR_LE_U, gate: rules.GATE_SCALAR, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
 
-    # vector lane access (#2236), reachable only because this target declares
-    # `has_lane_ops`: everywhere else the middle end has already rewritten it to the
-    # vector's memory image, which is why these are not in the unconditional
-    # selection alphabet. they pass through on their generic opcode - the element
-    # size, the destination bank and the lane index are all on the instruction
-    # already, so a retag would add nothing - and the encoder picks UMOV / DUP-element
-    # for a read and INS-from-GP / INS-from-element for a write.
     rules.Rule{ op: mir.MIR_VEC_EXTRACT, gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_VEC_INSERT,  gate: rules.GATE_VECTOR, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
 
-    # memory ops pass through unchanged (their generic opcode values are above the
-    # concrete A64 opcode space, so the encoder dispatches them without a sentinel
-    # rewrite). ALLOCA / GEP select to A64 address arithmetic (ADD / SUB), and LOAD /
-    # STORE to LDR / STR with addressing-mode legalization; operand 0 stays a clean
-    # def (or the memory destination for a store). a frame-slot MEM base survives to
-    # the encoder, which resolves it to `[x29 + slot.offset]`.
     rules.Rule{ op: mir.MIR_ALLOCA, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_LOAD,   gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_STORE,  gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_GEP,    gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
 
-    # call / phi pseudo-opcodes pass through unchanged. MIR_CALL is the caller-saved
-    # clobber barrier the shared register allocator keys on; the argument, result,
-    # and phi pseudos are resolved (or skipped) downstream.
     rules.Rule{ op: mir.MIR_CALL,     gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_ARG,      gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_CALL_RES, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_PHI,      gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
 
-    # the scalar float arithmetic / comparison / negate ops pass through keeping
-    # their dedicated high-sentinel MIR opcode, like the integer compare / divide
-    # families: each is a clean `[dst, lhs, rhs]` (or `[dst, src]`) the register
-    # allocator reads by operand shape, and the encoder materializes the A64
-    # scalar-FP byte sequence (FADD/FSUB/FMUL/FDIV/FNEG single words; FCMP + CSET for
-    # the comparison) from the surviving opcode, sizing the S-vs-D form by mi.width.
     rules.Rule{ op: mir.MIR_FADD, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_FSUB, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_FMUL, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
@@ -380,25 +169,10 @@ pub val RULES: [RULE_COUNT]rules.Rule = [RULE_COUNT]rules.Rule{
     rules.Rule{ op: mir.MIR_FCMP, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_FNEG, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
 
-    # a bit reinterpret touching the float / vector bank selects to FMOV, whose
-    # encoder dispatches the machine form by operand register class and width: a
-    # cross-bank scalar `:~` (`f64 :~ i64` / `i32 :~ f32`) transfers the raw bits
-    # between an X/W and an S/D register, and a same-bank vector `:~` (`f32x4 :~
-    # u32x4`, both operands vector-bank) materializes the 128-bit `MOV Vd.16b,
-    # Vn.16b`. routing a vector bitcast to the GP MIR_BITCAST path would emit an ORR
-    # of the aliasing register index, writing a GP register and leaving the vector
-    # destination unpopulated (#2082). a same-bank GP<->GP reinterpret stays
-    # MIR_BITCAST, the plain register copy the integer conversion encoder handles.
-    # the float-bank guard precedes its plain pass-through fallback.
     rules.Rule{ op: mir.MIR_BITCAST, gate: rules.GATE_ANY, guard: rules.guard_fp_bank_move, kind: rules.RULE_RETAG, to: arm64.FMOV::u32, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_BITCAST, gate: rules.GATE_ANY, guard: guard_identity_copy,        kind: rules.RULE_RETAG, to: arm64.MOV::u32,  expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_BITCAST, gate: rules.GATE_ANY, guard: nil,                        kind: rules.RULE_PASS,  to: 0,             expand: nil, expansion_length: 0 },
 
-    # the integer width conversions and the float conversions pass through unchanged:
-    # their generic opcode values sit above the concrete A64 opcode space, so the
-    # encoder dispatches each directly (SXTB/UXTB/width-MOV for the integer forms;
-    # FCVT / SCVTF / UCVTF / FCVTZS / FCVTZU for the float forms) and the allocator
-    # reads operand 0 as a clean def.
     rules.Rule{ op: mir.MIR_TRUNC,    gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_SEXT,     gate: rules.GATE_ANY, guard: guard_identity_copy, kind: rules.RULE_RETAG, to: arm64.MOV::u32, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_SEXT,     gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
@@ -410,24 +184,15 @@ pub val RULES: [RULE_COUNT]rules.Rule = [RULE_COUNT]rules.Rule{
     rules.Rule{ op: mir.MIR_SI_TO_FP, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_UI_TO_FP, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
 
-    # inline assembly passes through unchanged: the encoder parses the asm body and
-    # emits A64 words directly. MIR_ASM carries no operands to rewrite; its
-    # `asm_block` payload is the inline-asm clobber barrier the register allocator
-    # keys on.
     rules.Rule{ op: mir.MIR_ASM, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
 };
 
-# the post-selection plain register-copy opcodes: the concrete GP move (`orr xd,
-# xzr, xn`), the concrete float move (`fmov`), and the generic `mir.MIR_MOV` the
-# reload / store moves regalloc splices after selection keep
 pub val COPY_OPCODES: [COPY_OPCODE_COUNT]u32 = [COPY_OPCODE_COUNT]u32{
     arm64.MOV::u32,
     arm64.FMOV::u32,
     mir.MIR_MOV,
 };
 
-# the comparison opcodes the engine's compare-and-branch fusion combines with a
-# consuming conditional branch on aarch64: all six scalar conditions
 pub val FUSED_CCS: [FUSED_CC_COUNT]u32 = [FUSED_CC_COUNT]u32{
     mir.MIR_CMP_EQ,
     mir.MIR_CMP_NE,
@@ -437,7 +202,6 @@ pub val FUSED_CCS: [FUSED_CC_COUNT]u32 = [FUSED_CC_COUNT]u32{
     mir.MIR_CMP_LE_U,
 };
 
-# the pack handed to the shared engine
 pub val PACK: rules.RulePack = rules.RulePack{
     name:               "aarch64",
     rules:              ?RULES[0],
@@ -448,47 +212,11 @@ pub val PACK: rules.RulePack = rules.RulePack{
     fused_cbr_cc_count: FUSED_CC_COUNT::u32,
 };
 
-# whether an operation width selects the 64-bit (X-register) form
-#
-# MIRRORS `arm64.encode.is64`, including its width-0 fallback to the machine word
-# (a pseudo carrying no natural width). The guard below must agree with it exactly,
-# because that predicate is what both `encode_convert` and `encode_mov` use to pick
-# ORR_X versus ORR_W - so the width-0 case is pinned by the test beside them rather
-# than left to drift.
-# ---
-# width: the operation width in bytes
-# ret:   true when the operation selects the X-register form
 fun width_is_64(width: u8) bool {
     if (width == 0) { ret true; }
     ret width >= 8;
 }
 
-# guard admitting a conversion that is the IDENTITY on A64, so selection can retag
-# it to the plain register move it already encodes as
-#
-# Same selection gap as riscv64 (#2392), but the width rule is DERIVED FROM A64's
-# own canonicalization contract, not carried over. `encode_convert` emits
-# `ORR rd, ZR, rs` for a BITCAST and for a SEXT whose source is already 8 bytes;
-# emitted as CONVERSIONS, so `instr_is_reg_copy` rejected them and the coalescer
-# could not see them (#2443).
-#
-# What differs from riscv64:
-#
-#   - A narrow BITCAST is not a copy HERE either, but for the opposite reason. RV64
-#     canonicalizes a 32-bit value through `sext.w` because the RV64 psABI holds it
-#     sign-extended; A64 emits ORR_W, and a W-register write ZERO-extends into bits
-#     63:32. `mov w0, w0` is therefore not a no-op - it clears the top half - so
-#     only the X form is an identity.
-#   - The SEXT arm needs the DESTINATION width too, which the RV64 guard did not.
-#     RV64's `encode_mov` emits the same `mv` at every width, so a destination term
-#     there was inert; A64's picks ORR_X vs ORR_W off `mi.width`, while
-#     `encode_convert` emits ORR_X unconditionally once the source is 8 bytes. A
-#     SEXT with an 8-byte source and a narrower destination would therefore change
-#     bytes if retagged, so it is not admitted.
-# ---
-# f:   the MIR function owning the instruction (unused; the widths are self-contained)
-# mi:  the instruction under selection
-# ret: true when the conversion is a full-width register copy
 fun guard_identity_copy(f: *mir.MirFunction, mi: *mir.MirInstr) bool {
     if (mi.operand_count != 2)   { ret false; }
     if (!width_is_64(mi.width))  { ret false; }
@@ -496,24 +224,16 @@ fun guard_identity_copy(f: *mir.MirFunction, mi: *mir.MirInstr) bool {
     ret mi.src_width >= 8;
 }
 
-# a float / vector-bank physical register operand for register index `idx` (the
-# composite vector id the allocator hands the float pre-coloring), so a test can
-# drive the float-vs-GP move classification without a vreg table
 fun fp_preg(idx: i32) mir.MirOperand {
     ret mir.op_preg(isa.regid_make(isa.REG_CLASS_ID_XMM, idx)::u32);
 }
 
-# selection rewrites each scalar generic MIR opcode in place into the concrete A64
-# opcode (or the surviving sentinel / pass-through), keying the float-vs-GP move on
-# the operand register class, and retags a vector data-processing op to its NEON
-# opcode. all-physical-register operands keep the test free of a vreg table; the
-# engine only nil-checks its target and allocator, so a zeroed pair suffices. the
-# block carries no expanding rule (the vector compares are exercised separately), so
-# it retags in place
 test "mach.lang.target.isa.arm64.rules:opcode_rewrites" {
     var bad: i32 = 0;
     var alloc: A.Allocator;
-    var tgt:   target.Target;
+    var tgt: isa.BackendTarget;
+    tgt.identity.arch_id = isa.ARCH_AARCH64;
+    tgt.model.pointer_width = 8;
 
     var instrs: [17]mir.MirInstr;
     var ops:    [17][3]mir.MirOperand;
@@ -528,29 +248,21 @@ test "mach.lang.target.isa.arm64.rules:opcode_rewrites" {
         i = i + 1;
     }
 
-    # the three-address integer ops, shifts, divide, and negate / not.
     instrs[0].opcode  = mir.MIR_ADD;
     instrs[1].opcode  = mir.MIR_SHL;
     instrs[2].opcode  = mir.MIR_DIV_S;
     instrs[3].opcode  = mir.MIR_NEG;
-    # the surviving compare / conditional-branch / float-arith pass-throughs.
     instrs[4].opcode  = mir.MIR_CMP_EQ;
     instrs[5].opcode  = mir.MIR_CBR;
     instrs[6].opcode  = mir.MIR_FADD;
-    # a GP move and a float move - the float one keys FMOV off the operand class.
     instrs[7].opcode  = mir.MIR_MOV;
     instrs[8].opcode  = mir.MIR_MOV;
     ops[8][0] = fp_preg(10); ops[8][1] = fp_preg(11);
-    # a bitcast touching the float / vector bank selects FMOV - cross-bank
-    # (instrs[9]); a same-bank GP<->GP bitcast (instrs[10]) stays MIR_BITCAST.
     instrs[9].opcode  = mir.MIR_BITCAST;
     ops[9][0] = fp_preg(10); ops[9][1] = mir.op_preg(11);
     instrs[10].opcode = mir.MIR_BITCAST;
-    # control flow.
     instrs[11].opcode = mir.MIR_BR;
     instrs[12].opcode = mir.MIR_RET;
-    # NEON vector data-processing rewrites: a vector add / and / equality compare
-    # retag to their VEC_* opcode ahead of the scalar rule.
     instrs[13].opcode = mir.MIR_ADD;    instrs[13].vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, 4, 4);
     instrs[14].opcode = mir.MIR_AND;    instrs[14].vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, 4, 4);
     instrs[15].opcode = mir.MIR_CMP_EQ; instrs[15].vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, 4, 4);
@@ -566,8 +278,8 @@ test "mach.lang.target.isa.arm64.rules:opcode_rewrites" {
     f.block_count = 1;
     f.vreg_count  = 0;
 
-    val r: R.Result[bool, str] = select(?alloc, ?tgt, ?f);
-    if (R.is_err[bool, str](r)) { ret 1; }
+    val r: R.Result[R.Void, str] = select(?alloc, ?tgt, ?f);
+    if (R.is_err[R.Void, str](r)) { ret 1; }
 
     if (instrs[0].opcode  != arm64.ADD::u32)      { bad = 1; }
     if (instrs[1].opcode  != arm64.LSL::u32)      { bad = 1; }
@@ -575,23 +287,21 @@ test "mach.lang.target.isa.arm64.rules:opcode_rewrites" {
     if (instrs[3].opcode  != arm64.NEG::u32)      { bad = 1; }
     if (instrs[4].opcode  != mir.MIR_SEL_CMP_EQ)  { bad = 1; }
     if (instrs[5].opcode  != mir.MIR_SEL_CBR)     { bad = 1; }
-    if (instrs[6].opcode  != mir.MIR_FADD)        { bad = 1; }  # float arith survives
-    if (instrs[7].opcode  != arm64.MOV::u32)      { bad = 1; }  # GP move
-    if (instrs[8].opcode  != arm64.FMOV::u32)     { bad = 1; }  # float move
-    if (instrs[9].opcode  != arm64.FMOV::u32)     { bad = 1; }  # cross-bank bitcast
-    if (instrs[10].opcode != mir.MIR_BITCAST)     { bad = 1; }  # same-bank GP bitcast survives
+    if (instrs[6].opcode  != mir.MIR_FADD)        { bad = 1; }
+    if (instrs[7].opcode  != arm64.MOV::u32)      { bad = 1; }
+    if (instrs[8].opcode  != arm64.FMOV::u32)     { bad = 1; }
+    if (instrs[9].opcode  != arm64.FMOV::u32)     { bad = 1; }
+    if (instrs[10].opcode != mir.MIR_BITCAST)     { bad = 1; }
     if (instrs[11].opcode != arm64.B::u32)        { bad = 1; }
     if (instrs[12].opcode != arm64.RET::u32)      { bad = 1; }
-    if (instrs[13].opcode != arm64.VEC_ADD::u32)  { bad = 1; }  # vector add
-    if (instrs[14].opcode != arm64.VEC_AND::u32)  { bad = 1; }  # vector and
-    if (instrs[15].opcode != arm64.VEC_CMEQ::u32) { bad = 1; }  # vector equality compare
-    if (instrs[16].opcode != arm64.VEC_DIV::u32)  { bad = 1; }  # vector float divide
+    if (instrs[13].opcode != arm64.VEC_ADD::u32)  { bad = 1; }
+    if (instrs[14].opcode != arm64.VEC_AND::u32)  { bad = 1; }
+    if (instrs[15].opcode != arm64.VEC_CMEQ::u32) { bad = 1; }
+    if (instrs[16].opcode != arm64.VEC_DIV::u32)  { bad = 1; }
 
     ret bad;
 }
 
-# the copy-hygiene move classifier admits both concrete move forms (GP and float)
-# and the generic MIR_MOV regalloc splices, and rejects a non-move opcode
 test "mach.lang.target.isa.arm64.rules:is_reg_move" {
     if (!is_reg_move(arm64.MOV::u32))  { ret 1; }
     if (!is_reg_move(arm64.FMOV::u32)) { ret 1; }
@@ -600,15 +310,11 @@ test "mach.lang.target.isa.arm64.rules:is_reg_move" {
     ret 0;
 }
 
-# a bit reinterpret touching the float / vector bank selects FMOV; only a GP<->GP
-# reinterpret stays MIR_BITCAST. a same-bank vector `:~` (both operands float-bank)
-# reaching the GP MIR_BITCAST encode path emits an ORR of the aliasing register
-# index, writing a GP register and leaving the vector destination unpopulated.
-# regression guard for the aarch64 vector `:~` miscompile (#2082), exercised through
-# the full select path
 test "mach.lang.target.isa.arm64.rules:bitcast_bank_selects_fmov" {
     var alloc: A.Allocator;
-    var tgt:   target.Target;
+    var tgt: isa.BackendTarget;
+    tgt.identity.arch_id = isa.ARCH_AARCH64;
+    tgt.model.pointer_width = 8;
     var vregs: [2]mir.MirVReg;
 
     var ops: [2]mir.MirOperand;
@@ -630,52 +336,35 @@ test "mach.lang.target.isa.arm64.rules:bitcast_bank_selects_fmov" {
     f.vregs       = ?vregs[0];
     f.vreg_count  = 2;
 
-    # both operands in the float / vector bank: a vector reinterpret -> FMOV.
     vregs[0].class = 1; vregs[1].class = 1;
     instrs[0].opcode = mir.MIR_BITCAST;
-    if (R.is_err[bool, str](select(?alloc, ?tgt, ?f))) { ret 1; }
+    if (R.is_err[R.Void, str](select(?alloc, ?tgt, ?f))) { ret 1; }
     if (instrs[0].opcode != arm64.FMOV::u32) { ret 1; }
 
-    # a same-bank GP<->GP reinterpret is a plain GP register copy, and at machine
-    # width it now selects to the concrete MOV so the coalescer can see it (#2443 -
-    # this fixture sets no width, which `width_is_64` reads as the machine word).
-    # what #2082 guards is unchanged and asserted more strictly than before: the GP
-    # reinterpret must NOT reach FMOV, whose encoder would write the float bank.
     vregs[0].class = mir.REG_CLASS_GP; vregs[1].class = mir.REG_CLASS_GP;
     instrs[0].opcode = mir.MIR_BITCAST;
-    if (R.is_err[bool, str](select(?alloc, ?tgt, ?f))) { ret 2; }
+    if (R.is_err[R.Void, str](select(?alloc, ?tgt, ?f))) { ret 2; }
     if (instrs[0].opcode == arm64.FMOV::u32) { ret 2; }
     if (instrs[0].opcode != arm64.MOV::u32)  { ret 2; }
 
-    # a cross-bank scalar reinterpret (one float side) -> FMOV.
     vregs[0].class = 1; vregs[1].class = mir.REG_CLASS_GP;
     instrs[0].opcode = mir.MIR_BITCAST;
-    if (R.is_err[bool, str](select(?alloc, ?tgt, ?f))) { ret 3; }
+    if (R.is_err[R.Void, str](select(?alloc, ?tgt, ?f))) { ret 3; }
     if (instrs[0].opcode != arm64.FMOV::u32) { ret 3; }
 
     ret 0;
 }
 
-# every generic opcode that can reach selection terminates in a rule - the scalar
-# alphabet via a scalar probe and the NEON alphabet via a vector probe - and the
-# three ops eliminated before selection ever runs stay default-deny: the table
-# cannot silently lose an opcode. also pins the table at its exact storage length,
-# so an appended rule and the storage size can never drift apart
 test "mach.lang.target.isa.arm64.rules:generic_opcode_coverage" {
     val pack: *rules.RulePack = ?PACK;
-    if (pack.rule_count != 85) { ret 1; }
+    if (pack.rule_count != 87) { ret 1; }
 
-    # the shared selection alphabet (a property of mir.lower_ir, one table for
-    # every pack's coverage test): reachable opcodes must terminate in a rule.
     var reachable: [mir.SELECTION_REACHABLE_COUNT]u32;
     mir.selection_reachable(?reachable[0]);
 
-    # the opcodes eliminated before selection stay default-deny.
     var eliminated: [mir.SELECTION_ELIMINATED_COUNT]u32;
     mir.selection_eliminated(?eliminated[0]);
 
-    # the NEON alphabet: every generic opcode that takes a GATE_VECTOR rule when the
-    # instruction is vector-typed.
     var reachable_vec: [20]u32;
     reachable_vec[0]  = mir.MIR_ADD;
     reachable_vec[1]  = mir.MIR_SUB;
@@ -702,9 +391,6 @@ test "mach.lang.target.isa.arm64.rules:generic_opcode_coverage" {
     ops[0] = mir.op_preg(10);
     ops[1] = mir.op_preg(11);
     ops[2] = mir.op_preg(12);
-    # the opcode is the loop variable below - every use assigns it first - so the
-    # constructor's is dead. `vec_lane` is cleared by construction, which is the
-    # VEC_LANE_NONE this probe wants.
     var probe: mir.MirInstr = mir.instr(mir.MIR_ADD, ?ops[0], 3, 8, 0);
 
     var f: mir.MirFunction;
@@ -731,7 +417,6 @@ test "mach.lang.target.isa.arm64.rules:generic_opcode_coverage" {
         i = i + 1;
     }
 
-    # the fused survivors the engine's combine produces must be admitted.
     var fused: [mir.SELECTION_FUSED_COUNT]u32;
     mir.selection_fused(?fused[0]);
     i = 0;
@@ -743,11 +428,6 @@ test "mach.lang.target.isa.arm64.rules:generic_opcode_coverage" {
     }
     if (pack.fused_cbr_cc_count != 6) { ret 1; }
 
-    # the capability-gated lane alphabet: this target declares `has_lane_ops`, so the
-    # middle end hands it MIR_VEC_EXTRACT / MIR_VEC_INSERT and its table must admit
-    # them. a pack that does not opt in keeps them default-deny, which is why they are
-    # not in `selection_reachable` - that list is unconditional and every pack's
-    # coverage test probes all of it (#2236).
     var lane: [mir.SELECTION_LANE_COUNT]u32;
     mir.selection_lane(?lane[0]);
     i = 0;
@@ -758,10 +438,6 @@ test "mach.lang.target.isa.arm64.rules:generic_opcode_coverage" {
         i = i + 1;
     }
 
-    # the capability-gated widening multiply: this target declares `mul_hi_width = 0`,
-    # so `be.codegen.legalize` synthesizes the high half instead of forming
-    # MIR_MUL_HI_U, and this table must keep it default-deny. the riscv pack asserts
-    # the other side of the same contract in this position (#2778).
     var wmul: [mir.SELECTION_WIDENING_MUL_COUNT]u32;
     mir.selection_widening_mul(?wmul[0]);
     i = 0;
@@ -771,41 +447,44 @@ test "mach.lang.target.isa.arm64.rules:generic_opcode_coverage" {
         if (rules.find_rule(pack, ?f, ?probe) != nil) { ret 1; }
         i = i + 1;
     }
+
+    if (arm64.HAS_FLOAT) {
+        var rfloat: [mir.SELECTION_REACHABLE_FLOAT_COUNT]u32;
+        mir.selection_reachable_float(?rfloat[0]);
+        i = 0;
+        for (i < mir.SELECTION_REACHABLE_FLOAT_COUNT) {
+            probe.opcode   = rfloat[i];
+            probe.vec_lane = mir.VEC_LANE_NONE;
+            if (rules.find_rule(pack, ?f, ?probe) == nil) { ret 1; }
+            i = i + 1;
+        }
+    }
     ret 0;
 }
 
-# a vector ordering compare expands to one NEON piece with the lhs and rhs
-# (operands 1 and 2) swapped, the destination held in place, and every identity
-# field carried onto the piece. the swapped operand order normalizes `a < b` to `b
-# > a` (VEC_CMGT); the identity carriage proves the piece is built through the
-# engine's `emit` (which copies width, vec_lane, loc, inline_site, and the first
-# piece's -g bindings), never a zeroed buffer
 test "mach.lang.target.isa.arm64.rules:vector_compare_swaps_operands" {
     var backing: A.Allocator;
     if (O.is_some[str](page.make(?backing))) { ret 1; }
-    var tgt: target.Target;
+    var tgt: isa.BackendTarget;
+    tgt.identity.arch_id = isa.ARCH_AARCH64;
+    tgt.model.pointer_width = 8;
 
-    # block storage the engine will release must come from the allocator.
     val res_instrs: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](?backing, 1::usize);
     if (R.is_err[*mir.MirInstr, str](res_instrs)) { ret 1; }
     val instrs: *mir.MirInstr = R.unwrap_ok[*mir.MirInstr, str](res_instrs);
 
-    # the source operand array is released by the engine once the piece is emitted,
-    # so it too must come from the allocator.
     val res_ops: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](?backing, 3::usize);
     if (R.is_err[*mir.MirOperand, str](res_ops)) { ret 1; }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](res_ops);
-    ops[0] = mir.op_preg(20);  # dst
-    ops[1] = mir.op_preg(21);  # lhs
-    ops[2] = mir.op_preg(22);  # rhs
+    ops[0] = mir.op_preg(20);
+    ops[1] = mir.op_preg(21);
+    ops[2] = mir.op_preg(22);
 
     var bindings: [1]mir.MirDbgBinding;
     bindings[0].iid  = 7;
     bindings[0].vreg = 3;
     bindings[0].cmp_op = 0;
 
-    # a signed vector less-than at an int lane: opcode is VEC_CMGT regardless of the
-    # lane's float/int kind, so the swap is the only variable under test.
     instrs[0].opcode            = mir.MIR_CMP_LT_S;
     instrs[0].operands          = ops;
     instrs[0].operand_count     = 3;
@@ -828,22 +507,18 @@ test "mach.lang.target.isa.arm64.rules:vector_compare_swaps_operands" {
     f.block_count = 1;
     f.vreg_count  = 0;
 
-    val r: R.Result[bool, str] = select(?backing, ?tgt, ?f);
-    if (R.is_err[bool, str](r)) { ret 1; }
+    val r: R.Result[R.Void, str] = select(?backing, ?tgt, ?f);
+    if (R.is_err[R.Void, str](r)) { ret 1; }
 
-    # one instruction stayed one instruction in a fresh exactly-sized array.
     if (blk.instr_count != 1) { ret 1; }
     if (blk.instr_cap != 1)   { ret 1; }
 
-    # the normalized NEON opcode and the swapped operand order (dst held, lhs and
-    # rhs exchanged).
     if (blk.instrs[0].opcode != arm64.VEC_CMGT::u32) { ret 1; }
     if (blk.instrs[0].operand_count != 3)            { ret 1; }
-    if (blk.instrs[0].operands[0].preg != 20)        { ret 1; }  # dst in place
-    if (blk.instrs[0].operands[1].preg != 22)        { ret 1; }  # was rhs
-    if (blk.instrs[0].operands[2].preg != 21)        { ret 1; }  # was lhs
+    if (blk.instrs[0].operands[0].preg != 20)        { ret 1; }
+    if (blk.instrs[0].operands[1].preg != 22)        { ret 1; }
+    if (blk.instrs[0].operands[2].preg != 21)        { ret 1; }
 
-    # every identity field carried onto the piece.
     if (blk.instrs[0].width != 16)                                              { ret 1; }
     if (blk.instrs[0].src_width != 4)                                           { ret 1; }
     if (blk.instrs[0].vec_lane != mir.vec_lane_make(mir.VEC_LANE_INT, 4, 4))       { ret 1; }
@@ -856,11 +531,6 @@ test "mach.lang.target.isa.arm64.rules:vector_compare_swaps_operands" {
     ret 0;
 }
 
-# a float ordering compare arrives in the generic unsigned form (a float operand is
-# not "signed"), and must select the float ordered compare (FCMGT/FCMGE), not the
-# unsigned integer compare (CMHI/CMHS). integer unsigned compares are unaffected.
-# regression guard for the aarch64 float `< <= > >=` miscompile, exercised through
-# the full select path
 test "mach.lang.target.isa.arm64.rules:float_ordering_compare_selects_float" {
     if (sel_vec_cmp(mir.MIR_CMP_LT_U, mir.vec_lane_make(mir.VEC_LANE_FLOAT, 4, 4)) != arm64.VEC_CMGT::u32) { ret 1; }
     if (sel_vec_cmp(mir.MIR_CMP_LT_U, mir.vec_lane_make(mir.VEC_LANE_INT, 4, 4))   != arm64.VEC_CMHI::u32) { ret 2; }
@@ -869,14 +539,12 @@ test "mach.lang.target.isa.arm64.rules:float_ordering_compare_selects_float" {
     ret 0;
 }
 
-# select a single vector compare through the full engine and return the emitted
-# piece's opcode, or 0 on any failure. the block storage and the source operands
-# come from a page allocator because the compare expands and the engine rebuilds
-# the block
 fun sel_vec_cmp(opcode: u32, lane: u32) u32 {
     var backing: A.Allocator;
     if (O.is_some[str](page.make(?backing))) { ret 0; }
-    var tgt: target.Target;
+    var tgt: isa.BackendTarget;
+    tgt.identity.arch_id = isa.ARCH_AARCH64;
+    tgt.model.pointer_width = 8;
 
     val res_instrs: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](?backing, 1::usize);
     if (R.is_err[*mir.MirInstr, str](res_instrs)) { ret 0; }
@@ -906,42 +574,36 @@ fun sel_vec_cmp(opcode: u32, lane: u32) u32 {
     f.block_count = 1;
     f.vreg_count  = 0;
 
-    val r: R.Result[bool, str] = select(?backing, ?tgt, ?f);
-    if (R.is_err[bool, str](r)) { ret 0; }
+    val r: R.Result[R.Void, str] = select(?backing, ?tgt, ?f);
+    if (R.is_err[R.Void, str](r)) { ret 0; }
     ret blk.instrs[0].opcode;
 }
 
-# vector shift and remainder have no NEON form: reaching selection is a loud error,
-# never a silent fall-through to a scalar shift / divide opcode
 test "mach.lang.target.isa.arm64.rules:vector_shift_rem_unsupported" {
     if (!vec_op_errors(mir.MIR_SHL))   { ret 1; }
     if (!vec_op_errors(mir.MIR_SHR_S)) { ret 2; }
     if (!vec_op_errors(mir.MIR_SHR_U)) { ret 3; }
     if (!vec_op_errors(mir.MIR_REM_S)) { ret 4; }
     if (!vec_op_errors(mir.MIR_REM_U)) { ret 5; }
-    # the same opcodes at a scalar lane select cleanly (the loud error is
-    # vector-only).
     if (vec_op_errors_scalar(mir.MIR_SHL))   { ret 6; }
     if (vec_op_errors_scalar(mir.MIR_REM_U)) { ret 7; }
     ret 0;
 }
 
-# whether selecting a single vector-typed instruction of `opcode` fails loudly
 fun vec_op_errors(opcode: u32) bool {
     ret vec_op_select_fails(opcode, mir.vec_lane_make(mir.VEC_LANE_INT, 4, 4));
 }
 
-# whether selecting a single scalar instruction of `opcode` fails (it must not)
 fun vec_op_errors_scalar(opcode: u32) bool {
     ret vec_op_select_fails(opcode, mir.VEC_LANE_NONE);
 }
 
-# run `select` on a single-instruction block and report whether it errored. the
-# storage comes from a page allocator so an expanding rule can rebuild the block
 fun vec_op_select_fails(opcode: u32, lane: u32) bool {
     var backing: A.Allocator;
     if (O.is_some[str](page.make(?backing))) { ret false; }
-    var tgt: target.Target;
+    var tgt: isa.BackendTarget;
+    tgt.identity.arch_id = isa.ARCH_AARCH64;
+    tgt.model.pointer_width = 8;
 
     val res_instrs: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](?backing, 1::usize);
     if (R.is_err[*mir.MirInstr, str](res_instrs)) { ret false; }
@@ -971,33 +633,29 @@ fun vec_op_select_fails(opcode: u32, lane: u32) bool {
     f.block_count = 1;
     f.vreg_count  = 0;
 
-    ret R.is_err[bool, str](select(?backing, ?tgt, ?f));
+    ret R.is_err[R.Void, str](select(?backing, ?tgt, ?f));
 }
 
-# a conversion that is the identity at X-register width selects to the plain
-# register move it already encodes as, and every narrower form does not
-#
-# `encode_convert` emitted `ORR rd, ZR, rs` for a BITCAST and for a SEXT whose
-# source is already 8 bytes, but as a CONVERSION - so `instr_is_reg_copy` rejected
-# it and the coalescer never saw it (#2443, the aarch64 sibling of #2392).
-#
-# The narrow cases are what make the guard A64-SPECIFIC rather than a copy of the
-# RV64 one, and each is pinned here:
-#
-#   - a 4-byte BITCAST stays generic because ORR_W ZERO-extends into bits 63:32, so
-#     `mov w0, w0` clears the top half and is not a no-op. RV64 rejects the same
-#     case for the opposite reason (`sext.w`).
-#   - a SEXT with an 8-byte SOURCE and a narrower DESTINATION stays generic. This
-#     term does not exist in the RV64 guard: RV64's `encode_mov` emits the same `mv`
-#     at every width, but A64's picks ORR_X vs ORR_W off `mi.width` while
-#     `encode_convert` emits ORR_X unconditionally - so retagging that shape would
-#     change the emitted bytes.
-#   - a width of 0 IS admitted, matching `encode.is64`'s machine-word fallback,
-#     which is what keeps `width_is_64` from drifting away from it.
+fun vec_op_ok(opcode: u32, lane: u32) bool {
+    ret !vec_op_select_fails(opcode, lane);
+}
+
+test "mach.lang.target.isa.arm64.rules:integer_vector_divide_unsupported" {
+    if (!vec_op_errors(mir.MIR_DIV_S)) { ret 1; }
+    if (!vec_op_errors(mir.MIR_DIV_U)) { ret 2; }
+    if (!vec_op_ok(mir.MIR_DIV_S, mir.vec_lane_make(mir.VEC_LANE_FLOAT, 4, 4))) { ret 3; }
+    if (!vec_op_ok(mir.MIR_DIV_U, mir.vec_lane_make(mir.VEC_LANE_FLOAT, 8, 2))) { ret 4; }
+    if (vec_op_errors_scalar(mir.MIR_DIV_S)) { ret 5; }
+    if (vec_op_errors_scalar(mir.MIR_DIV_U)) { ret 6; }
+    ret 0;
+}
+
 test "mach.lang.target.isa.arm64.rules:identity_conversions_select_to_a_move" {
     var bad: i32 = 0;
     var alloc: A.Allocator;
-    var tgt:   target.Target;
+    var tgt: isa.BackendTarget;
+    tgt.identity.arch_id = isa.ARCH_AARCH64;
+    tgt.model.pointer_width = 8;
 
     var instrs: [8]mir.MirInstr;
     var ops:    [8][2]mir.MirOperand;
@@ -1013,30 +671,18 @@ test "mach.lang.target.isa.arm64.rules:identity_conversions_select_to_a_move" {
         i = i + 1;
     }
 
-    # an 8-byte GP reinterpret is a full-width copy.
     instrs[0].opcode = mir.MIR_BITCAST;
-    # a 4-byte reinterpret is NOT: ORR_W zero-extends into the high half.
     instrs[1].opcode = mir.MIR_BITCAST;
     instrs[1].width  = 4;
-    # a sign-extension whose source already fills the register has nothing to do.
     instrs[2].opcode = mir.MIR_SEXT;
-    # a real widening sign-extension does.
     instrs[3].opcode    = mir.MIR_SEXT;
     instrs[3].src_width = 1;
-    # an 8-byte source into a NARROWER destination: ORR_X from the conversion
-    # encoder, but ORR_W from the move encoder, so retagging would change bytes.
     instrs[4].opcode = mir.MIR_SEXT;
     instrs[4].width  = 4;
-    # a width of 0 is the machine word, matching `encode.is64`.
     instrs[5].opcode = mir.MIR_BITCAST;
     instrs[5].width  = 0;
-    # the float-bank rule still precedes the identity guard at full width.
     instrs[6].opcode = mir.MIR_BITCAST;
     ops[6][0] = fp_preg(10);
-    # a 4-byte source widened to 8: the destination IS the machine word, so only the
-    # `src_width >= 8` half rejects it - and it must be rejected. this is a real
-    # SBFM sign-extension, and retagging it to a MOV would emit ORR_X and drop the
-    # sign extension entirely.
     instrs[7].opcode    = mir.MIR_SEXT;
     instrs[7].src_width = 4;
 
@@ -1050,8 +696,8 @@ test "mach.lang.target.isa.arm64.rules:identity_conversions_select_to_a_move" {
     f.block_count = 1;
     f.vreg_count  = 0;
 
-    val r: R.Result[bool, str] = select(?alloc, ?tgt, ?f);
-    if (R.is_err[bool, str](r)) { ret 1; }
+    val r: R.Result[R.Void, str] = select(?alloc, ?tgt, ?f);
+    if (R.is_err[R.Void, str](r)) { ret 1; }
 
     if (instrs[0].opcode != arm64.MOV::u32)  { bad = 1; }
     if (instrs[1].opcode != mir.MIR_BITCAST) { bad = 1; }
@@ -1062,8 +708,6 @@ test "mach.lang.target.isa.arm64.rules:identity_conversions_select_to_a_move" {
     if (instrs[6].opcode != arm64.FMOV::u32) { bad = 1; }
     if (instrs[7].opcode != mir.MIR_SEXT)    { bad = 1; }
 
-    # the retagged form must now be what the copy machinery calls a move, which is
-    # the entire point of the retag - a conversion opcode is not one.
     if (!is_reg_move(arm64.MOV::u32)) { bad = 1; }
     if (is_reg_move(mir.MIR_BITCAST)) { bad = 1; }
     if (is_reg_move(mir.MIR_SEXT))    { bad = 1; }

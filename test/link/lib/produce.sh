@@ -87,6 +87,10 @@
 #                 build carries one; a profiler, a debugger and a crash dumper all
 #                 read it, and nothing the program computes depends on it. requires
 #                 llvm-readelf.
+#   elf-needed  — read the ELF `.dynamic` section's DT_NEEDED entries and report
+#                 the dependency list, sorted, or "none" for a fully static image.
+#                 requires readelf.
+#   link-provider - report whether a local link dependency's symbol is defined. requires nm.
 #   gdb-session — drive a real gdb batch session over the `-g` artifact and report
 #                 where it stopped, which frame it named, and what each local read
 #                 back as (#2756). debuginfo checks the ENCODING; this checks what a
@@ -2159,6 +2163,43 @@ produce_debuginfo() {
     done
 }
 
+# produce_elf-needed <engine> <leg> <binary>
+# the ELF DT_NEEDED observable: one `name` line per shared-library dependency the
+# `.dynamic` section actually carries, sorted, or the literal line "none" when the
+# image has no PT_DYNAMIC segment at all (a fully static link). mach's own ELF
+# writer does not emit a conventional `.dynstr`/`.dynsym` section pair the way a
+# hand-parsed byte reader could walk directly (`.dynamic` is the only dynamic-linking
+# section it emits), so this shells out to `readelf -d` rather than reimplementing
+# ELF dynamic-section parsing; the same tool dependency `symtab` already requires.
+produce_elf_needed() {
+    b=$3
+    command -v readelf >/dev/null 2>&1 || {
+        echo "link: elf-needed: readelf not found (install the 'binutils' package)" >&2; return 2
+    }
+    # readelf prints an explanatory sentence (exit 0) rather than empty output
+    # when a static image has no PT_DYNAMIC segment at all, so the absence check
+    # is on the filtered NEEDED lines, not on readelf's raw output.
+    needed=$(readelf -d "$b" 2>/dev/null | awk -F'[][]' '/\(NEEDED\)/ { print $2 }' | sort)
+    if [ -z "$needed" ]; then
+        echo "none"
+        return 0
+    fi
+    printf '%s\n' "$needed"
+}
+
+# produce_link_provider <engine> <leg> <binary>
+produce_link_provider() {
+    b=$3
+    command -v nm >/dev/null 2>&1 || {
+        echo "link: link-provider: nm not found (install the 'binutils' package)" >&2; return 2
+    }
+    if nm "$b" 2>/dev/null | grep -qE ' T provider_marker$'; then
+        echo "provider_marker=defined"
+    else
+        echo "provider_marker=missing"
+    fi
+}
+
 # produce_symtab <engine> <leg> <binary>
 # the ELF `.symtab` observable (#2772): a PLAIN build (no `-g`, no special flag -
 # the shape a shipped release binary actually has) now carries a real function
@@ -2829,6 +2870,8 @@ produce() {
         built)       produce_built "$@" ;;
         debuginfo)   produce_debuginfo "$@" ;;
         symtab)      produce_symtab "$@" ;;
+        elf-needed)  produce_elf_needed "$@" ;;
+        link-provider) produce_link_provider "$@" ;;
         gdb-session) produce_gdb_session "$@" ;;
         spirv-val-vulkan) produce_spirv_val_vulkan "$@" ;;
         spirv-image)  produce_spirv_image "$@" ;;

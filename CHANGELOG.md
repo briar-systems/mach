@@ -5,6 +5,229 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.30.0] - Unreleased
+
+The compatible transition release. Every language and manifest form 4.26.x
+accepted is still accepted, the new forms are accepted beside them, and 4.30.0
+becomes the seed that builds 5.0.0. Two CLI flags are gone, listed under
+"Removed". Everything else that goes away is listed under "Planned for 5.0.0"
+at the end of this section.
+
+### Added
+
+#### Language
+
+- `expr:>T` is the declassification form. It produces the same node as `expr:^T`, the target type is required, and every declassification diagnostic now names `:>T`. The `:^` and `:^T` forms remain accepted.
+- A typed literal suffix is honored. `7u32` has type `u32`, inference reports the suffix type instead of the `i64` or `f64` default, a conflicting context is a type error with no implicit conversion, and the value is range-checked against the suffixed type with the negated bound checked under a unary minus. An `f32` suffix rounds at its width at compile time.
+- `$each` iterates an imported constant array (#2157).
+
+#### Manifest and dependencies
+
+- The dependency model is a flat closure owned by the root project. Every member lands at `dep/<id>` one level deep as a git submodule, the committed gitlink is the pin, and the manifest key, the directory under `dep/`, and the project id are one name. A consumed dependency's own `dep/` is never initialized.
+- A package declares only what it uses directly. Its dependencies' dependencies reach the root's `dep/` through closure computation. An identity reached through two chains with different selections stops the command and prints both chains and the root declaration that decides.
+- `mach dep verify [<path>]` runs the build's dependency checks as a command without changing anything, and names a directory under `dep/` that is not in the closure.
+- `mach dep add`, `mach dep remove`, and `mach dep update` move the manifest, `.gitmodules`, and the gitlinks together or not at all. `update` alone moves selectors. A failed clone exits 3.
+- Dependency verification reads the index, not HEAD, so `mach init` followed by `mach build .` works with nothing committed. A project nested inside an unrelated repository realizes dependencies as plain clones and verifies against the checkout.
+- A `path` dependency is copied into `dep/<id>` as tracked content, never symlinked.
+- `mach init` scaffolds on `std.runtime`, declares `[dep.std]` at `branch/main`, and realizes it as a submodule. `--no-deps` publishes the scaffold and prints the `mach dep pull` it skipped.
+- `default = true` on `[target.*]`, `[profile.*]`, and `[artifact.*]` selects among several declarations. Selection never reads table order. Zero declared profiles get the built-in `debug` and `release`, and one declared profile selects itself.
+- An artifact's `need` names build steps, other artifacts, or `*` globs over both. A required artifact is planned before its consumer, on the consumer's target when the requirement declares it and otherwise on every target the requirement names, and `{artifact.<id>.out}` expands to its output path relative to the project root, including inside `#[embed]`. A failed requirement fails its consumer by name.
+- `env` on `[target.*]` names a consumer environment owned by the target's ISA. SPIR-V defines `vulkan1.0` through `vulkan1.3`, which fix the SPIR-V version word and cap the capability set.
+- `timeout_seconds` on `[step.<name>]` bounds a build step. Its process group is terminated at the bound and the build fails naming the step.
+- `[link.X]` gains `include = "always"` (the default) and `include = "referenced"`, so a dynamic library is named in the image only when a live import references it (#2800).
+- Build steps resolve ordinary relative fields under their execution root and `{project.out}` fields under the consumer's output root, with escapes rejected. `MACH_TARGET_ISA`, `MACH_TARGET_OS`, and `MACH_TARGET_ABI` are set exactly once in every step process.
+
+#### CLI
+
+- `--timeout_seconds <n>` on `mach test` bounds each spawned test process and its process group independently. A timed-out test is its own reported kind, counted on the summary line and in the JSON summary, and the suite exits 1.
+- `--timeout_seconds <n>` on `mach run` bounds the run. A terminated run exits 3.
+- Every command is described once by a closed schema and parsed in one pass. Help renders exactly the schema the parser consumes.
+- An environmental failure, such as a directory that could not be created or a clone that failed, is its own outcome with exit code 3, distinct from a rejected program and from a compiler defect.
+- A diagnostic excerpt is windowed to 120 characters around the span, with 40 of context before it and `...` on each cut side. Column numbers are unchanged.
+- `mach test` distinguishes an infrastructure failure (exit 2) from an ordinary test failure (exit 1).
+
+#### Standard library
+
+The pin moves from 0.28.1 to 0.37.1.
+
+- 0.28.2: `Vector[T]` clears released storage metadata and survives repeated teardown.
+- 0.31.0: libc-free linkage. An ordinary linux binary carries no `PT_INTERP` and no dynamic section, and the compiler adopts the normalized io error surface.
+- 0.35.0: `std.filesystem.transaction`, contained directory operations on `Root`, process supervision against a deadline with group termination and a retried interrupted wait, an advisory whole-file lock, and the `std.allocator` fail-at-N testing allocator. The compiler's publication and subprocess layers moved onto them and `src/filesystem/` is gone.
+- 0.35.1: every darwin `libSystem` import names its library.
+- 0.35.2: the TOML reader bounds nesting at 64.
+- 0.36.0: `R.Void` and `R.ok_void`, a success that carries nothing.
+- 0.36.1: `R.void_of`, narrowing a result to `Void`.
+- 0.37.0: the `transaction.prepare` producer returns `Result[Void, str]`. The `ok(false)` abort arm is gone and `err` is the only abort.
+- 0.37.1: `root_remove_tree`, root-anchored recursive removal with a depth bound of 256.
+
+### Changed
+
+#### Language
+
+- `$mach.abi.sysv` resolves to `sysv64` with a deprecation warning naming the registry spelling.
+- Run-time and compile-time conditions accept exactly `u8` with one as truth. Union builds resolve compile-time gates per target tuple with isolated bindings, and a cross-module reader of a tuple-gated constant is refused rather than handed a first-tuple value.
+- Arithmetic and bitwise binary operators require both operands to share one type. Comparisons keep the mixed-width rule and shifts keep a free count width.
+- A record or union declared volatile makes every access to its fields a volatile access, through any access shape.
+- Omitted fields in a partial record or union literal zero-fill at run time, at compile time, and in constant data alike.
+- Floating-point types are rejected at semantic analysis on a target whose machine model declares no float support, naming the type and the target.
+- An exceptional integer division traps on `riscv64` and `riscv32` as it already did on `x86_64` and `aarch64`, instead of producing the ISA's defined result.
+
+#### Manifest and dependencies
+
+- `mach.lock` is neither read nor written. The committed gitlinks under `dep/` are the record.
+- A `[dep.<key>]` whose key is not the realized project's id is accepted with a note naming the rename.
+- The manifest is a closed schema at the document root too. An unknown top-level table is rejected as an unknown key inside `[project]` already was.
+- Several targets, profiles, or artifacts with none marked `default = true` still select the first declared, with a deprecation warning.
+- An `#[embed]` path that escapes the project root warns.
+- `#[embed]` resolves through one resolver shared by every phase, and a templated argument resolves against the project root.
+- Manifest-controlled paths, including outputs, artifact outputs, local links, step paths, and `-o`, must be canonical project-relative descendants, checked again after template substitution.
+- Dependency, target, artifact, profile, and link names share one portable identifier grammar.
+- Build steps and test children are process-group leaders, so their descendants die with them.
+- `mach dep add` and `mach dep remove` preserve everything in the manifest they did not deliberately change and refuse an ambiguous edit.
+
+#### CLI
+
+- `mach clean` enumerates every declared target, profile, and artifact through the build planner's own resolution. A template beginning with a dynamic component used to clean nothing.
+- `mach clean` and `mach dep` remove through a root capability that refuses a path escaping the project root or reached through a symlink.
+- `mach run` honors `-o`, and rejects the build-only options it used to accept and ignore, naming the first offending token.
+- `mach test` rejects `--emit`, and `--quiet` suppresses the build banner for `build` and `test`.
+- `mach dep sync` is a deprecated alias of `mach dep pull`.
+- `mach init` into an existing project root replaces only the files it owns, recoverably.
+- Executable resolution accepts a searched candidate only when it is executable and expands windows extensions.
+- `-g` on a target without a debug model fails the artifact instead of emitting none.
+- The build fingerprint covers the whole target tuple, including object format, debug model, stack reserve and commit, and the step environment, and closed-catalog fingerprints carry versioned framing. Caches from earlier releases are invalidated once.
+
+#### Compiler
+
+- The parser bounds recursive descent at 2048 levels and refuses deeper input with a diagnostic naming the limit, instead of exhausting the stack.
+- `name[` as a generic argument list or an index expression is decided by parsing each reading once and keeping the winner, so a nested chain costs its square instead of two to its power. Diagnostics are byte-identical.
+- Fourteen untrusted boundaries have fuzz corpora replayed by the ordinary suite in both profiles: the lexer, the parser, the manifest, inline assembly, relocation application, RISC-V attributes, the IR verifier, MIR validation, DWARF input, the SPIR-V carrier, and the ELF, COFF, Mach-O, and archive readers.
+- Compile-time gates have one evaluator with a typed verdict. An undecided gate terminates with a located error naming the constant it waits on, a gate whose constant is declared later in the module is decided on retry, and a stalled fixpoint no longer prints an unlocated sentence.
+- A statement-scope gate whose condition cannot be evaluated reports a diagnostic instead of selecting the inactive arm.
+- Failures below the driver carry a closed kind instead of message text. Compile-time evaluation fails with a kind, lowering and query failures carry reported-or-message, and no consumer branches on an error string.
+- Every compiler-controlled output is published through `std.filesystem.transaction`: object files, archives, executables, IR and asm artifacts, step stamps, manifests edited by `mach dep`, `mach doc` pages, and scaffolds. A failed or partial write leaves the previous file byte-identical.
+- Load and phase results, module-slot registration, and layout field tables publish whole or not at all.
+- One configuration reaches execution. A manifest edited between planning and execution is refused rather than mixed.
+- The test link runs through the query engine, keyed on the selected test set.
+- IR structural verification runs between every stage in every build.
+- One closed IR operation descriptor per opcode owns operand roles, effects, constant-time class, and lowering route, and every opcode-property consumer reads it. Inert on generated code.
+- Emission order is an explicit product, and blocks ending in the target's trap form are placed last.
+- Diagnostics are built and committed atomically into an immutable store, and the renderer prints fixes.
+- Register allocator output is verified before frame planning.
+
+#### Targets
+
+- The MOS 6502 target is withdrawn from ordinary build planning. Selecting it returns an unavailable code.
+- Linux operating-system policy, the dynamic interpreter and multiarch directories, is declared per architecture.
+- Every target component registry derives from one descriptor table, and the SPIR-V calling convention has a catalog id.
+- The `$mach` target namespaces enumerate the registries, so every registered name resolves and no unregistered name does.
+
+### Fixed
+
+#### Language and frontend
+
+- `?` on a temporary (a call result, literal, cast, operator result, array, record or vector literal, or a field or element of one) is refused, naming the operand kind. It used to compile to a pointer into dead stack.
+- A whole record or array declassified with `:>T` or `:^T` reached the middle end as an aggregate strip and was refused.
+- A `$if` whose condition short-circuited to true lost its width and was deferred forever, so every identifier in its body reported unbound.
+- A module guarded by a declaration-free target gate was compiled for the selected target under `mach test` instead of being marked and skipped.
+- The recursive-type and union-secrecy checks passed a module when their scratch allocation failed. Both fail closed, and the recursive walk's depth bound is 1024.
+- Four secrecy and generic proofs answered "not secret" for a type they could not resolve.
+- A secret parameter bound directly into inline assembly was marked public.
+- The inline-assembly taint scanner ignored implicit operands, so a compare-and-exchange on a secret accumulator and the flags branch after it passed.
+- Two modules each declaring a generic parameter as their first declaration collapsed onto one type, so a diagnostic named a parameter spelled in an unrelated file.
+- A forwarded re-export resolved only when it appeared before its use, and a renamed re-export did not link.
+- A generic specialization lost `#[scalar]` and `#[noinline]`.
+- A generic call was queued for specialization before its arguments were checked.
+- Eight parser defects: a bare carriage return did not end comments or literals, recovery ate a decorator, an unclosed decorator still attached, flat recovery ignored nesting, the strip operator accepted only identifiers, error spans ended past the consumed token, a directive absorbed an assignment, and the parser made no progress on an unexpected token.
+- A fatal parse left the cursor in place, so every enclosing loop walked the rest of the file a token at a time.
+- Bracket-ambiguity resolution overwrote the live tree, and a lost recoverable syntax error let a malformed module report success.
+- An out-of-range literal on the right of a commutative operator compiled while the same literal on the left was rejected, `u64` maximum cast to double folded to minus one, a folded left shift went negative and dropped shifted-out bits, and a folded reinterpret cast did not reinterpret.
+- A folded float truncation rounds at the destination width.
+- Inline parameter substitution carries use-site secrecy, and the two remaining secrecy-blind primitive queries in sema and DWARF strip it.
+- A `volatile`, `packed`, or `align` decorator whose registration failed was silently dropped.
+- A module rejected while its diagnostic could not be stored was reported as accepted, and a diagnostic append's result was discarded at 31 sites.
+- Phase failure classification read session-wide state, so one module's diagnostic made a later module's internal failure look already reported.
+- The editor's resolve and analyze built an empty dependency set, so any file importing another module failed to resolve.
+- Implicit module discovery and glob matching descended hidden directories that never asked for them.
+- Import-depth cost was superlinear: the query shard scanned every entry, closure scratch was re-zeroed per call, and dependencies were recorded twice.
+- Generic instance and revalidation lookups were linear scans.
+
+#### Middle end
+
+- The vectorizer could mutate the function and then decline, and its remainder guard hardcoded a signed compare over a wrapping bound.
+- Loop versioning's disjointness check authorized the fast path on aliasing memory when a bound wrapped.
+- A once-called callee whose address escapes was inlined as free, and a small callee could be duplicated without bound.
+- Dead-code elimination dropped an integer division or remainder that can trap.
+- A by-value copy of a volatile record is a volatile copy.
+- Scalar replacement and the instruction cloner read a pointer after the append that relocated it.
+- A recursive query request returned a blank entry as a completed value. Cycles are reported as a chain and dependency capture fails closed.
+
+#### Backends
+
+- x86_64: a fixed scratch register collided with an operand of an inline-assembly wide add, memory-destination shifts encoded register-direct, RSP was accepted as a SIB index, the SSE2 `i64x2` compare staged below RSP, realigned frames dropped callee-save records, and vector callee-save obligations were missed.
+- x86_64: an out-of-range immediate or displacement was truncated instead of refused, and the `XCHG`, `XADD`, and `CMPXCHG` memory forms dropped their write-back.
+- x86_64: a rejected port operand left a prefix byte in the output.
+- aarch64: integer vector division emitted floating division, SP was accepted where only XZR encodes, mixed-width assembly operands were accepted, GOT page relocations were refused, and call and jump relocations were conflated.
+- aarch64: a NEON lane index past the lane count aliased a different lane, and X18 reservation was wired behind a false guard.
+- riscv: branch relaxation is bounded by a proven round count and releases its mark table on every path.
+- riscv: an ISA attribute string's numbers wrapped, so an object declaring `rv4294967360` merged into an rv64 link, and an arch naming no extension was accepted.
+- Constant-time validation classified an unknown opcode or an out-of-range register as public. Both are rejected, operand kinds fail closed against the catalog, and selected instruction forms carry their timing class.
+- Cross-compiling to aarch64 or riscv64 linux baked in the x86_64 dynamic interpreter.
+- An indirect call was never treated as possibly external, so a foreign callee's by-reference aggregate aliased the caller's local (#3063).
+- The packed vector width read a constant instead of the machine model.
+- Target-declared special registers were rejected as rewritten operands after allocation.
+- SPIR-V: layout round-up reports overflow as unrepresentable.
+- Debug info: an inline-site relocation table sized off a flat count overflowed the heap, a two-byte-pointer target wrote four-byte addresses, a base register above 31 clamped, and a nil register-mapping pointer was called.
+
+#### Linker and object formats
+
+- Three of four link-input classes accepted a file on its name alone. Every input is read and checked against the selected target's format and machine.
+- Relocation traits were fail-open. The catalog is closed to the kinds application admits, and a producer refuses an unknown kind before queuing it.
+- The archive symbol index was never parsed. It is read with every declared value validated.
+- Counts and offsets in the COFF, Mach-O, and ELF readers, the linker, debug info, SPIR-V emission, encoding, frame layout, and the front-end pools are checked. A COFF relocation-count sum overflowed and wrote past its allocation, a Mach-O segment's section count walked past the buffer, and a grow loop spun forever at a wrapped capacity.
+- Signed address arithmetic in relocation application refuses an unrepresentable value, and aarch64 scaled relocations check alignment and instruction form.
+- RISC-V pc-relative `HI20`/`LO12` pairs are indexed by the encoder and carried into the object, so the linker no longer rederives them by scanning labels.
+- Debug-string relocation remapping honors symbol offsets and plans referenced suffixes, and abbreviation dedup requires equal length and bytes.
+- Two contributions claiming one output range are rejected naming both.
+- An object writer's planned size and the bytes it writes must agree, and a short write is an error.
+- `NEEDED` entries are emitted only for declared imports that a live relocation references.
+- A link mode other than executable, relocatable, or shared is rejected, and a difference relocation's subtrahend is retained.
+- Object images are validated at every publication boundary, and a parser that fails publishes nothing.
+
+#### Driver and build
+
+- A required artifact planned under `mach test` was built as a test cell.
+- `--quiet` on `mach build` was ignored.
+- `BuildPlan` borrowed its request.
+- `mach doc` selects the artifact the way `mach build` does, takes `--bin` and `--lib`, and renders the session's diagnostics, so the first-declared-artifact deprecation warning and program errors are shown. A project with several artifacts was refused even when only one supported the target, so the init scaffold and the compiler itself could not be documented.
+- Two `[target.*]` tables marked `default = true` are refused when the manifest is read, naming each table. A host match used to hide the conflict.
+- An artifact `link` entry naming no `[link.*]` table is a manifest error naming the artifact and the declared tables. It used to be skipped silently at link time.
+- `[project].name`, `description` and `mach` and `[profile].emit_ir` and `emit_asm` are accepted with a deprecation warning naming the key, the table, and the 5.0.0 refusal, in root and dependency manifests alike, and are never read. A root manifest used to refuse them and a dependency's to discard them silently.
+- `mach init <dir>` derives the default project id from the last component of the destination. An absolute or slash-terminated directory was rejected as an invalid id, and `mach init .` was rejected outright.
+- The bare-import error for a dependency whose artifacts name different entries says so. It used to point at a manifest key that does not exist.
+- An option a command does not accept is refused by name. `mach doc` used to parse and ignore `-o`, `--profile`, `-v` and every code-generation flag, and `mach run` did the same with `--lib`; help and the parser now read one acceptance mask per command and option.
+- `mach doc --out` with an absolute path writes there. It used to be joined under the project root.
+- `mach test` on a project with several artifacts and no `default = true` prints the first-declared-artifact deprecation warning. The selection carried no flag into the build, so the warning was recorded nowhere.
+- A test build whose artifact selection fails, two artifacts marked `default = true` for instance, fails at planning with the manifest error. It was reported as an internal error, and the planner's requirement pass swallowed the selector's failure.
+- `-O1` is refused on the same path as every other unknown option, with its removal message, by every command. Only `build` and `test` refused it, on raw argv.
+
+### Removed
+
+- `-O1`. It was identical to `-O2`. Selecting it is rejected with a message naming the two real levels.
+- `--verify-ir`. IR verification is mandatory.
+
+### Planned for 5.0.0
+
+- The `:^` and `:^T` declassification forms are rejected with a migration diagnostic. Write `expr:>T`.
+- An alias dependency key, a `[dep.<key>]` whose key is not the realized project id, and a nested realization are rejected with migration diagnostics.
+- A `mach.lock` file is rejected with a migration diagnostic.
+- `$mach.abi.sysv` is removed. Write `sysv64`.
+- Several targets, profiles, or artifacts with none marked `default = true` are refused.
+- `[project].name`, `description`, `mach` and `[profile].emit_ir`, `emit_asm` are refused.
+- An `#[embed]` path outside the project root is refused.
+- The MOS 6502 target is deleted.
+- `mach dep update` proposes SemVer selection among tagged releases within one major and above every tested floor.
+
 ## [4.26.5] - 2026-08-27
 
 ### Fixed

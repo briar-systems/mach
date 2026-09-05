@@ -44,16 +44,14 @@ val n: i64            = p.x;            # field access via .
 
 By default the compiler may insert padding between fields for alignment. The
 `#[align(N)]` decorator on a record raises its minimum type alignment to `N`
-bytes (a power of two); see [decorators.md](decorators.md).
-
-> Disabling padding entirely (a `packed` layout for binary-protocol / on-disk
-> structs) is not yet available — the field-to-field padding always follows the
-> natural C-style rule. The legacy `$NAME.align = N;` / `$NAME.packed = true;`
-> attribute setters were removed in v2.0.0.
+bytes (a power of two), and `#[packed]` lays the record out with no padding
+at all, for a shape whose layout is fixed elsewhere (a C struct, a file
+header, a wire frame); see [decorators.md](decorators.md#packed--no-padding)
+for what a packed record refuses.
 
 ## See also
 
 - [uni.md](uni.md) — overlapping-memory counterpart
-- [comptime-attrs.md](comptime-attrs.md) — `.align` and `.packed`
+- [decorators.md](decorators.md) — `#[align]` and `#[packed]`
 - [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of`,
   `$offset_of`

@@ -1,0 +1,1904 @@
+use std.allocator;
+use std.allocator.page;
+use std.chrono.duration;
+use tm: std.chrono.time;
+use std.filesystem;
+use std.format;
+use std.process.env;
+use std.process.events;
+use std.process.exec;
+use cnc: std.sync.cancel;
+use std.system.os;
+use std.text.string.str_dup;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option;
+use std.types.result;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_contains;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+use io_error: std.io.error;
+use io_handle: std.io.handle;
+
+$if ($mach.build.os == $mach.os.linux) {
+    use std.system.os.linux;
+}
+$or ($mach.build.os == $mach.os.darwin) {
+    use std.system.os.darwin;
+}
+$or ($mach.build.os == $mach.os.windows) {
+    use std.system.os.windows;
+}
+
+pub def SubprocessState: u8;
+
+pub val STATE_UNSTARTED:     SubprocessState = 0;
+pub val STATE_SPAWN_FAILURE: SubprocessState = 1;
+pub val STATE_RUNNING:       SubprocessState = 2;
+pub val STATE_EXITED:        SubprocessState = 3;
+pub val STATE_SIGNALED:      SubprocessState = 4;
+pub val STATE_REAPED:        SubprocessState = 7;
+
+pub rec SubprocessTerminal {
+    kind: SubprocessState;
+    code: i32;
+}
+
+pub rec CaptureIoResult {
+    bytes:        usize;
+    truncated:    bool;
+    short_read:   bool;
+    read_failed:  bool;
+    write_failed: bool;
+    close_failed: bool;
+    closed:       bool;
+    owned:        bool;
+}
+
+pub rec OwnedCapture {
+    file:     filesystem.File;
+    identity: *u8;
+    buffer:   *u8;
+    capacity: usize;
+    limit:    usize;
+    result:   CaptureIoResult;
+    finished: bool;
+    released: bool;
+}
+
+pub rec OwnedSubprocess {
+    child:      exec.Child;
+    state:      SubprocessState;
+    terminal:   SubprocessTerminal;
+    requested:  cnc.Reason;
+    capture:    OwnedCapture;
+    has_capture: bool;
+    spawn_attempted: bool;
+    reap_count: u8;
+    pathname:   *u8;
+    has_deadline: bool;
+    deadline:   tm.Time;
+    timeout_seconds: i64;
+}
+
+fun dup_cstr(a: *A.Allocator, s: *u8) R.Result[*u8, str] {
+    val r: R.Result[str, str] = str_dup(a, s::str);
+    if (R.is_err[str, str](r)) { ret R.err[*u8, str](R.unwrap_err[str, str](r)); }
+    ret R.ok[*u8, str](R.unwrap_ok[str, str](r)::*u8);
+}
+
+fun free_cstr(a: *A.Allocator, s: *u8) {
+    str_free(a, s::str);
+}
+
+fun cstr_count(list: **u8) usize {
+    var n: usize = 0;
+    for (list[n] != nil) { n = n + 1; }
+    ret n;
+}
+
+fun free_cstr_list(a: *A.Allocator, list: **u8) {
+    if (list == nil) { ret; }
+    var n: usize = 0;
+    for (list[n] != nil) { free_cstr(a, list[n]); n = n + 1; }
+    A.deallocate[*u8](a, list, n + 1);
+}
+
+fun dup_cstr_list(a: *A.Allocator, list: **u8) R.Result[**u8, str] {
+    val n: usize = cstr_count(list);
+    val ar: R.Result[**u8, str] = A.allocate[*u8](a, n + 1);
+    if (R.is_err[**u8, str](ar)) { ret ar; }
+    val out: **u8 = R.unwrap_ok[**u8, str](ar);
+    var i: usize = 0;
+    for (i < n) {
+        val dr: R.Result[*u8, str] = dup_cstr(a, list[i]);
+        if (R.is_err[*u8, str](dr)) {
+            var j: usize = 0;
+            for (j < i) { free_cstr(a, out[j]); j = j + 1; }
+            A.deallocate[*u8](a, out, n + 1);
+            ret R.err[**u8, str](R.unwrap_err[*u8, str](dr));
+        }
+        out[i] = R.unwrap_ok[*u8, str](dr);
+        i = i + 1;
+    }
+    out[n] = nil;
+    ret R.ok[**u8, str](out);
+}
+
+rec SpawnCopy {
+    pathname: *u8;
+    argv:     **u8;
+    envp:     **u8;
+}
+
+fun spawn_copy_free_request(a: *A.Allocator, c: *SpawnCopy) {
+    free_cstr_list(a, c.argv);
+    free_cstr_list(a, c.envp);
+    c.argv = nil;
+    c.envp = nil;
+}
+
+fun prepare_spawn_copy(a: *A.Allocator, pathname: str, argv: **u8, envp: **u8) R.Result[SpawnCopy, str] {
+    var c: SpawnCopy = SpawnCopy{pathname: nil, argv: nil, envp: nil};
+    val pr: R.Result[*u8, str] = dup_cstr(a, pathname::*u8);
+    if (R.is_err[*u8, str](pr)) { ret R.err[SpawnCopy, str](R.unwrap_err[*u8, str](pr)); }
+    c.pathname = R.unwrap_ok[*u8, str](pr);
+    val ar: R.Result[**u8, str] = dup_cstr_list(a, argv);
+    if (R.is_err[**u8, str](ar)) {
+        free_cstr(a, c.pathname);
+        ret R.err[SpawnCopy, str](R.unwrap_err[**u8, str](ar));
+    }
+    c.argv = R.unwrap_ok[**u8, str](ar);
+    val er: R.Result[**u8, str] = dup_cstr_list(a, envp);
+    if (R.is_err[**u8, str](er)) {
+        free_cstr(a, c.pathname);
+        free_cstr_list(a, c.argv);
+        ret R.err[SpawnCopy, str](R.unwrap_err[**u8, str](er));
+    }
+    c.envp = R.unwrap_ok[**u8, str](er);
+    ret R.ok[SpawnCopy, str](c);
+}
+
+fun identity_error(a: *A.Allocator, pathname: str, detail: str) str {
+    val r: R.Result[str, str] = format.sprint(a, "{}: {}", pathname, detail);
+    if (R.is_err[str, str](r)) { ret "subprocess operation failed"; }
+    ret R.unwrap_ok[str, str](r);
+}
+
+fun owner_identity(p: *OwnedSubprocess) str {
+    if (p.pathname == nil) { ret "subprocess"; }
+    ret p.pathname::str;
+}
+
+fun empty_capture(limit: usize) OwnedCapture {
+    ret OwnedCapture{
+        file: filesystem.File{handle: io_handle.invalid_file()},
+        identity: nil,
+        buffer: nil,
+        capacity: 0,
+        limit: limit,
+        result: CaptureIoResult{
+            bytes: 0,
+            truncated: false,
+            short_read: false,
+            read_failed: false,
+            write_failed: false,
+            close_failed: false,
+            closed: true,
+            owned: true,
+        },
+        finished: false,
+        released: false,
+    };
+}
+
+pub fun init(p: *OwnedSubprocess) {
+    p.child.pid   = 0;
+    p.state       = STATE_UNSTARTED;
+    p.terminal    = SubprocessTerminal{kind: STATE_UNSTARTED, code: 0};
+    p.requested   = cnc.ACTIVE;
+    p.capture     = empty_capture(0);
+    p.has_capture = false;
+    p.spawn_attempted = false;
+    p.reap_count  = 0;
+    p.pathname    = nil;
+    p.has_deadline = false;
+    p.deadline    = tm.Time{sec: 0, nsec: 0};
+    p.timeout_seconds = 0;
+}
+
+pub fun set_deadline(p: *OwnedSubprocess, deadline: tm.Time) bool {
+    if (p.state != STATE_UNSTARTED && p.state != STATE_RUNNING) { ret false; }
+    if (deadline.sec < 0 || deadline.nsec < 0 || deadline.nsec >= 1000000000) { ret false; }
+    p.has_deadline = true;
+    p.deadline     = deadline;
+    ret true;
+}
+
+pub fun bound_seconds(p: *OwnedSubprocess, seconds: i64) bool {
+    if (seconds < 1) { ret false; }
+    if (!set_deadline(p, tm.time_add(tm.monotonic(), duration.SECOND * seconds))) { ret false; }
+    p.timeout_seconds = seconds;
+    ret true;
+}
+
+pub fun deadline_reached(p: *OwnedSubprocess, now: tm.Time) bool {
+    if (!p.has_deadline) { ret false; }
+    ret !tm.time_before(now, p.deadline);
+}
+
+pub fun expired(p: *OwnedSubprocess) bool {
+    ret p.requested == cnc.TIMED_OUT;
+}
+
+pub fun dnit(a: *A.Allocator, p: *OwnedSubprocess) {
+    free_cstr(a, p.pathname);
+    p.pathname = nil;
+    if (p.capture.identity != nil) {
+        close_capture(?p.capture);
+        free_cstr(a, p.capture.identity);
+        p.capture.identity = nil;
+    }
+}
+
+fun observe_spawn(p: *OwnedSubprocess, child: exec.Child) {
+    p.child      = child;
+    p.state      = STATE_RUNNING;
+    p.terminal   = SubprocessTerminal{kind: STATE_RUNNING, code: 0};
+    p.requested  = cnc.ACTIVE;
+    p.spawn_attempted = true;
+    p.reap_count = 0;
+}
+
+fun observe_spawn_failure(p: *OwnedSubprocess) {
+    p.state    = STATE_SPAWN_FAILURE;
+    p.terminal = SubprocessTerminal{kind: STATE_SPAWN_FAILURE, code: 0};
+}
+
+fun begin_spawn(p: *OwnedSubprocess) bool {
+    if (p.spawn_attempted || p.state != STATE_UNSTARTED) { ret false; }
+    p.spawn_attempted = true;
+    ret true;
+}
+
+fun observe_terminal(p: *OwnedSubprocess, kind: SubprocessState, code: i32) bool {
+    if (p.state != STATE_RUNNING) { ret false; }
+    if (kind != STATE_EXITED && kind != STATE_SIGNALED) { ret false; }
+    p.state    = kind;
+    p.terminal = SubprocessTerminal{kind: kind, code: code};
+    ret true;
+}
+
+fun close_capture(c: *OwnedCapture) {
+    if (c.result.closed) { ret; }
+    if (O.is_some[io_error.Error](filesystem.close(?c.file))) { c.result.close_failed = true; }
+    c.file          = filesystem.File{handle: io_handle.invalid_file()};
+    c.result.closed = true;
+}
+
+fun mark_reaped(p: *OwnedSubprocess) bool {
+    if (p.state != STATE_EXITED && p.state != STATE_SIGNALED) { ret false; }
+    if (p.reap_count != 0) { ret false; }
+    p.reap_count = 1;
+    p.state      = STATE_REAPED;
+    ret true;
+}
+
+fun observe_raw_status(p: *OwnedSubprocess, raw: i32) bool {
+    var kind: SubprocessState = STATE_EXITED;
+    var code: i32 = 0;
+    val st: exec.ExitStatus = exec.ExitStatus{raw: raw};
+    if (exec.signaled(st)) {
+        kind = STATE_SIGNALED;
+        code = exec.signal(st);
+    }
+    or (exec.exited(st)) {
+        code = exec.code(st);
+    }
+    or { ret false; }
+    ret observe_terminal(p, kind, code) && mark_reaped(p);
+}
+
+pub fun spawn(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8) R.Result[R.Void, str] {
+    if (!begin_spawn(p)) { ret R.err[R.Void, str]("subprocess spawn already attempted"); }
+    val cr: R.Result[SpawnCopy, str] = prepare_spawn_copy(a, pathname, argv, envp);
+    if (R.is_err[SpawnCopy, str](cr)) {
+        observe_spawn_failure(p);
+        ret R.err[R.Void, str](identity_error(a, pathname, R.unwrap_err[SpawnCopy, str](cr)));
+    }
+    var c: SpawnCopy = R.unwrap_ok[SpawnCopy, str](cr);
+    val sr: R.Result[exec.Child, str] = exec.spawn(c.pathname::str, c.argv, c.envp);
+    spawn_copy_free_request(a, ?c);
+    if (R.is_err[exec.Child, str](sr)) {
+        val msg: str = identity_error(a, pathname, R.unwrap_err[exec.Child, str](sr));
+        free_cstr(a, c.pathname);
+        observe_spawn_failure(p);
+        ret R.err[R.Void, str](msg);
+    }
+    p.pathname = c.pathname;
+    observe_spawn(p, R.unwrap_ok[exec.Child, str](sr));
+    ret R.ok_void[str]();
+}
+
+pub fun spawn_in(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
+                 cwd: str) R.Result[R.Void, str] {
+    if (!begin_spawn(p)) { ret R.err[R.Void, str]("subprocess spawn already attempted"); }
+    val cr: R.Result[SpawnCopy, str] = prepare_spawn_copy(a, pathname, argv, envp);
+    if (R.is_err[SpawnCopy, str](cr)) {
+        observe_spawn_failure(p);
+        ret R.err[R.Void, str](identity_error(a, pathname, R.unwrap_err[SpawnCopy, str](cr)));
+    }
+    var c: SpawnCopy = R.unwrap_ok[SpawnCopy, str](cr);
+    val sr: R.Result[exec.Child, str] =
+        exec.spawn_redirected_in(c.pathname::str, c.argv, c.envp, cwd, -1, -1, -1);
+    spawn_copy_free_request(a, ?c);
+    if (R.is_err[exec.Child, str](sr)) {
+        val msg: str = identity_error(a, pathname, R.unwrap_err[exec.Child, str](sr));
+        free_cstr(a, c.pathname);
+        observe_spawn_failure(p);
+        ret R.err[R.Void, str](msg);
+    }
+    p.pathname = c.pathname;
+    observe_spawn(p, R.unwrap_ok[exec.Child, str](sr));
+    ret R.ok_void[str]();
+}
+
+pub fun spawn_captured(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
+                       identity: str, limit: usize) R.Result[R.Void, str] {
+    if (!begin_spawn(p)) { ret R.err[R.Void, str]("subprocess spawn already attempted"); }
+    val idr: R.Result[*u8, str] = dup_cstr(a, identity::*u8);
+    if (R.is_err[*u8, str](idr)) {
+        observe_spawn_failure(p);
+        ret R.err[R.Void, str](identity_error(a, pathname, R.unwrap_err[*u8, str](idr)));
+    }
+    p.capture = empty_capture(limit);
+    p.capture.identity = R.unwrap_ok[*u8, str](idr);
+    p.has_capture = true;
+
+    val raw: i64 = os.open(os.AT_FDCWD, p.capture.identity::str,
+        os.O_CREAT | os.O_TRUNC | os.O_RDWR, 420);
+    if (raw < 0) {
+        p.capture.result.write_failed = true;
+        val msg: str = identity_error(a, pathname, os.message(raw));
+        observe_spawn_failure(p);
+        dnit(a, p);
+        ret R.err[R.Void, str](msg);
+    }
+    p.capture.file          = filesystem.File{handle: io_handle.FileHandle{value: raw::usize}};
+    p.capture.result.closed = false;
+
+    val cr: R.Result[SpawnCopy, str] = prepare_spawn_copy(a, pathname, argv, envp);
+    if (R.is_err[SpawnCopy, str](cr)) {
+        val msg: str = identity_error(a, pathname, R.unwrap_err[SpawnCopy, str](cr));
+        observe_spawn_failure(p);
+        dnit(a, p);
+        ret R.err[R.Void, str](msg);
+    }
+    var c: SpawnCopy = R.unwrap_ok[SpawnCopy, str](cr);
+    val sr: R.Result[exec.Child, str] = exec.spawn_redirected(
+        c.pathname::str, c.argv, c.envp, p.capture.file.handle.value::i32, p.capture.file.handle.value::i32);
+    spawn_copy_free_request(a, ?c);
+    if (R.is_err[exec.Child, str](sr)) {
+        val msg: str = identity_error(a, pathname, R.unwrap_err[exec.Child, str](sr));
+        free_cstr(a, c.pathname);
+        observe_spawn_failure(p);
+        dnit(a, p);
+        ret R.err[R.Void, str](msg);
+    }
+    p.pathname = c.pathname;
+    observe_spawn(p, R.unwrap_ok[exec.Child, str](sr));
+    ret R.ok_void[str]();
+}
+
+pub fun spawn_grouped(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8) R.Result[R.Void, str] {
+    if (!begin_spawn(p)) { ret R.err[R.Void, str]("subprocess spawn already attempted"); }
+    val cr: R.Result[SpawnCopy, str] = prepare_spawn_copy(a, pathname, argv, envp);
+    if (R.is_err[SpawnCopy, str](cr)) {
+        observe_spawn_failure(p);
+        ret R.err[R.Void, str](identity_error(a, pathname, R.unwrap_err[SpawnCopy, str](cr)));
+    }
+    var c: SpawnCopy = R.unwrap_ok[SpawnCopy, str](cr);
+    val sr: R.Result[exec.Child, str] = exec.spawn_grouped(c.pathname::str, c.argv, c.envp);
+    spawn_copy_free_request(a, ?c);
+    if (R.is_err[exec.Child, str](sr)) {
+        val msg: str = identity_error(a, pathname, R.unwrap_err[exec.Child, str](sr));
+        free_cstr(a, c.pathname);
+        observe_spawn_failure(p);
+        ret R.err[R.Void, str](msg);
+    }
+    p.pathname = c.pathname;
+    observe_spawn(p, R.unwrap_ok[exec.Child, str](sr));
+    ret R.ok_void[str]();
+}
+
+pub fun spawn_in_grouped(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
+                         cwd: str) R.Result[R.Void, str] {
+    if (!begin_spawn(p)) { ret R.err[R.Void, str]("subprocess spawn already attempted"); }
+    val cr: R.Result[SpawnCopy, str] = prepare_spawn_copy(a, pathname, argv, envp);
+    if (R.is_err[SpawnCopy, str](cr)) {
+        observe_spawn_failure(p);
+        ret R.err[R.Void, str](identity_error(a, pathname, R.unwrap_err[SpawnCopy, str](cr)));
+    }
+    var c: SpawnCopy = R.unwrap_ok[SpawnCopy, str](cr);
+    val sr: R.Result[exec.Child, str] = exec.spawn_redirected_in_grouped(
+        c.pathname::str, c.argv, c.envp, cwd, -1, -1, -1);
+    spawn_copy_free_request(a, ?c);
+    if (R.is_err[exec.Child, str](sr)) {
+        val msg: str = identity_error(a, pathname, R.unwrap_err[exec.Child, str](sr));
+        free_cstr(a, c.pathname);
+        observe_spawn_failure(p);
+        ret R.err[R.Void, str](msg);
+    }
+    p.pathname = c.pathname;
+    observe_spawn(p, R.unwrap_ok[exec.Child, str](sr));
+    ret R.ok_void[str]();
+}
+
+pub fun spawn_captured_grouped(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
+                               identity: str, limit: usize) R.Result[R.Void, str] {
+    if (!begin_spawn(p)) { ret R.err[R.Void, str]("subprocess spawn already attempted"); }
+    val idr: R.Result[*u8, str] = dup_cstr(a, identity::*u8);
+    if (R.is_err[*u8, str](idr)) {
+        observe_spawn_failure(p);
+        ret R.err[R.Void, str](identity_error(a, pathname, R.unwrap_err[*u8, str](idr)));
+    }
+    p.capture = empty_capture(limit);
+    p.capture.identity = R.unwrap_ok[*u8, str](idr);
+    p.has_capture = true;
+
+    val raw: i64 = os.open(os.AT_FDCWD, p.capture.identity::str,
+        os.O_CREAT | os.O_TRUNC | os.O_RDWR, 420);
+    if (raw < 0) {
+        p.capture.result.write_failed = true;
+        val msg: str = identity_error(a, pathname, os.message(raw));
+        observe_spawn_failure(p);
+        dnit(a, p);
+        ret R.err[R.Void, str](msg);
+    }
+    p.capture.file          = filesystem.File{handle: io_handle.FileHandle{value: raw::usize}};
+    p.capture.result.closed = false;
+
+    val cr: R.Result[SpawnCopy, str] = prepare_spawn_copy(a, pathname, argv, envp);
+    if (R.is_err[SpawnCopy, str](cr)) {
+        val msg: str = identity_error(a, pathname, R.unwrap_err[SpawnCopy, str](cr));
+        observe_spawn_failure(p);
+        dnit(a, p);
+        ret R.err[R.Void, str](msg);
+    }
+    var c: SpawnCopy = R.unwrap_ok[SpawnCopy, str](cr);
+    val sr: R.Result[exec.Child, str] = exec.spawn_redirected_grouped(
+        c.pathname::str, c.argv, c.envp, p.capture.file.handle.value::i32, p.capture.file.handle.value::i32);
+    spawn_copy_free_request(a, ?c);
+    if (R.is_err[exec.Child, str](sr)) {
+        val msg: str = identity_error(a, pathname, R.unwrap_err[exec.Child, str](sr));
+        free_cstr(a, c.pathname);
+        observe_spawn_failure(p);
+        dnit(a, p);
+        ret R.err[R.Void, str](msg);
+    }
+    p.pathname = c.pathname;
+    observe_spawn(p, R.unwrap_ok[exec.Child, str](sr));
+    ret R.ok_void[str]();
+}
+
+pub fun running(p: *OwnedSubprocess) bool {
+    ret p.state == STATE_RUNNING;
+}
+
+pub fun pid(p: *OwnedSubprocess) i64 {
+    if (!running(p)) { ret 0; }
+    ret p.child.pid;
+}
+
+pub fun wait(a: *A.Allocator, p: *OwnedSubprocess) R.Result[SubprocessTerminal, str] {
+    if (!running(p)) {
+        ret R.err[SubprocessTerminal, str](identity_error(a, owner_identity(p), "subprocess is not running"));
+    }
+    val wr: R.Result[exec.ExitStatus, str] = exec.wait(p.child);
+    if (R.is_err[exec.ExitStatus, str](wr)) {
+        ret R.err[SubprocessTerminal, str](identity_error(a, owner_identity(p), R.unwrap_err[exec.ExitStatus, str](wr)));
+    }
+    if (!observe_raw_status(p, R.unwrap_ok[exec.ExitStatus, str](wr).raw)) {
+        ret R.err[SubprocessTerminal, str](identity_error(a, owner_identity(p), "invalid subprocess terminal status"));
+    }
+    ret R.ok[SubprocessTerminal, str](p.terminal);
+}
+
+fun capture_over_limit(p: *OwnedSubprocess) bool {
+    if (!p.has_capture) { ret false; }
+    val mr: R.Result[filesystem.Metadata, str] = filesystem.stat_of(p.capture.file);
+    if (R.is_err[filesystem.Metadata, str](mr)) { ret false; }
+    ret R.unwrap_ok[filesystem.Metadata, str](mr).size > p.capture.limit;
+}
+
+pub fun wait_any(a: *A.Allocator, owners: *OwnedSubprocess, count: u32, scope: *cnc.Scope, source: *events.Source) R.Result[*OwnedSubprocess, str] {
+    for (true) {
+        val now: tm.Time = tm.monotonic();
+        var fired: cnc.Reason = cnc.ACTIVE;
+        if (scope != nil) {
+            if (source != nil) {
+                var event: events.Event;
+                if (events.next(source, ?event) == 1) {
+                    if (event.kind == events.TERMINATE || event.kind == events.INTERRUPT
+                        || event.kind == events.CONSOLE_CLOSE || event.kind == events.SERVICE_STOP) {
+                        cnc.cancel(scope);
+                    }
+                }
+            }
+            cnc.expire(scope, now);
+            fired = cnc.reason(scope);
+        }
+
+        var live: bool = false;
+        var i: u32 = 0;
+        for (i < count) {
+            val p: *OwnedSubprocess = ?owners[i];
+            if (running(p)) {
+                live = true;
+                if (fired == cnc.TIMED_OUT || fired == cnc.CANCELLED) {
+                    var tr: R.Result[SubprocessTerminal, str];
+                    if (fired == cnc.TIMED_OUT) { tr = timeout(a, p, 0); }
+                    or { tr = cancel(a, p, 0); }
+                    if (R.is_err[SubprocessTerminal, str](tr)) {
+                        ret R.err[*OwnedSubprocess, str](R.unwrap_err[SubprocessTerminal, str](tr));
+                    }
+                    ret R.ok[*OwnedSubprocess, str](p);
+                }
+                if (deadline_reached(p, now)) {
+                    val dr: R.Result[SubprocessTerminal, str] = timeout(a, p, 0);
+                    if (R.is_err[SubprocessTerminal, str](dr)) {
+                        ret R.err[*OwnedSubprocess, str](R.unwrap_err[SubprocessTerminal, str](dr));
+                    }
+                    ret R.ok[*OwnedSubprocess, str](p);
+                }
+                if (capture_over_limit(p)) {
+                    val cr: R.Result[SubprocessTerminal, str] = cancel(a, p, 0);
+                    if (R.is_err[SubprocessTerminal, str](cr)) {
+                        ret R.err[*OwnedSubprocess, str](R.unwrap_err[SubprocessTerminal, str](cr));
+                    }
+                    ret R.ok[*OwnedSubprocess, str](p);
+                }
+                val wr: R.Result[O.Option[exec.ExitStatus], str] = exec.try_wait(p.child);
+                if (R.is_err[O.Option[exec.ExitStatus], str](wr)) {
+                    ret R.err[*OwnedSubprocess, str](identity_error(a, owner_identity(p), R.unwrap_err[O.Option[exec.ExitStatus], str](wr)));
+                }
+                val got: O.Option[exec.ExitStatus] = R.unwrap_ok[O.Option[exec.ExitStatus], str](wr);
+                if (O.is_some[exec.ExitStatus](got)) {
+                    if (!observe_raw_status(p, O.unwrap[exec.ExitStatus](got).raw)) {
+                        ret R.err[*OwnedSubprocess, str](identity_error(a, owner_identity(p), "invalid subprocess terminal status"));
+                    }
+                    ret R.ok[*OwnedSubprocess, str](p);
+                }
+            }
+            i = i + 1;
+        }
+        if (!live) { ret R.err[*OwnedSubprocess, str]("no owned subprocess is running"); }
+        os.sleep(duration.MILLISECOND);
+    }
+}
+
+fun finalize_capture_file(a: *A.Allocator, c: *OwnedCapture, keep: bool) {
+    val mr: R.Result[filesystem.Metadata, str] = filesystem.stat_of(c.file);
+    if (R.is_err[filesystem.Metadata, str](mr)) {
+        c.result.read_failed = true;
+        ret;
+    }
+    val source: usize = R.unwrap_ok[filesystem.Metadata, str](mr).size;
+    var stored: usize = source;
+    if (stored > c.limit) {
+        stored = c.limit;
+        c.result.truncated = true;
+    }
+    if (stored == 0) { ret; }
+
+    val sk: R.Result[i64, io_error.Error] = filesystem.seek(c.file, 0, filesystem.SEEK_SET);
+    if (R.is_err[i64, io_error.Error](sk)) {
+        c.result.read_failed = true;
+        ret;
+    }
+
+    val br: R.Result[*u8, str] = A.allocate[u8](a, stored);
+    if (R.is_err[*u8, str](br)) {
+        c.result.read_failed = true;
+        ret;
+    }
+    val buf: *u8 = R.unwrap_ok[*u8, str](br);
+
+    var got: usize = 0;
+    for (got < stored) {
+        val rr: R.Result[usize, io_error.Error] = filesystem.read(c.file, (buf::usize + got)::*u8, stored - got);
+        if (R.is_err[usize, io_error.Error](rr)) {
+            c.result.read_failed = true;
+            brk;
+        }
+        val n: usize = R.unwrap_ok[usize, io_error.Error](rr);
+        if (n == 0) { brk; }
+        got = got + n;
+    }
+    c.result.bytes = got;
+    if (got < stored && !c.result.read_failed) { c.result.short_read = true; }
+
+    if (keep && !c.result.read_failed) {
+        c.buffer   = buf;
+        c.capacity = stored;
+    }
+    or {
+        A.deallocate[u8](a, buf, stored);
+    }
+}
+
+pub fun finish_capture(a: *A.Allocator, p: *OwnedSubprocess, retain: bool) R.Result[CaptureIoResult, str] {
+    if (!p.has_capture) { ret R.ok[CaptureIoResult, str](p.capture.result); }
+    if (p.capture.released) {
+        ret R.err[CaptureIoResult, str](identity_error(a, owner_identity(p), "subprocess capture already released"));
+    }
+    if (p.state == STATE_RUNNING) {
+        ret R.err[CaptureIoResult, str](identity_error(a, owner_identity(p), "subprocess capture cannot finish while the child is running"));
+    }
+    if (!p.capture.finished) {
+        finalize_capture_file(a, ?p.capture, retain);
+        p.capture.finished = true;
+    }
+    close_capture(?p.capture);
+    ret R.ok[CaptureIoResult, str](p.capture.result);
+}
+
+pub fun abandon_capture(p: *OwnedSubprocess) {
+    if (!p.has_capture) { ret; }
+    close_capture(?p.capture);
+    p.capture.finished = true;
+    p.capture.result.read_failed = true;
+}
+
+pub fun capture_bytes(p: *OwnedSubprocess, len: *usize) *u8 {
+    @len = 0;
+    if (!p.has_capture || !p.capture.result.owned || !p.capture.finished) { ret nil; }
+    @len = p.capture.result.bytes;
+    ret p.capture.buffer;
+}
+
+pub fun release_capture(a: *A.Allocator, p: *OwnedSubprocess) R.Result[R.Void, str] {
+    if (!p.has_capture) { ret R.ok_void[str](); }
+    if (p.capture.released) {
+        ret R.err[R.Void, str](identity_error(a, owner_identity(p), "subprocess capture already released"));
+    }
+    if (!p.capture.finished) {
+        ret R.err[R.Void, str](identity_error(a, owner_identity(p), "subprocess capture must finish before it can be released"));
+    }
+    close_capture(?p.capture);
+    if (p.capture.result.owned && p.capture.buffer != nil) {
+        val released: R.Result[bool, *u8] =
+            A.deallocate[u8](a, p.capture.buffer, p.capture.capacity);
+        if (R.is_err[bool, *u8](released)) {
+            ret R.err[R.Void, str](identity_error(a, owner_identity(p), "capture deallocation failed"));
+        }
+    }
+    free_cstr(a, p.capture.identity);
+    p.capture.identity     = nil;
+    p.capture.result.owned = false;
+    p.capture.buffer       = nil;
+    p.capture.capacity     = 0;
+    p.capture.result.bytes = 0;
+    p.capture.released     = true;
+    ret R.ok_void[str]();
+}
+
+fun pid_string(buf: *u8, child_pid: i64) *u8 {
+    var value: i64 = child_pid;
+    var digits: usize = 1;
+    var scale: i64 = 10;
+    for (value >= scale && digits < 19) {
+        digits = digits + 1;
+        scale = scale * 10;
+    }
+    var i: usize = digits;
+    buf[i] = 0;
+    for (i > 0) {
+        i = i - 1;
+        buf[i] = ('0'::i64 + value % 10)::u8;
+        value = value / 10;
+    }
+    ret buf;
+}
+
+fun actual_terminate(a: *A.Allocator, child: exec.Child, hard: bool) bool {
+    if (hard) {
+        val terminated: R.Result[bool, str] =
+            exec.terminate_child(exec.Child{pid: child.pid});
+        ret R.is_ok[bool, str](terminated);
+    }
+    if (child.pgid != 0) {
+        val grouped: R.Result[bool, str] = exec.terminate_group(child);
+        ret R.is_ok[bool, str](grouped);
+    }
+    var pid_buf: [24]u8;
+    val pid_arg: *u8 = pid_string(?pid_buf[0], child.pid);
+    var argv: [5]*u8;
+    var pathname: *u8;
+    $if ($mach.build.os == $mach.os.windows) {
+        pathname = "taskkill.exe";
+        argv[0] = pathname;
+        argv[1] = "/PID";
+        argv[2] = pid_arg;
+        argv[3] = nil;
+    }
+    $or {
+        pathname = "/bin/kill";
+        argv[0] = pathname;
+        argv[1] = "-TERM";
+        argv[2] = pid_arg;
+        argv[3] = nil;
+    }
+
+    var helper: OwnedSubprocess;
+    init(?helper);
+    val sr: R.Result[R.Void, str] = spawn(a, ?helper, pathname, ?argv[0], env.environ());
+    if (R.is_err[R.Void, str](sr)) { dnit(a, ?helper); ret false; }
+    val wr: R.Result[SubprocessTerminal, str] = wait(a, ?helper);
+    dnit(a, ?helper);
+    if (R.is_err[SubprocessTerminal, str](wr)) { ret false; }
+    val terminal: SubprocessTerminal = R.unwrap_ok[SubprocessTerminal, str](wr);
+    ret terminal.kind == STATE_EXITED && terminal.code == 0;
+}
+
+fun actual_wait(a: *A.Allocator, child_pid: i64, block: bool,
+                kind: *SubprocessState, code: *i32) i8 {
+    val child: exec.Child = exec.Child{pid: child_pid, pgid: 0};
+    var st: exec.ExitStatus = exec.ExitStatus{raw: 0};
+    if (block) {
+        val br: R.Result[exec.ExitStatus, str] = exec.wait(child);
+        if (R.is_err[exec.ExitStatus, str](br)) { ret -1; }
+        st = R.unwrap_ok[exec.ExitStatus, str](br);
+    }
+    or {
+        val pr: R.Result[O.Option[exec.ExitStatus], str] = exec.try_wait(child);
+        if (R.is_err[O.Option[exec.ExitStatus], str](pr)) { ret -1; }
+        val got: O.Option[exec.ExitStatus] = R.unwrap_ok[O.Option[exec.ExitStatus], str](pr);
+        if (!O.is_some[exec.ExitStatus](got)) { ret 0; }
+        st = O.unwrap[exec.ExitStatus](got);
+    }
+    if (exec.signaled(st)) {
+        @kind = STATE_SIGNALED;
+        @code = exec.signal(st);
+    }
+    or (exec.exited(st)) {
+        @kind = STATE_EXITED;
+        @code = exec.code(st);
+    }
+    or { ret -1; }
+    ret 1;
+}
+
+fun actual_sleep(a: *A.Allocator) {
+    os.sleep(duration.MILLISECOND);
+}
+
+fun request_with[T](p: *OwnedSubprocess, a: *A.Allocator, request: cnc.Reason, attempts: u32,
+                    ctx: *T, terminate: fun(*T, exec.Child, bool) bool,
+                    wait_child: fun(*T, i64, bool, *SubprocessState, *i32) i8,
+                    sleep: fun(*T)) R.Result[SubprocessTerminal, str] {
+    if (ctx == nil || terminate == nil || wait_child == nil || sleep == nil) {
+        ret R.err[SubprocessTerminal, str]("subprocess lifecycle capability is incomplete");
+    }
+    if (!running(p)) {
+        ret R.err[SubprocessTerminal, str](identity_error(a, owner_identity(p), "subprocess is not running"));
+    }
+    if (request != cnc.TIMED_OUT && request != cnc.CANCELLED) {
+        ret R.err[SubprocessTerminal, str]("invalid subprocess termination request");
+    }
+    p.requested = request;
+
+    val soft_sent: bool = terminate(ctx, p.child, false);
+    var i: u32 = 0;
+    for (soft_sent && i < attempts) {
+        var kind: SubprocessState = STATE_EXITED;
+        var code: i32 = 0;
+        val wr: i8 = wait_child(ctx, p.child.pid, false, ?kind, ?code);
+        if (wr > 0) {
+            if (!observe_terminal(p, kind, code) || !mark_reaped(p)) {
+                ret R.err[SubprocessTerminal, str]("invalid subprocess terminal transition");
+            }
+            ret R.ok[SubprocessTerminal, str](p.terminal);
+        }
+        if (wr < 0) { brk; }
+        sleep(ctx);
+        i = i + 1;
+    }
+
+    if (!terminate(ctx, p.child, true)) {
+        var pkind: SubprocessState = STATE_EXITED;
+        var pcode: i32 = 0;
+        val polled: i8 = wait_child(ctx, p.child.pid, false, ?pkind, ?pcode);
+        if (polled <= 0) {
+            ret R.err[SubprocessTerminal, str](identity_error(a, owner_identity(p), "subprocess termination failed"));
+        }
+        if (!observe_terminal(p, pkind, pcode) || !mark_reaped(p)) {
+            ret R.err[SubprocessTerminal, str]("invalid subprocess terminal transition");
+        }
+        ret R.ok[SubprocessTerminal, str](p.terminal);
+    }
+
+    var kind: SubprocessState = STATE_EXITED;
+    var code: i32 = 0;
+    if (wait_child(ctx, p.child.pid, true, ?kind, ?code) <= 0) {
+        ret R.err[SubprocessTerminal, str](identity_error(a, owner_identity(p), "subprocess reap failed"));
+    }
+    if (!observe_terminal(p, kind, code) || !mark_reaped(p)) {
+        ret R.err[SubprocessTerminal, str]("invalid subprocess terminal transition");
+    }
+    ret R.ok[SubprocessTerminal, str](p.terminal);
+}
+
+fun request(p: *OwnedSubprocess, a: *A.Allocator, state: cnc.Reason,
+            grace: duration.Duration) R.Result[SubprocessTerminal, str] {
+    if (grace < 0) {
+        ret R.err[SubprocessTerminal, str](identity_error(a, owner_identity(p), "subprocess termination grace cannot be negative"));
+    }
+    var attempts: u32 = 0;
+    if (grace > 0) {
+        var millis: i64 = grace / duration.MILLISECOND;
+        if (grace % duration.MILLISECOND != 0) { millis = millis + 1; }
+        if (millis > 4294967295) {
+            ret R.err[SubprocessTerminal, str](identity_error(a, owner_identity(p), "subprocess termination grace is too large"));
+        }
+        attempts = millis::u32;
+    }
+    ret request_with[A.Allocator](p, a, state, attempts, a, actual_terminate, actual_wait,
+                                  actual_sleep);
+}
+
+pub fun timeout(a: *A.Allocator, p: *OwnedSubprocess, grace: duration.Duration) R.Result[SubprocessTerminal, str] {
+    ret request(p, a, cnc.TIMED_OUT, grace);
+}
+
+pub fun cancel(a: *A.Allocator, p: *OwnedSubprocess, grace: duration.Duration) R.Result[SubprocessTerminal, str] {
+    ret request(p, a, cnc.CANCELLED, grace);
+}
+
+rec FakeLifecycle {
+    soft:        u32;
+    hard:        u32;
+    group_soft:  u32;
+    polls:       u32;
+    sleeps:      u32;
+    finish_poll: u32;
+    kind:        SubprocessState;
+    code:        i32;
+    fail_soft:   bool;
+    fail_hard:   bool;
+    fail_group_soft: bool;
+}
+
+fun fake_terminate(f: *FakeLifecycle, child: exec.Child, hard: bool) bool {
+    if (hard) {
+        f.hard = f.hard + 1;
+        ret !f.fail_hard;
+    }
+    if (child.pgid != 0) {
+        f.group_soft = f.group_soft + 1;
+        ret !f.fail_group_soft;
+    }
+    f.soft = f.soft + 1;
+    ret !f.fail_soft;
+}
+
+fun fake_wait(f: *FakeLifecycle, child_pid: i64, block: bool,
+              kind: *SubprocessState, code: *i32) i8 {
+    f.polls = f.polls + 1;
+    if (!block && (f.finish_poll == 0 || f.polls < f.finish_poll)) { ret 0; }
+    @kind = f.kind;
+    @code = f.code;
+    ret 1;
+}
+
+fun fake_sleep(f: *FakeLifecycle) {
+    f.sleeps = f.sleeps + 1;
+}
+
+fun fake_owner(p: *OwnedSubprocess, child_pid: i64) {
+    init(p);
+    p.spawn_attempted = true;
+    observe_spawn(p, exec.Child{pid: child_pid});
+}
+
+fun fake_owner_grouped(p: *OwnedSubprocess, child_pid: i64) {
+    init(p);
+    p.spawn_attempted = true;
+    observe_spawn(p, exec.Child{pid: child_pid, pgid: child_pid});
+}
+
+fun fake_request(p: *OwnedSubprocess, a: *A.Allocator, request: cnc.Reason, attempts: u32,
+                 f: *FakeLifecycle) R.Result[SubprocessTerminal, str] {
+    ret request_with[FakeLifecycle](p, a, request, attempts, f, fake_terminate, fake_wait,
+                                    fake_sleep);
+}
+
+rec CaptureProbe {
+    backing: A.Allocator;
+    live:    i64;
+    calls:   u32;
+    fail_at: u32;
+}
+
+fun capture_probe_allocate(ctx: ptr, size: usize, align: usize) O.Option[ptr] {
+    val p: *CaptureProbe = ctx::*CaptureProbe;
+    p.calls = p.calls + 1;
+    if (p.fail_at != 0 && p.calls == p.fail_at) { ret O.none[ptr](); }
+    val r: O.Option[ptr] = p.backing.fn_allocate(p.backing.ctx, size, align);
+    if (O.is_some[ptr](r)) { p.live = p.live + size::i64; }
+    ret r;
+}
+
+fun capture_probe_reallocate(ctx: ptr, item: ptr, old_size: usize, new_size: usize, align: usize) O.Option[ptr] {
+    val p: *CaptureProbe = ctx::*CaptureProbe;
+    val r: O.Option[ptr] = p.backing.fn_reallocate(p.backing.ctx, item, old_size, new_size, align);
+    if (O.is_some[ptr](r)) { p.live = p.live - old_size::i64 + new_size::i64; }
+    ret r;
+}
+
+fun capture_probe_deallocate(ctx: ptr, item: ptr, size: usize, align: usize) i64 {
+    val p: *CaptureProbe = ctx::*CaptureProbe;
+    p.live = p.live - size::i64;
+    ret p.backing.fn_deallocate(p.backing.ctx, item, size, align);
+}
+
+fun capture_probe_make(p: *CaptureProbe, alloc: *A.Allocator, fail_at: u32) bool {
+    if (O.is_some[str](page.make(?p.backing))) { ret false; }
+    p.live    = 0;
+    p.calls   = 0;
+    p.fail_at = fail_at;
+    val probe: *CaptureProbe = p;
+    alloc.ctx           = probe::ptr;
+    alloc.fn_allocate   = capture_probe_allocate;
+    alloc.fn_reallocate = capture_probe_reallocate;
+    alloc.fn_deallocate = capture_probe_deallocate;
+    ret true;
+}
+
+test "mach.subprocess:spawn_captured_open_failure_leaks_nothing" {
+    var identity: *u8;
+    $if ($mach.build.os == $mach.os.windows) { identity = "Z:\\mach-no-parent\\capture-probe-open"; }
+    $or { identity = "/mach-no-parent/capture-probe-open"; }
+    var argv: [2]*u8;
+    argv[0] = identity;
+    argv[1] = nil;
+    var probe: CaptureProbe;
+    var alloc: A.Allocator;
+    if (!capture_probe_make(?probe, ?alloc, 0)) { ret 1; }
+    var p: OwnedSubprocess;
+    init(?p);
+    val sr: R.Result[R.Void, str] = spawn_captured(?alloc, ?p, identity, ?argv[0], env.environ(), identity, 8);
+    if (R.is_ok[R.Void, str](sr)) { ret 1; }
+    str_free(?alloc, R.unwrap_err[R.Void, str](sr));
+    if (probe.live != 0) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:spawn_captured_prepare_failure_leaks_nothing" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var plain: A.Allocator;
+    if (O.is_some[str](page.make(?plain))) { ret 1; }
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?plain, "mach_subprocess_probe_prepare");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val identity: str = filesystem.temp_path(?tf);
+    filesystem.temp_close_and_remove(?tf);
+
+    var argv: [4]*u8;
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = "printf hi";
+    argv[3] = nil;
+
+    var probe: CaptureProbe;
+    var alloc: A.Allocator;
+    if (!capture_probe_make(?probe, ?alloc, 2)) { ret 1; }
+    var p: OwnedSubprocess;
+    init(?p);
+    val sr: R.Result[R.Void, str] = spawn_captured(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), identity, 64);
+    var bad: bool = false;
+    if (R.is_ok[R.Void, str](sr)) { bad = true; }
+    or { str_free(?alloc, R.unwrap_err[R.Void, str](sr)); }
+    if (probe.live != 0) { bad = true; }
+    filesystem.remove_file(identity);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:double_dnit_after_spawn_failure_is_idempotent" {
+    var identity: *u8;
+    $if ($mach.build.os == $mach.os.windows) { identity = "Z:\\mach-no-parent\\capture-double-dnit"; }
+    $or { identity = "/mach-no-parent/capture-double-dnit"; }
+    var argv: [2]*u8;
+    argv[0] = identity;
+    argv[1] = nil;
+    var probe: CaptureProbe;
+    var alloc: A.Allocator;
+    if (!capture_probe_make(?probe, ?alloc, 0)) { ret 1; }
+    var p: OwnedSubprocess;
+    init(?p);
+    val sr: R.Result[R.Void, str] = spawn_captured(?alloc, ?p, identity, ?argv[0], env.environ(), identity, 8);
+    if (R.is_ok[R.Void, str](sr)) { ret 1; }
+    str_free(?alloc, R.unwrap_err[R.Void, str](sr));
+    if (probe.live != 0) { ret 1; }
+    dnit(?alloc, ?p);
+    if (probe.live != 0) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:dnit_after_release_frees_nothing_twice" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var plain: A.Allocator;
+    if (O.is_some[str](page.make(?plain))) { ret 1; }
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?plain, "mach_subprocess_dnit_release");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val identity: str = filesystem.temp_path(?tf);
+    filesystem.temp_close_and_remove(?tf);
+
+    var argv: [4]*u8;
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = "printf hi";
+    argv[3] = nil;
+
+    var probe: CaptureProbe;
+    var alloc: A.Allocator;
+    if (!capture_probe_make(?probe, ?alloc, 0)) { ret 1; }
+    var p: OwnedSubprocess;
+    init(?p);
+    val sr: R.Result[R.Void, str] = spawn_captured(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), identity, 64);
+    var bad: bool = false;
+    if (R.is_err[R.Void, str](sr)) { bad = true; }
+    or {
+        val wr: R.Result[SubprocessTerminal, str] = wait(?alloc, ?p);
+        if (R.is_err[SubprocessTerminal, str](wr)) { bad = true; }
+        or {
+            val cr: R.Result[CaptureIoResult, str] = finish_capture(?alloc, ?p, true);
+            if (R.is_err[CaptureIoResult, str](cr)) { bad = true; }
+            or {
+                val rel: R.Result[R.Void, str] = release_capture(?alloc, ?p);
+                if (R.is_err[R.Void, str](rel)) { bad = true; }
+                or {
+                    dnit(?alloc, ?p);
+                    if (probe.live != 0) { bad = true; }
+                    dnit(?alloc, ?p);
+                    if (probe.live != 0) { bad = true; }
+                }
+            }
+        }
+    }
+    filesystem.remove_file(identity);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:legal_exit_and_reap_is_exactly_once" {
+    var p: OwnedSubprocess;
+    fake_owner(?p, 41);
+    if (!observe_terminal(?p, STATE_EXITED, 7)) { ret 1; }
+    if (!mark_reaped(?p)) { ret 1; }
+    if (p.state != STATE_REAPED || p.terminal.kind != STATE_EXITED || p.terminal.code != 7) { ret 1; }
+    if (p.reap_count != 1 || mark_reaped(?p) || observe_terminal(?p, STATE_SIGNALED, 9)) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:illegal_terminal_transitions_are_rejected" {
+    var p: OwnedSubprocess;
+    init(?p);
+    if (observe_terminal(?p, STATE_EXITED, 0)) { ret 1; }
+    fake_owner(?p, 42);
+    if (observe_terminal(?p, STATE_UNSTARTED, 0)) { ret 1; }
+    if (mark_reaped(?p)) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:unstarted_is_distinct_from_spawn_failure" {
+    var p: OwnedSubprocess;
+    init(?p);
+    if (p.state != STATE_UNSTARTED || p.terminal.kind != STATE_UNSTARTED) { ret 1; }
+    if (running(?p) || p.spawn_attempted) { ret 1; }
+
+    var identity: *u8;
+    $if ($mach.build.os == $mach.os.windows) { identity = "Z:\\mach-no-parent\\capture-unstarted"; }
+    $or { identity = "/mach-no-parent/capture-unstarted"; }
+    var argv: [2]*u8;
+    argv[0] = identity;
+    argv[1] = nil;
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[R.Void, str] = spawn_captured(?alloc, ?p, identity, ?argv[0], env.environ(), identity, 8);
+    if (R.is_ok[R.Void, str](sr)) { ret 1; }
+    if (p.state != STATE_SPAWN_FAILURE || p.terminal.kind != STATE_SPAWN_FAILURE) { ret 1; }
+    if (!str_contains(R.unwrap_err[R.Void, str](sr), identity::str)) { ret 1; }
+    val retry: R.Result[R.Void, str] = spawn_captured(?alloc, ?p, identity, ?argv[0], env.environ(), identity, 8);
+    if (R.is_ok[R.Void, str](retry)) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:cancel_reaps_a_real_running_child" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var argv: [4]*u8;
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = "sleep 30";
+    argv[3] = nil;
+    var p: OwnedSubprocess;
+    init(?p);
+    val sr: R.Result[R.Void, str] = spawn(?alloc, ?p, "/bin/sh", ?argv[0], env.environ());
+    if (R.is_err[R.Void, str](sr)) { ret 1; }
+    if (!running(?p)) { ret 1; }
+    val cr: R.Result[SubprocessTerminal, str] = cancel(?alloc, ?p, duration.MILLISECOND * 50);
+    if (R.is_err[SubprocessTerminal, str](cr)) { ret 1; }
+    val terminal: SubprocessTerminal = R.unwrap_ok[SubprocessTerminal, str](cr);
+    if (terminal.kind != STATE_SIGNALED && terminal.kind != STATE_EXITED) { ret 1; }
+    if (p.state != STATE_REAPED || p.reap_count != 1 || p.requested != cnc.CANCELLED) { ret 1; }
+    dnit(?alloc, ?p);
+    ret 0;
+}
+
+test "mach.subprocess:wait_any_reaps_the_child_that_exits" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var fast_argv: [4]*u8;
+    fast_argv[0] = "/bin/sh";
+    fast_argv[1] = "-c";
+    fast_argv[2] = "exit 3";
+    fast_argv[3] = nil;
+    var slow_argv: [4]*u8;
+    slow_argv[0] = "/bin/sh";
+    slow_argv[1] = "-c";
+    slow_argv[2] = "sleep 30";
+    slow_argv[3] = nil;
+
+    var owners: [2]OwnedSubprocess;
+    init(?owners[0]);
+    init(?owners[1]);
+    val fast_r: R.Result[R.Void, str] = spawn(?alloc, ?owners[0], "/bin/sh", ?fast_argv[0], env.environ());
+    if (R.is_err[R.Void, str](fast_r)) { ret 1; }
+    val slow_r: R.Result[R.Void, str] = spawn(?alloc, ?owners[1], "/bin/sh", ?slow_argv[0], env.environ());
+    if (R.is_err[R.Void, str](slow_r)) { dnit(?alloc, ?owners[0]); ret 1; }
+
+    val wr: R.Result[*OwnedSubprocess, str] = wait_any(?alloc, ?owners[0], 2, nil, nil);
+    var bad: bool = false;
+    if (R.is_err[*OwnedSubprocess, str](wr)) { bad = true; }
+    or {
+        val reaped: *OwnedSubprocess = R.unwrap_ok[*OwnedSubprocess, str](wr);
+        if (reaped != ?owners[0] || reaped.terminal.kind != STATE_EXITED || reaped.terminal.code != 3) { bad = true; }
+        if (running(?owners[1])) {
+            val cr: R.Result[SubprocessTerminal, str] = cancel(?alloc, ?owners[1], 0);
+            if (R.is_err[SubprocessTerminal, str](cr)) { bad = true; }
+        }
+        or { bad = true; }
+    }
+    dnit(?alloc, ?owners[0]);
+    dnit(?alloc, ?owners[1]);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:capture_reads_back_through_the_same_descriptor" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "mach_subprocess_capture_readback");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val identity: str = filesystem.temp_path(?tf);
+    filesystem.temp_close_and_remove(?tf);
+
+    var argv: [4]*u8;
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = "printf hello";
+    argv[3] = nil;
+    var p: OwnedSubprocess;
+    init(?p);
+    val sr: R.Result[R.Void, str] = spawn_captured(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), identity, 64);
+    var bad: bool = false;
+    if (R.is_err[R.Void, str](sr)) { bad = true; }
+    or {
+        val wr: R.Result[SubprocessTerminal, str] = wait(?alloc, ?p);
+        if (R.is_err[SubprocessTerminal, str](wr)) { bad = true; }
+        or {
+            val cr: R.Result[CaptureIoResult, str] = finish_capture(?alloc, ?p, true);
+            if (R.is_err[CaptureIoResult, str](cr)) { bad = true; }
+            or {
+                val capture: CaptureIoResult = R.unwrap_ok[CaptureIoResult, str](cr);
+                if (capture.bytes != 5 || capture.truncated || capture.read_failed) { bad = true; }
+                var n: usize = 0;
+                val bytes: *u8 = capture_bytes(?p, ?n);
+                if (bytes == nil || n != 5 || bytes[0] != 'h' || bytes[4] != 'o') { bad = true; }
+                val rel: R.Result[R.Void, str] = release_capture(?alloc, ?p);
+                if (R.is_err[R.Void, str](rel)) { bad = true; }
+            }
+        }
+    }
+    filesystem.remove_file(identity);
+    dnit(?alloc, ?p);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:spawn_does_not_borrow_caller_pathname_or_argv" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+
+    var pathname_buf: [10]u8;
+    val original: str = "/bin/true";
+    var i: usize = 0;
+    for (i < 9) { pathname_buf[i] = original[i]; i = i + 1; }
+    pathname_buf[9] = 0;
+
+    var argv: [2]*u8;
+    argv[0] = ?pathname_buf[0];
+    argv[1] = nil;
+
+    var p: OwnedSubprocess;
+    init(?p);
+    val sr: R.Result[R.Void, str] = spawn(?alloc, ?p, (?pathname_buf[0])::str, ?argv[0], env.environ());
+    if (R.is_err[R.Void, str](sr)) { ret 1; }
+
+    var j: usize = 0;
+    for (j < 9) { pathname_buf[j] = 'X'::u8; j = j + 1; }
+
+    val first: R.Result[SubprocessTerminal, str] = wait(?alloc, ?p);
+    var bad: bool = false;
+    if (R.is_err[SubprocessTerminal, str](first)) { bad = true; }
+
+    val second: R.Result[SubprocessTerminal, str] = wait(?alloc, ?p);
+    if (R.is_ok[SubprocessTerminal, str](second)) { bad = true; }
+    or {
+        val msg: str = R.unwrap_err[SubprocessTerminal, str](second);
+        if (!str_contains(msg, "/bin/true")) { bad = true; }
+        if (str_contains(msg, "XXXXXXXXX")) { bad = true; }
+    }
+    dnit(?alloc, ?p);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:spawn_captured_does_not_borrow_caller_identity" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "mach_subprocess_identity_borrow");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val real_path: *u8 = filesystem.temp_path(?tf)::*u8;
+    filesystem.temp_close_and_remove(?tf);
+
+    var identity_buf: [256]u8;
+    var cleanup_buf: [256]u8;
+    var n: usize = 0;
+    for (n < 255 && real_path[n] != 0) {
+        identity_buf[n] = real_path[n];
+        cleanup_buf[n]  = real_path[n];
+        n = n + 1;
+    }
+    identity_buf[n] = 0;
+    cleanup_buf[n]  = 0;
+
+    var argv: [4]*u8;
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = "printf hi";
+    argv[3] = nil;
+    var p: OwnedSubprocess;
+    init(?p);
+    val sr: R.Result[R.Void, str] = spawn_captured(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), (?identity_buf[0])::str, 64);
+    var bad: bool = false;
+    if (R.is_err[R.Void, str](sr)) { bad = true; }
+    or {
+        var k: usize = 0;
+        for (k < n) { identity_buf[k] = 'Z'::u8; k = k + 1; }
+
+        val wr: R.Result[SubprocessTerminal, str] = wait(?alloc, ?p);
+        if (R.is_err[SubprocessTerminal, str](wr)) { bad = true; }
+        or {
+            val cr: R.Result[CaptureIoResult, str] = finish_capture(?alloc, ?p, true);
+            if (R.is_err[CaptureIoResult, str](cr)) { bad = true; }
+            or {
+                val capture: CaptureIoResult = R.unwrap_ok[CaptureIoResult, str](cr);
+                if (capture.bytes != 2 || capture.read_failed) { bad = true; }
+                val rel: R.Result[R.Void, str] = release_capture(?alloc, ?p);
+                if (R.is_err[R.Void, str](rel)) { bad = true; }
+            }
+        }
+    }
+    filesystem.remove_file((?cleanup_buf[0])::str);
+    dnit(?alloc, ?p);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:termination_failure_error_names_the_command" {
+    var p: OwnedSubprocess;
+    fake_owner(?p, 49);
+    p.pathname = "fake-owner-command"::*u8;
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var f: FakeLifecycle = FakeLifecycle{
+        soft: 0, hard: 0, polls: 0, sleeps: 0, finish_poll: 0,
+        kind: STATE_EXITED, code: 0, fail_soft: true, fail_hard: true,
+    };
+    val rr: R.Result[SubprocessTerminal, str] =
+        fake_request(?p, ?alloc, cnc.TIMED_OUT, 2, ?f);
+    if (R.is_ok[SubprocessTerminal, str](rr)) { ret 1; }
+    if (!str_contains(R.unwrap_err[SubprocessTerminal, str](rr), "fake-owner-command")) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:wait_any_bounds_a_runaway_capture" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "mach_subprocess_capture_limit");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val identity: str = filesystem.temp_path(?tf);
+    filesystem.temp_close_and_remove(?tf);
+
+    var argv: [4]*u8;
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = "while true; do echo 0123456789; done";
+    argv[3] = nil;
+    var p: OwnedSubprocess;
+    init(?p);
+    val sr: R.Result[R.Void, str] = spawn_captured(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), identity, 64);
+    var bad: bool = false;
+    if (R.is_err[R.Void, str](sr)) { bad = true; }
+    or {
+        val wr: R.Result[*OwnedSubprocess, str] = wait_any(?alloc, ?p, 1, nil, nil);
+        if (R.is_err[*OwnedSubprocess, str](wr)) { bad = true; }
+        or {
+            if (p.state != STATE_REAPED || p.requested != cnc.CANCELLED) { bad = true; }
+
+            val disk_r: R.Result[filesystem.Metadata, str] = filesystem.metadata(identity);
+            if (R.is_err[filesystem.Metadata, str](disk_r)) { bad = true; }
+            or {
+                val disk_size: usize = R.unwrap_ok[filesystem.Metadata, str](disk_r).size;
+                if (disk_size < 64 || disk_size >= 1048576) { bad = true; }
+            }
+
+            val cr: R.Result[CaptureIoResult, str] = finish_capture(?alloc, ?p, true);
+            if (R.is_err[CaptureIoResult, str](cr)) { bad = true; }
+            or {
+                val capture: CaptureIoResult = R.unwrap_ok[CaptureIoResult, str](cr);
+                if (!capture.truncated || capture.bytes != 64 || capture.read_failed) { bad = true; }
+                var n: usize = 0;
+                val bytes: *u8 = capture_bytes(?p, ?n);
+                if (bytes == nil || n != 64) { bad = true; }
+                val rel: R.Result[R.Void, str] = release_capture(?alloc, ?p);
+                if (R.is_err[R.Void, str](rel)) { bad = true; }
+            }
+        }
+    }
+    filesystem.remove_file(identity);
+    dnit(?alloc, ?p);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:spawn_failure_owns_no_child_and_cannot_retry" {
+    var p: OwnedSubprocess;
+    init(?p);
+    if (!begin_spawn(?p)) { ret 1; }
+    if (p.state != STATE_UNSTARTED || running(?p) || p.child.pid != 0 || p.reap_count != 0) { ret 1; }
+    if (begin_spawn(?p)) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:capture_acquisition_failure_has_no_child" {
+    var identity: *u8;
+    $if ($mach.build.os == $mach.os.windows) { identity = "Z:\\mach-no-parent\\capture"; }
+    $or { identity = "/mach-no-parent/capture"; }
+    var argv: [2]*u8;
+    argv[0] = identity;
+    argv[1] = nil;
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var p: OwnedSubprocess;
+    init(?p);
+    val rr: R.Result[R.Void, str] = spawn_captured(
+        ?alloc, ?p, identity, ?argv[0], env.environ(), identity, 8);
+    if (R.is_ok[R.Void, str](rr)) { ret 1; }
+    if (running(?p) || p.child.pid != 0 || !p.has_capture) { ret 1; }
+    if (!p.capture.result.write_failed || !p.capture.result.closed) { ret 1; }
+    if (p.state != STATE_SPAWN_FAILURE) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:timeout_preserves_request_and_observed_exit" {
+    var p: OwnedSubprocess;
+    fake_owner(?p, 43);
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var f: FakeLifecycle = FakeLifecycle{
+        soft: 0, hard: 0, polls: 0, sleeps: 0, finish_poll: 2,
+        kind: STATE_EXITED, code: 0, fail_soft: false, fail_hard: false,
+    };
+    val rr: R.Result[SubprocessTerminal, str] =
+        fake_request(?p, ?alloc, cnc.TIMED_OUT, 4, ?f);
+    if (R.is_err[SubprocessTerminal, str](rr)) { ret 1; }
+    if (p.requested != cnc.TIMED_OUT || p.terminal.kind != STATE_EXITED) { ret 1; }
+    if (p.state != STATE_REAPED || p.reap_count != 1) { ret 1; }
+    if (f.soft != 1 || f.hard != 0 || f.polls != 2 || f.sleeps != 1) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:cancellation_escalates_and_reaps_signal" {
+    var p: OwnedSubprocess;
+    fake_owner(?p, 44);
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var f: FakeLifecycle = FakeLifecycle{
+        soft: 0, hard: 0, polls: 0, sleeps: 0, finish_poll: 0,
+        kind: STATE_SIGNALED, code: 9, fail_soft: false, fail_hard: false,
+    };
+    val rr: R.Result[SubprocessTerminal, str] =
+        fake_request(?p, ?alloc, cnc.CANCELLED, 2, ?f);
+    if (R.is_err[SubprocessTerminal, str](rr)) { ret 1; }
+    if (p.requested != cnc.CANCELLED || p.terminal.kind != STATE_SIGNALED || p.terminal.code != 9) { ret 1; }
+    if (p.state != STATE_REAPED || p.reap_count != 1) { ret 1; }
+    if (f.soft != 1 || f.hard != 1 || f.polls != 3 || f.sleeps != 2) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:termination_failure_keeps_live_ownership_and_can_retry" {
+    var p: OwnedSubprocess;
+    fake_owner(?p, 45);
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var f: FakeLifecycle = FakeLifecycle{
+        soft: 0, hard: 0, polls: 0, sleeps: 0, finish_poll: 0,
+        kind: STATE_EXITED, code: 0, fail_soft: true, fail_hard: true,
+    };
+    val rr: R.Result[SubprocessTerminal, str] =
+        fake_request(?p, ?alloc, cnc.TIMED_OUT, 2, ?f);
+    if (R.is_ok[SubprocessTerminal, str](rr)) { ret 1; }
+    if (!running(?p) || p.reap_count != 0 || p.requested != cnc.TIMED_OUT) { ret 1; }
+    val again: R.Result[SubprocessTerminal, str] =
+        fake_request(?p, ?alloc, cnc.CANCELLED, 2, ?f);
+    if (R.is_ok[SubprocessTerminal, str](again) || f.soft != 2 || f.hard != 2) { ret 1; }
+    f.fail_hard = false;
+    val final: R.Result[SubprocessTerminal, str] =
+        fake_request(?p, ?alloc, cnc.CANCELLED, 2, ?f);
+    if (R.is_err[SubprocessTerminal, str](final)) { ret 1; }
+    if (p.state != STATE_REAPED || p.reap_count != 1 || p.requested != cnc.CANCELLED) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:termination_grace_rejects_invalid_durations" {
+    var p: OwnedSubprocess;
+    fake_owner(?p, 46);
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val negative: R.Result[SubprocessTerminal, str] = timeout(?alloc, ?p, -1);
+    if (R.is_ok[SubprocessTerminal, str](negative) || p.requested != cnc.ACTIVE) { ret 1; }
+    val excessive: duration.Duration = 4294967296::i64 * duration.MILLISECOND;
+    val large: R.Result[SubprocessTerminal, str] = cancel(?alloc, ?p, excessive);
+    if (R.is_ok[SubprocessTerminal, str](large) || p.requested != cnc.ACTIVE) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:capture_facts_and_borrows_have_one_owner" {
+    var a: A.Allocator;
+    page.make(?a);
+    val allocated: R.Result[*u8, str] = A.allocate[u8](?a, 8);
+    if (R.is_err[*u8, str](allocated)) { ret 1; }
+    val id_r: R.Result[*u8, str] = dup_cstr(?a, "capture-owner-fixture");
+    if (R.is_err[*u8, str](id_r)) { ret 1; }
+    var p: OwnedSubprocess;
+    init(?p);
+    p.has_capture = true;
+    p.capture = empty_capture(8);
+    p.capture.identity = R.unwrap_ok[*u8, str](id_r);
+    p.capture.finished = true;
+    p.capture.buffer = R.unwrap_ok[*u8, str](allocated);
+    p.capture.capacity = 8;
+    p.capture.result.bytes = 8;
+    p.capture.result.truncated = true;
+    p.capture.result.short_read = true;
+    p.capture.result.read_failed = true;
+    p.capture.result.write_failed = true;
+    p.capture.result.close_failed = true;
+    var n: usize = 0;
+    if (capture_bytes(?p, ?n) == nil || n != 8) { ret 1; }
+    val released: R.Result[R.Void, str] = release_capture(?a, ?p);
+    if (R.is_err[R.Void, str](released)) { ret 1; }
+    if (capture_bytes(?p, ?n) != nil || n != 0 || p.capture.result.owned) { ret 1; }
+    if (!p.capture.released) { ret 1; }
+    val double: R.Result[R.Void, str] = release_capture(?a, ?p);
+    if (R.is_ok[R.Void, str](double)) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:finish_capture_rejects_running_child" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var identity: *u8;
+    $if ($mach.build.os == $mach.os.windows) { identity = "Z:\\mach-no-parent\\capture-running"; }
+    $or { identity = "/mach-no-parent/capture-running"; }
+    var p: OwnedSubprocess;
+    fake_owner(?p, 47);
+    p.has_capture = true;
+    p.capture = empty_capture(8);
+    val fr: R.Result[CaptureIoResult, str] = finish_capture(?alloc, ?p, false);
+    if (R.is_ok[CaptureIoResult, str](fr)) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:release_before_finish_is_illegal" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var p: OwnedSubprocess;
+    fake_owner(?p, 48);
+    if (!observe_terminal(?p, STATE_EXITED, 0)) { ret 1; }
+    if (!mark_reaped(?p)) { ret 1; }
+    p.has_capture = true;
+    p.capture = empty_capture(8);
+    val premature: R.Result[R.Void, str] = release_capture(?alloc, ?p);
+    if (R.is_ok[R.Void, str](premature)) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:spawn_grouped_sets_pgid" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var argv: [4]*u8;
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = "exit 0";
+    argv[3] = nil;
+    var p: OwnedSubprocess;
+    init(?p);
+    val sr: R.Result[R.Void, str] = spawn_grouped(?alloc, ?p, "/bin/sh", ?argv[0], env.environ());
+    var bad: bool = false;
+    if (R.is_err[R.Void, str](sr)) { bad = true; }
+    or {
+        if (p.child.pgid == 0 || p.child.pgid != p.child.pid) { bad = true; }
+        val wr: R.Result[SubprocessTerminal, str] = wait(?alloc, ?p);
+        if (R.is_err[SubprocessTerminal, str](wr)) { bad = true; }
+    }
+    dnit(?alloc, ?p);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:spawn_captured_grouped_failure_leaks_nothing" {
+    var identity: *u8;
+    $if ($mach.build.os == $mach.os.windows) { identity = "Z:\\mach-no-parent\\capture-grouped"; }
+    $or { identity = "/mach-no-parent/capture-grouped"; }
+    var argv: [2]*u8;
+    argv[0] = identity;
+    argv[1] = nil;
+    var probe: CaptureProbe;
+    var alloc: A.Allocator;
+    if (!capture_probe_make(?probe, ?alloc, 0)) { ret 1; }
+    var p: OwnedSubprocess;
+    init(?p);
+    val sr: R.Result[R.Void, str] = spawn_captured_grouped(?alloc, ?p, identity, ?argv[0], env.environ(), identity, 8);
+    if (R.is_ok[R.Void, str](sr)) { ret 1; }
+    str_free(?alloc, R.unwrap_err[R.Void, str](sr));
+    if (probe.live != 0) { ret 1; }
+    if (p.state != STATE_SPAWN_FAILURE || p.child.pgid != 0) { ret 1; }
+    dnit(?alloc, ?p);
+    if (probe.live != 0) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:cancel_reaps_a_grouped_child_and_its_descendant" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "mach_subprocess_group_descendant");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val identity: str = filesystem.temp_path(?tf);
+    filesystem.temp_close_and_remove(?tf);
+
+    var argv: [4]*u8;
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = "sleep 30 & echo $!; wait";
+    argv[3] = nil;
+    var p: OwnedSubprocess;
+    init(?p);
+    val sr: R.Result[R.Void, str] = spawn_captured_grouped(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), identity, 32);
+    var bad: bool = false;
+    if (R.is_err[R.Void, str](sr)) { bad = true; }
+    or {
+        if (p.child.pgid == 0) { bad = true; }
+        os.sleep(duration.MILLISECOND * 100);
+        val cr: R.Result[SubprocessTerminal, str] = cancel(?alloc, ?p, duration.MILLISECOND * 50);
+        if (R.is_err[SubprocessTerminal, str](cr)) { bad = true; }
+        or {
+            val fr: R.Result[CaptureIoResult, str] = finish_capture(?alloc, ?p, true);
+            if (R.is_err[CaptureIoResult, str](fr)) { bad = true; }
+            or {
+                var n: usize = 0;
+                val bytes: *u8 = capture_bytes(?p, ?n);
+                var grandchild: i64 = 0;
+                var i: usize = 0;
+                for (i < n && bytes[i] >= '0'::u8 && bytes[i] <= '9'::u8) {
+                    grandchild = grandchild * 10 + (bytes[i] - '0'::u8)::i64;
+                    i = i + 1;
+                }
+                if (grandchild <= 0) { bad = true; }
+                or {
+                    var tries: usize = 0;
+                    var gone: bool = false;
+                    for (tries < 50 && !gone) {
+                        $if ($mach.build.os == $mach.os.linux) {
+                            if (linux.getpgid(grandchild) < 0) { gone = true; }
+                        }
+                        $or ($mach.build.os == $mach.os.darwin) {
+                            if (darwin.getpgid(grandchild) < 0) { gone = true; }
+                        }
+                        if (!gone) { os.sleep(duration.MILLISECOND * 20); }
+                        tries = tries + 1;
+                    }
+                    if (!gone) { bad = true; }
+                }
+                val rel: R.Result[R.Void, str] = release_capture(?alloc, ?p);
+                if (R.is_err[R.Void, str](rel)) { bad = true; }
+            }
+        }
+    }
+    filesystem.remove_file(identity);
+    dnit(?alloc, ?p);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:grouped_termination_failure_keeps_live_ownership_and_can_retry" {
+    var p: OwnedSubprocess;
+    fake_owner_grouped(?p, 50);
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var f: FakeLifecycle = FakeLifecycle{
+        soft: 0, hard: 0, group_soft: 0, polls: 0, sleeps: 0, finish_poll: 0,
+        kind: STATE_EXITED, code: 0, fail_soft: false, fail_hard: true, fail_group_soft: true,
+    };
+    val rr: R.Result[SubprocessTerminal, str] =
+        fake_request(?p, ?alloc, cnc.TIMED_OUT, 2, ?f);
+    if (R.is_ok[SubprocessTerminal, str](rr)) { ret 1; }
+    if (!running(?p) || p.reap_count != 0 || p.requested != cnc.TIMED_OUT) { ret 1; }
+    if (f.group_soft != 1 || f.soft != 0 || f.hard != 1) { ret 1; }
+    f.fail_group_soft = false;
+    f.fail_hard = false;
+    val retry: R.Result[SubprocessTerminal, str] =
+        fake_request(?p, ?alloc, cnc.CANCELLED, 2, ?f);
+    if (R.is_err[SubprocessTerminal, str](retry)) { ret 1; }
+    if (p.state != STATE_REAPED || p.reap_count != 1 || p.requested != cnc.CANCELLED) { ret 1; }
+    if (f.group_soft != 2) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:wait_any_scoped_deadline_cancels_a_running_child" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "mach_subprocess_deadline");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val identity: str = filesystem.temp_path(?tf);
+    filesystem.temp_close_and_remove(?tf);
+
+    var argv: [4]*u8;
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = "sleep 30";
+    argv[3] = nil;
+    var p: OwnedSubprocess;
+    init(?p);
+    val sr: R.Result[R.Void, str] = spawn_captured(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), identity, 64);
+    var bad: bool = false;
+    if (R.is_err[R.Void, str](sr)) { bad = true; }
+    or {
+        var scope: cnc.Scope;
+        val deadline: tm.Time = tm.time_add(tm.monotonic(), duration.MILLISECOND * 60);
+        cnc.make_root(?scope, true, deadline);
+        val wr: R.Result[*OwnedSubprocess, str] = wait_any(?alloc, ?p, 1, ?scope, nil);
+        if (R.is_err[*OwnedSubprocess, str](wr)) { bad = true; }
+        or {
+            if (p.state != STATE_REAPED || p.requested != cnc.TIMED_OUT) { bad = true; }
+            if (cnc.reason(?scope) != cnc.TIMED_OUT) { bad = true; }
+        }
+        cnc.destroy(?scope);
+        val fr: R.Result[CaptureIoResult, str] = finish_capture(?alloc, ?p, false);
+        if (R.is_err[CaptureIoResult, str](fr)) { bad = true; }
+    }
+    filesystem.remove_file(identity);
+    dnit(?alloc, ?p);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:wait_any_scoped_cancellation_races_a_fast_exit" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var argv: [4]*u8;
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = "exit 7";
+    argv[3] = nil;
+    var p: OwnedSubprocess;
+    init(?p);
+    val sr: R.Result[R.Void, str] = spawn(?alloc, ?p, "/bin/sh", ?argv[0], env.environ());
+    var bad: bool = false;
+    if (R.is_err[R.Void, str](sr)) { bad = true; }
+    or {
+        var scope: cnc.Scope;
+        cnc.make_root(?scope, false, tm.Time{sec: 0, nsec: 0});
+        cnc.cancel(?scope);
+        os.sleep(duration.MILLISECOND * 30);
+        val wr: R.Result[*OwnedSubprocess, str] = wait_any(?alloc, ?p, 1, ?scope, nil);
+        if (R.is_err[*OwnedSubprocess, str](wr)) { bad = true; }
+        or {
+            if (p.state != STATE_REAPED || p.reap_count != 1) { bad = true; }
+            if (p.requested != cnc.CANCELLED) { bad = true; }
+            if (p.terminal.kind != STATE_EXITED && p.terminal.kind != STATE_SIGNALED) { bad = true; }
+        }
+        cnc.destroy(?scope);
+    }
+    dnit(?alloc, ?p);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+test "mach.subprocess:an_owner_deadline_terminates_the_group_and_reaps_the_grandchild" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "mach_subprocess_owner_deadline");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val identity: str = filesystem.temp_path(?tf);
+    filesystem.temp_close_and_remove(?tf);
+
+    var argv: [4]*u8;
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = "sleep 30 & echo $!; wait";
+    argv[3] = nil;
+    var p: OwnedSubprocess;
+    init(?p);
+    val sr: R.Result[R.Void, str] = spawn_captured_grouped(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), identity, 32);
+    var bad: i32 = 0;
+    if (R.is_err[R.Void, str](sr)) { bad = 1; }
+    or {
+        if (p.child.pgid == 0) { bad = 2; }
+        os.sleep(duration.MILLISECOND * 100);
+        if (!bound_seconds(?p, 1)) { bad = 3; }
+        if (p.timeout_seconds != 1) { bad = 4; }
+        val started: tm.Time = tm.monotonic();
+        val wr: R.Result[*OwnedSubprocess, str] = wait_any(?alloc, ?p, 1, nil, nil);
+        if (R.is_err[*OwnedSubprocess, str](wr)) { bad = 5; }
+        or {
+            if (!expired(?p)) { bad = 6; }
+            if (p.state != STATE_REAPED) { bad = 7; }
+            val waited: duration.Duration = tm.time_sub(tm.monotonic(), started);
+            if (waited > duration.SECOND * 20) { bad = 8; }
+            val fr: R.Result[CaptureIoResult, str] = finish_capture(?alloc, ?p, true);
+            if (R.is_err[CaptureIoResult, str](fr)) { bad = 9; }
+            or {
+                var n: usize = 0;
+                val bytes: *u8 = capture_bytes(?p, ?n);
+                var grandchild: i64 = 0;
+                var i: usize = 0;
+                for (i < n && bytes[i] >= '0'::u8 && bytes[i] <= '9'::u8) {
+                    grandchild = grandchild * 10 + (bytes[i] - '0'::u8)::i64;
+                    i = i + 1;
+                }
+                if (grandchild <= 0) { bad = 10; }
+                or {
+                    var tries: usize = 0;
+                    var gone: bool = false;
+                    for (tries < 50 && !gone) {
+                        $if ($mach.build.os == $mach.os.linux) {
+                            if (linux.getpgid(grandchild) < 0) { gone = true; }
+                        }
+                        $or ($mach.build.os == $mach.os.darwin) {
+                            if (darwin.getpgid(grandchild) < 0) { gone = true; }
+                        }
+                        if (!gone) { os.sleep(duration.MILLISECOND * 20); }
+                        tries = tries + 1;
+                    }
+                    if (!gone) { bad = 11; }
+                }
+                val rel: R.Result[R.Void, str] = release_capture(?alloc, ?p);
+                if (R.is_err[R.Void, str](rel)) { bad = 12; }
+            }
+        }
+    }
+    filesystem.remove_file(identity);
+    dnit(?alloc, ?p);
+    ret bad;
+}
+
+test "mach.subprocess:an_unbounded_owner_runs_to_its_own_exit" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var argv: [4]*u8;
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = "sleep 1; exit 5";
+    argv[3] = nil;
+    var p: OwnedSubprocess;
+    init(?p);
+    val sr: R.Result[R.Void, str] = spawn_grouped(?alloc, ?p, "/bin/sh", ?argv[0], env.environ());
+    var bad: i32 = 0;
+    if (R.is_err[R.Void, str](sr)) { bad = 1; }
+    or {
+        if (p.has_deadline) { bad = 2; }
+        val wr: R.Result[*OwnedSubprocess, str] = wait_any(?alloc, ?p, 1, nil, nil);
+        if (R.is_err[*OwnedSubprocess, str](wr)) { bad = 3; }
+        or {
+            if (expired(?p)) { bad = 4; }
+            if (p.terminal.kind != STATE_EXITED || p.terminal.code != 5) { bad = 5; }
+        }
+    }
+    dnit(?alloc, ?p);
+    ret bad;
+}
+
+test "mach.subprocess:a_child_that_beats_its_deadline_is_not_reported_timed_out" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var argv: [4]*u8;
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = "exit 3";
+    argv[3] = nil;
+    var p: OwnedSubprocess;
+    init(?p);
+    val sr: R.Result[R.Void, str] = spawn_grouped(?alloc, ?p, "/bin/sh", ?argv[0], env.environ());
+    var bad: i32 = 0;
+    if (R.is_err[R.Void, str](sr)) { bad = 1; }
+    or {
+        if (!bound_seconds(?p, 30)) { bad = 2; }
+        val wr: R.Result[*OwnedSubprocess, str] = wait_any(?alloc, ?p, 1, nil, nil);
+        if (R.is_err[*OwnedSubprocess, str](wr)) { bad = 3; }
+        or {
+            if (expired(?p)) { bad = 4; }
+            if (p.terminal.kind != STATE_EXITED || p.terminal.code != 3) { bad = 5; }
+        }
+    }
+    dnit(?alloc, ?p);
+    ret bad;
+}
+
+test "mach.subprocess.bound_seconds:rejects_a_nonpositive_bound_and_a_finished_owner" {
+    var p: OwnedSubprocess;
+    init(?p);
+    if (bound_seconds(?p, 0))  { ret 1; }
+    if (bound_seconds(?p, -1)) { ret 2; }
+    if (p.has_deadline || p.timeout_seconds != 0) { ret 3; }
+    if (!bound_seconds(?p, 4)) { ret 4; }
+    if (!p.has_deadline || p.timeout_seconds != 4) { ret 5; }
+    if (deadline_reached(?p, tm.Time{sec: 0, nsec: 0})) { ret 6; }
+
+    var q: OwnedSubprocess;
+    fake_owner(?q, 90);
+    if (!bound_seconds(?q, 2)) { ret 7; }
+    q.state = STATE_REAPED;
+    if (bound_seconds(?q, 2)) { ret 8; }
+    ret 0;
+}

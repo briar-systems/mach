@@ -1,26 +1,20 @@
-# `mach build <path>` - compile the project per the composed request
-#
-# The command is the pipeline's thin front: parse the flags, compose the
-# settled request against the once-loaded manifest, resolve it into a plan,
-# hand the plan to the engine, and render the outcome. Resolution lives in the
-# planner (`mach.lang.build.plan`), execution in the engine
-# (`mach.lang.build.engine`); nothing here compiles, emits, or links. With
-# `--explain` the resolved plan is printed and nothing is built. Exit codes:
-# 0 ok, 1 user error (missing mach.toml, unknown target, compile errors),
-# 2 internal error.
-
 use std.allocator.arena;
 use std.allocator.page;
+use fs: std.filesystem;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.path;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.string.str_equals;
+use std.types.string.str_len;
 
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
+
+use std.process.env;
+use mach.subprocess;
 
 use mach.cli.args;
 use cli_diag: mach.cli.diagnostic;
@@ -34,20 +28,16 @@ use mach.lang.manifest;
 use mach.lang.readout;
 use mach.lang.session;
 
-# compose and plan one invocation: init the planning session (returned through
-# `ps`, which the caller tears down after consuming the plan), load the root
-# manifest once, compose the settled request against it, and resolve the plan
-#
-# On error the session is torn down here and the failure is returned for the
-# caller's render. The plan's units borrow the session's interner and
-# allocator, so `ps` must outlive every consumer of the returned plan.
+# initialise a session, load the manifest, and plan a build for parsed CLI arguments
 # ---
-# a:    allocator backing the planning session and the plan's units
-# root: the resolved project root directory (from the command entry)
-# cli:  the parsed command line, captures included (collect_build ran)
-# goal: what this invocation produces
-# ps:   receives the live planning session on success
-# ret:  the resolved plan, or the failure to render
+# a: allocator for the request
+# root: the project root directory
+# cli: the parsed arguments
+# goal: what to produce, objects or an executable
+# ps: out; the session the plan refers to, initialised here; on an error it has already been
+#  torn down
+# ret: the plan, or a Fail: internal for session or registry setup, user for manifest,
+#  selection, and request errors, and whatever plan.plan returns
 pub fun plan_invocation(a: *A.Allocator, root: str, cli: *args.CliArgs, goal: request.BuildGoal,
                         ps: *session.Session) R.Result[plan.BuildPlan, outcome.Fail] {
     val res_session: R.Result[session.Session, str] = session.init(a);
@@ -56,10 +46,10 @@ pub fun plan_invocation(a: *A.Allocator, root: str, cli: *args.CliArgs, goal: re
     }
     @ps = R.unwrap_ok[session.Session, str](res_session);
 
-    val res_register: R.Result[bool, str] = driver.setup_registry(?ps.registry);
-    if (R.is_err[bool, str](res_register)) {
+    val res_register: R.Result[R.Void, str] = driver.setup_registry(?ps.registry);
+    if (R.is_err[R.Void, str](res_register)) {
         session.dnit(ps);
-        ret R.err[plan.BuildPlan, outcome.Fail](outcome.internal(R.unwrap_err[bool, str](res_register)));
+        ret R.err[plan.BuildPlan, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](res_register)));
     }
 
     val res_manifest: R.Result[manifest.Manifest, str] = driver.load_manifest(ps, root);
@@ -71,9 +61,9 @@ pub fun plan_invocation(a: *A.Allocator, root: str, cli: *args.CliArgs, goal: re
     var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](res_manifest);
 
     var sel: manifest.Selection;
-    val sr: R.Result[bool, str] = args.selection_from_config(cli, ?sel);
-    if (R.is_err[bool, str](sr)) {
-        val f: outcome.Fail = outcome.user(R.unwrap_err[bool, str](sr));
+    val sr: R.Result[R.Void, str] = args.selection_from_config(cli, ?sel);
+    if (R.is_err[R.Void, str](sr)) {
+        val f: outcome.Fail = outcome.user(R.unwrap_err[R.Void, str](sr));
         session.dnit(ps);
         ret R.err[plan.BuildPlan, outcome.Fail](f);
     }
@@ -85,57 +75,43 @@ pub fun plan_invocation(a: *A.Allocator, root: str, cli: *args.CliArgs, goal: re
         ret R.err[plan.BuildPlan, outcome.Fail](f);
     }
 
-    # the composed request must outlive the plan (its units point back at it);
-    # it lands on the planning allocator next to the units it drives.
-    val res_rq: R.Result[*request.BuildRequest, str] = A.allocate[request.BuildRequest](a, 1::usize);
-    if (R.is_err[*request.BuildRequest, str](res_rq)) {
-        session.dnit(ps);
-        ret R.err[plan.BuildPlan, outcome.Fail](outcome.internal("out of memory"));
-    }
-    val req: *request.BuildRequest = R.unwrap_ok[*request.BuildRequest, str](res_rq);
-    @req = R.unwrap_ok[request.BuildRequest, outcome.Fail](res_req);
-
-    val plan_r: R.Result[plan.BuildPlan, outcome.Fail] = plan.plan(ps.alloc, ?ps.interner, ?ps.registry, ?m, req);
+    val plan_r: R.Result[plan.BuildPlan, outcome.Fail] = plan.plan(ps.alloc, ?ps.interner, ?ps.registry, ?m,
+        R.unwrap_ok[request.BuildRequest, outcome.Fail](res_req));
     if (R.is_err[plan.BuildPlan, outcome.Fail](plan_r)) {
         session.dnit(ps);
     }
     ret plan_r;
 }
 
-# `mach build` subcommand entry point
-#
-# parse -> compose -> plan -> execute -> render: the flags settle into a
-# request, the planner resolves the (target, artifact) matrix, the engine
-# executes each unit, and the outcome derives the exit code. Called by
-# cmd.dispatch.
+# `mach build`: plan and execute a build of the project operand, rendering diagnostics and
+# the outcome to stderr. `-O1` is refused before parsing; `--explain` prints the plan and
+# stops; `-v` and `-vv` render the phase readout after the build
 # ---
-# argc:  argument count including argv[0]
-# argv:  the argument vector (argc null-terminated byte pointers)
-# marks: consumption record parallel to argv, for the unknown-flag rejector
-# ret:   0 on success, 1 on a user error, 2 on an internal error
-pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
+# argv: the full process arguments
+# inv: the parsed invocation for this command
+# ret: 0 success, 1 user error, 2 internal failure, 3 environment failure
+pub fun run_typed(argv: **u8, inv: *args.ParsedInvocation) i64 {
+    val cmd: args.CommandId = args.CMD_BUILD;
+
     var goal: request.BuildGoal = request.GOAL_EXECUTE;
-    val opt_emit: O.Option[str] = util.flag_value(argc, argv, "--emit");
-    if (O.is_some[str](opt_emit)) {
-        val kind: str = O.unwrap[str](opt_emit);
-        if (str_equals(kind, "obj")) { goal = request.GOAL_OBJECTS; }
-        or (str_equals(kind, "exe")) { goal = request.GOAL_EXECUTE; }
-        or {
-            val f: outcome.Fail = outcome.user("--emit expects 'obj' or 'exe'");
+    val opt_emit: O.Option[*u8] = args.invocation_value(cmd, inv, argv, "--emit");
+    if (O.is_some[*u8](opt_emit)) {
+        val kind: str = O.unwrap[*u8](opt_emit)::str;
+        val goal_o: O.Option[request.BuildGoal] = request.goal_from_emit_name(kind);
+        if (O.is_none[request.BuildGoal](goal_o)) {
+            val f: outcome.Fail = outcome.user(request.EMIT_ERROR);
             ret cli_diag.render_fail(?f);
         }
+        goal = O.unwrap[request.BuildGoal](goal_o);
     }
 
-    # back the build with a page allocator; the planning pass and each engine
-    # unit get their own arena over it, so a unit's compile memory is reclaimed
-    # before the next while the plan (the request arena) outlives the loop.
     var backing: A.Allocator;
     if (O.is_some[str](page.make(?backing))) {
         val f: outcome.Fail = outcome.internal("failed to initialise allocator");
         ret cli_diag.render_fail(?f);
     }
 
-    val res_config: R.Result[args.CliArgs, str] = args.parse(argc, argv);
+    val res_config: R.Result[args.CliArgs, str] = args.build_cli_invocation(cmd, inv, argv);
     if (R.is_err[args.CliArgs, str](res_config)) {
         val f: outcome.Fail = outcome.user(R.unwrap_err[args.CliArgs, str](res_config));
         ret cli_diag.render_fail(?f);
@@ -146,46 +122,30 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         ret cli_diag.render_fail(?f);
     }
 
-    # mark the flags `mach build` accepts from their tables - the cross-cutting
-    # set (`parse` read their values), the `-O` override, the build-flow inputs,
-    # and `--explain` (prints the resolved plan and builds nothing) - then reject
-    # any unrecognized flag before the project-path positional is resolved (so an
-    # unknown flag can never displace the path). `mach build` gives `--` no
-    # special meaning, so a stray `--` is rejected here like any other flag.
-    args.mark_cross(marks, argc, argv);
-    args.mark_flags(marks, argc, argv, ?args.OPT[0], args.OPT_N);
-    args.mark_flags(marks, argc, argv, ?args.EMIT[0], args.EMIT_N);
-    args.mark_flags(marks, argc, argv, ?args.JOBS[0], args.JOBS_N);
-    args.mark_flags(marks, argc, argv, ?args.LINKIN[0], args.LINKIN_N);
-    args.mark_flags(marks, argc, argv, ?args.BUILD_OWN[0], args.BUILD_OWN_N);
-    val explain_only: bool = util.flag_exists(argc, argv, "--explain");
-    if (util.flag_reject_unknown(argc, argv, marks, 2, "mach build")) { ret 1; }
+    val explain_only: bool = args.invocation_flag(cmd, inv, "--explain");
+    if (quiet_explain_conflict(config.quiet, explain_only)) {
+        val f: outcome.Fail = outcome.user("`--explain` and `--quiet`/`-q` cannot be combined");
+        ret cli_diag.render_fail(?f);
+    }
+    if (args.reject_unknown_from_invocation(inv, argv, "mach build")) { ret 1; }
 
-    # resolve the project root from the required positional path
-    # (`mach build <path>`); see util.resolve_project_root for the rules.
-    val pix: usize = util.arg_index_positional(argc, argv, marks, 2);
     var arg: *u8 = nil;
-    if (pix < argc) { arg = argv[pix]; }
+    if (inv.has_positional) { arg = argv[inv.positional_idx]; }
 
-    val root_r: R.Result[str, str] = util.resolve_project_root(?backing, arg);
-    if (R.is_err[str, str](root_r)) {
-        val f: outcome.Fail = outcome.user(R.unwrap_err[str, str](root_r));
+    val loc_r: R.Result[util.ProjectLocation, str] = util.resolve_project_location(?backing, arg);
+    if (R.is_err[util.ProjectLocation, str](loc_r)) {
+        val f: outcome.Fail = outcome.user(R.unwrap_err[util.ProjectLocation, str](loc_r));
         ret cli_diag.render_fail(?f);
     }
-    val root: str = R.unwrap_ok[str, str](root_r);
+    val loc: util.ProjectLocation = R.unwrap_ok[util.ProjectLocation, str](loc_r);
+    val root: str = loc.root;
 
-    # capture the build-flow values (`-O`, `--jobs`, `-L` dirs, link tokens) now
-    # that the full flag set is marked; past this point argv is dead to the
-    # build flow - every unit reads its composed request.
-    val col_r: R.Result[bool, str] = args.collect_build(?backing, ?config, argc, argv, marks);
-    if (R.is_err[bool, str](col_r)) {
-        val f: outcome.Fail = outcome.internal(R.unwrap_err[bool, str](col_r));
+    val col_r: R.Result[R.Void, str] = args.collect_link_inputs(?backing, ?config, cmd, inv, argv);
+    if (R.is_err[R.Void, str](col_r)) {
+        val f: outcome.Fail = outcome.internal(R.unwrap_err[R.Void, str](col_r));
         ret cli_diag.render_fail(?f);
     }
 
-    # the request arena: the plan, the composed request, and the outcome live
-    # here for the whole invocation; the planning session's interner backs the
-    # unit selectors and target entries.
     var menu_ar: arena.Arena;
     if (O.is_some[str](arena.init(?menu_ar, ?backing, 0))) {
         val f: outcome.Fail = outcome.internal("failed to initialise allocator");
@@ -206,11 +166,8 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         arena.dnit(?menu_ar);
         ret c;
     }
-    # a successful plan always holds at least one unit - an empty matrix is the
-    # planner's own error, naming the target nothing was declared for.
     val bp: plan.BuildPlan = R.unwrap_ok[plan.BuildPlan, outcome.Fail](plan_r);
 
-    # `--explain`: render the resolved plan and exit without building.
     if (explain_only) {
         plan.explain(?bp, ?ps.interner);
         session.dnit(?ps);
@@ -218,22 +175,18 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         ret 0;
     }
 
-    # the `-v`/`-vv` narration: a readout-backed progress sink; a plain build
-    # passes none and stays silent.
-    var ro: readout.Readout;
     var pr: readout.Progress;
     var ev: *readout.Progress = nil;
     if (config.verbosity > 0) {
-        readout.init(?ro, ?menu_alloc, config.verbosity);
-        pr = readout.progress(?ro);
+        readout.init(?pr, ?menu_alloc, config.verbosity);
         ev = ?pr;
     }
 
-    var rctx: cli_diag.RenderCtx;
-    var rd: outcome.Render = cli_diag.render_sink(?rctx, bp.units.len);
-
-    val ex_r: R.Result[outcome.BuildOutcome, outcome.Fail] = engine.execute(?bp, ?backing, ?menu_alloc, ev, ?rd);
-    readout.dnit(?ro);
+    val ex_r: R.Result[outcome.BuildOutcome, outcome.Fail] = engine.execute(?bp, ?backing, ?menu_alloc, ev);
+    if (ev != nil) {
+        readout.render(ev);
+        readout.dnit(ev);
+    }
 
     var code: i64 = 0;
     if (R.is_err[outcome.BuildOutcome, outcome.Fail](ex_r)) {
@@ -242,10 +195,184 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
     }
     or {
         var bo: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](ex_r);
+        cli_diag.render_outcome(?bo, config.quiet);
         code = cli_diag.outcome_code(?bo);
+        outcome.outcome_dnit(?bo);
     }
 
     session.dnit(?ps);
     arena.dnit(?menu_ar);
     ret code;
+}
+
+fun quiet_explain_conflict(quiet: bool, explain_only: bool) bool {
+    ret quiet && explain_only;
+}
+
+fun t_build(argc: usize, argv: **u8) i64 {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 2; }
+    val ir: R.Result[args.ParsedInvocation, str] = args.parse_invocation(?a, argc, argv);
+    if (R.is_err[args.ParsedInvocation, str](ir)) { ret 2; }
+    var inv: args.ParsedInvocation = R.unwrap_ok[args.ParsedInvocation, str](ir);
+    ret run_typed(argv, ?inv);
+}
+
+test "mach.cli.cmd.build.quiet_explain_conflict:only_the_combination_conflicts" {
+    if (!quiet_explain_conflict(true, true))  { ret 1; }
+    if (quiet_explain_conflict(true, false))  { ret 2; }
+    if (quiet_explain_conflict(false, true))  { ret 3; }
+    if (quiet_explain_conflict(false, false)) { ret 4; }
+    ret 0;
+}
+
+test "mach.cli.cmd.build.run_typed:rejects_quiet_combined_with_explain" {
+    var argv: [4]*u8;
+    argv[0] = "mach"; argv[1] = "build"; argv[2] = "--quiet"; argv[3] = "--explain";
+    if (t_build(4, ?argv[0]) != 1) { ret 1; }
+
+    var alias: [4]*u8;
+    alias[0] = "mach"; alias[1] = "build"; alias[2] = "-q"; alias[3] = "--explain";
+    if (t_build(4, ?alias[0]) != 1) { ret 2; }
+
+    ret 0;
+}
+
+fun t_req_join(a: *A.Allocator, base: str, leaf: str) str {
+    val r: R.Result[str, str] = path.join(a, base, leaf);
+    if (R.is_err[str, str](r)) { ret base; }
+    ret R.unwrap_ok[str, str](r);
+}
+
+fun t_req_write(a: *A.Allocator, dir: str, name: str, body: str) bool {
+    if (O.is_some[str](fs.create_dir_all(a, dir, 0o755))) { ret false; }
+    val p: str = t_req_join(a, dir, name);
+    ret O.is_none[str](fs.write_bytes(p, body::*u8, str_len(body), 0o644));
+}
+
+val T_REQ_MANIFEST: str = "[project]\nid = \"reqfx\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.host]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[target.alt]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[artifact.shader-a]\nkind = \"static\"\nentry = \"shader.mach\"\nout = \"lib/shader-a.a\"\ntargets = [\"alt\"]\nlink = []\nneed = []\n\n[artifact.shader-b]\nkind = \"static\"\nentry = \"shader.mach\"\nout = \"lib/shader-b.a\"\ntargets = [\"alt\"]\nlink = []\nneed = []\n\n[artifact.app]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app\"\ntargets = [\"host\"]\nlink = []\nneed = [\"shader-*\"]\n\n[profile.debug]\ndefault = true\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n";
+
+val T_REQ_SHADER: str = "pub fun tint(x: u64) u64 { ret x + 3; }\n";
+
+val T_REQ_MAIN: str = "#[embed(\"{artifact.shader-a.out}\")]\nval SHADER: [_]u8;\n\n#[symbol(\"_start\")]\nfun start() {\n    var c: u64 = 1;\n    if (SHADER[0] == 0x21 && SHADER[1] == 0x3C && SHADER[6] == 0x3E && SHADER[7] == 0x0A) { c = 0; }\n    asm x86_64 {\n        mov rax, 60\n        mov rdi, {c}\n        syscall\n    }\n}\n";
+
+fun t_req_exit_code(a: *A.Allocator, exe: str) i32 {
+    var child: subprocess.OwnedSubprocess;
+    subprocess.init(?child);
+    var argv: [2]*u8;
+    argv[0] = exe::*u8;
+    argv[1] = nil;
+    if (R.is_err[R.Void, str](subprocess.spawn(a, ?child, exe, ?argv[0], env.environ()))) {
+        subprocess.dnit(a, ?child);
+        ret -1;
+    }
+    val wr: R.Result[subprocess.SubprocessTerminal, str] = subprocess.wait(a, ?child);
+    if (R.is_err[subprocess.SubprocessTerminal, str](wr)) {
+        subprocess.dnit(a, ?child);
+        ret -1;
+    }
+    val term: subprocess.SubprocessTerminal = R.unwrap_ok[subprocess.SubprocessTerminal, str](wr);
+    subprocess.dnit(a, ?child);
+    if (term.kind != subprocess.STATE_EXITED) { ret -1; }
+    ret term.code;
+}
+
+test "mach.cli.cmd.build.run_typed:a_glob_requirement_builds_first_and_the_bin_embeds_its_output" {
+    $if ($mach.build.os != $mach.os.linux)      { ret 0; }
+    $if ($mach.build.arch != $mach.arch.x86_64) { ret 0; }
+
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?a, "mach_build_artifact_need");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val root: str = fs.temp_path(?tf);
+    fs.temp_close_and_remove(?tf);
+    if (O.is_some[str](fs.create_dir_all(?a, root, 0o755))) { ret 1; }
+
+    var bad: i32 = 0;
+    if (!t_req_write(?a, root, "mach.toml", T_REQ_MANIFEST)) { bad = 1; }
+    val src_dir: str = t_req_join(?a, root, "src");
+    if (!t_req_write(?a, src_dir, "shader.mach", T_REQ_SHADER)) { bad = 1; }
+    if (!t_req_write(?a, src_dir, "main.mach", T_REQ_MAIN))     { bad = 1; }
+    if (bad != 0) { fs.remove_all(?a, root); ret 1; }
+
+    var argv: [5]*u8;
+    argv[0] = "mach"::*u8; argv[1] = "build"::*u8; argv[2] = root::*u8;
+    argv[3] = "--target"::*u8; argv[4] = "host"::*u8;
+    if (t_build(5, ?argv[0]) != 0) { fs.remove_all(?a, root); ret 1; }
+
+    val lib_a: str = t_req_join(?a, root, "out/alt/debug/lib/shader-a.a");
+    val lib_b: str = t_req_join(?a, root, "out/alt/debug/lib/shader-b.a");
+    val app:   str = t_req_join(?a, root, "out/host/debug/bin/app");
+    if (!fs.is_file(lib_a)) { bad = 1; }
+    if (!fs.is_file(lib_b)) { bad = 1; }
+    if (!fs.is_file(app))   { bad = 1; }
+    if (bad != 0) { fs.remove_all(?a, root); ret 1; }
+
+    if (t_req_exit_code(?a, app) != 0) { bad = 1; }
+
+    val out_dir: str = t_req_join(?a, root, "out");
+    fs.remove_all(?a, out_dir);
+    if (!t_req_write(?a, src_dir, "shader.mach", "pub fun tint(x: u64) u64 { ret nonesuch; }\n")) { bad = 1; }
+    if (t_build(5, ?argv[0]) == 0) { bad = 1; }
+    if (fs.is_file(app))           { bad = 1; }
+
+    fs.remove_all(?a, root);
+    ret bad;
+}
+
+test "mach.cli.cmd.build.run_typed:rejects_o1_before_any_side_effect_o0_and_o2_still_build" {
+    val toml_body: str = "[project]\nid = \"rem102fx\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out\"\n\n[artifact.rem102fx]\nkind = \"static\"\nentry = \"lib.mach\"\nout = \"lib/rem102fx.a\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+    val src_body: str = "pub fun value() i64 {\n    ret 42;\n}\n";
+
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?a, "mach_build_cmd_o1");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val root: str = fs.temp_path(?tf);
+    fs.temp_close_and_remove(?tf);
+    if (O.is_some[str](fs.create_dir_all(?a, root, 0o755))) { ret 1; }
+
+    val toml_path_r: R.Result[str, str] = path.join(?a, root, "mach.toml");
+    if (R.is_err[str, str](toml_path_r)) { ret 1; }
+    val toml_path: str = R.unwrap_ok[str, str](toml_path_r);
+    if (O.is_some[str](fs.write_bytes(toml_path, toml_body::*u8, str_len(toml_body), 0o644))) { ret 1; }
+
+    val src_dir_r: R.Result[str, str] = path.join(?a, root, "src");
+    if (R.is_err[str, str](src_dir_r)) { ret 1; }
+    val src_dir: str = R.unwrap_ok[str, str](src_dir_r);
+    if (O.is_some[str](fs.create_dir_all(?a, src_dir, 0o755))) { ret 1; }
+    val src_path_r: R.Result[str, str] = path.join(?a, src_dir, "lib.mach");
+    if (R.is_err[str, str](src_path_r)) { ret 1; }
+    val src_path: str = R.unwrap_ok[str, str](src_path_r);
+    if (O.is_some[str](fs.write_bytes(src_path, src_body::*u8, str_len(src_body), 0o644))) { ret 1; }
+
+    val out_dir_r: R.Result[str, str] = path.join(?a, root, "out");
+    if (R.is_err[str, str](out_dir_r)) { ret 1; }
+    val out_dir: str = R.unwrap_ok[str, str](out_dir_r);
+
+    var bad: i32 = 0;
+
+    var argv_o1: [4]*u8;
+    argv_o1[0] = "mach"; argv_o1[1] = "build"; argv_o1[2] = "-O1"; argv_o1[3] = root::*u8;
+    if (t_build(4, ?argv_o1[0]) != 1) { bad = 1; }
+    if (fs.is_dir(out_dir))           { bad = 1; }
+
+    var argv_o0: [4]*u8;
+    argv_o0[0] = "mach"; argv_o0[1] = "build"; argv_o0[2] = "-O0"; argv_o0[3] = root::*u8;
+    if (t_build(4, ?argv_o0[0]) != 0) { bad = 1; }
+    if (!fs.is_dir(out_dir))          { bad = 1; }
+    fs.remove_all(?a, out_dir);
+
+    var argv_o2: [4]*u8;
+    argv_o2[0] = "mach"; argv_o2[1] = "build"; argv_o2[2] = "-O2"; argv_o2[3] = root::*u8;
+    if (t_build(4, ?argv_o2[0]) != 0) { bad = 1; }
+    if (!fs.is_dir(out_dir))          { bad = 1; }
+
+    fs.remove_all(?a, root);
+    ret bad;
 }

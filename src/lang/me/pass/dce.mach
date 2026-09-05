@@ -1,49 +1,3 @@
-# dead code elimination over the SSA IR
-#
-# Two cooperating sweeps run on each non-extern function:
-#
-#   1. value DCE - a mark-and-sweep from the roots. The roots are the block-listed
-#      instructions DCE may never remove (the terminators and every side-effecting
-#      opcode - stores, memzeros, calls, allocas, asm, loads, debug values - plus
-#      any volatile op); marking walks their value operands transitively. An
-#      instruction that is removable-when-unused (a pure value op, or an OP_PHI,
-#      which is not `is_pure` but has no side effects) and that no root reaches is
-#      dead. Reachability, not a use count, is the criterion: a use count is exact
-#      on a DAG but wrong on a cycle, where a set of phis naming only each other
-#      keeps every member's count at one and none is ever seeded (#2247). mem2reg
-#      produces such cycles routinely - a slot conditionally stored inside a loop
-#      gets a phi at the merge and another at the loop header, each naming the
-#      other and nothing else. Block lists, not the instruction pool, are the
-#      source of truth for liveness: a pool entry no longer named by any block - a
-#      ghost left by a pass that unlinked it - is neither a root nor a removal
-#      candidate, so it neither pins live values nor is reported dead.
-#   2. reachability DCE - blocks unreachable from the entry block (BlockId 0)
-#      along terminator edges are removed. The block array compacts, every
-#      BlockId reference (terminator targets, predecessor lists, phi incomings)
-#      is remapped, and phi incomings from removed predecessors are dropped.
-#
-# Constant-time contract (#1646): this pass removes only pure, unused value ops -
-# never a store, memzero, or call - so a zeroizing write to secret storage already
-# survives it. INVARIANT: should a dead-store-elimination sweep ever be added here,
-# it MUST consult the secret taint (`Instruction.secret`) and never remove a store /
-# memzero to secret storage; eliminating a zeroization would leave a secret in memory
-# past its intended lifetime, the leak the #1648 validator checks on emitted code.
-#
-# THERE IS ONE TAINT, NOT TWO (#2364). The MIR-side `MirInstr.writes_secret` seed is
-# DERIVED from this field - `be.codegen.mir.lower` stamps it as `(OP_STORE ||
-# OP_MEMZERO) && inst.secret` - so a sweep may consult whichever side it runs on and
-# get the same answer. `Instruction.secret` itself is written by two composing sites,
-# and a sweep depends on BOTH: `me.ir.builder.emit_store` marks a secret-VALUE store,
-# and `me.lower.expr.assign_epilogue` (with the decl-statement sites in
-# `me.lower.stmt`) marks by DESTINATION secrecy, which is the half that covers a
-# public zero written into secret storage - `crypto.ct.zeroize`'s exact shape.
-#
-# The guarantee this protects is SECRET-STORAGE scoped, not `#[oblivious]` scoped: it
-# holds in a function carrying no decorator. A sweep must therefore key on the taint,
-# never on the decorator - keying on the decorator would silently drop every wipe
-# outside an annotated function. `mach.lang.driver:secret_store_taint_survives_lower`
-# pins the taint so this requirement is enforceable before such a sweep exists.
-
 use std.allocator.page;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -60,79 +14,48 @@ use std.collections.map;
 use mach.lang.intern;
 use mach.lang.me.ir;
 use mach.lang.me.ir.builder;
+use mach.lang.me.ir.effect;
 use mach.lang.me.ir.id;
 use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.refs;
 use mach.lang.me.ir.mutate;
 use mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use semtype: mach.lang.type;
 
-# sentinel for a removed block in the reachability compaction remap
 val BLOCK_GONE: u32 = 0xFFFFFFFF;
 
-# run dead code elimination over every non-extern function in `m`: value DCE
-# followed by reachability DCE
-# ---
-# m:   the module to mutate in place
-# ret: ok(true) on success, or the first allocation error encountered
 pub fun run(m: *ir.Module) R.Result[bool, str] {
+    var changed: bool = false;
     var i: u32 = 0;
     for (i < m.function_len) {
         val fn: *ir.Function = ?m.functions[i];
         if ((fn.flags & ir.FN_FLAG_EXTERN) == 0) {
-            val res_value_dce: R.Result[bool, str] = value_dce(m, fn);
-            if (R.is_err[bool, str](res_value_dce)) { ret res_value_dce; }
-            val res_reach_dce: R.Result[bool, str] = reachability_dce(m, fn);
-            if (R.is_err[bool, str](res_reach_dce)) { ret res_reach_dce; }
+            val value_changed_r: R.Result[bool, str] = value_dce(m, fn);
+            if (R.is_err[bool, str](value_changed_r)) { ret value_changed_r; }
+            if (R.unwrap_ok[bool, str](value_changed_r)) { changed = true; }
+            val reach_changed_r: R.Result[bool, str] = reachability_dce(m, fn);
+            if (R.is_err[bool, str](reach_changed_r)) { ret reach_changed_r; }
+            if (R.unwrap_ok[bool, str](reach_changed_r)) { changed = true; }
         }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok[bool, str](changed);
 }
 
-# the erase context threaded to `dce_marked`: the per-instruction dead-flag array
-# and its length
-# ---
-# dead: per-instruction dead flags, indexed by InstructionId
-# ilen: length of `dead` and the in-range bound
 rec DceMarks {
     dead: *bool;
     ilen: u32;
 }
 
-# the erase predicate `erase_marked` drives: whether dce flagged `iid` dead
-#
-# An id at or beyond the dead map's range is conservatively kept.
-# ---
-# ctx: a *DceMarks (the dead-flag array and its length)
-# iid: the instruction id to test
-# ret: true when iid is flagged dead
-fun dce_marked(ctx: ptr, iid: id.InstructionId) bool {
-    val c: *DceMarks = ctx::*DceMarks;
+fun dce_marked(c: *DceMarks, iid: id.InstructionId) bool {
     if (iid::u32 >= c.ilen) { ret false; }
     ret c.dead[iid::u32];
 }
 
-# value DCE for one function
-#
-# One sweep over the block lists partitions the listed instructions: a root (an
-# instruction DCE may not remove) is marked live and pushed, a removable one is
-# flagged dead until proven otherwise. Draining the worklist marks each live
-# instruction's value operands live, clearing their dead flags, so what survives
-# is exactly the set the roots reach. A phi cycle no root reaches stays flagged
-# and is removed whole - the case a use count cannot see, since its members keep
-# each other's counts at one. Block lists are the source of truth for liveness: a
-# pool entry no longer named by any block (a ghost left by an earlier pass) is
-# neither seeded as a root nor flagged dead, so it pins nothing and is reported
-# as surviving, exactly as before. The dead instructions are compacted out of
-# their block lists in a final sweep.
-# ---
-# m:   the owning module; its allocator backs the scratch arrays
-# fn:  the function to process
-# ret: ok(true) on success, or an allocation error
 fun value_dce(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
     val ilen: u32 = fn.instr_len;
-    if (ilen == 0) { ret R.ok[bool, str](true); }
+    if (ilen == 0) { ret R.ok[bool, str](false); }
 
     val res_live: R.Result[*bool, str] = A.allocate[bool](m.alloc, ilen::usize);
     if (R.is_err[*bool, str](res_live)) {
@@ -162,7 +85,6 @@ fun value_dce(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
         i = i + 1;
     }
 
-    # mark: seed the roots from the block lists, then close over their operands.
     var wlen: u32 = 0;
     i = 0;
     for (i < fn.block_count) {
@@ -187,74 +109,37 @@ fun value_dce(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
         i = i + 1;
     }
 
-    # drain: a live instruction's value operands are live too. `work` doubles as
-    # the worklist stack; `live` dedups, so each id is pushed at most once.
     for (wlen > 0) {
         wlen = wlen - 1;
         val did:  u32                      = work[wlen]::u32;
         val inst: *instruction.Instruction = ?fn.instrs[did];
 
-        var ii: u32 = 0;
-        for (ii < inst.operand_count) {
-            val opt_def: O.Option[u32] = operand_instr_use(inst, ii, ilen);
-            if (O.is_some[u32](opt_def)) {
-                val def_id: u32 = O.unwrap[u32](opt_def);
-                dead[def_id] = false;
-                if (live[def_id] == false) {
-                    live[def_id] = true;
-                    work[wlen]   = def_id::id.InstructionId;
-                    wlen         = wlen + 1;
-                }
-            }
-            ii = ii + 1;
-        }
+        var lc: LiveWalk;
+        lc.live = live;
+        lc.dead = dead;
+        lc.work = work;
+        lc.wlen = wlen;
+        lc.ilen = ilen;
+        refs.visit_operands[LiveWalk](inst, ?lc, mark_operand_use);
+        wlen = lc.wlen;
     }
 
-    # sweep: drop the still-flagged instructions from every block's lists through
-    # the shared batch removal helper (the single free path; no private compaction).
     var marks: DceMarks;
     marks.dead = dead;
     marks.ilen = ilen;
-    val marks_ptr: *DceMarks = ?marks;
-    val res_erase: R.Result[bool, str] = mutate.erase_marked(m, fn, marks_ptr::ptr, dce_marked);
+    val erased_r: R.Result[bool, str] =
+        mutate.erase_marked[DceMarks](m, fn, ?marks, dce_marked);
 
     A.deallocate[bool](m.alloc, live, ilen::usize);
     A.deallocate[bool](m.alloc, dead, ilen::usize);
     A.deallocate[id.InstructionId](m.alloc, work, ilen::usize);
-    ret res_erase;
+    ret erased_r;
 }
 
-# whether `inst` may be deleted once its result is unused
-#
-# Pure value-producing opcodes qualify, as does OP_PHI: a phi is not `is_pure`
-# (it is position-dependent, so CSE must never merge phis) but it has no side
-# effects, so an unused phi is dead. Every side-effecting opcode (store, call,
-# memzero, alloca, asm, va_*, terminators) and any volatile load is kept
-# regardless of use.
-# ---
-# inst: the instruction to test
-# ret:  true when the instruction is dead once its result is unused
 fun is_removable_when_unused(inst: *instruction.Instruction) bool {
-    if (inst.kind == instruction.OP_PHI)                     { ret true; }
-    if (instruction.is_pure(inst.kind) == false)             { ret false; }
-    if ((inst.flags & instruction.INSTR_FLAG_VOLATILE) != 0) { ret false; }
-    ret true;
+    ret effect.discardable(inst);
 }
 
-# classify one block-listed instruction for the mark phase: a root is marked live
-# and pushed onto the worklist, a removable one is flagged dead until the drain
-# proves a root reaches it
-#
-# Only ids the block lists name reach this; a ghost pool entry is therefore
-# neither a root nor a removal candidate.
-# ---
-# fn:   the function owning the instruction
-# iid:  the listed instruction to classify
-# live: per-instruction live marks, indexed by InstructionId
-# dead: per-instruction dead flags, indexed by InstructionId
-# work: the worklist stack of live instruction ids
-# wlen: in/out worklist length, advanced when `iid` is pushed
-# ilen: the instruction pool length (the bound on every per-instruction array)
 fun classify_listed(fn: *ir.Function, iid: id.InstructionId, live: *bool, dead: *bool, work: *id.InstructionId, wlen: *u32, ilen: u32) {
     val idx: u32 = iid::u32;
     if (idx >= ilen) { ret; }
@@ -267,8 +152,6 @@ fun classify_listed(fn: *ir.Function, iid: id.InstructionId, live: *bool, dead: 
         dead[idx] = true;
         ret;
     }
-    # `live` dedups the push, so the worklist takes each id at most once and stays
-    # within its pool-length allocation.
     if (live[idx] == false) {
         live[idx]   = true;
         work[@wlen] = iid;
@@ -276,59 +159,31 @@ fun classify_listed(fn: *ir.Function, iid: id.InstructionId, live: *bool, dead: 
     }
 }
 
-# whether operand slot `o` of `inst` names an SSA value rather than a block target
-#
-# OP_BR's sole operand is a block; OP_CBR operand 0 is the condition value and
-# operands 1 and 2 are blocks; OP_PHI alternates [block, value, ...], so odd
-# slots are values. OP_DBG_VALUE's operand is a debug use, not a real one: it must
-# never keep an otherwise-dead value alive, or a `-g` build would drop fewer
-# instructions than a plain build and emit different code. When such a value is in
-# fact dropped, erase_marked salvages the debug value (rebasing it onto a surviving
-# value plus an expression, or marking it optimized out).
-# ---
-# inst: the instruction
-# o:    the operand slot
-# ret:  true when slot `o` is a value use that keeps its definition live
-fun operand_is_value_use(inst: *instruction.Instruction, o: u32) bool {
-    if (inst.kind == instruction.OP_BR)        { ret false; }
-    if (inst.kind == instruction.OP_CBR)       { ret o == 0; }
-    if (inst.kind == instruction.OP_PHI)       { ret (o % 2) == 1; }
-    if (inst.kind == instruction.OP_DBG_VALUE) { ret false; }
+rec LiveWalk {
+    live: *bool;
+    dead: *bool;
+    work: *id.InstructionId;
+    wlen: u32;
+    ilen: u32;
+}
+
+fun mark_operand_use(c: *LiveWalk, r: *refs.Ref) bool {
+    if (r.role != refs.REF_VALUE_USE)      { ret true; }
+    if (r.value.kind != value.VAL_INSTR)   { ret true; }
+    val def_id: u32 = r.value.data.instr::u32;
+    if (def_id >= c.ilen)                  { ret true; }
+    c.dead[def_id] = false;
+    if (c.live[def_id] == false) {
+        c.live[def_id] = true;
+        c.work[c.wlen] = def_id::id.InstructionId;
+        c.wlen         = c.wlen + 1;
+    }
     ret true;
 }
 
-# the InstructionId defining the value used by operand `o` of `inst`, when that
-# operand is an in-range value use of an instruction result, or none
-#
-# Folds the value-use, VAL_INSTR, and bounds checks shared by the use counter
-# and the worklist drain into one decode.
-# ---
-# inst: the instruction
-# o:    the operand slot
-# ilen: the instruction pool length (the in-range bound)
-# ret:  some(id) for an in-range instruction-result operand, none otherwise
-fun operand_instr_use(inst: *instruction.Instruction, o: u32, ilen: u32) O.Option[u32] {
-    if (operand_is_value_use(inst, o) == false) { ret O.none[u32](); }
-    val op: value.Value = inst.operands[o];
-    if (op.kind != value.VAL_INSTR) { ret O.none[u32](); }
-    val def_id: u32 = op.data.instr::u32;
-    if (def_id >= ilen) { ret O.none[u32](); }
-    ret O.some[u32](def_id);
-}
-
-# reachability DCE for one function
-#
-# Marks blocks reachable from the entry block (BlockId 0) along terminator
-# edges, frees the unreachable blocks, compacts the survivors, and remaps every
-# BlockId reference - terminator targets, predecessor lists, and phi incomings -
-# dropping phi incomings whose predecessor was removed.
-# ---
-# m:   the owning module; its allocator backs the scratch arrays
-# fn:  the function to process
-# ret: ok(true) on success, or an allocation error
 fun reachability_dce(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
     val n: u32 = fn.block_count;
-    if (n == 0) { ret R.ok[bool, str](true); }
+    if (n == 0) { ret R.ok[bool, str](false); }
 
     val res_reach: R.Result[*bool, str] = A.allocate[bool](m.alloc, n::usize);
     if (R.is_err[*bool, str](res_reach)) {
@@ -349,7 +204,6 @@ fun reachability_dce(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
         i = i + 1;
     }
 
-    # BFS from the entry block along terminator successor edges.
     var qhead: u32 = 0;
     var qtail: u32 = 0;
     reach[0]     = true;
@@ -375,7 +229,6 @@ fun reachability_dce(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
         }
     }
 
-    # nothing to compact when every block is reachable.
     var all_reach: bool = true;
     i = 0;
     for (i < n) {
@@ -388,10 +241,9 @@ fun reachability_dce(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
     if (all_reach) {
         A.deallocate[bool](m.alloc, reach, n::usize);
         A.deallocate[id.BlockId](m.alloc, queue, n::usize);
-        ret R.ok[bool, str](true);
+        ret R.ok[bool, str](false);
     }
 
-    # build the old-BlockId -> new-BlockId remap; the entry stays at 0.
     val res_remap: R.Result[*u32, str] = A.allocate[u32](m.alloc, n::usize);
     if (R.is_err[*u32, str](res_remap)) {
         A.deallocate[bool](m.alloc, reach, n::usize);
@@ -413,7 +265,6 @@ fun reachability_dce(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
         i = i + 1;
     }
 
-    # free every removed block's owned arrays before the survivors move over them.
     i = 0;
     for (i < n) {
         if (reach[i] == false) {
@@ -422,7 +273,6 @@ fun reachability_dce(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
         i = i + 1;
     }
 
-    # compact survivors down, rewriting each block's id and remapping its preds.
     var w: u32 = 0;
     var r: u32 = 0;
     for (r < n) {
@@ -437,7 +287,6 @@ fun reachability_dce(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
     }
     fn.block_count = w;
 
-    # remap terminator block targets and prune phi incomings from removed preds.
     i = 0;
     for (i < fn.block_count) {
         val blk: *ir.Block = ?fn.blocks[i];
@@ -452,10 +301,6 @@ fun reachability_dce(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
     ret R.ok[bool, str](true);
 }
 
-# free a removed block's owned instruction, phi, and predecessor arrays
-# ---
-# m:   the owning module; its allocator owns the arrays
-# blk: the block whose storage to release
 fun block_arrays_free(m: *ir.Module, blk: *ir.Block) {
     if (blk.instructions != nil && blk.instr_cap > 0) {
         A.deallocate[id.InstructionId](m.alloc, blk.instructions, blk.instr_cap::usize);
@@ -468,13 +313,6 @@ fun block_arrays_free(m: *ir.Module, blk: *ir.Block) {
     }
 }
 
-# compact a predecessor list in place, remapping surviving ids through `remap`
-# and dropping any predecessor that was removed
-# ---
-# preds: the predecessor list to compact in place
-# len:   its current length
-# remap: old-BlockId -> new-BlockId table (BLOCK_GONE marks a removed block)
-# ret:   the compacted length
 fun remap_preds(preds: *id.BlockId, len: u32, remap: *u32) u32 {
     var w: u32 = 0;
     var r: u32 = 0;
@@ -489,44 +327,22 @@ fun remap_preds(preds: *id.BlockId, len: u32, remap: *u32) u32 {
     ret w;
 }
 
-# rewrite `blk`'s terminator block targets through `remap`
-#
-# Block ids ride in the terminator's operand int_lit slots (the shared
-# block-target encoding). A surviving block's terminator only targets survivors,
-# so no live target is ever gone.
-# ---
-# fn:    the function owning the terminator
-# blk:   the block whose terminator to rewrite
-# remap: old-BlockId -> new-BlockId table
 fun remap_terminator(fn: *ir.Function, blk: *ir.Block, remap: *u32) {
     if (blk.terminator == id.INSTR_NIL) { ret; }
     val opt_term: O.Option[*instruction.Instruction] = ir.instruction_get(fn, blk.terminator);
     if (O.is_none[*instruction.Instruction](opt_term)) { ret; }
     val term: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_term);
 
-    if (term.kind == instruction.OP_BR && term.operand_count >= 1) {
-        val old: u32 = term.operands[0].data.int_lit::u32;
-        if (remap[old] != BLOCK_GONE) {
-            term.operands[0].data.int_lit = remap[old]::u64;
+    var o: u32 = 0;
+    for (o < term.operand_count) {
+        if (refs.operand_is_block(term.kind, o)) {
+            val old: u32 = term.operands[o].data.int_lit::u32;
+            if (remap[old] != BLOCK_GONE) { term.operands[o].data.int_lit = remap[old]::u64; }
         }
-    }
-    or (term.kind == instruction.OP_CBR && term.operand_count >= 3) {
-        val old_true:  u32 = term.operands[1].data.int_lit::u32;
-        val old_false: u32 = term.operands[2].data.int_lit::u32;
-        if (remap[old_true]  != BLOCK_GONE) { term.operands[1].data.int_lit = remap[old_true]::u64; }
-        if (remap[old_false] != BLOCK_GONE) { term.operands[2].data.int_lit = remap[old_false]::u64; }
+        o = o + 1;
     }
 }
 
-# prune and remap `blk`'s phi incomings
-#
-# Each phi's operands are [block0, val0, block1, val1, ...]; a pair whose
-# predecessor block was removed is dropped, and a surviving block id is remapped
-# to its new BlockId. Operands are compacted in place and operand_count shrinks.
-# ---
-# fn:    the function owning the phis
-# blk:   the block whose phis to prune
-# remap: old-BlockId -> new-BlockId table
 fun prune_phis(fn: *ir.Function, blk: *ir.Block, remap: *u32) {
     var i: u32 = 0;
     for (i < blk.phi_count) {
@@ -553,8 +369,6 @@ fun prune_phis(fn: *ir.Function, blk: *ir.Block, remap: *u32) {
     }
 }
 
-# an unused phi must be removed: a phi is not `is_pure`, so DCE must recognize it
-# as removable-when-unused rather than keeping it like a side-effecting op
 test "mach.lang.me.pass.dce.run:unused_phi_removed" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -584,19 +398,18 @@ test "mach.lang.me.pass.dce.run:unused_phi_removed" {
     val join: id.BlockId = R.unwrap_ok[id.BlockId, str](res_join);
 
     builder.set_block(?bld, entry);
-    val res_br: R.Result[bool, str] = builder.emit_br(?bld, join);
-    if (R.is_err[bool, str](res_br)) { ret 1; }
+    val res_br: R.Result[R.Void, str] = builder.emit_br(?bld, join);
+    if (R.is_err[R.Void, str](res_br)) { ret 1; }
 
     builder.set_block(?bld, join);
-    # an unused phi
     val res_phi: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
     if (R.is_err[value.Value, str](res_phi)) { ret 1; }
     val phi: value.Value = R.unwrap_ok[value.Value, str](res_phi);
 
-    val res_incoming: R.Result[bool, str] = builder.phi_add_incoming(?bld, phi, entry, value.const_int(5, i64t));
-    if (R.is_err[bool, str](res_incoming)) { ret 1; }
-    val res_ret: R.Result[bool, str] = builder.emit_ret(?bld, value.const_int(9, i64t));
-    if (R.is_err[bool, str](res_ret)) { ret 1; }
+    val res_incoming: R.Result[R.Void, str] = builder.phi_add_incoming(?bld, phi, entry, value.const_int(5, i64t));
+    if (R.is_err[R.Void, str](res_incoming)) { ret 1; }
+    val res_ret: R.Result[R.Void, str] = builder.emit_ret(?bld, value.const_int(9, i64t));
+    if (R.is_err[R.Void, str](res_ret)) { ret 1; }
 
     val res_run: R.Result[bool, str] = run(?m);
     if (R.is_err[bool, str](res_run)) { ret 1; }
@@ -605,12 +418,82 @@ test "mach.lang.me.pass.dce.run:unused_phi_removed" {
     ret 0;
 }
 
-# #2247: a phi cycle no root reaches is dead even though every member's use count
-# stays at one. this builds the shape mem2reg leaves for a slot conditionally stored
-# inside a loop - a phi at the loop header naming the merge phi, and a phi at the
-# merge naming the header phi, with nothing else naming either. the mark-and-sweep
-# removes both; the use-count seed it replaced never reaches zero on either, so
-# reverting `value_dce` to that form leaves one phi in each block and fails here.
+test "mach.lang.me.pass.dce.run:unused_integer_division_and_remainder_are_retained" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    val res_module: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_module)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_module);
+    val res_i64: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](res_i64)) { ret 1; }
+    val i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i64);
+    val res_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_fn)) { ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](res_fn)];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+    val res_entry: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_entry)) { ret 1; }
+    val entry: id.BlockId = R.unwrap_ok[id.BlockId, str](res_entry);
+    builder.set_block(?bld, entry);
+
+    val lhs: value.Value = value.param(0, i64t);
+    val rhs: value.Value = value.param(1, i64t);
+    if (R.is_err[value.Value, str](builder.emit_div_s(?bld, lhs, rhs))) { ret 1; }
+    if (R.is_err[value.Value, str](builder.emit_div_u(?bld, lhs, rhs))) { ret 1; }
+    if (R.is_err[value.Value, str](builder.emit_rem_s(?bld, lhs, rhs))) { ret 1; }
+    if (R.is_err[value.Value, str](builder.emit_rem_u(?bld, lhs, rhs))) { ret 1; }
+    if (R.is_err[value.Value, str](builder.emit_add(?bld, lhs, rhs)))   { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, lhs)))              { ret 1; }
+
+    if (R.is_err[bool, str](run(?m))) { ret 1; }
+    val block: *ir.Block = ?fn.blocks[entry::u32];
+    if (block.instr_count != 4) { ret 1; }
+    if (fn.instrs[block.instructions[0]::u32].kind != instruction.OP_DIV_S) { ret 1; }
+    if (fn.instrs[block.instructions[1]::u32].kind != instruction.OP_DIV_U) { ret 1; }
+    if (fn.instrs[block.instructions[2]::u32].kind != instruction.OP_REM_S) { ret 1; }
+    if (fn.instrs[block.instructions[3]::u32].kind != instruction.OP_REM_U) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.me.pass.dce.run:unused_store_is_retained_until_rem_132_adds_dead_store_elimination" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    val res_module: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_module)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_module);
+    val res_i64: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](res_i64)) { ret 1; }
+    val i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i64);
+    val res_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_fn)) { ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](res_fn)];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+    val res_entry: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_entry)) { ret 1; }
+    val entry: id.BlockId = R.unwrap_ok[id.BlockId, str](res_entry);
+    builder.set_block(?bld, entry);
+
+    val res_alloca: R.Result[value.Value, str] = builder.emit_alloca(?bld, i64t, value.const_int(1, i64t));
+    if (R.is_err[value.Value, str](res_alloca)) { ret 1; }
+    val p: value.Value = R.unwrap_ok[value.Value, str](res_alloca);
+
+    if (R.is_err[R.Void, str](builder.emit_store(?bld, value.const_int(7, i64t), p))) { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, value.const_int(0, i64t))))      { ret 1; }
+
+    if (R.is_err[bool, str](run(?m))) { ret 1; }
+    val block: *ir.Block = ?fn.blocks[entry::u32];
+    if (block.instr_count != 2) { ret 1; }
+    if (fn.instrs[block.instructions[0]::u32].kind != instruction.OP_ALLOCA) { ret 1; }
+    if (fn.instrs[block.instructions[1]::u32].kind != instruction.OP_STORE)  { ret 1; }
+    ret 0;
+}
+
 test "mach.lang.me.pass.dce.run:dead_phi_cycle_removed" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -630,7 +513,6 @@ test "mach.lang.me.pass.dce.run:dead_phi_cycle_removed" {
     var bld: builder.Builder = builder.init(?m);
     builder.set_function(?bld, fn);
 
-    # entry -> header -> body -> {then, latch}; then -> latch; latch -> header.
     val rb0: R.Result[id.BlockId, str] = builder.new_block(?bld);
     val rb1: R.Result[id.BlockId, str] = builder.new_block(?bld);
     val rb2: R.Result[id.BlockId, str] = builder.new_block(?bld);
@@ -646,7 +528,6 @@ test "mach.lang.me.pass.dce.run:dead_phi_cycle_removed" {
     val latch:  id.BlockId = R.unwrap_ok[id.BlockId, str](rb4);
     val exit_b: id.BlockId = R.unwrap_ok[id.BlockId, str](rb5);
 
-    # both phis exist before either names the other.
     builder.set_block(?bld, header);
     val res_ph: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
     if (R.is_err[value.Value, str](res_ph)) { ret 1; }
@@ -660,23 +541,22 @@ test "mach.lang.me.pass.dce.run:dead_phi_cycle_removed" {
     val cond: value.Value = value.param(0, i64t);
 
     builder.set_block(?bld, entry);
-    if (R.is_err[bool, str](builder.emit_br(?bld, header)))              { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_br(?bld, header)))              { ret 1; }
     builder.set_block(?bld, header);
-    if (R.is_err[bool, str](builder.emit_cbr(?bld, cond, body, exit_b))) { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_cbr(?bld, cond, body, exit_b))) { ret 1; }
     builder.set_block(?bld, body);
-    if (R.is_err[bool, str](builder.emit_cbr(?bld, cond, then_b, latch))) { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_cbr(?bld, cond, then_b, latch))) { ret 1; }
     builder.set_block(?bld, then_b);
-    if (R.is_err[bool, str](builder.emit_br(?bld, latch)))               { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_br(?bld, latch)))               { ret 1; }
     builder.set_block(?bld, latch);
-    if (R.is_err[bool, str](builder.emit_br(?bld, header)))              { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_br(?bld, header)))              { ret 1; }
     builder.set_block(?bld, exit_b);
-    if (R.is_err[bool, str](builder.emit_ret(?bld, value.const_int(0, i64t)))) { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, value.const_int(0, i64t)))) { ret 1; }
 
-    # the cycle: header takes the latch phi, latch takes the header phi.
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi_h, entry, value.const_int(0, i64t)))) { ret 1; }
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi_h, latch, phi_m)))                    { ret 1; }
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi_m, then_b, value.const_int(7, i64t)))) { ret 1; }
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi_m, body, phi_h)))                      { ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, phi_h, entry, value.const_int(0, i64t)))) { ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, phi_h, latch, phi_m)))                    { ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, phi_m, then_b, value.const_int(7, i64t)))) { ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, phi_m, body, phi_h)))                      { ret 1; }
 
     if (R.is_err[bool, str](run(?m))) { ret 1; }
 
@@ -685,8 +565,6 @@ test "mach.lang.me.pass.dce.run:dead_phi_cycle_removed" {
     ret 0;
 }
 
-# reachability DCE removes an unreachable block and prunes the phi incoming that
-# came from it
 test "mach.lang.me.pass.dce.run:dead_block_and_phi_pruned" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -719,40 +597,29 @@ test "mach.lang.me.pass.dce.run:dead_block_and_phi_pruned" {
     if (R.is_err[id.BlockId, str](res_dead)) { ret 1; }
     val b_dead: id.BlockId = R.unwrap_ok[id.BlockId, str](res_dead);
 
-    # entry: unconditional branch to b_live; b_dead is never reached.
     builder.set_block(?bld, entry);
-    if (R.is_err[bool, str](builder.emit_br(?bld, b_live))) { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_br(?bld, b_live))) { ret 1; }
 
-    # b_live: phi with incomings from entry (live) and b_dead (stale); ret(phi).
     builder.set_block(?bld, b_live);
     val res_phi: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
     if (R.is_err[value.Value, str](res_phi)) { ret 1; }
     val phi: value.Value = R.unwrap_ok[value.Value, str](res_phi);
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi, entry, value.const_int(10, i64t))))  { ret 1; }
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi, b_dead, value.const_int(20, i64t)))) { ret 1; }
-    if (R.is_err[bool, str](builder.emit_ret(?bld, phi)))                                            { ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, phi, entry, value.const_int(10, i64t))))  { ret 1; }
+    if (R.is_err[R.Void, str](builder.phi_add_incoming(?bld, phi, b_dead, value.const_int(20, i64t)))) { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, phi)))                                            { ret 1; }
 
-    # b_dead: unreachable block branching to b_live, giving the phi a source to prune.
     builder.set_block(?bld, b_dead);
-    if (R.is_err[bool, str](builder.emit_br(?bld, b_live))) { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_br(?bld, b_live))) { ret 1; }
 
     if (R.is_err[bool, str](run(?m))) { ret 1; }
 
-    # b_dead removed; exactly entry + b_live remain.
     if (fn.block_count != 2) { ret 1; }
-    # b_live is now block 1; its phi keeps only the entry incoming (one pair).
     val phi_id: id.InstructionId = fn.blocks[1].phis[0];
     val phi_inst: *instruction.Instruction = ?fn.instrs[phi_id];
     if (phi_inst.operand_count != 2) { ret 1; }
     ret 0;
 }
 
-# a -g additivity regression (#1944): a dropped value's debug value must be salvaged
-# even when the function carries no DbgVar metadata for it -- the state the inliner
-# leaves after cloning a callee's OP_DBG_VALUE instructions but before its dbg-clone
-# attaches their metadata. erase_marked gates salvage on OP_DBG_VALUE presence, not on
-# dbg_vars length; keying it on the map length (the reverted behaviour) skips salvage
-# here and leaves the debug value dangling at the removed instruction.
 test "mach.lang.me.pass.dce.run:salvages_metadata_free_dbg_value" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -778,22 +645,17 @@ test "mach.lang.me.pass.dce.run:salvages_metadata_free_dbg_value" {
     val p0: value.Value = value.param(0, i64t);
     val p1: value.Value = value.param(1, i64t);
 
-    # x = add(p0, p1) -- referenced only by the debug value, so DCE drops it.
     val res_x: R.Result[value.Value, str] = builder.emit_add(?bld, p0, p1);
     if (R.is_err[value.Value, str](res_x)) { ret 1; }
     val x: value.Value = R.unwrap_ok[value.Value, str](res_x);
 
-    if (R.is_err[bool, str](builder.emit_dbg_value(?bld, x, intern.STR_NIL, i64t, semtype.TYPE_NIL, false, 0))) { ret 1; }
-    if (R.is_err[bool, str](builder.emit_ret(?bld, p0))) { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_dbg_value(?bld, x, intern.STR_NIL, i64t, semtype.TYPE_NIL, false, 0))) { ret 1; }
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, p0))) { ret 1; }
 
-    # simulate an inlined debug-value clone: the OP_DBG_VALUE binds x but carries no
-    # DbgVar metadata (empty dbg_vars).
     map.clear[id.InstructionId, ir.DbgVar](?fn.dbg_vars);
 
     if (R.is_err[bool, str](run(?m))) { ret 1; }
 
-    # x is dropped; its debug value survives (not removable) and must be salvaged to the
-    # optimized-out null idiom, never left dangling at the removed instruction.
     var found: bool = false;
     var i: u32 = 0;
     for (i < fn.instr_len) {
@@ -805,5 +667,126 @@ test "mach.lang.me.pass.dce.run:salvages_metadata_free_dbg_value" {
         i = i + 1;
     }
     if (found == false) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.me.pass.dce.run:reports_no_change_when_every_instruction_is_live" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    val res_module: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_module)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_module);
+
+    val res_i64: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](res_i64)) { ret 1; }
+    val i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i64);
+
+    val res_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_fn)) { ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](res_fn)];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+    val res_entry: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_entry)) { ret 1; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](res_entry));
+
+    val p0: value.Value = value.param(0, i64t);
+    val p1: value.Value = value.param(1, i64t);
+
+    val res_x: R.Result[value.Value, str] = builder.emit_add(?bld, p0, p1);
+    if (R.is_err[value.Value, str](res_x)) { ret 1; }
+    val x: value.Value = R.unwrap_ok[value.Value, str](res_x);
+
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, x))) { ret 1; }
+
+    val res_run: R.Result[bool, str] = run(?m);
+    if (R.is_err[bool, str](res_run)) { ret 1; }
+    if (R.unwrap_ok[bool, str](res_run) != false) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.me.pass.dce.run:reports_change_when_a_dead_phi_is_removed" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    val res_module: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_module)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_module);
+
+    val res_i64: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](res_i64)) { ret 1; }
+    val i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i64);
+
+    val res_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_fn)) { ret 1; }
+    val fi: u32 = R.unwrap_ok[u32, str](res_fn);
+    val fn: *ir.Function = ?m.functions[fi];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val res_entry: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_entry)) { ret 1; }
+    val entry: id.BlockId = R.unwrap_ok[id.BlockId, str](res_entry);
+
+    val res_join: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_join)) { ret 1; }
+    val join: id.BlockId = R.unwrap_ok[id.BlockId, str](res_join);
+
+    builder.set_block(?bld, entry);
+    val res_br: R.Result[R.Void, str] = builder.emit_br(?bld, join);
+    if (R.is_err[R.Void, str](res_br)) { ret 1; }
+
+    builder.set_block(?bld, join);
+    val res_phi: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
+    if (R.is_err[value.Value, str](res_phi)) { ret 1; }
+    val phi: value.Value = R.unwrap_ok[value.Value, str](res_phi);
+
+    val res_incoming: R.Result[R.Void, str] = builder.phi_add_incoming(?bld, phi, entry, value.const_int(5, i64t));
+    if (R.is_err[R.Void, str](res_incoming)) { ret 1; }
+    val res_ret: R.Result[R.Void, str] = builder.emit_ret(?bld, value.const_int(9, i64t));
+    if (R.is_err[R.Void, str](res_ret)) { ret 1; }
+
+    val res_run: R.Result[bool, str] = run(?m);
+    if (R.is_err[bool, str](res_run)) { ret 1; }
+    if (R.unwrap_ok[bool, str](res_run) != true) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.me.pass.dce.run:reports_change_when_an_unreachable_block_is_pruned" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    val res_module: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_module)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_module);
+
+    val res_i64: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](res_i64)) { ret 1; }
+    val i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i64);
+
+    val res_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_fn)) { ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](res_fn)];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val res_entry: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_entry)) { ret 1; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](res_entry));
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, value.const_int(1, i64t)))) { ret 1; }
+
+    val res_dead: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_dead)) { ret 1; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](res_dead));
+    if (R.is_err[R.Void, str](builder.emit_ret(?bld, value.const_int(2, i64t)))) { ret 1; }
+
+    val res_run: R.Result[bool, str] = run(?m);
+    if (R.is_err[bool, str](res_run)) { ret 1; }
+    if (R.unwrap_ok[bool, str](res_run) != true) { ret 1; }
+    if (fn.block_count != 1) { ret 1; }
     ret 0;
 }

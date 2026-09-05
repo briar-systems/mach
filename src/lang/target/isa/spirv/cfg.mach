@@ -1,25 +1,3 @@
-# SPIR-V structured control-flow reconstruction over a lowered MIR function
-#
-# SPIR-V is not an arbitrary-CFG target. Every block with two successors must
-# declare where control reconverges (`OpSelectionMerge` / `OpLoopMerge`), a loop
-# has exactly one back edge, and a branch may leave a construct only through that
-# construct's merge block or an enclosing loop's merge / continue target. Mach's
-# MIR is a plain CFG, so the shape has to be reconstructed.
-#
-# The reconstruction runs in one pass over a function: derive the successor graph
-# from the block terminators, compute reverse postorder and the dominator tree,
-# discover the natural loops, then give every loop a continue target and a merge
-# block and every remaining two-successor block a merge block. Two kinds of
-# synthetic node are inserted, and only where SPIR-V's shape demands one: a
-# continue block per loop (so the loop has exactly one back edge even when the
-# source `cnt`s from several places) and an unreachable merge block for a
-# construct control never reconverges out of.
-#
-# The result is checked rather than assumed: `verify` walks every edge against the
-# nesting just built and records the first shape it cannot express. A function
-# whose CFG does not reconstruct is refused by name, so the emitter never emits a
-# module whose structure was not proven.
-
 use std.allocator.page;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -33,74 +11,27 @@ use R: std.types.result;
 
 use mach.lang.be.codegen.mir;
 
-# absent node index: no successor, no dominator, no enclosing loop
 pub val NO_BLOCK: u32 = 0xFFFFFFFF;
 
-# a block that heads no construct: it falls inside its enclosing one
 pub val CK_PLAIN: u8 = 0;
-# a two-successor block that is not a loop header: it declares OpSelectionMerge
 pub val CK_SELECTION: u8 = 1;
-# the target of a back edge: it declares OpLoopMerge
 pub val CK_LOOP: u8 = 2;
 
-# a node standing for a real MIR block
 pub val ROLE_REAL: u8 = 0;
-# a synthesized loop continue target: branches to its loop header and nothing else
 pub val ROLE_CONTINUE: u8 = 1;
-# a synthesized merge block for a construct control never reconverges out of:
-# terminates in OpUnreachable and has no predecessor
 pub val ROLE_UNREACHABLE: u8 = 2;
-# a synthesized block interposed ahead of a merge target another construct already
-# claims: SPIR-V allows one header per merge block, so the inner construct
-# reconverges on this block, which branches straight on to the shared one
 pub val ROLE_FORWARD: u8 = 4;
-# a synthesized block carrying a loop header's own conditional branch. `OpLoopMerge`
-# occupies the header's merge slot, so a header whose test picks between two blocks
-# inside the loop has nowhere left to declare that selection; the branch moves here,
-# where it is an ordinary selection, and the header falls through to it
 pub val ROLE_SPLIT: u8 = 3;
 
-# the reconstruction succeeded: every construct has a merge and every edge is legal
 pub val CFG_OK: u8 = 0;
-# a back edge whose target does not dominate its source - an irreducible CFG,
-# which no merge / continue assignment can express
 pub val CFG_IRREDUCIBLE: u8 = 1;
-# a block unreachable from the entry: it cannot be placed in any construct
 pub val CFG_UNREACHABLE: u8 = 2;
-# a terminator with more than two successors (a jump table): SPIR-V would need
-# OpSwitch, which this reconstruction does not build
 pub val CFG_MULTIWAY: u8 = 3;
-# a loop whose exits do not funnel through one block the header dominates
 pub val CFG_LOOP_MERGE: u8 = 4;
-# two constructs claiming the same merge block, which SPIR-V forbids
 pub val CFG_MERGE_CLAIMED: u8 = 5;
-# an edge leaving its construct through something that is not that construct's
-# merge block nor an enclosing loop's merge / continue target
 pub val CFG_CROSSING_EDGE: u8 = 6;
-# a block with no terminator
 pub val CFG_NO_TERMINATOR: u8 = 7;
 
-# one node of the reconstructed graph: a real MIR block or a synthesized one
-#
-# Successors are the reconstruction's, not the terminator's: a loop's back edges
-# are rewritten to point at its synthesized continue target, so the emitter reads
-# its branch targets from here and the MIR terminator only for its condition.
-# ---
-# id:       the MIR block id, or NO_BLOCK for a synthesized node
-# block:    index into `MirFunction.blocks`, or NO_BLOCK for a synthesized node
-# succ0:    first successor node index (the taken edge of a conditional)
-# succ1:    second successor node index
-# nsucc:    number of successors (0 for a return / unreachable terminator)
-# idom:     immediate dominator node index, NO_BLOCK for the entry
-# rpo:      position in reverse postorder, NO_BLOCK when unreachable
-# kind:     one of CK_*
-# merge:    the construct's merge block, NO_BLOCK when `kind` is CK_PLAIN
-# cont:     the loop's continue target, NO_BLOCK unless `kind` is CK_LOOP
-# loop_hdr: innermost loop containing this node (itself for a loop header),
-#           NO_BLOCK when it is in no loop
-# split:    the ROLE_SPLIT node carrying this loop header's own branch, NO_BLOCK
-#           when the header keeps it
-# role:     one of ROLE_*
 pub rec Node {
     id:       u32;
     block:    u32;
@@ -117,22 +48,6 @@ pub rec Node {
     role:     u8;
 }
 
-# the reconstructed control-flow structure of one MIR function
-#
-# `nodes` holds the real blocks first, in MIR block order, then the synthesized
-# ones, so a node index below `real` indexes `MirFunction.blocks` through
-# `Node.block`. `order` is the emission order: reverse postorder over the real
-# blocks, then the synthesized nodes.
-# ---
-# alloc:  allocator backing every owned array
-# nodes:  the node table (owned)
-# count:  number of nodes, real plus synthesized
-# real:   number of real blocks (the prefix of `nodes` that maps to MIR blocks)
-# cap:    allocated node capacity
-# order:  emission order over node indices (owned, `count` entries)
-# status: one of CFG_*; CFG_OK when the structure is usable
-# at:     the MIR block id the status refers to, NO_BLOCK when it names none
-# to:     the node index the refused edge targets, NO_BLOCK when none
 pub rec Structure {
     alloc:  *A.Allocator;
     nodes:  *Node;
@@ -145,15 +60,6 @@ pub rec Structure {
     to:     u32;
 }
 
-# reconstruct the structured control flow of one MIR function
-#
-# Always returns a Structure unless an allocation fails; a CFG the reconstruction
-# cannot express reports itself through `status` / `at` rather than an error, so a
-# caller can name both the function and the offending block.
-# ---
-# mf:    the MIR function to reconstruct
-# alloc: allocator backing the structure's arrays
-# ret:   the reconstructed structure, or an allocation error
 pub fun analyze(mf: *mir.MirFunction, alloc: *A.Allocator) R.Result[Structure, str] {
     var st: Structure;
     st.alloc  = alloc;
@@ -166,8 +72,6 @@ pub fun analyze(mf: *mir.MirFunction, alloc: *A.Allocator) R.Result[Structure, s
     st.at     = NO_BLOCK;
     st.to     = NO_BLOCK;
 
-    # capacity: every real block, plus at most one continue, one merge and one
-    # split block per real block (a construct heads at most one of each).
     val cap: u32 = mf.block_count * 4 + 2;
     val rn: R.Result[*Node, str] = A.allocate[Node](alloc, cap::usize);
     if (R.is_err[*Node, str](rn)) { ret R.err[Structure, str](R.unwrap_err[*Node, str](rn)); }
@@ -177,34 +81,31 @@ pub fun analyze(mf: *mir.MirFunction, alloc: *A.Allocator) R.Result[Structure, s
     if (R.is_err[*u32, str](ro)) { dnit(?st); ret R.err[Structure, str](R.unwrap_err[*u32, str](ro)); }
     st.order = R.unwrap_ok[*u32, str](ro);
 
-    val rb: R.Result[bool, str] = build_nodes(?st, mf);
-    if (R.is_err[bool, str](rb)) { dnit(?st); ret R.err[Structure, str](R.unwrap_err[bool, str](rb)); }
+    val rb: R.Result[R.Void, str] = build_nodes(?st, mf);
+    if (R.is_err[R.Void, str](rb)) { dnit(?st); ret R.err[Structure, str](R.unwrap_err[R.Void, str](rb)); }
     if (st.status != CFG_OK) { ret R.ok[Structure, str](st); }
 
-    val rr: R.Result[bool, str] = compute_rpo(?st);
-    if (R.is_err[bool, str](rr)) { dnit(?st); ret R.err[Structure, str](R.unwrap_err[bool, str](rr)); }
+    val rr: R.Result[R.Void, str] = compute_rpo(?st);
+    if (R.is_err[R.Void, str](rr)) { dnit(?st); ret R.err[Structure, str](R.unwrap_err[R.Void, str](rr)); }
     if (st.status != CFG_OK) { ret R.ok[Structure, str](st); }
 
-    val rd: R.Result[bool, str] = compute_idom(?st);
-    if (R.is_err[bool, str](rd)) { dnit(?st); ret R.err[Structure, str](R.unwrap_err[bool, str](rd)); }
+    val rd: R.Result[R.Void, str] = compute_idom(?st);
+    if (R.is_err[R.Void, str](rd)) { dnit(?st); ret R.err[Structure, str](R.unwrap_err[R.Void, str](rd)); }
 
-    val rl: R.Result[bool, str] = find_loops(?st);
-    if (R.is_err[bool, str](rl)) { dnit(?st); ret R.err[Structure, str](R.unwrap_err[bool, str](rl)); }
+    val rl: R.Result[R.Void, str] = find_loops(?st);
+    if (R.is_err[R.Void, str](rl)) { dnit(?st); ret R.err[Structure, str](R.unwrap_err[R.Void, str](rl)); }
     if (st.status != CFG_OK) { ret R.ok[Structure, str](st); }
 
-    val rm: R.Result[bool, str] = assign_merges(?st);
-    if (R.is_err[bool, str](rm)) { dnit(?st); ret R.err[Structure, str](R.unwrap_err[bool, str](rm)); }
+    val rm: R.Result[R.Void, str] = assign_merges(?st);
+    if (R.is_err[R.Void, str](rm)) { dnit(?st); ret R.err[Structure, str](R.unwrap_err[R.Void, str](rm)); }
     if (st.status != CFG_OK) { ret R.ok[Structure, str](st); }
 
-    val bo: R.Result[bool, str] = build_order(?st);
-    if (R.is_err[bool, str](bo)) { dnit(?st); ret R.err[Structure, str](R.unwrap_err[bool, str](bo)); }
+    val bo: R.Result[R.Void, str] = build_order(?st);
+    if (R.is_err[R.Void, str](bo)) { dnit(?st); ret R.err[Structure, str](R.unwrap_err[R.Void, str](bo)); }
     verify(?st);
     ret R.ok[Structure, str](st);
 }
 
-# release every array the structure owns
-# ---
-# st: the structure to tear down
 pub fun dnit(st: *Structure) {
     if (st.nodes != nil) { A.deallocate[Node](st.alloc, st.nodes, st.cap::usize); st.nodes = nil; }
     if (st.order != nil) { A.deallocate[u32](st.alloc, st.order, st.cap::usize); st.order = nil; }
@@ -212,10 +113,6 @@ pub fun dnit(st: *Structure) {
     st.cap   = 0;
 }
 
-# the diagnostic text for a reconstruction status, naming the construct refused
-# ---
-# status: one of CFG_*
-# ret:    the message, or nil for CFG_OK
 pub fun status_message(status: u8) str {
     if (status == CFG_IRREDUCIBLE)   { ret "an irreducible loop (a loop entered at more than one block) is not expressible in the SPIR-V target"; }
     if (status == CFG_UNREACHABLE)   { ret "a block unreachable from the function entry is not expressible in the SPIR-V target"; }
@@ -227,12 +124,7 @@ pub fun status_message(status: u8) str {
     ret nil;
 }
 
-# seed one node per MIR block and read its successors off the terminator
-# ---
-# st: the structure being built
-# mf: the MIR function
-# ret: true on success, or an allocation error
-fun build_nodes(st: *Structure, mf: *mir.MirFunction) R.Result[bool, str] {
+fun build_nodes(st: *Structure, mf: *mir.MirFunction) R.Result[R.Void, str] {
     var i: u32 = 0;
     for (i < mf.block_count) {
         val blk: *mir.MirBlock = ?mf.blocks[i];
@@ -261,14 +153,14 @@ fun build_nodes(st: *Structure, mf: *mir.MirFunction) R.Result[bool, str] {
         if (blk.instr_count == 0) {
             st.status = CFG_NO_TERMINATOR;
             st.at     = blk.id;
-            ret R.ok[bool, str](true);
+            ret R.ok_void[str]();
         }
         val term: *mir.MirInstr = ?blk.instrs[blk.instr_count - 1];
         if (term.opcode == mir.MIR_BR) {
             if (term.operand_count < 1 || term.operands[0].kind != mir.MIR_OP_BLOCK) {
                 st.status = CFG_NO_TERMINATOR;
                 st.at     = blk.id;
-                ret R.ok[bool, str](true);
+                ret R.ok_void[str]();
             }
             st.nodes[i].succ0 = node_of_id(st, term.operands[0].imm::u32);
             st.nodes[i].nsucc = 1;
@@ -278,7 +170,7 @@ fun build_nodes(st: *Structure, mf: *mir.MirFunction) R.Result[bool, str] {
                 || term.operands[2].kind != mir.MIR_OP_BLOCK) {
                 st.status = CFG_NO_TERMINATOR;
                 st.at     = blk.id;
-                ret R.ok[bool, str](true);
+                ret R.ok_void[str]();
             }
             st.nodes[i].succ0 = node_of_id(st, term.operands[1].imm::u32);
             st.nodes[i].succ1 = node_of_id(st, term.operands[2].imm::u32);
@@ -288,32 +180,26 @@ fun build_nodes(st: *Structure, mf: *mir.MirFunction) R.Result[bool, str] {
             st.nodes[i].nsucc = 0;
         }
         or {
-            # a terminator this reconstruction does not model: a jump table would
-            # need OpSwitch, anything else is a block that simply does not end.
             if (instr_has_block_operand(term)) { st.status = CFG_MULTIWAY; }
             or { st.status = CFG_NO_TERMINATOR; }
             st.at = blk.id;
-            ret R.ok[bool, str](true);
+            ret R.ok_void[str]();
         }
         if (st.nodes[i].succ0 == NO_BLOCK && st.nodes[i].nsucc > 0) {
             st.status = CFG_NO_TERMINATOR;
             st.at     = blk.id;
-            ret R.ok[bool, str](true);
+            ret R.ok_void[str]();
         }
         if (st.nodes[i].nsucc == 2 && st.nodes[i].succ1 == NO_BLOCK) {
             st.status = CFG_NO_TERMINATOR;
             st.at     = blk.id;
-            ret R.ok[bool, str](true);
+            ret R.ok_void[str]();
         }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# whether an instruction carries a branch-target operand
-# ---
-# mi:  the instruction
-# ret: true when any operand is a block reference
 fun instr_has_block_operand(mi: *mir.MirInstr) bool {
     var i: u32 = 0;
     for (i < mi.operand_count) {
@@ -323,11 +209,6 @@ fun instr_has_block_operand(mi: *mir.MirInstr) bool {
     ret false;
 }
 
-# the node index of a MIR block id, or NO_BLOCK when no block carries it
-# ---
-# st: the structure
-# id: the MIR block id
-# ret: the node index, or NO_BLOCK
 fun node_of_id(st: *Structure, id: u32) u32 {
     var i: u32 = 0;
     for (i < st.real) {
@@ -337,32 +218,24 @@ fun node_of_id(st: *Structure, id: u32) u32 {
     ret NO_BLOCK;
 }
 
-# number the reachable nodes in reverse postorder, writing `Node.rpo`
-#
-# A depth-first walk from the entry with an explicit stack; the postorder is
-# reversed in place. A real block the walk never reaches cannot be placed in any
-# construct, so it is refused rather than emitted unattached.
-# ---
-# st:  the structure
-# ret: true on success, or an allocation error
-fun compute_rpo(st: *Structure) R.Result[bool, str] {
+fun compute_rpo(st: *Structure) R.Result[R.Void, str] {
     val n: u32 = st.real;
-    if (n == 0) { ret R.ok[bool, str](true); }
+    if (n == 0) { ret R.ok_void[str](); }
 
     val rs: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
-    if (R.is_err[*u32, str](rs)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rs)); }
+    if (R.is_err[*u32, str](rs)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](rs)); }
     val stack: *u32 = R.unwrap_ok[*u32, str](rs);
     val ri: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
     if (R.is_err[*u32, str](ri)) {
         A.deallocate[u32](st.alloc, stack, n::usize);
-        ret R.err[bool, str](R.unwrap_err[*u32, str](ri));
+        ret R.err[R.Void, str](R.unwrap_err[*u32, str](ri));
     }
     val next: *u32 = R.unwrap_ok[*u32, str](ri);
     val rp: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
     if (R.is_err[*u32, str](rp)) {
         A.deallocate[u32](st.alloc, stack, n::usize);
         A.deallocate[u32](st.alloc, next, n::usize);
-        ret R.err[bool, str](R.unwrap_err[*u32, str](rp));
+        ret R.err[R.Void, str](R.unwrap_err[*u32, str](rp));
     }
     val post: *u32 = R.unwrap_ok[*u32, str](rp);
 
@@ -373,7 +246,7 @@ fun compute_rpo(st: *Structure) R.Result[bool, str] {
     var count: u32 = 0;
     stack[0] = 0;
     sp = 1;
-    st.nodes[0].rpo = 0;  # marks visited; overwritten with the real index below
+    st.nodes[0].rpo = 0;
     for (sp > 0) {
         val cur: u32 = stack[sp - 1];
         val k:   u32 = next[cur];
@@ -411,24 +284,15 @@ fun compute_rpo(st: *Structure) R.Result[bool, str] {
             i = i + 1;
         }
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# build the dominator tree over the reachable nodes (Cooper-Harvey-Kennedy)
-#
-# Iterates the meet of predecessor immediate dominators in reverse-postorder
-# until a fixed point. Predecessors are derived from the successor edges each
-# round rather than materialized, so the pass owns no auxiliary graph.
-# ---
-# st:  the structure
-# ret: true on success, or an allocation error
-fun compute_idom(st: *Structure) R.Result[bool, str] {
+fun compute_idom(st: *Structure) R.Result[R.Void, str] {
     val n: u32 = st.real;
-    if (n == 0) { ret R.ok[bool, str](true); }
+    if (n == 0) { ret R.ok_void[str](); }
 
-    # rpo_node[k] is the node at reverse-postorder position k.
     val rr: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
-    if (R.is_err[*u32, str](rr)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rr)); }
+    if (R.is_err[*u32, str](rr)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](rr)); }
     val rpo_node: *u32 = R.unwrap_ok[*u32, str](rr);
     var i: u32 = 0;
     for (i < n) {
@@ -462,15 +326,9 @@ fun compute_idom(st: *Structure) R.Result[bool, str] {
     st.nodes[0].idom = NO_BLOCK;
 
     A.deallocate[u32](st.alloc, rpo_node, n::usize);
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# whether node `p` has node `b` as a successor
-# ---
-# st: the structure
-# p:  the candidate predecessor
-# b:  the successor
-# ret: true when an edge p -> b exists
 fun is_pred(st: *Structure, p: u32, b: u32) bool {
     if (st.nodes[p].rpo == NO_BLOCK) { ret false; }
     if (st.nodes[p].nsucc >= 1 && st.nodes[p].succ0 == b) { ret true; }
@@ -478,13 +336,6 @@ fun is_pred(st: *Structure, p: u32, b: u32) bool {
     ret false;
 }
 
-# the nearest common dominator of two nodes, walking the two idom chains together
-# in reverse-postorder order
-# ---
-# st: the structure
-# a:  one node
-# b:  the other node
-# ret: their nearest common dominator
 fun intersect(st: *Structure, a: u32, b: u32) u32 {
     var x: u32 = a;
     var y: u32 = b;
@@ -495,12 +346,6 @@ fun intersect(st: *Structure, a: u32, b: u32) u32 {
     ret x;
 }
 
-# whether `a` dominates `b` (reflexively), by walking b's dominator chain
-# ---
-# st: the structure
-# a:  the candidate dominator
-# b:  the candidate dominated node
-# ret: true when a dominates b
 pub fun dominates(st: *Structure, a: u32, b: u32) bool {
     if (a == NO_BLOCK || b == NO_BLOCK) { ret false; }
     var x: u32 = b;
@@ -511,20 +356,9 @@ pub fun dominates(st: *Structure, a: u32, b: u32) bool {
     ret false;
 }
 
-# discover the natural loops and mark every node's innermost enclosing loop
-#
-# A back edge is an edge whose target dominates its source; its target is a loop
-# header. An edge that runs backwards in reverse postorder without its target
-# dominating its source is an irreducible entry, which no merge assignment can
-# express, so it is refused. Headers are processed innermost-first (decreasing
-# reverse-postorder position) and each node is claimed by the first loop that
-# reaches it, so `loop_hdr` names the innermost one.
-# ---
-# st:  the structure
-# ret: true on success, or an allocation error
-fun find_loops(st: *Structure) R.Result[bool, str] {
+fun find_loops(st: *Structure) R.Result[R.Void, str] {
     val n: u32 = st.real;
-    if (n == 0) { ret R.ok[bool, str](true); }
+    if (n == 0) { ret R.ok_void[str](); }
 
     var i: u32 = 0;
     for (i < n) {
@@ -537,7 +371,7 @@ fun find_loops(st: *Structure) R.Result[bool, str] {
                     if (!dominates(st, s, i)) {
                         st.status = CFG_IRREDUCIBLE;
                         st.at     = st.nodes[s].id;
-                        ret R.ok[bool, str](true);
+                        ret R.ok_void[str]();
                     }
                     st.nodes[s].kind = CK_LOOP;
                 }
@@ -547,10 +381,8 @@ fun find_loops(st: *Structure) R.Result[bool, str] {
         i = i + 1;
     }
 
-    # claim each loop's body, innermost first: walk the headers in decreasing
-    # reverse-postorder position so a nested header runs before its parent.
     val rs: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
-    if (R.is_err[*u32, str](rs)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rs)); }
+    if (R.is_err[*u32, str](rs)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](rs)); }
     val stack: *u32 = R.unwrap_ok[*u32, str](rs);
 
     var pos: u32 = n;
@@ -566,7 +398,6 @@ fun find_loops(st: *Structure) R.Result[bool, str] {
 
         if (st.nodes[h].loop_hdr == NO_BLOCK) { st.nodes[h].loop_hdr = h; }
         var sp: u32 = 0;
-        # seed with every back-edge source and walk predecessors up to the header.
         i = 0;
         for (i < n) {
             if (is_pred(st, i, h) && dominates(st, h, i) && st.nodes[i].loop_hdr == NO_BLOCK) {
@@ -592,29 +423,15 @@ fun find_loops(st: *Structure) R.Result[bool, str] {
     }
 
     A.deallocate[u32](st.alloc, stack, n::usize);
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# the loop enclosing a loop header, or NO_BLOCK when it is outermost
-#
-# A header's immediate dominator lies in the enclosing loop (or outside every
-# loop), so the enclosing loop is exactly the loop that claimed it.
-# ---
-# st: the structure
-# h:  a loop header node
-# ret: the enclosing loop header, or NO_BLOCK
 fun outer_loop(st: *Structure, h: u32) u32 {
     val d: u32 = st.nodes[h].idom;
     if (d == NO_BLOCK) { ret NO_BLOCK; }
     ret st.nodes[d].loop_hdr;
 }
 
-# whether node `b` lies in the loop headed by `h`
-# ---
-# st: the structure
-# h:  the loop header
-# b:  the node to test
-# ret: true when b is in h's loop (h itself included)
 fun in_loop(st: *Structure, h: u32, b: u32) bool {
     var l: u32 = st.nodes[b].loop_hdr;
     for (l != NO_BLOCK) {
@@ -624,18 +441,6 @@ fun in_loop(st: *Structure, h: u32, b: u32) bool {
     ret false;
 }
 
-# scratch buffers the merge search reuses, sized to the node table
-#
-# The two reachability marks and the worklist are allocated once per function
-# rather than per construct: the search runs a walk per branch arm and per loop
-# exit, and every one of them is bounded by the same node count.
-# ---
-# a:     reachability marks for one arm / exit target
-# b:     reachability marks for the other arm
-# seen:  distinct-exit-target marks
-# score: per-node count of loop exits that reach it
-# stack: worklist for the walks
-# n:     the buffers' length
 rec Scratch {
     a:     *bool;
     b:     *bool;
@@ -645,35 +450,24 @@ rec Scratch {
     n:     u32;
 }
 
-# give every loop a continue target and a merge block, and every remaining
-# two-successor block a merge block
-#
-# Loops are handled first, innermost first, so an inner construct never claims a
-# block an outer one needs; then selections, outermost first, for the same reason.
-# A loop's back edges are rewritten to a fresh continue block, which is what gives
-# SPIR-V the single back edge it requires however many places the source `cnt`s
-# from.
-# ---
-# st:  the structure
-# ret: true on success, or an allocation error
-fun assign_merges(st: *Structure) R.Result[bool, str] {
+fun assign_merges(st: *Structure) R.Result[R.Void, str] {
     val n: u32 = st.cap;
     var sc: Scratch;
     sc.n = n;
     val ra: R.Result[*bool, str] = A.allocate[bool](st.alloc, n::usize);
-    if (R.is_err[*bool, str](ra)) { ret R.err[bool, str](R.unwrap_err[*bool, str](ra)); }
+    if (R.is_err[*bool, str](ra)) { ret R.err[R.Void, str](R.unwrap_err[*bool, str](ra)); }
     sc.a = R.unwrap_ok[*bool, str](ra);
     val rb: R.Result[*bool, str] = A.allocate[bool](st.alloc, n::usize);
     if (R.is_err[*bool, str](rb)) {
         A.deallocate[bool](st.alloc, sc.a, n::usize);
-        ret R.err[bool, str](R.unwrap_err[*bool, str](rb));
+        ret R.err[R.Void, str](R.unwrap_err[*bool, str](rb));
     }
     sc.b = R.unwrap_ok[*bool, str](rb);
     val rk: R.Result[*bool, str] = A.allocate[bool](st.alloc, n::usize);
     if (R.is_err[*bool, str](rk)) {
         A.deallocate[bool](st.alloc, sc.a, n::usize);
         A.deallocate[bool](st.alloc, sc.b, n::usize);
-        ret R.err[bool, str](R.unwrap_err[*bool, str](rk));
+        ret R.err[R.Void, str](R.unwrap_err[*bool, str](rk));
     }
     sc.seen = R.unwrap_ok[*bool, str](rk);
     val rc: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
@@ -681,7 +475,7 @@ fun assign_merges(st: *Structure) R.Result[bool, str] {
         A.deallocate[bool](st.alloc, sc.a, n::usize);
         A.deallocate[bool](st.alloc, sc.b, n::usize);
         A.deallocate[bool](st.alloc, sc.seen, n::usize);
-        ret R.err[bool, str](R.unwrap_err[*u32, str](rc));
+        ret R.err[R.Void, str](R.unwrap_err[*u32, str](rc));
     }
     sc.score = R.unwrap_ok[*u32, str](rc);
     val rs: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
@@ -690,11 +484,11 @@ fun assign_merges(st: *Structure) R.Result[bool, str] {
         A.deallocate[bool](st.alloc, sc.b, n::usize);
         A.deallocate[bool](st.alloc, sc.seen, n::usize);
         A.deallocate[u32](st.alloc, sc.score, n::usize);
-        ret R.err[bool, str](R.unwrap_err[*u32, str](rs));
+        ret R.err[R.Void, str](R.unwrap_err[*u32, str](rs));
     }
     sc.stack = R.unwrap_ok[*u32, str](rs);
 
-    val r: R.Result[bool, str] = assign_with(st, ?sc);
+    val r: R.Result[R.Void, str] = assign_with(st, ?sc);
     A.deallocate[bool](st.alloc, sc.a, n::usize);
     A.deallocate[bool](st.alloc, sc.b, n::usize);
     A.deallocate[bool](st.alloc, sc.seen, n::usize);
@@ -703,14 +497,7 @@ fun assign_merges(st: *Structure) R.Result[bool, str] {
     ret r;
 }
 
-# the merge assignment proper, over pre-allocated scratch
-# ---
-# st:  the structure
-# sc:  the scratch buffers
-# ret: true on success, or an allocation error
-fun assign_with(st: *Structure, sc: *Scratch) R.Result[bool, str] {
-    # loop headers, innermost first: a nested construct is deeper in the dominator
-    # tree than the one enclosing it, so descending depth is descending nesting.
+fun assign_with(st: *Structure, sc: *Scratch) R.Result[R.Void, str] {
     var d: u32 = max_depth(st) + 1;
     for (d > 0) {
         d = d - 1;
@@ -719,10 +506,8 @@ fun assign_with(st: *Structure, sc: *Scratch) R.Result[bool, str] {
             if (st.nodes[h].kind != CK_LOOP || depth(st, h) != d) { h = h + 1; cnt; }
 
             val c: u32 = push_node(st, ROLE_CONTINUE, h);
-            if (c == NO_BLOCK) { ret R.err[bool, str]("spirv.cfg: continue-block capacity exhausted"); }
+            if (c == NO_BLOCK) { ret R.err[R.Void, str]("spirv.cfg: continue-block capacity exhausted"); }
             st.nodes[h].cont = c;
-            # rewrite every back edge into the loop's own continue block, and place
-            # the continue block under the dominator covering all of them.
             var cdom: u32 = NO_BLOCK;
             var i: u32 = 0;
             for (i < st.count) {
@@ -740,19 +525,17 @@ fun assign_with(st: *Structure, sc: *Scratch) R.Result[bool, str] {
             if (cdom != NO_BLOCK) { st.nodes[c].idom = cdom; }
 
             val mb: u32 = loop_merge(st, sc, h);
-            if (st.status != CFG_OK) { ret R.ok[bool, str](true); }
-            if (mb == NO_BLOCK) { ret R.err[bool, str]("spirv.cfg: merge-block capacity exhausted"); }
+            if (st.status != CFG_OK) { ret R.ok_void[str](); }
+            if (mb == NO_BLOCK) { ret R.err[R.Void, str]("spirv.cfg: merge-block capacity exhausted"); }
             st.nodes[h].merge = mb;
 
-            if (!split_header(st, h)) { ret R.err[bool, str]("spirv.cfg: split-block capacity exhausted"); }
+            if (!split_header(st, h)) { ret R.err[R.Void, str]("spirv.cfg: split-block capacity exhausted"); }
             h = h + 1;
         }
     }
 
-    if (!claim_merges(st)) { ret R.ok[bool, str](true); }
+    if (!claim_merges(st)) { ret R.ok_void[str](); }
 
-    # selections, outermost first: a nested one must not take a block its parent
-    # or an enclosing loop already claimed.
     val top: u32 = max_depth(st);
     d = 0;
     for (d <= top) {
@@ -761,22 +544,17 @@ fun assign_with(st: *Structure, sc: *Scratch) R.Result[bool, str] {
             if (st.nodes[s].nsucc != 2 || st.nodes[s].kind == CK_LOOP || depth(st, s) != d) { s = s + 1; cnt; }
             st.nodes[s].kind = CK_SELECTION;
             val mb: u32 = sel_merge(st, sc, s);
-            if (mb == NO_BLOCK) { ret R.err[bool, str]("spirv.cfg: merge-block capacity exhausted"); }
+            if (mb == NO_BLOCK) { ret R.err[R.Void, str]("spirv.cfg: merge-block capacity exhausted"); }
             st.nodes[s].merge = mb;
             s = s + 1;
         }
         d = d + 1;
     }
 
-    if (!claim_merges(st)) { ret R.ok[bool, str](true); }
-    ret R.ok[bool, str](true);
+    if (!claim_merges(st)) { ret R.ok_void[str](); }
+    ret R.ok_void[str]();
 }
 
-# the node's depth in the dominator tree, the nesting order constructs follow
-# ---
-# st: the structure
-# x:  the node
-# ret: the number of dominators above it
 fun depth(st: *Structure, x: u32) u32 {
     var d: u32 = 0;
     var c: u32 = st.nodes[x].idom;
@@ -787,10 +565,6 @@ fun depth(st: *Structure, x: u32) u32 {
     ret d;
 }
 
-# the deepest node in the dominator tree
-# ---
-# st: the structure
-# ret: the maximum dominator-tree depth
 fun max_depth(st: *Structure) u32 {
     var m: u32 = 0;
     var i: u32 = 0;
@@ -802,17 +576,6 @@ fun max_depth(st: *Structure) u32 {
     ret m;
 }
 
-# move a loop header's own conditional branch into a synthesized block
-#
-# A header carries `OpLoopMerge`, so the only selection it can declare is the
-# loop's own exit test: a conditional whose targets are both inside the loop has
-# nowhere to say where they reconverge, and SPIR-V rejects it. The branch moves to
-# a block the header falls into, where it is an ordinary selection. A header whose
-# branch already picks the merge or the continue target is left alone.
-# ---
-# st:  the structure
-# h:   the loop header
-# ret: false when the node table is full
 fun split_header(st: *Structure, h: u32) bool {
     if (st.nodes[h].nsucc != 2) { ret true; }
     val m: u32 = st.nodes[h].merge;
@@ -827,9 +590,7 @@ fun split_header(st: *Structure, h: u32) bool {
     st.nodes[sp].nsucc    = 2;
     st.nodes[sp].idom     = h;
     st.nodes[sp].loop_hdr = h;
-    # the moved branch still reads its condition from the header's own terminator.
     st.nodes[sp].block    = st.nodes[h].block;
-    # everything the header immediately dominated is now entered through the split.
     var i: u32 = 0;
     for (i < st.count) {
         if (i != sp && st.nodes[i].idom == h) { st.nodes[i].idom = sp; }
@@ -842,18 +603,6 @@ fun split_header(st: *Structure, h: u32) bool {
     ret true;
 }
 
-# interpose a forwarding block ahead of a merge target another construct claims
-#
-# SPIR-V allows exactly one header per merge block, so two constructs that
-# reconverge on the same block cannot both name it. The inner one reconverges on a
-# fresh block instead, which branches straight on to the shared target: every edge
-# out of the inner construct is rerouted through it, so control still arrives where
-# it did and the shared block keeps its single claimant.
-# ---
-# st:  the structure
-# h:   the header whose construct reconverges on `m`
-# m:   the already-claimed merge target
-# ret: the forwarding node index, or NO_BLOCK when the node table is full
 fun forward_merge(st: *Structure, h: u32, m: u32) u32 {
     val f: u32 = push_node(st, ROLE_FORWARD, m);
     if (f == NO_BLOCK) { ret NO_BLOCK; }
@@ -861,8 +610,6 @@ fun forward_merge(st: *Structure, h: u32, m: u32) u32 {
     st.nodes[f].succ0    = m;
     st.nodes[f].idom     = h;
     st.nodes[f].loop_hdr = st.nodes[h].loop_hdr;
-    # a loop's merge block sits outside that loop, so the block standing in for it
-    # belongs to the enclosing loop rather than to the one it terminates.
     if (st.nodes[h].kind == CK_LOOP) { st.nodes[f].loop_hdr = outer_loop(st, h); }
 
     var i: u32 = 0;
@@ -876,24 +623,6 @@ fun forward_merge(st: *Structure, h: u32, m: u32) u32 {
     ret f;
 }
 
-# the merge block of the loop headed by `h`
-#
-# Control leaves a loop through the edges out of its body, and the merge is where
-# those edges reconverge: the block the most of them reach. A tail that only
-# returns reaches nothing and stays inside the construct, which is legal. The
-# candidate must also be a place control does not come BACK from - a block whose
-# subtree branches into the loop construct would be an entry into it, which SPIR-V
-# forbids - so those are rejected outright. A loop with no exit at all gets a
-# synthesized unreachable merge, the shape SPIR-V wants for a loop control never
-# leaves normally. A single-exit loop always has a merge, whether or not the header
-# dominates the block it leaves for: where it does not, the block is one a sibling
-# construct reaches too, and the loop reconverges on an interposed block instead.
-# ---
-# st:  the structure
-# sc:  the scratch buffers
-# h:   the loop header
-# ret: the merge node index, or NO_BLOCK on capacity exhaustion; sets `status`
-#      when the exits cannot be expressed
 fun loop_merge(st: *Structure, sc: *Scratch, h: u32) u32 {
     var i: u32 = 0;
     for (i < sc.n) { sc.seen[i] = false; sc.score[i] = 0; i = i + 1; }
@@ -943,11 +672,6 @@ fun loop_merge(st: *Structure, sc: *Scratch, h: u32) u32 {
         ret merge;
     }
 
-    # every exit edge leaves for the same block and control does not come back, so
-    # the exits do reconverge - the block is just shared with a sibling construct
-    # that also arrives there, which leaves it outside the header's dominance. A
-    # block interposed on those edges is dominated by the header by construction, so
-    # the loop reconverges on that and the shared block keeps its own claimant.
     if (exits == 1 && !merge_reenters(st, h, one_exit)) { ret forward_merge(st, h, one_exit); }
 
     st.status = CFG_LOOP_MERGE;
@@ -955,16 +679,6 @@ fun loop_merge(st: *Structure, sc: *Scratch, h: u32) u32 {
     ret NO_BLOCK;
 }
 
-# whether control re-enters the construct after passing through `m`
-#
-# The loop construct is what the header dominates less what the merge dominates, so
-# a block below the merge branching back into that difference is an entry into the
-# construct from outside - the one thing SPIR-V's structure forbids outright.
-# ---
-# st: the structure
-# h:  the loop header
-# m:  the candidate merge block
-# ret: true when some block m dominates branches back into h's construct
 fun merge_reenters(st: *Structure, h: u32, m: u32) bool {
     var x: u32 = 0;
     for (x < st.count) {
@@ -982,28 +696,10 @@ fun merge_reenters(st: *Structure, h: u32, m: u32) bool {
     ret false;
 }
 
-# the merge block of the selection headed by `s`
-#
-# The arms reconverge, or they do not. When they do, the merge is the earliest
-# block both reach that the header dominates. When only one arm carries control
-# on past the header's dominance region - the other returns, breaks, or continues
-# - that arm's entry is the merge, which is the shape an `if` with an early exit
-# takes. When neither does, control never reconverges and the construct gets a
-# synthesized unreachable merge.
-# ---
-# st:  the structure
-# sc:  the scratch buffers
-# s:   the selection header
-# ret: the merge node index, or NO_BLOCK on capacity exhaustion
 fun sel_merge(st: *Structure, sc: *Scratch, s: u32) u32 {
     reach_from(st, sc, st.nodes[s].succ0, s, sc.a);
     reach_from(st, sc, st.nodes[s].succ1, s, sc.b);
 
-    # the NEAREST reconvergence point, claimed or not: skipping a claimed one for a
-    # farther free block would stretch the construct past where control actually
-    # rejoins - and past the enclosing loop's merge, which nests the constructs
-    # wrongly. A claimed block is reached through a forwarding block instead, since
-    # SPIR-V allows one header per merge block.
     var merge: u32 = NO_BLOCK;
     var i: u32 = 0;
     for (i < st.count) {
@@ -1023,17 +719,6 @@ fun sel_merge(st: *Structure, sc: *Scratch, s: u32) u32 {
     ret merge;
 }
 
-# whether a merge candidate still lies inside every loop enclosing the header
-#
-# Constructs nest, so a selection inside a loop cannot reconverge on that loop's
-# merge block or anything past it: control has already left the loop there. An arm
-# that reaches the loop merge is a break, and a break leaves the selection through
-# its own merge, not by making the loop's merge one.
-# ---
-# st: the structure
-# s:  the selection header
-# m:  the candidate merge block
-# ret: true when m is inside every loop that encloses s
 fun in_enclosing(st: *Structure, s: u32, m: u32) bool {
     var l: u32 = st.nodes[s].loop_hdr;
     for (l != NO_BLOCK) {
@@ -1044,14 +729,6 @@ fun in_enclosing(st: *Structure, s: u32, m: u32) bool {
     ret true;
 }
 
-# whether control leaving the subtree rooted at `arm` leaves `s`'s dominance
-# region - the test that tells a branch arm carrying the rest of the construct
-# from one that only returns
-# ---
-# st:  the structure
-# s:   the selection header
-# arm: the arm's entry node
-# ret: true when some node the arm dominates branches outside `s`'s region
 fun arm_escapes(st: *Structure, s: u32, arm: u32) bool {
     var x: u32 = 0;
     for (x < st.count) {
@@ -1069,28 +746,12 @@ fun arm_escapes(st: *Structure, s: u32, arm: u32) bool {
     ret false;
 }
 
-# whether `a` comes before `b` in the emission order
-#
-# A synthesized node carries no reverse-postorder position and trails every real
-# block, so an absent position orders last.
-# ---
-# st: the structure
-# a:  one node
-# b:  the other node
-# ret: true when a precedes b
 fun rpo_before(st: *Structure, a: u32, b: u32) bool {
     if (st.nodes[a].rpo == NO_BLOCK) { ret false; }
     if (st.nodes[b].rpo == NO_BLOCK) { ret true; }
     ret st.nodes[a].rpo < st.nodes[b].rpo;
 }
 
-# mark every node reachable from `from` without passing through `avoid`
-# ---
-# st:    the structure
-# sc:    the scratch buffers (supplies the worklist)
-# from:  the node to start from (marked itself)
-# avoid: a node the walk does not step through
-# out:   per-node output flags, `sc.n` wide
 fun reach_from(st: *Structure, sc: *Scratch, from: u32, avoid: u32, out: *bool) {
     var i: u32 = 0;
     for (i < sc.n) { out[i] = false; i = i + 1; }
@@ -1116,11 +777,6 @@ fun reach_from(st: *Structure, sc: *Scratch, from: u32, avoid: u32, out: *bool) 
     }
 }
 
-# whether a node is already the merge block or continue target of some construct
-# ---
-# st: the structure
-# b:  the node to test
-# ret: true when another construct claims it
 fun is_claimed(st: *Structure, b: u32) bool {
     var i: u32 = 0;
     for (i < st.count) {
@@ -1131,10 +787,6 @@ fun is_claimed(st: *Structure, b: u32) bool {
     ret false;
 }
 
-# check that no block is claimed as the merge or continue target of two constructs
-# ---
-# st:  the structure
-# ret: true when every claim is unique; sets `status` otherwise
 fun claim_merges(st: *Structure) bool {
     var i: u32 = 0;
     for (i < st.count) {
@@ -1155,12 +807,6 @@ fun claim_merges(st: *Structure) bool {
     ret true;
 }
 
-# append a synthesized node, returning its index or NO_BLOCK when full
-# ---
-# st:     the structure
-# role:   ROLE_CONTINUE or ROLE_UNREACHABLE
-# target: the loop header a continue block branches to, NO_BLOCK otherwise
-# ret:    the new node index, or NO_BLOCK when the table is full
 fun push_node(st: *Structure, role: u8, target: u32) u32 {
     if (st.count >= st.cap) { ret NO_BLOCK; }
     var n: Node;
@@ -1188,17 +834,9 @@ fun push_node(st: *Structure, role: u8, target: u32) u32 {
     ret ix;
 }
 
-# lay out the emission order: the reachable blocks in reverse postorder, then the
-# synthesized nodes
-#
-# SPIR-V only requires a block to follow every block that dominates it, which
-# reverse postorder gives; a synthesized continue or unreachable merge dominates
-# nothing, so it can trail the function body.
-# ---
-# st: the structure
-fun build_order(st: *Structure) R.Result[bool, str] {
+fun build_order(st: *Structure) R.Result[R.Void, str] {
     val rp: R.Result[*bool, str] = A.allocate[bool](st.alloc, st.cap::usize);
-    if (R.is_err[*bool, str](rp)) { ret R.err[bool, str](R.unwrap_err[*bool, str](rp)); }
+    if (R.is_err[*bool, str](rp)) { ret R.err[R.Void, str](R.unwrap_err[*bool, str](rp)); }
     val placed: *bool = R.unwrap_ok[*bool, str](rp);
     var i: u32 = 0;
     for (i < st.cap) { placed[i] = false; i = i + 1; }
@@ -1213,8 +851,6 @@ fun build_order(st: *Structure) R.Result[bool, str] {
                 st.order[k] = i;
                 k = k + 1;
                 placed[i] = true;
-                # a split block is entered only from its header and dominates the
-                # header's successors, so it has to follow the header immediately.
                 val sp: u32 = st.nodes[i].split;
                 if (sp != NO_BLOCK) {
                     st.order[k] = sp;
@@ -1239,19 +875,9 @@ fun build_order(st: *Structure) R.Result[bool, str] {
     }
 
     A.deallocate[bool](st.alloc, placed, st.cap::usize);
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# lay out the forwarding blocks that feed `target`, and whatever feeds those
-#
-# A forwarding block may be the only way into the block it feeds, in which case it
-# dominates it and SPIR-V requires it to appear first.
-# ---
-# st:     the structure
-# target: the node being laid out
-# placed: per-node placement marks
-# k:      the next free slot in the emission order
-# ret:    the next free slot after the feeders
 fun place_feeders(st: *Structure, target: u32, placed: *bool, k: u32) u32 {
     var out: u32 = k;
     var j: u32 = st.real;
@@ -1266,14 +892,7 @@ fun place_feeders(st: *Structure, target: u32, placed: *bool, k: u32) u32 {
     }
     ret out;
 }
-# the innermost construct containing a node: the nearest header on its dominator
-# chain whose construct the node lies in
-# ---
-# st: the structure
-# b:  the node
-# ret: the header node index, or NO_BLOCK when the node is at function scope
 fun construct_of(st: *Structure, b: u32) u32 {
-    # a header is in its own construct.
     if (st.nodes[b].kind != CK_PLAIN) { ret b; }
     var x: u32 = b;
     for (x != NO_BLOCK) {
@@ -1283,16 +902,6 @@ fun construct_of(st: *Structure, b: u32) u32 {
     ret NO_BLOCK;
 }
 
-# whether node `b` lies in the construct headed by `h`
-#
-# SPIR-V's construct is the set of blocks the header dominates, less those the
-# merge block dominates and less the continue construct - a single synthesized
-# block here, so the exclusion is an identity test.
-# ---
-# st: the structure
-# h:  the construct header
-# b:  the node to test
-# ret: true when b is in h's construct
 fun in_construct(st: *Structure, h: u32, b: u32) bool {
     if (!dominates(st, h, b)) { ret false; }
     if (b == st.nodes[h].cont) { ret false; }
@@ -1300,13 +909,6 @@ fun in_construct(st: *Structure, h: u32, b: u32) bool {
     ret true;
 }
 
-# check every edge against the constructs just built
-#
-# An edge may stay inside its construct, reach that construct's merge block, or
-# break / continue an enclosing loop. Anything else is a shape SPIR-V cannot
-# express, and is recorded rather than emitted.
-# ---
-# st: the structure
 fun verify(st: *Structure) {
     var b: u32 = 0;
     for (b < st.count) {
@@ -1328,15 +930,7 @@ fun verify(st: *Structure) {
     }
 }
 
-# whether the edge `u -> v` is one SPIR-V's structured control flow allows
-# ---
-# st: the structure
-# u:  the source node
-# v:  the target node
-# ret: true when the edge stays inside its construct, reaches its merge, or
-#      breaks / continues an enclosing loop
 fun edge_legal(st: *Structure, u: u32, v: u32) bool {
-    # a synthesized continue block's only edge is the back edge it exists for.
     if (st.nodes[u].role == ROLE_CONTINUE) { ret v == st.nodes[u].succ0; }
 
     val k: u32 = construct_of(st, u);
@@ -1353,11 +947,6 @@ fun edge_legal(st: *Structure, u: u32, v: u32) bool {
     ret false;
 }
 
-# wire a block to hold one instruction from a shared array
-# ---
-# b:  the block to fill
-# id: the block's MIR id
-# mi: the instruction it holds
 fun t_block(b: *mir.MirBlock, id: u32, mi: *mir.MirInstr) {
     b.id          = id;
     b.instrs      = mi;
@@ -1368,11 +957,6 @@ fun t_block(b: *mir.MirBlock, id: u32, mi: *mir.MirInstr) {
     b.pred_cap    = 0;
 }
 
-# an unconditional branch to `target`
-# ---
-# mi:     the instruction to fill
-# ops:    two-operand backing store
-# target: the target block id
 fun t_br(mi: *mir.MirInstr, ops: *mir.MirOperand, target: u32) {
     ops[0]           = mir.op_block(target);
     mi.opcode        = mir.MIR_BR;
@@ -1380,12 +964,6 @@ fun t_br(mi: *mir.MirInstr, ops: *mir.MirOperand, target: u32) {
     mi.operand_count = 1;
 }
 
-# a conditional branch on vreg 0 to `t0` / `t1`
-# ---
-# mi:  the instruction to fill
-# ops: three-operand backing store
-# t0:  the taken target block id
-# t1:  the untaken target block id
 fun t_cbr(mi: *mir.MirInstr, ops: *mir.MirOperand, t0: u32, t1: u32) {
     ops[0]           = mir.op_vreg(0);
     ops[1]           = mir.op_block(t0);
@@ -1395,16 +973,12 @@ fun t_cbr(mi: *mir.MirInstr, ops: *mir.MirOperand, t0: u32, t1: u32) {
     mi.operand_count = 3;
 }
 
-# a bare return
-# ---
-# mi: the instruction to fill
 fun t_ret(mi: *mir.MirInstr) {
     mi.opcode        = mir.MIR_RET;
     mi.operands      = nil;
     mi.operand_count = 0;
 }
 
-# a straight-line function heads no construct and needs no synthesized block
 test "mach.lang.target.isa.spirv.cfg.analyze:straight_line" {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }
@@ -1428,7 +1002,6 @@ test "mach.lang.target.isa.spirv.cfg.analyze:straight_line" {
     ret rc;
 }
 
-# a conditional whose arms rejoin declares that join its merge block
 test "mach.lang.target.isa.spirv.cfg.analyze:selection_merge" {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }
@@ -1453,15 +1026,12 @@ test "mach.lang.target.isa.spirv.cfg.analyze:selection_merge" {
     var rc: i32 = 0;
     if (st.status != CFG_OK)                { rc = 2; }
     if (st.nodes[0].kind != CK_SELECTION)   { rc = 3; }
-    # the join, not either arm, and no synthesized block was needed.
     if (st.nodes[0].merge != 3)             { rc = 4; }
     if (st.count != 4)                      { rc = 5; }
     dnit(?st);
     ret rc;
 }
 
-# a loop gets a merge block and a synthesized continue target its back edge is
-# rewritten to, so SPIR-V sees exactly one back edge
 test "mach.lang.target.isa.spirv.cfg.analyze:loop_continue_and_merge" {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }
@@ -1491,14 +1061,11 @@ test "mach.lang.target.isa.spirv.cfg.analyze:loop_continue_and_merge" {
     if (c < st.real)                     { rc = 5; }
     if (rc == 0 && st.nodes[c].role != ROLE_CONTINUE) { rc = 6; }
     if (rc == 0 && st.nodes[c].succ0 != 1)            { rc = 7; }
-    # the latch's back edge now runs through the continue block.
     if (rc == 0 && st.nodes[2].succ0 != c)            { rc = 8; }
     dnit(?st);
     ret rc;
 }
 
-# a cycle entered at two blocks is irreducible: no merge assignment expresses it,
-# so it is refused rather than emitted
 test "mach.lang.target.isa.spirv.cfg.analyze:irreducible_is_refused" {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }
@@ -1526,7 +1093,6 @@ test "mach.lang.target.isa.spirv.cfg.analyze:irreducible_is_refused" {
     ret rc;
 }
 
-# a block no path reaches cannot be placed in any construct, and is refused
 test "mach.lang.target.isa.spirv.cfg.analyze:unreachable_is_refused" {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }
@@ -1550,16 +1116,6 @@ test "mach.lang.target.isa.spirv.cfg.analyze:unreachable_is_refused" {
     ret rc;
 }
 
-# two sibling loops leaving for one shared block reconverge on interposed blocks
-#
-# The shape loop versioning produces: a guard picks between two copies of the same
-# loop, and both copies branch straight to the block after them. Neither header
-# dominates that block, since the other copy reaches it too, so neither loop can
-# name it as its merge - SPIR-V requires a header to dominate its merge. The flow is
-# reducible and every loop has one exit, so it IS expressible: each loop reconverges
-# on a block interposed on its own exit edge, which its header dominates by
-# construction, and the shared block stays the selection's merge. This was refused
-# outright before #2921.
 test "mach.lang.target.isa.spirv.cfg.analyze:sibling_loops_share_one_exit" {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }
@@ -1595,10 +1151,8 @@ test "mach.lang.target.isa.spirv.cfg.analyze:sibling_loops_share_one_exit" {
     if (rc == 0 && st.nodes[ma].role != ROLE_FORWARD) { rc = 6; }
     if (rc == 0 && st.nodes[mb].role != ROLE_FORWARD) { rc = 7; }
     if (rc == 0 && ma == mb)                          { rc = 8; }
-    # each interposed block carries control on to the block both loops left for.
     if (rc == 0 && st.nodes[ma].succ0 != 5)           { rc = 9; }
     if (rc == 0 && st.nodes[mb].succ0 != 5)           { rc = 10; }
-    # the exit edges now run through them, and the shared block is the selection's.
     if (rc == 0 && st.nodes[1].succ1 != ma)           { rc = 11; }
     if (rc == 0 && st.nodes[3].succ1 != mb)           { rc = 12; }
     if (rc == 0 && st.nodes[0].merge != 5)            { rc = 13; }
@@ -1606,11 +1160,6 @@ test "mach.lang.target.isa.spirv.cfg.analyze:sibling_loops_share_one_exit" {
     ret rc;
 }
 
-# the same two loops with an exit block each keep those blocks as their merges
-#
-# The control for the case above: nothing is interposed where the header already
-# dominates the block its loop leaves for, so the reconstruction still names the
-# real blocks and the node table grows only by the two continue targets.
 test "mach.lang.target.isa.spirv.cfg.analyze:sibling_loops_with_own_exits" {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }

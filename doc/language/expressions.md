@@ -30,8 +30,8 @@ val pair: Pair[i64, u8]     = Pair[i64, u8]{ left: 5, right: 6u8 };
 
 For generics, the type arguments appear in brackets before the body.
 
-Vector literals (`f32x4{ ... }`) follow the same shape but depend on the
-SIMD vector types, which are not yet implemented — see [types.md](types.md).
+Vector literals (`f32x4{ 1.0, 2.0, 3.0, 4.0 }`) follow the same shape, one
+initializer per lane — see [types.md](types.md#simd-vectors).
 
 ## Field / index access
 

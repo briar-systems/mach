@@ -1,74 +1,98 @@
-# the SPIR-V object format: writing a finished module to a `.spv` file
-#
-# For a machine target the object writer serializes sections, symbols, and
-# relocations into a relocatable container the linker later reads back. A SPIR-V
-# module is not that: it is a complete, self-contained word stream the SPIR-V back
-# half already produced (the `codegen_module` fork wraps it as the single section
-# of the object image). This writer therefore just emits that section's bytes
-# verbatim to the output path - the `.spv` is the final artifact.
-#
-# The format is the FINISHED-MODULE emission shape (`object_is_artifact`): it is
-# not a flat load image, and its `emit_object` output is not a link input either -
-# each `.spv` is already the deliverable. The build driver reads that declaration
-# to end the build at the emit phase, so `mach build` and `mach build --emit obj`
-# write the same module tree and there is no executable to link (#2245, #2121).
-# Linking several SPIR-V modules into one is out of the milestone, so
-# `parse_object` and the executable / shared writers are nil.
-
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.string.str;
+use std.types.string.str_contains;
 use std.types.string.str_equals;
 use std.types.size.usize;
 
+use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
+
+use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 use fs: std.filesystem;
 
 use mach.lang.intern;
 use mach.lang.target.isa;
+use mach.lang.target.isa.spirv;
 use mach.lang.target.of;
+use mach.lang.target.of.bin;
+use mach.lang.publication;
 
-# process-global storage for the SPIR-V object-format vtable. written once by
-# `register` and borrowed by the vtable installed into the registry; lives for the
-# process lifetime.
-var spv_vtable: of.OfVTable;
-
-# the name of the single section the codegen fork stores the SPIR-V module in
 val SPV_SECTION: str = ".spirv";
 
-# write the SPIR-V module bytes to `path`
-#
-# The object image carries the finished module as its single `.spirv` section (the
-# `codegen_module` SPIR-V fork built it); this locates that section and writes its
-# bytes verbatim. The instruction-set vtable is unused - a SPIR-V module is not
-# machine-specific.
-# ---
-# isa_vt: the instruction-set vtable (unused)
-# image:  the object image carrying the module section
-# path:   null-terminated output file path
-# ret:    true on success, or an error string
-fun emit_object(isa_vt: *isa.IsaVTable, image: *of.ObjectImage, path: *u8) R.Result[bool, str] {
-    val sec: *of.Section = find_module_section(image);
-    if (sec == nil) {
-        ret R.err[bool, str]("of.spv: object image carries no SPIR-V module section");
-    }
-    if (sec.bytes == nil || sec.len == 0) {
-        ret R.err[bool, str]("of.spv: SPIR-V module section is empty");
-    }
-    val we: O.Option[str] = fs.write_bytes(path::str, sec.bytes, sec.len::usize, 0o644);
-    if (O.is_some[str](we)) { ret R.err[bool, str](O.unwrap[str](we)); }
-    ret R.ok[bool, str](true);
+pub rec SpvSummary {
+    version:           u32;
+    bound:             u32;
+    instruction_count: u32;
 }
 
-# locate the object image's `.spirv` module section, or nil
-#
-# Resolves each section's interned name against the image's interner; falls back to
-# the sole section when a single-section image carries the module unnamed.
-# ---
-# image: the object image to search
-# ret:   the module section, or nil
+pub fun validate(buf: *u8, len: usize) R.Result[SpvSummary, str] {
+    if (len < 20) {
+        ret R.err[SpvSummary, str]("of.spv: module is smaller than the 5-word header");
+    }
+    if (len % 4 != 0) {
+        ret R.err[SpvSummary, str]("of.spv: module length is not a multiple of 4 bytes");
+    }
+
+    val magic: u32 = bin.read_u32_le(buf, 0);
+    if (magic != spirv.SPV_MAGIC) {
+        ret R.err[SpvSummary, str]("of.spv: module magic does not match little-endian SPIR-V");
+    }
+    val version: u32 = bin.read_u32_le(buf, 4);
+    val bound:   u32 = bin.read_u32_le(buf, 12);
+    val schema:  u32 = bin.read_u32_le(buf, 16);
+    if (schema != 0) {
+        ret R.err[SpvSummary, str]("of.spv: module schema field is not reserved-zero");
+    }
+
+    var pos: usize = 20;
+    var instr_count: u32 = 0;
+    for (pos < len) {
+        if (!bin.region_ok(len, pos, 4)) {
+            ret R.err[SpvSummary, str]("of.spv: truncated instruction word");
+        }
+        val w:  u32 = bin.read_u32_le(buf, pos);
+        val wc: u32 = w >> 16;
+        if (wc == 0) {
+            ret R.err[SpvSummary, str]("of.spv: instruction declares a zero word count");
+        }
+        val instr_bytes: usize = (wc::usize) * 4;
+        if (!bin.region_ok(len, pos, instr_bytes)) {
+            ret R.err[SpvSummary, str]("of.spv: instruction word count overruns the module");
+        }
+        pos = pos + instr_bytes;
+        instr_count = instr_count + 1;
+    }
+    if (pos != len) {
+        ret R.err[SpvSummary, str]("of.spv: instruction stream does not end exactly at the module boundary");
+    }
+
+    var s: SpvSummary;
+    s.version           = version;
+    s.bound              = bound;
+    s.instruction_count = instr_count;
+    ret R.ok[SpvSummary, str](s);
+}
+
+fun emit_object(isa_vt: *of.ObjectTarget, image: *of.ObjectImage, path: *u8) R.Result[R.Void, str] {
+    val sec: *of.Section = find_module_section(image);
+    if (sec == nil) {
+        ret R.err[R.Void, str]("of.spv: object image carries no SPIR-V module section");
+    }
+    if (sec.bytes == nil || sec.len == 0) {
+        ret R.err[R.Void, str]("of.spv: SPIR-V module section is empty");
+    }
+    val vr: R.Result[SpvSummary, str] = validate(sec.bytes, sec.len::usize);
+    if (R.is_err[SpvSummary, str](vr)) {
+        ret R.err[R.Void, str](R.unwrap_err[SpvSummary, str](vr));
+    }
+    ret publication.bytes(image.interner, image.alloc, path::str, sec.bytes, sec.len::usize, 0o644, publication.REPLACE, publication.PARENTS_EXIST, "of.spv: cannot publish", "of.spv: could not publish output file", nil);
+}
+
 fun find_module_section(image: *of.ObjectImage) *of.Section {
     var i: u32 = 0;
     for (i < image.section_count) {
@@ -81,54 +105,290 @@ fun find_module_section(image: *of.ObjectImage) *of.Section {
     ret nil;
 }
 
-# build and install the SPIR-V object-format vtable
-#
-# Declares the finished-module emission shape so the build driver writes one `.spv`
-# per module through `emit_object` and stops; the linking / executable hooks are
-# nil (out of the milestone). It covers the SPIR-V instruction set alone - the
-# module bytes come from that ISA's whole-module emitter, and no other ISA produces
-# them - and carries no debug model. Idempotent: the registry entry is write-once.
-# ---
-# reg: the object-format registry to install the vtable into
-# ret: true on success
-pub fun register(reg: *of.OfRegistry) R.Result[bool, str] {
-    spv_vtable.id             = of.OF_SPV;
-    spv_vtable.name           = "spv";
-    # not a flat load image: the object-emit path writes one module per file and
-    # never lays out load segments.
-    spv_vtable.produces_image = false;
-    # a SPIR-V module is never linked into an executable, so it never feeds the
-    # in-memory executable-link path.
-    spv_vtable.links_from_image = false;
-    # the emitted module is the finished artifact: nothing reads it back, so the
-    # build delivers the module tree instead of linking it.
-    spv_vtable.object_is_artifact = true;
-    spv_vtable.object_ext         = "spv";
-    spv_vtable.emit_object    = emit_object;
-    # a finished SPIR-V module is never read back, linked, or laid out as an
-    # executable in this milestone.
-    spv_vtable.parse_object   = nil;
-    spv_vtable.emit_exec      = nil;
-    spv_vtable.emit_dyn_exec  = nil;
-    spv_vtable.emit_shared    = nil;
+pub fun register(reg: *of.OfRegistry) R.Result[R.Void, str] {
+    var spv_vtable: of.OfVTable = of.artifact_vtable(
+        of.OF_SPV, of.of_name_for(of.OF_SPV), "spv", emit_object
+    );
 
     spv_vtable.two_level_namespace = false;
     spv_vtable.default_debug       = "";
     spv_vtable.shared_input_ext    = "";
     spv_vtable.import_address_prefix = "";
-    # a SPIR-V module is not a loaded image; it has no header span to reserve.
     spv_vtable.header_in_first_segment = false;
-    # a SPIR-V module is not a loadable image and has no thread stack (#2990)
     spv_vtable.carries_stack_size = false;
     spv_vtable.default_stack_reserve = 0;
     spv_vtable.executable_section_location = nil;
 
-    # only the SPIR-V ISA's whole-module emitter produces the `.spirv` section this
-    # writer serializes, so the format covers that instruction set and no other.
     spv_vtable.covers_isa_any   = false;
     spv_vtable.covers_isa_count = 0;
     of.cover_isa(?spv_vtable, isa.ARCH_SPIRV);
 
-    of.register(reg, ?spv_vtable);
-    ret R.ok[bool, str](true);
+    ret of.register(reg, ?spv_vtable);
+}
+
+fun t_intern(itn: *intern.Interner, s: str) intern.StrId {
+    val r: R.Result[intern.StrId, str] = intern.intern(itn, s);
+    if (R.is_err[intern.StrId, str](r)) { ret intern.STR_NIL; }
+    ret R.unwrap_ok[intern.StrId, str](r);
+}
+
+fun t_poison(buf: *u8, len: usize) {
+    var i: usize = 0;
+    for (i < len) { buf[i] = 0xAA; i = i + 1; }
+}
+
+fun t_header(buf: *u8, version: u32, bound: u32, schema: u32) {
+    bin.write_u32_le(buf, 0,  spirv.SPV_MAGIC);
+    bin.write_u32_le(buf, 4,  version);
+    bin.write_u32_le(buf, 8,  spirv.SPV_GENERATOR);
+    bin.write_u32_le(buf, 12, bound);
+    bin.write_u32_le(buf, 16, schema);
+}
+
+test "mach.lang.target.of.spv.validate:header_only_module_is_valid_with_zero_instructions" {
+    var buf: [20]u8;
+    t_poison(?buf[0], 20);
+    t_header(?buf[0], spirv.SPV_VERSION_1_6, 7, 0);
+
+    val vr: R.Result[SpvSummary, str] = validate(?buf[0], 20);
+    if (R.is_err[SpvSummary, str](vr)) { ret 1; }
+    val s: SpvSummary = R.unwrap_ok[SpvSummary, str](vr);
+    if (s.version != spirv.SPV_VERSION_1_6) { ret 1; }
+    if (s.bound != 7) { ret 1; }
+    if (s.instruction_count != 0) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.of.spv.validate:two_instruction_module_round_trips" {
+    var buf: [32]u8;
+    t_poison(?buf[0], 32);
+    t_header(?buf[0], spirv.SPV_VERSION_1_6, 11, 0);
+    bin.write_u32_le(?buf[0], 20, spirv.inst_word(0, 1));
+    bin.write_u32_le(?buf[0], 24, spirv.inst_word(0, 2));
+    bin.write_u32_le(?buf[0], 28, 0xDEADBEEF::u32);
+
+    val vr: R.Result[SpvSummary, str] = validate(?buf[0], 32);
+    if (R.is_err[SpvSummary, str](vr)) { ret 1; }
+    val s: SpvSummary = R.unwrap_ok[SpvSummary, str](vr);
+    if (s.bound != 11) { ret 1; }
+    if (s.instruction_count != 2) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.of.spv.emit_object:planned_size_is_the_written_size" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var mod: [32]u8;
+    t_poison(?mod[0], 32);
+    t_header(?mod[0], spirv.SPV_VERSION_1_6, 11, 0);
+    bin.write_u32_le(?mod[0], 20, spirv.inst_word(0, 1));
+    bin.write_u32_le(?mod[0], 24, spirv.inst_word(0, 2));
+    bin.write_u32_le(?mod[0], 28, 0xDEADBEEF::u32);
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?i, SPV_SECTION); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?mod[0]; secs[0].len = 32; secs[0].align = 4;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "spvsize");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = nil; img.symbol_count = 0;
+    img.relocations = nil; img.reloc_count = 0;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "spv_size");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    var isa_vt: of.ObjectTarget;
+    val em: R.Result[R.Void, str] = emit_object(?isa_vt, ?img, tpath::*u8);
+    if (R.is_err[R.Void, str](em)) { fs.temp_close_and_remove(?tf); ret 2; }
+    val rr: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rr)) { ret 3; }
+    var b: Vector[u8] = R.unwrap_ok[Vector[u8], str](rr);
+    val written: usize = b.len;
+    vector.dnit[u8](?b);
+    if (written != 32) { ret 4; }
+
+    secs[0].len = 28;
+    val short_em: R.Result[R.Void, str] = emit_object(?isa_vt, ?img, tpath::*u8);
+    if (!R.is_err[R.Void, str](short_em)) { ret 5; }
+    ret 0;
+}
+
+test "mach.lang.target.of.spv.validate:buffer_one_byte_short_of_header_is_refused" {
+    var buf: [19]u8;
+    t_poison(?buf[0], 19);
+
+    val vr: R.Result[SpvSummary, str] = validate(?buf[0], 19);
+    if (!R.is_err[SpvSummary, str](vr)) { ret 1; }
+    if (!str_contains(R.unwrap_err[SpvSummary, str](vr), "smaller than the 5-word header")) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.of.spv.validate:length_one_byte_past_a_whole_word_is_refused" {
+    var buf: [21]u8;
+    t_poison(?buf[0], 21);
+    t_header(?buf[0], spirv.SPV_VERSION_1_6, 1, 0);
+
+    val vr: R.Result[SpvSummary, str] = validate(?buf[0], 21);
+    if (!R.is_err[SpvSummary, str](vr)) { ret 1; }
+    if (!str_contains(R.unwrap_err[SpvSummary, str](vr), "not a multiple of 4")) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.of.spv.validate:byte_swapped_magic_is_refused" {
+    var buf: [20]u8;
+    t_poison(?buf[0], 20);
+    t_header(?buf[0], spirv.SPV_VERSION_1_6, 1, 0);
+    bin.write_u32_le(?buf[0], 0, 0x03022307::u32);
+
+    val vr: R.Result[SpvSummary, str] = validate(?buf[0], 20);
+    if (!R.is_err[SpvSummary, str](vr)) { ret 1; }
+    if (!str_contains(R.unwrap_err[SpvSummary, str](vr), "magic")) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.of.spv.validate:nonzero_schema_is_refused" {
+    var buf: [20]u8;
+    t_poison(?buf[0], 20);
+    t_header(?buf[0], spirv.SPV_VERSION_1_6, 1, 1);
+
+    val vr: R.Result[SpvSummary, str] = validate(?buf[0], 20);
+    if (!R.is_err[SpvSummary, str](vr)) { ret 1; }
+    if (!str_contains(R.unwrap_err[SpvSummary, str](vr), "reserved-zero")) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.of.spv.validate:zero_word_count_instruction_is_refused" {
+    var buf: [24]u8;
+    t_poison(?buf[0], 24);
+    t_header(?buf[0], spirv.SPV_VERSION_1_6, 1, 0);
+    bin.write_u32_le(?buf[0], 20, spirv.inst_word(0, 0));
+
+    val vr: R.Result[SpvSummary, str] = validate(?buf[0], 24);
+    if (!R.is_err[SpvSummary, str](vr)) { ret 1; }
+    if (!str_contains(R.unwrap_err[SpvSummary, str](vr), "zero word count")) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.of.spv.validate:instruction_claiming_exactly_the_available_words_is_valid" {
+    var buf: [24]u8;
+    t_poison(?buf[0], 24);
+    t_header(?buf[0], spirv.SPV_VERSION_1_6, 1, 0);
+    bin.write_u32_le(?buf[0], 20, spirv.inst_word(0, 1));
+
+    val vr: R.Result[SpvSummary, str] = validate(?buf[0], 24);
+    if (R.is_err[SpvSummary, str](vr)) { ret 1; }
+    val s: SpvSummary = R.unwrap_ok[SpvSummary, str](vr);
+    if (s.instruction_count != 1) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.of.spv.validate:instruction_claiming_one_word_past_available_is_refused" {
+    var buf: [24]u8;
+    t_poison(?buf[0], 24);
+    t_header(?buf[0], spirv.SPV_VERSION_1_6, 1, 0);
+    bin.write_u32_le(?buf[0], 20, spirv.inst_word(0, 2));
+
+    val vr: R.Result[SpvSummary, str] = validate(?buf[0], 24);
+    if (!R.is_err[SpvSummary, str](vr)) { ret 1; }
+    if (!str_contains(R.unwrap_err[SpvSummary, str](vr), "overruns the module")) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.of.spv.emit_object:malformed_section_is_refused_and_nothing_is_written" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+
+    var garbage: [24]u8;
+    t_poison(?garbage[0], 24);
+    t_header(?garbage[0], spirv.SPV_VERSION_1_6, 1, 0);
+    bin.write_u32_le(?garbage[0], 20, spirv.inst_word(0, 2));
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?itn, SPV_SECTION); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?garbage[0]; secs[0].len = 24; secs[0].align = 4;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?itn;
+    img.name = t_intern(?itn, "test");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = nil; img.symbol_count = 0;
+    img.relocations = nil; img.reloc_count = 0;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "spv_malformed");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: R.Result[R.Void, str] = emit_object(nil, ?img, tpath::*u8);
+
+    val rr: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+
+    if (!R.is_err[R.Void, str](em)) { ret 1; }
+    if (!str_contains(R.unwrap_err[R.Void, str](em), "overruns the module")) { ret 1; }
+
+    if (R.is_err[Vector[u8], str](rr)) { ret 1; }
+    var b: Vector[u8] = R.unwrap_ok[Vector[u8], str](rr);
+    val leftover: usize = b.len;
+    vector.dnit[u8](?b);
+    if (leftover != 0) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.of.spv.emit_object:well_formed_section_is_written_byte_for_byte" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+
+    var mod: [24]u8;
+    t_poison(?mod[0], 24);
+    t_header(?mod[0], spirv.SPV_VERSION_1_6, 3, 0);
+    bin.write_u32_le(?mod[0], 20, spirv.inst_word(0, 1));
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?itn, SPV_SECTION); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?mod[0]; secs[0].len = 24; secs[0].align = 4;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?itn;
+    img.name = t_intern(?itn, "test");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = nil; img.symbol_count = 0;
+    img.relocations = nil; img.reloc_count = 0;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "spv_wellformed");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: R.Result[R.Void, str] = emit_object(nil, ?img, tpath::*u8);
+
+    val rr: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+
+    if (R.is_err[R.Void, str](em)) { ret 1; }
+    if (R.is_err[Vector[u8], str](rr)) { ret 1; }
+    var b: Vector[u8] = R.unwrap_ok[Vector[u8], str](rr);
+    if (b.len != 24) { vector.dnit[u8](?b); ret 1; }
+
+    var i: usize = 0;
+    var bad: bool = false;
+    for (i < 24) {
+        if (b.data[i] != mod[i]) { bad = true; }
+        i = i + 1;
+    }
+    vector.dnit[u8](?b);
+    if (bad) { ret 1; }
+    ret 0;
 }

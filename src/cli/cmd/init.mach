@@ -1,26 +1,7 @@
-# `mach init` - scaffolds a new project
-#
-# Writes a complete `mach.toml` (a `[project]` block with explicit src/dep dirs
-# and output templates, `[target.*]` platforms for linux/windows/darwin on the
-# host isa - each target's abi derived from the os's self-declared native
-# convention, and any os with no composable tuple on the host skipped - an
-# artifact surface split by executable-extension convention, debug/release
-# profiles, and a `[dep.mach-std]` dependency) plus a starter source module. For a binary the
-# generated `src/main.mach` is a standard-library hello world; a library gets a
-# bare `src/lib.mach` root. The command then syncs `mach-std` into `dep/mach-std`
-# through the same machinery as `mach dep pull`, so a fresh scaffold builds
-# immediately.
-#
-# It refuses to overwrite an existing `mach.toml` or source entry unless
-# `--force` is given. The project id is `--name`, else the positional name, else
-# the current directory's base name for a bare `mach init`. The positional is
-# taken verbatim, so a value the manifest grammar would reject (`.`, a path, ...)
-# is refused before any filesystem write - invalid input is rejected, not
-# repaired.
-
 use fs: std.filesystem;
 use std.allocator.arena;
 use std.allocator.page;
+use std.format;
 use std.print;
 use std.process.env;
 use std.types.path;
@@ -29,38 +10,46 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_copy_slice;
 use std.types.string.str_empty;
 use std.types.string.str_equals;
 use std.types.string.str_len;
+use std.text.string.str_free;
 
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
+use std.collections.vector;
+use std.collections.vector.Vector;
 
-use mach.cli.cmd.dep;
 use mach.cli.args;
+use cli_diag: mach.cli.diagnostic;
 use mach.cli.util;
+use txn: std.filesystem.transaction;
+use mach.lang.build.outcome;
+use mach.lang.build.plan;
+use mach.lang.build.request;
+use mach.lang.diagnostic;
+use mach.lang.driver;
+use ddep: mach.lang.driver.deps;
+use mach.lang.editor;
+use mach.lang.fe.ast;
+use mach.lang.intern;
 use mach.lang.manifest;
+use mach.lang.session;
+use mach.lang.source;
 use mach.lang.target;
 use mach.lang.target.isa;
+use mach.lang.target.of;
+use mach.lang.target.resolved;
 use tos: mach.lang.target.os;
+use std.data.toml;
+use mach.lang.publication;
 
-# git source url for the bundled standard-library dependency
-val MACH_STD_URL: *u8 = "https://github.com/briar-systems/mach-std";
-# default git ref for the standard-library dependency
-val MACH_STD_REF: *u8 = "branch/main";
-
-# permission bits for a created directory (octal 0755, rwxr-xr-x)
 val DIR_MODE:  i32 = 493;
-# permission bits for a written file (octal 0644, rw-r--r--)
 val FILE_MODE: i32 = 420;
 
-# fixed-capacity append buffer over caller-provided storage
-# ---
-# ptr: backing storage
-# cap: capacity in bytes
-# len: bytes appended so far
-# ok:  whether every append fit so far (false once one overflowed)
 rec Buf {
     ptr: *u8;
     cap: usize;
@@ -68,26 +57,25 @@ rec Buf {
     ok:  bool;
 }
 
-# `mach init` subcommand entry point. scaffolds a new project in the positional
-# directory (or the current directory). called by cmd.dispatch
+# `mach init`: scaffold a project. the positional names the directory (default the working
+# directory) and, unless `--name` is given, the project id, which must be a portable
+# identifier. an absent directory is created whole; an existing one is filled in, and
+# `--force` allows overwriting mach.toml and the entry file. `--lib` writes src/lib.mach
+# and a static artifact instead of src/root.mach and binary artifacts. the std dependency
+# is then realized as a git submodule unless `--no-deps`; `--quiet` silences progress
 # ---
-# argc:  argument count including argv[0]
-# argv:  the argument vector (argc null-terminated byte pointers)
-# marks: consumption record parallel to argv, for the unknown-flag rejector
-# ret:   0 on success, 1 on a user error, 2 on an internal error
-pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
-    # `mach init` reads only its own flags (no shared config parser). mark the
-    # INIT table for the rejector, then read each flag's value. reject any
-    # unrecognized flag before the directory positional is resolved.
-    args.mark_flags(marks, argc, argv, ?args.INIT[0], args.INIT_N);
-    val force:    bool          = util.flag_exists(argc, argv, "--force");
-    val is_lib:   bool          = util.flag_exists(argc, argv, "--lib");
-    val quiet:    bool          = util.flag_exists(argc, argv, "--quiet") || util.flag_exists(argc, argv, "-q");
-    val opt_name: O.Option[*u8] = util.flag_value(argc, argv, "--name");
-    if (util.flag_reject_unknown(argc, argv, marks, 2, "mach init")) { ret 1; }
+# argv: the full process arguments
+# inv: the parsed invocation for this command
+# ret: 0 success, 1 an invalid id, a refused overwrite, or a failed publish, 2 allocator or
+#  filesystem failure, 3 the std dependency could not be realized
+pub fun run_typed(argv: **u8, inv: *args.ParsedInvocation) i64 {
+    if (args.reject_unknown_from_invocation(inv, argv, "mach init")) { ret 1; }
+    val parsed: args.InitInvocation = args.build_init_invocation(inv, argv);
+    val force:   bool = parsed.force;
+    val is_lib:  bool = parsed.is_lib;
+    val no_deps: bool = parsed.no_deps;
+    val quiet:   bool = parsed.quiet;
 
-    # scaffold paths are built through the path module; one arena backs them
-    # and is reclaimed on every exit
     var backing: A.Allocator;
     if (O.is_some[str](page.make(?backing))) {
         print.eprint("error: failed to initialise allocator\n");
@@ -113,23 +101,18 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
     }
     val cwd: str = R.unwrap_ok[str, str](cwd_r);
 
-    # the target directory and project id both default to the cwd; a positional
-    # argument (the first bare argv after `init`) overrides both. it is taken
-    # verbatim, so a path or `.` is refused by is_valid_id below, never repaired.
     var dir: *u8 = cwd;
-    var id:  *u8 = base_name(cwd);
-    val pos_idx: usize = util.arg_index_positional(argc, argv, marks, 2);
-    if (pos_idx < argc) {
-        dir = argv[pos_idx];
-        id  = argv[pos_idx];
+    if (parsed.has_dir) { dir = argv[parsed.dir_idx]; }
+
+    val id_r: R.Result[str, str] = default_project_id(?a, cwd, dir::str);
+    if (R.is_err[str, str](id_r)) {
+        print.eprint("error: out of memory\n");
+        arena.dnit(?ar);
+        ret 2;
     }
+    var id: *u8 = R.unwrap_ok[str, str](id_r);
+    if (parsed.has_name) { id = argv[parsed.name_idx]; }
 
-    # --name (read above) takes precedence over the positional for the id (never
-    # the directory)
-    if (O.is_some[*u8](opt_name)) { id = O.unwrap[*u8](opt_name); }
-
-    # validate the id before any filesystem write so a rejected init leaves
-    # nothing behind
     if (!manifest.is_valid_id(id::str)) {
         print.eprint("error: '");
         print.eprint(id::str);
@@ -140,85 +123,747 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         ret 1;
     }
 
-    val mp_r: R.Result[str, str] = path.join(?a, dir::str, util.PROJECT_CONFIG_NAME);
-    val sd_r: R.Result[str, str] = path.join(?a, dir::str, "src");
-
-    var entry_leaf:  *u8 = "main.mach";
-    var entry_label: *u8 = "src/main.mach";
+    var entry_leaf:  *u8 = "root.mach";
+    var entry_label: *u8 = "src/root.mach";
     if (is_lib) {
         entry_leaf  = "lib.mach";
         entry_label = "src/lib.mach";
     }
-    if (R.is_err[str, str](mp_r) || R.is_err[str, str](sd_r)) {
+
+    val split_r: R.Result[DestSplit, str] = split_for_discovery(?a, cwd, dir::str);
+    if (R.is_err[DestSplit, str](split_r)) {
         print.eprint("error: out of memory\n");
         arena.dnit(?ar);
         ret 2;
     }
-    val manifest_path: str = R.unwrap_ok[str, str](mp_r);
-    val src_dir:       str = R.unwrap_ok[str, str](sd_r);
+    val split: DestSplit = R.unwrap_ok[DestSplit, str](split_r);
 
-    val en_r: R.Result[str, str] = path.join(?a, src_dir, entry_leaf::str);
-    if (R.is_err[str, str](en_r)) {
-        print.eprint("error: out of memory\n");
-        arena.dnit(?ar);
-        ret 2;
-    }
-    val entry: str = R.unwrap_ok[str, str](en_r);
-
-    # preflight every collision check before any filesystem write, so a refused
-    # init (a populated path without --force) leaves nothing behind
-    if (exists_refused(manifest_path, util.PROJECT_CONFIG_NAME, force)) { arena.dnit(?ar); ret 1; }
-    if (exists_refused(entry, entry_label, force))         { arena.dnit(?ar); ret 1; }
-
-    # all collision checks passed - create directories and write the scaffold
-    if (!dir_ensure(dir, "project"))  { arena.dnit(?ar); ret 2; }
-    if (!dir_ensure(src_dir, "src"))  { arena.dnit(?ar); ret 2; }
-
-    if (!write_manifest(manifest_path, id, is_lib)) {
-        print.eprint("error: failed to write mach.toml\n");
-        arena.dnit(?ar);
-        ret 2;
-    }
-
-    var template: *u8 = main_template();
-    if (is_lib) { template = lib_template(); }
-    if (!write_source(entry, template)) {
-        print.eprint("error: failed to write ");
-        print.eprint(entry_label);
+    val disc_r: R.Result[O.Option[txn.Descent], txn.Error] =
+        txn.descend(?a, split.root, split.dest_rel);
+    if (R.is_err[O.Option[txn.Descent], txn.Error](disc_r)) {
+        print.eprint("error: ");
+        print.eprint(txn.error_message(R.unwrap_err[O.Option[txn.Descent], txn.Error](disc_r)));
         print.eprint("\n");
         arena.dnit(?ar);
+        ret 1;
+    }
+    val disc: O.Option[txn.Descent] = R.unwrap_ok[O.Option[txn.Descent], txn.Error](disc_r);
+
+    val dest_root_r: R.Result[str, str] = path.join(?a, split.root, split.dest_rel);
+    if (R.is_err[str, str](dest_root_r)) {
+        print.eprint("error: out of memory\n");
+        arena.dnit(?ar);
+        ret 2;
+    }
+    val dest_root: str = R.unwrap_ok[str, str](dest_root_r);
+
+    if (O.is_some[txn.Descent](disc)) {
+        var mp: txn.Descent = O.unwrap[txn.Descent](disc);
+        val code: i64 = run_absent_branch(?a, ?mp, id, is_lib, entry_label, quiet);
+        if (code == 0) {
+            val dep_code: i64 = dependency_stage(?a, dest_root, no_deps, quiet);
+            arena.dnit(?ar);
+            ret dep_code;
+        }
+        arena.dnit(?ar);
+        ret code;
+    }
+
+    val code: i64 = run_existing_branch(?a, split.root, split.dest_rel, id, is_lib, entry_leaf, entry_label, force, quiet);
+    if (code == 0) {
+        val dep_code: i64 = dependency_stage(?a, dest_root, no_deps, quiet);
+        arena.dnit(?ar);
+        ret dep_code;
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+fun t_init(argc: usize, argv: **u8) i64 {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 2; }
+    val ir: R.Result[args.ParsedInvocation, str] = args.parse_invocation(?a, argc, argv);
+    if (R.is_err[args.ParsedInvocation, str](ir)) { ret 2; }
+    var inv: args.ParsedInvocation = R.unwrap_ok[args.ParsedInvocation, str](ir);
+    ret run_typed(argv, ?inv);
+}
+
+rec ScaffoldDep {
+    id:  str;
+    git: str;
+    ref: str;
+}
+
+val SCAFFOLD_DEP_COUNT: usize = 1;
+val SCAFFOLD_DEPS: [1]ScaffoldDep = [1]ScaffoldDep{
+    ScaffoldDep{ id: "std", git: "https://github.com/briar-systems/mach-std", ref: "branch/main" }
+};
+
+fun dependency_stage(a: *A.Allocator, root: str, no_deps: bool, quiet: bool) i64 {
+    if (no_deps) {
+        if (!quiet) {
+            print.eprint("dependencies declared but not realized; run `mach dep pull` to realize them\n");
+        }
+        ret 0;
+    }
+    ret realize_declared_deps(a, root, quiet);
+}
+
+fun realize_declared_deps(a: *A.Allocator, root: str, quiet: bool) i64 {
+    val sr: R.Result[session.Session, str] = session.init(a);
+    if (R.is_err[session.Session, str](sr)) {
+        val fail: outcome.Fail = outcome.internal("failed to initialize dependency realization");
+        ret cli_diag.render_fail(?fail);
+    }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var i: usize = 0;
+    for (i < SCAFFOLD_DEP_COUNT) {
+        val dep: ScaffoldDep = SCAFFOLD_DEPS[i];
+        val real_r: R.Result[R.Void, str] = ddep.realize_git_submodule(?s, root, dep.id, dep.git, dep.ref);
+        if (R.is_err[R.Void, str](real_r)) {
+            val msg_r: R.Result[str, str] = format.sprint(a,
+                "dependency '{}' could not be realized: {}", dep.id, R.unwrap_err[R.Void, str](real_r));
+            session.dnit(?s);
+            if (R.is_err[str, str](msg_r)) {
+                val fail: outcome.Fail = outcome.environment("a declared dependency could not be realized");
+                ret cli_diag.render_fail(?fail);
+            }
+            val fail: outcome.Fail = outcome.environment(R.unwrap_ok[str, str](msg_r));
+            ret cli_diag.render_fail(?fail);
+        }
+        if (!quiet) {
+            print.eprint("realized dependency '");
+            print.eprint(dep.id);
+            print.eprint("'\n");
+        }
+        i = i + 1;
+    }
+
+    session.dnit(?s);
+    ret 0;
+}
+
+rec DestSplit {
+    root:     str;
+    dest_rel: str;
+}
+
+fun split_for_discovery(alloc: *A.Allocator, cwd: str, dir: str) R.Result[DestSplit, str] {
+    val cleaned_r: R.Result[str, str] = path.clean(alloc, dir);
+    if (R.is_err[str, str](cleaned_r)) { ret R.err[DestSplit, str](R.unwrap_err[str, str](cleaned_r)); }
+    val cleaned: str = R.unwrap_ok[str, str](cleaned_r);
+
+    var ds: DestSplit;
+    if (path.is_abs(cleaned)) {
+        ds.root = "/";
+        ds.dest_rel = "";
+        if (str_len(cleaned) > 1) {
+            val stripped_r: R.Result[str, str] = str_copy_slice(alloc, cleaned, 1, str_len(cleaned) - 1);
+            if (R.is_err[str, str](stripped_r)) { ret R.err[DestSplit, str](R.unwrap_err[str, str](stripped_r)); }
+            ds.dest_rel = R.unwrap_ok[str, str](stripped_r);
+        }
+    }
+    or {
+        ds.root = cwd;
+        ds.dest_rel = cleaned;
+        if (str_equals(cleaned, ".")) { ds.dest_rel = ""; }
+    }
+    ret R.ok[DestSplit, str](ds);
+}
+
+# place an inventory path under the part of the destination that is missing
+#
+# the transaction publishes one component, so when the destination is several
+# levels below the deepest existing directory, everything the scaffold contains
+# has to be addressed relative to that one component rather than to the
+# destination itself.
+fun under_remainder(a: *A.Allocator, remainder: str, rel: str) str {
+    if (str_empty(remainder)) { ret rel; }
+    val r: R.Result[str, str] = format.sprint(a, "{}/{}", remainder, rel);
+    if (R.is_err[str, str](r)) { ret rel; }
+    ret R.unwrap_ok[str, str](r);
+}
+
+fun run_absent_branch(a: *A.Allocator, mp: *txn.Descent, id: *u8, is_lib: bool,
+                      entry_label: *u8, quiet: bool) i64 {
+    val text_r: R.Result[str, str] = build_manifest_text(a, id, is_lib, target.host_arch_id());
+    if (R.is_err[str, str](text_r)) {
+        print.eprint("error: failed to build mach.toml\n");
+        txn.descent_dnit(a, mp);
+        ret 2;
+    }
+    val text: str = R.unwrap_ok[str, str](text_r);
+
+    var inv: txn.Inventory = txn.inventory_init(a);
+    val manifest_rel: str = under_remainder(a, mp.remainder, "mach.toml");
+    val push1: O.Option[txn.Error] = txn.inventory_push(?inv,
+        txn.entry_file(manifest_rel, text::*u8, str_len(text), FILE_MODE));
+    if (O.is_some[txn.Error](push1)) {
+        print.eprint("error: internal: cannot plan mach.toml\n");
+        txn.inventory_dnit(?inv);
+        txn.descent_dnit(a, mp);
         ret 2;
     }
 
-    # delegate dependency acquisition to the same machinery as `mach dep pull`:
-    # the freshly written manifest drives a single clone path with the
-    # allowlisted child environment and lockfile handling, propagating its
-    # accurate diagnostics on failure
-    val pull_rc: i64 = dep.pull_project(dir::str, quiet);
-    if (pull_rc != 0) { arena.dnit(?ar); ret pull_rc; }
+    val src_text: str = source_template(is_lib)::str;
+    val entry_rel: str = under_remainder(a, mp.remainder, entry_label::str);
+    val push2: O.Option[txn.Error] = txn.inventory_push(?inv,
+        txn.entry_file(entry_rel, src_text::*u8, str_len(src_text), FILE_MODE));
+    if (O.is_some[txn.Error](push2)) {
+        print.eprint("error: internal: cannot plan ");
+        print.eprint(entry_label);
+        print.eprint("\n");
+        txn.inventory_dnit(?inv);
+        txn.descent_dnit(a, mp);
+        ret 2;
+    }
+
+    # the whole missing chain is staged privately and appears with one rename,
+    # so a reader never sees a scaffold that is half written
+    val published: R.Result[R.Void, str] = publication.subtree(a, mp, ?inv, DIR_MODE);
+    txn.inventory_dnit(?inv);
+    txn.descent_dnit(a, mp);
+    if (R.is_err[R.Void, str](published)) {
+        print.eprint("error: ");
+        print.eprint(R.unwrap_err[R.Void, str](published));
+        print.eprint("\n");
+        ret 1;
+    }
 
     if (!quiet) {
         print.eprint("created project '");
         print.eprint(id::str);
         print.eprint("'\n");
     }
-    arena.dnit(?ar);
     ret 0;
 }
 
-# write the `mach.toml` manifest for a freshly scaffolded project
-#
-# Emits a `[project]` block (id, version, src/dep dirs, output-path templates,
-# and `module` for a library), `[target.<os>-<isa>]` blocks for linux/windows/darwin
-# on the host isa (each abi derived from the os's native convention, uncomposable
-# oses skipped), target-split binary artifacts (or one library artifact),
-# debug/release profiles, and the `[dep.mach-std]` dependency.
-# ---
-# path:   destination path for the manifest
-# id:     project id (already validated)
-# is_lib: emit a library project rather than a binary
-# ret:    true on success, false on a write error or if the content overflowed
-fun write_manifest(path: *u8, id: *u8, is_lib: bool) bool {
+val JOURNAL_LEAF:     str = ".machinit1.journal";
+val BACKUP_MANIFEST:  str = ".machinit1.mach.toml.backup";
+val BACKUP_ENTRY_BIN: str = ".machinit1.root.mach.backup";
+val BACKUP_ENTRY_LIB: str = ".machinit1.lib.mach.backup";
+
+val INIT_JOURNAL_MAGIC:   u32 = 0x494e4a31;
+val INIT_JOURNAL_VERSION: u32 = 1;
+
+rec InitJournal {
+    magic:                 u32;
+    version:                u32;
+    root_device:            u64;
+    root_file:              u64;
+    manifest_had_identity:  bool;
+    manifest_prior_device:  u64;
+    manifest_prior_file:    u64;
+    manifest_new_device:    u64;
+    manifest_new_file:      u64;
+    entry_is_lib:           bool;
+    entry_had_identity:     bool;
+    entry_prior_device:     u64;
+    entry_prior_file:       u64;
+    entry_new_device:       u64;
+    entry_new_file:         u64;
+    src_dir_created:        bool;
+}
+
+val RECOVER_CLEAN:       i32 = 0;
+val RECOVER_ROLLED_BACK: i32 = 1;
+val RECOVER_COMPLETED:   i32 = 2;
+
+fun entry_backup_leaf(is_lib: bool) str {
+    if (is_lib) { ret BACKUP_ENTRY_LIB; }
+    ret BACKUP_ENTRY_BIN;
+}
+
+# init reports failures as display strings, and the transaction layer reports a
+# closed error kind. these adapters convert at that one boundary rather than
+# threading two error types through every helper below.
+fun txn_msg(e: txn.Error) str {
+    ret txn.error_message(e);
+}
+
+fun open_root(root: str, rel: str) R.Result[txn.Root, str] {
+    val r: R.Result[txn.Root, txn.Error] = txn.root_open(root, rel);
+    if (R.is_err[txn.Root, txn.Error](r)) {
+        ret R.err[txn.Root, str](txn_msg(R.unwrap_err[txn.Root, txn.Error](r)));
+    }
+    ret R.ok[txn.Root, str](R.unwrap_ok[txn.Root, txn.Error](r));
+}
+
+fun probe_entry(cap: *txn.Root, leaf: str) R.Result[txn.EntryProbe, str] {
+    val r: R.Result[txn.EntryProbe, txn.Error] = txn.entry_probe(cap, leaf);
+    if (R.is_err[txn.EntryProbe, txn.Error](r)) {
+        ret R.err[txn.EntryProbe, str](txn_msg(R.unwrap_err[txn.EntryProbe, txn.Error](r)));
+    }
+    ret R.ok[txn.EntryProbe, str](R.unwrap_ok[txn.EntryProbe, txn.Error](r));
+}
+
+fun rename_entry(cap: *txn.Root, from: str, to: str) O.Option[str] {
+    val e: O.Option[txn.Error] = txn.entry_rename(cap, from, to);
+    if (O.is_none[txn.Error](e)) { ret O.none[str](); }
+    ret O.some[str](txn_msg(O.unwrap[txn.Error](e)));
+}
+
+fun unlink_entry(cap: *txn.Root, leaf: str) O.Option[str] {
+    val e: O.Option[txn.Error] = txn.entry_unlink(cap, leaf);
+    if (O.is_none[txn.Error](e)) { ret O.none[str](); }
+    ret O.some[str](txn_msg(O.unwrap[txn.Error](e)));
+}
+
+fun stage_absent(a: *A.Allocator, cap: *txn.Root, leaf: str,
+                 data: *u8, len: usize) R.Result[txn.Transaction, str] {
+    val r: R.Result[txn.Transaction, txn.Error] =
+        txn.prepare_bytes(a, cap, leaf, data, len, FILE_MODE, false);
+    if (R.is_err[txn.Transaction, txn.Error](r)) {
+        ret R.err[txn.Transaction, str](txn_msg(R.unwrap_err[txn.Transaction, txn.Error](r)));
+    }
+    ret R.ok[txn.Transaction, str](R.unwrap_ok[txn.Transaction, txn.Error](r));
+}
+
+fun commit_absent(t: *txn.Transaction) O.Option[str] {
+    val r: R.Result[txn.Outcome, txn.Error] =
+        txn.commit(t, txn.PRE_ABSENT_AT_COMMIT, txn.durability_none());
+    if (R.is_err[txn.Outcome, txn.Error](r)) {
+        ret O.some[str](txn_msg(R.unwrap_err[txn.Outcome, txn.Error](r)));
+    }
+    ret O.none[str]();
+}
+
+fun rmdir_entry(cap: *txn.Root, leaf: str) O.Option[str] {
+    val e: O.Option[txn.Error] = txn.entry_rmdir_if_empty(cap, leaf);
+    if (O.is_none[txn.Error](e)) { ret O.none[str](); }
+    ret O.some[str](txn_msg(O.unwrap[txn.Error](e)));
+}
+
+fun make_dir_entry(cap: *txn.Root, leaf: str, mode: i32) R.Result[bool, str] {
+    val r: R.Result[bool, txn.Error] = txn.entry_make_dir(cap, leaf, mode);
+    if (R.is_err[bool, txn.Error](r)) {
+        ret R.err[bool, str](txn_msg(R.unwrap_err[bool, txn.Error](r)));
+    }
+    ret R.ok[bool, str](R.unwrap_ok[bool, txn.Error](r));
+}
+
+fun root_identity_of(cap: *txn.Root) R.Result[txn.Identity, str] {
+    val r: R.Result[txn.Identity, txn.Error] = txn.root_identity(cap);
+    if (R.is_err[txn.Identity, txn.Error](r)) {
+        ret R.err[txn.Identity, str](txn_msg(R.unwrap_err[txn.Identity, txn.Error](r)));
+    }
+    ret R.ok[txn.Identity, str](R.unwrap_ok[txn.Identity, txn.Error](r));
+}
+
+fun staged_identity_of(t: *txn.Transaction) R.Result[txn.Identity, str] {
+    val r: R.Result[txn.Identity, txn.Error] = txn.transaction_staged_identity(t);
+    if (R.is_err[txn.Identity, txn.Error](r)) {
+        ret R.err[txn.Identity, str](txn_msg(R.unwrap_err[txn.Identity, txn.Error](r)));
+    }
+    ret R.ok[txn.Identity, str](R.unwrap_ok[txn.Identity, txn.Error](r));
+}
+
+fun sweep_root(a: *A.Allocator, cap: *txn.Root) {
+    txn.recover(a, cap, "");
+}
+
+fun src_dir_rel(a: *A.Allocator, dir_rel: str) R.Result[str, str] {
+    ret path.join(a, dir_rel, "src");
+}
+
+fun open_src_cap(a: *A.Allocator, root: str, dir_rel: str) R.Result[txn.Root, str] {
+    val rel_r: R.Result[str, str] = src_dir_rel(a, dir_rel);
+    if (R.is_err[str, str](rel_r)) { ret R.err[txn.Root, str](R.unwrap_err[str, str](rel_r)); }
+    ret open_root(root, R.unwrap_ok[str, str](rel_r));
+}
+
+fun journal_read(a: *A.Allocator, root_cap: *txn.Root) R.Result[O.Option[InitJournal], str] {
+    var j: InitJournal;
+    val jsize: usize = $size_of(InitJournal);
+    val read_r: R.Result[O.Option[usize], txn.Error] =
+        txn.entry_read_all(root_cap, JOURNAL_LEAF, (?j)::*u8, jsize);
+    if (R.is_err[O.Option[usize], txn.Error](read_r)) {
+        ret R.err[O.Option[InitJournal], str](txn_msg(R.unwrap_err[O.Option[usize], txn.Error](read_r)));
+    }
+    val got: O.Option[usize] = R.unwrap_ok[O.Option[usize], txn.Error](read_r);
+    if (O.is_none[usize](got)) { ret R.ok[O.Option[InitJournal], str](O.none[InitJournal]()); }
+    if (O.unwrap[usize](got) != jsize) { ret R.err[O.Option[InitJournal], str]("init journal has an unexpected size"); }
+    if (j.magic != INIT_JOURNAL_MAGIC || j.version != INIT_JOURNAL_VERSION) {
+        ret R.err[O.Option[InitJournal], str]("init journal has an unrecognized version");
+    }
+    ret R.ok[O.Option[InitJournal], str](O.some[InitJournal](j));
+}
+
+fun journal_create(a: *A.Allocator, root_cap: *txn.Root, root_id: txn.Identity,
+                   manifest_probe: txn.EntryProbe, manifest_new: txn.Identity,
+                   entry_probe: txn.EntryProbe, entry_new: txn.Identity,
+                   is_lib: bool, src_dir_created: bool) R.Result[R.Void, str] {
+    var j: InitJournal;
+    j.magic                 = INIT_JOURNAL_MAGIC;
+    j.version                = INIT_JOURNAL_VERSION;
+    j.root_device             = root_id.device;
+    j.root_file               = root_id.file;
+    j.manifest_had_identity   = manifest_probe.present;
+    j.manifest_prior_device   = manifest_probe.identity.device;
+    j.manifest_prior_file     = manifest_probe.identity.file;
+    j.manifest_new_device     = manifest_new.device;
+    j.manifest_new_file       = manifest_new.file;
+    j.entry_is_lib            = is_lib;
+    j.entry_had_identity      = entry_probe.present;
+    j.entry_prior_device      = entry_probe.identity.device;
+    j.entry_prior_file        = entry_probe.identity.file;
+    j.entry_new_device        = entry_new.device;
+    j.entry_new_file          = entry_new.file;
+    j.src_dir_created         = src_dir_created;
+
+    ret publication.bytes_at(nil, a, root_cap, JOURNAL_LEAF, JOURNAL_LEAF, (?j)::*u8, $size_of(InitJournal),
+                             FILE_MODE, publication.CREATE, "write", "the init journal could not be published", nil);
+}
+
+fun stage_owned(a: *A.Allocator, cap: *txn.Root, leaf: str,
+                data: *u8, len: usize) R.Result[txn.Transaction, str] {
+    ret stage_absent(a, cap, leaf, data, len);
+}
+
+fun commit_owned(a: *A.Allocator, cap: *txn.Root, pf: *txn.Transaction,
+                 had_identity: bool, final_leaf: str, backup_leaf: str) O.Option[str] {
+    if (had_identity) {
+        val mv: O.Option[str] = rename_entry(cap, final_leaf, backup_leaf);
+        if (O.is_some[str](mv)) {
+            txn.abort(pf);
+            ret mv;
+        }
+    }
+    ret commit_absent(pf);
+}
+
+fun resolve_rollback(a: *A.Allocator, cap: *txn.Root,
+                     final_leaf: str, backup_leaf: str, had_identity_before: bool) O.Option[str] {
+    val probe_r: R.Result[txn.EntryProbe, str] = probe_entry(cap, backup_leaf);
+    if (R.is_err[txn.EntryProbe, str](probe_r)) { ret O.some[str](R.unwrap_err[txn.EntryProbe, str](probe_r)); }
+    val probe: txn.EntryProbe = R.unwrap_ok[txn.EntryProbe, str](probe_r);
+    if (probe.present) { ret rename_entry(cap, backup_leaf, final_leaf); }
+    if (!had_identity_before) { ret unlink_entry(cap, final_leaf); }
+    ret O.none[str]();
+}
+
+fun resolve_commit_cleanup(a: *A.Allocator, cap: *txn.Root, backup_leaf: str) O.Option[str] {
+    ret unlink_entry(cap, backup_leaf);
+}
+
+val OUTPUT_ORIGINAL: i32 = 0;
+val OUTPUT_DONE:     i32 = 1;
+val OUTPUT_ANOMALY:  i32 = -1;
+
+fun classify_output(current: txn.EntryProbe, had_identity: bool,
+                    prior: txn.Identity, new_id: txn.Identity) i32 {
+    if (!current.present) { ret OUTPUT_ORIGINAL; }
+    if (!current.is_regular) { ret OUTPUT_ANOMALY; }
+    if (txn.identity_equal(current.identity, new_id)) { ret OUTPUT_DONE; }
+    if (had_identity && txn.identity_equal(current.identity, prior)) { ret OUTPUT_ORIGINAL; }
+    ret OUTPUT_ANOMALY;
+}
+
+fun recover_existing(a: *A.Allocator, root: str, dir_rel: str, root_cap: *txn.Root) R.Result[i32, str] {
+    val jr: R.Result[O.Option[InitJournal], str] = journal_read(a, root_cap);
+    if (R.is_err[O.Option[InitJournal], str](jr)) { ret R.err[i32, str](R.unwrap_err[O.Option[InitJournal], str](jr)); }
+    val jo: O.Option[InitJournal] = R.unwrap_ok[O.Option[InitJournal], str](jr);
+    if (O.is_none[InitJournal](jo)) { ret R.ok[i32, str](RECOVER_CLEAN); }
+    val j: InitJournal = O.unwrap[InitJournal](jo);
+
+    val root_id_r: R.Result[txn.Identity, str] = root_identity_of(root_cap);
+    if (R.is_err[txn.Identity, str](root_id_r)) { ret R.err[i32, str](R.unwrap_err[txn.Identity, str](root_id_r)); }
+    val root_id: txn.Identity = R.unwrap_ok[txn.Identity, str](root_id_r);
+    if (root_id.device != j.root_device || root_id.file != j.root_file) {
+        ret R.err[i32, str]("init journal does not match its destination root");
+    }
+
+    val manifest_now_r: R.Result[txn.EntryProbe, str] = probe_entry(root_cap, util.PROJECT_CONFIG_NAME);
+    if (R.is_err[txn.EntryProbe, str](manifest_now_r)) { ret R.err[i32, str](R.unwrap_err[txn.EntryProbe, str](manifest_now_r)); }
+    val manifest_now: txn.EntryProbe = R.unwrap_ok[txn.EntryProbe, str](manifest_now_r);
+    val manifest_prior: txn.Identity = txn.Identity{device: j.manifest_prior_device, file: j.manifest_prior_file};
+    val manifest_new:   txn.Identity = txn.Identity{device: j.manifest_new_device,   file: j.manifest_new_file};
+    val manifest_class: i32 = classify_output(manifest_now, j.manifest_had_identity, manifest_prior, manifest_new);
+    if (manifest_class == OUTPUT_ANOMALY) { ret R.err[i32, str]("init journal: mach.toml is neither the original nor the staged replacement"); }
+
+    val entry_leaf: str = if_str(j.entry_is_lib, "lib.mach", "root.mach");
+    val entry_backup: str = entry_backup_leaf(j.entry_is_lib);
+    val entry_prior: txn.Identity = txn.Identity{device: j.entry_prior_device, file: j.entry_prior_file};
+    val entry_new:   txn.Identity = txn.Identity{device: j.entry_new_device,   file: j.entry_new_file};
+
+    val src_now_r: R.Result[txn.EntryProbe, str] = probe_entry(root_cap, "src");
+    if (R.is_err[txn.EntryProbe, str](src_now_r)) { ret R.err[i32, str](R.unwrap_err[txn.EntryProbe, str](src_now_r)); }
+    val src_now: txn.EntryProbe = R.unwrap_ok[txn.EntryProbe, str](src_now_r);
+
+    var have_src_cap: bool = false;
+    var src_cap: txn.Root;
+    var entry_class: i32 = OUTPUT_ORIGINAL;
+    if (src_now.present && src_now.is_directory) {
+        val src_cap_r: R.Result[txn.Root, str] = open_src_cap(a, root, dir_rel);
+        if (R.is_err[txn.Root, str](src_cap_r)) { ret R.err[i32, str](R.unwrap_err[txn.Root, str](src_cap_r)); }
+        src_cap = R.unwrap_ok[txn.Root, str](src_cap_r);
+        have_src_cap = true;
+
+        val entry_now_r: R.Result[txn.EntryProbe, str] = probe_entry(?src_cap, entry_leaf);
+        if (R.is_err[txn.EntryProbe, str](entry_now_r)) { txn.root_dnit(?src_cap); ret R.err[i32, str](R.unwrap_err[txn.EntryProbe, str](entry_now_r)); }
+        val entry_now: txn.EntryProbe = R.unwrap_ok[txn.EntryProbe, str](entry_now_r);
+        entry_class = classify_output(entry_now, j.entry_had_identity, entry_prior, entry_new);
+    }
+    if (entry_class == OUTPUT_ANOMALY) {
+        if (have_src_cap) { txn.root_dnit(?src_cap); }
+        ret R.err[i32, str]("init journal: the selected entry file is neither the original nor the staged replacement");
+    }
+
+    val overall_done: bool = manifest_class == OUTPUT_DONE;
+    if (overall_done && entry_class != OUTPUT_DONE) {
+        if (have_src_cap) { txn.root_dnit(?src_cap); }
+        ret R.err[i32, str]("init journal: mach.toml committed but the entry file did not");
+    }
+
+    if (overall_done) {
+        resolve_commit_cleanup(a, root_cap, BACKUP_MANIFEST);
+        if (have_src_cap) {
+            resolve_commit_cleanup(a, ?src_cap, entry_backup);
+            sweep_root(a, ?src_cap);
+            txn.root_dnit(?src_cap);
+        }
+        sweep_root(a, root_cap);
+        unlink_entry(root_cap, JOURNAL_LEAF);
+        ret R.ok[i32, str](RECOVER_COMPLETED);
+    }
+
+    resolve_rollback(a, root_cap, util.PROJECT_CONFIG_NAME, BACKUP_MANIFEST, j.manifest_had_identity);
+    if (have_src_cap) {
+        resolve_rollback(a, ?src_cap, entry_leaf, entry_backup, j.entry_had_identity);
+        sweep_root(a, ?src_cap);
+        txn.root_dnit(?src_cap);
+    }
+    if (j.src_dir_created) { rmdir_entry(root_cap, "src"); }
+    sweep_root(a, root_cap);
+    unlink_entry(root_cap, JOURNAL_LEAF);
+    ret R.ok[i32, str](RECOVER_ROLLED_BACK);
+}
+
+fun if_str(cond: bool, when_true: str, when_false: str) str {
+    if (cond) { ret when_true; }
+    ret when_false;
+}
+
+fun refuse_exists(label: *u8) {
+    print.eprint("error: ");
+    print.eprint(label);
+    print.eprint(" already exists (use --force to overwrite)\n");
+}
+
+fun refuse_not_regular(label: *u8) {
+    print.eprint("error: ");
+    print.eprint(label);
+    print.eprint(" exists and is not a regular file\n");
+}
+
+fun run_existing_branch(a: *A.Allocator, root: str, dir_rel: str, id: *u8, is_lib: bool,
+                        entry_leaf: *u8, entry_label: *u8, force: bool, quiet: bool) i64 {
+    val cap_r: R.Result[txn.Root, str] = open_root(root, dir_rel);
+    if (R.is_err[txn.Root, str](cap_r)) {
+        print.eprint("error: ");
+        print.eprint(R.unwrap_err[txn.Root, str](cap_r));
+        print.eprint("\n");
+        ret 2;
+    }
+    var root_cap: txn.Root = R.unwrap_ok[txn.Root, str](cap_r);
+
+    val recover_r: R.Result[i32, str] = recover_existing(a, root, dir_rel, ?root_cap);
+    if (R.is_err[i32, str](recover_r)) {
+        print.eprint("error: ");
+        print.eprint(R.unwrap_err[i32, str](recover_r));
+        print.eprint(" (recovery required; inspect the destination before retrying)\n");
+        txn.root_dnit(?root_cap);
+        ret 2;
+    }
+
+    val manifest_probe_r: R.Result[txn.EntryProbe, str] = probe_entry(?root_cap, util.PROJECT_CONFIG_NAME);
+    if (R.is_err[txn.EntryProbe, str](manifest_probe_r)) {
+        print.eprint("error: "); print.eprint(R.unwrap_err[txn.EntryProbe, str](manifest_probe_r)); print.eprint("\n");
+        txn.root_dnit(?root_cap);
+        ret 2;
+    }
+    val manifest_probe: txn.EntryProbe = R.unwrap_ok[txn.EntryProbe, str](manifest_probe_r);
+    if (manifest_probe.present && !manifest_probe.is_regular) {
+        refuse_not_regular(util.PROJECT_CONFIG_NAME);
+        txn.root_dnit(?root_cap);
+        ret 1;
+    }
+    if (manifest_probe.present && !force) {
+        refuse_exists(util.PROJECT_CONFIG_NAME);
+        txn.root_dnit(?root_cap);
+        ret 1;
+    }
+
+    val src_probe_r: R.Result[txn.EntryProbe, str] = probe_entry(?root_cap, "src");
+    if (R.is_err[txn.EntryProbe, str](src_probe_r)) {
+        print.eprint("error: "); print.eprint(R.unwrap_err[txn.EntryProbe, str](src_probe_r)); print.eprint("\n");
+        txn.root_dnit(?root_cap);
+        ret 2;
+    }
+    val src_probe: txn.EntryProbe = R.unwrap_ok[txn.EntryProbe, str](src_probe_r);
+    if (src_probe.present && !src_probe.is_directory) {
+        print.eprint("error: 'src' exists and is not a directory\n");
+        txn.root_dnit(?root_cap);
+        ret 1;
+    }
+
+    var entry_probe: txn.EntryProbe;
+    var have_src_cap: bool = false;
+    var src_cap: txn.Root;
+    if (src_probe.present) {
+        val src_cap_r: R.Result[txn.Root, str] = open_src_cap(a, root, dir_rel);
+        if (R.is_err[txn.Root, str](src_cap_r)) {
+            print.eprint("error: "); print.eprint(R.unwrap_err[txn.Root, str](src_cap_r)); print.eprint("\n");
+            txn.root_dnit(?root_cap);
+            ret 2;
+        }
+        src_cap = R.unwrap_ok[txn.Root, str](src_cap_r);
+        have_src_cap = true;
+
+        val entry_probe_r: R.Result[txn.EntryProbe, str] = probe_entry(?src_cap, entry_leaf::str);
+        if (R.is_err[txn.EntryProbe, str](entry_probe_r)) {
+            print.eprint("error: "); print.eprint(R.unwrap_err[txn.EntryProbe, str](entry_probe_r)); print.eprint("\n");
+            txn.root_dnit(?src_cap); txn.root_dnit(?root_cap);
+            ret 2;
+        }
+        entry_probe = R.unwrap_ok[txn.EntryProbe, str](entry_probe_r);
+    }
+    if (entry_probe.present && !entry_probe.is_regular) {
+        refuse_not_regular(entry_label);
+        if (have_src_cap) { txn.root_dnit(?src_cap); }
+        txn.root_dnit(?root_cap);
+        ret 1;
+    }
+    if (entry_probe.present && !force) {
+        refuse_exists(entry_label);
+        if (have_src_cap) { txn.root_dnit(?src_cap); }
+        txn.root_dnit(?root_cap);
+        ret 1;
+    }
+
+    val root_id_r: R.Result[txn.Identity, str] = root_identity_of(?root_cap);
+    if (R.is_err[txn.Identity, str](root_id_r)) {
+        print.eprint("error: "); print.eprint(R.unwrap_err[txn.Identity, str](root_id_r)); print.eprint("\n");
+        if (have_src_cap) { txn.root_dnit(?src_cap); }
+        txn.root_dnit(?root_cap);
+        ret 2;
+    }
+    val root_id: txn.Identity = R.unwrap_ok[txn.Identity, str](root_id_r);
+
+    val manifest_text_r: R.Result[str, str] = build_manifest_text(a, id, is_lib, target.host_arch_id());
+    if (R.is_err[str, str](manifest_text_r)) {
+        print.eprint("error: failed to build mach.toml\n");
+        if (have_src_cap) { txn.root_dnit(?src_cap); }
+        txn.root_dnit(?root_cap);
+        ret 2;
+    }
+    val manifest_text: str = R.unwrap_ok[str, str](manifest_text_r);
+    val manifest_prep_r: R.Result[txn.Transaction, str] = stage_owned(a, ?root_cap, util.PROJECT_CONFIG_NAME, manifest_text::*u8, str_len(manifest_text));
+    if (R.is_err[txn.Transaction, str](manifest_prep_r)) {
+        print.eprint("error: "); print.eprint(R.unwrap_err[txn.Transaction, str](manifest_prep_r)); print.eprint("\n");
+        if (have_src_cap) { txn.root_dnit(?src_cap); }
+        txn.root_dnit(?root_cap);
+        ret 2;
+    }
+    var manifest_pf: txn.Transaction = R.unwrap_ok[txn.Transaction, str](manifest_prep_r);
+    val manifest_new_r: R.Result[txn.Identity, str] = staged_identity_of(?manifest_pf);
+    if (R.is_err[txn.Identity, str](manifest_new_r)) {
+        print.eprint("error: "); print.eprint(R.unwrap_err[txn.Identity, str](manifest_new_r)); print.eprint("\n");
+        txn.abort(?manifest_pf);
+        if (have_src_cap) { txn.root_dnit(?src_cap); }
+        txn.root_dnit(?root_cap);
+        ret 2;
+    }
+    val manifest_new: txn.Identity = R.unwrap_ok[txn.Identity, str](manifest_new_r);
+
+    val will_create_src: bool = !src_probe.present;
+    val src_text: str = source_template(is_lib)::str;
+
+    if (will_create_src) {
+        val created_r: R.Result[bool, str] = make_dir_entry(?root_cap, "src", DIR_MODE);
+        if (R.is_err[bool, str](created_r)) {
+            txn.abort(?manifest_pf);
+            txn.root_dnit(?root_cap);
+            print.eprint("error: "); print.eprint(R.unwrap_err[bool, str](created_r)); print.eprint("\n");
+            ret 2;
+        }
+        val src_cap_r: R.Result[txn.Root, str] = open_src_cap(a, root, dir_rel);
+        if (R.is_err[txn.Root, str](src_cap_r)) {
+            txn.abort(?manifest_pf);
+            rmdir_entry(?root_cap, "src");
+            txn.root_dnit(?root_cap);
+            print.eprint("error: "); print.eprint(R.unwrap_err[txn.Root, str](src_cap_r)); print.eprint("\n");
+            ret 2;
+        }
+        src_cap = R.unwrap_ok[txn.Root, str](src_cap_r);
+        have_src_cap = true;
+    }
+
+    val entry_prep_r: R.Result[txn.Transaction, str] = stage_owned(a, ?src_cap, entry_leaf::str, src_text::*u8, str_len(src_text));
+    if (R.is_err[txn.Transaction, str](entry_prep_r)) {
+        txn.abort(?manifest_pf);
+        if (will_create_src) { rmdir_entry(?root_cap, "src"); }
+        txn.root_dnit(?src_cap); txn.root_dnit(?root_cap);
+        print.eprint("error: "); print.eprint(R.unwrap_err[txn.Transaction, str](entry_prep_r)); print.eprint("\n");
+        ret 2;
+    }
+    var entry_pf: txn.Transaction = R.unwrap_ok[txn.Transaction, str](entry_prep_r);
+    val entry_new_r: R.Result[txn.Identity, str] = staged_identity_of(?entry_pf);
+    if (R.is_err[txn.Identity, str](entry_new_r)) {
+        txn.abort(?entry_pf); txn.abort(?manifest_pf);
+        if (will_create_src) { rmdir_entry(?root_cap, "src"); }
+        txn.root_dnit(?src_cap); txn.root_dnit(?root_cap);
+        print.eprint("error: "); print.eprint(R.unwrap_err[txn.Identity, str](entry_new_r)); print.eprint("\n");
+        ret 2;
+    }
+    val entry_new: txn.Identity = R.unwrap_ok[txn.Identity, str](entry_new_r);
+
+    val journal_r: R.Result[R.Void, str] = journal_create(a, ?root_cap, root_id,
+        manifest_probe, manifest_new, entry_probe, entry_new, is_lib, will_create_src);
+    if (R.is_err[R.Void, str](journal_r)) {
+        txn.abort(?entry_pf); txn.abort(?manifest_pf);
+        if (will_create_src) { rmdir_entry(?root_cap, "src"); }
+        txn.root_dnit(?src_cap); txn.root_dnit(?root_cap);
+        print.eprint("error: "); print.eprint(R.unwrap_err[R.Void, str](journal_r)); print.eprint("\n");
+        ret 2;
+    }
+
+    val entry_backup: str = entry_backup_leaf(is_lib);
+    val entry_commit_err: O.Option[str] = commit_owned(a, ?src_cap, ?entry_pf, entry_probe.present, entry_leaf::str, entry_backup);
+    if (O.is_some[str](entry_commit_err)) {
+        print.eprint("error: "); print.eprint(O.unwrap[str](entry_commit_err)); print.eprint("\n");
+        recover_existing(a, root, dir_rel, ?root_cap);
+        txn.root_dnit(?src_cap); txn.root_dnit(?root_cap);
+        ret 2;
+    }
+
+    val manifest_commit_err: O.Option[str] = commit_owned(a, ?root_cap, ?manifest_pf, manifest_probe.present, util.PROJECT_CONFIG_NAME, BACKUP_MANIFEST);
+    if (O.is_some[str](manifest_commit_err)) {
+        print.eprint("error: "); print.eprint(O.unwrap[str](manifest_commit_err)); print.eprint("\n");
+        recover_existing(a, root, dir_rel, ?root_cap);
+        txn.root_dnit(?src_cap); txn.root_dnit(?root_cap);
+        ret 2;
+    }
+
+    resolve_commit_cleanup(a, ?src_cap, entry_backup);
+    resolve_commit_cleanup(a, ?root_cap, BACKUP_MANIFEST);
+    sweep_root(a, ?src_cap);
+    sweep_root(a, ?root_cap);
+    unlink_entry(?root_cap, JOURNAL_LEAF);
+
+    txn.root_dnit(?src_cap);
+    txn.root_dnit(?root_cap);
+
+    if (!quiet) {
+        print.eprint("created project '");
+        print.eprint(id::str);
+        print.eprint("'\n");
+    }
+    ret 0;
+}
+
+fun build_manifest_text(alloc: *A.Allocator, id: *u8, is_lib: bool, arch_id: u32) R.Result[str, str] {
     var storage: [4096]u8;
     var buf: Buf;
     buf.ptr = ?storage[0];
@@ -235,53 +880,78 @@ fun write_manifest(path: *u8, id: *u8, is_lib: bool) bool {
     buf_put(?buf, "out = \"out/{target.name}/{profile.name}\"\n");
     buf_put(?buf, "\n");
 
-    # emit the `[target.*]` blocks, deriving each abi from the os's self-declared
-    # native convention on the host isa rather than a hardcoded os->abi table. the
-    # registry is the same capability seam the driver owns; register_all never fails
-    # in practice, but a failure means the compiler cannot describe any target, so
-    # the scaffold cannot be written.
     var reg: target.TargetRegistry = target.registry_init();
-    if (R.is_err[bool, str](target.register_all(?reg))) { ret false; }
-    val arch_id: u32 = target.host_arch_id();
+    fin { target.registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](driver.setup_registry(?reg))) { ret R.err[str, str]("failed to register targets"); }
     emit_targets(?buf, ?reg, arch_id);
     emit_artifacts(?buf, ?reg, arch_id, id, is_lib);
+    if (!is_lib && !str_empty(scaffold_abi(?reg, "windows", arch_id))) {
+        buf_put(?buf, "[link.kernel32]\nsource = \"system\"\nname = \"kernel32.dll\"\nos = [\"windows\"]\nisa = [\"*\"]\nabi = [\"*\"]\nexport = false\n\n");
+    }
 
     buf_put(?buf, "[profile.debug]\n");
+    buf_put(?buf, "default = true\n");
     buf_put(?buf, "opt = 0\n");
     buf_put(?buf, "debug = true\n");
     buf_put(?buf, "simd = \"scalarize\"\n");
+    buf_put(?buf, "vectorize = false\n");
     buf_put(?buf, "\n");
     buf_put(?buf, "[profile.release]\n");
     buf_put(?buf, "opt = 2\n");
     buf_put(?buf, "debug = false\n");
     buf_put(?buf, "simd = \"scalarize\"\n");
+    buf_put(?buf, "vectorize = true\n");
     buf_put(?buf, "\n");
 
-    buf_put(?buf, "[dep.mach-std]\n");
-    buf_put(?buf, "git = \"");
-    buf_put(?buf, MACH_STD_URL);
-    buf_put(?buf, "\"\n");
-    buf_put(?buf, "ref = \"");
-    buf_put(?buf, MACH_STD_REF);
-    buf_put(?buf, "\"\n");
+    var di: usize = 0;
+    for (di < SCAFFOLD_DEP_COUNT) {
+        val dep: ScaffoldDep = SCAFFOLD_DEPS[di];
+        buf_put(?buf, "[dep.");
+        buf_put(?buf, dep.id::*u8);
+        buf_put(?buf, "]\n");
+        buf_put(?buf, "git = \"");
+        buf_put(?buf, dep.git::*u8);
+        buf_put(?buf, "\"\n");
+        buf_put(?buf, "ref = \"");
+        buf_put(?buf, dep.ref::*u8);
+        buf_put(?buf, "\"\n");
+        di = di + 1;
+    }
 
-    if (!buf.ok) { ret false; }
-    val res_write: O.Option[str] = fs.write_bytes(path, ?storage[0], buf.len, FILE_MODE);
-    ret !O.is_some[str](res_write);
+    if (!buf.ok) { ret R.err[str, str]("mach.toml scaffold exceeds the scratch buffer"); }
+    ret str_copy_slice(alloc, buf.ptr::str, 0, buf.len);
 }
 
-# emit the scaffold's artifact surface
-#
-# Libraries keep one all-target artifact. A binary with a composable Windows
-# target gets disjoint artifacts because `out` is literal: non-Windows targets
-# produce `bin/<id>` and Windows produces `bin/<id>.exe` (#2981).
+fun scaffold_of_name(reg: *target.TargetRegistry, os_name: str, arch_id: u32) R.Result[of.ArtifactName, str] {
+    val abi_name: str = scaffold_abi(reg, os_name, arch_id);
+    if (str_empty(abi_name)) { ret R.err[of.ArtifactName, str]("scaffold: no naming target"); }
+    val tgt_r: R.Result[resolved.Target, str] = target.select(reg, isa.arch_name_for(arch_id), os_name, abi_name);
+    if (R.is_err[resolved.Target, str](tgt_r)) { ret R.err[of.ArtifactName, str](R.unwrap_err[resolved.Target, str](tgt_r)); }
+    var tgt: resolved.Target = R.unwrap_ok[resolved.Target, str](tgt_r);
+    ret target.artifact_naming(?tgt, of.ARTIFACT_EXECUTABLE);
+}
+
 fun emit_artifacts(b: *Buf, reg: *target.TargetRegistry, arch_id: u32,
                    id: *u8, is_lib: bool) {
     if (is_lib) {
+        val lib_r: R.Result[resolved.Target, str] = target.select(reg, isa.arch_name_for(arch_id), "linux", scaffold_abi(reg, "linux", arch_id));
+        var prefix: str = "lib";
+        var suffix: str = ".a";
+        if (R.is_ok[resolved.Target, str](lib_r)) {
+            var tgt: resolved.Target = R.unwrap_ok[resolved.Target, str](lib_r);
+            val an_r: R.Result[of.ArtifactName, str] = target.artifact_naming(?tgt, of.ARTIFACT_STATIC_LIB);
+            if (R.is_ok[of.ArtifactName, str](an_r)) {
+                val an: of.ArtifactName = R.unwrap_ok[of.ArtifactName, str](an_r);
+                prefix = an.prefix;
+                suffix = an.suffix;
+            }
+        }
         buf_put(b, "[artifact.");
         buf_put(b, id);
         buf_put(b, "]\nkind = \"static\"\nentry = \"lib.mach\"\nout = \"lib/");
+        buf_put(b, prefix::*u8);
         buf_put(b, id);
+        buf_put(b, suffix::*u8);
         buf_put(b, "\"\ntargets = [\"*\"]\nlink = []\nneed = []\n\n");
         ret;
     }
@@ -292,21 +962,26 @@ fun emit_artifacts(b: *Buf, reg: *target.TargetRegistry, arch_id: u32,
     }
 }
 
-# emit one side of a binary scaffold's extension split
 fun emit_binary_artifact(b: *Buf, reg: *target.TargetRegistry, arch_id: u32,
                          id: *u8, windows: bool) {
+    var os_name: str = "linux";
+    if (windows) { os_name = "windows"; }
+    var suffix: str = "";
+    val an_r: R.Result[of.ArtifactName, str] = scaffold_of_name(reg, os_name, arch_id);
+    if (R.is_ok[of.ArtifactName, str](an_r)) { suffix = R.unwrap_ok[of.ArtifactName, str](an_r).suffix; }
+
     buf_put(b, "[artifact.");
     buf_put(b, id);
     if (windows) { buf_put(b, "-windows"); }
-    buf_put(b, "]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/");
+    buf_put(b, "]\nkind = \"bin\"\nentry = \"root.mach\"\nout = \"bin/");
     buf_put(b, id);
-    if (windows) { buf_put(b, ".exe"); }
+    buf_put(b, suffix::*u8);
     buf_put(b, "\"\ntargets = [");
     emit_artifact_targets(b, reg, arch_id, windows);
-    buf_put(b, "]\nlink = []\nneed = []\n\n");
+    if (windows) { buf_put(b, "]\nlink = [\"kernel32\"]\nneed = []\n\n"); }
+    or            { buf_put(b, "]\nlink = []\nneed = []\n\n"); }
 }
 
-# emit the target-name strings for one side of the extension split
 fun emit_artifact_targets(b: *Buf, reg: *target.TargetRegistry,
                           arch_id: u32, windows: bool) {
     var wrote: bool = false;
@@ -315,7 +990,6 @@ fun emit_artifact_targets(b: *Buf, reg: *target.TargetRegistry,
     emit_artifact_target(b, reg, "darwin", arch_id, windows, ?wrote);
 }
 
-# append one supported target name when it belongs to the requested split side
 fun emit_artifact_target(b: *Buf, reg: *target.TargetRegistry, os_name: *u8,
                          arch_id: u32, windows: bool, wrote: *bool) {
     val is_windows: bool = str_equals(os_name::str, "windows");
@@ -329,69 +1003,13 @@ fun emit_artifact_target(b: *Buf, reg: *target.TargetRegistry, os_name: *u8,
     @wrote = true;
 }
 
-# write a null-terminated source template to `path`
-# ---
-# path:     destination path
-# template: null-terminated template bytes
-# ret:      true on success, false on a write error
-fun write_source(path: *u8, template: *u8) bool {
-    val res_write: O.Option[str] = fs.write_bytes(path, template, str_len(template), FILE_MODE);
-    ret !O.is_some[str](res_write);
+val BIN_SOURCE_TEMPLATE: str = "use std.runtime;\nuse print: std.print;\n\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i64 {\n    print.println(\"Hello, World!\");\n    ret 0;\n}\n";
+
+fun source_template(is_lib: bool) *u8 {
+    if (is_lib) { ret ""; }
+    ret BIN_SOURCE_TEMPLATE::*u8;
 }
 
-# the starter binary entry module for a default `mach init`
-#
-# A standard-library hello world wired through `std.runtime` and `std.print`.
-# ---
-# ret: the null-terminated module source
-fun main_template() *u8 {
-    ret "use std.runtime;\nuse print: std.print;\n\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i64 {\n    print.println(\"Hello, World!\");\n    ret 0;\n}\n";
-}
-
-# the starter library root module for `mach init --lib`
-#
-# Library builds stop at per-module objects, so the root needs no entry point.
-# ---
-# ret: the null-terminated module source
-fun lib_template() *u8 {
-    ret "# library root module.\n";
-}
-
-# create `path` as a directory if absent, reporting a labeled error on failure
-# ---
-# path:  directory to create
-# label: human name of the directory, used in the error message
-# ret:   true on success
-fun dir_ensure(path: *u8, label: *u8) bool {
-    if (util.ensure_dir(path)) { ret true; }
-    print.eprint("error: failed to create the ");
-    print.eprint(label);
-    print.eprint(" directory\n");
-    ret false;
-}
-
-# report and refuse when `path` already exists without `--force`
-# ---
-# path:  path to test
-# label: human name of the file, used in the error message
-# force: whether `--force` was given
-# ret:   true if the init must abort (the path exists and force is unset)
-fun exists_refused(path: *u8, label: *u8, force: bool) bool {
-    if (!fs.exists(path) || force) { ret false; }
-    print.eprint("error: ");
-    print.eprint(label);
-    print.eprint(" already exists (use --force to overwrite)\n");
-    ret true;
-}
-
-# append a null-terminated `s` to the buffer, marking overflow
-#
-# Once an append would exceed capacity the buffer is marked failed (`ok` set
-# false) and every later append is a no-op, so a truncated manifest is never
-# written.
-# ---
-# b: the buffer to append to
-# s: null-terminated bytes to append
 fun buf_put(b: *Buf, s: *u8) {
     if (!b.ok) { ret; }
     val n: usize = str_len(s);
@@ -407,51 +1025,20 @@ fun buf_put(b: *Buf, s: *u8) {
     b.len = b.len + n;
 }
 
-# the trailing path component of `path`, after the final `/`
-#
-# Returns the whole string when there is no separator. The result is a view into
-# `path`, not a copy.
-# ---
-# path: null-terminated path
-# ret:  pointer to the base-name component within `path`
-fun base_name(path: *u8) *u8 {
-    val n: usize = str_len(path);
-    var start: usize = 0;
-    var i: usize = 0;
-    for (i < n) {
-        if (path[i] == '/') { start = i + 1; }
-        i = i + 1;
-    }
-    ret ?path[start];
+fun default_project_id(a: *A.Allocator, cwd: str, dir: str) R.Result[str, str] {
+    val abs_r: R.Result[str, str] = path.resolve(a, cwd, dir);
+    if (R.is_err[str, str](abs_r)) { ret abs_r; }
+    val clean_r: R.Result[str, str] = path.clean(a, R.unwrap_ok[str, str](abs_r));
+    if (R.is_err[str, str](clean_r)) { ret clean_r; }
+    ret R.ok[str, str](path.filename(R.unwrap_ok[str, str](clean_r)));
 }
 
-# emit the scaffold's `[target.*]` blocks for the host isa, one per operating
-# system whose native convention composes, in the linux/windows/darwin order the
-# scaffold has always used
-#
-# An os with no composable tuple on the host isa (e.g. windows on a non-x86_64
-# host) is skipped rather than emitting a target that cannot build.
-# ---
-# b:       the manifest buffer to append to
-# reg:     the registered target registry
-# arch_id: the host architecture id (one of isa.ARCH_*)
 fun emit_targets(b: *Buf, reg: *target.TargetRegistry, arch_id: u32) {
     emit_target(b, reg, "linux",   arch_id);
     emit_target(b, reg, "windows", arch_id);
     emit_target(b, reg, "darwin",  arch_id);
 }
 
-# emit one `[target.<os>-<isa>]` block when the os has a composable native
-# convention on `arch_id`; emit nothing (skip the block) otherwise
-#
-# The block names follow the `<os>-<isa>` convention the root manifest uses, and
-# the os and isa names are taken verbatim so the block name always matches the
-# fields. The isa name derives from `arch_id` (the single arch source of truth).
-# ---
-# b:        the manifest buffer to append to
-# reg:      the registered target registry
-# os_name:  the operating-system name, taken verbatim into the block
-# arch_id:  the host architecture id (one of isa.ARCH_*)
 fun emit_target(b: *Buf, reg: *target.TargetRegistry, os_name: *u8, arch_id: u32) {
     val abi_name: str = scaffold_abi(reg, os_name::str, arch_id);
     if (str_empty(abi_name)) { ret; }
@@ -473,21 +1060,6 @@ fun emit_target(b: *Buf, reg: *target.TargetRegistry, os_name: *u8, arch_id: u32
     buf_put(b, "\n");
 }
 
-# the calling convention `mach init` scaffolds for operating system `os_name` on
-# architecture `arch_id`, or "" to skip the target block
-#
-# Reads the os's self-declared native convention (`tos.native_abi_for`) and keeps
-# it only when the full (isa, os, abi) tuple composes end-to-end through the same
-# capability path the driver uses (`target.select`), so a scaffolded block never
-# names a tuple that cannot build. No os/arch->abi literal table lives here: the
-# convention is the os vtable's own datum and the composition gate is the shared
-# predicate.
-# ---
-# reg:     the registered target registry
-# os_name: the operating-system name ("linux", "windows", "darwin")
-# arch_id: the host architecture id (one of isa.ARCH_*)
-# ret:     the abi name to scaffold, or "" when the os has no composable native
-#          convention for that architecture
 fun scaffold_abi(reg: *target.TargetRegistry, os_name: str, arch_id: u32) str {
     val os_opt: O.Option[*tos.OsVTable] = tos.lookup(?reg.os, os_name);
     if (O.is_none[*tos.OsVTable](os_opt)) { ret ""; }
@@ -497,11 +1069,10 @@ fun scaffold_abi(reg: *target.TargetRegistry, os_name: str, arch_id: u32) str {
     ret abi_name;
 }
 
-# a binary scaffold writes extension-correct artifacts on x86_64, while a
-# library remains one all-target artifact
 test "mach.cli.cmd.init.emit_artifacts:extension_split" {
     var reg: target.TargetRegistry = target.registry_init();
-    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    fin { target.registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](driver.setup_registry(?reg))) { ret 1; }
 
     var bin_storage: [1024]u8;
     var bin: Buf;
@@ -509,7 +1080,7 @@ test "mach.cli.cmd.init.emit_artifacts:extension_split" {
     emit_artifacts(?bin, ?reg, isa.ARCH_X86_64, "demo", false);
     if (!bin.ok || bin.len >= bin.cap) { ret 1; }
     bin.ptr[bin.len] = 0;
-    val want_bin: str = "[artifact.demo]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/demo\"\ntargets = [\"linux-x86_64\", \"darwin-x86_64\"]\nlink = []\nneed = []\n\n[artifact.demo-windows]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/demo.exe\"\ntargets = [\"windows-x86_64\"]\nlink = []\nneed = []\n\n";
+    val want_bin: str = "[artifact.demo]\nkind = \"bin\"\nentry = \"root.mach\"\nout = \"bin/demo\"\ntargets = [\"linux-x86_64\", \"darwin-x86_64\"]\nlink = []\nneed = []\n\n[artifact.demo-windows]\nkind = \"bin\"\nentry = \"root.mach\"\nout = \"bin/demo.exe\"\ntargets = [\"windows-x86_64\"]\nlink = [\"kernel32\"]\nneed = []\n\n";
     if (!str_equals(bin.ptr::str, want_bin)) { ret 1; }
 
     var lib_storage: [512]u8;
@@ -518,54 +1089,766 @@ test "mach.cli.cmd.init.emit_artifacts:extension_split" {
     emit_artifacts(?lib, ?reg, isa.ARCH_X86_64, "demo", true);
     if (!lib.ok || lib.len >= lib.cap) { ret 1; }
     lib.ptr[lib.len] = 0;
-    val want_lib: str = "[artifact.demo]\nkind = \"static\"\nentry = \"lib.mach\"\nout = \"lib/demo\"\ntargets = [\"*\"]\nlink = []\nneed = []\n\n";
+    val want_lib: str = "[artifact.demo]\nkind = \"static\"\nentry = \"lib.mach\"\nout = \"lib/libdemo.a\"\ntargets = [\"*\"]\nlink = []\nneed = []\n\n";
     if (!str_equals(lib.ptr::str, want_lib)) { ret 1; }
     ret 0;
 }
 
-# on an x86_64 host the derived conventions reproduce today's scaffold exactly:
-# sysv64 for linux and darwin, win64 for windows. this is the byte-identical pin
+fun t_manifest_from_text(a: *A.Allocator, itn: *intern.Interner, text: str) O.Option[manifest.Manifest] {
+    val tr: R.Result[toml.Table, str] = toml.parse(a, text);
+    if (R.is_err[toml.Table, str](tr)) { ret O.none[manifest.Manifest](); }
+    var t: toml.Table = R.unwrap_ok[toml.Table, str](tr);
+    val mr: R.Result[manifest.Manifest, str] = manifest.parse(a, itn, ?t, true);
+    toml.dnit(a, ?t);
+    if (R.is_err[manifest.Manifest, str](mr)) { ret O.none[manifest.Manifest](); }
+    ret O.some[manifest.Manifest](R.unwrap_ok[manifest.Manifest, str](mr));
+}
+
+fun t_scaffold_plan_units(a: *A.Allocator, id: *u8, is_lib: bool, arch_id: u32) i64 {
+    val text_r: R.Result[str, str] = build_manifest_text(a, id, is_lib, arch_id);
+    if (R.is_err[str, str](text_r)) { ret -1; }
+    val text: str = R.unwrap_ok[str, str](text_r);
+
+    var itn: intern.Interner = intern.init(a);
+    val opt_m: O.Option[manifest.Manifest] = t_manifest_from_text(a, ?itn, text);
+    if (O.is_none[manifest.Manifest](opt_m)) { ret -1; }
+    var m: manifest.Manifest = O.unwrap[manifest.Manifest](opt_m);
+
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](driver.setup_registry(?reg))) { ret -1; }
+
+    var rq: request.BuildRequest = request.defaults();
+    rq.project_root = "/scaftest";
+    rq.all_targets  = true;
+
+    val pr: R.Result[plan.BuildPlan, outcome.Fail] = plan.plan(a, ?itn, ?reg, ?m, rq);
+    if (R.is_err[plan.BuildPlan, outcome.Fail](pr)) { ret -1; }
+    val bp: plan.BuildPlan = R.unwrap_ok[plan.BuildPlan, outcome.Fail](pr);
+    ret bp.units.len::i64;
+}
+
+test "mach.cli.cmd.init.build_manifest_text:bin_scaffold_parses_and_plans_for_every_host_arch" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+
+    if (t_scaffold_plan_units(?alloc, "scaftest", false, isa.ARCH_X86_64)  != 3) { ret 1; }
+    if (t_scaffold_plan_units(?alloc, "scaftest", false, isa.ARCH_AARCH64) != 2) { ret 1; }
+    if (t_scaffold_plan_units(?alloc, "scaftest", false, isa.ARCH_RISCV64) != 1) { ret 1; }
+    ret 0;
+}
+
+test "mach.cli.cmd.init.build_manifest_text:lib_scaffold_parses_and_plans_for_every_host_arch" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+
+    if (t_scaffold_plan_units(?alloc, "scaftest", true, isa.ARCH_X86_64)  != 3) { ret 1; }
+    if (t_scaffold_plan_units(?alloc, "scaftest", true, isa.ARCH_AARCH64) != 2) { ret 1; }
+    if (t_scaffold_plan_units(?alloc, "scaftest", true, isa.ARCH_RISCV64) != 1) { ret 1; }
+    ret 0;
+}
+
+test "mach.cli.cmd.init.source_template:lib_is_empty_bin_declares_std_runtime" {
+    if (!str_empty(source_template(true)::str)) { ret 1; }
+
+    val bin: str = source_template(false)::str;
+    if (str_empty(bin)) { ret 1; }
+    if (!str_contains(bin, "std.runtime")) { ret 1; }
+    if (str_contains(bin, "_start")) { ret 1; }
+    if (str_contains(bin, "mainCRTStartup")) { ret 1; }
+    if (str_contains(bin, "ExitProcess")) { ret 1; }
+    if (str_contains(bin, "asm ")) { ret 1; }
+    ret 0;
+}
+
+test "mach.cli.cmd.init.build_manifest_text:declares_dep_std" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+
+    val text_r: R.Result[str, str] = build_manifest_text(?alloc, "scaftest", false, isa.ARCH_X86_64);
+    if (R.is_err[str, str](text_r)) { ret 1; }
+    val text: str = R.unwrap_ok[str, str](text_r);
+    if (!str_contains(text, "[dep.std]")) { ret 1; }
+
+    var itn: intern.Interner = intern.init(?alloc);
+    val opt_m: O.Option[manifest.Manifest] = t_manifest_from_text(?alloc, ?itn, text);
+    if (O.is_none[manifest.Manifest](opt_m)) { ret 1; }
+    val m: manifest.Manifest = O.unwrap[manifest.Manifest](opt_m);
+
+    if (m.dep_count != 1) { ret 1; }
+    val name_opt: O.Option[str] = intern.lookup(?itn, m.deps[0].name);
+    if (O.is_none[str](name_opt) || !str_equals(O.unwrap[str](name_opt), "std")) { ret 1; }
+    val git_opt: O.Option[str] = intern.lookup(?itn, m.deps[0].git);
+    if (O.is_none[str](git_opt) || !str_equals(O.unwrap[str](git_opt), "https://github.com/briar-systems/mach-std")) { ret 1; }
+    val ref_opt: O.Option[str] = intern.lookup(?itn, m.deps[0].ref);
+    if (O.is_none[str](ref_opt) || !str_equals(O.unwrap[str](ref_opt), "branch/main")) { ret 1; }
+    ret 0;
+}
+
+fun t_source_parses(alloc: *A.Allocator, text: str) bool {
+    val sr: R.Result[session.Session, str] = session.init(alloc);
+    if (R.is_err[session.Session, str](sr)) { ret false; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var es: editor.EditorSession = editor.init(?s);
+
+    val open_r: R.Result[source.FileId, str] = editor.open(?es, "/mach-init-standalone-parse-check/entry.mach", text);
+    if (R.is_err[source.FileId, str](open_r)) { editor.dnit(?es); session.dnit(?s); ret false; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](open_r);
+
+    val parse_r: R.Result[*ast.Ast, str] = editor.parse(?es, fid);
+    var ok: bool = true;
+    if (R.is_err[*ast.Ast, str](parse_r)) { ok = false; }
+
+    val diag_r: R.Result[*diagnostic.DiagnosticStore, str] = editor.diagnostics(?es, fid);
+    if (R.is_err[*diagnostic.DiagnosticStore, str](diag_r)) { ok = false; }
+    or {
+        if (diagnostic.has_errors(R.unwrap_ok[*diagnostic.DiagnosticStore, str](diag_r))) { ok = false; }
+    }
+
+    editor.dnit(?es);
+    session.dnit(?s);
+    ret ok;
+}
+
+fun t_entry_parses(alloc: *A.Allocator, dest: str, entry_rel: str) bool {
+    val p_r: R.Result[str, str] = path.join(alloc, dest, entry_rel);
+    if (R.is_err[str, str](p_r)) { ret false; }
+    val p: str = R.unwrap_ok[str, str](p_r);
+    val text_opt: O.Option[str] = t_read_file(alloc, p);
+    str_free(alloc, p);
+    if (O.is_none[str](text_opt)) { ret false; }
+    ret t_source_parses(alloc, O.unwrap[str](text_opt));
+}
+
+test "mach.cli.cmd.init.run_typed:the_scaffolded_binary_source_parses" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_init_e2e_bin");
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    val dest_r: R.Result[str, str] = path.join(?alloc, root, "proj");
+    val dest: str = R.unwrap_ok[str, str](dest_r);
+
+    var argv: [6]*u8;
+    argv[0] = "mach"; argv[1] = "init"; argv[2] = dest::*u8; argv[3] = "--name"; argv[4] = "proj"::*u8; argv[5] = "--no-deps"::*u8;
+    val rc: i64 = t_init(6, ?argv[0]);
+
+    var bad: i32 = 0;
+    if (rc != 0) { bad = 1; }
+    or (!t_entry_parses(?alloc, dest, "src/root.mach")) { bad = 1; }
+
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    ret bad;
+}
+
+test "mach.cli.cmd.init.run_typed:the_scaffolded_library_source_parses" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_init_e2e_lib");
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    val dest_r: R.Result[str, str] = path.join(?alloc, root, "proj");
+    val dest: str = R.unwrap_ok[str, str](dest_r);
+
+    var argv: [7]*u8;
+    argv[0] = "mach"; argv[1] = "init"; argv[2] = dest::*u8; argv[3] = "--name"; argv[4] = "proj"::*u8; argv[5] = "--lib"::*u8; argv[6] = "--no-deps"::*u8;
+    val rc: i64 = t_init(7, ?argv[0]);
+
+    var bad: i32 = 0;
+    if (rc != 0) { bad = 1; }
+    or (!t_entry_parses(?alloc, dest, "src/lib.mach")) { bad = 1; }
+
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    ret bad;
+}
+
 test "mach.cli.cmd.init.scaffold_abi:x86_64_reproduces_today" {
     var reg: target.TargetRegistry = target.registry_init();
-    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    fin { target.registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](driver.setup_registry(?reg))) { ret 1; }
     if (!str_equals(scaffold_abi(?reg, "linux",   isa.ARCH_X86_64), "sysv64")) { ret 1; }
     if (!str_equals(scaffold_abi(?reg, "windows", isa.ARCH_X86_64), "win64"))  { ret 1; }
     if (!str_equals(scaffold_abi(?reg, "darwin",  isa.ARCH_X86_64), "sysv64")) { ret 1; }
     ret 0;
 }
 
-# on an aarch64 host linux and darwin derive aapcs64; windows declares no aarch64
-# convention, so its block is skipped ("")
 test "mach.cli.cmd.init.scaffold_abi:aarch64_derives_aapcs64_skips_windows" {
     var reg: target.TargetRegistry = target.registry_init();
-    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    fin { target.registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](driver.setup_registry(?reg))) { ret 1; }
     if (!str_equals(scaffold_abi(?reg, "linux",  isa.ARCH_AARCH64), "aapcs64")) { ret 1; }
     if (!str_equals(scaffold_abi(?reg, "darwin", isa.ARCH_AARCH64), "aapcs64")) { ret 1; }
     if (!str_empty(scaffold_abi(?reg, "windows", isa.ARCH_AARCH64)))            { ret 1; }
     ret 0;
 }
 
-# on a riscv64 host linux derives lp64d; windows and darwin declare no riscv64
-# convention, so both blocks are skipped ("")
 test "mach.cli.cmd.init.scaffold_abi:riscv64_derives_lp64d_skips_windows_darwin" {
     var reg: target.TargetRegistry = target.registry_init();
-    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    fin { target.registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](driver.setup_registry(?reg))) { ret 1; }
     if (!str_equals(scaffold_abi(?reg, "linux", isa.ARCH_RISCV64), "lp64d")) { ret 1; }
     if (!str_empty(scaffold_abi(?reg, "windows", isa.ARCH_RISCV64)))        { ret 1; }
     if (!str_empty(scaffold_abi(?reg, "darwin",  isa.ARCH_RISCV64)))        { ret 1; }
     ret 0;
 }
 
-# every supported host arch scaffolds at least a linux target block: linux runs on
-# all three, so each must derive a composable convention. this pins registry-data
-# completeness - it fails if an os impl loses its native_abi wiring or an isa loses
-# codegen - which the per-block select gate alone does not guarantee (a scaffold
-# that skipped every block would still "pass" that gate)
 test "mach.cli.cmd.init.scaffold_abi:every_host_arch_scaffolds_linux" {
     var reg: target.TargetRegistry = target.registry_init();
-    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    fin { target.registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](driver.setup_registry(?reg))) { ret 1; }
     if (str_empty(scaffold_abi(?reg, "linux", isa.ARCH_X86_64)))  { ret 1; }
     if (str_empty(scaffold_abi(?reg, "linux", isa.ARCH_AARCH64))) { ret 1; }
     if (str_empty(scaffold_abi(?reg, "linux", isa.ARCH_RISCV64))) { ret 1; }
     ret 0;
+}
+
+fun t_scratch_dir(alloc: *A.Allocator, prefix: str) R.Result[str, str] {
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, prefix);
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret R.err[str, str](R.unwrap_err[fs.TempFile, str](tf_r)); }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val root_r: R.Result[str, str] = str_copy_slice(alloc, fs.temp_path(?tf), 0, str_len(fs.temp_path(?tf)));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[str, str](root_r)) { ret root_r; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    if (O.is_some[str](fs.create_dir(root, 0o755))) { ret R.err[str, str]("cannot create scratch root"); }
+    ret R.ok[str, str](root);
+}
+
+fun t_read_file(alloc: *A.Allocator, path: str) O.Option[str] {
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(alloc, path);
+    if (R.is_err[Vector[u8], str](rb)) { ret O.none[str](); }
+    var v: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+    val rr: R.Result[str, str] = str_copy_slice(alloc, v.data::str, 0, v.len);
+    vector.dnit[u8](?v);
+    if (R.is_err[str, str](rr)) { ret O.none[str](); }
+    ret O.some[str](R.unwrap_ok[str, str](rr));
+}
+
+test "mach.cli.cmd.init.split_for_discovery:relative_stays_under_cwd_absolute_uses_filesystem_root" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var bad: i32 = 0;
+
+    val rel_r: R.Result[DestSplit, str] = split_for_discovery(?alloc, "/home/x", "myproj");
+    if (R.is_err[DestSplit, str](rel_r)) { bad = 1; }
+    or {
+        val ds: DestSplit = R.unwrap_ok[DestSplit, str](rel_r);
+        if (!str_equals(ds.root, "/home/x") || !str_equals(ds.dest_rel, "myproj")) { bad = 1; }
+    }
+
+    val dotrel_r: R.Result[DestSplit, str] = split_for_discovery(?alloc, "/home/x", "./myproj");
+    if (R.is_err[DestSplit, str](dotrel_r)) { bad = 1; }
+    or {
+        val ds: DestSplit = R.unwrap_ok[DestSplit, str](dotrel_r);
+        if (!str_equals(ds.dest_rel, "myproj")) { bad = 1; }
+    }
+
+    val abs_r: R.Result[DestSplit, str] = split_for_discovery(?alloc, "/home/x", "/tmp/other/myproj");
+    if (R.is_err[DestSplit, str](abs_r)) { bad = 1; }
+    or {
+        val ds: DestSplit = R.unwrap_ok[DestSplit, str](abs_r);
+        if (!str_equals(ds.root, "/") || !str_equals(ds.dest_rel, "tmp/other/myproj")) { bad = 1; }
+    }
+
+    val dot_r: R.Result[DestSplit, str] = split_for_discovery(?alloc, "/home/x", ".");
+    if (R.is_err[DestSplit, str](dot_r)) { bad = 1; }
+    or {
+        val ds: DestSplit = R.unwrap_ok[DestSplit, str](dot_r);
+        if (!str_empty(ds.dest_rel) && !str_equals(ds.dest_rel, ".")) { bad = 1; }
+    }
+
+    ret bad;
+}
+
+test "mach.cli.cmd.init.default_project_id:is_the_final_component_of_the_resolved_destination" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var bad: i32 = 0;
+
+    var dirs: [6]str;
+    dirs[0] = "p1"; dirs[1] = "p1/"; dirs[2] = "./p1"; dirs[3] = "/tmp/other/p1"; dirs[4] = "."; dirs[5] = "a/../b";
+    var want: [6]str;
+    want[0] = "p1"; want[1] = "p1"; want[2] = "p1"; want[3] = "p1"; want[4] = "x"; want[5] = "b";
+    var i: usize = 0;
+    for (i < 6) {
+        val r: R.Result[str, str] = default_project_id(?alloc, "/home/x", dirs[i]);
+        if (R.is_err[str, str](r) || !str_equals(R.unwrap_ok[str, str](r), want[i])) { bad = 1; }
+        i = i + 1;
+    }
+    ret bad;
+}
+
+test "mach.cli.cmd.init.run_typed:an_absolute_or_slash_terminated_destination_names_the_project_after_its_last_component" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_init_absid");
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    var bad: i32 = 0;
+
+    val abs_dest: str = R.unwrap_ok[str, str](path.join(?alloc, root, "absproj"));
+    var argv: [4]*u8;
+    argv[0] = "mach"; argv[1] = "init"; argv[2] = abs_dest::*u8; argv[3] = "--no-deps"::*u8;
+    if (t_init(4, ?argv[0]) != 0) { bad = 1; }
+    val abs_toml: str = R.unwrap_ok[str, str](path.join(?alloc, abs_dest, "mach.toml"));
+    val abs_text: R.Result[str, str] = fs.read_string(?alloc, abs_toml);
+    if (R.is_err[str, str](abs_text) || !str_contains(R.unwrap_ok[str, str](abs_text), "id = \"absproj\"")) { bad = 1; }
+
+    val slash_dest: str = R.unwrap_ok[str, str](path.join(?alloc, root, "slashproj/"));
+    argv[2] = slash_dest::*u8;
+    if (t_init(4, ?argv[0]) != 0) { bad = 1; }
+    val slash_toml: str = R.unwrap_ok[str, str](path.join(?alloc, slash_dest, "mach.toml"));
+    val slash_text: R.Result[str, str] = fs.read_string(?alloc, slash_toml);
+    if (R.is_err[str, str](slash_text) || !str_contains(R.unwrap_ok[str, str](slash_text), "id = \"slashproj\"")) { bad = 1; }
+
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    ret bad;
+}
+
+test "mach.cli.cmd.init.run_typed:publishes_a_wholly_absent_destination_atomically" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_init_absent");
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    val dest_r: R.Result[str, str] = path.join(?alloc, root, "proj");
+    val dest: str = R.unwrap_ok[str, str](dest_r);
+
+    var argv: [6]*u8;
+    argv[0] = "mach"; argv[1] = "init"; argv[2] = dest::*u8; argv[3] = "--name"; argv[4] = "proj"::*u8; argv[5] = "--no-deps"::*u8;
+
+    val rc: i64 = t_init(6, ?argv[0]);
+
+    var bad: i32 = 0;
+    if (rc != 0) { bad = 1; }
+    val toml_r: R.Result[str, str] = path.join(?alloc, dest, "mach.toml");
+    if (!fs.exists(R.unwrap_ok[str, str](toml_r))) { bad = 1; }
+    val src_r: R.Result[str, str] = path.join(?alloc, dest, "src/root.mach");
+    if (!fs.exists(R.unwrap_ok[str, str](src_r))) { bad = 1; }
+
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    ret bad;
+}
+
+test "mach.cli.cmd.init.run_typed:publishes_a_nested_absent_destination_in_one_shot" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_init_nested");
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    val dest_r: R.Result[str, str] = path.join(?alloc, root, "a/b/proj");
+    val dest: str = R.unwrap_ok[str, str](dest_r);
+    val mid_r: R.Result[str, str] = path.join(?alloc, root, "a");
+    val mid: str = R.unwrap_ok[str, str](mid_r);
+
+    var argv: [6]*u8;
+    argv[0] = "mach"; argv[1] = "init"; argv[2] = dest::*u8; argv[3] = "--name"; argv[4] = "nested"::*u8; argv[5] = "--no-deps"::*u8;
+    if (fs.exists(mid)) { fs.remove_all(?alloc, root); str_free(?alloc, root); ret 1; }
+    val rc: i64 = t_init(6, ?argv[0]);
+
+    var bad: i32 = 0;
+    if (rc != 0) { bad = 1; }
+    val toml_r: R.Result[str, str] = path.join(?alloc, dest, "mach.toml");
+    if (!fs.exists(R.unwrap_ok[str, str](toml_r))) { bad = 1; }
+
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    ret bad;
+}
+
+test "mach.cli.cmd.init.run_typed:a_destination_that_already_exists_before_the_call_routes_to_the_existing_branch" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_init_preexisting");
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    val dest_r: R.Result[str, str] = path.join(?alloc, root, "proj");
+    val dest: str = R.unwrap_ok[str, str](dest_r);
+    if (O.is_some[str](fs.create_dir(dest, 0o755))) { fs.remove_all(?alloc, root); str_free(?alloc, root); ret 1; }
+    val sentinel_r: R.Result[str, str] = path.join(?alloc, dest, "sentinel.txt");
+    val sentinel: str = R.unwrap_ok[str, str](sentinel_r);
+    if (O.is_some[str](fs.write_bytes(sentinel, "mine"::*u8, 4::usize, 0o644))) { fs.remove_all(?alloc, root); str_free(?alloc, root); ret 1; }
+
+    var argv: [6]*u8;
+    argv[0] = "mach"; argv[1] = "init"; argv[2] = dest::*u8; argv[3] = "--name"; argv[4] = "proj"::*u8; argv[5] = "--no-deps"::*u8;
+
+    val rc: i64 = t_init(6, ?argv[0]);
+
+    var bad: i32 = 0;
+    if (rc != 0) { bad = 1; }
+    if (!fs.exists(sentinel)) { bad = 1; }
+    val toml_r: R.Result[str, str] = path.join(?alloc, dest, "mach.toml");
+    if (!fs.exists(R.unwrap_ok[str, str](toml_r))) { bad = 1; }
+
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    ret bad;
+}
+
+test "mach.cli.cmd.init.run_typed:rejects_a_destination_blocked_by_a_file_ancestor" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_init_blocked");
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    val blocker_r: R.Result[str, str] = path.join(?alloc, root, "blocker");
+    val blocker: str = R.unwrap_ok[str, str](blocker_r);
+    if (O.is_some[str](fs.write_bytes(blocker, "x"::*u8, 1::usize, 0o644))) { fs.remove_all(?alloc, root); str_free(?alloc, root); ret 1; }
+    val dest_r: R.Result[str, str] = path.join(?alloc, root, "blocker/proj");
+    val dest: str = R.unwrap_ok[str, str](dest_r);
+
+    var argv: [5]*u8;
+    argv[0] = "mach"; argv[1] = "init"; argv[2] = dest::*u8; argv[3] = "--name"; argv[4] = "proj"::*u8;
+
+    val rc: i64 = t_init(5, ?argv[0]);
+
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    if (rc == 0) { ret 1; }
+    ret 0;
+}
+
+test "mach.cli.cmd.init.run_typed:existing_empty_directory_publishes_a_project_into_it" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_init_existing");
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var argv: [6]*u8;
+    argv[0] = "mach"; argv[1] = "init"; argv[2] = root::*u8; argv[3] = "--name"; argv[4] = "existingproj"::*u8; argv[5] = "--no-deps"::*u8;
+
+    val rc: i64 = t_init(6, ?argv[0]);
+
+    var bad: i32 = 0;
+    if (rc != 0) { bad = 1; }
+    val toml_r: R.Result[str, str] = path.join(?alloc, root, "mach.toml");
+    if (!fs.exists(R.unwrap_ok[str, str](toml_r))) { bad = 1; }
+    val src_r: R.Result[str, str] = path.join(?alloc, root, "src/root.mach");
+    if (!fs.exists(R.unwrap_ok[str, str](src_r))) { bad = 1; }
+
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    ret bad;
+}
+
+test "mach.cli.cmd.init.run_typed:refuses_an_owned_output_without_force_and_leaves_it_byte_identical" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_init_refuse");
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    var bad: i32 = 0;
+
+    val toml_r: R.Result[str, str] = path.join(?alloc, root, "mach.toml");
+    val toml: str = R.unwrap_ok[str, str](toml_r);
+    if (O.is_some[str](fs.write_bytes(toml, "mine"::*u8, 4::usize, 0o644))) { bad = 1; }
+
+    var argv: [5]*u8;
+    argv[0] = "mach"; argv[1] = "init"; argv[2] = root::*u8; argv[3] = "--name"; argv[4] = "refused"::*u8;
+
+    val rc: i64 = t_init(5, ?argv[0]);
+    if (rc != 1) { bad = 1; }
+    val kept: O.Option[str] = t_read_file(?alloc, toml);
+    if (O.is_none[str](kept) || !str_equals(O.unwrap[str](kept), "mine")) { bad = 1; }
+    val src_r: R.Result[str, str] = path.join(?alloc, root, "src");
+    if (fs.exists(R.unwrap_ok[str, str](src_r))) { bad = 1; }
+
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    ret bad;
+}
+
+test "mach.cli.cmd.init.run_typed:force_replaces_owned_outputs_and_leaves_an_unowned_neighbor_byte_identical" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_init_force");
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    var bad: i32 = 0;
+
+    val toml_r: R.Result[str, str] = path.join(?alloc, root, "mach.toml");
+    val toml: str = R.unwrap_ok[str, str](toml_r);
+    if (O.is_some[str](fs.write_bytes(toml, "stale"::*u8, 5::usize, 0o644))) { bad = 1; }
+    val src_dir_r: R.Result[str, str] = path.join(?alloc, root, "src");
+    if (O.is_some[str](fs.create_dir(R.unwrap_ok[str, str](src_dir_r), 0o755))) { bad = 1; }
+    val entry_r: R.Result[str, str] = path.join(?alloc, root, "src/root.mach");
+    val entry: str = R.unwrap_ok[str, str](entry_r);
+    if (O.is_some[str](fs.write_bytes(entry, "stale-source"::*u8, 12::usize, 0o644))) { bad = 1; }
+    val neighbor_r: R.Result[str, str] = path.join(?alloc, root, "src/mine.mach");
+    val neighbor: str = R.unwrap_ok[str, str](neighbor_r);
+    if (O.is_some[str](fs.write_bytes(neighbor, "user-owned"::*u8, 10::usize, 0o644))) { bad = 1; }
+    val readme_r: R.Result[str, str] = path.join(?alloc, root, "README.md");
+    val readme: str = R.unwrap_ok[str, str](readme_r);
+    if (O.is_some[str](fs.write_bytes(readme, "hello"::*u8, 5::usize, 0o644))) { bad = 1; }
+
+    var argv: [7]*u8;
+    argv[0] = "mach"; argv[1] = "init"; argv[2] = root::*u8; argv[3] = "--name"; argv[4] = "forced"::*u8; argv[5] = "--force"::*u8; argv[6] = "--no-deps"::*u8;
+
+    val rc: i64 = t_init(7, ?argv[0]);
+    if (rc != 0) { bad = 1; }
+
+    val new_toml: O.Option[str] = t_read_file(?alloc, toml);
+    if (O.is_none[str](new_toml) || str_equals(O.unwrap[str](new_toml), "stale")) { bad = 1; }
+    val new_entry: O.Option[str] = t_read_file(?alloc, entry);
+    if (O.is_none[str](new_entry) || str_equals(O.unwrap[str](new_entry), "stale-source")) { bad = 1; }
+    val kept_neighbor: O.Option[str] = t_read_file(?alloc, neighbor);
+    if (O.is_none[str](kept_neighbor) || !str_equals(O.unwrap[str](kept_neighbor), "user-owned")) { bad = 1; }
+    val kept_readme: O.Option[str] = t_read_file(?alloc, readme);
+    if (O.is_none[str](kept_readme) || !str_equals(O.unwrap[str](kept_readme), "hello")) { bad = 1; }
+
+    var jname: str = sfmt_join(?alloc, root, JOURNAL_LEAF);
+    if (fs.exists(jname)) { bad = 1; }
+    var bname: str = sfmt_join(?alloc, root, BACKUP_MANIFEST);
+    if (fs.exists(bname)) { bad = 1; }
+
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    ret bad;
+}
+
+fun sfmt_join(alloc: *A.Allocator, root: str, leaf: str) str {
+    val r: R.Result[str, str] = path.join(alloc, root, leaf);
+    if (R.is_err[str, str](r)) { ret ""; }
+    ret R.unwrap_ok[str, str](r);
+}
+
+test "mach.cli.cmd.init.run_typed:refuses_a_non_regular_owned_output" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_init_nonregular");
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    var bad: i32 = 0;
+
+    val toml_r: R.Result[str, str] = path.join(?alloc, root, "mach.toml");
+    if (O.is_some[str](fs.create_dir(R.unwrap_ok[str, str](toml_r), 0o755))) { bad = 1; }
+
+    var argv: [6]*u8;
+    argv[0] = "mach"; argv[1] = "init"; argv[2] = root::*u8; argv[3] = "--name"; argv[4] = "x"::*u8; argv[5] = "--force"::*u8;
+
+    val rc: i64 = t_init(6, ?argv[0]);
+    if (rc == 0) { bad = 1; }
+    if (!fs.exists(R.unwrap_ok[str, str](toml_r))) { bad = 1; }
+
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    ret bad;
+}
+
+test "mach.cli.cmd.init.recover_existing:mid_swap_backup_restores_the_original_owned_output" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_init_recover_rollback");
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    var bad: i32 = 0;
+
+    val toml_r: R.Result[str, str] = path.join(?alloc, root, "mach.toml");
+    val toml: str = R.unwrap_ok[str, str](toml_r);
+    if (O.is_some[str](fs.write_bytes(toml, "original"::*u8, 8::usize, 0o644))) { bad = 1; }
+
+    val cap_r: R.Result[txn.Root, str] = open_root(root, "");
+    var cap: txn.Root = R.unwrap_ok[txn.Root, str](cap_r);
+
+    var prior: txn.EntryProbe = R.unwrap_ok[txn.EntryProbe, str](probe_entry(?cap, "mach.toml"));
+    var empty_entry: txn.EntryProbe;
+    var zero_id: txn.Identity;
+    val root_id: txn.Identity = R.unwrap_ok[txn.Identity, str](root_identity_of(?cap));
+
+    val prep_r: R.Result[txn.Transaction, str] = stage_absent(?alloc, ?cap, "mach.toml", "fresh"::*u8, 5::usize);
+    var pf: txn.Transaction = R.unwrap_ok[txn.Transaction, str](prep_r);
+    val new_id: txn.Identity = R.unwrap_ok[txn.Identity, str](staged_identity_of(?pf));
+
+    if (R.is_err[R.Void, str](journal_create(?alloc, ?cap, root_id, prior, new_id, empty_entry, zero_id, false, false))) { bad = 1; }
+
+    if (O.is_some[str](rename_entry(?cap, "mach.toml", BACKUP_MANIFEST))) { bad = 1; }
+    txn.abort(?pf);
+
+    val rec_r: R.Result[i32, str] = recover_existing(?alloc, root, "", ?cap);
+    if (R.is_err[i32, str](rec_r) || R.unwrap_ok[i32, str](rec_r) != RECOVER_ROLLED_BACK) { bad = 1; }
+
+    val restored: O.Option[str] = t_read_file(?alloc, toml);
+    if (O.is_none[str](restored) || !str_equals(O.unwrap[str](restored), "original")) { bad = 1; }
+    if (fs.exists(sfmt_join(?alloc, root, BACKUP_MANIFEST))) { bad = 1; }
+    if (fs.exists(sfmt_join(?alloc, root, JOURNAL_LEAF))) { bad = 1; }
+
+    txn.root_dnit(?cap);
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    ret bad;
+}
+
+test "mach.cli.cmd.init.recover_existing:completed_swap_finishes_cleanup_and_keeps_the_new_content" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_init_recover_complete");
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    var bad: i32 = 0;
+
+    val toml_r: R.Result[str, str] = path.join(?alloc, root, "mach.toml");
+    val toml: str = R.unwrap_ok[str, str](toml_r);
+    if (O.is_some[str](fs.write_bytes(toml, "original"::*u8, 8::usize, 0o644))) { bad = 1; }
+    val src_dir_r: R.Result[str, str] = path.join(?alloc, root, "src");
+    if (O.is_some[str](fs.create_dir(R.unwrap_ok[str, str](src_dir_r), 0o755))) { bad = 1; }
+    val entry_path_r: R.Result[str, str] = path.join(?alloc, root, "src/root.mach");
+    val entry_path: str = R.unwrap_ok[str, str](entry_path_r);
+    if (O.is_some[str](fs.write_bytes(entry_path, "orig-src"::*u8, 8::usize, 0o644))) { bad = 1; }
+
+    val cap_r: R.Result[txn.Root, str] = open_root(root, "");
+    var cap: txn.Root = R.unwrap_ok[txn.Root, str](cap_r);
+    val src_cap_r: R.Result[txn.Root, str] = open_root(root, "src");
+    var src_cap: txn.Root = R.unwrap_ok[txn.Root, str](src_cap_r);
+
+    var prior: txn.EntryProbe = R.unwrap_ok[txn.EntryProbe, str](probe_entry(?cap, "mach.toml"));
+    var entry_prior: txn.EntryProbe = R.unwrap_ok[txn.EntryProbe, str](probe_entry(?src_cap, "root.mach"));
+    val root_id: txn.Identity = R.unwrap_ok[txn.Identity, str](root_identity_of(?cap));
+
+    val prep_r: R.Result[txn.Transaction, str] = stage_absent(?alloc, ?cap, "mach.toml", "fresh"::*u8, 5::usize);
+    var pf: txn.Transaction = R.unwrap_ok[txn.Transaction, str](prep_r);
+    val new_id: txn.Identity = R.unwrap_ok[txn.Identity, str](staged_identity_of(?pf));
+
+    val entry_prep_r: R.Result[txn.Transaction, str] = stage_absent(?alloc, ?src_cap, "root.mach", "new-src"::*u8, 7::usize);
+    var entry_pf: txn.Transaction = R.unwrap_ok[txn.Transaction, str](entry_prep_r);
+    val entry_new: txn.Identity = R.unwrap_ok[txn.Identity, str](staged_identity_of(?entry_pf));
+
+    if (R.is_err[R.Void, str](journal_create(?alloc, ?cap, root_id, prior, new_id, entry_prior, entry_new, false, false))) { bad = 1; }
+
+    if (O.is_some[str](rename_entry(?src_cap, "root.mach", BACKUP_ENTRY_BIN))) { bad = 1; }
+    if (O.is_some[str](commit_absent(?entry_pf))) { bad = 1; }
+    if (O.is_some[str](rename_entry(?cap, "mach.toml", BACKUP_MANIFEST))) { bad = 1; }
+    if (O.is_some[str](commit_absent(?pf))) { bad = 1; }
+
+    val rec_r: R.Result[i32, str] = recover_existing(?alloc, root, "", ?cap);
+    if (R.is_err[i32, str](rec_r) || R.unwrap_ok[i32, str](rec_r) != RECOVER_COMPLETED) { bad = 1; }
+
+    val kept: O.Option[str] = t_read_file(?alloc, toml);
+    if (O.is_none[str](kept) || !str_equals(O.unwrap[str](kept), "fresh")) { bad = 1; }
+    val kept_entry: O.Option[str] = t_read_file(?alloc, entry_path);
+    if (O.is_none[str](kept_entry) || !str_equals(O.unwrap[str](kept_entry), "new-src")) { bad = 1; }
+    if (fs.exists(sfmt_join(?alloc, root, BACKUP_MANIFEST))) { bad = 1; }
+    if (fs.exists(sfmt_join(?alloc, root, JOURNAL_LEAF))) { bad = 1; }
+    if (fs.exists(sfmt_join(?alloc, sfmt_join(?alloc, root, "src"), BACKUP_ENTRY_BIN))) { bad = 1; }
+
+    txn.root_dnit(?src_cap);
+    txn.root_dnit(?cap);
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    ret bad;
+}
+
+test "mach.cli.cmd.init.recover_existing:with_no_journal_is_a_no_op" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_init_recover_clean");
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    var bad: i32 = 0;
+
+    val cap_r: R.Result[txn.Root, str] = open_root(root, "");
+    var cap: txn.Root = R.unwrap_ok[txn.Root, str](cap_r);
+
+    val rec_r: R.Result[i32, str] = recover_existing(?alloc, root, "", ?cap);
+    if (R.is_err[i32, str](rec_r) || R.unwrap_ok[i32, str](rec_r) != RECOVER_CLEAN) { bad = 1; }
+
+    txn.root_dnit(?cap);
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    ret bad;
+}
+
+test "mach.cli.cmd.init.recover_existing:manifest_done_without_entry_done_is_recovery_required" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_init_recover_inconsistent");
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    var bad: i32 = 0;
+
+    val toml_r: R.Result[str, str] = path.join(?alloc, root, "mach.toml");
+    val toml: str = R.unwrap_ok[str, str](toml_r);
+    if (O.is_some[str](fs.write_bytes(toml, "original"::*u8, 8::usize, 0o644))) { bad = 1; }
+
+    val cap_r: R.Result[txn.Root, str] = open_root(root, "");
+    var cap: txn.Root = R.unwrap_ok[txn.Root, str](cap_r);
+
+    var prior: txn.EntryProbe = R.unwrap_ok[txn.EntryProbe, str](probe_entry(?cap, "mach.toml"));
+    var empty_entry: txn.EntryProbe;
+    var zero_id: txn.Identity;
+    val root_id: txn.Identity = R.unwrap_ok[txn.Identity, str](root_identity_of(?cap));
+
+    val prep_r: R.Result[txn.Transaction, str] = stage_absent(?alloc, ?cap, "mach.toml", "fresh"::*u8, 5::usize);
+    var pf: txn.Transaction = R.unwrap_ok[txn.Transaction, str](prep_r);
+    val new_id: txn.Identity = R.unwrap_ok[txn.Identity, str](staged_identity_of(?pf));
+
+    if (R.is_err[R.Void, str](journal_create(?alloc, ?cap, root_id, prior, new_id, empty_entry, zero_id, false, false))) { bad = 1; }
+
+    if (O.is_some[str](rename_entry(?cap, "mach.toml", BACKUP_MANIFEST))) { bad = 1; }
+    if (O.is_some[str](commit_absent(?pf))) { bad = 1; }
+
+    val rec_r: R.Result[i32, str] = recover_existing(?alloc, root, "", ?cap);
+    if (R.is_ok[i32, str](rec_r)) { bad = 1; }
+
+    txn.root_dnit(?cap);
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    ret bad;
+}
+
+test "mach.cli.cmd.init.recover_existing:rollback_deletes_a_freshly_committed_output_that_never_existed_before" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = t_scratch_dir(?alloc, "mach_init_recover_undo_fresh");
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    var bad: i32 = 0;
+
+    val src_dir_r: R.Result[str, str] = path.join(?alloc, root, "src");
+    if (O.is_some[str](fs.create_dir(R.unwrap_ok[str, str](src_dir_r), 0o755))) { bad = 1; }
+
+    val cap_r: R.Result[txn.Root, str] = open_root(root, "");
+    var cap: txn.Root = R.unwrap_ok[txn.Root, str](cap_r);
+    val src_cap_r: R.Result[txn.Root, str] = open_root(root, "src");
+    var src_cap: txn.Root = R.unwrap_ok[txn.Root, str](src_cap_r);
+
+    var manifest_prior: txn.EntryProbe = R.unwrap_ok[txn.EntryProbe, str](probe_entry(?cap, "mach.toml"));
+    var entry_prior: txn.EntryProbe = R.unwrap_ok[txn.EntryProbe, str](probe_entry(?src_cap, "root.mach"));
+    val root_id: txn.Identity = R.unwrap_ok[txn.Identity, str](root_identity_of(?cap));
+
+    val manifest_prep_r: R.Result[txn.Transaction, str] = stage_absent(?alloc, ?cap, "mach.toml", "fresh"::*u8, 5::usize);
+    var manifest_pf: txn.Transaction = R.unwrap_ok[txn.Transaction, str](manifest_prep_r);
+    val manifest_new: txn.Identity = R.unwrap_ok[txn.Identity, str](staged_identity_of(?manifest_pf));
+
+    val entry_prep_r: R.Result[txn.Transaction, str] = stage_absent(?alloc, ?src_cap, "root.mach", "new-src"::*u8, 7::usize);
+    var entry_pf: txn.Transaction = R.unwrap_ok[txn.Transaction, str](entry_prep_r);
+    val entry_new: txn.Identity = R.unwrap_ok[txn.Identity, str](staged_identity_of(?entry_pf));
+
+    if (R.is_err[R.Void, str](journal_create(?alloc, ?cap, root_id, manifest_prior, manifest_new, entry_prior, entry_new, false, false))) { bad = 1; }
+
+    if (O.is_some[str](commit_absent(?entry_pf))) { bad = 1; }
+    txn.abort(?manifest_pf);
+
+    val rec_r: R.Result[i32, str] = recover_existing(?alloc, root, "", ?cap);
+    if (R.is_err[i32, str](rec_r) || R.unwrap_ok[i32, str](rec_r) != RECOVER_ROLLED_BACK) { bad = 1; }
+
+    val entry_path_r: R.Result[str, str] = path.join(?alloc, root, "src/root.mach");
+    if (fs.exists(R.unwrap_ok[str, str](entry_path_r))) { bad = 1; }
+    val toml_r: R.Result[str, str] = path.join(?alloc, root, "mach.toml");
+    if (fs.exists(R.unwrap_ok[str, str](toml_r))) { bad = 1; }
+    if (fs.exists(sfmt_join(?alloc, root, JOURNAL_LEAF))) { bad = 1; }
+
+    txn.root_dnit(?src_cap);
+    txn.root_dnit(?cap);
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    ret bad;
 }

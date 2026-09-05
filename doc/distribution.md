@@ -640,7 +640,7 @@ per cell:
 
 ```toml
 [step.qz]
-cmd  = "vendor/build-qz.sh {project.out}/obj/qz/libqz.a"
+argv = ["sh", "vendor/build-qz.sh", "{project.out}/obj/qz/libqz.a"]
 in   = ["vendor/qz/*.c", "vendor/qz/*.h", "vendor/build-qz.sh"]
 out  = ["{project.out}/obj/qz/libqz.a"]
 need = []

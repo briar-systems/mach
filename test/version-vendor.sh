@@ -59,7 +59,7 @@ need = []
 [dep.mach]
 path = "$root"
 
-[dep.mach-std]
+[dep.std]
 git = "https://github.com/briar-systems/mach-std"
 ref = "branch/main"
 EOF

@@ -1,26 +1,3 @@
-# literal coercion and assignability for the sema phase
-#
-# Mach is explicit-everything: no implicit numeric widening between variables,
-# no implicit float<->int conversion, no pointer-base widening, no automatic
-# deref or address-of, and no mutability coercion. The only implicit conversion
-# the language permits is fixing an untyped literal to the concrete type its
-# surrounding context demands.
-#
-# `try_coerce_literal` retypes a literal expression to a requested destination
-# type when the literal can legally take it: an integer literal to any integer
-# that holds its value, a float literal to f32/f64, a nil literal to any
-# pointer-like type (`ptr`, `*T`, or `fun(...)`). It rewrites the expression's
-# entry in the parallel `expr_type` array so downstream phases observe the
-# coerced type, and descends through the value-preserving arithmetic/bitwise
-# operators that wrap a literal, so a folded or negated literal (`-1`, `1 << 3`)
-# takes its context type just as a bare literal does.
-#
-# `is_assignable` is identity-only: two types are assignable iff their interned
-# `TypeId`s are equal, since the interner canonicalizes every compound type.
-# Function types fall back to structural signature equality (they are not
-# deduplicated), and the type-erased raw `ptr` interconverts with any typed
-# `*T`.
-
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -38,78 +15,30 @@ use mach.lang.fe.sema.context;
 use mach.lang.fe.sema.generics;
 use mach.lang.type;
 
-# the inclusive value range of an integer type, for out-of-range diagnostics
-#
-# `min_negated` marks a signed type's negative minimum; `min_mag` and `max_mag`
-# are the unsigned magnitudes of the bounds. Derived once per destination in
-# `int_bounds_of` and carried on an OUT_OF_RANGE result, so the reporter renders
-# the range without recomputing it.
-# ---
-# min_negated: true when the minimum is negative (a signed type)
-# min_mag:     the magnitude of the minimum bound
-# max_mag:     the magnitude of the maximum bound
-pub rec IntBounds {
-    min_negated: bool;
-    min_mag:     u64;
-    max_mag:     u64;
-}
-
-# discriminator of CoerceResult: the three outcomes of offering a literal a type
 pub def CoerceKind: u8;
 
-# the expression is not a coercible literal for `to` (a typed value, or a literal
-# whose form does not admit the destination); no diagnostic is implied
 pub val COERCE_NOT_APPLICABLE: CoerceKind = 0;
-# the literal legally took `to`; expr_type[eid] was rewritten to record it
 pub val COERCE_COERCED:        CoerceKind = 1;
-# `eid` is an integer-valued literal whose value does not fit the integer
-# destination `to`; the magnitude, sign, and bounds travel to the reporter
 pub val COERCE_OUT_OF_RANGE:   CoerceKind = 2;
 
-# the outcome of a literal coercion attempt
-#
-# `kind` selects the payload: COERCED carries `ty` (the type the literal took);
-# OUT_OF_RANGE carries `ty` (the integer destination), `value` (the literal's
-# unsigned magnitude), `negated` (whether it sat under an odd number of unary
-# `-`), and `bounds` (the destination's inclusive range); NOT_APPLICABLE carries
-# nothing meaningful. The whole out-of-range fact - value, sign, and bounds - is
-# computed once here in coerce from one PrimDesc read and consumed at the
-# reporting site, so no caller re-derives whether a literal fit or what the
-# destination's range is.
-# ---
-# kind:    which outcome occurred
-# ty:      the coerced type (COERCED) or the integer destination (OUT_OF_RANGE)
-# value:   the literal's unsigned magnitude (OUT_OF_RANGE)
-# negated: whether the literal is negated (OUT_OF_RANGE)
-# bounds:  the destination's inclusive value range (OUT_OF_RANGE)
 pub rec CoerceResult {
     kind:    CoerceKind;
     ty:      type.TypeId;
     value:   u64;
     negated: bool;
-    bounds:  IntBounds;
+    bounds:  type.IntRange;
 
-    # what the out-of-range constant was SPELLED as, so the diagnostic can name it:
-    # true for a literal the author wrote, false for one a fold produced (a layout
-    # measurement, a comptime path). "literal 300" is the wrong noun for
-    # `$size_of(Huge)`, and "value 300" is the weaker one for `300` (#2934).
     literal: bool;
 }
 
-# a zeroed IntBounds, for results that carry no range
-# ---
-# ret: an IntBounds with all fields cleared
-fun zero_bounds() IntBounds {
-    var b: IntBounds;
+fun zero_bounds() type.IntRange {
+    var b: type.IntRange;
     b.min_negated = false;
     b.min_mag     = 0;
     b.max_mag     = 0;
     ret b;
 }
 
-# a NOT_APPLICABLE coercion outcome
-# ---
-# ret: a CoerceResult with kind COERCE_NOT_APPLICABLE
 fun not_applicable() CoerceResult {
     var r: CoerceResult;
     r.kind    = COERCE_NOT_APPLICABLE;
@@ -120,10 +49,6 @@ fun not_applicable() CoerceResult {
     ret r;
 }
 
-# a COERCED outcome recording the type the literal took
-# ---
-# to:  the type the literal was fixed to
-# ret: a CoerceResult with kind COERCE_COERCED carrying `to`
 fun applicable(to: type.TypeId) CoerceResult {
     var r: CoerceResult;
     r.kind    = COERCE_COERCED;
@@ -134,14 +59,7 @@ fun applicable(to: type.TypeId) CoerceResult {
     ret r;
 }
 
-# an OUT_OF_RANGE outcome recording the offending literal, destination, and range
-# ---
-# to:      the integer destination the value overflowed
-# value:   the literal's unsigned magnitude
-# negated: whether the literal is negated
-# bounds:  the destination's inclusive value range
-# ret:     a CoerceResult with kind COERCE_OUT_OF_RANGE
-fun out_of_range(to: type.TypeId, value: u64, negated: bool, bounds: IntBounds, literal: bool) CoerceResult {
+pub fun out_of_range(to: type.TypeId, value: u64, negated: bool, bounds: type.IntRange, literal: bool) CoerceResult {
     var r: CoerceResult;
     r.kind    = COERCE_OUT_OF_RANGE;
     r.ty      = to;
@@ -152,63 +70,15 @@ fun out_of_range(to: type.TypeId, value: u64, negated: bool, bounds: IntBounds, 
     ret r;
 }
 
-# fix an untyped literal expression to a requested destination type
-#
-# Only literal expressions whose form admits the destination are coerced; on
-# success `sc.expr_type[eid]` is rewritten to `to` - stripped of any `^`, since a
-# literal is public by construction (#2196) - and a COERCED result is returned. An
-# integer literal whose value overflows an integer destination
-# yields OUT_OF_RANGE, carrying the value and sign so the caller can report the
-# overflow directly. Every other expression - including an already-typed variable
-# reference - yields NOT_APPLICABLE, because Mach performs no implicit widening
-# between typed values. Coercion descends through a unary `-`/`~` operand and the
-# operands of the value-preserving binary operators, so a folded literal adopts
-# the context type the same way a bare literal does; a unary `-` additionally
-# flips the sign domain used to range-check its inner integer literal.
-# ---
-# sc:  the active sema context
-# eid: the expression to coerce; indexes sc.a.exprs
-# to:  the destination TypeId the surrounding context requires
-# ret: COERCED when the literal legally takes `to`'s public base (and expr_type[eid]
-#      is updated to it), OUT_OF_RANGE when an integer literal overflows an integer
-#      `to`, NOT_APPLICABLE when no literal coercion applies
 pub fun try_coerce_literal(sc: *context.SemaContext, eid: id.ExprId, to: type.TypeId) CoerceResult {
     if (to == type.TYPE_NIL || to == type.TYPE_ERROR) { ret not_applicable(); }
 
-    # a literal flowing into a secret slot fixes against the public BASE and STAYS
-    # public (#2196). a literal is public by construction - its value is in the
-    # instruction stream, readable by anyone holding the binary - so conferring `^`
-    # on it because a neighbouring operand is secret classifies a constant as a
-    # secret. Nothing needs the secret spelling here: public is the bottom of the
-    # lattice, so `u32` is assignable to every `^u32` slot with no syntax, and the
-    # secrecy JOIN in `infer_binary` reads the operands' PRE-unification types, so
-    # a result computed with a secret operand is still secret.
-    #
-    # Conferring it was actively wrong: the literal's secrecy seeds `MirVReg.secret`,
-    # so `v << 3` on a secret `v` presented the constant `3` to the constant-time
-    # shift gate as a secret shift COUNT and was rejected on a target without a
-    # barrel shifter - forbidding the most common constant-time idiom there is.
-    #
-    # This cannot over-correct into a laundering path: `coerce_to` retypes only
-    # expressions that are literal BY CONSTRUCTION - integer / char / float / nil
-    # leaves, a folded comptime path, and the `- ~` / arithmetic nodes whose every
-    # leaf is one of those. An identifier reference declines (NOT_APPLICABLE), so a
-    # value COMPUTED from a secret never reaches this retype however it is spelled.
-    # TWO-PHASE: probe without writing, commit only on a whole-tree COERCED (#3073).
-    # coercion is a try: a decline must leave every expr_type slot untouched. the
-    # recursive descent decides per NODE, so a subtree could coerce its first
-    # literal and then decline on a later operand - `3.0 - 2.0 * b` toward f64
-    # committed `2.0: f64` before `b` declined the whole attempt, and the stale
-    # slot survived into lowering as a mixed-width operand. probing first makes
-    # the outcome known before the first write.
     val pub_to: type.TypeId = type.strip_secret(?sc.s.types, to);
     var r: CoerceResult = coerce_to(sc, eid, pub_to, false, true);
     if (r.kind == COERCE_COERCED) {
         r = coerce_to(sc, eid, pub_to, false, false);
     }
     if (pub_to != to && r.kind == COERCE_OUT_OF_RANGE) {
-        # a secret destination: an out-of-range result names the secret type the
-        # user actually wrote, while keeping the integer base's bounds.
         var rr: CoerceResult = r;
         rr.ty = to;
         ret rr;
@@ -216,22 +86,6 @@ pub fun try_coerce_literal(sc: *context.SemaContext, eid: id.ExprId, to: type.Ty
     ret r;
 }
 
-# recursive core of try_coerce_literal, dispatching on the expression's kind
-#
-# `negated` is set when an odd number of unary `-` operators enclose the
-# expression, so a leaf integer literal is range-checked against the signed
-# negative domain of `to`.
-# ---
-# `probe` suppresses every expr_type write (see try_coerce_literal): the probe
-# pass computes the outcome, the commit pass repeats it with the writes on.
-# ---
-# sc:      the active sema context
-# eid:     the expression to coerce
-# to:      the destination TypeId
-# negated: true when the literal sits under an odd number of unary `-`
-# probe:   true to decide without writing expr_type
-# ret:     COERCED when the possibly nested literal takes `to`, OUT_OF_RANGE when
-#          an integer literal overflows an integer `to`, else NOT_APPLICABLE
 fun coerce_to(sc: *context.SemaContext, eid: id.ExprId, to: type.TypeId, negated: bool, probe: bool) CoerceResult {
     if (eid == id.EXPR_NIL) { ret not_applicable(); }
 
@@ -240,20 +94,22 @@ fun coerce_to(sc: *context.SemaContext, eid: id.ExprId, to: type.TypeId, negated
     val e: *expr.Expr = O.unwrap[*expr.Expr](opt_e);
 
     if (e.kind == expr.EXPR_KIND_LIT_INT) {
-        ret coerce_int_literal(sc, eid, e.data.lit_int, to, negated, true, probe);
+        if (e.data.lit_int.suffix != expr.LIT_SUFFIX_NONE) {
+            ret coerce_suffixed_literal(sc, eid, e.data.lit_int.suffix, to, probe);
+        }
+        ret coerce_int_literal(sc, eid, e.data.lit_int.value, to, negated, true, probe);
     }
     if (e.kind == expr.EXPR_KIND_LIT_CHAR) {
         ret coerce_int_literal(sc, eid, e.data.lit_char::u64, to, negated, true, probe);
     }
     if (e.kind == expr.EXPR_KIND_LIT_FLOAT) {
+        if (e.data.lit_float.suffix != expr.LIT_SUFFIX_NONE) {
+            ret coerce_suffixed_literal(sc, eid, e.data.lit_float.suffix, to, probe);
+        }
         if (to != type.TYPE_F32 && to != type.TYPE_F64) { ret not_applicable(); }
         ret commit(sc, eid, to, probe);
     }
     if (e.kind == expr.EXPR_KIND_LIT_NIL) {
-        # nil is the null address; it takes any pointer-like type - a raw `ptr`,
-        # a typed `*T`, or a `fun(...)` (a function value is a code address, so
-        # the null address is a valid null callback). `fn == nil` / `fn != nil`
-        # stay related as comparisons in infer_binary, independent of this.
         if (!type.is_pointer_like(?sc.s.types, to)) { ret not_applicable(); }
         ret commit(sc, eid, to, probe);
     }
@@ -273,71 +129,31 @@ fun coerce_to(sc: *context.SemaContext, eid: id.ExprId, to: type.TypeId, negated
     ret not_applicable();
 }
 
-# fix an integer-valued literal of magnitude `v` to the destination `to`
-#
-# The destination's integer bounds are read once (`int_bounds_of`): a non-integer
-# destination declines with NOT_APPLICABLE (an integer literal is not a coercion
-# target for a float, pointer, or nominal type - the caller reports the plain
-# mismatch); an integer destination whose range cannot hold `v` yields
-# OUT_OF_RANGE carrying the magnitude, sign, and those bounds; a holding
-# destination commits and returns COERCED. Both the accept/reject decision and the
-# reported range come from the single bounds computation. Shared by the integer-
-# and character-literal leaves and the comptime integer path.
-# ---
-# sc:      the active sema context
-# eid:     the literal expression to retype on success
-# v:       the literal's unsigned magnitude
-# to:      the destination TypeId
-# negated: true when the literal sits under an odd number of unary `-`
-# ret:     COERCED, OUT_OF_RANGE, or NOT_APPLICABLE per the destination
-fun coerce_int_literal(sc: *context.SemaContext, eid: id.ExprId, v: u64, to: type.TypeId, negated: bool, literal: bool, probe: bool) CoerceResult {
-    val opt_bounds: O.Option[IntBounds] = int_bounds_of(sc, to);
-    if (O.is_none[IntBounds](opt_bounds)) { ret not_applicable(); }
-    val bounds: IntBounds = O.unwrap[IntBounds](opt_bounds);
-    if (!fits_bounds(v, negated, bounds)) { ret out_of_range(to, v, negated, bounds, literal); }
+fun coerce_suffixed_literal(sc: *context.SemaContext, eid: id.ExprId, suffix: type.TypeKind, to: type.TypeId, probe: bool) CoerceResult {
+    val opt_type: O.Option[*type.Type] = type.get(?sc.s.types, to);
+    if (O.is_none[*type.Type](opt_type))              { ret not_applicable(); }
+    if (O.unwrap[*type.Type](opt_type).kind != suffix) { ret not_applicable(); }
     ret commit(sc, eid, to, probe);
 }
 
-# coerce a comptime path that folds to an integer to a destination integer type
-#
-# A rooted comptime path (`$mach.build.os`, ...) is evaluated and, when it folds
-# to an integer, range-checked against the destination width and signedness
-# exactly like an integer literal; on a fit the path's expr_type slot is
-# committed to `to`, and an overflow of an integer destination yields OUT_OF_RANGE
-# carrying the folded value. A path that is not a comptime path or does not fold
-# to an integer yields NOT_APPLICABLE, leaving it an ordinary non-coercible
-# expression.
-# ---
-# sc:      the active sema context
-# eid:     the path expression to coerce
-# to:      the destination TypeId
-# negated: true when the path sits under an odd number of unary `-`
-# ret:     COERCED when the folded integer fits `to`, OUT_OF_RANGE when it
-#          overflows an integer `to`, else NOT_APPLICABLE
+fun coerce_int_literal(sc: *context.SemaContext, eid: id.ExprId, v: u64, to: type.TypeId, negated: bool, literal: bool, probe: bool) CoerceResult {
+    val opt_bounds: O.Option[type.IntRange] = int_bounds_of(sc, to);
+    if (O.is_none[type.IntRange](opt_bounds)) { ret not_applicable(); }
+    val bounds: type.IntRange = O.unwrap[type.IntRange](opt_bounds);
+    if (!type.int_fits(v, negated, bounds)) { ret out_of_range(to, v, negated, bounds, literal); }
+    ret commit(sc, eid, to, probe);
+}
+
 fun coerce_comptime_int_path(sc: *context.SemaContext, eid: id.ExprId, to: type.TypeId, negated: bool, probe: bool) CoerceResult {
     if (!comptime.is_comptime_path(sc.a, eid)) { ret not_applicable(); }
 
-    val res_eval: R.Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, eid, ?sc.s.interner);
-    if (R.is_err[comptime.CTValue, str](res_eval)) { ret not_applicable(); }
-    val ctval: comptime.CTValue = R.unwrap_ok[comptime.CTValue, str](res_eval);
+    val res_eval: R.Result[comptime.CTValue, comptime.EvalFail] = comptime.evaluate[context.SemaContext](sc.ctx, sc, sc.caps, sc.a, sc.source, eid, ?sc.s.interner);
+    if (R.is_err[comptime.CTValue, comptime.EvalFail](res_eval)) { ret not_applicable(); }
+    val ctval: comptime.CTValue = R.unwrap_ok[comptime.CTValue, comptime.EvalFail](res_eval);
 
     ret coerce_ct_int(sc, eid, ctval, to, negated, probe);
 }
 
-# range-check an already-folded comptime integer against `to` and commit
-#
-# The shared tail of every folded-constant arm. The fold already produced a
-# definite value, so its magnitude and sign are derived rather than reading the
-# raw i64 as a u64: a negative signed fold has a real magnitude and an implicit
-# negation that compose with the surrounding unary `-`, and reading it as a
-# near-max u64 would reject values that fit.
-# ---
-# sc:      the active sema context
-# eid:     the expression to retype on success
-# ctval:   the folded constant
-# to:      the destination TypeId
-# negated: true when the expression sits under an odd number of unary `-`
-# ret:     COERCED, OUT_OF_RANGE, or NOT_APPLICABLE per the destination
 fun coerce_ct_int(sc: *context.SemaContext, eid: id.ExprId, ctval: comptime.CTValue, to: type.TypeId, negated: bool, probe: bool) CoerceResult {
     if (ctval.kind != comptime.CT_KIND_INT) { ret not_applicable(); }
 
@@ -355,85 +171,27 @@ fun coerce_ct_int(sc: *context.SemaContext, eid: id.ExprId, ctval: comptime.CTVa
     ret coerce_int_literal(sc, eid, mag, to, negated_total, false, probe);
 }
 
-# coerce a layout intrinsic (`$size_of` / `$align_of` / `$length_of`) to a
-# destination integer type
-#
-# A LAYOUT INTRINSIC IS AN UNTYPED COMPTIME INTEGER, exactly like a literal
-# (#2934/#2946). It measures a constant the compiler already knows, so there is no
-# conversion to perform when it lands in a narrower binding - only a choice of
-# representation, which is the same thing `val x: u8 = 5;` does. Typing it `u64`
-# flat meant `val step: usize = $size_of(usize);` compiled only where `usize`
-# happens to BE `u64`, so mach-std built on lp64 by coincidence and no ilp32
-# target could compile it at all.
-#
-# THE MEASUREMENT IS NOT REPEATED HERE. `comptime.eval` routes a layout intrinsic
-# through the `layout_fn` resolver sema installs, which is the same
-# `fold_layout_intrinsic` an array length and a `$if` gate go through - so a size
-# measured in a binding and the same size measured in a gate cannot disagree.
-#
-# `$offset_of` DECLINES, and not by omission: a field's offset is decided at
-# lowering, later than any fold available here, so the evaluator refuses it and
-# this returns NOT_APPLICABLE. It keeps its `u64` typing and an explicit cast,
-# which is the honest answer while sema has no offset to range-check against.
-# ---
-# sc:      the active sema context
-# eid:     the call expression to coerce
-# to:      the destination TypeId
-# negated: true when the call sits under an odd number of unary `-`
-# ret:     COERCED when the measured constant fits `to`, OUT_OF_RANGE when it
-#          overflows an integer `to`, else NOT_APPLICABLE
 fun coerce_layout_intrinsic(sc: *context.SemaContext, eid: id.ExprId, to: type.TypeId, negated: bool, probe: bool) CoerceResult {
-    # every other call is a runtime value and coerces to nothing
     if (!comptime.is_layout_intrinsic_call(sc.a, sc.source, eid)) { ret not_applicable(); }
 
-    # a layout measure is an integer and takes no other destination; a float or
-    # pointer slot gets the plain mismatch its own diagnostic describes
-    if (O.is_none[IntBounds](int_bounds_of(sc, to))) { ret not_applicable(); }
+    if (O.is_none[type.IntRange](int_bounds_of(sc, to))) { ret not_applicable(); }
 
-    # THE FOLD HERE IS SPECULATIVE AND MUST NOT REPORT. `$size_of(T)` inside a
-    # generic body has no measurable layout until the instantiation supplies `T`,
-    # and an assignability probe is not the place to announce that - the episode
-    # is asking "could this take that type", not "measure this now".
     val saved_silent: bool = sc.silent;
     sc.silent = true;
-    val res_eval: R.Result[comptime.CTValue, str] =
-        comptime.eval(sc.ctx, sc.a, sc.source, eid, ?sc.s.interner);
+    val res_eval: R.Result[comptime.CTValue, comptime.EvalFail] =
+        comptime.evaluate[context.SemaContext](sc.ctx, sc, sc.caps, sc.a, sc.source, eid, ?sc.s.interner);
     sc.silent = saved_silent;
 
-    if (R.is_ok[comptime.CTValue, str](res_eval)) {
-        val ctval: comptime.CTValue = R.unwrap_ok[comptime.CTValue, str](res_eval);
+    if (R.is_ok[comptime.CTValue, comptime.EvalFail](res_eval)) {
+        val ctval: comptime.CTValue = R.unwrap_ok[comptime.CTValue, comptime.EvalFail](res_eval);
         if (ctval.kind == comptime.CT_KIND_INT) {
             ret coerce_ct_int(sc, eid, ctval, to, negated, probe);
         }
     }
 
-    # MEASURABLE LATER, NOT NEVER. Two intrinsics reach here: `$size_of(T)` on a
-    # generic parameter, whose layout arrives with the instantiation, and
-    # `$offset_of`, whose answer is decided at lowering by design. Both are still
-    # comptime constants of the width the binding declares, so the type commits
-    # here and the VALUE is range-checked where it is finally known - the lowering
-    # fold refuses a measure too wide for the slot rather than truncating it.
-    #
-    # Declining instead would leave them `u64`, which is exactly the defect: on an
-    # ilp32 target `$size_of(T) * count` against a `usize` count is the mismatch
-    # that stopped mach-std compiling at all (#2934).
     ret commit(sc, eid, to, probe);
 }
 
-# coerce a unary `-`/`~` node by coercing its operand to `to`
-#
-# Only `-` and `~` are coercion-transparent: they wrap an untyped literal and
-# adopt its type. The `+`-domain operators (`!`, `&`, `*`) wrap typed results,
-# not literals. A `-` flips the negation domain for the operand's range check.
-# On success the unary node itself is retyped to `to`.
-# ---
-# sc:      the active sema context
-# eid:     the unary expression to retype on success
-# u:       the unary node payload
-# to:      the destination TypeId
-# negated: true when this node sits under an odd number of unary `-`
-# ret:     COERCED when the operand coerces, else the operand's own outcome
-#          (OUT_OF_RANGE carries the offending literal up unchanged)
 fun coerce_unary(sc: *context.SemaContext, eid: id.ExprId, u: *expr.ExprUnary, to: type.TypeId, negated: bool, probe: bool) CoerceResult {
     if (u.op != expr.UN_NEG && u.op != expr.UN_BIT_NOT) { ret not_applicable(); }
 
@@ -445,20 +203,6 @@ fun coerce_unary(sc: *context.SemaContext, eid: id.ExprId, u: *expr.ExprUnary, t
     ret commit(sc, eid, to, probe);
 }
 
-# coerce a binary arithmetic/bitwise node by coercing both operands to `to`
-#
-# Comparison, logical, and assignment operators yield fixed or independent
-# result types and are not coercion-transparent. The negation domain does not
-# cross a binary operator - each operand carries its own literal sign - so the
-# operands are coerced in the non-negated domain. On success the binary node
-# itself is retyped to `to`.
-# ---
-# sc:  the active sema context
-# eid: the binary expression to retype on success
-# b:   the binary node payload
-# to:  the destination TypeId
-# ret: COERCED when both operands coerce; otherwise the first non-coercing
-#      operand's outcome (an OUT_OF_RANGE operand carries its literal up unchanged)
 fun coerce_binary(sc: *context.SemaContext, eid: id.ExprId, b: *expr.ExprBinary, to: type.TypeId, probe: bool) CoerceResult {
     if (!is_value_preserving_binop(b.op)) { ret not_applicable(); }
 
@@ -469,14 +213,6 @@ fun coerce_binary(sc: *context.SemaContext, eid: id.ExprId, b: *expr.ExprBinary,
     ret commit(sc, eid, to, probe);
 }
 
-# whether a binary operator yields its operand type
-#
-# Arithmetic and bitwise operators propagate a coerced literal type to the
-# operation node; comparisons and logical operators yield a fixed boolean, and
-# assignment yields an lvalue result, so neither is coercion-transparent.
-# ---
-# op:  the binary operator to classify
-# ret: true for the arithmetic and bitwise operators
 fun is_value_preserving_binop(op: expr.BinOp) bool {
     if (op == expr.BIN_ADD || op == expr.BIN_SUB || op == expr.BIN_MUL
         || op == expr.BIN_DIV || op == expr.BIN_MOD) { ret true; }
@@ -485,66 +221,12 @@ fun is_value_preserving_binop(op: expr.BinOp) bool {
     ret false;
 }
 
-# the integer bounds of `to`, or none when `to` is not an integer primitive
-#
-# The one home for the width/signedness range arithmetic, expressed as renderable
-# magnitudes: a signed N-bit type spans -2^(N-1)..2^(N-1)-1, an unsigned one
-# 0..2^N-1 (with the 64-bit unsigned maximum formed as `0 - 1` to avoid
-# overflowing the shift). The single PrimDesc read that both the fit check
-# (`fits_bounds`) and the diagnostic range derive from.
-# ---
-# sc:  the active sema context
-# to:  the destination TypeId to range
-# ret: some(bounds) for an integer primitive, none otherwise
-fun int_bounds_of(sc: *context.SemaContext, to: type.TypeId) O.Option[IntBounds] {
-    val opt_type: O.Option[*type.Type] = type.get(?sc.s.types, to);
-    if (O.is_none[*type.Type](opt_type)) { ret O.none[IntBounds](); }
-    val d: type.PrimDesc = type.prim_desc(O.unwrap[*type.Type](opt_type).kind);
-    if (d.class != type.PRIM_CLASS_INT) { ret O.none[IntBounds](); }
-
-    var b: IntBounds;
-    if (d.signed) {
-        b.min_negated = true;
-        b.min_mag     = 1::u64 << (d.bits - 1)::usize;
-        b.max_mag     = (1::u64 << (d.bits - 1)::usize) - 1;
-        ret O.some[IntBounds](b);
-    }
-    b.min_negated = false;
-    b.min_mag     = 0;
-    if (d.bits >= 64) { b.max_mag = 0::u64 - 1; }
-    or                { b.max_mag = (1::u64 << d.bits::usize) - 1; }
-    ret O.some[IntBounds](b);
+pub fun int_bounds_of(sc: *context.SemaContext, to: type.TypeId) O.Option[type.IntRange] {
+    val opt_type: O.Option[*type.Type] = type.get(?sc.s.types, type.strip_secret(?sc.s.types, to));
+    if (O.is_none[*type.Type](opt_type)) { ret O.none[type.IntRange](); }
+    ret type.int_range(O.unwrap[*type.Type](opt_type).kind);
 }
 
-# whether the literal magnitude `v` fits `bounds` in the given sign domain
-#
-# A negated literal needs a signed destination (a negative value never takes an
-# unsigned type) and its magnitude may reach |min|; a non-negated one is checked
-# against the maximum. The same reasoning `int_bounds_of` encodes, read back off
-# the bounds it produced rather than recomputed from the type.
-# ---
-# v:       the literal's unsigned magnitude
-# negated: true when the literal sits under an odd number of unary `-`
-# bounds:  the destination's integer bounds
-# ret:     true when `v` fits `bounds`
-fun fits_bounds(v: u64, negated: bool, bounds: IntBounds) bool {
-    if (negated) {
-        if (!bounds.min_negated) { ret false; }
-        ret v <= bounds.min_mag;
-    }
-    ret v <= bounds.max_mag;
-}
-
-# rewrite expr_type[eid] to the coerced type and return a COERCED result
-#
-# The write is skipped when the side table is absent or `eid` is out of its
-# range; the coercion still succeeds, since the literal legally takes `to`
-# whether or not the cache is present to record it.
-# ---
-# sc:  the active sema context
-# eid: the expression whose type slot to update
-# to:  the coerced TypeId
-# ret: a COERCED CoerceResult carrying `to`
 fun commit(sc: *context.SemaContext, eid: id.ExprId, to: type.TypeId, probe: bool) CoerceResult {
     if (!probe && sc.expr_type != nil && eid::usize < sc.a.expr_len) {
         sc.expr_type[eid] = to;
@@ -552,31 +234,10 @@ fun commit(sc: *context.SemaContext, eid: id.ExprId, to: type.TypeId, probe: boo
     ret applicable(to);
 }
 
-# whether a value of type `from` may be assigned to a slot of type `to`
-#
-# Assignability is identity of interned TypeIds; the interner canonicalizes
-# pointers, arrays, nominals, and instances, so identical structure always
-# yields the same TypeId. Function types are not deduplicated, so a structural
-# signature comparison is the fallback when both operands are function types.
-# The one structural relaxation is the raw-pointer rule: the untyped `ptr` and
-# any typed `*T` are mutually assignable, since `ptr` is the language's
-# type-erased pointer. No other widening - no float<->int, no pointer-base
-# widening, no deref/addr/mutability coercion - is performed. An error type on
-# either side is assignable, so one upstream failure does not cascade.
-# ---
-# sc:   the active sema context
-# from: the source value's type
-# to:   the destination slot's type
-# ret:  true when `from` may be assigned to `to`
 pub fun is_assignable(sc: *context.SemaContext, from: type.TypeId, to: type.TypeId) bool {
     if (from == to)                                       { ret true; }
     if (from == type.TYPE_ERROR || to == type.TYPE_ERROR) { ret true; }
 
-    # the secrecy lattice (#1645): public is the bottom, secret the top. a value
-    # coerces UP to a secret slot with no syntax, so a secret destination accepts
-    # a public or secret source of the same base. the reverse - a secret source
-    # into a public slot - is the forbidden downgrade and falls through to fail
-    # (only the explicit `:^` strip downgrades).
     val to_secret:   bool = type.is_secret(?sc.s.types, to);
     val from_secret: bool = type.is_secret(?sc.s.types, from);
     if (to_secret) {
@@ -588,22 +249,7 @@ pub fun is_assignable(sc: *context.SemaContext, from: type.TypeId, to: type.Type
     ret type.type_equals_signatures(?sc.s.types, from, to);
 }
 
-# whether `from` and `to` pair a raw `ptr` with a typed `*T`, in either order
-#
-# The untyped `ptr` is type-erased, so it interconverts with any typed pointer
-# without a cast; two distinct typed pointers stay unrelated (only `from == to`
-# matches those).
-# ---
-# sc:   the active sema context
-# from: the first type
-# to:   the second type
-# ret:  true when one side is the raw `ptr` and the other a typed `*T`
 fun ptr_compatible(sc: *context.SemaContext, from: type.TypeId, to: type.TypeId) bool {
-    # the welded-storage rule (#1645): the untyped `ptr` interconverts with any typed
-    # pointer EXCEPT one carrying secret data. erasing a `*^T` - or a `*P` whose pointee
-    # `P` wraps a `^` field (#2165) - to `ptr` would let a public alias read secret
-    # memory, so it is unconstructable. the check is DEEP (`contains_secret_deep`), since a
-    # nominal pointee can hide a `^` in its field graph that the shallow spine walk misses.
     if (from == type.TYPE_PTR && is_typed_pointer(sc, to)) {
         ret !generics.contains_secret_deep(sc.s, to);
     }
@@ -613,12 +259,6 @@ fun ptr_compatible(sc: *context.SemaContext, from: type.TypeId, to: type.TypeId)
     ret false;
 }
 
-# whether `t` is an interned `*T` pointer, as opposed to the raw `ptr` or a
-# non-pointer
-# ---
-# sc:  the active sema context
-# t:   the TypeId to classify
-# ret: true when `t` is a TYPE_POINTER
 fun is_typed_pointer(sc: *context.SemaContext, t: type.TypeId) bool {
     val opt_type: O.Option[*type.Type] = type.get(?sc.s.types, t);
     if (O.is_none[*type.Type](opt_type)) { ret false; }

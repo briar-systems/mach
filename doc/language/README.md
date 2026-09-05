@@ -31,7 +31,7 @@ neighboring links; start from the index below.
 
 - [literals.md](literals.md) — numeric, char, string
 - [types.md](types.md) — primitive grammar, compound types
-- [secrecy.md](secrecy.md) — the `^` secret qualifier, flow typing, gates, `:^`
+- [secrecy.md](secrecy.md) — the `^` secret qualifier, flow typing, gates, `:>T`
 - [operators.md](operators.md) — arithmetic, bitwise, comparison, logical, pointer, cast
 - [expressions.md](expressions.md) — construction, access, calls, generic instantiation
 
@@ -67,3 +67,20 @@ neighboring links; start from the index below.
 - [../manifest.md](../manifest.md) — the `mach.toml` manifest reference
 - [../cli.md](../cli.md) — the `mach` command-line reference
 - [../distribution.md](../distribution.md) — shipping an application to users
+
+## Tooling
+
+- [../tooling/editor-api.md](../tooling/editor-api.md) — the editor query
+  surface (`mach.lang.editor`) a language server binds to
+- [../tooling/test-json.md](../tooling/test-json.md) — the `mach test
+  --format json` event schema
+
+The supported, source-stable surface of the compiler is the editor API, the
+command line, and the manifest schema. Everything else under `src/` is
+internal.
+
+## Design
+
+- [../design/](../design/) — why the compiler is shaped the way it is: the
+  dependency model, the release shape, the IR operation descriptor,
+  publication, and the closed failure kind

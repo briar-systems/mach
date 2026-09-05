@@ -1,25 +1,23 @@
-# per-module lowering state and the accessor API the lowering passes thread
-#
-# `LowerContext` (and the loop / fin / locals machinery hung off it) is the
-# state the decl / stmt / expr lowering passes thread and mutate. it lives in
-# this leaf -- apart from the `lower` orchestrator that drives the passes -- so
-# the passes can take a `*LowerContext` without importing the orchestrator,
-# which would close an import cycle.
-
+use std.allocator.page;
+use std.chrono.duration;
 use std.collections.map;
 use std.format;
 use std.memory;
+use std.print;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 use std.types.string.str_region_equals;
+use std.text.string.str_free;
 
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
+use mach.lang.diagnostic;
 use mach.lang.fe.ast;
 use adecl: mach.lang.fe.ast.decl;
 use aexpr: mach.lang.fe.ast.expr;
@@ -38,86 +36,33 @@ use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.session;
 use mach.lang.source;
-use isa: mach.lang.target.isa;
+use mach.lang.target.isa;
 use target:  mach.lang.target.resolved;
+use tm: std.chrono.time;
 use mach.lang.float;
 use mach.lang.type;
+use mach.lang.fail;
 
-
-# initial capacity for the loop and fin working stacks on a LowerContext
 val INITIAL_STACK_CAP: u32 = 8;
 
-# upper bound on the number of distinct comptime value-parameter instances one
-# module may emit. a recursive comptime-param function called with a changing
-# value (`f($n - 1)`) would otherwise instantiate without end; hitting this cap
-# is reported as an error rather than exhausting memory
 pub val MAX_VALUE_INSTANCES: u32 = 4096;
 
-# `Instance.parent` sentinel: this instance was named by an ordinary body, so it
-# begins a derivation chain rather than continuing one
+pub val MAX_PACK_INSTANCES: u32 = 8192;
+
 pub val INSTANCE_NONE: u32 = 4294967295;
 
-# the cap on how far one chain of DERIVED generic instantiations may run
-#
-# The worklist's name dedup terminates any FINITE instance set, mutual recursion
-# included. It cannot terminate an infinite one: a body that instantiates itself
-# at a strictly larger type argument (`f[T]` naming `f[*T]`) mangles a new name
-# every time, so the worklist grows without end - and its dedup is a linear scan,
-# so the growth is quadratic on top. The divergent shape is a chain of DERIVED
-# instantiations, so that is what this bounds; a module's TOTAL instance count is
-# a different quantity, bounded separately by MAX_INSTANCES, because a large
-# generic-heavy module legitimately emits hundreds of unrelated instances at
-# depth 0.
-#
-# Measured, not guessed: see doc/design/instantiation-limits.md for the deepest
-# chain mach and mach-std actually derive, and the headroom that leaves.
 pub val MAX_INSTANCE_DEPTH: u32 = 32;
 
-# the cap on the number of distinct generic instances one module may emit
-#
-# The depth bound alone is not enough: a body that names TWO strictly larger
-# instances of itself (`f[T]` naming `f[*T]` and `f[[2]T]`) stays inside any
-# depth budget while emitting 2^depth instances, which against the linear-scan
-# dedup is a hang long before the depth cap is reached. This bounds the breadth
-# that depth cannot see.
-#
-# Measured, not guessed: see doc/design/instantiation-limits.md.
 pub val MAX_INSTANCES: u32 = 8192;
 
-# how many links of a refused derivation chain the diagnostic spells
 val CHAIN_LINKS: u32 = 5;
 
-# one entry on the loop stack: the header and exit blocks of an active loop.
-# `cnt` branches to `header`, `brk` branches to `exit`
-# ---
-# header:    block a `cnt` (or back-edge) branches to
-# exit:      block a `brk` branches to
-# fin_depth: fin-stack length at loop entry; a `brk` / `cnt` replays the fins
-#            above it (every scope being exited, the loop body included)
 pub rec LoopFrame {
     header:    ir.BlockId;
     exit:      ir.BlockId;
     fin_depth: u32;
 }
 
-# one collected generic instance awaiting body emission: a concrete
-# `(generic_decl, origin, type-args)` triple plus the mangled symbol name the
-# instance is emitted under. the worklist dedups by `name`, so an instance is
-# emitted once per object no matter how many call sites reference it
-# ---
-# decl:    DeclId of the generic function in `origin`'s AST
-# origin:  ModuleId that declares the generic
-# args:    owned copy of the concrete type-argument sequence (by ordinal)
-# arg_len: number of type arguments
-# name:    instance linkage name (mangled, with the type-args suffix)
-# bare:    the generic's source name, which `name` encodes but does not spell;
-#          the instantiation-chain diagnostic renders links from it
-# depth:   length of the derivation chain that reached this instance: 0 for one
-#          named by an ordinary body, one more than its parent's for one named
-#          by an instance body
-# parent:  worklist index of the instance whose body named this one, or
-#          INSTANCE_NONE at the root of a chain; the link the diagnostic walks
-#          to name the whole chain
 pub rec Instance {
     decl:    id.DeclId;
     origin:  session.ModuleId;
@@ -129,22 +74,6 @@ pub rec Instance {
     parent:  u32;
 }
 
-# one collected comptime value-parameter instance awaiting body emission: a
-# `(decl, origin, comptime-value sequence)` triple plus the mangled symbol name
-# the instance is emitted under. mirrors `Instance` but keys on folded comptime
-# VALUES (CTValues) rather than type arguments, so a function with one or more
-# `$`-parameters is monomorphized once per distinct argument-value sequence. the
-# worklist dedups by `name`
-# ---
-# decl:    DeclId of the comptime-param function in `origin`'s AST
-# origin:  ModuleId that declares the function
-# vals:    owned copy of the folded comptime-value sequence (by comptime
-#          ordinal)
-# val_len: number of comptime values
-# names:   owned copy of the bare comptime-param identifiers (by comptime
-#          ordinal), paired positionally with `vals` for binding into the
-#          comptime context
-# name:    instance linkage name (mangled, with the value-args suffix)
 pub rec ValueInstance {
     decl:    id.DeclId;
     origin:  session.ModuleId;
@@ -154,22 +83,6 @@ pub rec ValueInstance {
     name:    intern.StrId;
 }
 
-# one collected comptime variadic-pack instance awaiting body emission: a
-# `(decl, origin, generic type-args, pack element type-list)` tuple plus the
-# mangled symbol name the instance is emitted under. mirrors `Instance` but keys
-# on BOTH the call's generic type-arguments and the concrete TYPES the pack
-# absorbs, so a pack-tailed function is monomorphized once per distinct
-# `(type-args x trailing arg-types)` pair (#2251). the worklist dedups by `name`
-# ---
-# decl:     DeclId of the pack-tailed function in `origin`'s AST
-# origin:   ModuleId that declares the function
-# args:     owned copy of the concrete generic type-argument sequence (by
-#           ordinal), nil for a non-generic pack tail; the substitution the
-#           instance body is lowered and re-typed under
-# arg_len:  number of generic type arguments
-# types:    owned copy of the pack element type-list (by pack ordinal)
-# type_len: number of pack element types
-# name:     instance linkage name (mangled, with both suffixes)
 pub rec PackInstance {
     decl:     id.DeclId;
     origin:   session.ModuleId;
@@ -180,105 +93,45 @@ pub rec PackInstance {
     name:     intern.StrId;
 }
 
-# per-module lowering state, threaded through every decl / stmt / expr
-#
-# The leading fields are the phase inputs and the IR being built; the following
-# fields are the working state for the function currently being lowered (reset
-# by `begin_function`). `test_mode` remains appended to preserve every existing
-# field offset.
-# ---
-# s:             shared session (allocator, interner, type universe)
-# tgt:           selected target -- drives IR type sizing
-# a:             parsed AST being lowered
-# fqn:           FQN of the module being lowered; the mangler qualifies every
-#                definition's symbol with it
-# own_module:    ModuleId of the module being lowered; keys its export-name
-#                overrides and matches a self-reference's origin
-# sema_result:   typing output parallel to the AST
-# rr:            name-resolution output parallel to the AST
-# ctx:           comptime context supplying folded global initialisers
-# debug:         the build's settled debug-info decision
-# m:             the IR module being built
-# builder:       insertion cursor into `m`
-# locals:        source SymbolId -> the Value naming its current storage (an
-#                alloca pointer for address-taken / mutable locals)
-# local_names:   source local name -> its storage Value, last-binding-wins; the
-#                inline-asm lowerer resolves `{name}` references against it
-#
-# fn_index:      index into m.functions of the function being lowered
-# ret_type:      IR return type of the function being lowered
-# fn_ret_sem:    semantic return type of the function being lowered, with
-#                generic substitution applied inside a monomorphized instance
-#                body; used by deferred `$each $fields(T)` body re-inference
-#
-# loops:         active loop stack (innermost last) for brk / cnt
-# loop_len:      number of active loop frames
-# loop_cap:      allocated capacity of the loop stack
-#
-# fins:          deferred `fin` body StmtIds (innermost last); each block marks
-#                the length on entry and pops back to it on exit, so the stack
-#                holds exactly the open scopes' pending fins
-# fin_len:       number of pending fin entries
-# fin_cap:       allocated capacity of the fin stack
-#
-# subst:         active generic substitution (concrete type-args by param
-#                ordinal) while lowering a monomorphized instance body, nil
-#                otherwise; lower_type consults it to resolve
-#                TYPE_GENERIC_PARAMs
-# subst_len:     number of substitution arguments
-#
-# insts:         per-module worklist of generic instances collected at call
-#                sites, drained to fixpoint after the module's decls are lowered
-# inst_len:      number of worklist entries
-# inst_cap:      allocated capacity of the worklist
-# inst_drained:  persistent cursor into `insts`: entries below it are already
-#                emitted, so a re-entrant drain emits each generic body exactly
-#                once
-# inst_current:  worklist index of the instance whose body is being lowered, or
-#                INSTANCE_NONE outside an instance body; every instance named
-#                from here is stamped as its child, which is what makes a
-#                derivation chain measurable
-#
-# vinsts:        per-module worklist of comptime value-parameter instances,
-#                drained after the type-instance worklist; each binds its
-#                `$param -> CTValue` while lowering
-# vinst_len:     number of value-instance worklist entries
-# vinst_cap:     allocated capacity of the value-instance worklist
-# vinst_drained: persistent cursor into `vinsts` (see inst_drained)
-#
-# pinsts:        per-module worklist of comptime variadic-pack instances,
-#                drained alongside the type / value worklists; each expands the
-#                pack to N params typed by its element type-list
-# pinst_len:     number of pack-instance worklist entries
-# pinst_cap:     allocated capacity of the pack-instance worklist
-# pinst_drained: persistent cursor into `pinsts` (see inst_drained)
-#
-# pack_slots:    while lowering a pack instance body, the N expanded pack-
-#                parameter alloca slots (by pack ordinal); nil outside a pack
-#                instance
-# pack_types:    the N concrete pack element semantic types (by pack ordinal),
-#                parallel to pack_slots; nil outside a pack instance
-# pack_len:      number of expanded pack parameters (0 outside a pack instance)
-# pack_ret_type: the pack instance's semantic return type, supplied to per-
-#                element body re-inference so a body `ret` checks against it
-#
-# ct_insts:      the module's constant-time re-validation worklist (#2177), shared
-#                by every deferred-`$each` body re-inference so a generic reached
-#                only from inside one is re-validated under its concrete type
-#                arguments, and each distinct instance exactly once
-# test_mode:     true when test declarations belong in the emitted IR; appended
-#                to keep the existing working-field offsets stable
+pub rec ModuleScope {
+    a:            *ast.Ast;
+    fqn:          intern.StrId;
+    own_module:   session.ModuleId;
+    sema_result:  *sema.SemaResult;
+    rr:           *resolve.ResolveResult;
+    env:          comptime.ComptimeEnv;
+    ctx:          *comptime.ComptimeCtx;
+    subst:        *type.TypeId;
+    subst_len:    u32;
+    inst_current: u32;
+}
+
+pub rec ScopeMark {
+    owner:      ptr;
+    depth:      u32;
+    generation: u64;
+    parent:     u64;
+}
+
+pub rec LowerRequest {
+    s:         *session.Session;
+    tgt:       *target.Target;
+    malloc:    *A.Allocator;
+    module:    ModuleScope;
+    test_mode: bool;
+    debug:     bool;
+}
+
 pub rec LowerContext {
     s:           *session.Session;
     tgt:         *target.Target;
-    a:           *ast.Ast;
-    fqn:         intern.StrId;
-    own_module:  session.ModuleId;
-    sema_result: *sema.SemaResult;
-    rr:          *resolve.ResolveResult;
-    ctx:         *comptime.ComptimeCtx;
-    # the build's settled debug-info decision: gate the scope tree and the
-    # per-local source metadata the DWARF producer consumes downstream
+    scope:       ModuleScope;
+    scopes:      *ModuleScope;
+    scope_len:   u32;
+    scope_cap:   u32;
+    scope_generation: u64;
+    scope_top:        u64;
+    caps:        comptime.PhaseCapabilities[LowerContext];
     debug:       bool;
     m:           *ir.Module;
     builder:     builder.Builder;
@@ -297,24 +150,23 @@ pub rec LowerContext {
     fin_len: u32;
     fin_cap: u32;
 
-    subst:     *type.TypeId;
-    subst_len: u32;
-
     insts:        *Instance;
     inst_len:     u32;
     inst_cap:     u32;
     inst_drained: u32;
-    inst_current: u32;
+    inst_by_name: map.Map[intern.StrId, u32];
 
     vinsts:        *ValueInstance;
     vinst_len:     u32;
     vinst_cap:     u32;
     vinst_drained: u32;
+    vinst_by_name: map.Map[intern.StrId, u32];
 
     pinsts:        *PackInstance;
     pinst_len:     u32;
     pinst_cap:     u32;
     pinst_drained: u32;
+    pinst_by_name: map.Map[intern.StrId, u32];
 
     pack_slots:    *value.Value;
     pack_types:    *type.TypeId;
@@ -323,32 +175,84 @@ pub rec LowerContext {
 
     ct_insts: *sema.InstWorklist;
 
-    # appended so the build variant does not perturb existing working-field offsets
     test_mode: bool;
 }
 
+pub fun scope_nil() ModuleScope {
+    var sc: ModuleScope;
+    sc.a            = nil;
+    sc.fqn          = intern.STR_NIL;
+    sc.own_module   = 0::session.ModuleId;
+    sc.sema_result  = nil;
+    sc.rr           = nil;
+    sc.ctx          = nil;
+    sc.subst        = nil;
+    sc.subst_len    = 0;
+    sc.inst_current = INSTANCE_NONE;
+    ret sc;
+}
 
-# initialise a LowerContext: wire the phase inputs, point the builder at the
-# module, install the comptime resolvers, build the locals maps, and allocate
-# the loop / fin working stacks
-# ---
-# lc:          context to populate
-# s:           shared session
-# tgt:         selected target
-# a:           parsed AST
-# fqn:         FQN of the module being lowered (for symbol mangling)
-# own_module:  ModuleId of the module being lowered
-# sema_result: typing output
-# rr:          name resolution
-# ctx:         comptime context
-# test_mode:   true when test declarations belong in the emitted IR
-# debug:       the build's settled debug-info decision
-# m:           IR module being built
-# ret:         true on success, or an allocation error
-pub fun init_context(
-    lc:          *LowerContext,
+pub fun module_scope(
+    s:           *session.Session,
+    own_module:  session.ModuleId,
+    a:           *ast.Ast,
+    fqn:         intern.StrId,
+    sema_result: *sema.SemaResult,
+    rr:          *resolve.ResolveResult,
+    ctx:         *comptime.ComptimeCtx
+) R.Result[ModuleScope, fail.Fail] {
+    if (s == nil)   { ret R.err[ModuleScope, fail.Fail](fail.message("lower: a module scope requires a session")); }
+    if (a == nil)   { ret R.err[ModuleScope, fail.Fail](fail.message("lower: module scope has no parsed AST")); }
+    if (sema_result == nil) { ret R.err[ModuleScope, fail.Fail](fail.message("lower: module scope has no semantic result")); }
+    if (rr == nil)  { ret R.err[ModuleScope, fail.Fail](fail.message("lower: module scope has no name-resolution result")); }
+    if (ctx == nil) { ret R.err[ModuleScope, fail.Fail](fail.message("lower: module scope has no comptime context")); }
+
+    if (session.module_ast(s, own_module) != a) {
+        ret R.err[ModuleScope, fail.Fail](fail.message("lower: module scope AST belongs to another module"));
+    }
+    if (session.module_fqn(s, own_module) != fqn) {
+        ret R.err[ModuleScope, fail.Fail](fail.message("lower: module scope name belongs to another module"));
+    }
+    if ((session.module_sema_ptr(s, own_module))::*sema.SemaResult != sema_result) {
+        ret R.err[ModuleScope, fail.Fail](fail.message("lower: module scope semantic result belongs to another module"));
+    }
+    if ((session.module_resolve_ptr(s, own_module))::*resolve.ResolveResult != rr) {
+        ret R.err[ModuleScope, fail.Fail](fail.message("lower: module scope name-resolution result belongs to another module"));
+    }
+    if ((session.module_comptime_ptr(s, own_module))::*comptime.ComptimeCtx != ctx) {
+        ret R.err[ModuleScope, fail.Fail](fail.message("lower: module scope comptime context belongs to another module"));
+    }
+
+    var sc: ModuleScope = scope_nil();
+    sc.a           = a;
+    sc.fqn         = fqn;
+    sc.own_module  = own_module;
+    sc.sema_result = sema_result;
+    sc.rr          = rr;
+    sc.env         = comptime.environment(ctx);
+    sc.ctx         = ctx;
+    ret R.ok[ModuleScope, fail.Fail](sc);
+}
+
+pub fun origin_scope(s: *session.Session, origin: session.ModuleId) O.Option[ModuleScope] {
+    val oa: *ast.Ast = session.module_ast(s, origin);
+    if (oa == nil) { ret O.none[ModuleScope](); }
+    val osema: *sema.SemaResult = (session.module_sema_ptr(s, origin))::*sema.SemaResult;
+    if (osema == nil) { ret O.none[ModuleScope](); }
+    val orr: *resolve.ResolveResult = (session.module_resolve_ptr(s, origin))::*resolve.ResolveResult;
+    if (orr == nil) { ret O.none[ModuleScope](); }
+    val octx: *comptime.ComptimeCtx = (session.module_comptime_ptr(s, origin))::*comptime.ComptimeCtx;
+    if (octx == nil) { ret O.none[ModuleScope](); }
+
+    val r: R.Result[ModuleScope, fail.Fail] = module_scope(s, origin, oa, session.module_fqn(s, origin), osema, orr, octx);
+    if (R.is_err[ModuleScope, fail.Fail](r)) { ret O.none[ModuleScope](); }
+    ret O.some[ModuleScope](R.unwrap_ok[ModuleScope, fail.Fail](r));
+}
+
+pub fun request(
     s:           *session.Session,
     tgt:         *target.Target,
+    malloc:      *A.Allocator,
     a:           *ast.Ast,
     fqn:         intern.StrId,
     own_module:  session.ModuleId,
@@ -356,42 +260,94 @@ pub fun init_context(
     rr:          *resolve.ResolveResult,
     ctx:         *comptime.ComptimeCtx,
     test_mode:   bool,
-    debug:       bool,
-    m:           *ir.Module
-) R.Result[bool, str] {
+    debug:       bool
+) R.Result[LowerRequest, fail.Fail] {
+    if (tgt == nil)    { ret R.err[LowerRequest, fail.Fail](fail.message("lower: a lowering request requires a resolved target")); }
+    if (malloc == nil) { ret R.err[LowerRequest, fail.Fail](fail.message("lower: a lowering request requires an allocator")); }
+
+    val sr: R.Result[ModuleScope, fail.Fail] = module_scope(s, own_module, a, fqn, sema_result, rr, ctx);
+    if (R.is_err[ModuleScope, fail.Fail](sr)) { ret R.err[LowerRequest, fail.Fail](R.unwrap_err[ModuleScope, fail.Fail](sr)); }
+
+    var req: LowerRequest;
+    req.s         = s;
+    req.tgt       = tgt;
+    req.malloc    = malloc;
+    req.module    = R.unwrap_ok[ModuleScope, fail.Fail](sr);
+    req.test_mode = test_mode;
+    req.debug     = debug;
+    ret R.ok[LowerRequest, fail.Fail](req);
+}
+
+pub fun scope_enter(lc: *LowerContext, next: ModuleScope) R.Result[ScopeMark, fail.Fail] {
+    if (lc == nil) { ret R.err[ScopeMark, fail.Fail](fail.message("lower: scope_enter requires a context")); }
+    if (lc.scope_generation == 0xFFFFFFFFFFFFFFFF) {
+        ret R.err[ScopeMark, fail.Fail](fail.message("lower: module scope generation exhausted"));
+    }
+    if (lc.scope_len == lc.scope_cap) {
+        var new_cap: u32 = lc.scope_cap * 2;
+        if (new_cap == 0) { new_cap = INITIAL_STACK_CAP; }
+        val gr: R.Result[*ModuleScope, str] = A.reallocate[ModuleScope](lc.s.alloc, lc.scopes, lc.scope_cap::usize, new_cap::usize);
+        if (R.is_err[*ModuleScope, str](gr)) { ret R.err[ScopeMark, fail.Fail](fail.message(R.unwrap_err[*ModuleScope, str](gr))); }
+        lc.scopes    = R.unwrap_ok[*ModuleScope, str](gr);
+        lc.scope_cap = new_cap;
+    }
+
+    lc.scopes[lc.scope_len] = lc.scope;
+    lc.scope_len = lc.scope_len + 1;
+
+    var mark: ScopeMark;
+    mark.owner      = lc::ptr;
+    mark.depth      = lc.scope_len;
+    mark.generation = lc.scope_generation + 1;
+    mark.parent     = lc.scope_top;
+
+    lc.scope_generation = mark.generation;
+    lc.scope_top        = mark.generation;
+    lc.scope            = next;
+    ret R.ok[ScopeMark, fail.Fail](mark);
+}
+
+pub fun scope_leave(lc: *LowerContext, mark: ScopeMark) R.Result[R.Void, fail.Fail] {
+    if (lc == nil || mark.owner != lc::ptr) {
+        ret R.err[R.Void, fail.Fail](fail.message("lower: scope_leave mark belongs to another context"));
+    }
+    if (mark.generation == 0 || mark.generation != lc.scope_top || mark.depth != lc.scope_len) {
+        ret R.err[R.Void, fail.Fail](fail.message("lower: scope_leave mark is stale or out of order"));
+    }
+    lc.scope_len = lc.scope_len - 1;
+    lc.scope     = lc.scopes[lc.scope_len];
+    lc.scope_top = mark.parent;
+    ret R.ok_void[fail.Fail]();
+}
+
+pub fun init_context(lc: *LowerContext, req: *LowerRequest, m: *ir.Module) R.Result[R.Void, fail.Fail] {
+    if (req == nil) { ret R.err[R.Void, fail.Fail](fail.message("lower: init_context requires a lowering request")); }
+    val s: *session.Session = req.s;
     lc.s           = s;
-    lc.tgt         = tgt;
-    lc.a           = a;
-    lc.fqn         = fqn;
-    lc.own_module  = own_module;
-    lc.sema_result = sema_result;
-    lc.rr          = rr;
-    lc.ctx         = ctx;
-    lc.test_mode   = test_mode;
-    lc.debug       = debug;
+    lc.tgt         = req.tgt;
+    lc.scope       = req.module;
+    lc.scopes      = nil;
+    lc.scope_len   = 0;
+    lc.scope_cap   = 0;
+    lc.scope_generation = 0;
+    lc.scope_top        = 0;
+    lc.test_mode   = req.test_mode;
+    lc.debug       = req.debug;
     lc.m           = m;
     lc.builder     = builder.init(m);
 
-    # install the `alias.CONST` member resolver so comptime.eval can fold module-
-    # qualified constant paths in this module's initialisers and gates. data is
-    # the LowerContext itself, read live so the value-instance drains' module
-    # swaps stay correct.
-    comptime.set_member_resolver(ctx, resolve_module_member_const::*u8, lc::ptr);
-    # install the type-comparison operand resolver so comptime.eval can fold
-    # `$type_of(...)` type gates in this module's bodies.
-    comptime.set_type_resolver(ctx, resolve_type_comparison_operand::*u8, lc::ptr);
-    # install the field-descriptor member resolver so `f.name` / `f.type` /
-    # `f.offset` fold inside `$each` bodies.
-    comptime.set_field_resolver(ctx, resolve_field_member::*u8, lc::ptr);
-    # install the type-query resolver so a `$is_record` / `$type_name` gate folds here.
-    comptime.set_type_query_resolver(ctx, resolve_type_query::*u8, lc::ptr);
-    # and the layout resolver, so a `$size_of` / `$align_of` gate folds here too
-    # (#2857) - a chain whose arm is selected at monomorphization never reaches
-    # sema's resolver.
-    comptime.set_layout_resolver(ctx, resolve_layout_intrinsic::*u8, lc::ptr);
-    # install the identifier-binding resolver so a gate folded here reads the
-    # declaration each leaf resolves to rather than its spelling (#2764).
-    comptime.set_ident_resolver(ctx, comptime_ident_is_runtime::*u8, lc::ptr);
+    val caps_r: R.Result[comptime.PhaseCapabilities[LowerContext], str] = comptime.lowering_capabilities[LowerContext](
+        resolve_module_member_const,
+        resolve_type_comparison_operand,
+        resolve_field_member,
+        resolve_type_query,
+        resolve_layout_intrinsic,
+        comptime_ident_is_runtime
+    );
+    if (R.is_err[comptime.PhaseCapabilities[LowerContext], str](caps_r)) {
+        ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[comptime.PhaseCapabilities[LowerContext], str](caps_r)));
+    }
+    lc.caps = R.unwrap_ok[comptime.PhaseCapabilities[LowerContext], str](caps_r);
 
     lc.locals      = map.init[resolve.SymbolId, value.Value](s.alloc, map.hash_u32, map.eq_u32);
     lc.local_names = map.init[intern.StrId, LocalBinding](s.alloc, map.hash_u32, map.eq_u32);
@@ -404,7 +360,7 @@ pub fun init_context(
     if (R.is_err[*LoopFrame, str](res_loops)) {
         map.dnit[intern.StrId, LocalBinding](?lc.local_names);
         map.dnit[resolve.SymbolId, value.Value](?lc.locals);
-        ret R.err[bool, str](R.unwrap_err[*LoopFrame, str](res_loops));
+        ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*LoopFrame, str](res_loops)));
     }
     lc.loops    = R.unwrap_ok[*LoopFrame, str](res_loops);
     lc.loop_len = 0;
@@ -415,71 +371,58 @@ pub fun init_context(
         A.deallocate[LoopFrame](s.alloc, lc.loops, lc.loop_cap::usize);
         map.dnit[intern.StrId, LocalBinding](?lc.local_names);
         map.dnit[resolve.SymbolId, value.Value](?lc.locals);
-        ret R.err[bool, str](R.unwrap_err[*id.StmtId, str](res_fins));
+        ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*id.StmtId, str](res_fins)));
     }
     lc.fins    = R.unwrap_ok[*id.StmtId, str](res_fins);
     lc.fin_len = 0;
     lc.fin_cap = INITIAL_STACK_CAP;
 
-    lc.subst     = nil;
-    lc.subst_len = 0;
-
     lc.insts        = nil;
     lc.inst_len     = 0;
     lc.inst_cap     = 0;
     lc.inst_drained = 0;
-    lc.inst_current = INSTANCE_NONE;
+    lc.inst_by_name = map.init[intern.StrId, u32](s.alloc, map.hash_u32, map.eq_u32);
 
     lc.vinsts        = nil;
     lc.vinst_len     = 0;
     lc.vinst_cap     = 0;
     lc.vinst_drained = 0;
+    lc.vinst_by_name = map.init[intern.StrId, u32](s.alloc, map.hash_u32, map.eq_u32);
 
     lc.pinsts        = nil;
     lc.pinst_len     = 0;
     lc.pinst_cap     = 0;
     lc.pinst_drained = 0;
+    lc.pinst_by_name = map.init[intern.StrId, u32](s.alloc, map.hash_u32, map.eq_u32);
 
     lc.pack_slots    = nil;
     lc.pack_types    = nil;
     lc.pack_len      = 0;
     lc.pack_ret_type = type.TYPE_NIL;
 
-    # the CT re-validation worklist spans the whole module's lowering so its
-    # `drained` cursor dedupes across every deferred-`$each` body (#2177).
     val res_ct: R.Result[*sema.InstWorklist, str] = sema.inst_worklist_new(s.alloc);
     if (R.is_err[*sema.InstWorklist, str](res_ct)) {
         A.deallocate[id.StmtId](s.alloc, lc.fins, lc.fin_cap::usize);
         A.deallocate[LoopFrame](s.alloc, lc.loops, lc.loop_cap::usize);
+        map.dnit[intern.StrId, u32](?lc.pinst_by_name);
+        map.dnit[intern.StrId, u32](?lc.vinst_by_name);
+        map.dnit[intern.StrId, u32](?lc.inst_by_name);
         map.dnit[intern.StrId, LocalBinding](?lc.local_names);
         map.dnit[resolve.SymbolId, value.Value](?lc.locals);
-        ret R.err[bool, str](R.unwrap_err[*sema.InstWorklist, str](res_ct));
+        ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*sema.InstWorklist, str](res_ct)));
     }
     lc.ct_insts = R.unwrap_ok[*sema.InstWorklist, str](res_ct);
 
-    ret R.ok[bool, str](true);
+    ret R.ok_void[fail.Fail]();
 }
 
-# release the working storage held by a LowerContext (the locals maps, the loop
-# and fin stacks, the three instance worklists, and the constant-time re-validation
-# worklist) and clear the comptime
-# resolvers init_context installed, so the borrowed ctx never keeps a dangling
-# LowerContext pointer past this module's lowering. does not otherwise touch the
-# borrowed phase inputs or the module
-# ---
-# lc: context to tear down
 pub fun dnit_context(lc: *LowerContext) {
     if (lc == nil) { ret; }
-    if (lc.ctx != nil) {
-        comptime.set_member_resolver(lc.ctx, nil, nil);
-        comptime.set_type_resolver(lc.ctx, nil, nil);
-        comptime.set_field_resolver(lc.ctx, nil, nil);
-        comptime.set_type_query_resolver(lc.ctx, nil, nil);
-        comptime.set_layout_resolver(lc.ctx, nil, nil);
-        comptime.set_ident_resolver(lc.ctx, nil, nil);
-    }
     map.dnit[intern.StrId, LocalBinding](?lc.local_names);
     map.dnit[resolve.SymbolId, value.Value](?lc.locals);
+    map.dnit[intern.StrId, u32](?lc.inst_by_name);
+    map.dnit[intern.StrId, u32](?lc.vinst_by_name);
+    map.dnit[intern.StrId, u32](?lc.pinst_by_name);
 
     if (lc.loops != nil && lc.loop_cap > 0) {
         A.deallocate[LoopFrame](lc.s.alloc, lc.loops, lc.loop_cap::usize);
@@ -526,6 +469,15 @@ pub fun dnit_context(lc: *LowerContext) {
     sema.inst_worklist_free(lc.ct_insts);
     lc.ct_insts = nil;
 
+    if (lc.scopes != nil && lc.scope_cap > 0) {
+        A.deallocate[ModuleScope](lc.s.alloc, lc.scopes, lc.scope_cap::usize);
+    }
+    lc.scope     = scope_nil();
+    lc.scopes    = nil;
+    lc.scope_len = 0;
+    lc.scope_cap = 0;
+    lc.scope_top = 0;
+
     lc.loops    = nil;
     lc.loop_len = 0;
     lc.loop_cap = 0;
@@ -537,7 +489,6 @@ pub fun dnit_context(lc: *LowerContext) {
     lc.inst_len     = 0;
     lc.inst_cap     = 0;
     lc.inst_drained = 0;
-    lc.inst_current = INSTANCE_NONE;
 
     lc.vinsts        = nil;
     lc.vinst_len     = 0;
@@ -555,46 +506,35 @@ pub fun dnit_context(lc: *LowerContext) {
     lc.pack_ret_type = type.TYPE_NIL;
 }
 
-# the comptime-constant table that DECLARES `sym`
-#
-# A ComptimeCtx is keyed by bare leaf name, so it only answers for the module
-# that owns it: the declaring module's table is the one authority for a
-# reference's folded value (#2223). A symbol declared by the module being
-# lowered reads the ACTIVE context, so an open `$param` / `$each` frame stays
-# visible; anything else reads the declaring module's registered context. Nil
-# when that module registered no context (a build-graph incoherence), which
-# every caller treats as "not a foldable constant".
-# ---
-# lc:  the active lowering context
-# sym: the referenced symbol
-# ret: the ComptimeCtx that declares `sym`, or nil
 pub fun declaring_comptime_ctx(lc: *LowerContext, sym: *resolve.Symbol) *comptime.ComptimeCtx {
-    if (sym.origin == lc.own_module) { ret lc.ctx; }
+    if (sym.origin == lc.scope.own_module) { ret lc.scope.ctx; }
     ret (session.module_comptime_ptr(lc.s, sym.origin))::*comptime.ComptimeCtx;
 }
 
-# the `alias.CONST` member resolver lowering installs on every ComptimeCtx it
-# evaluates against (a comptime.ModuleMemberFn)
-#
-# Given a module-qualified member expression, it reads the active module's name
-# resolution for the member's resolved symbol; when that symbol is a constant
-# imported from another module, it returns the constant's pre-folded comptime
-# value from the declaring module's ComptimeCtx. It returns none -- leaving
-# comptime.eval to reject the path with a loud error -- whenever the member
-# resolves to anything else (a function, a `var`, a non-constant `val`, or an
-# unexported / unknown member): the declaring module's ctx holds exactly its
-# transitively-constant module-level vals, so a lookup miss there is the scope
-# guard for everything that is not a constant. `data` is the *LowerContext
-# driving the evaluation; reading its `rr` / `s` live keeps the resolver correct
-# across the value-instance drains that swap the active module.
-# ---
-# data: the *LowerContext, erased to a ptr by the installer
-# eid:  the MEMBER expression id, valid in the active module's ast
-# ret:  some(value) when the member names a module-level constant, else none
-pub fun resolve_module_member_const(data: ptr, eid: id.ExprId) R.Result[O.Option[comptime.CTValue], str] {
-    val lc: *LowerContext = data::*LowerContext;
+pub fun gated_lower_member_const_message(lc: *LowerContext, name: intern.StrId, dep_fqn: intern.StrId) str {
+    val fallback: str = "tuple-dependent public constants are not yet supported in union builds";
+    val no: O.Option[str] = intern.lookup(?lc.s.interner, name);
+    val fo: O.Option[str] = intern.lookup(?lc.s.interner, dep_fqn);
+    if (O.is_none[str](no) || O.is_none[str](fo)) { ret fallback; }
+
+    val res_msg: R.Result[str, str] = format.sprint(lc.s.alloc,
+        "tuple-dependent public constants are not yet supported in union builds: '{}' in module '{}' is bound under a per-target-tuple condition",
+        O.unwrap[str](no), O.unwrap[str](fo));
+    if (R.is_err[str, str](res_msg)) { ret fallback; }
+    val buf: str = R.unwrap_ok[str, str](res_msg);
+
+    val ir: R.Result[intern.StrId, str] = intern.intern(?lc.s.interner, buf);
+    str_free(lc.s.alloc, buf);
+    if (R.is_err[intern.StrId, str](ir)) { ret fallback; }
+
+    val nm: O.Option[str] = intern.lookup(?lc.s.interner, R.unwrap_ok[intern.StrId, str](ir));
+    if (O.is_some[str](nm)) { ret O.unwrap[str](nm); }
+    ret fallback;
+}
+
+pub fun resolve_module_member_const(lc: *LowerContext, eid: id.ExprId) R.Result[O.Option[comptime.CTValue], str] {
     if (lc == nil) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
-    val rr: *resolve.ResolveResult = lc.rr;
+    val rr: *resolve.ResolveResult = lc.scope.rr;
     if (rr == nil || rr.expr_resolved == nil || eid::u32 >= rr.expr_count) {
         ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]());
     }
@@ -608,129 +548,63 @@ pub fun resolve_module_member_const(data: ptr, eid: id.ExprId) R.Result[O.Option
     }
     val octx: *comptime.ComptimeCtx = declaring_comptime_ctx(lc, sym);
     if (octx == nil) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
-    val nc: O.Option[*comptime.NamedConst] = comptime.lookup(octx, sym.name);
-    if (O.is_none[*comptime.NamedConst](nc)) {
+    val nc: O.Option[comptime.NamedConst] = comptime.lookup(octx, sym.name);
+    if (O.is_none[comptime.NamedConst](nc)) {
         ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]());
     }
-    ret R.ok[O.Option[comptime.CTValue], str](O.some[comptime.CTValue](O.unwrap[*comptime.NamedConst](nc).value));
+    val named: comptime.NamedConst = O.unwrap[comptime.NamedConst](nc);
+    if (named.gated && lc.scope.env.union_build) {
+        val msg: str = gated_lower_member_const_message(lc, sym.name, session.module_fqn(lc.s, sym.origin));
+        val e_opt: O.Option[*aexpr.Expr] = ast.get_expr(lc.scope.a, eid);
+        var span: token.Span;
+        span.offset = 0;
+        span.len    = 0;
+        if (O.is_some[*aexpr.Expr](e_opt)) { span = O.unwrap[*aexpr.Expr](e_opt).span; }
+        diagnostic.record_gate_error(?lc.s.gate_diags, ?lc.s.diags, ?lc.s.interner, lc.scope.a.file_id, span, msg);
+        ret R.err[O.Option[comptime.CTValue], str](msg);
+    }
+    ret R.ok[O.Option[comptime.CTValue], str](O.some[comptime.CTValue](named.value));
 }
 
-# the identifier-binding resolver lowering installs on every ComptimeCtx it
-# evaluates against (a comptime.IdentBindingFn)
-#
-# Lowering is where a `$param`-gated `$if` finally folds, and a body it folds may
-# hold a runtime local that shares a name with a module constant. Answering that by
-# spelling selects an arm the program never asked for, silently (#2764), so the
-# question goes to `resolve.symbol_is_runtime` like everywhere else. `data` is the
-# *LowerContext driving the evaluation; reading its `rr` live keeps the answer
-# correct across the instance drains that swap the active module - the same reason
-# the member resolver reads it live
-# ---
-# data: the *LowerContext, erased to a ptr by the installer
-# eid:  the IDENT expression id, valid in the active module's ast
-# ret:  true when the identifier names a runtime binding
-pub fun comptime_ident_is_runtime(data: ptr, eid: id.ExprId) bool {
-    val lc: *LowerContext = data::*LowerContext;
+pub fun comptime_ident_is_runtime(lc: *LowerContext, eid: id.ExprId) bool {
     if (lc == nil || eid == id.EXPR_NIL) { ret false; }
-    val rr: *resolve.ResolveResult = lc.rr;
+    val rr: *resolve.ResolveResult = lc.scope.rr;
     if (rr == nil || rr.expr_resolved == nil || eid::u32 >= rr.expr_count) { ret false; }
     val sid: resolve.SymbolId = rr.expr_resolved[eid];
     if (sid == resolve.SYMBOL_NIL || sid::u32 >= rr.symbol_count) { ret false; }
     ret resolve.symbol_is_runtime(?rr.symbols[sid]);
 }
 
-# the type-comparison operand resolver lowering installs on every ComptimeCtx it
-# evaluates against (a comptime.TypeIdentFn)
-#
-# Given the value expression of a type-comparison operand -- a `$type_of(...)`'s
-# inner value, or a type-name spelling -- it returns the operand's interned
-# semantic TypeId as an opaque type-identity token, so a `$type_of(x) == i64`
-# gate folds to an identity compare. None when the expression carries no
-# resolved type (an untyped or erroneous operand), leaving comptime.eval to
-# defer / error. `data` is the *LowerContext driving the evaluation; reading its
-# `sema_result` live keeps the resolver correct across the value-instance drains
-# that swap the active module.
-# ---
-# data: the *LowerContext, erased to a ptr by the installer
-# eid:  the operand value expression id, valid in the active module's ast
-# ret:  some(type-id token) when the operand has a resolved type, else none
-pub fun resolve_type_comparison_operand(data: ptr, eid: id.ExprId) R.Result[O.Option[u32], str] {
-    val lc: *LowerContext = data::*LowerContext;
+pub fun resolve_type_comparison_operand(lc: *LowerContext, eid: id.ExprId) R.Result[O.Option[u32], str] {
     if (lc == nil) { ret R.ok[O.Option[u32], str](O.none[u32]()); }
     val t: type.TypeId = expr_type_of(lc, eid);
     if (t == type.TYPE_NIL || t == type.TYPE_ERROR) { ret R.ok[O.Option[u32], str](O.none[u32]()); }
     ret R.ok[O.Option[u32], str](O.some[u32](t::u32));
 }
 
-# the type-query resolver lowering installs on every ComptimeCtx it evaluates
-# against (a comptime.TypeQueryFn), so a `$is_record` / `$is_union` / `$is_pointer`
-# / `$is_secret` / `$type_name` gate deferred past sema still folds here (#2128,
-# #2694)
-#
-# Delegates to `infer.answer_type_query`, the one implementation, so a predicate
-# folded during arm selection and the same predicate folded at monomorphization
-# cannot answer differently.
-# ---
-# data:  the *LowerContext, erased to a ptr by the installer
-# tid:   the already-resolved TypeId to ask about
-# which: a comptime.TYPE_QUERY_* selector
-# ret:   some(bool) for a predicate, some(string) for the name, none when unanswerable
-pub fun resolve_type_query(data: ptr, tid: u32, which: u8) R.Result[O.Option[comptime.CTValue], str] {
-    val lc: *LowerContext = data::*LowerContext;
+pub fun resolve_type_query(lc: *LowerContext, tid: u32, which: u8) R.Result[O.Option[comptime.CTValue], str] {
     if (lc == nil) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
     ret infer.answer_type_query(lc.s, tid, which);
 }
 
-# the layout resolver lowering installs so a `$size_of` / `$align_of` / `$length_of`
-# gate folds here as well as in sema (#2857, #2875)
-#
-# LOWERING NEEDS ITS OWN because a `$if` chain does not always fold in sema: a chain
-# gated on a comptime value parameter, or one inside a generic body, has its arm
-# selected here at monomorphization instead - which is why lowering already installs
-# a type-query resolver beside this one. A layout gate reaching that point with no
-# resolver was refused outright, so the sema-side fix alone left the generic case
-# broken.
-#
-# The measurement is `ir_type.byte_size` / `byte_align` over the IR type, the same
-# authority `lower_comptime_intrinsic` reads for a VALUE position two files over.
-# That is what keeps a size folded in a gate equal to the same size folded in an
-# expression: sema's `type_extent` and this both resolve through the one session
-# layout entry (see the note at `lower_type`), so the three cannot disagree.
-#
-# `$length_of` counts elements rather than measuring storage, so it is answered from
-# the SEMA type's `element_count` and never reaches the IR: an element count is a
-# property of the type spelling and is the same on every target, which is exactly
-# what makes reading it here equal to sema's answer.
-#
-# `$offset_of` answers none: it takes a field as its second argument, which this
-# signature does not carry, and sema does not fold it in a gate either.
-# ---
-# data: the erased *LowerContext
-# eid:  the intrinsic call expression, as a raw id
-# ret:  ok(some(v)) measured; ok(none) not answerable here; err on a real failure
-pub fun resolve_layout_intrinsic(data: ptr, eid: u32) R.Result[O.Option[comptime.CTValue], str] {
-    val lc: *LowerContext = data::*LowerContext;
+pub fun resolve_layout_intrinsic(lc: *LowerContext, eid: u32) R.Result[O.Option[comptime.CTValue], str] {
     if (lc == nil) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
     val e: id.ExprId = eid::id.ExprId;
     val src: str = module_source(lc);
-    val is_size:  bool = comptime.is_size_of_call(lc.a, src, e);
-    val is_align: bool = comptime.is_align_of_call(lc.a, src, e);
-    val is_len:   bool = comptime.is_length_of_call(lc.a, src, e);
+    val is_size:  bool = comptime.is_size_of_call(lc.scope.a, src, e);
+    val is_align: bool = comptime.is_align_of_call(lc.scope.a, src, e);
+    val is_len:   bool = comptime.is_length_of_call(lc.scope.a, src, e);
     if (!is_size && !is_align && !is_len) {
         ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]());
     }
 
-    val arg: id.ExprId = comptime.layout_intrinsic_type_arg(lc.a, e);
+    val arg: id.ExprId = comptime.layout_intrinsic_type_arg(lc.scope.a, e);
     if (arg == id.EXPR_NIL) {
         ret R.err[O.Option[comptime.CTValue], str]("a layout intrinsic takes one type argument");
     }
-    # secret-stripped for the reason every other shape decision here is (#2297):
-    # `^T` occupies exactly `T`'s storage.
     val op_ty: type.TypeId = type.strip_secret(?lc.s.types, expr_type_of(lc, arg));
 
     if (is_len) {
-        # the count is read after substitution, so `$length_of(T)` inside a
-        # monomorphized body counts the instance's type argument.
         val n_opt: O.Option[u32] = type.element_count(?lc.s.types, substitute_type(lc, op_ty));
         if (O.is_none[u32](n_opt)) {
             ret R.err[O.Option[comptime.CTValue], str]("`$length_of` expects a fixed array or a vector");
@@ -739,34 +613,25 @@ pub fun resolve_layout_intrinsic(data: ptr, eid: u32) R.Result[O.Option[comptime
             O.some[comptime.CTValue](comptime.ct_uint(O.unwrap[u32](n_opt)::u64)));
     }
 
-    val res_ir: R.Result[ir_type.IrTypeId, str] = lower_type(lc, op_ty);
-    if (R.is_err[ir_type.IrTypeId, str](res_ir)) {
-        ret R.err[O.Option[comptime.CTValue], str](R.unwrap_err[ir_type.IrTypeId, str](res_ir));
+    val res_ir: R.Result[ir_type.IrTypeId, fail.Fail] = lower_type(lc, op_ty);
+    if (R.is_err[ir_type.IrTypeId, fail.Fail](res_ir)) {
+        ret R.err[O.Option[comptime.CTValue], str](R.unwrap_err[ir_type.IrTypeId, fail.Fail](res_ir).message);
     }
-    val op_ir: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](res_ir);
+    val op_ir: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, fail.Fail](res_ir);
 
-    var n: u32 = ir_type.byte_size(?lc.m.types, op_ir, lc.tgt);
-    if (is_align) { n = ir_type.byte_align(?lc.m.types, op_ir, lc.tgt); }
+    var n: u32 = ir_type.byte_size_for_machine(?lc.m.types, op_ir, target.layout_machine(lc.tgt));
+    if (is_align) { n = ir_type.byte_align_for_machine(?lc.m.types, op_ir, target.layout_machine(lc.tgt)); }
     ret R.ok[O.Option[comptime.CTValue], str](O.some[comptime.CTValue](comptime.ct_uint(n::u64)));
 }
 
-# the field-descriptor member resolver lowering installs on every ComptimeCtx it
-# evaluates against (a comptime.FieldMemberFn)
-#
-# Given the owning record's sema TypeId, a field ordinal, and a FIELD_SEL_*
-# selector, it projects the field's `.name` (str), `.type` (a sema TypeId
-# token), or `.offset` (its byte offset in the target layout, the same authority
-# `$offset_of` reads). None when the ordinal is out of range.
-# ---
-# data:  the *LowerContext, erased to a ptr by the installer
-# owner: the owning record's sema TypeId
-# index: the field ordinal
-# sel:   a comptime.FIELD_SEL_* selector
-# ret:   some(value) for the projected attribute, else none
-pub fun resolve_field_member(data: ptr, owner: u32, index: u32, sel: u8) R.Result[O.Option[comptime.CTValue], str] {
-    val lc: *LowerContext = data::*LowerContext;
+pub fun resolve_field_member(lc: *LowerContext, owner: u32, index: u32, sel: u8) R.Result[O.Option[comptime.CTValue], str] {
     if (lc == nil) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
     val owner_ty: type.TypeId = owner::type.TypeId;
+
+    if (sel == comptime.FIELD_SEL_ZERO_BY_NAME) {
+        ret resolve_omitted_field_zero(lc, owner_ty, index::intern.StrId);
+    }
+
     val fa: O.Option[*type.FieldEntry] = type.field_at(?lc.s.types, owner_ty, index);
     if (O.is_none[*type.FieldEntry](fa)) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
     val fe: *type.FieldEntry = O.unwrap[*type.FieldEntry](fa);
@@ -778,22 +643,43 @@ pub fun resolve_field_member(data: ptr, owner: u32, index: u32, sel: u8) R.Resul
         ret R.ok[O.Option[comptime.CTValue], str](O.some[comptime.CTValue](comptime.ct_type(fe.ty::u32)));
     }
 
-    # offset: the field's byte offset in the target layout (IR authority).
-    val res_ir: R.Result[ir_type.IrTypeId, str] = lower_type(lc, owner_ty);
-    if (R.is_err[ir_type.IrTypeId, str](res_ir)) { ret R.err[O.Option[comptime.CTValue], str](R.unwrap_err[ir_type.IrTypeId, str](res_ir)); }
-    val ir_id: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](res_ir);
-    val off: u32 = ir_type.byte_offset(?lc.m.types, ir_id, index, lc.tgt);
+    val res_ir: R.Result[ir_type.IrTypeId, fail.Fail] = lower_type(lc, owner_ty);
+    if (R.is_err[ir_type.IrTypeId, fail.Fail](res_ir)) { ret R.err[O.Option[comptime.CTValue], str](R.unwrap_err[ir_type.IrTypeId, fail.Fail](res_ir).message); }
+    val ir_id: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, fail.Fail](res_ir);
+    val off: u32 = ir_type.byte_offset_for_machine(?lc.m.types, ir_id, index, target.layout_machine(lc.tgt));
     ret R.ok[O.Option[comptime.CTValue], str](O.some[comptime.CTValue](comptime.ct_uint(off::u64)));
 }
 
-# reset the per-function working state before lowering a new function: clear the
-# locals maps and the loop / fin stacks, and record the new function index and
-# IR return type. the builder cursor is set by the caller (`lower.decl.lower_fun`)
-# once the entry block exists
-# ---
-# lc:       the context
-# fn_index: index of the function in m.functions
-# ret_type: the function's IR return type
+fun resolve_omitted_field_zero(lc: *LowerContext, owner_ty: type.TypeId, name: intern.StrId) R.Result[O.Option[comptime.CTValue], str] {
+    val stripped: type.TypeId = type.strip_secret(?lc.s.types, owner_ty);
+    val n: u32 = type.field_count(?lc.s.types, stripped);
+    var i: u32 = 0;
+    for (i < n) {
+        val fa: O.Option[*type.FieldEntry] = type.field_at(?lc.s.types, stripped, i);
+        if (O.is_some[*type.FieldEntry](fa)) {
+            val fe: *type.FieldEntry = O.unwrap[*type.FieldEntry](fa);
+            if (fe.name == name) {
+                val fty: type.TypeId = type.strip_secret(?lc.s.types, fe.ty);
+                val ft: O.Option[*type.Type] = type.get(?lc.s.types, fty);
+                if (O.is_none[*type.Type](ft)) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
+                val kind: type.TypeKind = O.unwrap[*type.Type](ft).kind;
+                val pd: type.PrimDesc = type.prim_desc(kind);
+                if (pd.class == type.PRIM_CLASS_INT) {
+                    ret R.ok[O.Option[comptime.CTValue], str](
+                        O.some[comptime.CTValue](comptime.ct_zero_int(!pd.signed, pd.bits::u8)));
+                }
+                if (pd.class == type.PRIM_CLASS_FLOAT) {
+                    ret R.ok[O.Option[comptime.CTValue], str](
+                        O.some[comptime.CTValue](comptime.ct_float(0.0, type.float_width_of(kind))));
+                }
+                ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]());
+            }
+        }
+        i = i + 1;
+    }
+    ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]());
+}
+
 pub fun begin_function(lc: *LowerContext, fn_index: u32, ret_type: ir_type.IrTypeId) {
     map.clear[resolve.SymbolId, value.Value](?lc.locals);
     map.clear[intern.StrId, LocalBinding](?lc.local_names);
@@ -803,79 +689,35 @@ pub fun begin_function(lc: *LowerContext, fn_index: u32, ret_type: ir_type.IrTyp
     lc.ret_type   = ret_type;
     lc.fn_ret_sem = type.TYPE_NIL;
 
-    # pack-instance body state defaults off; lower_pack_instance sets it after
-    # this reset, and an ordinary function (or a generic / value instance) never
-    # reads it.
     lc.pack_slots    = nil;
     lc.pack_types    = nil;
     lc.pack_len      = 0;
     lc.pack_ret_type = type.TYPE_NIL;
 }
 
-# a local's storage Value together with whether its storage may hold a SECRET
-#
-# One record per local rather than a `local_names` map beside a `local_secret` map:
-# the two would have to agree, and nothing would check that they did - the shape
-# #2364's dual secret markings were misread for. Carrying both facts in one entry
-# makes the agreement structural.
-#
-# `secret` is the DECLARED type's answer, taken at bind time from the sema type via
-# `type.carries_secret`, which is the same authority the welded-storage rules use. It
-# is what the inline-asm walk reads to decide whether a `{name}` binding is a secret
-# in of an `#[oblivious]` asm block (#2230).
-# ---
-# value:  the IR Value naming the local's storage
-# secret: true when the declared type carries `^` anywhere on its by-value spine
 pub rec LocalBinding {
     value:  value.Value;
     secret: bool;
 }
 
-# bind a source SymbolId to the IR Value that names its storage. for locals this
-# is the alloca-slot pointer; for parameters seeded before the body it may be a
-# VAL_PARAM. overwrites any prior binding
-#
-# The binding is also recorded by source name in `local_names` (last-binding-
-# wins) so the inline-asm lowerer can resolve a `{name}` reference to its storage
-# Value, mirroring cmach's name-keyed local table.
-# ---
-# lc:  the context
-# sym: source symbol id
-# v:   the Value to bind
-# ret: true on success, or an allocation error from the map
-pub fun bind_local(lc: *LowerContext, sym: resolve.SymbolId, v: value.Value) R.Result[bool, str] {
+pub fun bind_local(lc: *LowerContext, sym: resolve.SymbolId, v: value.Value, secret: bool) R.Result[R.Void, fail.Fail] {
     val res_bind: R.Result[bool, str] = map.insert[resolve.SymbolId, value.Value](?lc.locals, sym, v);
-    if (R.is_err[bool, str](res_bind)) { ret res_bind; }
+    if (R.is_err[bool, str](res_bind)) { ret fail.lift[R.Void](R.void_of[bool, str](res_bind)); }
 
     val opt_sym: O.Option[*resolve.Symbol] = symbol_of(lc, sym);
     if (O.is_some[*resolve.Symbol](opt_sym)) {
         val name: intern.StrId = O.unwrap[*resolve.Symbol](opt_sym).name;
         if (name != intern.STR_NIL) {
-            # the stamp: the DECLARED type decides, and this is the only site that
-            # writes `local_names`, so every name a `{name}` binding can resolve
-            # through carries it. an unknown decl yields TYPE_NIL, whose answer is
-            # false - correct, because a symbol with no declared type has no secret
-            # storage to describe.
             var lb: LocalBinding;
             lb.value  = v;
-            # the SPINE predicate, not the top-level one: a local typed `*^u8` holds
-            # a pointer whose pointee is secret, and treating its storage as secret
-            # refuses more than strictly necessary. that is the fail-closed direction,
-            # and it is what a security gate should err toward.
-            lb.secret = type.carries_secret(?lc.s.types, substitute_type(lc, decl_type_of(lc, O.unwrap[*resolve.Symbol](opt_sym).decl)));
-            ret map.insert[intern.StrId, LocalBinding](?lc.local_names, name, lb);
+            lb.secret = secret;
+            ret fail.lift[R.Void](R.void_of[bool, str](map.insert[intern.StrId, LocalBinding](?lc.local_names, name, lb)));
         }
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[fail.Fail]();
 }
 
-# look up the storage Value bound to a source local by interned name, or none
-# when no local with that name is in scope. the inline-asm lowerer uses this to
-# resolve `{name}` references in an asm body to the local's alloca slot
-# ---
-# lc:   the context
-# name: interned source local name
-# ret:  some(LocalBinding) when a local of that name is bound, none otherwise
+
 pub fun lookup_local_name(lc: *LowerContext, name: intern.StrId) O.Option[LocalBinding] {
     var key: intern.StrId = name;
     val res_get: R.Result[*LocalBinding, str] = map.get[intern.StrId, LocalBinding](?lc.local_names, ?key);
@@ -885,12 +727,6 @@ pub fun lookup_local_name(lc: *LowerContext, name: intern.StrId) O.Option[LocalB
     ret O.none[LocalBinding]();
 }
 
-# look up the Value bound to a source SymbolId, or none when the symbol has no
-# local binding (a global or function reference)
-# ---
-# lc:  the context
-# sym: source symbol id
-# ret: some(Value) when bound, none otherwise
 pub fun lookup_local(lc: *LowerContext, sym: resolve.SymbolId) O.Option[value.Value] {
     val res_get: R.Result[*value.Value, str] = map.get[resolve.SymbolId, value.Value](?lc.locals, ?sym);
     if (R.is_ok[*value.Value, str](res_get)) {
@@ -899,19 +735,11 @@ pub fun lookup_local(lc: *LowerContext, sym: resolve.SymbolId) O.Option[value.Va
     ret O.none[value.Value]();
 }
 
-# push a loop frame, recording the header and exit blocks the innermost `cnt` /
-# `brk` branch to, and the fin-stack depth their unwind replays down to. grows
-# the loop stack on overflow
-# ---
-# lc:     the context
-# header: block `cnt` branches to
-# exit:   block `brk` branches to
-# ret:    true on success, or an allocation error
-pub fun push_loop(lc: *LowerContext, header: ir.BlockId, exit: ir.BlockId) R.Result[bool, str] {
+pub fun push_loop(lc: *LowerContext, header: ir.BlockId, exit: ir.BlockId) R.Result[R.Void, fail.Fail] {
     if (lc.loop_len == lc.loop_cap) {
         val new_cap: u32 = lc.loop_cap * 2;
         val res_grow: R.Result[*LoopFrame, str] = A.reallocate[LoopFrame](lc.s.alloc, lc.loops, lc.loop_cap::usize, new_cap::usize);
-        if (R.is_err[*LoopFrame, str](res_grow)) { ret R.err[bool, str](R.unwrap_err[*LoopFrame, str](res_grow)); }
+        if (R.is_err[*LoopFrame, str](res_grow)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*LoopFrame, str](res_grow))); }
         lc.loops    = R.unwrap_ok[*LoopFrame, str](res_grow);
         lc.loop_cap = new_cap;
     }
@@ -921,66 +749,34 @@ pub fun push_loop(lc: *LowerContext, header: ir.BlockId, exit: ir.BlockId) R.Res
     f.fin_depth = lc.fin_len;
     lc.loops[lc.loop_len] = f;
     lc.loop_len = lc.loop_len + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[fail.Fail]();
 }
 
-# pop the innermost loop frame. no-op when the stack is empty
-# ---
-# lc: the context
 pub fun pop_loop(lc: *LowerContext) {
     if (lc.loop_len > 0) { lc.loop_len = lc.loop_len - 1; }
 }
 
-# return a pointer to the innermost active loop frame, or nil outside any loop.
-# a pointer (rather than a by-value `Option[LoopFrame]`) keeps the two block ids
-# stable through the call boundary
-# ---
-# lc:  the context
-# ret: pointer to the innermost LoopFrame, or nil outside any loop
 pub fun current_loop(lc: *LowerContext) *LoopFrame {
     if (lc.loop_len == 0) { ret nil; }
     ret ?lc.loops[lc.loop_len - 1];
 }
 
-# record a generic instance `(decl, origin, args)` on the per-module worklist
-# under its mangled `name`, deduped by name (a linear scan, no map/hash, so
-# determinism is preserved). takes an OWNED copy of `args` so the caller's buffer
-# can be reused / freed; the copy is released when the context is torn down. an
-# already-queued or already-emitted instance is skipped
-#
-# The dedup terminates any FINITE instance set, including mutual recursion. An
-# infinite one - a generic whose body instantiates itself at a strictly larger
-# type argument - never repeats a name, so it needs a hard bound: both of them
-# (see MAX_INSTANCE_DEPTH and MAX_INSTANCES), reported as an error naming the
-# derivation chain rather than left to run the module out of memory.
-# ---
-# lc:      the context
-# decl:    DeclId of the generic function in `origin`'s AST
-# origin:  ModuleId declaring the generic
-# args:    concrete type-argument sequence (copied)
-# arg_len: number of type arguments
-# name:    instance linkage name
-# bare:    the generic's source name, for the instantiation-chain diagnostic
-# ret:     true on success, or an allocation / cap error
 pub fun enqueue_instance(lc: *LowerContext, decl: id.DeclId, origin: session.ModuleId,
                          args: *type.TypeId, arg_len: u32, name: intern.StrId,
-                         bare: intern.StrId) R.Result[bool, str] {
-    var i: u32 = 0;
-    for (i < lc.inst_len) {
-        if (lc.insts[i].name == name) { ret R.ok[bool, str](true); }
-        i = i + 1;
-    }
+                         bare: intern.StrId) R.Result[R.Void, fail.Fail] {
+    var lookup_name: intern.StrId = name;
+    if (map.contains[intern.StrId, u32](?lc.inst_by_name, ?lookup_name)) { ret R.ok_void[fail.Fail](); }
 
     var depth: u32 = 0;
-    if (lc.inst_current != INSTANCE_NONE) { depth = lc.insts[lc.inst_current].depth + 1; }
+    if (lc.scope.inst_current != INSTANCE_NONE) { depth = lc.insts[lc.scope.inst_current].depth + 1; }
 
     if (depth > MAX_INSTANCE_DEPTH) {
-        ret R.err[bool, str](instantiation_chain_error(lc, bare, args, arg_len,
-            "generic instantiation depth limit exceeded: a generic instantiates itself at a growing type argument"));
+        ret R.err[R.Void, fail.Fail](fail.message(instantiation_chain_error(lc, bare, args, arg_len,
+            "generic instantiation depth limit exceeded: a generic instantiates itself at a growing type argument")));
     }
     if (lc.inst_len >= MAX_INSTANCES) {
-        ret R.err[bool, str](instantiation_chain_error(lc, bare, args, arg_len,
-            "generic instantiation limit exceeded: one module reached the cap on distinct instances"));
+        ret R.err[R.Void, fail.Fail](fail.message(instantiation_chain_error(lc, bare, args, arg_len,
+            "generic instantiation limit exceeded: one module reached the cap on distinct instances")));
     }
 
     if (lc.inst_len == lc.inst_cap) {
@@ -988,12 +784,12 @@ pub fun enqueue_instance(lc: *LowerContext, decl: id.DeclId, origin: session.Mod
         if (new_cap == 0) { new_cap = INITIAL_STACK_CAP; }
         if (lc.insts == nil) {
             val res_grow: R.Result[*Instance, str] = A.allocate[Instance](lc.s.alloc, new_cap::usize);
-            if (R.is_err[*Instance, str](res_grow)) { ret R.err[bool, str](R.unwrap_err[*Instance, str](res_grow)); }
+            if (R.is_err[*Instance, str](res_grow)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*Instance, str](res_grow))); }
             lc.insts = R.unwrap_ok[*Instance, str](res_grow);
         }
         or {
             val res_grow: R.Result[*Instance, str] = A.reallocate[Instance](lc.s.alloc, lc.insts, lc.inst_cap::usize, new_cap::usize);
-            if (R.is_err[*Instance, str](res_grow)) { ret R.err[bool, str](R.unwrap_err[*Instance, str](res_grow)); }
+            if (R.is_err[*Instance, str](res_grow)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*Instance, str](res_grow))); }
             lc.insts = R.unwrap_ok[*Instance, str](res_grow);
         }
         lc.inst_cap = new_cap;
@@ -1002,7 +798,7 @@ pub fun enqueue_instance(lc: *LowerContext, decl: id.DeclId, origin: session.Mod
     var args_copy: *type.TypeId = nil;
     if (arg_len > 0) {
         val res_copy: R.Result[*type.TypeId, str] = A.allocate[type.TypeId](lc.s.alloc, arg_len::usize);
-        if (R.is_err[*type.TypeId, str](res_copy)) { ret R.err[bool, str](R.unwrap_err[*type.TypeId, str](res_copy)); }
+        if (R.is_err[*type.TypeId, str](res_copy)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*type.TypeId, str](res_copy))); }
         args_copy = R.unwrap_ok[*type.TypeId, str](res_copy);
         memory.copy[type.TypeId](args_copy, args, arg_len::usize);
     }
@@ -1015,43 +811,20 @@ pub fun enqueue_instance(lc: *LowerContext, decl: id.DeclId, origin: session.Mod
     inst.name    = name;
     inst.bare    = bare;
     inst.depth   = depth;
-    inst.parent  = lc.inst_current;
+    inst.parent  = lc.scope.inst_current;
     lc.insts[lc.inst_len] = inst;
+    val res_index: R.Result[bool, str] = map.insert[intern.StrId, u32](?lc.inst_by_name, name, lc.inst_len);
+    if (R.is_err[bool, str](res_index)) { ret fail.lift[R.Void](R.void_of[bool, str](res_index)); }
     lc.inst_len = lc.inst_len + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[fail.Fail]();
 }
 
-# the message for a refused instantiation: the limit, then the derivation chain
-# that reached it
-#
-# The chain is the actionable half. The limit alone says only that something
-# diverged; the chain shows WHICH family is growing and HOW - `f[u32]` naming
-# `f[*u32]` naming `f[**u32]` is a fix the author can see. Only the last
-# CHAIN_LINKS links are spelled, with a count of those elided: the growth is
-# visible in the tail, and spelling a whole chain at the depth limit would run to
-# thousands of characters (the last argument alone carries one qualifier per
-# link). The refused instantiation is always the final link.
-#
-# The result is interned rather than owned: the caller returns it as an error
-# string, and every path out of lowering tears the context (and its allocator's
-# working set) down before the driver renders the message. Any allocation failure
-# degrades to the bare headline, so a refused instantiation always fails the
-# build with a message.
-# ---
-# lc:       the context (its worklist holds the chain, its session the interner)
-# bare:     source name of the generic the refused instance specializes
-# args:     the refused instance's concrete type arguments
-# arg_len:  number of type arguments
-# headline: the limit that was reached
-# ret:      the message
 fun instantiation_chain_error(lc: *LowerContext, bare: intern.StrId, args: *type.TypeId,
                               arg_len: u32, headline: str) str {
-    # the ancestors nearest the refusal, nearest first, and how many there are in
-    # total; a chain longer than the window is reported with the elided count.
     var shown: [CHAIN_LINKS]u32;
     var count: u32 = 0;
     var total: u32 = 0;
-    var walk:  u32 = lc.inst_current;
+    var walk:  u32 = lc.scope.inst_current;
     for (walk != INSTANCE_NONE) {
         if (count < CHAIN_LINKS) {
             shown[count] = walk;
@@ -1096,25 +869,12 @@ fun instantiation_chain_error(lc: *LowerContext, bare: intern.StrId, args: *type
     ret O.unwrap[str](text);
 }
 
-# begin a chain message: the headline plus the chain lead-in, owned
-# ---
-# lc:       the context (its allocator backs the message)
-# headline: the limit that was reached
-# ret:      the owned message, or nil on an allocation failure
 fun chain_start(lc: *LowerContext, headline: str) str {
     val r: R.Result[str, str] = format.sprint(lc.s.alloc, "{}; chain: ", headline);
     if (R.is_err[str, str](r)) { ret nil; }
     ret R.unwrap_ok[str, str](r);
 }
 
-# append `piece` to the owned message `msg`, releasing `msg` (and `piece`, when
-# it is owned too)
-# ---
-# lc:          the context (its allocator backs both strings)
-# msg:         the owned accumulator
-# piece:       the text to append
-# piece_owned: whether `piece` must be released
-# ret:         the extended owned message, or nil on an allocation failure
 fun chain_append(lc: *LowerContext, msg: str, piece: str, piece_owned: bool) str {
     val r: R.Result[str, str] = format.sprint(lc.s.alloc, "{}{}", msg, piece);
     return_chain(lc, msg);
@@ -1123,41 +883,18 @@ fun chain_append(lc: *LowerContext, msg: str, piece: str, piece_owned: bool) str
     ret R.unwrap_ok[str, str](r);
 }
 
-# release a string built for a chain message
-# ---
-# lc:    the context (its allocator backed the string)
-# owned: the string to release (nil is a no-op)
 fun return_chain(lc: *LowerContext, owned: str) {
     typename.type_str_free(lc.s, owned);
 }
 
-# record a comptime value-parameter instance `(decl, origin, vals, names)` on the
-# per-module worklist under its mangled `name`, deduped by name (a linear scan,
-# as `enqueue_instance`). takes OWNED copies of `vals` and `names` so the
-# caller's buffers can be reused / freed; the copies are released when the
-# context is torn down. exceeding MAX_VALUE_INSTANCES distinct instances is
-# reported as an error (a recursive comptime-param function called with a
-# changing value would otherwise instantiate without end)
-# ---
-# lc:      the context
-# decl:    DeclId of the comptime-param function in `origin`'s AST
-# origin:  ModuleId declaring the function
-# vals:    folded comptime-value sequence (copied), by comptime ordinal
-# names:   bare comptime-param identifiers (copied), by comptime ordinal
-# val_len: number of comptime values / names
-# name:    instance linkage name
-# ret:     true on success, or an allocation / cap error
 pub fun enqueue_value_instance(lc: *LowerContext, decl: id.DeclId, origin: session.ModuleId,
                                vals: *comptime.CTValue, names: *intern.StrId, val_len: u32,
-                               name: intern.StrId) R.Result[bool, str] {
-    var i: u32 = 0;
-    for (i < lc.vinst_len) {
-        if (lc.vinsts[i].name == name) { ret R.ok[bool, str](true); }
-        i = i + 1;
-    }
+                               name: intern.StrId) R.Result[R.Void, fail.Fail] {
+    var lookup_name: intern.StrId = name;
+    if (map.contains[intern.StrId, u32](?lc.vinst_by_name, ?lookup_name)) { ret R.ok_void[fail.Fail](); }
 
     if (lc.vinst_len >= MAX_VALUE_INSTANCES) {
-        ret R.err[bool, str]("comptime value-parameter instantiation limit exceeded (likely unbounded comptime recursion)");
+        ret R.err[R.Void, fail.Fail](fail.message("comptime value-parameter instantiation limit exceeded (likely unbounded comptime recursion)"));
     }
 
     if (lc.vinst_len == lc.vinst_cap) {
@@ -1165,12 +902,12 @@ pub fun enqueue_value_instance(lc: *LowerContext, decl: id.DeclId, origin: sessi
         if (new_cap == 0) { new_cap = INITIAL_STACK_CAP; }
         if (lc.vinsts == nil) {
             val res_grow: R.Result[*ValueInstance, str] = A.allocate[ValueInstance](lc.s.alloc, new_cap::usize);
-            if (R.is_err[*ValueInstance, str](res_grow)) { ret R.err[bool, str](R.unwrap_err[*ValueInstance, str](res_grow)); }
+            if (R.is_err[*ValueInstance, str](res_grow)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*ValueInstance, str](res_grow))); }
             lc.vinsts = R.unwrap_ok[*ValueInstance, str](res_grow);
         }
         or {
             val res_grow: R.Result[*ValueInstance, str] = A.reallocate[ValueInstance](lc.s.alloc, lc.vinsts, lc.vinst_cap::usize, new_cap::usize);
-            if (R.is_err[*ValueInstance, str](res_grow)) { ret R.err[bool, str](R.unwrap_err[*ValueInstance, str](res_grow)); }
+            if (R.is_err[*ValueInstance, str](res_grow)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*ValueInstance, str](res_grow))); }
             lc.vinsts = R.unwrap_ok[*ValueInstance, str](res_grow);
         }
         lc.vinst_cap = new_cap;
@@ -1180,12 +917,12 @@ pub fun enqueue_value_instance(lc: *LowerContext, decl: id.DeclId, origin: sessi
     var names_copy: *intern.StrId = nil;
     if (val_len > 0) {
         val res_vals: R.Result[*comptime.CTValue, str] = A.allocate[comptime.CTValue](lc.s.alloc, val_len::usize);
-        if (R.is_err[*comptime.CTValue, str](res_vals)) { ret R.err[bool, str](R.unwrap_err[*comptime.CTValue, str](res_vals)); }
+        if (R.is_err[*comptime.CTValue, str](res_vals)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*comptime.CTValue, str](res_vals))); }
         vals_copy = R.unwrap_ok[*comptime.CTValue, str](res_vals);
         val res_names: R.Result[*intern.StrId, str] = A.allocate[intern.StrId](lc.s.alloc, val_len::usize);
         if (R.is_err[*intern.StrId, str](res_names)) {
             A.deallocate[comptime.CTValue](lc.s.alloc, vals_copy, val_len::usize);
-            ret R.err[bool, str](R.unwrap_err[*intern.StrId, str](res_names));
+            ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*intern.StrId, str](res_names)));
         }
         names_copy = R.unwrap_ok[*intern.StrId, str](res_names);
         memory.copy[comptime.CTValue](vals_copy, vals, val_len::usize);
@@ -1200,32 +937,20 @@ pub fun enqueue_value_instance(lc: *LowerContext, decl: id.DeclId, origin: sessi
     inst.names   = names_copy;
     inst.name    = name;
     lc.vinsts[lc.vinst_len] = inst;
+    val res_index: R.Result[bool, str] = map.insert[intern.StrId, u32](?lc.vinst_by_name, name, lc.vinst_len);
+    if (R.is_err[bool, str](res_index)) { ret fail.lift[R.Void](R.void_of[bool, str](res_index)); }
     lc.vinst_len = lc.vinst_len + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[fail.Fail]();
 }
 
-# record a comptime variadic-pack instance `(decl, origin, type-args, type-list)`
-# on the per-module worklist under its mangled `name`, deduped by name (a linear
-# scan, as `enqueue_instance`). takes OWNED copies of `args` and `types` so the
-# caller's buffers can be reused / freed; the copies are released when the
-# context is torn down
-# ---
-# lc:       the context
-# decl:     DeclId of the pack-tailed function in `origin`'s AST
-# origin:   ModuleId declaring the function
-# args:     generic type-argument sequence (copied), by ordinal
-# arg_len:  number of generic type arguments (0 for a non-generic pack tail)
-# types:    pack element type-list (copied), by pack ordinal
-# type_len: number of pack element types
-# name:     instance linkage name
-# ret:      true on success, or an allocation error
 pub fun enqueue_pack_instance(lc: *LowerContext, decl: id.DeclId, origin: session.ModuleId,
                               args: *type.TypeId, arg_len: u32,
-                              types: *type.TypeId, type_len: u32, name: intern.StrId) R.Result[bool, str] {
-    var i: u32 = 0;
-    for (i < lc.pinst_len) {
-        if (lc.pinsts[i].name == name) { ret R.ok[bool, str](true); }
-        i = i + 1;
+                              types: *type.TypeId, type_len: u32, name: intern.StrId) R.Result[R.Void, fail.Fail] {
+    var lookup_name: intern.StrId = name;
+    if (map.contains[intern.StrId, u32](?lc.pinst_by_name, ?lookup_name)) { ret R.ok_void[fail.Fail](); }
+
+    if (lc.pinst_len >= MAX_PACK_INSTANCES) {
+        ret R.err[R.Void, fail.Fail](fail.message("comptime pack instantiation limit exceeded (likely unbounded recursive pack expansion)"));
     }
 
     if (lc.pinst_len == lc.pinst_cap) {
@@ -1233,12 +958,12 @@ pub fun enqueue_pack_instance(lc: *LowerContext, decl: id.DeclId, origin: sessio
         if (new_cap == 0) { new_cap = INITIAL_STACK_CAP; }
         if (lc.pinsts == nil) {
             val res_grow: R.Result[*PackInstance, str] = A.allocate[PackInstance](lc.s.alloc, new_cap::usize);
-            if (R.is_err[*PackInstance, str](res_grow)) { ret R.err[bool, str](R.unwrap_err[*PackInstance, str](res_grow)); }
+            if (R.is_err[*PackInstance, str](res_grow)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*PackInstance, str](res_grow))); }
             lc.pinsts = R.unwrap_ok[*PackInstance, str](res_grow);
         }
         or {
             val res_grow: R.Result[*PackInstance, str] = A.reallocate[PackInstance](lc.s.alloc, lc.pinsts, lc.pinst_cap::usize, new_cap::usize);
-            if (R.is_err[*PackInstance, str](res_grow)) { ret R.err[bool, str](R.unwrap_err[*PackInstance, str](res_grow)); }
+            if (R.is_err[*PackInstance, str](res_grow)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*PackInstance, str](res_grow))); }
             lc.pinsts = R.unwrap_ok[*PackInstance, str](res_grow);
         }
         lc.pinst_cap = new_cap;
@@ -1247,7 +972,7 @@ pub fun enqueue_pack_instance(lc: *LowerContext, decl: id.DeclId, origin: sessio
     var args_copy: *type.TypeId = nil;
     if (arg_len > 0) {
         val res_args: R.Result[*type.TypeId, str] = A.allocate[type.TypeId](lc.s.alloc, arg_len::usize);
-        if (R.is_err[*type.TypeId, str](res_args)) { ret R.err[bool, str](R.unwrap_err[*type.TypeId, str](res_args)); }
+        if (R.is_err[*type.TypeId, str](res_args)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*type.TypeId, str](res_args))); }
         args_copy = R.unwrap_ok[*type.TypeId, str](res_args);
         memory.copy[type.TypeId](args_copy, args, arg_len::usize);
     }
@@ -1257,7 +982,7 @@ pub fun enqueue_pack_instance(lc: *LowerContext, decl: id.DeclId, origin: sessio
         val res_copy: R.Result[*type.TypeId, str] = A.allocate[type.TypeId](lc.s.alloc, type_len::usize);
         if (R.is_err[*type.TypeId, str](res_copy)) {
             if (args_copy != nil) { A.deallocate[type.TypeId](lc.s.alloc, args_copy, arg_len::usize); }
-            ret R.err[bool, str](R.unwrap_err[*type.TypeId, str](res_copy));
+            ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*type.TypeId, str](res_copy)));
         }
         types_copy = R.unwrap_ok[*type.TypeId, str](res_copy);
         memory.copy[type.TypeId](types_copy, types, type_len::usize);
@@ -1272,155 +997,87 @@ pub fun enqueue_pack_instance(lc: *LowerContext, decl: id.DeclId, origin: sessio
     inst.type_len = type_len;
     inst.name     = name;
     lc.pinsts[lc.pinst_len] = inst;
+    val res_index: R.Result[bool, str] = map.insert[intern.StrId, u32](?lc.pinst_by_name, name, lc.pinst_len);
+    if (R.is_err[bool, str](res_index)) { ret fail.lift[R.Void](R.void_of[bool, str](res_index)); }
     lc.pinst_len = lc.pinst_len + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[fail.Fail]();
 }
 
-# push a deferred `fin` body onto the enclosing block's fin scope. the body
-# StmtId is replayed (lowered inline) on every path that exits the block, and
-# popped by the block lowerer once its exits are stitched. grows the fin stack
-# on overflow
-# ---
-# lc:   the context
-# body: StmtId of the fin body
-# ret:  true on success, or an allocation error
-pub fun push_fin(lc: *LowerContext, body: id.StmtId) R.Result[bool, str] {
+pub fun push_fin(lc: *LowerContext, body: id.StmtId) R.Result[R.Void, fail.Fail] {
     if (lc.fin_len == lc.fin_cap) {
         val new_cap: u32 = lc.fin_cap * 2;
         val res_grow: R.Result[*id.StmtId, str] = A.reallocate[id.StmtId](lc.s.alloc, lc.fins, lc.fin_cap::usize, new_cap::usize);
-        if (R.is_err[*id.StmtId, str](res_grow)) { ret R.err[bool, str](R.unwrap_err[*id.StmtId, str](res_grow)); }
+        if (R.is_err[*id.StmtId, str](res_grow)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*id.StmtId, str](res_grow))); }
         lc.fins    = R.unwrap_ok[*id.StmtId, str](res_grow);
         lc.fin_cap = new_cap;
     }
     lc.fins[lc.fin_len] = body;
     lc.fin_len = lc.fin_len + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[fail.Fail]();
 }
 
-# return the number of pending fin bodies
-# ---
-# lc:  the context
-# ret: count of deferred fin entries
 pub fun fin_count(lc: *LowerContext) u32 {
     ret lc.fin_len;
 }
 
-# return the fin body StmtId at stack index `i` (0 = outermost), or STMT_NIL when
-# out of range
-# ---
-# lc:  the context
-# i:   stack index in [0, fin_count)
-# ret: the StmtId, or STMT_NIL when out of range
 pub fun fin_at(lc: *LowerContext, i: u32) id.StmtId {
     if (i >= lc.fin_len) { ret id.STMT_NIL; }
     ret lc.fins[i];
 }
 
-# drop the fin entries above `mark`, closing a block's fin scope once its exit
-# paths have replayed them. a `mark` at or above the current length is a no-op
-# ---
-# lc:   the context
-# mark: fin-stack length recorded at block entry
 pub fun pop_fins_to(lc: *LowerContext, mark: u32) {
     if (mark < lc.fin_len) { lc.fin_len = mark; }
 }
 
-# lower a semantic `type.TypeId` into the module's IR type universe
-#
-# Generics, instances, and aliases are assumed resolved by sema; this maps the
-# concrete machine shapes. Unknown / error types lower to void so that lowering
-# never aborts on a poisoned upstream type (dce / the verifier surface the real
-# problem).
-# ---
-# lc:  the context
-# tid: semantic TypeId
-# ret: the corresponding IrTypeId, or an allocation error
-pub fun lower_type(lc: *LowerContext, tid: type.TypeId) R.Result[ir_type.IrTypeId, str] {
+pub fun lower_type(lc: *LowerContext, tid: type.TypeId) R.Result[ir_type.IrTypeId, fail.Fail] {
     if (tid == type.TYPE_NIL) {
-        ret ir_type.intern_void(?lc.m.types);
+        ret fail.lift[ir_type.IrTypeId](ir_type.intern_void(?lc.m.types));
     }
 
-    # while lowering a monomorphized instance body, resolve any generic parameter
-    # in `tid` (a bare `T`, `*T`, `[N]T`, a nested `Result[T,E]`, etc.) to its
-    # concrete type-argument before mapping the machine shape, so storage sizing
-    # and field layout match the instance instead of falling through to the
-    # pointer-width erasure below.
     var rtid: type.TypeId = tid;
-    if (lc.subst != nil && lc.subst_len > 0) {
-        rtid = generics.substitute(lc.s, tid, lc.subst, lc.subst_len);
+    if (lc.scope.subst != nil && lc.scope.subst_len > 0) {
+        rtid = generics.substitute(lc.s, tid, lc.scope.subst, lc.scope.subst_len);
     }
 
-    # ensure a generic instance's substituted field table exists before lowering
-    # it, regardless of whether the current body substitutes params. a non-generic
-    # function that names a concrete instance (e.g. returning `Option[str]`) never
-    # substitutes, so without this its instance lowers against an unpopulated field
-    # store and collapses to an undersized struct. a no-op for non-instances and
-    # already-tabled instances.
     generics.ensure_fields(lc.s, rtid);
 
     val t_opt: O.Option[*type.Type] = type.get(?lc.s.types, rtid);
     if (O.is_none[*type.Type](t_opt)) {
-        ret ir_type.intern_void(?lc.m.types);
+        ret fail.lift[ir_type.IrTypeId](ir_type.intern_void(?lc.m.types));
     }
     val t: *type.Type = O.unwrap[*type.Type](t_opt);
     val k: type.TypeKind = t.kind;
 
-    # secrecy has no runtime representation (#1645): `^T` lowers to exactly `T`'s
-    # machine shape. the secret-taint-to-MIR contract that propagates it through
-    # codegen for the constant-time guarantee lands separately (#1646).
     if (k == type.TYPE_SECRET) { ret lower_type(lc, t.data.secret.base); }
 
     val d: type.PrimDesc = type.prim_desc(k);
-    if (d.class == type.PRIM_CLASS_INT)   { ret ir_type.intern_int(?lc.m.types, d.bits); }
-    if (d.class == type.PRIM_CLASS_FLOAT) { ret ir_type.intern_float(?lc.m.types, d.bits); }
-    if (d.class == type.PRIM_CLASS_PTR)   { ret ir_type.intern_ptr(?lc.m.types); }
-    if (k == type.TYPE_POINTER)           { ret ir_type.intern_ptr(?lc.m.types); }
+    if (d.class == type.PRIM_CLASS_INT)   { ret fail.lift[ir_type.IrTypeId](ir_type.intern_int(?lc.m.types, d.bits)); }
+    if (d.class == type.PRIM_CLASS_FLOAT) { ret fail.lift[ir_type.IrTypeId](ir_type.intern_float(?lc.m.types, d.bits)); }
+    if (d.class == type.PRIM_CLASS_PTR)   { ret fail.lift[ir_type.IrTypeId](ir_type.intern_ptr(?lc.m.types)); }
+    if (k == type.TYPE_POINTER)           { ret fail.lift[ir_type.IrTypeId](ir_type.intern_ptr(?lc.m.types)); }
 
     if (k == type.TYPE_ARRAY) {
-        val res_base: R.Result[ir_type.IrTypeId, str] = lower_type(lc, t.data.array.base);
-        if (R.is_err[ir_type.IrTypeId, str](res_base)) { ret res_base; }
-        ret ir_type.intern_array(?lc.m.types, R.unwrap_ok[ir_type.IrTypeId, str](res_base), t.data.array.count);
+        val res_base: R.Result[ir_type.IrTypeId, fail.Fail] = lower_type(lc, t.data.array.base);
+        if (R.is_err[ir_type.IrTypeId, fail.Fail](res_base)) { ret res_base; }
+        ret fail.lift[ir_type.IrTypeId](ir_type.intern_array(?lc.m.types, R.unwrap_ok[ir_type.IrTypeId, fail.Fail](res_base), t.data.array.count));
     }
 
-    # a vector lowers to an IRT_VECTOR over its lowered scalar element (#1965).
     if (k == type.TYPE_VECTOR) {
         val ed: type.PrimDesc = type.prim_desc(t.data.vector.element);
         var res_elem: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?lc.m.types, ed.bits);
         if (ed.class == type.PRIM_CLASS_FLOAT) { res_elem = ir_type.intern_float(?lc.m.types, ed.bits); }
-        if (R.is_err[ir_type.IrTypeId, str](res_elem)) { ret res_elem; }
-        ret ir_type.intern_vector(?lc.m.types, R.unwrap_ok[ir_type.IrTypeId, str](res_elem), t.data.vector.lanes);
+        if (R.is_err[ir_type.IrTypeId, str](res_elem)) { ret fail.lift[ir_type.IrTypeId](res_elem); }
+        ret fail.lift[ir_type.IrTypeId](ir_type.intern_vector(?lc.m.types, R.unwrap_ok[ir_type.IrTypeId, str](res_elem), t.data.vector.lanes));
     }
 
-    # a handle lowers to an IR handle carrying the same constructor and the same
-    # operands (#2888). Every one is copied across and none is read: the back end
-    # mints its type from these words, and a word defaulted here would produce a
-    # valid module naming a different thing than the declaration did.
-    #
-    # A composed operand is another handle, and its SEMANTIC TypeId is rewritten to
-    # the IR one here, which is the only reading this layer does: an id means
-    # nothing across universes, and leaving the semantic one in place would hand the
-    # back end a number belonging to a table it cannot see.
     if (k == type.TYPE_HANDLE) {
         ret lower_handle_type(lc, rtid, t);
     }
 
-    # an ABI type lowers to an IR aggregate of the target's DECLARED extent (#3004):
-    # a run of bytes at the declared alignment, with no field the program can name.
-    # Being an aggregate is the whole mechanism - AAPCS64's by-reference rule for a
-    # composite over sixteen bytes is what makes the caller copy a 32-byte `va_list`
-    # and pass an address, and the same rule reduces an eight-byte one to the single
-    # register a pointer would have taken everywhere else.
     if (k == type.TYPE_ABI) {
         ret lower_abi_type(lc, t);
     }
 
-    # records, unions, and generic instances all lower to an IR aggregate of their
-    # field layout, read from the session-global field store. a generic instance
-    # carries a substituted field table (built by `generics.instantiate`), so it
-    # lowers to the same concrete shape as its non-generic twin -- field access
-    # within a generic body GEPs through it correctly. whether that shape overlaps
-    # its fields comes from the nominal the instance specializes, never from the
-    # instance's own kind, which is TYPE_INSTANCE either way (#2239).
     if (k == type.TYPE_REC || k == type.TYPE_UNI || k == type.TYPE_INSTANCE) {
         ret lower_nominal(lc, rtid, type.is_union(?lc.s.types, rtid));
     }
@@ -1429,55 +1086,26 @@ pub fun lower_type(lc: *LowerContext, tid: type.TypeId) R.Result[ir_type.IrTypeI
         ret lower_function_type(lc, t);
     }
 
-    # generic params / errors that survived to here lower to a pointer-width
-    # opaque slot so storage sizing still works.
-    ret ir_type.intern_ptr(?lc.m.types);
+    ret fail.lift[ir_type.IrTypeId](ir_type.intern_ptr(?lc.m.types));
 }
 
-# lower a target-declared ABI type into an IR aggregate of its declared extent
-#
-# One `[size]u8` field under the declared alignment, rather than a run of
-# machine-word members: the byte array carries the size for any size, and the
-# alignment override carries the alignment, so a platform whose `va_list` is not a
-# whole number of words needs no second rule. The leaves are integer bytes, which is
-# what every convention's classifier reads them as - the integer path on all of them,
-# never a homogeneous-float aggregate.
-# ---
-# lc: the lowering context
-# t:  the semantic type record
-# ret: the IR aggregate type id, or an allocation error
-fun lower_abi_type(lc: *LowerContext, t: *type.Type) R.Result[ir_type.IrTypeId, str] {
+fun lower_abi_type(lc: *LowerContext, t: *type.Type) R.Result[ir_type.IrTypeId, fail.Fail] {
     val r_u8: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?lc.m.types, 8);
-    if (R.is_err[ir_type.IrTypeId, str](r_u8)) { ret r_u8; }
+    if (R.is_err[ir_type.IrTypeId, str](r_u8)) { ret fail.lift[ir_type.IrTypeId](r_u8); }
     val r_arr: R.Result[ir_type.IrTypeId, str] =
         ir_type.intern_array(?lc.m.types, R.unwrap_ok[ir_type.IrTypeId, str](r_u8), t.data.abi.size);
-    if (R.is_err[ir_type.IrTypeId, str](r_arr)) { ret r_arr; }
+    if (R.is_err[ir_type.IrTypeId, str](r_arr)) { ret fail.lift[ir_type.IrTypeId](r_arr); }
     var field: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r_arr);
-    ret ir_type.intern_struct(?lc.m.types, ?field, 1, t.data.abi.align, false);
+    ret fail.lift[ir_type.IrTypeId](ir_type.intern_struct(?lc.m.types, ?field, 1, t.data.abi.align, false));
 }
 
-# lower a handle's constructor and operands into an IR handle type
-#
-# The composed operands are the only ones touched: a handle that names another is
-# carried as a TypeId, and a TypeId is meaningless outside the universe that minted
-# it, so each is lowered and the IR id written in its place.
-#
-# WHICH POSITIONS THOSE ARE COMES FROM THE TARGET'S OWN ROW, never from the word
-# sitting there. A literal operand is an ordinary small number and would collide
-# with a TypeId constantly, so a reader that guessed by value would lower a
-# dimensionality as if it were a composed type.
-# ---
-# lc:   the lowering context
-# rtid: the resolved semantic TypeId
-# t:    the semantic type record
-# ret:  the IR handle type id, or an allocation error
-fun lower_handle_type(lc: *LowerContext, rtid: type.TypeId, t: *type.Type) R.Result[ir_type.IrTypeId, str] {
+fun lower_handle_type(lc: *LowerContext, rtid: type.TypeId, t: *type.Type) R.Result[ir_type.IrTypeId, fail.Fail] {
     val n: u32 = t.data.handle.ops_len;
     var ops: *ir_type.IrTypeId = nil;
     if (n > 0) {
         val r_ops: R.Result[*ir_type.IrTypeId, str] = A.allocate[ir_type.IrTypeId](lc.s.alloc, n::usize);
         if (R.is_err[*ir_type.IrTypeId, str](r_ops)) {
-            ret R.err[ir_type.IrTypeId, str](R.unwrap_err[*ir_type.IrTypeId, str](r_ops));
+            ret R.err[ir_type.IrTypeId, fail.Fail](fail.message(R.unwrap_err[*ir_type.IrTypeId, str](r_ops)));
         }
         ops = R.unwrap_ok[*ir_type.IrTypeId, str](r_ops);
     }
@@ -1489,53 +1117,36 @@ fun lower_handle_type(lc: *LowerContext, rtid: type.TypeId, t: *type.Type) R.Res
         val w: u32 = type.handle_operand(?lc.s.types, rtid, i);
         ops[i] = w::ir_type.IrTypeId;
         if (td != nil && i < td.arity && td.operands[i] != isa.TYPE_OPERAND_WORD) {
-            val inner: R.Result[ir_type.IrTypeId, str] = lower_type(lc, w::type.TypeId);
-            if (R.is_err[ir_type.IrTypeId, str](inner)) {
+            val inner: R.Result[ir_type.IrTypeId, fail.Fail] = lower_type(lc, w::type.TypeId);
+            if (R.is_err[ir_type.IrTypeId, fail.Fail](inner)) {
                 if (ops != nil) { A.deallocate[ir_type.IrTypeId](lc.s.alloc, ops, n::usize); }
                 ret inner;
             }
-            ops[i] = R.unwrap_ok[ir_type.IrTypeId, str](inner);
+            ops[i] = R.unwrap_ok[ir_type.IrTypeId, fail.Fail](inner);
         }
         i = i + 1;
     }
 
     val res: R.Result[ir_type.IrTypeId, str] = ir_type.intern_handle(?lc.m.types, t.data.handle.ctor, ops, n);
     if (ops != nil) { A.deallocate[ir_type.IrTypeId](lc.s.alloc, ops, n::usize); }
-    ret res;
+    ret fail.lift[ir_type.IrTypeId](res);
 }
 
-# lower a nominal (rec / uni) semantic type to an IR struct of its lowered field
-# types, read from the session-global field store keyed by TypeId. the store is
-# the canonical field layout (built once by sema and shared across phases and
-# modules), so it resolves anonymous records -- whose identity is structural, not
-# tied to a single AST declaration -- as well as named records referenced from
-# another module. a type with no field table lowers to an empty struct, keeping
-# lowering total
-# ---
-# lc:       the context
-# tid:      the nominal semantic TypeId
-# is_union: lower to an IR union rather than a struct
-# ret:      the IrTypeId, or an allocation error
-fun lower_nominal(lc: *LowerContext, tid: type.TypeId, is_union: bool) R.Result[ir_type.IrTypeId, str] {
-    # an `#[align(...)]` decorator on the record/union, folded by sema and keyed
-    # by this nominal TypeId; 0 leaves the natural alignment.
+fun lower_nominal(lc: *LowerContext, tid: type.TypeId, is_union: bool) R.Result[ir_type.IrTypeId, fail.Fail] {
     var nom_align: u32 = 0;
     val ta: O.Option[u32] = session.type_align(lc.s, tid::u32);
     if (O.is_some[u32](ta)) { nom_align = O.unwrap[u32](ta); }
 
-    # a `#[packed]` decorator, keyed the same way (#2715). the front end and the
-    # middle end read the same session entry, so `$size_of` folded at sema and the
-    # IR struct's own layout cannot disagree about a record's size.
     val nom_packed: bool = session.type_is_packed(lc.s, tid::u32);
 
     val fields_len: u32 = type.field_count(?lc.s.types, tid);
     if (fields_len == 0) {
-        ret ir_type.intern_struct(?lc.m.types, nil, 0, nom_align, nom_packed);
+        ret fail.lift[ir_type.IrTypeId](ir_type.intern_struct(?lc.m.types, nil, 0, nom_align, nom_packed));
     }
 
     val res_buf: R.Result[*ir_type.IrTypeId, str] = A.allocate[ir_type.IrTypeId](lc.s.alloc, fields_len::usize);
     if (R.is_err[*ir_type.IrTypeId, str](res_buf)) {
-        ret R.err[ir_type.IrTypeId, str](R.unwrap_err[*ir_type.IrTypeId, str](res_buf));
+        ret R.err[ir_type.IrTypeId, fail.Fail](fail.message(R.unwrap_err[*ir_type.IrTypeId, str](res_buf)));
     }
     val buf: *ir_type.IrTypeId = R.unwrap_ok[*ir_type.IrTypeId, str](res_buf);
 
@@ -1543,56 +1154,45 @@ fun lower_nominal(lc: *LowerContext, tid: type.TypeId, is_union: bool) R.Result[
     for (i < fields_len) {
         val fe_opt: O.Option[*type.FieldEntry] = type.field_at(?lc.s.types, tid, i);
         if (O.is_none[*type.FieldEntry](fe_opt)) {
-            # field_count promised fields_len entries, so an in-range miss is a
-            # corrupt field table, not a layout we can guess. fail rather than
-            # substitute a pointer-width slot and silently mis-size the type.
             A.deallocate[ir_type.IrTypeId](lc.s.alloc, buf, fields_len::usize);
-            ret R.err[ir_type.IrTypeId, str]("field table for nominal type is missing an in-range field");
+            ret R.err[ir_type.IrTypeId, fail.Fail](fail.message("field table for nominal type is missing an in-range field"));
         }
 
         val sem: type.TypeId = O.unwrap[*type.FieldEntry](fe_opt).ty;
-        val res_field: R.Result[ir_type.IrTypeId, str] = lower_type(lc, sem);
-        if (R.is_err[ir_type.IrTypeId, str](res_field)) {
+        val res_field: R.Result[ir_type.IrTypeId, fail.Fail] = lower_type(lc, sem);
+        if (R.is_err[ir_type.IrTypeId, fail.Fail](res_field)) {
             A.deallocate[ir_type.IrTypeId](lc.s.alloc, buf, fields_len::usize);
             ret res_field;
         }
-        buf[i] = R.unwrap_ok[ir_type.IrTypeId, str](res_field);
+        buf[i] = R.unwrap_ok[ir_type.IrTypeId, fail.Fail](res_field);
         i = i + 1;
     }
 
-    var res_struct: R.Result[ir_type.IrTypeId, str];
+    var res_struct: R.Result[ir_type.IrTypeId, fail.Fail];
     if (is_union) {
-        res_struct = ir_type.intern_union(?lc.m.types, buf, fields_len, nom_align, nom_packed);
+        res_struct = fail.lift[ir_type.IrTypeId](ir_type.intern_union(?lc.m.types, buf, fields_len, nom_align, nom_packed));
     }
     or {
-        res_struct = ir_type.intern_struct(?lc.m.types, buf, fields_len, nom_align, nom_packed);
+        res_struct = fail.lift[ir_type.IrTypeId](ir_type.intern_struct(?lc.m.types, buf, fields_len, nom_align, nom_packed));
     }
     A.deallocate[ir_type.IrTypeId](lc.s.alloc, buf, fields_len::usize);
     ret res_struct;
 }
 
-# lower a TYPE_FUN semantic type into an IRT_FN. parameter types come from the
-# type interner's param pool
-# ---
-# lc: the context
-# t:  the function Type to lower
-# ret: the IRT_FN IrTypeId, or an allocation error
-fun lower_function_type(lc: *LowerContext, t: *type.Type) R.Result[ir_type.IrTypeId, str] {
-    val res_ret: R.Result[ir_type.IrTypeId, str] = lower_type(lc, t.data.fn.ret_type);
-    if (R.is_err[ir_type.IrTypeId, str](res_ret)) { ret res_ret; }
-    val ir_ret: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](res_ret);
+fun lower_function_type(lc: *LowerContext, t: *type.Type) R.Result[ir_type.IrTypeId, fail.Fail] {
+    val res_ret: R.Result[ir_type.IrTypeId, fail.Fail] = lower_type(lc, t.data.fn.ret_type);
+    if (R.is_err[ir_type.IrTypeId, fail.Fail](res_ret)) { ret res_ret; }
+    val ir_ret: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, fail.Fail](res_ret);
 
-    # the C-variadic flag rides the signature into the IR: the backend reads it off
-    # the callee IRT_FN to place a call's tail arguments.
     val c_variadic: bool = t.data.fn.c_variadic;
     val params_len: u32  = t.data.fn.params_len;
     if (params_len == 0) {
-        ret ir_type.intern_fn(?lc.m.types, ir_ret, nil, 0, c_variadic);
+        ret fail.lift[ir_type.IrTypeId](ir_type.intern_fn(?lc.m.types, ir_ret, nil, 0, c_variadic));
     }
 
     val res_buf: R.Result[*ir_type.IrTypeId, str] = A.allocate[ir_type.IrTypeId](lc.s.alloc, params_len::usize);
     if (R.is_err[*ir_type.IrTypeId, str](res_buf)) {
-        ret R.err[ir_type.IrTypeId, str](R.unwrap_err[*ir_type.IrTypeId, str](res_buf));
+        ret R.err[ir_type.IrTypeId, fail.Fail](fail.message(R.unwrap_err[*ir_type.IrTypeId, str](res_buf)));
     }
     val buf: *ir_type.IrTypeId = R.unwrap_ok[*ir_type.IrTypeId, str](res_buf);
 
@@ -1601,37 +1201,35 @@ fun lower_function_type(lc: *LowerContext, t: *type.Type) R.Result[ir_type.IrTyp
         val po: O.Option[type.TypeId] = type.get_param(?lc.s.types, t.data.fn.params_start + i);
         var p_sem: type.TypeId = type.TYPE_NIL;
         if (O.is_some[type.TypeId](po)) { p_sem = O.unwrap[type.TypeId](po); }
-        val res_param: R.Result[ir_type.IrTypeId, str] = lower_type(lc, p_sem);
-        if (R.is_err[ir_type.IrTypeId, str](res_param)) {
+        val res_param: R.Result[ir_type.IrTypeId, fail.Fail] = lower_type(lc, p_sem);
+        if (R.is_err[ir_type.IrTypeId, fail.Fail](res_param)) {
             A.deallocate[ir_type.IrTypeId](lc.s.alloc, buf, params_len::usize);
             ret res_param;
         }
-        buf[i] = R.unwrap_ok[ir_type.IrTypeId, str](res_param);
+        buf[i] = R.unwrap_ok[ir_type.IrTypeId, fail.Fail](res_param);
         i = i + 1;
     }
 
     val res_fn: R.Result[ir_type.IrTypeId, str] = ir_type.intern_fn(?lc.m.types, ir_ret, buf, params_len, c_variadic);
     A.deallocate[ir_type.IrTypeId](lc.s.alloc, buf, params_len::usize);
-    ret res_fn;
+    ret fail.lift[ir_type.IrTypeId](res_fn);
 }
 
-# truthiness of a comptime value for `$if` arm selection
-# ---
-# v:   the comptime value
-# ret: true when `v` is a true bool or a non-zero int
-pub fun ct_truthy(v: comptime.CTValue) bool {
-    if (v.kind == comptime.CT_KIND_BOOL) { ret v.data.b; }
-    if (v.kind == comptime.CT_KIND_INT)  { ret v.data.i != 0; }
-    ret false;
+pub fun gate_is_active(lc: *LowerContext, source: str, cond: id.ExprId,
+                       scope: comptime.GateScope, cache: bool) R.Result[bool, fail.Fail] {
+    val vr: R.Result[comptime.GateVerdict, str] = comptime.evaluate_gate[LowerContext](
+        lc.scope.ctx, lc, lc.caps, lc.scope.a, source, cond, ?lc.s.interner, scope, cache, true);
+    if (R.is_err[comptime.GateVerdict, str](vr)) {
+        ret R.err[bool, fail.Fail](fail.message(R.unwrap_err[comptime.GateVerdict, str](vr)));
+    }
+    val v: comptime.GateVerdict = R.unwrap_ok[comptime.GateVerdict, str](vr);
+    if (v.outcome == comptime.GATE_ACTIVE)         { ret R.ok[bool, fail.Fail](true); }
+    if (v.outcome == comptime.GATE_INACTIVE)       { ret R.ok[bool, fail.Fail](false); }
+    if (v.outcome == comptime.GATE_AWAITING_TYPES) { ret R.ok[bool, fail.Fail](comptime.truth(v.value)); }
+    if (str_len(v.message) > 0) { ret R.err[bool, fail.Fail](fail.message(v.message)); }
+    ret R.err[bool, fail.Fail](fail.message("lower: a comptime gate reached lowering undecided"));
 }
 
-# whether the builder's current block already carries a terminator
-#
-# Used to avoid emitting a second terminator (which the builder refuses) and to
-# skip unreachable trailing statements.
-# ---
-# lc:  the context
-# ret: true when the current block is terminated
 pub fun block_terminated(lc: *LowerContext) bool {
     if (lc.builder.fn == nil) { ret false; }
     val b: ir.BlockId = lc.builder.block;
@@ -1640,49 +1238,22 @@ pub fun block_terminated(lc: *LowerContext) bool {
     ret lc.builder.fn.blocks[b].terminator != ir.INSTR_NIL;
 }
 
-# whether an IR type is the void type (or unresolved)
-# ---
-# lc:  the context
-# tid: the IR type to test
-# ret: true for void or an out-of-range / unresolved type
 pub fun is_void_ir(lc: *LowerContext, tid: ir_type.IrTypeId) bool {
     val opt_type: O.Option[*ir_type.IrType] = ir_type.get(?lc.m.types, tid);
     if (O.is_none[*ir_type.IrType](opt_type)) { ret true; }
     ret O.unwrap[*ir_type.IrType](opt_type).kind == ir_type.IRT_VOID;
 }
 
-# return the semantic type of an expression from the sema result, or TYPE_NIL
-# when the id is out of range
-# ---
-# lc:  the context
-# eid: AST ExprId
-# ret: the expression's interned semantic TypeId (TYPE_NIL if unknown)
 pub fun expr_type_of(lc: *LowerContext, eid: id.ExprId) type.TypeId {
     if (eid == id.EXPR_NIL)          { ret type.TYPE_NIL; }
-    if (eid::usize >= lc.a.expr_len) { ret type.TYPE_NIL; }
-    ret lc.sema_result.expr_type[eid];
+    if (eid::usize >= lc.scope.a.expr_len) { ret type.TYPE_NIL; }
+    ret lc.scope.sema_result.expr_type[eid];
 }
 
-# the float width sema fixed for an expression, for handing to the comptime
-# evaluator so a folded float constant rounds at its declared type (#2918)
-#
-# Lowering is the pass that HAS the answer: the alias, the generic substitution
-# and the coercion are all resolved by the time it runs, so it reads the checked
-# type rather than a spelling. FLOAT_W_NONE for a non-float expression.
-# ---
-# lc:  the context
-# eid: AST ExprId
-# ret: the expression's float width, or FLOAT_W_NONE
 pub fun expr_float_width(lc: *LowerContext, eid: id.ExprId) float.FloatWidth {
     ret float_width_of_type(lc, expr_type_of(lc, eid));
 }
 
-# the float width of a semantic type, under the active generic substitution and
-# through the secret `^` wrapper: a `^f32` rounds at f32 like any other f32
-# ---
-# lc:  the context
-# tid: the semantic type
-# ret: the type's float width, or FLOAT_W_NONE
 pub fun float_width_of_type(lc: *LowerContext, tid: type.TypeId) float.FloatWidth {
     if (tid == type.TYPE_NIL) { ret float.FLOAT_W_NONE; }
     val ct: type.TypeId = type.strip_secret(?lc.s.types, substitute_type(lc, tid));
@@ -1691,81 +1262,37 @@ pub fun float_width_of_type(lc: *LowerContext, tid: type.TypeId) float.FloatWidt
     ret type.float_width_of(O.unwrap[*type.Type](opt_t).kind);
 }
 
-# whether expression `eid` carries the secret `^` qualifier, per sema's flow typing
-# (#1646)
-#
-# The authoritative per-use secrecy the lowerer stamps onto each produced Value: the
-# top-level `^` is read after applying the active generic substitution, so a secret
-# type argument flowing into a generic-parameter-typed expression (a secrecy-transparent
-# `copy[^u32]`) is seen as secret rather than as the un-substituted parameter. A `:^`
-# downgrade expression is typed public by sema, so this yields false for it - the one
-# place a value sheds its taint.
-# ---
-# lc:  the context
-# eid: AST ExprId
-# ret: true when the expression's concrete type is secret-qualified
 pub fun expr_is_secret(lc: *LowerContext, eid: id.ExprId) bool {
     ret type_is_secret(lc, expr_type_of(lc, eid));
 }
 
-# whether semantic type `tid` carries the secret `^` qualifier after applying the
-# active generic substitution (#1646)
-#
-# The type-level twin of `expr_is_secret`, used to seed the taint at a function's
-# parameter boundary. A generic parameter instantiated with a secret type argument is
-# seen as secret through the substitution.
-# ---
-# lc:  the context
-# tid: semantic TypeId
-# ret: true when the substituted type is secret-qualified
 pub fun type_is_secret(lc: *LowerContext, tid: type.TypeId) bool {
     if (tid == type.TYPE_NIL) { ret false; }
     ret type.is_secret(?lc.s.types, substitute_type(lc, tid));
 }
 
-# apply the active generic substitution to `tid`, returning the concrete sema
-# TypeId. when no substitution is active (not inside a monomorphized generic
-# instance body), `tid` is returned unchanged. used to resolve a deferred
-# `$fields(T)` type argument to its concrete record type
-# ---
-# lc:  the context
-# tid: semantic TypeId
-# ret: the substituted TypeId, or `tid` when no substitution is active
-pub fun substitute_type(lc: *LowerContext, tid: type.TypeId) type.TypeId {
-    if (lc.subst == nil || lc.subst_len == 0) { ret tid; }
-    ret generics.substitute(lc.s, tid, lc.subst, lc.subst_len);
+pub fun type_carries_secret(lc: *LowerContext, tid: type.TypeId) bool {
+    if (tid == type.TYPE_NIL) { ret false; }
+    ret type.carries_secret(?lc.s.types, substitute_type(lc, tid));
 }
 
-# return the interned semantic type a syntactic AstType resolved to, or TYPE_NIL
-# when the id is out of range
-# ---
-# lc:  the context
-# tid: AST TypeId
-# ret: the interned semantic TypeId (TYPE_NIL if unknown)
+pub fun substitute_type(lc: *LowerContext, tid: type.TypeId) type.TypeId {
+    if (lc.scope.subst == nil || lc.scope.subst_len == 0) { ret tid; }
+    ret generics.substitute(lc.s, tid, lc.scope.subst, lc.scope.subst_len);
+}
+
 pub fun type_resolved_of(lc: *LowerContext, tid: id.TypeId) type.TypeId {
     if (tid == id.TYPE_NIL)          { ret type.TYPE_NIL; }
-    if (tid::usize >= lc.a.type_len) { ret type.TYPE_NIL; }
-    ret lc.sema_result.type_resolved_ty[tid];
+    if (tid::usize >= lc.scope.a.type_len) { ret type.TYPE_NIL; }
+    ret lc.scope.sema_result.type_resolved_ty[tid];
 }
 
-# return the declared / inferred semantic type of a decl, or TYPE_NIL
-# ---
-# lc:  the context
-# did: AST DeclId
-# ret: the decl's interned semantic TypeId (TYPE_NIL if unknown)
 pub fun decl_type_of(lc: *LowerContext, did: id.DeclId) type.TypeId {
     if (did == id.DECL_NIL)          { ret type.TYPE_NIL; }
-    if (did::usize >= lc.a.decl_len) { ret type.TYPE_NIL; }
-    ret lc.sema_result.decl_type[did];
+    if (did::usize >= lc.scope.a.decl_len) { ret type.TYPE_NIL; }
+    ret lc.scope.sema_result.decl_type[did];
 }
 
-# return the semantic return type of a function decl, with any generic
-# substitution applied. used by `lower_instance` to populate `fn_ret_sem` so
-# deferred `$each $fields(T)` body re-inference can check `ret`
-# ---
-# lc:  the context (subst/subst_len active when inside a generic instance body)
-# did: DeclId of the function declaration
-# ret: the substituted sema return TypeId, or TYPE_NIL when unavailable
 pub fun decl_ret_sem(lc: *LowerContext, did: id.DeclId) type.TypeId {
     val fn_ty: type.TypeId = decl_type_of(lc, did);
     val to: O.Option[*type.Type] = type.get(?lc.s.types, fn_ty);
@@ -1773,223 +1300,125 @@ pub fun decl_ret_sem(lc: *LowerContext, did: id.DeclId) type.TypeId {
     val t: *type.Type = O.unwrap[*type.Type](to);
     if (t.kind != type.TYPE_FUN) { ret type.TYPE_NIL; }
     var ret_type: type.TypeId = t.data.fn.ret_type;
-    if (lc.subst != nil && lc.subst_len > 0) {
-        ret_type = generics.substitute(lc.s, ret_type, lc.subst, lc.subst_len);
+    if (lc.scope.subst != nil && lc.scope.subst_len > 0) {
+        ret_type = generics.substitute(lc.s, ret_type, lc.scope.subst, lc.scope.subst_len);
     }
     ret ret_type;
 }
 
-# the IR return type of a function decl
-#
-# Lowers the return type of its semantic TYPE_FUN signature (through the active
-# substitution env), defaulting to void. Shared by the concrete/instance body
-# lowerings and the pack-instance reference signature helper.
-# ---
-# lc:  the context
-# did: the function's DeclId
-# ret: the IR return type, or an error
-pub fun function_return_ir(lc: *LowerContext, did: id.DeclId) R.Result[ir_type.IrTypeId, str] {
+pub fun function_return_ir(lc: *LowerContext, did: id.DeclId) R.Result[ir_type.IrTypeId, fail.Fail] {
     val sem: type.TypeId = decl_type_of(lc, did);
     val opt_type: O.Option[*type.Type] = type.get(?lc.s.types, sem);
-    if (O.is_none[*type.Type](opt_type)) { ret ir_type.intern_void(?lc.m.types); }
+    if (O.is_none[*type.Type](opt_type)) { ret fail.lift[ir_type.IrTypeId](ir_type.intern_void(?lc.m.types)); }
     val t: *type.Type = O.unwrap[*type.Type](opt_type);
-    if (t.kind != type.TYPE_FUN) { ret ir_type.intern_void(?lc.m.types); }
+    if (t.kind != type.TYPE_FUN) { ret fail.lift[ir_type.IrTypeId](ir_type.intern_void(?lc.m.types)); }
     ret lower_type(lc, t.data.fn.ret_type);
 }
 
-# intern the IR function type of a pack instance
-#
-# The signature is the leading fixed parameter IR types followed by the N expanded
-# element IR types, returning `ret_ir`. The expanded elements take the place of
-# the single TYPE_PACK parameter, so the instance's ABI matches the collected call
-# rather than the opaque pack. Shared by the pack-instance definition and its
-# reference signature helper, so a call and the drained body classify identically.
-# ---
-# lc:          the context (its substitution env, if any, is applied by lower_type)
-# d:           the resolved template Decl
-# fixed_count: number of leading fixed parameters
-# types:       the concrete pack element type-list
-# type_len:    number of pack element types
-# ret_ir:      the function's IR return type
-# ret:         the interned IR function type, or an error
 pub fun pack_instance_sig(lc: *LowerContext, d: *adecl.Decl, fixed_count: u32,
-                          types: *type.TypeId, type_len: u32, ret_ir: ir_type.IrTypeId) R.Result[ir_type.IrTypeId, str] {
+                          types: *type.TypeId, type_len: u32, ret_ir: ir_type.IrTypeId) R.Result[ir_type.IrTypeId, fail.Fail] {
     val total: u32 = fixed_count + type_len;
-    # a pack instance is a mach function with a concrete, fully expanded parameter
-    # list; the C-variadic form is an ext-only declaration and never reaches here.
     if (total == 0) {
-        ret ir_type.intern_fn(?lc.m.types, ret_ir, nil, 0, false);
+        ret fail.lift[ir_type.IrTypeId](ir_type.intern_fn(?lc.m.types, ret_ir, nil, 0, false));
     }
 
     val res_buf: R.Result[*ir_type.IrTypeId, str] = A.allocate[ir_type.IrTypeId](lc.s.alloc, total::usize);
-    if (R.is_err[*ir_type.IrTypeId, str](res_buf)) { ret R.err[ir_type.IrTypeId, str](R.unwrap_err[*ir_type.IrTypeId, str](res_buf)); }
+    if (R.is_err[*ir_type.IrTypeId, str](res_buf)) { ret R.err[ir_type.IrTypeId, fail.Fail](fail.message(R.unwrap_err[*ir_type.IrTypeId, str](res_buf))); }
     val buf: *ir_type.IrTypeId = R.unwrap_ok[*ir_type.IrTypeId, str](res_buf);
 
-    # buf[0 .. fixed_count) are the leading fixed parameter IR types; the rest are
-    # the expanded pack element IR types, replacing the single TYPE_PACK parameter.
     var i: u32 = 0;
     for (i < total) {
         var elem_sem: type.TypeId = type.TYPE_NIL;
         if (i < fixed_count) {
             val pool_ix: u32 = d.data.fun_.params_start + i;
-            if (pool_ix::usize < lc.a.typed_name_len) {
-                elem_sem = type_resolved_of(lc, lc.a.typed_names[pool_ix].ty);
+            if (pool_ix::usize < lc.scope.a.typed_name_len) {
+                elem_sem = type_resolved_of(lc, lc.scope.a.typed_names[pool_ix].ty);
             }
         }
         or {
             elem_sem = types[i - fixed_count];
         }
-        val res_elem: R.Result[ir_type.IrTypeId, str] = lower_type(lc, elem_sem);
-        if (R.is_err[ir_type.IrTypeId, str](res_elem)) {
+        val res_elem: R.Result[ir_type.IrTypeId, fail.Fail] = lower_type(lc, elem_sem);
+        if (R.is_err[ir_type.IrTypeId, fail.Fail](res_elem)) {
             A.deallocate[ir_type.IrTypeId](lc.s.alloc, buf, total::usize);
             ret res_elem;
         }
-        buf[i] = R.unwrap_ok[ir_type.IrTypeId, str](res_elem);
+        buf[i] = R.unwrap_ok[ir_type.IrTypeId, fail.Fail](res_elem);
         i = i + 1;
     }
 
     val res_fn: R.Result[ir_type.IrTypeId, str] = ir_type.intern_fn(?lc.m.types, ret_ir, buf, total, false);
     A.deallocate[ir_type.IrTypeId](lc.s.alloc, buf, total::usize);
-    ret res_fn;
+    ret fail.lift[ir_type.IrTypeId](res_fn);
 }
 
-# the true IRT_FN signature of a generic or comptime-value instance at a reference
-# site in the referencing module
-#
-# A monomorphized-instance callee reference must carry the same signature the
-# drained definition emits, so a direct call classifies its ABI from the declared
-# parameter types rather than from per-operand stamps (the fragile contract behind
-# #2035). The signature depends on the callee's own type-parameter binding, absent
-# in the referencing context -- a naive caller-side `lower_type` erases a nested
-# generic param to pointer width. So bind the origin module's typing and the
-# concrete substitution env (as the instance drain does) and lower the template's
-# declared function type through the identical path, then restore the caller's
-# state. `lower_type` / `decl_type_of` read only the swapped fields, so nothing
-# else needs binding. `args`/`arg_len` are the concrete type-arguments for a
-# generic instance, or nil/0 for a value instance (whose signature carries no type
-# args, and whose comptime bindings never reach the signature -- lower_type folds
-# no comptime).
-# ---
-# lc:      the referencing context
-# decl_id: DeclId of the template function in `origin`'s AST
-# origin:  ModuleId declaring the template
-# args:    concrete type-argument sequence, or nil
-# arg_len: number of type arguments
-# ret:     the interned IRT_FN, or an error
 pub fun instance_ref_sig(lc: *LowerContext, decl_id: id.DeclId, origin: session.ModuleId,
-                         args: *type.TypeId, arg_len: u32) R.Result[ir_type.IrTypeId, str] {
-    val oa: *ast.Ast = session.module_ast(lc.s, origin);
-    if (oa == nil) { ret R.err[ir_type.IrTypeId, str]("lower: instance-reference origin AST not registered"); }
-    val osema: *sema.SemaResult = (session.module_sema_ptr(lc.s, origin))::*sema.SemaResult;
-    if (osema == nil) { ret R.err[ir_type.IrTypeId, str]("lower: instance-reference origin typing not registered"); }
+                         args: *type.TypeId, arg_len: u32) R.Result[ir_type.IrTypeId, fail.Fail] {
+    val sc_o: O.Option[ModuleScope] = origin_scope(lc.s, origin);
+    if (O.is_none[ModuleScope](sc_o)) {
+        ret R.err[ir_type.IrTypeId, fail.Fail](fail.message("lower: instance-reference origin module is not registered"));
+    }
+    var sc: ModuleScope = O.unwrap[ModuleScope](sc_o);
+    sc.subst     = args;
+    sc.subst_len = arg_len;
 
-    val home_a:         *ast.Ast          = lc.a;
-    val home_sema:      *sema.SemaResult   = lc.sema_result;
-    val home_subst:     *type.TypeId       = lc.subst;
-    val home_subst_len: u32                = lc.subst_len;
-    lc.a           = oa;
-    lc.sema_result = osema;
-    lc.subst       = args;
-    lc.subst_len   = arg_len;
+    val mark_r: R.Result[ScopeMark, fail.Fail] = scope_enter(lc, sc);
+    if (R.is_err[ScopeMark, fail.Fail](mark_r)) {
+        ret R.err[ir_type.IrTypeId, fail.Fail](R.unwrap_err[ScopeMark, fail.Fail](mark_r));
+    }
 
-    val res_sig: R.Result[ir_type.IrTypeId, str] = lower_type(lc, decl_type_of(lc, decl_id));
+    val res_sig: R.Result[ir_type.IrTypeId, fail.Fail] = lower_type(lc, decl_type_of(lc, decl_id));
 
-    lc.a           = home_a;
-    lc.sema_result = home_sema;
-    lc.subst       = home_subst;
-    lc.subst_len   = home_subst_len;
+    val leave: R.Result[R.Void, fail.Fail] = scope_leave(lc, R.unwrap_ok[ScopeMark, fail.Fail](mark_r));
+    if (R.is_err[R.Void, fail.Fail](leave)) { ret R.err[ir_type.IrTypeId, fail.Fail](R.unwrap_err[R.Void, fail.Fail](leave)); }
     ret res_sig;
 }
 
-# the true IRT_FN signature of a comptime variadic-pack instance at a reference
-# site in the referencing module
-#
-# The pack expands to `type_len` concrete element parameters after the leading
-# fixed ones, so the signature is built by `pack_instance_sig` (not the whole
-# declared function type), exactly as the drained definition builds it. Binds the
-# origin module's typing AND the instance's generic substitution (as the pack
-# drain does), so a `T`-typed fixed parameter or return lowers to the concrete
-# argument here exactly as it does in the definition; without it the reference
-# erased `T` to pointer width while the call passed the concrete value, which the
-# IR verifier rejected as a call-argument type disagreement (#2251). Restores the
-# caller's state afterwards.
-# ---
-# lc:       the referencing context
-# decl_id:  DeclId of the pack-tailed template in `origin`'s AST
-# origin:   ModuleId declaring the template
-# args:     the instance's concrete generic type-arguments, or nil
-# arg_len:  number of generic type arguments
-# types:    the concrete pack element type-list (by pack ordinal)
-# type_len: number of pack element types
-# ret:      the interned IRT_FN, or an error
 pub fun pack_instance_ref_sig(lc: *LowerContext, decl_id: id.DeclId, origin: session.ModuleId,
                               args: *type.TypeId, arg_len: u32,
-                              types: *type.TypeId, type_len: u32) R.Result[ir_type.IrTypeId, str] {
-    val oa: *ast.Ast = session.module_ast(lc.s, origin);
-    if (oa == nil) { ret R.err[ir_type.IrTypeId, str]("lower: pack-instance-reference origin AST not registered"); }
-    val osema: *sema.SemaResult = (session.module_sema_ptr(lc.s, origin))::*sema.SemaResult;
-    if (osema == nil) { ret R.err[ir_type.IrTypeId, str]("lower: pack-instance-reference origin typing not registered"); }
-    val opt_d: O.Option[*adecl.Decl] = ast.get_decl(oa, decl_id);
-    if (O.is_none[*adecl.Decl](opt_d)) { ret R.err[ir_type.IrTypeId, str]("lower: pack-instance-reference origin declaration not found"); }
+                              types: *type.TypeId, type_len: u32) R.Result[ir_type.IrTypeId, fail.Fail] {
+    val sc_o: O.Option[ModuleScope] = origin_scope(lc.s, origin);
+    if (O.is_none[ModuleScope](sc_o)) {
+        ret R.err[ir_type.IrTypeId, fail.Fail](fail.message("lower: pack-instance-reference origin module is not registered"));
+    }
+    var sc: ModuleScope = O.unwrap[ModuleScope](sc_o);
+    val opt_d: O.Option[*adecl.Decl] = ast.get_decl(sc.a, decl_id);
+    if (O.is_none[*adecl.Decl](opt_d)) { ret R.err[ir_type.IrTypeId, fail.Fail](fail.message("lower: pack-instance-reference origin declaration not found")); }
     val d: *adecl.Decl = O.unwrap[*adecl.Decl](opt_d);
-    if (d.kind != adecl.DECL_KIND_FUN) { ret R.err[ir_type.IrTypeId, str]("lower: pack-instance-reference origin declaration is not a function"); }
+    if (d.kind != adecl.DECL_KIND_FUN) { ret R.err[ir_type.IrTypeId, fail.Fail](fail.message("lower: pack-instance-reference origin declaration is not a function")); }
+    sc.subst     = args;
+    sc.subst_len = arg_len;
 
-    val home_a:         *ast.Ast          = lc.a;
-    val home_sema:      *sema.SemaResult   = lc.sema_result;
-    val home_subst:     *type.TypeId       = lc.subst;
-    val home_subst_len: u32                = lc.subst_len;
-    lc.a           = oa;
-    lc.sema_result = osema;
-    lc.subst       = args;
-    lc.subst_len   = arg_len;
+    val mark_r: R.Result[ScopeMark, fail.Fail] = scope_enter(lc, sc);
+    if (R.is_err[ScopeMark, fail.Fail](mark_r)) {
+        ret R.err[ir_type.IrTypeId, fail.Fail](R.unwrap_err[ScopeMark, fail.Fail](mark_r));
+    }
 
-    var res_sig: R.Result[ir_type.IrTypeId, str] = R.err[ir_type.IrTypeId, str]("");
-    val res_ret_ir: R.Result[ir_type.IrTypeId, str] = function_return_ir(lc, decl_id);
-    if (R.is_err[ir_type.IrTypeId, str](res_ret_ir)) {
-        res_sig = R.err[ir_type.IrTypeId, str](R.unwrap_err[ir_type.IrTypeId, str](res_ret_ir));
+    var res_sig: R.Result[ir_type.IrTypeId, fail.Fail];
+    val res_ret_ir: R.Result[ir_type.IrTypeId, fail.Fail] = function_return_ir(lc, decl_id);
+    if (R.is_err[ir_type.IrTypeId, fail.Fail](res_ret_ir)) {
+        res_sig = R.err[ir_type.IrTypeId, fail.Fail](R.unwrap_err[ir_type.IrTypeId, fail.Fail](res_ret_ir));
     }
     or {
         val fixed_count: u32 = d.data.fun_.params_len - 1;
-        res_sig = pack_instance_sig(lc, d, fixed_count, types, type_len, R.unwrap_ok[ir_type.IrTypeId, str](res_ret_ir));
+        res_sig = pack_instance_sig(lc, d, fixed_count, types, type_len, R.unwrap_ok[ir_type.IrTypeId, fail.Fail](res_ret_ir));
     }
 
-    lc.a           = home_a;
-    lc.sema_result = home_sema;
-    lc.subst       = home_subst;
-    lc.subst_len   = home_subst_len;
+    val leave: R.Result[R.Void, fail.Fail] = scope_leave(lc, R.unwrap_ok[ScopeMark, fail.Fail](mark_r));
+    if (R.is_err[R.Void, fail.Fail](leave)) { ret R.err[ir_type.IrTypeId, fail.Fail](R.unwrap_err[R.Void, fail.Fail](leave)); }
     ret res_sig;
 }
 
-# return the resolved SymbolId for an expression reference, or SYMBOL_NIL
-# ---
-# lc:  the context
-# eid: AST ExprId (typically an IDENT)
-# ret: the bound SymbolId, or SYMBOL_NIL
 pub fun expr_symbol_of(lc: *LowerContext, eid: id.ExprId) resolve.SymbolId {
     if (eid == id.EXPR_NIL)             { ret resolve.SYMBOL_NIL; }
-    if (eid::usize >= lc.rr.expr_count) { ret resolve.SYMBOL_NIL; }
-    ret lc.rr.expr_resolved[eid];
+    if (eid::usize >= lc.scope.rr.expr_count) { ret resolve.SYMBOL_NIL; }
+    ret lc.scope.rr.expr_resolved[eid];
 }
 
-# return the module's source text from the session source map. an unregistered
-# file id yields the empty string -- never reached for a well-formed pipeline,
-# since resolve already required the file to be registered
-# ---
-# lc:  the context
-# ret: the module's source text, or the empty string
 pub fun module_source(lc: *LowerContext) str {
-    ret ast_source(lc, lc.a);
+    ret ast_source(lc, lc.scope.a);
 }
 
-# return the source text an arbitrary module's AST was parsed from
-#
-# `module_source` answers for the module being lowered; a cross-module reference
-# needs the same answer for the module the referent was DECLARED in, whose
-# decorator spans index that text and not this one.
-# ---
-# lc:  the context
-# a:   the AST whose source text is wanted
-# ret: the source text, or the empty string for an unregistered file id
 pub fun ast_source(lc: *LowerContext, a: *ast.Ast) str {
     if (a == nil) { ret ""; }
     val sf: O.Option[*source.SourceFile] = source.get(?lc.s.sources, a.file_id);
@@ -1997,25 +1426,6 @@ pub fun ast_source(lc: *LowerContext, a: *ast.Ast) str {
     ret O.unwrap[*source.SourceFile](sf).text;
 }
 
-# read a function decl's `#[op(target, set, name)]` into a resolved set tag and opcode
-#
-# Every argument is a string literal sema has already closed against the SAME table
-# this reads, the selected target's own, so an unrecognized spelling cannot reach
-# here (#2888). `isa.NO_OP_SET` covers the decorator being absent, which is every
-# ordinary function, covers a declaration addressed to another target, and covers a
-# target that publishes no operations at all.
-#
-# The decl and its source text are passed rather than taken from the context
-# because this is read on BOTH sides of a module boundary: on the definition, where
-# they are the module being lowered, and at a call site in another module, where
-# they belong to the callee's origin module.
-# ---
-# a:      the AST the decl belongs to
-# src:    that AST's source text
-# d:      the function's decl
-# defs:   the selected target's operation table, or nil
-# out_op: receives the opcode within the set, untouched when there is no decorator
-# ret:    the target's own tag for the set, or isa.NO_OP_SET
 pub fun decl_target_op(a: *ast.Ast, src: str, d: *adecl.Decl, defs: *isa.TargetDefs, out_op: *u32) u32 {
     if (a == nil || d == nil) { ret isa.NO_OP_SET; }
     var i: u32 = 0;
@@ -2039,41 +1449,18 @@ pub fun decl_target_op(a: *ast.Ast, src: str, d: *adecl.Decl, defs: *isa.TargetD
     ret isa.NO_OP_SET;
 }
 
-# emit an OP_DBG_VALUE binding the source variable named by `name_span` (type
-# `ty`) to `val_v`, its current value
-#
-# Interns the variable's source name and records the debug value in the current
-# function. Scope is the function body (0) for now; the location-emitter tiers
-# build the scope tree. Callers gate this on `lc.debug`; shared by the decl,
-# parameter, and reassignment birth sites.
-# ---
-# lc:        the lowering context
-# name_span: source span of the variable's identifier
-# ty:        the variable's IR type
-# ty_sem:    the variable's semantic type (keeps signedness the IR type erases)
-# is_param:  true for a formal parameter, false for a local
-# val_v:     the value the variable currently holds
-# ret:       true on success, or an error
 pub fun emit_dbg_birth(lc: *LowerContext, name_span: token.Span, ty: ir_type.IrTypeId,
                        ty_sem: type.TypeId, is_param: bool, val_v: value.Value,
-                       slot: O.Option[value.Value]) R.Result[bool, str] {
+                       slot: O.Option[value.Value]) R.Result[R.Void, fail.Fail] {
     val res_name: R.Result[intern.StrId, str] = intern.intern_span(?lc.s.interner, module_source(lc), name_span);
     if (R.is_err[intern.StrId, str](res_name)) {
-        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](res_name));
+        ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[intern.StrId, str](res_name)));
     }
     val name: intern.StrId = R.unwrap_ok[intern.StrId, str](res_name);
-    # inside a monomorphized instance body, a local/param written as a bare generic param
-    # (`T`, `*T`, `[N]T`) resolves to TYPE_GENERIC_PARAM here; substitute the active
-    # type-arguments so the debug type is the concrete instance type (the paired IR type
-    # already is), the same way decl_ret_sem substitutes the return type. a no-op outside
-    # an instance body and for an already-concrete type.
     var sem: type.TypeId = ty_sem;
-    if (lc.subst != nil && lc.subst_len > 0) {
-        sem = generics.substitute(lc.s, sem, lc.subst, lc.subst_len);
+    if (lc.scope.subst != nil && lc.scope.subst_len > 0) {
+        sem = generics.substitute(lc.s, sem, lc.scope.subst, lc.scope.subst_len);
     }
-    # #1904: when the variable is slot-backed (a local's OP_ALLOCA), link that alloca to
-    # this source-variable identity so mem2reg can name the variable at the phi it
-    # inserts when it promotes the slot. params and reassignments pass none.
     if (O.is_some[value.Value](slot)) {
         val sv: value.Value = O.unwrap[value.Value](slot);
         if (sv.kind == value.VAL_INSTR) {
@@ -2083,55 +1470,32 @@ pub fun emit_dbg_birth(lc: *LowerContext, name_span: token.Span, ty: ir_type.IrT
             dv.ty_sem   = sem;
             dv.is_param = is_param;
             dv.scope    = 0;
-            val res_link: R.Result[bool, str] = ir.record_alloca_dbg_var(lc.builder.fn, sv.data.instr, dv);
-            if (R.is_err[bool, str](res_link)) { ret R.err[bool, str](R.unwrap_err[bool, str](res_link)); }
+            val res_link: R.Result[R.Void, str] = ir.record_alloca_dbg_var(lc.builder.fn, sv.data.instr, dv);
+            if (R.is_err[R.Void, str](res_link)) { ret fail.lift[R.Void](res_link); }
         }
     }
-    ret builder.emit_dbg_value(?lc.builder, val_v, name, ty, sem, is_param, 0);
+    ret fail.lift[R.Void](builder.emit_dbg_value(?lc.builder, val_v, name, ty, sem, is_param, 0));
 }
 
-# return a pointer to a resolved Symbol by id, or none when out of range
-# ---
-# lc:  the context
-# sid: SymbolId into the resolve result
-# ret: some(*Symbol) or none
 pub fun symbol_of(lc: *LowerContext, sid: resolve.SymbolId) O.Option[*resolve.Symbol] {
     if (sid == resolve.SYMBOL_NIL) { ret O.none[*resolve.Symbol](); }
-    if (sid >= lc.rr.symbol_count) { ret O.none[*resolve.Symbol](); }
-    ret O.some[*resolve.Symbol](?lc.rr.symbols[sid]);
+    if (sid >= lc.scope.rr.symbol_count) { ret O.none[*resolve.Symbol](); }
+    ret O.some[*resolve.Symbol](?lc.scope.rr.symbols[sid]);
 }
 
-# return the index of the module function named `name`, creating a signature-only
-# `FN_FLAG_EXTERN` declaration when none exists. a cross-module function
-# reference resolves through this so the back end emits a name-based call
-# relocation against the imported symbol (the linker binds it to the defining
-# module's object)
-#
-# `import_flag` marks a genuine foreign C import (a reference to a declared
-# `ext fun`), whose calls marshal their arguments to the foreign convention at the
-# boundary (#2058); a plain same-artifact cross-module reference (a generic instance
-# drained elsewhere, a forward reference) passes it false and keeps mach's internal
-# convention. a repeated reference to a name already declared an import stays an
-# import, mirroring `ensure_extern_global`.
-# ---
-# lc:          the context
-# name:        interned function symbol name
-# sig:         the function's IR type
-# import_flag: true for a genuine foreign C import (a declared `ext fun`)
-# ret:         the function index, or an allocation error
-pub fun ensure_extern_function(lc: *LowerContext, name: intern.StrId, sig: ir_type.IrTypeId, import_flag: bool) R.Result[u32, str] {
+pub fun ensure_extern_function(lc: *LowerContext, name: intern.StrId, sig: ir_type.IrTypeId, import_flag: bool) R.Result[u32, fail.Fail] {
     val m: *ir.Module = lc.m;
     val existing: O.Option[u32] = ir.function_lookup(m, name);
     if (O.is_some[u32](existing)) {
         val fi: u32 = O.unwrap[u32](existing);
         if (import_flag) { m.functions[fi].is_import = true; }
-        ret R.ok[u32, str](fi);
+        ret R.ok[u32, fail.Fail](fi);
     }
 
     if (m.function_len == m.function_cap) {
         val new_cap: u32 = grow_cap(m.function_cap);
         val res_grow: R.Result[*ir.Function, str] = A.reallocate[ir.Function](m.alloc, m.functions, m.function_cap::usize, new_cap::usize);
-        if (R.is_err[*ir.Function, str](res_grow)) { ret R.err[u32, str](R.unwrap_err[*ir.Function, str](res_grow)); }
+        if (R.is_err[*ir.Function, str](res_grow)) { ret R.err[u32, fail.Fail](fail.message(R.unwrap_err[*ir.Function, str](res_grow))); }
         m.functions    = R.unwrap_ok[*ir.Function, str](res_grow);
         m.function_cap = new_cap;
     }
@@ -2140,46 +1504,28 @@ pub fun ensure_extern_function(lc: *LowerContext, name: intern.StrId, sig: ir_ty
     m.functions[idx] = ir.function_new(m.alloc, name, sig, ir.FN_FLAG_EXTERN);
     m.functions[idx].is_import = import_flag;
     m.function_len   = m.function_len + 1;
-    val res_reg: R.Result[bool, str] = ir.function_register(m, name, idx);
-    if (R.is_err[bool, str](res_reg)) { ret R.err[u32, str](R.unwrap_err[bool, str](res_reg)); }
+    val res_reg: R.Result[R.Void, str] = ir.function_register(m, name, idx);
+    if (R.is_err[R.Void, str](res_reg)) { ret R.err[u32, fail.Fail](fail.message(R.unwrap_err[R.Void, str](res_reg))); }
 
-    # appending may have reallocated `m.functions`, invalidating the builder's
-    # raw pointer to the function currently being lowered. re-point it at the
-    # live array so subsequent emits land in the right function.
     if (lc.builder.fn != nil && lc.fn_index < m.function_len) {
         lc.builder.fn = ?m.functions[lc.fn_index];
     }
-    ret R.ok[u32, str](idx);
+    ret R.ok[u32, fail.Fail](idx);
 }
 
-# return the index of the module global named `name`, creating a storage-less
-# `is_extern` declaration when none exists. a reference to a `val`/`var` defined
-# in another module resolves through this so the back end emits a name-based
-# relocation the linker binds to the defining object
-#
-# `import_flag` marks a genuine foreign/dynamic data import (a reference to an
-# `ext val`/`ext var`), which lowers GOT-indirect on a dynamic target; a plain
-# same-artifact cross-module reference passes it false and keeps direct addressing.
-# a repeated reference to a name already declared an import stays an import.
-# ---
-# lc:          the context
-# name:        interned global symbol name
-# ty:          the global's IR storage type
-# import_flag: true for a genuine dynamic data import (#2026)
-# ret:         the global index, or an allocation error
-pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: ir_type.IrTypeId, import_flag: bool) R.Result[u32, str] {
+pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: ir_type.IrTypeId, import_flag: bool) R.Result[u32, fail.Fail] {
     val m: *ir.Module = lc.m;
     val existing: O.Option[u32] = ir.global_lookup(m, name);
     if (O.is_some[u32](existing)) {
         val gi: u32 = O.unwrap[u32](existing);
         if (import_flag) { m.globals[gi].is_import = true; }
-        ret R.ok[u32, str](gi);
+        ret R.ok[u32, fail.Fail](gi);
     }
 
     if (m.global_len == m.global_cap) {
         val new_cap: u32 = grow_cap(m.global_cap);
         val res_grow: R.Result[*ir.Global, str] = A.reallocate[ir.Global](m.alloc, m.globals, m.global_cap::usize, new_cap::usize);
-        if (R.is_err[*ir.Global, str](res_grow)) { ret R.err[u32, str](R.unwrap_err[*ir.Global, str](res_grow)); }
+        if (R.is_err[*ir.Global, str](res_grow)) { ret R.err[u32, fail.Fail](fail.message(R.unwrap_err[*ir.Global, str](res_grow))); }
         m.globals    = R.unwrap_ok[*ir.Global, str](res_grow);
         m.global_cap = new_cap;
     }
@@ -2199,37 +1545,27 @@ pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: ir_type.
     g.section   = intern.STR_NIL;
     m.globals[idx] = g;
     m.global_len   = m.global_len + 1;
-    val res_reg: R.Result[bool, str] = ir.global_register(m, name, idx);
-    if (R.is_err[bool, str](res_reg)) { ret R.err[u32, str](R.unwrap_err[bool, str](res_reg)); }
-    ret R.ok[u32, str](idx);
+    val res_reg: R.Result[R.Void, str] = ir.global_register(m, name, idx);
+    if (R.is_err[R.Void, str](res_reg)) { ret R.err[u32, fail.Fail](fail.message(R.unwrap_err[R.Void, str](res_reg))); }
+    ret R.ok[u32, fail.Fail](idx);
 }
 
-# materialise a byte-blob constant (`init`, a VAL_CONST_BYTES) as an anonymous
-# read-only data global and return a VAL_GLOBAL pointer to it. string literals
-# and other inline byte blobs flow through here so the back end emits them to
-# `.rodata` and resolves uses to the global's address rather than carrying raw
-# bytes into instruction operands
-# ---
-# lc:   the context
-# init: the VAL_CONST_BYTES value to store
-# pty:  the IR pointer type the resulting global value carries
-# ret:  a VAL_GLOBAL pointer to the new global, or an error
-pub fun add_rodata_bytes(lc: *LowerContext, init: value.Value, pty: ir_type.IrTypeId) R.Result[value.Value, str] {
+pub fun add_rodata_bytes(lc: *LowerContext, init: value.Value, pty: ir_type.IrTypeId) R.Result[value.Value, fail.Fail] {
     val m: *ir.Module = lc.m;
-    val res_name: R.Result[intern.StrId, str] = anon_global_name(lc, m.global_len);
-    if (R.is_err[intern.StrId, str](res_name)) { ret R.err[value.Value, str](R.unwrap_err[intern.StrId, str](res_name)); }
+    val res_name: R.Result[intern.StrId, fail.Fail] = anon_global_name(lc, m.global_len);
+    if (R.is_err[intern.StrId, fail.Fail](res_name)) { ret R.err[value.Value, fail.Fail](R.unwrap_err[intern.StrId, fail.Fail](res_name)); }
 
     if (m.global_len == m.global_cap) {
         val new_cap: u32 = grow_cap(m.global_cap);
         val res_grow: R.Result[*ir.Global, str] = A.reallocate[ir.Global](m.alloc, m.globals, m.global_cap::usize, new_cap::usize);
-        if (R.is_err[*ir.Global, str](res_grow)) { ret R.err[value.Value, str](R.unwrap_err[*ir.Global, str](res_grow)); }
+        if (R.is_err[*ir.Global, str](res_grow)) { ret R.err[value.Value, fail.Fail](fail.message(R.unwrap_err[*ir.Global, str](res_grow))); }
         m.globals    = R.unwrap_ok[*ir.Global, str](res_grow);
         m.global_cap = new_cap;
     }
 
     val idx: u32 = m.global_len;
     var g: ir.Global;
-    g.name      = R.unwrap_ok[intern.StrId, str](res_name);
+    g.name      = R.unwrap_ok[intern.StrId, fail.Fail](res_name);
     g.ty        = init.ty;
     g.init      = init;
     g.is_mut    = false;
@@ -2243,17 +1579,10 @@ pub fun add_rodata_bytes(lc: *LowerContext, init: value.Value, pty: ir_type.IrTy
     m.globals[idx] = g;
     m.global_len   = m.global_len + 1;
 
-    ret R.ok[value.Value, str](value.global(idx, pty));
+    ret R.ok[value.Value, fail.Fail](value.global(idx, pty));
 }
 
-# intern a unique anonymous data-global name `.Lc.<n>` for slot `n`, distinct
-# from any user symbol (the `.L` prefix is the conventional local-label form) and
-# unique because `n` is the global's index
-# ---
-# lc:  the context
-# n:   the global's index
-# ret: the interned name, or an allocation error
-fun anon_global_name(lc: *LowerContext, n: u32) R.Result[intern.StrId, str] {
+fun anon_global_name(lc: *LowerContext, n: u32) R.Result[intern.StrId, fail.Fail] {
     var buf: [16]u8;
     buf[0] = '.';
     buf[1] = 'L';
@@ -2270,14 +1599,269 @@ fun anon_global_name(lc: *LowerContext, n: u32) R.Result[intern.StrId, str] {
         len = len + 1;
         d = d + 1;
     }
-    ret intern.intern_bytes(?lc.s.interner, (?buf[0])::str, len);
+    ret fail.lift[intern.StrId](intern.intern_bytes(?lc.s.interner, (?buf[0])::str, len));
 }
 
-# doubling growth for the function / global arrays, seeding an empty one
-# ---
-# cap: current capacity
-# ret: the next capacity (4 when seeding from empty)
 fun grow_cap(cap: u32) u32 {
     if (cap == 0) { ret 4; }
     ret cap * 2;
+}
+
+fun enqueue_distinct_instances(lc: *LowerContext, first: u32, count: u32) R.Result[R.Void, fail.Fail] {
+    var i: u32 = first;
+    for (i < first + count) {
+        val r: R.Result[R.Void, fail.Fail] = enqueue_instance(lc, 0::id.DeclId, 0::session.ModuleId, nil, 0, i::intern.StrId, i::intern.StrId);
+        if (R.is_err[R.Void, fail.Fail](r)) { ret r; }
+        i = i + 1;
+    }
+    ret R.ok_void[fail.Fail]();
+}
+
+fun time_enqueue_fresh(count: u32) i64 {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret -1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret -1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var lc: LowerContext;
+    lc.s            = ?s;
+    lc.scope        = scope_nil();
+    lc.inst_len     = 0;
+    lc.inst_cap     = 0;
+    lc.insts        = nil;
+    lc.inst_by_name = map.init[intern.StrId, u32](?alloc, map.hash_u32, map.eq_u32);
+
+    val start: tm.Time = tm.monotonic();
+    val ok: R.Result[R.Void, fail.Fail] = enqueue_distinct_instances(?lc, 0, count);
+    val elapsed: duration.Duration = tm.time_sub(tm.monotonic(), start);
+    if (R.is_err[R.Void, fail.Fail](ok)) { ret -1; }
+
+    var i: u32 = 0;
+    for (i < lc.inst_len) {
+        if (lc.insts[i].args != nil && lc.insts[i].arg_len > 0) {
+            A.deallocate[type.TypeId](?alloc, lc.insts[i].args, lc.insts[i].arg_len::usize);
+        }
+        i = i + 1;
+    }
+    if (lc.insts != nil && lc.inst_cap > 0) { A.deallocate[Instance](?alloc, lc.insts, lc.inst_cap::usize); }
+    map.dnit[intern.StrId, u32](?lc.inst_by_name);
+
+    ret duration.duration_usec(elapsed);
+}
+
+fun time_enqueue_min(count: u32, reps: u32) i64 {
+    var best: i64 = -1;
+    var r: u32 = 0;
+    for (r < reps) {
+        val us: i64 = time_enqueue_fresh(count);
+        if (us < 0) { ret -1; }
+        if (best < 0 || us < best) { best = us; }
+        r = r + 1;
+    }
+    ret best;
+}
+
+test "mach.lang.me.lower.context.scope_leave:refuses_a_stale_or_out_of_order_mark" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var lc: LowerContext;
+    lc.s                = ?s;
+    lc.scopes           = nil;
+    lc.scope_len        = 0;
+    lc.scope_cap        = 0;
+    lc.scope_generation = 0;
+    lc.scope_top        = 0;
+
+    var home: ModuleScope = scope_nil();
+    home.fqn = 11::intern.StrId;
+    lc.scope = home;
+
+    var first: ModuleScope = scope_nil();
+    first.fqn = 22::intern.StrId;
+    var second: ModuleScope = scope_nil();
+    second.fqn = 33::intern.StrId;
+
+    var code: i32 = 0;
+
+    val m1r: R.Result[ScopeMark, fail.Fail] = scope_enter(?lc, first);
+    if (R.is_err[ScopeMark, fail.Fail](m1r)) { ret 1; }
+    val m1: ScopeMark = R.unwrap_ok[ScopeMark, fail.Fail](m1r);
+    if (lc.scope.fqn != 22::intern.StrId) { code = 1; }
+
+    val m2r: R.Result[ScopeMark, fail.Fail] = scope_enter(?lc, second);
+    if (R.is_err[ScopeMark, fail.Fail](m2r)) { ret 1; }
+    val m2: ScopeMark = R.unwrap_ok[ScopeMark, fail.Fail](m2r);
+    if (lc.scope.fqn != 33::intern.StrId) { code = 1; }
+
+    if (R.is_ok[R.Void, fail.Fail](scope_leave(?lc, m1))) { code = 1; }
+    if (lc.scope.fqn != 33::intern.StrId) { code = 1; }
+    if (lc.scope_len != 2) { code = 1; }
+
+    if (R.is_err[R.Void, fail.Fail](scope_leave(?lc, m2))) { code = 1; }
+    if (lc.scope.fqn != 22::intern.StrId) { code = 1; }
+
+    if (R.is_ok[R.Void, fail.Fail](scope_leave(?lc, m2))) { code = 1; }
+
+    if (R.is_err[R.Void, fail.Fail](scope_leave(?lc, m1))) { code = 1; }
+    if (lc.scope.fqn != 11::intern.StrId) { code = 1; }
+    if (lc.scope_len != 0) { code = 1; }
+
+    var other: LowerContext;
+    other.s = ?s;
+    if (R.is_ok[R.Void, fail.Fail](scope_leave(?other, m1))) { code = 1; }
+
+    if (lc.scopes != nil && lc.scope_cap > 0) {
+        A.deallocate[ModuleScope](?alloc, lc.scopes, lc.scope_cap::usize);
+    }
+    ret code;
+}
+
+test "mach.lang.me.lower.context.module_scope:refuses_a_piece_that_belongs_to_another_module" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var a1:  ast.Ast;
+    var a2:  ast.Ast;
+    var sm1: sema.SemaResult;
+    var sm2: sema.SemaResult;
+    var rr1: resolve.ResolveResult;
+    var rr2: resolve.ResolveResult;
+    var cc1: comptime.ComptimeCtx;
+    var cc2: comptime.ComptimeCtx;
+
+    val mid: session.ModuleId = 0::session.ModuleId;
+    val fqn: intern.StrId     = 7::intern.StrId;
+
+    val ri: R.Result[R.Void, str] = session.register_module_identity(?s, mid, ?a1, fqn, 5);
+    if (R.is_err[R.Void, str](ri)) { ret 1; }
+    val rp: R.Result[R.Void, str] = session.register_module_phase(?s, mid, (?sm1)::ptr, (?rr1)::ptr, (?cc1)::ptr);
+    if (R.is_err[R.Void, str](rp)) { ret 1; }
+
+    var code: i32 = 0;
+
+    cc1.env.pointer_width = 99;
+    val good: R.Result[ModuleScope, fail.Fail] = module_scope(?s, mid, ?a1, fqn, ?sm1, ?rr1, ?cc1);
+    if (R.is_err[ModuleScope, fail.Fail](good)) { ret 1; }
+    val sc: ModuleScope = R.unwrap_ok[ModuleScope, fail.Fail](good);
+    if (sc.env.pointer_width != 99) { code = 1; }
+    cc1.env.pointer_width = 12;
+    if (sc.env.pointer_width != 99) { code = 1; }
+
+    if (R.is_ok[ModuleScope, fail.Fail](module_scope(?s, mid, ?a2, fqn, ?sm1, ?rr1, ?cc1)))               { code = 1; }
+    if (R.is_ok[ModuleScope, fail.Fail](module_scope(?s, mid, ?a1, 8::intern.StrId, ?sm1, ?rr1, ?cc1)))   { code = 1; }
+    if (R.is_ok[ModuleScope, fail.Fail](module_scope(?s, mid, ?a1, fqn, ?sm2, ?rr1, ?cc1)))               { code = 1; }
+    if (R.is_ok[ModuleScope, fail.Fail](module_scope(?s, mid, ?a1, fqn, ?sm1, ?rr2, ?cc1)))               { code = 1; }
+    if (R.is_ok[ModuleScope, fail.Fail](module_scope(?s, mid, ?a1, fqn, ?sm1, ?rr1, ?cc2)))               { code = 1; }
+    if (R.is_ok[ModuleScope, fail.Fail](module_scope(?s, mid, nil, fqn, ?sm1, ?rr1, ?cc1)))               { code = 1; }
+    if (R.is_ok[ModuleScope, fail.Fail](module_scope(?s, mid, ?a1, fqn, nil, ?rr1, ?cc1)))                { code = 1; }
+    if (R.is_ok[ModuleScope, fail.Fail](module_scope(?s, mid, ?a1, fqn, ?sm1, nil, ?cc1)))                { code = 1; }
+    if (R.is_ok[ModuleScope, fail.Fail](module_scope(?s, mid, ?a1, fqn, ?sm1, ?rr1, nil)))                { code = 1; }
+    if (R.is_ok[ModuleScope, fail.Fail](module_scope(?s, 1::session.ModuleId, ?a1, fqn, ?sm1, ?rr1, ?cc1))) { code = 1; }
+
+    ret code;
+}
+
+test "mach.lang.me.lower.context.request:refuses_a_module_product_that_does_not_correspond" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var a1:  ast.Ast;
+    var a2:  ast.Ast;
+    var sm1: sema.SemaResult;
+    var rr1: resolve.ResolveResult;
+    var cc1: comptime.ComptimeCtx;
+    var tgt: target.Target;
+
+    val mid: session.ModuleId = 0::session.ModuleId;
+    val fqn: intern.StrId     = 7::intern.StrId;
+
+    val ri: R.Result[R.Void, str] = session.register_module_identity(?s, mid, ?a1, fqn, 5);
+    if (R.is_err[R.Void, str](ri)) { ret 1; }
+    val rp: R.Result[R.Void, str] = session.register_module_phase(?s, mid, (?sm1)::ptr, (?rr1)::ptr, (?cc1)::ptr);
+    if (R.is_err[R.Void, str](rp)) { ret 1; }
+
+    var code: i32 = 0;
+
+    val good: R.Result[LowerRequest, fail.Fail] = request(?s, ?tgt, ?alloc, ?a1, fqn, mid, ?sm1, ?rr1, ?cc1, false, false);
+    if (R.is_err[LowerRequest, fail.Fail](good)) { ret 1; }
+    val req: LowerRequest = R.unwrap_ok[LowerRequest, fail.Fail](good);
+    if (req.module.a != ?a1 || req.module.own_module != mid) { code = 1; }
+
+    if (R.is_ok[LowerRequest, fail.Fail](request(?s, nil, ?alloc, ?a1, fqn, mid, ?sm1, ?rr1, ?cc1, false, false))) { code = 1; }
+    if (R.is_ok[LowerRequest, fail.Fail](request(?s, ?tgt, nil, ?a1, fqn, mid, ?sm1, ?rr1, ?cc1, false, false)))   { code = 1; }
+    if (R.is_ok[LowerRequest, fail.Fail](request(?s, ?tgt, ?alloc, ?a2, fqn, mid, ?sm1, ?rr1, ?cc1, false, false))) { code = 1; }
+
+    ret code;
+}
+
+test "mach.lang.me.lower.context.enqueue_instance:cost_stays_near_linear_as_population_grows" {
+    val small: u32 = 1500;
+    val large: u32 = small * 4;
+
+    val us_small: i64 = time_enqueue_min(small, 7);
+    val us_large: i64 = time_enqueue_min(large, 7);
+    if (us_small < 0 || us_large < 0) { ret 1; }
+
+    var pa: A.Allocator;
+    page.make(?pa);
+    val msg: R.Result[str, str] = format.sprint(?pa, "us_small={} us_large={}\n", us_small, us_large);
+    if (R.is_ok[str, str](msg)) { print.eprint(R.unwrap_ok[str, str](msg)); }
+
+    var bad: i32 = 0;
+    if (us_large > us_small * 8) { bad = 1; }
+    ret bad;
+}
+
+test "mach.lang.me.lower.context.enqueue_pack_instance:refuses_past_the_instance_cap" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var lc: LowerContext;
+    lc.s            = ?s;
+    lc.pinst_len    = 0;
+    lc.pinst_cap    = 0;
+    lc.pinsts       = nil;
+    lc.pinst_by_name = map.init[intern.StrId, u32](?alloc, map.hash_u32, map.eq_u32);
+
+    var code: i32 = 0;
+    var i: u32 = 0;
+    for (i < MAX_PACK_INSTANCES) {
+        val r: R.Result[R.Void, fail.Fail] = enqueue_pack_instance(?lc, 0::id.DeclId, 0::session.ModuleId, nil, 0, nil, 0, i::intern.StrId);
+        if (R.is_err[R.Void, fail.Fail](r)) { code = 1; brk; }
+        i = i + 1;
+    }
+    if (lc.pinst_len != MAX_PACK_INSTANCES) { code = 1; }
+
+    val over: R.Result[R.Void, fail.Fail] = enqueue_pack_instance(?lc, 0::id.DeclId, 0::session.ModuleId, nil, 0, nil, 0, MAX_PACK_INSTANCES::intern.StrId);
+    if (R.is_ok[R.Void, fail.Fail](over)) { code = 1; }
+    if (lc.pinst_len != MAX_PACK_INSTANCES) { code = 1; }
+
+    var j: u32 = 0;
+    for (j < lc.pinst_len) {
+        if (lc.pinsts[j].args != nil && lc.pinsts[j].arg_len > 0) {
+            A.deallocate[type.TypeId](?alloc, lc.pinsts[j].args, lc.pinsts[j].arg_len::usize);
+        }
+        if (lc.pinsts[j].types != nil && lc.pinsts[j].type_len > 0) {
+            A.deallocate[type.TypeId](?alloc, lc.pinsts[j].types, lc.pinsts[j].type_len::usize);
+        }
+        j = j + 1;
+    }
+    if (lc.pinsts != nil && lc.pinst_cap > 0) { A.deallocate[PackInstance](?alloc, lc.pinsts, lc.pinst_cap::usize); }
+    map.dnit[intern.StrId, u32](?lc.pinst_by_name);
+
+    ret code;
 }
