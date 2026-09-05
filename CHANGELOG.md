@@ -196,6 +196,7 @@ The pin moves from 0.28.1 to 0.37.1.
 
 #### Driver and build
 
+- Link fixture build steps preserve the harness-selected toolchain PATH, including CI's versioned LLVM directory and native Windows compiler paths (#3141).
 - A required artifact planned under `mach test` was built as a test cell.
 - `--quiet` on `mach build` was ignored.
 - `BuildPlan` borrowed its request.
