@@ -196,6 +196,7 @@ The pin moves from 0.28.1 to 0.37.1.
 
 #### Driver and build
 
+- CI's vendored-version and checked-type fixtures use contained source snapshots at the compiler's std pin, and release additivity builds use project-relative output paths (#3135).
 - A required artifact planned under `mach test` was built as a test cell.
 - `--quiet` on `mach build` was ignored.
 - `BuildPlan` borrowed its request.
