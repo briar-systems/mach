@@ -856,7 +856,9 @@ without threading it through the template — e.g. `cc --target=$MACH_TARGET_ISA
 The step inherits the planner's environment, then applies its declared `env`
 values, then assigns those three target variables. Names use host identity:
 case-sensitive on Unix and ordinal case-insensitive on Windows, including Unicode
-names. Each name has one value. A `MACH_TARGET_*` value inherited from an enclosing
+names. A declaration cannot contain names differing only in ASCII case on any
+host, or names that alias under Windows Unicode comparison on Windows. Each name
+has one value. A `MACH_TARGET_*` value inherited from an enclosing
 build or declared by the step is overwritten by the cell's own. The same three values are
 available in the `argv` templates as the `{target.*}` keys (see
 [Path templates](#path-templates)).
