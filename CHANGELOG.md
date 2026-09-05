@@ -66,6 +66,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 ### Changed
 
+- The unshipped initialization journal uses a single `.machinit.*` layout without protocol versioning.
+
 #### Language
 
 - `$mach.abi.sysv` resolves to `sysv64` with a deprecation warning naming the registry spelling.
