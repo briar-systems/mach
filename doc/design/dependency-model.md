@@ -149,7 +149,9 @@ Dependencies declare sources only. Artifacts, tests, and steps declare which
 ids they consume; there is no scope vocabulary (no "dev" or "test"
 dependencies), because a scope is a property of the consumer, and the
 consumer already says what it consumes. Public entry is the module a
-dependency's artifacts share; there is no implicit `lib.mach`.
+dependency's artifacts share. In 4.30.0, a dependency with no artifacts still
+gets the legacy `lib.mach` entry under its source directory. 5.0.0 removes
+that fallback and requires an explicitly defaulted library artifact.
 
 Three things fit the five statements without changing them and are named as
 future slots rather than built: owner-prefixed (dotted) ids if the flat id
