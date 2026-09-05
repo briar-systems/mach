@@ -202,6 +202,7 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 #### Driver and build
 
+- Initialization preserves Windows drive and UNC roots and converts native path components to canonical transaction-relative paths (#3169).
 - Manifest dependency editing allocates escaped TOML strings at their exact owned size, so ordinary values release their full allocation (#3160).
 - Build steps inherit the planner environment and apply declared overrides with host-correct name identity. Target variables remain authoritative, environment changes invalidate cached steps, and allocating failures release exact owned extents (#3146).
 - CI's vendored-version and checked-type fixtures use contained source snapshots at the compiler's std pin, and release additivity builds use project-relative output paths (#3135).
