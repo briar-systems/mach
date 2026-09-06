@@ -135,6 +135,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 - Code generation releases each module's MIR, register-allocation, encoding and debug scratch after preserving its completed object image, instead of retaining scratch across the worker batch (#2299).
 - Mach-O executables describe embedded DWARF as file-only data with no memory protection and no relocation, allowing native dyld to load debug builds (#3202).
+- Calls prepare argument values and owned aggregate copies before filling physical argument registers, keeping bulk-copy scratch available and preserving direct, indirect, hidden-result and variadic placement (#3109).
+
 - Native aggregate copies and zero initialization lower through bounded MIR loops. Copies preserve snapshot semantics for self and partial overlap, use exact byte extents, and retain secret-data markers without payload-dependent control flow (#3109).
 - Windows vector calls now use one explicit carrier per byte extent: integer bits at 2/4 bytes, `__m64` at 8 bytes, a 128-bit intrinsic at 16 bytes, and an exact-size byte aggregate otherwise. Direct calls, typed indirect calls, parameter capture and returns agree, including hidden result-pointer argument shifts and caller-owned aggregate copies (#3199).
 
