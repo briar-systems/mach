@@ -18,11 +18,11 @@ OUT.mkdir(exist_ok=True)
 COMMIT = '49fbbc48a9b290cbcb17c8187d339e5ce0bcc64b'
 PIN = '3ee8e709a8ed7baff6e93780ce9b3582a907a91f'
 RESULTS = []
-PATTERN = r'^([^[:space:]]*/)?(mach|m[0-9A-Za-z_-]*|A|B|C|D)(\.exe)? (build|test)( |$)'
+PATTERN = r'^([^[:space:]]*/)?(qemu-[^[:space:]]+ )?([^[:space:]]*/)?(mach|m[0-9A-Za-z_-]*|selfhostcc|A|B|C|D)(\.exe)? (build|test)( |$)'
 
 def census():
     if sys.platform == 'win32':
-        cmd = ['powershell.exe', '-NoProfile', '-Command', r"$ErrorActionPreference = 'Stop'; $found = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(mach|m[0-9A-Za-z_-]*|A|B|C|D)(\.exe)?$' -and $_.CommandLine -match '\s(build|test)(\s|$)' }); $found | Select-Object ProcessId, Name, CommandLine | Format-List; if ($found.Count) { exit 75 }"]
+        cmd = ['powershell.exe', '-NoProfile', '-Command', r"$ErrorActionPreference = 'Stop'; $found = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(mach|m[0-9A-Za-z_-]*|selfhostcc|A|B|C|D)(\.exe)?$' -and $_.CommandLine -match '\s(build|test)(\s|$)' }); $found | Select-Object ProcessId, Name, CommandLine | Format-List; if ($found.Count) { exit 75 }"]
     else:
         cmd = ['bash', '-c', 'pgrep -af '+repr(PATTERN)+' || true\nif pgrep -f '+repr(PATTERN)+' >/dev/null; then exit 75; fi']
     result = subprocess.run(cmd, capture_output=True, timeout=30)
@@ -137,7 +137,20 @@ def main():
             run('decode-corpus',[sys.executable,__file__,'corpus',compiler,'--decode',os.environ['AUDIT_RUNNER']],limit=1200)
         os.environ['MACH_LINK_MACH']=wrapper.as_posix()
         os.environ['MACH_LINK_OUT']=(OUT/'link').as_posix()
-        run('native-link',['bash','test/link/run.sh','--deps','pin'],limit=2400)
+        link_script=SOURCE/'test/link/run.sh'
+        original_link=link_script.read_bytes()
+        original_text=original_link.decode()
+        anchor='&& $buildcc build .'
+        assert original_text.count(anchor)==1
+        os.environ['AUDIT_PYTHON']=sys.executable
+        os.environ['AUDIT_SCRIPT']=str(Path(__file__).resolve())
+        instrumented=original_text.replace(anchor, '&& "$AUDIT_PYTHON" "$AUDIT_SCRIPT" census && $buildcc build .')
+        (OUT/'link-census-instrumentation.txt').write_text('Exactly one shell buildcc invocation gains a pre-invocation census. Original tracked script restored after the link suite.\n')
+        try:
+            link_script.write_text(instrumented, newline='\n')
+            run('native-link',['bash','test/link/run.sh','--deps','pin'],limit=2400)
+        finally:
+            link_script.write_bytes(original_link)
         if sys.platform=='linux':
             run('std-build',[compiler,'build','.'],cwd=SOURCE/'dep/std',compiler=True)
             run('std-suite',[compiler,'test','.'],cwd=SOURCE/'dep/std',compiler=True,suite=True)
@@ -145,8 +158,9 @@ def main():
             record(dict(name='std-root',status='unsupported root manifest target on this host',passed=True))
         for matrix in OUT.glob('*/matrix.tsv'):
             rows=list(csv.DictReader(matrix.open(newline=''),delimiter='\t'))
-            counts={status:sum(r.get('status')==status for r in rows) for status in ['PASS','FAIL','SKIP']}
-            record(dict(name='matrix-'+matrix.parent.name,counts=counts,total=len(rows),passed=counts['FAIL']==0 and bool(rows)))
+            column='result' if matrix.parent.name=='link' else 'status'
+            counts={status:sum(r.get(column)==status for r in rows) for status in sorted({r[column] for r in rows})}
+            record(dict(name='matrix-'+matrix.parent.name,counts=counts,total=len(rows),passed=not any(r[column] not in ('PASS','SKIP') for r in rows) and bool(rows)))
     finally:
         census()
         run('source-clean',['git','diff','--exit-code'])
@@ -154,6 +168,8 @@ def main():
     if not all(x['passed'] for x in RESULTS): raise RuntimeError('full bar contains recorded failures')
 
 if __name__=='__main__':
+    if len(sys.argv)>1 and sys.argv[1]=='census':
+        census(); sys.exit(0)
     if len(sys.argv)>1 and sys.argv[1]=='gate':
         if len(sys.argv)>3 and sys.argv[3] in ('build','test'): census()
         sys.exit(subprocess.run(sys.argv[2:]).returncode)
