@@ -130,6 +130,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 ### Fixed
 
+- Deferred gate and generic type probes keep their incomplete outcome, and identifiers already rejected by resolution retain their source error. Actual allocation failures and unvisited committed bindings remain internal errors (#3115, #3130).
+
 - Manifests own one synthesized native target across repeated resolutions and release it on destruction. Early parse failures also release recorded deprecated keys (#3116).
 - Optimization releases mem2reg, constant-folding, algebraic, common-subexpression and dead-code work tables after each function, and verifier scratch after each check, instead of retaining them in the lowered IR arena (#2299).
 
