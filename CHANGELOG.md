@@ -131,6 +131,7 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 ### Fixed
 
 - Three Windows corpus disassemblies now reflect the verified vector carrier ABI, including direct eight-byte payloads and exact twelve-byte staging (#3199).
+- Deferred gate and generic type probes keep their incomplete outcome, and identifiers already rejected by resolution retain their source error. Actual allocation failures and unvisited committed bindings remain internal errors (#3115, #3130).
 
 - Manifests own one synthesized native target across repeated resolutions and release it on destruction. Early parse failures also release recorded deprecated keys (#3116).
 - Mach-O executables describe embedded DWARF as file-only data with no memory protection and no relocation, allowing native dyld to load debug builds (#3202).
@@ -149,6 +150,9 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 #### Language and frontend
 
+- Oversized vector diagnostics allocate one owned message and preserve allocation failure instead of overwriting the first formatting result (#3204).
+
+- Frontend phases carry explicit accepted, rejected and internal outcomes. Recoverable syntax errors retain their AST without claiming acceptance, and allocation failures in diagnostics, type interning and generic substitution remain internal even after a user error. Build classification no longer infers failure kinds from diagnostic counts (#3115, #3130).
 - `?` on a temporary (a call result, literal, cast, operator result, array, record or vector literal, or a field or element of one) is refused, naming the operand kind. It used to compile to a pointer into dead stack.
 - A whole record or array declassified with `:>T` or `:^T` reached the middle end as an aggregate strip and was refused.
 - A `$if` whose condition short-circuited to true lost its width and was deferred forever, so every identifier in its body reported unbound.
