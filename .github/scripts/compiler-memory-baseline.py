@@ -30,9 +30,11 @@ abi = "sysv64"
 [profile.debug]
 opt = 0
 debug = true
+simd = "scalarize"
 [profile.release]
 opt = 2
 debug = false
+simd = "scalarize"
 [artifact.bench]
 kind = "bin"
 entry = "main.mach"
