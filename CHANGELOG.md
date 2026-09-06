@@ -156,6 +156,7 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 - A module rejected while its diagnostic could not be stored was reported as accepted, and a diagnostic append's result was discarded at 31 sites.
 - Phase failure classification read session-wide state, so one module's diagnostic made a later module's internal failure look already reported.
 - The editor's resolve and analyze built an empty dependency set, so any file importing another module failed to resolve.
+- Editor project lookup accepts both Windows path separators at source-directory boundaries and within the project prefix, so native and mixed-separator buffer paths retain their project dependencies (#3188).
 - Implicit module discovery and glob matching descended hidden directories that never asked for them.
 - Import-depth cost was superlinear: the query shard scanned every entry, closure scratch was re-zeroed per call, and dependencies were recorded twice.
 - Generic instance and revalidation lookups were linear scans.
