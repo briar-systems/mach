@@ -41,6 +41,8 @@ def record(result):
 
 def run(name, command, cwd=SOURCE, compiler=False, suite=False, expected=None, limit=1200):
     if compiler: census()
+    if sys.platform == 'win32' and str(command[0]) == 'bash':
+        command=[os.environ['AUDIT_BASH'],*command[1:]]
     start = time.monotonic()
     print('START '+name, flush=True)
     with (OUT / (name+'.log')).open('wb') as log:
