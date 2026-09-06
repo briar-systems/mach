@@ -8,7 +8,7 @@ import os
 import signal
 
 checkout = pathlib.Path(__file__).resolve().parents[2]
-baseline = '73de9227'
+baseline = '7b7d5f5d'
 root = checkout / '.wt' / 'source'
 evidence = checkout / 'vector-carrier-evidence'
 evidence.mkdir(exist_ok=True)
@@ -37,6 +37,7 @@ def census(name):
 
 
 def invoke(name, command, timeout=600):
+    print("invoke: "+name, flush=True)
     census(name)
     process = subprocess.Popen(command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                start_new_session=sys.platform != 'win32')
@@ -128,6 +129,84 @@ if sys.platform == 'win32':
                 raise RuntimeError(cc+' native link baseline failed')
     finally:
         fixture.write_bytes(fixture_original)
+def mutate_function(path, function, old, new, occurrences=1):
+    source = originals[path].decode()
+    start = source.index(function)
+    tail = source.find('\npub fun ', start + len(function))
+    if tail == -1:
+        tail = len(source)
+    region = source[start:tail]
+    assert region.count(old) == occurrences, (function, old, region.count(old))
+    changed = source[:start] + region.replace(old, new) + source[tail:]
+    (root/path).write_text(changed)
+
+
+classifier = 'src/lang/target/abi/win64.mach'
+mir_abi = 'src/lang/be/codegen/mir/abi.mach'
+extent_test = 'mach.lang.target.abi.win64:vector_extent_carriers'
+mixed_test = 'mach.lang.be.codegen.mir.abi.classify_signature:odd_vector_sret_shifts_mixed_arguments'
+mutations = [
+    ('small-argument-carrier', classifier, 'pub fun classify_arg(', 'if (is_by_value_size(size)) {', 'if (false && is_by_value_size(size)) {', 2, extent_test, 2),
+    ('argument-payload-extent', classifier, 'pub fun classify_arg(', 'abi.make_slot(abi.CLASS_GP, slot_gp_reg(slot), 0, size)', 'abi.make_slot(abi.CLASS_GP, slot_gp_reg(slot), 0, 8)', 3, extent_test, 3),
+    ('indirect-payload-extent', classifier, 'pub fun classify_arg(', 'size, VEC_REG_BYTES::u32)', 'VEC_REG_BYTES, VEC_REG_BYTES::u32)', 2, extent_test, 6),
+    ('indirect-argument-alignment', classifier, 'pub fun classify_arg(', 'size, VEC_REG_BYTES::u32)', 'size, 8)', 2, extent_test, 7),
+    ('small-result-carrier', classifier, 'pub fun classify_return(', 'if (is_by_value_size(size)) {', 'if (false && is_by_value_size(size)) {', 2, extent_test, 4),
+    ('intrinsic-result-carrier', classifier, 'pub fun classify_return(', 'if (size == VEC_REG_BYTES) {', 'if (false && size == VEC_REG_BYTES) {', 1, extent_test, 8),
+    ('odd-result-carrier', classifier, 'pub fun classify_return(', 'ret abi.make_slot(abi.CLASS_SRET, REG_RAX, 0, 8);', 'ret abi.make_slot(abi.CLASS_GP, REG_RAX, 0, 8);', 2, extent_test, 9),
+    ('hidden-result-argument-position', mir_abi, 'pub fun classify_signature(', 'if (sret_reserves_gp(out.ret_slot.class, ctx.tgt.abi.indirect_result_in_argfile)) {', 'if (false && sret_reserves_gp(out.ret_slot.class, ctx.tgt.abi.indirect_result_in_argfile)) {', 1, mixed_test, 3),
+]
+for name, path, function, old, new, count, selected, exit_code in mutations:
+    try:
+        mutate_function(path, function, old, new, count)
+        (evidence / (name+'.diff')).write_bytes(subprocess.check_output(['git', 'diff', '--', path], cwd=root))
+        if not test('mutation-'+name, selected, 1, mutation=True, exit_code=exit_code):
+            raise RuntimeError(name+' did not fail the runtime assertion')
+    finally:
+        (root/path).write_bytes(originals[path])
+
+if sys.platform == 'win32':
+    main = root / 'test/link/cases/win64-vector-call/src/main.mach'
+    original_main = main.read_bytes()
+    fixture_root = main.parents[1]
+    main_text = original_main.decode()
+    start = main_text.index('#[symbol("main")]')
+    end = main_text.index('\ndef CarrierFn2:', start)
+    guard_main = '\n'.join([
+        '#[symbol("main")]',
+        'fun main(argc: usize, argv: **u8) i64 {',
+        '    val v: u8x3 = u8x3{3, 8, 13};',
+        '    val code: i64 = carrier_guard_3(local_carrier_3, v);',
+        '    p.printlnf("carrier guard={}", code);',
+        '    ret code;',
+        '}',
+    ])
+    try:
+        main.write_text(main_text[:start]+guard_main+'\n'+main_text[end:])
+        for label, active_compiler, expected_exit in [('baseline', compiler, 0), ('mutation', root/'D.exe', 3)]:
+            if label == 'mutation':
+                mutate_function(mir_abi, 'pub fun lower_ret(',
+                                'context.store_subwidth_vector(ctx, mb, mir.op_mem_value(ctx.sret_vreg, 0), rvop, rt)',
+                                'context.store_vector_register(ctx, mb, mir.op_mem_value(ctx.sret_vreg, 0), rvop, rt)')
+                (evidence/'sret-overwrite.diff').write_bytes(subprocess.check_output(['git', 'diff', '--', mir_abi], cwd=root))
+                built = invoke('sret-overwrite-compiler', [str(compiler), 'build', '.', '-o', active_compiler.name])
+                if built.returncode:
+                    raise RuntimeError('mutated compiler failed to build, not runtime proof')
+            for profile in ['debug', 'release']:
+                name = label+'-sret-byte-guard-'+profile
+                built = invoke(name+'-build', [str(active_compiler), 'build', str(fixture_root), '--target', 'x86_64-windows', '--profile', profile, '-o', 'out/guard.exe'])
+                if built.returncode:
+                    raise RuntimeError(name+' failed to build, not runtime proof')
+                ran = invoke(name, [str(fixture_root/'out/guard.exe')], timeout=30)
+                expected = 'carrier guard='+str(expected_exit)+'\n'
+                verified = ran.returncode == expected_exit and ran.stdout.decode().replace('\r\n','\n') == expected
+                results.append(dict(name=name, runtime_exit=ran.returncode, verified=verified))
+                (evidence/'results.json').write_text(json.dumps(results, indent=2)+'\n')
+                if not verified:
+                    raise RuntimeError(name+' did not produce the expected runtime assertion')
+    finally:
+        (root/mir_abi).write_bytes(originals[mir_abi])
+        main.write_bytes(original_main)
+
 for path in paths:
     assert (root/path).read_bytes() == originals[path]
-(evidence / 'complete.txt').write_text('Native focused baselines and selected link cells passed. Production source restored.\n')
+(evidence / 'complete.txt').write_text('Native focused baselines, selected link cells, and runtime mutations passed. Production source restored.\n')
