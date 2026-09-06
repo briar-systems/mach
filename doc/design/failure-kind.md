@@ -116,3 +116,9 @@ Queries preserve classified `fail.Fail` values. The build engine reads the
 frontend products at its load and semantic boundaries. It never changes an
 internal failure into a reported user error because a diagnostic was added
 before that failure.
+
+Compile-time phase callbacks return `EvalFail` directly. A capability rejection
+stays a rejection, and allocation or invariant failure stays internal through
+nested evaluation and speculative folding. An unavailable value is `Ok(None)`,
+which remains distinct from either failure. Phase owners retain internal failures
+even when the caller uses a recovery value to finish traversing a partial product.
