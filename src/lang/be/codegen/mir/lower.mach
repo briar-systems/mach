@@ -17,6 +17,7 @@ use R: std.types.result;
 use mach.lang.ct;
 use mach.lang.be.codegen.mir;
 use mabi: mach.lang.be.codegen.mir.abi;
+use mach.lang.be.codegen.mir.bulk;
 use lctx: mach.lang.be.codegen.mir.context;
 use mach.lang.intern;
 use mach.lang.me.ir;
@@ -124,6 +125,7 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, alloc: 
     ctx.cur_inline_site = 0;
     ctx.cur_vec_lane   = mir.VEC_LANE_NONE;
     ctx.cur_writes_secret = false;
+    ctx.cur_memory_flags = 0;
     ctx.pending        = nil;
     ctx.pending_count  = 0;
     ctx.pending_cap    = 0;
@@ -161,6 +163,13 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, alloc: 
         lctx.ctx_dnit(?ctx);
         mir.dnit_function(alloc, ?mf);
         ret R.err[mir.MirFunction, str](R.unwrap_err[R.Void, str](lph));
+    }
+
+    val lbk: R.Result[R.Void, str] = bulk.expand(?ctx);
+    if (R.is_err[R.Void, str](lbk)) {
+        lctx.ctx_dnit(?ctx);
+        mir.dnit_function(alloc, ?mf);
+        ret R.err[mir.MirFunction, str](R.unwrap_err[R.Void, str](lbk));
     }
 
     lctx.ctx_dnit(?ctx);
@@ -573,6 +582,8 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     ctx.cur_inline_site = ir.instr_inline_site_of(fn, iid);
     ctx.cur_vec_lane = lctx.compute_vec_lane(ctx, inst);
     ctx.cur_writes_secret = (inst.kind == instr.OP_STORE || inst.kind == instr.OP_MEMZERO) && inst.secret;
+    ctx.cur_memory_flags = 0;
+    if ((inst.flags & instr.INSTR_FLAG_VOLATILE) != 0) { ctx.cur_memory_flags = mir.MEMORY_VOLATILE; }
 
     var cop: ct.CtOp = opcode_ct_op(inst.kind);
     if (is_float_op(ctx, inst)) { cop = ct.CT_OP_FLOAT; }
@@ -1462,45 +1473,8 @@ fun lower_store(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
 
 fun lower_store_aggregate(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction) R.Result[R.Void, str] {
     val size: u32 = ir_type.byte_size_for_machine(ctx.types, inst.operands[0].ty, ctx.layout);
-
-    if (!ctx.tgt.model.flat_addressing) {
-        val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 3::usize);
-        if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](r)); }
-        val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
-        ops[0] = agg_pointer_mem(ctx, inst.operands[1], 0);
-        ops[1] = agg_pointer_mem(ctx, inst.operands[0], 0);
-        ops[2] = mir.op_imm(size::i64);
-        var mi: mir.MirInstr = mir.instr(mir.MIR_MEMCPY, ops, 3,
-                                         ctx.tgt.model.gpr_width::u8, ctx.tgt.model.gpr_width::u8);
-        ret lctx.push_instr(ctx, mb, mi);
-    }
-
-    var off: i64 = 0;
-    for (off::u32 < size) {
-        val chunk: u8 = lctx.copy_chunk_width(ctx.tgt, (size - off::u32)::u64);
-
-        val src: mir.MirOperand = agg_pointer_mem(ctx, inst.operands[0], off);
-        val dst: mir.MirOperand = agg_pointer_mem(ctx, inst.operands[1], off);
-
-        val tr: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
-        if (R.is_err[u32, str](tr)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](tr)); }
-        val tmp: u32 = R.unwrap_ok[u32, str](tr);
-
-        val ldr: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
-        if (R.is_err[*mir.MirOperand, str](ldr)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](ldr)); }
-        val ldops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](ldr);
-        ldops[0] = mir.op_vreg(tmp);
-        ldops[1] = src;
-        var ld: mir.MirInstr = mir.instr(mir.MIR_LOAD, ldops, 2, chunk, chunk);
-        val pl: R.Result[R.Void, str] = lctx.push_instr(ctx, mb, ld);
-        if (R.is_err[R.Void, str](pl)) { ret pl; }
-
-        val st: R.Result[R.Void, str] = lctx.push_store_chunk(ctx, mb, dst, mir.op_vreg(tmp), chunk);
-        if (R.is_err[R.Void, str](st)) { ret st; }
-
-        off = off + chunk::i64;
-    }
-    ret R.ok_void[str]();
+    ret lctx.copy_aggregate(ctx, mb, agg_pointer_mem(ctx, inst.operands[1], 0),
+                            agg_pointer_mem(ctx, inst.operands[0], 0), size::u64);
 }
 
 fun lower_memzero(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction) R.Result[R.Void, str] {
@@ -1512,28 +1486,14 @@ fun lower_memzero(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instructi
     }
     val size: u32 = ir_type.byte_size_for_machine(ctx.types, inst.aux_ty, ctx.layout);
 
-    if (!ctx.tgt.model.flat_addressing) {
-        val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
-        if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](r)); }
-        val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
-        ops[0] = agg_pointer_mem(ctx, inst.operands[0], 0);
-        ops[1] = mir.op_imm(size::i64);
-        var mi: mir.MirInstr = mir.instr(mir.MIR_MEMZERO, ops, 2,
-                                         ctx.tgt.model.gpr_width::u8, ctx.tgt.model.gpr_width::u8);
-        ret lctx.push_instr(ctx, mb, mi);
-    }
-
-    var off: i64 = 0;
-    for (off::u32 < size) {
-        val chunk: u8 = lctx.copy_chunk_width(ctx.tgt, (size - off::u32)::u64);
-
-        val dst: mir.MirOperand = agg_pointer_mem(ctx, inst.operands[0], off);
-        val st: R.Result[R.Void, str] = lctx.push_store_chunk(ctx, mb, dst, mir.op_imm(0), chunk);
-        if (R.is_err[R.Void, str](st)) { ret st; }
-
-        off = off + chunk::i64;
-    }
-    ret R.ok_void[str]();
+    val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
+    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](r)); }
+    val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
+    ops[0] = agg_pointer_mem(ctx, inst.operands[0], 0);
+    ops[1] = mir.op_imm(size::i64);
+    var mi: mir.MirInstr = mir.instr(mir.MIR_MEMZERO, ops, 2,
+                                     ctx.tgt.model.pointer_width::u8, ctx.tgt.model.pointer_width::u8);
+    ret lctx.push_instr(ctx, mb, mi);
 }
 
 fun agg_pointer_mem(ctx: *lctx.LowerCtx, v: value.Value, disp: i64) mir.MirOperand {
@@ -1864,5 +1824,52 @@ test "mach.lang.be.codegen.mir.lower.lower_block_phis:missing_incoming" {
     if (!str_contains(err, "block 3"))               { ret 1; }
     if (!str_contains(err, "block 2"))               { ret 1; }
     if (!str_contains(err, "result vreg"))           { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.mir.lower:volatile_memory_flags_follow_each_ir_instruction" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var types: ir_type.IrTypeTable;
+    if (O.is_some[str](ir_type.init(?types, ?alloc))) { ret 1; }
+    fin { ir_type.dnit(?types); }
+    val tr: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](tr)) { ret 1; }
+    val ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](tr);
+    var tgt: target.Target;
+    tgt.model.flat_addressing = true;
+    tgt.model.pointer_width = 8;
+    tgt.model.gpr_width = 8;
+    var parameters: [1]u32 = [1]u32{0};
+    var operands: [1]value.Value;
+    operands[0] = value.param(0, ty);
+    var instructions: [2]instr.Instruction;
+    var i: u32 = 0;
+    for (i < 2) {
+        instructions[i].kind = instr.OP_MEMZERO;
+        instructions[i].ty = ty;
+        instructions[i].aux_ty = ty;
+        instructions[i].operands = ?operands[0];
+        instructions[i].operand_count = 1;
+        i = i + 1;
+    }
+    instructions[0].flags = instr.INSTR_FLAG_VOLATILE;
+    var fn: ir.Function;
+    fn.instrs = ?instructions[0];
+    fn.instr_len = 2;
+    var ctx: lctx.LowerCtx;
+    ctx.alloc = ?alloc;
+    ctx.tgt = ?tgt;
+    ctx.types = ?types;
+    ctx.param_vregs = ?parameters[0];
+    ctx.param_count = 1;
+    var mb: mir.MirBlock;
+    fin { mir.dnit_block(?alloc, ?mb); }
+    if (R.is_err[R.Void, str](lower_instr(?ctx, ?fn, ?mb, 0))) { ret 2; }
+    if (R.is_err[R.Void, str](lower_instr(?ctx, ?fn, ?mb, 1))) { ret 3; }
+    if (mb.instr_count != 2) { ret 4; }
+    if (mb.instrs[0].opcode != mir.MIR_MEMZERO || mb.instrs[1].opcode != mir.MIR_MEMZERO) { ret 5; }
+    if (mb.instrs[0].memory_flags != mir.MEMORY_VOLATILE) { ret 6; }
+    if (mb.instrs[1].memory_flags != 0) { ret 7; }
     ret 0;
 }

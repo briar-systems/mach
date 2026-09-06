@@ -130,6 +130,9 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 ### Fixed
 
+- Calls prepare argument values and owned aggregate copies before filling physical argument registers, keeping bulk-copy scratch available and preserving direct, indirect, hidden-result and variadic placement (#3109).
+- Native aggregate copies and zero initialization lower through bounded MIR loops. Copies preserve snapshot semantics for self and partial overlap, use exact byte extents, and retain secret-data markers without payload-dependent control flow (#3109).
+
 - Aggregate reads capture their bytes when evaluated, preserving values across later argument effects, assignment destination evaluation and return cleanup (#3210).
 
 - Reclaim vector scalarization maps and lane work after each function while retaining emitted operands in IR-owned storage.
