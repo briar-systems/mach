@@ -128,6 +128,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 ### Fixed
 
+- Windows vector calls now use one explicit carrier per byte extent: integer bits at 2/4 bytes, `__m64` at 8 bytes, a 128-bit intrinsic at 16 bytes, and an exact-size byte aggregate otherwise. Direct calls, typed indirect calls, parameter capture and returns agree, including hidden result-pointer argument shifts and caller-owned aggregate copies (#3199).
+
 - The frame-location link oracle checks every DWARF description sharing a machine range, preventing false failures for backed variables (#3197).
 
 - Windows and Darwin corpus disassemblies now reflect the audited aggregate and vector ABI, scratch-register preservation, canonical boolean, trapping remainder, inline, vector-loop and Darwin x18 fixes. All 77 updates were independently decoded and reviewed against native C-reference results (#3179).
