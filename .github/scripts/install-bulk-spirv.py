@@ -2,7 +2,8 @@ import os
 import pathlib
 import re
 import tarfile
-import urllib.request
+import subprocess
+import tempfile
 
 root = pathlib.Path(__file__).resolve().parents[2]
 rows = [line.split() for line in (root / 'test/tools.lock').read_text().splitlines()]
@@ -15,8 +16,10 @@ url = f'https://sdk.lunarg.com/sdk/download/{version}/linux/vulkansdk-linux-x86_
 bindir = root / 'bulk-tools'
 bindir.mkdir(exist_ok=True)
 wanted = {f'{version}/x86_64/bin/{name}': name for name in ['spirv-val', 'spirv-dis']}
-with urllib.request.urlopen(url, timeout=120) as response:
-    with tarfile.open(fileobj=response, mode='r|xz') as archive:
+with tempfile.TemporaryFile() as downloaded:
+    subprocess.run(['curl', '-fsSL', url], stdout=downloaded, check=True, timeout=600)
+    downloaded.seek(0)
+    with tarfile.open(fileobj=downloaded, mode='r:xz') as archive:
         for entry in archive:
             if entry.name not in wanted:
                 continue
