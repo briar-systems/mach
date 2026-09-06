@@ -8,7 +8,7 @@ import os
 import signal
 
 checkout = pathlib.Path(__file__).resolve().parents[2]
-baseline = '7b7d5f5d'
+baseline = 'cc49bf6d'
 root = checkout / '.wt' / 'source'
 evidence = checkout / 'vector-carrier-evidence'
 evidence.mkdir(exist_ok=True)
