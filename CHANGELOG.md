@@ -128,6 +128,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 ### Fixed
 
+- Native aggregate copies and zero initialization lower through bounded MIR loops. Copies preserve snapshot semantics for self and partial overlap, use exact byte extents, and retain secret-data markers without payload-dependent control flow (#3109).
+
 - The frame-location link oracle checks every DWARF description sharing a machine range, preventing false failures for backed variables (#3197).
 
 - Windows and Darwin corpus disassemblies now reflect the audited aggregate and vector ABI, scratch-register preservation, canonical boolean, trapping remainder, inline, vector-loop and Darwin x18 fixes. All 77 updates were independently decoded and reviewed against native C-reference results (#3179).

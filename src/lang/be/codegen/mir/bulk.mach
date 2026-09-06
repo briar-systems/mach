@@ -1,0 +1,714 @@
+use A: std.allocator;
+use std.allocator.page;
+use O: std.types.option;
+use mach.lang.target.resolved;
+use R: std.types.result;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use mach.lang.be.codegen.mir;
+use context: mach.lang.be.codegen.mir.context;
+
+val SMALL_BYTES: u64 = 16;
+
+rec Expansion {
+    ctx: *context.LowerCtx;
+    next_id: u32;
+    origin: *mir.MirInstr;
+    pending: mir.MirInstr;
+}
+
+fun append_block(e: *Expansion, id: u32) R.Result[u32, str] {
+    val f: *mir.MirFunction = e.ctx.f;
+    if (f.block_count == f.block_cap) {
+        var cap: u32 = f.block_cap * 2;
+        if (cap < 8) { cap = 8; }
+        val rr: R.Result[*mir.MirBlock, str] = A.reallocate[mir.MirBlock](e.ctx.alloc, f.blocks, f.block_cap::usize, cap::usize);
+        if (R.is_err[*mir.MirBlock, str](rr)) { ret R.err[u32, str](R.unwrap_err[*mir.MirBlock, str](rr)); }
+        f.blocks = R.unwrap_ok[*mir.MirBlock, str](rr);
+        f.block_cap = cap;
+    }
+    val ix: u32 = f.block_count;
+    var block: mir.MirBlock;
+    block.id = id;
+    f.blocks[ix] = block;
+    f.block_count = ix + 1;
+    ret R.ok[u32, str](ix);
+}
+
+fun fresh_block(e: *Expansion) R.Result[u32, str] {
+    val id: u32 = e.next_id;
+    e.next_id = id + 1;
+    ret append_block(e, id);
+}
+
+fun emit(e: *Expansion, bi: u32, opcode: mir.MirOpcode, operands: *mir.MirOperand, n: u32, width: u8) R.Result[R.Void, str] {
+    val rr: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](e.ctx.alloc, n::usize);
+    if (R.is_err[*mir.MirOperand, str](rr)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](rr)); }
+    val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](rr);
+    var i: u32 = 0;
+    for (i < n) { ops[i] = operands[i]; i = i + 1; }
+    val mb: *mir.MirBlock = ?e.ctx.f.blocks[bi];
+    val gr: R.Result[R.Void, str] = context.grow_instr(e.ctx, mb);
+    if (R.is_err[R.Void, str](gr)) {
+        A.deallocate[mir.MirOperand](e.ctx.alloc, ops, n::usize);
+        ret gr;
+    }
+    var mi: mir.MirInstr = mir.instr(opcode, ops, n, width, width);
+    mi.loc = e.origin.loc;
+    mi.inline_site = e.origin.inline_site;
+    mi.writes_secret = e.origin.writes_secret && (opcode == mir.MIR_LOAD || opcode == mir.MIR_STORE);
+    mb.instrs[mb.instr_count] = mi;
+    mb.instr_count = mb.instr_count + 1;
+    ret R.ok_void[str]();
+}
+
+fun emit2(e: *Expansion, bi: u32, opcode: mir.MirOpcode, a: mir.MirOperand, b: mir.MirOperand, width: u8) R.Result[R.Void, str] {
+    var ops: [2]mir.MirOperand = [2]mir.MirOperand{a, b};
+    ret emit(e, bi, opcode, ?ops[0], 2, width);
+}
+
+fun emit3(e: *Expansion, bi: u32, opcode: mir.MirOpcode, a: mir.MirOperand, b: mir.MirOperand, c: mir.MirOperand, width: u8) R.Result[R.Void, str] {
+    var ops: [3]mir.MirOperand = [3]mir.MirOperand{a, b, c};
+    ret emit(e, bi, opcode, ?ops[0], 3, width);
+}
+
+fun branch(e: *Expansion, bi: u32, target: u32) R.Result[R.Void, str] {
+    var op: mir.MirOperand = mir.op_block(e.ctx.f.blocks[target].id);
+    ret emit(e, bi, mir.MIR_BR, ?op, 1, e.ctx.tgt.model.pointer_width::u8);
+}
+
+fun conditional(e: *Expansion, bi: u32, cond: u32, yes: u32, no: u32) R.Result[R.Void, str] {
+    ret emit3(e, bi, mir.MIR_CBR, mir.op_vreg(cond), mir.op_block(e.ctx.f.blocks[yes].id),
+                 mir.op_block(e.ctx.f.blocks[no].id), e.ctx.tgt.model.pointer_width::u8);
+}
+
+fun address(e: *Expansion, bi: u32, mem: mir.MirOperand) R.Result[u32, str] {
+    val rv: R.Result[u32, str] = context.new_vreg(e.ctx, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](rv)) { ret rv; }
+    val v: u32 = R.unwrap_ok[u32, str](rv);
+    val er: R.Result[R.Void, str] = emit2(e, bi, mir.MIR_GEP, mir.op_vreg(v), mem, e.ctx.tgt.model.pointer_width::u8);
+    if (R.is_err[R.Void, str](er)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](er)); }
+    ret R.ok[u32, str](v);
+}
+
+fun small(e: *Expansion, bi: u32, dst: mir.MirOperand, src: mir.MirOperand, size: u64, copy: bool) R.Result[R.Void, str] {
+    var values: [16]u32;
+    var off: u64 = 0;
+    if (copy) {
+        for (off < size) {
+            val rv: R.Result[u32, str] = context.new_vreg(e.ctx, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](rv)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](rv)); }
+            values[off] = R.unwrap_ok[u32, str](rv);
+            e.ctx.f.vregs[values[off]].secret = e.origin.writes_secret;
+            val er: R.Result[R.Void, str] = emit2(e, bi, mir.MIR_LOAD, mir.op_vreg(values[off]), context.mem_at(src, off::i64), 1);
+            if (R.is_err[R.Void, str](er)) { ret er; }
+            off = off + 1;
+        }
+    }
+    off = 0;
+    for (off < size) {
+        var value: mir.MirOperand = mir.op_imm(0);
+        if (copy) { value = mir.op_vreg(values[off]); }
+        val er: R.Result[R.Void, str] = emit2(e, bi, mir.MIR_STORE, context.mem_at(dst, off::i64), value, 1);
+        if (R.is_err[R.Void, str](er)) { ret er; }
+        off = off + 1;
+    }
+    ret R.ok_void[str]();
+}
+
+fun loop_path(e: *Expansion, dst: u32, src: u32, size: u64, copy: bool, backward: bool, width: u8, done: u32) R.Result[u32, str] {
+    val rs: R.Result[u32, str] = fresh_block(e);
+    if (R.is_err[u32, str](rs)) { ret rs; }
+    val setup: u32 = R.unwrap_ok[u32, str](rs);
+    val rb: R.Result[u32, str] = fresh_block(e);
+    if (R.is_err[u32, str](rb)) { ret rb; }
+    val body: u32 = R.unwrap_ok[u32, str](rb);
+    val rt: R.Result[u32, str] = fresh_block(e);
+    if (R.is_err[u32, str](rt)) { ret rt; }
+    val tail: u32 = R.unwrap_ok[u32, str](rt);
+    val rd: R.Result[u32, str] = context.new_vreg(e.ctx, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](rd)) { ret rd; }
+    val d: u32 = R.unwrap_ok[u32, str](rd);
+    val rsrc: R.Result[u32, str] = context.new_vreg(e.ctx, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](rsrc)) { ret rsrc; }
+    val s: u32 = R.unwrap_ok[u32, str](rsrc);
+    val rc: R.Result[u32, str] = context.new_vreg(e.ctx, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](rc)) { ret rc; }
+    val count: u32 = R.unwrap_ok[u32, str](rc);
+    val rv: R.Result[u32, str] = context.new_vreg(e.ctx, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](rv)) { ret rv; }
+    val value: u32 = R.unwrap_ok[u32, str](rv);
+    e.ctx.f.vregs[value].secret = e.origin.writes_secret;
+    val rq: R.Result[u32, str] = context.new_vreg(e.ctx, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](rq)) { ret rq; }
+    val more: u32 = R.unwrap_ok[u32, str](rq);
+    val pw: u8 = e.ctx.tgt.model.pointer_width::u8;
+    val remainder: u64 = size % width::u64;
+    val whole: u64 = size - remainder;
+    var initial: i64 = 0;
+    if (backward) { initial = whole::i64; }
+
+    val ed: R.Result[R.Void, str] = emit3(e, setup, mir.MIR_ADD, mir.op_vreg(d), mir.op_vreg(dst), mir.op_imm(initial), pw);
+    if (R.is_err[R.Void, str](ed)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](ed)); }
+    if (copy) {
+        val es: R.Result[R.Void, str] = emit3(e, setup, mir.MIR_ADD, mir.op_vreg(s), mir.op_vreg(src), mir.op_imm(initial), pw);
+        if (R.is_err[R.Void, str](es)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](es)); }
+    }
+    if (backward) {
+        val et: R.Result[R.Void, str] = small(e, setup, mir.op_mem_value(d, 0), mir.op_mem_value(s, 0), remainder, copy);
+        if (R.is_err[R.Void, str](et)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](et)); }
+    }
+    val ec: R.Result[R.Void, str] = emit2(e, setup, mir.MIR_MOV, mir.op_vreg(count), mir.op_imm(whole::i64), pw);
+    if (R.is_err[R.Void, str](ec)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](ec)); }
+    val eb: R.Result[R.Void, str] = branch(e, setup, body);
+    if (R.is_err[R.Void, str](eb)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](eb)); }
+
+    if (backward) {
+        val edb: R.Result[R.Void, str] = emit3(e, body, mir.MIR_SUB, mir.op_vreg(d), mir.op_vreg(d), mir.op_imm(width::i64), pw);
+        if (R.is_err[R.Void, str](edb)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](edb)); }
+        if (copy) {
+            val esb: R.Result[R.Void, str] = emit3(e, body, mir.MIR_SUB, mir.op_vreg(s), mir.op_vreg(s), mir.op_imm(width::i64), pw);
+            if (R.is_err[R.Void, str](esb)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](esb)); }
+        }
+    }
+    var stored: mir.MirOperand = mir.op_imm(0);
+    if (copy) {
+        val el: R.Result[R.Void, str] = emit2(e, body, mir.MIR_LOAD, mir.op_vreg(value), mir.op_mem_value(s, 0), width);
+        if (R.is_err[R.Void, str](el)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](el)); }
+        stored = mir.op_vreg(value);
+    }
+    val ew: R.Result[R.Void, str] = emit2(e, body, mir.MIR_STORE, mir.op_mem_value(d, 0), stored, width);
+    if (R.is_err[R.Void, str](ew)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](ew)); }
+    if (!backward) {
+        val edf: R.Result[R.Void, str] = emit3(e, body, mir.MIR_ADD, mir.op_vreg(d), mir.op_vreg(d), mir.op_imm(width::i64), pw);
+        if (R.is_err[R.Void, str](edf)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](edf)); }
+        if (copy) {
+            val esf: R.Result[R.Void, str] = emit3(e, body, mir.MIR_ADD, mir.op_vreg(s), mir.op_vreg(s), mir.op_imm(width::i64), pw);
+            if (R.is_err[R.Void, str](esf)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](esf)); }
+        }
+    }
+    val en: R.Result[R.Void, str] = emit3(e, body, mir.MIR_SUB, mir.op_vreg(count), mir.op_vreg(count), mir.op_imm(width::i64), pw);
+    if (R.is_err[R.Void, str](en)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](en)); }
+    val eq: R.Result[R.Void, str] = emit3(e, body, mir.MIR_CMP_NE, mir.op_vreg(more), mir.op_vreg(count), mir.op_imm(0), pw);
+    if (R.is_err[R.Void, str](eq)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](eq)); }
+    val ej: R.Result[R.Void, str] = conditional(e, body, more, body, tail);
+    if (R.is_err[R.Void, str](ej)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](ej)); }
+    if (!backward) {
+        val et: R.Result[R.Void, str] = small(e, tail, mir.op_mem_value(d, 0), mir.op_mem_value(s, 0), remainder, copy);
+        if (R.is_err[R.Void, str](et)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](et)); }
+    }
+    val ee: R.Result[R.Void, str] = branch(e, tail, done);
+    if (R.is_err[R.Void, str](ee)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](ee)); }
+    ret R.ok[u32, str](setup);
+}
+
+fun expand_one(e: *Expansion, bi: u32) R.Result[u32, str] {
+    val mi: *mir.MirInstr = e.origin;
+    val copy: bool = mi.opcode == mir.MIR_MEMCPY;
+    val size: u64 = mi.operands[mi.operand_count - 1].imm::u64;
+    val dst: mir.MirOperand = mi.operands[0];
+    var src: mir.MirOperand;
+    if (copy) { src = mi.operands[1]; }
+    if (size <= SMALL_BYTES) {
+        val er: R.Result[R.Void, str] = small(e, bi, dst, src, size, copy);
+        if (R.is_err[R.Void, str](er)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](er)); }
+        ret R.ok[u32, str](bi);
+    }
+    val rd: R.Result[u32, str] = address(e, bi, dst);
+    if (R.is_err[u32, str](rd)) { ret rd; }
+    val d: u32 = R.unwrap_ok[u32, str](rd);
+    var s: u32 = mir.MIR_VREG_NIL;
+    if (copy) {
+        val rs: R.Result[u32, str] = address(e, bi, src);
+        if (R.is_err[u32, str](rs)) { ret rs; }
+        s = R.unwrap_ok[u32, str](rs);
+    }
+    val re: R.Result[u32, str] = fresh_block(e);
+    if (R.is_err[u32, str](re)) { ret re; }
+    val done: u32 = R.unwrap_ok[u32, str](re);
+    val word: u8 = e.ctx.tgt.model.gpr_width::u8;
+    val pw: u8 = e.ctx.tgt.model.pointer_width::u8;
+    val ra: R.Result[u32, str] = context.new_vreg(e.ctx, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](ra)) { ret ra; }
+    val unaligned: u32 = R.unwrap_ok[u32, str](ra);
+    var combined: mir.MirOperand = mir.op_vreg(d);
+    if (copy) {
+        val eo: R.Result[R.Void, str] = emit3(e, bi, mir.MIR_OR, mir.op_vreg(unaligned), mir.op_vreg(d), mir.op_vreg(s), pw);
+        if (R.is_err[R.Void, str](eo)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](eo)); }
+        combined = mir.op_vreg(unaligned);
+    }
+    val ea: R.Result[R.Void, str] = emit3(e, bi, mir.MIR_AND, mir.op_vreg(unaligned), combined, mir.op_imm((word - 1)::i64), pw);
+    if (R.is_err[R.Void, str](ea)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](ea)); }
+    val rw: R.Result[u32, str] = loop_path(e, d, s, size, copy, false, word, done);
+    if (R.is_err[u32, str](rw)) { ret rw; }
+    val rb: R.Result[u32, str] = loop_path(e, d, s, size, copy, false, 1, done);
+    if (R.is_err[u32, str](rb)) { ret rb; }
+    if (!copy) {
+        val ej: R.Result[R.Void, str] = conditional(e, bi, unaligned, R.unwrap_ok[u32, str](rb), R.unwrap_ok[u32, str](rw));
+        if (R.is_err[R.Void, str](ej)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](ej)); }
+        ret R.ok[u32, str](done);
+    }
+    val rbackw: R.Result[u32, str] = loop_path(e, d, s, size, true, true, word, done);
+    if (R.is_err[u32, str](rbackw)) { ret rbackw; }
+    val rbackb: R.Result[u32, str] = loop_path(e, d, s, size, true, true, 1, done);
+    if (R.is_err[u32, str](rbackb)) { ret rbackb; }
+    val rf: R.Result[u32, str] = fresh_block(e);
+    if (R.is_err[u32, str](rf)) { ret rf; }
+    val forward: u32 = R.unwrap_ok[u32, str](rf);
+    val rback: R.Result[u32, str] = fresh_block(e);
+    if (R.is_err[u32, str](rback)) { ret rback; }
+    val backward: u32 = R.unwrap_ok[u32, str](rback);
+    val ef: R.Result[R.Void, str] = conditional(e, forward, unaligned, R.unwrap_ok[u32, str](rb), R.unwrap_ok[u32, str](rw));
+    if (R.is_err[R.Void, str](ef)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](ef)); }
+    val eb: R.Result[R.Void, str] = conditional(e, backward, unaligned, R.unwrap_ok[u32, str](rbackb), R.unwrap_ok[u32, str](rbackw));
+    if (R.is_err[R.Void, str](eb)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](eb)); }
+    val rq: R.Result[u32, str] = context.new_vreg(e.ctx, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](rq)) { ret rq; }
+    val before: u32 = R.unwrap_ok[u32, str](rq);
+    val ec: R.Result[R.Void, str] = emit3(e, bi, mir.MIR_CMP_LT_U, mir.op_vreg(before), mir.op_vreg(d), mir.op_vreg(s), pw);
+    if (R.is_err[R.Void, str](ec)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](ec)); }
+    val ej: R.Result[R.Void, str] = conditional(e, bi, before, forward, backward);
+    if (R.is_err[R.Void, str](ej)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](ej)); }
+    ret R.ok[u32, str](done);
+}
+
+fun move_bindings(e: *Expansion, dst: *mir.MirInstr, src: *mir.MirInstr) R.Result[R.Void, str] {
+    if (src.dbg_binding_count == 0) { ret R.ok_void[str](); }
+    val old: u32 = dst.dbg_binding_count;
+    val count: u32 = old + src.dbg_binding_count;
+    val rr: R.Result[*mir.MirDbgBinding, str] = A.reallocate[mir.MirDbgBinding](e.ctx.alloc, dst.dbg_bindings, old::usize, count::usize);
+    if (R.is_err[*mir.MirDbgBinding, str](rr)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirDbgBinding, str](rr)); }
+    dst.dbg_bindings = R.unwrap_ok[*mir.MirDbgBinding, str](rr);
+    var i: u32 = 0;
+    for (i < src.dbg_binding_count) { dst.dbg_bindings[old + i] = src.dbg_bindings[i]; i = i + 1; }
+    dst.dbg_binding_count = count;
+    A.deallocate[mir.MirDbgBinding](e.ctx.alloc, src.dbg_bindings, src.dbg_binding_count::usize);
+    src.dbg_bindings = nil;
+    src.dbg_binding_count = 0;
+    ret R.ok_void[str]();
+}
+
+fun move_instr(e: *Expansion, bi: u32, mi: *mir.MirInstr) R.Result[R.Void, str] {
+    val mb: *mir.MirBlock = ?e.ctx.f.blocks[bi];
+    val gr: R.Result[R.Void, str] = context.grow_instr(e.ctx, mb);
+    if (R.is_err[R.Void, str](gr)) { ret gr; }
+    val dr: R.Result[R.Void, str] = move_bindings(e, mi, ?e.pending);
+    if (R.is_err[R.Void, str](dr)) { ret dr; }
+    mb.instrs[mb.instr_count] = @mi;
+    mb.instr_count = mb.instr_count + 1;
+    mi.operands = nil;
+    mi.operand_count = 0;
+    mi.dbg_bindings = nil;
+    mi.dbg_binding_count = 0;
+    mi.asm_block = nil;
+    ret R.ok_void[str]();
+}
+
+fun rebuild_preds(e: *Expansion) R.Result[R.Void, str] {
+    val f: *mir.MirFunction = e.ctx.f;
+    val rr: R.Result[*u32, str] = A.allocate[u32](e.ctx.alloc, e.next_id::usize);
+    if (R.is_err[*u32, str](rr)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](rr)); }
+    val indices: *u32 = R.unwrap_ok[*u32, str](rr);
+    fin { A.deallocate[u32](e.ctx.alloc, indices, e.next_id::usize); }
+    var bi: u32 = 0;
+    for (bi < f.block_count) { indices[f.blocks[bi].id] = bi; bi = bi + 1; }
+    bi = 0;
+    for (bi < f.block_count) {
+        val mb: *mir.MirBlock = ?f.blocks[bi];
+        if (mb.instr_count > 0) {
+            val term: *mir.MirInstr = ?mb.instrs[mb.instr_count - 1];
+            var oi: u32 = 0;
+            for (oi < term.operand_count) {
+                val op: mir.MirOperand = term.operands[oi];
+                if (op.kind == mir.MIR_OP_BLOCK) {
+                    val succ: *mir.MirBlock = ?f.blocks[indices[op.imm::u32]];
+                    succ.pred_cap = succ.pred_cap + 1;
+                }
+                oi = oi + 1;
+            }
+        }
+        bi = bi + 1;
+    }
+    bi = 0;
+    for (bi < f.block_count) {
+        val mb: *mir.MirBlock = ?f.blocks[bi];
+        if (mb.pred_cap > 0) {
+            val rp: R.Result[*u32, str] = A.allocate[u32](e.ctx.alloc, mb.pred_cap::usize);
+            if (R.is_err[*u32, str](rp)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](rp)); }
+            mb.preds = R.unwrap_ok[*u32, str](rp);
+        }
+        bi = bi + 1;
+    }
+    bi = 0;
+    for (bi < f.block_count) {
+        val mb: *mir.MirBlock = ?f.blocks[bi];
+        if (mb.instr_count > 0) {
+            val term: *mir.MirInstr = ?mb.instrs[mb.instr_count - 1];
+            var oi: u32 = 0;
+            for (oi < term.operand_count) {
+                val op: mir.MirOperand = term.operands[oi];
+                if (op.kind == mir.MIR_OP_BLOCK) {
+                    val succ: *mir.MirBlock = ?f.blocks[indices[op.imm::u32]];
+                    succ.preds[succ.pred_count] = mb.id;
+                    succ.pred_count = succ.pred_count + 1;
+                }
+                oi = oi + 1;
+            }
+        }
+        bi = bi + 1;
+    }
+    ret R.ok_void[str]();
+}
+
+pub fun expand(ctx: *context.LowerCtx) R.Result[R.Void, str] {
+    if (!ctx.tgt.model.flat_addressing) { ret R.ok_void[str](); }
+    var found: bool = false;
+    var next_id: u32 = 0;
+    var bi: u32 = 0;
+    for (bi < ctx.f.block_count) {
+        val mb: *mir.MirBlock = ?ctx.f.blocks[bi];
+        if (mb.id >= next_id) { next_id = mb.id + 1; }
+        var ii: u32 = 0;
+        for (ii < mb.instr_count) {
+            val op: mir.MirOpcode = mb.instrs[ii].opcode;
+            if (op == mir.MIR_MEMCPY || op == mir.MIR_MEMZERO) { found = true; }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    if (!found) { ret R.ok_void[str](); }
+    var old: mir.MirFunction;
+    old.blocks = ctx.f.blocks;
+    old.block_count = ctx.f.block_count;
+    old.block_cap = ctx.f.block_cap;
+    ctx.f.blocks = nil;
+    ctx.f.block_count = 0;
+    ctx.f.block_cap = 0;
+    fin { mir.dnit_function(ctx.alloc, ?old); }
+    var e: Expansion;
+    e.ctx = ctx;
+    e.next_id = next_id;
+    fin {
+        if (e.pending.dbg_bindings != nil) {
+            A.deallocate[mir.MirDbgBinding](ctx.alloc, e.pending.dbg_bindings, e.pending.dbg_binding_count::usize);
+        }
+    }
+    bi = 0;
+    for (bi < old.block_count) {
+        val rb: R.Result[u32, str] = append_block(?e, old.blocks[bi].id);
+        if (R.is_err[u32, str](rb)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](rb)); }
+        var current: u32 = R.unwrap_ok[u32, str](rb);
+        var ii: u32 = 0;
+        for (ii < old.blocks[bi].instr_count) {
+            val mi: *mir.MirInstr = ?old.blocks[bi].instrs[ii];
+            if (mi.opcode == mir.MIR_MEMCPY || mi.opcode == mir.MIR_MEMZERO) {
+                e.origin = mi;
+                val er: R.Result[u32, str] = expand_one(?e, current);
+                if (R.is_err[u32, str](er)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](er)); }
+                current = R.unwrap_ok[u32, str](er);
+                val dr: R.Result[R.Void, str] = move_bindings(?e, ?e.pending, mi);
+                if (R.is_err[R.Void, str](dr)) { ret dr; }
+            }
+            or {
+                val mr: R.Result[R.Void, str] = move_instr(?e, current, mi);
+                if (R.is_err[R.Void, str](mr)) { ret mr; }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret rebuild_preds(?e);
+}
+
+fun t_setup(ctx: *context.LowerCtx, size: u64, copy: bool) R.Result[R.Void, str] {
+    val rv: R.Result[*mir.MirVReg, str] = A.allocate[mir.MirVReg](ctx.alloc, 8);
+    if (R.is_err[*mir.MirVReg, str](rv)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirVReg, str](rv)); }
+    ctx.f.vregs = R.unwrap_ok[*mir.MirVReg, str](rv);
+    ctx.f.vreg_cap = 8;
+    ctx.f.vreg_count = 2;
+    ctx.f.vregs[0] = mir.vreg(0, mir.REG_CLASS_GP, false, false);
+    ctx.f.vregs[1] = mir.vreg(1, mir.REG_CLASS_GP, false, false);
+    var e: Expansion;
+    e.ctx = ctx;
+    val rb: R.Result[u32, str] = append_block(?e, 7);
+    if (R.is_err[u32, str](rb)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](rb)); }
+    var origin: mir.MirInstr;
+    origin.inline_site = 19;
+    origin.writes_secret = true;
+    e.origin = ?origin;
+    if (copy) {
+        val er: R.Result[R.Void, str] = emit3(?e, 0, mir.MIR_MEMCPY, mir.op_mem_value(1, 0), mir.op_mem_value(0, 0), mir.op_imm(size::i64), ctx.tgt.model.pointer_width::u8);
+        if (R.is_err[R.Void, str](er)) { ret er; }
+    }
+    or {
+        val er: R.Result[R.Void, str] = emit2(?e, 0, mir.MIR_MEMZERO, mir.op_mem_value(1, 0), mir.op_imm(size::i64), ctx.tgt.model.pointer_width::u8);
+        if (R.is_err[R.Void, str](er)) { ret er; }
+    }
+    ctx.f.blocks[0].instrs[0].writes_secret = true;
+    val dr: R.Result[R.Void, str] = mir.instr_attach_dbg(ctx.alloc, ?ctx.f.blocks[0].instrs[0], 29, 1);
+    if (R.is_err[R.Void, str](dr)) { ret dr; }
+    ctx.f.blocks[0].instrs[0].dbg_bindings[0].cmp_width = 4;
+    var ret_inst: mir.MirInstr = mir.instr(mir.MIR_RET, nil, 0, ctx.tgt.model.pointer_width::u8, ctx.tgt.model.pointer_width::u8);
+    ret context.push_instr(ctx, ?ctx.f.blocks[0], ret_inst);
+}
+
+fun t_value(op: mir.MirOperand, regs: *u64) u64 {
+    if (op.kind == mir.MIR_OP_IMM) { ret op.imm::u64; }
+    if (op.kind == mir.MIR_OP_MEM) { ret regs[op.vreg] + op.imm::u64; }
+    ret regs[op.vreg];
+}
+
+fun t_execute(f: *mir.MirFunction, bytes: *u8, src: u64, dst: u64) i32 {
+    var regs: [128]u64;
+    regs[0] = src;
+    regs[1] = dst;
+    var bi: u32 = 0;
+    var steps: u32 = 0;
+    for (steps < 100000) {
+        val mb: *mir.MirBlock = ?f.blocks[bi];
+        var next: u32 = mir.MIR_VREG_NIL;
+        var ii: u32 = 0;
+        for (ii < mb.instr_count) {
+            val mi: *mir.MirInstr = ?mb.instrs[ii];
+            val op: mir.MirOpcode = mi.opcode;
+            steps = steps + 1;
+            if (op == mir.MIR_RET) { ret 0; }
+            if (op == mir.MIR_BR) { next = mi.operands[0].imm::u32; }
+            or (op == mir.MIR_CBR) {
+                next = mi.operands[2].imm::u32;
+                if (t_value(mi.operands[0], ?regs[0]) != 0) { next = mi.operands[1].imm::u32; }
+            }
+            or (op == mir.MIR_LOAD || op == mir.MIR_STORE) {
+                var mem: mir.MirOperand = mi.operands[1];
+                if (op == mir.MIR_STORE) { mem = mi.operands[0]; }
+                val at: u64 = t_value(mem, ?regs[0]);
+                if (at + mi.width::u64 > 1024) { ret 1; }
+                if (mi.width > 1 && at % mi.width::u64 != 0) { ret 2; }
+                var value: u64 = 0;
+                if (op == mir.MIR_STORE) { value = t_value(mi.operands[1], ?regs[0]); }
+                var j: u32 = 0;
+                for (j < mi.width::u32) {
+                    if (op == mir.MIR_LOAD) { value = value | (bytes[at + j::u64]::u64 << (j * 8)); }
+                    or { bytes[at + j::u64] = (value >> (j * 8))::u8; }
+                    j = j + 1;
+                }
+                if (op == mir.MIR_LOAD) { regs[mi.operands[0].vreg] = value; }
+            }
+            or {
+                val a: u64 = t_value(mi.operands[1], ?regs[0]);
+                var b: u64 = 0;
+                if (mi.operand_count == 3) { b = t_value(mi.operands[2], ?regs[0]); }
+                var result: u64 = a;
+                if (op == mir.MIR_ADD) { result = a + b; }
+                or (op == mir.MIR_SUB) { result = a - b; }
+                or (op == mir.MIR_OR) { result = a | b; }
+                or (op == mir.MIR_AND) { result = a & b; }
+                or (op == mir.MIR_CMP_NE) { result = (a != b)::u64; }
+                or (op == mir.MIR_CMP_LT_U) { result = (a < b)::u64; }
+                or (op != mir.MIR_MOV && op != mir.MIR_GEP) { ret 3; }
+                if (mi.width < 8) { result = result & ((1u64 << (mi.width::u32 * 8)) - 1); }
+                regs[mi.operands[0].vreg] = result;
+            }
+            ii = ii + 1;
+        }
+        bi = 0;
+        for (bi < f.block_count && f.blocks[bi].id != next) { bi = bi + 1; }
+        if (bi == f.block_count) { ret 4; }
+    }
+    ret 5;
+}
+
+fun t_case(size: u64, src: u64, dst: u64, copy: bool, pointer_width: u32, word: u32) i32 {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var tgt: resolved.Target;
+    tgt.model.flat_addressing = true;
+    tgt.model.pointer_width = pointer_width;
+    tgt.model.gpr_width = word;
+    var f: mir.MirFunction;
+    fin { mir.dnit_function(?alloc, ?f); }
+    var ctx: context.LowerCtx;
+    ctx.alloc = ?alloc;
+    ctx.tgt = ?tgt;
+    ctx.f = ?f;
+    if (R.is_err[R.Void, str](t_setup(?ctx, size, copy))) { ret 2; }
+    if (R.is_err[R.Void, str](expand(?ctx))) { ret 3; }
+    var bytes: [1024]u8;
+    var i: u64 = 0;
+    for (i < 1024) { bytes[i] = (i % 251)::u8; i = i + 1; }
+    val executed: i32 = t_execute(?f, ?bytes[0], src, dst);
+    if (executed != 0) { ret 10 + executed; }
+    i = 0;
+    for (i < 1024) {
+        var expected: u8 = (i % 251)::u8;
+        if (i >= dst && i < dst + size) {
+            expected = 0;
+            if (copy) { expected = ((src + i - dst) % 251)::u8; }
+        }
+        if (bytes[i] != expected) { ret 20; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.mir.bulk:snapshot_overlap_and_exact_extent" {
+    var sizes: [8]u64 = [8]u64{0, 1, 3, 15, 16, 17, 65, 257};
+    var i: u32 = 0;
+    for (i < 8) {
+        if (t_case(sizes[i], 16, 17, true, 8, 8) != 0) { ret 1; }
+        if (t_case(sizes[i], 17, 16, true, 8, 8) != 0) { ret 2; }
+        if (t_case(sizes[i], 16, 24, true, 8, 8) != 0) { ret 3; }
+        if (t_case(sizes[i], 24, 16, true, 8, 8) != 0) { ret 4; }
+        if (t_case(sizes[i], 17, 17, true, 8, 8) != 0) { ret 5; }
+        if (t_case(sizes[i], 16, 320, true, 4, 4) != 0) { ret 6; }
+        if (t_case(sizes[i], 16, 17, true, 2, 1) != 0) { ret 7; }
+        if (t_case(sizes[i], 16, 16, false, 8, 8) != 0) { ret 8; }
+        if (t_case(sizes[i], 16, 17, false, 8, 8) != 0) { ret 9; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.mir.bulk:bounded_shape_secrecy_and_debug_ownership" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var sizes: [7]u64 = [7]u64{0, 3, 16, 17, 65, 65536, 1048577};
+    var si: u32 = 0;
+    for (si < 7) {
+        var tgt: resolved.Target;
+        tgt.model.flat_addressing = true;
+        tgt.model.pointer_width = 8;
+        tgt.model.gpr_width = 8;
+        var f: mir.MirFunction;
+        fin { mir.dnit_function(?alloc, ?f); }
+        var ctx: context.LowerCtx;
+        ctx.alloc = ?alloc;
+        ctx.tgt = ?tgt;
+        ctx.f = ?f;
+        if (R.is_err[R.Void, str](t_setup(?ctx, sizes[si], true))) { ret 2; }
+        if (R.is_err[R.Void, str](expand(?ctx))) { ret 3; }
+        if (f.block_count > 16 || f.vreg_count > 64 || f.blocks[0].id != 7) { ret 4; }
+        var instructions: u32 = 0;
+        var bindings: u32 = 0;
+        var loads: u32 = 0;
+        var stores: u32 = 0;
+        var saw_store: bool = false;
+        var bi: u32 = 0;
+        for (bi < f.block_count) {
+            val mb: *mir.MirBlock = ?f.blocks[bi];
+            if (mb.instr_count == 0) { ret 5; }
+            instructions = instructions + mb.instr_count;
+            var ii: u32 = 0;
+            for (ii < mb.instr_count) {
+                val mi: *mir.MirInstr = ?mb.instrs[ii];
+                if (mi.opcode == mir.MIR_MEMCPY || mi.opcode == mir.MIR_MEMZERO) { ret 6; }
+                val memory: bool = mi.opcode == mir.MIR_LOAD || mi.opcode == mir.MIR_STORE;
+                if (mi.writes_secret != memory) { ret 7; }
+                if (mi.opcode != mir.MIR_RET && mi.inline_site != 19) { ret 8; }
+                if (mi.opcode == mir.MIR_LOAD) {
+                    loads = loads + 1;
+                    if (!f.vregs[mi.operands[0].vreg].secret) { ret 9; }
+                    if (sizes[si] <= SMALL_BYTES && saw_store) { ret 10; }
+                }
+                if (mi.opcode == mir.MIR_STORE) { stores = stores + 1; saw_store = true; }
+                bindings = bindings + mi.dbg_binding_count;
+                if (mi.dbg_binding_count > 0) {
+                    if (mi.opcode != mir.MIR_RET || mi.dbg_binding_count != 1) { ret 11; }
+                    if (mi.dbg_bindings[0].iid != 29 || mi.dbg_bindings[0].cmp_width != 4) { ret 12; }
+                }
+                ii = ii + 1;
+            }
+            var pi: u32 = 0;
+            for (pi < mb.pred_count) {
+                var pred: u32 = 0;
+                for (pred < f.block_count && f.blocks[pred].id != mb.preds[pi]) { pred = pred + 1; }
+                if (pred == f.block_count) { ret 13; }
+                val term: *mir.MirInstr = ?f.blocks[pred].instrs[f.blocks[pred].instr_count - 1];
+                var edges: u32 = 0;
+                var oi: u32 = 0;
+                for (oi < term.operand_count) {
+                    if (term.operands[oi].kind == mir.MIR_OP_BLOCK && term.operands[oi].imm::u32 == mb.id) { edges = edges + 1; }
+                    oi = oi + 1;
+                }
+                if (edges == 0) { ret 14; }
+                pi = pi + 1;
+            }
+            bi = bi + 1;
+        }
+        if (instructions > 160 || bindings != 1) { ret 15; }
+        if (sizes[si] == 0 && (loads != 0 || stores != 0)) { ret 16; }
+        si = si + 1;
+    }
+    ret 0;
+}
+
+rec AllocationProbe {
+    backing: A.Allocator;
+    calls: u32;
+    live: u32;
+    fail_at: u32;
+}
+
+fun t_allocate(ctx: ptr, size: usize, align: usize) O.Option[ptr] {
+    val p: *AllocationProbe = ctx::*AllocationProbe;
+    p.calls = p.calls + 1;
+    if (p.calls == p.fail_at) { ret O.none[ptr](); }
+    val item: O.Option[ptr] = p.backing.fn_allocate(p.backing.ctx, size, align);
+    if (O.is_some[ptr](item)) { p.live = p.live + 1; }
+    ret item;
+}
+
+fun t_reallocate(ctx: ptr, item: ptr, old_size: usize, new_size: usize, align: usize) O.Option[ptr] {
+    val p: *AllocationProbe = ctx::*AllocationProbe;
+    p.calls = p.calls + 1;
+    if (p.calls == p.fail_at) { ret O.none[ptr](); }
+    val grown: O.Option[ptr] = p.backing.fn_reallocate(p.backing.ctx, item, old_size, new_size, align);
+    if (item == nil && O.is_some[ptr](grown)) { p.live = p.live + 1; }
+    ret grown;
+}
+
+fun t_deallocate(ctx: ptr, item: ptr, size: usize, align: usize) i64 {
+    val p: *AllocationProbe = ctx::*AllocationProbe;
+    if (item != nil) { p.live = p.live - 1; }
+    ret p.backing.fn_deallocate(p.backing.ctx, item, size, align);
+}
+
+test "mach.lang.be.codegen.mir.bulk:every_allocation_failure_releases_owned_storage" {
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret 1; }
+    var fail: u32 = 1;
+    for (fail < 1000) {
+        var probe: AllocationProbe;
+        probe.backing = backing;
+        var alloc: A.Allocator;
+        alloc.ctx = (?probe)::ptr;
+        alloc.fn_allocate = t_allocate;
+        alloc.fn_reallocate = t_reallocate;
+        alloc.fn_deallocate = t_deallocate;
+        var tgt: resolved.Target;
+        tgt.model.flat_addressing = true;
+        tgt.model.pointer_width = 8;
+        tgt.model.gpr_width = 8;
+        var f: mir.MirFunction;
+        var ctx: context.LowerCtx;
+        ctx.alloc = ?alloc;
+        ctx.tgt = ?tgt;
+        ctx.f = ?f;
+        if (R.is_err[R.Void, str](t_setup(?ctx, 257, true))) { mir.dnit_function(?alloc, ?f); ret 2; }
+        probe.fail_at = probe.calls + fail;
+        val result: R.Result[R.Void, str] = expand(?ctx);
+        mir.dnit_function(?alloc, ?f);
+        if (probe.live != 0) { ret 3; }
+        if (R.is_ok[R.Void, str](result)) {
+            if (probe.calls >= probe.fail_at) { ret 4; }
+            if (fail < 100) { ret 5; }
+            ret 0;
+        }
+        if (probe.calls < probe.fail_at) { ret 6; }
+        fail = fail + 1;
+    }
+    ret 7;
+}
