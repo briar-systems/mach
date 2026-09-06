@@ -8,7 +8,7 @@ import os
 import signal
 
 checkout = pathlib.Path(__file__).resolve().parents[2]
-baseline = '96c84fd7954d0efbf452c5c288c9ac103ebc4d58'
+baseline = '9918a117cbc6a5520583c729993b64dd0bc36f7f'
 root = checkout / '.wt' / 'source'
 evidence = checkout / 'bulk-evidence'
 evidence.mkdir(exist_ok=True)
@@ -95,10 +95,18 @@ identities = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in [compi
 if len(set(identities.values())) != 1:
     raise RuntimeError('B/C fixpoint differs')
 for profile in ['debug', 'release']:
-    if not test('bulk-'+profile, 'mach.lang.be.codegen.mir.bulk:', 4, profile=profile):
+    if not test('bulk-'+profile, 'mach.lang.be.codegen.mir.bulk:', 5, profile=profile):
         raise RuntimeError('bulk focused baseline failed')
     if not test('argument-staging-'+profile, 'mach.lang.be.codegen.mir.abi:owned_argument_', 2, profile=profile):
         raise RuntimeError('argument staging baseline failed')
+for profile in ['debug', 'release']:
+    for name, selected in [
+        ('volatile-ir', 'mach.lang.be.codegen.mir.lower:volatile_memory_flags_follow_each_ir_instruction'),
+        ('volatile-spirv', 'mach.lang.target.isa.spirv.emit:volatile_whole_object_self_copy_keeps_load_and_store'),
+        ('volatile-selection', 'mach.lang.be.codegen.rules.select:expansion_identity_carriage'),
+    ]:
+        if not test(name+'-'+profile, selected, 1, profile=profile):
+            raise RuntimeError(name+' baseline failed')
 selected = 'mach.lang.be.codegen.regalloc.rewrite_instr:spilled_update_reloads_previous_value_once'
 regalloc = root / 'src/lang/be/codegen/regalloc.mach'
 pristine = regalloc.read_text()
