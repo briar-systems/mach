@@ -53,22 +53,22 @@ $if ($mach.build.arch == $mach.arch.x86_64 && $mach.build.os == $mach.os.windows
         val m: usize = multi::usize;
         var i: usize = 0;
         for (i < 64) {
-            std.print.printlnf("bare[{}]={:02x}", i, @((b + i)::*u8));
-            std.print.printlnf("multi[{}]={:02x}", i, @((m + i)::*u8));
+            p.printlnf("bare[{}]={:02x}", i, @((b + i)::*u8));
+            p.printlnf("multi[{}]={:02x}", i, @((m + i)::*u8));
             i = i + 1;
         }
         ret 9;
     }
 }
 """
-(evidence / 'diagnostic-fixture.mach').write_bytes(b'use std.print;\n'+original+diagnostic.encode())
+(evidence / 'diagnostic-fixture.mach').write_bytes(b'use p: std.print;\n'+original+diagnostic.encode())
 results = []
 for profile in ['debug', 'release']:
     compiler = root / ('B-'+profile+'.exe')
     rc, text = invoke('A-to-B-'+profile, [str(compiler_a), 'build', str(root), '--profile', profile, '-o', compiler.name])
     assert rc == 0, text
     try:
-        fixture.write_bytes(b'use std.print;\n'+original+diagnostic.encode())
+        fixture.write_bytes(b'use p: std.print;\n'+original+diagnostic.encode())
         rc, text = invoke('geometry-'+profile, [str(compiler), 'test', '.', '--profile', profile, '--filter', 'mach.lang.be.codegen.stack_probe_runtime'])
         counts = re.findall(r'(\d+) passed, (\d+) failed, (\d+) total', text)
         counts = list(map(int, counts[0])) if len(counts) == 1 else None
