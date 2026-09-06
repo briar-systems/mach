@@ -1,3 +1,4 @@
+import hashlib
 import json
 import pathlib
 import re
@@ -8,6 +9,8 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SOURCE = '66772261065a68e5ca03f4234407d5887a3e0fe8'
 PIN = 'c6b335ac862f4df392b69f503c4ffb1501d5a451'
+BRIDGE = '49fbbc48a9b290cbcb17c8187d339e5ce0bcc64b'
+BRIDGE_PIN = '3ee8e709a8ed7baff6e93780ce9b3582a907a91f'
 EVIDENCE = ROOT / 'cli-lifecycle-evidence'
 EVIDENCE.mkdir(exist_ok=True)
 (EVIDENCE / 'verification-script.py').write_bytes(pathlib.Path(__file__).read_bytes())
@@ -67,10 +70,10 @@ def invoke(name, command, timeout=2400):
     return result.returncode, log
 
 
-def check_source():
-    run(['git', 'diff', '--exit-code', SOURCE, '--', 'src', 'mach.toml', 'dep/std'])
+def check_source(source=SOURCE, pin=PIN):
+    run(['git', 'diff', '--exit-code', source, '--', 'src', 'mach.toml', 'dep/std'])
     actual = run(['git', '-C', 'dep/std', 'rev-parse', 'HEAD']).stdout.decode().strip()
-    if actual != PIN:
+    if actual != pin:
         raise RuntimeError('std pin drift')
     run(['git', '-C', 'dep/std', 'diff', '--exit-code'])
 
@@ -109,6 +112,48 @@ def mutate(name, path, before, after, selected, child, required_log=None):
         raise RuntimeError('mutation did not reach its required runtime failure')
 
 
+seed = shutil.which('mach')
+if not seed:
+    raise RuntimeError('published seed unavailable')
+suffix = '.exe' if sys.platform == 'win32' else ''
+stage = ROOT / ('m3149cliStage' + suffix)
+FIXPOINTS = []
+
+
+def build_generation(compiler, name, profile='debug'):
+    executable = ROOT / (name + suffix)
+    rc, _ = invoke(name + '-build', [str(compiler), 'build', str(ROOT), '--profile', profile, '-o', stage.name])
+    if rc:
+        raise RuntimeError(name + ' compilation failed')
+    shutil.copy2(stage, executable)
+    return executable
+
+
+def fixpoint(name, left, right):
+    left_bytes = left.read_bytes()
+    right_bytes = right.read_bytes()
+    record = dict(name=name, left_sha256=hashlib.sha256(left_bytes).hexdigest(),
+                  right_sha256=hashlib.sha256(right_bytes).hexdigest(), identical=left_bytes == right_bytes)
+    FIXPOINTS.append(record)
+    (EVIDENCE / 'fixpoints.json').write_text(json.dumps(FIXPOINTS, indent=2), encoding='utf-8')
+    print(json.dumps(record), flush=True)
+    if not record['identical']:
+        raise RuntimeError(name + ' byte fixpoint failed')
+
+
+run(['git', 'checkout', '--detach', BRIDGE])
+run(['git', 'submodule', 'update', '--init', '--recursive'], timeout=300)
+check_source(BRIDGE, BRIDGE_PIN)
+(EVIDENCE / 'bridge-source.json').write_text(json.dumps(dict(source=BRIDGE, pin=BRIDGE_PIN, host=sys.platform)), encoding='utf-8')
+bridge_a = build_generation(seed, 'm3149BridgeA')
+bridge_b = build_generation(bridge_a, 'm3149BridgeB')
+bridge_c = build_generation(bridge_b, 'm3149BridgeC')
+fixpoint('bridge-B-C', bridge_b, bridge_c)
+if not test(bridge_c, 'debug', 'bridge-renamed-forward-regressions', 'mach.lang.driver:resolve_fwd_renamed_reexport_', 3):
+    raise RuntimeError('audited bridge renamed-forward regression failed')
+check_source(BRIDGE, BRIDGE_PIN)
+
+
 run(['git', 'checkout', '--detach', SOURCE])
 run(['git', 'submodule', 'update', '--init', '--recursive'], timeout=300)
 check_source()
@@ -138,21 +183,13 @@ for name, prefix, expected in PREFIXES:
     inventory[prefix] = names
 (EVIDENCE / 'test-inventory.json').write_text(json.dumps(inventory, indent=2), encoding='utf-8')
 
-seed = shutil.which('mach')
-if not seed:
-    raise RuntimeError('published seed unavailable')
-suffix = '.exe' if sys.platform == 'win32' else ''
-a = ROOT / ('m3149cliA' + suffix)
-rc, _ = invoke('seed-to-A', [seed, 'build', str(ROOT), '-o', a.name])
-if rc:
-    raise RuntimeError('seed-to-A compilation failed')
+a = build_generation(bridge_c, 'm3149cliA')
 COMPILERS = {}
 for profile in ['debug', 'release']:
-    compiler = ROOT / ('m3149cliB' + profile + suffix)
-    rc, _ = invoke('A-to-B-' + profile, [str(a), 'build', str(ROOT), '--profile', profile, '-o', compiler.name])
-    if rc:
-        raise RuntimeError('A-to-B compilation failed')
-    COMPILERS[profile] = compiler
+    b = build_generation(a, 'm3149cliB' + profile, profile)
+    c = build_generation(b, 'm3149cliC' + profile, profile)
+    fixpoint('paired-' + profile + '-B-C', b, c)
+    COMPILERS[profile] = c
 
 baseline_ok = True
 for profile in ['debug', 'release']:
@@ -190,6 +227,96 @@ def engine_probe(kind):
                  '    val actual: O.Option[txn.Error] = publication.plan_dnit(?st.outputs);\n'
                  '    if (O.is_some[txn.Error](actual)) { ret actual; }\n'
                  '    ret O.some[txn.Error](txn.error(txn.' + kind + ', txn.OP_ABORT));')
+
+
+def compile_cli_probe(name):
+    executable = ROOT / (name + suffix)
+    rc, _ = invoke(name + '-build', [str(COMPILERS['debug']), 'build', str(ROOT), '-o', executable.name])
+    if rc:
+        raise RuntimeError('CLI fault probe failed to compile')
+    return executable
+
+
+def cli_probe(executable, name, directory):
+    return invoke(name, [str(executable), 'init', str(directory), '--name', 'recovery_audit', '--force', '--no-deps'])
+
+
+def cli_fixture(name):
+    directory = EVIDENCE / name
+    directory.mkdir()
+    (directory / 'src').mkdir()
+    (directory / 'src' / 'root.mach').write_text('original source\n', encoding='utf-8')
+    (directory / 'mach.toml').write_text('original manifest\n', encoding='utf-8')
+    return directory
+
+
+def recovery_cli_probes():
+    restore()
+    replace_once(INIT,
+                 '    val manifest_now_r: R.Result[InitEntry, str] = probe_entry(root_cap, util.PROJECT_CONFIG_NAME);',
+                 '    if (a != nil) { ret R.err[i32, str]("audit recovery primary"); }\n'
+                 '    val manifest_now_r: R.Result[InitEntry, str] = probe_entry(root_cap, util.PROJECT_CONFIG_NAME);')
+    replace_once(INIT,
+                 '    if (R.is_err[R.Void, str](journal)) { ret R.err[i32, str](R.unwrap_err[R.Void, str](journal)); }',
+                 '    if (R.is_err[R.Void, str](journal)) { ret R.err[i32, str](R.unwrap_err[R.Void, str](journal)); }\n'
+                 '    if (a != nil) { ret R.err[i32, str]("audit after journal"); }')
+    replace_once(INIT,
+                 '    val closed: O.Option[str] = directory_close(?source);',
+                 '    var closed: O.Option[str] = directory_close(?source);\n'
+                 '    if (R.is_err[i32, str](result) && str_equals(R.unwrap_err[i32, str](result), "audit recovery primary")) {\n'
+                 '        closed = O.some[str]("audit recovery cleanup");\n'
+                 '    }')
+    fixed = compile_cli_probe('m3149RecoveryReports')
+    directory = cli_fixture('recovery-two-errors')
+    rc, log = cli_probe(fixed, 'recovery-journal-setup', directory)
+    journal = directory / '.machinit.journal'
+    if rc != 3 or 'audit after journal' not in log or not journal.is_file():
+        raise RuntimeError('CLI setup did not retain its actual journal after the injected phase failure')
+    original = journal.read_bytes()
+    rc, log = cli_probe(fixed, 'recovery-both-errors', directory)
+    cleanup = 'error: init recovery cleanup: audit recovery cleanup'
+    if rc != 3 or 'audit recovery primary' not in log or cleanup not in log or journal.read_bytes() != original:
+        raise RuntimeError('CLI did not report both failures while retaining the unchanged journal')
+    replace_once(INIT,
+                 '        if (O.is_some[str](closed)) { print.eprintlnf("error: init recovery cleanup: {}", O.unwrap[str](closed)); }\n', '')
+    old = compile_cli_probe('m3149RecoveryDrops')
+    old_rc, old_log = cli_probe(old, 'old-recovery-drops-cleanup', directory)
+    if old_rc != 3 or 'audit recovery primary' not in old_log or cleanup in old_log or journal.read_bytes() != original:
+        raise RuntimeError('old recovery policy did not isolate the missing cleanup diagnostic')
+    (EVIDENCE / 'recovery-error-reporting.json').write_text(json.dumps(dict(
+        positive_exit=rc, mutant_exit=old_rc, positive_messages=2, mutant_messages=1,
+        journal_unchanged=True, mutation_guard='missing cleanup diagnostic', verified=True)), encoding='utf-8')
+
+    restore()
+    replace_once(INIT, 'fun directory_close(cap: *InitDirectory) O.Option[str] {',
+                 'fun directory_close(cap: *InitDirectory) O.Option[str] {\n'
+                 '    val audit_live_source: bool = cap.names[0] != nil && str_equals(cap.names[0], "root.mach")\n'
+                 '        && R.is_ok[txn.Identity, txn.Error](txn.root_identity(?cap.root));')
+    replace_once(INIT,
+                 '    if (O.is_some[txn.Error](failure)) { ret O.some[str](txn_msg(O.unwrap[txn.Error](failure))); }\n    ret O.none[str]();',
+                 '    if (O.is_some[txn.Error](failure)) { ret O.some[str](txn_msg(O.unwrap[txn.Error](failure))); }\n'
+                 '    if (audit_live_source) { ret O.some[str]("audit source close failure"); }\n'
+                 '    ret O.none[str]();')
+    fixed = compile_cli_probe('m3149RecoveryKeeps')
+    directory = cli_fixture('recovery-close-keeps-journal')
+    rc, log = cli_probe(fixed, 'recovery-close-retains-journal', directory)
+    journal = directory / '.machinit.journal'
+    if rc != 3 or 'audit source close failure' not in log or not journal.is_file():
+        raise RuntimeError('source close failure did not retain the completed publication journal')
+    if (directory / 'mach.toml').read_text() == 'original manifest\n' or (directory / 'src' / 'root.mach').read_text() == 'original source\n':
+        raise RuntimeError('close fault occurred before the actual publications')
+    replace_once(INIT,
+                 '    if (O.is_none[str](failure) && entry_backup != nil) { failure = resolve_commit_cleanup(src_cap, entry_backup); }\n'
+                 '    if (O.is_none[str](failure)) { failure = directory_close(src_cap); }',
+                 '    if (O.is_none[str](failure) && entry_backup != nil) { failure = resolve_commit_cleanup(src_cap, entry_backup); }')
+    old = compile_cli_probe('m3149RecoveryLoses')
+    old_directory = cli_fixture('recovery-close-loses-journal')
+    old_rc, old_log = cli_probe(old, 'old-recovery-close-loses-journal', old_directory)
+    if old_rc != 3 or 'audit source close failure' not in old_log or (old_directory / '.machinit.journal').exists():
+        raise RuntimeError('old close ordering did not isolate premature journal deletion')
+    (EVIDENCE / 'recovery-close-ordering.json').write_text(json.dumps(dict(
+        positive_exit=rc, mutant_exit=old_rc, positive_journal=True, mutant_journal=False,
+        native_publications=True, mutation_guard='journal missing after source close failure', verified=True)), encoding='utf-8')
 
 
 try:
@@ -241,6 +368,8 @@ try:
     replace_once(ENGINE, '        if (error.kind == txn.INVALID) { cleanup = outcome.internal(detail); }\n', '')
     if not test(COMPILERS['debug'], 'debug', 'engine-invalid-cleanup-misclassified', engine_filter, 1, 11):
         raise RuntimeError('invalid cleanup mutation did not fail at event-kind guard')
+
+    recovery_cli_probes()
 
 finally:
     restore()
