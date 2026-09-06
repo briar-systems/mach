@@ -1,6 +1,11 @@
 #include <emmintrin.h>
 #include <mmintrin.h>
 
+#if defined(_MSC_VER)
+// the standalone probe owns the MSVC floating-point link marker.
+int _fltused;
+#endif
+
 typedef __m128i v4si;
 typedef __m64 v4hi;
 typedef long long (*vec_op)(v4si);
