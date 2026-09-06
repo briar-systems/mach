@@ -131,6 +131,9 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 ### Fixed
 
 - Code generation releases each module's MIR, register-allocation, encoding and debug scratch after preserving its completed object image, instead of retaining scratch across the worker batch (#2299).
+- The frame-location link oracle checks every DWARF description sharing a machine range, preventing false failures for backed variables (#3197).
+- Two union-loader fixtures exercise the selected native semantic projection while preserving all six target tuples, transitive reachability masks, and errors in unreachable foreign branches (#3193).
+- Build steps normalize native output roots, snapshots, and declared staging paths before comparison, preserving contained Windows drive and UNC outputs. Absolute output templates retain their leading-marker requirement, and directory declarations use native component boundaries (#3195).
 
 - Windows and Darwin corpus disassemblies now reflect the audited aggregate and vector ABI, scratch-register preservation, canonical boolean, trapping remainder, inline, vector-loop and Darwin x18 fixes. All 77 updates were independently decoded and reviewed against native C-reference results (#3179).
 
@@ -221,6 +224,9 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 - Manifest dependency editing allocates escaped TOML strings at their exact owned size, so ordinary values release their full allocation (#3160).
 - Build steps inherit the planner environment and apply declared overrides with host-correct name identity. Target variables remain authoritative, environment changes invalidate cached steps, and allocating failures release exact owned extents (#3146).
 - CI's vendored-version and checked-type fixtures use contained source snapshots at the compiler's std pin, and release additivity builds use project-relative output paths (#3135).
+- The worker-count determinism fixture exports its declared Linux entry symbol on every native host while retaining debug output and the one-versus-six-worker byte comparison (#3191).
+- Tracked dependency symlinks resolve in canonical package-relative space on Windows, preserving contained chains while rejecting escapes and cycles (#3187).
+
 - Root dependency overrides select the realization's source kind, URL and exact selector before verification, including when a transitive edge is visited first (#3138).
 - Link fixture build steps preserve the harness-selected toolchain PATH, including CI's versioned LLVM directory and native Windows compiler paths (#3141).
 - A required artifact planned under `mach test` was built as a test cell.
