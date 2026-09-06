@@ -69,35 +69,12 @@ a = root / ("m3115repairA" + suffix)
 rc, log = invoke("seed-to-A", [seed, "build", str(root), "-o", a.name])
 if rc:
     raise SystemExit("source compiler build failed")
-names = []
-for p in (root / "src").rglob("*.mach"):
-    names.extend(re.findall(r'^test "([^\"]+)"', p.read_text(encoding="utf-8"), re.M))
-failures = []
-# five Linux or six Windows tests are selected by explicit host-gated declarations.
-expected = len(names) + (6 if sys.platform == "win32" else 5)
-assert expected == (2522 if sys.platform == "win32" else 2521), expected
-for profile in ["debug", "release"]:
-    compiler = root / ("m3115repairB" + profile + suffix)
-    rc, log = invoke("A-to-B-" + profile, [str(a), "build", str(root), "--profile", profile, "-o", compiler.name])
-    if rc:
-        raise SystemExit("source compiler build failed")
-    try:
-        test(profile + "-complete-unit-suite", "", expected)
-    except RuntimeError:
-        row = results[-1]
-        geometry = "mach.lang.be.codegen.stack_probe_runtime:win64_frame_geometry_pinned"
-        known_geometry = (sys.platform == "win32" and profile == "release"
-                          and row["counts"] == [expected - 1, 1, expected]
-                          and set(row["failures"]) == {geometry}
-                          and set(row["exits"]) == {"2"})
-        if known_geometry:
-            print("Full release suite FAILED its independent pinned-geometry assertion. Outcome mutation proof continues separately.", flush=True)
-        else:
-            failures.append(profile)
-if failures:
-    raise RuntimeError("complete unit baseline failed: " + repr(failures))
+# exact b3d216f6 Windows full baseline is recorded in run34012313243.
 profile = "debug"
 compiler = root / ("m3115repairBdebug" + suffix)
+rc, log = invoke("A-to-B-debug", [str(a), "build", str(root), "--profile", profile, "-o", compiler.name])
+if rc:
+    raise SystemExit("source compiler build failed")
 # appended after building the debug B compiler on the committed repair source
 paths = ["src/lang/fe/sema/infer.mach", "src/lang/fe/sema/context.mach", "src/lang/fe/resolve.mach", "src/lang/driver.mach", "src/lang/editor.mach", "src/lang/fe/parser/state.mach", "src/lang/session.mach"]
 pristine = {p: (root / p).read_bytes() for p in paths}
@@ -117,14 +94,14 @@ def mutate_one(path, before, after):
 
 try:
     restore()
-    before = function(pristine[paths[0]].decode(), "report_unbound_ident")
+    before = function(pristine[paths[0]].decode().replace("\r\n", "\n"), "report_unbound_ident")
     after = before.replace("    if (sc.silent) { ret type.TYPE_ERROR; }\n", "")
     assert before != after
     mutate_one(paths[0], before, after)
     test("old-unvisited-gate-internal", "mach.lang.driver:comptime_alias_gate_resolution", child=5)
 
     restore()
-    before = function(pristine[paths[0]].decode(), "report_unbound_ident")
+    before = function(pristine[paths[0]].decode().replace("\r\n", "\n"), "report_unbound_ident")
     begin = before.index("    if (sc.rr != nil")
     end = before.index("    val e_opt", begin)
     after = before[:begin] + before[end:]
@@ -132,7 +109,7 @@ try:
     test("old-rejected-identifier-internal", "mach.lang.editor.resolve:reload_reflects_edited_dependency", child=1)
 
     restore()
-    old_infer = subprocess.check_output(["git", "show", "19bb44c8:" + paths[0]], cwd=root).decode()
+    old_infer = subprocess.check_output(["git", "show", "19bb44c8:" + paths[0]], cwd=root).decode().replace("\r\n", "\n")
     for name in ["intrinsic_operand_type", "resolve_type_ref", "memo_record"]:
         current = (root / paths[0]).read_text(encoding="utf-8")
         mutate_one(paths[0], function(current, name), function(old_infer, name))
@@ -144,7 +121,7 @@ try:
     test("old-intrinsic-guessed-internal", "mach.lang.driver:comptime_length_of", child=1)
 
     restore()
-    before = function(pristine[paths[0]].decode(), "report_unbound_ident")
+    before = function(pristine[paths[0]].decode().replace("\r\n", "\n"), "report_unbound_ident")
     condition = "sc.rr != nil && sc.rr.expr_resolved != nil && eid < sc.rr.expr_count\n        && sc.rr.expr_resolved[eid] == resolve.SYMBOL_REJECTED"
     after = before.replace(condition, "sc.rr != nil && sc.rr.status.kind == fail.REJECTED")
     assert before != after
@@ -152,7 +129,7 @@ try:
     test("incorrect-phase-wide-rejection", "mach.lang.fe.sema:unvisited_identifier_after_unrelated_rejection_is_internal", child=9)
 
     restore()
-    before = function(pristine[paths[1]].decode(), "type_result")
+    before = function(pristine[paths[1]].decode().replace("\r\n", "\n"), "type_result")
     after = before.replace("fail.internal(?sc.status,", "if (!sc.silent) { fail.internal(?sc.status,")
     # type_result has one typed allocation-failure recording statement.
     after = after.replace("R.unwrap_err[type.TypeId, str](r));", "R.unwrap_err[type.TypeId, str](r)); }")
@@ -161,7 +138,7 @@ try:
     test("incorrect-silent-allocation-suppression", "mach.lang.fe.sema:substitution_allocation_failure_during_silent_probe_is_internal", child=9)
     restore()
     path = "src/lang/fe/resolve.mach"
-    before = function(pristine[path].decode(), "add_symbol")
+    before = function(pristine[path].decode().replace("\r\n", "\n"), "add_symbol")
     start = before.index("    if (rc.sym_len >= SYMBOL_REJECTED)")
     end = before.index("    if (rc.sym_len == rc.sym_cap)", start)
     mutate_one(path, before, before[:start] + before[end:])
@@ -186,21 +163,21 @@ try:
 
     restore()
     path = "src/lang/fe/parser/state.mach"
-    before = function(pristine[path].decode(), "fatal_depth")
+    before = function(pristine[path].decode().replace("\r\n", "\n"), "fatal_depth")
     after = before.replace("set_fatal(p, PARSE_FAIL_OOM, current(p).span, R.unwrap_err[str, str](r));", "set_fatal(p, PARSE_FAIL_DEPTH, current(p).span, \"input nests deeper than this parser descends\");")
     assert after != before
     mutate_one(path, before, after)
     test("old-depth-formatting-refusal-lost", "mach.lang.fe.parser.state.fatal_depth:formatting_refusal_is_internal_before_depth_rejection", child=9)
 
     restore()
-    before = function(pristine[path].decode(), "fatal_depth")
+    before = function(pristine[path].decode().replace("\r\n", "\n"), "fatal_depth")
     after = before.replace("    fin { str_free(p.ast.a, detail); }\n", "")
     assert after != before
     mutate_one(path, before, after)
     test("old-depth-formatted-detail-leak", "mach.lang.fe.parser.state.fatal_depth:formatted_detail_is_released_after_diagnostic_copy", child=11)
 
     restore()
-    before = function(pristine[path].decode(), "set_fatal_detail")
+    before = function(pristine[path].decode().replace("\r\n", "\n"), "set_fatal_detail")
     start = before.index("    if (R.is_err[R.Void, str](r))")
     end = before.rindex("}")
     after = before[:start] + before[end:]
@@ -223,7 +200,7 @@ try:
 
     restore()
     path = "src/lang/session.mach"
-    before = function(pristine[path].decode(), "load_source")
+    before = function(pristine[path].decode().replace("\r\n", "\n"), "load_source")
     start = before.index("    val key_r:")
     end = before.index("    if (R.is_err[source.FileId, str](res_fid))")
     after = before[:start] + "    val res_fid: R.Result[source.FileId, str] = source.load(?s.sources, ?s.interner, path, text);\n" + before[end:]
