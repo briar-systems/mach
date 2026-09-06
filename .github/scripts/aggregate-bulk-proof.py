@@ -134,6 +134,10 @@ for profile in ['debug', 'release']:
             regalloc.write_text(pristine)
 assert regalloc.read_text() == pristine
 volatile_mutants = [
+    ('small-copy-stores-before-snapshot', 'src/lang/be/codegen/mir/bulk.mach',
+     '            off = off + 1;\n        }\n    }\n    off = 0;',
+     '            val early: R.Result[R.Void, str] = emit2(e, bi, mir.MIR_STORE, context.mem_at(dst, off::i64), mir.op_vreg(values[off]), 1);\n            if (R.is_err[R.Void, str](early)) { ret early; }\n            off = off + 1;\n        }\n    }\n    off = 0;',
+     'mach.lang.be.codegen.mir.bulk:bounded_shape_secrecy_and_debug_ownership', 10),
     ('call-registers-before-copies', 'src/lang/be/codegen/mir/abi.mach',
      '    if (ctx.tgt.model.flat_addressing) { registers = ?pending_registers; }', '',
      'mach.lang.be.codegen.mir.abi:owned_argument_preparation_precedes_register_placement', 1),
