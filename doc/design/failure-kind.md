@@ -49,8 +49,7 @@ The compiler has two closed failure types, one per layer.
 
 `mach.lang.fail.Fail` is the language layer's: kind `REPORTED` (the failure
 was already recorded as a diagnostic on the session, and there is nothing
-further to say) or `MESSAGE` (a failure with text that has not been reported
-anywhere). It is carried through the query engine, so a query that fails
+further to say) or `MESSAGE` (an internal failure whose text must be preserved). It is carried through the query engine, so a query that fails
 because a dependency's phase already reported does not report again, and the
 build's fail path reads the kind rather than a string.
 
@@ -88,3 +87,32 @@ allocation failure is never mapped to a valid-looking default (public,
 false, zero, empty, a continuable error type), and a diagnostic append
 result is never discarded. Those are the invariants the closed kind exists
 to make checkable.
+
+## Frontend phase products
+
+`fail.PhaseStatus` is the authority for a frontend phase. Its kinds are
+`ACCEPTED`, `REJECTED` and `INTERNAL`. A rejection is recorded before its
+diagnostic is formatted or appended. An internal failure dominates every
+rejection and retains its first failure message. Diagnostic counts and
+rendering are not phase outcomes.
+
+Parsing returns this status while publishing its complete recovery AST.
+A fatal parse retains its specific `ParseFailKind` and publishes no AST.
+Depth refusal is a user rejection. Allocation, diagnostic construction and
+parser invariant failures are internal. Resolver and semantic products carry
+their status, including a rejected partial product useful to the editor.
+Their `Result` error channel carries internal failure after releasing owned
+partial products.
+
+Semantic recovery values are confined to a phase whose status has already
+recorded failure. Generic operations that allocate return `Result` to every
+caller. Their recursive walks use an operation-local status, including layout
+callbacks whose value type cannot carry allocation errors. The semantic or
+lowering caller records an error in its own phase before using a recovery
+value. No failed operation publishes an accepted phase or a build artifact.
+Deferred semantic contexts merge their status into their owning phase.
+
+Queries preserve classified `fail.Fail` values. The build engine reads the
+frontend products at its load and semantic boundaries. It never changes an
+internal failure into a reported user error because a diagnostic was added
+before that failure.
