@@ -8,7 +8,7 @@ import os
 import signal
 
 checkout = pathlib.Path(__file__).resolve().parents[2]
-baseline = 'cc49bf6d'
+baseline = 'b6801df9'
 root = checkout / '.wt' / 'source'
 evidence = checkout / 'vector-carrier-evidence'
 evidence.mkdir(exist_ok=True)
@@ -171,41 +171,55 @@ if sys.platform == 'win32':
     main_text = original_main.decode()
     start = main_text.index('#[symbol("main")]')
     end = main_text.index('\ndef CarrierFn2:', start)
-    guard_main = '\n'.join([
-        '#[symbol("main")]',
-        'fun main(argc: usize, argv: **u8) i64 {',
-        '    val v: u8x3 = u8x3{3, 8, 13};',
-        '    val code: i64 = carrier_guard_3(local_carrier_3, v);',
-        '    p.printlnf("carrier guard={}", code);',
-        '    ret code;',
-        '}',
-    ])
-    try:
-        main.write_text(main_text[:start]+guard_main+'\n'+main_text[end:])
-        for label, active_compiler, expected_exit in [('baseline', compiler, 0), ('mutation', root/'D.exe', 3)]:
-            if label == 'mutation':
-                mutate_function(mir_abi, 'pub fun lower_ret(',
-                                'context.store_subwidth_vector(ctx, mb, mir.op_mem_value(ctx.sret_vreg, 0), rvop, rt)',
-                                'context.store_vector_register(ctx, mb, mir.op_mem_value(ctx.sret_vreg, 0), rvop, rt)')
-                (evidence/'sret-overwrite.diff').write_bytes(subprocess.check_output(['git', 'diff', '--', mir_abi], cwd=root))
-                built = invoke('sret-overwrite-compiler', [str(compiler), 'build', '.', '-o', active_compiler.name])
-                if built.returncode:
-                    raise RuntimeError('mutated compiler failed to build, not runtime proof')
-            for profile in ['debug', 'release']:
-                name = label+'-sret-byte-guard-'+profile
-                built = invoke(name+'-build', [str(active_compiler), 'build', str(fixture_root), '--target', 'x86_64-windows', '--profile', profile, '-o', 'out/guard.exe'])
-                if built.returncode:
-                    raise RuntimeError(name+' failed to build, not runtime proof')
-                ran = invoke(name, [str(fixture_root/'out/guard.exe')], timeout=30)
-                expected = 'carrier guard='+str(expected_exit)+'\n'
-                verified = ran.returncode == expected_exit and ran.stdout.decode().replace('\r\n','\n') == expected
-                results.append(dict(name=name, runtime_exit=ran.returncode, verified=verified))
-                (evidence/'results.json').write_text(json.dumps(results, indent=2)+'\n')
-                if not verified:
-                    raise RuntimeError(name+' did not produce the expected runtime assertion')
-    finally:
-        (root/mir_abi).write_bytes(originals[mir_abi])
-        main.write_bytes(original_main)
+    staging_cases = [
+        ('sret-byte-guard',
+         '    val v: u8x3 = u8x3{3, 8, 13};\n    val code: i64 = carrier_guard_3(local_carrier_3, v);',
+         'pub fun lower_ret(',
+         'context.store_subwidth_vector(ctx, mb, mir.op_mem_value(ctx.sret_vreg, 0), rvop, rt)',
+         'context.store_vector_register(ctx, mb, mir.op_mem_value(ctx.sret_vreg, 0), rvop, rt)', 3),
+        ('wide-pointer-capture',
+         '    val code: i64 = carrier_capture_guard_20(local_carrier_20);',
+         'fun capture_vector_byref(',
+         '    if (!context.value_is_vector(ctx, ty)) {\n        ret context.emit_mov_w(ctx, mb, mir.op_vreg(pv), src, ptr_move_width(ctx));\n    }\n',
+         '', 1),
+        ('wide-copy-extent',
+         '    val code: i64 = check_carrier_20();',
+         'fun spill_vector_to_temp(',
+         'context.copy_aggregate(ctx, mb, mir.op_mem_slot(sk, 0), val_op, size)',
+         'context.copy_aggregate(ctx, mb, mir.op_mem_slot(sk, 0), val_op, logical_size)', 1),
+    ]
+    for case, body, function, old, new, mutation_exit in staging_cases:
+        guard_main = '\n'.join([
+            '#[symbol("main")]',
+            'fun main(argc: usize, argv: **u8) i64 {', body,
+            '    p.printlnf("carrier guard={}", code);',
+            '    ret code;', '}',
+        ])
+        try:
+            main.write_text(main_text[:start]+guard_main+'\n'+main_text[end:])
+            (evidence/(case+'-main.mach')).write_bytes(main.read_bytes())
+            for label, active_compiler, expected_exit in [('baseline', compiler, 0), ('mutation', root/'D.exe', mutation_exit)]:
+                if label == 'mutation':
+                    mutate_function(mir_abi, function, old, new)
+                    (evidence/(case+'.diff')).write_bytes(subprocess.check_output(['git', 'diff', '--', mir_abi], cwd=root))
+                    built = invoke(case+'-compiler', [str(compiler), 'build', '.', '-o', active_compiler.name])
+                    if built.returncode:
+                        raise RuntimeError('mutated compiler failed to build, not runtime proof')
+                for profile in ['debug', 'release']:
+                    name = label+'-'+case+'-'+profile
+                    built = invoke(name+'-build', [str(active_compiler), 'build', str(fixture_root), '--target', 'x86_64-windows', '--profile', profile, '-o', 'out/guard.exe'])
+                    if built.returncode:
+                        raise RuntimeError(name+' failed to build, not runtime proof')
+                    ran = invoke(name, [str(fixture_root/'out/guard.exe')], timeout=30)
+                    expected = 'carrier guard='+str(expected_exit)+'\n'
+                    verified = ran.returncode == expected_exit and ran.stdout.decode().replace('\r\n','\n') == expected
+                    results.append(dict(name=name, runtime_exit=ran.returncode, verified=verified))
+                    (evidence/'results.json').write_text(json.dumps(results, indent=2)+'\n')
+                    if not verified:
+                        raise RuntimeError(name+' did not produce the expected runtime assertion')
+        finally:
+            (root/mir_abi).write_bytes(originals[mir_abi])
+            main.write_bytes(original_main)
 
 for path in paths:
     assert (root/path).read_bytes() == originals[path]
