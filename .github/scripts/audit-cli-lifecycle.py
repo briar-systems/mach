@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-SOURCE = '66772261065a68e5ca03f4234407d5887a3e0fe8'
+SOURCE = 'fd18ee1048ea1cdf54904f9baf12804dd8a8f5b3'
 PIN = 'c6b335ac862f4df392b69f503c4ffb1501d5a451'
 BRIDGE = '49fbbc48a9b290cbcb17c8187d339e5ce0bcc64b'
 BRIDGE_PIN = '3ee8e709a8ed7baff6e93780ce9b3582a907a91f'
@@ -16,7 +16,7 @@ EVIDENCE.mkdir(exist_ok=True)
 (EVIDENCE / 'verification-script.py').write_bytes(pathlib.Path(__file__).read_bytes())
 RESULTS = []
 PREFIXES = [
-    ('init', 'mach.cli.cmd.init', 40),
+    ('init', 'mach.cli.cmd.init', 41),
     ('dep-cli', 'mach.cli.cmd.dep', 21),
     ('clean', 'mach.cli.cmd.clean', 8),
     ('deps', 'mach.lang.driver.deps', 12),
@@ -322,6 +322,23 @@ def recovery_cli_probes():
 
 
 try:
+    mutate('absolute-anchor-skipped', INIT,
+           'val anchored: O.Option[txn.Error] = anchor_absolute_parent(?a, ?split);',
+           'val anchored: O.Option[txn.Error] = O.none[txn.Error]();',
+           'mach.cli.cmd.init.run_typed:absolute_ancestor_aliases_preserve_final_destination_refusal', 7)
+    restore()
+    current_deps = (ROOT / DEPS).read_text(encoding='utf-8')
+    clear_start = current_deps.index('    var list: [5]str', current_deps.index('fun txn_restore_index('))
+    clear_end = current_deps.index('    ret txn_write_index(', clear_start)
+    old_clear = ('    var clear: [9]str = [9]str{"rm", "--cached", "-r", "-f", "-q", "--ignore-unmatch", "--", REALIZE_DEP_DIR, ".gitmodules"};\n'
+                 '    val removed: R.Result[str, str] = git_op(s.build_alloc, ?gi, t.root, ?clear[0], 9, nil);\n'
+                 '    if (R.is_err[str, str](removed)) { ret O.some[str](R.unwrap_err[str, str](removed)); }\n'
+                 '    str_free(s.build_alloc, R.unwrap_ok[str, str](removed));\n')
+    replace_once(DEPS, current_deps[clear_start:clear_end], old_clear)
+    if not test(COMPILERS['debug'], 'debug', 'porcelain-index-clear-restored',
+                'mach.cli.cmd.dep.add:a_clash_leaves_the_index_and_tree_as_they_were_and_no_lock_file', 1, 3,
+                'dependency rollback failed:'):
+        raise RuntimeError('porcelain index clear did not fail at rollback')
     mutate('missing-original-refusal-removed', INIT,
            'if (!manifest_now.present && j.manifest_had_identity && !R.unwrap_ok[bool, str](manifest_backup)) {',
            'if (false) {',
@@ -344,11 +361,18 @@ try:
     mutate('dependency-rollback-error-discarded', DEPS,
            '    if (O.is_some[str](manifest_restored)) { ret manifest_restored; }', '',
            'mach.cli.cmd.dep.txn:final_storage_refuses_copies_and_snapshot_failure_releases_the_guard', 17)
-    mutate('dependency-index-snapshot-loses-stages', DEPS,
-           'var args: [6]str = [6]str{"ls-files", "--stage", "-z", "--", REALIZE_DEP_DIR, ".gitmodules"};',
-           'var args: [6]str = [6]str{"ls-files", "--cached", "-z", "--", REALIZE_DEP_DIR, ".gitmodules"};',
-           'mach.lang.driver.deps.txn:rollback_preserves_conflict_stages_and_binary_path_records', 12,
-           'malformed index info')
+    restore()
+    replace_once(DEPS,
+                 'git_query_capture(alloc, gi, root, args, arg_len, false, nil, input.file.handle.value::i32, true)',
+                 'git_query_capture(alloc, gi, root, args, arg_len, false, nil, input.file.handle.value::i32, false)')
+    index_filter = 'mach.lang.driver.deps.txn:rollback_preserves_conflict_stages_and_binary_path_records'
+    if not test(COMPILERS['debug'], 'debug', 'index-roundtrip-with-native-stderr', index_filter, 1):
+        raise RuntimeError('index stderr observation changed the positive fixture')
+    replace_once(DEPS,
+                 'var args: [6]str = [6]str{"ls-files", "--stage", "-z", "--", REALIZE_DEP_DIR, ".gitmodules"};',
+                 'var args: [6]str = [6]str{"ls-files", "--cached", "-z", "--", REALIZE_DEP_DIR, ".gitmodules"};')
+    if not test(COMPILERS['debug'], 'debug', 'dependency-index-snapshot-loses-stages', index_filter, 1, 12, 'malformed index info'):
+        raise RuntimeError('stage-less snapshot did not fail in native index-info parsing')
     engine_filter = 'mach.lang.build.engine.audit:internal_phase_and_cleanup_failures_remain_distinct'
     engine_probe('IO')
     if not test(COMPILERS['debug'], 'debug', 'engine-primary-plus-io-cleanup', engine_filter, 1):
