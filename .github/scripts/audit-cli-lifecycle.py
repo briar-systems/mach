@@ -18,7 +18,7 @@ PREFIXES = [
     ('clean', 'mach.cli.cmd.clean', 8),
     ('deps', 'mach.lang.driver.deps', 12),
     ('publication', 'mach.lang.publication', 2),
-    ('fingerprint', 'mach.lang.build.fingerprint', 10),
+    ('fingerprint', 'mach.lang.build.fingerprint', 11),
 ]
 
 
@@ -113,7 +113,16 @@ run(['git', 'checkout', '--detach', SOURCE])
 run(['git', 'submodule', 'update', '--init', '--recursive'], timeout=300)
 check_source()
 (EVIDENCE / 'source.json').write_text(json.dumps(dict(source=SOURCE, pin=PIN, host=sys.platform)), encoding='utf-8')
-structural = run(['bash', 'test/census.sh'], timeout=120, check=False)
+bash = shutil.which('bash')
+if sys.platform == 'win32':
+    git = pathlib.Path(shutil.which('git') or '')
+    choices = [parent / 'bin' / 'bash.exe' for parent in git.parents]
+    bash = next((str(value) for value in choices if value.is_file()), None)
+if not bash:
+    raise RuntimeError('native source-census shell unavailable')
+structural_command = [bash, 'test/census.sh']
+print(json.dumps(dict(structural_census=structural_command)), flush=True)
+structural = run(structural_command, timeout=120, check=False)
 (EVIDENCE / 'structural-census.log').write_bytes(structural.stdout)
 if structural.returncode:
     print(structural.stdout.decode('utf-8', errors='replace'), flush=True)
