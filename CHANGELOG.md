@@ -130,6 +130,10 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 ### Fixed
 
+- Reclaim vector scalarization maps and lane work after each function while retaining emitted operands in IR-owned storage.
+- Loop-invariant motion and scalar replacement reclaim analysis and rewrite plans after each function or transformation round, while emitted IR operands retain module ownership (#2299).
+- Optimization releases mem2reg, constant-folding, algebraic, common-subexpression and dead-code work tables after each function, and verifier scratch after each check, instead of retaining them in the lowered IR arena (#2299).
+
 - Three Windows corpus disassemblies now reflect the verified vector carrier ABI, including direct eight-byte payloads and exact twelve-byte staging (#3199).
 - Deferred gate and generic type probes keep their incomplete outcome, and identifiers already rejected by resolution retain their source error. Actual allocation failures and unvisited committed bindings remain internal errors (#3115, #3130).
 
