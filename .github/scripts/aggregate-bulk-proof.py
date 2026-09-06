@@ -52,6 +52,7 @@ def invoke(name, command, timeout=600):
         (evidence / (name + '.log')).write_bytes(output)
         raise RuntimeError(name + ' timed out, not mutation proof')
     (evidence / (name + '.log')).write_bytes(output)
+    (evidence / (name + '-exit.txt')).write_text(str(process.returncode)+'\n')
     return subprocess.CompletedProcess(command, process.returncode, output)
 
 
@@ -83,10 +84,26 @@ for name, command in [('seed-to-A', [seed, 'build', str(root), '-o', compiler_a.
 source = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root).decode().strip()
 pin = subprocess.check_output(['git', '-C', 'dep/std', 'rev-parse', 'HEAD'], cwd=root).decode().strip()
 (evidence / 'source-and-pin.txt').write_text(source+'\n'+pin+'\n')
+project = root / 'test/bulk-diagnostic'
+(project/'src').mkdir(parents=True)
+(project/'mach.toml').write_text((checkout/'.github/fixtures/bulk-probe.toml').read_text())
+(project/'src/main.mach').write_text((checkout/'.github/fixtures/bulk-probe.mach').read_text())
+pull = subprocess.run([str(compiler_a), 'dep', 'pull', str(project)], cwd=root, capture_output=True)
+(evidence/'diagnostic-dep-pull.log').write_bytes(pull.stdout+pull.stderr)
+if pull.returncode:
+    raise RuntimeError('diagnostic dependency pull failed')
+for profile in ['debug', 'release']:
+    built = invoke('A-overlap-'+profile+'-build', [str(compiler_a), 'build', str(project), '--profile', profile, '-o', 'bin/probe'])
+    if built.returncode:
+        raise RuntimeError('A overlap diagnostic did not build')
+    invoke('A-overlap-'+profile+'-run', [str(project/'bin/probe')], timeout=30)
+for option in ['--version', '--help']:
+    invoke('B-'+option[2:], [str(compiler), option], timeout=30)
 compiler_c = root / 'C'
 result = invoke('B-to-C', [str(compiler), 'build', str(root), '-o', 'C'])
 if result.returncode:
-    raise RuntimeError('B-to-C failed')
+    invoke('B-gdb', ['gdb', '-q', '-batch', '-ex', 'run', '-ex', 'thread apply all bt', '-ex', 'info registers', '-ex', 'x/20i $pc-40', '--args', str(compiler), 'build', str(root), '-o', 'C'])
+    raise RuntimeError('B-to-C failed: '+str(result.returncode))
 import hashlib
 identities = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in [compiler, compiler_c]}
 (evidence/'fixpoint.json').write_text(json.dumps(identities, indent=2)+'\n')
