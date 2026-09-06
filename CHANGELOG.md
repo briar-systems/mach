@@ -135,6 +135,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 - Deferred gate and generic type probes keep their incomplete outcome, and identifiers already rejected by resolution retain their source error. Actual allocation failures and unvisited committed bindings remain internal errors (#3115, #3130).
 
 - Manifests own one synthesized native target across repeated resolutions and release it on destruction. Early parse failures also release recorded deprecated keys (#3116).
+- Reclaim vector scalarization maps and lane work after each function while retaining emitted operands in IR-owned storage.
+
 - Loop-invariant motion and scalar replacement reclaim analysis and rewrite plans after each function or transformation round, while emitted IR operands retain module ownership (#2299).
 
 - Optimization releases mem2reg, constant-folding, algebraic, common-subexpression and dead-code work tables after each function, and verifier scratch after each check, instead of retaining them in the lowered IR arena (#2299).
