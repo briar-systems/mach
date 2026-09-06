@@ -67,11 +67,14 @@ implementation = evidence / 'compiler-wrapper.py'
 census_source = pathlib.Path(__file__).read_text().split('def census(name):',1)[1].split('\n\ndef invoke',1)[0]
 implementation.write_text('import pathlib, subprocess, sys, os, json\nroot=pathlib.Path('+repr(str(root))+')\nevidence=pathlib.Path('+repr(str(evidence))+')\ndef census(name):'+census_source+'\nif len(sys.argv)>1 and sys.argv[1] in ("build","test"):\n    census("corpus-invocation-"+str(len(list(evidence.glob("corpus-invocation-*-census.log")))))\nsys.exit(subprocess.run(['+repr(str(compiler))+']+sys.argv[1:]).returncode)\n')
 wrapper.write_text('#!/usr/bin/env bash\nexec python "'+implementation.as_posix()+'" "$@"\n')
-os.environ['MACH_CORPUS_MACH'] = wrapper.as_posix()
+os.environ['MACH_CORPUS_MACH'] = str(compiler)
 os.environ['MACH_CORPUS_OUT'] = (evidence / 'corpus').as_posix()
 os.environ['CC'] = 'gcc'
 capture = evidence / 'capture-driver.py'
 capture.write_text("import pathlib, sys, shutil\nroot=pathlib.Path("+repr(str(root))+")\nevidence=pathlib.Path("+repr(str(evidence))+")\nsys.path.insert(0, str(root/'test/lib'))\nimport layers, driver\noriginal=layers.layer_b\ndef capture(tools, target, case, path, golden_path, bless):\n    assert not bless\n    result=original(tools,target,case,path,golden_path,bless)\n    if result[1] is not None:\n        out=evidence/'decoded'/target.name/(case+'.dis')\n        out.parent.mkdir(parents=True, exist_ok=True)\n        out.write_text(result[1], encoding='utf-8', newline='\\n')\n        shutil.copy2(path, out.with_suffix('.obj'))\n    return result\nlayers.layer_b=capture\nsys.exit(driver.main(sys.argv[1:]))\n")
+capture_source = capture.read_text()
+guarded = 'import subprocess, os, json\ncompiler='+repr(str(compiler))+'\ndef census(name):'+census_source+'\noriginal_run=subprocess.run\ndef guarded_run(command, *args, **kwargs):\n    if isinstance(command, (list, tuple)) and len(command)>1 and os.path.normcase(os.path.abspath(str(command[0]))) == os.path.normcase(os.path.abspath(compiler)) and command[1] in ("build", "test"):\n        census("corpus-invocation-"+str(len(list(evidence.glob("corpus-invocation-*-census.log")))))\n    return original_run(command, *args, **kwargs)\nsubprocess.run=guarded_run\n'
+capture.write_text(capture_source.replace('original=layers.layer_b\n', guarded+'original=layers.layer_b\n'))
 cases = ['call/call_mixed', 'vec/vec_f32x2', 'vec/vec_i16x4']
 arguments = []
 for case in cases: arguments += ['--case', case]
