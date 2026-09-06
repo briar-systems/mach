@@ -133,6 +133,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 - Manifests own one synthesized native target across repeated resolutions and release it on destruction. Early parse failures also release recorded deprecated keys (#3116).
 
 - Code generation releases each module's MIR, register-allocation, encoding and debug scratch after preserving its completed object image, instead of retaining scratch across the worker batch (#2299).
+- Mach-O executables describe embedded DWARF as file-only data with no memory protection and no relocation, allowing native dyld to load debug builds (#3202).
+
 - The frame-location link oracle checks every DWARF description sharing a machine range, preventing false failures for backed variables (#3197).
 - Two union-loader fixtures exercise the selected native semantic projection while preserving all six target tuples, transitive reachability masks, and errors in unreachable foreign branches (#3193).
 - Build steps normalize native output roots, snapshots, and declared staging paths before comparison, preserving contained Windows drive and UNC outputs. Absolute output templates retain their leading-marker requirement, and directory declarations use native component boundaries (#3195).
