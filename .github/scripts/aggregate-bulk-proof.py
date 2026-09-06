@@ -6,6 +6,7 @@ import subprocess
 import sys
 import os
 import signal
+import hashlib
 
 checkout = pathlib.Path(__file__).resolve().parents[2]
 baseline = '18f2eb6b4884b1ce5e244c5b0091813194b3b10b'
@@ -21,6 +22,7 @@ originals = {path: (root / path).read_bytes() for path in paths}
 compiler_a = root / ('A.exe' if sys.platform == 'win32' else 'A')
 compiler = root / ('B.exe' if sys.platform == 'win32' else 'B')
 results = []
+pristine_test_artifacts = {}
 
 
 def census(name):
@@ -57,6 +59,23 @@ def invoke(name, command, timeout=600):
 
 
 def test(name, selected, count, mutation=False, exit_code=None, profile='debug'):
+    if not mutation and profile in pristine_test_artifacts:
+        binary, digest, registry = pristine_test_artifacts[profile]
+        assert hashlib.sha256(binary.read_bytes()).hexdigest() == digest
+        cases = [case for case in registry if selected in case['label']]
+        assert len(cases) == count, (selected, cases)
+        assert len({case['index'] for case in cases}) == count
+        exits = []
+        for case in cases:
+            result = invoke(name+'-index-'+str(case['index']), [str(binary), str(case['index'])], timeout=30)
+            exits.append(result.returncode)
+        passed = sum(code == 0 for code in exits)
+        record = dict(name=name, mode='artifact-runtime', counts=[passed, count-passed, count],
+                      exits=exits, cases=cases, binary=str(binary), sha256=digest, verified=passed == count)
+        results.append(record)
+        (evidence / 'results.json').write_text(json.dumps(results, indent=2)+'\n')
+        print(json.dumps(record), flush=True)
+        return record['verified']
     result = invoke(name, [str(compiler), 'test', '.', '--filter', selected, '--profile', profile])
     output = result.stdout.decode(errors='replace')
     matches = re.findall(r'(\d+) passed, (\d+) failed, (\d+) total', output)
@@ -68,6 +87,19 @@ def test(name, selected, count, mutation=False, exit_code=None, profile='debug')
     results.append(record)
     (evidence / 'results.json').write_text(json.dumps(results, indent=2) + '\n', encoding='utf-8')
     print(json.dumps(record), flush=True)
+    if verified and not mutation:
+        binaries = list(root.glob('out/*/'+profile+'/test/mach'))
+        assert len(binaries) == 1, binaries
+        binary = binaries[0]
+        listed = invoke('registry-'+profile, [str(compiler), 'test', '.', '--list', '--format', 'json', '--profile', profile])
+        if listed.returncode:
+            raise RuntimeError('test registry collection failed')
+        registry = [json.loads(line) for line in listed.stdout.decode().splitlines() if line.startswith('{')]
+        registry = [case for case in registry if case.get('event') == 'case']
+        assert registry and len([case for case in registry if selected in case['label']]) == count
+        digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+        pristine_test_artifacts[profile] = binary, digest, registry
+        (evidence / ('test-artifact-'+profile+'.json')).write_text(json.dumps(dict(binary=str(binary), sha256=digest, cases=registry), indent=2)+'\n')
     return verified
 
 
