@@ -128,7 +128,7 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 ### Fixed
 
-- Build steps compare normalized native output roots, preserving contained Windows drive and UNC paths while retaining canonical manifest paths and escape rejection (#3195).
+- Build steps normalize native output roots, snapshots, and declared staging paths before comparison, preserving contained Windows drive and UNC outputs. Absolute output templates retain their leading-marker requirement, and directory declarations use native component boundaries (#3195).
 
 - Windows and Darwin corpus disassemblies now reflect the audited aggregate and vector ABI, scratch-register preservation, canonical boolean, trapping remainder, inline, vector-loop and Darwin x18 fixes. All 77 updates were independently decoded and reviewed against native C-reference results (#3179).
 
