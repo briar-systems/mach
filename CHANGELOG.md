@@ -209,6 +209,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 #### Driver and build
 
+- Planner template lookups borrow successful artifact outputs, release diagnostic scratch, and preserve allocation failures (#3208).
+
 - Initialization reports rollback and cleanup failures and retains its recovery journal until every required operation succeeds (#3174).
 - `mach run` validates artifact execution through the native command boundary, allowing Windows executables while retaining Unix execute-permission and native image rejection (#3184).
 
