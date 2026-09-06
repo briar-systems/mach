@@ -136,6 +136,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 #### Language and frontend
 
+- Oversized vector diagnostics allocate one owned message and preserve allocation failure instead of overwriting the first formatting result (#3204).
+
 - Frontend phases carry explicit accepted, rejected and internal outcomes. Recoverable syntax errors retain their AST without claiming acceptance, and allocation failures in diagnostics, type interning and generic substitution remain internal even after a user error. Build classification no longer infers failure kinds from diagnostic counts (#3115, #3130).
 - `?` on a temporary (a call result, literal, cast, operator result, array, record or vector literal, or a field or element of one) is refused, naming the operand kind. It used to compile to a pointer into dead stack.
 - A whole record or array declassified with `:>T` or `:^T` reached the middle end as an aggregate strip and was refused.
