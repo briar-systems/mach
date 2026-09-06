@@ -3,7 +3,6 @@ import json
 import os
 import pathlib
 import re
-import resource
 import shutil
 import signal
 import struct
@@ -89,13 +88,12 @@ def timed(name, command, cwd, timeout=600):
     census(name)
     rss = {'VmRSS_kib': 0, 'RssAnon_kib': 0, 'RssFile_kib': 0, 'samples': 0}
     mem = int(re.search(r'MemTotal:\s+(\d+)', pathlib.Path('/proc/meminfo').read_text())[1]) * 1024
-    limit = min(5 * 1024**3, mem * 3 // 5)
-    def set_limit():
-        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+    limit = min(8 * 1024**3, mem * 3 // 5)
+    guard = {"resident_budget_exceeded": False}
     log = EVIDENCE / (name + '.log')
     started = time.monotonic()
     with log.open('wb') as out:
-        process = subprocess.Popen(['/usr/bin/time', '-f', '%M\t%e\t%U\t%S\t%x', '-o', str(EVIDENCE / (name + '.time')), *command], cwd=cwd, stdout=out, stderr=subprocess.STDOUT, start_new_session=True, preexec_fn=set_limit)
+        process = subprocess.Popen(['/usr/bin/time', '-f', '%M\t%e\t%U\t%S\t%x', '-o', str(EVIDENCE / (name + '.time')), *command], cwd=cwd, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
         done = threading.Event()
         def sample():
             while not done.wait(0.02):
@@ -108,6 +106,11 @@ def timed(name, command, cwd, timeout=600):
                             if match:
                                 rss[field + '_kib'] = max(rss[field + '_kib'], int(match[1]))
                         rss['samples'] += 1
+                        available = int(re.search(r'MemAvailable:\s+(\d+)', pathlib.Path('/proc/meminfo').read_text())[1]) * 1024
+                        if rss['VmRSS_kib'] * 1024 > limit or available < 2 * 1024**3:
+                            guard['resident_budget_exceeded'] = True
+                            os.killpg(process.pid, signal.SIGKILL)
+                            return
                 except (OSError, ProcessLookupError):
                     pass
         thread = threading.Thread(target=sample)
@@ -123,7 +126,7 @@ def timed(name, command, cwd, timeout=600):
             thread.join()
     fields = (EVIDENCE / (name + '.time')).read_text().strip().splitlines() if (EVIDENCE / (name + '.time')).exists() else []
     values = fields[-1].split('\t') if fields else []
-    record = {'name': name, 'command': command, 'exit': code, 'elapsed_s': time.monotonic()-started, 'address_space_limit_bytes': limit, 'sampled': rss}
+    record = {'name': name, 'command': command, 'exit': code, 'elapsed_s': time.monotonic()-started, 'resident_memory_limit_bytes': limit, 'sampled': rss, **guard}
     if len(values) == 5:
         record.update(peak_rss_kib=int(values[0]), wall_s=float(values[1]), user_s=float(values[2]), system_s=float(values[3]), timed_exit=int(values[4]))
     RESULTS.append(record)
@@ -192,6 +195,8 @@ pub fun bench_main(x: i64) i64 {{
 
 
 def main():
+    shutil.copyfile(__file__, EVIDENCE / 'generator-and-runner.py')
+    (EVIDENCE / 'method.txt').write_text('Cold means project output artifacts are removed before each compiler process. OS file cache is not flushed. One measurement per cell, no statistical confidence interval. GNU time measures compiler RSS. The external sampler does not instrument Mach allocation or phase boundaries.\n')
     assert os.environ['SEED_TAG'] == 'v4.26.5'
     run(['git', 'worktree', 'add', '--detach', str(ROOT), SOURCE])
     run(['git', 'submodule', 'update', '--init', 'dep/std'], ROOT)
