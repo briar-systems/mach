@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 root = pathlib.Path(__file__).resolve().parents[2]
-baseline = "3336e104af85deffe22aa8baf2ac3fb0b5f3c46a"
+baseline = "65d2affed4738cb658ed04033e2912a856f23493"
 pin = "3ee8e709a8ed7baff6e93780ce9b3582a907a91f"
 evidence = root / "outcome-repair-evidence"
 evidence.mkdir(exist_ok=True)
