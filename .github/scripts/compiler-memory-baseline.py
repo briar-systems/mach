@@ -205,10 +205,10 @@ def main():
     seed = shutil.which('mach')
     if seed is None:
         raise RuntimeError('published seed absent')
-    (EVIDENCE / 'provenance.json').write_text(json.dumps({'source': SOURCE, 'std': STD, 'seed_tag': os.environ['SEED_TAG'], 'seed_sha256': hashlib.sha256(pathlib.Path(seed).read_bytes()).hexdigest(), 'instrumentation': 'none in compiler source', 'gnu_time': run(['/usr/bin/time', '--version']), 'host': run(['uname', '-a']), 'cpu': pathlib.Path('/proc/cpuinfo').read_text(), 'memory': pathlib.Path('/proc/meminfo').read_text()}, indent=2))
-    timed('seed-to-A', [seed, 'build', '.', '--profile', 'release', '-o', 'A'], ROOT, 900)
+    (EVIDENCE / 'provenance.json').write_text(json.dumps({'source': SOURCE, 'std': STD, 'seed_tag': os.environ['SEED_TAG'], 'seed_sha256': hashlib.sha256(pathlib.Path(seed).read_bytes()).hexdigest(), 'instrumentation': 'none in compiler source', 'compiler_build_profile': 'debug: opt0, debug=false' , 'gnu_time': run(['/usr/bin/time', '--version']), 'host': run(['uname', '-a']), 'cpu': pathlib.Path('/proc/cpuinfo').read_text(), 'memory': pathlib.Path('/proc/meminfo').read_text()}, indent=2))
+    timed('seed-to-A', [seed, 'build', '.', '--profile', 'debug', '-o', 'A'], ROOT, 900)
     compiler = ROOT / 'B'
-    timed('A-to-B', [str(ROOT/'A'), 'build', '.', '--profile', 'release', '-o', 'B'], ROOT, 900)
+    timed('A-to-B', [str(ROOT/'A'), 'build', '.', '--profile', 'debug', '-o', 'B'], ROOT, 900)
     (EVIDENCE / 'compiler-sha256.txt').write_text(hashlib.sha256(compiler.read_bytes()).hexdigest()+'\n')
     projects = EVIDENCE / 'projects'
     for family, sizes in [('modules', (10,50,150)), ('dense', (10,50,150)), ('aggregate', (4096,16384,65536))]:
