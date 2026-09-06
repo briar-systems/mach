@@ -27,7 +27,7 @@ run(['llvm-objdump', '--version'], 'objdump-version.txt')
 manifest = case / 'mach.toml'
 original = manifest.read_bytes()
 try:
-    manifest.write_text(original.decode().replace('ref = "branch/main"', 'ref = "565f40abf76275e149eb9ce43ad950fdd992fd20"'))
+    manifest.write_text(original.decode().replace('ref = "branch/main"', 'ref = "commit/565f40abf76275e149eb9ce43ad950fdd992fd20"'))
     run([str(compiler), 'dep', 'pull'], 'fixture-deps.txt', case)
     run(['git', '-C', str(case / 'dep/std'), 'rev-parse', 'HEAD'], 'fixture-std.txt')
     for target in ['x86_64-linux', 'aarch64-linux', 'riscv64-linux']:
