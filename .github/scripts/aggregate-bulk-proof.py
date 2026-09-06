@@ -8,7 +8,7 @@ import os
 import signal
 
 checkout = pathlib.Path(__file__).resolve().parents[2]
-baseline = 'a17fb73cdc03115cef8d3bc34dd3ff45c7015ae6'
+baseline = 'a67c4b9b4b20027653fb2d4802517e90547b19cf'
 root = checkout / '.wt' / 'source'
 evidence = checkout / 'bulk-evidence'
 evidence.mkdir(exist_ok=True)
@@ -95,6 +95,8 @@ if len(set(identities.values())) != 1:
 for profile in ['debug', 'release']:
     if not test('bulk-'+profile, 'mach.lang.be.codegen.mir.bulk:', 3, profile=profile):
         raise RuntimeError('bulk focused baseline failed')
+    if not test('argument-staging-'+profile, 'mach.lang.be.codegen.mir.abi:owned_argument_', 2, profile=profile):
+        raise RuntimeError('argument staging baseline failed')
 project = root / 'test/bulk-probe'
 (project/'src').mkdir(parents=True)
 (project/'mach.toml').write_text((checkout/'.github/fixtures/bulk-probe.toml').read_text())
