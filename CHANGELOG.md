@@ -130,6 +130,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 ### Fixed
 
+- Manifests own one synthesized native target across repeated resolutions and release it on destruction. Early parse failures also release recorded deprecated keys (#3116).
+
 - The frame-location link oracle checks every DWARF description sharing a machine range, preventing false failures for backed variables (#3197).
 - Two union-loader fixtures exercise the selected native semantic projection while preserving all six target tuples, transitive reachability masks, and errors in unreachable foreign branches (#3193).
 - Build steps normalize native output roots, snapshots, and declared staging paths before comparison, preserving contained Windows drive and UNC outputs. Absolute output templates retain their leading-marker requirement, and directory declarations use native component boundaries (#3195).
