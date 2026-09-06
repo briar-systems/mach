@@ -148,6 +148,7 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 #### Language and frontend
 
 - Oversized vector diagnostics allocate one owned message and preserve allocation failure instead of overwriting the first formatting result (#3204).
+- Embed containment checks preserve allocation and I/O failures as internal phase errors, release temporary paths, and pass canonical relative paths to the filesystem boundary on Windows (#3209).
 
 - Frontend phases carry explicit accepted, rejected and internal outcomes. Recoverable syntax errors retain their AST without claiming acceptance, and allocation failures in diagnostics, type interning and generic substitution remain internal even after a user error. Build classification no longer infers failure kinds from diagnostic counts (#3115, #3130).
 - `?` on a temporary (a call result, literal, cast, operator result, array, record or vector literal, or a field or element of one) is refused, naming the operand kind. It used to compile to a pointer into dead stack.
@@ -221,6 +222,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 - Object images are validated at every publication boundary, and a parser that fails publishes nothing.
 
 #### Driver and build
+
+- Planner template lookups borrow successful artifact outputs, release diagnostic scratch, and preserve allocation failures (#3208).
 
 - Initialization reports rollback and cleanup failures and retains its recovery journal until every required operation succeeds (#3174).
 - `mach run` validates artifact execution through the native command boundary, allowing Windows executables while retaining Unix execute-permission and native image rejection (#3184).
