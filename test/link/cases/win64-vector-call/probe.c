@@ -111,3 +111,16 @@ __declspec(noinline) __m64 carrier_float_stack(long long a, long long b, long lo
     if (a + b + c + d != 10) ((unsigned char *)&v)[0] ^= 1;
     return v;
 }
+
+__declspec(noinline) long long carrier_capture_guard_20(carrier_fn20 f) {
+    _Alignas(16) unsigned char decoy[32];
+    _Alignas(16) carrier20 value;
+    union { void *pointer; unsigned char bytes[8]; } address;
+    address.pointer = decoy;
+    for (unsigned i = 0; i < 32; ++i) decoy[i] = 0xcc;
+    for (unsigned i = 0; i < 20; ++i) value.bytes[i] = (unsigned char)(i + 1);
+    for (unsigned i = 0; i < 8; ++i) value.bytes[i] = address.bytes[i];
+    carrier20 result = f(value);
+    for (unsigned i = 0; i < 20; ++i) if (result.bytes[i] != value.bytes[i]) return 1;
+    return 0;
+}
