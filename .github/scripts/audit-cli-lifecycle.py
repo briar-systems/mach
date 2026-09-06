@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-SOURCE = '6cbaf12eae5222baa93dba7d9b3b5a1188064e09'
+SOURCE = '80f55672acd5c6aa5f52e313ee8128ff40b91204'
 PIN = 'c6b335ac862f4df392b69f503c4ffb1501d5a451'
 EVIDENCE = ROOT / 'cli-lifecycle-evidence'
 EVIDENCE.mkdir(exist_ok=True)
@@ -165,11 +165,32 @@ if not baseline_ok:
 
 INIT = 'src/cli/cmd/init.mach'
 DEPS = 'src/lang/driver/deps.mach'
-pristine = {p: (ROOT / p).read_bytes() for p in [INIT, DEPS]}
+ENGINE = 'src/lang/build/engine.mach'
+DRIVER_TESTS = 'src/lang/driver/tests.mach'
+pristine = {p: (ROOT / p).read_bytes() for p in [INIT, DEPS, ENGINE, DRIVER_TESTS]}
 
 def restore():
     for path, content in pristine.items():
         (ROOT / path).write_bytes(content)
+
+ENGINE_PROBE = '\ntest "mach.lang.build.engine.audit:internal_phase_and_cleanup_failures_remain_distinct" {\n    var alloc: A.Allocator;\n    if (O.is_some[str](page.make(?alloc))) { ret 1; }\n    val sr: R.Result[session.Session, str] = session.init(?alloc);\n    if (R.is_err[session.Session, str](sr)) { ret 2; }\n    var s: session.Session = R.unwrap_ok[session.Session, str](sr);\n    fin { session.dnit(?s); }\n    if (R.is_err[R.Void, str](driver.setup_registry(?s.registry))) { ret 3; }\n    var names: [1]str = [1]str{"main.mach"};\n    var texts: [1]str;\n    texts[0] = ut_cc3(?alloc, "#[symbol(\\"", ut_entry_symbol(), "\\")]\\nfun start() i32 { ret 0; }\\n");\n    val root_r: R.Result[str, str] = ut_scaffold_m(?alloc, ut_manifest_notargets(), ?names[0], ?texts[0], 1);\n    if (R.is_err[str, str](root_r)) { ret 4; }\n    val root: str = R.unwrap_ok[str, str](root_r);\n    fin { fs.remove_all(?alloc, root); }\n    val manifest_r: R.Result[manifest.Manifest, str] = driver.load_manifest(?s, root);\n    if (R.is_err[manifest.Manifest, str](manifest_r)) { ret 5; }\n    var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](manifest_r);\n    var req: request.BuildRequest = request.defaults();\n    req.project_root = root;\n    val planned: R.Result[bplan.BuildPlan, outcome.Fail] = bplan.plan(?alloc, ?s.interner, ?s.registry, ?m, req);\n    if (R.is_err[bplan.BuildPlan, outcome.Fail](planned)) { ret 6; }\n    var bp: bplan.BuildPlan = R.unwrap_ok[bplan.BuildPlan, outcome.Fail](planned);\n    val result: R.Result[outcome.BuildOutcome, outcome.Fail] = bengine.execute_warm(?bp, 0, ?s, ?alloc, nil);\n    if (R.is_err[outcome.BuildOutcome, outcome.Fail](result)) { ret 7; }\n    var bo: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](result);\n    fin { outcome.outcome_dnit(?bo); }\n    if (bo.artifacts.len != 0) { ret 8; }\n    if (bo.severity != outcome.BUILD_INTERNAL) { ret 9; }\n    var primary: usize = 0;\n    var cleanup: usize = 0;\n    var i: usize = 0;\n    for (i < bo.events.len) {\n        val event: *outcome.BuildEvent = ?bo.events.data[i];\n        if (event.kind == outcome.BUILD_EVENT_FAIL) {\n            if (event.data.fail.kind == outcome.FAIL_INTERNAL\n                && str_equals(event.data.fail.message, "audit internal phase failure")) { primary = primary + 1; }\n            or (event.data.fail.kind == outcome.FAIL_ENVIRONMENT\n                && str_contains(event.data.fail.message, "publication cleanup: ")) { cleanup = cleanup + 1; }\n            or { ret 11; }\n        }\n        i = i + 1;\n    }\n    if (primary != 1 || cleanup != 1) { ret 10; }\n    ret 0;\n}\n'
+
+def engine_probe(kind):
+    restore()
+    fixture = ENGINE_PROBE
+    if kind == 'INVALID':
+        fixture = fixture.replace('event.data.fail.kind == outcome.FAIL_ENVIRONMENT', 'event.data.fail.kind == outcome.FAIL_INTERNAL')
+    with (ROOT / DRIVER_TESTS).open('a', encoding='utf-8', newline='') as file:
+        file.write(fixture)
+    replace_once(ENGINE,
+                 'if (R.is_ok[R.Void, outcome.Fail](result)) { result = codegen_phase(p, st, ev); }',
+                 'if (R.is_ok[R.Void, outcome.Fail](result)) { result = R.err[R.Void, outcome.Fail](outcome.internal("audit internal phase failure")); }')
+    replace_once(ENGINE,
+                 '    ret publication.plan_dnit(?st.outputs);',
+                 '    val actual: O.Option[txn.Error] = publication.plan_dnit(?st.outputs);\n'
+                 '    if (O.is_some[txn.Error](actual)) { ret actual; }\n'
+                 '    ret O.some[txn.Error](txn.error(txn.' + kind + ', txn.OP_ABORT));')
+
 
 try:
     mutate('missing-original-refusal-removed', INIT,
@@ -199,6 +220,28 @@ try:
            'var args: [6]str = [6]str{"ls-files", "--cached", "-z", "--", REALIZE_DEP_DIR, ".gitmodules"};',
            'mach.lang.driver.deps.txn:rollback_preserves_conflict_stages_and_binary_path_records', 12,
            'malformed index info')
+    engine_filter = 'mach.lang.build.engine.audit:internal_phase_and_cleanup_failures_remain_distinct'
+    engine_probe('IO')
+    if not test(COMPILERS['debug'], 'debug', 'engine-primary-plus-io-cleanup', engine_filter, 1):
+        raise RuntimeError('engine combined failure probe failed')
+    current = (ROOT / ENGINE).read_text(encoding='utf-8')
+    old = run(['git', 'show', '5aa3f091:' + ENGINE]).stdout.decode().replace('\r\n', '\n')
+    begin = '    var event_error: str = nil;'
+    end = '    if (event_error == nil) {'
+    left = current.index(begin, current.index('pub fun execute_warm('))
+    right = current.index(end, left)
+    old_left = old.index('    if (O.is_some[txn.Error](released)) {', old.index('pub fun execute_warm('))
+    old_right = old.index(end, old_left)
+    replace_once(ENGINE, current[left:right], old[old_left:old_right])
+    if not test(COMPILERS['debug'], 'debug', 'old-engine-cleanup-overwrites-primary', engine_filter, 1, 9):
+        raise RuntimeError('old engine event policy did not fail with internal-severity loss')
+    engine_probe('INVALID')
+    if not test(COMPILERS['debug'], 'debug', 'engine-invalid-cleanup-is-internal', engine_filter, 1):
+        raise RuntimeError('engine invalid cleanup probe failed')
+    replace_once(ENGINE, '        if (error.kind == txn.INVALID) { cleanup = outcome.internal(detail); }\n', '')
+    if not test(COMPILERS['debug'], 'debug', 'engine-invalid-cleanup-misclassified', engine_filter, 1, 11):
+        raise RuntimeError('invalid cleanup mutation did not fail at event-kind guard')
+
 finally:
     restore()
     check_source()
