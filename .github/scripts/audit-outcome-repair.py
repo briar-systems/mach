@@ -42,7 +42,10 @@ def invoke(name, command, timeout=1800):
     return result.returncode, log
 
 def test(name, selected, count=1, child=0):
-    rc, log = invoke(name, [str(compiler), "test", str(root), "--filter", selected, "--profile", profile])
+    command = [str(compiler), "test", str(root), "--profile", profile]
+    if selected:
+        command.extend(["--filter", selected])
+    rc, log = invoke(name, command)
     counts = re.findall(r"(\d+) passed, (\d+) failed, (\d+) total", log)
     counts = list(map(int, counts[-1])) if counts else None
     exits = re.findall(r"\(exit ([^)]+)\)", log)
