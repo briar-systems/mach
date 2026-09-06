@@ -46,7 +46,7 @@ fixture = root / 'src/lang/be/codegen/stack_probe_runtime.mach'
 original = fixture.read_bytes()
 diagnostic = """
 $if ($mach.build.arch == $mach.arch.x86_64 && $mach.build.os == $mach.os.windows) {
-    test "mach.lang.be.codegen.stack_probe_runtime:observe_frame_bytes" {
+    test "mach.lang.be.codegen.audit.frame_geometry_bytes" {
         val bare: fun(i32) i32 = bare_page_recurse;
         val multi: fun(i32) i32 = page_multiple_recurse;
         val b: usize = bare::usize;
@@ -57,36 +57,58 @@ $if ($mach.build.arch == $mach.arch.x86_64 && $mach.build.os == $mach.os.windows
             p.printlnf("multi[{}]={:02x}", i, @((m + i)::*u8));
             i = i + 1;
         }
-        ret 9;
+        ret 0;
     }
 }
 """
-(evidence / 'diagnostic-fixture.mach').write_bytes(b'use p: std.print;\n'+original+diagnostic.encode())
+candidate = (checkout / '.github/fixtures/stack-probe-runtime.mach').read_bytes()
+assert candidate.count(b'#[volatile]') == 2
+(evidence / 'candidate-fixture.mach').write_bytes(candidate)
+(evidence / 'original-fixture.mach').write_bytes(original)
 results = []
+def run_cases(name, compiler, profile, body, expected, expected_exits):
+    fixture.write_bytes(b'use p: std.print;\n'+body+diagnostic.encode())
+    rc, output = invoke(name, [str(compiler), 'test', '.', '--profile', profile, '--filter', 'mach.lang.be.codegen.stack_probe_runtime'])
+    counts = re.findall(r'(\d+) passed, (\d+) failed, (\d+) total', output)
+    counts = list(map(int, counts[0])) if len(counts) == 1 else None
+    exits = set(re.findall(r'\(exit ([^)]+)\)', output))
+    record = dict(name=name, counts=counts, exits=sorted(exits), compiler_exit=rc,
+                  compiler_sha256=hashlib.sha256(compiler.read_bytes()).hexdigest())
+    results.append(record)
+    (evidence / 'results.json').write_text(json.dumps(results, indent=2))
+    assert rc == (1 if expected_exits else 0) and counts == expected and exits == expected_exits, output
+
 for profile in ['debug', 'release']:
     compiler = root / ('mGeometryB'+profile+'.exe')
-    rc, text = invoke('A-to-B-'+profile, [str(compiler_a), 'build', str(root), '--profile', profile, '-o', compiler.name])
-    assert rc == 0, text
+    rc, output = invoke('A-to-B-'+profile, [str(compiler_a), 'build', str(root), '--profile', profile, '-o', compiler.name])
+    assert rc == 0, output
     try:
-        fixture.write_bytes(b'use p: std.print;\n'+original+diagnostic.encode())
-        rc, text = invoke('geometry-'+profile, [str(compiler), 'test', '.', '--profile', profile, '--filter', 'mach.lang.be.codegen.stack_probe_runtime'])
-        counts = re.findall(r'(\d+) passed, (\d+) failed, (\d+) total', text)
-        counts = list(map(int, counts[0])) if len(counts) == 1 else None
-        exits = set(re.findall(r'\(exit ([^)]+)\)', text))
-        expected = [5, 1, 6] if profile == 'debug' else [4, 2, 6]
-        expected_exits = {'9'} if profile == 'debug' else {'2', '9'}
-        record = dict(profile=profile, counts=counts, exits=sorted(exits), expected_diagnostic_exit=9, compiler_sha256=hashlib.sha256(compiler.read_bytes()).hexdigest())
-        results.append(record)
-        (evidence / 'results.json').write_text(json.dumps(results, indent=2))
-        assert rc == 1 and counts == expected and exits == expected_exits, text
-        for label in ['bare', 'multi']:
-            found = re.findall(label+r'\[(\d+)\]=([0-9a-fA-F]{2})', text)
-            values = {int(index): int(byte, 16) for index, byte in found}
-            assert set(values) == set(range(64)), (label, found)
-            (evidence / (profile+'-'+label+'.bin')).write_bytes(bytes(values[index] for index in range(64)))
+        run_cases('geometry-'+profile, compiler, profile, candidate, [5, 0, 5], set())
         binary = root / 'out/windows-x86_64' / profile / 'test/mach-windows'
         assert binary.is_file() and binary.read_bytes()[:2] == b'MZ'
+        digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+        rc, output = invoke('registry-'+profile, [str(compiler), 'test', '.', '--list', '--format', 'json', '--profile', profile])
+        assert rc == 0, output
+        cases = [json.loads(line) for line in output.splitlines() if line.startswith('{')]
+        cases = [case for case in cases if case.get('event') == 'case' and case.get('label') == 'mach.lang.be.codegen.audit.frame_geometry_bytes']
+        assert len(cases) == 1, cases
+        assert hashlib.sha256(binary.read_bytes()).hexdigest() == digest
+        rc, output = invoke('bytes-'+profile, [str(binary), str(cases[0]['index'])])
+        assert rc == 0, output
+        for label, extent in [('bare', 4096), ('multi', 8192)]:
+            found = re.findall(label+r'\[(\d+)\]=([0-9a-fA-F]{2})', output)
+            values = {int(index): int(byte, 16) for index, byte in found}
+            assert len(found) == 64 and set(values) == set(range(64)), (label, found)
+            data = bytes(values[index] for index in range(64))
+            (evidence / (profile+'-'+label+'.bin')).write_bytes(data)
+            assert data[:4] == bytes.fromhex('55 48 89 e5')
+            assert data[4:7] == bytes.fromhex('48 81 ec' if label == 'bare' else '49 c7 c3')
+            assert int.from_bytes(data[7:11], 'little') == extent
         shutil.copy2(binary, evidence / ('test-'+profile+'.exe'))
+        (evidence / ('artifact-'+profile+'.json')).write_text(json.dumps(dict(sha256=digest, diagnostic=cases[0])))
+        if profile == 'release':
+            run_cases('mutant-original-array', compiler, profile, original, [4, 1, 5], {'2'})
+            run_cases('mutant-volatile-storage', compiler, profile, candidate.replace(b'#[volatile]\n', b''), [4, 1, 5], {'2'})
     finally:
         fixture.write_bytes(original)
 assert fixture.read_bytes() == original
