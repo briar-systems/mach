@@ -96,3 +96,13 @@ __declspec(noinline) carrier3 carrier_mixed(long long a, double b, long long c, 
     v.bytes[0] += (unsigned char)(a + (long long)b + c + d);
     return v;
 }
+
+
+typedef __m64 (*carrier_float_fn)(__m64);
+__declspec(noinline) __m64 carrier_float_identity(__m64 v) { return v; }
+__declspec(noinline) carrier_float_fn carrier_float_select(carrier_float_fn f) { return f; }
+__declspec(noinline) __m64 carrier_float_dispatch(carrier_float_fn f, __m64 v) { return f(v); }
+__declspec(noinline) __m64 carrier_float_stack(long long a, long long b, long long c, long long d, __m64 v) {
+    if (a + b + c + d != 10) ((unsigned char *)&v)[0] ^= 1;
+    return v;
+}
