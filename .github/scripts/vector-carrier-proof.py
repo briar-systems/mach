@@ -94,25 +94,40 @@ if sys.platform == 'win32':
     wrapper = evidence / 'compiler-wrapper.sh'
     implementation = evidence / 'compiler-wrapper.py'
     census_source = pathlib.Path(__file__).read_text().split('def census(name):',1)[1].split('\n\ndef invoke',1)[0]
-    implementation.write_text('import pathlib, subprocess, sys, os, json\nroot=pathlib.Path('+repr(str(root))+')\nevidence=pathlib.Path('+repr(str(evidence))+')\ndef census(name):'+census_source+'\nif len(sys.argv)>1 and sys.argv[1] in ("build","test"):\n    census("link-invocation-"+str(len(list(evidence.glob("link-invocation-*-census.log")))))\nos.execv('+repr(str(compiler))+', ['+repr(str(compiler))+']+sys.argv[1:])\n')
+    implementation.write_text('import pathlib, subprocess, sys, os, json\nroot=pathlib.Path('+repr(str(root))+')\nevidence=pathlib.Path('+repr(str(evidence))+')\ndef census(name):'+census_source+'\nif len(sys.argv)>1 and sys.argv[1] in ("build","test"):\n    census("link-invocation-"+str(len(list(evidence.glob("link-invocation-*-census.log")))))\nsys.exit(subprocess.run(['+repr(str(compiler))+']+sys.argv[1:]).returncode)\n')
     wrapper.write_text('#!/usr/bin/env bash\nexec python "'+implementation.as_posix()+'" "$@"\n')
     wrapper.chmod(0o755)
     os.environ['MACH_LINK_MACH'] = wrapper.as_posix()
-    for cc, extra in [('gcc', []), ('clang', ['--case', 'win64-vector-call'])]:
-        os.environ['CC'] = cc
-        os.environ['MACH_LINK_OUT'] = (evidence / ('link-'+cc)).as_posix()
-        identity = subprocess.run([cc, '--version'], capture_output=True, check=True)
-        (evidence / (cc+'-version.txt')).write_bytes(identity.stdout+identity.stderr)
-        result = subprocess.run([cc, '-O1', '-fno-stack-protector', '-S', str(root/'test/link/cases/win64-vector-call/probe.c'), '-o', str(evidence/(cc+'-probe.s'))], capture_output=True)
-        (evidence / (cc+'-probe-build.log')).write_bytes(result.stdout+result.stderr)
-        if result.returncode:
-            raise RuntimeError(cc+' C probe failed')
-        result = invoke('windows-link-'+cc, [bash, str(root/'test/link/run.sh'), '--deps', 'float', '--leg', 'x86_64-windows', *extra], timeout=1200)
-        results.append(dict(name='windows-link-'+cc, compiler_exit=result.returncode, verified=result.returncode==0))
-        (evidence / 'results.json').write_text(json.dumps(results, indent=2)+'\n')
-        if result.returncode:
-            print(result.stdout.decode(errors='replace'), flush=True)
-            raise RuntimeError(cc+' native link baseline failed')
+    fixture = root / 'test/link/cases/win64-vector-call/mach.toml'
+    fixture_original = fixture.read_bytes()
+    try:
+        for cc, extra in [('gcc', []), ('clang', ['--case', 'win64-vector-call'])]:
+            os.environ['CC'] = cc
+            fixture.write_bytes(fixture_original)
+            selected_cc = shutil.which(cc)
+            if selected_cc is None:
+                raise RuntimeError(cc+' missing')
+            if cc == 'clang':
+                source_manifest = fixture_original.decode()
+                anchor = 'argv = ["sh", "../../lib/cc.sh",'
+                assert source_manifest.count(anchor) == 1
+                fixture.write_text(source_manifest.replace(anchor, 'argv = ['+json.dumps(selected_cc)+',', 1))
+            (evidence / (cc+'-fixture-manifest.toml')).write_bytes(fixture.read_bytes())
+            os.environ['MACH_LINK_OUT'] = (evidence / ('link-'+cc)).as_posix()
+            identity = subprocess.run([cc, '--version'], capture_output=True, check=True)
+            (evidence / (cc+'-version.txt')).write_bytes(identity.stdout+identity.stderr)
+            result = subprocess.run([cc, '-O1', '-fno-stack-protector', '-S', str(root/'test/link/cases/win64-vector-call/probe.c'), '-o', str(evidence/(cc+'-probe.s'))], capture_output=True)
+            (evidence / (cc+'-probe-build.log')).write_bytes(result.stdout+result.stderr)
+            if result.returncode:
+                raise RuntimeError(cc+' C probe failed')
+            result = invoke('windows-link-'+cc, [bash, str(root/'test/link/run.sh'), '--deps', 'float', '--leg', 'x86_64-windows', *extra], timeout=1200)
+            results.append(dict(name='windows-link-'+cc, compiler_exit=result.returncode, verified=result.returncode==0))
+            (evidence / 'results.json').write_text(json.dumps(results, indent=2)+'\n')
+            if result.returncode:
+                print(result.stdout.decode(errors='replace'), flush=True)
+                raise RuntimeError(cc+' native link baseline failed')
+    finally:
+        fixture.write_bytes(fixture_original)
 for path in paths:
     assert (root/path).read_bytes() == originals[path]
 (evidence / 'complete.txt').write_text('Native focused baselines and selected link cells passed. Production source restored.\n')
