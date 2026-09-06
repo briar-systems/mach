@@ -36,6 +36,7 @@ use mach.lang.driver.project;
 use mach.lang.driver.load;
 use txn_fs: std.filesystem.transaction;
 use std.print;
+use std.system.os;
 
 rec GitInspector {
     program: str;
@@ -1947,7 +1948,6 @@ pub fun staged_paths(s: *session.Session, root: str, rel: str) R.Result[str, str
     args[0] = "ls-files"; args[1] = "--stage"; args[2] = "--"; args[3] = rel;
     val q: R.Result[str, str] = git_query_raw(s.build_alloc, ?gi, root, ?args[0], 4);
     git_inspector_dnit(s.build_alloc, ?gi);
-    if (R.is_err[str, str](q)) { ret R.ok[str, str](""); }
     ret q;
 }
 
@@ -2270,10 +2270,13 @@ pub fun stage_dependency(s: *session.Session, root: str, id: str) R.Result[R.Voi
 }
 
 pub rec DepTxn {
+    address:       usize;
+    live:          bool;
     root:          str;
     mode:          u8;
     manifest_path: str;
     manifest_pre:  str;
+    manifest_had:  bool;
     gm_path:       str;
     gm_pre:        str;
     gm_had:        bool;
@@ -2307,100 +2310,102 @@ fun txn_index_snapshot(s: *session.Session, root: str) R.Result[str, str] {
     args[3] = REALIZE_DEP_DIR; args[4] = ".gitmodules"; args[5] = "";
     val q: R.Result[str, str] = git_query_raw(s.build_alloc, ?gi, root, ?args[0], 5);
     git_inspector_dnit(s.build_alloc, ?gi);
-    if (R.is_err[str, str](q)) { ret R.ok[str, str](""); }
     ret q;
 }
 
-fun txn_read_or_empty(alloc: *A.Allocator, p: str, had: *bool) str {
-    @had = fs.exists(p);
-    if (!had[0]) { ret ""; }
-    val r: R.Result[str, str] = fs.read_string(alloc, p);
-    if (R.is_err[str, str](r)) { ret ""; }
-    ret R.unwrap_ok[str, str](r);
+fun txn_read_snapshot(alloc: *A.Allocator, p: str, had: *bool) R.Result[str, str] {
+    @had = false;
+    var st: os.stat_t;
+    val checked: i64 = os.stat_path(os.AT_FDCWD, p, ?st, os.AT_SYMLINK_NOFOLLOW);
+    if (checked == os.ENOENT) { ret R.ok[str, str](nil); }
+    if (checked < 0) { ret R.err[str, str](os.message(checked)); }
+    val read: R.Result[str, str] = fs.read_string(alloc, p);
+    if (R.is_err[str, str](read)) { ret read; }
+    @had = true;
+    ret read;
 }
 
-pub fun txn_begin(s: *session.Session, root: str, mode: u8, label: str) R.Result[DepTxn, str] {
-    var t: DepTxn;
+pub fun txn_begin(t: *DepTxn, s: *session.Session, root: str, mode: u8, label: str) R.Result[R.Void, str] {
+    if (t == nil || (t.address != 0 && (t.address != t::usize || t.live))) {
+        ret R.err[R.Void, str]("dependency transaction requires final caller-owned storage");
+    }
+    t.address = t::usize;
+    t.live = true;
     t.root = root;
     t.mode = mode;
-    t.manifest_pre = "";
-    t.gm_pre = "";
+    t.manifest_path = nil;
+    t.manifest_pre = nil;
+    t.manifest_had = false;
+    t.gm_path = nil;
+    t.gm_pre = nil;
     t.gm_had = false;
-    t.index_pre = "";
+    t.index_pre = nil;
+    t.dirs_pre = vector.init[str](s.build_alloc);
+    var ready: bool = false;
+    fin { if (!ready) { txn_free(s, t); } }
 
-    # the claim is an advisory lock rather than a lock FILE, so a mach process
-    # that dies mid-mutation releases it at exit and the next writer simply
-    # proceeds. that is what makes a crashed transaction distinguishable from a
-    # live one, and it is why there is no longer anything for a user to remove
-    # by hand.
     val gitdir_r: R.Result[str, str] = git_dir_of(s, root);
-    if (R.is_err[str, str](gitdir_r)) { ret R.err[DepTxn, str](R.unwrap_err[str, str](gitdir_r)); }
+    if (R.is_err[str, str](gitdir_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](gitdir_r)); }
     val gitdir: str = R.unwrap_ok[str, str](gitdir_r);
-    val root_r: R.Result[txn_fs.Root, txn_fs.Error] = txn_fs.root_open(gitdir, "");
+    val root_r: O.Option[txn_fs.Error] = txn_fs.root_open(?t.root_cap, gitdir, "");
     str_free(s.build_alloc, gitdir);
-    if (R.is_err[txn_fs.Root, txn_fs.Error](root_r)) {
-        ret R.err[DepTxn, str](txn_fs.error_message(R.unwrap_err[txn_fs.Root, txn_fs.Error](root_r)));
+    if (O.is_some[txn_fs.Error](root_r)) {
+        ret R.err[R.Void, str](txn_fs.error_message(O.unwrap[txn_fs.Error](root_r)));
     }
-    t.root_cap = R.unwrap_ok[txn_fs.Root, txn_fs.Error](root_r);
-
-    val guard_r: R.Result[txn_fs.Lock, txn_fs.Error] = txn_fs.lock(?t.root_cap);
-    if (R.is_err[txn_fs.Lock, txn_fs.Error](guard_r)) {
-        txn_fs.root_dnit(?t.root_cap);
-        val e: txn_fs.Error = R.unwrap_err[txn_fs.Lock, txn_fs.Error](guard_r);
+    val guard_r: O.Option[txn_fs.Error] = txn_fs.lock(?t.guard, ?t.root_cap);
+    if (O.is_some[txn_fs.Error](guard_r)) {
+        val e: txn_fs.Error = O.unwrap[txn_fs.Error](guard_r);
         if (e.kind == txn_fs.LOCK_HELD) {
-            ret R.err[DepTxn, str]("another mach process is mutating this project root; retry once it finishes");
+            ret R.err[R.Void, str]("another mach process is mutating this project root; retry once it finishes");
         }
-        ret R.err[DepTxn, str](txn_fs.error_message(e));
+        ret R.err[R.Void, str](txn_fs.error_message(e));
     }
-    t.guard = R.unwrap_ok[txn_fs.Lock, txn_fs.Error](guard_r);
 
     val mp_r: R.Result[str, str] = load.join_path(s.build_alloc, root, manifest.MANIFEST_FILE);
-    if (R.is_err[str, str](mp_r)) {
-        txn_fs.unlock(?t.guard);
-        txn_fs.root_dnit(?t.root_cap);
-        ret R.err[DepTxn, str](R.unwrap_err[str, str](mp_r));
-    }
+    if (R.is_err[str, str](mp_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](mp_r)); }
     t.manifest_path = R.unwrap_ok[str, str](mp_r);
-    var had: bool = false;
-    t.manifest_pre = txn_read_or_empty(s.build_alloc, t.manifest_path, ?had);
+    val manifest_r: R.Result[str, str] = txn_read_snapshot(s.build_alloc, t.manifest_path, ?t.manifest_had);
+    if (R.is_err[str, str](manifest_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](manifest_r)); }
+    t.manifest_pre = R.unwrap_ok[str, str](manifest_r);
 
     val gm_r: R.Result[str, str] = load.join_path(s.build_alloc, root, ".gitmodules");
-    if (R.is_err[str, str](gm_r)) {
-        txn_fs.unlock(?t.guard);
-        txn_fs.root_dnit(?t.root_cap);
-        ret R.err[DepTxn, str](R.unwrap_err[str, str](gm_r));
-    }
+    if (R.is_err[str, str](gm_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](gm_r)); }
     t.gm_path = R.unwrap_ok[str, str](gm_r);
-    t.gm_pre = txn_read_or_empty(s.build_alloc, t.gm_path, ?t.gm_had);
+    val gm_pre_r: R.Result[str, str] = txn_read_snapshot(s.build_alloc, t.gm_path, ?t.gm_had);
+    if (R.is_err[str, str](gm_pre_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](gm_pre_r)); }
+    t.gm_pre = R.unwrap_ok[str, str](gm_pre_r);
 
     if (mode == REALIZE_REPO_ROOT) {
         val ix: R.Result[str, str] = txn_index_snapshot(s, root);
-        if (R.is_ok[str, str](ix)) { t.index_pre = R.unwrap_ok[str, str](ix); }
+        if (R.is_err[str, str](ix)) { ret R.err[R.Void, str](R.unwrap_err[str, str](ix)); }
+        t.index_pre = R.unwrap_ok[str, str](ix);
     }
-
     val dirs_r: R.Result[Vector[str], str] = realized_ids(s.build_alloc, root);
-    if (R.is_err[Vector[str], str](dirs_r)) {
-        txn_fs.unlock(?t.guard);
-        txn_fs.root_dnit(?t.root_cap);
-        ret R.err[DepTxn, str](R.unwrap_err[Vector[str], str](dirs_r));
-    }
+    if (R.is_err[Vector[str], str](dirs_r)) { ret R.err[R.Void, str](R.unwrap_err[Vector[str], str](dirs_r)); }
     t.dirs_pre = R.unwrap_ok[Vector[str], str](dirs_r);
-    ret R.ok[DepTxn, str](t);
+    ready = true;
+    ret R.ok_void[str]();
 }
 
-fun txn_free(s: *session.Session, t: *DepTxn) {
-    if (!str_empty(t.manifest_pre)) { str_free(s.build_alloc, t.manifest_pre); }
-    if (!str_empty(t.gm_pre)) { str_free(s.build_alloc, t.gm_pre); }
-    if (!str_empty(t.index_pre)) { str_free(s.build_alloc, t.index_pre); }
+fun txn_free(s: *session.Session, t: *DepTxn) O.Option[str] {
+    if (t == nil || t.address != t::usize) { ret O.some[str]("dependency transaction owner was copied"); }
+    if (!t.live) { ret O.none[str](); }
+    if (t.manifest_pre != nil) { str_free(s.build_alloc, t.manifest_pre); }
+    if (t.gm_pre != nil) { str_free(s.build_alloc, t.gm_pre); }
+    if (t.index_pre != nil) { str_free(s.build_alloc, t.index_pre); }
     free_name_vector(s.build_alloc, ?t.dirs_pre);
     str_free(s.build_alloc, t.manifest_path);
     str_free(s.build_alloc, t.gm_path);
-    txn_fs.unlock(?t.guard);
-    txn_fs.root_dnit(?t.root_cap);
+    t.live = false;
+    val unlocked: O.Option[txn_fs.Error] = txn_fs.unlock(?t.guard);
+    val closed: O.Option[txn_fs.Error] = txn_fs.root_dnit(?t.root_cap);
+    if (O.is_some[txn_fs.Error](unlocked)) { ret O.some[str](txn_fs.error_message(O.unwrap[txn_fs.Error](unlocked))); }
+    if (O.is_some[txn_fs.Error](closed)) { ret O.some[str](txn_fs.error_message(O.unwrap[txn_fs.Error](closed))); }
+    ret O.none[str]();
 }
 
-pub fun txn_commit(s: *session.Session, t: *DepTxn) {
-    txn_free(s, t);
+pub fun txn_commit(s: *session.Session, t: *DepTxn) O.Option[str] {
+    ret txn_free(s, t);
 }
 
 fun txn_restore_index(s: *session.Session, t: *DepTxn) {
@@ -2484,7 +2489,8 @@ fun txn_dir_was_present(t: *DepTxn, id: str) bool {
 }
 
 pub fun txn_rollback(s: *session.Session, t: *DepTxn) {
-    if (!str_empty(t.manifest_pre)) {
+    if (t == nil || t.address != t::usize || !t.live) { ret; }
+    if (t.manifest_had) {
         fs.write_bytes(t.manifest_path, t.manifest_pre::*u8, str_len(t.manifest_pre), 0o644);
     }
     if (t.gm_had) {
