@@ -8,7 +8,7 @@ import os
 import signal
 
 checkout = pathlib.Path(__file__).resolve().parents[2]
-baseline = '902c3a9386237f69f64052a948675b0bcd297361'
+baseline = 'a17fb73cdc03115cef8d3bc34dd3ff45c7015ae6'
 root = checkout / '.wt' / 'source'
 evidence = checkout / 'bulk-evidence'
 evidence.mkdir(exist_ok=True)
