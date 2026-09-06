@@ -236,5 +236,8 @@ for profile in ['debug', 'release']:
         text = disassembled.stdout.decode()
         if not re.search(r'OpLoad .*Volatile', text) or not re.search(r'OpStore .*Volatile', text):
             raise RuntimeError('volatile accesses missing from final SPIR-V')
-(evidence/'source-restored.txt').write_bytes(subprocess.check_output(['git','status','--short','--untracked-files=no'],cwd=root))
+tracked_status = subprocess.check_output(['git', 'status', '--short', '--untracked-files=no'], cwd=root)
+(evidence/'source-restored.txt').write_bytes(tracked_status)
+assert not tracked_status.strip(), 'tracked source not restored'
+assert all((root/path).read_bytes() == original for path, original in originals.items())
 (evidence/'complete.txt').write_text('Exact source seed/A/B/C fixpoint, both focused profiles, and all overlap runtime controls passed.\n')
