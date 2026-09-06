@@ -107,7 +107,7 @@ The fixed parameters always follow the target's ordinary calling convention. The
 | **Apple arm64** (`darwin` + `aarch64`) | **Every** tail argument is passed on the **stack**, naturally aligned with an 8-byte minimum. There is no register phase at all — not for integers, not for floats. |
 | **Other AAPCS64** (`linux` + `aarch64`) | Ordinary rule: register-then-stack, exactly as for a named argument. |
 | **System V x86-64** (`linux` / `darwin` + `x86_64`) | Ordinary rule, plus `AL` set to the number of vector registers the call uses. It is set for **every** call to a C-variadic callee, including one whose tail is empty. |
-| **Microsoft x64** (`windows`) | Ordinary rule. A tail float rides **both** its XMM register and the integer register of the same positional slot, since a `va_arg` reader walks only the integer slots. The `ext`-boundary vector-by-reference rule below is unchanged. |
+| **Microsoft x64** (`windows`) | Ordinary rule. A tail float rides **both** its XMM register and the integer register of the same positional slot, since a `va_arg` reader walks only the integer slots. Vectors follow the extent-based carrier mapping below. |
 
 A tail argument keeps its *form* on every target: a record too large to pass by
 value is still passed by reference, and only the hidden pointer's location moves.
