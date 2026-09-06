@@ -6,6 +6,8 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.memory;
 use std.allocator.page;
+use std.allocator.arena;
+use alloc_test: std.allocator.testing;
 use std.system.os;
 
 use A: std.allocator;
@@ -26,6 +28,7 @@ use mach.lang.be.codegen.regalloc;
 use mach.lang.be.codegen.unit;
 use mach.lang.be.obj;
 use mach.lang.float;
+use mach.lang.fail;
 use mach.lang.fe.sema.generics;
 use mach.lang.intern;
 use mach.lang.layout;
@@ -36,6 +39,7 @@ use mach.lang.session;
 use mach.lang.source;
 use mach.lang.target;
 use mach.lang.target.isa;
+use target_testing: mach.lang.target.testing;
 use mach.lang.target.of;
 use reloc: mach.lang.target.of.reloc;
 use mach.lang.target.resolved;
@@ -77,80 +81,127 @@ pub fun no_debug() DebugInfo {
 
 pub def EmitModuleFn: isa.EmitModuleFn;
 
+rec CodegenContext {
+    alloc: *A.Allocator;
+    session: *session.Session;
+}
+
 pub fun codegen_module(s: *session.Session, tgt: *target.Target,
                        irmod: *ir.Module, deps: unit.IrSet, asm_out: *writer.Writer,
-                       placement_policy: u32, dbg: DebugInfo) R.Result[of.ObjectImage, str] {
-    if (s == nil)     { ret R.err[of.ObjectImage, str]("codegen: nil session"); }
-    if (tgt == nil)   { ret R.err[of.ObjectImage, str]("codegen: nil target"); }
-    if (irmod == nil) { ret R.err[of.ObjectImage, str]("codegen: nil ir module"); }
+                       placement_policy: u32, dbg: DebugInfo) R.Result[of.ObjectImage, fail.Fail] {
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) {
+        ret R.err[of.ObjectImage, fail.Fail](fail.message("codegen: scratch backing allocator failed"));
+    }
+    ret codegen_with_backing(s, tgt, irmod, deps, asm_out, placement_policy, dbg, ?backing);
+}
 
-    val res_lower: R.Result[mir.MirModule, str] = lower.lower_ir(tgt, irmod, s.alloc, ?s.interner, ?s.sources);
+fun codegen_with_backing(s: *session.Session, tgt: *target.Target,
+                        irmod: *ir.Module, deps: unit.IrSet, asm_out: *writer.Writer,
+                        placement_policy: u32, dbg: DebugInfo,
+                        backing: *A.Allocator) R.Result[of.ObjectImage, fail.Fail] {
+    if (s == nil) { ret R.err[of.ObjectImage, fail.Fail](fail.message("codegen: nil session")); }
+    var scratch: arena.Arena;
+    val initialized: O.Option[str] = arena.init(?scratch, backing, 0);
+    if (O.is_some[str](initialized)) { ret R.err[of.ObjectImage, fail.Fail](fail.message(O.unwrap[str](initialized))); }
+    fin { arena.dnit(?scratch); }
+    var alloc: A.Allocator;
+    val bound: O.Option[str] = arena.make(?alloc, ?scratch);
+    if (O.is_some[str](bound)) { ret R.err[of.ObjectImage, fail.Fail](fail.message(O.unwrap[str](bound))); }
+    var context: CodegenContext = CodegenContext{alloc: ?alloc, session: s};
+    val emitted: R.Result[of.ObjectImage, fail.Fail] = codegen_scratch(?context, tgt, irmod, deps, asm_out, placement_policy, dbg);
+    if (R.is_err[of.ObjectImage, fail.Fail](emitted)) {
+        val error: fail.Fail = R.unwrap_err[of.ObjectImage, fail.Fail](emitted);
+        if (error.kind == fail.REPORTED) { ret R.err[of.ObjectImage, fail.Fail](error); }
+        val stable: R.Result[intern.StrId, str] = intern.intern(?s.interner, error.message);
+        if (R.is_err[intern.StrId, str](stable)) {
+            ret R.err[of.ObjectImage, fail.Fail](fail.message("codegen: allocation failure retaining diagnostic"));
+        }
+        val text: O.Option[str] = intern.lookup(?s.interner, R.unwrap_ok[intern.StrId, str](stable));
+        if (O.is_none[str](text)) { ret R.err[of.ObjectImage, fail.Fail](fail.message("codegen: retained diagnostic is missing")); }
+        ret R.err[of.ObjectImage, fail.Fail](fail.message(O.unwrap[str](text)));
+    }
+    var temporary: of.ObjectImage = R.unwrap_ok[of.ObjectImage, fail.Fail](emitted);
+    fin { obj.dnit(?temporary); }
+    val names: intern.ReinternMap = intern.ReinternMap{
+        base_len: s.interner.base_len + s.interner.len, ids: nil, len: 0};
+    ret fail.lift[of.ObjectImage](obj.rehome_remap(s.alloc, ?s.interner, ?temporary, names));
+}
+
+fun codegen_scratch(s: *CodegenContext, tgt: *target.Target,
+                       irmod: *ir.Module, deps: unit.IrSet, asm_out: *writer.Writer,
+                       placement_policy: u32, dbg: DebugInfo) R.Result[of.ObjectImage, fail.Fail] {
+    if (s == nil)     { ret R.err[of.ObjectImage, fail.Fail](fail.message("codegen: nil session")); }
+    if (tgt == nil)   { ret R.err[of.ObjectImage, fail.Fail](fail.message("codegen: nil target")); }
+    if (irmod == nil) { ret R.err[of.ObjectImage, fail.Fail](fail.message("codegen: nil ir module")); }
+
+    val res_lower: R.Result[mir.MirModule, str] = lower.lower_ir(tgt, irmod, s.alloc, ?s.session.interner, ?s.session.sources);
     if (R.is_err[mir.MirModule, str](res_lower)) {
-        ret R.err[of.ObjectImage, str](R.unwrap_err[mir.MirModule, str](res_lower));
+        ret R.err[of.ObjectImage, fail.Fail](fail.message(R.unwrap_err[mir.MirModule, str](res_lower)));
     }
     var mir_module: mir.MirModule = R.unwrap_ok[mir.MirModule, str](res_lower);
 
     if (isa.emits_whole_module(tgt.isa)) {
         val res_whole: R.Result[of.ObjectImage, str] = whole_module_image(s, tgt, irmod, ?mir_module, deps);
         mir.dnit_module(?mir_module);
-        ret res_whole;
+        ret fail.lift[of.ObjectImage](res_whole);
     }
 
     val res_looprotate: R.Result[R.Void, str] = looprotate.run(tgt, ?mir_module);
     if (R.is_err[R.Void, str](res_looprotate)) {
         mir.dnit_module(?mir_module);
-        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_looprotate));
+        ret R.err[of.ObjectImage, fail.Fail](fail.message(R.unwrap_err[R.Void, str](res_looprotate)));
     }
 
     val res_ctvalidate: R.Result[R.Void, str] = ctvalidate.run(tgt, ?mir_module);
     if (R.is_err[R.Void, str](res_ctvalidate)) {
         mir.dnit_module(?mir_module);
-        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_ctvalidate));
+        ret R.err[of.ObjectImage, fail.Fail](fail.message(R.unwrap_err[R.Void, str](res_ctvalidate)));
     }
 
     val res_legalize: R.Result[R.Void, str] = legalize.run(tgt, ?mir_module);
     if (R.is_err[R.Void, str](res_legalize)) {
         mir.dnit_module(?mir_module);
-        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_legalize));
+        ret R.err[of.ObjectImage, fail.Fail](fail.message(R.unwrap_err[R.Void, str](res_legalize)));
     }
 
     val res_isel: R.Result[R.Void, str] = isel.run(tgt, ?mir_module);
     if (R.is_err[R.Void, str](res_isel)) {
         mir.dnit_module(?mir_module);
-        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_isel));
+        ret R.err[of.ObjectImage, fail.Fail](fail.message(R.unwrap_err[R.Void, str](res_isel)));
     }
 
     val res_regalloc: R.Result[R.Void, str] = regalloc.run(tgt, ?mir_module);
     if (R.is_err[R.Void, str](res_regalloc)) {
         mir.dnit_module(?mir_module);
-        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_regalloc));
+        ret R.err[of.ObjectImage, fail.Fail](fail.message(R.unwrap_err[R.Void, str](res_regalloc)));
     }
 
     val res_order: R.Result[R.Void, str] = compute_emission_order_module(?mir_module, tgt, resolve_placement_policy(placement_policy));
     if (R.is_err[R.Void, str](res_order)) {
         mir.dnit_module(?mir_module);
-        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_order));
+        ret R.err[of.ObjectImage, fail.Fail](fail.message(R.unwrap_err[R.Void, str](res_order)));
     }
 
     val res_frame: R.Result[R.Void, str] = frame.run(tgt, ?mir_module);
     if (R.is_err[R.Void, str](res_frame)) {
         mir.dnit_module(?mir_module);
-        ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](res_frame));
+        ret R.err[of.ObjectImage, fail.Fail](fail.message(R.unwrap_err[R.Void, str](res_frame)));
     }
 
     val res_encode: R.Result[encode.EncoderOutput, str] = encode.run(tgt, ?mir_module, asm_out);
     if (R.is_err[encode.EncoderOutput, str](res_encode)) {
         mir.dnit_module(?mir_module);
-        ret R.err[of.ObjectImage, str](R.unwrap_err[encode.EncoderOutput, str](res_encode));
+        ret R.err[of.ObjectImage, fail.Fail](fail.message(R.unwrap_err[encode.EncoderOutput, str](res_encode)));
     }
     val enc: encode.EncoderOutput = R.unwrap_ok[encode.EncoderOutput, str](res_encode);
 
     val res_pack: R.Result[of.ObjectImage, str] = pack_image(s, tgt, irmod, ?mir_module, ?enc, dbg);
     mir.dnit_module(?mir_module);
-    ret res_pack;
+    ret fail.lift[of.ObjectImage](res_pack);
 }
 
-fun whole_module_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
+fun whole_module_image(s: *CodegenContext, tgt: *target.Target, irmod: *ir.Module,
                        mirmod: *mir.MirModule, deps: unit.IrSet) R.Result[of.ObjectImage, str] {
     var u: unit.Unit;
     val ru: R.Result[R.Void, str] = unit.init(s.alloc, deps.len + 1, ?u);
@@ -162,7 +213,7 @@ fun whole_module_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Modu
     var i: u32 = 0;
     for (i < deps.len) {
         val dm: *ir.Module = deps.mods[i];
-        val rd: R.Result[mir.MirModule, str] = lower.lower_ir(tgt, dm, s.alloc, ?s.interner, ?s.sources);
+        val rd: R.Result[mir.MirModule, str] = lower.lower_ir(tgt, dm, s.alloc, ?s.session.interner, ?s.session.sources);
         if (R.is_err[mir.MirModule, str](rd)) {
             unit_release(s, ?u, i);
             ret R.err[of.ObjectImage, str](R.unwrap_err[mir.MirModule, str](rd));
@@ -409,7 +460,7 @@ fun emission_block_index_of(idx: *u32, idx_cap: u32, bid: u32) u32 {
     ret idx[bid];
 }
 
-fun unit_release(s: *session.Session, u: *unit.Unit, n: u32) {
+fun unit_release(s: *CodegenContext, u: *unit.Unit, n: u32) {
     var i: u32 = 0;
     for (i < n) {
         val box: *mir.MirModule = u.mods[i + 1].mir;
@@ -431,7 +482,7 @@ fun finish_codegen_image(image: of.ObjectImage) R.Result[of.ObjectImage, str] {
     ret R.ok[of.ObjectImage, str](image);
 }
 
-fun emit_spirv_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
+fun emit_spirv_image(s: *CodegenContext, tgt: *target.Target, irmod: *ir.Module,
                      u: *unit.Unit) R.Result[of.ObjectImage, str] {
     var bytes: *u8 = nil;
     var len:   u32 = 0;
@@ -439,11 +490,11 @@ fun emit_spirv_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module
     val r: R.Result[R.Void, str] = tgt.isa.emitter.emit_module(s.alloc, ?backend_target, u, ?bytes, ?len);
     if (R.is_err[R.Void, str](r)) { ret R.err[of.ObjectImage, str](R.unwrap_err[R.Void, str](r)); }
 
-    val res_image: R.Result[of.ObjectImage, str] = obj.init(s.alloc, ?s.interner, irmod.name);
+    val res_image: R.Result[of.ObjectImage, str] = obj.init(s.alloc, ?s.session.interner, irmod.name);
     if (R.is_err[of.ObjectImage, str](res_image)) { ret res_image; }
     var image: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](res_image);
 
-    val res_name: R.Result[intern.StrId, str] = intern.intern(?s.interner, ".spirv");
+    val res_name: R.Result[intern.StrId, str] = intern.intern(?s.session.interner, ".spirv");
     if (R.is_err[intern.StrId, str](res_name)) {
         if (bytes != nil && len > 0) { A.deallocate[u8](s.alloc, bytes, len::usize); }
         obj.dnit(?image);
@@ -474,7 +525,8 @@ pub fun prepare_debug_types(s: *session.Session) R.Result[R.Void, str] {
         val ot: O.Option[*semtype.Type] = semtype.get(?s.types, type_id);
         if (O.is_some[*semtype.Type](ot)
             && O.unwrap[*semtype.Type](ot).kind == semtype.TYPE_INSTANCE) {
-            generics.ensure_fields(s, type_id);
+            val prepared: R.Result[R.Void, str] = generics.ensure_fields(s, type_id);
+            if (R.is_err[R.Void, str](prepared)) { ret prepared; }
             val oft: O.Option[*semtype.FieldTable] = semtype.field_table_for(?s.types, type_id);
             if (O.is_none[*semtype.FieldTable](oft)
                 || O.unwrap[*semtype.FieldTable](oft).epoch != semtype.field_epoch(?s.types)) {
@@ -503,7 +555,7 @@ fun debug_types_ready(s: *session.Session) bool {
     ret true;
 }
 
-fun encoder_output_dnit(s: *session.Session, enc: *encode.EncoderOutput) {
+fun encoder_output_dnit(s: *CodegenContext, enc: *encode.EncoderOutput) {
     if (enc.text != nil && enc.text_len > 0) {
         A.deallocate[u8](s.alloc, enc.text, enc.text_len::usize);
     }
@@ -544,7 +596,7 @@ fun encoder_output_dnit(s: *session.Session, enc: *encode.EncoderOutput) {
     enc.frame_count = 0;
 }
 
-fun pack_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
+fun pack_image(s: *CodegenContext, tgt: *target.Target, irmod: *ir.Module,
                mirmod: *mir.MirModule, enc: *encode.EncoderOutput, dbg: DebugInfo) R.Result[of.ObjectImage, str] {
     val res_output: R.Result[R.Void, str] = validate_encoder_output(enc);
     if (R.is_err[R.Void, str](res_output)) {
@@ -559,7 +611,7 @@ fun pack_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     }
     var text_layout: TextLayout = R.unwrap_ok[TextLayout, str](res_layout);
 
-    val res_image: R.Result[of.ObjectImage, str] = obj.init(s.alloc, ?s.interner, irmod.name);
+    val res_image: R.Result[of.ObjectImage, str] = obj.init(s.alloc, ?s.session.interner, irmod.name);
     if (R.is_err[of.ObjectImage, str](res_image)) {
         text_layout_dnit(s, ?text_layout);
         encoder_output_dnit(s, enc);
@@ -661,19 +713,19 @@ fun pack_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
             obj.dnit(?image);
             ret R.err[of.ObjectImage, str]("codegen: debug producer registered no produce hook");
         }
-        if (!debug_types_ready(s)) {
+        if (!debug_types_ready(s.session)) {
             encoder_output_dnit(s, enc);
             obj.dnit(?image);
             ret R.err[of.ObjectImage, str]("codegen: debug type view was not finalized before code generation");
         }
         var req: of.DebugProduceRequest;
         req.program.alloc         = s.alloc;
-        req.program.interner      = ?s.interner;
-        req.program.types         = ?s.types;
-        req.program.sources       = ?s.sources;
-        req.program.type_aligns   = ?s.type_aligns;
-        req.program.type_packed   = ?s.type_packed;
-        req.program.field_epoch   = semtype.field_epoch(?s.types);
+        req.program.interner      = ?s.session.interner;
+        req.program.types         = ?s.session.types;
+        req.program.sources       = ?s.session.sources;
+        req.program.type_aligns   = ?s.session.type_aligns;
+        req.program.type_packed   = ?s.session.type_packed;
+        req.program.field_epoch   = semtype.field_epoch(?s.session.types);
         req.program.ir_module     = irmod;
         req.program.mir_module    = mirmod;
         req.program.layout        = layout.machine(tgt.model.pointer_width, tgt.model.vector_bits);
@@ -703,9 +755,9 @@ fun pack_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     ret finish_codegen_image(image);
 }
 
-fun pack_text(s: *session.Session, image: *of.ObjectImage, enc: *encode.EncoderOutput,
+fun pack_text(s: *CodegenContext, image: *of.ObjectImage, enc: *encode.EncoderOutput,
               text_layout: *TextLayout) R.Result[u32, str] {
-    val res_name: R.Result[intern.StrId, str] = intern.intern(?s.interner, ".text");
+    val res_name: R.Result[intern.StrId, str] = intern.intern(?s.session.interner, ".text");
     if (R.is_err[intern.StrId, str](res_name)) {
         ret R.err[u32, str](R.unwrap_err[intern.StrId, str](res_name));
     }
@@ -940,7 +992,7 @@ fun section_index_of(image: *of.ObjectImage, name: intern.StrId) i64 {
     ret -1;
 }
 
-fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImage,
+fun pack_globals(s: *CodegenContext, tgt: *target.Target, image: *of.ObjectImage,
                  deferred: *obj.DeferredRelocs, irmod: *ir.Module) R.Result[R.Void, str] {
     val machine: layout.Machine = resolved.layout_machine(tgt);
     var i: u32 = 0;
@@ -1010,7 +1062,7 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
 
         var sec_name: intern.StrId = g.section;
         if (sec_name == intern.STR_NIL) {
-            val res_name: R.Result[intern.StrId, str] = intern.intern(?s.interner, sname);
+            val res_name: R.Result[intern.StrId, str] = intern.intern(?s.session.interner, sname);
             if (R.is_err[intern.StrId, str](res_name)) {
                 ret R.err[R.Void, str](R.unwrap_err[intern.StrId, str](res_name));
             }
@@ -1067,10 +1119,10 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
     ret R.ok_void[str]();
 }
 
-fun pack_constpool(s: *session.Session, image: *of.ObjectImage, enc: *encode.EncoderOutput) R.Result[R.Void, str] {
+fun pack_constpool(s: *CodegenContext, image: *of.ObjectImage, enc: *encode.EncoderOutput) R.Result[R.Void, str] {
     if (enc.const_count == 0) { ret R.ok_void[str](); }
 
-    val res_name: R.Result[intern.StrId, str] = intern.intern(?s.interner, ".rodata.cst");
+    val res_name: R.Result[intern.StrId, str] = intern.intern(?s.session.interner, ".rodata.cst");
     if (R.is_err[intern.StrId, str](res_name)) {
         ret R.err[R.Void, str](R.unwrap_err[intern.StrId, str](res_name));
     }
@@ -1192,7 +1244,7 @@ fun validate_encoder_output(enc: *encode.EncoderOutput) R.Result[R.Void, str] {
     ret R.ok_void[str]();
 }
 
-fun build_text_layout(s: *session.Session, irmod: *ir.Module,
+fun build_text_layout(s: *CodegenContext, irmod: *ir.Module,
                       enc: *encode.EncoderOutput) R.Result[TextLayout, str] {
     var text_layout: TextLayout;
     text_layout.placements      = nil;
@@ -1242,7 +1294,7 @@ fun build_text_layout(s: *session.Session, irmod: *ir.Module,
     ret R.ok[TextLayout, str](text_layout);
 }
 
-fun text_layout_dnit(s: *session.Session, text_layout: *TextLayout) {
+fun text_layout_dnit(s: *CodegenContext, text_layout: *TextLayout) {
     if (text_layout.placements != nil && text_layout.placement_cap > 0) {
         A.deallocate[SectionPlacement](s.alloc, text_layout.placements, text_layout.placement_cap::usize);
     }
@@ -1253,7 +1305,7 @@ fun text_layout_dnit(s: *session.Session, text_layout: *TextLayout) {
     text_layout.text_sec        = of.SECTION_EXTERNAL;
 }
 
-fun apply_text_layout(s: *session.Session, image: *of.ObjectImage, enc: *encode.EncoderOutput,
+fun apply_text_layout(s: *CodegenContext, image: *of.ObjectImage, enc: *encode.EncoderOutput,
                       text_layout: *TextLayout) R.Result[R.Void, str] {
     var i: u32 = 0;
     for (i < text_layout.placement_count) {
@@ -1308,7 +1360,7 @@ fun section_placement_plan(placements: *SectionPlacement, count: *u32, cap: u32,
     ret R.ok_void[str]();
 }
 
-fun func_section_add(s: *session.Session, image: *of.ObjectImage, sname: intern.StrId,
+fun func_section_add(s: *CodegenContext, image: *of.ObjectImage, sname: intern.StrId,
                      enc: *encode.EncoderOutput, start: u32, end: u32) R.Result[u32, str] {
     if (s == nil || image == nil || enc == nil || enc.text == nil
         || start >= end || end > enc.text_len) {
@@ -1977,6 +2029,7 @@ test "mach.lang.be.codegen.encoder_output_dnit:frees_the_complete_exact_owner" {
     val sr: R.Result[session.Session, str] = session.init(?alloc);
     if (R.is_err[session.Session, str](sr)) { ret 1; }
     var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var context: CodegenContext = CodegenContext{alloc: ?alloc, session: ?s};
 
     var enc: encode.EncoderOutput;
     val rtext: R.Result[*u8, str] = A.allocate[u8](?alloc, 11::usize);
@@ -2023,7 +2076,7 @@ test "mach.lang.be.codegen.encoder_output_dnit:frees_the_complete_exact_owner" {
     enc.frames = R.unwrap_ok[*of.FrameUnwind, str](rfr);
     enc.frame_count = 7;
 
-    encoder_output_dnit(?s, ?enc);
+    encoder_output_dnit(?context, ?enc);
 
     if (enc.text != nil || enc.text_len != 0)                  { session.dnit(?s); ret 1; }
     if (enc.consts != nil || enc.const_count != 0)             { session.dnit(?s); ret 1; }
@@ -2300,5 +2353,79 @@ test "mach.lang.be.codegen.finish_codegen_image:publishes_only_valid_owned_image
     }
 
     intern.dnit(?itn);
+    ret 0;
+}
+
+
+test "mach.lang.be.codegen.scratch:module_images_survive_reclaimed_working_storage" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    fin { session.dnit(?s); }
+    if (R.is_err[R.Void, str](target.register_all(?s.registry, target_testing.debug_descriptor))) { ret 2; }
+    val selected: R.Result[target.Target, str] = target.select(?s.registry, "x86_64", "linux", "sysv64");
+    if (R.is_err[target.Target, str](selected)) { ret 2; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](selected);
+    val named: R.Result[intern.StrId, str] = intern.intern(?s.interner, "scratch_probe");
+    if (R.is_err[intern.StrId, str](named)) { ret 2; }
+    val name: intern.StrId = R.unwrap_ok[intern.StrId, str](named);
+    val initialized: R.Result[ir.Module, str] = ir.init(?alloc, name);
+    if (R.is_err[ir.Module, str](initialized)) { ret 2; }
+    var module: ir.Module = R.unwrap_ok[ir.Module, str](initialized);
+    fin { ir.dnit(?module); }
+    val typed: R.Result[type.IrTypeId, str] = type.intern_int(?module.types, 64);
+    if (R.is_err[type.IrTypeId, str](typed)) { ret 2; }
+    val ty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](typed);
+    module.globals[0] = ir.Global{name: name, ty: ty, init: value.const_int(0x0807060504030201, ty),
+        is_mut: false, is_pub: true, is_extern: false, is_import: false, is_local: false,
+        is_embed: false, align: 8, section: intern.STR_NIL, iface: 0, iface_a: 0, iface_b: 0, iface_flags: 0};
+    module.global_len = 1;
+    var ordinal: usize = 0;
+    var attempts: usize = 0;
+    for (ordinal <= attempts) {
+        var tracking: alloc_test.Testing;
+        if (O.is_some[str](alloc_test.make(?tracking))) { ret 2; }
+        tracking.fail_at = ordinal;
+        val emitted: R.Result[of.ObjectImage, fail.Fail] = codegen_with_backing(?s, ?tgt, ?module,
+            unit.ir_set_empty(), nil, PLACEMENT_POLICY_VERSION, no_debug(), ?tracking.a);
+        if (ordinal == 0) { attempts = tracking.attempts; }
+        val clean: bool = tracking.live == 0 && tracking.double_frees == 0 && tracking.exhausted == 0;
+        alloc_test.dnit(?tracking);
+        if (!clean) { ret 3; }
+        if (ordinal != 0) {
+            if (R.is_ok[of.ObjectImage, fail.Fail](emitted)) {
+                var unexpected: of.ObjectImage = R.unwrap_ok[of.ObjectImage, fail.Fail](emitted);
+                obj.dnit(?unexpected);
+                ret 4;
+            }
+            val error: fail.Fail = R.unwrap_err[of.ObjectImage, fail.Fail](emitted);
+            if (error.kind != fail.MESSAGE || error.message == nil || error.message[0] == 0) { ret 5; }
+        }
+        or {
+            if (R.is_err[of.ObjectImage, fail.Fail](emitted)) { ret 6; }
+            var image: of.ObjectImage = R.unwrap_ok[of.ObjectImage, fail.Fail](emitted);
+            var good: bool = image.alloc == ?alloc && image.interner == ?s.interner;
+            var found: bool = false;
+            var i: u32 = 0;
+            for (i < image.section_count) {
+                val sec: *of.Section = ?image.sections[i];
+                if (sec.kind == of.SK_RODATA && sec.len == 8) {
+                    found = true;
+                    var j: u32 = 0;
+                    for (j < 8) {
+                        if (sec.bytes[j] != (j + 1)::u8) { good = false; }
+                        j = j + 1;
+                    }
+                }
+                i = i + 1;
+            }
+            obj.dnit(?image);
+            if (!good || !found) { ret 7; }
+        }
+        ordinal = ordinal + 1;
+    }
+    if (attempts == 0) { ret 8; }
     ret 0;
 }

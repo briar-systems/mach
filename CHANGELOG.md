@@ -132,6 +132,7 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 - Manifests own one synthesized native target across repeated resolutions and release it on destruction. Early parse failures also release recorded deprecated keys (#3116).
 
+- Code generation releases each module's MIR, register-allocation, encoding and debug scratch after preserving its completed object image, instead of retaining scratch across the worker batch (#2299).
 - The frame-location link oracle checks every DWARF description sharing a machine range, preventing false failures for backed variables (#3197).
 - Two union-loader fixtures exercise the selected native semantic projection while preserving all six target tuples, transitive reachability masks, and errors in unreachable foreign branches (#3193).
 - Build steps normalize native output roots, snapshots, and declared staging paths before comparison, preserving contained Windows drive and UNC outputs. Absolute output templates retain their leading-marker requirement, and directory declarations use native component boundaries (#3195).
@@ -142,6 +143,7 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 #### Language and frontend
 
+- Frontend phases carry explicit accepted, rejected and internal outcomes. Recoverable syntax errors retain their AST without claiming acceptance, and allocation failures in diagnostics, type interning and generic substitution remain internal even after a user error. Build classification no longer infers failure kinds from diagnostic counts (#3115, #3130).
 - `?` on a temporary (a call result, literal, cast, operator result, array, record or vector literal, or a field or element of one) is refused, naming the operand kind. It used to compile to a pointer into dead stack.
 - A whole record or array declassified with `:>T` or `:^T` reached the middle end as an aggregate strip and was refused.
 - A `$if` whose condition short-circuited to true lost its width and was deferred forever, so every identifier in its body reported unbound.
