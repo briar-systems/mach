@@ -126,7 +126,7 @@ def main():
         wrapper=gate(compiler)
         require('structural-censuses',['bash','test/census.sh'])
         text=(OUT/'structural-censuses.log').read_text()
-        record(dict(name='nine-censuses',count=len(re.findall(r'^census .*: ok$',text,re.M)),passed=len(re.findall(r'^census .*: ok$',text,re.M))==9))
+        record(dict(name='nine-censuses',count=len(re.findall(r'^census [^:]+: ok(?: \([^\n]*\))?$',text,re.M)),passed=len(re.findall(r'^census [^:]+: ok(?: \([^\n]*\))?$',text,re.M))==9))
         run('corpus-contract',[sys.executable,'test/test-corpus.py'])
         run('determinism',['bash','test/determinism.sh',wrapper,'.'],expected='determinism: manifest-only incremental build matches clean')
         if sys.platform!='win32':
@@ -142,11 +142,11 @@ def main():
         original_link=link_script.read_bytes()
         original_text=original_link.decode()
         anchor='&& $buildcc build .'
-        assert original_text.count(anchor)==1
+        assert original_text.count(anchor)==2
         os.environ['AUDIT_PYTHON']=sys.executable
         os.environ['AUDIT_SCRIPT']=str(Path(__file__).resolve())
         instrumented=original_text.replace(anchor, '&& "$AUDIT_PYTHON" "$AUDIT_SCRIPT" census && $buildcc build .')
-        (OUT/'link-census-instrumentation.txt').write_text('Exactly one shell buildcc invocation gains a pre-invocation census. Original tracked script restored after the link suite.\n')
+        (OUT/'link-census-instrumentation.txt').write_text('Both shell buildcc invocations (ordinary and debug-info) gain a pre-invocation census. Original tracked script restored after the link suite.\n')
         try:
             link_script.write_text(instrumented, newline='\n')
             run('native-link',['bash','test/link/run.sh','--deps','pin'],limit=2400)
