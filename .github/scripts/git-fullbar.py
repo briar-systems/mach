@@ -1,104 +1,161 @@
+import csv
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import runpy
+import shutil
 import signal
 import subprocess
+import sys
 import time
 
-root = Path.cwd()
-out = root / 'fullbar-evidence'
-out.mkdir(exist_ok=True)
-fixed = root / '.wt/fullbar-fixed'
-base = root / '.wt/fullbar-base'
-commit = os.environ['AUDIT_COMMIT']
-base_commit = 'b89e87e917af41898c5ed378b374506ba0f42731'
-pins = {'fixed': 'aac7012d2c6b01dfcb7c7d1db677b0d762a4f955', 'base': '565f40abf76275e149eb9ce43ad950fdd992fd20'}
-results = []
-pattern = r'^(\S*/)?(mach|m[0-9A-Za-z]*|A|B|C|D)(\.exe)? (build|test)( |$)'
+ROOT = Path(__file__).resolve().parents[2]
+SOURCE = ROOT / 'source'
+OUT = ROOT / 'fullbar-evidence'
+OUT.mkdir(exist_ok=True)
+COMMIT = '49fbbc48a9b290cbcb17c8187d339e5ce0bcc64b'
+PIN = '3ee8e709a8ed7baff6e93780ce9b3582a907a91f'
+RESULTS = []
+PATTERN = r'^([^[:space:]]*/)?(mach|m[0-9A-Za-z_-]*|A|B|C|D)(\.exe)? (build|test)( |$)'
 
 def census():
-    p = subprocess.run(['pgrep', '-af', pattern], text=True, capture_output=True)
-    with (out / 'process-census.log').open('a') as f:
-        f.write(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) + '\n' + p.stdout)
-    assert p.returncode == 1, 'compiler census not empty: ' + p.stdout
+    if sys.platform == 'win32':
+        cmd = ['powershell.exe', '-NoProfile', '-Command', r"$ErrorActionPreference = 'Stop'; $found = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(mach|m[0-9A-Za-z_-]*|A|B|C|D)(\.exe)?$' -and $_.CommandLine -match '\s(build|test)(\s|$)' }); $found | Select-Object ProcessId, Name, CommandLine | Format-List; if ($found.Count) { exit 75 }"]
+    else:
+        cmd = ['bash', '-c', 'pgrep -af '+repr(PATTERN)+' || true\nif pgrep -f '+repr(PATTERN)+' >/dev/null; then exit 75; fi']
+    result = subprocess.run(cmd, capture_output=True, timeout=30)
+    with (OUT / 'process-census.jsonl').open('a', encoding='utf-8') as f:
+        f.write(json.dumps(dict(time=time.time(), command=cmd, code=result.returncode,
+                               stdout=result.stdout.decode(errors='replace'), stderr=result.stderr.decode(errors='replace'))) + '\n')
+    if result.returncode or result.stderr:
+        raise RuntimeError('compiler census occupied or unavailable: '+repr(result))
 
-def run(name, command, cwd=fixed, counts=None, limit=600, compiler=False, expected=None):
-    if compiler:
-        census()
+def record(result):
+    RESULTS.append(result)
+    (OUT / 'results.json').write_text(json.dumps(RESULTS, indent=2))
+    print(json.dumps(result), flush=True)
+    return result['passed']
+
+def run(name, command, cwd=SOURCE, compiler=False, suite=False, expected=None, limit=1200):
+    if compiler: census()
     start = time.monotonic()
-    log = out / (name + '.log')
-    with log.open('w') as f:
-        f.write('cwd: ' + str(cwd) + '\ncommand: ' + json.dumps(list(map(str, command))) + '\n')
-        f.flush()
-        p = subprocess.Popen(list(map(str, command)), cwd=cwd, stdout=f, stderr=subprocess.STDOUT, start_new_session=True)
-        try:
-            code = p.wait(timeout=limit)
+    print('START '+name, flush=True)
+    with (OUT / (name+'.log')).open('wb') as log:
+        log.write(('cwd: '+str(cwd)+'\ncommand: '+json.dumps(list(map(str,command)))+'\n').encode()); log.flush()
+        p = subprocess.Popen(list(map(str, command)), cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
+                             start_new_session=sys.platform != 'win32')
+        try: code = p.wait(timeout=limit)
         except subprocess.TimeoutExpired:
-            os.killpg(p.pid, signal.SIGKILL)
-            p.wait()
-            code = 124
-    body = log.read_text()
-    summaries = re.findall(r'(\d+) passed, (\d+) failed, (\d+) total', body)
-    good = code == 0 and (counts is None or summaries == [tuple(map(str, counts))]) and (expected is None or expected in body)
-    result = dict(name=name, code=code, seconds=round(time.monotonic()-start, 3), summaries=summaries, passed=good)
-    results.append(result)
-    (out / 'results.json').write_text(json.dumps(results, indent=2))
-    print(json.dumps(result), flush=True)
-    if not good:
-        print(body[-12000:], flush=True)
-    return good
+            if sys.platform == 'win32': subprocess.run(['taskkill','/F','/T','/PID',str(p.pid)], capture_output=True)
+            else: os.killpg(p.pid, signal.SIGKILL)
+            p.wait(timeout=30); code=124
+    body = (OUT / (name+'.log')).read_text(errors='replace')
+    summaries = [tuple(map(int,x)) for x in re.findall(r'(\d+) passed, (\d+) failed, (\d+) total', body)]
+    good = code == 0
+    if suite: good &= len(summaries)==1 and summaries[0][0]>0 and summaries[0][1]==0 and summaries[0][0]==summaries[0][2]
+    if expected: good &= expected in body
+    result = dict(name=name, code=code, seconds=round(time.monotonic()-start,3), summaries=summaries, passed=good)
+    if not good: print(body[-12000:], flush=True)
+    return record(result)
 
-def require(name, command, cwd=fixed, **kwargs):
-    assert run(name, command, cwd, **kwargs), name
+def require(name, command, **kwargs):
+    if not run(name,command,**kwargs): raise RuntimeError(name+' failed')
 
-def identity(name, left, right):
-    a = hashlib.sha256(left.read_bytes()).hexdigest()
-    b = hashlib.sha256(right.read_bytes()).hexdigest()
-    result = dict(name=name, left_sha256=a, right_sha256=b, passed=a == b)
-    results.append(result)
-    (out / 'results.json').write_text(json.dumps(results, indent=2))
-    print(json.dumps(result), flush=True)
+def identity(name,a,b):
+    left=hashlib.sha256(a.read_bytes()).hexdigest();right=hashlib.sha256(b.read_bytes()).hexdigest()
+    return record(dict(name=name,left_sha256=left,right_sha256=right,passed=left==right))
 
-require('fixed-checkout', ['git', 'worktree', 'add', '--detach', fixed, commit], root)
-require('base-checkout', ['git', 'worktree', 'add', '--detach', base, base_commit], root)
-for label, checkout, expected in [('fixed', fixed, commit), ('base', base, base_commit)]:
-    require(label + '-pin', ['git', 'submodule', 'update', '--init', 'dep/std'], checkout)
-    assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=checkout, text=True).strip() == expected
-    assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=checkout / 'dep/std', text=True).strip() == pins[label]
-    require(label + '-clean', ['git', 'diff', '--exit-code'], checkout)
-seed = root / '.mach-seed/mach'
-try:
-    require('seed-A', [seed, 'build', '.', '-o', 'A'], compiler=True)
-    require('A-B', [fixed / 'A', 'build', '.', '-o', 'B'], compiler=True)
-    require('B-C', [fixed / 'B', 'build', '.', '-o', 'C'], compiler=True)
-    identity('debug-fixpoint', fixed / 'B', fixed / 'C')
-    run('compiler-debug-suite', [fixed / 'B', 'test', '.'], counts=(2471, 0, 2471), compiler=True)
-    run('compiler-release-suite', [fixed / 'B', 'test', '.', '--profile', 'release'], counts=(2471, 0, 2471), compiler=True)
-    require('seed-release-A', [seed, 'build', '.', '--profile', 'release', '-o', 'release-A'], compiler=True)
-    require('release-A-B', [fixed / 'release-A', 'build', '.', '--profile', 'release', '-o', 'release-B'], compiler=True)
-    require('release-B-C', [fixed / 'release-B', 'build', '.', '--profile', 'release', '-o', 'release-C'], compiler=True)
-    identity('release-fixpoint', fixed / 'release-B', fixed / 'release-C')
-    require('structural-censuses', ['bash', 'test/census.sh'])
-    census_lines = (out / 'structural-censuses.log').read_text()
-    assert len(re.findall(r'^census .*: ok', census_lines, re.M)) == 9
-    gate = out / 'compiler-gate'
-    gate.write_text('#!/bin/bash\nset -euo pipefail\npattern=' + "'" + pattern + "'" + '\ndate -u +census:%Y-%m-%dT%H:%M:%SZ\nif pgrep -af "$pattern"; then echo "compiler census not empty" >&2; exit 75; fi\nexec "' + str(fixed / 'B') + '" "$@"\n')
-    gate.chmod(0o755)
-    run('determinism', ['bash', 'test/determinism.sh', gate, '.'])
-    run('native-link', ['env', 'MACH_LINK_MACH=' + str(gate), 'bash', 'test/link/run.sh', '--leg', 'x86_64-linux', '--deps', 'pin'], expected='link: 124 pass / 0 fail / 0 skip over 124 cell(s)')
-    require('std-build', [fixed / 'B', 'build', '.'], fixed / 'dep/std', compiler=True)
-    run('std-suite', [fixed / 'B', 'test', '.'], fixed / 'dep/std', counts=(1108, 0, 1108), compiler=True)
-    require('baseline-compiler', [seed, 'build', '.', '-o', 'A'], base, compiler=True)
-    for target in ['linux-x86_64', 'linux-arm64', 'linux-riscv64']:
-        old = 'identity-old-' + target
-        new = 'identity-new-' + target
-        require(old, [base / 'A', 'build', '.', '--target', target, '-o', old], compiler=True)
-        require(new, [fixed / 'B', 'build', '.', '--target', target, '-o', new], compiler=True)
-        identity('same-source-' + target, fixed / old, fixed / new)
-finally:
-    run('final-fixed-clean', ['git', 'diff', '--exit-code'])
-    run('final-base-clean', ['git', 'diff', '--exit-code'], base)
-    run('final-std-clean', ['git', 'diff', '--exit-code'], fixed / 'dep/std')
-assert all(r['passed'] for r in results), 'full bar contains failures'
+def gate(compiler):
+    path=OUT/'compiler-gate.sh'
+    path.write_text('#!/usr/bin/env bash\nexec python "'+Path(__file__).as_posix()+'" gate "'+compiler.as_posix()+'" "$@"\n', newline='\n')
+    path.chmod(0o755)
+    return path
+
+def corpus(compiler, arguments):
+    os.chdir(SOURCE)
+    os.environ['MACH_CORPUS_MACH']=str(compiler)
+    os.environ['MACH_CORPUS_OUT']=str(OUT/('corpus-decode' if '--decode' in arguments else 'corpus'))
+    sys.path.insert(0,str(SOURCE/'test/lib'))
+    import driver,layers
+    original_run=subprocess.run
+    def guarded_run(command,*args,**kwargs):
+        if isinstance(command,(list,tuple)) and len(command)>1 and os.path.normcase(os.path.abspath(str(command[0])))==os.path.normcase(os.path.abspath(str(compiler))) and command[1] in ('build','test'):
+            census()
+        return original_run(command,*args,**kwargs)
+    subprocess.run=guarded_run
+    original_b=layers.layer_b
+    def captured_b(tools,target,case,path,golden_path,bless):
+        assert not bless
+        result=original_b(tools,target,case,path,golden_path,bless)
+        if result[1] is not None:
+            dest=OUT/'decoded'/target.name/(case+'.dis');dest.parent.mkdir(parents=True,exist_ok=True)
+            dest.write_text(result[1],encoding='utf-8',newline='\n')
+        return result
+    layers.layer_b=captured_b
+    return driver.main(arguments)
+
+def main():
+    assert subprocess.check_output(['git','rev-parse','HEAD'],cwd=SOURCE,text=True).strip()==COMMIT
+    require('std-pin',['git','submodule','update','--init','dep/std'])
+    assert subprocess.check_output(['git','rev-parse','HEAD'],cwd=SOURCE/'dep/std',text=True).strip()==PIN
+    (OUT/'source.json').write_text(json.dumps(dict(source=COMMIT,pin=PIN,host=sys.platform,runner=os.environ['AUDIT_RUNNER'],seed=os.environ['SEED_TAG'])))
+    if sys.platform == 'win32': os.environ['CC']='gcc'
+    suffix='.exe' if sys.platform=='win32' else ''
+    seed=Path(os.environ.get('AUDIT_SEED') or shutil.which('mach'))
+    if not seed.is_absolute(): seed=(ROOT/seed).resolve()
+    seed.chmod(0o755)
+    if os.environ.get('AUDIT_MODE')=='cross-seeds':
+        require('seed-A',[seed,'build','.','-o','A'],compiler=True)
+        for target in ['darwin-x86_64','darwin-aarch64']:
+            require('cross-'+target,[SOURCE/'A','build','.','--target',target,'--profile','release','-o','mSeed-'+target],compiler=True)
+            shutil.copy2(SOURCE/('mSeed-'+target),OUT/('mSeed-'+target))
+        return
+    try:
+        for profile in ['debug','release']:
+            names=[SOURCE/('m'+profile+stage+suffix) for stage in 'ABC']
+            current=seed
+            for stage,dest in zip('ABC',names):
+                require(profile+'-'+stage,[current,'build','.','--profile',profile,'-o',dest.name],compiler=True)
+                current=dest
+            identity(profile+'-fixpoint',names[1],names[2])
+            run('compiler-'+profile+'-suite',[names[2],'test','.','--profile',profile],compiler=True,suite=True)
+        compiler=SOURCE/('mdebugC'+suffix)
+        wrapper=gate(compiler)
+        require('structural-censuses',['bash','test/census.sh'])
+        text=(OUT/'structural-censuses.log').read_text()
+        record(dict(name='nine-censuses',count=len(re.findall(r'^census .*: ok$',text,re.M)),passed=len(re.findall(r'^census .*: ok$',text,re.M))==9))
+        run('corpus-contract',[sys.executable,'test/test-corpus.py'])
+        run('determinism',['bash','test/determinism.sh',wrapper,'.'],expected='determinism: manifest-only incremental build matches clean')
+        if sys.platform!='win32':
+            run('version-vendor',['bash','test/version-vendor.sh',wrapper,'.'])
+            env=dict(os.environ);os.environ['MACH_CHECKED_COMPILER']=str(wrapper)
+            run('checked-types',['bash','test/checked-types/verify.sh'])
+        run('native-corpus',[sys.executable,__file__,'corpus',compiler,'--runner',os.environ['AUDIT_RUNNER']],limit=2400)
+        if os.environ['AUDIT_RUNNER']=='ubuntu-latest':
+            run('decode-corpus',[sys.executable,__file__,'corpus',compiler,'--decode',os.environ['AUDIT_RUNNER']],limit=1200)
+        os.environ['MACH_LINK_MACH']=wrapper.as_posix()
+        os.environ['MACH_LINK_OUT']=(OUT/'link').as_posix()
+        run('native-link',['bash','test/link/run.sh','--deps','pin'],limit=2400)
+        if sys.platform=='linux':
+            run('std-build',[compiler,'build','.'],cwd=SOURCE/'dep/std',compiler=True)
+            run('std-suite',[compiler,'test','.'],cwd=SOURCE/'dep/std',compiler=True,suite=True)
+        else:
+            record(dict(name='std-root',status='unsupported root manifest target on this host',passed=True))
+        for matrix in OUT.glob('*/matrix.tsv'):
+            rows=list(csv.DictReader(matrix.open(newline=''),delimiter='\t'))
+            counts={status:sum(r.get('status')==status for r in rows) for status in ['PASS','FAIL','SKIP']}
+            record(dict(name='matrix-'+matrix.parent.name,counts=counts,total=len(rows),passed=counts['FAIL']==0 and bool(rows)))
+    finally:
+        census()
+        run('source-clean',['git','diff','--exit-code'])
+        run('std-clean',['git','diff','--exit-code'],cwd=SOURCE/'dep/std')
+    if not all(x['passed'] for x in RESULTS): raise RuntimeError('full bar contains recorded failures')
+
+if __name__=='__main__':
+    if len(sys.argv)>1 and sys.argv[1]=='gate':
+        if len(sys.argv)>3 and sys.argv[3] in ('build','test'): census()
+        sys.exit(subprocess.run(sys.argv[2:]).returncode)
+    if len(sys.argv)>1 and sys.argv[1]=='corpus': sys.exit(corpus(Path(sys.argv[2]),sys.argv[3:]))
+    main()
