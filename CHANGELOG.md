@@ -155,6 +155,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 #### Language and frontend
 
+- Embed containment checks preserve allocation and I/O failures as internal phase errors, release temporary paths, and pass canonical relative paths to the filesystem boundary on Windows (#3209).
+
 - Oversized vector diagnostics allocate one owned message and preserve allocation failure instead of overwriting the first formatting result (#3204).
 
 - Frontend phases carry explicit accepted, rejected and internal outcomes. Recoverable syntax errors retain their AST without claiming acceptance, and allocation failures in diagnostics, type interning and generic substitution remain internal even after a user error. Build classification no longer infers failure kinds from diagnostic counts (#3115, #3130).
