@@ -132,6 +132,7 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 - The frame-location link oracle checks every DWARF description sharing a machine range, preventing false failures for backed variables (#3197).
 - Two union-loader fixtures exercise the selected native semantic projection while preserving all six target tuples, transitive reachability masks, and errors in unreachable foreign branches (#3193).
+- Build steps normalize native output roots, snapshots, and declared staging paths before comparison, preserving contained Windows drive and UNC outputs. Absolute output templates retain their leading-marker requirement, and directory declarations use native component boundaries (#3195).
 
 - Windows and Darwin corpus disassemblies now reflect the audited aggregate and vector ABI, scratch-register preservation, canonical boolean, trapping remainder, inline, vector-loop and Darwin x18 fixes. All 77 updates were independently decoded and reviewed against native C-reference results (#3179).
 
