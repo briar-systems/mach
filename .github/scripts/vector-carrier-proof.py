@@ -94,7 +94,7 @@ if sys.platform == 'win32':
     wrapper = evidence / 'compiler-wrapper.sh'
     implementation = evidence / 'compiler-wrapper.py'
     census_source = pathlib.Path(__file__).read_text().split('def census(name):',1)[1].split('\n\ndef invoke',1)[0]
-    implementation.write_text('import pathlib, subprocess, sys, os\nroot=pathlib.Path('+repr(str(root))+')\nevidence=pathlib.Path('+repr(str(evidence))+')\ndef census(name):'+census_source+'\nif len(sys.argv)>1 and sys.argv[1] in ("build","test"):\n    census("link-invocation-"+str(len(list(evidence.glob("link-invocation-*-census.log")))))\nos.execv('+repr(str(compiler))+', ['+repr(str(compiler))+']+sys.argv[1:])\n')
+    implementation.write_text('import pathlib, subprocess, sys, os, json\nroot=pathlib.Path('+repr(str(root))+')\nevidence=pathlib.Path('+repr(str(evidence))+')\ndef census(name):'+census_source+'\nif len(sys.argv)>1 and sys.argv[1] in ("build","test"):\n    census("link-invocation-"+str(len(list(evidence.glob("link-invocation-*-census.log")))))\nos.execv('+repr(str(compiler))+', ['+repr(str(compiler))+']+sys.argv[1:])\n')
     wrapper.write_text('#!/usr/bin/env bash\nexec python "'+implementation.as_posix()+'" "$@"\n')
     wrapper.chmod(0o755)
     os.environ['MACH_LINK_MACH'] = wrapper.as_posix()
