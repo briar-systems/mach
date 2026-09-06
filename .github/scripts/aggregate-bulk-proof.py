@@ -8,7 +8,7 @@ import os
 import signal
 
 checkout = pathlib.Path(__file__).resolve().parents[2]
-baseline = 'd813b3d13ea6dc8156859f1346c602aa372a3735'
+baseline = '96c84fd7954d0efbf452c5c288c9ac103ebc4d58'
 root = checkout / '.wt' / 'source'
 evidence = checkout / 'bulk-evidence'
 evidence.mkdir(exist_ok=True)
@@ -84,21 +84,6 @@ for name, command in [('seed-to-A', [seed, 'build', str(root), '-o', compiler_a.
 source = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root).decode().strip()
 pin = subprocess.check_output(['git', '-C', 'dep/std', 'rev-parse', 'HEAD'], cwd=root).decode().strip()
 (evidence / 'source-and-pin.txt').write_text(source+'\n'+pin+'\n')
-project = root / 'test/bulk-diagnostic'
-(project/'src').mkdir(parents=True)
-(project/'mach.toml').write_text((checkout/'.github/fixtures/bulk-probe.toml').read_text())
-(project/'src/main.mach').write_text((checkout/'.github/fixtures/bulk-probe.mach').read_text())
-pull = subprocess.run([str(compiler_a), 'dep', 'pull', str(project)], cwd=root, capture_output=True)
-(evidence/'diagnostic-dep-pull.log').write_bytes(pull.stdout+pull.stderr)
-if pull.returncode:
-    raise RuntimeError('diagnostic dependency pull failed')
-for profile in ['debug', 'release']:
-    built = invoke('A-overlap-'+profile+'-build', [str(compiler_a), 'build', str(project), '--profile', profile, '-o', 'bin/probe'])
-    if built.returncode:
-        raise RuntimeError('A overlap diagnostic did not build')
-    invoke('A-overlap-'+profile+'-run', [str(project/'bin/probe')], timeout=30)
-for option in ['--version', '--help']:
-    invoke('B-'+option[2:], [str(compiler), option], timeout=30)
 compiler_c = root / 'C'
 result = invoke('B-to-C', [str(compiler), 'build', str(root), '-o', 'C'])
 if result.returncode:
@@ -110,10 +95,34 @@ identities = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in [compi
 if len(set(identities.values())) != 1:
     raise RuntimeError('B/C fixpoint differs')
 for profile in ['debug', 'release']:
-    if not test('bulk-'+profile, 'mach.lang.be.codegen.mir.bulk:', 3, profile=profile):
+    if not test('bulk-'+profile, 'mach.lang.be.codegen.mir.bulk:', 4, profile=profile):
         raise RuntimeError('bulk focused baseline failed')
     if not test('argument-staging-'+profile, 'mach.lang.be.codegen.mir.abi:owned_argument_', 2, profile=profile):
         raise RuntimeError('argument staging baseline failed')
+selected = 'mach.lang.be.codegen.regalloc.rewrite_instr:spilled_update_reloads_previous_value_once'
+regalloc = root / 'src/lang/be/codegen/regalloc.mach'
+pristine = regalloc.read_text()
+missing = """                    if (!store_dst_reloaded) {
+                        val er: R.Result[R.Void, str] = emit_reload(ctx, dst, wp, store_dst_tmp::u32, v, mi.loc, mi.inline_site);
+                        if (R.is_err[R.Void, str](er)) { free_ops(ctx, ops, n); ret er; }
+                        store_dst_reloaded = true;
+                    }
+"""
+assert pristine.count(missing) == 1
+for profile in ['debug', 'release']:
+    if not test('spill-update-'+profile, selected, 1, profile=profile):
+        raise RuntimeError('spill update baseline failed')
+    for name, changed, expected in [
+        ('missing-reload', pristine.replace(missing, ''), 5),
+        ('duplicate-reload', pristine.replace('if (!store_dst_reloaded) {', 'if (true) {'), 18),
+    ]:
+        try:
+            regalloc.write_text(changed)
+            if not test(name+'-'+profile, selected, 1, mutation=True, exit_code=expected, profile=profile):
+                raise RuntimeError(name+' did not fail the intended runtime assertion')
+        finally:
+            regalloc.write_text(pristine)
+assert regalloc.read_text() == pristine
 project = root / 'test/bulk-probe'
 (project/'src').mkdir(parents=True)
 (project/'mach.toml').write_text((checkout/'.github/fixtures/bulk-probe.toml').read_text())
