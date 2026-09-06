@@ -134,7 +134,7 @@ def main():
             run('determinism',['bash','test/determinism.sh',wrapper,'.'],expected='determinism: manifest-only incremental build matches clean')
             run('version-vendor',['bash','test/version-vendor.sh',wrapper,'.'])
         else:
-            record(dict(name='linux-only-harnesses',status='unsupported: determinism and version-vendor declare Linux fixture targets',passed=True))
+            record(dict(name='linux-only-harnesses',status='unsupported: determinism and version-vendor declare Linux fixture targets',passed=None))
         if sys.platform!='win32':
             os.environ['MACH_CHECKED_COMPILER']=str(wrapper)
             run('checked-types',['bash','test/checked-types/verify.sh'])
@@ -161,7 +161,7 @@ def main():
             run('std-build',[compiler,'build','.'],cwd=SOURCE/'dep/std',compiler=True)
             run('std-suite',[compiler,'test','.'],cwd=SOURCE/'dep/std',compiler=True,suite=True)
         else:
-            record(dict(name='std-root',status='unsupported root manifest target on this host',passed=True))
+            record(dict(name='std-root',status='unsupported root manifest target on this host',passed=None))
         for matrix in OUT.glob('*/matrix.tsv'):
             rows=list(csv.DictReader(matrix.open(newline=''),delimiter='\t'))
             column='result' if matrix.parent.name=='link' else 'status'
@@ -171,7 +171,7 @@ def main():
         census()
         run('source-clean',['git','diff','--exit-code'])
         run('std-clean',['git','diff','--exit-code'],cwd=SOURCE/'dep/std')
-    if not all(x['passed'] for x in RESULTS): raise RuntimeError('full bar contains recorded failures')
+    if any(x['passed'] is False for x in RESULTS): raise RuntimeError('full bar contains recorded failures')
 
 if __name__=='__main__':
     if len(sys.argv)>1 and sys.argv[1]=='census':
