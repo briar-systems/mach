@@ -76,14 +76,16 @@ def run_cases(name, compiler, profile, body, expected, expected_exits):
                   compiler_sha256=hashlib.sha256(compiler.read_bytes()).hexdigest())
     results.append(record)
     (evidence / 'results.json').write_text(json.dumps(results, indent=2))
-    assert rc == (1 if expected_exits else 0) and counts == expected and exits == expected_exits, output
+    record['verified'] = rc == (1 if expected_exits else 0) and counts == expected and exits == expected_exits
+    (evidence / 'results.json').write_text(json.dumps(results, indent=2))
+    return record['verified']
 
 for profile in ['debug', 'release']:
     compiler = root / ('mGeometryB'+profile+'.exe')
     rc, output = invoke('A-to-B-'+profile, [str(compiler_a), 'build', str(root), '--profile', profile, '-o', compiler.name])
     assert rc == 0, output
     try:
-        run_cases('geometry-'+profile, compiler, profile, candidate, [5, 0, 5], set())
+        baseline_ok = run_cases('geometry-'+profile, compiler, profile, candidate, [5, 0, 5], set())
         binary = root / 'out/windows-x86_64' / profile / 'test/mach-windows'
         assert binary.is_file() and binary.read_bytes()[:2] == b'MZ'
         digest = hashlib.sha256(binary.read_bytes()).hexdigest()
@@ -102,11 +104,12 @@ for profile in ['debug', 'release']:
             data = bytes(values[index] for index in range(64))
             (evidence / (profile+'-'+label+'.bin')).write_bytes(data)
             assert data[:4] == bytes.fromhex('55 48 89 e5')
-            assert data[4:7] == bytes.fromhex('48 81 ec' if label == 'bare' else '49 c7 c3')
-            assert int.from_bytes(data[7:11], 'little') == extent
+            if baseline_ok:
+                assert data[4:7] == bytes.fromhex('48 81 ec' if label == 'bare' else '49 c7 c3')
+                assert int.from_bytes(data[7:11], 'little') == extent
         shutil.copy2(binary, evidence / ('test-'+profile+'.exe'))
         (evidence / ('artifact-'+profile+'.json')).write_text(json.dumps(dict(sha256=digest, diagnostic=cases[0])))
-        if profile == 'release':
+        if profile == 'release' and baseline_ok:
             run_cases('mutant-original-array', compiler, profile, original, [4, 1, 5], {'2'})
             run_cases('mutant-volatile-storage', compiler, profile, candidate.replace(b'#[volatile]\n', b''), [4, 1, 5], {'2'})
     finally:
@@ -115,3 +118,4 @@ assert fixture.read_bytes() == original
 status = subprocess.check_output(['git', 'status', '--short', '--untracked-files=no'], cwd=root)
 (evidence / 'restored.txt').write_bytes(status)
 assert not status.strip()
+assert all(result['verified'] for result in results), results
