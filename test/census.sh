@@ -244,7 +244,7 @@ if want real-bools; then
             /\) R\.Result\[bool, (str|outcome\.Fail)\][ \t]*\{/ { print rel ":" name }
         ' "$f"
     done | sort > "$found"
-    sort "$list" > "$listed"
+    awk '{ sub(/\r$/, ""); print }' "$list" | sort > "$listed"
     : > "$tmp"
     comm -23 "$found" "$listed" | sed 's|^|  declared, not listed: |' >> "$tmp"
     comm -13 "$found" "$listed" | sed 's|^|  listed, not declared: |' >> "$tmp"
