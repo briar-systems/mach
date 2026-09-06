@@ -8,7 +8,7 @@ import os
 import signal
 
 checkout = pathlib.Path(__file__).resolve().parents[2]
-baseline = '9918a117cbc6a5520583c729993b64dd0bc36f7f'
+baseline = '18f2eb6b4884b1ce5e244c5b0091813194b3b10b'
 root = checkout / '.wt' / 'source'
 evidence = checkout / 'bulk-evidence'
 evidence.mkdir(exist_ok=True)
@@ -103,6 +103,8 @@ for profile in ['debug', 'release']:
     for name, selected in [
         ('volatile-ir', 'mach.lang.be.codegen.mir.lower:volatile_memory_flags_follow_each_ir_instruction'),
         ('volatile-spirv', 'mach.lang.target.isa.spirv.emit:volatile_whole_object_self_copy_keeps_load_and_store'),
+        ('volatile-opaque', 'mach.lang.target.isa.spirv.emit:volatile_opaque_load_is_evaluated_once_at_its_instruction'),
+        ('volatile-legalization', 'mach.lang.be.codegen.legalize:expands_a_wide_access_at_a_symbol'),
         ('volatile-selection', 'mach.lang.be.codegen.rules.select:expansion_identity_carriage'),
     ]:
         if not test(name+'-'+profile, selected, 1, profile=profile):
@@ -131,6 +133,61 @@ for profile in ['debug', 'release']:
         finally:
             regalloc.write_text(pristine)
 assert regalloc.read_text() == pristine
+volatile_mutants = [
+    ('call-registers-before-copies', 'src/lang/be/codegen/mir/abi.mach',
+     '    if (ctx.tgt.model.flat_addressing) { registers = ?pending_registers; }', '',
+     'mach.lang.be.codegen.mir.abi:owned_argument_preparation_precedes_register_placement', 1),
+    ('bulk-direction-reversed', 'src/lang/be/codegen/mir/bulk.mach',
+     'conditional(e, bi, before, forward, backward)', 'conditional(e, bi, before, backward, forward)',
+     'mach.lang.be.codegen.mir.bulk:snapshot_overlap_and_exact_extent', 1),
+    ('bulk-tail-dropped', 'src/lang/be/codegen/mir/bulk.mach',
+     '    val remainder: u64 = size % width::u64;\n    val whole: u64 = size - remainder;', '    val remainder: u64 = 0;\n    val whole: u64 = size - size % width::u64;',
+     'mach.lang.be.codegen.mir.bulk:snapshot_overlap_and_exact_extent', 3),
+    ('bulk-self-accesses-skipped', 'src/lang/be/codegen/mir/bulk.mach',
+     'conditional(e, bi, before, forward, backward)', 'conditional(e, bi, before, forward, done)',
+     'mach.lang.be.codegen.mir.bulk:volatile_self_copy_performs_every_access', 21),
+    ('bulk-original-owner-leaked', 'src/lang/be/codegen/mir/bulk.mach',
+     '    fin { mir.dnit_function(ctx.alloc, ?old); }', '',
+     'mach.lang.be.codegen.mir.bulk:every_allocation_failure_releases_owned_storage', 3),
+    ('ir-flag-dropped', 'src/lang/be/codegen/mir/lower.mach',
+     '    if ((inst.flags & instr.INSTR_FLAG_VOLATILE) != 0) { ctx.cur_memory_flags = mir.MEMORY_VOLATILE; }', '',
+     'mach.lang.be.codegen.mir.lower:volatile_memory_flags_follow_each_ir_instruction', 6),
+    ('ir-flag-not-reset', 'src/lang/be/codegen/mir/lower.mach',
+     '    ctx.cur_memory_flags = 0;\n    if ((inst.flags & instr.INSTR_FLAG_VOLATILE)', '    if ((inst.flags & instr.INSTR_FLAG_VOLATILE)',
+     'mach.lang.be.codegen.mir.lower:volatile_memory_flags_follow_each_ir_instruction', 7),
+    ('bulk-flag-dropped', 'src/lang/be/codegen/mir/bulk.mach',
+     '    if (opcode == mir.MIR_LOAD || opcode == mir.MIR_STORE) { mi.memory_flags = e.origin.memory_flags; }', '',
+     'mach.lang.be.codegen.mir.bulk:bounded_shape_secrecy_and_debug_ownership', 17),
+    ('legalize-flag-dropped', 'src/lang/be/codegen/legalize.mach',
+     '    p.memory_flags = src.memory_flags;', '',
+     'mach.lang.be.codegen.legalize:expands_a_wide_access_at_a_symbol', 2),
+    ('selection-flag-dropped', 'src/lang/be/codegen/rules.mach',
+     '    piece.memory_flags = source.memory_flags;', '',
+     'mach.lang.be.codegen.rules.select:expansion_identity_carriage', 2),
+    ('spirv-load-flag-dropped', 'src/lang/target/isa/spirv/emit.mach',
+     '    if ((flags & mir.MEMORY_VOLATILE) != 0) { ops[3] = 1; count = 4; }', '',
+     'mach.lang.target.isa.spirv.emit:volatile_whole_object_self_copy_keeps_load_and_store', 3),
+    ('spirv-store-flag-dropped', 'src/lang/target/isa/spirv/emit.mach',
+     '    if ((flags & mir.MEMORY_VOLATILE) != 0) { ops[2] = 1; count = 3; }', '',
+     'mach.lang.target.isa.spirv.emit:volatile_whole_object_self_copy_keeps_load_and_store', 3),
+    ('spirv-opaque-deferred', 'src/lang/target/isa/spirv/emit.mach',
+     '        if ((mi.memory_flags & mir.MEMORY_VOLATILE) == 0) {', '        if (true) {',
+     'mach.lang.target.isa.spirv.emit:volatile_opaque_load_is_evaluated_once_at_its_instruction', 3),
+    ('spirv-opaque-stale-deferred', 'src/lang/target/isa/spirv/emit.mach',
+     '        vm.opq_var[dst] = 0;', '',
+     'mach.lang.target.isa.spirv.emit:volatile_opaque_load_is_evaluated_once_at_its_instruction', 4),
+]
+for name, path, old, new, selected, expected in volatile_mutants:
+    path = root / path
+    original = path.read_text()
+    assert original.count(old) == 1, name
+    try:
+        path.write_text(original.replace(old, new))
+        if not test(name, selected, 1, mutation=True, exit_code=expected):
+            raise RuntimeError(name+' did not fail its intended runtime assertion')
+    finally:
+        path.write_text(original)
+    assert path.read_text() == original
 project = root / 'test/bulk-probe'
 (project/'src').mkdir(parents=True)
 (project/'mach.toml').write_text((checkout/'.github/fixtures/bulk-probe.toml').read_text())
@@ -147,5 +204,33 @@ for profile in ['debug','release']:
     lines = ran.stdout.decode().splitlines()
     if ran.returncode or len(lines) != 9 or any(not x.endswith('=0') for x in lines):
         raise RuntimeError('overlap snapshot or exact-tail assertion failed: '+repr(lines))
+shader = root / 'test/bulk-volatile-shader'
+(shader / 'src').mkdir(parents=True)
+(shader / 'mach.toml').write_text((checkout / '.github/fixtures/bulk-volatile-shader.toml').read_text())
+(shader / 'src/main.mach').write_text((checkout / '.github/fixtures/bulk-volatile-shader.mach').read_text())
+for tool in ['spirv-val', 'spirv-dis']:
+    version = subprocess.check_output([tool, '--version']).decode()
+    expected = next(row.split()[3] for row in (root / 'test/tools.lock').read_text().splitlines()
+                    if row.startswith('tool '+tool+' '))
+    assert re.search(r'v'+re.escape(expected)+r'(?:\D|$)', version), version
+    (evidence / (tool+'-version.txt')).write_text(version)
+for profile in ['debug', 'release']:
+    built = invoke('volatile-shader-'+profile+'-build', [str(compiler), 'build', str(shader), '--target', 'spirv', '--profile', profile])
+    if built.returncode:
+        raise RuntimeError('volatile shader did not compile')
+    modules = sorted((shader / 'out/spirv' / profile).rglob('*.spv'))
+    assert modules, 'shader produced no SPIR-V module'
+    for index, module in enumerate(modules):
+        name = 'volatile-shader-'+profile+'-'+str(index)
+        shutil.copy2(module, evidence / (name+'.spv'))
+        validated = invoke(name+'-validate', ['spirv-val', str(module)])
+        if validated.returncode:
+            raise RuntimeError('SPIR-V validator refused volatile module')
+        disassembled = invoke(name+'-disassemble', ['spirv-dis', '--no-color', '--no-indent', str(module)])
+        if disassembled.returncode:
+            raise RuntimeError('SPIR-V disassembler refused volatile module')
+        text = disassembled.stdout.decode()
+        if not re.search(r'OpLoad .*Volatile', text) or not re.search(r'OpStore .*Volatile', text):
+            raise RuntimeError('volatile accesses missing from final SPIR-V')
 (evidence/'source-restored.txt').write_bytes(subprocess.check_output(['git','status','--short','--untracked-files=no'],cwd=root))
 (evidence/'complete.txt').write_text('Exact source seed/A/B/C fixpoint, both focused profiles, and all overlap runtime controls passed.\n')
