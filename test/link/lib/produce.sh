@@ -2799,9 +2799,10 @@ produce_varloc_fbreg() {
         # "  4076a0: sd a0, -0x68(s0)"
         /^[ ]*[0-9a-f]+:/ {
             addr = $1; sub(/:$/, "", addr); a = hex2dec("0x" addr)
+            # multiple debug descriptions can share the same machine range
             for (i = 1; i <= n; i++) {
                 if (a >= flo[i] && a < fhi[i]) {
-                    if (index($0, freg[i]) == 0) { break }
+                    if (index($0, freg[i]) == 0) { continue }
                     s = $0
                     while (match(s, /-?0x[0-9a-f]+/)) {
                         t = substr(s, RSTART, RLENGTH)
@@ -2810,7 +2811,6 @@ produce_varloc_fbreg() {
                         seen[i "/" v] = 1
                         s = substr(s, RSTART + RLENGTH)
                     }
-                    break
                 }
             }
         }
