@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-SOURCE = '80f55672acd5c6aa5f52e313ee8128ff40b91204'
+SOURCE = '66772261065a68e5ca03f4234407d5887a3e0fe8'
 PIN = 'c6b335ac862f4df392b69f503c4ffb1501d5a451'
 EVIDENCE = ROOT / 'cli-lifecycle-evidence'
 EVIDENCE.mkdir(exist_ok=True)
