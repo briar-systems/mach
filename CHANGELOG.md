@@ -131,6 +131,7 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 ### Fixed
 
 - Aggregate reads capture their bytes when evaluated, preserving values across later argument effects, assignment destination evaluation and return cleanup (#3210).
+- Three Windows corpus disassemblies now reflect the verified vector carrier ABI, including direct eight-byte payloads and exact twelve-byte staging (#3199).
 
 - Manifests own one synthesized native target across repeated resolutions and release it on destruction. Early parse failures also release recorded deprecated keys (#3116).
 - Loop-invariant motion and scalar replacement reclaim analysis and rewrite plans after each function or transformation round, while emitted IR operands retain module ownership (#2299).
@@ -140,6 +141,9 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 - Code generation releases each module's MIR, register-allocation, encoding and debug scratch after preserving its completed object image, instead of retaining scratch across the worker batch (#2299).
 - Mach-O executables describe embedded DWARF as file-only data with no memory protection and no relocation, allowing native dyld to load debug builds (#3202).
 - Windows vector calls now use one explicit carrier per byte extent: integer bits at 2/4 bytes, `__m64` at 8 bytes, a 128-bit intrinsic at 16 bytes, and an exact-size byte aggregate otherwise. Direct calls, typed indirect calls, parameter capture and returns agree, including hidden result-pointer argument shifts and caller-owned aggregate copies (#3199).
+- Keep the Windows stack-probe runtime fixtures at exact one-page and two-page frames in both build profiles by using explicitly volatile cold storage. The existing prologue-byte and recursion assertions remain unchanged.
+
+- Reload a spilled read/modify/write destination before its first source use, preserving shared scratch identity and reusing the reload for repeated aliases (#3215).
 
 - The frame-location link oracle checks every DWARF description sharing a machine range, preventing false failures for backed variables (#3197).
 - Two union-loader fixtures exercise the selected native semantic projection while preserving all six target tuples, transitive reachability masks, and errors in unreachable foreign branches (#3193).
