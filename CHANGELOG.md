@@ -135,10 +135,20 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 - Compiler output publication holds stable directory coordinators and reserves every unit destination before code-generation workers start. Object writers and linkers borrow those reservations, including IR, assembly and test dispatcher outputs.
 
 - Manifests own one synthesized native target across repeated resolutions and release it on destruction. Early parse failures also release recorded deprecated keys (#3116).
+- Aggregate reads capture their bytes when evaluated, preserving values across later argument effects, assignment destination evaluation and return cleanup (#3210).
+- Three Windows corpus disassemblies now reflect the verified vector carrier ABI, including direct eight-byte payloads and exact twelve-byte staging (#3199).
+- Deferred gate and generic type probes keep their incomplete outcome, and identifiers already rejected by resolution retain their source error. Actual allocation failures and unvisited committed bindings remain internal errors (#3115, #3130).
+- Reclaim vector scalarization maps and lane work after each function while retaining emitted operands in IR-owned storage.
+- Loop-invariant motion and scalar replacement reclaim analysis and rewrite plans after each function or transformation round, while emitted IR operands retain module ownership (#2299).
+- Optimization releases mem2reg, constant-folding, algebraic, common-subexpression and dead-code work tables after each function, and verifier scratch after each check, instead of retaining them in the lowered IR arena (#2299).
 
 - Code generation releases each module's MIR, register-allocation, encoding and debug scratch after preserving its completed object image, instead of retaining scratch across the worker batch (#2299).
 - Mach-O executables describe embedded DWARF as file-only data with no memory protection and no relocation, allowing native dyld to load debug builds (#3202).
 - Windows vector calls now use one explicit carrier per byte extent: integer bits at 2/4 bytes, `__m64` at 8 bytes, a 128-bit intrinsic at 16 bytes, and an exact-size byte aggregate otherwise. Direct calls, typed indirect calls, parameter capture and returns agree, including hidden result-pointer argument shifts and caller-owned aggregate copies (#3199).
+- Keep the Windows stack-probe runtime fixtures at exact one-page and two-page frames in both build profiles by using explicitly volatile cold storage. The existing prologue-byte and recursion assertions remain unchanged.
+- Calls prepare argument values and owned aggregate copies before filling physical argument registers, keeping bulk-copy scratch available and preserving direct, indirect, hidden-result and variadic placement (#3109).
+- Native aggregate copies and zero initialization lower through bounded MIR loops. Copies preserve snapshot semantics for self and partial overlap, use exact byte extents, and retain secret-data markers without payload-dependent control flow (#3109).
+- Reload a spilled read/modify/write destination before its first source use, preserving shared scratch identity and reusing the reload for repeated aliases (#3215).
 
 - The frame-location link oracle checks every DWARF description sharing a machine range, preventing false failures for backed variables (#3197).
 - Two union-loader fixtures exercise the selected native semantic projection while preserving all six target tuples, transitive reachability masks, and errors in unreachable foreign branches (#3193).
@@ -149,6 +159,9 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 - Darwin CI installs the Homebrew LLVM formula selected by the committed oracle major, so a newer Homebrew stable release cannot break the pinned disassembly lane (#3181).
 
 #### Language and frontend
+
+- Oversized vector diagnostics allocate one owned message and preserve allocation failure instead of overwriting the first formatting result (#3204).
+- Embed containment checks preserve allocation and I/O failures as internal phase errors, release temporary paths, and pass canonical relative paths to the filesystem boundary on Windows (#3209).
 
 - Frontend phases carry explicit accepted, rejected and internal outcomes. Recoverable syntax errors retain their AST without claiming acceptance, and allocation failures in diagnostics, type interning and generic substitution remain internal even after a user error. Build classification no longer infers failure kinds from diagnostic counts (#3115, #3130).
 - `?` on a temporary (a call result, literal, cast, operator result, array, record or vector literal, or a field or element of one) is refused, naming the operand kind. It used to compile to a pointer into dead stack.
@@ -222,6 +235,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 - Object images are validated at every publication boundary, and a parser that fails publishes nothing.
 
 #### Driver and build
+
+- Planner template lookups borrow successful artifact outputs, release diagnostic scratch, and preserve allocation failures (#3208).
 
 - Initialization reports rollback and cleanup failures and retains its recovery journal until every required operation succeeds (#3174).
 - `mach run` validates artifact execution through the native command boundary, allowing Windows executables while retaining Unix execute-permission and native image rejection (#3184).
