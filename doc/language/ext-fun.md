@@ -448,3 +448,40 @@ same-named dynamic import.
 - [visibility.md](visibility.md) — `pub` and `ext` modifiers
 - [decorators.md](decorators.md) — `symbol`, `library`, and other codegen decorators
 - [variadics.md](variadics.md) — the comptime pack `...`, which is a Mach calling convention and not this one
+
+## Windows vector carriers
+
+The `win64` ABI maps a vector's lane bytes to the following C carrier. This
+mapping applies to arguments, returns, and typed function pointers, including
+calls between Mach functions. It is independent of the selected C compiler.
+
+| Vector extent | C carrier | Arguments | Return |
+|---|---|---|---|
+| 2 bytes | `unsigned short` | integer register or stack slot | low 16 bits of `RAX` |
+| 4 bytes | `unsigned int` | integer register or stack slot | low 32 bits of `RAX` |
+| 8 bytes | `__m64` | integer register or stack slot | `RAX` |
+| 16 bytes | `__m128`, `__m128i`, or `__m128d` | pointer to a caller-owned, 16-byte-aligned copy | `XMM0` |
+| Any other extent `N` | `struct { unsigned char bytes[N]; }` | pointer to a caller-owned, 16-byte-aligned copy | caller-provided result storage |
+
+Include `<mmintrin.h>` for `__m64` and `<emmintrin.h>` for the 128-bit intrinsic
+carriers. The byte-array carrier has exactly `N` bytes and no trailing padding.
+The result-storage pointer for an aggregate return occupies the first integer
+argument position, shifting the other arguments by one position. The callee
+returns that pointer in `RAX`.
+
+Lane zero occupies the first bytes. Each lane keeps its little-endian integer
+or IEEE floating-point bit representation. Carrier conversion copies bits,
+without numeric conversion, lane widening, or padding between lanes. Signed
+and floating-point lanes therefore use the same transport as unsigned lanes
+of the same width. A C function can inspect or construct lane bytes with a
+union or `memcpy`. Only the vector's `N` bytes belong to the value, even when
+its argument temporary has additional alignment padding.
+
+For example, `i16x4` uses `__m64`, `f32x4` uses a 128-bit intrinsic carrier,
+and `f32x3` uses `struct { unsigned char bytes[12]; }`. The memory layout of
+an enclosing Mach record is a separate contract from this function-boundary
+carrier mapping.
+
+A generic C extension such as `short __attribute__((vector_size(8)))` is not
+a substitute for `__m64`: GCC and Clang assign that extension different Windows
+argument and return conventions. Declare the carrier above at the boundary.
