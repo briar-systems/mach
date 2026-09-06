@@ -130,6 +130,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 ### Fixed
 
+- Embed containment roots initialize in final storage and propagate close failures through the typed result. The compiler uses the paired std filesystem ownership and publication API.
+
 - File digests retain the opened file while hashing and reject replacement paths or changed file metadata before publishing the digest.
 
 - Compiler output publication holds stable directory coordinators and reserves every unit destination before code-generation workers start. Object writers and linkers borrow those reservations, including IR, assembly and test dispatcher outputs.
