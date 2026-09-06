@@ -84,9 +84,9 @@ for profile in ['debug', 'release']:
             values = {int(index): int(byte, 16) for index, byte in found}
             assert set(values) == set(range(64)), (label, found)
             (evidence / (profile+'-'+label+'.bin')).write_bytes(bytes(values[index] for index in range(64)))
-        binaries = list(root.glob('out/*/'+profile+'/test/mach.exe'))
-        assert len(binaries) == 1, binaries
-        shutil.copy2(binaries[0], evidence / ('test-'+profile+'.exe'))
+        binary = root / 'out/windows-x86_64' / profile / 'test/mach-windows'
+        assert binary.is_file() and binary.read_bytes()[:2] == b'MZ'
+        shutil.copy2(binary, evidence / ('test-'+profile+'.exe'))
     finally:
         fixture.write_bytes(original)
 assert fixture.read_bytes() == original
