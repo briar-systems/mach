@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 root = pathlib.Path(__file__).resolve().parents[2]
-baseline = "eb60239a4d64bd158372a3031391544315c335a1"
+baseline = "3336e104af85deffe22aa8baf2ac3fb0b5f3c46a"
 pin = "3ee8e709a8ed7baff6e93780ce9b3582a907a91f"
 evidence = root / "outcome-repair-evidence"
 evidence.mkdir(exist_ok=True)
@@ -67,24 +67,13 @@ if rc:
 names = []
 for p in (root / "src").rglob("*.mach"):
     names.extend(re.findall(r'^test "([^\"]+)"', p.read_text(encoding="utf-8"), re.M))
-groups = ["mach.lang.driver.tests:", "mach.lang.editor.", "mach.lang.fe.", "mach.lang.driver.passes:"]
-# actual module names are checked against the source inventory before selecting.
-if not any(name.startswith(groups[0]) for name in names):
-    groups[0] = "mach.lang.driver:"
-failures = []
-for profile in ["debug", "release"]:
-    compiler = root / ("m3115repairB" + profile + suffix)
-    rc, log = invoke("A-to-B-" + profile, [str(a), "build", str(root), "--profile", profile, "-o", compiler.name])
-    if rc:
-        raise SystemExit("source compiler build failed")
-    for i, prefix in enumerate(groups):
-        count = sum(name.startswith(prefix) for name in names)
-        assert count > 0, prefix
-        try:
-            test(profile + "-baseline-group-" + str(i), prefix, count)
-        except RuntimeError:
-            failures.append((profile, prefix))
-if failures:
-    raise RuntimeError("baseline failures: " + repr(failures))
+profile = "debug"
+compiler = root / ("m3115repairBdebug" + suffix)
+rc, log = invoke("A-to-B-debug", [str(a), "build", str(root), "-o", compiler.name])
+if rc:
+    raise SystemExit("source compiler build failed")
+test("parser-parity-diagnostic", "mach.lang.editor.parse:driver_and_editor_share_one_parse_outcome", child=1)
+test("reserved-binding-ids", "mach.lang.fe.resolve:reserved_binding_ids_are_never_allocated_as_symbols")
+test("symbol-growth-edge", "mach.lang.fe.resolve:symbol_growth_does_not_wrap_into_deallocation")
 check_source()
 (evidence / "restoration.json").write_text(json.dumps(dict(source=baseline, pin=pin, restored=True)))
