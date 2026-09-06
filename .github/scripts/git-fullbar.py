@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import runpy
 import shutil
+import shlex
 import signal
 import subprocess
 import sys
@@ -24,7 +25,7 @@ def census():
     if sys.platform == 'win32':
         cmd = ['powershell.exe', '-NoProfile', '-Command', r"$ErrorActionPreference = 'Stop'; $found = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(mach|m[0-9A-Za-z_-]*|selfhostcc|A|B|C|D)(\.exe)?$' -and $_.CommandLine -match '\s(build|test)(\s|$)' }); $found | Select-Object ProcessId, Name, CommandLine | Format-List; if ($found.Count) { exit 75 }"]
     else:
-        cmd = ['bash', '-c', 'pgrep -af '+repr(PATTERN)+' || true\nif pgrep -f '+repr(PATTERN)+' >/dev/null; then exit 75; fi']
+        cmd = ['bash', '-c', 'pgrep -af '+shlex.quote(PATTERN)+' || true\nif pgrep -f '+shlex.quote(PATTERN)+' >/dev/null; then exit 75; fi']
     result = subprocess.run(cmd, capture_output=True, timeout=30)
     with (OUT / 'process-census.jsonl').open('a', encoding='utf-8') as f:
         f.write(json.dumps(dict(time=time.time(), command=cmd, code=result.returncode,
