@@ -30,6 +30,7 @@ use R: std.types.result;
 use mach.lang.intern;
 use mach.lang.manifest;
 use mach.lang.session;
+use mach.lang.publication;
 use mach.subprocess;
 
 use mach.lang.driver.project;
@@ -2309,6 +2310,12 @@ pub rec DepTxn {
     rollback_dirs: Vector[str];
     rollback_planned: bool;
     # the exclusive claim on the project root, held for the whole mutation
+    project_cap:   txn_fs.Root;
+    project_guard: txn_fs.Lock;
+    manifest_claim: txn_fs.Claim;
+    gitmodules_claim: txn_fs.Claim;
+    dep_claim: txn_fs.Claim;
+    modules_claim: txn_fs.Claim;
     root_cap:      txn_fs.Root;
     guard:         txn_fs.Lock;
 }
@@ -2336,16 +2343,35 @@ fun txn_index_snapshot(s: *session.Session, root: str) R.Result[GitBytes, str] {
     ret git_query_capture(s.build_alloc, ?gi, root, ?args[0], 6, false, nil, -1, false);
 }
 
-fun txn_read_snapshot(alloc: *A.Allocator, p: str, had: *bool) R.Result[str, str] {
+fun txn_read_snapshot(alloc: *A.Allocator, root: *txn_fs.Root, leaf: str, had: *bool) R.Result[str, str] {
     @had = false;
     var st: os.stat_t;
-    val checked: i64 = os.stat_path(os.AT_FDCWD, p, ?st, os.AT_SYMLINK_NOFOLLOW);
+    val checked: i64 = os.stat_path(txn_fs.root_fd(root), leaf, ?st, 0);
     if (checked == os.ENOENT) { ret R.ok[str, str](nil); }
     if (checked < 0) { ret R.err[str, str](os.message(checked)); }
-    val read: R.Result[str, str] = fs.read_string(alloc, p);
-    if (R.is_err[str, str](read)) { ret read; }
+    if ((os.stat_mode(?st) & os.S_IFMT) != os.S_IFREG) { ret R.err[str, str]("dependency snapshot is not a regular file"); }
+    if (st.st_size < 0 || st.st_size::u64 >= (~(0::usize))::u64) { ret R.err[str, str]("dependency snapshot size exceeds addressable storage"); }
+    val size: usize = st.st_size::usize;
+    val allocated: R.Result[*u8, str] = A.allocate[u8](alloc, size + 1);
+    if (R.is_err[*u8, str](allocated)) { ret R.err[str, str](R.unwrap_err[*u8, str](allocated)); }
+    val bytes: *u8 = R.unwrap_ok[*u8, str](allocated);
+    val read: R.Result[O.Option[usize], txn_fs.Error] = txn_fs.entry_read_all(root, leaf, bytes, size);
+    if (R.is_err[O.Option[usize], txn_fs.Error](read)) {
+        A.deallocate[u8](alloc, bytes, size + 1);
+        ret R.err[str, str](txn_fs.error_message(R.unwrap_err[O.Option[usize], txn_fs.Error](read)));
+    }
+    val count: O.Option[usize] = R.unwrap_ok[O.Option[usize], txn_fs.Error](read);
+    if (O.is_none[usize](count) || O.unwrap[usize](count) != size) {
+        A.deallocate[u8](alloc, bytes, size + 1);
+        ret R.err[str, str]("dependency snapshot changed while it was read");
+    }
+    bytes[size] = 0;
+    if (str_len(bytes::str) != size) {
+        A.deallocate[u8](alloc, bytes, size + 1);
+        ret R.err[str, str]("dependency text snapshot contains an embedded nul byte");
+    }
     @had = true;
-    ret read;
+    ret R.ok[str, str](bytes::str);
 }
 
 pub fun txn_begin(t: *DepTxn, s: *session.Session, root: str, mode: u8, label: str) R.Result[R.Void, str] {
@@ -2373,8 +2399,20 @@ pub fun txn_begin(t: *DepTxn, s: *session.Session, root: str, mode: u8, label: s
     val gitdir_r: R.Result[str, str] = git_dir_of(s, root);
     if (R.is_err[str, str](gitdir_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](gitdir_r)); }
     val gitdir: str = R.unwrap_ok[str, str](gitdir_r);
+    fin { str_free(s.build_alloc, gitdir); }
+    val project_opened: O.Option[txn_fs.Error] = txn_fs.root_open(?t.project_cap, root, "");
+    if (O.is_some[txn_fs.Error](project_opened)) { ret R.err[R.Void, str](txn_fs.error_message(O.unwrap[txn_fs.Error](project_opened))); }
+    val project_locked: O.Option[txn_fs.Error] = txn_fs.lock(?t.project_guard, ?t.project_cap);
+    if (O.is_some[txn_fs.Error](project_locked)) { ret R.err[R.Void, str](txn_fs.error_message(O.unwrap[txn_fs.Error](project_locked))); }
+    val recovered: R.Result[usize, txn_fs.Error] = txn_fs.recover(s.build_alloc, ?t.project_guard, "");
+    if (R.is_err[usize, txn_fs.Error](recovered)) { ret R.err[R.Void, str](txn_fs.error_message(R.unwrap_err[usize, txn_fs.Error](recovered))); }
+    val manifest_claimed: O.Option[txn_fs.Error] = txn_fs.claim(?t.manifest_claim, s.build_alloc, ?t.project_guard, manifest.MANIFEST_FILE);
+    if (O.is_some[txn_fs.Error](manifest_claimed)) { ret R.err[R.Void, str](txn_fs.error_message(O.unwrap[txn_fs.Error](manifest_claimed))); }
+    val gitmodules_claimed: O.Option[txn_fs.Error] = txn_fs.claim(?t.gitmodules_claim, s.build_alloc, ?t.project_guard, ".gitmodules");
+    if (O.is_some[txn_fs.Error](gitmodules_claimed)) { ret R.err[R.Void, str](txn_fs.error_message(O.unwrap[txn_fs.Error](gitmodules_claimed))); }
+    val dep_claimed: O.Option[txn_fs.Error] = txn_fs.claim(?t.dep_claim, s.build_alloc, ?t.project_guard, REALIZE_DEP_DIR);
+    if (O.is_some[txn_fs.Error](dep_claimed)) { ret R.err[R.Void, str](txn_fs.error_message(O.unwrap[txn_fs.Error](dep_claimed))); }
     val root_r: O.Option[txn_fs.Error] = txn_fs.root_open(?t.root_cap, gitdir, "");
-    str_free(s.build_alloc, gitdir);
     if (O.is_some[txn_fs.Error](root_r)) {
         ret R.err[R.Void, str](txn_fs.error_message(O.unwrap[txn_fs.Error](root_r)));
     }
@@ -2387,17 +2425,22 @@ pub fun txn_begin(t: *DepTxn, s: *session.Session, root: str, mode: u8, label: s
         ret R.err[R.Void, str](txn_fs.error_message(e));
     }
 
+    val git_recovered: R.Result[usize, txn_fs.Error] = txn_fs.recover(s.build_alloc, ?t.guard, "");
+    if (R.is_err[usize, txn_fs.Error](git_recovered)) { ret R.err[R.Void, str](txn_fs.error_message(R.unwrap_err[usize, txn_fs.Error](git_recovered))); }
+    val modules_claimed: O.Option[txn_fs.Error] = txn_fs.claim(?t.modules_claim, s.build_alloc, ?t.guard, "modules");
+    if (O.is_some[txn_fs.Error](modules_claimed)) { ret R.err[R.Void, str](txn_fs.error_message(O.unwrap[txn_fs.Error](modules_claimed))); }
+
     val mp_r: R.Result[str, str] = load.join_path(s.build_alloc, root, manifest.MANIFEST_FILE);
     if (R.is_err[str, str](mp_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](mp_r)); }
     t.manifest_path = R.unwrap_ok[str, str](mp_r);
-    val manifest_r: R.Result[str, str] = txn_read_snapshot(s.build_alloc, t.manifest_path, ?t.manifest_had);
+    val manifest_r: R.Result[str, str] = txn_read_snapshot(s.build_alloc, ?t.project_cap, manifest.MANIFEST_FILE, ?t.manifest_had);
     if (R.is_err[str, str](manifest_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](manifest_r)); }
     t.manifest_pre = R.unwrap_ok[str, str](manifest_r);
 
     val gm_r: R.Result[str, str] = load.join_path(s.build_alloc, root, ".gitmodules");
     if (R.is_err[str, str](gm_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](gm_r)); }
     t.gm_path = R.unwrap_ok[str, str](gm_r);
-    val gm_pre_r: R.Result[str, str] = txn_read_snapshot(s.build_alloc, t.gm_path, ?t.gm_had);
+    val gm_pre_r: R.Result[str, str] = txn_read_snapshot(s.build_alloc, ?t.project_cap, ".gitmodules", ?t.gm_had);
     if (R.is_err[str, str](gm_pre_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](gm_pre_r)); }
     t.gm_pre = R.unwrap_ok[str, str](gm_pre_r);
 
@@ -2424,10 +2467,20 @@ fun txn_free(s: *session.Session, t: *DepTxn) O.Option[str] {
     str_free(s.build_alloc, t.manifest_path);
     str_free(s.build_alloc, t.gm_path);
     t.live = false;
-    val unlocked: O.Option[txn_fs.Error] = txn_fs.unlock(?t.guard);
-    val closed: O.Option[txn_fs.Error] = txn_fs.root_dnit(?t.root_cap);
-    if (O.is_some[txn_fs.Error](unlocked)) { ret O.some[str](txn_fs.error_message(O.unwrap[txn_fs.Error](unlocked))); }
-    if (O.is_some[txn_fs.Error](closed)) { ret O.some[str](txn_fs.error_message(O.unwrap[txn_fs.Error](closed))); }
+    var errors: [8]O.Option[txn_fs.Error];
+    errors[0] = txn_fs.release_claim(?t.modules_claim);
+    errors[1] = txn_fs.unlock(?t.guard);
+    errors[2] = txn_fs.root_dnit(?t.root_cap);
+    errors[3] = txn_fs.release_claim(?t.dep_claim);
+    errors[4] = txn_fs.release_claim(?t.gitmodules_claim);
+    errors[5] = txn_fs.release_claim(?t.manifest_claim);
+    errors[6] = txn_fs.unlock(?t.project_guard);
+    errors[7] = txn_fs.root_dnit(?t.project_cap);
+    var i: usize = 0;
+    for (i < 8) {
+        if (O.is_some[txn_fs.Error](errors[i])) { ret O.some[str](txn_fs.error_message(O.unwrap[txn_fs.Error](errors[i]))); }
+        i = i + 1;
+    }
     ret O.none[str]();
 }
 
@@ -2486,9 +2539,9 @@ fun txn_dir_was_present(t: *DepTxn, id: str) bool {
 # a failed rollback retains its snapshots and guard for retry or explicit commit
 pub fun txn_rollback(s: *session.Session, t: *DepTxn) O.Option[str] {
     if (t == nil || t.address != t::usize || !t.live) { ret O.some[str]("dependency transaction is not live at its original address"); }
-    val manifest_restored: O.Option[str] = txn_restore_file(t.manifest_path, t.manifest_had, t.manifest_pre);
+    val manifest_restored: O.Option[str] = txn_restore_file(s.build_alloc, ?t.manifest_claim, t.manifest_path, t.manifest_had, t.manifest_pre);
     if (O.is_some[str](manifest_restored)) { ret manifest_restored; }
-    val gm_restored: O.Option[str] = txn_restore_file(t.gm_path, t.gm_had, t.gm_pre);
+    val gm_restored: O.Option[str] = txn_restore_file(s.build_alloc, ?t.gitmodules_claim, t.gm_path, t.gm_had, t.gm_pre);
     if (O.is_some[str](gm_restored)) { ret gm_restored; }
 
     if (!t.rollback_planned) {
@@ -2501,20 +2554,15 @@ pub fun txn_rollback(s: *session.Session, t: *DepTxn) O.Option[str] {
     var i: usize = 0;
     for (i < now.len) {
         if (!txn_dir_was_present(t, now.data[i])) {
-            val full_r: R.Result[str, str] = dep_full_of(s.build_alloc, t.root, now.data[i]);
-            if (R.is_err[str, str](full_r)) { ret O.some[str](R.unwrap_err[str, str](full_r)); }
-            val full: str = R.unwrap_ok[str, str](full_r);
-            fin { str_free(s.build_alloc, full); }
-            val removed: O.Option[str] = fs.remove_all(s.build_alloc, full);
-            if (O.is_some[str](removed)) { ret removed; }
+            val removed: R.Result[usize, txn_fs.Error] = txn_fs.root_remove_tree(?t.dep_claim, now.data[i]);
+            if (R.is_err[usize, txn_fs.Error](removed)) { ret O.some[str](txn_fs.error_message(R.unwrap_err[usize, txn_fs.Error](removed))); }
             if (t.mode == REALIZE_REPO_ROOT) {
-                val internal_r: R.Result[str, str] = format.sprint(s.build_alloc,
-                    "{}/.git/modules/{}/{}", t.root, REALIZE_DEP_DIR, now.data[i]);
+                val internal_r: R.Result[str, str] = dep_rel_of(s.build_alloc, now.data[i]);
                 if (R.is_err[str, str](internal_r)) { ret O.some[str](R.unwrap_err[str, str](internal_r)); }
                 val internal: str = R.unwrap_ok[str, str](internal_r);
                 fin { str_free(s.build_alloc, internal); }
-                val cleaned: O.Option[str] = fs.remove_all(s.build_alloc, internal);
-                if (O.is_some[str](cleaned)) { ret cleaned; }
+                val cleaned: R.Result[usize, txn_fs.Error] = txn_fs.root_remove_tree(?t.modules_claim, internal);
+                if (R.is_err[usize, txn_fs.Error](cleaned)) { ret O.some[str](txn_fs.error_message(R.unwrap_err[usize, txn_fs.Error](cleaned))); }
             }
         }
         i = i + 1;
@@ -2526,13 +2574,26 @@ pub fun txn_rollback(s: *session.Session, t: *DepTxn) O.Option[str] {
     ret txn_free(s, t);
 }
 
-fun txn_restore_file(p: str, had: bool, content: str) O.Option[str] {
-    if (had) { ret fs.write_bytes(p, content::*u8, str_len(content), 0o644); }
-    var st: os.stat_t;
-    val checked: i64 = os.stat_path(os.AT_FDCWD, p, ?st, os.AT_SYMLINK_NOFOLLOW);
-    if (checked == os.ENOENT) { ret O.none[str](); }
-    if (checked < 0) { ret O.some[str](os.message(checked)); }
-    ret fs.remove_file(p);
+pub fun txn_purge(t: *DepTxn, name: str) R.Result[usize, str] {
+    if (t == nil || t.address != t::usize || !t.live) { ret R.err[usize, str]("dependency transaction is not live at its original address"); }
+    if (!manifest.is_project_path(name)) { ret R.err[usize, str]("dependency removal requires a canonical path beneath dep"); }
+    val removed: R.Result[usize, txn_fs.Error] = txn_fs.root_remove_tree(?t.dep_claim, name);
+    if (R.is_err[usize, txn_fs.Error](removed)) { ret R.err[usize, str](txn_fs.error_message(R.unwrap_err[usize, txn_fs.Error](removed))); }
+    ret R.ok[usize, str](R.unwrap_ok[usize, txn_fs.Error](removed));
+}
+
+fun txn_restore_file(a: *A.Allocator, destination: *txn_fs.Claim, p: str, had: bool, content: str) O.Option[str] {
+    if (had) {
+        val restored: R.Result[R.Void, str] = publication.bytes_at(nil, a, destination, p, content::*u8, str_len(content), 0o644,
+            publication.REPLACE, "restore", "dependency rollback could not restore the file", nil);
+        if (R.is_err[R.Void, str](restored)) { ret O.some[str](R.unwrap_err[R.Void, str](restored)); }
+        ret O.none[str]();
+    }
+    val removed: O.Option[txn_fs.Error] = txn_fs.entry_unlink(destination);
+    if (O.is_none[txn_fs.Error](removed)) { ret O.none[str](); }
+    val e: txn_fs.Error = O.unwrap[txn_fs.Error](removed);
+    if (e.kind == txn_fs.IO && e.code == os.ENOENT) { ret O.none[str](); }
+    ret O.some[str](txn_fs.error_message(e));
 }
 
 fun t_scratch_dir(alloc: *A.Allocator, prefix: str) R.Result[str, str] {
