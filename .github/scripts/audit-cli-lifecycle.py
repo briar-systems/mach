@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-SOURCE = 'fd18ee1048ea1cdf54904f9baf12804dd8a8f5b3'
+SOURCE = 'f4cb38779d678d88962ca3f3d4792e09546246eb'
 PIN = 'c6b335ac862f4df392b69f503c4ffb1501d5a451'
 BRIDGE = '49fbbc48a9b290cbcb17c8187d339e5ce0bcc64b'
 BRIDGE_PIN = '3ee8e709a8ed7baff6e93780ce9b3582a907a91f'
@@ -192,6 +192,7 @@ for profile in ['debug', 'release']:
     c = build_generation(b, 'm3149cliC' + profile, profile)
     fixpoint('paired-' + profile + '-B-C', b, c)
     COMPILERS[profile] = c
+    shutil.copy2(c, EVIDENCE / c.name)
 
 baseline_ok = True
 for profile in ['debug', 'release']:
@@ -336,9 +337,13 @@ try:
                  '    str_free(s.build_alloc, R.unwrap_ok[str, str](removed));\n')
     replace_once(DEPS, current_deps[clear_start:clear_end], old_clear)
     if not test(COMPILERS['debug'], 'debug', 'porcelain-index-clear-restored',
-                'mach.cli.cmd.dep.add:a_clash_leaves_the_index_and_tree_as_they_were_and_no_lock_file', 1, 3,
+                'mach.cli.cmd.dep.add:a_clash_restores_the_index_and_tree_and_releases_both_coordinators', 1, 3,
                 'dependency rollback failed:'):
         raise RuntimeError('porcelain index clear did not fail at rollback')
+    mutate('successful-rollback-retains-coordinators', DEPS,
+           '    ret txn_free(s, t);\n}\n\npub fun txn_purge(',
+           '    ret O.none[str]();\n}\n\npub fun txn_purge(',
+           'mach.cli.cmd.dep.add:a_clash_restores_the_index_and_tree_and_releases_both_coordinators', 5)
     mutate('missing-original-refusal-removed', INIT,
            'if (!manifest_now.present && j.manifest_had_identity && !R.unwrap_ok[bool, str](manifest_backup)) {',
            'if (false) {',
