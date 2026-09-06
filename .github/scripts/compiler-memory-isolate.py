@@ -7,6 +7,7 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 
 HERE=Path(__file__).resolve().parent
 ROOT=HERE.parents[1]
@@ -138,22 +139,45 @@ def main():
     row.update(stage=label,category='aggregate-threshold',size=size,compiler_profile='debug',workload_profile=profile,expected=expected,observed=struct.unpack('<q',output.stdout)[0],binary_bytes=binary.stat().st_size,text_bytes=int(text[1],16),binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),object_bytes=sum(p.stat().st_size for p in (project/'out').rglob('*.o')),**metadata)
     save()
   shutil.rmtree(project/'out');shutil.rmtree(project/'.git')
- bulk=sources['bulk'];path=bulk/'src/lang/be/codegen/mir/bulk.mach';original=path.read_bytes()
+ observe_shape(sources['bulk'],compilers['bulk'])
+ for source in [workload,*sources.values()]:
+  assert not command(['git','diff','--exit-code','HEAD','--','src','mach.toml','dep/std'],source)
+ f.census('final')
+ (OUT/'complete.json').write_text(json.dumps(dict(stages=7,bootstrap_builds=21,producer_observations=27,generated_observations=27,aggregate_controls=48,MIR_shapes=30,source_unmodified=True),indent=2))
+
+
+def observe_shape(bulk,compiler):
+ path=bulk/'src/lang/be/codegen/mir/bulk.mach';original=path.read_bytes()
  (OUT/'shape-observation-test.mach').write_text(SHAPE_TEST)
  try:
   # imports stay before module declarations
   inserted='use audit_print: std.print;\n'+original.decode()+SHAPE_TEST.replace('use audit_print: std.print;\n','')
   path.write_text(inserted)
-  f.timed('instrumented-MIR-shape',[str(compilers['bulk']),'test','.','--profile','debug','--filter','mach.lang.be.codegen.mir.bulk:audit_shape_observation'],bulk,1200)
+  f.timed('instrumented-MIR-shape',[str(compiler),'test','.','--profile','debug','--filter','mach.lang.be.codegen.mir.bulk:audit_shape_observation','-vv'],bulk,1200)
   log=(OUT/'instrumented-MIR-shape.log').read_text()
   assert re.findall(r'(\d+) passed, (\d+) failed, (\d+) total',log)==[('1','0','1')]
   shapes=re.findall(r'bulk-shape,(\d+),(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)',log)
   assert len(shapes)==30,len(shapes)
   (OUT/'MIR-shapes.json').write_text(json.dumps([dict(zip(['bytes','copy','blocks','vregs','instructions','loads','stores'],map(int,row))) for row in shapes],indent=2))
  finally: path.write_bytes(original)
- for source in [workload,*sources.values()]:
-  assert not command(['git','diff','--exit-code','HEAD','--','src','mach.toml','dep/std'],source)
- f.census('final')
- (OUT/'complete.json').write_text(json.dumps(dict(stages=7,bootstrap_builds=21,producer_observations=27,generated_observations=27,aggregate_controls=48,MIR_shapes=30,source_unmodified=True),indent=2))
 
-if __name__=='__main__':main()
+def shape_only():
+ assert os.environ['SEED_TAG']=='v4.26.5'
+ source=checkout('bulk',STAGES['bulk'])
+ seed=shutil.which('mach');assert seed
+ for stage,current in [('A',seed),('B',str(source/'A'))]:
+  f.timed('shape-bootstrap-'+stage,[current,'build','.','--profile','debug','-o',stage],source,1200)
+ digest=hashlib.sha256((source/'B').read_bytes()).hexdigest()
+ assert digest=='f102acea0176e08efc81aeac3d15ae0871f23756e492a785e8c5edbbdf9c49cc',digest
+ (OUT/'shape-provenance.json').write_text(json.dumps(dict(source=STAGES['bulk'],std=STD,compiler_sha256=digest,prior_run=34040695104),indent=2))
+ try:
+  observe_shape(source,source/'B')
+ finally:
+  assert not command(['git','diff','--exit-code','HEAD','--','src','mach.toml','dep/std'],source)
+  f.census('final')
+ save()
+ (OUT/'shape-complete.json').write_text(json.dumps(dict(MIR_shapes=30,source_unmodified=True),indent=2))
+
+if __name__=='__main__':
+ if sys.argv[1:]==['--shape-only']:shape_only()
+ else:main()
