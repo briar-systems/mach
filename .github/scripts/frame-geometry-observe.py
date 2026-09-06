@@ -64,7 +64,7 @@ $if ($mach.build.arch == $mach.arch.x86_64 && $mach.build.os == $mach.os.windows
 (evidence / 'diagnostic-fixture.mach').write_bytes(b'use p: std.print;\n'+original+diagnostic.encode())
 results = []
 for profile in ['debug', 'release']:
-    compiler = root / ('B-'+profile+'.exe')
+    compiler = root / ('mGeometryB'+profile+'.exe')
     rc, text = invoke('A-to-B-'+profile, [str(compiler_a), 'build', str(root), '--profile', profile, '-o', compiler.name])
     assert rc == 0, text
     try:
