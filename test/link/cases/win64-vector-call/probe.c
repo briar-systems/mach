@@ -2,7 +2,7 @@
 #include <mmintrin.h>
 
 #if defined(_MSC_VER)
-// the standalone probe owns the MSVC floating-point link marker.
+// the standalone probe owns the msvc floating-point link marker.
 int _fltused;
 #endif
 
