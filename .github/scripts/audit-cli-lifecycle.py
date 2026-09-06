@@ -149,6 +149,7 @@ bridge_a = build_generation(seed, 'm3149BridgeA')
 bridge_b = build_generation(bridge_a, 'm3149BridgeB')
 bridge_c = build_generation(bridge_b, 'm3149BridgeC')
 fixpoint('bridge-B-C', bridge_b, bridge_c)
+shutil.copy2(bridge_c, EVIDENCE / bridge_c.name)
 if not test(bridge_c, 'debug', 'bridge-renamed-forward-regressions', 'mach.lang.driver:resolve_fwd_renamed_reexport_', 3):
     raise RuntimeError('audited bridge renamed-forward regression failed')
 check_source(BRIDGE, BRIDGE_PIN)
@@ -184,6 +185,7 @@ for name, prefix, expected in PREFIXES:
 (EVIDENCE / 'test-inventory.json').write_text(json.dumps(inventory, indent=2), encoding='utf-8')
 
 a = build_generation(bridge_c, 'm3149cliA')
+shutil.copy2(a, EVIDENCE / a.name)
 COMPILERS = {}
 for profile in ['debug', 'release']:
     b = build_generation(a, 'm3149cliB' + profile, profile)
@@ -270,18 +272,18 @@ def recovery_cli_probes():
     directory = cli_fixture('recovery-two-errors')
     rc, log = cli_probe(fixed, 'recovery-journal-setup', directory)
     journal = directory / '.machinit.journal'
-    if rc != 3 or 'audit after journal' not in log or not journal.is_file():
+    if rc != 2 or 'audit after journal' not in log or not journal.is_file():
         raise RuntimeError('CLI setup did not retain its actual journal after the injected phase failure')
     original = journal.read_bytes()
     rc, log = cli_probe(fixed, 'recovery-both-errors', directory)
     cleanup = 'error: init recovery cleanup: audit recovery cleanup'
-    if rc != 3 or 'audit recovery primary' not in log or cleanup not in log or journal.read_bytes() != original:
+    if rc != 2 or 'audit recovery primary' not in log or cleanup not in log or journal.read_bytes() != original:
         raise RuntimeError('CLI did not report both failures while retaining the unchanged journal')
     replace_once(INIT,
                  '        if (O.is_some[str](closed)) { print.eprintlnf("error: init recovery cleanup: {}", O.unwrap[str](closed)); }\n', '')
     old = compile_cli_probe('m3149RecoveryDrops')
     old_rc, old_log = cli_probe(old, 'old-recovery-drops-cleanup', directory)
-    if old_rc != 3 or 'audit recovery primary' not in old_log or cleanup in old_log or journal.read_bytes() != original:
+    if old_rc != 2 or 'audit recovery primary' not in old_log or cleanup in old_log or journal.read_bytes() != original:
         raise RuntimeError('old recovery policy did not isolate the missing cleanup diagnostic')
     (EVIDENCE / 'recovery-error-reporting.json').write_text(json.dumps(dict(
         positive_exit=rc, mutant_exit=old_rc, positive_messages=2, mutant_messages=1,
@@ -301,7 +303,7 @@ def recovery_cli_probes():
     directory = cli_fixture('recovery-close-keeps-journal')
     rc, log = cli_probe(fixed, 'recovery-close-retains-journal', directory)
     journal = directory / '.machinit.journal'
-    if rc != 3 or 'audit source close failure' not in log or not journal.is_file():
+    if rc != 2 or 'audit source close failure' not in log or not journal.is_file():
         raise RuntimeError('source close failure did not retain the completed publication journal')
     if (directory / 'mach.toml').read_text() == 'original manifest\n' or (directory / 'src' / 'root.mach').read_text() == 'original source\n':
         raise RuntimeError('close fault occurred before the actual publications')
@@ -312,7 +314,7 @@ def recovery_cli_probes():
     old = compile_cli_probe('m3149RecoveryLoses')
     old_directory = cli_fixture('recovery-close-loses-journal')
     old_rc, old_log = cli_probe(old, 'old-recovery-close-loses-journal', old_directory)
-    if old_rc != 3 or 'audit source close failure' not in old_log or (old_directory / '.machinit.journal').exists():
+    if old_rc != 2 or 'audit source close failure' not in old_log or (old_directory / '.machinit.journal').exists():
         raise RuntimeError('old close ordering did not isolate premature journal deletion')
     (EVIDENCE / 'recovery-close-ordering.json').write_text(json.dumps(dict(
         positive_exit=rc, mutant_exit=old_rc, positive_journal=True, mutant_journal=False,
