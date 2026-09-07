@@ -7,6 +7,22 @@ for output,compiler in [('A',seed),('B',f.P/'A'),('C',f.P/'B')]:
  code,_=f.invoke('bootstrap-'+output,[compiler,'build','.','--profile','debug','-o',output]);assert code==0
 assert (f.P/'B').read_bytes()==(f.P/'C').read_bytes()
 compiler=f.P/'B'
+oracle=f.P/'test/link/lib/produce.sh'
+code,_=f.invoke('oracle-controls',['python3',HERE/'fbreg-controls.py',oracle]);assert code==0
+text=oracle.read_text()
+mutations=[
+ ('stale-mov','previous = known.pop(number, None)','previous = known.get(number)','register-clobber'),
+ ('stale-load','known.pop(destination[0], None)','None','load-clobber'),
+ ('stale-join','if address in targets:\n            known.clear()','if address in targets:\n            pass','branch-join'),
+]
+for name,old,new,expected in mutations:
+ assert text.count(old)==1
+ mutant=f.E/(name+'-producer.sh');mutant.write_text(text.replace(old,new))
+ code,log=f.invoke(name+'-control',['python3',HERE/'fbreg-controls.py',mutant])
+ assert code!=0 and expected in log,log
+old_producer=f.E/'old-producer.sh'
+old=f.cmd(['git','show','7e26667e:test/link/lib/produce.sh'])
+old_producer.write_text(old)
 project=f.P/'test/link/cases/2759-riscv64-fbreg-bias'
 manifest=project/'mach.toml';original=manifest.read_bytes()
 manifest.write_text(original.decode().replace('ref = "branch/main"','ref = "commit/'+f.PIN+'"'))
@@ -28,7 +44,12 @@ for target in ['aarch64-linux','riscv64-linux','x86_64-linux']:
   binary=project/'out/evidence'/prefix;g=project/'out/evidence'/(prefix+'-g')
   command=['bash','-c','. "$1"; produce_varloc_fbreg native "$2" "$3" "$4"','proof',producer,target,binary,g]
   code,log=f.invoke(prefix+'-oracle',command);assert code==0
-  results.append(dict(target=target,profile=profile,oracle=log))
+  assert log=='varloc_fbreg_checked=nonzero\nvarloc_fbreg_unbacked=0\n',log
+  old_command=['bash','-c','. "$1"; produce_varloc_fbreg native "$2" "$3" "$4"','proof',old_producer,target,binary,g]
+  code,old_log=f.invoke(prefix+'-old-oracle',old_command);assert code==0
+  expected=4 if target=='aarch64-linux' and profile=='debug' else 0
+  assert old_log=='varloc_fbreg_checked=nonzero\nvarloc_fbreg_unbacked='+str(expected)+'\n',old_log
+  results.append(dict(target=target,profile=profile,oracle=log,old_oracle=old_log))
   for tag,tool,args in [('dwarf','llvm-dwarfdump',['--debug-info']),('disassembly','llvm-objdump',['-d','--no-show-raw-insn'])]:
    code,_=f.invoke(prefix+'-'+tag,[tool,*args,g]);assert code==0
 shutil.copytree(project/'out',f.E/'fixture-out')

@@ -1,6 +1,6 @@
 import hashlib,json,os,pathlib,re,shutil,subprocess,sys,time,signal
 ROOT=pathlib.Path(__file__).resolve().parents[2]
-SOURCE='7e26667e92e279b6ad2da53bf8e9a68ca42caa49'
+SOURCE='b4825532'
 PIN='3ee8e709a8ed7baff6e93780ce9b3582a907a91f'
 P=ROOT/'.wt/pieces';E=ROOT/'piece-evidence';E.mkdir(exist_ok=True)
 results=[]
