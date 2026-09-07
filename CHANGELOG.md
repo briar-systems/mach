@@ -130,6 +130,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 ### Fixed
 
+- Aggregate ABI carrier loads respect the exact logical object extent, including odd-sized register tails and split register/stack arguments. Partial carriers use initialized owned storage, incoming values reserve their full transport extent, and return carriers are prepared before physical return registers are assigned.
+
 - Bound common aggregate snapshots by machine-width pieces and avoid redundant alignment branches on targets with explicit ordinary-memory unaligned access support.
 
 - Calls prepare argument values and owned aggregate copies before filling physical argument registers, keeping bulk-copy scratch available and preserving direct, indirect, hidden-result and variadic placement (#3109).
