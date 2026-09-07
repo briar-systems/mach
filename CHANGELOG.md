@@ -130,7 +130,10 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 ### Fixed
 
+- Allocate ELF imported-address slots by actual use, including functions also called through the PLT. Preserve unique dynamic symbols and emit RISC-V pointer relocations with the ABI-defined type.
+
 - Isolate publication test outputs in private directories so concurrent linker and object-writer fixtures do not contend for one temporary-directory lock.
+
 
 - Resolve RISC-V GOT high/low relocation pairs through pointer-width GOT slots, preserving the high relocation target for both RV32 and RV64.
 
