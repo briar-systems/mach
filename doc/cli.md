@@ -731,7 +731,7 @@ needs no project (it runs from anywhere, with or without a `mach.toml`). The
 output is line-oriented and stable for scripts:
 
 ```
-mach 4.26.5
+mach 4.30.0
 host: linux/x86_64
 isa: x86_64 aarch64 riscv64 riscv32 spirv mos6502
 os: linux darwin windows freestanding

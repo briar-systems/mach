@@ -1396,7 +1396,7 @@ artifacts split on the executable extension, and one dependency, `std`:
 ```toml
 [project]
 id = "mach"
-version = "4.26.5"
+version = "4.30.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
@@ -1439,7 +1439,7 @@ need = []
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "branch/main"
+ref = "tag/v1.0.0"
 ```
 
 (The full manifest declares all six targets; `version` is whatever the tree's

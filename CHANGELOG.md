@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [4.30.0] - Unreleased
+## [4.30.0] - 2026-09-07
 
 The transition release that becomes the seed for 5.0.0. Replacement language
 and manifest forms ship alongside the legacy forms retained for migration
@@ -51,7 +51,7 @@ limits, including the refusal to take addresses of temporaries.
 
 #### Standard library
 
-The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
+The pin moves from 0.28.1 to std 1.0.0, the audited transition dependency.
 
 - 0.28.2: `Vector[T]` clears released storage metadata and survives repeated teardown.
 - 0.31.0: libc-free linkage. An ordinary linux binary carries no `PT_INTERP` and no dynamic section, and the compiler adopts the normalized io error surface.
@@ -63,6 +63,11 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 - 0.37.0: the `transaction.prepare` producer returns `Result[Void, str]`. The `ok(false)` abort arm is gone and `err` is the only abort.
 - 0.37.1: `root_remove_tree`, root-anchored recursive removal with a depth bound of 256.
 - 0.37.2: the TOML inline-table conflict path frees its parsed value through a local binding instead of taking the address of a call result. A heap-owning string test covers the release.
+
+- 1.0.0: explicit filesystem identity, cooperative publication ownership,
+  Windows Unicode process/filesystem boundaries, extensible descriptor storage,
+  and audited native resource lifetimes. This major establishes std's public
+  API and Semantic Versioning policy. Its future v5 migration is std 2.0.0.
 
 ### Changed
 
