@@ -51,7 +51,7 @@ limits, including the refusal to take addresses of temporaries.
 
 #### Standard library
 
-The pin moves from 0.28.1 to std 1.0.0, the audited transition dependency.
+The pin moves from 0.28.1 to std 1.0.1, the audited transition dependency.
 
 - 0.28.2: `Vector[T]` clears released storage metadata and survives repeated teardown.
 - 0.31.0: libc-free linkage. An ordinary linux binary carries no `PT_INTERP` and no dynamic section, and the compiler adopts the normalized io error surface.
