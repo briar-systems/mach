@@ -13,7 +13,7 @@ overlap='mach.lang.be.codegen.mir.bulk:unaligned_pieces_keep_snapshot_tails_and_
 cap='mach.lang.target.isa.moves_unaligned_gp:'
 mutants=[
  ('byte-pieces',bulk,'if (isa.moves_unaligned_gp(?e.ctx.tgt.model, width))','if (false)',shape,7),
- ('redundant-alignment-paths',bulk,'if ((mask & word::u32) != 0)','if (false)',shape,11),
+ ('redundant-alignment-paths',bulk,'if ((mask & word::u32) != 0)','if (false)',shape,12),
  ('volatile-unaligned-access',bulk,'if ((mi.memory_flags & mir.MEMORY_VOLATILE) == 0)','if (true)',overlap,8),
  ('tail-overrun',bulk,'width::u64 > remaining || ','',overlap,1),
  ('capability-invalid-width',isa,'if (bytes == 0 || bytes > m.gpr_width || (bytes & (bytes - 1)) != 0)','if (false)',cap,2),
