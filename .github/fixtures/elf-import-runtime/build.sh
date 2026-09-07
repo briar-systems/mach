@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -eu
 out=$1
-provider=$(realpath "$out/libprovider.so")
+provider="$PWD/$2"
 cc -fPIC -shared provider.c -Wl,-soname,"$provider" -o "$out/libprovider.so"
 cc -fPIC -O1 -c probe.c -o "$out/probe.o"
 readelf -rW "$out/probe.o" > "$out/probe.relocs"
