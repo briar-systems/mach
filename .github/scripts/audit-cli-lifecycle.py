@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-SOURCE = '9772c1334c33a81262c9f07507198762e3b9dfe0'
+SOURCE = 'e0c353e7d29e5581efa44a3ad0064bc9e12c6074'
 PIN = 'c6a8816933fffa8ee490bb0bed8a97e7f0c1b296'
 BASE_SOURCE = 'be70fdcd6cb0806406830be3ce2abb8d91f6ce0f'
 BASE_RUN = 34074514612
@@ -17,7 +17,7 @@ EVIDENCE.mkdir(exist_ok=True)
 (EVIDENCE / 'verification-script.py').write_bytes(pathlib.Path(__file__).read_bytes())
 RESULTS = []
 PREFIXES = [
-    ('elf', 'mach.lang.target.of.elf', 42),
+    ('elf', 'mach.lang.target.of.elf', 43),
 ]
 
 
@@ -157,24 +157,27 @@ try:
     old = run(['git', 'show', '3cb9ec3e:src/lang/target/of/elf.mach']).stdout.decode('utf-8').replace('\r\n', '\n')
     start = old.index('fun so_basename(')
     end = old.index('fun emit_shared(', start)
-    helper = old[start:end]
+    helper = old[start:end].replace("fun so_basename(path: *u8)", "fun so_basename(path: str)")
     label = 'old-windows-separator'
+    selector = 'mach.lang.target.of.elf.emit_shared:exports_and_soname'
+    expected_exit = '1'
     if sys.platform != 'win32':
         helper = helper.replace("path[i] == '/'", "path[i] == '/' || path[i] == '\\\\'")
         label = 'incorrect-posix-backslash-separator'
-    before = 'host_path.filename(destination.path)'
-    assert text.count(before) == 1 and text.count('fun emit_shared(') == 1
-    changed = text.replace(before, 'so_basename(destination.path::*u8)').replace('fun emit_shared(', helper + 'fun emit_shared(', 1)
+        selector = 'mach.lang.target.of.elf.so_basename:preserves_host_component_identity'
+        expected_exit = '2'
+    current_start = text.index('fun so_basename(')
+    current_end = text.index('test "mach.lang.target.of.elf.so_basename:', current_start)
+    changed = text[:current_start] + helper + text[current_end:]
     path.write_text(changed, encoding='utf-8', newline='')
     (EVIDENCE / 'mutated-helper.txt').write_text(helper, encoding='utf-8')
-    selector = 'mach.lang.target.of.elf.emit_shared:exports_and_soname'
     command = [str(COMPILERS['debug']), 'test', str(ROOT), '--profile', 'debug',
                '--filter', selector, '--timeout_seconds', '180']
     code, log = invoke(label, command)
     summaries = re.findall(r'(\d+) passed, (\d+) failed, (\d+) total', log)
     counts = list(map(int, summaries[-1])) if summaries else None
     exits = re.findall(r'\((?:exit|signal) ([^)]+)\)', log)
-    verified = counts == [0, 1, 1] and code != 0 and bool(exits) and set(exits) == {'1'} and '(signal ' not in log
+    verified = counts == [0, 1, 1] and code != 0 and bool(exits) and set(exits) == {expected_exit} and '(signal ' not in log
     row = dict(name=label, counts=counts, exits=exits, compiler_exit=code, verified=verified)
     RESULTS.append(row)
     (EVIDENCE / 'summary.json').write_text(json.dumps(RESULTS, indent=2), encoding='utf-8')
