@@ -496,17 +496,33 @@ Dispatches on `argv[2]`. The model it operates is documented in
 [manifest.md](manifest.md#depid): a dependency is named by its project id in
 the manifest key, the directory, and source alike; a `git` dependency is a git
 **submodule** at `dep/<id>/` whose committed gitlink is the pin; a `path`
-dependency is copied in as tracked files; the root's `dep/` holds the whole
+dependency is copied in as ordinary files; the root's `dep/` holds the whole
 transitive closure one level deep; and there is no lock file.
 
 | Action   | Args | Effect |
 |----------|------|--------|
 | `pull`   | `[<path>]` | realize the committed dependency closure without changing anything: check out every gitlink at its committed commit, one level deep, initializing a gitlink a fresh clone left as an empty directory (`realized std @ <commit> (initialized the committed gitlink)`). Never fetches anything new and never reads a `path` source. Idempotent. |
 | `verify` | `[<path>]` | run the build's dependency checks as a command, closure and selectors included, and print `ok`, or the first failure. A stale `mach.lock` in the root is noted here as on `pull`, since this is where a user looks when something is wrong. |
-| `add`    | `<name> (--git <url> [--ref <ref>] \| --path <dir>)` | declare `[dep.<name>]`, realize it and every identity it transitively requires, and stage the manifest, `.gitmodules`, and gitlinks as one transaction. Nothing is committed. A failure (a clash, a git error) leaves the index, the manifest, and `.gitmodules` byte-identical and no `dep/<name>` behind. |
+| `add`    | `<name> (--git <url> [--ref <ref>] \| --path <dir>)` | validate the candidate declaration, realize its dependency closure through Git, then publish `[dep.<name>]` in `mach.toml`. Git stages `.gitmodules` and gitlinks. Nothing is committed. |
 | `update` | `<name> \| --all` | advance `branch/` selectors to their current remote tips and re-stage the gitlinks; move an identity to the exact selector the root declares for it (`b: <old> -> <new> (pinned to the exact selector)`, or `(exact selector, already pinned)` when nothing moves). |
-| `remove` | `<name> [--purge]` | drop the declaration from `mach.toml` (and the gitlink from `.gitmodules`); `--purge` also deletes `dep/<name>/`. |
+| `remove` | `<name> [--purge]` | remove a Git dependency’s registration from the index and `.gitmodules` when no longer required, then publish the manifest without its declaration. The checkout is retained unless `--purge` is given. |
 | `list`   | — | print each realized dependency with its source, selector, pinned commit, and state (`realized`/`missing`). |
+
+Dependency changes use Git's normal submodule and index operations. Validation
+rejects conflicts that can be determined before those operations begin. A remote
+fetch, checkout, newly discovered transitive conflict, or manifest publication can
+still fail after an earlier operation succeeds. Mach stops, reports the failed
+operation and completed work, and leaves Git's state available for inspection.
+It does not restore an earlier index or recursively erase partial checkouts.
+Use `git status` and inspect the named dependency before retrying.
+
+`mach.toml` is published only after the requested dependency operations succeed.
+Its contents are replaced atomically with the complete old or new file. An error
+can occur after replacement, so inspect `mach.toml` when publication reports an
+error. Completed Git operations remain. Concurrent Mach manifest
+edits are serialized. Git provides its own locking for each Git operation.
+Directories outside the resulting closure are reported and retained for explicit
+removal.
 
 `sync` is the pre-`pull` name, kept as a deprecated alias of `pull`.
 
@@ -535,10 +551,9 @@ tag/<name>, or commit/<full-object-id>`). `--ref` is valid only with `--git`;
 
 `mach build` never requires the network: a project whose `dep/` is realized
 builds offline, and the build never fetches and never writes under `dep/`.
-The build does require **git**, since the pin it verifies is a gitlink: a root
-that is not inside a git repository does not build (`dependency 'std': project
-root '...' is not inside a Git repository; dependency realization is verified
-from Git`). Only `pull`, `update`, and `add` reach the network, through git
+A project and its local path dependencies do not need a Git repository or index.
+Git dependencies require **git** for offline checkout and pin verification. Only
+`pull`, `update`, and `add` reach the network, through git
 discovered on `PATH` and invoked with an allowlisted environment (`PATH`,
 `HOME`, the common git/ssh/proxy/CA variables, and
 `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, which is how a
@@ -553,13 +568,16 @@ against a gitlink that is not yet a checkout of its own: an empty directory a
 plain `git clone` leaves for a submodule is initialized in place by `pull`. A
 checkout that is not at its gitlink, or that has uncommitted changes, fails
 verification (`dependency 'std': checkout is dirty:  M mach.toml`);
-realization must be a physical directory, not a symlink. The writer guard
-that excludes a second concurrent `mach dep` mutator lives in the repository's
-git directory, so nothing appears in the working tree.
+realization must be a physical directory, not a symlink. A project without its
+own Git repository realizes Git dependencies as plain clones and verifies those
+checkouts directly. Dependency commands never create the project repository,
+create commits, move project branches, or stage `mach.toml` or unrelated files.
 
-For a **path** dependency, `add --path <dir>` copies the source's tracked files
-into `dep/<name>/` as tracked files of the root repository, without the
-source's own `dep/`, and refuses a source that escapes through a symlink. The
+For a **path** dependency, `add --path <dir>` copies the local source files
+into `dep/<name>/`, without the source's own `dep/` or Git metadata, and refuses
+a source that escapes through a symlink. Copied files are not automatically
+staged. Verification checks the filesystem realization and does not require it
+to be tracked in Git. The
 `path` is resolved relative to the requiring manifest's directory. `pull` never
 reads a `path` source: the copy is the realization.
 

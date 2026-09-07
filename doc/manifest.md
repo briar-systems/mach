@@ -886,7 +886,7 @@ A stanza declares exactly one source:
 |--------|---------|
 | `git`  | Git URL. The dependency is a git **submodule** at `dep/<id>/`, pinned by the gitlink the root repository commits. Requires `ref`. |
 | `ref`  | Selector for `git`: `branch/<name>`, `tag/<name>`, or `commit/<full-object-id>`. Any other spelling is rejected (`[dep.std].ref must be branch/<name>, tag/<name>, or commit/<full-object-id>`). |
-| `path` | Local project tree, never fetched. A relative `path` is resolved relative to this manifest's directory. `mach dep add --path` copies its tracked files into `dep/<id>/` as ordinary tracked files of the root repository, without the source's own `dep/`. Forbids `ref`. |
+| `path` | Local project tree, never fetched. A relative `path` is resolved relative to this manifest's directory. `mach dep add --path` copies its files into `dep/<id>/` without the source's own `dep/` or Git metadata. No repository or index is required for a path dependency, and copied files are not automatically staged. Forbids `ref`. |
 
 `git` and `path` are mutually exclusive and exactly one is required. A
 registry-style `version =` is reserved and rejected
@@ -900,10 +900,11 @@ records a pin: there is no `mach.lock`, and a `mach.lock` left over from an
 earlier release is not read. In 4.30.0 it is ignored; 5.0.0 rejects a project
 that carries one, with a diagnostic naming the migration.
 
-Because the pin is a gitlink, the source distribution of a project is a git
-clone: a tree without `.git` does not build, and dependency verification never
-degrades in its absence (`project root '...' is not inside a Git repository;
-dependency realization is verified from Git`).
+A project does not need its own Git repository. In a repository root, Git
+dependencies use the staged gitlinks as their pins. In a filesystem project or a
+project nested inside an unrelated repository, they are plain clones whose own
+checkout commits are verified. Local path dependencies are verified from their
+filesystem realizations, independently of any Git index.
 
 ### The root owns the flat closure
 
@@ -953,9 +954,9 @@ local mirror) verifies by its commit alone.
 Builds never fetch and never write under `dep/`. Every build (and `mach dep
 verify` as a command) checks, offline, that:
 
-1. every `dep/<id>` is a gitlink checked out at the committed commit and clean
-   (`dependency 'std': checkout is dirty:  M mach.toml`), or tracked path
-   content;
+1. every Git dependency is a clean checkout at its applicable pin
+   (`dependency 'std': checkout is dirty:  M mach.toml`), and every path
+   dependency is a contained filesystem tree without repository metadata;
 2. its project id equals the directory name;
 3. the closure computed from the realized manifests equals the set of
    directories under `dep/`: nothing missing (`dependency 'std' is not
@@ -983,8 +984,8 @@ a checkout of its own.
 
 A project root is identified by its own `mach.toml`, not by an enclosing git
 repository; `dep/<id>` is resolved relative to the project root. A project
-nested inside an unrelated repository builds. When the root is not a repository
-root, verification says so rather than reporting a missing gitlink.
+nested inside an unrelated repository or without any repository builds. Git
+dependencies in these projects are verified from their own plain checkouts.
 
 ### Selection on `update`
 
