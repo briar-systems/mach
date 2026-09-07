@@ -3,6 +3,12 @@
 Expressions evaluate to values. They appear on the right side of bindings,
 as conditions, and as call arguments.
 
+Reading an aggregate captures its value at that evaluation point. A later
+argument, assignment destination expression, or `fin` body cannot change
+the captured value by modifying its original storage. Call arguments evaluate
+left to right. Assignment evaluates and captures the right side before
+evaluating the destination on the left side.
+
 ## Literals
 
 See [literals.md](literals.md) — numeric, char, string, and `nil` forms.
