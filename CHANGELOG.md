@@ -132,6 +132,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 ### Fixed
 
+- Patch x86-64 ELF imported-address GOT references through the existing relocation backend, preserving displacement addends and field-width overflow checks.
+
 - Allocate ELF imported-address slots by actual use, including functions also called through the PLT. Preserve unique dynamic symbols and emit RISC-V pointer relocations with the ABI-defined type.
 
 - Resolve RISC-V GOT high/low relocation pairs through pointer-width GOT slots, preserving the high relocation target for both RV32 and RV64.
