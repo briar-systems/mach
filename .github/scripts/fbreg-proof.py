@@ -9,7 +9,7 @@ assert (f.P/'B').read_bytes()==(f.P/'C').read_bytes()
 compiler=f.P/'B'
 project=f.P/'test/link/cases/2759-riscv64-fbreg-bias'
 manifest=project/'mach.toml';original=manifest.read_bytes()
-manifest.write_text(original.decode().replace('ref = "branch/main"','ref = "'+f.PIN+'"'))
+manifest.write_text(original.decode().replace('ref = "branch/main"','ref = "commit/'+f.PIN+'"'))
 subprocess.run(['git','clone','--quiet',str(f.P/'dep/std'),str(project/'dep/std')],check=True)
 f.cmd(['git','checkout','--detach',f.PIN],project/'dep/std')
 code,_=f.invoke('fixture-pull',[compiler,'dep','pull',project]);assert code==0
