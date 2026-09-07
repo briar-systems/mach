@@ -7,19 +7,17 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-SOURCE = 'f4cb38779d678d88962ca3f3d4792e09546246eb'
-PIN = 'c6b335ac862f4df392b69f503c4ffb1501d5a451'
+SOURCE = '15618425ea867bd4e91edf616b027b5abe1644aa'
+PIN = 'c6a8816933fffa8ee490bb0bed8a97e7f0c1b296'
 BRIDGE = '49fbbc48a9b290cbcb17c8187d339e5ce0bcc64b'
-BRIDGE_PIN = '3ee8e709a8ed7baff6e93780ce9b3582a907a91f'
+BRIDGE_PIN = 'c6a8816933fffa8ee490bb0bed8a97e7f0c1b296'
 EVIDENCE = ROOT / 'cli-lifecycle-evidence'
 EVIDENCE.mkdir(exist_ok=True)
 (EVIDENCE / 'verification-script.py').write_bytes(pathlib.Path(__file__).read_bytes())
 RESULTS = []
 PREFIXES = [
-    ('init', 'mach.cli.cmd.init', 41),
-    ('dep-cli', 'mach.cli.cmd.dep', 21),
-    ('clean', 'mach.cli.cmd.clean', 8),
-    ('deps', 'mach.lang.driver.deps', 12),
+    ('init', 'mach.cli.cmd.init', 44),
+    ('args', 'mach.cli.args', 15),
     ('publication', 'mach.lang.publication', 2),
     ('fingerprint', 'mach.lang.build.fingerprint', 11),
 ]
@@ -203,206 +201,39 @@ if not baseline_ok:
     (EVIDENCE / 'restoration.json').write_text(json.dumps(dict(source=SOURCE, pin=PIN, restored=True)), encoding='utf-8')
     raise RuntimeError('one or more complete native prefix suites failed')
 
-INIT = 'src/cli/cmd/init.mach'
-DEPS = 'src/lang/driver/deps.mach'
-ENGINE = 'src/lang/build/engine.mach'
-DRIVER_TESTS = 'src/lang/driver/tests.mach'
-pristine = {p: (ROOT / p).read_bytes() for p in [INIT, DEPS, ENGINE, DRIVER_TESTS]}
 
-def restore():
-    for path, content in pristine.items():
-        (ROOT / path).write_bytes(content)
+import os
+import tempfile
 
-ENGINE_PROBE = '\ntest "mach.lang.build.engine.audit:internal_phase_and_cleanup_failures_remain_distinct" {\n    var alloc: A.Allocator;\n    if (O.is_some[str](page.make(?alloc))) { ret 1; }\n    val sr: R.Result[session.Session, str] = session.init(?alloc);\n    if (R.is_err[session.Session, str](sr)) { ret 2; }\n    var s: session.Session = R.unwrap_ok[session.Session, str](sr);\n    fin { session.dnit(?s); }\n    if (R.is_err[R.Void, str](driver.setup_registry(?s.registry))) { ret 3; }\n    var names: [1]str = [1]str{"main.mach"};\n    var texts: [1]str;\n    texts[0] = ut_cc3(?alloc, "#[symbol(\\"", ut_entry_symbol(), "\\")]\\nfun start() i32 { ret 0; }\\n");\n    val root_r: R.Result[str, str] = ut_scaffold_m(?alloc, ut_manifest_notargets(), ?names[0], ?texts[0], 1);\n    if (R.is_err[str, str](root_r)) { ret 4; }\n    val root: str = R.unwrap_ok[str, str](root_r);\n    fin { fs.remove_all(?alloc, root); }\n    val manifest_r: R.Result[manifest.Manifest, str] = driver.load_manifest(?s, root);\n    if (R.is_err[manifest.Manifest, str](manifest_r)) { ret 5; }\n    var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](manifest_r);\n    var req: request.BuildRequest = request.defaults();\n    req.project_root = root;\n    val planned: R.Result[bplan.BuildPlan, outcome.Fail] = bplan.plan(?alloc, ?s.interner, ?s.registry, ?m, req);\n    if (R.is_err[bplan.BuildPlan, outcome.Fail](planned)) { ret 6; }\n    var bp: bplan.BuildPlan = R.unwrap_ok[bplan.BuildPlan, outcome.Fail](planned);\n    val result: R.Result[outcome.BuildOutcome, outcome.Fail] = bengine.execute_warm(?bp, 0, ?s, ?alloc, nil);\n    if (R.is_err[outcome.BuildOutcome, outcome.Fail](result)) { ret 7; }\n    var bo: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](result);\n    fin { outcome.outcome_dnit(?bo); }\n    if (bo.artifacts.len != 0) { ret 8; }\n    if (bo.severity != outcome.BUILD_INTERNAL) { ret 9; }\n    var primary: usize = 0;\n    var cleanup: usize = 0;\n    var i: usize = 0;\n    for (i < bo.events.len) {\n        val event: *outcome.BuildEvent = ?bo.events.data[i];\n        if (event.kind == outcome.BUILD_EVENT_FAIL) {\n            if (event.data.fail.kind == outcome.FAIL_INTERNAL\n                && str_equals(event.data.fail.message, "audit internal phase failure")) { primary = primary + 1; }\n            or (event.data.fail.kind == outcome.FAIL_ENVIRONMENT\n                && str_contains(event.data.fail.message, "publication cleanup: ")) { cleanup = cleanup + 1; }\n            or { ret 11; }\n        }\n        i = i + 1;\n    }\n    if (primary != 1 || cleanup != 1) { ret 10; }\n    ret 0;\n}\n'
+with tempfile.TemporaryDirectory(prefix='mach-init-without-git-') as scratch:
+    destination = pathlib.Path(scratch) / 'project'
+    environment = dict(os.environ, PATH='')
+    command = [str(COMPILERS['debug']), 'init', str(destination), '--name', 'without_git', '--no-git', '--no-deps']
+    census('init-without-git-program')
+    result = subprocess.run(command, cwd=scratch, env=environment, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, timeout=90)
+    (EVIDENCE / 'init-without-git-program.log').write_bytes(result.stdout)
+    assert result.returncode == 0, result.stdout.decode(errors='replace')
+    assert (destination / 'mach.toml').is_file()
+    assert (destination / 'src/root.mach').is_file()
+    assert not (destination / '.git').exists()
+    assert not (destination / '.gitmodules').exists()
 
-def engine_probe(kind):
-    restore()
-    fixture = ENGINE_PROBE
-    if kind == 'INVALID':
-        fixture = fixture.replace('event.data.fail.kind == outcome.FAIL_ENVIRONMENT', 'event.data.fail.kind == outcome.FAIL_INTERNAL')
-    with (ROOT / DRIVER_TESTS).open('a', encoding='utf-8', newline='') as file:
-        file.write(fixture)
-    replace_once(ENGINE,
-                 'if (R.is_ok[R.Void, outcome.Fail](result)) { result = codegen_phase(p, st, ev); }',
-                 'if (R.is_ok[R.Void, outcome.Fail](result)) { result = R.err[R.Void, outcome.Fail](outcome.internal("audit internal phase failure")); }')
-    replace_once(ENGINE,
-                 '    ret publication.plan_dnit(?st.outputs);',
-                 '    val actual: O.Option[txn.Error] = publication.plan_dnit(?st.outputs);\n'
-                 '    if (O.is_some[txn.Error](actual)) { ret actual; }\n'
-                 '    ret O.some[txn.Error](txn.error(txn.' + kind + ', txn.OP_ABORT));')
-
-
-def compile_cli_probe(name):
-    executable = ROOT / (name + suffix)
-    rc, _ = invoke(name + '-build', [str(COMPILERS['debug']), 'build', str(ROOT), '-o', executable.name])
-    if rc:
-        raise RuntimeError('CLI fault probe failed to compile')
-    return executable
-
-
-def cli_probe(executable, name, directory):
-    return invoke(name, [str(executable), 'init', str(directory), '--name', 'recovery_audit', '--force', '--no-deps'])
-
-
-def cli_fixture(name):
-    directory = EVIDENCE / name
-    directory.mkdir()
-    (directory / 'src').mkdir()
-    (directory / 'src' / 'root.mach').write_text('original source\n', encoding='utf-8')
-    (directory / 'mach.toml').write_text('original manifest\n', encoding='utf-8')
-    return directory
-
-
-def recovery_cli_probes():
-    restore()
-    replace_once(INIT,
-                 '    val manifest_now_r: R.Result[InitEntry, str] = probe_entry(root_cap, util.PROJECT_CONFIG_NAME);',
-                 '    if (a != nil) { ret R.err[i32, str]("audit recovery primary"); }\n'
-                 '    val manifest_now_r: R.Result[InitEntry, str] = probe_entry(root_cap, util.PROJECT_CONFIG_NAME);')
-    replace_once(INIT,
-                 '    if (R.is_err[R.Void, str](journal)) { ret R.err[i32, str](R.unwrap_err[R.Void, str](journal)); }',
-                 '    if (R.is_err[R.Void, str](journal)) { ret R.err[i32, str](R.unwrap_err[R.Void, str](journal)); }\n'
-                 '    if (a != nil) { ret R.err[i32, str]("audit after journal"); }')
-    replace_once(INIT,
-                 '    val closed: O.Option[str] = directory_close(?source);',
-                 '    var closed: O.Option[str] = directory_close(?source);\n'
-                 '    if (R.is_err[i32, str](result) && str_equals(R.unwrap_err[i32, str](result), "audit recovery primary")) {\n'
-                 '        closed = O.some[str]("audit recovery cleanup");\n'
-                 '    }')
-    fixed = compile_cli_probe('m3149RecoveryReports')
-    directory = cli_fixture('recovery-two-errors')
-    rc, log = cli_probe(fixed, 'recovery-journal-setup', directory)
-    journal = directory / '.machinit.journal'
-    if rc != 2 or 'audit after journal' not in log or not journal.is_file():
-        raise RuntimeError('CLI setup did not retain its actual journal after the injected phase failure')
-    original = journal.read_bytes()
-    rc, log = cli_probe(fixed, 'recovery-both-errors', directory)
-    cleanup = 'error: init recovery cleanup: audit recovery cleanup'
-    if rc != 2 or 'audit recovery primary' not in log or cleanup not in log or journal.read_bytes() != original:
-        raise RuntimeError('CLI did not report both failures while retaining the unchanged journal')
-    replace_once(INIT,
-                 '        if (O.is_some[str](closed)) { print.eprintlnf("error: init recovery cleanup: {}", O.unwrap[str](closed)); }\n', '')
-    old = compile_cli_probe('m3149RecoveryDrops')
-    old_rc, old_log = cli_probe(old, 'old-recovery-drops-cleanup', directory)
-    if old_rc != 2 or 'audit recovery primary' not in old_log or cleanup in old_log or journal.read_bytes() != original:
-        raise RuntimeError('old recovery policy did not isolate the missing cleanup diagnostic')
-    (EVIDENCE / 'recovery-error-reporting.json').write_text(json.dumps(dict(
-        positive_exit=rc, mutant_exit=old_rc, positive_messages=2, mutant_messages=1,
-        journal_unchanged=True, mutation_guard='missing cleanup diagnostic', verified=True)), encoding='utf-8')
-
-    restore()
-    replace_once(INIT, 'fun directory_close(cap: *InitDirectory) O.Option[str] {',
-                 'fun directory_close(cap: *InitDirectory) O.Option[str] {\n'
-                 '    val audit_live_source: bool = cap.names[0] != nil && str_equals(cap.names[0], "root.mach")\n'
-                 '        && R.is_ok[txn.Identity, txn.Error](txn.root_identity(?cap.root));')
-    replace_once(INIT,
-                 '    if (O.is_some[txn.Error](failure)) { ret O.some[str](txn_msg(O.unwrap[txn.Error](failure))); }\n    ret O.none[str]();',
-                 '    if (O.is_some[txn.Error](failure)) { ret O.some[str](txn_msg(O.unwrap[txn.Error](failure))); }\n'
-                 '    if (audit_live_source) { ret O.some[str]("audit source close failure"); }\n'
-                 '    ret O.none[str]();')
-    fixed = compile_cli_probe('m3149RecoveryKeeps')
-    directory = cli_fixture('recovery-close-keeps-journal')
-    rc, log = cli_probe(fixed, 'recovery-close-retains-journal', directory)
-    journal = directory / '.machinit.journal'
-    if rc != 2 or 'audit source close failure' not in log or not journal.is_file():
-        raise RuntimeError('source close failure did not retain the completed publication journal')
-    if (directory / 'mach.toml').read_text() == 'original manifest\n' or (directory / 'src' / 'root.mach').read_text() == 'original source\n':
-        raise RuntimeError('close fault occurred before the actual publications')
-    replace_once(INIT,
-                 '    if (O.is_none[str](failure) && entry_backup != nil) { failure = resolve_commit_cleanup(src_cap, entry_backup); }\n'
-                 '    if (O.is_none[str](failure)) { failure = directory_close(src_cap); }',
-                 '    if (O.is_none[str](failure) && entry_backup != nil) { failure = resolve_commit_cleanup(src_cap, entry_backup); }')
-    old = compile_cli_probe('m3149RecoveryLoses')
-    old_directory = cli_fixture('recovery-close-loses-journal')
-    old_rc, old_log = cli_probe(old, 'old-recovery-close-loses-journal', old_directory)
-    if old_rc != 2 or 'audit source close failure' not in old_log or (old_directory / '.machinit.journal').exists():
-        raise RuntimeError('old close ordering did not isolate premature journal deletion')
-    (EVIDENCE / 'recovery-close-ordering.json').write_text(json.dumps(dict(
-        positive_exit=rc, mutant_exit=old_rc, positive_journal=True, mutant_journal=False,
-        native_publications=True, mutation_guard='journal missing after source close failure', verified=True)), encoding='utf-8')
-
-
+path = ROOT / 'src/cli/cmd/init.mach'
+original = path.read_bytes()
 try:
-    mutate('absolute-anchor-skipped', INIT,
-           'val anchored: O.Option[txn.Error] = anchor_absolute_parent(?a, ?split);',
-           'val anchored: O.Option[txn.Error] = O.none[txn.Error]();',
-           'mach.cli.cmd.init.run_typed:absolute_ancestor_aliases_preserve_final_destination_refusal', 7)
-    restore()
-    current_deps = (ROOT / DEPS).read_text(encoding='utf-8')
-    clear_start = current_deps.index('    var list: [5]str', current_deps.index('fun txn_restore_index('))
-    clear_end = current_deps.index('    ret txn_write_index(', clear_start)
-    old_clear = ('    var clear: [9]str = [9]str{"rm", "--cached", "-r", "-f", "-q", "--ignore-unmatch", "--", REALIZE_DEP_DIR, ".gitmodules"};\n'
-                 '    val removed: R.Result[str, str] = git_op(s.build_alloc, ?gi, t.root, ?clear[0], 9, nil);\n'
-                 '    if (R.is_err[str, str](removed)) { ret O.some[str](R.unwrap_err[str, str](removed)); }\n'
-                 '    str_free(s.build_alloc, R.unwrap_ok[str, str](removed));\n')
-    replace_once(DEPS, current_deps[clear_start:clear_end], old_clear)
-    if not test(COMPILERS['debug'], 'debug', 'porcelain-index-clear-restored',
-                'mach.cli.cmd.dep.add:a_clash_restores_the_index_and_tree_and_releases_both_coordinators', 1, 3,
-                'dependency rollback failed:'):
-        raise RuntimeError('porcelain index clear did not fail at rollback')
-    mutate('successful-rollback-retains-coordinators', DEPS,
-           '    ret txn_free(s, t);\n}\n\npub fun txn_purge(',
-           '    ret O.none[str]();\n}\n\npub fun txn_purge(',
-           'mach.cli.cmd.dep.add:a_clash_restores_the_index_and_tree_and_releases_both_coordinators', 5)
-    mutate('missing-original-refusal-removed', INIT,
-           'if (!manifest_now.present && j.manifest_had_identity && !R.unwrap_ok[bool, str](manifest_backup)) {',
-           'if (false) {',
-           'mach.cli.cmd.init.recover_existing:missing_original_and_backup_preserves_the_journal', 10)
-    mutate('journal-root-identity-truncated', INIT,
-           '    j.root = root_id;',
-           '    j.root = root_id;\n    j.root.representation[40] = 0;',
-           'mach.cli.cmd.init.lifecycle:journal_preserves_the_complete_native_identity', 11)
-    mutate('new-source-recovery-admits-child-coordinator', INIT,
-           '            val opened: O.Option[txn.Error] = txn.root_open_child(?src_cap.root, ?root_cap.root, "src");\n            if (O.is_some[txn.Error](opened)) { ret R.err[i32, str](txn_msg(O.unwrap[txn.Error](opened))); }',
-           '            val opened: R.Result[R.Void, str] = open_src_cap(src_cap, a, root_cap);\n            if (R.is_err[R.Void, str](opened)) { ret R.err[i32, str](R.unwrap_err[R.Void, str](opened)); }',
-           'mach.cli.cmd.init.recover_existing:new_source_subtree_rolls_back_without_coordinator_residue', 17)
-    mutate('new-source-entry-removal-skipped', INIT,
-           '            if (entry_present) {', '            if (false) {',
-           'mach.cli.cmd.init.recover_existing:new_source_subtree_rolls_back_without_coordinator_residue', 14)
-    mutate('new-source-rollback-removes-neighbors', INIT,
-           'txn.root_remove_tree(destination(root_cap, "src"), entry_leaf)',
-           'txn.root_remove_tree(destination(root_cap, "src"), "")',
-           'mach.cli.cmd.init.recover_existing:new_source_subtree_rollback_preserves_unowned_neighbors', 15)
-    mutate('dependency-rollback-error-discarded', DEPS,
-           '    if (O.is_some[str](manifest_restored)) { ret manifest_restored; }', '',
-           'mach.cli.cmd.dep.txn:final_storage_refuses_copies_and_snapshot_failure_releases_the_guard', 17)
-    restore()
-    replace_once(DEPS,
-                 'git_query_capture(alloc, gi, root, args, arg_len, false, nil, input.file.handle.value::i32, true)',
-                 'git_query_capture(alloc, gi, root, args, arg_len, false, nil, input.file.handle.value::i32, false)')
-    index_filter = 'mach.lang.driver.deps.txn:rollback_preserves_conflict_stages_and_binary_path_records'
-    if not test(COMPILERS['debug'], 'debug', 'index-roundtrip-with-native-stderr', index_filter, 1):
-        raise RuntimeError('index stderr observation changed the positive fixture')
-    replace_once(DEPS,
-                 'var args: [6]str = [6]str{"ls-files", "--stage", "-z", "--", REALIZE_DEP_DIR, ".gitmodules"};',
-                 'var args: [6]str = [6]str{"ls-files", "--cached", "-z", "--", REALIZE_DEP_DIR, ".gitmodules"};')
-    if not test(COMPILERS['debug'], 'debug', 'dependency-index-snapshot-loses-stages', index_filter, 1, 12, 'malformed index info'):
-        raise RuntimeError('stage-less snapshot did not fail in native index-info parsing')
-    engine_filter = 'mach.lang.build.engine.audit:internal_phase_and_cleanup_failures_remain_distinct'
-    engine_probe('IO')
-    if not test(COMPILERS['debug'], 'debug', 'engine-primary-plus-io-cleanup', engine_filter, 1):
-        raise RuntimeError('engine combined failure probe failed')
-    current = (ROOT / ENGINE).read_text(encoding='utf-8')
-    old = run(['git', 'show', '5aa3f091:' + ENGINE]).stdout.decode().replace('\r\n', '\n')
-    begin = '    var event_error: str = nil;'
-    end = '    if (event_error == nil) {'
-    left = current.index(begin, current.index('pub fun execute_warm('))
-    right = current.index(end, left)
-    old_left = old.index('    if (O.is_some[txn.Error](released)) {', old.index('pub fun execute_warm('))
-    old_right = old.index(end, old_left)
-    replace_once(ENGINE, current[left:right], old[old_left:old_right])
-    if not test(COMPILERS['debug'], 'debug', 'old-engine-cleanup-overwrites-primary', engine_filter, 1, 9):
-        raise RuntimeError('old engine event policy did not fail with internal-severity loss')
-    engine_probe('INVALID')
-    if not test(COMPILERS['debug'], 'debug', 'engine-invalid-cleanup-is-internal', engine_filter, 1):
-        raise RuntimeError('engine invalid cleanup probe failed')
-    replace_once(ENGINE, '        if (error.kind == txn.INVALID) { cleanup = outcome.internal(detail); }\n', '')
-    if not test(COMPILERS['debug'], 'debug', 'engine-invalid-cleanup-misclassified', engine_filter, 1, 11):
-        raise RuntimeError('invalid cleanup mutation did not fail at event-kind guard')
-
-    recovery_cli_probes()
-
+    text = original.decode('utf-8')
+    assert text.count('    if (!no_git) {') == 1
+    for label, condition, selector in [
+        ('ignored-opt-out', '    if (true) {', 'mach.cli.cmd.init.git_boundary: no_git_scaffolds'),
+        ('skipped-initialization', '    if (false) {', 'mach.cli.cmd.init.git_boundary: explicit_initialization'),
+    ]:
+        path.write_text(text.replace('    if (!no_git) {', condition), encoding='utf-8', newline='')
+        if not test(COMPILERS['debug'], 'debug', label, selector, 1, 10):
+            raise RuntimeError('Git initialization guard mutant missed its required assertion')
+        path.write_bytes(original)
 finally:
-    restore()
-    check_source()
-    (EVIDENCE / 'restoration.json').write_text(json.dumps(dict(source=SOURCE, pin=PIN, restored=True)), encoding='utf-8')
+    path.write_bytes(original)
+check_source()
+census('final-source-restored')
+(EVIDENCE / 'restoration.json').write_text(json.dumps(dict(source=SOURCE, pin=PIN, restored=True)), encoding='utf-8')
