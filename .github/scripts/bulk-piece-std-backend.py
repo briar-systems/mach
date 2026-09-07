@@ -20,6 +20,18 @@ code,_=f.invoke('backend-dep-pull',[compiler,'dep','pull',project]);assert code=
 outcomes=[]
 for profile in ['debug','release']:
  code,log=f.invoke('backend-'+profile+'-build',[compiler,'build',project,'--target','darwin-aarch64','--profile',profile])
+ captured=f.E/'backend-fixture'
+ captured.mkdir(exist_ok=True)
+ shutil.copy2(project/'mach.toml',captured/'mach.toml')
+ shutil.copytree(project/'src',captured/'src',dirs_exist_ok=True)
+ if (project/'out').exists():shutil.copytree(project/'out',captured/'out',dirs_exist_ok=True)
+ inspections=[]
+ for index,obj in enumerate(sorted((project/'out/darwin-aarch64'/profile).rglob('*.o'))):
+  read=subprocess.run(['xcrun','llvm-objdump','--all-headers',str(obj)],capture_output=True)
+  name='backend-'+profile+'-object-'+str(index)+'.log'
+  (f.E/name).write_bytes(read.stdout+read.stderr)
+  inspections.append(dict(object=str(obj.relative_to(project)),log=name,exit=read.returncode))
+ (f.E/('backend-'+profile+'-objects.json')).write_text(json.dumps(inspections,indent=2))
  outcome=dict(profile=profile,build_exit=code)
  if code==0:
   binary=project/'out/darwin-aarch64'/profile/'bin/backends'
