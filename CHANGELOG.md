@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [4.30.0] - Unreleased
 
-- Bound common aggregate snapshots by machine-width pieces and avoid redundant alignment branches on targets with explicit ordinary-memory unaligned access support.
-
 The transition release that becomes the seed for 5.0.0. Replacement language
 and manifest forms ship alongside the legacy forms retained for migration
 until 5.0.0. This is not a guarantee that every previously accepted project
@@ -131,6 +129,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 - The `$mach` target namespaces enumerate the registries, so every registered name resolves and no unregistered name does.
 
 ### Fixed
+
+- Bound common aggregate snapshots by machine-width pieces and avoid redundant alignment branches on targets with explicit ordinary-memory unaligned access support.
 
 - Calls prepare argument values and owned aggregate copies before filling physical argument registers, keeping bulk-copy scratch available and preserving direct, indirect, hidden-result and variadic placement (#3109).
 - Native aggregate copies and zero initialization lower through bounded MIR loops. Copies preserve snapshot semantics for self and partial overlap, use exact byte extents, and retain secret-data markers without payload-dependent control flow (#3109).
