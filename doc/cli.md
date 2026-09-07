@@ -634,7 +634,14 @@ exports the `main` symbol.
 | `--force`      | —     | scaffold even when `mach.toml` or `src` already exists |
 | `--lib`        | —     | library layout: `src/lib.mach` and one `static` `[artifact.<id>]` |
 | `--no-deps`    | —     | publish the scaffold and declare its dependencies without realizing them; a later `mach dep pull` realizes them (`dependencies declared but not realized; run `mach dep pull` to realize them`) |
+| `--no-git`     | —     | skip repository initialization and submodule registration, using plain dependency checkouts instead |
 | `--quiet`, `-q`| —     | suppress non-error output |
+
+By default, `mach init` initializes Git when the destination is outside an
+existing worktree. It does not commit files or change existing history.
+`--no-git` skips initialization and submodule registration. Combine it with
+`--no-deps` to scaffold without invoking Git. `--no-deps` alone still allows
+repository initialization.
 
 The first non-flag argument after `init` is the target directory. Scaffolding
 into a directory that already holds unrelated files keeps them; an existing
@@ -642,7 +649,7 @@ into a directory that already holds unrelated files keeps them; an existing
 --force to overwrite)`), and every collision is checked before any file is
 written, so a refused init leaves nothing behind. Files are written through
 the same atomic publication path as build outputs. A realization failure
-leaves a valid scaffold and a diagnostic, never a half-realized `dep/`.
+leaves the scaffold and completed Git operations available for inspection, with a diagnostic identifying the failed step.
 
 `mach init` scaffolds a buildable project directly: for a default binary
 scaffold, `mach build .` then `mach run .` prints `Hello, World!` without
