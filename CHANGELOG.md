@@ -130,7 +130,10 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 ### Fixed
 
+- Patch x86-64 ELF imported-address GOT references through the existing relocation backend, preserving displacement addends and field-width overflow checks.
+
 - Run expected-trap child programs inside their private fixture directories and remove those directories afterward, keeping QEMU core dumps out of the checkout (#3132).
+
 
 - Allocate ELF imported-address slots by actual use, including functions also called through the PLT. Preserve unique dynamic symbols and emit RISC-V pointer relocations with the ABI-defined type.
 
