@@ -20,20 +20,21 @@ mutants=[
  ('capability-ignored-mask',isa,'ret (m.gp_unaligned_widths & bytes) != 0;','ret true;',cap,2),
  ('fingerprint-missing-field',target,'    ok = ok && fp.write_domain_u32(e, d, v, m.gp_unaligned_widths);\n','','mach.lang.target.fingerprint_model:',1),
 ]
-driver=f.P/'src/lang/driver/tests.mach'
-driver_original=driver.read_bytes()
-try:
- text=driver_original.decode();needle='    @out_agg = aggs;'
- assert text.count(needle)==1
- text=text.replace(needle, '    val observation: R.Result[usize, str] = print.printlnf("symbol-shape,{},{},{}", tname, out, aggs);\n    if (R.is_err[usize, str](observation)) { ret -1; }\n'+needle)
- driver.write_text(text)
- code,log=f.invoke('symbol-shape-diagnostic',[B,'test','.','--profile','debug','--filter','mach.lang.driver:a_symbol_address_materializes_only_on_a_flat_target','-vv'])
- (f.E/'symbol-shapes.json').write_text(json.dumps(re.findall(r'symbol-shape,([^,]+),(-?\d+),(\d+)',log)))
- assert code==1 and len(re.findall(r'symbol-shape,',log))==4
-finally:driver.write_bytes(driver_original)
-
+if sys.argv[1:]!=['--remaining']:
+ driver=f.P/'src/lang/driver/tests.mach'
+ driver_original=driver.read_bytes()
+ try:
+  text=driver_original.decode();needle='    @out_agg = aggs;'
+  assert text.count(needle)==1
+  text=text.replace(needle, '    val observation: R.Result[usize, str] = print.printlnf("symbol-shape,{},{},{}", tname, out, aggs);\n    if (R.is_err[usize, str](observation)) { ret -1; }\n'+needle)
+  driver.write_text(text)
+  code,log=f.invoke('symbol-shape-diagnostic',[B,'test','.','--profile','debug','--filter','mach.lang.driver:a_symbol_address_materializes_only_on_a_flat_target','-vv'])
+  (f.E/'symbol-shapes.json').write_text(json.dumps(re.findall(r'symbol-shape,([^,]+),(-?\d+),(\d+)',log)))
+  assert code==1 and len(re.findall(r'symbol-shape,',log))==4
+ finally:driver.write_bytes(driver_original)
+ 
 text=original[bulk].decode();start=text.index('fun small(');end=text.index('\nfun loop_path',start);part=text[start:end]
-mutants.append(('oversized-live-snapshot',bulk,text,text.replace('val SNAPSHOT_PIECES: u32 = 8;','val SNAPSHOT_PIECES: u32 = 16;').replace('var values: [8]u32;','var values: [16]u32;'),shape,11))
+mutants.append(('oversized-live-snapshot',bulk,text,text.replace('val SNAPSHOT_PIECES: u32 = 8;','val SNAPSHOT_PIECES: u32 = 16;').replace('var values: [8]u32;','var values: [16]u32;'),shape,12))
 needle='''            if (R.is_err[R.Void, str](er)) { ret er; }
             off = off + width::u64;'''
 assert part.count(needle)==1
@@ -43,6 +44,7 @@ interleaved=part.replace(needle,'''            if (R.is_err[R.Void, str](er)) { 
             off = off + width::u64;''').replace('    off = 0;','    if (copy) { ret R.ok_void[str](); }\n    off = 0;')
 mutants.append(('interleaved-snapshot',bulk,part,interleaved,overlap,1))
 records=[]
+if sys.argv[1:]==['--remaining']:mutants=mutants[-2:]
 for name,path,old,new,selected,expected in mutants:
  text=original[path].decode();assert text.count(old)==1,(name,text.count(old))
  try:
