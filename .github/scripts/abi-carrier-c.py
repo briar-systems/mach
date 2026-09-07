@@ -7,7 +7,7 @@ def run(f,B,source,pin,targets=None):
  manifest=(source/'test/link/cases/ext-byval-aggregate/mach.toml').read_text().replace('ref = "branch/main"','ref = "commit/'+pin+'"')
  (project/'mach.toml').write_text(manifest)
  ms=['use std.runtime;','use p: std.print;']
- cs=[]
+ cs=["void *memcpy(void *destination, const void *source, __SIZE_TYPE__ size) { unsigned char *out=destination; const unsigned char *in=source; for (__SIZE_TYPE__ i=0;i<size;i++) out[i]=in[i]; return destination; }"]
  main=['#[symbol("main")]','fun main() i64 {']
  for n in [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17]:
   t='T'+str(n);args='a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, v: '+t+', x: f64, y: f64'
