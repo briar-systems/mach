@@ -11,6 +11,7 @@ oracle=f.P/'test/link/lib/produce.sh'
 code,_=f.invoke('oracle-controls',['python3',HERE/'fbreg-controls.py',oracle]);assert code==0
 text=oracle.read_text()
 mutations=[
+ ('branch-bit-target',"target = re.match(r'0x[0-9a-f]+(?=\\s|$)', operands.rsplit(',', 1)[-1].strip())","target = re.search(r'0x[0-9a-f]+', operands)",'tbz-join'),
  ('stale-mov','previous = known.pop(number, None)','previous = known.get(number)','register-clobber'),
  ('stale-load','known.pop(destination[0], None)','None','load-clobber'),
  ('stale-join','if address in targets:\n            known.clear()','if address in targets:\n            pass','branch-join'),

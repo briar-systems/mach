@@ -19,6 +19,8 @@ cases={
  'unknown-effect':(wide+['add x16, x16, #0x8','str x0, [x29, x16]'],'-320',1),
  'missing-offset':(wide+['str x0, [x29, x16]'],'-320,-328',1),
  'positive-is-distinct':(wide+['str x0, [x29, x16]'],'320',1),
+ 'tbz-join':(['tbz x0, #0x1, 0x1014']+wide+['str x0, [x29, x16]'],'-320',1),
+ 'tbnz-join':(['tbnz x0, #0x1, 0x1014']+wide+['str x0, [x29, x16]'],'-320',1),
  'branch-join':(['b.eq 0x1014']+wide+['str x0, [x29, x16]'],'-320',1),
 }
 results=[]
