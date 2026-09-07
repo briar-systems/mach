@@ -501,9 +501,9 @@ transitive closure one level deep; and there is no lock file.
 
 | Action   | Args | Effect |
 |----------|------|--------|
-| `pull`   | `[<path>]` | realize the committed dependency closure without changing anything: check out every gitlink at its committed commit, one level deep, initializing a gitlink a fresh clone left as an empty directory (`realized std @ <commit> (initialized the committed gitlink)`). Never fetches anything new and never reads a `path` source. Idempotent. |
+| `pull`   | `[<path>]` | restore existing Git dependencies to their recorded gitlinks and initialize empty gitlink checkouts. Realize missing declared dependencies, cloning Git sources or copying path sources as needed. Retain existing path copies. Use `update` to refresh them from their sources. |
 | `verify` | `[<path>]` | run the build's dependency checks as a command, closure and selectors included, and print `ok`, or the first failure. A stale `mach.lock` in the root is noted here as on `pull`, since this is where a user looks when something is wrong. |
-| `add`    | `<name> (--git <url> [--ref <ref>] \| --path <dir>)` | validate the candidate declaration, realize its dependency closure through Git, then publish `[dep.<name>]` in `mach.toml`. Git stages `.gitmodules` and gitlinks. Nothing is committed. |
+| `add`    | `<name> (--git <url> [--ref <ref>] \| --path <dir>)` | validate the candidate declaration, realize its dependency closure, then publish `[dep.<name>]` in `mach.toml`. Git stages `.gitmodules` and gitlinks. Nothing is committed. |
 | `update` | `<name> \| --all` | advance `branch/` selectors to their current remote tips and re-stage the gitlinks; move an identity to the exact selector the root declares for it (`b: <old> -> <new> (pinned to the exact selector)`, or `(exact selector, already pinned)` when nothing moves). |
 | `remove` | `<name> [--purge]` | remove a Git dependency’s registration from the index and `.gitmodules` when no longer required, then publish the manifest without its declaration. The checkout is retained unless `--purge` is given. |
 | `list`   | — | print each realized dependency with its source, selector, pinned commit, and state (`realized`/`missing`). |
@@ -577,9 +577,13 @@ For a **path** dependency, `add --path <dir>` copies the local source files
 into `dep/<name>/`, without the source's own `dep/` or Git metadata, and refuses
 a source that escapes through a symlink. Copied files are not automatically
 staged. Verification checks the filesystem realization and does not require it
-to be tracked in Git. The
-`path` is resolved relative to the requiring manifest's directory. `pull` never
-reads a `path` source: the copy is the realization.
+to be tracked in Git. The `path` is resolved relative to the requiring manifest's
+directory. `pull` copies a missing path dependency and retains an existing copy.
+`update` refreshes the copy from the source. Before copying, Mach inventories
+source files and excludes the destination itself when the source is an ancestor.
+An existing destination entry absent from that inventory, or with a conflicting
+type, requires explicit cleanup before the update can proceed. Mach does not
+delete extra files. A copy failure retains completed writes for inspection.
 
 ### The closure and clashes
 

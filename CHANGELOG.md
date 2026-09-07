@@ -130,6 +130,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 ### Fixed
 
+- Inventory local dependency sources before copying, exclude a destination inside an ancestor source, and refuse stale destination entries before writing. Pull missing path dependencies without requiring or staging a Git index.
+
 - Pair compiler output, initialization and cleanup with the std filesystem ownership API. Reserve build destinations before workers start and retain directory ownership through publication and recovery.
 - Only `mach init` requests repository creation, with `--no-git` to opt out. Dependency commands preserve project history and unrelated staged work, use native submodule operations, and retain checkouts unless removal explicitly requests `--purge`.
 - Anchor absolute initialization paths beneath their native existing parent and keep staging and recovery bound to the held directory.
