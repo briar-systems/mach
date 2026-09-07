@@ -10,7 +10,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 SOURCE = '15618425ea867bd4e91edf616b027b5abe1644aa'
 PIN = 'c6a8816933fffa8ee490bb0bed8a97e7f0c1b296'
 BRIDGE = '49fbbc48a9b290cbcb17c8187d339e5ce0bcc64b'
-BRIDGE_PIN = 'c6a8816933fffa8ee490bb0bed8a97e7f0c1b296'
+BRIDGE_PIN = '3ee8e709a8ed7baff6e93780ce9b3582a907a91f'
 EVIDENCE = ROOT / 'cli-lifecycle-evidence'
 EVIDENCE.mkdir(exist_ok=True)
 (EVIDENCE / 'verification-script.py').write_bytes(pathlib.Path(__file__).read_bytes())
