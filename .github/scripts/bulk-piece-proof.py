@@ -1,6 +1,6 @@
 import hashlib,json,os,pathlib,re,shutil,subprocess,sys,time,signal
 ROOT=pathlib.Path(__file__).resolve().parents[2]
-SOURCE='2152b51d'
+SOURCE='5a81edb6'
 PIN='3ee8e709a8ed7baff6e93780ce9b3582a907a91f'
 P=ROOT/'.wt/pieces';E=ROOT/'piece-evidence';E.mkdir(exist_ok=True)
 results=[]
@@ -14,10 +14,10 @@ def census(name):
  if sys.platform=='win32':
   args=['powershell.exe','-NoProfile','-Command',r"$ErrorActionPreference='Stop'; $p=@(Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(mach|m[0-9A-Za-z_-]*|A|B|C|D)(\.exe)?$' -and $_.CommandLine -match '\s(build|test)(\s|$)' }); $p | Format-List ProcessId,Name,CommandLine; if ($p.Count) { exit 75 }"]
  else:
-  args=['bash','-c',r"pgrep -af '^([^[:space:]]*/)?(mach|m[0-9A-Za-z_-]*|A|B|C|D)(\.exe)? (build|test)( |$)' || true"+'\n'+r"if pgrep -f '^([^[:space:]]*/)?(mach|m[0-9A-Za-z_-]*|A|B|C|D)(\.exe)? (build|test)( |$)' >/dev/null; then exit 75; fi"]
+  args=['pgrep','-af',r'^([^[:space:]]*/)?(mach|m[0-9A-Za-z_-]*|A|B|C|D)(\.exe)? (build|test)( |$)']
  r=subprocess.run(args,capture_output=True,timeout=30)
  (E/(name+'-census.json')).write_text(json.dumps(dict(args=args,code=r.returncode,out=r.stdout.decode(),err=r.stderr.decode())))
- assert r.returncode==0 and not r.stdout.strip() and not r.stderr.strip(),name
+ assert r.returncode==(0 if sys.platform=='win32' else 1) and not r.stdout.strip() and not r.stderr.strip(),name
 
 def invoke(name,args,timeout=1200):
  census(name);start=time.monotonic()

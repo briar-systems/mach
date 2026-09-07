@@ -7,6 +7,14 @@ for output,compiler in [('A',seed),('B',f.P/'A'),('C',f.P/'B')]:
  code,_=f.invoke('backend-bootstrap-'+output,[compiler,'build','.','--profile','debug','-o',output]);assert code==0
 assert (f.P/'B').read_bytes()==(f.P/'C').read_bytes()
 compiler=f.P/'B'
+for profile in ['debug','release']:
+ code,log=f.invoke('linker-'+profile,[compiler,'test','.','--profile',profile,'--filter','mach.lang.be.linker.','--format','json'])
+ events=[json.loads(line) for line in log.splitlines() if line.startswith('{')]
+ cases=[e for e in events if e.get('event')=='test']
+ assert any(e.get('label')=='mach.lang.be.linker.link_modules:arm64_import_tail_branch' for e in cases),cases
+ summary=[e for e in events if e.get('event')=='summary']
+ assert code==0 and len(summary)==1 and summary[0]['failed']==0 and summary[0]['passed']>0,log
+
 source=f.ROOT/'.wt/std-backend-source'
 subprocess.run(['git','clone','--no-checkout','https://github.com/briar-systems/mach-std',str(source)],check=True)
 f.cmd(['git','checkout','--detach',STD],source);assert f.cmd(['git','rev-parse','HEAD'],source)==STD
@@ -19,7 +27,7 @@ f.cmd(['git','-c','user.name=Native proof','-c','user.email=native-proof@invalid
 code,_=f.invoke('backend-dep-pull',[compiler,'dep','pull',project]);assert code==0
 outcomes=[]
 for profile in ['debug','release']:
- code,log=f.invoke('backend-'+profile+'-build',[compiler,'build',project,'--target','darwin-aarch64','--profile',profile])
+ code,log=f.invoke('backend-'+profile+'-build',[compiler,'build',project,'--target','darwin-aarch64','--profile',profile,'--emit-ir','--emit-asm'])
  captured=f.E/'backend-fixture'
  captured.mkdir(exist_ok=True)
  shutil.copy2(project/'mach.toml',captured/'mach.toml')
@@ -27,7 +35,7 @@ for profile in ['debug','release']:
  if (project/'out').exists():shutil.copytree(project/'out',captured/'out',dirs_exist_ok=True)
  inspections=[]
  for index,obj in enumerate(sorted((project/'out/darwin-aarch64'/profile).rglob('*.o'))):
-  read=subprocess.run(['xcrun','llvm-objdump','--all-headers',str(obj)],capture_output=True)
+  read=subprocess.run(['xcrun','llvm-objdump','--disassemble','--reloc',str(obj)],capture_output=True)
   name='backend-'+profile+'-object-'+str(index)+'.log'
   (f.E/name).write_bytes(read.stdout+read.stderr)
   inspections.append(dict(object=str(obj.relative_to(project)),log=name,exit=read.returncode))
@@ -39,6 +47,28 @@ for profile in ['debug','release']:
   outcome.update(runtime_exit=code,stdout=log,sha256=hashlib.sha256(binary.read_bytes()).hexdigest())
  outcomes.append(outcome)
 (f.E/'backend-outcomes.json').write_text(json.dumps(outcomes,indent=2))
+linker=f.P/'src/lang/be/linker.mach'
+original=linker.read_bytes()
+try:
+ text=original.decode()
+ needle='ret kind == of.RK_PC32 || kind == of.RK_PLT32 || kind == of.RK_JUMP26;'
+ assert text.count(needle)==1
+ linker.write_text(text.replace(needle,'ret kind == of.RK_PC32 || kind == of.RK_PLT32;'))
+ code,_=f.invoke('mutant-compiler-build',[compiler,'build','.','--profile','debug','-o','D'])
+ assert code==0
+ mutant=f.P/'D'
+ for profile in ['debug','release']:
+  code,log=f.invoke('mutant-linker-'+profile,[mutant,'test','.','--profile',profile,'--filter','mach.lang.be.linker.link_modules:arm64_import_tail_branch','--format','json'])
+  events=[json.loads(line) for line in log.splitlines() if line.startswith('{')]
+  summary=[e for e in events if e.get('event')=='summary']
+  assert code!=0 and len(summary)==1 and summary[0]['failed']==1 and summary[0]['total']==1,log
+  tests=[e for e in events if e.get('event')=='test']
+  assert len(tests)==1 and tests[0].get('code')==6,tests
+  code,log=f.invoke('mutant-backend-'+profile,[mutant,'build',project,'--target','darwin-aarch64','--profile',profile])
+  assert code!=0 and "import '_calloc' pinned to library 'libSystem' not among the link's dependencies" in log,log
+finally:
+ linker.write_bytes(original)
+assert linker.read_bytes()==original
 f.census('backend-final');assert not f.cmd(['git','status','--short','--untracked-files=no'])
 assert not f.cmd(['git','status','--short','--untracked-files=no'],project)
 assert not f.cmd(['git','status','--short','--untracked-files=no'],source)
