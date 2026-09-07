@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Every dependency action selects its project with `mach dep <action> <path>`.
+  Dependency names follow the path. Missing or extra operands are refused.
+  Use `.` for the current project. Pull retains existing local copies and update
+  refreshes them. Dependency commands preserve the project's Git history.
+
 ## [4.30.0] - 2026-09-07
 
 The transition release that becomes the seed for 5.0.0. Replacement language

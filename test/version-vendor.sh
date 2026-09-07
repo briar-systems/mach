@@ -89,7 +89,7 @@ fun main(argc: usize, argv: *str) i64 { ret dispatch(argc, argv); }
 EOF
 
 cd "$work/project"
-"$cc" dep pull
+"$cc" dep pull .
 vendored_cli=./vendored-mach
 "$cc" build . -o vendored-mach
 if [ "$("$vendored_cli" info --version)" != "$compiler_ver" ]; then

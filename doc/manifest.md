@@ -886,7 +886,7 @@ A stanza declares exactly one source:
 |--------|---------|
 | `git`  | Git URL. The dependency is a git **submodule** at `dep/<id>/`, pinned by the gitlink the root repository commits. Requires `ref`. |
 | `ref`  | Selector for `git`: `branch/<name>`, `tag/<name>`, or `commit/<full-object-id>`. Any other spelling is rejected (`[dep.std].ref must be branch/<name>, tag/<name>, or commit/<full-object-id>`). |
-| `path` | Local project tree, never fetched. A relative `path` is resolved relative to this manifest's directory. `mach dep add --path` copies its files into `dep/<id>/` without the source's own `dep/` or Git metadata. No repository or index is required for a path dependency, and copied files are not automatically staged. Forbids `ref`. |
+| `path` | Local project tree, never fetched. A relative `path` is resolved relative to this manifest's directory. `mach dep add <path> <id> --path` copies its files into `dep/<id>/` without the source's own `dep/` or Git metadata. No repository or index is required for a path dependency, and copied files are not automatically staged. Forbids `ref`. |
 
 `git` and `path` are mutually exclusive and exactly one is required. A
 registry-style `version =` is reserved and rejected
@@ -960,7 +960,7 @@ verify` as a command) checks, offline, that:
 2. its project id equals the directory name;
 3. the closure computed from the realized manifests equals the set of
    directories under `dep/`: nothing missing (`dependency 'std' is not
-   resolved (missing 'dep/std'); run `mach dep pull`), nothing extra;
+   resolved (missing 'dep/std'); run `mach dep pull <path>`), nothing extra;
 4. there are no cycles (reported as the chain).
 
 The committed gitlink is what is verified, and the root's own declaration is
@@ -970,7 +970,7 @@ root does **not** declare, every requirer's exact selector (`tag/`, resolved
 through the checkout's own refs, or `commit/`) must be satisfied by the
 realized commit; a mismatch names both commits and the two remedies
 (`dependency 'b': exact ref 'tag/v1.0.0' resolves to '<commit>' but the
-realized commit is '<other>'; run `mach dep update b` to re-pin it, or declare
+realized commit is '<other>'; run `mach dep update <path> b` to re-pin it, or declare
 the identity at the root to override`; a root `commit/` that does not match
 reads `exact commit ref 'commit/<id>' is not satisfied by the realized commit
 '<other>'`). A `branch/` selector is an input to `update`, never a verify fact.

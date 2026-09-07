@@ -488,7 +488,7 @@ on an allocator or io failure.
 ## `mach dep`
 
 ```
-mach dep <action> [args]
+mach dep <action> <path> [args]
 ```
 
 Realizes, verifies, and changes the project's dependencies under `dep/`.
@@ -501,12 +501,12 @@ transitive closure one level deep; and there is no lock file.
 
 | Action   | Args | Effect |
 |----------|------|--------|
-| `pull`   | `[<path>]` | restore existing Git dependencies to their recorded gitlinks and initialize empty gitlink checkouts. Realize missing declared dependencies, cloning Git sources or copying path sources as needed. Retain existing path copies. Use `update` to refresh them from their sources. |
-| `verify` | `[<path>]` | run the build's dependency checks as a command, closure and selectors included, and print `ok`, or the first failure. A stale `mach.lock` in the root is noted here as on `pull`, since this is where a user looks when something is wrong. |
-| `add`    | `<name> (--git <url> [--ref <ref>] \| --path <dir>)` | validate the candidate declaration, realize its dependency closure, then publish `[dep.<name>]` in `mach.toml`. Git stages `.gitmodules` and gitlinks. Nothing is committed. |
-| `update` | `<name> \| --all` | advance `branch/` selectors to their current remote tips and re-stage the gitlinks; move an identity to the exact selector the root declares for it (`b: <old> -> <new> (pinned to the exact selector)`, or `(exact selector, already pinned)` when nothing moves). |
-| `remove` | `<name> [--purge]` | remove a Git dependency’s registration from the index and `.gitmodules` when no longer required, then publish the manifest without its declaration. The checkout is retained unless `--purge` is given. |
-| `list`   | — | print each realized dependency with its source, selector, pinned commit, and state (`realized`/`missing`). |
+| `pull`   | `<path>` | restore existing Git dependencies to their recorded gitlinks and initialize empty gitlink checkouts. Realize missing declared dependencies, cloning Git sources or copying path sources as needed. Retain existing path copies. Use `update` to refresh them from their sources. |
+| `verify` | `<path>` | run the build's dependency checks as a command, closure and selectors included, and print `ok`, or the first failure. A stale `mach.lock` in the root is noted here as on `pull`, since this is where a user looks when something is wrong. |
+| `add`    | `<path> <name> (--git <url> [--ref <ref>] \| --path <dir>)` | validate the candidate declaration, realize its dependency closure, then publish `[dep.<name>]` in `mach.toml`. Git stages `.gitmodules` and gitlinks. Nothing is committed. |
+| `update` | `<path> (<name> \| --all)` | advance `branch/` selectors to their current remote tips and re-stage the gitlinks; move an identity to the exact selector the root declares for it (`b: <old> -> <new> (pinned to the exact selector)`, or `(exact selector, already pinned)` when nothing moves). |
+| `remove` | `<path> <name> [--purge]` | remove a Git dependency’s registration from the index and `.gitmodules` when no longer required, then publish the manifest without its declaration. The checkout is retained unless `--purge` is given. |
+| `list`   | `<path>` | print each realized dependency with its source, selector, pinned commit, and state (`realized`/`missing`). |
 
 Dependency changes use Git's normal submodule and index operations. Validation
 rejects conflicts that can be determined before those operations begin. A remote
@@ -526,14 +526,16 @@ removal.
 
 `sync` is the pre-`pull` name, kept as a deprecated alias of `pull`.
 
-`--quiet`/`-q` suppresses routine output on every action. `pull` and `verify`
-take a project directory or manifest path, resolved by the same rules as
-`mach build <path>`, and default to the current directory when none is given.
-`add`, `remove`, `update`, and `list` act on the current directory's project
-and do not search upward (`error: no mach.toml in the project directory`).
+Every action requires its project directory or manifest path as the first
+positional operand, resolved by the same rules as `mach build <path>`. Write `.`
+for the current project. A dependency name follows the project path, for example
+`mach dep update ../app widget`. Relative local dependency sources are resolved
+from the selected project's manifest directory. Extra operands, missing option
+values and repeated source options are refused.
+`--quiet`/`-q` suppresses routine output on every action.
 
 ```
-$ mach dep list
+$ mach dep list .
   std  git=https://github.com/briar-systems/mach-std  ref=branch/main  pin=74ce8f4e65943172274f523e6bbe3a638ae3fadc  realized
 $ mach dep verify .
 ok
@@ -600,10 +602,10 @@ different commits for one id, `add` stops and prints both chains and the
 root declaration that would decide (the exact text is in
 [manifest.md](manifest.md#one-identity-one-commit)); the root resolves it by
 declaring the identity with its own `ref`, at upstream or at a fork, and
-`mach dep update <id>` re-pins the realized checkout to that declaration.
+`mach dep update <path> <id>` re-pins the realized checkout to that declaration.
 Verification then holds every requirer's exact selector against the realized
 commit (`dependency 'b': exact ref 'tag/v1.0.0' resolves to '<commit>' but the
-realized commit is '<other>'; run `mach dep update b` to re-pin it, or declare
+realized commit is '<other>'; run `mach dep update <path> b` to re-pin it, or declare
 the identity at the root to override`), except for an identity the root
 declares with a `tag/`, whose gitlink is the pin; the rules are in
 [manifest.md](manifest.md#what-a-build-verifies).
@@ -655,7 +657,7 @@ exports the `main` symbol.
 | `--name <id>`  | id    | project id (default: the last path component of `[dir]`, so `mach init /work/ia`, `mach init ib/`, and `mach init .` name the project `ia`, `ib`, and the current directory's name) |
 | `--force`      | —     | scaffold even when `mach.toml` or `src` already exists |
 | `--lib`        | —     | library layout: `src/lib.mach` and one `static` `[artifact.<id>]` |
-| `--no-deps`    | —     | publish the scaffold and declare its dependencies without realizing them; a later `mach dep pull` realizes them (`dependencies declared but not realized; run `mach dep pull` to realize them`) |
+| `--no-deps`    | —     | publish the scaffold and declare its dependencies without realizing them; a later `mach dep pull` realizes them (`dependencies declared but not realized; run `mach dep pull <path>` to realize them`) |
 | `--no-git`     | —     | skip repository initialization and submodule registration, using plain dependency checkouts instead |
 | `--quiet`, `-q`| —     | suppress non-error output |
 

@@ -54,7 +54,7 @@ Mach builds itself, so building from source needs an existing `mach` installatio
 ```bash
 git clone https://github.com/briar-systems/mach
 cd mach
-mach dep pull
+mach dep pull .
 mach build .
 ```
 
