@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-SOURCE = '15618425ea867bd4e91edf616b027b5abe1644aa'
+SOURCE = '0413d440a93e766ad1d7fb928e25dbe5a20561b4'
 PIN = 'c6a8816933fffa8ee490bb0bed8a97e7f0c1b296'
 BRIDGE = '49fbbc48a9b290cbcb17c8187d339e5ce0bcc64b'
 BRIDGE_PIN = '3ee8e709a8ed7baff6e93780ce9b3582a907a91f'
@@ -20,6 +20,9 @@ PREFIXES = [
     ('args', 'mach.cli.args', 15),
     ('publication', 'mach.lang.publication', 2),
     ('fingerprint', 'mach.lang.build.fingerprint', 11),
+    ('dep-cli', 'mach.cli.cmd.dep', 24),
+    ('dep-driver', 'mach.lang.driver.deps', 15),
+    ('linker', 'mach.lang.be.linker', 87),
 ]
 
 
@@ -94,20 +97,6 @@ def test(compiler, profile, name, selected, count, child=0, required_log=None):
     (EVIDENCE / 'summary.json').write_text(json.dumps(RESULTS, indent=2), encoding='utf-8')
     print(json.dumps(row), flush=True)
     return valid
-
-
-def replace_once(path, before, after):
-    text = (ROOT / path).read_text(encoding='utf-8')
-    if text.count(before) != 1 or before == after:
-        raise RuntimeError(f'mutation site mismatch: {path}, occurrences={text.count(before)}, text={before[:100]!r}')
-    (ROOT / path).write_text(text.replace(before, after, 1), encoding='utf-8', newline='')
-
-
-def mutate(name, path, before, after, selected, child, required_log=None):
-    restore()
-    replace_once(path, before, after)
-    if not test(COMPILERS['debug'], 'debug', name, selected, 1, child, required_log):
-        raise RuntimeError('mutation did not reach its required runtime failure')
 
 
 seed = shutil.which('mach')
@@ -219,6 +208,45 @@ with tempfile.TemporaryDirectory(prefix='mach-init-without-git-') as scratch:
     assert not (destination / '.git').exists()
     assert not (destination / '.gitmodules').exists()
 
+for no_git in [False, True]:
+    with tempfile.TemporaryDirectory(prefix='mach-init-existing-history-') as scratch:
+        destination = pathlib.Path(scratch)
+        def fixture_git(*args):
+            return subprocess.run(['git', '-C', scratch, *args], check=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        fixture_git('init', '-b', 'user-branch')
+        tracked = destination / 'user-file'
+        for contents in ['first\n', 'second\n']:
+            tracked.write_text(contents, encoding='utf-8')
+            fixture_git('add', '--', 'user-file')
+            fixture_git('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid',
+                        '-c', 'commit.gpgsign=false', 'commit', '-m', contents.strip())
+        tracked.write_text('staged user work\n', encoding='utf-8')
+        fixture_git('add', '--', 'user-file')
+        tracked.write_text('unstaged user work\n', encoding='utf-8')
+        git_dir = destination / '.git'
+        before = {str(path.relative_to(git_dir)): path.read_bytes()
+                  for path in git_dir.rglob('*') if path.is_file()}
+        command = [str(COMPILERS['debug']), 'init', scratch, '--name', 'existing_history', '--no-deps']
+        if no_git:
+            command.append('--no-git')
+        label = 'init-existing-history-' + ('opt-out' if no_git else 'default')
+        census(label)
+        result = subprocess.run(command, cwd=scratch, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, timeout=90)
+        (EVIDENCE / (label + '.log')).write_bytes(result.stdout)
+        assert result.returncode == 0, result.stdout.decode(errors='replace')
+        after = {str(path.relative_to(git_dir)): path.read_bytes()
+                 for path in git_dir.rglob('*') if path.is_file()}
+        assert before == after, 'init changed existing Git metadata'
+        assert tracked.read_bytes() == b'unstaged user work\n'
+        assert (destination / 'mach.toml').is_file()
+        assert (destination / 'src/root.mach').is_file()
+        (EVIDENCE / (label + '.json')).write_text(json.dumps(dict(
+            no_git=no_git, existing_commits=2, git_metadata_unchanged=True,
+            staged_and_unstaged_work_preserved=True)), encoding='utf-8')
+
+
 path = ROOT / 'src/cli/cmd/init.mach'
 original = path.read_bytes()
 try:
@@ -231,6 +259,41 @@ try:
         path.write_text(text.replace('    if (!no_git) {', condition), encoding='utf-8', newline='')
         if not test(COMPILERS['debug'], 'debug', label, selector, 1, 10):
             raise RuntimeError('Git initialization guard mutant missed its required assertion')
+        path.write_bytes(original)
+finally:
+    path.write_bytes(original)
+path = ROOT / 'src/lang/driver/deps.mach'
+original = path.read_bytes()
+try:
+    source = original.decode('utf-8')
+    start = source.index('pub fun stage_dependency(')
+    end = source.index('\nfun t_scratch_dir(', start)
+    function = source[start:end]
+    before = '''    var args: [3]str = [3]str{"add", "--", rel};
+    val r: R.Result[str, str] = git_op(s.build_alloc, ?gi, root, ?args[0], 3, nil);'''
+    after = '''    var args: [4]str = [4]str{"add", "--", ".gitmodules", rel};
+    val r: R.Result[str, str] = git_op(s.build_alloc, ?gi, root, ?args[0], 4, nil);'''
+    assert function.count(before) == 1
+    path.write_text(source[:start] + function.replace(before, after) + source[end:], encoding='utf-8', newline='')
+    if not test(COMPILERS['debug'], 'debug', 'staged-unrelated-metadata',
+                'mach.lang.driver.deps.metadata:registration_refuses_unstaged_edits_and_pin_staging_leaves_them_unstaged', 1, 20):
+        raise RuntimeError('metadata staging mutant missed its required assertion')
+finally:
+    path.write_bytes(original)
+path = ROOT / 'src/lang/driver/deps.mach'
+original = path.read_bytes()
+try:
+    text = original.decode('utf-8')
+    for label, before, after, selector, child in [
+        ('copied-own-destination', 'if (fs.identity_equal(identity, excluded[0])) { cnt; }',
+         'if (false) { cnt; }', 'mach.lang.driver.deps.path_copy:ancestor_source_uses_finite_inventory_and_excludes_its_destination', 13),
+        ('ignored-destination-extras', 'for (i < existing.len) {', 'for (false) {',
+         'mach.lang.driver.deps.path_copy:extra_destination_entries_refuse_before_selected_files_change', 5),
+    ]:
+        assert text.count(before) == 1
+        path.write_text(text.replace(before, after), encoding='utf-8', newline='')
+        if not test(COMPILERS['debug'], 'debug', label, selector, 1, child):
+            raise RuntimeError('path copy mutant missed its required runtime assertion')
         path.write_bytes(original)
 finally:
     path.write_bytes(original)
