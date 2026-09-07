@@ -13,20 +13,23 @@ compiler or its standard library can adopt that form. This requires an explicit
 bootstrap chain, rather than assuming the latest published compiler can build
 any later source directly.
 
-The current reproducible chain starts with published **4.26.5**, builds the
-pinned audited compiler at `7e26667e92e279b6ad2da53bf8e9a68ca42caa49` with std
-`3ee8e709a8ed7baff6e93780ce9b3582a907a91f`, then builds the final 4.30.0 source
-with its own std pin. The setup action records the seed and source identities.
-Darwin bridge binaries are cross-built on Linux before native self-host checks.
-Required historical source commits remain reachable until the published seed
-replaces them.
+The current seed is published **4.30.0**, released from main merge
+`b65afb9704218e89998af5f71050ca315e7709a9` with the audited std **1.0.1** pin.
+Both repositories install that published compiler directly. The setup action
+verifies the selected archive against `SHA256SUMS` before extraction, checks the
+installed version and records release metadata and archive/compiler hashes.
+Fresh installations have passed on all five native hosts.
+
+The historical 4.26.5 source bridge was used to produce 4.30.0. Its proof and
+complete source history are preserved in verified Git bundles. It is no longer
+part of the current CI bootstrap.
 
 At each self-host stage, the seed builds A, A builds B, and B builds C. B and C
 must be byte-identical. A may differ because it was produced by the older
 compiler. Final verification checks the exact versioned compiler source and std
 pin in both optimization profiles on the required native hosts.
 
-Published 4.30.0 becomes the starting seed for v5. The new tagged-value and
+Published 4.30.0 is the starting seed for v5. The new tagged-value and
 failure-control features must be implemented in a usable compiler before its
 own source and std migrate. Their design issue specifies the pinned intermediate
 bootstrap and migration order. Publishing 4.30.0 does not by itself make that
@@ -81,7 +84,15 @@ a place and refuses temporaries, arithmetic and non-shift bitwise binary
 operators require operands of one type, and manifest-controlled paths must
 stay within the project root. The [changelog](../../CHANGELOG.md) lists the
 immediate changes and fixes.
-The listed 5.0.0 removals remain deferred until the new seed is published.
+The listed 5.0.0 removals belong to the coordinated v5 migration, now that the
+new seed is published.
+
+Std has an independent Semantic Versioning sequence. Published 1.0.x releases
+preserve their declared public contracts. The breaking language and API migration
+ships as **std 2.0.0**, paired with Mach 5.0.0. Compatible later additions belong
+to 2.1.0. Public signatures, layouts, documented behavior, ownership, lifetimes,
+errors and supported compiler/target combinations form that versioned contract.
+Published version contents and tags are immutable.
 
 ## Landing and release gates
 
