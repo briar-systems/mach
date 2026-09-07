@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-SOURCE = '40be912ce19ddcd3e1fa2d2ab3772f3f883aab78'
+SOURCE = 'fc93b85787d5732e663f6698a9a36c6598a932c7'
 PIN = 'c6a8816933fffa8ee490bb0bed8a97e7f0c1b296'
 BASE_SOURCE = 'be70fdcd6cb0806406830be3ce2abb8d91f6ce0f'
 BASE_RUN = 34074514612
@@ -17,7 +17,7 @@ EVIDENCE.mkdir(exist_ok=True)
 (EVIDENCE / 'verification-script.py').write_bytes(pathlib.Path(__file__).read_bytes())
 RESULTS = []
 PREFIXES = [
-    ('object-formats', 'mach.lang.target.of', 178),
+    ('object-formats', 'mach.lang.target.of', 182 if sys.platform == 'win32' else 181),
     ('linker', 'mach.lang.be.linker', 91),
     ('driver-stack', 'mach.lang.driver:a_manifest_stack_reserve_reaches_the_linked_pe', 1),
     ('driver-unwind', 'mach.lang.driver:w64_', 3),
@@ -87,7 +87,7 @@ def test(compiler, profile, name, selected, count):
     valid = counts == expected and rc == 0
     row = dict(name=name, profile=profile, filter=selected, expected=expected, counts=counts,
                compiler_exit=rc, verified=valid,
-               failures=re.findall(r'^\s*FAIL\s+(.*?)\s+\(exit', log, re.M))
+               failures=re.findall(r'^\s*FAIL\s+(.*?)\s+\((?:exit|signal)', log, re.M))
     RESULTS.append(row)
     (EVIDENCE / 'summary.json').write_text(json.dumps(RESULTS, indent=2), encoding='utf-8')
     print(json.dumps(row), flush=True)
@@ -135,10 +135,11 @@ inventory = {}
 for name, prefix, expected in PREFIXES:
     names = []
     for path in (ROOT / 'src').rglob('*.mach'):
-        names += [value for value in re.findall(r'^test "([^"]+)"', path.read_text(encoding='utf-8'), re.M) if value.startswith(prefix)]
-    if len(names) != expected:
-        raise RuntimeError(f'prefix inventory drift: {prefix}, {len(names)} != {expected}')
-    inventory[prefix] = names
+        names += [value for value in re.findall(r'^[ \t]*test "([^"]+)"', path.read_text(encoding='utf-8'), re.M) if value.startswith(prefix)]
+    declared = 183 if name == 'object-formats' else expected
+    if len(names) != declared:
+        raise RuntimeError(f'prefix inventory drift: {prefix}, {len(names)} != {declared}')
+    inventory[prefix] = dict(declared_names=names, expected_native_count=expected)
 (EVIDENCE / 'test-inventory.json').write_text(json.dumps(inventory, indent=2), encoding='utf-8')
 
 changed = run(['git', 'diff', '--name-only', BASE_SOURCE, SOURCE, '--', 'src', 'mach.toml', 'dep/std']).stdout.decode().splitlines()
