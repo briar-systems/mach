@@ -11,10 +11,15 @@ use mwriter: std.io.writer;
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
-use fs: std.filesystem;
-use spath: std.types.path;
 use txn: std.filesystem.transaction;
 use mach.lang.intern;
+use planned: mach.lang.publication.plan;
+fwd planned.Plan;
+fwd planned.Destination;
+fwd plan_init: planned.init;
+fwd plan_add: planned.add;
+fwd plan_seal: planned.seal;
+fwd plan_dnit: planned.dnit;
 
 pub def Precondition: u8;
 
@@ -51,110 +56,139 @@ fun message(itn: *intern.Interner, a: *A.Allocator, op: str, path: str, detail: 
     ret io_message(itn, a, op, path, detail, generic);
 }
 
-fun precondition_of(pre: Precondition) txn.Precondition {
-    if (pre == CREATE) { ret txn.PRE_ABSENT_AT_COMMIT; }
-    ret txn.PRE_UNCHANGED_SINCE_PREPARE;
+fun prepare_options(pre: Precondition) txn.PrepareOptions {
+    var required: txn.Precondition = txn.PRE_SAME_OBJECT;
+    if (pre == CREATE) { required = txn.PRE_ABSENT; }
+    ret txn.PrepareOptions{precondition: required, prior_access: txn.READ_AUTHORIZED,
+        durability: txn.durability_none()};
 }
 
-fun open_parent(itn: *intern.Interner, a: *A.Allocator, path: str, parents: Parents, op: str, generic: str) R.Result[txn.Root, str] {
-    val dir_r: R.Result[str, str] = spath.parent(a, path);
-    if (R.is_err[str, str](dir_r)) {
-        ret R.err[txn.Root, str](message(itn, a, op, path, R.unwrap_err[str, str](dir_r), generic));
+fun operation_open(out: *Plan, a: *A.Allocator, path: str, parents: Parents) R.Result[*Destination, str] {
+    val initialized: O.Option[txn.Error] = planned.init(out, a);
+    if (O.is_some[txn.Error](initialized)) {
+        ret R.err[*Destination, str](txn.error_message(O.unwrap[txn.Error](initialized)));
     }
-    val dir: str = R.unwrap_ok[str, str](dir_r);
-    if (parents == PARENTS_CREATE) {
-        val mk: O.Option[str] = fs.create_dir_all(a, dir, DIR_MODE);
-        if (O.is_some[str](mk)) {
-            val msg: str = message(itn, a, op, path, O.unwrap[str](mk), generic);
-            str_free(a, dir);
-            ret R.err[txn.Root, str](msg);
-        }
+    val added: R.Result[*Destination, str] = planned.add(out, path, parents == PARENTS_CREATE);
+    if (R.is_err[*Destination, str](added)) { ret added; }
+    val admitted: O.Option[txn.Error] = planned.seal(out);
+    if (O.is_some[txn.Error](admitted)) {
+        ret R.err[*Destination, str](txn.error_message(O.unwrap[txn.Error](admitted)));
     }
-    val root_r: R.Result[txn.Root, txn.Error] = txn.root_open(dir, "");
-    str_free(a, dir);
-    if (R.is_err[txn.Root, txn.Error](root_r)) {
-        ret R.err[txn.Root, str](message(itn, a, op, path,
-            txn.error_message(R.unwrap_err[txn.Root, txn.Error](root_r)), generic));
+    ret added;
+}
+
+fun operation_finish(operation: *Plan, itn: *intern.Interner, a: *A.Allocator,
+                     result: R.Result[R.Void, str]) R.Result[R.Void, str] {
+    val cleanup: O.Option[txn.Error] = planned.dnit(operation);
+    if (O.is_none[txn.Error](cleanup)) { ret result; }
+    val detail: str = txn.error_message(O.unwrap[txn.Error](cleanup));
+    if (R.is_ok[R.Void, str](result)) { ret R.err[R.Void, str](detail); }
+    val combined: R.Result[str, str] = format.sprint(a, "{}, publication cleanup: {}",
+        R.unwrap_err[R.Void, str](result), detail);
+    if (R.is_err[str, str](combined)) { ret R.err[R.Void, str](R.unwrap_err[str, str](combined)); }
+    val text: str = R.unwrap_ok[str, str](combined);
+    if (itn == nil) { ret R.err[R.Void, str](text); }
+    ret R.err[R.Void, str](intern_message(itn, a, text, str_len(text), detail));
+}
+
+fun abort_failure(itn: *intern.Interner, a: *A.Allocator, t: *txn.Transaction,
+                  path: str, detail: str, op: str, generic: str) R.Result[R.Void, str] {
+    val aborted: O.Option[txn.Error] = txn.abort(t);
+    if (O.is_some[txn.Error](aborted)) {
+        val combined: R.Result[str, str] = format.sprint(a, "{}; abort: {}", detail,
+            txn.error_message(O.unwrap[txn.Error](aborted)));
+        if (R.is_err[str, str](combined)) { ret R.err[R.Void, str](R.unwrap_err[str, str](combined)); }
+        val text: str = R.unwrap_ok[str, str](combined);
+        if (itn == nil) { ret R.err[R.Void, str](text); }
+        fin { str_free(a, text); }
+        ret R.err[R.Void, str](message(itn, a, op, path, text, generic));
     }
-    ret R.ok[txn.Root, str](R.unwrap_ok[txn.Root, txn.Error](root_r));
+    ret R.err[R.Void, str](message(itn, a, op, path, detail, generic));
 }
 
 fun finish(itn: *intern.Interner, a: *A.Allocator, t: *txn.Transaction, path: str, planned: usize,
-           check_len: bool, pre: Precondition, op: str, generic: str, digest_out: *[32]u8) R.Result[R.Void, str] {
+           check_len: bool, op: str, generic: str, digest_out: *[32]u8) R.Result[R.Void, str] {
     if (check_len && txn.transaction_len(t) != planned) {
-        txn.abort(t);
+        ret abort_failure(itn, a, t, path,
+            "short write: the staged file holds fewer bytes than the writer planned", op, generic);
+    }
+    var digest: [32]u8;
+    if (digest_out != nil && !txn.transaction_digest(t, ?digest)) {
+        ret abort_failure(itn, a, t, path, "publication produced no content digest", op, generic);
+    }
+    val committed: R.Result[txn.Outcome, txn.Error] = txn.commit(t);
+    if (R.is_err[txn.Outcome, txn.Error](committed)) {
         ret R.err[R.Void, str](message(itn, a, op, path,
-            "short write: the staged file holds fewer bytes than the writer planned", generic));
+            txn.error_message(R.unwrap_err[txn.Outcome, txn.Error](committed)), generic));
     }
-    if (digest_out != nil) {
-        var digest: [32]u8;
-        if (!txn.transaction_digest(t, ?digest)) {
-            txn.abort(t);
-            ret R.err[R.Void, str](message(itn, a, op, path, "publication produced no content digest", generic));
-        }
-        @digest_out = digest;
-    }
-    val commit_r: R.Result[txn.Outcome, txn.Error] = txn.commit(t, precondition_of(pre), txn.durability_none());
-    if (R.is_err[txn.Outcome, txn.Error](commit_r)) {
-        ret R.err[R.Void, str](message(itn, a, op, path,
-            txn.error_message(R.unwrap_err[txn.Outcome, txn.Error](commit_r)), generic));
-    }
+    if (digest_out != nil) { @digest_out = digest; }
     ret R.ok_void[str]();
 }
 
-pub fun bytes_at(itn: *intern.Interner, a: *A.Allocator, root: *txn.Root, leaf: str, path: str,
+pub fun bytes_at(itn: *intern.Interner, a: *A.Allocator, destination: *txn.Claim, path: str,
                  buf: *u8, len: usize, mode: i32, pre: Precondition, op: str, generic: str,
                  digest_out: *[32]u8) R.Result[R.Void, str] {
-    val prepare_r: R.Result[txn.Transaction, txn.Error] =
-        txn.prepare_bytes(a, root, leaf, buf, len, mode, digest_out != nil);
-    if (R.is_err[txn.Transaction, txn.Error](prepare_r)) {
-        ret R.err[R.Void, str](message(itn, a, op, path,
-            txn.error_message(R.unwrap_err[txn.Transaction, txn.Error](prepare_r)), generic));
+    var transaction: txn.Transaction;
+    val prepared: O.Option[txn.Error] = txn.prepare_bytes(?transaction, a, destination,
+        buf, len, mode, digest_out != nil, prepare_options(pre));
+    if (O.is_some[txn.Error](prepared)) {
+        ret R.err[R.Void, str](message(itn, a, op, path, txn.error_message(O.unwrap[txn.Error](prepared)), generic));
     }
-    var t: txn.Transaction = R.unwrap_ok[txn.Transaction, txn.Error](prepare_r);
-    ret finish(itn, a, ?t, path, len, true, pre, op, generic, digest_out);
+    ret finish(itn, a, ?transaction, path, len, true, op, generic, digest_out);
 }
 
 pub fun bytes(itn: *intern.Interner, a: *A.Allocator, path: str, buf: *u8, len: usize, mode: i32,
               pre: Precondition, parents: Parents, op: str, generic: str,
               digest_out: *[32]u8) R.Result[R.Void, str] {
-    val root_r: R.Result[txn.Root, str] = open_parent(itn, a, path, parents, op, generic);
-    if (R.is_err[txn.Root, str](root_r)) { ret R.err[R.Void, str](R.unwrap_err[txn.Root, str](root_r)); }
-    var root: txn.Root = R.unwrap_ok[txn.Root, str](root_r);
-    val r: R.Result[R.Void, str] = bytes_at(itn, a, ?root, spath.filename(path), path, buf, len, mode, pre, op, generic, digest_out);
-    txn.root_dnit(?root);
-    ret r;
+    var operation: Plan;
+    val opened: R.Result[*Destination, str] = operation_open(?operation, a, path, parents);
+    var result: R.Result[R.Void, str] = R.ok_void[str]();
+    if (R.is_err[*Destination, str](opened)) {
+        result = R.err[R.Void, str](message(itn, a, op, path, R.unwrap_err[*Destination, str](opened), generic));
+    } or {
+        val destination: *Destination = R.unwrap_ok[*Destination, str](opened);
+        result = bytes_at(itn, a, ?destination.claim, path, buf, len, mode, pre, op, generic, digest_out);
+    }
+    ret operation_finish(?operation, itn, a, result);
+}
+
+pub fun writer_at[W](itn: *intern.Interner, a: *A.Allocator, destination: *txn.Claim, path: str, ctx: *W,
+                     write_cb: fun(*W, *mwriter.Writer) R.Result[R.Void, str], mode: i32,
+                     pre: Precondition, op: str, generic: str) R.Result[R.Void, str] {
+    var transaction: txn.Transaction;
+    val prepared: O.Option[txn.Error] = txn.prepare[W](?transaction, a, destination,
+        ctx, write_cb, mode, false, prepare_options(pre));
+    if (O.is_some[txn.Error](prepared)) {
+        ret R.err[R.Void, str](message(itn, a, op, path, txn.error_message(O.unwrap[txn.Error](prepared)), generic));
+    }
+    ret finish(itn, a, ?transaction, path, 0, false, op, generic, nil);
 }
 
 pub fun writer[W](itn: *intern.Interner, a: *A.Allocator, path: str, ctx: *W,
                   write_cb: fun(*W, *mwriter.Writer) R.Result[R.Void, str], mode: i32,
                   pre: Precondition, parents: Parents, op: str, generic: str) R.Result[R.Void, str] {
-    val root_r: R.Result[txn.Root, str] = open_parent(itn, a, path, parents, op, generic);
-    if (R.is_err[txn.Root, str](root_r)) { ret R.err[R.Void, str](R.unwrap_err[txn.Root, str](root_r)); }
-    var root: txn.Root = R.unwrap_ok[txn.Root, str](root_r);
-    val prepare_r: R.Result[txn.Transaction, txn.Error] =
-        txn.prepare[W](a, ?root, spath.filename(path), ctx, write_cb, mode, false);
-    if (R.is_err[txn.Transaction, txn.Error](prepare_r)) {
-        txn.root_dnit(?root);
-        ret R.err[R.Void, str](message(itn, a, op, path,
-            txn.error_message(R.unwrap_err[txn.Transaction, txn.Error](prepare_r)), generic));
+    var operation: Plan;
+    val opened: R.Result[*Destination, str] = operation_open(?operation, a, path, parents);
+    var result: R.Result[R.Void, str] = R.ok_void[str]();
+    if (R.is_err[*Destination, str](opened)) {
+        result = R.err[R.Void, str](message(itn, a, op, path, R.unwrap_err[*Destination, str](opened), generic));
+    } or {
+        val destination: *Destination = R.unwrap_ok[*Destination, str](opened);
+        result = writer_at[W](itn, a, ?destination.claim, path, ctx, write_cb, mode, pre, op, generic);
     }
-    var t: txn.Transaction = R.unwrap_ok[txn.Transaction, txn.Error](prepare_r);
-    val r: R.Result[R.Void, str] = finish(itn, a, ?t, path, 0, false, pre, op, generic, nil);
-    txn.root_dnit(?root);
-    ret r;
+    ret operation_finish(?operation, itn, a, result);
 }
 
-pub fun subtree(a: *A.Allocator, d: *txn.Descent, inv: *txn.Inventory, dir_mode: i32) R.Result[R.Void, str] {
-    val prep_r: R.Result[txn.Transaction, txn.Error] =
-        txn.prepare_subtree(a, ?d.root, d.first_missing, inv, dir_mode);
-    if (R.is_err[txn.Transaction, txn.Error](prep_r)) {
-        ret R.err[R.Void, str](txn.error_message(R.unwrap_err[txn.Transaction, txn.Error](prep_r)));
+pub fun subtree(a: *A.Allocator, destination: *txn.Claim, inv: *txn.Inventory, dir_mode: i32) R.Result[R.Void, str] {
+    var transaction: txn.Transaction;
+    val prepared: O.Option[txn.Error] = txn.prepare_subtree(?transaction, a, destination,
+        inv, dir_mode, prepare_options(CREATE));
+    if (O.is_some[txn.Error](prepared)) {
+        ret R.err[R.Void, str](txn.error_message(O.unwrap[txn.Error](prepared)));
     }
-    var t: txn.Transaction = R.unwrap_ok[txn.Transaction, txn.Error](prep_r);
-    val commit_r: R.Result[txn.Outcome, txn.Error] = txn.commit(?t, txn.PRE_ABSENT_AT_COMMIT, txn.durability_none());
-    if (R.is_err[txn.Outcome, txn.Error](commit_r)) {
-        ret R.err[R.Void, str](txn.error_message(R.unwrap_err[txn.Outcome, txn.Error](commit_r)));
+    val committed: R.Result[txn.Outcome, txn.Error] = txn.commit(?transaction);
+    if (R.is_err[txn.Outcome, txn.Error](committed)) {
+        ret R.err[R.Void, str](txn.error_message(R.unwrap_err[txn.Outcome, txn.Error](committed)));
     }
     ret R.ok_void[str]();
 }

@@ -2,6 +2,8 @@ use std.allocator.arena;
 use std.allocator.page;
 use fs: std.filesystem;
 use std.memory;
+use std.types.path;
+use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -25,6 +27,8 @@ use mach.lang.build.emit;
 use mach.lang.build.fingerprint;
 use mach.lang.build.outcome;
 use mach.lang.build.plan;
+use mach.lang.publication;
+use txn: std.filesystem.transaction;
 use mach.lang.build.request;
 use dq: mach.lang.driver.query;
 use mach.lang.be.codegen;
@@ -55,6 +59,12 @@ rec UnitState {
 
     out_path:     *u8;
     scope:        btest.TestScope;
+    outputs:      publication.Plan;
+    objects:      **publication.Destination;
+    ir_outputs:   **publication.Destination;
+    asm_outputs:  **publication.Destination;
+    artifact:     *publication.Destination;
+    dispatcher:   *publication.Destination;
 }
 
 
@@ -335,13 +345,25 @@ pub fun execute_warm(bp: *plan.BuildPlan, unit_index: usize, s: *session.Session
         result = record_artifact(?p, unit, ?st, ?bo);
     }
 
+    if (st.out_path != nil) { st.out_path = unit.out_path::*u8; }
+    val released: O.Option[txn.Error] = release_outputs(?p, ?st);
     var event_error: str = nil;
     if (R.is_err[R.Void, outcome.Fail](result)) {
         var f: outcome.Fail = R.unwrap_err[R.Void, outcome.Fail](result);
         val fail_r: R.Result[R.Void, str] = outcome.record_fail(?bo, ?f);
         if (R.is_err[R.Void, str](fail_r)) { event_error = "failed to record build failure"; }
     }
-    or (ev != nil) {
+    if (O.is_some[txn.Error](released)) {
+        val error: txn.Error = O.unwrap[txn.Error](released);
+        val detail: str = plan.join_msg(p.alloc, "publication cleanup: ", txn.error_message(error));
+        var cleanup: outcome.Fail = outcome.environment(detail);
+        if (error.kind == txn.INVALID) { cleanup = outcome.internal(detail); }
+        val recorded: R.Result[R.Void, str] = outcome.record_fail(?bo, ?cleanup);
+        if (R.is_err[R.Void, str](recorded)) { event_error = "failed to record publication cleanup failure"; }
+        outcome.fold_fail(?bo, ?cleanup);
+        if (R.is_ok[R.Void, outcome.Fail](result)) { result = R.err[R.Void, outcome.Fail](cleanup); }
+    }
+    if (R.is_ok[R.Void, outcome.Fail](result) && ev != nil) {
         emit_unit_summary(?p, ?st, ev);
     }
 
@@ -453,6 +475,96 @@ fun warm_fail(bo: *outcome.BuildOutcome, f: outcome.Fail) R.Result[outcome.Build
     ret R.ok[outcome.BuildOutcome, outcome.Fail](@bo);
 }
 
+fun plan_module_outputs(p: *driver.Project, outputs: *publication.Plan, base: str, suffix: str)
+                        R.Result[**publication.Destination, outcome.Fail] {
+    if (p.emit_len == 0) { ret R.ok[**publication.Destination, outcome.Fail](nil); }
+    val allocated: R.Result[**publication.Destination, str] = A.allocate[*publication.Destination](p.alloc, p.emit_len::usize);
+    if (R.is_err[**publication.Destination, str](allocated)) {
+        ret R.err[**publication.Destination, outcome.Fail](outcome.internal(R.unwrap_err[**publication.Destination, str](allocated)));
+    }
+    val destinations: **publication.Destination = R.unwrap_ok[**publication.Destination, str](allocated);
+    var complete: bool = false;
+    fin { if (!complete) { A.deallocate[*publication.Destination](p.alloc, destinations, p.emit_len::usize); } }
+    var i: u32 = 0;
+    for (i < p.emit_len) {
+        val m: *driver.ModuleEntry = ?p.modules[p.topo[i]::u32];
+        val fqn: O.Option[str] = intern.lookup(?p.s.interner, m.fqn);
+        if (O.is_none[str](fqn)) {
+            ret R.err[**publication.Destination, outcome.Fail](outcome.internal("module FQN not interned"));
+        }
+        val name_r: R.Result[str, str] = emit.mirror_fqn(p.alloc, base, O.unwrap[str](fqn), suffix);
+        if (R.is_err[str, str](name_r)) {
+            ret R.err[**publication.Destination, outcome.Fail](outcome.internal(R.unwrap_err[str, str](name_r)));
+        }
+        val name: str = R.unwrap_ok[str, str](name_r);
+        val reserved: R.Result[*publication.Destination, str] = publication.plan_add(outputs, name, true);
+        str_free(p.alloc, name);
+        if (R.is_err[*publication.Destination, str](reserved)) {
+            ret R.err[**publication.Destination, outcome.Fail](outcome.environment(R.unwrap_err[*publication.Destination, str](reserved)));
+        }
+        destinations[i] = R.unwrap_ok[*publication.Destination, str](reserved);
+        i = i + 1;
+    }
+    complete = true;
+    ret R.ok[**publication.Destination, outcome.Fail](destinations);
+}
+
+fun plan_outputs(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState) R.Result[R.Void, outcome.Fail] {
+    val initialized: O.Option[txn.Error] = publication.plan_init(?st.outputs, p.alloc);
+    if (O.is_some[txn.Error](initialized)) {
+        ret R.err[R.Void, outcome.Fail](outcome.internal(txn.error_message(O.unwrap[txn.Error](initialized))));
+    }
+    val goal: request.BuildGoal = p.req.goal;
+    val flat: bool = p.target.of != nil && p.target.of.produces_image;
+    val objects: bool = (goal == request.GOAL_EXECUTE && !flat)
+        || goal == request.GOAL_OBJECTS || goal == request.GOAL_TESTS;
+    if (objects) {
+        val planned: R.Result[**publication.Destination, outcome.Fail] = plan_module_outputs(p, ?st.outputs, unit.obj_dir, p.target.of.object_ext);
+        if (R.is_err[**publication.Destination, outcome.Fail](planned)) { ret R.void_of[**publication.Destination, outcome.Fail](planned); }
+        st.objects = R.unwrap_ok[**publication.Destination, outcome.Fail](planned);
+    }
+    if (p.req.emit_ir) {
+        val planned: R.Result[**publication.Destination, outcome.Fail] = plan_module_outputs(p, ?st.outputs, unit.ir_dir, "ir");
+        if (R.is_err[**publication.Destination, outcome.Fail](planned)) { ret R.void_of[**publication.Destination, outcome.Fail](planned); }
+        st.ir_outputs = R.unwrap_ok[**publication.Destination, outcome.Fail](planned);
+    }
+    if (p.req.emit_asm) {
+        val planned: R.Result[**publication.Destination, outcome.Fail] = plan_module_outputs(p, ?st.outputs, unit.asm_dir, "s");
+        if (R.is_err[**publication.Destination, outcome.Fail](planned)) { ret R.void_of[**publication.Destination, outcome.Fail](planned); }
+        st.asm_outputs = R.unwrap_ok[**publication.Destination, outcome.Fail](planned);
+    }
+    if ((goal == request.GOAL_EXECUTE && !plan.finished_modules(?p.target)) || goal == request.GOAL_TESTS) {
+        val planned: R.Result[*publication.Destination, str] = publication.plan_add(?st.outputs, unit.out_path, true);
+        if (R.is_err[*publication.Destination, str](planned)) {
+            ret R.err[R.Void, outcome.Fail](outcome.environment(R.unwrap_err[*publication.Destination, str](planned)));
+        }
+        st.artifact = R.unwrap_ok[*publication.Destination, str](planned);
+    }
+    if (goal == request.GOAL_TESTS) {
+        val name_r: R.Result[str, str] = path.join(p.alloc, unit.obj_dir, "__mach_test_dispatch.o");
+        if (R.is_err[str, str](name_r)) { ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[str, str](name_r))); }
+        val name: str = R.unwrap_ok[str, str](name_r);
+        val planned: R.Result[*publication.Destination, str] = publication.plan_add(?st.outputs, name, true);
+        str_free(p.alloc, name);
+        if (R.is_err[*publication.Destination, str](planned)) {
+            ret R.err[R.Void, outcome.Fail](outcome.environment(R.unwrap_err[*publication.Destination, str](planned)));
+        }
+        st.dispatcher = R.unwrap_ok[*publication.Destination, str](planned);
+    }
+    val sealed: O.Option[txn.Error] = publication.plan_seal(?st.outputs);
+    if (O.is_some[txn.Error](sealed)) {
+        ret R.err[R.Void, outcome.Fail](outcome.environment(txn.error_message(O.unwrap[txn.Error](sealed))));
+    }
+    ret R.ok_void[outcome.Fail]();
+}
+
+fun release_outputs(p: *driver.Project, st: *UnitState) O.Option[txn.Error] {
+    if (st.objects != nil) { A.deallocate[*publication.Destination](p.alloc, st.objects, p.emit_len::usize); st.objects = nil; }
+    if (st.ir_outputs != nil) { A.deallocate[*publication.Destination](p.alloc, st.ir_outputs, p.emit_len::usize); st.ir_outputs = nil; }
+    if (st.asm_outputs != nil) { A.deallocate[*publication.Destination](p.alloc, st.asm_outputs, p.emit_len::usize); st.asm_outputs = nil; }
+    ret publication.plan_dnit(?st.outputs);
+}
+
 fun run_phase(ph: plan.PhaseKind, p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
               bo: *outcome.BuildOutcome, oa: *A.Allocator,
               ev: *readout.Progress) R.Result[R.Void, outcome.Fail] {
@@ -462,7 +574,10 @@ fun run_phase(ph: plan.PhaseKind, p: *driver.Project, unit: *plan.BuildUnit, st:
     if (ph == plan.PH_LOAD)      { result = load_phase(p); }
     if (ph == plan.PH_SEMA)      { result = sema_phase(p, st); }
     if (ph == plan.PH_LOWER)     { result = lower_phase(p, st, bo, ev); }
-    if (ph == plan.PH_CODEGEN)   { result = codegen_phase(p, st, ev); }
+    if (ph == plan.PH_CODEGEN) {
+        result = plan_outputs(p, unit, st);
+        if (R.is_ok[R.Void, outcome.Fail](result)) { result = codegen_phase(p, st, ev); }
+    }
     if (ph == plan.PH_EMIT)      { result = emit_phase(p, unit, st, bo, ev); }
     if (ph == plan.PH_LINK)      { result = link_phase(p, unit, st, bo, oa, ev); }
 
@@ -598,13 +713,13 @@ fun emit_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
             val mid: session.ModuleId    = p.topo[i];
             val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
             if (p.req.emit_ir) {
-                val res_ir: R.Result[R.Void, str] = emit.emit_ir(p, unit.ir_dir::*u8, m.fqn, m.ir_module);
+                val res_ir: R.Result[R.Void, str] = emit.emit_ir(p, st.ir_outputs[i], m.ir_module);
                 if (R.is_err[R.Void, str](res_ir)) {
                     ret R.err[R.Void, outcome.Fail](outcome.environment(R.unwrap_err[R.Void, str](res_ir)));
                 }
             }
             if (p.req.emit_asm) {
-                val res_asm: R.Result[R.Void, str] = emit.emit_asm(p, unit.asm_dir::*u8, m.fqn, m.ir_module);
+                val res_asm: R.Result[R.Void, str] = emit.emit_asm(p, st.asm_outputs[i], m.ir_module);
                 if (R.is_err[R.Void, str](res_asm)) {
                     ret R.err[R.Void, outcome.Fail](outcome.environment(R.unwrap_err[R.Void, str](res_asm)));
                 }
@@ -640,7 +755,7 @@ fun emit_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
         || goal == request.GOAL_OBJECTS
         || goal == request.GOAL_TESTS;
     if (objects) {
-        val oc: R.Result[R.Void, outcome.Fail] = emit.write_objects(p, st.images, unit.obj_dir::*u8, ?st.obj_paths);
+        val oc: R.Result[R.Void, outcome.Fail] = emit.write_objects(p, st.images, st.objects, ?st.obj_paths);
         if (R.is_err[R.Void, outcome.Fail](oc)) { ret oc; }
         st.obj_len = p.emit_len;
     }
@@ -719,7 +834,7 @@ fun link_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
 
     if (te.mode == driver.MODE_LIBRARY) {
         if (te.lib_kind == manifest.LIBKIND_STATIC) {
-            val arc_r: R.Result[R.Void, outcome.Fail] = emit.emit_static_archive(p, unit, st.images, st.obj_paths, ?st.out_path);
+            val arc_r: R.Result[R.Void, outcome.Fail] = emit.emit_static_archive(p, st.artifact, st.images, st.obj_paths, ?st.out_path);
             if (R.is_err[R.Void, outcome.Fail](arc_r)) { ret arc_r; }
             readout.phase_end(ev, readout.PH_LINK, 1, "archive", "archives");
             ret R.ok_void[outcome.Fail]();
@@ -727,7 +842,7 @@ fun link_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
         if (te.lib_kind == manifest.LIBKIND_SHARED) {
             val ext_r: R.Result[R.Void, outcome.Fail] = emit.append_external_inputs(p, unit, ?st.obj_paths, ?st.obj_len, ?st.dynlibs, ?st.dynlib_len);
             if (R.is_err[R.Void, outcome.Fail](ext_r)) { ret ext_r; }
-            val so_r: R.Result[R.Void, outcome.Fail] = emit.emit_shared_library(p, unit, st.obj_paths, st.obj_len, st.dynlibs, st.dynlib_len, ?st.out_path);
+            val so_r: R.Result[R.Void, outcome.Fail] = emit.emit_shared_library(p, st.artifact, st.obj_paths, st.obj_len, st.dynlibs, st.dynlib_len, ?st.out_path);
             if (R.is_err[R.Void, outcome.Fail](so_r)) { ret so_r; }
             readout.phase_end(ev, readout.PH_LINK, 1, "library", "libraries");
             ret R.ok_void[outcome.Fail]();
@@ -741,9 +856,6 @@ fun link_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
     if (R.is_err[R.Void, outcome.Fail](ext_r)) { ret ext_r; }
 
     val artifact: str = unit.out_path;
-    if (O.is_some[str](emit.ensure_parents(p.alloc, artifact))) {
-        ret R.err[R.Void, outcome.Fail](outcome.environment("failed to create binary directory"));
-    }
 
     val ext_from:  u32 = p.emit_len;
     val ext_count: u32 = st.obj_len - p.emit_len;
@@ -771,10 +883,10 @@ fun link_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
     val from_image: bool = p.target.of.links_from_image;
     var res_link: R.Result[R.Void, outcome.Fail] = R.ok_void[outcome.Fail]();
     if (from_image) {
-        res_link = emit.link_mixed_images(p, st.images, ?st.obj_paths[ext_from], ext_count, st.dynlibs, st.dynlib_len, artifact::*u8, loaded.options);
+        res_link = emit.link_mixed_images(p, st.images, ?st.obj_paths[ext_from], ext_count, st.dynlibs, st.dynlib_len, st.artifact, loaded.options);
     }
     if (!from_image) {
-        res_link = emit.link_executable(p, st.obj_paths, st.obj_len, st.dynlibs, st.dynlib_len, artifact::*u8, loaded.options);
+        res_link = emit.link_executable(p, st.obj_paths, st.obj_len, st.dynlibs, st.dynlib_len, st.artifact, loaded.options);
     }
     emit.dnit_image_options(p.alloc, ?loaded);
     if (R.is_err[R.Void, outcome.Fail](res_link)) { ret res_link; }
@@ -815,7 +927,7 @@ fun link_dispatch_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitStat
         ret R.ok_void[outcome.Fail]();
     }
 
-    val lr: R.Result[R.Void, outcome.Fail] = btest.link_dispatcher(p, unit, ?st.scope, ?di);
+    val lr: R.Result[R.Void, outcome.Fail] = btest.link_dispatcher(p, unit, ?st.scope, ?di, st.dispatcher, st.artifact);
     btest.free_dispatch_inputs(p, ?di);
     if (R.is_err[R.Void, outcome.Fail](lr)) { ret lr; }
 
@@ -853,9 +965,6 @@ fun set_dispatch_config_input(p: *driver.Project, out_path: *u8,
 
 fun link_flat(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState, ev: *readout.Progress, t_link: ctime.Time) R.Result[R.Void, outcome.Fail] {
     val artifact: str = unit.out_path;
-    if (O.is_some[str](emit.ensure_parents(p.alloc, artifact))) {
-        ret R.err[R.Void, outcome.Fail](outcome.environment("failed to create binary directory"));
-    }
 
     val cfg_r: R.Result[R.Void, outcome.Fail] = set_link_config_input(p, artifact::*u8, emit.artifact_product_name(p), linker.LINK_EXE::u32, nil, 0, nil, 0, nil);
     if (R.is_err[R.Void, outcome.Fail](cfg_r)) { ret cfg_r; }
@@ -869,7 +978,7 @@ fun link_flat(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState, ev: *re
         ret R.ok_void[outcome.Fail]();
     }
 
-    val res_link: R.Result[R.Void, outcome.Fail] = emit.link_flat_images(p, st.images, artifact::*u8,
+    val res_link: R.Result[R.Void, outcome.Fail] = emit.link_flat_images(p, st.images, st.artifact,
         of.image_options_default(p.req.subsystem));
     if (R.is_err[R.Void, outcome.Fail](res_link)) { ret res_link; }
 

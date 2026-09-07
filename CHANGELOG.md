@@ -29,9 +29,9 @@ limits, including the refusal to take addresses of temporaries.
 - The dependency model is a flat closure owned by the root project. Every member lands at `dep/<id>` one level deep as a git submodule, the committed gitlink is the pin, and the manifest key, the directory under `dep/`, and the project id are one name. A consumed dependency's own `dep/` is never initialized.
 - A package declares only what it uses directly. Its dependencies' dependencies reach the root's `dep/` through closure computation. An identity reached through two chains with different selections stops the command and prints both chains and the root declaration that decides.
 - `mach dep verify [<path>]` runs the build's dependency checks as a command without changing anything, and names a directory under `dep/` that is not in the closure.
-- `mach dep add`, `mach dep remove`, and `mach dep update` move the manifest, `.gitmodules`, and the gitlinks together or not at all. `update` alone moves selectors. A failed clone exits 3.
+- `mach dep add`, `mach dep remove`, and `mach dep update` validate before mutation and use native submodule operations. The manifest is published last. A later failure preserves completed Git state for inspection. `update` alone moves selectors. A failed clone exits 3.
 - Dependency verification reads the index, not HEAD, so `mach init` followed by `mach build .` works with nothing committed. A project nested inside an unrelated repository realizes dependencies as plain clones and verifies against the checkout.
-- A `path` dependency is copied into `dep/<id>` as tracked content, never symlinked.
+- A `path` dependency is copied into `dep/<id>` as ordinary files, never symlinked or automatically staged. Local path dependencies need no Git repository.
 - `mach init` scaffolds on `std.runtime`, declares `[dep.std]` at `branch/main`, and realizes it as a submodule. `--no-deps` publishes the scaffold and prints the `mach dep pull` it skipped.
 - `default = true` on `[target.*]`, `[profile.*]`, and `[artifact.*]` selects among several declarations. Selection never reads table order. Zero declared profiles get the built-in `debug` and `release`, and one declared profile selects itself.
 - An artifact's `need` names build steps, other artifacts, or `*` globs over both. A required artifact is planned before its consumer, on the consumer's target when the requirement declares it and otherwise on every target the requirement names, and `{artifact.<id>.out}` expands to its output path relative to the project root, including inside `#[embed]`. A failed requirement fails its consumer by name.
@@ -129,6 +129,10 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 - The `$mach` target namespaces enumerate the registries, so every registered name resolves and no unregistered name does.
 
 ### Fixed
+
+- Pair compiler output, initialization and cleanup with the std filesystem ownership API. Reserve build destinations before workers start and retain directory ownership through publication and recovery.
+- Only `mach init` requests repository creation, with `--no-git` to opt out. Dependency commands preserve project history and unrelated staged work, use native submodule operations, and retain checkouts unless removal explicitly requests `--purge`.
+- Anchor absolute initialization paths beneath their native existing parent and keep staging and recovery bound to the held directory.
 
 - Bound common aggregate snapshots by machine-width pieces and avoid redundant alignment branches on targets with explicit ordinary-memory unaligned access support.
 
@@ -241,7 +245,7 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 - Planner template lookups borrow successful artifact outputs, release diagnostic scratch, and preserve allocation failures (#3208).
 
-- Initialization reports rollback and cleanup failures and retains its recovery journal until every required operation succeeds (#3174).
+- Initialization reports rollback and cleanup failures independently and retains its recovery journal until every required operation, including coordinator close, succeeds (#3174).
 - `mach run` validates artifact execution through the native command boundary, allowing Windows executables while retaining Unix execute-permission and native image rejection (#3184).
 
 - Native driver fixtures resolve host executables, compare complete native paths, select a genuinely foreign target and check both sides of target-gated orphan collection (#3176).
