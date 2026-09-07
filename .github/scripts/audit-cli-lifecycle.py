@@ -7,20 +7,17 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-SOURCE = 'fc93b85787d5732e663f6698a9a36c6598a932c7'
+SOURCE = '9772c1334c33a81262c9f07507198762e3b9dfe0'
 PIN = 'c6a8816933fffa8ee490bb0bed8a97e7f0c1b296'
 BASE_SOURCE = 'be70fdcd6cb0806406830be3ce2abb8d91f6ce0f'
 BASE_RUN = 34074514612
 RETAINED = ROOT / 'retained-cli-lifecycle'
-EVIDENCE = ROOT / 'output-fixture-evidence'
+EVIDENCE = ROOT / 'soname-evidence'
 EVIDENCE.mkdir(exist_ok=True)
 (EVIDENCE / 'verification-script.py').write_bytes(pathlib.Path(__file__).read_bytes())
 RESULTS = []
 PREFIXES = [
-    ('object-formats', 'mach.lang.target.of', 182 if sys.platform == 'win32' else 181),
-    ('linker', 'mach.lang.be.linker', 91),
-    ('driver-stack', 'mach.lang.driver:a_manifest_stack_reserve_reaches_the_linked_pe', 1),
-    ('driver-unwind', 'mach.lang.driver:w64_', 3),
+    ('elf', 'mach.lang.target.of.elf', 42),
 ]
 
 
@@ -136,7 +133,7 @@ for name, prefix, expected in PREFIXES:
     names = []
     for path in (ROOT / 'src').rglob('*.mach'):
         names += [value for value in re.findall(r'^[ \t]*test "([^"]+)"', path.read_text(encoding='utf-8'), re.M) if value.startswith(prefix)]
-    declared = 183 if name == 'object-formats' else expected
+    declared = expected
     if len(names) != declared:
         raise RuntimeError(f'prefix inventory drift: {prefix}, {len(names)} != {declared}')
     inventory[prefix] = dict(declared_names=names, expected_native_count=expected)
@@ -153,8 +150,42 @@ for profile in ['debug', 'release']:
         if not test(COMPILERS[profile], profile, profile + '-' + name, prefix, count):
             baseline_ok = False
 
+path = ROOT / 'src/lang/target/of/elf.mach'
+original = path.read_bytes()
+try:
+    text = original.decode('utf-8').replace('\r\n', '\n')
+    old = run(['git', 'show', '3cb9ec3e:src/lang/target/of/elf.mach']).stdout.decode('utf-8').replace('\r\n', '\n')
+    start = old.index('fun so_basename(')
+    end = old.index('fun emit_shared(', start)
+    helper = old[start:end]
+    label = 'old-windows-separator'
+    if sys.platform != 'win32':
+        helper = helper.replace("path[i] == '/'", "path[i] == '/' || path[i] == '\\\\'")
+        label = 'incorrect-posix-backslash-separator'
+    before = 'host_path.filename(destination.path)'
+    assert text.count(before) == 1 and text.count('fun emit_shared(') == 1
+    changed = text.replace(before, 'so_basename(destination.path::*u8)').replace('fun emit_shared(', helper + 'fun emit_shared(', 1)
+    path.write_text(changed, encoding='utf-8', newline='')
+    (EVIDENCE / 'mutated-helper.txt').write_text(helper, encoding='utf-8')
+    selector = 'mach.lang.target.of.elf.emit_shared:exports_and_soname'
+    command = [str(COMPILERS['debug']), 'test', str(ROOT), '--profile', 'debug',
+               '--filter', selector, '--timeout_seconds', '180']
+    code, log = invoke(label, command)
+    summaries = re.findall(r'(\d+) passed, (\d+) failed, (\d+) total', log)
+    counts = list(map(int, summaries[-1])) if summaries else None
+    exits = re.findall(r'\((?:exit|signal) ([^)]+)\)', log)
+    verified = counts == [0, 1, 1] and code != 0 and bool(exits) and set(exits) == {'1'} and '(signal ' not in log
+    row = dict(name=label, counts=counts, exits=exits, compiler_exit=code, verified=verified)
+    RESULTS.append(row)
+    (EVIDENCE / 'summary.json').write_text(json.dumps(RESULTS, indent=2), encoding='utf-8')
+    print(json.dumps(row), flush=True)
+    if not verified:
+        baseline_ok = False
+finally:
+    path.write_bytes(original)
+
 check_source()
 census('final-source-restored')
 (EVIDENCE / 'restoration.json').write_text(json.dumps(dict(source=SOURCE, pin=PIN, restored=True)), encoding='utf-8')
 if not baseline_ok:
-    raise RuntimeError('one or more complete native output fixture suites failed')
+    raise RuntimeError('native ELF SONAME proof failed')
