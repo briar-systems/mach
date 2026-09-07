@@ -133,6 +133,9 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 ### Fixed
 
 - Only `mach init` requests repository creation. `--no-git` opts out and uses plain dependency checkouts, while initialization preserves existing Git history and does not stage scaffold files.
+- Aggregate ABI carrier loads respect the exact logical object extent, including odd-sized register tails and split register/stack arguments. Partial carriers use initialized owned storage, incoming values reserve their full transport extent, and return carriers are prepared before physical return registers are assigned.
+
+- Bound common aggregate snapshots by machine-width pieces and avoid redundant alignment branches on targets with explicit ordinary-memory unaligned access support.
 
 - Embed containment roots initialize in final storage and propagate close failures through the typed result. The compiler uses the paired std filesystem ownership and publication API.
 
