@@ -64,11 +64,14 @@ def main():
  ]
  outcomes=[]
  for profile in ['debug','release']:
-  code,log=invoke('bulk-'+profile,[B,'test','.','--profile',profile,'--filter',selected[0],'-vv']);assert code==0 and re.findall(r'(\d+) passed, (\d+) failed, (\d+) total',log)==[('7','0','7')]
+  code,log=invoke('bulk-'+profile,[B,'test','.','--profile',profile,'--filter',selected[0],'--format','json']);assert code==0
+  events=[json.loads(x) for x in log.splitlines() if x.startswith('{')]
+  summary=[x for x in events if x.get('event')=='summary'];assert len(summary)==1 and [summary[0][k] for k in ['passed','failed','total']]==[7,0,7]
+  executables={x['exe'] for x in events if x.get('event')=='test'};assert len(executables)==1
+  binary=pathlib.Path(executables.pop());assert binary.is_file()
   code,log=invoke('registry-'+profile,[B,'test','.','--profile',profile,'--list','--format','json']);assert code==0
   registry=[json.loads(x) for x in log.splitlines() if x.startswith('{')];registry=[x for x in registry if x.get('event')=='case']
-  binaries=list(P.glob('out/*/'+profile+'/test/mach'+suffix));assert len(binaries)==1,binaries
-  binary=binaries[0];shutil.copy2(binary,E/('mTests'+profile+suffix))
+  shutil.copy2(binary,E/('mTests'+profile+suffix))
   cases=[x for x in registry if any(sel in x['label'] for sel in selected)]
   for sel in selected:assert any(sel in x['label'] for x in cases),sel
   (E/('selected-'+profile+'.json')).write_text(json.dumps(cases,indent=2))
