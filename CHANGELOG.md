@@ -130,6 +130,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 ### Fixed
 
+- Isolate publication test outputs in private directories so concurrent linker and object-writer fixtures do not contend for one temporary-directory lock.
+
 - Resolve RISC-V GOT high/low relocation pairs through pointer-width GOT slots, preserving the high relocation target for both RV32 and RV64.
 
 - Separate aggregate object sizes from ABI register widths. Copy partial pieces through initialized owned carriers, bound split stack tails to their logical bytes, and prepare all return carriers before assigning registers.
