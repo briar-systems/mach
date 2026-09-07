@@ -138,7 +138,7 @@ There are no scalar↔vector casts in this increment: neither an implicit
 scalar-to-vector conversion nor a `1.0::f32x4` reinterpret is legal. The
 lane-wise operators and the comparison-to-mask rule are in
 [operators.md](operators.md); what a target without hardware SIMD does with a
-vector operator is the `simd` profile lever ([manifest.md](manifest.md),
+vector operator is the `simd` profile lever ([manifest.md](../manifest.md),
 [policy.md](policy.md)).
 
 ## Handles

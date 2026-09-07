@@ -1,20 +1,3 @@
-# post-construction IR mutation primitives
-#
-# `builder.mach` creates IR; this module transforms it after the fact. The two are
-# distinct lifecycle surfaces, so the shared mutation API the optimization passes
-# consume lives here rather than on the construction cursor.
-#
-# Three primitives, each the single place its kind of mutation happens so that
-# source-location (and, with debug info, OP_DBG_VALUE) maintenance is an invariant
-# of the primitive instead of a concern re-solved in every pass:
-#
-#   - value replacement (RAUW): a batched `Rewrite` map for the passes that record
-#     many substitutions then apply once (cse, algebraic, constfold, mem2reg), plus
-#     `replace_uses` for a single immediate replacement (inline).
-#   - erasure: `erase_marked`, the single batch removal path a pass drives with its
-#     own predicate (dce's dead set, mem2reg's promoted memops).
-#   - cloning: `clone_instruction`, a faithful per-instruction copy.
-
 use std.allocator.page;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -25,6 +8,7 @@ use std.types.string.str;
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
+use std.collections.map;
 
 use mach.lang.intern;
 use mach.lang.me.ir;
@@ -34,41 +18,21 @@ use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.source;
 
-# a batched value-replacement map (RAUW) over one function's instruction pool
-#
-# Records that an instruction's result is superseded by another Value, indexed by
-# instruction id, then rewrites every operand naming a replaced instruction to its
-# replacement in a single transitive pass. This is the one shared substitution
-# facility the value-optimization passes (cse, algebraic, constfold, mem2reg) build
-# on instead of each carrying a private copy.
-#
-# The map is acyclic: a replacement never (transitively) names the instruction it
-# replaces, so `rewrite_resolve` terminates; the hop bound is a guard only.
-# ---
-# vals: replacement Value per instruction id, meaningful where live[iid] is set
-# live: whether vals[iid] holds a recorded replacement
-# len:  number of instruction slots (the function's instr_len at init)
 pub rec Rewrite {
     vals: *value.Value;
     live: *bool;
     len:  u32;
 }
 
-# allocate and clear a rewrite map sized to `len` instruction slots
-# ---
-# rw:  the map to initialize in place
-# a:   allocator backing both arrays
-# len: number of instruction slots (the function's instr_len)
-# ret: ok(true) on success, or an allocation error
-pub fun rewrite_init(rw: *Rewrite, a: *A.Allocator, len: u32) R.Result[bool, str] {
+pub fun rewrite_init(rw: *Rewrite, a: *A.Allocator, len: u32) R.Result[R.Void, str] {
     val res_vals: R.Result[*value.Value, str] = A.allocate[value.Value](a, len::usize);
     if (R.is_err[*value.Value, str](res_vals)) {
-        ret R.err[bool, str](R.unwrap_err[*value.Value, str](res_vals));
+        ret R.err[R.Void, str](R.unwrap_err[*value.Value, str](res_vals));
     }
     val res_live: R.Result[*bool, str] = A.allocate[bool](a, len::usize);
     if (R.is_err[*bool, str](res_live)) {
         A.deallocate[value.Value](a, R.unwrap_ok[*value.Value, str](res_vals), len::usize);
-        ret R.err[bool, str](R.unwrap_err[*bool, str](res_live));
+        ret R.err[R.Void, str](R.unwrap_err[*bool, str](res_live));
     }
 
     rw.vals = R.unwrap_ok[*value.Value, str](res_vals);
@@ -77,13 +41,9 @@ pub fun rewrite_init(rw: *Rewrite, a: *A.Allocator, len: u32) R.Result[bool, str
 
     var i: u32 = 0;
     for (i < len) { rw.live[i] = false; i = i + 1; }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# free a rewrite map's arrays and zero it
-# ---
-# rw: the map to tear down
-# a:  the allocator the arrays were taken from
 pub fun rewrite_dnit(rw: *Rewrite, a: *A.Allocator) {
     if (rw.vals != nil && rw.len > 0) { A.deallocate[value.Value](a, rw.vals, rw.len::usize); }
     if (rw.live != nil && rw.len > 0) { A.deallocate[bool](a, rw.live, rw.len::usize); }
@@ -92,79 +52,38 @@ pub fun rewrite_dnit(rw: *Rewrite, a: *A.Allocator) {
     rw.len  = 0;
 }
 
-# record that instruction `iid`'s result is replaced by value `v` (RAUW)
-#
-# The replacement is not applied to operands until `rewrite_apply`; recording only
-# updates the map, so matching that resolves operands through the map (a pass
-# driving itself to a fixpoint) sees the replacement immediately.
-# ---
-# rw:  the map to record into
-# iid: the instruction whose result is superseded
-# v:   the value its uses resolve to
 pub fun replace_value(rw: *Rewrite, iid: id.InstructionId, v: value.Value) {
     rw.vals[iid::u32] = v;
     rw.live[iid::u32] = true;
 }
 
-# whether instruction `iid` has a recorded replacement
-# ---
-# rw:  the map to query
-# iid: the instruction id to test
-# ret: true when a replacement was recorded for iid
 pub fun rewrite_has(rw: *Rewrite, iid: id.InstructionId) bool {
     val idx: u32 = iid::u32;
     ret idx < rw.len && rw.live[idx];
 }
 
-# resolve a value through the map, following replacement chains transitively
-#
-# A VAL_INSTR naming a replaced instruction becomes its replacement, followed
-# again if that too was replaced, up to `len` hops (an acyclicity guard). A
-# non-instruction (or unreplaced) value passes through. The result always carries
-# the original value's type, so a replacement flowing into a differently-typed use
-# slot keeps that slot's type (the aggregate-pointer identity mem2reg relies on).
-# ---
-# rw: the map to resolve through
-# v:  the value to resolve
-# ret: the transitive replacement, retyped to v's type
 pub fun rewrite_resolve(rw: *Rewrite, v: value.Value) value.Value {
     var cur:  value.Value = v;
     var hops: u32         = 0;
     for (cur.kind == value.VAL_INSTR && hops <= rw.len) {
         val iid: u32 = cur.data.instr::u32;
-        if (iid >= rw.len || rw.live[iid] == false) { ret carry_secret(value.retype(cur, v.ty), v); }
+        if (iid >= rw.len || rw.live[iid] == false) { ret substitute_for_use(cur, v); }
         cur  = rw.vals[iid];
         hops = hops + 1;
     }
-    ret carry_secret(value.retype(cur, v.ty), v);
+    ret substitute_for_use(cur, v);
 }
 
-# monotone secrecy taint across a RAUW: the substitute `sub` inherits the taint of
-# the original value `orig` it replaces (#1646)
-#
-# The single point every rewrite passes through, so no optimizer pass can launder a
-# secret by replacing a tainted value with an untainted equivalent. The join is one
-# way - taint only ever grows - so a `:^` public view (already stripped upstream)
-# is never re-tainted, while a secret use can never be cleared by a substitution.
-# ---
-# sub:  the replacement value (already retyped to the use slot)
-# orig: the value being replaced
-# ret:  `sub` with its secret bit joined with `orig`'s
 fun carry_secret(sub: value.Value, orig: value.Value) value.Value {
     var out: value.Value = sub;
     if (orig.secret) { out.secret = true; }
     ret out;
 }
 
-# rewrite every operand naming a replaced instruction to its resolved replacement,
-# across every instruction in the function's pool
-#
-# Only VAL_INSTR operands with a live replacement are touched, resolved
-# transitively so a chain of replacements collapses fully. Block-target operands
-# ride in VAL_CONST_INT slots and so are never rewritten.
-# ---
-# fn: the function whose operands are rewritten in place
-# rw: the populated rewrite map to apply
+pub fun substitute_for_use(sub: value.Value, use: value.Value) value.Value {
+    ret carry_secret(value.retype(sub, use.ty), use);
+}
+
 pub fun rewrite_apply(fn: *ir.Function, rw: *Rewrite) {
     var i: u32 = 0;
     for (i < fn.instr_len) {
@@ -184,24 +103,6 @@ pub fun rewrite_apply(fn: *ir.Function, rw: *Rewrite) {
     }
 }
 
-# replace every operand of `fn` naming instruction `old_id` with `replacement`,
-# immediately (a single un-batched RAUW)
-#
-# The immediate counterpart to the `Rewrite` map: used where exactly one value is
-# replaced (inlining wires a call result to its return value) and a batched map
-# would be overkill. Block-target operands ride in VAL_CONST_INT slots, so the
-# VAL_INSTR guard already skips them.
-#
-# Each rewritten slot keeps its own type, mirroring `rewrite_resolve`: the use-site
-# stamp is the slot's semantic contract (a by-address aggregate is a ptr-producing
-# value stamped with the aggregate type), so substituting which value fills the slot
-# must not change what the slot means. Clobbering the stamp with the replacement's
-# def type turned an inlined callee's deref-copied return into an 8-byte pointer
-# store (#2092).
-# ---
-# fn:          the function whose operands are rewritten in place
-# old_id:      the value-producing instruction id being replaced
-# replacement: the value to substitute in, retyped per use slot
 pub fun replace_uses(fn: *ir.Function, old_id: id.InstructionId, replacement: value.Value) {
     var i: u32 = 0;
     for (i < fn.instr_len) {
@@ -210,7 +111,7 @@ pub fun replace_uses(fn: *ir.Function, old_id: id.InstructionId, replacement: va
         for (ii < inst.operand_count) {
             val op: value.Value = inst.operands[ii];
             if (op.kind == value.VAL_INSTR && op.data.instr == old_id) {
-                inst.operands[ii] = carry_secret(value.retype(replacement, op.ty), op);
+                inst.operands[ii] = substitute_for_use(replacement, op);
             }
             ii = ii + 1;
         }
@@ -218,48 +119,13 @@ pub fun replace_uses(fn: *ir.Function, old_id: id.InstructionId, replacement: va
     }
 }
 
-# a predicate on instruction ids, supplied by a pass driving an erase
-#
-# `ctx` carries the pass's state (dce's dead-flag array, mem2reg's promotion
-# state); `erase_marked` threads it back on every test so the predicate needs no
-# capture.
-# ---
-# ctx: opaque pointer to the caller's state
-# iid: the instruction id to test
-# ret: true when iid is to be erased
-pub def EraseTest: fun(ptr, id.InstructionId) bool;
-
-# erase every instruction of `fn` for which `test(ctx, iid)` holds, from its
-# block's phi and instruction lists -- the single batch removal path
-#
-# CONTRACT (load-bearing): every removal of an instruction from a block MUST route
-# through this helper; no pass may compact a block's instruction or phi list
-# privately. It is the single point #1696 salvages the dbg-values of each dropped
-# value, so a pass compacting on its own would silently lose them. There is no
-# back-pointer from an instruction to its owning block, so the invariant cannot be
-# asserted mechanically; it is held by convention and exposed by #1696's dbg-value
-# tests. (A per-id erase was the stale part of the mutation-API spec: no pass
-# removes one instruction by id -- dce and mem2reg each mark a set and drop it
-# while walking blocks they own, so the helper takes the pass's predicate and does
-# the one walk.)
-#
-# Survivor order is preserved; a dropped instruction's pool entry remains as a
-# ghost, reclaimed at function teardown.
-# ---
-# m:    module owning the allocator (salvage grows the function's dbg-expression pool)
-# fn:   the function whose block lists are compacted
-# ctx:  opaque state threaded to `test`
-# test: the removal predicate
-# ret:  ok(true) once every marked instruction is dropped and its dbg-values
-#       salvaged, or an allocation error raised while growing the pool
-pub fun erase_marked(m: *ir.Module, fn: *ir.Function, ctx: ptr, test: EraseTest) R.Result[bool, str] {
-    # salvage runs only when the function actually holds debug values, decided once
-    # here by scanning for an OP_DBG_VALUE. gating on debug-value presence (not on
-    # DbgVar metadata) is load-bearing: the inliner clones a callee's OP_DBG_VALUE
-    # instructions before its dbg-clone attaches their metadata, so a caller can bind
-    # a debug operand with an empty dbg_vars map; that operand still needs salvaging
-    # when its value is dropped, or it dangles at a value the verifier rejects.
+pub fun erase_marked[T](m: *ir.Module, fn: *ir.Function, ctx: *T,
+                        test: fun(*T, id.InstructionId) bool) R.Result[bool, str] {
+    if (ctx == nil || test == nil) {
+        ret R.err[bool, str]("instruction erasure predicate is incomplete");
+    }
     val dbg: bool = has_dbg_values(fn);
+    var changed: bool = false;
 
     var b: u32 = 0;
     for (b < fn.block_count) {
@@ -273,11 +139,13 @@ pub fun erase_marked(m: *ir.Module, fn: *ir.Function, ctx: ptr, test: EraseTest)
                 w = w + 1;
             }
             or (dbg) {
-                val res: R.Result[bool, str] = salvage_dbg_values(m, fn, ctx, test, blk.phis[r]);
-                if (R.is_err[bool, str](res)) { ret res; }
+                val res: R.Result[R.Void, str] =
+                    salvage_dbg_values[T](m, fn, ctx, test, blk.phis[r]);
+                if (R.is_err[R.Void, str](res)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res)); }
             }
             r = r + 1;
         }
+        if (w != blk.phi_count) { changed = true; }
         blk.phi_count = w;
 
         w = 0;
@@ -288,27 +156,20 @@ pub fun erase_marked(m: *ir.Module, fn: *ir.Function, ctx: ptr, test: EraseTest)
                 w = w + 1;
             }
             or (dbg) {
-                val res: R.Result[bool, str] = salvage_dbg_values(m, fn, ctx, test, blk.instructions[r]);
-                if (R.is_err[bool, str](res)) { ret res; }
+                val res: R.Result[R.Void, str] =
+                    salvage_dbg_values[T](m, fn, ctx, test, blk.instructions[r]);
+                if (R.is_err[R.Void, str](res)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res)); }
             }
             r = r + 1;
         }
+        if (w != blk.instr_count) { changed = true; }
         blk.instr_count = w;
 
         b = b + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok[bool, str](changed);
 }
 
-# true when `fn` holds any OP_DBG_VALUE instruction in its pool
-#
-# OP_DBG_VALUE instructions exist only under `-g`. erase_marked scans for one once per
-# call so salvage runs whenever debug values are present -- including inlined debug-value
-# clones that bind an operand but carry no DbgVar metadata yet, which a dbg_vars-length
-# test would miss.
-# ---
-# fn:  the function to scan
-# ret: true when at least one OP_DBG_VALUE lives in the instruction pool
 fun has_dbg_values(fn: *ir.Function) bool {
     var i: u32 = 0;
     for (i < fn.instr_len) {
@@ -319,32 +180,14 @@ fun has_dbg_values(fn: *ir.Function) bool {
     ret false;
 }
 
-# salvage every debug value bound to instruction `dropped`, which erase_marked is
-# about to remove, so its variable's location survives the erase
-#
-# When `dropped` is a recoverable pure op (an add/sub of a constant) whose base
-# itself survives this erase, each debug value naming it is rebased onto the base and
-# its pooled expression gains a step recovering the old operand -- the variable's
-# value stays computable. Otherwise (an unrecoverable op, or a base that is also
-# being erased) the debug value is marked optimized out: its operand becomes the
-# null idiom, so the debugger shows *optimized out* rather than a stale value.
-# The caller (erase_marked) gates this on has_dbg_values, so it is reached only when
-# the function actually holds OP_DBG_VALUE instructions.
-# ---
-# m:       module owning the allocator
-# fn:      the function being compacted
-# ctx:     the erase predicate's context (to test whether the base also dies)
-# test:    the erase predicate
-# dropped: the instruction id being removed
-# ret:     ok(true), or an allocation error from growing the expression pool
-fun salvage_dbg_values(m: *ir.Module, fn: *ir.Function, ctx: ptr, test: EraseTest, dropped: id.InstructionId) R.Result[bool, str] {
+fun salvage_dbg_values[T](m: *ir.Module, fn: *ir.Function, ctx: *T,
+                          test: fun(*T, id.InstructionId) bool,
+                          dropped: id.InstructionId) R.Result[R.Void, str] {
     var base:        value.Value;
     var op:          ir.DbgOp;
     var recoverable: bool = false;
     salvage_decode(fn, dropped, ?base, ?op, ?recoverable);
 
-    # the recovered expression names the base, so the base must itself survive this
-    # erase; a base that is also dying leaves nothing to compute from.
     var base_live: bool = false;
     if (recoverable) {
         if (base.kind != value.VAL_INSTR) { base_live = true; }
@@ -357,57 +200,33 @@ fun salvage_dbg_values(m: *ir.Module, fn: *ir.Function, ctx: ptr, test: EraseTes
         if (d.kind == instruction.OP_DBG_VALUE && d.operand_count == 1
             && d.operands[0].kind == value.VAL_INSTR && d.operands[0].data.instr == dropped) {
             if (recoverable && base_live) {
-                val res: R.Result[bool, str] = salvage_rebase(m, fn, i::id.InstructionId, d, base, op);
-                if (R.is_err[bool, str](res)) { ret res; }
+                val res: R.Result[R.Void, str] = salvage_rebase(m, fn, i::id.InstructionId, d, base, op);
+                if (R.is_err[R.Void, str](res)) { ret res; }
             }
             or {
-                # unrecoverable: mark optimized out via the null operand idiom.
                 d.operands[0] = value.const_null(d.operands[0].ty);
             }
         }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# rebase debug value `iid` (the instruction `d`) onto `base` and prepend `op` to its
-# pooled expression, so the variable's value is recovered from the surviving base
-# ---
-# m:    module owning the allocator
-# fn:   the owning function
-# iid:  the OP_DBG_VALUE instruction id
-# d:    the OP_DBG_VALUE instruction (its operand is rewritten to `base`)
-# base: the surviving value the expression is rebased onto
-# op:   the recovery step mapping `base` back to the old operand
-# ret:  ok(true), or an allocation error from growing the pool
-fun salvage_rebase(m: *ir.Module, fn: *ir.Function, iid: id.InstructionId, d: *instruction.Instruction, base: value.Value, op: ir.DbgOp) R.Result[bool, str] {
+fun salvage_rebase(m: *ir.Module, fn: *ir.Function, iid: id.InstructionId, d: *instruction.Instruction, base: value.Value, op: ir.DbgOp) R.Result[R.Void, str] {
     var eid: ir.DbgExprId = ir.dbg_expr_id(fn, iid);
     if (eid == ir.DBG_EXPR_IDENTITY) {
         val res_new: R.Result[ir.DbgExprId, str] = ir.dbg_expr_new(m, fn, iid);
         if (R.is_err[ir.DbgExprId, str](res_new)) {
-            ret R.err[bool, str](R.unwrap_err[ir.DbgExprId, str](res_new));
+            ret R.err[R.Void, str](R.unwrap_err[ir.DbgExprId, str](res_new));
         }
         eid = R.unwrap_ok[ir.DbgExprId, str](res_new);
     }
-    val res_op: R.Result[bool, str] = ir.dbg_expr_prepend_op(m, fn, eid, op);
-    if (R.is_err[bool, str](res_op)) { ret res_op; }
+    val res_op: R.Result[R.Void, str] = ir.dbg_expr_prepend_op(m, fn, eid, op);
+    if (R.is_err[R.Void, str](res_op)) { ret res_op; }
     d.operands[0] = base;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# decode whether instruction `dropped` is a debug-recoverable `add` / `sub` of a
-# constant, yielding the surviving base value and the expression step that recovers
-# the original operand from it
-#
-# `add base, k` and `add k, base` recover as base + k (DBG_OP_PLUS_CONST); `sub
-# base, k` recovers as base - k (DBG_OP_MINUS_CONST). `sub k, base` is not a constant
-# offset of a single value, so it is left unrecoverable.
-# ---
-# fn:          the owning function
-# dropped:     the instruction id to decode
-# base:        receives the non-constant operand (the recovery base)
-# op:          receives the recovery step (kind + immediate)
-# recoverable: receives true when a recovery was decoded
 fun salvage_decode(fn: *ir.Function, dropped: id.InstructionId, base: *value.Value, op: *ir.DbgOp, recoverable: *bool) {
     @recoverable = false;
     val opt_x: O.Option[*instruction.Instruction] = ir.instruction_get(fn, dropped);
@@ -436,11 +255,6 @@ fun salvage_decode(fn: *ir.Function, dropped: id.InstructionId, base: *value.Val
     }
 }
 
-# build a DbgOp from a selector and immediate
-# ---
-# kind: DBG_OP_* selector
-# arg:  the op's u64 immediate
-# ret:  the DbgOp
 fun dbg_op(kind: u8, arg: u64) ir.DbgOp {
     var o: ir.DbgOp;
     o.op  = kind;
@@ -448,28 +262,16 @@ fun dbg_op(kind: u8, arg: u64) ir.DbgOp {
     ret o;
 }
 
-# clone instruction `src` into `dst_fn`'s pool and return the new instruction's id
-#
-# Copies the opcode, result / auxiliary types, modifier flags, source location,
-# and a fresh copy of the operand array. Operand Values are copied verbatim; a
-# caller remapping ids across functions (inlining) rewrites them afterward. loc
-# and the flag word ride along, so a clone is a faithful copy the debug info
-# treats as the same source position.
-# ---
-# m:      module owning the allocator
-# dst_fn: the function whose pool receives the clone
-# src:    the instruction to clone (from any function)
-# ret:    the new instruction's id, or an allocation error
 pub fun clone_instruction(m: *ir.Module, dst_fn: *ir.Function, src: *instruction.Instruction) R.Result[id.InstructionId, str] {
     var clone: instruction.Instruction;
     clone.kind          = src.kind;
     clone.ty            = src.ty;
     clone.operand_count = src.operand_count;
-    clone.operand_cap   = src.operand_count;   # instruction_add normalizes cap to count
+    clone.operand_cap   = src.operand_count;
     clone.flags         = src.flags;
     clone.aux_ty        = src.aux_ty;
     clone.loc           = src.loc;
-    clone.secret        = src.secret;   # inlining preserves the constant-time taint (#1646)
+    clone.secret        = src.secret;
     clone.operands      = nil;
     if (src.operand_count > 0) {
         val res_ops: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, src.operand_count::usize);
@@ -488,24 +290,30 @@ pub fun clone_instruction(m: *ir.Module, dst_fn: *ir.Function, src: *instruction
     val res_id: R.Result[id.InstructionId, str] = ir.instruction_add(m, dst_fn, clone);
     if (R.is_err[id.InstructionId, str](res_id)) {
         if (clone.operands != nil) {
-            A.deallocate[value.Value](m.alloc, clone.operands, src.operand_count::usize);
+            A.deallocate[value.Value](m.alloc, clone.operands, clone.operand_count::usize);
         }
         ret res_id;
     }
     ret res_id;
 }
 
-# build a pool instruction with the given operands (copied into an owned array)
-# and add it to fn, returning its id (test helper; replace_uses walks the raw pool,
-# so no block wiring is needed)
-# ---
-# m:    module owning the allocator
-# fn:   function whose pool receives the instruction
-# kind: opcode
-# ty:   result type
-# ops:  operand values to copy (nil when n == 0)
-# n:    operand count
-# ret:  the new InstructionId, or an allocation error
+pub fun clone_instruction_complete(m: *ir.Module, src_fn: *ir.Function, dst_fn: *ir.Function, src_iid: id.InstructionId, instr_map: *u32, map_len: u32) R.Result[id.InstructionId, str] {
+    val src: *instruction.Instruction = ?src_fn.instrs[src_iid::u32];
+    val res_id: R.Result[id.InstructionId, str] = clone_instruction(m, dst_fn, src);
+    if (R.is_err[id.InstructionId, str](res_id)) { ret res_id; }
+    val new_iid: id.InstructionId = R.unwrap_ok[id.InstructionId, str](res_id);
+
+    val rd: R.Result[R.Void, str] = ir.clone_dbg_metadata(m, src_fn, dst_fn, src_iid, new_iid);
+    if (R.is_err[R.Void, str](rd)) { ret R.err[id.InstructionId, str](R.unwrap_err[R.Void, str](rd)); }
+    val ra: R.Result[R.Void, str] = ir.clone_asm_payload(m, src_fn, dst_fn, src_iid, new_iid, instr_map, map_len);
+    if (R.is_err[R.Void, str](ra)) { ret R.err[id.InstructionId, str](R.unwrap_err[R.Void, str](ra)); }
+    val rl: R.Result[R.Void, str] = ir.clone_alloca_dbg_var(src_fn, dst_fn, src_iid, new_iid);
+    if (R.is_err[R.Void, str](rl)) { ret R.err[id.InstructionId, str](R.unwrap_err[R.Void, str](rl)); }
+    val rs: R.Result[R.Void, str] = ir.clone_instr_inline_site(src_fn, dst_fn, src_iid, new_iid);
+    if (R.is_err[R.Void, str](rs)) { ret R.err[id.InstructionId, str](R.unwrap_err[R.Void, str](rs)); }
+    ret R.ok[id.InstructionId, str](new_iid);
+}
+
 fun test_instr(m: *ir.Module, fn: *ir.Function, kind: instruction.InstrKind, ty: ir_type.IrTypeId, ops: *value.Value, n: u32) R.Result[id.InstructionId, str] {
     var owned: *value.Value = nil;
     if (n > 0) {
@@ -528,13 +336,6 @@ fun test_instr(m: *ir.Module, fn: *ir.Function, kind: instruction.InstrKind, ty:
     ret ir.instruction_add(m, fn, inst);
 }
 
-# #2092: replace_uses must preserve each rewritten slot's use-site type stamp. a
-# ptr-producing value used with an aggregate stamp is a by-address aggregate (the
-# store below means "copy the record"); substituting which value fills the slot must
-# not change what the slot means. builds `store %v:{agg} -> %slot` in the raw pool
-# and replaces %v with a bare-ptr param: the store's value operand must become the
-# param while still carrying the aggregate type, not the replacement's ptr type, and
-# the untouched pointer slot must keep its own stamp.
 test "mach.lang.me.ir.mutate.replace_uses:preserves_use_site_type" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -561,8 +362,6 @@ test "mach.lang.me.ir.mutate.replace_uses:preserves_use_site_type" {
     if (R.is_err[u32, str](r_fn)) { ir.dnit(?m); ret 1; }
     val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](r_fn)];
 
-    # %v and %slot: two ptr-producing allocas; the store's value operand is %v
-    # stamped with the aggregate type (the deref-copy idiom).
     var count: [1]value.Value;
     count[0] = value.const_int(1, i64t);
     val r_v: R.Result[id.InstructionId, str] = test_instr(?m, fn, instruction.OP_ALLOCA, ptrt, ?count[0], 1);
@@ -586,14 +385,328 @@ test "mach.lang.me.ir.mutate.replace_uses:preserves_use_site_type" {
     val ins: *instruction.Instruction = O.unwrap[*instruction.Instruction](oi);
 
     var bad: i32 = 0;
-    if (ins.operands[0].kind != value.VAL_PARAM)  { bad = 3; }   # substitution happened
+    if (ins.operands[0].kind != value.VAL_PARAM)  { bad = 3; }
     or (ins.operands[0].data.param_ix != 0)       { bad = 4; }
-    or (ins.operands[0].ty != aggt)               { bad = 2; }   # use-site stamp kept
+    or (ins.operands[0].ty != aggt)               { bad = 2; }
     if (bad == 0) {
-        if (ins.operands[1].kind != value.VAL_INSTR)  { bad = 5; }   # other slot untouched
+        if (ins.operands[1].kind != value.VAL_INSTR)  { bad = 5; }
         or (ins.operands[1].data.instr != slot_id)    { bad = 6; }
         or (ins.operands[1].ty != ptrt)               { bad = 7; }
     }
+    ir.dnit(?m);
+    ret bad;
+}
+
+fun t_erase_none(target: *id.InstructionId, iid: id.InstructionId) bool { ret false; }
+
+fun t_erase_target(target: *id.InstructionId, iid: id.InstructionId) bool {
+    ret iid == @target;
+}
+
+test "mach.lang.me.ir.mutate.erase_marked:reports_no_change_when_nothing_is_marked" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val ri: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](ri)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ri);
+
+    val r_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](r_fn)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](r_fn)];
+
+    val res_blk: R.Result[id.BlockId, str] = ir.block_add(?m, fn);
+    if (R.is_err[id.BlockId, str](res_blk)) { ir.dnit(?m); ret 1; }
+    val bid: id.BlockId = R.unwrap_ok[id.BlockId, str](res_blk);
+    val blk: *ir.Block = ?fn.blocks[bid::u32];
+
+    var count: [1]value.Value;
+    count[0] = value.const_int(1, i64t);
+    val r_ret: R.Result[id.InstructionId, str] = test_instr(?m, fn, instruction.OP_RET, i64t, ?count[0], 1);
+    if (R.is_err[id.InstructionId, str](r_ret)) { ir.dnit(?m); ret 1; }
+    blk.terminator = R.unwrap_ok[id.InstructionId, str](r_ret);
+
+    var target: id.InstructionId = id.INSTR_NIL;
+    val target_ptr: *id.InstructionId = ?target;
+    val res: R.Result[bool, str] =
+        erase_marked[id.InstructionId](?m, fn, target_ptr, t_erase_none);
+    if (R.is_err[bool, str](res)) { ir.dnit(?m); ret 1; }
+    val changed: bool = R.unwrap_ok[bool, str](res);
+    ir.dnit(?m);
+    if (changed != false) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.me.ir.mutate.erase_marked:reports_change_when_the_marked_instruction_is_erased" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val ri: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](ri)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ri);
+
+    val r_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](r_fn)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](r_fn)];
+
+    val res_blk: R.Result[id.BlockId, str] = ir.block_add(?m, fn);
+    if (R.is_err[id.BlockId, str](res_blk)) { ir.dnit(?m); ret 1; }
+    val bid: id.BlockId = R.unwrap_ok[id.BlockId, str](res_blk);
+    val blk: *ir.Block = ?fn.blocks[bid::u32];
+
+    var addops: [2]value.Value;
+    addops[0] = value.param(0, i64t);
+    addops[1] = value.param(1, i64t);
+    val r_add: R.Result[id.InstructionId, str] = test_instr(?m, fn, instruction.OP_ADD, i64t, ?addops[0], 2);
+    if (R.is_err[id.InstructionId, str](r_add)) { ir.dnit(?m); ret 1; }
+    val x_id: id.InstructionId = R.unwrap_ok[id.InstructionId, str](r_add);
+    if (R.is_err[R.Void, str](ir.block_append_instr(?m, blk, x_id))) { ir.dnit(?m); ret 1; }
+
+    var count: [1]value.Value;
+    count[0] = value.const_int(1, i64t);
+    val r_ret: R.Result[id.InstructionId, str] = test_instr(?m, fn, instruction.OP_RET, i64t, ?count[0], 1);
+    if (R.is_err[id.InstructionId, str](r_ret)) { ir.dnit(?m); ret 1; }
+    blk.terminator = R.unwrap_ok[id.InstructionId, str](r_ret);
+
+    val before: u32 = blk.instr_count;
+
+    var target: id.InstructionId = x_id;
+    val target_ptr: *id.InstructionId = ?target;
+    val res: R.Result[bool, str] =
+        erase_marked[id.InstructionId](?m, fn, target_ptr, t_erase_target);
+    if (R.is_err[bool, str](res)) { ir.dnit(?m); ret 1; }
+    val changed: bool = R.unwrap_ok[bool, str](res);
+    val after: u32 = blk.instr_count;
+    ir.dnit(?m);
+    if (changed != true) { ret 1; }
+    if (after != before - 1) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.me.ir.mutate.rewrite_apply:preserves_use_site_type" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val ri: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](ri)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ri);
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+    val rv: R.Result[ir_type.IrTypeId, str] = ir_type.intern_void(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rv)) { ir.dnit(?m); ret 1; }
+    val voidt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rv);
+    var fields: [3]ir_type.IrTypeId;
+    fields[0] = i64t; fields[1] = i64t; fields[2] = i64t;
+    val ra: R.Result[ir_type.IrTypeId, str] = ir_type.intern_struct(?m.types, ?fields[0], 3, 8, false);
+    if (R.is_err[ir_type.IrTypeId, str](ra)) { ir.dnit(?m); ret 1; }
+    val aggt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ra);
+
+    val r_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](r_fn)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](r_fn)];
+
+    var count: [1]value.Value;
+    count[0] = value.const_int(1, i64t);
+    val r_v: R.Result[id.InstructionId, str] = test_instr(?m, fn, instruction.OP_ALLOCA, ptrt, ?count[0], 1);
+    if (R.is_err[id.InstructionId, str](r_v)) { ir.dnit(?m); ret 1; }
+    val v_id: id.InstructionId = R.unwrap_ok[id.InstructionId, str](r_v);
+    val r_slot: R.Result[id.InstructionId, str] = test_instr(?m, fn, instruction.OP_ALLOCA, ptrt, ?count[0], 1);
+    if (R.is_err[id.InstructionId, str](r_slot)) { ir.dnit(?m); ret 1; }
+    val slot_id: id.InstructionId = R.unwrap_ok[id.InstructionId, str](r_slot);
+
+    var store_ops: [2]value.Value;
+    store_ops[0] = value.instr(v_id, aggt);
+    store_ops[1] = value.instr(slot_id, ptrt);
+    val r_store: R.Result[id.InstructionId, str] = test_instr(?m, fn, instruction.OP_STORE, voidt, ?store_ops[0], 2);
+    if (R.is_err[id.InstructionId, str](r_store)) { ir.dnit(?m); ret 1; }
+    val store_id: id.InstructionId = R.unwrap_ok[id.InstructionId, str](r_store);
+
+    var rw: Rewrite;
+    if (R.is_err[R.Void, str](rewrite_init(?rw, ?alloc, fn.instr_len))) { ir.dnit(?m); ret 1; }
+    replace_value(?rw, v_id, value.param(0, ptrt));
+    rewrite_apply(fn, ?rw);
+    rewrite_dnit(?rw, ?alloc);
+
+    val oi: O.Option[*instruction.Instruction] = ir.instruction_get(fn, store_id);
+    if (O.is_none[*instruction.Instruction](oi)) { ir.dnit(?m); ret 1; }
+    val ins: *instruction.Instruction = O.unwrap[*instruction.Instruction](oi);
+
+    var bad: i32 = 0;
+    if (ins.operands[0].kind != value.VAL_PARAM)  { bad = 3; }
+    or (ins.operands[0].data.param_ix != 0)       { bad = 4; }
+    or (ins.operands[0].ty != aggt)               { bad = 2; }
+    if (bad == 0) {
+        if (ins.operands[1].kind != value.VAL_INSTR)  { bad = 5; }
+        or (ins.operands[1].data.instr != slot_id)    { bad = 6; }
+        or (ins.operands[1].ty != ptrt)               { bad = 7; }
+    }
+    ir.dnit(?m);
+    ret bad;
+}
+
+test "mach.lang.me.ir.mutate.clone_instruction_complete:carries_both_debug_metadata_and_asm_payload_in_one_call" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val ri: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](ri)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ri);
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+    val rv: R.Result[ir_type.IrTypeId, str] = ir_type.intern_void(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rv)) { ir.dnit(?m); ret 1; }
+    val voidt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rv);
+
+    val r_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, voidt, 0);
+    if (R.is_err[u32, str](r_fn)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](r_fn)];
+
+    var count: [1]value.Value;
+    count[0] = value.const_int(1, i64t);
+    val r_bound: R.Result[id.InstructionId, str] = test_instr(?m, fn, instruction.OP_ALLOCA, ptrt, ?count[0], 1);
+    if (R.is_err[id.InstructionId, str](r_bound)) { ir.dnit(?m); ret 1; }
+    val bound_id: id.InstructionId = R.unwrap_ok[id.InstructionId, str](r_bound);
+
+    val r_asm: R.Result[id.InstructionId, str] = test_instr(?m, fn, instruction.OP_ASM, voidt, ?count[0], 0);
+    if (R.is_err[id.InstructionId, str](r_asm)) { ir.dnit(?m); ret 1; }
+    val asm_id: id.InstructionId = R.unwrap_ok[id.InstructionId, str](r_asm);
+
+    var dv: ir.DbgVar;
+    dv.name     = 9191::intern.StrId;
+    dv.ty       = i64t;
+    dv.is_param = false;
+    dv.scope    = 3;
+    if (R.is_err[bool, str](map.insert[id.InstructionId, ir.DbgVar](?fn.dbg_vars, asm_id, dv))) { ir.dnit(?m); ret 1; }
+
+    var bind: ir.IrAsmBind;
+    bind.name   = 5151::intern.StrId;
+    bind.instr  = bound_id;
+    bind.secret = false;
+    val rb: R.Result[*ir.IrAsmBind, str] = A.allocate[ir.IrAsmBind](m.alloc, 1::usize);
+    if (R.is_err[*ir.IrAsmBind, str](rb)) { ir.dnit(?m); ret 1; }
+    val binds: *ir.IrAsmBind = R.unwrap_ok[*ir.IrAsmBind, str](rb);
+    binds[0] = bind;
+
+    var asm_val: ir.IrAsm;
+    asm_val.isa        = intern.STR_NIL;
+    asm_val.body       = intern.STR_NIL;
+    asm_val.binds      = binds;
+    asm_val.bind_count = 1;
+    asm_val.bind_cap   = 1;
+    if (R.is_err[bool, str](map.insert[id.InstructionId, ir.IrAsm](?fn.asm_blocks, asm_id, asm_val))) { ir.dnit(?m); ret 1; }
+
+    val map_len: u32 = fn.instr_len;
+    val res_map: R.Result[*u32, str] = A.allocate[u32](m.alloc, map_len::usize);
+    if (R.is_err[*u32, str](res_map)) { ir.dnit(?m); ret 1; }
+    val instr_map: *u32 = R.unwrap_ok[*u32, str](res_map);
+    var k: u32 = 0;
+    for (k < map_len) { instr_map[k] = 0xFFFFFFFF; k = k + 1; }
+
+    val r_clone_bound: R.Result[id.InstructionId, str] = clone_instruction_complete(?m, fn, fn, bound_id, instr_map, map_len);
+    if (R.is_err[id.InstructionId, str](r_clone_bound)) { A.deallocate[u32](m.alloc, instr_map, map_len::usize); ir.dnit(?m); ret 1; }
+    instr_map[bound_id::u32] = R.unwrap_ok[id.InstructionId, str](r_clone_bound)::u32;
+
+    val r_clone_asm: R.Result[id.InstructionId, str] = clone_instruction_complete(?m, fn, fn, asm_id, instr_map, map_len);
+    if (R.is_err[id.InstructionId, str](r_clone_asm)) { A.deallocate[u32](m.alloc, instr_map, map_len::usize); ir.dnit(?m); ret 1; }
+    val clone_asm_id: id.InstructionId = R.unwrap_ok[id.InstructionId, str](r_clone_asm);
+    val clone_bound_id: id.InstructionId = instr_map[bound_id::u32]::id.InstructionId;
+    A.deallocate[u32](m.alloc, instr_map, map_len::usize);
+
+    var bad: i32 = 0;
+
+    val opt_clone_dv: O.Option[*ir.DbgVar] = ir.dbg_var_get(fn, clone_asm_id);
+    if (O.is_none[*ir.DbgVar](opt_clone_dv)) { bad = 1; }
+    or {
+        val cdv: *ir.DbgVar = O.unwrap[*ir.DbgVar](opt_clone_dv);
+        if (cdv.name != 9191::intern.StrId) { bad = 2; }
+        if (cdv.scope != 3)                 { bad = 3; }
+    }
+
+    var key: id.InstructionId = clone_asm_id;
+    val res_clone_asm_blk: R.Result[*ir.IrAsm, str] = map.get[id.InstructionId, ir.IrAsm](?fn.asm_blocks, ?key);
+    if (bad == 0) {
+        if (R.is_err[*ir.IrAsm, str](res_clone_asm_blk)) { bad = 4; }
+        or {
+            val cab: *ir.IrAsm = R.unwrap_ok[*ir.IrAsm, str](res_clone_asm_blk);
+            if (cab.bind_count != 1)                  { bad = 5; }
+            or (cab.binds[0].name != 5151::intern.StrId) { bad = 6; }
+            or (cab.binds[0].instr != clone_bound_id)  { bad = 7; }
+        }
+    }
+
+    ir.dnit(?m);
+    ret bad;
+}
+
+test "mach.lang.me.ir.mutate.clone_instruction_complete:carries_alloca_debug_metadata_to_the_clone" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val ri: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](ri)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ri);
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+    val rv: R.Result[ir_type.IrTypeId, str] = ir_type.intern_void(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rv)) { ir.dnit(?m); ret 1; }
+    val voidt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rv);
+
+    val r_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, voidt, 0);
+    if (R.is_err[u32, str](r_fn)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](r_fn)];
+
+    var count: [1]value.Value;
+    count[0] = value.const_int(1, i64t);
+    val r_alloca: R.Result[id.InstructionId, str] = test_instr(?m, fn, instruction.OP_ALLOCA, ptrt, ?count[0], 1);
+    if (R.is_err[id.InstructionId, str](r_alloca)) { ir.dnit(?m); ret 1; }
+    val alloca_id: id.InstructionId = R.unwrap_ok[id.InstructionId, str](r_alloca);
+
+    var dv: ir.DbgVar;
+    dv.name     = 7373::intern.StrId;
+    dv.ty       = i64t;
+    dv.is_param = false;
+    dv.scope    = 5;
+    if (R.is_err[R.Void, str](ir.record_alloca_dbg_var(fn, alloca_id, dv))) { ir.dnit(?m); ret 1; }
+
+    val map_len: u32 = fn.instr_len;
+    val res_map: R.Result[*u32, str] = A.allocate[u32](m.alloc, map_len::usize);
+    if (R.is_err[*u32, str](res_map)) { ir.dnit(?m); ret 1; }
+    val instr_map: *u32 = R.unwrap_ok[*u32, str](res_map);
+    var k: u32 = 0;
+    for (k < map_len) { instr_map[k] = 0xFFFFFFFF; k = k + 1; }
+
+    val r_clone: R.Result[id.InstructionId, str] = clone_instruction_complete(?m, fn, fn, alloca_id, instr_map, map_len);
+    A.deallocate[u32](m.alloc, instr_map, map_len::usize);
+    if (R.is_err[id.InstructionId, str](r_clone)) { ir.dnit(?m); ret 1; }
+    val clone_id: id.InstructionId = R.unwrap_ok[id.InstructionId, str](r_clone);
+
+    var bad: i32 = 0;
+    val opt_clone_dv: O.Option[*ir.DbgVar] = ir.alloca_dbg_var_get(fn, clone_id);
+    if (O.is_none[*ir.DbgVar](opt_clone_dv)) { bad = 1; }
+    or {
+        val cdv: *ir.DbgVar = O.unwrap[*ir.DbgVar](opt_clone_dv);
+        if (cdv.name != 7373::intern.StrId) { bad = 2; }
+        if (cdv.scope != 5)                 { bad = 3; }
+    }
+
     ir.dnit(?m);
     ret bad;
 }

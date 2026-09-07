@@ -1,32 +1,3 @@
-# assign each MIR frame slot an offset from the slot region's base, size the frame,
-# and decide whether the function needs a frame at all - and what base it gets
-#
-# Assigns each MIR frame slot a negative offset from the slot region's base, sizes
-# the frame to the ABI stack alignment, and rounds the outgoing-argument region
-# to the call-boundary alignment. The slots themselves - allocas plus the
-# small-aggregate param, aggregate-load, and aggregate-return spill slots - are
-# materialized into `mir.MirFrame` during instruction selection; this pass only
-# computes their final offsets and the total frame size.
-#
-# WHAT THE BASE IS, AND WHAT IT IS ALIGNED TO. Normally the base is the frame pointer,
-# and the only alignment that reaches the frame pointer is the ABI's 16-byte call
-# boundary - so a slot offset being a multiple of 32 said nothing about the address
-# until #2735. `MirFrame.realign` records, per function, the largest slot alignment
-# above the ABI's; a function that has one gets a prologue that masks the STACK pointer
-# down to it and addresses its slot region from there instead. The frame pointer keeps
-# the caller's business - incoming stack arguments and the frame record - because after
-# a mask only one of the two pointers is still a fixed distance from the caller's stack.
-#
-# It also records, in `MirFrame.omit`, whether the function needs a compiler-
-# generated prologue and epilogue at all (#1940). Both are single decision
-# points across every target: each encoder reads the field instead of re-deriving
-# the answer from its own copy of the rule.
-#
-# Target-agnostic but for three reads through the target - the ABI stack
-# alignment, and the frame- and stack-pointer register ids the frame-reference
-# scan recognizes. The resulting offsets are consumed by the encoder when it
-# forms `[rbp + disp]` (or, in a realigned frame, `[rsp + disp]`) memory operands.
-
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -39,78 +10,51 @@ use std.allocator.page;
 use std.types.string.str_contains;
 use A: std.allocator;
 use std.format;
-use of: mach.lang.target.of;
+use mach.lang.target.of;
 
 use mach.lang.be.codegen.mir;
 use mach.lang.intern;
+use mach.lang.layout;
 use mach.lang.target.abi;
+use mach.lang.target.isa;
 use target: mach.lang.target.resolved;
 
-# frame alignment used when no ABI override applies; the 16-byte call-boundary minimum
 pub val DEFAULT_STACK_ALIGN: u32 = 16;
 
-# compute stack-frame offsets and size for every function in a MIR module
-# ---
-# tgt: resolved target; the ABI vtable supplies the stack alignment
-# m:   MIR module whose functions are laid out in place
-# ret: true on success, or an error string on a malformed frame
-pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[bool, str] {
-    if (m == nil) { ret R.err[bool, str]("frame.run: nil mir module"); }
+rec FrameByteUnit {
+}
+
+pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[R.Void, str] {
+    if (m == nil) { ret R.err[R.Void, str]("frame.run: nil mir module"); }
     if (tgt == nil || tgt.abi == nil) {
-        ret R.err[bool, str]("frame.run: target has no ABI");
+        ret R.err[R.Void, str]("frame.run: target has no ABI");
     }
 
     val align: u32 = stack_align(tgt);
 
-    # the reserve this target's image will actually get, or 0 when nothing bounds it
-    # at compile time. read once: it is a property of the target, not of a function.
     val reserve: u64 = of.effective_stack_reserve(tgt.of, tgt.stack_reserve);
 
     var fi: u32 = 0;
     for (fi < m.function_len) {
         val func: *mir.MirFunction = ?m.functions[fi];
-        layout_function(func, align);
-        # the frame facts are final only now, so the omission decision follows the
-        # layout rather than racing it.
+        val laid_out: R.Result[R.Void, str] = layout_function(func, align);
+        if (R.is_err[R.Void, str](laid_out)) { ret laid_out; }
         func.frame.omit = omits_frame(func, tgt.model.frame_ptr_reg::u32,
                                       tgt.model.stack_ptr_reg::u32);
+        val distd: R.Result[R.Void, str] = set_frame_dist(tgt, func);
+        if (R.is_err[R.Void, str](distd)) { ret distd; }
 
-        val over: R.Result[bool, str] = check_frame_fits(m, func, reserve);
-        if (R.is_err[bool, str](over)) { ret over; }
+        val over: R.Result[R.Void, str] = check_frame_fits(m, func, reserve);
+        if (R.is_err[R.Void, str](over)) { ret over; }
         fi = fi + 1;
     }
 
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# refuse a function whose own frame cannot fit in the image's stack reserve (#2991)
-#
-# A PROOF, NOT AN ESTIMATE, which is why it is an error rather than a warning: one
-# frame against one reserve, no call graph, no input dependence, no false positives.
-# A function whose single frame exceeds the whole stack can never execute, on any
-# input, and mach used to emit it and say nothing - a real program shipped for months
-# needing 1,107,824 bytes against a 1,048,576-byte reserve, dying in its own prologue
-# on every Windows machine while running fine on linux, which hands the main thread
-# eight megabytes and hides it.
-#
-# THE REJECTED ALTERNATIVE is whole-call-graph depth analysis. Recursion and indirect
-# calls make cumulative depth undecidable, and a heuristic that reports chains which
-# cannot happen trains people to ignore the one report that is exact.
-#
-# EQUAL IS REFUSED. A frame exactly the size of the reserve leaves nothing for the
-# caller that entered it, the return address it was called through, or the guard page
-# the OS keeps below - so the boundary is `>=`, and one byte under it builds.
-#
-# A zero reserve means nothing bounds the stack at compile time (an ELF target's is
-# the kernel's), and the check does not run.
-# ---
-# m:       the MIR module, for the interner that names the function
-# func:    the laid-out function
-# reserve: the image's effective stack reserve, or 0 to skip
-# ret:     ok(true) when the frame fits, or the refusal naming function, size, reserve
-fun check_frame_fits(m: *mir.MirModule, func: *mir.MirFunction, reserve: u64) R.Result[bool, str] {
-    if (reserve == 0) { ret R.ok[bool, str](true); }
-    if (func.frame.size::u64 < reserve) { ret R.ok[bool, str](true); }
+fun check_frame_fits(m: *mir.MirModule, func: *mir.MirFunction, reserve: u64) R.Result[R.Void, str] {
+    if (reserve == 0) { ret R.ok_void[str](); }
+    if (func.frame.size::u64 < reserve) { ret R.ok_void[str](); }
 
     var name: str = "<unknown>";
     if (m.interner != nil) {
@@ -122,60 +66,23 @@ fun check_frame_fits(m: *mir.MirModule, func: *mir.MirFunction, reserve: u64) R.
         "frame: `{}` needs a {}-byte stack frame, which its target's {}-byte stack reserve cannot hold; raise `stack_reserve` on the target, or move the large locals off the stack",
         name, func.frame.size::u64, reserve);
     if (R.is_err[str, str](r)) {
-        ret R.err[bool, str]("frame: a function's stack frame exceeds the target's stack reserve");
+        ret R.err[R.Void, str]("frame: a function's stack frame exceeds the target's stack reserve");
     }
-    ret R.err[bool, str](R.unwrap_ok[str, str](r));
+    ret R.err[R.Void, str](R.unwrap_ok[str, str](r));
 }
 
-# report whether a function needs no compiler-generated prologue or epilogue
-#
-# Two disjoint reasons suppress the frame.
-#
-#   1. `#[naked]` (#2198). The author declared that this function's prologue,
-#      epilogue, stack alignment, link register and return are theirs. Nothing is
-#      derived and nothing is checked here - a declaration is not a proof
-#      obligation. Sema restricts a naked body to inline `asm`, so the compiler
-#      allocates nothing under it and the shapes the guards below reject cannot
-#      arise anyway.
-#
-#   2. The frame is provably unused (#1940). A function that allocated no frame of
-#      its own - no slots (`frame.size`), no callee-saved GP or vector registers,
-#      no outgoing-argument region - and that calls nothing and addresses nothing
-#      through the frame or stack pointer cannot observe the difference between
-#      having a frame record and not having one, so the `push rbp; mov rbp, rsp` /
-#      `mov rsp, rbp; pop rbp` pair is pure cost.
-#
-# The leaf requirement in reason 2 is load-bearing rather than conservative, and
-# for a different reason on each ISA. On x86-64 entry RSP is 8 mod 16 and the
-# frame-pointer push is what restores the 16-byte call boundary the ABI demands,
-# so a frameless function that made a call would hand its callee a stack SysV
-# forbids. On aarch64 and riscv64 `bl` / `jalr` write the link register instead of
-# pushing, so alignment survives - but the prologue is also the only thing that
-# saves that register, and a frameless function that made a call would have its
-# own return address overwritten by the call and `ret` back into itself, forever.
-# Making no call, a function reaches neither failure.
-#
-# An inline-asm body used to be a third reason, standing on its own and tolerating
-# a call (#2283). It does not: the two failures above are exactly what
-# `std.system.os.linux.shared.terminate` was compiled into on `dev`, and it
-# survived only because `exit_group` never returns. A function that merely
-# CONTAINS asm is not asking to own its frame; one that says `#[naked]` is. An
-# asm-only leaf still omits its frame, now through reason 2 - an asm payload
-# contributes no MIR operand, so such a function satisfies the scan on its own.
-#
-# The frame-reference scan is what excludes an incoming stack parameter: those
-# are lowered to `[fp + incoming_arg_base + off]` (`mir.abi.emit_param_slot`) and
-# stay addressable only while the frame pointer is live.
-#
-# Nothing here can read the debug flag, and `-g` adds no MIR instruction and no
-# frame slot (its bindings ride on existing instructions as metadata), so the
-# decision is identical with and without `-g` and `.text` stays byte-identical -
-# the #1944 additivity invariant.
-# ---
-# func: the laid-out function to judge
-# fp:   the target's frame-pointer register id
-# sp:   the target's stack-pointer register id
-# ret:  true when the encoder must emit neither prologue nor epilogue
+fun set_frame_dist(tgt: *target.Target, func: *mir.MirFunction) R.Result[R.Void, str] {
+    if (tgt.arch == nil || tgt.arch.frame_dist == nil) {
+        ret R.err[R.Void, str]("frame: target declares no frame-distance model; an instruction set that reaches frame insertion must declare one");
+    }
+    var base_dist: u32 = 0;
+    var fp_dist:   u32 = 0;
+    tgt.arch.frame_dist(?tgt.model, func, ?base_dist, ?fp_dist);
+    func.frame.base_dist = base_dist;
+    func.frame.fp_dist   = fp_dist;
+    ret R.ok_void[str]();
+}
+
 pub fun omits_frame(func: *mir.MirFunction, fp: u32, sp: u32) bool {
     if (func.naked) { ret true; }
 
@@ -207,17 +114,6 @@ pub fun omits_frame(func: *mir.MirFunction, fp: u32, sp: u32) bool {
     ret !calls && !frame_ref;
 }
 
-# report whether a MIR operand addresses memory through the frame or stack pointer
-#
-# A frame-slot memory operand carries a slot key in `vreg` and is resolved against
-# the layout, so it is not the shape this looks for; the physical-register base
-# form (`mir.op_mem_preg`) is. Both register fields count - a base and, when the
-# index is a physical register, the index - since either keeps the pointer live.
-# ---
-# o:   the operand to test
-# fp:  the target's frame-pointer register id
-# sp:  the target's stack-pointer register id
-# ret: true when the operand reads or writes relative to fp or sp
 fun operand_is_frame_relative(o: *mir.MirOperand, fp: u32, sp: u32) bool {
     if (o.kind != mir.MIR_OP_MEM) { ret false; }
     if (o.vreg == mir.MIR_VREG_NIL && (o.preg == fp || o.preg == sp)) { ret true; }
@@ -225,184 +121,52 @@ fun operand_is_frame_relative(o: *mir.MirOperand, fp: u32, sp: u32) bool {
     ret false;
 }
 
-# look up the frame-pointer offset assigned to a MIR value's slot
-#
-# The frame phase lays slots out relative to a frame pointer that sits immediately
-# above the locals; a target whose prologue reserves space between the two must
-# subtract that reservation or the offsets alias what the prologue saved. That
-# reservation is `MirFrame.fp_dist`, stamped once by the target's own encoder, so it
-# is read here rather than passed in - a caller-supplied bias is a second derivation,
-# and a reader that forgot to apply it is #2759. x86-64 and aarch64 stamp 0; riscv64
-# pins `s0` at the frame top and stamps its ra/s0-plus-callee-saved reservation.
-# An inline-asm `{name}` is addressed from the STACK pointer instead
-# (`isa.asm.SlotFn`), which is `slot_sp_offset` and reads `base_dist`, the twin.
-#
-# measured over an identical corpus, one record per lookup (#2291): the reservation
-# is 0 on every one of 12 969 x86-64 and 7 291 aarch64 lookups, and nonzero on all
-# 3 865 riscv64 ones, ranging 16..200 bytes. it is not an occasional correction.
-# ---
-# frame: the laid-out frame to search, with `fp_dist` already stamped
-# v:     the MIR value id whose slot offset is requested
-# ret:   the offset, or none if `v` owns no frame slot
 pub fun slot_offset(frame: *mir.MirFrame, v: u32) O.Option[i64] {
     val opt_slot: O.Option[*mir.MirSlot] = slot_find(frame, v);
     if (!O.is_some[*mir.MirSlot](opt_slot)) { ret O.none[i64](); }
     ret O.some[i64](O.unwrap[*mir.MirSlot](opt_slot).offset - frame.fp_dist::i64);
 }
 
-# look up the STACK-pointer displacement of a MIR value's slot
-#
-# The twin of `slot_offset` on the other base. A slot offset is measured from the slot
-# region's base and is negative; `MirFrame.base_dist` is how far that base sits above
-# the stack pointer, so their sum is the positive displacement from it. There is no
-# per-target bias here because `base_dist` already is the per-target part - which is the
-# point of stamping it: the two targets that address an inline-asm `{name}` from the
-# stack pointer each carried their own copy of this sum (#2689), and a realigned frame
-# needs the same number for every access, not just an asm-bound one.
-#
-# The stack pointer is fixed from prologue to epilogue - a variable-length alloca is
-# refused at lowering, the outgoing-argument region is preallocated, and an asm body that
-# writes it is refused whenever it binds a `{name}` - so this displacement is as constant
-# as the frame-pointer one.
-# ---
-# frame: the laid-out frame to search, with `base_dist` already stamped
-# v:     the MIR value id whose slot displacement is requested
-# ret:   the displacement, or none if `v` owns no frame slot
 pub fun slot_sp_offset(frame: *mir.MirFrame, v: u32) O.Option[i64] {
     val opt_slot: O.Option[*mir.MirSlot] = slot_find(frame, v);
     if (!O.is_some[*mir.MirSlot](opt_slot)) { ret O.none[i64](); }
     ret O.some[i64](frame.base_dist::i64 + O.unwrap[*mir.MirSlot](opt_slot).offset);
 }
 
-# report whether the slot region is addressed from the stack pointer rather than the
-# frame pointer
-#
-# True exactly when the frame was realigned. Realigning masks the stack pointer down to
-# a boundary the caller did not promise, which makes the distance between the two
-# pointers a run-time quantity: after it, only one of them can still be a statically
-# known distance from the caller's stack. It has to be the frame pointer, because
-# incoming stack arguments and the frame record are addressed from it and both belong
-# to the caller. So the slot region moves to the stack pointer, which is the register
-# that was masked and therefore the one that carries the alignment.
-# ---
-# frame: the laid-out frame
-# ret:   true when slots, spills and the callee-save area are stack-pointer relative
 pub fun slots_from_sp(frame: *mir.MirFrame) bool {
     ret frame.realign != 0;
 }
 
-# report whether a MIR value owns a frame slot
-# ---
-# frame: the laid-out frame to search
-# v:     the MIR value id to test
-# ret:   true if `v` has an assigned stack slot
 pub fun is_slot(frame: *mir.MirFrame, v: u32) bool {
     ret O.is_some[*mir.MirSlot](slot_find(frame, v));
 }
 
-# report whether a MIR value's slot is an addressed alloca rather than an aggregate spill
-# ---
-# frame: the laid-out frame to search
-# v:     the MIR value id to test
-# ret:   true if `v`'s slot is an alloca; false if it is an aggregate spill or
-#        `v` owns no slot
 pub fun is_alloca_slot(frame: *mir.MirFrame, v: u32) bool {
     val opt_slot: O.Option[*mir.MirSlot] = slot_find(frame, v);
     if (!O.is_some[*mir.MirSlot](opt_slot)) { ret false; }
     ret O.unwrap[*mir.MirSlot](opt_slot).kind == mir.SLOT_ALLOCA;
 }
 
-# read the ABI stack alignment
-#
-# The caller (`run`) has already verified the target and its ABI are present; an
-# ABI that left `stack_align` unset (0) takes the 16-byte call-boundary default.
-# ---
-# tgt: resolved target with a non-nil ABI (guaranteed by `run`)
-# ret: the stack alignment in bytes
 fun stack_align(tgt: *target.Target) u32 {
     if (tgt.abi.stack_align == 0) { ret DEFAULT_STACK_ALIGN; }
     ret tgt.abi.stack_align;
 }
 
-# lay out one function's frame: assign each slot an offset from the slot region's
-# base, size the frame, and round the outgoing-argument region to the stack alignment
-#
-# The frame grows downward from the slot region's base:
-#
-#   [base - ..]                   locals, spills, two-register-param copies (the slots)
-#   ---- the slot region, rounded up to `align`, is `frame.size` ----
-#   [base - (frame.size + 8) ..]  callee-saved registers (reserved by the encoder)
-#   [rsp .. rsp + outgoing_size)  outgoing call-argument region (lowest)
-#
-# The encoder reserves the callee-save and outgoing regions below `frame.size`
-# when it subtracts RSP, placing the outgoing region at the very bottom so a
-# caller's `[rsp + off]` store lands in it. Rounding `outgoing_size` up to the
-# stack alignment keeps the encoder's RSP subtraction 16-byte aligned at every
-# call site: `frame.size` plus the callee region is aligned on its own, and a
-# 16-aligned outgoing region added below preserves the call-boundary invariant.
-#
-# WHAT THE SLOT OFFSETS ARE ALIGNED RELATIVE TO. Each offset is a multiple of its own
-# slot's alignment, which is a statement about the BASE plus the offset only if the
-# base carries that alignment too. The base is normally the frame pointer, and the only
-# alignment that reaches the frame pointer is the ABI's call-boundary minimum - 16 on
-# every target here. So a slot asking for more than 16 got an offset that was a correct
-# multiple of nothing (#2735): the address was a multiple of 32 exactly when the process
-# stack happened to start on one, which varies with the environment block and therefore
-# from run to run of the same binary.
-#
-# `frame.realign` is what closes that. When some slot needs more than the ABI gives, the
-# largest such alignment is recorded there and the function's prologue masks the STACK
-# pointer down to it, making `sp + <the target's slot-base distance>` the base every
-# offset is measured from. The stack pointer is the one that can move: it is provably
-# fixed from prologue to epilogue (a variable-length alloca is refused at lowering, an
-# asm body that writes it is refused whenever it binds a `{name}`), whereas the frame
-# pointer must stay where the ABI put it because incoming stack arguments and the frame
-# record are addressed from it. Only one of the two can sit a statically known distance
-# from the caller's stack once a mask has been applied, and it has to be the frame
-# pointer.
-#
-# The DECISION lives here and only here. Each encoder reads `frame.realign` and applies
-# it; none re-derives it from the slots, which would be a second copy of a layout policy
-# agreeing with this one by accident - the shape #2715 and #2725 both came from.
-# ---
-# func:  function to lay out; its `frame` is filled in place
-# align: stack alignment to round the frame size up to
-fun layout_function(func: *mir.MirFunction, align: u32) {
+fun layout_function(func: *mir.MirFunction, align: u32) R.Result[R.Void, str] {
     val frame: *mir.MirFrame = ?func.frame;
     frame.align = align;
     frame.realign = over_alignment(frame, align);
 
+    val align_r: R.Result[layout.CheckedAlignment[FrameByteUnit], layout.CheckCause] =
+        layout.alignment[FrameByteUnit](align::usize);
+    if (R.is_err[layout.CheckedAlignment[FrameByteUnit], layout.CheckCause](align_r)) {
+        ret R.err[R.Void, str]("frame: stack alignment is invalid");
+    }
+    val frame_align: layout.CheckedAlignment[FrameByteUnit] =
+        R.unwrap_ok[layout.CheckedAlignment[FrameByteUnit], layout.CheckCause](align_r);
+
     var offset: i64 = 0;
 
-    # INLINE-ASM `{name}` SLOTS ARE PLACED LAST, at the BOTTOM of the slot region,
-    # which is the end nearest the stack pointer.
-    #
-    # Every other slot is reached by a COMPILER-emitted load or store, which each
-    # target legalizes when the offset outgrows its immediate form - materializing the
-    # address through a register the back end reserves. A `{name}` slot is reached by
-    # an AUTHOR-written one, and there is no register the compiler may borrow inside
-    # someone else's asm body: aarch64 taking IP0 for exactly that was a silent
-    # miscompile (#2667), and riscv64 refuses rather than take t0.
-    #
-    # So the one slot kind that cannot be legalized is the one placed where it never
-    # needs to be - ADJACENT TO THE REGISTER IT IS ADDRESSED FROM. On the two targets
-    # whose immediate range is a real constraint that register is the stack pointer
-    # (`isa.asm.SlotFn`), because a slot sits below the frame pointer and an fp-relative
-    # displacement is therefore negative, which aarch64's unsigned scaled form cannot
-    # encode at all. Measured from the stack pointer the displacement is positive, and
-    # the bottom of the slot region is the near end. x86-64 reaches either end of any
-    # frame with a disp32 and is indifferent to where this puts it.
-    #
-    # What is left between a `{name}` slot and the stack pointer is the callee-save and
-    # outgoing-argument areas, both bounded by the ABI rather than by the function. That
-    # is the difference that matters: ordering the slots by the constraint made the reach
-    # a function of the frame's SIZE (#2674), and this makes it independent of it. A
-    # caller that inlines a syscall wrapper into a large frame is exactly the case that
-    # broke (#2689), and inlining is precisely what grows a frame under someone else's
-    # `{name}` (#2231).
-    #
-    # `{name}` slots are few - a handful per asm statement - and every other slot is
-    # indifferent to where it lands, so nothing is traded away.
     var si: u32 = 0;
     for (si < frame.slot_count) {
         if (!slot_is_asm_bound(func, frame.slots[si].value)) {
@@ -420,32 +184,35 @@ fun layout_function(func: *mir.MirFunction, align: u32) {
 
     var size: usize = 0;
     if (offset < 0) {
-        val align_mask: usize = align::usize - 1;
-        size = ((-offset)::usize + align_mask) & ~align_mask;
+        val aligned_r: R.Result[layout.CheckedOffset[FrameByteUnit], layout.CheckCause] =
+            layout.align_offset_up[FrameByteUnit](layout.offset[FrameByteUnit]((-offset)::usize), frame_align);
+        if (R.is_err[layout.CheckedOffset[FrameByteUnit], layout.CheckCause](aligned_r)) {
+            ret R.err[R.Void, str]("frame: stack frame size overflows while rounding up to the stack alignment");
+        }
+        size = R.unwrap_ok[layout.CheckedOffset[FrameByteUnit], layout.CheckCause](aligned_r).value;
     }
-    frame.size = size::u32;
+    val size_fits: R.Result[u32, layout.CheckCause] = layout.usize_to_u32(size);
+    if (R.is_err[u32, layout.CheckCause](size_fits)) {
+        ret R.err[R.Void, str]("frame: stack frame size exceeds the u32 limit");
+    }
+    frame.size = R.unwrap_ok[u32, layout.CheckCause](size_fits);
 
     if (frame.outgoing_size > 0) {
-        val align_mask: u32 = align - 1;
-        frame.outgoing_size = (frame.outgoing_size + align_mask) & ~align_mask;
+        val outgoing_r: R.Result[layout.CheckedOffset[FrameByteUnit], layout.CheckCause] =
+            layout.align_offset_up[FrameByteUnit](layout.offset[FrameByteUnit](frame.outgoing_size::usize), frame_align);
+        if (R.is_err[layout.CheckedOffset[FrameByteUnit], layout.CheckCause](outgoing_r)) {
+            ret R.err[R.Void, str]("frame: outgoing argument area overflows while rounding up to the stack alignment");
+        }
+        val outgoing_fits: R.Result[u32, layout.CheckCause] = layout.usize_to_u32(
+            R.unwrap_ok[layout.CheckedOffset[FrameByteUnit], layout.CheckCause](outgoing_r).value);
+        if (R.is_err[u32, layout.CheckCause](outgoing_fits)) {
+            ret R.err[R.Void, str]("frame: outgoing argument area exceeds the u32 limit");
+        }
+        frame.outgoing_size = R.unwrap_ok[u32, layout.CheckCause](outgoing_fits);
     }
+    ret R.ok_void[str]();
 }
 
-# the alignment the slot region's base must be given, or 0 when `align` already covers
-# every slot
-#
-# The largest slot alignment in the function, reported only when it exceeds what the ABI
-# guarantees the frame pointer. Read as a whole rather than per slot: the base is one
-# address, so the strongest request in the frame is what it has to satisfy, and every
-# weaker one is satisfied by the same mask because alignments are powers of two.
-#
-# A spill slot asks with the same voice as a declared local. That is deliberate and is
-# the member this is designed against: an over-width vector spilled to the stack (#2727)
-# wants a 32-byte base for a machine reason, and it never appears in source at all.
-# ---
-# frame: the frame whose slots have been recorded (offsets need not be assigned yet)
-# align: the ABI stack alignment the frame pointer already carries
-# ret:   the required base alignment, or 0 when none exceeds `align`
 fun over_alignment(frame: *mir.MirFrame, align: u32) u32 {
     if (frame.slots == nil) { ret 0; }
     var most: u32 = align;
@@ -458,33 +225,6 @@ fun over_alignment(frame: *mir.MirFrame, align: u32) u32 {
     ret most;
 }
 
-# assign `slot` the next address below `offset`, returning the new watermark
-#
-# The layout step itself, split out so the two ordering passes above run one
-# implementation rather than two copies that could round differently.
-#
-# THE ROUNDING HERE IS DOWNWARD, AND DOWNWARD IS NOT THE UPWARD RULE WITH A SIGN
-# FLIPPED. This walk descends: `offset` is the watermark, the lowest address already
-# spoken for, and the slot must end at or below it. Its base is therefore `offset -
-# size` at the highest, and rounding that base DOWN to a multiple of the alignment is
-# `base & ~mask` on its own. Two's complement `&` clears low bits, which moves a
-# negative number away from zero, which is downward - so a base that is already
-# aligned is already the answer and nothing is subtracted from it.
-#
-# The upward rule `(x + mask) & ~mask` adds a full alignment unit's worth of slack
-# FIRST because clearing the low bits would otherwise move an ascending cursor
-# BACKWARD, into the previous allocation. Descending, clearing the low bits already
-# moves away from the previous allocation, so the slack has nothing to correct.
-# Carrying it over sign-flipped as `(base - mask) & ~mask` (#2725) subtracts a whole
-# alignment unit from every slot whose base is already aligned, which is most of
-# them: an 8-byte 8-aligned local occupied 16 bytes, and every frame on every target
-# was up to twice the size it needed to be. It was invisible to correctness - nothing
-# overlapped and every offset stayed aligned - so only a measurement finds it.
-#
-# The two properties this must hold are `next + size <= offset` (no overlap with what
-# is above) and `next % align == 0`. Rounding down satisfies both: `base <= offset -
-# size` before rounding and rounding only lowers it, and the mask is what makes it
-# aligned.
 fun place_slot(slot: *mir.MirSlot, offset: i64) i64 {
     var slot_align: i64 = 1;
     if (slot.align > 0) { slot_align = slot.align::i64; }
@@ -499,13 +239,6 @@ fun place_slot(slot: *mir.MirSlot, offset: i64) i64 {
     ret next;
 }
 
-# true when any inline-asm body in `func` binds `{name}` to the slot vreg `v`
-#
-# Read off the MIR_ASM payloads rather than tracked on the slot, because the binding
-# is a property of the asm statement and the slot is shared machinery: a flag on
-# `MirSlot` would be a second place for the same fact to be recorded, and the one
-# that could go stale. The scan is over instructions carrying an asm payload only,
-# which is zero for almost every function.
 fun slot_is_asm_bound(func: *mir.MirFunction, v: u32) bool {
     var bi: u32 = 0;
     for (bi < func.block_count) {
@@ -527,11 +260,6 @@ fun slot_is_asm_bound(func: *mir.MirFunction, v: u32) bool {
     ret false;
 }
 
-# find the slot owned by a MIR value id
-# ---
-# frame: the laid-out frame to search
-# v:     the MIR value id to look up
-# ret:   a pointer to `v`'s slot, or none if `v` owns no frame slot
 fun slot_find(frame: *mir.MirFrame, v: u32) O.Option[*mir.MirSlot] {
     if (frame == nil)       { ret O.none[*mir.MirSlot](); }
     if (frame.slots == nil) { ret O.none[*mir.MirSlot](); }
@@ -546,11 +274,7 @@ fun slot_find(frame: *mir.MirFrame, v: u32) O.Option[*mir.MirSlot] {
     ret O.none[*mir.MirSlot]();
 }
 
-# slot_offset, is_slot, and is_alloca_slot distinguish an alloca slot from a
-# spill slot and report a missing value id as owning no slot
 test "mach.lang.be.codegen.frame.slot_offset:alloca_and_spill_lookup" {
-    # build two manual slots without an allocator: offsets are set directly, so
-    # no `run` pass is needed.
     var slots: [2]mir.MirSlot;
     slots[0].value  = 10;
     slots[0].kind   = mir.SLOT_ALLOCA;
@@ -586,9 +310,6 @@ test "mach.lang.be.codegen.frame.slot_offset:alloca_and_spill_lookup" {
     val opt_off99: O.Option[i64] = slot_offset(?frame, 99);
     if (O.is_some[i64](opt_off99))       { ret 1; }
 
-    # a target that reserves space between the frame pointer and the slot region stamps
-    # it as `fp_dist`, and every offset this returns is measured past it. reading the raw
-    # slot offset instead is right only where the reservation is 0 (#2759).
     frame.fp_dist = 32;
     val biased10: O.Option[i64] = slot_offset(?frame, 10);
     if (!O.is_some[i64](biased10))      { ret 1; }
@@ -604,29 +325,10 @@ test "mach.lang.be.codegen.frame.slot_offset:alloca_and_spill_lookup" {
     ret 0;
 }
 
-# an inline-asm `{name}` slot is laid out at the bottom of the slot region - the end
-# nearest the stack pointer - whatever order it was recorded in (#2689)
-#
-# THE ONE SLOT KIND THAT CANNOT BE LEGALIZED IS THE ONE PLACED WHERE IT NEVER NEEDS TO
-# BE. Every other slot is reached by a compiler-emitted access, which each target
-# rewrites through a reserved register when the offset outgrows its immediate form. A
-# `{name}` slot is reached by an author-written one, and there is no register the
-# compiler may borrow inside someone else's asm body - aarch64 taking IP0 for exactly
-# that was a silent miscompile (#2667), and riscv64 refuses rather than take t0.
-#
-# So it is placed adjacent to the register it is addressed from, which is the stack
-# pointer (`isa.asm.SlotFn`). The invariant asserted is the ARCHITECTURAL one - the
-# bound slot's distance from the bottom of the slot region is independent of how large
-# the ordinary slots are - rather than an exact offset, which would only restate the
-# rounding rule. That independence is the whole fix: laying the bound slot nearest the
-# FRAME pointer instead (#2674) made its reach a function of the frame's size, and a
-# caller inlining a syscall wrapper into a large frame exceeded it.
 test "mach.lang.be.codegen.frame.layout_function:asm_bound_slots_are_nearest_the_stack_pointer" {
     var instrs: [1]mir.MirInstr;
     mk_instr(?instrs[0], mir.MIR_ASM);
 
-    # the asm statement binds `{name}` to vreg 7, which is recorded FIRST among the
-    # slots: without the ordering it would land furthest from the stack pointer.
     var binds: [1]mir.MirAsmBind;
     binds[0] = mir.asm_bind(0::intern.StrId, 7, false);
     var payload: mir.MirAsm;
@@ -640,8 +342,6 @@ test "mach.lang.be.codegen.frame.layout_function:asm_bound_slots_are_nearest_the
     var func: mir.MirFunction;
     mk_func(?blk, ?func, ?instrs[0], 1);
 
-    # the bound slot recorded first, then four ordinary slots each big enough that the
-    # bound one would sit well past every immediate window if it were laid out in order.
     var slots: [5]mir.MirSlot;
     slots[0].value  = 7;
     slots[0].kind   = mir.SLOT_ALLOCA;
@@ -664,33 +364,21 @@ test "mach.lang.be.codegen.frame.layout_function:asm_bound_slots_are_nearest_the
 
     layout_function(?func, 16);
 
-    # THE BOUND SLOT IS AT THE BOTTOM. Slot offsets are negative and grow downward, so
-    # "nearest the stack pointer" is "most negative", and its distance from the frame's
-    # low edge is its own size alone - not the 1024 bytes of ordinary locals above it.
     if (func.frame.size::i64 + slots[0].offset > 8) { ret 21; }
 
-    # every ordinary slot is strictly above it, so nothing overlaps and the ordering
-    # really put the bound one last.
     var j: usize = 1;
     for (j < 5) {
         if (slots[j].offset <= slots[0].offset) { ret 22; }
         j = j + 1;
     }
-    # the frame still covers every slot: four 256-byte locals plus the bound 8.
     if (func.frame.size < 1032) { ret 23; }
 
-    # a slot no asm body binds is ordinary, so the predicate is not answering true
-    # for everything - which would place them all last and assert nothing.
     if (!slot_is_asm_bound(?func, 7)) { ret 24; }
     if (slot_is_asm_bound(?func, 1))  { ret 25; }
     if (slot_is_asm_bound(?func, 4))  { ret 26; }
     ret 0;
 }
 
-# a function with no inline asm lays out exactly as it did before, in slot order
-#
-# The no-regression half: the ordering must be invisible to every function that has no
-# `{name}` to protect, which is almost all of them.
 test "mach.lang.be.codegen.frame.layout_function:no_asm_keeps_slot_order" {
     var instrs: [1]mir.MirInstr;
     mk_instr(?instrs[0], mir.MIR_MOV);
@@ -716,14 +404,10 @@ test "mach.lang.be.codegen.frame.layout_function:no_asm_keeps_slot_order" {
 
     layout_function(?func, 16);
 
-    # descending in declaration order, each below the last, with nothing reordered.
     if (slots[0].offset >= 0)                 { ret 11; }
     if (slots[1].offset >= slots[0].offset)   { ret 12; }
     if (slots[2].offset >= slots[1].offset)   { ret 13; }
 
-    # EXACT offsets, not an ordering. three 8-byte 8-aligned slots pack into 24 bytes,
-    # which the 16-byte stack alignment rounds to 32. an ordering assertion passes just
-    # as happily on the 16-apart layout #2725 was, so it is the numbers that pin this.
     if (slots[0].offset != -8)                { ret 14; }
     if (slots[1].offset != -16)               { ret 15; }
     if (slots[2].offset != -24)               { ret 16; }
@@ -731,20 +415,6 @@ test "mach.lang.be.codegen.frame.layout_function:no_asm_keeps_slot_order" {
     ret 0;
 }
 
-# a slot is placed at the FIRST address below the watermark that satisfies its own
-# alignment, and an already-aligned address satisfies it (#2725)
-#
-# The descending walk rounds down, so an aligned base is left where it is. Rounding a
-# descending cursor with the ASCENDING idiom `(base - mask) & ~mask` drops a full
-# alignment unit from every slot that needed no adjustment at all, which is most of
-# them, and doubles the frame.
-#
-# The two properties asserted are the ones that actually constrain the rule -
-# no overlap and each offset a multiple of its own alignment - plus the exact offsets,
-# because both properties hold under the old rule too. A frame of uniform `i64` cannot
-# tell a correct rule from several wrong ones either, so the alignments here run
-# 1/2/4/8/16/32: a byte, a half, a word, a double, a vector, and an over-aligned
-# record. The 1-aligned slot is what forces the following ones to actually round.
 test "mach.lang.be.codegen.frame.place_slot:rounds_down_without_dropping_a_unit" {
     var instrs: [1]mir.MirInstr;
     mk_instr(?instrs[0], mir.MIR_MOV);
@@ -779,15 +449,6 @@ test "mach.lang.be.codegen.frame.place_slot:rounds_down_without_dropping_a_unit"
 
     layout_function(?func, 16);
 
-    # derived by hand from the watermark, which starts at 0 and only descends:
-    #   1@1  -> base -1,  already fine       -> -1
-    #   2@2  -> base -3,  down to a multiple -> -4
-    #   4@4  -> base -8,  already a multiple -> -8
-    #   8@8  -> base -16, already a multiple -> -16
-    #  16@16 -> base -32, already a multiple -> -32
-    #  32@32 -> base -64, already a multiple -> -64
-    # so 63 bytes of slot occupy 64, and the frame is 64. The old rule produced
-    # -1/-4/-12/-32/-64/-128 and a 128-byte frame for the same six slots.
     if (slots[0].offset != -1)   { ret 31; }
     if (slots[1].offset != -4)   { ret 32; }
     if (slots[2].offset != -8)   { ret 33; }
@@ -796,16 +457,12 @@ test "mach.lang.be.codegen.frame.place_slot:rounds_down_without_dropping_a_unit"
     if (slots[5].offset != -64)  { ret 36; }
     if (func.frame.size != 64)   { ret 37; }
 
-    # each offset is a multiple of its own alignment. an off-by-one in the other
-    # direction - rounding UP instead of down - would still pack tightly and still
-    # not overlap, and this is the half that catches it.
     var j: usize = 0;
     for (j < 6) {
         if ((slots[j].offset & (aligns[j]::i64 - 1)) != 0) { ret 38; }
         j = j + 1;
     }
 
-    # no slot runs into the one above it, and every slot is inside the frame.
     var k: usize = 0;
     for (k < 6) {
         var n: usize = 0;
@@ -826,17 +483,6 @@ test "mach.lang.be.codegen.frame.place_slot:rounds_down_without_dropping_a_unit"
     ret 0;
 }
 
-# the realignment decision is the LARGEST slot alignment above the ABI's, recorded on
-# the frame, and 0 when nothing asks for more (#2735)
-#
-# THE OFFSETS ALONE CANNOT SHOW THIS. Every offset here is a multiple of its own
-# alignment with or without the decision - they were on the bug too. What the decision
-# changes is the BASE those offsets are measured from, which is a fact about the
-# prologue, so the assertion has to be on the recorded number rather than on the layout.
-#
-# The 128 is deliberately not the last slot recorded: taking the largest means taking it
-# whatever order the slots arrive in, and a rule that read the final slot, or the first
-# over-aligned one, would pass a frame ordered the convenient way.
 test "mach.lang.be.codegen.frame.layout_function:records_the_largest_over_alignment" {
     var instrs: [1]mir.MirInstr;
     mk_instr(?instrs[0], mir.MIR_MOV);
@@ -867,8 +513,6 @@ test "mach.lang.be.codegen.frame.layout_function:records_the_largest_over_alignm
     if (func.frame.realign != 128) { ret 51; }
     if (!slots_from_sp(?func.frame)) { ret 52; }
 
-    # a frame nothing over-aligns records 0 and stays frame-pointer based, so an ordinary
-    # function emits the prologue it always did.
     var plain: [3]mir.MirSlot;
     var j: usize = 0;
     for (j < 3) {
@@ -889,12 +533,6 @@ test "mach.lang.be.codegen.frame.layout_function:records_the_largest_over_alignm
     ret 0;
 }
 
-# a slot's stack-pointer displacement is its offset from the slot region's base plus the
-# distance the encoder stamped between that base and the stack pointer
-#
-# The two halves have to be added by one function, because a caller that took the offset
-# from here and the distance from its own arithmetic is the second copy the whole
-# `base_dist` field exists to prevent - aarch64 and riscv64 each had one (#2689).
 test "mach.lang.be.codegen.frame.slot_sp_offset:adds_the_stamped_base_distance" {
     var slots: [2]mir.MirSlot;
     slots[0].value  = 10;
@@ -928,26 +566,14 @@ test "mach.lang.be.codegen.frame.slot_sp_offset:adds_the_stamped_base_distance" 
     if (!O.is_some[i64](b))     { ret 63; }
     if (O.unwrap[i64](b) != 56) { ret 64; }
 
-    # a value that owns no slot answers none rather than the base distance, which would
-    # be a plausible-looking address into the frame.
     if (O.is_some[i64](slot_sp_offset(?frame, 99))) { ret 65; }
     ret 0;
 }
 
-# the frame-pointer and stack-pointer register ids the omission tests use. arbitrary
-# distinct values: `omits_frame` compares operand register fields against whatever it
-# is handed, so the numbering matters only in being distinguishable from a third id
-# the tests use for an ordinary register.
 val TEST_FP:    u32 = 5;
 val TEST_SP:    u32 = 4;
 val TEST_OTHER: u32 = 9;
 
-# build a one-block function around `instrs`, with an otherwise empty frame
-# ---
-# blk:    caller-owned block storage
-# func:   caller-owned function storage, filled in
-# instrs: the block's instruction array
-# n:      number of instructions
 fun mk_func(blk: *mir.MirBlock, func: *mir.MirFunction, instrs: *mir.MirInstr, n: u32) {
     blk.id          = 0;
     blk.instrs      = instrs;
@@ -978,10 +604,6 @@ fun mk_func(blk: *mir.MirBlock, func: *mir.MirFunction, instrs: *mir.MirInstr, n
     func.naked               = false;
 }
 
-# fill `mi` as an instruction with no operands
-# ---
-# mi: the instruction to fill
-# op: its opcode
 fun mk_instr(mi: *mir.MirInstr, op: mir.MirOpcode) {
     mi.opcode            = op;
     mi.operands          = nil;
@@ -995,10 +617,6 @@ fun mk_instr(mi: *mir.MirInstr, op: mir.MirOpcode) {
     mi.vec_lane          = 0;
 }
 
-# a leaf that allocates nothing and touches neither pointer omits its frame - the
-# shape #1940 exists for. mutating `omits_frame` to answer false unconditionally
-# fails here, and mutating it to answer true unconditionally fails every disqualifier
-# test below
 test "mach.lang.be.codegen.frame.omits_frame:bare_leaf_omits" {
     var instrs: [2]mir.MirInstr;
     mk_instr(?instrs[0], mir.MIR_ADD);
@@ -1012,9 +630,6 @@ test "mach.lang.be.codegen.frame.omits_frame:bare_leaf_omits" {
     ret 0;
 }
 
-# each frame fact the compiler itself allocated keeps the frame: a slot, a callee-saved
-# GP register, a callee-saved vector register, or an outgoing-argument region. deleting
-# any one of the four guards in `omits_frame` fails this test
 test "mach.lang.be.codegen.frame.omits_frame:allocated_frame_keeps_it" {
     var instrs: [1]mir.MirInstr;
     mk_instr(?instrs[0], mir.MIR_RET);
@@ -1041,10 +656,6 @@ test "mach.lang.be.codegen.frame.omits_frame:allocated_frame_keeps_it" {
     ret 0;
 }
 
-# a call keeps the frame. entry RSP is 8 mod 16 and the frame-pointer push is what
-# restores the 16-byte call boundary, so a frame-omitting function that called
-# anything would hand its callee a misaligned stack. deleting the MIR_CALL scan fails
-# here
 test "mach.lang.be.codegen.frame.omits_frame:a_call_keeps_the_frame" {
     var instrs: [2]mir.MirInstr;
     mk_instr(?instrs[0], mir.MIR_CALL);
@@ -1058,12 +669,6 @@ test "mach.lang.be.codegen.frame.omits_frame:a_call_keeps_the_frame" {
     ret 0;
 }
 
-# a memory operand based on the frame or stack pointer keeps the frame: an incoming
-# stack parameter is lowered to `[fp + incoming_arg_base + off]` and stays addressable
-# only while the frame pointer is live. eliding such a function is a miscompile that
-# still returns the right answer for a small enough argument list, so this is the
-# guard worth mutating. an ordinary physical-register base, and a frame-slot base
-# (which carries a slot key rather than a register), both stay elidable
 test "mach.lang.be.codegen.frame.omits_frame:frame_relative_operand_keeps_the_frame" {
     var blk: mir.MirBlock;
     var func: mir.MirFunction;
@@ -1109,12 +714,6 @@ test "mach.lang.be.codegen.frame.omits_frame:frame_relative_operand_keeps_the_fr
     ret 0;
 }
 
-# an inline-asm body carries no weight of its own (#2283). an asm-only leaf still
-# omits its frame - through the leaf rule, since an asm payload contributes no MIR
-# operand - but an asm body that also makes a call is framed like any other caller.
-# restoring the old `if (mi.asm_block != nil) { ret true; }` arm fails the second
-# half here, and it is a hang on aarch64 / riscv64 rather than a lost optimization:
-# the call overwrites the link register the omitted prologue never saved
 test "mach.lang.be.codegen.frame.omits_frame:asm_alone_omits_asm_with_a_call_does_not" {
     var payload: mir.MirAsm;
 
@@ -1135,7 +734,6 @@ test "mach.lang.be.codegen.frame.omits_frame:asm_alone_omits_asm_with_a_call_doe
     mk_func(?blk, ?func, ?calling[0], 2);
     if (omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
 
-    # an asm body still needs the frame the compiler allocated under it
     mk_func(?blk, ?func, ?leaf[0], 2);
     func.frame.size = 8;
     if (omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
@@ -1143,11 +741,6 @@ test "mach.lang.be.codegen.frame.omits_frame:asm_alone_omits_asm_with_a_call_doe
     ret 0;
 }
 
-# `#[naked]` omits the frame by declaration, so it answers true through every
-# disqualifier the derived reason rejects: allocated slots, callee-saved registers,
-# an outgoing-argument region, a call, and a frame-pointer-relative operand. deleting
-# the `func.naked` arm fails this and leaves the decorator emitting a prologue the
-# author forbade
 test "mach.lang.be.codegen.frame.omits_frame:naked_omits_unconditionally" {
     var ops: [1]mir.MirOperand;
     ops[0] = mir.op_mem_preg(TEST_FP, 16);
@@ -1166,16 +759,31 @@ test "mach.lang.be.codegen.frame.omits_frame:naked_omits_unconditionally" {
     func.callee_mask_fp      = 1 << 6;
     func.frame.outgoing_size = 16;
 
-    # every guard above says "keep the frame" ...
     if (omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
-    # ... and the declaration overrides all of them.
     func.naked = true;
     if (!omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
     ret 0;
 }
 
-# `run` writes the decision onto every function's frame, so the encoders read a fact
-# rather than re-deriving it. reverting `run` to leave `omit` untouched fails here
+fun t_frame_dist(model: *isa.MachineModel, func: *mir.MirFunction, base_dist: *u32, fp_dist: *u32) {
+    @base_dist = 96;
+    @fp_dist   = 32;
+}
+
+fun t_is_reg_move(opcode: u32) bool { ret false; }
+
+fun t_is_trap_terminator(opcode: u32) bool { ret false; }
+
+fun t_frame_machine() isa.RegMachine {
+    var m: isa.RegMachine = isa.reg_machine(nil, nil, t_is_reg_move, t_is_trap_terminator,
+                                            nil, 0, nil, 0,
+                                            -1, -1,
+                                            -1, -1, 0,
+                                            -1, -1, -1);
+    isa.with_frame_dist(?m, t_frame_dist);
+    ret m;
+}
+
 test "mach.lang.be.codegen.frame.run:stamps_the_omission_decision" {
     var leaf_instrs: [1]mir.MirInstr;
     mk_instr(?leaf_instrs[0], mir.MIR_RET);
@@ -1196,13 +804,9 @@ test "mach.lang.be.codegen.frame.run:stamps_the_omission_decision" {
     m.function_len = 2;
     m.function_cap = 2;
 
-    # only the field `run` reads is set to a real value, the ABI's stack alignment;
-    # the rest are placeholders `abi.abi_vtable` requires but this test does not
-    # exercise (the other read `run` makes is the frame- / stack-pointer register
-    # ids on `tgt.model`, set below).
     var abi_vt: abi.AbiVTable = abi.abi_vtable(
         0, "", 0,
-        nil, nil, nil,
+nil, nil,
         nil, nil,
         16, 0, 0,
         -1, false,
@@ -1211,30 +815,27 @@ test "mach.lang.be.codegen.frame.run:stamps_the_omission_decision" {
         nil
     );
 
+    var machine: isa.RegMachine = t_frame_machine();
+
     var tgt: target.Target;
     tgt.abi                = ?abi_vt;
     tgt.model.frame_ptr_reg = TEST_FP::i32;
     tgt.model.stack_ptr_reg = TEST_SP::i32;
 
-    val r: R.Result[bool, str] = run(?tgt, ?m);
-    if (R.is_err[bool, str](r)) { ret 1; }
+    val undeclared: R.Result[R.Void, str] = run(?tgt, ?m);
+    if (!R.is_err[R.Void, str](undeclared)) { ret 1; }
+
+    tgt.arch = ?machine;
+    val r: R.Result[R.Void, str] = run(?tgt, ?m);
+    if (R.is_err[R.Void, str](r)) { ret 1; }
 
     if (!funcs[0].frame.omit) { ret 1; }
     if (funcs[1].frame.omit)  { ret 1; }
+    if (funcs[0].frame.base_dist != 96) { ret 1; }
+    if (funcs[0].frame.fp_dist   != 32) { ret 1; }
     ret 0;
 }
 
-# The frame-versus-reserve boundary is exact, and a zero reserve does not diagnose (#2991).
-#
-# Tested here rather than through a compiled program because the boundary is the claim:
-# source big enough to produce a frame of EXACTLY the reserve is not something a test
-# can write and keep true, since the frame carries saved registers and padding the
-# author does not control. The refusal is a proof about two numbers, so the two numbers
-# are what it is checked against.
-#
-# EQUAL IS REFUSED. A frame exactly the size of the reserve leaves nothing for the
-# caller that entered it, the return address, or the guard page below - and "one byte
-# under builds" is what keeps the rule a proof rather than a margin someone tuned.
 test "mach.lang.be.codegen.frame.check_frame_fits:boundary_is_exact" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -1256,42 +857,28 @@ test "mach.lang.be.codegen.frame.check_frame_fits:boundary_is_exact" {
 
     var bad: i32 = 0;
 
-    # one byte under the reserve builds
     f.frame.size = 1048575;
-    if (R.is_err[bool, str](check_frame_fits(?m, ?f, 1048576)) && bad == 0) { bad = 2; }
+    if (R.is_err[R.Void, str](check_frame_fits(?m, ?f, 1048576)) && bad == 0) { bad = 2; }
 
-    # exactly the reserve is refused
     f.frame.size = 1048576;
-    if (R.is_ok[bool, str](check_frame_fits(?m, ?f, 1048576)) && bad == 0) { bad = 3; }
+    if (R.is_ok[R.Void, str](check_frame_fits(?m, ?f, 1048576)) && bad == 0) { bad = 3; }
 
-    # over it is refused, and the message owes the reader three facts: which function,
-    # how big its frame is, and what it was measured against
     f.frame.size = 1107824;
-    val over: R.Result[bool, str] = check_frame_fits(?m, ?f, 1048576);
-    if (R.is_ok[bool, str](over)) { bad = 4; }
+    val over: R.Result[R.Void, str] = check_frame_fits(?m, ?f, 1048576);
+    if (R.is_ok[R.Void, str](over)) { bad = 4; }
     or {
-        val msg: str = R.unwrap_err[bool, str](over);
+        val msg: str = R.unwrap_err[R.Void, str](over);
         if (!str_contains(msg, "fat")     && bad == 0) { bad = 5; }
         if (!str_contains(msg, "1107824") && bad == 0) { bad = 6; }
         if (!str_contains(msg, "1048576") && bad == 0) { bad = 7; }
     }
 
-    # A ZERO RESERVE IS "NOTHING BOUNDS THIS", not "a reserve of zero". An ELF target's
-    # stack is the kernel's and `ulimit`'s, and a Mach-O image with no stated reserve
-    # takes dyld's default - neither is a number mach put in the image, so neither may
-    # refuse a program that runs.
     f.frame.size = 999999999;
-    if (R.is_err[bool, str](check_frame_fits(?m, ?f, 0)) && bad == 0) { bad = 8; }
+    if (R.is_err[R.Void, str](check_frame_fits(?m, ?f, 0)) && bad == 0) { bad = 8; }
 
     ret bad;
 }
 
-# The effective reserve prefers what a target STATED over what the format defaults to (#2991).
-#
-# The three cases are ordered, and the order is what makes the check honest: a stated
-# reserve is what the writer will put in the image, a format default is what it puts in
-# when nothing is stated, and 0 means mach chose no number at all and must not pretend
-# otherwise.
 test "mach.lang.be.codegen.frame.effective_stack_reserve:stated_beats_default" {
     var pe: of.OfVTable;
     pe.carries_stack_size    = true;
@@ -1302,14 +889,75 @@ test "mach.lang.be.codegen.frame.effective_stack_reserve:stated_beats_default" {
     elf_vt.default_stack_reserve = 0;
 
     var bad: i32 = 0;
-    # stated wins over the format default
     if (of.effective_stack_reserve(?pe, 0x800000) != 0x800000)   { bad = 1; }
-    # unstated falls to the format default
     if (of.effective_stack_reserve(?pe, 0) != 0x100000          && bad == 0) { bad = 2; }
-    # a format with no default bounds nothing when nothing is stated
     if (of.effective_stack_reserve(?elf_vt, 0) != 0             && bad == 0) { bad = 3; }
-    # ...but a stated value still stands: the manifest already refused the key where it
-    # cannot be carried, so reaching here with one means the format carries it
     if (of.effective_stack_reserve(?elf_vt, 0x800000) != 0x800000 && bad == 0) { bad = 4; }
     ret bad;
+}
+
+test "mach.lang.be.codegen.frame.layout_function:refuses_a_frame_size_past_the_u32_limit" {
+    var instrs: [1]mir.MirInstr;
+    mk_instr(?instrs[0], mir.MIR_MOV);
+
+    var blk: mir.MirBlock;
+    var func: mir.MirFunction;
+    mk_func(?blk, ?func, ?instrs[0], 1);
+
+    var slots: [1]mir.MirSlot;
+    slots[0].value  = 0;
+    slots[0].kind   = mir.SLOT_ALLOCA;
+    slots[0].offset = 0;
+    slots[0].size   = 0xFFFFFFFF;
+    slots[0].align  = 1;
+
+    func.frame.slots      = ?slots[0];
+    func.frame.slot_count = 1;
+    func.frame.slot_cap   = 1;
+
+    val r: R.Result[R.Void, str] = layout_function(?func, 16);
+    if (!R.is_err[R.Void, str](r)) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.frame.layout_function:refuses_an_outgoing_area_past_the_u32_limit" {
+    var instrs: [1]mir.MirInstr;
+    mk_instr(?instrs[0], mir.MIR_MOV);
+
+    var blk: mir.MirBlock;
+    var func: mir.MirFunction;
+    mk_func(?blk, ?func, ?instrs[0], 1);
+
+    func.frame.outgoing_size = 0xFFFFFFFF;
+
+    val r: R.Result[R.Void, str] = layout_function(?func, 16);
+    if (!R.is_err[R.Void, str](r)) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.frame.layout_function:ordinary_frame_still_succeeds" {
+    var instrs: [1]mir.MirInstr;
+    mk_instr(?instrs[0], mir.MIR_MOV);
+
+    var blk: mir.MirBlock;
+    var func: mir.MirFunction;
+    mk_func(?blk, ?func, ?instrs[0], 1);
+
+    var slots: [1]mir.MirSlot;
+    slots[0].value  = 0;
+    slots[0].kind   = mir.SLOT_ALLOCA;
+    slots[0].offset = 0;
+    slots[0].size   = 32;
+    slots[0].align  = 16;
+
+    func.frame.slots      = ?slots[0];
+    func.frame.slot_count = 1;
+    func.frame.slot_cap   = 1;
+    func.frame.outgoing_size = 24;
+
+    val r: R.Result[R.Void, str] = layout_function(?func, 16);
+    if (R.is_err[R.Void, str](r))         { ret 1; }
+    if (func.frame.size != 32)          { ret 2; }
+    if (func.frame.outgoing_size != 32) { ret 3; }
+    ret 0;
 }

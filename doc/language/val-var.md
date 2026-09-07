@@ -83,7 +83,8 @@ ext var errno: i32;                        # imported mutable datum
   `library` decorators, and the static/dynamic linking inputs all work exactly as
   for [`ext fun`](ext-fun.md).
 - On a dynamic target the reference is emitted GOT-indirect so the loader binds
-  it to the runtime definition (ELF: an `R_*_GLOB_DAT` GOT slot); an ordinary
+  it to the runtime definition. ELF uses a dynamic pointer relocation,
+  `GLOB_DAT` on x86-64 and ARM64 or `R_RISCV_64` on RV64. An ordinary
   cross-module reference to a `val`/`var` defined elsewhere in the same artifact
   stays directly addressed. Executed dynamic-import resolution is proven on the
   native ELF legs.
@@ -105,11 +106,14 @@ that type.
 
 ```mach
 val n: i64 = 42;                    # ok — 42 conforms to i64
-val x       = 42;                   # ERROR — no type to check against
+val x       = 42;                   # ERROR — a binding declares its type
+val y       = 42i64;                # ERROR — a suffix is not an annotation
 ```
 
-If the surrounding context doesn't constrain the literal's type, use a
-typed suffix (`42i64`).
+The annotation is required whatever the initializer is: a typed suffix
+gives the literal a type, it does not give the binding one. Suffixes earn
+their keep where there is no annotation to read from, such as the elements
+of a pack tail. See [literals.md](literals.md#typed-suffixes).
 
 ## See also
 

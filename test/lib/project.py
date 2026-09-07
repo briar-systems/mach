@@ -97,10 +97,10 @@ class Project(object):
                 shutil.copy2(os.path.join(self.corpus_root, "lib", name),
                              os.path.join(src, "lib", name))
         if self.with_std:
-            std = os.path.join(self.repo_root, "dep", "mach-std")
+            std = os.path.join(self.repo_root, "dep", "std")
             if not os.path.isdir(std):
                 raise BuildError("mach-std is not materialised at %s; run `mach dep pull .` in the checkout" % std)
-            dst = os.path.join(self.root, "dep", "mach-std")
+            dst = os.path.join(self.root, "dep", "std")
             os.makedirs(dst)
             shutil.copytree(os.path.join(std, "src"), os.path.join(dst, "src"))
             shutil.copy2(os.path.join(std, "mach.toml"), os.path.join(dst, "mach.toml"))
@@ -149,8 +149,8 @@ class Project(object):
                 out.append("need = []")
                 out.append("")
         if self.with_std:
-            out.append("[dep.mach-std]")
-            out.append('path = "dep/mach-std"')
+            out.append("[dep.std]")
+            out.append('path = "dep/std"')
             out.append("")
         return "\n".join(out)
 

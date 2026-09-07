@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run.sh: the cross-compilation and linking suite.
 #
-# usage: run.sh [--leg <name>]... [--case <name>]... [--deps float|pin] [--bless] [--matrix]
+# usage: run.sh [--leg <name>]... [--case <name>]... [--deps pin|float] [--bless] [--matrix]
 #
 # ONE QUESTION: does mach produce a correct IMAGE for a target, and link it against
 # what the platform actually provides? that is the question a checksum cannot ask.
@@ -29,14 +29,15 @@
 # reason. there is no flag to override an engine: a run that says it exercised a leg
 # has to have exercised it.
 #
-# DEPENDENCY RESOLUTION. a case declares `ref = "branch/main"` for mach-std, which
-# tracks its latest RELEASE, and `--deps float` resolves it fresh - that is what
-# catches a downstream break on the pull request that would first trip over it.
-# `--deps pin` states the other intent, resolving every case to the commit THIS
-# REPO'S OWN mach.lock records, which is the one the compiler in the same checkout
-# was built against, so a release-gate run is reproducible and a bisect over mach
-# commits is sound (#2592). float resolves ONCE PER RUN, not once per case (#2619):
-# before that, a suite spanning a mach-std merge compiled some cases against one
+# DEPENDENCY RESOLUTION. the default, `--deps pin`, resolves every case to the
+# commit THIS REPO'S OWN GITLINK records, which is the one the compiler in the same
+# checkout was built against: the leg tests the compiler against its own standard
+# library, a release-gate run is reproducible, and a bisect over mach commits is
+# sound (#2592). `--deps float` is the explicit second mode: a case declares
+# `ref = "branch/main"` for the standard library, which tracks its latest RELEASE,
+# and float resolves it fresh - that is what catches a downstream break on the pull
+# request that would first trip over it. float resolves ONCE PER RUN, not once per case
+# (#2619): before that, a suite spanning a std merge compiled some cases against one
 # standard library and some against another and still reported a single verdict.
 #
 # NOT SAFE TO RUN CONCURRENTLY AGAINST ONE CHECKOUT. a case builds into its own
@@ -52,8 +53,12 @@ repo=$(CDPATH= cd -- "$here/../.." && pwd)
 . "$here/lib/produce.sh"
 . "$here/lib/deps.sh"
 
+# the caller's own LD_LIBRARY_PATH, restored before every case so one case's
+# fixture-owned .so (see below) never leaks into the next case's run.
+base_ld_library_path=${LD_LIBRARY_PATH:-}
+
 usage() {
-    echo "usage: run.sh [--leg <name>]... [--case <name>]... [--deps float|pin] [--bless] [--matrix]" >&2
+    echo "usage: run.sh [--leg <name>]... [--case <name>]... [--deps pin|float] [--bless] [--matrix]" >&2
     exit 2
 }
 
@@ -61,7 +66,7 @@ want_legs=
 want_cases=
 bless=0
 matrix_only=0
-deps_mode=float
+deps_mode=pin
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -211,7 +216,7 @@ fi
 if [ "$deps_mode" = pin ]; then
     while read -r c d u; do
         [ -n "$c" ] || continue
-        echo "run.sh: $c declares git dep '$d' ($u), which the repo's own mach.lock does not record, so a pinned run cannot resolve it" >&2
+        echo "run.sh: $c declares git dep '$d' ($u), which this repo does not itself realize at dep/$d, so a pinned run cannot resolve it" >&2
         preflight_fails=$((preflight_fails + 1))
     done <<EOF
 $(unpinnable_deps)
@@ -220,12 +225,19 @@ fi
 [ "$preflight_fails" -eq 0 ] || exit 2
 echo "preflight: $preflight_checked case x leg pair(s) declare their target block"
 
-# the run's own float resolution, one line per git dep: "<name> <url> <ref> <commit>".
+# the run's own resolution, one line per git dep: "<name> <url> <ref> <commit>".
 # written by record_run_deps once the first case resolves, read by prepare_case_deps
 # for every case after it. truncated per run, so a run never inherits the previous
 # run's resolution - float still tracks the tip, it just does so once (#2619).
 run_deps=$out/run-deps.txt
 : >"$run_deps"
+
+# where the run keeps the checkout every later case is seeded from. under float it is
+# whatever the first case's `mach dep pull` produced; under pin it is this repo's own
+# realized dep/<name>. either way a case after the first reaches no network.
+dep_cache=$out/dep-cache
+rm -rf "$dep_cache"
+mkdir -p "$dep_cache"
 
 # what every case actually compiled against, as a file rather than only as a log
 # line: "what did the run that cut this tag build against" is asked after the fact,
@@ -237,94 +249,49 @@ run_dep_commit() {
     awk -v n="$1" '$1 == n { print $4; exit }' "$run_deps"
 }
 
-# case_lock_from <case-dir> <resolver> — write the case's mach.lock, taking each git
-# dep's commit from `<resolver> <name>`. returns 1 when the resolver has no commit
-# for some git dep, naming it in `missing_dep` and leaving no lock behind, so a
-# caller can either fail or fall back to resolving fresh. a case declaring no git dep
-# correctly ends with no lock at all.
-case_lock_from() {
-    dir=$1
-    resolver=$2
-    missing_dep=
-    tmplock=$dir/mach.lock.new
-    echo "# written by test/link/run.sh; not tracked." >"$tmplock"
-    written=0
-    for name in $(case_deps "$dir"); do
-        url=$(dep_field "$dir/mach.toml" "$name" git)
-        if [ -z "$url" ]; then continue; fi
-        commit=$("$resolver" "$name")
-        if [ -z "$commit" ]; then
-            missing_dep=$name
-            rm -f "$tmplock"
-            return 1
-        fi
-        printf '\n[dep.%s]\nurl = "%s"\nref = "%s"\ncommit = "%s"\n' \
-            "$name" "$url" "$(dep_field "$dir/mach.toml" "$name" ref)" "$commit" >>"$tmplock"
-        written=$((written + 1))
-    done
-    if [ "$written" -eq 0 ]; then
-        rm -f "$tmplock" "$dir/mach.lock"
-        return 0
-    fi
-    mv "$tmplock" "$dir/mach.lock"
-}
-
-# prepare_case_deps <case-dir> — settle what the case's `dep pull` will resolve.
+# prepare_case_deps <case-dir> — settle what the case's `dep pull` will find.
 #
-# float removes any lock first, so the ref genuinely resolves fresh. that is not a
-# no-op: `dep pull` HONORS a lock that is present even for a `branch/` ref, so a tree
-# that had ever run pinned would keep resolving that pin silently.
+# a git dep the run has already resolved is seeded from the run's own cache, and
+# `mach dep pull` then finds it realized and fetches nothing (R-DEP-6). only the
+# first case of a float run resolves a ref, and it resolves it through mach.
 prepare_case_deps() {
     dir=$1
-    if [ "$deps_mode" = float ]; then
-        if ! case_lock_from "$dir" run_dep_commit; then
-            rm -f "$dir/mach.lock"
+    for name in $(case_deps "$dir"); do
+        url=$(dep_field "$dir/mach.toml" "$name" git)
+        [ -n "$url" ] || continue
+        if [ -d "$dep_cache/$name" ]; then
+            commit=$(run_dep_commit "$name")
+            seed_case_dep "$dir" "$name" "$dep_cache/$name" "$commit" "$url" || return 1
+            continue
         fi
-        return 0
-    fi
-    case_lock_from "$dir" pin_dep_commit
+        if [ "$deps_mode" = pin ]; then
+            commit=$(pin_dep_commit "$name")
+            [ -n "$commit" ] || return 1
+            seed_case_dep "$dir" "$name" "$(pin_dep_source "$name")" "$commit" "$url" || return 1
+            printf '%s %s %s %s\n' "$name" "$url" "$(dep_field "$dir/mach.toml" "$name" ref)" "$commit" >>"$run_deps"
+            git clone -q --no-checkout "$(pin_dep_source "$name")" "$dep_cache/$name" >/dev/null 2>&1 || return 1
+            continue
+        fi
+        rm -rf "$dir/dep/$name"
+    done
+    return 0
 }
 
 # record_run_deps <case-dir> — remember what this case's `dep pull` resolved, so
-# every later case in the run is handed the same commit. reads the lock `dep pull`
-# just wrote rather than the checked-out tree, so what is recorded is exactly what
-# the compiler decided the ref meant. first writer wins.
+# every later case in the run is handed the same commit, and keep the checkout it
+# produced as the run's local source. first writer wins.
 record_run_deps() {
     dir=$1
-    if [ "$deps_mode" != float ]; then return 0; fi
-    if [ ! -f "$dir/mach.lock" ]; then return 0; fi
     for name in $(case_deps "$dir"); do
         url=$(dep_field "$dir/mach.toml" "$name" git)
-        if [ -z "$url" ]; then continue; fi
-        if [ -n "$(run_dep_commit "$name")" ]; then continue; fi
-        commit=$(lock_commit "$dir/mach.lock" "$name")
-        if [ -z "$commit" ]; then continue; fi
-        printf '%s %s %s %s\n' \
-            "$name" "$url" "$(dep_field "$dir/mach.toml" "$name" ref)" "$commit" >>"$run_deps"
-    done
-}
-
-# dep_commits <case-dir> [full] — "name@sha" per git dep checked out under a case's
-# dep/, ground-truthed from the CHECKOUT rather than from mach.lock: the lock is the
-# RECORD of a resolution and the checkout is the entity that was compiled against,
-# and #2387 was a case where those disagreed. a disagreement prints
-# "name@<checkout>!lock=<locked>" rather than silently trusting either one.
-dep_commits() {
-    dir=$1
-    fmt=${2:-short}
-    [ -d "$dir/dep" ] || return 0
-    for depdir in "$dir"/dep/*/; do
-        [ -d "${depdir}.git" ] || [ -f "${depdir}.git" ] || continue
-        name=$(basename "$depdir")
-        full=$(git -C "$depdir" rev-parse HEAD 2>/dev/null) || continue
-        short=$(git -C "$depdir" rev-parse --short HEAD 2>/dev/null) || continue
-        if [ "$fmt" = full ]; then head=$full; else head=$short; fi
-        locked=$(lock_commit "$dir/mach.lock" "$name")
-        if [ -n "$locked" ] && [ "$locked" != "$full" ]; then
-            printf '%s@%s!lock=%s ' "$name" "$head" "$(printf '%s' "$locked" | cut -c1-7)"
-        else
-            printf '%s@%s ' "$name" "$head"
-        fi
+        [ -n "$url" ] || continue
+        [ -n "$(run_dep_commit "$name")" ] && continue
+        [ -d "$dir/dep/$name/.git" ] || continue
+        commit=$(git -C "$dir/dep/$name" rev-parse HEAD 2>/dev/null) || continue
+        [ -n "$commit" ] || continue
+        printf '%s %s %s %s\n' "$name" "$url" "$(dep_field "$dir/mach.toml" "$name" ref)" "$commit" >>"$run_deps"
+        rm -rf "$dep_cache/$name"
+        git clone -q --no-checkout "$dir/dep/$name" "$dep_cache/$name" >/dev/null 2>&1 || true
     done
 }
 
@@ -333,12 +300,14 @@ dep_commits() {
 # pinned lane was believed to be running when it had never once started.
 deps_banner() {
     if [ "$deps_mode" = float ]; then
-        echo "deps: float - every ref resolved fresh by 'mach dep pull', no lock consulted"
+        echo "deps: float - the run's first case resolves each ref through 'mach dep pull', once"
         return 0
     fi
-    echo "deps: pin - commits taken from the repo's own mach.lock"
-    for name in $(dep_names "$root_lock"); do
-        echo "deps:   mach.lock $name@$(lock_commit "$root_lock" "$name")"
+    echo "deps: pin - commits taken from this repo's own committed gitlinks"
+    for name in $(dep_names "$repo/mach.toml"); do
+        commit=$(pin_dep_commit "$name")
+        [ -n "$commit" ] || continue
+        echo "deps:   gitlink dep/$name@$commit"
     done
 }
 
@@ -412,22 +381,19 @@ for dir in "$here"/cases/*/; do
             rm -rf "$dir/out/link"
             mkdir -p "$dir/out/link"
 
-            # drop the step stamp cache so every `[step]` re-runs for this build.
-            # mach skips a step whose stamp matches and whose outputs all exist, and
-            # neither depends on the compiler, so a stamp an earlier run wrote made
-            # later runs skip the step engine entirely - a case asserting on step
-            # output kept passing against a compiler that could no longer run a step
-            # at all (#2578). the outputs are left alone: with no stamp the step
-            # always runs, and a step that fails is a build failure.
-            rm -rf "$dir/out/.steps"
-
             # normally the from-source compiler itself. a self-host case first
             # cross-builds that compiler to the leg's target and drives it under the
             # leg's engine, so the case is compiled by the target-hosted compiler -
             # the coverage running produced binaries can never reach.
+            #
+            # that cross-build's project is the REPO, and `-o` names a path inside
+            # the project root, so it cannot land in a mktemp directory. it goes
+            # under the case's own out/link/, which this loop already creates and
+            # removes per cell, and is therefore cleaned with the rest of the cell.
             buildcc=$compiler
+            selfhost_rel=${dir#"$repo"/}/out/link/selfhostcc$exe
             if [ -n "$case_self_host" ]; then
-                if ! (cd "$repo" && "$compiler" build . --target "$case_self_host" --profile "$profile" -o "$tmp/selfhostcc") >"$tmp/selfhost.log" 2>&1; then
+                if ! (cd "$repo" && "$compiler" build . --target "$case_self_host" --profile "$profile" -o "$selfhost_rel") >"$tmp/selfhost.log" 2>&1; then
                     echo "FAIL $label (self-host cross-build)"
                     sed 's/^/    /' "$tmp/selfhost.log" >&2
                     fails=$((fails + 1))
@@ -436,8 +402,8 @@ for dir in "$here"/cases/*/; do
                     continue
                 fi
                 case "$engine" in
-                    qemu:*) buildcc="${engine#qemu:} $tmp/selfhostcc" ;;
-                    *)      buildcc=$tmp/selfhostcc ;;
+                    qemu:*) buildcc="${engine#qemu:} $repo/$selfhost_rel" ;;
+                    *)      buildcc=$repo/$selfhost_rel ;;
                 esac
             fi
 
@@ -502,6 +468,21 @@ for dir in "$here"/cases/*/; do
                         continue
                     fi
                 fi
+
+                # a case whose own [step]s built a fixture-owned shared library (a
+                # dynamic dependency the case itself produces, never a host system
+                # library) needs the dynamic loader to find it at run time; a
+                # co-located .so under the case's own out tree is never on the
+                # system search path, so its directory joins LD_LIBRARY_PATH here.
+                # reset from base_ld_library_path every time so one case's fixture
+                # .so cannot leak into the next case's run.
+                so_dirs=$(find "$dir/out" -name '*.so*' -exec dirname {} \; 2>/dev/null | sort -u)
+                if [ -n "$so_dirs" ]; then
+                    LD_LIBRARY_PATH=$(printf '%s\n' "$so_dirs" | tr '\n' ':')$base_ld_library_path
+                else
+                    LD_LIBRARY_PATH=$base_ld_library_path
+                fi
+                export LD_LIBRARY_PATH
 
                 if produce "$case_run" "$engine" "$leg" "$bin" "$gbin" "$profile" >"$tmp/out.txt" 2>"$tmp/err.txt"; then
                     prc=0

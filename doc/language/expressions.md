@@ -3,6 +3,12 @@
 Expressions evaluate to values. They appear on the right side of bindings,
 as conditions, and as call arguments.
 
+Reading an aggregate captures its value at that evaluation point. A later
+argument, assignment destination expression, or `fin` body cannot change
+the captured value by modifying its original storage. Call arguments evaluate
+left to right. Assignment evaluates and captures the right side before
+evaluating the destination on the left side.
+
 ## Literals
 
 See [literals.md](literals.md) — numeric, char, string, and `nil` forms.
@@ -30,8 +36,8 @@ val pair: Pair[i64, u8]     = Pair[i64, u8]{ left: 5, right: 6u8 };
 
 For generics, the type arguments appear in brackets before the body.
 
-Vector literals (`f32x4{ ... }`) follow the same shape but depend on the
-SIMD vector types, which are not yet implemented — see [types.md](types.md).
+Vector literals (`f32x4{ 1.0, 2.0, 3.0, 4.0 }`) follow the same shape, one
+initializer per lane — see [types.md](types.md#simd-vectors).
 
 ## Field / index access
 

@@ -15,21 +15,25 @@ pub rec Point { x: i64; y: i64; }
 pub val MAX: i64 = 100;
 ```
 
-Applies to: `fun`, `rec`, `uni`, `def`, `val`, `var`, `ext fun`.
+Applies to: `fun`, `rec`, `uni`, `def`, `val`, `var`, `ext fun`, `ext val`,
+`ext var`.
 
 `fwd` always publishes and does not take an explicit `pub` modifier.
 
 ## `ext`
 
-Declares a function with C ABI as a forward reference — body-less. The
-linker resolves the symbol at link time. Only functions can be `ext`.
+Declares a function or a data binding whose definition lives in another
+object, as a forward reference the linker resolves. An `ext fun` has no body
+and follows the C ABI; an `ext val` / `ext var` has no initializer and no
+storage of its own.
 
 ```mach
 #[symbol("write")]
 pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
+
+ext var errno: i32;
 ```
 
-- `ext fun` declarations have no body.
 - The C ABI is the contract; argument and return types must be
   representable in C.
 - Use the `#[symbol("real_name")]` decorator to override the linker name.
@@ -41,4 +45,5 @@ declarations do not exist.
 
 - [fun.md](fun.md) — regular function declarations
 - [ext-fun.md](ext-fun.md) — full reference for `ext fun`
-- [comptime-attrs.md](comptime-attrs.md) — `.symbol` and other attributes
+- [val-var.md](val-var.md#ext--foreign-data-imports) — `ext val` / `ext var`
+- [decorators.md](decorators.md) — `#[symbol]` and the other decorators

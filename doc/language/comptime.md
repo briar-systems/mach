@@ -34,7 +34,7 @@ The parser distinguishes these by structure:
 | Root | Reads | Source |
 |---|---|---|
 | `$mach.*` | resolved build os/arch/abi/mode tags, pointer width, compiler identity | active build + compiler |
-| `$project.{id,version,name,description}` | project metadata | `[project]` in `mach.toml` |
+| `$project.{id,version}` | project metadata | `[project]` in `mach.toml` |
 | `$project.version.{major,minor,patch}` | structured version components | `[project].version` |
 | `$project.target.{os,arch,abi}` | the selected target's declared tuple, as strings | the selected `mach.toml` target |
 | `$bin.name` | the artifact being built | the selected build unit (`[artifact.*]`) |
@@ -43,11 +43,11 @@ The parser distinguishes these by structure:
 (`"linux"`, `"x86_64"`, `"sysv64"`), distinct from `$mach.build.*`'s numeric tags
 used for `$mach.{os,arch,abi}.*` comparison. Flat `$project.version` is the whole
 version **string** (`"2.0.0"`); the structured `$project.version.{major,minor,
-patch}` folds its integer components — both are available. A root field the
-manifest does not declare (`$project.description` on a v1 manifest, `$bin.name`
-on a v1 manifest with no artifact stanza) reports the read as unavailable rather
-than folding to an empty string. See [comptime-mach.md](comptime-mach.md) for the
-`$mach.*` subtree.
+patch}` folds its integer components — both are available. `[project]` has
+exactly the keys `id`, `version`, `src`, and `out`
+([manifest.md](../manifest.md#project)), so `$project.name` and
+`$project.description` do not exist and are compile errors. See
+[comptime-mach.md](comptime-mach.md) for the `$mach.*` subtree.
 
 ```mach
 val ver: str = $project.version;                 # "2.0.0", from [project].version

@@ -35,7 +35,7 @@ secret however its other operand is spelled — so `v << 3` on a secret `v` stil
 yields a secret, while the constant `3` is not mistaken for a secret shift
 count.
 
-The reverse never happens implicitly. The only downgrade is the explicit `:^`
+The reverse never happens implicitly. The only downgrade is the explicit `:>T`
 strip below.
 
 ## Join
@@ -143,18 +143,24 @@ Note that a walk which skips a secret field is pinned by the flow rules rather
 than by convention — reading one into a public accumulator does not compile, so a
 walk that gates wrongly is a compile error, not a silent disclosure.
 
-## Downgrade with `:^`
+## Downgrade with `:>T`
 
-`:^` is the only way to remove `^`. It produces a new public value and never
-reinterprets storage in place:
+`:>T` is the only way to remove `^`. It produces a new public value and never
+reinterprets storage in place, and it always names the public type it lands on:
 
 ```mach
-fun publish(a: ^u32) u32 { ret a:^; }       # bare strip
-fun publish2(a: ^u32) u32 { ret a:^u32; }   # explicit target names the public type
+fun publish(a: ^u32) u32 { ret a:>u32; }
+fun publish2(a: ^*u8) *u8 { ret a:>*u8; }
 ```
 
-`:^` peels exactly the outer qualifier, so it can never launder a welded pointee
-(`*^T` stays `*^T`). `::` and `:~` may neither add nor drop `^`.
+`:>T` peels exactly the outer qualifier, so it can never launder a welded pointee
+(`*^T` stays `*^T`). `::` and `:~` may neither add nor drop `^`. Promotion needs
+no operator of its own: a public value coerces up to secret implicitly, and a
+cast to a secret type (`x::^u16`) is an ordinary cast.
+
+The older spellings `:^` (bare, no target) and `:^T` mean the same thing and are
+accepted through 4.30.0. They are rejected in 5.0.0 with a diagnostic naming
+`:>T`, so new code writes `:>T`.
 
 ## Welded-storage pointers
 
@@ -322,7 +328,7 @@ The zeroizing-write guarantee is separate and broader; it is described below.
 A secret-taint bit is threaded from sema's flow typing through IR and MIR to the
 emitted instruction stream, preserved across every value replacement, inline
 clone, instruction selection, and register-allocator copy. The one place taint
-stops is the declassify barrier a `:^` cast lowers to. Secret-free code carries
+stops is the declassify barrier a `:>T` cast lowers to. Secret-free code carries
 no taint and compiles byte-identically.
 
 A function instance that **computes** on a secret must carry `#[oblivious]`; one
@@ -394,7 +400,7 @@ code for a machine target and pass such a target only public data.
 
 ## Trusted base
 
-The only secret-to-public crossings are the explicit `:^` cast and inline `asm`
+The only secret-to-public crossings are the explicit `:>T` cast and inline `asm`
 blocks (which a type system cannot check). Everything else is enforced. A proof
 is always relative to a leakage model. Its fidelity to real silicon is
 empirical.
@@ -511,11 +517,18 @@ What does not hold — the known open holes:
   rule rejects those instantiations either way — but it is the reason a
   `Result[^u32, u32]` built before that rule landed leaked nothing at run time
 
-The validator's scope is the lowered MIR; it trusts instruction selection, width
-legalization, register allocation, and encoding to be timing-preserving.
-Validation of the emitted machine code is future work. Where mach does not own
-those stages at all — a whole-module emitter such as SPIR-V — the contract is
-refused rather than assumed.
+**Where the check runs.** Through 5.0.0 the constant-time contract is checked
+at the **IR level**: the validator runs over the lowered, target-independent
+MIR before width legalization, instruction selection, register allocation,
+spilling, frame insertion, and encoding, and trusts those stages to be
+timing-preserving. What it refuses, it refuses closed: an operation it does not
+know, an out-of-range register reference, and inline assembly without a
+complete effect declaration are rejected, never defaulted to public. A proof
+over the final allocated machine program — after selection, allocation, spills
+and frame insertion, over physical registers and flags — is planned additive
+work past 5.0.0, not something this version claims. Where mach does not own
+the later stages at all — a whole-module emitter such as SPIR-V — the contract
+is refused rather than assumed.
 
 ## See also
 
@@ -523,4 +536,4 @@ refused rather than assumed.
 - [comptime-intrinsics.md](comptime-intrinsics.md) — `$is_secret` and the rest of the type-predicate family
 - [operators.md](operators.md) — the `::` / `:~` casts that preserve secrecy
 - [decorators.md](decorators.md) — the `#[oblivious]` decorator reference
-- [grammar.md](grammar.md) — the formal grammar of `^` and `:^`
+- [grammar.md](grammar.md) — the formal grammar of `^` and `:>T`

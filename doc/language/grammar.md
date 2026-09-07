@@ -51,7 +51,7 @@ token ::= IDENT
 punctuation ::= "(" | ")" | "{" | "}" | "[" | "]"
               | ";" | ":" | "," | "." | "?" | "@" | "$" | "`"
               | "#["    (* attribute-open: "#" immediately followed by "[" *)
-              | "::" | ":~" | ":^" | "..."
+              | "::" | ":~" | ":^" | ":>" | "..."
 
 operator ::= "+" | "-" | "*" | "/" | "%"
            | "&" | "|" | "^" | "~"
@@ -66,11 +66,14 @@ Notes:
   tokens; the parser recognizes them contextually by their text
   (`at_kw` / `eat_kw` in `parser/state.mach`). The same applies to the
   primitive type names and `nil`.
-- The maximal-munch multi-character operators are `::`, `:~`, `:^`, `...`,
-  `==`, `!=`, `<=`, `<<`, `>=`, `>>`, `&&`, `||`. A leading `:` lexes as `::`,
-  `:~`, or `:^` before a bare `:`, so `expr:~Type` is one cast, never `:` then
-  `~`. A space after the annotation colon (`k: ^[32]u8`) keeps `:` and `^`
-  separate, the same adjacency rule `::`/`:~` rely on.
+- The maximal-munch multi-character operators are `::`, `:~`, `:^`, `:>`,
+  `...`, `==`, `!=`, `<=`, `<<`, `>=`, `>>`, `&&`, `||`. A leading `:` lexes as
+  `::`, `:~`, `:^`, or `:>` before a bare `:`, so `expr:~Type` is one cast,
+  never `:` then `~`. A space after the annotation colon (`k: ^[32]u8`) keeps
+  `:` and `^` separate, the same adjacency rule `::`/`:~` rely on, so `k: >T`
+  is still `:` then `>`. `:>` can never take a bare `:` away from an existing
+  program: `>` neither begins an expression nor begins a type, so a `:`
+  immediately followed by `>` was a syntax error in every position.
 - The lexer recognizes the standalone characters `=`, `!`, `<`, `>`, `&`,
   `|` and the two-character forms above. There is no `+=`, `-=`, etc. —
   compound assignment does not exist.
@@ -115,18 +118,22 @@ hex-int  ::= "0x" hex-digit { hex-digit | "_" } [ int-suffix ]
 bin-int  ::= "0b" ( "0" | "1" ) { "0" | "1" | "_" } [ int-suffix ]
 oct-int  ::= "0o" oct-digit { oct-digit | "_" } [ int-suffix ]
 
-int-suffix ::= ( "u" | "i" ) { digit }   (* e.g. u8, i64 — width digits *)
+int-suffix ::= "u8" | "u16" | "u32" | "u64"
+             | "i8" | "i16" | "i32" | "i64"
 
 digit     ::= '0'..'9'
 hex-digit ::= digit | 'a'..'f' | 'A'..'F'
 oct-digit ::= '0'..'7'
 ```
 
-A leading `0x` / `0b` / `0o` selects the base; the `u`/`i` width suffix is
-scanned on any non-float integer literal regardless of base (the lexer
-scans the digit run, then — when the token is not a float — accepts a
-trailing `u`/`i` followed by width digits). Underscores are permitted as
-digit separators in every base.
+A leading `0x` / `0b` / `0o` selects the base; the suffix is scanned on any
+non-float integer literal regardless of base. The lexer scans the digit
+run, then — when the token is not a float — takes a trailing `u`, `i` or
+`f` with the digits after it into the same token, so a suffix that names
+no integer type (`7u7`, `1f32`) is diagnosed as a bad literal rather than
+lexed as a number followed by an identifier. Underscores are permitted as
+digit separators in every base. A suffix is the spelling of the type the
+literal has; see [literals.md](literals.md#typed-suffixes).
 
 ### Float literals
 
@@ -137,7 +144,7 @@ LIT_FLOAT ::= digit { digit | "_" }
 
 frac        ::= "." digit { digit | "_" }
 exponent    ::= ( "e" | "E" ) [ "+" | "-" ] digit { digit | "_" }
-float-suffix ::= "f" { digit }              (* e.g. f32, f64 *)
+float-suffix ::= "f32" | "f64"
 ```
 
 A token is a float when it has a fractional part (`.` followed by a digit)
@@ -226,8 +233,10 @@ decorated-decl ::= { decorator } decl
 - Arguments are comptime expressions (not types): `$size_of(T)` is a valid
   argument; `T` as a raw type name is not. A layout intrinsic is accepted on both
   a global's `align` and a record/union type's, see [decorators.md](decorators.md).
-- The closed directive set is `symbol`, `section`, `inline`, `align`,
-  `library`, `oblivious`, `scalar`. See [decorators.md](decorators.md).
+- The directive set is closed and enforced by sema, not the parser; the
+  full list (`symbol`, `library`, `inline`, `noinline`, `align`, `packed`,
+  `section`, `oblivious`, `scalar`, `naked`, `embed`, and the shader and
+  target-type directives) is in [decorators.md](decorators.md).
 - A backtick form (`` `name(args)` ``) existed through v2.3.0 and was removed in
   v2.4.0; a backtick at decorator position is a migration error.
 
@@ -517,17 +526,21 @@ index        ::= "[" expr "]"
 member       ::= "." IDENT
 project      ::= "." "[" expr "]"          (* v.[f]: comptime field projection *)
 cast         ::= ( "::" | ":~" ) type
-              | ":^" [ named-type ]        (* secret-qualifier strip cast *)
+              | ":>" type                  (* secret-qualifier strip cast *)
+              | ":^" [ named-type ]        (* deprecated strip spellings *)
 ```
 
 `::` is a value conversion and `:~` a same-size bit reinterpret; see
 [operators.md](operators.md#cast). Neither `::` nor `:~` may add or drop the
-`^` secret qualifier. `:^` is the only downgrade: it strips `^` from the
+`^` secret qualifier. `:>` is the only downgrade: it strips `^` from the
 operand's type, producing a new public value (#1643, [secrecy.md](secrecy.md)).
-A bare `:^` needs no target, while `:^Type` names the operand's stripped public
-type (`:^` never reinterprets storage). A non-`named-type` lead (`*`, `[`, ...)
-after `:^` leaves a bare strip so it still binds as a multiply/index on the
-stripped value. All three bind as postfix.
+Its target type is required and names the operand's stripped public type; a bare
+`:>` is a parse error, and `:>` never reinterprets storage.
+
+The deprecated spellings `:^` and `:^Type` produce the same node and are
+accepted through 4.30.0, rejected in 5.0.0. A bare `:^` needs no target, and a
+non-`named-type` lead (`*`, `[`, ...) after `:^` leaves a bare strip so it still
+binds as a multiply/index on the stripped value. All bind as postfix.
 
 Disambiguating a postfix `[`: the bracket may open a generic argument list
 (`callee[T, U](args)`, or `f[T]` naming an instance as a value) or be an index
@@ -756,7 +769,7 @@ Productions verified directly against the parser source:
 - **Declarations** — `parser/decl.mach`: `use`, `fwd` (incl. `pub fwd`
   rejection), `fun` (generics, params, variadic `...`, named pack `name: ...`,
   comptime `$` params, optional return type, block-or-`;` body), `rec`, `uni`,
-  `val`/`var` (both annotations optional), `def`, `test`, `flags`
+  `val`/`var` (type annotation required; `val x = 42;` is rejected), `def`, `test`, `flags`
   (`pub`/`ext` any order/count), the decl-scope `$if`/`$or` chain, and the
   `comptime-directive` (attribute-write vs. bare directive) form.
 - **Statements** — `parser/decl.mach`: `block`, `if`/`or` chain, `for`
@@ -780,17 +793,16 @@ Doc-only (intended surface, not a distinct parser production):
   strings) — the lexer only treats `\` as "consume next char"; the actual
   escape set is decoded in `comptime.eval_lit_char` / string lowering and
   documented in [literals.md](literals.md).
-- The closed ISA-tag set (`x86_64`, `aarch64`) and the closed `$mach.*`
-  tag/path set — the parser accepts any `IDENT` / `$`-chain; the closed
-  sets are enforced later (see [asm.md](asm.md),
+- The closed ISA-tag set (`x86_64`, `aarch64`, `riscv64`, `riscv32`) and the
+  closed `$mach.*` tag/path set — the parser accepts any `IDENT` / `$`-chain;
+  the closed sets are enforced later (see [asm.md](asm.md),
   [comptime-mach.md](comptime-mach.md)).
 - The closed intrinsic set (`$size_of`, `$length_of`, `$align_of`, `$offset_of`,
   `$type_of`, `$fields`, `$is_record`, `$is_union`, `$is_pointer`, `$is_secret`,
   `$type_name`, `$error`) — syntactically indistinguishable from any other
   `comptime-ident` call.
-- The closed decorator directive set (`symbol`, `library`, `inline`, `align`,
-  `section`) — the parser accepts any `IDENT` after `#[`; sema enforces the
-  closed set.
+- The closed decorator directive set ([decorators.md](decorators.md)) — the
+  parser accepts any `IDENT` after `#[`; sema enforces the closed set.
 
 Divergences flagged inline:
 

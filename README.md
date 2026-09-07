@@ -13,7 +13,10 @@ We have an official [Discord](https://discord.com/invite/dfWG9NhGj7)!
 
 Mach is a self hosted, statically-typed, compiled systems language designed to be simple, fast, verbose, and intuitive. Mach was created for projects like compilers, runtimes, operating systems, tooling, and embedded systems -- anywhere performance is a requirement and hidden behavior is a liability. The language is deliberately small and explicit: what you read is what executes, every cost is visible in the code that incurs it.
 
-Mach does not rely on any external dependencies for the compiler or during runtime -- no LLVM, no linking to libc, no system linker or other tools. The entire compiler and all base language features are written in native Mach. 
+The compiler, code generators, and linker are written in native Mach, with no
+LLVM or external assembler or linker. Ordinary Linux programs using the
+standard library need no libc. The standard library uses platform libraries
+where required, including libSystem on Darwin and Windows system DLLs.
 
 Memory is managed manually. There is no garbage collector and no hidden allocation. Memory flows through allocators that you create and pass explicitly, and the standard library is built around that style end to end: anything that allocates takes an allocator, and anything that doesn't never will. 
 
@@ -55,7 +58,9 @@ mach dep pull
 mach build .
 ```
 
-The compiler is written to `out/<target>/bin/mach`, where `<target>` is the selected target name.
+The compiler is written to `out/<target>/<profile>/bin/mach`, or `bin/mach.exe`
+on Windows. A default Linux x86_64 build writes
+`out/linux-x86_64/debug/bin/mach`.
 
 
 # Examples

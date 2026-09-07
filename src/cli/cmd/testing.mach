@@ -1,59 +1,7 @@
-# `mach test` - build one dispatcher executable, run each test as a separate
-# process, and report a per-module roll-up
-#
-# `mach test` compiles the project's `test "..."` blocks into a single
-# executable (the project's transitive code plus a synthesized dispatcher
-# `main` that runs the test selected by a decimal index argument). this command
-# spawns that executable once per test as `<exe> <idx>`, captures each child's
-# output, times it, and reads its exit status - per-test process isolation is
-# unchanged, only the build is shared.
-#
-# the readout is live: each module's roll-up line (`mach.lang.driver  36 ok
-# 41ms`) prints the moment its last test completes, and a module with failures
-# expands each failing test's captured child output, `file:line`, and exit
-# code or signal as it happens. the run ends with a summary that re-lists the
-# failures and reports the run's wall time. a crashing test (a signal) is
-# reported and the run continues, so one SIGSEGV no longer kills the suite.
-# `-v` lists every test under its module header as it completes; `-vv` also
-# prints passing tests' captured output. timing is `chrono.monotonic`; column
-# widths are computed from the collected tests before the run (clamped, so one
-# long name cannot blow out the table); the layout is fixed-width ASCII.
-#
-# tests run in parallel: a sliding window of `--jobs` children (defaulting to
-# the CPUs available to this process; 1 serializes) is kept in flight and
-# reaped with a blocking wait-any. each child's stdout and stderr are bound to
-# a per-test capture file under `log/` beside the dispatcher, so the kernel
-# does the buffering and a chatty test never blocks. a passing test's file is
-# unlinked on reap (retained first under `-vv`); a failing test's file stays
-# for inspection, and its first 64KB surface under the expanded failure along
-# with the exact rerun command. results always render in collection order, so
-# the readout is deterministic regardless of completion order.
-#
-# by default only `test` blocks declared in the current project's own modules are
-# collected; `--include-deps` widens collection to dependency modules too (#1556).
-# `--list` prints the collected tests without building or running them.
-# `--filter <substr>` selects the tests whose name contains the substring; it is
-# applied here at run time, so the built executable is identical regardless of
-# filter. `--jobs <n>` overrides the parallel window width. `--runner <cmd>`
-# launches every test as `<cmd> <exe> <idx>` instead of
-# spawning the executable directly - the host-side launcher for foreign-target
-# artifacts (e.g. wine for a windows target, #1345). absent the flag, the
-# executable is spawned directly and a spawn failure reports exactly that.
-#
-# spawning and output capture go through `std.process`, which is multiplatform
-# (linux, darwin, windows), so the readout behaves identically on every host.
-#
-# `--format json` swaps the human readout for a machine-readable NDJSON event
-# stream (one object per line: `run_start`, one `test` per result, `summary`;
-# `case` per test under `--list`) driven off the same per-test event stream as
-# the human renderer through the `Renderer` vtable. the schema is versioned in
-# `doc/tooling/test-json.md`; `std.data.json` owns the ASCII-safe encoding.
-
 use std.allocator.arena;
 use std.allocator.page;
 use std.print;
 use std.process.env;
-use std.process.exec;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -63,6 +11,8 @@ use std.types.path;
 use std.types.string.str_contains;
 use std.types.string.str_equals;
 use std.types.string.str_len;
+use std.text.string.str_dup;
+use std.text.string.str_free;
 
 use A:   std.allocator;
 use O:   std.types.option;
@@ -83,67 +33,48 @@ use mach.lang.build.engine;
 use mach.lang.build.plan;
 use mach.lang.build.outcome;
 use mach.lang.build.request;
+use btest: mach.lang.build.testing;
 use mach.lang.session;
+use mach.lang.validation;
+use mach.subprocess;
+use cnc: std.sync.cancel;
+use std.process.events;
 
-# a test that passed
-val KIND_PASS:   u8 = 0;
-# a test that exited with a non-zero code (`code` carries it)
-val KIND_EXIT:   u8 = 1;
-# a test killed by a signal (`code` carries the signal number)
-val KIND_SIGNAL: u8 = 2;
-# a test whose executable could not be spawned
-val KIND_SPAWN:  u8 = 3;
-# a test that neither exited nor signaled (should not occur)
-val KIND_OTHER:  u8 = 4;
-# a test not yet finalized; the render cursor never crosses one
-val KIND_PENDING: u8 = 5;
-
-# the machine-readable output schema version stamped on every JSON event; bump
-# it on any incompatible change to the event shapes (see doc/tooling/test-json.md)
 val SCHEMA_VERSION: i64 = 1;
 
-# most retained bytes per test from its capture file; a file holding more is
-# retained truncated (the file itself keeps the full output)
 val CAP_OUTPUT: usize = 65536;
 
-# the result of running one test
-#
-# `out` retains the captured child output for a failing test (and for a
-# passing one under `-vv`), read back from the test's capture file; it is
-# owned by the run allocator.
-# ---
-# art:       the built test artifact (borrowed; owned by the run allocator)
-# kind:      a KIND_* outcome
-# code:      exit code (KIND_EXIT) or signal number (KIND_SIGNAL); 0 otherwise
-# elapsed:   wall time of the child process
-# out:       retained captured stdout, or nil when the test passed or wrote none
-# out_len:   bytes stored in `out`
-# truncated: the child wrote more than the capture buffer held
 rec Outcome {
     art:       *outcome.TestArtifact;
-    kind:      u8;
+    done:      bool;
+    result:    validation.ValidationGateResult;
     code:      i32;
     elapsed:   du.Duration;
     out:       *u8;
     out_len:   usize;
     truncated: bool;
+    bound:     i64;
 }
 
-# `mach test` subcommand entry: build one executable per test, run each as its
-# own process, and report the results
-#
-# Called by cmd.dispatch.
+# `mach test`: build the project's test dispatcher and run the collected tests. `-O1` and
+# `--emit` are refused; `--list` prints the collected tests and stops; `--format json`
+# writes the machine-readable event stream; `--filter`, `--runner`, `--timeout_seconds`,
+# and `--jobs` shape the run
 # ---
-# argc:  argument count including argv[0]
-# argv:  argument vector of argc null-terminated byte pointers
-# marks: consumption record parallel to argv, for the unknown-flag rejector
-# ret:   0 if all selected tests passed, 1 if any failed, 2 on a build or internal error
-pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
-    # config.parse marks the cross-cutting flags and validates the `-v`/`--quiet`
-    # exclusion; `mach test` also accepts every build flag plus its own. mark them
-    # all, then reject any unrecognized flag before the build runs, so an unknown
-    # flag never slips through the shared build body.
-    val res_cfg: R.Result[args.CliArgs, str] = args.parse(argc, argv);
+# argv: the full process arguments
+# inv: the parsed invocation for this command
+# ret: 0 every test passed, 1 a usage error, a build user error, or at least one failed
+#  test, 2 an internal or infrastructure failure or out of memory, 3 an environment
+#  failure during the build
+pub fun run_typed(argv: **u8, inv: *args.ParsedInvocation) i64 {
+    val cmd: args.CommandId = args.CMD_TEST;
+
+    if (util.flag_exists(inv.argc, argv, "--emit")) {
+        print.eprint("error: --emit is not applicable to 'test'; test always builds its internal test dispatcher\n");
+        ret 1;
+    }
+
+    val res_cfg: R.Result[args.CliArgs, str] = args.build_cli_invocation(cmd, inv, argv);
     if (R.is_err[args.CliArgs, str](res_cfg)) {
         print.eprint("error: ");
         print.eprint(R.unwrap_err[args.CliArgs, str](res_cfg));
@@ -152,31 +83,15 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
     }
     var config: args.CliArgs = R.unwrap_ok[args.CliArgs, str](res_cfg);
 
-    # mark the flags `mach test` accepts from their tables - the cross-cutting set
-    # (`parse` read their values), the `-O` override, the build-flow inputs, and
-    # test's own - then read their values and reject any unrecognized flag before
-    # the build runs. `--include-deps` is captured into the request (via
-    # collect_build) where it scopes collection.
-    args.mark_cross(marks, argc, argv);
-    args.mark_flags(marks, argc, argv, ?args.OPT[0], args.OPT_N);
-    args.mark_flags(marks, argc, argv, ?args.EMIT[0], args.EMIT_N);
-    args.mark_flags(marks, argc, argv, ?args.JOBS[0], args.JOBS_N);
-    args.mark_flags(marks, argc, argv, ?args.LINKIN[0], args.LINKIN_N);
-    args.mark_flags(marks, argc, argv, ?args.TEST_OWN[0], args.TEST_OWN_N);
-    val list:       bool          = util.flag_exists(argc, argv, "--list");
-    val opt_format: O.Option[*u8] = util.flag_value(argc, argv, "--format");
-    val opt_jobs:   O.Option[*u8] = util.flag_value(argc, argv, "--jobs");
-    val opt_filter: O.Option[*u8] = util.flag_value(argc, argv, "--filter");
-    val opt_runner: O.Option[*u8] = util.flag_value(argc, argv, "--runner");
-    if (util.flag_reject_unknown(argc, argv, marks, 2, "mach test")) { ret 1; }
+    val list:       bool          = args.invocation_flag(cmd, inv, "--list");
+    val opt_format: O.Option[*u8] = args.invocation_value(cmd, inv, argv, "--format");
+    val opt_filter: O.Option[*u8] = args.invocation_value(cmd, inv, argv, "--filter");
+    val opt_runner: O.Option[*u8] = args.invocation_value(cmd, inv, argv, "--runner");
+    val opt_timeout: O.Option[*u8] = args.invocation_value(cmd, inv, argv, "--timeout_seconds");
+    if (args.reject_unknown_from_invocation(inv, argv, "mach test")) { ret 1; }
 
-    # verbosity comes from the shared config (`-v`/`-vv`; `--verbose` was dropped in
-    # #1775): `-v` lists every test as it completes, `-vv` also prints passing output.
     val level: u8 = config.verbosity;
 
-    # `--format json` selects the machine-readable NDJSON event stream (one JSON
-    # object per line, no human readout); `human` (the default) keeps the live
-    # readout. an unrecognized value is a usage error.
     var json_out: bool = false;
     if (O.is_some[*u8](opt_format)) {
         val fv: str = O.unwrap[*u8](opt_format)::str;
@@ -188,11 +103,19 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         }
     }
 
-    # `--jobs <n>` bounds how many test children run at once; the default is
-    # the CPUs available to this process, and 1 serializes.
+    var timeout_seconds: i64 = 0;
+    if (O.is_some[*u8](opt_timeout)) {
+        val tv: i64 = parse_count(O.unwrap[*u8](opt_timeout));
+        if (tv < 1) {
+            print.eprint("error: --timeout_seconds expects a positive integer number of seconds\n");
+            ret 1;
+        }
+        timeout_seconds = tv;
+    }
+
     var jobs: u32 = 1;
-    if (O.is_some[*u8](opt_jobs)) {
-        val jv: i64 = parse_count(O.unwrap[*u8](opt_jobs));
+    if (config.jobs != nil) {
+        val jv: i64 = parse_count(config.jobs);
         if (jv < 1) {
             print.eprint("error: --jobs expects a positive integer\n");
             ret 1;
@@ -204,11 +127,6 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         if (nc > 1) { jobs = nc::u32; }
     }
 
-    # back the build with an arena over a page allocator, matching `mach build`.
-    # the build's internal teardown frees through this allocator; the page
-    # allocator would munmap each block individually, unmapping the page a test
-    # executable path lives in before we exec it. the arena defers all reclamation
-    # to a single `arena.dnit`, keeping every artifact path mapped until we are done.
     var backing: A.Allocator;
     if (O.is_some[str](page.make(?backing))) {
         print.eprint("error: failed to initialise allocator\n");
@@ -226,37 +144,29 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         ret 2;
     }
 
-    # resolve the project root from the required positional path
-    # (`mach test <path>`); see util.resolve_project_root for the rules.
-    val pix: usize = util.arg_index_positional(argc, argv, marks, 2);
     var root_arg: *u8 = nil;
-    if (pix < argc) { root_arg = argv[pix]; }
+    if (inv.has_positional) { root_arg = argv[inv.positional_idx]; }
 
-    val root_r: R.Result[str, str] = util.resolve_project_root(?a, root_arg);
-    if (R.is_err[str, str](root_r)) {
+    val loc_r: R.Result[util.ProjectLocation, str] = util.resolve_project_location(?a, root_arg);
+    if (R.is_err[util.ProjectLocation, str](loc_r)) {
         print.eprint("error: ");
-        print.eprint(R.unwrap_err[str, str](root_r));
+        print.eprint(R.unwrap_err[util.ProjectLocation, str](loc_r));
         print.eprint("\n");
         arena.dnit(?ar);
         ret 1;
     }
-    val root: str = R.unwrap_ok[str, str](root_r);
+    val loc: util.ProjectLocation = R.unwrap_ok[util.ProjectLocation, str](loc_r);
+    val root: str = loc.root;
 
-    # capture the build-flow values (`-O`, `--jobs`, `-L` dirs, link tokens,
-    # `--include-deps`) now that the full flag set is marked; past this point
-    # argv is dead to the build flow - the build reads its composed request.
-    val col_r: R.Result[bool, str] = args.collect_build(?a, ?config, argc, argv, marks);
-    if (R.is_err[bool, str](col_r)) {
+    val col_r: R.Result[R.Void, str] = args.collect_link_inputs(?a, ?config, cmd, inv, argv);
+    if (R.is_err[R.Void, str](col_r)) {
         print.eprint("error: ");
-        print.eprint(R.unwrap_err[bool, str](col_r));
+        print.eprint(R.unwrap_err[R.Void, str](col_r));
         print.eprint("\n");
         arena.dnit(?ar);
         ret 2;
     }
 
-    # the test flow's build: compose -> plan -> execute, exactly as `mach build`
-    # runs its units; the goal selects the dispatcher build or the collection
-    # pass, and the outcome carries the test artifacts on this command's arena.
     var goal: request.BuildGoal = request.GOAL_TESTS;
     if (list) { goal = request.GOAL_TEST_LIST; }
 
@@ -270,9 +180,7 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
     }
     val bp: plan.BuildPlan = R.unwrap_ok[plan.BuildPlan, outcome.Fail](plan_r);
 
-    var rctx: cli_diag.RenderCtx;
-    var rd: outcome.Render = cli_diag.render_sink(?rctx, bp.units.len);
-    val ex_r: R.Result[outcome.BuildOutcome, outcome.Fail] = engine.execute(?bp, ?backing, ?a, nil, ?rd);
+    val ex_r: R.Result[outcome.BuildOutcome, outcome.Fail] = engine.execute(?bp, ?backing, ?a, nil);
     session.dnit(?ps);
     if (R.is_err[outcome.BuildOutcome, outcome.Fail](ex_r)) {
         var xf: outcome.Fail = R.unwrap_err[outcome.BuildOutcome, outcome.Fail](ex_r);
@@ -281,7 +189,8 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         ret xc;
     }
     var bo: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](ex_r);
-    if (!bo.ok) {
+    cli_diag.render_outcome(?bo, config.quiet);
+    if (bo.severity != outcome.BUILD_OK) {
         val bc: i64 = cli_diag.outcome_code(?bo);
         arena.dnit(?ar);
         ret bc;
@@ -289,17 +198,11 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
     val built_tests: *outcome.TestArtifact = bo.tests.data;
     val built_len:   u32                   = bo.tests.len::u32;
 
-    # surface any target-gated own-src modules excluded from collection, so the
-    # whole-source test set never drops a module silently (#1873).
     if (bo.tests_skipped > 0) { report_skipped(bo.tests_skipped); }
 
-    # `--filter <substr>` (read above) selects at run time: the dispatcher embeds
-    # every in-scope test, this command runs (or lists) only the matching ones.
     var filter: *u8 = nil;
     if (O.is_some[*u8](opt_filter)) { filter = O.unwrap[*u8](opt_filter); }
 
-    # `--list`: report each selected test with no execution - one `case` JSON
-    # object per test under `--format json`, else `label file:line`.
     if (list) {
         var lw: writer.Writer;
         if (json_out) { lw = fs.writer(fs.STDOUT); }
@@ -318,7 +221,6 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         ret 0;
     }
 
-    # the selected artifacts, in collection order (module runs stay adjacent).
     var selected: *outcome.TestArtifact = nil;
     var sel_len:  u32 = 0;
     if (built_len > 0) {
@@ -339,9 +241,6 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         }
     }
 
-    # `--runner <cmd>` (read above): launch each test as `<cmd> <exe>`. resolved to
-    # a concrete path up front (execve does no PATH search) so a missing runner is
-    # one clean error rather than a FAIL(spawn) per test.
     var runner: *u8 = nil;
     if (O.is_some[*u8](opt_runner)) {
         val name: *u8 = O.unwrap[*u8](opt_runner);
@@ -358,20 +257,19 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         runner = R.unwrap_ok[*u8, str](res_resolve);
     }
 
-    # a filtered run that matched nothing has no work and no failures.
     if (sel_len == 0) {
+        var empty_tally: outcome.GateTally = outcome.gate_tally_init(?a);
         if (json_out) {
             var jc: JsonCtx;
-            var r:  Renderer = json_renderer(?jc, ?a, nil);
-            r.fn_start(r.ctx, nil, 0);
-            r.fn_summary(r.ctx, nil, 0, 0, 0, 0);
+            json_ctx_init(?jc, ?a, nil);
+            json_start(?jc, nil, 0);
+            json_summary(?jc, nil, 0, 0, 0, 0, ?empty_tally);
         }
         or { print.print("0 passed, 0 failed, 0 total  (0ms)\n"); }
         arena.dnit(?ar);
         ret 0;
     }
 
-    # one Outcome per selected test.
     val res_out: R.Result[*Outcome, str] = A.allocate[Outcome](?a, sel_len::usize);
     if (R.is_err[*Outcome, str](res_out)) {
         arena.dnit(?ar);
@@ -380,9 +278,6 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
     }
     val outcomes: *Outcome = R.unwrap_ok[*Outcome, str](res_out);
 
-    # per-test capture files live under `log/` beside the dispatcher. wiping
-    # this build's index range at run start leaves the directory holding only
-    # the failures of the run about to happen.
     val ld_r: R.Result[str, str] = capture_log_dir(?a, selected[0].exe);
     if (R.is_err[str, str](ld_r)) {
         arena.dnit(?ar);
@@ -392,207 +287,228 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
     val log_dir: str = R.unwrap_ok[str, str](ld_r);
     wipe_logs(?a, log_dir, built_len);
 
-    # the human readout and the JSON stream are sibling renderers over the same
-    # per-test event stream; only one is live per run. the human renderer needs
-    # the column widths (computed from the selection, so lines align on the first
-    # write) and the retained per-test output bytes; the JSON stream needs
-    # neither - it emits paths, not inline output - so both are skipped for it.
-    var hc: HumanCtx;
-    var jc: JsonCtx;
-    var r:  Renderer;
-    if (json_out) { r = json_renderer(?jc, ?a, log_dir); }
+    var code: i64 = 0;
+    if (json_out) {
+        var jc: JsonCtx;
+        json_ctx_init(?jc, ?a, log_dir);
+        code = execute_rendered[JsonCtx](?a, selected, sel_len, runner, outcomes, level, jobs,
+                                         log_dir, false, timeout_seconds, ?jc, json_start, json_test,
+                                         json_summary);
+    }
     or {
+        var hc: HumanCtx;
         val mod_w:   usize = module_col_width(selected, sel_len);
         val label_w: usize = label_col_width(selected, sel_len);
-        r = human_renderer(?a, ?hc, level, mod_w, label_w, runner, log_dir);
+        human_ctx_init(?a, ?hc, level, mod_w, label_w, runner, log_dir);
+        code = execute_rendered[HumanCtx](?a, selected, sel_len, runner, outcomes, level, jobs,
+                                          log_dir, true, timeout_seconds, ?hc, human_start, human_test,
+                                          human_summary);
     }
-
-    val run_start: tm.Time = tm.monotonic();
-    r.fn_start(r.ctx, selected, sel_len);
-    execute_and_render(?a, selected, sel_len, runner, outcomes, level, jobs, log_dir, !json_out, ?r);
-    val wall: du.Duration = tm.time_sub(tm.monotonic(), run_start);
-
-    val failed: u32 = count_failed(outcomes, sel_len);
-    val passed: u32 = sel_len - failed;
-    r.fn_summary(r.ctx, outcomes, sel_len, passed, failed, wall);
-
     arena.dnit(?ar);
-    if (failed > 0) { ret 1; }
+    ret code;
+}
+
+fun exit_code(failed: u32, tally: *outcome.GateTally) i64 {
+    if (tally.infrastructure_failure > 0) { ret 2; }
+    if (failed > 0)                       { ret 1; }
     ret 0;
 }
 
-# one in-flight test child
-# ---
-# pid:   the child's process id; 0 marks the slot free
-# art:   the artifact the child is running
-# idx:   index into the selection/outcomes arrays
-# start: monotonic spawn time
-# f:     the capture file, held open until the child is reaped
+fun count_timed_out(outcomes: *Outcome, len: u32) u32 {
+    var t: u32 = 0;
+    var i: u32 = 0;
+    for (i < len) {
+        if (outcomes[i].result.kind == validation.RESULT_RESOURCE_EXHAUSTION
+            && outcomes[i].result.cause == validation.CAUSE_ORACLE_TIMEOUT) { t = t + 1; }
+        i = i + 1;
+    }
+    ret t;
+}
+
+fun build_gate_tally(gt: *outcome.GateTally, a: *A.Allocator, outcomes: *Outcome, n: u32) {
+    var i: u32 = 0;
+    for (i < n) {
+        outcome.record_gate(gt, a, outcomes[i].result);
+        i = i + 1;
+    }
+}
+
+fun execute_rendered[T](a: *A.Allocator, arts: *outcome.TestArtifact, n: u32, runner: *u8,
+                        outcomes: *Outcome, level: u8, jobs: u32, log_dir: *u8,
+                        want_bytes: bool, timeout_seconds: i64, ctx: *T,
+                        fn_start: fun(*T, *outcome.TestArtifact, u32),
+                        fn_test: fun(*T, *Outcome, *outcome.TestArtifact, u32),
+                        fn_summary: fun(*T, *Outcome, u32, u32, u32, du.Duration,
+                                        *outcome.GateTally)) i64 {
+    val run_start: tm.Time = tm.monotonic();
+    fn_start(ctx, arts, n);
+    execute_and_render[T](a, arts, n, runner, outcomes, level, jobs, log_dir, want_bytes,
+                          timeout_seconds, ctx, fn_test);
+    val wall: du.Duration = tm.time_sub(tm.monotonic(), run_start);
+
+    val failed: u32 = count_failed(outcomes, n);
+    val passed: u32 = n - failed;
+    var tally: outcome.GateTally = outcome.gate_tally_init(a);
+    build_gate_tally(?tally, a, outcomes, n);
+    fn_summary(ctx, outcomes, n, passed, failed, wall, ?tally);
+    ret exit_code(failed, ?tally);
+}
+
 rec Slot {
-    pid:   i64;
+    active: bool;
     art:   *outcome.TestArtifact;
     idx:   u32;
     start: tm.Time;
-    f:     fs.File;
 }
 
-# run every selected test through a sliding window of child processes,
-# notifying the renderer as each outcome finalizes, in completion order
-#
-# Up to `jobs` children are in flight at once, each with stdout and stderr
-# bound to its capture file; a blocking wait-any reaps whichever exits first.
-# The renderer's `fn_test` fires the moment an outcome finalizes - in
-# completion order, not collection order - so a live JSON consumer sees each
-# result as it lands and a slow test never head-of-line-blocks the stream. A
-# renderer that wants collection order (the human readout) buffers internally.
-# ---
-# a:          allocator retaining captured output
-# arts:       the selected test artifacts to run, in collection order
-# n:          number of artifacts in `arts`
-# runner:     resolved `--runner` launcher, or nil to exec the dispatcher directly
-# outcomes:   caller-owned array (length n) filled in test order
-# level:      verbosity (0 roll-ups, 1 per-test lines, 2 also passing output)
-# jobs:       window width (1 serializes)
-# log_dir:    the capture-file directory
-# want_bytes: retain each failing test's captured output in memory (the human
-#             readout inlines it; the JSON stream references the file instead)
-# r:          the renderer notified as each outcome finalizes
-fun execute_and_render(a: *A.Allocator, arts: *outcome.TestArtifact, n: u32, runner: *u8,
-                       outcomes: *Outcome, level: u8, jobs: u32, log_dir: *u8,
-                       want_bytes: bool, r: *Renderer) {
+fun execute_and_render[T](a: *A.Allocator, arts: *outcome.TestArtifact, n: u32, runner: *u8,
+                          outcomes: *Outcome, level: u8, jobs: u32, log_dir: *u8,
+                          want_bytes: bool, timeout_seconds: i64, ctx: *T,
+                          fn_test: fun(*T, *Outcome, *outcome.TestArtifact, u32)) {
     var i: u32 = 0;
-    for (i < n) { outcomes[i].kind = KIND_PENDING; i = i + 1; }
+    for (i < n) { outcomes[i].done = false; i = i + 1; }
 
     var window: u32 = jobs;
     if (window < 1) { window = 1; }
     if (window > n) { window = n; }
 
+    val res_processes: R.Result[*subprocess.OwnedSubprocess, str] =
+        A.allocate[subprocess.OwnedSubprocess](a, n::usize);
     val res_slots: R.Result[*Slot, str] = A.allocate[Slot](a, window::usize);
-    if (R.is_err[*Slot, str](res_slots)) {
+    if (R.is_err[*subprocess.OwnedSubprocess, str](res_processes)
+        || R.is_err[*Slot, str](res_slots)) {
         print.eprint("error: out of memory\n");
         i = 0;
         for (i < n) {
             outcomes[i].art       = ?arts[i];
-            outcomes[i].kind      = KIND_OTHER;
+            outcomes[i].done      = true;
+            outcomes[i].result    = btest.classify_setup_failure();
             outcomes[i].code      = 0;
             outcomes[i].elapsed   = 0;
             outcomes[i].out       = nil;
             outcomes[i].out_len   = 0;
             outcomes[i].truncated = false;
+            outcomes[i].bound     = 0;
             i = i + 1;
         }
         i = 0;
-        for (i < n) { r.fn_test(r.ctx, outcomes, arts, i); i = i + 1; }
+        for (i < n) { fn_test(ctx, outcomes, arts, i); i = i + 1; }
         ret;
     }
+    val processes: *subprocess.OwnedSubprocess =
+        R.unwrap_ok[*subprocess.OwnedSubprocess, str](res_processes);
     val slots: *Slot = R.unwrap_ok[*Slot, str](res_slots);
     i = 0;
-    for (i < window) { slots[i].pid = 0; i = i + 1; }
+    for (i < n) { subprocess.init(?processes[i]); i = i + 1; }
+    i = 0;
+    for (i < window) { slots[i].active = false; i = i + 1; }
+
+    var scope: cnc.Scope;
+    cnc.make_root(?scope, false, tm.Time{sec: 0, nsec: 0});
+    var source: events.Source;
+    var has_source: bool = events.make(?source) == 0;
+    var interrupt_source: *events.Source = nil;
+    if (has_source) { interrupt_source = ?source; }
 
     var spawned:  u32 = 0;
     var done:     u32 = 0;
     var inflight: u32 = 0;
 
     for (done < n) {
-        # top the window back up
         for (inflight < window && spawned < n) {
             val idx: u32 = spawned;
             spawned = spawned + 1;
-            if (spawn_one(a, slots, window, ?arts[idx], idx, runner, log_dir)) {
+            val spawn_fail: O.Option[validation.ValidationGateResult] =
+                spawn_one(a, processes, slots, window, ?arts[idx], idx, runner, log_dir,
+                          timeout_seconds);
+            if (O.is_none[validation.ValidationGateResult](spawn_fail)) {
                 inflight = inflight + 1;
             }
             or {
-                # the spawn itself failed, so the outcome is final immediately
                 outcomes[idx].art       = ?arts[idx];
-                outcomes[idx].kind      = KIND_SPAWN;
+                outcomes[idx].done      = true;
+                outcomes[idx].result    = O.unwrap[validation.ValidationGateResult](spawn_fail);
                 outcomes[idx].code      = 0;
                 outcomes[idx].elapsed   = 0;
                 outcomes[idx].out       = nil;
                 outcomes[idx].out_len   = 0;
                 outcomes[idx].truncated = false;
+                outcomes[idx].bound     = 0;
                 done = done + 1;
-                r.fn_test(r.ctx, outcomes, arts, idx);
+                fn_test(ctx, outcomes, arts, idx);
             }
         }
 
         if (inflight > 0) {
-            val wr: R.Result[exec.Reaped, str] = exec.wait_any();
-            if (R.is_err[exec.Reaped, str](wr)) {
-                # nothing reapable despite live children: report each rather
-                # than spinning forever
+            val wr: R.Result[*subprocess.OwnedSubprocess, str] =
+                subprocess.wait_any(a, processes, n, ?scope, interrupt_source);
+            if (R.is_err[*subprocess.OwnedSubprocess, str](wr)) {
                 print.eprint("error: waiting for test children failed\n");
                 var sx: u32 = 0;
                 for (sx < window) {
-                    if (slots[sx].pid != 0) {
+                    if (slots[sx].active) {
                         val eidx: u32 = slots[sx].idx;
-                        fs.close(slots[sx].f);
-                        outcomes[eidx].art       = slots[sx].art;
-                        outcomes[eidx].kind      = KIND_OTHER;
-                        outcomes[eidx].code      = 0;
-                        outcomes[eidx].elapsed   = 0;
-                        outcomes[eidx].out       = nil;
-                        outcomes[eidx].out_len   = 0;
-                        outcomes[eidx].truncated = false;
-                        slots[sx].pid = 0;
+                        var cleaned: bool = false;
+                        val one: R.Result[subprocess.SubprocessTerminal, str] =
+                            subprocess.wait(a, ?processes[eidx]);
+                        if (R.is_ok[subprocess.SubprocessTerminal, str](one)) { cleaned = true; }
+                        or {
+                            val canceled: R.Result[subprocess.SubprocessTerminal, str] =
+                                subprocess.cancel(a, ?processes[eidx], 0);
+                            if (R.is_ok[subprocess.SubprocessTerminal, str](canceled)) { cleaned = true; }
+                        }
+                        if (cleaned) {
+                            finalize_slot(a, ?processes[eidx], ?slots[sx], outcomes,
+                                          level, want_bytes, log_dir);
+                        }
+                        or {
+                            subprocess.abandon_capture(?processes[eidx]);
+                            subprocess.dnit(a, ?processes[eidx]);
+                            outcomes[eidx].art       = slots[sx].art;
+                            outcomes[eidx].done      = true;
+                            outcomes[eidx].result    = btest.classify_wait_failure();
+                            outcomes[eidx].code      = 0;
+                            outcomes[eidx].elapsed   = 0;
+                            outcomes[eidx].out       = nil;
+                            outcomes[eidx].out_len   = 0;
+                            outcomes[eidx].truncated = false;
+                            outcomes[eidx].bound     = 0;
+                        }
+                        slots[sx].active = false;
                         inflight = inflight - 1;
                         done = done + 1;
-                        r.fn_test(r.ctx, outcomes, arts, eidx);
+                        fn_test(ctx, outcomes, arts, eidx);
                     }
                     sx = sx + 1;
                 }
             }
             or {
-                # a pid not in the window is a reparented grandchild; it is not
-                # a test result, so it does not account against the run.
-                val reaped: exec.Reaped = R.unwrap_ok[exec.Reaped, str](wr);
-                val pid: i64 = reaped.child.pid;
+                val reaped: *subprocess.OwnedSubprocess =
+                    R.unwrap_ok[*subprocess.OwnedSubprocess, str](wr);
                 var sx: u32 = 0;
                 for (sx < window) {
-                    if (slots[sx].pid == pid) {
+                    if (slots[sx].active) {
                         val fidx: u32 = slots[sx].idx;
-                        finalize_slot(a, ?slots[sx], reaped.status, outcomes, level, want_bytes, log_dir);
-                        slots[sx].pid = 0;
-                        inflight = inflight - 1;
-                        done = done + 1;
-                        r.fn_test(r.ctx, outcomes, arts, fidx);
-                        brk;
+                        if (?processes[fidx] == reaped) {
+                            finalize_slot(a, ?processes[fidx], ?slots[sx], outcomes,
+                                          level, want_bytes, log_dir);
+                            slots[sx].active = false;
+                            inflight = inflight - 1;
+                            done = done + 1;
+                            fn_test(ctx, outcomes, arts, fidx);
+                            brk;
+                        }
                     }
                     sx = sx + 1;
                 }
             }
         }
     }
+
+    if (has_source) { events.close(?source); }
+    cnc.destroy(?scope);
 }
 
-# the run-event renderer: an opaque ctx plus per-event callbacks, so the human
-# readout and the machine-readable JSON stream are sibling consumers of one
-# event stream rather than one scraping the other's text
-# ---
-# ctx:        opaque renderer state handed to each callback
-# fn_start:   run start (selected artifacts, count)
-# fn_test:    one finalized outcome, fired in completion order (outcomes, artifacts, index)
-# fn_summary: run end (outcomes, count, passed, failed, wall time)
-rec Renderer {
-    ctx:        ptr;
-    fn_start:   fun(ptr, *outcome.TestArtifact, u32);
-    fn_test:    fun(ptr, *Outcome, *outcome.TestArtifact, u32);
-    fn_summary: fun(ptr, *Outcome, u32, u32, u32, du.Duration);
-}
-
-# state the human readout carries across its per-test callbacks
-#
-# `fn_test` fires in completion order, so the readout keeps its own `cursor`
-# and renders collection order by advancing across contiguous finalized
-# outcomes from the front on each call.
-# ---
-# level:   verbosity (0 roll-ups, 1 per-test lines, 2 also passing output)
-# mod_w:   module roll-up column width
-# label_w: `-v` label column width
-# runner:  resolved `--runner` launcher, or nil
-# log_dir: the capture-file directory
-# n:       number of selected tests
-# cursor:  index of the next outcome to render in collection order
-# first:   index of the current module's first outcome
 rec HumanCtx {
     a:       *A.Allocator;
     level:   u8;
@@ -605,12 +521,6 @@ rec HumanCtx {
     first:   u32;
 }
 
-# state the JSON stream carries across its per-test callbacks
-# ---
-# a:       allocator for each test's output-reference path
-# log_dir: the capture-file directory, source of each test's output reference
-# n:       number of selected tests
-# w:       the stdout writer the NDJSON lines are emitted through
 rec JsonCtx {
     a:       *A.Allocator;
     log_dir: *u8;
@@ -618,17 +528,8 @@ rec JsonCtx {
     w:       writer.Writer;
 }
 
-# build a human-readout renderer over caller-owned ctx storage
-# ---
-# hc:      the ctx cell the renderer borrows (must outlive the run)
-# level:   verbosity
-# mod_w:   module roll-up column width
-# label_w: `-v` label column width
-# runner:  resolved `--runner` launcher, or nil
-# log_dir: the capture-file directory
-# ret:     a Renderer bound to `hc`
-fun human_renderer(a: *A.Allocator, hc: *HumanCtx, level: u8, mod_w: usize, label_w: usize,
-                   runner: *u8, log_dir: *u8) Renderer {
+fun human_ctx_init(a: *A.Allocator, hc: *HumanCtx, level: u8, mod_w: usize, label_w: usize,
+                   runner: *u8, log_dir: *u8) {
     hc.a       = a;
     hc.level   = level;
     hc.mod_w   = mod_w;
@@ -638,41 +539,16 @@ fun human_renderer(a: *A.Allocator, hc: *HumanCtx, level: u8, mod_w: usize, labe
     hc.n       = 0;
     hc.cursor  = 0;
     hc.first   = 0;
-    var r: Renderer;
-    r.ctx        = hc::ptr;
-    r.fn_start   = human_start;
-    r.fn_test    = human_test;
-    r.fn_summary = human_summary;
-    ret r;
 }
 
-# record the run size; the human readout writes nothing at start
-# ---
-# ctx:  the HumanCtx cell
-# arts: the selected artifacts (unused; the cursor reads them per-test)
-# n:    number of selected tests
-fun human_start(ctx: ptr, arts: *outcome.TestArtifact, n: u32) {
-    val hc: *HumanCtx = ctx::*HumanCtx;
+fun human_start(hc: *HumanCtx, arts: *outcome.TestArtifact, n: u32) {
     hc.n      = n;
     hc.cursor = 0;
     hc.first  = 0;
 }
 
-# advance the human readout across every outcome that has finalized since the
-# last call, rendering the module header, per-test line, and end-of-module
-# roll-up in collection order
-#
-# `idx` (the just-finalized outcome, in completion order) is not read directly:
-# the cursor renders strictly in collection order, crossing an outcome only once
-# every earlier one has also finalized, so the readout stays deterministic.
-# ---
-# ctx:      the HumanCtx cell
-# outcomes: the run outcomes, finalized in place
-# arts:     the selected artifacts, in collection order
-# idx:      the outcome that just finalized (drives the cursor forward)
-fun human_test(ctx: ptr, outcomes: *Outcome, arts: *outcome.TestArtifact, idx: u32) {
-    val hc: *HumanCtx = ctx::*HumanCtx;
-    for (hc.cursor < hc.n && outcomes[hc.cursor].kind != KIND_PENDING) {
+fun human_test(hc: *HumanCtx, outcomes: *Outcome, arts: *outcome.TestArtifact, idx: u32) {
+    for (hc.cursor < hc.n && outcomes[hc.cursor].done) {
         val c: u32 = hc.cursor;
         val mod_name: str = arts[c].module;
         if (hc.level > 0 && c == hc.first) { print.printf("{}\n", mod_name); }
@@ -687,55 +563,25 @@ fun human_test(ctx: ptr, outcomes: *Outcome, arts: *outcome.TestArtifact, idx: u
     }
 }
 
-# render the closing human summary
-# ---
-# ctx:      the HumanCtx cell (unused)
-# outcomes: the run outcomes in test order
-# n:        number of outcomes
-# passed:   number of passing tests
-# failed:   number of failing tests
-# wall:     the run's wall time
-fun human_summary(ctx: ptr, outcomes: *Outcome, n: u32, passed: u32, failed: u32, wall: du.Duration) {
-    render_summary(outcomes, n, passed, failed, wall);
+fun human_summary(hc: *HumanCtx, outcomes: *Outcome, n: u32, passed: u32, failed: u32,
+                  wall: du.Duration, tally: *outcome.GateTally) {
+    render_summary(outcomes, n, passed, failed, wall, tally);
 }
 
-# build a JSON-stream renderer over caller-owned ctx storage
-# ---
-# jc:      the ctx cell the renderer borrows (must outlive the run)
-# a:       allocator for output-reference paths
-# log_dir: the capture-file directory, or nil when no tests will run
-# ret:     a Renderer bound to `jc`
-fun json_renderer(jc: *JsonCtx, a: *A.Allocator, log_dir: *u8) Renderer {
+fun json_ctx_init(jc: *JsonCtx, a: *A.Allocator, log_dir: *u8) {
     jc.a       = a;
     jc.log_dir = log_dir;
     jc.n       = 0;
     jc.w = fs.writer(fs.STDOUT);
-    var r: Renderer;
-    r.ctx        = jc::ptr;
-    r.fn_start   = json_start;
-    r.fn_test    = json_test;
-    r.fn_summary = json_summary;
-    ret r;
 }
 
-# open a JSON event object and write its shared `schema` and `event` members
-# ---
-# w:     the writer to emit through
-# o:     the object state to open
-# event: the event discriminator token
 fun json_event_begin(w: *writer.Writer, o: *json.Object, event: *u8) {
     json.object_begin(w, o);
     json.field_i64(o, "schema", SCHEMA_VERSION);
     json.field_str(o, "event", event);
 }
 
-# emit the `run_start` event
-# ---
-# ctx:  the JsonCtx cell
-# arts: the selected artifacts (unused)
-# n:    number of selected tests
-fun json_start(ctx: ptr, arts: *outcome.TestArtifact, n: u32) {
-    val jc: *JsonCtx = ctx::*JsonCtx;
+fun json_start(jc: *JsonCtx, arts: *outcome.TestArtifact, n: u32) {
     jc.n = n;
     var o: json.Object;
     json_event_begin(?jc.w, ?o, "run_start");
@@ -743,15 +589,8 @@ fun json_start(ctx: ptr, arts: *outcome.TestArtifact, n: u32) {
     json.object_end(?o);
 }
 
-# emit one `test` event for a finalized outcome
-# ---
-# ctx:      the JsonCtx cell
-# outcomes: the run outcomes, finalized in place
-# arts:     the selected artifacts, in collection order
-# idx:      the outcome to emit
-fun json_test(ctx: ptr, outcomes: *Outcome, arts: *outcome.TestArtifact, idx: u32) {
-    val jc:  *JsonCtx            = ctx::*JsonCtx;
-    val o0:  *Outcome            = ?outcomes[idx];
+fun json_test(jc: *JsonCtx, outcomes: *Outcome, arts: *outcome.TestArtifact, idx: u32) {
+    val o0:  *Outcome              = ?outcomes[idx];
     val art: *outcome.TestArtifact = ?arts[idx];
     var o: json.Object;
     json_event_begin(?jc.w, ?o, "test");
@@ -759,14 +598,13 @@ fun json_test(ctx: ptr, outcomes: *Outcome, arts: *outcome.TestArtifact, idx: u3
     json.field_str(?o, "module", art.module);
     json.field_str(?o, "file", art.file);
     json.field_i64(?o, "line", art.line::i64);
-    json.field_str(?o, "kind", kind_name(o0.kind));
+    json.field_str(?o, "kind", result_name(?o0.result));
     json.field_i64(?o, "code", o0.code::i64);
+    json.field_i64(?o, "timeout_seconds", o0.bound);
     json.field_i64(?o, "duration_ns", du.duration_nsec(o0.elapsed));
     json.field_i64(?o, "index", art.idx::i64);
     json.field_str(?o, "exe", art.exe);
-    # `output` references the on-disk capture file when the outcome kept one; a
-    # pass (unlinked) and a spawn failure (never created) have none.
-    if (has_capture(o0.kind)) {
+    if (has_capture(?o0.result)) {
         json.field_str_or_null(?o, "output", json_output_ref(jc, art.idx));
     }
     or {
@@ -775,44 +613,30 @@ fun json_test(ctx: ptr, outcomes: *Outcome, arts: *outcome.TestArtifact, idx: u3
     json.object_end(?o);
 }
 
-# emit the `summary` event
-# ---
-# ctx:      the JsonCtx cell
-# outcomes: the run outcomes (unused)
-# n:        number of outcomes
-# passed:   number of passing tests
-# failed:   number of failing tests
-# wall:     the run's wall time
-fun json_summary(ctx: ptr, outcomes: *Outcome, n: u32, passed: u32, failed: u32, wall: du.Duration) {
-    val jc: *JsonCtx = ctx::*JsonCtx;
+fun json_summary(jc: *JsonCtx, outcomes: *Outcome, n: u32, passed: u32, failed: u32,
+                 wall: du.Duration, tally: *outcome.GateTally) {
     var o: json.Object;
     json_event_begin(?jc.w, ?o, "summary");
     json.field_i64(?o, "passed", passed::i64);
     json.field_i64(?o, "failed", failed::i64);
     json.field_i64(?o, "total", n::i64);
     json.field_i64(?o, "duration_ns", du.duration_nsec(wall));
+    json.field_i64(?o, "mismatch", tally.semantic_mismatch::i64);
+    json.field_i64(?o, "unsupported", tally.unsupported_input::i64);
+    json.field_i64(?o, "target_unavailable", tally.tool_unavailable::i64);
+    json.field_i64(?o, "infrastructure_failure", tally.infrastructure_failure::i64);
+    json.field_i64(?o, "resource_exhaustion", tally.resource_exhaustion::i64);
+    json.field_i64(?o, "timed_out", count_timed_out(outcomes, n)::i64);
+    json.field_i64(?o, "invalid_injection", tally.invalid_injection::i64);
     json.object_end(?o);
 }
 
-# compose the `<log_dir>/<idx>.log` capture path into a freshly allocated buffer
-#
-# Allocating exactly to fit means the reference can never overflow a fixed
-# buffer; the result is owned by the run allocator. nil only on allocation
-# failure (the event then carries `output: null`).
-# ---
-# jc:  the JSON stream state (allocator + capture directory)
-# idx: the test's dispatch index
-# ret: the null-terminated path, or nil on allocation failure
 fun json_output_ref(jc: *JsonCtx, idx: u32) *u8 {
     val r: R.Result[str, str] = log_path(jc.a, jc.log_dir, idx);
     if (R.is_err[str, str](r)) { ret nil; }
     ret R.unwrap_ok[str, str](r);
 }
 
-# emit one `case` event describing a collected test in `--list` mode
-# ---
-# w:   the stdout writer to emit through
-# art: the collected test artifact
 fun emit_list_case(w: *writer.Writer, art: *outcome.TestArtifact) {
     var o: json.Object;
     json_event_begin(w, ?o, "case");
@@ -824,61 +648,35 @@ fun emit_list_case(w: *writer.Writer, art: *outcome.TestArtifact) {
     json.object_end(?o);
 }
 
-# the JSON `kind` token for an outcome kind
-# ---
-# kind: a KIND_* outcome
-# ret:  the stable token ("pass", "exit", "signal", "spawn", "other")
-fun kind_name(kind: u8) *u8 {
-    if (kind == KIND_PASS)   { ret "pass"; }
-    if (kind == KIND_EXIT)   { ret "exit"; }
-    if (kind == KIND_SIGNAL) { ret "signal"; }
-    if (kind == KIND_SPAWN)  { ret "spawn"; }
+fun result_name(r: *validation.ValidationGateResult) *u8 {
+    if (r.kind == validation.RESULT_PASS) { ret "pass"; }
+    if (r.kind == validation.RESULT_SEMANTIC_MISMATCH && r.cause == validation.CAUSE_ORACLE_EXIT)   { ret "exit"; }
+    if (r.kind == validation.RESULT_SEMANTIC_MISMATCH && r.cause == validation.CAUSE_ORACLE_SIGNAL) { ret "signal"; }
+    if (r.kind == validation.RESULT_INFRASTRUCTURE_FAILURE && r.cause == validation.CAUSE_ORACLE_SPAWN_FAILURE) { ret "spawn"; }
+    if (r.kind == validation.RESULT_RESOURCE_EXHAUSTION && r.cause == validation.CAUSE_ORACLE_TIMEOUT) { ret "timeout"; }
     ret "other";
 }
 
-# whether a finalized outcome left its capture file on disk (so its output can
-# be referenced): a reaped non-passing outcome keeps its file, while a pass is
-# unlinked and a spawn failure never created one
-# ---
-# kind: a KIND_* outcome
-# ret:  true when the capture file persists
-fun has_capture(kind: u8) bool {
-    ret kind == KIND_EXIT || kind == KIND_SIGNAL || kind == KIND_OTHER;
+fun has_capture(r: *validation.ValidationGateResult) bool {
+    if (r.kind == validation.RESULT_SEMANTIC_MISMATCH) { ret true; }
+    if (r.kind == validation.RESULT_RESOURCE_EXHAUSTION) { ret true; }
+    ret r.kind == validation.RESULT_INFRASTRUCTURE_FAILURE && r.cause != validation.CAUSE_ORACLE_SPAWN_FAILURE;
 }
 
-# spawn one test child into a free slot, its stdout and stderr bound to its
-# capture file
-#
-# A false return means the child never started (capture-file creation or the
-# spawn failed); the caller records the KIND_SPAWN outcome.
-# ---
-# slots:   the window's slot array
-# window:  number of slots
-# art:     the test to spawn
-# idx:     the test's index in the selection/outcomes arrays
-# runner:  resolved `--runner` launcher, or nil to exec the dispatcher directly
-# log_dir: the capture-file directory
-# ret:     true when the child is running and its slot is filled
-fun spawn_one(a: *A.Allocator, slots: *Slot, window: u32, art: *outcome.TestArtifact, idx: u32,
-              runner: *u8, log_dir: *u8) bool {
+fun spawn_one(a: *A.Allocator, processes: *subprocess.OwnedSubprocess, slots: *Slot,
+              window: u32, art: *outcome.TestArtifact, idx: u32, runner: *u8,
+              log_dir: *u8, timeout_seconds: i64) O.Option[validation.ValidationGateResult] {
     var s: u32 = 0;
-    for (s < window && slots[s].pid != 0) { s = s + 1; }
-    if (s == window) { ret false; }
+    for (s < window && slots[s].active) { s = s + 1; }
+    if (s == window) { ret O.some[validation.ValidationGateResult](btest.classify_setup_failure()); }
 
     val lp_r: R.Result[str, str] = log_path(a, log_dir, art.idx);
-    if (R.is_err[str, str](lp_r)) { ret false; }
+    if (R.is_err[str, str](lp_r)) { ret O.some[validation.ValidationGateResult](btest.classify_setup_failure()); }
     val lp: str = R.unwrap_ok[str, str](lp_r);
-    val res_f: R.Result[fs.File, str] = fs.create(lp, 420);
-    if (R.is_err[fs.File, str](res_f)) { ret false; }
-    var f: fs.File = R.unwrap_ok[fs.File, str](res_f);
 
-    # the test's dispatch index, rendered for the child's argv
     var ibuf: [16]u8;
     write_index(?ibuf[0], 16, art.idx);
 
-    # child argv: [exe, idx] directly, or [runner, exe, idx] under --runner.
-    # argv[0] doubles as the pathname the spawn receives, so a runner needs
-    # no PATH search. the child inherits the parent's environment unmodified.
     var child_argv: [4]*u8;
     if (runner != nil) {
         child_argv[0] = runner;
@@ -893,131 +691,81 @@ fun spawn_one(a: *A.Allocator, slots: *Slot, window: u32, art: *outcome.TestArti
     }
 
     val start: tm.Time = tm.monotonic();
-    val res_c: R.Result[exec.Child, str] =
-        exec.spawn_redirected(child_argv[0], ?child_argv[0], env.environ(), f, f);
-    if (R.is_err[exec.Child, str](res_c)) {
-        fs.close(f);
+    val res_c: R.Result[R.Void, str] = subprocess.spawn_captured_grouped(
+        a, ?processes[idx], child_argv[0], ?child_argv[0], env.environ(), lp, CAP_OUTPUT);
+    if (R.is_err[R.Void, str](res_c)) {
+        val term: subprocess.SubprocessTerminal = processes[idx].terminal;
+        var empty_cap: subprocess.CaptureIoResult;
+        empty_cap.bytes        = 0;
+        empty_cap.truncated    = false;
+        empty_cap.short_read   = false;
+        empty_cap.read_failed  = false;
+        empty_cap.write_failed = false;
+        empty_cap.close_failed = false;
+        empty_cap.closed       = false;
+        empty_cap.owned        = false;
+        val result: validation.ValidationGateResult = btest.classify_subprocess(?term, false, true, ?empty_cap);
+        subprocess.dnit(a, ?processes[idx]);
         fs.remove_file(?lp[0]);
-        ret false;
+        ret O.some[validation.ValidationGateResult](result);
     }
 
-    slots[s].pid   = R.unwrap_ok[exec.Child, str](res_c).pid;
+    if (timeout_seconds > 0) { subprocess.bound_seconds(?processes[idx], timeout_seconds); }
+
+    slots[s].active = true;
     slots[s].art   = art;
     slots[s].idx   = idx;
     slots[s].start = start;
-    slots[s].f     = f;
-    ret true;
+    ret O.none[validation.ValidationGateResult]();
 }
 
-# turn a reaped child's status into its final Outcome
-#
-# Closes the capture file, classifies the wait status, and unlinks a passing
-# test's file so only failures persist in `log/`. When `want_bytes` is set the
-# readout wants the captured output inline, so it is retained (always on
-# failure, on pass under `-vv`); the JSON stream clears it and references the
-# on-disk file instead, so nothing is read into memory.
-# ---
-# a:          allocator retaining captured output
-# slot:       the reaped child's slot
-# st:         the wait status
-# outcomes:   the outcomes array to finalize into
-# level:      verbosity (2 retains passing output)
-# want_bytes: retain the captured output in memory for the readout
-# log_dir:    the capture-file directory
-fun finalize_slot(a: *A.Allocator, slot: *Slot, st: exec.ExitStatus,
+fun finalize_slot(a: *A.Allocator, process: *subprocess.OwnedSubprocess, slot: *Slot,
                   outcomes: *Outcome, level: u8, want_bytes: bool, log_dir: *u8) {
     var o: Outcome;
     o.art       = slot.art;
+    o.done      = true;
     o.code      = 0;
     o.out       = nil;
     o.out_len   = 0;
     o.truncated = false;
     o.elapsed   = tm.time_sub(tm.monotonic(), slot.start);
 
-    fs.close(slot.f);
+    val provisional_pass: bool = process.terminal.kind == subprocess.STATE_EXITED && process.terminal.code == 0;
+    var retain: bool = want_bytes;
+    if (provisional_pass && level < 2) { retain = false; }
 
-    if (exec.exited(st) && exec.code(st) == 0) { o.kind = KIND_PASS; }
-    or (exec.signaled(st)) {
-        # a crash reports the signal and the run continues.
-        o.kind = KIND_SIGNAL;
-        o.code = exec.signal(st);
-    }
-    or (exec.exited(st)) {
-        o.kind = KIND_EXIT;
-        o.code = exec.code(st);
-    }
-    or { o.kind = KIND_OTHER; }
-
-    val lp_r: R.Result[str, str] = log_path(a, log_dir, slot.art.idx);
-    if (R.is_ok[str, str](lp_r)) {
-        val lp: str = R.unwrap_ok[str, str](lp_r);
-        if (o.kind == KIND_PASS) {
-            if (want_bytes && level >= 2) { retain_from_file(a, ?o, lp); }
-            fs.remove_file(lp);
-        }
-        or {
-            if (want_bytes) { retain_from_file(a, ?o, lp); }
+    val capture_r: R.Result[subprocess.CaptureIoResult, str] = subprocess.finish_capture(a, process, retain);
+    var cap_ok: bool = R.is_ok[subprocess.CaptureIoResult, str](capture_r);
+    var capture: subprocess.CaptureIoResult;
+    capture.bytes        = 0;
+    capture.truncated    = false;
+    capture.short_read    = false;
+    capture.read_failed   = false;
+    capture.write_failed  = false;
+    capture.close_failed  = false;
+    capture.closed        = false;
+    capture.owned         = false;
+    if (cap_ok) {
+        capture = R.unwrap_ok[subprocess.CaptureIoResult, str](capture_r);
+        if (retain) {
+            o.out = subprocess.capture_bytes(process, ?o.out_len);
+            o.truncated = capture.truncated;
         }
     }
 
+    o.bound  = 0;
+    if (subprocess.expired(process)) { o.bound = process.timeout_seconds; }
+    o.result = btest.classify_subprocess(?process.terminal, subprocess.expired(process), cap_ok, ?capture);
+    if (o.result.kind == validation.RESULT_SEMANTIC_MISMATCH) { o.code = process.terminal.code; }
+
+    subprocess.dnit(a, process);
+    if (o.result.kind == validation.RESULT_PASS) {
+        val lp_r: R.Result[str, str] = log_path(a, log_dir, slot.art.idx);
+        if (R.is_ok[str, str](lp_r)) { fs.remove_file(R.unwrap_ok[str, str](lp_r)); }
+    }
     outcomes[slot.idx] = o;
 }
 
-# copy up to CAP_OUTPUT bytes of a test's capture file into `a`, marking the
-# outcome truncated when the file holds more
-#
-# Any filesystem or allocation error leaves the outcome without retained
-# output; the result still reports its location and exit status, and a failing
-# test's file stays on disk for direct inspection.
-# ---
-# a:    allocator owning the retained copy
-# o:    the outcome to attach the copy to
-# path: the capture-file path
-fun retain_from_file(a: *A.Allocator, o: *Outcome, path: str) {
-    val res_f: R.Result[fs.File, str] = fs.open(path);
-    if (R.is_err[fs.File, str](res_f)) { ret; }
-    var f: fs.File = R.unwrap_ok[fs.File, str](res_f);
-
-    val res_fi: R.Result[fs.Metadata, str] = fs.stat_of(f);
-    if (R.is_err[fs.Metadata, str](res_fi)) { fs.close(f); ret; }
-    val size: usize = R.unwrap_ok[fs.Metadata, str](res_fi).size;
-
-    var stored: usize = size;
-    if (stored > CAP_OUTPUT) {
-        stored      = CAP_OUTPUT;
-        o.truncated = true;
-    }
-    if (stored == 0) { fs.close(f); ret; }
-
-    val res_buf: R.Result[*u8, str] = A.allocate[u8](a, stored);
-    if (R.is_err[*u8, str](res_buf)) { fs.close(f); ret; }
-    val dst: *u8 = R.unwrap_ok[*u8, str](res_buf);
-
-    var got: usize = 0;
-    for (got < stored) {
-        val res_n: R.Result[usize, str] = fs.read(f, (dst::usize + got)::*u8, stored - got);
-        if (R.is_err[usize, str](res_n)) { brk; }
-        val n: usize = R.unwrap_ok[usize, str](res_n);
-        if (n == 0) { brk; }
-        got = got + n;
-    }
-    fs.close(f);
-
-    if (got == 0) { ret; }
-    o.out     = dst;
-    o.out_len = got;
-}
-
-# render one completed module run under the default readout: the roll-up line,
-# then the expanded detail of each failure in the run
-# ---
-# outcomes: the run outcomes in test order
-# first:    index of the module's first outcome
-# last:     index of the module's last outcome (inclusive)
-# mod_name: the module's fully-qualified name
-# mod_w:    module column width
-# runner:   resolved `--runner` launcher, or nil (for the rerun command)
-# log_dir:  the capture-file directory (for the full-output pointer)
 fun render_module_run(a: *A.Allocator, outcomes: *Outcome, first: u32, last: u32, mod_name: str, mod_w: usize,
                       runner: *u8, log_dir: *u8) {
     var ok:      u32 = 0;
@@ -1025,8 +773,8 @@ fun render_module_run(a: *A.Allocator, outcomes: *Outcome, first: u32, last: u32
     var elapsed: du.Duration = 0;
     var j: u32 = first;
     for (j <= last) {
-        if (outcomes[j].kind == KIND_PASS) { ok = ok + 1; }
-        or                                 { fail = fail + 1; }
+        if (outcomes[j].result.kind == validation.RESULT_PASS) { ok = ok + 1; }
+        or                                                     { fail = fail + 1; }
         elapsed = elapsed + outcomes[j].elapsed;
         j = j + 1;
     }
@@ -1035,18 +783,12 @@ fun render_module_run(a: *A.Allocator, outcomes: *Outcome, first: u32, last: u32
     if (fail > 0) {
         j = first;
         for (j <= last) {
-            if (outcomes[j].kind != KIND_PASS) { print_fail_detail(a, ?outcomes[j], runner, log_dir); }
+            if (outcomes[j].result.kind != validation.RESULT_PASS) { print_fail_detail(a, ?outcomes[j], runner, log_dir); }
             j = j + 1;
         }
     }
 }
 
-# the width of the module roll-up column: the longest selected module FQN,
-# clamped so one deep module tree cannot blow out the table, plus the gutter
-# ---
-# arts: the selected test artifacts
-# n:    number of artifacts
-# ret:  the column width in bytes
 fun module_col_width(arts: *outcome.TestArtifact, n: u32) usize {
     var w: usize = 0;
     var i: u32 = 0;
@@ -1060,12 +802,6 @@ fun module_col_width(arts: *outcome.TestArtifact, n: u32) usize {
     ret w + 2;
 }
 
-# the width of the `-v` label column: the longest label (verbatim, as the
-# test declared it), clamped, plus the gutter
-# ---
-# arts: the selected test artifacts
-# n:    number of artifacts
-# ret:  the column width in bytes
 fun label_col_width(arts: *outcome.TestArtifact, n: u32) usize {
     var w: usize = 0;
     var i: u32 = 0;
@@ -1079,11 +815,6 @@ fun label_col_width(arts: *outcome.TestArtifact, n: u32) usize {
     ret w + 2;
 }
 
-# write `s` padded with trailing spaces to `width`; a value longer than the
-# column still gets the two-space gutter so the next column never touches it
-# ---
-# s:     the column value
-# width: the column width
 fun print_col(s: str, width: usize) {
     print.print(s);
     var pad: usize = 2;
@@ -1093,11 +824,6 @@ fun print_col(s: str, width: usize) {
     for (i < pad) { print.print(" "); i = i + 1; }
 }
 
-# write the two-space gutter, then a duration right-aligned to a seven-byte
-# column (durations end their line, so the shared right edge keeps the table
-# tidy)
-# ---
-# elapsed: the duration to render
 fun print_dur(elapsed: du.Duration) {
     var dbuf: [24]u8;
     val ds: str = du.format_duration(elapsed, ?dbuf[0], 24::usize);
@@ -1108,13 +834,6 @@ fun print_dur(elapsed: du.Duration) {
     print.print(ds);
 }
 
-# write one module's roll-up line: `<module>  <ok> ok[  <fail> FAIL]  <dur>`
-# ---
-# mod_name: the module's fully-qualified name
-# ok:       number of passing tests
-# fail:     number of failing tests
-# elapsed:  summed wall time of the module's tests
-# mod_w:    module column width
 fun print_rollup(mod_name: str, ok: u32, fail: u32, elapsed: du.Duration, mod_w: usize) {
     print_col(mod_name, mod_w);
     if (fail > 0) { print.printf("{:4} ok  {:4} FAIL", ok::i64, fail::i64); }
@@ -1123,13 +842,6 @@ fun print_rollup(mod_name: str, ok: u32, fail: u32, elapsed: du.Duration, mod_w:
     print.print("\n");
 }
 
-# write the expanded detail for one failing test under the default readout:
-# the FAIL line, the captured output, a full-output pointer when the retained
-# copy is truncated, and the exact rerun command
-# ---
-# o:       the failing outcome
-# runner:  resolved `--runner` launcher, or nil
-# log_dir: the capture-file directory
 fun print_fail_detail(a: *A.Allocator, o: *Outcome, runner: *u8, log_dir: *u8) {
     val label: str = o.art.label;
     print.printf("  FAIL  {}  {}:{}  ", label, o.art.file, o.art.line::i64);
@@ -1139,13 +851,6 @@ fun print_fail_detail(a: *A.Allocator, o: *Outcome, runner: *u8, log_dir: *u8) {
     print_fail_pointers(a, o, runner, log_dir);
 }
 
-# write a failing test's trailing pointers: `full output:` when the retained
-# copy is truncated (the capture file holds everything), and the `rerun:`
-# command that reproduces exactly this test
-# ---
-# o:       the failing outcome
-# runner:  resolved `--runner` launcher, or nil
-# log_dir: the capture-file directory
 fun print_fail_pointers(a: *A.Allocator, o: *Outcome, runner: *u8, log_dir: *u8) {
     if (o.truncated) {
         val lp_r: R.Result[str, str] = log_path(a, log_dir, o.art.idx);
@@ -1164,16 +869,9 @@ fun print_fail_pointers(a: *A.Allocator, o: *Outcome, runner: *u8, log_dir: *u8)
     print.print("\n");
 }
 
-# write one test's line under the `-v` readout as it completes, expanding a
-# failure inline; a passing test's retained output (`-vv`) prints beneath it
-# ---
-# o:       the outcome to list
-# label_w: label column width
-# runner:  resolved `--runner` launcher, or nil (for the rerun command)
-# log_dir: the capture-file directory (for the full-output pointer)
 fun print_verbose_test(a: *A.Allocator, o: *Outcome, label_w: usize, runner: *u8, log_dir: *u8) {
     val label: str = o.art.label;
-    if (o.kind == KIND_PASS) {
+    if (o.result.kind == validation.RESULT_PASS) {
         print.print("  ok    ");
         print_col(label, label_w);
         print_dur(o.elapsed);
@@ -1192,24 +890,28 @@ fun print_verbose_test(a: *A.Allocator, o: *Outcome, label_w: usize, runner: *u8
     }
 }
 
-# write a failing outcome's reason token: `(exit N)`, `(signal N)`, or a word
-# ---
-# o: the failing outcome
 fun print_reason(o: *Outcome) {
-    if (o.kind == KIND_EXIT)   { print.printf("(exit {})", o.code::i64); }
-    or (o.kind == KIND_SIGNAL) { print.printf("(signal {})", o.code::i64); }
-    or (o.kind == KIND_SPAWN)  { print.print("(spawn failed)"); }
+    if (o.result.kind == validation.RESULT_RESOURCE_EXHAUSTION && o.result.cause == validation.CAUSE_ORACLE_TIMEOUT) {
+        print.printf("(timed out after {}s)", o.bound);
+    }
+    or (o.result.kind == validation.RESULT_SEMANTIC_MISMATCH && o.result.cause == validation.CAUSE_ORACLE_EXIT) {
+        print.printf("(exit {})", o.code::i64);
+    }
+    or (o.result.kind == validation.RESULT_SEMANTIC_MISMATCH && o.result.cause == validation.CAUSE_ORACLE_SIGNAL) {
+        print.printf("(signal {})", o.code::i64);
+    }
+    or (o.result.kind == validation.RESULT_INFRASTRUCTURE_FAILURE && o.result.cause == validation.CAUSE_ORACLE_SPAWN_FAILURE) {
+        print.print("(spawn failed)");
+    }
+    or (o.result.kind == validation.RESULT_INFRASTRUCTURE_FAILURE && o.result.cause == validation.CAUSE_ORACLE_CAPTURE) {
+        print.print("(capture failed)");
+    }
+    or (o.result.kind == validation.RESULT_INFRASTRUCTURE_FAILURE && o.result.cause == validation.CAUSE_INVALID_TERMINAL) {
+        print.print("(runner failed)");
+    }
     or                         { print.print("(failed)"); }
 }
 
-# write a test's retained stdout, each line indented, then a truncation note
-# when the output overflowed the capture buffer
-#
-# Nothing is written when the test produced no output. The bytes are streamed
-# verbatim through a stdout writer so arbitrary content (not null-terminated)
-# renders faithfully.
-# ---
-# o: the failing outcome
 fun print_captured(o: *Outcome) {
     if (o.out == nil || o.out_len == 0) {
         if (o.truncated) { print.print("    ... (output truncated)\n"); }
@@ -1237,22 +939,14 @@ fun print_captured(o: *Outcome) {
     if (o.truncated) { fmt.write_str(?w, "    ... (output truncated)\n"); }
 }
 
-# write the closing summary: a `failures:` block re-listing each failure, then a
-# `passed/failed/total` count with the run's wall time
-# ---
-# outcomes: the run outcomes in test order
-# len:      number of outcomes
-# passed:   number of passing tests
-# failed:   number of failing tests
-# wall:     the run's wall time (start of first spawn to last completion)
-fun render_summary(outcomes: *Outcome, len: u32, passed: u32, failed: u32, wall: du.Duration) {
+fun render_summary(outcomes: *Outcome, len: u32, passed: u32, failed: u32, wall: du.Duration, tally: *outcome.GateTally) {
     print.print("\n");
 
     if (failed > 0) {
         print.print("failures:\n");
         var i: u32 = 0;
         for (i < len) {
-            if (outcomes[i].kind != KIND_PASS) {
+            if (outcomes[i].result.kind != validation.RESULT_PASS) {
                 print.printf("  {}  {}:{}  ",
                     outcomes[i].art.label,
                     outcomes[i].art.file,
@@ -1267,28 +961,34 @@ fun render_summary(outcomes: *Outcome, len: u32, passed: u32, failed: u32, wall:
 
     var dbuf: [24]u8;
     val ds: str = du.format_duration(wall, ?dbuf[0], 24::usize);
-    print.printf("{} passed, {} failed, {} total  ({})\n", passed::i64, failed::i64, len::i64, ds);
+    val timed_out: u32 = count_timed_out(outcomes, len);
+    if (timed_out > 0) {
+        print.printf("{} passed, {} failed ({} timed out), {} total  ({})\n",
+            passed::i64, failed::i64, timed_out::i64, len::i64, ds);
+    }
+    or {
+        print.printf("{} passed, {} failed, {} total  ({})\n", passed::i64, failed::i64, len::i64, ds);
+    }
+
+    val extra_infra: u32 = tally.unsupported_input + tally.tool_unavailable
+        + tally.resource_exhaustion + tally.invalid_injection;
+    if (extra_infra > 0) {
+        print.printf("  unsupported {}, target unavailable {}, resource exhaustion {}, invalid injection {}\n",
+            tally.unsupported_input::i64, tally.tool_unavailable::i64,
+            tally.resource_exhaustion::i64, tally.invalid_injection::i64);
+    }
 }
 
-# the number of non-passing outcomes
-# ---
-# outcomes: the run outcomes
-# len:      number of outcomes
-# ret:      count of failing tests
 fun count_failed(outcomes: *Outcome, len: u32) u32 {
     var f: u32 = 0;
     var i: u32 = 0;
     for (i < len) {
-        if (outcomes[i].kind != KIND_PASS) { f = f + 1; }
+        if (outcomes[i].result.kind != validation.RESULT_PASS) { f = f + 1; }
         i = i + 1;
     }
     ret f;
 }
 
-# write a test's identifying `label file:line` prefix to stdout, no trailing
-# newline (the `--list` line shape)
-# ---
-# art: the test artifact to describe
 fun artifact_report(art: *outcome.TestArtifact) {
     print.print(art.label::str);
     print.print(" ");
@@ -1297,22 +997,11 @@ fun artifact_report(art: *outcome.TestArtifact) {
     print.u64(art.line::u64);
 }
 
-# whether an artifact passes the `--filter` selection (every artifact when
-# `filter` is nil, else those whose label contains the substring)
-# ---
-# art:    the artifact to check
-# filter: the filter substring, or nil to select everything
-# ret:    true when selected
 fun filter_matches(art: *outcome.TestArtifact, filter: *u8) bool {
     if (filter == nil) { ret true; }
     ret str_contains(art.label, filter);
 }
 
-# print the per-run note that `n` own-source modules were excluded as target-gated
-# (#1873), so the whole-source test set never drops a module silently. Written to
-# stderr, so it never pollutes the `--list` / `--format json` stdout streams
-# ---
-# n: number of excluded modules (only called when non-zero)
 fun report_skipped(n: u32) {
     var buf: [16]u8;
     write_index(?buf[0], 16, n);
@@ -1322,12 +1011,6 @@ fun report_skipped(n: u32) {
     or          { print.eprint(" target-gated modules\n"); }
 }
 
-# write the decimal text of `n` into `buf`, null-terminated (the dispatch
-# index argument handed to the test executable)
-# ---
-# buf: the destination buffer
-# cap: the buffer capacity (must hold the digits plus the terminator)
-# n:   the value to render
 fun write_index(buf: *u8, cap: usize, n: u32) {
     var tmp: [16]u8;
     var t:   usize = 0;
@@ -1339,10 +1022,6 @@ fun write_index(buf: *u8, cap: usize, n: u32) {
     buf[k] = 0;
 }
 
-# parse a positive decimal flag value (the `--jobs` argument)
-# ---
-# s:   the null-terminated value text
-# ret: the parsed value, or -1 when empty, non-decimal, or absurdly large
 fun parse_count(s: *u8) i64 {
     if (s == nil || s[0] == 0) { ret -1; }
     var v: i64 = 0;
@@ -1356,24 +1035,12 @@ fun parse_count(s: *u8) i64 {
     ret v;
 }
 
-# derive the capture-file directory - `log/` beside the dispatcher - from the
-# dispatcher's executable path
-# ---
-# a:   allocator for the result
-# exe: the dispatcher executable path
-# ret: the `<exe dir>/log` path, or an error
 fun capture_log_dir(a: *A.Allocator, exe: *u8) R.Result[str, str] {
     val dir_r: R.Result[str, str] = path.parent(a, exe::str);
     if (R.is_err[str, str](dir_r)) { ret dir_r; }
     ret path.join(a, R.unwrap_ok[str, str](dir_r), "log");
 }
 
-# compose the `<log_dir>/<idx>.log` capture path, allocated from `a`
-# ---
-# a:       allocator for the result
-# log_dir: the capture-file directory
-# idx:     the test's dispatch index
-# ret:     the capture path, or an error
 fun log_path(a: *A.Allocator, log_dir: *u8, idx: u32) R.Result[str, str] {
     var leaf: [24]u8;
     write_index(?leaf[0], 16, idx);
@@ -1386,12 +1053,6 @@ fun log_path(a: *A.Allocator, log_dir: *u8, idx: u32) R.Result[str, str] {
     ret path.join(a, log_dir::str, (?leaf[0])::str);
 }
 
-# remove every capture file this build could have written, so `log/` carries
-# only the run about to happen; the directory is created on the way
-# ---
-# a:       allocator for the transient capture paths
-# log_dir: the capture-file directory
-# total:   the build's dispatch-index count (indices are 0..total-1)
 fun wipe_logs(a: *A.Allocator, log_dir: *u8, total: u32) {
     var idx: u32 = 0;
     for (idx < total) {
@@ -1403,4 +1064,346 @@ fun wipe_logs(a: *A.Allocator, log_dir: *u8, total: u32) {
         }
         idx = idx + 1;
     }
+}
+
+fun t_outcome(kind: validation.ValidationGateResultKind, cause: validation.ValidationCause) Outcome {
+    var art: outcome.TestArtifact;
+    art.module = "m";
+    art.label  = "l";
+    art.file   = "f.mach";
+    art.line   = 1;
+    art.exe    = nil;
+    art.idx    = 0;
+
+    var o: Outcome;
+    o.art       = ?art;
+    o.done      = true;
+    o.result    = validation.gate_result(kind, cause, nil);
+    o.code      = 0;
+    o.elapsed   = 0;
+    o.out       = nil;
+    o.out_len   = 0;
+    o.truncated = false;
+    o.bound     = 0;
+    ret o;
+}
+
+test "mach.cli.cmd.testing.result_name_and_has_capture:cover_every_classified_shape" {
+    var bad: i32 = 0;
+
+    var pass: Outcome = t_outcome(validation.RESULT_PASS, validation.CAUSE_PASS);
+    if (!str_equals(result_name(?pass.result), "pass"))   { bad = 1; }
+    if (has_capture(?pass.result))                        { bad = 1; }
+
+    var ex: Outcome = t_outcome(validation.RESULT_SEMANTIC_MISMATCH, validation.CAUSE_ORACLE_EXIT);
+    if (!str_equals(result_name(?ex.result), "exit"))     { bad = 1; }
+    if (!has_capture(?ex.result))                         { bad = 1; }
+
+    var sig: Outcome = t_outcome(validation.RESULT_SEMANTIC_MISMATCH, validation.CAUSE_ORACLE_SIGNAL);
+    if (!str_equals(result_name(?sig.result), "signal"))  { bad = 1; }
+    if (!has_capture(?sig.result))                        { bad = 1; }
+
+    var spawn: Outcome = t_outcome(validation.RESULT_INFRASTRUCTURE_FAILURE, validation.CAUSE_ORACLE_SPAWN_FAILURE);
+    if (!str_equals(result_name(?spawn.result), "spawn")) { bad = 1; }
+    if (has_capture(?spawn.result))                       { bad = 1; }
+
+    var cap: Outcome = t_outcome(validation.RESULT_INFRASTRUCTURE_FAILURE, validation.CAUSE_ORACLE_CAPTURE);
+    if (!str_equals(result_name(?cap.result), "other"))   { bad = 1; }
+    if (!has_capture(?cap.result))                        { bad = 1; }
+
+    var wait: Outcome = t_outcome(validation.RESULT_INFRASTRUCTURE_FAILURE, validation.CAUSE_INVALID_TERMINAL);
+    if (!str_equals(result_name(?wait.result), "other"))  { bad = 1; }
+    if (!has_capture(?wait.result))                       { bad = 1; }
+
+    var late: Outcome = t_outcome(validation.RESULT_RESOURCE_EXHAUSTION, validation.CAUSE_ORACLE_TIMEOUT);
+    if (!str_equals(result_name(?late.result), "timeout")) { bad = 1; }
+    if (!has_capture(?late.result))                        { bad = 1; }
+
+    ret bad;
+}
+
+test "mach.cli.cmd.testing.count_failed_and_build_gate_tally:only_pass_counts_as_passing" {
+    var a: A.Allocator;
+    page.make(?a);
+
+    var outcomes: [3]Outcome;
+    outcomes[0] = t_outcome(validation.RESULT_PASS, validation.CAUSE_PASS);
+    outcomes[1] = t_outcome(validation.RESULT_SEMANTIC_MISMATCH, validation.CAUSE_ORACLE_EXIT);
+    outcomes[2] = t_outcome(validation.RESULT_TOOL_UNAVAILABLE, validation.CAUSE_TOOL_UNAVAILABLE);
+
+    if (count_failed(?outcomes[0], 3) != 2) { ret 1; }
+
+    var gt: outcome.GateTally = outcome.gate_tally_init(?a);
+    build_gate_tally(?gt, ?a, ?outcomes[0], 3);
+
+    var bad: i32 = 0;
+    if (gt.pass != 1)              { bad = 1; }
+    or (gt.semantic_mismatch != 1) { bad = 1; }
+    or (gt.tool_unavailable != 1)  { bad = 1; }
+    or (outcome.gate_tally_total(?gt) != 3) { bad = 1; }
+
+    outcome.gate_tally_dnit(?gt);
+    ret bad;
+}
+
+test "mach.cli.cmd.testing.exit_code:infrastructure_failure_dominates_ordinary_test_failure" {
+    var a: A.Allocator;
+    page.make(?a);
+
+    var clean: outcome.GateTally = outcome.gate_tally_init(?a);
+    if (exit_code(0, ?clean) != 0) { ret 1; }
+    outcome.gate_tally_dnit(?clean);
+
+    var only_failed: outcome.GateTally = outcome.gate_tally_init(?a);
+    if (exit_code(3, ?only_failed) != 1) { ret 2; }
+    outcome.gate_tally_dnit(?only_failed);
+
+    var infra: outcome.GateTally = outcome.gate_tally_init(?a);
+    if (R.is_err[R.Void, str](outcome.record_gate(?infra, ?a,
+        validation.gate_result(validation.RESULT_INFRASTRUCTURE_FAILURE, validation.CAUSE_ORACLE_CAPTURE, nil)))) { ret 3; }
+    if (exit_code(0, ?infra) != 2) { ret 4; }
+    if (exit_code(5, ?infra) != 2) { ret 5; }
+    outcome.gate_tally_dnit(?infra);
+
+    ret 0;
+}
+
+fun t_test(argc: usize, argv: **u8) i64 {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 2; }
+    val ir: R.Result[args.ParsedInvocation, str] = args.parse_invocation(?a, argc, argv);
+    if (R.is_err[args.ParsedInvocation, str](ir)) { ret 2; }
+    var inv: args.ParsedInvocation = R.unwrap_ok[args.ParsedInvocation, str](ir);
+    ret run_typed(argv, ?inv);
+}
+
+test "mach.cli.cmd.testing.run_typed:rejects_emit_before_effects_for_every_value_shape_and_position" {
+    var bad: i32 = 0;
+
+    var no_value: [3]*u8;
+    no_value[0] = "mach"; no_value[1] = "test"; no_value[2] = "--emit";
+    if (t_test(3, ?no_value[0]) != 1) { bad = 1; }
+
+    var with_obj: [4]*u8;
+    with_obj[0] = "mach"; with_obj[1] = "test"; with_obj[2] = "--emit"; with_obj[3] = "obj";
+    if (t_test(4, ?with_obj[0]) != 1) { bad = 1; }
+
+    var with_exe: [4]*u8;
+    with_exe[0] = "mach"; with_exe[1] = "test"; with_exe[2] = "--emit"; with_exe[3] = "exe";
+    if (t_test(4, ?with_exe[0]) != 1) { bad = 1; }
+
+    var arbitrary: [4]*u8;
+    arbitrary[0] = "mach"; arbitrary[1] = "test"; arbitrary[2] = "--emit"; arbitrary[3] = "bogus";
+    if (t_test(4, ?arbitrary[0]) != 1) { bad = 1; }
+
+    var duplicate: [5]*u8;
+    duplicate[0] = "mach"; duplicate[1] = "test"; duplicate[2] = "--emit";
+    duplicate[3] = "obj"; duplicate[4] = "--emit";
+    if (t_test(5, ?duplicate[0]) != 1) { bad = 1; }
+
+    var positional_adjacent: [4]*u8;
+    positional_adjacent[0] = "mach"; positional_adjacent[1] = "test";
+    positional_adjacent[2] = "."; positional_adjacent[3] = "--emit";
+    if (t_test(4, ?positional_adjacent[0]) != 1) { bad = 1; }
+
+    var trailing_conflict: [6]*u8;
+    trailing_conflict[0] = "mach"; trailing_conflict[1] = "test"; trailing_conflict[2] = "--list";
+    trailing_conflict[3] = "--filter"; trailing_conflict[4] = "foo"; trailing_conflict[5] = "--emit";
+    if (t_test(6, ?trailing_conflict[0]) != 1) { bad = 1; }
+
+    ret bad;
+}
+
+test "mach.cli.cmd.testing.run_typed:rejects_o1_before_any_side_effect_at_every_position" {
+    var bad: i32 = 0;
+
+    var alone: [3]*u8;
+    alone[0] = "mach"; alone[1] = "test"; alone[2] = "-O1";
+    if (t_test(3, ?alone[0]) != 1) { bad = 1; }
+
+    var with_project: [4]*u8;
+    with_project[0] = "mach"; with_project[1] = "test"; with_project[2] = "-O1";
+    with_project[3] = "/definitely/not/a/real/rem102-project";
+    if (t_test(4, ?with_project[0]) != 1) { bad = 1; }
+
+    var trailing: [4]*u8;
+    trailing[0] = "mach"; trailing[1] = "test";
+    trailing[2] = "/definitely/not/a/real/rem102-project"; trailing[3] = "-O1";
+    if (t_test(4, ?trailing[0]) != 1) { bad = 1; }
+
+    var duplicate: [4]*u8;
+    duplicate[0] = "mach"; duplicate[1] = "test"; duplicate[2] = "-O1"; duplicate[3] = "-O1";
+    if (t_test(4, ?duplicate[0]) != 1) { bad = 1; }
+
+    var with_o2: [4]*u8;
+    with_o2[0] = "mach"; with_o2[1] = "test"; with_o2[2] = "-O1"; with_o2[3] = "-O2";
+    if (t_test(4, ?with_o2[0]) != 1) { bad = 1; }
+
+    ret bad;
+}
+
+fun t_temp_name(a: *A.Allocator) str {
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(a, "mach_test_timeout");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret ""; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val dup_r: R.Result[str, str] = str_dup(a, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[str, str](dup_r)) { ret ""; }
+    ret R.unwrap_ok[str, str](dup_r);
+}
+
+rec TimeoutProbe {
+    script:  str;
+    log_dir: str;
+    marker:  str;
+    outcome: Outcome;
+}
+
+fun t_probe_free(a: *A.Allocator, pr: *TimeoutProbe) {
+    if (str_len(pr.script) > 0)  { fs.remove_file(pr.script);  str_free(a, pr.script); }
+    if (str_len(pr.log_dir) > 0) { fs.remove_all(a, pr.log_dir); str_free(a, pr.log_dir); }
+    if (str_len(pr.marker) > 0)  { fs.remove_file(pr.marker);  str_free(a, pr.marker); }
+    pr.script  = "";
+    pr.log_dir = "";
+    pr.marker  = "";
+}
+
+# runs one test process through the real spawn, wait and finalize chain
+fun t_run_one_bounded(a: *A.Allocator, body: str, timeout_seconds: i64, pr: *TimeoutProbe) i32 {
+    pr.script  = t_temp_name(a);
+    pr.log_dir = t_temp_name(a);
+    if (str_len(pr.script) == 0 || str_len(pr.log_dir) == 0) { ret 1; }
+    if (O.is_some[str](fs.write_bytes(pr.script, body::*u8, str_len(body), 0o600))) { ret 2; }
+    if (O.is_some[str](fs.create_dir(pr.log_dir, 0o700))) { ret 3; }
+
+    var art: outcome.TestArtifact;
+    art.module = "mach.timeout.probe";
+    art.label  = "probe";
+    art.file   = "probe.mach";
+    art.line   = 1;
+    art.exe    = pr.script::*u8;
+    art.idx    = 0;
+
+    var process: subprocess.OwnedSubprocess;
+    subprocess.init(?process);
+    var slot: Slot;
+    slot.active = false;
+
+    val spawn_fail: O.Option[validation.ValidationGateResult] =
+        spawn_one(a, ?process, ?slot, 1, ?art, 0, "/bin/sh"::*u8, pr.log_dir::*u8, timeout_seconds);
+    if (O.is_some[validation.ValidationGateResult](spawn_fail)) { ret 4; }
+
+    val wr: R.Result[*subprocess.OwnedSubprocess, str] =
+        subprocess.wait_any(a, ?process, 1, nil, nil);
+    if (R.is_err[*subprocess.OwnedSubprocess, str](wr)) {
+        subprocess.cancel(a, ?process, 0);
+        subprocess.dnit(a, ?process);
+        ret 5;
+    }
+    var outcomes: [1]Outcome;
+    finalize_slot(a, ?process, ?slot, ?outcomes[0], 0, true, pr.log_dir::*u8);
+    pr.outcome = outcomes[0];
+    ret 0;
+}
+
+test "mach.cli.cmd.testing:a_test_past_its_bound_is_timed_out_and_its_grandchild_dies_with_it" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+
+    var pr: TimeoutProbe;
+    pr.script = ""; pr.log_dir = ""; pr.marker = "";
+    pr.marker = t_temp_name(?a);
+    if (str_len(pr.marker) == 0) { ret 2; }
+
+    val body: str = sfmt_probe(?a, pr.marker);
+    if (str_len(body) == 0) { t_probe_free(?a, ?pr); ret 3; }
+    val setup: i32 = t_run_one_bounded(?a, body, 1, ?pr);
+    str_free(?a, body);
+    var bad: i32 = 0;
+    if (setup != 0) { bad = 10 + setup; }
+    or {
+        val o: *Outcome = ?pr.outcome;
+        if (o.result.kind != validation.RESULT_RESOURCE_EXHAUSTION) { bad = 4; }
+        or (o.result.cause != validation.CAUSE_ORACLE_TIMEOUT)      { bad = 5; }
+        or (o.bound != 1)                                           { bad = 6; }
+        or (!str_equals(result_name(?o.result), "timeout"))         { bad = 7; }
+        or {
+            var one: [1]Outcome;
+            one[0] = @o;
+            if (count_timed_out(?one[0], 1) != 1) { bad = 8; }
+            or (count_failed(?one[0], 1) != 1)    { bad = 9; }
+            or {
+                var tally: outcome.GateTally = outcome.gate_tally_init(?a);
+                build_gate_tally(?tally, ?a, ?one[0], 1);
+                if (exit_code(1, ?tally) != 1) { bad = 20; }
+                outcome.gate_tally_dnit(?tally);
+            }
+        }
+        # the grandchild outlives its bound by 2s; if the group was not
+        # terminated it wakes and publishes the marker
+        if (bad == 0) {
+            sys.sleep(du.SECOND * 3);
+            if (fs.exists(pr.marker)) { bad = 21; }
+        }
+    }
+    t_probe_free(?a, ?pr);
+    ret bad;
+}
+
+fun sfmt_probe(a: *A.Allocator, marker: str) str {
+    val r: R.Result[str, str] = fmt.sprint(a, "(sleep 2; echo alive > {}) &\nsleep 30\n", marker);
+    if (R.is_err[str, str](r)) { ret ""; }
+    ret R.unwrap_ok[str, str](r);
+}
+
+test "mach.cli.cmd.testing:an_unbounded_test_that_sleeps_briefly_still_passes" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+
+    var pr: TimeoutProbe;
+    pr.script = ""; pr.log_dir = ""; pr.marker = "";
+    val setup: i32 = t_run_one_bounded(?a, "sleep 1\nexit 0\n", 0, ?pr);
+    var bad: i32 = 0;
+    if (setup != 0) { bad = 10 + setup; }
+    or {
+        val o: *Outcome = ?pr.outcome;
+        if (o.result.kind != validation.RESULT_PASS) { bad = 2; }
+        or (o.bound != 0)                            { bad = 3; }
+        or {
+            var one: [1]Outcome;
+            one[0] = @o;
+            if (count_timed_out(?one[0], 1) != 0) { bad = 4; }
+            or {
+                var tally: outcome.GateTally = outcome.gate_tally_init(?a);
+                build_gate_tally(?tally, ?a, ?one[0], 1);
+                if (exit_code(0, ?tally) != 0) { bad = 5; }
+                outcome.gate_tally_dnit(?tally);
+            }
+        }
+    }
+    t_probe_free(?a, ?pr);
+    ret bad;
+}
+
+test "mach.cli.cmd.testing:a_test_that_beats_its_bound_keeps_its_own_outcome" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+
+    var pr: TimeoutProbe;
+    pr.script = ""; pr.log_dir = ""; pr.marker = "";
+    val setup: i32 = t_run_one_bounded(?a, "exit 4\n", 30, ?pr);
+    var bad: i32 = 0;
+    if (setup != 0) { bad = 10 + setup; }
+    or {
+        val o: *Outcome = ?pr.outcome;
+        if (o.result.kind != validation.RESULT_SEMANTIC_MISMATCH) { bad = 2; }
+        or (o.result.cause != validation.CAUSE_ORACLE_EXIT)       { bad = 3; }
+        or (o.code != 4)                                          { bad = 4; }
+        or (o.bound != 0)                                         { bad = 5; }
+    }
+    t_probe_free(?a, ?pr);
+    ret bad;
 }

@@ -1,27 +1,5 @@
-# the shared CLI diagnostic renderer
-#
-# one framed renderer for every command that surfaces compiler diagnostics. each
-# diagnostic prints as a severity headline (`error:` / `warning:`), a
-# `--> file:line:col` location line, an ASCII line-number gutter, and the
-# offending span underlined with `^`; a span that runs across several source
-# lines marks its continuation lines with `-`. a diagnostic may carry any number
-# of secondary locations at unrelated positions, each drawn in its own
-# `--> file:line:col` frame with a `-` underline and an optional trailing label,
-# separated from the frame before it by a blank gutter bar. attached notes render
-# as `= note:` and suggestions as `= help:`. a non-empty run ends with an
-# `N errors / M warnings` summary.
-#
-# locations resolve against the session source map via each Location's file_id
-# and span; an unresolvable captioned location degrades to a `= note:` line rather
-# than vanishing. output is ASCII only - no Unicode, no color, no terminal escapes
-# - and fixed-width, so it is byte-identical across linux, darwin, and windows.
-# every line is emitted through a caller-owned `writer.Writer`, so the CLI passes
-# a stderr-backed one while tests render into a sink and assert on the bytes.
-# `mach build` renders its whole-project diagnostics through `flush`.
-
 use std.allocator.page;
 use fs: std.filesystem;
-use std.print;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -35,6 +13,7 @@ use O:   std.types.option;
 use R:   std.types.result;
 use fmt: std.format;
 use std.io.writer;
+use std.system.panic.panic;
 
 use mach.lang.build.outcome;
 use mach.lang.diagnostic;
@@ -42,28 +21,81 @@ use mach.lang.fe.token;
 use mach.lang.session;
 use mach.lang.source;
 
-# source lines rendered for one multi-line span before the middle is elided
 val MAX_SPAN_LINES: usize = 10;
 
-# render every diagnostic in `list` through `out` against the session source map
-#
-# Each diagnostic is framed individually, separated by a blank line, and a
-# non-empty run closes with a counts summary. A diagnostic whose file does not
-# resolve degrades to its headline (and note) with no source frame.
+val EXCERPT_WIDTH: usize = 120;
+val EXCERPT_LEAD:  usize = 40;
+val EXCERPT_MARK:  str   = "...";
+
+rec Excerpt {
+    start:     usize;
+    end:       usize;
+    cut_left:  bool;
+    cut_right: bool;
+}
+
+rec MarkRange {
+    from: usize;
+    to:   usize;
+}
+
+fun mark_range(b: source.LineSpan, off: usize, end: usize) MarkRange {
+    var r: MarkRange;
+    r.from = b.start;
+    if (off > b.start && off <= b.end) { r.from = off; }
+    r.to = b.end;
+    if (end >= b.start && end <= b.end) { r.to = end; }
+    if (r.to < r.from) { r.to = r.from; }
+    ret r;
+}
+
+fun excerpt_of(b: source.LineSpan, m: MarkRange) Excerpt {
+    var x: Excerpt;
+    x.start     = b.start;
+    x.end       = b.end;
+    x.cut_left  = false;
+    x.cut_right = false;
+    if (b.end - b.start <= EXCERPT_WIDTH) { ret x; }
+    var ws: usize = b.start;
+    if (m.from > b.start + EXCERPT_LEAD) { ws = m.from - EXCERPT_LEAD; }
+    var we: usize = ws + EXCERPT_WIDTH;
+    if (we > b.end) {
+        we = b.end;
+        if (we - b.start > EXCERPT_WIDTH) { ws = we - EXCERPT_WIDTH; }
+        or                                { ws = b.start; }
+    }
+    x.start     = ws;
+    x.end       = we;
+    x.cut_left  = ws > b.start;
+    x.cut_right = we < b.end;
+    ret x;
+}
+
+# render every diagnostic of a store to a writer, then an "N errors / M warnings" line
 # ---
-# out:  the writer every line is emitted through (the CLI passes stderr)
-# s:    session carrying the source map spans resolve against
-# list: diagnostics to render, in order
-pub fun flush(out: *writer.Writer, s: *session.Session, list: *diagnostic.DiagList) {
+# out: the destination
+# s: the session whose SourceMap locates each diagnostic
+# list: the diagnostics, rendered in order; nothing is written when it is empty
+pub fun flush(out: *writer.Writer, s: *session.Session, list: *diagnostic.DiagnosticStore) {
+    flush_sources(out, ?s.sources, list);
+}
+
+# render every diagnostic of a store to a writer, then an "N errors / M warnings" line
+# ---
+# out: the destination
+# sources: the SourceMap that locates each diagnostic
+# list: the diagnostics, rendered in order; nothing is written when it is empty
+pub fun flush_sources(out: *writer.Writer, sources: *source.SourceMap, list: *diagnostic.DiagnosticStore) {
     var errors:   usize = 0;
     var warnings: usize = 0;
 
+    val total: usize = diagnostic.len(list);
     var i: usize = 0;
-    for (i < list.len) {
-        val d: *diagnostic.Diagnostic = ?list.items[i];
+    for (i < total) {
+        val d: *diagnostic.Diagnostic = ?list.items.data[i];
 
         if (i > 0) { fmt.write_str(out, "\n"); }
-        render(out, s, d);
+        render(out, sources, d);
 
         if (d.severity == diagnostic.SEVERITY_ERROR)        { errors   = errors + 1;   }
         or (d.severity == diagnostic.SEVERITY_WARNING)      { warnings = warnings + 1; }
@@ -71,21 +103,12 @@ pub fun flush(out: *writer.Writer, s: *session.Session, list: *diagnostic.DiagLi
         i = i + 1;
     }
 
-    if (list.len > 0) {
+    if (total > 0) {
         fmt.write_str(out, "\n");
         emit_summary(out, errors, warnings);
     }
 }
 
-# the resolved geometry of one span against its source file, shared by the
-# primary and secondary frames of a diagnostic
-# ---
-# sf:     the resolved source file
-# off:    clamped span start byte offset
-# end:    clamped span end byte offset (exclusive)
-# line_s: 1-based first line the span touches
-# line_e: 1-based last line the span touches
-# col_s:  1-based column of the span start
 rec Frame {
     sf:     *source.SourceFile;
     off:    usize;
@@ -95,16 +118,8 @@ rec Frame {
     col_s:  usize;
 }
 
-# resolve a Location to a Frame, or none when its file is unknown
-#
-# The span is clamped to the file bounds so a synthesized or out-of-range span
-# degrades to a valid frame rather than crashing.
-# ---
-# s:   session carrying the source map
-# loc: the location to resolve
-# ret: some(Frame) when the file resolves, none otherwise
-fun locate(s: *session.Session, loc: diagnostic.Location) O.Option[Frame] {
-    val opt_file: O.Option[*source.SourceFile] = source.get(?s.sources, loc.file_id);
+fun locate(sources: *source.SourceMap, loc: diagnostic.Location) O.Option[Frame] {
+    val opt_file: O.Option[*source.SourceFile] = source.get(sources, loc.file_id);
     if (O.is_none[*source.SourceFile](opt_file)) { ret O.none[Frame](); }
     val sf: *source.SourceFile = O.unwrap[*source.SourceFile](opt_file);
 
@@ -131,23 +146,11 @@ fun locate(s: *session.Session, loc: diagnostic.Location) O.Option[Frame] {
     ret O.some[Frame](f);
 }
 
-# render one diagnostic: headline, a primary source frame, every secondary
-# frame, then note and help lines
-#
-# The gutter width is unified across the primary and all resolvable secondary
-# frames so their bars align. A secondary frame is separated from the one before
-# it by a blank gutter bar. A location whose file does not resolve never vanishes:
-# a captioned one degrades to a `= note:` line in the trailer, and the primary
-# failing to resolve still lets resolvable secondaries render.
-# ---
-# out: the writer the diagnostic is emitted through
-# s:   session carrying the source map
-# d:   the diagnostic to render
-fun render(out: *writer.Writer, s: *session.Session, d: *diagnostic.Diagnostic) {
+fun render(out: *writer.Writer, sources: *source.SourceMap, d: *diagnostic.Diagnostic) {
     emit_headline(out, d.severity, d.message);
 
-    val opt_pf: O.Option[Frame] = locate(s, d.loc);
-    val w: usize = gutter_width(s, d, opt_pf);
+    val opt_pf: O.Option[Frame] = locate(sources, d.loc);
+    val w: usize = gutter_width(sources, d, opt_pf);
 
     var framed: bool = false;
     if (O.is_some[Frame](opt_pf)) {
@@ -157,9 +160,9 @@ fun render(out: *writer.Writer, s: *session.Session, d: *diagnostic.Diagnostic) 
     }
 
     var i: usize = 0;
-    for (i < d.related_len) {
-        val rel: *diagnostic.Related = ?d.related[i];
-        val opt_rf: O.Option[Frame] = locate(s, rel.loc);
+    for (i < d.related.len) {
+        val rel: *diagnostic.Related = ?d.related.data[i];
+        val opt_rf: O.Option[Frame] = locate(sources, rel.loc);
         if (O.is_some[Frame](opt_rf)) {
             if (framed) { emit_bar(out, w); }
             var rf: Frame = O.unwrap[Frame](opt_rf);
@@ -169,24 +172,16 @@ fun render(out: *writer.Writer, s: *session.Session, d: *diagnostic.Diagnostic) 
         i = i + 1;
     }
 
-    emit_trailer(out, s, d, framed, w);
+    emit_trailer(out, sources, d, framed, w);
 }
 
-# the gutter width unified across the primary frame and every resolvable
-# secondary frame, so their `|` bars align. At least 1 so an all-unresolved
-# diagnostic still yields a sane width
-# ---
-# s:      session carrying the source map
-# d:      the diagnostic being rendered
-# opt_pf: the already-resolved primary frame, or none
-# ret:    the gutter width in columns
-fun gutter_width(s: *session.Session, d: *diagnostic.Diagnostic, opt_pf: O.Option[Frame]) usize {
+fun gutter_width(sources: *source.SourceMap, d: *diagnostic.Diagnostic, opt_pf: O.Option[Frame]) usize {
     var w: usize = 1;
     if (O.is_some[Frame](opt_pf)) { w = decimal_width(O.unwrap[Frame](opt_pf).line_e); }
 
     var i: usize = 0;
-    for (i < d.related_len) {
-        val opt_rf: O.Option[Frame] = locate(s, d.related[i].loc);
+    for (i < d.related.len) {
+        val opt_rf: O.Option[Frame] = locate(sources, d.related.data[i].loc);
         if (O.is_some[Frame](opt_rf)) {
             val rw: usize = decimal_width(O.unwrap[Frame](opt_rf).line_e);
             if (rw > w) { w = rw; }
@@ -196,34 +191,14 @@ fun gutter_width(s: *session.Session, d: *diagnostic.Diagnostic, opt_pf: O.Optio
     ret w;
 }
 
-# draw one frame: its `--> file:line:col` line, a blank gutter bar, and the
-# underlined source line(s)
-# ---
-# out:   the writer the frame is emitted through
-# f:     resolved frame geometry
-# w:     unified gutter width in columns
-# head:  underline glyph for the first line ("^" primary, "-" secondary)
-# label: label appended to the final underline line, or nil for none
 fun emit_frame(out: *writer.Writer, f: *Frame, w: usize, head: str, label: str) {
     emit_loc(out, w, f.sf.path, f.line_s, f.col_s);
     emit_bar(out, w);
     emit_snippet(out, f.sf, w, f.line_s, f.line_e, f.off, f.end, head, label);
 }
 
-# render the trailing lines under a diagnostic's frames: the caption of every
-# unresolvable-but-captioned secondary location, then the note, then the help
-#
-# When at least one frame was drawn a single blank gutter bar separates the
-# frames from the trailer and the lines indent to align with the gutter; the
-# unframed (degraded) path emits the lines directly under the headline.
-# ---
-# out:    the writer the trailing lines are emitted through
-# s:      session carrying the source map
-# d:      the diagnostic whose trailing lines are rendered
-# framed: whether any source frame preceded these lines
-# w:      unified gutter width in columns
-fun emit_trailer(out: *writer.Writer, s: *session.Session, d: *diagnostic.Diagnostic, framed: bool, w: usize) {
-    if (!has_trailer(s, d)) { ret; }
+fun emit_trailer(out: *writer.Writer, sources: *source.SourceMap, d: *diagnostic.Diagnostic, framed: bool, w: usize) {
+    if (!has_trailer(sources, d)) { ret; }
 
     var indent: usize = 2;
     if (framed) {
@@ -232,53 +207,61 @@ fun emit_trailer(out: *writer.Writer, s: *session.Session, d: *diagnostic.Diagno
     }
 
     var i: usize = 0;
-    for (i < d.related_len) {
-        val rel: *diagnostic.Related = ?d.related[i];
-        if (rel.label != nil && O.is_none[Frame](locate(s, rel.loc))) {
+    for (i < d.related.len) {
+        val rel: *diagnostic.Related = ?d.related.data[i];
+        if (rel.label != nil && O.is_none[Frame](locate(sources, rel.loc))) {
             emit_tagged(out, "note", rel.label, indent);
         }
         i = i + 1;
     }
-    if (d.note != nil) { emit_tagged(out, "note", d.note, indent); }
-    if (d.help != nil) { emit_tagged(out, "help", d.help, indent); }
+
+    var c: usize = 0;
+    for (c < d.children.len) {
+        val child: *diagnostic.Child = ?d.children.data[c];
+        if (child.kind == diagnostic.CHILD_HELP) { emit_tagged(out, "help", child.text, indent); }
+        or                                       { emit_tagged(out, "note", child.text, indent); }
+        c = c + 1;
+    }
+
+    var f: usize = 0;
+    for (f < d.fixes.len) {
+        emit_fix(out, sources, w, ?d.fixes.data[f], indent);
+        f = f + 1;
+    }
 }
 
-# whether a diagnostic has any trailing line to render: a note, a help, or an
-# unresolvable-but-captioned secondary location
-# ---
-# s:   session carrying the source map
-# d:   the diagnostic being rendered
-# ret: true when at least one trailing line is present
-fun has_trailer(s: *session.Session, d: *diagnostic.Diagnostic) bool {
-    if (d.note != nil || d.help != nil) { ret true; }
+fun emit_fix(out: *writer.Writer, sources: *source.SourceMap, w: usize, fx: *diagnostic.Fix, indent: usize) {
+    emit_tagged(out, "fix", fx.label, indent);
+    var e: usize = 0;
+    for (e < fx.edits.len) {
+        val ed: *diagnostic.Edit = ?fx.edits.data[e];
+        val opt_ef: O.Option[Frame] = locate(sources, ed.loc);
+        if (O.is_some[Frame](opt_ef)) {
+            var ef: Frame = O.unwrap[Frame](opt_ef);
+            emit_loc(out, w, ef.sf.path, ef.line_s, ef.col_s);
+        }
+        emit_spaces(out, indent + 2);
+        fmt.write_str(out, "-> replace with `");
+        fmt.write_str(out, ed.replacement);
+        fmt.write_str(out, "`\n");
+        e = e + 1;
+    }
+}
+
+fun has_trailer(sources: *source.SourceMap, d: *diagnostic.Diagnostic) bool {
+    if (d.children.len > 0 || d.fixes.len > 0) { ret true; }
 
     var i: usize = 0;
-    for (i < d.related_len) {
-        if (d.related[i].label != nil && O.is_none[Frame](locate(s, d.related[i].loc))) { ret true; }
+    for (i < d.related.len) {
+        if (d.related.data[i].label != nil && O.is_none[Frame](locate(sources, d.related.data[i].loc))) { ret true; }
         i = i + 1;
     }
     ret false;
 }
 
-# render the source line(s) the span covers, each followed by its underline
-#
-# A single-line span underlines its range with `head`. A multi-line span marks
-# the first line with `head` and every continuation line with `-`; a span taller
-# than MAX_SPAN_LINES renders only its first and last lines with the middle
-# elided. The label, when present, trails the final underline line.
-# ---
-# out:    the writer the lines are emitted through
-# sf:     source file the lines are drawn from
-# w:      gutter width in columns
-# line_s: 1-based first line of the span
-# line_e: 1-based last line of the span
-# off:    clamped span start byte offset
-# end:    clamped span end byte offset (exclusive)
-# head:   underline glyph for the first line ("^" primary, "-" secondary)
-# label:  label appended to the final underline line, or nil for none
 fun emit_snippet(out: *writer.Writer, sf: *source.SourceFile, w: usize, line_s: usize, line_e: usize, off: usize, end: usize, head: str, label: str) {
     if (line_e <= line_s) {
-        emit_source_line(out, sf, w, line_s);
+        emit_source_line(out, sf, w, line_s, off, end);
         emit_underline(out, sf, w, line_s, off, end, head, label);
         ret;
     }
@@ -286,7 +269,7 @@ fun emit_snippet(out: *writer.Writer, sf: *source.SourceFile, w: usize, line_s: 
     if (line_e - line_s + 1 <= MAX_SPAN_LINES) {
         var l: usize = line_s;
         for (l <= line_e) {
-            emit_source_line(out, sf, w, l);
+            emit_source_line(out, sf, w, l, off, end);
             if (l == line_s)      { emit_underline(out, sf, w, l, off, end, head, nil);  }
             or (l == line_e)      { emit_underline(out, sf, w, l, off, end, "-", label); }
             or                    { emit_underline(out, sf, w, l, off, end, "-", nil);   }
@@ -295,61 +278,42 @@ fun emit_snippet(out: *writer.Writer, sf: *source.SourceFile, w: usize, line_s: 
         ret;
     }
 
-    emit_source_line(out, sf, w, line_s);
+    emit_source_line(out, sf, w, line_s, off, end);
     emit_underline(out, sf, w, line_s, off, end, head, nil);
     emit_elision(out, w);
-    emit_source_line(out, sf, w, line_e);
+    emit_source_line(out, sf, w, line_e, off, end);
     emit_underline(out, sf, w, line_e, off, end, "-", label);
 }
 
-# write one numbered source line through the gutter, verbatim
-# ---
-# out:  the writer the line is emitted through
-# sf:   source file the line is drawn from
-# w:    gutter width in columns
-# line: 1-based line number to print
-fun emit_source_line(out: *writer.Writer, sf: *source.SourceFile, w: usize, line: usize) {
+fun emit_source_line(out: *writer.Writer, sf: *source.SourceFile, w: usize, line: usize, off: usize, end: usize) {
     val opt_bounds: O.Option[source.LineSpan] = source.line_bounds(sf, line);
     if (O.is_none[source.LineSpan](opt_bounds)) { ret; }
     val b: source.LineSpan = O.unwrap[source.LineSpan](opt_bounds);
+    val x: Excerpt = excerpt_of(b, mark_range(b, off, end));
 
     emit_gutter_num(out, w, line);
-    if (b.end > b.start) {
-        fmt.write_bytes(out, ?sf.text[b.start], b.end - b.start);
+    if (x.cut_left) { fmt.write_str(out, EXCERPT_MARK); }
+    if (x.end > x.start) {
+        fmt.write_bytes(out, ?sf.text[x.start], x.end - x.start);
     }
+    if (x.cut_right) { fmt.write_str(out, EXCERPT_MARK); }
     fmt.write_str(out, "\n");
 }
 
-# write the underline for the portion of `line` the span covers
-#
-# The leading run up to the marked range is reproduced as tabs and spaces so the
-# markers land under the span regardless of tab width. The marker glyph (`^` for
-# the primary line, `-` for a continuation) fills the covered range, with a
-# zero-length range marking a single column. A non-nil `label` trails the glyph
-# run after a single space.
-# ---
-# out:   the writer the underline is emitted through
-# sf:    source file the line is drawn from
-# w:     gutter width in columns
-# line:  1-based line number being underlined
-# off:   clamped span start byte offset
-# end:   clamped span end byte offset (exclusive)
-# glyph: the marker glyph, "^" or "-"
-# label: label appended after the glyph run, or nil for none
 fun emit_underline(out: *writer.Writer, sf: *source.SourceFile, w: usize, line: usize, off: usize, end: usize, glyph: str, label: str) {
     val opt_bounds: O.Option[source.LineSpan] = source.line_bounds(sf, line);
     if (O.is_none[source.LineSpan](opt_bounds)) { ret; }
     val b: source.LineSpan = O.unwrap[source.LineSpan](opt_bounds);
-
-    var mark_from: usize = b.start;
-    if (off > b.start && off <= b.end) { mark_from = off; }
-    var mark_to: usize = b.end;
-    if (end >= b.start && end <= b.end) { mark_to = end; }
-    if (mark_to < mark_from) { mark_to = mark_from; }
+    val m: MarkRange = mark_range(b, off, end);
+    val x: Excerpt = excerpt_of(b, m);
+    val mark_from: usize = m.from;
+    var mark_to: usize = m.to;
+    if (mark_to > x.end) { mark_to = x.end; }
 
     emit_gutter_bar(out, w);
 
-    var i: usize = b.start;
+    if (x.cut_left) { emit_spaces(out, str_len(EXCERPT_MARK)); }
+    var i: usize = x.start;
     for (i < mark_from) {
         if (sf.text[i] == '\t') { fmt.write_str(out, "\t"); }
         or                      { fmt.write_str(out, " ");  }
@@ -367,13 +331,6 @@ fun emit_underline(out: *writer.Writer, sf: *source.SourceFile, w: usize, line: 
     fmt.write_str(out, "\n");
 }
 
-# write the `--> file:line:col` location line under the gutter
-# ---
-# out:  the writer the line is emitted through
-# w:    gutter width in columns
-# path: source file path
-# line: 1-based line of the span start
-# col:  1-based column of the span start
 fun emit_loc(out: *writer.Writer, w: usize, path: str, line: usize, col: usize) {
     emit_spaces(out, w);
     fmt.write_str(out, "--> ");
@@ -385,50 +342,27 @@ fun emit_loc(out: *writer.Writer, w: usize, path: str, line: usize, col: usize) 
     fmt.write_str(out, "\n");
 }
 
-# write a blank gutter line (`|`) terminated by a newline
-# ---
-# out: the writer the line is emitted through
-# w:   gutter width in columns
 fun emit_bar(out: *writer.Writer, w: usize) {
     emit_spaces(out, w);
     fmt.write_str(out, " |\n");
 }
 
-# write the `...` elision marker standing in for omitted span lines
-# ---
-# out: the writer the marker is emitted through
-# w:   gutter width in columns
 fun emit_elision(out: *writer.Writer, w: usize) {
     emit_spaces(out, w);
     fmt.write_str(out, " | ...\n");
 }
 
-# write a right-aligned line number followed by the ` | ` gutter separator
-# ---
-# out:  the writer the gutter is emitted through
-# w:    gutter width in columns
-# line: 1-based line number to print
 fun emit_gutter_num(out: *writer.Writer, w: usize, line: usize) {
     emit_spaces(out, w - decimal_width(line));
     fmt.write_u64(out, line::u64);
     fmt.write_str(out, " | ");
 }
 
-# write a blank (numberless) gutter prefix ending in the ` | ` separator
-# ---
-# out: the writer the gutter is emitted through
-# w:   gutter width in columns
 fun emit_gutter_bar(out: *writer.Writer, w: usize) {
     emit_spaces(out, w);
     fmt.write_str(out, " | ");
 }
 
-# write a `= <tag>:` line indented so its `=` aligns with the gutter bar
-# ---
-# out:    the writer the line is emitted through
-# tag:    the line tag ("note" or "help")
-# text:   the line text
-# indent: spaces preceding the `=`
 fun emit_tagged(out: *writer.Writer, tag: str, text: str, indent: usize) {
     emit_spaces(out, indent);
     fmt.write_str(out, "= ");
@@ -438,11 +372,6 @@ fun emit_tagged(out: *writer.Writer, tag: str, text: str, indent: usize) {
     fmt.write_newline(out);
 }
 
-# write the closing `N errors / M warnings` counts line
-# ---
-# out:      the writer the summary is emitted through
-# errors:   number of error-severity diagnostics rendered
-# warnings: number of warning-severity diagnostics rendered
 fun emit_summary(out: *writer.Writer, errors: usize, warnings: usize) {
     fmt.write_u64(out, errors::u64);
     if (errors == 1) { fmt.write_str(out, " error");  }
@@ -454,30 +383,17 @@ fun emit_summary(out: *writer.Writer, errors: usize, warnings: usize) {
     fmt.write_str(out, "\n");
 }
 
-# write the `severity: message` headline line
-# ---
-# out:      the writer the headline is emitted through
-# severity: severity of the diagnostic
-# message:  the diagnostic message
 fun emit_headline(out: *writer.Writer, severity: diagnostic.Severity, message: str) {
     fmt.write_str(out, severity_label(severity));
     fmt.write_str(out, message);
     fmt.write_newline(out);
 }
 
-# write `n` spaces through `out`
-# ---
-# out: the writer the spaces are emitted through
-# n:   number of spaces to emit
 fun emit_spaces(out: *writer.Writer, n: usize) {
     var i: usize = 0;
     for (i < n) { fmt.write_str(out, " "); i = i + 1; }
 }
 
-# the count of decimal digits in `n` (at least 1)
-# ---
-# n:   the value to measure
-# ret: number of decimal digits
 fun decimal_width(n: usize) usize {
     var w: usize = 1;
     var v: usize = n;
@@ -485,10 +401,6 @@ fun decimal_width(n: usize) usize {
     ret w;
 }
 
-# the leading `severity: ` text for a diagnostic severity
-# ---
-# severity: severity to label
-# ret:      the label text, including its trailing `: `
 fun severity_label(severity: diagnostic.Severity) str {
     if (severity == diagnostic.SEVERITY_ERROR)   { ret "error: ";   }
     if (severity == diagnostic.SEVERITY_WARNING) { ret "warning: "; }
@@ -496,48 +408,39 @@ fun severity_label(severity: diagnostic.Severity) str {
     ret "help: ";
 }
 
-# a fixed-capacity byte sink capturing rendered output in tests
-# ---
-# buf: destination buffer
-# cap: buffer capacity
-# len: bytes written so far
-rec RenderSink {
+rec MemSink {
     buf: *u8;
     cap: usize;
     len: usize;
 }
 
-# writer callback appending to a RenderSink, dropping bytes past its capacity
-fun render_sink_write(ctx: ptr, buf: *u8, len: usize) R.Result[usize, str] {
-    val s: *RenderSink = ctx::*RenderSink;
+fun mem_sink_write(ctx: ptr, buf: *u8, len: usize) R.Result[usize, str] {
+    val s: *MemSink = ctx::*MemSink;
     var i: usize = 0;
     for (i < len && s.len < s.cap) {
         s.buf[s.len] = buf[i];
         s.len = s.len + 1;
         i = i + 1;
     }
-    ret R.ok[usize, str](len);
+    ret R.ok[usize, str](i);
 }
 
-# wire a Writer over a RenderSink backed by `buf`
-fun render_writer(w: *writer.Writer, s: *RenderSink, buf: *u8, cap: usize) {
+fun mem_writer(w: *writer.Writer, s: *MemSink, buf: *u8, cap: usize) {
     s.buf = buf;
     s.cap = cap;
     s.len = 0;
     w.ctx      = s::ptr;
-    w.f_write = render_sink_write;
+    w.f_write = mem_sink_write;
 }
 
-# whether the `wl`-byte `want` matches the sink's captured bytes at offset `i`
-fun sink_match_at(s: *RenderSink, i: usize, want: str, wl: usize) bool {
+fun sink_match_at(s: *MemSink, i: usize, want: str, wl: usize) bool {
     var j: usize = 0;
     for (j < wl && s.buf[i + j] == want[j]) { j = j + 1; }
     if (j == wl) { ret true; }
     ret false;
 }
 
-# whether the sink's captured bytes contain `want` as a substring
-fun sink_contains(s: *RenderSink, want: str) bool {
+fun sink_contains(s: *MemSink, want: str) bool {
     val wl: usize = str_len(want);
     if (wl == 0)     { ret true;  }
     if (wl > s.len)  { ret false; }
@@ -549,8 +452,7 @@ fun sink_contains(s: *RenderSink, want: str) bool {
     ret false;
 }
 
-# the count of non-overlapping occurrences of `want` in the sink's bytes
-fun sink_count(s: *RenderSink, want: str) usize {
+fun sink_count(s: *MemSink, want: str) usize {
     val wl: usize = str_len(want);
     if (wl == 0 || wl > s.len) { ret 0; }
     var count: usize = 0;
@@ -562,7 +464,6 @@ fun sink_count(s: *RenderSink, want: str) usize {
     ret count;
 }
 
-# a whole-line span over `line` of `sf`, or a zero span when it is out of range
 fun line_span(sf: *source.SourceFile, line: usize) token.Span {
     var sp: token.Span;
     sp.offset = 0;
@@ -575,8 +476,44 @@ fun line_span(sf: *source.SourceFile, line: usize) token.Span {
     ret sp;
 }
 
-# a resolvable primary and secondary render two frames whose single- and
-# two-digit line numbers share one unified gutter, separated by a blank bar
+test "mach.cli.diagnostic.render:long_line_is_windowed_around_the_span" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_s: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](res_s)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_s);
+
+    var text: [402]u8;
+    var i: usize = 0;
+    for (i < 400) { text[i] = 'a' + ((i / 10) % 26)::u8; i = i + 1; }
+    text[400] = '\n'; text[401] = 0;
+    val res_fid: R.Result[source.FileId, str] = session.load_source(?s, "t.mach", (?text[0])::str);
+    if (R.is_err[source.FileId, str](res_fid)) { session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
+
+    var list: diagnostic.DiagnosticStore = diagnostic.store_init(?alloc);
+    var sp: token.Span; sp.offset = 200; sp.len = 4;
+    diagnostic.error(?list, fid, sp, "here");
+
+    var buf:  [2048]u8;
+    var sink: MemSink;
+    var w:    writer.Writer;
+    mem_writer(?w, ?sink, ?buf[0], 2048);
+    flush(?w, ?s, ?list);
+
+    var code: i32 = 0;
+    if (!sink_contains(?sink, "--> t.mach:1:201"))            { code = 1; }
+    if (!sink_contains(?sink, " | ...qqqqqqqqqq"))            { code = 2; }
+    if (!sink_contains(?sink, "...\n"))                       { code = 3; }
+    if (sink_contains(?sink, "| aaaaaaaaaa"))                  { code = 4; }
+    if (!sink_contains(?sink, "^^^^\n"))                       { code = 5; }
+    if (sink_count(?sink, "...") != 2)                         { code = 6; }
+
+    diagnostic.store_dnit(?list);
+    session.dnit(?s);
+    ret code;
+}
+
 test "mach.cli.diagnostic.render:separator_bar_and_unified_gutter" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -593,33 +530,28 @@ test "mach.cli.diagnostic.render:separator_bar_and_unified_gutter" {
     if (O.is_none[*source.SourceFile](opt_sf)) { session.dnit(?s); ret 1; }
     val sf: *source.SourceFile = O.unwrap[*source.SourceFile](opt_sf);
 
-    var list: diagnostic.DiagList = diagnostic.init(?alloc);
+    var list: diagnostic.DiagnosticStore = diagnostic.store_init(?alloc);
     diagnostic.error(?list, fid, line_span(sf, 9), "primary here");
-    diagnostic.attach_related(?list, fid, line_span(sf, 12), "secondary here");
+    val last_a: diagnostic.DiagnosticId = R.unwrap_ok[diagnostic.DiagnosticId, str](diagnostic.last_id(?list));
+    diagnostic.attach_related_committed(?list, last_a, fid, line_span(sf, 12), "secondary here");
 
     var buf:  [1024]u8;
-    var sink: RenderSink;
+    var sink: MemSink;
     var w:    writer.Writer;
-    render_writer(?w, ?sink, ?buf[0], 1024);
+    mem_writer(?w, ?sink, ?buf[0], 1024);
     flush(?w, ?s, ?list);
 
     var code: i32 = 0;
-    # both the primary and secondary locations produced a frame.
     if (sink_count(?sink, "--> ") != 2)                  { code = 1; }
-    # the single-digit primary line right-aligns behind a leading space so its
-    # gutter matches the two-digit secondary line.
     if (!sink_contains(?sink, " 9 | line 09"))           { code = 1; }
     if (!sink_contains(?sink, "12 | line 12"))           { code = 1; }
-    # a blank gutter bar separates the primary frame from the secondary frame.
     if (!sink_contains(?sink, "   |\n  --> t.mach:12:"))  { code = 1; }
 
-    diagnostic.dnit(?list);
+    diagnostic.store_dnit(?list);
     session.dnit(?s);
     ret code;
 }
 
-# an unresolvable but captioned secondary location degrades to a trailer
-# `= note:` line rather than a frame
 test "mach.cli.diagnostic.render:unresolvable_related_degrades_to_note" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -636,29 +568,26 @@ test "mach.cli.diagnostic.render:unresolvable_related_degrades_to_note" {
     val sf: *source.SourceFile = O.unwrap[*source.SourceFile](opt_sf);
 
     val bad_fid: source.FileId = 4242;
-    var list: diagnostic.DiagList = diagnostic.init(?alloc);
+    var list: diagnostic.DiagnosticStore = diagnostic.store_init(?alloc);
     diagnostic.error(?list, fid, line_span(sf, 2), "primary msg");
-    diagnostic.attach_related(?list, bad_fid, line_span(sf, 2), "defined here");
+    val last_b: diagnostic.DiagnosticId = R.unwrap_ok[diagnostic.DiagnosticId, str](diagnostic.last_id(?list));
+    diagnostic.attach_related_committed(?list, last_b, bad_fid, line_span(sf, 2), "defined here");
 
     var buf:  [512]u8;
-    var sink: RenderSink;
+    var sink: MemSink;
     var w:    writer.Writer;
-    render_writer(?w, ?sink, ?buf[0], 512);
+    mem_writer(?w, ?sink, ?buf[0], 512);
     flush(?w, ?s, ?list);
 
     var code: i32 = 0;
-    # only the resolvable primary produced a frame.
     if (sink_count(?sink, "--> ") != 1)                    { code = 1; }
-    # the unresolvable caption falls through to a `= note:` trailer line.
     if (!sink_contains(?sink, "= note: defined here"))     { code = 1; }
 
-    diagnostic.dnit(?list);
+    diagnostic.store_dnit(?list);
     session.dnit(?s);
     ret code;
 }
 
-# a primary location that does not resolve still renders every resolvable
-# secondary frame with its caption
 test "mach.cli.diagnostic.render:unresolvable_primary_still_renders_secondary" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -675,132 +604,416 @@ test "mach.cli.diagnostic.render:unresolvable_primary_still_renders_secondary" {
     val sf: *source.SourceFile = O.unwrap[*source.SourceFile](opt_sf);
 
     val bad_fid: source.FileId = 4242;
-    var list: diagnostic.DiagList = diagnostic.init(?alloc);
+    var list: diagnostic.DiagnosticStore = diagnostic.store_init(?alloc);
     diagnostic.error(?list, bad_fid, line_span(sf, 2), "primary msg");
-    diagnostic.attach_related(?list, fid, line_span(sf, 3), "look here");
+    val last_c: diagnostic.DiagnosticId = R.unwrap_ok[diagnostic.DiagnosticId, str](diagnostic.last_id(?list));
+    diagnostic.attach_related_committed(?list, last_c, fid, line_span(sf, 3), "look here");
 
     var buf:  [512]u8;
-    var sink: RenderSink;
+    var sink: MemSink;
     var w:    writer.Writer;
-    render_writer(?w, ?sink, ?buf[0], 512);
+    mem_writer(?w, ?sink, ?buf[0], 512);
     flush(?w, ?s, ?list);
 
     var code: i32 = 0;
-    # the headline renders even though the primary location did not resolve.
     if (!sink_contains(?sink, "error: primary msg")) { code = 1; }
-    # the resolvable secondary still produces its own frame, source line, caption.
     if (sink_count(?sink, "--> ") != 1)              { code = 1; }
     if (!sink_contains(?sink, "--> t.mach:3:"))      { code = 1; }
     if (!sink_contains(?sink, "gamma"))              { code = 1; }
     if (!sink_contains(?sink, "look here"))          { code = 1; }
 
-    diagnostic.dnit(?list);
+    diagnostic.store_dnit(?list);
     session.dnit(?s);
     ret code;
 }
 
-# render a build failure to stderr and derive its process exit code
-#
-# The single point every error in the build / run / test flow passes through. An
-# unreported failure prints `error: <message>`; a reported one already reached the
-# user as a flushed located diagnostic, so nothing further is printed. The exit
-# code is the outcome derivation: an internal fault is 2, any other failure 1.
+test "mach.cli.diagnostic.render:multi_edit_fix_renders_a_location_per_edit" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_s: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](res_s)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_s);
+
+    val res_fid: R.Result[source.FileId, str] = session.load_source(?s, "t.mach", "alpha\nbeta\ngamma\n");
+    if (R.is_err[source.FileId, str](res_fid)) { session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
+
+    val opt_sf: O.Option[*source.SourceFile] = source.get(?s.sources, fid);
+    if (O.is_none[*source.SourceFile](opt_sf)) { session.dnit(?s); ret 1; }
+    val sf: *source.SourceFile = O.unwrap[*source.SourceFile](opt_sf);
+
+    var list: diagnostic.DiagnosticStore = diagnostic.store_init(?alloc);
+    val head: token.Span = line_span(sf, 1);
+    val tail: token.Span = line_span(sf, 3);
+
+    val b_r: R.Result[diagnostic.DiagnosticBuilder, str] = diagnostic.builder_init(?alloc, diagnostic.SEVERITY_ERROR, fid, line_span(sf, 2), "cast the value to `i64`");
+    if (R.is_err[diagnostic.DiagnosticBuilder, str](b_r)) { session.dnit(?s); diagnostic.store_dnit(?list); ret 1; }
+    var b: diagnostic.DiagnosticBuilder = R.unwrap_ok[diagnostic.DiagnosticBuilder, str](b_r);
+    val fix_r: R.Result[diagnostic.FixId, str] = diagnostic.attach_fix(?b, "cast the value to `i64`", fid, head, "(");
+    if (R.is_err[diagnostic.FixId, str](fix_r)) { diagnostic.builder_dnit(?b); session.dnit(?s); diagnostic.store_dnit(?list); ret 1; }
+    val fix: diagnostic.FixId = R.unwrap_ok[diagnostic.FixId, str](fix_r);
+    if (R.is_err[R.Void, str](diagnostic.attach_fix_edit(?b, fix, fid, tail, ")::i64"))) { diagnostic.builder_dnit(?b); session.dnit(?s); diagnostic.store_dnit(?list); ret 1; }
+    if (R.is_err[diagnostic.DiagnosticId, str](diagnostic.commit(?b, ?list))) { diagnostic.builder_dnit(?b); session.dnit(?s); diagnostic.store_dnit(?list); ret 1; }
+
+    var buf:  [512]u8;
+    var sink: MemSink;
+    var w:    writer.Writer;
+    mem_writer(?w, ?sink, ?buf[0], 512);
+    flush(?w, ?s, ?list);
+
+    var code: i32 = 0;
+    if (!sink_contains(?sink, "-> replace with `(`"))         { code = 1; }
+    if (!sink_contains(?sink, "-> replace with `)::i64`"))     { code = 1; }
+    if (!sink_contains(?sink, "--> t.mach:1:"))                { code = 1; }
+    if (!sink_contains(?sink, "--> t.mach:3:"))                { code = 1; }
+
+    diagnostic.store_dnit(?list);
+    session.dnit(?s);
+    ret code;
+}
+
+test "mach.cli.diagnostic.render:renders_help_and_fix_edits" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_s: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](res_s)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_s);
+
+    val res_fid: R.Result[source.FileId, str] = session.load_source(?s, "t.mach", "alpha\nbeta\ngamma\n");
+    if (R.is_err[source.FileId, str](res_fid)) { session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
+
+    val opt_sf: O.Option[*source.SourceFile] = source.get(?s.sources, fid);
+    if (O.is_none[*source.SourceFile](opt_sf)) { session.dnit(?s); ret 1; }
+    val sf: *source.SourceFile = O.unwrap[*source.SourceFile](opt_sf);
+
+    var list: diagnostic.DiagnosticStore = diagnostic.store_init(?alloc);
+    val sp: token.Span = line_span(sf, 2);
+
+    val b_r: R.Result[diagnostic.DiagnosticBuilder, str] = diagnostic.builder_init(?alloc, diagnostic.SEVERITY_ERROR, fid, sp, "unresolved identifier `helpr`");
+    if (R.is_err[diagnostic.DiagnosticBuilder, str](b_r)) { session.dnit(?s); diagnostic.store_dnit(?list); ret 1; }
+    var b: diagnostic.DiagnosticBuilder = R.unwrap_ok[diagnostic.DiagnosticBuilder, str](b_r);
+    diagnostic.attach_help(?b, "did you mean `helper`?");
+    val fix_r: R.Result[diagnostic.FixId, str] = diagnostic.attach_fix(?b, "replace with `helper`", fid, sp, "helper");
+    if (R.is_err[diagnostic.FixId, str](fix_r)) { diagnostic.builder_dnit(?b); session.dnit(?s); diagnostic.store_dnit(?list); ret 1; }
+    if (R.is_err[diagnostic.DiagnosticId, str](diagnostic.commit(?b, ?list))) { diagnostic.builder_dnit(?b); session.dnit(?s); diagnostic.store_dnit(?list); ret 1; }
+
+    var buf:  [512]u8;
+    var sink: MemSink;
+    var w:    writer.Writer;
+    mem_writer(?w, ?sink, ?buf[0], 512);
+    flush(?w, ?s, ?list);
+
+    var code: i32 = 0;
+    if (!sink_contains(?sink, "= help: did you mean `helper`?"))       { code = 1; }
+    if (!sink_contains(?sink, "= fix: replace with `helper`"))         { code = 1; }
+    if (!sink_contains(?sink, "-> replace with `helper`"))             { code = 1; }
+
+    diagnostic.store_dnit(?list);
+    session.dnit(?s);
+    ret code;
+}
+
+fun stderr_writer() writer.Writer {
+    ret fs.writer(fs.STDERR);
+}
+
+fun render_fail_w(w: *writer.Writer, f: *outcome.Fail) i64 {
+    if (f.kind == outcome.FAIL_REPORTED) { ret 1; }
+    if (f.kind == outcome.FAIL_USER) {
+        fmt.write_str(w, "error: ");
+        fmt.write_str(w, f.message);
+        fmt.write_str(w, "\n");
+        ret 1;
+    }
+    if (f.kind == outcome.FAIL_ENVIRONMENT) {
+        fmt.write_str(w, "error: ");
+        fmt.write_str(w, f.message);
+        fmt.write_str(w, "\n");
+        ret 3;
+    }
+    if (f.kind == outcome.FAIL_INTERNAL) {
+        fmt.write_str(w, "error: ");
+        fmt.write_str(w, f.message);
+        fmt.write_str(w, "\n");
+        ret 2;
+    }
+    panic("cli.diagnostic.render_fail_w: unrecognized outcome.FailKind\n");
+    ret 1;
+}
+
+# print a Fail to stderr as "error: <message>" and map it to an exit code
+# a reported Fail prints nothing, its diagnostics having been rendered already
 # ---
-# f:   the failure to render
-# ret: the process exit code (1 user error, 2 internal fault)
+# f: the Fail
+# ret: 1 for reported and user failures, 2 for internal, 3 for environment
 pub fun render_fail(f: *outcome.Fail) i64 {
-    if (!f.reported) {
-        print.eprint("error: ");
-        print.eprint(f.message);
-        print.eprint("\n");
-    }
-    if (f.internal) { ret 2; }
-    ret 1;
+    var w: writer.Writer = stderr_writer();
+    ret render_fail_w(?w, f);
 }
 
-# derive the process exit code from an executed outcome
-#
-# Every failure in the outcome was already rendered through the engine's
-# render seam, so this is pure derivation: ok is 0, a user error 1, an
-# internal fault 2.
+# map a build outcome's severity to the process exit code
 # ---
-# bo:  the executed outcome
-# ret: the process exit code
+# bo: the outcome
+# ret: 0 ok, 1 user, 2 internal, 3 environment; any other severity panics
 pub fun outcome_code(bo: *outcome.BuildOutcome) i64 {
-    if (bo.ok)       { ret 0; }
-    if (bo.internal) { ret 2; }
+    if (bo.severity == outcome.BUILD_OK)          { ret 0; }
+    if (bo.severity == outcome.BUILD_USER)        { ret 1; }
+    if (bo.severity == outcome.BUILD_INTERNAL)    { ret 2; }
+    if (bo.severity == outcome.BUILD_ENVIRONMENT) { ret 3; }
+    panic("cli.diagnostic.outcome_code: unrecognized outcome.BuildSeverity\n");
     ret 1;
 }
 
-# the CLI's render-seam state: what the engine's render events need to know
-# ---
-# units: the plan's unit count (the banner prints only on a multi-unit build)
-pub rec RenderCtx {
-    units: usize;
-}
-
-# build the CLI's standard render sink over caller-owned ctx storage
-#
-# The engine emits unit banners, the scalarization note, failures, and
-# diagnostics flushes through the returned seam; every byte lands on stderr
-# exactly as the moment occurs.
-# ---
-# rc:    the ctx cell the sink borrows (must outlive the execution)
-# units: the plan's unit count
-# ret:   an outcome.Render bound to `rc`
-pub fun render_sink(rc: *RenderCtx, units: usize) outcome.Render {
-    rc.units = units;
-    var rd: outcome.Render;
-    rd.ctx      = rc::ptr;
-    rd.fn_unit  = sink_unit;
-    rd.fn_note  = sink_note;
-    rd.fn_fail  = sink_fail;
-    rd.fn_diags = sink_diags;
-    ret rd;
-}
-
-# write a `building <artifact> (<target>)` progress line to stderr before a
-# plan unit compiles, on a multi-unit build; the target is omitted when default
-fun sink_unit(ctx: ptr, artifact: str, target: str, has_artifact: bool) {
-    val rc: *RenderCtx = ctx::*RenderCtx;
-    if (rc.units <= 1) { ret; }
-    print.eprint("building ");
-    if (has_artifact) { print.eprint(artifact); }
-    or                { print.eprint("project"); }
+fun sink_unit_w(w: *writer.Writer, units: usize, quiet: bool, artifact: str, target: str, has_artifact: bool) {
+    if (quiet)      { ret; }
+    if (units <= 1) { ret; }
+    fmt.write_str(w, "building ");
+    if (has_artifact) { fmt.write_str(w, artifact); }
+    or                { fmt.write_str(w, "project"); }
     if (!str_empty(target)) {
-        print.eprint(" (");
-        print.eprint(target);
-        print.eprint(")");
+        fmt.write_str(w, " (");
+        fmt.write_str(w, target);
+        fmt.write_str(w, ")");
     }
-    print.eprint("\n");
+    fmt.write_str(w, "\n");
 }
 
-# emit the one-shot vector-scalarization note (#2016) in the `report_skipped`
-# style: lowercase `note:`, singular/plural on the count, stderr
-#
-# THE REASON IS NO LONGER "no SIMD" and the note must not claim it is. Scalarization
-# is per OPERATION (#2726) and per SHAPE (#2727): a target with a full vector unit
-# scalarizes an operator it has no packed word for, and any shape wider than its
-# vector register, so a note reading "target has no SIMD" on x86-64 sent the reader
-# to check a capability the target plainly has. What the note states is the posture
-# that allowed it; `simd = "require"` names the exact operator and shape instead.
-fun sink_note(ctx: ptr, total: u32) {
+fun sink_note_w(w: *writer.Writer, total: u32) {
     if (total == 1) {
-        print.eprintf("note: scalarized {} vector operation with no packed form on this target (simd = \"scalarize\")\n", total::i64);
+        fmt.vformat(w, "note: scalarized {} vector operation with no packed form on this target (simd = \"scalarize\")\n", total::i64);
     }
     or {
-        print.eprintf("note: scalarized {} vector operations with no packed form on this target (simd = \"scalarize\")\n", total::i64);
+        fmt.vformat(w, "note: scalarized {} vector operations with no packed form on this target (simd = \"scalarize\")\n", total::i64);
     }
 }
 
-# render a failure the moment it lands (render_fail's printing half)
-fun sink_fail(ctx: ptr, f: *outcome.Fail) {
-    render_fail(f);
+fun build_unit_count(bo: *outcome.BuildOutcome) usize {
+    var total: usize = 0;
+    var i: usize = 0;
+    for (i < bo.events.len) {
+        if (bo.events.data[i].kind == outcome.BUILD_EVENT_UNIT) { total = total + 1; }
+        i = i + 1;
+    }
+    ret total;
 }
 
-# flush a unit session's located diagnostics to stderr
-fun sink_diags(ctx: ptr, sp: ptr) {
-    val s: *session.Session = sp::*session.Session;
-    var diag_w: writer.Writer = fs.writer(fs.STDERR);
-    flush(?diag_w, s, ?s.diags);
+fun render_outcome_w(w: *writer.Writer, bo: *outcome.BuildOutcome, quiet: bool) {
+    val units: usize = build_unit_count(bo);
+    var i: usize = 0;
+    for (i < bo.events.len) {
+        val ev: *outcome.BuildEvent = ?bo.events.data[i];
+        if (ev.kind == outcome.BUILD_EVENT_UNIT) {
+            sink_unit_w(w, units, quiet, ev.data.unit.artifact, ev.data.unit.target, ev.data.unit.has_artifact);
+        }
+        or (ev.kind == outcome.BUILD_EVENT_NOTE) {
+            sink_note_w(w, ev.data.scalarized);
+        }
+        or (ev.kind == outcome.BUILD_EVENT_FAIL) {
+            render_fail_w(w, ?ev.data.fail);
+        }
+        or (ev.kind == outcome.BUILD_EVENT_DIAGNOSTICS) {
+            flush_sources(w, ev.data.diagnostics.sources, ev.data.diagnostics.diags);
+        }
+        or {
+            panic("cli.diagnostic.render_outcome_w: unrecognized build event kind\n");
+        }
+        i = i + 1;
+    }
+}
+
+# render a build outcome's events to stderr in order: unit banners, scalarization notes,
+# failures, and diagnostics
+# ---
+# bo: the outcome
+# quiet: suppress the "building <artifact> (<target>)" banner, which prints only when the
+#  outcome has more than one unit
+pub fun render_outcome(bo: *outcome.BuildOutcome, quiet: bool) {
+    var w: writer.Writer = stderr_writer();
+    render_outcome_w(?w, bo, quiet);
+}
+
+test "mach.cli.diagnostic.render_fail:classifies_exit_code_and_suppresses_reported_output" {
+    var buf: [256]u8;
+    var sink: MemSink;
+    var w: writer.Writer;
+    mem_writer(?w, ?sink, ?buf[0], 256);
+
+    var rf: outcome.Fail = outcome.reported();
+    if (render_fail_w(?w, ?rf) != 1) { ret 1; }
+    if (sink.len != 0)               { ret 2; }
+
+    var uf: outcome.Fail = outcome.user("bad input");
+    if (render_fail_w(?w, ?uf) != 1)              { ret 3; }
+    if (!sink_contains(?sink, "error: bad input")) { ret 4; }
+
+    var buf2: [256]u8;
+    var sink2: MemSink;
+    var w2: writer.Writer;
+    mem_writer(?w2, ?sink2, ?buf2[0], 256);
+    var iv: outcome.Fail = outcome.internal("boom");
+    if (render_fail_w(?w2, ?iv) != 2)          { ret 5; }
+    if (!sink_contains(?sink2, "error: boom")) { ret 6; }
+
+    var buf3: [256]u8;
+    var sink3: MemSink;
+    var w3: writer.Writer;
+    mem_writer(?w3, ?sink3, ?buf3[0], 256);
+    var ev: outcome.Fail = outcome.environment("disk full");
+    if (render_fail_w(?w3, ?ev) != 3)               { ret 7; }
+    if (!sink_contains(?sink3, "error: disk full")) { ret 8; }
+
+    ret 0;
+}
+
+test "mach.cli.diagnostic.outcome_code:maps_every_closed_severity" {
+    var ok_bo: outcome.BuildOutcome;
+    ok_bo.severity = outcome.BUILD_OK;
+    if (outcome_code(?ok_bo) != 0) { ret 1; }
+
+    var user_bo: outcome.BuildOutcome;
+    user_bo.severity = outcome.BUILD_USER;
+    if (outcome_code(?user_bo) != 1) { ret 2; }
+
+    var internal_bo: outcome.BuildOutcome;
+    internal_bo.severity = outcome.BUILD_INTERNAL;
+    if (outcome_code(?internal_bo) != 2) { ret 3; }
+
+    var env_bo: outcome.BuildOutcome;
+    env_bo.severity = outcome.BUILD_ENVIRONMENT;
+    if (outcome_code(?env_bo) != 3) { ret 4; }
+
+    ret 0;
+}
+
+test "mach.cli.diagnostic.sink_unit:suppressed_for_a_single_unit_shown_for_many" {
+    var buf: [256]u8;
+    var sink: MemSink;
+    var w: writer.Writer;
+    mem_writer(?w, ?sink, ?buf[0], 256);
+
+    sink_unit_w(?w, 1, false, "app", "linux", true);
+    if (sink.len != 0) { ret 1; }
+
+    sink_unit_w(?w, 2, false, "app", "linux", true);
+    if (!sink_contains(?sink, "building app (linux)\n")) { ret 2; }
+
+    var buf2: [256]u8;
+    var sink2: MemSink;
+    var w2: writer.Writer;
+    mem_writer(?w2, ?sink2, ?buf2[0], 256);
+    sink_unit_w(?w2, 2, false, "app", "", false);
+    if (!sink_contains(?sink2, "building project\n")) { ret 3; }
+
+    ret 0;
+}
+
+test "mach.cli.diagnostic.sink_unit:quiet_suppresses_multi_unit_banner" {
+    var buf: [256]u8;
+    var sink: MemSink;
+    var w: writer.Writer;
+    mem_writer(?w, ?sink, ?buf[0], 256);
+
+    sink_unit_w(?w, 2, true, "app", "linux", true);
+    if (sink.len != 0) { ret 1; }
+
+    ret 0;
+}
+
+test "mach.cli.diagnostic.sink_note:singular_and_plural" {
+    var buf: [256]u8;
+    var sink: MemSink;
+    var w: writer.Writer;
+    mem_writer(?w, ?sink, ?buf[0], 256);
+    sink_note_w(?w, 1);
+    if (!sink_contains(?sink, "scalarized 1 vector operation with")) { ret 1; }
+
+    var buf2: [256]u8;
+    var sink2: MemSink;
+    var w2: writer.Writer;
+    mem_writer(?w2, ?sink2, ?buf2[0], 256);
+    sink_note_w(?w2, 3);
+    if (!sink_contains(?sink2, "scalarized 3 vector operations with")) { ret 2; }
+
+    ret 0;
+}
+
+test "mach.cli.diagnostic.render_outcome_w:consumes_owned_events_in_order" {
+    var a: A.Allocator;
+    page.make(?a);
+    var bo: outcome.BuildOutcome = outcome.outcome_init(?a);
+    var f: outcome.Fail = outcome.user("bad input");
+
+    if (R.is_err[R.Void, str](outcome.record_unit(?bo, "app", "linux", true))) { outcome.outcome_dnit(?bo); ret 1; }
+    if (R.is_err[R.Void, str](outcome.record_unit(?bo, "lib", "", true)))      { outcome.outcome_dnit(?bo); ret 1; }
+    if (R.is_err[R.Void, str](outcome.record_note(?bo, 2)))                    { outcome.outcome_dnit(?bo); ret 1; }
+    if (R.is_err[R.Void, str](outcome.record_fail(?bo, ?f)))                   { outcome.outcome_dnit(?bo); ret 1; }
+
+    var buf: [512]u8;
+    var sink: MemSink;
+    var w: writer.Writer;
+    mem_writer(?w, ?sink, ?buf[0], 512);
+    render_outcome_w(?w, ?bo, false);
+
+    var bad: i32 = 0;
+    if (!sink_contains(?sink, "building app (linux)\n")) { bad = 1; }
+    if (!sink_contains(?sink, "building lib\n"))         { bad = 1; }
+    if (!sink_contains(?sink, "scalarized 2 vector operations")) { bad = 1; }
+    if (!sink_contains(?sink, "error: bad input\n"))     { bad = 1; }
+
+    outcome.outcome_dnit(?bo);
+    ret bad;
+}
+
+test "mach.cli.diagnostic.render_outcome_w:diagnostics_survive_session_teardown" {
+    var a: A.Allocator;
+    page.make(?a);
+    val session_r: R.Result[session.Session, str] = session.init(?a);
+    if (R.is_err[session.Session, str](session_r)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](session_r);
+
+    val file_r: R.Result[source.FileId, str] = session.load_source(?s, "owned.mach", "bad value\n");
+    if (R.is_err[source.FileId, str](file_r)) { session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](file_r);
+    val file_o: O.Option[*source.SourceFile] = source.get(?s.sources, fid);
+    if (O.is_none[*source.SourceFile](file_o)) { session.dnit(?s); ret 1; }
+    val sf: *source.SourceFile = O.unwrap[*source.SourceFile](file_o);
+    if (R.is_err[R.Void, str](diagnostic.error(?s.diags, fid, line_span(sf, 1), "owned diagnostic"))) {
+        session.dnit(?s);
+        ret 1;
+    }
+
+    var bo: outcome.BuildOutcome = outcome.outcome_init(?a);
+    if (R.is_err[R.Void, str](outcome.record_diagnostics(?bo, ?s.sources, ?s.diags))) {
+        outcome.outcome_dnit(?bo);
+        session.dnit(?s);
+        ret 1;
+    }
+    session.dnit(?s);
+
+    var buf: [512]u8;
+    var sink: MemSink;
+    var w: writer.Writer;
+    mem_writer(?w, ?sink, ?buf[0], 512);
+    render_outcome_w(?w, ?bo, false);
+
+    var bad: i32 = 0;
+    if (!sink_contains(?sink, "owned diagnostic")) { bad = 1; }
+    if (!sink_contains(?sink, "owned.mach:1:1"))   { bad = 1; }
+    if (!sink_contains(?sink, "1 | bad value"))    { bad = 1; }
+    outcome.outcome_dnit(?bo);
+    ret bad;
+}
+
+test "mach.cli.diagnostic.mem_sink_write:reports_only_bytes_actually_written" {
+    var buf: [4]u8;
+    var sink: MemSink;
+    var w: writer.Writer;
+    mem_writer(?w, ?sink, ?buf[0], 4);
+
+    val r: R.Result[usize, str] = fmt.write_str(?w, "hello");
+    if (R.is_ok[usize, str](r)) { ret 1; }
+    if (sink.len != 4)          { ret 2; }
+
+    ret 0;
 }

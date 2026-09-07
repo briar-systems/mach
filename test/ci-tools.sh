@@ -66,18 +66,15 @@ install_llvm() {
     fi
 
     if [ "$host_os" = darwin ]; then
-        # homebrew's `llvm` is the current stable and carries no version in its name,
-        # so it is checked against the pin rather than trusted: when brew's stable
-        # moves past the pinned major this fails and names the versioned formula,
-        # instead of installing a decoder no golden was blessed against. llvm is
-        # keg-only, so its tools reach PATH only through the prefix.
-        brew install llvm
+        # select the pinned major independently of homebrew's moving stable formula
+        local formula="llvm@$major"
+        brew install "$formula"
         local prefix
-        prefix=$(brew --prefix llvm)
+        prefix=$(brew --prefix "$formula")
         local got
         got=$("$prefix/bin/llvm-objdump" --version | grep -o 'LLVM version [0-9]*' | grep -o '[0-9]*$')
         if [ "$got" != "$major" ]; then
-            echo "ci-tools.sh: brew's llvm is major $got and tools.lock pins $major; install llvm@$major instead, or move the pin and re-bless" >&2
+            echo "ci-tools.sh: $formula installed major $got but tools.lock pins $major" >&2
             exit 1
         fi
         echo "$prefix/bin" >> "${GITHUB_PATH:-/dev/null}"

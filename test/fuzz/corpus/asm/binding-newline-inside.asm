@@ -1,0 +1,2 @@
+mov rax, {a
+b}

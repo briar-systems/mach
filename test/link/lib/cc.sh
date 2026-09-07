@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cc.sh — resolve a C compiler for the leg a case's [step] is building against.
 #
-# A [step] that shells out to a bare `cc` assumes the host toolchain targets the
+# A [step] that invokes a bare `cc` assumes the host toolchain targets the
 # leg being built. That holds on a leg's own native CI runner (every engines.conf
 # row builds natively there) but not on a developer's cross-build from a
 # different host - `mach --target linux-arm64` on an x86-64 box still runs the
@@ -25,10 +25,9 @@
 #
 # usage: cc.sh <compiler args...>  (same argv a bare `cc` would take)
 #
-# a case's [step] invokes this instead of `cc` directly; MACH_TARGET_ISA /
-# MACH_TARGET_OS / MACH_TARGET_ABI are already injected into every step's
-# environment for the active build cell (#1964), which is what makes this
-# possible without threading the target through the step's own cmd string.
+# a case's [step] invokes this instead of `cc` directly and declares
+# MACH_TARGET_ISA / MACH_TARGET_OS / MACH_TARGET_ABI in its environment from
+# the active build cell's templates.
 set -eu
 
 : "${MACH_TARGET_ISA:?cc.sh: MACH_TARGET_ISA is not set - this must run as a mach build [step]}"
@@ -56,11 +55,8 @@ host_os() {
 # host_cc - the host's own C compiler, by whatever name it answers to.
 #
 # `cc` is the POSIX spelling and every unix runner has one. WINDOWS DOES NOT: neither
-# Git Bash nor the image's Visual Studio install provides that name. CI already works
-# around it by exporting `CC=gcc` from ci-tools.sh ("cc is spelled gcc on this host,
-# per tools.lock"), so the gap only bites a host where nothing sets CC - a developer's
-# own Windows machine, which is where a case is most likely to be run by hand and least
-# likely to have the environment CI builds.
+# Git Bash nor the image's Visual Studio install provides that name. The candidates
+# below resolve gcc or clang directly from the step's declared PATH.
 #
 # gcc and clang accept the same flags a bare `cc` does, so resolving to either needs no
 # argv translation and no case has to know which one answered. MSVC's `cl` does not
@@ -68,10 +64,6 @@ host_os() {
 # flag dialect for one call site is a permanent maintenance cost, and every candidate
 # ahead of it produces the same object for this purpose.
 host_cc() {
-    if [ -n "${CC:-}" ]; then
-        echo "$CC"
-        return 0
-    fi
     for candidate in cc gcc clang; do
         if command -v "$candidate" >/dev/null 2>&1; then
             echo "$candidate"
@@ -79,7 +71,7 @@ host_cc() {
         fi
     done
     if command -v cl >/dev/null 2>&1; then
-        echo "cc.sh: the only host C compiler on PATH is MSVC 'cl', whose flags are spelled differently from a bare 'cc' ('/c', '/Fo:') - this script passes a case's argv through unchanged. put a gcc or clang on PATH, or set CC to one." >&2
+        echo "cc.sh: the only host C compiler on PATH is MSVC 'cl', whose flags are spelled differently from a bare 'cc' ('/c', '/Fo:') - this script passes a case's argv through unchanged. put a gcc or clang on the step's declared PATH." >&2
     else
         echo "cc.sh: no host C compiler on PATH (tried cc, gcc, clang). a case's [step] that compiles C needs one on every leg that runs it." >&2
     fi
@@ -161,15 +153,14 @@ case "$MACH_TARGET_OS-$MACH_TARGET_ISA" in
     # <sysroot>/include and stops searching the host's /usr/include, so a probe
     # either compiles against riscv64's own headers or fails naming the one it
     # wanted. The path is where Ubuntu's `libc6-dev-riscv64-cross` installs, which
-    # ci.yml installs on this leg; MACH_RISCV64_SYSROOT overrides it for a host
-    # that keeps its cross headers elsewhere. Absent, the build stops here naming
-    # the package rather than falling back to the host's headers, which is exactly
+    # ci.yml installs on this leg. Absent, the build stops here naming the package
+    # rather than falling back to the host's headers, which is exactly
     # the silent wrong-headers outcome this exists to prevent.
     linux-riscv64)
         triple=riscv64-linux-gnu
-        sysroot=${MACH_RISCV64_SYSROOT:-/usr/riscv64-linux-gnu}
+        sysroot=/usr/riscv64-linux-gnu
         if [ ! -d "$sysroot/include" ]; then
-            echo "cc.sh: cross-building linux-riscv64 needs riscv64 libc headers, and none are at '$sysroot/include' - install Ubuntu's libc6-dev-riscv64-cross (or your distro's riscv64-linux-gnu glibc headers) and point MACH_RISCV64_SYSROOT at it if it lands elsewhere. compiling against the host's headers instead would emit an object built to the wrong architecture's libc (mach#2741, mach#2771)" >&2
+            echo "cc.sh: cross-building linux-riscv64 needs riscv64 libc headers, and none are at '$sysroot/include' - install Ubuntu's libc6-dev-riscv64-cross. compiling against the host's headers instead would emit an object built to the wrong architecture's libc (mach#2741, mach#2771)" >&2
             exit 1
         fi
         extra="-march=rv64gc -mabi=lp64d -mno-relax -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-jump-tables"
@@ -191,9 +182,8 @@ fi
 
 # $extra is deliberately unquoted: it is always either empty or a fixed set of
 # single-word flags built above, never user input, so word-splitting it here is
-# the intended expansion, not a quoting bug. the sysroot is the opposite - it can
-# come from MACH_RISCV64_SYSROOT - so it rides its own quoted expansion, present
-# only for a branch that set one.
+# the intended expansion, not a quoting bug. the sysroot rides its own quoted
+# expansion and is present only for a branch that set one.
 clang -target "$triple" ${sysroot_arg:+--sysroot="$sysroot_arg"} $extra "$@" || exit $?
 
 # the -mabi/-march pin above is a REQUEST, and a toolchain that does not honour it

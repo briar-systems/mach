@@ -1,51 +1,3 @@
-# mach.lang.be.codegen.looprotate: MIR-level loop rotation (#1937, #2211)
-#
-# Rotates a top-test loop into bottom-test form so the steady state runs one taken
-# branch per iteration instead of two. A `for (cond)` lowers with the test in the
-# loop header and the body branching back to it, so each iteration takes two taken
-# branches: the header's conditional into the body and the body's unconditional
-# back edge. This pass duplicates the header test into the preheader as an entry
-# guard, which both preserves the zero-trip semantics (the guard skips the loop
-# when the condition is initially false) and, once the preheader branches straight
-# to the body, lets the register allocator's reverse-postorder layout place the
-# exit after the latch: the latch then falls through into the test and the single
-# conditional back edge is the only taken branch. It composes with the fallthrough
-# elision of #1936, which drops the latch's now-redundant branch to the test.
-#
-# Why MIR, not IR: at this point `mir.lower_ir` has already destroyed SSA phis
-# into ordinary register copies placed at the ends of the predecessor blocks. The
-# loop-carried updates therefore already live at the end of the latch (which ends
-# in an unconditional back edge) and the initial values at the end of the
-# preheader. Adding the guard needs no phi surgery and creates no critical edge
-# that the backend would split into a detour block - the two properties that make
-# an IR-level rotate regress under the backend's unconditional critical-edge
-# splitting. The transform is a target-neutral CFG rewrite over the shared MIR.
-#
-# Scope: the loop must have one entry (the header `H`), one preheader `P` and one
-# exit block `E`, and `H`'s test must be duplicable. Concretely:
-#
-#   - `H` ends in a conditional branch `cbr cond, B, E`;
-#   - the loop is every block reachable from `B` without re-entering `H` or
-#     leaving through `E`. Exactly one of `H`'s predecessors lies outside it - the
-#     preheader `P`, which must end in `br H` - and at least one inside it (a back
-#     edge). A multi-block body, a nested loop, `cnt`'s second back edge and
-#     `brk`'s early exit into `E` all satisfy this;
-#   - every instruction of `H` before the terminator is duplicable computation -
-#     register arithmetic, compares, conversions, moves, and the address / load
-#     reads that a `for (i < LIMIT)` over a module-scope bound lowers to - and one
-#     of them defines `cond`. A store, a call, an alloca or inline asm is not
-#     duplicable and declines the loop;
-#   - no value `H` defines is read outside `H`, since the rotated entry path
-#     branches around `H` and would leave such a read undefined.
-#
-# The duplicated test is evaluated in `P` exactly where `H`'s first evaluation ran
-# (`P` unconditionally entered `H`), so a cloned load reads the same memory at the
-# same point and can neither fault nor observe a body write that the original did
-# not. `H` ends in a conditional branch, so `mir.lower_ir` split every critical
-# edge out of it: `H` carries no phi-destruction copies, and the new `P -> B` /
-# `P -> E` edges need none either. A loop that does not match is left untouched -
-# correctness preserved, optimization skipped.
-
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -57,40 +9,21 @@ use std.allocator.page;
 use A: std.allocator;
 use R: std.types.result;
 
-use mir: mach.lang.be.codegen.mir;
+use mach.lang.be.codegen.mir;
 use mach.lang.source;
 use mach.lang.target;
 
-# rotate every rotatable loop in every function of a MIR module in place
-#
-# Target-neutral: the transform reads and rewrites only the shared MIR CFG, so it
-# runs once before instruction selection for every register-machine ISA.
-# ---
-# tgt: resolved target (unused; accepted for pipeline-stage signature parity)
-# m:   the MIR module to rotate in place
-# ret: ok(true) on success, or an allocation error
-pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[bool, str] {
-    if (m == nil) { ret R.err[bool, str]("looprotate: nil mir module"); }
+pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[R.Void, str] {
+    if (m == nil) { ret R.err[R.Void, str]("looprotate: nil mir module"); }
     var fi: u32 = 0;
     for (fi < m.function_len) {
-        val r: R.Result[bool, str] = rotate_function(m.alloc, ?m.functions[fi]);
-        if (R.is_err[bool, str](r)) { ret r; }
+        val r: R.Result[R.Void, str] = rotate_function(m.alloc, ?m.functions[fi]);
+        if (R.is_err[R.Void, str](r)) { ret r; }
         fi = fi + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# per-function scratch shared by every shape match in one function
-#
-# Block ids and the block count are stable across the pass (rotation rewrites a
-# terminator, never adds or removes a block), so one allocation serves every
-# candidate header.
-# ---
-# id_index:     block id -> index into `f.blocks`; MIR_VREG_NIL where no block owns the id
-# id_index_cap: length of `id_index` (the largest block id plus one)
-# in_loop:      per-block-index mark: true when the block lies inside the candidate loop
-# stack:        the loop-reachability DFS work stack, one slot per block
-# block_count:  length of `in_loop` and `stack`
 rec LoopScratch {
     id_index:     *u32;
     id_index_cap: u32;
@@ -99,47 +32,32 @@ rec LoopScratch {
     block_count:  u32;
 }
 
-# rotate every rotatable loop header in one function
-#
-# Predecessor lists are the source of truth for the shape match and for the
-# allocator's fallthrough detection, so they are rebuilt from the terminators
-# up front and again after each rotation (which retargets an edge).
-# ---
-# alloc: the function's backing allocator
-# f:     the MIR function to rotate in place
-# ret:   ok(true) on success, or an allocation error
-fun rotate_function(alloc: *A.Allocator, f: *mir.MirFunction) R.Result[bool, str] {
-    if (f.block_count == 0) { ret R.ok[bool, str](true); }
+fun rotate_function(alloc: *A.Allocator, f: *mir.MirFunction) R.Result[R.Void, str] {
+    if (f.block_count == 0) { ret R.ok_void[str](); }
 
     var sc: LoopScratch;
-    val si: R.Result[bool, str] = scratch_init(alloc, f, ?sc);
-    if (R.is_err[bool, str](si)) { ret si; }
+    val si: R.Result[R.Void, str] = scratch_init(alloc, f, ?sc);
+    if (R.is_err[R.Void, str](si)) { ret si; }
 
-    val rp: R.Result[bool, str] = rebuild_preds(alloc, f, ?sc);
-    if (R.is_err[bool, str](rp)) { scratch_dnit(alloc, ?sc); ret rp; }
+    val rp: R.Result[R.Void, str] = rebuild_preds(alloc, f, ?sc);
+    if (R.is_err[R.Void, str](rp)) { scratch_dnit(alloc, ?sc); ret rp; }
 
     var bi: u32 = 0;
     for (bi < f.block_count) {
-        val r: R.Result[bool, str] = try_rotate_header(alloc, f, ?sc, ?f.blocks[bi]);
-        if (R.is_err[bool, str](r)) { scratch_dnit(alloc, ?sc); ret r; }
-        if (R.unwrap_ok[bool, str](r)) {
-            val rp2: R.Result[bool, str] = rebuild_preds(alloc, f, ?sc);
-            if (R.is_err[bool, str](rp2)) { scratch_dnit(alloc, ?sc); ret rp2; }
+        val rotated_r: R.Result[bool, str] = try_rotate_header(alloc, f, ?sc, ?f.blocks[bi]);
+        if (R.is_err[bool, str](rotated_r)) { scratch_dnit(alloc, ?sc); ret R.err[R.Void, str](R.unwrap_err[bool, str](rotated_r)); }
+        if (R.unwrap_ok[bool, str](rotated_r)) {
+            val rp2: R.Result[R.Void, str] = rebuild_preds(alloc, f, ?sc);
+            if (R.is_err[R.Void, str](rp2)) { scratch_dnit(alloc, ?sc); ret rp2; }
         }
         bi = bi + 1;
     }
 
     scratch_dnit(alloc, ?sc);
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# allocate the per-function scratch and fill the block-id -> index map
-# ---
-# alloc: the function's backing allocator
-# f:     the function the scratch describes
-# sc:    the scratch to initialize (owned by the caller, freed with `scratch_dnit`)
-# ret:   ok(true) on success, or an allocation error (the scratch is left freed)
-fun scratch_init(alloc: *A.Allocator, f: *mir.MirFunction, sc: *LoopScratch) R.Result[bool, str] {
+fun scratch_init(alloc: *A.Allocator, f: *mir.MirFunction, sc: *LoopScratch) R.Result[R.Void, str] {
     sc.id_index     = nil;
     sc.id_index_cap = 0;
     sc.in_loop      = nil;
@@ -155,7 +73,7 @@ fun scratch_init(alloc: *A.Allocator, f: *mir.MirFunction, sc: *LoopScratch) R.R
 
     val cap: u32 = max_id + 1;
     val ri: R.Result[*u32, str] = A.allocate[u32](alloc, cap::usize);
-    if (R.is_err[*u32, str](ri)) { ret R.err[bool, str](R.unwrap_err[*u32, str](ri)); }
+    if (R.is_err[*u32, str](ri)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](ri)); }
     sc.id_index     = R.unwrap_ok[*u32, str](ri);
     sc.id_index_cap = cap;
     var k: u32 = 0;
@@ -166,24 +84,20 @@ fun scratch_init(alloc: *A.Allocator, f: *mir.MirFunction, sc: *LoopScratch) R.R
     val rb: R.Result[*bool, str] = A.allocate[bool](alloc, f.block_count::usize);
     if (R.is_err[*bool, str](rb)) {
         scratch_dnit(alloc, sc);
-        ret R.err[bool, str](R.unwrap_err[*bool, str](rb));
+        ret R.err[R.Void, str](R.unwrap_err[*bool, str](rb));
     }
     sc.in_loop = R.unwrap_ok[*bool, str](rb);
 
     val rs: R.Result[*u32, str] = A.allocate[u32](alloc, f.block_count::usize);
     if (R.is_err[*u32, str](rs)) {
         scratch_dnit(alloc, sc);
-        ret R.err[bool, str](R.unwrap_err[*u32, str](rs));
+        ret R.err[R.Void, str](R.unwrap_err[*u32, str](rs));
     }
     sc.stack = R.unwrap_ok[*u32, str](rs);
 
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# free every scratch array and reset the handles
-# ---
-# alloc: the allocator the scratch was taken from
-# sc:    the scratch to release
 fun scratch_dnit(alloc: *A.Allocator, sc: *LoopScratch) {
     if (sc.id_index != nil) {
         A.deallocate[u32](alloc, sc.id_index, sc.id_index_cap::usize);
@@ -200,39 +114,17 @@ fun scratch_dnit(alloc: *A.Allocator, sc: *LoopScratch) {
     }
 }
 
-# the index into `f.blocks` of the block whose id is `id`, or MIR_VREG_NIL
-# ---
-# sc: the scratch holding the id map
-# id: the block id to resolve
-# ret: the block index, or MIR_VREG_NIL when no block owns the id
 fun block_index(sc: *LoopScratch, id: u32) u32 {
     if (id >= sc.id_index_cap) { ret mir.MIR_VREG_NIL; }
     ret sc.id_index[id];
 }
 
-# the block whose id equals `id`, or nil when none matches
-# ---
-# f:   the function to search
-# sc:  the scratch holding the id map
-# id:  the block id to find
-# ret: the matching block, or nil
 fun find_block(f: *mir.MirFunction, sc: *LoopScratch, id: u32) *mir.MirBlock {
     val ix: u32 = block_index(sc, id);
     if (ix == mir.MIR_VREG_NIL) { ret nil; }
     ret ?f.blocks[ix];
 }
 
-# match the rotatable loop shape at header `h` and rotate it when it fits
-#
-# Returns ok(true) when a rotation was performed, ok(false) when `h` is not a
-# rotatable header (the loop is left untouched), or an error on allocation
-# failure during a rotation.
-# ---
-# alloc: the function's backing allocator
-# f:     the owning MIR function
-# sc:    the per-function scratch
-# h:     the candidate loop header block
-# ret:   ok(true) rotated, ok(false) not a match, or an allocation error
 fun try_rotate_header(alloc: *A.Allocator, f: *mir.MirFunction, sc: *LoopScratch,
                       h: *mir.MirBlock) R.Result[bool, str] {
     if (h.instr_count == 0) { ret R.ok[bool, str](false); }
@@ -246,23 +138,17 @@ fun try_rotate_header(alloc: *A.Allocator, f: *mir.MirFunction, sc: *LoopScratch
     if (term.operands[2].kind != mir.MIR_OP_BLOCK) { ret R.ok[bool, str](false); }
 
     val cond_vreg: u32 = cond_op.vreg;
-    val b_id: u32 = term.operands[1].imm::u32;  # then: the loop body's first block
-    val e_id: u32 = term.operands[2].imm::u32;  # else: the loop exit
+    val b_id: u32 = term.operands[1].imm::u32;
+    val e_id: u32 = term.operands[2].imm::u32;
     if (b_id == e_id)  { ret R.ok[bool, str](false); }
     if (b_id == h.id)  { ret R.ok[bool, str](false); }
     if (e_id == h.id)  { ret R.ok[bool, str](false); }
 
-    # a loop header is entered from outside and from at least one back edge.
     if (h.pred_count < 2) { ret R.ok[bool, str](false); }
 
-    # H's test must be clonable computation defining the branch condition, and none
-    # of the values it defines may be read outside H: the rotated entry path
-    # branches around H, so such a read would see an undefined register.
     if (!test_clonable(h, cond_vreg)) { ret R.ok[bool, str](false); }
     if (!defs_confined(f, h))         { ret R.ok[bool, str](false); }
 
-    # partition H's predecessors against the loop: exactly one outside it is the
-    # preheader P, and at least one inside it is a back edge.
     if (!mark_loop(f, sc, b_id, h.id, e_id)) { ret R.ok[bool, str](false); }
     var p_id: u32 = mir.MIR_VREG_NIL;
     var outside: u32 = 0;
@@ -283,27 +169,17 @@ fun try_rotate_header(alloc: *A.Allocator, f: *mir.MirFunction, sc: *LoopScratch
     if (p_id == h.id) { ret R.ok[bool, str](false); }
     if (p_id == e_id) { ret R.ok[bool, str](false); }
 
-    # P: a clean preheader whose sole successor is H, so its terminator can be
-    # replaced by the guard outright.
     val p: *mir.MirBlock = find_block(f, sc, p_id);
     if (p == nil)                { ret R.ok[bool, str](false); }
     if (!ends_in_br_to(p, h.id)) { ret R.ok[bool, str](false); }
 
-    ret rotate(alloc, f, h, p, b_id, e_id, cond_vreg);
+    val rotated: R.Result[R.Void, str] = rotate(alloc, f, h, p, b_id, e_id, cond_vreg);
+
+    if (R.is_err[R.Void, str](rotated)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](rotated)); }
+
+    ret R.ok[bool, str](true);
 }
 
-# mark every block of the loop entered at `b_id` into `sc.in_loop`
-#
-# The loop is what a forward walk from the header's body target reaches without
-# re-entering the header or leaving through the exit block, so `cnt`'s back-edge
-# block and a nested loop are inside it while everything past the exit is not.
-# ---
-# f:    the owning function
-# sc:   the scratch whose `in_loop` marks and `stack` the walk uses
-# b_id: the header's body target, the walk's root
-# h_id: the header id, a walk barrier
-# e_id: the exit id, a walk barrier
-# ret:  true when the walk ran (false when `b_id` names no block)
 fun mark_loop(f: *mir.MirFunction, sc: *LoopScratch, b_id: u32, h_id: u32, e_id: u32) bool {
     var i: u32 = 0;
     for (i < sc.block_count) { sc.in_loop[i] = false; i = i + 1; }
@@ -341,67 +217,40 @@ fun mark_loop(f: *mir.MirFunction, sc: *LoopScratch, b_id: u32, h_id: u32, e_id:
     ret true;
 }
 
-# perform the rotation once the shape is confirmed: duplicate H's test and its
-# conditional branch into P as the entry guard, replacing P's `br H`
-#
-# The guard's clones read the loop-carried registers at their preheader values
-# (the initial-value copies already sitting at the end of P), so the guard tests
-# the first iteration's condition exactly as H's original entry evaluation did.
-# H is left intact, now reached only by the loop's back edges.
-# ---
-# alloc:     the function's backing allocator
-# f:         the owning MIR function
-# h:         the loop header (its test + cbr are the clone source)
-# p:         the preheader receiving the guard
-# b_id/e_id: the body and exit block ids the guard branches to
-# cond_vreg: H's branch-condition vreg, remapped to its clone for the guard
-# ret:       ok(true) on success, or an allocation error
 fun rotate(alloc: *A.Allocator, f: *mir.MirFunction, h: *mir.MirBlock, p: *mir.MirBlock,
-           b_id: u32, e_id: u32, cond_vreg: u32) R.Result[bool, str] {
+           b_id: u32, e_id: u32, cond_vreg: u32) R.Result[R.Void, str] {
     val orig_vregs: u32 = f.vreg_count;
     val rr: R.Result[*u32, str] = A.allocate[u32](alloc, orig_vregs::usize);
-    if (R.is_err[*u32, str](rr)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rr)); }
+    if (R.is_err[*u32, str](rr)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](rr)); }
     val remap: *u32 = R.unwrap_ok[*u32, str](rr);
     var i: u32 = 0;
     for (i < orig_vregs) { remap[i] = mir.MIR_VREG_NIL; i = i + 1; }
 
-    # drop P's `br H` terminator; the guard clones take its place.
     val pt: *mir.MirInstr = ?p.instrs[p.instr_count - 1];
     if (pt.operands != nil && pt.operand_count > 0) {
         A.deallocate[mir.MirOperand](alloc, pt.operands, pt.operand_count::usize);
     }
     p.instr_count = p.instr_count - 1;
 
-    # clone H's test instructions (everything before its terminator) into P,
-    # giving each a fresh destination vreg and remapping intra-test uses.
     var k: u32 = 0;
     for (k < h.instr_count - 1) {
         val cl: R.Result[mir.MirInstr, str] = clone_compute(alloc, f, ?h.instrs[k], remap, orig_vregs);
-        if (R.is_err[mir.MirInstr, str](cl)) { A.deallocate[u32](alloc, remap, orig_vregs::usize); ret R.err[bool, str](R.unwrap_err[mir.MirInstr, str](cl)); }
-        val ap: R.Result[bool, str] = append_instr(alloc, p, R.unwrap_ok[mir.MirInstr, str](cl));
-        if (R.is_err[bool, str](ap)) { A.deallocate[u32](alloc, remap, orig_vregs::usize); ret ap; }
+        if (R.is_err[mir.MirInstr, str](cl)) { A.deallocate[u32](alloc, remap, orig_vregs::usize); ret R.err[R.Void, str](R.unwrap_err[mir.MirInstr, str](cl)); }
+        val ap: R.Result[R.Void, str] = append_instr(alloc, p, R.unwrap_ok[mir.MirInstr, str](cl));
+        if (R.is_err[R.Void, str](ap)) { A.deallocate[u32](alloc, remap, orig_vregs::usize); ret ap; }
         k = k + 1;
     }
 
-    # clone H's conditional branch as the guard, retargeting nothing (it already
-    # branches to B / E) but remapping the condition to its cloned definition.
     val hb: *mir.MirInstr = ?h.instrs[h.instr_count - 1];
     val gr: R.Result[mir.MirInstr, str] = clone_guard_cbr(alloc, hb, remap, orig_vregs, cond_vreg, b_id, e_id);
-    if (R.is_err[mir.MirInstr, str](gr)) { A.deallocate[u32](alloc, remap, orig_vregs::usize); ret R.err[bool, str](R.unwrap_err[mir.MirInstr, str](gr)); }
-    val ap2: R.Result[bool, str] = append_instr(alloc, p, R.unwrap_ok[mir.MirInstr, str](gr));
-    if (R.is_err[bool, str](ap2)) { A.deallocate[u32](alloc, remap, orig_vregs::usize); ret ap2; }
+    if (R.is_err[mir.MirInstr, str](gr)) { A.deallocate[u32](alloc, remap, orig_vregs::usize); ret R.err[R.Void, str](R.unwrap_err[mir.MirInstr, str](gr)); }
+    val ap2: R.Result[R.Void, str] = append_instr(alloc, p, R.unwrap_ok[mir.MirInstr, str](gr));
+    if (R.is_err[R.Void, str](ap2)) { A.deallocate[u32](alloc, remap, orig_vregs::usize); ret ap2; }
 
     A.deallocate[u32](alloc, remap, orig_vregs::usize);
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# whether every instruction of `h`'s test (all but the terminator) is a clonable
-# computation defining a value vreg, and one of them defines `cond_vreg` (so the
-# cloned guard re-derives the branch condition)
-# ---
-# h:         the header block whose test is inspected
-# cond_vreg: the branch-condition vreg that must be defined within the test
-# ret:       true when the test can be safely duplicated into the guard
 fun test_clonable(h: *mir.MirBlock, cond_vreg: u32) bool {
     var defines_cond: bool = false;
     var i: u32 = 0;
@@ -417,17 +266,6 @@ fun test_clonable(h: *mir.MirBlock, cond_vreg: u32) bool {
     ret defines_cond;
 }
 
-# whether no value `h`'s test defines is named by an instruction outside `h`
-#
-# The rotated entry path runs the guard and branches straight to the body or the
-# exit, so `h` no longer executes on the first iteration: any value it defines
-# that another block names would be read undefined. `h` ends in a conditional
-# branch, so `lower_ir` never placed a phi-destruction copy in it and its
-# definitions are unique - a name that reappears elsewhere is a genuine read.
-# ---
-# f:   the owning function
-# h:   the header whose test definitions are checked
-# ret: true when every test definition is confined to `h`
 fun defs_confined(f: *mir.MirFunction, h: *mir.MirBlock) bool {
     var bi: u32 = 0;
     for (bi < f.block_count) {
@@ -444,11 +282,6 @@ fun defs_confined(f: *mir.MirFunction, h: *mir.MirBlock) bool {
     ret true;
 }
 
-# whether any operand of `ins` names a vreg that `h`'s test defines
-# ---
-# h:   the header whose test definitions are the search set
-# ins: the instruction to inspect
-# ret: true when `ins` names one of them
 fun names_test_def(h: *mir.MirBlock, ins: *mir.MirInstr) bool {
     var k: u32 = 0;
     for (k < ins.operand_count) {
@@ -463,11 +296,6 @@ fun names_test_def(h: *mir.MirBlock, ins: *mir.MirInstr) bool {
     ret false;
 }
 
-# whether one of `h`'s test instructions defines vreg `v`
-# ---
-# h:   the header whose test is scanned
-# v:   the vreg id to look for
-# ret: true when a test instruction writes `v`
 fun test_defines(h: *mir.MirBlock, v: u32) bool {
     if (v == mir.MIR_VREG_NIL) { ret false; }
     var i: u32 = 0;
@@ -480,33 +308,11 @@ fun test_defines(h: *mir.MirBlock, v: u32) bool {
     ret false;
 }
 
-# whether a generic MIR opcode is a computation safe to duplicate into the guard:
-# the arithmetic / logic / compare / conversion family (0..MIR_BITCAST), a plain
-# register move, and the address / load reads a bound fetched from memory lowers
-# to. Stores, calls, allocas, inline asm and branches are excluded, so a clone has
-# no side effect. A load is duplicable because the guard sits exactly where the
-# header's first evaluation ran - it reads the same address at the same point,
-# faults where the original faulted, and cannot observe a body write
-# ---
-# op:  the opcode to classify
-# ret: true when duplicating an instruction with this opcode is side-effect-free
 fun clonable_opcode(op: mir.MirOpcode) bool {
-    if (op <= mir.MIR_BITCAST) { ret true; }
-    if (op == mir.MIR_LOAD)    { ret true; }
-    if (op == mir.MIR_GEP)     { ret true; }
-    if (op == mir.MIR_MOV)     { ret true; }
-    ret false;
+    ret mir.has(op, mir.MIRF_CLONABLE);
 }
 
-# clone one pure computation instruction, allocating a fresh destination vreg and
-# remapping any operand that names an already-cloned vreg to its clone
-# ---
-# alloc:      the function's allocator
-# f:          the owning function (grown with the fresh destination vreg)
-# src:        the instruction to clone
-# remap:      old-vreg -> clone-vreg table (MIR_VREG_NIL where unmapped)
-# orig_vregs: the vreg count before cloning began (bounds the remap table)
-# ret:        the cloned instruction, or an allocation error
+
 fun clone_compute(alloc: *A.Allocator, f: *mir.MirFunction, src: *mir.MirInstr,
                   remap: *u32, orig_vregs: u32) R.Result[mir.MirInstr, str] {
     val old_dest: u32 = src.operands[0].vreg;
@@ -518,9 +324,6 @@ fun clone_compute(alloc: *A.Allocator, f: *mir.MirFunction, src: *mir.MirInstr,
     if (R.is_err[*mir.MirOperand, str](ro)) { ret R.err[mir.MirInstr, str](R.unwrap_err[*mir.MirOperand, str](ro)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](ro);
 
-    # the sources are remapped BEFORE the destination is recorded, so an
-    # instruction that reads its own destination register reads the value the
-    # earlier clones produced rather than its own fresh one.
     var k: u32 = 1;
     for (k < src.operand_count) {
         ops[k] = remap_operand(src.operands[k], remap, orig_vregs);
@@ -532,16 +335,6 @@ fun clone_compute(alloc: *A.Allocator, f: *mir.MirFunction, src: *mir.MirInstr,
     ret R.ok[mir.MirInstr, str](make_instr(src, ops, src.operand_count));
 }
 
-# clone H's `MIR_CBR` as the preheader guard: `[cond, then=B, else=E]`, with the
-# condition remapped to the clone that `clone_compute` produced for it
-# ---
-# alloc:      the function's allocator
-# src:        H's conditional-branch terminator
-# remap:      old-vreg -> clone-vreg table
-# orig_vregs: the vreg count bounding the remap table
-# cond_vreg:  H's original condition vreg (its clone is remap[cond_vreg])
-# b_id/e_id:  the then / else target block ids
-# ret:        the cloned guard branch, or an allocation error
 fun clone_guard_cbr(alloc: *A.Allocator, src: *mir.MirInstr, remap: *u32, orig_vregs: u32,
                     cond_vreg: u32, b_id: u32, e_id: u32) R.Result[mir.MirInstr, str] {
     val ro: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](alloc, 3::usize);
@@ -559,13 +352,6 @@ fun clone_guard_cbr(alloc: *A.Allocator, src: *mir.MirInstr, remap: *u32, orig_v
     ret R.ok[mir.MirInstr, str](make_instr(src, ops, 3));
 }
 
-# remap an operand's value vregs (its own, and a memory operand's base / index)
-# through `remap`, copying every other field verbatim
-# ---
-# src:        the operand to clone
-# remap:      old-vreg -> clone-vreg table
-# orig_vregs: the vreg count bounding the remap table
-# ret:        the remapped operand
 fun remap_operand(src: mir.MirOperand, remap: *u32, orig_vregs: u32) mir.MirOperand {
     var o: mir.MirOperand = src;
     if (o.kind == mir.MIR_OP_VREG && o.vreg < orig_vregs && remap[o.vreg] != mir.MIR_VREG_NIL) {
@@ -582,32 +368,14 @@ fun remap_operand(src: mir.MirOperand, remap: *u32, orig_vregs: u32) mir.MirOper
     ret o;
 }
 
-# build a MirInstr borrowing `src`'s opcode / widths / vec-lane / loc / inline
-# site but owning the fresh `ops` operand array; the clone carries no `-g`
-# bindings and no inline-asm payload, so debug and non-debug builds stay identical
-# ---
-# src: the source instruction whose scalar carriers are copied
-# ops: the owned operand array for the clone
-# n:   the operand count
-# ret: the assembled instruction
 fun make_instr(src: *mir.MirInstr, ops: *mir.MirOperand, n: u32) mir.MirInstr {
     var mi: mir.MirInstr = mir.instr_like(src, ops, n);
-    # a CLONE, so the two owned references the derive carries are dropped rather than
-    # duplicated: an inline-asm block belongs to the instruction that declared it, and
-    # the -g dbg-binding list is owned by the original (the encoder would otherwise
-    # record the same VarLocs twice and the list would be freed twice).
     mi.asm_block         = nil;
     mi.dbg_bindings      = nil;
     mi.dbg_binding_count = 0;
     ret mi;
 }
 
-# append a fresh vreg with the same register class and vector-ness as `like`
-# ---
-# alloc: the function's allocator
-# f:     the function whose vreg table grows
-# like:  an existing vreg id whose class / vector flag the new vreg copies
-# ret:   the new vreg id, or an allocation error
 fun add_vreg_like(alloc: *A.Allocator, f: *mir.MirFunction, like: u32) R.Result[u32, str] {
     if (f.vreg_count >= f.vreg_cap) {
         var new_cap: u32 = f.vreg_cap * 2;
@@ -618,41 +386,26 @@ fun add_vreg_like(alloc: *A.Allocator, f: *mir.MirFunction, like: u32) R.Result[
         f.vreg_cap = new_cap;
     }
     val vid: u32 = f.vreg_count;
-    # carry the class / vector / constant-time seed marker from the template - a
-    # loop-rotated copy of a secret-source vreg stays a secret source (#1646).
     f.vregs[vid] = mir.vreg(vid, f.vregs[like].class, f.vregs[like].vector, f.vregs[like].secret);
-    # the rotated clone denotes the same source value. keep its inert source type
-    # metadata in step with the class, vector shape and secrecy seed.
     f.vregs[vid].ty = f.vregs[like].ty;
     f.vreg_count = f.vreg_count + 1;
     ret R.ok[u32, str](vid);
 }
 
-# append an instruction to a MIR block's instruction list, growing it as needed
-# ---
-# alloc: the block's allocator
-# mb:    the block receiving the instruction
-# mi:    the instruction to append (its owned operand array transfers to the block)
-# ret:   ok(true) on success, or an allocation error
-fun append_instr(alloc: *A.Allocator, mb: *mir.MirBlock, mi: mir.MirInstr) R.Result[bool, str] {
+fun append_instr(alloc: *A.Allocator, mb: *mir.MirBlock, mi: mir.MirInstr) R.Result[R.Void, str] {
     if (mb.instr_count >= mb.instr_cap) {
         var new_cap: u32 = mb.instr_cap * 2;
         if (new_cap < mir.INITIAL_INSTR_CAP) { new_cap = mir.INITIAL_INSTR_CAP; }
         val rg: R.Result[*mir.MirInstr, str] = A.reallocate[mir.MirInstr](alloc, mb.instrs, mb.instr_cap::usize, new_cap::usize);
-        if (R.is_err[*mir.MirInstr, str](rg)) { ret R.err[bool, str](R.unwrap_err[*mir.MirInstr, str](rg)); }
+        if (R.is_err[*mir.MirInstr, str](rg)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirInstr, str](rg)); }
         mb.instrs    = R.unwrap_ok[*mir.MirInstr, str](rg);
         mb.instr_cap = new_cap;
     }
     mb.instrs[mb.instr_count] = mi;
     mb.instr_count = mb.instr_count + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# whether block `mb` ends in an unconditional `MIR_BR` to block id `target`
-# ---
-# mb:     the block to inspect
-# target: the required branch target id
-# ret:    true when `mb`'s terminator is exactly `br target`
 fun ends_in_br_to(mb: *mir.MirBlock, target: u32) bool {
     if (mb.instr_count == 0) { ret false; }
     val t: *mir.MirInstr = ?mb.instrs[mb.instr_count - 1];
@@ -662,15 +415,7 @@ fun ends_in_br_to(mb: *mir.MirBlock, target: u32) bool {
     ret t.operands[0].imm::u32 == target;
 }
 
-# rebuild every block's predecessor list from the terminators' block-target
-# operands, so the shape match and the allocator's fallthrough detection read
-# edges consistent with the rewritten CFG
-# ---
-# alloc: the function's allocator
-# f:     the function whose predecessor lists are rebuilt
-# sc:    the per-function scratch holding the block-id map
-# ret:   ok(true) on success, or an allocation error
-fun rebuild_preds(alloc: *A.Allocator, f: *mir.MirFunction, sc: *LoopScratch) R.Result[bool, str] {
+fun rebuild_preds(alloc: *A.Allocator, f: *mir.MirFunction, sc: *LoopScratch) R.Result[R.Void, str] {
     var i: u32 = 0;
     for (i < f.block_count) { f.blocks[i].pred_count = 0; i = i + 1; }
 
@@ -685,8 +430,8 @@ fun rebuild_preds(alloc: *A.Allocator, f: *mir.MirFunction, sc: *LoopScratch) R.
                 if (op.kind == mir.MIR_OP_BLOCK) {
                     val succ: *mir.MirBlock = find_block(f, sc, op.imm::u32);
                     if (succ != nil) {
-                        val ap: R.Result[bool, str] = pred_append(alloc, succ, mb.id);
-                        if (R.is_err[bool, str](ap)) { ret ap; }
+                        val ap: R.Result[R.Void, str] = pred_append(alloc, succ, mb.id);
+                        if (R.is_err[R.Void, str](ap)) { ret ap; }
                     }
                 }
                 k = k + 1;
@@ -694,35 +439,23 @@ fun rebuild_preds(alloc: *A.Allocator, f: *mir.MirFunction, sc: *LoopScratch) R.
         }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# append `pred` to block `mb`'s predecessor list, growing it as needed. one entry
-# is recorded per edge (a cbr with both arms to the same block records two),
-# matching `mir.lower_ir`'s multiset convention
-# ---
-# alloc: the block's allocator
-# mb:    the block whose predecessor list grows
-# pred:  the predecessor block id to append
-# ret:   ok(true) on success, or an allocation error
-fun pred_append(alloc: *A.Allocator, mb: *mir.MirBlock, pred: u32) R.Result[bool, str] {
+fun pred_append(alloc: *A.Allocator, mb: *mir.MirBlock, pred: u32) R.Result[R.Void, str] {
     if (mb.pred_count >= mb.pred_cap) {
         var new_cap: u32 = mb.pred_cap * 2;
         if (new_cap < mir.INITIAL_INSTR_CAP) { new_cap = mir.INITIAL_INSTR_CAP; }
         val rg: R.Result[*u32, str] = A.reallocate[u32](alloc, mb.preds, mb.pred_cap::usize, new_cap::usize);
-        if (R.is_err[*u32, str](rg)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rg)); }
+        if (R.is_err[*u32, str](rg)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](rg)); }
         mb.preds    = R.unwrap_ok[*u32, str](rg);
         mb.pred_cap = new_cap;
     }
     mb.preds[mb.pred_count] = pred;
     mb.pred_count = mb.pred_count + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# a heap operand array holding a copy of `src` (test helper)
-#
-# The pass frees the preheader terminator's operand array, so a test's blocks must
-# own heap operands rather than borrow a stack array.
 fun t_ops(alloc: *A.Allocator, src: *mir.MirOperand, n: u32) *mir.MirOperand {
     val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](alloc, n::usize);
     val out: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
@@ -731,7 +464,6 @@ fun t_ops(alloc: *A.Allocator, src: *mir.MirOperand, n: u32) *mir.MirOperand {
     ret out;
 }
 
-# a MIR instruction over a heap-copied operand array (test helper)
 fun t_instr(alloc: *A.Allocator, op: mir.MirOpcode, ops: *mir.MirOperand, n: u32) mir.MirInstr {
     var mi: mir.MirInstr = mir.instr(op, t_ops(alloc, ops, n), n, 8, 8);
     mi.asm_block         = nil;
@@ -744,11 +476,6 @@ fun t_instr(alloc: *A.Allocator, op: mir.MirOpcode, ops: *mir.MirOperand, n: u32
     ret mi;
 }
 
-# a MIR block over a heap-copied instruction array (test helper)
-#
-# The guard grows the preheader through `append_instr`, which reallocates the
-# array, so a test's blocks must own heap instructions rather than borrow a stack
-# array.
 fun t_block(alloc: *A.Allocator, id: u32, instrs: *mir.MirInstr, n: u32) mir.MirBlock {
     val r: R.Result[*mir.MirInstr, str] = A.allocate[mir.MirInstr](alloc, n::usize);
     val own: *mir.MirInstr = R.unwrap_ok[*mir.MirInstr, str](r);
@@ -766,7 +493,6 @@ fun t_block(alloc: *A.Allocator, id: u32, instrs: *mir.MirInstr, n: u32) mir.Mir
     ret b;
 }
 
-# a MIR function over borrowed block / vreg arrays (test helper)
 fun t_fn(alloc: *A.Allocator, blocks: *mir.MirBlock, nb: u32, nv: u32) mir.MirFunction {
     var f: mir.MirFunction;
     f.blocks      = blocks;
@@ -789,7 +515,6 @@ fun t_fn(alloc: *A.Allocator, blocks: *mir.MirBlock, nb: u32, nv: u32) mir.MirFu
     ret f;
 }
 
-# whether `mb`'s terminator is a `cbr` branching to `then_id` / `else_id` (test helper)
 fun t_ends_in_cbr_to(mb: *mir.MirBlock, then_id: u32, else_id: u32) bool {
     if (mb.instr_count == 0) { ret false; }
     val t: *mir.MirInstr = ?mb.instrs[mb.instr_count - 1];
@@ -800,16 +525,10 @@ fun t_ends_in_cbr_to(mb: *mir.MirBlock, then_id: u32, else_id: u32) bool {
     ret true;
 }
 
-# a loop whose body is more than one block - the shape a `for` with an `if` inside
-# lowers to - rotates. B0 preheader -> B1 header (`cmp`, `cbr B2, B5`); B2 body
-# branches to B3 or B4, both of which reach the B4 latch; B5 exit. The v1 matcher
-# required the header's then-target to BE the latch, so every real loop carrying a
-# branch declined and shipped top-tested (#2211).
 test "mach.lang.be.codegen.looprotate.try_rotate_header:multi_block_body" {
     var alloc: A.Allocator;
     page.make(?alloc);
 
-    # v0 induction, v1 bound, v2 condition, v3 body scratch.
     var mov:  [2]mir.MirOperand; mov[0]  = mir.op_vreg(0); mov[1]  = mir.op_imm(0);
     var pbr:  [1]mir.MirOperand; pbr[0]  = mir.op_block(1);
     var b0i:  [2]mir.MirInstr;
@@ -848,33 +567,25 @@ test "mach.lang.be.codegen.looprotate.try_rotate_header:multi_block_body" {
     blocks[5] = t_block(?alloc, 5, ?b5i[0], 1);
 
     var f: mir.MirFunction = t_fn(?alloc, ?blocks[0], 6, 4);
-    val r: R.Result[bool, str] = rotate_function(?alloc, ?f);
-    if (R.is_err[bool, str](r)) { ret 1; }
+    val r: R.Result[R.Void, str] = rotate_function(?alloc, ?f);
+    if (R.is_err[R.Void, str](r)) { ret 1; }
 
-    # the preheader keeps its init move and gains the cloned compare plus the guard.
     if (f.blocks[0].instr_count != 3)                       { ret 1; }
     if (f.blocks[0].instrs[1].opcode != mir.MIR_CMP_LT_S)   { ret 1; }
     if (!t_ends_in_cbr_to(?f.blocks[0], 2, 5))              { ret 1; }
-    # the guard branches on the CLONE of the condition, not the header's vreg.
     if (f.blocks[0].instrs[2].operands[0].vreg != 4)        { ret 1; }
     if (f.blocks[0].instrs[1].operands[0].vreg != 4)        { ret 1; }
 
-    # the header is now reached only by the latch's back edge.
     if (f.blocks[1].pred_count != 1) { ret 1; }
     if (f.blocks[1].preds[0] != 4)   { ret 1; }
     if (f.blocks[1].instr_count != 2) { ret 1; }
     ret 0;
 }
 
-# a header testing a bound fetched from memory - what `for (i < LIMIT)` over a
-# module-scope `val` lowers to - rotates, with the load duplicated into the guard.
-# the v1 clonable set stopped at MIR_BITCAST, so any loop whose bound was not
-# already in a register declined (#2211).
 test "mach.lang.be.codegen.looprotate.try_rotate_header:memory_bound_test" {
     var alloc: A.Allocator;
     page.make(?alloc);
 
-    # v0 induction, v1 bound pointer, v2 loaded bound, v3 condition.
     var mov:  [2]mir.MirOperand; mov[0]  = mir.op_vreg(0); mov[1]  = mir.op_imm(0);
     var pbr:  [1]mir.MirOperand; pbr[0]  = mir.op_block(1);
     var b0i:  [2]mir.MirInstr;
@@ -905,24 +616,19 @@ test "mach.lang.be.codegen.looprotate.try_rotate_header:memory_bound_test" {
     blocks[3] = t_block(?alloc, 3, ?b3i[0], 1);
 
     var f: mir.MirFunction = t_fn(?alloc, ?blocks[0], 4, 4);
-    val r: R.Result[bool, str] = rotate_function(?alloc, ?f);
-    if (R.is_err[bool, str](r)) { ret 1; }
+    val r: R.Result[R.Void, str] = rotate_function(?alloc, ?f);
+    if (R.is_err[R.Void, str](r)) { ret 1; }
 
-    # init move + cloned load + cloned compare + guard.
     if (f.blocks[0].instr_count != 4)                     { ret 1; }
     if (f.blocks[0].instrs[1].opcode != mir.MIR_LOAD)     { ret 1; }
     if (f.blocks[0].instrs[2].opcode != mir.MIR_CMP_LT_S) { ret 1; }
     if (!t_ends_in_cbr_to(?f.blocks[0], 2, 3))            { ret 1; }
-    # the cloned compare reads the CLONED load's destination, not the header's v2.
     if (f.blocks[0].instrs[1].operands[0].vreg != 4)      { ret 1; }
     if (f.blocks[0].instrs[2].operands[2].vreg != 4)      { ret 1; }
     if (f.blocks[1].pred_count != 1)                      { ret 1; }
     ret 0;
 }
 
-# a header whose test result is also read in the loop body is left alone: the
-# rotated entry path branches around the header, so the body would read a register
-# the guard only ever wrote under a fresh name.
 test "mach.lang.be.codegen.looprotate.try_rotate_header:declines_escaping_test_def" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -939,7 +645,6 @@ test "mach.lang.be.codegen.looprotate.try_rotate_header:declines_escaping_test_d
     b1i[0] = t_instr(?alloc, mir.MIR_CMP_LT_S, ?cmp[0], 3);
     b1i[1] = t_instr(?alloc, mir.MIR_CBR,      ?hcbr[0], 3);
 
-    # the latch reads v2, the header's compare result.
     var use:  [3]mir.MirOperand; use[0] = mir.op_vreg(0); use[1] = mir.op_vreg(0); use[2] = mir.op_vreg(2);
     var lbr:  [1]mir.MirOperand; lbr[0] = mir.op_block(1);
     var b2i:  [2]mir.MirInstr;
@@ -956,23 +661,19 @@ test "mach.lang.be.codegen.looprotate.try_rotate_header:declines_escaping_test_d
     blocks[3] = t_block(?alloc, 3, ?b3i[0], 1);
 
     var f: mir.MirFunction = t_fn(?alloc, ?blocks[0], 4, 3);
-    val r: R.Result[bool, str] = rotate_function(?alloc, ?f);
-    if (R.is_err[bool, str](r)) { ret 1; }
+    val r: R.Result[R.Void, str] = rotate_function(?alloc, ?f);
+    if (R.is_err[R.Void, str](r)) { ret 1; }
 
-    # untouched: the preheader still ends in its unconditional branch.
     if (f.blocks[0].instr_count != 2)      { ret 1; }
     if (!ends_in_br_to(?f.blocks[0], 1))   { ret 1; }
     if (f.blocks[1].pred_count != 2)       { ret 1; }
     ret 0;
 }
 
-# a header with two entries from outside the loop has no single preheader to hold
-# the guard, and is left alone.
 test "mach.lang.be.codegen.looprotate.try_rotate_header:declines_two_entries" {
     var alloc: A.Allocator;
     page.make(?alloc);
 
-    # B0 and B1 both branch into the header B2; B3 body / latch; B4 exit.
     var e0br: [1]mir.MirOperand; e0br[0] = mir.op_block(2);
     var b0i:  [1]mir.MirInstr;
     b0i[0] = t_instr(?alloc, mir.MIR_BR, ?e0br[0], 1);
@@ -1004,8 +705,8 @@ test "mach.lang.be.codegen.looprotate.try_rotate_header:declines_two_entries" {
     blocks[4] = t_block(?alloc, 4, ?b4i[0], 1);
 
     var f: mir.MirFunction = t_fn(?alloc, ?blocks[0], 5, 3);
-    val r: R.Result[bool, str] = rotate_function(?alloc, ?f);
-    if (R.is_err[bool, str](r)) { ret 1; }
+    val r: R.Result[R.Void, str] = rotate_function(?alloc, ?f);
+    if (R.is_err[R.Void, str](r)) { ret 1; }
 
     if (f.blocks[0].instr_count != 1)    { ret 1; }
     if (f.blocks[1].instr_count != 1)    { ret 1; }

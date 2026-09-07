@@ -1,70 +1,3 @@
-# the shared inline-assembly parser - text back into the machine model
-#
-# One parser, parameterized per ISA, rather than one per target. `asm x86_64 { ... }`,
-# `asm riscv64 { ... }` and `asm aarch64 { ... }` are the same grammar with three
-# instruction sets: statements separated by newlines and `;`, a mnemonic, a
-# comma-separated operand list, GNU-as numeric local labels (`1:` / `1f` / `1b`), and
-# `{name}` references binding the block to the function's locals. Everything in that
-# sentence lives here; what differs per target is the instruction set, the operand
-# syntax, and the register names.
-#
-# The split, stated once so a target cannot quietly re-implement the shared half:
-#
-#   SHARED (this module)          the statement cursor and its byte accounting, the
-#                                 mnemonic table walk, top-level operand splitting,
-#                                 numeric-local-label scope and resolution, `{name}`
-#                                 binding, the effect-clause grammar, the effect
-#                                 (clobber) fold, the block driver, and every
-#                                 diagnostic.
-#   PER-ISA (the `Grammar`)       the mnemonic table (what each mnemonic denotes, its
-#                                 register-write facts, how many words it emits),
-#                                 the operand lexer (register names, `[base + i*s +
-#                                 d]` versus `d(base)` versus `[Xn, #d]`, relocation
-#                                 modifiers), the declarable register names, and the
-#                                 emitter.
-#
-# TOTALITY IS CHECKED, NOT ASSUMED. Every byte of a body must be claimed by exactly
-# one parsed item, with only whitespace and statement separators between claims, or
-# the block is refused naming the instruction that failed to account for itself.
-# There is no permissive path and no silent fallback: a body the parser cannot read
-# in full is a build error, never bytes nobody described.
-#
-# A fixed-width target admits a second, stronger invariant on the emit side: a
-# mnemonic row declares how many instruction words its form emits, and the driver
-# refuses a form that emitted a different number. What that does NOT catch is a form
-# declaring `WORDS_VARIABLE` (riscv64's `li`, whose length is a property of the
-# immediate), and it does not apply at all to a variable-length encoding like
-# x86-64's, where no such count exists ahead of the encoder.
-#
-# Under `--emit-asm` a third check applies on EVERY target, variable-length included:
-# a statement that emitted bytes must have notified the assembly sink at least once,
-# and on a fixed-width target exactly once per word it emitted. The encoder's own
-# byte tiling (`encode.sink_claim`) would catch the same omission a statement or two
-# later, when a successor's claim failed to begin at the cursor; checking it here is
-# what lets the refusal name the STATEMENT that dropped the notification instead of
-# the whole `asm` block (#2250).
-#
-# CONSERVATIVE BY DEFAULT. An unrecognized mnemonic refuses the block. A byte stream
-# the parser cannot read (a data directive's payload) writes every register in every bank.
-# Precision is earned per mnemonic, on that mnemonic's own table row, and never
-# credited by category - `opaque-and-slow` is safe, `modeled-and-wrong` is a
-# miscompile.
-#
-# THE ONE PLACE THAT DEFAULT MAY BE OVERRIDDEN is a data directive carrying an explicit
-# effect clause, `.byte 0xee :: writes()`, which is opt-in, attaches to nothing the
-# compiler can already read, and moves correctness onto the author for that statement
-# alone. See `CLAUSE_MARK` for what survives that trade and what does not (#2594).
-#
-# A `{name}` binding is the one operand every grammar reads the same way, so it is
-# stated here rather than three times (#2258): it denotes a frame slot, a frame slot
-# is memory, and memory is not a register - so it contributes nothing to the write
-# set and the statement around it is modeled whether or not the frame is laid out
-# yet. That is what makes the effect model a property of the parsed instruction
-# stream rather than of the parse phase: the same body folds to the same set before
-# register allocation and at emit time. The emitter never sees an unresolved binding,
-# because it always parses with a binding context, and the driver CHECKS that rather
-# than assuming it.
-
 use std.text.parse;
 use mach.lang.ct;
 use std.types.bool.bool;
@@ -86,71 +19,27 @@ use mach.lang.be.codegen.mir;
 use mach.lang.intern;
 use mach.lang.target.isa;
 
-# the widest operand list the shared splitter accepts
-#
-# Four is the widest form any supported target spells: aarch64's post-index
-# `ldp Xa, Xb, [Xn], #imm`. A statement naming more is refused rather than truncated.
 pub val MAX_OPS: usize = 4;
 
-# longest inline-asm statement the parser accepts, in bytes
 pub val STMT_MAX: usize = 512;
 
-# most payload bytes one data directive can carry
-#
-# Derived from the narrowest directive: a `.byte` value needs at least a digit and a
-# separator, so a statement bounded by `STMT_MAX` can never name more than half that
-# many. A wider directive reaches the same payload cap with fewer values - 32 `.quad`s
-# rather than 256 `.byte`s - which is a bound on the payload, not on the statement.
 pub val BYTES_MAX: usize = STMT_MAX / 2;
 
-# the kind of a parsed inline-asm operand
-#
-# The parse-time superset of `isa.Operand`: it additionally names a bare symbol
-# (which the encoder resolves to a relocation rather than to an addressing mode) and
-# an unresolved `{name}` binding, whose frame slot is only known once the frame is
-# laid out.
-pub val AOP_NONE: u8 = 0;  # no operand parsed
-pub val AOP_REG:  u8 = 1;  # a register
-pub val AOP_IMM:  u8 = 2;  # an immediate constant
-pub val AOP_MEM:  u8 = 3;  # a memory reference
-pub val AOP_SYM:  u8 = 4;  # a bare symbol / branch-target name
-pub val AOP_BIND: u8 = 5;  # a `{name}` local whose frame slot is not yet known
+pub val AOP_NONE: u8 = 0;
+pub val AOP_REG:  u8 = 1;
+pub val AOP_IMM:  u8 = 2;
+pub val AOP_MEM:  u8 = 3;
+pub val AOP_SYM:  u8 = 4;
+pub val AOP_BIND: u8 = 5;
 
-# operand decorations an ISA's lexer sets and its emitter reads
-#
-# The addressing facts the shared model needs to know about (does this memory operand
-# name a symbol, does it write its base back) plus the two register facts a target
-# cannot express in `reg` alone. A bit not listed here does not exist: two ISAs each
-# appending "the next flag" to a private space is how two unrelated flags have already
-# landed on the same bit (#2137).
-pub val AOF_MEM_SYM:   u8 = 0x01;  # a memory operand addresses a symbol (`name_off` set)
-pub val AOF_HAS_DISP:  u8 = 0x02;  # a memory operand carries an explicit displacement
-pub val AOF_HAS_INDEX: u8 = 0x04;  # a memory operand carries an index register
-pub val AOF_WRITEBACK: u8 = 0x08;  # the access writes its updated base register back
-pub val AOF_STACK_PTR: u8 = 0x10;  # the register names the stack pointer, not the zero register
-pub val AOF_WIDE:      u8 = 0x20;  # the index register is the wide (64-bit) form
-pub val AOF_MEM_ABS:   u8 = 0x40;  # a memory operand addresses an absolute constant (`imm` set, no base, no index)
+pub val AOF_MEM_SYM:   u8 = 0x01;
+pub val AOF_HAS_DISP:  u8 = 0x02;
+pub val AOF_HAS_INDEX: u8 = 0x04;
+pub val AOF_WRITEBACK: u8 = 0x08;
+pub val AOF_STACK_PTR: u8 = 0x10;
+pub val AOF_WIDE:      u8 = 0x20;
+pub val AOF_MEM_ABS:   u8 = 0x40;
 
-# a parsed inline-asm operand
-#
-# Names are spans into the asm body, not copies, so the interned body is the single
-# backing store for a parse.
-# ---
-# kind:     one of AOP_*
-# reg:      register id for AOP_REG, or the base register for AOP_MEM (-1 when none)
-# size:     operand width in bytes, or 0 when the operand NAMES no width of its own
-#           and takes the instruction's. A register always names one - `eax` is four
-#           bytes however it is used - while a memory reference names one only where
-#           the syntax says so (`word [rcx]`), which is exactly the distinction #2595
-#           needed: a width that came from the operand and one that came from the
-#           instruction are checkable against each other only while they are separate
-# imm:      immediate value for AOP_IMM, or the displacement for AOP_MEM
-# index:    scaled-index register for AOP_MEM (-1 when none)
-# scale:    index scale for AOP_MEM (1, 2, 4 or 8; 0 when no index)
-# mod:      the relocation modifier a symbol-bearing operand carries
-# flags:    AOF_* decorations
-# name_off: body offset of the symbol or binding name this operand carries
-# name_len: length in bytes of that name
 pub rec Operand {
     kind:     u8;
     reg:      i32;
@@ -164,85 +53,34 @@ pub rec Operand {
     name_len: usize;
 }
 
-# the operand shape a mnemonic takes, as the shared cursor reads it
-#
-# The cursor distinguishes only two cases: a mnemonic that is the whole statement, and
-# everything else (split the operand list and hand it to the ISA). A target's finer
-# distinctions - one operand versus two, a branch target versus a register - are its
-# own, carried in `Mnemonic.code` and read by its parser.
-pub val AF_NONE:  u8 = 0;  # no operands; the mnemonic is the whole statement
-pub val AF_OPS:   u8 = 1;  # a comma-separated operand list the ISA parses
+pub val AF_NONE:  u8 = 0;
+pub val AF_OPS:   u8 = 1;
 
-# a form whose emitted instruction-word count is a property of its operands rather
-# than of the mnemonic, so no count can be checked against it
 pub val WORDS_VARIABLE: u8 = 0;
 
-# the registers a mnemonic writes, as a flag set over its own operands
-#
-# Every fact is stated per mnemonic, never per category, and always relative to the
-# operands as written. Condition flags are not modeled - the allocator holds no value
-# in them. Registers a form writes regardless of its operands (a syscall's return
-# register, a call's caller-saved file) ride `Mnemonic.implicit` instead.
-pub val AW_NONE:    u8 = 0x00;  # writes no register (flags, memory or control only)
-pub val AW_OP0:     u8 = 0x01;  # writes its first operand
-pub val AW_OP1:     u8 = 0x02;  # writes its second operand
-pub val AW_WB_BASE: u8 = 0x04;  # writes the base of a writeback memory operand
+pub val AW_NONE:    u8 = 0x00;
+pub val AW_OP0:     u8 = 0x01;
+pub val AW_OP1:     u8 = 0x02;
+pub val AW_WB_BASE: u8 = 0x04;
 
-# one mnemonic: its text, the instruction it denotes, its operand shape, and its
-# register-write facts
-#
-# The single table the parser, the emitter and the effect model all read, so an
-# instruction's encoding and its effects can never describe different instructions.
-# An alias (`jz` for `je`, `mv` for `addi rd, rs, 0`) is its own row naming the same
-# instruction.
-# ---
-# name:     the mnemonic text as written (nil for a row a decoder synthesized)
-# code:     the instruction the mnemonic denotes, in the ISA's own space
-# form:     AF_*, the operand shape the cursor reads
-# writes:   AW_*, the registers the form writes among its own operands
-# implicit: registers the form writes regardless of its operands, as a bitmask
-# flags:    encoding flags the mnemonic itself implies, in the ISA's own space
-# words:    instruction words the form emits, or WORDS_VARIABLE
 pub rec Mnemonic {
-    name:     str;
-    code:     u32;
-    form:     u8;
-    writes:   u8;
-    implicit: u32;
-    flags:    u16;
-    words:    u8;
+    name:         str;
+    code:         u32;
+    form:         u8;
+    writes:       u8;
+    implicit:     u32;
+    flags:        u16;
+    words:        u8;
+    implicit_mem: bool;
 }
 
-# one data directive: its text and the width of each value it carries
-#
-# A data directive denotes no instruction - `.quad 1` means the same eight bytes on
-# every machine - so the family is a statement shape the shared cursor reads, like a
-# numeric local label, rather than rows in three mnemonic tables. That is also what
-# makes it the raw-encoding escape a fixed-width target needs (#2479): where a missing
-# mnemonic on x86-64 is an inconvenience, on aarch64 and riscv64 it is a wall, and
-# `.word <u32>` is the general way through it.
-#
-# WHAT IS PER-TARGET IS THE WIDTH OF `.word`, which is why a grammar names its own
-# table rather than reading one global list - see `DIRECTIVES_WORD16` /
-# `DIRECTIVES_WORD32`.
-# ---
-# name:  the directive text as written, including its leading dot
-# width: bytes each of its values occupies
 pub rec Directive {
     name:  str;
     width: u8;
 }
 
-# number of directives in each shared family table
 pub val DIRECTIVE_COUNT: usize = 4;
 
-# the data directives for a target whose `.word` is 16 bits (x86-64)
-#
-# The widths are GNU as's, per target, because a body is written by someone reading
-# that assembler's manual: `.byte` is one byte everywhere, `.long` four and `.quad`
-# eight, and `.word` IS THE ONE THAT DIVERGES - two bytes on x86, four on ARM and
-# RISC-V. Stating both conventions side by side here is what keeps the divergence a
-# documented fact rather than a per-encoder typo.
 pub val DIRECTIVES_WORD16: [DIRECTIVE_COUNT]Directive = [DIRECTIVE_COUNT]Directive{
     Directive{ name: ".byte", width: 1 },
     Directive{ name: ".word", width: 2 },
@@ -250,10 +88,6 @@ pub val DIRECTIVES_WORD16: [DIRECTIVE_COUNT]Directive = [DIRECTIVE_COUNT]Directi
     Directive{ name: ".quad", width: 8 },
 };
 
-# the data directives for a target whose `.word` is 32 bits (aarch64, riscv64)
-#
-# `.word` is one instruction word on both, which is the spelling a raw encoding takes:
-# `.word 0xd503201f` is aarch64's `nop`.
 pub val DIRECTIVES_WORD32: [DIRECTIVE_COUNT]Directive = [DIRECTIVE_COUNT]Directive{
     Directive{ name: ".byte", width: 1 },
     Directive{ name: ".word", width: 4 },
@@ -261,119 +95,27 @@ pub val DIRECTIVES_WORD32: [DIRECTIVE_COUNT]Directive = [DIRECTIVE_COUNT]Directi
     Directive{ name: ".quad", width: 8 },
 };
 
-# the parse outcomes one statement can have
-#
-# There is no "parsed but unmodeled" outcome: a statement the grammar accepts is one
-# the effect model describes, and one it does not accept refuses the block.
-pub val AI_INST:   u8 = 0;  # a modeled machine instruction
-pub val AI_LABEL:  u8 = 1;  # a numeric local-label definition
-pub val AI_BYTES:  u8 = 2;  # a raw byte directive's payload
+pub val AI_INST:   u8 = 0;
+pub val AI_LABEL:  u8 = 1;
+pub val AI_BYTES:  u8 = 2;
 
-# what a parsed instruction still needs the encoder to resolve
-pub val AR_NONE:  u8 = 0;  # nothing: the instruction is self-contained
-pub val AR_SYM:   u8 = 1;  # a named symbol the linker resolves
-pub val AR_LOCAL: u8 = 2;  # a numeric local label within this block
+pub val AR_NONE:  u8 = 0;
+pub val AR_SYM:   u8 = 1;
+pub val AR_LOCAL: u8 = 2;
 
-# the effect clause a raw encoding may carry: `.byte 0xee :: writes()`
-#
-# THE ESCAPE HATCH'S ESCAPE HATCH, and the reason it exists is the one the register
-# surface already argued (#2594). `doc/language/asm.md` says the named system-register
-# set is "deliberately not exhaustive" because any register is ALSO nameable by its
-# encoding, "which is what makes the surface complete rather than a list that always
-# lags the architecture". A data directive is that same numeric escape one level up:
-# it names an instruction the mnemonic table does not. What it could not do until now
-# is carry the fact the table would have carried, so it bought completeness at the
-# price of the whole register file - the allocator holds nothing live across a
-# `.byte`, which is measurable and which the curated table exists to avoid.
-#
-# THE PROPERTY THAT MAKES A DECLARATION SAFE TO ACCEPT IS THAT IT IS MONOTONE. A
-# clause attaches to a data directive and to nothing else. A modeled instruction's
-# facts come from its mnemonic row and cannot be overridden, so a declaration can only
-# ever NARROW the maximally-conservative default, applied at exactly the statements
-# where the compiler had no information at all. It can never contradict a fact the
-# compiler derived, and the blast radius of a wrong one is the single hand-written
-# statement that carries it.
-#
-# WHAT THE COMPILER STILL CHECKS, and what it cannot:
-#
-#   CHECKED  the clause is claimed like every other byte, so a malformed one refuses
-#            the block rather than being silently dropped - an author who mistypes
-#            `writes(` gets a build error, not a declaration that quietly said nothing.
-#   CHECKED  every register named resolves through the ISA's own name table, so a
-#            typo (`x32`, `raxx`) refuses rather than naming nothing.
-#   CHECKED  a grammar wiring no name table refuses every declaration, so a target
-#            gains the syntax only when it can validate it.
-#   CHECKED  `writes()` and an absent clause are DIFFERENT: the first declares the
-#            empty set, the second declares nothing and keeps the conservative default.
-#   UNCHECKED, AND IRREDUCIBLY SO: whether the bytes write what the clause says. The
-#            compiler does not decode the payload - that is what the mnemonic table is
-#            for, and a decoder here would be one. An author who under-declares gets a
-#            miscompile. This is the one place in the inline-asm surface where
-#            correctness rests on the author rather than on the compiler, and
-#            `doc/language/asm.md` says so where an author will read it.
-#
-# A DECLARATION BUYS ALLOCATION QUALITY, NOT VERIFICATION. `ct_scan` still refuses a
-# data directive inside an `#[oblivious]` function whether or not it is declared: a
-# write set says which registers change, and says nothing about whether the payload is
-# a secret-dependent branch or a variable-latency divide. Letting an author declare
-# past a security gate is #2288's failure exactly.
-#
-# WHY THERE IS NO `noreturn` YET, though `iretq` wants one (#2590). Control not
-# returning is a CFG fact: it would remove the block's fall-through edge, which is what
-# would make values live across the block dead instead. Nothing in the effect model
-# reaches liveness, so an attribute added here today would parse, validate, and change
-# nothing - a spelling that promises more than it does, which is worse than its
-# absence. The clause grammar is a space-separated attribute list precisely so it lands
-# as one more row when the CFG can act on it. A per-statement `barrier` is a different
-# story and will not be added: every `asm` block is already assumed to modify arbitrary
-# memory, so the attribute would be true and inert on the day it was written.
 pub val CLAUSE_MARK: str = "::";
 
-# the register banks a declared clobber can name
-pub val ABANK_GP: u8 = 0;  # the general-purpose file
-pub val ABANK_FP: u8 = 1;  # the float / vector file
+pub val ABANK_GP: u8 = 0;
+pub val ABANK_FP: u8 = 1;
 
-# one parsed inline-asm statement
-#
-# The unit both consumers read: the emitter turns it into bytes, the effect model
-# turns its write facts plus its operands into a register set. `src_off` / `src_len`
-# are the body bytes this item claims, which is what makes the parse's totality
-# checkable rather than assumed.
-#
-# `writes` and `words` start as the mnemonic row's defaults and the ISA's parser may
-# refine either once it knows the operand shape - `jalr rs` links through a register
-# the row cannot name, and an aarch64 `mov` is one instruction or a materialization
-# sequence depending on its source. The refinement is stated where the shape is
-# known; nothing downstream re-derives it.
-# ---
-# kind:       one of AI_*
-# code:       the instruction the item denotes, in the ISA's own space
-# flags:      encoding flags, in the ISA's own space
-# writes:     AW_* register-write facts
-# implicit:   registers written regardless of the operands
-# words:      instruction words the form emits, or WORDS_VARIABLE
-# ops:        the parsed operands
-# nops:       number of operands parsed
-# ref:        what the emitter must still resolve (AR_*)
-# ref_off:    body offset of the referenced symbol name (AR_SYM)
-# ref_len:    length of that name
-# ref_mod:    the relocation modifier that symbol reference carries
-# ref_num:    the numeric local label (AR_LOCAL, or the label AI_LABEL defines)
-# ref_fwd:    true when an AR_LOCAL reference is forward (`<digits>f`)
-# bytes:      the raw byte payload (AI_BYTES)
-# byte_count: number of payload bytes
-# declared:   the statement carried a `::` effect clause (AI_BYTES only)
-# decl_gp:    the general-purpose registers that clause names
-# decl_fp:    the float / vector registers that clause names
-# src_off:    body offset of the statement text this item claims
-# src_len:    length of that text
 pub rec Item {
-    kind:       u8;
-    code:       u32;
-    flags:      u16;
-    writes:     u8;
-    implicit:   u32;
-    words:      u8;
+    kind:         u8;
+    code:         u32;
+    flags:        u16;
+    writes:       u8;
+    implicit:     u32;
+    words:        u8;
+    implicit_mem: bool;
     ops:        [MAX_OPS]Operand;
     nops:       u32;
     ref:        u8;
@@ -391,17 +133,6 @@ pub rec Item {
     src_len:    usize;
 }
 
-# one statement as the shared cursor resolved it, before the ISA reads its operands
-#
-# The cursor has already matched the mnemonic, claimed its bytes, and split and
-# claimed the operand tokens; the ISA's parser turns those spans into operands.
-# ---
-# m:      the matched mnemonic row
-# lo:     body offset the statement starts at
-# hi:     body offset just past the statement
-# arg_lo: body offset each operand token starts at
-# arg_hi: body offset just past each operand token
-# nargs:  number of operand tokens
 pub rec Stmt {
     m:      Mnemonic;
     lo:     usize;
@@ -411,30 +142,6 @@ pub rec Stmt {
     nargs:  u32;
 }
 
-# a cursor over an inline-asm body, yielding one `Item` per statement
-#
-# The parse runs twice over the same text through the same code: once before
-# register allocation to derive the block's effects, and once after frame layout to
-# emit bytes. That is what makes the instructions the compiler reasons about and the
-# ones it emits the same instructions.
-#
-# `f` / `pl` supply the `{name}` binding context. They are nil before the frame is
-# laid out, where a binding's stack displacement genuinely is not yet known.
-#
-# `claimed` is the accounting watermark - the body offset through which every byte
-# has been claimed by exactly one item. Anything below it that no item claimed must
-# be inter-statement whitespace or a separator, or the block is refused.
-# ---
-# body:     the comment-stripped inline-asm body text
-# len:      length of the body
-# pos:      cursor: the next body byte to consider
-# claimed:  accounting watermark
-# alloc:    allocator for diagnostic construction, or nil
-# interner: interner diagnostics are built in, or nil (messages degrade to a fixed
-#           form the encoder later reissues located)
-# f:        the function whose laid-out frame resolves a `{name}`, or nil
-# pl:       the block's `{name}` bindings, or nil
-# g:        the target's grammar
 pub rec Cursor {
     body:     str;
     len:      usize;
@@ -447,210 +154,28 @@ pub rec Cursor {
     g:        *Grammar;
 }
 
-# decode a mnemonic the table cannot enumerate, synthesizing its row
-#
-# The escape hatch for a suffixed family whose spelling is combinatorial:
-# riscv64's `amoadd.d.aqrl` (base x width x ordering) and aarch64's `b.<cond>`. It
-# reads `body[lo..hi)`, and on a match fills the row and the mnemonic's byte length.
-# A target with no such family leaves this nil.
 pub def DecodeFn: fun(str, usize, usize, *Mnemonic, *usize) bool;
 
-# turn one resolved statement into a parsed item
-#
-# The ISA's operand lexer. The mnemonic and every operand token have already been
-# matched and claimed, so this reads spans and fills `Item`; it must not claim.
-pub def ParseFn: fun(*Cursor, *Stmt, *Item) R.Result[bool, str];
+pub def ParseFn: fun(*Cursor, *Stmt, *Item) R.Result[R.Void, str];
 
-# emit one parsed item's machine bytes
-#
-# The ISA's assembler. It runs after frame layout, through the same emitters the
-# instruction selector drives, so an inline-asm instruction and a compiler-selected
-# one are the same value taking the same path.
-pub def EmitFn: fun(*encode.EncodeState, *Cursor, *Labels, *Item) R.Result[bool, str];
+pub def EmitFn: fun(*encode.EncodeState, *Cursor, *Labels, *Item) R.Result[R.Void, str];
 
-# insert the displacement from a branch at `patch_pos` to a target at `target_off`
-#
-# The ISA's branch-fixup hook, reached when a numeric local label resolves. Both
-# offsets are `.text`-relative.
-pub def PatchFn: fun(*encode.EncodeState, u32, u32) R.Result[bool, str];
+pub def PatchFn: fun(*encode.EncodeState, u32, u32) R.Result[R.Void, str];
 
-# the offset of the slot a MIR value owns, RELATIVE TO THE BASE REGISTER THIS TARGET
-# ADDRESSES A `{name}` FROM, or none
-#
-# It used to say frame-pointer-relative, and saying so was #2689: it froze one target's
-# addressing choice into the interface every other target reads. WHICH BASE IS PART OF
-# THE ADDRESSING DECISION, and the addressing decision is the target's, because only
-# the target knows which of its forms reaches. The offset returned here and the base
-# register the ISA's operand lexer names are two halves of one answer and must agree.
-#
-# What that choice costs when it is made badly: a frame slot sits BELOW the frame
-# pointer, so an fp-relative displacement is negative, and aarch64's scaled imm12 form
-# is unsigned-only - the whole reach for a `{name}` was the unscaled imm9's -256, which
-# is thirty-two eight-byte slots, and one inlined syscall wrapper too many exceeded it.
-# aarch64 and riscv64 therefore measure from the STACK pointer, where the displacement
-# is positive and the scaled form applies, and the frame phase lays asm-bound slots at
-# the bottom of the slot region so that what separates a `{name}` from the stack pointer
-# is the callee-save and outgoing-argument areas - bounded by the ABI, not by the
-# function. x86-64's disp32 reaches either end of any frame, so it keeps RBP, the base
-# its own loads and stores already use.
-#
-# The bias between whatever base is chosen and the laid-out offset is per-ISA and not an
-# accident: what a target's prologue reserves between the two differs - x86-64 reserves
-# nothing below RBP, riscv64 pins s0 at the frame top with the ra / s0 record and the
-# callee-saved areas beneath it - so a shared implementation would resolve `{name}` to a
-# different address than the same target's own loads and stores.
-#
-# WHATEVER BASE IS CHOSEN MUST NOT MOVE for the life of the block. A target that picks
-# the frame pointer gets that for free. One that picks the stack pointer says so through
-# `slot_sp`, and `writes_sp` is what holds the promise.
 pub def SlotFn: fun(*mir.MirFunction, u32) O.Option[i64];
 
-# does this FUNCTION's `{name}` measure from the stack pointer
-#
-# Per function, not per grammar, because the base can depend on the frame. A realigned
-# frame (#2735) masks the stack pointer down to an over-aligned boundary, which makes the
-# distance between the two pointers a run-time quantity: the slot region moves to the
-# stack pointer and the frame pointer keeps the caller's business (incoming stack
-# arguments, the frame record). x86-64 therefore answers true for a realigned function
-# and false otherwise - it keeps RBP where it can, because an asm body that pushes is
-# legal and common on it and a frame-pointer base tolerates that. aarch64 and riscv64
-# answer true always, for the immediate-reach reason #2689 records.
-#
-# WIRING THIS IS THE DECLARATION, and `writes_sp` is the obligation that comes with it:
-# a grammar that can answer true must wire both, since the promise it makes is that the
-# base has not moved when the access runs.
 pub def SlotBaseFn: fun(*mir.MirFunction) bool;
 
-# true when one parsed statement writes the stack pointer
-#
-# THE OBLIGATION THAT COMES WITH `slot_sp` ANSWERING TRUE. A `{name}` displacement
-# is measured once, at block entry, so a statement inside the block that moves the base -
-# a push, a pre-index store through SP, an `addi sp, sp, -16` - invalidates every
-# `{name}` in the block, including one a backward branch reaches again. That is a silent
-# wrong address, the failure mode this family keeps producing, so the block is refused.
-# A grammar whose `SlotFn` never measures from the stack pointer leaves this nil: it has
-# no such promise to keep, and inventing an answer would refuse bodies that are correct
-# on it. It is read only for a function `slot_sp` answers true for, so x86-64 wires it
-# and an ordinary x86-64 body that pushes is still accepted.
-#
-# Per-ISA because which register is the stack pointer is, and because an ISA can spell
-# it ambiguously: aarch64's index 31 is the zero register in one operand position and SP
-# in another, told apart only by `AOF_STACK_PTR`, so a shared scan over the write mask
-# would read `mov xzr, x0` as moving the stack.
-#
-# A RAW BYTE PAYLOAD WRITES IT unless the statement declared otherwise, exactly as
-# `fold_clobbers` treats every other register: the compiler does not decode the bytes,
-# so it cannot see the push inside them.
 pub def WritesSpFn: fun(*Item) bool;
 
-# true when one parsed statement cannot fall through to the next
-#
-# The single fact behind `returns` (#2791). A trap - x86-64's `hlt`, aarch64's `brk`,
-# riscv64's `ebreak` - ends the thread of control, so a body whose last statement is
-# one cannot reach the statement after the block.
-#
-# STATED PER MNEMONIC, like every other fact here, and read off `item.code` rather
-# than the mnemonic text so an alias row answers the same as the row it aliases.
-#
-# THE CONSERVATIVE ANSWER IS FALSE, WHICH IS THE OPPOSITE END FROM `writes_sp`. A wrong
-# `true` here makes the caller drop everything after the block, so it deletes live code
-# rather than pessimizing allocation. A raw byte payload therefore answers false even
-# though its bytes may well be a trap: the compiler does not decode the payload, and a
-# declaration cannot help, because this is a fact the compiler acts on rather than one
-# it merely allocates against. A grammar leaving this nil says every statement falls
-# through, which is what every target did before this existed.
 pub def NoFallThroughFn: fun(*Item) bool;
 
-# the constant-time classification of one of this grammar's mnemonics
-#
-# The per-ISA half of the `#[oblivious]` asm walk (#2230): given a mnemonic's own
-# code, what the walk needs to know about it beyond the register-effect facts the
-# `Mnemonic` row already carries. An unclassified code returns `ct.asm_unknown()`,
-# which refuses the moment a secret reaches it.
-# ---
-# A form's classification is a function of BOTH its code and its encoding flags,
-# not the code alone. A grammar admits forms through TWO channels - its static
-# `Mnemonic` table and its `decode` hook - and a decoded form may share a code with
-# a statically-declared one while differing in flags. aarch64's `b.<cond>` is exactly
-# that: `a64_decode_bcond` gives it `A64M_B`, the UNCONDITIONAL branch's code, and
-# carries the condition in flags. Classifying on code alone read every `b.eq` as an
-# unconditional branch and passed secret-dependent branches as leak-free (#2477).
-# ---
-# code:  the mnemonic's code, in the ISA's own space
-# flags: the mnemonic's encoding flags, in the ISA's own space
 pub def CtClassFn: fun(u32, u16) ct.AsmClass;
 
-# notify this target's assembly printer of a raw-byte directive's payload
-#
-# The TEXT is shared (`encode.render_bytes_directive`); only the TIMING is per-ISA. A
-# printer that renders on the spot notifies as the bytes are emitted; one that buffers
-# notes for a later pass records it so the directive lands in program order. Without a
-# notification the payload's bytes are never accounted, and the encoder refuses the
-# whole `--emit-asm` run rather than silently dropping them (#2467).
-# ---
-# st:    the encode state carrying the sink
-# bytes: the payload
-# n:     number of payload bytes
-# start: `.text` offset of the payload's first byte
-pub def NoteBytesFn: fun(*encode.EncodeState, *u8, usize, usize) R.Result[bool, str];
+pub def NoteBytesFn: fun(*encode.EncodeState, *u8, usize, usize) R.Result[R.Void, str];
 
-# resolve a register name a declared clobber set spells, to its bank and index
-#
-# The per-ISA half of the effect clause (#2594): the clause's SHAPE is one grammar on
-# every machine and lives in the shared parser, the register NAMES are the target's,
-# exactly the split the module header states.
-#
-# THIS IS NOT THE OPERAND LEXER AND MUST NOT BE IT. An operand lexer names only what an
-# operand may be, which on x86-64 excludes every vector register by design - the
-# comment on `x64_reg` says so, and widening it would give `xmm0` a `reg` id that
-# collides with RAX in the shared write fold. A declaration names a register in EITHER
-# bank without placing it in an instruction, so it is a strictly larger vocabulary and
-# gets its own resolver.
-#
-# EVERY REGISTER THE GRAMMAR'S `all_gp` / `all_fp` REACHES MUST BE NAMEABLE HERE, or
-# the escape hatch is incomplete in exactly the way it exists to fix: a raw encoding
-# writing a register with no spelling could not be declared, and would have to fall
-# back to the conservative default the clause is meant to avoid.
-# ---
-# name: the register name as written in the clause
-# bank: receives ABANK_GP or ABANK_FP
-# idx:  receives the within-bank register index, which is the bit position in the mask
-# ret:  true when the name resolves, false when this ISA spells no such register
 pub def DeclRegFn: fun(str, *u8, *u32) bool;
 
-# one target's inline-assembly grammar
-#
-# Everything the shared parser needs that is not the same on every machine. A target
-# that accepts inline asm builds one of these; a target that does not (`mos6502`
-# today, spir-v by construction) needs none, which is what makes the parser a
-# capability rather than a tax on every new target (#2212).
-# ---
-# isa:        the ISA tag the `asm` block spells
-# unknown:    the refusal prefix an unrecognized mnemonic takes, up to its opening
-#             quote - spelled out rather than composed, so naming the target in a
-#             diagnostic needs no buffer and can never degrade to a vaguer message
-# rows:       the mnemonic table
-# row_count:  number of rows
-# data:       the data-directive table (one of the shared `DIRECTIVES_*`)
-# data_count: number of directives
-# decode:     the suffixed-family decoder, or nil
-# parse:      the operand lexer
-# emit:       the assembler
-# patch:      the branch-displacement insert
-# slot:       a local's stack-slot offset from the base this target addresses it from
-# slot_sp:    true when THIS FUNCTION's `slot` measures from the stack pointer, nil on a
-#             grammar that never does
-# writes_sp:  true when a statement moves the stack pointer - wired by every grammar
-#             whose `slot_sp` can answer true, nil by one that never measures from it
-# no_fall:    true when a statement cannot fall through to the next, or nil to say
-#             every statement falls through (#2791)
-# all_gp:     every general-purpose register the grammar can reach
-# all_fp:     every float / vector register an unreadable byte stream could reach
-# word:       the instruction word size in bytes, or 0 for a variable-length encoding
-# endian:     the byte order a data directive's values take
-# note_bytes: the assembly-printer notification for a directive payload
-# decl_reg:   the register-name resolver a declared clobber set reads, or nil to
-#             refuse every declaration on this target
 pub rec Grammar {
     isa:        str;
     unknown:    str;
@@ -675,7 +200,6 @@ pub rec Grammar {
     decl_reg:   DeclRegFn;
 }
 
-# an operand in the neutral state each lexer fills in
 pub fun op_none() Operand {
     var op: Operand;
     op.kind     = AOP_NONE;
@@ -691,7 +215,6 @@ pub fun op_none() Operand {
     ret op;
 }
 
-# a register operand
 pub fun op_reg(reg: i32, size: u8) Operand {
     var op: Operand = op_none();
     op.kind = AOP_REG;
@@ -700,7 +223,6 @@ pub fun op_reg(reg: i32, size: u8) Operand {
     ret op;
 }
 
-# an immediate operand
 pub fun op_imm(v: i64, size: u8) Operand {
     var op: Operand = op_none();
     op.kind = AOP_IMM;
@@ -709,7 +231,6 @@ pub fun op_imm(v: i64, size: u8) Operand {
     ret op;
 }
 
-# a `base + index*scale + disp` memory operand
 pub fun op_mem(base: i32, disp: i64, index: i32, scale: u8, size: u8) Operand {
     var op: Operand = op_none();
     op.kind  = AOP_MEM;
@@ -721,7 +242,6 @@ pub fun op_mem(base: i32, disp: i64, index: i32, scale: u8, size: u8) Operand {
     ret op;
 }
 
-# a bare symbol operand carrying `mod`
 pub fun op_sym(name_off: usize, name_len: usize, mod: isa.SymModifier, size: u8) Operand {
     var op: Operand = op_none();
     op.kind     = AOP_SYM;
@@ -732,29 +252,16 @@ pub fun op_sym(name_off: usize, name_len: usize, mod: isa.SymModifier, size: u8)
     ret op;
 }
 
-# true for the ASCII whitespace the asm tokenizer trims
 pub fun is_space(c: char) bool {
     ret c == ' '::char || c == '\t'::char || c == '\r'::char;
 }
 
-# true for a byte that may lie between statements: whitespace, a newline, or the `;`
-# statement separator. every other byte must be claimed by an item
 pub fun is_skip(c: char) bool {
     ret is_space(c) || c == '\n'::char || c == ';'::char;
 }
 
-# true for an ASCII decimal digit
 pub fun is_digit(c: char) bool { ret c >= '0'::char && c <= '9'::char; }
 
-# true for a character allowed inside a bare symbol name
-#
-# `.` and `$` are the two characters the mangler puts in a linkage name that a
-# source identifier cannot contain: `.` separates the module path from the name,
-# `$` introduces a generic argument. Both are accepted here so EVERY mangled
-# symbol, generic or not, stays nameable from inline asm. Neither has any other
-# role in the asm grammar on any ISA - a memory operand opens with `[` or `(`, a
-# relocation modifier with `:` or `%`, operands separate on `,` - so admitting
-# them cannot make an existing operand parse differently.
 pub fun is_sym_char(c: char) bool {
     ret c == '_'::char || c == '.'::char || c == '$'::char ||
         (c >= 'a'::char && c <= 'z'::char) ||
@@ -762,8 +269,6 @@ pub fun is_sym_char(c: char) bool {
         (c >= '0'::char && c <= '9'::char);
 }
 
-# true when `s[lo..hi)` is a valid bare symbol name: the leading character a letter
-# or underscore, the rest symbol characters
 pub fun is_sym_region(s: str, lo: usize, hi: usize) bool {
     if (hi <= lo) { ret false; }
     val c0: char = s[lo];
@@ -778,8 +283,6 @@ pub fun is_sym_region(s: str, lo: usize, hi: usize) bool {
     ret true;
 }
 
-# copy `s[lo..hi)`, trimming surrounding whitespace, into `dst` as a NUL-terminated
-# string. returns false on an empty or oversized slice
 pub fun copy_region(s: str, lo: usize, hi: usize, dst: *u8, cap: usize) bool {
     var a: usize = lo;
     var b: usize = hi;
@@ -793,8 +296,6 @@ pub fun copy_region(s: str, lo: usize, hi: usize, dst: *u8, cap: usize) bool {
     ret true;
 }
 
-# parse `s[lo..hi)` as a signed integer literal in any base the shared literal
-# reader accepts, returning none when the region is not exactly one
 pub fun region_i64(s: str, lo: usize, hi: usize) O.Option[i64] {
     var buf: [40]u8;
     if (!copy_region(s, lo, hi, ?buf[0], 40)) { ret O.none[i64](); }
@@ -803,8 +304,6 @@ pub fun region_i64(s: str, lo: usize, hi: usize) O.Option[i64] {
     ret O.some[i64](R.unwrap_ok[i64, str](r));
 }
 
-# parse `s[lo..hi)` as an unsigned integer literal in any base the shared literal
-# reader accepts, returning none when the region is not exactly one
 fun region_u64(s: str, lo: usize, hi: usize) O.Option[u64] {
     var buf: [40]u8;
     if (!copy_region(s, lo, hi, ?buf[0], 40)) { ret O.none[u64](); }
@@ -813,28 +312,16 @@ fun region_u64(s: str, lo: usize, hi: usize) O.Option[u64] {
     ret O.some[u64](R.unwrap_ok[u64, str](r));
 }
 
-# the largest unsigned value `width` bytes can hold
 fun width_max(width: u8) u64 {
     if (width >= 8) { ret 18446744073709551615; }
     ret (1::u64 << (width::u64 * 8)) - 1;
 }
 
-# the most negative signed value `width` bytes can hold
 fun width_min(width: u8) i64 {
     if (width >= 8) { ret -9223372036854775808; }
     ret 0 - (1::i64 << (width::i64 * 8 - 1));
 }
 
-# the `width`-byte value `body[lo..hi)` names, as the bits that reach the payload
-#
-# Both spellings of the same bytes are accepted, and each is bounded by what the width
-# holds: a negative literal by the signed minimum (`.byte -128`), everything else by
-# the unsigned maximum (`.byte 255`). Reading a non-negative literal UNSIGNED is what
-# lets `.quad 0xFFFFFFFFFFFFFFFF` name an address no `i64` can hold.
-#
-# A value the width cannot hold is refused rather than truncated, for the reason
-# `.byte 0x1FF` has always been: naming one byte and getting the low half of two is an
-# instruction stream nobody wrote.
 fun data_value(body: str, lo: usize, hi: usize, width: u8, out: *u64) bool {
     if (hi > lo && body[lo] == '-'::char) {
         val sv: O.Option[i64] = region_i64(body, lo, hi);
@@ -852,7 +339,6 @@ fun data_value(body: str, lo: usize, hi: usize, width: u8, out: *u64) bool {
     ret true;
 }
 
-# write the low `width` bytes of `bits` into `dst` in `endian` byte order
 fun data_expand(bits: u64, width: u8, endian: isa.Endian, dst: *u8) {
     var i: u64 = 0;
     for (i < width::u64) {
@@ -863,10 +349,6 @@ fun data_expand(bits: u64, width: u8, endian: isa.Endian, dst: *u8) {
     }
 }
 
-# the index of the directive `body[lo..hi)` names, or -1
-#
-# A directive matches its exact spelling followed by whitespace, so `.byte` alone is
-# not the directive and reaches the mnemonic table (where it is refused by name).
 fun directive_lookup(g: *Grammar, body: str, lo: usize, hi: usize) i32 {
     var i: usize = 0;
     for (i < g.data_count) {
@@ -878,18 +360,6 @@ fun directive_lookup(g: *Grammar, body: str, lo: usize, hi: usize) i32 {
     ret -1;
 }
 
-# build "<prefix><name><suffix>", interned so the message outlives this call
-#
-# Degrades to `fallback` when no interner is available - the effect derivation, whose
-# caller reports nothing; the encoder re-parses the same body and reissues the
-# message with its source location.
-# ---
-# alloc:    allocator the message is built in
-# interner: interner the message is interned into, or nil
-# prefix:   text before the name
-# name:     the named entity (an instruction, an operand, a symbol)
-# suffix:   text after the name
-# fallback: the message to use when no interner is available or building fails
 pub fun named_message(alloc: *A.Allocator, interner: *intern.Interner, prefix: str, name: str,
                       suffix: str, fallback: str) str {
     if (interner == nil || name == nil) { ret fallback; }
@@ -918,7 +388,6 @@ pub fun named_message(alloc: *A.Allocator, interner: *intern.Interner, prefix: s
     ret fallback;
 }
 
-# build "<prefix><body[lo..hi)><suffix>" for a span of the body being parsed
 pub fun span_message(c: *Cursor, prefix: str, lo: usize, hi: usize, suffix: str, fallback: str) str {
     if (c.interner == nil) { ret fallback; }
     var buf: [STMT_MAX]u8;
@@ -926,18 +395,6 @@ pub fun span_message(c: *Cursor, prefix: str, lo: usize, hi: usize, suffix: str,
     ret named_message(c.alloc, c.interner, prefix, (?buf[0])::str, suffix, fallback);
 }
 
-# start a parse over `body`
-#
-# `f` and `pl` are the binding context: pass both to resolve `{name}` against a
-# laid-out frame, or nil to parse before the frame exists.
-# ---
-# c:        the cursor to initialize
-# g:        the target's grammar
-# body:     the comment-stripped inline-asm body
-# alloc:    allocator for diagnostics, or nil
-# interner: interner for diagnostics, or nil
-# f:        function supplying the laid-out frame, or nil
-# pl:       the block's inline-asm payload carrying its bindings, or nil
 pub fun cursor_init(c: *Cursor, g: *Grammar, body: str, alloc: *A.Allocator,
                     interner: *intern.Interner, f: *mir.MirFunction, pl: *mir.MirAsm) {
     c.body     = body;
@@ -951,29 +408,17 @@ pub fun cursor_init(c: *Cursor, g: *Grammar, body: str, alloc: *A.Allocator,
     c.g        = g;
 }
 
-# claim `body[off .. off+len)` for the item being parsed
-#
-# The accounting guard. It refuses a claim overlapping an earlier one, and refuses a
-# gap of unclaimed bytes that are not inter-statement filler - so at the end of a
-# parse every byte of the body is claimed by exactly one item or is whitespace. This
-# is what makes "the parse is total" a checked property rather than a hope.
-# ---
-# c:   the cursor
-# off: body offset the claim starts at
-# len: number of bytes claimed
-# ret: ok(true), or the coverage error naming the offending text
-pub fun claim(c: *Cursor, off: usize, len: usize) R.Result[bool, str] {
-    if (off < c.claimed) { ret R.err[bool, str](coverage_error(c, off, off + len)); }
+pub fun claim(c: *Cursor, off: usize, len: usize) R.Result[R.Void, str] {
+    if (off < c.claimed) { ret R.err[R.Void, str](coverage_error(c, off, off + len)); }
     var i: usize = c.claimed;
     for (i < off) {
-        if (!is_skip(c.body[i])) { ret R.err[bool, str](coverage_error(c, c.claimed, off)); }
+        if (!is_skip(c.body[i])) { ret R.err[R.Void, str](coverage_error(c, c.claimed, off)); }
         i = i + 1;
     }
     c.claimed = off + len;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# the diagnostic for a body byte no parsed instruction claims
 fun coverage_error(c: *Cursor, lo: usize, hi: usize) str {
     ret span_message(c,
         "encode: inline-asm instruction '", lo, hi,
@@ -981,14 +426,14 @@ fun coverage_error(c: *Cursor, lo: usize, hi: usize) str {
         "encode: an inline-asm instruction does not account for every byte of its statement");
 }
 
-# reset an item to the neutral state each parse fills in
 fun item_reset(item: *Item) {
     item.kind       = AI_INST;
     item.code       = 0;
     item.flags      = 0;
-    item.writes     = AW_NONE;
-    item.implicit   = 0;
-    item.words      = WORDS_VARIABLE;
+    item.writes       = AW_NONE;
+    item.implicit     = 0;
+    item.words        = WORDS_VARIABLE;
+    item.implicit_mem = false;
     item.nops       = 0;
     item.ref        = AR_NONE;
     item.ref_off    = 0;
@@ -1006,8 +451,6 @@ fun item_reset(item: *Item) {
     for (i < MAX_OPS) { item.ops[i] = op_none(); i = i + 1; }
 }
 
-# if `body[lo..hi)` begins with a numeric local-label definition `<digits>:`, return
-# the byte length of that prefix (through the colon) and the parsed number; else 0
 pub fun label_def_span(body: str, lo: usize, hi: usize, num_out: *u64) usize {
     if (lo >= hi)                { ret 0; }
     if (!is_digit(body[lo]))     { ret 0; }
@@ -1023,8 +466,6 @@ pub fun label_def_span(body: str, lo: usize, hi: usize, num_out: *u64) usize {
     ret i + 1 - lo;
 }
 
-# true when `body[lo..hi)` is a numeric local-label reference `<digits>f` /
-# `<digits>b`, yielding its number and direction. false for any other token shape
 pub fun label_ref_span(body: str, lo: usize, hi: usize, num_out: *u64, fwd_out: *bool) bool {
     if (hi < lo + 2)         { ret false; }
     if (!is_digit(body[lo])) { ret false; }
@@ -1043,12 +484,6 @@ pub fun label_ref_span(body: str, lo: usize, hi: usize, num_out: *u64, fwd_out: 
     ret true;
 }
 
-# the index of the mnemonic row `body[lo..hi)` names, or -1
-#
-# A zero-operand mnemonic matches the whole statement; every other form matches a
-# prefix followed by a space, so `mov` never shadows `movzx` and `cmp` never shadows
-# `cmpxchg`. Rows are tried in table order, so a longer spelling sharing a prefix
-# with a shorter one (`lock cmpxchg` before `cmpxchg`) is placed first.
 fun row_lookup(g: *Grammar, body: str, lo: usize, hi: usize) i32 {
     var i: usize = 0;
     for (i < g.row_count) {
@@ -1065,16 +500,11 @@ fun row_lookup(g: *Grammar, body: str, lo: usize, hi: usize) i32 {
     ret -1;
 }
 
-# split `body[lo..hi)` into trimmed top-level operand token spans, claiming each
-# token and each separating comma
-#
-# Depth is tracked across `(`, `[` and `{` so a comma inside an addressing form
-# (`[x29, #16]`) does not separate operands.
-fun split_ops(c: *Cursor, lo: usize, hi: usize, s: *Stmt) R.Result[bool, str] {
+fun split_ops(c: *Cursor, lo: usize, hi: usize, s: *Stmt) R.Result[R.Void, str] {
     s.nargs = 0;
     var a: usize = lo;
     for (a < hi && is_space(c.body[a])) { a = a + 1; }
-    if (a >= hi) { ret R.ok[bool, str](true); }
+    if (a >= hi) { ret R.ok_void[str](); }
 
     var depth: i32 = 0;
     var start: usize = a;
@@ -1088,7 +518,7 @@ fun split_ops(c: *Cursor, lo: usize, hi: usize, s: *Stmt) R.Result[bool, str] {
 
         if (sep) {
             if (s.nargs::usize >= MAX_OPS) {
-                ret R.err[bool, str](span_message(c,
+                ret R.err[R.Void, str](span_message(c,
                     "encode: inline-asm instruction '", lo, hi, "' names too many operands",
                     "encode: an inline-asm instruction names too many operands"));
             }
@@ -1096,36 +526,24 @@ fun split_ops(c: *Cursor, lo: usize, hi: usize, s: *Stmt) R.Result[bool, str] {
             var tb: usize = i;
             for (ta < tb && is_space(c.body[ta])) { ta = ta + 1; }
             for (tb > ta && is_space(c.body[tb - 1])) { tb = tb - 1; }
-            if (tb <= ta) { ret R.err[bool, str]("encode: malformed inline-asm operand"); }
-            val cr: R.Result[bool, str] = claim(c, ta, tb - ta);
-            if (R.is_err[bool, str](cr)) { ret cr; }
+            if (tb <= ta) { ret R.err[R.Void, str]("encode: malformed inline-asm operand"); }
+            val cr: R.Result[R.Void, str] = claim(c, ta, tb - ta);
+            if (R.is_err[R.Void, str](cr)) { ret cr; }
             s.arg_lo[s.nargs::usize] = ta;
             s.arg_hi[s.nargs::usize] = tb;
             s.nargs = s.nargs + 1;
             if (i < hi) {
-                val cc: R.Result[bool, str] = claim(c, i, 1);
-                if (R.is_err[bool, str](cc)) { ret cc; }
+                val cc: R.Result[R.Void, str] = claim(c, i, 1);
+                if (R.is_err[R.Void, str](cc)) { ret cc; }
             }
             start = i + 1;
         }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# decode a data directive's payload from `body[lo..hi)`, claiming each value and
-# separator
-#
-# A directive is not an instruction: its payload is a value sequence, not an operand
-# list, so it splits here rather than through `split_ops` and is bounded by
-# `BYTES_MAX` rather than by `MAX_OPS`. Routing it through the operand splitter is
-# what capped a byte sequence at four (#2398) - a limit that belongs to instruction
-# operands, where four is a real machine fact, and means nothing here.
-#
-# Each value is expanded to `d.width` bytes in the grammar's byte order, so `.word` on
-# a little-endian target writes the low byte first and a raw instruction word reads the
-# way its manual prints it.
-fun parse_data(c: *Cursor, lo: usize, hi: usize, d: *Directive, item: *Item) R.Result[bool, str] {
+fun parse_data(c: *Cursor, lo: usize, hi: usize, d: *Directive, item: *Item) R.Result[R.Void, str] {
     item.kind = AI_BYTES;
 
     var a: usize = lo;
@@ -1140,7 +558,7 @@ fun parse_data(c: *Cursor, lo: usize, hi: usize, d: *Directive, item: *Item) R.R
 
         if (sep) {
             if (item.byte_count + d.width::usize > BYTES_MAX) {
-                ret R.err[bool, str](span_message(c,
+                ret R.err[R.Void, str](span_message(c,
                     "encode: inline-asm directive '", lo, hi, "' names more bytes than a statement can carry",
                     "encode: an inline-asm data directive names more bytes than a statement can carry"));
             }
@@ -1148,39 +566,30 @@ fun parse_data(c: *Cursor, lo: usize, hi: usize, d: *Directive, item: *Item) R.R
             var tb: usize = i;
             for (ta < tb && is_space(c.body[ta])) { ta = ta + 1; }
             for (tb > ta && is_space(c.body[tb - 1])) { tb = tb - 1; }
-            if (tb <= ta) { ret R.err[bool, str]("encode: malformed inline-asm data-directive value"); }
+            if (tb <= ta) { ret R.err[R.Void, str]("encode: malformed inline-asm data-directive value"); }
 
             var bits: u64 = 0;
             if (!data_value(c.body, ta, tb, d.width, ?bits)) {
-                ret R.err[bool, str](span_message(c,
+                ret R.err[R.Void, str](span_message(c,
                     "encode: inline-asm directive '", lo, hi, "' names a value its width cannot hold",
                     "encode: an inline-asm data directive names a value its width cannot hold"));
             }
 
-            val cr: R.Result[bool, str] = claim(c, ta, tb - ta);
-            if (R.is_err[bool, str](cr)) { ret cr; }
+            val cr: R.Result[R.Void, str] = claim(c, ta, tb - ta);
+            if (R.is_err[R.Void, str](cr)) { ret cr; }
             data_expand(bits, d.width, c.g.endian, ?item.bytes[item.byte_count]);
             item.byte_count = item.byte_count + d.width::usize;
             if (i < hi) {
-                val cc: R.Result[bool, str] = claim(c, i, 1);
-                if (R.is_err[bool, str](cc)) { ret cc; }
+                val cc: R.Result[R.Void, str] = claim(c, i, 1);
+                if (R.is_err[R.Void, str](cc)) { ret cc; }
             }
             start = i + 1;
         }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# parse the next statement of the body into `item`
-#
-# Returns ok(true) with `item` filled, ok(false) at the end of the body (after
-# checking every trailing byte is skippable), or an error naming the instruction that
-# could not be parsed or accounted for.
-# ---
-# c:    the cursor
-# item: receives the parsed statement
-# ret:  ok(true) on an item, ok(false) at end of body, or a refusal
 pub fun next(c: *Cursor, item: *Item) R.Result[bool, str] {
     for (c.pos < c.len && is_skip(c.body[c.pos])) { c.pos = c.pos + 1; }
     if (c.pos >= c.len) { ret finish(c); }
@@ -1199,7 +608,6 @@ pub fun next(c: *Cursor, item: *Item) R.Result[bool, str] {
     if (R.is_err[usize, str](pr)) { ret R.err[bool, str](R.unwrap_err[usize, str](pr)); }
     val consumed: usize = R.unwrap_ok[usize, str](pr);
 
-    # the statement is only parsed when every one of its bytes was claimed.
     if (c.claimed != consumed) { ret R.err[bool, str](coverage_error(c, lo, hi)); }
 
     item.src_len = consumed - lo;
@@ -1207,7 +615,6 @@ pub fun next(c: *Cursor, item: *Item) R.Result[bool, str] {
     ret R.ok[bool, str](true);
 }
 
-# end-of-body check: the bytes past the last claim must all be skippable
 fun finish(c: *Cursor) R.Result[bool, str] {
     var i: usize = c.claimed;
     for (i < c.len) {
@@ -1217,17 +624,6 @@ fun finish(c: *Cursor) R.Result[bool, str] {
     ret R.ok[bool, str](false);
 }
 
-# parse one statement `body[lo..hi)`, returning the offset it consumed through
-#
-# A numeric local-label definition is its own item and consumes only its `<digits>:`
-# prefix, so an instruction sharing the line is parsed by the next call and claims
-# its own bytes.
-#
-# A data directive is resolved BEFORE the mnemonic table, so the family means the same
-# thing on every target and a mnemonic table cannot shadow it.
-#
-# An effect clause is split off FIRST, so everything below reads the statement proper
-# and no payload or operand splitter has to know the clause exists (#2594).
 fun parse_stmt(c: *Cursor, lo: usize, hi: usize, item: *Item) R.Result[usize, str] {
     val cl: usize = clause_start(c.body, lo, hi);
     var body_hi: usize = hi;
@@ -1237,8 +633,8 @@ fun parse_stmt(c: *Cursor, lo: usize, hi: usize, item: *Item) R.Result[usize, st
     val dlen: usize = label_def_span(c.body, lo, body_hi, ?num);
     if (dlen > 0) {
         if (cl < hi) { ret R.err[usize, str](clause_target_message(c, lo, hi)); }
-        val cr: R.Result[bool, str] = claim(c, lo, dlen);
-        if (R.is_err[bool, str](cr)) { ret R.err[usize, str](R.unwrap_err[bool, str](cr)); }
+        val cr: R.Result[R.Void, str] = claim(c, lo, dlen);
+        if (R.is_err[R.Void, str](cr)) { ret R.err[usize, str](R.unwrap_err[R.Void, str](cr)); }
         item.kind    = AI_LABEL;
         item.ref_num = num;
         ret R.ok[usize, str](lo + dlen);
@@ -1249,15 +645,11 @@ fun parse_stmt(c: *Cursor, lo: usize, hi: usize, item: *Item) R.Result[usize, st
         val dr: R.Result[usize, str] = parse_directive(c, lo, body_hi, ?c.g.data[di::usize], item);
         if (R.is_err[usize, str](dr)) { ret dr; }
         if (cl >= hi) { ret R.ok[usize, str](body_hi); }
-        val kr: R.Result[bool, str] = parse_clause(c, cl, hi, item);
-        if (R.is_err[bool, str](kr)) { ret R.err[usize, str](R.unwrap_err[bool, str](kr)); }
+        val kr: R.Result[R.Void, str] = parse_clause(c, cl, hi, item);
+        if (R.is_err[R.Void, str](kr)) { ret R.err[usize, str](R.unwrap_err[R.Void, str](kr)); }
         ret R.ok[usize, str](hi);
     }
 
-    # a modeled instruction's effects come from its mnemonic row, and letting a clause
-    # override them would be the one direction this feature must not go: it could
-    # UNDER-declare an instruction the compiler already reads correctly, turning a
-    # derived fact into an author's assertion for no gain (#2594).
     if (cl < hi) { ret R.err[usize, str](clause_target_message(c, lo, hi)); }
 
     var s: Stmt;
@@ -1276,33 +668,27 @@ fun parse_stmt(c: *Cursor, lo: usize, hi: usize, item: *Item) R.Result[usize, st
         }
     }
 
-    val cr: R.Result[bool, str] = claim(c, lo, mlen);
-    if (R.is_err[bool, str](cr)) { ret R.err[usize, str](R.unwrap_err[bool, str](cr)); }
+    val cr: R.Result[R.Void, str] = claim(c, lo, mlen);
+    if (R.is_err[R.Void, str](cr)) { ret R.err[usize, str](R.unwrap_err[R.Void, str](cr)); }
 
-    item.code     = s.m.code;
-    item.flags    = s.m.flags;
-    item.writes   = s.m.writes;
-    item.implicit = s.m.implicit;
-    item.words    = s.m.words;
+    item.code         = s.m.code;
+    item.flags        = s.m.flags;
+    item.writes       = s.m.writes;
+    item.implicit     = s.m.implicit;
+    item.words        = s.m.words;
+    item.implicit_mem = s.m.implicit_mem;
 
     if (s.m.form != AF_NONE) {
-        val sr: R.Result[bool, str] = split_ops(c, lo + mlen, hi, ?s);
-        if (R.is_err[bool, str](sr)) { ret R.err[usize, str](R.unwrap_err[bool, str](sr)); }
+        val sr: R.Result[R.Void, str] = split_ops(c, lo + mlen, hi, ?s);
+        if (R.is_err[R.Void, str](sr)) { ret R.err[usize, str](R.unwrap_err[R.Void, str](sr)); }
     }
 
     item.nops = s.nargs;
-    val pr: R.Result[bool, str] = c.g.parse(c, ?s, item);
-    if (R.is_err[bool, str](pr)) { ret R.err[usize, str](R.unwrap_err[bool, str](pr)); }
+    val pr: R.Result[R.Void, str] = c.g.parse(c, ?s, item);
+    if (R.is_err[R.Void, str](pr)) { ret R.err[usize, str](R.unwrap_err[R.Void, str](pr)); }
     ret R.ok[usize, str](hi);
 }
 
-# the offset of the effect clause's `::` within `body[lo..hi)`, or `hi` when there is
-# none
-#
-# `::` cannot occur anywhere else in a statement: a payload value is an integer
-# literal, an operand is a register, a bracketed address, an immediate or a name, and
-# none of the three grammars spells a doubled colon. So a plain scan is exact rather
-# than a heuristic, and no depth tracking is needed.
 fun clause_start(body: str, lo: usize, hi: usize) usize {
     var i: usize = lo;
     for (i + 1 < hi) {
@@ -1312,14 +698,12 @@ fun clause_start(body: str, lo: usize, hi: usize) usize {
     ret hi;
 }
 
-# the end of the statement proper: `cl` with its preceding whitespace trimmed off
 fun clause_body_end(body: str, lo: usize, cl: usize) usize {
     var b: usize = cl;
     for (b > lo && is_space(body[b - 1])) { b = b - 1; }
     ret b;
 }
 
-# the diagnostic for an effect clause on a statement that may not carry one
 fun clause_target_message(c: *Cursor, lo: usize, hi: usize) str {
     ret span_message(c,
         "encode: inline-asm statement '", lo, hi,
@@ -1327,23 +711,9 @@ fun clause_target_message(c: *Cursor, lo: usize, hi: usize) str {
         "encode: an inline-asm effect clause may follow only a data directive, since a modeled instruction's effects come from its mnemonic");
 }
 
-# parse the effect clause spanning `body[lo..hi)`, claiming all of it
-#
-# The clause is claimed as ONE region rather than token by token, which is exactly what
-# it is: a single syntactic unit attached to the statement before it. The accounting
-# invariant is unchanged - every byte of the body is still claimed by exactly one item
-# - and this reader is total over the span, so no byte inside it goes unread either.
-# ---
-# c:    the cursor
-# lo:   body offset of the `::`
-# hi:   body offset just past the clause
-# item: receives the declared facts
-# ret:  ok(true), or the refusal naming what was wrong
-fun parse_clause(c: *Cursor, lo: usize, hi: usize, item: *Item) R.Result[bool, str] {
-    # a target that wires no register-name resolver cannot validate a declaration, so
-    # it refuses one rather than accepting a set it could not check.
+fun parse_clause(c: *Cursor, lo: usize, hi: usize, item: *Item) R.Result[R.Void, str] {
     if (c.g.decl_reg == nil) {
-        ret R.err[bool, str](named_message(c.alloc, c.interner,
+        ret R.err[R.Void, str](named_message(c.alloc, c.interner,
             "encode: ", c.g.isa, " inline asm does not support effect clauses",
             "encode: this target's inline asm does not support effect clauses"));
     }
@@ -1354,12 +724,12 @@ fun parse_clause(c: *Cursor, lo: usize, hi: usize, item: *Item) R.Result[bool, s
         for (i < hi && is_space(c.body[i])) { i = i + 1; }
         if (i >= hi) { cnt; }
         val ar: R.Result[usize, str] = parse_attr(c, i, hi, item);
-        if (R.is_err[usize, str](ar)) { ret R.err[bool, str](R.unwrap_err[usize, str](ar)); }
+        if (R.is_err[usize, str](ar)) { ret R.err[R.Void, str](R.unwrap_err[usize, str](ar)); }
         i    = R.unwrap_ok[usize, str](ar);
         seen = seen + 1;
     }
     if (seen == 0) {
-        ret R.err[bool, str](span_message(c,
+        ret R.err[R.Void, str](span_message(c,
             "encode: inline-asm effect clause '", lo, hi, "' names no attribute",
             "encode: an inline-asm effect clause names no attribute"));
     }
@@ -1368,11 +738,6 @@ fun parse_clause(c: *Cursor, lo: usize, hi: usize, item: *Item) R.Result[bool, s
     ret claim(c, lo, hi - lo);
 }
 
-# parse one attribute starting at `lo`, returning the offset just past it
-#
-# `writes(<reg>, ...)` is the only attribute today and the grammar is a
-# space-separated LIST so that stays true by choice rather than by construction - see
-# the clause's design note for why `noreturn` is not here yet.
 fun parse_attr(c: *Cursor, lo: usize, hi: usize, item: *Item) R.Result[usize, str] {
     var name_hi: usize = lo;
     for (name_hi < hi && is_sym_char(c.body[name_hi])) { name_hi = name_hi + 1; }
@@ -1407,21 +772,15 @@ fun parse_attr(c: *Cursor, lo: usize, hi: usize, item: *Item) R.Result[usize, st
             "encode: an inline-asm effect attribute has no closing ')'"));
     }
 
-    val lr: R.Result[bool, str] = parse_reg_list(c, name_hi + 1, close, item);
-    if (R.is_err[bool, str](lr)) { ret R.err[usize, str](R.unwrap_err[bool, str](lr)); }
+    val lr: R.Result[R.Void, str] = parse_reg_list(c, name_hi + 1, close, item);
+    if (R.is_err[R.Void, str](lr)) { ret R.err[usize, str](R.unwrap_err[R.Void, str](lr)); }
     ret R.ok[usize, str](close + 1);
 }
 
-# fold the comma-separated register names in `body[lo..hi)` into the declared masks
-#
-# An empty list is a DECLARATION, not an omission: `writes()` says the encoding writes
-# no register, which is the whole point for an instruction like `out dx, al`. That is
-# why the presence of the clause and its contents are tracked separately - an absent
-# clause and an empty one must not be the same value (#2594).
-fun parse_reg_list(c: *Cursor, lo: usize, hi: usize, item: *Item) R.Result[bool, str] {
+fun parse_reg_list(c: *Cursor, lo: usize, hi: usize, item: *Item) R.Result[R.Void, str] {
     var a: usize = lo;
     for (a < hi && is_space(c.body[a])) { a = a + 1; }
-    if (a >= hi) { ret R.ok[bool, str](true); }
+    if (a >= hi) { ret R.ok_void[str](); }
 
     var start: usize = a;
     var i: usize = a;
@@ -1436,29 +795,23 @@ fun parse_reg_list(c: *Cursor, lo: usize, hi: usize, item: *Item) R.Result[bool,
             for (ta < tb && is_space(c.body[ta])) { ta = ta + 1; }
             for (tb > ta && is_space(c.body[tb - 1])) { tb = tb - 1; }
             if (tb <= ta) {
-                ret R.err[bool, str](span_message(c,
+                ret R.err[R.Void, str](span_message(c,
                     "encode: inline-asm effect clause '", lo, hi, "' names an empty register",
                     "encode: an inline-asm effect clause names an empty register"));
             }
-            val rr: R.Result[bool, str] = declare_reg(c, ta, tb, item);
-            if (R.is_err[bool, str](rr)) { ret rr; }
+            val rr: R.Result[R.Void, str] = declare_reg(c, ta, tb, item);
+            if (R.is_err[R.Void, str](rr)) { ret rr; }
             start = i + 1;
         }
         i = i + 1;
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# resolve one register name and set its bit in the declared mask
-#
-# A name this ISA does not spell REFUSES. That is the difference between a declaration
-# and a comment: a typo that resolved to nothing would silently declare a smaller set
-# than the author wrote, which is the miscompile this whole feature has to be careful
-# about (#2594).
-fun declare_reg(c: *Cursor, lo: usize, hi: usize, item: *Item) R.Result[bool, str] {
+fun declare_reg(c: *Cursor, lo: usize, hi: usize, item: *Item) R.Result[R.Void, str] {
     var buf: [32]u8;
     if (!copy_region(c.body, lo, hi, ?buf[0], 32)) {
-        ret R.err[bool, str](span_message(c,
+        ret R.err[R.Void, str](span_message(c,
             "encode: inline-asm effect clause names '", lo, hi, "', which is not a register",
             "encode: an inline-asm effect clause names something that is not a register"));
     }
@@ -1466,40 +819,28 @@ fun declare_reg(c: *Cursor, lo: usize, hi: usize, item: *Item) R.Result[bool, st
     var bank: u8 = ABANK_GP;
     var idx: u32 = 0;
     if (!c.g.decl_reg((?buf[0])::str, ?bank, ?idx)) {
-        ret R.err[bool, str](span_message(c,
+        ret R.err[R.Void, str](span_message(c,
             "encode: inline-asm effect clause names '", lo, hi, "', which is not a register on this target",
             "encode: an inline-asm effect clause names something that is not a register on this target"));
     }
-    # the masks are 32 bits wide, the same domain `mark_written` folds into, so a
-    # resolver handing back a wider index would silently declare nothing.
     if (idx >= 32) {
-        ret R.err[bool, str](span_message(c,
+        ret R.err[R.Void, str](span_message(c,
             "encode: inline-asm effect clause names '", lo, hi, "', whose register index the clobber mask cannot represent",
             "encode: an inline-asm effect clause names a register the clobber mask cannot represent"));
     }
 
     if (bank == ABANK_FP) { item.decl_fp = item.decl_fp | (1::u32 << idx); }
     or                    { item.decl_gp = item.decl_gp | (1::u32 << idx); }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# parse one data-directive statement `body[lo..hi)`, returning the offset it consumed
-# through
-#
-# ON A FIXED-WIDTH TARGET THE PAYLOAD MUST BE A WHOLE NUMBER OF INSTRUCTION WORDS.
-# Every aarch64 and riscv64 instruction is one aligned word, so a directive emitting
-# three bytes silently misaligns every instruction after it - inside this block and in
-# the compiler-emitted code following it. Refusing here is the parse-side twin of the
-# emit-side word-count guard `check_words` applies to instructions: a variable-length
-# encoding declares no word (`g.word == 0`) and is unconstrained, which is why
-# `.byte 0x90` stays a legal single byte on x86-64.
 fun parse_directive(c: *Cursor, lo: usize, hi: usize, d: *Directive, item: *Item) R.Result[usize, str] {
     val nlen: usize = str_len(d.name);
-    val cr: R.Result[bool, str] = claim(c, lo, nlen);
-    if (R.is_err[bool, str](cr)) { ret R.err[usize, str](R.unwrap_err[bool, str](cr)); }
+    val cr: R.Result[R.Void, str] = claim(c, lo, nlen);
+    if (R.is_err[R.Void, str](cr)) { ret R.err[usize, str](R.unwrap_err[R.Void, str](cr)); }
 
-    val pr: R.Result[bool, str] = parse_data(c, lo + nlen, hi, d, item);
-    if (R.is_err[bool, str](pr)) { ret R.err[usize, str](R.unwrap_err[bool, str](pr)); }
+    val pr: R.Result[R.Void, str] = parse_data(c, lo + nlen, hi, d, item);
+    if (R.is_err[R.Void, str](pr)) { ret R.err[usize, str](R.unwrap_err[R.Void, str](pr)); }
 
     if (c.g.word != 0 && item.byte_count % c.g.word::usize != 0) {
         ret R.err[usize, str](span_message(c,
@@ -1510,29 +851,10 @@ fun parse_directive(c: *Cursor, lo: usize, hi: usize, d: *Directive, item: *Item
     ret R.ok[usize, str](hi);
 }
 
-# "unknown <isa> inline-asm instruction '<text>'"
 fun unknown_message(c: *Cursor, lo: usize, hi: usize) str {
     ret span_message(c, c.g.unknown, lo, hi, "'", "unknown inline-asm instruction");
 }
 
-# resolve a `{name}` reference spanning `body[lo..hi)` to its frame-slot offset
-#
-# The shared half of a local binding: the token shape, the lookup against the block's
-# bindings, and the laid-out frame's slot offset. What the offset BECOMES is the
-# target's - `[rbp + off]`, `off(sp)`, `[sp, #off]` - so the ISA's lexer calls this and
-# builds its own memory operand around the base register `SlotFn` measured from.
-#
-# Returns ok(false) when the parse carries no binding context: before the frame is
-# laid out a binding's displacement genuinely is unknown. The operand stays a binding
-# and the statement is still modeled - what the displacement turns out to be cannot
-# change which registers the statement writes, since a slot is memory either way.
-# ---
-# c:   the cursor
-# lo:  body offset of the `{`
-# hi:  body offset just past the `}`
-# off: receives the slot offset, in the base register `SlotFn` measures from
-# ret: ok(true) when resolved, ok(false) when there is no binding context, or the
-#      refusal naming the malformed or unbound reference
 pub fun bind_offset(c: *Cursor, lo: usize, hi: usize, off: *i64) R.Result[bool, str] {
     if (hi <= lo || c.body[lo] != '{'::char) { ret R.err[bool, str]("encode: malformed inline-asm operand"); }
     var close: usize = lo;
@@ -1561,34 +883,12 @@ pub fun bind_offset(c: *Cursor, lo: usize, hi: usize, off: *i64) R.Result[bool, 
     ret R.err[bool, str]("encode: unknown local in inline asm '{name}' reference");
 }
 
-# true when the interned binding name equals the `name_len` bytes of `body` at `start`
 fun bind_name_eq(interner: *intern.Interner, name: intern.StrId, body: str, start: usize, name_len: usize) bool {
     val nopt: O.Option[str] = intern.lookup(interner, name);
     if (!O.is_some[str](nopt)) { ret false; }
     ret str_region_equals(body, start, name_len, O.unwrap[str](nopt));
 }
 
-# the registers one parsed item writes, folded into the running masks
-#
-# The whole effect model, and the same one on every target. An instruction writes
-# exactly the registers its mnemonic's facts name among its own operands, plus the
-# ones its form writes regardless. A raw byte payload is not an instruction the
-# parser read at all, so it reaches every register in every bank UNLESS its statement
-# declared a set, in which case the declaration is the fact (#2594).
-#
-# THE UNDECLARED CASE IS UNCHANGED, deliberately: a `.byte` written before this
-# existed, or by an author who did not want to reason about it, keeps costing the whole
-# register file. A declaration is opt-in precisely because it moves the burden of being
-# right from the compiler onto the author, and nothing should acquire that burden by
-# being left alone.
-#
-# A `{name}` binding names a frame slot, never a register, so a statement carrying
-# one folds to the same set resolved or unresolved (#2258).
-# ---
-# g:    the target's grammar
-# item: the parsed statement
-# gp:   accumulated general-purpose write mask (index n -> bit n)
-# fp:   accumulated float / vector write mask (index n -> bit n)
 pub fun fold_clobbers(g: *Grammar, item: *Item, gp: *u32, fp: *u32) {
     if (item.kind == AI_LABEL) { ret; }
     if (item.kind == AI_BYTES) {
@@ -1616,30 +916,12 @@ pub fun fold_clobbers(g: *Grammar, item: *Item, gp: *u32, fp: *u32) {
     }
 }
 
-# OR a written operand's register bit into `@gp`
-#
-# Only a register destination writes a register: a memory destination writes memory
-# and merely reads its base, an immediate writes nothing, and a `{name}` binding is a
-# stack slot, so it can never name one.
 fun mark_written(op: *Operand, gp: *u32) {
     if (op.kind == AOP_REG && op.reg >= 0 && op.reg < 32) {
         @gp = @gp | (1::u32 << op.reg::u32);
     }
 }
 
-# the registers an inline-asm body writes, derived from the instructions it parses to
-#
-# Runs before register allocation, on the same parser the emitter later runs on the
-# same text, so the clobber set is a property of the parsed instruction stream rather
-# than a second reading of it. A body the parser refuses is opaque: the emitter
-# rejects it with a located diagnostic, and until then no register may hold a live
-# value. The result is always a sound over-approximation - a register the body merely
-# reads may be reported, a written one is never omitted.
-# ---
-# g:      the target's grammar
-# body:   raw inline-asm body text
-# gp_out: receives the general-purpose clobber bitmask (index n -> bit n)
-# fp_out: receives the float / vector clobber bitmask (index n -> bit n)
 pub fun clobbers(g: *Grammar, body: str, gp_out: *u32, fp_out: *u32) {
     var gp: u32 = 0;
     var fp: u32 = 0;
@@ -1650,13 +932,13 @@ pub fun clobbers(g: *Grammar, body: str, gp_out: *u32, fp_out: *u32) {
     var item: Item;
     var done: bool = false;
     for (!done) {
-        val pr: R.Result[bool, str] = next(?c, ?item);
-        if (R.is_err[bool, str](pr)) {
+        val found_r: R.Result[bool, str] = next(?c, ?item);
+        if (R.is_err[bool, str](found_r)) {
             gp   = g.all_gp;
             fp   = g.all_fp;
             done = true;
         }
-        or (!R.unwrap_ok[bool, str](pr)) { done = true; }
+        or (!R.unwrap_ok[bool, str](found_r)) { done = true; }
         or { fold_clobbers(g, ?item, ?gp, ?fp); }
     }
 
@@ -1664,28 +946,6 @@ pub fun clobbers(g: *Grammar, body: str, gp_out: *u32, fp_out: *u32) {
     @fp_out = fp;
 }
 
-# whether control can fall out of an inline-asm body, derived from the instructions it
-# parses to (#2791)
-#
-# Runs on the same parser the emitter later runs on the same text, so the answer is a
-# property of the parsed instruction stream rather than a second reading of it - the
-# same argument `clobbers` makes, and the reason neither is a lexical scan.
-#
-# ONLY THE LAST STATEMENT DECIDES IT, and only when nothing can jump past it. A trap in
-# the middle of a body is not the end of the body: a numeric local label after it is a
-# branch target, so control reaches the statements beyond. Rather than model reachability
-# inside someone else.s asm, this answers false only for the strictly simpler shape -
-# the final statement is a trap and the body defines no label at all - which is what
-# every non-returning body in mach-std is, on all three ISAs.
-#
-# EVERY UNMODELED CASE ANSWERS TRUE, because false deletes the caller.s continuation. A
-# body the parser refuses, an empty body, a grammar wiring no predicate, and a raw byte
-# payload all report that control returns, which is what every target did before this
-# existed and is never worse than that.
-# ---
-# g:    the target's grammar
-# body: raw inline-asm body text
-# ret:  true when control can fall out of the body, false when it provably cannot
 pub fun returns(g: *Grammar, body: str) bool {
     if (g.no_fall == nil) { ret true; }
 
@@ -1698,9 +958,9 @@ pub fun returns(g: *Grammar, body: str) bool {
     var saw_label: bool    = false;
     var done: bool         = false;
     for (!done) {
-        val pr: R.Result[bool, str] = next(?c, ?item);
-        if (R.is_err[bool, str](pr)) { ret true; }
-        or (!R.unwrap_ok[bool, str](pr)) { done = true; }
+        val found_r: R.Result[bool, str] = next(?c, ?item);
+        if (R.is_err[bool, str](found_r)) { ret true; }
+        or (!R.unwrap_ok[bool, str](found_r)) { done = true; }
         or {
             if (item.kind == AI_LABEL) { saw_label = true; }
             or {
@@ -1715,45 +975,18 @@ pub fun returns(g: *Grammar, body: str) bool {
     ret !last_no_fall;
 }
 
-# initial capacity for the numeric local-label definition / fixup arrays
 val LABEL_INIT_CAP: u32 = 16;
 
-# a numeric local label's most recent definition: the label number and the `.text`
-# offset its `N:` definition marks. a redefinition updates `offset`, so a backward
-# `Nb` reference always binds to the nearest preceding definition
-# ---
-# number: the numeric label
-# offset: byte offset of the definition within `.text`
 pub rec LabelDef {
     number: u64;
     offset: u32;
 }
 
-# a pending forward reference to a numeric local label: the branch at `patch_pos`
-# targets the nearest following definition of `number`. resolved when that definition
-# is reached; an entry still pending at the end of the block is an undefined-label
-# error
-# ---
-# patch_pos: byte offset of the branch instruction within `.text`
-# number:    the referenced numeric label
 pub rec LabelFixup {
     patch_pos: u32;
     number:    u64;
 }
 
-# per-block numeric-local-label scope
-#
-# `defs` tracks the nearest preceding definition of each number for backward
-# references; `fixups` holds forward references awaiting theirs. The displacement
-# insert itself is the ISA's `patch` hook, so this bookkeeping carries no encoding.
-# ---
-# alloc:       backing allocator
-# defs:        recorded label definitions (latest offset per number)
-# def_count:   number of definitions
-# def_cap:     capacity of `defs`
-# fixups:      pending forward references
-# fixup_count: number of pending forward references
-# fixup_cap:   capacity of `fixups`
 pub rec Labels {
     alloc:       *A.Allocator;
     defs:        *LabelDef;
@@ -1764,7 +997,6 @@ pub rec Labels {
     fixup_cap:   u32;
 }
 
-# initialize an empty numeric-local-label scope backed by `alloc`
 pub fun labels_init(l: *Labels, alloc: *A.Allocator) {
     l.alloc       = alloc;
     l.defs        = nil;
@@ -1775,7 +1007,6 @@ pub fun labels_init(l: *Labels, alloc: *A.Allocator) {
     l.fixup_cap   = 0;
 }
 
-# release a label scope's owned arrays
 pub fun labels_dnit(l: *Labels) {
     if (l.defs != nil && l.def_cap > 0) {
         A.deallocate[LabelDef](l.alloc, l.defs, l.def_cap::usize);
@@ -1791,41 +1022,38 @@ pub fun labels_dnit(l: *Labels) {
     }
 }
 
-# grow the label-definition array (or allocate it on first use)
-fun grow_defs(l: *Labels) R.Result[bool, str] {
+fun grow_defs(l: *Labels) R.Result[R.Void, str] {
     if (l.defs == nil) {
         val r: R.Result[*LabelDef, str] = A.allocate[LabelDef](l.alloc, LABEL_INIT_CAP::usize);
-        if (R.is_err[*LabelDef, str](r)) { ret R.err[bool, str](R.unwrap_err[*LabelDef, str](r)); }
+        if (R.is_err[*LabelDef, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*LabelDef, str](r)); }
         l.defs    = R.unwrap_ok[*LabelDef, str](r);
         l.def_cap = LABEL_INIT_CAP;
-        ret R.ok[bool, str](true);
+        ret R.ok_void[str]();
     }
     val nc: u32 = l.def_cap * 2;
     val r: R.Result[*LabelDef, str] = A.reallocate[LabelDef](l.alloc, l.defs, l.def_cap::usize, nc::usize);
-    if (R.is_err[*LabelDef, str](r)) { ret R.err[bool, str](R.unwrap_err[*LabelDef, str](r)); }
+    if (R.is_err[*LabelDef, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*LabelDef, str](r)); }
     l.defs    = R.unwrap_ok[*LabelDef, str](r);
     l.def_cap = nc;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# grow the label-fixup array (or allocate it on first use)
-fun grow_fixups(l: *Labels) R.Result[bool, str] {
+fun grow_fixups(l: *Labels) R.Result[R.Void, str] {
     if (l.fixups == nil) {
         val r: R.Result[*LabelFixup, str] = A.allocate[LabelFixup](l.alloc, LABEL_INIT_CAP::usize);
-        if (R.is_err[*LabelFixup, str](r)) { ret R.err[bool, str](R.unwrap_err[*LabelFixup, str](r)); }
+        if (R.is_err[*LabelFixup, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*LabelFixup, str](r)); }
         l.fixups    = R.unwrap_ok[*LabelFixup, str](r);
         l.fixup_cap = LABEL_INIT_CAP;
-        ret R.ok[bool, str](true);
+        ret R.ok_void[str]();
     }
     val nc: u32 = l.fixup_cap * 2;
     val r: R.Result[*LabelFixup, str] = A.reallocate[LabelFixup](l.alloc, l.fixups, l.fixup_cap::usize, nc::usize);
-    if (R.is_err[*LabelFixup, str](r)) { ret R.err[bool, str](R.unwrap_err[*LabelFixup, str](r)); }
+    if (R.is_err[*LabelFixup, str](r)) { ret R.err[R.Void, str](R.unwrap_err[*LabelFixup, str](r)); }
     l.fixups    = R.unwrap_ok[*LabelFixup, str](r);
     l.fixup_cap = nc;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# the nearest preceding definition offset of `number`, or none
 pub fun label_lookup(l: *Labels, number: u64) O.Option[u32] {
     var i: u32 = 0;
     for (i < l.def_count) {
@@ -1835,30 +1063,24 @@ pub fun label_lookup(l: *Labels, number: u64) O.Option[u32] {
     ret O.none[u32]();
 }
 
-# record a pending forward reference to `number` whose branch is at `patch_pos`
-pub fun label_push_fixup(l: *Labels, patch_pos: u32, number: u64) R.Result[bool, str] {
+pub fun label_push_fixup(l: *Labels, patch_pos: u32, number: u64) R.Result[R.Void, str] {
     if (l.fixup_count >= l.fixup_cap) {
-        val gr: R.Result[bool, str] = grow_fixups(l);
-        if (R.is_err[bool, str](gr)) { ret gr; }
+        val gr: R.Result[R.Void, str] = grow_fixups(l);
+        if (R.is_err[R.Void, str](gr)) { ret gr; }
     }
     l.fixups[l.fixup_count].patch_pos = patch_pos;
     l.fixups[l.fixup_count].number    = number;
     l.fixup_count = l.fixup_count + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# record a definition of `number` at `.text` offset `off`
-#
-# Patches every pending forward reference to it (this is their nearest following
-# definition) through the ISA's `patch` hook, and updates the nearest-preceding
-# definition backward references resolve against. A redefinition is allowed.
-pub fun label_record_def(st: *encode.EncodeState, g: *Grammar, l: *Labels, number: u64, off: u32) R.Result[bool, str] {
+pub fun label_record_def(st: *encode.EncodeState, g: *Grammar, l: *Labels, number: u64, off: u32) R.Result[R.Void, str] {
     var w: u32 = 0;
     var r: u32 = 0;
     for (r < l.fixup_count) {
         if (l.fixups[r].number == number) {
-            val pr: R.Result[bool, str] = g.patch(st, l.fixups[r].patch_pos, off);
-            if (R.is_err[bool, str](pr)) { ret pr; }
+            val pr: R.Result[R.Void, str] = g.patch(st, l.fixups[r].patch_pos, off);
+            if (R.is_err[R.Void, str](pr)) { ret pr; }
         } or {
             l.fixups[w].patch_pos = l.fixups[r].patch_pos;
             l.fixups[w].number    = l.fixups[r].number;
@@ -1872,31 +1094,26 @@ pub fun label_record_def(st: *encode.EncodeState, g: *Grammar, l: *Labels, numbe
     for (i < l.def_count) {
         if (l.defs[i].number == number) {
             l.defs[i].offset = off;
-            ret R.ok[bool, str](true);
+            ret R.ok_void[str]();
         }
         i = i + 1;
     }
     if (l.def_count >= l.def_cap) {
-        val gr: R.Result[bool, str] = grow_defs(l);
-        if (R.is_err[bool, str](gr)) { ret gr; }
+        val gr: R.Result[R.Void, str] = grow_defs(l);
+        if (R.is_err[R.Void, str](gr)) { ret gr; }
     }
     l.defs[l.def_count].number = number;
     l.defs[l.def_count].offset = off;
     l.def_count                = l.def_count + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# resolve a branch just emitted at `patch_pos` against a numeric local label
-#
-# A forward reference is recorded as a fixup patched when its definition is reached;
-# a backward one is patched immediately against the label's nearest preceding
-# definition, and an undefined one is a hard error.
 pub fun resolve_local(st: *encode.EncodeState, g: *Grammar, l: *Labels, patch_pos: u32,
-                      number: u64, fwd: bool) R.Result[bool, str] {
+                      number: u64, fwd: bool) R.Result[R.Void, str] {
     if (fwd) { ret label_push_fixup(l, patch_pos, number); }
     val def: O.Option[u32] = label_lookup(l, number);
     if (!O.is_some[u32](def)) {
-        ret R.err[bool, str](label_message(st,
+        ret R.err[R.Void, str](label_message(st,
             "encode: inline-asm backward reference to local label '", number,
             "b' has no preceding definition in this asm block",
             "encode: inline-asm backward reference to a local label has no preceding definition in this asm block"));
@@ -1904,8 +1121,6 @@ pub fun resolve_local(st: *encode.EncodeState, g: *Grammar, l: *Labels, patch_po
     ret g.patch(st, patch_pos, O.unwrap[u32](def));
 }
 
-# write the decimal digits of `n` into `dst` (at least one digit) and return the
-# digit count; `dst` must hold at least 20 bytes
 fun u64_to_dec(n: u64, dst: *u8) usize {
     if (n == 0) { dst[0] = '0'::u8; ret 1; }
     var tmp: [20]u8;
@@ -1921,7 +1136,6 @@ fun u64_to_dec(n: u64, dst: *u8) usize {
     ret len;
 }
 
-# build an interned error naming a numeric local label, e.g. "<prefix>1<suffix>"
 fun label_message(st: *encode.EncodeState, prefix: str, number: u64, suffix: str, fallback: str) str {
     var buf: [24]u8;
     val len: usize = u64_to_dec(number, ?buf[0]);
@@ -1929,47 +1143,24 @@ fun label_message(st: *encode.EncodeState, prefix: str, number: u64, suffix: str
     ret named_message(st.alloc, st.interner, prefix, (?buf[0])::str, suffix, fallback);
 }
 
-# expand an inline-asm MIR_ASM instruction into machine bytes
-#
-# Parses the body into the target's own instruction stream and emits each
-# instruction through the encoder the instruction selector drives, so an inline-asm
-# instruction and a compiler-selected one are the same value taking the same path.
-# `{name}` references resolve against the laid-out frame during the parse; a branch
-# or symbol operand records its relocation. An unknown mnemonic, a malformed operand,
-# or a statement byte no instruction claims is a hard error located at the asm
-# statement's "path:line:col" (#2153).
-#
-# On a fixed-width target the driver additionally checks each item emitted exactly
-# the number of instruction words its mnemonic declares, so a form silently emitting
-# two instructions under one mnemonic - or none - fails the build naming it. A form
-# declaring `WORDS_VARIABLE`, and every form on a variable-length encoding, is
-# checked only by the parse-side accounting.
-# ---
-# st: the shared encode state
-# g:  the target's grammar
-# f:  the function being encoded, whose frame resolves a `{name}`
-# mi: the MIR_ASM instruction
-# ret: ok(true), or the located refusal
-pub fun encode_block(st: *encode.EncodeState, g: *Grammar, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
-    if (mi.asm_block == nil) { ret R.err[bool, str]("encode: MIR_ASM has no payload"); }
+pub fun encode_block(st: *encode.EncodeState, g: *Grammar, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[R.Void, str] {
+    if (mi.asm_block == nil) { ret R.err[R.Void, str]("encode: MIR_ASM has no payload"); }
     val pl: *mir.MirAsm = mi.asm_block;
 
-    # only this ISA's tag is encodable here; a mismatched tag means a comptime arch
-    # guard failed to select the right block.
     if (!str_equals(pl.isa, g.isa)) {
-        ret R.err[bool, str](encode.asm_located_message(st, mi.loc,
+        ret R.err[R.Void, str](encode.asm_located_message(st, mi.loc,
             named_message(st.alloc, st.interner, "encode: inline-asm block is not ", g.isa, "",
                           "encode: inline-asm block is not for this target")));
     }
 
     if (pl.bind_count > 0 && g.slot_sp != nil && g.slot_sp(f)) {
         if (g.writes_sp == nil) {
-            ret R.err[bool, str](encode.asm_located_message(st, mi.loc,
+            ret R.err[R.Void, str](encode.asm_located_message(st, mi.loc,
                 "internal compiler error: inline-asm grammar measures a '{name}' from the stack pointer without wiring the stack-pointer-write check"));
         }
-        val sr: R.Result[bool, str] = check_stable_sp(st, g, f, pl);
-        if (R.is_err[bool, str](sr)) {
-            ret R.err[bool, str](encode.asm_located_message(st, mi.loc, R.unwrap_err[bool, str](sr)));
+        val sr: R.Result[R.Void, str] = check_stable_sp(st, g, f, pl);
+        if (R.is_err[R.Void, str](sr)) {
+            ret R.err[R.Void, str](encode.asm_located_message(st, mi.loc, R.unwrap_err[R.Void, str](sr)));
         }
     }
 
@@ -1979,12 +1170,10 @@ pub fun encode_block(st: *encode.EncodeState, g: *Grammar, f: *mir.MirFunction, 
     var c: Cursor;
     cursor_init(?c, g, pl.body, st.alloc, st.interner, f, pl);
 
-    val rr: R.Result[bool, str] = run(st, g, ?c, ?l);
+    val rr: R.Result[R.Void, str] = run(st, g, ?c, ?l);
     var fail: str = nil;
-    if (R.is_err[bool, str](rr)) { fail = R.unwrap_err[bool, str](rr); }
+    if (R.is_err[R.Void, str](rr)) { fail = R.unwrap_err[R.Void, str](rr); }
 
-    # a forward reference whose label was never defined in the block is a hard error,
-    # not a silently zero-displacement branch.
     or (l.fixup_count > 0) {
         fail = label_message(st,
             "encode: inline-asm forward reference to local label '", l.fixups[0].number,
@@ -1992,110 +1181,57 @@ pub fun encode_block(st: *encode.EncodeState, g: *Grammar, f: *mir.MirFunction, 
             "encode: inline-asm forward reference to a local label has no definition in this asm block");
     }
     labels_dnit(?l);
-    if (fail != nil) { ret R.err[bool, str](encode.asm_located_message(st, mi.loc, fail)); }
-    ret R.ok[bool, str](true);
+    if (fail != nil) { ret R.err[R.Void, str](encode.asm_located_message(st, mi.loc, fail)); }
+    ret R.ok_void[str]();
 }
 
-# refuse a `{name}`-binding block that moves the stack pointer
-#
-# Reached only for a function whose `slot_sp` says its `SlotFn` measures from the stack
-# pointer. That displacement is taken once, at block entry, so
-# the pointer must still be where it was when the access runs. The break is not local to
-# the statements after the write: a backward branch inside the body reaches an earlier
-# `{name}` again with the moved pointer. So the whole block is judged, not a prefix of
-# it, and it is judged BEFORE a byte is emitted.
-#
-# It costs one extra parse of a body that is a handful of statements, and only for a
-# block that binds at all - a `#[naked]` prologue writing SP owns no locals and is
-# never scanned.
-# ---
-# st: the shared encode state
-# g:  the target's grammar
-# f:  the function whose frame the bindings resolve against
-# pl: the block's payload
-# ret: ok(true), or the unlocated refusal
-fun check_stable_sp(st: *encode.EncodeState, g: *Grammar, f: *mir.MirFunction, pl: *mir.MirAsm) R.Result[bool, str] {
+fun check_stable_sp(st: *encode.EncodeState, g: *Grammar, f: *mir.MirFunction, pl: *mir.MirAsm) R.Result[R.Void, str] {
     var c: Cursor;
     cursor_init(?c, g, pl.body, st.alloc, st.interner, f, pl);
     var item: Item;
     var done: bool = false;
     for (!done) {
-        val pr: R.Result[bool, str] = next(?c, ?item);
-        # a malformed body is the emitting pass's diagnostic to issue, not this one's:
-        # reporting it here would name the scan in a message about a typo.
-        if (R.is_err[bool, str](pr))     { ret R.ok[bool, str](true); }
-        or (!R.unwrap_ok[bool, str](pr)) { done = true; }
+        val found_r: R.Result[bool, str] = next(?c, ?item);
+        if (R.is_err[bool, str](found_r))     { ret R.ok_void[str](); }
+        or (!R.unwrap_ok[bool, str](found_r)) { done = true; }
         or (g.writes_sp(?item)) {
-            ret R.err[bool, str](span_message(?c,
+            ret R.err[R.Void, str](span_message(?c,
                 "encode: inline-asm statement '", item.src_off, item.src_off + item.src_len,
                 "' writes the stack pointer in a body that binds a '{name}' local, whose slot is addressed from a base fixed at block entry; move the stack adjustment out of the block, or drop the '{name}' and stage the address into a register first",
                 "encode: an inline-asm body that binds a '{name}' local may not write the stack pointer, because a '{name}' slot is addressed from a base fixed at block entry"));
         }
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# parse and emit every statement a cursor still holds
-#
-# The driver proper, split out so a caller that already owns a cursor and a label
-# scope (an encoder test assembling a body a statement at a time) reaches the same
-# loop the block path does rather than a second one. It leaves unresolved forward
-# references pending in `l`; whether that is an error is the block's question, since
-# the definition may sit in a later part of the same block.
-# ---
-# st: the shared encode state
-# g:  the target's grammar
-# c:  the cursor, already initialized over the body
-# l:  the block's numeric-local-label scope
-# ret: ok(true), or the unlocated refusal
-pub fun run(st: *encode.EncodeState, g: *Grammar, c: *Cursor, l: *Labels) R.Result[bool, str] {
+pub fun run(st: *encode.EncodeState, g: *Grammar, c: *Cursor, l: *Labels) R.Result[R.Void, str] {
     var item: Item;
     var done: bool = false;
     for (!done) {
-        val pr: R.Result[bool, str] = next(c, ?item);
-        if (R.is_err[bool, str](pr))     { ret pr; }
-        or (!R.unwrap_ok[bool, str](pr)) { done = true; }
+        val found_r: R.Result[bool, str] = next(c, ?item);
+        if (R.is_err[bool, str](found_r))     { ret R.err[R.Void, str](R.unwrap_err[bool, str](found_r)); }
+        or (!R.unwrap_ok[bool, str](found_r)) { done = true; }
         or {
             val before: usize = st.buf.len;
             val claimed: u32 = encode.sink_claims(?st.buf);
-            val er: R.Result[bool, str] = emit_one(st, g, c, l, ?item);
-            if (R.is_err[bool, str](er)) { ret er; }
+            val er: R.Result[R.Void, str] = emit_one(st, g, c, l, ?item);
+            if (R.is_err[R.Void, str](er)) { ret er; }
             val wf: str = check_words(st, c, ?item, st.buf.len - before,
                                       encode.sink_claims(?st.buf) - claimed);
-            if (wf != nil) { ret R.err[bool, str](wf); }
+            if (wf != nil) { ret R.err[R.Void, str](wf); }
         }
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# emit one parsed item
-#
-# A label definition records the current offset (resolving pending forward references
-# to it), a raw byte payload is written verbatim, and an instruction goes to the
-# target's assembler.
-fun emit_one(st: *encode.EncodeState, g: *Grammar, c: *Cursor, l: *Labels, item: *Item) R.Result[bool, str] {
+fun emit_one(st: *encode.EncodeState, g: *Grammar, c: *Cursor, l: *Labels, item: *Item) R.Result[R.Void, str] {
     if (item.kind == AI_LABEL) {
         ret label_record_def(st, g, l, item.ref_num, st.buf.len::u32);
     }
     if (item.kind == AI_BYTES) {
-        # a target that wires no hook is refused rather than left to emit a dump that
-        # silently omits the directive - a dump missing instructions is worse than one
-        # that fails (#2467).
         if (encode.sink_active(?st.buf) && g.note_bytes == nil) {
-            ret R.err[bool, str]("--emit-asm: this target wires no raw-byte directive printer, so a `.byte` payload cannot be rendered");
+            ret R.err[R.Void, str]("--emit-asm: this target wires no raw-byte directive printer, so a `.byte` payload cannot be rendered");
         }
-        # ONE WORD PER NOTIFICATION on a fixed-width target, exactly as an instruction
-        # is - `parse_directive` already refused anything not a whole number of words,
-        # so this never leaves a short remainder. A variable-width target (`g.word ==
-        # 0`) declares no word to chunk by, so its whole payload is one notification,
-        # as it always was.
-        #
-        # This is what a BUFFERING printer needs: `note_bytes` runs after every one of
-        # its words is actually in the text, matching how an instruction's own bytes
-        # precede its own notification, so the notification can claim exactly the
-        # bytes just written rather than a span spanning bytes not yet emitted (#2493).
-        # A printer that renders on the spot pays only a few more calls for a
-        # multi-word directive; the bytes and the rendered text are unchanged.
         var step: usize = item.byte_count;
         if (g.word != 0) { step = g.word::usize; }
         var i: usize = 0;
@@ -2107,28 +1243,21 @@ fun emit_one(st: *encode.EncodeState, g: *Grammar, c: *Cursor, l: *Labels, item:
                 k = k + 1;
             }
             if (encode.sink_active(?st.buf)) {
-                val rn: R.Result[bool, str] = g.note_bytes(st, ?item.bytes[i], step, start);
-                if (R.is_err[bool, str](rn)) { ret rn; }
+                val rn: R.Result[R.Void, str] = g.note_bytes(st, ?item.bytes[i], step, start);
+                if (R.is_err[R.Void, str](rn)) { ret rn; }
             }
             i = i + step;
         }
-        ret R.ok[bool, str](true);
+        ret R.ok_void[str]();
     }
-    # the emitter always parses with a binding context, so every `{name}` resolved to
-    # its frame slot or failed the parse. checking it here, over every operand of
-    # every statement, is what lets each grammar read a binding as the memory operand
-    # it is without three emitters re-deriving the same refusal - and it covers every
-    # operand position, including the ones whose emitter reads a register field
-    # directly and would otherwise encode a base the binding never named (#2258).
     var i: u32 = 0;
     for (i < item.nops) {
-        if (item.ops[i::usize].kind == AOP_BIND) { ret R.err[bool, str](unresolved_message(c, item)); }
+        if (item.ops[i::usize].kind == AOP_BIND) { ret R.err[R.Void, str](unresolved_message(c, item)); }
         i = i + 1;
     }
     ret g.emit(st, c, l, item);
 }
 
-# the diagnostic for a statement whose `{name}` never resolved to a frame slot
 fun unresolved_message(c: *Cursor, item: *Item) str {
     ret span_message(c,
         "internal compiler error: inline-asm statement '", item.src_off, item.src_off + item.src_len,
@@ -2136,18 +1265,6 @@ fun unresolved_message(c: *Cursor, item: *Item) str {
         "internal compiler error: an inline-asm statement reached the encoder with an unresolved '{name}'");
 }
 
-# check an emitted instruction against the word count its mnemonic declares and the
-# notifications its emission produced
-#
-# The emit-side half of the totality guard. The word count is available only where an
-# instruction has a fixed width; the notification count is available on every target
-# and is the part a variable-length encoding gets, since `claims` counts machine
-# instructions rather than bytes. A fixed-width form must have notified once per word
-# it emitted, a variable-length one at least once, or the statement emitted machine
-# code the `.s` does not describe. `claims` is zero on an object-producing encode, so
-# the check applies only when a sink is attached.
-#
-# Returns nil when the item is accounted for, else the refusal naming the statement.
 fun check_words(st: *encode.EncodeState, c: *Cursor, item: *Item, emitted: usize, claims: u32) str {
     if (item.kind != AI_INST) { ret nil; }
 
@@ -2169,7 +1286,6 @@ fun check_words(st: *encode.EncodeState, c: *Cursor, item: *Item, emitted: usize
     ret nil;
 }
 
-# the diagnostic for an instruction whose emission did not reach the assembly sink
 fun notify_message(c: *Cursor, item: *Item) str {
     ret span_message(c,
         "encode: inline-asm instruction '", item.src_off, item.src_off + item.src_len,
@@ -2177,8 +1293,6 @@ fun notify_message(c: *Cursor, item: *Item) str {
         "encode: an inline-asm instruction emitted machine code the assembly printer was not notified of");
 }
 
-# the diagnostic for an instruction that emitted a different number of words than its
-# mnemonic declares
 fun words_message(c: *Cursor, item: *Item) str {
     ret span_message(c,
         "encode: inline-asm instruction '", item.src_off, item.src_off + item.src_len,
@@ -2186,57 +1300,40 @@ fun words_message(c: *Cursor, item: *Item) str {
         "encode: an inline-asm instruction emitted a different number of instruction words than its form declares");
 }
 
-# numeric local-label definitions and references are recognized by token shape, the
-# same shape on every target
 test "mach.lang.target.isa.asm:label_token_shapes" {
     var num: u64 = 0;
     var bad: i32 = 0;
 
-    # `<digits>:` is a definition; the prefix length includes the colon.
     if (label_def_span("1:", 0, 2, ?num) != 2 || num != 1)                 { bad = 1; }
     if (label_def_span("42: mov rax, rbx", 0, 16, ?num) != 3 || num != 42) { bad = 1; }
-    # not a definition: no colon, or a non-digit lead.
     if (label_def_span("mov rax, rbx", 0, 12, ?num) != 0) { bad = 1; }
     if (label_def_span("1f", 0, 2, ?num) != 0)            { bad = 1; }
 
     var fwd: bool = false;
-    # `<digits>f` is a forward reference, `<digits>b` a backward one.
     if (!label_ref_span("1f", 0, 2, ?num, ?fwd) || num != 1 || !fwd)   { bad = 1; }
     if (!label_ref_span("23b", 0, 3, ?num, ?fwd) || num != 23 || fwd)  { bad = 1; }
-    # a bare symbol, a digit-led non-f/b token, and a too-short token are not refs.
     if (label_ref_span("loop", 0, 4, ?num, ?fwd)) { bad = 1; }
     if (label_ref_span("1x", 0, 2, ?num, ?fwd))   { bad = 1; }
     if (label_ref_span("1", 0, 1, ?num, ?fwd))    { bad = 1; }
     ret bad;
 }
 
-# a data directive's value occupies exactly its width, in the target's byte order
-#
-# The byte order is where a raw-encoding escape is silently wrong or silently right:
-# `.word 0xd503201f` must land as `1f 20 03 d5` on a little-endian machine, which is
-# what makes it aarch64's `nop` rather than four bytes in the wrong order (#2479).
-# Both orders are asserted, so the parameter is exercised rather than assumed - a
-# big-endian target inherits a checked expansion instead of an untested branch.
 test "mach.lang.target.isa.asm:data_expand_orders_bytes_by_endianness" {
     var bad: i32 = 0;
     var b: [8]u8;
 
-    # little-endian: least-significant byte first.
     data_expand(0xD503201F, 4, isa.ENDIAN_LITTLE, ?b[0]);
     if (b[0] != 0x1F || b[1] != 0x20 || b[2] != 0x03 || b[3] != 0xD5) { bad = 1; }
 
-    # big-endian: the same value, most-significant byte first.
     data_expand(0xD503201F, 4, isa.ENDIAN_BIG, ?b[0]);
     if (b[0] != 0xD5 || b[1] != 0x03 || b[2] != 0x20 || b[3] != 0x1F) { bad = 1; }
 
-    # one byte is the same either way, and a full 64-bit value keeps every byte.
     data_expand(0x90, 1, isa.ENDIAN_LITTLE, ?b[0]);
     if (b[0] != 0x90) { bad = 1; }
     data_expand(0x0123456789ABCDEF, 8, isa.ENDIAN_LITTLE, ?b[0]);
     if (b[0] != 0xEF || b[1] != 0xCD || b[2] != 0xAB || b[3] != 0x89) { bad = 1; }
     if (b[4] != 0x67 || b[5] != 0x45 || b[6] != 0x23 || b[7] != 0x01) { bad = 1; }
 
-    # a two-byte value writes two bytes and touches no third.
     b[2] = 0xAA;
     data_expand(0x1234, 2, isa.ENDIAN_LITTLE, ?b[0]);
     if (b[0] != 0x34 || b[1] != 0x12 || b[2] != 0xAA) { bad = 1; }
@@ -2244,48 +1341,32 @@ test "mach.lang.target.isa.asm:data_expand_orders_bytes_by_endianness" {
     ret bad;
 }
 
-# a value the directive's width cannot hold is refused, at every width
-#
-# The bounds are the two spellings of the same bytes: a negative literal down to the
-# signed minimum, everything else up to the unsigned maximum. Refusing rather than
-# truncating is what keeps `.word 0x10000` from becoming a zero word nobody wrote.
 test "mach.lang.target.isa.asm:data_value_bounds_are_per_width" {
     var bad: i32 = 0;
     var v: u64 = 0;
 
-    # one byte: -128 .. 255, and one past each end.
     if (!data_value("255", 0, 3, 1, ?v) || v != 255)   { bad = 1; }
     if (data_value("256", 0, 3, 1, ?v))                { bad = 1; }
     if (!data_value("-128", 0, 4, 1, ?v) || v != 0x80) { bad = 1; }
     if (data_value("-129", 0, 4, 1, ?v))               { bad = 1; }
 
-    # two bytes: the same shape one width up.
     if (!data_value("65535", 0, 5, 2, ?v) || v != 65535) { bad = 1; }
     if (data_value("65536", 0, 5, 2, ?v))                { bad = 1; }
     if (!data_value("-32768", 0, 6, 2, ?v) || v != 0x8000) { bad = 1; }
     if (data_value("-32769", 0, 6, 2, ?v))                 { bad = 1; }
 
-    # four bytes.
     if (!data_value("4294967295", 0, 10, 4, ?v) || v != 4294967295) { bad = 1; }
     if (data_value("4294967296", 0, 10, 4, ?v))                     { bad = 1; }
 
-    # eight bytes: the whole unsigned range is nameable, which an `i64` parse alone
-    # could not express.
     if (!data_value("0xFFFFFFFFFFFFFFFF", 0, 18, 8, ?v) || v != 18446744073709551615) { bad = 1; }
     if (!data_value("-1", 0, 2, 8, ?v) || v != 18446744073709551615)                   { bad = 1; }
 
-    # a region that is not exactly one literal names no value.
     if (data_value("0x1 0x2", 0, 7, 1, ?v)) { bad = 1; }
     if (data_value("zz", 0, 2, 1, ?v))      { bad = 1; }
 
     ret bad;
 }
 
-# true when operand `op` names a `{name}` binding listed in `secret_names`
-#
-# A binding substitutes to the local's frame slot, so its ADDRESS is public (a fixed
-# `[fp+off]`) while its CONTENTS are secret. That distinction is why a secret binding
-# is a taint SOURCE but never a secret-address violation.
 fun bind_is_secret(body: str, op: *Operand, secret_names: *str, n_secret: u32) bool {
     if (op.kind != AOP_BIND) { ret false; }
     var i: u32 = 0;
@@ -2299,18 +1380,14 @@ fun bind_is_secret(body: str, op: *Operand, secret_names: *str, n_secret: u32) b
     ret false;
 }
 
-# true when register index `r` is tainted in `taint`
 fun reg_tainted(taint: u32, r: i32) bool {
     if (r < 0 || r >= 32) { ret false; }
     ret (taint & (1::u32 << r::u32)) != 0;
 }
 
-# true when any operand of `item` carries a secret - a secret `{name}` binding, a
-# register the walk has already tainted, or any memory read once memory is tainted
-#
-# `mem_taint` is a SINGLE bit covering all of memory, and reading one memory operand
-# is enough. See `ct_scan` for why the domain has no finer resolution than that.
 fun item_reads_secret(body: str, item: *Item, taint: u32, mem_taint: bool, secret_names: *str, n_secret: u32) bool {
+    if ((taint & item.implicit) != 0) { ret true; }
+    if (item.implicit_mem && mem_taint) { ret true; }
     var i: u32 = 0;
     for (i < item.nops) {
         val op: *Operand = ?item.ops[i::usize];
@@ -2319,10 +1396,6 @@ fun item_reads_secret(body: str, item: *Item, taint: u32, mem_taint: bool, secre
         if (op.kind == AOP_MEM) {
             if (reg_tainted(taint, op.reg))   { ret true; }
             if (reg_tainted(taint, op.index)) { ret true; }
-            # a `{name}` binding substitutes to a fixed frame slot the compiler owns,
-            # not to a location this body can have stored a secret into, so it is not
-            # a read of the tainted memory domain. its secrecy is decided by
-            # `bind_is_secret` above.
             if (mem_taint) { ret true; }
         }
         i = i + 1;
@@ -2330,24 +1403,8 @@ fun item_reads_secret(body: str, item: *Item, taint: u32, mem_taint: bool, secre
     ret false;
 }
 
-# true when `item` has any memory operand at all
-#
-# THE `writes` MASK CANNOT ANSWER THIS AND MUST NOT BE USED FOR IT. `writes` names the
-# form's REGISTER OPERANDS, which is what the allocator needs: aarch64 `str x0, [x1]`
-# and riscv64 `sd a0, 0(sp)` both carry `AW_NONE`, because neither writes a register,
-# and both are stores. Deriving "is a store" from that mask produces a check that fires
-# on x86-64's `mov [rsp], rax` and silently passes every store on the other two targets.
-#
-# So the question asked here is the coarser, target-independent one: does this
-# instruction touch memory? An item that reads a secret and touches memory is treated
-# as having stored that secret. That over-taints a secret-reading LOAD, which only
-# refuses more, and it is the right trade at this domain's one-bit resolution.
-#
-# IT ALSO FAILS CLOSED ALONG THE GROWTH AXIS, which the alternative does not. A store
-# mnemonic added to any grammar later is covered the moment it parses a memory operand.
-# Had this been a per-mnemonic `stores` fact instead, a new row that forgot to set it
-# would launder secrets exactly as this issue describes, and nothing would report it.
 fun item_touches_memory(item: *Item) bool {
+    if (item.implicit_mem) { ret true; }
     var i: u32 = 0;
     for (i < item.nops) {
         if (item.ops[i::usize].kind == AOP_MEM) { ret true; }
@@ -2356,158 +1413,68 @@ fun item_touches_memory(item: *Item) bool {
     ret false;
 }
 
-# walk an inline-asm body for the `#[oblivious]` leakage checks (#2230)
-#
-# The shared half of the asm validation every ISA runs: the same parser the emitter
-# and the clobber analyzer use, so the checks are facts about the parsed instruction
-# stream rather than a second reading of the text.
-#
-# Taint enters through the `{name}` bindings named in `secret_names` and propagates
-# by the effect model's WRITE facts - an instruction that reads a secret taints every
-# register it writes. Reads are taken conservatively (every operand is treated as
-# read), which can only over-taint and therefore only refuse more.
-#
-# FAILS CLOSED on every construct it cannot model:
-#   - a body that does not parse (the emitter will reject it too, with a location)
-#   - a data directive's payload, whose bytes can encode any instruction at all
-#   - a mnemonic the ISA has not classified
-#   - a conditional branch whose condition rides FLAGS (x86-64), which the effect
-#     model does not represent - see `ct.AsmClass` and #2460
-#
-# Returns the FIRST violation, so the caller's diagnostic can name one instruction.
-# ---
-# g:            the target's grammar
-# body:         raw inline-asm body text
-# secret_names: `{name}` bindings whose storage is secret
-# n_secret:     number of entries in `secret_names`
-# trust_mul:    the target's data-independent-multiply capability
-# trust_shift:  the target's constant-time variable-shift capability
-# ret:          ok(true) when the body leaks nothing, or the first violation
 pub fun ct_scan(g: *Grammar, body: str, secret_names: *str, n_secret: u32,
-                trust_mul: bool, trust_shift: bool) R.Result[bool, str] {
+                trust_mul: bool, trust_shift: bool) R.Result[R.Void, str] {
     var c: Cursor;
     cursor_init(?c, g, body, nil, nil, nil, nil);
 
     var taint: u32 = 0;
-    # whether FLAGS currently holds a secret-derived value. a separate domain from
-    # the register bitmask because x86-64 conditions its branches on it and nothing
-    # in the register model represents it (#2460)
     var flags_taint: bool = false;
-    # whether ANY secret has been stored to memory in this body (#2706). the third
-    # domain, beside the register set and FLAGS, and the reason a spill no longer
-    # launders: before this, a secret stored and reloaded came back in a register the
-    # model believed public, defeating all three leak checks at once.
-    #
-    # ONE BIT FOR ALL OF MEMORY, AND THAT IS DELIBERATE. The obvious refinement -
-    # track `[base + literal]` slots and taint only those - is NOT SOUND here, for two
-    # independent reasons, and both have to be answered before any finer domain ships:
-    #
-    #   1. ALIASING ACROSS BASES. `[rsp + k]` and `[rbp + j]` can name the same byte,
-    #      and nothing in this walk knows the relationship between two base registers.
-    #      A per-base or per-slot set would miss a secret stored through one base and
-    #      reloaded through the other.
-    #   2. PARTIAL OVERLAP. A slot key is an address, not an extent. An 8-byte store to
-    #      `[rsp]` and a 4-byte load from `[rsp + 4]` overlap, and the parsed item does
-    #      not carry a reliable access width to compare.
-    #
-    # So the resolution the walk can actually justify is "memory holds a secret, or it
-    # does not". The cost is over-refusal, never under-refusal, and it is narrower than
-    # it first looks: a body only loses by this if it stores a secret AND later reloads
-    # some other public value AND then branches on, addresses with, or variable-latency
-    # operates on what it reloaded. The last of those is the thing an `#[oblivious]`
-    # body must not do regardless.
-    #
-    # MONOTONE - set once, never cleared. A later store of a PUBLIC value cannot clear
-    # it, because "the same slot" is exactly the question this domain cannot answer.
     var mem_taint: bool = false;
     var item: Item;
     var done: bool = false;
     for (!done) {
-        val pr: R.Result[bool, str] = next(?c, ?item);
-        if (R.is_err[bool, str](pr)) {
-            ret R.err[bool, str]("contains an inline-asm block this compiler cannot parse, so it cannot be verified constant-time");
+        val found_r: R.Result[bool, str] = next(?c, ?item);
+        if (R.is_err[bool, str](found_r)) {
+            ret R.err[R.Void, str]("contains an inline-asm block this compiler cannot parse, so it cannot be verified constant-time");
         }
-        if (!R.unwrap_ok[bool, str](pr)) { done = true; }
+        if (!R.unwrap_ok[bool, str](found_r)) { done = true; }
         or {
-            val vr: R.Result[bool, str] = ct_check_item(g, body, ?item, ?taint, ?flags_taint, ?mem_taint, secret_names, n_secret, trust_mul, trust_shift);
-            if (R.is_err[bool, str](vr)) { ret vr; }
+            val vr: R.Result[R.Void, str] = ct_check_item(g, body, ?item, ?taint, ?flags_taint, ?mem_taint, secret_names, n_secret, trust_mul, trust_shift);
+            if (R.is_err[R.Void, str](vr)) { ret vr; }
         }
     }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# run the leakage checks on one parsed item and fold its taint
-#
-# Split out so the walk above reads as the loop it is. `taint` is updated in place:
-# an instruction that reads a secret taints the registers it writes.
 fun ct_check_item(g: *Grammar, body: str, item: *Item, taint: *u32, flags_taint: *bool, mem_taint: *bool,
                   secret_names: *str, n_secret: u32,
-                  trust_mul: bool, trust_shift: bool) R.Result[bool, str] {
-    if (item.kind == AI_LABEL) { ret R.ok[bool, str](true); }
+                  trust_mul: bool, trust_shift: bool) R.Result[R.Void, str] {
+    if (item.kind == AI_LABEL) { ret R.ok_void[str](); }
 
-    # a data directive's payload can encode ANY instruction, including a secret-
-    # dependent branch. there is nothing to analyze, so the whole family - `.byte`,
-    # `.word`, `.long`, `.quad` - is refused outright, BEFORE any classification is
-    # consulted. that is what makes the raw-encoding escape (#2479) safe to widen: a
-    # directive can never reach `g.ct_class`, so no spelling of it can be classified
-    # constant-time by omission.
-    #
-    # A DECLARED WRITE SET DOES NOT CHANGE THIS AND MUST NOT (#2594). `item.declared`
-    # is deliberately not consulted here: a clause says which registers an encoding
-    # changes, which is what the ALLOCATOR needs, and says nothing about whether the
-    # payload branches on a secret or divides in variable time - the two things this
-    # walk exists to catch. Letting an author declare their way past a security gate is
-    # #2288's failure exactly, so a declaration buys allocation quality and never
-    # verification.
     if (item.kind == AI_BYTES) {
-        ret R.err[bool, str]("contains a data directive inside an #[oblivious] function; its payload can encode any instruction, so it cannot be verified constant-time (a `writes(...)` declaration does not change this: it states which registers change, not whether the encoding is constant-time)");
+        ret R.err[R.Void, str]("contains a data directive inside an #[oblivious] function; its payload can encode any instruction, so it cannot be verified constant-time (a `writes(...)` declaration does not change this: it states which registers change, not whether the encoding is constant-time)");
     }
 
     val cls: ct.AsmClass = g.ct_class(item.code, item.flags);
     val reads_secret: bool = item_reads_secret(body, item, @taint, @mem_taint, secret_names, n_secret);
 
-    # a conditional branch whose condition rides the flags register is refused when
-    # FLAGS holds a secret-derived value, and accepted otherwise. before #2460 the
-    # effect model represented no flags at all, so a preceding `cmp` of a secret was
-    # invisible and the whole family was refused outright; `flags_taint` is now
-    # tracked beside the register set, so a genuinely public compare-and-branch is
-    # admitted and only a secret-dependent one is refused.
     if (cls.cond_flags && @flags_taint) {
-        ret R.err[bool, str]("branches on a secret value inside an #[oblivious] inline-asm block; its condition rides the flags register, which a preceding instruction filled from a secret, so the branch's timing reveals the secret. select branch-free over public data, or `:^`-declassify when disclosure is intended");
+        ret R.err[R.Void, str]("branches on a secret value inside an #[oblivious] inline-asm block; its condition rides the flags register, which a preceding instruction filled from a secret, so the branch's timing reveals the secret. select branch-free over public data, or `:>T`-declassify when disclosure is intended");
     }
 
-    # (a) a register-conditioned branch on a secret leaks through the taken path.
     if (cls.cond_reg && reads_secret) {
-        ret R.err[bool, str]("branches on a secret value inside an inline-asm block; the branch decides the taken path, so its timing reveals the secret. select branch-free over public data, or `:^`-declassify when disclosure is intended");
+        ret R.err[R.Void, str]("branches on a secret value inside an inline-asm block; the branch decides the taken path, so its timing reveals the secret. select branch-free over public data, or `:>T`-declassify when disclosure is intended");
     }
 
-    # (b) a memory operand whose ADDRESS is secret leaks through the access pattern.
-    # a `{name}` binding is excluded: it addresses a fixed frame slot, so its address
-    # is public even when its contents are not.
     var i: u32 = 0;
     for (i < item.nops) {
         val op: *Operand = ?item.ops[i::usize];
         if (op.kind == AOP_MEM) {
             if (reg_tainted(@taint, op.reg) || reg_tainted(@taint, op.index)) {
-                ret R.err[bool, str]("addresses memory with a secret value inside an inline-asm block; the access pattern reveals the secret through the cache. index with public data, or `:^`-declassify when disclosure is intended");
+                ret R.err[R.Void, str]("addresses memory with a secret value inside an inline-asm block; the access pattern reveals the secret through the cache. index with public data, or `:>T`-declassify when disclosure is intended");
             }
         }
         i = i + 1;
     }
 
-    # an instruction the ISA has not classified is opaque to check (c): refuse the
-    # moment a secret reaches it, rather than assume it is constant-time.
     if (!cls.known && reads_secret) {
-        ret R.err[bool, str]("passes a secret value to an inline-asm instruction whose constant-time behaviour this compiler does not model; it cannot be verified, so it is refused");
+        ret R.err[R.Void, str]("passes a secret value to an inline-asm instruction whose constant-time behaviour this compiler does not model; it cannot be verified, so it is refused");
     }
 
-    # (c) a variable-latency operation on a secret operand leaks through its timing,
-    # unless the target documents the capability that makes it constant-time.
     if (cls.known && cls.op != ct.CT_OP_NONE) {
         val cap: ct.CtCap = ct.ct_cap(cls.op);
         if (!ct.target_provides(trust_mul, trust_shift, cap)) {
-            # a shift leaks through its variable COUNT, not the value shifted, so it
-            # observes the count operand alone.
             var offending: bool = reads_secret;
             if (ct.ct_op_gates_count_only(cls.op)) {
                 offending = false;
@@ -2518,67 +1485,26 @@ fun ct_check_item(g: *Grammar, body: str, item: *Item, taint: *u32, flags_taint:
                 }
             }
             if (offending) {
-                ret R.err[bool, str]("performs a variable-latency inline-asm operation on a secret value; its latency depends on the operand, so its timing reveals the secret. use a constant-time sequence, or `:^`-declassify when disclosure is intended");
+                ret R.err[R.Void, str]("performs a variable-latency inline-asm operation on a secret value; its latency depends on the operand, so its timing reveals the secret. use a constant-time sequence, or `:>T`-declassify when disclosure is intended");
             }
         }
     }
 
-    # fold the taint: an instruction reading a secret taints every register it writes.
-    #
-    # AW_WB_BASE IS DELIBERATELY NOT FOLDED, unlike in the clobber twin `fold_clobbers`.
-    # A writeback base receives `base + immediate` - an ADDRESS, computed from a base
-    # register and a literal displacement, never from the instruction's data operands.
-    # So it cannot carry secret-derived data even when the instruction reads a secret,
-    # and tainting it would refuse `ldp`/`stp` writeback forms for no reason. The
-    # clobber analyzer must still report it, because the register IS written and a live
-    # value there would be destroyed - a different question from what it holds.
-    #
-    # THE CONDITION THAT INVALIDATES THIS: a mnemonic whose AW_WB_BASE target receives
-    # DATA rather than an address. None exists in any current grammar; one added later
-    # must be folded here, or its writeback register carries an untracked secret.
-    #
-    # REGISTER-INDEX DOMAIN: `taint` is a 32-bit set, so only indices 0..31 are
-    # representable - the same domain `mark_written` assumes. Two registers colliding
-    # on an index would over-taint, which only refuses more; an index at or past 32 is
-    # silently DROPPED, which is the fail-open direction. Every grammar here numbers
-    # its general-purpose registers below 32, and a target that did not would need this
-    # set widened before its bodies could be validated.
-    # an instruction that CONSUMES a tainted flag carries the secret out of FLAGS and
-    # into whatever it writes, so it folds exactly as one reading a secret register
-    # does. Without this a `setcc` launders a secret into a register the model then
-    # treats as public, and a later access indexed by it is accepted.
     val secret_in: bool = reads_secret || (cls.reads_flags && @flags_taint);
 
     if (secret_in) {
         @taint = @taint | item.implicit;
         if ((item.writes & AW_OP0) != 0 && item.nops > 0) { taint_written(?item.ops[0], taint); }
         if ((item.writes & AW_OP1) != 0 && item.nops > 1) { taint_written(?item.ops[1], taint); }
-        # and the MEMORY domain: an instruction that carries a secret and touches
-        # memory taints all of memory, so a later reload comes back secret instead of
-        # laundered public (#2706). the address is public here - a secret address was
-        # already refused by check (b) above - so this is about the VALUE, not the slot.
         if (item_touches_memory(item)) { @mem_taint = true; }
     }
 
-    # fold the FLAGS taint. the arms are ordered, and the order is the model:
-    #
-    #   opaque   - a flag value from memory, the stack, or a masked prior RFLAGS.
-    #              unconditional, because these rows carry no operands to condition
-    #              on and an operand-conditioned rule could never fire for them.
-    #   writes   - a MAY-write with a secret operand taints.
-    #   defines  - an unconditional overwrite of every observable flag, with public
-    #              operands, is the ONLY thing that clears.
-    #
-    # anything else leaves FLAGS unchanged, which is what `inc` / `dec` and the
-    # shifts need: they write some flags but not all, so they must neither clear a
-    # standing taint nor be treated as having refreshed it.
     if (cls.opaque_flags)                        { @flags_taint = true; }
     or (cls.writes_flags && secret_in)           { @flags_taint = true; }
     or (cls.defines_flags && !secret_in)         { @flags_taint = false; }
-    ret R.ok[bool, str](true);
+    ret R.ok_void[str]();
 }
 
-# OR a written operand's register bit into `@taint` (the taint twin of `mark_written`)
 fun taint_written(op: *Operand, taint: *u32) {
     if (op.kind == AOP_REG && op.reg >= 0 && op.reg < 32) {
         @taint = @taint | (1::u32 << op.reg::u32);

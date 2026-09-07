@@ -45,7 +45,7 @@ the day it broke.
 run.sh                          # every case, every leg this host serves
 run.sh --leg <name>             # one leg (repeatable)
 run.sh --case <name>            # one case (repeatable)
-run.sh --deps float|pin         # resolve refs fresh (default), or from mach.lock
+run.sh --deps float|pin         # resolve refs fresh (default), or from this repo's gitlinks
 run.sh --bless                  # rewrite goldens, print diffs, never under CI
 run.sh --matrix                 # print the coverage matrix from the last run
 ```
@@ -124,7 +124,7 @@ set: a golden nobody read is not a golden.
   look identical (#2741).
 - Before anything is built, the driver checks that every case declares the
   `[target.<t>]` block each leg it runs on will build, and — under `--deps pin` —
-  that the repo's own `mach.lock` records every git dep any case declares. Both were
+  that the repo itself realizes every git dep any case declares. Both were
   separate scripts a workflow could stop calling, and #2353 and #2729 are each a year
   of a lane believed to be running that had never once started. They live inside the
   driver now so nothing can reach a build without them holding.
@@ -144,14 +144,14 @@ row is native for that reason.
 
 ## Dependency resolution
 
-A case declares `ref = "branch/main"` for mach-std, which tracks its latest release.
+A case declares `ref = "branch/main"` for std, which tracks its latest release.
 
 - `--deps float` (default) resolves it fresh, which is what catches a downstream
   break on the pull request that would first trip over it. It resolves **once per
-  run**, not once per case: before #2619, a suite spanning a mach-std merge compiled
+  run**, not once per case: before #2619, a suite spanning a std merge compiled
   some cases against one standard library and some against another and still reported
   a single verdict.
-- `--deps pin` resolves every case to the commit this repo's own `mach.lock`
+- `--deps pin` resolves every case to the commit this repo's own gitlink
   records — the one the compiler in the same checkout was built against — so a
   release-gate run is reproducible and a bisect over mach commits is sound (#2592).
 
