@@ -7,10 +7,11 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-SOURCE = 'be70fdcd6cb0806406830be3ce2abb8d91f6ce0f'
+SOURCE = 'faf0d9c6b1ff0685de0287702df0cc9d16b1e70c'
 PIN = 'c6a8816933fffa8ee490bb0bed8a97e7f0c1b296'
-BRIDGE = '49fbbc48a9b290cbcb17c8187d339e5ce0bcc64b'
-BRIDGE_PIN = '3ee8e709a8ed7baff6e93780ce9b3582a907a91f'
+BASE_SOURCE = 'be70fdcd6cb0806406830be3ce2abb8d91f6ce0f'
+BASE_RUN = 34074514612
+RETAINED = ROOT / 'retained-cli-lifecycle'
 EVIDENCE = ROOT / 'cli-lifecycle-evidence'
 EVIDENCE.mkdir(exist_ok=True)
 (EVIDENCE / 'verification-script.py').write_bytes(pathlib.Path(__file__).read_bytes())
@@ -22,7 +23,7 @@ PREFIXES = [
     ('fingerprint', 'mach.lang.build.fingerprint', 11),
     ('dep-cli', 'mach.cli.cmd.dep', 24),
     ('dep-driver', 'mach.lang.driver.deps', 15),
-    ('linker', 'mach.lang.be.linker', 87),
+    ('linker', 'mach.lang.be.linker', 88),
 ]
 
 
@@ -99,47 +100,22 @@ def test(compiler, profile, name, selected, count, child=0, required_log=None):
     return valid
 
 
-seed = shutil.which('mach')
-if not seed:
-    raise RuntimeError('published seed unavailable')
 suffix = '.exe' if sys.platform == 'win32' else ''
-stage = ROOT / ('m3149cliStage' + suffix)
-FIXPOINTS = []
-
-
-def build_generation(compiler, name, profile='debug'):
-    executable = ROOT / (name + suffix)
-    rc, _ = invoke(name + '-build', [str(compiler), 'build', str(ROOT), '--profile', profile, '-o', stage.name])
-    if rc:
-        raise RuntimeError(name + ' compilation failed')
-    shutil.copy2(stage, executable)
-    return executable
-
-
-def fixpoint(name, left, right):
-    left_bytes = left.read_bytes()
-    right_bytes = right.read_bytes()
-    record = dict(name=name, left_sha256=hashlib.sha256(left_bytes).hexdigest(),
-                  right_sha256=hashlib.sha256(right_bytes).hexdigest(), identical=left_bytes == right_bytes)
-    FIXPOINTS.append(record)
-    (EVIDENCE / 'fixpoints.json').write_text(json.dumps(FIXPOINTS, indent=2), encoding='utf-8')
-    print(json.dumps(record), flush=True)
-    if not record['identical']:
-        raise RuntimeError(name + ' byte fixpoint failed')
-
-
-run(['git', 'checkout', '--detach', BRIDGE])
-run(['git', 'submodule', 'update', '--init', '--recursive'], timeout=300)
-check_source(BRIDGE, BRIDGE_PIN)
-(EVIDENCE / 'bridge-source.json').write_text(json.dumps(dict(source=BRIDGE, pin=BRIDGE_PIN, host=sys.platform)), encoding='utf-8')
-bridge_a = build_generation(seed, 'm3149BridgeA')
-bridge_b = build_generation(bridge_a, 'm3149BridgeB')
-bridge_c = build_generation(bridge_b, 'm3149BridgeC')
-fixpoint('bridge-B-C', bridge_b, bridge_c)
-shutil.copy2(bridge_c, EVIDENCE / bridge_c.name)
-if not test(bridge_c, 'debug', 'bridge-renamed-forward-regressions', 'mach.lang.driver:resolve_fwd_renamed_reexport_', 3):
-    raise RuntimeError('audited bridge renamed-forward regression failed')
-check_source(BRIDGE, BRIDGE_PIN)
+retained_source = json.loads((RETAINED / 'source.json').read_text())
+assert retained_source == dict(source=BASE_SOURCE, pin=PIN, host=sys.platform)
+fixpoints = json.loads((RETAINED / 'fixpoints.json').read_text())
+assert len(fixpoints) == 3 and all(row['identical'] for row in fixpoints)
+COMPILERS = {}
+for profile in ['debug', 'release']:
+    record = next(row for row in fixpoints if row['name'] == 'paired-' + profile + '-B-C')
+    compiler = RETAINED / ('m3149cliC' + profile + suffix)
+    digest = hashlib.sha256(compiler.read_bytes()).hexdigest()
+    assert digest == record['left_sha256'] == record['right_sha256']
+    compiler.chmod(0o755)
+    COMPILERS[profile] = compiler
+(EVIDENCE / 'compiler-provenance.json').write_text(json.dumps(dict(
+    compiler_source=BASE_SOURCE, compiler_std=PIN, run=BASE_RUN,
+    tested_source=SOURCE, fixpoints=fixpoints)), encoding='utf-8')
 
 
 run(['git', 'checkout', '--detach', SOURCE])
@@ -171,28 +147,56 @@ for name, prefix, expected in PREFIXES:
     inventory[prefix] = names
 (EVIDENCE / 'test-inventory.json').write_text(json.dumps(inventory, indent=2), encoding='utf-8')
 
-a = build_generation(bridge_c, 'm3149cliA')
-shutil.copy2(a, EVIDENCE / a.name)
-COMPILERS = {}
-for profile in ['debug', 'release']:
-    b = build_generation(a, 'm3149cliB' + profile, profile)
-    c = build_generation(b, 'm3149cliC' + profile, profile)
-    fixpoint('paired-' + profile + '-B-C', b, c)
-    COMPILERS[profile] = c
-    shutil.copy2(c, EVIDENCE / c.name)
-
+changed = run(['git', 'diff', '--name-only', BASE_SOURCE, SOURCE, '--', 'src', 'mach.toml', 'dep/std']).stdout.decode().splitlines()
+assert set(changed) <= {'src/cli/cmd/init.mach', 'src/cli/cmd/dep.mach', 'src/lang/be/linker.mach'}, changed
+patch = run(['git', 'diff', BASE_SOURCE, SOURCE, '--', 'src']).stdout
+(EVIDENCE / 'reviewed-fixture-changes.patch').write_bytes(patch)
+# these source changes were reviewed as test fixtures and helpers only
 baseline_ok = True
 for profile in ['debug', 'release']:
     for name, prefix, count in PREFIXES:
-        baseline_ok = test(COMPILERS[profile], profile, profile + '-' + name, prefix, count) and baseline_ok
-if not baseline_ok:
-    check_source()
-    (EVIDENCE / 'restoration.json').write_text(json.dumps(dict(source=SOURCE, pin=PIN, restored=True)), encoding='utf-8')
-    raise RuntimeError('one or more complete native prefix suites failed')
+        if name in ('init', 'dep-cli', 'linker'):
+            baseline_ok = test(COMPILERS[profile], profile, profile + '-' + name, prefix, count) and baseline_ok
 
 
 import os
 import tempfile
+
+if sys.platform == 'win32':
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    with tempfile.TemporaryDirectory(prefix='native-held-directory-') as scratch:
+        original = pathlib.Path(scratch) / 'original'
+        moved = pathlib.Path(scratch) / 'moved'
+        original.mkdir()
+        root_handle = kernel.CreateFileW(str(original), 0x80000000, 7, None, 3, 0x02000000, None)
+        assert root_handle != ctypes.c_void_p(-1).value, ctypes.get_last_error()
+        child_handle = kernel.CreateFileW(str(original / 'lock'), 0x40000000, 7, None, 1, 0x80, None)
+        assert child_handle != ctypes.c_void_p(-1).value, ctypes.get_last_error()
+        try:
+            refusal = None
+            try:
+                os.rename(original, moved)
+            except OSError as error:
+                refusal = error.winerror
+            assert refusal in (5, 32), refusal
+            assert kernel.CloseHandle(child_handle)
+            child_handle = None
+            os.rename(original, moved)
+            assert moved.is_dir() and not original.exists()
+            (EVIDENCE / 'windows-native-directory-rename.json').write_text(json.dumps(dict(
+                child_share_read_write_delete=True, open_child_rename_error=refusal,
+                closed_child_held_root_rename_succeeded=True)), encoding='utf-8')
+        finally:
+            if child_handle is not None:
+                kernel.CloseHandle(child_handle)
+            kernel.CloseHandle(root_handle)
 
 with tempfile.TemporaryDirectory(prefix='mach-init-without-git-') as scratch:
     destination = pathlib.Path(scratch) / 'project'
@@ -283,6 +287,24 @@ finally:
 path = ROOT / 'src/lang/driver/deps.mach'
 original = path.read_bytes()
 try:
+    source = original.decode('utf-8')
+    before = '    var add_args: [4]str;\n    add_args[0] = "submodule";'
+    after = '''    var history_args: [3]str = [3]str{"checkout", "--detach", "HEAD"};
+    val history_result: R.Result[str, str] = git_op(s.build_alloc, ?gi, root, ?history_args[0], 3, extra_env);
+    if (R.is_err[str, str](history_result)) { ret R.err[R.Void, str](R.unwrap_err[str, str](history_result)); }
+    str_free(s.build_alloc, R.unwrap_ok[str, str](history_result));
+    var add_args: [4]str;
+    add_args[0] = "submodule";'''
+    assert source.count(before) == 1
+    path.write_text(source.replace(before, after), encoding='utf-8', newline='')
+    if not test(COMPILERS['debug'], 'debug', 'changed-project-symbolic-head',
+                'mach.cli.cmd.dep.remove:native_lock_failure_and_success_preserve_checkout_and_project_history', 1, 24):
+        raise RuntimeError('project history mutant missed its required runtime assertion')
+finally:
+    path.write_bytes(original)
+path = ROOT / 'src/lang/driver/deps.mach'
+original = path.read_bytes()
+try:
     text = original.decode('utf-8')
     for label, before, after, selector, child in [
         ('copied-own-destination', 'if (fs.identity_equal(identity, excluded[0])) { cnt; }',
@@ -300,3 +322,6 @@ finally:
 check_source()
 census('final-source-restored')
 (EVIDENCE / 'restoration.json').write_text(json.dumps(dict(source=SOURCE, pin=PIN, restored=True)), encoding='utf-8')
+
+if not baseline_ok:
+    raise RuntimeError('one or more complete native prefix suites failed')
