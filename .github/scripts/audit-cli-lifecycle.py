@@ -255,7 +255,7 @@ for no_git in [False, True]:
 path = ROOT / 'src/cli/cmd/init.mach'
 original = path.read_bytes()
 try:
-    text = original.decode('utf-8')
+    text = original.decode('utf-8').replace('\r\n', '\n')
     assert text.count('    if (!no_git) {') == 1
     for label, condition, selector in [
         ('ignored-opt-out', '    if (true) {', 'mach.cli.cmd.init.git_boundary: no_git_scaffolds'),
@@ -270,7 +270,7 @@ finally:
 path = ROOT / 'src/lang/driver/deps.mach'
 original = path.read_bytes()
 try:
-    source = original.decode('utf-8')
+    source = original.decode('utf-8').replace('\r\n', '\n')
     start = source.index('pub fun stage_dependency(')
     end = source.index('\nfun t_scratch_dir(', start)
     function = source[start:end]
@@ -288,7 +288,7 @@ finally:
 path = ROOT / 'src/lang/driver/deps.mach'
 original = path.read_bytes()
 try:
-    source = original.decode('utf-8')
+    source = original.decode('utf-8').replace('\r\n', '\n')
     before = '    var add_args: [4]str;\n    add_args[0] = "submodule";'
     after = '''    var history_args: [3]str = [3]str{"checkout", "--detach", "HEAD"};
     val history_result: R.Result[str, str] = git_op(s.build_alloc, ?gi, root, ?history_args[0], 3, extra_env);
@@ -306,7 +306,7 @@ finally:
 path = ROOT / 'src/lang/driver/deps.mach'
 original = path.read_bytes()
 try:
-    text = original.decode('utf-8')
+    text = original.decode('utf-8').replace('\r\n', '\n')
     for label, before, after, selector, child in [
         ('copied-own-destination', 'if (fs.identity_equal(identity, excluded[0])) { cnt; }',
          'if (false) { cnt; }', 'mach.lang.driver.deps.path_copy:ancestor_source_uses_finite_inventory_and_excludes_its_destination', 13),
