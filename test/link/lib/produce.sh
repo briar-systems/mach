@@ -2718,12 +2718,10 @@ riscv_pcrel_image_scan() {
 #   checked=<n>   offsets crossed. zero would make `unbacked` vacuous, so it is stated
 #   unbacked=<n>  offsets no emitted access backs. the invariant is 0 on every target
 #
-# the displacement set is read coarsely - every integer literal on an instruction line
-# mentioning the frame-base register - because the three ISAs spell a frame access three
-# ways and a large offset is spelled a fourth (materialized into a scratch register
-# first). coarse in the permissive direction only: it can accept an offset it should
-# have rejected, never reject a correct one, and #2759's offsets miss the real set by
-# the whole reservation rather than narrowly. requires llvm-dwarfdump and llvm-objdump.
+# immediate displacements are read from instructions naming the frame-base register.
+# arm64 large displacements are reconstructed from constant register definitions and
+# actual indexed accesses, with state cleared at control-flow joins and unknown effects.
+# python integers preserve all 64 bits of signed mov/movk offset construction.
 produce_varloc_fbreg() {
     g=$4
     dd_tool=$(resolve_dwarfdump) || {
@@ -2768,68 +2766,124 @@ produce_varloc_fbreg() {
         *) fb_isa=x86_64 ;;
     esac
 
-    awk -v fns="$g.fns" -v isa="$fb_isa" '
-        function hex2dec(h,   v, i, c, d) {
-            sub(/^0x/, "", h); v = 0
-            for (i = 1; i <= length(h); i++) {
-                c = tolower(substr(h, i, 1)); d = index("0123456789abcdef", c) - 1
-                v = v * 16 + d
-            }
-            return v
-        }
-        # the frame-base register as the disassembler spells it, from the DWARF number.
-        # only two can appear: the frame pointer, and the stack pointer for a function
-        # with no frame record (`dwarf.frame_base_omit_reg`).
-        function disname(n) {
-            if (isa == "riscv64") { if (n == 8)  { return "s0"   } if (n == 2)  { return "sp"   } }
-            if (isa == "aarch64") { if (n == 29) { return "x29"  } if (n == 31) { return "sp"   } }
-            if (isa == "x86_64")  { if (n == 6)  { return "%rbp" } if (n == 7)  { return "%rsp" } }
-            return ""
-        }
-        BEGIN {
-            n = 0
-            while ((getline line < fns) > 0) {
-                split(line, f, " ")
-                r = disname(f[3] + 0)
-                if (r == "") { continue }
-                n++; flo[n] = hex2dec(f[1]); fhi[n] = hex2dec(f[2]); freg[n] = r; foffs[n] = f[4]
-            }
-            close(fns)
-        }
-        # "  4076a0: sd a0, -0x68(s0)"
-        /^[ ]*[0-9a-f]+:/ {
-            addr = $1; sub(/:$/, "", addr); a = hex2dec("0x" addr)
-            # multiple debug descriptions can share the same machine range
-            for (i = 1; i <= n; i++) {
-                if (a >= flo[i] && a < fhi[i]) {
-                    if (index($0, freg[i]) == 0) { continue }
-                    s = $0
-                    while (match(s, /-?0x[0-9a-f]+/)) {
-                        t = substr(s, RSTART, RLENGTH)
-                        neg = (substr(t, 1, 1) == "-")
-                        v = hex2dec(neg ? substr(t, 2) : t); if (neg) { v = -v }
-                        seen[i "/" v] = 1
-                        s = substr(s, RSTART + RLENGTH)
-                    }
-                }
-            }
-        }
-        END {
-            checked = 0; unbacked = 0
-            for (i = 1; i <= n; i++) {
-                c = split(foffs[i], o, ",")
-                for (j = 1; j <= c; j++) {
-                    checked++
-                    if (!((i "/" (o[j] + 0)) in seen)) { unbacked++ }
-                }
-            }
-            # the count itself is ISA-dependent (the three back ends put different
-            # variables in slots), so only its being nonzero is stated - without which
-            # `unbacked=0` would be vacuous. the invariant is exact.
-            print "varloc_fbreg_checked=" (checked > 0 ? "nonzero" : "zero")
-            print "varloc_fbreg_unbacked=" unbacked
-        }
-    ' "$g.dis"
+    python3 - "$g.fns" "$g.dis" "$fb_isa" <<'PY_FBREG'
+import re
+import sys
+from pathlib import Path
+
+ranges, disassembly, isa = sys.argv[1:]
+registers = {
+    'riscv64': {8: 's0', 2: 'sp'},
+    'aarch64': {29: 'x29', 31: 'sp'},
+    'x86_64': {6: '%rbp', 7: '%rsp'},
+}[isa]
+
+
+def gp(text):
+    match = re.fullmatch(r'([xw])([0-9]+)', text)
+    if match and int(match[2]) < 31:
+        return int(match[2]), 64 if match[1] == 'x' else 32
+    return None
+
+
+def constant(opcode, operands, known):
+    destination = gp(operands[0]) if operands else None
+    if destination is None:
+        return
+    number, width = destination
+    mask = (1 << width) - 1
+    previous = known.pop(number, None)
+    if len(operands) < 2:
+        return
+    source = gp(operands[1])
+    if source is not None and opcode == 'mov':
+        value = previous if source[0] == number else known.get(source[0])
+        if value is not None:
+            known[number] = value & ((1 << source[1]) - 1) & mask
+        return
+    try:
+        value = int(operands[1].removeprefix('#'), 0)
+        shift = 0
+        if len(operands) == 3:
+            match = re.fullmatch(r'lsl #([0-9]+)', operands[2])
+            if match is None:
+                return
+            shift = int(match[1])
+        if shift not in range(0, width, 16):
+            return
+        if opcode == 'movk':
+            if previous is None:
+                return
+            value = (previous & ~(65535 << shift)) | ((value & 65535) << shift)
+        else:
+            value <<= shift
+            if opcode == 'movn':
+                value = ~value
+        known[number] = value & mask
+    except ValueError:
+        return
+
+
+instructions = []
+targets = set()
+for line in Path(disassembly).read_text().splitlines():
+    match = re.match(r'\s*([0-9a-f]+):\s+([^\s]+)\s*(.*)', line)
+    if match is None:
+        continue
+    address, opcode, operands = int(match[1], 16), match[2], match[3].split('//')[0]
+    instructions.append((address, opcode, operands))
+    if isa == 'aarch64' and (opcode == 'b' or opcode.startswith('b.') or opcode in ('cbz', 'cbnz', 'tbz', 'tbnz')):
+        target = re.match(r'0x[0-9a-f]+(?=\s|$)', operands.rsplit(',', 1)[-1].strip())
+        if target:
+            targets.add(int(target[0], 16))
+
+checked = unbacked = 0
+for row in Path(ranges).read_text().splitlines():
+    lo, hi, register, offsets = row.split()
+    lo, hi = int(lo, 16), int(hi, 16)
+    base = registers.get(int(register))
+    if base is None:
+        continue
+    known, seen = {}, set()
+    for address, opcode, operands in instructions:
+        if not lo <= address < hi:
+            continue
+        if address in targets:
+            known.clear()
+        line = opcode + ' ' + operands
+        if re.search(r'(?<![A-Za-z0-9_])' + re.escape(base) + r'(?![A-Za-z0-9_])', line):
+            seen.update(int(value, 16) for value in re.findall(r'-?0x[0-9a-f]+', line))
+            if isa == 'aarch64' and re.fullmatch(r'(?:ld|st)(?:r|ur|p)[a-z]*', opcode):
+                memory = re.search(r'\[' + re.escape(base) + r',\s*(x[0-9]+)\]', operands)
+                if memory and gp(memory[1]) is not None:
+                    value = known.get(gp(memory[1])[0])
+                    if value is not None:
+                        seen.add(value if value < (1 << 63) else value - (1 << 64))
+        if isa != 'aarch64':
+            continue
+        parts = [part.strip() for part in operands.split(',')]
+        if opcode in ('mov', 'movz', 'movn', 'movk'):
+            constant(opcode, parts, known)
+        elif opcode in ('cmp', 'cmn', 'tst', 'ccmp', 'ccmn', 'nop'):
+            pass
+        elif re.fullmatch(r'(?:ld|st)(?:r|ur|p)[a-z]*', opcode):
+            if opcode.startswith('ld'):
+                for part in parts[:2 if opcode.startswith('ldp') else 1]:
+                    destination = gp(part)
+                    if destination:
+                        known.pop(destination[0], None)
+            if ']!' in operands or '],' in operands:
+                written_base = re.search(r'\[(x[0-9]+)', operands)
+                if written_base and gp(written_base[1]):
+                    known.pop(gp(written_base[1])[0], None)
+        else:
+            known.clear()
+    for offset in offsets.split(','):
+        checked += 1
+        unbacked += int(offset) not in seen
+print('varloc_fbreg_checked=' + ('nonzero' if checked else 'zero'))
+print('varloc_fbreg_unbacked=' + str(unbacked))
+PY_FBREG
     rc=$?
     rm -f "$g.fns" "$g.dis"
     return $rc
