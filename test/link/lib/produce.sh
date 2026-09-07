@@ -2281,9 +2281,13 @@ produce_symtab() {
     # is no "before" build to compare against): every PT_LOAD's file extent must
     # end at or before .symtab's file offset, so a loader - which reads only
     # PT_LOAD - never sees a byte the symbol table touched.
-    # readelf -SW's leading "[ N]" is two whitespace-split fields ("[" and "N]"),
-    # so the section name is $3 and the file offset is $6.
-    symtab_off_hex=$(printf '%s\n' "$sh_out" | awk '$3 == ".symtab" { print $6; exit }')
+    # strip the section index before splitting fields, since [ 9] and [10] differ.
+    symtab_off_hex=$(printf '%s\n' "$sh_out" | awk '
+        /^[[:space:]]*\[[[:space:]]*[0-9]+\]/ {
+            sub(/^[[:space:]]*\[[[:space:]]*[0-9]+\][[:space:]]*/, "")
+            if ($1 == ".symtab" && $2 == "SYMTAB") { print $4; exit }
+        }
+    ')
     last_load_end=0
     while read -r typ off _va _pa filesz _memsz _flg _align; do
         [ "$typ" = "LOAD" ] || continue
