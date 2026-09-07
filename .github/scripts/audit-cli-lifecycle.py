@@ -7,23 +7,20 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-SOURCE = '82d346da3cadb82b20051a84d3e3d220cbe10b13'
+SOURCE = '40be912ce19ddcd3e1fa2d2ab3772f3f883aab78'
 PIN = 'c6a8816933fffa8ee490bb0bed8a97e7f0c1b296'
 BASE_SOURCE = 'be70fdcd6cb0806406830be3ce2abb8d91f6ce0f'
 BASE_RUN = 34074514612
 RETAINED = ROOT / 'retained-cli-lifecycle'
-EVIDENCE = ROOT / 'cli-lifecycle-evidence'
+EVIDENCE = ROOT / 'output-fixture-evidence'
 EVIDENCE.mkdir(exist_ok=True)
 (EVIDENCE / 'verification-script.py').write_bytes(pathlib.Path(__file__).read_bytes())
 RESULTS = []
 PREFIXES = [
-    ('init', 'mach.cli.cmd.init', 44),
-    ('args', 'mach.cli.args', 15),
-    ('publication', 'mach.lang.publication', 2),
-    ('fingerprint', 'mach.lang.build.fingerprint', 11),
-    ('dep-cli', 'mach.cli.cmd.dep', 24),
-    ('dep-driver', 'mach.lang.driver.deps', 15),
-    ('linker', 'mach.lang.be.linker', 88),
+    ('object-formats', 'mach.lang.target.of', 178),
+    ('linker', 'mach.lang.be.linker', 91),
+    ('driver-stack', 'mach.lang.driver:a_manifest_stack_reserve_reaches_the_linked_pe', 1),
+    ('driver-unwind', 'mach.lang.driver:w64_', 3),
 ]
 
 
@@ -80,19 +77,16 @@ def check_source(source=SOURCE, pin=PIN):
     run(['git', '-C', 'dep/std', 'diff', '--exit-code'])
 
 
-def test(compiler, profile, name, selected, count, child=0, required_log=None):
+def test(compiler, profile, name, selected, count):
     command = [str(compiler), 'test', str(ROOT), '--profile', profile,
                '--filter', selected, '--timeout_seconds', '180']
     rc, log = invoke(name, command)
     matches = re.findall(r'(\d+) passed, (\d+) failed, (\d+) total', log)
     counts = list(map(int, matches[-1])) if matches else None
-    exits = re.findall(r'\(exit ([^)]+)\)', log)
-    expected = [count, 0, count] if child == 0 else [0, 1, 1]
-    valid = counts == expected and (rc == 0 if child == 0 else rc != 0 and bool(exits) and set(exits) == {str(child)})
-    if required_log is not None:
-        valid = valid and required_log in log
+    expected = [count, 0, count]
+    valid = counts == expected and rc == 0
     row = dict(name=name, profile=profile, filter=selected, expected=expected, counts=counts,
-               exits=exits, compiler_exit=rc, verified=valid,
+               compiler_exit=rc, verified=valid,
                failures=re.findall(r'^\s*FAIL\s+(.*?)\s+\(exit', log, re.M))
     RESULTS.append(row)
     (EVIDENCE / 'summary.json').write_text(json.dumps(RESULTS, indent=2), encoding='utf-8')
@@ -148,184 +142,18 @@ for name, prefix, expected in PREFIXES:
 (EVIDENCE / 'test-inventory.json').write_text(json.dumps(inventory, indent=2), encoding='utf-8')
 
 changed = run(['git', 'diff', '--name-only', BASE_SOURCE, SOURCE, '--', 'src', 'mach.toml', 'dep/std']).stdout.decode().splitlines()
-assert set(changed) <= {'src/cli/cmd/init.mach', 'src/cli/cmd/dep.mach', 'src/lang/be/linker.mach', 'src/lang/driver/deps.mach'}, changed
+(EVIDENCE / 'changed-source-paths.json').write_text(json.dumps(changed, indent=2), encoding='utf-8')
 patch = run(['git', 'diff', BASE_SOURCE, SOURCE, '--', 'src']).stdout
-(EVIDENCE / 'reviewed-candidate-changes.patch').write_bytes(patch)
-# the retained compiler builds candidate tests including the native removal fix
+(EVIDENCE / 'candidate-source-changes.patch').write_bytes(patch)
+
 baseline_ok = True
 for profile in ['debug', 'release']:
     for name, prefix, count in PREFIXES:
-        if name in ('dep-cli', 'dep-driver'):
-            baseline_ok = test(COMPILERS[profile], profile, profile + '-' + name, prefix, count) and baseline_ok
+        if not test(COMPILERS[profile], profile, profile + '-' + name, prefix, count):
+            baseline_ok = False
 
-
-import os
-import tempfile
-
-if sys.platform == 'win32':
-    import ctypes
-    from ctypes import wintypes
-    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
-    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                                  wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
-    kernel.CreateFileW.restype = wintypes.HANDLE
-    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel.CloseHandle.restype = wintypes.BOOL
-    with tempfile.TemporaryDirectory(prefix='native-held-directory-') as scratch:
-        original = pathlib.Path(scratch) / 'original'
-        moved = pathlib.Path(scratch) / 'moved'
-        original.mkdir()
-        root_handle = kernel.CreateFileW(str(original), 0x80000000, 7, None, 3, 0x02000000, None)
-        assert root_handle != ctypes.c_void_p(-1).value, ctypes.get_last_error()
-        child_handle = kernel.CreateFileW(str(original / 'lock'), 0x40000000, 7, None, 1, 0x80, None)
-        assert child_handle != ctypes.c_void_p(-1).value, ctypes.get_last_error()
-        try:
-            refusal = None
-            try:
-                os.rename(original, moved)
-            except OSError as error:
-                refusal = error.winerror
-            assert refusal in (5, 32), refusal
-            assert kernel.CloseHandle(child_handle)
-            child_handle = None
-            os.rename(original, moved)
-            assert moved.is_dir() and not original.exists()
-            (EVIDENCE / 'windows-native-directory-rename.json').write_text(json.dumps(dict(
-                child_share_read_write_delete=True, open_child_rename_error=refusal,
-                closed_child_held_root_rename_succeeded=True)), encoding='utf-8')
-        finally:
-            if child_handle is not None:
-                kernel.CloseHandle(child_handle)
-            kernel.CloseHandle(root_handle)
-
-with tempfile.TemporaryDirectory(prefix='mach-init-without-git-') as scratch:
-    destination = pathlib.Path(scratch) / 'project'
-    environment = dict(os.environ, PATH='')
-    command = [str(COMPILERS['debug']), 'init', str(destination), '--name', 'without_git', '--no-git', '--no-deps']
-    census('init-without-git-program')
-    result = subprocess.run(command, cwd=scratch, env=environment, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, timeout=90)
-    (EVIDENCE / 'init-without-git-program.log').write_bytes(result.stdout)
-    assert result.returncode == 0, result.stdout.decode(errors='replace')
-    assert (destination / 'mach.toml').is_file()
-    assert (destination / 'src/root.mach').is_file()
-    assert not (destination / '.git').exists()
-    assert not (destination / '.gitmodules').exists()
-
-for no_git in [False, True]:
-    with tempfile.TemporaryDirectory(prefix='mach-init-existing-history-') as scratch:
-        destination = pathlib.Path(scratch)
-        def fixture_git(*args):
-            return subprocess.run(['git', '-C', scratch, *args], check=True,
-                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        fixture_git('init', '-b', 'user-branch')
-        tracked = destination / 'user-file'
-        for contents in ['first\n', 'second\n']:
-            tracked.write_text(contents, encoding='utf-8')
-            fixture_git('add', '--', 'user-file')
-            fixture_git('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid',
-                        '-c', 'commit.gpgsign=false', 'commit', '-m', contents.strip())
-        tracked.write_text('staged user work\n', encoding='utf-8')
-        fixture_git('add', '--', 'user-file')
-        tracked.write_text('unstaged user work\n', encoding='utf-8')
-        worktree_before = tracked.read_bytes()
-        git_dir = destination / '.git'
-        before = {str(path.relative_to(git_dir)): path.read_bytes()
-                  for path in git_dir.rglob('*') if path.is_file()}
-        command = [str(COMPILERS['debug']), 'init', scratch, '--name', 'existing_history', '--no-deps']
-        if no_git:
-            command.append('--no-git')
-        label = 'init-existing-history-' + ('opt-out' if no_git else 'default')
-        census(label)
-        result = subprocess.run(command, cwd=scratch, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, timeout=90)
-        (EVIDENCE / (label + '.log')).write_bytes(result.stdout)
-        assert result.returncode == 0, result.stdout.decode(errors='replace')
-        after = {str(path.relative_to(git_dir)): path.read_bytes()
-                 for path in git_dir.rglob('*') if path.is_file()}
-        assert before == after, 'init changed existing Git metadata'
-        assert tracked.read_bytes() == worktree_before
-        assert (destination / 'mach.toml').is_file()
-        assert (destination / 'src/root.mach').is_file()
-        (EVIDENCE / (label + '.json')).write_text(json.dumps(dict(
-            no_git=no_git, existing_commits=2, git_metadata_unchanged=True,
-            staged_and_unstaged_work_preserved=True)), encoding='utf-8')
-
-
-path = ROOT / 'src/cli/cmd/init.mach'
-original = path.read_bytes()
-try:
-    text = original.decode('utf-8').replace('\r\n', '\n')
-    assert text.count('    if (!no_git) {') == 1
-    for label, condition, selector in [
-        ('ignored-opt-out', '    if (true) {', 'mach.cli.cmd.init.git_boundary: no_git_scaffolds'),
-        ('skipped-initialization', '    if (false) {', 'mach.cli.cmd.init.git_boundary: explicit_initialization'),
-    ]:
-        path.write_text(text.replace('    if (!no_git) {', condition), encoding='utf-8', newline='')
-        if not test(COMPILERS['debug'], 'debug', label, selector, 1, 10):
-            raise RuntimeError('Git initialization guard mutant missed its required assertion')
-        path.write_bytes(original)
-finally:
-    path.write_bytes(original)
-path = ROOT / 'src/lang/driver/deps.mach'
-original = path.read_bytes()
-try:
-    source = original.decode('utf-8').replace('\r\n', '\n')
-    start = source.index('pub fun stage_dependency(')
-    end = source.index('\nfun t_scratch_dir(', start)
-    function = source[start:end]
-    before = '''    var args: [3]str = [3]str{"add", "--", rel};
-    val r: R.Result[str, str] = git_op(s.build_alloc, ?gi, root, ?args[0], 3, nil);'''
-    after = '''    var args: [4]str = [4]str{"add", "--", ".gitmodules", rel};
-    val r: R.Result[str, str] = git_op(s.build_alloc, ?gi, root, ?args[0], 4, nil);'''
-    assert function.count(before) == 1
-    path.write_text(source[:start] + function.replace(before, after) + source[end:], encoding='utf-8', newline='')
-    if not test(COMPILERS['debug'], 'debug', 'staged-unrelated-metadata',
-                'mach.lang.driver.deps.metadata:registration_refuses_unstaged_edits_and_pin_staging_leaves_them_unstaged', 1, 20):
-        raise RuntimeError('metadata staging mutant missed its required assertion')
-finally:
-    path.write_bytes(original)
-path = ROOT / 'src/lang/driver/deps.mach'
-original = path.read_bytes()
-try:
-    source = original.decode('utf-8').replace('\r\n', '\n')
-    before = '    var add_args: [4]str;\n    add_args[0] = "submodule";'
-    after = '''    var history_args: [3]str = [3]str{"checkout", "--detach", "HEAD"};
-    val history_result: R.Result[str, str] = git_op(s.build_alloc, ?gi, root, ?history_args[0], 3, extra_env);
-    if (R.is_err[str, str](history_result)) { ret R.err[R.Void, str](R.unwrap_err[str, str](history_result)); }
-    str_free(s.build_alloc, R.unwrap_ok[str, str](history_result));
-    var add_args: [4]str;
-    add_args[0] = "submodule";'''
-    assert source.count(before) == 1
-    path.write_text(source.replace(before, after), encoding='utf-8', newline='')
-    if not test(COMPILERS['debug'], 'debug', 'changed-project-symbolic-head',
-                'mach.cli.cmd.dep.remove:native_lock_failure_and_success_preserve_checkout_and_project_history', 1, 24):
-        raise RuntimeError('project history mutant missed its required runtime assertion')
-finally:
-    path.write_bytes(original)
-path = ROOT / 'src/lang/driver/deps.mach'
-original = path.read_bytes()
-try:
-    text = original.decode('utf-8').replace('\r\n', '\n')
-    for label, before, after, selector, child in [
-        ('copied-own-destination', 'if (fs.identity_equal(identity, excluded[0])) { cnt; }',
-         'if (false) { cnt; }', 'mach.lang.driver.deps.path_copy:ancestor_source_uses_finite_inventory_and_excludes_its_destination', 13),
-        ('ignored-destination-extras', 'for (i < existing.len) {', 'for (false) {',
-         'mach.lang.driver.deps.path_copy:extra_destination_entries_refuse_before_selected_files_change', 5),
-        ('refused-uncommitted-gitlink-removal', '"rm", "--force", "--cached", "--", rel',
-         '"rm", "--cached", "--ignore-unmatch", "--", rel',
-         'mach.cli.cmd.dep.remove:native_lock_failure_and_success_preserve_checkout_and_project_history', 16),
-    ]:
-        assert text.count(before) == 1
-        path.write_text(text.replace(before, after), encoding='utf-8', newline='')
-        if not test(COMPILERS['debug'], 'debug', label, selector, 1, child):
-            raise RuntimeError('dependency mutation missed its required runtime assertion')
-        path.write_bytes(original)
-finally:
-    path.write_bytes(original)
 check_source()
 census('final-source-restored')
 (EVIDENCE / 'restoration.json').write_text(json.dumps(dict(source=SOURCE, pin=PIN, restored=True)), encoding='utf-8')
-
 if not baseline_ok:
-    raise RuntimeError('one or more complete native prefix suites failed')
+    raise RuntimeError('one or more complete native output fixture suites failed')
