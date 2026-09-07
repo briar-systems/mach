@@ -14,7 +14,7 @@ mutations=[
  ('branch-bit-target',"target = re.match(r'0x[0-9a-f]+(?=\\s|$)', operands.rsplit(',', 1)[-1].strip())","target = re.search(r'0x[0-9a-f]+', operands)",'tbz-join'),
  ('stale-mov','previous = known.pop(number, None)','previous = known.get(number)','register-clobber'),
  ('stale-load','known.pop(destination[0], None)','None','load-clobber'),
- ('stale-join','if address in targets:\n            known.clear()','if address in targets:\n            pass','branch-join'),
+ ('stale-join','if address in targets:\n            known.clear()','if address in targets:\n            pass','tbz-join'),
 ]
 for name,old,new,expected in mutations:
  assert text.count(old)==1
