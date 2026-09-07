@@ -136,6 +136,7 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 - Compiler output publication holds stable directory coordinators and reserves every unit destination before code-generation workers start. Object writers and linkers borrow those reservations, including IR, assembly and test dispatcher outputs.
 
+- Absolute initialization paths select their native existing parent before contained descent, so ancestor directory aliases work while a symlink at the destination is still refused.
 - Init holds final-storage root, lock and destination reservations through its journaled operation. Existing files use retained backups, while a missing source directory is published as one staged subtree. Recovery checks complete root, source, prior and replacement identities, preserves unresolved journals and unexpected neighbors, and never opens child coordinator metadata inside a newly created source tree.
 - Manifests own one synthesized native target across repeated resolutions and release it on destruction. Early parse failures also release recorded deprecated keys (#3116).
 - Aggregate reads capture their bytes when evaluated, preserving values across later argument effects, assignment destination evaluation and return cleanup (#3210).
