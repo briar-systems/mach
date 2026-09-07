@@ -306,13 +306,13 @@ fun natural_stack_slot(tgt: *target.Target, variadic: bool) bool {
 fun stack_only_tail_slot(slot: abi.ParamSlot) abi.ParamSlot {
     if (is_stack_slot_class(slot.class)) { ret slot; }
     if (slot.class == abi.CLASS_BYREF) {
-        ret abi.make_slot(abi.CLASS_STACK_BYREF, -1, 0, slot.size);
+        ret abi.make_slot(abi.CLASS_STACK_BYREF, -1, 0, slot.size, 0);
     }
     if (slot.class == abi.CLASS_VEC_BYREF) {
         ret abi.make_slot_indirect(abi.CLASS_VEC_STACK_BYREF, -1, 0, slot.size,
                                    slot.indirect_size, slot.indirect_align);
     }
-    ret abi.make_slot(abi.CLASS_STACK, -1, 0, slot.size);
+    ret abi.make_slot(abi.CLASS_STACK, -1, 0, slot.size, 0);
 }
 
 fun is_stack_slot_class(class: abi.ParamClass) bool {
@@ -484,7 +484,16 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         if (rslot.class == abi.CLASS_AGG) {
             ra = context.alloc_object_storage(ctx, mb, res_dst, ret_type);
         } or {
-            ra = context.alloc_result_storage(ctx, mb, res_dst, ret_size, context.ret_align(ctx, ret_type));
+            var owned_size: u64 = ret_size;
+            if (rslot.class != abi.CLASS_SRET) {
+                val extent: R.Result[u64, str] = abi.carrier_storage_extent(?rslot);
+                if (R.is_err[u64, str](extent)) {
+                    sig_layout_free(ctx, ?layout);
+                    ret R.err[R.Void, str](R.unwrap_err[u64, str](extent));
+                }
+                owned_size = R.unwrap_ok[u64, str](extent);
+            }
+            ra = context.alloc_result_storage(ctx, mb, res_dst, owned_size, context.ret_align(ctx, ret_type));
         }
         if (R.is_err[R.Void, str](ra)) {
             sig_layout_free(ctx, ?layout);
@@ -707,12 +716,51 @@ rec PiecePlan {
     stack_base: u32;
     stack_off:  i64;
     stack_ok:   bool;
+    owned_extent: u64;
+}
+
+fun load_piece_carrier(ctx: *context.LowerCtx, mb: *mir.MirBlock, registers: *mir.MirBlock,
+                       reg: mir.MirOperand, source: mir.MirOperand,
+                       logical_width: u8, carrier_width: u8) R.Result[R.Void, str] {
+    if (logical_width == carrier_width) {
+        ret emit_call_reg(ctx, mb, registers, reg, source, carrier_width);
+    }
+    val kr: R.Result[u32, str] = context.new_vreg(ctx, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](kr)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](kr)); }
+    val key: u32 = R.unwrap_ok[u32, str](kr);
+    val ar: R.Result[R.Void, str] = context.add_alloca_slot(ctx, key,
+        carrier_width::u64, carrier_width::u32, mir.SLOT_TY_NIL);
+    if (R.is_err[R.Void, str](ar)) { ret ar; }
+    var off: u64 = 0;
+    for (off < carrier_width::u64) {
+        val width: u8 = context.copy_chunk_width(ctx.tgt, carrier_width::u64 - off);
+        val zero: R.Result[R.Void, str] = context.push_store_chunk(ctx, mb,
+            mir.op_mem_slot(key, off::i64), mir.op_imm(0), width);
+        if (R.is_err[R.Void, str](zero)) { ret zero; }
+        off = off + width::u64;
+    }
+    val copied: R.Result[R.Void, str] = context.copy_aggregate(ctx, mb,
+        mir.op_mem_slot(key, 0), source, logical_width::u64);
+    if (R.is_err[R.Void, str](copied)) { ret copied; }
+    ret emit_call_reg(ctx, mb, registers, reg, mir.op_mem_slot(key, 0), carrier_width);
 }
 
 fun materialize_pieces(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, plan: PiecePlan) R.Result[R.Void, str] {
+    val er: R.Result[u64, str] = abi.carrier_storage_extent(?slot);
+    if (R.is_err[u64, str](er)) { ret R.err[R.Void, str](R.unwrap_err[u64, str](er)); }
+    if (plan.store && plan.owned_extent < R.unwrap_ok[u64, str](er)) {
+        ret R.err[R.Void, str]("mir.abi: carrier stores exceed owned destination storage");
+    }
+    var pending: mir.MirBlock;
+    fin { mir.dnit_block(ctx.alloc, ?pending); }
+    var registers: *mir.MirBlock = plan.registers;
+    if (!plan.store && registers == mb) { registers = ?pending; }
     var i: u32 = 0;
     for (i < slot.piece_count) {
         val p: abi.ParamPiece = slot.pieces[i];
+        val wr: R.Result[u8, str] = abi.piece_memory_width(?slot, ?slot.pieces[i]);
+        if (R.is_err[u8, str](wr)) { ret R.err[R.Void, str](R.unwrap_err[u8, str](wr)); }
+        val logical_width: u8 = R.unwrap_ok[u8, str](wr);
         var mem: mir.MirOperand = mir.op_mem_value(plan.mem_base, p.src_off);
         if (plan.mem_slot) { mem = mir.op_mem_slot(plan.mem_base, p.src_off); }
         if (p.kind == abi.PIECE_STACK) {
@@ -720,28 +768,25 @@ fun materialize_pieces(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.Para
                 ret R.err[R.Void, str]("mir.lower_ir: return slot carries an outgoing stack chunk");
             }
             val stk: mir.MirOperand = mir.op_mem_preg(plan.stack_base, plan.stack_off + p.stk_off);
-            val tr: R.Result[u32, str] = context.new_vreg(ctx, mir.REG_CLASS_GP);
-            if (R.is_err[u32, str](tr)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](tr)); }
-            val tmp: u32 = R.unwrap_ok[u32, str](tr);
             var src: mir.MirOperand = mem;
             var dst: mir.MirOperand = stk;
             if (plan.store) { src = stk; dst = mem; }
-            val ld: R.Result[R.Void, str] = context.emit_mov(ctx, mb, mir.op_vreg(tmp), src);
-            if (R.is_err[R.Void, str](ld)) { ret ld; }
-            val st: R.Result[R.Void, str] = context.emit_store_to(ctx, mb, dst, mir.op_vreg(tmp));
-            if (R.is_err[R.Void, str](st)) { ret st; }
+            val copied: R.Result[R.Void, str] = context.copy_aggregate(ctx, mb, dst, src, logical_width::u64);
+            if (R.is_err[R.Void, str](copied)) { ret copied; }
         } or {
             val reg: mir.MirOperand = mir.op_preg(p.reg::u32);
             if (plan.store) {
                 val st: R.Result[R.Void, str] = context.emit_store_to_w(ctx, mb, mem, reg, p.width);
                 if (R.is_err[R.Void, str](st)) { ret st; }
             } or {
-                val mr: R.Result[R.Void, str] = emit_call_reg(ctx, mb, plan.registers, reg, mem, p.width);
+                val mr: R.Result[R.Void, str] = load_piece_carrier(ctx, mb, registers,
+                    reg, mem, logical_width, p.width);
                 if (R.is_err[R.Void, str](mr)) { ret mr; }
             }
         }
         i = i + 1;
     }
+    if (registers == ?pending) { ret place_call_registers(ctx, mb, ?pending); }
     ret R.ok_void[str]();
 }
 
@@ -915,7 +960,10 @@ fun emit_ret_slot_to_vreg(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.P
         ret context.emit_agg_store(ctx, mb, mir.op_mem_value(dst, 0), slot.reg::u32);
     }
     if (is_aggr) {
+        val extent: R.Result[u64, str] = abi.carrier_storage_extent(?slot);
+        if (R.is_err[u64, str](extent)) { ret R.err[R.Void, str](R.unwrap_err[u64, str](extent)); }
         var plan: PiecePlan;
+        plan.owned_extent = R.unwrap_ok[u64, str](extent);
         plan.registers = mb;
         plan.store      = true;
         plan.mem_base   = dst;
@@ -1029,9 +1077,12 @@ fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSl
         ret context.emit_agg_store(ctx, mb, mir.op_mem_value(pv, 0), slot.reg::u32);
     }
     if (is_aggr) {
-        val sr: R.Result[R.Void, str] = context.add_spill_slot(ctx, pv, size);
+        val extent: R.Result[u64, str] = abi.carrier_storage_extent(?slot);
+        if (R.is_err[u64, str](extent)) { ret R.err[R.Void, str](R.unwrap_err[u64, str](extent)); }
+        val sr: R.Result[R.Void, str] = context.add_spill_slot(ctx, pv, R.unwrap_ok[u64, str](extent));
         if (R.is_err[R.Void, str](sr)) { ret sr; }
         var plan: PiecePlan;
+        plan.owned_extent = R.unwrap_ok[u64, str](extent);
         plan.registers = mb;
         plan.store      = true;
         plan.mem_base   = pv;
@@ -1324,12 +1375,12 @@ test "mach.lang.be.codegen.mir.abi.natural_stack_slot:fixed_diverges_variadic_do
 }
 
 test "mach.lang.be.codegen.mir.abi.stack_only_tail_slot:moves_placement_not_form" {
-    val gp: abi.ParamSlot = stack_only_tail_slot(abi.make_slot(abi.CLASS_GP, 1, 0, 8));
+    val gp: abi.ParamSlot = stack_only_tail_slot(abi.make_slot(abi.CLASS_GP, 1, 0, 8, 8));
     if (gp.class != abi.CLASS_STACK) { ret 1; }
     if (gp.reg != -1)                { ret 1; }
     if (gp.piece_count != 0)         { ret 1; }
     if (gp.size != 8)                { ret 1; }
-    val fp: abi.ParamSlot = stack_only_tail_slot(abi.make_slot(abi.CLASS_FP, isa.regid_make(isa.REG_CLASS_ID_XMM, 0), 0, 8));
+    val fp: abi.ParamSlot = stack_only_tail_slot(abi.make_slot(abi.CLASS_FP, isa.regid_make(isa.REG_CLASS_ID_XMM, 0), 0, 8, 8));
     if (fp.class != abi.CLASS_STACK) { ret 1; }
     val pair: abi.ParamSlot = stack_only_tail_slot(abi.make_slot_pair(abi.CLASS_GP, 0, 1, 0, 16, 8));
     if (pair.class != abi.CLASS_STACK) { ret 1; }
@@ -1338,14 +1389,14 @@ test "mach.lang.be.codegen.mir.abi.stack_only_tail_slot:moves_placement_not_form
     val hfa: abi.ParamSlot = stack_only_tail_slot(abi.make_slot_hfa(isa.regid_make(isa.REG_CLASS_ID_XMM, 0), 4, 8, 32));
     if (hfa.class != abi.CLASS_STACK) { ret 1; }
     if (hfa.piece_count != 0)         { ret 1; }
-    val byref: abi.ParamSlot = stack_only_tail_slot(abi.make_slot(abi.CLASS_BYREF, 0, 0, 8));
+    val byref: abi.ParamSlot = stack_only_tail_slot(abi.make_slot(abi.CLASS_BYREF, 0, 0, 8, 8));
     if (byref.class != abi.CLASS_STACK_BYREF) { ret 1; }
     if (byref.size != 8)                      { ret 1; }
     val vstored: abi.ParamSlot = stack_only_tail_slot(abi.make_slot_indirect(abi.CLASS_VEC_BYREF, 0, 0, 8, 16, 16));
     if (vstored.class != abi.CLASS_VEC_STACK_BYREF) { ret 1; }
     if (vstored.indirect_size != 16)                { ret 1; }
     if (vstored.indirect_align != 16)               { ret 1; }
-    val stk: abi.ParamSlot = stack_only_tail_slot(abi.make_slot(abi.CLASS_STACK, -1, 24, 16));
+    val stk: abi.ParamSlot = stack_only_tail_slot(abi.make_slot(abi.CLASS_STACK, -1, 24, 16, 0));
     if (stk.class != abi.CLASS_STACK) { ret 1; }
     if (stk.offset != 24)             { ret 1; }
     ret 0;
@@ -1355,13 +1406,13 @@ fun probe_arg(index: i32, size: u64, align: u64, is_float: bool, fp_eightbytes: 
               is_aggregate: bool, is_vector: bool,
               gp_used: i32, fp_used: i32,
               hfa_members: u8, hfa_elem: u8, agg: abi.AggLayout) abi.ParamSlot {
-    ret abi.make_slot(abi.CLASS_GP, index, 0, size);
+    ret abi.make_slot(abi.CLASS_GP, index, 0, size, 8);
 }
 
 fun probe_ret(size: u64, align: u64, is_float: bool, fp_eightbytes: u8,
               is_aggregate: bool, is_vector: bool, hfa_members: u8, hfa_elem: u8,
               agg: abi.AggLayout) abi.ParamSlot {
-    ret abi.make_slot(abi.CLASS_GP, 0, 0, size);
+    ret abi.make_slot(abi.CLASS_GP, 0, 0, size, 8);
 }
 
 test "mach.lang.be.codegen.mir.abi.require_abi:variadic_facts_are_not_call_preconditions" {
@@ -1666,5 +1717,203 @@ test "mach.lang.be.codegen.mir.abi:owned_argument_native_direct_indirect_and_sre
     }
     i = 0;
     for (i < 65) { if (payload.bytes[i] != (i + 1)::u8) { ret 5; } i = i + 1; }
+    ret 0;
+}
+
+rec CarrierBytes {
+    memory: [16][32]u8;
+    extent: [16]u32;
+    virtual: [64][16]u8;
+    physical: [4][16]u8;
+    registers: [4]i32;
+}
+
+fun t_carrier_address(bytes: *CarrierBytes, operand: mir.MirOperand, width: u32) *u8 {
+    if (width > 16) { ret nil; }
+    if (operand.kind == mir.MIR_OP_VREG) {
+        if (operand.vreg >= 64) { ret nil; }
+        ret ?bytes.virtual[operand.vreg][0];
+    }
+    if (operand.kind == mir.MIR_OP_PREG) {
+        var i: u32 = 0;
+        for (i < 4) {
+            if (bytes.registers[i] == operand.preg::i32) { ret ?bytes.physical[i][0]; }
+            i = i + 1;
+        }
+        ret nil;
+    }
+    if (operand.kind != mir.MIR_OP_MEM || operand.imm < 0) { ret nil; }
+    var key: u32 = operand.vreg;
+    if (key == mir.MIR_VREG_NIL) { key = 15; }
+    if (key >= 16 || operand.imm::u64 + width::u64 > bytes.extent[key]::u64) { ret nil; }
+    ret ?bytes.memory[key][operand.imm::u32];
+}
+
+fun t_run_carriers(bytes: *CarrierBytes, block: *mir.MirBlock) i32 {
+    var placed: bool = false;
+    var i: u32 = 0;
+    for (i < block.instr_count) {
+        val mi: *mir.MirInstr = ?block.instrs[i];
+        if (mi.opcode != mir.MIR_MOV && mi.opcode != mir.MIR_STORE && mi.opcode != mir.MIR_MEMCPY) { ret 1; }
+        var width: u32 = mi.width::u32;
+        if (mi.opcode == mir.MIR_MEMCPY) { width = mi.operands[2].imm::u32; }
+        if (placed && (mi.operands[1].kind == mir.MIR_OP_MEM || mi.opcode == mir.MIR_MEMCPY)) { ret 2; }
+        if (mi.operands[0].kind == mir.MIR_OP_PREG) { placed = true; }
+        val dst: *u8 = t_carrier_address(bytes, mi.operands[0], width);
+        if (dst == nil) { ret 3; }
+        var snapshot: [16]u8;
+        if (mi.operands[1].kind == mir.MIR_OP_IMM) {
+            if (mi.operands[1].imm != 0) { ret 4; }
+        } or {
+            val src: *u8 = t_carrier_address(bytes, mi.operands[1], width);
+            if (src == nil) { ret 5; }
+            var j: u32 = 0;
+            for (j < width) { snapshot[j] = src[j]; j = j + 1; }
+        }
+        var j: u32 = 0;
+        for (j < width) { dst[j] = snapshot[j]; j = j + 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+fun t_carrier_materialization(tgt: *target.Target, slot: abi.ParamSlot,
+                              store: bool, separate: bool, insufficient: bool) i32 {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var f: mir.MirFunction;
+    fin { mir.dnit_function(?alloc, ?f); }
+    var ctx: context.LowerCtx;
+    ctx.alloc = ?alloc;
+    ctx.tgt = tgt;
+    ctx.layout = target.layout_machine(tgt);
+    ctx.f = ?f;
+    val vr: R.Result[*mir.MirVReg, str] = A.allocate[mir.MirVReg](?alloc, 16);
+    if (R.is_err[*mir.MirVReg, str](vr)) { ret 2; }
+    f.vregs = R.unwrap_ok[*mir.MirVReg, str](vr);
+    f.vreg_cap = 16;
+    if (R.is_err[u32, str](context.new_vreg(?ctx, mir.REG_CLASS_GP))) { ret 2; }
+    var mb: mir.MirBlock;
+    fin { mir.dnit_block(?alloc, ?mb); }
+    var registers: mir.MirBlock;
+    fin { mir.dnit_block(?alloc, ?registers); }
+    val er: R.Result[u64, str] = abi.carrier_storage_extent(?slot);
+    if (R.is_err[u64, str](er)) { ret 3; }
+    val extent: u64 = R.unwrap_ok[u64, str](er);
+    var plan: PiecePlan;
+    plan.store = store;
+    plan.mem_slot = true;
+    plan.mem_base = 0;
+    plan.stack_ok = true;
+    plan.registers = ?mb;
+    if (separate) { plan.registers = ?registers; }
+    plan.owned_extent = extent;
+    if (insufficient) { plan.owned_extent = extent - 1; }
+    val mr: R.Result[R.Void, str] = materialize_pieces(?ctx, ?mb, slot, plan);
+    if (insufficient) {
+        if (!R.is_err[R.Void, str](mr) || mb.instr_count != 0) { ret 4; }
+        ret 0;
+    }
+    if (R.is_err[R.Void, str](mr)) { ret 5; }
+    if (separate && R.is_err[R.Void, str](place_call_registers(?ctx, ?mb, ?registers))) { ret 6; }
+    var bytes: CarrierBytes;
+    var i: u32 = 0;
+    for (i < 16) {
+        var j: u32 = 0;
+        for (j < 32) { bytes.memory[i][j] = 165; j = j + 1; }
+        i = i + 1;
+    }
+    bytes.extent[0] = slot.size::u32;
+    if (store) { bytes.extent[0] = extent::u32; }
+    i = 0;
+    for (i < f.frame.slot_count) {
+        val owned: *mir.MirSlot = ?f.frame.slots[i];
+        if (owned.value == 0 || owned.value >= 15 || owned.size > 16) { ret 7; }
+        bytes.extent[owned.value] = owned.size;
+        i = i + 1;
+    }
+    i = 0;
+    for (i < slot.size::u32) { bytes.memory[0][i] = (i * 17 + 3)::u8; i = i + 1; }
+    i = 0;
+    for (i < slot.piece_count) {
+        val p: abi.ParamPiece = slot.pieces[i];
+        bytes.registers[i] = p.reg;
+        var j: u32 = 0;
+        for (j < p.width::u32) {
+            var byte: u8 = 0;
+            if (p.src_off::u64 + j::u64 < slot.size) { byte = ((p.src_off::u32 + j) * 17 + 3)::u8; }
+            if (store) {
+                if (p.kind == abi.PIECE_STACK) {
+                    if (p.src_off::u64 + j::u64 < slot.size) { bytes.memory[15][j] = byte; }
+                }
+                or { bytes.physical[i][j] = byte; }
+            }
+            j = j + 1;
+        }
+        if (p.kind == abi.PIECE_STACK) { bytes.extent[15] = (slot.size - p.src_off::u64)::u32; }
+        i = i + 1;
+    }
+    val ran: i32 = t_run_carriers(?bytes, ?mb);
+    if (ran != 0) { ret 10 + ran; }
+    i = 0;
+    for (i < slot.piece_count) {
+        val p: abi.ParamPiece = slot.pieces[i];
+        var count: u32 = p.width::u32;
+        if (p.kind == abi.PIECE_STACK) { count = bytes.extent[15]; }
+        var j: u32 = 0;
+        for (j < count) {
+            var expected: u8 = 0;
+            if (p.src_off::u64 + j::u64 < slot.size) { expected = ((p.src_off::u32 + j) * 17 + 3)::u8; }
+            var actual: u8 = bytes.physical[i][j];
+            if (p.kind == abi.PIECE_STACK) { actual = bytes.memory[15][j]; }
+            if (store) { actual = bytes.memory[0][p.src_off::u32 + j]; }
+            if (actual != expected) { ret 20; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = bytes.extent[0];
+    for (i < 32) { if (bytes.memory[0][i] != 165) { ret 21; } i = i + 1; }
+    i = bytes.extent[15];
+    for (i < 32) { if (bytes.memory[15][i] != 165) { ret 22; } i = i + 1; }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.mir.abi:carrier_memory_exact_extent_and_padding" {
+    var reg: treg.TargetRegistry = treg.registry_init();
+    fin { treg.registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](treg.register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+    var target_index: u32 = 0;
+    for (target_index < 6) {
+        val tr: R.Result[target.Target, str] = treg.select(?reg, CONV_ARCH[target_index], CONV_OS[target_index], CONV_ABI[target_index]);
+        if (R.is_err[target.Target, str](tr)) { ret 2; }
+        var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+        val word: u32 = tgt.model.gpr_width;
+        val arg: abi.ArgPassingFn = tgt.abi.arg_passing;
+        val result: abi.RetPassingFn = tgt.abi.ret_passing;
+        val classified_arg: abi.ParamSlot = arg(0, 4, 4, false, 0, true, false, 0, 0, 0, 0, abi.agg_none());
+        val classified_ret: abi.ParamSlot = result(4, 4, false, 0, true, false, 0, 0, abi.agg_none());
+        if (classified_arg.size != 4 || classified_ret.size != 4 ||
+            classified_arg.piece_count != 1 || classified_ret.piece_count != 1 ||
+            classified_arg.pieces[0].width != word::u8 || classified_ret.pieces[0].width != word::u8) { ret 10; }
+        var size: u64 = 0;
+        for (size <= word::u64 * 2) {
+            var slot: abi.ParamSlot = abi.make_slot_pair(abi.CLASS_GP, 0, 1, 0, size, word);
+            if (size < word::u64) { slot.piece_count = 1; }
+            if (t_carrier_materialization(?tgt, slot, false, false, false) != 0) { ret 3; }
+            if (t_carrier_materialization(?tgt, slot, false, true, false) != 0) { ret 4; }
+            if (t_carrier_materialization(?tgt, slot, true, false, false) != 0) { ret 5; }
+            if (t_carrier_materialization(?tgt, slot, true, false, true) != 0) { ret 6; }
+            if (size > word::u64) {
+                slot.pieces[1].kind = abi.PIECE_STACK;
+                if (t_carrier_materialization(?tgt, slot, false, false, false) != 0) { ret 7; }
+                if (t_carrier_materialization(?tgt, slot, true, false, false) != 0) { ret 8; }
+            }
+            size = size + 1;
+        }
+        var fp: abi.ParamSlot = abi.make_slot(abi.CLASS_FP, isa.regid_make(isa.REG_CLASS_ID_XMM, 0), 0, 3, 8);
+        if (t_carrier_materialization(?tgt, fp, false, false, false) != 0) { ret 9; }
+        target_index = target_index + 1;
+    }
     ret 0;
 }

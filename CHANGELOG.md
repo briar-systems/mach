@@ -130,6 +130,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 ### Fixed
 
+- Separate aggregate object sizes from ABI register widths. Copy partial pieces through initialized owned carriers, bound split stack tails to their logical bytes, and prepare all return carriers before assigning registers.
+
 - Retain files while hashing and reject replacement paths or changed file metadata before publishing their digests.
 
 - Inventory local dependency sources before copying, exclude a destination inside an ancestor source, and refuse stale destination entries before writing. Pull missing path dependencies without requiring or staging a Git index.
