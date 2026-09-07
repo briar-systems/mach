@@ -135,6 +135,8 @@ The pin moves from 0.28.1 to std 1.0.0, the audited transition dependency.
 
 ### Fixed
 
+- Path-only dependency verification leaves its unused Git inspector empty, so cleanup never attempts to free a static string.
+
 - Patch x86-64 ELF imported-address GOT references through the existing relocation backend, preserving displacement addends and field-width overflow checks.
 
 - Run expected-trap child programs inside their private fixture directories and remove those directories afterward, keeping QEMU core dumps out of the checkout (#3132).
