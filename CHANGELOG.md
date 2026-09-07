@@ -132,6 +132,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 ### Fixed
 
+- Resolve RISC-V GOT high/low relocation pairs through pointer-width GOT slots, preserving the high relocation target for both RV32 and RV64.
+
 - Only `mach init` requests repository creation. `--no-git` opts out and uses plain dependency checkouts, while initialization preserves existing Git history and does not stage scaffold files.
 - Aggregate ABI carrier loads respect the exact logical object extent, including odd-sized register tails and split register/stack arguments. Partial carriers use initialized owned storage, incoming values reserve their full transport extent, and return carriers are prepared before physical return registers are assigned.
 
