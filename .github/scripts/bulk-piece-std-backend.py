@@ -15,6 +15,29 @@ for profile in ['debug','release']:
  summary=[e for e in events if e.get('event')=='summary']
  assert code==0 and len(summary)==1 and summary[0]['failed']==0 and summary[0]['passed']>0,log
 
+fixture=f.P/'src/lang/driver/tests.mach'
+fixture_original=fixture.read_bytes()
+fixture_label='mach.lang.driver:a_symbol_address_materializes_only_on_a_flat_target'
+for mutation in [False,True]:
+ try:
+  if mutation:
+   text=fixture_original.decode()
+   for opcode in ['LOAD','STORE']:
+    needle='if (flat && mi.opcode == mir.MIR_'+opcode+' && mi.operand_count == 2'
+    assert text.count(needle)==1
+    text=text.replace(needle,'if (mi.opcode == mir.MIR_'+opcode+' && mi.operand_count == 2')
+   fixture.write_text(text)
+  for profile in ['debug','release']:
+   code,log=f.invoke(('mutant-' if mutation else '')+'symbol-'+profile,[compiler,'test','.','--profile',profile,'--filter',fixture_label,'--format','json'])
+   events=[json.loads(line) for line in log.splitlines() if line.startswith('{')]
+   summary=[e for e in events if e.get('event')=='summary']
+   tests=[e for e in events if e.get('event')=='test']
+   assert len(summary)==1 and summary[0]['total']==1 and len(tests)==1,log
+   assert summary[0]['failed']==int(mutation) and tests[0]['code']==int(mutation),log
+   assert (code!=0)==mutation,log
+ finally:
+  fixture.write_bytes(fixture_original)
+assert fixture.read_bytes()==fixture_original
 source=f.ROOT/'.wt/std-backend-source'
 subprocess.run(['git','clone','--no-checkout','https://github.com/briar-systems/mach-std',str(source)],check=True)
 f.cmd(['git','checkout','--detach',STD],source);assert f.cmd(['git','rev-parse','HEAD'],source)==STD
