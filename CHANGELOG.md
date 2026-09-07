@@ -140,6 +140,8 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 - Compiler output publication holds stable directory coordinators and reserves every unit destination before code-generation workers start. Object writers and linkers borrow those reservations, including IR, assembly and test dispatcher outputs.
 
+- Path dependency realization inventories source files before writing, excludes an existing destination inside an ancestor source, and refuses stale destination entries before updating. Missing path dependencies can be pulled in filesystem or Git projects without staging their contents.
+
 - Dependency failures leave completed Git changes inspectable instead of reconstructing the index or recursively deleting partial checkouts. Removal retains the checkout unless `--purge` is requested.
 - Absolute initialization paths select their native existing parent before contained descent, so ancestor directory aliases work while a symlink at the destination is still refused.
 - Init holds final-storage root, lock and destination reservations through its journaled operation. Existing files use retained backups, while a missing source directory is published as one staged subtree. Recovery checks complete root, source, prior and replacement identities, preserves unresolved journals and unexpected neighbors, and never opens child coordinator metadata inside a newly created source tree.
