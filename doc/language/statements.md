@@ -45,9 +45,9 @@ next iteration.
 
 ```mach
 for (i < 10) {
+    i = i + 1;
     if (i == 3) { cnt; }
     if (i == 8) { brk; }
-    i = i + 1;
 }
 ```
 
