@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-SOURCE = 'faf0d9c6b1ff0685de0287702df0cc9d16b1e70c'
+SOURCE = '82d346da3cadb82b20051a84d3e3d220cbe10b13'
 PIN = 'c6a8816933fffa8ee490bb0bed8a97e7f0c1b296'
 BASE_SOURCE = 'be70fdcd6cb0806406830be3ce2abb8d91f6ce0f'
 BASE_RUN = 34074514612
@@ -148,14 +148,14 @@ for name, prefix, expected in PREFIXES:
 (EVIDENCE / 'test-inventory.json').write_text(json.dumps(inventory, indent=2), encoding='utf-8')
 
 changed = run(['git', 'diff', '--name-only', BASE_SOURCE, SOURCE, '--', 'src', 'mach.toml', 'dep/std']).stdout.decode().splitlines()
-assert set(changed) <= {'src/cli/cmd/init.mach', 'src/cli/cmd/dep.mach', 'src/lang/be/linker.mach'}, changed
+assert set(changed) <= {'src/cli/cmd/init.mach', 'src/cli/cmd/dep.mach', 'src/lang/be/linker.mach', 'src/lang/driver/deps.mach'}, changed
 patch = run(['git', 'diff', BASE_SOURCE, SOURCE, '--', 'src']).stdout
-(EVIDENCE / 'reviewed-fixture-changes.patch').write_bytes(patch)
-# these source changes were reviewed as test fixtures and helpers only
+(EVIDENCE / 'reviewed-candidate-changes.patch').write_bytes(patch)
+# the retained compiler builds candidate tests including the native removal fix
 baseline_ok = True
 for profile in ['debug', 'release']:
     for name, prefix, count in PREFIXES:
-        if name in ('init', 'dep-cli', 'linker'):
+        if name in ('dep-cli', 'dep-driver'):
             baseline_ok = test(COMPILERS[profile], profile, profile + '-' + name, prefix, count) and baseline_ok
 
 
@@ -228,6 +228,7 @@ for no_git in [False, True]:
         tracked.write_text('staged user work\n', encoding='utf-8')
         fixture_git('add', '--', 'user-file')
         tracked.write_text('unstaged user work\n', encoding='utf-8')
+        worktree_before = tracked.read_bytes()
         git_dir = destination / '.git'
         before = {str(path.relative_to(git_dir)): path.read_bytes()
                   for path in git_dir.rglob('*') if path.is_file()}
@@ -243,7 +244,7 @@ for no_git in [False, True]:
         after = {str(path.relative_to(git_dir)): path.read_bytes()
                  for path in git_dir.rglob('*') if path.is_file()}
         assert before == after, 'init changed existing Git metadata'
-        assert tracked.read_bytes() == b'unstaged user work\n'
+        assert tracked.read_bytes() == worktree_before
         assert (destination / 'mach.toml').is_file()
         assert (destination / 'src/root.mach').is_file()
         (EVIDENCE / (label + '.json')).write_text(json.dumps(dict(
@@ -311,11 +312,14 @@ try:
          'if (false) { cnt; }', 'mach.lang.driver.deps.path_copy:ancestor_source_uses_finite_inventory_and_excludes_its_destination', 13),
         ('ignored-destination-extras', 'for (i < existing.len) {', 'for (false) {',
          'mach.lang.driver.deps.path_copy:extra_destination_entries_refuse_before_selected_files_change', 5),
+        ('refused-uncommitted-gitlink-removal', '"rm", "--force", "--cached", "--", rel',
+         '"rm", "--cached", "--ignore-unmatch", "--", rel',
+         'mach.cli.cmd.dep.remove:native_lock_failure_and_success_preserve_checkout_and_project_history', 16),
     ]:
         assert text.count(before) == 1
         path.write_text(text.replace(before, after), encoding='utf-8', newline='')
         if not test(COMPILERS['debug'], 'debug', label, selector, 1, child):
-            raise RuntimeError('path copy mutant missed its required runtime assertion')
+            raise RuntimeError('dependency mutation missed its required runtime assertion')
         path.write_bytes(original)
 finally:
     path.write_bytes(original)
