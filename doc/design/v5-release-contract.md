@@ -6,11 +6,16 @@ The source inspected for the v5 candidate is
 [`c8e4d2bf`](https://github.com/briar-systems/mach/tree/c8e4d2bf04066a033e42e84c23590c7e6528ddd9).
 A registered capability does not establish that its final v5 acceptance passed.
 
-## Decisions awaiting the owner
+## Current v5 decisions
+
+The owner approved these decisions on 2026-09-08 as the path forward for v5.
+Dependency selection and public entry may be revisited if practical use exposes
+productivity blockers. That possibility does not leave the current contract
+undecided or authorize implementations to substitute a different policy.
 
 ### Dependency selection
 
-Proposed v5 contract: retain explicit selection and do not introduce automatic
+Accepted v5 contract: retain explicit selection and do not introduce automatic
 SemVer upgrades. The root owns one realized commit per project identity and may
 override a dependency's selector, including with a fork carrying that identity.
 Without a root override, requirers must agree. Conflicts name the requiring
@@ -26,14 +31,13 @@ version interval, ancestry-based compatibility promise or minimum compatible
 release. A future range-selection policy would require an explicit range
 contract rather than inferring permission from a tested commit.
 
-The existing dependency design and manifest prose describe an automatic SemVer
-proposal. That proposal is not accepted by #3112 and must not drive implementation
-until the owner decides. F3 owns reconciliation of the final selector contract
-with update, verification and conflict diagnostics.
+The earlier automatic SemVer proposal is superseded by this explicit-selection
+contract. F3 owns acceptance of update, verification and conflict diagnostics
+against that contract. Any future range policy needs a separate explicit decision.
 
 ### Library public entry
 
-Proposed v5 contract: preserve the current candidate's unambiguous-entry rule.
+Accepted v5 contract: preserve the current candidate's unambiguous-entry rule.
 A bare dependency import uses the entry of an explicitly defaulted `static` or
 `shared` artifact. Multiple default library artifacts are permitted when they
 name the same entry. Executable entries and nondefault libraries do not select
@@ -49,7 +53,7 @@ Candidate evidence: `manifest.canonical_module` and the public-entry cases in
 
 ### SPIR-V boundary
 
-Proposed v5 contract: retain finished-module emission, the four declared Vulkan
+Accepted v5 contract: retain finished-module emission, the four declared Vulkan
 environments and the existing unqualified environment. Debug requests are
 explicitly refused. No GPU execution or GPU runtime support is claimed.
 
@@ -76,8 +80,7 @@ work. It cannot be reclassified as unsupported just to make a test pass.
 
 ## Retained target matrix
 
-This is the release scope, with the proposed SPIR-V debug boundary above still
-awaiting the owner. N1 and R1 must reconcile every advertised tuple against the
+This is the release scope, including the accepted SPIR-V debug refusal above. N1 and R1 must reconcile every advertised tuple against the
 registry and test coverage. Artifact support follows the selected format and ABI,
 not the Cartesian product of accepted manifest words.
 
@@ -91,7 +94,7 @@ not the Cartesian product of accepted manifest words.
 | RV64 | Linux or freestanding, `lp64`, `lp64f`, `lp64d` compatible with selected ISA | ELF and freestanding raw forms as declared | DWARF for ELF, refusal for raw | ISA/ABI conformance and independent objects, with qemu execution bounded to compute evidence |
 | RV32 | Freestanding, `ilp32`, `ilp32f`, `ilp32d` compatible with selected ISA | Static/relocatable ELF and freestanding static images | DWARF for ELF, refusal for raw | Independent ELF32, relocations, ISA and ABI evidence, no claimed hosted execution |
 | Native freestanding | x86-64 or AArch64 with their matching ABI | Raw images or declared ELF forms, caller-supplied runtime | DWARF for ELF, refusal for raw | Format and selected-machine conformance, no implicit OS services |
-| SPIR-V | Freestanding, `spirv`, environment table above | Finished `.spv` module tree | Proposed explicit refusal | Independent `spirv-val` and decoding, no execution claim |
+| SPIR-V | Freestanding, `spirv`, environment table above | Finished `.spv` module tree | Explicit refusal | Independent `spirv-val` and decoding, no execution claim |
 
 RISC-V retains the declared I/M/A/F/D/C/Zicsr/Zifencei vocabulary and supported
 versions. ABI floating-point requirements must fit the selected machine.
@@ -127,8 +130,9 @@ A workflow rename requires a corresponding ruleset reconciliation.
 passed on dev `143bc0ba`. A later run on the same source,
 [34288169859](https://github.com/briar-systems/mach/actions/runs/34288169859),
 failed when the Windows seed checksum download connection was reset. This was
-before compiler bootstrap. One failed-job rerun was requested. Its outcome must
-be recorded separately from the original failure.
+before compiler bootstrap. The single failed-job rerun, attempt 2, subsequently
+passed. The original failure remains download-infrastructure evidence, not a
+compiler failure or a passing test attempt.
 
 ## Bootstrap and completion
 
@@ -143,7 +147,7 @@ Their implementation successors and the v5 release remain open. The new language
 must produce a pinned usable compiler before compiler/std source migration.
 Final Mach 5.0.0 and std 2.0.0 require their own exact-source acceptance.
 
-G1 completes when the three owner decisions above are recorded, conflicting
-reference prose is reconciled, and downstream issue owners have the resulting
-contracts. This document does not close implementation issues or certify the
+G1 records the three approved decisions, reconciled reference prose and CI
+requirements. Downstream implementation owners remain responsible for acceptance
+against these contracts. This document does not close implementation issues or certify the
 current candidate as a finished release.

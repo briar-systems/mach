@@ -78,8 +78,8 @@ migration. The linked issues contain their acceptance criteria. Remaining syntax
 and representation choices are design work, not declarations of implemented
 features.
 
-Dependency version selection remains an explicit decision in the
-[coordinator reconciliation](v5-release-contract.md).
+Dependency version selection follows the explicit-selector policy approved in
+the [coordinator reconciliation](v5-release-contract.md).
 A tested dependency commit is evidence of testing, not an automatic promise of
 compatibility with every later release. The earlier SemVer proposal is not an
 accepted implementation contract.

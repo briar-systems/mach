@@ -130,8 +130,9 @@ An earlier design proposed selecting the highest same-major tagged release above
 every tested commit. That proposal is not an accepted v5 contract. A tested
 commit establishes neither an ordering constraint nor permission to substitute
 later releases. The [release contract reconciliation](v5-release-contract.md)
-presents explicit selection for the owner's decision. Until that decision, the
-manual rule above remains the implementation baseline.
+records the owner-approved explicit-selection policy. The manual rule above is
+the v5 contract. Compatibility ranges may be revisited through a separate
+decision if practical use exposes productivity blockers.
 
 Selectors are `branch/<name>`, `tag/<name>`, and `commit/<full-object-id>`,
 and nothing else: a bare name that git would guess at is exactly the
@@ -154,7 +155,8 @@ gets the legacy `lib.mach` entry under its source directory. The current v5 cand
 that fallback. A bare dependency import needs an unambiguous entry selected by
 explicitly defaulted library artifacts. Multiple defaults may share one entry.
 Full-module imports remain available without a default artifact, including for
-source-only dependencies. G1 requests confirmation of that existing rule.
+source-only dependencies. The owner approved this rule for v5. It may be revisited if practical use exposes
+productivity blockers.
 
 Three things fit the five statements without changing them and are named as
 future slots rather than built: owner-prefixed (dotted) ids if the flat id
