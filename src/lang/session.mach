@@ -11,12 +11,15 @@ use std.types.string.str_equals;
 use std.types.string.str_len;
 
 use A: std.allocator;
+use T: std.allocator.testing;
+use std.memory;
 use P: std.types.path;
 use O: std.types.option;
 use R: std.types.result;
 
 use mach.lang.diagnostic;
 use mach.lang.embed;
+use mach.lang.fail;
 use mach.lang.fe.ast;
 use mach.lang.intern;
 use mach.lang.module;
@@ -51,11 +54,13 @@ pub rec Session {
     build_alloc: *A.Allocator;
     sources:    source.SourceMap;
     diags:      diagnostic.DiagnosticStore;
-    gate_diags: diagnostic.GateDiagLedger;
     interner:   intern.Interner;
     types:      type.TypeInterner;
 
     queries: query.QueryDb;
+    query_presentation: *query.Presentation;
+    query_failure_message: str;
+    parse_sequence: u64;
 
     module_asts:      **ast.Ast;
     module_ast_count: u32;
@@ -102,10 +107,13 @@ val OVERLAY_SEED_CAP: u32 = 4;
 pub fun init(alloc: *A.Allocator) R.Result[Session, str] {
     var s: Session;
     s.alloc            = alloc;
+    s.parse_sequence   = 0;
     s.build_alloc      = alloc;
     s.sources          = source.init(alloc);
     s.diags            = diagnostic.store_init(alloc);
-    s.gate_diags       = diagnostic.ledger_init(alloc);
+    s.query_presentation = nil;
+    s.query_failure_message = nil;
+
     s.interner         = intern.init(alloc);
     s.module_asts      = nil;
     s.module_ast_count = 0;
@@ -138,7 +146,7 @@ pub fun init(alloc: *A.Allocator) R.Result[Session, str] {
     val opt_types: O.Option[str] = type.init(?s.types, alloc);
     if (O.is_some[str](opt_types)) {
         intern.dnit(?s.interner);
-        diagnostic.ledger_dnit(?s.gate_diags);
+
         diagnostic.store_dnit(?s.diags);
         source.dnit(?s.sources);
         ret R.err[Session, str](O.unwrap[str](opt_types));
@@ -148,7 +156,7 @@ pub fun init(alloc: *A.Allocator) R.Result[Session, str] {
     if (R.is_err[query.QueryDb, str](res_queries)) {
         type.dnit(?s.types);
         intern.dnit(?s.interner);
-        diagnostic.ledger_dnit(?s.gate_diags);
+
         diagnostic.store_dnit(?s.diags);
         source.dnit(?s.sources);
         ret R.err[Session, str](R.unwrap_err[query.QueryDb, str](res_queries));
@@ -160,7 +168,7 @@ pub fun init(alloc: *A.Allocator) R.Result[Session, str] {
         query.dnit(?s.queries);
         type.dnit(?s.types);
         intern.dnit(?s.interner);
-        diagnostic.ledger_dnit(?s.gate_diags);
+
         diagnostic.store_dnit(?s.diags);
         source.dnit(?s.sources);
         ret R.err[Session, str](R.unwrap_err[R.Void, str](res_catalog));
@@ -238,11 +246,19 @@ pub fun dnit(s: *Session) {
     map.dnit[intern.StrId, module.StableModuleId](?s.stable_ids);
     map.dnit[module.StableModuleId, module.ModuleId](?s.stable_to_mid);
 
+    if (s.query_presentation != nil) {
+        query.presentation_dnit(s.query_presentation);
+        s.query_presentation = nil;
+    }
+    if (s.query_failure_message != nil) {
+        str_free(s.queries.a, s.query_failure_message);
+        s.query_failure_message = nil;
+    }
     query.dnit(?s.queries);
     embed.dnit(?s.embeds);
     type.dnit(?s.types);
     intern.dnit(?s.interner);
-    diagnostic.ledger_dnit(?s.gate_diags);
+
     diagnostic.store_dnit(?s.diags);
     source.dnit(?s.sources);
 }
@@ -335,6 +351,9 @@ pub fun stable_module_id(s: *Session, fqn: intern.StrId) R.Result[module.StableM
         ret R.ok[module.StableModuleId, str](@R.unwrap_ok[*module.StableModuleId, str](res_get));
     }
 
+    if (s.stable_id_next == module.STABLE_MODULE_NIL) {
+        ret R.err[module.StableModuleId, str]("stable module identities are exhausted");
+    }
     val id: module.StableModuleId = s.stable_id_next;
     val res_insert: R.Result[bool, str] = map.insert[intern.StrId, module.StableModuleId](?s.stable_ids, fqn, id);
     if (R.is_err[bool, str](res_insert)) {
@@ -391,6 +410,17 @@ pub fun export_library(s: *Session, mid: module.ModuleId, did: u32) O.Option[int
         ret O.some[intern.StrId](@R.unwrap_ok[*intern.StrId, str](res_get));
     }
     ret O.none[intern.StrId]();
+}
+
+pub fun reset_type_projection(s: *Session) R.Result[R.Void, str] {
+    if (s.queries.operation_active || s.queries.presentation_pending) {
+        ret R.err[R.Void, str]("cannot replace type projections while query products are borrowed");
+    }
+    type.field_projection_reset(?s.types);
+    map.clear[u32, u32](?s.type_aligns);
+    map.clear[u32, u32](?s.type_packed);
+    map.clear[u32, u32](?s.type_volatile);
+    ret R.ok_void[str]();
 }
 
 pub fun register_type_align(s: *Session, tid: u32, align: u32) R.Result[R.Void, str] {
@@ -659,22 +689,28 @@ pub fun module_comptime_ptr(s: *Session, mid: module.ModuleId) ptr {
     ret nil;
 }
 
+pub fun next_parse_incarnation(s: *Session) R.Result[u64, str] {
+    if (s.parse_sequence == ~(0::u64)) { ret R.err[u64, str]("parsed source incarnations are exhausted"); }
+    s.parse_sequence = s.parse_sequence + 1;
+    ret R.ok[u64, str](s.parse_sequence);
+}
+
 pub fun load_source(s: *Session, path: str, text: str) R.Result[source.FileId, str] {
+    if (s.queries.operation_active || s.queries.presentation_pending) {
+        ret R.err[source.FileId, str]("cannot change source inputs before the operation is released");
+    }
     val key_r: R.Result[str, str] = source_key(s, path);
     if (R.is_err[str, str](key_r)) { ret R.err[source.FileId, str](R.unwrap_err[str, str](key_r)); }
     val key: str = R.unwrap_ok[str, str](key_r);
     fin { str_free(s.alloc, key); }
-    val res_fid: R.Result[source.FileId, str] = source.load(?s.sources, ?s.interner, key, text);
-    if (R.is_err[source.FileId, str](res_fid)) {
-        ret res_fid;
-    }
-    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
-
-    val res_input: R.Result[R.Void, str] = query.set_input(?s.queries, query.Q_FILE_TEXT, fid::u64, text::*u8, str_len(text)::u32);
-    if (R.is_err[R.Void, str](res_input)) {
-        ret R.err[source.FileId, str](R.unwrap_err[R.Void, str](res_input));
-    }
-    ret R.ok[source.FileId, str](fid);
+    if (str_len(text) > 0xFFFFFFFF::usize) { ret R.err[source.FileId, str]("source input exceeds the query byte extent"); }
+    val staged: R.Result[source.PreparedLoad, str] = source.prepare_load(?s.sources, ?s.interner, key, text);
+    if (R.is_err[source.PreparedLoad, str](staged)) { ret R.err[source.FileId, str](R.unwrap_err[source.PreparedLoad, str](staged)); }
+    var prepared: source.PreparedLoad = R.unwrap_ok[source.PreparedLoad, str](staged);
+    fin { source.discard_load(?prepared); }
+    val input: R.Result[R.Void, str] = query.set_input(?s.queries, query.Q_FILE_TEXT, prepared.id::u64, text::*u8, str_len(text)::u32);
+    if (R.is_err[R.Void, str](input)) { ret R.err[source.FileId, str](R.unwrap_err[R.Void, str](input)); }
+    ret R.ok[source.FileId, str](source.commit_load(?prepared));
 }
 
 pub fun set_overlay(s: *Session, path: str, text: str) R.Result[R.Void, str] {
@@ -945,5 +981,156 @@ test "mach.lang.session.load_source:source_and_overlay_keys_share_native_path_id
         val literal: R.Result[source.FileId, str] = load_source(?s, "/x/src\\a.mach", "literal");
         if (R.is_err[source.FileId, str](literal) || R.unwrap_ok[source.FileId, str](literal) == fid) { ret 9; }
     }
+    ret 0;
+}
+
+
+test "mach.lang.session.stable_module_id:registry_reorder_and_exhaustion_preserve_existing_identities" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val opened: R.Result[Session, str] = init(?alloc);
+    if (R.is_err[Session, str](opened)) { ret 2; }
+    var s: Session = R.unwrap_ok[Session, str](opened);
+    fin { dnit(?s); }
+    val a: R.Result[module.StableModuleId, str] = stable_module_id(?s, 1);
+    val b: R.Result[module.StableModuleId, str] = stable_module_id(?s, 2);
+    if (R.is_err[module.StableModuleId, str](a) || R.is_err[module.StableModuleId, str](b)) { ret 3; }
+    val aid: module.StableModuleId = R.unwrap_ok[module.StableModuleId, str](a);
+    val bid: module.StableModuleId = R.unwrap_ok[module.StableModuleId, str](b);
+    if (R.is_err[R.Void, str](register_stable_mid(?s, aid, 0))
+        || R.is_err[R.Void, str](register_stable_mid(?s, bid, 1))) { ret 4; }
+    reset_module_registry(?s);
+    if (R.is_err[R.Void, str](register_stable_mid(?s, bid, 0))
+        || R.is_err[R.Void, str](register_stable_mid(?s, aid, 1))) { ret 5; }
+    if (stable_module_id_lookup(?s, 1) != aid || module_id_for_stable(?s, aid) != 1) { ret 6; }
+    s.stable_id_next = module.STABLE_MODULE_NIL;
+    val existing: R.Result[module.StableModuleId, str] = stable_module_id(?s, 1);
+    if (R.is_err[module.StableModuleId, str](existing) || R.unwrap_ok[module.StableModuleId, str](existing) != aid) { ret 7; }
+    val refused: R.Result[module.StableModuleId, str] = stable_module_id(?s, 3);
+    if (!R.is_err[module.StableModuleId, str](refused)) { ret 8; }
+    if (stable_module_id_lookup(?s, 3) != module.STABLE_MODULE_NIL || s.stable_ids.len != 2
+        || s.stable_id_next != module.STABLE_MODULE_NIL) { ret 9; }
+    ret 0;
+}
+
+fun t_source_input_compute(s: *Session, kind: query.QueryKind, key: u64, a: *A.Allocator,
+                           diags: *diagnostic.DiagnosticStore) R.Result[query.QueryOutput, fail.Fail] {
+    ret R.err[query.QueryOutput, fail.Fail](fail.message("source input unexpectedly required a derived computation"));
+}
+
+fun t_source_input(s: *Session, id: source.FileId, expected: str, stamp: *query.Revision) i32 {
+    val runtime: R.Result[query.QueryRuntime[Session], str] = query.runtime[Session](?s.queries, t_source_input_compute);
+    if (R.is_err[query.QueryRuntime[Session], str](runtime)) { ret 30; }
+    var rt: query.QueryRuntime[Session] = R.unwrap_ok[query.QueryRuntime[Session], str](runtime);
+    val opened: R.Result[query.Operation, str] = query.begin(?s.queries);
+    if (R.is_err[query.Operation, str](opened)) { ret 31; }
+    val operation: query.Operation = R.unwrap_ok[query.Operation, str](opened);
+    val read: R.Result[query.QueryView, fail.Fail] = query.get[Session](?rt, s, query.Q_FILE_TEXT, id::u64);
+    var code: i32 = 0;
+    if (R.is_err[query.QueryView, fail.Fail](read)) { code = 32; }
+    or {
+        val view: query.QueryView = R.unwrap_ok[query.QueryView, fail.Fail](read);
+        if (view.value_len::usize != str_len(expected)
+            || !memory.raw_equal(view.value::ptr, expected::ptr, str_len(expected))) { code = 33; }
+        @stamp = view.last_changed;
+    }
+    if (R.is_err[R.Void, fail.Fail](query.end(?s.queries, operation))) { code = 34; }
+    if (R.is_err[R.Void, str](query.discard(?s.queries, operation))) { code = 35; }
+    ret code;
+}
+
+fun t_source_publication_attempt(tracker: *T.Testing, existing: bool, ordinal: usize, finished: *bool) i32 {
+    val opened: R.Result[Session, str] = init(T.allocator_of(tracker));
+    if (R.is_err[Session, str](opened)) { ret 2; }
+    var s: Session = R.unwrap_ok[Session, str](opened);
+    fin { dnit(?s); }
+    val path: str = "n4/source.mach";
+    var id: source.FileId = 1;
+    var old_text: str = nil;
+    var old_lines: *usize = nil;
+    var old_stamp: query.Revision = 0;
+    if (existing) {
+        val loaded: R.Result[source.FileId, str] = load_source(?s, path, "before\ntext");
+        if (R.is_err[source.FileId, str](loaded)) { ret 3; }
+        id = R.unwrap_ok[source.FileId, str](loaded);
+        old_text = s.sources.files[id].text;
+        old_lines = s.sources.files[id].line_starts;
+        val code: i32 = t_source_input(?s, id, "before\ntext", ?old_stamp);
+        if (code != 0) { ret code; }
+    }
+    val old_len: usize = s.sources.len;
+    val old_paths: usize = s.sources.by_path.len;
+    val old_revision: query.Revision = s.queries.revision;
+    T.fail_at_ordinal(tracker, T.attempt_count(tracker) + ordinal);
+    val attempted: R.Result[source.FileId, str] = load_source(?s, path, "after\ntwo\nlines");
+    T.clear_failure(tracker);
+    if (R.is_err[source.FileId, str](attempted)) {
+        if (s.sources.len != old_len || s.sources.by_path.len != old_paths || s.queries.revision != old_revision) { ret 4; }
+        if (existing) {
+            if (s.sources.files[id].text != old_text || s.sources.files[id].line_starts != old_lines
+                || !str_equals(s.sources.files[id].text, "before\ntext")) { ret 5; }
+            var stamp: query.Revision = 0;
+            val code: i32 = t_source_input(?s, id, "before\ntext", ?stamp);
+            if (code != 0) { ret code; }
+            if (stamp != old_stamp) { ret 6; }
+        }
+    }
+    or { @finished = true; }
+    val retry: R.Result[source.FileId, str] = load_source(?s, path, "after\ntwo\nlines");
+    if (R.is_err[source.FileId, str](retry) || R.unwrap_ok[source.FileId, str](retry) != id) { ret 7; }
+    if (s.sources.len != 2 || s.sources.by_path.len != 1 || s.queries.revision != old_revision + 1) { ret 8; }
+    val file: *source.SourceFile = ?s.sources.files[id];
+    if (!str_equals(file.text, "after\ntwo\nlines") || file.line_len != 3
+        || file.line_starts[1] != 6 || file.line_starts[2] != 10) { ret 9; }
+    var new_stamp: query.Revision = 0;
+    val code: i32 = t_source_input(?s, id, "after\ntwo\nlines", ?new_stamp);
+    if (code != 0) { ret code; }
+    if (new_stamp != old_revision + 1) { ret 10; }
+    ret 0;
+}
+
+test "mach.lang.session.load_source:allocation_refusal_preserves_text_identity_and_query_stamp" {
+    var mode: u32 = 0;
+    for (mode < 2) {
+        var ordinal: usize = 1;
+        var finished: bool = false;
+        for (ordinal <= 64 && !finished) {
+            var tracker: T.Testing;
+            if (O.is_some[str](T.make(?tracker))) { ret 1; }
+            val code: i32 = t_source_publication_attempt(?tracker, mode != 0, ordinal, ?finished);
+            val leaked: bool = T.leaked(?tracker) || T.double_free_count(?tracker) != 0 || T.tracking_exhausted(?tracker);
+            T.dnit(?tracker);
+            if (code != 0) { ret code; }
+            if (leaked) { ret 11; }
+            ordinal = ordinal + 1;
+        }
+        if (!finished || ordinal <= 2) { ret 12; }
+        mode = mode + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.session.load_source:active_and_pending_operations_refuse_before_source_mutation" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val opened: R.Result[Session, str] = init(?alloc);
+    if (R.is_err[Session, str](opened)) { ret 2; }
+    var s: Session = R.unwrap_ok[Session, str](opened);
+    fin { dnit(?s); }
+    val loaded: R.Result[source.FileId, str] = load_source(?s, "n4/source.mach", "before");
+    if (R.is_err[source.FileId, str](loaded)) { ret 3; }
+    val id: source.FileId = R.unwrap_ok[source.FileId, str](loaded);
+    val text: str = s.sources.files[id].text;
+    val revision: query.Revision = s.queries.revision;
+    val started: R.Result[query.Operation, str] = query.begin(?s.queries);
+    if (R.is_err[query.Operation, str](started)) { ret 4; }
+    val operation: query.Operation = R.unwrap_ok[query.Operation, str](started);
+    if (!R.is_err[source.FileId, str](load_source(?s, "n4/source.mach", "after"))) { ret 5; }
+    if (R.is_err[R.Void, fail.Fail](query.end(?s.queries, operation))) { ret 6; }
+    if (!R.is_err[source.FileId, str](load_source(?s, "n4/new.mach", "new"))) { ret 7; }
+    if (s.sources.len != 2 || s.sources.by_path.len != 1 || s.sources.files[id].text != text
+        || !str_equals(text, "before") || s.queries.revision != revision) { ret 8; }
+    if (R.is_err[R.Void, str](query.discard(?s.queries, operation))) { ret 9; }
+    if (R.is_err[source.FileId, str](load_source(?s, "n4/source.mach", "after"))) { ret 10; }
     ret 0;
 }

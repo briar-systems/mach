@@ -22,6 +22,8 @@ use R: std.types.result;
 use ctime: std.chrono.time;
 
 use mach.lang.build.request;
+use mach.lang.build.outcome;
+use std.collections.vector;
 use mach.lang.diagnostic;
 use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
@@ -338,7 +340,6 @@ fun module_context(p: *project.Project, req: *request.BuildRequest) R.Result[com
         p.compiler_name,
         p.compiler_ver
     );
-    comptime.set_diagnostics(?ctx, ?p.s.diags);
     comptime.set_target_defs(?ctx, p.target.isa.defs);
     comptime.set_va_list(?ctx, p.target.va_list_size, p.target.va_list_align);
     comptime.set_union_build(?ctx, p.union);
@@ -419,8 +420,6 @@ fun register_module_slot(p: *project.Project, fqn: intern.StrId) R.Result[sessio
     m.sema_result       = nil;
     m.ir_module         = nil;
     m.object_image      = nil;
-    m.staged_ir         = nil;
-    m.staged_home       = nil;
     m.staged_image      = nil;
     m.target_gated      = false;
     m.load_outcome      = comptime.GATE_ACTIVE;
@@ -567,27 +566,68 @@ fun parse_module(p: *project.Project, mid: session.ModuleId, fqn: intern.StrId) 
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
     m.file_id = file_id;
 
-    val e_r: R.Result[*query.QueryEntry, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_PARSE, file_id::u64);
-    if (R.is_err[*query.QueryEntry, fail.Fail](e_r)) {
-        val f: fail.Fail = R.unwrap_err[*query.QueryEntry, fail.Fail](e_r);
-        if (f.kind == fail.REPORTED) { fail.reject(?m.parse_status); }
-        or { fail.internal(?m.parse_status, f.message); }
-        ret R.err[R.Void, str](f.message);
-    }
-    val a: *ast.Ast = ast_handle_decode(R.unwrap_ok[*query.QueryEntry, fail.Fail](e_r));
-    if (a == nil) { ret R.err[R.Void, str]("Q_PARSE produced no AST handle"); }
-    m.a = a;
-    m.parse_status = (R.unwrap_ok[*query.QueryEntry, fail.Fail](e_r).value::ptr::*ParsedModule).status;
-    ret comptime.prepare_gates(?m.ctx, a.expr_len::u32, a.decl_len::u32);
+    val acquired: R.Result[R.Void, str] = acquire_load_view(p, mid, 0);
+    if (R.is_err[R.Void, str](acquired)) { ret acquired; }
+    ret comptime.prepare_gates(?p.modules[mid::u32].ctx,
+        p.modules[mid::u32].a.expr_len::u32, p.modules[mid::u32].a.decl_len::u32);
 }
 
-pub fun q_parse_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, fail.Fail] {
+fun acquire_parse_view(p: *project.Project, mid: session.ModuleId) R.Result[R.Void, fail.Fail] {
+    val m: *project.ModuleEntry = ?p.modules[mid::u32];
+    val acquired: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_PARSE, m.file_id::u64);
+    if (R.is_err[query.QueryView, fail.Fail](acquired)) {
+        val failure: fail.Fail = R.unwrap_err[query.QueryView, fail.Fail](acquired);
+        if (failure.kind == fail.REPORTED) { fail.reject(?m.parse_status); }
+        or { fail.internal(?m.parse_status, failure.message); }
+        ret R.err[R.Void, fail.Fail](failure);
+    }
+    val owner: query.QueryView = R.unwrap_ok[query.QueryView, fail.Fail](acquired);
+    val a: *ast.Ast = ast_handle_decode(owner);
+    if (a == nil) { ret R.err[R.Void, fail.Fail](fail.message("Q_PARSE produced no AST handle")); }
+    m.a = a;
+    m.parse_status = (owner.value::ptr::*ParsedModule).status;
+    ret R.ok_void[fail.Fail]();
+}
+
+fun acquire_load_view(p: *project.Project, mid: session.ModuleId, incarnation: u64) R.Result[R.Void, str] {
+    val begun: R.Result[query.Operation, outcome.Fail] = project.begin_query_phase(p);
+    if (R.is_err[query.Operation, outcome.Fail](begun)) { ret R.err[R.Void, str](R.unwrap_err[query.Operation, outcome.Fail](begun).message); }
+    val operation: query.Operation = R.unwrap_ok[query.Operation, outcome.Fail](begun);
+    var result: R.Result[R.Void, outcome.Fail] = R.ok_void[outcome.Fail]();
+    val acquired: R.Result[R.Void, fail.Fail] = acquire_parse_view(p, mid);
+    if (R.is_err[R.Void, fail.Fail](acquired)) { result = R.err[R.Void, outcome.Fail](outcome.from_fail(R.unwrap_err[R.Void, fail.Fail](acquired))); }
+    or (incarnation != 0 && p.modules[mid::u32].a.incarnation != incarnation) {
+        result = R.err[R.Void, outcome.Fail](outcome.internal("module syntax changed during dependency discovery"));
+    }
+    var root: query.QueryKey = query.QueryKey{ kind: query.Q_PARSE, key: p.modules[mid::u32].file_id::u64 };
+    var count: usize = 0;
+    if (R.is_err[R.Void, outcome.Fail](result)) { count = 1; }
+    val finished: R.Result[R.Void, outcome.Fail] = project.finish_query_phase(p, operation, ?root, count, result);
+    if (R.is_err[R.Void, outcome.Fail](finished)) { ret R.err[R.Void, str](R.unwrap_err[R.Void, outcome.Fail](finished).message); }
+    ret R.ok_void[str]();
+}
+
+pub fun parsed_definition(ctx: ptr, mid: session.ModuleId) R.Result[resolve.ParsedDefinition, fail.Fail] {
+    val p: *project.Project = ctx::*project.Project;
+    if (p == nil || mid == session.MODULE_NIL || mid::u32 >= p.module_len) {
+        ret R.err[resolve.ParsedDefinition, fail.Fail](fail.message("parsed definition module is not in the active project"));
+    }
+    val file_id: src.FileId = p.modules[mid::u32].file_id;
+    val acquired: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_PARSE, file_id::u64);
+    if (R.is_err[query.QueryView, fail.Fail](acquired)) { ret R.err[resolve.ParsedDefinition, fail.Fail](R.unwrap_err[query.QueryView, fail.Fail](acquired)); }
+    val a: *ast.Ast = ast_handle_decode(R.unwrap_ok[query.QueryView, fail.Fail](acquired));
+    if (a == nil) { ret R.err[resolve.ParsedDefinition, fail.Fail](fail.message("parsed definition query produced no AST owner")); }
+    p.modules[mid::u32].a = a;
+    ret R.ok[resolve.ParsedDefinition, fail.Fail](resolve.ParsedDefinition{ a: a, owner: resolve.type_owner(p.s, mid, file_id), incarnation: a.incarnation });
+}
+
+pub fun q_parse_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[query.QueryOutput, fail.Fail] {
     val db: *query.QueryDb = ?p.s.queries;
     val s: *session.Session = p.s;
     val file_id: src.FileId = key::u32;
 
-    val rd: R.Result[R.Void, str] = query.record_dep(db, query.Q_PARSE, key, query.Q_FILE_TEXT, key);
-    if (R.is_err[R.Void, str](rd)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rd))); }
+    val rd: R.Result[R.Void, fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_FILE_TEXT, key);
+    if (R.is_err[R.Void, fail.Fail](rd)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[R.Void, fail.Fail](rd)); }
 
     val file_opt: O.Option[*src.SourceFile] = src.get(?s.sources, file_id);
     if (O.is_none[*src.SourceFile](file_opt)) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_PARSE: FileId not registered with the session")); }
@@ -604,15 +644,23 @@ pub fun q_parse_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.Re
     }
     val a: *ast.Ast = R.unwrap_ok[*ast.Ast, str](ar);
     a[0] = ast.init(alloc, file_id);
+    val incarnation: R.Result[u64, str] = session.next_parse_incarnation(s);
+    if (R.is_err[u64, str](incarnation)) {
+        ast.dnit(a);
+        A.deallocate[ast.Ast](alloc, a, 1);
+        lexer.dnit(?stream, alloc);
+        ret fail.lift[query.QueryOutput](R.err[query.QueryOutput, str](R.unwrap_err[u64, str](incarnation)));
+    }
+    a.incarnation = R.unwrap_ok[u64, str](incarnation);
 
-    val le_r: R.Result[R.Void, str] = lexer.emit_diagnostics(?stream, ?s.diags);
+    val le_r: R.Result[R.Void, str] = lexer.emit_diagnostics(?stream, diags);
     if (R.is_err[R.Void, str](le_r)) {
         ast.dnit(a);
         A.deallocate[ast.Ast](alloc, a, 1::usize);
         lexer.dnit(?stream, alloc);
         ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](le_r)));
     }
-    val parse_r: R.Result[fail.PhaseStatus, state.ParseFail] = parser.parse(?stream, a, ?s.diags);
+    val parse_r: R.Result[fail.PhaseStatus, state.ParseFail] = parser.parse(?stream, a, diags);
     lexer.dnit(?stream, alloc);
     if (R.is_err[fail.PhaseStatus, state.ParseFail](parse_r)) {
         ast.dnit(a);
@@ -655,15 +703,15 @@ fun ast_handle_encode(alloc: *A.Allocator, a: *ast.Ast, status: fail.PhaseStatus
     ret R.ok[query.QueryOutput, str](out);
 }
 
-fun ast_handle_decode(e: *query.QueryEntry) *ast.Ast {
+fun ast_handle_decode(e: query.QueryView) *ast.Ast {
     if (e.value == nil || e.value_len::usize < $size_of(ParsedModule)) { ret nil; }
     ret (e.value::ptr::*ParsedModule).a;
 }
 
-pub fun q_exports_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, fail.Fail] {
-    val e_r: R.Result[*query.QueryEntry, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_RESOLVE, key);
-    if (R.is_err[*query.QueryEntry, fail.Fail](e_r)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[*query.QueryEntry, fail.Fail](e_r)); }
-    val rr: *resolve.ResolveResult = dq.resolve_handle_decode(R.unwrap_ok[*query.QueryEntry, fail.Fail](e_r));
+pub fun q_exports_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[query.QueryOutput, fail.Fail] {
+    val e_r: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_RESOLVE, key);
+    if (R.is_err[query.QueryView, fail.Fail](e_r)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[query.QueryView, fail.Fail](e_r)); }
+    val rr: *resolve.ResolveResult = dq.resolve_handle_decode(R.unwrap_ok[query.QueryView, fail.Fail](e_r));
     if (rr == nil) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_EXPORTS: module has no resolve result")); }
 
     var fb: dq.FpBuf;
@@ -672,7 +720,21 @@ pub fun q_exports_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.
     fb.len   = 0;
     fb.cap   = 0;
 
-    val wr: R.Result[R.Void, str] = fp_pub_surface(?fb, rr);
+    var definition_revision: query.Revision = 0;
+    var i: u32 = 0;
+    for (i < rr.public_constant_count) {
+        if (rr.public_constants[i].present && rr.public_constants[i].value.kind == comptime.CT_KIND_CONST_ELEM) {
+            val mid: session.ModuleId = session.module_id_for_stable(p.s, key::u32::session.StableModuleId);
+            if (mid == session.MODULE_NIL) { dq.fp_free(?fb); ret R.err[query.QueryOutput, fail.Fail](fail.message("constant definition is not loaded")); }
+            val observed: R.Result[query.Revision, fail.Fail] = query.revision[project.Project](?p.queries, p,
+                query.Q_PARSE, p.modules[mid::u32].file_id::u64);
+            if (R.is_err[query.Revision, fail.Fail](observed)) { dq.fp_free(?fb); ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[query.Revision, fail.Fail](observed)); }
+            definition_revision = R.unwrap_ok[query.Revision, fail.Fail](observed);
+            brk;
+        }
+        i = i + 1;
+    }
+    val wr: R.Result[R.Void, str] = dq.fp_public_surface(?fb, rr, key::u32::session.StableModuleId, definition_revision);
     if (R.is_err[R.Void, str](wr)) {
         if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](alloc, fb.buf, fb.cap::usize); }
         ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](wr)));
@@ -681,35 +743,9 @@ pub fun q_exports_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.
     ret fail.lift[query.QueryOutput](dq.fp_take(?fb));
 }
 
-fun fp_pub_surface(fb: *dq.FpBuf, rr: *resolve.ResolveResult) R.Result[R.Void, str] {
-    val pc: R.Result[R.Void, str] = dq.fp_u32(fb, rr.pub_count);
-    if (R.is_err[R.Void, str](pc)) { ret pc; }
-    if (rr.symbols == nil)       { ret R.ok_void[str](); }
-    var i: u32 = 0;
-    for (i < rr.pub_count) {
-        val sym: *resolve.Symbol = ?rr.symbols[i];
-        val rk: R.Result[R.Void, str] = dq.fp_u8(fb, sym.kind::u8);             if (R.is_err[R.Void, str](rk)) { ret rk; }
-        val rn: R.Result[R.Void, str] = dq.fp_u32(fb, sym.name::u32);          if (R.is_err[R.Void, str](rn)) { ret rn; }
-        val rdl: R.Result[R.Void, str] = dq.fp_u32(fb, sym.decl::u32);         if (R.is_err[R.Void, str](rdl)) { ret rdl; }
-        val ro: R.Result[R.Void, str] = dq.fp_u32(fb, sym.origin_stable::u32); if (R.is_err[R.Void, str](ro)) { ret ro; }
-        var slot_fp: u32 = sym.slot;
-        if (sym.kind == resolve.SYM_USE) { slot_fp = sym.slot_stable::u32; }
-        val rs: R.Result[R.Void, str] = dq.fp_u32(fb, slot_fp);                if (R.is_err[R.Void, str](rs)) { ret rs; }
-        i = i + 1;
-    }
-
-    val rl: R.Result[R.Void, str] = dq.fp_u32(fb, rr.pub_const_fp_len);
-    if (R.is_err[R.Void, str](rl)) { ret rl; }
-    var b: u32 = 0;
-    for (b < rr.pub_const_fp_len) {
-        val rb: R.Result[R.Void, str] = dq.fp_u8(fb, rr.pub_const_fp[b]);
-        if (R.is_err[R.Void, str](rb)) { ret rb; }
-        b = b + 1;
-    }
-    ret R.ok_void[str]();
-}
-
 fun walk_module_for_load(p: *project.Project, mid: session.ModuleId) R.Result[comptime.GateOutcome, str] {
+    val acquired: R.Result[R.Void, str] = acquire_load_view(p, mid, 0);
+    if (R.is_err[R.Void, str](acquired)) { ret R.err[comptime.GateOutcome, str](R.unwrap_err[R.Void, str](acquired)); }
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
     val m_opt: O.Option[*module.Module] = ast.get_module(m.a, m.a.root_module);
     if (O.is_none[*module.Module](m_opt)) { ret R.err[comptime.GateOutcome, str]("module root not set on Ast"); }
@@ -760,10 +796,31 @@ pub fun deferred_gate_count(p: *project.Project) u32 {
 }
 
 fun walk_decl_list_for_load(p: *project.Project, mid: session.ModuleId, start: u32, len: u32) R.Result[comptime.GateOutcome, str] {
+    val refreshed: R.Result[R.Void, str] = acquire_load_view(p, mid, 0);
+    if (R.is_err[R.Void, str](refreshed)) { ret R.err[comptime.GateOutcome, str](R.unwrap_err[R.Void, str](refreshed)); }
+    val a: *ast.Ast = p.modules[mid::u32].a;
+    val incarnation: u64 = a.incarnation;
+    if (start::usize > a.decl_id_len || len::usize > a.decl_id_len - start::usize) {
+        ret R.err[comptime.GateOutcome, str]("load declaration list exceeds its parsed owner");
+    }
+    var work: vector.Vector[id.DeclId] = vector.init[id.DeclId](p.alloc);
+    fin { vector.dnit[id.DeclId](?work); }
+    var wi: u32 = 0;
+    for (wi < len) {
+        val saved: R.Result[usize, str] = vector.push[id.DeclId](?work, a.decl_ids[start + wi]);
+        if (R.is_err[usize, str](saved)) { ret R.err[comptime.GateOutcome, str](R.unwrap_err[usize, str](saved)); }
+        wi = wi + 1;
+    }
+    var sequence: u64 = p.s.queries.operation_sequence;
     var deferred: bool = false;
     var i: u32 = 0;
     for (i < len) {
-        val did: id.DeclId = (?p.modules[mid::u32]).a.decl_ids[start + i];
+        if (p.s.queries.operation_sequence != sequence) {
+            val current: R.Result[R.Void, str] = acquire_load_view(p, mid, incarnation);
+            if (R.is_err[R.Void, str](current)) { ret R.err[comptime.GateOutcome, str](R.unwrap_err[R.Void, str](current)); }
+            sequence = p.s.queries.operation_sequence;
+        }
+        val did: id.DeclId = work.data[i];
         val r: R.Result[comptime.GateOutcome, str] = walk_one_decl_for_load(p, mid, did);
         if (R.is_err[comptime.GateOutcome, str](r)) { ret r; }
         val outcome: comptime.GateOutcome = R.unwrap_ok[comptime.GateOutcome, str](r);
@@ -779,7 +836,8 @@ fun walk_one_decl_for_load(p: *project.Project, mid: session.ModuleId, did: id.D
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
     val d_opt: O.Option[*decl.Decl] = ast.get_decl(m.a, did);
     if (O.is_none[*decl.Decl](d_opt)) { ret R.err[comptime.GateOutcome, str]("DeclId out of range during walk"); }
-    val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+    var copied: decl.Decl = @O.unwrap[*decl.Decl](d_opt);
+    val d: *decl.Decl = ?copied;
 
     if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
         ret walk_comptime_if_for_load(p, mid, did, ?d.data.comptime_if);
@@ -898,7 +956,7 @@ fun comptime_branch_active_load(p: *project.Project, mid: session.ModuleId, br: 
     lc.p   = p;
     lc.mid = mid;
     val caps_r: R.Result[comptime.PhaseCapabilities[LoadMemberCtx], str] =
-        comptime.loading_capabilities[LoadMemberCtx](resolve_module_member_const_load);
+        comptime.loading_capabilities[LoadMemberCtx](resolve_module_member_const_load, ?p.diags);
     if (R.is_err[comptime.PhaseCapabilities[LoadMemberCtx], str](caps_r)) {
         ret R.err[comptime.GateOutcome, str](R.unwrap_err[comptime.PhaseCapabilities[LoadMemberCtx], str](caps_r));
     }
@@ -917,7 +975,7 @@ fun comptime_branch_active_load(p: *project.Project, mid: session.ModuleId, br: 
     if (v.outcome == comptime.GATE_AWAITING_LAYOUT) {
         if (!emit_diag) { ret R.ok[comptime.GateOutcome, str](comptime.GATE_AWAITING_LAYOUT); }
         fail.reject(?m.load_status);
-        val committed_r: R.Result[bool, str] = diagnostic.gate_error(?p.s.gate_diags, ?p.s.diags, ?p.s.interner, m.file_id, v.span, v.message);
+        val committed_r: R.Result[bool, str] = diagnostic.gate_error(?p.diags, ?p.s.interner, m.file_id, v.span, v.message);
         if (R.is_err[bool, str](committed_r)) { ret R.err[comptime.GateOutcome, str](R.unwrap_err[bool, str](committed_r)); }
         ret R.ok[comptime.GateOutcome, str](comptime.GATE_FAILED);
     }
@@ -925,7 +983,7 @@ fun comptime_branch_active_load(p: *project.Project, mid: session.ModuleId, br: 
         if (emit_diag) { fail.reject(?m.load_status); }
         if (emit_diag && str_len(v.message) > 0) {
             fail.reject(?m.load_status);
-            val committed_r: R.Result[bool, str] = diagnostic.gate_error(?p.s.gate_diags, ?p.s.diags, ?p.s.interner, m.file_id, v.span, v.message);
+            val committed_r: R.Result[bool, str] = diagnostic.gate_error(?p.diags, ?p.s.interner, m.file_id, v.span, v.message);
             if (R.is_err[bool, str](committed_r)) { ret R.err[comptime.GateOutcome, str](R.unwrap_err[bool, str](committed_r)); }
         }
         ret R.ok[comptime.GateOutcome, str](comptime.GATE_REJECTED);
@@ -933,12 +991,12 @@ fun comptime_branch_active_load(p: *project.Project, mid: session.ModuleId, br: 
     if (v.outcome == comptime.GATE_FAILED) {
         if (emit_diag && v.depends != intern.STR_NIL) {
             fail.reject(?m.load_status);
-            val committed_r: R.Result[bool, str] = diagnostic.gate_error_named(?p.s.gate_diags, ?p.s.diags, ?p.s.interner, m.file_id, v.span, v.depends, v.message);
+            val committed_r: R.Result[bool, str] = diagnostic.gate_error_named(?p.diags, ?p.s.interner, m.file_id, v.span, v.depends, v.message);
             if (R.is_err[bool, str](committed_r)) { ret R.err[comptime.GateOutcome, str](R.unwrap_err[bool, str](committed_r)); }
         }
         or (emit_diag) {
             fail.reject(?m.load_status);
-            val committed_r: R.Result[bool, str] = diagnostic.gate_error(?p.s.gate_diags, ?p.s.diags, ?p.s.interner, m.file_id, v.span, v.message);
+            val committed_r: R.Result[bool, str] = diagnostic.gate_error(?p.diags, ?p.s.interner, m.file_id, v.span, v.message);
             if (R.is_err[bool, str](committed_r)) { ret R.err[comptime.GateOutcome, str](R.unwrap_err[bool, str](committed_r)); }
         }
         ret R.ok[comptime.GateOutcome, str](comptime.GATE_FAILED);
@@ -1087,9 +1145,20 @@ fun walk_comptime_if_union(p: *project.Project, mid: session.ModuleId, did: id.D
         ti = ti + 1;
     }
 
+    val incarnation: u64 = m.a.incarnation;
+    var sequence: u64 = p.s.queries.operation_sequence;
     var bi: u32 = 0;
     for (bi < n) {
         if (taken[bi]) {
+            if (p.s.queries.operation_sequence != sequence) {
+                val current: R.Result[R.Void, str] = acquire_load_view(p, mid, incarnation);
+                if (R.is_err[R.Void, str](current)) {
+                    A.deallocate[bool](p.alloc, coverage, coverage_len);
+                    A.deallocate[bool](p.alloc, taken, n::usize);
+                    ret R.err[comptime.GateOutcome, str](R.unwrap_err[R.Void, str](current));
+                }
+                sequence = p.s.queries.operation_sequence;
+            }
             val br: *decl.ComptimeBranch = ?(?p.modules[mid::u32]).a.comptime_branches[ci.branches_start + bi];
             val saved_filter: *bool = p.union_tuple_filter;
             p.union_tuple_filter = ?coverage[bi::usize * tuple_count];
@@ -1174,6 +1243,14 @@ fun walk_use_for_load(p: *project.Project, mid: session.ModuleId, du: *decl.Decl
     val tgt_r: R.Result[UseTarget, str] = resolve_use_target(p, source, du.path);
     if (R.is_err[UseTarget, str](tgt_r)) { ret R.err[R.Void, str](R.unwrap_err[UseTarget, str](tgt_r)); }
     val ut: UseTarget = R.unwrap_ok[UseTarget, str](tgt_r);
+    var bound: intern.StrId = intern.STR_NIL;
+    if (ut.binds_module) {
+        val name: R.Result[intern.StrId, str] = use_bound_name(p, source, du, ut);
+        if (R.is_err[intern.StrId, str](name)) { ret R.err[R.Void, str](R.unwrap_err[intern.StrId, str](name)); }
+        bound = R.unwrap_ok[intern.StrId, str](name);
+    }
+    val alias: bool = du.alias.len > 0;
+    val span: token.Span = du.path;
 
     val dep_r: R.Result[session.ModuleId, str] = dfs_load(p, ut.module_fqn);
     if (R.is_err[session.ModuleId, str](dep_r)) { ret R.err[R.Void, str](R.unwrap_err[session.ModuleId, str](dep_r)); }
@@ -1184,19 +1261,11 @@ fun walk_use_for_load(p: *project.Project, mid: session.ModuleId, du: *decl.Decl
 
     if (propagate_target_gate(p, mid, dep_mid)) { ret R.ok_void[str](); }
 
-    if (ut.binds_module) {
-        val name_r: R.Result[intern.StrId, str] = use_bound_name(p, source, du, ut);
-        if (R.is_err[intern.StrId, str](name_r)) { ret R.err[R.Void, str](R.unwrap_err[intern.StrId, str](name_r)); }
-        ret record_mod_ref(p, mid, R.unwrap_ok[intern.StrId, str](name_r), dep_mid);
-    }
-
-    if (du.alias.len > 0) {
-        ret R.ok_void[str]();
-    }
-
-    val rec_r: R.Result[R.Void, str] = record_const_import(p, mid, ut.leaf, dep_mid, du.path);
+    if (ut.binds_module) { ret record_mod_ref(p, mid, bound, dep_mid); }
+    if (alias) { ret R.ok_void[str](); }
+    val rec_r: R.Result[R.Void, str] = record_const_import(p, mid, ut.leaf, dep_mid, span);
     if (R.is_err[R.Void, str](rec_r)) { ret rec_r; }
-    ret merge_pub_consts(p, mid, dep_mid, ut.leaf, du.path);
+    ret merge_pub_consts(p, mid, dep_mid, ut.leaf, span);
 }
 
 fun record_const_import(p: *project.Project, mid: session.ModuleId, name: intern.StrId, dep_mid: session.ModuleId, span: token.Span) R.Result[R.Void, str] {
@@ -1508,7 +1577,7 @@ pub fun check_gated_const_imports(p: *project.Project) R.Result[R.Void, str] {
             if (pc.gated) {
                 val msg: str = gated_const_message(p.s, ?m.load_status, ci.name, dep.fqn);
                 fail.reject(?m.load_status);
-                val committed_r: R.Result[bool, str] = diagnostic.gate_error(?p.s.gate_diags, ?p.s.diags, ?p.s.interner, m.file_id, ci.span, msg);
+                val committed_r: R.Result[bool, str] = diagnostic.gate_error(?p.diags, ?p.s.interner, m.file_id, ci.span, msg);
                 if (R.is_err[bool, str](committed_r)) { ret R.void_of[bool, str](committed_r); }
             }
             j = j + 1;
@@ -1527,7 +1596,7 @@ fun merge_pub_consts(p: *project.Project, mid: session.ModuleId, dep_mid: sessio
     if (pc.gated && p.union) {
         val msg: str = gated_const_message(p.s, ?m.load_status, leaf, dep.fqn);
         fail.reject(?m.load_status);
-        ret R.void_of[bool, str](diagnostic.gate_error(?p.s.gate_diags, ?p.s.diags, ?p.s.interner, m.file_id, span, msg));
+        ret R.void_of[bool, str](diagnostic.gate_error(?p.diags, ?p.s.interner, m.file_id, span, msg));
     }
     ret comptime.bind(?m.ctx, leaf, pc.value);
 }
@@ -1550,7 +1619,7 @@ pub fun remerge_tuple_pub_consts(p: *project.Project, mid: session.ModuleId, ti:
         if (pc.gated && p.union) {
             val msg: str = gated_const_message(p.s, ?m.load_status, ci.name, dep.fqn);
             fail.reject(?m.load_status);
-            val committed_r: R.Result[bool, str] = diagnostic.gate_error(?p.s.gate_diags, ?p.s.diags, ?p.s.interner, m.file_id, ci.span, msg);
+            val committed_r: R.Result[bool, str] = diagnostic.gate_error(?p.diags, ?p.s.interner, m.file_id, ci.span, msg);
             if (R.is_err[bool, str](committed_r)) { ret R.err[bool, str](R.unwrap_err[bool, str](committed_r)); }
             bound = bound + 1;
             i = i + 1;
@@ -1632,7 +1701,7 @@ fun resolve_module_member_const_load(lc: *LoadMemberCtx, eid: id.ExprId) R.Resul
     if (pc.gated && lc.p.union) {
         val msg: str = gated_const_message(lc.p.s, ?m.load_status, name, dep.fqn);
         fail.reject(?m.load_status);
-        val committed_r: R.Result[bool, str] = diagnostic.gate_error(?lc.p.s.gate_diags, ?lc.p.s.diags, ?lc.p.s.interner, m.file_id, node.data.member.name, msg);
+        val committed_r: R.Result[bool, str] = diagnostic.gate_error(?lc.p.diags, ?lc.p.s.interner, m.file_id, node.data.member.name, msg);
         if (R.is_err[bool, str](committed_r)) { ret R.err[O.Option[comptime.CTValue], comptime.EvalFail](comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, R.unwrap_err[bool, str](committed_r))); }
         ret R.ok[O.Option[comptime.CTValue], comptime.EvalFail](O.none[comptime.CTValue]());
     }
@@ -1652,7 +1721,7 @@ pub fun eval_for_load(
     lc.mid = mid;
     val lcp: *LoadMemberCtx = ?lc;
     val caps_r: R.Result[comptime.PhaseCapabilities[LoadMemberCtx], str] =
-        comptime.loading_capabilities[LoadMemberCtx](resolve_module_member_const_load);
+        comptime.loading_capabilities[LoadMemberCtx](resolve_module_member_const_load, ?p.diags);
     if (R.is_err[comptime.PhaseCapabilities[LoadMemberCtx], str](caps_r)) {
         var f: comptime.EvalFail;
         f.kind    = comptime.EVAL_FAIL_INTERNAL;
@@ -1863,30 +1932,87 @@ fun topo_push(p: *project.Project, mid: session.ModuleId) R.Result[R.Void, str] 
 }
 
 pub fun register_module_asts(p: *project.Project) R.Result[R.Void, str] {
+    var roots: vector.Vector[query.QueryKey] = vector.init[query.QueryKey](p.alloc);
+    fin { vector.dnit[query.QueryKey](?roots); }
     var i: u32 = 0;
     for (i < p.module_len) {
         val m: *project.ModuleEntry = ?p.modules[i];
-        val r: R.Result[R.Void, str] = session.register_module_identity(p.s, i, m.a, m.fqn, m.stable_id);
-        if (R.is_err[R.Void, str](r)) { unpublish_modules(p, i); ret r; }
-
-        var num: u32 = i::u32;
+        if (m.file_id == src.FILE_NIL) { i = i + 1; cnt; }
+        var num: u32 = i;
         val rn: R.Result[R.Void, str] = query.set_input(?p.s.queries, query.Q_MODULE_NUMBER, m.stable_id::u64, (?num)::*u8, 4);
-        if (R.is_err[R.Void, str](rn)) {
-            session.unregister_module_identity(p.s, i, m.stable_id);
-            unpublish_modules(p, i);
-            ret rn;
-        }
+        if (R.is_err[R.Void, str](rn)) { ret rn; }
+        val saved: R.Result[usize, str] = vector.push[query.QueryKey](?roots, query.QueryKey{ kind: query.Q_PARSE, key: m.file_id::u64 });
+        if (R.is_err[usize, str](saved)) { ret R.err[R.Void, str](R.unwrap_err[usize, str](saved)); }
         i = i + 1;
+    }
+    val begun: R.Result[query.Operation, outcome.Fail] = project.begin_query_phase(p);
+    if (R.is_err[query.Operation, outcome.Fail](begun)) { ret R.err[R.Void, str](R.unwrap_err[query.Operation, outcome.Fail](begun).message); }
+    val operation: query.Operation = R.unwrap_ok[query.Operation, outcome.Fail](begun);
+    var result: R.Result[R.Void, outcome.Fail] = R.ok_void[outcome.Fail]();
+    i = 0;
+    for (i < p.module_len) {
+        if (p.modules[i].file_id == src.FILE_NIL) { i = i + 1; cnt; }
+        val acquired: R.Result[R.Void, fail.Fail] = acquire_parse_view(p, i::session.ModuleId);
+        if (R.is_err[R.Void, fail.Fail](acquired)) { result = R.err[R.Void, outcome.Fail](outcome.from_fail(R.unwrap_err[R.Void, fail.Fail](acquired))); brk; }
+        val m: *project.ModuleEntry = ?p.modules[i];
+        val registered: R.Result[R.Void, str] = session.register_module_identity(p.s, i, m.a, m.fqn, m.stable_id);
+        if (R.is_err[R.Void, str](registered)) { result = R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](registered))); brk; }
+        i = i + 1;
+    }
+    val finished: R.Result[R.Void, outcome.Fail] = project.finish_query_phase(p, operation, roots.data, roots.len, result);
+    if (R.is_err[R.Void, outcome.Fail](finished)) {
+        var j: u32 = 0;
+        for (j < i) { session.unregister_module_identity(p.s, j, p.modules[j].stable_id); j = j + 1; }
+        ret R.err[R.Void, str](R.unwrap_err[R.Void, outcome.Fail](finished).message);
     }
     ret R.ok_void[str]();
 }
 
-fun unpublish_modules(p: *project.Project, published: u32) {
-    var j: u32 = 0;
-    for (j < published) {
-        val m: *project.ModuleEntry = ?p.modules[j];
-        session.unregister_module_identity(p.s, j, m.stable_id);
-        query.invalidate(?p.s.queries, query.Q_MODULE_NUMBER, m.stable_id::u64);
-        j = j + 1;
+pub fun acquire_loaded_parses(p: *project.Project) R.Result[R.Void, fail.Fail] {
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        if (p.modules[i].file_id != src.FILE_NIL) {
+            val acquired: R.Result[R.Void, fail.Fail] = acquire_parse_view(p, i::session.ModuleId);
+            if (R.is_err[R.Void, fail.Fail](acquired)) { ret acquired; }
+        }
+        i = i + 1;
     }
+    ret R.ok_void[fail.Fail]();
+}
+
+pub fun collect_loaded_parses(p: *project.Project, primary: R.Result[R.Void, outcome.Fail]) R.Result[R.Void, outcome.Fail] {
+    var roots: vector.Vector[query.QueryKey] = vector.init[query.QueryKey](p.alloc);
+    fin { vector.dnit[query.QueryKey](?roots); }
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        val file: src.FileId = p.modules[i].file_id;
+        if (file != src.FILE_NIL) {
+            val added: R.Result[usize, str] = vector.push[query.QueryKey](?roots, query.QueryKey{ kind: query.Q_PARSE, key: file::u64 });
+            if (R.is_err[usize, str](added)) {
+                diagnostic.note_lost(?p.s.diags);
+                if (R.is_err[R.Void, outcome.Fail](primary)) { ret primary; }
+                ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[usize, str](added)));
+            }
+        }
+        i = i + 1;
+    }
+    val begun: R.Result[query.Operation, outcome.Fail] = project.begin_query_phase(p);
+    if (R.is_err[query.Operation, outcome.Fail](begun)) {
+        if (R.is_err[R.Void, outcome.Fail](primary)) { ret primary; }
+        ret R.err[R.Void, outcome.Fail](R.unwrap_err[query.Operation, outcome.Fail](begun));
+    }
+    val operation: query.Operation = R.unwrap_ok[query.Operation, outcome.Fail](begun);
+    var result: R.Result[R.Void, outcome.Fail] = primary;
+    i = 0;
+    for (i < p.module_len) {
+        if (p.modules[i].file_id != src.FILE_NIL) {
+            val acquired: R.Result[R.Void, fail.Fail] = acquire_parse_view(p, i::session.ModuleId);
+            if (R.is_err[R.Void, fail.Fail](acquired)) {
+                if (R.is_ok[R.Void, outcome.Fail](result)) { result = R.err[R.Void, outcome.Fail](outcome.from_fail(R.unwrap_err[R.Void, fail.Fail](acquired))); }
+                brk;
+            }
+        }
+        i = i + 1;
+    }
+    ret project.finish_query_phase(p, operation, roots.data, roots.len, result);
 }

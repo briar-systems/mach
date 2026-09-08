@@ -1,4 +1,5 @@
 use std.text.string.str_free;
+use std.text.string.str_dup;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -11,6 +12,8 @@ use O: std.types.option;
 use R: std.types.result;
 
 use std.data.toml;
+use std.collections.vector;
+use std.collections.vector.Vector;
 
 use mach.lang.be.codegen.dwarf;
 use mach.lang.build.outcome;
@@ -23,6 +26,7 @@ use mach.lang.me.pipeline;
 use mach.lang.query;
 use mach.lang.readout;
 use mach.lang.session;
+use mach.lang.source;
 use mach.lang.target;
 use mach.lang.target.isa;
 use mach.lang.target.of;
@@ -43,18 +47,16 @@ fwd project.TARGET_OPT_RELEASE;
 fwd project.dnit_project;
 fwd project.fqn_name;
 fwd project.link_name_for;
+fwd project.begin_query_phase;
+fwd project.finish_query_phase;
+fwd project.refresh_diagnostics;
 
 fwd union.count_target_gated;
 
-fwd passes.run_sema_pass;
-fwd passes.run_lower_pass;
-fwd passes.run_codegen_pass;
-fwd passes.run_link_pass;
 fwd passes.codegen_reusable;
 fwd passes.CodeSources;
 fwd passes.code_sources;
 fwd passes.sources_dnit;
-fwd passes.lower_sweep_staged;
 fwd passes.module_in_current_project;
 fwd passes.debug_info_of;
 fwd passes.frontend_status;
@@ -71,17 +73,153 @@ pub fun setup_registry(reg: *target.TargetRegistry) R.Result[R.Void, str] {
     ret target.register_all(reg, provide_debug_descriptor);
 }
 
+fun append_phase_roots(p: *project.Project, roots: *Vector[query.QueryKey],
+                       kind: query.QueryKind, count: u32) R.Result[R.Void, outcome.Fail] {
+    var i: u32 = 0;
+    for (i < count) {
+        val m: *project.ModuleEntry = ?p.modules[p.topo[i]::u32];
+        var key: u64 = m.stable_id::u64;
+        if (kind == query.Q_PARSE) { key = m.file_id::u64; }
+        or (kind == query.Q_LOWER || kind == query.Q_CODEGEN) { key = passes.back_half_key_for(p, m); }
+        val added: R.Result[usize, str] = vector.push[query.QueryKey](roots, query.QueryKey{ kind: kind, key: key });
+        if (R.is_err[usize, str](added)) {
+            ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[usize, str](added)));
+        }
+        i = i + 1;
+    }
+    ret R.ok_void[outcome.Fail]();
+}
+
+pub fun append_frontend_roots(p: *project.Project, roots: *Vector[query.QueryKey]) R.Result[R.Void, outcome.Fail] {
+    val parsed: R.Result[R.Void, outcome.Fail] = append_phase_roots(p, roots, query.Q_PARSE, p.topo_len);
+    if (R.is_err[R.Void, outcome.Fail](parsed)) { ret parsed; }
+    val resolved: R.Result[R.Void, outcome.Fail] = append_phase_roots(p, roots, query.Q_RESOLVE, p.topo_len);
+    if (R.is_err[R.Void, outcome.Fail](resolved)) { ret resolved; }
+    ret append_phase_roots(p, roots, query.Q_SEMA, p.topo_len);
+}
+
+fun append_backend_roots(p: *project.Project, roots: *Vector[query.QueryKey],
+                        codegen: bool) R.Result[R.Void, outcome.Fail] {
+    val frontend: R.Result[R.Void, outcome.Fail] = append_frontend_roots(p, roots);
+    if (R.is_err[R.Void, outcome.Fail](frontend)) { ret frontend; }
+    val surface: R.Result[R.Void, outcome.Fail] = append_phase_roots(p, roots, query.Q_LOWERED_SURFACE, p.emit_len);
+    if (R.is_err[R.Void, outcome.Fail](surface)) { ret surface; }
+    val lowered: R.Result[R.Void, outcome.Fail] = append_phase_roots(p, roots, query.Q_LOWER, p.emit_len);
+    if (R.is_err[R.Void, outcome.Fail](lowered)) { ret lowered; }
+    if (codegen) { ret append_phase_roots(p, roots, query.Q_CODEGEN, p.emit_len); }
+    ret R.ok_void[outcome.Fail]();
+}
+
+fun run_query_pass(p: *project.Project, roots: *Vector[query.QueryKey],
+                   run: fun(*project.Project) R.Result[R.Void, outcome.Fail]) R.Result[R.Void, outcome.Fail] {
+    val begun: R.Result[query.Operation, outcome.Fail] = project.begin_query_phase(p);
+    if (R.is_err[query.Operation, outcome.Fail](begun)) {
+        ret R.err[R.Void, outcome.Fail](R.unwrap_err[query.Operation, outcome.Fail](begun));
+    }
+    val result: R.Result[R.Void, outcome.Fail] = run(p);
+    ret project.finish_query_phase(p, R.unwrap_ok[query.Operation, outcome.Fail](begun), roots.data, roots.len, result);
+}
+
+fun finish_nonquery_phase(p: *project.Project,
+                         result: R.Result[R.Void, outcome.Fail]) R.Result[R.Void, outcome.Fail] {
+    val refreshed: R.Result[R.Void, outcome.Fail] = project.refresh_diagnostics(p);
+    if (R.is_err[R.Void, outcome.Fail](refreshed)) {
+        diagnostic.note_lost(?p.diags);
+        diagnostic.note_lost(?p.s.diags);
+        if (R.is_ok[R.Void, outcome.Fail](result)) { ret refreshed; }
+    }
+    ret result;
+}
+
+fun project_failure(p: *project.Project, failure: outcome.Fail) R.Result[project.Project, outcome.Fail] {
+    var stable: outcome.Fail = failure;
+    if (failure.message != nil && failure.message != p.s.query_failure_message
+        && (p.s.query_presentation == nil || failure.message != p.s.query_presentation.message)) {
+        val copied: R.Result[str, str] = str_dup(p.s.queries.a, failure.message);
+        if (R.is_err[str, str](copied)) {
+            stable.message = R.unwrap_err[str, str](copied);
+            diagnostic.note_lost(?p.diags);
+        }
+        or {
+            if (p.s.query_failure_message != nil) { str_free(p.s.queries.a, p.s.query_failure_message); }
+            p.s.query_failure_message = R.unwrap_ok[str, str](copied);
+            stable.message = p.s.query_failure_message;
+        }
+    }
+    val published: R.Result[R.Void, outcome.Fail] = finish_nonquery_phase(p, R.err[R.Void, outcome.Fail](stable));
+    project.dnit_project(p);
+    ret R.err[project.Project, outcome.Fail](R.unwrap_err[R.Void, outcome.Fail](published));
+}
+
+pub fun run_sema_pass(p: *project.Project) R.Result[R.Void, outcome.Fail] {
+    val prepared: R.Result[R.Void, outcome.Fail] = passes.prepare_sema_pass(p);
+    if (R.is_err[R.Void, outcome.Fail](prepared)) { ret prepared; }
+    var roots: Vector[query.QueryKey] = vector.init[query.QueryKey](p.alloc);
+    fin { vector.dnit[query.QueryKey](?roots); }
+    val rooted: R.Result[R.Void, outcome.Fail] = append_frontend_roots(p, ?roots);
+    if (R.is_err[R.Void, outcome.Fail](rooted)) { ret rooted; }
+    ret run_query_pass(p, ?roots, passes.run_sema_pass);
+}
+
+pub fun run_lower_pass(p: *project.Project) R.Result[R.Void, outcome.Fail] {
+    val prepared: R.Result[R.Void, outcome.Fail] = passes.prepare_lower_pass(p);
+    if (R.is_err[R.Void, outcome.Fail](prepared)) { ret prepared; }
+    var roots: Vector[query.QueryKey] = vector.init[query.QueryKey](p.alloc);
+    fin { vector.dnit[query.QueryKey](?roots); }
+    val rooted: R.Result[R.Void, outcome.Fail] = append_backend_roots(p, ?roots, false);
+    if (R.is_err[R.Void, outcome.Fail](rooted)) { ret rooted; }
+    ret run_query_pass(p, ?roots, passes.run_lower_pass);
+}
+
+pub fun run_codegen_pass(p: *project.Project) R.Result[R.Void, outcome.Fail] {
+    val prepared: R.Result[R.Void, outcome.Fail] = passes.prepare_codegen_pass(p);
+    if (R.is_err[R.Void, outcome.Fail](prepared)) { ret prepared; }
+    var roots: Vector[query.QueryKey] = vector.init[query.QueryKey](p.alloc);
+    fin { vector.dnit[query.QueryKey](?roots); }
+    val rooted: R.Result[R.Void, outcome.Fail] = append_backend_roots(p, ?roots, true);
+    if (R.is_err[R.Void, outcome.Fail](rooted)) { ret rooted; }
+    ret run_query_pass(p, ?roots, passes.run_codegen_pass);
+}
+
+pub fun run_link_pass(p: *project.Project) R.Result[bool, outcome.Fail] {
+    val prepared: R.Result[R.Void, outcome.Fail] = passes.prepare_link_pass(p);
+    if (R.is_err[R.Void, outcome.Fail](prepared)) {
+        ret R.err[bool, outcome.Fail](R.unwrap_err[R.Void, outcome.Fail](prepared));
+    }
+    var roots: Vector[query.QueryKey] = vector.init[query.QueryKey](p.alloc);
+    fin { vector.dnit[query.QueryKey](?roots); }
+    val rooted: R.Result[R.Void, outcome.Fail] = append_backend_roots(p, ?roots, true);
+    if (R.is_err[R.Void, outcome.Fail](rooted)) {
+        ret R.err[bool, outcome.Fail](R.unwrap_err[R.Void, outcome.Fail](rooted));
+    }
+    val linked: R.Result[usize, str] = vector.push[query.QueryKey](?roots, query.QueryKey{ kind: query.Q_LINK, key: 0 });
+    if (R.is_err[usize, str](linked)) {
+        ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[usize, str](linked)));
+    }
+    val begun: R.Result[query.Operation, outcome.Fail] = project.begin_query_phase(p);
+    if (R.is_err[query.Operation, outcome.Fail](begun)) {
+        ret R.err[bool, outcome.Fail](R.unwrap_err[query.Operation, outcome.Fail](begun));
+    }
+    val result: R.Result[bool, outcome.Fail] = passes.run_link_pass(p);
+    val finished: R.Result[R.Void, outcome.Fail] = project.finish_query_phase(p,
+        R.unwrap_ok[query.Operation, outcome.Fail](begun), roots.data, roots.len, R.void_of[bool, outcome.Fail](result));
+    if (R.is_err[R.Void, outcome.Fail](finished)) {
+        ret R.err[bool, outcome.Fail](R.unwrap_err[R.Void, outcome.Fail](finished));
+    }
+    ret result;
+}
+
 fun query_compute(p: *project.Project, kind: query.QueryKind, key: u64,
-                  alloc: *A.Allocator) R.Result[query.QueryOutput, fail.Fail] {
-    if (kind == query.Q_PARSE)           { ret load.q_parse_compute(p, key, alloc); }
-    if (kind == query.Q_RESOLVE)         { ret passes.q_resolve_compute(p, key, alloc); }
-    if (kind == query.Q_EXPORTS)         { ret load.q_exports_compute(p, key, alloc); }
-    if (kind == query.Q_SEMA)            { ret passes.q_sema_compute(p, key, alloc); }
-    if (kind == query.Q_TYPED_EXPORTS)   { ret passes.q_typed_exports_compute(p, key, alloc); }
-    if (kind == query.Q_LOWERED_SURFACE) { ret passes.q_lowered_surface_compute(p, key, alloc); }
-    if (kind == query.Q_LOWER)           { ret passes.q_lower_compute(p, key, alloc); }
-    if (kind == query.Q_CODEGEN)         { ret passes.q_codegen_compute(p, key, alloc); }
-    if (kind == query.Q_LINK)            { ret passes.q_link_compute(p, key, alloc); }
+                  alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[query.QueryOutput, fail.Fail] {
+    if (kind == query.Q_PARSE)           { ret load.q_parse_compute(p, key, alloc, diags); }
+    if (kind == query.Q_RESOLVE)         { ret passes.q_resolve_compute(p, key, alloc, diags); }
+    if (kind == query.Q_EXPORTS)         { ret load.q_exports_compute(p, key, alloc, diags); }
+    if (kind == query.Q_SEMA)            { ret passes.q_sema_compute(p, key, alloc, diags); }
+    if (kind == query.Q_TYPED_EXPORTS)   { ret passes.q_typed_exports_compute(p, key, alloc, diags); }
+    if (kind == query.Q_LOWERED_SURFACE) { ret passes.q_lowered_surface_compute(p, key, alloc, diags); }
+    if (kind == query.Q_LOWER)           { ret passes.q_lower_compute(p, key, alloc, diags); }
+    if (kind == query.Q_CODEGEN)         { ret passes.q_codegen_compute(p, key, alloc, diags); }
+    if (kind == query.Q_LINK)            { ret passes.q_link_compute(p, key, alloc, diags); }
     ret R.err[query.QueryOutput, fail.Fail](fail.message("query kind has no driver compute capability"));
 }
 
@@ -110,20 +248,17 @@ fun build_project_impl(s: *session.Session, project_root: str, sel: *manifest.Se
     if (run_steps) {
         val res_dep_steps: R.Result[R.Void, outcome.Fail] = run_dep_steps_phase(?p);
         if (R.is_err[R.Void, outcome.Fail](res_dep_steps)) {
-            project.dnit_project(?p);
-            ret R.err[project.Project, outcome.Fail](R.unwrap_err[R.Void, outcome.Fail](res_dep_steps));
+            ret project_failure(?p, R.unwrap_err[R.Void, outcome.Fail](res_dep_steps));
         }
         val res_steps: R.Result[R.Void, outcome.Fail] = run_steps_phase(?p);
         if (R.is_err[R.Void, outcome.Fail](res_steps)) {
-            project.dnit_project(?p);
-            ret R.err[project.Project, outcome.Fail](R.unwrap_err[R.Void, outcome.Fail](res_steps));
+            ret project_failure(?p, R.unwrap_err[R.Void, outcome.Fail](res_steps));
         }
     }
 
     val load_r: R.Result[R.Void, outcome.Fail] = run_load_phase(?p);
     if (R.is_err[R.Void, outcome.Fail](load_r)) {
-        project.dnit_project(?p);
-        ret R.err[project.Project, outcome.Fail](R.unwrap_err[R.Void, outcome.Fail](load_r));
+        ret project_failure(?p, R.unwrap_err[R.Void, outcome.Fail](load_r));
     }
 
     ret R.ok[project.Project, outcome.Fail](p);
@@ -137,12 +272,25 @@ pub fun verify_dependencies(s: *session.Session, project_root: str) R.Result[R.V
     project.init_project(?p, s);
     p.req.project_root = project_root;
     val dep_id_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, "dep");
-    if (R.is_err[intern.StrId, str](dep_id_r)) { manifest.dnit(?m, s.build_alloc); ret R.err[R.Void, str](R.unwrap_err[intern.StrId, str](dep_id_r)); }
+    if (R.is_err[intern.StrId, str](dep_id_r)) {
+        project.dnit_project(?p);
+        manifest.dnit(?m, s.build_alloc);
+        ret R.err[R.Void, str](R.unwrap_err[intern.StrId, str](dep_id_r));
+    }
     p.config.dir_dep = R.unwrap_ok[intern.StrId, str](dep_id_r);
     val dr: R.Result[R.Void, str] = ddep.resolve_deps(?p, ?m, project_root);
+    if (R.is_err[R.Void, str](dr)) {
+        val rejected: R.Result[project.Project, outcome.Fail] = project_failure(?p, outcome.user(R.unwrap_err[R.Void, str](dr)));
+        manifest.dnit(?m, s.build_alloc);
+        ret R.err[R.Void, str](R.unwrap_err[project.Project, outcome.Fail](rejected).message);
+    }
+    val published: R.Result[R.Void, outcome.Fail] = finish_nonquery_phase(?p, R.ok_void[outcome.Fail]());
     project.dnit_project(?p);
     manifest.dnit(?m, s.build_alloc);
-    ret dr;
+    if (R.is_err[R.Void, outcome.Fail](published)) {
+        ret R.err[R.Void, str](R.unwrap_err[R.Void, outcome.Fail](published).message);
+    }
+    ret R.ok_void[str]();
 }
 
 pub fun begin_build(s: *session.Session, m: *manifest.Manifest, req: *request.BuildRequest, ev: *readout.Progress) R.Result[project.Project, outcome.Fail] {
@@ -181,15 +329,13 @@ pub fun analyze_project(s: *session.Session, m: *manifest.Manifest, req: *reques
         run_load_phase_roots(?p, extra_roots, extra_root_count);
     if (R.is_err[R.Void, outcome.Fail](load_r)) {
         val failure: outcome.Fail = R.unwrap_err[R.Void, outcome.Fail](load_r);
-        project.dnit_project(?p);
-        ret R.err[project.Project, outcome.Fail](failure);
+        ret project_failure(?p, failure);
     }
 
-    val sema_r: R.Result[R.Void, outcome.Fail] = passes.run_sema_pass(?p);
+    val sema_r: R.Result[R.Void, outcome.Fail] = run_sema_pass(?p);
     if (R.is_err[R.Void, outcome.Fail](sema_r)) {
         val failure: outcome.Fail = R.unwrap_err[R.Void, outcome.Fail](sema_r);
-        project.dnit_project(?p);
-        ret R.err[project.Project, outcome.Fail](failure);
+        ret project_failure(?p, failure);
     }
 
     ret R.ok[project.Project, outcome.Fail](p);
@@ -207,8 +353,7 @@ fun begin_build_impl(s: *session.Session, project_root: str, sel: *manifest.Sele
 
     val q_r: R.Result[R.Void, str] = bind_queries(?p);
     if (R.is_err[R.Void, str](q_r)) {
-        project.dnit_project(?p);
-        ret R.err[project.Project, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](q_r)));
+        ret project_failure(?p, outcome.internal(R.unwrap_err[R.Void, str](q_r)));
     }
 
     var cfg_r: R.Result[R.Void, str];
@@ -218,22 +363,19 @@ fun begin_build_impl(s: *session.Session, project_root: str, sel: *manifest.Sele
     or {
         val mp_r: R.Result[str, str] = load.join_path(s.alloc, project_root, manifest.MANIFEST_FILE);
         if (R.is_err[str, str](mp_r)) {
-            project.dnit_project(?p);
-            ret R.err[project.Project, outcome.Fail](outcome.internal(R.unwrap_err[str, str](mp_r)));
+            ret project_failure(?p, outcome.internal(R.unwrap_err[str, str](mp_r)));
         }
         val manifest_path: str = R.unwrap_ok[str, str](mp_r);
         cfg_r = dcfg.load_project_config(?p, project_root, manifest_path, sel, for_union, is_test);
         str_free(s.alloc, manifest_path);
     }
     if (R.is_err[R.Void, str](cfg_r)) {
-        project.dnit_project(?p);
-        ret R.err[project.Project, outcome.Fail](outcome.user(R.unwrap_err[R.Void, str](cfg_r)));
+        ret project_failure(?p, outcome.user(R.unwrap_err[R.Void, str](cfg_r)));
     }
 
     val te: *project.TargetEntry = p.target_entry;
     if (te == nil) {
-        project.dnit_project(?p);
-        ret R.err[project.Project, outcome.Fail](outcome.internal("internal: manifest selected no target"));
+        ret project_failure(?p, outcome.internal("internal: manifest selected no target"));
     }
 
     if (req == nil) {
@@ -242,15 +384,20 @@ fun begin_build_impl(s: *session.Session, project_root: str, sel: *manifest.Sele
         if (te.opt == project.TARGET_OPT_RELEASE) { p.req.opt = pipeline.OPT_RELEASE; }
     }
 
+    val published: R.Result[R.Void, outcome.Fail] = finish_nonquery_phase(?p, R.ok_void[outcome.Fail]());
+    if (R.is_err[R.Void, outcome.Fail](published)) {
+        ret project_failure(?p, R.unwrap_err[R.Void, outcome.Fail](published));
+    }
+
     ret R.ok[project.Project, outcome.Fail](p);
 }
 
 pub fun run_steps_phase(p: *project.Project) R.Result[R.Void, outcome.Fail] {
     val res_steps: R.Result[R.Void, str] = dcfg.execute_steps(p.alloc, p, p.req.project_root);
     if (R.is_err[R.Void, str](res_steps)) {
-        ret R.err[R.Void, outcome.Fail](outcome.user(R.unwrap_err[R.Void, str](res_steps)));
+        ret finish_nonquery_phase(p, R.err[R.Void, outcome.Fail](outcome.user(R.unwrap_err[R.Void, str](res_steps))));
     }
-    ret R.ok_void[outcome.Fail]();
+    ret finish_nonquery_phase(p, R.ok_void[outcome.Fail]());
 }
 
 pub fun run_dep_steps_phase(p: *project.Project) R.Result[R.Void, outcome.Fail] {
@@ -260,9 +407,9 @@ pub fun run_dep_steps_phase(p: *project.Project) R.Result[R.Void, outcome.Fail] 
     val abi_s: str = O.unwrap[str](intern.lookup(?p.s.interner, te.abi_name));
     val res_dep_steps: R.Result[R.Void, str] = dcfg.execute_dep_steps(p, isa_s, os_s, abi_s);
     if (R.is_err[R.Void, str](res_dep_steps)) {
-        ret R.err[R.Void, outcome.Fail](outcome.user(R.unwrap_err[R.Void, str](res_dep_steps)));
+        ret finish_nonquery_phase(p, R.err[R.Void, outcome.Fail](outcome.user(R.unwrap_err[R.Void, str](res_dep_steps))));
     }
-    ret R.ok_void[outcome.Fail]();
+    ret finish_nonquery_phase(p, R.ok_void[outcome.Fail]());
 }
 
 pub fun run_load_phase(p: *project.Project) R.Result[R.Void, outcome.Fail] {
@@ -271,6 +418,11 @@ pub fun run_load_phase(p: *project.Project) R.Result[R.Void, outcome.Fail] {
 
 fun run_load_phase_roots(p: *project.Project, extra_roots: *intern.StrId,
                          extra_root_count: u32) R.Result[R.Void, outcome.Fail] {
+    ret finish_nonquery_phase(p, load_phase_impl(p, extra_roots, extra_root_count));
+}
+
+fun load_phase_impl(p: *project.Project, extra_roots: *intern.StrId,
+                    extra_root_count: u32) R.Result[R.Void, outcome.Fail] {
     val te: *project.TargetEntry = p.target_entry;
 
     val fp_r: R.Result[R.Void, str] = dcfg.select_target(p, te);
@@ -287,7 +439,7 @@ fun run_load_phase_roots(p: *project.Project, extra_roots: *intern.StrId,
     readout.phase_begin(p.events, readout.PH_LOAD);
     val load_r: R.Result[session.ModuleId, str] = load.dfs_load(p, entry_fqn);
     if (R.is_err[session.ModuleId, str](load_r)) {
-        ret R.err[R.Void, outcome.Fail](load_failure(p, R.unwrap_err[session.ModuleId, str](load_r)));
+        ret load.collect_loaded_parses(p, R.err[R.Void, outcome.Fail](load_failure(p, R.unwrap_err[session.ModuleId, str](load_r))));
     }
 
     if (p.roots == project.ROOT_UNION) {
@@ -295,7 +447,7 @@ fun run_load_phase_roots(p: *project.Project, extra_roots: *intern.StrId,
         for (ei < p.union_entry_count) {
             val ear: R.Result[session.ModuleId, str] = load.dfs_load(p, p.union_entries[ei]);
             if (R.is_err[session.ModuleId, str](ear)) {
-                ret R.err[R.Void, outcome.Fail](load_failure(p, R.unwrap_err[session.ModuleId, str](ear)));
+                ret load.collect_loaded_parses(p, R.err[R.Void, outcome.Fail](load_failure(p, R.unwrap_err[session.ModuleId, str](ear))));
             }
             ei = ei + 1;
         }
@@ -307,7 +459,7 @@ fun run_load_phase_roots(p: *project.Project, extra_roots: *intern.StrId,
     for (xi < extra_root_count) {
         val xr: R.Result[session.ModuleId, str] = load.dfs_load(p, extra_roots[xi]);
         if (R.is_err[session.ModuleId, str](xr)) {
-            ret R.err[R.Void, outcome.Fail](load_failure(p, R.unwrap_err[session.ModuleId, str](xr)));
+            ret load.collect_loaded_parses(p, R.err[R.Void, outcome.Fail](load_failure(p, R.unwrap_err[session.ModuleId, str](xr))));
         }
         xi = xi + 1;
     }
@@ -315,7 +467,7 @@ fun run_load_phase_roots(p: *project.Project, extra_roots: *intern.StrId,
     if (p.roots == project.ROOT_TEST) {
         val allsrc_r: R.Result[R.Void, str] = union.load_all_own_src(p);
         if (R.is_err[R.Void, str](allsrc_r)) {
-            ret R.err[R.Void, outcome.Fail](outcome.user(R.unwrap_err[R.Void, str](allsrc_r)));
+            ret load.collect_loaded_parses(p, R.err[R.Void, outcome.Fail](outcome.user(R.unwrap_err[R.Void, str](allsrc_r))));
         }
     }
 
@@ -342,6 +494,11 @@ fun run_load_phase_roots(p: *project.Project, extra_roots: *intern.StrId,
         ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](emb_r)));
     }
 
+    val final_resolve: R.Result[bool, outcome.Fail] = resolve_query_phase(p, false, false);
+    if (R.is_err[bool, outcome.Fail](final_resolve)) {
+        ret R.err[R.Void, outcome.Fail](R.unwrap_err[bool, outcome.Fail](final_resolve));
+    }
+
     val exp_r: R.Result[R.Void, str] = union.register_export_names(p);
     if (R.is_err[R.Void, str](exp_r)) {
         ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](exp_r)));
@@ -350,25 +507,77 @@ fun run_load_phase_roots(p: *project.Project, extra_roots: *intern.StrId,
     ret R.ok_void[outcome.Fail]();
 }
 
+pub fun run_gate_pass(p: *project.Project) R.Result[bool, outcome.Fail] {
+    ret resolve_query_phase(p, true, false);
+}
+
+fun resolve_query_phase(p: *project.Project, gates: bool, provisional: bool) R.Result[bool, outcome.Fail] {
+    val prepared: R.Result[R.Void, fail.Fail] = passes.prepare_resolve_pass(p);
+    if (R.is_err[R.Void, fail.Fail](prepared)) {
+        ret R.err[bool, outcome.Fail](outcome.from_fail(R.unwrap_err[R.Void, fail.Fail](prepared)));
+    }
+    var roots: Vector[query.QueryKey] = vector.init[query.QueryKey](p.alloc);
+    fin { vector.dnit[query.QueryKey](?roots); }
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        val m: *project.ModuleEntry = ?p.modules[i];
+        if (m.file_id == source.FILE_NIL) { i = i + 1; cnt; }
+        val added: R.Result[usize, str] = vector.push[query.QueryKey](?roots,
+            query.QueryKey{ kind: query.Q_PARSE, key: m.file_id::u64 });
+        if (R.is_err[usize, str](added)) {
+            ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[usize, str](added)));
+        }
+        i = i + 1;
+    }
+    val parse_count: usize = roots.len;
+    val resolved: R.Result[R.Void, outcome.Fail] = append_phase_roots(p, ?roots, query.Q_RESOLVE, p.topo_len);
+    if (R.is_err[R.Void, outcome.Fail](resolved)) {
+        ret R.err[bool, outcome.Fail](R.unwrap_err[R.Void, outcome.Fail](resolved));
+    }
+    val exported: R.Result[R.Void, outcome.Fail] = append_phase_roots(p, ?roots, query.Q_EXPORTS, p.topo_len);
+    if (R.is_err[R.Void, outcome.Fail](exported)) {
+        ret R.err[bool, outcome.Fail](R.unwrap_err[R.Void, outcome.Fail](exported));
+    }
+    val begun: R.Result[query.Operation, outcome.Fail] = project.begin_query_phase(p);
+    if (R.is_err[query.Operation, outcome.Fail](begun)) {
+        ret R.err[bool, outcome.Fail](R.unwrap_err[query.Operation, outcome.Fail](begun));
+    }
+    var computed: R.Result[R.Void, fail.Fail] = load.acquire_loaded_parses(p);
+    if (R.is_ok[R.Void, fail.Fail](computed)) { computed = passes.run_resolve_pass(p); }
+    var result: R.Result[R.Void, outcome.Fail] = R.ok_void[outcome.Fail]();
+    var changed: bool = false;
+    if (R.is_err[R.Void, fail.Fail](computed)) {
+        result = R.err[R.Void, outcome.Fail](outcome.from_fail(R.unwrap_err[R.Void, fail.Fail](computed)));
+    }
+    or (gates) {
+        val evaluated: R.Result[bool, str] = passes.run_gate_pass(p);
+        if (R.is_err[bool, str](evaluated)) {
+            result = R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[bool, str](evaluated)));
+        }
+        or { changed = R.unwrap_ok[bool, str](evaluated); }
+    }
+    var count: usize = roots.len;
+    if (provisional && R.is_ok[R.Void, outcome.Fail](result)) { count = parse_count; }
+    val finished: R.Result[R.Void, outcome.Fail] = project.finish_query_phase(p,
+        R.unwrap_ok[query.Operation, outcome.Fail](begun), roots.data, count, result);
+    if (R.is_err[R.Void, outcome.Fail](finished)) {
+        ret R.err[bool, outcome.Fail](R.unwrap_err[R.Void, outcome.Fail](finished));
+    }
+    ret R.ok[bool, outcome.Fail](changed);
+}
+
 fun resolve_deferred_gate_load(p: *project.Project) R.Result[R.Void, outcome.Fail] {
     for (true) {
         val gc: R.Result[R.Void, str] = load.check_gated_const_imports(p);
         if (R.is_err[R.Void, str](gc)) { ret gate_load_user_fail(fail.lift[R.Void](gc)); }
         val deferred_before: u32 = load.deferred_gate_count(p);
         val decided_before:  u32 = passes.decided_gate_count(p);
-        val diag_mark: diagnostic.DiagMark = diagnostic.mark(?p.s.diags);
-        val rr: R.Result[R.Void, fail.Fail] = passes.run_resolve_pass(p);
-        if (R.is_err[R.Void, fail.Fail](rr)) { passes.clear_gate_results(p); ret gate_load_user_fail(rr); }
-        if (deferred_before > 0) {
-            val tr: R.Result[R.Void, str] = diagnostic.truncate(?p.s.diags, diag_mark);
-            if (R.is_err[R.Void, str](tr)) { passes.clear_gate_results(p); ret gate_load_user_fail(fail.lift[R.Void](tr)); }
-        }
-        val changed_r: R.Result[bool, str] = passes.run_gate_pass(p);
-        if (R.is_err[bool, str](changed_r)) {
+        val changed_r: R.Result[bool, outcome.Fail] = resolve_query_phase(p, true, deferred_before > 0);
+        if (R.is_err[bool, outcome.Fail](changed_r)) {
             passes.clear_gate_results(p);
-            ret gate_load_user_fail(fail.lift[R.Void](R.void_of[bool, str](changed_r)));
+            ret R.err[R.Void, outcome.Fail](R.unwrap_err[bool, outcome.Fail](changed_r));
         }
-        var changed: bool = R.unwrap_ok[bool, str](changed_r);
+        var changed: bool = R.unwrap_ok[bool, outcome.Fail](changed_r);
         if (passes.decided_gate_count(p) != decided_before) { changed = true; }
         val deferred: u32 = load.deferred_gate_count(p);
         if (deferred == 0) {
@@ -377,11 +586,11 @@ fun resolve_deferred_gate_load(p: *project.Project) R.Result[R.Void, outcome.Fai
         }
         if (!changed) {
             p.gate_terminal = true;
-            val fr: R.Result[R.Void, fail.Fail] = passes.run_resolve_pass(p);
+            val fr: R.Result[bool, outcome.Fail] = resolve_query_phase(p, false, false);
             p.gate_terminal = false;
-            if (R.is_err[R.Void, fail.Fail](fr)) {
+            if (R.is_err[bool, outcome.Fail](fr)) {
                 passes.clear_gate_results(p);
-                ret gate_load_user_fail(fr);
+                ret R.err[R.Void, outcome.Fail](R.unwrap_err[bool, outcome.Fail](fr));
             }
             passes.clear_gate_results(p);
             val status: fail.PhaseStatus = passes.frontend_status(p);
@@ -406,7 +615,7 @@ fun resolve_deferred_gate_load(p: *project.Project) R.Result[R.Void, outcome.Fai
         if (R.is_err[bool, str](resumed_r)) {
             if (emit_roots != nil) { A.deallocate[session.ModuleId](p.alloc, emit_roots, emit_root_count::usize); }
             passes.clear_gate_results(p);
-            ret gate_load_user_fail(fail.lift[R.Void](R.void_of[bool, str](resumed_r)));
+            ret load.collect_loaded_parses(p, gate_load_user_fail(fail.lift[R.Void](R.void_of[bool, str](resumed_r))));
         }
         val tr: R.Result[R.Void, str] = load.rebuild_topo(p, emit_roots, emit_root_count);
         if (emit_roots != nil) { A.deallocate[session.ModuleId](p.alloc, emit_roots, emit_root_count::usize); }
@@ -517,7 +726,7 @@ pub fun build_project_union(s: *session.Session, project_root: str) R.Result[pro
 
 fun bind_queries(p: *project.Project) R.Result[R.Void, str] {
     val rt_r: R.Result[query.QueryRuntime[project.Project], str] =
-        query.runtime[project.Project](?p.s.queries, ?p.s.diags, query_compute);
+        query.runtime[project.Project](?p.s.queries, query_compute);
     if (R.is_err[query.QueryRuntime[project.Project], str](rt_r)) {
         ret R.err[R.Void, str](R.unwrap_err[query.QueryRuntime[project.Project], str](rt_r));
     }
