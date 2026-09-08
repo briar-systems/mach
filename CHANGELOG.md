@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Test listing stops after collecting tests without generating or linking machine code.
 
+- Dotted import, re-export and type names resolve identically with spacing or comments around dots. Diagnostics retain the original source spans.
 - Embedded files are read through held directory and file handles. Escaping paths
   and symlinks are rejected before reading, and failed refreshes preserve cache
   ownership and the prior query input.
