@@ -46,6 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Darwin persistent cache identity hashes the compiler executable through its own
   code mapping, including when the loader inserts libraries before that executable.
 
+- Embedded files resolve consistently with relative or absolute project and source
+  paths. Project containment still rejects traversal and symlink escapes.
+
 - Unknown syntax, operator, IR operand and backend instruction, operand and register
   class tags report internal failures with their catalog and numeric value. Verifier diagnostics own their text and propagate
   allocation failures without losing tag or source information.
