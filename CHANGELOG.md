@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refreshes them. Dependency commands preserve the project's Git history.
 ### Added
 
+- `mach build <path> --plan` reports the selected entries, prerequisites, outputs and link requirements through the shared planner. It replaces `--explain`.
+
 - `mach check <path>` checks selected artifact source through the shared frontend without executing build steps or producing artifacts.
 
 ## [4.30.0] - 2026-09-07

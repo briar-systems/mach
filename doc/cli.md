@@ -140,8 +140,11 @@ dispatcher to run; each is refused by name rather than attempted.
 The optimisation pipeline comes from the selected profile's `opt` — the profile
 is how a build picks its optimisation level.
 
-`--explain` resolves the full build plan — the (target, artifact) matrix and each
-unit's inputs — prints it, and exits without compiling or linking.
+`--plan` resolves the full build plan — the (target, artifact) matrix and each
+unit's entry, output paths, ordered prerequisite steps and link requirements,
+prints it, and exits without running generators, compiling or linking. Generated
+input bytes remain unresolved until their prerequisites run. The plan does not
+claim those bytes or the final link are valid.
 
 | Flag           | Value          | Effect |
 |----------------|----------------|--------|
@@ -154,7 +157,7 @@ unit's inputs — prints it, and exits without compiling or linking.
 | `--subsystem <k>` | `console`\|`gui` | the environment a windows executable declares it runs under, overriding the artifact's `subsystem` key (see below) |
 | `-L <dir>`     | dir            | add a search directory for `-l`-resolved inputs; repeatable |
 | `-l <name>`    | name           | link a named object, archive, or target-format shared library, resolved through the `-L` dirs (see below); repeatable |
-| `--explain`    | —              | print the resolved build plan and exit without building |
+| `--plan`    | —              | print the resolved build plan and exit without building |
 | *(positional)* | input path     | a bare argument that contains `/`, ends in `.o` / `.obj` / `.a` / `.lib`, or names a `.so`, `.dylib`, or `.dll` is linked explicitly |
 
 Plus the global flags above.
