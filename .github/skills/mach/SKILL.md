@@ -105,11 +105,11 @@ fwd impl.page_size;
 
 ## Entrypoint and output
 
-An artifact's `out` is literal across every target it names. A cross-platform
-executable therefore uses disjoint artifacts for extension conventions:
-`out = "bin/app"` for non-Windows targets and `out = "bin/app.exe"` for Windows.
-`mach init` emits that split for binary projects. Do not use one `targets = ["*"]`
-artifact when its output must be directly executable on Windows and elsewhere.
+An artifact's `out` expands `{artifact.suffix}` using its selected target's naming
+rules. `out = "bin/app{artifact.suffix}"` gives `app.exe` on Windows and `app` on
+Linux/Darwin with one stable artifact identity. Literal output paths stay literal.
+`mach init` emits one artifact with this placeholder. `need` entries are qualified:
+`step.generate`, `artifact.support`, or globs such as `artifact.shader-*`.
 
 The stdlib provides the platform `_start`, which calls whatever function
 exports the linker symbol `main`. `use std.runtime;` is required to link it in

@@ -507,7 +507,7 @@ reads the selected artifact's name.
 |-----------|----------|---------|
 | `kind`    | yes | `"bin"`, `"static"`, or `"shared"` (see below). |
 | `entry`   | yes | Entry source, relative to the project `src` dir (e.g. `main.mach` for `src/main.mach`). The entry module's FQN is `<id>.<entry without .mach>`, `/` turned into `.`. |
-| `out`     | yes | This artifact's output path, **relative to the expanded project `out`** and rooted there automatically — write `bin/demo`, not `{project.out}/bin/demo`. An executable extension, where wanted, is written literally here, and it is one string shared by every target in `targets`, so an executable that ships on Windows and elsewhere **cannot use `targets = ["*"]`** (see [One artifact per extension convention](#one-artifact-per-extension-convention)). |
+| `out`     | yes | This artifact's output path, **relative to the expanded project `out`** and rooted there automatically — write `bin/demo`, not `{project.out}/bin/demo`. Use `{artifact.suffix}` for the target extension, or write a literal filename. See [Artifact filenames and identity](#artifact-filenames-and-identity). |
 | `targets` | yes | Array of declared target names this artifact builds for; `["*"]` means every declared target. |
 | `link`    | yes | Array of `[link.X]` names this artifact links (see below). `[]` for none. A name with no table is a manifest error naming the artifact and the declared tables (`[artifact.p1].link names no [link.*] table: 'nosuch' (declared: [link.kernel32])`). |
 | `need`    | yes | Array of category-qualified requirements such as `step.generate`, `artifact.support`, and `artifact.shader-*`. Each glob matches only its named category. `[]` for none. See [Artifact requirements](#artifact-requirements). |
@@ -533,59 +533,44 @@ every module in the current project's `src` tree.
 Per-target extension or per-target entry is not a per-cell exception table — it is a
 second artifact stanza, so the condition stays visible like everything else.
 
-### One artifact per extension convention
+### Artifact filenames and identity
 
-`out` is one literal string, and every target in `targets` resolves it the same way.
-Windows will not execute a file without an executable extension until someone renames
-it by hand, and no other platform wants one, so there is no single `out` that is right
-for both. `bin/app` gives Windows an unrunnable `app`, and `bin/app.exe` gives linux
-and darwin a binary called `app.exe`. An executable that ships on Windows and anywhere
-else therefore cannot use `targets = ["*"]`. It is two artifacts with disjoint
-`targets` lists:
+Use `{artifact.suffix}` in an artifact's `out` to select its target filename
+extension. Literal paths stay literal. No prefix is inserted, so a library may
+spell its desired `lib` prefix directly.
 
 ```toml
 [artifact.app]
 kind = "bin"
 entry = "main.mach"
-out = "bin/app"
-targets = ["linux-x86_64", "darwin-aarch64"]
-link = []
-need = []
-
-[artifact.app-windows]
-kind = "bin"
-entry = "main.mach"
-out = "bin/app.exe"
-targets = ["windows-x86_64"]
+out = "bin/app{artifact.suffix}"
+targets = ["*"]
 link = []
 need = []
 ```
 
-This is deliberate rather than a defect, and it costs three things worth knowing before
-you meet them.
+This produces `app.exe` on Windows and `app` on Linux and Darwin. The artifact
+name and `$bin.name` remain `app` on every target. `mach init` generates one
+artifact using this form. Build, run, clean, required-artifact paths and plan
+inspection use the same expansion.
 
-The two stanzas differ only in `out` and `targets` and are otherwise duplicates, so
-they drift. A `link` or `need` added to one and not the other changes the build on
-Windows only, which is the platform least likely to be the one in front of you.
+| Target output format | `bin` suffix | `static` suffix | `shared` suffix |
+| --- | --- | --- | --- |
+| ELF on Linux or freestanding | empty | `.a` | `.so` |
+| Mach-O on Darwin | empty | `.a` | `.dylib` |
+| COFF/PE on Windows | `.exe` | `.lib` | `.dll` |
+| Raw image | empty | unsupported | unsupported |
+| SPIR-V module | `.spv` | unsupported | unsupported |
 
-Every new target has to be added to the right list by hand, because neither stanza can
-use `*`. Declaring a target and forgetting to list it means that target simply builds
-nothing.
+The selected object format supplies the naming rules, including explicit target
+format overrides. Unsupported library forms are errors. Module-producing backends
+retain their existing per-module output behavior.
 
-The artifact **name** differs between the two, so `$bin.name` differs by platform: a
-project that reads it sees `app` everywhere and `app-windows` on Windows. Nothing in
-mach's own source reads it, and a project that does needs to expect both.
-
-`mach build` enumerates artifact-by-target cells and builds only the ones that match,
-so each platform gets its stanza with nothing named on the command line. `mach test`
-links the whole source tree rather than one artifact, but selects its primary context
-from the sole artifact that declares the resolved target, so the same split works
-there. `mach run` selects the target's artifact when exactly one matches; if several
-artifacts can run on that target, it still asks for `--bin` rather than guessing.
-
-mach's own `mach.toml` is split this way: an ordinary Windows build produces
-`bin/mach.exe`, and its test run selects `mach-windows` as the primary context without
-a command-line workaround.
+`{artifact.suffix}` is available only in an artifact output template. It does not
+expand in project output roots, link paths, step arguments or source embeds.
+Output collisions are checked after expansion among artifacts selected for the
+target. An explicit literal such as `bin/app.exe` can therefore collide with
+`bin/app{artifact.suffix}` on Windows.
 
 ### `subsystem` — the windows console/GUI selector
 
