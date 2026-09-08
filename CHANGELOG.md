@@ -46,6 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Darwin persistent cache identity hashes the compiler executable through its own
   code mapping, including when the loader inserts libraries before that executable.
 
+- Darwin linker planning releases temporary working-directory and runtime search
+  paths after copying their results, including rejected and undersized outputs.
+
 - Embedded files resolve consistently with relative or absolute project and source
   paths. Project containment still rejects traversal and symlink escapes.
 
