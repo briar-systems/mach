@@ -95,10 +95,11 @@ The reserved keywords (matched as `IDENT` text by the parser) are:
 
 ```
 asm  brk  cnt  def  ext  fin  for  fun  fwd  if
-nil  or   pub  rec  ret  test uni  use  val  var
+nil  or   pub  rec  ret  tag  test try  uni  use
+val  var
 ```
 
-`nil` is an expression literal; the rest are statement/declaration/type
+`nil` is an expression literal, and `try` is a prefix expression operator. The rest are statement, declaration, or type
 introducers. Note these are *contextual*: nothing in the lexer prevents a
 binding or field from being named after one, but the parser will treat the
 keyword in its keyword position. The operand-less statement keywords `brk`
@@ -250,6 +251,7 @@ decl ::= comptime-decl
                | fun-decl
                | rec-decl
                | uni-decl
+               | tag-decl
                | bind-decl
                | def-decl
                | test-decl )
@@ -289,6 +291,17 @@ field-block ::= "{" { typed-name ";" } "}"
 
 `rec` is a struct (sequential layout); `uni` is a raw union (overlapping
 layout). Both may be generic and both share the same field-block grammar.
+
+### `tag` - tagged value
+
+```ebnf
+tag-decl ::= "tag" IDENT [ generic-params ] "{" { tag-case ";" } "}"
+
+tag-case ::= IDENT [ ":" type ]
+```
+
+`tag` defines a discriminated aggregate value with one active case at any time.
+Each case specifies a name and either one payload type or no payload.
 
 ### `fun` — function
 
@@ -467,10 +480,9 @@ Notes:
 - Anonymous inline `rec {...}` / `uni {...}` types use a field block whose
   entries do **not** accept the leading `$` comptime marker.
 
-There is **no `?T` option-type sugar and no Result sugar in the grammar.**
-`?` is exclusively the prefix address-of operator (below). `Option` and
-`Result` are ordinary stdlib generic types written `Option[T]` /
-`Result[T, E]`.
+There is **no `?T` option-type sugar and no special Result keyword sugar in the grammar.**
+`?` is exclusively the prefix address-of operator (below). Canonical `res[T, E]`,
+`opt[T]`, and `err[E]` are compiler-known tags written with ordinary generic brackets.
 
 
 ## Expressions
@@ -493,8 +505,11 @@ prefix ::= LIT_INT | LIT_FLOAT | LIT_CHAR | LIT_STR
          | comptime-ident
          | typed-literal
          | array-literal
+         | try-expr
          | unary-op prefix { postfix }
          | "(" expr ")"
+
+try-expr ::= "try" prefix { postfix } "or" [ "(" IDENT ":" type ")" ] block
 
 comptime-ident ::= "$" IDENT
 
@@ -571,18 +586,21 @@ outcomes apply whether or not a `(` follows the `]`:
 ### Literals with a type prefix
 
 ```ebnf
-typed-literal ::= named-type "{" [ field-init { "," field-init } [ "," ] ] "}"
+typed-literal ::= named-type "{" [ member-init { "," member-init } [ "," ] ] "}"
 array-literal ::= array-type "{" [ expr { "," expr } [ "," ] ] "}"
 
-field-init ::= IDENT ":" expr
+member-init ::= IDENT ":" expr | IDENT
 ```
 
-- `typed-literal` is a record/union (struct) literal: a named type
-  (optionally generic) followed by a brace-delimited list of `field: value`
-  initializers (`Point{ x: 1, y: 2 }`, `Pair[i64, u8]{ left: 5, right: 6u8 }`).
+- `typed-literal` is a record, union, or tag literal: a named type
+  (optionally generic) followed by a brace-delimited initializer list.
+  For records and unions, each member is a `field: value` pair (`Point{ x: 1, y: 2 }`,
+  `Pair[i64, u8]{ left: 5, right: 6u8 }`).
+  For tags, exactly one case is initialized: either a bare case name for a payloadless
+  case (`Reply{empty}`) or a named payload (`Reply{value: 42}`).
   The parser commits to this form via a lookahead
   (`Name (.Name)* ([...])? {`).
-- `array-literal` is `[N]T{ e0, e1, ... }` — an array type followed by a
+- `array-literal` is `[N]T{ e0, e1, ... }`, an array type followed by a
   brace-delimited positional element list.
 
 ### Operator precedence
