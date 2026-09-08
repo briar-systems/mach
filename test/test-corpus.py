@@ -35,7 +35,7 @@ class DebugCapability(unittest.TestCase):
 
     def test_declared_support_is_explicit(self):
         self.assertEqual({t.name for t in self.targets if t.debug == 'unsupported'},
-                         {'spirv', 'x86_64-windows', 'mos6502'})
+                         {'spirv', 'x86_64-windows'})
         conf = Path(self.temp.name) / 'engines.conf'
         conf.write_text('sample x86_64 linux sysv64 - bin hosted native llvm-objdump ubuntu-latest pr - maybe note\n')
         with self.assertRaisesRegex(config.ConfigError, 'debug must be'):

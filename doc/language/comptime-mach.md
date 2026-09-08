@@ -107,8 +107,8 @@ directly; there is no second list to keep in step. A tag name the registry
 does not carry is a compile error, never a silent fold.
 
 `$mach.abi.sysv` is rejected with a removal diagnostic. Write
-`$mach.abi.sysv64`. `$mach.arch.mos6502` likewise still resolves in 4.30.0 for
-the withdrawn MOS 6502 target and is gone in 5.0.0.
+`$mach.abi.sysv64`. The withdrawn `$mach.arch.mos6502` tag is removed and
+is an unknown-tag error.
 
 ## Comparison
 

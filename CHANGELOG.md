@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- Withdrawn MOS 6502 instruction set, ABI, registry entries and corpus column.
+  Shared width legalization and retained target coverage remain available.
+
 ### Fixed
 
 - Test listing stops after collecting tests without generating or linking machine code.

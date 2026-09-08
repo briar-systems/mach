@@ -197,8 +197,8 @@ such an image is refused at link rather than silently dropped.
 | `os`  | `linux`, `windows`, `darwin`, `freestanding` |
 | `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, `ilp32d`, `spirv` |
 
-`mos6502` (an `isa` and an `abi`) is still accepted by 4.30.0 as a withdrawn
-experiment and is removed in 5.0.0; do not declare it.
+The withdrawn `mos6502` ISA and ABI are removed. Declaring either is an
+unknown-target error.
 
 `x86_64`/`linux`/`sysv64` is the primary host and target. `aarch64`-linux builds
 and runs natively in CI on every PR; `riscv64`-linux runs under qemu and

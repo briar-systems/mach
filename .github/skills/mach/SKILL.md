@@ -478,14 +478,16 @@ $mach.version / .major / .minor / .patch    # live; compiler version
 $mach.compiler.name / .version              # live
 
 $mach.os.linux    .darwin   .windows  .freestanding
-$mach.arch.x86_64 .aarch64  .riscv64
-$mach.abi.sysv64  .win64    .aapcs64  .lp64
+$mach.arch.x86_64 .aarch64  .riscv64 .riscv32 .spirv
+$mach.abi.sysv64  .win64    .aapcs64  .lp64 .lp64f .lp64d
+$mach.abi.ilp32   .ilp32f   .ilp32d   .spirv
 $mach.mode.debug  .release
 ```
 
 `$mach.build.{timestamp,host,git.*}`, `$mach.project.*`, and `$mach.source.*`
 are reserved stubs - reading one is a compile error. The tag tables are closed;
-an unrecognized tag is a compile error, never a silent fold.
+an unrecognized tag is a compile error, never a silent fold. The withdrawn
+MOS 6502 target, ABI and architecture tag are removed.
 
 Tag comparison is path-value - plain `==`, no `.id` suffix, no unwrap:
 
