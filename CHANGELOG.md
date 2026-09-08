@@ -33,12 +33,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Comptime evaluation distinguishes unknown internal tags from unsupported values
+  and rejects comparisons of reflection descriptors without equality semantics.
+
 - Test listing stops after collecting tests without generating or linking machine code.
 - Required vector lowering preserves volatile accesses and runs in functions that
   contain volatile I/O.
 
+- Native encoder failures preserve full opcode values and report owned diagnostics.
+  Selected target instructions are validated in their own opcode domain.
+
 - Darwin persistent cache identity hashes the compiler executable through its own
   code mapping, including when the loader inserts libraries before that executable.
+
+- Unknown syntax, operator, IR operand and backend instruction, operand and register
+  class tags report internal failures with their catalog and numeric value. Verifier diagnostics own their text and propagate
+  allocation failures without losing tag or source information.
 
 - Constant expressions evaluate nested scalar casts and preserve integer widths and
   signedness. Failed global initializers reject compilation and cannot publish zero
