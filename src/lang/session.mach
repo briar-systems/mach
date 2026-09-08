@@ -50,6 +50,7 @@ pub rec LinkPublication {
 }
 
 pub rec Session {
+    view_generation: u64;
     alloc:       *A.Allocator;
     build_alloc: *A.Allocator;
     sources:    source.SourceMap;
@@ -109,6 +110,7 @@ pub fun init(alloc: *A.Allocator) R.Result[Session, str] {
     s.alloc            = alloc;
     s.parse_sequence   = 0;
     s.build_alloc      = alloc;
+    s.view_generation = 1;
     s.sources          = source.init(alloc);
     s.diags            = diagnostic.store_init(alloc);
     s.query_presentation = nil;
@@ -263,8 +265,14 @@ pub fun dnit(s: *Session) {
     source.dnit(?s.sources);
 }
 
+# exhaustion permanently refuses new borrowed views while teardown remains infallible
+pub fun expire_views(s: *Session) {
+    if (s.view_generation != ~(0::u64)) { s.view_generation = s.view_generation + 1; }
+}
+
 pub fun reset_module_registry(s: *Session) {
     if (s == nil) { ret; }
+    expire_views(s);
 
     if (s.module_asts != nil && s.module_ast_cap > 0) {
         A.deallocate[*ast.Ast](s.alloc, s.module_asts, s.module_ast_cap::usize);
@@ -289,6 +297,7 @@ pub fun reset_module_registry(s: *Session) {
 }
 
 pub fun register_module_ast(s: *Session, mid: module.ModuleId, a: *ast.Ast) R.Result[R.Void, str] {
+    expire_views(s);
     val needed: u32 = mid::u32 + 1;
     if (needed > s.module_ast_cap) {
         var new_cap: u32 = s.module_ast_cap;
@@ -416,6 +425,7 @@ pub fun reset_type_projection(s: *Session) R.Result[R.Void, str] {
     if (s.queries.operation_active || s.queries.presentation_pending) {
         ret R.err[R.Void, str]("cannot replace type projections while query products are borrowed");
     }
+    expire_views(s);
     type.field_projection_reset(?s.types);
     map.clear[u32, u32](?s.type_aligns);
     map.clear[u32, u32](?s.type_packed);
@@ -424,10 +434,12 @@ pub fun reset_type_projection(s: *Session) R.Result[R.Void, str] {
 }
 
 pub fun register_type_align(s: *Session, tid: u32, align: u32) R.Result[R.Void, str] {
+    expire_views(s);
     ret R.void_of[bool, str](map.insert[u32, u32](?s.type_aligns, tid, align));
 }
 
 pub fun register_type_packed(s: *Session, tid: u32) R.Result[R.Void, str] {
+    expire_views(s);
     ret R.void_of[bool, str](map.insert[u32, u32](?s.type_packed, tid, 1));
 }
 
@@ -436,6 +448,7 @@ pub fun type_is_packed(s: *Session, tid: u32) bool {
 }
 
 pub fun register_type_volatile(s: *Session, tid: u32) R.Result[R.Void, str] {
+    expire_views(s);
     ret R.void_of[bool, str](map.insert[u32, u32](?s.type_volatile, tid, 1));
 }
 
@@ -603,6 +616,7 @@ pub fun reset_link_publications(s: *Session) {
 }
 
 pub fun register_module_sema(s: *Session, mid: module.ModuleId, p: ptr) R.Result[R.Void, str] {
+    expire_views(s);
     ret R.void_of[bool, str](map.insert[module.ModuleId, ptr](?s.module_sema, mid, p));
 }
 
@@ -615,6 +629,7 @@ pub fun module_sema_ptr(s: *Session, mid: module.ModuleId) ptr {
 }
 
 pub fun register_module_resolve(s: *Session, mid: module.ModuleId, p: ptr) R.Result[R.Void, str] {
+    expire_views(s);
     ret R.void_of[bool, str](map.insert[module.ModuleId, ptr](?s.module_resolve, mid, p));
 }
 
@@ -627,6 +642,7 @@ pub fun module_resolve_ptr(s: *Session, mid: module.ModuleId) ptr {
 }
 
 pub fun register_module_comptime(s: *Session, mid: module.ModuleId, p: ptr) R.Result[R.Void, str] {
+    expire_views(s);
     ret R.void_of[bool, str](map.insert[module.ModuleId, ptr](?s.module_comptime, mid, p));
 }
 
@@ -710,64 +726,100 @@ pub fun load_source(s: *Session, path: str, text: str) R.Result[source.FileId, s
     fin { source.discard_load(?prepared); }
     val input: R.Result[R.Void, str] = query.set_input(?s.queries, query.Q_FILE_TEXT, prepared.id::u64, text::*u8, str_len(text)::u32);
     if (R.is_err[R.Void, str](input)) { ret R.err[source.FileId, str](R.unwrap_err[R.Void, str](input)); }
+    if (prepared.changed) { expire_views(s); }
     ret R.ok[source.FileId, str](source.commit_load(?prepared));
 }
 
-pub fun set_overlay(s: *Session, path: str, text: str) R.Result[R.Void, str] {
-    val key_r: R.Result[str, str] = source_key(s, path);
-    if (R.is_err[str, str](key_r)) { ret R.err[R.Void, str](R.unwrap_err[str, str](key_r)); }
-    val key: str = R.unwrap_ok[str, str](key_r);
+pub rec PreparedOverlay {
+    owner: *Session;
+    key: str;
+    text: str;
+    index: u32;
+    remove: bool;
+    changed: bool;
+}
 
-    val dup_text_r: R.Result[str, str] = str_dup(s.alloc, text);
-    if (R.is_err[str, str](dup_text_r)) {
-        str_free(s.alloc, key);
-        ret R.err[R.Void, str](R.unwrap_err[str, str](dup_text_r));
-    }
-    val dup_text: str = R.unwrap_ok[str, str](dup_text_r);
-
+# the caller exclusively borrows overlay state through commit or discard
+pub fun prepare_overlay(s: *Session, path: str, text: str, remove: bool) R.Result[PreparedOverlay, str] {
+    val canonical: R.Result[str, str] = source_key(s, path);
+    if (R.is_err[str, str](canonical)) { ret R.err[PreparedOverlay, str](R.unwrap_err[str, str](canonical)); }
+    var prepared: PreparedOverlay = PreparedOverlay{
+        owner: s, key: R.unwrap_ok[str, str](canonical), index: s.overlay_len, remove: remove
+    };
+    var complete: bool = false;
+    fin { if (!complete) { discard_overlay(?prepared); } }
     var i: u32 = 0;
     for (i < s.overlay_len) {
-        if (str_equals(s.overlays[i].path, key)) {
-            str_free(s.alloc, s.overlays[i].text);
-            s.overlays[i].text = dup_text;
-            str_free(s.alloc, key);
-            ret R.ok_void[str]();
-        }
+        if (str_equals(s.overlays[i].path, prepared.key)) { prepared.index = i; brk; }
         i = i + 1;
     }
-
-    val res_grow: R.Result[R.Void, str] = overlays_reserve(s, s.overlay_len + 1);
-    if (R.is_err[R.Void, str](res_grow)) {
-        str_free(s.alloc, dup_text);
-        str_free(s.alloc, key);
-        ret res_grow;
+    if (remove) { prepared.changed = prepared.index < s.overlay_len; }
+    or {
+        prepared.changed = prepared.index == s.overlay_len || !str_equals(s.overlays[prepared.index].text, text);
+        if (prepared.changed) {
+            val copied: R.Result[str, str] = str_dup(s.alloc, text);
+            if (R.is_err[str, str](copied)) { ret R.err[PreparedOverlay, str](R.unwrap_err[str, str](copied)); }
+            prepared.text = R.unwrap_ok[str, str](copied);
+            if (prepared.index == s.overlay_len) {
+                if (s.overlay_len == ~(0::u32)) { ret R.err[PreparedOverlay, str]("overlay capacity exhausted"); }
+                val reserved: R.Result[R.Void, str] = overlays_reserve(s, s.overlay_len + 1);
+                if (R.is_err[R.Void, str](reserved)) { ret R.err[PreparedOverlay, str](R.unwrap_err[R.Void, str](reserved)); }
+            }
+        }
     }
-    s.overlays[s.overlay_len].path = key;
-    s.overlays[s.overlay_len].text = dup_text;
-    s.overlay_len = s.overlay_len + 1;
+    complete = true;
+    ret R.ok[PreparedOverlay, str](prepared);
+}
+
+pub fun discard_overlay(prepared: *PreparedOverlay) {
+    if (prepared.owner == nil) { ret; }
+    str_free(prepared.owner.alloc, prepared.key);
+    str_free(prepared.owner.alloc, prepared.text);
+    prepared.owner = nil;
+    prepared.key = nil;
+    prepared.text = nil;
+}
+
+pub fun commit_overlay(prepared: *PreparedOverlay) bool {
+    val s: *Session = prepared.owner;
+    val changed: bool = prepared.changed;
+    if (changed) {
+        expire_views(s);
+        val i: u32 = prepared.index;
+        if (prepared.remove) {
+            str_free(s.alloc, s.overlays[i].path);
+            str_free(s.alloc, s.overlays[i].text);
+            s.overlay_len = s.overlay_len - 1;
+            if (i != s.overlay_len) { s.overlays[i] = s.overlays[s.overlay_len]; }
+        }
+        or {
+            if (i == s.overlay_len) {
+                s.overlays[i].path = prepared.key;
+                prepared.key = nil;
+                s.overlay_len = s.overlay_len + 1;
+            }
+            or { str_free(s.alloc, s.overlays[i].text); }
+            s.overlays[i].text = prepared.text;
+            prepared.text = nil;
+        }
+    }
+    discard_overlay(prepared);
+    ret changed;
+}
+
+pub fun set_overlay(s: *Session, path: str, text: str) R.Result[R.Void, str] {
+    val staged: R.Result[PreparedOverlay, str] = prepare_overlay(s, path, text, false);
+    if (R.is_err[PreparedOverlay, str](staged)) { ret R.void_of[PreparedOverlay, str](staged); }
+    var prepared: PreparedOverlay = R.unwrap_ok[PreparedOverlay, str](staged);
+    commit_overlay(?prepared);
     ret R.ok_void[str]();
 }
 
-pub fun clear_overlay(s: *Session, path: str) bool {
-    val key_r: R.Result[str, str] = source_key(s, path);
-    if (R.is_err[str, str](key_r)) { ret false; }
-    val key: str = R.unwrap_ok[str, str](key_r);
-
-    var i: u32 = 0;
-    for (i < s.overlay_len) {
-        if (str_equals(s.overlays[i].path, key)) {
-            str_free(s.alloc, key);
-            str_free(s.alloc, s.overlays[i].path);
-            str_free(s.alloc, s.overlays[i].text);
-            val last: u32 = s.overlay_len - 1;
-            if (i != last) { s.overlays[i] = s.overlays[last]; }
-            s.overlay_len = last;
-            ret true;
-        }
-        i = i + 1;
-    }
-    str_free(s.alloc, key);
-    ret false;
+pub fun clear_overlay(s: *Session, path: str) R.Result[bool, str] {
+    val staged: R.Result[PreparedOverlay, str] = prepare_overlay(s, path, nil, true);
+    if (R.is_err[PreparedOverlay, str](staged)) { ret R.err[bool, str](R.unwrap_err[PreparedOverlay, str](staged)); }
+    var prepared: PreparedOverlay = R.unwrap_ok[PreparedOverlay, str](staged);
+    ret R.ok[bool, str](commit_overlay(?prepared));
 }
 
 pub fun overlay_get(s: *Session, path: str) O.Option[str] {
@@ -796,7 +848,10 @@ fun overlays_reserve(s: *Session, need: u32) R.Result[R.Void, str] {
 
     var new_cap: u32 = s.overlay_cap;
     if (new_cap == 0) { new_cap = OVERLAY_SEED_CAP; }
-    for (new_cap < need) { new_cap = new_cap * 2; }
+    for (new_cap < need) {
+        if (new_cap > (~(0::u32)) / 2) { new_cap = need; }
+        or { new_cap = new_cap * 2; }
+    }
 
     if (s.overlays == nil) {
         val res_alloc: R.Result[*Overlay, str] = A.allocate[Overlay](s.alloc, new_cap::usize);
@@ -822,7 +877,8 @@ test "mach.lang.session.overlay:set_get_replace_clear" {
     var bad: i32 = 0;
 
     if (O.is_some[str](overlay_get(?s, "/x/a.mach"))) { bad = 1; }
-    if (clear_overlay(?s, "/x/a.mach"))               { bad = 1; }
+    val absent: R.Result[bool, str] = clear_overlay(?s, "/x/a.mach");
+    if (R.is_err[bool, str](absent) || R.unwrap_ok[bool, str](absent)) { bad = 1; }
 
     if (R.is_err[R.Void, str](set_overlay(?s, "/x/a.mach", "AAA"))) { dnit(?s); ret 1; }
     if (R.is_err[R.Void, str](set_overlay(?s, "/x/b.mach", "BBB"))) { dnit(?s); ret 1; }
@@ -837,7 +893,8 @@ test "mach.lang.session.overlay:set_get_replace_clear" {
     val ga2: O.Option[str] = overlay_get(?s, "/x/a.mach");
     if (O.is_none[str](ga2) || !str_equals(O.unwrap[str](ga2), "A2")) { bad = 1; }
 
-    if (!clear_overlay(?s, "/x/a.mach"))              { bad = 1; }
+    val cleared: R.Result[bool, str] = clear_overlay(?s, "/x/a.mach");
+    if (R.is_err[bool, str](cleared) || !R.unwrap_ok[bool, str](cleared)) { bad = 1; }
     if (s.overlay_len != 1)                           { bad = 1; }
     if (O.is_some[str](overlay_get(?s, "/x/a.mach"))) { bad = 1; }
     val gb2: O.Option[str] = overlay_get(?s, "/x/b.mach");
@@ -870,7 +927,8 @@ test "mach.lang.session.overlay:one_file_is_one_entry_however_it_is_spelled" {
     if (O.is_some[str](overlay_get(?s, "/x/src/b.mach")) && bad == 0) { bad = 7; }
     if (O.is_some[str](overlay_get(?s, "/src/a.mach"))   && bad == 0) { bad = 8; }
 
-    if (!clear_overlay(?s, "/x//src/a.mach") && bad == 0) { bad = 9; }
+    val cleared: R.Result[bool, str] = clear_overlay(?s, "/x//src/a.mach");
+    if ((R.is_err[bool, str](cleared) || !R.unwrap_ok[bool, str](cleared)) && bad == 0) { bad = 9; }
     if (s.overlay_len != 0                   && bad == 0) { bad = 10; }
 
     dnit(?s);
