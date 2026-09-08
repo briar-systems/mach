@@ -236,6 +236,7 @@ The pin moves from 0.28.1 to std 1.0.1, the audited transition dependency.
 
 - Reclaim vector scalarization maps and lane work after each function while retaining emitted operands in IR-owned storage.
 - Loop-invariant motion and scalar replacement reclaim analysis and rewrite plans after each function or transformation round, while emitted IR operands retain module ownership (#2299).
+- Register liveness propagates through recorded uses and predecessor edges instead of allocating four block-by-register matrices. Scratch storage grows with actual references, blocks, registers and edges, and is released when liveness finishes (#2299).
 - Optimization releases mem2reg, constant-folding, algebraic, common-subexpression and dead-code work tables after each function, and verifier scratch after each check, instead of retaining them in the lowered IR arena (#2299).
 
 - Three Windows corpus disassemblies now reflect the verified vector carrier ABI, including direct eight-byte payloads and exact twelve-byte staging (#3199).
