@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Integer vector division follows scalar division per lane, preserving signedness
+  and rejecting secret operands. Targets without packed division scalarize it.
+
 - `mach fmt <project-path> [--check]` formats declared project source without
   fetching dependencies or building. Check mode is read only, and file replacement
   uses held-root publication while preserving exact POSIX permission bits.
@@ -30,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Test listing stops after collecting tests without generating or linking machine code.
+- Required vector lowering preserves volatile accesses and runs in functions that
+  contain volatile I/O.
+
+- Constant expressions evaluate nested scalar casts and preserve integer widths and
+  signedness. Failed global initializers reject compilation and cannot publish zero
+  values or successful cached lowering products. Nonnumeric equal-size casts retain
+  their representation in both constant evaluation and runtime lowering.
 
 - Dotted import, re-export and type names resolve identically with spacing or comments around dots. Diagnostics retain the original source spans.
 - Embedded files are read through held directory and file handles. Escaping paths

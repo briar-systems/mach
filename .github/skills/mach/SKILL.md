@@ -318,7 +318,10 @@ Ten 128-bit SIMD vector types are also seeded: `f32x4 f64x2`, `i8x16 i16x8
 i32x4 i64x2`, and `u8x16 u16x8 u32x4 u64x2` — a single `x`, no other shapes.
 Literals are full-arity (`f32x4{1.0, 2.0, 3.0, 4.0}`), lane access `v[i]` takes
 a comptime-constant index, and the operators apply lane-wise with a comparison
-producing a same-shape unsigned mask. See `doc/language/types.md`.
+producing a same-shape unsigned mask. Integer vector `/` follows scalar division
+per lane using the lane type's signedness. It scalarizes where packed integer
+division is unavailable, and secret dividends or divisors are rejected. Vector
+`%` and shifts remain unsupported. See `doc/language/types.md`.
 
 ```mach
 *T                  # pointer          ?x address-of, @p dereference
