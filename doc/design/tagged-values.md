@@ -3,9 +3,9 @@
 Accepted by the owner on 2026-09-08 for #3217. This is the normative implementation
 contract for #3218 and #3219. The existing compiler does not implement these forms.
 
-The owner approved the complete design and confirmed the one-argument `res[E]`
-form after reviewing construction, direct case handling and `try` examples.
-It represents an explicit payloadless success case and an error payload of type E.
+The canonical types are `res[T, E]`, `opt[T]` and distinct `err[E]`. Each has one
+fixed generic arity. `err[E]` represents payloadless success or an error of type E
+and uses the same explicit failure handling as `res[T, E]`.
 
 ## Types and construction
 
@@ -38,8 +38,10 @@ on a payloadless case, multiple selections and an empty literal are errors.
 Payload types and generic arguments remain explicit under the existing rules.
 
 `res[T, E]` is a canonical tag with `err: E` first and `ok: T` second.
-`res[E]` has `err: E` first and payloadless `ok` second. This fixed one-argument
-form does not introduce general type inference or a dummy success type.
+`err[E]` is a distinct canonical tag with `err: E` first and payloadless `ok`
+second. It is not an alias of `opt[E]`. `res` requires exactly two type arguments,
+and `opt` and `err` each require exactly one. There is no defaulted type argument,
+general type inference or dummy success type.
 `opt[T]` has payloadless `none` first and `some: T` second. These types work
 without importing std and use the same tag implementation as user declarations.
 
@@ -49,14 +51,15 @@ tag WriteError {
     native: i32;
 }
 
-fun flush() res[WriteError] {
-    ret res[WriteError]{ok};
+fun flush() err[WriteError] {
+    ret err[WriteError]{ok};
 }
 ```
 
 `ok`, `err`, `some` and `none` are contextual case members, not global keywords.
-There is no `err` primitive and no `Void`, unit value, constructor function or
-automatic error conversion.
+The canonical `err[E]` type is resolved in type positions. Its `err` case follows
+the same contextual member rule as the `err` case of `res[T, E]`. There is no
+`Void`, unit value, constructor function or automatic error conversion.
 
 ## Tests, payload access and mutation
 
@@ -126,7 +129,7 @@ the explicitly typed error and executes the written failure block. That block
 must exit and cannot initialize the destination or provide a fallback value.
 Propagation and conversion remain ordinary visible code.
 
-`try` accepts canonical `res` and `opt` values. Ordinary user-defined tags have
+`try` accepts canonical `res`, `opt` and `err` values. Ordinary user-defined tags have
 no implicit success/failure convention and use explicit case tests.
 
 The operand is a prefix/postfix expression. A larger operand requires parentheses.
@@ -145,13 +148,14 @@ val number: i64 = try lookup(key) or {
 };
 
 try flush() or (error: WriteError) {
-    ret res[WriteError]{err: error};
+    ret err[WriteError]{err: error};
 };
 ```
 
-Options have no error binding. Result failure bindings use the exact error type.
-Payloadless result extraction produces no value and is allowed only as a direct
-expression statement. It cannot be an initializer, argument or arithmetic operand.
+Options have no error binding. Both `res` and `err` failure bindings use the
+exact error type. Successful `try` extracts the `ok` payload from `res` or the
+`some` payload from `opt`. For `err`, the payloadless `ok` case produces no value
+and `try` is allowed only as a direct expression statement. It cannot be an initializer, argument or arithmetic operand.
 
 Every reachable path through the failure block must leave it through an ordinary
 valid `ret`, or `brk`/`cnt` targeting an enclosing loop outside the failure block.
@@ -165,15 +169,16 @@ expression and does not initialize its destination. A replacement initializer
 may read the old selected payload before overwriting it.
 
 The assignment rule preserves the current compiler and audited 4.30 behavior.
-Historical #469/#494 chose LHS-first. The accepted v5 rule is RHS-first. This explicitly supersedes that earlier
-assignment-order decision.
+Historical #469/#494 chose LHS-first. The accepted v5 rule is RHS-first. This
+explicitly supersedes that earlier assignment-order decision.
 
 ## Initialization and representation
 
 Ordinary zero initialization remains uniform. Case code zero selects the first
 declared case and zero-initializes its payload. This applies to locals, globals,
 omitted fields, arrays and comptime values. Canonical option defaults to `none`
-and result defaults to `err` with a zero-initialized error payload. Raw allocated
+and both `res` and `err` default to their `err` case with a zero-initialized
+error payload. Raw allocated
 capacity is not automatically a constructed value.
 
 The discriminator is stored at offset zero in target byte order. Its type is
@@ -210,7 +215,7 @@ selected target's actual storage.
 
 Add three intrinsics, following existing comptime conventions:
 
-- `$is_tag(T)` identifies public tag shapes, including `res` and `opt`.
+- `$is_tag(T)` identifies public tag shapes, including `res`, `opt` and `err`.
 - `$cases(T)` enumerates owner-qualified descriptors in declaration order through
   the existing `$each` construct.
 - `$discriminant_of(T)` produces the actual unsigned discriminator type.
@@ -312,7 +317,7 @@ val fallback: i64 = try parse(input) or (error: ParseError) {
 
 fin {
     try flush() or (error: WriteError) {
-        ret res[WriteError]{err: error};
+        ret err[WriteError]{err: error};
     };                                # rejected, return crosses a fin boundary
 }
 ```

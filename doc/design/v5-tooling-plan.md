@@ -58,6 +58,6 @@ and dependency-name parsing, accurate help and preservation of Git boundaries.
 ## Accepted language contract
 
 The owner accepted the [tagged-value and failure-control contract](tagged-values.md)
-on 2026-09-08. It defines tag, res, opt and expression-level try with explicit
-types, visible failure exits and manual ownership. There is no separate err type.
+on 2026-09-08. It defines tag, res[T, E], opt[T], err[E] and expression-level try with explicit
+types, visible failure exits and manual ownership.
 The contract is approved for implementation through #3218 and #3219.
