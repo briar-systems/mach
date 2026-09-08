@@ -116,6 +116,32 @@ and the module tree is the artifact, so `mach build --target <spirv-target>` and
 There is no executable to link, no archive or shared-library form, and no test
 dispatcher to run; each is refused by name rather than attempted.
 
+Relocatable object output preserves explicit section names, native flags and
+section associations, including empty sections. Symbols retain local, global,
+weak, common and absolute definitions. A relocatable combination remaps section,
+symbol and relocation references without applying final executable layout or
+removing debug sections. `--emit obj` still delivers the per-module object tree
+described above, rather than combining that tree into one file.
+
+ELF section groups and Mach-O difference relocations and indirect-symbol tables
+retain their native relations. COFF DLL-attributed imports use native import
+tables and code thunks, preserving named or ordinal lookup and public aliases.
+Unrelated sections remain intact. Native metadata belongs to its object format:
+an output writer rejects metadata from another format, and ELF or Mach-O
+relocatable output rejects provider-attributed imports it cannot represent.
+
+Mach-O may combine eligible compiler-generated default data sections, but keeps
+explicit placements and parsed native sections distinct. An output requiring
+more than 255 distinct Mach-O sections is refused. COFF common symbols use its
+size-derived alignment, capped at 32 bytes, and reject an explicit alignment
+that the native common-symbol form cannot preserve.
+
+Final linking resolves absolute symbol values without treating them as external
+references or adding a loader base adjustment. Native Mach-O indirect-only
+sections currently require relocatable output. Position-independent links also
+reject absolute-address expressions that require an unsupported runtime base
+adjustment, including differences between absolute and image-relative symbols.
+
 The optimisation pipeline comes from the selected profile's `opt` — the profile
 is how a build picks its optimisation level.
 

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Relocatable linking preserves native sections, symbols, imports, attributes and
+  relocation relations across ELF, Mach-O and COFF. Final linking resolves absolute
+  definitions separately from image-relative symbols (#3119).
+
 - Instruction selection preserves each register operand's required bank. Post-allocation
   verification independently rejects wrong-bank operands, including conversions,
   moves, and memory addresses.
