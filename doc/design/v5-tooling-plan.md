@@ -55,9 +55,9 @@ refreshes copied path dependencies and applies the declared update policy.
 Acceptance includes every action invoked outside its project, unambiguous path
 and dependency-name parsing, accurate help and preservation of Git boundaries.
 
-## Separate language discussion
+## Accepted language contract
 
-try, res, opt, err and tag are permitted design candidates, not approved language
-features. Preserve explicit types, visible failure paths and manual ownership
-while evaluating them. No inference, propagation or tagged-union proposal has
-been approved for implementation.
+The owner accepted the [tagged-value and failure-control contract](tagged-values.md)
+on 2026-09-08. It defines tag, res[T, E], opt[T], err[E] and expression-level try with explicit
+types, visible failure exits and manual ownership.
+The contract is approved for implementation through #3218 and #3219.

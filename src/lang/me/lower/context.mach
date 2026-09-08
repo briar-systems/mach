@@ -114,7 +114,36 @@ pub rec ScopeMark {
     parent:     u64;
 }
 
+pub rec BindingInterface {
+    flags: u32;
+    export_name: intern.StrId;
+    op_set: u32;
+    op_code: u32;
+    has_body: bool;
+    needs_instance: bool;
+}
+
+pub rec BindingReader {
+    ctx: ptr;
+    read: fun(ptr, session.ModuleId, intern.StrId) R.Result[BindingInterface, fail.Fail];
+}
+
+pub fun binding_interface(lc: *LowerContext, sym: *resolve.Symbol) R.Result[BindingInterface, fail.Fail] {
+    if (lc.bindings.ctx == nil || lc.bindings.read == nil) {
+        fail.internal(?lc.status, "lower: imported binding requires an interface reader");
+        ret R.err[BindingInterface, fail.Fail](fail.phase_failure(lc.status));
+    }
+    val acquired: R.Result[BindingInterface, fail.Fail] = lc.bindings.read(lc.bindings.ctx, sym.origin, sym.canon);
+    if (R.is_err[BindingInterface, fail.Fail](acquired)) {
+        val reason: fail.Fail = R.unwrap_err[BindingInterface, fail.Fail](acquired);
+        if (reason.kind == fail.REPORTED) { fail.reject(?lc.status); }
+        or { fail.internal(?lc.status, reason.message); }
+    }
+    ret acquired;
+}
+
 pub rec LowerRequest {
+    bindings: BindingReader;
     deps: *sema.SemaDeps;
     diags: *diagnostic.DiagnosticStore;
     s:         *session.Session;
@@ -125,7 +154,14 @@ pub rec LowerRequest {
     debug:     bool;
 }
 
+rec LogicalTypePath {
+    ty: type.TypeId;
+    previous: *LogicalTypePath;
+}
+
 pub rec LowerContext {
+    bindings: BindingReader;
+    logical_type_path: *LogicalTypePath;
     deps: *sema.SemaDeps;
     diags: *diagnostic.DiagnosticStore;
     status: fail.PhaseStatus;
@@ -257,7 +293,8 @@ pub fun request(
     test_mode:   bool,
     debug:       bool,
     diags:       *diagnostic.DiagnosticStore,
-    deps:        *sema.SemaDeps
+    deps:        *sema.SemaDeps,
+    bindings:    BindingReader
 ) R.Result[LowerRequest, fail.Fail] {
     if (tgt == nil)    { ret R.err[LowerRequest, fail.Fail](fail.message("lower: a lowering request requires a resolved target")); }
     if (malloc == nil) { ret R.err[LowerRequest, fail.Fail](fail.message("lower: a lowering request requires an allocator")); }
@@ -269,6 +306,7 @@ pub fun request(
     var req: LowerRequest;
     req.s         = s;
     req.deps      = deps;
+    req.bindings  = bindings;
     req.diags     = diags;
     req.tgt       = tgt;
     req.malloc    = malloc;
@@ -324,8 +362,10 @@ pub fun init_context(lc: *LowerContext, req: *LowerRequest, m: *ir.Module) R.Res
     if (req == nil) { ret R.err[R.Void, fail.Fail](fail.message("lower: init_context requires a lowering request")); }
     val s: *session.Session = req.s;
     lc.status      = fail.accepted();
+    lc.logical_type_path = nil;
     lc.s           = s;
     lc.deps        = req.deps;
+    lc.bindings    = req.bindings;
     lc.diags       = req.diags;
     lc.tgt         = req.tgt;
     lc.scope       = req.module;
@@ -345,6 +385,7 @@ pub fun init_context(lc: *LowerContext, req: *LowerRequest, m: *ir.Module) R.Res
         resolve_field_member,
         resolve_type_query,
         resolve_layout_intrinsic,
+        resolve_scalar_cast, resolve_scalar_value,
         comptime_ident_is_runtime, comptime_expression, req.diags
     );
     if (R.is_err[comptime.PhaseCapabilities[LowerContext], str](caps_r)) {
@@ -644,6 +685,20 @@ pub fun comptime_ident_is_runtime(lc: *LowerContext, eid: id.ExprId) bool {
     val sid: resolve.SymbolId = rr.expr_resolved[eid];
     if (sid == resolve.SYMBOL_NIL || sid::u32 >= rr.symbol_count) { ret false; }
     ret resolve.symbol_is_runtime(?rr.symbols[sid]);
+}
+
+fun resolve_scalar_value(lc: *LowerContext, eid: id.ExprId, value: comptime.CTValue) R.Result[comptime.CTValue, comptime.EvalFail] {
+    val ty: type.TypeId = expr_type_of(lc, eid);
+    ret comptime.cast_scalar(?lc.s.types, lc.tgt.isa.pointer_width, value, ty, ty, false);
+}
+
+fun resolve_scalar_cast(lc: *LowerContext, eid: id.ExprId, value: comptime.CTValue) R.Result[comptime.CTValue, comptime.EvalFail] {
+    val expression_r: R.Result[aexpr.Expr, str] = expression(lc, eid);
+    if (R.is_err[aexpr.Expr, str](expression_r)) { ret R.err[comptime.CTValue, comptime.EvalFail](comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, R.unwrap_err[aexpr.Expr, str](expression_r))); }
+    val node: aexpr.Expr = R.unwrap_ok[aexpr.Expr, str](expression_r);
+    if (node.kind != aexpr.EXPR_KIND_CAST) { ret R.err[comptime.CTValue, comptime.EvalFail](comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, "lowering cast capability requires a cast expression")); }
+    ret comptime.cast_scalar(?lc.s.types, lc.tgt.isa.pointer_width, value,
+        expr_type_of(lc, node.data.cast.value), type_resolved_of(lc, node.data.cast.ty), node.data.cast.reinterpret);
 }
 
 pub fun resolve_type_comparison_operand(lc: *LowerContext, eid: id.ExprId) R.Result[O.Option[u32], comptime.EvalFail] {
@@ -1110,6 +1165,26 @@ pub fun lower_type(lc: *LowerContext, tid: type.TypeId) R.Result[ir_type.IrTypeI
         rtid = recover_type(lc, generics.substitute(lc.s, tid, lc.scope.subst, lc.scope.subst_len));
     }
 
+    val previous: *LogicalTypePath = lc.logical_type_path;
+    var path: LogicalTypePath;
+    if (!lc.tgt.model.flat_addressing) {
+        var active: *LogicalTypePath = previous;
+        for (active != nil) {
+            if (active.ty == rtid) {
+                var span: token.Span;
+                span.offset = lc.builder.loc.offset;
+                span.len = 0;
+                ret R.err[ir_type.IrTypeId, fail.Fail](report_gate(lc, span,
+                    "recursive reference types require pointer capabilities absent from the Logical Shader environment"));
+            }
+            active = active.previous;
+        }
+        path.ty = rtid;
+        path.previous = previous;
+        lc.logical_type_path = ?path;
+    }
+    fin { lc.logical_type_path = previous; }
+
     val fields: R.Result[R.Void, str] = generics.ensure_fields(lc.s, rtid);
     if (R.is_err[R.Void, str](fields)) { ret fail.lift[ir_type.IrTypeId](R.err[ir_type.IrTypeId, str](R.unwrap_err[R.Void, str](fields))); }
     if (lc.status.kind == fail.INTERNAL) { ret R.err[ir_type.IrTypeId, fail.Fail](fail.phase_failure(lc.status)); }
@@ -1127,7 +1202,12 @@ pub fun lower_type(lc: *LowerContext, tid: type.TypeId) R.Result[ir_type.IrTypeI
     if (d.class == type.PRIM_CLASS_INT)   { ret fail.lift[ir_type.IrTypeId](ir_type.intern_int(?lc.m.types, d.bits)); }
     if (d.class == type.PRIM_CLASS_FLOAT) { ret fail.lift[ir_type.IrTypeId](ir_type.intern_float(?lc.m.types, d.bits)); }
     if (d.class == type.PRIM_CLASS_PTR)   { ret fail.lift[ir_type.IrTypeId](ir_type.intern_ptr(?lc.m.types)); }
-    if (k == type.TYPE_POINTER)           { ret fail.lift[ir_type.IrTypeId](ir_type.intern_ptr(?lc.m.types)); }
+    if (k == type.TYPE_POINTER) {
+        if (lc.tgt.model.flat_addressing) { ret fail.lift[ir_type.IrTypeId](ir_type.intern_ptr(?lc.m.types)); }
+        val base: R.Result[ir_type.IrTypeId, fail.Fail] = lower_type(lc, t.data.pointer.base);
+        if (R.is_err[ir_type.IrTypeId, fail.Fail](base)) { ret base; }
+        ret fail.lift[ir_type.IrTypeId](ir_type.intern_reference(?lc.m.types, R.unwrap_ok[ir_type.IrTypeId, fail.Fail](base)));
+    }
 
     if (k == type.TYPE_ARRAY) {
         val res_base: R.Result[ir_type.IrTypeId, fail.Fail] = lower_type(lc, t.data.array.base);
@@ -1908,14 +1988,14 @@ test "mach.lang.me.lower.context.request:refuses_a_module_product_that_does_not_
 
     var code: i32 = 0;
 
-    val good: R.Result[LowerRequest, fail.Fail] = request(?s, ?tgt, ?alloc, ?a1, fqn, mid, ?sm1, ?rr1, ?cc1, false, false, nil, ?deps);
+    val good: R.Result[LowerRequest, fail.Fail] = request(?s, ?tgt, ?alloc, ?a1, fqn, mid, ?sm1, ?rr1, ?cc1, false, false, nil, ?deps, BindingReader{});
     if (R.is_err[LowerRequest, fail.Fail](good)) { ret 1; }
     val req: LowerRequest = R.unwrap_ok[LowerRequest, fail.Fail](good);
     if (req.module.a != ?a1 || req.module.own_module != mid) { code = 1; }
 
-    if (R.is_ok[LowerRequest, fail.Fail](request(?s, nil, ?alloc, ?a1, fqn, mid, ?sm1, ?rr1, ?cc1, false, false, nil, ?deps))) { code = 1; }
-    if (R.is_ok[LowerRequest, fail.Fail](request(?s, ?tgt, nil, ?a1, fqn, mid, ?sm1, ?rr1, ?cc1, false, false, nil, ?deps)))   { code = 1; }
-    if (R.is_ok[LowerRequest, fail.Fail](request(?s, ?tgt, ?alloc, ?a2, fqn, mid, ?sm1, ?rr1, ?cc1, false, false, nil, ?deps))) { code = 1; }
+    if (R.is_ok[LowerRequest, fail.Fail](request(?s, nil, ?alloc, ?a1, fqn, mid, ?sm1, ?rr1, ?cc1, false, false, nil, ?deps, BindingReader{}))) { code = 1; }
+    if (R.is_ok[LowerRequest, fail.Fail](request(?s, ?tgt, nil, ?a1, fqn, mid, ?sm1, ?rr1, ?cc1, false, false, nil, ?deps, BindingReader{})))   { code = 1; }
+    if (R.is_ok[LowerRequest, fail.Fail](request(?s, ?tgt, ?alloc, ?a2, fqn, mid, ?sm1, ?rr1, ?cc1, false, false, nil, ?deps, BindingReader{}))) { code = 1; }
 
     ret code;
 }

@@ -193,7 +193,7 @@ such an image is refused at link rather than silently dropped.
 
 | Axis  | Values |
 |-------|--------|
-| `isa` | `x86_64`, `aarch64`, `riscv64`, `riscv32`, `spirv` |
+| `isa` | `x86_64`, `aarch64`, `riscv64`, `riscv32`, canonical RISC-V extension strings, `spirv` |
 | `os`  | `linux`, `windows`, `darwin`, `freestanding` |
 | `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, `ilp32d`, `spirv` |
 
@@ -212,13 +212,26 @@ not an os of its own. `spirv` is not a machine at all — it
 emits a finished GPU module rather than machine code (see
 [Finished-module targets](#finished-module-targets)).
 
-`riscv64` and `riscv32` are width-only spellings, and each names a **default
-profile**: `riscv64` is `rv64gc` and `riscv32` is `rv32imac`. That default is
-the only profile a target can name today. There is no key that bounds the
-extensions below it (an `isa = "rv32imc"` or a standard profile string is not
-accepted), and the width-only spelling is never rejected; extension bounding is
-future additive work. The ABI, not the isa, selects the calling convention and
-the float facts.
+`riscv64` and `riscv32` name the default profiles `rv64gc` and `rv32imac`.
+A canonical extension string such as `rv32imc` selects a smaller machine.
+The retained vocabulary is I, M, A, F, D, C, Zicsr and Zifencei, written in
+lowercase canonical order. G expands to IMAFD plus Zicsr and Zifencei.
+F includes its required Zicsr capability, and D requires F. Optional versions
+must match I 2.1, M 2.0, A 2.1, F/D 2.2, C 2.0 or Zicsr/Zifencei 2.0.
+Unknown extensions, unsupported versions, duplicates, noncanonical order,
+E-base machines and profiles outside this vocabulary are refused.
+
+The selected ISA bounds compiler-generated instructions and named inline assembly.
+Foreign object attributes must declare only selected extensions at the supported
+versions and the same register width. Linking never expands the selected ISA.
+Object header flags are checked even when attributes are absent. The compressed
+flag requires C, and flags for unavailable extensions or ABIs are refused.
+C is accepted as a hardware capability, but the current emitter uses full-width
+instructions. Explicit raw assembly directives remain the documented unchecked
+encoding boundary, so their author must ensure extension compatibility.
+The ABI selects calling convention independently and must fit the selected ISA.
+For example, `rv32imc` has no floating-point or atomic capability and requires
+`ilp32`. Use `rv32imafdc` with `ilp32d` when RV32 hardware floating point is needed.
 
 `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, and `ilp32d` are the RISC-V psABI
 calling-convention family, one `abi` per member. The lp64 three target

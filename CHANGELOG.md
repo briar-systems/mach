@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Canonical RISC-V extension selection bounds generated instructions, named
+  assembly, object attributes and header flags while preserving explicit ABIs.
+
+- Integer vector division follows scalar division per lane, preserving signedness
+  and rejecting secret operands. Targets without packed division scalarize it.
+
+- Persistent object-image caching across compiler processes, bounded entry storage, and `--no-cache` for build and test.
 - `mach fmt <project-path> [--check]` formats declared project source without
   fetching dependencies or building. Check mode is read only, and file replacement
   uses held-root publication while preserving exact POSIX permission bits.
@@ -29,8 +36,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Test listing stops after collecting tests without generating or linking machine code.
+- Relocatable linking preserves native section identities, symbol definitions,
+  import declarations and relocation relations instead of applying final-image
+  section merging. ELF groups, Mach-O indirect symbols and difference relocations,
+  and COFF native imports survive object round trips. Unsupported native
+  representations are diagnosed instead of silently losing metadata. (#3119)
 
+- Release inlining acquires eligible bodies across module boundaries with bounded
+  owned storage, preserving symbol identity, assembly effects and debug metadata.
+  Provider body changes invalidate importers even when a body was previously
+  ineligible. Recursive peeling respects `noinline`, `scalar`, and naked function
+  boundaries, and call cycles are detected in one traversal. (#3110)
+
+- SPIR-V calls carry typed logical arguments and results without a synthetic
+  register bank. Whole-object reference parameters preserve their pointee types.
+
+- Serial optimization records its processed modules, and parallel lowering counts
+  each module once in progress output.
+
+- Comptime evaluation distinguishes unknown internal tags from unsupported values
+  and rejects comparisons of reflection descriptors without equality semantics.
+
+- Test listing stops after collecting tests without generating or linking machine code.
+- Required vector lowering preserves volatile accesses and runs in functions that
+  contain volatile I/O.
+
+- Native encoder failures preserve full opcode values and report owned diagnostics.
+  Selected target instructions are validated in their own opcode domain.
+
+- Darwin persistent cache identity hashes the compiler executable through its own
+  code mapping, including when the loader inserts libraries before that executable.
+
+- Darwin linker planning releases temporary working-directory and runtime search
+  paths after copying their results, including rejected and undersized outputs.
+
+- Embedded files resolve consistently with relative or absolute project and source
+  paths. Project containment still rejects traversal and symlink escapes.
+
+- Unknown syntax, operator, IR operand and backend instruction, operand and register
+  class tags report internal failures with their catalog and numeric value. Verifier diagnostics own their text and propagate
+  allocation failures without losing tag or source information.
+
+- Constant expressions evaluate nested scalar casts and preserve integer widths and
+  signedness. Failed global initializers reject compilation and cannot publish zero
+  values or successful cached lowering products. Nonnumeric equal-size casts retain
+  their representation in both constant evaluation and runtime lowering.
+
+- Dotted import, re-export and type names resolve identically with spacing or comments around dots. Diagnostics retain the original source spans.
 - Embedded files are read through held directory and file handles. Escaping paths
   and symlinks are rejected before reading, and failed refreshes preserve cache
   ownership and the prior query input.
@@ -55,6 +107,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI rebuilds its audited compiler from published 4.26.5 and source commits reachable from main after withdrawal of the 4.30.0 release.
 
 ### Changed
+
+- Vector operations require an explicit target capability row. Missing or malformed
+  operation and lane shapes no longer default to packed support.
 
 - Removed `$project.name`, `$project.description` and the `$mach.abi.sysv` alias. Diagnostics identify the removed forms, and the ABI tag uses only `sysv64`.
 

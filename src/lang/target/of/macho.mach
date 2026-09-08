@@ -77,6 +77,7 @@ val VM_PROT_EXECUTE: u32 = 4;
 val SECTION_TYPE:             u32 = 0x000000FF;
 val S_ZEROFILL:               u32 = 0x1;
 val S_MOD_INIT_FUNC_POINTERS: u32 = 0x9;
+val S_ATTR_NO_DEAD_STRIP: u32 = 0x10000000;
 val S_ATTR_DEBUG:             u32 = 0x02000000;
 val S_ATTR_SOME_INSTRUCTIONS: u32 = 0x00000400;
 val S_ATTR_PURE_INSTRUCTIONS: u32 = 0x80000000;
@@ -85,8 +86,10 @@ val N_EXT:  u8 = 0x01;
 val N_TYPE: u8 = 0x0e;
 val N_UNDF: u8 = 0x00;
 val N_SECT: u8 = 0x0e;
+val N_ABS: u8 = 0x02;
 
 val N_WEAK_DEF: u16 = 0x0080;
+val N_WEAK_REF: u16 = 0x0040;
 
 val REFERENCE_TYPE_MASK:          u16 = 0x7;
 val REFERENCE_FLAG_UNDEFINED_LAZY: u16 = 0x1;
@@ -102,6 +105,7 @@ val X86_64_RELOC_SIGNED_2: u32 = 7;
 val X86_64_RELOC_SIGNED_4: u32 = 8;
 
 val ARM64_RELOC_UNSIGNED:  u32 = 0;
+val ARM64_RELOC_SUBTRACTOR: u32 = 1;
 val ARM64_RELOC_BRANCH26:  u32 = 2;
 val ARM64_RELOC_PAGE21:    u32 = 3;
 val ARM64_RELOC_PAGEOFF12: u32 = 4;
@@ -358,6 +362,7 @@ fun macho_kind_from(flags: u32, is_text: bool, is_data_const: bool, is_rodata: b
 }
 
 fun needs_addend_entry(arch_id: u32, kind: of.RelocKind, addend: i64) bool {
+    if (of.is_difference(kind))                      { ret false; }
     if (!arch_is_arm64(arch_id))                     { ret false; }
     if (addend == 0)                                 { ret false; }
     if (kind == of.RK_ABS64 || kind == of.RK_ABS32) { ret false; }
@@ -370,7 +375,8 @@ fun reloc_entries_for_section(img: *of.ObjectImage, sec_idx: u32, arch_id: u32) 
     for (i < img.reloc_count) {
         if (img.relocations[i].section == sec_idx) {
             n = n + 1;
-            if (needs_addend_entry(arch_id, img.relocations[i].kind, img.relocations[i].addend)) { n = n + 1; }
+            if (of.is_difference(img.relocations[i].kind)
+                || needs_addend_entry(arch_id, img.relocations[i].kind, img.relocations[i].addend)) { n = n + 1; }
         }
         i = i + 1;
     }
@@ -396,8 +402,22 @@ fun validate_reloc_symbols(img: *of.ObjectImage) R.Result[R.Void, str] {
 fun validate_reloc_kinds(img: *of.ObjectImage, arch_id: u32) R.Result[R.Void, str] {
     var i: u32 = 0;
     for (i < img.reloc_count) {
-        val r: R.Result[MachoReloc, str] = macho_reloc_for(img.interner, img.alloc, arch_id, img.relocations[i].kind);
+        var kind: of.RelocKind = img.relocations[i].kind;
+        if (of.is_difference(kind)) {
+            if (img.relocations[i].sym2 >= img.symbol_count) {
+                ret R.err[R.Void, str]("macho: difference relocation has no second symbol");
+            }
+            if (kind == of.RK_DIFF64) { kind = of.RK_ABS64; }
+            or { kind = of.RK_ABS32; }
+        }
+        val r: R.Result[MachoReloc, str] = macho_reloc_for(img.interner, img.alloc, arch_id, kind);
         if (R.is_err[MachoReloc, str](r)) { ret R.err[R.Void, str](R.unwrap_err[MachoReloc, str](r)); }
+        val reloc: *of.Relocation = ?img.relocations[i];
+        val width: u32 = 1 << R.unwrap_ok[MachoReloc, str](r).length;
+        if (reloc.section >= img.section_count || img.sections[reloc.section].bytes == nil
+            || reloc.offset > img.sections[reloc.section].len || width > img.sections[reloc.section].len - reloc.offset) {
+            ret R.err[R.Void, str]("macho: relocation field is outside its section bytes");
+        }
         i = i + 1;
     }
     ret R.ok_void[str]();
@@ -538,8 +558,18 @@ fun write_nlist(buf: *u8, sym_off: usize, str_base: usize, str_pos: *usize,
     or ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0) {
         n_desc = REFERENCE_FLAG_UNDEFINED_LAZY;
     }
+    if (sym.section == of.SECTION_EXTERNAL && (sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0) { n_desc = n_desc | N_WEAK_REF; }
+    if ((sym.flags & of.SYM_OBJ_FLAG_COMMON) != 0) {
+        n_value = sym.size::u64;
+        n_desc = n_desc | (align_log2(sym.align)::u16 << 8);
+    }
+    if (sym.section == of.SECTION_ABSOLUTE) { n_type = N_ABS; n_value = sym.absolute_value; }
     if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0 || sym.section == of.SECTION_EXTERNAL) {
         n_type = n_type | N_EXT;
+    }
+    if (sym.native.format == of.OF_MACHO) {
+        n_type = n_type | (sym.native.kind::u8 & ~(N_TYPE | N_EXT));
+        n_desc = sym.native.flags::u16;
     }
     buf[sym_off + 4] = n_type;
     buf[sym_off + 5] = n_sect;
@@ -554,14 +584,14 @@ fun add_u64_mod(a: u64, b: u64) u64 {
 }
 
 fun fold_inplace_addend(buf: *u8, field: usize, arch_id: u32, kind: of.RelocKind, addend: i64) {
-    if (kind == of.RK_ABS64) {
+    if (kind == of.RK_ABS64 || kind == of.RK_DIFF64) {
         if (addend != 0) {
             bin.write_u64_le(buf, field,
                 add_u64_mod(bin.read_u64_le(buf, field), addend::u64));
         }
         ret;
     }
-    if (kind == of.RK_ABS32) {
+    if (kind == of.RK_ABS32 || kind == of.RK_DIFF32) {
         if (addend != 0) { bin.write_u32_le(buf, field, bin.read_u32_le(buf, field) + (addend::u64)::u32); }
         ret;
     }
@@ -593,12 +623,93 @@ rec MachoOutSec {
     align:  u32;
     reloff: usize;
     nrel:   u32;
+    indirect_base: u32;
+}
+
+fun generated_section_group(img: *of.ObjectImage, index: u32) u32 {
+    val sec: *of.Section = ?img.sections[index];
+    if (sec.native.format != 0 || (sec.flags & of.SEC_FLAG_COALESCE) == 0) { ret index; }
+    var i: u32 = 0;
+    for (i < index) {
+        val prior: *of.Section = ?img.sections[i];
+        if (prior.native.format == 0 && prior.flags == sec.flags && prior.kind == sec.kind
+            && prior.name == sec.name && prior.align == sec.align) { ret i; }
+        i = i + 1;
+    }
+    ret index;
+}
+
+fun generated_section_count(img: *of.ObjectImage) R.Result[u32, str] {
+    var count: u32 = 0;
+    var size: u64 = 0;
+    var i: u32 = 0;
+    for (i < img.section_count) {
+        val padded: u64 = img.sections[i].len::u64 + img.sections[i].align::u64 - 1;
+        if (size > 0xFFFFFFFFFFFFFFFF - padded) { ret R.err[u32, str]("macho: generated section layout overflows"); }
+        size = size + padded;
+        if (generated_section_group(img, i) == i) { count = count + 1; }
+        i = i + 1;
+    }
+    ret R.ok[u32, str](count);
+}
+
+fun plan_generated_sections(img: *of.ObjectImage, out: *MachoOutSec, sec_to_out: *u32) {
+    var count: u32 = 0;
+    var i: u32 = 0;
+    for (i < img.section_count) {
+        val representative: u32 = generated_section_group(img, i);
+        if (representative != i) { sec_to_out[i] = sec_to_out[representative]; }
+        or {
+            out[count].kind = img.sections[i].kind;
+            out[count].srcsec = i;
+            sec_to_out[i] = count;
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fun indirect_slots(section: *of.Section) R.Result[u32, str] {
+    if (section.native.format != of.OF_MACHO) { ret R.ok[u32, str](0); }
+    val kind: u32 = section.native.flags::u32 & SECTION_TYPE;
+    var stride: u32 = 0;
+    if (kind == 6 || kind == 7 || kind == 0x10 || kind == 0x14) { stride = 8; }
+    or (kind == 8) {
+        stride = section.native.reserved2;
+        if (stride == 0) { ret R.err[u32, str]("macho: symbol stub has zero stride"); }
+    }
+    if (stride == 0) { ret R.ok[u32, str](0); }
+    if (section.len % stride != 0) { ret R.err[u32, str]("macho: indirect section has an incomplete slot"); }
+    ret R.ok[u32, str](section.len / stride);
+}
+
+fun validate_indirects(img: *of.ObjectImage) R.Result[R.Void, str] {
+    var entry: u32 = 0;
+    var section: u32 = 0;
+    for (section < img.section_count) {
+        val planned: R.Result[u32, str] = indirect_slots(?img.sections[section]);
+        if (R.is_err[u32, str](planned)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](planned)); }
+        val count: u32 = R.unwrap_ok[u32, str](planned);
+        if (count > img.indirect_count - entry) { ret R.err[R.Void, str]("macho: indirect section is missing symbol slots"); }
+        var slot: u32 = 0;
+        for (slot < count) {
+            if (img.indirects[entry].section != section || img.indirects[entry].slot != slot) {
+                ret R.err[R.Void, str]("macho: indirect slots must be complete and ordered by section");
+            }
+            entry = entry + 1;
+            slot = slot + 1;
+        }
+        section = section + 1;
+    }
+    if (entry != img.indirect_count) { ret R.err[R.Void, str]("macho: indirect symbol has no native slot"); }
+    ret R.ok_void[str]();
 }
 
 fun emit_object(isa_vt: *of.ObjectTarget, img: *of.ObjectImage, destination: *publication.Destination) R.Result[R.Void, str] {
     if (isa_vt == nil || img == nil || destination == nil) {
         ret R.err[R.Void, str]("macho: nil writer argument");
     }
+    if (img.import_count != 0) { ret R.err[R.Void, str]("macho: attributed imports are not representable in a Mach-O relocatable object"); }
     val arch_id: u32 = isa_vt.arch_id;
     val ct: R.Result[u32, str] = cpu_type_for(arch_id);
     if (R.is_err[u32, str](ct)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](ct)); }
@@ -611,35 +722,36 @@ fun emit_object(isa_vt: *of.ObjectTarget, img: *of.ObjectImage, destination: *pu
     val alloc:    *A.Allocator = img.alloc;
     val num_secs: u32 = img.section_count;
     val num_syms: u32 = img.symbol_count;
-
-    var nd_order: [4]of.SectionKind;
-    nd_order[0] = of.SK_TEXT;
-    nd_order[1] = of.SK_RODATA;
-    nd_order[2] = of.SK_RELRO;
-    nd_order[3] = of.SK_DATA;
-
-    var num_out: u32 = 0;
-    var ci: u32 = 0;
-    for (ci < 4) {
-        var sp: u32 = 0;
-        for (sp < num_secs) {
-            if (img.sections[sp].kind == nd_order[ci]) { num_out = num_out + 1; brk; }
-            sp = sp + 1;
+    val native_valid: R.Result[R.Void, str] = of.validate_native_sections(img, of.OF_MACHO);
+    if (R.is_err[R.Void, str](native_valid)) { ret native_valid; }
+    val indirect_valid: R.Result[R.Void, str] = validate_indirects(img);
+    if (R.is_err[R.Void, str](indirect_valid)) { ret indirect_valid; }
+    var common_i: u32 = 0;
+    for (common_i < num_syms) {
+        val symbol: *of.Symbol = ?img.symbols[common_i];
+        if ((symbol.flags & of.SYM_OBJ_FLAG_COMMON) != 0
+            && (symbol.size == 0 || symbol.align > 32768
+                || (symbol.align != 0 && (symbol.align & (symbol.align - 1)) != 0))) {
+            ret R.err[R.Void, str]("macho: common size or alignment is not natively representable");
         }
-        ci = ci + 1;
+        common_i = common_i + 1;
     }
-    var sp_dbg: u32 = 0;
-    for (sp_dbg < num_secs) {
-        if (img.sections[sp_dbg].kind == of.SK_DEBUG) { num_out = num_out + 1; }
-        sp_dbg = sp_dbg + 1;
+    val planned: R.Result[u32, str] = generated_section_count(img);
+    if (R.is_err[u32, str](planned)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](planned)); }
+    val num_out: u32 = R.unwrap_ok[u32, str](planned);
+    var name_i: u32 = 0;
+    for (name_i < num_secs) {
+        val section: *of.Section = ?img.sections[name_i];
+        val named: str = bin.resolve_name(img.interner, section.name);
+        if (section.native.format == 0 && section.kind != of.SK_DEBUG
+            && named != nil && str_len(named) > 16) {
+            ret R.err[R.Void, str]("macho: section name exceeds the native sixteen-byte field");
+        }
+        name_i = name_i + 1;
     }
-    var has_bss: bool = false;
-    var sp_bss: u32 = 0;
-    for (sp_bss < num_secs) {
-        if (img.sections[sp_bss].kind == of.SK_BSS) { has_bss = true; brk; }
-        sp_bss = sp_bss + 1;
+    if (num_out > 255 || num_syms > 0x1000000) {
+        ret R.err[R.Void, str]("macho: section or relocation symbol ordinal exceeds its native width");
     }
-    if (has_bss) { num_out = num_out + 1; }
 
     val seg_cmd_size: usize = SEGMENT_CMD_64_SIZE + num_out::usize * SECTION_64_SIZE;
     val sizeofcmds:   usize = seg_cmd_size + SYMTAB_CMD_SIZE + DYSYMTAB_CMD_SIZE;
@@ -673,46 +785,13 @@ fun emit_object(isa_vt: *of.ObjectTarget, img: *of.ObjectImage, destination: *pu
     }
     var out: *MachoOutSec = R.unwrap_ok[*MachoOutSec, str](res_out);
 
-    var no: u32 = 0;
-    ci = 0;
-    for (ci < 4) {
-        var present: bool = false;
-        var sp: u32 = 0;
-        for (sp < num_secs) {
-            if (img.sections[sp].kind == nd_order[ci]) { present = true; brk; }
-            sp = sp + 1;
-        }
-        if (present) {
-            out[no].kind   = nd_order[ci];
-            out[no].srcsec = 0xFFFFFFFF;
-            sp = 0;
-            for (sp < num_secs) {
-                if (img.sections[sp].kind == nd_order[ci]) { sec_to_out[sp] = no; }
-                sp = sp + 1;
-            }
-            no = no + 1;
-        }
-        ci = ci + 1;
-    }
-    var sp_d: u32 = 0;
-    for (sp_d < num_secs) {
-        if (img.sections[sp_d].kind == of.SK_DEBUG) {
-            out[no].kind   = of.SK_DEBUG;
-            out[no].srcsec = sp_d;
-            sec_to_out[sp_d] = no;
-            no = no + 1;
-        }
-        sp_d = sp_d + 1;
-    }
-    if (has_bss) {
-        out[no].kind   = of.SK_BSS;
-        out[no].srcsec = 0xFFFFFFFF;
-        var sp: u32 = 0;
-        for (sp < num_secs) {
-            if (img.sections[sp].kind == of.SK_BSS) { sec_to_out[sp] = no; }
-            sp = sp + 1;
-        }
-        no = no + 1;
+    plan_generated_sections(img, out, sec_to_out);
+    var indirect_base: u32 = 0;
+    var indirect_section: u32 = 0;
+    for (indirect_section < num_out) {
+        out[indirect_section].indirect_base = indirect_base;
+        indirect_base = indirect_base + R.unwrap_ok[u32, str](indirect_slots(?img.sections[out[indirect_section].srcsec]));
+        indirect_section = indirect_section + 1;
     }
 
     var vm: u64 = 0;
@@ -784,11 +863,20 @@ fun emit_object(isa_vt: *of.ObjectTarget, img: *of.ObjectImage, destination: *pu
         ko = ko + 1;
     }
 
-    val symtab_off: usize = bin.align_up(roff, 8);
+    val indirect_off: usize = bin.align_up(roff, 4);
+    val indirect_size: usize = img.indirect_count::usize * 4;
+    val symtab_off: usize = bin.align_up(indirect_off + indirect_size, 8);
     val symtab_sz:  usize = num_syms::usize * NLIST_64_SIZE;
     val strtab_off: usize = symtab_off + symtab_sz;
     val strtab_sz:  usize = strtab_size(img);
     val total_size: usize = strtab_off + strtab_sz;
+    if (total_size > 0xFFFFFFFF) {
+        A.deallocate[u64](alloc, sec_addr, (num_secs + 1)::usize);
+        A.deallocate[usize](alloc, data_off, (num_secs + 1)::usize);
+        A.deallocate[u32](alloc, sec_to_out, (num_secs + 1)::usize);
+        A.deallocate[MachoOutSec](alloc, out, num_out::usize);
+        ret R.err[R.Void, str]("macho: object layout exceeds native file-offset width");
+    }
 
     var lay: bin.Layout;
     bin.layout_init(?lay);
@@ -811,6 +899,8 @@ fun emit_object(isa_vt: *of.ObjectTarget, img: *of.ObjectImage, destination: *pu
         }
         ko = ko + 1;
     }
+    bin.layout_pad(?lay, "indirect table alignment", indirect_off);
+    bin.layout_region(?lay, "indirect symbols", indirect_off, indirect_size);
     bin.layout_pad(?lay, "symbol table alignment", symtab_off);
     bin.layout_region(?lay, "symbol table", symtab_off, symtab_sz);
     bin.layout_region(?lay, "string table", strtab_off, strtab_sz);
@@ -858,13 +948,20 @@ fun emit_object(isa_vt: *of.ObjectTarget, img: *of.ObjectImage, destination: *pu
     var sh: usize = lc + SEGMENT_CMD_64_SIZE;
     ko = 0;
     for (ko < num_out) {
-        if (out[ko].kind == of.SK_DEBUG) {
-            write_dwarf_sectname(buf, sh, bin.resolve_name(img.interner, img.sections[out[ko].srcsec].name));
+        val section: *of.Section = ?img.sections[out[ko].srcsec];
+        if (section.native.format == of.OF_MACHO) {
+            memory.raw_copy((buf::usize + sh)::ptr, (?section.native.name[0])::ptr, 16);
+            memory.raw_copy((buf::usize + sh + 16)::ptr, (?section.native.segment[0])::ptr, 16);
         }
         or {
-            write_fixed16(buf, sh, macho_sectname(out[ko].kind));
+            val named: str = bin.resolve_name(img.interner, section.name);
+            if (section.kind == of.SK_DEBUG) { write_dwarf_sectname(buf, sh, named); }
+            or (str_equals(named, of.canonical_section_name(section.kind))) {
+                write_fixed16(buf, sh, macho_sectname(section.kind));
+            }
+            or { write_fixed16(buf, sh, named); }
+            write_fixed16(buf, sh + 16, macho_segname(section.kind));
         }
-        write_fixed16(buf, sh + 16, macho_segname(out[ko].kind));
         bin.write_u64_le(buf, sh + 32, out[ko].addr);
         bin.write_u64_le(buf, sh + 40, out[ko].size);
         var foff: u32 = 0;
@@ -873,10 +970,17 @@ fun emit_object(isa_vt: *of.ObjectTarget, img: *of.ObjectImage, destination: *pu
         bin.write_u32_le(buf, sh + 52, align_log2(out[ko].align));
         bin.write_u32_le(buf, sh + 56, out[ko].reloff::u32);
         bin.write_u32_le(buf, sh + 60, out[ko].nrel);
-        bin.write_u32_le(buf, sh + 64, macho_section_flags(out[ko].kind));
-        bin.write_u32_le(buf, sh + 68, 0);
-        bin.write_u32_le(buf, sh + 72, 0);
-        bin.write_u32_le(buf, sh + 76, 0);
+        var flags: u32 = macho_section_flags(section.kind);
+        if ((section.flags & of.SEC_FLAG_INIT_FUNCS) != 0) {
+            flags = (flags & ~SECTION_TYPE) | S_MOD_INIT_FUNC_POINTERS;
+        }
+        if (section.native.format == of.OF_MACHO) { flags = section.native.flags::u32; }
+        bin.write_u32_le(buf, sh + 64, flags);
+        var reserved1: u32 = section.native.reserved1;
+        if (R.unwrap_ok[u32, str](indirect_slots(section)) != 0) { reserved1 = out[ko].indirect_base; }
+        bin.write_u32_le(buf, sh + 68, reserved1);
+        bin.write_u32_le(buf, sh + 72, section.native.reserved2);
+        bin.write_u32_le(buf, sh + 76, section.native.reserved3);
         sh = sh + SECTION_64_SIZE;
         ko = ko + 1;
     }
@@ -909,6 +1013,8 @@ fun emit_object(isa_vt: *of.ObjectTarget, img: *of.ObjectImage, destination: *pu
     bin.write_u32_le(buf, dysym_lc + 20, n_extdef);
     bin.write_u32_le(buf, dysym_lc + 24, n_local + n_extdef);
     bin.write_u32_le(buf, dysym_lc + 28, n_undef);
+    if (img.indirect_count != 0) { bin.write_u32_le(buf, dysym_lc + 56, indirect_off::u32); }
+    bin.write_u32_le(buf, dysym_lc + 60, img.indirect_count);
 
     s = 0;
     for (s < num_secs) {
@@ -974,6 +1080,16 @@ fun emit_object(isa_vt: *of.ObjectTarget, img: *of.ObjectImage, destination: *pu
         symi = symi + 1;
     }
 
+    var indirect_i: u32 = 0;
+    for (indirect_i < img.indirect_count) {
+        val entry: *of.NativeIndirect = ?img.indirects[indirect_i];
+        var value: u32 = entry.flags;
+        if (value == 0) { value = remap[entry.symbol]; }
+        val index: u32 = out[sec_to_out[entry.section]].indirect_base + entry.slot;
+        bin.write_u32_le(buf, indirect_off + index::usize * 4, value);
+        indirect_i = indirect_i + 1;
+    }
+
     ko = 0;
     for (ko < num_out) {
         if (out[ko].reloff == 0) { ko = ko + 1; cnt; }
@@ -988,7 +1104,17 @@ fun emit_object(isa_vt: *of.ObjectTarget, img: *of.ObjectImage, destination: *pu
                     val radr: u32 = base + img.relocations[ri].offset;
                     val rsi: u32 = R.unwrap_ok[u32, str](reloc_sym_index(img, ?img.relocations[ri]));
                     val symnum: u32 = remap[rsi];
-                    val mr: MachoReloc = R.unwrap_ok[MachoReloc, str](macho_reloc_for(img.interner, alloc, arch_id, img.relocations[ri].kind));
+                    var output_kind: of.RelocKind = img.relocations[ri].kind;
+                    if (of.is_difference(output_kind)) {
+                        var subtractor: u32 = X86_64_RELOC_SUBTRACTOR;
+                        if (arch_is_arm64(arch_id)) { subtractor = ARM64_RELOC_SUBTRACTOR; }
+                        var width: u32 = 2;
+                        if (output_kind == of.RK_DIFF64) { width = 3; output_kind = of.RK_ABS64; }
+                        or { output_kind = of.RK_ABS32; }
+                        write_reloc_info(buf, ro, radr, remap[img.relocations[ri].sym2], 0, width, 1, subtractor);
+                        ro = ro + RELOC_INFO_SIZE;
+                    }
+                    val mr: MachoReloc = R.unwrap_ok[MachoReloc, str](macho_reloc_for(img.interner, alloc, arch_id, output_kind));
                     if (needs_addend_entry(arch_id, img.relocations[ri].kind, img.relocations[ri].addend)) {
                         write_reloc_info(buf, ro, radr, (img.relocations[ri].addend::u64)::u32 & 0xFFFFFF,
                                          0, 2, 0, ARM64_RELOC_ADDEND);
@@ -2705,6 +2831,9 @@ fun parse_object_into(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
     var stroff:      usize = 0;
     var strsize:     usize = 0;
     var have_symtab: bool = false;
+    var indirect_off: usize = 0;
+    var indirect_count: u32 = 0;
+    var have_dysymtab: bool = false;
 
     var off: usize = MACH_HEADER_64_SIZE;
     var c: u32 = 0;
@@ -2731,7 +2860,17 @@ fun parse_object_into(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
                 ret R.err[R.Void, str]("macho: section count exceeds the u32 limit");
             }
             sec_total = R.unwrap_ok[layout.CheckedCount[of.Section], layout.CheckCause](added);
+        } or (cmd == LC_DYSYMTAB) {
+            if (cmdsize < DYSYMTAB_CMD_SIZE || have_dysymtab) {
+                ret R.err[R.Void, str]("macho: malformed or duplicate dynamic symbol command");
+            }
+            have_dysymtab = true;
+            indirect_off = bin.read_u32_le(buf, off + 56)::usize;
+            indirect_count = bin.read_u32_le(buf, off + 60);
         } or (cmd == LC_SYMTAB) {
+            if (cmdsize < SYMTAB_CMD_SIZE || have_symtab) {
+                ret R.err[R.Void, str]("macho: malformed or duplicate symbol command");
+            }
             symoff  = bin.read_u32_le(buf, off + 8)::usize;
             nsyms   = bin.read_u32_le(buf, off + 12);
             stroff  = bin.read_u32_le(buf, off + 16)::usize;
@@ -2748,6 +2887,8 @@ fun parse_object_into(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
     }
     val sec_n: u32 = R.unwrap_ok[u32, layout.CheckCause](sec_n_fits);
 
+    val vi: R.Result[R.Void, str] = bin.require_region(buf_size, indirect_off, indirect_count::usize * 4, "macho: indirect symbol table out of bounds");
+    if (R.is_err[R.Void, str](vi)) { ret vi; }
     if (have_symtab) {
         val vsy: R.Result[R.Void, str] = bin.require_region(buf_size, symoff, nsyms::usize * NLIST_64_SIZE, "macho: symbol table out of bounds");
         if (R.is_err[R.Void, str](vsy)) { ret vsy; }
@@ -2834,6 +2975,13 @@ fun parse_object_into(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
                 out.sections[sec_i].name  = R.unwrap_ok[intern.StrId, str](rin);
                 out.sections[sec_i].kind  = kind;
                 out.sections[sec_i].flags = 0;
+                out.sections[sec_i].native.format = of.OF_MACHO;
+                out.sections[sec_i].native.flags = flags::u64;
+                memory.raw_copy((?out.sections[sec_i].native.name[0])::ptr, (buf::usize + sh)::ptr, 16);
+                memory.raw_copy((?out.sections[sec_i].native.segment[0])::ptr, (buf::usize + sh + 16)::ptr, 16);
+                out.sections[sec_i].native.reserved1 = bin.read_u32_le(buf, sh + 68);
+                out.sections[sec_i].native.reserved2 = bin.read_u32_le(buf, sh + 72);
+                out.sections[sec_i].native.reserved3 = bin.read_u32_le(buf, sh + 76);
                 if ((flags & SECTION_TYPE) == S_MOD_INIT_FUNC_POINTERS) {
                     out.sections[sec_i].flags = of.SEC_FLAG_INIT_FUNCS;
                 }
@@ -2904,10 +3052,19 @@ fun parse_object_into(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
 
         var flags: u32 = 0;
         if ((n_type & N_EXT) != 0)      { flags = flags | of.SYM_OBJ_FLAG_GLOBAL; }
-        if ((n_desc & N_WEAK_DEF) != 0) { flags = flags | of.SYM_OBJ_FLAG_WEAK; }
-        if ((n_type & N_TYPE) == N_UNDF) {
+        if ((n_desc & (N_WEAK_DEF | N_WEAK_REF)) != 0) { flags = flags | of.SYM_OBJ_FLAG_WEAK; }
+        out.symbols[si].native = of.NativeSymbol{format: of.OF_MACHO, kind: n_type::u32, flags: n_desc::u32};
+        if ((n_type & N_TYPE) == N_ABS) {
+            out.symbols[si].section = of.SECTION_ABSOLUTE;
+            out.symbols[si].absolute_value = n_value;
+            out.symbols[si].offset = 0;
+        } or ((n_type & N_TYPE) == N_UNDF) {
             flags = flags | of.SYM_OBJ_FLAG_EXTERN;
             if ((n_type & N_EXT) != 0 && n_value != 0) {
+                if (n_value > 0xFFFFFFFF) {
+                    free_parse_scratch(alloc, sec_base, sec_anchor, sec_n);
+                    ret R.err[R.Void, str]("macho: common symbol exceeds represented size");
+                }
                 flags = flags | of.SYM_OBJ_FLAG_COMMON;
                 out.symbols[si].size = n_value::u32;
                 out.symbols[si].align = 1;
@@ -2953,6 +3110,53 @@ fun parse_object_into(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
                                                   sec_base, sec_anchor, nsyms, out);
     free_parse_scratch(alloc, sec_base, sec_anchor, sec_n);
     if (R.is_err[R.Void, str](rp)) { ret rp; }
+    ret populate_indirects(alloc, buf, indirect_off, indirect_count, nsyms, out);
+}
+
+fun populate_indirects(alloc: *A.Allocator, buf: *u8, table: usize, table_count: u32,
+                      nsyms: u32, out: *of.ObjectImage) R.Result[R.Void, str] {
+    var count: u32 = 0;
+    var section: u32 = 0;
+    for (section < out.section_count) {
+        val planned: R.Result[u32, str] = indirect_slots(?out.sections[section]);
+        if (R.is_err[u32, str](planned)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](planned)); }
+        val slots: u32 = R.unwrap_ok[u32, str](planned);
+        val base: u32 = out.sections[section].native.reserved1;
+        if (slots != 0 && (base > table_count || slots > table_count - base)) {
+            ret R.err[R.Void, str]("macho: section indirect symbols are outside the table");
+        }
+        if (slots > 0xFFFFFFFF - count) { ret R.err[R.Void, str]("macho: indirect symbol count overflows"); }
+        count = count + slots;
+        section = section + 1;
+    }
+    if (count == 0) {
+        if (table_count != 0) { ret R.err[R.Void, str]("macho: indirect symbols have no represented section"); }
+        ret R.ok_void[str]();
+    }
+    val storage: R.Result[*of.NativeIndirect, str] = A.zallocate[of.NativeIndirect](alloc, count::usize);
+    if (R.is_err[*of.NativeIndirect, str](storage)) { ret R.err[R.Void, str](R.unwrap_err[*of.NativeIndirect, str](storage)); }
+    out.indirects = R.unwrap_ok[*of.NativeIndirect, str](storage);
+    out.indirect_cap = count;
+    section = 0;
+    for (section < out.section_count) {
+        val slots: u32 = R.unwrap_ok[u32, str](indirect_slots(?out.sections[section]));
+        var slot: u32 = 0;
+        for (slot < slots) {
+            val index: u32 = out.sections[section].native.reserved1 + slot;
+            val value: u32 = bin.read_u32_le(buf, table + index::usize * 4);
+            var entry: of.NativeIndirect = of.NativeIndirect{section: section, slot: slot, symbol: of.SYMBOL_NONE};
+            entry.flags = value & (of.INDIRECT_LOCAL | of.INDIRECT_ABSOLUTE);
+            if (entry.flags == 0) {
+                if (value >= nsyms) { ret R.err[R.Void, str]("macho: indirect symbol index out of bounds"); }
+                entry.symbol = value;
+            } or (value != entry.flags) { ret R.err[R.Void, str]("macho: malformed indirect symbol marker"); }
+            out.indirects[out.indirect_count] = entry;
+            out.indirect_count = out.indirect_count + 1;
+            slot = slot + 1;
+        }
+        if (slots != 0) { out.sections[section].native.reserved1 = 0; }
+        section = section + 1;
+    }
     ret R.ok_void[str]();
 }
 
@@ -3029,7 +3233,8 @@ fun count_relocs(buf: *u8, buf_size: usize, cputype: u32, ncmds: u32) R.Result[u
                     val word: u32 = bin.read_u32_le(buf, reloff + r::usize * RELOC_INFO_SIZE + 4);
                     val r_type: u32 = (word >> 28) & 0xF;
                     if (cputype == CPU_TYPE_ARM64 && r_type == ARM64_RELOC_ADDEND) { r = r + 1; cnt; }
-                    if (cputype == CPU_TYPE_X86_64 && r_type == X86_64_RELOC_SUBTRACTOR) { r = r + 1; cnt; }
+                    if (((cputype == CPU_TYPE_X86_64 && r_type == X86_64_RELOC_SUBTRACTOR)
+                        || (cputype == CPU_TYPE_ARM64 && r_type == ARM64_RELOC_SUBTRACTOR))) { r = r + 1; cnt; }
                     total = total + 1;
                     r = r + 1;
                 }
@@ -3068,6 +3273,7 @@ fun populate_relocs(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_si
                 var sub_sym: u32 = 0;
                 var have_sub: bool = false;
                 var sub_addr: u32 = 0;
+                var sub_length: u32 = 0;
                 var r: u32 = 0;
                 for (r < nreloc) {
                     val e: usize = reloff + r::usize * RELOC_INFO_SIZE;
@@ -3085,29 +3291,34 @@ fun populate_relocs(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_si
                         r = r + 1;
                         cnt;
                     }
-                    if (cputype == CPU_TYPE_X86_64 && r_type == X86_64_RELOC_SUBTRACTOR) {
+                    if (((cputype == CPU_TYPE_X86_64 && r_type == X86_64_RELOC_SUBTRACTOR)
+                        || (cputype == CPU_TYPE_ARM64 && r_type == ARM64_RELOC_SUBTRACTOR))) {
                         if (have_sub) {
-                            ret R.err[R.Void, str]("macho: two X86_64_RELOC_SUBTRACTOR entries in a row; each one pairs with the UNSIGNED that follows it");
+                            ret R.err[R.Void, str]("macho: two subtractor entries in a row; each one pairs with the UNSIGNED that follows it");
                         }
                         if (extn == 0) {
-                            ret R.err[R.Void, str]("macho: X86_64_RELOC_SUBTRACTOR is not symbol-based");
+                            ret R.err[R.Void, str]("macho: subtractor is not symbol-based");
                         }
                         if (symnum >= nsyms) { ret R.err[R.Void, str]("macho: relocation symbol index out of range"); }
                         if (r_length != 2 && r_length != 3) {
-                            ret R.err[R.Void, str]("macho: X86_64_RELOC_SUBTRACTOR field is neither 4 nor 8 bytes");
+                            ret R.err[R.Void, str]("macho: subtractor field is neither 4 nor 8 bytes");
                         }
                         sub_sym  = symnum;
                         sub_addr = address;
+                        sub_length = r_length;
                         have_sub = true;
                         r = r + 1;
                         cnt;
                     }
                     if (have_sub) {
                         if (r_type != X86_64_RELOC_UNSIGNED) {
-                            ret R.err[R.Void, str]("macho: X86_64_RELOC_SUBTRACTOR is not followed by X86_64_RELOC_UNSIGNED");
+                            ret R.err[R.Void, str]("macho: subtractor is not followed by an unsigned relocation");
+                        }
+                        if (r_length != sub_length || pcrel != 0 || extn == 0) {
+                            ret R.err[R.Void, str]("macho: subtractor pair has incompatible field encodings");
                         }
                         if (address != sub_addr) {
-                            ret R.err[R.Void, str]("macho: the halves of an X86_64_RELOC_SUBTRACTOR pair patch different addresses");
+                            ret R.err[R.Void, str]("macho: the halves of a subtractor pair patch different addresses");
                         }
                     }
                     if (cputype == CPU_TYPE_X86_64 && x64_is_signed(r_type) && pcrel == 0) {
@@ -3160,7 +3371,7 @@ fun populate_relocs(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_si
                         if (r_length == 3)      { out_kind = of.RK_DIFF64; }
                         or (r_length == 2)      { out_kind = of.RK_DIFF32; }
                         or {
-                            ret R.err[R.Void, str]("macho: an X86_64_RELOC_SUBTRACTOR pair writes neither 4 nor 8 bytes");
+                            ret R.err[R.Void, str]("macho: a subtractor pair writes neither 4 nor 8 bytes");
                         }
                         out_sym2 = sub_sym;
                     }
@@ -3828,7 +4039,7 @@ fun ts_arm64_roundtrip() u8 {
     ret 0;
 }
 
-fun ts_many_sections_coalesce() u8 {
+fun ts_generated_sections_coalesce_without_erasing_placement() u8 {
     var alloc: A.Allocator;
     page.make(?alloc);
     var i: intern.Interner = intern.init(?alloc);
@@ -3858,6 +4069,8 @@ fun ts_many_sections_coalesce() u8 {
     var s: u32 = 1;
     for (s < total) {
         secs[s].name = t_intern(?i, ".rodata"); secs[s].kind = of.SK_RODATA; secs[s].align = 8;
+        secs[s].flags = of.SEC_FLAG_COALESCE;
+        if (s == 1) { secs[s].flags = 0; secs[s].name = t_intern(?i, ".explicit"); }
         if (s == tgt_sec) { secs[s].bytes = ?data_bytes[0]; secs[s].len = 8; }
         or                { secs[s].bytes = nil;            secs[s].len = 0; }
         s = s + 1;
@@ -3899,7 +4112,7 @@ fun ts_many_sections_coalesce() u8 {
     val pr: R.Result[R.Void, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?out);
     if (R.is_err[R.Void, str](pr)) { ret 1; }
 
-    if (out.section_count != 2) { ret 1; }
+    if (out.section_count != 3 || out.sections[1].name != secs[1].name) { ret 1; }
 
     if (out.reloc_count != 1)                      { ret 1; }
     if (of.reloc_symbol_name(?out, ?out.relocations[0]) != syms[1].name) { ret 1; }
@@ -3918,6 +4131,18 @@ fun ts_many_sections_coalesce() u8 {
         si = si + 1;
     }
     if (!found) { ret 1; }
+    s = 0;
+    for (s < total) { secs[s].flags = 0; s = s + 1; }
+    val explicit_refused: R.Result[R.Void, str] = t_planned_emit_object(?isa_vt, ?img, tpath::*u8);
+    if (R.is_ok[R.Void, str](explicit_refused)) { ret 2; }
+    s = 0;
+    for (s < total) {
+        secs[s].native.format = of.OF_MACHO;
+        write_fixed16(?secs[s].native.name[0], 0, "__native");
+        s = s + 1;
+    }
+    val native_refused: R.Result[R.Void, str] = t_planned_emit_object(?isa_vt, ?img, tpath::*u8);
+    if (R.is_ok[R.Void, str](native_refused)) { ret 3; }
     ret 0;
 }
 
@@ -5109,7 +5334,7 @@ test "mach.lang.target.of.macho:object_round_trip_and_reloc_maps" {
     if (ts_x64_signed_variants() != 0)   { ret 1; }
     if (ts_relro_roundtrip() != 0)       { ret 1; }
     if (ts_arm64_roundtrip() != 0)       { ret 1; }
-    if (ts_many_sections_coalesce() != 0) { ret 1; }
+    if (ts_generated_sections_coalesce_without_erasing_placement() != 0) { ret 1; }
     if (ts_reloc_map() != 0)             { ret 1; }
     if (ts_pageoff12() != 0)             { ret 1; }
     if (ts_abs32() != 0)                 { ret 1; }
@@ -6210,4 +6435,142 @@ fun t_planned_emit_object(isa_vt: *of.ObjectTarget, img: *of.ObjectImage, path: 
     val opened: R.Result[*publication.Destination, str] = t_publication_open(?operation, img.alloc, path::str);
     if (R.is_err[*publication.Destination, str](opened)) { ret t_publication_close(?operation, R.err[R.Void, str](R.unwrap_err[*publication.Destination, str](opened))); }
     ret t_publication_close(?operation, emit_object(isa_vt, img, R.unwrap_ok[*publication.Destination, str](opened)));
+}
+
+test "mach.lang.target.of.macho:relocatable_preserves_native_sections_and_difference_pairs" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    fin { intern.dnit(?itn); }
+    var data: [8]u8;
+    var sections: [2]of.Section;
+    sections[0] = of.Section{name: t_intern(?itn, "custom_a"), kind: of.SK_DATA, bytes: ?data[0], len: 8, align: 8};
+    sections[1] = of.Section{name: t_intern(?itn, "custom_b"), kind: of.SK_DATA, align: 8};
+    var i: u32 = 0;
+    for (i < 2) {
+        sections[i].native.format = of.OF_MACHO;
+        sections[i].native.flags = S_ATTR_NO_DEAD_STRIP::u64;
+        write_fixed16(?sections[i].native.name[0], 0, bin.resolve_name(?itn, sections[i].name));
+        write_fixed16(?sections[i].native.segment[0], 0, "__CUSTOM");
+        i = i + 1;
+    }
+    var symbols: [2]of.Symbol;
+    symbols[0] = of.Symbol{name: t_intern(?itn, "_left"), section: 0, size: 8, align: 8, flags: of.SYM_OBJ_FLAG_GLOBAL};
+    symbols[1] = of.Symbol{name: t_intern(?itn, "_right"), section: 1, align: 8, flags: of.SYM_OBJ_FLAG_GLOBAL};
+    var relocation: of.Relocation = of.Relocation{section: 0, kind: of.RK_DIFF64, sym: 0, sym2: 1, addend: -7};
+    var image: of.ObjectImage = of.object_image_init(?alloc, ?itn, intern.STR_NIL);
+    image.sections = ?sections[0]; image.section_count = 2;
+    image.symbols = ?symbols[0]; image.symbol_count = 2;
+    image.relocations = ?relocation; image.reloc_count = 1;
+    val created: R.Result[output.Output, str] = output.create(?alloc, "macho_relocatable");
+    if (R.is_err[output.Output, str](created)) { ret 1; }
+    var file: output.Output = R.unwrap_ok[output.Output, str](created);
+    fin { output.dnit(?file); }
+    var arch: u32 = 0;
+    for (arch < 2) {
+        var target: of.ObjectTarget = t_isa(isa.ARCH_X86_64);
+        if (arch == 1) { target = t_isa(isa.ARCH_AARCH64); }
+        val emitted: R.Result[R.Void, str] = t_planned_emit_object(?target, ?image, output.path(?file));
+        if (R.is_err[R.Void, str](emitted)) { ret 2; }
+        val read: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, output.path(?file));
+        if (R.is_err[Vector[u8], str](read)) { ret 3; }
+        var bytes: Vector[u8] = R.unwrap_ok[Vector[u8], str](read);
+        fin { if (bytes.data != nil) { A.deallocate[u8](?alloc, bytes.data, bytes.cap); } }
+        val header: usize = MACH_HEADER_64_SIZE + SEGMENT_CMD_64_SIZE;
+        if (!fixed16_equals(bytes.data, header, "custom_a") || !fixed16_equals(bytes.data, header + 16, "__CUSTOM")
+            || !fixed16_equals(bytes.data, header + SECTION_64_SIZE, "custom_b")
+            || bin.read_u32_le(bytes.data, header + 64)::u64 != sections[0].native.flags) { ret 4; }
+        val relocoff: usize = bin.read_u32_le(bytes.data, header + 56)::usize;
+        var subtractor: u32 = X86_64_RELOC_SUBTRACTOR;
+        if (arch == 1) { subtractor = ARM64_RELOC_SUBTRACTOR; }
+        if (bin.read_u32_le(bytes.data, header + 60) != 2
+            || (bin.read_u32_le(bytes.data, relocoff + 4) >> 28) != subtractor
+            || (bin.read_u32_le(bytes.data, relocoff + RELOC_INFO_SIZE + 4) >> 28) != 0) { ret 5; }
+        var parsed: of.ObjectImage;
+        val decoded: R.Result[R.Void, str] = parse_object(?alloc, ?itn, bytes.data, bytes.len, ?parsed);
+        if (R.is_err[R.Void, str](decoded)) { ret 6; }
+        fin { of.object_image_dnit(?parsed); }
+        if (parsed.section_count != 2 || parsed.sections[1].len != 0 || parsed.reloc_count != 1
+            || parsed.relocations[0].kind != of.RK_DIFF64 || parsed.relocations[0].addend != -7
+            || parsed.symbols[parsed.relocations[0].sym].name != symbols[0].name
+            || parsed.symbols[parsed.relocations[0].sym2].name != symbols[1].name) { ret 7; }
+        var evidence: str = "macho-difference-x64.o";
+        if (arch == 1) { evidence = "macho-difference-arm64.o"; }
+        if (R.is_err[R.Void, str](output.retain_bytes(?alloc, evidence, bytes.data, bytes.len))) { ret 10; }
+        arch = arch + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.target.of.macho:relocatable_remaps_indirect_symbols_and_absolute_definitions" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    fin { intern.dnit(?itn); }
+    var data: [16]u8;
+    var stub: [6]u8;
+    stub[0] = 0xFF; stub[1] = 0x25;
+    var sections: [2]of.Section;
+    sections[0] = of.Section{name: t_intern(?itn, "__pointers"), kind: of.SK_DATA, bytes: ?data[0], len: 16, align: 8};
+    sections[1] = of.Section{name: t_intern(?itn, "__stubs"), kind: of.SK_TEXT, bytes: ?stub[0], len: 6, align: 1};
+    var si: u32 = 0;
+    for (si < 2) {
+        sections[si].native.format = of.OF_MACHO;
+        write_fixed16(?sections[si].native.name[0], 0, bin.resolve_name(?itn, sections[si].name));
+        write_fixed16(?sections[si].native.segment[0], 0, "__CUSTOM");
+        si = si + 1;
+    }
+    sections[0].native.flags = 6;
+    sections[1].native.flags = 8; sections[1].native.reserved2 = 6;
+    var symbols: [3]of.Symbol;
+    symbols[0] = of.Symbol{name: t_intern(?itn, "_external"), section: of.SECTION_EXTERNAL, flags: of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN};
+    symbols[1] = of.Symbol{name: t_intern(?itn, "_absolute"), section: of.SECTION_ABSOLUTE,
+        absolute_value: 0xFEDCBA9876543210, flags: of.SYM_OBJ_FLAG_GLOBAL,
+        native: of.NativeSymbol{format: of.OF_MACHO, kind: N_ABS::u32 | 0x10, flags: 0x20}};
+    symbols[2] = of.Symbol{name: t_intern(?itn, "local_absolute"), section: of.SECTION_ABSOLUTE, absolute_value: 17};
+    var indirects: [3]of.NativeIndirect;
+    indirects[0] = of.NativeIndirect{section: 0, slot: 0, symbol: 0};
+    indirects[1] = of.NativeIndirect{section: 0, slot: 1, symbol: of.SYMBOL_NONE, flags: of.INDIRECT_LOCAL | of.INDIRECT_ABSOLUTE};
+    indirects[2] = of.NativeIndirect{section: 1, slot: 0, symbol: 0};
+    var image: of.ObjectImage = of.object_image_init(?alloc, ?itn, intern.STR_NIL);
+    image.sections = ?sections[0]; image.section_count = 2;
+    image.symbols = ?symbols[0]; image.symbol_count = 3;
+    image.indirects = ?indirects[0]; image.indirect_count = 3;
+    var target: of.ObjectTarget = t_isa(isa.ARCH_X86_64);
+    val created: R.Result[output.Output, str] = output.create(?alloc, "macho_indirects");
+    if (R.is_err[output.Output, str](created)) { ret 1; }
+    var file: output.Output = R.unwrap_ok[output.Output, str](created);
+    fin { output.dnit(?file); }
+    val emitted: R.Result[R.Void, str] = t_planned_emit_object(?target, ?image, output.path(?file));
+    if (R.is_err[R.Void, str](emitted)) { ret 2; }
+    val read: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, output.path(?file));
+    if (R.is_err[Vector[u8], str](read)) { ret 3; }
+    var bytes: Vector[u8] = R.unwrap_ok[Vector[u8], str](read);
+    fin { if (bytes.data != nil) { A.deallocate[u8](?alloc, bytes.data, bytes.cap); } }
+    val command: usize = t_find_lc(bytes.data, LC_DYSYMTAB);
+    val table: usize = bin.read_u32_le(bytes.data, command + 56)::usize;
+    if (bin.read_u32_le(bytes.data, command + 60) != 3 || bin.read_u32_le(bytes.data, table) != 2
+        || bin.read_u32_le(bytes.data, table + 4) != (of.INDIRECT_LOCAL | of.INDIRECT_ABSOLUTE)
+        || bin.read_u32_le(bytes.data, table + 8) != 2) { ret 4; }
+    var parsed: of.ObjectImage;
+    val decoded: R.Result[R.Void, str] = parse_object(?alloc, ?itn, bytes.data, bytes.len, ?parsed);
+    if (R.is_err[R.Void, str](decoded)) { ret 5; }
+    fin { of.object_image_dnit(?parsed); }
+    if (parsed.indirect_count != 3 || parsed.indirects[2].section != 1 || parsed.indirects[2].slot != 0
+        || parsed.symbols[parsed.indirects[0].symbol].name != symbols[0].name
+        || parsed.symbols[1].section != of.SECTION_ABSOLUTE || parsed.symbols[1].absolute_value != symbols[1].absolute_value
+        || parsed.symbols[1].native.kind != (N_ABS::u32 | N_EXT::u32 | 0x10)
+        || parsed.symbols[1].native.flags != 0x20) { ret 6; }
+    if (R.is_err[R.Void, str](output.retain_bytes(?alloc, "macho-indirect.o", bytes.data, bytes.len))) { ret 10; }
+    indirects[1].slot = 0;
+    if (R.is_ok[R.Void, str](validate_indirects(?image))) { ret 7; }
+    indirects[1].slot = 1;
+    image.indirect_count = 2;
+    if (R.is_ok[R.Void, str](validate_indirects(?image))) { ret 8; }
+    bin.write_u32_le(bytes.data, table, 3);
+    var invalid: of.ObjectImage;
+    if (R.is_ok[R.Void, str](parse_object(?alloc, ?itn, bytes.data, bytes.len, ?invalid))) {
+        of.object_image_dnit(?invalid); ret 9;
+    }
+    ret 0;
 }
