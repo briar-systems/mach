@@ -17,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer makes the resolver report every module again for each pass it takes,
   and each module's resolve time is accumulated across those passes (#3231).
 
+- Comptime evaluation distinguishes unknown internal tags from unsupported values
+  and rejects comparisons of reflection descriptors without equality semantics.
+
+- Native encoder failures preserve full opcode values and report owned diagnostics.
+  Selected target instructions are validated in their own opcode domain.
+
+- Unknown syntax, operator, IR operand and backend instruction, operand and register
+  class tags report internal failures with their catalog and numeric value. Verifier diagnostics own their text and propagate
+  allocation failures without losing tag or source information.
+
 - Constant expressions evaluate nested scalar casts and preserve integer widths and
   signedness. A failed global initializer now rejects the compilation instead of
   publishing a zero value or a successful cached lowering product (#3122).
