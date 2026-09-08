@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `mach fmt <project-path> [--check]` formats declared project source without
+  fetching dependencies or building. Check mode is read only, and file replacement
+  uses held-root publication while preserving exact POSIX permission bits.
+
 ### Removed
 
 - Implicit dependency public entries. Bare imports require an explicitly defaulted

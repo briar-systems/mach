@@ -6,7 +6,7 @@ mach <command> [options]
 
 The compiler dispatches on `argv[1]`. With no command, or an unknown one, it
 prints usage and exits `1`. The project commands — `build`, `run`, `test`,
-`clean`, and `doc` — take the project as a **required** positional: a directory
+`clean`, `fmt`, and `doc` — take the project as a **required** positional: a directory
 containing `mach.toml`, or the path of a `mach.toml` itself. Nothing is
 searched for: `mach build src` inside a project is `error: no mach.toml in the
 project directory`, and a bare invocation with no path is a user error.
@@ -43,6 +43,7 @@ argument forwarding.
 | `build` | compile the project to objects and (for a `bin` artifact) a linked binary |
 | `run`   | execute the already-built binary (a post-`build` convenience, not a rebuild) |
 | `test`  | build the test binary and run the collected tests |
+| `fmt`   | format only the project’s declared source, or check it without writing |
 | `clean` | remove the project's build output directory trees |
 | `dep`   | realize, verify, and change the project's dependencies under `dep/` |
 | `init`  | scaffold a new project |
@@ -822,3 +823,30 @@ exits `1`.
 - [language/test.md](language/test.md) — the `test` declaration and `mach test`
 - [tooling/test-json.md](tooling/test-json.md) — the `mach test --format json` event schema
 - [language/files.md](language/files.md) — project file layout
+
+## `mach fmt`
+
+```
+mach fmt <project-path> [--check]
+```
+
+Formats `.mach` files beneath the manifest’s declared `project.src`, including
+subdirectories. It does not build, execute steps, resolve or fetch dependencies,
+or format dependency source. Symlink source files and ancestors are refused.
+Selecting the dependency directory through a source-path alias is refused using
+held native identities. A filesystem
+that cannot provide that identity contract is refused explicitly.
+
+`--check` prints each differing source path and writes nothing, including no
+publication metadata. It exits `1` when source differs or a file is malformed.
+Normal mode publishes each complete formatted file through the existing filesystem
+transaction API, preserves exact POSIX permission bits, and rejects replacement of the
+source object while formatting. Malformed files produce located diagnostics and
+remain unchanged. Files already formatted earlier in the traversal remain changed
+if a later file fails. This is a per-file operation.
+
+Windows uses its native inherited access-control policy. The synthesized POSIX
+mode is not a Windows ACL and does not promise preservation of a custom ACL.
+
+Both modes exit `0` on success, `2` for an internal failure, and `3` for a filesystem
+failure. There are no formatter configuration options.
