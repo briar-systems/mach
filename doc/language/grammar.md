@@ -1,11 +1,17 @@
 # Mach grammar (EBNF)
 
-A formal grammar for the **implemented** Mach dialect, derived from the
+A formal grammar for the Mach dialect, derived from the
 parser (`src/lang/fe/lexer.mach`, `src/lang/fe/token.mach`, and
 `src/lang/fe/parser/`) and cross-checked against the per-element docs in
 this directory. Where the live parser diverges from a doc, the divergence
 is called out inline. Productions that could not be fully pinned to the
 parser are marked `(* approximate, verify *)`.
+
+Tag and `try` syntax is parsed at base commit `fc5c9e7e`. Canonical tag types,
+case descriptor construction, and the new reflection forms below also describe
+the [accepted v5 contract](../design/tagged-values.md), whose implementation is
+still incomplete. See [tag.md](tag.md) and [try.md](try.md) for status and semantic
+restrictions.
 
 This is a reference grammar, not the parser's exact control flow. The
 parser is a hybrid recursive-descent / Pratt climber that is
@@ -590,7 +596,8 @@ outcomes apply whether or not a `(` follows the `]`:
 typed-literal ::= named-type "{" [ member-init { "," member-init } [ "," ] ] "}"
 array-literal ::= array-type "{" [ expr { "," expr } [ "," ] ] "}"
 
-member-init ::= IDENT ":" expr | IDENT
+member-init ::= IDENT ":" expr | expr
+              | "[" expr "]" [ ":" expr ]   (* accepted v5 case descriptor construction *)
 ```
 
 - `typed-literal` is a record, union, or tag literal: a named type
@@ -599,6 +606,10 @@ member-init ::= IDENT ":" expr | IDENT
   `Pair[i64, u8]{ left: 5, right: 6u8 }`).
   For tags, exactly one case is initialized: either a bare case name for a payloadless
   case (`Reply{empty}`) or a named payload (`Reply{value: 42}`).
+  Numeric vector types use positional expressions, as in `f32x4{1.0, 2.0, 3.0, 4.0}`.
+  A bare identifier is interpreted after resolving the type, as a tag case or a
+  vector element expression. The accepted v5 descriptor forms `T{[case]: payload}`
+  and `T{[case]}` obey the same single-case rule after specialization.
   The parser commits to this form via a lookahead
   (`Name (.Name)* ([...])? {`).
 - `array-literal` is `[N]T{ e0, e1, ... }`, an array type followed by a
@@ -683,7 +694,8 @@ comptime-each-stmt ::= "$" "each" IDENT "in" expr stmt-branch-body
 ```
 
 `$each` is a compile-time unroll: the body is duplicated once per element of
-the sequence, which must be `$fields(T)`, a variadic pack identifier, or a
+the sequence, which must be `$fields(T)`, `$cases(T)` in the accepted v5
+contract, a variadic pack identifier, or a
 comptime-constant array `val` (see
 [comptime-intrinsics.md](comptime-intrinsics.md)). `in` is a contextual keyword.
 
@@ -737,17 +749,19 @@ mach-read      ::= comptime-ident { member }        (* $mach.build.os, $mach.arc
 ```
 
 - Intrinsic calls (`$size_of(T)`, `$length_of(T)`, `$align_of(T)`,
-  `$offset_of(T, field)`, `$type_of(e)`, `$fields(T)`, `$is_record(T)`,
+  `$offset_of(T, field)`, `$type_of(e)`, `$fields(T)`, `$cases(T)`,
+  `$discriminant_of(T)`, `$is_tag(T)`, `$is_record(T)`,
   `$is_union(T)`, `$is_pointer(T)`, `$is_secret(T)`, `$type_name(T)`,
   `$error("msg")`) are syntactically a `comptime-ident` callee with `call-args`.
 - The **type-taking** intrinsics — `$size_of`, `$length_of`, `$align_of`,
-  `$offset_of`, `$fields`, and the four predicates with `$type_name` — parse their
+  `$offset_of`, `$fields`, `$cases`, `$discriminant_of`, and the five predicates
+  with `$type_name` — parse their
   **first argument with the `type` production**, not the
   expression grammar, so the whole type language is spellable there:
   `$fields(Box[T])`, `$size_of(Pair[A, B])`, `$size_of(*T)`, `$size_of([4]u16)`,
   `$size_of(^u32)`, `$fields(mod.Rec)`. Every other argument is an ordinary
   expression; `$offset_of`'s second is a bare field name resolved against the
-  record. `$type_of(e)` takes a value expression and produces a comptime type
+  record or tag payload case. `$type_of(e)` takes a value expression and produces a comptime type
   value.
 - A **type comparison** operand (`$type_of(x) == Name`) is the one type spelling
   read with the expression grammar, because the comparison is only recognizable
@@ -816,7 +830,8 @@ Doc-only (intended surface, not a distinct parser production):
   the closed sets are enforced later (see [asm.md](asm.md),
   [comptime-mach.md](comptime-mach.md)).
 - The closed intrinsic set (`$size_of`, `$length_of`, `$align_of`, `$offset_of`,
-  `$type_of`, `$fields`, `$is_record`, `$is_union`, `$is_pointer`, `$is_secret`,
+  `$type_of`, `$fields`, `$cases`, `$discriminant_of`, `$is_tag`, `$is_record`,
+  `$is_union`, `$is_pointer`, `$is_secret`,
   `$type_name`, `$error`) — syntactically indistinguishable from any other
   `comptime-ident` call.
 - The closed decorator directive set ([decorators.md](decorators.md)) — the

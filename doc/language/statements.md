@@ -1,5 +1,9 @@
 # Statements
 
+Tag, canonical type, and `try` descriptions include the accepted v5 contract.
+Implementation is incomplete at base commit `fc5c9e7e`. See
+[tag.md](tag.md#implementation-status) and [try.md](try.md#implementation-status).
+
 Statement forms compose into function bodies and blocks. Statements end
 with `;` except where they end with a block `{...}`.
 

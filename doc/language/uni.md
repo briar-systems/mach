@@ -52,7 +52,7 @@ foreign data structures, hardware registers, or wire formats:
 ```mach
 rec RawPacket {
     kind: u8;
-    data: uni { header: Header; raw: [64]u8; }
+    data: uni { header: Header; raw: [64]u8; };
 }
 ```
 

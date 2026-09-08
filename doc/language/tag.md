@@ -7,8 +7,9 @@ or no payload at all.
 ## Implementation status
 
 The features described on this page represent the accepted Mach v5 contract
-specified in `doc/design/tagged-values.md`. In the current repository state,
-tag declaration parsing and documentation comment validation are implemented.
+specified in [the tagged value design](../design/tagged-values.md). At base
+commit `fc5c9e7e`, tag parsing, declaration and constructor type checking, checked
+layout, `$is_tag`, and documentation comment validation are implemented.
 Canonical types, proof-based payload tracking, and code generation remain in
 progress.
 
@@ -153,7 +154,8 @@ The compiler tracks active proofs along control flow paths:
 
 - Constructing a tag establishes proof of that case
 - Testing `value == TagName.case` establishes proof inside the true branch
-- Testing `value != TagName.case` establishes proof of remaining cases in the opposite branch
+- Testing `value != TagName.case` excludes that case in the true branch and proves that case in the false branch
+- Excluding a case proves another specific case only when it is the sole remaining possibility
 - Branch joins retain only proofs that hold on every incoming path
 
 ```mach
@@ -226,12 +228,39 @@ maximum of discriminator alignment, payload alignment, and any explicit
 area. Tags with no payloads contain only the discriminator and trailing padding.
 
 Packing with `#[packed]` places the payload immediately after the discriminator
-at offset `D` with base alignment 1.
+at offset `D` with base alignment 1. Explicit alignment raises object alignment
+and rounds total size without repacking nested payloads. Packed value access
+uses legal unaligned operations. A typed payload pointer must not promise
+stronger alignment than its storage provides.
 
-Casts via `::` and `:~` are rejected when either operand type contains a tag,
-including through records, arrays, or unions. Stripping secrecy with `:>` removes
-only outer secrecy from the tag value and preserves the active case and inner
+Construction captures the active payload before overwriting the destination and
+zeroes tag-owned gaps, inactive payload suffix bytes, and tail padding. Active
+payload representation rules remain unchanged, including raw union bytes.
+Replacing a larger case clears the bytes that become inactive.
+
+Representation-changing `::` and `:~` casts are rejected when either by-value
+representation contains a tag, including through records, arrays, or unions.
+Same-type identity casts remain valid, and transparent aliases preserve type
+identity. Ordinary pointer retyping remains an explicit raw-memory operation.
+Reading through a typed tag pointer requires live, aligned storage with a valid
+case code and a valid selected payload. A pointer cast does not validate raw data.
+
+Stripping secrecy with `:>` removes only outer secrecy from the tag value and preserves the active case and inner
 payload qualifiers.
+
+## Secrecy and ownership
+
+A public tag has a public discriminator, while each payload retains its declared
+secrecy. Outer `^Tag` also protects the active case. Secret-dependent case tests
+and `try` branches must obey the constant-time rules. Copies preserve potentially
+secret storage across all cases and use the fixed public type extent, rather
+than choosing a copy size from a secret active case.
+
+An immutable pointer binding does not make its pointee immutable. Raw payload
+pointers carry the lifetime and active-case obligations above. Tags introduce
+no borrow checker, moves, destructors, allocation, unwinding, or automatic
+resource rollback. Address-bound owners initialize caller-owned final storage
+and are not returned by value inside results.
 
 ## Reflection
 

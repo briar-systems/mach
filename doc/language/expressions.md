@@ -1,5 +1,9 @@
 # Expressions
 
+Tag, canonical type, and `try` descriptions include the accepted v5 contract.
+Implementation is incomplete at base commit `fc5c9e7e`. See
+[tag.md](tag.md#implementation-status) and [try.md](try.md#implementation-status).
+
 Expressions evaluate to values. They appear on the right side of bindings,
 as conditions, and as call arguments.
 

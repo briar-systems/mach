@@ -56,13 +56,15 @@ fun probe[T]() u64 {
 ```
 
 `$offset_of`'s **second** argument is the exception: a bare field name, resolved
-against the record's layout, never a type or a value.
+against the aggregate layout, never a type or a value. The accepted v5 tag
+contract also permits a payload case name.
 
-`$offset_of` adopts its binding's width like the other three, but its answer is
-decided later than the others': a field's offset is fixed at lowering, so it is
-the one measurement that cannot be read in a `$if` gate, and the check that its
-value fits the binding happens at lowering rather than during type checking. The
-diagnostic is the same either way.
+`$offset_of` adopts its binding's width like the other three. The accepted v5
+contract makes checked offsets available under the same complete-type rules as
+size and alignment. Unresolved or recursive layout is diagnosed. This supersedes
+the earlier lowering-only offset exception. That exception still describes the
+implementation at base commit `fc5c9e7e`, where offset queries cannot be used in
+`$if` gates and their result width is checked during lowering.
 
 ### `$length_of` — elements, not bytes
 
@@ -136,9 +138,9 @@ rec Over { x: u8; }
 rec Holder { buf: [$size_of(Pair)]u8; }   # an array length, inside a field type
 ```
 
-`$offset_of` is the exception among the four: it folds in a value position but not
-in a type one, because a field offset is settled during lowering rather than by the
-front end.
+At base commit `fc5c9e7e`, `$offset_of` folds in a value position but not a
+type position. The accepted v5 complete-type rule described above removes this
+implementation restriction.
 
 A `$if` / `$or` condition is not a type position, so what it can measure depends on
 when the gate is decided. A gate in a function body, and a gate in declaration scope
@@ -511,9 +513,9 @@ fun cross(p: Pair, q: Pair) i64 {
 ## Tag reflection: `$cases` and `$discriminant_of`
 
 Accepted v5 contract. The intrinsics described here reflect the accepted Mach v5
-tagged value design in `doc/design/tagged-values.md`. In the current compiler
-base, tag declarations are parsed, while runtime lowering and reflection hooks
-are under active development.
+tagged value design in [the accepted contract](../design/tagged-values.md). At
+base commit `fc5c9e7e`, `$is_tag` is implemented, while `$cases`, descriptor
+projections, `$discriminant_of`, and runtime tag lowering remain unfinished.
 
 `$cases(T)` produces a comptime sequence of owner-qualified case descriptors for
 a tag type `T`, in declaration order:
@@ -534,7 +536,8 @@ five readable properties:
 | `case.code`        | u64      | declaration ordinal case code                           |
 
 Accessing `case.type` or `case.offset` on a descriptor whose `has_payload` is false
-is a compile error.
+is a compile error. `case.type` preserves all declared payload qualifiers.
+`$is_tag(^T)` is false, and `$cases(^T)` is rejected.
 
 Inside the loop body, `T.[case]` denotes the case selector, and `v.[case]`
 projects the payload under proof checking:
