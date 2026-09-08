@@ -1,4 +1,5 @@
 use std.allocator.page;
+use T: std.allocator.testing;
 use std.format;
 use std.collections.vector;
 use std.collections.vector.Vector;
@@ -16,6 +17,7 @@ use std.text.string.str_free;
 use std.types.string.str;
 use std.types.string.str_contains;
 use std.types.string.str_copy;
+use std.types.string.str_copy_slice;
 use std.types.string.str_empty;
 use std.types.string.str_ends_with;
 use std.types.string.str_equals;
@@ -37,6 +39,9 @@ use mach.lang.target.of.macho;
 use mach.lang.build.outcome;
 use mach.lang.build.request;
 use mach.lang.driver.project;
+use mach.lang.driver;
+use dcfg: mach.lang.driver.config;
+use mach.lang.session;
 use mach.lang.intern;
 use mach.lang.manifest;
 use mach.lang.me.pipeline;
@@ -89,6 +94,8 @@ pub rec BuildUnit {
     ir_dir:       str;
     asm_dir:      str;
     link_inputs:  Vector[LinkInput];
+    dep_steps:    Vector[str];
+    export_links: Vector[intern.StrId];
     phases:       Vector[PhaseKind];
 
     sel_target:   str;
@@ -97,6 +104,7 @@ pub rec BuildUnit {
     has_artifact: bool;
     is_required:  bool;
     requires:     Vector[str];
+    steps:        Vector[str];
     subsystem:    of.Subsystem;
 }
 
@@ -109,6 +117,10 @@ pub rec BuildPlan {
 
 pub fun plan(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry,
              m: *manifest.Manifest, owned_req: request.BuildRequest) R.Result[BuildPlan, outcome.Fail] {
+    val valid: R.Result[R.Void, outcome.Fail] = request.validate(a, ?owned_req);
+    if (R.is_err[R.Void, outcome.Fail](valid)) {
+        ret R.err[BuildPlan, outcome.Fail](R.unwrap_err[R.Void, outcome.Fail](valid));
+    }
     var bp: BuildPlan;
     bp.request = owned_req;
     bp.units   = vector.init[BuildUnit](a);
@@ -121,14 +133,14 @@ pub fun plan(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry
         sel.artifact     = req.artifact;
         sel.want_lib     = req.want_lib;
         sel.has_artifact = !str_empty(req.artifact);
-        sel.legacy_default = false;
+
         val psr: R.Result[R.Void, str] = manifest.select_primary_artifact(a, itn, m, ?sel);
         if (R.is_err[R.Void, str](psr)) {
             ret R.err[BuildPlan, outcome.Fail](outcome.user(R.unwrap_err[R.Void, str](psr)));
         }
         bp.request.artifact = sel.artifact;
         bp.request.want_lib = sel.want_lib;
-        bp.request.artifact_by_table_order = sel.legacy_default;
+
         val cr: R.Result[R.Void, outcome.Fail] = plan_cell(a, itn, reg, m, req, ?bp,
             req.target, req.artifact, req.want_lib, !str_empty(req.artifact), false);
         if (R.is_err[R.Void, outcome.Fail](cr)) {
@@ -202,6 +214,64 @@ pub fun plan(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry
     ret R.ok[BuildPlan, outcome.Fail](bp);
 }
 
+pub fun configure(s: *session.Session, m: *manifest.Manifest, bp: *BuildPlan) R.Result[R.Void, outcome.Fail] {
+    var i: usize = 0;
+    for (i < bp.units.len) {
+        val u: *BuildUnit = ?bp.units.data[i];
+        var req: request.BuildRequest = request.for_cell(?bp.request, u.sel_target,
+            u.sel_artifact, u.want_lib, u.subsystem, u.goal);
+        val begun: R.Result[project.Project, outcome.Fail] = driver.begin_build(s, m, ?req, nil);
+        if (R.is_err[project.Project, outcome.Fail](begun)) {
+            ret R.err[R.Void, outcome.Fail](R.unwrap_err[project.Project, outcome.Fail](begun));
+        }
+        var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](begun);
+        val copied: R.Result[R.Void, outcome.Fail] = collect_dependency_plan(?p, u);
+        project.dnit_project(?p);
+        if (R.is_err[R.Void, outcome.Fail](copied)) { ret copied; }
+        i = i + 1;
+    }
+    ret R.ok_void[outcome.Fail]();
+}
+
+fun collect_dependency_plan(p: *project.Project, u: *BuildUnit) R.Result[R.Void, outcome.Fail] {
+    val itn: *intern.Interner = ?p.s.interner;
+    val planned: R.Result[Vector[dcfg.DependencyStep], str] = dcfg.plan_dep_steps(p,
+        entry_name(itn, u.target_entry.isa_name), entry_name(itn, u.target_entry.os_name),
+        entry_name(itn, u.target_entry.abi_name));
+    if (R.is_err[Vector[dcfg.DependencyStep], str](planned)) {
+        ret R.err[R.Void, outcome.Fail](outcome.user(R.unwrap_err[Vector[dcfg.DependencyStep], str](planned)));
+    }
+    var steps: Vector[dcfg.DependencyStep] = R.unwrap_ok[Vector[dcfg.DependencyStep], str](planned);
+    fin { vector.dnit[dcfg.DependencyStep](?steps); }
+    var i: usize = 0;
+    for (i < steps.len) {
+        val selected: dcfg.DependencyStep = steps.data[i];
+        val m: *manifest.Manifest = ?p.config.deps[selected.dependency].manifest;
+        val label: R.Result[str, str] = format.sprint(p.alloc, "{}.{}",
+            entry_name(itn, m.id), entry_name(itn, m.steps[selected.step].name));
+        if (R.is_err[str, str](label)) {
+            ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[str, str](label)));
+        }
+        val text: str = R.unwrap_ok[str, str](label);
+        val pushed: R.Result[usize, str] = vector.push[str](?u.dep_steps, text);
+        if (R.is_err[usize, str](pushed)) {
+            str_free(p.alloc, text);
+            ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[usize, str](pushed)));
+        }
+        i = i + 1;
+    }
+    var li: u32 = 0;
+    for (li < p.config.cascade_lib_count) {
+        val pushed: R.Result[usize, str] = vector.push[intern.StrId](?u.export_links,
+            p.config.cascade_libs[li].text);
+        if (R.is_err[usize, str](pushed)) {
+            ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[usize, str](pushed)));
+        }
+        li = li + 1;
+    }
+    ret R.ok_void[outcome.Fail]();
+}
+
 fun selected_unit_count(bp: *BuildPlan) usize {
     var n: usize = 0;
     var i: usize = 0;
@@ -228,7 +298,7 @@ fun plan_cell(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistr
               tname: str, aname: str, want_lib: bool, has_artifact: bool,
               is_required: bool) R.Result[R.Void, outcome.Fail] {
     var cell_req: request.BuildRequest = @req;
-    if (is_required) { cell_req.goal = request.GOAL_EXECUTE; }
+    if (is_required && req.goal != request.GOAL_CHECK) { cell_req.goal = request.GOAL_EXECUTE; }
     val ur: R.Result[BuildUnit, outcome.Fail] = plan_unit(a, itn, reg, m, ?cell_req,
         tname, aname, want_lib, has_artifact, is_required);
     if (R.is_err[BuildUnit, outcome.Fail](ur)) {
@@ -355,6 +425,12 @@ fun unit_decisions_equal(a: *BuildUnit, b: *BuildUnit) bool {
     if (a.has_artifact != b.has_artifact)    { ret false; }
     if (a.is_required != b.is_required)      { ret false; }
 
+    if (a.steps.len != b.steps.len) { ret false; }
+    var si: usize = 0;
+    for (si < a.steps.len) {
+        if (!str_equals(a.steps.data[si], b.steps.data[si])) { ret false; }
+        si = si + 1;
+    }
     if (a.requires.len != b.requires.len) { ret false; }
     var ri: usize = 0;
     for (ri < a.requires.len) {
@@ -399,7 +475,7 @@ fun plan_unit(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistr
     sel.want_lib     = want_lib;
     sel.has_artifact = has_artifact;
 
-    val ur: R.Result[manifest.BuildUnit, str] = manifest.resolve_build_unit(a, itn, m, sel);
+    val ur: R.Result[manifest.BuildUnit, str] = manifest.resolve_build_unit(a, itn, reg, m, sel);
     if (R.is_err[manifest.BuildUnit, str](ur)) {
         ret R.err[BuildUnit, outcome.Fail](outcome.user(R.unwrap_err[manifest.BuildUnit, str](ur)));
     }
@@ -488,6 +564,8 @@ fun plan_unit(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistr
     if (R.is_err[str, outcome.Fail](op_r)) { ret R.err[BuildUnit, outcome.Fail](R.unwrap_err[str, outcome.Fail](op_r)); }
     u.out_path = R.unwrap_ok[str, outcome.Fail](op_r);
 
+    u.dep_steps = vector.init[str](a);
+    u.export_links = vector.init[intern.StrId](a);
     u.link_inputs = vector.init[LinkInput](a);
     var ti: usize = 0;
     for (ti < req.link_tokens.len) {
@@ -570,6 +648,7 @@ pub fun finished_modules(tgt: *target.Target) bool {
 fun unit_out_path(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
                   req: *request.BuildRequest, bu: *manifest.BuildUnit,
                   tgt: *target.Target, obj_dir: str, is_required: bool) R.Result[str, outcome.Fail] {
+    if (req.goal == request.GOAL_CHECK) { ret R.ok[str, outcome.Fail](""); }
     if (req.goal == request.GOAL_OBJECTS)   { ret R.ok[str, outcome.Fail](obj_dir); }
     if (req.goal == request.GOAL_TEST_LIST) { ret R.ok[str, outcome.Fail](""); }
     if (req.goal == request.GOAL_EXECUTE && finished_modules(tgt)) {
@@ -622,8 +701,14 @@ fun derive_phases(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
                   req: *request.BuildRequest, bu: *manifest.BuildUnit,
                   tgt: *target.Target, u: *BuildUnit) R.Result[R.Void, outcome.Fail] {
     u.phases = vector.init[PhaseKind](a);
+    u.steps = vector.init[str](a);
+    if (req.goal == request.GOAL_CHECK) {
+        val loaded: R.Result[R.Void, outcome.Fail] = push_phase(u, PH_LOAD);
+        if (R.is_err[R.Void, outcome.Fail](loaded)) { ret loaded; }
+        ret push_phase(u, PH_SEMA);
+    }
 
-    val demanded_r: R.Result[bool, outcome.Fail] = steps_demanded(a, itn, m, req, bu);
+    val demanded_r: R.Result[bool, outcome.Fail] = steps_demanded(a, itn, m, req, bu, ?u.steps);
     if (R.is_err[bool, outcome.Fail](demanded_r)) { ret R.void_of[bool, outcome.Fail](demanded_r); }
     if (m.dep_count > 0) {
         val r1: R.Result[R.Void, outcome.Fail] = push_phase(u, PH_DEP_STEPS);
@@ -640,6 +725,7 @@ fun derive_phases(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
     if (R.is_err[R.Void, outcome.Fail](r4)) { ret r4; }
     val r5: R.Result[R.Void, outcome.Fail] = push_phase(u, PH_LOWER);
     if (R.is_err[R.Void, outcome.Fail](r5)) { ret r5; }
+    if (req.goal == request.GOAL_TEST_LIST) { ret R.ok_void[outcome.Fail](); }
     val r6: R.Result[R.Void, outcome.Fail] = push_phase(u, PH_CODEGEN);
     if (R.is_err[R.Void, outcome.Fail](r6)) { ret r6; }
 
@@ -666,7 +752,7 @@ fun push_phase(u: *BuildUnit, k: PhaseKind) R.Result[R.Void, outcome.Fail] {
 }
 
 fun steps_demanded(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
-                   req: *request.BuildRequest, bu: *manifest.BuildUnit) R.Result[bool, outcome.Fail] {
+                   req: *request.BuildRequest, bu: *manifest.BuildUnit, steps: *Vector[str]) R.Result[bool, outcome.Fail] {
     if (m.step_count == 0) { ret R.ok[bool, outcome.Fail](false); }
 
     val pn_opt: O.Option[str] = intern.lookup(itn, bu.profile_name);
@@ -705,7 +791,15 @@ fun steps_demanded(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest
     if (R.is_err[R.Void, str](r)) {
         ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[R.Void, str](r)));
     }
-    if (order != nil && count > 0) { A.deallocate[u32](a, order, count::usize); }
+    fin { if (order != nil && count > 0) { A.deallocate[u32](a, order, count::usize); } }
+    var i: u32 = 0;
+    for (i < count) {
+        val named: O.Option[str] = intern.lookup(itn, m.steps[order[i]].name);
+        if (O.is_none[str](named)) { ret R.err[bool, outcome.Fail](outcome.internal("planned step name is not interned")); }
+        val appended: R.Result[usize, str] = vector.push[str](steps, O.unwrap[str](named));
+        if (R.is_err[usize, str](appended)) { ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[usize, str](appended))); }
+        i = i + 1;
+    }
     ret R.ok[bool, outcome.Fail](count > 0);
 }
 
@@ -920,7 +1014,9 @@ fun dylib_copy(a: *A.Allocator, actual: *u8,
     if (R.is_err[str, str](rp_r)) {
         ret R.err[LinkInput, outcome.Fail](outcome.user(R.unwrap_err[str, str](rp_r)));
     }
-    ret dyn_copy_with_rpath(a, install_name, R.unwrap_ok[str, str](rp_r)::*u8);
+    val rp: str = R.unwrap_ok[str, str](rp_r);
+    fin { str_free(a, rp); }
+    ret dyn_copy_with_rpath(a, install_name, rp::*u8);
 }
 
 fun object_matches_target(buf: *u8, len: usize, tgt: *target.Target) bool {
@@ -1281,6 +1377,7 @@ fun dylib_rpath_into(a: *A.Allocator, candidate: *u8, install_name: *u8,
     val rp_r: R.Result[str, str] = dylib_rpath(a, candidate, install_name);
     if (R.is_err[str, str](rp_r)) { ret false; }
     val rp: str = R.unwrap_ok[str, str](rp_r);
+    fin { str_free(a, rp); }
     val n: usize = str_len(rp);
     if (n + 1 > cap) { ret false; }
     memory.raw_copy(out::ptr, rp::ptr, n + 1);
@@ -1292,6 +1389,7 @@ fun dylib_rpath(a: *A.Allocator, candidate: *u8,
     val abs_r: R.Result[str, str] = resolve_from_cwd(a, candidate::str);
     if (R.is_err[str, str](abs_r)) { ret abs_r; }
     val abs: str = R.unwrap_ok[str, str](abs_r);
+    fin { str_free(a, abs); }
     val suffix: str = (install_name::usize + 7)::str;
     if (!str_contains(suffix, "/")) { ret path.parent(a, abs); }
     val abs_len: usize = str_len(abs);
@@ -1307,15 +1405,16 @@ fun dylib_rpath(a: *A.Allocator, candidate: *u8,
             "the selected dylib path does not match its @rpath install-name suffix");
     }
     if (cut > 1) { cut = cut - 1; }
-    (abs::*u8)[cut] = 0;
-    ret R.ok[str, str](abs);
+    ret str_copy_slice(a, abs, 0, cut);
 }
 
 fun resolve_from_cwd(a: *A.Allocator, p: str) R.Result[str, str] {
     if (path.is_abs(p)) { ret path.clone(a, p); }
     val cwd_r: R.Result[str, str] = env.current_dir(a);
     if (R.is_err[str, str](cwd_r)) { ret R.err[str, str](R.unwrap_err[str, str](cwd_r)); }
-    ret path.resolve(a, R.unwrap_ok[str, str](cwd_r), p);
+    val cwd: str = R.unwrap_ok[str, str](cwd_r);
+    fin { str_free(a, cwd); }
+    ret path.resolve(a, cwd, p);
 }
 
 fun accept_dylib(a: *A.Allocator, cand: *u8, arch_id: u32,
@@ -1374,7 +1473,7 @@ fun write_named_versioned(dir: *u8, name: *u8, v: u32, buf: *u8, cap: usize) boo
     ret true;
 }
 
-pub fun explain(p: *BuildPlan, itn: *intern.Interner) {
+pub fun explain(a: *A.Allocator, p: *BuildPlan, itn: *intern.Interner) R.Result[R.Void, outcome.Fail] {
     print.printf("plan: {}\n", p.request.project_root);
     print.printf("units: {}\n", p.units.len::i64);
 
@@ -1386,6 +1485,35 @@ pub fun explain(p: *BuildPlan, itn: *intern.Interner) {
             (i + 1)::i64, unit_artifact_label(u), unit_kind_label(u),
             entry_name(itn, u.target_entry.name), u.profile);
         print.printf("  goal    {}\n", request.goal_name(u.goal));
+        print.printf("  entry   {}\n", entry_name(itn, u.target_entry.entrypoint));
+        var ri: usize = 0;
+        for (ri < u.requires.len) {
+            print.printf("  need    artifact {}\n", u.requires.data[ri]);
+            ri = ri + 1;
+        }
+        var di: usize = 0;
+        for (di < u.dep_steps.len) {
+            print.printf("  depstep {}\n", u.dep_steps.data[di]);
+            di = di + 1;
+        }
+        var si: usize = 0;
+        for (si < u.steps.len) {
+            print.printf("  step    {}\n", u.steps.data[si]);
+            si = si + 1;
+        }
+        if (u.dep_steps.len != 0 || u.steps.len != 0 || u.requires.len != 0) {
+            print.print("  inputs  generated bytes remain unresolved until prerequisites run\n");
+        }
+        var mi: u32 = 0;
+        for (mi < u.target_entry.lib_count) {
+            print.printf("  link    manifest requirement {}\n", entry_name(itn, u.target_entry.libs[mi].text));
+            mi = mi + 1;
+        }
+        var ei: usize = 0;
+        for (ei < u.export_links.len) {
+            print.printf("  link    dependency export {}\n", entry_name(itn, u.export_links.data[ei]));
+            ei = ei + 1;
+        }
         print.printf("  tuple   {}-{}-{}\n",
             entry_name(itn, u.target_entry.isa_name),
             entry_name(itn, u.target_entry.os_name),
@@ -1411,12 +1539,17 @@ pub fun explain(p: *BuildPlan, itn: *intern.Interner) {
         var pi: usize = 0;
         for (pi < u.phases.len) {
             if (pi > 0) { print.print(" -> "); }
-            print.print(phase_name(u.phases.data[pi]));
+            val name: O.Option[str] = phase_name(u.phases.data[pi]);
+            if (O.is_none[str](name)) {
+                ret R.err[R.Void, outcome.Fail](unknown_phase(a, u.phases.data[pi]));
+            }
+            print.print(O.unwrap[str](name));
             pi = pi + 1;
         }
         print.print("\n");
         i = i + 1;
     }
+    ret R.ok_void[outcome.Fail]();
 }
 
 fun unit_artifact_label(u: *BuildUnit) str {
@@ -1443,15 +1576,22 @@ fun opt_name(level: u8) str {
     ret "debug";
 }
 
-fun phase_name(k: PhaseKind) str {
-    if (k == PH_DEP_STEPS) { ret "dep steps"; }
-    if (k == PH_LOAD)      { ret "load"; }
-    if (k == PH_STEPS)     { ret "steps"; }
-    if (k == PH_SEMA)      { ret "sema"; }
-    if (k == PH_LOWER)     { ret "lower"; }
-    if (k == PH_CODEGEN)   { ret "codegen"; }
-    if (k == PH_EMIT)      { ret "emit"; }
-    ret "link";
+# the name of a declared build phase, absent for an unknown catalog member
+pub fun phase_name(k: PhaseKind) O.Option[str] {
+    if (k == PH_DEP_STEPS) { ret O.some[str]("dep steps"); }
+    if (k == PH_LOAD)      { ret O.some[str]("load"); }
+    if (k == PH_STEPS)     { ret O.some[str]("steps"); }
+    if (k == PH_SEMA)      { ret O.some[str]("sema"); }
+    if (k == PH_LOWER)     { ret O.some[str]("lower"); }
+    if (k == PH_CODEGEN)   { ret O.some[str]("codegen"); }
+    if (k == PH_EMIT)      { ret O.some[str]("emit"); }
+    if (k == PH_LINK)      { ret O.some[str]("link"); }
+    ret O.none[str]();
+}
+
+# an internal catalog failure with a caller-owned message
+pub fun unknown_phase(a: *A.Allocator, k: PhaseKind) outcome.Fail {
+    ret outcome.unknown_catalog(a, "PhaseKind", k::u32);
 }
 
 fun ut_manifest_src(a: *A.Allocator, itn: *intern.Interner, src: str, out_m: *manifest.Manifest) bool {
@@ -1460,7 +1600,7 @@ fun ut_manifest_src(a: *A.Allocator, itn: *intern.Interner, src: str, out_m: *ma
     val tr: R.Result[toml.Table, str] = toml.parse(a, src);
     if (R.is_err[toml.Table, str](tr)) { ret false; }
     var t: toml.Table = R.unwrap_ok[toml.Table, str](tr);
-    val mr: R.Result[manifest.Manifest, str] = manifest.parse(a, itn, ?t, true);
+    val mr: R.Result[manifest.Manifest, str] = manifest.parse(a, itn, ?t);
     toml.dnit(a, ?t);
     if (R.is_err[manifest.Manifest, str](mr)) { ret false; }
     @out_m = R.unwrap_ok[manifest.Manifest, str](mr);
@@ -1468,7 +1608,7 @@ fun ut_manifest_src(a: *A.Allocator, itn: *intern.Interner, src: str, out_m: *ma
 }
 
 fun ut_manifest(a: *A.Allocator, itn: *intern.Interner, out_m: *manifest.Manifest) bool {
-    ret ut_manifest_src(a, itn, "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.ta]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[target.tb]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[artifact.appa]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/appa\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[artifact.libb]\nkind = \"static\"\nentry = \"lib.mach\"\nout = \"lib/libb.a\"\ntargets = [\"*\"]\nlink = []\nneed = []\n", out_m);
+    ret ut_manifest_src(a, itn, "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.ta]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[target.tb]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n[profile.debug]\nvectorize=true\nfloat_reassoc=false\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[artifact.appa]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/appa\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[artifact.libb]\nkind = \"static\"\nentry = \"lib.mach\"\nout = \"lib/libb.a\"\ntargets = [\"*\"]\nlink = []\nneed = []\n", out_m);
 }
 
 fun ut_scaffold(alloc: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry, m: *manifest.Manifest) bool {
@@ -1983,21 +2123,32 @@ test "mach.lang.build.plan.extract_fat_dylib_id:selects_target_slice" {
 }
 
 test "mach.lang.build.plan.dylib_rpath:matches_install_name_suffix" {
-    var alloc: A.Allocator;
-    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var testing: T.Testing;
+    if (O.is_some[str](T.make(?testing))) { ret 1; }
+    fin { T.dnit(?testing); }
+    val alloc: *A.Allocator = T.allocator_of(?testing);
     val base: R.Result[str, str] =
-        dylib_rpath(?alloc, "/opt/lib/libfoo.dylib"::*u8,
+        dylib_rpath(alloc, "/opt/lib/libfoo.dylib"::*u8,
                     "@rpath/libfoo.3.dylib"::*u8);
     val nested: R.Result[str, str] =
-        dylib_rpath(?alloc, "/opt/lib/sub/libfoo.dylib"::*u8,
+        dylib_rpath(alloc, "/opt/lib/sub/libfoo.dylib"::*u8,
                     "@rpath/sub/libfoo.dylib"::*u8);
     val mismatch: R.Result[str, str] =
-        dylib_rpath(?alloc, "/opt/lib/libfoo.dylib"::*u8,
+        dylib_rpath(alloc, "/opt/lib/libfoo.dylib"::*u8,
                     "@rpath/sub/libfoo.dylib"::*u8);
     if (R.is_err[str, str](base) || R.is_err[str, str](nested)
         || R.is_ok[str, str](mismatch)) { ret 1; }
     if (!str_equals(R.unwrap_ok[str, str](base), "/opt/lib")
         || !str_equals(R.unwrap_ok[str, str](nested), "/opt/lib")) { ret 1; }
+    str_free(alloc, R.unwrap_ok[str, str](base));
+    str_free(alloc, R.unwrap_ok[str, str](nested));
+    var buffer: [64]u8;
+    if (!dylib_rpath_into(alloc, "/opt/lib/sub/libfoo.dylib", "@rpath/sub/libfoo.dylib", ?buffer[0], 64)) { ret 2; }
+    if (dylib_rpath_into(alloc, "/opt/lib/sub/libfoo.dylib", "@rpath/sub/libfoo.dylib", ?buffer[0], 1)) { ret 3; }
+    val relative: R.Result[str, str] = dylib_rpath(alloc, "sub/libfoo.dylib", "@rpath/sub/libfoo.dylib");
+    if (R.is_err[str, str](relative)) { ret 4; }
+    str_free(alloc, R.unwrap_ok[str, str](relative));
+    if (T.leaked(?testing) || T.double_free_count(?testing) != 0 || T.tracking_exhausted(?testing)) { ret 5; }
     ret 0;
 }
 
@@ -2075,7 +2226,7 @@ test "mach.lang.build.plan.plan:matrix_expands_targets_outer_artifacts_inner" {
 }
 
 fun ut_split_src() str {
-    ret "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.host]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[target.kern]\nisa = \"x86_64\"\nos = \"freestanding\"\nabi = \"sysv64\"\n[target.other]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[artifact.tool]\nkind = \"bin\"\nentry = \"tool.mach\"\nout = \"bin/tool\"\ntargets = [\"host\"]\nlink = []\nneed = []\n[artifact.kernel]\nkind = \"bin\"\nentry = \"kernel.mach\"\nout = \"bin/kernel\"\ntargets = [\"kern\"]\nlink = []\nneed = []\n";
+    ret "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.host]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[target.kern]\nisa = \"x86_64\"\nos = \"freestanding\"\nabi = \"sysv64\"\n[target.other]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n[profile.debug]\nvectorize=true\nfloat_reassoc=false\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[artifact.tool]\nkind = \"bin\"\nentry = \"tool.mach\"\nout = \"bin/tool\"\ntargets = [\"host\"]\nlink = []\nneed = []\n[artifact.kernel]\nkind = \"bin\"\nentry = \"kernel.mach\"\nout = \"bin/kernel\"\ntargets = [\"kern\"]\nlink = []\nneed = []\n";
 }
 
 test "mach.lang.build.plan.plan:artifacts_expand_filtered_by_target" {
@@ -2100,7 +2251,7 @@ test "mach.lang.build.plan.plan:artifacts_expand_filtered_by_target" {
 }
 
 fun ut_need_src() str {
-    ret "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.ta]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[target.tb]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[artifact.shader-a]\nkind = \"static\"\nentry = \"s.mach\"\nout = \"lib/shader-a.a\"\ntargets = [\"tb\"]\nlink = []\nneed = []\n[artifact.shader-b]\nkind = \"static\"\nentry = \"s.mach\"\nout = \"lib/shader-b.a\"\ntargets = [\"tb\"]\nlink = []\nneed = []\n[artifact.app]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app\"\ntargets = [\"ta\"]\nlink = []\nneed = [\"shader-*\"]\n[artifact.app2]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app2\"\ntargets = [\"ta\"]\nlink = []\nneed = [\"shader-a\"]\n";
+    ret "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.ta]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[target.tb]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n[profile.debug]\nvectorize=true\nfloat_reassoc=false\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[artifact.shader-a]\nkind = \"static\"\nentry = \"s.mach\"\nout = \"lib/shader-a.a\"\ntargets = [\"tb\"]\nlink = []\nneed = []\n[artifact.shader-b]\nkind = \"static\"\nentry = \"s.mach\"\nout = \"lib/shader-b.a\"\ntargets = [\"tb\"]\nlink = []\nneed = []\n[artifact.app]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app\"\ntargets = [\"ta\"]\nlink = []\nneed = [\"artifact.shader-*\"]\n[artifact.app2]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app2\"\ntargets = [\"ta\"]\nlink = []\nneed = [\"artifact.shader-a\"]\n";
 }
 
 test "mach.lang.build.plan.plan:required_artifacts_precede_their_consumer_on_their_own_target" {
@@ -2170,7 +2321,7 @@ test "mach.lang.build.plan.plan:a_test_build_builds_its_requirements_as_ordinary
 fun ut_two_bins_src(defaults: str) str {
     var backing: A.Allocator;
     if (O.is_some[str](page.make(?backing))) { ret ""; }
-    val head: str = "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.ta]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[artifact.first]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/first\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+    val head: str = "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.ta]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[profile.debug]\nvectorize=true\nfloat_reassoc=false\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[artifact.first]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/first\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
     val second: str = "[artifact.second]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/second\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
     val r: R.Result[str, str] = format.sprint(?backing, "{}{}{}{}", head, defaults, second, defaults);
     if (R.is_err[str, str](r)) { ret ""; }
@@ -2197,7 +2348,7 @@ test "mach.lang.build.plan.plan:a_test_goal_selection_error_fails_at_planning_wi
     ret 0;
 }
 
-test "mach.lang.build.plan.plan:a_test_goal_without_a_default_takes_the_first_declared_artifact_and_says_so_in_the_request" {
+test "mach.lang.build.plan.plan:a_test_goal_without_a_default_refuses_ambiguous_artifacts" {
     var alloc: A.Allocator;
     var itn:   intern.Interner;
     var reg:   target.TargetRegistry;
@@ -2210,11 +2361,9 @@ test "mach.lang.build.plan.plan:a_test_goal_without_a_default_takes_the_first_de
     rq.goal         = request.GOAL_TESTS;
 
     val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
-    val bp: BuildPlan = R.unwrap_ok[BuildPlan, outcome.Fail](pr);
-    if (bp.units.len != 1) { ret 2; }
-    if (!str_equals(bp.request.artifact, "first") || !bp.request.artifact_by_table_order) { ret 3; }
-    if (!str_equals(bp.units.data[0].sel_artifact, "first")) { ret 4; }
+    if (R.is_ok[BuildPlan, outcome.Fail](pr)) { ret 1; }
+    val refused: outcome.Fail = R.unwrap_err[BuildPlan, outcome.Fail](pr);
+    if (refused.kind != outcome.FAIL_USER || !str_contains(refused.message, "without a default")) { ret 2; }
     ret 0;
 }
 
@@ -2379,9 +2528,21 @@ test "mach.lang.build.plan.plan:phases_follow_goal" {
     val pl: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
     if (R.is_err[BuildPlan, outcome.Fail](pl)) { ret 1; }
     val ul: *BuildUnit = ?R.unwrap_ok[BuildPlan, outcome.Fail](pl).units.data[0];
-    if (ul.phases.len != 4)               { ret 1; }
-    if (ul.phases.data[3] != PH_CODEGEN)  { ret 1; }
-    if (!str_empty(ul.out_path))          { ret 1; }
+    if (ul.phases.len != 3)              { ret 1; }
+    if (ul.phases.data[0] != PH_LOAD)     { ret 1; }
+    if (ul.phases.data[1] != PH_SEMA)     { ret 1; }
+    if (ul.phases.data[2] != PH_LOWER)    { ret 1; }
+    if (!str_empty(ul.out_path))         { ret 1; }
+
+    rq.emit_ir = true;
+    rq.emit_asm = true;
+    val pe: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (R.is_err[BuildPlan, outcome.Fail](pe)) { ret 1; }
+    val ue: *BuildUnit = ?R.unwrap_ok[BuildPlan, outcome.Fail](pe).units.data[0];
+    if (ue.phases.len != 3 || ue.phases.data[2] != PH_LOWER) { ret 1; }
+    if (!str_empty(ue.out_path)) { ret 1; }
+    rq.emit_ir = false;
+    rq.emit_asm = false;
 
     rq.goal = request.GOAL_TESTS;
     val pt: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
@@ -2399,7 +2560,7 @@ test "mach.lang.build.plan.plan:finished_modules_end_at_emit" {
     var itn:   intern.Interner;
     var reg:   target.TargetRegistry;
     var m:     manifest.Manifest;
-    if (!ut_scaffold_src(?alloc, ?itn, ?reg, ?m, "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.gpu]\nisa = \"spirv\"\nos = \"freestanding\"\nabi = \"spirv\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[artifact.appa]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/appa\"\ntargets = [\"*\"]\nlink = []\nneed = []\n")) { ret 1; }
+    if (!ut_scaffold_src(?alloc, ?itn, ?reg, ?m, "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.gpu]\nisa = \"spirv\"\nos = \"freestanding\"\nabi = \"spirv\"\n[profile.debug]\nvectorize=true\nfloat_reassoc=false\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[artifact.appa]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/appa\"\ntargets = [\"*\"]\nlink = []\nneed = []\n")) { ret 1; }
 
     var rq: request.BuildRequest = request.defaults();
     rq.project_root = "/r";
@@ -2442,7 +2603,7 @@ test "mach.lang.build.plan.plan:dep_steps_precede_project_steps" {
     var itn:   intern.Interner;
     var reg:   target.TargetRegistry;
     var m:     manifest.Manifest;
-    if (!ut_scaffold_src(?alloc, ?itn, ?reg, ?m, "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.ta]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[step.s]\nargv = [\"true\"]\nin = []\nout = [\"gen/x\"]\nneed = []\n[dep.d]\npath = \"./vendor/d\"\n[artifact.appa]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/appa\"\ntargets = [\"*\"]\nlink = []\nneed = [\"s\"]\n")) { ret 1; }
+    if (!ut_scaffold_src(?alloc, ?itn, ?reg, ?m, "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.ta]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[profile.debug]\nvectorize=true\nfloat_reassoc=false\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[step.s]\nargv = [\"true\"]\nin = []\nout = [\"gen/x\"]\nneed = []\n[dep.d]\npath = \"./vendor/d\"\n[artifact.appa]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/appa\"\ntargets = [\"*\"]\nlink = []\nneed = [\"step.s\"]\n")) { ret 1; }
 
     var rq: request.BuildRequest = request.defaults();
     rq.project_root = "/r";
@@ -2455,6 +2616,7 @@ test "mach.lang.build.plan.plan:dep_steps_precede_project_steps" {
 
     if (u0.phases.len < 3)                  { ret 1; }
     if (u0.phases.data[0] != PH_DEP_STEPS)  { ret 1; }
+    if (u0.steps.len != 1 || !str_equals(u0.steps.data[0], "s")) { ret 2; }
     if (u0.phases.data[1] != PH_STEPS)      { ret 1; }
     if (u0.phases.data[2] != PH_LOAD)       { ret 1; }
     ret 0;
@@ -2613,5 +2775,19 @@ test "mach.lang.build.plan.plan:owns_its_request_beyond_the_planning_scope" {
     val bp: BuildPlan = R.unwrap_ok[BuildPlan, outcome.Fail](pr);
     if (!str_equals(bp.request.project_root, "/owned-by-the-plan")) { ret 1; }
     if (!bp.request.all_targets) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.build.plan.plan:unknown_request_goal_is_internal_before_manifest_access" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    var req: request.BuildRequest = request.defaults();
+    req.goal = 255;
+    val result: R.Result[BuildPlan, outcome.Fail] = plan(?a, nil, nil, nil, req);
+    if (R.is_ok[BuildPlan, outcome.Fail](result)) { ret 2; }
+    val f: outcome.Fail = R.unwrap_err[BuildPlan, outcome.Fail](result);
+    fin { str_free(?a, f.message); }
+    if (f.kind != outcome.FAIL_INTERNAL || !str_contains(f.message, "BuildGoal")
+        || !str_contains(f.message, "255")) { ret 3; }
     ret 0;
 }

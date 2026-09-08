@@ -2,11 +2,16 @@ use std.allocator.page;
 use std.format;
 use T: std.allocator.testing;
 use std.system.os;
+use std.process.env;
 use std.collections.vector;
 use std.collections.vector.Vector;
 use std.crypto.hash.sha256;
 use fs: std.filesystem;
 use txn: std.filesystem.transaction;
+use io_error: std.io.error;
+use io_handle: std.io.handle;
+$if ($mach.build.os == $mach.os.linux) { use nofollow_os: std.system.os.linux; }
+$or ($mach.build.os == $mach.os.darwin) { use nofollow_os: std.system.os.darwin; }
 use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -17,6 +22,7 @@ use std.types.string.str_contains_char;
 use std.types.string.str_empty;
 use std.types.string.str_equals;
 use std.types.string.str_len;
+use std.types.string.str_copy;
 use std.types.string.str_starts_with;
 
 use A: std.allocator;
@@ -30,6 +36,7 @@ use mach.lang.fe.ast.expr;
 use mach.lang.fe.token;
 use mach.lang.intern;
 use mach.lang.manifest;
+use phase: mach.lang.fail;
 use mach.lang.query;
 
 pub def EmbedStatus: u8;
@@ -40,12 +47,41 @@ pub val EMBED_IS_DIR:   EmbedStatus = 2;
 pub val EMBED_UNREADABLE: EmbedStatus = 3;
 pub val EMBED_TOO_LARGE:  EmbedStatus = 4;
 
+pub rec EmbedError {
+    kind: phase.PhaseKind;
+    message: str;
+    native: O.Option[io_error.Error];
+    file_cleanup: O.Option[io_error.Error];
+    parent_cleanup: O.Option[txn.Error];
+}
+
+fun internal_error(message: str) EmbedError {
+    ret EmbedError{kind: phase.INTERNAL, message: message};
+}
+
+fun native_error(error: io_error.Error) EmbedError {
+    ret EmbedError{kind: phase.REJECTED, message: io_error.message(error), native: O.some[io_error.Error](error)};
+}
+
+fun parent_error(error: txn.Error) EmbedError {
+    var result: EmbedError = EmbedError{kind: phase.REJECTED, message: txn.error_message(error)};
+    if (error.kind == txn.MEMORY || error.kind == txn.INVALID) { result.kind = phase.INTERNAL; }
+    if (error.kind == txn.IO) {
+        var native: io_error.Error = io_error.from_code(error.code, io_error.OP_OPEN);
+        native.cleanup_code = error.cleanup_code;
+        result.native = O.some[io_error.Error](native);
+    }
+    or (error.cleanup_code != 0) { result.parent_cleanup = O.some[txn.Error](txn.Error{kind: txn.IO, op: error.op, code: error.cleanup_code}); }
+    ret result;
+}
+
 pub rec EmbedFile {
     path:   intern.StrId;
     status: EmbedStatus;
-    reason: str;
+    error: EmbedError;
     bytes:  *u8;
     len:    u32;
+    cap:    usize;
     digest: [32]u8;
 }
 
@@ -62,7 +98,7 @@ pub rec EmbedCache {
 
 val ENTRY_SEED_CAP: u32 = 8;
 
-val INPUT_LEN: u32 = 33;
+val INPUT_LEN: u32 = 65;
 
 pub fun init(alloc: *A.Allocator) EmbedCache {
     var c: EmbedCache;
@@ -109,7 +145,7 @@ pub fun get(c: *EmbedCache, path_id: intern.StrId) O.Option[*EmbedFile] {
     ret O.none[*EmbedFile]();
 }
 
-pub fun resolve_arg(alloc: *A.Allocator, c: *EmbedCache, decl_file: str, arg: str) R.Result[str, manifest.TemplateError] {
+fun resolve_arg_path(alloc: *A.Allocator, c: *EmbedCache, decl_file: str, arg: str) R.Result[str, manifest.TemplateError] {
     if (!str_contains_char(arg, '{')) {
         val r: R.Result[str, str] = resolve_path(alloc, decl_file, arg);
         if (R.is_err[str, str](r)) {
@@ -133,30 +169,77 @@ pub fun resolve_arg(alloc: *A.Allocator, c: *EmbedCache, decl_file: str, arg: st
     ret R.ok[str, manifest.TemplateError](R.unwrap_ok[path.Path, str](jr));
 }
 
-# check lexical and existing-parent containment beneath the project root
-# a missing parent is left to embed loading, while an incomplete check is err
-pub fun escapes_root(alloc: *A.Allocator, c: *EmbedCache, resolved: str) R.Result[bool, str] {
-    if (str_empty(c.root)) { ret R.ok[bool, str](false); }
-    val root_r: R.Result[path.Path, str] = path.clean(alloc, c.root);
-    if (R.is_err[path.Path, str](root_r)) { ret R.err[bool, str](R.unwrap_err[path.Path, str](root_r)); }
-    val root: str = R.unwrap_ok[path.Path, str](root_r);
-    fin { str_free(alloc, root); }
-    val res_r: R.Result[path.Path, str] = path.clean(alloc, resolved);
-    if (R.is_err[path.Path, str](res_r)) { ret R.err[bool, str](R.unwrap_err[path.Path, str](res_r)); }
+fun absolute_clean(alloc: *A.Allocator, value: str) R.Result[path.Path, str] {
+    if (path.is_abs(value)) { ret path.clean(alloc, value); }
+    val cwd_r: R.Result[str, str] = env.current_dir(alloc);
+    if (R.is_err[str, str](cwd_r)) { ret cwd_r; }
+    val cwd: str = R.unwrap_ok[str, str](cwd_r);
+    fin { str_free(alloc, cwd); }
+    val joined_r: R.Result[path.Path, str] = path.resolve(alloc, cwd, value);
+    if (R.is_err[path.Path, str](joined_r)) { ret joined_r; }
+    val joined: str = R.unwrap_ok[path.Path, str](joined_r);
+    fin { str_free(alloc, joined); }
+    ret path.clean(alloc, joined);
+}
+
+pub fun resolve_arg(alloc: *A.Allocator, c: *EmbedCache, decl_file: str, arg: str) R.Result[str, manifest.TemplateError] {
+    val result: R.Result[str, manifest.TemplateError] = resolve_arg_path(alloc, c, decl_file, arg);
+    if (R.is_err[str, manifest.TemplateError](result)) { ret result; }
+    val raw: str = R.unwrap_ok[str, manifest.TemplateError](result);
+    val normalized: R.Result[path.Path, str] = absolute_clean(alloc, raw);
+    str_free(alloc, raw);
+    if (R.is_err[path.Path, str](normalized)) { ret R.err[str, manifest.TemplateError](manifest.template_internal(R.unwrap_err[path.Path, str](normalized))); }
+    val resolved: str = R.unwrap_ok[path.Path, str](normalized);
+    if (!str_empty(c.root)) {
+        val cleaned: R.Result[path.Path, str] = absolute_clean(alloc, c.root);
+        if (R.is_err[path.Path, str](cleaned)) {
+            str_free(alloc, resolved);
+            ret R.err[str, manifest.TemplateError](manifest.template_internal(R.unwrap_err[path.Path, str](cleaned)));
+        }
+        val root: str = R.unwrap_ok[path.Path, str](cleaned);
+        val outside: bool = O.is_none[usize](relative_start(root, resolved));
+        str_free(alloc, root);
+        if (outside) {
+            str_free(alloc, resolved);
+            ret R.err[str, manifest.TemplateError](manifest.template_rejection(alloc, "an `embed` path", arg,
+                "path escapes the project root; keep embedded files inside the project"));
+        }
+    }
+    ret R.ok[str, manifest.TemplateError](resolved);
+}
+
+fun relative_start(root: str, target: str) O.Option[usize] {
+    if (str_equals(root, target)) { ret O.some[usize](str_len(root)); }
+    val len: usize = str_len(root);
+    if (len == 0 || str_len(target) <= len || !str_starts_with(target, root)) { ret O.none[usize](); }
+    if (root[len - 1] == path.separator()) { ret O.some[usize](len); }
+    if (target[len] != path.separator()) { ret O.none[usize](); }
+    ret O.some[usize](len + 1);
+}
+
+val PARENT_READY: u8 = 0;
+val PARENT_MISSING: u8 = 1;
+val PARENT_OUTSIDE: u8 = 2;
+
+# leaf storage and root ownership are published only together on parent_ready.
+fun open_parent(alloc: *A.Allocator, c: *EmbedCache, resolved: str, opened: *txn.Root, leaf: *str) R.Result[u8, EmbedError] {
+    @leaf = nil;
+    val res_r: R.Result[path.Path, str] = absolute_clean(alloc, resolved);
+    if (R.is_err[path.Path, str](res_r)) { ret R.err[u8, EmbedError](internal_error(R.unwrap_err[path.Path, str](res_r))); }
     val target: str = R.unwrap_ok[path.Path, str](res_r);
     fin { str_free(alloc, target); }
-    if (str_equals(target, root)) { ret R.ok[bool, str](false); }
-
-    val rl: usize = str_len(root);
-    if (str_len(target) <= rl || !str_starts_with(target, root)) { ret R.ok[bool, str](true); }
-    var relative_start: usize = rl;
-    if (root[rl - 1] != path.separator()) {
-        if (target[rl] != path.separator()) { ret R.ok[bool, str](true); }
-        relative_start = relative_start + 1;
-    }
-    val rel: str = (target::usize + relative_start)::str;
+    var root_r: R.Result[path.Path, str];
+    if (str_empty(c.root)) { root_r = path.parent(alloc, target); }
+    or { root_r = absolute_clean(alloc, c.root); }
+    if (R.is_err[path.Path, str](root_r)) { ret R.err[u8, EmbedError](internal_error(R.unwrap_err[path.Path, str](root_r))); }
+    val root: str = R.unwrap_ok[path.Path, str](root_r);
+    fin { str_free(alloc, root); }
+    val start: O.Option[usize] = relative_start(root, target);
+    if (O.is_none[usize](start)) { ret R.ok[u8, EmbedError](PARENT_OUTSIDE); }
+    var rel: str = ".";
+    if (!str_equals(root, target)) { rel = (target::usize + O.unwrap[usize](start))::str; }
     val dir_r: R.Result[path.Path, str] = path.parent(alloc, rel);
-    if (R.is_err[path.Path, str](dir_r)) { ret R.err[bool, str](R.unwrap_err[path.Path, str](dir_r)); }
+    if (R.is_err[path.Path, str](dir_r)) { ret R.err[u8, EmbedError](internal_error(R.unwrap_err[path.Path, str](dir_r))); }
     val dir: str = R.unwrap_ok[path.Path, str](dir_r);
     fin { str_free(alloc, dir); }
     if (path.separator() != '/'::u8) {
@@ -166,19 +249,44 @@ pub fun escapes_root(alloc: *A.Allocator, c: *EmbedCache, resolved: str) R.Resul
             i = i + 1;
         }
     }
-    var opened: txn.Root;
-    val open_r: O.Option[txn.Error] = txn.root_open(?opened, root, dir);
+    val leaf_r: R.Result[str, str] = str_copy(alloc, path.filename(rel));
+    if (R.is_err[str, str](leaf_r)) { ret R.err[u8, EmbedError](internal_error(R.unwrap_err[str, str](leaf_r))); }
+    val name: str = R.unwrap_ok[str, str](leaf_r);
+    val open_r: O.Option[txn.Error] = txn.root_open(opened, root, dir);
     if (O.is_some[txn.Error](open_r)) {
+        str_free(alloc, name);
         val error: txn.Error = O.unwrap[txn.Error](open_r);
-        if (error.kind == txn.CONTAINMENT) { ret R.ok[bool, str](true); }
-        if (error.kind == txn.IO && error.code == os.ENOENT) { ret R.ok[bool, str](false); }
-        ret R.err[bool, str](txn.error_message(error));
+        if (error.kind == txn.CONTAINMENT && error.cleanup_code == 0) { ret R.ok[u8, EmbedError](PARENT_OUTSIDE); }
+        if (error.kind == txn.IO && error.code == os.ENOENT && error.cleanup_code == 0) { ret R.ok[u8, EmbedError](PARENT_MISSING); }
+        ret R.err[u8, EmbedError](parent_error(error));
     }
-    val closed: O.Option[txn.Error] = txn.root_dnit(?opened);
-    if (O.is_some[txn.Error](closed)) {
-        ret R.err[bool, str](txn.error_message(O.unwrap[txn.Error](closed)));
+    @leaf = name;
+    ret R.ok[u8, EmbedError](PARENT_READY);
+}
+
+# a missing generated path is contained, while an incomplete check remains an error.
+fun t_escapes_root(alloc: *A.Allocator, c: *EmbedCache, resolved: str) R.Result[bool, EmbedError] {
+    if (str_empty(c.root)) { ret R.ok[bool, EmbedError](false); }
+    var parent: txn.Root;
+    var leaf: str = nil;
+    val prepared: R.Result[u8, EmbedError] = open_parent(alloc, c, resolved, ?parent, ?leaf);
+    if (R.is_err[u8, EmbedError](prepared)) { ret R.err[bool, EmbedError](R.unwrap_err[u8, EmbedError](prepared)); }
+    val status: u8 = R.unwrap_ok[u8, EmbedError](prepared);
+    if (status != PARENT_READY) { ret R.ok[bool, EmbedError](status == PARENT_OUTSIDE); }
+    fin { str_free(alloc, leaf); }
+    var info: os.stat_t;
+    var inspected: i64 = 0;
+    if (str_equals(leaf, ".")) { inspected = os.stat(txn.root_fd(?parent), ?info); }
+    or { inspected = os.stat_path(txn.root_fd(?parent), leaf, ?info, os.AT_SYMLINK_NOFOLLOW); }
+    val closed: O.Option[txn.Error] = txn.root_dnit(?parent);
+    if (inspected < 0 && inspected != os.ENOENT) {
+        var error: EmbedError = native_error(io_error.from_code(inspected, io_error.OP_OPEN));
+        error.parent_cleanup = closed;
+        ret R.err[bool, EmbedError](error);
     }
-    ret R.ok[bool, str](false);
+    if (O.is_some[txn.Error](closed)) { ret R.err[bool, EmbedError](parent_error(O.unwrap[txn.Error](closed))); }
+    if (inspected == os.ENOENT) { ret R.ok[bool, EmbedError](false); }
+    ret R.ok[bool, EmbedError]((os.stat_mode(?info) & os.S_IFMT) == os.S_IFLNK);
 }
 
 pub fun resolve_path(alloc: *A.Allocator, decl_file: str, arg: str) R.Result[str, str] {
@@ -192,139 +300,228 @@ pub fun resolve_path(alloc: *A.Allocator, decl_file: str, arg: str) R.Result[str
     ret R.ok[str, str](R.unwrap_ok[path.Path, str](jr));
 }
 
-pub fun refresh(c: *EmbedCache, db: *query.QueryDb, itn: *intern.Interner, p: str) R.Result[intern.StrId, str] {
+pub fun refresh(c: *EmbedCache, db: *query.QueryDb, itn: *intern.Interner, p: str) R.Result[intern.StrId, EmbedError] {
     val ir: R.Result[intern.StrId, str] = intern.intern(itn, p);
-    if (R.is_err[intern.StrId, str](ir)) { ret ir; }
+    if (R.is_err[intern.StrId, str](ir)) { ret R.err[intern.StrId, EmbedError](internal_error(R.unwrap_err[intern.StrId, str](ir))); }
     val path_id: intern.StrId = R.unwrap_ok[intern.StrId, str](ir);
-
-    val er: R.Result[*EmbedFile, str] = entry_for(c, path_id);
-    if (R.is_err[*EmbedFile, str](er)) { ret R.err[intern.StrId, str](R.unwrap_err[*EmbedFile, str](er)); }
-    val e: *EmbedFile = R.unwrap_ok[*EmbedFile, str](er);
-
-    val rr: R.Result[R.Void, str] = read_into(c, e, p);
-    if (R.is_err[R.Void, str](rr)) { ret R.err[intern.StrId, str](R.unwrap_err[R.Void, str](rr)); }
-
-    val pr: R.Result[R.Void, str] = publish(db, e);
-    if (R.is_err[R.Void, str](pr)) { ret R.err[intern.StrId, str](R.unwrap_err[R.Void, str](pr)); }
-    ret R.ok[intern.StrId, str](path_id);
+    var index: u32 = 0;
+    for (index < c.len && c.entries[index].path != path_id) { index = index + 1; }
+    if (index == c.len) {
+        val gr: R.Result[R.Void, str] = grow(c);
+        if (R.is_err[R.Void, str](gr)) { ret R.err[intern.StrId, EmbedError](internal_error(R.unwrap_err[R.Void, str](gr))); }
+    }
+    val e: *EmbedFile = ?c.entries[index];
+    var fresh: EmbedFile = empty_file(path_id);
+    fin { free_bytes(c, ?fresh); }
+    val rr: R.Result[R.Void, EmbedError] = read_into(c, ?fresh, p);
+    if (R.is_err[R.Void, EmbedError](rr)) { ret R.err[intern.StrId, EmbedError](R.unwrap_err[R.Void, EmbedError](rr)); }
+    val pr: R.Result[R.Void, str] = publish(db, ?fresh);
+    if (R.is_err[R.Void, str](pr)) {
+        var error: EmbedError = fresh.error;
+        error.kind = phase.INTERNAL;
+        error.message = R.unwrap_err[R.Void, str](pr);
+        ret R.err[intern.StrId, EmbedError](error);
+    }
+    if (index < c.len && e.status == EMBED_OK && fresh.status == EMBED_OK && e.len == fresh.len
+        && digest_equals(?e.digest[0], ?fresh.digest[0])) { ret R.ok[intern.StrId, EmbedError](path_id); }
+    if (index < c.len) { free_bytes(c, e); }
+    or { c.len = c.len + 1; }
+    @e = fresh;
+    fresh.bytes = nil;
+    fresh.cap = 0;
+    ret R.ok[intern.StrId, EmbedError](path_id);
 }
 
-fun read_into(c: *EmbedCache, e: *EmbedFile, p: str) R.Result[R.Void, str] {
-    val was_ok:  bool = e.status == EMBED_OK;
-    val old_len: u32  = e.len;
+fun rejected(e: *EmbedFile, status: EmbedStatus, message: str) {
+    e.status = status;
+    e.error = EmbedError{kind: phase.REJECTED, message: message};
+}
 
-    if (fs.is_dir(p)) {
-        free_bytes(c, e);
-        zero_digest(e);
-        e.status = EMBED_IS_DIR;
-        e.reason = "is a directory";
-        ret R.ok_void[str]();
-    }
-    if (!fs.exists(p)) {
-        free_bytes(c, e);
-        zero_digest(e);
-        e.status = EMBED_MISSING;
-        e.reason = "no such file or directory";
-        ret R.ok_void[str]();
-    }
+fun io_refused(e: *EmbedFile, error: io_error.Error) {
+    e.status = EMBED_UNREADABLE;
+    e.error = native_error(error);
+    if (error.code == os.ENOENT) { e.status = EMBED_MISSING; }
+}
 
-    val mr: R.Result[fs.Metadata, str] = fs.metadata(p);
-    if (R.is_ok[fs.Metadata, str](mr) && R.unwrap_ok[fs.Metadata, str](mr).size::u64 > 4294967295) {
-        mark_too_large(c, e);
-        ret R.ok_void[str]();
-    }
-
-    val rr: R.Result[Vector[u8], str] = fs.read_bytes(c.alloc, p);
-    if (R.is_err[Vector[u8], str](rr)) {
-        free_bytes(c, e);
-        zero_digest(e);
+fun read_into(c: *EmbedCache, e: *EmbedFile, p: str) R.Result[R.Void, EmbedError] {
+    var parent: txn.Root;
+    var leaf: str = nil;
+    val prepared: R.Result[u8, EmbedError] = open_parent(c.alloc, c, p, ?parent, ?leaf);
+    if (R.is_err[u8, EmbedError](prepared)) {
+        val error: EmbedError = R.unwrap_err[u8, EmbedError](prepared);
+        if (error.kind == phase.INTERNAL) { ret R.err[R.Void, EmbedError](error); }
         e.status = EMBED_UNREADABLE;
-        e.reason = R.unwrap_err[Vector[u8], str](rr);
-        ret R.ok_void[str]();
+        e.error = error;
+        ret R.ok_void[EmbedError]();
     }
-    var buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rr);
-    if (buf.len::u64 > 4294967295) {
-        vector.dnit[u8](?buf);
-        mark_too_large(c, e);
-        ret R.ok_void[str]();
+    val status: u8 = R.unwrap_ok[u8, EmbedError](prepared);
+    if (status == PARENT_MISSING) { rejected(e, EMBED_MISSING, "no such file or directory"); ret R.ok_void[EmbedError](); }
+    if (status == PARENT_OUTSIDE) { rejected(e, EMBED_UNREADABLE, "path escapes the project root or traverses a symlink"); ret R.ok_void[EmbedError](); }
+    fin { str_free(c.alloc, leaf); }
+    val read: R.Result[R.Void, EmbedError] = read_leaf(c, e, ?parent, leaf);
+    val closed: O.Option[txn.Error] = txn.root_dnit(?parent);
+    if (R.is_err[R.Void, EmbedError](read)) {
+        var error: EmbedError = R.unwrap_err[R.Void, EmbedError](read);
+        error.parent_cleanup = closed;
+        ret R.err[R.Void, EmbedError](error);
     }
-
-    var fresh: [32]u8;
-    sha256.hash(buf.data, buf.len, ?fresh[0]);
-
-    if (was_ok && old_len == buf.len::u32 && digest_equals(?e.digest[0], ?fresh[0])) {
-        vector.dnit[u8](?buf);
-        ret R.ok_void[str]();
-    }
-
-    free_bytes(c, e);
-    e.status = EMBED_OK;
-    e.reason = "";
-    var i: u32 = 0;
-    for (i < 32) {
-        e.digest[i] = fresh[i];
-        i = i + 1;
-    }
-
-    if (buf.len > 0) {
-        val ar: R.Result[*u8, str] = A.allocate[u8](c.alloc, buf.len);
-        if (R.is_err[*u8, str](ar)) {
-            vector.dnit[u8](?buf);
-            ret R.err[R.Void, str](R.unwrap_err[*u8, str](ar));
+    if (O.is_some[txn.Error](closed)) {
+        val error: EmbedError = parent_error(O.unwrap[txn.Error](closed));
+        if (error.kind == phase.INTERNAL) {
+            if (e.status == EMBED_OK) { ret R.err[R.Void, EmbedError](error); }
+            e.error.kind = phase.INTERNAL;
+            e.error.parent_cleanup = closed;
+            ret R.err[R.Void, EmbedError](e.error);
         }
-        e.bytes = R.unwrap_ok[*u8, str](ar);
-        e.len   = buf.len::u32;
-        var bi: usize = 0;
-        for (bi < buf.len) {
-            e.bytes[bi] = buf.data[bi];
-            bi = bi + 1;
-        }
+        if (e.status == EMBED_OK) { e.status = EMBED_UNREADABLE; e.error = parent_error(O.unwrap[txn.Error](closed)); }
+        or { e.error.parent_cleanup = closed; }
     }
-    vector.dnit[u8](?buf);
-    ret R.ok_void[str]();
+    if (e.status != EMBED_OK) { free_bytes(c, e); zero_digest(e); }
+    ret R.ok_void[EmbedError]();
+}
+
+fun read_leaf(c: *EmbedCache, e: *EmbedFile, parent: *txn.Root, leaf: str) R.Result[R.Void, EmbedError] {
+    if (str_equals(leaf, ".")) { rejected(e, EMBED_IS_DIR, "is a directory"); ret R.ok_void[EmbedError](); }
+    var info: os.stat_t;
+    val inspected: i64 = os.stat_path(txn.root_fd(parent), leaf, ?info, os.AT_SYMLINK_NOFOLLOW);
+    if (inspected < 0) { io_refused(e, io_error.from_code(inspected, io_error.OP_OPEN)); ret R.ok_void[EmbedError](); }
+    classify_file(e, ?info);
+    if (e.status != EMBED_OK) { ret R.ok_void[EmbedError](); }
+    var flags: i32 = os.O_RDONLY;
+    $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
+        flags = flags | nofollow_os.O_NOFOLLOW | nofollow_os.O_NONBLOCK;
+    }
+    val opened: i64 = os.open(txn.root_fd(parent), leaf, flags, 0);
+    if (opened < 0) { io_refused(e, io_error.from_code(opened, io_error.OP_OPEN)); ret R.ok_void[EmbedError](); }
+    var file: fs.File = fs.File{handle: io_handle.FileHandle{value: opened::usize}};
+    val read: R.Result[R.Void, EmbedError] = read_handle(c, e, file);
+    val closed: O.Option[io_error.Error] = fs.close(?file);
+    if (R.is_err[R.Void, EmbedError](read)) {
+        var error: EmbedError = R.unwrap_err[R.Void, EmbedError](read);
+        error.file_cleanup = closed;
+        ret R.err[R.Void, EmbedError](error);
+    }
+    if (O.is_some[io_error.Error](closed)) {
+        if (e.status == EMBED_OK) { io_refused(e, O.unwrap[io_error.Error](closed)); }
+        or { e.error.file_cleanup = closed; }
+    }
+    ret R.ok_void[EmbedError]();
+}
+
+fun classify_file(e: *EmbedFile, info: *os.stat_t) {
+    val kind: u32 = os.stat_mode(info) & os.S_IFMT;
+    if (kind == os.S_IFDIR) { rejected(e, EMBED_IS_DIR, "is a directory"); ret; }
+    if (kind == os.S_IFLNK) { rejected(e, EMBED_UNREADABLE, "path traverses a symlink"); ret; }
+    if (kind != os.S_IFREG) { rejected(e, EMBED_UNREADABLE, "is not a regular file"); ret; }
+    if (info.st_size::u64 > 4294967295) { rejected(e, EMBED_TOO_LARGE, "file exceeds the maximum embed size of 4294967295 bytes"); ret; }
+}
+
+fun read_handle(c: *EmbedCache, e: *EmbedFile, file: fs.File) R.Result[R.Void, EmbedError] {
+    var info: os.stat_t;
+    val inspected: i64 = os.stat(file.handle.value::i32, ?info);
+    if (inspected < 0) { io_refused(e, io_error.from_code(inspected, io_error.OP_READ)); ret R.ok_void[EmbedError](); }
+    classify_file(e, ?info);
+    if (e.status != EMBED_OK) { ret R.ok_void[EmbedError](); }
+    var buf: Vector[u8] = vector.init[u8](c.alloc);
+    fin { vector.dnit[u8](?buf); }
+    if (info.st_size > 0) {
+        val reserve: R.Result[usize, str] = vector.reserve[u8](?buf, info.st_size::usize);
+        if (R.is_err[usize, str](reserve)) { ret R.err[R.Void, EmbedError](internal_error(R.unwrap_err[usize, str](reserve))); }
+    }
+    for {
+        if (buf.len == buf.cap || buf.len::u64 == 4294967295) {
+            var extra: u8 = 0;
+            val probe: R.Result[usize, io_error.Error] = fs.read(file, ?extra, 1);
+            if (R.is_err[usize, io_error.Error](probe)) {
+                val error: io_error.Error = R.unwrap_err[usize, io_error.Error](probe);
+                if (error.kind == io_error.INTERRUPTED) { cnt; }
+                io_refused(e, error); ret R.ok_void[EmbedError]();
+            }
+            if (R.unwrap_ok[usize, io_error.Error](probe) == 0) { brk; }
+            if (buf.len::u64 == 4294967295) {
+                rejected(e, EMBED_TOO_LARGE, "file exceeds the maximum embed size of 4294967295 bytes");
+                ret R.ok_void[EmbedError]();
+            }
+            var additional: usize = 8192;
+            if (4294967295 - buf.len::u64 < additional::u64) { additional = (4294967295 - buf.len::u64)::usize; }
+            val reserve: R.Result[usize, str] = vector.reserve[u8](?buf, additional);
+            if (R.is_err[usize, str](reserve)) { ret R.err[R.Void, EmbedError](internal_error(R.unwrap_err[usize, str](reserve))); }
+            buf.data[buf.len] = extra;
+            buf.len = buf.len + 1;
+            cnt;
+        }
+        var count: usize = buf.cap - buf.len;
+        if (count::u64 > 4294967295 - buf.len::u64) { count = (4294967295 - buf.len::u64)::usize; }
+        val read: R.Result[usize, io_error.Error] = fs.read(file, ?buf.data[buf.len], count);
+        if (R.is_err[usize, io_error.Error](read)) {
+            val error: io_error.Error = R.unwrap_err[usize, io_error.Error](read);
+            if (error.kind == io_error.INTERRUPTED) { cnt; }
+            io_refused(e, error); ret R.ok_void[EmbedError]();
+        }
+        val n: usize = R.unwrap_ok[usize, io_error.Error](read);
+        if (n == 0) { brk; }
+        buf.len = buf.len + n;
+    }
+    sha256.hash(buf.data, buf.len, ?e.digest[0]);
+    e.bytes = buf.data;
+    e.len = buf.len::u32;
+    e.cap = buf.cap;
+    buf.data = nil;
+    buf.cap = 0;
+    ret R.ok_void[EmbedError]();
 }
 
 fun digest_equals(a: *u8, b: *u8) bool {
     var i: u32 = 0;
-    for (i < 32) {
-        if (a[i] != b[i]) { ret false; }
-        i = i + 1;
-    }
+    for (i < 32) { if (a[i] != b[i]) { ret false; } i = i + 1; }
     ret true;
 }
 
+fun hash_number(state: *sha256.State, n: u64) {
+    var bytes: [8]u8;
+    var i: u32 = 0;
+    for (i < 8) { bytes[i] = (n >> (i * 8))::u8; i = i + 1; }
+    sha256.update(state, ?bytes[0], 8);
+}
+
+fun hash_native(state: *sha256.State, error: O.Option[io_error.Error]) {
+    hash_number(state, O.is_some[io_error.Error](error)::u64);
+    if (O.is_some[io_error.Error](error)) {
+        val e: io_error.Error = O.unwrap[io_error.Error](error);
+        hash_number(state, e.kind::u64);
+        hash_number(state, e.operation::u64);
+        hash_number(state, e.code::u64);
+        hash_number(state, e.cleanup_code::u64);
+    }
+}
+
+fun hash_error(error: EmbedError, digest: *u8) {
+    var state: sha256.State = sha256.init();
+    hash_number(?state, error.kind::u64);
+    if (!str_empty(error.message)) { sha256.update(?state, error.message, str_len(error.message)); }
+    hash_native(?state, error.native);
+    hash_native(?state, error.file_cleanup);
+    hash_number(?state, O.is_some[txn.Error](error.parent_cleanup)::u64);
+    if (O.is_some[txn.Error](error.parent_cleanup)) {
+        val e: txn.Error = O.unwrap[txn.Error](error.parent_cleanup);
+        hash_number(?state, e.kind::u64);
+        hash_number(?state, e.op::u64);
+        hash_number(?state, e.code::u64);
+        hash_number(?state, e.cleanup_code::u64);
+    }
+    sha256.final(?state, digest);
+}
+
 fun publish(db: *query.QueryDb, e: *EmbedFile) R.Result[R.Void, str] {
-    var value: [33]u8;
+    var value: [65]u8;
     value[0] = e.status;
     var i: u32 = 0;
     for (i < 32) {
         value[i + 1] = e.digest[i];
         i = i + 1;
     }
+    hash_error(e.error, ?value[33]);
     ret query.set_input(db, query.Q_EMBED_FILE, e.path::u64, ?value[0], INPUT_LEN);
-}
-
-fun entry_for(c: *EmbedCache, path_id: intern.StrId) R.Result[*EmbedFile, str] {
-    var i: u32 = 0;
-    for (i < c.len) {
-        if (c.entries[i].path == path_id) { ret R.ok[*EmbedFile, str](?c.entries[i]); }
-        i = i + 1;
-    }
-
-    val gr: R.Result[R.Void, str] = grow(c);
-    if (R.is_err[R.Void, str](gr)) { ret R.err[*EmbedFile, str](R.unwrap_err[R.Void, str](gr)); }
-
-    val idx: u32 = c.len;
-    var e: EmbedFile;
-    e.path   = path_id;
-    e.status = EMBED_OK;
-    e.reason = "";
-    e.bytes  = nil;
-    e.len    = 0;
-    c.entries[idx] = e;
-    c.len = c.len + 1;
-    zero_digest(?c.entries[idx]);
-    ret R.ok[*EmbedFile, str](?c.entries[idx]);
 }
 
 fun grow(c: *EmbedCache) R.Result[R.Void, str] {
@@ -348,11 +545,12 @@ fun grow(c: *EmbedCache) R.Result[R.Void, str] {
 }
 
 fun free_bytes(c: *EmbedCache, e: *EmbedFile) {
-    if (e.bytes != nil && e.len > 0) {
-        A.deallocate[u8](c.alloc, e.bytes, e.len::usize);
+    if (e.bytes != nil && e.cap > 0) {
+        A.deallocate[u8](c.alloc, e.bytes, e.cap);
     }
     e.bytes = nil;
     e.len   = 0;
+    e.cap   = 0;
 }
 
 fun zero_digest(e: *EmbedFile) {
@@ -363,11 +561,8 @@ fun zero_digest(e: *EmbedFile) {
     }
 }
 
-fun mark_too_large(c: *EmbedCache, e: *EmbedFile) {
-    free_bytes(c, e);
-    zero_digest(e);
-    e.status = EMBED_TOO_LARGE;
-    e.reason = "file exceeds the maximum embed size of 4294967295 bytes";
+fun empty_file(path_id: intern.StrId) EmbedFile {
+    ret EmbedFile{path: path_id, status: EMBED_OK};
 }
 
 pub fun path_arg_span(a: *ast.Ast, dec: *decl.Decorator) O.Option[token.Span] {
@@ -425,9 +620,9 @@ fun t_embed_containment_paths(refuse: bool) i32 {
     var i: u32 = 0;
     for (i < 4) {
         val before: usize = T.attempt_count(?t);
-        val result: R.Result[bool, str] = escapes_root(alloc, ?cache, paths[i]);
-        if (R.is_err[bool, str](result)) { ret 2; }
-        if (R.unwrap_ok[bool, str](result) != (i == 3)) { ret 3; }
+        val result: R.Result[bool, EmbedError] = t_escapes_root(alloc, ?cache, paths[i]);
+        if (R.is_err[bool, EmbedError](result)) { ret 2; }
+        if (R.unwrap_ok[bool, EmbedError](result) != (i == 3)) { ret 3; }
         if (T.leaked(?t) || T.double_free_count(?t) != 0 || T.tracking_exhausted(?t)) { ret 4; }
         val attempts: usize = T.attempt_count(?t) - before;
         if (attempts == 0) { ret 5; }
@@ -435,9 +630,9 @@ fun t_embed_containment_paths(refuse: bool) i32 {
             var ordinal: usize = 1;
             for (ordinal <= attempts) {
                 T.fail_at_ordinal(?t, T.attempt_count(?t) + ordinal);
-                val failed: R.Result[bool, str] = escapes_root(alloc, ?cache, paths[i]);
-                if (R.is_ok[bool, str](failed)) { ret 6; }
-                if (!str_equals(R.unwrap_err[bool, str](failed), "out of memory")) { ret 7; }
+                val failed: R.Result[bool, EmbedError] = t_escapes_root(alloc, ?cache, paths[i]);
+                if (R.is_ok[bool, EmbedError](failed)) { ret 6; }
+                if (!str_equals(R.unwrap_err[bool, EmbedError](failed).message, "out of memory")) { ret 7; }
                 if (T.leaked(?t) || T.double_free_count(?t) != 0 || T.tracking_exhausted(?t)) { ret 8; }
                 ordinal = ordinal + 1;
             }
@@ -445,6 +640,58 @@ fun t_embed_containment_paths(refuse: bool) i32 {
         }
         i = i + 1;
     }
+    ret 0;
+}
+
+test "mach.lang.embed.containment:relative_roots_and_source_paths_share_absolute_coordinates" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val cwd_r: R.Result[str, str] = env.current_dir(?alloc);
+    if (R.is_err[str, str](cwd_r)) { ret 2; }
+    val cwd: str = R.unwrap_ok[str, str](cwd_r);
+    fin { str_free(?alloc, cwd); }
+    val source_r: R.Result[path.Path, str] = path.join(?alloc, cwd, "main.mach");
+    if (R.is_err[path.Path, str](source_r)) { ret 3; }
+    val source: str = R.unwrap_ok[path.Path, str](source_r);
+    fin { str_free(?alloc, source); }
+    val expected_r: R.Result[path.Path, str] = path.join(?alloc, cwd, "payload.bin");
+    if (R.is_err[path.Path, str](expected_r)) { ret 4; }
+    val expected: str = R.unwrap_ok[path.Path, str](expected_r);
+    fin { str_free(?alloc, expected); }
+    var cache: EmbedCache = init(?alloc);
+    var mode: u32 = 0;
+    for (mode < 6) {
+        cache.root = ".";
+        var declaration: str = "src/main.mach";
+        var argument: str = "../payload.bin";
+        if (mode == 1) { cache.root = "./src/.."; }
+        if (mode == 2) { declaration = source; argument = "payload.bin"; }
+        if (mode == 3) { cache.root = cwd; }
+        if (mode == 4) { cache.root = ".."; }
+        if (mode == 5) { cache.root = ""; }
+        val result: R.Result[str, manifest.TemplateError] = resolve_arg(?alloc, ?cache, declaration, argument);
+        if (R.is_err[str, manifest.TemplateError](result)) { ret 5; }
+        val resolved: str = R.unwrap_ok[str, manifest.TemplateError](result);
+        fin { str_free(?alloc, resolved); }
+        if (!str_equals(resolved, expected)) { ret 6; }
+        var parent: txn.Root;
+        var leaf: str = nil;
+        val opened: R.Result[u8, EmbedError] = open_parent(?alloc, ?cache, resolved, ?parent, ?leaf);
+        if (R.is_err[u8, EmbedError](opened) || R.unwrap_ok[u8, EmbedError](opened) != PARENT_READY) { ret 7; }
+        fin { str_free(?alloc, leaf); }
+        val leaf_ok: bool = str_equals(leaf, "payload.bin");
+        if (O.is_some[txn.Error](txn.root_dnit(?parent)) || !leaf_ok) { ret 8; }
+        mode = mode + 1;
+    }
+    cache.root = ".";
+    val escaped: R.Result[str, manifest.TemplateError] = resolve_arg(?alloc, ?cache, "main.mach", "../payload.bin");
+    if (R.is_ok[str, manifest.TemplateError](escaped)) {
+        str_free(?alloc, R.unwrap_ok[str, manifest.TemplateError](escaped));
+        ret 9;
+    }
+    var error: manifest.TemplateError = R.unwrap_err[str, manifest.TemplateError](escaped);
+    fin { manifest.template_error_dnit(?alloc, error); }
+    if (error.kind != phase.REJECTED) { ret 10; }
     ret 0;
 }
 
@@ -472,9 +719,9 @@ test "mach.lang.embed.containment:root_open_failure_is_not_a_missing_parent" {
     fin { T.dnit(?t); }
     var cache: EmbedCache = init(?backing);
     cache.root = temp.path;
-    val result: R.Result[bool, str] = escapes_root(T.allocator_of(?t), ?cache, child);
-    if (R.is_ok[bool, str](result)) { ret 2; }
-    if (str_empty(R.unwrap_err[bool, str](result))) { ret 3; }
+    val result: R.Result[bool, EmbedError] = t_escapes_root(T.allocator_of(?t), ?cache, child);
+    if (R.is_ok[bool, EmbedError](result)) { ret 2; }
+    if (str_empty(R.unwrap_err[bool, EmbedError](result).message)) { ret 3; }
     if (T.leaked(?t) || T.double_free_count(?t) != 0 || T.tracking_exhausted(?t)) { ret 4; }
     ret 0;
 }
@@ -484,9 +731,197 @@ test "mach.lang.embed.containment:filesystem_root_is_a_parent_without_an_extra_s
     if (O.is_some[str](page.make(?backing))) { ret 1; }
     var cache: EmbedCache = init(?backing);
     cache.root = "/";
-    val result: R.Result[bool, str] = escapes_root(?backing, ?cache,
+    val result: R.Result[bool, EmbedError] = t_escapes_root(?backing, ?cache,
         "/mach_embed_containment_missing_parent_3209/payload.bin");
-    if (R.is_err[bool, str](result)) { ret 2; }
-    if (R.unwrap_ok[bool, str](result)) { ret 3; }
+    if (R.is_err[bool, EmbedError](result)) { ret 2; }
+    if (R.unwrap_ok[bool, EmbedError](result)) { ret 3; }
     ret 0;
+}
+
+fun t_embed_refresh_refusal(root: str, file: str, cold: bool, ordinal: usize, attempts: *usize) i32 {
+    var t: T.Testing;
+    if (O.is_some[str](T.make(?t))) { ret 1; }
+    fin { T.dnit(?t); }
+    val alloc: *A.Allocator = T.allocator_of(?t);
+    var result: i32 = 0;
+    {
+        var cache: EmbedCache = init(alloc);
+        cache.root = root;
+        fin { dnit(?cache); }
+        var itn: intern.Interner = intern.init(alloc);
+        fin { intern.dnit(?itn); }
+        val db_r: R.Result[query.QueryDb, str] = query.init(alloc);
+        if (R.is_err[query.QueryDb, str](db_r)) { ret 2; }
+        var db: query.QueryDb = R.unwrap_ok[query.QueryDb, str](db_r);
+        fin { query.dnit(?db); }
+        if (R.is_err[R.Void, str](query.register_input(?db, query.Q_EMBED_FILE))) { ret 3; }
+        if (O.is_some[str](fs.write_bytes(file, "abc", 3, 0o600))) { ret 4; }
+        val interned: R.Result[intern.StrId, str] = intern.intern(?itn, file);
+        if (R.is_err[intern.StrId, str](interned)) { ret 5; }
+        val key: intern.StrId = R.unwrap_ok[intern.StrId, str](interned);
+        var old: *u8 = nil;
+        var revision: query.Revision = 0;
+        if (!cold) {
+            val first: R.Result[intern.StrId, EmbedError] = refresh(?cache, ?db, ?itn, file);
+            if (R.is_err[intern.StrId, EmbedError](first)) { ret 5; }
+            old = cache.entries[0].bytes;
+            revision = query.peek_revision(?db, query.Q_EMBED_FILE, key::u64);
+            val unchanged: R.Result[intern.StrId, EmbedError] = refresh(?cache, ?db, ?itn, file);
+            if (R.is_err[intern.StrId, EmbedError](unchanged) || cache.entries[0].bytes != old
+                || query.peek_revision(?db, query.Q_EMBED_FILE, key::u64) != revision) { ret 13; }
+        }
+        if (O.is_some[str](fs.write_bytes(file, "changed!", 8, 0o600))) { ret 6; }
+        val before: usize = T.attempt_count(?t);
+        if (ordinal != 0) { T.fail_at_ordinal(?t, before + ordinal); }
+        val second: R.Result[intern.StrId, EmbedError] = refresh(?cache, ?db, ?itn, file);
+        @attempts = T.attempt_count(?t) - before;
+        T.fail_at_ordinal(?t, 0);
+        if (ordinal == 0) {
+            if (R.is_err[intern.StrId, EmbedError](second) || cache.entries[0].len != 8
+                || cache.entries[0].bytes[0] != 'c'::u8
+                || query.peek_revision(?db, query.Q_EMBED_FILE, key::u64) == revision) { result = 7; }
+        }
+        or {
+            if (R.is_ok[intern.StrId, EmbedError](second)) { result = 8; }
+            or {
+                val error: EmbedError = R.unwrap_err[intern.StrId, EmbedError](second);
+                if (error.kind != phase.INTERNAL || !str_equals(error.message, "out of memory")) { result = 9; }
+            }
+            if (query.peek_revision(?db, query.Q_EMBED_FILE, key::u64) != revision) { result = 10; }
+            if (cold) { if (cache.len != 0) { result = 14; } }
+            or (cache.entries[0].status != EMBED_OK || cache.entries[0].bytes != old
+                || cache.entries[0].len != 3 || old[0] != 'a'::u8 || old[2] != 'c'::u8) { result = 10; }
+        }
+    }
+    if (T.leaked(?t) || T.double_free_count(?t) != 0 || T.tracking_exhausted(?t)) { ret 11; }
+    ret result;
+}
+
+test "mach.lang.embed.read:allocation_refusal_preserves_cache_ownership_and_input_revision" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val made: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "mach_embed_refusal");
+    if (R.is_err[fs.TempFile, str](made)) { ret 2; }
+    var temp: fs.TempFile = R.unwrap_ok[fs.TempFile, str](made);
+    if (O.is_some[str](fs.temp_close(?temp))) { fs.temp_remove(?temp); str_free(?alloc, temp.path); ret 3; }
+    fin { fs.temp_remove(?temp); str_free(?alloc, temp.path); }
+    val parent: R.Result[path.Path, str] = path.parent(?alloc, temp.path);
+    if (R.is_err[path.Path, str](parent)) { ret 4; }
+    val root: str = R.unwrap_ok[path.Path, str](parent);
+    fin { str_free(?alloc, root); }
+    var mode: u8 = 0;
+    for (mode < 2) {
+        var attempts: usize = 0;
+        val baseline: i32 = t_embed_refresh_refusal(root, temp.path, mode == 0, 0, ?attempts);
+        if (baseline != 0) { ret baseline; }
+        if (attempts == 0) { ret 12; }
+        var ordinal: usize = 1;
+        for (ordinal <= attempts) {
+            var refused_attempts: usize = 0;
+            val refused: i32 = t_embed_refresh_refusal(root, temp.path, mode == 0, ordinal, ?refused_attempts);
+            if (refused != 0) { ret refused; }
+            ordinal = ordinal + 1;
+        }
+        mode = mode + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.embed.read:symlink_parents_and_leaves_are_refused_without_bytes" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val made: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "mach_embed_links");
+    if (R.is_err[fs.TempFile, str](made)) { ret 2; }
+    var temp: fs.TempFile = R.unwrap_ok[fs.TempFile, str](made);
+    fin { str_free(?alloc, temp.path); }
+    if (O.is_some[str](fs.temp_close_and_remove(?temp)) || O.is_some[str](fs.create_dir(temp.path, 0o700))) { ret 3; }
+    fin { fs.remove_all(?alloc, temp.path); }
+    val file_r: R.Result[path.Path, str] = path.join(?alloc, temp.path, "payload");
+    val link_r: R.Result[path.Path, str] = path.join(?alloc, temp.path, "link");
+    val child_r: R.Result[path.Path, str] = path.join(?alloc, temp.path, "link/payload");
+    if (R.is_err[path.Path, str](file_r) || R.is_err[path.Path, str](link_r) || R.is_err[path.Path, str](child_r)) { ret 4; }
+    val file: str = R.unwrap_ok[path.Path, str](file_r);
+    val link: str = R.unwrap_ok[path.Path, str](link_r);
+    val child: str = R.unwrap_ok[path.Path, str](child_r);
+    fin { str_free(?alloc, file); str_free(?alloc, link); str_free(?alloc, child); }
+    if (O.is_some[str](fs.write_bytes(file, "secret", 6, 0o600))) { ret 5; }
+    var cache: EmbedCache = init(?alloc);
+    cache.root = temp.path;
+    var e: EmbedFile = empty_file(0);
+    fin { free_bytes(?cache, ?e); }
+    if (O.is_some[str](fs.symlink("payload", link))) { ret 6; }
+    val leaf_read: R.Result[R.Void, EmbedError] = read_into(?cache, ?e, link);
+    if (R.is_err[R.Void, EmbedError](leaf_read) || e.status != EMBED_UNREADABLE || e.bytes != nil || e.len != 0) { ret 7; }
+    if (O.is_some[str](fs.remove_file(link)) || O.is_some[str](fs.symlink(".", link))) { ret 8; }
+    e = empty_file(0);
+    val parent_read: R.Result[R.Void, EmbedError] = read_into(?cache, ?e, child);
+    if (R.is_err[R.Void, EmbedError](parent_read) || e.status != EMBED_UNREADABLE || e.bytes != nil || e.len != 0) { ret 9; }
+    if (O.is_some[str](fs.remove_file(link))) { ret 10; }
+    e = empty_file(0);
+    val missing: R.Result[R.Void, EmbedError] = read_into(?cache, ?e, child);
+    if (R.is_err[R.Void, EmbedError](missing) || e.status != EMBED_MISSING || e.bytes != nil) { ret 11; }
+    e = empty_file(0);
+    val inside: R.Result[R.Void, EmbedError] = read_into(?cache, ?e, file);
+    if (R.is_err[R.Void, EmbedError](inside) || e.status != EMBED_OK || e.len != 6 || e.bytes[0] != 's'::u8) { ret 12; }
+    ret 0;
+}
+
+test "mach.lang.embed.read:diagnostic_changes_invalidate_equal_status_inputs" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val made: R.Result[query.QueryDb, str] = query.init(?alloc);
+    if (R.is_err[query.QueryDb, str](made)) { ret 2; }
+    var db: query.QueryDb = R.unwrap_ok[query.QueryDb, str](made);
+    fin { query.dnit(?db); }
+    if (R.is_err[R.Void, str](query.register_input(?db, query.Q_EMBED_FILE))) { ret 3; }
+    var e: EmbedFile = empty_file(1);
+    io_refused(?e, io_error.from_code(os.EACCES, io_error.OP_OPEN));
+    if (R.is_err[R.Void, str](publish(?db, ?e))) { ret 4; }
+    val denied: query.Revision = query.peek_revision(?db, query.Q_EMBED_FILE, 1);
+    io_refused(?e, io_error.from_code(os.EIO, io_error.OP_READ));
+    if (R.is_err[R.Void, str](publish(?db, ?e))) { ret 5; }
+    val unreadable: query.Revision = query.peek_revision(?db, query.Q_EMBED_FILE, 1);
+    if (unreadable == denied) { ret 6; }
+    e.error.file_cleanup = O.some[io_error.Error](io_error.from_code(os.EBADF, io_error.OP_CLOSE));
+    if (R.is_err[R.Void, str](publish(?db, ?e))) { ret 7; }
+    if (query.peek_revision(?db, query.Q_EMBED_FILE, 1) == unreadable) { ret 8; }
+    ret 0;
+}
+
+test "mach.lang.embed.read:held_parent_survives_path_replacement" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val made: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "mach_embed_parent");
+    if (R.is_err[fs.TempFile, str](made)) { ret 2; }
+    var temp: fs.TempFile = R.unwrap_ok[fs.TempFile, str](made);
+    fin { str_free(?alloc, temp.path); }
+    if (O.is_some[str](fs.temp_close_and_remove(?temp)) || O.is_some[str](fs.create_dir(temp.path, 0o700))) { ret 3; }
+    fin { fs.remove_all(?alloc, temp.path); }
+    val original_r: R.Result[path.Path, str] = path.join(?alloc, temp.path, "original");
+    val moved_r: R.Result[path.Path, str] = path.join(?alloc, temp.path, "moved");
+    val file_r: R.Result[path.Path, str] = path.join(?alloc, temp.path, "original/payload");
+    if (R.is_err[path.Path, str](original_r) || R.is_err[path.Path, str](moved_r) || R.is_err[path.Path, str](file_r)) { ret 4; }
+    val original: str = R.unwrap_ok[path.Path, str](original_r);
+    val moved: str = R.unwrap_ok[path.Path, str](moved_r);
+    val file: str = R.unwrap_ok[path.Path, str](file_r);
+    fin { str_free(?alloc, original); str_free(?alloc, moved); str_free(?alloc, file); }
+    if (O.is_some[str](fs.create_dir(original, 0o700)) || O.is_some[str](fs.write_bytes(file, "old", 3, 0o600))) { ret 5; }
+    var cache: EmbedCache = init(?alloc);
+    cache.root = temp.path;
+    var parent: txn.Root;
+    var leaf: str = nil;
+    val opened: R.Result[u8, EmbedError] = open_parent(?alloc, ?cache, file, ?parent, ?leaf);
+    if (R.is_err[u8, EmbedError](opened) || R.unwrap_ok[u8, EmbedError](opened) != PARENT_READY) { ret 6; }
+    fin { str_free(?alloc, leaf); }
+    var result: i32 = 0;
+    if (O.is_some[str](fs.rename(original, moved)) || O.is_some[str](fs.create_dir(original, 0o700))
+        || O.is_some[str](fs.write_bytes(file, "new", 3, 0o600))) { result = 7; }
+    or {
+        var e: EmbedFile = empty_file(0);
+        fin { free_bytes(?cache, ?e); }
+        val read: R.Result[R.Void, EmbedError] = read_leaf(?cache, ?e, ?parent, leaf);
+        if (R.is_err[R.Void, EmbedError](read) || e.status != EMBED_OK || e.len != 3 || e.bytes[0] != 'o'::u8) { result = 8; }
+    }
+    if (O.is_some[txn.Error](txn.root_dnit(?parent))) { ret 9; }
+    ret result;
 }

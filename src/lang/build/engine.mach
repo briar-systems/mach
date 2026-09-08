@@ -36,6 +36,8 @@ use mach.lang.be.linker;
 use mach.lang.be.obj;
 use mach.lang.diagnostic;
 use mach.lang.driver;
+use project: mach.lang.driver.project;
+use passes: mach.lang.driver.passes;
 use mach.lang.intern;
 use mach.lang.manifest;
 use mach.lang.me.ir;
@@ -47,11 +49,6 @@ use mach.lang.target.of;
 use mach.lang.fail;
 
 rec UnitState {
-    irs:          *ir.Module;
-    ir_ready:     *bool;
-    images:       *of.ObjectImage;
-    image_ready:  *bool;
-
     obj_paths:    **u8;
     obj_len:      u32;
     dynlibs:      *of.DynLib;
@@ -309,16 +306,16 @@ pub fun execute_warm(bp: *plan.BuildPlan, unit_index: usize, s: *session.Session
 
     val begin_r: R.Result[driver.Project, outcome.Fail] = driver.begin_build(s, ?m, ?req, ev);
     if (R.is_err[driver.Project, outcome.Fail](begin_r)) {
-        val r: R.Result[outcome.BuildOutcome, outcome.Fail] = warm_fail(?bo, R.unwrap_err[driver.Project, outcome.Fail](begin_r));
-        ret r;
+        val diags_r: R.Result[R.Void, str] = outcome.record_diagnostics(?bo, ?s.sources, ?s.diags);
+        if (R.is_err[R.Void, str](diags_r)) {
+            outcome.outcome_dnit(?bo);
+            ret R.err[outcome.BuildOutcome, outcome.Fail](outcome.internal("failed to snapshot build diagnostics"));
+        }
+        ret warm_fail(?bo, R.unwrap_err[driver.Project, outcome.Fail](begin_r));
     }
     var p: driver.Project = R.unwrap_ok[driver.Project, outcome.Fail](begin_r);
 
     var st: UnitState;
-    st.irs          = nil;
-    st.ir_ready     = nil;
-    st.images       = nil;
-    st.image_ready  = nil;
     st.obj_paths    = nil;
     st.obj_len      = 0;
     st.dynlibs      = nil;
@@ -347,11 +344,19 @@ pub fun execute_warm(bp: *plan.BuildPlan, unit_index: usize, s: *session.Session
 
     if (st.out_path != nil) { st.out_path = unit.out_path::*u8; }
     val released: O.Option[txn.Error] = release_outputs(?p, ?st);
+    val refreshed: R.Result[R.Void, outcome.Fail] = driver.refresh_diagnostics(?p);
     var event_error: str = nil;
     if (R.is_err[R.Void, outcome.Fail](result)) {
         var f: outcome.Fail = R.unwrap_err[R.Void, outcome.Fail](result);
         val fail_r: R.Result[R.Void, str] = outcome.record_fail(?bo, ?f);
         if (R.is_err[R.Void, str](fail_r)) { event_error = "failed to record build failure"; }
+    }
+    if (R.is_err[R.Void, outcome.Fail](refreshed)) {
+        var failure: outcome.Fail = R.unwrap_err[R.Void, outcome.Fail](refreshed);
+        val recorded: R.Result[R.Void, str] = outcome.record_fail(?bo, ?failure);
+        if (R.is_err[R.Void, str](recorded)) { event_error = "failed to record diagnostic refresh failure"; }
+        outcome.fold_fail(?bo, ?failure);
+        if (R.is_ok[R.Void, outcome.Fail](result)) { result = refreshed; }
     }
     if (O.is_some[txn.Error](released)) {
         val error: txn.Error = O.unwrap[txn.Error](released);
@@ -363,7 +368,7 @@ pub fun execute_warm(bp: *plan.BuildPlan, unit_index: usize, s: *session.Session
         outcome.fold_fail(?bo, ?cleanup);
         if (R.is_ok[R.Void, outcome.Fail](result)) { result = R.err[R.Void, outcome.Fail](cleanup); }
     }
-    if (R.is_ok[R.Void, outcome.Fail](result) && ev != nil) {
+    if (R.is_ok[R.Void, outcome.Fail](result) && ev != nil && req.goal != request.GOAL_CHECK) {
         emit_unit_summary(?p, ?st, ev);
     }
 
@@ -373,7 +378,6 @@ pub fun execute_warm(bp: *plan.BuildPlan, unit_index: usize, s: *session.Session
     }
     btest.free_scope(?p, ?st.scope);
     pcg_sweep_staged(?p);
-    driver.lower_sweep_staged(?p);
     driver.dnit_project(?p);
 
     if (event_error != nil) {
@@ -568,11 +572,14 @@ fun release_outputs(p: *driver.Project, st: *UnitState) O.Option[txn.Error] {
 fun run_phase(ph: plan.PhaseKind, p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
               bo: *outcome.BuildOutcome, oa: *A.Allocator,
               ev: *readout.Progress) R.Result[R.Void, outcome.Fail] {
+    if (O.is_none[str](plan.phase_name(ph))) {
+        ret R.err[R.Void, outcome.Fail](plan.unknown_phase(oa, ph));
+    }
     var result: R.Result[R.Void, outcome.Fail] = R.err[R.Void, outcome.Fail](outcome.internal("unknown build phase"));
     if (ph == plan.PH_STEPS)     { result = driver.run_steps_phase(p); }
     if (ph == plan.PH_DEP_STEPS) { result = driver.run_dep_steps_phase(p); }
     if (ph == plan.PH_LOAD)      { result = load_phase(p); }
-    if (ph == plan.PH_SEMA)      { result = sema_phase(p, st); }
+    if (ph == plan.PH_SEMA)      { result = driver.run_sema_pass(p); }
     if (ph == plan.PH_LOWER)     { result = lower_phase(p, st, bo, ev); }
     if (ph == plan.PH_CODEGEN) {
         result = plan_outputs(p, unit, st);
@@ -589,6 +596,21 @@ fun run_phase(ph: plan.PhaseKind, p: *driver.Project, unit: *plan.BuildUnit, st:
     ret result;
 }
 
+test "mach.lang.build.engine.run_phase:unknown_catalog_member_is_internal_before_execution" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    val link: O.Option[str] = plan.phase_name(plan.PH_LINK);
+    if (O.is_none[str](link) || !str_equals(O.unwrap[str](link), "link")) { ret 2; }
+    if (O.is_some[str](plan.phase_name(255::plan.PhaseKind))) { ret 3; }
+    val result: R.Result[R.Void, outcome.Fail] = run_phase(255::plan.PhaseKind, nil, nil, nil, nil, ?a, nil);
+    if (R.is_ok[R.Void, outcome.Fail](result)) { ret 4; }
+    val failure: outcome.Fail = R.unwrap_err[R.Void, outcome.Fail](result);
+    fin { str_free(?a, failure.message); }
+    if (failure.kind != outcome.FAIL_INTERNAL || !str_contains(failure.message, "PhaseKind")
+        || !str_contains(failure.message, "255")) { ret 5; }
+    ret 0;
+}
+
 fun load_phase(p: *driver.Project) R.Result[R.Void, outcome.Fail] {
     val lr: R.Result[R.Void, outcome.Fail] = driver.run_load_phase(p);
     if (R.is_err[R.Void, outcome.Fail](lr)) { ret lr; }
@@ -598,41 +620,42 @@ fun load_phase(p: *driver.Project) R.Result[R.Void, outcome.Fail] {
     ret R.ok_void[outcome.Fail]();
 }
 
-fun ensure_views(p: *driver.Project, st: *UnitState) R.Result[R.Void, outcome.Fail] {
-    if (st.irs != nil) { ret R.ok_void[outcome.Fail](); }
-    val n: usize = p.module_len::usize;
-
-    val res_irs: R.Result[*ir.Module, str] = A.allocate[ir.Module](p.alloc, n);
-    if (R.is_err[*ir.Module, str](res_irs)) { ret R.err[R.Void, outcome.Fail](outcome.internal("out of memory")); }
-    st.irs = R.unwrap_ok[*ir.Module, str](res_irs);
-
-    val res_ir_ready: R.Result[*bool, str] = A.allocate[bool](p.alloc, n);
-    if (R.is_err[*bool, str](res_ir_ready)) { ret R.err[R.Void, outcome.Fail](outcome.internal("out of memory")); }
-    st.ir_ready = R.unwrap_ok[*bool, str](res_ir_ready);
-
-    val res_images: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](p.alloc, n);
-    if (R.is_err[*of.ObjectImage, str](res_images)) { ret R.err[R.Void, outcome.Fail](outcome.internal("out of memory")); }
-    st.images = R.unwrap_ok[*of.ObjectImage, str](res_images);
-
-    val res_image_ready: R.Result[*bool, str] = A.allocate[bool](p.alloc, n);
-    if (R.is_err[*bool, str](res_image_ready)) { ret R.err[R.Void, outcome.Fail](outcome.internal("out of memory")); }
-    st.image_ready = R.unwrap_ok[*bool, str](res_image_ready);
-
+fun collect_test_scope(p: *driver.Project, st: *UnitState) R.Result[R.Void, outcome.Fail] {
+    val allocated: R.Result[*ir.Module, str] = A.zallocate[ir.Module](p.alloc, p.module_len::usize);
+    if (R.is_err[*ir.Module, str](allocated)) {
+        ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[*ir.Module, str](allocated)));
+    }
+    val headers: *ir.Module = R.unwrap_ok[*ir.Module, str](allocated);
+    fin { A.deallocate[ir.Module](p.alloc, headers, p.module_len::usize); }
     var i: u32 = 0;
-    for (i < p.module_len) {
-        st.ir_ready[i]    = false;
-        st.image_ready[i] = false;
-        st.irs[i].function_len = 0;
+    for (i < p.emit_len) {
+        val mid: session.ModuleId = p.topo[i];
+        val current: *ir.Module = p.modules[mid::u32].ir_module;
+        if (current == nil) { ret R.err[R.Void, outcome.Fail](outcome.internal("test collection requires a current lowered module")); }
+        headers[mid::u32] = @current;
         i = i + 1;
     }
-    ret R.ok_void[outcome.Fail]();
+    ret btest.collect_scope(p, headers, ?st.scope);
 }
 
-fun sema_phase(p: *driver.Project, st: *UnitState) R.Result[R.Void, outcome.Fail] {
-    val vr: R.Result[R.Void, outcome.Fail] = ensure_views(p, st);
-    if (R.is_err[R.Void, outcome.Fail](vr)) { ret vr; }
-
-    ret driver.run_sema_pass(p);
+fun current_image_headers(p: *driver.Project) R.Result[*of.ObjectImage, outcome.Fail] {
+    val allocated: R.Result[*of.ObjectImage, str] = A.zallocate[of.ObjectImage](p.alloc, p.module_len::usize);
+    if (R.is_err[*of.ObjectImage, str](allocated)) {
+        ret R.err[*of.ObjectImage, outcome.Fail](outcome.internal(R.unwrap_err[*of.ObjectImage, str](allocated)));
+    }
+    val headers: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](allocated);
+    var i: u32 = 0;
+    for (i < p.emit_len) {
+        val mid: session.ModuleId = p.topo[i];
+        val current: *of.ObjectImage = p.modules[mid::u32].object_image;
+        if (current == nil) {
+            A.deallocate[of.ObjectImage](p.alloc, headers, p.module_len::usize);
+            ret R.err[*of.ObjectImage, outcome.Fail](outcome.internal("image publication requires a current codegen module"));
+        }
+        headers[mid::u32] = @current;
+        i = i + 1;
+    }
+    ret R.ok[*of.ObjectImage, outcome.Fail](headers);
 }
 
 fun lower_phase(p: *driver.Project, st: *UnitState, bo: *outcome.BuildOutcome, ev: *readout.Progress) R.Result[R.Void, outcome.Fail] {
@@ -658,14 +681,10 @@ fun lower_phase(p: *driver.Project, st: *UnitState, bo: *outcome.BuildOutcome, e
         }
     }
 
-    i = 0;
-    for (i < p.emit_len) {
-        val mid: session.ModuleId    = p.topo[i];
-        val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
-        val irm: *ir.Module          = m.ir_module;
-        st.irs[mid::u32]      = @irm;
-        st.ir_ready[mid::u32] = true;
-        i = i + 1;
+    if (p.req.goal == request.GOAL_TESTS || p.req.goal == request.GOAL_TEST_LIST) {
+        val collected: R.Result[R.Void, outcome.Fail] = collect_test_scope(p, st);
+        if (R.is_err[R.Void, outcome.Fail](collected)) { ret collected; }
+        bo.tests_skipped = st.scope.skipped;
     }
 
     readout.phase_end(ev, readout.PH_LOWER, p.emit_len, "module", "modules");
@@ -675,26 +694,45 @@ fun lower_phase(p: *driver.Project, st: *UnitState, bo: *outcome.BuildOutcome, e
 
 fun codegen_phase(p: *driver.Project, st: *UnitState, ev: *readout.Progress) R.Result[R.Void, outcome.Fail] {
     readout.phase_begin(ev, readout.PH_CODEGEN);
+    val prepared: R.Result[R.Void, outcome.Fail] = passes.prepare_codegen_pass(p);
+    if (R.is_err[R.Void, outcome.Fail](prepared)) { ret prepared; }
 
-    if (pcg_enabled(p)) {
-        val rp: R.Result[R.Void, fail.Fail] = run_codegen_parallel(p);
-        if (R.is_err[R.Void, fail.Fail](rp)) {
-            ret R.err[R.Void, outcome.Fail](outcome.from_fail(R.unwrap_err[R.Void, fail.Fail](rp)));
-        }
-    }
-
-    val res_codegen: R.Result[R.Void, outcome.Fail] = driver.run_codegen_pass(p);
-    if (R.is_err[R.Void, outcome.Fail](res_codegen)) { ret res_codegen; }
-
+    var roots: Vector[query.QueryKey] = vector.init[query.QueryKey](p.alloc);
+    fin { vector.dnit[query.QueryKey](?roots); }
+    val frontend: R.Result[R.Void, outcome.Fail] = driver.append_frontend_roots(p, ?roots);
+    if (R.is_err[R.Void, outcome.Fail](frontend)) { ret frontend; }
     var i: u32 = 0;
     for (i < p.emit_len) {
-        val mid: session.ModuleId    = p.topo[i];
-        val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
-        val img: *of.ObjectImage     = m.object_image;
-        st.images[mid::u32]      = @img;
-        st.image_ready[mid::u32] = true;
+        val m: *driver.ModuleEntry = ?p.modules[p.topo[i]::u32];
+        val key: u64 = passes.back_half_key_for(p, m);
+        val lowered: R.Result[usize, str] = vector.push[query.QueryKey](?roots,
+            query.QueryKey{kind: query.Q_LOWER, key: key});
+        if (R.is_err[usize, str](lowered)) {
+            ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[usize, str](lowered)));
+        }
+        val emitted: R.Result[usize, str] = vector.push[query.QueryKey](?roots,
+            query.QueryKey{kind: query.Q_CODEGEN, key: key});
+        if (R.is_err[usize, str](emitted)) {
+            ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[usize, str](emitted)));
+        }
         i = i + 1;
     }
+    val started: R.Result[query.Operation, outcome.Fail] = driver.begin_query_phase(p);
+    if (R.is_err[query.Operation, outcome.Fail](started)) {
+        ret R.err[R.Void, outcome.Fail](R.unwrap_err[query.Operation, outcome.Fail](started));
+    }
+    val operation: query.Operation = R.unwrap_ok[query.Operation, outcome.Fail](started);
+    var result: R.Result[R.Void, outcome.Fail] = passes.acquire_codegen_inputs(p);
+    if (R.is_ok[R.Void, outcome.Fail](result)) { result = passes.prepare_persistent_cache(p); }
+    if (R.is_ok[R.Void, outcome.Fail](result) && pcg_enabled(p)) {
+        val parallel: R.Result[R.Void, fail.Fail] = run_codegen_parallel(p);
+        if (R.is_err[R.Void, fail.Fail](parallel)) {
+            result = R.err[R.Void, outcome.Fail](outcome.from_fail(R.unwrap_err[R.Void, fail.Fail](parallel)));
+        }
+    }
+    if (R.is_ok[R.Void, outcome.Fail](result)) { result = passes.run_codegen_pass(p); }
+    result = driver.finish_query_phase(p, operation, roots.data, roots.len, result);
+    if (R.is_err[R.Void, outcome.Fail](result)) { ret result; }
 
     readout.phase_end(ev, readout.PH_CODEGEN, p.emit_len, "module", "modules");
     ret R.ok_void[outcome.Fail]();
@@ -742,9 +780,6 @@ fun emit_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
     }
 
     if (goal == request.GOAL_TESTS) {
-        val cr: R.Result[R.Void, outcome.Fail] = btest.collect_scope(p, st.irs, ?st.scope);
-        if (R.is_err[R.Void, outcome.Fail](cr)) { ret cr; }
-        bo.tests_skipped = st.scope.skipped;
         if (st.scope.sel_len == 0) {
             readout.phase_end(ev, readout.PH_EMIT, 0, "object", "objects");
             ret R.ok_void[outcome.Fail]();
@@ -755,7 +790,11 @@ fun emit_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
         || goal == request.GOAL_OBJECTS
         || goal == request.GOAL_TESTS;
     if (objects) {
-        val oc: R.Result[R.Void, outcome.Fail] = emit.write_objects(p, st.images, st.objects, ?st.obj_paths);
+        val borrowed: R.Result[*of.ObjectImage, outcome.Fail] = current_image_headers(p);
+        if (R.is_err[*of.ObjectImage, outcome.Fail](borrowed)) { ret R.void_of[*of.ObjectImage, outcome.Fail](borrowed); }
+        val images: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, outcome.Fail](borrowed);
+        fin { A.deallocate[of.ObjectImage](p.alloc, images, p.module_len::usize); }
+        val oc: R.Result[R.Void, outcome.Fail] = emit.write_objects(p, images, st.objects, ?st.obj_paths);
         if (R.is_err[R.Void, outcome.Fail](oc)) { ret oc; }
         st.obj_len = p.emit_len;
     }
@@ -834,7 +873,11 @@ fun link_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
 
     if (te.mode == driver.MODE_LIBRARY) {
         if (te.lib_kind == manifest.LIBKIND_STATIC) {
-            val arc_r: R.Result[R.Void, outcome.Fail] = emit.emit_static_archive(p, st.artifact, st.images, st.obj_paths, ?st.out_path);
+            val borrowed: R.Result[*of.ObjectImage, outcome.Fail] = current_image_headers(p);
+            if (R.is_err[*of.ObjectImage, outcome.Fail](borrowed)) { ret R.void_of[*of.ObjectImage, outcome.Fail](borrowed); }
+            val images: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, outcome.Fail](borrowed);
+            fin { A.deallocate[of.ObjectImage](p.alloc, images, p.module_len::usize); }
+            val arc_r: R.Result[R.Void, outcome.Fail] = emit.emit_static_archive(p, st.artifact, images, st.obj_paths, ?st.out_path);
             if (R.is_err[R.Void, outcome.Fail](arc_r)) { ret arc_r; }
             readout.phase_end(ev, readout.PH_LINK, 1, "archive", "archives");
             ret R.ok_void[outcome.Fail]();
@@ -883,7 +926,11 @@ fun link_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
     val from_image: bool = p.target.of.links_from_image;
     var res_link: R.Result[R.Void, outcome.Fail] = R.ok_void[outcome.Fail]();
     if (from_image) {
-        res_link = emit.link_mixed_images(p, st.images, ?st.obj_paths[ext_from], ext_count, st.dynlibs, st.dynlib_len, st.artifact, loaded.options);
+        val borrowed: R.Result[*of.ObjectImage, outcome.Fail] = current_image_headers(p);
+        if (R.is_err[*of.ObjectImage, outcome.Fail](borrowed)) { emit.dnit_image_options(p.alloc, ?loaded); ret R.void_of[*of.ObjectImage, outcome.Fail](borrowed); }
+        val images: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, outcome.Fail](borrowed);
+        fin { A.deallocate[of.ObjectImage](p.alloc, images, p.module_len::usize); }
+        res_link = emit.link_mixed_images(p, images, ?st.obj_paths[ext_from], ext_count, st.dynlibs, st.dynlib_len, st.artifact, loaded.options);
     }
     if (!from_image) {
         res_link = emit.link_executable(p, st.obj_paths, st.obj_len, st.dynlibs, st.dynlib_len, st.artifact, loaded.options);
@@ -978,7 +1025,11 @@ fun link_flat(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState, ev: *re
         ret R.ok_void[outcome.Fail]();
     }
 
-    val res_link: R.Result[R.Void, outcome.Fail] = emit.link_flat_images(p, st.images, st.artifact,
+    val borrowed: R.Result[*of.ObjectImage, outcome.Fail] = current_image_headers(p);
+    if (R.is_err[*of.ObjectImage, outcome.Fail](borrowed)) { ret R.void_of[*of.ObjectImage, outcome.Fail](borrowed); }
+    val images: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, outcome.Fail](borrowed);
+    fin { A.deallocate[of.ObjectImage](p.alloc, images, p.module_len::usize); }
+    val res_link: R.Result[R.Void, outcome.Fail] = emit.link_flat_images(p, images, st.artifact,
         of.image_options_default(p.req.subsystem));
     if (R.is_err[R.Void, outcome.Fail](res_link)) { ret res_link; }
 
@@ -992,9 +1043,6 @@ fun link_flat(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState, ev: *re
 }
 
 fun list_tests(p: *driver.Project, st: *UnitState, bo: *outcome.BuildOutcome, oa: *A.Allocator) R.Result[R.Void, outcome.Fail] {
-    val cr: R.Result[R.Void, outcome.Fail] = btest.collect_scope(p, st.irs, ?st.scope);
-    if (R.is_err[R.Void, outcome.Fail](cr)) { ret cr; }
-    bo.tests_skipped = st.scope.skipped;
     ret btest.record_tests(p, ?st.scope, nil, bo, oa);
 }
 
@@ -1107,12 +1155,48 @@ fun write_link_config(fb: *dq.FpBuf, p: *driver.Project, out_path: *u8, product:
     val a5: R.Result[R.Void, str] = dq.fp_u32(fb, dynlib_count);        if (R.is_err[R.Void, str](a5)) { ret a5; }
     var j: u32 = 0;
     for (j < dynlib_count) {
-        val an: R.Result[R.Void, str] = dq.fp_u32(fb, dynlibs[j].name::u32);   if (R.is_err[R.Void, str](an)) { ret an; }
-        val as: R.Result[R.Void, str] = dq.fp_u32(fb, dynlibs[j].soname::u32); if (R.is_err[R.Void, str](as)) { ret as; }
-        val ar: R.Result[R.Void, str] = dq.fp_u32(fb, dynlibs[j].rpath::u32);  if (R.is_err[R.Void, str](ar)) { ret ar; }
+        val an: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, dynlibs[j].name);   if (R.is_err[R.Void, str](an)) { ret an; }
+        val as: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, dynlibs[j].soname); if (R.is_err[R.Void, str](as)) { ret as; }
+        val ar: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, dynlibs[j].rpath);  if (R.is_err[R.Void, str](ar)) { ret ar; }
+        val ai: R.Result[R.Void, str] = dq.fp_u8(fb, dynlibs[j].include_referenced); if (R.is_err[R.Void, str](ai)) { ret ai; }
         j = j + 1;
     }
     ret R.ok_void[str]();
+}
+
+test "mach.lang.build.engine.link_config:provider_policy_invalidates_without_changing_names" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    val initialized: R.Result[session.Session, str] = session.init(?a);
+    if (R.is_err[session.Session, str](initialized)) { ret 2; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](initialized);
+    fin { session.dnit(?s); }
+    var p: driver.Project;
+    project.init_project(?p, ?s);
+    fin { driver.dnit_project(?p); }
+    val name: R.Result[intern.StrId, str] = intern.intern(?s.interner, "provider");
+    if (R.is_err[intern.StrId, str](name)) { ret 3; }
+    var lib: of.DynLib = of.DynLib{
+        name: R.unwrap_ok[intern.StrId, str](name),
+        soname: R.unwrap_ok[intern.StrId, str](name),
+        rpath: intern.STR_NIL, include_referenced: false
+    };
+    if (R.is_err[R.Void, outcome.Fail](set_link_config_input(?p, "app", "app", linker.LINK_EXE::u32,
+        nil, 0, ?lib, 1, nil))) { ret 4; }
+    val baseline: query.Revision = query.peek_revision(?s.queries, query.Q_LINK_CONFIG, 0);
+    if (baseline == 0) { ret 5; }
+    if (R.is_err[R.Void, outcome.Fail](set_link_config_input(?p, "app", "app", linker.LINK_EXE::u32,
+        nil, 0, ?lib, 1, nil))) { ret 6; }
+    if (query.peek_revision(?s.queries, query.Q_LINK_CONFIG, 0) != baseline) { ret 7; }
+    lib.include_referenced = true;
+    if (R.is_err[R.Void, outcome.Fail](set_link_config_input(?p, "app", "app", linker.LINK_EXE::u32,
+        nil, 0, ?lib, 1, nil))) { ret 8; }
+    val changed: query.Revision = query.peek_revision(?s.queries, query.Q_LINK_CONFIG, 0);
+    if (changed == baseline) { ret 9; }
+    if (R.is_err[R.Void, outcome.Fail](set_link_config_input(?p, "app", "app", linker.LINK_EXE::u32,
+        nil, 0, ?lib, 1, nil))) { ret 10; }
+    if (query.peek_revision(?s.queries, query.Q_LINK_CONFIG, 0) != changed) { ret 11; }
+    ret 0;
 }
 
 rec PcgWorker {
@@ -1239,7 +1323,12 @@ fun run_codegen_parallel(p: *driver.Project) R.Result[R.Void, fail.Fail] {
     var stale_len: u32 = 0;
     var ti: u32 = 0;
     for (ti < emit_len) {
-        if (!driver.codegen_reusable(p, p.topo[ti])) {
+        val reusable: R.Result[bool, fail.Fail] = passes.codegen_reusable(p, p.topo[ti]);
+        if (R.is_err[bool, fail.Fail](reusable)) {
+            A.deallocate[u32](p.alloc, stale, emit_len::usize);
+            ret R.err[R.Void, fail.Fail](R.unwrap_err[bool, fail.Fail](reusable));
+        }
+        if (!R.unwrap_ok[bool, fail.Fail](reusable)) {
             stale[stale_len] = ti;
             stale_len = stale_len + 1;
         }

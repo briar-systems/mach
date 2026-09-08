@@ -1,12 +1,11 @@
 # Decorators
 
-A decorator is a codegen directive attached to a declaration. It expresses
-metadata that influences how the compiler emits the symbol: its linker name,
+A decorator attaches metadata to a declaration. It can provide source-use
+notices or influence how the compiler emits the symbol: its linker name,
 alignment, section placement, inlining, dynamic import attribution, constant-time
 obligations, or exclusion from auto-vectorization.
 
-Decorators are **codegen-only**. Visibility (`pub` / `ext`) is separate and
-unaffected by decorators.
+Visibility (`pub` / `ext`) is separate and unaffected by decorators.
 
 ## Surface
 
@@ -25,9 +24,40 @@ A decorator is written as an attribute:
 > (with no space) opens an attribute. Write such a comment with a separating
 > space — `# [...]`.
 
+## Deprecation notices
+
+`#[deprecated]` and `#[deprecated("message")]` mark a declaration as deprecated.
+The optional message must be one string literal and uses the normal literal
+escape decoding. Repeating the attribute or providing other arguments is an
+error. The attribute does not alter visibility, type identity, ABI, or codegen.
+
+Uses of a deprecated named declaration from another source module warn at the
+identifier being used. Value references, calls, and type references are covered,
+including generic uses. Each source site warns once, even when a generic body is
+instantiated more than once. The declaring source module does not warn on its
+own uses. An unused import alone produces no warning.
+
+Notices follow imported symbols and re-exports. An annotation on a re-export
+belongs to the forwarding module and replaces any inherited notice for that
+exported name. Other aliases of the same canonical definition keep their own
+notices. A clean alias is not made deprecated by using a deprecated alias first.
+
+```mach
+#[deprecated("use replacement")]
+pub fun old() i32 { ret replacement(); }
+
+pub fun replacement() i32 { ret 1; }
+```
+
+The attribute supports `fun`, `rec`, `uni`, `def`, `val`, `var`, `use`, and `fwd`
+declarations. Tests, comptime directives, and comptime declaration blocks reject
+it because they do not declare an externally usable name.
+
 ## Grammar
 
 ```
+#[deprecated]        # external uses warn
+#[deprecated("message")] # external uses warn with this message
 #[symbol("name")]    # linker name override
 #[library("dep")]    # dynamic import attribution (ext only)
 #[inline]            # force inlining (no arguments)
@@ -130,7 +160,23 @@ ext fun wsa_startup(ver: u16, data: *u8) i32;
 ### `inline` — force inlining
 
 Marks a function for inlining at every call site, overriding the compiler's
-size- and use-count heuristics. Applies to functions only; takes no arguments.
+size and use-count heuristics. Applies to functions only and takes no arguments.
+The optimization pipeline must enable inlining. Indirect calls and recursive
+call cycles are not expanded by this attribute. Taking a function's address
+retains its callable identity even when direct calls are inlined.
+
+Release optimization makes small ordinary helper bodies available across source
+modules without emitting extra definitions. Extraction, import and per-caller
+expansion each have a limit of 1024 copied IR instructions and 256 KiB of owned
+payload. `inline` overrides size and use-count heuristics within those limits.
+A remaining call or taken address still names the original defining function.
+Generic, comptime and pack specializations keep their existing shared weak
+linkage. When several modules materialize that same specialization, body import
+uses an already available definition or the first acquired provider of that
+linkage, and tracks that provider as a query dependency.
+Helpers referencing compiler-local literal pools retain their calls because those
+objects have module-local identity. Named globals keep their original symbols,
+and copied instructions preserve effects, assembly bindings and debug locations.
 
 ```mach
 #[inline]
@@ -159,8 +205,8 @@ caller's instruction cache, or to hold code size down on a constrained target.
 - Purely a hint to the inliner; it does not otherwise change codegen. It binds
   at every optimization level — the debug pipeline runs no inlining pass at
   all, so `noinline` is inert (and unnecessary) there — and it will bind
-  identically to any future cross-module or LTO inlining path, which is not a
-  separate mechanism exempt from it.
+  identically when a callee body is available from another module. Recursive
+  peeling also respects `noinline` and `scalar`.
 
 ### `align(expr)` — alignment override
 
@@ -478,9 +524,12 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
   `symbol` and `section` — the path is taken as written.
 - The path resolves relative to the **declaring source file's** directory. An
   absolute path is taken as written. The resolved file must lie inside the
-  project root: in 4.30.0 an embed that escapes it (`../../outside.txt` from
-  `src/`) is a **warning** naming the path, and 5.0.0 rejects it. Keep assets
-  under the project.
+  project root. Lexical escapes (`../../outside.txt` from `src/`) and symlinks
+  in the relative parent path or final file are rejected before content is read,
+  including symlinks whose targets remain inside the project. The compiler holds
+  the parent directory and reads only the regular file opened relative to it.
+  Keep assets under the project. A missing contained generated file remains a
+  missing-file diagnostic until its prerequisite supplies it.
 - A path holding `{artifact.<id>.out}` names the output of an artifact this one
   requires through the manifest's `need`, and resolves against the **project
   root** rather than the declaring file's directory; the required artifact is

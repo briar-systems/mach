@@ -46,9 +46,11 @@ A project has a `mach.toml` at its root; `[project] id` roots every module
 path. A file at `src/foo/bar.mach` in project `id = "myproj"` is the module
 `myproj.foo.bar`. There is no `this.` self-prefix - always use the full
 project-rooted path, including for sibling modules. A one-segment `use <id>;`
-resolves only when that project declares a `[project] module` surface file
-(e.g. a library `glfw` imported as `use glfw;`); `std` does not - always
-import full `std.*` paths.
+binds a dependency's public entry only when a `static` or `shared` artifact
+explicitly declares `default = true`. Multiple default libraries must share
+that entry. There is no `lib.mach` fallback. Full module paths work without
+an artifact declaration. The current project's own id binds the selected
+artifact's entry. Import std through its full `std.*` paths.
 
 An artifact build roots its module graph at `[artifact.*].entry` and compiles only
 that module plus its active transitive `use`/`fwd` dependencies. A sibling source
@@ -103,13 +105,27 @@ $or {
 fwd impl.page_size;
 ```
 
+## Manifest policy
+
+Every root and dependency manifest must declare at least one profile. Each profile
+requires `opt`, `debug`, `simd`, `vectorize`, and `float_reassoc`. There are no
+synthetic profiles or policy defaults. Preserve existing explicit values when
+migrating a project. `simd = "scalarize"` does not disable loop vectorization.
+
+A sole profile is the default. With multiple profiles, use an explicit `--profile`
+or mark exactly one `default = true`. Targets and artifacts likewise never select
+by table order. The consumer's selected target and profile apply to dependency
+source, although every dependency manifest must satisfy the same schema.
+Optional selectors and derived platform facts remain documented in
+[doc/manifest.md](../../../doc/manifest.md).
+
 ## Entrypoint and output
 
-An artifact's `out` is literal across every target it names. A cross-platform
-executable therefore uses disjoint artifacts for extension conventions:
-`out = "bin/app"` for non-Windows targets and `out = "bin/app.exe"` for Windows.
-`mach init` emits that split for binary projects. Do not use one `targets = ["*"]`
-artifact when its output must be directly executable on Windows and elsewhere.
+An artifact's `out` expands `{artifact.suffix}` using its selected target's naming
+rules. `out = "bin/app{artifact.suffix}"` gives `app.exe` on Windows and `app` on
+Linux/Darwin with one stable artifact identity. Literal output paths stay literal.
+`mach init` emits one artifact with this placeholder. `need` entries are qualified:
+`step.generate`, `artifact.support`, or globs such as `artifact.shader-*`.
 
 The stdlib provides the platform `_start`, which calls whatever function
 exports the linker symbol `main`. `use std.runtime;` is required to link it in
@@ -302,7 +318,10 @@ Ten 128-bit SIMD vector types are also seeded: `f32x4 f64x2`, `i8x16 i16x8
 i32x4 i64x2`, and `u8x16 u16x8 u32x4 u64x2` — a single `x`, no other shapes.
 Literals are full-arity (`f32x4{1.0, 2.0, 3.0, 4.0}`), lane access `v[i]` takes
 a comptime-constant index, and the operators apply lane-wise with a comparison
-producing a same-shape unsigned mask. See `doc/language/types.md`.
+producing a same-shape unsigned mask. Integer vector `/` follows scalar division
+per lane using the lane type's signedness. It scalarizes where packed integer
+division is unavailable, and secret dividends or divisors are rejected. Vector
+`%` and shifts remain unsupported. See `doc/language/types.md`.
 
 ```mach
 *T                  # pointer          ?x address-of, @p dereference
@@ -321,7 +340,7 @@ is walked). A `fun(...)` type may carry a trailing `...` for FFI only.
 and be stored but may never reach an observable position: a branch or loop
 condition, the left operand of `&&`/`||`, a memory index, or a `/`/`%`
 operand - each is a compile error. Public flows up to secret implicitly; the
-**only** downgrade is the explicit strip cast `x:>T` (the result type is required; `x:^` and `x:^T` are deprecated spellings accepted through 4.30.0). Any operation
+**only** downgrade is the explicit strip cast `x:>T` (the result type is required; `x:^` and `x:^T` are removed spellings and are rejected). Any operation
 with a secret operand yields a secret result; `uni` variants must agree on
 secrecy; a secret-welded pointer (`*^T`) cannot be erased to `ptr`. Also
 rejected: a secret float operand, a secret integer multiply or variable shift
@@ -464,14 +483,16 @@ $mach.version / .major / .minor / .patch    # live; compiler version
 $mach.compiler.name / .version              # live
 
 $mach.os.linux    .darwin   .windows  .freestanding
-$mach.arch.x86_64 .aarch64  .riscv64
-$mach.abi.sysv64  .win64    .aapcs64  .lp64
+$mach.arch.x86_64 .aarch64  .riscv64 .riscv32 .spirv
+$mach.abi.sysv64  .win64    .aapcs64  .lp64 .lp64f .lp64d
+$mach.abi.ilp32   .ilp32f   .ilp32d   .spirv
 $mach.mode.debug  .release
 ```
 
 `$mach.build.{timestamp,host,git.*}`, `$mach.project.*`, and `$mach.source.*`
 are reserved stubs - reading one is a compile error. The tag tables are closed;
-an unrecognized tag is a compile error, never a silent fold.
+an unrecognized tag is a compile error, never a silent fold. The withdrawn
+MOS 6502 target, ABI and architecture tag are removed.
 
 Tag comparison is path-value - plain `==`, no `.id` suffix, no unwrap:
 
@@ -507,7 +528,7 @@ manifest does not declare is reported unavailable, not folded to `""`.
 
 ### Decorators - `#[...]`
 
-Codegen directives on the line(s) above a declaration (after the docstring).
+Declaration metadata on the line(s) above a declaration (after the docstring).
 One clause each, stackable on one line or several; they attach only to the
 immediately following declaration. Closed set:
 
@@ -515,6 +536,7 @@ immediately following declaration. Closed set:
 |---|---|---|---|
 | `#[symbol("name")]` | fun, ext fun, val/var | string | linker name override |
 | `#[library("name")]` | ext import | string | dynamic import dependency pin |
+| `#[deprecated]` / `#[deprecated("message")]` | `fun`, `rec`, `uni`, `def`, `val`, `var`, `use`, `fwd` | zero or one literal string | warn once per external use, preserving re-export notice ownership |
 | `#[inline]` | fun | none | force inlining |
 | `#[align(expr)]` | val/var, rec/uni | comptime int | alignment override |
 | `#[section(".name")]` | fun, ext fun, val/var | string | object section placement |
@@ -548,7 +570,7 @@ known open disclosure path - do not write production crypto against it.
 `#[scalar]` excludes a function from loop auto-vectorization (which runs in the
 release pipeline on targets with 128-bit vectors) and also blocks inlining, so
 the opt-out survives. The project-wide lever is the `vectorize` profile key in
-`mach.toml`, optional and default-on.
+`mach.toml`, required in every declared profile.
 
 `#[naked]` emits the body exactly as written - no frame record, no stack
 allocation, no argument moves, and no return. The body may hold only inline

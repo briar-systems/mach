@@ -56,13 +56,15 @@ fun probe[T]() u64 {
 ```
 
 `$offset_of`'s **second** argument is the exception: a bare field name, resolved
-against the record's layout, never a type or a value.
+against the aggregate layout, never a type or a value. The accepted v5 tag
+contract also permits a payload case name.
 
-`$offset_of` adopts its binding's width like the other three, but its answer is
-decided later than the others': a field's offset is fixed at lowering, so it is
-the one measurement that cannot be read in a `$if` gate, and the check that its
-value fits the binding happens at lowering rather than during type checking. The
-diagnostic is the same either way.
+`$offset_of` adopts its binding's width like the other three. The accepted v5
+contract makes checked offsets available under the same complete-type rules as
+size and alignment. Unresolved or recursive layout is diagnosed. This supersedes
+the earlier lowering-only offset exception. That exception still describes the
+implementation at base commit `fc5c9e7e`, where offset queries cannot be used in
+`$if` gates and their result width is checked during lowering.
 
 ### `$length_of` — elements, not bytes
 
@@ -136,9 +138,9 @@ rec Over { x: u8; }
 rec Holder { buf: [$size_of(Pair)]u8; }   # an array length, inside a field type
 ```
 
-`$offset_of` is the exception among the four: it folds in a value position but not
-in a type one, because a field offset is settled during lowering rather than by the
-front end.
+At base commit `fc5c9e7e`, `$offset_of` folds in a value position but not a
+type position. The accepted v5 complete-type rule described above removes this
+implementation restriction.
 
 A `$if` / `$or` condition is not a type position, so what it can measure depends on
 when the gate is decided. A gate in a function body, and a gate in declaration scope
@@ -168,6 +170,7 @@ and folds in a `$if` / `$or` gate:
 ```mach
 $is_record(T)           # T is a record (or an instance of one)
 $is_union(T)            # T is a union  (or an instance of one)
+$is_tag(T)              # T is a tagged value (or an instance of one)
 $is_pointer(T)          # T is a reference: the raw `ptr` or a typed `*U`
 $is_secret(T)           # T is `^`-qualified at the outermost level
 ```
@@ -323,13 +326,13 @@ about storage.**
 
 | asks about | strips `^` |
 |---|---|
-| `$size_of` / `$length_of` / `$align_of` / `$offset_of` | yes — a secret occupies its base type's storage |
-| `$is_record` / `$is_union` / `$is_pointer` | no — `^T` is a secret, not a `T` |
-| `$is_secret` | no — and it is the one query *about* the `^` |
-| `$pointee_of` | no — `^*U` is a secret, and is refused rather than followed |
-| `$type_name` | no — the spelling is `^T` |
-| `$fields` | no — a secret record is refused, not walked |
-| type comparison (`f.type == u64`) | no — `^u64` is not `u64` |
+| `$size_of` / `$length_of` / `$align_of` / `$offset_of` / `$discriminant_of` | yes: a secret occupies its base type storage and exposes storage width |
+| `$is_record` / `$is_union` / `$is_tag` / `$is_pointer` | no: `^T` is a secret, not a `T` |
+| `$is_secret` | no: and it is the one query *about* the `^` |
+| `$pointee_of` | no: `^*U` is a secret, and is refused rather than followed |
+| `$type_name` | no: the spelling is `^T` |
+| `$fields` / `$cases` | no: a secret aggregate is refused, not walked |
+| type comparison (`f.type == u64`) | no: `^u64` is not `u64` |
 
 ## The type operand
 
@@ -507,13 +510,71 @@ fun cross(p: Pair, q: Pair) i64 {
 }
 ```
 
+## Tag reflection: `$cases` and `$discriminant_of`
+
+Accepted v5 contract. The intrinsics described here reflect the accepted Mach v5
+tagged value design in [the accepted contract](../design/tagged-values.md). At
+base commit `fc5c9e7e`, `$is_tag` is implemented, while `$cases`, descriptor
+projections, `$discriminant_of`, and runtime tag lowering remain unfinished.
+
+`$cases(T)` produces a comptime sequence of owner-qualified case descriptors for
+a tag type `T`, in declaration order:
+
+```mach
+$cases(T)               # comptime case descriptor sequence for tag T
+```
+
+`$cases(T)` is consumed by `$each case in $cases(T)`. Each case descriptor provides
+five readable properties:
+
+| Property           | Type     | Value                                                   |
+|--------------------|----------|---------------------------------------------------------|
+| `case.name`        | `*u8`    | case name as a NUL-terminated string                    |
+| `case.has_payload` | bool     | comptime predicate indicating whether a payload exists  |
+| `case.type`        | type val | comptime type value of the payload                      |
+| `case.offset`      | u64      | byte offset of the payload in `T`'s layout              |
+| `case.code`        | u64      | declaration ordinal case code                           |
+
+Accessing `case.type` or `case.offset` on a descriptor whose `has_payload` is false
+is a compile error. `case.type` preserves all declared payload qualifiers.
+`$is_tag(^T)` is false, and `$cases(^T)` is rejected.
+
+Inside the loop body, `T.[case]` denotes the case selector, and `v.[case]`
+projects the payload under proof checking:
+
+```mach
+$each case in $cases(T) {
+    if (value == T.[case]) {
+        $if (case.has_payload) {
+            consume[case.type](value.[case]);
+        }
+    }
+}
+```
+
+Tags reconstruct through the same single-case literal rule after specialization,
+using `T{[case]: payload}` for payload cases or `T{[case]}` for payloadless cases.
+A descriptor from another nominal type or another generic instantiation is
+rejected.
+
+`$discriminant_of(T)` produces the actual unsigned integer type used to store
+the discriminator (`u8`, `u16`, `u32`, or `u64`). It may inspect outer-secret
+types (`$discriminant_of(^T)`) because it reports storage metadata rather than
+the active case. Conversely, `$cases(^T)` is refused, matching current shape query
+conventions.
+
+`$offset_of(T, payload_case)` reuses the layout intrinsic to report the common
+payload offset. Like `$size_of` and `$align_of`, layout answers for tags come
+from the checked target layout.
+
 ## `$each` — compile-time unroll
 
 `$each` is a statement form that splices its body once per element of a
-comptime sequence. There are three sequence forms:
+comptime sequence. There are four sequence forms:
 
 ```mach
-$each f in $fields(T) { ... }    # one iteration per field of T
+$each f in $fields(T) { ... }    # one iteration per field of record T
+$each case in $cases(T) { ... }  # one iteration per case of tag T
 $each a in va { ... }            # one iteration per element of pack va
 $each x in ARR { ... }           # one iteration per element of a constant array val
 ```

@@ -28,6 +28,7 @@ use mach.lang.handle;
 use mach.lang.intern;
 use mach.lang.layout;
 use mach.lang.module;
+use mach.lang.source;
 
 pub def TypeId:     u32;
 pub val TYPE_NIL:   TypeId = 0xFFFFFFFF;
@@ -67,6 +68,8 @@ pub val VEC_COUNT: u32 = 10;
 pub val TYPE_HANDLE: TypeKind = 21;
 
 pub val TYPE_ABI: TypeKind = 22;
+
+pub val TYPE_TAG: TypeKind = 23;
 
 pub def PrimClass: u8;
 
@@ -340,27 +343,68 @@ pub rec TypeFun {
     params_start: u32;
     params_len:   u32;
     c_variadic:   bool;
+    next_in_bucket: TypeId;
+}
+
+# persistent source identity, independent of the current module registry
+pub rec TypeOwner {
+    module: module.StableModuleId;
+    file: source.FileId;
+}
+
+pub def CanonTagFamily: u8;
+
+pub val CANON_TAG_RES:   CanonTagFamily = 0;
+pub val CANON_TAG_OPT:   CanonTagFamily = 1;
+pub val CANON_TAG_ERR:   CanonTagFamily = 2;
+pub val CANON_TAG_COUNT: u32            = 3;
+
+pub fun canon_tag_arity(family: CanonTagFamily) u32 {
+    if (family == CANON_TAG_RES) { ret 2; }
+    ret 1;
+}
+
+pub fun canon_tag_name(family: CanonTagFamily) str {
+    if (family == CANON_TAG_RES) { ret "res"; }
+    if (family == CANON_TAG_OPT) { ret "opt"; }
+    if (family == CANON_TAG_ERR) { ret "err"; }
+    ret "";
+}
+
+pub fun canon_tag_family_from_name(name: str) O.Option[CanonTagFamily] {
+    if (str_equals(name, "res")) { ret O.some[CanonTagFamily](CANON_TAG_RES); }
+    if (str_equals(name, "opt")) { ret O.some[CanonTagFamily](CANON_TAG_OPT); }
+    if (str_equals(name, "err")) { ret O.some[CanonTagFamily](CANON_TAG_ERR); }
+    ret O.none[CanonTagFamily]();
+}
+
+pub fun canon_tag_owner() TypeOwner {
+    var o: TypeOwner;
+    o.module = module.STABLE_MODULE_NIL;
+    o.file   = source.FILE_NIL;
+    ret o;
 }
 
 pub rec TypeNominal {
-    name:   intern.StrId;
-    origin: module.ModuleId;
-    decl:   id.DeclId;
+    name: intern.StrId;
+    owner: TypeOwner;
+    incarnation: u64;
+    syntax: intern.StrId;
 }
 
 pub rec TypeGenericParam {
-    name:   intern.StrId;
-    origin: module.ModuleId;
-    owner:  id.DeclId;
-    index:  u32;
+    name: intern.StrId;
+    owner: TypeOwner;
+    owner_name: intern.StrId;
+    owner_kind: TypeKind;
+    index: u32;
 }
 
 pub rec TypeInstance {
-    nominal:       TypeId;
-    target_origin: module.ModuleId;
-    target_decl:   id.DeclId;
-    args_start:    u32;
-    args_len:      u32;
+    nominal: TypeId;
+    args_start: u32;
+    args_len: u32;
+    next_in_bucket: TypeId;
 }
 
 pub rec Type {
@@ -417,6 +461,8 @@ pub rec TypeInterner {
     prims: [PRIM_COUNT]TypeId;
 
     vecs: [VEC_COUNT]TypeId;
+
+    canon_tags: [CANON_TAG_COUNT]TypeId;
 
     field_tables: handle.StableChunks[FieldTable];
 
@@ -554,6 +600,12 @@ pub fun init(ti: *TypeInterner, a: *A.Allocator) O.Option[str] {
         }
         ti.vecs[vi] = R.unwrap_ok[TypeId, str](res_vec);
         vi = vi + 1;
+    }
+
+    var ci: u32 = 0;
+    for (ci < CANON_TAG_COUNT) {
+        ti.canon_tags[ci] = TYPE_NIL;
+        ci = ci + 1;
     }
 
     ret O.none[str]();
@@ -1129,11 +1181,13 @@ pub fun intern_handle(ti: *TypeInterner, name: intern.StrId, ctor: u32, ops: *u3
     t.data.handle.ops_len   = count;
 
     val res_append: R.Result[TypeId, str] = append_type(ti, t);
-    if (R.is_err[TypeId, str](res_append)) { ret res_append; }
+    if (R.is_err[TypeId, str](res_append)) { ti.handle_ops_len = t.data.handle.ops_start; ret res_append; }
     val tid: TypeId = R.unwrap_ok[TypeId, str](res_append);
 
     val res_track: R.Result[R.Void, str] = track_handle(ti, tid);
     if (R.is_err[R.Void, str](res_track)) {
+        ti.types.len = tid::usize;
+        ti.handle_ops_len = t.data.handle.ops_start;
         ret R.err[TypeId, str](R.unwrap_err[R.Void, str](res_track));
     }
     ret R.ok[TypeId, str](tid);
@@ -1239,33 +1293,63 @@ pub fun intern_pack(ti: *TypeInterner) R.Result[TypeId, str] {
     ret intern_dedup(ti, t);
 }
 
-pub fun intern_nominal(ti: *TypeInterner, name: intern.StrId, origin: module.ModuleId, decl: id.DeclId, kind: TypeKind) R.Result[TypeId, str] {
+pub fun intern_nominal(ti: *TypeInterner, name: intern.StrId, owner: TypeOwner, kind: TypeKind) R.Result[TypeId, str] {
     var t: Type;
-    t.kind                = kind;
-    t.data.nominal.name   = name;
-    t.data.nominal.origin = origin;
-    t.data.nominal.decl   = decl;
+    t.kind = kind;
+    t.data.nominal.name = name;
+    t.data.nominal.owner = owner;
+    t.data.nominal.incarnation = 0;
+    t.data.nominal.syntax = intern.STR_NIL;
     ret intern_dedup(ti, t);
 }
 
-pub fun intern_generic_param(ti: *TypeInterner, name: intern.StrId, origin: module.ModuleId, owner: id.DeclId, index: u32) R.Result[TypeId, str] {
+# an anonymous recipe belongs to one source incarnation
+pub fun intern_anonymous(ti: *TypeInterner, name: intern.StrId, owner: TypeOwner,
+    incarnation: u64, syntax: intern.StrId, kind: TypeKind) R.Result[TypeId, str] {
+    if (incarnation == 0 || syntax == intern.STR_NIL) {
+        ret R.err[TypeId, str]("anonymous type requires its parsed incarnation and structural recipe");
+    }
     var t: Type;
-    t.kind                      = TYPE_GENERIC_PARAM;
-    t.data.generic_param.name   = name;
-    t.data.generic_param.origin = origin;
-    t.data.generic_param.owner  = owner;
-    t.data.generic_param.index  = index;
+    t.kind = kind;
+    t.data.nominal.name = name;
+    t.data.nominal.owner = owner;
+    t.data.nominal.incarnation = incarnation;
+    t.data.nominal.syntax = syntax;
+    ret intern_dedup(ti, t);
+}
+
+pub fun intern_generic_param(ti: *TypeInterner, name: intern.StrId, owner: TypeOwner,
+    owner_name: intern.StrId, owner_kind: TypeKind, index: u32) R.Result[TypeId, str] {
+    var t: Type;
+    t.kind = TYPE_GENERIC_PARAM;
+    t.data.generic_param.name = name;
+    t.data.generic_param.owner = owner;
+    t.data.generic_param.owner_name = owner_name;
+    t.data.generic_param.owner_kind = owner_kind;
+    t.data.generic_param.index = index;
     ret intern_dedup(ti, t);
 }
 
 pub fun intern_function(ti: *TypeInterner, ret_type: TypeId, params: *TypeId, count: u32, c_variadic: bool) R.Result[TypeId, str] {
+    if (count != 0 && params == nil) { ret R.err[TypeId, str]("type parameter input is nil"); }
     val h: u64 = hash_fun(ret_type, params, count, c_variadic);
+    ret intern_function_bucket(ti, ret_type, params, count, c_variadic, h);
+}
 
+fun intern_function_bucket(ti: *TypeInterner, ret_type: TypeId, params: *TypeId, count: u32, c_variadic: bool, h: u64) R.Result[TypeId, str] {
+
+    var head: TypeId = TYPE_NIL;
     val res_get: R.Result[*TypeId, str] = map.get[u64, TypeId](?ti.fun_index, ?h);
     if (R.is_ok[*TypeId, str](res_get)) {
-        val existing: TypeId = @R.unwrap_ok[*TypeId, str](res_get);
-        if (fun_matches(ti, existing, ret_type, params, count, c_variadic)) {
-            ret R.ok[TypeId, str](existing);
+        head = @R.unwrap_ok[*TypeId, str](res_get);
+        var existing: TypeId = head;
+        for (existing != TYPE_NIL) {
+            val entry: R.Result[*Type, str] = handle.chunk_get[Type](?ti.types, existing::usize);
+            if (R.is_err[*Type, str](entry)) { ret R.err[TypeId, str](R.unwrap_err[*Type, str](entry)); }
+            val candidate: *Type = R.unwrap_ok[*Type, str](entry);
+            if (candidate.kind != TYPE_FUN) { ret R.err[TypeId, str]("type interner bucket has the wrong kind"); }
+            if (fun_matches(ti, existing, ret_type, params, count, c_variadic)) { ret R.ok[TypeId, str](existing); }
+            existing = candidate.data.fn.next_in_bucket;
         }
     }
 
@@ -1282,25 +1366,29 @@ pub fun intern_function(ti: *TypeInterner, ret_type: TypeId, params: *TypeId, co
     t.data.fn.params_len   = count;
     t.data.fn.c_variadic   = c_variadic;
 
+    t.data.fn.next_in_bucket = head;
+
     val res_append: R.Result[TypeId, str] = append_type(ti, t);
     if (R.is_err[TypeId, str](res_append)) {
+        ti.params_len = start;
         ret res_append;
     }
     val tid: TypeId = R.unwrap_ok[TypeId, str](res_append);
 
     val res_insert: R.Result[bool, str] = map.insert[u64, TypeId](?ti.fun_index, h, tid);
     if (R.is_err[bool, str](res_insert)) {
+        ti.types.len = tid::usize;
+        ti.params_len = start;
         ret R.err[TypeId, str](R.unwrap_err[bool, str](res_insert));
     }
 
     ret R.ok[TypeId, str](tid);
 }
 
-fun hash_instance(target_origin: module.ModuleId, target_decl: id.DeclId, args: *TypeId, count: u32) u64 {
+fun hash_instance(nominal: TypeId, args: *TypeId, count: u32) u64 {
     var h: u64 = fnv1a.FNV_INIT;
     h = fnv1a.step_u8(h, TYPE_INSTANCE::u8);
-    h = fnv1a.step_u32(h, target_origin::u32);
-    h = fnv1a.step_u32(h, target_decl::u32);
+    h = fnv1a.step_u32(h, nominal::u32);
     h = fnv1a.step_u32(h, count);
 
     var i: u32 = 0;
@@ -1311,13 +1399,12 @@ fun hash_instance(target_origin: module.ModuleId, target_decl: id.DeclId, args: 
     ret h;
 }
 
-fun instance_matches(ti: *TypeInterner, tid: TypeId, target_origin: module.ModuleId, target_decl: id.DeclId, args: *TypeId, count: u32) bool {
+fun instance_matches(ti: *TypeInterner, tid: TypeId, nominal: TypeId, args: *TypeId, count: u32) bool {
     val r: R.Result[*Type, str] = handle.chunk_get[Type](?ti.types, tid::usize);
     if (R.is_err[*Type, str](r)) { ret false; }
     val cand: *Type = R.unwrap_ok[*Type, str](r);
     if (cand.kind != TYPE_INSTANCE)                        { ret false; }
-    if (cand.data.instance.target_origin != target_origin) { ret false; }
-    if (cand.data.instance.target_decl != target_decl)     { ret false; }
+    if (cand.data.instance.nominal != nominal) { ret false; }
     if (cand.data.instance.args_len != count)               { ret false; }
 
     var i: u32 = 0;
@@ -1328,14 +1415,26 @@ fun instance_matches(ti: *TypeInterner, tid: TypeId, target_origin: module.Modul
     ret true;
 }
 
-pub fun intern_instance(ti: *TypeInterner, nominal: TypeId, target_origin: module.ModuleId, target_decl: id.DeclId, args: *TypeId, count: u32) R.Result[TypeId, str] {
-    val h: u64 = hash_instance(target_origin, target_decl, args, count);
+pub fun intern_instance(ti: *TypeInterner, nominal: TypeId, args: *TypeId, count: u32) R.Result[TypeId, str] {
+    if (count != 0 && args == nil) { ret R.err[TypeId, str]("type parameter input is nil"); }
+    val h: u64 = hash_instance(nominal, args, count);
+    ret intern_instance_bucket(ti, nominal, args, count, h);
+}
 
+fun intern_instance_bucket(ti: *TypeInterner, nominal: TypeId, args: *TypeId, count: u32, h: u64) R.Result[TypeId, str] {
+
+    var head: TypeId = TYPE_NIL;
     val res_get: R.Result[*TypeId, str] = map.get[u64, TypeId](?ti.instance_index, ?h);
     if (R.is_ok[*TypeId, str](res_get)) {
-        val existing: TypeId = @R.unwrap_ok[*TypeId, str](res_get);
-        if (instance_matches(ti, existing, target_origin, target_decl, args, count)) {
-            ret R.ok[TypeId, str](existing);
+        head = @R.unwrap_ok[*TypeId, str](res_get);
+        var existing: TypeId = head;
+        for (existing != TYPE_NIL) {
+            val entry: R.Result[*Type, str] = handle.chunk_get[Type](?ti.types, existing::usize);
+            if (R.is_err[*Type, str](entry)) { ret R.err[TypeId, str](R.unwrap_err[*Type, str](entry)); }
+            val candidate: *Type = R.unwrap_ok[*Type, str](entry);
+            if (candidate.kind != TYPE_INSTANCE) { ret R.err[TypeId, str]("type interner bucket has the wrong kind"); }
+            if (instance_matches(ti, existing, nominal, args, count)) { ret R.ok[TypeId, str](existing); }
+            existing = candidate.data.instance.next_in_bucket;
         }
     }
 
@@ -1348,19 +1447,22 @@ pub fun intern_instance(ti: *TypeInterner, nominal: TypeId, target_origin: modul
     var t: Type;
     t.kind                        = TYPE_INSTANCE;
     t.data.instance.nominal       = nominal;
-    t.data.instance.target_origin = target_origin;
-    t.data.instance.target_decl   = target_decl;
     t.data.instance.args_start    = start;
     t.data.instance.args_len      = count;
 
+    t.data.instance.next_in_bucket = head;
+
     val res_append: R.Result[TypeId, str] = append_type(ti, t);
     if (R.is_err[TypeId, str](res_append)) {
+        ti.params_len = start;
         ret res_append;
     }
     val tid: TypeId = R.unwrap_ok[TypeId, str](res_append);
 
     val res_insert: R.Result[bool, str] = map.insert[u64, TypeId](?ti.instance_index, h, tid);
     if (R.is_err[bool, str](res_insert)) {
+        ti.types.len = tid::usize;
+        ti.params_len = start;
         ret R.err[TypeId, str](R.unwrap_err[bool, str](res_insert));
     }
 
@@ -1389,6 +1491,17 @@ pub fun type_equals_signatures(ti: *TypeInterner, a: TypeId, b: TypeId) bool {
         i = i + 1;
     }
     ret true;
+}
+
+pub fun field_projection_reset(ti: *TypeInterner) {
+    handle.chunk_dnit[FieldTable](?ti.field_tables);
+    handle.chunk_dnit[FieldEntry](?ti.field_pool);
+    ti.field_tables = handle.chunk_init[FieldTable](ti.a);
+    ti.field_pool = handle.chunk_init[FieldEntry](ti.a);
+    map.clear[TypeId, u32](?ti.field_index);
+    ti.field_epoch = 0;
+    ti.gparam_epoch = 0;
+    if (ti.gparam != nil && ti.gparam_cap != 0) { memory.zero[u8](ti.gparam, ti.gparam_cap::usize); }
 }
 
 pub fun field_epoch_bump(ti: *TypeInterner) {
@@ -1481,9 +1594,35 @@ pub fun aggregate_nominal(ti: *TypeInterner, tid: TypeId) TypeId {
     val opt_t: O.Option[*Type] = get(ti, tid);
     if (O.is_none[*Type](opt_t)) { ret TYPE_ERROR; }
     val t: *Type = O.unwrap[*Type](opt_t);
-    if (t.kind == TYPE_REC || t.kind == TYPE_UNI) { ret tid; }
+    if (t.kind == TYPE_REC || t.kind == TYPE_UNI || t.kind == TYPE_TAG) { ret tid; }
     if (t.kind != TYPE_INSTANCE) { ret TYPE_ERROR; }
     ret t.data.instance.nominal;
+}
+
+pub fun is_tag(ti: *TypeInterner, tid: TypeId) bool {
+    ret nominal_kind_is(ti, tid, TYPE_TAG);
+}
+
+pub fun canonical_tag_id(ti: *TypeInterner, family: CanonTagFamily) TypeId {
+    if (family::u32 >= CANON_TAG_COUNT) { ret TYPE_NIL; }
+    ret ti.canon_tags[family];
+}
+
+pub fun canonical_tag_family(ti: *TypeInterner, tid: TypeId) O.Option[CanonTagFamily] {
+    val nom: TypeId = aggregate_nominal(ti, tid);
+    if (nom == TYPE_ERROR || nom == TYPE_NIL) { ret O.none[CanonTagFamily](); }
+    var i: u32 = 0;
+    for (i < CANON_TAG_COUNT) {
+        if (ti.canon_tags[i] != TYPE_NIL && ti.canon_tags[i] == nom) {
+            ret O.some[CanonTagFamily](i::CanonTagFamily);
+        }
+        i = i + 1;
+    }
+    ret O.none[CanonTagFamily]();
+}
+
+pub fun is_canonical_tag(ti: *TypeInterner, tid: TypeId) bool {
+    ret O.is_some[CanonTagFamily](canonical_tag_family(ti, tid));
 }
 
 pub fun is_union(ti: *TypeInterner, tid: TypeId) bool {
@@ -1541,6 +1680,132 @@ pub fun field_entry_at(ti: *TypeInterner, ft: *FieldTable, ix: u32) *FieldEntry 
     ret R.unwrap_ok[*FieldEntry, str](entry_r);
 }
 
+pub fun ensure_canon_tag(ti: *TypeInterner, family: CanonTagFamily, interner: *intern.Interner) R.Result[TypeId, str] {
+    if (family::u32 >= CANON_TAG_COUNT) {
+        ret R.err[TypeId, str]("invalid canonical tag family");
+    }
+    val fam_name: str = canon_tag_name(family);
+    val r_name: R.Result[intern.StrId, str] = intern.intern(interner, fam_name);
+    if (R.is_err[intern.StrId, str](r_name)) { ret r_name; }
+    val name: intern.StrId = R.unwrap_ok[intern.StrId, str](r_name);
+
+    var nom: TypeId = ti.canon_tags[family];
+    if (nom == TYPE_NIL) {
+        val r_nom: R.Result[TypeId, str] = intern_nominal(ti, name, canon_tag_owner(), TYPE_TAG);
+        if (R.is_err[TypeId, str](r_nom)) { ret r_nom; }
+        nom = R.unwrap_ok[TypeId, str](r_nom);
+        ti.canon_tags[family] = nom;
+    }
+
+    val opt_table: O.Option[*FieldTable] = field_table_for(ti, nom);
+    if (O.is_some[*FieldTable](opt_table)) {
+        ret R.ok[TypeId, str](nom);
+    }
+
+    if (family == CANON_TAG_RES) {
+        val r_t: R.Result[intern.StrId, str] = intern.intern(interner, "T");
+        if (R.is_err[intern.StrId, str](r_t)) { ret R.err[TypeId, str](R.unwrap_err[intern.StrId, str](r_t)); }
+        val r_e: R.Result[intern.StrId, str] = intern.intern(interner, "E");
+        if (R.is_err[intern.StrId, str](r_e)) { ret R.err[TypeId, str](R.unwrap_err[intern.StrId, str](r_e)); }
+        val t_id: intern.StrId = R.unwrap_ok[intern.StrId, str](r_t);
+        val e_id: intern.StrId = R.unwrap_ok[intern.StrId, str](r_e);
+
+        val r_tp: R.Result[TypeId, str] = intern_generic_param(ti, t_id, canon_tag_owner(), name, TYPE_TAG, 0);
+        if (R.is_err[TypeId, str](r_tp)) { ret r_tp; }
+        val r_ep: R.Result[TypeId, str] = intern_generic_param(ti, e_id, canon_tag_owner(), name, TYPE_TAG, 1);
+        if (R.is_err[TypeId, str](r_ep)) { ret r_ep; }
+        val t_param: TypeId = R.unwrap_ok[TypeId, str](r_tp);
+        val e_param: TypeId = R.unwrap_ok[TypeId, str](r_ep);
+
+        val r_err: R.Result[intern.StrId, str] = intern.intern(interner, "err");
+        if (R.is_err[intern.StrId, str](r_err)) { ret R.err[TypeId, str](R.unwrap_err[intern.StrId, str](r_err)); }
+        val r_ok: R.Result[intern.StrId, str] = intern.intern(interner, "ok");
+        if (R.is_err[intern.StrId, str](r_ok)) { ret R.err[TypeId, str](R.unwrap_err[intern.StrId, str](r_ok)); }
+        val err_name: intern.StrId = R.unwrap_ok[intern.StrId, str](r_err);
+        val ok_name: intern.StrId = R.unwrap_ok[intern.StrId, str](r_ok);
+
+        val start_r: R.Result[u32, str] = field_table_stage(ti, 2);
+        if (R.is_err[u32, str](start_r)) { ret R.err[TypeId, str](R.unwrap_err[u32, str](start_r)); }
+        val start: u32 = R.unwrap_ok[u32, str](start_r);
+
+        val p0: R.Result[R.Void, str] = field_table_stage_push(ti, err_name, e_param);
+        if (R.is_err[R.Void, str](p0)) { ret R.err[TypeId, str](R.unwrap_err[R.Void, str](p0)); }
+        val p1: R.Result[R.Void, str] = field_table_stage_push(ti, ok_name, t_param);
+        if (R.is_err[R.Void, str](p1)) { ret R.err[TypeId, str](R.unwrap_err[R.Void, str](p1)); }
+
+        val pub_r: R.Result[R.Void, str] = field_table_publish(ti, nom, start, 2);
+        if (R.is_err[R.Void, str](pub_r)) { ret R.err[TypeId, str](R.unwrap_err[R.Void, str](pub_r)); }
+    }
+    or (family == CANON_TAG_OPT) {
+        val r_t: R.Result[intern.StrId, str] = intern.intern(interner, "T");
+        if (R.is_err[intern.StrId, str](r_t)) { ret R.err[TypeId, str](R.unwrap_err[intern.StrId, str](r_t)); }
+        val t_id: intern.StrId = R.unwrap_ok[intern.StrId, str](r_t);
+
+        val r_tp: R.Result[TypeId, str] = intern_generic_param(ti, t_id, canon_tag_owner(), name, TYPE_TAG, 0);
+        if (R.is_err[TypeId, str](r_tp)) { ret r_tp; }
+        val t_param: TypeId = R.unwrap_ok[TypeId, str](r_tp);
+
+        val r_none: R.Result[intern.StrId, str] = intern.intern(interner, "none");
+        if (R.is_err[intern.StrId, str](r_none)) { ret R.err[TypeId, str](R.unwrap_err[intern.StrId, str](r_none)); }
+        val r_some: R.Result[intern.StrId, str] = intern.intern(interner, "some");
+        if (R.is_err[intern.StrId, str](r_some)) { ret R.err[TypeId, str](R.unwrap_err[intern.StrId, str](r_some)); }
+        val none_name: intern.StrId = R.unwrap_ok[intern.StrId, str](r_none);
+        val some_name: intern.StrId = R.unwrap_ok[intern.StrId, str](r_some);
+
+        val start_r: R.Result[u32, str] = field_table_stage(ti, 2);
+        if (R.is_err[u32, str](start_r)) { ret R.err[TypeId, str](R.unwrap_err[u32, str](start_r)); }
+        val start: u32 = R.unwrap_ok[u32, str](start_r);
+
+        val p0: R.Result[R.Void, str] = field_table_stage_push(ti, none_name, TYPE_NIL);
+        if (R.is_err[R.Void, str](p0)) { ret R.err[TypeId, str](R.unwrap_err[R.Void, str](p0)); }
+        val p1: R.Result[R.Void, str] = field_table_stage_push(ti, some_name, t_param);
+        if (R.is_err[R.Void, str](p1)) { ret R.err[TypeId, str](R.unwrap_err[R.Void, str](p1)); }
+
+        val pub_r: R.Result[R.Void, str] = field_table_publish(ti, nom, start, 2);
+        if (R.is_err[R.Void, str](pub_r)) { ret R.err[TypeId, str](R.unwrap_err[R.Void, str](pub_r)); }
+    }
+    or (family == CANON_TAG_ERR) {
+        val r_e: R.Result[intern.StrId, str] = intern.intern(interner, "E");
+        if (R.is_err[intern.StrId, str](r_e)) { ret R.err[TypeId, str](R.unwrap_err[intern.StrId, str](r_e)); }
+        val e_id: intern.StrId = R.unwrap_ok[intern.StrId, str](r_e);
+
+        val r_ep: R.Result[TypeId, str] = intern_generic_param(ti, e_id, canon_tag_owner(), name, TYPE_TAG, 0);
+        if (R.is_err[TypeId, str](r_ep)) { ret r_ep; }
+        val e_param: TypeId = R.unwrap_ok[TypeId, str](r_ep);
+
+        val r_err: R.Result[intern.StrId, str] = intern.intern(interner, "err");
+        if (R.is_err[intern.StrId, str](r_err)) { ret R.err[TypeId, str](R.unwrap_err[intern.StrId, str](r_err)); }
+        val r_ok: R.Result[intern.StrId, str] = intern.intern(interner, "ok");
+        if (R.is_err[intern.StrId, str](r_ok)) { ret R.err[TypeId, str](R.unwrap_err[intern.StrId, str](r_ok)); }
+        val err_name: intern.StrId = R.unwrap_ok[intern.StrId, str](r_err);
+        val ok_name: intern.StrId = R.unwrap_ok[intern.StrId, str](r_ok);
+
+        val start_r: R.Result[u32, str] = field_table_stage(ti, 2);
+        if (R.is_err[u32, str](start_r)) { ret R.err[TypeId, str](R.unwrap_err[u32, str](start_r)); }
+        val start: u32 = R.unwrap_ok[u32, str](start_r);
+
+        val p0: R.Result[R.Void, str] = field_table_stage_push(ti, err_name, e_param);
+        if (R.is_err[R.Void, str](p0)) { ret R.err[TypeId, str](R.unwrap_err[R.Void, str](p0)); }
+        val p1: R.Result[R.Void, str] = field_table_stage_push(ti, ok_name, TYPE_NIL);
+        if (R.is_err[R.Void, str](p1)) { ret R.err[TypeId, str](R.unwrap_err[R.Void, str](p1)); }
+
+        val pub_r: R.Result[R.Void, str] = field_table_publish(ti, nom, start, 2);
+        if (R.is_err[R.Void, str](pub_r)) { ret R.err[TypeId, str](R.unwrap_err[R.Void, str](pub_r)); }
+    }
+
+    ret R.ok[TypeId, str](nom);
+}
+
+pub fun ensure_all_canonical_tags(ti: *TypeInterner, interner: *intern.Interner) R.Result[R.Void, str] {
+    var i: u32 = 0;
+    for (i < CANON_TAG_COUNT) {
+        val r: R.Result[TypeId, str] = ensure_canon_tag(ti, i::CanonTagFamily, interner);
+        if (R.is_err[TypeId, str](r)) { ret R.err[R.Void, str](R.unwrap_err[TypeId, str](r)); }
+        i = i + 1;
+    }
+    ret R.ok_void[str]();
+}
+
 fun intern_dedup(ti: *TypeInterner, t: Type) R.Result[TypeId, str] {
     val res_get: R.Result[*TypeId, str] = map.get[Type, TypeId](?ti.dedup, ?t);
     if (R.is_ok[*TypeId, str](res_get)) {
@@ -1555,6 +1820,7 @@ fun intern_dedup(ti: *TypeInterner, t: Type) R.Result[TypeId, str] {
 
     val res_insert: R.Result[bool, str] = map.insert[Type, TypeId](?ti.dedup, t, tid);
     if (R.is_err[bool, str](res_insert)) {
+        ti.types.len = tid::usize;
         ret R.err[TypeId, str](R.unwrap_err[bool, str](res_insert));
     }
 
@@ -1562,7 +1828,9 @@ fun intern_dedup(ti: *TypeInterner, t: Type) R.Result[TypeId, str] {
 }
 
 fun append_type(ti: *TypeInterner, t: Type) R.Result[TypeId, str] {
-    val tid: TypeId = handle.chunk_count[Type](?ti.types)::u32;
+    val count: usize = handle.chunk_count[Type](?ti.types);
+    if (count >= TYPE_ERROR::usize) { ret R.err[TypeId, str]("type identities are exhausted"); }
+    val tid: TypeId = count::TypeId;
 
     val ce_r: R.Result[handle.ChunkEditor[Type], str] = handle.chunk_edit[Type](?ti.types);
     if (R.is_err[handle.ChunkEditor[Type], str](ce_r)) {
@@ -1617,15 +1885,30 @@ fun reserve_params(ti: *TypeInterner, need: u32) R.Result[R.Void, str] {
 
 fun params_append(ti: *TypeInterner, src: *TypeId, len: u32) R.Result[u32, str] {
     val start: u32 = ti.params_len;
+    if (len != 0 && src == nil) { ret R.err[u32, str]("type parameter input is nil"); }
+    var borrowed: bool = false;
+    var offset: usize = 0;
+    if (len != 0 && ti.params != nil && src::usize >= ti.params::usize) {
+        val delta: usize = src::usize - ti.params::usize;
+        if (delta / $size_of(TypeId) < ti.params_cap::usize) {
+            offset = delta / $size_of(TypeId);
+            if (delta % $size_of(TypeId) != 0 || offset > start::usize || len::usize > start::usize - offset) {
+                ret R.err[u32, str]("type parameter input exceeds its owned run");
+            }
+            borrowed = true;
+        }
+    }
 
     val res_reserve: R.Result[R.Void, str] = reserve_params(ti, len);
     if (R.is_err[R.Void, str](res_reserve)) {
         ret R.err[u32, str](R.unwrap_err[R.Void, str](res_reserve));
     }
 
+    var input: *TypeId = src;
+    if (borrowed) { input = ?ti.params[offset]; }
     var i: u32 = 0;
     for (i < len) {
-        ti.params[start + i] = src[i];
+        ti.params[start + i] = input[i];
         i = i + 1;
     }
     ti.params_len = start + len;
@@ -1685,13 +1968,20 @@ fun hash_type(p: ptr) u64 {
         h = fnv1a.step_u8(h, t.data.vector.element::u8);
         h = fnv1a.step_u32(h, t.data.vector.lanes);
     }
-    or (t.kind == TYPE_REC || t.kind == TYPE_UNI) {
-        h = fnv1a.step_u32(h, t.data.nominal.origin::u32);
-        h = fnv1a.step_u32(h, t.data.nominal.decl::u32);
+    or (t.kind == TYPE_REC || t.kind == TYPE_UNI || t.kind == TYPE_TAG) {
+        h = fnv1a.step_u32(h, t.data.nominal.owner.module::u32);
+        h = fnv1a.step_u32(h, t.data.nominal.owner.file::u32);
+        h = fnv1a.step_u32(h, t.data.nominal.name::u32);
+        h = fnv1a.step_u32(h, t.data.nominal.incarnation::u32);
+        h = fnv1a.step_u32(h, (t.data.nominal.incarnation >> 32)::u32);
+        h = fnv1a.step_u32(h, t.data.nominal.syntax::u32);
     }
     or (t.kind == TYPE_GENERIC_PARAM) {
-        h = fnv1a.step_u32(h, t.data.generic_param.origin::u32);
-        h = fnv1a.step_u32(h, t.data.generic_param.owner::u32);
+        h = fnv1a.step_u32(h, t.data.generic_param.owner.module::u32);
+        h = fnv1a.step_u32(h, t.data.generic_param.owner.file::u32);
+        h = fnv1a.step_u32(h, t.data.generic_param.owner_name::u32);
+        h = fnv1a.step_u8(h, t.data.generic_param.owner_kind);
+        h = fnv1a.step_u32(h, t.data.generic_param.name::u32);
         h = fnv1a.step_u32(h, t.data.generic_param.index);
     }
     or (t.kind == TYPE_ABI) {
@@ -1721,13 +2011,19 @@ fun eq_type(pa: ptr, pb: ptr) bool {
         ret a.data.vector.element == b.data.vector.element
             && a.data.vector.lanes == b.data.vector.lanes;
     }
-    if (a.kind == TYPE_REC || a.kind == TYPE_UNI) {
-        ret a.data.nominal.origin == b.data.nominal.origin
-            && a.data.nominal.decl == b.data.nominal.decl;
+    if (a.kind == TYPE_REC || a.kind == TYPE_UNI || a.kind == TYPE_TAG) {
+        ret a.data.nominal.owner.module == b.data.nominal.owner.module
+            && a.data.nominal.owner.file == b.data.nominal.owner.file
+            && a.data.nominal.name == b.data.nominal.name
+            && a.data.nominal.incarnation == b.data.nominal.incarnation
+            && a.data.nominal.syntax == b.data.nominal.syntax;
     }
     if (a.kind == TYPE_GENERIC_PARAM) {
-        ret a.data.generic_param.origin == b.data.generic_param.origin
-            && a.data.generic_param.owner == b.data.generic_param.owner
+        ret a.data.generic_param.owner.module == b.data.generic_param.owner.module
+            && a.data.generic_param.owner.file == b.data.generic_param.owner.file
+            && a.data.generic_param.owner_name == b.data.generic_param.owner_name
+            && a.data.generic_param.owner_kind == b.data.generic_param.owner_kind
+            && a.data.generic_param.name == b.data.generic_param.name
             && a.data.generic_param.index == b.data.generic_param.index;
     }
     if (a.kind == TYPE_ABI) {
@@ -1775,27 +2071,27 @@ test "mach.lang.type.intern_function:identical_signatures" {
     ret 0;
 }
 
-test "mach.lang.type.intern_generic_param:dedup_by_origin_owner_index" {
+test "mach.lang.type.intern_generic_param:dedup_by_persistent_owner_name_and_index" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var ti: TypeInterner;
     if (O.is_some[str](init(?ti, ?alloc))) { ret 1; }
 
-    val r1: R.Result[TypeId, str] = intern_generic_param(?ti, intern.STR_NIL, 1::module.ModuleId, 0::id.DeclId, 0);
-    val r2: R.Result[TypeId, str] = intern_generic_param(?ti, intern.STR_NIL, 1::module.ModuleId, 0::id.DeclId, 0);
+    val r1: R.Result[TypeId, str] = intern_generic_param(?ti, 7::intern.StrId, TypeOwner{ module: 1::module.StableModuleId, file: 1::source.FileId }, 0::intern.StrId, TYPE_FUN, 0);
+    val r2: R.Result[TypeId, str] = intern_generic_param(?ti, 7::intern.StrId, TypeOwner{ module: 1::module.StableModuleId, file: 1::source.FileId }, 0::intern.StrId, TYPE_FUN, 0);
     if (R.is_err[TypeId, str](r1))                                    { dnit(?ti); ret 1; }
     if (R.is_err[TypeId, str](r2))                                    { dnit(?ti); ret 1; }
     if (R.unwrap_ok[TypeId, str](r1) != R.unwrap_ok[TypeId, str](r2)) { dnit(?ti); ret 1; }
 
-    val r_other_module: R.Result[TypeId, str] = intern_generic_param(?ti, intern.STR_NIL, 2::module.ModuleId, 0::id.DeclId, 0);
+    val r_other_module: R.Result[TypeId, str] = intern_generic_param(?ti, 7::intern.StrId, TypeOwner{ module: 2::module.StableModuleId, file: 1::source.FileId }, 0::intern.StrId, TYPE_FUN, 0);
     if (R.is_err[TypeId, str](r_other_module)) { dnit(?ti); ret 1; }
     if (R.unwrap_ok[TypeId, str](r1) == R.unwrap_ok[TypeId, str](r_other_module)) { dnit(?ti); ret 1; }
 
-    val r_other_owner: R.Result[TypeId, str] = intern_generic_param(?ti, intern.STR_NIL, 1::module.ModuleId, 1::id.DeclId, 0);
+    val r_other_owner: R.Result[TypeId, str] = intern_generic_param(?ti, 7::intern.StrId, TypeOwner{ module: 1::module.StableModuleId, file: 1::source.FileId }, 1::intern.StrId, TYPE_FUN, 0);
     if (R.is_err[TypeId, str](r_other_owner)) { dnit(?ti); ret 1; }
     if (R.unwrap_ok[TypeId, str](r1) == R.unwrap_ok[TypeId, str](r_other_owner)) { dnit(?ti); ret 1; }
 
-    val r_other_index: R.Result[TypeId, str] = intern_generic_param(?ti, intern.STR_NIL, 1::module.ModuleId, 0::id.DeclId, 1);
+    val r_other_index: R.Result[TypeId, str] = intern_generic_param(?ti, 7::intern.StrId, TypeOwner{ module: 1::module.StableModuleId, file: 1::source.FileId }, 0::intern.StrId, TYPE_FUN, 1);
     if (R.is_err[TypeId, str](r_other_index)) { dnit(?ti); ret 1; }
     if (R.unwrap_ok[TypeId, str](r1) == R.unwrap_ok[TypeId, str](r_other_index)) { dnit(?ti); ret 1; }
 
@@ -1803,7 +2099,7 @@ test "mach.lang.type.intern_generic_param:dedup_by_origin_owner_index" {
     ret 0;
 }
 
-test "mach.lang.type.intern_instance:dedup_by_origin_decl_args" {
+test "mach.lang.type.intern_instance:dedup_by_nominal_and_arguments" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var ti: TypeInterner;
@@ -1812,29 +2108,29 @@ test "mach.lang.type.intern_instance:dedup_by_origin_decl_args" {
     val u32_id: TypeId = O.unwrap[TypeId](prim(?ti, TYPE_U32));
     val u8_id:  TypeId = O.unwrap[TypeId](prim(?ti, TYPE_U8));
 
-    val rn: R.Result[TypeId, str] = intern_nominal(?ti, intern.STR_NIL, 1::module.ModuleId, 0::id.DeclId, TYPE_REC);
+    val rn: R.Result[TypeId, str] = intern_nominal(?ti, 0::intern.StrId, TypeOwner{ module: 1::module.StableModuleId, file: 1::source.FileId }, TYPE_REC);
     if (R.is_err[TypeId, str](rn)) { dnit(?ti); ret 1; }
     val nom: TypeId = R.unwrap_ok[TypeId, str](rn);
 
     var a1: [1]TypeId;
     a1[0] = u32_id;
 
-    val r1: R.Result[TypeId, str] = intern_instance(?ti, nom, 1::module.ModuleId, 0::id.DeclId, ?a1[0], 1);
-    val r2: R.Result[TypeId, str] = intern_instance(?ti, nom, 1::module.ModuleId, 0::id.DeclId, ?a1[0], 1);
+    val r1: R.Result[TypeId, str] = intern_instance(?ti, nom, ?a1[0], 1);
+    val r2: R.Result[TypeId, str] = intern_instance(?ti, nom, ?a1[0], 1);
     if (R.is_err[TypeId, str](r1))                                    { dnit(?ti); ret 1; }
     if (R.is_err[TypeId, str](r2))                                    { dnit(?ti); ret 1; }
     if (R.unwrap_ok[TypeId, str](r1) != R.unwrap_ok[TypeId, str](r2)) { dnit(?ti); ret 1; }
 
     var a1u8: [1]TypeId;
     a1u8[0] = u8_id;
-    val r3: R.Result[TypeId, str] = intern_instance(?ti, nom, 1::module.ModuleId, 0::id.DeclId, ?a1u8[0], 1);
+    val r3: R.Result[TypeId, str] = intern_instance(?ti, nom, ?a1u8[0], 1);
     if (R.is_err[TypeId, str](r3))                                    { dnit(?ti); ret 1; }
     if (R.unwrap_ok[TypeId, str](r1) == R.unwrap_ok[TypeId, str](r3)) { dnit(?ti); ret 1; }
 
     var a2: [2]TypeId;
     a2[0] = u32_id;
     a2[1] = u8_id;
-    val r4: R.Result[TypeId, str] = intern_instance(?ti, nom, 1::module.ModuleId, 0::id.DeclId, ?a2[0], 2);
+    val r4: R.Result[TypeId, str] = intern_instance(?ti, nom, ?a2[0], 2);
     if (R.is_err[TypeId, str](r4))                                    { dnit(?ti); ret 1; }
     if (R.unwrap_ok[TypeId, str](r1) == R.unwrap_ok[TypeId, str](r4)) { dnit(?ti); ret 1; }
 
@@ -1852,15 +2148,15 @@ test "mach.lang.type.is_union:instance_follows_its_nominal" {
     var args: [1]TypeId;
     args[0] = u32_id;
 
-    val rr: R.Result[TypeId, str] = intern_nominal(?ti, intern.STR_NIL, 1::module.ModuleId, 0::id.DeclId, TYPE_REC);
-    val ru: R.Result[TypeId, str] = intern_nominal(?ti, intern.STR_NIL, 1::module.ModuleId, 1::id.DeclId, TYPE_UNI);
+    val rr: R.Result[TypeId, str] = intern_nominal(?ti, 0::intern.StrId, TypeOwner{ module: 1::module.StableModuleId, file: 1::source.FileId }, TYPE_REC);
+    val ru: R.Result[TypeId, str] = intern_nominal(?ti, 1::intern.StrId, TypeOwner{ module: 1::module.StableModuleId, file: 1::source.FileId }, TYPE_UNI);
     if (R.is_err[TypeId, str](rr)) { dnit(?ti); ret 1; }
     if (R.is_err[TypeId, str](ru)) { dnit(?ti); ret 1; }
     val rec_nom: TypeId = R.unwrap_ok[TypeId, str](rr);
     val uni_nom: TypeId = R.unwrap_ok[TypeId, str](ru);
 
-    val ri: R.Result[TypeId, str] = intern_instance(?ti, rec_nom, 1::module.ModuleId, 0::id.DeclId, ?args[0], 1);
-    val ui: R.Result[TypeId, str] = intern_instance(?ti, uni_nom, 1::module.ModuleId, 1::id.DeclId, ?args[0], 1);
+    val ri: R.Result[TypeId, str] = intern_instance(?ti, rec_nom, ?args[0], 1);
+    val ui: R.Result[TypeId, str] = intern_instance(?ti, uni_nom, ?args[0], 1);
     if (R.is_err[TypeId, str](ri)) { dnit(?ti); ret 1; }
     if (R.is_err[TypeId, str](ui)) { dnit(?ti); ret 1; }
     val rec_inst: TypeId = R.unwrap_ok[TypeId, str](ri);
@@ -2565,7 +2861,7 @@ fun intern_distinct_instances(ti: *TypeInterner, first: u32, count: u32) R.Resul
     var i: u32 = first;
     for (i < first + count) {
         var arg: TypeId = i::TypeId;
-        val r: R.Result[TypeId, str] = intern_instance(ti, 0::TypeId, 0::module.ModuleId, i::id.DeclId, ?arg, 1);
+        val r: R.Result[TypeId, str] = intern_instance(ti, 0::TypeId, ?arg, 1);
         if (R.is_err[TypeId, str](r)) { ret R.err[R.Void, str](R.unwrap_err[TypeId, str](r)); }
         i = i + 1;
     }
@@ -2678,4 +2974,162 @@ test "mach.lang.type.scans:allocation_failures_keep_their_reason_and_release_sca
     dnit(?ti);
     if (T.leaked(?t) || T.double_free_count(?t) != 0 || T.tracking_exhausted(?t)) { code = 9; }
     ret code;
+}
+
+
+test "mach.lang.type.intern_nominal:named_identity_survives_unrelated_declaration_insertion" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var ti: TypeInterner;
+    if (O.is_some[str](init(?ti, ?alloc))) { ret 2; }
+    fin { dnit(?ti); }
+    val owner: TypeOwner = TypeOwner{ module: 9, file: 4 };
+    val first: R.Result[TypeId, str] = intern_nominal(?ti, 7, owner, TYPE_REC);
+    if (R.is_err[TypeId, str](first)) { ret 3; }
+    if (R.is_err[TypeId, str](intern_nominal(?ti, 8, owner, TYPE_REC))) { ret 4; }
+    val warm: R.Result[TypeId, str] = intern_nominal(?ti, 7, owner, TYPE_REC);
+    if (R.is_err[TypeId, str](warm) || R.unwrap_ok[TypeId, str](first) != R.unwrap_ok[TypeId, str](warm)) { ret 5; }
+    val other_file: R.Result[TypeId, str] = intern_nominal(?ti, 7, TypeOwner{ module: 9, file: 5 }, TYPE_REC);
+    val other_module: R.Result[TypeId, str] = intern_nominal(?ti, 7, TypeOwner{ module: 10, file: 4 }, TYPE_REC);
+    val renamed: R.Result[TypeId, str] = intern_nominal(?ti, 8, owner, TYPE_REC);
+    if (R.is_err[TypeId, str](other_file) || R.is_err[TypeId, str](other_module) || R.is_err[TypeId, str](renamed)) { ret 6; }
+    val original: TypeId = R.unwrap_ok[TypeId, str](first);
+    if (original == R.unwrap_ok[TypeId, str](other_file) || original == R.unwrap_ok[TypeId, str](other_module)
+        || original == R.unwrap_ok[TypeId, str](renamed)) { ret 7; }
+    ret 0;
+}
+
+test "mach.lang.type.intern_anonymous:identical_shapes_keep_their_source_incarnation" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var ti: TypeInterner;
+    if (O.is_some[str](init(?ti, ?alloc))) { ret 2; }
+    fin { dnit(?ti); }
+    val owner: TypeOwner = TypeOwner{ module: 9, file: 4 };
+    val first: R.Result[TypeId, str] = intern_anonymous(?ti, 7, owner, 1, 2, TYPE_REC);
+    val same: R.Result[TypeId, str] = intern_anonymous(?ti, 7, owner, 1, 2, TYPE_REC);
+    val edited: R.Result[TypeId, str] = intern_anonymous(?ti, 7, owner, 2, 2, TYPE_REC);
+    val other: R.Result[TypeId, str] = intern_anonymous(?ti, 7, TypeOwner{ module: 10, file: 5 }, 1, 2, TYPE_REC);
+    if (R.is_err[TypeId, str](first) || R.is_err[TypeId, str](same) || R.is_err[TypeId, str](edited) || R.is_err[TypeId, str](other)) { ret 3; }
+    val original: TypeId = R.unwrap_ok[TypeId, str](first);
+    if (original != R.unwrap_ok[TypeId, str](same)) { ret 4; }
+    if (original == R.unwrap_ok[TypeId, str](edited) || original == R.unwrap_ok[TypeId, str](other)) { ret 5; }
+    if (!R.is_err[TypeId, str](intern_anonymous(?ti, 7, owner, 0, 2, TYPE_REC))) { ret 6; }
+    ret 0;
+}
+
+
+test "mach.lang.type.interning:hash_collisions_keep_every_canonical_signature" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var ti: TypeInterner;
+    if (O.is_some[str](init(?ti, ?alloc))) { ret 2; }
+    fin { dnit(?ti); }
+    var first: TypeId = O.unwrap[TypeId](prim(?ti, TYPE_I32));
+    var second: TypeId = O.unwrap[TypeId](prim(?ti, TYPE_U64));
+    val f1: R.Result[TypeId, str] = intern_function_bucket(?ti, first, ?first, 1, false, 7);
+    val f2: R.Result[TypeId, str] = intern_function_bucket(?ti, first, ?second, 1, false, 7);
+    val i1: R.Result[TypeId, str] = intern_instance_bucket(?ti, first, ?first, 1, 7);
+    val i2: R.Result[TypeId, str] = intern_instance_bucket(?ti, first, ?second, 1, 7);
+    if (R.is_err[TypeId, str](f1) || R.is_err[TypeId, str](f2) || R.is_err[TypeId, str](i1) || R.is_err[TypeId, str](i2)) { ret 3; }
+    if (R.unwrap_ok[TypeId, str](f1) == R.unwrap_ok[TypeId, str](f2) || R.unwrap_ok[TypeId, str](i1) == R.unwrap_ok[TypeId, str](i2)) { ret 4; }
+    val count: TypeId = type_count(?ti);
+    val params: u32 = ti.params_len;
+    var n: u32 = 0;
+    for (n < 32) {
+        val a: R.Result[TypeId, str] = intern_function_bucket(?ti, first, ?first, 1, false, 7);
+        val b: R.Result[TypeId, str] = intern_function_bucket(?ti, first, ?second, 1, false, 7);
+        val c: R.Result[TypeId, str] = intern_instance_bucket(?ti, first, ?first, 1, 7);
+        val d: R.Result[TypeId, str] = intern_instance_bucket(?ti, first, ?second, 1, 7);
+        if (R.is_err[TypeId, str](a) || R.is_err[TypeId, str](b) || R.is_err[TypeId, str](c) || R.is_err[TypeId, str](d)) { ret 5; }
+        if (R.unwrap_ok[TypeId, str](a) != R.unwrap_ok[TypeId, str](f1) || R.unwrap_ok[TypeId, str](b) != R.unwrap_ok[TypeId, str](f2)
+            || R.unwrap_ok[TypeId, str](c) != R.unwrap_ok[TypeId, str](i1) || R.unwrap_ok[TypeId, str](d) != R.unwrap_ok[TypeId, str](i2)) { ret 6; }
+        n = n + 1;
+    }
+    if (type_count(?ti) != count || ti.params_len != params) { ret 7; }
+    ret 0;
+}
+
+fun t_intern_attempt(ti: *TypeInterner, kind: u32, arg: *TypeId) R.Result[TypeId, str] {
+    val base: TypeId = O.unwrap[TypeId](prim(ti, TYPE_I32));
+    if (kind == 0) { ret intern_pointer(ti, base); }
+    if (kind == 1) { ret intern_function(ti, base, arg, 1, false); }
+    ret intern_instance(ti, base, arg, 1);
+}
+
+test "mach.lang.type.interning:refused_publication_retries_one_canonical_identity" {
+    var kind: u32 = 0;
+    for (kind < 3) {
+        var ordinal: usize = 1;
+        var finished: bool = false;
+        for (ordinal <= 16 && !finished) {
+            var t: T.Testing;
+            if (O.is_some[str](T.make(?t))) { ret 1; }
+            var ti: TypeInterner;
+            if (O.is_some[str](init(?ti, T.allocator_of(?t)))) { T.dnit(?t); ret 2; }
+            val before: TypeId = type_count(?ti);
+            val run: u32 = ti.params_len;
+            var arg: TypeId = O.unwrap[TypeId](prim(?ti, TYPE_U64));
+            T.fail_at_ordinal(?t, T.attempt_count(?t) + ordinal);
+            val attempt: R.Result[TypeId, str] = t_intern_attempt(?ti, kind, ?arg);
+            var code: i32 = 0;
+            if (R.is_err[TypeId, str](attempt)) {
+                if (!str_equals(R.unwrap_err[TypeId, str](attempt), "out of memory")) { code = 3; }
+                if (type_count(?ti) != before || ti.params_len != run) { code = 4; }
+            }
+            or { finished = true; }
+            T.clear_failure(?t);
+            val retry: R.Result[TypeId, str] = t_intern_attempt(?ti, kind, ?arg);
+            val again: R.Result[TypeId, str] = t_intern_attempt(?ti, kind, ?arg);
+            if (R.is_err[TypeId, str](retry) || R.is_err[TypeId, str](again)) { code = 5; }
+            or {
+                if (R.unwrap_ok[TypeId, str](retry) != before || R.unwrap_ok[TypeId, str](again) != before || type_count(?ti) != before + 1) { code = 6; }
+            }
+            dnit(?ti);
+            if (T.leaked(?t) || T.double_free_count(?t) != 0 || T.tracking_exhausted(?t)) { code = 7; }
+            T.dnit(?t);
+            if (code != 0) { ret code; }
+            ordinal = ordinal + 1;
+        }
+        if (!finished) { ret 8; }
+        kind = kind + 1;
+    }
+    ret 0;
+}
+
+fun t_borrowed_parameter_growth(tracker: *T.Testing) i32 {
+    var ti: TypeInterner;
+    if (O.is_some[str](init(?ti, T.allocator_of(tracker)))) { ret 2; }
+    fin { dnit(?ti); }
+    var arg: TypeId = O.unwrap[TypeId](prim(?ti, TYPE_I32));
+    for (ti.params_len < ti.params_cap) {
+        if (R.is_err[u32, str](params_append(?ti, ?arg, 1))) { ret 3; }
+    }
+    val old_len: u32 = ti.params_len;
+    val old_address: usize = ti.params::usize;
+    val appended: R.Result[u32, str] = params_append(?ti, ti.params, old_len);
+    if (R.is_err[u32, str](appended) || R.unwrap_ok[u32, str](appended) != old_len || ti.params_len != old_len * 2) { ret 4; }
+    if (ti.params::usize == old_address) { ret 7; }
+    var i: u32 = 0;
+    for (i < ti.params_len) {
+        if (ti.params[i] != arg) { ret 5; }
+        i = i + 1;
+    }
+    val saved: usize = ti.types.len;
+    ti.types.len = TYPE_ERROR::usize;
+    val exhausted: R.Result[TypeId, str] = intern_pointer(?ti, O.unwrap[TypeId](prim(?ti, TYPE_U64)));
+    ti.types.len = saved;
+    if (R.is_ok[TypeId, str](exhausted) || !str_equals(R.unwrap_err[TypeId, str](exhausted), "type identities are exhausted")) { ret 6; }
+    ret 0;
+}
+
+
+test "mach.lang.type.interning:borrowed_parameter_runs_survive_pool_growth" {
+    var tracker: T.Testing;
+    if (O.is_some[str](T.make(?tracker))) { ret 1; }
+    fin { T.dnit(?tracker); }
+    val code: i32 = t_borrowed_parameter_growth(?tracker);
+    if (code != 0) { ret code; }
+    if (T.leaked(?tracker) || T.double_free_count(?tracker) != 0 || T.tracking_exhausted(?tracker)) { ret 8; }
+    ret 0;
 }

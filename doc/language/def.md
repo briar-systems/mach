@@ -19,7 +19,7 @@ pub def Choice: uni { a: i64; b: f64; };        # inline union
 ```
 
 Aliases may name any type: primitives, pointers, arrays, function types,
-records, unions, or other aliases.
+records, unions, tags, or other aliases.
 
 ## Stdlib aliases
 
@@ -30,5 +30,5 @@ shorthand imports the appropriate stdlib module.
 
 ## See also
 
-- [types.md](types.md) — the type grammar `def` references
-- [rec.md](rec.md), [uni.md](uni.md) — record / union forms commonly aliased
+- [types.md](types.md) - the type grammar def references
+- [rec.md](rec.md), [uni.md](uni.md), [tag.md](tag.md) - aggregate forms commonly aliased

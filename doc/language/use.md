@@ -28,11 +28,12 @@ use std.types.size;             # binds module 'size'; use as `size.usize`
 use sz: std.types.size;         # binds module under 'sz'; use as `sz.usize`
 use std.types.size.usize;       # binds symbol 'usize'; use bare as `usize`
 use my_usize: std.types.size.usize;  # binds symbol under 'my_usize'
-use std;                         # bare project id: binds std's public module
+use example;                     # binds the explicitly defaulted library entry
 ```
 
-A one-segment path equal to a resolvable project id binds that project's
-public module, the `entry` its artifacts share — see
+A one-segment dependency path binds the `entry` of its explicitly defaulted
+library artifact. The current project's own id binds the selected artifact's
+entry. See
 [modules.md](modules.md#bare-project-id-imports).
 
 ## Design rule
