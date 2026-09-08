@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Canonical RISC-V extension selection bounds generated instructions, named
+  assembly, object attributes and header flags while preserving explicit ABIs.
+
 - Integer vector division follows scalar division per lane, preserving signedness
   and rejecting secret operands. Targets without packed division scalarize it.
 
@@ -32,6 +35,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Shared width legalization and retained target coverage remain available.
 
 ### Fixed
+
+- Relocatable linking preserves native section identities, symbol definitions,
+  import declarations and relocation relations instead of applying final-image
+  section merging. ELF groups, Mach-O indirect symbols and difference relocations,
+  and COFF native imports survive object round trips. Unsupported native
+  representations are diagnosed instead of silently losing metadata. (#3119)
+
+- Release inlining acquires eligible bodies across module boundaries with bounded
+  owned storage, preserving symbol identity, assembly effects and debug metadata.
+  Provider body changes invalidate importers even when a body was previously
+  ineligible. Recursive peeling respects `noinline`, `scalar`, and naked function
+  boundaries, and call cycles are detected in one traversal. (#3110)
+
+- SPIR-V calls carry typed logical arguments and results without a synthetic
+  register bank. Whole-object reference parameters preserve their pointee types.
+
+- Serial optimization records its processed modules, and parallel lowering counts
+  each module once in progress output.
 
 - Comptime evaluation distinguishes unknown internal tags from unsupported values
   and rejects comparisons of reflection descriptors without equality semantics.
