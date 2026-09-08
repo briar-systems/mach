@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Instruction-selection guards read the selected machine model. RV32 full-register
+  conversions are recognized as copies and removed by register coalescing, including
+  when RV32 and RV64 targets are selected in the same process.
 - CI rebuilds its audited compiler from published 4.26.5 and source commits reachable from main after withdrawal of the 4.30.0 release.
 
 ### Changed
