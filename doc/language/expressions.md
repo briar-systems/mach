@@ -23,7 +23,7 @@ counter             # local or module-level binding
 core.add            # symbol from module `core`
 ```
 
-## Record / array / union literals
+## Record / array / union / tag literals
 
 A type name followed by a brace-delimited initializer:
 
@@ -32,14 +32,22 @@ val p:    Point             = Point{ x: 1, y: 2 };
 val a:    [3]i64            = [3]i64{10, 20, 30};
 val u:    Number            = Number{ i: 99 };
 val pair: Pair[i64, u8]     = Pair[i64, u8]{ left: 5, right: 6u8 };
+val rep0: Reply             = Reply{empty};
+val rep1: Reply             = Reply{value: 42};
+val good: res[i64, MyErr]   = res[i64, MyErr]{ok: 42};
+val done: err[MyErr]        = err[MyErr]{ok};
 ```
 
 For generics, the type arguments appear in brackets before the body.
 
-Vector literals (`f32x4{ 1.0, 2.0, 3.0, 4.0 }`) follow the same shape, one
-initializer per lane — see [types.md](types.md#simd-vectors).
+A tag literal requires selecting exactly one case. Selecting zero cases, selecting
+multiple cases, omitting a required payload, or supplying a payload to a
+payloadless case is a compile error.
 
-## Field / index access
+Vector literals (`f32x4{ 1.0, 2.0, 3.0, 4.0 }`) follow the same brace shape, but
+require one positional initializer per lane. See [types.md](types.md#simd-vectors).
+
+## Field, index, and tag access
 
 ```mach
 val x:     i64 = p.x;            # record field
@@ -47,8 +55,37 @@ val first: i64 = a[0];           # array index
 ```
 
 An index the compiler can fold is bounds-checked against a statically known
-length — a fixed array's `N`, a vector's lane count — see
+length, such as a fixed array length `N` or a vector lane count. See
 [types.md](types.md).
+
+For tagged values:
+
+- `TypeName.case` is a case selector used in comparisons. It is not a value and cannot be stored or passed.
+- `tag_val.case` accesses the payload of that case. It requires a current compiler proof that the case is active. Reading an unproved payload is a compile error.
+
+See [tag.md](tag.md) for proof tracking and alias invalidation rules.
+
+## `try` expressions
+
+A `try` expression performs explicit, visible failure handling for canonical
+`res[T, E]`, `opt[T]`, and `err[E]` values:
+
+```mach
+val number: i64 = try parse(input) or (error: ParseError) {
+    ret res[i64, ParseError]{err: error};
+};
+```
+
+On success, `try` extracts the active payload. On failure, it binds the error
+(if applicable) and executes a mandatory terminating failure block. A failed
+`try` skips the remainder of the enclosing expression and does not initialize its
+destination.
+
+In assignments, the right hand side evaluates and captures before the destination
+place on the left hand side is evaluated.
+
+Ordinary user-defined tags do not acquire an automatic `try` convention. See
+[try.md](try.md) for complete failure handling rules.
 
 ## Function calls
 
