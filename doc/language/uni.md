@@ -38,28 +38,31 @@ secret (`^`) or every field is public. A mixed union would let the same storage
 be read at two secrecy classifications, the aliasing leak the welded-storage
 rules forbid. See [secrecy.md](secrecy.md).
 
-## Discriminated values — by convention
+## Raw unions versus tagged values
 
-Mach has no tagged-union construct and no pattern-matching dispatch.
-Discriminated values compose from `rec` and `uni`:
+A `uni` is unchecked, raw memory. The compiler tracks neither which variant was
+written nor whether reading a variant is valid.
+
+For safe, discriminated values where the active case is tracked and payloads
+require proof before access, use `tag`. See [tag.md](tag.md).
+
+Low-level systems code can still compose `rec` and `uni` manually when modeling
+foreign data structures, hardware registers, or wire formats:
 
 ```mach
-rec Value {
-    kind: ValueKind;
-    data: uni { i: i64; f: f64; }
+rec RawPacket {
+    kind: u8;
+    data: uni { header: Header; raw: [64]u8; }
 }
 ```
 
-Consumers read `kind`, then access the matching `data` field via ordinary
-`if`/`or` chains. The compiler does not verify that `kind` and `data`
-agree; keeping them consistent is the constructor's responsibility.
-
-This is deliberate. Tagged unions and `match`-style dispatch would add
-significant surface area to the language and compiler for an abstraction
-the composed form already expresses honestly.
+With manual composition, the compiler does not verify that `kind` and `data`
+agree. Keeping them consistent is the programmer's responsibility. In ordinary
+Mach code, prefer first-class `tag` declarations.
 
 ## See also
 
-- [rec.md](rec.md) — the discriminator-and-payload outer shape
-- [statements.md](statements.md) — `if`/`or` chains for discrimination
-- [secrecy.md](secrecy.md) — why overlapping variants must agree on secrecy
+- [tag.md](tag.md) - checked tagged values with proof-guarded payload access
+- [rec.md](rec.md) - records and sequential aggregate layout
+- [statements.md](statements.md) - if/or chains for branching
+- [secrecy.md](secrecy.md) - secrecy agreement across overlapping variants
