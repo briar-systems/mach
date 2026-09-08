@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Dependency names follow the path. Missing or extra operands are refused.
   Use `.` for the current project. Pull retains existing local copies and update
   refreshes them. Dependency commands preserve the project's Git history.
+
+- Manifest requirements use explicit `step.<name>` and `artifact.<name>` categories, including category-specific globs. Step cycles are rejected during manifest parsing.
+
 ### Added
 
 - `mach build <path> --plan` reports the selected entries, prerequisites, outputs and link requirements through the shared planner. It replaces `--explain`.

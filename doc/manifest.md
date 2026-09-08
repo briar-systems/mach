@@ -510,7 +510,7 @@ reads the selected artifact's name.
 | `out`     | yes | This artifact's output path, **relative to the expanded project `out`** and rooted there automatically — write `bin/demo`, not `{project.out}/bin/demo`. An executable extension, where wanted, is written literally here, and it is one string shared by every target in `targets`, so an executable that ships on Windows and elsewhere **cannot use `targets = ["*"]`** (see [One artifact per extension convention](#one-artifact-per-extension-convention)). |
 | `targets` | yes | Array of declared target names this artifact builds for; `["*"]` means every declared target. |
 | `link`    | yes | Array of `[link.X]` names this artifact links (see below). `[]` for none. A name with no table is a manifest error naming the artifact and the declared tables (`[artifact.p1].link names no [link.*] table: 'nosuch' (declared: [link.kernel32])`). |
-| `need`    | yes | Array of `[step.X]` and `[artifact.X]` names this artifact requires, and `*`-globs over both. `[]` for none. See [Artifact requirements](#artifact-requirements). |
+| `need`    | yes | Array of category-qualified requirements such as `step.generate`, `artifact.support`, and `artifact.shader-*`. Each glob matches only its named category. `[]` for none. See [Artifact requirements](#artifact-requirements). |
 | `subsystem` | no | `"console"` (default) or `"gui"` — the environment a windows executable declares it runs under (see below). |
 | `icon` | no | Project-root-relative `.ico` path embedded in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
 | `manifest` | no | Project-root-relative application-manifest path embedded byte-for-byte in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
@@ -780,7 +780,7 @@ plain identifier — it keys the step's stamp file.
 | `env`  | no  | Table of string values added to the step process's environment. |
 | `in`   | yes | Declared input file list. Accepts globs (`*`, `**`), expanded sorted for a stable fingerprint; a glob that matches nothing is a hard error. |
 | `out`  | yes | Declared output file list. Concrete paths only — a glob here is an error, since the demand match and cache key expand `out` verbatim. |
-| `need` | yes | Array of other `[step.X]` names this step must run after (explicit ordering; cycles error). `[]` for none. |
+| `need` | yes | Array of `step.<name>` requirements or `step.<pattern>` globs this step must run after. Steps may require only steps. Cycles are manifest errors. `[]` for none. |
 | `timeout_seconds` | no | Positive integer number of seconds after which the step's process group is terminated and the build fails. Omit for an unbounded step. |
 
 Steps carry **no filters** and **never run automatically**. A step runs only when
@@ -1061,18 +1061,20 @@ collide and fail at build start.
 
 ## Artifact requirements
 
-An artifact's `need` names what must exist before it is built. An entry is a
-`[step.X]` name, an `[artifact.X]` name, or a `*`-glob matching either. A glob
-never matches the artifact that declares it.
+An artifact's `need` names what must exist before it is built. Every entry
+identifies its category: `step.generate` selects `[step.generate]`, while
+`artifact.support` selects `[artifact.support]`. A `*` glob applies only within
+that category, so `artifact.shader-*` never selects a similarly named step.
+A step and an artifact may share a name. List both qualified names to require both.
 
 A required artifact is built before its consumer, for the consumer's profile and
-for the required artifact's **own** targets: the consumer's target when the
-requirement declares it, and otherwise every target the requirement names. That is
-what lets a host executable require a shader compiled for an accelerator target.
+for the required artifact's own targets: the consumer's target when the
+requirement declares it, and otherwise every target the requirement names.
 A requirement reached from several consumers is built once.
 
-Inside the consumer, `{artifact.<id>.out}` expands to that artifact's output path,
-so the consumer can name the file:
+Inside the consumer, `{artifact.<id>.out}` expands to that artifact's output path.
+It is an error to name an artifact the consumer does not require, or one that
+builds for several targets here and therefore has no single output.
 
 ```toml
 [artifact.shader-blur]
@@ -1089,7 +1091,7 @@ entry   = "main.mach"
 out     = "bin/app"
 targets = ["linux-x86_64"]
 link    = []
-need    = ["shader-*"]
+need    = ["artifact.shader-*"]
 ```
 
 ```mach
@@ -1107,15 +1109,15 @@ dependency.
 
 These are errors:
 
-- a `need` entry that is neither an identifier nor a glob over one;
-- a name that is both a `[step.X]` and an `[artifact.X]` — the diagnostic names
-  both tables, and one of them has to be renamed;
-- a name matching no declared step or artifact;
-- a glob matching nothing — an empty match is an error, not an empty set;
-- an artifact that requires itself, and any cycle among artifacts, reported with
-  the chain (`a -> b -> c -> a`);
-- `{artifact.<id>.out}` naming an artifact the consumer does not require, or one
-  that builds for more than one target here and so has no single output.
+- a missing or malformed category prefix, including bare names;
+- a name or glob matching no declaration in its named category;
+- an explicit self-requirement, or a glob matching only the declaring item;
+- an artifact requirement in a step's `need` list;
+- artifact cycles and step cycles, including cycles formed by globs.
+
+Globs exclude the declaring item. Matching declarations retain manifest order,
+and transitive prerequisites run before their consumers. Both root and dependency
+manifests receive these checks during parsing, before planning can execute a step.
 
 A required artifact that fails to build fails its consumer, naming the requirement,
 and the consumer is not attempted.
