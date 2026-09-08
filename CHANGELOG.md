@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Integer vector division follows scalar division per lane, preserving signedness
   and rejecting secret operands. Targets without packed division scalarize it.
 
+- Persistent object-image caching across compiler processes, bounded entry storage, and `--no-cache` for build and test.
 - `mach fmt <project-path> [--check]` formats declared project source without
   fetching dependencies or building. Check mode is read only, and file replacement
   uses held-root publication while preserving exact POSIX permission bits.
@@ -35,6 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Test listing stops after collecting tests without generating or linking machine code.
 - Required vector lowering preserves volatile accesses and runs in functions that
   contain volatile I/O.
+
+- Darwin persistent cache identity hashes the compiler executable through its own
+  code mapping, including when the loader inserts libraries before that executable.
 
 - Constant expressions evaluate nested scalar casts and preserve integer widths and
   signedness. Failed global initializers reject compilation and cannot publish zero

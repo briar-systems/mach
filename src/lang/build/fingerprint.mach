@@ -43,6 +43,7 @@ pub val DOMAIN_FS_POLICY:     Domain = 12;
 pub val FILE_DIGEST_CHUNK: usize = 8192;
 
 pub fun file_sha256(path: str, digest: *u8) R.Result[R.Void, str] {
+    if (path == nil || digest == nil) { ret R.err[R.Void, str]("file digest input or output is missing"); }
     val open_r: R.Result[fs.File, io_error.Error] = fs.open(path);
     if (R.is_err[fs.File, io_error.Error](open_r)) {
         ret R.err[R.Void, str](io_error.message(R.unwrap_err[fs.File, io_error.Error](open_r)));
@@ -62,7 +63,36 @@ pub fun file_sha256(path: str, digest: *u8) R.Result[R.Void, str] {
     }
     val identity: fs.Identity = R.unwrap_ok[fs.Identity, io_error.Error](identity_r);
 
+    var computed: [32]u8;
+    val hashed: R.Result[R.Void, str] = held_file_sha256(f, ?computed[0]);
+    if (R.is_err[R.Void, str](hashed)) { ret hashed; }
+    val validated: R.Result[R.Void, str] = validate_digest_input(path, f, before, identity);
+    if (R.is_err[R.Void, str](validated)) { ret validated; }
+    val closed: O.Option[io_error.Error] = fs.close(?f);
+    opened = false;
+    if (O.is_some[io_error.Error](closed)) {
+        ret R.err[R.Void, str](io_error.message(O.unwrap[io_error.Error](closed)));
+    }
+    var i: usize = 0;
+    for (i < 32) { digest[i] = computed[i]; i = i + 1; }
+    ret R.ok_void[str]();
+}
+
+# borrows the file and exclusive seek/read access, rewinds first and leaves it at eof
+# failure does not publish a digest, the caller retains close ownership
+pub fun held_file_sha256(f: fs.File, digest: *u8) R.Result[R.Void, str] {
+    if (digest == nil) { ret R.err[R.Void, str]("file digest output is missing"); }
+    val before_r: R.Result[fs.Metadata, str] = fs.stat_of(f);
+    if (R.is_err[fs.Metadata, str](before_r)) { ret R.err[R.Void, str](R.unwrap_err[fs.Metadata, str](before_r)); }
+    val before: fs.Metadata = R.unwrap_ok[fs.Metadata, str](before_r);
+    if (!fs.meta_is_file(?before)) { ret R.err[R.Void, str]("cannot digest a non-file handle"); }
+    val rewound: R.Result[i64, io_error.Error] = fs.seek(f, 0, fs.SEEK_SET);
+    if (R.is_err[i64, io_error.Error](rewound)) {
+        ret R.err[R.Void, str](io_error.message(R.unwrap_err[i64, io_error.Error](rewound)));
+    }
+    if (R.unwrap_ok[i64, io_error.Error](rewound) != 0) { ret R.err[R.Void, str]("file digest could not rewind its input"); }
     var st: sha256.State = sha256.init();
+    var total: usize = 0;
     var buf: [8192]u8;
     for {
         val rr: R.Result[usize, io_error.Error] = fs.read(f, ?buf[0], FILE_DIGEST_CHUNK);
@@ -71,15 +101,13 @@ pub fun file_sha256(path: str, digest: *u8) R.Result[R.Void, str] {
         }
         val n: usize = R.unwrap_ok[usize, io_error.Error](rr);
         if (n == 0) { brk; }
+        if (n > before.size - total) { ret R.err[R.Void, str]("file grew while computing its digest"); }
+        total = total + n;
         sha256.update(?st, ?buf[0], n);
     }
-    val validated: R.Result[R.Void, str] = validate_digest_input(path, f, before, identity);
-    if (R.is_err[R.Void, str](validated)) { ret validated; }
-    val closed: O.Option[io_error.Error] = fs.close(?f);
-    opened = false;
-    if (O.is_some[io_error.Error](closed)) {
-        ret R.err[R.Void, str](io_error.message(O.unwrap[io_error.Error](closed)));
-    }
+    if (total != before.size) { ret R.err[R.Void, str]("file shrank while computing its digest"); }
+    val stable: R.Result[R.Void, str] = validate_held_digest_input(f, before);
+    if (R.is_err[R.Void, str](stable)) { ret stable; }
     sha256.final(?st, digest);
     ret R.ok_void[str]();
 }
@@ -102,6 +130,10 @@ fun validate_digest_input(path: str, held: fs.File, before: fs.Metadata, identit
     if (!fs.identity_equal(identity, R.unwrap_ok[fs.Identity, io_error.Error](observed))) {
         ret R.err[R.Void, str]("file changed while computing its digest");
     }
+    ret validate_held_digest_input(held, before);
+}
+
+fun validate_held_digest_input(held: fs.File, before: fs.Metadata) R.Result[R.Void, str] {
     val after_r: R.Result[fs.Metadata, str] = fs.stat_of(held);
     if (R.is_err[fs.Metadata, str](after_r)) { ret R.err[R.Void, str](R.unwrap_err[fs.Metadata, str](after_r)); }
     val after: fs.Metadata = R.unwrap_ok[fs.Metadata, str](after_r);
@@ -372,4 +404,29 @@ test "mach.lang.build.fingerprint.file_sha256:rejects_path_replacement_while_obj
 
 test "mach.lang.build.fingerprint.file_sha256:rejects_changes_to_the_held_object" {
     ret t_digest_observation_case(false);
+}
+
+
+test "mach.lang.build.fingerprint.held_file_sha256:rewinds_and_borrows_the_complete_file" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val created: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "mach-held-digest");
+    if (R.is_err[fs.TempFile, str](created)) { ret 1; }
+    var file: fs.TempFile = R.unwrap_ok[fs.TempFile, str](created);
+    fin { fs.temp_close_and_remove(?file); str_free(?alloc, file.path); }
+    val written: R.Result[usize, io_error.Error] = fs.write(file.file, "abc"::*u8, 3);
+    if (R.is_err[usize, io_error.Error](written) || R.unwrap_ok[usize, io_error.Error](written) != 3) { ret 2; }
+    val seeked: R.Result[i64, io_error.Error] = fs.seek(file.file, 1, fs.SEEK_SET);
+    if (R.is_err[i64, io_error.Error](seeked)) { ret 3; }
+    var digest: [32]u8;
+    if (R.is_err[R.Void, str](held_file_sha256(file.file, ?digest[0]))) { ret 4; }
+    val expected: [32]u8 = [32]u8{0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+        0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3,
+        0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad};
+    if (!bytes_eq(?digest[0], ?expected[0], 32)) { ret 5; }
+    val position: R.Result[i64, io_error.Error] = fs.seek(file.file, 0, fs.SEEK_CUR);
+    if (R.is_err[i64, io_error.Error](position) || R.unwrap_ok[i64, io_error.Error](position) != 3) { ret 6; }
+    if (R.is_err[R.Void, str](held_file_sha256(file.file, ?digest[0]))
+        || !bytes_eq(?digest[0], ?expected[0], 32)) { ret 7; }
+    ret 0;
 }
