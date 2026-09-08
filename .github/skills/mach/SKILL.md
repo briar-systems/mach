@@ -103,6 +103,20 @@ $or {
 fwd impl.page_size;
 ```
 
+## Manifest policy
+
+Every root and dependency manifest must declare at least one profile. Each profile
+requires `opt`, `debug`, `simd`, `vectorize`, and `float_reassoc`. There are no
+synthetic profiles or policy defaults. Preserve existing explicit values when
+migrating a project. `simd = "scalarize"` does not disable loop vectorization.
+
+A sole profile is the default. With multiple profiles, use an explicit `--profile`
+or mark exactly one `default = true`. Targets and artifacts likewise never select
+by table order. The consumer's selected target and profile apply to dependency
+source, although every dependency manifest must satisfy the same schema.
+Optional selectors and derived platform facts remain documented in
+[doc/manifest.md](../../../doc/manifest.md).
+
 ## Entrypoint and output
 
 An artifact's `out` expands `{artifact.suffix}` using its selected target's naming
@@ -548,7 +562,7 @@ known open disclosure path - do not write production crypto against it.
 `#[scalar]` excludes a function from loop auto-vectorization (which runs in the
 release pipeline on targets with 128-bit vectors) and also blocks inlining, so
 the opt-out survives. The project-wide lever is the `vectorize` profile key in
-`mach.toml`, optional and default-on.
+`mach.toml`, required in every declared profile.
 
 `#[naked]` emits the body exactly as written - no frame record, no stack
 allocation, no argument moves, and no return. The body may hold only inline

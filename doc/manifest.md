@@ -24,27 +24,30 @@ Nothing is inferred from the directory layout. `mach init` writes a complete
 manifest so a new project never starts from that error (see
 [cli.md](cli.md#mach-init)).
 
-A table you *declare*, you declare completely. Every field of a declared table is
-required; a missing field is a strict-parse error, not a silent default. This is
-the manifest twin of Mach's explicitness: there are no field defaults to memorize,
-because "any" and "none" are said out loud —
+Required fields must be present in every declared table. A missing required
+field is a schema error. At least one `[profile.*]` is required, and every profile
+must state `opt`, `debug`, `simd`, `vectorize`, and `float_reassoc`. The compiler
+does not synthesize profiles or use table order to choose build policy.
 
-- `"*"` is the explicit any-token for a filter axis or `targets` entry;
-- `[]` is the explicit empty list ("none").
+- `"*"` is the explicit any-token for a filter axis or `targets` entry.
+- `[]` is the explicit empty list.
 
-The sole exception is **shape-dependence**: a field whose presence follows another
-value in the same table. A dependency is `git` *or* `path`; a `[link.X]` names a
-`name` *or* a `path` according to its `source`. Nothing else defaults.
+The schema tables below distinguish required values from optional selectors and
+derived platform facts. For example, `default` is an optional selection marker,
+`of` can derive from the target tuple, and `subsystem` defaults to `console`.
+Shape-dependent fields remain explicit: a dependency selects `git` or `path`,
+and a link selects `name` or `path` according to its `source`.
 
 Unknown sections and unknown keys are always errors. A path value is always
 `/`-separated; a literal `\` is rejected (`manifest paths use '/'`), so the same
 manifest is portable and is normalized to the host separator at the filesystem
 boundary.
 
-### Root vs. dependency strictness
+### One schema for roots and dependencies
 
-A dependency's `mach.toml` is read by the same closed schema, once, and an
-unknown or removed key in it fails the consumer's build naming the dependency:
+Root and dependency manifests use the same required fields and closed schema.
+An unknown, removed, or missing required key in a dependency fails the consumer's
+build naming that dependency:
 
 ```
 error: dep 'std': mach.toml: unknown key 'bogus' in [project]
@@ -54,7 +57,8 @@ What a consumer *uses* from a dependency's manifest is its export surface: the
 project id, the module a bare `use <id>;` binds (see
 [language/modules.md](language/modules.md#bare-project-id-imports)), its
 `export = true` link entries, and the steps those entries demand. A dependency's
-`[profile.*]` and `[target.*]` tables are never read to build the consumer.
+`[profile.*]` and `[target.*]` tables are fully validated, but do not select the
+consumer's build policy. The consumer supplies the selected target and profile.
 
 ## The schema at a glance
 
@@ -71,9 +75,12 @@ os  = "linux"
 abi = "sysv64"
 
 [profile.debug]                        # a build variant
+default = true
 opt   = 0                              # 0 (debug pipeline) | 1 | 2 (release pipeline)
 debug = true                           # emit debug info for this profile
 simd  = "scalarize"                    # SIMD lever: "scalarize" | "require"
+vectorize = true
+float_reassoc = false
 
 [artifact.demo]                        # a produced artifact
 kind    = "bin"                        # "bin" | "static" | "shared"
@@ -81,7 +88,7 @@ entry   = "main.mach"                  # entry source, relative to src
 out     = "bin/demo"                   # output path, relative to the project out
 targets = ["*"]                        # which declared targets build it ("*" = all)
 link    = []                           # [link.X] names this artifact links
-need    = []                           # [step.X] / [artifact.X] names this artifact requires
+need    = []                           # qualified step.X / artifact.X requirements
 # subsystem = "gui"                    # optional: windows console/GUI selector
 # icon = "assets/demo.ico"             # optional: PE executable icon
 # manifest = "assets/demo.manifest"    # optional: PE application manifest
@@ -102,12 +109,10 @@ ref = "branch/main"
 | `src`     | string | Source root, project-root-relative. Module paths resolve under it. |
 | `out`     | string | The output-path template root, referenced as `{project.out}` by artifact `out`, step paths, and `cmd`s. Expanded over `{target.name}`/`{target.isa}`/`{target.os}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). |
 
-`[project]` is exactly these four keys. `name`, `description`, and `mach` are
-deprecated until 5.0.0: 4.26.x accepted them and never read them, so 4.30.0
-accepts them with a warning naming the key, the table, and the 5.0.0 refusal,
-in a root manifest and a dependency's alike; `[profile.<name>]`'s `emit_ir` and
-`emit_asm` are in the same window (emission is `--emit-ir`/`--emit-asm` on the
-command line). Any other key is an unknown-key error in every manifest.
+`[project]` uses exactly these four keys. The unused `name`, `description`,
+`mach`, and profile `emit_ir`/`emit_asm` keys currently produce deprecation
+warnings. Their v5 removal is tracked in #3129. Use the command-line
+`--emit-ir` and `--emit-asm` switches for side artifacts.
 
 ## `[target.<name>]`
 
@@ -376,35 +381,27 @@ live here because they are variant concerns.
 | `opt`   | integer | Optimization level: `0` selects the debug pipeline (the always-on passes only), `1` and `2` select the release pipeline. `1` and `2` currently share a pass set, which includes loop auto-vectorization (see `vectorize` below). Any other integer — or a non-integer — is a manifest error. |
 | `debug` | bool    | Emit debug info (DWARF on ELF/Mach-O, CodeView on COFF) for this profile. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
 | `simd`  | string  | SIMD scalarization lever. `"scalarize"` emits a defined unrolled scalar expansion wherever the target has no packed instruction for a vector operator, with a build-time note. `"require"` makes that a hard error naming the operation, its **lane width**, the function and the target. It applies **per operation on every target**, not only to targets with no vector unit: x86-64's SSE2 baseline has no 32-bit lane integer multiply and NEON has no 64-bit one, so a capable target scalarizes too. Any other string is a manifest error. |
-| `vectorize` | bool | **Optional** auto-vectorization lever; absent it defaults to `true`. When `true`, the release pipeline rewrites provably-safe counted loops to 128-bit SIMD on a target with hardware vectors; `false` skips the pass, so release output stays scalar. A non-boolean is a manifest error. |
-| `float_reassoc` | bool | **Optional** permission to treat floating-point addition and multiplication as **associative**; absent it defaults to `false`. It lets the vectorizer reduce an `f32`/`f64` accumulator through lane-count partial sums, which changes the result — see [Float reassociation](#float-reassociation) for what that costs and what it buys. A non-boolean is a manifest error. |
-| `default` | bool | **Optional.** `true` marks the profile a build uses when several are declared and `--profile` is absent. Exactly one profile may carry it. See [Built-in profiles and profile selection](#built-in-profiles-and-profile-selection). |
+| `vectorize` | bool | **Required** auto-vectorization policy. When `true`, the release pipeline rewrites provably-safe counted loops to 128-bit SIMD on a target with hardware vectors; `false` skips the pass, so release output stays scalar. A non-boolean is a manifest error. |
+| `float_reassoc` | bool | **Required** permission to treat floating-point addition and multiplication as **associative**. It lets the vectorizer reduce an `f32`/`f64` accumulator through lane-count partial sums, which changes the result — see [Float reassociation](#float-reassociation) for what that costs and what it buys. A non-boolean is a manifest error. |
+| `default` | bool | **Optional.** `true` marks the profile a build uses when several are declared and `--profile` is absent. Exactly one profile may carry it. See [Profile selection](#profile-selection). |
 
-Three keys (`opt`, `debug`, `simd`) are required in a declared profile;
-`vectorize` and `float_reassoc` are optional, defaulting to on and off
-respectively, and `default` is optional.
+All five policy keys (`opt`, `debug`, `simd`, `vectorize`, `float_reassoc`) are
+required in every profile. `default` is optional and affects selection only.
+A missing policy field is diagnosed even in a dependency manifest.
 
-### Built-in profiles and profile selection
+### Profile selection
 
-A manifest that declares no `[profile.*]` table at all gets two built-in
-profiles, `debug` (`opt = 0`, `debug = true`) and `release` (`opt = 2`), and
-`debug` is the default. Declaring any profile replaces both built-ins: a
-manifest with only `[profile.fast]` has no `debug` and no `release`.
+A manifest must declare at least one profile. There are no built-in `debug` or
+`release` profiles. Those names exist only when the manifest declares them.
 
-Which profile a build uses follows one rule, the same one that selects a
-target and an artifact:
+1. An explicit `--profile <name>` selects that declared profile.
+2. Otherwise a sole declared profile is chosen.
+3. Otherwise exactly one profile must be marked `default = true`.
 
-1. an explicit `--profile <name>` wins;
-2. otherwise a sole declared profile is chosen;
-3. otherwise the one marked `default = true` is chosen.
+Several profiles without a default require an explicit selection. Multiple
+defaults are a schema error. Table order never chooses a profile, target, or
+artifact.
 
-Table order carries no meaning. In 4.30.0 a manifest that declares several
-profiles and marks none still builds: the first declared profile is taken with
-a warning that names the fix. 5.0.0 refuses that manifest.
-
-```
-warning: mach.toml: several profiles are declared and none is marked `default = true`; the first declared profile is selected by table order, which 5.0.0 stops doing: mark exactly one [profile.<name>] with `default = true` or select one with --profile
-```
 Emission of the human-readable IR and assembly side-artifacts is **not** a profile
 concern — it is controlled only by the `--emit-ir` / `--emit-asm` CLI flags (see
 [cli.md](cli.md)).
@@ -424,11 +421,10 @@ does nothing else; `vectorize = false` switches the pass off wholesale and so ov
 it.
 
 The `simd`, `vectorize` and `float_reassoc` levers are always the **consumer's**.
-Consistent with the root-vs-dependency strictness above, a dependency's `[profile.*]`
-is parsed permissively and never read to build the consumer, so a library's values are
-inert — the effective levers come from the consumer's resolved profile. Libraries set
-nothing SIMD-specific and inherit the consumer's choice; there is no ecosystem fork and
-no dual API.
+A dependency's `[profile.*]` tables meet the same schema, including all five
+required policy keys. They govern builds of that dependency as a root project.
+When its source is built into a consumer, the effective levers come from the
+consumer's resolved profile.
 
 ### Float reassociation
 
@@ -526,12 +522,13 @@ every module in the current project's `src` tree.
 - **`bin`** links an executable at the resolved `out` path.
 - **`static`** materialises a real `ar` archive at the resolved `out` path — the
   per-module objects with an archive symbol index, the deliverable a consumer links
-  as a `.a` (#1997).
-- **`shared`** is reserved for a shared-library deliverable; its emission is phase 2
-  (#1980).
+  using the selected static-library filename, such as `.a` or `.lib`.
+- **`shared`** links a shared-library deliverable where the selected format
+  supports that artifact kind. Unsupported kinds are refused.
 
-Per-target extension or per-target entry is not a per-cell exception table — it is a
-second artifact stanza, so the condition stays visible like everything else.
+A filename extension can vary through `{artifact.suffix}` while retaining one
+artifact identity. Different entry modules use separate artifact declarations
+with explicit target sets.
 
 ### Artifact filenames and identity
 
@@ -1117,13 +1114,12 @@ A build cell is one artifact × one target × one profile.
   artifact; `--target <name>` selects a declared target; `--profile <name>` selects
   a profile.
 - `mach run <path>` consumes exactly one artifact. With no `--bin`/`--lib`, it selects
-  one when exactly one artifact declares the resolved target; if several do, it asks
-  you to pick one, naming every candidate.
+  one when exactly one executable artifact declares the resolved target. With
+  several candidates, use an explicit selector or exactly one applicable default.
 - `mach test <path>` and `mach doc <path>` need one artifact as their primary
   context and select it by the same rule as everything else: `--bin`/`--lib`
   wins, a sole artifact that declares the resolved target is chosen, several
-  need exactly one `default = true` (4.30.0 falls back to the first declared
-  with a warning; 5.0.0 refuses). `mach test` links the union of all artifacts' referenced entries plus
+  need exactly one `default = true`, or an explicit artifact selector. `mach test` links the union of all artifacts' referenced entries plus
   exported dependency entries, filtered to that target. Foreign-target tests require
   a compatible `--runner`. If two artifacts' objects collide on symbols in that union,
   that is an honest link error — restructure the entries.
@@ -1182,10 +1178,9 @@ never a synthesized tuple. Exactly one host match is chosen; several matching tu
 is an ambiguity error naming the candidates. With no match, a sole declared target
 is chosen with a warning, so a cross-only project still builds on a foreign host;
 several declared targets select the one marked `default = true` (or an explicit
-`--target`). A manifest that declares several and marks none still builds in 4.x:
-the first declared target is taken, with a deprecation warning, and 5.0.0 refuses
-that manifest, since table order carries no meaning. The same window applies to
-`[profile.*]` and to `[artifact.*]` when a command needs one artifact.
+`--target`). With several declared targets and no host match or default, selection fails with the required selector or default. Table order carries no meaning. Profiles and commands that
+need one artifact likewise require a sole candidate, an explicit selector, or
+exactly one applicable default.
 
 ## Worked example: a consumer of C bindings and vendored C
 
@@ -1283,14 +1278,20 @@ os  = "windows"
 abi = "win64"
 
 [profile.debug]
+default = true
 opt   = 0
 debug = true
 simd  = "scalarize"
+vectorize = true
+float_reassoc = false
 
 [profile.release]
 opt   = 2
 debug = false
 simd  = "scalarize"
+vectorize = true
+float_reassoc = false
+
 ```
 
 The `gl` and `shim-x11` entries carry `os = "linux"`, so on a windows build cell
@@ -1311,6 +1312,21 @@ id      = "glfw"
 version = "0.3.0"
 src     = "src"
 out     = "out/{target.name}/{profile.name}"
+
+[profile.debug]
+default = true
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[profile.release]
+opt = 2
+debug = false
+simd = "scalarize"
+vectorize = true
+float_reassoc = false
 
 [link.glfw]
 source = "system"
@@ -1360,6 +1376,21 @@ version = "1.0.3"
 src     = "src"
 out     = "out/{target.name}/{profile.name}"
 
+[profile.debug]
+default = true
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[profile.release]
+opt = 2
+debug = false
+simd = "scalarize"
+vectorize = true
+float_reassoc = false
+
 [link.miniz]
 source = "local"
 path   = "{project.out}/obj/miniz/miniz.o"
@@ -1377,8 +1408,8 @@ need = []
 
 ## The compiler's own manifest
 
-Mach builds itself from a manifest that declares six targets, two binary
-artifacts split on the executable extension, and one dependency, `std`:
+Mach builds itself from a manifest that declares six targets, one binary
+artifact, two explicit profiles, and one dependency, `std`:
 
 ```toml
 [project]
@@ -1399,40 +1430,38 @@ abi  = "win64"
 stack_reserve = 0x800000
 
 [profile.debug]
+default = true
 opt = 0
 debug = false
 simd = "scalarize"
+vectorize = true
+float_reassoc = false
 
 [profile.release]
 opt = 2
 debug = false
 simd = "scalarize"
+vectorize = true
+float_reassoc = false
 
 [artifact.mach]
 kind = "bin"
 entry = "bin/main.mach"
-out = "bin/mach"
-targets = ["linux-x86_64", "linux-arm64", "linux-riscv64", "darwin-x86_64", "darwin-aarch64"]
-link = []
-need = []
-
-[artifact.mach-windows]
-kind = "bin"
-entry = "bin/main.mach"
-out = "bin/mach.exe"
-targets = ["windows-x86_64"]
+out = "bin/mach{artifact.suffix}"
+targets = ["*"]
 link = []
 need = []
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v1.0.0"
+ref = "tag/v1.0.1"
 ```
 
 (The full manifest declares all six targets; `version` is whatever the tree's
 current release is.) `mach build .` selects the host-matching target via
-`native`, compiles `src/bin/main.mach` and its transitive imports — including
-modules from `std` at `dep/std/` — and links `out/<target>/<profile>/bin/mach`.
+`native`, compiles `src/bin/main.mach` and its transitive imports including
+modules from `std` at `dep/std/`, and links `out/<target>/<profile>/bin/mach`
+with the selected target suffix.
 `dep/std` is a git submodule whose gitlink is the pin; the build resolves it
 purely by that directory and verifies the gitlink from the repository's index,
 fetching nothing.

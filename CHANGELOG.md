@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Use `.` for the current project. Pull retains existing local copies and update
   refreshes them. Dependency commands preserve the project's Git history.
 
+- Root and dependency manifests share one strict schema. Profiles explicitly declare all compilation policy, and ambiguous target, profile, or artifact selections require a selector or a declared default.
 - Manifest requirements use explicit `step.<name>` and `artifact.<name>` categories, including category-specific globs. Step cycles are rejected during manifest parsing.
 
 ### Added
