@@ -86,6 +86,27 @@ unknown flag).
 > `mach dep`, `mach init`, and `mach clean` do not use the shared config
 > parser; they read only their own flags listed below.
 
+## `mach check`
+
+```text
+mach check <path> [--target <name>] [--profile <name>] [--bin <name> | --lib <name>] [-v | -vv | --quiet]
+```
+
+Checks syntax, name resolution, types and comptime for the same selected artifacts
+and imported source as `mach build`. Unreferenced files outside the selected
+artifact graph are not checked. Artifact and target defaults follow build selection.
+
+Check uses the shared frontend and its explicit accepted, rejected and internal
+failure outcomes. It does not lower, generate code, link, execute build steps or
+produce output files. Generated source and embedded inputs must already exist.
+Missing inputs are reported as errors. Run the appropriate build explicitly to
+produce them. A successful check does not establish backend, machine-code or link
+correctness.
+
+Exit status is 0 for accepted source, 1 for user rejection, 2 for internal failure
+and 3 for environment failure. Diagnostics retain the same locations and
+classifications as the corresponding frontend build.
+
 ## `mach build`
 
 ```
@@ -408,7 +429,7 @@ bin p1-windows)`, `no bin named 'nosuch'`, `no profile named 'nosuch'`.
 | `--jobs <n>`        | count   | run up to `<n>` test processes at once **and** size the build's codegen workers (default: the CPUs available; 1 serializes) |
 | `--filter <pattern>`| pattern | run only tests whose name contains `<pattern>` |
 | `--include-deps`    | —       | also collect tests declared in dependency modules |
-| `--list`            | —       | list the collected tests and exit |
+| `--list`            | —       | collect and list tests without code generation or linking |
 | `--format <mode>`   | `human`\|`json` | output format: the live readout (default `human`), or the machine-readable JSON event stream |
 | `--runner <cmd>`    | command | launch every test as `<cmd> <exe> <idx>` instead of exec'ing the dispatcher directly |
 | `--timeout_seconds <n>` | count | terminate a test process and its process group after `<n>` seconds (default: unbounded) |

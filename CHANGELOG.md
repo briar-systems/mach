@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Test listing stops after collecting tests without generating or linking machine code.
+
 - Instruction selection preserves each register operand's required bank. Post-allocation
   verification independently rejects wrong-bank operands, including conversions,
   moves, and memory addresses.
@@ -29,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Dependency names follow the path. Missing or extra operands are refused.
   Use `.` for the current project. Pull retains existing local copies and update
   refreshes them. Dependency commands preserve the project's Git history.
+### Added
+
+- `mach check <path>` checks selected artifact source through the shared frontend without executing build steps or producing artifacts.
 
 ## [4.30.0] - 2026-09-07
 
