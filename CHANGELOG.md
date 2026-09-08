@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Memory promotion removes unreachable blocks before rewriting locals, preserving
+  valid IR when an unconditional loop leaves a dead cleanup or return path.
+
 - The COFF weak-body linker test publishes into private temporary directories,
   preventing contention with parallel publication tests and reporting failing stages.
 - Instruction-selection guards read the selected machine model. RV32 full-register
