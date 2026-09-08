@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Instruction selection preserves each register operand's required bank. Post-allocation
+  verification independently rejects wrong-bank operands, including conversions,
+  moves, and memory addresses.
+
 - Memory promotion removes unreachable blocks before rewriting locals, preserving
   valid IR when an unconditional loop leaves a dead cleanup or return path.
 

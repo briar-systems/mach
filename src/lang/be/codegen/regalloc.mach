@@ -15,6 +15,7 @@ use O: std.types.option;
 use R: std.types.result;
 
 use mach.lang.be.codegen.mir;
+use mach.lang.be.codegen.rules;
 use mach.lang.intern;
 use mach.lang.layout;
 use mach.lang.source;
@@ -160,7 +161,7 @@ fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) 
         if (fp_scratch != 0 && function_uses_fp_scratch(f)) {
             f.callee_mask_fp = fp_scratch;
         }
-        ret R.ok_void[str]();
+        ret verify_rewritten_operands(tgt, f);
     }
 
     var ctx: AllocCtx;
@@ -216,14 +217,13 @@ fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) 
     val rw: R.Result[R.Void, str] = rewrite(tgt, ?ctx);
     if (R.is_err[R.Void, str](rw)) { ctx_dnit(?ctx); ret rw; }
 
-    drop_self_copies_physical(tgt, ?ctx);
-
     val vf: R.Result[R.Void, str] = verify_allocation(tgt, ?ctx);
     if (R.is_err[R.Void, str](vf)) { ctx_dnit(?ctx); ret vf; }
 
     val vo: R.Result[R.Void, str] = verify_rewritten_operands(tgt, ctx.f);
     if (R.is_err[R.Void, str](vo)) { ctx_dnit(?ctx); ret vo; }
 
+    drop_self_copies_physical(tgt, ?ctx);
     record_callee_mask(tgt, ?ctx);
 
     val ro: R.Result[R.Void, str] = restore_order(?ctx);
@@ -2313,6 +2313,12 @@ fun special_gp_register(tgt: *target.Target, rid: i32) bool {
     ret false;
 }
 
+fun operand_bank_matches(op: *mir.MirOperand) bool {
+    val class: i32 = isa.regid_class(op.preg::i32);
+    ret (op.required_bank == mir.BANK_GP && class == isa.REG_CLASS_ID_GP)
+        || (op.required_bank == mir.BANK_FP && class == isa.REG_CLASS_ID_XMM);
+}
+
 fun verify_rewritten_operands(tgt: *target.Target, f: *mir.MirFunction) R.Result[R.Void, str] {
     var bi: u32 = 0;
     for (bi < f.block_count) {
@@ -2329,12 +2335,17 @@ fun verify_rewritten_operands(tgt: *target.Target, f: *mir.MirFunction) R.Result
                 if (op.kind == mir.MIR_OP_PREG && !rewritten_preg_ok(tgt, op.preg)) {
                     ret R.err[R.Void, str]("regalloc: a rewritten operand names a physical register outside every register class");
                 }
+                if (op.kind == mir.MIR_OP_PREG && !operand_bank_matches(op)) {
+                    ret R.err[R.Void, str]("regalloc: a rewritten register operand violates its selected bank constraint");
+                }
                 if (op.kind == mir.MIR_OP_MEM) {
-                    if (op.vreg == mir.MIR_VREG_NIL && !rewritten_preg_ok(tgt, op.preg)) {
-                        ret R.err[R.Void, str]("regalloc: a rewritten memory base names a physical register outside every register class");
+                    if (op.vreg == mir.MIR_VREG_NIL
+                        && (!rewritten_preg_ok(tgt, op.preg) || isa.regid_class(op.preg::i32) != isa.REG_CLASS_ID_GP)) {
+                        ret R.err[R.Void, str]("regalloc: a rewritten memory base is not a valid general-bank register");
                     }
-                    if (op.index != mir.MIR_VREG_NIL && op.index_is_preg && !rewritten_preg_ok(tgt, op.index)) {
-                        ret R.err[R.Void, str]("regalloc: a rewritten memory index names a physical register outside every register class");
+                    if (op.index != mir.MIR_VREG_NIL && op.index_is_preg
+                        && (!rewritten_preg_ok(tgt, op.index) || isa.regid_class(op.index::i32) != isa.REG_CLASS_ID_GP)) {
+                        ret R.err[R.Void, str]("regalloc: a rewritten memory index is not a valid general-bank register");
                     }
                 }
                 k = k + 1;
@@ -2639,6 +2650,7 @@ fun rewrite_instr(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
                 }
             }
         }
+        ops[k].required_bank = mi.operands[k].required_bank;
         k = k + 1;
     }
 
@@ -2646,7 +2658,8 @@ fun rewrite_instr(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
         && mi.width >= ctx.spill_width
         && instr_is_reg_copy(tgt, mi)
         && ops[0].kind == mir.MIR_OP_PREG && ops[1].kind == mir.MIR_OP_PREG
-        && ops[0].preg == ops[1].preg) {
+        && ops[0].preg == ops[1].preg
+        && operand_bank_matches(?ops[0]) && operand_bank_matches(?ops[1])) {
         free_ops(ctx, ops, n);
         if (mi.dbg_binding_count > 0) {
             dst[@wp].opcode            = isa.ISA_USE::mir.MirOpcode;
@@ -2727,10 +2740,14 @@ fun id_claimed(claimed: *i32, count: u32, id: i32) bool {
 }
 
 fun emit_reload(ctx: *AllocCtx, dst: *mir.MirInstr, wp: *u32, tmp: u32, v: u32, loc: source.SrcLoc, inline_site: u32) R.Result[R.Void, str] {
+    if (isa.regid_class(tmp::i32) != isa.REG_CLASS_ID_GP) {
+        ret R.err[R.Void, str]("regalloc: spill transport requires a general-bank scratch register");
+    }
     val ro: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
     if (R.is_err[*mir.MirOperand, str](ro)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](ro)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](ro);
     ops[0] = mir.op_preg(tmp);
+    ops[0].required_bank = mir.BANK_GP;
     ops[1] = mir.op_mem_slot(v, 0);
     dst[@wp].opcode        = mir.MIR_MOV;
     dst[@wp].operands      = ops;
@@ -2744,11 +2761,15 @@ fun emit_reload(ctx: *AllocCtx, dst: *mir.MirInstr, wp: *u32, tmp: u32, v: u32, 
 }
 
 fun emit_store(ctx: *AllocCtx, dst: *mir.MirInstr, wp: *u32, v: u32, tmp: u32, loc: source.SrcLoc, inline_site: u32) R.Result[R.Void, str] {
+    if (isa.regid_class(tmp::i32) != isa.REG_CLASS_ID_GP) {
+        ret R.err[R.Void, str]("regalloc: spill transport requires a general-bank scratch register");
+    }
     val ro: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
     if (R.is_err[*mir.MirOperand, str](ro)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](ro)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](ro);
     ops[0] = mir.op_mem_slot(v, 0);
     ops[1] = mir.op_preg(tmp);
+    ops[1].required_bank = mir.BANK_GP;
     dst[@wp].opcode        = mir.MIR_MOV;
     dst[@wp].operands      = ops;
     dst[@wp].operand_count = 2;
@@ -3790,6 +3811,7 @@ test "mach.lang.be.codegen.regalloc.verify_rewritten_operands:walks_the_program_
     f.blocks = ?blk[0];
     f.block_count = 1;
 
+    if (R.is_err[R.Void, str](rules.capture_operand_banks(?f, ?ins[0]))) { ret 1; }
     if (R.is_err[R.Void, str](verify_rewritten_operands(?tgt, ?f))) { ret 1; }
     ops[1] = mir.op_preg(isa.regid_make(isa.REG_CLASS_ID_GP, (gp + 40)::i32)::u32);
     if (R.is_ok[R.Void, str](verify_rewritten_operands(?tgt, ?f)))  { ret 2; }
@@ -3841,6 +3863,7 @@ fun t_spilled_update(mode: u32) i32 {
     } or (mode == 2) {
         ops[1] = mir.op_imm(100);
     }
+    if (R.is_err[R.Void, str](rules.capture_operand_banks(?f, ?mi))) { ret 8; }
     var dst: [5]mir.MirInstr;
     var written: u32 = 0;
     fin {
@@ -3850,6 +3873,10 @@ fun t_spilled_update(mode: u32) i32 {
             i = i + 1;
         }
     }
+    val wrong_scratch: u32 = isa.regid_make(isa.REG_CLASS_ID_XMM, 0)::u32;
+    if (R.is_ok[R.Void, str](emit_reload(?ctx, ?dst[0], ?written, wrong_scratch, 0, mi.loc, 0))) { free_ops(?ctx, ops, count); ret 9; }
+    if (R.is_ok[R.Void, str](emit_store(?ctx, ?dst[0], ?written, 0, wrong_scratch, mi.loc, 0))) { free_ops(?ctx, ops, count); ret 9; }
+    if (written != 0) { free_ops(?ctx, ops, count); ret 9; }
     val rr: R.Result[R.Void, str] = rewrite_instr(?tgt, ?ctx, ?mi, ?dst[0], ?written, false, 0);
     if (R.is_err[R.Void, str](rr)) { ret 2; }
     var slot: i64 = 40;
@@ -3859,6 +3886,11 @@ fun t_spilled_update(mode: u32) i32 {
     var i: u32 = 0;
     for (i < written) {
         val ins: *mir.MirInstr = ?dst[i];
+        var oi: u32 = 0;
+        for (oi < ins.operand_count) {
+            if (ins.operands[oi].kind == mir.MIR_OP_PREG && !operand_bank_matches(?ins.operands[oi])) { ret 8; }
+            oi = oi + 1;
+        }
         val a: *mir.MirOperand = ?ins.operands[0];
         val b: *mir.MirOperand = ?ins.operands[1];
         if (ins.opcode == mir.MIR_MOV) {
@@ -3908,5 +3940,74 @@ test "mach.lang.be.codegen.regalloc.rewrite_instr:spilled_update_reloads_previou
     if (repeated != 0) { ret 10 + repeated; }
     val pure: i32 = t_spilled_update(2);
     if (pure != 0) { ret 20 + pure; }
+    ret 0;
+}
+
+fun t_verify_bank_slots(tgt: *target.Target, opcode: mir.MirOpcode, bank0: mir.OperandBank,
+                       bank1: mir.OperandBank, bank2: mir.OperandBank, count: u32, vector: bool) i32 {
+    var expected: [3]mir.OperandBank;
+    expected[0] = bank0; expected[1] = bank1; expected[2] = bank2;
+    var ops: [3]mir.MirOperand;
+    var k: u32 = 0;
+    for (k < count) {
+        var class: i32 = isa.REG_CLASS_ID_GP;
+        if (expected[k] == mir.BANK_FP) { class = isa.REG_CLASS_ID_XMM; }
+        ops[k] = mir.op_preg(isa.regid_make(class, 1 + k::i32)::u32);
+        k = k + 1;
+    }
+    var mi: mir.MirInstr = mir.instr(opcode, ?ops[0], count, 8, 8);
+    if (vector) { mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, 4, 4); }
+    var blk: mir.MirBlock;
+    blk.instrs = ?mi; blk.instr_count = 1;
+    var f: mir.MirFunction;
+    f.blocks = ?blk; f.block_count = 1;
+    if (R.is_err[R.Void, str](rules.capture_operand_banks(?f, ?mi))) { ret 1; }
+    if (R.is_err[R.Void, str](verify_rewritten_operands(tgt, ?f))) { ret 2; }
+    k = 0;
+    for (k < count) {
+        val original: u32 = ops[k].preg;
+        var wrong: i32 = isa.REG_CLASS_ID_XMM;
+        if (expected[k] == mir.BANK_FP) { wrong = isa.REG_CLASS_ID_GP; }
+        ops[k].preg = isa.regid_make(wrong, 1 + k::i32)::u32;
+        if (R.is_ok[R.Void, str](verify_rewritten_operands(tgt, ?f))) { ret 3; }
+        ops[k].preg = original;
+        k = k + 1;
+    }
+    ops[0].required_bank = mir.BANK_UNKNOWN;
+    if (R.is_ok[R.Void, str](verify_rewritten_operands(tgt, ?f))) { ret 4; }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.regalloc.verify_rewritten_operands:enforces_individual_selected_banks" {
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](target.register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+    val tr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (R.is_err[target.Target, str](tr)) { ret 1; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+    if (t_verify_bank_slots(?tgt, mir.MIR_FADD, mir.BANK_FP, mir.BANK_FP, mir.BANK_FP, 3, false) != 0) { ret 2; }
+    if (t_verify_bank_slots(?tgt, mir.MIR_FCMP, mir.BANK_GP, mir.BANK_FP, mir.BANK_FP, 3, false) != 0) { ret 3; }
+    if (t_verify_bank_slots(?tgt, mir.MIR_FP_TO_SI, mir.BANK_GP, mir.BANK_FP, mir.BANK_UNKNOWN, 2, false) != 0) { ret 4; }
+    if (t_verify_bank_slots(?tgt, mir.MIR_SI_TO_FP, mir.BANK_FP, mir.BANK_GP, mir.BANK_UNKNOWN, 2, false) != 0) { ret 5; }
+    if (t_verify_bank_slots(?tgt, mir.MIR_MOV, mir.BANK_GP, mir.BANK_GP, mir.BANK_UNKNOWN, 2, false) != 0) { ret 6; }
+    if (t_verify_bank_slots(?tgt, mir.MIR_MOV, mir.BANK_FP, mir.BANK_GP, mir.BANK_UNKNOWN, 2, false) != 0) { ret 7; }
+    if (t_verify_bank_slots(?tgt, mir.MIR_MOV, mir.BANK_GP, mir.BANK_FP, mir.BANK_UNKNOWN, 2, false) != 0) { ret 8; }
+    if (t_verify_bank_slots(?tgt, mir.MIR_ADD, mir.BANK_FP, mir.BANK_FP, mir.BANK_FP, 3, true) != 0) { ret 9; }
+    var ops: [2]mir.MirOperand;
+    ops[0] = mir.op_preg(1); ops[1] = mir.op_mem_preg(tgt.model.stack_ptr_reg::u32, 0);
+    var mi: mir.MirInstr = mir.instr(mir.MIR_MOV, ?ops[0], 2, 8, 8);
+    var blk: mir.MirBlock; blk.instrs = ?mi; blk.instr_count = 1;
+    var f: mir.MirFunction; f.blocks = ?blk; f.block_count = 1;
+    if (R.is_err[R.Void, str](rules.capture_operand_banks(?f, ?mi))) { ret 10; }
+    if (R.is_err[R.Void, str](verify_rewritten_operands(?tgt, ?f))) { ret 11; }
+    ops[1].preg = isa.regid_make(isa.REG_CLASS_ID_XMM, 1)::u32;
+    if (R.is_ok[R.Void, str](verify_rewritten_operands(?tgt, ?f))) { ret 12; }
+    ops[1].preg = tgt.model.stack_ptr_reg::u32;
+    ops[1].index_is_preg = true;
+    ops[1].index = isa.regid_make(isa.REG_CLASS_ID_XMM, 1)::u32;
+    if (R.is_ok[R.Void, str](verify_rewritten_operands(?tgt, ?f))) { ret 13; }
+    if (R.is_ok[R.Void, str](alloc_function(?tgt, nil, ?f))) { ret 15; }
+    ops[1].index = 2;
+    if (R.is_err[R.Void, str](verify_rewritten_operands(?tgt, ?f))) { ret 14; }
     ret 0;
 }
