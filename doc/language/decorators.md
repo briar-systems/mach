@@ -170,6 +170,10 @@ modules without emitting extra definitions. Extraction, import and per-caller
 expansion each have a limit of 1024 copied IR instructions and 256 KiB of owned
 payload. `inline` overrides size and use-count heuristics within those limits.
 A remaining call or taken address still names the original defining function.
+Generic, comptime and pack specializations keep their existing shared weak
+linkage. When several modules materialize that same specialization, body import
+uses an already available definition or the first acquired provider of that
+linkage, and tracks that provider as a query dependency.
 Helpers referencing compiler-local literal pools retain their calls because those
 objects have module-local identity. Named globals keep their original symbols,
 and copied instructions preserve effects, assembly bindings and debug locations.
