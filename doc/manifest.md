@@ -510,7 +510,7 @@ reads the selected artifact's name.
 | `subsystem` | no | `"console"` (default) or `"gui"` — the environment a windows executable declares it runs under (see below). |
 | `icon` | no | Project-root-relative `.ico` path embedded in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
 | `manifest` | no | Project-root-relative application-manifest path embedded byte-for-byte in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
-| `default` | no | `true` marks the artifact chosen when a command needs one artifact (`mach test`, `mach run`, the editor's union build) and several declared artifacts support the selected target. Exactly one of those candidates may carry it; an explicit `--bin`/`--lib` always wins, and a sole candidate needs no marker. |
+| `default` | no | `true` marks the artifact chosen when a command needs one artifact (`mach test`, `mach run`, the editor's union build) and several declared artifacts support the selected target. Exactly one of those candidates may carry it; an explicit `--bin`/`--lib` always wins, and a sole candidate needs no marker. For dependency bare imports, a library requires this marker even when it is the sole artifact. See [public modules](language/modules.md#bare-project-id-imports). |
 
 `entry` is the build cell's source root. The build follows its active `use` and
 `fwd` edges transitively and compiles that reachable module set; another file under
@@ -879,8 +879,8 @@ registry-style `version =` is reserved and rejected
 The record of which commit a dependency is at is the **gitlink** committed in
 the root repository, generated into `.gitmodules` by `mach dep`. Nothing else
 records a pin: there is no `mach.lock`, and a `mach.lock` left over from an
-earlier release is not read. In 4.30.0 it is ignored; 5.0.0 rejects a project
-that carries one, with a diagnostic naming the migration.
+earlier release is rejected without reading it. Remove the file and retain
+the committed gitlinks as the dependency pins.
 
 A project does not need its own Git repository. In a repository root, Git
 dependencies use the staged gitlinks as their pins. In a filesystem project or a
@@ -987,20 +987,18 @@ top: among tagged releases at or above every tested floor and within one
 major, the highest is proposed; candidates spanning two majors are a clash.
 The proposal never bypasses a root override.
 
-### 4.30.0 and 5.0.0
+### Removed dependency forms
 
-4.30.0 accepts two older forms beside the ones above and notes the migration;
-5.0.0 rejects them:
-
-- an **alias key**, a `[dep.<key>]` whose realized project declares a
-  different id. 4.30.0 realizes it and prints
-  `note: [dep.foo] realizes project 'std'; rename the table to [dep.std] and
-  the directory to dep/std. alias keys are rejected in 5.0.0`;
-- **nested realization**, a `dep/<id>/dep/` left by an older tool; 4.30.0
-  ignores it;
-- `mach.lock`, ignored in 4.30.0 as above; `pull` prints
-  `note: mach.lock is not read; the committed gitlinks under dep/ are the
-  pins, so delete it. mach.lock is rejected in 5.0.0`.
+- An **alias key**, a `[dep.<key>]` whose realized project declares a different
+  id, is rejected. Rename the table and its directory under `dep/` to the
+  declared project id.
+- A **nested realization**, a nonempty dependency beneath `dep/<id>/dep/`, is
+  rejected. Dependencies are realized in the consuming project's flat `dep/`
+  directory. Empty directories are placeholders, not realized dependencies,
+  and remain permitted without requiring Git metadata.
+- A root `mach.lock` is rejected before dependency operations or compilation.
+  Remove it and use committed gitlinks as the pins. Inspection failures are
+  reported as errors, not treated as absence.
 
 Command-line usage (`pull`, `verify`, `add`, `update`, `remove`, `list`) is
 documented in [cli.md](cli.md#mach-dep).

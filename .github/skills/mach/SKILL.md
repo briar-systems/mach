@@ -46,9 +46,11 @@ A project has a `mach.toml` at its root; `[project] id` roots every module
 path. A file at `src/foo/bar.mach` in project `id = "myproj"` is the module
 `myproj.foo.bar`. There is no `this.` self-prefix - always use the full
 project-rooted path, including for sibling modules. A one-segment `use <id>;`
-resolves only when that project declares a `[project] module` surface file
-(e.g. a library `glfw` imported as `use glfw;`); `std` does not - always
-import full `std.*` paths.
+binds a dependency's public entry only when a `static` or `shared` artifact
+explicitly declares `default = true`. Multiple default libraries must share
+that entry. There is no `lib.mach` fallback. Full module paths work without
+an artifact declaration. The current project's own id binds the selected
+artifact's entry. Import std through its full `std.*` paths.
 
 An artifact build roots its module graph at `[artifact.*].entry` and compiles only
 that module plus its active transitive `use`/`fwd` dependencies. A sibling source

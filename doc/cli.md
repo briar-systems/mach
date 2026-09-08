@@ -530,7 +530,7 @@ transitive closure one level deep; and there is no lock file.
 | Action   | Args | Effect |
 |----------|------|--------|
 | `pull`   | `<path>` | restore existing Git dependencies to their recorded gitlinks and initialize empty gitlink checkouts. Realize missing declared dependencies, cloning Git sources or copying path sources as needed. Retain existing path copies. Use `update` to refresh them from their sources. |
-| `verify` | `<path>` | run the build's dependency checks as a command, closure and selectors included, and print `ok`, or the first failure. A stale `mach.lock` in the root is noted here as on `pull`, since this is where a user looks when something is wrong. |
+| `verify` | `<path>` | run the build's dependency checks as a command, closure and selectors included, and print `ok`, or the first failure. A root `mach.lock` is refused before verification, as on other dependency commands. |
 | `add`    | `<path> <name> (--git <url> [--ref <ref>] \| --path <dir>)` | validate the candidate declaration, realize its dependency closure, then publish `[dep.<name>]` in `mach.toml`. Git stages `.gitmodules` and gitlinks. Nothing is committed. |
 | `update` | `<path> (<name> \| --all)` | advance `branch/` selectors to their current remote tips and re-stage the gitlinks; move an identity to the exact selector the root declares for it (`b: <old> -> <new> (pinned to the exact selector)`, or `(exact selector, already pinned)` when nothing moves). |
 | `remove` | `<path> <name> [--purge]` | remove a Git dependency’s registration from the index and `.gitmodules` when no longer required, then publish the manifest without its declaration. The checkout is retained unless `--purge` is given. |
@@ -638,15 +638,14 @@ the identity at the root to override`), except for an identity the root
 declares with a `tag/`, whose gitlink is the pin; the rules are in
 [manifest.md](manifest.md#what-a-build-verifies).
 
-### 4.30.0 and 5.0.0
+### Removed dependency forms
 
-A `[dep.<key>]` whose realized project declares a different id is an **alias
-key**. 4.30.0 realizes it and prints a migration note
-(`note: [dep.foo] realizes project 'std'; rename the table to [dep.std] and the
-directory to dep/std. alias keys are rejected in 5.0.0`). A `mach.lock` from
-an earlier release is not read; `pull` prints `note: mach.lock is not read;
-the committed gitlinks under dep/ are the pins, so delete it. mach.lock is
-rejected in 5.0.0`.
+A `[dep.<key>]` whose realized project declares a different id is rejected.
+Rename the table and directory under `dep/` to the declared project id.
+Nonempty nested dependencies beneath `dep/<id>/dep/` are also rejected.
+Remove those nested copies and use the consuming project's flat `dep/`.
+Empty directories remain valid placeholders. A root `mach.lock` is rejected
+without reading it. Remove it and retain committed gitlinks as dependency pins.
 
 Exit codes: `0` ok, `1` user error, `2` internal error, `3` environmental
 error (git missing or a git operation that failed).
@@ -684,7 +683,7 @@ exports the `main` symbol.
 |----------------|-------|--------|
 | `--name <id>`  | id    | project id (default: the last path component of `[dir]`, so `mach init /work/ia`, `mach init ib/`, and `mach init .` name the project `ia`, `ib`, and the current directory's name) |
 | `--force`      | —     | scaffold even when `mach.toml` or `src` already exists |
-| `--lib`        | —     | library layout: `src/lib.mach` and one `static` `[artifact.<id>]` |
+| `--lib`        | —     | library layout: `src/lib.mach` and one `static` `[artifact.<id>]` with `default = true` |
 | `--no-deps`    | —     | publish the scaffold and declare its dependencies without realizing them; a later `mach dep pull` realizes them (`dependencies declared but not realized; run `mach dep pull <path>` to realize them`) |
 | `--no-git`     | —     | skip repository initialization and submodule registration, using plain dependency checkouts instead |
 | `--quiet`, `-q`| —     | suppress non-error output |

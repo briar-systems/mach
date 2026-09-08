@@ -15,20 +15,33 @@ syntactically uniform regardless of where it appears.
 
 ## Bare project-id imports
 
-A one-segment `use`/`fwd` path equal to a resolvable project id — a dependency's
-id or the current project's own id — binds that project's **public module**,
-the module its artifacts enter at. For a dependency that is the `entry` its
-artifacts share: `std` declares one `static` artifact with
-`entry = "lib/libstd.mach"`, so `use std;` binds the module `std.lib.libstd`.
-For the current project it is the selected artifact's entry. A dependency
-whose artifacts name different entries has no single public module, and a
-bare import of it is an error (`project 'x' has no public module because its
-artifacts name different entries; import a full path, or give every
-[artifact.*] table in its manifest the same entry`). Longer paths are
-unaffected. A dependency that declares no artifact at all falls back to
-`lib.mach` (`dep 'lib1' mach.toml: default entry names no file` when that
-file is absent); the fallback is removed in 5.0.0, so a library should
-declare its artifact.
+A one-segment `use`/`fwd` path equal to a dependency's project id binds its
+explicit public module. Declare a `static` or `shared` artifact with
+`default = true` to select its `entry` as that module:
+
+```toml
+[artifact.api]
+kind = "static"
+default = true
+entry = "api.mach"
+out = "lib/api{artifact.suffix}"
+targets = ["*"]
+link = []
+need = []
+```
+
+For a dependency with `id = "example"`, `use example;` now binds
+`example.api`. Nondefault artifacts and executable entries do not select a
+dependency's public module. If several library artifacts are explicitly
+defaulted, they must share the same entry for a bare import to be unambiguous.
+
+Without an explicit public entry, import full module paths such as
+`use example.api;`. Source-only dependencies may omit artifacts entirely.
+There is no implicit `lib.mach` entry, even when that file exists, and a sole
+library artifact still needs `default = true` to expose a bare import.
+
+A bare import of the current project's own id binds the selected artifact's
+entry. Longer paths are unaffected by public entry selection.
 
 ## Shadow-module pattern
 

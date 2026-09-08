@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- Implicit dependency public entries. Bare imports require an explicitly defaulted
+  library artifact, and source-only dependencies use full module paths.
+
+- Dependency alias keys, nonempty nested dependency realizations, and root
+  `mach.lock` files. Empty dependency placeholders remain permitted.
+
 - Legacy declassification spellings `:^` and `:^T`. Use `:>T` with an explicit
   public result type, including pointer and array types. Ordinary `::^T` casts remain.
 
