@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Dependency names follow the path. Missing or extra operands are refused.
   Use `.` for the current project. Pull retains existing local copies and update
   refreshes them. Dependency commands preserve the project's Git history.
+- Removed the ignored manifest keys `[project].name`, `description`, `mach`, and `[profile.*].emit_ir`/`emit_asm`. Use the CLI emission switches for side artifacts.
 
 - Root and dependency manifests share one strict schema. Profiles explicitly declare all compilation policy, and ambiguous target, profile, or artifact selections require a selector or a declared default.
 - Manifest requirements use explicit `step.<name>` and `artifact.<name>` categories, including category-specific globs. Step cycles are rejected during manifest parsing.

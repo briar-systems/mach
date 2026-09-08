@@ -110,8 +110,8 @@ ref = "branch/main"
 | `out`     | string | The output-path template root, referenced as `{project.out}` by artifact `out`, step paths, and `cmd`s. Expanded over `{target.name}`/`{target.isa}`/`{target.os}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). |
 
 `[project]` uses exactly these four keys. The unused `name`, `description`,
-`mach`, and profile `emit_ir`/`emit_asm` keys currently produce deprecation
-warnings. Their v5 removal is tracked in #3129. Use the command-line
+`mach`, and profile `emit_ir`/`emit_asm` keys are rejected as unknown keys.
+Use the command-line
 `--emit-ir` and `--emit-asm` switches for side artifacts.
 
 ## `[target.<name>]`
