@@ -178,7 +178,13 @@ an `iretq` are unreachable without the compiler saying so.
 ## Raw encodings
 
 Four data directives emit their values verbatim, for an encoding the ISA's mnemonic
-table does not name. They work on every target:
+table does not name.
+
+For a RISC-V target, canonical extension selection constrains generated code and
+named assembly instructions. Raw directives intentionally remain opaque and
+unchecked for extension compatibility, including when `writes(...)` is present.
+Their author must ensure that the selected machine can execute those bytes.
+They work on every target:
 
 ```mach
 asm x86_64 {

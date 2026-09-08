@@ -3,6 +3,8 @@ use std.collections.sort;
 use std.collections.vector;
 use std.format;
 use fs: std.filesystem;
+use io_error: std.io.error;
+use txn: std.filesystem.transaction;
 use std.collections.vector.Vector;
 use std.text.string.str_free;
 use std.types.bool.bool;
@@ -31,6 +33,7 @@ use mach.lang.fe.ast.id;
 use mach.lang.fe.ast.module;
 use mach.lang.fe.token;
 use mach.lang.intern;
+use mach.lang.fail;
 use mach.lang.manifest;
 use mach.lang.session;
 use src: mach.lang.source;
@@ -95,36 +98,40 @@ pub fun load_all_own_src(p: *project.Project) R.Result[R.Void, str] {
     ret R.ok_void[str]();
 }
 
+fun directory_cleanup_result(alloc: *A.Allocator, result: R.Result[R.Void, str], code: i64) R.Result[R.Void, str] {
+    if (code >= 0) { ret result; }
+    if (R.is_ok[R.Void, str](result)) { ret R.err[R.Void, str](sysos.message(code)); }
+    val message: R.Result[str, str] = format.sprint(alloc, "{}; directory cleanup failed: {} (code {})",
+        R.unwrap_err[R.Void, str](result), sysos.message(code), code);
+    if (R.is_err[str, str](message)) { ret R.err[R.Void, str](R.unwrap_err[str, str](message)); }
+    ret R.err[R.Void, str](R.unwrap_ok[str, str](message));
+}
+
 fun collect_src_modules(p: *project.Project, dir_abs: str, src_prefix_len: usize, id_text: str, out: *vector.Vector[SrcMod]) R.Result[R.Void, str] {
     val fd_raw: i64 = sysos.open(sysos.AT_FDCWD, dir_abs, sysos.O_RDONLY | sysos.O_DIRECTORY, 0);
     if (fd_raw < 0) { ret R.err[R.Void, str](sysos.message(fd_raw)); }
     val fd: i32 = fd_raw::i32;
 
-    var dbuf: [8192]u8;
-    var result: R.Result[R.Void, str] = R.ok_void[str]();
-    var reading: bool = true;
-    for (reading) {
-        val n: i64 = sysos.read_dir(fd, (?dbuf[0])::*sysos.dirent64, 8192);
-        if (n < 0)  { result = R.err[R.Void, str](sysos.message(n)); reading = false; }
-        or (n == 0) { reading = false; }
-        or {
-            var pos: usize = 0;
-            for (reading && pos < n::usize) {
-                val ent:    *sysos.dirent64 = ((?dbuf[0])::usize + pos)::*sysos.dirent64;
-                val reclen: usize           = ent.d_reclen::usize;
-                if (reclen == 0) { reading = false; }
-                or {
-                    val name: *u8 = ?ent.d_name[0];
-                    if (!is_hidden_name(name)) {
-                        val rr: R.Result[R.Void, str] = visit_src_entry(p, dir_abs, name::str, src_prefix_len, id_text, out);
-                        if (R.is_err[R.Void, str](rr)) { result = rr; reading = false; }
-                    }
-                    pos = pos + reclen;
-                }
-            }
-        }
+    var cursor: sysos.DirectoryCursor = sysos.DirectoryCursor{};
+    val initialized: sysos.DirectoryInitResult = sysos.directory_init(?cursor, fd);
+    if (initialized.code < 0) {
+        var failed: R.Result[R.Void, str] = R.err[R.Void, str](sysos.message(initialized.code));
+        failed = directory_cleanup_result(p.alloc, failed, initialized.cleanup_code);
+        ret directory_cleanup_result(p.alloc, failed, sysos.close(fd));
     }
-    sysos.close(fd);
+    var result: R.Result[R.Void, str] = R.ok_void[str]();
+    for {
+        var entry: sysos.DirectoryEntry;
+        val next: i64 = sysos.directory_next(?cursor, ?entry);
+        if (next < 0) { result = R.err[R.Void, str](sysos.message(next)); brk; }
+        if (next == 0) { brk; }
+        if (!is_hidden_name(entry.name::*u8)) {
+            result = visit_src_entry(p, dir_abs, entry.name, src_prefix_len, id_text, out);
+        }
+        if (R.is_err[R.Void, str](result)) { brk; }
+    }
+    result = directory_cleanup_result(p.alloc, result, sysos.directory_close(?cursor));
+    result = directory_cleanup_result(p.alloc, result, sysos.close(fd));
     ret result;
 }
 
@@ -173,7 +180,7 @@ fun warn_union_target_skipped(p: *project.Project, os_name: str, isa_name: str, 
     var span: token.Span;
     span.offset = 0;
     span.len    = 0;
-    diagnostic.record_warning(?p.s.diags, 0xFFFFFFFF::src.FileId, span, buf);
+    diagnostic.record_warning(?p.diags, 0xFFFFFFFF::src.FileId, span, buf);
 
     str_free(p.alloc, buf);
 }
@@ -546,21 +553,53 @@ fun register_ext_global(p: *project.Project, mid: session.ModuleId, source: str,
 }
 
 pub fun register_embed_inputs(p: *project.Project) R.Result[R.Void, str] {
+    var paths: vector.Vector[str] = vector.init[str](p.s.alloc);
+    fin {
+        var i: usize = 0;
+        for (i < paths.len) { str_free(p.s.alloc, paths.data[i]); i = i + 1; }
+        vector.dnit[str](?paths);
+    }
     var i: u32 = 0;
     for (i < p.module_len) {
         val m: *project.ModuleEntry = ?p.modules[i];
         val m_opt: O.Option[*module.Module] = ast.get_module(m.a, m.a.root_module);
         if (O.is_some[*module.Module](m_opt)) {
             val mod_node: *module.Module = O.unwrap[*module.Module](m_opt);
-            val r: R.Result[R.Void, str] = refresh_embeds_in(p, m, mod_node.decls_start, mod_node.decls_len);
+            val r: R.Result[R.Void, str] = collect_embeds_in(p, m, mod_node.decls_start, mod_node.decls_len, ?paths);
             if (R.is_err[R.Void, str](r)) { ret r; }
         }
         i = i + 1;
     }
+    var pi: usize = 0;
+    for (pi < paths.len) {
+        val refreshed: R.Result[intern.StrId, embed.EmbedError] = embed.refresh(?p.s.embeds, ?p.s.queries, ?p.s.interner, paths.data[pi]);
+        if (R.is_err[intern.StrId, embed.EmbedError](refreshed)) {
+            val error: embed.EmbedError = R.unwrap_err[intern.StrId, embed.EmbedError](refreshed);
+            if (O.is_some[io_error.Error](error.native)) {
+                val native: io_error.Error = O.unwrap[io_error.Error](error.native);
+                embed_io_error(p, paths.data[pi], "file I/O", io_error.message(native));
+                if (native.cleanup_code != 0) { embed_io_error(p, paths.data[pi], "native cleanup", sysos.message(native.cleanup_code)); }
+            }
+            if (O.is_some[io_error.Error](error.file_cleanup)) { embed_io_error(p, paths.data[pi], "file close", io_error.message(O.unwrap[io_error.Error](error.file_cleanup))); }
+            if (O.is_some[txn.Error](error.parent_cleanup)) { embed_io_error(p, paths.data[pi], "directory close", txn.error_message(O.unwrap[txn.Error](error.parent_cleanup))); }
+            ret R.err[R.Void, str](error.message);
+        }
+        pi = pi + 1;
+    }
     ret R.ok_void[str]();
 }
 
-fun refresh_embeds_in(p: *project.Project, m: *project.ModuleEntry, start: u32, len: u32) R.Result[R.Void, str] {
+fun embed_io_error(p: *project.Project, path: str, owner: str, reason: str) {
+    val formatted: R.Result[str, str] = format.sprint(p.s.alloc, "embed {} for '{}' failed: {}", owner, path, reason);
+    if (R.is_err[str, str](formatted)) { diagnostic.note_lost(?p.diags); ret; }
+    val message: str = R.unwrap_ok[str, str](formatted);
+    fin { str_free(p.s.alloc, message); }
+    var span: token.Span;
+    span.offset = 0; span.len = 0;
+    diagnostic.record_error(?p.diags, src.FILE_NIL, span, message);
+}
+
+fun collect_embeds_in(p: *project.Project, m: *project.ModuleEntry, start: u32, len: u32, paths: *vector.Vector[str]) R.Result[R.Void, str] {
     var i: u32 = 0;
     for (i < len) {
         val did: id.DeclId = m.a.decl_ids[start + i];
@@ -573,7 +612,7 @@ fun refresh_embeds_in(p: *project.Project, m: *project.ModuleEntry, start: u32, 
             var b: u32 = 0;
             for (b < d.data.comptime_if.branches_len) {
                 val br: *decl.ComptimeBranch = ?m.a.comptime_branches[d.data.comptime_if.branches_start + b];
-                val r: R.Result[R.Void, str] = refresh_embeds_in(p, m, br.body_start, br.body_len);
+                val r: R.Result[R.Void, str] = collect_embeds_in(p, m, br.body_start, br.body_len, paths);
                 if (R.is_err[R.Void, str](r)) { ret r; }
                 b = b + 1;
             }
@@ -585,7 +624,7 @@ fun refresh_embeds_in(p: *project.Project, m: *project.ModuleEntry, start: u32, 
         for (di < d.decorators_len) {
             val dec: *decl.Decorator = ?m.a.decorators[d.decorators_start + di];
             if (embed_named(p, m, dec)) {
-                val r: R.Result[R.Void, str] = refresh_one(p, m, dec);
+                val r: R.Result[R.Void, str] = collect_embed_path(p, m, dec, paths);
                 if (R.is_err[R.Void, str](r)) { ret r; }
             }
             di = di + 1;
@@ -602,7 +641,7 @@ fun embed_named(p: *project.Project, m: *project.ModuleEntry, dec: *decl.Decorat
     ret str_region_equals(source, dec.name.offset, dec.name.len, "embed");
 }
 
-fun refresh_one(p: *project.Project, m: *project.ModuleEntry, dec: *decl.Decorator) R.Result[R.Void, str] {
+fun collect_embed_path(p: *project.Project, m: *project.ModuleEntry, dec: *decl.Decorator, paths: *vector.Vector[str]) R.Result[R.Void, str] {
     val src_opt: O.Option[*src.SourceFile] = src.get(?p.s.sources, m.file_id);
     if (O.is_none[*src.SourceFile](src_opt)) { ret R.ok_void[str](); }
     val f: *src.SourceFile = O.unwrap[*src.SourceFile](src_opt);
@@ -617,12 +656,22 @@ fun refresh_one(p: *project.Project, m: *project.ModuleEntry, dec: *decl.Decorat
     val arg_opt: O.Option[str] = intern.lookup(?p.s.interner, R.unwrap_ok[intern.StrId, str](ir));
     if (O.is_none[str](arg_opt)) { ret R.ok_void[str](); }
 
-    val pr: R.Result[str, str] = embed.resolve_arg(p.s.alloc, ?p.s.embeds, f.path, O.unwrap[str](arg_opt));
-    if (R.is_err[str, str](pr)) { ret R.ok_void[str](); }
-    val resolved: str = R.unwrap_ok[str, str](pr);
+    val pr: R.Result[str, manifest.TemplateError] = embed.resolve_arg(p.s.alloc, ?p.s.embeds, f.path, O.unwrap[str](arg_opt));
+    if (R.is_err[str, manifest.TemplateError](pr)) {
+        val e: manifest.TemplateError = R.unwrap_err[str, manifest.TemplateError](pr);
+        if (e.kind == fail.INTERNAL) {
+            fail.internal(?m.load_status, e.message);
+            ret R.err[R.Void, str](e.message);
+        }
+        manifest.template_error_dnit(p.s.alloc, e);
+        ret R.ok_void[str]();
+    }
+    val resolved: str = R.unwrap_ok[str, manifest.TemplateError](pr);
 
-    val rr: R.Result[intern.StrId, str] = embed.refresh(?p.s.embeds, ?p.s.queries, ?p.s.interner, resolved);
-    str_free(p.s.alloc, resolved);
-    if (R.is_err[intern.StrId, str](rr)) { ret R.err[R.Void, str](R.unwrap_err[intern.StrId, str](rr)); }
+    val saved: R.Result[usize, str] = vector.push[str](paths, resolved);
+    if (R.is_err[usize, str](saved)) {
+        str_free(p.s.alloc, resolved);
+        ret R.err[R.Void, str](R.unwrap_err[usize, str](saved));
+    }
     ret R.ok_void[str]();
 }

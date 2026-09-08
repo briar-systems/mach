@@ -6,7 +6,7 @@ mach <command> [options]
 
 The compiler dispatches on `argv[1]`. With no command, or an unknown one, it
 prints usage and exits `1`. The project commands — `build`, `run`, `test`,
-`clean`, and `doc` — take the project as a **required** positional: a directory
+`clean`, `fmt`, and `doc` — take the project as a **required** positional: a directory
 containing `mach.toml`, or the path of a `mach.toml` itself. Nothing is
 searched for: `mach build src` inside a project is `error: no mach.toml in the
 project directory`, and a bare invocation with no path is a user error.
@@ -43,6 +43,7 @@ argument forwarding.
 | `build` | compile the project to objects and (for a `bin` artifact) a linked binary |
 | `run`   | execute the already-built binary (a post-`build` convenience, not a rebuild) |
 | `test`  | build the test binary and run the collected tests |
+| `fmt`   | format only the project’s declared source, or check it without writing |
 | `clean` | remove the project's build output directory trees |
 | `dep`   | realize, verify, and change the project's dependencies under `dep/` |
 | `init`  | scaffold a new project |
@@ -86,6 +87,27 @@ unknown flag).
 > `mach dep`, `mach init`, and `mach clean` do not use the shared config
 > parser; they read only their own flags listed below.
 
+## `mach check`
+
+```text
+mach check <path> [--target <name>] [--profile <name>] [--bin <name> | --lib <name>] [-v | -vv | --quiet]
+```
+
+Checks syntax, name resolution, types and comptime for the same selected artifacts
+and imported source as `mach build`. Unreferenced files outside the selected
+artifact graph are not checked. Artifact and target defaults follow build selection.
+
+Check uses the shared frontend and its explicit accepted, rejected and internal
+failure outcomes. It does not lower, generate code, link, execute build steps or
+produce output files. Generated source and embedded inputs must already exist.
+Missing inputs are reported as errors. Run the appropriate build explicitly to
+produce them. A successful check does not establish backend, machine-code or link
+correctness.
+
+Exit status is 0 for accepted source, 1 for user rejection, 2 for internal failure
+and 3 for environment failure. Diagnostics retain the same locations and
+classifications as the corresponding frontend build.
+
 ## `mach build`
 
 ```
@@ -116,11 +138,44 @@ and the module tree is the artifact, so `mach build --target <spirv-target>` and
 There is no executable to link, no archive or shared-library form, and no test
 dispatcher to run; each is refused by name rather than attempted.
 
+Relocatable object output preserves explicit section names, native flags and
+section associations, including empty sections. Symbols retain local, global,
+weak, common and absolute definitions. A relocatable combination remaps section,
+symbol and relocation references without applying final executable layout or
+removing debug sections. `--emit obj` still delivers the per-module object tree
+described above, rather than combining that tree into one file.
+
+ELF section groups and Mach-O difference relocations and indirect-symbol tables
+retain their native relations. COFF DLL-attributed imports use native import
+tables and code thunks, preserving named or ordinal lookup and public aliases.
+Unrelated sections remain intact. Native metadata belongs to its object format:
+an output writer rejects metadata from another format, and ELF or Mach-O
+relocatable output rejects provider-attributed imports it cannot represent.
+
+Mach-O may combine eligible compiler-generated default data sections, but keeps
+explicit placements and parsed native sections distinct. An output requiring
+more than 255 distinct Mach-O sections is refused. COFF common symbols use its
+size-derived alignment, capped at 32 bytes, and reject an explicit alignment
+that the native common-symbol form cannot preserve.
+
+Final linking resolves absolute symbol values without treating them as external
+references or adding a loader base adjustment. Native Mach-O indirect-only
+sections currently require relocatable output. Position-independent links also
+reject absolute-address expressions that require an unsupported runtime base
+adjustment, including differences between absolute and image-relative symbols.
+
 The optimisation pipeline comes from the selected profile's `opt` — the profile
 is how a build picks its optimisation level.
 
-`--explain` resolves the full build plan — the (target, artifact) matrix and each
-unit's inputs — prints it, and exits without compiling or linking.
+`--plan` resolves the full build plan — the (target, artifact) matrix and each
+unit's entry, output paths, ordered local and dependency-export prerequisite
+steps, and local and dependency-export link requirements,
+prints it, and exits without fetching dependencies, running generators, compiling
+or linking. Realized dependency manifests and content are validated through the
+normal configuration path, including dependency cycles. Missing realized
+dependencies are errors. Generated
+input bytes remain unresolved until their prerequisites run. The plan does not
+claim those bytes or the final link are valid.
 
 | Flag           | Value          | Effect |
 |----------------|----------------|--------|
@@ -128,15 +183,38 @@ unit's inputs — prints it, and exits without compiling or linking.
 | `-O2`          | —              | select the release pipeline, overriding the selected profile's `opt`; it includes loop auto-vectorization on a vector-capable target (the profile's `vectorize` key and the `#[scalar]` decorator opt out). `-O1` is rejected on every command with one message (`-O1 was removed; use -O0 or -O2`) until a distinct pipeline exists |
 | `-g`           | —              | emit debug info for this build, forcing the selected profile's `debug` on (precedence `-g` > profile > off) |
 | `--emit <kind>`| `obj`\|`exe`   | `obj` stops at the relocatable objects; `exe` (default) links a binary |
+| `--no-cache`   | none           | disable persistent compiler products and build-step reuse for this invocation |
 | `--jobs <n>`   | count          | codegen worker threads (default: host CPUs; `1` serialises) |
 | `--pie`        | —              | emit a position-independent (ET_DYN) executable for ASLR instead of the default fixed-address one; opt-in (see below) |
 | `--subsystem <k>` | `console`\|`gui` | the environment a windows executable declares it runs under, overriding the artifact's `subsystem` key (see below) |
 | `-L <dir>`     | dir            | add a search directory for `-l`-resolved inputs; repeatable |
 | `-l <name>`    | name           | link a named object, archive, or target-format shared library, resolved through the `-L` dirs (see below); repeatable |
-| `--explain`    | —              | print the resolved build plan and exit without building |
+| `--plan`    | —              | print the resolved build plan and exit without building |
 | *(positional)* | input path     | a bare argument that contains `/`, ends in `.o` / `.obj` / `.a` / `.lib`, or names a `.so`, `.dylib`, or `.dll` is linked explicitly |
 
 Plus the global flags above.
+
+Successful code generation stores serializable object images in `.mach-cache`
+under the selected project output directory. A later compiler process can reuse
+those images. The frontend and lowering still run, and linking still resolves and
+validates its current inputs. The key includes the running compiler's file digest,
+the selected build configuration, active source graph including dependency and
+generic bodies, embedded bytes, and executed build-step inputs and tools. A change
+to any source in the active build cell currently invalidates that cell's objects.
+
+`mach build . --no-cache` and `mach test . --no-cache` neither read nor write
+persistent object entries or build-step stamps. They also force declared build
+steps to execute. `-vv` reports each reused image as `cached object`.
+
+A missing, corrupt, locked, or inaccessible cache falls back to compilation.
+Allocation failures and internal compiler failures remain errors. Each cache
+holds at most 512 MiB of logical entry bytes, with at most one additional staged
+entry during publication. Individual entries and decoded image owners are limited
+to 64 MiB each. Filesystem metadata, allocation-unit overhead, and the compiler's
+other live state are separate from those limits. Eviction removes private cache
+entries under a short exclusive lock. Cache operations never fetch dependencies
+or modify Git state.
+
 
 `--pie` is an opt-in: without it, a linux executable links fixed-address
 (`ET_EXEC`) exactly as before — a normal build is byte-identical. With it, the
@@ -405,10 +483,11 @@ bin p1-windows)`, `no bin named 'nosuch'`, `no profile named 'nosuch'`.
 
 | Flag                | Value   | Effect |
 |---------------------|---------|--------|
+| `--no-cache`        | none    | disable persistent compiler products and build-step reuse while compiling tests |
 | `--jobs <n>`        | count   | run up to `<n>` test processes at once **and** size the build's codegen workers (default: the CPUs available; 1 serializes) |
 | `--filter <pattern>`| pattern | run only tests whose name contains `<pattern>` |
 | `--include-deps`    | —       | also collect tests declared in dependency modules |
-| `--list`            | —       | list the collected tests and exit |
+| `--list`            | —       | collect and list tests without code generation or linking |
 | `--format <mode>`   | `human`\|`json` | output format: the live readout (default `human`), or the machine-readable JSON event stream |
 | `--runner <cmd>`    | command | launch every test as `<cmd> <exe> <idx>` instead of exec'ing the dispatcher directly |
 | `--timeout_seconds <n>` | count | terminate a test process and its process group after `<n>` seconds (default: unbounded) |
@@ -488,7 +567,7 @@ on an allocator or io failure.
 ## `mach dep`
 
 ```
-mach dep <action> [args]
+mach dep <action> <path> [args]
 ```
 
 Realizes, verifies, and changes the project's dependencies under `dep/`.
@@ -496,28 +575,46 @@ Dispatches on `argv[2]`. The model it operates is documented in
 [manifest.md](manifest.md#depid): a dependency is named by its project id in
 the manifest key, the directory, and source alike; a `git` dependency is a git
 **submodule** at `dep/<id>/` whose committed gitlink is the pin; a `path`
-dependency is copied in as tracked files; the root's `dep/` holds the whole
+dependency is copied in as ordinary files; the root's `dep/` holds the whole
 transitive closure one level deep; and there is no lock file.
 
 | Action   | Args | Effect |
 |----------|------|--------|
-| `pull`   | `[<path>]` | realize the committed dependency closure without changing anything: check out every gitlink at its committed commit, one level deep, initializing a gitlink a fresh clone left as an empty directory (`realized std @ <commit> (initialized the committed gitlink)`). Never fetches anything new and never reads a `path` source. Idempotent. |
-| `verify` | `[<path>]` | run the build's dependency checks as a command, closure and selectors included, and print `ok`, or the first failure. A stale `mach.lock` in the root is noted here as on `pull`, since this is where a user looks when something is wrong. |
-| `add`    | `<name> (--git <url> [--ref <ref>] \| --path <dir>)` | declare `[dep.<name>]`, realize it and every identity it transitively requires, and stage the manifest, `.gitmodules`, and gitlinks as one transaction. Nothing is committed. A failure (a clash, a git error) leaves the index, the manifest, and `.gitmodules` byte-identical and no `dep/<name>` behind. |
-| `update` | `<name> \| --all` | advance `branch/` selectors to their current remote tips and re-stage the gitlinks; move an identity to the exact selector the root declares for it (`b: <old> -> <new> (pinned to the exact selector)`, or `(exact selector, already pinned)` when nothing moves). |
-| `remove` | `<name> [--purge]` | drop the declaration from `mach.toml` (and the gitlink from `.gitmodules`); `--purge` also deletes `dep/<name>/`. |
-| `list`   | — | print each realized dependency with its source, selector, pinned commit, and state (`realized`/`missing`). |
+| `pull`   | `<path>` | restore existing Git dependencies to their recorded gitlinks and initialize empty gitlink checkouts. Realize missing declared dependencies, cloning Git sources or copying path sources as needed. Retain existing path copies. Use `update` to refresh them from their sources. |
+| `verify` | `<path>` | run the build's dependency checks as a command, closure and selectors included, and print `ok`, or the first failure. A root `mach.lock` is refused before verification, as on other dependency commands. |
+| `add`    | `<path> <name> (--git <url> [--ref <ref>] \| --path <dir>)` | validate the candidate declaration, realize its dependency closure, then publish `[dep.<name>]` in `mach.toml`. Git stages `.gitmodules` and gitlinks. Nothing is committed. |
+| `update` | `<path> (<name> \| --all)` | advance `branch/` selectors to their current remote tips and re-stage the gitlinks; move an identity to the exact selector the root declares for it (`b: <old> -> <new> (pinned to the exact selector)`, or `(exact selector, already pinned)` when nothing moves). |
+| `remove` | `<path> <name> [--purge]` | remove a Git dependency’s registration from the index and `.gitmodules` when no longer required, then publish the manifest without its declaration. The checkout is retained unless `--purge` is given. |
+| `list`   | `<path>` | print each realized dependency with its source, selector, pinned commit, and state (`realized`/`missing`). |
+
+Dependency changes use Git's normal submodule and index operations. Validation
+rejects conflicts that can be determined before those operations begin. A remote
+fetch, checkout, newly discovered transitive conflict, or manifest publication can
+still fail after an earlier operation succeeds. Mach stops, reports the failed
+operation and completed work, and leaves Git's state available for inspection.
+It does not restore an earlier index or recursively erase partial checkouts.
+Use `git status` and inspect the named dependency before retrying.
+
+`mach.toml` is published only after the requested dependency operations succeed.
+Its contents are replaced atomically with the complete old or new file. An error
+can occur after replacement, so inspect `mach.toml` when publication reports an
+error. Completed Git operations remain. Concurrent Mach manifest
+edits are serialized. Git provides its own locking for each Git operation.
+Directories outside the resulting closure are reported and retained for explicit
+removal.
 
 `sync` is the pre-`pull` name, kept as a deprecated alias of `pull`.
 
-`--quiet`/`-q` suppresses routine output on every action. `pull` and `verify`
-take a project directory or manifest path, resolved by the same rules as
-`mach build <path>`, and default to the current directory when none is given.
-`add`, `remove`, `update`, and `list` act on the current directory's project
-and do not search upward (`error: no mach.toml in the project directory`).
+Every action requires its project directory or manifest path as the first
+positional operand, resolved by the same rules as `mach build <path>`. Write `.`
+for the current project. A dependency name follows the project path, for example
+`mach dep update ../app widget`. Relative local dependency sources are resolved
+from the selected project's manifest directory. Extra operands, missing option
+values and repeated source options are refused.
+`--quiet`/`-q` suppresses routine output on every action.
 
 ```
-$ mach dep list
+$ mach dep list .
   std  git=https://github.com/briar-systems/mach-std  ref=branch/main  pin=74ce8f4e65943172274f523e6bbe3a638ae3fadc  realized
 $ mach dep verify .
 ok
@@ -535,10 +632,9 @@ tag/<name>, or commit/<full-object-id>`). `--ref` is valid only with `--git`;
 
 `mach build` never requires the network: a project whose `dep/` is realized
 builds offline, and the build never fetches and never writes under `dep/`.
-The build does require **git**, since the pin it verifies is a gitlink: a root
-that is not inside a git repository does not build (`dependency 'std': project
-root '...' is not inside a Git repository; dependency realization is verified
-from Git`). Only `pull`, `update`, and `add` reach the network, through git
+A project and its local path dependencies do not need a Git repository or index.
+Git dependencies require **git** for offline checkout and pin verification. Only
+`pull`, `update`, and `add` reach the network, through git
 discovered on `PATH` and invoked with an allowlisted environment (`PATH`,
 `HOME`, the common git/ssh/proxy/CA variables, and
 `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, which is how a
@@ -553,15 +649,22 @@ against a gitlink that is not yet a checkout of its own: an empty directory a
 plain `git clone` leaves for a submodule is initialized in place by `pull`. A
 checkout that is not at its gitlink, or that has uncommitted changes, fails
 verification (`dependency 'std': checkout is dirty:  M mach.toml`);
-realization must be a physical directory, not a symlink. The writer guard
-that excludes a second concurrent `mach dep` mutator lives in the repository's
-git directory, so nothing appears in the working tree.
+realization must be a physical directory, not a symlink. A project without its
+own Git repository realizes Git dependencies as plain clones and verifies those
+checkouts directly. Dependency commands never create the project repository,
+create commits, move project branches, or stage `mach.toml` or unrelated files.
 
-For a **path** dependency, `add --path <dir>` copies the source's tracked files
-into `dep/<name>/` as tracked files of the root repository, without the
-source's own `dep/`, and refuses a source that escapes through a symlink. The
-`path` is resolved relative to the requiring manifest's directory. `pull` never
-reads a `path` source: the copy is the realization.
+For a **path** dependency, `add --path <dir>` copies the local source files
+into `dep/<name>/`, without the source's own `dep/` or Git metadata, and refuses
+a source that escapes through a symlink. Copied files are not automatically
+staged. Verification checks the filesystem realization and does not require it
+to be tracked in Git. The `path` is resolved relative to the requiring manifest's
+directory. `pull` copies a missing path dependency and retains an existing copy.
+`update` refreshes the copy from the source. Before copying, Mach inventories
+source files and excludes the destination itself when the source is an ancestor.
+An existing destination entry absent from that inventory, or with a conflicting
+type, requires explicit cleanup before the update can proceed. Mach does not
+delete extra files. A copy failure retains completed writes for inspection.
 
 ### The closure and clashes
 
@@ -578,23 +681,22 @@ different commits for one id, `add` stops and prints both chains and the
 root declaration that would decide (the exact text is in
 [manifest.md](manifest.md#one-identity-one-commit)); the root resolves it by
 declaring the identity with its own `ref`, at upstream or at a fork, and
-`mach dep update <id>` re-pins the realized checkout to that declaration.
+`mach dep update <path> <id>` re-pins the realized checkout to that declaration.
 Verification then holds every requirer's exact selector against the realized
 commit (`dependency 'b': exact ref 'tag/v1.0.0' resolves to '<commit>' but the
-realized commit is '<other>'; run `mach dep update b` to re-pin it, or declare
+realized commit is '<other>'; run `mach dep update <path> b` to re-pin it, or declare
 the identity at the root to override`), except for an identity the root
 declares with a `tag/`, whose gitlink is the pin; the rules are in
 [manifest.md](manifest.md#what-a-build-verifies).
 
-### 4.30.0 and 5.0.0
+### Removed dependency forms
 
-A `[dep.<key>]` whose realized project declares a different id is an **alias
-key**. 4.30.0 realizes it and prints a migration note
-(`note: [dep.foo] realizes project 'std'; rename the table to [dep.std] and the
-directory to dep/std. alias keys are rejected in 5.0.0`). A `mach.lock` from
-an earlier release is not read; `pull` prints `note: mach.lock is not read;
-the committed gitlinks under dep/ are the pins, so delete it. mach.lock is
-rejected in 5.0.0`.
+A `[dep.<key>]` whose realized project declares a different id is rejected.
+Rename the table and directory under `dep/` to the declared project id.
+Nonempty nested dependencies beneath `dep/<id>/dep/` are also rejected.
+Remove those nested copies and use the consuming project's flat `dep/`.
+Empty directories remain valid placeholders. A root `mach.lock` is rejected
+without reading it. Remove it and retain committed gitlinks as dependency pins.
 
 Exit codes: `0` ok, `1` user error, `2` internal error, `3` environmental
 error (git missing or a git operation that failed).
@@ -632,9 +734,16 @@ exports the `main` symbol.
 |----------------|-------|--------|
 | `--name <id>`  | id    | project id (default: the last path component of `[dir]`, so `mach init /work/ia`, `mach init ib/`, and `mach init .` name the project `ia`, `ib`, and the current directory's name) |
 | `--force`      | —     | scaffold even when `mach.toml` or `src` already exists |
-| `--lib`        | —     | library layout: `src/lib.mach` and one `static` `[artifact.<id>]` |
-| `--no-deps`    | —     | publish the scaffold and declare its dependencies without realizing them; a later `mach dep pull` realizes them (`dependencies declared but not realized; run `mach dep pull` to realize them`) |
+| `--lib`        | —     | library layout: `src/lib.mach` and one `static` `[artifact.<id>]` with `default = true` |
+| `--no-deps`    | —     | publish the scaffold and declare its dependencies without realizing them; a later `mach dep pull` realizes them (`dependencies declared but not realized; run `mach dep pull <path>` to realize them`) |
+| `--no-git`     | —     | skip repository initialization and submodule registration, using plain dependency checkouts instead |
 | `--quiet`, `-q`| —     | suppress non-error output |
+
+By default, `mach init` initializes Git when the destination is outside an
+existing worktree. It does not commit files or change existing history.
+`--no-git` skips initialization and submodule registration. Combine it with
+`--no-deps` to scaffold without invoking Git. `--no-deps` alone still allows
+repository initialization.
 
 The first non-flag argument after `init` is the target directory. Scaffolding
 into a directory that already holds unrelated files keeps them; an existing
@@ -642,7 +751,7 @@ into a directory that already holds unrelated files keeps them; an existing
 --force to overwrite)`), and every collision is checked before any file is
 written, so a refused init leaves nothing behind. Files are written through
 the same atomic publication path as build outputs. A realization failure
-leaves a valid scaffold and a diagnostic, never a half-realized `dep/`.
+leaves the scaffold and completed Git operations available for inspection, with a diagnostic identifying the failed step.
 
 `mach init` scaffolds a buildable project directly: for a default binary
 scaffold, `mach build .` then `mach run .` prints `Hello, World!` without
@@ -702,18 +811,18 @@ needs no project (it runs from anywhere, with or without a `mach.toml`). The
 output is line-oriented and stable for scripts:
 
 ```
-mach 4.26.5
+mach 4.30.0
 host: linux/x86_64
-isa: x86_64 aarch64 riscv64 riscv32 spirv mos6502
+isa: x86_64 aarch64 riscv64 riscv32 spirv
 os: linux darwin windows freestanding
-abi: sysv64 win64 aapcs64 lp64 lp64f lp64d ilp32 ilp32f ilp32d spirv mos6502
+abi: sysv64 win64 aapcs64 lp64 lp64f lp64d ilp32 ilp32f ilp32d spirv
 object: elf coff macho raw spv
 ```
 
 The version line and `host:` line fold at compile time; the four capability
 lines are read from the binary's target registries, so they report exactly what
-this build can target (`mos6502` is the withdrawn experiment still registered
-in 4.30.0 and removed in 5.0.0). `mach info --version` prints the version
+this build can target. The withdrawn MOS 6502 ISA and ABI are absent.
+`mach info --version` prints the version
 string alone on one line, for tooling.
 
 `mach info targets` prints the **supported target-tuple matrix** — one
@@ -764,3 +873,30 @@ exits `1`.
 - [language/test.md](language/test.md) — the `test` declaration and `mach test`
 - [tooling/test-json.md](tooling/test-json.md) — the `mach test --format json` event schema
 - [language/files.md](language/files.md) — project file layout
+
+## `mach fmt`
+
+```
+mach fmt <project-path> [--check]
+```
+
+Formats `.mach` files beneath the manifest’s declared `project.src`, including
+subdirectories. It does not build, execute steps, resolve or fetch dependencies,
+or format dependency source. Symlink source files and ancestors are refused.
+Selecting the dependency directory through a source-path alias is refused using
+held native identities. A filesystem
+that cannot provide that identity contract is refused explicitly.
+
+`--check` prints each differing source path and writes nothing, including no
+publication metadata. It exits `1` when source differs or a file is malformed.
+Normal mode publishes each complete formatted file through the existing filesystem
+transaction API, preserves exact POSIX permission bits, and rejects replacement of the
+source object while formatting. Malformed files produce located diagnostics and
+remain unchanged. Files already formatted earlier in the traversal remain changed
+if a later file fails. This is a per-file operation.
+
+Windows uses its native inherited access-control policy. The synthesized POSIX
+mode is not a Windows ACL and does not promise preservation of a custom ACL.
+
+Both modes exit `0` on success, `2` for an internal failure, and `3` for a filesystem
+failure. There are no formatter configuration options.

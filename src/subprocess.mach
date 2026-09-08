@@ -43,11 +43,13 @@ pub val STATE_SPAWN_FAILURE: SubprocessState = 1;
 pub val STATE_RUNNING:       SubprocessState = 2;
 pub val STATE_EXITED:        SubprocessState = 3;
 pub val STATE_SIGNALED:      SubprocessState = 4;
+pub val STATE_UNOWNED:       SubprocessState = 5;
 pub val STATE_REAPED:        SubprocessState = 7;
 
 pub rec SubprocessTerminal {
     kind: SubprocessState;
-    code: i32;
+    code: u32;
+    core_dumped: bool;
 }
 
 pub rec CaptureIoResult {
@@ -74,6 +76,7 @@ pub rec OwnedCapture {
 
 pub rec OwnedSubprocess {
     child:      exec.Child;
+    last_wait_error: os.ProcessWaitError;
     state:      SubprocessState;
     terminal:   SubprocessTerminal;
     requested:  cnc.Reason;
@@ -155,7 +158,9 @@ fun prepare_spawn_copy(a: *A.Allocator, pathname: str, argv: **u8, envp: **u8) R
         ret R.err[SpawnCopy, str](R.unwrap_err[**u8, str](ar));
     }
     c.argv = R.unwrap_ok[**u8, str](ar);
-    val er: R.Result[**u8, str] = dup_cstr_list(a, envp);
+    var environment: **u8 = envp;
+    if (environment == nil) { environment = env.environ(); }
+    val er: R.Result[**u8, str] = dup_cstr_list(a, environment);
     if (R.is_err[**u8, str](er)) {
         free_cstr(a, c.pathname);
         free_cstr_list(a, c.argv);
@@ -199,7 +204,8 @@ fun empty_capture(limit: usize) OwnedCapture {
 }
 
 pub fun init(p: *OwnedSubprocess) {
-    p.child.pid   = 0;
+    p.child       = exec.Child{};
+    p.last_wait_error = os.ProcessWaitError{};
     p.state       = STATE_UNSTARTED;
     p.terminal    = SubprocessTerminal{kind: STATE_UNSTARTED, code: 0};
     p.requested   = cnc.ACTIVE;
@@ -267,7 +273,7 @@ fun begin_spawn(p: *OwnedSubprocess) bool {
     ret true;
 }
 
-fun observe_terminal(p: *OwnedSubprocess, kind: SubprocessState, code: i32) bool {
+fun observe_terminal(p: *OwnedSubprocess, kind: SubprocessState, code: u32) bool {
     if (p.state != STATE_RUNNING) { ret false; }
     if (kind != STATE_EXITED && kind != STATE_SIGNALED) { ret false; }
     p.state    = kind;
@@ -287,22 +293,45 @@ fun mark_reaped(p: *OwnedSubprocess) bool {
     if (p.reap_count != 0) { ret false; }
     p.reap_count = 1;
     p.state      = STATE_REAPED;
+    p.child      = exec.Child{};
     ret true;
 }
 
-fun observe_raw_status(p: *OwnedSubprocess, raw: i32) bool {
+fun observe_status(p: *OwnedSubprocess, st: exec.ExitStatus) bool {
     var kind: SubprocessState = STATE_EXITED;
-    var code: i32 = 0;
-    val st: exec.ExitStatus = exec.ExitStatus{raw: raw};
+    var code: u32 = 0;
     if (exec.signaled(st)) {
         kind = STATE_SIGNALED;
-        code = exec.signal(st);
+        code = exec.signal(st)::u32;
     }
-    or (exec.exited(st)) {
-        code = exec.code(st);
-    }
+    or (exec.exited(st)) { code = exec.code(st); }
     or { ret false; }
-    ret observe_terminal(p, kind, code) && mark_reaped(p);
+    if (!observe_terminal(p, kind, code)) { ret false; }
+    p.terminal.core_dumped = st.core_dumped;
+    ret mark_reaped(p);
+}
+
+fun accept_wait(a: *A.Allocator, p: *OwnedSubprocess,
+                result: R.Result[O.Option[exec.ExitStatus], exec.Error]) R.Result[bool, str] {
+    if (R.is_err[O.Option[exec.ExitStatus], exec.Error](result)) {
+        val error: exec.Error = R.unwrap_err[O.Option[exec.ExitStatus], exec.Error](result);
+        p.last_wait_error = os.ProcessWaitError{code: error.code, native_code: error.native_code, operation: error.operation};
+        p.child = error.child;
+        if (p.child.pid == 0) {
+            p.state = STATE_UNOWNED;
+            p.terminal = SubprocessTerminal{kind: STATE_UNSTARTED};
+        }
+        val message: R.Result[str, str] = format.sprint(a, "{}: {} (operation {}, code {}, native {})",
+            owner_identity(p), exec.error_message(error), error.operation::u64, error.code, error.native_code::u64);
+        if (R.is_err[str, str](message)) { ret R.err[bool, str]("subprocess wait failed"); }
+        ret R.err[bool, str](R.unwrap_ok[str, str](message));
+    }
+    val got: O.Option[exec.ExitStatus] = R.unwrap_ok[O.Option[exec.ExitStatus], exec.Error](result);
+    if (O.is_none[exec.ExitStatus](got)) { ret R.ok[bool, str](false); }
+    if (!observe_status(p, O.unwrap[exec.ExitStatus](got))) {
+        ret R.err[bool, str](identity_error(a, owner_identity(p), "invalid subprocess terminal status"));
+    }
+    ret R.ok[bool, str](true);
 }
 
 pub fun spawn(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8) R.Result[R.Void, str] {
@@ -351,6 +380,11 @@ pub fun spawn_in(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8
 
 pub fun spawn_captured(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
                        identity: str, limit: usize) R.Result[R.Void, str] {
+    ret spawn_captured_input(a, p, pathname, argv, envp, -1, true, identity, limit);
+}
+
+pub fun spawn_captured_input(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
+                             stdin_fd: i32, capture_stderr: bool, identity: str, limit: usize) R.Result[R.Void, str] {
     if (!begin_spawn(p)) { ret R.err[R.Void, str]("subprocess spawn already attempted"); }
     val idr: R.Result[*u8, str] = dup_cstr(a, identity::*u8);
     if (R.is_err[*u8, str](idr)) {
@@ -381,8 +415,10 @@ pub fun spawn_captured(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv
         ret R.err[R.Void, str](msg);
     }
     var c: SpawnCopy = R.unwrap_ok[SpawnCopy, str](cr);
-    val sr: R.Result[exec.Child, str] = exec.spawn_redirected(
-        c.pathname::str, c.argv, c.envp, p.capture.file.handle.value::i32, p.capture.file.handle.value::i32);
+    var stderr_fd: i32 = -1;
+    if (capture_stderr) { stderr_fd = p.capture.file.handle.value::i32; }
+    val sr: R.Result[exec.Child, str] = exec.spawn_redirected_in(
+        c.pathname::str, c.argv, c.envp, "", stdin_fd, p.capture.file.handle.value::i32, stderr_fd);
     spawn_copy_free_request(a, ?c);
     if (R.is_err[exec.Child, str](sr)) {
         val msg: str = identity_error(a, pathname, R.unwrap_err[exec.Child, str](sr));
@@ -500,13 +536,9 @@ pub fun wait(a: *A.Allocator, p: *OwnedSubprocess) R.Result[SubprocessTerminal, 
     if (!running(p)) {
         ret R.err[SubprocessTerminal, str](identity_error(a, owner_identity(p), "subprocess is not running"));
     }
-    val wr: R.Result[exec.ExitStatus, str] = exec.wait(p.child);
-    if (R.is_err[exec.ExitStatus, str](wr)) {
-        ret R.err[SubprocessTerminal, str](identity_error(a, owner_identity(p), R.unwrap_err[exec.ExitStatus, str](wr)));
-    }
-    if (!observe_raw_status(p, R.unwrap_ok[exec.ExitStatus, str](wr).raw)) {
-        ret R.err[SubprocessTerminal, str](identity_error(a, owner_identity(p), "invalid subprocess terminal status"));
-    }
+    val observed: R.Result[bool, str] = accept_wait(a, p, actual_wait(a, p.child, true));
+    if (R.is_err[bool, str](observed)) { ret R.err[SubprocessTerminal, str](R.unwrap_err[bool, str](observed)); }
+    if (!R.unwrap_ok[bool, str](observed)) { ret R.err[SubprocessTerminal, str]("blocking subprocess wait returned no completion"); }
     ret R.ok[SubprocessTerminal, str](p.terminal);
 }
 
@@ -564,17 +596,11 @@ pub fun wait_any(a: *A.Allocator, owners: *OwnedSubprocess, count: u32, scope: *
                     }
                     ret R.ok[*OwnedSubprocess, str](p);
                 }
-                val wr: R.Result[O.Option[exec.ExitStatus], str] = exec.try_wait(p.child);
-                if (R.is_err[O.Option[exec.ExitStatus], str](wr)) {
-                    ret R.err[*OwnedSubprocess, str](identity_error(a, owner_identity(p), R.unwrap_err[O.Option[exec.ExitStatus], str](wr)));
+                val observed: R.Result[bool, str] = accept_wait(a, p, exec.try_wait(p.child));
+                if (R.is_err[bool, str](observed)) {
+                    ret R.err[*OwnedSubprocess, str](R.unwrap_err[bool, str](observed));
                 }
-                val got: O.Option[exec.ExitStatus] = R.unwrap_ok[O.Option[exec.ExitStatus], str](wr);
-                if (O.is_some[exec.ExitStatus](got)) {
-                    if (!observe_raw_status(p, O.unwrap[exec.ExitStatus](got).raw)) {
-                        ret R.err[*OwnedSubprocess, str](identity_error(a, owner_identity(p), "invalid subprocess terminal status"));
-                    }
-                    ret R.ok[*OwnedSubprocess, str](p);
-                }
+                if (R.unwrap_ok[bool, str](observed)) { ret R.ok[*OwnedSubprocess, str](p); }
             }
             i = i + 1;
         }
@@ -747,32 +773,13 @@ fun actual_terminate(a: *A.Allocator, child: exec.Child, hard: bool) bool {
     ret terminal.kind == STATE_EXITED && terminal.code == 0;
 }
 
-fun actual_wait(a: *A.Allocator, child_pid: i64, block: bool,
-                kind: *SubprocessState, code: *i32) i8 {
-    val child: exec.Child = exec.Child{pid: child_pid, pgid: 0};
-    var st: exec.ExitStatus = exec.ExitStatus{raw: 0};
-    if (block) {
-        val br: R.Result[exec.ExitStatus, str] = exec.wait(child);
-        if (R.is_err[exec.ExitStatus, str](br)) { ret -1; }
-        st = R.unwrap_ok[exec.ExitStatus, str](br);
+fun actual_wait(a: *A.Allocator, child: exec.Child, block: bool) R.Result[O.Option[exec.ExitStatus], exec.Error] {
+    if (!block) { ret exec.try_wait(child); }
+    val waited: R.Result[exec.ExitStatus, exec.Error] = exec.wait(child);
+    if (R.is_err[exec.ExitStatus, exec.Error](waited)) {
+        ret R.err[O.Option[exec.ExitStatus], exec.Error](R.unwrap_err[exec.ExitStatus, exec.Error](waited));
     }
-    or {
-        val pr: R.Result[O.Option[exec.ExitStatus], str] = exec.try_wait(child);
-        if (R.is_err[O.Option[exec.ExitStatus], str](pr)) { ret -1; }
-        val got: O.Option[exec.ExitStatus] = R.unwrap_ok[O.Option[exec.ExitStatus], str](pr);
-        if (!O.is_some[exec.ExitStatus](got)) { ret 0; }
-        st = O.unwrap[exec.ExitStatus](got);
-    }
-    if (exec.signaled(st)) {
-        @kind = STATE_SIGNALED;
-        @code = exec.signal(st);
-    }
-    or (exec.exited(st)) {
-        @kind = STATE_EXITED;
-        @code = exec.code(st);
-    }
-    or { ret -1; }
-    ret 1;
+    ret R.ok[O.Option[exec.ExitStatus], exec.Error](O.some[exec.ExitStatus](R.unwrap_ok[exec.ExitStatus, exec.Error](waited)));
 }
 
 fun actual_sleep(a: *A.Allocator) {
@@ -781,7 +788,7 @@ fun actual_sleep(a: *A.Allocator) {
 
 fun request_with[T](p: *OwnedSubprocess, a: *A.Allocator, request: cnc.Reason, attempts: u32,
                     ctx: *T, terminate: fun(*T, exec.Child, bool) bool,
-                    wait_child: fun(*T, i64, bool, *SubprocessState, *i32) i8,
+                    wait_child: fun(*T, exec.Child, bool) R.Result[O.Option[exec.ExitStatus], exec.Error],
                     sleep: fun(*T)) R.Result[SubprocessTerminal, str] {
     if (ctx == nil || terminate == nil || wait_child == nil || sleep == nil) {
         ret R.err[SubprocessTerminal, str]("subprocess lifecycle capability is incomplete");
@@ -797,40 +804,18 @@ fun request_with[T](p: *OwnedSubprocess, a: *A.Allocator, request: cnc.Reason, a
     val soft_sent: bool = terminate(ctx, p.child, false);
     var i: u32 = 0;
     for (soft_sent && i < attempts) {
-        var kind: SubprocessState = STATE_EXITED;
-        var code: i32 = 0;
-        val wr: i8 = wait_child(ctx, p.child.pid, false, ?kind, ?code);
-        if (wr > 0) {
-            if (!observe_terminal(p, kind, code) || !mark_reaped(p)) {
-                ret R.err[SubprocessTerminal, str]("invalid subprocess terminal transition");
-            }
-            ret R.ok[SubprocessTerminal, str](p.terminal);
-        }
-        if (wr < 0) { brk; }
+        val observed: R.Result[bool, str] = accept_wait(a, p, wait_child(ctx, p.child, false));
+        if (R.is_err[bool, str](observed)) { ret R.err[SubprocessTerminal, str](R.unwrap_err[bool, str](observed)); }
+        if (R.unwrap_ok[bool, str](observed)) { ret R.ok[SubprocessTerminal, str](p.terminal); }
         sleep(ctx);
         i = i + 1;
     }
 
-    if (!terminate(ctx, p.child, true)) {
-        var pkind: SubprocessState = STATE_EXITED;
-        var pcode: i32 = 0;
-        val polled: i8 = wait_child(ctx, p.child.pid, false, ?pkind, ?pcode);
-        if (polled <= 0) {
-            ret R.err[SubprocessTerminal, str](identity_error(a, owner_identity(p), "subprocess termination failed"));
-        }
-        if (!observe_terminal(p, pkind, pcode) || !mark_reaped(p)) {
-            ret R.err[SubprocessTerminal, str]("invalid subprocess terminal transition");
-        }
-        ret R.ok[SubprocessTerminal, str](p.terminal);
-    }
-
-    var kind: SubprocessState = STATE_EXITED;
-    var code: i32 = 0;
-    if (wait_child(ctx, p.child.pid, true, ?kind, ?code) <= 0) {
-        ret R.err[SubprocessTerminal, str](identity_error(a, owner_identity(p), "subprocess reap failed"));
-    }
-    if (!observe_terminal(p, kind, code) || !mark_reaped(p)) {
-        ret R.err[SubprocessTerminal, str]("invalid subprocess terminal transition");
+    val hard_sent: bool = terminate(ctx, p.child, true);
+    val observed: R.Result[bool, str] = accept_wait(a, p, wait_child(ctx, p.child, hard_sent));
+    if (R.is_err[bool, str](observed)) { ret R.err[SubprocessTerminal, str](R.unwrap_err[bool, str](observed)); }
+    if (!R.unwrap_ok[bool, str](observed)) {
+        ret R.err[SubprocessTerminal, str](identity_error(a, owner_identity(p), "subprocess termination produced no completion"));
     }
     ret R.ok[SubprocessTerminal, str](p.terminal);
 }
@@ -869,7 +854,9 @@ rec FakeLifecycle {
     sleeps:      u32;
     finish_poll: u32;
     kind:        SubprocessState;
-    code:        i32;
+    code:        u32;
+    wait_error: os.ProcessWaitError;
+    lose_child: bool;
     fail_soft:   bool;
     fail_hard:   bool;
     fail_group_soft: bool;
@@ -888,13 +875,21 @@ fun fake_terminate(f: *FakeLifecycle, child: exec.Child, hard: bool) bool {
     ret !f.fail_soft;
 }
 
-fun fake_wait(f: *FakeLifecycle, child_pid: i64, block: bool,
-              kind: *SubprocessState, code: *i32) i8 {
+fun fake_wait(f: *FakeLifecycle, child: exec.Child, block: bool) R.Result[O.Option[exec.ExitStatus], exec.Error] {
     f.polls = f.polls + 1;
-    if (!block && (f.finish_poll == 0 || f.polls < f.finish_poll)) { ret 0; }
-    @kind = f.kind;
-    @code = f.code;
-    ret 1;
+    if (f.wait_error.code < 0) {
+        var pending: exec.Child = child;
+        if (f.lose_child) { pending = exec.Child{}; }
+        ret R.err[O.Option[exec.ExitStatus], exec.Error](exec.Error{code: f.wait_error.code,
+            native_code: f.wait_error.native_code, operation: f.wait_error.operation, child: pending});
+    }
+    if (!block && (f.finish_poll == 0 || f.polls < f.finish_poll)) {
+        ret R.ok[O.Option[exec.ExitStatus], exec.Error](O.none[exec.ExitStatus]());
+    }
+    var status: exec.ExitStatus;
+    if (f.kind == STATE_EXITED) { status.kind = os.PROCESS_EXITED; status.code = f.code; }
+    or (f.kind == STATE_SIGNALED) { status.kind = os.PROCESS_SIGNALED; status.signal = f.code::i32; }
+    ret R.ok[O.Option[exec.ExitStatus], exec.Error](O.some[exec.ExitStatus](status));
 }
 
 fun fake_sleep(f: *FakeLifecycle) {
@@ -1900,5 +1895,106 @@ test "mach.subprocess.bound_seconds:rejects_a_nonpositive_bound_and_a_finished_o
     if (!bound_seconds(?q, 2)) { ret 7; }
     q.state = STATE_REAPED;
     if (bound_seconds(?q, 2)) { ret 8; }
+    ret 0;
+}
+
+test "mach.subprocess:completion_preserves_full_exit_code_and_signal_core_flag" {
+    var p: OwnedSubprocess;
+    fake_owner(?p, 70);
+    if (!observe_status(?p, exec.ExitStatus{kind: os.PROCESS_EXITED, code: 3221225477})) { ret 1; }
+    if (p.terminal.code != 3221225477 || p.terminal.kind != STATE_EXITED || p.terminal.core_dumped) { ret 2; }
+    if (p.child.pid != 0 || p.child.pgid != 0 || p.reap_count != 1) { ret 3; }
+    fake_owner(?p, 71);
+    if (!observe_status(?p, exec.ExitStatus{kind: os.PROCESS_SIGNALED, signal: 11, core_dumped: true})) { ret 4; }
+    if (p.terminal.code != 11 || p.terminal.kind != STATE_SIGNALED || !p.terminal.core_dumped) { ret 5; }
+    fake_owner(?p, 72);
+    if (observe_status(?p, exec.ExitStatus{kind: os.PROCESS_STOPPED, signal: 19})) { ret 6; }
+    if (!running(?p) || p.child.pid != 72 || p.reap_count != 0) { ret 7; }
+    if (observe_status(?p, exec.ExitStatus{})) { ret 8; }
+    ret 0;
+}
+
+test "mach.subprocess:lost_wait_ownership_never_escalates_or_invents_completion" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    var p: OwnedSubprocess;
+    fake_owner_grouped(?p, 73);
+    var f: FakeLifecycle;
+    f.wait_error = os.ProcessWaitError{code: os.ECHILD, operation: os.PROCESS_OP_WAIT};
+    f.lose_child = true;
+    val result: R.Result[SubprocessTerminal, str] = fake_request(?p, ?a, cnc.CANCELLED, 2, ?f);
+    if (R.is_ok[SubprocessTerminal, str](result)) { ret 2; }
+    if (p.state != STATE_UNOWNED || running(?p) || pid(?p) != 0 || p.child.pgid != 0) { ret 3; }
+    if (p.reap_count != 0 || p.terminal.kind != STATE_UNSTARTED || p.terminal.code != 0) { ret 4; }
+    if (p.last_wait_error.code != os.ECHILD || p.last_wait_error.operation != os.PROCESS_OP_WAIT) { ret 5; }
+    if (f.group_soft != 1 || f.hard != 0 || f.polls != 1) { ret 6; }
+    if (R.is_ok[SubprocessTerminal, str](fake_request(?p, ?a, cnc.CANCELLED, 0, ?f))) { ret 7; }
+    if (f.group_soft != 1 || f.hard != 0 || f.polls != 1) { ret 8; }
+    dnit(?a, ?p);
+    ret 0;
+}
+
+test "mach.subprocess:failed_status_keeps_typed_cause_and_child_for_retry" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    var p: OwnedSubprocess;
+    fake_owner_grouped(?p, 74);
+    var f: FakeLifecycle;
+    f.wait_error = os.ProcessWaitError{code: os.EACCES, native_code: 5, operation: os.PROCESS_OP_STATUS};
+    val result: R.Result[SubprocessTerminal, str] = fake_request(?p, ?a, cnc.CANCELLED, 2, ?f);
+    if (R.is_ok[SubprocessTerminal, str](result)) { ret 2; }
+    if (!running(?p) || p.child.pid != 74 || p.child.pgid != 74 || p.reap_count != 0) { ret 3; }
+    if (p.last_wait_error.code != os.EACCES || p.last_wait_error.native_code != 5 || p.last_wait_error.operation != os.PROCESS_OP_STATUS) { ret 4; }
+    if (f.hard != 0 || f.polls != 1) { ret 5; }
+    f.wait_error = os.ProcessWaitError{};
+    f.finish_poll = 2;
+    f.kind = STATE_EXITED;
+    f.code = 4294967295;
+    val retried: R.Result[SubprocessTerminal, str] = fake_request(?p, ?a, cnc.CANCELLED, 2, ?f);
+    if (R.is_err[SubprocessTerminal, str](retried)) { ret 6; }
+    if (p.terminal.code != 4294967295 || p.state != STATE_REAPED || p.reap_count != 1 || p.child.pid != 0) { ret 7; }
+    dnit(?a, ?p);
+    ret 0;
+}
+
+test "mach.subprocess:native_echild_releases_owner_without_a_terminal_observation" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    var p: OwnedSubprocess;
+    fake_owner(?p, os.getpid());
+    val waited: R.Result[SubprocessTerminal, str] = wait(?a, ?p);
+    if (R.is_ok[SubprocessTerminal, str](waited)) { ret 2; }
+    if (p.last_wait_error.code != os.ECHILD || p.state != STATE_UNOWNED || p.child.pid != 0) { ret 3; }
+    if (p.reap_count != 0 || p.terminal.kind != STATE_UNSTARTED || running(?p)) { ret 4; }
+    if (R.is_ok[SubprocessTerminal, str](cancel(?a, ?p, 0))) { ret 5; }
+    dnit(?a, ?p);
+    ret 0;
+}
+
+test "mach.subprocess:omitted_environment_is_an_owned_inherited_snapshot" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    var argv: [2]*u8;
+    argv[0] = "environment-probe";
+    argv[1] = nil;
+    val inherited: **u8 = env.environ();
+    val prepared: R.Result[SpawnCopy, str] = prepare_spawn_copy(?a, "environment-probe", ?argv[0], nil);
+    if (R.is_err[SpawnCopy, str](prepared)) { ret 2; }
+    var copy: SpawnCopy = R.unwrap_ok[SpawnCopy, str](prepared);
+    fin { spawn_copy_free_request(?a, ?copy); free_cstr(?a, copy.pathname); }
+    if (copy.envp == inherited || copy.argv == ?argv[0]) { ret 3; }
+    val count: usize = cstr_count(inherited);
+    if (cstr_count(copy.envp) != count) { ret 4; }
+    var i: usize = 0;
+    for (i < count) {
+        if (copy.envp[i] == inherited[i]) { ret 5; }
+        var j: usize = 0;
+        for (inherited[i][j] != 0) {
+            if (copy.envp[i][j] != inherited[i][j]) { ret 6; }
+            j = j + 1;
+        }
+        if (copy.envp[i][j] != 0) { ret 7; }
+        i = i + 1;
+    }
     ret 0;
 }

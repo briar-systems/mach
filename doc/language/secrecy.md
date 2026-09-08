@@ -158,9 +158,9 @@ fun publish2(a: ^*u8) *u8 { ret a:>*u8; }
 no operator of its own: a public value coerces up to secret implicitly, and a
 cast to a secret type (`x::^u16`) is an ordinary cast.
 
-The older spellings `:^` (bare, no target) and `:^T` mean the same thing and are
-accepted through 4.30.0. They are rejected in 5.0.0 with a diagnostic naming
-`:>T`, so new code writes `:>T`.
+The removed spellings `:^` (bare, no target) and `:^T` are rejected with a
+diagnostic naming `:>T`. Write the explicit public result type, including
+pointer and array types such as `:>*u8` and `:>[4]u32`.
 
 ## Welded-storage pointers
 

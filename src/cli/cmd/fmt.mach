@@ -1,0 +1,493 @@
+use A: std.allocator;
+use std.allocator.arena;
+use std.allocator.page;
+use std.collections.vector;
+use std.data.toml;
+use fs: std.filesystem;
+use txn: std.filesystem.transaction;
+use os: std.system.os;
+use std.print;
+use O: std.types.option;
+use R: std.types.result;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.string.str_equals;
+use std.types.string.str_ends_with;
+use std.types.string.str_copy_slice;
+use std.types.string.str_replace;
+use std.text.string.str_free;
+use std.types.path;
+use mach.cli.args;
+use mach.cli.util;
+use mach.lang.diagnostic;
+use mach.lang.fail;
+use formatter: mach.lang.format;
+use mach.lang.intern;
+use mach.lang.manifest;
+use mach.lang.publication;
+$if ($mach.build.os == $mach.os.linux) { use nofollow: std.system.os.linux; }
+$or ($mach.build.os == $mach.os.darwin) { use nofollow: std.system.os.darwin; }
+
+fun os_failure(name: str, code: i64) i64 {
+    print.eprintf("error: {}: {}\n", name, os.message(code));
+    ret 3;
+}
+
+fun txn_failure(name: str, error: txn.Error) i64 {
+    print.eprintf("error: {}: {}\n", name, txn.error_message(error));
+    if (error.code < 0) { print.eprintf("  {}\n", os.message(error.code)); }
+    if (error.cleanup_code < 0) { print.eprintf("  cleanup: {}\n", os.message(error.cleanup_code)); }
+    if (error.kind == txn.MEMORY || error.kind == txn.INVALID) { ret 2; }
+    ret 3;
+}
+
+fun finish_root(root: *txn.Root, name: str, code: i64) i64 {
+    val closed: O.Option[txn.Error] = txn.root_dnit(root);
+    if (O.is_some[txn.Error](closed)) { ret txn_failure(name, O.unwrap[txn.Error](closed)); }
+    ret code;
+}
+
+rec ReadError { status: i64; message: str; }
+
+fun read_text(a: *A.Allocator, fd: i32) R.Result[str, ReadError] {
+    var info: os.stat_t;
+    val checked: i64 = os.stat(fd, ?info);
+    if (checked < 0) { ret R.err[str, ReadError](ReadError{status: 3, message: os.message(checked)}); }
+    if ((os.stat_mode(?info) & os.S_IFMT) != os.S_IFREG) {
+        ret R.err[str, ReadError](ReadError{status: 3, message: "source must be a regular file"});
+    }
+    var bytes: vector.Vector[u8] = vector.init[u8](a);
+    fin { vector.dnit[u8](?bytes); }
+    var chunk: [4096]u8;
+    for {
+        val count: i64 = os.read(fd, ?chunk[0], 4096);
+        if (count < 0) { ret R.err[str, ReadError](ReadError{status: 3, message: os.message(count)}); }
+        if (count == 0) { brk; }
+        var i: usize = 0;
+        for (i < count::usize) {
+            if (chunk[i] == 0) { ret R.err[str, ReadError](ReadError{status: 1, message: "source contains a NUL byte"}); }
+            i = i + 1;
+        }
+        val appended: R.Result[usize, str] = vector.reserve[u8](?bytes, count::usize);
+        if (R.is_err[usize, str](appended)) { ret R.err[str, ReadError](ReadError{status: 2, message: R.unwrap_err[usize, str](appended)}); }
+        i = 0;
+        for (i < count::usize) { bytes.data[bytes.len] = chunk[i]; bytes.len = bytes.len + 1; i = i + 1; }
+    }
+    val length: usize = bytes.len;
+    val terminated: R.Result[usize, str] = vector.push[u8](?bytes, 0);
+    if (R.is_err[usize, str](terminated)) { ret R.err[str, ReadError](ReadError{status: 2, message: R.unwrap_err[usize, str](terminated)}); }
+    val copied: R.Result[str, str] = str_copy_slice(a, bytes.data::str, 0, length);
+    if (R.is_err[str, str](copied)) { ret R.err[str, ReadError](ReadError{status: 2, message: R.unwrap_err[str, str](copied)}); }
+    ret R.ok[str, ReadError](R.unwrap_ok[str, str](copied));
+}
+
+fun open_file(root: *txn.Root, leaf: str) i64 {
+    var info: os.stat_t;
+    val checked: i64 = os.stat_path(txn.root_fd(root), leaf, ?info, os.AT_SYMLINK_NOFOLLOW);
+    if (checked < 0) { ret checked; }
+    if ((os.stat_mode(?info) & os.S_IFMT) != os.S_IFREG) { ret os.EINVAL; }
+    var flags: i32 = os.O_RDONLY;
+    $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
+        flags = flags | nofollow.O_NOFOLLOW | nofollow.O_NONBLOCK;
+    }
+    ret os.open(txn.root_fd(root), leaf, flags, 0);
+}
+
+fun render_diagnostics(name: str, text: str, store: *diagnostic.DiagnosticStore) {
+    var i: usize = 0;
+    for (i < diagnostic.len(store)) {
+        val item: R.Result[*diagnostic.Diagnostic, str] = diagnostic.get(store, i);
+        if (R.is_ok[*diagnostic.Diagnostic, str](item)) {
+            val d: *diagnostic.Diagnostic = R.unwrap_ok[*diagnostic.Diagnostic, str](item);
+            var line: usize = 1;
+            var column: usize = 1;
+            var at: usize = 0;
+            for (text[at] != 0 && at < d.loc.span.offset) {
+                if (text[at] == '\n'::u8) { line = line + 1; column = 1; }
+                or { column = column + 1; }
+                at = at + 1;
+            }
+            print.eprintf("{}:{}:{}: {}\n", name, line, column, d.message);
+        }
+        i = i + 1;
+    }
+}
+
+fun format_open_file(a: *A.Allocator, owned: *i32, claim: *txn.Claim, name: str, check: bool) i64 {
+    val fd: i32 = @owned;
+    var info: os.stat_t;
+    val checked: i64 = os.stat(fd, ?info);
+    if (checked < 0) { ret os_failure(name, checked); }
+    if ((os.stat_mode(?info) & os.S_IFMT) != os.S_IFREG) {
+        print.eprintf("error: {}: source must be a regular file\n", name); ret 3;
+    }
+    var identity: txn.Identity;
+    if (!check) {
+        val identified: i64 = os.file_identity(fd, ?identity);
+        if (identified < 0) { ret os_failure(name, identified); }
+    }
+    val read: R.Result[str, ReadError] = read_text(a, fd);
+    if (R.is_err[str, ReadError](read)) {
+        val failure: ReadError = R.unwrap_err[str, ReadError](read);
+        print.eprintf("error: {}: {}\n", name, failure.message); ret failure.status;
+    }
+    val text: str = R.unwrap_ok[str, ReadError](read);
+    fin { str_free(a, text); }
+    var diagnostics: diagnostic.DiagnosticStore = diagnostic.store_init(a);
+    fin { diagnostic.store_dnit(?diagnostics); }
+    val formatted: R.Result[str, fail.Fail] = formatter.format_source(a, text, 1, ?diagnostics);
+    if (R.is_err[str, fail.Fail](formatted)) {
+        val failure: fail.Fail = R.unwrap_err[str, fail.Fail](formatted);
+        render_diagnostics(name, text, ?diagnostics);
+        if (failure.kind == fail.REPORTED) { ret 1; }
+        print.eprintf("error: {}: {}\n", name, failure.message); ret 2;
+    }
+    val output: str = R.unwrap_ok[str, fail.Fail](formatted);
+    fin { str_free(a, output); }
+    if (str_equals(text, output)) { ret 0; }
+    if (check) { print.println(name); ret 1; }
+    var exact_mode: bool = false;
+    $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) { exact_mode = true; }
+    val replaced: R.Result[R.Void, txn.Error] = publication.replace_source(a, claim, owned, identity,
+        output, str_len(output), (os.stat_mode(?info) & 0o7777)::i32, exact_mode);
+    if (R.is_err[R.Void, txn.Error](replaced)) { ret txn_failure(name, R.unwrap_err[R.Void, txn.Error](replaced)); }
+    print.println(name);
+    ret 0;
+}
+
+fun format_file(backing: *A.Allocator, root: *txn.Root, held: *txn.Lock, leaf: str, name: str, check: bool) i64 {
+    var ar: arena.Arena;
+    if (O.is_some[str](arena.init(?ar, backing, 0))) { ret 2; }
+    fin { arena.dnit(?ar); }
+    var a: A.Allocator;
+    if (O.is_some[str](arena.make(?a, ?ar))) { ret 2; }
+    var claim: txn.Claim;
+    if (!check) {
+        val recovered: R.Result[usize, txn.Error] = txn.recover(?a, held, leaf);
+        if (R.is_err[usize, txn.Error](recovered)) { ret txn_failure(name, R.unwrap_err[usize, txn.Error](recovered)); }
+        val reserved: O.Option[txn.Error] = txn.claim(?claim, ?a, held, leaf);
+        if (O.is_some[txn.Error](reserved)) { ret txn_failure(name, O.unwrap[txn.Error](reserved)); }
+    }
+    val opened: i64 = open_file(root, leaf);
+    var code: i64 = 0;
+    if (opened < 0) { code = os_failure(name, opened); }
+    or {
+        var fd: i32 = opened::i32;
+        code = format_open_file(?a, ?fd, ?claim, name, check);
+        if (fd >= 0) {
+            val closed: i64 = os.close(fd);
+            if (closed < 0) { code = os_failure(name, closed); }
+        }
+    }
+    if (!check) {
+        val released: O.Option[txn.Error] = txn.release_claim(?claim);
+        if (O.is_some[txn.Error](released)) { code = txn_failure(name, O.unwrap[txn.Error](released)); }
+    }
+    ret code;
+}
+
+fun visit(a: *A.Allocator, root: *txn.Root, held: *txn.Lock, leaf: str, name: str, check: bool, depth: usize) i64 {
+    val probed: R.Result[txn.EntryProbe, txn.Error] = txn.entry_probe(root, leaf);
+    if (R.is_err[txn.EntryProbe, txn.Error](probed)) { ret txn_failure(name, R.unwrap_err[txn.EntryProbe, txn.Error](probed)); }
+    val entry: txn.EntryProbe = R.unwrap_ok[txn.EntryProbe, txn.Error](probed);
+    if (entry.is_directory) {
+        var child: txn.Root;
+        val opened: O.Option[txn.Error] = txn.root_open_child(?child, root, leaf);
+        if (O.is_some[txn.Error](opened)) { ret txn_failure(name, O.unwrap[txn.Error](opened)); }
+        val code: i64 = walk(a, ?child, name, check, depth + 1);
+        ret finish_root(?child, name, code);
+    }
+    if (!entry.is_regular) {
+        print.eprintf("error: {}: symlinks and nonregular source entries are refused\n", name); ret 3;
+    }
+    if (!str_ends_with(leaf, ".mach")) { ret 0; }
+    ret format_file(a, root, held, leaf, name, check);
+}
+
+fun walk(a: *A.Allocator, root: *txn.Root, name: str, check: bool, depth: usize) i64 {
+    if (depth >= 256) { print.eprintf("error: {}: source directory nesting exceeds 256\n", name); ret 3; }
+    var held: txn.Lock;
+    if (!check) {
+        val locked: O.Option[txn.Error] = txn.lock(?held, root);
+        if (O.is_some[txn.Error](locked)) { ret txn_failure(name, O.unwrap[txn.Error](locked)); }
+    }
+    var names: vector.Vector[str] = vector.init[str](a);
+    fin {
+        var i: usize = 0;
+        for (i < names.len) { str_free(a, names.data[i]); i = i + 1; }
+        vector.dnit[str](?names);
+    }
+    var cursor: os.DirectoryCursor = os.DirectoryCursor{};
+    val initialized: os.DirectoryInitResult = os.directory_init(?cursor, txn.root_fd(root));
+    var code: i64 = 0;
+    if (initialized.code < 0) {
+        code = os_failure(name, initialized.code);
+        if (initialized.cleanup_code < 0) { code = os_failure(name, initialized.cleanup_code); }
+    } or {
+        for {
+            var entry: os.DirectoryEntry;
+            val next: i64 = os.directory_next(?cursor, ?entry);
+            if (next < 0) { code = os_failure(name, next); brk; }
+            if (next == 0) { brk; }
+            if (str_equals(entry.name, ".") || str_equals(entry.name, "..") || str_equals(entry.name, txn.LOCK_LEAF)
+                || str_equals(entry.name, ".machtxn.claims") || str_equals(entry.name, ".machtxn.backup")) { cnt; }
+            val copied: R.Result[str, str] = str_copy_slice(a, entry.name, 0, entry.length);
+            if (R.is_err[str, str](copied)) { code = 2; brk; }
+            val leaf: str = R.unwrap_ok[str, str](copied);
+            val pushed: R.Result[usize, str] = vector.push[str](?names, leaf);
+            if (R.is_err[usize, str](pushed)) { str_free(a, leaf); code = 2; brk; }
+        }
+        val closed: i64 = os.directory_close(?cursor);
+        if (closed < 0) { code = os_failure(name, closed); }
+    }
+    var i: usize = 0;
+    for (i < names.len && code < 2) {
+        val joined: R.Result[str, str] = path.join(a, name, names.data[i]);
+        if (R.is_err[str, str](joined)) { code = 2; brk; }
+        val display: str = R.unwrap_ok[str, str](joined);
+        val result: i64 = visit(a, root, ?held, names.data[i], display, check, depth);
+        str_free(a, display);
+        if (result > code) { code = result; }
+        i = i + 1;
+    }
+    if (!check) {
+        val unlocked: O.Option[txn.Error] = txn.unlock(?held);
+        if (O.is_some[txn.Error](unlocked)) { code = txn_failure(name, O.unwrap[txn.Error](unlocked)); }
+    }
+    ret code;
+}
+
+fun source_walk(a: *A.Allocator, root: *txn.Root, rel: str, start: usize, name: str, check: bool, depth: usize, exclude: *txn.Identity) i64 {
+    if (depth >= 256) { print.eprintf("error: {}: source directory nesting exceeds 256\n", name); ret 3; }
+    var end: usize = start;
+    val length: usize = str_len(rel);
+    for (end < length && rel[end] != '/'::u8) { end = end + 1; }
+    val copied: R.Result[str, str] = str_copy_slice(a, rel, start, end - start);
+    if (R.is_err[str, str](copied)) { ret 2; }
+    val leaf: str = R.unwrap_ok[str, str](copied);
+    fin { str_free(a, leaf); }
+    var child: txn.Root;
+    val opened: O.Option[txn.Error] = txn.root_open_child(?child, root, leaf);
+    if (O.is_some[txn.Error](opened)) { ret txn_failure(name, O.unwrap[txn.Error](opened)); }
+    if (exclude != nil) {
+        val identity: R.Result[txn.Identity, txn.Error] = txn.root_identity(?child);
+        if (R.is_err[txn.Identity, txn.Error](identity)) {
+            ret finish_root(?child, name, txn_failure(name, R.unwrap_err[txn.Identity, txn.Error](identity)));
+        }
+        if (txn.identity_equal(@exclude, R.unwrap_ok[txn.Identity, txn.Error](identity))) {
+            print.eprintln("error: project source cannot be the dependency tree");
+            ret finish_root(?child, name, 1);
+        }
+    }
+    var code: i64 = 0;
+    if (end == length) { code = walk(a, ?child, name, check, 0); }
+    or { code = source_walk(a, ?child, rel, end + 1, name, check, depth + 1, nil); }
+    ret finish_root(?child, name, code);
+}
+
+fun project_body(a: *A.Allocator, backing: *A.Allocator, root: *txn.Root, name: str, check: bool) i64 {
+    val opened: i64 = open_file(root, util.PROJECT_CONFIG_NAME);
+    if (opened < 0) { ret os_failure(name, opened); }
+    val text: R.Result[str, ReadError] = read_text(a, opened::i32);
+    val closed: i64 = os.close(opened::i32);
+    if (R.is_err[str, ReadError](text)) {
+        val failure: ReadError = R.unwrap_err[str, ReadError](text);
+        print.eprintf("error: mach.toml: {}\n", failure.message);
+        if (closed < 0) { ret os_failure(name, closed); }
+        ret failure.status;
+    }
+    if (closed < 0) { ret os_failure(name, closed); }
+    val raw: str = R.unwrap_ok[str, ReadError](text);
+    fin { str_free(a, raw); }
+    val valid: R.Result[R.Void, str] = manifest.validate_source_text(raw);
+    if (R.is_err[R.Void, str](valid)) { print.eprintf("error: mach.toml: {}\n", R.unwrap_err[R.Void, str](valid)); ret 1; }
+    val parsed: R.Result[toml.Table, str] = toml.parse(a, raw);
+    if (R.is_err[toml.Table, str](parsed)) { print.eprintf("error: mach.toml: {}\n", R.unwrap_err[toml.Table, str](parsed)); ret 1; }
+    var table: toml.Table = R.unwrap_ok[toml.Table, str](parsed);
+    fin { toml.dnit(a, ?table); }
+    var itn: intern.Interner = intern.init(a);
+    fin { intern.dnit(?itn); }
+    val parsed_manifest: R.Result[manifest.Manifest, str] = manifest.parse(a, ?itn, ?table);
+    if (R.is_err[manifest.Manifest, str](parsed_manifest)) { print.eprintf("error: mach.toml: {}\n", R.unwrap_err[manifest.Manifest, str](parsed_manifest)); ret 1; }
+    var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](parsed_manifest);
+    fin { manifest.dnit(?m, a); }
+    val source: O.Option[str] = intern.lookup(?itn, m.src);
+    if (O.is_none[str](source)) { ret 2; }
+    val cleaned: R.Result[str, str] = path.clean(a, O.unwrap[str](source));
+    if (R.is_err[str, str](cleaned)) { ret 2; }
+    val rel: str = R.unwrap_ok[str, str](cleaned);
+    fin { str_free(a, rel); }
+    val probed: R.Result[txn.EntryProbe, txn.Error] = txn.entry_probe(root, "dep");
+    if (R.is_err[txn.EntryProbe, txn.Error](probed)) { ret txn_failure("dep", R.unwrap_err[txn.EntryProbe, txn.Error](probed)); }
+    if (!R.unwrap_ok[txn.EntryProbe, txn.Error](probed).is_directory) {
+        ret source_walk(backing, root, rel, 0, rel, check, 0, nil);
+    }
+    var dependency: txn.Root;
+    val dependency_open: O.Option[txn.Error] = txn.root_open_child(?dependency, root, "dep");
+    if (O.is_some[txn.Error](dependency_open)) { ret txn_failure("dep", O.unwrap[txn.Error](dependency_open)); }
+    val identity: R.Result[txn.Identity, txn.Error] = txn.root_identity(?dependency);
+    if (R.is_err[txn.Identity, txn.Error](identity)) {
+        ret finish_root(?dependency, "dep", txn_failure("dep", R.unwrap_err[txn.Identity, txn.Error](identity)));
+    }
+    val excluded: txn.Identity = R.unwrap_ok[txn.Identity, txn.Error](identity);
+    val code: i64 = source_walk(backing, root, rel, 0, rel, check, 0, ?excluded);
+    ret finish_root(?dependency, "dep", code);
+}
+
+pub fun run_typed(argv: **u8, inv: *args.ParsedInvocation) i64 {
+    if (args.reject_unknown_from_invocation(inv, argv, "mach fmt")) { ret 1; }
+    if (inv.positional_count != 1) { print.eprintln("error: mach fmt requires exactly one project path"); ret 1; }
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret 2; }
+    var ar: arena.Arena;
+    if (O.is_some[str](arena.init(?ar, ?backing, 0))) { ret 2; }
+    fin { arena.dnit(?ar); }
+    var a: A.Allocator;
+    if (O.is_some[str](arena.make(?a, ?ar))) { ret 2; }
+    val located: R.Result[util.ProjectLocation, str] = util.resolve_project_location(?a, argv[inv.positional_idx]);
+    if (R.is_err[util.ProjectLocation, str](located)) { print.eprintf("error: {}\n", R.unwrap_err[util.ProjectLocation, str](located)); ret 1; }
+    val location: util.ProjectLocation = R.unwrap_ok[util.ProjectLocation, str](located);
+    var root: txn.Root;
+    val opened: O.Option[txn.Error] = txn.root_open(?root, location.root, "");
+    if (O.is_some[txn.Error](opened)) { ret txn_failure(location.root, O.unwrap[txn.Error](opened)); }
+    val code: i64 = project_body(?a, ?backing, ?root, location.root, args.invocation_flag(args.CMD_FMT, inv, "--check"));
+    ret finish_root(?root, location.root, code);
+}
+
+use fixture: mach.lang.publication.testing;
+
+fun t_write(a: *A.Allocator, root: str, rel: str, text: str, mode: i32) bool {
+    val joined: R.Result[str, str] = path.join(a, root, rel);
+    if (R.is_err[str, str](joined)) { ret false; }
+    val name: str = R.unwrap_ok[str, str](joined);
+    fin { str_free(a, name); }
+    ret O.is_none[str](fs.write_bytes(name, text, str_len(text), mode));
+}
+
+fun t_same(a: *A.Allocator, root: str, rel: str, expected: str) bool {
+    val joined: R.Result[str, str] = path.join(a, root, rel);
+    if (R.is_err[str, str](joined)) { ret false; }
+    val name: str = R.unwrap_ok[str, str](joined);
+    fin { str_free(a, name); }
+    val read: R.Result[str, str] = fs.read_string(a, name);
+    if (R.is_err[str, str](read)) { ret false; }
+    val text: str = R.unwrap_ok[str, str](read);
+    fin { str_free(a, text); }
+    ret str_equals(text, expected);
+}
+
+fun t_run(a: *A.Allocator, root: str, check: bool) i64 {
+    var argv: [4]*u8 = [4]*u8{"mach", "fmt", root, "--check"};
+    var count: usize = 3;
+    if (check) { count = 4; }
+    val parsed: R.Result[args.ParsedInvocation, str] = args.parse_invocation(a, count, ?argv[0]);
+    if (R.is_err[args.ParsedInvocation, str](parsed)) { ret 2; }
+    var inv: args.ParsedInvocation = R.unwrap_ok[args.ParsedInvocation, str](parsed);
+    fin { args.dnit_invocation(a, ?inv); }
+    ret run_typed(?argv[0], ?inv);
+}
+
+val T_MANIFEST: str = "[project]\nid=\"fmtfixture\"\nversion=\"0.0.0\"\nsrc=\"src\"\nout=\"out\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n[artifact.main]\nkind=\"bin\"\nentry=\"src/main.mach\"\nout=\"bin/main{artifact.suffix}\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n";
+
+test "mach.cli.cmd.fmt: check is read only and formatting preserves modes and excludes dependencies" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    val created: R.Result[fixture.Output, str] = fixture.create(?a, "mach-fmt");
+    if (R.is_err[fixture.Output, str](created)) { ret 2; }
+    var owner: fixture.Output = R.unwrap_ok[fixture.Output, str](created);
+    fin { fixture.dnit(?owner); }
+    var root: txn.Root;
+    if (O.is_some[txn.Error](txn.root_open(?root, owner.directory, ""))) { ret 3; }
+    fin { txn.root_dnit(?root); }
+    if (os.make_dir(txn.root_fd(?root), "src", 0o700) < 0 || os.make_dir(txn.root_fd(?root), "dep", 0o700) < 0) { ret 4; }
+    val original: str = "fun main()i32{ret 0;}";
+    if (!t_write(?a, owner.directory, "mach.toml", T_MANIFEST, 0o600)
+        || !t_write(?a, owner.directory, "src/main.mach", original, 0o751)
+        || !t_write(?a, owner.directory, "dep/untouched.mach", "fun broken(", 0o600)) { ret 5; }
+    var src: txn.Root;
+    if (O.is_some[txn.Error](txn.root_open_child(?src, ?root, "src"))) { ret 6; }
+    fin { txn.root_dnit(?src); }
+    $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
+        val mode_fd: i64 = open_file(?src, "main.mach");
+        if (mode_fd < 0) { ret 16; }
+        val changed: i64 = os.set_mode(mode_fd::i32, 0o774);
+        val closed: i64 = os.close(mode_fd::i32);
+        if (changed < 0 || closed < 0) { ret 17; }
+    }
+    var before: os.stat_t;
+    if (os.stat_path(txn.root_fd(?src), "main.mach", ?before, os.AT_SYMLINK_NOFOLLOW) < 0) { ret 7; }
+    if (t_run(?a, owner.directory, true) != 1 || !t_same(?a, owner.directory, "src/main.mach", original)) { ret 8; }
+    val metadata: R.Result[txn.EntryProbe, txn.Error] = txn.entry_probe(?src, txn.LOCK_LEAF);
+    if (R.is_err[txn.EntryProbe, txn.Error](metadata) || R.unwrap_ok[txn.EntryProbe, txn.Error](metadata).present) { ret 9; }
+    if (t_run(?a, owner.directory, false) != 0 || t_same(?a, owner.directory, "src/main.mach", original)) { ret 10; }
+    var after: os.stat_t;
+    if (os.stat_path(txn.root_fd(?src), "main.mach", ?after, os.AT_SYMLINK_NOFOLLOW) < 0
+        || (os.stat_mode(?before) & 0o7777) != (os.stat_mode(?after) & 0o7777)) { ret 11; }
+    if (t_run(?a, owner.directory, true) != 0 || t_run(?a, owner.directory, false) != 0) { ret 12; }
+    if (!t_same(?a, owner.directory, "dep/untouched.mach", "fun broken(")
+        || !t_same(?a, owner.directory, "mach.toml", T_MANIFEST)) { ret 13; }
+    if (!t_write(?a, owner.directory, "src/main.mach", "fun broken(", 0o600)) { ret 14; }
+    if (t_run(?a, owner.directory, false) != 1 || !t_same(?a, owner.directory, "src/main.mach", "fun broken(")) { ret 15; }
+    ret 0;
+}
+
+test "mach.cli.cmd.fmt: rejects symlink source without rewriting its target" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    val created: R.Result[fixture.Output, str] = fixture.create(?a, "mach-fmt-link");
+    if (R.is_err[fixture.Output, str](created)) { ret 2; }
+    var owner: fixture.Output = R.unwrap_ok[fixture.Output, str](created);
+    fin { fixture.dnit(?owner); }
+    val joined: R.Result[str, str] = path.join(?a, owner.directory, "src");
+    if (R.is_err[str, str](joined)) { ret 3; }
+    val src: str = R.unwrap_ok[str, str](joined);
+    fin { str_free(?a, src); }
+    if (O.is_some[str](fs.create_dir(src, 0o700)) || !t_write(?a, owner.directory, "mach.toml", T_MANIFEST, 0o600)
+        || !t_write(?a, owner.directory, "outside.mach", "fun main()i32{ret 0;}", 0o600)) { ret 4; }
+    val link_r: R.Result[str, str] = path.join(?a, src, "main.mach");
+    if (R.is_err[str, str](link_r)) { ret 5; }
+    val link: str = R.unwrap_ok[str, str](link_r);
+    fin { str_free(?a, link); }
+    if (O.is_some[str](fs.symlink("../outside.mach", link))) { ret 6; }
+    if (t_run(?a, owner.directory, true) != 3 || t_run(?a, owner.directory, false) != 3) { ret 7; }
+    if (!t_same(?a, owner.directory, "outside.mach", "fun main()i32{ret 0;}")) { ret 8; }
+    if (O.is_some[str](fs.remove_file(link)) || O.is_some[fs.RemovalError](fs.remove_all(?a, src))) { ret 9; }
+    if (O.is_some[str](fs.symlink(".", src))) { ret 10; }
+    if (t_run(?a, owner.directory, true) != 3) { ret 11; }
+    ret 0;
+}
+
+
+test "mach.cli.cmd.fmt: source aliases cannot select the dependency directory" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    val created: R.Result[fixture.Output, str] = fixture.create(?a, "mach-fmt-dep");
+    if (R.is_err[fixture.Output, str](created)) { ret 2; }
+    var owner: fixture.Output = R.unwrap_ok[fixture.Output, str](created);
+    fin { fixture.dnit(?owner); }
+    var root: txn.Root;
+    if (O.is_some[txn.Error](txn.root_open(?root, owner.directory, ""))) { ret 3; }
+    fin { txn.root_dnit(?root); }
+    val dep_leaf: str = "dep";
+    var source_setting: str = "src=\"dep\"";
+    $if ($mach.build.os == $mach.os.windows) { source_setting = "src=\"DEP\""; }
+    if (os.make_dir(txn.root_fd(?root), dep_leaf, 0o700) < 0) { ret 4; }
+    val dep_file_r: R.Result[str, str] = path.join(?a, dep_leaf, "untouched.mach");
+    if (R.is_err[str, str](dep_file_r)) { ret 5; }
+    val dep_file: str = R.unwrap_ok[str, str](dep_file_r);
+    fin { str_free(?a, dep_file); }
+    if (!t_write(?a, owner.directory, dep_file, "fun main()i32{ret 0;}", 0o600)) { ret 6; }
+    val invalid_r: R.Result[str, str] = str_replace(?a, T_MANIFEST, "src=\"src\"", source_setting);
+    if (R.is_err[str, str](invalid_r)) { ret 7; }
+    val invalid: str = R.unwrap_ok[str, str](invalid_r);
+    fin { str_free(?a, invalid); }
+    if (!t_write(?a, owner.directory, "mach.toml", invalid, 0o600)
+        || t_run(?a, owner.directory, true) != 1 || t_run(?a, owner.directory, false) != 1) { ret 8; }
+    if (!t_same(?a, owner.directory, dep_file, "fun main()i32{ret 0;}")) { ret 9; }
+    ret 0;
+}

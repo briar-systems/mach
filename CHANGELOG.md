@@ -5,7 +5,135 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [4.30.0] - Unreleased
+## [Unreleased]
+
+### Added
+
+- Canonical RISC-V extension selection bounds generated instructions, named
+  assembly, object attributes and header flags while preserving explicit ABIs.
+
+- Integer vector division follows scalar division per lane, preserving signedness
+  and rejecting secret operands. Targets without packed division scalarize it.
+
+- Persistent object-image caching across compiler processes, bounded entry storage, and `--no-cache` for build and test.
+- `mach fmt <project-path> [--check]` formats declared project source without
+  fetching dependencies or building. Check mode is read only, and file replacement
+  uses held-root publication while preserving exact POSIX permission bits.
+
+### Removed
+
+- Implicit dependency public entries. Bare imports require an explicitly defaulted
+  library artifact, and source-only dependencies use full module paths.
+
+- Dependency alias keys, nonempty nested dependency realizations, and root
+  `mach.lock` files. Empty dependency placeholders remain permitted.
+
+- Legacy declassification spellings `:^` and `:^T`. Use `:>T` with an explicit
+  public result type, including pointer and array types. Ordinary `::^T` casts remain.
+
+- Withdrawn MOS 6502 instruction set, ABI, registry entries and corpus column.
+  Shared width legalization and retained target coverage remain available.
+
+### Fixed
+
+- Relocatable linking preserves native section identities, symbol definitions,
+  import declarations and relocation relations instead of applying final-image
+  section merging. ELF groups, Mach-O indirect symbols and difference relocations,
+  and COFF native imports survive object round trips. Unsupported native
+  representations are diagnosed instead of silently losing metadata. (#3119)
+
+- Release inlining acquires eligible bodies across module boundaries with bounded
+  owned storage, preserving symbol identity, assembly effects and debug metadata.
+  Provider body changes invalidate importers even when a body was previously
+  ineligible. Recursive peeling respects `noinline`, `scalar`, and naked function
+  boundaries, and call cycles are detected in one traversal. (#3110)
+
+- SPIR-V calls carry typed logical arguments and results without a synthetic
+  register bank. Whole-object reference parameters preserve their pointee types.
+
+- Serial optimization records its processed modules, and parallel lowering counts
+  each module once in progress output.
+
+- Comptime evaluation distinguishes unknown internal tags from unsupported values
+  and rejects comparisons of reflection descriptors without equality semantics.
+
+- Test listing stops after collecting tests without generating or linking machine code.
+- Required vector lowering preserves volatile accesses and runs in functions that
+  contain volatile I/O.
+
+- Native encoder failures preserve full opcode values and report owned diagnostics.
+  Selected target instructions are validated in their own opcode domain.
+
+- Darwin persistent cache identity hashes the compiler executable through its own
+  code mapping, including when the loader inserts libraries before that executable.
+
+- Darwin linker planning releases temporary working-directory and runtime search
+  paths after copying their results, including rejected and undersized outputs.
+
+- Embedded files resolve consistently with relative or absolute project and source
+  paths. Project containment still rejects traversal and symlink escapes.
+
+- Unknown syntax, operator, IR operand and backend instruction, operand and register
+  class tags report internal failures with their catalog and numeric value. Verifier diagnostics own their text and propagate
+  allocation failures without losing tag or source information.
+
+- Constant expressions evaluate nested scalar casts and preserve integer widths and
+  signedness. Failed global initializers reject compilation and cannot publish zero
+  values or successful cached lowering products. Nonnumeric equal-size casts retain
+  their representation in both constant evaluation and runtime lowering.
+
+- Dotted import, re-export and type names resolve identically with spacing or comments around dots. Diagnostics retain the original source spans.
+- Embedded files are read through held directory and file handles. Escaping paths
+  and symlinks are rejected before reading, and failed refreshes preserve cache
+  ownership and the prior query input.
+
+- Build planning, driver setup and request hashing reject unknown request catalog values. Invalid phases report their tag and catalog instead of appearing as linking, and invalid goals no longer masquerade as allocation failures.
+
+- Instruction selection preserves each register operand's required bank. Post-allocation
+  verification independently rejects wrong-bank operands, including conversions,
+  moves, and memory addresses.
+- Compiler directory scans use owned cursors and typed cleanup errors. Process
+  supervision preserves complete exit codes and native wait causes, and releases
+  stale child ownership without inventing a completion after `ECHILD`.
+
+- Memory promotion removes unreachable blocks before rewriting locals, preserving
+  valid IR when an unconditional loop leaves a dead cleanup or return path.
+
+- The COFF weak-body linker test publishes into private temporary directories,
+  preventing contention with parallel publication tests and reporting failing stages.
+- Instruction-selection guards read the selected machine model. RV32 full-register
+  conversions are recognized as copies and removed by register coalescing, including
+  when RV32 and RV64 targets are selected in the same process.
+- CI rebuilds its audited compiler from published 4.26.5 and source commits reachable from main after withdrawal of the 4.30.0 release.
+
+### Changed
+
+- Vector operations require an explicit target capability row. Missing or malformed
+  operation and lane shapes no longer default to packed support.
+
+- Removed `$project.name`, `$project.description` and the `$mach.abi.sysv` alias. Diagnostics identify the removed forms, and the ABI tag uses only `sysv64`.
+
+- Every dependency action selects its project with `mach dep <action> <path>`.
+  Dependency names follow the path. Missing or extra operands are refused.
+  Use `.` for the current project. Pull retains existing local copies and update
+  refreshes them. Dependency commands preserve the project's Git history.
+- Removed the ignored manifest keys `[project].name`, `description`, `mach`, and `[profile.*].emit_ir`/`emit_asm`. Use the CLI emission switches for side artifacts.
+- Editor analysis returns an owned diagnostic/source snapshot with explicit phase and target selection. Raw products have checked serial-view lifetimes. Closing a buffer retires its overlay, source payload and cached dependents while retaining its FileId. Buffer slots are reused, and checked editor teardown preserves owners on preparation failure (#2999).
+- Root and dependency manifests share one strict schema. Profiles explicitly declare all compilation policy, and ambiguous target, profile, or artifact selections require a selector or a declared default.
+- Manifest requirements use explicit `step.<name>` and `artifact.<name>` categories, including category-specific globs. Step cycles are rejected during manifest parsing.
+
+### Added
+
+- `#[deprecated]` and `#[deprecated("message")]` warn once per external source
+  use, preserving notices through imports, generics, and re-exports.
+
+- `{artifact.suffix}` expands artifact output extensions through the target naming rules. Scaffolds use one artifact across supported targets, and collision checks compare expanded paths for the selected target.
+
+- `mach build <path> --plan` reports the selected entries, prerequisites, outputs and link requirements through the shared planner. It replaces `--explain`.
+
+- `mach check <path>` checks selected artifact source through the shared frontend without executing build steps or producing artifacts.
+
+## [4.30.0] - 2026-09-07
 
 The transition release that becomes the seed for 5.0.0. Replacement language
 and manifest forms ship alongside the legacy forms retained for migration
@@ -29,9 +157,9 @@ limits, including the refusal to take addresses of temporaries.
 - The dependency model is a flat closure owned by the root project. Every member lands at `dep/<id>` one level deep as a git submodule, the committed gitlink is the pin, and the manifest key, the directory under `dep/`, and the project id are one name. A consumed dependency's own `dep/` is never initialized.
 - A package declares only what it uses directly. Its dependencies' dependencies reach the root's `dep/` through closure computation. An identity reached through two chains with different selections stops the command and prints both chains and the root declaration that decides.
 - `mach dep verify [<path>]` runs the build's dependency checks as a command without changing anything, and names a directory under `dep/` that is not in the closure.
-- `mach dep add`, `mach dep remove`, and `mach dep update` move the manifest, `.gitmodules`, and the gitlinks together or not at all. `update` alone moves selectors. A failed clone exits 3.
+- `mach dep add`, `mach dep remove`, and `mach dep update` validate before mutation and use native submodule operations. The manifest is published last. A later failure preserves completed Git state for inspection. `update` alone moves selectors. A failed clone exits 3.
 - Dependency verification reads the index, not HEAD, so `mach init` followed by `mach build .` works with nothing committed. A project nested inside an unrelated repository realizes dependencies as plain clones and verifies against the checkout.
-- A `path` dependency is copied into `dep/<id>` as tracked content, never symlinked.
+- A `path` dependency is copied into `dep/<id>` as ordinary files, never symlinked or automatically staged. Local path dependencies need no Git repository.
 - `mach init` scaffolds on `std.runtime`, declares `[dep.std]` at `branch/main`, and realizes it as a submodule. `--no-deps` publishes the scaffold and prints the `mach dep pull` it skipped.
 - `default = true` on `[target.*]`, `[profile.*]`, and `[artifact.*]` selects among several declarations. Selection never reads table order. Zero declared profiles get the built-in `debug` and `release`, and one declared profile selects itself.
 - An artifact's `need` names build steps, other artifacts, or `*` globs over both. A required artifact is planned before its consumer, on the consumer's target when the requirement declares it and otherwise on every target the requirement names, and `{artifact.<id>.out}` expands to its output path relative to the project root, including inside `#[embed]`. A failed requirement fails its consumer by name.
@@ -51,7 +179,7 @@ limits, including the refusal to take addresses of temporaries.
 
 #### Standard library
 
-The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
+The pin moves from 0.28.1 to std 1.0.1, the audited transition dependency.
 
 - 0.28.2: `Vector[T]` clears released storage metadata and survives repeated teardown.
 - 0.31.0: libc-free linkage. An ordinary linux binary carries no `PT_INTERP` and no dynamic section, and the compiler adopts the normalized io error surface.
@@ -64,7 +192,14 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 - 0.37.1: `root_remove_tree`, root-anchored recursive removal with a depth bound of 256.
 - 0.37.2: the TOML inline-table conflict path frees its parsed value through a local binding instead of taking the address of a call result. A heap-owning string test covers the release.
 
+- 1.0.0: explicit filesystem identity, cooperative publication ownership,
+  Windows Unicode process/filesystem boundaries, extensible descriptor storage,
+  and audited native resource lifetimes. This major establishes std's public
+  API and Semantic Versioning policy. Its future v5 migration is std 2.0.0.
+
 ### Changed
+
+- The unshipped initialization journal uses a single `.machinit.*` layout without protocol versioning.
 
 #### Language
 
@@ -128,8 +263,69 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 ### Fixed
 
+- Path-only dependency verification leaves its unused Git inspector empty, so cleanup never attempts to free a static string.
+
+- Patch x86-64 ELF imported-address GOT references through the existing relocation backend, preserving displacement addends and field-width overflow checks.
+
+- Run expected-trap child programs inside their private fixture directories and remove those directories afterward, keeping QEMU core dumps out of the checkout (#3132).
+
+
+- Allocate ELF imported-address slots by actual use, including functions also called through the PLT. Preserve unique dynamic symbols and emit RISC-V pointer relocations with the ABI-defined type.
+
+- Isolate publication test outputs in private directories so concurrent linker and object-writer fixtures do not contend for one temporary-directory lock.
+
+
+- Resolve RISC-V GOT high/low relocation pairs through pointer-width GOT slots, preserving the high relocation target for both RV32 and RV64.
+
+- Separate aggregate object sizes from ABI register widths. Copy partial pieces through initialized owned carriers, bound split stack tails to their logical bytes, and prepare all return carriers before assigning registers.
+
+
+- Retain files while hashing and reject replacement paths or changed file metadata before publishing their digests.
+
+- Inventory local dependency sources before copying, exclude a destination inside an ancestor source, and refuse stale destination entries before writing. Pull missing path dependencies without requiring or staging a Git index.
+
+- Pair compiler output, initialization and cleanup with the std filesystem ownership API. Reserve build destinations before workers start and retain directory ownership through publication and recovery.
+- Only `mach init` requests repository creation, with `--no-git` to opt out. Dependency commands preserve project history and unrelated staged work, use native submodule operations, and retain checkouts unless removal explicitly requests `--purge`.
+- Anchor absolute initialization paths beneath their native existing parent and keep staging and recovery bound to the held directory.
+
+- Bound common aggregate snapshots by machine-width pieces and avoid redundant alignment branches on targets with explicit ordinary-memory unaligned access support.
+
+- Calls prepare argument values and owned aggregate copies before filling physical argument registers, keeping bulk-copy scratch available and preserving direct, indirect, hidden-result and variadic placement (#3109).
+- Native aggregate copies and zero initialization lower through bounded MIR loops. Copies preserve snapshot semantics for self and partial overlap, use exact byte extents, and retain secret-data markers without payload-dependent control flow (#3109).
+
+- Aggregate reads capture their bytes when evaluated, preserving values across later argument effects, assignment destination evaluation and return cleanup (#3210).
+
+- Reclaim vector scalarization maps and lane work after each function while retaining emitted operands in IR-owned storage.
+- Loop-invariant motion and scalar replacement reclaim analysis and rewrite plans after each function or transformation round, while emitted IR operands retain module ownership (#2299).
+- Register liveness propagates through recorded uses and predecessor edges instead of allocating four block-by-register matrices. Scratch storage grows with actual references, blocks, registers and edges, and is released when liveness finishes (#2299).
+- Optimization releases mem2reg, constant-folding, algebraic, common-subexpression and dead-code work tables after each function, and verifier scratch after each check, instead of retaining them in the lowered IR arena (#2299).
+
+- Three Windows corpus disassemblies now reflect the verified vector carrier ABI, including direct eight-byte payloads and exact twelve-byte staging (#3199).
+- Deferred gate and generic type probes keep their incomplete outcome, and identifiers already rejected by resolution retain their source error. Actual allocation failures and unvisited committed bindings remain internal errors (#3115, #3130).
+
+- Manifests own one synthesized native target across repeated resolutions and release it on destruction. Early parse failures also release recorded deprecated keys (#3116).
+- Mach-O executables describe embedded DWARF as file-only data with no memory protection and no relocation, allowing native dyld to load debug builds (#3202).
+- Windows vector calls now use one explicit carrier per byte extent: integer bits at 2/4 bytes, `__m64` at 8 bytes, a 128-bit intrinsic at 16 bytes, and an exact-size byte aggregate otherwise. Direct calls, typed indirect calls, parameter capture and returns agree, including hidden result-pointer argument shifts and caller-owned aggregate copies (#3199).
+- Keep the Windows stack-probe runtime fixtures at exact one-page and two-page frames in both build profiles by using explicitly volatile cold storage. The existing prologue-byte and recursion assertions remain unchanged.
+
+- Reload a spilled read/modify/write destination before its first source use, preserving shared scratch identity and reusing the reload for repeated aliases (#3215).
+
+- The frame-location link oracle checks every DWARF description sharing a machine range, preventing false failures for backed variables (#3197).
+- Two union-loader fixtures exercise the selected native semantic projection while preserving all six target tuples, transitive reachability masks, and errors in unreachable foreign branches (#3193).
+- Build steps normalize native output roots, snapshots, and declared staging paths before comparison, preserving contained Windows drive and UNC outputs. Absolute output templates retain their leading-marker requirement, and directory declarations use native component boundaries (#3195).
+- Code generation releases each module's MIR, register-allocation, encoding and debug scratch after preserving its completed object image, instead of retaining scratch across the worker batch (#2299).
+
+- Windows and Darwin corpus disassemblies now reflect the audited aggregate and vector ABI, scratch-register preservation, canonical boolean, trapping remainder, inline, vector-loop and Darwin x18 fixes. All 77 updates were independently decoded and reviewed against native C-reference results (#3179).
+
+- Darwin CI installs the Homebrew LLVM formula selected by the committed oracle major, so a newer Homebrew stable release cannot break the pinned disassembly lane (#3181).
+
 #### Language and frontend
 
+- Embed containment checks preserve allocation and I/O failures as internal phase errors, release temporary paths, and pass canonical relative paths to the filesystem boundary on Windows (#3209).
+
+- Oversized vector diagnostics allocate one owned message and preserve allocation failure instead of overwriting the first formatting result (#3204).
+
+- Frontend phases carry explicit accepted, rejected and internal outcomes. Recoverable syntax errors retain their AST without claiming acceptance, and allocation failures in diagnostics, type interning and generic substitution remain internal even after a user error. Build classification no longer infers failure kinds from diagnostic counts (#3115, #3130).
 - `?` on a temporary (a call result, literal, cast, operator result, array, record or vector literal, or a field or element of one) is refused, naming the operand kind. It used to compile to a pointer into dead stack.
 - A whole record or array declassified with `:>T` or `:^T` reached the middle end as an aggregate strip and was refused.
 - A `$if` whose condition short-circuited to true lost its width and was deferred forever, so every identifier in its body reported unbound.
@@ -152,12 +348,14 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 - A module rejected while its diagnostic could not be stored was reported as accepted, and a diagnostic append's result was discarded at 31 sites.
 - Phase failure classification read session-wide state, so one module's diagnostic made a later module's internal failure look already reported.
 - The editor's resolve and analyze built an empty dependency set, so any file importing another module failed to resolve.
+- Editor project lookup accepts both Windows path separators at source-directory boundaries and within the project prefix, so native and mixed-separator buffer paths retain their project dependencies (#3188).
 - Implicit module discovery and glob matching descended hidden directories that never asked for them.
 - Import-depth cost was superlinear: the query shard scanned every entry, closure scratch was re-zeroed per call, and dependencies were recorded twice.
 - Generic instance and revalidation lookups were linear scans.
 
 #### Middle end
 
+- Floating remainder preserves negative zero when a negative exact multiple is reduced to zero, matching comptime evaluation at both float widths (#3164).
 - The vectorizer could mutate the function and then decline, and its remainder guard hardcoded a signed compare over a wrapping bound.
 - Loop versioning's disjointness check authorized the fast path on aliasing memory when a bound wrapped.
 - A once-called callee whose address escapes was inlined as free, and a small callee could be duplicated without bound.
@@ -200,7 +398,23 @@ The pin moves from 0.28.1 to 0.37.2 (`565f40ab`).
 
 #### Driver and build
 
+- Planner template lookups borrow successful artifact outputs, release diagnostic scratch, and preserve allocation failures (#3208).
+
+- Initialization reports rollback and cleanup failures independently and retains its recovery journal until every required operation, including coordinator close, succeeds (#3174).
+- `mach run` validates artifact execution through the native command boundary, allowing Windows executables while retaining Unix execute-permission and native image rejection (#3184).
+
+- Native driver fixtures resolve host executables, compare complete native paths, select a genuinely foreign target and check both sides of target-gated orphan collection (#3176).
+
+- Initialization stops on inventory path allocation failure instead of publishing a file above its intended nested destination (#3171).
+- Initialization preserves Windows drive and UNC roots and converts native path components to canonical transaction-relative paths (#3169).
+- Manifest dependency editing allocates escaped TOML strings at their exact owned size, so ordinary values release their full allocation (#3160).
+- Build steps inherit the planner environment and apply declared overrides with host-correct name identity. Target variables remain authoritative, environment changes invalidate cached steps, and allocating failures release exact owned extents (#3146).
+- CI's vendored-version and checked-type fixtures use contained source snapshots at the compiler's std pin, and release additivity builds use project-relative output paths (#3135).
+- The worker-count determinism fixture exports its declared Linux entry symbol on every native host while retaining debug output and the one-versus-six-worker byte comparison (#3191).
+- Tracked dependency symlinks resolve in canonical package-relative space on Windows, preserving contained chains while rejecting escapes and cycles (#3187).
+
 - Root dependency overrides select the realization's source kind, URL and exact selector before verification, including when a transitive edge is visited first (#3138).
+- Link fixture build steps preserve the harness-selected toolchain PATH, including CI's versioned LLVM directory and native Windows compiler paths (#3141).
 - A required artifact planned under `mach test` was built as a test cell.
 - `--quiet` on `mach build` was ignored.
 - `BuildPlan` borrowed its request.

@@ -1,0 +1,616 @@
+use std.allocator.page;
+use std.print;
+use T: std.allocator.testing;
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+use std.collections.vector;
+use std.collections.sort;
+use std.text.string.str_dup_range;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.string.str_region_equals;
+use std.types.string.str_equals;
+use mach.lang.diagnostic;
+use mach.lang.fail;
+use mach.lang.source;
+use mach.lang.fe.ast;
+use mach.lang.fe.ast.decl;
+use mach.lang.fe.ast.expr;
+use mach.lang.fe.ast.stmt;
+use atype: mach.lang.fe.ast.type;
+use mach.lang.fe.lexer;
+use mach.lang.fe.parser;
+use mach.lang.fe.parser.state;
+use mach.lang.fe.token;
+
+val COMMENT: token.Kind = 250;
+val RAW_ASM: token.Kind = 251;
+val TIGHT_AFTER: u8 = 1;
+val TIGHT_BEFORE: u8 = 2;
+val SPACE_BEFORE: u8 = 4;
+val DECLARATION: u8 = 8;
+val IMPORT: u8 = 16;
+val NO_ATOM: usize = (-1)::usize;
+
+rec Atom {
+    span: token.Span;
+    kind: token.Kind;
+    flags: u8;
+    pair: usize;
+    lines: u8;
+    trailing: bool;
+}
+
+# success transfers one null-terminated string to the caller's allocator.
+pub fun format_source(a: *A.Allocator, text: str, file_id: source.FileId, diags: *diagnostic.DiagnosticStore) R.Result[str, fail.Fail] {
+    if (a == nil || text == nil || diags == nil) { ret R.err[str, fail.Fail](fail.message("formatter requires an allocator, source, and diagnostic store")); }
+    val lexed: R.Result[lexer.TokenStream, str] = lexer.tokenize(text, a, file_id);
+    if (R.is_err[lexer.TokenStream, str](lexed)) { ret fail.lift[str](R.err[str, str](R.unwrap_err[lexer.TokenStream, str](lexed))); }
+    var stream: lexer.TokenStream = R.unwrap_ok[lexer.TokenStream, str](lexed);
+    fin { lexer.dnit(?stream, a); }
+    val emitted: R.Result[R.Void, str] = lexer.emit_diagnostics(?stream, diags);
+    if (R.is_err[R.Void, str](emitted)) { ret R.err[str, fail.Fail](fail.message(R.unwrap_err[R.Void, str](emitted))); }
+    if (stream.error_len != 0) { ret R.err[str, fail.Fail](fail.reported()); }
+    var parsed: ast.Ast = ast.init(a, file_id);
+    fin { ast.dnit(?parsed); }
+    val checked: R.Result[fail.PhaseStatus, state.ParseFail] = parser.parse(?stream, ?parsed, diags);
+    if (R.is_err[fail.PhaseStatus, state.ParseFail](checked)) { ret R.err[str, fail.Fail](state.failure(R.unwrap_err[fail.PhaseStatus, state.ParseFail](checked))); }
+    val status: fail.PhaseStatus = R.unwrap_ok[fail.PhaseStatus, state.ParseFail](checked);
+    if (status.kind != fail.ACCEPTED) { ret R.err[str, fail.Fail](fail.phase_failure(status)); }
+    ret fail.lift[str](format_parsed(a, ?stream, ?parsed));
+}
+
+fun span_compare(a: *token.Span, b: *token.Span) i64 {
+    if (a.offset < b.offset) { ret -1; }
+    if (a.offset > b.offset) { ret 1; }
+    ret 0;
+}
+
+fun token_at(stream: *lexer.TokenStream, offset: usize) usize {
+    var lo: usize = 0;
+    var hi: usize = stream.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (stream.tokens[mid].span.offset < offset) { lo = mid + 1; }
+        or { hi = mid; }
+    }
+    ret lo;
+}
+
+fun raw_regions(stream: *lexer.TokenStream, parsed: *ast.Ast, spans: *vector.Vector[token.Span]) R.Result[R.Void, str] {
+    var i: usize = 0;
+    for (i < parsed.stmt_len) {
+        val node: *stmt.Stmt = ?parsed.stmts[i];
+        if (node.kind == stmt.STMT_KIND_ASM) {
+            val body: token.Span = node.data.asm_.body;
+            val span: token.Span = token.Span{offset: body.offset - 1, len: body.len + 2};
+            val pushed: R.Result[usize, str] = vector.push[token.Span](spans, span);
+            if (R.is_err[usize, str](pushed)) { ret R.void_of[usize, str](pushed); }
+        }
+        i = i + 1;
+    }
+    sort.sort[token.Span](spans.data, spans.len, span_compare);
+    var comment: usize = 0;
+    i = 0;
+    for (i < spans.len) {
+        val span: *token.Span = ?spans.data[i];
+        val close: usize = span.offset + span.len - 1;
+        for (comment < stream.comment_len && stream.comments[comment].span.offset + stream.comments[comment].span.len <= close) { comment = comment + 1; }
+        if (comment < stream.comment_len && stream.comments[comment].span.offset <= close) {
+            var end: usize = close + 1;
+            for (stream.source[end] != 0 && stream.source[end] != '\n' && stream.source[end] != '\r') { end = end + 1; }
+            span.len = end - span.offset;
+        }
+        val after: usize = token_at(stream, close + 1);
+        if (after > 0) {
+            val covered: token.Span = stream.tokens[after - 1].span;
+            if (covered.offset + covered.len > span.offset + span.len) { span.len = covered.offset + covered.len - span.offset; }
+        }
+        i = i + 1;
+    }
+    ret R.ok_void[str]();
+}
+
+fun line_start(text: str, offset: usize) bool {
+    var i: usize = offset;
+    for (i > 0) {
+        i = i - 1;
+        if (text[i] == '\n' || text[i] == '\r') { ret true; }
+        if (text[i] != ' ' && text[i] != '\t') { ret false; }
+    }
+    ret true;
+}
+
+fun gap_lines(text: str, start: usize, end: usize) u8 {
+    var lines: u8 = 0;
+    var i: usize = start;
+    for (i < end) {
+        if (text[i] == '\r' || text[i] == '\n') {
+            lines = lines + 1;
+            if (lines == 2) { ret 2; }
+            if (text[i] == '\r' && i + 1 < end && text[i + 1] == '\n') { i = i + 1; }
+        }
+        i = i + 1;
+    }
+    ret lines;
+}
+
+fun append_atom(atoms: *vector.Vector[Atom], text: str, span: token.Span, kind: token.Kind) R.Result[R.Void, str] {
+    var previous: usize = 0;
+    if (atoms.len != 0) { previous = atoms.data[atoms.len - 1].span.offset + atoms.data[atoms.len - 1].span.len; }
+    val atom: Atom = Atom{span: span, kind: kind, pair: NO_ATOM,
+        lines: gap_lines(text, previous, span.offset), trailing: kind == COMMENT && !line_start(text, span.offset)};
+    ret R.void_of[usize, str](vector.push[Atom](atoms, atom));
+}
+
+fun trivia(atoms: *vector.Vector[Atom], text: str, start: usize, end: usize) R.Result[R.Void, str] {
+    var i: usize = start;
+    for (i < end) {
+        val byte: u8 = text[i];
+        if (byte == ' ' || byte == '\t' || byte == '\r' || byte == '\n') { i = i + 1; cnt; }
+        if (byte != '#') { ret R.err[R.Void, str]("formatter encountered source outside a parsed token or assembly body"); }
+        val begin: usize = i;
+        for (i < end && text[i] != '\r' && text[i] != '\n') { i = i + 1; }
+        val added: R.Result[R.Void, str] = append_atom(atoms, text, token.Span{offset: begin, len: i - begin}, COMMENT);
+        if (R.is_err[R.Void, str](added)) { ret added; }
+    }
+    ret R.ok_void[str]();
+}
+
+fun collect_atoms(a: *A.Allocator, stream: *lexer.TokenStream, parsed: *ast.Ast, atoms: *vector.Vector[Atom]) R.Result[R.Void, str] {
+    var raw: vector.Vector[token.Span] = vector.init[token.Span](a);
+    fin { vector.dnit[token.Span](?raw); }
+    val regions: R.Result[R.Void, str] = raw_regions(stream, parsed, ?raw);
+    if (R.is_err[R.Void, str](regions)) { ret regions; }
+    var region: usize = 0;
+    var ti: usize = 0;
+    var position: usize = 0;
+    for (ti < stream.len) {
+        val tok: token.Token = stream.tokens[ti];
+        val gap: R.Result[R.Void, str] = trivia(atoms, stream.source, position, tok.span.offset);
+        if (R.is_err[R.Void, str](gap)) { ret gap; }
+        if (tok.kind == token.KIND_EOF) { brk; }
+        if (region < raw.len && raw.data[region].offset == tok.span.offset) {
+            val span: token.Span = raw.data[region];
+            val added: R.Result[R.Void, str] = append_atom(atoms, stream.source, span, RAW_ASM);
+            if (R.is_err[R.Void, str](added)) { ret added; }
+            position = span.offset + span.len;
+            for (ti < stream.len && stream.tokens[ti].span.offset < position) { ti = ti + 1; }
+            region = region + 1;
+        }
+        or {
+            val added: R.Result[R.Void, str] = append_atom(atoms, stream.source, tok.span, tok.kind);
+            if (R.is_err[R.Void, str](added)) { ret added; }
+            position = tok.span.offset + tok.span.len;
+            ti = ti + 1;
+        }
+    }
+    ret R.ok_void[str]();
+}
+
+fun find_atom(atoms: *vector.Vector[Atom], offset: usize) usize {
+    var lo: usize = 0;
+    var hi: usize = atoms.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (atoms.data[mid].span.offset < offset) { lo = mid + 1; }
+        or { hi = mid; }
+    }
+    if (lo < atoms.len && atoms.data[lo].span.offset == offset) { ret lo; }
+    ret NO_ATOM;
+}
+
+fun mark(atoms: *vector.Vector[Atom], offset: usize, flags: u8) {
+    val index: usize = find_atom(atoms, offset);
+    if (index != NO_ATOM) { atoms.data[index].flags = atoms.data[index].flags | flags; }
+}
+
+fun pair_delimiters(a: *A.Allocator, atoms: *vector.Vector[Atom]) R.Result[R.Void, str] {
+    var stack: vector.Vector[usize] = vector.init[usize](a);
+    fin { vector.dnit[usize](?stack); }
+    var i: usize = 0;
+    for (i < atoms.len) {
+        val kind: token.Kind = atoms.data[i].kind;
+        if (kind == token.KIND_LPAREN || kind == token.KIND_LBRACKET || kind == token.KIND_ATTR_OPEN || kind == token.KIND_LBRACE) {
+            val pushed: R.Result[usize, str] = vector.push[usize](?stack, i);
+            if (R.is_err[usize, str](pushed)) { ret R.void_of[usize, str](pushed); }
+        }
+        or (kind == token.KIND_RPAREN || kind == token.KIND_RBRACKET || kind == token.KIND_RBRACE) {
+            if (stack.len == 0) { ret R.err[R.Void, str]("formatter parsed delimiters are unbalanced"); }
+            stack.len = stack.len - 1;
+            val open: usize = stack.data[stack.len];
+            atoms.data[open].pair = i;
+            atoms.data[i].pair = open;
+        }
+        i = i + 1;
+    }
+    if (stack.len != 0) { ret R.err[R.Void, str]("formatter parsed delimiters are unbalanced"); }
+    ret R.ok_void[str]();
+}
+
+fun mark_syntax(atoms: *vector.Vector[Atom], parsed: *ast.Ast) {
+    var i: usize = 0;
+    for (i < parsed.expr_len) {
+        val e: *expr.Expr = ?parsed.exprs[i];
+        if (e.kind == expr.EXPR_KIND_UNARY) { mark(atoms, e.span.offset, TIGHT_AFTER); }
+        if (e.kind == expr.EXPR_KIND_STRUCT_LIT || e.kind == expr.EXPR_KIND_ARRAY_LIT || e.kind == expr.EXPR_KIND_VECTOR_LIT) {
+            val close: usize = find_atom(atoms, e.span.offset + e.span.len - 1);
+            if (close != NO_ATOM && atoms.data[close].kind == token.KIND_RBRACE && atoms.data[close].pair != NO_ATOM) {
+                val open: usize = atoms.data[close].pair;
+                atoms.data[open].flags = atoms.data[open].flags | TIGHT_BEFORE;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < parsed.type_len) {
+        val t: *atype.Type = ?parsed.types[i];
+        if (t.kind == atype.TYPE_KIND_PTR || t.kind == atype.TYPE_KIND_SECRET) { mark(atoms, t.span.offset, TIGHT_AFTER); }
+        if (t.kind == atype.TYPE_KIND_ARRAY) {
+            mark(atoms, t.span.offset, SPACE_BEFORE);
+            val element: O.Option[*atype.Type] = ast.get_type(parsed, t.data.array.element);
+            if (O.is_some[*atype.Type](element)) { mark(atoms, O.unwrap[*atype.Type](element).span.offset, TIGHT_BEFORE); }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < parsed.decl_len) {
+        val d: *decl.Decl = ?parsed.decls[i];
+        var offset: usize = d.span.offset;
+        if (d.doc.len != 0) { offset = d.doc.offset; }
+        var flags: u8 = DECLARATION;
+        if (d.kind == decl.DECL_KIND_USE || d.kind == decl.DECL_KIND_FWD) { flags = flags | IMPORT; }
+        mark(atoms, offset, flags);
+        i = i + 1;
+    }
+}
+
+fun word(text: str, atom: *Atom, name: str) bool {
+    ret atom.kind == token.KIND_IDENT && str_region_equals(text, atom.span.offset, atom.span.len, name);
+}
+
+fun joined_before(kind: token.Kind) bool {
+    ret kind == token.KIND_RPAREN || kind == token.KIND_RBRACKET || kind == token.KIND_COMMA
+        || kind == token.KIND_SEMI || kind == token.KIND_DOT || kind == token.KIND_COLON
+        || kind == token.KIND_COLON_COLON || kind == token.KIND_COLON_TILDE || kind == token.KIND_COLON_GT;
+}
+
+fun separated(text: str, previous: *Atom, current: *Atom) bool {
+    if (previous.kind == token.KIND_LBRACE && current.kind == token.KIND_RBRACE) { ret false; }
+    if (joined_before(current.kind)) { ret false; }
+    if (current.kind == token.KIND_DOT_DOT_DOT && (previous.kind == token.KIND_IDENT
+        || previous.kind == token.KIND_RPAREN || previous.kind == token.KIND_RBRACKET)) { ret false; }
+    if (previous.kind == token.KIND_LPAREN || previous.kind == token.KIND_LBRACKET || previous.kind == token.KIND_ATTR_OPEN
+        || previous.kind == token.KIND_DOT || previous.kind == token.KIND_DOLLAR
+        || previous.kind == token.KIND_COLON_COLON || previous.kind == token.KIND_COLON_TILDE || previous.kind == token.KIND_COLON_GT
+        || (previous.flags & TIGHT_AFTER) != 0 || (current.flags & TIGHT_BEFORE) != 0) { ret false; }
+    if ((current.flags & SPACE_BEFORE) != 0) { ret true; }
+    if (current.kind == token.KIND_LPAREN) {
+        if (previous.kind == token.KIND_RBRACKET || previous.kind == token.KIND_RPAREN) { ret false; }
+        if (previous.kind == token.KIND_IDENT) {
+            ret word(text, previous, "if") || word(text, previous, "or") || word(text, previous, "for") || word(text, previous, "ret") || word(text, previous, "try");
+        }
+        ret true;
+    }
+    if (current.kind == token.KIND_LBRACKET) { ret false; }
+    ret true;
+}
+
+fun append_bytes(out: *vector.Vector[u8], text: str, offset: usize, len: usize) R.Result[R.Void, str] {
+    val room: R.Result[usize, str] = vector.reserve[u8](out, len);
+    if (R.is_err[usize, str](room)) { ret R.void_of[usize, str](room); }
+    var i: usize = 0;
+    for (i < len) { out.data[out.len + i] = text[offset + i]; i = i + 1; }
+    out.len = out.len + len;
+    ret R.ok_void[str]();
+}
+
+fun whitespace(out: *vector.Vector[u8], lines: u8, indent: usize, space: bool) R.Result[R.Void, str] {
+    if (out.len != 0 && lines != 0) {
+        var n: u8 = 0;
+        for (n < lines) {
+            val pushed: R.Result[usize, str] = vector.push[u8](out, '\n');
+            if (R.is_err[usize, str](pushed)) { ret R.void_of[usize, str](pushed); }
+            n = n + 1;
+        }
+    }
+    var spaces: usize = 0;
+    if (out.len == 0 || lines != 0) { spaces = indent * 4; }
+    or (space) { spaces = 1; }
+    var n: usize = 0;
+    for (n < spaces) {
+        val pushed: R.Result[usize, str] = vector.push[u8](out, ' ');
+        if (R.is_err[usize, str](pushed)) { ret R.void_of[usize, str](pushed); }
+        n = n + 1;
+    }
+    ret R.ok_void[str]();
+}
+
+fun render(a: *A.Allocator, text: str, atoms: *vector.Vector[Atom]) R.Result[str, str] {
+    var out: vector.Vector[u8] = vector.init[u8](a);
+    fin { vector.dnit[u8](?out); }
+    var stack: vector.Vector[token.Kind] = vector.init[token.Kind](a);
+    fin { vector.dnit[token.Kind](?stack); }
+    var indent: usize = 0;
+    var pending: u8 = 0;
+    var previous_import: bool = false;
+    var i: usize = 0;
+    for (i < atoms.len) {
+        val current: *Atom = ?atoms.data[i];
+        var lines: u8 = pending;
+        var space: bool = false;
+        if (current.kind == token.KIND_RBRACE) {
+            if (indent == 0) { ret R.err[str, str]("formatter block indentation is unbalanced"); }
+            indent = indent - 1;
+            lines = 1;
+            if (current.pair + 1 == i) { lines = 0; }
+        }
+        if (i != 0) {
+            val previous: *Atom = ?atoms.data[i - 1];
+            space = separated(text, previous, current);
+            if (previous.kind == COMMENT) { lines = 1; if (current.lines > 1) { lines = 2; } }
+            or (current.kind == COMMENT && current.trailing) { lines = 0; space = true; }
+            or (current.kind == COMMENT) { lines = 1; if (current.lines > 1) { lines = 2; } }
+            if (previous.kind == token.KIND_RBRACE || previous.kind == RAW_ASM) {
+                if (joined_before(current.kind) || token.infix_precedence(current.kind) != 0 || word(text, current, "or")) { lines = 0; }
+            }
+        }
+        if ((current.flags & DECLARATION) != 0 && indent == 0) {
+            if (i != 0 && !(previous_import && (current.flags & IMPORT) != 0)) { lines = 2; }
+            previous_import = (current.flags & IMPORT) != 0;
+        }
+        val gap: R.Result[R.Void, str] = whitespace(?out, lines, indent, space);
+        if (R.is_err[R.Void, str](gap)) { ret R.err[str, str](R.unwrap_err[R.Void, str](gap)); }
+        val written: R.Result[R.Void, str] = append_bytes(?out, text, current.span.offset, current.span.len);
+        if (R.is_err[R.Void, str](written)) { ret R.err[str, str](R.unwrap_err[R.Void, str](written)); }
+        pending = 0;
+        if (current.kind == token.KIND_LBRACE) {
+            indent = indent + 1;
+            if (current.pair != i + 1) { pending = 1; }
+        }
+        if (current.kind == token.KIND_SEMI || current.kind == token.KIND_RBRACE || current.kind == COMMENT || current.kind == RAW_ASM) { pending = 1; }
+        if (current.kind == token.KIND_RBRACKET && current.pair != NO_ATOM && atoms.data[current.pair].kind == token.KIND_ATTR_OPEN) { pending = 1; }
+        if (current.kind == token.KIND_COMMA && stack.len != 0 && stack.data[stack.len - 1] == token.KIND_LBRACE) { pending = 1; }
+        if (current.kind == token.KIND_LBRACE || current.kind == token.KIND_LPAREN || current.kind == token.KIND_LBRACKET || current.kind == token.KIND_ATTR_OPEN) {
+            val pushed: R.Result[usize, str] = vector.push[token.Kind](?stack, current.kind);
+            if (R.is_err[usize, str](pushed)) { ret R.err[str, str](R.unwrap_err[usize, str](pushed)); }
+        }
+        or (current.kind == token.KIND_RBRACE || current.kind == token.KIND_RPAREN || current.kind == token.KIND_RBRACKET) { stack.len = stack.len - 1; }
+        i = i + 1;
+    }
+    if (out.len != 0) {
+        val newline: R.Result[usize, str] = vector.push[u8](?out, '\n');
+        if (R.is_err[usize, str](newline)) { ret R.err[str, str](R.unwrap_err[usize, str](newline)); }
+    }
+    ret str_dup_range(a, out.data, 0, out.len);
+}
+
+fun format_parsed(a: *A.Allocator, stream: *lexer.TokenStream, parsed: *ast.Ast) R.Result[str, str] {
+    var atoms: vector.Vector[Atom] = vector.init[Atom](a);
+    fin { vector.dnit[Atom](?atoms); }
+    val collected: R.Result[R.Void, str] = collect_atoms(a, stream, parsed, ?atoms);
+    if (R.is_err[R.Void, str](collected)) { ret R.err[str, str](R.unwrap_err[R.Void, str](collected)); }
+    val paired: R.Result[R.Void, str] = pair_delimiters(a, ?atoms);
+    if (R.is_err[R.Void, str](paired)) { ret R.err[str, str](R.unwrap_err[R.Void, str](paired)); }
+    mark_syntax(?atoms, parsed);
+    ret render(a, stream.source, ?atoms);
+}
+
+fun t_doc_end(atoms: *vector.Vector[Atom], span: token.Span) usize {
+    if (span.len == 0) { ret NO_ATOM; }
+    var i: usize = find_atom(atoms, span.offset);
+    if (i == NO_ATOM) { ret NO_ATOM; }
+    var end: usize = i;
+    for (i < atoms.len && atoms.data[i].span.offset < span.offset + span.len) { end = i; i = i + 1; }
+    ret end;
+}
+
+fun t_same_meaning(a: *A.Allocator, before: str, after: str) bool {
+    val lr: R.Result[lexer.TokenStream, str] = lexer.tokenize(before, a, 0);
+    if (R.is_err[lexer.TokenStream, str](lr)) { ret false; }
+    var left: lexer.TokenStream = R.unwrap_ok[lexer.TokenStream, str](lr);
+    fin { lexer.dnit(?left, a); }
+    val rr: R.Result[lexer.TokenStream, str] = lexer.tokenize(after, a, 0);
+    if (R.is_err[lexer.TokenStream, str](rr)) { ret false; }
+    var right: lexer.TokenStream = R.unwrap_ok[lexer.TokenStream, str](rr);
+    fin { lexer.dnit(?right, a); }
+    var la: ast.Ast = ast.init(a, 0);
+    var ra: ast.Ast = ast.init(a, 0);
+    fin { ast.dnit(?la); ast.dnit(?ra); }
+    var diags: diagnostic.DiagnosticStore = diagnostic.store_init(a);
+    fin { diagnostic.store_dnit(?diags); }
+    val lp: R.Result[fail.PhaseStatus, state.ParseFail] = parser.parse(?left, ?la, ?diags);
+    val rp: R.Result[fail.PhaseStatus, state.ParseFail] = parser.parse(?right, ?ra, ?diags);
+    if (R.is_err[fail.PhaseStatus, state.ParseFail](lp) || R.is_err[fail.PhaseStatus, state.ParseFail](rp)) { ret false; }
+    if (R.unwrap_ok[fail.PhaseStatus, state.ParseFail](lp).kind != fail.ACCEPTED
+        || R.unwrap_ok[fail.PhaseStatus, state.ParseFail](rp).kind != fail.ACCEPTED) { ret false; }
+    var latoms: vector.Vector[Atom] = vector.init[Atom](a);
+    var ratoms: vector.Vector[Atom] = vector.init[Atom](a);
+    fin { vector.dnit[Atom](?latoms); vector.dnit[Atom](?ratoms); }
+    if (R.is_err[R.Void, str](collect_atoms(a, ?left, ?la, ?latoms))
+        || R.is_err[R.Void, str](collect_atoms(a, ?right, ?ra, ?ratoms))) { ret false; }
+    if (latoms.len != ratoms.len || la.decl_len != ra.decl_len || la.stmt_len != ra.stmt_len || la.expr_len != ra.expr_len || la.type_len != ra.type_len
+        || la.tag_case_len != ra.tag_case_len || la.field_init_len != ra.field_init_len) { ret false; }
+    var i: usize = 0;
+    for (i < latoms.len) {
+        val l: *Atom = ?latoms.data[i];
+        val r: *Atom = ?ratoms.data[i];
+        if (l.kind != r.kind || l.span.len != r.span.len || l.trailing != r.trailing) { ret false; }
+        var b: usize = 0;
+        for (b < l.span.len) { if (before[l.span.offset + b] != after[r.span.offset + b]) { ret false; } b = b + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < la.decl_len) {
+        val l: *decl.Decl = ?la.decls[i];
+        val r: *decl.Decl = ?ra.decls[i];
+        if (l.kind != r.kind || (l.doc.len == 0) != (r.doc.len == 0)) { ret false; }
+        if (l.doc.len != 0 && (find_atom(?latoms, l.doc.offset) != find_atom(?ratoms, r.doc.offset)
+            || t_doc_end(?latoms, l.doc) != t_doc_end(?ratoms, r.doc))) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun t_report_failure(stage: str, error: fail.Fail, diags: *diagnostic.DiagnosticStore) {
+    print.eprintlnf("formatter {} failed: kind {}, message '{}'", stage, error.kind, error.message);
+    var i: usize = 0;
+    for (i < diagnostic.len(diags)) {
+        val d: *diagnostic.Diagnostic = ?diags.items.data[i];
+        print.eprintlnf("diagnostic at {}+{}: {}", d.loc.span.offset, d.loc.span.len, d.message);
+        i = i + 1;
+    }
+}
+
+fun t_roundtrip(text: str, expected: str) i32 {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    var diags: diagnostic.DiagnosticStore = diagnostic.store_init(?a);
+    fin { diagnostic.store_dnit(?diags); }
+    val first: R.Result[str, fail.Fail] = format_source(?a, text, 0, ?diags);
+    if (R.is_err[str, fail.Fail](first)) { t_report_failure("first pass", R.unwrap_err[str, fail.Fail](first), ?diags); ret 2; }
+    val formatted: str = R.unwrap_ok[str, fail.Fail](first);
+    fin { str_free(?a, formatted); }
+    if (expected != nil && !str_equals(expected, formatted)) {
+        print.eprintlnf("formatter policy mismatch\nexpected:\n{}actual:\n{}", expected, formatted);
+        ret 3;
+    }
+    val second: R.Result[str, fail.Fail] = format_source(?a, formatted, 0, ?diags);
+    if (R.is_err[str, fail.Fail](second)) { t_report_failure("second pass", R.unwrap_err[str, fail.Fail](second), ?diags); ret 4; }
+    val repeated: str = R.unwrap_ok[str, fail.Fail](second);
+    fin { str_free(?a, repeated); }
+    if (!str_equals(formatted, repeated)) {
+        print.eprintlnf("formatter idempotence mismatch\nfirst:\n{}second:\n{}", formatted, repeated);
+        ret 5;
+    }
+    if (!t_same_meaning(?a, text, formatted)) {
+        print.eprintlnf("formatter changed tokens or syntax ownership\nsource:\n{}formatted:\n{}", text, formatted);
+        ret 6;
+    }
+    ret 0;
+}
+
+test "mach.lang.format:one_policy_is_idempotent" {
+    ret t_roundtrip("use a.b;use x:c.d;#[inline]pub fun f(x:* ^i32,y:i32)i32{val n:i32=y*2;if(n>0){ret n;}or{ret 0;}}",
+        "use a.b;\nuse x: c.d;\n\n#[inline]\npub fun f(x: *^i32, y: i32) i32 {\n    val n: i32 = y * 2;\n    if (n > 0) {\n        ret n;\n    } or {\n        ret 0;\n    }\n}\n");
+}
+
+test "mach.lang.format:retained_types_expressions_and_comptime_keep_their_tokens" {
+    ret t_roundtrip("pub rec Pair[T]{a:T;b:T;} pub uni Cell{word:i64;bytes:[8]u8;} def Fn:fun(i64,...)i64; ext fun foreign(x:i64,...)i64; fun f(x: ^i64,p:*Pair[i64],va:...)i64{var a:[2]i64=[2]i64{1,2};val v:i32x4=i32x4{1,2,3,4};val r:Pair[i64]=Pair[i64]{a:a[0],b:a[1]};fin{a[0]=0;}$if($type_of(x)==i64){$error(\"unexpected public value\");}$or{$each arg in va{a[0]=arg::i64;}}for(a[0]<3){a[0]=a[0]+1;if(a[0]==2){cnt;}brk;}ret (x:>i64)+@?r.a+(v[0]::i64);}", nil);
+}
+
+test "mach.lang.format:comments_docstrings_and_raw_assembly_keep_their_owners" {
+    val comments: i32 = t_roundtrip("# banner\r\n\r\nuse a.b; # import\r\n# standalone\r\n\r\n# function summary\r\n#[inline] pub fun f() {val x:i32=1; # first\r\nval y:i32=2; # second\r\nret;} # end\r\n", nil);
+    if (comments != 0) { ret comments; }
+    val plain: i32 = t_roundtrip("fun f(){asm x86_64 { mov rax, 7 } val x:i32=1;ret;}", nil);
+    if (plain != 0) { ret plain; }
+    ret t_roundtrip("fun f(){asm aarch64 {\r\n\tmov x0, #5\r\n  } asm aarch64 { mov x0, #7 } # trailing raw line\r\nret;}\r\n", nil);
+}
+
+test "mach.lang.format:tag_declarations_and_cases" {
+    ret t_roundtrip(
+        "#[packed] pub tag Status{active;suspended;} tag Reply{empty;value:i64;} pub tag res[T,E]{err:E;ok:T;}\n\n# document\ntag Cell[T]{\n# empty case\nempty;value:T;# inline\n}",
+        "#[packed]\npub tag Status {\n    active;\n    suspended;\n}\n\ntag Reply {\n    empty;\n    value: i64;\n}\n\npub tag res[T, E] {\n    err: E;\n    ok: T;\n}\n\n# document\ntag Cell[T] {\n    # empty case\n    empty;\n    value: T; # inline\n}\n");
+}
+
+test "mach.lang.format:tag_and_vector_constructors" {
+    ret t_roundtrip(
+        "fun f(){val a:Reply=Reply{empty};val b:Reply=Reply{value:42};val c:res[i64,Error]=res[i64,Error]{ok:42};val d:err[Error]=err[Error]{ok};val e:opt[i64]=opt[i64]{none};val v:i32x2=i32x2{x,y};ret;}",
+        "fun f() {\n    val a: Reply = Reply{\n        empty\n    };\n    val b: Reply = Reply{\n        value: 42\n    };\n    val c: res[i64, Error] = res[i64, Error]{\n        ok: 42\n    };\n    val d: err[Error] = err[Error]{\n        ok\n    };\n    val e: opt[i64] = opt[i64]{\n        none\n    };\n    val v: i32x2 = i32x2{\n        x,\n        y\n    };\n    ret;\n}\n");
+}
+
+test "mach.lang.format:try_expressions_and_failure_blocks" {
+    ret t_roundtrip(
+        "fun f(input:str)res[i64,Error]{val number:i64=try parse(input) or (error:Error){\n# failure\nret res[i64,Error]{err:error};};val total:i64=(try left() or{ret 0;})+(try right() or{ret 0;});try step1() or (err1:Error){try step2() or (err2:Error){ret res[i64,Error]{err:err2};};ret res[i64,Error]{err:err1};};try (x+1) or {ret 0;};ret try calculate(number) or {ret res[i64,Error]{err:Error{invalid}};};}",
+        "fun f(input: str) res[i64, Error] {\n    val number: i64 = try parse(input) or (error: Error) {\n        # failure\n        ret res[i64, Error]{\n            err: error\n        };\n    };\n    val total: i64 = (try left() or {\n        ret 0;\n    }) + (try right() or {\n        ret 0;\n    });\n    try step1() or (err1: Error) {\n        try step2() or (err2: Error) {\n            ret res[i64, Error]{\n                err: err2\n            };\n        };\n        ret res[i64, Error]{\n            err: err1\n        };\n    };\n    try (x + 1) or {\n        ret 0;\n    };\n    ret try calculate(number) or {\n        ret res[i64, Error]{\n            err: Error{\n                invalid\n            }\n        };\n    };\n}\n");
+}
+
+test "mach.lang.format:malformed_source_has_no_output_and_existing_diagnostics_do_not_reject_valid_source" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    var diags: diagnostic.DiagnosticStore = diagnostic.store_init(?a);
+    fin { diagnostic.store_dnit(?diags); }
+    val bad: R.Result[str, fail.Fail] = format_source(?a, "fun f( {", 41, ?diags);
+    if (R.is_ok[str, fail.Fail](bad)) { str_free(?a, R.unwrap_ok[str, fail.Fail](bad)); ret 2; }
+    if (R.unwrap_err[str, fail.Fail](bad).kind != fail.REPORTED || diagnostic.len(?diags) == 0) { ret 3; }
+    if (diags.items.data[0].loc.file_id != 41) { ret 4; }
+    val lexical: R.Result[str, fail.Fail] = format_source(?a, "fun f() {} \\", 43, ?diags);
+    if (R.is_ok[str, fail.Fail](lexical)) { str_free(?a, R.unwrap_ok[str, fail.Fail](lexical)); ret 7; }
+    if (R.unwrap_err[str, fail.Fail](lexical).kind != fail.REPORTED) { ret 8; }
+    val bad_tag: R.Result[str, fail.Fail] = format_source(?a, "tag { empty; }", 44, ?diags);
+    if (R.is_ok[str, fail.Fail](bad_tag)) { str_free(?a, R.unwrap_ok[str, fail.Fail](bad_tag)); ret 9; }
+    if (R.unwrap_err[str, fail.Fail](bad_tag).kind != fail.REPORTED) { ret 10; }
+    val bad_try: R.Result[str, fail.Fail] = format_source(?a, "fun f() { try foo(); }", 45, ?diags);
+    if (R.is_ok[str, fail.Fail](bad_try)) { str_free(?a, R.unwrap_ok[str, fail.Fail](bad_try)); ret 11; }
+    if (R.unwrap_err[str, fail.Fail](bad_try).kind != fail.REPORTED) { ret 12; }
+    val before: usize = diagnostic.len(?diags);
+    val valid: R.Result[str, fail.Fail] = format_source(?a, "fun f(){}", 42, ?diags);
+    if (R.is_err[str, fail.Fail](valid)) { ret 5; }
+    val formatted: str = R.unwrap_ok[str, fail.Fail](valid);
+    fin { str_free(?a, formatted); }
+    if (!str_equals(formatted, "fun f() {}\n") || diagnostic.len(?diags) != before) { ret 6; }
+    ret 0;
+}
+
+fun t_allocation_refusal(ordinal: usize, attempts: *usize) i32 {
+    var t: T.Testing;
+    if (O.is_some[str](T.make(?t))) { ret 1; }
+    fin { T.dnit(?t); }
+    val a: *A.Allocator = T.allocator_of(?t);
+    var diags: diagnostic.DiagnosticStore = diagnostic.store_init(a);
+    T.fail_at_ordinal(?t, ordinal);
+    val formatted: R.Result[str, fail.Fail] = format_source(a, "# identity\npub fun f(x:i32)i32{ret x+1;}", 0, ?diags);
+    @attempts = T.attempt_count(?t);
+    T.fail_at_ordinal(?t, 0);
+    var result: i32 = 0;
+    if (R.is_ok[str, fail.Fail](formatted)) {
+        str_free(a, R.unwrap_ok[str, fail.Fail](formatted));
+        if (ordinal != 0) {
+            print.eprintlnf("formatter allocation {} unexpectedly succeeded after {} attempts", ordinal, @attempts);
+            result = 2;
+        }
+    }
+    or {
+        val error: fail.Fail = R.unwrap_err[str, fail.Fail](formatted);
+        val allocator_reason: bool = str_equals(error.message, "out of memory")
+            || str_equals(error.message, "out of memory while parsing");
+        if (ordinal == 0 || error.kind != fail.MESSAGE || !allocator_reason) {
+            print.eprintlnf("formatter allocation {} failed after {} attempts", ordinal, @attempts);
+            t_report_failure("allocation refusal", error, ?diags);
+            result = 3;
+        }
+    }
+    diagnostic.store_dnit(?diags);
+    if (T.leaked(?t) || T.double_free_count(?t) != 0 || T.tracking_exhausted(?t)) {
+        print.eprintlnf("formatter allocation {} ownership failure: leaked {}, double frees {}, exhausted {}",
+            ordinal, T.leaked(?t), T.double_free_count(?t), T.tracking_exhausted(?t));
+        ret 4;
+    }
+    ret result;
+}
+
+test "mach.lang.format:allocation_refusal_returns_no_partial_output_or_leaked_owner" {
+    var attempts: usize = 0;
+    val baseline: i32 = t_allocation_refusal(0, ?attempts);
+    if (baseline != 0) { ret baseline; }
+    if (attempts == 0) { ret 5; }
+    var ordinal: usize = 1;
+    for (ordinal <= attempts) {
+        var refused_attempts: usize = 0;
+        val refused: i32 = t_allocation_refusal(ordinal, ?refused_attempts);
+        if (refused != 0) { ret refused; }
+        ordinal = ordinal + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.format:parenthesized_and_chained_calls_stay_tight" {
+    ret t_roundtrip("fun f(){(callback)(x);factory()();}",
+        "fun f() {\n    (callback)(x);\n    factory()();\n}\n");
+}

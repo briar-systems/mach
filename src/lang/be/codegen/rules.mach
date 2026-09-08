@@ -10,11 +10,11 @@ use O: std.types.option;
 use R: std.types.result;
 
 use std.allocator.page;
+use std.format;
 
 use mach.lang.be.codegen.mir;
 use mach.lang.source;
 use mach.lang.target.isa;
-use target: mach.lang.target.resolved;
 
 pub def RuleKind: u8;
 
@@ -28,7 +28,7 @@ pub val GATE_ANY:    RuleGate = 0;
 pub val GATE_SCALAR: RuleGate = 1;
 pub val GATE_VECTOR: RuleGate = 2;
 
-pub def GuardFn: fun(*mir.MirFunction, *mir.MirInstr) bool;
+pub def GuardFn: fun(*isa.BackendTarget, *mir.MirFunction, *mir.MirInstr) bool;
 
 pub rec ExpansionBuilder {
     allocator: *A.Allocator;
@@ -63,10 +63,47 @@ pub rec RulePack {
     fused_cbr_cc_count: u32;
 }
 
-pub fun select(pack: *RulePack, a: *A.Allocator, f: *mir.MirFunction) R.Result[R.Void, str] {
+fun typed_operand_bank(f: *mir.MirFunction, op: *mir.MirOperand) R.Result[mir.OperandBank, str] {
+    if (op.kind == mir.MIR_OP_VREG) {
+        if (op.vreg >= f.vreg_count || f.vregs == nil) { ret R.err[mir.OperandBank, str]("rules: operand bank refers to a missing virtual register"); }
+        if (mir.vreg_is_fp(f, op.vreg)) { ret R.ok[mir.OperandBank, str](mir.BANK_FP); }
+        ret R.ok[mir.OperandBank, str](mir.BANK_GP);
+    }
+    if (op.kind == mir.MIR_OP_PREG) {
+        val class: i32 = isa.regid_class(op.preg::i32);
+        if (class == isa.REG_CLASS_ID_GP) { ret R.ok[mir.OperandBank, str](mir.BANK_GP); }
+        if (class == isa.REG_CLASS_ID_XMM) { ret R.ok[mir.OperandBank, str](mir.BANK_FP); }
+        ret R.err[mir.OperandBank, str]("rules: operand bank refers to an unknown physical register class");
+    }
+    ret R.err[mir.OperandBank, str]("rules: operand is not a register");
+}
+
+pub fun capture_operand_banks(f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[R.Void, str] {
+    var k: u32 = 0;
+    for (k < mi.operand_count) {
+        val op: *mir.MirOperand = ?mi.operands[k];
+        if (op.kind == mir.MIR_OP_VREG || op.kind == mir.MIR_OP_PREG) {
+            val declared: R.Result[mir.OperandBank, str] = mir.operand_bank(mi.opcode, k, mi.vec_lane != mir.VEC_LANE_NONE);
+            if (R.is_err[mir.OperandBank, str](declared)) { ret R.err[R.Void, str](R.unwrap_err[mir.OperandBank, str](declared)); }
+            val typed: R.Result[mir.OperandBank, str] = typed_operand_bank(f, op);
+            if (R.is_err[mir.OperandBank, str](typed)) { ret R.err[R.Void, str](R.unwrap_err[mir.OperandBank, str](typed)); }
+            val actual: mir.OperandBank = R.unwrap_ok[mir.OperandBank, str](typed);
+            val required: mir.OperandBank = R.unwrap_ok[mir.OperandBank, str](declared);
+            if (required != mir.BANK_EITHER && required != actual) {
+                ret R.err[R.Void, str]("rules: register operand is in the wrong bank for its machine opcode");
+            }
+            op.required_bank = actual;
+        }
+        k = k + 1;
+    }
+    ret R.ok_void[str]();
+}
+
+pub fun select(pack: *RulePack, a: *A.Allocator, tgt: *isa.BackendTarget, f: *mir.MirFunction) R.Result[R.Void, str] {
     if (pack == nil) { ret R.err[R.Void, str]("rules: nil rule pack"); }
     if (a == nil)    { ret R.err[R.Void, str]("rules: nil allocator"); }
     if (f == nil)    { ret R.err[R.Void, str]("rules: nil mir function"); }
+    if (tgt == nil)  { ret R.err[R.Void, str]("rules: nil backend target"); }
 
     if (pack.fused_cbr_cc_count > 0) {
         val res_combine: R.Result[R.Void, str] = combine_cbr(pack, a, f);
@@ -75,7 +112,7 @@ pub fun select(pack: *RulePack, a: *A.Allocator, f: *mir.MirFunction) R.Result[R
 
     var bi: u32 = 0;
     for (bi < f.block_count) {
-        val res_block: R.Result[R.Void, str] = select_block(pack, a, f, ?f.blocks[bi]);
+        val res_block: R.Result[R.Void, str] = select_block(pack, a, tgt, f, ?f.blocks[bi]);
         if (R.is_err[R.Void, str](res_block)) { ret res_block; }
         bi = bi + 1;
     }
@@ -92,12 +129,12 @@ pub fun is_reg_move(pack: *RulePack, opcode: u32) bool {
     ret false;
 }
 
-pub fun find_rule(pack: *RulePack, f: *mir.MirFunction, mi: *mir.MirInstr) *Rule {
+pub fun find_rule(pack: *RulePack, tgt: *isa.BackendTarget, f: *mir.MirFunction, mi: *mir.MirInstr) *Rule {
     var i: u32 = 0;
     for (i < pack.rule_count) {
         val r: *Rule = ?pack.rules[i];
         if (r.op == mi.opcode && gate_admits(r.gate, mi) &&
-            (r.guard == nil || r.guard(f, mi))) {
+            (r.guard == nil || r.guard(tgt, f, mi))) {
             ret r;
         }
         i = i + 1;
@@ -108,6 +145,22 @@ pub fun find_rule(pack: *RulePack, f: *mir.MirFunction, mi: *mir.MirInstr) *Rule
 pub fun emit(builder: *ExpansionBuilder, opcode: u32, operands: *mir.MirOperand, operand_count: u32) R.Result[*mir.MirInstr, str] {
     if (builder.emitted >= builder.limit) {
         ret R.err[*mir.MirInstr, str]("rules: expansion emitted more pieces than its rule's declared length");
+    }
+
+    var oi: u32 = 0;
+    for (oi < operand_count) {
+        val op: *mir.MirOperand = ?operands[oi];
+        if (op.kind == mir.MIR_OP_VREG || op.kind == mir.MIR_OP_PREG) {
+            if (op.required_bank != mir.BANK_GP && op.required_bank != mir.BANK_FP) {
+                ret R.err[*mir.MirInstr, str]("rules: expansion register operand omits its selected bank constraint");
+            }
+            val typed: R.Result[mir.OperandBank, str] = typed_operand_bank(builder.function, op);
+            if (R.is_err[mir.OperandBank, str](typed)) { ret R.err[*mir.MirInstr, str](R.unwrap_err[mir.OperandBank, str](typed)); }
+            if (R.unwrap_ok[mir.OperandBank, str](typed) != op.required_bank) {
+                ret R.err[*mir.MirInstr, str]("rules: expansion register operand violates its selected bank constraint");
+            }
+        }
+        oi = oi + 1;
     }
 
     var ops: *mir.MirOperand = nil;
@@ -133,6 +186,8 @@ pub fun emit(builder: *ExpansionBuilder, opcode: u32, operands: *mir.MirOperand,
     piece.src_width     = source.src_width;
     piece.vec_lane      = source.vec_lane;
     piece.writes_secret = source.writes_secret;
+    piece.memory_flags = source.memory_flags;
+    piece.security_boundary = mir.SECURITY_NONE;
     piece.loc           = source.loc;
     piece.inline_site   = source.inline_site;
     if (builder.emitted == 0) {
@@ -157,7 +212,7 @@ pub fun operand_rides_fp_bank(f: *mir.MirFunction, op: *mir.MirOperand) bool {
     ret false;
 }
 
-pub fun guard_fp_bank_move(f: *mir.MirFunction, mi: *mir.MirInstr) bool {
+pub fun guard_fp_bank_move(tgt: *isa.BackendTarget, f: *mir.MirFunction, mi: *mir.MirInstr) bool {
     ret operand_rides_fp_bank(f, ?mi.operands[0]) || operand_rides_fp_bank(f, ?mi.operands[1]);
 }
 
@@ -399,7 +454,7 @@ fun merge_dbg_bindings(a: *A.Allocator, cmp: *mir.MirInstr, br: *mir.MirInstr) R
     ret R.ok_void[str]();
 }
 
-fun select_block(pack: *RulePack, a: *A.Allocator, f: *mir.MirFunction, b: *mir.MirBlock) R.Result[R.Void, str] {
+fun select_block(pack: *RulePack, a: *A.Allocator, tgt: *isa.BackendTarget, f: *mir.MirFunction, b: *mir.MirBlock) R.Result[R.Void, str] {
     val n: u32 = b.instr_count;
     if (n == 0) { ret R.ok_void[str](); }
 
@@ -420,13 +475,26 @@ fun select_block(pack: *RulePack, a: *A.Allocator, f: *mir.MirFunction, b: *mir.
     var i:            u32  = 0;
     for (i < n) {
         val mi:   *mir.MirInstr = ?b.instrs[i];
-        val rule: *Rule         = find_rule(pack, f, mi);
+        val banks: R.Result[R.Void, str] = capture_operand_banks(f, mi);
+        if (R.is_err[R.Void, str](banks)) {
+            free_rule_cache(a, rules_for, n, cache_on_heap);
+            ret banks;
+        }
+        val rule: *Rule         = find_rule(pack, tgt, f, mi);
         if (rule == nil) {
             write_opcode_ice(mi.opcode);
             free_rule_cache(a, rules_for, n, cache_on_heap);
             ret R.err[R.Void, str]("internal compiler error: unhandled MIR opcode in instruction selection");
         }
         if (rule.kind == RULE_EXPAND) {
+            if (mi.security_boundary != mir.SECURITY_NONE) {
+                free_rule_cache(a, rules_for, n, cache_on_heap);
+                val error: R.Result[str, str] = format.sprint(a,
+                    "internal compiler error: instruction expansion has no destination-bound security transfer (opcode {}, source file {}, byte {})",
+                    mi.opcode, mi.loc.file, mi.loc.offset);
+                if (R.is_err[str, str](error)) { ret R.err[R.Void, str](R.unwrap_err[str, str](error)); }
+                ret R.err[R.Void, str](R.unwrap_ok[str, str](error));
+            }
             if (rule.expand == nil || rule.expansion_length == 0) {
                 free_rule_cache(a, rules_for, n, cache_on_heap);
                 ret R.err[R.Void, str]("rules: malformed expansion rule");
@@ -572,7 +640,7 @@ fun write_opcode_ice(opcode: u32) {
     os.write(os.STDERR_FD, "\n", 1);
 }
 
-fun t_operand_zero_is_preg_ten(f: *mir.MirFunction, mi: *mir.MirInstr) bool {
+fun t_operand_zero_is_preg_ten(tgt: *isa.BackendTarget, f: *mir.MirFunction, mi: *mir.MirInstr) bool {
     ret mi.operands[0].kind == mir.MIR_OP_PREG && mi.operands[0].preg == 10;
 }
 
@@ -615,7 +683,7 @@ fun t_function(blk: *mir.MirBlock, instrs: *mir.MirInstr, instr_count: u32, f: *
 
 test "mach.lang.be.codegen.rules.select:retag_pass_priority" {
     var alloc: A.Allocator;
-    var tgt:   target.Target;
+    var tgt:   isa.BackendTarget;
 
     var instrs: [3]mir.MirInstr;
     var ops:    [3][2]mir.MirOperand;
@@ -649,7 +717,7 @@ test "mach.lang.be.codegen.rules.select:retag_pass_priority" {
     var f:   mir.MirFunction;
     t_function(?blk, ?instrs[0], 3, ?f);
 
-    val r: R.Result[R.Void, str] = select(?pack, ?alloc, ?f);
+    val r: R.Result[R.Void, str] = select(?pack, ?alloc, ?tgt, ?f);
     if (R.is_err[R.Void, str](r)) { ret 1; }
 
     if (instrs[0].opcode != 101) { ret 1; }
@@ -664,7 +732,7 @@ test "mach.lang.be.codegen.rules.select:retag_pass_priority" {
 
 test "mach.lang.be.codegen.rules.select:guard_routing" {
     var alloc: A.Allocator;
-    var tgt:   target.Target;
+    var tgt:   isa.BackendTarget;
 
     var instrs: [2]mir.MirInstr;
     var ops:    [2][2]mir.MirOperand;
@@ -701,7 +769,7 @@ test "mach.lang.be.codegen.rules.select:guard_routing" {
     var f:   mir.MirFunction;
     t_function(?blk, ?instrs[0], 2, ?f);
 
-    val r: R.Result[R.Void, str] = select(?pack, ?alloc, ?f);
+    val r: R.Result[R.Void, str] = select(?pack, ?alloc, ?tgt, ?f);
     if (R.is_err[R.Void, str](r)) { ret 1; }
 
     if (instrs[0].opcode != 700) { ret 1; }
@@ -711,7 +779,7 @@ test "mach.lang.be.codegen.rules.select:guard_routing" {
 
 test "mach.lang.be.codegen.rules.select:gate_routing" {
     var alloc: A.Allocator;
-    var tgt:   target.Target;
+    var tgt:   isa.BackendTarget;
 
     var instrs: [2]mir.MirInstr;
     var ops:    [2][2]mir.MirOperand;
@@ -726,6 +794,8 @@ test "mach.lang.be.codegen.rules.select:gate_routing" {
         i = i + 1;
     }
     instrs[1].vec_lane = mir.vec_lane_make(mir.VEC_LANE_FLOAT, 4, 4);
+    ops[1][0] = mir.op_preg(isa.regid_make(isa.REG_CLASS_ID_XMM, 0)::u32);
+    ops[1][1] = mir.op_preg(isa.regid_make(isa.REG_CLASS_ID_XMM, 1)::u32);
 
     var rules_table: [2]Rule;
     rules_table[0].op   = 5;
@@ -748,7 +818,7 @@ test "mach.lang.be.codegen.rules.select:gate_routing" {
     var f:   mir.MirFunction;
     t_function(?blk, ?instrs[0], 2, ?f);
 
-    val r: R.Result[R.Void, str] = select(?pack, ?alloc, ?f);
+    val r: R.Result[R.Void, str] = select(?pack, ?alloc, ?tgt, ?f);
     if (R.is_err[R.Void, str](r)) { ret 1; }
 
     if (instrs[0].opcode != 501) { ret 1; }
@@ -758,7 +828,7 @@ test "mach.lang.be.codegen.rules.select:gate_routing" {
 
 test "mach.lang.be.codegen.rules.select:unmatched_opcode_fails" {
     var alloc: A.Allocator;
-    var tgt:   target.Target;
+    var tgt:   isa.BackendTarget;
 
     var instrs: [1]mir.MirInstr;
     var ops:    [2]mir.MirOperand;
@@ -783,7 +853,7 @@ test "mach.lang.be.codegen.rules.select:unmatched_opcode_fails" {
     var f:   mir.MirFunction;
     t_function(?blk, ?instrs[0], 1, ?f);
 
-    val r: R.Result[R.Void, str] = select(?pack, ?alloc, ?f);
+    val r: R.Result[R.Void, str] = select(?pack, ?alloc, ?tgt, ?f);
     if (!R.is_err[R.Void, str](r)) { ret 1; }
     ret 0;
 }
@@ -791,7 +861,7 @@ test "mach.lang.be.codegen.rules.select:unmatched_opcode_fails" {
 test "mach.lang.be.codegen.rules.select:expansion_identity_carriage" {
     var backing: A.Allocator;
     if (O.is_some[str](page.make(?backing))) { ret 1; }
-    var tgt: target.Target;
+    var tgt: isa.BackendTarget;
 
     val res_instrs: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](?backing, 3::usize);
     if (R.is_err[*mir.MirInstr, str](res_instrs)) { ret 1; }
@@ -799,8 +869,8 @@ test "mach.lang.be.codegen.rules.select:expansion_identity_carriage" {
     val res_exp_ops: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](?backing, 2::usize);
     if (R.is_err[*mir.MirOperand, str](res_exp_ops)) { ret 1; }
     val exp_ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](res_exp_ops);
-    exp_ops[0] = mir.op_preg(10);
-    exp_ops[1] = mir.op_preg(11);
+    exp_ops[0] = mir.op_preg(isa.regid_make(isa.REG_CLASS_ID_XMM, 0)::u32);
+    exp_ops[1] = mir.op_preg(isa.regid_make(isa.REG_CLASS_ID_XMM, 1)::u32);
 
     var edge_ops: [2][2]mir.MirOperand;
     edge_ops[0][0] = mir.op_preg(12);
@@ -825,6 +895,7 @@ test "mach.lang.be.codegen.rules.select:expansion_identity_carriage" {
     instrs[1].vec_lane          = mir.vec_lane_make(mir.VEC_LANE_INT, 4, 4);
     instrs[1].loc               = source.loc(3, 77);
     instrs[1].inline_site       = 5;
+    instrs[1].memory_flags      = mir.MEMORY_VOLATILE;
     instrs[1].dbg_bindings      = ?bindings[0];
     instrs[1].dbg_binding_count = 1;
     instrs[2].opcode        = 1;
@@ -852,7 +923,7 @@ test "mach.lang.be.codegen.rules.select:expansion_identity_carriage" {
     var f:   mir.MirFunction;
     t_function(?blk, instrs, 3, ?f);
 
-    val r: R.Result[R.Void, str] = select(?pack, ?backing, ?f);
+    val r: R.Result[R.Void, str] = select(?pack, ?backing, ?tgt, ?f);
     if (R.is_err[R.Void, str](r)) { ret 1; }
 
     if (blk.instr_count != 4) { ret 1; }
@@ -871,9 +942,11 @@ test "mach.lang.be.codegen.rules.select:expansion_identity_carriage" {
         if (blk.instrs[p].loc.file != 3)      { ret 1; }
         if (blk.instrs[p].loc.offset != 77)   { ret 1; }
         if (blk.instrs[p].inline_site != 5)   { ret 1; }
+        if (blk.instrs[p].memory_flags != mir.MEMORY_VOLATILE) { ret 2; }
         if (blk.instrs[p].asm_block != nil)   { ret 1; }
         if (blk.instrs[p].operand_count != 2) { ret 1; }
-        if (blk.instrs[p].operands[0].preg != 10) { ret 1; }
+        if (blk.instrs[p].operands[0].preg != isa.regid_make(isa.REG_CLASS_ID_XMM, 0)::u32) { ret 1; }
+        if (blk.instrs[p].operands[0].required_bank != mir.BANK_FP) { ret 2; }
         p = p + 1;
     }
     if (blk.instrs[1].opcode != 900) { ret 1; }
@@ -889,7 +962,7 @@ test "mach.lang.be.codegen.rules.select:expansion_identity_carriage" {
 test "mach.lang.be.codegen.rules.select:expansion_length_mismatch_fails" {
     var backing: A.Allocator;
     if (O.is_some[str](page.make(?backing))) { ret 1; }
-    var tgt: target.Target;
+    var tgt: isa.BackendTarget;
 
     val res_instrs: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](?backing, 1::usize);
     if (R.is_err[*mir.MirInstr, str](res_instrs)) { ret 1; }
@@ -920,7 +993,7 @@ test "mach.lang.be.codegen.rules.select:expansion_length_mismatch_fails" {
     var f:   mir.MirFunction;
     t_function(?blk, instrs, 1, ?f);
 
-    val r: R.Result[R.Void, str] = select(?pack, ?backing, ?f);
+    val r: R.Result[R.Void, str] = select(?pack, ?backing, ?tgt, ?f);
     if (!R.is_err[R.Void, str](r)) { ret 1; }
     ret 0;
 }
@@ -928,7 +1001,7 @@ test "mach.lang.be.codegen.rules.select:expansion_length_mismatch_fails" {
 test "mach.lang.be.codegen.rules.select:expansion_over_emission_fails" {
     var backing: A.Allocator;
     if (O.is_some[str](page.make(?backing))) { ret 1; }
-    var tgt: target.Target;
+    var tgt: isa.BackendTarget;
 
     val res_instrs: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](?backing, 1::usize);
     if (R.is_err[*mir.MirInstr, str](res_instrs)) { ret 1; }
@@ -959,7 +1032,7 @@ test "mach.lang.be.codegen.rules.select:expansion_over_emission_fails" {
     var f:   mir.MirFunction;
     t_function(?blk, instrs, 1, ?f);
 
-    val r: R.Result[R.Void, str] = select(?pack, ?backing, ?f);
+    val r: R.Result[R.Void, str] = select(?pack, ?backing, ?tgt, ?f);
     if (!R.is_err[R.Void, str](r)) { ret 1; }
     if (blk.instrs != instrs)  { ret 1; }
     if (blk.instr_count != 1)  { ret 1; }
@@ -984,7 +1057,7 @@ fun t_heap_instr(a: *A.Allocator, mi: *mir.MirInstr, opcode: u32, operands: *mir
 test "mach.lang.be.codegen.rules.combine_cbr:fuses_safe_shape" {
     var backing: A.Allocator;
     if (O.is_some[str](page.make(?backing))) { ret 1; }
-    var tgt: target.Target;
+    var tgt: isa.BackendTarget;
 
     val res_instrs: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](?backing, 2::usize);
     if (R.is_err[*mir.MirInstr, str](res_instrs)) { ret 1; }
@@ -1042,8 +1115,13 @@ test "mach.lang.be.codegen.rules.combine_cbr:fuses_safe_shape" {
     var f:   mir.MirFunction;
     t_function(?blk, instrs, 2, ?f);
     f.vreg_count = 3;
+    var vregs: [3]mir.MirVReg;
+    vregs[0] = mir.vreg(0, mir.REG_CLASS_GP, false, false);
+    vregs[1] = mir.vreg(1, mir.REG_CLASS_GP, false, false);
+    vregs[2] = mir.vreg(2, mir.REG_CLASS_GP, false, false);
+    f.vregs = ?vregs[0];
 
-    val r: R.Result[R.Void, str] = select(?pack, ?backing, ?f);
+    val r: R.Result[R.Void, str] = select(?pack, ?backing, ?tgt, ?f);
     if (R.is_err[R.Void, str](r)) { ret 1; }
 
     if (blk.instr_count != 1) { ret 1; }
@@ -1182,5 +1260,61 @@ test "mach.lang.be.codegen.rules.is_reg_move:membership" {
     if (!is_reg_move(?pack, 0x1000)) { ret 1; }
     if (is_reg_move(?pack, 2))       { ret 1; }
     if (is_reg_move(?pack, 0x1100))  { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.rules.capture_operand_banks:checks_opcode_before_preserving_type" {
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_preg(1); ops[1] = mir.op_preg(2); ops[2] = mir.op_preg(3);
+    var mi: mir.MirInstr = mir.instr(mir.MIR_FADD, ?ops[0], 3, 8, 8);
+    var f: mir.MirFunction;
+    if (R.is_ok[R.Void, str](capture_operand_banks(?f, ?mi))) { ret 1; }
+    var k: u32 = 0;
+    for (k < 3) { ops[k] = mir.op_preg(isa.regid_make(isa.REG_CLASS_ID_XMM, k::i32)::u32); k = k + 1; }
+    if (R.is_err[R.Void, str](capture_operand_banks(?f, ?mi))) { ret 2; }
+    mi.opcode = mir.MIR_FP_TO_SI; mi.operand_count = 2;
+    if (R.is_ok[R.Void, str](capture_operand_banks(?f, ?mi))) { ret 3; }
+    ops[0] = mir.op_preg(1);
+    if (R.is_err[R.Void, str](capture_operand_banks(?f, ?mi))) { ret 4; }
+    if (ops[0].required_bank != mir.BANK_GP || ops[1].required_bank != mir.BANK_FP) { ret 5; }
+    ops[0] = mir.op_vreg(0);
+    if (R.is_ok[R.Void, str](capture_operand_banks(?f, ?mi))) { ret 6; }
+    var vregs: [1]mir.MirVReg;
+    vregs[0] = mir.vreg(0, mir.REG_CLASS_GP, false, false);
+    f.vregs = ?vregs[0]; f.vreg_count = 1;
+    if (R.is_err[R.Void, str](capture_operand_banks(?f, ?mi))) { ret 7; }
+    if (ops[0].required_bank != mir.BANK_GP) { ret 8; }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.rules.emit:new_registers_require_explicit_bank_constraints" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var f: mir.MirFunction;
+    var source: mir.MirInstr = mir.instr(mir.MIR_ADD, nil, 0, 0, 0);
+    var dst: [2]mir.MirInstr;
+    var builder: ExpansionBuilder;
+    builder.allocator = ?alloc;
+    builder.function = ?f;
+    builder.source = ?source;
+    builder.dst = ?dst[0];
+    builder.limit = 2;
+    fin {
+        var i: u32 = 0;
+        for (i < builder.emitted) {
+            A.deallocate[mir.MirOperand](?alloc, dst[i].operands, dst[i].operand_count::usize);
+            i = i + 1;
+        }
+    }
+    var ops: [2]mir.MirOperand;
+    ops[0] = mir.op_preg(1); ops[1] = mir.op_imm(0);
+    if (R.is_ok[*mir.MirInstr, str](emit(?builder, 900, ?ops[0], 2))) { ret 2; }
+    if (builder.emitted != 0 || builder.cursor != 0) { ret 3; }
+    ops[0].required_bank = mir.BANK_GP;
+    if (R.is_err[*mir.MirInstr, str](emit(?builder, 900, ?ops[0], 2))) { ret 4; }
+    if (dst[0].operands[0].required_bank != mir.BANK_GP) { ret 5; }
+    ops[0].required_bank = mir.BANK_FP;
+    if (R.is_ok[*mir.MirInstr, str](emit(?builder, 900, ?ops[0], 2))) { ret 6; }
+    if (builder.emitted != 1 || builder.cursor != 1) { ret 7; }
     ret 0;
 }

@@ -24,7 +24,7 @@ engines_field() {
 # all_legs — every row that is a MACHINE: it declares a runner and it executes.
 #
 # a leg is somewhere a case runs, which is not the same set as the targets the
-# registry carries. `engine none` says a row executes nothing, so spirv, mos6502 and
+# registry carries. `engine none` says a row executes nothing, so spirv and
 # riscv32 are columns the x86_64-linux machine cross-builds and reads, never machines
 # of their own - a link case reaches them through case.conf's `target:`, which is the
 # axis that exists for exactly this. a row whose runner is `-` has nowhere to run at

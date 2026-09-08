@@ -33,16 +33,28 @@ if [ ! -f "$compiler" ]; then
     exit 2
 fi
 
-if [ ! -e "$here/provider/src" ]; then
-    ln -s ../../../src "$here/provider/src"
-fi
-"$compiler" dep pull "$here" >/dev/null
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+git init -q "$work"
+mkdir -p "$work/project" "$work/provider" "$work/std"
+sed 's|path = "provider"|path = "../provider"|' "$here/mach.toml" > "$work/project/mach.toml"
+cat >> "$work/project/mach.toml" <<'EOF'
+
+[dep.std]
+path = "../std"
+EOF
+cp -R "$here/src" "$work/project/"
+cp "$here/provider/mach.toml" "$work/provider/"
+cp -R "$root/src" "$work/provider/"
+cp "$root/dep/std/mach.toml" "$work/std/"
+cp -R "$root/dep/std/src" "$work/std/"
+"$compiler" dep pull "$work/project" >/dev/null
 
 verify_rejection() {
     artifact=$1
     first_type=$2
     second_type=$3
-    if output=$("$compiler" build "$here" --lib "$artifact" --emit obj 2>&1); then
+    if output=$("$compiler" build "$work/project" --lib "$artifact" --emit obj 2>&1); then
         echo "checked-types: $artifact unexpectedly compiled" >&2
         exit 1
     fi

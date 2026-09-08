@@ -109,16 +109,23 @@ pub val ASM_NOTE_INST:  u8 = 0;
 pub val ASM_NOTE_FUNC:  u8 = 1;
 pub val ASM_NOTE_BLOCK: u8 = 2;
 pub val ASM_NOTE_BYTES: u8 = 3;
+pub val ASM_NOTE_DECLASSIFY: u8 = 4;
 
 pub val ASM_NOTE_BYTES_WIDTH: usize = 4;
 
 pub rec AsmNote {
     kind:  u8;
     off:   u32;
+    byte_len: u32;
+    loc: source.SrcLoc;
+    inline_site: u32;
     inst:  isa.Inst;
     name:  intern.StrId;
     id:    u32;
     bytes: [ASM_NOTE_BYTES_WIDTH]u8;
+    boundary_dst: mir.MirOperand;
+    boundary_width: u8;
+    boundary_loc: source.SrcLoc;
 }
 
 val ASM_NOTE_INIT_CAP: u32 = 64;
@@ -142,12 +149,37 @@ pub fun sink_init(out: *writer.Writer, interner: *intern.Interner) AsmSink {
 
 pub fun note_blank() AsmNote {
     var n: AsmNote;
+    n.byte_len = 0;
+    n.loc = source.loc_nil();
+    n.inline_site = 0;
     n.kind = ASM_NOTE_INST;
     n.off  = 0;
     n.inst = isa.inst_blank();
     n.name = intern.STR_NIL;
     n.id   = 0;
+    n.boundary_dst = mir.MirOperand{};
+    n.boundary_width = 0;
+    n.boundary_loc = source.loc_nil();
     ret n;
+}
+
+pub fun note_security_boundary(buf: *ByteBuf, mi: *mir.MirInstr) R.Result[R.Void, str] {
+    if (mi.security_boundary == mir.SECURITY_NONE) { ret R.ok_void[str](); }
+    if (mi.security_boundary != mir.SECURITY_DECLASSIFY || mi.operands == nil
+        || mi.operand_count != 2 || mi.width == 0) {
+        ret R.err[R.Void, str]("internal compiler error: invalid emitted security boundary");
+    }
+    if (mi.operands[0].kind != mir.MIR_OP_PREG && mi.operands[0].kind != mir.MIR_OP_MEM) {
+        ret R.err[R.Void, str]("internal compiler error: emitted declassification has no physical destination");
+    }
+    if (!sink_active(buf)) { ret R.ok_void[str](); }
+    var note: AsmNote = note_blank();
+    note.kind = ASM_NOTE_DECLASSIFY;
+    note.off = buf.len::u32;
+    note.boundary_dst = mi.operands[0];
+    note.boundary_width = mi.width;
+    note.boundary_loc = mi.loc;
+    ret note_push(buf, ?note);
 }
 
 pub fun note_push(buf: *ByteBuf, n: *AsmNote) R.Result[R.Void, str] {
@@ -158,6 +190,16 @@ pub fun note_push(buf: *ByteBuf, n: *AsmNote) R.Result[R.Void, str] {
         if (R.is_err[R.Void, str](res_grow)) { ret res_grow; }
     }
     s.notes[s.note_count] = @n;
+    if (s.mi != nil) {
+        s.notes[s.note_count].loc = s.mi.loc;
+        s.notes[s.note_count].inline_site = s.mi.inline_site;
+    }
+    if (n.kind == ASM_NOTE_INST || n.kind == ASM_NOTE_BYTES) {
+        if (buf.len < n.off::usize || buf.len - n.off::usize > 0xFFFFFFFF::usize) {
+            ret R.err[R.Void, str]("encode: instruction notification extent is outside the text range");
+        }
+        s.notes[s.note_count].byte_len = (buf.len - n.off::usize)::u32;
+    }
     s.note_count = s.note_count + 1;
     if (n.kind == ASM_NOTE_INST || n.kind == ASM_NOTE_BYTES) {
         s.note_insts = s.note_insts + 1;
@@ -186,6 +228,7 @@ pub fun note_insert_after(buf: *ByteBuf, idx: u32, n: *AsmNote, nbytes: u32) R.R
         i = i - 1;
     }
     s.notes[at] = @n;
+    if (n.kind == ASM_NOTE_INST) { s.notes[at].byte_len = nbytes; }
     s.note_count = s.note_count + 1;
     if (n.kind == ASM_NOTE_INST) {
         s.note_insts = s.note_insts + 1;
@@ -481,6 +524,7 @@ pub def PatchBranchFn: fun(*EncodeState, *BranchFixup, u32) R.Result[R.Void, str
 pub rec EncodeHooks {
     encode_function: EncodeFunctionFn;
     patch_branch:    PatchBranchFn;
+    render_notes: fun(*ByteBuf) R.Result[R.Void, str];
 }
 
 pub fun encode_driver(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.MirModule, hooks: *EncodeHooks) R.Result[EncoderOutput, str] {
@@ -548,12 +592,28 @@ pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.
     for (fi < m.function_len) {
         st.last_inline_site = 0;
         val pre_sym_count: u32 = st.sym_count;
+        val first_fixup: u32 = st.fixup_count;
         val res_encode: R.Result[R.Void, str] = hooks.encode_function(?st, ?m.functions[fi]);
         if (R.is_err[R.Void, str](res_encode)) {
             notes_free(?st.buf);
             state_dnit(?st);
             ret R.err[EncoderOutput, str](R.unwrap_err[R.Void, str](res_encode));
         }
+        val patched: R.Result[R.Void, str] = patch_branches(?st, hooks, first_fixup);
+        if (R.is_err[R.Void, str](patched)) {
+            notes_free(?st.buf);
+            state_dnit(?st);
+            ret R.err[EncoderOutput, str](R.unwrap_err[R.Void, str](patched));
+        }
+        if (asm_out != nil && sink_active(?st.buf) && hooks.render_notes != nil) {
+            val rendered: R.Result[R.Void, str] = hooks.render_notes(?st.buf);
+            if (R.is_err[R.Void, str](rendered)) {
+                notes_free(?st.buf);
+                state_dnit(?st);
+                ret R.err[EncoderOutput, str](R.unwrap_err[R.Void, str](rendered));
+            }
+        }
+        notes_reset(?st.buf);
         if (st.sym_count > pre_sym_count) {
             st.syms[pre_sym_count].size = st.buf.len::u32 - st.syms[pre_sym_count].offset;
         }
@@ -574,12 +634,6 @@ pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.
     notes_free(?st.buf);
 
     map.dnit[u64, RelocPairSite](?st.reloc_pair_sites);
-    val res_patch: R.Result[R.Void, str] = patch_branches(?st, hooks);
-    if (R.is_err[R.Void, str](res_patch)) {
-        state_dnit(?st);
-        ret R.err[EncoderOutput, str](R.unwrap_err[R.Void, str](res_patch));
-    }
-
     val res_shrink: R.Result[R.Void, str] = shrink_text(?st);
     if (R.is_err[R.Void, str](res_shrink)) {
         state_dnit(?st);
@@ -1393,9 +1447,9 @@ test "mach.lang.be.codegen.encode.shrink_arrays:cap_equals_count_after_shrink" {
     ret 0;
 }
 
-fun patch_branches(st: *EncodeState, hooks: *EncodeHooks) R.Result[R.Void, str] {
+fun patch_branches(st: *EncodeState, hooks: *EncodeHooks, first: u32) R.Result[R.Void, str] {
     if (st.buf.data == nil) { ret R.ok_void[str](); }
-    var i: u32 = 0;
+    var i: u32 = first;
     for (i < st.fixup_count) {
         val fx: *BranchFixup = ?st.fixups[i];
         val res_off: R.Result[u32, str] = block_offset(st, fx.fn_text_base, fx.target_block);
@@ -1576,6 +1630,24 @@ fun put_decimal(buf: *u8, at: usize, n: usize) usize {
     ret k;
 }
 
+pub fun opcode_failure(st: *EncodeState, f: *mir.MirFunction, architecture: str, opcode: u32) R.Result[R.Void, str] {
+    if (st.alloc == nil || st.interner == nil) {
+        ret R.err[R.Void, str]("encode: opcode failure has no diagnostic owner");
+    }
+    var name: str = "<unknown>";
+    val found_name: O.Option[str] = intern.lookup(st.interner, f.name);
+    if (O.is_some[str](found_name)) { name = O.unwrap[str](found_name); }
+    val formatted: R.Result[str, str] = format.sprint(st.alloc, "cannot encode {} opcode tag {} in '{}'", architecture, opcode, name);
+    if (R.is_err[str, str](formatted)) { ret R.err[R.Void, str](R.unwrap_err[str, str](formatted)); }
+    val text: str = R.unwrap_ok[str, str](formatted);
+    fin { A.deallocate[u8](st.alloc, text, str_len(text) + 1); }
+    val saved: R.Result[intern.StrId, str] = intern.intern(st.interner, text);
+    if (R.is_err[intern.StrId, str](saved)) { ret R.err[R.Void, str](R.unwrap_err[intern.StrId, str](saved)); }
+    val found: O.Option[str] = intern.lookup(st.interner, R.unwrap_ok[intern.StrId, str](saved));
+    if (O.is_none[str](found)) { ret R.err[R.Void, str]("encode: opcode diagnostic is absent from its interner"); }
+    ret R.err[R.Void, str](O.unwrap[str](found));
+}
+
 pub fun asm_located_message(st: *EncodeState, loc: source.SrcLoc, msg: str) str {
     if (st.srcmap == nil || st.interner == nil) { ret msg; }
     if (!source.loc_is_valid(loc)) { ret msg; }
@@ -1625,6 +1697,74 @@ fun t_machine() *isa.MachineModel {
 
 fun t_row_state(alloc: *A.Allocator, st: *EncodeState) {
     state_blank(st, alloc, t_machine());
+}
+
+test "mach.lang.be.codegen.encode.security_boundary:owns_zero_byte_events_through_relaxation" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var st: EncodeState;
+    t_row_state(?alloc, ?st);
+    var sink: AsmSink = sink_init(nil, nil);
+    st.buf.asm = ?sink;
+    fin { notes_free(?st.buf); state_dnit(?st); }
+
+    var ops: [2]mir.MirOperand;
+    ops[0] = mir.op_preg(3);
+    ops[1] = mir.op_preg(3);
+    var boundary: mir.MirInstr = mir.instr(mir.MIR_DECLASSIFY, ?ops[0], 2, 8, 8);
+    boundary.opcode = isa.ISA_USE::mir.MirOpcode;
+    boundary.loc = source.loc(7, 19);
+    val zero: R.Result[R.Void, str] = note_security_boundary(?st.buf, ?boundary);
+    if (R.is_err[R.Void, str](zero)) { ret 1; }
+    if (st.buf.len != 0 || sink.accounted != 0 || sink.claims != 0
+        || sink.refused != 0 || sink.note_insts != 0 || sink.note_count != 1) { ret 2; }
+
+    ops[0] = mir.op_mem_slot(12, 4);
+    boundary.loc = source.loc(7, 29);
+    var i: u32 = 0;
+    for (i < 4) { emit_byte(?st.buf, 0); i = i + 1; }
+    var instruction: AsmNote = note_blank();
+    val first: R.Result[R.Void, str] = note_push(?st.buf, ?instruction);
+    if (R.is_err[R.Void, str](first)) { ret 3; }
+    val after: R.Result[R.Void, str] = note_security_boundary(?st.buf, ?boundary);
+    if (R.is_err[R.Void, str](after)) { ret 4; }
+    ops[0] = mir.op_preg(9);
+    boundary.width = 4;
+    boundary.loc = source.loc_nil();
+    i = 0;
+    for (i < 4) { emit_byte(?st.buf, 0); i = i + 1; }
+    instruction.off = 4;
+    val second: R.Result[R.Void, str] = note_push(?st.buf, ?instruction);
+    if (R.is_err[R.Void, str](second)) { ret 5; }
+
+    val gap: R.Result[R.Void, str] = insert_text(?st, 4, 4);
+    if (R.is_err[R.Void, str](gap)) { ret 6; }
+    val jump: R.Result[R.Void, str] = note_insert_after(?st.buf, 1, ?instruction, 4);
+    if (R.is_err[R.Void, str](jump)) { ret 7; }
+    val wide: R.Result[R.Void, str] = insert_text(?st, 8, 4);
+    if (R.is_err[R.Void, str](wide)) { ret 8; }
+    instruction.off = 8;
+    val tail: R.Result[R.Void, str] = note_insert_after(?st.buf, 2, ?instruction, 4);
+    if (R.is_err[R.Void, str](tail)) { ret 9; }
+
+    if (sink.note_count != 6 || sink.note_insts != 4 || sink.claims != 4
+        || sink.accounted != 16 || st.buf.len != 16 || sink.refused != 0) { ret 10; }
+    val before: *AsmNote = note_at(?st.buf, 0);
+    if (before.kind != ASM_NOTE_DECLASSIFY || before.off != 0
+        || before.boundary_dst.kind != mir.MIR_OP_PREG || before.boundary_dst.preg != 3
+        || before.boundary_width != 8 || before.boundary_loc.file != 7
+        || before.boundary_loc.offset != 19) { ret 11; }
+    val completed: *AsmNote = note_at(?st.buf, 4);
+    if (completed.kind != ASM_NOTE_DECLASSIFY || completed.off != 12
+        || completed.boundary_dst.kind != mir.MIR_OP_MEM || completed.boundary_dst.vreg != 12
+        || completed.boundary_dst.imm != 4 || completed.boundary_width != 8
+        || completed.boundary_loc.file != 7 || completed.boundary_loc.offset != 29) { ret 12; }
+    if (note_index_at(?st.buf, 0) != 1 || note_index_at(?st.buf, 4) != 2
+        || note_index_at(?st.buf, 8) != 3 || note_index_at(?st.buf, 12) != 5) { ret 13; }
+    notes_reset(?st.buf);
+    if (sink.note_count != 0 || sink.note_insts != 0 || sink.accounted != 16
+        || sink.claims != 4 || sink.refused != 0) { ret 14; }
+    ret 0;
 }
 
 test "mach.lang.be.codegen.encode.insert_text:shifts_line_rows" {

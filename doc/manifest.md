@@ -24,27 +24,30 @@ Nothing is inferred from the directory layout. `mach init` writes a complete
 manifest so a new project never starts from that error (see
 [cli.md](cli.md#mach-init)).
 
-A table you *declare*, you declare completely. Every field of a declared table is
-required; a missing field is a strict-parse error, not a silent default. This is
-the manifest twin of Mach's explicitness: there are no field defaults to memorize,
-because "any" and "none" are said out loud —
+Required fields must be present in every declared table. A missing required
+field is a schema error. At least one `[profile.*]` is required, and every profile
+must state `opt`, `debug`, `simd`, `vectorize`, and `float_reassoc`. The compiler
+does not synthesize profiles or use table order to choose build policy.
 
-- `"*"` is the explicit any-token for a filter axis or `targets` entry;
-- `[]` is the explicit empty list ("none").
+- `"*"` is the explicit any-token for a filter axis or `targets` entry.
+- `[]` is the explicit empty list.
 
-The sole exception is **shape-dependence**: a field whose presence follows another
-value in the same table. A dependency is `git` *or* `path`; a `[link.X]` names a
-`name` *or* a `path` according to its `source`. Nothing else defaults.
+The schema tables below distinguish required values from optional selectors and
+derived platform facts. For example, `default` is an optional selection marker,
+`of` can derive from the target tuple, and `subsystem` defaults to `console`.
+Shape-dependent fields remain explicit: a dependency selects `git` or `path`,
+and a link selects `name` or `path` according to its `source`.
 
 Unknown sections and unknown keys are always errors. A path value is always
 `/`-separated; a literal `\` is rejected (`manifest paths use '/'`), so the same
 manifest is portable and is normalized to the host separator at the filesystem
 boundary.
 
-### Root vs. dependency strictness
+### One schema for roots and dependencies
 
-A dependency's `mach.toml` is read by the same closed schema, once, and an
-unknown or removed key in it fails the consumer's build naming the dependency:
+Root and dependency manifests use the same required fields and closed schema.
+An unknown, removed, or missing required key in a dependency fails the consumer's
+build naming that dependency:
 
 ```
 error: dep 'std': mach.toml: unknown key 'bogus' in [project]
@@ -54,7 +57,8 @@ What a consumer *uses* from a dependency's manifest is its export surface: the
 project id, the module a bare `use <id>;` binds (see
 [language/modules.md](language/modules.md#bare-project-id-imports)), its
 `export = true` link entries, and the steps those entries demand. A dependency's
-`[profile.*]` and `[target.*]` tables are never read to build the consumer.
+`[profile.*]` and `[target.*]` tables are fully validated, but do not select the
+consumer's build policy. The consumer supplies the selected target and profile.
 
 ## The schema at a glance
 
@@ -71,9 +75,12 @@ os  = "linux"
 abi = "sysv64"
 
 [profile.debug]                        # a build variant
+default = true
 opt   = 0                              # 0 (debug pipeline) | 1 | 2 (release pipeline)
 debug = true                           # emit debug info for this profile
 simd  = "scalarize"                    # SIMD lever: "scalarize" | "require"
+vectorize = true
+float_reassoc = false
 
 [artifact.demo]                        # a produced artifact
 kind    = "bin"                        # "bin" | "static" | "shared"
@@ -81,7 +88,7 @@ entry   = "main.mach"                  # entry source, relative to src
 out     = "bin/demo"                   # output path, relative to the project out
 targets = ["*"]                        # which declared targets build it ("*" = all)
 link    = []                           # [link.X] names this artifact links
-need    = []                           # [step.X] / [artifact.X] names this artifact requires
+need    = []                           # qualified step.X / artifact.X requirements
 # subsystem = "gui"                    # optional: windows console/GUI selector
 # icon = "assets/demo.ico"             # optional: PE executable icon
 # manifest = "assets/demo.manifest"    # optional: PE application manifest
@@ -102,12 +109,10 @@ ref = "branch/main"
 | `src`     | string | Source root, project-root-relative. Module paths resolve under it. |
 | `out`     | string | The output-path template root, referenced as `{project.out}` by artifact `out`, step paths, and `cmd`s. Expanded over `{target.name}`/`{target.isa}`/`{target.os}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). |
 
-`[project]` is exactly these four keys. `name`, `description`, and `mach` are
-deprecated until 5.0.0: 4.26.x accepted them and never read them, so 4.30.0
-accepts them with a warning naming the key, the table, and the 5.0.0 refusal,
-in a root manifest and a dependency's alike; `[profile.<name>]`'s `emit_ir` and
-`emit_asm` are in the same window (emission is `--emit-ir`/`--emit-asm` on the
-command line). Any other key is an unknown-key error in every manifest.
+`[project]` uses exactly these four keys. The unused `name`, `description`,
+`mach`, and profile `emit_ir`/`emit_asm` keys are rejected as unknown keys.
+Use the command-line
+`--emit-ir` and `--emit-asm` switches for side artifacts.
 
 ## `[target.<name>]`
 
@@ -188,12 +193,12 @@ such an image is refused at link rather than silently dropped.
 
 | Axis  | Values |
 |-------|--------|
-| `isa` | `x86_64`, `aarch64`, `riscv64`, `riscv32`, `spirv` |
+| `isa` | `x86_64`, `aarch64`, `riscv64`, `riscv32`, canonical RISC-V extension strings, `spirv` |
 | `os`  | `linux`, `windows`, `darwin`, `freestanding` |
 | `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, `ilp32d`, `spirv` |
 
-`mos6502` (an `isa` and an `abi`) is still accepted by 4.30.0 as a withdrawn
-experiment and is removed in 5.0.0; do not declare it.
+The withdrawn `mos6502` ISA and ABI are removed. Declaring either is an
+unknown-target error.
 
 `x86_64`/`linux`/`sysv64` is the primary host and target. `aarch64`-linux builds
 and runs natively in CI on every PR; `riscv64`-linux runs under qemu and
@@ -207,13 +212,26 @@ not an os of its own. `spirv` is not a machine at all — it
 emits a finished GPU module rather than machine code (see
 [Finished-module targets](#finished-module-targets)).
 
-`riscv64` and `riscv32` are width-only spellings, and each names a **default
-profile**: `riscv64` is `rv64gc` and `riscv32` is `rv32imac`. That default is
-the only profile a target can name today. There is no key that bounds the
-extensions below it (an `isa = "rv32imc"` or a standard profile string is not
-accepted), and the width-only spelling is never rejected; extension bounding is
-future additive work. The ABI, not the isa, selects the calling convention and
-the float facts.
+`riscv64` and `riscv32` name the default profiles `rv64gc` and `rv32imac`.
+A canonical extension string such as `rv32imc` selects a smaller machine.
+The retained vocabulary is I, M, A, F, D, C, Zicsr and Zifencei, written in
+lowercase canonical order. G expands to IMAFD plus Zicsr and Zifencei.
+F includes its required Zicsr capability, and D requires F. Optional versions
+must match I 2.1, M 2.0, A 2.1, F/D 2.2, C 2.0 or Zicsr/Zifencei 2.0.
+Unknown extensions, unsupported versions, duplicates, noncanonical order,
+E-base machines and profiles outside this vocabulary are refused.
+
+The selected ISA bounds compiler-generated instructions and named inline assembly.
+Foreign object attributes must declare only selected extensions at the supported
+versions and the same register width. Linking never expands the selected ISA.
+Object header flags are checked even when attributes are absent. The compressed
+flag requires C, and flags for unavailable extensions or ABIs are refused.
+C is accepted as a hardware capability, but the current emitter uses full-width
+instructions. Explicit raw assembly directives remain the documented unchecked
+encoding boundary, so their author must ensure extension compatibility.
+The ABI selects calling convention independently and must fit the selected ISA.
+For example, `rv32imc` has no floating-point or atomic capability and requires
+`ilp32`. Use `rv32imafdc` with `ilp32d` when RV32 hardware floating point is needed.
 
 `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, and `ilp32d` are the RISC-V psABI
 calling-convention family, one `abi` per member. The lp64 three target
@@ -376,35 +394,27 @@ live here because they are variant concerns.
 | `opt`   | integer | Optimization level: `0` selects the debug pipeline (the always-on passes only), `1` and `2` select the release pipeline. `1` and `2` currently share a pass set, which includes loop auto-vectorization (see `vectorize` below). Any other integer — or a non-integer — is a manifest error. |
 | `debug` | bool    | Emit debug info (DWARF on ELF/Mach-O, CodeView on COFF) for this profile. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
 | `simd`  | string  | SIMD scalarization lever. `"scalarize"` emits a defined unrolled scalar expansion wherever the target has no packed instruction for a vector operator, with a build-time note. `"require"` makes that a hard error naming the operation, its **lane width**, the function and the target. It applies **per operation on every target**, not only to targets with no vector unit: x86-64's SSE2 baseline has no 32-bit lane integer multiply and NEON has no 64-bit one, so a capable target scalarizes too. Any other string is a manifest error. |
-| `vectorize` | bool | **Optional** auto-vectorization lever; absent it defaults to `true`. When `true`, the release pipeline rewrites provably-safe counted loops to 128-bit SIMD on a target with hardware vectors; `false` skips the pass, so release output stays scalar. A non-boolean is a manifest error. |
-| `float_reassoc` | bool | **Optional** permission to treat floating-point addition and multiplication as **associative**; absent it defaults to `false`. It lets the vectorizer reduce an `f32`/`f64` accumulator through lane-count partial sums, which changes the result — see [Float reassociation](#float-reassociation) for what that costs and what it buys. A non-boolean is a manifest error. |
-| `default` | bool | **Optional.** `true` marks the profile a build uses when several are declared and `--profile` is absent. Exactly one profile may carry it. See [Built-in profiles and profile selection](#built-in-profiles-and-profile-selection). |
+| `vectorize` | bool | **Required** auto-vectorization policy. When `true`, the release pipeline rewrites provably-safe counted loops to 128-bit SIMD on a target with hardware vectors; `false` skips the pass, so release output stays scalar. A non-boolean is a manifest error. |
+| `float_reassoc` | bool | **Required** permission to treat floating-point addition and multiplication as **associative**. It lets the vectorizer reduce an `f32`/`f64` accumulator through lane-count partial sums, which changes the result — see [Float reassociation](#float-reassociation) for what that costs and what it buys. A non-boolean is a manifest error. |
+| `default` | bool | **Optional.** `true` marks the profile a build uses when several are declared and `--profile` is absent. Exactly one profile may carry it. See [Profile selection](#profile-selection). |
 
-Three keys (`opt`, `debug`, `simd`) are required in a declared profile;
-`vectorize` and `float_reassoc` are optional, defaulting to on and off
-respectively, and `default` is optional.
+All five policy keys (`opt`, `debug`, `simd`, `vectorize`, `float_reassoc`) are
+required in every profile. `default` is optional and affects selection only.
+A missing policy field is diagnosed even in a dependency manifest.
 
-### Built-in profiles and profile selection
+### Profile selection
 
-A manifest that declares no `[profile.*]` table at all gets two built-in
-profiles, `debug` (`opt = 0`, `debug = true`) and `release` (`opt = 2`), and
-`debug` is the default. Declaring any profile replaces both built-ins: a
-manifest with only `[profile.fast]` has no `debug` and no `release`.
+A manifest must declare at least one profile. There are no built-in `debug` or
+`release` profiles. Those names exist only when the manifest declares them.
 
-Which profile a build uses follows one rule, the same one that selects a
-target and an artifact:
+1. An explicit `--profile <name>` selects that declared profile.
+2. Otherwise a sole declared profile is chosen.
+3. Otherwise exactly one profile must be marked `default = true`.
 
-1. an explicit `--profile <name>` wins;
-2. otherwise a sole declared profile is chosen;
-3. otherwise the one marked `default = true` is chosen.
+Several profiles without a default require an explicit selection. Multiple
+defaults are a schema error. Table order never chooses a profile, target, or
+artifact.
 
-Table order carries no meaning. In 4.30.0 a manifest that declares several
-profiles and marks none still builds: the first declared profile is taken with
-a warning that names the fix. 5.0.0 refuses that manifest.
-
-```
-warning: mach.toml: several profiles are declared and none is marked `default = true`; the first declared profile is selected by table order, which 5.0.0 stops doing: mark exactly one [profile.<name>] with `default = true` or select one with --profile
-```
 Emission of the human-readable IR and assembly side-artifacts is **not** a profile
 concern — it is controlled only by the `--emit-ir` / `--emit-asm` CLI flags (see
 [cli.md](cli.md)).
@@ -424,11 +434,10 @@ does nothing else; `vectorize = false` switches the pass off wholesale and so ov
 it.
 
 The `simd`, `vectorize` and `float_reassoc` levers are always the **consumer's**.
-Consistent with the root-vs-dependency strictness above, a dependency's `[profile.*]`
-is parsed permissively and never read to build the consumer, so a library's values are
-inert — the effective levers come from the consumer's resolved profile. Libraries set
-nothing SIMD-specific and inherit the consumer's choice; there is no ecosystem fork and
-no dual API.
+A dependency's `[profile.*]` tables meet the same schema, including all five
+required policy keys. They govern builds of that dependency as a root project.
+When its source is built into a consumer, the effective levers come from the
+consumer's resolved profile.
 
 ### Float reassociation
 
@@ -507,14 +516,14 @@ reads the selected artifact's name.
 |-----------|----------|---------|
 | `kind`    | yes | `"bin"`, `"static"`, or `"shared"` (see below). |
 | `entry`   | yes | Entry source, relative to the project `src` dir (e.g. `main.mach` for `src/main.mach`). The entry module's FQN is `<id>.<entry without .mach>`, `/` turned into `.`. |
-| `out`     | yes | This artifact's output path, **relative to the expanded project `out`** and rooted there automatically — write `bin/demo`, not `{project.out}/bin/demo`. An executable extension, where wanted, is written literally here, and it is one string shared by every target in `targets`, so an executable that ships on Windows and elsewhere **cannot use `targets = ["*"]`** (see [One artifact per extension convention](#one-artifact-per-extension-convention)). |
+| `out`     | yes | This artifact's output path, **relative to the expanded project `out`** and rooted there automatically — write `bin/demo`, not `{project.out}/bin/demo`. Use `{artifact.suffix}` for the target extension, or write a literal filename. See [Artifact filenames and identity](#artifact-filenames-and-identity). |
 | `targets` | yes | Array of declared target names this artifact builds for; `["*"]` means every declared target. |
 | `link`    | yes | Array of `[link.X]` names this artifact links (see below). `[]` for none. A name with no table is a manifest error naming the artifact and the declared tables (`[artifact.p1].link names no [link.*] table: 'nosuch' (declared: [link.kernel32])`). |
-| `need`    | yes | Array of `[step.X]` and `[artifact.X]` names this artifact requires, and `*`-globs over both. `[]` for none. See [Artifact requirements](#artifact-requirements). |
+| `need`    | yes | Array of category-qualified requirements such as `step.generate`, `artifact.support`, and `artifact.shader-*`. Each glob matches only its named category. `[]` for none. See [Artifact requirements](#artifact-requirements). |
 | `subsystem` | no | `"console"` (default) or `"gui"` — the environment a windows executable declares it runs under (see below). |
 | `icon` | no | Project-root-relative `.ico` path embedded in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
 | `manifest` | no | Project-root-relative application-manifest path embedded byte-for-byte in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
-| `default` | no | `true` marks the artifact chosen when a command needs one artifact (`mach test`, `mach run`, the editor's union build) and several declared artifacts support the selected target. Exactly one of those candidates may carry it; an explicit `--bin`/`--lib` always wins, and a sole candidate needs no marker. |
+| `default` | no | `true` marks the artifact chosen when a command needs one artifact (`mach test`, `mach run`, the editor's union build) and several declared artifacts support the selected target. Exactly one of those candidates may carry it; an explicit `--bin`/`--lib` always wins, and a sole candidate needs no marker. For dependency bare imports, a library requires this marker even when it is the sole artifact. See [public modules](language/modules.md#bare-project-id-imports). |
 
 `entry` is the build cell's source root. The build follows its active `use` and
 `fwd` edges transitively and compiles that reachable module set; another file under
@@ -526,66 +535,52 @@ every module in the current project's `src` tree.
 - **`bin`** links an executable at the resolved `out` path.
 - **`static`** materialises a real `ar` archive at the resolved `out` path — the
   per-module objects with an archive symbol index, the deliverable a consumer links
-  as a `.a` (#1997).
-- **`shared`** is reserved for a shared-library deliverable; its emission is phase 2
-  (#1980).
+  using the selected static-library filename, such as `.a` or `.lib`.
+- **`shared`** links a shared-library deliverable where the selected format
+  supports that artifact kind. Unsupported kinds are refused.
 
-Per-target extension or per-target entry is not a per-cell exception table — it is a
-second artifact stanza, so the condition stays visible like everything else.
+A filename extension can vary through `{artifact.suffix}` while retaining one
+artifact identity. Different entry modules use separate artifact declarations
+with explicit target sets.
 
-### One artifact per extension convention
+### Artifact filenames and identity
 
-`out` is one literal string, and every target in `targets` resolves it the same way.
-Windows will not execute a file without an executable extension until someone renames
-it by hand, and no other platform wants one, so there is no single `out` that is right
-for both. `bin/app` gives Windows an unrunnable `app`, and `bin/app.exe` gives linux
-and darwin a binary called `app.exe`. An executable that ships on Windows and anywhere
-else therefore cannot use `targets = ["*"]`. It is two artifacts with disjoint
-`targets` lists:
+Use `{artifact.suffix}` in an artifact's `out` to select its target filename
+extension. Literal paths stay literal. No prefix is inserted, so a library may
+spell its desired `lib` prefix directly.
 
 ```toml
 [artifact.app]
 kind = "bin"
 entry = "main.mach"
-out = "bin/app"
-targets = ["linux-x86_64", "darwin-aarch64"]
-link = []
-need = []
-
-[artifact.app-windows]
-kind = "bin"
-entry = "main.mach"
-out = "bin/app.exe"
-targets = ["windows-x86_64"]
+out = "bin/app{artifact.suffix}"
+targets = ["*"]
 link = []
 need = []
 ```
 
-This is deliberate rather than a defect, and it costs three things worth knowing before
-you meet them.
+This produces `app.exe` on Windows and `app` on Linux and Darwin. The artifact
+name and `$bin.name` remain `app` on every target. `mach init` generates one
+artifact using this form. Build, run, clean, required-artifact paths and plan
+inspection use the same expansion.
 
-The two stanzas differ only in `out` and `targets` and are otherwise duplicates, so
-they drift. A `link` or `need` added to one and not the other changes the build on
-Windows only, which is the platform least likely to be the one in front of you.
+| Target output format | `bin` suffix | `static` suffix | `shared` suffix |
+| --- | --- | --- | --- |
+| ELF on Linux or freestanding | empty | `.a` | `.so` |
+| Mach-O on Darwin | empty | `.a` | `.dylib` |
+| COFF/PE on Windows | `.exe` | `.lib` | `.dll` |
+| Raw image | empty | unsupported | unsupported |
+| SPIR-V module | `.spv` | unsupported | unsupported |
 
-Every new target has to be added to the right list by hand, because neither stanza can
-use `*`. Declaring a target and forgetting to list it means that target simply builds
-nothing.
+The selected object format supplies the naming rules, including explicit target
+format overrides. Unsupported library forms are errors. Module-producing backends
+retain their existing per-module output behavior.
 
-The artifact **name** differs between the two, so `$bin.name` differs by platform: a
-project that reads it sees `app` everywhere and `app-windows` on Windows. Nothing in
-mach's own source reads it, and a project that does needs to expect both.
-
-`mach build` enumerates artifact-by-target cells and builds only the ones that match,
-so each platform gets its stanza with nothing named on the command line. `mach test`
-links the whole source tree rather than one artifact, but selects its primary context
-from the sole artifact that declares the resolved target, so the same split works
-there. `mach run` selects the target's artifact when exactly one matches; if several
-artifacts can run on that target, it still asks for `--bin` rather than guessing.
-
-mach's own `mach.toml` is split this way: an ordinary Windows build produces
-`bin/mach.exe`, and its test run selects `mach-windows` as the primary context without
-a command-line workaround.
+`{artifact.suffix}` is available only in an artifact output template. It does not
+expand in project output roots, link paths, step arguments or source embeds.
+Output collisions are checked after expansion among artifacts selected for the
+target. An explicit literal such as `bin/app.exe` can therefore collide with
+`bin/app{artifact.suffix}` on Windows.
 
 ### `subsystem` — the windows console/GUI selector
 
@@ -780,7 +775,7 @@ plain identifier — it keys the step's stamp file.
 | `env`  | no  | Table of string values added to the step process's environment. |
 | `in`   | yes | Declared input file list. Accepts globs (`*`, `**`), expanded sorted for a stable fingerprint; a glob that matches nothing is a hard error. |
 | `out`  | yes | Declared output file list. Concrete paths only — a glob here is an error, since the demand match and cache key expand `out` verbatim. |
-| `need` | yes | Array of other `[step.X]` names this step must run after (explicit ordering; cycles error). `[]` for none. |
+| `need` | yes | Array of `step.<name>` requirements or `step.<pattern>` globs this step must run after. Steps may require only steps. Cycles are manifest errors. `[]` for none. |
 | `timeout_seconds` | no | Positive integer number of seconds after which the step's process group is terminated and the build fails. Omit for an unbounded step. |
 
 Steps carry **no filters** and **never run automatically**. A step runs only when
@@ -795,9 +790,10 @@ Because a step has no filter of its own, the condition for running it lives in t
 link entry that demands it: on a build cell where that entry filters out, the step
 is never demanded and never runs.
 
-A step is cached by content: its `in` contents plus its expanded `argv` fingerprint
-the step (the query engine's `Q_LINK_CONFIG` pattern). An unchanged step whose
-outputs still exist is skipped; change an input or the command and it re-runs.
+A step is cached by content: its declared inputs, resolved executable, expanded
+arguments, and effective environment contribute to its fingerprint. An unchanged
+step whose outputs still exist is skipped. Changing an inherited environment
+value received by the child also invalidates the step.
 
 **Bounding a step.** `timeout_seconds` gives the step a deadline measured from
 the moment it is spawned. When the deadline passes, the step's whole process
@@ -852,9 +848,13 @@ distinct sibling such as `{project.out}/vendor/<library>/`.
 build cell's target tuple as `MACH_TARGET_ISA`, `MACH_TARGET_OS`, and
 `MACH_TARGET_ABI`, so the script `argv` invokes can branch on the target
 without threading it through the template — e.g. `cc --target=$MACH_TARGET_ISA-…`.
-The step's environment is the planner's environment with those three variables
-**replaced**, never appended: a `MACH_TARGET_*` value inherited from an
-enclosing build is overwritten by the cell's own. The same three values are
+The step inherits the planner's environment, then applies its declared `env`
+values, then assigns those three target variables. Names use host identity:
+case-sensitive on Unix and ordinal case-insensitive on Windows, including Unicode
+names. A declaration cannot contain names differing only in ASCII case on any
+host, or names that alias under Windows Unicode comparison on Windows. Each name
+has one value. A `MACH_TARGET_*` value inherited from an enclosing
+build or declared by the step is overwritten by the cell's own. The same three values are
 available in the `argv` templates as the `{target.*}` keys (see
 [Path templates](#path-templates)).
 
@@ -881,7 +881,7 @@ A stanza declares exactly one source:
 |--------|---------|
 | `git`  | Git URL. The dependency is a git **submodule** at `dep/<id>/`, pinned by the gitlink the root repository commits. Requires `ref`. |
 | `ref`  | Selector for `git`: `branch/<name>`, `tag/<name>`, or `commit/<full-object-id>`. Any other spelling is rejected (`[dep.std].ref must be branch/<name>, tag/<name>, or commit/<full-object-id>`). |
-| `path` | Local project tree, never fetched. A relative `path` is resolved relative to this manifest's directory. `mach dep add --path` copies its tracked files into `dep/<id>/` as ordinary tracked files of the root repository, without the source's own `dep/`. Forbids `ref`. |
+| `path` | Local project tree, never fetched. A relative `path` is resolved relative to this manifest's directory. `mach dep add <path> <id> --path` copies its files into `dep/<id>/` without the source's own `dep/` or Git metadata. No repository or index is required for a path dependency, and copied files are not automatically staged. Forbids `ref`. |
 
 `git` and `path` are mutually exclusive and exactly one is required. A
 registry-style `version =` is reserved and rejected
@@ -892,13 +892,14 @@ registry-style `version =` is reserved and rejected
 The record of which commit a dependency is at is the **gitlink** committed in
 the root repository, generated into `.gitmodules` by `mach dep`. Nothing else
 records a pin: there is no `mach.lock`, and a `mach.lock` left over from an
-earlier release is not read. In 4.30.0 it is ignored; 5.0.0 rejects a project
-that carries one, with a diagnostic naming the migration.
+earlier release is rejected without reading it. Remove the file and retain
+the committed gitlinks as the dependency pins.
 
-Because the pin is a gitlink, the source distribution of a project is a git
-clone: a tree without `.git` does not build, and dependency verification never
-degrades in its absence (`project root '...' is not inside a Git repository;
-dependency realization is verified from Git`).
+A project does not need its own Git repository. In a repository root, Git
+dependencies use the staged gitlinks as their pins. In a filesystem project or a
+project nested inside an unrelated repository, they are plain clones whose own
+checkout commits are verified. Local path dependencies are verified from their
+filesystem realizations, independently of any Git index.
 
 ### The root owns the flat closure
 
@@ -948,13 +949,13 @@ local mirror) verifies by its commit alone.
 Builds never fetch and never write under `dep/`. Every build (and `mach dep
 verify` as a command) checks, offline, that:
 
-1. every `dep/<id>` is a gitlink checked out at the committed commit and clean
-   (`dependency 'std': checkout is dirty:  M mach.toml`), or tracked path
-   content;
+1. every Git dependency is a clean checkout at its applicable pin
+   (`dependency 'std': checkout is dirty:  M mach.toml`), and every path
+   dependency is a contained filesystem tree without repository metadata;
 2. its project id equals the directory name;
 3. the closure computed from the realized manifests equals the set of
    directories under `dep/`: nothing missing (`dependency 'std' is not
-   resolved (missing 'dep/std'); run `mach dep pull`), nothing extra;
+   resolved (missing 'dep/std'); run `mach dep pull <path>`), nothing extra;
 4. there are no cycles (reported as the chain).
 
 The committed gitlink is what is verified, and the root's own declaration is
@@ -964,7 +965,7 @@ root does **not** declare, every requirer's exact selector (`tag/`, resolved
 through the checkout's own refs, or `commit/`) must be satisfied by the
 realized commit; a mismatch names both commits and the two remedies
 (`dependency 'b': exact ref 'tag/v1.0.0' resolves to '<commit>' but the
-realized commit is '<other>'; run `mach dep update b` to re-pin it, or declare
+realized commit is '<other>'; run `mach dep update <path> b` to re-pin it, or declare
 the identity at the root to override`; a root `commit/` that does not match
 reads `exact commit ref 'commit/<id>' is not satisfied by the realized commit
 '<other>'`). A `branch/` selector is an input to `update`, never a verify fact.
@@ -978,8 +979,8 @@ a checkout of its own.
 
 A project root is identified by its own `mach.toml`, not by an enclosing git
 repository; `dep/<id>` is resolved relative to the project root. A project
-nested inside an unrelated repository builds. When the root is not a repository
-root, verification says so rather than reporting a missing gitlink.
+nested inside an unrelated repository or without any repository builds. Git
+dependencies in these projects are verified from their own plain checkouts.
 
 ### Selection on `update`
 
@@ -999,20 +1000,18 @@ top: among tagged releases at or above every tested floor and within one
 major, the highest is proposed; candidates spanning two majors are a clash.
 The proposal never bypasses a root override.
 
-### 4.30.0 and 5.0.0
+### Removed dependency forms
 
-4.30.0 accepts two older forms beside the ones above and notes the migration;
-5.0.0 rejects them:
-
-- an **alias key**, a `[dep.<key>]` whose realized project declares a
-  different id. 4.30.0 realizes it and prints
-  `note: [dep.foo] realizes project 'std'; rename the table to [dep.std] and
-  the directory to dep/std. alias keys are rejected in 5.0.0`;
-- **nested realization**, a `dep/<id>/dep/` left by an older tool; 4.30.0
-  ignores it;
-- `mach.lock`, ignored in 4.30.0 as above; `pull` prints
-  `note: mach.lock is not read; the committed gitlinks under dep/ are the
-  pins, so delete it. mach.lock is rejected in 5.0.0`.
+- An **alias key**, a `[dep.<key>]` whose realized project declares a different
+  id, is rejected. Rename the table and its directory under `dep/` to the
+  declared project id.
+- A **nested realization**, a nonempty dependency beneath `dep/<id>/dep/`, is
+  rejected. Dependencies are realized in the consuming project's flat `dep/`
+  directory. Empty directories are placeholders, not realized dependencies,
+  and remain permitted without requiring Git metadata.
+- A root `mach.lock` is rejected before dependency operations or compilation.
+  Remove it and use committed gitlinks as the pins. Inspection failures are
+  reported as errors, not treated as absence.
 
 Command-line usage (`pull`, `verify`, `add`, `update`, `remove`, `list`) is
 documented in [cli.md](cli.md#mach-dep).
@@ -1055,18 +1054,20 @@ collide and fail at build start.
 
 ## Artifact requirements
 
-An artifact's `need` names what must exist before it is built. An entry is a
-`[step.X]` name, an `[artifact.X]` name, or a `*`-glob matching either. A glob
-never matches the artifact that declares it.
+An artifact's `need` names what must exist before it is built. Every entry
+identifies its category: `step.generate` selects `[step.generate]`, while
+`artifact.support` selects `[artifact.support]`. A `*` glob applies only within
+that category, so `artifact.shader-*` never selects a similarly named step.
+A step and an artifact may share a name. List both qualified names to require both.
 
 A required artifact is built before its consumer, for the consumer's profile and
-for the required artifact's **own** targets: the consumer's target when the
-requirement declares it, and otherwise every target the requirement names. That is
-what lets a host executable require a shader compiled for an accelerator target.
+for the required artifact's own targets: the consumer's target when the
+requirement declares it, and otherwise every target the requirement names.
 A requirement reached from several consumers is built once.
 
-Inside the consumer, `{artifact.<id>.out}` expands to that artifact's output path,
-so the consumer can name the file:
+Inside the consumer, `{artifact.<id>.out}` expands to that artifact's output path.
+It is an error to name an artifact the consumer does not require, or one that
+builds for several targets here and therefore has no single output.
 
 ```toml
 [artifact.shader-blur]
@@ -1083,7 +1084,7 @@ entry   = "main.mach"
 out     = "bin/app"
 targets = ["linux-x86_64"]
 link    = []
-need    = ["shader-*"]
+need    = ["artifact.shader-*"]
 ```
 
 ```mach
@@ -1101,15 +1102,15 @@ dependency.
 
 These are errors:
 
-- a `need` entry that is neither an identifier nor a glob over one;
-- a name that is both a `[step.X]` and an `[artifact.X]` — the diagnostic names
-  both tables, and one of them has to be renamed;
-- a name matching no declared step or artifact;
-- a glob matching nothing — an empty match is an error, not an empty set;
-- an artifact that requires itself, and any cycle among artifacts, reported with
-  the chain (`a -> b -> c -> a`);
-- `{artifact.<id>.out}` naming an artifact the consumer does not require, or one
-  that builds for more than one target here and so has no single output.
+- a missing or malformed category prefix, including bare names;
+- a name or glob matching no declaration in its named category;
+- an explicit self-requirement, or a glob matching only the declaring item;
+- an artifact requirement in a step's `need` list;
+- artifact cycles and step cycles, including cycles formed by globs.
+
+Globs exclude the declaring item. Matching declarations retain manifest order,
+and transitive prerequisites run before their consumers. Both root and dependency
+manifests receive these checks during parsing, before planning can execute a step.
 
 A required artifact that fails to build fails its consumer, naming the requirement,
 and the consumer is not attempted.
@@ -1124,13 +1125,12 @@ A build cell is one artifact × one target × one profile.
   artifact; `--target <name>` selects a declared target; `--profile <name>` selects
   a profile.
 - `mach run <path>` consumes exactly one artifact. With no `--bin`/`--lib`, it selects
-  one when exactly one artifact declares the resolved target; if several do, it asks
-  you to pick one, naming every candidate.
+  one when exactly one executable artifact declares the resolved target. With
+  several candidates, use an explicit selector or exactly one applicable default.
 - `mach test <path>` and `mach doc <path>` need one artifact as their primary
   context and select it by the same rule as everything else: `--bin`/`--lib`
   wins, a sole artifact that declares the resolved target is chosen, several
-  need exactly one `default = true` (4.30.0 falls back to the first declared
-  with a warning; 5.0.0 refuses). `mach test` links the union of all artifacts' referenced entries plus
+  need exactly one `default = true`, or an explicit artifact selector. `mach test` links the union of all artifacts' referenced entries plus
   exported dependency entries, filtered to that target. Foreign-target tests require
   a compatible `--runner`. If two artifacts' objects collide on symbols in that union,
   that is an honest link error — restructure the entries.
@@ -1189,10 +1189,9 @@ never a synthesized tuple. Exactly one host match is chosen; several matching tu
 is an ambiguity error naming the candidates. With no match, a sole declared target
 is chosen with a warning, so a cross-only project still builds on a foreign host;
 several declared targets select the one marked `default = true` (or an explicit
-`--target`). A manifest that declares several and marks none still builds in 4.x:
-the first declared target is taken, with a deprecation warning, and 5.0.0 refuses
-that manifest, since table order carries no meaning. The same window applies to
-`[profile.*]` and to `[artifact.*]` when a command needs one artifact.
+`--target`). With several declared targets and no host match or default, selection fails with the required selector or default. Table order carries no meaning. Profiles and commands that
+need one artifact likewise require a sole candidate, an explicit selector, or
+exactly one applicable default.
 
 ## Worked example: a consumer of C bindings and vendored C
 
@@ -1290,14 +1289,20 @@ os  = "windows"
 abi = "win64"
 
 [profile.debug]
+default = true
 opt   = 0
 debug = true
 simd  = "scalarize"
+vectorize = true
+float_reassoc = false
 
 [profile.release]
 opt   = 2
 debug = false
 simd  = "scalarize"
+vectorize = true
+float_reassoc = false
+
 ```
 
 The `gl` and `shim-x11` entries carry `os = "linux"`, so on a windows build cell
@@ -1318,6 +1323,21 @@ id      = "glfw"
 version = "0.3.0"
 src     = "src"
 out     = "out/{target.name}/{profile.name}"
+
+[profile.debug]
+default = true
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[profile.release]
+opt = 2
+debug = false
+simd = "scalarize"
+vectorize = true
+float_reassoc = false
 
 [link.glfw]
 source = "system"
@@ -1367,6 +1387,21 @@ version = "1.0.3"
 src     = "src"
 out     = "out/{target.name}/{profile.name}"
 
+[profile.debug]
+default = true
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[profile.release]
+opt = 2
+debug = false
+simd = "scalarize"
+vectorize = true
+float_reassoc = false
+
 [link.miniz]
 source = "local"
 path   = "{project.out}/obj/miniz/miniz.o"
@@ -1384,13 +1419,13 @@ need = []
 
 ## The compiler's own manifest
 
-Mach builds itself from a manifest that declares six targets, two binary
-artifacts split on the executable extension, and one dependency, `std`:
+Mach builds itself from a manifest that declares six targets, one binary
+artifact, two explicit profiles, and one dependency, `std`:
 
 ```toml
 [project]
 id = "mach"
-version = "4.26.5"
+version = "4.30.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
@@ -1406,40 +1441,38 @@ abi  = "win64"
 stack_reserve = 0x800000
 
 [profile.debug]
+default = true
 opt = 0
 debug = false
 simd = "scalarize"
+vectorize = true
+float_reassoc = false
 
 [profile.release]
 opt = 2
 debug = false
 simd = "scalarize"
+vectorize = true
+float_reassoc = false
 
 [artifact.mach]
 kind = "bin"
 entry = "bin/main.mach"
-out = "bin/mach"
-targets = ["linux-x86_64", "linux-arm64", "linux-riscv64", "darwin-x86_64", "darwin-aarch64"]
-link = []
-need = []
-
-[artifact.mach-windows]
-kind = "bin"
-entry = "bin/main.mach"
-out = "bin/mach.exe"
-targets = ["windows-x86_64"]
+out = "bin/mach{artifact.suffix}"
+targets = ["*"]
 link = []
 need = []
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "branch/main"
+ref = "tag/v1.0.1"
 ```
 
 (The full manifest declares all six targets; `version` is whatever the tree's
 current release is.) `mach build .` selects the host-matching target via
-`native`, compiles `src/bin/main.mach` and its transitive imports — including
-modules from `std` at `dep/std/` — and links `out/<target>/<profile>/bin/mach`.
+`native`, compiles `src/bin/main.mach` and its transitive imports including
+modules from `std` at `dep/std/`, and links `out/<target>/<profile>/bin/mach`
+with the selected target suffix.
 `dep/std` is a git submodule whose gitlink is the pin; the build resolves it
 purely by that directory and verifies the gitlink from the repository's index,
 fetching nothing.

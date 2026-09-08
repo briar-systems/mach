@@ -134,7 +134,13 @@ another layer's output.
 pipelines, plus a third `-g` build. `llvm-readobj --file-header --sections --relocs`
 must parse cleanly, and the class, machine and endianness must match the target.
 SPIR-V goes to `spirv-val` under the environment the module itself declares.
-`llvm-dwarfdump --verify` must pass on the debug build. A `raw` flat image has no
+`llvm-dwarfdump --verify` must pass on supported ELF and Mach-O debug builds.
+The registry declares debug capability separately from execution capability. For
+an unsupported target, the g build must return the specific no-debug-model refusal
+and leave neither an object nor an artifact. The matrix records that cell as SKIP
+with an explicit unsupported reason, and the run summarizes supported, unsupported,
+failed and separately declared skip cells. An unexpected successful debug build or
+another diagnostic fails the cell, so a stale declaration cannot hide new support. A `raw` flat image has no
 external structural oracle wired for it, so layer A records a skip rather than a
 pass: a target reaching this cell needs a `SKIPS` entry, the same as any other
 declared gap.
@@ -183,7 +189,7 @@ engine: one host decodes and validates every column, which is how a target with 
 runner of its own still gets goldens.
 
 Before this, the driver selected by capability everywhere, and a target with
-`engine none` needs no execution host, so `spirv`, `riscv32` and `mos6502` were
+`engine none` needs no execution host, so `spirv` and `riscv32` were
 recomputed on the windows and arm runners as well. That is coverage nobody scheduled
 and, for spirv, coverage whose pinned decoder has no build for those hosts at all
 (#2948). Windows accordingly needs no spirv-tools.

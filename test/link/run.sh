@@ -407,7 +407,7 @@ for dir in "$here"/cases/*/; do
                 esac
             fi
 
-            if (cd "$dir" && "$compiler" dep pull && $buildcc build . --target "$build_target" --profile "$profile" $case_build_flags -o "$relbin") >"$tmp/build.log" 2>&1; then
+            if (cd "$dir" && "$compiler" dep pull . && $buildcc build . --target "$build_target" --profile "$profile" $case_build_flags -o "$relbin") >"$tmp/build.log" 2>&1; then
                 build_ok=1
             else
                 build_ok=0

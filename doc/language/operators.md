@@ -14,8 +14,9 @@ val q: f32    = 1.5 * 2.0;
 `%` is the remainder. On integers it is the native truncated remainder, taking
 the sign of the dividend (`-7 % 3 == -1`). On floats it is the truncated (C
 `fmod`) remainder `a - trunc(a / b) * b`, likewise taking the sign of the
-dividend (`5.5 % 3.0 == 2.5`, `-5.5 % 3.0 == -2.5`). The exact float result is
-defined for `|a / b| < 2^63`.
+dividend (`5.5 % 3.0 == 2.5`, `-5.5 % 3.0 == -2.5`). For finite operands and a
+nonzero divisor, this applies across the finite operand range, including
+quotients beyond the `i64` range.
 
 ```mach
 val r: f64 = 5.5 % 3.0;      # 2.5
@@ -108,7 +109,10 @@ Two postfix cast operators, both written `expr OP Type`:
 
 - `expr::Type` — **value conversion**. Resizes integers (sign- or zero-extend,
   truncate), converts between integer and float (a numeric `CVT`), and is the
-  identity on a same-type operand. Value-preserving where representable.
+  identity on a same-type operand. Value-preserving where representable. When
+  either type is nonnumeric, equal sizes are required and the bits are reinterpreted.
+  Constant expressions follow these rules at every nesting depth, including casts
+  through type aliases.
 - `expr:~Type` — **bit reinterpret**. Reads the operand's exact bits as the
   target type with no conversion. Legal only when `Type` has the same byte size
   as the operand's type (a size mismatch is a compile error). The `~` recalls
@@ -141,17 +145,22 @@ the two differ only in how they are realized.
 | Lane family | `+` `-` | `*` | `/` | `%` | `& \| ^ ~` | `<< >>` | `== != < > <= >=` |
 |---|---|---|---|---|---|---|---|
 | float — `f32x4`, `f64x2` | yes | yes | yes | no | — | no | → same-shape unsigned mask |
-| integer — `i8x16` `i16x8` `i32x4` `i64x2` (+ unsigned) | yes | yes | no | no | yes | no | → same-shape unsigned mask |
+| integer — `i8x16` `i16x8` `i32x4` `i64x2` (+ unsigned) | yes | yes | yes | no | yes | no | → same-shape unsigned mask |
 
 Both operands of a binary operator must be the **same** vector shape: there is no
 implicit scalar↔vector mixing and no cross-shape widening. Anything the table
 marks `no` is a compile error, not a silent fallback:
 
 - no vector `%` on any lane type;
-- no integer vector `/` — division is float lanes only;
 - bitwise `& | ^ ~` require integer lanes; the shifts `<< >>` are not in this
   increment (a per-lane variable shift is AVX2-only on x86_64, with no 8-bit
   packed form).
+
+Integer division uses each lane's signedness and scalar division behavior, including
+truncation toward zero for signed quotients and the scalar behavior for division by
+zero or signed overflow. A secret dividend or divisor is rejected because integer
+division has variable latency. x86_64 and aarch64 realize integer vector division
+as scalar lane operations, as does RISC-V without a vector unit.
 
 ### Legality is target-independent; realization is not
 

@@ -1,6 +1,7 @@
 use std.allocator.page;
 use std.chrono.duration;
 use std.collections.map;
+use std.collections.vector;
 use std.crypto.hash.fnv1a;
 use std.format;
 use std.print;
@@ -19,6 +20,7 @@ use R: std.types.result;
 use tm: std.chrono.time;
 
 use mach.lang.diagnostic;
+use mach.lang.fail;
 use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.expr;
@@ -26,13 +28,17 @@ use mach.lang.fe.ast.stmt;
 use mach.lang.fe.ast.id;
 use mach.lang.fe.comptime;
 use mach.lang.fe.resolve;
+use mach.lang.fe.sema.fields;
 use mach.lang.fe.token;
 use mach.lang.intern;
 use mach.lang.layout;
 use mach.lang.session;
+use mach.lang.source;
 use mach.lang.type;
 
 pub rec SemaResult {
+    field_graph: fields.Graph;
+    status: fail.PhaseStatus;
     alloc:            *A.Allocator;
     expr_type:        *type.TypeId;
     type_resolved_ty: *type.TypeId;
@@ -49,15 +55,142 @@ pub val EMBED_LEN_NONE: u64 = 0xFFFFFFFFFFFFFFFF;
 
 pub val EMBED_LEN_FAILED: u64 = 0xFFFFFFFFFFFFFFFE;
 
+pub rec TypeExport {
+    origin: session.StableModuleId;
+    canon: intern.StrId;
+    ty: type.TypeId;
+    constant: resolve.ExportConstant;
+    definition_incarnation: u64;
+}
+
 pub rec ModuleSema {
-    path:       intern.StrId;
-    module:     session.ModuleId;
-    decl_type:  *type.TypeId;
-    decl_count: u32;
-    ctx:        *comptime.ComptimeCtx;
+    path: intern.StrId;
+    module: session.ModuleId;
+    exports: vector.Vector[TypeExport];
+    graph: fields.Graph;
+}
+
+pub fun module_sema_init(a: *A.Allocator, path: intern.StrId, module: session.ModuleId) ModuleSema {
+    ret ModuleSema{ path: path, module: module, exports: vector.init[TypeExport](a), graph: fields.init(a) };
+}
+
+pub fun module_sema_dnit(module: *ModuleSema) {
+    vector.dnit[TypeExport](?module.exports);
+    fields.dnit(?module.graph);
+}
+
+pub def DefinitionPhase: u8;
+pub val DEFINITION_PARSED: DefinitionPhase = 0;
+pub val DEFINITION_RESOLVED: DefinitionPhase = 1;
+pub val DEFINITION_TYPED: DefinitionPhase = 2;
+
+pub rec Definition {
+    parsed: resolve.ParsedDefinition;
+    origin: session.ModuleId;
+    rr: *resolve.ResolveResult;
+    sr: *SemaResult;
+    ctx: *comptime.ComptimeCtx;
+}
+
+pub rec DefinitionReader {
+    ctx: ptr;
+    read: fun(ptr, session.ModuleId, DefinitionPhase) R.Result[Definition, fail.Fail];
+}
+
+pub rec DefinedSymbol {
+    definition: Definition;
+    symbol: resolve.Symbol;
+}
+
+pub fun acquire_definition(reader: *DefinitionReader, origin: session.ModuleId,
+                           phase: DefinitionPhase) R.Result[Definition, fail.Fail] {
+    if (reader == nil || reader.ctx == nil || reader.read == nil || phase > DEFINITION_TYPED) {
+        ret R.err[Definition, fail.Fail](fail.message("current definition acquisition requires an active phase capability"));
+    }
+    val acquired: R.Result[Definition, fail.Fail] = reader.read(reader.ctx, origin, phase);
+    if (R.is_err[Definition, fail.Fail](acquired)) { ret acquired; }
+    val current: Definition = R.unwrap_ok[Definition, fail.Fail](acquired);
+    if (current.origin != origin || current.parsed.a == nil || current.parsed.incarnation == 0
+        || current.parsed.incarnation != current.parsed.a.incarnation
+        || current.parsed.owner.file != current.parsed.a.file_id) {
+        ret R.err[Definition, fail.Fail](fail.message("current definition has inconsistent parsed ownership"));
+    }
+    if (phase >= DEFINITION_RESOLVED && current.rr == nil) {
+        ret R.err[Definition, fail.Fail](fail.message("current definition has no acquired resolution product"));
+    }
+    if (phase == DEFINITION_TYPED && (current.sr == nil || current.ctx == nil)) {
+        ret R.err[Definition, fail.Fail](fail.message("current definition has no acquired semantic product"));
+    }
+    if (phase >= DEFINITION_RESOLVED && current.rr.status.kind != fail.ACCEPTED) {
+        ret R.err[Definition, fail.Fail](fail.phase_failure(current.rr.status));
+    }
+    if (phase == DEFINITION_TYPED && current.sr.status.kind != fail.ACCEPTED) {
+        ret R.err[Definition, fail.Fail](fail.phase_failure(current.sr.status));
+    }
+    ret acquired;
+}
+
+pub fun acquire_symbol(reader: *DefinitionReader, requested: *resolve.Symbol,
+                       phase: DefinitionPhase) R.Result[DefinedSymbol, fail.Fail] {
+    if (requested == nil || phase < DEFINITION_RESOLVED) {
+        ret R.err[DefinedSymbol, fail.Fail](fail.message("symbol definition requires resolved acquisition"));
+    }
+    val acquired: R.Result[Definition, fail.Fail] = acquire_definition(reader, requested.origin, phase);
+    if (R.is_err[Definition, fail.Fail](acquired)) { ret R.err[DefinedSymbol, fail.Fail](R.unwrap_err[Definition, fail.Fail](acquired)); }
+    val current: Definition = R.unwrap_ok[Definition, fail.Fail](acquired);
+    var found: resolve.SymbolId = resolve.SYMBOL_NIL;
+    var i: u32 = 0;
+    for (i < current.rr.symbol_count) {
+        val symbol: *resolve.Symbol = ?current.rr.symbols[i];
+        if (symbol.origin == requested.origin && symbol.kind == requested.definition_kind
+            && symbol.canon == requested.canon && symbol.decl != id.DECL_NIL) {
+            if (found != resolve.SYMBOL_NIL && current.rr.symbols[found].decl != symbol.decl) {
+                ret R.err[DefinedSymbol, fail.Fail](fail.message("current canonical definition is ambiguous"));
+            }
+            found = i;
+        }
+        i = i + 1;
+    }
+    if (found == resolve.SYMBOL_NIL || current.rr.symbols[found].decl >= current.parsed.a.decl_len::u32) {
+        ret R.err[DefinedSymbol, fail.Fail](fail.message("current canonical definition is absent from its resolved owner"));
+    }
+    ret R.ok[DefinedSymbol, fail.Fail](DefinedSymbol{ definition: current, symbol: current.rr.symbols[found] });
+}
+
+pub fun imported_definition(sc: *SemaContext, sym: *resolve.Symbol,
+                           phase: DefinitionPhase) R.Result[DefinedSymbol, fail.Fail] {
+    if (sym.origin == sc.own_module || sc.deps == nil) {
+        val reason: fail.Fail = fail.message("foreign definition acquisition cannot refresh the active semantic owner");
+        fail.internal(?sc.status, reason.message);
+        ret R.err[DefinedSymbol, fail.Fail](reason);
+    }
+    val result: R.Result[DefinedSymbol, fail.Fail] = acquire_symbol(?sc.deps.definitions, sym, phase);
+    if (R.is_err[DefinedSymbol, fail.Fail](result)) {
+        val reason: fail.Fail = R.unwrap_err[DefinedSymbol, fail.Fail](result);
+        if (reason.kind == fail.REPORTED) { fail.reject(?sc.status); }
+        or { fail.internal(?sc.status, reason.message); }
+    }
+    ret result;
+}
+
+pub fun symbol_definition(sc: *SemaContext, sym: *resolve.Symbol,
+                          phase: DefinitionPhase) R.Result[DefinedSymbol, fail.Fail] {
+    if (sym.origin != sc.own_module) { ret imported_definition(sc, sym, phase); }
+    if (sc.a == nil || sc.rr == nil || sym.decl == id.DECL_NIL || sym.decl >= sc.a.decl_len::u32) {
+        val reason: fail.Fail = fail.message("symbol has no declaration in the active semantic owner");
+        fail.internal(?sc.status, reason.message);
+        ret R.err[DefinedSymbol, fail.Fail](reason);
+    }
+    val parsed: resolve.ParsedDefinition = resolve.ParsedDefinition{
+        a: sc.a, owner: resolve.type_owner(sc.s, sc.own_module, sc.a.file_id), incarnation: sc.a.incarnation
+    };
+    ret R.ok[DefinedSymbol, fail.Fail](DefinedSymbol{
+        definition: Definition{ parsed: parsed, origin: sc.own_module, rr: sc.rr, ctx: sc.ctx }, symbol: @sym
+    });
 }
 
 pub rec SemaDeps {
+    definitions: DefinitionReader;
     entries: *ModuleSema;
     count:   u32;
 }
@@ -105,8 +238,7 @@ pub val SECRET_ABSENT:  u8 = 1;
 pub val SECRET_PRESENT: u8 = 2;
 
 pub val TYPE_MEMO_NONE:     u8 = 0;
-pub val TYPE_MEMO_QUIET:    u8 = 1;
-pub val TYPE_MEMO_REPORTED: u8 = 2;
+pub val TYPE_MEMO_RESOLVED: u8 = 1;
 
 pub val LAYOUT_PENDING: u8 = 0;
 pub val LAYOUT_ACTIVE:  u8 = 1;
@@ -134,6 +266,8 @@ pub fun uni_report_mark(ur: *UniReports, key: type.TypeId) bool {
 }
 
 pub rec SemaContext {
+    diags: *diagnostic.DiagnosticStore;
+    status: fail.PhaseStatus;
     s:          *session.Session;
     a:          *ast.Ast;
     rr:         *resolve.ResolveResult;
@@ -181,7 +315,7 @@ pub rec SemaContext {
 
     subst:     *type.TypeId;
     subst_len: u32;
-    subst_fn:  fun(*session.Session, type.TypeId, *type.TypeId, u32) type.TypeId;
+    subst_fn:  fun(*session.Session, type.TypeId, *type.TypeId, u32) R.Result[type.TypeId, str];
 
     uni_check_fn: fun(*SemaContext, id.TypeId);
     uni_reports:  *UniReports;
@@ -198,9 +332,24 @@ pub fun resolved_type_of(sc: *SemaContext, ast_tid: id.TypeId) type.TypeId {
     ret apply_subst(sc, sc.type_resolved_ty[ast_tid]);
 }
 
+pub fun expression(sc: *SemaContext, eid: id.ExprId) R.Result[expr.Expr, str] {
+    val result: R.Result[expr.Expr, str] = resolve.expression(sc.rr, sc.a, eid);
+    if (R.is_err[expr.Expr, str](result)) { fail.internal(?sc.status, R.unwrap_err[expr.Expr, str](result)); }
+    ret result;
+}
+
+pub fun comptime_expression(sc: *SemaContext, a: *ast.Ast, eid: id.ExprId) R.Result[expr.Expr, comptime.EvalFail] {
+    if (sc == nil || sc.a != a) { ret R.err[expr.Expr, comptime.EvalFail](comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, "semantic expression belongs to a different parsed owner")); }
+    val result: R.Result[expr.Expr, str] = expression(sc, eid);
+    if (R.is_err[expr.Expr, str](result)) {
+        ret R.err[expr.Expr, comptime.EvalFail](comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, R.unwrap_err[expr.Expr, str](result)));
+    }
+    ret R.ok[expr.Expr, comptime.EvalFail](R.unwrap_ok[expr.Expr, str](result));
+}
+
 pub fun apply_subst(sc: *SemaContext, tid: type.TypeId) type.TypeId {
     if (sc.subst == nil || sc.subst_len == 0 || sc.subst_fn == nil) { ret tid; }
-    ret sc.subst_fn(sc.s, tid, sc.subst, sc.subst_len);
+    ret type_result(sc, sc.subst_fn(sc.s, tid, sc.subst, sc.subst_len));
 }
 
 pub fun arg_triggers_revalidation(sc: *SemaContext, tid: type.TypeId) bool {
@@ -217,9 +366,15 @@ pub fun arg_triggers_revalidation(sc: *SemaContext, tid: type.TypeId) bool {
 
 fun module_rr_for(sc: *SemaContext, origin: session.ModuleId) *resolve.ResolveResult {
     if (origin == sc.own_module) { ret sc.rr; }
-    val p: ptr = session.module_resolve_ptr(sc.s, origin);
-    if (p == nil) { ret nil; }
-    ret p::*resolve.ResolveResult;
+    if (sc.deps == nil) { fail.internal(?sc.status, "semantic definition has no dependency reader"); ret nil; }
+    val acquired: R.Result[Definition, fail.Fail] = acquire_definition(?sc.deps.definitions, origin, DEFINITION_RESOLVED);
+    if (R.is_err[Definition, fail.Fail](acquired)) {
+        val reason: fail.Fail = R.unwrap_err[Definition, fail.Fail](acquired);
+        if (reason.kind == fail.REPORTED) { fail.reject(?sc.status); }
+        or { fail.internal(?sc.status, reason.message); }
+        ret nil;
+    }
+    ret R.unwrap_ok[Definition, fail.Fail](acquired).rr;
 }
 
 fun callee_is_c_variadic(sc: *SemaContext, rr: *resolve.ResolveResult, callee_eid: id.ExprId) bool {
@@ -228,13 +383,12 @@ fun callee_is_c_variadic(sc: *SemaContext, rr: *resolve.ResolveResult, callee_ei
     val sid: resolve.SymbolId = rr.expr_resolved[callee_eid];
     if (sid == resolve.SYMBOL_NIL || sid >= rr.symbol_count)       { ret false; }
     val sym: *resolve.Symbol = ?rr.symbols[sid];
-    if (sym.decl == id.DECL_NIL) { ret false; }
-
-    var da: *ast.Ast = sc.a;
-    if (sym.origin != sc.own_module) { da = session.module_ast(sc.s, sym.origin); }
-    if (da == nil) { ret false; }
-
-    val d_opt: O.Option[*decl.Decl] = ast.get_decl(da, sym.decl);
+    if (sym.kind != resolve.SYM_FUN && sym.kind != resolve.SYM_IMPORTED) { ret false; }
+    if (sym.kind == resolve.SYM_IMPORTED && sym.definition_kind != resolve.SYM_FUN) { ret false; }
+    val acquired: R.Result[DefinedSymbol, fail.Fail] = symbol_definition(sc, sym, DEFINITION_RESOLVED);
+    if (R.is_err[DefinedSymbol, fail.Fail](acquired)) { ret false; }
+    val current: DefinedSymbol = R.unwrap_ok[DefinedSymbol, fail.Fail](acquired);
+    val d_opt: O.Option[*decl.Decl] = ast.get_decl(current.definition.parsed.a, current.symbol.decl);
     if (O.is_none[*decl.Decl](d_opt)) { ret false; }
     val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
     if (d.kind != decl.DECL_KIND_FUN) { ret false; }
@@ -262,15 +416,23 @@ fun callee_body_reaches(sc: *SemaContext, rr: *resolve.ResolveResult, callee_eid
     val sid: resolve.SymbolId = rr.expr_resolved[callee_eid];
     if (sid == resolve.SYMBOL_NIL || sid >= rr.symbol_count)       { ret false; }
     val sym: *resolve.Symbol = ?rr.symbols[sid];
-    if (sym.decl == id.DECL_NIL) { ret false; }
-    ret decl_reaches_c_variadic(sc, sym.origin, sym.decl, want_spread, seen);
+    if (sym.kind != resolve.SYM_FUN && sym.kind != resolve.SYM_IMPORTED) { ret false; }
+    if (sym.kind == resolve.SYM_IMPORTED && sym.definition_kind != resolve.SYM_FUN) { ret false; }
+    val acquired: R.Result[DefinedSymbol, fail.Fail] = symbol_definition(sc, sym, DEFINITION_RESOLVED);
+    if (R.is_err[DefinedSymbol, fail.Fail](acquired)) { ret false; }
+    val current: DefinedSymbol = R.unwrap_ok[DefinedSymbol, fail.Fail](acquired);
+    ret decl_reaches_c_variadic(sc, current.symbol.origin, current.symbol.decl, want_spread, seen);
 }
 
 fun expr_has_c_variadic_call(sc: *SemaContext, a: *ast.Ast, rr: *resolve.ResolveResult, eid: id.ExprId, want_spread: bool, seen: *ReachSeen) bool {
     if (eid == id.EXPR_NIL) { ret false; }
-    val e_opt: O.Option[*expr.Expr] = ast.get_expr(a, eid);
-    if (O.is_none[*expr.Expr](e_opt)) { ret false; }
-    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
+    val e_opt: R.Result[expr.Expr, str] = resolve.expression(rr, a, eid);
+    if (R.is_err[expr.Expr, str](e_opt)) {
+        fail.internal(?sc.status, R.unwrap_err[expr.Expr, str](e_opt));
+        ret false;
+    }
+    var e_value: expr.Expr = R.unwrap_ok[expr.Expr, str](e_opt);
+    val e: *expr.Expr = ?e_value;
     val k: expr.ExprKind = e.kind;
 
     if (k == expr.EXPR_KIND_CALL) {
@@ -377,8 +539,7 @@ fun decl_body_reaches_c_variadic(sc: *SemaContext, origin: session.ModuleId, did
 fun decl_reaches_c_variadic(sc: *SemaContext, origin: session.ModuleId, did: id.DeclId,
                             want_spread: bool, seen: *ReachSeen) bool {
     if (!reach_visit(seen, origin, did)) { ret false; }
-    var a: *ast.Ast = sc.a;
-    if (origin != sc.own_module) { a = session.module_ast(sc.s, origin); }
+    val a: *ast.Ast = definition_ast(sc, origin);
     if (a == nil) { ret false; }
     val rr: *resolve.ResolveResult = module_rr_for(sc, origin);
     if (rr == nil) { ret false; }
@@ -450,9 +611,8 @@ fun stmt_calls_c_variadic(sc: *SemaContext, a: *ast.Ast, rr: *resolve.ResolveRes
     ret false;
 }
 
-fun decl_body_has_type_directive(sc: *SemaContext, origin: session.ModuleId, did: id.DeclId) bool {
-    var a: *ast.Ast = sc.a;
-    if (origin != sc.own_module) { a = session.module_ast(sc.s, origin); }
+fun decl_body_requires_revalidation(sc: *SemaContext, origin: session.ModuleId, did: id.DeclId) bool {
+    val a: *ast.Ast = definition_ast(sc, origin);
     if (a == nil) { ret false; }
 
     val d_opt: O.Option[*decl.Decl] = ast.get_decl(a, did);
@@ -460,10 +620,10 @@ fun decl_body_has_type_directive(sc: *SemaContext, origin: session.ModuleId, did
     val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
     if (d.kind != decl.DECL_KIND_FUN)        { ret false; }
     if (d.data.fun_.body == id.STMT_NIL)     { ret false; }
-    ret stmt_has_type_directive(a, d.data.fun_.body);
+    ret stmt_requires_revalidation(a, d.data.fun_.body);
 }
 
-fun stmt_has_type_directive(a: *ast.Ast, sid: id.StmtId) bool {
+fun stmt_requires_revalidation(a: *ast.Ast, sid: id.StmtId) bool {
     if (sid == id.STMT_NIL) { ret false; }
     val s_opt: O.Option[*stmt.Stmt] = ast.get_stmt(a, sid);
     if (O.is_none[*stmt.Stmt](s_opt)) { ret false; }
@@ -473,29 +633,76 @@ fun stmt_has_type_directive(a: *ast.Ast, sid: id.StmtId) bool {
     if (k == stmt.STMT_KIND_COMPTIME_IF || k == stmt.STMT_KIND_COMPTIME_EACH
      || k == stmt.STMT_KIND_COMPTIME_ATTR) { ret true; }
 
-    if (k == stmt.STMT_KIND_EXPR || k == stmt.STMT_KIND_RET || k == stmt.STMT_KIND_BRK
-     || k == stmt.STMT_KIND_CNT  || k == stmt.STMT_KIND_DECL || k == stmt.STMT_KIND_ASM
+    if (k == stmt.STMT_KIND_EXPR) { ret expr_requires_revalidation(a, s.data.expr.expr); }
+    if (k == stmt.STMT_KIND_RET) { ret expr_requires_revalidation(a, s.data.ret_.value); }
+    if (k == stmt.STMT_KIND_DECL) {
+        val d: O.Option[*decl.Decl] = ast.get_decl(a, s.data.decl.decl);
+        if (O.is_none[*decl.Decl](d)) { ret false; }
+        val binding: *decl.Decl = O.unwrap[*decl.Decl](d);
+        if (binding.kind == decl.DECL_KIND_VAL || binding.kind == decl.DECL_KIND_VAR) {
+            ret expr_requires_revalidation(a, binding.data.bind.init);
+        }
+        ret false;
+    }
+    if (k == stmt.STMT_KIND_BRK || k == stmt.STMT_KIND_CNT || k == stmt.STMT_KIND_ASM
      || k == stmt.STMT_KIND_ERROR) { ret false; }
 
     if (k == stmt.STMT_KIND_BLOCK) {
         var i: u32 = 0;
         for (i < s.data.block.stmts_len) {
-            if (stmt_has_type_directive(a, a.stmt_ids[s.data.block.stmts_start + i])) { ret true; }
+            if (stmt_requires_revalidation(a, a.stmt_ids[s.data.block.stmts_start + i])) { ret true; }
             i = i + 1;
         }
         ret false;
     }
     if (k == stmt.STMT_KIND_IF) {
-        if (stmt_has_type_directive(a, s.data.if_.then_block)) { ret true; }
-        ret stmt_has_type_directive(a, s.data.if_.else_block);
+        if (expr_requires_revalidation(a, s.data.if_.cond)) { ret true; }
+        if (stmt_requires_revalidation(a, s.data.if_.then_block)) { ret true; }
+        ret stmt_requires_revalidation(a, s.data.if_.else_block);
     }
-    if (k == stmt.STMT_KIND_FOR) { ret stmt_has_type_directive(a, s.data.for_.body); }
-    if (k == stmt.STMT_KIND_FIN) { ret stmt_has_type_directive(a, s.data.fin_.body); }
+    if (k == stmt.STMT_KIND_FOR) { ret expr_requires_revalidation(a, s.data.for_.cond) || stmt_requires_revalidation(a, s.data.for_.body); }
+    if (k == stmt.STMT_KIND_FIN) { ret stmt_requires_revalidation(a, s.data.fin_.body); }
 
     ret true;
 }
 
-fun type_mentions_generic_param(sc: *SemaContext, tid: type.TypeId) bool {
+fun expr_requires_revalidation(a: *ast.Ast, eid: id.ExprId) bool {
+    if (eid == id.EXPR_NIL) { ret false; }
+    val eo: O.Option[*expr.Expr] = ast.get_expr(a, eid);
+    if (O.is_none[*expr.Expr](eo)) { ret false; }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](eo);
+    val k: expr.ExprKind = e.kind;
+    if (k == expr.EXPR_KIND_STRIP || k == expr.EXPR_KIND_GENERIC_INSTANCE) { ret true; }
+    if (k == expr.EXPR_KIND_BINARY) { ret expr_requires_revalidation(a, e.data.binary.lhs) || expr_requires_revalidation(a, e.data.binary.rhs); }
+    if (k == expr.EXPR_KIND_UNARY) { ret expr_requires_revalidation(a, e.data.unary.operand); }
+    if (k == expr.EXPR_KIND_INDEX) { ret expr_requires_revalidation(a, e.data.index.object) || expr_requires_revalidation(a, e.data.index.index); }
+    if (k == expr.EXPR_KIND_MEMBER) { ret expr_requires_revalidation(a, e.data.member.object); }
+    if (k == expr.EXPR_KIND_PROJECT) { ret expr_requires_revalidation(a, e.data.project.object) || expr_requires_revalidation(a, e.data.project.field); }
+    if (k == expr.EXPR_KIND_SPREAD) { ret expr_requires_revalidation(a, e.data.spread.inner); }
+    if (k == expr.EXPR_KIND_CAST) { ret true; }
+    var start: u32 = 0;
+    var count: u32 = 0;
+    if (k == expr.EXPR_KIND_CALL) {
+        if (e.data.call.type_args_len != 0) { ret true; }
+        if (expr_requires_revalidation(a, e.data.call.callee)) { ret true; }
+        start = e.data.call.args_start;
+        count = e.data.call.args_len;
+    } or (k == expr.EXPR_KIND_ARRAY_LIT) {
+        start = e.data.array_lit.elems_start;
+        count = e.data.array_lit.elems_len;
+    } or (k == expr.EXPR_KIND_VECTOR_LIT) {
+        start = e.data.vector_lit.elems_start;
+        count = e.data.vector_lit.elems_len;
+    } or (k == expr.EXPR_KIND_STRUCT_LIT) { ret true; }
+    var i: u32 = 0;
+    for (i < count) {
+        if (expr_requires_revalidation(a, a.expr_ids[start + i])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+pub fun type_mentions_generic_param(sc: *SemaContext, tid: type.TypeId) bool {
     if (tid == type.TYPE_ERROR || tid == type.TYPE_NIL) { ret false; }
     val t_opt: O.Option[*type.Type] = type.get(?sc.s.types, tid);
     if (O.is_none[*type.Type](t_opt)) { ret false; }
@@ -556,13 +763,13 @@ pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.Dec
             && !type_mentions_generic_param(sc, args[i])) { any = true; }
         i = i + 1;
     }
-    if (!any && decl_body_has_type_directive(sc, origin, decl)) { any = true; }
+    if (!any && decl_body_requires_revalidation(sc, origin, decl)) { any = true; }
     if (!any && decl_body_calls_c_variadic(sc, origin, decl)) { any = true; }
     if (!any) { ret R.ok[u8, str](RECORD_OK); }
 
     if (sc.insts == nil) {
         val wr: R.Result[*InstWorklist, str] = inst_worklist_new(sc.s.alloc);
-        if (R.is_err[*InstWorklist, str](wr)) { ret R.err[u8, str](R.unwrap_err[*InstWorklist, str](wr)); }
+        if (R.is_err[*InstWorklist, str](wr)) { fail.internal(?sc.status, R.unwrap_err[*InstWorklist, str](wr)); ret R.err[u8, str](R.unwrap_err[*InstWorklist, str](wr)); }
         sc.insts = R.unwrap_ok[*InstWorklist, str](wr);
     }
     val wl: *InstWorklist = sc.insts;
@@ -594,13 +801,13 @@ pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.Dec
         if (wl.cap > 0) { new_cap = wl.cap * 2; }
         var nr: R.Result[*InstReq, str] = A.allocate[InstReq](wl.alloc, new_cap::usize);
         if (wl.cap > 0) { nr = A.reallocate[InstReq](wl.alloc, wl.items, wl.cap::usize, new_cap::usize); }
-        if (R.is_err[*InstReq, str](nr)) { ret R.err[u8, str]("internal: out of memory growing the constant-time re-validation worklist"); }
+        if (R.is_err[*InstReq, str](nr)) { fail.internal(?sc.status, R.unwrap_err[*InstReq, str](nr)); ret R.err[u8, str]("internal: out of memory growing the constant-time re-validation worklist"); }
         wl.items = R.unwrap_ok[*InstReq, str](nr);
         wl.cap   = new_cap;
     }
 
     val cr: R.Result[*type.TypeId, str] = A.allocate[type.TypeId](wl.alloc, arg_len::usize);
-    if (R.is_err[*type.TypeId, str](cr)) { ret R.err[u8, str]("internal: out of memory copying a generic instance's type arguments"); }
+    if (R.is_err[*type.TypeId, str](cr)) { fail.internal(?sc.status, R.unwrap_err[*type.TypeId, str](cr)); ret R.err[u8, str]("internal: out of memory copying a generic instance's type arguments"); }
     val owned: *type.TypeId = R.unwrap_ok[*type.TypeId, str](cr);
     var k: u32 = 0;
     for (k < arg_len) { owned[k] = args[k]; k = k + 1; }
@@ -687,23 +894,36 @@ pub fun module_sema_for(sc: *SemaContext, module: session.ModuleId) O.Option[*Mo
     ret O.none[*ModuleSema]();
 }
 
+pub fun public_type_for(sc: *SemaContext, sym: *resolve.Symbol) O.Option[TypeExport] {
+    if (sc.deps == nil) { ret O.none[TypeExport](); }
+    val owner: session.StableModuleId = resolve.type_owner(sc.s, sym.origin, sym.definition_file).module;
+    var i: u32 = 0;
+    for (i < sc.deps.count) {
+        val module: *ModuleSema = ?sc.deps.entries[i];
+        var j: usize = 0;
+        for (j < module.exports.len) {
+            val item: TypeExport = module.exports.data[j];
+            if (item.origin == owner && item.canon == sym.canon) { ret O.some[TypeExport](item); }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret O.none[TypeExport]();
+}
+
 pub fun decl_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.TypeId {
-    if (sym.decl == id.DECL_NIL) { ret type.TYPE_ERROR; }
-
-    if (sym.kind == resolve.SYM_PARAM)   { ret param_type_for(sc, sym); }
+    if (sym.kind == resolve.SYM_PARAM) { ret param_type_for(sc, sym); }
     if (sym.kind == resolve.SYM_GENERIC) { ret generic_param_type_for(sc, sym); }
-
     if (sym.origin == sc.own_module) {
-        if (sc.decl_type == nil)            { ret type.TYPE_ERROR; }
-        if (sym.decl >= sc.a.decl_len::u32) { ret type.TYPE_ERROR; }
+        if (sc.decl_type == nil || sym.decl == id.DECL_NIL || sym.decl >= sc.a.decl_len::u32) { ret type.TYPE_ERROR; }
         ret sc.decl_type[sym.decl];
     }
-
-    val ms_opt: O.Option[*ModuleSema] = module_sema_for(sc, sym.origin);
-    if (O.is_none[*ModuleSema](ms_opt)) { ret type.TYPE_ERROR; }
-    val ms: *ModuleSema = O.unwrap[*ModuleSema](ms_opt);
-    if (ms.decl_type == nil || sym.decl >= ms.decl_count) { ret type.TYPE_ERROR; }
-    ret ms.decl_type[sym.decl];
+    val exported: O.Option[TypeExport] = public_type_for(sc, sym);
+    if (O.is_none[TypeExport](exported)) {
+        fail.internal(?sc.status, "imported type has no acquired public surface");
+        ret type.TYPE_ERROR;
+    }
+    ret O.unwrap[TypeExport](exported).ty;
 }
 
 pub fun symbol_for_expr(sc: *SemaContext, eid: id.ExprId) O.Option[*resolve.Symbol] {
@@ -744,49 +964,67 @@ pub fun machine_of(sc: *SemaContext) layout.Machine {
 
 pub fun report(sc: *SemaContext, span: token.Span, message: str) {
     if (sc.silent) { ret; }
+    fail.reject(?sc.status);
     if (sc.in_comptime_gate) {
-        diagnostic.record_gate_error(?sc.s.gate_diags, ?sc.s.diags, ?sc.s.interner, sc.a.file_id, span, message);
+        val r: R.Result[bool, str] = diagnostic.gate_error(sc.diags, ?sc.s.interner, sc.a.file_id, span, message);
+        if (R.is_err[bool, str](r)) { fail.internal(?sc.status, R.unwrap_err[bool, str](r)); }
         ret;
     }
-    diagnostic.record_error(?sc.s.diags, sc.a.file_id, span, message);
+    val r: R.Result[R.Void, str] = diagnostic.error(sc.diags, sc.a.file_id, span, message);
+    if (R.is_err[R.Void, str](r)) { fail.internal(?sc.status, R.unwrap_err[R.Void, str](r)); }
 }
 
-pub fun diag_mark(sc: *SemaContext) diagnostic.DiagMark {
-    ret diagnostic.mark(?sc.s.diags);
+pub fun report_internal(sc: *SemaContext, span: token.Span, message: str) {
+    fail.internal(?sc.status, message);
 }
 
-pub fun reported_since(sc: *SemaContext, mark: diagnostic.DiagMark) bool {
-    ret diagnostic.len(?sc.s.diags) > mark.len;
+pub fun type_result(sc: *SemaContext, r: R.Result[type.TypeId, str]) type.TypeId {
+    if (R.is_err[type.TypeId, str](r)) {
+        fail.internal(?sc.status, R.unwrap_err[type.TypeId, str](r));
+        ret type.TYPE_ERROR;
+    }
+    ret R.unwrap_ok[type.TypeId, str](r);
+}
+
+pub fun diag_mark(sc: *SemaContext) u64 {
+    ret sc.status.rejections;
+}
+
+pub fun reported_since(sc: *SemaContext, mark: u64) bool {
+    ret sc.status.rejections != mark;
 }
 
 pub fun report_warning(sc: *SemaContext, span: token.Span, message: str) {
     if (sc.silent || sc.in_comptime_gate) { ret; }
-    diagnostic.record_warning(?sc.s.diags, sc.a.file_id, span, message);
+    val r: R.Result[R.Void, str] = diagnostic.warning(sc.diags, sc.a.file_id, span, message);
+    if (R.is_err[R.Void, str](r)) { fail.internal(?sc.status, R.unwrap_err[R.Void, str](r)); }
 }
 
 pub fun report_note(sc: *SemaContext, span: token.Span, message: str, note: str) {
     if (sc.silent) { ret; }
+    fail.reject(?sc.status);
 
     val b_r: R.Result[diagnostic.DiagnosticBuilder, str] = diagnostic.builder_init(sc.s.diags.a, diagnostic.SEVERITY_ERROR, sc.a.file_id, span, message);
-    if (R.is_err[diagnostic.DiagnosticBuilder, str](b_r)) { diagnostic.note_error(?sc.s.diags); ret; }
+    if (R.is_err[diagnostic.DiagnosticBuilder, str](b_r)) { fail.internal(?sc.status, R.unwrap_err[diagnostic.DiagnosticBuilder, str](b_r)); ret; }
     var b: diagnostic.DiagnosticBuilder = R.unwrap_ok[diagnostic.DiagnosticBuilder, str](b_r);
 
     val ar: R.Result[R.Void, str] = diagnostic.attach_note(?b, note);
-    if (R.is_err[R.Void, str](ar)) { diagnostic.builder_dnit(?b); diagnostic.note_error(?sc.s.diags); ret; }
+    if (R.is_err[R.Void, str](ar)) { diagnostic.builder_dnit(?b); fail.internal(?sc.status, R.unwrap_err[R.Void, str](ar)); ret; }
 
     if (sc.in_comptime_gate) {
-        diagnostic.record_gate_commit(?sc.s.gate_diags, ?sc.s.diags, ?sc.s.interner, ?b);
+        val r: R.Result[bool, str] = diagnostic.gate_commit(sc.diags, ?sc.s.interner, ?b);
+        if (R.is_err[bool, str](r)) { fail.internal(?sc.status, R.unwrap_err[bool, str](r)); }
         ret;
     }
 
-    val cr: R.Result[diagnostic.DiagnosticId, str] = diagnostic.commit(?b, ?sc.s.diags);
-    if (R.is_err[diagnostic.DiagnosticId, str](cr)) { diagnostic.builder_dnit(?b); ret; }
+    val cr: R.Result[diagnostic.DiagnosticId, str] = diagnostic.commit(?b, sc.diags);
+    if (R.is_err[diagnostic.DiagnosticId, str](cr)) { diagnostic.builder_dnit(?b); fail.internal(?sc.status, R.unwrap_err[diagnostic.DiagnosticId, str](cr)); ret; }
 }
 
 pub fun report_numbered(sc: *SemaContext, span: token.Span, prefix: str, n: usize, suffix: str, fallback: str) {
     val res_msg: R.Result[str, str] = format.sprint(sc.s.alloc, "{}{}{}", prefix, n, suffix);
     if (R.is_err[str, str](res_msg)) {
-        report(sc, span, fallback);
+        fail.internal(?sc.status, R.unwrap_err[str, str](res_msg));
         ret;
     }
     val msg: str = R.unwrap_ok[str, str](res_msg);
@@ -829,27 +1067,27 @@ pub fun field_lookup(sc: *SemaContext, ty: type.TypeId, name: intern.StrId) O.Op
     ret O.none[type.TypeId]();
 }
 
-pub fun resolve_field_member(sc: *SemaContext, owner: u32, index: u32, sel: u8) R.Result[O.Option[comptime.CTValue], str] {
-    if (sc == nil) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
+pub fun resolve_field_member(sc: *SemaContext, owner: u32, index: u32, sel: u8) R.Result[O.Option[comptime.CTValue], comptime.EvalFail] {
+    if (sc == nil) { ret R.ok[O.Option[comptime.CTValue], comptime.EvalFail](O.none[comptime.CTValue]()); }
 
     if (sel == comptime.FIELD_SEL_ZERO_BY_NAME) {
         ret resolve_omitted_field_zero(sc, owner::type.TypeId, index::intern.StrId);
     }
 
     val fa: O.Option[*type.FieldEntry] = type.field_at(?sc.s.types, owner::type.TypeId, index);
-    if (O.is_none[*type.FieldEntry](fa)) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
+    if (O.is_none[*type.FieldEntry](fa)) { ret R.ok[O.Option[comptime.CTValue], comptime.EvalFail](O.none[comptime.CTValue]()); }
     val fe: *type.FieldEntry = O.unwrap[*type.FieldEntry](fa);
 
     if (sel == comptime.FIELD_SEL_NAME) {
-        ret R.ok[O.Option[comptime.CTValue], str](O.some[comptime.CTValue](comptime.ct_str(fe.name)));
+        ret R.ok[O.Option[comptime.CTValue], comptime.EvalFail](O.some[comptime.CTValue](comptime.ct_str(fe.name)));
     }
     if (sel == comptime.FIELD_SEL_TYPE) {
-        ret R.ok[O.Option[comptime.CTValue], str](O.some[comptime.CTValue](comptime.ct_type(fe.ty::u32)));
+        ret R.ok[O.Option[comptime.CTValue], comptime.EvalFail](O.some[comptime.CTValue](comptime.ct_type(fe.ty::u32)));
     }
-    ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]());
+    ret R.ok[O.Option[comptime.CTValue], comptime.EvalFail](O.none[comptime.CTValue]());
 }
 
-fun resolve_omitted_field_zero(sc: *SemaContext, owner_ty: type.TypeId, name: intern.StrId) R.Result[O.Option[comptime.CTValue], str] {
+fun resolve_omitted_field_zero(sc: *SemaContext, owner_ty: type.TypeId, name: intern.StrId) R.Result[O.Option[comptime.CTValue], comptime.EvalFail] {
     val stripped: type.TypeId = type.strip_secret(?sc.s.types, owner_ty);
     val n: u32 = type.field_count(?sc.s.types, stripped);
     var i: u32 = 0;
@@ -860,32 +1098,32 @@ fun resolve_omitted_field_zero(sc: *SemaContext, owner_ty: type.TypeId, name: in
             if (fe.name == name) {
                 val fty: type.TypeId = type.strip_secret(?sc.s.types, fe.ty);
                 val ft: O.Option[*type.Type] = type.get(?sc.s.types, fty);
-                if (O.is_none[*type.Type](ft)) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
+                if (O.is_none[*type.Type](ft)) { ret R.ok[O.Option[comptime.CTValue], comptime.EvalFail](O.none[comptime.CTValue]()); }
                 val kind: type.TypeKind = O.unwrap[*type.Type](ft).kind;
                 val pd: type.PrimDesc = type.prim_desc(kind);
                 if (pd.class == type.PRIM_CLASS_INT) {
-                    ret R.ok[O.Option[comptime.CTValue], str](
+                    ret R.ok[O.Option[comptime.CTValue], comptime.EvalFail](
                         O.some[comptime.CTValue](comptime.ct_zero_int(!pd.signed, pd.bits::u8)));
                 }
                 if (pd.class == type.PRIM_CLASS_FLOAT) {
-                    ret R.ok[O.Option[comptime.CTValue], str](
+                    ret R.ok[O.Option[comptime.CTValue], comptime.EvalFail](
                         O.some[comptime.CTValue](comptime.ct_float(0.0, type.float_width_of(kind))));
                 }
-                ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]());
+                ret R.ok[O.Option[comptime.CTValue], comptime.EvalFail](O.none[comptime.CTValue]());
             }
         }
         i = i + 1;
     }
-    ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]());
+    ret R.ok[O.Option[comptime.CTValue], comptime.EvalFail](O.none[comptime.CTValue]());
 }
 
-pub fun resolve_type_comparison_operand(sc: *SemaContext, eid: id.ExprId) R.Result[O.Option[u32], str] {
-    if (sc == nil)           { ret R.ok[O.Option[u32], str](O.none[u32]()); }
-    if (sc.expr_type == nil) { ret R.ok[O.Option[u32], str](O.none[u32]()); }
-    if (eid == id.EXPR_NIL || eid >= sc.a.expr_len::u32) { ret R.ok[O.Option[u32], str](O.none[u32]()); }
+pub fun resolve_type_comparison_operand(sc: *SemaContext, eid: id.ExprId) R.Result[O.Option[u32], comptime.EvalFail] {
+    if (sc == nil)           { ret R.ok[O.Option[u32], comptime.EvalFail](O.none[u32]()); }
+    if (sc.expr_type == nil) { ret R.ok[O.Option[u32], comptime.EvalFail](O.none[u32]()); }
+    if (eid == id.EXPR_NIL || eid >= sc.a.expr_len::u32) { ret R.ok[O.Option[u32], comptime.EvalFail](O.none[u32]()); }
     val t: type.TypeId = sc.expr_type[eid];
-    if (t == type.TYPE_NIL || t == type.TYPE_ERROR) { ret R.ok[O.Option[u32], str](O.none[u32]()); }
-    ret R.ok[O.Option[u32], str](O.some[u32](t::u32));
+    if (t == type.TYPE_NIL || t == type.TYPE_ERROR) { ret R.ok[O.Option[u32], comptime.EvalFail](O.none[u32]()); }
+    ret R.ok[O.Option[u32], comptime.EvalFail](O.some[u32](t::u32));
 }
 
 fun gated_member_const_message(sc: *SemaContext, name: intern.StrId, dep_path: intern.StrId) str {
@@ -897,55 +1135,66 @@ fun gated_member_const_message(sc: *SemaContext, name: intern.StrId, dep_path: i
     val res_msg: R.Result[str, str] = format.sprint(sc.s.alloc,
         "tuple-dependent public constants are not yet supported in union builds: '{}' in module '{}' is bound under a per-target-tuple condition",
         O.unwrap[str](no), O.unwrap[str](fo));
-    if (R.is_err[str, str](res_msg)) { ret fallback; }
+    if (R.is_err[str, str](res_msg)) { fail.internal(?sc.status, R.unwrap_err[str, str](res_msg)); ret fallback; }
     val buf: str = R.unwrap_ok[str, str](res_msg);
 
     val ir: R.Result[intern.StrId, str] = intern.intern(?sc.s.interner, buf);
     str_free(sc.s.alloc, buf);
-    if (R.is_err[intern.StrId, str](ir)) { ret fallback; }
+    if (R.is_err[intern.StrId, str](ir)) { fail.internal(?sc.status, R.unwrap_err[intern.StrId, str](ir)); ret fallback; }
 
     val nm: O.Option[str] = intern.lookup(?sc.s.interner, R.unwrap_ok[intern.StrId, str](ir));
     if (O.is_some[str](nm)) { ret O.unwrap[str](nm); }
     ret fallback;
 }
 
-pub fun resolve_module_member_const(sc: *SemaContext, eid: id.ExprId) R.Result[O.Option[comptime.CTValue], str] {
-    if (sc == nil) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
+pub fun resolve_module_member_const(sc: *SemaContext, eid: id.ExprId) R.Result[O.Option[comptime.CTValue], comptime.EvalFail] {
+    if (sc == nil) { ret R.ok[O.Option[comptime.CTValue], comptime.EvalFail](O.none[comptime.CTValue]()); }
     val rr: *resolve.ResolveResult = sc.rr;
     if (rr == nil || rr.expr_resolved == nil || eid::u32 >= rr.expr_count) {
-        ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]());
+        ret R.ok[O.Option[comptime.CTValue], comptime.EvalFail](O.none[comptime.CTValue]());
     }
     val sid: resolve.SymbolId = rr.expr_resolved[eid];
     if (sid == resolve.SYMBOL_NIL || sid::u32 >= rr.symbol_count) {
-        ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]());
+        ret R.ok[O.Option[comptime.CTValue], comptime.EvalFail](O.none[comptime.CTValue]());
     }
     val sym: *resolve.Symbol = ?rr.symbols[sid];
     if (sym.kind != resolve.SYM_IMPORTED) {
-        ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]());
+        ret R.ok[O.Option[comptime.CTValue], comptime.EvalFail](O.none[comptime.CTValue]());
     }
-    val ms_opt: O.Option[*ModuleSema] = module_sema_for(sc, sym.origin);
-    var octx: *comptime.ComptimeCtx = nil;
-    if (O.is_some[*ModuleSema](ms_opt)) { octx = O.unwrap[*ModuleSema](ms_opt).ctx; }
-    if (octx == nil) { octx = (session.module_comptime_ptr(sc.s, sym.origin))::*comptime.ComptimeCtx; }
-    if (octx == nil) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
-    val nc: O.Option[comptime.NamedConst] = comptime.lookup(octx, sym.name);
-    if (O.is_none[comptime.NamedConst](nc)) {
-        ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]());
+    val exported: O.Option[TypeExport] = public_type_for(sc, sym);
+    if (O.is_none[TypeExport](exported) || !O.unwrap[TypeExport](exported).constant.present) {
+        ret R.ok[O.Option[comptime.CTValue], comptime.EvalFail](O.none[comptime.CTValue]());
     }
-    val named: comptime.NamedConst = O.unwrap[comptime.NamedConst](nc);
+    val item: TypeExport = O.unwrap[TypeExport](exported);
+    val named: resolve.ExportConstant = item.constant;
+    if (named.value.kind == comptime.CT_KIND_CONST_ELEM) {
+        val current: R.Result[DefinedSymbol, fail.Fail] = imported_definition(sc, sym, DEFINITION_RESOLVED);
+        if (R.is_err[DefinedSymbol, fail.Fail](current)) {
+            val reason: fail.Fail = R.unwrap_err[DefinedSymbol, fail.Fail](current);
+            var kind: comptime.EvalFailKind = comptime.EVAL_FAIL_INTERNAL;
+            if (reason.kind == fail.REPORTED) { kind = comptime.EVAL_FAIL_REJECTED; }
+            ret R.err[O.Option[comptime.CTValue], comptime.EvalFail](comptime.eval_error(kind, reason.message));
+        }
+        if (R.unwrap_ok[DefinedSymbol, fail.Fail](current).definition.parsed.incarnation != item.definition_incarnation) {
+            fail.internal(?sc.status, "constant element does not belong to the acquired parsed definition");
+            ret R.err[O.Option[comptime.CTValue], comptime.EvalFail](comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, sc.status.message));
+        }
+    }
     if (named.gated && sc.ctx.env.union_build) {
-        var dep_path: intern.StrId = intern.STR_NIL;
-        if (O.is_some[*ModuleSema](ms_opt)) { dep_path = O.unwrap[*ModuleSema](ms_opt).path; }
+        val dep_path: intern.StrId = session.module_fqn(sc.s, sym.origin);
         val msg: str = gated_member_const_message(sc, sym.name, dep_path);
-        val e_opt: O.Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+        val e_opt: R.Result[expr.Expr, str] = expression(sc, eid);
         var span: token.Span;
         span.offset = 0;
         span.len    = 0;
-        if (O.is_some[*expr.Expr](e_opt)) { span = O.unwrap[*expr.Expr](e_opt).span; }
+        if (R.is_ok[expr.Expr, str](e_opt)) { span = R.unwrap_ok[expr.Expr, str](e_opt).span; }
         report(sc, span, msg);
-        ret R.err[O.Option[comptime.CTValue], str](msg);
+        if (sc.status.kind == fail.INTERNAL) {
+            ret R.err[O.Option[comptime.CTValue], comptime.EvalFail](comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, sc.status.message));
+        }
+        ret R.err[O.Option[comptime.CTValue], comptime.EvalFail](comptime.eval_error(comptime.EVAL_FAIL_REJECTED, msg));
     }
-    ret R.ok[O.Option[comptime.CTValue], str](O.some[comptime.CTValue](named.value));
+    ret R.ok[O.Option[comptime.CTValue], comptime.EvalFail](O.some[comptime.CTValue](named.value));
 }
 
 fun param_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.TypeId {
@@ -957,9 +1206,62 @@ fun param_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.TypeId {
     ret resolved_type_of(sc, tn.ty);
 }
 
+pub fun own_nominal_declaration(sc: *SemaContext, nominal: *type.Type) R.Result[id.DeclId, fail.Fail] {
+    if (sc.rr == nil || sc.a == nil) { ret R.err[id.DeclId, fail.Fail](fail.message("nominal definition requires the active resolved owner")); }
+    val owner: type.TypeOwner = resolve.type_owner(sc.s, sc.own_module, sc.a.file_id);
+    if (nominal.data.nominal.owner.module != owner.module || nominal.data.nominal.owner.file != owner.file) {
+        ret R.err[id.DeclId, fail.Fail](fail.message("nominal definition belongs to another source owner"));
+    }
+    var found: id.DeclId = id.DECL_NIL;
+    var i: u32 = 0;
+    for (i < sc.rr.symbol_count) {
+        val symbol: *resolve.Symbol = ?sc.rr.symbols[i];
+        var matches: bool = symbol.kind == resolve.SYM_REC && nominal.kind == type.TYPE_REC;
+        if (symbol.kind == resolve.SYM_UNI && nominal.kind == type.TYPE_UNI) { matches = true; }
+        if (symbol.kind == resolve.SYM_TAG && nominal.kind == type.TYPE_TAG) { matches = true; }
+        if (matches && symbol.origin == sc.own_module && symbol.canon == nominal.data.nominal.name) {
+            if (found != id.DECL_NIL && found != symbol.decl) { ret R.err[id.DeclId, fail.Fail](fail.message("nominal definition is ambiguous in the active resolved owner")); }
+            found = symbol.decl;
+        }
+        i = i + 1;
+    }
+    if (found == id.DECL_NIL || found >= sc.a.decl_len::u32) { ret R.err[id.DeclId, fail.Fail](fail.message("nominal definition is absent from the active resolved owner")); }
+    ret R.ok[id.DeclId, fail.Fail](found);
+}
+
+pub fun definition_ast(sc: *SemaContext, origin: session.ModuleId) *ast.Ast {
+    if (origin == sc.own_module) { ret sc.a; }
+    if (sc.deps == nil) { fail.internal(?sc.status, "semantic definition has no dependency reader"); ret nil; }
+    val acquired: R.Result[Definition, fail.Fail] = acquire_definition(?sc.deps.definitions, origin, DEFINITION_PARSED);
+    if (R.is_err[Definition, fail.Fail](acquired)) {
+        val reason: fail.Fail = R.unwrap_err[Definition, fail.Fail](acquired);
+        if (reason.kind == fail.REPORTED) { fail.reject(?sc.status); }
+        or { fail.internal(?sc.status, reason.message); }
+        ret nil;
+    }
+    ret R.unwrap_ok[Definition, fail.Fail](acquired).parsed.a;
+}
+
 pub fun generic_param_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.TypeId {
-    val res_intern: R.Result[type.TypeId, str] = type.intern_generic_param(?sc.s.types, sym.name, sym.origin, sym.decl, sym.slot);
-    if (R.is_err[type.TypeId, str](res_intern)) { ret type.TYPE_ERROR; }
+    val a: *ast.Ast = definition_ast(sc, sym.origin);
+    if (a == nil) { ret type.TYPE_ERROR; }
+    val selected: O.Option[*decl.Decl] = ast.get_decl(a, sym.decl);
+    if (O.is_none[*decl.Decl](selected)) { fail.internal(?sc.status, "generic parameter has no current owning declaration"); ret type.TYPE_ERROR; }
+    val declaration: *decl.Decl = O.unwrap[*decl.Decl](selected);
+    var name: token.Span;
+    var kind: type.TypeKind = type.TYPE_FUN;
+    if (declaration.kind == decl.DECL_KIND_FUN) { name = declaration.data.fun_.name; }
+    or (declaration.kind == decl.DECL_KIND_REC) { name = declaration.data.rec_.name; kind = type.TYPE_REC; }
+    or (declaration.kind == decl.DECL_KIND_UNI) { name = declaration.data.uni_.name; kind = type.TYPE_UNI; }
+    or (declaration.kind == decl.DECL_KIND_TAG) { name = declaration.data.tag_.name; kind = type.TYPE_TAG; }
+    or { fail.internal(?sc.status, "generic parameter owner has the wrong declaration kind"); ret type.TYPE_ERROR; }
+    val text: O.Option[*source.SourceFile] = source.get(?sc.s.sources, a.file_id);
+    if (O.is_none[*source.SourceFile](text)) { fail.internal(?sc.status, "generic parameter owner has no source"); ret type.TYPE_ERROR; }
+    val canonical: R.Result[intern.StrId, str] = intern.intern_span(?sc.s.interner, O.unwrap[*source.SourceFile](text).text, name);
+    if (R.is_err[intern.StrId, str](canonical)) { fail.internal(?sc.status, R.unwrap_err[intern.StrId, str](canonical)); ret type.TYPE_ERROR; }
+    val res_intern: R.Result[type.TypeId, str] = type.intern_generic_param(?sc.s.types, sym.name,
+        resolve.type_owner(sc.s, sym.origin, a.file_id), R.unwrap_ok[intern.StrId, str](canonical), kind, sym.slot);
+    if (R.is_err[type.TypeId, str](res_intern)) { fail.internal(?sc.status, R.unwrap_err[type.TypeId, str](res_intern)); ret type.TYPE_ERROR; }
     ret apply_subst(sc, R.unwrap_ok[type.TypeId, str](res_intern));
 }
 
@@ -1016,12 +1318,12 @@ pub fun record_embed_path(sc: *SemaContext, path_id: intern.StrId) R.Result[R.Vo
         if (sc.embed_path_cap > 0) { new_cap = sc.embed_path_cap * 2; }
         if (sc.embed_paths == nil) {
             val ar: R.Result[*intern.StrId, str] = A.allocate[intern.StrId](sc.s.alloc, new_cap::usize);
-            if (R.is_err[*intern.StrId, str](ar)) { ret R.err[R.Void, str](R.unwrap_err[*intern.StrId, str](ar)); }
+            if (R.is_err[*intern.StrId, str](ar)) { fail.internal(?sc.status, R.unwrap_err[*intern.StrId, str](ar)); ret R.err[R.Void, str](R.unwrap_err[*intern.StrId, str](ar)); }
             sc.embed_paths = R.unwrap_ok[*intern.StrId, str](ar);
         }
         or {
             val rr: R.Result[*intern.StrId, str] = A.reallocate[intern.StrId](sc.s.alloc, sc.embed_paths, sc.embed_path_cap::usize, new_cap::usize);
-            if (R.is_err[*intern.StrId, str](rr)) { ret R.err[R.Void, str](R.unwrap_err[*intern.StrId, str](rr)); }
+            if (R.is_err[*intern.StrId, str](rr)) { fail.internal(?sc.status, R.unwrap_err[*intern.StrId, str](rr)); ret R.err[R.Void, str](R.unwrap_err[*intern.StrId, str](rr)); }
             sc.embed_paths = R.unwrap_ok[*intern.StrId, str](rr);
         }
         sc.embed_path_cap = new_cap;
@@ -1036,8 +1338,8 @@ fun record_distinct_instances(sc: *SemaContext, first: u32, count: u32) R.Result
     var i: u32 = first;
     for (i < first + count) {
         val res_nom: R.Result[type.TypeId, str] =
-            type.intern_nominal(?sc.s.types, i::intern.StrId, 0::session.ModuleId, i::id.DeclId, type.TYPE_REC);
-        if (R.is_err[type.TypeId, str](res_nom)) { ret R.err[R.Void, str](R.unwrap_err[type.TypeId, str](res_nom)); }
+            type.intern_nominal(?sc.s.types, i::intern.StrId, type.TypeOwner{ module: 0, file: 1 }, type.TYPE_REC);
+        if (R.is_err[type.TypeId, str](res_nom)) { fail.internal(?sc.status, R.unwrap_err[type.TypeId, str](res_nom)); ret R.err[R.Void, str](R.unwrap_err[type.TypeId, str](res_nom)); }
         var arg: type.TypeId = R.unwrap_ok[type.TypeId, str](res_nom);
 
         var span: token.Span;
@@ -1059,7 +1361,9 @@ fun time_record_fresh(count: u32) i64 {
     if (O.is_some[str](type.init(?sess.types, ?alloc))) { ret -1; }
 
     var sc: SemaContext;
+    sc.status        = fail.accepted();
     sc.s             = ?sess;
+    sc.diags = ?sess.diags;
     sc.collect_insts = true;
     sc.insts         = nil;
     sc.inst_depth    = 0;
@@ -1103,4 +1407,22 @@ test "mach.lang.fe.sema.context.record_instance:cost_stays_near_linear_as_workli
     var bad: i32 = 0;
     if (us_large > (us_small + 2000) * 6) { bad = 1; }
     ret bad;
+}
+
+pub fun recover[T](sc: *SemaContext, r: R.Result[T, str], recovery: T) T {
+    if (R.is_err[T, str](r)) {
+        fail.internal(?sc.status, R.unwrap_err[T, str](r));
+        ret recovery;
+    }
+    ret R.unwrap_ok[T, str](r);
+}
+
+pub fun record_result(sc: *SemaContext, r: R.Result[R.Void, str]) {
+    if (R.is_err[R.Void, str](r)) { fail.internal(?sc.status, R.unwrap_err[R.Void, str](r)); }
+}
+
+pub fun record_eval_result(sc: *SemaContext, r: R.Result[comptime.CTValue, comptime.EvalFail]) {
+    if (!R.is_err[comptime.CTValue, comptime.EvalFail](r)) { ret; }
+    val f: comptime.EvalFail = R.unwrap_err[comptime.CTValue, comptime.EvalFail](r);
+    if (f.kind == comptime.EVAL_FAIL_INTERNAL) { fail.internal(?sc.status, f.message); }
 }

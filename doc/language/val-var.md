@@ -83,7 +83,8 @@ ext var errno: i32;                        # imported mutable datum
   `library` decorators, and the static/dynamic linking inputs all work exactly as
   for [`ext fun`](ext-fun.md).
 - On a dynamic target the reference is emitted GOT-indirect so the loader binds
-  it to the runtime definition (ELF: an `R_*_GLOB_DAT` GOT slot); an ordinary
+  it to the runtime definition. ELF uses a dynamic pointer relocation,
+  `GLOB_DAT` on x86-64 and ARM64 or `R_RISCV_64` on RV64. An ordinary
   cross-module reference to a `val`/`var` defined elsewhere in the same artifact
   stays directly addressed. Executed dynamic-import resolution is proven on the
   native ELF legs.

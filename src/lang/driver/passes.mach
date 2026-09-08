@@ -1,4 +1,5 @@
 use std.crypto.hash.sha256;
+use std.collections.vector;
 use std.encoding.binary;
 use std.allocator.page;
 use std.types.bool.bool;
@@ -21,6 +22,7 @@ use ctime: std.chrono.time;
 use cdur:  std.chrono.duration;
 use std.sync.atomic;
 use std.sync.thread;
+use std.process.env;
 
 use mach.lang.be.codegen;
 use mach.lang.be.codegen.unit;
@@ -36,12 +38,20 @@ use mach.lang.fe.ast.stmt;
 use mach.lang.fe.comptime;
 use mach.lang.fe.resolve;
 use mach.lang.fe.sema;
+use scx: mach.lang.fe.sema.context;
+use mach.lang.fe.sema.fields;
 use mach.lang.fe.token;
 use mach.lang.intern;
 use mach.lang.manifest;
 use mach.lang.me.ir;
+use mach.lang.me.ir.body;
+use ir_equal: mach.lang.me.ir.equal;
+use mach.lang.me.pass.mem2reg;
+use inline_pass: mach.lang.me.pass.inline;
 use mach.lang.me.analysis.oblivious;
 use mach.lang.me.lower;
+use lcx: mach.lang.me.lower.context;
+use atype: mach.lang.fe.ast.type;
 use mach.lang.me.lower.testrunner;
 use mach.lang.me.pipeline;
 use mach.lang.query;
@@ -55,12 +65,36 @@ use mach.lang.target.of;
 use mach.lang.type;
 
 use mach.lang.driver.project;
+use persistent: mach.lang.driver.cache;
+use step_env: mach.lang.driver.environment;
 use mach.lang.driver.union;
 use dq: mach.lang.driver.query;
 use mach.lang.driver.load;
 use mach.lang.fail;
 
-pub fun run_resolve_pass(p: *project.Project) R.Result[R.Void, fail.Fail] {
+pub fun read_definition(raw: ptr, mid: session.ModuleId, phase: scx.DefinitionPhase) R.Result[scx.Definition, fail.Fail] {
+    val p: *project.Project = raw::*project.Project;
+    val parsed: R.Result[resolve.ParsedDefinition, fail.Fail] = load.parsed_definition(raw, mid);
+    if (R.is_err[resolve.ParsedDefinition, fail.Fail](parsed)) { ret R.err[scx.Definition, fail.Fail](R.unwrap_err[resolve.ParsedDefinition, fail.Fail](parsed)); }
+    var result: scx.Definition = scx.Definition{ parsed: R.unwrap_ok[resolve.ParsedDefinition, fail.Fail](parsed), origin: mid };
+    if (phase >= scx.DEFINITION_RESOLVED) {
+        val acquired: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_RESOLVE, p.modules[mid::u32].stable_id::u64);
+        if (R.is_err[query.QueryView, fail.Fail](acquired)) { ret R.err[scx.Definition, fail.Fail](R.unwrap_err[query.QueryView, fail.Fail](acquired)); }
+        result.rr = dq.resolve_handle_decode(R.unwrap_ok[query.QueryView, fail.Fail](acquired));
+        if (result.rr == nil) { ret R.err[scx.Definition, fail.Fail](fail.message("current definition has no resolved query owner")); }
+        resolve.remap_result(result.rr, p.s);
+        p.modules[mid::u32].resolve_result = result.rr;
+    }
+    if (phase == scx.DEFINITION_TYPED) {
+        val acquired: R.Result[*sema.SemaResult, fail.Fail] = acquire_sema(p, mid);
+        if (R.is_err[*sema.SemaResult, fail.Fail](acquired)) { ret R.err[scx.Definition, fail.Fail](R.unwrap_err[*sema.SemaResult, fail.Fail](acquired)); }
+        result.sr = R.unwrap_ok[*sema.SemaResult, fail.Fail](acquired);
+        result.ctx = ?p.modules[mid::u32].ctx;
+    }
+    ret R.ok[scx.Definition, fail.Fail](result);
+}
+
+pub fun prepare_resolve_pass(p: *project.Project) R.Result[R.Void, fail.Fail] {
     if (!query.is_registered(?p.s.queries, query.Q_RESOLVE)) {
         val rr: R.Result[R.Void, str] = query.register_derived_owned(?p.s.queries, query.Q_RESOLVE, q_resolve_finalize);
         if (R.is_err[R.Void, str](rr)) { ret fail.lift[R.Void](rr); }
@@ -75,7 +109,10 @@ pub fun run_resolve_pass(p: *project.Project) R.Result[R.Void, fail.Fail] {
     val tf: R.Result[R.Void, str] = query.set_input(?p.s.queries, query.Q_GATE_TERMINAL, 0, ?tflag, 1);
     if (R.is_err[R.Void, str](tf)) { ret fail.lift[R.Void](tf); }
 
-    readout.phase_begin(p.events, readout.PH_RESOLVE);
+    ret R.ok_void[fail.Fail]();
+}
+
+pub fun run_resolve_pass(p: *project.Project) R.Result[R.Void, fail.Fail] {
     var i: u32 = 0;
     for (i < p.topo_len) {
         val mid: session.ModuleId = p.topo[i];
@@ -85,7 +122,6 @@ pub fun run_resolve_pass(p: *project.Project) R.Result[R.Void, fail.Fail] {
         }
         i = i + 1;
     }
-    readout.phase_end(p.events, readout.PH_RESOLVE, p.topo_len, "module", "modules");
     ret R.ok_void[fail.Fail]();
 }
 
@@ -94,23 +130,23 @@ fun run_resolve_one(p: *project.Project, mid: session.ModuleId) R.Result[R.Void,
 
     val t_item: ctime.Time = readout.item_begin(p.events);
 
-    val e_r: R.Result[*query.QueryEntry, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_RESOLVE, m.stable_id::u64);
-    if (R.is_err[*query.QueryEntry, fail.Fail](e_r)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*query.QueryEntry, fail.Fail](e_r).message)); }
-    val rr: *resolve.ResolveResult = dq.resolve_handle_decode(R.unwrap_ok[*query.QueryEntry, fail.Fail](e_r));
+    val e_r: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_RESOLVE, m.stable_id::u64);
+    if (R.is_err[query.QueryView, fail.Fail](e_r)) { ret R.err[R.Void, fail.Fail](R.unwrap_err[query.QueryView, fail.Fail](e_r)); }
+    val rr: *resolve.ResolveResult = dq.resolve_handle_decode(R.unwrap_ok[query.QueryView, fail.Fail](e_r));
     if (rr == nil) { ret R.err[R.Void, fail.Fail](fail.message("Q_RESOLVE produced no result handle")); }
 
-    val ex_r: R.Result[*query.QueryEntry, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_EXPORTS, m.stable_id::u64);
-    if (R.is_err[*query.QueryEntry, fail.Fail](ex_r)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*query.QueryEntry, fail.Fail](ex_r).message)); }
+    val ex_r: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_EXPORTS, m.stable_id::u64);
+    if (R.is_err[query.QueryView, fail.Fail](ex_r)) { ret R.err[R.Void, fail.Fail](R.unwrap_err[query.QueryView, fail.Fail](ex_r)); }
 
     resolve.remap_result(rr, p.s);
 
     m.resolve_result = rr;
     m.resolved       = true;
-    readout.item(p.events, readout.PH_RESOLVE, project.fqn_name(p, m.fqn), t_item);
+    if (p.events != nil) { m.resolve_elapsed = m.resolve_elapsed + ctime.time_sub(ctime.monotonic(), t_item); }
     ret R.ok_void[fail.Fail]();
 }
 
-pub fun q_resolve_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, fail.Fail] {
+pub fun q_resolve_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[query.QueryOutput, fail.Fail] {
     val db: *query.QueryDb = ?p.s.queries;
     val s: *session.Session = p.s;
 
@@ -118,15 +154,13 @@ pub fun q_resolve_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.
     val mid: session.ModuleId = session.module_id_for_stable(s, stable);
     if (mid == session.MODULE_NIL) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_RESOLVE: stable id not loaded this build")); }
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
-    val a: *ast.Ast = m.a;
-    if (a == nil) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_RESOLVE: module has no parsed AST")); }
-
-    val rp: R.Result[R.Void, str] = query.record_dep(db, query.Q_RESOLVE, key, query.Q_PARSE, a.file_id::u64);
-    if (R.is_err[R.Void, str](rp)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rp))); }
-    val rt: R.Result[R.Void, str] = query.record_dep(db, query.Q_RESOLVE, key, query.Q_TARGET, 0);
-    if (R.is_err[R.Void, str](rt)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rt))); }
-    val rgt: R.Result[R.Void, str] = query.record_dep(db, query.Q_RESOLVE, key, query.Q_GATE_TERMINAL, 0);
-    if (R.is_err[R.Void, str](rgt)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rgt))); }
+    val parsed: R.Result[resolve.ParsedDefinition, fail.Fail] = load.parsed_definition(p::ptr, mid);
+    if (R.is_err[resolve.ParsedDefinition, fail.Fail](parsed)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[resolve.ParsedDefinition, fail.Fail](parsed)); }
+    val a: *ast.Ast = R.unwrap_ok[resolve.ParsedDefinition, fail.Fail](parsed).a;
+    val rt: R.Result[R.Void, fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_TARGET, 0);
+    if (R.is_err[R.Void, fail.Fail](rt)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[R.Void, fail.Fail](rt)); }
+    val rgt: R.Result[R.Void, fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_GATE_TERMINAL, 0);
+    if (R.is_err[R.Void, fail.Fail](rgt)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[R.Void, fail.Fail](rgt)); }
 
     val deps_r: R.Result[resolve.ResolveDeps, str] = build_resolve_deps_owned(p, m);
     if (R.is_err[resolve.ResolveDeps, str](deps_r)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[resolve.ResolveDeps, str](deps_r))); }
@@ -137,19 +171,19 @@ pub fun q_resolve_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.
         val dep_mid: session.ModuleId = deps.entries[di].module;
         if (dep_mid::u32 < p.module_len) {
             val dep_stable: session.StableModuleId = p.modules[dep_mid::u32].stable_id;
-            val ge: R.Result[*query.QueryEntry, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_EXPORTS, dep_stable::u64);
-            if (R.is_err[*query.QueryEntry, fail.Fail](ge)) {
+            val ge: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_EXPORTS, dep_stable::u64);
+            if (R.is_err[query.QueryView, fail.Fail](ge)) {
                 free_resolve_deps(s.alloc, ?deps);
-                ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[*query.QueryEntry, fail.Fail](ge));
+                ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[query.QueryView, fail.Fail](ge));
             }
         }
         di = di + 1;
     }
 
-    val rr_r: R.Result[resolve.ResolveResult, str] = resolve.resolve(s, a, ?deps, ?m.ctx, mid, p.gate_terminal);
+    val rr_r: R.Result[resolve.ResolveResult, fail.Fail] = resolve.resolve(s, a, ?deps, ?m.ctx, mid, p.gate_terminal, diags);
     free_resolve_deps(s.alloc, ?deps);
-    if (R.is_err[resolve.ResolveResult, str](rr_r)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[resolve.ResolveResult, str](rr_r))); }
-    var result: resolve.ResolveResult = R.unwrap_ok[resolve.ResolveResult, str](rr_r);
+    if (R.is_err[resolve.ResolveResult, fail.Fail](rr_r)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[resolve.ResolveResult, fail.Fail](rr_r)); }
+    var result: resolve.ResolveResult = R.unwrap_ok[resolve.ResolveResult, fail.Fail](rr_r);
 
     val br: R.Result[*resolve.ResolveResult, str] = A.allocate[resolve.ResolveResult](alloc, 1::usize);
     if (R.is_err[*resolve.ResolveResult, str](br)) {
@@ -196,7 +230,7 @@ fun resolve_list_contains(list: *session.ModuleId, list_len: u32, id: session.Mo
     ret false;
 }
 
-pub fun run_sema_pass(p: *project.Project) R.Result[R.Void, outcome.Fail] {
+pub fun prepare_sema_pass(p: *project.Project) R.Result[R.Void, outcome.Fail] {
     if (!query.is_registered(?p.s.queries, query.Q_SEMA)) {
         val rsm: R.Result[R.Void, str] = query.register_derived_owned(?p.s.queries, query.Q_SEMA, q_sema_finalize);
         if (R.is_err[R.Void, str](rsm)) { ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](rsm))); }
@@ -206,16 +240,18 @@ pub fun run_sema_pass(p: *project.Project) R.Result[R.Void, outcome.Fail] {
         if (R.is_err[R.Void, str](rte)) { ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](rte))); }
     }
 
-    type.field_epoch_bump(?p.s.types);
+    ret R.ok_void[outcome.Fail]();
+}
 
+pub fun run_sema_pass(p: *project.Project) R.Result[R.Void, outcome.Fail] {
     readout.phase_begin(p.events, readout.PH_SEMA);
     var i: u32 = 0;
     for (i < p.topo_len) {
         val mid: session.ModuleId = p.topo[i];
-        val before: usize = diagnostic.error_count(?p.s.diags);
+
         val r: R.Result[R.Void, fail.Fail] = run_sema_one(p, mid);
         if (R.is_err[R.Void, fail.Fail](r)) {
-            ret R.err[R.Void, outcome.Fail](pass_fail(p, before, R.unwrap_err[R.Void, fail.Fail](r)));
+            ret R.err[R.Void, outcome.Fail](outcome.from_fail(R.unwrap_err[R.Void, fail.Fail](r)));
         }
         i = i + 1;
     }
@@ -223,21 +259,36 @@ pub fun run_sema_pass(p: *project.Project) R.Result[R.Void, outcome.Fail] {
     ret R.ok_void[outcome.Fail]();
 }
 
+pub fun acquire_sema(p: *project.Project, mid: session.ModuleId) R.Result[*sema.SemaResult, fail.Fail] {
+    if (mid == session.MODULE_NIL || mid::u32 >= p.module_len) {
+        ret R.err[*sema.SemaResult, fail.Fail](fail.message("semantic definition module is not in the active project"));
+    }
+    val stable: session.StableModuleId = p.modules[mid::u32].stable_id;
+    val acquired: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_SEMA, stable::u64);
+    if (R.is_err[query.QueryView, fail.Fail](acquired)) { ret R.err[*sema.SemaResult, fail.Fail](R.unwrap_err[query.QueryView, fail.Fail](acquired)); }
+    val result: *sema.SemaResult = sema_handle_decode(R.unwrap_ok[query.QueryView, fail.Fail](acquired));
+    if (result == nil) { ret R.err[*sema.SemaResult, fail.Fail](fail.message("semantic query produced no result owner")); }
+    val installed: R.Result[R.Void, str] = fields.install(p.s, ?result.field_graph);
+    if (R.is_err[R.Void, str](installed)) { ret R.err[*sema.SemaResult, fail.Fail](fail.message(R.unwrap_err[R.Void, str](installed))); }
+    p.modules[mid::u32].sema_result = result;
+    ret R.ok[*sema.SemaResult, fail.Fail](result);
+}
+
 fun run_sema_one(p: *project.Project, mid: session.ModuleId) R.Result[R.Void, fail.Fail] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
 
     val t_item: ctime.Time = readout.item_begin(p.events);
 
-    val e_r: R.Result[*query.QueryEntry, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_SEMA, m.stable_id::u64);
-    if (R.is_err[*query.QueryEntry, fail.Fail](e_r)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*query.QueryEntry, fail.Fail](e_r).message)); }
-    val sr: *sema.SemaResult = sema_handle_decode(R.unwrap_ok[*query.QueryEntry, fail.Fail](e_r));
-    if (sr == nil) { ret R.err[R.Void, fail.Fail](fail.message("Q_SEMA produced no result handle")); }
+    val acquired: R.Result[scx.Definition, fail.Fail] = read_definition(p::ptr, mid, scx.DEFINITION_TYPED);
+    if (R.is_err[scx.Definition, fail.Fail](acquired)) { ret R.err[R.Void, fail.Fail](R.unwrap_err[scx.Definition, fail.Fail](acquired)); }
+    val current: scx.Definition = R.unwrap_ok[scx.Definition, fail.Fail](acquired);
+    val sr: *sema.SemaResult = current.sr;
 
-    val tx_r: R.Result[*query.QueryEntry, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_TYPED_EXPORTS, m.stable_id::u64);
-    if (R.is_err[*query.QueryEntry, fail.Fail](tx_r)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*query.QueryEntry, fail.Fail](tx_r).message)); }
+    val tx_r: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_TYPED_EXPORTS, m.stable_id::u64);
+    if (R.is_err[query.QueryView, fail.Fail](tx_r)) { ret R.err[R.Void, fail.Fail](R.unwrap_err[query.QueryView, fail.Fail](tx_r)); }
 
     val rp: R.Result[R.Void, str] = session.register_module_phase(p.s, mid, sr::ptr,
-        m.resolve_result::ptr, (?m.ctx)::ptr);
+        current.rr::ptr, current.ctx::ptr);
     if (R.is_err[R.Void, str](rp)) { ret fail.lift[R.Void](rp); }
 
     m.sema_result = sr;
@@ -245,7 +296,7 @@ fun run_sema_one(p: *project.Project, mid: session.ModuleId) R.Result[R.Void, fa
     ret R.ok_void[fail.Fail]();
 }
 
-pub fun q_sema_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, fail.Fail] {
+pub fun q_sema_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[query.QueryOutput, fail.Fail] {
     val db: *query.QueryDb = ?p.s.queries;
     val s: *session.Session = p.s;
 
@@ -253,52 +304,36 @@ pub fun q_sema_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.Res
     val mid: session.ModuleId = session.module_id_for_stable(s, stable);
     if (mid == session.MODULE_NIL) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_SEMA: stable id not loaded this build")); }
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
-    val a: *ast.Ast = m.a;
-    if (a == nil) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_SEMA: module has no parsed AST")); }
-    val rr: *resolve.ResolveResult = m.resolve_result;
-    if (rr == nil) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_SEMA: module has no resolve result")); }
+    val parsed: R.Result[resolve.ParsedDefinition, fail.Fail] = load.parsed_definition(p::ptr, mid);
+    if (R.is_err[resolve.ParsedDefinition, fail.Fail](parsed)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[resolve.ParsedDefinition, fail.Fail](parsed)); }
+    val definition: resolve.ParsedDefinition = R.unwrap_ok[resolve.ParsedDefinition, fail.Fail](parsed);
+    if (definition.status.kind != fail.ACCEPTED) { ret R.err[query.QueryOutput, fail.Fail](fail.phase_failure(definition.status)); }
+    val a: *ast.Ast = definition.a;
+    val resolved: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_RESOLVE, key);
+    if (R.is_err[query.QueryView, fail.Fail](resolved)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[query.QueryView, fail.Fail](resolved)); }
+    val rr: *resolve.ResolveResult = dq.resolve_handle_decode(R.unwrap_ok[query.QueryView, fail.Fail](resolved));
+    if (rr == nil) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_SEMA: acquired query has no resolve result")); }
+    m.resolve_result = rr;
+    val rt: R.Result[R.Void, fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_TARGET, 0);
+    if (R.is_err[R.Void, fail.Fail](rt)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[R.Void, fail.Fail](rt)); }
+    val rn: R.Result[R.Void, fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_MODULE_NUMBER, key);
+    if (R.is_err[R.Void, fail.Fail](rn)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[R.Void, fail.Fail](rn)); }
 
-    val rrd: R.Result[R.Void, str] = query.record_dep(db, query.Q_SEMA, key, query.Q_RESOLVE, key);
-    if (R.is_err[R.Void, str](rrd)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rrd))); }
-    val rt: R.Result[R.Void, str] = query.record_dep(db, query.Q_SEMA, key, query.Q_TARGET, 0);
-    if (R.is_err[R.Void, str](rt)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rt))); }
-    val rn: R.Result[R.Void, str] = query.record_dep(db, query.Q_SEMA, key, query.Q_MODULE_NUMBER, key);
-    if (R.is_err[R.Void, str](rn)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rn))); }
+    val sdeps_r: R.Result[sema.SemaDeps, fail.Fail] = build_sema_deps_query(p, m);
+    if (R.is_err[sema.SemaDeps, fail.Fail](sdeps_r)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[sema.SemaDeps, fail.Fail](sdeps_r)); }
+    var sdeps: sema.SemaDeps = R.unwrap_ok[sema.SemaDeps, fail.Fail](sdeps_r);
 
-    val deps_r: R.Result[resolve.ResolveDeps, str] = build_resolve_deps_owned(p, m);
-    if (R.is_err[resolve.ResolveDeps, str](deps_r)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[resolve.ResolveDeps, str](deps_r))); }
-    var deps: resolve.ResolveDeps = R.unwrap_ok[resolve.ResolveDeps, str](deps_r);
-    var di: u32 = 0;
-    for (di < deps.count) {
-        val dep_mid: session.ModuleId = deps.entries[di].module;
-        if (dep_mid::u32 < p.module_len) {
-            val dep_stable: session.StableModuleId = p.modules[dep_mid::u32].stable_id;
-            val ge: R.Result[*query.QueryEntry, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_TYPED_EXPORTS, dep_stable::u64);
-            if (R.is_err[*query.QueryEntry, fail.Fail](ge)) {
-                free_resolve_deps(s.alloc, ?deps);
-                ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[*query.QueryEntry, fail.Fail](ge));
-            }
-        }
-        di = di + 1;
-    }
-    free_resolve_deps(s.alloc, ?deps);
-
-    val sdeps_r: R.Result[sema.SemaDeps, str] = build_sema_deps_query(p);
-    if (R.is_err[sema.SemaDeps, str](sdeps_r)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[sema.SemaDeps, str](sdeps_r))); }
-    var sdeps: sema.SemaDeps = R.unwrap_ok[sema.SemaDeps, str](sdeps_r);
-
-    val sem_r: R.Result[sema.SemaResult, str] = sema.sema(s, a, rr, ?sdeps, ?m.ctx, mid);
+    val sem_r: R.Result[sema.SemaResult, fail.Fail] = sema.sema(s, a, rr, ?sdeps, ?m.ctx, mid, diags);
     free_sema_deps_query(s.alloc, ?sdeps);
-    if (R.is_err[sema.SemaResult, str](sem_r)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[sema.SemaResult, str](sem_r))); }
-    var result: sema.SemaResult = R.unwrap_ok[sema.SemaResult, str](sem_r);
+    if (R.is_err[sema.SemaResult, fail.Fail](sem_r)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[sema.SemaResult, fail.Fail](sem_r)); }
+    var result: sema.SemaResult = R.unwrap_ok[sema.SemaResult, fail.Fail](sem_r);
 
     var ei: u32 = 0;
     for (ei < result.embed_path_count) {
-        val re: R.Result[R.Void, str] = query.record_dep(db, query.Q_SEMA, key,
-                                                       query.Q_EMBED_FILE, result.embed_paths[ei]::u64);
-        if (R.is_err[R.Void, str](re)) {
+        val re: R.Result[R.Void, fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_EMBED_FILE, result.embed_paths[ei]::u64);
+        if (R.is_err[R.Void, fail.Fail](re)) {
             sema.dnit_result(?result);
-            ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](re)));
+            ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[R.Void, fail.Fail](re));
         }
         ei = ei + 1;
     }
@@ -339,56 +374,67 @@ fun sema_handle_encode(alloc: *A.Allocator, r: *sema.SemaResult) R.Result[query.
     ret R.ok[query.QueryOutput, fail.Fail](out);
 }
 
-fun sema_handle_decode(e: *query.QueryEntry) *sema.SemaResult {
+fun sema_handle_decode(e: query.QueryView) *sema.SemaResult {
     if (e.value == nil || e.value_len::usize < $size_of(ptr)) { ret nil; }
     val slot: *ptr = e.value::ptr::*ptr;
     ret slot[0]::*sema.SemaResult;
 }
 
-fun build_sema_deps_query(p: *project.Project) R.Result[sema.SemaDeps, str] {
-    var deps: sema.SemaDeps;
-    deps.entries = nil;
-    deps.count   = 0;
-
-    var ready_count: u32 = 0;
-    var j: u32 = 0;
-    for (j < p.module_len) {
-        if (p.modules[j].sema_result != nil) { ready_count = ready_count + 1; }
-        j = j + 1;
-    }
-    if (ready_count == 0) { ret R.ok[sema.SemaDeps, str](deps); }
-
-    val r: R.Result[*sema.ModuleSema, str] = A.allocate[sema.ModuleSema](p.s.alloc, ready_count::usize);
-    if (R.is_err[*sema.ModuleSema, str](r)) { ret R.err[sema.SemaDeps, str](R.unwrap_err[*sema.ModuleSema, str](r)); }
-    val arr: *sema.ModuleSema = R.unwrap_ok[*sema.ModuleSema, str](r);
-
-    var i: u32 = 0;
-    var k: u32 = 0;
-    for (i < p.module_len) {
-        val sr: *sema.SemaResult = p.modules[i].sema_result;
-        if (sr != nil) {
-            var ms: sema.ModuleSema;
-            ms.path       = p.modules[i].fqn;
-            ms.module     = i::session.ModuleId;
-            ms.decl_type  = sr.decl_type;
-            ms.decl_count = sr.decl_count;
-            ms.ctx        = ?p.modules[i].ctx;
-            arr[k] = ms;
-            k = k + 1;
+fun build_sema_deps_query(p: *project.Project, m: *project.ModuleEntry) R.Result[sema.SemaDeps, fail.Fail] {
+    var deps: sema.SemaDeps = sema.SemaDeps{};
+    deps.definitions = scx.DefinitionReader{ ctx: p::ptr, read: read_definition };
+    val closure: R.Result[LowerClosure, str] = collect_lower_closure(p, m);
+    if (R.is_err[LowerClosure, str](closure)) { ret R.err[sema.SemaDeps, fail.Fail](fail.message(R.unwrap_err[LowerClosure, str](closure))); }
+    var imports: LowerClosure = R.unwrap_ok[LowerClosure, str](closure);
+    fin { free_lower_closure(p.s.alloc, ?imports); }
+    if (imports.count == 0) { ret R.ok[sema.SemaDeps, fail.Fail](deps); }
+    val allocated: R.Result[*sema.ModuleSema, str] = A.allocate[sema.ModuleSema](p.s.alloc, imports.count::usize);
+    if (R.is_err[*sema.ModuleSema, str](allocated)) { ret R.err[sema.SemaDeps, fail.Fail](fail.message(R.unwrap_err[*sema.ModuleSema, str](allocated))); }
+    deps.entries = R.unwrap_ok[*sema.ModuleSema, str](allocated);
+    deps.count = imports.count;
+    var initialized: u32 = 0;
+    var transferred: bool = false;
+    fin {
+        if (!transferred) {
+            var i: u32 = 0;
+            for (i < initialized) { scx.module_sema_dnit(?deps.entries[i]); i = i + 1; }
+            A.deallocate[sema.ModuleSema](p.s.alloc, deps.entries, deps.count::usize);
         }
-        i = i + 1;
     }
-
-    deps.entries = arr;
-    deps.count   = ready_count;
-    ret R.ok[sema.SemaDeps, str](deps);
+    for (initialized < imports.count) {
+        val mid: session.ModuleId = imports.list[initialized];
+        val captured: R.Result[scx.ModuleSema, fail.Fail] = read_typed_surface(p, mid, p.s.alloc);
+        if (R.is_err[scx.ModuleSema, fail.Fail](captured)) { ret R.err[sema.SemaDeps, fail.Fail](R.unwrap_err[scx.ModuleSema, fail.Fail](captured)); }
+        deps.entries[initialized] = R.unwrap_ok[scx.ModuleSema, fail.Fail](captured);
+        initialized = initialized + 1;
+    }
+    transferred = true;
+    ret R.ok[sema.SemaDeps, fail.Fail](deps);
 }
 
 fun free_sema_deps_query(alloc: *A.Allocator, deps: *sema.SemaDeps) {
-    if (deps.entries == nil) { ret; }
-    A.deallocate[sema.ModuleSema](alloc, deps.entries, deps.count::usize);
+    var i: u32 = 0;
+    for (i < deps.count) { scx.module_sema_dnit(?deps.entries[i]); i = i + 1; }
+    if (deps.entries != nil) { A.deallocate[sema.ModuleSema](alloc, deps.entries, deps.count::usize); }
     deps.entries = nil;
-    deps.count   = 0;
+    deps.count = 0;
+}
+
+pub fun read_typed_surface(p: *project.Project, mid: session.ModuleId, a: *A.Allocator) R.Result[scx.ModuleSema, fail.Fail] {
+    if (mid == session.MODULE_NIL || mid::u32 >= p.module_len) { ret R.err[scx.ModuleSema, fail.Fail](fail.message("typed surface module is not loaded")); }
+    val acquired: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p,
+        query.Q_TYPED_EXPORTS, p.modules[mid::u32].stable_id::u64);
+    if (R.is_err[query.QueryView, fail.Fail](acquired)) { ret R.err[scx.ModuleSema, fail.Fail](R.unwrap_err[query.QueryView, fail.Fail](acquired)); }
+    val view: query.QueryView = R.unwrap_ok[query.QueryView, fail.Fail](acquired);
+    val decoded: R.Result[scx.ModuleSema, str] = dq.typed_surface_decode(a, view.value, view.value_len, p.modules[mid::u32].fqn, mid);
+    if (R.is_err[scx.ModuleSema, str](decoded)) { ret fail.lift[scx.ModuleSema](decoded); }
+    var owned: scx.ModuleSema = R.unwrap_ok[scx.ModuleSema, str](decoded);
+    val installed: R.Result[R.Void, str] = fields.install(p.s, ?owned.graph);
+    if (R.is_err[R.Void, str](installed)) {
+        scx.module_sema_dnit(?owned);
+        ret R.err[scx.ModuleSema, fail.Fail](fail.message(R.unwrap_err[R.Void, str](installed)));
+    }
+    ret R.ok[scx.ModuleSema, fail.Fail](owned);
 }
 
 pub fun decided_gate_count(p: *project.Project) u32 {
@@ -426,19 +472,19 @@ pub fun run_gate_pass(p: *project.Project) R.Result[bool, str] {
             if (m.ctx.gate_states[gi] != comptime.GATE_STATE_UNKNOWN) { before = before + 1; }
             gi = gi + 1;
         }
-        val gr: R.Result[sema.SemaResult, str] = sema.resolve_gates(p.s, m.a, m.resolve_result, ?deps, ?m.ctx, mid);
+        val gr: R.Result[sema.SemaResult, fail.Fail] = sema.resolve_gates(p.s, m.a, m.resolve_result, ?deps, ?m.ctx, mid, ?p.diags);
         free_sema_deps_query(p.s.alloc, ?deps);
-        if (R.is_err[sema.SemaResult, str](gr)) {
-            ret R.err[bool, str](R.unwrap_err[sema.SemaResult, str](gr));
+        if (R.is_err[sema.SemaResult, fail.Fail](gr)) {
+            ret R.err[bool, str](R.unwrap_err[sema.SemaResult, fail.Fail](gr).message);
         }
         val ar: R.Result[*sema.SemaResult, str] = A.allocate[sema.SemaResult](p.alloc, 1::usize);
         if (R.is_err[*sema.SemaResult, str](ar)) {
-            var result: sema.SemaResult = R.unwrap_ok[sema.SemaResult, str](gr);
+            var result: sema.SemaResult = R.unwrap_ok[sema.SemaResult, fail.Fail](gr);
             sema.dnit_result(?result);
             ret R.err[bool, str](R.unwrap_err[*sema.SemaResult, str](ar));
         }
         m.gate_result = R.unwrap_ok[*sema.SemaResult, str](ar);
-        m.gate_result[0] = R.unwrap_ok[sema.SemaResult, str](gr);
+        m.gate_result[0] = R.unwrap_ok[sema.SemaResult, fail.Fail](gr);
         var after: u32 = 0;
         gi = 0;
         for (gi < m.ctx.gate_count) {
@@ -662,21 +708,21 @@ fun run_one_union_tuple(p: *project.Project, ti: u32) R.Result[bool, str] {
             }
             ug = ug + 1;
         }
-        val diag_mark: diagnostic.DiagMark = diagnostic.mark(?p.s.diags);
+        val diag_mark: diagnostic.DiagMark = diagnostic.mark(?p.diags);
         val deps_r: R.Result[resolve.ResolveDeps, str] = build_resolve_deps_owned(p, m);
         if (R.is_err[resolve.ResolveDeps, str](deps_r)) {
             leave_union_tuple(p, ti);
             ret R.err[bool, str](R.unwrap_err[resolve.ResolveDeps, str](deps_r));
         }
         var deps: resolve.ResolveDeps = R.unwrap_ok[resolve.ResolveDeps, str](deps_r);
-        val rr: R.Result[resolve.ResolveResult, str] = resolve.resolve(p.s, m.a, ?deps, ?m.ctx, mid, false);
+        val rr: R.Result[resolve.ResolveResult, fail.Fail] = resolve.resolve(p.s, m.a, ?deps, ?m.ctx, mid, false, ?p.diags);
         free_resolve_deps(p.s.alloc, ?deps);
-        if (R.is_err[resolve.ResolveResult, str](rr)) {
+        if (R.is_err[resolve.ResolveResult, fail.Fail](rr)) {
             leave_union_tuple(p, ti);
-            ret R.err[bool, str](R.unwrap_err[resolve.ResolveResult, str](rr));
+            ret R.err[bool, str](R.unwrap_err[resolve.ResolveResult, fail.Fail](rr).message);
         }
         if (unresolved_before > 0) {
-            val tr: R.Result[R.Void, str] = diagnostic.truncate(?p.s.diags, diag_mark);
+            val tr: R.Result[R.Void, str] = diagnostic.truncate(?p.diags, diag_mark);
             if (R.is_err[R.Void, str](tr)) {
                 leave_union_tuple(p, ti);
                 ret R.err[bool, str](R.unwrap_err[R.Void, str](tr));
@@ -687,7 +733,7 @@ fun run_one_union_tuple(p: *project.Project, ti: u32) R.Result[bool, str] {
             A.deallocate[resolve.ResolveResult](p.alloc, m.resolve_result, 1::usize);
             m.resolve_result = nil;
         }
-        var resolved: resolve.ResolveResult = R.unwrap_ok[resolve.ResolveResult, str](rr);
+        var resolved: resolve.ResolveResult = R.unwrap_ok[resolve.ResolveResult, fail.Fail](rr);
         val rb: R.Result[*resolve.ResolveResult, str] = box_resolve_result(p, resolved);
         if (R.is_err[*resolve.ResolveResult, str](rb)) {
             resolve.dnit_result(?resolved);
@@ -708,18 +754,18 @@ fun run_one_union_tuple(p: *project.Project, ti: u32) R.Result[bool, str] {
             if (m.ctx.gate_states[gi] != comptime.GATE_STATE_UNKNOWN) { before = before + 1; }
             gi = gi + 1;
         }
-        val sr: R.Result[sema.SemaResult, str] = sema.resolve_gates(p.s, m.a, m.resolve_result, ?sema_deps, ?m.ctx, mid);
+        val sr: R.Result[sema.SemaResult, fail.Fail] = sema.resolve_gates(p.s, m.a, m.resolve_result, ?sema_deps, ?m.ctx, mid, ?p.diags);
         free_sema_deps_query(p.s.alloc, ?sema_deps);
-        if (R.is_err[sema.SemaResult, str](sr)) {
+        if (R.is_err[sema.SemaResult, fail.Fail](sr)) {
             leave_union_tuple(p, ti);
-            ret R.err[bool, str](R.unwrap_err[sema.SemaResult, str](sr));
+            ret R.err[bool, str](R.unwrap_err[sema.SemaResult, fail.Fail](sr).message);
         }
         if (m.gate_result != nil) {
             sema.dnit_result(m.gate_result);
             A.deallocate[sema.SemaResult](p.alloc, m.gate_result, 1::usize);
             m.gate_result = nil;
         }
-        var sema_result: sema.SemaResult = R.unwrap_ok[sema.SemaResult, str](sr);
+        var sema_result: sema.SemaResult = R.unwrap_ok[sema.SemaResult, fail.Fail](sr);
         val sb: R.Result[*sema.SemaResult, str] = box_sema_result(p, sema_result);
         if (R.is_err[*sema.SemaResult, str](sb)) {
             sema.dnit_result(?sema_result);
@@ -754,6 +800,7 @@ fun run_union_gate_pass(p: *project.Project) R.Result[bool, str] {
 
 fun build_gate_deps(p: *project.Project, m: *project.ModuleEntry) R.Result[sema.SemaDeps, str] {
     var deps: sema.SemaDeps;
+    deps.definitions = scx.DefinitionReader{ ctx: p::ptr, read: read_definition };
     deps.entries = nil;
     deps.count = 0;
     val rr: R.Result[resolve.ResolveDeps, str] = build_resolve_deps_owned(p, m);
@@ -802,11 +849,16 @@ fun build_gate_deps(p: *project.Project, m: *project.ModuleEntry) R.Result[sema.
             i = i + 1;
             cnt;
         }
-        entries[w].path = p.modules[mid::u32].fqn;
-        entries[w].module = mid;
-        entries[w].decl_type = result.decl_type;
-        entries[w].decl_count = result.decl_count;
-        entries[w].ctx = ?p.modules[mid::u32].ctx;
+        val captured: R.Result[scx.ModuleSema, fail.Fail] = build_type_surface(p, mid,
+            p.modules[mid::u32].resolve_result, result, true, p.s.alloc);
+        if (R.is_err[scx.ModuleSema, fail.Fail](captured)) {
+            var j: u32 = 0;
+            for (j < w) { scx.module_sema_dnit(?entries[j]); j = j + 1; }
+            A.deallocate[sema.ModuleSema](p.s.alloc, entries, dep_count::usize);
+            free_resolve_deps(p.s.alloc, ?resolve_deps);
+            ret R.err[sema.SemaDeps, str](R.unwrap_err[scx.ModuleSema, fail.Fail](captured).message);
+        }
+        entries[w] = R.unwrap_ok[scx.ModuleSema, fail.Fail](captured);
         w = w + 1;
         i = i + 1;
     }
@@ -821,6 +873,7 @@ pub fun clear_gate_results(p: *project.Project) {
     for (i < p.module_len) {
         val result: *sema.SemaResult = p.modules[i].gate_result;
         if (result != nil) {
+            p.modules[i].gate_status = result.status;
             sema.dnit_result(result);
             A.deallocate[sema.SemaResult](p.alloc, result, 1::usize);
             p.modules[i].gate_result = nil;
@@ -844,20 +897,22 @@ pub fun invalidate_resolve_pass(p: *project.Project) R.Result[R.Void, str] {
     ret R.ok_void[str]();
 }
 
-pub fun q_typed_exports_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, fail.Fail] {
+pub fun q_typed_exports_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[query.QueryOutput, fail.Fail] {
     val s: *session.Session = p.s;
 
     val stable: session.StableModuleId = key::u32::session.StableModuleId;
     val mid: session.ModuleId = session.module_id_for_stable(s, stable);
     if (mid == session.MODULE_NIL) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_TYPED_EXPORTS: stable id not loaded this build")); }
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
-    val rr: *resolve.ResolveResult = m.resolve_result;
-    if (rr == nil) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_TYPED_EXPORTS: module has no resolve result")); }
-
-    val e_r: R.Result[*query.QueryEntry, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_SEMA, key);
-    if (R.is_err[*query.QueryEntry, fail.Fail](e_r)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[*query.QueryEntry, fail.Fail](e_r)); }
-    val sr: *sema.SemaResult = sema_handle_decode(R.unwrap_ok[*query.QueryEntry, fail.Fail](e_r));
-    if (sr == nil) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_TYPED_EXPORTS: module has no sema result")); }
+    val acquired: R.Result[*sema.SemaResult, fail.Fail] = acquire_sema(p, mid);
+    if (R.is_err[*sema.SemaResult, fail.Fail](acquired)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[*sema.SemaResult, fail.Fail](acquired)); }
+    val sr: *sema.SemaResult = R.unwrap_ok[*sema.SemaResult, fail.Fail](acquired);
+    val resolved: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_RESOLVE, key);
+    if (R.is_err[query.QueryView, fail.Fail](resolved)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[query.QueryView, fail.Fail](resolved)); }
+    val rr: *resolve.ResolveResult = dq.resolve_handle_decode(R.unwrap_ok[query.QueryView, fail.Fail](resolved));
+    if (rr == nil) { ret R.err[query.QueryOutput, fail.Fail](fail.message("typed surface has no acquired resolved owner")); }
+    if (rr.status.kind != fail.ACCEPTED) { ret R.err[query.QueryOutput, fail.Fail](fail.phase_failure(rr.status)); }
+    if (sr.status.kind != fail.ACCEPTED) { ret R.err[query.QueryOutput, fail.Fail](fail.phase_failure(sr.status)); }
 
     var fb: dq.FpBuf;
     fb.alloc = alloc;
@@ -865,7 +920,14 @@ pub fun q_typed_exports_compute(p: *project.Project, key: u64, alloc: *A.Allocat
     fb.len   = 0;
     fb.cap   = 0;
 
-    val wr: R.Result[R.Void, str] = fp_typed_surface(?fb, s, mid, rr, sr);
+    val captured: R.Result[scx.ModuleSema, fail.Fail] = build_type_surface(p, mid, rr, sr, false, alloc);
+    if (R.is_err[scx.ModuleSema, fail.Fail](captured)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[scx.ModuleSema, fail.Fail](captured)); }
+    var surface: scx.ModuleSema = R.unwrap_ok[scx.ModuleSema, fail.Fail](captured);
+    fin { scx.module_sema_dnit(?surface); }
+    val graph: R.Result[fields.Graph, fail.Fail] = capture_surface_graph(p, ?surface);
+    if (R.is_err[fields.Graph, fail.Fail](graph)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[fields.Graph, fail.Fail](graph)); }
+    surface.graph = R.unwrap_ok[fields.Graph, fail.Fail](graph);
+    val wr: R.Result[R.Void, str] = dq.typed_surface_encode(?fb, ?surface);
     if (R.is_err[R.Void, str](wr)) {
         if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](alloc, fb.buf, fb.cap::usize); }
         ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](wr)));
@@ -896,9 +958,13 @@ pub fun back_half_key_for(p: *project.Project, m: *project.ModuleEntry) u64 {
     ret back_half_key(m.stable_id, test_build(p));
 }
 
-pub fun codegen_reusable(p: *project.Project, mid: session.ModuleId) bool {
+pub fun codegen_reusable(p: *project.Project, mid: session.ModuleId) R.Result[bool, fail.Fail] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
-    ret query.peek_valid(?p.s.queries, query.Q_CODEGEN, back_half_key_for(p, m));
+    val reusable: R.Result[bool, fail.Fail] = query.reusable[project.Project](?p.queries, p, query.Q_CODEGEN, back_half_key_for(p, m));
+    if (R.is_err[bool, fail.Fail](reusable) || R.unwrap_ok[bool, fail.Fail](reusable)) { ret reusable; }
+    val restored: R.Result[bool, str] = persistent.restore(p, mid);
+    if (R.is_err[bool, str](restored)) { ret R.err[bool, fail.Fail](fail.message(R.unwrap_err[bool, str](restored))); }
+    ret R.ok[bool, fail.Fail](R.unwrap_ok[bool, str](restored));
 }
 
 pub fun test_build(p: *project.Project) bool {
@@ -954,111 +1020,139 @@ test "mach.lang.driver.passes.intern_producer:name_version" {
 }
 
 pub fun run_lower_pass(p: *project.Project) R.Result[R.Void, outcome.Fail] {
-    val imp_r: R.Result[R.Void, str] = union.register_import_libraries(p);
-    if (R.is_err[R.Void, str](imp_r)) {
-        ret R.err[R.Void, outcome.Fail](outcome.user(R.unwrap_err[R.Void, str](imp_r)));
-    }
-
-    val pr: R.Result[R.Void, outcome.Fail] = lower_prepare(p);
-    if (R.is_err[R.Void, outcome.Fail](pr)) { ret pr; }
+    val prepared: R.Result[R.Void, outcome.Fail] = acquire_lower_inputs(p);
+    if (R.is_err[R.Void, outcome.Fail](prepared)) { ret prepared; }
 
     if (lower_parallel_enabled(p)) {
-        val before_par: usize = diagnostic.error_count(?p.s.diags);
+
         val rp: R.Result[R.Void, fail.Fail] = run_lower_parallel(p);
         if (R.is_err[R.Void, fail.Fail](rp)) {
-            ret R.err[R.Void, outcome.Fail](pass_fail(p, before_par, R.unwrap_err[R.Void, fail.Fail](rp)));
+            ret R.err[R.Void, outcome.Fail](outcome.from_fail(R.unwrap_err[R.Void, fail.Fail](rp)));
         }
     }
 
     var i: u32 = 0;
     for (i < p.emit_len) {
         val mid: session.ModuleId = p.topo[i];
-        val before: usize = diagnostic.error_count(?p.s.diags);
+
         val r: R.Result[R.Void, fail.Fail] = run_lower_one(p, mid);
         if (R.is_err[R.Void, fail.Fail](r)) {
-            ret R.err[R.Void, outcome.Fail](pass_fail(p, before, R.unwrap_err[R.Void, fail.Fail](r)));
+            ret R.err[R.Void, outcome.Fail](outcome.from_fail(R.unwrap_err[R.Void, fail.Fail](r)));
         }
         i = i + 1;
     }
     ret R.ok_void[outcome.Fail]();
 }
 
-fun lower_prepare(p: *project.Project) R.Result[R.Void, outcome.Fail] {
+pub fun prepare_lower_pass(p: *project.Project) R.Result[R.Void, outcome.Fail] {
+    val imports: R.Result[R.Void, str] = union.register_import_libraries(p);
+    if (R.is_err[R.Void, str](imports)) { ret R.err[R.Void, outcome.Fail](outcome.user(R.unwrap_err[R.Void, str](imports))); }
+
+    if (!query.is_registered(?p.s.queries, query.Q_BINDING_INTERFACE)) {
+        val registered: R.Result[R.Void, str] = query.register_derived(?p.s.queries, query.Q_BINDING_INTERFACE);
+        if (R.is_err[R.Void, str](registered)) { ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](registered))); }
+    }
     if (!query.is_registered(?p.s.queries, query.Q_LOWERED_SURFACE)) {
         val rls: R.Result[R.Void, str] = query.register_derived(?p.s.queries, query.Q_LOWERED_SURFACE);
         if (R.is_err[R.Void, str](rls)) { ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](rls))); }
     }
+    if (!query.is_registered(?p.s.queries, query.Q_INLINE_BODIES)) {
+        val registered: R.Result[R.Void, str] = query.register_derived_owned(?p.s.queries, query.Q_INLINE_BODIES, q_lower_finalize);
+        if (R.is_err[R.Void, str](registered)) { ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](registered))); }
+    }
     if (!query.is_registered(?p.s.queries, query.Q_LOWER)) {
-        val rl: R.Result[R.Void, str] = query.register_derived_owned(?p.s.queries, query.Q_LOWER, q_lower_finalize);
+        val rl: R.Result[R.Void, str] = query.register_derived_equatable(?p.s.queries, query.Q_LOWER, q_lower_finalize, lower_output_equal);
         if (R.is_err[R.Void, str](rl)) { ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](rl))); }
     }
 
 
+    ret R.ok_void[outcome.Fail]();
+}
+
+fun acquire_frontend_inputs(p: *project.Project) R.Result[R.Void, outcome.Fail] {
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val acquired: R.Result[scx.Definition, fail.Fail] = read_definition(p::ptr, p.topo[i], scx.DEFINITION_TYPED);
+        if (R.is_err[scx.Definition, fail.Fail](acquired)) { ret R.err[R.Void, outcome.Fail](outcome.from_fail(R.unwrap_err[scx.Definition, fail.Fail](acquired))); }
+        i = i + 1;
+    }
+    ret R.ok_void[outcome.Fail]();
+}
+
+fun acquire_lower_inputs(p: *project.Project) R.Result[R.Void, outcome.Fail] {
+    val frontend: R.Result[R.Void, outcome.Fail] = acquire_frontend_inputs(p);
+    if (R.is_err[R.Void, outcome.Fail](frontend)) { ret frontend; }
     var i: u32 = 0;
     for (i < p.emit_len) {
         val m: *project.ModuleEntry = ?p.modules[p.topo[i]::u32];
-        val sf_r: R.Result[*query.QueryEntry, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_LOWERED_SURFACE, m.stable_id::u64);
-        if (R.is_err[*query.QueryEntry, fail.Fail](sf_r)) {
-            ret R.err[R.Void, outcome.Fail](outcome.from_fail(R.unwrap_err[*query.QueryEntry, fail.Fail](sf_r)));
+        val sf_r: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_LOWERED_SURFACE, m.stable_id::u64);
+        if (R.is_err[query.QueryView, fail.Fail](sf_r)) {
+            ret R.err[R.Void, outcome.Fail](outcome.from_fail(R.unwrap_err[query.QueryView, fail.Fail](sf_r)));
         }
         i = i + 1;
     }
     ret R.ok_void[outcome.Fail]();
 }
 
-fun lower_reusable(p: *project.Project, mid: session.ModuleId) bool {
+fun lower_reusable(p: *project.Project, mid: session.ModuleId) R.Result[bool, fail.Fail] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
-    ret query.peek_valid(?p.s.queries, query.Q_LOWER, back_half_key_for(p, m));
+    ret query.reusable[project.Project](?p.queries, p, query.Q_LOWER, back_half_key_for(p, m));
 }
 
-pub fun pass_fail(p: *project.Project, before: usize, f: fail.Fail) outcome.Fail {
-    if (f.kind == fail.REPORTED) { ret outcome.reported(); }
-    if (diagnostic.error_count(?p.s.diags) > before) { ret outcome.reported(); }
-    ret outcome.internal(f.message);
-}
-
-test "mach.lang.driver.passes.pass_fail:scopes_to_the_call_not_the_session" {
+test "mach.lang.driver.passes:internal_failure_is_not_hidden_by_a_user_error" {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }
-
     val sr: R.Result[session.Session, str] = session.init(?alloc);
-    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    if (R.is_err[session.Session, str](sr)) { ret 2; }
     var s: session.Session = R.unwrap_ok[session.Session, str](sr);
-
-    var p: project.Project;
-    p.s = ?s;
-
-    diagnostic.note_error(?s.diags);
-    val before: usize = diagnostic.error_count(?s.diags);
-
-    val stale: outcome.Fail = pass_fail(?p, before, fail.message("allocation failed lowering this module"));
-    if (stale.kind != outcome.FAIL_INTERNAL) { session.dnit(?s); ret 1; }
-
-    diagnostic.note_error(?s.diags);
-    val fresh: outcome.Fail = pass_fail(?p, before, fail.message("should be ignored in favor of the diagnostic"));
-    if (fresh.kind != outcome.FAIL_REPORTED) { session.dnit(?s); ret 2; }
-
-    val after: usize = diagnostic.error_count(?s.diags);
-    val carried: outcome.Fail = pass_fail(?p, after, fail.reported());
-    if (carried.kind != outcome.FAIL_REPORTED) { session.dnit(?s); ret 3; }
-
-    session.dnit(?s);
+    fin { session.dnit(?s); }
+    var span: token.Span;
+    span.offset = 0;
+    span.len = 1;
+    val emitted: R.Result[R.Void, str] = diagnostic.error(?s.diags, 0::src.FileId, span, "invalid user expression");
+    if (R.is_err[R.Void, str](emitted)) { ret 3; }
+    val f: outcome.Fail = outcome.from_fail(fail.message("internal allocation failure after rejection"));
+    if (f.kind != outcome.FAIL_INTERNAL) { ret 4; }
+    if (!str_equals(f.message, "internal allocation failure after rejection")) { ret 5; }
     ret 0;
+}
+
+test "mach.lang.driver.passes:message_only_internal_failure_stays_internal" {
+    val f: outcome.Fail = outcome.from_fail(fail.message("internal failure without a diagnostic"));
+    if (f.kind != outcome.FAIL_INTERNAL) { ret 1; }
+    if (!str_equals(f.message, "internal failure without a diagnostic")) { ret 2; }
+    if (outcome.from_fail(fail.reported()).kind != outcome.FAIL_REPORTED) { ret 3; }
+    ret 0;
+}
+
+pub fun frontend_status(p: *project.Project) fail.PhaseStatus {
+    var status: fail.PhaseStatus = fail.accepted();
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        val m: *project.ModuleEntry = ?p.modules[i];
+        fail.merge(?status, m.parse_status);
+        fail.merge(?status, m.load_status);
+        fail.merge(?status, m.gate_status);
+        if (m.resolve_result != nil) { fail.merge(?status, m.resolve_result.status); }
+        if (m.sema_result != nil) { fail.merge(?status, m.sema_result.status); }
+        i = i + 1;
+    }
+    ret status;
 }
 
 fun run_lower_one(p: *project.Project, mid: session.ModuleId) R.Result[R.Void, fail.Fail] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
 
-    val e_r: R.Result[*query.QueryEntry, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_LOWER, back_half_key_for(p, m));
-    if (R.is_err[*query.QueryEntry, fail.Fail](e_r)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*query.QueryEntry, fail.Fail](e_r).message)); }
-    val irm: *ir.Module = ir_handle_decode(R.unwrap_ok[*query.QueryEntry, fail.Fail](e_r));
+    val e_r: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_LOWER, back_half_key_for(p, m));
+    if (R.is_err[query.QueryView, fail.Fail](e_r)) { ret R.err[R.Void, fail.Fail](R.unwrap_err[query.QueryView, fail.Fail](e_r)); }
+    val irm: *ir.Module = ir_handle_decode(R.unwrap_ok[query.QueryView, fail.Fail](e_r));
     if (irm == nil) { ret R.err[R.Void, fail.Fail](fail.message("Q_LOWER produced no result handle")); }
 
     m.ir_module = irm;
     ret R.ok_void[fail.Fail]();
 }
 
-pub fun q_lowered_surface_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, fail.Fail] {
+pub fun q_lowered_surface_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[query.QueryOutput, fail.Fail] {
     val db: *query.QueryDb = ?p.s.queries;
     val s: *session.Session = p.s;
 
@@ -1066,11 +1160,9 @@ pub fun q_lowered_surface_compute(p: *project.Project, key: u64, alloc: *A.Alloc
     val mid: session.ModuleId = session.module_id_for_stable(s, stable);
     if (mid == session.MODULE_NIL) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_LOWERED_SURFACE: stable id not loaded this build")); }
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
-    val a: *ast.Ast = m.a;
-    if (a == nil) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_LOWERED_SURFACE: module has no parsed AST")); }
-
-    val rd: R.Result[R.Void, str] = query.record_dep(db, query.Q_LOWERED_SURFACE, key, query.Q_RESOLVE, key);
-    if (R.is_err[R.Void, str](rd)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rd))); }
+    val definition: R.Result[scx.Definition, fail.Fail] = read_definition(p::ptr, mid, scx.DEFINITION_RESOLVED);
+    if (R.is_err[scx.Definition, fail.Fail](definition)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[scx.Definition, fail.Fail](definition)); }
+    val a: *ast.Ast = R.unwrap_ok[scx.Definition, fail.Fail](definition).parsed.a;
 
     val sf_o: O.Option[*src.SourceFile] = src.get(?s.sources, a.file_id);
     if (O.is_none[*src.SourceFile](sf_o)) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_LOWERED_SURFACE: module source not loaded")); }
@@ -1185,55 +1277,23 @@ fun decl_has_decorator_named(a: *ast.Ast, text: str, d: *decl.Decl, name: str) b
     ret false;
 }
 
-pub fun q_lower_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, fail.Fail] {
-    val db: *query.QueryDb = ?p.s.queries;
+fun lower_raw_candidate_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[query.QueryOutput, fail.Fail] {
     val s: *session.Session = p.s;
-
     val stable: session.StableModuleId = key::u32::session.StableModuleId;
     val test_mode: bool = back_half_key_is_test(key);
     val mid: session.ModuleId = session.module_id_for_stable(s, stable);
     if (mid == session.MODULE_NIL) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_LOWER: stable id not loaded this build")); }
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
-    val a: *ast.Ast = m.a;
-    if (a == nil) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_LOWER: module has no parsed AST")); }
-    val sr: *sema.SemaResult = m.sema_result;
-    if (sr == nil) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_LOWER: module has no sema result")); }
-
-    val rsd: R.Result[R.Void, str] = query.record_dep(db, query.Q_LOWER, key, query.Q_SEMA, stable::u64);
-    if (R.is_err[R.Void, str](rsd)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rsd))); }
-    val rt: R.Result[R.Void, str] = query.record_dep(db, query.Q_LOWER, key, query.Q_TARGET, 0);
-    if (R.is_err[R.Void, str](rt)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rt))); }
-
-    val cl_r: R.Result[LowerClosure, str] = collect_lower_closure(p, m);
-    if (R.is_err[LowerClosure, str](cl_r)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[LowerClosure, str](cl_r))); }
-    var cl: LowerClosure = R.unwrap_ok[LowerClosure, str](cl_r);
-    var di: u32 = 0;
-    for (di < cl.count) {
-        val dep_mid: session.ModuleId = cl.list[di];
-        val dep_stable: session.StableModuleId = p.modules[dep_mid::u32].stable_id;
-        val ge: R.Result[*query.QueryEntry, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_LOWERED_SURFACE, dep_stable::u64);
-        if (R.is_err[*query.QueryEntry, fail.Fail](ge)) {
-            free_lower_closure(s.alloc, ?cl);
-            ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[*query.QueryEntry, fail.Fail](ge));
-        }
-        di = di + 1;
-    }
-    free_lower_closure(s.alloc, ?cl);
-
-    if (m.staged_ir != nil) {
-        val sir:  *ir.Module     = m.staged_ir;
-        val shome: *ir.ModuleHome = m.staged_home;
-        m.staged_ir   = nil;
-        m.staged_home = nil;
-        ret ir_handle_encode(alloc, sir, shome);
-    }
-
+    val definition: R.Result[scx.Definition, fail.Fail] = read_definition(p::ptr, mid, scx.DEFINITION_TYPED);
+    if (R.is_err[scx.Definition, fail.Fail](definition)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[scx.Definition, fail.Fail](definition)); }
+    val rt: R.Result[R.Void, fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_TARGET, 0);
+    if (R.is_err[R.Void, fail.Fail](rt)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[R.Void, fail.Fail](rt)); }
     val hr: R.Result[*ir.ModuleHome, str] = ir_home_new(alloc);
     if (R.is_err[*ir.ModuleHome, str](hr)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[*ir.ModuleHome, str](hr))); }
     val home: *ir.ModuleHome = R.unwrap_ok[*ir.ModuleHome, str](hr);
 
     val t_low: ctime.Time = readout.item_begin(p.events);
-    val rr_raw: R.Result[*ir.Module, fail.Fail] = lower_raw(p, mid, home, test_mode);
+    val rr_raw: R.Result[*ir.Module, fail.Fail] = lower_raw(p, mid, home, test_mode, diags);
     if (R.is_err[*ir.Module, fail.Fail](rr_raw)) {
         val stable: fail.Fail = lower_stable_fail(p, R.unwrap_err[*ir.Module, fail.Fail](rr_raw));
         ir_release(alloc, home);
@@ -1242,30 +1302,157 @@ pub fun q_lower_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.Re
     readout.item(p.events, readout.PH_LOWER, project.fqn_name(p, m.fqn), t_low);
     val irmod: *ir.Module = R.unwrap_ok[*ir.Module, fail.Fail](rr_raw);
 
-    val nid: R.Result[intern.StrId, fail.Fail] = neutralize_id(p, test_mode);
-    if (R.is_err[intern.StrId, fail.Fail](nid)) {
-        ir_release(alloc, home);
-        ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[intern.StrId, fail.Fail](nid));
-    }
-    val t_opt: ctime.Time = readout.span_begin(p.events);
-    val ro: R.Result[R.Void, fail.Fail] = lower_optimize(p, irmod, R.unwrap_ok[intern.StrId, fail.Fail](nid));
-    readout.item(p.events, readout.PH_OPTIMIZE, project.fqn_name(p, m.fqn), t_opt);
-    readout.span_end(p.events, readout.PH_OPTIMIZE, readout.PH_LOWER, t_opt);
-    if (R.is_err[R.Void, fail.Fail](ro)) {
-        val stable: fail.Fail = lower_stable_fail(p, R.unwrap_err[R.Void, fail.Fail](ro));
-        ir_release(alloc, home);
-        ret R.err[query.QueryOutput, fail.Fail](stable);
-    }
-
     ret ir_handle_encode(alloc, irmod, home);
 }
 
-fun lower_raw(p: *project.Project, mid: session.ModuleId, home: *ir.ModuleHome, test_mode: bool) R.Result[*ir.Module, fail.Fail] {
+pub fun q_inline_bodies_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[query.QueryOutput, fail.Fail] {
+    val raw: R.Result[query.QueryOutput, fail.Fail] = lower_raw_candidate_compute(p, key, alloc, diags);
+    if (R.is_err[query.QueryOutput, fail.Fail](raw)) { ret raw; }
+    val output: query.QueryOutput = R.unwrap_ok[query.QueryOutput, fail.Fail](raw);
+    var transferred: bool = false;
+    fin { if (!transferred) { release_lower_output(alloc, output); } }
+    val src: *ir.Module = ir_handle_decode(query.QueryView{value: output.bytes, value_len: output.len});
+    val normalized: R.Result[bool, str] = mem2reg.run(src);
+    if (R.is_err[bool, str](normalized)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(lower_stable_err(p, R.unwrap_err[bool, str](normalized)))); }
+    val created: R.Result[*ir.ModuleHome, str] = ir_home_new(alloc);
+    if (R.is_err[*ir.ModuleHome, str](created)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[*ir.ModuleHome, str](created))); }
+    val home: *ir.ModuleHome = R.unwrap_ok[*ir.ModuleHome, str](created);
+    val boxed: R.Result[*ir.Module, str] = A.allocate[ir.Module](?home.alloc, 1::usize);
+    if (R.is_err[*ir.Module, str](boxed)) { ir_release(alloc, home); ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[*ir.Module, str](boxed))); }
+    val dst: *ir.Module = R.unwrap_ok[*ir.Module, str](boxed);
+    val initialized: R.Result[ir.Module, str] = ir.init(?home.alloc, src.name);
+    if (R.is_err[ir.Module, str](initialized)) { ir_release(alloc, home); ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[ir.Module, str](initialized))); }
+    @dst = R.unwrap_ok[ir.Module, str](initialized);
+    val flags: R.Result[*bool, str] = A.allocate[bool](p.s.alloc, src.function_len::usize);
+    if (R.is_err[*bool, str](flags)) { ir_release(alloc, home); ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[*bool, str](flags))); }
+    val recursive: *bool = R.unwrap_ok[*bool, str](flags);
+    fin { if (recursive != nil) { A.deallocate[bool](p.s.alloc, recursive, src.function_len::usize); } }
+    val marked: R.Result[R.Void, str] = inline_pass.mark_recursive(src, recursive);
+    if (R.is_err[R.Void, str](marked)) { ir_release(alloc, home); ret R.err[query.QueryOutput, fail.Fail](fail.message(lower_stable_err(p, R.unwrap_err[R.Void, str](marked)))); }
+    val extracted: R.Result[R.Void, str] = body.extract(dst, src, ?p.target, p.s.alloc, recursive);
+    if (R.is_err[R.Void, str](extracted)) {
+        val message: str = lower_stable_err(p, R.unwrap_err[R.Void, str](extracted));
+        ir_release(alloc, home); ret R.err[query.QueryOutput, fail.Fail](fail.message(message));
+    }
+    val encoded: R.Result[query.QueryOutput, fail.Fail] = ir_handle_encode(alloc, dst, home);
+    if (R.is_err[query.QueryOutput, fail.Fail](encoded)) { ret encoded; }
+    if (p.raw_lower_capture != nil && p.raw_lower_capture.key == key && p.raw_lower_capture.output.bytes == nil) {
+        p.raw_lower_capture.output = output;
+        transferred = true;
+    }
+    ret encoded;
+}
+
+fun release_lower_output(alloc: *A.Allocator, output: query.QueryOutput) {
+    if (output.bytes == nil) { ret; }
+    q_lower_finalize(output.bytes, output.len, alloc);
+    A.deallocate[u8](alloc, output.bytes, output.len::usize);
+}
+
+fun lower_candidate_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[query.QueryOutput, fail.Fail] {
+    if (p.req.opt != pipeline.OPT_RELEASE) { ret lower_raw_candidate_compute(p, key, alloc, diags); }
+    var local: project.RawLowerCapture;
+    local.key = key;
+    val saved: *project.RawLowerCapture = p.raw_lower_capture;
+    if (saved == nil) { p.raw_lower_capture = ?local; }
+    fin {
+        p.raw_lower_capture = saved;
+        release_lower_output(alloc, local.output);
+    }
+    val available: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_INLINE_BODIES, key);
+    if (R.is_err[query.QueryView, fail.Fail](available)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[query.QueryView, fail.Fail](available)); }
+    if (p.raw_lower_capture.key == key && p.raw_lower_capture.output.bytes != nil) {
+        val out: query.QueryOutput = p.raw_lower_capture.output;
+        p.raw_lower_capture.output = query.QueryOutput{};
+        ret R.ok[query.QueryOutput, fail.Fail](out);
+    }
+    ret lower_raw_candidate_compute(p, key, alloc, diags);
+}
+
+fun acquire_inline_bodies(p: *project.Project, m: *ir.Module, available: *body.Available, test_mode: bool) R.Result[R.Void, fail.Fail] {
+    if (p.req.opt != pipeline.OPT_RELEASE) { ret R.ok_void[fail.Fail](); }
+    var i: u32 = 0;
+    for (i < m.function_len) {
+        val origin: intern.StrId = m.functions[i].body_module;
+        if ((m.functions[i].flags & ir.FN_FLAG_EXTERN) == 0 || origin == intern.STR_NIL || origin == m.name) { i = i + 1; cnt; }
+        val stable: session.StableModuleId = session.stable_module_id_lookup(p.s, origin);
+        if (stable == session.STABLE_MODULE_NIL) { ret R.err[R.Void, fail.Fail](fail.message("inline body: defining module has no stable query identity")); }
+        val got: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_INLINE_BODIES, back_half_key(stable, test_mode));
+        if (R.is_err[query.QueryView, fail.Fail](got)) { ret R.err[R.Void, fail.Fail](R.unwrap_err[query.QueryView, fail.Fail](got)); }
+        val provider: *ir.Module = ir_handle_decode(R.unwrap_ok[query.QueryView, fail.Fail](got));
+        if (provider == nil) { ret R.err[R.Void, fail.Fail](fail.message("inline body: provider has no owned product")); }
+        val imported: R.Result[R.Void, str] = body.acquire(available, m, provider, m.functions[i].name, ?p.target, p.s.alloc);
+        if (R.is_err[R.Void, str](imported)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[R.Void, str](imported))); }
+        i = i + 1;
+    }
+    ret R.ok_void[fail.Fail]();
+}
+
+fun q_lower_raw_compute(p: *project.Project, kind: query.QueryKind, key: u64,
+                       alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[query.QueryOutput, fail.Fail] {
+    if (kind != query.Q_LOWER) { ret R.err[query.QueryOutput, fail.Fail](fail.message("raw lowering requires its Q_LOWER owner")); }
+    val raw: R.Result[query.QueryOutput, fail.Fail] = lower_candidate_compute(p, key, alloc, diags);
+    if (R.is_err[query.QueryOutput, fail.Fail](raw)) { ret raw; }
+    val output: query.QueryOutput = R.unwrap_ok[query.QueryOutput, fail.Fail](raw);
+    if (p.req.opt == pipeline.OPT_RELEASE) {
+        if (p.raw_lower_capture == nil || p.raw_lower_capture.available == nil) {
+            release_lower_output(alloc, output);
+            ret R.err[query.QueryOutput, fail.Fail](fail.message("prepared lowering requires its scoped body owner"));
+        }
+        val m: *ir.Module = ir_handle_decode(query.QueryView{value: output.bytes, value_len: output.len});
+        val imported: R.Result[R.Void, fail.Fail] = acquire_inline_bodies(p, m, p.raw_lower_capture.available, back_half_key_is_test(key));
+        if (R.is_err[R.Void, fail.Fail](imported)) {
+            val failure: fail.Fail = lower_stable_fail(p, R.unwrap_err[R.Void, fail.Fail](imported));
+            release_lower_output(alloc, output); ret R.err[query.QueryOutput, fail.Fail](failure);
+        }
+    }
+    ret raw;
+}
+
+pub fun q_lower_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[query.QueryOutput, fail.Fail] {
+    val raw: R.Result[query.QueryOutput, fail.Fail] = lower_candidate_compute(p, key, alloc, diags);
+    if (R.is_err[query.QueryOutput, fail.Fail](raw)) { ret raw; }
+    val output: query.QueryOutput = R.unwrap_ok[query.QueryOutput, fail.Fail](raw);
+    var transferred: bool = false;
+    fin {
+        if (!transferred) {
+            q_lower_finalize(output.bytes, output.len, alloc);
+            A.deallocate[u8](alloc, output.bytes, output.len::usize);
+        }
+    }
+    val irmod: *ir.Module = ir_handle_decode(query.QueryView{ value: output.bytes, value_len: output.len });
+    var storage: body.Available;
+    var available: *body.Available = nil;
+    fin { if (available != nil) { body.available_dnit(available, irmod); } }
+    if (p.req.opt == pipeline.OPT_RELEASE) {
+        val opened: R.Result[R.Void, str] = body.available_init(?storage, irmod.name);
+        if (R.is_err[R.Void, str](opened)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](opened))); }
+        available = ?storage;
+        val imported: R.Result[R.Void, fail.Fail] = acquire_inline_bodies(p, irmod, available, back_half_key_is_test(key));
+        if (R.is_err[R.Void, fail.Fail](imported)) { ret R.err[query.QueryOutput, fail.Fail](lower_stable_fail(p, R.unwrap_err[R.Void, fail.Fail](imported))); }
+    }
+    val main_id: R.Result[intern.StrId, fail.Fail] = neutralize_id(p, back_half_key_is_test(key));
+    if (R.is_err[intern.StrId, fail.Fail](main_id)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[intern.StrId, fail.Fail](main_id)); }
+    val t_opt: ctime.Time = readout.span_begin(p.events);
+    val optimized: R.Result[R.Void, fail.Fail] = lower_optimize(p, irmod, R.unwrap_ok[intern.StrId, fail.Fail](main_id), available);
+    readout.span_end(p.events, readout.PH_OPTIMIZE, readout.PH_LOWER, t_opt);
+    readout.item(p.events, readout.PH_OPTIMIZE, project.fqn_name(p, irmod.name), t_opt);
+    if (R.is_err[R.Void, fail.Fail](optimized)) { ret R.err[query.QueryOutput, fail.Fail](lower_stable_fail(p, R.unwrap_err[R.Void, fail.Fail](optimized))); }
+    transferred = true;
+    ret raw;
+}
+
+fun lower_raw(p: *project.Project, mid: session.ModuleId, home: *ir.ModuleHome, test_mode: bool, diags: *diagnostic.DiagnosticStore) R.Result[*ir.Module, fail.Fail] {
     val s:   *session.Session   = p.s;
     val m:   *project.ModuleEntry = ?p.modules[mid::u32];
 
+    val captured: R.Result[sema.SemaDeps, fail.Fail] = build_sema_deps_query(p, m);
+    if (R.is_err[sema.SemaDeps, fail.Fail](captured)) { ret R.err[*ir.Module, fail.Fail](R.unwrap_err[sema.SemaDeps, fail.Fail](captured)); }
+    var deps: sema.SemaDeps = R.unwrap_ok[sema.SemaDeps, fail.Fail](captured);
+    fin { free_sema_deps_query(p.s.alloc, ?deps); }
     val req_r: R.Result[lower.LowerRequest, fail.Fail] = lower.request(s, ?p.target, ?home.alloc, m.a, m.fqn, mid,
-        m.sema_result, m.resolve_result, ?m.ctx, test_mode, p.req.debug);
+        m.sema_result, m.resolve_result, ?m.ctx, test_mode, p.req.debug, diags, ?deps,
+        lcx.BindingReader{ ctx: p::ptr, read: read_binding_interface });
     if (R.is_err[lower.LowerRequest, fail.Fail](req_r)) { ret R.err[*ir.Module, fail.Fail](R.unwrap_err[lower.LowerRequest, fail.Fail](req_r)); }
     var req: lower.LowerRequest = R.unwrap_ok[lower.LowerRequest, fail.Fail](req_r);
 
@@ -1277,17 +1464,18 @@ fun lower_raw(p: *project.Project, mid: session.ModuleId, home: *ir.ModuleHome, 
     val box: *ir.Module = R.unwrap_ok[*ir.Module, str](br);
     box[0] = R.unwrap_ok[ir.Module, fail.Fail](res_lower);
 
-    val res_obl: R.Result[bool, str] = oblivious.check_module(box, ?s.interner, ?s.diags, s.alloc);
+    val res_obl: R.Result[bool, str] = oblivious.check_module(box, ?s.interner, diags, s.alloc);
     if (R.is_err[bool, str](res_obl)) { ret R.err[*ir.Module, fail.Fail](fail.message(R.unwrap_err[bool, str](res_obl))); }
     if (!R.unwrap_ok[bool, str](res_obl)) {
-        ret R.err[*ir.Module, fail.Fail](fail.message("oblivious-required check: a function computes on a secret without `#[oblivious]`"));
+        ret R.err[*ir.Module, fail.Fail](fail.reported());
     }
     ret R.ok[*ir.Module, fail.Fail](box);
 }
 
-fun lower_optimize(p: *project.Project, irmod: *ir.Module, main_id: intern.StrId) R.Result[R.Void, fail.Fail] {
+fun lower_optimize(p: *project.Project, irmod: *ir.Module, main_id: intern.StrId, available: *body.Available) R.Result[R.Void, fail.Fail] {
     var preq: pipeline.PipelineRequest;
     preq.module            = irmod;
+    preq.available         = available;
     preq.target             = ?p.target;
     preq.level               = p.req.opt;
     preq.vectorize_enabled   = pipeline.VectorizeEnabledOption{ v: p.req.vectorize };
@@ -1365,17 +1553,22 @@ fun ir_handle_encode(alloc: *A.Allocator, r: *ir.Module, home: *ir.ModuleHome) R
     ret R.ok[query.QueryOutput, fail.Fail](out);
 }
 
-fun ir_handle_decode(e: *query.QueryEntry) *ir.Module {
+fun ir_handle_decode(e: query.QueryView) *ir.Module {
     if (e.value == nil || e.value_len < ir_handle_len()) { ret nil; }
     val slot: *ptr = e.value::ptr::*ptr;
     ret slot[0]::*ir.Module;
 }
 
 fun lower_parallel_enabled(p: *project.Project) bool {
-    ret p.req.jobs >= 1 && p.emit_len > 0;
+    ret p.emit_len > 0;
 }
 
 rec PlwSlot {
+    prepared: query.PreparedQuery;
+    capture: project.RawLowerCapture;
+    available: body.Available;
+    available_live: bool;
+    live: bool;
     mid:    session.ModuleId;
     m:      *ir.Module;
     failed: bool;
@@ -1403,7 +1596,7 @@ fun plw_worker_main(arg: *u8) {
 
         val slot: *PlwSlot = ?pl.slots[idx_raw::usize];
         val t0: ctime.Time = ctime.monotonic();
-        val r: R.Result[R.Void, fail.Fail] = lower_optimize(pl.p, slot.m, pl.main_id);
+        val r: R.Result[R.Void, fail.Fail] = lower_optimize(pl.p, slot.m, pl.main_id, slot.capture.available);
         slot.d = ctime.time_sub(ctime.monotonic(), t0);
         if (R.is_err[R.Void, fail.Fail](r)) {
             slot.fail   = R.unwrap_err[R.Void, fail.Fail](r);
@@ -1415,18 +1608,61 @@ fun plw_worker_main(arg: *u8) {
 }
 
 fun run_lower_parallel(p: *project.Project) R.Result[R.Void, fail.Fail] {
-    val emit_len: u32 = p.emit_len;
-    if (emit_len == 0) { ret R.ok_void[fail.Fail](); }
+    val count: u32 = p.emit_len;
+    if (count == 0) { ret R.ok_void[fail.Fail](); }
+    val allocated: R.Result[*PlwSlot, str] = A.allocate[PlwSlot](p.alloc, count::usize);
+    if (R.is_err[*PlwSlot, str](allocated)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*PlwSlot, str](allocated))); }
+    val slots: *PlwSlot = R.unwrap_ok[*PlwSlot, str](allocated);
+    fin { A.deallocate[PlwSlot](p.alloc, slots, count::usize); }
+    var i: u32 = 0;
+    for (i < count) { slots[i] = PlwSlot{}; i = i + 1; }
+    var result: R.Result[R.Void, fail.Fail] = run_lower_batch(p, slots, count);
+    i = 0;
+    for (i < count) {
+        if (slots[i].available_live) {
+            body.available_dnit(?slots[i].available, slots[i].m);
+            slots[i].available_live = false;
+        }
+        release_lower_output(p.s.queries.a, slots[i].capture.output);
+        slots[i].capture.output = query.QueryOutput{};
+        if (slots[i].live) {
+            val cancelled: R.Result[R.Void, str] = query.cancel_prepared(?p.s.queries, slots[i].prepared);
+            if (R.is_err[R.Void, str](cancelled)) {
+                if (R.is_ok[R.Void, fail.Fail](result) || R.unwrap_err[R.Void, fail.Fail](result).kind == fail.REPORTED) {
+                    result = R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[R.Void, str](cancelled)));
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret result;
+}
 
-    val rslots: R.Result[*PlwSlot, str] = A.allocate[PlwSlot](p.alloc, emit_len::usize);
-    if (R.is_err[*PlwSlot, str](rslots)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*PlwSlot, str](rslots))); }
-    val slots: *PlwSlot = R.unwrap_ok[*PlwSlot, str](rslots);
+fun prime_inline_bodies(p: *project.Project, capture: *project.RawLowerCapture) R.Result[R.Void, fail.Fail] {
+    val saved: *project.RawLowerCapture = p.raw_lower_capture;
+    p.raw_lower_capture = capture;
+    fin { p.raw_lower_capture = saved; }
+    val got: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_INLINE_BODIES, capture.key);
+    ret R.void_of[query.QueryView, fail.Fail](got);
+}
 
+fun prepare_lower_slot(p: *project.Project, capture: *project.RawLowerCapture) R.Result[query.PreparedQuery, fail.Fail] {
+    val saved: *project.RawLowerCapture = p.raw_lower_capture;
+    p.raw_lower_capture = capture;
+    fin { p.raw_lower_capture = saved; }
+    ret query.prepare[project.Project](?p.queries, p, query.Q_LOWER, capture.key, q_lower_raw_compute);
+}
+
+fun run_lower_batch(p: *project.Project, slots: *PlwSlot, emit_len: u32) R.Result[R.Void, fail.Fail] {
     var slot_len: u32 = 0;
     var ti: u32 = 0;
     for (ti < emit_len) {
         val mid: session.ModuleId = p.topo[ti];
-        if (!lower_reusable(p, mid)) {
+        val reusable: R.Result[bool, fail.Fail] = lower_reusable(p, mid);
+        if (R.is_err[bool, fail.Fail](reusable)) {
+            ret R.err[R.Void, fail.Fail](R.unwrap_err[bool, fail.Fail](reusable));
+        }
+        if (!R.unwrap_ok[bool, fail.Fail](reusable)) {
             slots[slot_len].mid = mid;
             slots[slot_len].m   = nil;
             slots[slot_len].failed = false;
@@ -1435,9 +1671,20 @@ fun run_lower_parallel(p: *project.Project) R.Result[R.Void, fail.Fail] {
         }
         ti = ti + 1;
     }
-    if (slot_len <= 1) {
-        A.deallocate[PlwSlot](p.alloc, slots, emit_len::usize);
-        ret R.ok_void[fail.Fail]();
+    if (slot_len == 0) { ret R.ok_void[fail.Fail](); }
+    var prime: u32 = 0;
+    for (prime < slot_len) {
+        val m: *project.ModuleEntry = ?p.modules[slots[prime].mid::u32];
+        slots[prime].capture.key = back_half_key_for(p, m);
+        if (p.req.opt == pipeline.OPT_RELEASE) {
+            val initialized: R.Result[R.Void, str] = body.available_init(?slots[prime].available, m.fqn);
+            if (R.is_err[R.Void, str](initialized)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[R.Void, str](initialized))); }
+            slots[prime].available_live = true;
+            slots[prime].capture.available = ?slots[prime].available;
+            val primed: R.Result[R.Void, fail.Fail] = prime_inline_bodies(p, ?slots[prime].capture);
+            if (R.is_err[R.Void, fail.Fail](primed)) { ret primed; }
+        }
+        prime = prime + 1;
     }
 
     val test_mode: bool = test_build(p);
@@ -1447,39 +1694,24 @@ fun run_lower_parallel(p: *project.Project) R.Result[R.Void, fail.Fail] {
         val mid: session.ModuleId = slots[si].mid;
         val m:   *project.ModuleEntry = ?p.modules[mid::u32];
 
-        val t_item: ctime.Time = readout.item_begin(p.events);
-
-        val hr: R.Result[*ir.ModuleHome, str] = ir_home_new(p.s.alloc);
-        if (R.is_err[*ir.ModuleHome, str](hr)) {
-            lower_sweep_staged(p);
-            A.deallocate[PlwSlot](p.alloc, slots, emit_len::usize);
-            ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*ir.ModuleHome, str](hr)));
-        }
-        val home: *ir.ModuleHome = R.unwrap_ok[*ir.ModuleHome, str](hr);
-
-        val rr_raw: R.Result[*ir.Module, fail.Fail] = lower_raw(p, mid, home, test_mode);
-        if (R.is_err[*ir.Module, fail.Fail](rr_raw)) {
-            val stable: fail.Fail = lower_stable_fail(p, R.unwrap_err[*ir.Module, fail.Fail](rr_raw));
-            ir_release(p.s.alloc, home);
-            lower_sweep_staged(p);
-            A.deallocate[PlwSlot](p.alloc, slots, emit_len::usize);
-            ret R.err[R.Void, fail.Fail](stable);
-        }
-        m.staged_ir   = R.unwrap_ok[*ir.Module, fail.Fail](rr_raw);
-        m.staged_home = home;
-        slots[si].m   = m.staged_ir;
-        readout.item(p.events, readout.PH_LOWER, project.fqn_name(p, m.fqn), t_item);
+        val prepared: R.Result[query.PreparedQuery, fail.Fail] = prepare_lower_slot(p, ?slots[si].capture);
+        if (R.is_err[query.PreparedQuery, fail.Fail](prepared)) { ret R.err[R.Void, fail.Fail](R.unwrap_err[query.PreparedQuery, fail.Fail](prepared)); }
+        slots[si].prepared = R.unwrap_ok[query.PreparedQuery, fail.Fail](prepared);
+        slots[si].live = true;
+        val view: R.Result[query.QueryView, str] = query.prepared_view(?p.s.queries, slots[si].prepared);
+        if (R.is_err[query.QueryView, str](view)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[query.QueryView, str](view))); }
+        slots[si].m = ir_handle_decode(R.unwrap_ok[query.QueryView, str](view));
+        if (slots[si].m == nil) { ret R.err[R.Void, fail.Fail](fail.message("prepared lowering has no IR owner")); }
         si = si + 1;
     }
 
+    if (p.raw_lower_capture != nil) { ret R.err[R.Void, fail.Fail](fail.message("lower: synchronous raw capture escaped into worker execution")); }
     var nworkers: u32 = p.req.jobs;
     if (nworkers == 0)        { nworkers = 1; }
     if (nworkers > slot_len)  { nworkers = slot_len; }
 
     val nid: R.Result[intern.StrId, fail.Fail] = neutralize_id(p, test_mode);
     if (R.is_err[intern.StrId, fail.Fail](nid)) {
-        lower_sweep_staged(p);
-        A.deallocate[PlwSlot](p.alloc, slots, emit_len::usize);
         ret R.err[R.Void, fail.Fail](R.unwrap_err[intern.StrId, fail.Fail](nid));
     }
 
@@ -1497,8 +1729,6 @@ fun run_lower_parallel(p: *project.Project) R.Result[R.Void, fail.Fail] {
     if (extra > 0) {
         val rt: R.Result[*thread.Thread, str] = A.allocate[thread.Thread](p.alloc, extra::usize);
         if (R.is_err[*thread.Thread, str](rt)) {
-            lower_sweep_staged(p);
-            A.deallocate[PlwSlot](p.alloc, slots, emit_len::usize);
             ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*thread.Thread, str](rt)));
         }
         threads = R.unwrap_ok[*thread.Thread, str](rt);
@@ -1529,29 +1759,21 @@ fun run_lower_parallel(p: *project.Project) R.Result[R.Void, fail.Fail] {
     var ei: u32 = 0;
     for (ei < slot_len) {
         if (slots[ei].failed) {
-            val stable: fail.Fail = lower_stable_fail(p, slots[ei].fail);
-            lower_sweep_staged(p);
-            A.deallocate[PlwSlot](p.alloc, slots, emit_len::usize);
-            ret R.err[R.Void, fail.Fail](stable);
+            val result: R.Result[R.Void, fail.Fail] = query.complete_prepared(?p.s.queries, slots[ei].prepared,
+                R.err[R.Void, fail.Fail](slots[ei].fail));
+            slots[ei].live = false;
+            ret result;
         }
         ei = ei + 1;
     }
-
-    A.deallocate[PlwSlot](p.alloc, slots, emit_len::usize);
-    ret R.ok_void[fail.Fail]();
-}
-
-pub fun lower_sweep_staged(p: *project.Project) {
-    var i: u32 = 0;
-    for (i < p.module_len) {
-        val m: *project.ModuleEntry = ?p.modules[i];
-        if (m.staged_home != nil) {
-            ir_release(p.s.alloc, m.staged_home);
-            m.staged_home = nil;
-        }
-        m.staged_ir = nil;
-        i = i + 1;
+    ei = 0;
+    for (ei < slot_len) {
+        val result: R.Result[R.Void, fail.Fail] = query.complete_prepared(?p.s.queries, slots[ei].prepared, R.ok_void[fail.Fail]());
+        slots[ei].live = false;
+        if (R.is_err[R.Void, fail.Fail](result)) { ret result; }
+        ei = ei + 1;
     }
+    ret R.ok_void[fail.Fail]();
 }
 
 fun ensure_lower_visit_capacity(p: *project.Project, needed: u32) R.Result[R.Void, str] {
@@ -1636,7 +1858,7 @@ fun free_lower_closure(alloc: *A.Allocator, cl: *LowerClosure) {
     cl.cap   = 0;
 }
 
-pub fun run_codegen_pass(p: *project.Project) R.Result[R.Void, outcome.Fail] {
+pub fun prepare_codegen_pass(p: *project.Project) R.Result[R.Void, outcome.Fail] {
     if (!query.is_registered(?p.s.queries, query.Q_CODEGEN)) {
         val rcg: R.Result[R.Void, str] = query.register_derived_owned(?p.s.queries, query.Q_CODEGEN, q_codegen_finalize);
         if (R.is_err[R.Void, str](rcg)) { ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](rcg))); }
@@ -1648,13 +1870,55 @@ pub fun run_codegen_pass(p: *project.Project) R.Result[R.Void, outcome.Fail] {
         ret R.err[R.Void, outcome.Fail](outcome.user(R.unwrap_err[R.Void, str](pf)));
     }
 
+    ret R.ok_void[outcome.Fail]();
+}
+
+pub fun acquire_codegen_inputs(p: *project.Project) R.Result[R.Void, outcome.Fail] {
+    var clear: u32 = 0;
+    for (clear < p.module_len) { p.modules[clear].ir_module = nil; clear = clear + 1; }
+    val frontend: R.Result[R.Void, outcome.Fail] = acquire_frontend_inputs(p);
+    if (R.is_err[R.Void, outcome.Fail](frontend)) { ret frontend; }
     var i: u32 = 0;
     for (i < p.emit_len) {
         val mid: session.ModuleId = p.topo[i];
-        val before: usize = diagnostic.error_count(?p.s.diags);
+        val acquired: R.Result[R.Void, fail.Fail] = run_lower_one(p, mid);
+        if (R.is_err[R.Void, fail.Fail](acquired)) { ret R.err[R.Void, outcome.Fail](outcome.from_fail(R.unwrap_err[R.Void, fail.Fail](acquired))); }
+        i = i + 1;
+    }
+    ret R.ok_void[outcome.Fail]();
+}
+
+pub fun prepare_persistent_cache(p: *project.Project) R.Result[R.Void, outcome.Fail] {
+    if (!persistent.operation_active(p)) { ret R.err[R.Void, outcome.Fail](outcome.internal("persistent cache requires the current query operation")); }
+    if (p.cache_initialized) { ret R.ok_void[outcome.Fail](); }
+    if (p.req.no_cache) {
+        val disabled: R.Result[R.Void, str] = persistent.prepare(p, nil, 0);
+        if (R.is_err[R.Void, str](disabled)) { ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](disabled))); }
+        ret R.ok_void[outcome.Fail]();
+    }
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret R.err[R.Void, outcome.Fail](outcome.internal("cache fingerprint allocator is unavailable")); }
+    val captured: R.Result[query.QueryOutput, str] = capture_build_config(p, ?backing);
+    if (R.is_err[query.QueryOutput, str](captured)) { ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[query.QueryOutput, str](captured))); }
+    val bytes: query.QueryOutput = R.unwrap_ok[query.QueryOutput, str](captured);
+    fin { if (bytes.bytes != nil) { A.deallocate[u8](?backing, bytes.bytes, bytes.len::usize); } }
+    val prepared: R.Result[R.Void, str] = persistent.prepare(p, bytes.bytes, bytes.len::usize);
+    if (R.is_err[R.Void, str](prepared)) { ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](prepared))); }
+    ret R.ok_void[outcome.Fail]();
+}
+
+pub fun run_codegen_pass(p: *project.Project) R.Result[R.Void, outcome.Fail] {
+    val inputs: R.Result[R.Void, outcome.Fail] = acquire_codegen_inputs(p);
+    if (R.is_err[R.Void, outcome.Fail](inputs)) { ret inputs; }
+    val cached: R.Result[R.Void, outcome.Fail] = prepare_persistent_cache(p);
+    if (R.is_err[R.Void, outcome.Fail](cached)) { ret cached; }
+    var i: u32 = 0;
+    for (i < p.emit_len) {
+        val mid: session.ModuleId = p.topo[i];
+
         val r: R.Result[R.Void, fail.Fail] = run_codegen_one(p, mid);
         if (R.is_err[R.Void, fail.Fail](r)) {
-            ret R.err[R.Void, outcome.Fail](pass_fail(p, before, R.unwrap_err[R.Void, fail.Fail](r)));
+            ret R.err[R.Void, outcome.Fail](outcome.from_fail(R.unwrap_err[R.Void, fail.Fail](r)));
         }
         i = i + 1;
     }
@@ -1787,16 +2051,16 @@ fun global_definer_of(p: *project.Project, name: intern.StrId) u32 {
 fun run_codegen_one(p: *project.Project, mid: session.ModuleId) R.Result[R.Void, fail.Fail] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
 
-    val e_r: R.Result[*query.QueryEntry, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_CODEGEN, back_half_key_for(p, m));
-    if (R.is_err[*query.QueryEntry, fail.Fail](e_r)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*query.QueryEntry, fail.Fail](e_r).message)); }
-    val img: *of.ObjectImage = image_handle_decode(R.unwrap_ok[*query.QueryEntry, fail.Fail](e_r));
+    val e_r: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_CODEGEN, back_half_key_for(p, m));
+    if (R.is_err[query.QueryView, fail.Fail](e_r)) { ret R.err[R.Void, fail.Fail](R.unwrap_err[query.QueryView, fail.Fail](e_r)); }
+    val img: *of.ObjectImage = image_handle_decode(R.unwrap_ok[query.QueryView, fail.Fail](e_r));
     if (img == nil) { ret R.err[R.Void, fail.Fail](fail.message("Q_CODEGEN produced no result handle")); }
 
     m.object_image = img;
     ret R.ok_void[fail.Fail]();
 }
 
-pub fun q_codegen_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, fail.Fail] {
+pub fun q_codegen_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[query.QueryOutput, fail.Fail] {
     val db: *query.QueryDb = ?p.s.queries;
     val s: *session.Session = p.s;
 
@@ -1804,15 +2068,15 @@ pub fun q_codegen_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.
     val mid: session.ModuleId = session.module_id_for_stable(s, stable);
     if (mid == session.MODULE_NIL) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_CODEGEN: stable id not loaded this build")); }
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
-    val irmod: *ir.Module = m.ir_module;
+    val lower_owner: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_LOWER, key);
+    if (R.is_err[query.QueryView, fail.Fail](lower_owner)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[query.QueryView, fail.Fail](lower_owner)); }
+    val irmod: *ir.Module = ir_handle_decode(R.unwrap_ok[query.QueryView, fail.Fail](lower_owner));
     if (irmod == nil) { ret R.err[query.QueryOutput, fail.Fail](fail.message("Q_CODEGEN: module has no lowered IR")); }
-
-    val rl: R.Result[R.Void, str] = query.record_dep(db, query.Q_CODEGEN, key, query.Q_LOWER, key);
-    if (R.is_err[R.Void, str](rl)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rl))); }
-    val rt: R.Result[R.Void, str] = query.record_dep(db, query.Q_CODEGEN, key, query.Q_TARGET, 0);
-    if (R.is_err[R.Void, str](rt)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rt))); }
-    val rpp: R.Result[R.Void, str] = query.record_dep(db, query.Q_CODEGEN, key, query.Q_CODEGEN_FLAGS, 0);
-    if (R.is_err[R.Void, str](rpp)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rpp))); }
+    m.ir_module = irmod;
+    val rt: R.Result[R.Void, fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_TARGET, 0);
+    if (R.is_err[R.Void, fail.Fail](rt)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[R.Void, fail.Fail](rt)); }
+    val rpp: R.Result[R.Void, fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_CODEGEN_FLAGS, 0);
+    if (R.is_err[R.Void, fail.Fail](rpp)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[R.Void, fail.Fail](rpp)); }
 
     val srcs_r: R.Result[CodeSources, str] = code_sources(p, mid, s.alloc);
     if (R.is_err[CodeSources, str](srcs_r)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[CodeSources, str](srcs_r))); }
@@ -1820,19 +2084,31 @@ pub fun q_codegen_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.
     var di: u32 = 0;
     for (di < srcs.set.len) {
         val dm: *project.ModuleEntry = ?p.modules[srcs.ids[di]::u32];
-        val rd: R.Result[R.Void, str] = query.record_dep(db, query.Q_CODEGEN, key, query.Q_LOWER,
-                                                       back_half_key_for(p, dm));
-        if (R.is_err[R.Void, str](rd)) {
+        val rd: R.Result[R.Void, fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_LOWER, back_half_key_for(p, dm));
+        if (R.is_err[R.Void, fail.Fail](rd)) {
             sources_dnit(s.alloc, ?srcs);
-            ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rd)));
+            ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[R.Void, fail.Fail](rd));
         }
         di = di + 1;
     }
 
+    if (m.staged_image == nil) {
+        val restored: R.Result[bool, str] = persistent.restore(p, mid);
+        if (R.is_err[bool, str](restored)) {
+            sources_dnit(s.alloc, ?srcs);
+            ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[bool, str](restored)));
+        }
+    }
     val staged: *of.ObjectImage = m.staged_image;
     if (staged != nil) {
         m.staged_image = nil;
         sources_dnit(s.alloc, ?srcs);
+        val published: R.Result[R.Void, str] = persistent.publish(p, m, staged);
+        if (R.is_err[R.Void, str](published)) {
+            obj.dnit(staged);
+            A.deallocate[of.ObjectImage](s.alloc, staged, 1);
+            ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](published)));
+        }
         ret image_handle_encode(alloc, staged);
     }
 
@@ -1843,11 +2119,16 @@ pub fun q_codegen_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.
     }
 
     val t_cg: ctime.Time = readout.item_begin(p.events);
-    val res_cg: R.Result[of.ObjectImage, str] = codegen.codegen_module(s, ?p.target, irmod, srcs.set, nil, p.req.placement_policy, R.unwrap_ok[codegen.DebugInfo, str](dbg_r));
+    val res_cg: R.Result[of.ObjectImage, fail.Fail] = codegen.codegen_module(s, ?p.target, irmod, srcs.set, nil, p.req.placement_policy, R.unwrap_ok[codegen.DebugInfo, str](dbg_r));
     sources_dnit(s.alloc, ?srcs);
-    if (R.is_err[of.ObjectImage, str](res_cg)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[of.ObjectImage, str](res_cg))); }
+    if (R.is_err[of.ObjectImage, fail.Fail](res_cg)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[of.ObjectImage, fail.Fail](res_cg)); }
     readout.item(p.events, readout.PH_CODEGEN, project.fqn_name(p, m.fqn), t_cg);
-    var img: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](res_cg);
+    var img: of.ObjectImage = R.unwrap_ok[of.ObjectImage, fail.Fail](res_cg);
+    val published: R.Result[R.Void, str] = persistent.publish(p, m, ?img);
+    if (R.is_err[R.Void, str](published)) {
+        obj.dnit(?img);
+        ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](published)));
+    }
 
     val br: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](alloc, 1::usize);
     if (R.is_err[*of.ObjectImage, str](br)) {
@@ -1885,26 +2166,32 @@ fun image_handle_encode(alloc: *A.Allocator, r: *of.ObjectImage) R.Result[query.
     ret R.ok[query.QueryOutput, fail.Fail](out);
 }
 
-fun image_handle_decode(e: *query.QueryEntry) *of.ObjectImage {
+fun image_handle_decode(e: query.QueryView) *of.ObjectImage {
     if (e.value == nil || e.value_len::usize < $size_of(ptr)) { ret nil; }
     val slot: *ptr = e.value::ptr::*ptr;
     ret slot[0]::*of.ObjectImage;
 }
 
-pub fun run_link_pass(p: *project.Project) R.Result[bool, outcome.Fail] {
+pub fun prepare_link_pass(p: *project.Project) R.Result[R.Void, outcome.Fail] {
     if (!query.is_registered(?p.s.queries, query.Q_LINK)) {
         val rln: R.Result[R.Void, str] = query.register_derived(?p.s.queries, query.Q_LINK);
-        if (R.is_err[R.Void, str](rln)) { ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](rln))); }
+        if (R.is_err[R.Void, str](rln)) { ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](rln))); }
     }
 
+    ret R.ok_void[outcome.Fail]();
+}
+
+pub fun run_link_pass(p: *project.Project) R.Result[bool, outcome.Fail] {
+    val images: R.Result[R.Void, outcome.Fail] = run_codegen_pass(p);
+    if (R.is_err[R.Void, outcome.Fail](images)) { ret R.err[bool, outcome.Fail](R.unwrap_err[R.Void, outcome.Fail](images)); }
     val prior: query.Revision = query.peek_revision(?p.s.queries, query.Q_LINK, 0);
-    val e_r: R.Result[*query.QueryEntry, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_LINK, 0);
-    if (R.is_err[*query.QueryEntry, fail.Fail](e_r)) { ret R.err[bool, outcome.Fail](outcome.from_fail(R.unwrap_err[*query.QueryEntry, fail.Fail](e_r))); }
-    val now: query.Revision = R.unwrap_ok[*query.QueryEntry, fail.Fail](e_r).last_changed;
+    val e_r: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_LINK, 0);
+    if (R.is_err[query.QueryView, fail.Fail](e_r)) { ret R.err[bool, outcome.Fail](outcome.from_fail(R.unwrap_err[query.QueryView, fail.Fail](e_r))); }
+    val now: query.Revision = R.unwrap_ok[query.QueryView, fail.Fail](e_r).last_changed;
     ret R.ok[bool, outcome.Fail](now != prior);
 }
 
-pub fun q_link_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, fail.Fail] {
+pub fun q_link_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[query.QueryOutput, fail.Fail] {
     val db: *query.QueryDb = ?p.s.queries;
     val s: *session.Session = p.s;
 
@@ -1913,104 +2200,160 @@ pub fun q_link_compute(p: *project.Project, key: u64, alloc: *A.Allocator) R.Res
     fb.buf   = nil;
     fb.len   = 0;
     fb.cap   = 0;
+    fin { dq.fp_free(?fb); }
 
-    val rt: R.Result[query.Revision, str] = query.record_dep_rev(db, query.Q_LINK, key, query.Q_TARGET, 0);
-    if (R.is_err[query.Revision, str](rt)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[query.Revision, str](rt)); }
-    val wt: R.Result[R.Void, str] = dq.fp_u64(?fb, R.unwrap_ok[query.Revision, str](rt));
-    if (R.is_err[R.Void, str](wt)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[R.Void, str](wt)); }
+    val rt: R.Result[query.Revision, fail.Fail] = query.revision[project.Project](?p.queries, p, query.Q_TARGET, 0);
+    if (R.is_err[query.Revision, fail.Fail](rt)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[query.Revision, fail.Fail](rt)); }
+    val wt: R.Result[R.Void, str] = dq.fp_u64(?fb, R.unwrap_ok[query.Revision, fail.Fail](rt));
+    if (R.is_err[R.Void, str](wt)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](wt))); }
 
-    val rc: R.Result[query.Revision, str] = query.record_dep_rev(db, query.Q_LINK, key, query.Q_LINK_CONFIG, 0);
-    if (R.is_err[query.Revision, str](rc)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[query.Revision, str](rc)); }
-    val wc: R.Result[R.Void, str] = dq.fp_u64(?fb, R.unwrap_ok[query.Revision, str](rc));
-    if (R.is_err[R.Void, str](wc)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[R.Void, str](wc)); }
+    val rc: R.Result[query.Revision, fail.Fail] = query.revision[project.Project](?p.queries, p, query.Q_LINK_CONFIG, 0);
+    if (R.is_err[query.Revision, fail.Fail](rc)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[query.Revision, fail.Fail](rc)); }
+    val wc: R.Result[R.Void, str] = dq.fp_u64(?fb, R.unwrap_ok[query.Revision, fail.Fail](rc));
+    if (R.is_err[R.Void, str](wc)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](wc))); }
 
     val wn: R.Result[R.Void, str] = dq.fp_u32(?fb, p.emit_len);
-    if (R.is_err[R.Void, str](wn)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[R.Void, str](wn)); }
+    if (R.is_err[R.Void, str](wn)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](wn))); }
     var i: u32 = 0;
     for (i < p.emit_len) {
         val m: *project.ModuleEntry = ?p.modules[(p.topo[i])::u32];
-        val rd: R.Result[query.Revision, str] = query.record_dep_rev(db, query.Q_LINK, key, query.Q_CODEGEN, back_half_key_for(p, m));
-        if (R.is_err[query.Revision, str](rd)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[query.Revision, str](rd)); }
-        val wm: R.Result[R.Void, str] = dq.fp_u64(?fb, R.unwrap_ok[query.Revision, str](rd));
-        if (R.is_err[R.Void, str](wm)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[R.Void, str](wm)); }
+        val rd: R.Result[query.Revision, fail.Fail] = query.revision[project.Project](?p.queries, p, query.Q_CODEGEN, back_half_key_for(p, m));
+        if (R.is_err[query.Revision, fail.Fail](rd)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[query.Revision, fail.Fail](rd)); }
+        val wm: R.Result[R.Void, str] = dq.fp_u64(?fb, R.unwrap_ok[query.Revision, fail.Fail](rd));
+        if (R.is_err[R.Void, str](wm)) { ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](wm))); }
         i = i + 1;
     }
 
     ret fail.lift[query.QueryOutput](dq.fp_take(?fb));
 }
 
-fun link_fp_fail(fb: *dq.FpBuf, alloc: *A.Allocator, msg: str) R.Result[query.QueryOutput, fail.Fail] {
-    if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](alloc, fb.buf, fb.cap::usize); }
-    ret R.err[query.QueryOutput, fail.Fail](fail.message(msg));
+fun own_type_export(p: *project.Project, mid: session.ModuleId, symbol: *resolve.Symbol,
+                    sr: *sema.SemaResult, ctx: *comptime.ComptimeCtx) R.Result[scx.TypeExport, str] {
+    var row: scx.TypeExport = scx.TypeExport{
+        origin: p.modules[mid::u32].stable_id, canon: symbol.canon, ty: type.TYPE_NIL,
+        constant: resolve.ExportConstant{ name: symbol.canon }
+    };
+    if (symbol.definition_kind == resolve.SYM_USE) { ret R.ok[scx.TypeExport, str](row); }
+    if (symbol.origin != mid || sr == nil || symbol.decl == id.DECL_NIL || symbol.decl >= sr.decl_count) {
+        ret R.err[scx.TypeExport, str]("typed export has no matching current declaration");
+    }
+    row.ty = sr.decl_type[symbol.decl];
+    if (symbol.definition_kind == resolve.SYM_VAL) {
+        val found: O.Option[comptime.NamedConst] = comptime.lookup(ctx, symbol.canon);
+        if (O.is_some[comptime.NamedConst](found)) {
+            val constant: comptime.NamedConst = O.unwrap[comptime.NamedConst](found);
+            row.constant.present = true;
+            row.constant.gated = constant.gated;
+            row.constant.value = constant.value;
+            if (constant.value.kind == comptime.CT_KIND_CONST_ELEM) {
+                row.definition_incarnation = p.modules[mid::u32].a.incarnation;
+            }
+        }
+    }
+    ret R.ok[scx.TypeExport, str](row);
 }
 
-fun fp_typed_surface(fb: *dq.FpBuf, s: *session.Session, mid: session.ModuleId, rr: *resolve.ResolveResult, sr: *sema.SemaResult) R.Result[R.Void, str] {
-    val pc: R.Result[R.Void, str] = dq.fp_u32(fb, rr.pub_count);
-    if (R.is_err[R.Void, str](pc)) { ret pc; }
-    if (rr.symbols == nil)       { ret R.ok_void[str](); }
+fun imported_type_export(p: *project.Project, symbol: *resolve.Symbol, gates: bool) R.Result[scx.TypeExport, fail.Fail] {
+    val mid: session.ModuleId = symbol.origin;
+    if (mid == session.MODULE_NIL || mid::u32 >= p.module_len) { ret R.err[scx.TypeExport, fail.Fail](fail.message("forwarded type origin is not loaded")); }
+    if (gates) {
+        val m: *project.ModuleEntry = ?p.modules[mid::u32];
+        if (m.resolve_result == nil || m.gate_result == nil) { ret R.err[scx.TypeExport, fail.Fail](fail.message("forwarded gate type has no current header owner")); }
+        var i: u32 = 0;
+        for (i < m.resolve_result.symbol_count) {
+            val current: *resolve.Symbol = ?m.resolve_result.symbols[i];
+            if (current.origin == mid && current.canon == symbol.canon && current.kind == symbol.definition_kind) {
+                ret fail.lift[scx.TypeExport](own_type_export(p, mid, current, m.gate_result, ?m.ctx));
+            }
+            i = i + 1;
+        }
+        ret R.err[scx.TypeExport, fail.Fail](fail.message("forwarded gate type has no current canonical declaration"));
+    }
+    val acquired: R.Result[scx.ModuleSema, fail.Fail] = read_typed_surface(p, mid, p.s.alloc);
+    if (R.is_err[scx.ModuleSema, fail.Fail](acquired)) { ret R.err[scx.TypeExport, fail.Fail](R.unwrap_err[scx.ModuleSema, fail.Fail](acquired)); }
+    var surface: scx.ModuleSema = R.unwrap_ok[scx.ModuleSema, fail.Fail](acquired);
+    fin { scx.module_sema_dnit(?surface); }
+    val origin: session.StableModuleId = p.modules[mid::u32].stable_id;
+    var i: usize = 0;
+    for (i < surface.exports.len) {
+        val row: scx.TypeExport = surface.exports.data[i];
+        if (row.origin == origin && row.canon == symbol.canon) { ret R.ok[scx.TypeExport, fail.Fail](row); }
+        i = i + 1;
+    }
+    ret R.err[scx.TypeExport, fail.Fail](fail.message("forwarded type has no acquired canonical public surface"));
+}
 
+fun build_type_surface(p: *project.Project, mid: session.ModuleId, rr: *resolve.ResolveResult,
+                       sr: *sema.SemaResult, gates: bool, a: *A.Allocator) R.Result[scx.ModuleSema, fail.Fail] {
+    var surface: scx.ModuleSema = scx.module_sema_init(a, p.modules[mid::u32].fqn, mid);
+    var transferred: bool = false;
+    fin { if (!transferred) { scx.module_sema_dnit(?surface); } }
     var i: u32 = 0;
     for (i < rr.pub_count) {
-        val sym: *resolve.Symbol = ?rr.symbols[i];
-        val rk: R.Result[R.Void, str] = dq.fp_u8(fb, sym.kind::u8);    if (R.is_err[R.Void, str](rk)) { ret rk; }
-        val rn: R.Result[R.Void, str] = dq.fp_u32(fb, sym.name::u32);  if (R.is_err[R.Void, str](rn)) { ret rn; }
-        if (sym.origin == mid && sym.decl::u32 < sr.decl_count) {
-            val ty: type.TypeId = sr.decl_type[sym.decl];
-            val rty: R.Result[R.Void, str] = dq.fp_u32(fb, ty::u32);   if (R.is_err[R.Void, str](rty)) { ret rty; }
-            val rf:  R.Result[R.Void, str] = fp_type_fields(fb, s, ty); if (R.is_err[R.Void, str](rf)) { ret rf; }
-        }
-        or {
-            val rty: R.Result[R.Void, str] = dq.fp_u32(fb, 0xFFFFFFFF); if (R.is_err[R.Void, str](rty)) { ret rty; }
-            val rf:  R.Result[R.Void, str] = dq.fp_u32(fb, 0);          if (R.is_err[R.Void, str](rf)) { ret rf; }
-        }
+        val symbol: *resolve.Symbol = ?rr.symbols[i];
+        var captured: R.Result[scx.TypeExport, fail.Fail];
+        if (symbol.origin == mid) { captured = fail.lift[scx.TypeExport](own_type_export(p, mid, symbol, sr, ?p.modules[mid::u32].ctx)); }
+        or { captured = imported_type_export(p, symbol, gates); }
+        if (R.is_err[scx.TypeExport, fail.Fail](captured)) { ret R.err[scx.ModuleSema, fail.Fail](R.unwrap_err[scx.TypeExport, fail.Fail](captured)); }
+        val added: R.Result[usize, str] = vector.push[scx.TypeExport](?surface.exports, R.unwrap_ok[scx.TypeExport, fail.Fail](captured));
+        if (R.is_err[usize, str](added)) { ret R.err[scx.ModuleSema, fail.Fail](fail.message(R.unwrap_err[usize, str](added))); }
         i = i + 1;
     }
-    ret R.ok_void[str]();
+    transferred = true;
+    ret R.ok[scx.ModuleSema, fail.Fail](surface);
 }
 
-fun fp_type_fields(fb: *dq.FpBuf, s: *session.Session, ty: type.TypeId) R.Result[R.Void, str] {
-    if (ty == type.TYPE_NIL || ty == type.TYPE_ERROR) { ret dq.fp_u32(fb, 0); }
-    val ft_opt: O.Option[*type.FieldTable] = type.field_table_for(?s.types, ty);
-    if (O.is_none[*type.FieldTable](ft_opt)) { ret dq.fp_u32(fb, 0); }
-    val ft: *type.FieldTable = O.unwrap[*type.FieldTable](ft_opt);
-    val rc: R.Result[R.Void, str] = dq.fp_u32(fb, ft.fields_len);
-    if (R.is_err[R.Void, str](rc)) { ret rc; }
-    var i: u32 = 0;
-    for (i < ft.fields_len) {
-        val fe: *type.FieldEntry = type.field_entry_at(?s.types, ft, i);
-        val rn: R.Result[R.Void, str] = dq.fp_u32(fb, fe.name::u32); if (R.is_err[R.Void, str](rn)) { ret rn; }
-        val rt: R.Result[R.Void, str] = dq.fp_u32(fb, fe.ty::u32);   if (R.is_err[R.Void, str](rt)) { ret rt; }
+fun prepared_surface_recipe(p: *project.Project, ty: type.TypeId) R.Result[R.Void, fail.Fail] {
+    if (O.is_none[*type.FieldTable](type.field_table_for(?p.s.types, ty))) {
+        ret R.err[R.Void, fail.Fail](fail.message("public nominal recipe was not prepared by its acquired semantic owner"));
+    }
+    ret R.ok_void[fail.Fail]();
+}
+
+fun capture_surface_graph(p: *project.Project, surface: *scx.ModuleSema) R.Result[fields.Graph, fail.Fail] {
+    var roots: vector.Vector[type.TypeId] = vector.init[type.TypeId](surface.exports.a);
+    fin { vector.dnit[type.TypeId](?roots); }
+    var i: usize = 0;
+    for (i < surface.exports.len) {
+        val row: *scx.TypeExport = ?surface.exports.data[i];
+        val added: R.Result[usize, str] = vector.push[type.TypeId](?roots, row.ty);
+        if (R.is_err[usize, str](added)) { ret R.err[fields.Graph, fail.Fail](fail.message(R.unwrap_err[usize, str](added))); }
+        if (row.constant.present) {
+            val value: comptime.CTValue = row.constant.value;
+            var extra: type.TypeId = type.TYPE_NIL;
+            if (value.kind == comptime.CT_KIND_TYPE) { extra = value.data.t::type.TypeId; }
+            or (value.kind == comptime.CT_KIND_FIELD) { extra = value.data.fld.owner::type.TypeId; }
+            or (value.kind == comptime.CT_KIND_PACK_ELEM) { extra = value.data.pelem.ty::type.TypeId; }
+            or (value.kind == comptime.CT_KIND_CONST_ELEM) { extra = value.data.celem.ty::type.TypeId; }
+            val added: R.Result[usize, str] = vector.push[type.TypeId](?roots, extra);
+            if (R.is_err[usize, str](added)) { ret R.err[fields.Graph, fail.Fail](fail.message(R.unwrap_err[usize, str](added))); }
+        }
         i = i + 1;
     }
-    ret R.ok_void[str]();
+    var group: fields.Roots = fields.Roots{ data: roots.data, len: roots.len };
+    ret fields.capture[project.Project](p.s, surface.exports.a, ?group, 1, fields.RECIPES,
+        p.modules[surface.module::u32].ctx.env.target_defs, p, prepared_surface_recipe);
+}
+
+pub fun capture_build_config(p: *project.Project, alloc: *A.Allocator) R.Result[query.QueryOutput, str] {
+    var fb: dq.FpBuf = dq.FpBuf{ alloc: alloc };
+    fin { dq.fp_free(?fb); }
+    val written: R.Result[R.Void, str] = write_build_config(?fb, p);
+    if (R.is_err[R.Void, str](written)) { ret R.err[query.QueryOutput, str](R.unwrap_err[R.Void, str](written)); }
+    ret dq.fp_take(?fb);
 }
 
 pub fun set_build_config_input(p: *project.Project) R.Result[R.Void, str] {
-    var fb: dq.FpBuf;
-    fb.alloc = p.s.alloc;
-    fb.buf   = nil;
-    fb.len   = 0;
-    fb.cap   = 0;
-
-    val w: R.Result[R.Void, str] = write_build_config(?fb, p);
-    if (R.is_err[R.Void, str](w)) {
-        if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](p.s.alloc, fb.buf, fb.cap::usize); }
-        ret w;
-    }
-
-    val fl: R.Result[u32, str] = dq.fp_input_len(?fb);
-    if (R.is_err[u32, str](fl)) {
-        dq.fp_free(?fb);
-        ret R.err[R.Void, str](R.unwrap_err[u32, str](fl));
-    }
-    val si: R.Result[R.Void, str] = query.set_input(?p.s.queries, query.Q_TARGET, 0, fb.buf, R.unwrap_ok[u32, str](fl));
-    if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](p.s.alloc, fb.buf, fb.cap::usize); }
-    ret si;
+    val captured: R.Result[query.QueryOutput, str] = capture_build_config(p, p.s.alloc);
+    if (R.is_err[query.QueryOutput, str](captured)) { ret R.void_of[query.QueryOutput, str](captured); }
+    val bytes: query.QueryOutput = R.unwrap_ok[query.QueryOutput, str](captured);
+    fin { if (bytes.bytes != nil) { A.deallocate[u8](p.s.alloc, bytes.bytes, bytes.len::usize); } }
+    ret query.set_input(?p.s.queries, query.Q_TARGET, 0, bytes.bytes, bytes.len);
 }
 
 fun write_build_config(fb: *dq.FpBuf, p: *project.Project) R.Result[R.Void, str] {
     var digest: [32]u8;
-    val hr: R.Result[R.Void, str] = request.semantic_hash(p.s.alloc, ?p.req, ?digest[0]);
+    val hr: R.Result[R.Void, str] = request.semantic_hash(fb.alloc, ?p.req, ?digest[0]);
     if (R.is_err[R.Void, str](hr)) { ret hr; }
     val ah: R.Result[R.Void, str] = dq.fp_bytes(fb, ?digest[0], request.HASH_SIZE::u32);
     if (R.is_err[R.Void, str](ah)) { ret ah; }
@@ -2018,19 +2361,18 @@ fun write_build_config(fb: *dq.FpBuf, p: *project.Project) R.Result[R.Void, str]
     val tf: R.Result[R.Void, str] = write_target_fingerprint(fb, p);
     if (R.is_err[R.Void, str](tf)) { ret tf; }
 
-    val a5: R.Result[R.Void, str] = dq.fp_u32(fb, p.target_entry.os_name::u32);  if (R.is_err[R.Void, str](a5)) { ret a5; }
-    val a6: R.Result[R.Void, str] = dq.fp_u32(fb, p.target_entry.isa_name::u32); if (R.is_err[R.Void, str](a6)) { ret a6; }
-    val a7: R.Result[R.Void, str] = dq.fp_u32(fb, p.target_entry.abi_name::u32); if (R.is_err[R.Void, str](a7)) { ret a7; }
-    val apl: R.Result[R.Void, str] = dq.fp_u32(fb, p.target_entry.platform_name::u32); if (R.is_err[R.Void, str](apl)) { ret apl; }
-    val a8: R.Result[R.Void, str] = dq.fp_u32(fb, p.config.id::u32);      if (R.is_err[R.Void, str](a8)) { ret a8; }
-    val a9: R.Result[R.Void, str] = dq.fp_u32(fb, p.config.version::u32); if (R.is_err[R.Void, str](a9)) { ret a9; }
-    val aa: R.Result[R.Void, str] = dq.fp_u32(fb, p.config.name::u32);    if (R.is_err[R.Void, str](aa)) { ret aa; }
-    val ab: R.Result[R.Void, str] = dq.fp_u32(fb, p.config.bin_name::u32); if (R.is_err[R.Void, str](ab)) { ret ab; }
+    val a5: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, p.target_entry.os_name);  if (R.is_err[R.Void, str](a5)) { ret a5; }
+    val a6: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, p.target_entry.isa_name); if (R.is_err[R.Void, str](a6)) { ret a6; }
+    val a7: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, p.target_entry.abi_name); if (R.is_err[R.Void, str](a7)) { ret a7; }
+    val apl: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, p.target_entry.platform_name); if (R.is_err[R.Void, str](apl)) { ret apl; }
+    val a8: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, p.config.id);      if (R.is_err[R.Void, str](a8)) { ret a8; }
+    val a9: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, p.config.version); if (R.is_err[R.Void, str](a9)) { ret a9; }
+    val ab: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, p.config.bin_name); if (R.is_err[R.Void, str](ab)) { ret ab; }
 
     val ac: R.Result[R.Void, str] = dq.fp_u32(fb, p.config.define_count); if (R.is_err[R.Void, str](ac)) { ret ac; }
     var i: u32 = 0;
     for (i < p.config.define_count) {
-        val ad: R.Result[R.Void, str] = dq.fp_u32(fb, p.config.defines[i]::u32);
+        val ad: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, p.config.defines[i]);
         if (R.is_err[R.Void, str](ad)) { ret ad; }
         i = i + 1;
     }
@@ -2038,7 +2380,7 @@ fun write_build_config(fb: *dq.FpBuf, p: *project.Project) R.Result[R.Void, str]
 }
 
 fun write_target_fingerprint(fb: *dq.FpBuf, p: *project.Project) R.Result[R.Void, str] {
-    var e: binary.Encoder = binary.encoder(p.s.alloc, binary.LITTLE);
+    var e: binary.Encoder = binary.encoder(fb.alloc, binary.LITTLE);
     if (!target.fingerprint(?p.target, ?e)) {
         binary.encoder_dnit(?e);
         ret R.err[R.Void, str]("out of memory fingerprinting the selected target");
@@ -2060,15 +2402,40 @@ fun write_step_environment(fb: *dq.FpBuf, p: *project.Project) R.Result[R.Void, 
     var si: u32 = 0;
     for (si < p.config.step_count) {
         val st: *manifest.StepDef = ?p.config.steps[si];
-        val rn: R.Result[R.Void, str] = dq.fp_u32(fb, st.name::u32);  if (R.is_err[R.Void, str](rn)) { ret rn; }
+        val rn: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, st.name);  if (R.is_err[R.Void, str](rn)) { ret rn; }
         val re: R.Result[R.Void, str] = dq.fp_u32(fb, st.env_count);  if (R.is_err[R.Void, str](re)) { ret re; }
         var ei: u32 = 0;
         for (ei < st.env_count) {
-            val rk: R.Result[R.Void, str] = dq.fp_u32(fb, st.env_keys[ei]::u32);   if (R.is_err[R.Void, str](rk)) { ret rk; }
-            val rv: R.Result[R.Void, str] = dq.fp_u32(fb, st.env_values[ei]::u32); if (R.is_err[R.Void, str](rv)) { ret rv; }
+            val rk: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, st.env_keys[ei]);   if (R.is_err[R.Void, str](rk)) { ret rk; }
+            val rv: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, st.env_values[ei]); if (R.is_err[R.Void, str](rv)) { ret rv; }
             ei = ei + 1;
         }
         si = si + 1;
+    }
+    if (p.config.step_count == 0 && p.config.dep_count == 0) { ret dq.fp_u32(fb, 0); }
+    val inherited: **u8 = env.environ();
+    if (inherited == nil) { ret R.err[R.Void, str]("planner environment unavailable"); }
+    ret write_planner_environment(fb, inherited);
+}
+
+
+# planner inputs cover child inheritance and executable lookup for root and dependency steps
+fun write_planner_environment(fb: *dq.FpBuf, inherited: **u8) R.Result[R.Void, str] {
+    val captured: R.Result[step_env.Environment, str] = step_env.capture(fb.alloc, inherited);
+    if (R.is_err[step_env.Environment, str](captured)) { ret R.err[R.Void, str](R.unwrap_err[step_env.Environment, str](captured)); }
+    var environment: step_env.Environment = R.unwrap_ok[step_env.Environment, str](captured);
+    fin { step_env.dnit(?environment); }
+    val exported: R.Result[step_env.Strings, str] = step_env.to_strings(?environment);
+    if (R.is_err[step_env.Strings, str](exported)) { ret R.err[R.Void, str](R.unwrap_err[step_env.Strings, str](exported)); }
+    var strings: step_env.Strings = R.unwrap_ok[step_env.Strings, str](exported);
+    fin { step_env.strings_free(fb.alloc, ?strings); }
+    val count: R.Result[R.Void, str] = dq.fp_u32(fb, strings.count);
+    if (R.is_err[R.Void, str](count)) { ret count; }
+    var i: u32 = 0;
+    for (i < strings.count) {
+        val entry: R.Result[R.Void, str] = dq.fp_cstr(fb, strings.items[i]);
+        if (R.is_err[R.Void, str](entry)) { ret entry; }
+        i = i + 1;
     }
     ret R.ok_void[str]();
 }
@@ -2090,8 +2457,11 @@ test "mach.lang.driver.passes.write_build_config:distinguishes_target_identity" 
     if (R.is_err[session.Session, str](sr)) { ret 1; }
     var s: session.Session = R.unwrap_ok[session.Session, str](sr);
 
-    var te:  project.TargetEntry;
+    var te: project.TargetEntry;
+    te.os_name = intern.STR_NIL; te.isa_name = intern.STR_NIL;
+    te.abi_name = intern.STR_NIL; te.platform_name = intern.STR_NIL;
     var cfg: project.ProjectConfig;
+    cfg.id = intern.STR_NIL; cfg.version = intern.STR_NIL; cfg.bin_name = intern.STR_NIL;
 
     var px: project.Project;
     px.s            = ?s;
@@ -2277,10 +2647,14 @@ fun build_module_exports(p: *project.Project, dep_id: session.ModuleId, dep: *pr
     for (i < pcount) {
         val sym: *resolve.Symbol = ?dep.resolve_result.symbols[i];
         var ps: resolve.PublicSymbol;
-        ps.kind   = sym.kind;
+        ps.kind   = sym.definition_kind;
         ps.name   = sym.name;
         ps.canon  = sym.canon;
-        ps.decl   = sym.decl;
+        ps.file = sym.definition_file;
+        ps.generic_arity = sym.generic_arity;
+        ps.has_comptime_params = sym.has_comptime_params;
+        ps.has_pack_param = sym.has_pack_param;
+        ps.deprecation = sym.deprecation;
         ps.slot   = sym.slot;
         ps.origin = sym.origin;
         syms[i] = ps;
@@ -2351,8 +2725,11 @@ test "mach.lang.driver.passes.write_build_config:every_tuple_field_moves_the_fin
     var s: session.Session = R.unwrap_ok[session.Session, str](sr);
     fin { session.dnit(?s); }
 
-    var te:  project.TargetEntry;
+    var te: project.TargetEntry;
+    te.os_name = intern.STR_NIL; te.isa_name = intern.STR_NIL;
+    te.abi_name = intern.STR_NIL; te.platform_name = intern.STR_NIL;
     var cfg: project.ProjectConfig;
+    cfg.id = intern.STR_NIL; cfg.version = intern.STR_NIL; cfg.bin_name = intern.STR_NIL;
 
     var base: project.Project;
     base.s            = ?s;
@@ -2392,7 +2769,7 @@ test "mach.lang.driver.passes.write_build_config:every_tuple_field_moves_the_fin
     if (!ut_fp_digest(?alloc, ?v, ?digests[8][0])) { ret 1; }
 
     var define_ids: [1]intern.StrId;
-    define_ids[0] = 7;
+    define_ids[0] = R.unwrap_ok[intern.StrId, str](intern.intern(?s.interner, "TRACE"));
     v = base;
     v.config.defines      = ?define_ids[0];
     v.config.define_count = 1;
@@ -2400,10 +2777,10 @@ test "mach.lang.driver.passes.write_build_config:every_tuple_field_moves_the_fin
 
     var env_keys:   [1]intern.StrId;
     var env_values: [1]intern.StrId;
-    env_keys[0]   = 11;
-    env_values[0] = 13;
+    env_keys[0] = R.unwrap_ok[intern.StrId, str](intern.intern(?s.interner, "MODE"));
+    env_values[0] = R.unwrap_ok[intern.StrId, str](intern.intern(?s.interner, "audit"));
     var steps: [1]manifest.StepDef;
-    steps[0].name       = 17;
+    steps[0].name = R.unwrap_ok[intern.StrId, str](intern.intern(?s.interner, "generate"));
     steps[0].env_keys   = ?env_keys[0];
     steps[0].env_values = ?env_values[0];
     steps[0].env_count  = 1;
@@ -2422,4 +2799,139 @@ test "mach.lang.driver.passes.write_build_config:every_tuple_field_moves_the_fin
         i = i + 1;
     }
     ret 0;
+}
+
+
+fun t_planner_environment_digest(a: *A.Allocator, inherited: **u8, digest: *u8) bool {
+    var fb: dq.FpBuf;
+    fb.alloc = a;
+    fb.buf = nil;
+    fb.len = 0;
+    fb.cap = 0;
+    fin { dq.fp_free(?fb); }
+    val written: R.Result[R.Void, str] = write_planner_environment(?fb, inherited);
+    if (R.is_err[R.Void, str](written)) { ret false; }
+    sha256.hash(fb.buf, fb.len, digest);
+    ret true;
+}
+
+test "mach.lang.driver.passes: planner environment cache input tracks values and ignores entry order" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    var entries: [4]usize;
+    entries[0] = ("MACH_3146_B=two")::usize;
+    entries[1] = ("MACH_3146_A=one")::usize;
+    entries[2] = ("MACH_3146_A=ignored duplicate")::usize;
+    entries[3] = 0;
+    var initial: [32]u8;
+    if (!t_planner_environment_digest(?a, (?entries[0])::**u8, ?initial[0])) { ret 2; }
+    entries[0] = ("MACH_3146_A=one")::usize;
+    entries[1] = ("MACH_3146_B=two")::usize;
+    entries[2] = 0;
+    var reordered: [32]u8;
+    if (!t_planner_environment_digest(?a, (?entries[0])::**u8, ?reordered[0])) { ret 3; }
+    if (ut_digest_differs(?initial[0], ?reordered[0])) { ret 4; }
+    entries[1] = ("MACH_3146_B=changed inherited value")::usize;
+    var changed: [32]u8;
+    if (!t_planner_environment_digest(?a, (?entries[0])::**u8, ?changed[0])) { ret 5; }
+    if (!ut_digest_differs(?initial[0], ?changed[0])) { ret 6; }
+    ret 0;
+}
+
+
+fun read_binding_interface(raw: ptr, mid: session.ModuleId, canon: intern.StrId) R.Result[lcx.BindingInterface, fail.Fail] {
+    val p: *project.Project = raw::*project.Project;
+    if (mid == session.MODULE_NIL || mid::u32 >= p.module_len || canon == intern.STR_NIL) {
+        ret R.err[lcx.BindingInterface, fail.Fail](fail.message("binding interface has no active declaring owner"));
+    }
+    val key: u64 = (p.modules[mid::u32].stable_id::u64 << 32) | canon::u64;
+    val acquired: R.Result[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_BINDING_INTERFACE, key);
+    if (R.is_err[query.QueryView, fail.Fail](acquired)) { ret R.err[lcx.BindingInterface, fail.Fail](R.unwrap_err[query.QueryView, fail.Fail](acquired)); }
+    val view: query.QueryView = R.unwrap_ok[query.QueryView, fail.Fail](acquired);
+    if (view.value == nil || view.value_len != 18) { ret R.err[lcx.BindingInterface, fail.Fail](fail.message("binding interface has an invalid encoded extent")); }
+    var decoder: binary.Decoder = binary.decoder(view.value, view.value_len::usize, binary.LITTLE);
+    val flags: R.Result[u32, str] = binary.read_u32(?decoder);
+    val name: R.Result[u32, str] = binary.read_u32(?decoder);
+    val set: R.Result[u32, str] = binary.read_u32(?decoder);
+    val op: R.Result[u32, str] = binary.read_u32(?decoder);
+    val body: R.Result[u8, str] = binary.read_u8(?decoder);
+    val instance: R.Result[u8, str] = binary.read_u8(?decoder);
+    if (R.is_err[u32, str](flags) || R.is_err[u32, str](name) || R.is_err[u32, str](set)
+        || R.is_err[u32, str](op) || R.is_err[u8, str](body) || R.is_err[u8, str](instance)) {
+        ret R.err[lcx.BindingInterface, fail.Fail](fail.message("binding interface is truncated"));
+    }
+    ret R.ok[lcx.BindingInterface, fail.Fail](lcx.BindingInterface{
+        flags: R.unwrap_ok[u32, str](flags), export_name: R.unwrap_ok[u32, str](name)::intern.StrId,
+        op_set: R.unwrap_ok[u32, str](set), op_code: R.unwrap_ok[u32, str](op),
+        has_body: R.unwrap_ok[u8, str](body) != 0, needs_instance: R.unwrap_ok[u8, str](instance) != 0
+    });
+}
+
+pub fun q_binding_interface_compute(p: *project.Project, key: u64, alloc: *A.Allocator,
+                                   diags: *diagnostic.DiagnosticStore) R.Result[query.QueryOutput, fail.Fail] {
+    val stable: session.StableModuleId = (key >> 32)::session.StableModuleId;
+    val canon: intern.StrId = key::u32::intern.StrId;
+    val mid: session.ModuleId = session.module_id_for_stable(p.s, stable);
+    if (mid == session.MODULE_NIL) { ret R.err[query.QueryOutput, fail.Fail](fail.message("binding interface owner is not loaded")); }
+    val target: R.Result[R.Void, fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_TARGET, 0);
+    if (R.is_err[R.Void, fail.Fail](target)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[R.Void, fail.Fail](target)); }
+    val acquired: R.Result[scx.Definition, fail.Fail] = read_definition(p::ptr, mid, scx.DEFINITION_RESOLVED);
+    if (R.is_err[scx.Definition, fail.Fail](acquired)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[scx.Definition, fail.Fail](acquired)); }
+    val current: scx.Definition = R.unwrap_ok[scx.Definition, fail.Fail](acquired);
+    if (current.parsed.status.kind != fail.ACCEPTED) { ret R.err[query.QueryOutput, fail.Fail](fail.phase_failure(current.parsed.status)); }
+    if (current.rr.status.kind != fail.ACCEPTED) { ret R.err[query.QueryOutput, fail.Fail](fail.phase_failure(current.rr.status)); }
+    var did: id.DeclId = id.DECL_NIL;
+    var i: u32 = 0;
+    for (i < current.rr.symbol_count) {
+        val symbol: *resolve.Symbol = ?current.rr.symbols[i];
+        if (symbol.origin == mid && symbol.canon == canon && symbol.decl != id.DECL_NIL) {
+            did = symbol.decl;
+            brk;
+        }
+        i = i + 1;
+    }
+    val declaration: O.Option[*decl.Decl] = ast.get_decl(current.parsed.a, did);
+    if (O.is_none[*decl.Decl](declaration)) { ret R.err[query.QueryOutput, fail.Fail](fail.message("binding interface has no named declaration")); }
+    val d: *decl.Decl = O.unwrap[*decl.Decl](declaration);
+    var binding: lcx.BindingInterface = lcx.BindingInterface{ flags: d.flags::u32, export_name: intern.STR_NIL, op_set: isa.NO_OP_SET };
+    val exported: O.Option[intern.StrId] = session.export_name(p.s, mid, did::u32);
+    if (O.is_some[intern.StrId](exported)) { binding.export_name = O.unwrap[intern.StrId](exported); }
+    val source: O.Option[*src.SourceFile] = src.get(?p.s.sources, current.parsed.a.file_id);
+    if (O.is_none[*src.SourceFile](source)) { ret R.err[query.QueryOutput, fail.Fail](fail.message("binding interface has no declaration source")); }
+    binding.op_set = lcx.decl_target_op(current.parsed.a, O.unwrap[*src.SourceFile](source).text,
+        d, p.target.isa.defs, ?binding.op_code);
+    if (d.kind == decl.DECL_KIND_FUN) {
+        binding.has_body = d.data.fun_.body != id.STMT_NIL && (d.flags & decl.DECL_FLAG_EXT) == 0;
+        binding.needs_instance = d.data.fun_.generics_len != 0;
+        i = 0;
+        for (i < d.data.fun_.params_len) {
+            val parameter: *decl.TypedName = ?current.parsed.a.typed_names[d.data.fun_.params_start + i];
+            val ty: O.Option[*atype.Type] = ast.get_type(current.parsed.a, parameter.ty);
+            if (parameter.comptime || (O.is_some[*atype.Type](ty) && O.unwrap[*atype.Type](ty).kind == atype.TYPE_KIND_PACK)) {
+                binding.needs_instance = true;
+            }
+            i = i + 1;
+        }
+    }
+    var fb: dq.FpBuf;
+    fb.alloc = alloc;
+    fin { dq.fp_free(?fb); }
+    val flags: R.Result[R.Void, str] = dq.fp_u32(?fb, binding.flags);
+    val name: R.Result[R.Void, str] = dq.fp_u32(?fb, binding.export_name::u32);
+    val set: R.Result[R.Void, str] = dq.fp_u32(?fb, binding.op_set);
+    val op: R.Result[R.Void, str] = dq.fp_u32(?fb, binding.op_code);
+    val body: R.Result[R.Void, str] = dq.fp_u8(?fb, binding.has_body::u8);
+    val instance: R.Result[R.Void, str] = dq.fp_u8(?fb, binding.needs_instance::u8);
+    if (R.is_err[R.Void, str](flags) || R.is_err[R.Void, str](name) || R.is_err[R.Void, str](set)
+        || R.is_err[R.Void, str](op) || R.is_err[R.Void, str](body) || R.is_err[R.Void, str](instance)) {
+        ret R.err[query.QueryOutput, fail.Fail](fail.message("binding interface encoding failed"));
+    }
+    ret fail.lift[query.QueryOutput](dq.fp_take(?fb));
+}
+
+fun lower_output_equal(a: *u8, a_len: u32, b: *u8, b_len: u32) bool {
+    val left: *ir.Module = ir_handle_decode(query.QueryView{value: a, value_len: a_len});
+    val right: *ir.Module = ir_handle_decode(query.QueryView{value: b, value_len: b_len});
+    if (left == nil || right == nil) { ret false; }
+    ret ir_equal.content_equal(left, right);
 }

@@ -1,5 +1,7 @@
 use std.allocator.page;
+use std.allocator.arena;
 use std.collections.sort;
+use std.collections.vector;
 use std.format;
 use std.system.panic.panic;
 use std.types.bool.bool;
@@ -8,12 +10,15 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
+use std.types.string.str_contains;
 
 use A: std.allocator;
+use T: std.allocator.testing;
 use O: std.types.option;
 use R: std.types.result;
 
 use mach.lang.be.codegen.mir;
+use mach.lang.be.codegen.rules;
 use mach.lang.intern;
 use mach.lang.layout;
 use mach.lang.source;
@@ -21,6 +26,8 @@ use mach.lang.target;
 use target_testing: mach.lang.target.testing;
 use mach.lang.target.abi;
 use mach.lang.target.isa;
+use mach.lang.target.isa.riscv;
+use target_view: mach.lang.target.resolved;
 use tos: mach.lang.target.os;
 
 pub val REG_CLASS_GP: u32 = 0;
@@ -126,11 +133,47 @@ pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[R.Void, str] {
         ret R.err[R.Void, str]("regalloc.run: ABI vtable exposes no callee-saved register file");
     }
 
+    val input: R.Result[R.Void, str] = mir.validate_operands(m);
+    if (R.is_err[R.Void, str](input)) { ret input; }
+    val model: R.Result[R.Void, str] = validate_register_model(tgt, m);
+    if (R.is_err[R.Void, str](model)) { ret model; }
     var fi: u32 = 0;
     for (fi < m.function_len) {
+        val classes: R.Result[R.Void, str] = validate_vreg_classes(tgt, m, ?m.functions[fi]);
+        if (R.is_err[R.Void, str](classes)) { ret classes; }
         val af: R.Result[R.Void, str] = alloc_function(tgt, m, ?m.functions[fi]);
         if (R.is_err[R.Void, str](af)) { ret af; }
         fi = fi + 1;
+    }
+    ret mir.validate_operands(m);
+}
+
+fun validate_register_model(tgt: *target.Target, m: *mir.MirModule) R.Result[R.Void, str] {
+    if (tgt.model.reg_class_len == 0 || tgt.model.reg_classes == nil) {
+        ret R.err[R.Void, str]("regalloc: target has no register class model");
+    }
+    var ci: u32 = 0;
+    for (ci < tgt.model.reg_class_len) {
+        val kind: isa.RegClassKind = tgt.model.reg_classes[ci].kind;
+        if (kind > isa.RC_FLAGS) { ret mir.catalog_failure(m, "RegClassKind", kind::u32); }
+        if ((ci == REG_CLASS_GP) != (kind == isa.RC_GENERAL)) {
+            ret R.err[R.Void, str]("regalloc: target general register class does not match the MIR general bank");
+        }
+        ci = ci + 1;
+    }
+    ret R.ok_void[str]();
+}
+
+fun validate_vreg_classes(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) R.Result[R.Void, str] {
+    var vi: u32 = 0;
+    for (vi < f.vreg_count) {
+        val class: u32 = f.vregs[vi].class;
+        if (class >= tgt.model.reg_class_len) { ret mir.catalog_failure(m, "MirRegisterClass", class); }
+        val kind: isa.RegClassKind = tgt.model.reg_classes[class].kind;
+        if (kind == isa.RC_VECTOR || kind == isa.RC_FLAGS) {
+            ret R.err[R.Void, str]("regalloc: declared target register class is unsupported for MIR virtual registers");
+        }
+        vi = vi + 1;
     }
     ret R.ok_void[str]();
 }
@@ -157,7 +200,7 @@ fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) 
         if (fp_scratch != 0 && function_uses_fp_scratch(f)) {
             f.callee_mask_fp = fp_scratch;
         }
-        ret R.ok_void[str]();
+        ret verify_rewritten_operands(tgt, f);
     }
 
     var ctx: AllocCtx;
@@ -213,14 +256,13 @@ fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) 
     val rw: R.Result[R.Void, str] = rewrite(tgt, ?ctx);
     if (R.is_err[R.Void, str](rw)) { ctx_dnit(?ctx); ret rw; }
 
-    drop_self_copies_physical(tgt, ?ctx);
-
     val vf: R.Result[R.Void, str] = verify_allocation(tgt, ?ctx);
     if (R.is_err[R.Void, str](vf)) { ctx_dnit(?ctx); ret vf; }
 
     val vo: R.Result[R.Void, str] = verify_rewritten_operands(tgt, ctx.f);
     if (R.is_err[R.Void, str](vo)) { ctx_dnit(?ctx); ret vo; }
 
+    drop_self_copies_physical(tgt, ?ctx);
     record_callee_mask(tgt, ?ctx);
 
     val ro: R.Result[R.Void, str] = restore_order(?ctx);
@@ -842,6 +884,7 @@ fun tally_reads(ctx: *AllocCtx, reads: *u32, nv: u32) {
 }
 
 fun is_dead_mov(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr, reads: *u32, nv: u32) bool {
+    if (mi.security_boundary != mir.SECURITY_NONE) { ret false; }
     if (!instr_is_reg_copy(tgt, mi)) { ret false; }
     val d: *mir.MirOperand = ?mi.operands[0];
     if (d.kind != mir.MIR_OP_VREG) { ret false; }
@@ -1024,6 +1067,7 @@ fun drop_self_copies(tgt: *target.Target, ctx: *AllocCtx) {
                 val b: *mir.MirOperand = ?mi.operands[1];
                 drop = a.kind == mir.MIR_OP_VREG && b.kind == mir.MIR_OP_VREG && a.vreg == b.vreg;
             }
+            if (mi.security_boundary != mir.SECURITY_NONE) { drop = false; }
             if (drop) {
                 if (mi.operands != nil && mi.operand_count > 0) {
                     A.deallocate[mir.MirOperand](ctx.alloc, mi.operands, mi.operand_count::usize);
@@ -1176,90 +1220,207 @@ fun maybe_reverse_hint(ctx: *AllocCtx, mi: *mir.MirInstr, pos: u32, nv: u32) {
     ctx.hints[sv].dst_copy_pos = p;
 }
 
-fun extend_liveness(ctx: *AllocCtx) R.Result[R.Void, str] {
+val LIVE_NIL: usize = (~0u64)::usize;
+
+rec LiveReference {
+    block: u32;
+    next: usize;
+    defines: bool;
+}
+
+rec LivePredecessor {
+    block: u32;
+    next: usize;
+}
+
+fun add_live_reference(refs: *vector.Vector[LiveReference], heads: *usize,
+                       reg: u32, block: u32, defines: bool) R.Result[R.Void, str] {
+    val next: usize = refs.len;
+    val added: R.Result[usize, str] = vector.push[LiveReference](refs,
+        LiveReference{block: block, next: heads[reg], defines: defines});
+    if (R.is_err[usize, str](added)) { ret R.err[R.Void, str](R.unwrap_err[usize, str](added)); }
+    heads[reg] = next;
+    ret R.ok_void[str]();
+}
+
+fun add_live_predecessor(edges: *vector.Vector[LivePredecessor], heads: *usize,
+                         predecessor: u32, successor: u32) R.Result[R.Void, str] {
+    val next: usize = edges.len;
+    val added: R.Result[usize, str] = vector.push[LivePredecessor](edges,
+        LivePredecessor{block: predecessor, next: heads[successor]});
+    if (R.is_err[usize, str](added)) { ret R.err[R.Void, str](R.unwrap_err[usize, str](added)); }
+    heads[successor] = next;
+    ret R.ok_void[str]();
+}
+
+fun collect_live_references(ctx: *AllocCtx, refs: *vector.Vector[LiveReference],
+                            heads: *usize, last_def: *u32) R.Result[R.Void, str] {
     val f: *mir.MirFunction = ctx.f;
-    val nb: u32 = f.block_count;
-    val nv: u32 = f.vreg_count;
-    if (nb == 0 || nv == 0) { ret R.ok_void[str](); }
-
-    val total: usize = (nb::usize) * (nv::usize);
-    val use_set: R.Result[*bool, str] = A.allocate[bool](ctx.alloc, total);
-    if (R.is_err[*bool, str](use_set)) { ret R.err[R.Void, str](R.unwrap_err[*bool, str](use_set)); }
-    val uses: *bool = R.unwrap_ok[*bool, str](use_set);
-    val def_set: R.Result[*bool, str] = A.allocate[bool](ctx.alloc, total);
-    if (R.is_err[*bool, str](def_set)) { A.deallocate[bool](ctx.alloc, uses, total); ret R.err[R.Void, str](R.unwrap_err[*bool, str](def_set)); }
-    val defs: *bool = R.unwrap_ok[*bool, str](def_set);
-    val in_set: R.Result[*bool, str] = A.allocate[bool](ctx.alloc, total);
-    if (R.is_err[*bool, str](in_set)) {
-        A.deallocate[bool](ctx.alloc, uses, total);
-        A.deallocate[bool](ctx.alloc, defs, total);
-        ret R.err[R.Void, str](R.unwrap_err[*bool, str](in_set));
-    }
-    val live_in: *bool = R.unwrap_ok[*bool, str](in_set);
-    val out_set: R.Result[*bool, str] = A.allocate[bool](ctx.alloc, total);
-    if (R.is_err[*bool, str](out_set)) {
-        A.deallocate[bool](ctx.alloc, uses, total);
-        A.deallocate[bool](ctx.alloc, defs, total);
-        A.deallocate[bool](ctx.alloc, live_in, total);
-        ret R.err[R.Void, str](R.unwrap_err[*bool, str](out_set));
-    }
-    val live_out: *bool = R.unwrap_ok[*bool, str](out_set);
-
-    var z: usize = 0;
-    for (z < total) {
-        uses[z] = false;
-        defs[z] = false;
-        live_in[z] = false;
-        live_out[z] = false;
-        z = z + 1;
-    }
-
-    compute_use_def(ctx, uses, defs, nv);
-
-    var changed: bool = true;
-    for (changed) {
-        changed = false;
-        var ri: i64 = nb::i64 - 1;
-        for (ri >= 0) {
-            val b: u32 = ri::u32;
-            val base: usize = (b::usize) * (nv::usize);
-
-            var v: u32 = 0;
-            for (v < nv) { live_out[base + v::usize] = false; v = v + 1; }
-            union_succ_live_in(ctx, b, live_out, live_in, nv);
-
-            v = 0;
-            for (v < nv) {
-                val idx: usize = base + v::usize;
-                var new_in: bool = uses[idx];
-                if (live_out[idx] && !defs[idx]) { new_in = true; }
-                if (new_in && !live_in[idx]) {
-                    live_in[idx] = true;
-                    changed = true;
-                }
-                v = v + 1;
-            }
-            ri = ri - 1;
-        }
-    }
-
     var bi: u32 = 0;
-    for (bi < nb) {
-        val span: BlockSpan = ctx.block_spans[bi];
-        val base: usize = (bi::usize) * (nv::usize);
-        var v: u32 = 0;
-        for (v < nv) {
-            val idx: usize = base + v::usize;
-            extend_range_for_block(?ctx.ranges[v], span, live_in[idx], live_out[idx]);
-            v = v + 1;
+    for (bi < f.block_count) {
+        val block: *mir.MirBlock = ?f.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < block.instr_count) {
+            val mi: *mir.MirInstr = ?block.instrs[ii];
+            val defines: bool = instr_defines(mi);
+            var k: u32 = 0;
+            for (k < mi.operand_count) {
+                val op: *mir.MirOperand = ?mi.operands[k];
+                var reg: u32 = mir.MIR_VREG_NIL;
+                if (op.kind == mir.MIR_OP_VREG || op.kind == mir.MIR_OP_MEM) { reg = op.vreg; }
+                val destination: bool = defines && k == 0 && op.kind == mir.MIR_OP_VREG;
+                if (!destination && reg < f.vreg_count && last_def[reg] != bi) {
+                    val added: R.Result[R.Void, str] = add_live_reference(refs, heads, reg, bi, false);
+                    if (R.is_err[R.Void, str](added)) { ret added; }
+                }
+                if (op.kind == mir.MIR_OP_MEM && !op.index_is_preg && op.index < f.vreg_count
+                    && last_def[op.index] != bi) {
+                    val added: R.Result[R.Void, str] = add_live_reference(refs, heads, op.index, bi, false);
+                    if (R.is_err[R.Void, str](added)) { ret added; }
+                }
+                k = k + 1;
+            }
+            if (defines) {
+                val reg: u32 = mi.operands[0].vreg;
+                if (reg < f.vreg_count && last_def[reg] != bi) {
+                    val added: R.Result[R.Void, str] = add_live_reference(refs, heads, reg, bi, true);
+                    if (R.is_err[R.Void, str](added)) { ret added; }
+                    last_def[reg] = bi;
+                }
+            }
+            ii = ii + 1;
         }
         bi = bi + 1;
     }
+    ret R.ok_void[str]();
+}
 
-    A.deallocate[bool](ctx.alloc, uses, total);
-    A.deallocate[bool](ctx.alloc, defs, total);
-    A.deallocate[bool](ctx.alloc, live_in, total);
-    A.deallocate[bool](ctx.alloc, live_out, total);
+fun collect_live_predecessors(ctx: *AllocCtx, edges: *vector.Vector[LivePredecessor],
+                              heads: *usize) R.Result[R.Void, str] {
+    var bi: u32 = 0;
+    for (bi < ctx.f.block_count) {
+        val block: *mir.MirBlock = ?ctx.f.blocks[bi];
+        if (block.instr_count > 0) {
+            val term: *mir.MirInstr = ?block.instrs[block.instr_count - 1];
+            var k: u32 = 0;
+            for (k < term.operand_count) {
+                val op: *mir.MirOperand = ?term.operands[k];
+                if (op.kind == mir.MIR_OP_BLOCK) {
+                    val successor: u32 = block_index_of(ctx, op.imm::u32);
+                    if (successor != RANGE_NIL) {
+                        val added: R.Result[R.Void, str] = add_live_predecessor(edges, heads, bi, successor);
+                        if (R.is_err[R.Void, str](added)) { ret added; }
+                    }
+                }
+                k = k + 1;
+            }
+        }
+        if (bi + 1 < ctx.f.block_count && block_lists_pred(?ctx.f.blocks[bi + 1], block.id)) {
+            val added: R.Result[R.Void, str] = add_live_predecessor(edges, heads, bi, bi + 1);
+            if (R.is_err[R.Void, str](added)) { ret added; }
+        }
+        bi = bi + 1;
+    }
+    ret R.ok_void[str]();
+}
+
+fun extend_liveness(ctx: *AllocCtx) R.Result[R.Void, str] {
+    if (ctx.f.block_count == 0 || ctx.f.vreg_count == 0) { ret R.ok_void[str](); }
+    var backing: A.Allocator;
+    val initialized: O.Option[str] = page.make(?backing);
+    if (O.is_some[str](initialized)) { ret R.err[R.Void, str](O.unwrap[str](initialized)); }
+    ret extend_liveness_with_backing(ctx, ?backing);
+}
+
+fun extend_liveness_with_backing(ctx: *AllocCtx, backing: *A.Allocator) R.Result[R.Void, str] {
+    var region: arena.Arena;
+    val initialized: O.Option[str] = arena.init(?region, backing, 0);
+    if (O.is_some[str](initialized)) { ret R.err[R.Void, str](O.unwrap[str](initialized)); }
+    fin { arena.dnit(?region); }
+    var alloc: A.Allocator;
+    val bound: O.Option[str] = arena.make(?alloc, ?region);
+    if (O.is_some[str](bound)) { ret R.err[R.Void, str](O.unwrap[str](bound)); }
+    ret extend_liveness_in(ctx, ?alloc);
+}
+
+# scratch grows with registers, blocks, operand references and control-flow edges
+fun extend_liveness_in(ctx: *AllocCtx, alloc: *A.Allocator) R.Result[R.Void, str] {
+    val nb: u32 = ctx.f.block_count;
+    val nv: u32 = ctx.f.vreg_count;
+    if (nb == 0 || nv == 0) { ret R.ok_void[str](); }
+    val heads_r: R.Result[*usize, str] = A.allocate[usize](alloc, nv::usize);
+    if (R.is_err[*usize, str](heads_r)) { ret R.err[R.Void, str](R.unwrap_err[*usize, str](heads_r)); }
+    val heads: *usize = R.unwrap_ok[*usize, str](heads_r);
+    fin { A.deallocate[usize](alloc, heads, nv::usize); }
+    val last_def_r: R.Result[*u32, str] = A.allocate[u32](alloc, nv::usize);
+    if (R.is_err[*u32, str](last_def_r)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](last_def_r)); }
+    val last_def: *u32 = R.unwrap_ok[*u32, str](last_def_r);
+    fin { A.deallocate[u32](alloc, last_def, nv::usize); }
+    val preds_r: R.Result[*usize, str] = A.allocate[usize](alloc, nb::usize);
+    if (R.is_err[*usize, str](preds_r)) { ret R.err[R.Void, str](R.unwrap_err[*usize, str](preds_r)); }
+    val preds: *usize = R.unwrap_ok[*usize, str](preds_r);
+    fin { A.deallocate[usize](alloc, preds, nb::usize); }
+    val definitions_r: R.Result[*u32, str] = A.allocate[u32](alloc, nb::usize);
+    if (R.is_err[*u32, str](definitions_r)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](definitions_r)); }
+    val definitions: *u32 = R.unwrap_ok[*u32, str](definitions_r);
+    fin { A.deallocate[u32](alloc, definitions, nb::usize); }
+    val visited_r: R.Result[*u32, str] = A.allocate[u32](alloc, nb::usize);
+    if (R.is_err[*u32, str](visited_r)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](visited_r)); }
+    val visited: *u32 = R.unwrap_ok[*u32, str](visited_r);
+    fin { A.deallocate[u32](alloc, visited, nb::usize); }
+    val pending_r: R.Result[*u32, str] = A.allocate[u32](alloc, nb::usize);
+    if (R.is_err[*u32, str](pending_r)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](pending_r)); }
+    val pending: *u32 = R.unwrap_ok[*u32, str](pending_r);
+    fin { A.deallocate[u32](alloc, pending, nb::usize); }
+    var i: u32 = 0;
+    for (i < nv) { heads[i] = LIVE_NIL; last_def[i] = RANGE_NIL; i = i + 1; }
+    i = 0;
+    for (i < nb) { preds[i] = LIVE_NIL; definitions[i] = RANGE_NIL; visited[i] = RANGE_NIL; i = i + 1; }
+    var refs: vector.Vector[LiveReference] = vector.init[LiveReference](alloc);
+    var edges: vector.Vector[LivePredecessor] = vector.init[LivePredecessor](alloc);
+    fin { vector.dnit[LiveReference](?refs); vector.dnit[LivePredecessor](?edges); }
+    val collected: R.Result[R.Void, str] = collect_live_references(ctx, ?refs, heads, last_def);
+    if (R.is_err[R.Void, str](collected)) { ret collected; }
+    val linked: R.Result[R.Void, str] = collect_live_predecessors(ctx, ?edges, preds);
+    if (R.is_err[R.Void, str](linked)) { ret linked; }
+    var reg: u32 = 0;
+    for (reg < nv) {
+        var reference: usize = heads[reg];
+        for (reference != LIVE_NIL) {
+            val ref: LiveReference = refs.data[reference];
+            if (ref.defines) { definitions[ref.block] = reg; }
+            reference = ref.next;
+        }
+        var count: u32 = 0;
+        reference = heads[reg];
+        for (reference != LIVE_NIL) {
+            val ref: LiveReference = refs.data[reference];
+            if (!ref.defines && visited[ref.block] != reg) {
+                visited[ref.block] = reg;
+                pending[count] = ref.block;
+                count = count + 1;
+                extend_range_for_block(?ctx.ranges[reg], ctx.block_spans[ref.block], true, false);
+            }
+            reference = ref.next;
+        }
+        for (count > 0) {
+            count = count - 1;
+            val block: u32 = pending[count];
+            var edge: usize = preds[block];
+            for (edge != LIVE_NIL) {
+                val pred: LivePredecessor = edges.data[edge];
+                extend_range_for_block(?ctx.ranges[reg], ctx.block_spans[pred.block], false, true);
+                if (definitions[pred.block] != reg && visited[pred.block] != reg) {
+                    visited[pred.block] = reg;
+                    pending[count] = pred.block;
+                    count = count + 1;
+                    extend_range_for_block(?ctx.ranges[reg], ctx.block_spans[pred.block], true, false);
+                }
+                edge = pred.next;
+            }
+        }
+        reg = reg + 1;
+    }
     ret R.ok_void[str]();
 }
 
@@ -1289,74 +1450,9 @@ fun build_block_spans(ctx: *AllocCtx) R.Result[R.Void, str] {
     ret R.ok_void[str]();
 }
 
-fun compute_use_def(ctx: *AllocCtx, uses: *bool, defs: *bool, nv: u32) {
-    val f: *mir.MirFunction = ctx.f;
-    var bi: u32 = 0;
-    for (bi < f.block_count) {
-        val blk: *mir.MirBlock = ?f.blocks[bi];
-        val base: usize = (bi::usize) * (nv::usize);
-        var ii: u32 = 0;
-        for (ii < blk.instr_count) {
-            val mi: *mir.MirInstr = ?blk.instrs[ii];
-            val has_def: bool = instr_defines(mi);
-
-            var k: u32 = 0;
-            for (k < mi.operand_count) {
-                val op: *mir.MirOperand = ?mi.operands[k];
-                var v: u32 = mir.MIR_VREG_NIL;
-                if (op.kind == mir.MIR_OP_VREG)                               { v = op.vreg; }
-                if (op.kind == mir.MIR_OP_MEM && op.vreg != mir.MIR_VREG_NIL) { v = op.vreg; }
-                if (v != mir.MIR_VREG_NIL && v < nv) {
-                    val is_dst: bool = has_def && k == 0 && op.kind == mir.MIR_OP_VREG;
-                    if (!is_dst) {
-                        if (!defs[base + v::usize]) { uses[base + v::usize] = true; }
-                    }
-                }
-                if (op.kind == mir.MIR_OP_MEM && !op.index_is_preg && op.index != mir.MIR_VREG_NIL && op.index < nv) {
-                    if (!defs[base + op.index::usize]) { uses[base + op.index::usize] = true; }
-                }
-                k = k + 1;
-            }
-            if (has_def) {
-                val d: *mir.MirOperand = ?mi.operands[0];
-                if (d.kind == mir.MIR_OP_VREG && d.vreg < nv) {
-                    defs[base + d.vreg::usize] = true;
-                }
-            }
-            ii = ii + 1;
-        }
-        bi = bi + 1;
-    }
-}
-
 fun instr_defines(mi: *mir.MirInstr) bool {
     if (!mir.instr_defines_shape(mi)) { ret false; }
     ret mi.operands[0].kind == mir.MIR_OP_VREG;
-}
-
-fun union_succ_live_in(ctx: *AllocCtx, b: u32, live_out: *bool, live_in: *bool, nv: u32) {
-    val f: *mir.MirFunction = ctx.f;
-    val blk: *mir.MirBlock = ?f.blocks[b];
-    val ob: usize = (b::usize) * (nv::usize);
-
-    if (blk.instr_count > 0) {
-        val term: *mir.MirInstr = ?blk.instrs[blk.instr_count - 1];
-        var k: u32 = 0;
-        for (k < term.operand_count) {
-            val op: *mir.MirOperand = ?term.operands[k];
-            if (op.kind == mir.MIR_OP_BLOCK) {
-                val si: u32 = block_index_of(ctx, op.imm::u32);
-                if (si != RANGE_NIL) {
-                    or_row(live_out, ob, live_in, (si::usize) * (nv::usize), nv);
-                }
-            }
-            k = k + 1;
-        }
-    }
-
-    if (b + 1 < f.block_count && block_lists_pred(?f.blocks[b + 1], blk.id)) {
-        or_row(live_out, ob, live_in, ((b + 1)::usize) * (nv::usize), nv);
-    }
 }
 
 fun block_lists_pred(blk: *mir.MirBlock, pred_id: u32) bool {
@@ -1366,14 +1462,6 @@ fun block_lists_pred(blk: *mir.MirBlock, pred_id: u32) bool {
         i = i + 1;
     }
     ret false;
-}
-
-fun or_row(dst: *bool, dbase: usize, src: *bool, sbase: usize, nv: u32) {
-    var v: u32 = 0;
-    for (v < nv) {
-        if (src[sbase + v::usize]) { dst[dbase + v::usize] = true; }
-        v = v + 1;
-    }
 }
 
 fun mark_call_crossing(ctx: *AllocCtx) R.Result[R.Void, str] {
@@ -2310,6 +2398,12 @@ fun special_gp_register(tgt: *target.Target, rid: i32) bool {
     ret false;
 }
 
+fun operand_bank_matches(op: *mir.MirOperand) bool {
+    val class: i32 = isa.regid_class(op.preg::i32);
+    ret (op.required_bank == mir.BANK_GP && class == isa.REG_CLASS_ID_GP)
+        || (op.required_bank == mir.BANK_FP && class == isa.REG_CLASS_ID_XMM);
+}
+
 fun verify_rewritten_operands(tgt: *target.Target, f: *mir.MirFunction) R.Result[R.Void, str] {
     var bi: u32 = 0;
     for (bi < f.block_count) {
@@ -2326,12 +2420,17 @@ fun verify_rewritten_operands(tgt: *target.Target, f: *mir.MirFunction) R.Result
                 if (op.kind == mir.MIR_OP_PREG && !rewritten_preg_ok(tgt, op.preg)) {
                     ret R.err[R.Void, str]("regalloc: a rewritten operand names a physical register outside every register class");
                 }
+                if (op.kind == mir.MIR_OP_PREG && !operand_bank_matches(op)) {
+                    ret R.err[R.Void, str]("regalloc: a rewritten register operand violates its selected bank constraint");
+                }
                 if (op.kind == mir.MIR_OP_MEM) {
-                    if (op.vreg == mir.MIR_VREG_NIL && !rewritten_preg_ok(tgt, op.preg)) {
-                        ret R.err[R.Void, str]("regalloc: a rewritten memory base names a physical register outside every register class");
+                    if (op.vreg == mir.MIR_VREG_NIL
+                        && (!rewritten_preg_ok(tgt, op.preg) || isa.regid_class(op.preg::i32) != isa.REG_CLASS_ID_GP)) {
+                        ret R.err[R.Void, str]("regalloc: a rewritten memory base is not a valid general-bank register");
                     }
-                    if (op.index != mir.MIR_VREG_NIL && op.index_is_preg && !rewritten_preg_ok(tgt, op.index)) {
-                        ret R.err[R.Void, str]("regalloc: a rewritten memory index names a physical register outside every register class");
+                    if (op.index != mir.MIR_VREG_NIL && op.index_is_preg
+                        && (!rewritten_preg_ok(tgt, op.index) || isa.regid_class(op.index::i32) != isa.REG_CLASS_ID_GP)) {
+                        ret R.err[R.Void, str]("regalloc: a rewritten memory index is not a valid general-bank register");
                     }
                 }
                 k = k + 1;
@@ -2419,6 +2518,10 @@ fun drop_self_copies_physical(tgt: *target.Target, ctx: *AllocCtx) {
                 val a: *mir.MirOperand = ?mi.operands[0];
                 val b: *mir.MirOperand = ?mi.operands[1];
                 drop = a.kind == mir.MIR_OP_PREG && b.kind == mir.MIR_OP_PREG && a.preg == b.preg;
+            }
+            if (drop && mi.security_boundary != mir.SECURITY_NONE) {
+                mi.opcode = isa.ISA_USE::mir.MirOpcode;
+                drop = false;
             }
             if (drop) {
                 if (mi.operands != nil && mi.operand_count > 0) {
@@ -2550,6 +2653,7 @@ fun rewrite_instr(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
 
     var store_dst_vreg: u32 = mir.MIR_VREG_NIL;
     var store_dst_tmp: i32 = -1;
+    var store_dst_reloaded: bool = false;
 
     var k: u32 = 0;
     for (k < n) {
@@ -2576,6 +2680,11 @@ fun rewrite_instr(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
                 if (is_fp_vreg(ctx, v) && is_spilled(ctx, v)) {
                     ops[k] = mir.op_mem_slot(v, 0);
                 } or (store_dst_tmp >= 0 && v == store_dst_vreg) {
+                    if (!store_dst_reloaded) {
+                        val er: R.Result[R.Void, str] = emit_reload(ctx, dst, wp, store_dst_tmp::u32, v, mi.loc, mi.inline_site);
+                        if (R.is_err[R.Void, str](er)) { free_ops(ctx, ops, n); ret er; }
+                        store_dst_reloaded = true;
+                    }
                     ops[k] = mir.op_preg(store_dst_tmp::u32);
                 } or (is_spilled(ctx, v)) {
                     val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, is_entry, src_pos);
@@ -2630,6 +2739,7 @@ fun rewrite_instr(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
                 }
             }
         }
+        ops[k].required_bank = mi.operands[k].required_bank;
         k = k + 1;
     }
 
@@ -2637,9 +2747,16 @@ fun rewrite_instr(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
         && mi.width >= ctx.spill_width
         && instr_is_reg_copy(tgt, mi)
         && ops[0].kind == mir.MIR_OP_PREG && ops[1].kind == mir.MIR_OP_PREG
-        && ops[0].preg == ops[1].preg) {
-        free_ops(ctx, ops, n);
-        if (mi.dbg_binding_count > 0) {
+        && ops[0].preg == ops[1].preg
+        && operand_bank_matches(?ops[0]) && operand_bank_matches(?ops[1])) {
+        if (mi.security_boundary != mir.SECURITY_NONE) {
+            dst[@wp] = mir.instr_like(mi, ops, n);
+            dst[@wp].opcode = isa.ISA_USE::mir.MirOpcode;
+            @wp = @wp + 1;
+        } or {
+            free_ops(ctx, ops, n);
+        }
+        if (mi.security_boundary == mir.SECURITY_NONE && mi.dbg_binding_count > 0) {
             dst[@wp].opcode            = isa.ISA_USE::mir.MirOpcode;
             dst[@wp].width             = mi.width;
             dst[@wp].src_width         = mi.src_width;
@@ -2718,16 +2835,21 @@ fun id_claimed(claimed: *i32, count: u32, id: i32) bool {
 }
 
 fun emit_reload(ctx: *AllocCtx, dst: *mir.MirInstr, wp: *u32, tmp: u32, v: u32, loc: source.SrcLoc, inline_site: u32) R.Result[R.Void, str] {
+    if (isa.regid_class(tmp::i32) != isa.REG_CLASS_ID_GP) {
+        ret R.err[R.Void, str]("regalloc: spill transport requires a general-bank scratch register");
+    }
     val ro: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
     if (R.is_err[*mir.MirOperand, str](ro)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](ro)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](ro);
     ops[0] = mir.op_preg(tmp);
+    ops[0].required_bank = mir.BANK_GP;
     ops[1] = mir.op_mem_slot(v, 0);
     dst[@wp].opcode        = mir.MIR_MOV;
     dst[@wp].operands      = ops;
     dst[@wp].operand_count = 2;
     dst[@wp].width         = ctx.spill_width;
     dst[@wp].src_width     = ctx.spill_width;
+    dst[@wp].security_boundary = mir.SECURITY_NONE;
     dst[@wp].loc           = loc;
     dst[@wp].inline_site   = inline_site;
     @wp = @wp + 1;
@@ -2735,16 +2857,21 @@ fun emit_reload(ctx: *AllocCtx, dst: *mir.MirInstr, wp: *u32, tmp: u32, v: u32, 
 }
 
 fun emit_store(ctx: *AllocCtx, dst: *mir.MirInstr, wp: *u32, v: u32, tmp: u32, loc: source.SrcLoc, inline_site: u32) R.Result[R.Void, str] {
+    if (isa.regid_class(tmp::i32) != isa.REG_CLASS_ID_GP) {
+        ret R.err[R.Void, str]("regalloc: spill transport requires a general-bank scratch register");
+    }
     val ro: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
     if (R.is_err[*mir.MirOperand, str](ro)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](ro)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](ro);
     ops[0] = mir.op_mem_slot(v, 0);
     ops[1] = mir.op_preg(tmp);
+    ops[1].required_bank = mir.BANK_GP;
     dst[@wp].opcode        = mir.MIR_MOV;
     dst[@wp].operands      = ops;
     dst[@wp].operand_count = 2;
     dst[@wp].width         = ctx.spill_width;
     dst[@wp].src_width     = ctx.spill_width;
+    dst[@wp].security_boundary = mir.SECURITY_NONE;
     dst[@wp].loc           = loc;
     dst[@wp].inline_site   = inline_site;
     @wp = @wp + 1;
@@ -3052,6 +3179,12 @@ test "mach.lang.be.codegen.regalloc.instr_defines:fused_cbr_shape" {
     ops[0] = mir.op_preg(7);
     if (instr_defines_preg(?fused))                  { ret 1; }
 
+    ops[0] = mir.op_vreg(3);
+    var returned: mir.MirInstr = mir.instr(mir.MIR_RET, ?ops[0], 1, 0, 0);
+    if (instr_defines(?returned) || mir.instr_defines_shape(?returned)) { ret 1; }
+    ops[0] = mir.op_preg(7);
+    if (instr_defines_preg(?returned)) { ret 1; }
+
     var cmp_ops: [3]mir.MirOperand;
     cmp_ops[0] = mir.op_vreg(5);
     cmp_ops[1] = mir.op_vreg(3);
@@ -3283,6 +3416,66 @@ test "mach.lang.be.codegen.regalloc.coalesce_copies:single_assignment_web_is_mer
     if (b.instrs[1].operands[1].vreg != 0)               { ret 1; }
     if (b.instrs[0].operands[0].vreg != 0)               { ret 1; }
 
+    ret 0;
+}
+
+fun t_selected_copy(t: *target.Target, opcode: u32, copied: bool) bool {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret false; }
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    f.blocks = ?b;
+    f.block_count = 1;
+    fin { mir.dnit_function(?alloc, ?f); }
+    t_vregs(?alloc, ?f, 2);
+    t_block(?alloc, ?b, 3);
+    t_mov(?alloc, ?b, 0, mir.op_vreg(0), mir.op_preg(10));
+    t_mov(?alloc, ?b, 1, mir.op_vreg(1), mir.op_vreg(0));
+    t_mov(?alloc, ?b, 2, mir.op_preg(11), mir.op_vreg(1));
+    var i: u32 = 0;
+    for (i < 3) {
+        b.instrs[i].width = t.model.gpr_width::u8;
+        b.instrs[i].src_width = t.model.gpr_width::u8;
+        i = i + 1;
+    }
+    b.instrs[1].opcode = opcode;
+    b.instrs[1].width = 4;
+    b.instrs[1].src_width = 4;
+    var backend: isa.BackendTarget = target_view.backend_target(t);
+    if (R.is_err[R.Void, str](t.arch.select(?alloc, ?backend, ?f))) { ret false; }
+    var selected: u32 = opcode;
+    if (copied) { selected = riscv.MOV::u32; }
+    if (b.instrs[1].opcode != selected) { ret false; }
+
+    var slots: [2]bool;
+    var ctx: AllocCtx;
+    t_ctx(?ctx, ?alloc, ?f, ?slots[0]);
+    ctx.spill_width = t.model.spill_width::u8;
+    if (R.is_err[R.Void, str](coalesce_copies(t, ?ctx))) { ret false; }
+    if (!copied) { ret b.instr_count == 3 && b.instrs[1].opcode == opcode; }
+    ret b.instr_count == 2 && b.instrs[1].operands[1].kind == mir.MIR_OP_VREG &&
+        b.instrs[1].operands[1].vreg == 0;
+}
+
+test "mach.lang.be.codegen.regalloc.coalesce_copies:rv32_guard_uses_each_selected_machine" {
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](target.register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+    val s32: R.Result[target.Target, str] = target.select(?reg, "rv32imafdc", "freestanding", "ilp32d");
+    if (R.is_err[target.Target, str](s32)) { ret 2; }
+    var rv32: target.Target = R.unwrap_ok[target.Target, str](s32);
+    val s64: R.Result[target.Target, str] = target.select(?reg, "riscv64", "linux", "lp64d");
+    if (R.is_err[target.Target, str](s64)) { ret 3; }
+    var rv64: target.Target = R.unwrap_ok[target.Target, str](s64);
+    if (rv32.model.gpr_width != 4 || rv64.model.gpr_width != 8) { ret 4; }
+    var pass: u32 = 0;
+    for (pass < 3) {
+        var current: *target.Target = ?rv32;
+        if (pass == 1) { current = ?rv64; }
+        if (!t_selected_copy(current, mir.MIR_BITCAST, pass != 1)) { ret 5; }
+        if (!t_selected_copy(current, mir.MIR_SEXT, pass != 1)) { ret 6; }
+        pass = pass + 1;
+    }
     ret 0;
 }
 
@@ -3721,6 +3914,7 @@ test "mach.lang.be.codegen.regalloc.verify_rewritten_operands:walks_the_program_
     f.blocks = ?blk[0];
     f.block_count = 1;
 
+    if (R.is_err[R.Void, str](rules.capture_operand_banks(?f, ?ins[0]))) { ret 1; }
     if (R.is_err[R.Void, str](verify_rewritten_operands(?tgt, ?f))) { ret 1; }
     ops[1] = mir.op_preg(isa.regid_make(isa.REG_CLASS_ID_GP, (gp + 40)::i32)::u32);
     if (R.is_ok[R.Void, str](verify_rewritten_operands(?tgt, ?f)))  { ret 2; }
@@ -3732,5 +3926,630 @@ test "mach.lang.be.codegen.regalloc.verify_rewritten_operands:walks_the_program_
     if (R.is_ok[R.Void, str](verify_rewritten_operands(?tgt, ?f)))  { ret 5; }
     ops[1] = mir.op_mem_preg(tgt.model.stack_ptr_reg::u32, 0);
     if (R.is_err[R.Void, str](verify_rewritten_operands(?tgt, ?f))) { ret 6; }
+    ret 0;
+}
+
+fun t_spilled_update(mode: u32) i32 {
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret 1; }
+    var scratch_arena: arena.Arena;
+    if (O.is_some[str](arena.init(?scratch_arena, ?backing, 65536))) { ret 1; }
+    fin { arena.dnit(?scratch_arena); }
+    var alloc: A.Allocator;
+    if (O.is_some[str](arena.make(?alloc, ?scratch_arena))) { ret 1; }
+    var vregs: [1]mir.MirVReg;
+    vregs[0] = mir.vreg(0, REG_CLASS_GP, false, false);
+    vregs[0].spill_slot = 0;
+    var f: mir.MirFunction;
+    f.vregs = ?vregs[0];
+    f.vreg_count = 1;
+    var scratch: [1]isa.Register;
+    scratch[0].id = 0;
+    var ctx: AllocCtx;
+    ctx.alloc = ?alloc;
+    ctx.f = ?f;
+    ctx.spill_width = 8;
+    ctx.reload_scratch = ?scratch[0];
+    ctx.reload_scratch_count = 1;
+    var tgt: target.Target;
+    val count: u32 = 3;
+    val ar: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](?alloc, count::usize);
+    if (R.is_err[*mir.MirOperand, str](ar)) { ret 1; }
+    val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](ar);
+    ops[0] = mir.op_vreg(0);
+    ops[1] = mir.op_vreg(0);
+    ops[2] = mir.op_imm(8);
+    var mi: mir.MirInstr = mir.instr(mir.MIR_SUB, ops, count, 8, 8);
+    if (mode == 1) {
+        mi.opcode = mir.MIR_ADD;
+        ops[2] = mir.op_vreg(0);
+    } or (mode == 2) {
+        ops[1] = mir.op_imm(100);
+    }
+    if (R.is_err[R.Void, str](rules.capture_operand_banks(?f, ?mi))) { ret 8; }
+    var dst: [5]mir.MirInstr;
+    var written: u32 = 0;
+    fin {
+        var i: u32 = 0;
+        for (i < written) {
+            free_ops(?ctx, dst[i].operands, dst[i].operand_count);
+            i = i + 1;
+        }
+    }
+    val wrong_scratch: u32 = isa.regid_make(isa.REG_CLASS_ID_XMM, 0)::u32;
+    if (R.is_ok[R.Void, str](emit_reload(?ctx, ?dst[0], ?written, wrong_scratch, 0, mi.loc, 0))) { free_ops(?ctx, ops, count); ret 9; }
+    if (R.is_ok[R.Void, str](emit_store(?ctx, ?dst[0], ?written, 0, wrong_scratch, mi.loc, 0))) { free_ops(?ctx, ops, count); ret 9; }
+    if (written != 0) { free_ops(?ctx, ops, count); ret 9; }
+    val rr: R.Result[R.Void, str] = rewrite_instr(?tgt, ?ctx, ?mi, ?dst[0], ?written, false, 0);
+    if (R.is_err[R.Void, str](rr)) { ret 2; }
+    var slot: i64 = 40;
+    var reg: i64 = 999;
+    var loads: u32 = 0;
+    var stores: u32 = 0;
+    var i: u32 = 0;
+    for (i < written) {
+        val ins: *mir.MirInstr = ?dst[i];
+        var oi: u32 = 0;
+        for (oi < ins.operand_count) {
+            if (ins.operands[oi].kind == mir.MIR_OP_PREG && !operand_bank_matches(?ins.operands[oi])) { ret 8; }
+            oi = oi + 1;
+        }
+        val a: *mir.MirOperand = ?ins.operands[0];
+        val b: *mir.MirOperand = ?ins.operands[1];
+        if (ins.opcode == mir.MIR_MOV) {
+            if (a.kind == mir.MIR_OP_PREG && b.kind == mir.MIR_OP_MEM && b.vreg == 0) {
+                reg = slot;
+                loads = loads + 1;
+            } or (a.kind == mir.MIR_OP_MEM && a.vreg == 0 && b.kind == mir.MIR_OP_PREG) {
+                slot = reg;
+                stores = stores + 1;
+            } or { ret 3; }
+        } or {
+            val c: *mir.MirOperand = ?ins.operands[2];
+            if (a.kind != mir.MIR_OP_PREG || a.preg != 0) { ret 3; }
+            var left: i64 = b.imm;
+            var right: i64 = c.imm;
+            if (b.kind == mir.MIR_OP_PREG) {
+                if (b.preg != a.preg) { ret 4; }
+                left = reg;
+            }
+            if (c.kind == mir.MIR_OP_PREG) {
+                if (c.preg != a.preg) { ret 4; }
+                right = reg;
+            }
+            if (ins.opcode == mir.MIR_SUB) { reg = left - right; }
+            or (ins.opcode == mir.MIR_ADD) { reg = left + right; }
+            or { ret 3; }
+        }
+        i = i + 1;
+    }
+    var expected: i64 = 32;
+    if (mode == 1) { expected = 80; }
+    or (mode == 2) { expected = 92; }
+    if (slot != expected) { ret 5; }
+    if (stores != 1) { ret 6; }
+    if (mode == 2) {
+        if (loads != 0 || written != 2) { ret 7; }
+    } or {
+        if (loads != 1 || written != 3) { ret 8; }
+    }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.regalloc.rewrite_instr:spilled_update_reloads_previous_value_once" {
+    val one: i32 = t_spilled_update(0);
+    if (one != 0) { ret one; }
+    val repeated: i32 = t_spilled_update(1);
+    if (repeated != 0) { ret 10 + repeated; }
+    val pure: i32 = t_spilled_update(2);
+    if (pure != 0) { ret 20 + pure; }
+    ret 0;
+}
+
+fun t_verify_bank_slots(tgt: *target.Target, opcode: mir.MirOpcode, bank0: mir.OperandBank,
+                       bank1: mir.OperandBank, bank2: mir.OperandBank, count: u32, vector: bool) i32 {
+    var expected: [3]mir.OperandBank;
+    expected[0] = bank0; expected[1] = bank1; expected[2] = bank2;
+    var ops: [3]mir.MirOperand;
+    var k: u32 = 0;
+    for (k < count) {
+        var class: i32 = isa.REG_CLASS_ID_GP;
+        if (expected[k] == mir.BANK_FP) { class = isa.REG_CLASS_ID_XMM; }
+        ops[k] = mir.op_preg(isa.regid_make(class, 1 + k::i32)::u32);
+        k = k + 1;
+    }
+    var mi: mir.MirInstr = mir.instr(opcode, ?ops[0], count, 8, 8);
+    if (vector) { mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, 4, 4); }
+    var blk: mir.MirBlock;
+    blk.instrs = ?mi; blk.instr_count = 1;
+    var f: mir.MirFunction;
+    f.blocks = ?blk; f.block_count = 1;
+    if (R.is_err[R.Void, str](rules.capture_operand_banks(?f, ?mi))) { ret 1; }
+    if (R.is_err[R.Void, str](verify_rewritten_operands(tgt, ?f))) { ret 2; }
+    k = 0;
+    for (k < count) {
+        val original: u32 = ops[k].preg;
+        var wrong: i32 = isa.REG_CLASS_ID_XMM;
+        if (expected[k] == mir.BANK_FP) { wrong = isa.REG_CLASS_ID_GP; }
+        ops[k].preg = isa.regid_make(wrong, 1 + k::i32)::u32;
+        if (R.is_ok[R.Void, str](verify_rewritten_operands(tgt, ?f))) { ret 3; }
+        ops[k].preg = original;
+        k = k + 1;
+    }
+    ops[0].required_bank = mir.BANK_UNKNOWN;
+    if (R.is_ok[R.Void, str](verify_rewritten_operands(tgt, ?f))) { ret 4; }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.regalloc.verify_rewritten_operands:enforces_individual_selected_banks" {
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](target.register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+    val tr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (R.is_err[target.Target, str](tr)) { ret 1; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+    if (t_verify_bank_slots(?tgt, mir.MIR_FADD, mir.BANK_FP, mir.BANK_FP, mir.BANK_FP, 3, false) != 0) { ret 2; }
+    if (t_verify_bank_slots(?tgt, mir.MIR_FCMP, mir.BANK_GP, mir.BANK_FP, mir.BANK_FP, 3, false) != 0) { ret 3; }
+    if (t_verify_bank_slots(?tgt, mir.MIR_FP_TO_SI, mir.BANK_GP, mir.BANK_FP, mir.BANK_UNKNOWN, 2, false) != 0) { ret 4; }
+    if (t_verify_bank_slots(?tgt, mir.MIR_SI_TO_FP, mir.BANK_FP, mir.BANK_GP, mir.BANK_UNKNOWN, 2, false) != 0) { ret 5; }
+    if (t_verify_bank_slots(?tgt, mir.MIR_MOV, mir.BANK_GP, mir.BANK_GP, mir.BANK_UNKNOWN, 2, false) != 0) { ret 6; }
+    if (t_verify_bank_slots(?tgt, mir.MIR_MOV, mir.BANK_FP, mir.BANK_GP, mir.BANK_UNKNOWN, 2, false) != 0) { ret 7; }
+    if (t_verify_bank_slots(?tgt, mir.MIR_MOV, mir.BANK_GP, mir.BANK_FP, mir.BANK_UNKNOWN, 2, false) != 0) { ret 8; }
+    if (t_verify_bank_slots(?tgt, mir.MIR_ADD, mir.BANK_FP, mir.BANK_FP, mir.BANK_FP, 3, true) != 0) { ret 9; }
+    var ops: [2]mir.MirOperand;
+    ops[0] = mir.op_preg(1); ops[1] = mir.op_mem_preg(tgt.model.stack_ptr_reg::u32, 0);
+    var mi: mir.MirInstr = mir.instr(mir.MIR_MOV, ?ops[0], 2, 8, 8);
+    var blk: mir.MirBlock; blk.instrs = ?mi; blk.instr_count = 1;
+    var f: mir.MirFunction; f.blocks = ?blk; f.block_count = 1;
+    if (R.is_err[R.Void, str](rules.capture_operand_banks(?f, ?mi))) { ret 10; }
+    if (R.is_err[R.Void, str](verify_rewritten_operands(?tgt, ?f))) { ret 11; }
+    ops[1].preg = isa.regid_make(isa.REG_CLASS_ID_XMM, 1)::u32;
+    if (R.is_ok[R.Void, str](verify_rewritten_operands(?tgt, ?f))) { ret 12; }
+    ops[1].preg = tgt.model.stack_ptr_reg::u32;
+    ops[1].index_is_preg = true;
+    ops[1].index = isa.regid_make(isa.REG_CLASS_ID_XMM, 1)::u32;
+    if (R.is_ok[R.Void, str](verify_rewritten_operands(?tgt, ?f))) { ret 13; }
+    if (R.is_ok[R.Void, str](alloc_function(?tgt, nil, ?f))) { ret 15; }
+    ops[1].index = 2;
+    if (R.is_err[R.Void, str](verify_rewritten_operands(?tgt, ?f))) { ret 14; }
+    ret 0;
+}
+
+# independent dense equations retained only as a small-graph test oracle
+fun t_dense_liveness(ctx: *AllocCtx) R.Result[R.Void, str] {
+    val f: *mir.MirFunction = ctx.f;
+    val nb: u32 = f.block_count;
+    val nv: u32 = f.vreg_count;
+    if (nb == 0 || nv == 0) { ret R.ok_void[str](); }
+
+    val total: usize = (nb::usize) * (nv::usize);
+    val use_set: R.Result[*bool, str] = A.allocate[bool](ctx.alloc, total);
+    if (R.is_err[*bool, str](use_set)) { ret R.err[R.Void, str](R.unwrap_err[*bool, str](use_set)); }
+    val uses: *bool = R.unwrap_ok[*bool, str](use_set);
+    val def_set: R.Result[*bool, str] = A.allocate[bool](ctx.alloc, total);
+    if (R.is_err[*bool, str](def_set)) { A.deallocate[bool](ctx.alloc, uses, total); ret R.err[R.Void, str](R.unwrap_err[*bool, str](def_set)); }
+    val defs: *bool = R.unwrap_ok[*bool, str](def_set);
+    val in_set: R.Result[*bool, str] = A.allocate[bool](ctx.alloc, total);
+    if (R.is_err[*bool, str](in_set)) {
+        A.deallocate[bool](ctx.alloc, uses, total);
+        A.deallocate[bool](ctx.alloc, defs, total);
+        ret R.err[R.Void, str](R.unwrap_err[*bool, str](in_set));
+    }
+    val live_in: *bool = R.unwrap_ok[*bool, str](in_set);
+    val out_set: R.Result[*bool, str] = A.allocate[bool](ctx.alloc, total);
+    if (R.is_err[*bool, str](out_set)) {
+        A.deallocate[bool](ctx.alloc, uses, total);
+        A.deallocate[bool](ctx.alloc, defs, total);
+        A.deallocate[bool](ctx.alloc, live_in, total);
+        ret R.err[R.Void, str](R.unwrap_err[*bool, str](out_set));
+    }
+    val live_out: *bool = R.unwrap_ok[*bool, str](out_set);
+
+    var z: usize = 0;
+    for (z < total) {
+        uses[z] = false;
+        defs[z] = false;
+        live_in[z] = false;
+        live_out[z] = false;
+        z = z + 1;
+    }
+
+    t_dense_use_def(ctx, uses, defs, nv);
+
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var ri: i64 = nb::i64 - 1;
+        for (ri >= 0) {
+            val b: u32 = ri::u32;
+            val base: usize = (b::usize) * (nv::usize);
+
+            var v: u32 = 0;
+            for (v < nv) { live_out[base + v::usize] = false; v = v + 1; }
+            t_dense_successors(ctx, b, live_out, live_in, nv);
+
+            v = 0;
+            for (v < nv) {
+                val idx: usize = base + v::usize;
+                var new_in: bool = uses[idx];
+                if (live_out[idx] && !defs[idx]) { new_in = true; }
+                if (new_in && !live_in[idx]) {
+                    live_in[idx] = true;
+                    changed = true;
+                }
+                v = v + 1;
+            }
+            ri = ri - 1;
+        }
+    }
+
+    var bi: u32 = 0;
+    for (bi < nb) {
+        val span: BlockSpan = ctx.block_spans[bi];
+        val base: usize = (bi::usize) * (nv::usize);
+        var v: u32 = 0;
+        for (v < nv) {
+            val idx: usize = base + v::usize;
+            extend_range_for_block(?ctx.ranges[v], span, live_in[idx], live_out[idx]);
+            v = v + 1;
+        }
+        bi = bi + 1;
+    }
+
+    A.deallocate[bool](ctx.alloc, uses, total);
+    A.deallocate[bool](ctx.alloc, defs, total);
+    A.deallocate[bool](ctx.alloc, live_in, total);
+    A.deallocate[bool](ctx.alloc, live_out, total);
+    ret R.ok_void[str]();
+}
+
+fun t_dense_use_def(ctx: *AllocCtx, uses: *bool, defs: *bool, nv: u32) {
+    val f: *mir.MirFunction = ctx.f;
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        val base: usize = (bi::usize) * (nv::usize);
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            val has_def: bool = instr_defines(mi);
+
+            var k: u32 = 0;
+            for (k < mi.operand_count) {
+                val op: *mir.MirOperand = ?mi.operands[k];
+                var v: u32 = mir.MIR_VREG_NIL;
+                if (op.kind == mir.MIR_OP_VREG)                               { v = op.vreg; }
+                if (op.kind == mir.MIR_OP_MEM && op.vreg != mir.MIR_VREG_NIL) { v = op.vreg; }
+                if (v != mir.MIR_VREG_NIL && v < nv) {
+                    val is_dst: bool = has_def && k == 0 && op.kind == mir.MIR_OP_VREG;
+                    if (!is_dst) {
+                        if (!defs[base + v::usize]) { uses[base + v::usize] = true; }
+                    }
+                }
+                if (op.kind == mir.MIR_OP_MEM && !op.index_is_preg && op.index != mir.MIR_VREG_NIL && op.index < nv) {
+                    if (!defs[base + op.index::usize]) { uses[base + op.index::usize] = true; }
+                }
+                k = k + 1;
+            }
+            if (has_def) {
+                val d: *mir.MirOperand = ?mi.operands[0];
+                if (d.kind == mir.MIR_OP_VREG && d.vreg < nv) {
+                    defs[base + d.vreg::usize] = true;
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+}
+
+fun t_dense_successors(ctx: *AllocCtx, b: u32, live_out: *bool, live_in: *bool, nv: u32) {
+    val f: *mir.MirFunction = ctx.f;
+    val blk: *mir.MirBlock = ?f.blocks[b];
+    val ob: usize = (b::usize) * (nv::usize);
+
+    if (blk.instr_count > 0) {
+        val term: *mir.MirInstr = ?blk.instrs[blk.instr_count - 1];
+        var k: u32 = 0;
+        for (k < term.operand_count) {
+            val op: *mir.MirOperand = ?term.operands[k];
+            if (op.kind == mir.MIR_OP_BLOCK) {
+                val si: u32 = block_index_of(ctx, op.imm::u32);
+                if (si != RANGE_NIL) {
+                    t_dense_or_row(live_out, ob, live_in, (si::usize) * (nv::usize), nv);
+                }
+            }
+            k = k + 1;
+        }
+    }
+
+    if (b + 1 < f.block_count && block_lists_pred(?f.blocks[b + 1], blk.id)) {
+        t_dense_or_row(live_out, ob, live_in, ((b + 1)::usize) * (nv::usize), nv);
+    }
+}
+
+fun t_dense_or_row(dst: *bool, dbase: usize, src: *bool, sbase: usize, nv: u32) {
+    var v: u32 = 0;
+    for (v < nv) {
+        if (src[sbase + v::usize]) { dst[dbase + v::usize] = true; }
+        v = v + 1;
+    }
+}
+
+
+fun t_sparse_liveness_case(sample: u32, ordinal: usize, own_scratch: bool, attempts: *usize) i32 {
+    var track: T.Testing;
+    if (O.is_some[str](T.make(?track))) { ret 1; }
+    fin { T.dnit(?track); }
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 2; }
+    var blocks: [8]mir.MirBlock;
+    var instrs: [8][4]mir.MirInstr;
+    var operands: [8][4][3]mir.MirOperand;
+    var preds: [8]u32;
+    var spans: [8]BlockSpan;
+    var block_map: [64]u32;
+    var sparse: [8]LiveRange;
+    var dense: [8]LiveRange;
+    var bi: u32 = 0;
+    for (bi < 64) { block_map[bi] = RANGE_NIL; bi = bi + 1; }
+    bi = 0;
+    for (bi < 8) {
+        val bid: u32 = 40 - bi * 3;
+        blocks[bi].id = bid;
+        block_map[bid] = bi;
+        blocks[bi].instrs = ?instrs[bi][0];
+        blocks[bi].instr_count = 4;
+        if (bi > 0 && ((sample + bi) & 1) == 0) {
+            preds[bi] = 40 - (bi - 1) * 3;
+            blocks[bi].preds = ?preds[bi];
+            blocks[bi].pred_count = 1;
+        }
+        var definition: u32 = 0;
+        var use_index: u32 = 1;
+        if ((sample & 2) != 0) { definition = 1; use_index = 0; }
+        operands[bi][definition][0] = mir.op_vreg(bi);
+        operands[bi][definition][1] = mir.op_preg(0);
+        instrs[bi][definition] = mir.instr(mir.MIR_MOV, ?operands[bi][definition][0], 2, 8, 8);
+        operands[bi][use_index][0] = mir.op_preg(0);
+        operands[bi][use_index][1] = mir.op_vreg((bi + sample) % 8);
+        instrs[bi][use_index] = mir.instr(mir.MIR_MOV, ?operands[bi][use_index][0], 2, 8, 8);
+        var destination: u32 = (bi + 1) % 8;
+        if ((sample & 4) != 0) { destination = bi; }
+        if ((sample & 3) == 3) { destination = (bi + 2) % 8; }
+        operands[bi][2][0] = mir.op_vreg(destination);
+        operands[bi][2][1] = mir.op_mem_value((bi + 2) % 8, 0);
+        operands[bi][2][1].index = (bi + 3) % 8;
+        operands[bi][2][1].index_is_preg = (sample & 1) != 0;
+        instrs[bi][2] = mir.instr(mir.MIR_LOAD, ?operands[bi][2][0], 2, 8, 8);
+        operands[bi][3][0] = mir.op_vreg((bi + 4) % 8);
+        operands[bi][3][1] = mir.op_block(40 - ((bi + 1) % 8) * 3);
+        operands[bi][3][2] = mir.op_block(40 - ((bi + sample + 6) % 8) * 3);
+        instrs[bi][3] = mir.instr(mir.MIR_CBR, ?operands[bi][3][0], 3, 8, 8);
+        spans[bi] = BlockSpan{start: (bi * 4)::i64, end: (bi * 4 + 3)::i64};
+        if (bi == 5 && (sample & 8) != 0) {
+            blocks[bi].instr_count = 0;
+            spans[bi] = BlockSpan{start: -1, end: -1};
+        }
+        sparse[bi] = LiveRange{vreg: bi, start: POS_MAX, end_pos: -1};
+        dense[bi] = sparse[bi];
+        bi = bi + 1;
+    }
+    var f: mir.MirFunction = mir.MirFunction{blocks: ?blocks[0], block_count: 8, vreg_count: 8};
+    var ctx: AllocCtx = AllocCtx{alloc: T.allocator_of(?track), f: ?f,
+        block_spans: ?spans[0], block_id_index: ?block_map[0], block_id_index_cap: 64,
+        ranges: ?sparse[0]};
+    T.fail_at_ordinal(?track, ordinal);
+    var result: R.Result[R.Void, str];
+    if (own_scratch) { result = extend_liveness_with_backing(?ctx, T.allocator_of(?track)); }
+    or { result = extend_liveness_in(?ctx, T.allocator_of(?track)); }
+    @attempts = T.attempt_count(?track);
+    if (T.leaked(?track) || T.double_free_count(?track) != 0 || T.tracking_exhausted(?track)) { ret 3; }
+    if (ordinal != 0) {
+        if (R.is_ok[R.Void, str](result)) { ret 4; }
+        bi = 0;
+        for (bi < 8) {
+            if (sparse[bi].start != POS_MAX || sparse[bi].end_pos != -1) { ret 5; }
+            bi = bi + 1;
+        }
+        ret 0;
+    }
+    if (R.is_err[R.Void, str](result)) { ret 6; }
+    ctx.alloc = ?alloc;
+    ctx.ranges = ?dense[0];
+    if (R.is_err[R.Void, str](t_dense_liveness(?ctx))) { ret 7; }
+    bi = 0;
+    for (bi < 8) {
+        if (sparse[bi].start != dense[bi].start || sparse[bi].end_pos != dense[bi].end_pos) { ret 8; }
+        bi = bi + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.regalloc.extend_liveness:sparse_matches_dense_loops_definitions_and_memory_uses" {
+    var sample: u32 = 0;
+    for (sample < 16) {
+        var attempts: usize = 0;
+        val result: i32 = t_sparse_liveness_case(sample, 0, true, ?attempts);
+        if (result != 0) { ret result; }
+        sample = sample + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.regalloc.extend_liveness:allocation_failure_preserves_ranges_and_releases_scratch" {
+    var mode: u32 = 0;
+    for (mode < 2) {
+        var attempts: usize = 0;
+        val baseline: i32 = t_sparse_liveness_case(9, 0, mode != 0, ?attempts);
+        if (baseline != 0 || attempts == 0) { ret 1; }
+        var ordinal: usize = 1;
+        for (ordinal <= attempts) {
+            var refused_attempts: usize = 0;
+            val result: i32 = t_sparse_liveness_case(9, ordinal, mode != 0, ?refused_attempts);
+            if (result != 0) { ret result; }
+            ordinal = ordinal + 1;
+        }
+        mode = mode + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.regalloc:unknown_catalog_inputs_never_use_the_fp_or_nonregister_defaults" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var interner: intern.Interner = intern.init(?alloc);
+    fin { intern.dnit(?interner); }
+    var registry: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?registry); }
+    if (R.is_err[R.Void, str](target.register_all(?registry, target_testing.debug_descriptor))) { ret 2; }
+    val selected: R.Result[target.Target, str] = target.select(?registry, "x86_64", "linux", "sysv64");
+    if (R.is_err[target.Target, str](selected)) { ret 3; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](selected);
+    var reg: mir.MirVReg = mir.vreg(0, REG_CLASS_GP, false, false);
+    var function: mir.MirFunction = mir.MirFunction{vregs: ?reg, vreg_count: 1};
+    var module: mir.MirModule = mir.MirModule{alloc: ?alloc, interner: ?interner, functions: ?function, function_len: 1};
+    if (R.is_err[R.Void, str](run(?tgt, ?module))) { ret 4; }
+    reg.class = fp_class_index(?tgt);
+    if (R.is_err[R.Void, str](run(?tgt, ?module))) { ret 5; }
+    reg.class = 200;
+    val unknown: R.Result[R.Void, str] = run(?tgt, ?module);
+    if (R.is_ok[R.Void, str](unknown) || !str_contains(R.unwrap_err[R.Void, str](unknown), "unknown MirRegisterClass tag 200")) { ret 6; }
+    reg.class = 2;
+    if (tgt.model.reg_classes[reg.class].kind != isa.RC_FLAGS) { ret 7; }
+    val unsupported: R.Result[R.Void, str] = run(?tgt, ?module);
+    if (R.is_ok[R.Void, str](unsupported) || !str_contains(R.unwrap_err[R.Void, str](unsupported), "unsupported for MIR virtual registers")) { ret 8; }
+    var classes: [3]isa.RegClass;
+    var ci: u32 = 0;
+    for (ci < 3) { classes[ci] = tgt.model.reg_classes[ci]; ci = ci + 1; }
+    tgt.model.reg_classes = ?classes[0];
+    val float_class: isa.RegClass = classes[1];
+    classes[1] = classes[2];
+    classes[2] = float_class;
+    reg.class = 2;
+    if (fp_class_index(?tgt) != reg.class || R.is_err[R.Void, str](run(?tgt, ?module))) { ret 12; }
+    classes[1].kind = 200;
+    function.vreg_count = 0;
+    val bad_kind: R.Result[R.Void, str] = run(?tgt, ?module);
+    if (R.is_ok[R.Void, str](bad_kind) || !str_contains(R.unwrap_err[R.Void, str](bad_kind), "unknown RegClassKind tag 200")) { ret 9; }
+    classes[1].kind = isa.RC_FLAGS;
+    var operand: mir.MirOperand = mir.op_imm(7);
+    var instruction: mir.MirInstr = mir.instr(mir.MIR_RET, ?operand, 1, 8, 8);
+    var block: mir.MirBlock = mir.MirBlock{instrs: ?instruction, instr_count: 1};
+    function.blocks = ?block;
+    function.block_count = 1;
+    operand.kind = 200;
+    val bad_operand: R.Result[R.Void, str] = run(?tgt, ?module);
+    if (R.is_ok[R.Void, str](bad_operand) || !str_contains(R.unwrap_err[R.Void, str](bad_operand), "unknown MirOperandKind tag 200")) { ret 10; }
+    ret 0;
+}
+
+fun t_declassification_rewrite(t: *target.Target, mode: u32) i32 {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    f.blocks = ?b; f.block_count = 1;
+    fin { mir.dnit_function(?alloc, ?f); }
+    t_vregs(?alloc, ?f, 2);
+    t_block(?alloc, ?b, 1);
+    t_mov(?alloc, ?b, 0, mir.op_vreg(0), mir.op_vreg(1));
+    b.instrs[0] = mir.instr(mir.MIR_DECLASSIFY, b.instrs[0].operands, 2, 8, 8);
+    f.vregs[0].assigned = 3;
+    f.vregs[1].assigned = 3;
+    f.vregs[1].secret = true;
+    if (mode == 1) { f.vregs[0].spill_slot = 0; }
+    if (mode == 2) { f.vregs[1].spill_slot = 1; }
+    if (mode == 3) { b.instrs[0].operands[1] = mir.op_vreg(0); }
+    if (mode == 5) {
+        var fp: u32 = 0;
+        for (fp < t.model.reg_class_len && t.model.reg_classes[fp].kind != isa.RC_FLOAT) { fp = fp + 1; }
+        if (fp == t.model.reg_class_len) { ret 1; }
+        f.vregs[0].class = fp;
+        f.vregs[1].class = fp;
+        f.vregs[0].spill_slot = 0;
+        f.vregs[1].assigned = isa.regid_make(isa.REG_CLASS_ID_XMM, 3)::u32;
+    }
+    var backend: isa.BackendTarget = target_view.backend_target(t);
+    if (R.is_err[R.Void, str](t.arch.select(?alloc, ?backend, ?f))) { ret 2; }
+    if (b.instrs[0].security_boundary != mir.SECURITY_DECLASSIFY
+        || b.instrs[0].opcode == mir.MIR_DECLASSIFY) { ret 3; }
+    var slots: [2]bool;
+    var ctx: AllocCtx;
+    t_ctx(?ctx, ?alloc, ?f, ?slots[0]);
+    var scratch: [1]isa.Register;
+    if (t.arch.reload_scratch_count < 1 || t.arch.reload_scratch_regs == nil) { ret 1; }
+    scratch[0] = t.arch.reload_scratch_regs[0];
+    ctx.reload_scratch = ?scratch[0];
+    ctx.reload_scratch_count = 1;
+    drop_self_copies(t, ?ctx);
+    if (b.instr_count != 1) { ret 4; }
+    if (mode == 4) {
+        b.instrs[0].operands[0] = mir.op_preg(3);
+        b.instrs[0].operands[1] = mir.op_preg(3);
+        b.instrs[0].operands[0].required_bank = mir.BANK_GP;
+        b.instrs[0].operands[1].required_bank = mir.BANK_GP;
+        drop_self_copies_physical(t, ?ctx);
+        if (b.instr_count != 1 || b.instrs[0].opcode != isa.ISA_USE::u32
+            || b.instrs[0].security_boundary != mir.SECURITY_DECLASSIFY
+            || b.instrs[0].operands[0].preg != 3 || b.instrs[0].width != 8) { ret 5; }
+        ret 0;
+    }
+    var output: [3]mir.MirInstr;
+    var written: u32 = 0;
+    fin {
+        var i: u32 = 0;
+        for (i < written) { free_ops(?ctx, output[i].operands, output[i].operand_count); i = i + 1; }
+    }
+    val result: R.Result[R.Void, str] = rewrite_instr(t, ?ctx, ?b.instrs[0], ?output[0], ?written, false, 0);
+    if (R.is_err[R.Void, str](result)) { ret 6; }
+    b.instr_count = 0;
+    var boundary: u32 = 0;
+    if (mode == 2) { boundary = 1; }
+    var expected: u32 = 1;
+    if (mode == 1 || mode == 2) { expected = 2; }
+    if (written != expected) { ret 7; }
+    var i: u32 = 0;
+    for (i < written) {
+        val piece: *mir.MirInstr = ?output[i];
+        if (i == boundary) {
+            if (piece.security_boundary != mir.SECURITY_DECLASSIFY || piece.width != 8) { ret 8; }
+            if (mode == 5) {
+                if (piece.operands[0].kind != mir.MIR_OP_MEM || piece.operands[0].vreg != 0) { ret 9; }
+            } or {
+                var destination: u32 = 3;
+                if (mode == 1) { destination = scratch[0].id::u32; }
+                if (piece.operands[0].kind != mir.MIR_OP_PREG || piece.operands[0].preg != destination) { ret 9; }
+            }
+            if ((mode == 0 || mode == 3) && piece.opcode != isa.ISA_USE::u32) { ret 10; }
+        } or {
+            if (piece.security_boundary != mir.SECURITY_NONE) { ret 11; }
+            if (mode == 1 && (piece.operands[0].kind != mir.MIR_OP_MEM || piece.operands[0].vreg != 0)) { ret 12; }
+            if (mode == 2 && (piece.operands[1].kind != mir.MIR_OP_MEM || piece.operands[1].vreg != 1)) { ret 13; }
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.regalloc:declassification_survives_selection_coalescing_and_spills" {
+    var registry: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?registry); }
+    if (R.is_err[R.Void, str](target.register_all(?registry, target_testing.debug_descriptor))) { ret 1; }
+    var names: [3]str = [3]str{"x86_64", "aarch64", "riscv64"};
+    var abis: [3]str = [3]str{"sysv64", "aapcs64", "lp64d"};
+    var i: u32 = 0;
+    for (i < 3) {
+        val selected: R.Result[target.Target, str] = target.select(?registry, names[i], "linux", abis[i]);
+        if (R.is_err[target.Target, str](selected)) { ret 2; }
+        var t: target.Target = R.unwrap_ok[target.Target, str](selected);
+        var mode: u32 = 0;
+        for (mode < 6) {
+            val result: i32 = t_declassification_rewrite(?t, mode);
+            if (result != 0) { ret 10 + (i * 100 + mode * 15)::i32 + result; }
+            mode = mode + 1;
+        }
+        i = i + 1;
+    }
     ret 0;
 }

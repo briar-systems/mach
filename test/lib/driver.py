@@ -21,6 +21,10 @@ import project as projectmod
 CORPUS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.dirname(CORPUS)
 
+NO_DEBUG_MODEL = ("error: debug info was requested, but this target registers no debug model; "
+                  "build without -g or select a target with one")
+DEBUG_UNSUPPORTED = "debug unsupported: compiler refused a target with no registered debug model"
+
 HOST_DIR = {("linux", "x86_64"): "linux-x86_64", ("linux", "aarch64"): "linux-arm64",
             ("darwin", "x86_64"): "darwin-x86_64", ("darwin", "arm64"): "darwin-aarch64",
             ("windows", "amd64"): "windows-x86_64"}
@@ -429,6 +433,16 @@ def run(out_root, matrix_path, only_targets, runner, only_cases, only_layers, bl
     m.save(matrix_path)
     sys.stdout.write(m.render(cases, [t.name for t in targets], wanted_layers) + "\n")
 
+    for t in targets:
+        debug_cells = [c for c in m.cells if c[1] == t.name and c[2:4] == ("a", "g")]
+        if debug_cells:
+            supported = sum(c[4] == "PASS" for c in debug_cells)
+            unsupported = sum(c[4] == "SKIP" and c[6] == DEBUG_UNSUPPORTED for c in debug_cells)
+            failed = sum(c[4] == "FAIL" for c in debug_cells)
+            declared = len(debug_cells) - supported - unsupported - failed
+            sys.stdout.write("debug cells %s: %d supported, %d unsupported, %d failed, %d declared skip\n"
+                             % (t.name, supported, unsupported, failed, declared))
+
     holes = gate(m, cases, targets, wanted_layers, skips)
     ok = True
     for cell in m.failures():
@@ -497,6 +511,20 @@ def layer_a_cells(proj, tools, m, t, case, built, skips):
         if cell_skip(m, skips, case, t.name, "a", profile):
             continue
         ok, log = built.get(profile)
+        if profile == "g" and t.debug == "unsupported":
+            if ok:
+                m.add(case, t.name, "a", profile, "FAIL", "",
+                      "debug build succeeded despite declared unsupported capability")
+            elif first_error(log) != NO_DEBUG_MODEL:
+                m.add(case, t.name, "a", profile, "FAIL", "",
+                      "unsupported debug request failed for another reason: " + first_error(log))
+            elif any(os.path.lexists(p) for p in (proj.object_path(case, t, profile),
+                                                  proj.artifact_path(case, t, profile))):
+                m.add(case, t.name, "a", profile, "FAIL", "",
+                      "unsupported debug request left an object or artifact")
+            else:
+                m.add(case, t.name, "a", profile, "SKIP", "", DEBUG_UNSUPPORTED)
+            continue
         if not ok:
             m.add(case, t.name, "a", profile, "FAIL", "", "build failed: " + first_error(log))
             continue

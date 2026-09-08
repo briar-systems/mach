@@ -1,38 +1,47 @@
 # The 4.30.0 / 5.0.0 release shape
 
-The changes that reshaped the compiler in 2026 ship as two releases with a
-fixed division of labour: **4.30.0** supplies the transition forms and seed,
-and **5.0.0** removes the legacy forms retained for migration. This page
-records why it has to be two, and why the split falls where it does.
+The audited **4.30.0** source supplies the transition compiler and bootstrap
+seed. Its public release and tag were withdrawn. **5.0.0** establishes the complete
+language, compiler, tooling and standard-library contract, including removal
+of superseded forms. The [release coordinator](https://github.com/briar-systems/mach/issues/3112)
+owns the required work across both repositories.
 
-## The seed forces it
+## The bootstrap chain
 
-Mach is self-hosting: the compiler's own source is compiled by an installed
-**seed** compiler, and the result compiles itself again. Every release is
-therefore built, first, by the release before it. A language or manifest
-change the seed does not understand cannot appear in the compiler's own
-source until a compiler that understands it *is* the seed.
+Mach is self-hosting. A compiler must understand a new source form before the
+compiler or its standard library can adopt that form. This requires an explicit
+bootstrap chain, rather than assuming the latest published compiler can build
+any later source directly.
 
-That is the whole constraint. A release that both added the new forms and
-removed the old ones could not be built by the seed that only knows the old
-ones, because its own manifest and source would already have to use the new
-forms. So:
+CI installs checksum-verified published **4.26.5**, then builds the fixed bridge
+`878a8f66a90127360dc23de4480241934fc1bf0d` with std
+`3ee8e709a8ed7baff6e93780ce9b3582a907a91f`. That compiler builds the audited
+main commit `b65afb9704218e89998af5f71050ca315e7709a9` with std **1.0.1**
+(`168a9f760d7c0f7a182f3b0685081e62f1a4f682`). Both source commits remain
+reachable from main. The bridge contains the same compiler source and manifest
+as the earlier audit bridge. No retired proof branch is required.
 
-- **4.30.0** adds the replacement language and manifest forms while retaining
-  the specific legacy forms listed below. The 4.26.5 seed builds it, because
-  nothing in its source or manifest is a form the seed rejects. Where a
-  4.30.0 feature would help the compiler's own source, the source waits. The
-  compiler is written against the seed's dialect.
-- 4.30.0 is then published as the seed.
-- **5.0.0** removes the old forms, with a migration diagnostic naming the new
-  one. The 4.30.0 seed builds it, because 5.0.0 source uses only forms
-  4.30.0 accepts.
+There are four builds: one bridge build followed by audited A, B and C. The
+bootstrap uses the debug profile, with optimization and compiler debug symbols
+disabled. Both repositories install audited B only after B and C match byte for
+byte. Ordinary CI then runs its existing debug and release checks with that
+compiler. The setup action records the published seed metadata and checksums,
+source and dependency pins, build logs and binary hashes. It does not download
+the withdrawn 4.30.0 release or depend on expiring audit artifacts.
 
-The two-generation invariant follows. Until the seed catches up, the
-seed-built compiler (call it A) may legitimately differ from the compiler A
-builds (B), because A carries the older code generator. The fixpoint that is
-checked is that B and the compiler B builds (C) are byte-identical. Release
-verification runs three generations for that reason.
+The [source bootstrap recipe](../tooling/bootstrap.md) gives the same pinned
+chain for a local build.
+
+At the final audited self-host stage, the bridge builds A, A builds B, and B
+builds C. B and C
+must be byte-identical. A may differ because it was produced by the older
+compiler. Final verification checks the exact versioned compiler source and std
+pin in both optimization profiles on the required native hosts.
+
+The audited 4.30.0 implementation is the starting seed for v5. The new tagged-value and
+failure-control features must be implemented in a usable compiler before its
+own source and std migrate. Their design issue specifies the pinned intermediate
+bootstrap and migration order. Building that implementation does not make it understand new v5 syntax.
 
 ## What is on each side
 
@@ -59,11 +68,20 @@ Removed, in 5.0.0:
 - the five deprecated manifest keys: `[project] name`, `description`, and
   `mach`, plus `[profile.*] emit_ir` and `emit_asm`.
 - `$project.name` and `$project.description`, with their manifest keys
-  ([#3128](https://github.com/briar-systems/mach/issues/3128)).
+  ([migration issue](https://github.com/briar-systems/mach/issues/3226)).
 - the implicit `lib.mach` entry for a dependency that declares no artifacts.
 
-5.0.0 also adds the SemVer proposal on `mach dep update`. It belongs with the
-finished dependency model, though it is an addition rather than a removal.
+V5 also includes checked `tag` values, canonical `res`/`opt`, expression-level
+`try` with explicit failure exits, query ownership and persistent compilation
+caching, the approved manifest and command changes, and the coordinated std
+migration. The linked issues contain their acceptance criteria. Remaining syntax
+and representation choices are design work, not declarations of implemented
+features.
+
+Dependency version selection remains an explicit decision in the coordinator.
+A tested dependency commit is evidence of testing, not an automatic promise of
+compatibility with every later release. The earlier SemVer proposal is not an
+accepted implementation contract.
 
 Compatibility in 4.30.0 means preserving the seed path and these specific
 migration forms. It does not mean accepting every project 4.26.x accepted.
@@ -74,31 +92,40 @@ a place and refuses temporaries, arithmetic and non-shift bitwise binary
 operators require operands of one type, and manifest-controlled paths must
 stay within the project root. The [changelog](../../CHANGELOG.md) lists the
 immediate changes and fixes.
-The listed 5.0.0 removals remain deferred until the new seed is published.
+The listed 5.0.0 removals belong to the coordinated v5 migration, using the audited transition compiler.
 
-## Why one squashed commit
+Std has an independent Semantic Versioning sequence. Published 1.0.x releases
+preserve their declared public contracts. The breaking language and API migration
+ships as **std 2.0.0**, paired with Mach 5.0.0. Compatible later additions belong
+to 2.1.0. Public signatures, layouts, documented behavior, ownership, lifetimes,
+errors and supported compiler/target combinations form that versioned contract.
+Published version contents and tags are immutable.
 
-The branch that carried this work was reviewed against a specification kept
-beside the code, and that specification, its conformance ledger, and its
-execution record were working documents: normative while the work was in
-flight, and wrong the moment the code moved past them. They do not ship.
-The branch lands on `dev` as a single squashed commit whose content is
-4.30.0, with the working documents absent from that commit and their history
-preserved nowhere, by ruling. What is still open at the landing is filed as
-issues carrying the relevant clause text, so nothing depends on the
-documents surviving. The residual design decisions that are worth keeping
-are these pages under `doc/design/`.
+## Landing and release gates
+
+Work lands directly on `dev`, with one cohesive commit per fix or change.
+Implementation issues close when their fixes have landed and their acceptance
+evidence is complete. Verification retries do not create additional issue or PR
+stacks. `main` takes release integration merges from `dev`.
+
+Every issue in the v5 required set must finish before publication, including the
+4.30.0 and audited std prerequisites. Consolidation transfers unfinished work to
+its named owner. Additional RV32 dynamic output, embedded E-base machines and
+specialized integer matmul are tracked in post-v5 milestones. Android expansion
+and MOS 6502 are withdrawn. The MOS instruction set, ABI and registry entries
+are deleted. Shared width legalization remains part of the retained backend.
+
+Release artifacts and tags identify the validated source. Historical bootstrap
+and proof references are preserved before obsolete branches are removed.
 
 ## Documentation ships with the code
 
-No release is cut from a tree whose supported public surface lacks
-docstrings or whose `doc/` pages contradict the compiler. Docstrings state
-what and how, `doc/design/` states why, and the changelog states when.
-Documentation never changes generated code, and that is checked: objects
-built with `debug = false` are byte-identical across a documentation change.
-The supported surface is the editor API, the command line, and the manifest
-schema. Their intended stability within a major has the explicit transition
-exceptions described above. Everything else under `src/` is internal and
-carries no promise. General deprecation attributes and experimental marking
-as compiler machinery were deferred as low-priority additive work.
-The targeted migration notes and warnings described above ship in 4.30.0.
+Supported public contracts and worked examples must agree with the compiler.
+Language references, command help, manifest documentation and ownership/error
+contracts have explicit coverage under the documentation issue. Internal
+comments explain non-obvious invariants without a docstring quota for every
+internal public declaration.
+
+General source deprecation diagnostics are required for v5. An experimental-mode
+feature is not part of that requirement. The targeted migration notes and
+warnings described above ship in 4.30.0.

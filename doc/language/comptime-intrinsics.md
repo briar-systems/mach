@@ -430,7 +430,7 @@ three readable properties:
 (readable and writable, including through a pointer receiver).
 
 ```mach
-$fields(T)              # comptime field sequence for record/union T
+$fields(T)              # comptime field sequence for record T
 v.[f]                   # comptime field projection: access the field f on v
 ```
 
