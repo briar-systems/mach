@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The COFF weak-body linker test publishes into private temporary directories,
+  preventing contention with parallel publication tests and reporting failing stages.
 - Instruction-selection guards read the selected machine model. RV32 full-register
   conversions are recognized as copies and removed by register coalescing, including
   when RV32 and RV64 targets are selected in the same process.
