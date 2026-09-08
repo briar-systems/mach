@@ -87,6 +87,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Vector operations require an explicit target capability row. Missing or malformed
+  operation and lane shapes no longer default to packed support.
+
 - Removed `$project.name`, `$project.description` and the `$mach.abi.sysv` alias. Diagnostics identify the removed forms, and the ABI tag uses only `sysv64`.
 
 - Every dependency action selects its project with `mach dep <action> <path>`.
