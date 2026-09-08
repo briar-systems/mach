@@ -22,15 +22,15 @@ repairs were all of the shape "detect the drift and re-resolve", which is
 exactly the work a build must never do.
 
 Git already has a first-class record of "this directory is at this commit":
-the gitlink a superproject commits for a submodule. Making the gitlink the
-pin removes the second record entirely. A dependency's commit is whatever the
-root repository committed for `dep/<id>`; `.gitmodules` is generated from the
-manifest, never read for pins; and nothing generated is an authority. The
-cost is that a project's source distribution is a git clone — a tree without
-`.git` does not build, and verification never degrades in its absence. That
-cost was accepted deliberately: a tarball release that carried a generated
-pin record would reintroduce the second record, so it is a separate ruling if
-it is ever wanted.
+the gitlink a superproject commits for a submodule. In a Git-managed root, the
+staged gitlink is authoritative, so newly realized dependencies can be verified
+before committing. There is no compiler-managed lock file. `.gitmodules`
+registers native submodules and does not provide a second pin authority.
+
+Project roots are identified by their own `mach.toml`. A standalone project or a
+project nested inside an unrelated repository validates dependencies from its
+own realized checkouts. It does not borrow an enclosing repository's dependency
+directory. The command reference describes these authority modes.
 
 ## The root owns a flat closure
 
@@ -43,7 +43,7 @@ has to be re-pinned at every level between it and the root.
 The flat model puts every identity in the transitive closure directly under
 the root's `dep/`, one gitlink each, exactly one level deep. A consumed
 dependency's own `dep/` is never initialized: its gitlinks are still readable
-(they are its tested floors, below) but they are inputs to the root's
+(they are its tested commits, below) but they are inputs to the root's
 closure computation, not checkouts. A package cloned on its own is a root and
 gets its own flat `dep/`. The root manifest declares only direct dependencies
 and overrides; everything transitive reaches `dep/` through closure
@@ -107,7 +107,7 @@ committed gitlink out at its commit, initializing in place the empty
 directory a plain clone leaves for a submodule, and no git command ever runs
 against a gitlink that is not yet a checkout of its own. A consumed
 dependency's gitlinks show up as empty directories under its own `dep/`; they
-are read as its tested floors and are otherwise ignored.
+are read as its tested commits and are otherwise ignored.
 
 A project root is identified by its own `mach.toml`, not by an enclosing
 repository, and `dep/<id>` resolves relative to that root. This was not
@@ -123,15 +123,15 @@ identity reached by more than one path the manual rule is: the root's
 selector wins if declared; otherwise agreement among the requirers is
 taken; otherwise stop, print both chains, and name the root declaration that
 would decide. A consumed dependency's own gitlink for an identity is its
-tested floor — the commit that package was tested against — and it is
+tested commit — the commit that package was tested against — and it is
 readable without initializing that package's `dep/`.
 
-5.0.0 adds a SemVer proposal on top of the manual rule, not in place of it:
-among tagged releases at or above every tested floor and within one major,
-propose the highest; candidates spanning two majors are a clash under the
-one-commit rule. The proposal never bypasses a root override. It is a
-separate commit after the manual rule because the manual rule is its
-fallback, and the fallback has to work first.
+An earlier design proposed selecting the highest same-major tagged release above
+every tested commit. That proposal is not an accepted v5 contract. A tested
+commit establishes neither an ordering constraint nor permission to substitute
+later releases. The [release contract reconciliation](v5-release-contract.md)
+presents explicit selection for the owner's decision. Until that decision, the
+manual rule above remains the implementation baseline.
 
 Selectors are `branch/<name>`, `tag/<name>`, and `commit/<full-object-id>`,
 and nothing else: a bare name that git would guess at is exactly the
@@ -150,8 +150,11 @@ ids they consume; there is no scope vocabulary (no "dev" or "test"
 dependencies), because a scope is a property of the consumer, and the
 consumer already says what it consumes. Public entry is the module a
 dependency's artifacts share. In 4.30.0, a dependency with no artifacts still
-gets the legacy `lib.mach` entry under its source directory. 5.0.0 removes
-that fallback and requires an explicitly defaulted library artifact.
+gets the legacy `lib.mach` entry under its source directory. The current v5 candidate removes
+that fallback. A bare dependency import needs an unambiguous entry selected by
+explicitly defaulted library artifacts. Multiple defaults may share one entry.
+Full-module imports remain available without a default artifact, including for
+source-only dependencies. G1 requests confirmation of that existing rule.
 
 Three things fit the five statements without changing them and are named as
 future slots rather than built: owner-prefixed (dotted) ids if the flat id

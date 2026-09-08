@@ -999,11 +999,11 @@ more than one path, one rule decides: the root's selector wins if the root
 declares the identity; otherwise agreement among the requirers is taken;
 otherwise the command stops, prints both chains, and names the root
 declaration that would decide (the diagnostic above). A consumed
-dependency's own gitlink for an identity is its tested floor, readable
-without initializing that dependency's `dep/`. 5.0.0 adds a SemVer proposal on
-top: among tagged releases at or above every tested floor and within one
-major, the highest is proposed; candidates spanning two majors are a clash.
-The proposal never bypasses a root override.
+dependency's own gitlink records a tested commit, readable without initializing
+that dependency's `dep/`. It is not an automatic compatibility floor. The earlier
+proposal to select the highest same-major release is not accepted for v5.
+[The coordinator decision](design/v5-release-contract.md#dependency-selection)
+must settle selection policy before that behavior is implemented.
 
 ### 4.30.0 and 5.0.0
 

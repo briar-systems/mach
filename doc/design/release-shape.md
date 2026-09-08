@@ -41,7 +41,7 @@ pin in both optimization profiles on the required native hosts.
 The audited 4.30.0 implementation is the starting seed for v5. The new tagged-value and
 failure-control features must be implemented in a usable compiler before its
 own source and std migrate. Their design issue specifies the pinned intermediate
-bootstrap and migration order. Building that implementation does not make it understand new v5 syntax.
+bootstrap and migration order. The audited seed itself does not understand the new v5 syntax.
 
 ## What is on each side
 
@@ -71,14 +71,15 @@ Removed, in 5.0.0:
   ([migration issue](https://github.com/briar-systems/mach/issues/3226)).
 - the implicit `lib.mach` entry for a dependency that declares no artifacts.
 
-V5 also includes checked `tag` values, canonical `res`/`opt`, expression-level
+V5 also includes checked `tag` values, canonical `res`/`opt`/`err`, expression-level
 `try` with explicit failure exits, query ownership and persistent compilation
 caching, the approved manifest and command changes, and the coordinated std
 migration. The linked issues contain their acceptance criteria. Remaining syntax
 and representation choices are design work, not declarations of implemented
 features.
 
-Dependency version selection remains an explicit decision in the coordinator.
+Dependency version selection remains an explicit decision in the
+[coordinator reconciliation](v5-release-contract.md).
 A tested dependency commit is evidence of testing, not an automatic promise of
 compatibility with every later release. The earlier SemVer proposal is not an
 accepted implementation contract.
