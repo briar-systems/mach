@@ -49,12 +49,15 @@ Precompiled binaries are also available directly on the [releases](https://githu
 
 ## Building Mach
 
-Mach builds itself, so building from source needs an existing `mach` installation.
+Mach builds itself. The current development source needs the audited 4.30.0
+compiler implementation. Its public release was withdrawn, so follow the
+[pinned source bootstrap recipe](doc/tooling/bootstrap.md) if you only have
+4.26.5. The recipe also explains how CI builds its compiler.
 
 ```bash
 git clone https://github.com/briar-systems/mach
 cd mach
-mach dep pull .
+git submodule update --init --recursive
 mach build .
 ```
 

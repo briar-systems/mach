@@ -1,7 +1,7 @@
 # The 4.30.0 / 5.0.0 release shape
 
-The release has two published checkpoints. **4.30.0** supplies the audited
-transition compiler and bootstrap seed. **5.0.0** establishes the complete
+The audited **4.30.0** source supplies the transition compiler and bootstrap
+seed. Its public release and tag were withdrawn. **5.0.0** establishes the complete
 language, compiler, tooling and standard-library contract, including removal
 of superseded forms. The [release coordinator](https://github.com/briar-systems/mach/issues/3112)
 owns the required work across both repositories.
@@ -13,27 +13,35 @@ compiler or its standard library can adopt that form. This requires an explicit
 bootstrap chain, rather than assuming the latest published compiler can build
 any later source directly.
 
-The current seed is published **4.30.0**, released from main merge
-`b65afb9704218e89998af5f71050ca315e7709a9` with the audited std **1.0.1** pin.
-Both repositories install that published compiler directly. The setup action
-verifies the selected archive against `SHA256SUMS` before extraction, checks the
-installed version and records release metadata and archive/compiler hashes.
-Fresh installations have passed on all five native hosts.
+CI installs checksum-verified published **4.26.5**, then builds the fixed bridge
+`878a8f66a90127360dc23de4480241934fc1bf0d` with std
+`3ee8e709a8ed7baff6e93780ce9b3582a907a91f`. That compiler builds the audited
+main commit `b65afb9704218e89998af5f71050ca315e7709a9` with std **1.0.1**
+(`168a9f760d7c0f7a182f3b0685081e62f1a4f682`). Both source commits remain
+reachable from main. The bridge contains the same compiler source and manifest
+as the earlier audit bridge. No retired proof branch is required.
 
-The historical 4.26.5 source bridge was used to produce 4.30.0. Its proof and
-complete source history are preserved in verified Git bundles. It is no longer
-part of the current CI bootstrap.
+There are four builds: one bridge build followed by audited A, B and C. The
+bootstrap uses the debug profile, with optimization and compiler debug symbols
+disabled. Both repositories install audited B only after B and C match byte for
+byte. Ordinary CI then runs its existing debug and release checks with that
+compiler. The setup action records the published seed metadata and checksums,
+source and dependency pins, build logs and binary hashes. It does not download
+the withdrawn 4.30.0 release or depend on expiring audit artifacts.
 
-At each self-host stage, the seed builds A, A builds B, and B builds C. B and C
+The [source bootstrap recipe](../tooling/bootstrap.md) gives the same pinned
+chain for a local build.
+
+At the final audited self-host stage, the bridge builds A, A builds B, and B
+builds C. B and C
 must be byte-identical. A may differ because it was produced by the older
 compiler. Final verification checks the exact versioned compiler source and std
 pin in both optimization profiles on the required native hosts.
 
-Published 4.30.0 is the starting seed for v5. The new tagged-value and
+The audited 4.30.0 implementation is the starting seed for v5. The new tagged-value and
 failure-control features must be implemented in a usable compiler before its
 own source and std migrate. Their design issue specifies the pinned intermediate
-bootstrap and migration order. Publishing 4.30.0 does not by itself make that
-compiler understand new v5 syntax.
+bootstrap and migration order. Building that implementation does not make it understand new v5 syntax.
 
 ## What is on each side
 
@@ -84,8 +92,7 @@ a place and refuses temporaries, arithmetic and non-shift bitwise binary
 operators require operands of one type, and manifest-controlled paths must
 stay within the project root. The [changelog](../../CHANGELOG.md) lists the
 immediate changes and fixes.
-The listed 5.0.0 removals belong to the coordinated v5 migration, now that the
-new seed is published.
+The listed 5.0.0 removals belong to the coordinated v5 migration, using the audited transition compiler.
 
 Std has an independent Semantic Versioning sequence. Published 1.0.x releases
 preserve their declared public contracts. The breaking language and API migration

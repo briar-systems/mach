@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- CI rebuilds its audited compiler from published 4.26.5 and source commits reachable from main after withdrawal of the 4.30.0 release.
+
 ### Changed
 
 - Every dependency action selects its project with `mach dep <action> <path>`.
