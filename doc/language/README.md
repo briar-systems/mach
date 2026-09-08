@@ -1,5 +1,9 @@
 # Mach language reference
 
+Tag, canonical type, and `try` descriptions include the accepted v5 contract.
+Implementation is incomplete at base commit `fc5c9e7e`. See
+[tag.md](tag.md#implementation-status) and [try.md](try.md#implementation-status).
+
 Per-element reference docs. Each file covers one language component;
 read the index below or follow `see also` links to navigate.
 
@@ -19,33 +23,35 @@ neighboring links; start from the index below.
 - [visibility.md](visibility.md) — `pub` and `ext` modifiers
 - [decorators.md](decorators.md) — codegen decorators, `#[name]` (`symbol`, `library`, `inline`, `align`, `section`, `embed`)
 - [def.md](def.md) — type alias
-- [rec.md](rec.md) — record
-- [uni.md](uni.md) — raw union and the discriminated-value convention
-- [fun.md](fun.md) — function
-- [ext-fun.md](ext-fun.md) — external function
-- [val-var.md](val-var.md) — immutable and mutable bindings
-- [test.md](test.md) — `test` declaration and the `mach test` workflow
-- [variadics.md](variadics.md) — variadic packs (`va: ...`, `$each`, `va.len`, `va...`)
+- [rec.md](rec.md) - record
+- [uni.md](uni.md) - raw union
+- [tag.md](tag.md) - tagged value
+- [fun.md](fun.md) - function
+- [ext-fun.md](ext-fun.md) - external function
+- [val-var.md](val-var.md) - immutable and mutable bindings
+- [test.md](test.md) - test declaration and the mach test workflow
+- [variadics.md](variadics.md) - variadic packs (va: ..., $each, va.len, va...)
 
 ## Values and types
 
-- [literals.md](literals.md) — numeric, char, string
-- [types.md](types.md) — primitive grammar, compound types
-- [secrecy.md](secrecy.md) — the `^` secret qualifier, flow typing, gates, `:>T`
-- [operators.md](operators.md) — arithmetic, bitwise, comparison, logical, pointer, cast
-- [expressions.md](expressions.md) — construction, access, calls, generic instantiation
+- [literals.md](literals.md) - numeric, char, string
+- [types.md](types.md) - primitive grammar, compound types, and canonical tags
+- [secrecy.md](secrecy.md) - the ^ secret qualifier, flow typing, gates, :>T
+- [operators.md](operators.md) - arithmetic, bitwise, comparison, logical, pointer, cast
+- [expressions.md](expressions.md) - construction, access, calls, generic instantiation, try
 
 ## Control flow
 
-- [statements.md](statements.md) — `if`/`or`, `for`, `ret`, `brk`, `cnt`, `fin`, blocks
+- [statements.md](statements.md) - if/or, for, ret, brk, cnt, fin, blocks
+- [try.md](try.md) - explicit failure handling with try
 
 ## Comptime channel
 
-- [comptime.md](comptime.md) — channel overview
-- [comptime-mach.md](comptime-mach.md) — `$mach.*` compiler-owned namespace
-- [decorators.md](decorators.md) — codegen decorators, `#[name]` (replaces the removed `$sym.attr` setters)
-- [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of`, `$length_of`, `$align_of`, `$offset_of`, `$type_of`, `$fields`, `$pointee_of`, `$is_record`, `$is_union`, `$is_pointer`, `$is_secret`, `$type_name`, `$each`, `$error`
-- [comptime-control.md](comptime-control.md) — `$if` / `$or`
+- [comptime.md](comptime.md) - channel overview
+- [comptime-mach.md](comptime-mach.md) - $mach.* compiler-owned namespace
+- [decorators.md](decorators.md) - codegen decorators, #[name] (replaces the removed $sym.attr setters)
+- [comptime-intrinsics.md](comptime-intrinsics.md) - $size_of, $length_of, $align_of, $offset_of, $type_of, $fields, $cases, $is_tag, $discriminant_of, $pointee_of, $is_record, $is_union, $is_pointer, $is_secret, $type_name, $each, $error
+- [comptime-control.md](comptime-control.md) - $if / $or
 
 ## Low-level
 
