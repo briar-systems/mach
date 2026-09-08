@@ -1,0 +1,471 @@
+use T: std.allocator.testing;
+use std.collections.sort;
+use std.collections.vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+
+use mach.lang.fe.ast.id;
+use mach.lang.intern;
+use mach.lang.fail;
+use mach.lang.session;
+use mach.lang.target.isa;
+use mach.lang.type;
+
+pub rec Node {
+    ty: type.TypeId;
+    entries: vector.Vector[type.FieldEntry];
+    has_align: bool;
+    align: u32;
+    packed: bool;
+    volatile_: bool;
+}
+
+pub rec Roots {
+    data: *type.TypeId;
+    len: usize;
+}
+
+pub def CaptureMode: u8;
+
+pub val RECIPES: CaptureMode = 0;
+pub val MATERIALIZED: CaptureMode = 1;
+
+pub rec Graph {
+    nodes: vector.Vector[Node];
+}
+
+pub fun init(a: *A.Allocator) Graph {
+    ret Graph{ nodes: vector.init[Node](a) };
+}
+
+pub fun dnit(graph: *Graph) {
+    var i: usize = 0;
+    for (i < graph.nodes.len) {
+        vector.dnit[type.FieldEntry](?graph.nodes.data[i].entries);
+        i = i + 1;
+    }
+    vector.dnit[Node](?graph.nodes);
+}
+
+fun node_compare(left: *Node, right: *Node) i64 {
+    if (left.ty < right.ty) { ret -1; }
+    if (left.ty > right.ty) { ret 1; }
+    ret 0;
+}
+
+fun enqueue(ti: *type.TypeInterner, scan: *type.TypeScan, pending: *vector.Vector[type.TypeId],
+            ty: type.TypeId) R.Result[R.Void, str] {
+    if (ty == type.TYPE_NIL || ty == type.TYPE_ERROR) { ret R.ok_void[str](); }
+    if (O.is_none[*type.Type](type.get(ti, ty))) { ret R.err[R.Void, str]("field graph contains an invalid type identity"); }
+    val marked: R.Result[type.VisitMark, str] = type.type_scan_mark(ti, scan, ty);
+    if (R.is_err[type.VisitMark, str](marked)) { ret R.void_of[type.VisitMark, str](marked); }
+    if (R.unwrap_ok[type.VisitMark, str](marked) == type.VISIT_SEEN) { ret R.ok_void[str](); }
+    ret R.void_of[usize, str](vector.push[type.TypeId](pending, ty));
+}
+
+fun enqueue_parameters(ti: *type.TypeInterner, scan: *type.TypeScan, pending: *vector.Vector[type.TypeId],
+                       start: u32, len: u32) R.Result[R.Void, str] {
+    var i: u32 = 0;
+    for (i < len) {
+        val parameter: O.Option[type.TypeId] = type.get_param(ti, start + i);
+        if (O.is_none[type.TypeId](parameter)) { ret R.err[R.Void, str]("field graph contains an invalid type parameter run"); }
+        val added: R.Result[R.Void, str] = enqueue(ti, scan, pending, O.unwrap[type.TypeId](parameter));
+        if (R.is_err[R.Void, str](added)) { ret added; }
+        i = i + 1;
+    }
+    ret R.ok_void[str]();
+}
+
+fun enqueue_handle(ti: *type.TypeInterner, scan: *type.TypeScan, pending: *vector.Vector[type.TypeId],
+                   handle: type.TypeHandle, defs: *isa.TargetDefs) R.Result[R.Void, str] {
+    if (handle.ctor == isa.NO_TYPE_CTOR) { ret R.ok_void[str](); }
+    if (defs == nil) { ret R.err[R.Void, str]("field graph handle has no acquired constructor schema"); }
+    val schema: *isa.TypeDef = isa.type_def_by_tag(defs, handle.ctor);
+    if (schema == nil || schema.arity != handle.ops_len || (schema.arity != 0 && schema.operands == nil)) {
+        ret R.err[R.Void, str]("field graph handle disagrees with its constructor schema");
+    }
+    if (handle.ops_start > ti.handle_ops_len || handle.ops_len > ti.handle_ops_len - handle.ops_start) {
+        ret R.err[R.Void, str]("field graph handle has an invalid operand run");
+    }
+    var i: u32 = 0;
+    for (i < schema.arity) {
+        if (schema.operands[i] != isa.TYPE_OPERAND_WORD) {
+            val child: type.TypeId = ti.handle_ops[handle.ops_start + i]::type.TypeId;
+            val info: O.Option[*type.Type] = type.get(ti, child);
+            if (O.is_none[*type.Type](info) || O.unwrap[*type.Type](info).kind != type.TYPE_HANDLE
+                || O.unwrap[*type.Type](info).data.handle.ctor != schema.operands[i]) {
+                ret R.err[R.Void, str]("field graph handle operand does not match its required constructor");
+            }
+            val added: R.Result[R.Void, str] = enqueue(ti, scan, pending, child);
+            if (R.is_err[R.Void, str](added)) { ret added; }
+        }
+        i = i + 1;
+    }
+    ret R.ok_void[str]();
+}
+
+fun capture_node(s: *session.Session, graph: *Graph, scan: *type.TypeScan,
+                 pending: *vector.Vector[type.TypeId], ty: type.TypeId) R.Result[R.Void, str] {
+    var node: Node;
+    node.ty = ty;
+    node.entries = vector.init[type.FieldEntry](graph.nodes.a);
+    node.has_align = false;
+    node.align = 0;
+    node.packed = session.type_is_packed(s, ty::u32);
+    node.volatile_ = session.type_is_volatile(s, ty::u32);
+    val alignment: O.Option[u32] = session.type_align(s, ty::u32);
+    if (O.is_some[u32](alignment)) { node.has_align = true; node.align = O.unwrap[u32](alignment); }
+    var transferred: bool = false;
+    fin { if (!transferred) { vector.dnit[type.FieldEntry](?node.entries); } }
+    val table: O.Option[*type.FieldTable] = type.field_table_for(?s.types, ty);
+    if (O.is_none[*type.FieldTable](table)) { ret R.err[R.Void, str]("prepared nominal field recipe is unavailable"); }
+    {
+        val current: *type.FieldTable = O.unwrap[*type.FieldTable](table);
+        var i: u32 = 0;
+        for (i < current.fields_len) {
+            val field: *type.FieldEntry = type.field_entry_at(?s.types, current, i);
+            if (field == nil) { ret R.err[R.Void, str]("field graph contains an invalid field run"); }
+            val copied: R.Result[usize, str] = vector.push[type.FieldEntry](?node.entries, @field);
+            if (R.is_err[usize, str](copied)) { ret R.void_of[usize, str](copied); }
+            val added: R.Result[R.Void, str] = enqueue(?s.types, scan, pending, field.ty);
+            if (R.is_err[R.Void, str](added)) { ret added; }
+            i = i + 1;
+        }
+    }
+    val appended: R.Result[usize, str] = vector.push[Node](?graph.nodes, node);
+    if (R.is_err[usize, str](appended)) { ret R.void_of[usize, str](appended); }
+    transferred = true;
+    ret R.ok_void[str]();
+}
+
+pub fun capture[T](s: *session.Session, a: *A.Allocator, roots: *Roots, count: usize, mode: CaptureMode, defs: *isa.TargetDefs, ctx: *T,
+                   prepare: fun(*T, type.TypeId) R.Result[R.Void, fail.Fail]) R.Result[Graph, fail.Fail] {
+    if (mode != RECIPES && mode != MATERIALIZED) { ret fail.lift[Graph](R.err[Graph, str]("invalid field graph capture mode")); }
+    if (roots == nil && count != 0) { ret fail.lift[Graph](R.err[Graph, str]("field graph roots are nil")); }
+    if (ctx == nil || prepare == nil) { ret fail.lift[Graph](R.err[Graph, str]("field graph capture requires an active preparation capability")); }
+    var graph: Graph = init(a);
+    var complete: bool = false;
+    fin { if (!complete) { dnit(?graph); } }
+    var scan: type.TypeScan;
+    val scanning: R.Result[R.Void, str] = type.type_scan_begin(?s.types, ?scan);
+    if (R.is_err[R.Void, str](scanning)) { ret fail.lift[Graph](R.err[Graph, str](R.unwrap_err[R.Void, str](scanning))); }
+    fin { type.type_scan_end(?s.types, ?scan); }
+    var pending: vector.Vector[type.TypeId] = vector.init[type.TypeId](a);
+    fin { vector.dnit[type.TypeId](?pending); }
+    var i: usize = 0;
+    for (i < count) {
+        val group: Roots = roots[i];
+        if (group.data == nil && group.len != 0) { ret fail.lift[Graph](R.err[Graph, str]("field graph root group is nil")); }
+        var j: usize = 0;
+        for (j < group.len) {
+            val added: R.Result[R.Void, str] = enqueue(?s.types, ?scan, ?pending, group.data[j]);
+            if (R.is_err[R.Void, str](added)) { ret fail.lift[Graph](R.err[Graph, str](R.unwrap_err[R.Void, str](added))); }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < pending.len) {
+        val ty: type.TypeId = pending.data[i];
+        val initial: O.Option[*type.Type] = type.get(?s.types, ty);
+        if (O.is_none[*type.Type](initial)) { ret fail.lift[Graph](R.err[Graph, str]("field graph contains an invalid type identity")); }
+        val kind: type.TypeKind = O.unwrap[*type.Type](initial).kind;
+        if (kind == type.TYPE_REC || kind == type.TYPE_UNI || kind == type.TYPE_TAG) {
+            val prepared: R.Result[R.Void, fail.Fail] = prepare(ctx, ty);
+            if (R.is_err[R.Void, fail.Fail](prepared)) { ret R.err[Graph, fail.Fail](R.unwrap_err[R.Void, fail.Fail](prepared)); }
+        }
+        val info: O.Option[*type.Type] = type.get(?s.types, ty);
+        if (O.is_none[*type.Type](info)) { ret fail.lift[Graph](R.err[Graph, str]("field graph type disappeared during capture")); }
+        val node: *type.Type = O.unwrap[*type.Type](info);
+        var child: type.TypeId = type.TYPE_NIL;
+        if (node.kind == type.TYPE_POINTER) { child = node.data.pointer.base; }
+        or (node.kind == type.TYPE_ARRAY) { child = node.data.array.base; }
+        or (node.kind == type.TYPE_SECRET) { child = node.data.secret.base; }
+        or (node.kind == type.TYPE_FUN) {
+            child = node.data.fn.ret_type;
+            val parameters: R.Result[R.Void, str] = enqueue_parameters(?s.types, ?scan, ?pending,
+                node.data.fn.params_start, node.data.fn.params_len);
+            if (R.is_err[R.Void, str](parameters)) { ret fail.lift[Graph](R.err[Graph, str](R.unwrap_err[R.Void, str](parameters))); }
+        }
+        or (node.kind == type.TYPE_INSTANCE) {
+            child = node.data.instance.nominal;
+            val parameters: R.Result[R.Void, str] = enqueue_parameters(?s.types, ?scan, ?pending,
+                node.data.instance.args_start, node.data.instance.args_len);
+            if (R.is_err[R.Void, str](parameters)) { ret fail.lift[Graph](R.err[Graph, str](R.unwrap_err[R.Void, str](parameters))); }
+        }
+        or (node.kind == type.TYPE_HANDLE) {
+            val operands: R.Result[R.Void, str] = enqueue_handle(?s.types, ?scan, ?pending, node.data.handle, defs);
+            if (R.is_err[R.Void, str](operands)) { ret fail.lift[Graph](R.err[Graph, str](R.unwrap_err[R.Void, str](operands))); }
+        }
+        val added: R.Result[R.Void, str] = enqueue(?s.types, ?scan, ?pending, child);
+        if (R.is_err[R.Void, str](added)) { ret fail.lift[Graph](R.err[Graph, str](R.unwrap_err[R.Void, str](added))); }
+        if (node.kind == type.TYPE_REC || node.kind == type.TYPE_UNI || node.kind == type.TYPE_TAG
+            || (mode == MATERIALIZED && node.kind == type.TYPE_INSTANCE
+                && O.is_some[*type.FieldTable](type.field_table_for(?s.types, ty)))) {
+            val copied: R.Result[R.Void, str] = capture_node(s, ?graph, ?scan, ?pending, ty);
+            if (R.is_err[R.Void, str](copied)) { ret fail.lift[Graph](R.err[Graph, str](R.unwrap_err[R.Void, str](copied))); }
+        }
+        i = i + 1;
+    }
+    sort.sort[Node](graph.nodes.data, graph.nodes.len, node_compare);
+    complete = true;
+    ret R.ok[Graph, fail.Fail](graph);
+}
+
+fun same_fields(s: *session.Session, table: *type.FieldTable, node: *Node) bool {
+    if (table.fields_len::usize != node.entries.len) { ret false; }
+    var i: u32 = 0;
+    for (i < table.fields_len) {
+        val entry: *type.FieldEntry = type.field_entry_at(?s.types, table, i);
+        if (entry == nil || entry.name != node.entries.data[i].name || entry.ty != node.entries.data[i].ty) { ret false; }
+        i = i + 1;
+    }
+    val alignment: O.Option[u32] = session.type_align(s, node.ty::u32);
+    if (O.is_some[u32](alignment) != node.has_align) { ret false; }
+    if (node.has_align && O.unwrap[u32](alignment) != node.align) { ret false; }
+    ret session.type_is_packed(s, node.ty::u32) == node.packed
+        && session.type_is_volatile(s, node.ty::u32) == node.volatile_;
+}
+
+pub fun install(s: *session.Session, graph: *Graph) R.Result[R.Void, str] {
+    var i: usize = 0;
+    for (i < graph.nodes.len) {
+        val node: *Node = ?graph.nodes.data[i];
+        val existing: O.Option[*type.FieldTable] = type.field_table_for(?s.types, node.ty);
+        if (O.is_some[*type.FieldTable](existing)) {
+            if (!same_fields(s, O.unwrap[*type.FieldTable](existing), node)) {
+                ret R.err[R.Void, str]("field projection disagrees with an acquired definition");
+            }
+            i = i + 1;
+            cnt;
+        }
+        if (node.entries.len > 0xFFFFFFFF::usize) { ret R.err[R.Void, str]("field projection exceeds the field count limit"); }
+        val staged: R.Result[u32, str] = type.field_table_stage(?s.types, node.entries.len::u32);
+        if (R.is_err[u32, str](staged)) { ret R.void_of[u32, str](staged); }
+        var j: usize = 0;
+        for (j < node.entries.len) {
+            val entry: type.FieldEntry = node.entries.data[j];
+            val copied: R.Result[R.Void, str] = type.field_table_stage_push(?s.types, entry.name, entry.ty);
+            if (R.is_err[R.Void, str](copied)) { ret copied; }
+            j = j + 1;
+        }
+        if (node.has_align) {
+            val aligned: R.Result[R.Void, str] = session.register_type_align(s, node.ty::u32, node.align);
+            if (R.is_err[R.Void, str](aligned)) { ret aligned; }
+        }
+        if (node.packed) {
+            val packed: R.Result[R.Void, str] = session.register_type_packed(s, node.ty::u32);
+            if (R.is_err[R.Void, str](packed)) { ret packed; }
+        }
+        if (node.volatile_) {
+            val volatile_: R.Result[R.Void, str] = session.register_type_volatile(s, node.ty::u32);
+            if (R.is_err[R.Void, str](volatile_)) { ret volatile_; }
+        }
+        val published: R.Result[R.Void, str] = type.field_table_publish(?s.types, node.ty,
+            R.unwrap_ok[u32, str](staged), node.entries.len::u32);
+        if (R.is_err[R.Void, str](published)) { ret published; }
+        i = i + 1;
+    }
+    ret R.ok_void[str]();
+}
+
+
+fun t_prepared(s: *session.Session, ty: type.TypeId) R.Result[R.Void, fail.Fail] {
+    ret R.ok_void[fail.Fail]();
+}
+
+fun t_one_field(s: *session.Session, owner: type.TypeId, field_type: type.TypeId) R.Result[R.Void, str] {
+    val staged: R.Result[u32, str] = type.field_table_stage(?s.types, 1);
+    if (R.is_err[u32, str](staged)) { ret R.void_of[u32, str](staged); }
+    val pushed: R.Result[R.Void, str] = type.field_table_stage_push(?s.types, 1::intern.StrId, field_type);
+    if (R.is_err[R.Void, str](pushed)) { ret pushed; }
+    ret type.field_table_publish(?s.types, owner, R.unwrap_ok[u32, str](staged), 1);
+}
+
+test "mach.lang.fe.sema.fields:circular_graph_owns_fields_and_remaps_rebuilt_projection_runs" {
+    var tracker: T.Testing;
+    if (O.is_some[str](T.make(?tracker))) { ret 1; }
+    fin { T.dnit(?tracker); }
+    val allocated: *A.Allocator = T.allocator_of(?tracker);
+    val initialized: R.Result[session.Session, str] = session.init(allocated);
+    if (R.is_err[session.Session, str](initialized)) { ret 2; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](initialized);
+    var session_live: bool = true;
+    fin { if (session_live) { session.dnit(?s); } }
+    val first_r: R.Result[type.TypeId, str] = type.intern_nominal(?s.types, 1::intern.StrId, type.TypeOwner{ module: 0, file: 0 }, type.TYPE_REC);
+    val second_r: R.Result[type.TypeId, str] = type.intern_nominal(?s.types, 2::intern.StrId, type.TypeOwner{ module: 0, file: 0 }, type.TYPE_REC);
+    if (R.is_err[type.TypeId, str](first_r) || R.is_err[type.TypeId, str](second_r)) { ret 3; }
+    val first: type.TypeId = R.unwrap_ok[type.TypeId, str](first_r);
+    val second: type.TypeId = R.unwrap_ok[type.TypeId, str](second_r);
+    val to_first_r: R.Result[type.TypeId, str] = type.intern_pointer(?s.types, first);
+    val to_second_r: R.Result[type.TypeId, str] = type.intern_pointer(?s.types, second);
+    if (R.is_err[type.TypeId, str](to_first_r) || R.is_err[type.TypeId, str](to_second_r)) { ret 4; }
+    val to_first: type.TypeId = R.unwrap_ok[type.TypeId, str](to_first_r);
+    val to_second: type.TypeId = R.unwrap_ok[type.TypeId, str](to_second_r);
+    if (R.is_err[R.Void, str](t_one_field(?s, second, to_first))
+        || R.is_err[R.Void, str](t_one_field(?s, first, to_second))) { ret 5; }
+    if (R.is_err[R.Void, str](session.register_type_align(?s, first::u32, 16))
+        || R.is_err[R.Void, str](session.register_type_packed(?s, first::u32))
+        || R.is_err[R.Void, str](session.register_type_volatile(?s, first::u32))) { ret 6; }
+    val prior: O.Option[*type.FieldTable] = type.field_table_for(?s.types, first);
+    if (O.is_none[*type.FieldTable](prior)) { ret 7; }
+    val prior_start: u32 = O.unwrap[*type.FieldTable](prior).fields_start;
+    var root: type.TypeId = first;
+    var roots: Roots = Roots{ data: ?root, len: 1 };
+    val captured: R.Result[Graph, fail.Fail] = capture[session.Session](?s, allocated, ?roots, 1, MATERIALIZED, nil, ?s, t_prepared);
+    if (R.is_err[Graph, fail.Fail](captured)) { ret 8; }
+    var graph: Graph = R.unwrap_ok[Graph, fail.Fail](captured);
+    var graph_live: bool = true;
+    fin { if (graph_live) { dnit(?graph); } }
+    if (graph.nodes.len != 2 || graph.nodes.data[0].ty != first || graph.nodes.data[1].ty != second) { ret 9; }
+    var baseline: usize = 0;
+    var iteration: u32 = 0;
+    for (iteration < 32) {
+        if (R.is_err[R.Void, str](session.reset_type_projection(?s))) { ret 10; }
+        if (type.field_count(?s.types, first) != 0 || session.type_is_packed(?s, first::u32)
+            || session.type_is_volatile(?s, first::u32) || O.is_some[u32](session.type_align(?s, first::u32))) { ret 10; }
+        if (R.is_err[R.Void, str](install(?s, ?graph))) { ret 11; }
+        val current: O.Option[*type.FieldTable] = type.field_table_for(?s.types, first);
+        if (O.is_none[*type.FieldTable](current) || O.unwrap[*type.FieldTable](current).fields_start == prior_start) { ret 12; }
+        val field: O.Option[*type.FieldEntry] = type.field_at(?s.types, first, 0);
+        if (O.is_none[*type.FieldEntry](field) || O.unwrap[*type.FieldEntry](field).ty != to_second) { ret 13; }
+        if (!session.type_is_packed(?s, first::u32) || !session.type_is_volatile(?s, first::u32)) { ret 14; }
+        val alignment: O.Option[u32] = session.type_align(?s, first::u32);
+        if (O.is_none[u32](alignment) || O.unwrap[u32](alignment) != 16) { ret 15; }
+        val before: usize = T.live_count(?tracker);
+        if (R.is_err[R.Void, str](install(?s, ?graph)) || T.live_count(?tracker) != before) { ret 16; }
+        if (iteration == 1) { baseline = T.live_count(?tracker); }
+        if (iteration > 1 && T.live_count(?tracker) != baseline) { ret 17; }
+        iteration = iteration + 1;
+    }
+    dnit(?graph);
+    graph_live = false;
+    session.dnit(?s);
+    session_live = false;
+    if (T.live_count(?tracker) != 0 || T.double_free_count(?tracker) != 0) { ret 18; }
+    ret 0;
+}
+
+rec RecipeProbe {
+    s: *session.Session;
+    calls: u32;
+}
+
+fun t_recipe_prepare(probe: *RecipeProbe, ty: type.TypeId) R.Result[R.Void, fail.Fail] {
+    val found: O.Option[*type.Type] = type.get(?probe.s.types, ty);
+    if (O.is_none[*type.Type](found)) { ret R.err[R.Void, fail.Fail](fail.message("recipe type is missing")); }
+    val kind: type.TypeKind = O.unwrap[*type.Type](found).kind;
+    if (kind != type.TYPE_REC && kind != type.TYPE_UNI && kind != type.TYPE_TAG) {
+        ret R.err[R.Void, fail.Fail](fail.message("capture tried to materialize an instance"));
+    }
+    probe.calls = probe.calls + 1;
+    ret R.ok_void[fail.Fail]();
+}
+
+fun t_instance_pointer(s: *session.Session, nominal: type.TypeId, argument: type.TypeId) R.Result[type.TypeId, str] {
+    var args: [1]type.TypeId;
+    args[0] = argument;
+    val instance: R.Result[type.TypeId, str] = type.intern_instance(?s.types, nominal, ?args[0], 1);
+    if (R.is_err[type.TypeId, str](instance)) { ret instance; }
+    ret type.intern_pointer(?s.types, R.unwrap_ok[type.TypeId, str](instance));
+}
+
+test "mach.lang.fe.sema.fields:growing_pointer_recipe_does_not_expand_incidental_instances" {
+    var tracker: T.Testing;
+    if (O.is_some[str](T.make(?tracker))) { ret 1; }
+    fin { T.dnit(?tracker); }
+    val alloc: *A.Allocator = T.allocator_of(?tracker);
+    val initialized: R.Result[session.Session, str] = session.init(alloc);
+    if (R.is_err[session.Session, str](initialized)) { ret 2; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](initialized);
+    fin { session.dnit(?s); }
+    val nom_r: R.Result[type.TypeId, str] = type.intern_nominal(?s.types, 1::intern.StrId, type.TypeOwner{ module: 0, file: 0 }, type.TYPE_REC);
+    val gp_r: R.Result[type.TypeId, str] = type.intern_generic_param(?s.types, 2::intern.StrId, type.TypeOwner{ module: 0, file: 0 }, 1::intern.StrId, type.TYPE_REC, 0);
+    if (R.is_err[type.TypeId, str](nom_r) || R.is_err[type.TypeId, str](gp_r)) { ret 3; }
+    val nominal: type.TypeId = R.unwrap_ok[type.TypeId, str](nom_r);
+    val argument_pointer: R.Result[type.TypeId, str] = type.intern_pointer(?s.types, R.unwrap_ok[type.TypeId, str](gp_r));
+    if (R.is_err[type.TypeId, str](argument_pointer)) { ret 4; }
+    val next_template: R.Result[type.TypeId, str] = t_instance_pointer(?s, nominal, R.unwrap_ok[type.TypeId, str](argument_pointer));
+    if (R.is_err[type.TypeId, str](next_template)) { ret 5; }
+    val template_type: type.TypeId = R.unwrap_ok[type.TypeId, str](next_template);
+    if (R.is_err[R.Void, str](t_one_field(?s, nominal, template_type))) { ret 6; }
+    val primitive: O.Option[type.TypeId] = type.prim(?s.types, type.TYPE_U32);
+    if (O.is_none[type.TypeId](primitive)) { ret 7; }
+    var args: [1]type.TypeId;
+    args[0] = O.unwrap[type.TypeId](primitive);
+    val instance_r: R.Result[type.TypeId, str] = type.intern_instance(?s.types, nominal, ?args[0], 1);
+    if (R.is_err[type.TypeId, str](instance_r)) { ret 8; }
+    var instance: type.TypeId = R.unwrap_ok[type.TypeId, str](instance_r);
+    var roots: Roots = Roots{ data: ?instance, len: 1 };
+    var probe: RecipeProbe = RecipeProbe{ s: ?s, calls: 0 };
+    val cold_r: R.Result[Graph, fail.Fail] = capture[RecipeProbe](?s, alloc, ?roots, 1, RECIPES, nil, ?probe, t_recipe_prepare);
+    if (R.is_err[Graph, fail.Fail](cold_r)) { ret 9; }
+    var cold: Graph = R.unwrap_ok[Graph, fail.Fail](cold_r);
+    fin { dnit(?cold); }
+    if (probe.calls != 1 || cold.nodes.len != 1 || cold.nodes.data[0].ty != nominal) { ret 10; }
+    if (cold.nodes.data[0].entries.len != 1 || cold.nodes.data[0].entries.data[0].ty != template_type) { ret 11; }
+    if (O.is_some[*type.FieldTable](type.field_table_for(?s.types, instance))) { ret 12; }
+    val to_primitive: R.Result[type.TypeId, str] = type.intern_pointer(?s.types, args[0]);
+    if (R.is_err[type.TypeId, str](to_primitive)) { ret 13; }
+    val next_concrete: R.Result[type.TypeId, str] = t_instance_pointer(?s, nominal, R.unwrap_ok[type.TypeId, str](to_primitive));
+    if (R.is_err[type.TypeId, str](next_concrete)) { ret 14; }
+    if (R.is_err[R.Void, str](t_one_field(?s, instance, R.unwrap_ok[type.TypeId, str](next_concrete)))) { ret 15; }
+    probe.calls = 0;
+    val warm_r: R.Result[Graph, fail.Fail] = capture[RecipeProbe](?s, alloc, ?roots, 1, RECIPES, nil, ?probe, t_recipe_prepare);
+    if (R.is_err[Graph, fail.Fail](warm_r)) { ret 16; }
+    var warm: Graph = R.unwrap_ok[Graph, fail.Fail](warm_r);
+    fin { dnit(?warm); }
+    if (probe.calls != 1 || warm.nodes.len != cold.nodes.len || warm.nodes.data[0].ty != nominal) { ret 17; }
+    if (warm.nodes.data[0].entries.len != 1 || warm.nodes.data[0].entries.data[0].ty != template_type) { ret 18; }
+    probe.calls = 0;
+    val full_r: R.Result[Graph, fail.Fail] = capture[RecipeProbe](?s, alloc, ?roots, 1, MATERIALIZED, nil, ?probe, t_recipe_prepare);
+    if (R.is_err[Graph, fail.Fail](full_r)) { ret 19; }
+    var full: Graph = R.unwrap_ok[Graph, fail.Fail](full_r);
+    fin { dnit(?full); }
+    if (probe.calls != 1 || full.nodes.len != 2) { ret 20; }
+    ret 0;
+}
+
+test "mach.lang.fe.sema.fields:handle_edges_follow_constructor_schema_and_skip_literal_words" {
+    var tracker: T.Testing;
+    if (O.is_some[str](T.make(?tracker))) { ret 1; }
+    fin { T.dnit(?tracker); }
+    val initialized: R.Result[session.Session, str] = session.init(T.allocator_of(?tracker));
+    if (R.is_err[session.Session, str](initialized)) { ret 2; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](initialized);
+    fin { session.dnit(?s); }
+    var word_schema: u32 = isa.TYPE_OPERAND_WORD;
+    var wrapper_schema: [2]u32 = [2]u32{ isa.TYPE_OPERAND_WORD, 10 };
+    var constructors: [2]isa.TypeDef;
+    constructors[0] = isa.type_def("word", 10, ?word_schema, 1, nil);
+    constructors[1] = isa.type_def("wrapper", 11, ?wrapper_schema[0], 2, nil);
+    var defs: isa.TargetDefs = isa.TargetDefs{ types: ?constructors[0], type_count: 2 };
+    var literal: u32 = 0xFFFFFFFD;
+    val leaf: R.Result[type.TypeId, str] = type.intern_handle(?s.types, 1, 10, ?literal, 1);
+    if (R.is_err[type.TypeId, str](leaf)) { ret 3; }
+    var operands: [2]u32 = [2]u32{ literal, R.unwrap_ok[type.TypeId, str](leaf)::u32 };
+    val wrapper: R.Result[type.TypeId, str] = type.intern_handle(?s.types, 2, 11, ?operands[0], 2);
+    if (R.is_err[type.TypeId, str](wrapper)) { ret 4; }
+    var root: type.TypeId = R.unwrap_ok[type.TypeId, str](wrapper);
+    var roots: Roots = Roots{ data: ?root, len: 1 };
+    val captured: R.Result[Graph, fail.Fail] = capture[session.Session](?s, s.alloc, ?roots, 1, RECIPES, ?defs, ?s, t_prepared);
+    if (R.is_err[Graph, fail.Fail](captured)) { ret 5; }
+    var graph: Graph = R.unwrap_ok[Graph, fail.Fail](captured);
+    dnit(?graph);
+    constructors[0].operands = ?wrapper_schema[1];
+    val refused: R.Result[Graph, fail.Fail] = capture[session.Session](?s, s.alloc, ?roots, 1, RECIPES, ?defs, ?s, t_prepared);
+    if (R.is_ok[Graph, fail.Fail](refused)) {
+        graph = R.unwrap_ok[Graph, fail.Fail](refused);
+        dnit(?graph);
+        ret 6;
+    }
+    if (R.unwrap_err[Graph, fail.Fail](refused).kind != fail.MESSAGE) { ret 7; }
+    ret 0;
+}

@@ -71,7 +71,7 @@ a cross-compilation case is that they differ — `pe-import-claim` runs on the
 `x86_64-linux` leg and builds `x86_64-windows`, and the import table it reads is a
 fact no Windows runner is needed to establish.
 
-`engine none` rows (spirv, mos6502, riscv32) are targets and never legs. A link case
+`engine none` rows (spirv, riscv32) are targets and never legs. A link case
 reaches them through `target:` in its `case.conf`.
 
 ## The case manifest

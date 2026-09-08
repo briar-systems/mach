@@ -112,7 +112,8 @@ Every issue in the v5 required set must finish before publication, including the
 4.30.0 and audited std prerequisites. Consolidation transfers unfinished work to
 its named owner. Additional RV32 dynamic output, embedded E-base machines and
 specialized integer matmul are tracked in post-v5 milestones. Android expansion
-and MOS 6502 are withdrawn.
+and MOS 6502 are withdrawn. The MOS instruction set, ABI and registry entries
+are deleted. Shared width legalization remains part of the retained backend.
 
 Release artifacts and tags identify the validated source. Historical bootstrap
 and proof references are preserved before obsolete branches are removed.

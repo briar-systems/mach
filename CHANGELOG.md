@@ -7,15 +7,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Canonical RISC-V extension selection bounds generated instructions, named
+  assembly, object attributes and header flags while preserving explicit ABIs.
+
+- Integer vector division follows scalar division per lane, preserving signedness
+  and rejecting secret operands. Targets without packed division scalarize it.
+
+- Persistent object-image caching across compiler processes, bounded entry storage, and `--no-cache` for build and test.
+- `mach fmt <project-path> [--check]` formats declared project source without
+  fetching dependencies or building. Check mode is read only, and file replacement
+  uses held-root publication while preserving exact POSIX permission bits.
+
+### Removed
+
+- Implicit dependency public entries. Bare imports require an explicitly defaulted
+  library artifact, and source-only dependencies use full module paths.
+
+- Dependency alias keys, nonempty nested dependency realizations, and root
+  `mach.lock` files. Empty dependency placeholders remain permitted.
+
+- Legacy declassification spellings `:^` and `:^T`. Use `:>T` with an explicit
+  public result type, including pointer and array types. Ordinary `::^T` casts remain.
+
+- Withdrawn MOS 6502 instruction set, ABI, registry entries and corpus column.
+  Shared width legalization and retained target coverage remain available.
+
 ### Fixed
 
-- Relocatable linking preserves native sections, symbols, imports, attributes and
-  relocation relations across ELF, Mach-O and COFF. Final linking resolves absolute
-  definitions separately from image-relative symbols (#3119).
+- Relocatable linking preserves native section identities, symbol definitions,
+  import declarations and relocation relations instead of applying final-image
+  section merging. ELF groups, Mach-O indirect symbols and difference relocations,
+  and COFF native imports survive object round trips. Unsupported native
+  representations are diagnosed instead of silently losing metadata. (#3119)
+
+- Release inlining acquires eligible bodies across module boundaries with bounded
+  owned storage, preserving symbol identity, assembly effects and debug metadata.
+  Provider body changes invalidate importers even when a body was previously
+  ineligible. Recursive peeling respects `noinline`, `scalar`, and naked function
+  boundaries, and call cycles are detected in one traversal. (#3110)
+
+- SPIR-V calls carry typed logical arguments and results without a synthetic
+  register bank. Whole-object reference parameters preserve their pointee types.
+
+- Serial optimization records its processed modules, and parallel lowering counts
+  each module once in progress output.
+
+- Comptime evaluation distinguishes unknown internal tags from unsupported values
+  and rejects comparisons of reflection descriptors without equality semantics.
+
+- Test listing stops after collecting tests without generating or linking machine code.
+- Required vector lowering preserves volatile accesses and runs in functions that
+  contain volatile I/O.
+
+- Native encoder failures preserve full opcode values and report owned diagnostics.
+  Selected target instructions are validated in their own opcode domain.
+
+- Darwin persistent cache identity hashes the compiler executable through its own
+  code mapping, including when the loader inserts libraries before that executable.
+
+- Darwin linker planning releases temporary working-directory and runtime search
+  paths after copying their results, including rejected and undersized outputs.
+
+- Embedded files resolve consistently with relative or absolute project and source
+  paths. Project containment still rejects traversal and symlink escapes.
+
+- Unknown syntax, operator, IR operand and backend instruction, operand and register
+  class tags report internal failures with their catalog and numeric value. Verifier diagnostics own their text and propagate
+  allocation failures without losing tag or source information.
+
+- Constant expressions evaluate nested scalar casts and preserve integer widths and
+  signedness. Failed global initializers reject compilation and cannot publish zero
+  values or successful cached lowering products. Nonnumeric equal-size casts retain
+  their representation in both constant evaluation and runtime lowering.
+
+- Dotted import, re-export and type names resolve identically with spacing or comments around dots. Diagnostics retain the original source spans.
+- Embedded files are read through held directory and file handles. Escaping paths
+  and symlinks are rejected before reading, and failed refreshes preserve cache
+  ownership and the prior query input.
+
+- Build planning, driver setup and request hashing reject unknown request catalog values. Invalid phases report their tag and catalog instead of appearing as linking, and invalid goals no longer masquerade as allocation failures.
 
 - Instruction selection preserves each register operand's required bank. Post-allocation
   verification independently rejects wrong-bank operands, including conversions,
   moves, and memory addresses.
+- Compiler directory scans use owned cursors and typed cleanup errors. Process
+  supervision preserves complete exit codes and native wait causes, and releases
+  stale child ownership without inventing a completion after `ECHILD`.
 
 - Memory promotion removes unreachable blocks before rewriting locals, preserving
   valid IR when an unconditional loop leaves a dead cleanup or return path.
@@ -29,10 +108,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Vector operations require an explicit target capability row. Missing or malformed
+  operation and lane shapes no longer default to packed support.
+
+- Removed `$project.name`, `$project.description` and the `$mach.abi.sysv` alias. Diagnostics identify the removed forms, and the ABI tag uses only `sysv64`.
+
 - Every dependency action selects its project with `mach dep <action> <path>`.
   Dependency names follow the path. Missing or extra operands are refused.
   Use `.` for the current project. Pull retains existing local copies and update
   refreshes them. Dependency commands preserve the project's Git history.
+- Removed the ignored manifest keys `[project].name`, `description`, `mach`, and `[profile.*].emit_ir`/`emit_asm`. Use the CLI emission switches for side artifacts.
+- Editor analysis returns an owned diagnostic/source snapshot with explicit phase and target selection. Raw products have checked serial-view lifetimes. Closing a buffer retires its overlay, source payload and cached dependents while retaining its FileId. Buffer slots are reused, and checked editor teardown preserves owners on preparation failure (#2999).
+- Root and dependency manifests share one strict schema. Profiles explicitly declare all compilation policy, and ambiguous target, profile, or artifact selections require a selector or a declared default.
+- Manifest requirements use explicit `step.<name>` and `artifact.<name>` categories, including category-specific globs. Step cycles are rejected during manifest parsing.
+
+### Added
+
+- `#[deprecated]` and `#[deprecated("message")]` warn once per external source
+  use, preserving notices through imports, generics, and re-exports.
+
+- `{artifact.suffix}` expands artifact output extensions through the target naming rules. Scaffolds use one artifact across supported targets, and collision checks compare expanded paths for the selected target.
+
+- `mach build <path> --plan` reports the selected entries, prerequisites, outputs and link requirements through the shared planner. It replaces `--explain`.
+
+- `mach check <path>` checks selected artifact source through the shared frontend without executing build steps or producing artifacts.
 
 ## [4.30.0] - 2026-09-07
 
@@ -198,6 +297,7 @@ The pin moves from 0.28.1 to std 1.0.1, the audited transition dependency.
 
 - Reclaim vector scalarization maps and lane work after each function while retaining emitted operands in IR-owned storage.
 - Loop-invariant motion and scalar replacement reclaim analysis and rewrite plans after each function or transformation round, while emitted IR operands retain module ownership (#2299).
+- Register liveness propagates through recorded uses and predecessor edges instead of allocating four block-by-register matrices. Scratch storage grows with actual references, blocks, registers and edges, and is released when liveness finishes (#2299).
 - Optimization releases mem2reg, constant-folding, algebraic, common-subexpression and dead-code work tables after each function, and verifier scratch after each check, instead of retaining them in the lowered IR arena (#2299).
 
 - Three Windows corpus disassemblies now reflect the verified vector carrier ABI, including direct eight-byte payloads and exact twelve-byte staging (#3199).

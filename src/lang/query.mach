@@ -5,14 +5,15 @@ use std.collections.vector;
 use std.collections.vector.Vector;
 use std.format;
 use std.memory;
+use std.text.string.str_dup;
+use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
-use std.types.char.char;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_contains;
-use std.types.string.str_len;
+use std.types.string.str_equals;
 
 use A: std.allocator;
 use O: std.types.option;
@@ -47,6 +48,8 @@ pub val Q_LOWERED_SURFACE: QueryKind = 17;
 pub val Q_EMBED_FILE: QueryKind = 18;
 pub val Q_CODEGEN_FLAGS: QueryKind = 19;
 pub val Q_GATE_TERMINAL: QueryKind = 20;
+pub val Q_INLINE_BODIES: QueryKind = 21;
+pub val Q_BINDING_INTERFACE: QueryKind = 22;
 
 pub def Revision: u64;
 
@@ -58,7 +61,54 @@ pub val SHARD_METADATA: ShardRole = 2;
 
 pub def FinalizeFn: fun(*u8, u32, *A.Allocator);
 
-pub def RevisionFn: fun(u64) Revision;
+pub rec MetadataRevision {
+    present: bool;
+    revision: Revision;
+}
+
+pub def RevisionFn: fun(ptr, u64) R.Result[MetadataRevision, fail.Fail];
+
+pub rec RevisionProvider {
+    context: ptr;
+    read: RevisionFn;
+}
+
+pub rec QueryKey {
+    kind: QueryKind;
+    key: u64;
+}
+
+pub rec Operation {
+    owner: ptr;
+    sequence: u64;
+}
+
+pub rec PreparedQuery {
+    operation: Operation;
+    key: QueryKey;
+}
+
+pub rec Presentation {
+    alloc: *A.Allocator;
+    diags: diagnostic.DiagnosticStore;
+    failure: O.Option[fail.Fail];
+    message: str;
+    message_alloc: *A.Allocator;
+}
+
+rec MetadataSample {
+    key: QueryKey;
+    value: MetadataRevision;
+}
+
+rec Attempt {
+    key: QueryKey;
+    prepared: *QueryEntry;
+    fresh: bool;
+    cancelled: bool;
+    failed: bool;
+    evidence: QueryEntry;
+}
 
 pub rec QueryOutput {
     bytes: *u8;
@@ -69,9 +119,18 @@ pub rec Dep {
     kind:         QueryKind;
     key:          u64;
     last_changed: Revision;
+    diagnostics_changed: Revision;
+    present: bool;
+    observed: bool;
 }
 
-pub rec QueryEntry {
+pub rec QueryView {
+    value: *u8;
+    value_len: u32;
+    last_changed: Revision;
+}
+
+rec QueryEntry {
     key:          u64;
     value:        *u8;
     value_len:    u32;
@@ -80,6 +139,8 @@ pub rec QueryEntry {
     dep_len:      u32;
     dep_cap:      u32;
     diags:        *diagnostic.DiagnosticStore;
+    diagnostics_changed: Revision;
+    ready: bool;
 }
 
 pub rec QueryEntryDomain {}
@@ -98,8 +159,9 @@ rec StackFrame {
 pub rec QueryShard {
     kind:       QueryKind;
     role:       ShardRole;
-    revisions:  RevisionFn;
+    revisions:  RevisionProvider;
     finalize:   FinalizeFn;
+    equal: fun(*u8, u32, *u8, u32) bool;
     registered: bool;
     entries:    handle.HandleTable[QueryEntry, QueryEntryDomain];
     index:      Vector[QueryIndexEntry];
@@ -114,15 +176,25 @@ pub rec QueryDb {
     kinds:        u32;
     compute_depth: u32;
     stack:        Vector[StackFrame];
+    prepared_count: usize;
+    operation_sequence: u64;
+    operation_active: bool;
+    presentation_pending: bool;
+    operation_failure: O.Option[fail.Fail];
+    operation_message: str;
+    attempts: Vector[Attempt];
+    attempt_index: Map[QueryKey, usize];
+    validated: Map[QueryKey, Revision];
+    metadata: Vector[MetadataSample];
+    metadata_index: Map[QueryKey, usize];
 }
 
 pub rec QueryCapabilities[T] {
-    compute: fun(*T, QueryKind, u64, *A.Allocator) R.Result[QueryOutput, fail.Fail];
+    compute: fun(*T, QueryKind, u64, *A.Allocator, *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail];
 }
 
 pub rec QueryRuntime[T] {
     db:    *QueryDb;
-    diags: *diagnostic.DiagnosticStore;
     caps:  QueryCapabilities[T];
 }
 
@@ -139,11 +211,27 @@ pub fun init(a: *A.Allocator) R.Result[QueryDb, str] {
     db.kinds         = 0;
     db.compute_depth = 0;
     db.stack         = vector.init[StackFrame](a);
+    db.prepared_count = 0;
+    db.operation_sequence = 0;
+    db.operation_active = false;
+    db.presentation_pending = false;
+    db.operation_failure = O.none[fail.Fail]();
+    db.operation_message = nil;
+    db.attempts = vector.init[Attempt](a);
+    db.attempt_index = map.init[QueryKey, usize](a, query_key_hash, query_key_equal);
+    db.validated = map.init[QueryKey, Revision](a, query_key_hash, query_key_equal);
+    db.metadata = vector.init[MetadataSample](a);
+    db.metadata_index = map.init[QueryKey, usize](a, query_key_hash, query_key_equal);
     ret R.ok[QueryDb, str](db);
 }
 
 pub fun dnit(db: *QueryDb) {
     if (db == nil) { ret; }
+
+    attempts_clear(db);
+    if (db.operation_message != nil) { str_free(db.a, db.operation_message); db.operation_message = nil; }
+    vector.dnit[Attempt](?db.attempts);
+    map.dnit[QueryKey, usize](?db.attempt_index);
 
     if (db.storage != nil) {
         var i: u32 = 0;
@@ -157,6 +245,10 @@ pub fun dnit(db: *QueryDb) {
     }
 
     vector.dnit[StackFrame](?db.stack);
+    map.dnit[QueryKey, Revision](?db.validated);
+    vector.dnit[MetadataSample](?db.metadata);
+    map.dnit[QueryKey, usize](?db.metadata_index);
+    db.operation_active = false;
 
     db.storage     = nil;
     db.storage_cap = 0;
@@ -165,15 +257,15 @@ pub fun dnit(db: *QueryDb) {
 }
 
 pub fun register_input(db: *QueryDb, kind: QueryKind) R.Result[R.Void, str] {
-    ret register(db, kind, SHARD_INPUT, nil::RevisionFn);
+    ret register(db, kind, SHARD_INPUT, RevisionProvider{});
 }
 
 pub fun register_derived(db: *QueryDb, kind: QueryKind) R.Result[R.Void, str] {
-    ret register(db, kind, SHARD_DERIVED, nil::RevisionFn);
+    ret register(db, kind, SHARD_DERIVED, RevisionProvider{});
 }
 
 pub fun register_derived_owned(db: *QueryDb, kind: QueryKind, finalize: FinalizeFn) R.Result[R.Void, str] {
-    val res_register: R.Result[R.Void, str] = register(db, kind, SHARD_DERIVED, nil::RevisionFn);
+    val res_register: R.Result[R.Void, str] = register(db, kind, SHARD_DERIVED, RevisionProvider{});
     if (R.is_err[R.Void, str](res_register)) { ret res_register; }
 
     val sh: *QueryShard = ?db.storage[kind::u32];
@@ -181,22 +273,287 @@ pub fun register_derived_owned(db: *QueryDb, kind: QueryKind, finalize: Finalize
     ret R.ok_void[str]();
 }
 
-pub fun register_metadata(db: *QueryDb, kind: QueryKind, lookup: RevisionFn) R.Result[R.Void, str] {
-    ret register(db, kind, SHARD_METADATA, lookup);
+pub fun register_derived_equatable(db: *QueryDb, kind: QueryKind, finalize: FinalizeFn,
+                                  equal: fun(*u8, u32, *u8, u32) bool) R.Result[R.Void, str] {
+    if (finalize == nil || equal == nil) { ret R.err[R.Void, str]("owned query equality requires a finalizer and comparator"); }
+    val registered: R.Result[R.Void, str] = register_derived_owned(db, kind, finalize);
+    if (R.is_err[R.Void, str](registered)) { ret registered; }
+    db.storage[kind::u32].equal = equal;
+    ret R.ok_void[str]();
 }
 
-pub fun runtime[T](db: *QueryDb, diags: *diagnostic.DiagnosticStore,
-                   compute: fun(*T, QueryKind, u64, *A.Allocator) R.Result[QueryOutput, fail.Fail]) R.Result[QueryRuntime[T], str] {
+pub fun register_metadata(db: *QueryDb, kind: QueryKind, provider: RevisionProvider) R.Result[R.Void, str] {
+    if (provider.read == nil) { ret R.err[R.Void, str]("metadata query requires a revision provider"); }
+    ret register(db, kind, SHARD_METADATA, provider);
+}
+
+pub fun runtime[T](db: *QueryDb, compute: fun(*T, QueryKind, u64, *A.Allocator, *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail]) R.Result[QueryRuntime[T], str] {
     if (db == nil) { ret R.err[QueryRuntime[T], str]("query runtime requires a database"); }
-    if (diags == nil) { ret R.err[QueryRuntime[T], str]("query runtime requires a diagnostic store"); }
     if (compute == nil) { ret R.err[QueryRuntime[T], str]("query runtime requires a compute capability"); }
     var caps: QueryCapabilities[T];
     caps.compute = compute;
     var rt: QueryRuntime[T];
     rt.db    = db;
-    rt.diags = diags;
     rt.caps  = caps;
     ret R.ok[QueryRuntime[T], str](rt);
+}
+
+fun query_key_hash(raw: ptr) u64 {
+    val key: *QueryKey = raw::*QueryKey;
+    var mixed: u64 = key.key ^ (key.kind::u64 * 0x9e3779b97f4a7c15);
+    mixed = (mixed ^ (mixed >> 30)) * 0xbf58476d1ce4e5b9;
+    mixed = (mixed ^ (mixed >> 27)) * 0x94d049bb133111eb;
+    ret mixed ^ (mixed >> 31);
+}
+
+fun query_key_equal(left: ptr, right: ptr) bool {
+    val a: *QueryKey = left::*QueryKey;
+    val b: *QueryKey = right::*QueryKey;
+    ret a.kind == b.kind && a.key == b.key;
+}
+
+pub fun begin(db: *QueryDb) R.Result[Operation, str] {
+    if (db == nil) { ret R.err[Operation, str]("query operation requires a database"); }
+    if (db.operation_active || db.stack.len != 0) { ret R.err[Operation, str]("query operation is already active"); }
+    if (db.presentation_pending) { ret R.err[Operation, str]("collect or discard the previous query presentation first"); }
+    if (db.operation_sequence == ~(0::u64)) { ret R.err[Operation, str]("query operation sequence exhausted"); }
+    map.clear[QueryKey, Revision](?db.validated);
+    map.clear[QueryKey, usize](?db.metadata_index);
+    db.metadata.len = 0;
+    db.operation_sequence = db.operation_sequence + 1;
+    db.operation_active = true;
+    db.operation_failure = O.none[fail.Fail]();
+    ret R.ok[Operation, str](Operation{ owner: db::ptr, sequence: db.operation_sequence });
+}
+
+pub fun end(db: *QueryDb, operation: Operation) R.Result[R.Void, fail.Fail] {
+    if (db == nil || operation.owner != db::ptr || !db.operation_active || operation.sequence != db.operation_sequence) {
+        ret R.err[R.Void, fail.Fail](fail.message("query operation is stale or belongs to another database"));
+    }
+    if (db.stack.len != 0) { ret R.err[R.Void, fail.Fail](fail.message("cannot end a query operation during computation")); }
+    if (db.prepared_count != 0) { ret R.err[R.Void, fail.Fail](fail.message("cannot end a query operation with unfinished prepared products")); }
+    fin {
+        db.operation_active = false;
+        db.presentation_pending = true;
+    }
+    if (O.is_some[fail.Fail](db.operation_failure)) { ret R.err[R.Void, fail.Fail](O.unwrap[fail.Fail](db.operation_failure)); }
+    var i: usize = 0;
+    for (i < db.metadata.len) {
+        val sample: MetadataSample = db.metadata.data[i];
+        val provider: RevisionProvider = db.storage[sample.key.kind::u32].revisions;
+        val current: R.Result[MetadataRevision, fail.Fail] = provider.read(provider.context, sample.key.key);
+        if (R.is_err[MetadataRevision, fail.Fail](current)) {
+            operation_fail(db, R.unwrap_err[MetadataRevision, fail.Fail](current));
+            ret R.err[R.Void, fail.Fail](O.unwrap[fail.Fail](db.operation_failure));
+        }
+        val value: MetadataRevision = R.unwrap_ok[MetadataRevision, fail.Fail](current);
+        if (value.present != sample.value.present || value.revision != sample.value.revision) {
+            operation_fail(db, fail.message("external query metadata changed during the operation"));
+            ret R.err[R.Void, fail.Fail](O.unwrap[fail.Fail](db.operation_failure));
+        }
+        i = i + 1;
+    }
+    ret R.ok_void[fail.Fail]();
+}
+
+fun operation_fail(db: *QueryDb, failure: fail.Fail) {
+    if (O.is_some[fail.Fail](db.operation_failure)
+        && (O.unwrap[fail.Fail](db.operation_failure).kind == fail.MESSAGE || failure.kind == fail.REPORTED)) { ret; }
+    if (failure.kind == fail.REPORTED) { db.operation_failure = O.some[fail.Fail](failure); ret; }
+    val copied: R.Result[str, str] = str_dup(db.a, failure.message);
+    if (R.is_err[str, str](copied)) {
+        db.operation_failure = O.some[fail.Fail](fail.message(R.unwrap_err[str, str](copied)));
+        ret;
+    }
+    db.operation_message = R.unwrap_ok[str, str](copied);
+    db.operation_failure = O.some[fail.Fail](fail.message(db.operation_message));
+}
+
+fun attempt_prepare(db: *QueryDb, key: QueryKey) R.Result[usize, str] {
+    var lookup: QueryKey = key;
+    val prior: R.Result[*usize, str] = map.get[QueryKey, usize](?db.attempt_index, ?lookup);
+    if (R.is_ok[*usize, str](prior)) { ret R.ok[usize, str](@R.unwrap_ok[*usize, str](prior)); }
+    val index: usize = db.attempts.len;
+    val added: R.Result[usize, str] = vector.push[Attempt](?db.attempts, Attempt{ key: key });
+    if (R.is_err[usize, str](added)) { ret added; }
+    val indexed: R.Result[bool, str] = map.insert[QueryKey, usize](?db.attempt_index, key, index);
+    if (R.is_err[bool, str](indexed)) {
+        db.attempts.len = index;
+        ret R.err[usize, str](R.unwrap_err[bool, str](indexed));
+    }
+    ret R.ok[usize, str](index);
+}
+
+fun attempt_preserve(db: *QueryDb, sh: *QueryShard, index: usize, candidate: *QueryEntry) {
+    val attempt: *Attempt = ?db.attempts.data[index];
+    attempt.failed = true;
+    attempt.evidence.deps = candidate.deps;
+    attempt.evidence.dep_len = candidate.dep_len;
+    attempt.evidence.dep_cap = candidate.dep_cap;
+    attempt.evidence.diags = candidate.diags;
+    candidate.deps = nil;
+    candidate.dep_len = 0;
+    candidate.dep_cap = 0;
+    candidate.diags = nil;
+    entry_free(db, sh, candidate);
+}
+
+fun attempts_clear(db: *QueryDb) {
+    var i: usize = 0;
+    for (i < db.attempts.len) {
+        val attempt: *Attempt = ?db.attempts.data[i];
+        if (attempt.prepared != nil) {
+            entry_free(db, ?db.storage[attempt.key.kind::u32], attempt.prepared);
+            A.deallocate[QueryEntry](db.a, attempt.prepared, 1);
+        }
+        entry_free(db, ?db.storage[attempt.key.kind::u32], ?attempt.evidence);
+        i = i + 1;
+    }
+    db.attempts.len = 0;
+    db.prepared_count = 0;
+    map.clear[QueryKey, usize](?db.attempt_index);
+}
+
+pub fun discard(db: *QueryDb, operation: Operation) R.Result[R.Void, str] {
+    if (db == nil || operation.owner != db::ptr || operation.sequence != db.operation_sequence
+        || db.operation_active || !db.presentation_pending) {
+        ret R.err[R.Void, str]("query presentation is stale or not ready");
+    }
+    attempts_clear(db);
+    if (db.operation_message != nil) { str_free(db.a, db.operation_message); db.operation_message = nil; }
+    map.clear[QueryKey, Revision](?db.validated);
+    map.clear[QueryKey, usize](?db.metadata_index);
+    db.metadata.len = 0;
+    db.operation_failure = O.none[fail.Fail]();
+    db.presentation_pending = false;
+    ret R.ok_void[str]();
+}
+
+# the caller takes the optional string allocated by db.a before discarding a failed collection
+pub fun take_failure_message(db: *QueryDb, operation: Operation) R.Result[str, str] {
+    if (db == nil || operation.owner != db::ptr || operation.sequence != db.operation_sequence
+        || db.operation_active || !db.presentation_pending) {
+        ret R.err[str, str]("query failure message is stale or not ready");
+    }
+    val message: str = db.operation_message;
+    db.operation_message = nil;
+    ret R.ok[str, str](message);
+}
+
+pub fun collect(db: *QueryDb, operation: Operation, roots: *QueryKey, count: usize,
+                a: *A.Allocator) R.Result[*Presentation, str] {
+    if (db == nil || operation.owner != db::ptr || operation.sequence != db.operation_sequence
+        || db.operation_active || !db.presentation_pending) {
+        ret R.err[*Presentation, str]("query presentation is stale or not ready");
+    }
+    if (roots == nil && count != 0) { ret R.err[*Presentation, str]("query presentation roots are nil"); }
+    val allocated: R.Result[*Presentation, str] = A.allocate[Presentation](a, 1);
+    if (R.is_err[*Presentation, str](allocated)) { ret allocated; }
+    val result: *Presentation = R.unwrap_ok[*Presentation, str](allocated);
+    result.alloc = a;
+    result.diags = diagnostic.store_init(a);
+    result.failure = O.none[fail.Fail]();
+    result.message = nil;
+    result.message_alloc = db.a;
+    val store: *diagnostic.DiagnosticStore = ?result.diags;
+    var complete: bool = false;
+    fin {
+        if (!complete) {
+            presentation_dnit(result);
+        }
+    }
+    var visited: Map[QueryKey, u8] = map.init[QueryKey, u8](a, query_key_hash, query_key_equal);
+    fin { map.dnit[QueryKey, u8](?visited); }
+    var i: usize = 0;
+    for (i < count) {
+        val copied: R.Result[R.Void, str] = collect_node(db, roots[i], ?visited, store);
+        if (R.is_err[R.Void, str](copied)) { ret R.err[*Presentation, str](R.unwrap_err[R.Void, str](copied)); }
+        i = i + 1;
+    }
+    result.failure = db.operation_failure;
+    result.message = db.operation_message;
+    db.operation_message = nil;
+    val released: R.Result[R.Void, str] = discard(db, operation);
+    if (R.is_err[R.Void, str](released)) { ret R.err[*Presentation, str](R.unwrap_err[R.Void, str](released)); }
+    complete = true;
+    ret R.ok[*Presentation, str](result);
+}
+
+pub fun presentation_dnit(p: *Presentation) {
+    if (p == nil) { ret; }
+    val a: *A.Allocator = p.alloc;
+    diagnostic.store_dnit(?p.diags);
+    if (p.message != nil) { str_free(p.message_alloc, p.message); }
+    A.deallocate[Presentation](a, p, 1);
+}
+
+fun collect_node(db: *QueryDb, key: QueryKey, visited: *Map[QueryKey, u8],
+                 into: *diagnostic.DiagnosticStore) R.Result[R.Void, str] {
+    var lookup: QueryKey = key;
+    val prior: R.Result[*u8, str] = map.get[QueryKey, u8](visited, ?lookup);
+    if (R.is_ok[*u8, str](prior)) {
+        if (@R.unwrap_ok[*u8, str](prior) == 1) { ret R.err[R.Void, str]("query diagnostic provenance contains a cycle"); }
+        ret R.ok_void[str]();
+    }
+    val entered: R.Result[bool, str] = map.insert[QueryKey, u8](visited, key, 1);
+    if (R.is_err[bool, str](entered)) { ret R.void_of[bool, str](entered); }
+    var entry: *QueryEntry = nil;
+    val attempted: R.Result[*usize, str] = map.get[QueryKey, usize](?db.attempt_index, ?lookup);
+    if (R.is_ok[*usize, str](attempted)) {
+        val attempt: *Attempt = ?db.attempts.data[@R.unwrap_ok[*usize, str](attempted)];
+        if (attempt.failed) { entry = ?attempt.evidence; }
+    }
+    if (entry == nil) {
+        val current: R.Result[*Revision, str] = map.get[QueryKey, Revision](?db.validated, ?lookup);
+        if (R.is_ok[*Revision, str](current) && @R.unwrap_ok[*Revision, str](current) != 0) {
+            val sh: *QueryShard = ?db.storage[key.kind::u32];
+            entry = entry_find(sh, key.key);
+            if (entry == nil || !entry.ready || entry.last_changed != @R.unwrap_ok[*Revision, str](current)) {
+                ret R.err[R.Void, str]("query presentation owner changed after validation");
+            }
+        }
+    }
+    if (entry != nil) {
+        var i: u32 = 0;
+        for (i < entry.dep_len) {
+            val dep: Dep = entry.deps[i];
+            val copied: R.Result[R.Void, str] = collect_node(db, QueryKey{ kind: dep.kind, key: dep.key }, visited, into);
+            if (R.is_err[R.Void, str](copied)) { ret copied; }
+            i = i + 1;
+        }
+        if (entry.diags != nil) {
+            if (entry.diags.lost != 0) { ret R.err[R.Void, str]("query diagnostics contain a lost emission"); }
+            val copied: R.Result[R.Void, str] = diagnostic.replay_into(into, entry.diags);
+            if (R.is_err[R.Void, str](copied)) { ret copied; }
+        }
+    }
+    val state: R.Result[*u8, str] = map.get[QueryKey, u8](visited, ?lookup);
+    if (R.is_err[*u8, str](state)) { ret R.void_of[*u8, str](state); }
+    @R.unwrap_ok[*u8, str](state) = 2;
+    ret R.ok_void[str]();
+}
+
+fun sample_metadata(db: *QueryDb, kind: QueryKind, key: u64) R.Result[MetadataRevision, fail.Fail] {
+    if (!db.operation_active) { ret R.err[MetadataRevision, fail.Fail](fail.message("metadata read requires an active query operation")); }
+    val sr: R.Result[*QueryShard, str] = shard_get(db, kind);
+    if (R.is_err[*QueryShard, str](sr)) { ret fail.lift[MetadataRevision](R.err[MetadataRevision, str](R.unwrap_err[*QueryShard, str](sr))); }
+    val sh: *QueryShard = R.unwrap_ok[*QueryShard, str](sr);
+    if (sh.role != SHARD_METADATA) { ret R.err[MetadataRevision, fail.Fail](fail.message("metadata read requires a metadata query")); }
+    var pair: QueryKey = QueryKey{ kind: kind, key: key };
+    val prior: R.Result[*usize, str] = map.get[QueryKey, usize](?db.metadata_index, ?pair);
+    if (R.is_ok[*usize, str](prior)) { ret R.ok[MetadataRevision, fail.Fail](db.metadata.data[@R.unwrap_ok[*usize, str](prior)].value); }
+    val read: R.Result[MetadataRevision, fail.Fail] = sh.revisions.read(sh.revisions.context, key);
+    if (R.is_err[MetadataRevision, fail.Fail](read)) { ret read; }
+    val value: MetadataRevision = R.unwrap_ok[MetadataRevision, fail.Fail](read);
+    val index: usize = db.metadata.len;
+    val pushed: R.Result[usize, str] = vector.push[MetadataSample](?db.metadata, MetadataSample{ key: pair, value: value });
+    if (R.is_err[usize, str](pushed)) { ret fail.lift[MetadataRevision](R.err[MetadataRevision, str](R.unwrap_err[usize, str](pushed))); }
+    val indexed: R.Result[bool, str] = map.insert[QueryKey, usize](?db.metadata_index, pair, index);
+    if (R.is_err[bool, str](indexed)) {
+        db.metadata.len = index;
+        ret fail.lift[MetadataRevision](R.err[MetadataRevision, str](R.unwrap_err[bool, str](indexed)));
+    }
+    ret R.ok[MetadataRevision, fail.Fail](value);
 }
 
 pub fun is_registered(db: *QueryDb, kind: QueryKind) bool {
@@ -204,73 +561,530 @@ pub fun is_registered(db: *QueryDb, kind: QueryKind) bool {
     ret (?db.storage[kind::u32]).registered;
 }
 
-pub fun set_input(db: *QueryDb, kind: QueryKind, key: u64, value: *u8, value_len: u32) R.Result[R.Void, str] {
-    val res_shard: R.Result[*QueryShard, str] = shard_get(db, kind);
-    if (R.is_err[*QueryShard, str](res_shard)) {
-        ret R.err[R.Void, str](R.unwrap_err[*QueryShard, str](res_shard));
-    }
-    val sh: *QueryShard = R.unwrap_ok[*QueryShard, str](res_shard);
-
-    if (sh.role != SHARD_INPUT) {
-        ret R.err[R.Void, str]("set_input: kind is not an input query");
-    }
-
+fun next_revision(db: *QueryDb) R.Result[Revision, str] {
+    if (db.revision == ~(0::Revision)) { ret R.err[Revision, str]("query revision sequence exhausted"); }
     db.revision = db.revision + 1;
+    ret R.ok[Revision, str](db.revision);
+}
 
-    val existing: *QueryEntry = entry_find(sh, key);
-    if (existing != nil) {
-        val same: bool = existing.value_len == value_len
-            && memory.raw_equal(existing.value::ptr, value::ptr, value_len::usize);
-        if (same) { ret R.ok_void[str](); }
-
-        val res_copy: R.Result[*u8, str] = bytes_dup(db.a, value, value_len);
-        if (R.is_err[*u8, str](res_copy)) {
-            ret R.err[R.Void, str](R.unwrap_err[*u8, str](res_copy));
+pub fun set_input(db: *QueryDb, kind: QueryKind, key: u64, value: *u8, value_len: u32) R.Result[R.Void, str] {
+    if (db.operation_active || db.presentation_pending) { ret R.err[R.Void, str]("cannot change query inputs before the operation is released"); }
+    val res_shard: R.Result[*QueryShard, str] = shard_get(db, kind);
+    if (R.is_err[*QueryShard, str](res_shard)) { ret R.void_of[*QueryShard, str](res_shard); }
+    val sh: *QueryShard = R.unwrap_ok[*QueryShard, str](res_shard);
+    if (sh.role != SHARD_INPUT) { ret R.err[R.Void, str]("set_input: kind is not an input query"); }
+    if (value_len != 0 && value == nil) { ret R.err[R.Void, str]("input bytes are nil"); }
+    var entry: *QueryEntry = entry_find(sh, key);
+    if (entry != nil && entry.ready && entry.value_len == value_len
+        && memory.raw_equal(entry.value::ptr, value::ptr, value_len::usize)) { ret R.ok_void[str](); }
+    if (db.revision == ~(0::Revision)) { ret R.err[R.Void, str]("query revision sequence exhausted"); }
+    val copied: R.Result[*u8, str] = bytes_dup(db.a, value, value_len);
+    if (R.is_err[*u8, str](copied)) { ret R.void_of[*u8, str](copied); }
+    val bytes: *u8 = R.unwrap_ok[*u8, str](copied);
+    if (entry == nil) {
+        val added: R.Result[*QueryEntry, str] = entry_append(db, sh, key);
+        if (R.is_err[*QueryEntry, str](added)) {
+            if (bytes != nil && value_len != 0) { A.deallocate[u8](db.a, bytes, value_len::usize); }
+            ret R.void_of[*QueryEntry, str](added);
         }
-        if (existing.value != nil && existing.value_len > 0) {
-            A.deallocate[u8](db.a, existing.value, existing.value_len::usize);
-        }
-        existing.value        = R.unwrap_ok[*u8, str](res_copy);
-        existing.value_len    = value_len;
-        existing.last_changed = db.revision;
-        ret R.ok_void[str]();
+        entry = R.unwrap_ok[*QueryEntry, str](added);
     }
-
-    val res_copy: R.Result[*u8, str] = bytes_dup(db.a, value, value_len);
-    if (R.is_err[*u8, str](res_copy)) {
-        ret R.err[R.Void, str](R.unwrap_err[*u8, str](res_copy));
-    }
-
-    val res_entry: R.Result[*QueryEntry, str] = entry_append(db, sh, key);
-    if (R.is_err[*QueryEntry, str](res_entry)) {
-        val buf: *u8 = R.unwrap_ok[*u8, str](res_copy);
-        if (buf != nil && value_len > 0) { A.deallocate[u8](db.a, buf, value_len::usize); }
-        ret R.err[R.Void, str](R.unwrap_err[*QueryEntry, str](res_entry));
-    }
-    val entry: *QueryEntry = R.unwrap_ok[*QueryEntry, str](res_entry);
-    entry.value        = R.unwrap_ok[*u8, str](res_copy);
-    entry.value_len    = value_len;
-    entry.last_changed = db.revision;
+    if (entry.value != nil && entry.value_len != 0) { A.deallocate[u8](db.a, entry.value, entry.value_len::usize); }
+    entry.value = bytes;
+    entry.value_len = value_len;
+    entry.ready = true;
+    entry.last_changed = R.unwrap_ok[Revision, str](next_revision(db));
     ret R.ok_void[str]();
 }
 
 pub fun invalidate(db: *QueryDb, kind: QueryKind, key: u64) R.Result[R.Void, str] {
+    if (db.operation_active || db.presentation_pending) { ret R.err[R.Void, str]("cannot retire a query before the operation is released"); }
     val res_shard: R.Result[*QueryShard, str] = shard_get(db, kind);
-    if (R.is_err[*QueryShard, str](res_shard)) {
-        ret R.err[R.Void, str](R.unwrap_err[*QueryShard, str](res_shard));
-    }
-
-    db.revision = db.revision + 1;
-
-    entry_remove(db, R.unwrap_ok[*QueryShard, str](res_shard), key);
+    if (R.is_err[*QueryShard, str](res_shard)) { ret R.void_of[*QueryShard, str](res_shard); }
+    val sh: *QueryShard = R.unwrap_ok[*QueryShard, str](res_shard);
+    if (entry_find(sh, key) == nil) { ret R.ok_void[str](); }
+    val rev: R.Result[Revision, str] = next_revision(db);
+    if (R.is_err[Revision, str](rev)) { ret R.void_of[Revision, str](rev); }
+    entry_remove(db, sh, key);
     ret R.ok_void[str]();
 }
 
-pub fun get[T](rt: *QueryRuntime[T], ctx: *T, kind: QueryKind, key: u64) R.Result[*QueryEntry, fail.Fail] {
-    if (rt == nil || rt.db == nil || rt.diags == nil || rt.caps.compute == nil || ctx == nil) {
+pub rec PreparedRetirement {
+    owner: *QueryDb;
+    operation: u64;
+    revision: Revision;
+    keys: Vector[QueryKey];
+    selected: Map[QueryKey, usize];
+}
+
+rec RetireNode {
+    key: QueryKey;
+    entry: *QueryEntry;
+    first: usize;
+    dependents: usize;
+    selected: bool;
+}
+
+rec RetireEdge {
+    dependent: usize;
+    next: usize;
+}
+
+pub fun discard_retirement(prepared: *PreparedRetirement) {
+    if (prepared.owner == nil) { ret; }
+    vector.dnit[QueryKey](?prepared.keys);
+    map.dnit[QueryKey, usize](?prepared.selected);
+    prepared.owner = nil;
+}
+
+pub fun prepare_retirement(db: *QueryDb, roots: *QueryKey, count: usize) R.Result[PreparedRetirement, str] {
+    if (db == nil || db.operation_active || db.presentation_pending) {
+        ret R.err[PreparedRetirement, str]("cannot prepare query retirement during query use");
+    }
+    if (roots == nil && count != 0) { ret R.err[PreparedRetirement, str]("retirement roots are nil"); }
+    var prepared: PreparedRetirement = PreparedRetirement{
+        owner: db, operation: db.operation_sequence, revision: db.revision,
+        keys: vector.init[QueryKey](db.a), selected: map.init[QueryKey, usize](db.a, query_key_hash, query_key_equal)
+    };
+    var complete: bool = false;
+    fin { if (!complete) { discard_retirement(?prepared); } }
+    var nodes: Vector[RetireNode] = vector.init[RetireNode](db.a);
+    fin { vector.dnit[RetireNode](?nodes); }
+    var edges: Vector[RetireEdge] = vector.init[RetireEdge](db.a);
+    fin { vector.dnit[RetireEdge](?edges); }
+    var pending: Vector[usize] = vector.init[usize](db.a);
+    fin { vector.dnit[usize](?pending); }
+    var index: Map[QueryKey, usize] = map.init[QueryKey, usize](db.a, query_key_hash, query_key_equal);
+    fin { map.dnit[QueryKey, usize](?index); }
+    var kind: u32 = 0;
+    for (kind < db.kinds) {
+        val sh: *QueryShard = ?db.storage[kind];
+        if (sh.entries.editing) { ret R.err[PreparedRetirement, str]("query shard has an active editor"); }
+        var j: usize = 0;
+        for (j < sh.index.len) {
+            val indexed: QueryIndexEntry = sh.index.data[j];
+            val entry: R.Result[*QueryEntry, str] = handle.get[QueryEntry, QueryEntryDomain](?sh.entries, indexed.id);
+            if (R.is_err[*QueryEntry, str](entry)) { ret R.err[PreparedRetirement, str](R.unwrap_err[*QueryEntry, str](entry)); }
+            val key: QueryKey = QueryKey{ kind: kind::QueryKind, key: indexed.key };
+            val added: R.Result[usize, str] = vector.push[RetireNode](?nodes,
+                RetireNode{ key: key, entry: R.unwrap_ok[*QueryEntry, str](entry), first: ~(0::usize) });
+            if (R.is_err[usize, str](added)) { ret R.err[PreparedRetirement, str](R.unwrap_err[usize, str](added)); }
+            val mapped: R.Result[bool, str] = map.insert[QueryKey, usize](?index, key, nodes.len - 1);
+            if (R.is_err[bool, str](mapped)) { ret R.err[PreparedRetirement, str](R.unwrap_err[bool, str](mapped)); }
+            j = j + 1;
+        }
+        kind = kind + 1;
+    }
+    var i: usize = 0;
+    for (i < count) {
+        var key: QueryKey = roots[i];
+        if (key.kind::u32 >= db.kinds || !db.storage[key.kind::u32].registered) {
+            ret R.err[PreparedRetirement, str]("retirement root kind is not registered");
+        }
+        if (R.is_err[*usize, str](map.get[QueryKey, usize](?index, ?key))) {
+            val added: R.Result[usize, str] = vector.push[RetireNode](?nodes,
+                RetireNode{ key: key, first: ~(0::usize) });
+            if (R.is_err[usize, str](added)) { ret R.err[PreparedRetirement, str](R.unwrap_err[usize, str](added)); }
+            val mapped: R.Result[bool, str] = map.insert[QueryKey, usize](?index, key, nodes.len - 1);
+            if (R.is_err[bool, str](mapped)) { ret R.err[PreparedRetirement, str](R.unwrap_err[bool, str](mapped)); }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < nodes.len) {
+        val entry: *QueryEntry = nodes.data[i].entry;
+        if (entry == nil) { i = i + 1; cnt; }
+        var j: u32 = 0;
+        for (j < entry.dep_len) {
+            var key: QueryKey = QueryKey{ kind: entry.deps[j].kind, key: entry.deps[j].key };
+            val found: R.Result[*usize, str] = map.get[QueryKey, usize](?index, ?key);
+            if (R.is_ok[*usize, str](found)) {
+                val child: usize = @R.unwrap_ok[*usize, str](found);
+                val added: R.Result[usize, str] = vector.push[RetireEdge](?edges,
+                    RetireEdge{ dependent: i, next: nodes.data[child].first });
+                if (R.is_err[usize, str](added)) { ret R.err[PreparedRetirement, str](R.unwrap_err[usize, str](added)); }
+                nodes.data[child].first = edges.len - 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < count) {
+        var key: QueryKey = roots[i];
+        val found: R.Result[*usize, str] = map.get[QueryKey, usize](?index, ?key);
+        if (R.is_ok[*usize, str](found)) {
+            val n: usize = @R.unwrap_ok[*usize, str](found);
+            if (!nodes.data[n].selected) {
+                nodes.data[n].selected = true;
+                val added: R.Result[usize, str] = vector.push[usize](?pending, n);
+                if (R.is_err[usize, str](added)) { ret R.err[PreparedRetirement, str](R.unwrap_err[usize, str](added)); }
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < pending.len) {
+        var edge: usize = nodes.data[pending.data[i]].first;
+        for (edge != ~(0::usize)) {
+            val n: usize = edges.data[edge].dependent;
+            if (!nodes.data[n].selected) {
+                nodes.data[n].selected = true;
+                val added: R.Result[usize, str] = vector.push[usize](?pending, n);
+                if (R.is_err[usize, str](added)) { ret R.err[PreparedRetirement, str](R.unwrap_err[usize, str](added)); }
+            }
+            edge = edges.data[edge].next;
+        }
+        i = i + 1;
+    }
+    val selected: usize = pending.len;
+    pending.len = 0;
+    i = 0;
+    for (i < nodes.len) {
+        if (nodes.data[i].selected) {
+            var edge: usize = nodes.data[i].first;
+            for (edge != ~(0::usize)) {
+                if (nodes.data[edges.data[edge].dependent].selected) {
+                    nodes.data[i].dependents = nodes.data[i].dependents + 1;
+                }
+                edge = edges.data[edge].next;
+            }
+            if (nodes.data[i].dependents == 0) {
+                val added: R.Result[usize, str] = vector.push[usize](?pending, i);
+                if (R.is_err[usize, str](added)) { ret R.err[PreparedRetirement, str](R.unwrap_err[usize, str](added)); }
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < pending.len) {
+        val node: RetireNode = nodes.data[pending.data[i]];
+        val added: R.Result[usize, str] = vector.push[QueryKey](?prepared.keys, node.key);
+        if (R.is_err[usize, str](added)) { ret R.err[PreparedRetirement, str](R.unwrap_err[usize, str](added)); }
+        var j: u32 = 0;
+        for (node.entry != nil && j < node.entry.dep_len) {
+            var key: QueryKey = QueryKey{ kind: node.entry.deps[j].kind, key: node.entry.deps[j].key };
+            val found: R.Result[*usize, str] = map.get[QueryKey, usize](?index, ?key);
+            if (R.is_ok[*usize, str](found)) {
+                val child: usize = @R.unwrap_ok[*usize, str](found);
+                if (nodes.data[child].selected) {
+                    nodes.data[child].dependents = nodes.data[child].dependents - 1;
+                    if (nodes.data[child].dependents == 0) {
+                        val queued: R.Result[usize, str] = vector.push[usize](?pending, child);
+                        if (R.is_err[usize, str](queued)) { ret R.err[PreparedRetirement, str](R.unwrap_err[usize, str](queued)); }
+                    }
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    if (prepared.keys.len != selected) { ret R.err[PreparedRetirement, str]("query retirement contains a dependency cycle"); }
+    if (selected != 0 && db.revision == ~(0::Revision)) { ret R.err[PreparedRetirement, str]("query revision sequence exhausted"); }
+    kind = 0;
+    for (kind < db.kinds) {
+        val sh: *QueryShard = ?db.storage[kind];
+        var removals: usize = 0;
+        i = 0;
+        for (i < sh.index.len) {
+            val item: QueryIndexEntry = sh.index.data[i];
+            var key: QueryKey = QueryKey{ kind: kind::QueryKind, key: item.key };
+            val found: R.Result[*usize, str] = map.get[QueryKey, usize](?index, ?key);
+            if (R.is_ok[*usize, str](found) && nodes.data[@R.unwrap_ok[*usize, str](found)].selected) {
+                if (item.id.generation == ~(0::u32)) { ret R.err[PreparedRetirement, str]("query handle generation exhausted"); }
+                removals = removals + 1;
+            }
+            i = i + 1;
+        }
+        if (removals::u64 > (~(0::u64)) - sh.entries.store_epoch) { ret R.err[PreparedRetirement, str]("query shard generation exhausted"); }
+        val reserved: R.Result[usize, str] = vector.reserve[usize](?sh.entries.free_list, removals);
+        if (R.is_err[usize, str](reserved)) { ret R.err[PreparedRetirement, str](R.unwrap_err[usize, str](reserved)); }
+        kind = kind + 1;
+    }
+    i = 0;
+    for (i < nodes.len) {
+        if (!nodes.data[i].selected) {
+            var key: QueryKey = nodes.data[i].key;
+            map.remove[QueryKey, usize](?index, ?key);
+        }
+        i = i + 1;
+    }
+    map.dnit[QueryKey, usize](?prepared.selected);
+    prepared.selected = index;
+    index = map.init[QueryKey, usize](db.a, query_key_hash, query_key_equal);
+    complete = true;
+    ret R.ok[PreparedRetirement, str](prepared);
+}
+
+pub fun validate_retirement(prepared: *PreparedRetirement) R.Result[R.Void, str] {
+    val db: *QueryDb = prepared.owner;
+    if (db == nil || db.operation_active || db.presentation_pending || db.operation_sequence != prepared.operation
+        || db.revision != prepared.revision) { ret R.err[R.Void, str]("prepared query retirement is stale"); }
+    ret R.ok_void[str]();
+}
+
+pub fun commit_retirement(prepared: *PreparedRetirement) R.Result[R.Void, str] {
+    val valid: R.Result[R.Void, str] = validate_retirement(prepared);
+    if (R.is_err[R.Void, str](valid)) { ret valid; }
+    val db: *QueryDb = prepared.owner;
+    if (prepared.keys.len != 0) {
+        db.revision = db.revision + 1;
+        var i: usize = 0;
+        for (i < prepared.keys.len) {
+            val key: QueryKey = prepared.keys.data[i];
+            val sh: *QueryShard = ?db.storage[key.kind::u32];
+            val entry: *QueryEntry = entry_find(sh, key.key);
+            if (entry != nil) { entry_free(db, sh, entry); }
+            i = i + 1;
+        }
+        var kind: u32 = 0;
+        for (kind < db.kinds) {
+            val sh: *QueryShard = ?db.storage[kind];
+            var write: usize = 0;
+            i = 0;
+            for (i < sh.index.len) {
+                val item: QueryIndexEntry = sh.index.data[i];
+                var key: QueryKey = QueryKey{ kind: kind::QueryKind, key: item.key };
+                if (R.is_ok[*usize, str](map.get[QueryKey, usize](?prepared.selected, ?key))) {
+                    var editor: handle.HandleEditor[QueryEntry, QueryEntryDomain] =
+                        R.unwrap_ok[handle.HandleEditor[QueryEntry, QueryEntryDomain], str](handle.edit[QueryEntry, QueryEntryDomain](?sh.entries));
+                    R.unwrap_ok[QueryEntry, str](handle.editor_remove[QueryEntry, QueryEntryDomain](?editor, item.id));
+                    handle.editor_finish[QueryEntry, QueryEntryDomain](?editor);
+                    var removed: u64 = item.key;
+                    map.remove[u64, handle.HandleId[QueryEntryDomain]](?sh.by_key, ?removed);
+                }
+                or {
+                    sh.index.data[write] = item;
+                    write = write + 1;
+                }
+                i = i + 1;
+            }
+            sh.index.len = write;
+            kind = kind + 1;
+        }
+    }
+    discard_retirement(prepared);
+    ret R.ok_void[str]();
+}
+
+# successful end permits serial reads until the next begin, input mutation, or retirement
+pub fun get[T](rt: *QueryRuntime[T], ctx: *T, kind: QueryKind, key: u64) R.Result[QueryView, fail.Fail] {
+    val acquired: R.Result[*QueryEntry, fail.Fail] = acquire_entry[T](rt, ctx, kind, key);
+    if (R.is_err[*QueryEntry, fail.Fail](acquired)) { ret R.err[QueryView, fail.Fail](R.unwrap_err[*QueryEntry, fail.Fail](acquired)); }
+    val entry: *QueryEntry = R.unwrap_ok[*QueryEntry, fail.Fail](acquired);
+    ret R.ok[QueryView, fail.Fail](QueryView{ value: entry.value, value_len: entry.value_len, last_changed: entry.last_changed });
+}
+
+# validation may refresh dependencies but never computes the requested product
+pub fun reusable[T](rt: *QueryRuntime[T], ctx: *T, kind: QueryKind, key: u64) R.Result[bool, fail.Fail] {
+    if (rt == nil || rt.db == nil || ctx == nil || rt.caps.compute == nil) {
+        ret R.err[bool, fail.Fail](fail.message("query reuse requires a complete runtime"));
+    }
+    val db: *QueryDb = rt.db;
+    if (!db.operation_active || db.stack.len != 0) {
+        ret R.err[bool, fail.Fail](fail.message("query reuse requires an active owner-thread operation"));
+    }
+    if (O.is_some[fail.Fail](db.operation_failure)) { ret R.err[bool, fail.Fail](O.unwrap[fail.Fail](db.operation_failure)); }
+    val result: R.Result[bool, fail.Fail] = reusable_inner[T](rt, ctx, kind, key);
+    if (R.is_err[bool, fail.Fail](result)) {
+        operation_fail(db, R.unwrap_err[bool, fail.Fail](result));
+        ret R.err[bool, fail.Fail](O.unwrap[fail.Fail](db.operation_failure));
+    }
+    ret result;
+}
+
+fun reusable_inner[T](rt: *QueryRuntime[T], ctx: *T, kind: QueryKind, key: u64) R.Result[bool, fail.Fail] {
+    val db: *QueryDb = rt.db;
+    val found: R.Result[*QueryShard, str] = shard_get(db, kind);
+    if (R.is_err[*QueryShard, str](found)) { ret fail.lift[bool](R.err[bool, str](R.unwrap_err[*QueryShard, str](found))); }
+    val sh: *QueryShard = R.unwrap_ok[*QueryShard, str](found);
+    if (sh.role != SHARD_DERIVED) { ret R.err[bool, fail.Fail](fail.message("query reuse requires a derived product")); }
+    var pair: QueryKey = QueryKey{ kind: kind, key: key };
+    val pending: R.Result[*usize, str] = map.get[QueryKey, usize](?db.attempt_index, ?pair);
+    if (R.is_ok[*usize, str](pending) && (db.attempts.data[@R.unwrap_ok[*usize, str](pending)].prepared != nil
+        || db.attempts.data[@R.unwrap_ok[*usize, str](pending)].cancelled)) {
+        ret R.err[bool, fail.Fail](fail.message("query product is awaiting owner completion"));
+    }
+    val entry: *QueryEntry = entry_find(sh, key);
+    if (entry == nil || !entry.ready) { ret R.ok[bool, fail.Fail](false); }
+    val prior: R.Result[*Revision, str] = map.get[QueryKey, Revision](?db.validated, ?pair);
+    if (R.is_ok[*Revision, str](prior) && @R.unwrap_ok[*Revision, str](prior) != 0) {
+        if (@R.unwrap_ok[*Revision, str](prior) != entry.last_changed) {
+            ret R.err[bool, fail.Fail](fail.message("validated query owner changed during reuse"));
+        }
+        ret R.ok[bool, fail.Fail](true);
+    }
+    val reserved: R.Result[bool, str] = map.insert[QueryKey, Revision](?db.validated, pair, 0);
+    if (R.is_err[bool, str](reserved)) { ret fail.lift[bool](reserved); }
+    val prepared: R.Result[usize, str] = attempt_prepare(db, pair);
+    if (R.is_err[usize, str](prepared)) { ret fail.lift[bool](R.err[bool, str](R.unwrap_err[usize, str](prepared))); }
+    val pushed: R.Result[R.Void, str] = stack_push(db, kind, key, nil);
+    if (R.is_err[R.Void, str](pushed)) { ret fail.lift[bool](R.err[bool, str](R.unwrap_err[R.Void, str](pushed))); }
+    fin { stack_pop(db); }
+    var evidence: QueryEntry = QueryEntry{};
+    val current: R.Result[bool, fail.Fail] = refresh_dependencies[T](rt, ctx, entry, ?evidence);
+    if (R.is_err[bool, fail.Fail](current)) {
+        attempt_preserve(db, sh, R.unwrap_ok[usize, str](prepared), ?evidence);
+        ret current;
+    }
+    entry_free(db, sh, ?evidence);
+    if (!R.unwrap_ok[bool, fail.Fail](current)) { ret current; }
+    val slot: R.Result[*Revision, str] = map.get[QueryKey, Revision](?db.validated, ?pair);
+    if (R.is_err[*Revision, str](slot)) { ret fail.lift[bool](R.err[bool, str](R.unwrap_err[*Revision, str](slot))); }
+    @R.unwrap_ok[*Revision, str](slot) = entry.last_changed;
+    ret current;
+}
+
+pub fun prepare[T](rt: *QueryRuntime[T], ctx: *T, kind: QueryKind, key: u64,
+                   compute: fun(*T, QueryKind, u64, *A.Allocator, *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail]) R.Result[PreparedQuery, fail.Fail] {
+    val result: R.Result[PreparedQuery, fail.Fail] = prepare_inner[T](rt, ctx, kind, key, compute);
+    if (R.is_err[PreparedQuery, fail.Fail](result) && rt != nil && rt.db != nil && rt.db.operation_active) {
+        operation_fail(rt.db, R.unwrap_err[PreparedQuery, fail.Fail](result));
+        ret R.err[PreparedQuery, fail.Fail](O.unwrap[fail.Fail](rt.db.operation_failure));
+    }
+    ret result;
+}
+
+fun prepare_inner[T](rt: *QueryRuntime[T], ctx: *T, kind: QueryKind, key: u64,
+                   compute: fun(*T, QueryKind, u64, *A.Allocator, *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail]) R.Result[PreparedQuery, fail.Fail] {
+    if (compute == nil) { ret R.err[PreparedQuery, fail.Fail](fail.message("prepared query requires a compute callback")); }
+    val current: R.Result[bool, fail.Fail] = reusable[T](rt, ctx, kind, key);
+    if (R.is_err[bool, fail.Fail](current)) { ret R.err[PreparedQuery, fail.Fail](R.unwrap_err[bool, fail.Fail](current)); }
+    if (R.unwrap_ok[bool, fail.Fail](current)) { ret R.err[PreparedQuery, fail.Fail](fail.message("cannot prepare a query owner already acquired in this operation")); }
+    val db: *QueryDb = rt.db;
+    val sh: *QueryShard = ?db.storage[kind::u32];
+    val pair: QueryKey = QueryKey{ kind: kind, key: key };
+    val reserved: R.Result[usize, str] = attempt_prepare(db, pair);
+    if (R.is_err[usize, str](reserved)) { ret fail.lift[PreparedQuery](R.err[PreparedQuery, str](R.unwrap_err[usize, str](reserved))); }
+    val index: usize = R.unwrap_ok[usize, str](reserved);
+    if (db.attempts.data[index].prepared != nil) { ret R.err[PreparedQuery, fail.Fail](fail.message("query product is already prepared")); }
+    val allocated: R.Result[*QueryEntry, str] = A.allocate[QueryEntry](db.a, 1);
+    if (R.is_err[*QueryEntry, str](allocated)) { ret fail.lift[PreparedQuery](R.err[PreparedQuery, str](R.unwrap_err[*QueryEntry, str](allocated))); }
+    val candidate: *QueryEntry = R.unwrap_ok[*QueryEntry, str](allocated);
+    @candidate = QueryEntry{ key: key };
+    val fresh: bool = entry_find(sh, key) == nil;
+    var retained: bool = false;
+    fin {
+        if (!retained) {
+            attempt_preserve(db, sh, index, candidate);
+            A.deallocate[QueryEntry](db.a, candidate, 1);
+            if (fresh) { entry_remove(db, sh, key); }
+        }
+    }
+    if (fresh) {
+        val added: R.Result[*QueryEntry, str] = entry_append(db, sh, key);
+        if (R.is_err[*QueryEntry, str](added)) { ret fail.lift[PreparedQuery](R.err[PreparedQuery, str](R.unwrap_err[*QueryEntry, str](added))); }
+    }
+    var lookup: QueryKey = pair;
+    val marked: R.Result[bool, str] = map.insert[QueryKey, Revision](?db.validated, lookup, 0);
+    if (R.is_err[bool, str](marked)) { ret fail.lift[PreparedQuery](R.err[PreparedQuery, str](R.unwrap_err[bool, str](marked))); }
+    val pushed: R.Result[R.Void, str] = stack_push(db, kind, key, nil);
+    if (R.is_err[R.Void, str](pushed)) { ret fail.lift[PreparedQuery](R.err[PreparedQuery, str](R.unwrap_err[R.Void, str](pushed))); }
+    val computed: R.Result[R.Void, fail.Fail] = candidate_compute[T](rt, ctx, sh, key, candidate, compute);
+    stack_pop(db);
+    if (R.is_err[R.Void, fail.Fail](computed)) {
+        operation_fail(db, R.unwrap_err[R.Void, fail.Fail](computed));
+        ret R.err[PreparedQuery, fail.Fail](O.unwrap[fail.Fail](db.operation_failure));
+    }
+    db.attempts.data[index].prepared = candidate;
+    db.attempts.data[index].fresh = fresh;
+    db.prepared_count = db.prepared_count + 1;
+    retained = true;
+    ret R.ok[PreparedQuery, fail.Fail](PreparedQuery{
+        operation: Operation{ owner: db::ptr, sequence: db.operation_sequence }, key: pair
+    });
+}
+
+fun prepared_attempt(db: *QueryDb, prepared: PreparedQuery) R.Result[*Attempt, str] {
+    if (db == nil || prepared.operation.owner != db::ptr || prepared.operation.sequence != db.operation_sequence
+        || !db.operation_active || db.stack.len != 0) { ret R.err[*Attempt, str]("prepared query belongs to another operation"); }
+    var key: QueryKey = prepared.key;
+    val index: R.Result[*usize, str] = map.get[QueryKey, usize](?db.attempt_index, ?key);
+    if (R.is_err[*usize, str](index)) { ret R.err[*Attempt, str]("prepared query is no longer owned"); }
+    val attempt: *Attempt = ?db.attempts.data[@R.unwrap_ok[*usize, str](index)];
+    if (attempt.prepared == nil) { ret R.err[*Attempt, str]("prepared query has already been consumed"); }
+    ret R.ok[*Attempt, str](attempt);
+}
+
+pub fun prepared_view(db: *QueryDb, prepared: PreparedQuery) R.Result[QueryView, str] {
+    val owner: R.Result[*Attempt, str] = prepared_attempt(db, prepared);
+    if (R.is_err[*Attempt, str](owner)) { ret R.err[QueryView, str](R.unwrap_err[*Attempt, str](owner)); }
+    val candidate: *QueryEntry = R.unwrap_ok[*Attempt, str](owner).prepared;
+    ret R.ok[QueryView, str](QueryView{ value: candidate.value, value_len: candidate.value_len });
+}
+
+pub fun cancel_prepared(db: *QueryDb, prepared: PreparedQuery) R.Result[R.Void, str] {
+    val owner: R.Result[*Attempt, str] = prepared_attempt(db, prepared);
+    if (R.is_err[*Attempt, str](owner)) { ret R.void_of[*Attempt, str](owner); }
+    val attempt: *Attempt = R.unwrap_ok[*Attempt, str](owner);
+    val candidate: *QueryEntry = attempt.prepared;
+    val sh: *QueryShard = ?db.storage[prepared.key.kind::u32];
+    var key: QueryKey = prepared.key;
+    val index: R.Result[*usize, str] = map.get[QueryKey, usize](?db.attempt_index, ?key);
+    if (R.is_err[*usize, str](index)) { ret R.void_of[*usize, str](index); }
+    attempt_preserve(db, sh, @R.unwrap_ok[*usize, str](index), candidate);
+    A.deallocate[QueryEntry](db.a, candidate, 1);
+    attempt.prepared = nil;
+    attempt.cancelled = true;
+    db.prepared_count = db.prepared_count - 1;
+    if (attempt.fresh) { entry_remove(db, sh, prepared.key.key); }
+    ret R.ok_void[str]();
+}
+
+pub fun complete_prepared(db: *QueryDb, prepared: PreparedQuery, result: R.Result[R.Void, fail.Fail]) R.Result[R.Void, fail.Fail] {
+    val owner: R.Result[*Attempt, str] = prepared_attempt(db, prepared);
+    if (R.is_err[*Attempt, str](owner)) { ret fail.lift[R.Void](R.void_of[*Attempt, str](owner)); }
+    if (R.is_err[R.Void, fail.Fail](result)) { operation_fail(db, R.unwrap_err[R.Void, fail.Fail](result)); }
+    if (O.is_some[fail.Fail](db.operation_failure)) {
+        val cancelled: R.Result[R.Void, str] = cancel_prepared(db, prepared);
+        if (R.is_err[R.Void, str](cancelled)) { ret fail.lift[R.Void](cancelled); }
+        ret R.err[R.Void, fail.Fail](O.unwrap[fail.Fail](db.operation_failure));
+    }
+    val attempt: *Attempt = R.unwrap_ok[*Attempt, str](owner);
+    val sh: *QueryShard = ?db.storage[prepared.key.kind::u32];
+    val entry: *QueryEntry = entry_find(sh, prepared.key.key);
+    if (entry == nil) { ret R.err[R.Void, fail.Fail](fail.message("prepared query lost its publication slot")); }
+    var key: QueryKey = prepared.key;
+    val revision: R.Result[*Revision, str] = map.get[QueryKey, Revision](?db.validated, ?key);
+    if (R.is_err[*Revision, str](revision)) { ret fail.lift[R.Void](R.void_of[*Revision, str](revision)); }
+    val published: R.Result[*QueryEntry, fail.Fail] = candidate_publish(db, sh, entry, attempt.prepared);
+    if (R.is_err[*QueryEntry, fail.Fail](published)) {
+        operation_fail(db, R.unwrap_err[*QueryEntry, fail.Fail](published));
+        val cancelled: R.Result[R.Void, str] = cancel_prepared(db, prepared);
+        if (R.is_err[R.Void, str](cancelled)) { ret fail.lift[R.Void](cancelled); }
+        ret R.err[R.Void, fail.Fail](O.unwrap[fail.Fail](db.operation_failure));
+    }
+    @R.unwrap_ok[*Revision, str](revision) = entry.last_changed;
+    A.deallocate[QueryEntry](db.a, attempt.prepared, 1);
+    attempt.prepared = nil;
+    db.prepared_count = db.prepared_count - 1;
+    ret R.ok_void[fail.Fail]();
+}
+
+fun acquire_entry[T](rt: *QueryRuntime[T], ctx: *T, kind: QueryKind, key: u64) R.Result[*QueryEntry, fail.Fail] {
+    if (rt == nil || rt.db == nil) { ret R.err[*QueryEntry, fail.Fail](fail.message("query get requires a live runtime")); }
+    if (O.is_some[fail.Fail](rt.db.operation_failure) && rt.db.operation_active) {
+        ret R.err[*QueryEntry, fail.Fail](O.unwrap[fail.Fail](rt.db.operation_failure));
+    }
+    val result: R.Result[*QueryEntry, fail.Fail] = get_acquired[T](rt, ctx, kind, key);
+    if (R.is_err[*QueryEntry, fail.Fail](result) && rt.db.operation_active) {
+        operation_fail(rt.db, R.unwrap_err[*QueryEntry, fail.Fail](result));
+        ret R.err[*QueryEntry, fail.Fail](O.unwrap[fail.Fail](rt.db.operation_failure));
+    }
+    ret result;
+}
+
+fun get_acquired[T](rt: *QueryRuntime[T], ctx: *T, kind: QueryKind, key: u64) R.Result[*QueryEntry, fail.Fail] {
+    if (rt == nil || rt.db == nil || rt.caps.compute == nil || ctx == nil) {
         ret R.err[*QueryEntry, fail.Fail](fail.message("query get requires a complete live runtime"));
     }
     val db: *QueryDb = rt.db;
+    var owner: *QueryEntry = nil;
+    if (db.stack.len != 0) { owner = db.stack.data[db.stack.len - 1].entry; }
+    if (owner != nil && !stack_contains(db, kind, key)) {
+        val edge: R.Result[R.Void, str] = dep_prepare(db, owner, kind, key);
+        if (R.is_err[R.Void, str](edge)) { ret R.err[*QueryEntry, fail.Fail](fail.message(R.unwrap_err[R.Void, str](edge))); }
+    }
     val res_shard: R.Result[*QueryShard, str] = shard_get(db, kind);
     if (R.is_err[*QueryShard, str](res_shard)) {
         ret R.err[*QueryEntry, fail.Fail](fail.message(R.unwrap_err[*QueryShard, str](res_shard)));
@@ -283,7 +1097,8 @@ pub fun get[T](rt: *QueryRuntime[T], ctx: *T, kind: QueryKind, key: u64) R.Resul
 
     if (db.stack.len > 0) {
         val owner: *StackFrame = ?db.stack.data[db.stack.len - 1];
-        val dep_r: R.Result[Revision, str] = dep_upsert(db, owner.entry, kind, key);
+        if (owner.entry == nil) { ret R.ok[*QueryEntry, fail.Fail](entry); }
+        val dep_r: R.Result[Revision, str] = dep_upsert(db, owner.entry, kind, key, entry.last_changed, entry.diagnostics_changed, true);
         if (R.is_err[Revision, str](dep_r)) {
             ret R.err[*QueryEntry, fail.Fail](fail.message(R.unwrap_err[Revision, str](dep_r)));
         }
@@ -294,52 +1109,96 @@ pub fun get[T](rt: *QueryRuntime[T], ctx: *T, kind: QueryKind, key: u64) R.Resul
 
 fun get_inner[T](rt: *QueryRuntime[T], ctx: *T, sh: *QueryShard, kind: QueryKind, key: u64) R.Result[*QueryEntry, fail.Fail] {
     val db: *QueryDb = rt.db;
-    if (sh.role == SHARD_METADATA) {
-        ret R.err[*QueryEntry, fail.Fail](fail.message("get: metadata kinds have no stored value"));
+    if (!db.operation_active) { ret R.err[*QueryEntry, fail.Fail](fail.message("query read requires an active operation")); }
+    var pair: QueryKey = QueryKey{ kind: kind, key: key };
+    val pending: R.Result[*usize, str] = map.get[QueryKey, usize](?db.attempt_index, ?pair);
+    if (R.is_ok[*usize, str](pending) && (db.attempts.data[@R.unwrap_ok[*usize, str](pending)].prepared != nil
+        || db.attempts.data[@R.unwrap_ok[*usize, str](pending)].cancelled)) {
+        ret R.err[*QueryEntry, fail.Fail](fail.message("query product is awaiting owner completion"));
     }
-
-    if (sh.role == SHARD_INPUT) {
+    val prior: R.Result[*Revision, str] = map.get[QueryKey, Revision](?db.validated, ?pair);
+    if (R.is_ok[*Revision, str](prior) && @R.unwrap_ok[*Revision, str](prior) != 0) {
         val entry: *QueryEntry = entry_find(sh, key);
-        if (entry == nil) {
-            ret R.err[*QueryEntry, fail.Fail](fail.message("get: input query has no value for key"));
+        if (entry == nil || !entry.ready || entry.last_changed != @R.unwrap_ok[*Revision, str](prior)) {
+            ret R.err[*QueryEntry, fail.Fail](fail.message("validated query owner changed during the operation"));
         }
         ret R.ok[*QueryEntry, fail.Fail](entry);
     }
+    if (stack_contains(db, kind, key)) { ret R.err[*QueryEntry, fail.Fail](cycle_failure(db, kind, key)); }
+    val reserved: R.Result[bool, str] = map.insert[QueryKey, Revision](?db.validated, pair, 0);
+    if (R.is_err[bool, str](reserved)) { ret fail.lift[*QueryEntry](R.err[*QueryEntry, str](R.unwrap_err[bool, str](reserved))); }
+    val prepared: R.Result[usize, str] = attempt_prepare(db, pair);
+    if (R.is_err[usize, str](prepared)) { ret fail.lift[*QueryEntry](R.err[*QueryEntry, str](R.unwrap_err[usize, str](prepared))); }
+    val refreshed: R.Result[*QueryEntry, fail.Fail] = refresh_entry[T](rt, ctx, sh, kind, key, R.unwrap_ok[usize, str](prepared));
+    if (R.is_err[*QueryEntry, fail.Fail](refreshed)) { ret refreshed; }
+    val revision: R.Result[*Revision, str] = map.get[QueryKey, Revision](?db.validated, ?pair);
+    if (R.is_err[*Revision, str](revision)) { ret fail.lift[*QueryEntry](R.err[*QueryEntry, str](R.unwrap_err[*Revision, str](revision))); }
+    @R.unwrap_ok[*Revision, str](revision) = R.unwrap_ok[*QueryEntry, fail.Fail](refreshed).last_changed;
+    ret refreshed;
+}
 
-    val existing: *QueryEntry = entry_find(sh, key);
-    if (existing != nil) {
-        if (stack_contains(db, kind, key)) {
-            ret R.err[*QueryEntry, fail.Fail](fail.message(cycle_message(db, kind, key)));
+fun refresh_entry[T](rt: *QueryRuntime[T], ctx: *T, sh: *QueryShard, kind: QueryKind, key: u64, attempt: usize) R.Result[*QueryEntry, fail.Fail] {
+    val db: *QueryDb = rt.db;
+    if (sh.role == SHARD_METADATA) { ret R.err[*QueryEntry, fail.Fail](fail.message("get: metadata kinds have no stored value")); }
+    if (sh.role == SHARD_INPUT) {
+        val entry: *QueryEntry = entry_find(sh, key);
+        if (entry == nil || !entry.ready) { ret R.err[*QueryEntry, fail.Fail](fail.message("get: input query has no value for key")); }
+        ret R.ok[*QueryEntry, fail.Fail](entry);
+    }
+    if (stack_contains(db, kind, key)) { ret R.err[*QueryEntry, fail.Fail](cycle_failure(db, kind, key)); }
+    val pushed: R.Result[R.Void, str] = stack_push(db, kind, key, nil);
+    if (R.is_err[R.Void, str](pushed)) { ret fail.lift[*QueryEntry](R.err[*QueryEntry, str](R.unwrap_err[R.Void, str](pushed))); }
+    fin { stack_pop(db); }
+    var entry: *QueryEntry = entry_find(sh, key);
+    if (entry != nil && entry.ready) {
+        var validation: QueryEntry = QueryEntry{};
+        val valid: R.Result[bool, fail.Fail] = refresh_dependencies[T](rt, ctx, entry, ?validation);
+        if (R.is_err[bool, fail.Fail](valid)) {
+            attempt_preserve(db, sh, attempt, ?validation);
+            ret R.err[*QueryEntry, fail.Fail](R.unwrap_err[bool, fail.Fail](valid));
         }
-        if (is_entry_valid(db, existing)) {
-            if (db.compute_depth == 0 && existing.diags != nil) {
-                val replay_r: R.Result[R.Void, str] = diagnostic.replay_into(rt.diags, existing.diags);
-                if (R.is_err[R.Void, str](replay_r)) { ret R.err[*QueryEntry, fail.Fail](fail.message(R.unwrap_err[R.Void, str](replay_r))); }
+        entry_free(db, sh, ?validation);
+        if (R.unwrap_ok[bool, fail.Fail](valid)) { ret R.ok[*QueryEntry, fail.Fail](entry); }
+    }
+    val fresh: bool = entry == nil;
+    if (fresh) {
+        val added: R.Result[*QueryEntry, str] = entry_append(db, sh, key);
+        if (R.is_err[*QueryEntry, str](added)) { ret fail.lift[*QueryEntry](added); }
+        entry = R.unwrap_ok[*QueryEntry, str](added);
+    }
+    val computed: R.Result[*QueryEntry, fail.Fail] = recompute[T](rt, ctx, sh, entry, key, attempt);
+    if (fresh && R.is_err[*QueryEntry, fail.Fail](computed)) { entry_remove(db, sh, key); }
+    ret computed;
+}
+
+fun refresh_dependencies[T](rt: *QueryRuntime[T], ctx: *T, entry: *QueryEntry, evidence: *QueryEntry) R.Result[bool, fail.Fail] {
+    val db: *QueryDb = rt.db;
+    var i: u32 = 0;
+    for (i < entry.dep_len) {
+        val dep: Dep = entry.deps[i];
+        if (!dep.observed) { ret R.err[bool, fail.Fail](fail.message("cached query has an incomplete dependency")); }
+        if (evidence != nil) {
+            val edge: R.Result[R.Void, str] = dep_prepare(db, evidence, dep.kind, dep.key);
+            if (R.is_err[R.Void, str](edge)) { ret fail.lift[bool](R.err[bool, str](R.unwrap_err[R.Void, str](edge))); }
+        }
+        val shard: R.Result[*QueryShard, str] = shard_get(db, dep.kind);
+        if (R.is_err[*QueryShard, str](shard)) { ret fail.lift[bool](R.err[bool, str](R.unwrap_err[*QueryShard, str](shard))); }
+        val sh: *QueryShard = R.unwrap_ok[*QueryShard, str](shard);
+        if (sh.role == SHARD_METADATA) {
+            val sampled: R.Result[MetadataRevision, fail.Fail] = sample_metadata(db, dep.kind, dep.key);
+            if (R.is_err[MetadataRevision, fail.Fail](sampled)) { ret R.err[bool, fail.Fail](R.unwrap_err[MetadataRevision, fail.Fail](sampled)); }
+            val current: MetadataRevision = R.unwrap_ok[MetadataRevision, fail.Fail](sampled);
+            if (current.present != dep.present || current.revision != dep.last_changed) { ret R.ok[bool, fail.Fail](false); }
+        } or {
+            if (sh.role == SHARD_DERIVED) {
+                val child: R.Result[*QueryEntry, fail.Fail] = get_inner[T](rt, ctx, sh, dep.kind, dep.key);
+                if (R.is_err[*QueryEntry, fail.Fail](child)) { ret R.err[bool, fail.Fail](R.unwrap_err[*QueryEntry, fail.Fail](child)); }
             }
-            ret R.ok[*QueryEntry, fail.Fail](existing);
+            if (last_changed_get(db, dep.kind, dep.key) != dep.last_changed) { ret R.ok[bool, fail.Fail](false); }
         }
-
-        val push_r: R.Result[R.Void, str] = stack_push(db, kind, key, existing);
-        if (R.is_err[R.Void, str](push_r)) {
-            ret R.err[*QueryEntry, fail.Fail](fail.message(R.unwrap_err[R.Void, str](push_r)));
-        }
-        val result: R.Result[*QueryEntry, fail.Fail] = recompute[T](rt, ctx, sh, existing, key);
-        stack_pop(db);
-        ret result;
+        i = i + 1;
     }
-
-    val res_entry: R.Result[*QueryEntry, str] = entry_append(db, sh, key);
-    if (R.is_err[*QueryEntry, str](res_entry)) { ret fail.lift[*QueryEntry](res_entry); }
-    val entry: *QueryEntry = R.unwrap_ok[*QueryEntry, str](res_entry);
-
-    val push_r: R.Result[R.Void, str] = stack_push(db, kind, key, entry);
-    if (R.is_err[R.Void, str](push_r)) {
-        entry_remove(db, sh, key);
-        ret R.err[*QueryEntry, fail.Fail](fail.message(R.unwrap_err[R.Void, str](push_r)));
-    }
-    val result: R.Result[*QueryEntry, fail.Fail] = recompute[T](rt, ctx, sh, entry, key);
-    stack_pop(db);
-    ret result;
+    ret R.ok[bool, fail.Fail](true);
 }
 
 fun stack_push(db: *QueryDb, kind: QueryKind, key: u64, entry: *QueryEntry) R.Result[R.Void, str] {
@@ -366,88 +1225,107 @@ fun stack_contains(db: *QueryDb, kind: QueryKind, key: u64) bool {
     ret false;
 }
 
-fun cycle_message(db: *QueryDb, kind: QueryKind, key: u64) str {
-    var b: textbuild.TextBuilder = textbuild.tb_init(db.a);
-    textbuild.tb_append(?b, "query cycle: ");
-
-    var fmt_failed: bool = false;
-    var i: usize = 0;
-    for (!fmt_failed && i < db.stack.len) {
-        val f: *StackFrame = ?db.stack.data[i];
-        val seg_r: R.Result[str, str] = format.sprint(db.a, "{}:{} -> ", f.kind, f.key);
-        if (R.is_err[str, str](seg_r)) {
-            fmt_failed = true;
-        } or {
-            val s: str = R.unwrap_ok[str, str](seg_r);
-            textbuild.tb_append(?b, s);
-            A.deallocate[char](db.a, s, str_len(s) + 1);
-        }
-        i = i + 1;
+fun cycle_failure(db: *QueryDb, kind: QueryKind, key: u64) fail.Fail {
+    val built: R.Result[str, str] = cycle_message(db, kind, key);
+    if (R.is_err[str, str](built)) {
+        operation_fail(db, fail.message(R.unwrap_err[str, str](built)));
+        ret O.unwrap[fail.Fail](db.operation_failure);
     }
-
-    if (!fmt_failed) {
-        val tail_r: R.Result[str, str] = format.sprint(db.a, "{}:{} (already computing)", kind, key);
-        if (R.is_err[str, str](tail_r)) {
-            fmt_failed = true;
-        } or {
-            val s: str = R.unwrap_ok[str, str](tail_r);
-            textbuild.tb_append(?b, s);
-            A.deallocate[char](db.a, s, str_len(s) + 1);
-        }
+    val text: str = R.unwrap_ok[str, str](built);
+    if (O.is_some[fail.Fail](db.operation_failure) && O.unwrap[fail.Fail](db.operation_failure).kind == fail.MESSAGE) {
+        str_free(db.a, text);
+        ret O.unwrap[fail.Fail](db.operation_failure);
     }
-
-    if (fmt_failed || textbuild.tb_failed(?b)) {
-        textbuild.tb_dnit(?b);
-        ret "query cycle detected (message construction failed)";
-    }
-
-    val fin: R.Result[str, str] = textbuild.tb_finish(?b);
-    if (R.is_err[str, str](fin)) {
-        textbuild.tb_dnit(?b);
-        ret "query cycle detected (message allocation failed)";
-    }
-    ret R.unwrap_ok[str, str](fin);
+    db.operation_message = text;
+    db.operation_failure = O.some[fail.Fail](fail.message(text));
+    ret O.unwrap[fail.Fail](db.operation_failure);
 }
 
-pub fun record_dep(db: *QueryDb, owner_kind: QueryKind, owner_key: u64, dep_kind: QueryKind, dep_key: u64) R.Result[R.Void, str] {
-    val r: R.Result[Revision, str] = record_dep_rev(db, owner_kind, owner_key, dep_kind, dep_key);
-    if (R.is_err[Revision, str](r)) { ret R.err[R.Void, str](R.unwrap_err[Revision, str](r)); }
+fun cycle_message(db: *QueryDb, kind: QueryKind, key: u64) R.Result[str, str] {
+    var b: textbuild.TextBuilder = textbuild.tb_init(db.a);
+    fin { textbuild.tb_dnit(?b); }
+    val prefix: R.Result[R.Void, str] = textbuild.tb_append(?b, "query cycle: ");
+    if (R.is_err[R.Void, str](prefix)) { ret R.err[str, str](R.unwrap_err[R.Void, str](prefix)); }
+    var i: usize = 0;
+    for (i < db.stack.len) {
+        val frame: *StackFrame = ?db.stack.data[i];
+        val segment: R.Result[str, str] = format.sprint(db.a, "{}:{} -> ", frame.kind, frame.key);
+        if (R.is_err[str, str](segment)) { ret segment; }
+        val text: str = R.unwrap_ok[str, str](segment);
+        val appended: R.Result[R.Void, str] = textbuild.tb_append(?b, text);
+        str_free(db.a, text);
+        if (R.is_err[R.Void, str](appended)) { ret R.err[str, str](R.unwrap_err[R.Void, str](appended)); }
+        i = i + 1;
+    }
+    val tail: R.Result[str, str] = format.sprint(db.a, "{}:{} (already computing)", kind, key);
+    if (R.is_err[str, str](tail)) { ret tail; }
+    val text: str = R.unwrap_ok[str, str](tail);
+    val appended: R.Result[R.Void, str] = textbuild.tb_append(?b, text);
+    str_free(db.a, text);
+    if (R.is_err[R.Void, str](appended)) { ret R.err[str, str](R.unwrap_err[R.Void, str](appended)); }
+    ret textbuild.tb_finish(?b);
+}
+
+pub fun revision[T](rt: *QueryRuntime[T], ctx: *T, kind: QueryKind, key: u64) R.Result[Revision, fail.Fail] {
+    val read: R.Result[QueryView, fail.Fail] = get[T](rt, ctx, kind, key);
+    if (R.is_err[QueryView, fail.Fail](read)) { ret R.err[Revision, fail.Fail](R.unwrap_err[QueryView, fail.Fail](read)); }
+    ret R.ok[Revision, fail.Fail](R.unwrap_ok[QueryView, fail.Fail](read).last_changed);
+}
+
+pub fun depend[T](rt: *QueryRuntime[T], ctx: *T, kind: QueryKind, key: u64) R.Result[R.Void, fail.Fail] {
+    ret R.void_of[Revision, fail.Fail](revision[T](rt, ctx, kind, key));
+}
+
+pub fun observe(db: *QueryDb, kind: QueryKind, key: u64) R.Result[MetadataRevision, fail.Fail] {
+    val result: R.Result[MetadataRevision, fail.Fail] = observe_inner(db, kind, key);
+    if (db != nil && db.operation_active && R.is_err[MetadataRevision, fail.Fail](result)) {
+        operation_fail(db, R.unwrap_err[MetadataRevision, fail.Fail](result));
+        ret R.err[MetadataRevision, fail.Fail](O.unwrap[fail.Fail](db.operation_failure));
+    }
+    ret result;
+}
+
+fun observe_inner(db: *QueryDb, kind: QueryKind, key: u64) R.Result[MetadataRevision, fail.Fail] {
+    if (db == nil || db.stack.len == 0 || db.stack.data[db.stack.len - 1].entry == nil) {
+        ret R.err[MetadataRevision, fail.Fail](fail.message("metadata dependency requires an active computation"));
+    }
+    val sampled: R.Result[MetadataRevision, fail.Fail] = sample_metadata(db, kind, key);
+    if (R.is_err[MetadataRevision, fail.Fail](sampled)) { ret sampled; }
+    val value: MetadataRevision = R.unwrap_ok[MetadataRevision, fail.Fail](sampled);
+    val recorded: R.Result[Revision, str] = dep_upsert(db, db.stack.data[db.stack.len - 1].entry,
+        kind, key, value.revision, 0, value.present);
+    if (R.is_err[Revision, str](recorded)) { ret fail.lift[MetadataRevision](R.err[MetadataRevision, str](R.unwrap_err[Revision, str](recorded))); }
+    ret sampled;
+}
+
+fun dep_prepare(db: *QueryDb, entry: *QueryEntry, kind: QueryKind, key: u64) R.Result[R.Void, str] {
+    var i: u32 = 0;
+    for (i < entry.dep_len) {
+        if (entry.deps[i].kind == kind && entry.deps[i].key == key) { ret R.ok_void[str](); }
+        i = i + 1;
+    }
+    val reserved: R.Result[R.Void, str] = deps_reserve(db, entry, 1);
+    if (R.is_err[R.Void, str](reserved)) { ret reserved; }
+    entry.deps[entry.dep_len] = Dep{ kind: kind, key: key };
+    entry.dep_len = entry.dep_len + 1;
     ret R.ok_void[str]();
 }
 
-pub fun record_dep_rev(db: *QueryDb, owner_kind: QueryKind, owner_key: u64, dep_kind: QueryKind, dep_key: u64) R.Result[Revision, str] {
-    if (owner_kind::u32 >= db.kinds) {
-        ret R.err[Revision, str]("record_dep: owner kind out of range");
-    }
-    val sh: *QueryShard = ?db.storage[owner_kind::u32];
-    if (!sh.registered) {
-        ret R.err[Revision, str]("record_dep: owner kind not registered");
-    }
-    val entry: *QueryEntry = entry_find(sh, owner_key);
-    if (entry == nil) {
-        ret R.err[Revision, str]("record_dep: owner entry not found");
-    }
-
-    if (!dep_kind_valid(db, dep_kind)) {
-        ret R.err[Revision, str]("record_dep: dependency kind is not a registered, readable query");
-    }
-
-    ret dep_upsert(db, entry, dep_kind, dep_key);
-}
-
-fun dep_kind_valid(db: *QueryDb, kind: QueryKind) bool {
-    if (kind::u32 >= db.kinds) { ret false; }
-    val sh: *QueryShard = ?db.storage[kind::u32];
-    if (!sh.registered) { ret false; }
-    if (sh.role == SHARD_METADATA && sh.revisions == nil::RevisionFn) { ret false; }
-    ret true;
-}
-
-fun dep_upsert(db: *QueryDb, entry: *QueryEntry, dep_kind: QueryKind, dep_key: u64) R.Result[Revision, str] {
+fun dep_upsert(db: *QueryDb, entry: *QueryEntry, dep_kind: QueryKind, dep_key: u64, rev: Revision, diagnostic_revision: Revision, present: bool) R.Result[Revision, str] {
     var i: u32 = 0;
     for (i < entry.dep_len) {
         val d: *Dep = ?entry.deps[i];
         if (d.kind == dep_kind && d.key == dep_key) {
+            if (!d.observed) {
+                d.last_changed = rev;
+                d.diagnostics_changed = diagnostic_revision;
+                d.present = present;
+                d.observed = true;
+                ret R.ok[Revision, str](rev);
+            }
+            if (d.last_changed != rev || d.diagnostics_changed != diagnostic_revision || d.present != present) {
+                ret R.err[Revision, str]("query dependency changed after acquisition");
+            }
             ret R.ok[Revision, str](d.last_changed);
         }
         i = i + 1;
@@ -456,20 +1334,42 @@ fun dep_upsert(db: *QueryDb, entry: *QueryEntry, dep_kind: QueryKind, dep_key: u
     val res_reserve: R.Result[R.Void, str] = deps_reserve(db, entry, 1);
     if (R.is_err[R.Void, str](res_reserve)) { ret R.err[Revision, str](R.unwrap_err[R.Void, str](res_reserve)); }
 
-    val rev: Revision = last_changed_get(db, dep_kind, dep_key);
     val dep: *Dep = ?entry.deps[entry.dep_len];
+    dep.observed     = true;
     dep.kind         = dep_kind;
     dep.key          = dep_key;
     dep.last_changed = rev;
+    dep.present = present;
+    dep.diagnostics_changed = diagnostic_revision;
     entry.dep_len = entry.dep_len + 1;
     ret R.ok[Revision, str](rev);
+}
+
+# observation copies recorded keys without validating or exposing a cached product
+pub fun cached_dependency_keys(db: *QueryDb, kind: QueryKind, key: u64,
+                               a: *A.Allocator) R.Result[Vector[QueryKey], str] {
+    val found: R.Result[*QueryEntry, str] = peek(db, kind, key);
+    if (R.is_err[*QueryEntry, str](found)) { ret R.err[Vector[QueryKey], str](R.unwrap_err[*QueryEntry, str](found)); }
+    val entry: *QueryEntry = R.unwrap_ok[*QueryEntry, str](found);
+    var keys: Vector[QueryKey] = vector.init[QueryKey](a);
+    var transferred: bool = false;
+    fin { if (!transferred) { vector.dnit[QueryKey](?keys); } }
+    var i: u32 = 0;
+    for (i < entry.dep_len) {
+        val dep: Dep = entry.deps[i];
+        val copied: R.Result[usize, str] = vector.push[QueryKey](?keys, QueryKey{ kind: dep.kind, key: dep.key });
+        if (R.is_err[usize, str](copied)) { ret R.err[Vector[QueryKey], str](R.unwrap_err[usize, str](copied)); }
+        i = i + 1;
+    }
+    transferred = true;
+    ret R.ok[Vector[QueryKey], str](keys);
 }
 
 pub fun peek_revision(db: *QueryDb, kind: QueryKind, key: u64) Revision {
     ret last_changed_get(db, kind, key);
 }
 
-pub fun peek(db: *QueryDb, kind: QueryKind, key: u64) R.Result[*QueryEntry, str] {
+fun peek(db: *QueryDb, kind: QueryKind, key: u64) R.Result[*QueryEntry, str] {
     val sh_r: R.Result[*QueryShard, str] = shard_get(db, kind);
     if (R.is_err[*QueryShard, str](sh_r)) {
         ret R.err[*QueryEntry, str](R.unwrap_err[*QueryShard, str](sh_r));
@@ -483,15 +1383,6 @@ pub fun peek(db: *QueryDb, kind: QueryKind, key: u64) R.Result[*QueryEntry, str]
     ret R.ok[*QueryEntry, str](entry);
 }
 
-pub fun peek_valid(db: *QueryDb, kind: QueryKind, key: u64) bool {
-    if (kind::u32 >= db.kinds) { ret false; }
-    val sh: *QueryShard = ?db.storage[kind::u32];
-    if (!sh.registered || sh.role == SHARD_METADATA) { ret false; }
-    val entry: *QueryEntry = entry_find(sh, key);
-    if (entry == nil) { ret false; }
-    if (sh.role == SHARD_INPUT) { ret true; }
-    ret is_entry_valid(db, entry);
-}
 
 pub fun shard_len(db: *QueryDb, kind: QueryKind) u32 {
     if (kind::u32 >= db.kinds) { ret 0; }
@@ -499,7 +1390,8 @@ pub fun shard_len(db: *QueryDb, kind: QueryKind) u32 {
     ret sh.index.len::u32;
 }
 
-fun register(db: *QueryDb, kind: QueryKind, role: ShardRole, revisions: RevisionFn) R.Result[R.Void, str] {
+fun register(db: *QueryDb, kind: QueryKind, role: ShardRole, revisions: RevisionProvider) R.Result[R.Void, str] {
+    if (db.operation_active || db.presentation_pending) { ret R.err[R.Void, str]("cannot register a query before the operation is released"); }
     val need: u32 = kind::u32 + 1;
     if (need > db.kinds) {
         val res_grow: R.Result[R.Void, str] = storage_grow(db, need);
@@ -557,8 +1449,9 @@ fun storage_grow(db: *QueryDb, need: u32) R.Result[R.Void, str] {
         val sh: *QueryShard = ?db.storage[i];
         sh.kind       = i::QueryKind;
         sh.role       = SHARD_INPUT;
-        sh.revisions  = nil::RevisionFn;
+        sh.revisions  = RevisionProvider{};
         sh.finalize   = nil::FinalizeFn;
+        sh.equal = nil;
         sh.registered = false;
 
         val te_r: R.Result[handle.HandleTable[QueryEntry, QueryEntryDomain], str] =
@@ -609,6 +1502,8 @@ fun entry_append(db: *QueryDb, sh: *QueryShard, key: u64) R.Result[*QueryEntry, 
     fresh.dep_len      = 0;
     fresh.dep_cap      = 0;
     fresh.diags        = nil;
+    fresh.diagnostics_changed = 0;
+    fresh.ready = false;
 
     val ed_r: R.Result[handle.HandleEditor[QueryEntry, QueryEntryDomain], str] =
         handle.edit[QueryEntry, QueryEntryDomain](?sh.entries);
@@ -708,6 +1603,7 @@ fun entry_free(db: *QueryDb, sh: *QueryShard, entry: *QueryEntry) {
     entry.dep_len   = 0;
     entry.dep_cap   = 0;
     entry.diags     = nil;
+    entry.ready     = false;
 }
 
 fun shard_entries_free(db: *QueryDb, sh: *QueryShard) {
@@ -725,89 +1621,133 @@ fun shard_entries_free(db: *QueryDb, sh: *QueryShard) {
     map.dnit[u64, handle.HandleId[QueryEntryDomain]](?sh.by_key);
 }
 
-fun is_entry_valid(db: *QueryDb, entry: *QueryEntry) bool {
-    var i: u32 = 0;
-    for (i < entry.dep_len) {
-        val dep: *Dep = ?entry.deps[i];
-        if (last_changed_get(db, dep.kind, dep.key) != dep.last_changed) {
-            ret false;
-        }
-        i = i + 1;
-    }
-    ret true;
-}
-
 fun last_changed_get(db: *QueryDb, kind: QueryKind, key: u64) Revision {
     if (kind::u32 >= db.kinds) { ret 0; }
     val sh: *QueryShard = ?db.storage[kind::u32];
-    if (sh.role == SHARD_METADATA) {
-        if (sh.revisions == nil) { ret 0; }
-        ret sh.revisions(key);
-    }
+    if (sh.role == SHARD_METADATA) { ret 0; }
     val entry: *QueryEntry = entry_find(sh, key);
     if (entry == nil) { ret 0; }
     ret entry.last_changed;
 }
 
-fun recompute[T](rt: *QueryRuntime[T], ctx: *T, sh: *QueryShard, entry: *QueryEntry, key: u64) R.Result[*QueryEntry, fail.Fail] {
+fun diagnostics_changed_get(db: *QueryDb, kind: QueryKind, key: u64) Revision {
+    if (kind::u32 >= db.kinds) { ret 0; }
+    val sh: *QueryShard = ?db.storage[kind::u32];
+    if (sh.role != SHARD_DERIVED) { ret 0; }
+    val entry: *QueryEntry = entry_find(sh, key);
+    if (entry == nil || !entry.ready) { ret 0; }
+    ret entry.diagnostics_changed;
+}
+
+fun diagnostic_dependencies_equal(left: *QueryEntry, right: *QueryEntry) bool {
+    var i: u32 = 0;
+    var j: u32 = 0;
+    for (true) {
+        for (i < left.dep_len && left.deps[i].diagnostics_changed == 0) { i = i + 1; }
+        for (j < right.dep_len && right.deps[j].diagnostics_changed == 0) { j = j + 1; }
+        if (i == left.dep_len || j == right.dep_len) { ret i == left.dep_len && j == right.dep_len; }
+        val l: Dep = left.deps[i];
+        val r: Dep = right.deps[j];
+        if (l.kind != r.kind || l.key != r.key || l.diagnostics_changed != r.diagnostics_changed) { ret false; }
+        i = i + 1;
+        j = j + 1;
+    }
+    ret false;
+}
+
+fun has_diagnostics(entry: *QueryEntry) bool {
+    if (entry.diags != nil && diagnostic.len(entry.diags) != 0) { ret true; }
+    var i: u32 = 0;
+    for (i < entry.dep_len) {
+        if (entry.deps[i].diagnostics_changed != 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun candidate_compute[T](rt: *QueryRuntime[T], ctx: *T, sh: *QueryShard, key: u64,
+                         candidate: *QueryEntry,
+                         compute: fun(*T, QueryKind, u64, *A.Allocator, *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail]) R.Result[R.Void, fail.Fail] {
     val db: *QueryDb = rt.db;
-    entry.dep_len = 0;
-
-    val diag_mark: usize = diagnostic.len(rt.diags);
-
+    val diags_r: R.Result[*diagnostic.DiagnosticStore, str] = A.allocate[diagnostic.DiagnosticStore](db.a, 1);
+    if (R.is_err[*diagnostic.DiagnosticStore, str](diags_r)) {
+        ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*diagnostic.DiagnosticStore, str](diags_r)));
+    }
+    candidate.diags = R.unwrap_ok[*diagnostic.DiagnosticStore, str](diags_r);
+    @candidate.diags = diagnostic.store_init(db.a);
+    val frame: usize = db.stack.len - 1;
+    db.stack.data[frame].entry = candidate;
+    fin { db.stack.data[frame].entry = nil; }
     db.compute_depth = db.compute_depth + 1;
-    val res_output: R.Result[QueryOutput, fail.Fail] = rt.caps.compute(ctx, sh.kind, key, db.a);
+    val computed: R.Result[QueryOutput, fail.Fail] = compute(ctx, sh.kind, key, db.a, candidate.diags);
     db.compute_depth = db.compute_depth - 1;
-
-    if (R.is_err[QueryOutput, fail.Fail](res_output)) {
-        entry_remove(db, sh, key);
-        ret R.err[*QueryEntry, fail.Fail](R.unwrap_err[QueryOutput, fail.Fail](res_output));
+    if (R.is_err[QueryOutput, fail.Fail](computed)) {
+        operation_fail(db, R.unwrap_err[QueryOutput, fail.Fail](computed));
+        ret R.err[R.Void, fail.Fail](O.unwrap[fail.Fail](db.operation_failure));
     }
-    val out: QueryOutput = R.unwrap_ok[QueryOutput, fail.Fail](res_output);
-
-    if (diagnostic.len(rt.diags) > diag_mark) {
-        val snap_r: R.Result[*diagnostic.DiagnosticStore, str] = diagnostic.snapshot_from(rt.diags, diag_mark, db.a);
-        if (R.is_err[*diagnostic.DiagnosticStore, str](snap_r)) {
-            if (out.bytes != nil && out.len > 0) {
-                if (sh.finalize != nil) { sh.finalize(out.bytes, out.len, db.a); }
-                A.deallocate[u8](db.a, out.bytes, out.len::usize);
-            }
-            entry_remove(db, sh, key);
-            ret R.err[*QueryEntry, fail.Fail](fail.message(R.unwrap_err[*diagnostic.DiagnosticStore, str](snap_r)));
-        }
-        if (entry.diags != nil) {
-            diagnostic.store_dnit(entry.diags);
-            A.deallocate[diagnostic.DiagnosticStore](db.a, entry.diags, 1::usize);
-        }
-        entry.diags = R.unwrap_ok[*diagnostic.DiagnosticStore, str](snap_r);
-    } or {
-        if (entry.diags != nil) {
-            diagnostic.store_dnit(entry.diags);
-            A.deallocate[diagnostic.DiagnosticStore](db.a, entry.diags, 1::usize);
-        }
-        entry.diags = nil;
+    val out: QueryOutput = R.unwrap_ok[QueryOutput, fail.Fail](computed);
+    candidate.value = out.bytes;
+    candidate.value_len = out.len;
+    if ((out.len != 0 && out.bytes == nil) || (out.len == 0 && out.bytes != nil)) {
+        ret R.err[R.Void, fail.Fail](fail.message("query output has an inconsistent byte extent"));
     }
+    if (O.is_some[fail.Fail](db.operation_failure)) {
+        ret R.err[R.Void, fail.Fail](O.unwrap[fail.Fail](db.operation_failure));
+    }
+    ret R.ok_void[fail.Fail]();
+}
 
-    val owned: bool = sh.finalize != nil;
-    if (!owned) {
-        val same: bool = entry.value_len == out.len
-            && memory.raw_equal(entry.value::ptr, out.bytes::ptr, out.len::usize);
-        if (same) {
-            if (out.bytes != nil && out.len > 0) {
-                A.deallocate[u8](db.a, out.bytes, out.len::usize);
-            }
-            ret R.ok[*QueryEntry, fail.Fail](entry);
+fun candidate_publish(db: *QueryDb, sh: *QueryShard, entry: *QueryEntry, candidate: *QueryEntry) R.Result[*QueryEntry, fail.Fail] {
+    candidate.ready = true;
+    val diag_equal: R.Result[bool, str] = diagnostic.content_equal(entry.diags, candidate.diags);
+    if (R.is_err[bool, str](diag_equal)) { ret R.err[*QueryEntry, fail.Fail](fail.message(R.unwrap_err[bool, str](diag_equal))); }
+    val same_diags: bool = R.unwrap_ok[bool, str](diag_equal) && diagnostic_dependencies_equal(entry, candidate);
+    var same_value: bool = false;
+    if (entry.ready) {
+        if (sh.equal != nil) { same_value = sh.equal(entry.value, entry.value_len, candidate.value, candidate.value_len); }
+        or (sh.finalize == nil) {
+            same_value = entry.value_len == candidate.value_len
+                && memory.raw_equal(entry.value::ptr, candidate.value::ptr, candidate.value_len::usize);
         }
     }
-
-    if (entry.value != nil && entry.value_len > 0) {
-        if (owned) { sh.finalize(entry.value, entry.value_len, db.a); }
-        A.deallocate[u8](db.a, entry.value, entry.value_len::usize);
+    var revision: Revision = entry.last_changed;
+    if (!same_value || !same_diags) {
+        val changed: R.Result[Revision, str] = next_revision(db);
+        if (R.is_err[Revision, str](changed)) { ret R.err[*QueryEntry, fail.Fail](fail.message(R.unwrap_err[Revision, str](changed))); }
+        revision = R.unwrap_ok[Revision, str](changed);
     }
-    entry.value        = out.bytes;
-    entry.value_len    = out.len;
-    entry.last_changed = db.revision;
+    candidate.last_changed = revision;
+    if (has_diagnostics(candidate)) {
+        if (same_diags) { candidate.diagnostics_changed = entry.diagnostics_changed; }
+        or { candidate.diagnostics_changed = revision; }
+    }
+    if (same_value) {
+        if (sh.finalize != nil) { sh.finalize(candidate.value, candidate.value_len, db.a); }
+        if (candidate.value != nil && candidate.value_len != 0) { A.deallocate[u8](db.a, candidate.value, candidate.value_len::usize); }
+        candidate.value = entry.value;
+        candidate.value_len = entry.value_len;
+        entry.value = nil;
+        entry.value_len = 0;
+    }
+    entry_free(db, sh, entry);
+    @entry = @candidate;
+    @candidate = QueryEntry{};
     ret R.ok[*QueryEntry, fail.Fail](entry);
+}
+
+fun recompute[T](rt: *QueryRuntime[T], ctx: *T, sh: *QueryShard, entry: *QueryEntry, key: u64, attempt: usize) R.Result[*QueryEntry, fail.Fail] {
+    val db: *QueryDb = rt.db;
+    var candidate: QueryEntry = QueryEntry{ key: key };
+    var committed: bool = false;
+    fin {
+        if (!committed) { attempt_preserve(db, sh, attempt, ?candidate); }
+        entry_free(db, sh, ?candidate);
+    }
+    val computed: R.Result[R.Void, fail.Fail] = candidate_compute[T](rt, ctx, sh, key, ?candidate, rt.caps.compute);
+    if (R.is_err[R.Void, fail.Fail](computed)) { ret R.err[*QueryEntry, fail.Fail](R.unwrap_err[R.Void, fail.Fail](computed)); }
+    val published: R.Result[*QueryEntry, fail.Fail] = candidate_publish(db, sh, entry, ?candidate);
+    if (R.is_ok[*QueryEntry, fail.Fail](published)) { committed = true; }
+    ret published;
 }
 
 fun deps_reserve(db: *QueryDb, entry: *QueryEntry, need: u32) R.Result[R.Void, str] {
@@ -882,26 +1822,31 @@ val T_MODE_DEDUP:      TestComputeMode = 7;
 val T_MODE_AUTO_DEP:   TestComputeMode = 8;
 val T_MODE_OWNED_DIAG: TestComputeMode = 9;
 val T_MODE_DIRECT_TOKENIZE: TestComputeMode = 10;
+val T_MODE_BRANCH: TestComputeMode = 11;
 
 rec TestQueryContext {
     runtime: QueryRuntime[TestQueryContext];
     diags:   diagnostic.DiagnosticStore;
     mode:    TestComputeMode;
+    last_presentation: *Presentation;
+    diagnostic_refused: bool;
 }
 
-def TestComputeFn: fun(*TestQueryContext, QueryKind, u64, *A.Allocator) R.Result[QueryOutput, fail.Fail];
+def TestComputeFn: fun(*TestQueryContext, QueryKind, u64, *A.Allocator, *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail];
 
 fun t_context_init_with(ctx: *TestQueryContext, db: *QueryDb, diag_alloc: *A.Allocator,
                         mode: TestComputeMode) bool {
     ctx.diags = diagnostic.store_init(diag_alloc);
     val rt_r: R.Result[QueryRuntime[TestQueryContext], str] =
-        runtime[TestQueryContext](db, ?ctx.diags, t_dispatch);
+        runtime[TestQueryContext](db, t_dispatch);
     if (R.is_err[QueryRuntime[TestQueryContext], str](rt_r)) {
         diagnostic.store_dnit(?ctx.diags);
         ret false;
     }
     ctx.runtime = R.unwrap_ok[QueryRuntime[TestQueryContext], str](rt_r);
     ctx.mode    = mode;
+    ctx.last_presentation = nil;
+    ctx.diagnostic_refused = false;
     ret true;
 }
 
@@ -910,18 +1855,60 @@ fun t_context_init(ctx: *TestQueryContext, db: *QueryDb, mode: TestComputeMode) 
 }
 
 fun t_context_dnit(ctx: *TestQueryContext) {
+    presentation_dnit(ctx.last_presentation);
+    ctx.last_presentation = nil;
     diagnostic.store_dnit(?ctx.diags);
 }
 
-fun t_always_fail(ctx: *TestQueryContext, key: u64, a: *A.Allocator) R.Result[QueryOutput, fail.Fail] {
+fun t_present(ctx: *TestQueryContext, operation: Operation, kind: QueryKind, key: u64) R.Result[R.Void, str] {
+    var root: QueryKey = QueryKey{ kind: kind, key: key };
+    val presented: R.Result[*Presentation, str] = collect(ctx.runtime.db, operation, ?root, 1, ctx.diags.a);
+    if (R.is_err[*Presentation, str](presented)) { ret R.void_of[*Presentation, str](presented); }
+    presentation_dnit(ctx.last_presentation);
+    ctx.last_presentation = R.unwrap_ok[*Presentation, str](presented);
+    ret diagnostic.replay_into(?ctx.diags, ?ctx.last_presentation.diags);
+}
+
+fun t_get(ctx: *TestQueryContext, kind: QueryKind, key: u64) R.Result[*QueryEntry, fail.Fail] {
+    presentation_dnit(ctx.last_presentation);
+    ctx.last_presentation = nil;
+    if (ctx.runtime.db.presentation_pending) {
+        val released: R.Result[R.Void, str] = discard(ctx.runtime.db,
+            Operation{ owner: ctx.runtime.db::ptr, sequence: ctx.runtime.db.operation_sequence });
+        if (R.is_err[R.Void, str](released)) { ret R.err[*QueryEntry, fail.Fail](fail.message(R.unwrap_err[R.Void, str](released))); }
+    }
+    val opened: R.Result[Operation, str] = begin(ctx.runtime.db);
+    if (R.is_err[Operation, str](opened)) { ret fail.lift[*QueryEntry](R.err[*QueryEntry, str](R.unwrap_err[Operation, str](opened))); }
+    val result: R.Result[*QueryEntry, fail.Fail] = acquire_entry[TestQueryContext](?ctx.runtime, ctx, kind, key);
+    val closed: R.Result[R.Void, fail.Fail] = end(ctx.runtime.db, R.unwrap_ok[Operation, str](opened));
+    val shown: R.Result[R.Void, str] = t_present(ctx, R.unwrap_ok[Operation, str](opened), kind, key);
+    if (R.is_err[*QueryEntry, fail.Fail](result)) { ret result; }
+    if (R.is_err[R.Void, str](shown)) { ret R.err[*QueryEntry, fail.Fail](fail.message(R.unwrap_err[R.Void, str](shown))); }
+    if (R.is_err[R.Void, fail.Fail](closed)) { ret R.err[*QueryEntry, fail.Fail](R.unwrap_err[R.Void, fail.Fail](closed)); }
+    ret result;
+}
+
+fun t_reusable(ctx: *TestQueryContext, kind: QueryKind, key: u64) R.Result[bool, fail.Fail] {
+    val opened: R.Result[Operation, str] = begin(ctx.runtime.db);
+    if (R.is_err[Operation, str](opened)) { ret fail.lift[bool](R.err[bool, str](R.unwrap_err[Operation, str](opened))); }
+    val result: R.Result[bool, fail.Fail] = reusable[TestQueryContext](?ctx.runtime, ctx, kind, key);
+    val closed: R.Result[R.Void, fail.Fail] = end(ctx.runtime.db, R.unwrap_ok[Operation, str](opened));
+    if (R.is_err[bool, fail.Fail](result)) { ret result; }
+    if (R.is_err[R.Void, fail.Fail](closed)) { ret R.err[bool, fail.Fail](R.unwrap_err[R.Void, fail.Fail](closed)); }
+    val released: R.Result[R.Void, str] = discard(ctx.runtime.db, R.unwrap_ok[Operation, str](opened));
+    if (R.is_err[R.Void, str](released)) { ret R.err[bool, fail.Fail](fail.message(R.unwrap_err[R.Void, str](released))); }
+    ret result;
+}
+
+fun t_always_fail(ctx: *TestQueryContext, key: u64, a: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail] {
     ret R.err[QueryOutput, fail.Fail](fail.message("compute always fails"));
 }
 
-fun t_tok_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator) R.Result[QueryOutput, fail.Fail] {
+fun t_tok_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail] {
     val db: *QueryDb = ctx.runtime.db;
-    val res_dep: R.Result[R.Void, str] = record_dep(db, Q_TOKENIZE, key, Q_FILE_TEXT, key);
-    if (R.is_err[R.Void, str](res_dep)) {
-        ret R.err[QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](res_dep)));
+    val res_dep: R.Result[R.Void, fail.Fail] = depend[TestQueryContext](?ctx.runtime, ctx, Q_FILE_TEXT, key);
+    if (R.is_err[R.Void, fail.Fail](res_dep)) {
+        ret R.err[QueryOutput, fail.Fail](R.unwrap_err[R.Void, fail.Fail](res_dep));
     }
     val res_buf: R.Result[*u8, str] = A.allocate[u8](a, 1);
     if (R.is_err[*u8, str](res_buf)) {
@@ -944,11 +1931,11 @@ fun t_handle_ptr(entry: *QueryEntry) ptr {
     ret slot[0];
 }
 
-fun t_owned_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator) R.Result[QueryOutput, fail.Fail] {
+fun t_owned_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail] {
     val db: *QueryDb = ctx.runtime.db;
-    val res_dep: R.Result[R.Void, str] = record_dep(db, Q_PARSE, key, Q_FILE_TEXT, key);
-    if (R.is_err[R.Void, str](res_dep)) {
-        ret R.err[QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](res_dep)));
+    val res_dep: R.Result[R.Void, fail.Fail] = depend[TestQueryContext](?ctx.runtime, ctx, Q_FILE_TEXT, key);
+    if (R.is_err[R.Void, fail.Fail](res_dep)) {
+        ret R.err[QueryOutput, fail.Fail](R.unwrap_err[R.Void, fail.Fail](res_dep));
     }
     val res_art: R.Result[*u64, str] = A.allocate[u64](a, 1::usize);
     if (R.is_err[*u64, str](res_art)) {
@@ -984,12 +1971,13 @@ fun t_owned_finalize(value: *u8, value_len: u32, a: *A.Allocator) {
     t_live = t_live - 1;
 }
 
-fun t_owned_diag_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator) R.Result[QueryOutput, fail.Fail] {
-    val out_r: R.Result[QueryOutput, fail.Fail] = t_owned_compute(ctx, key, a);
+fun t_owned_diag_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail] {
+    val out_r: R.Result[QueryOutput, fail.Fail] = t_owned_compute(ctx, key, a, diags);
     if (R.is_err[QueryOutput, fail.Fail](out_r)) { ret out_r; }
     val out: QueryOutput = R.unwrap_ok[QueryOutput, fail.Fail](out_r);
-    val diag_r: R.Result[R.Void, str] = t_emit_diag(ctx);
+    val diag_r: R.Result[R.Void, str] = t_emit_diag(diags);
     if (R.is_err[R.Void, str](diag_r)) {
+        ctx.diagnostic_refused = true;
         t_owned_finalize(out.bytes, out.len, a);
         if (out.bytes != nil && out.len > 0) { A.deallocate[u8](a, out.bytes, out.len::usize); }
         ret R.err[QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](diag_r)));
@@ -998,29 +1986,30 @@ fun t_owned_diag_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator) R.Re
 }
 
 fun t_dispatch(ctx: *TestQueryContext, kind: QueryKind, key: u64,
-               a: *A.Allocator) R.Result[QueryOutput, fail.Fail] {
-    if (ctx.mode == T_MODE_FAIL) { ret t_always_fail(ctx, key, a); }
-    if (ctx.mode == T_MODE_TOKENIZE) { ret t_tok_compute(ctx, key, a); }
-    if (ctx.mode == T_MODE_OWNED) { ret t_owned_compute(ctx, key, a); }
+               a: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail] {
+    if (ctx.mode == T_MODE_BRANCH) { ret t_branch_compute(ctx, kind, key, a, diags); }
+    if (ctx.mode == T_MODE_FAIL) { ret t_always_fail(ctx, key, a, diags); }
+    if (ctx.mode == T_MODE_TOKENIZE) { ret t_tok_compute(ctx, key, a, diags); }
+    if (ctx.mode == T_MODE_OWNED) { ret t_owned_compute(ctx, key, a, diags); }
     if (ctx.mode == T_MODE_DIAG) {
-        if (kind == Q_TOKENIZE) { ret t_inner_diag_compute(ctx, key, a); }
-        if (kind == Q_PARSE)    { ret t_outer_diag_compute(ctx, key, a); }
+        if (kind == Q_TOKENIZE) { ret t_inner_diag_compute(ctx, key, a, diags); }
+        if (kind == Q_PARSE)    { ret t_outer_diag_compute(ctx, key, a, diags); }
     }
-    if (ctx.mode == T_MODE_DIRECT) { ret t_direct_cycle_compute(ctx, key, a); }
-    if (ctx.mode == T_MODE_DIRECT_TOKENIZE) { ret t_direct_tokenize_recompute(ctx, key, a); }
+    if (ctx.mode == T_MODE_DIRECT) { ret t_direct_cycle_compute(ctx, key, a, diags); }
+    if (ctx.mode == T_MODE_DIRECT_TOKENIZE) { ret t_direct_tokenize_recompute(ctx, key, a, diags); }
     if (ctx.mode == T_MODE_INDIRECT) {
-        if (kind == Q_SEMA)  { ret t_cycle_a_compute(ctx, key, a); }
-        if (kind == Q_LOWER) { ret t_cycle_b_compute(ctx, key, a); }
+        if (kind == Q_SEMA)  { ret t_cycle_a_compute(ctx, key, a, diags); }
+        if (kind == Q_LOWER) { ret t_cycle_b_compute(ctx, key, a, diags); }
     }
     if (ctx.mode == T_MODE_PARSE_DEPS) {
-        if (kind == Q_TOKENIZE) { ret t_tok_compute(ctx, key, a); }
-        if (kind == Q_PARSE)    { ret t_parse_deps_on_tokenize(ctx, key, a); }
+        if (kind == Q_TOKENIZE) { ret t_tok_compute(ctx, key, a, diags); }
+        if (kind == Q_PARSE)    { ret t_parse_deps_on_tokenize(ctx, key, a, diags); }
     }
-    if (ctx.mode == T_MODE_DEDUP)      { ret t_dedup_owner_compute(ctx, key, a); }
-    if (ctx.mode == T_MODE_OWNED_DIAG) { ret t_owned_diag_compute(ctx, key, a); }
+    if (ctx.mode == T_MODE_DEDUP)      { ret t_dedup_owner_compute(ctx, key, a, diags); }
+    if (ctx.mode == T_MODE_OWNED_DIAG) { ret t_owned_diag_compute(ctx, key, a, diags); }
     if (ctx.mode == T_MODE_AUTO_DEP) {
-        if (kind == Q_TOKENIZE) { ret t_tok_compute(ctx, key, a); }
-        if (kind == Q_PARSE)    { ret t_auto_dep_outer_compute(ctx, key, a); }
+        if (kind == Q_TOKENIZE) { ret t_tok_compute(ctx, key, a, diags); }
+        if (kind == Q_PARSE)    { ret t_auto_dep_outer_compute(ctx, key, a, diags); }
     }
     ret R.err[QueryOutput, fail.Fail](fail.message("test query kind has no compute capability"));
 }
@@ -1036,8 +2025,8 @@ test "mach.lang.query.recompute:failed_not_cached_as_success" {
 
     if (R.is_err[R.Void, str](register_derived(?db, Q_TOKENIZE))) { dnit(?db); ret 1; }
 
-    if (!R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_TOKENIZE, 42))) { dnit(?db); ret 1; }
-    if (!R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_TOKENIZE, 42))) { dnit(?db); ret 1; }
+    if (!R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_TOKENIZE, 42))) { dnit(?db); ret 1; }
+    if (!R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_TOKENIZE, 42))) { dnit(?db); ret 1; }
 
     dnit(?db);
     t_context_dnit(?ctx);
@@ -1056,18 +2045,18 @@ test "mach.lang.query.set_input:identical_bytes_early_cutoff" {
     if (R.is_err[R.Void, str](register_input(?db, Q_PROJECT_ROOT))) { dnit(?db); ret 1; }
 
     if (R.is_err[R.Void, str](set_input(?db, Q_PROJECT_ROOT, 1, "hello"::*u8, 5))) { dnit(?db); ret 1; }
-    val res_entry_a: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ?ctx, Q_PROJECT_ROOT, 1);
+    val res_entry_a: R.Result[*QueryEntry, fail.Fail] = t_get(?ctx, Q_PROJECT_ROOT, 1);
     if (R.is_err[*QueryEntry, fail.Fail](res_entry_a)) { dnit(?db); ret 1; }
     val lc_a: Revision = R.unwrap_ok[*QueryEntry, fail.Fail](res_entry_a).last_changed;
 
     if (R.is_err[R.Void, str](set_input(?db, Q_PROJECT_ROOT, 1, "hello"::*u8, 5))) { dnit(?db); ret 1; }
-    val res_entry_b: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ?ctx, Q_PROJECT_ROOT, 1);
+    val res_entry_b: R.Result[*QueryEntry, fail.Fail] = t_get(?ctx, Q_PROJECT_ROOT, 1);
     if (R.is_err[*QueryEntry, fail.Fail](res_entry_b)) { dnit(?db); ret 1; }
     val lc_b: Revision = R.unwrap_ok[*QueryEntry, fail.Fail](res_entry_b).last_changed;
     if (lc_b != lc_a) { dnit(?db); ret 1; }
 
     if (R.is_err[R.Void, str](set_input(?db, Q_PROJECT_ROOT, 1, "world"::*u8, 5))) { dnit(?db); ret 1; }
-    val res_entry_c: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ?ctx, Q_PROJECT_ROOT, 1);
+    val res_entry_c: R.Result[*QueryEntry, fail.Fail] = t_get(?ctx, Q_PROJECT_ROOT, 1);
     if (R.is_err[*QueryEntry, fail.Fail](res_entry_c)) { dnit(?db); ret 1; }
     val lc_c: Revision = R.unwrap_ok[*QueryEntry, fail.Fail](res_entry_c).last_changed;
     if (lc_c <= lc_a) { dnit(?db); ret 1; }
@@ -1090,17 +2079,17 @@ test "mach.lang.query.get:derived_dep_tracking_early_cutoff" {
     if (R.is_err[R.Void, str](register_derived(?db, Q_TOKENIZE))) { dnit(?db); ret 1; }
 
     if (R.is_err[R.Void, str](set_input(?db, Q_FILE_TEXT, 7, "v1"::*u8, 2))) { dnit(?db); ret 1; }
-    val res_warm: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ?ctx, Q_TOKENIZE, 7);
+    val res_warm: R.Result[*QueryEntry, fail.Fail] = t_get(?ctx, Q_TOKENIZE, 7);
     if (R.is_err[*QueryEntry, fail.Fail](res_warm)) { dnit(?db); ret 1; }
     val lc_warm: Revision = R.unwrap_ok[*QueryEntry, fail.Fail](res_warm).last_changed;
 
     if (R.is_err[R.Void, str](set_input(?db, Q_FILE_TEXT, 7, "v2"::*u8, 2))) { dnit(?db); ret 1; }
-    val res_v2: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ?ctx, Q_TOKENIZE, 7);
+    val res_v2: R.Result[*QueryEntry, fail.Fail] = t_get(?ctx, Q_TOKENIZE, 7);
     if (R.is_err[*QueryEntry, fail.Fail](res_v2)) { dnit(?db); ret 1; }
     val lc_v2: Revision = R.unwrap_ok[*QueryEntry, fail.Fail](res_v2).last_changed;
 
     if (R.is_err[R.Void, str](set_input(?db, Q_FILE_TEXT, 7, "v1"::*u8, 2))) { dnit(?db); ret 1; }
-    val res_v1: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ?ctx, Q_TOKENIZE, 7);
+    val res_v1: R.Result[*QueryEntry, fail.Fail] = t_get(?ctx, Q_TOKENIZE, 7);
     if (R.is_err[*QueryEntry, fail.Fail](res_v1)) { dnit(?db); ret 1; }
     val lc_v1: Revision = R.unwrap_ok[*QueryEntry, fail.Fail](res_v1).last_changed;
 
@@ -1126,25 +2115,25 @@ test "mach.lang.query.register_derived_owned:finalizer_frees_artifacts" {
     if (R.is_err[R.Void, str](register_derived_owned(?db, Q_PARSE, t_owned_finalize))) { dnit(?db); ret 1; }
 
     if (R.is_err[R.Void, str](set_input(?db, Q_FILE_TEXT, 1, "a"::*u8, 1))) { dnit(?db); ret 1; }
-    val res_g1: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ?ctx, Q_PARSE, 1);
+    val res_g1: R.Result[*QueryEntry, fail.Fail] = t_get(?ctx, Q_PARSE, 1);
     if (R.is_err[*QueryEntry, fail.Fail](res_g1)) { dnit(?db); ret 1; }
     if (t_live != 1)                        { dnit(?db); ret 1; }
     val p1: ptr = t_handle_ptr(R.unwrap_ok[*QueryEntry, fail.Fail](res_g1));
 
     if (R.is_err[R.Void, str](set_input(?db, Q_FILE_TEXT, 1, "a"::*u8, 1))) { dnit(?db); ret 1; }
-    val res_g2: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ?ctx, Q_PARSE, 1);
+    val res_g2: R.Result[*QueryEntry, fail.Fail] = t_get(?ctx, Q_PARSE, 1);
     if (R.is_err[*QueryEntry, fail.Fail](res_g2))                        { dnit(?db); ret 1; }
     if (t_live != 1)                                               { dnit(?db); ret 1; }
     if (t_handle_ptr(R.unwrap_ok[*QueryEntry, fail.Fail](res_g2)) != p1) { dnit(?db); ret 1; }
 
     if (R.is_err[R.Void, str](set_input(?db, Q_FILE_TEXT, 1, "b"::*u8, 1))) { dnit(?db); ret 1; }
-    val res_g3: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ?ctx, Q_PARSE, 1);
+    val res_g3: R.Result[*QueryEntry, fail.Fail] = t_get(?ctx, Q_PARSE, 1);
     if (R.is_err[*QueryEntry, fail.Fail](res_g3))                        { dnit(?db); ret 1; }
     if (t_live != 1)                                               { dnit(?db); ret 1; }
     if (t_handle_ptr(R.unwrap_ok[*QueryEntry, fail.Fail](res_g3)) == p1) { dnit(?db); ret 1; }
 
     if (R.is_err[R.Void, str](set_input(?db, Q_FILE_TEXT, 2, "c"::*u8, 1))) { dnit(?db); ret 1; }
-    if (R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_PARSE, 2)))                 { dnit(?db); ret 1; }
+    if (R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_PARSE, 2)))                 { dnit(?db); ret 1; }
     if (t_live != 2)                                                      { dnit(?db); ret 1; }
 
     dnit(?db);
@@ -1159,18 +2148,18 @@ fun t_diag_reset(ctx: *TestQueryContext) {
     ctx.diags = diagnostic.store_init(a);
 }
 
-fun t_emit_diag(ctx: *TestQueryContext) R.Result[R.Void, str] {
+fun t_emit_diag(diags: *diagnostic.DiagnosticStore) R.Result[R.Void, str] {
     var span: token.Span;
     span.offset = 0;
     span.len    = 1;
-    ret diagnostic.error(?ctx.diags, 0, span, "query diagnostic");
+    ret diagnostic.error(diags, 0, span, "query diagnostic");
 }
 
-fun t_inner_diag_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator) R.Result[QueryOutput, fail.Fail] {
+fun t_inner_diag_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail] {
     val db: *QueryDb = ctx.runtime.db;
-    val rd: R.Result[R.Void, str] = record_dep(db, Q_TOKENIZE, key, Q_FILE_TEXT, key);
-    if (R.is_err[R.Void, str](rd)) { ret R.err[QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rd))); }
-    val de: R.Result[R.Void, str] = t_emit_diag(ctx);
+    val rd: R.Result[R.Void, fail.Fail] = depend[TestQueryContext](?ctx.runtime, ctx, Q_FILE_TEXT, key);
+    if (R.is_err[R.Void, fail.Fail](rd)) { ret R.err[QueryOutput, fail.Fail](R.unwrap_err[R.Void, fail.Fail](rd)); }
+    val de: R.Result[R.Void, str] = t_emit_diag(diags);
     if (R.is_err[R.Void, str](de)) { ret R.err[QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](de))); }
     val rb: R.Result[*u8, str] = A.allocate[u8](a, 1);
     if (R.is_err[*u8, str](rb)) { ret R.err[QueryOutput, fail.Fail](fail.message(R.unwrap_err[*u8, str](rb))); }
@@ -1182,13 +2171,13 @@ fun t_inner_diag_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator) R.Re
     ret R.ok[QueryOutput, fail.Fail](out);
 }
 
-fun t_outer_diag_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator) R.Result[QueryOutput, fail.Fail] {
+fun t_outer_diag_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail] {
     val db: *QueryDb = ctx.runtime.db;
-    val rd: R.Result[R.Void, str] = record_dep(db, Q_PARSE, key, Q_FILE_TEXT, key);
-    if (R.is_err[R.Void, str](rd)) { ret R.err[QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rd))); }
-    val de: R.Result[R.Void, str] = t_emit_diag(ctx);
+    val rd: R.Result[R.Void, fail.Fail] = depend[TestQueryContext](?ctx.runtime, ctx, Q_FILE_TEXT, key);
+    if (R.is_err[R.Void, fail.Fail](rd)) { ret R.err[QueryOutput, fail.Fail](R.unwrap_err[R.Void, fail.Fail](rd)); }
+    val de: R.Result[R.Void, str] = t_emit_diag(diags);
     if (R.is_err[R.Void, str](de)) { ret R.err[QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](de))); }
-    val g: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ctx, Q_TOKENIZE, key);
+    val g: R.Result[*QueryEntry, fail.Fail] = acquire_entry[TestQueryContext](?ctx.runtime, ctx, Q_TOKENIZE, key);
     if (R.is_err[*QueryEntry, fail.Fail](g)) { ret R.err[QueryOutput, fail.Fail](R.unwrap_err[*QueryEntry, fail.Fail](g)); }
     val rb: R.Result[*u8, str] = A.allocate[u8](a, 1);
     if (R.is_err[*u8, str](rb)) { ret R.err[QueryOutput, fail.Fail](fail.message(R.unwrap_err[*u8, str](rb))); }
@@ -1215,35 +2204,35 @@ test "mach.lang.query.get:reused_entry_replays_diagnostics" {
     if (R.is_err[R.Void, str](set_input(?db, Q_FILE_TEXT, 1, "x"::*u8, 1)))             { dnit(?db); ret 1; }
 
     t_diag_reset(?ctx);
-    if (R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_TOKENIZE, 1))) { dnit(?db); ret 1; }
+    if (R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_TOKENIZE, 1))) { dnit(?db); ret 1; }
     if (diagnostic.len(?ctx.diags) != 1)                      { dnit(?db); ret 1; }
 
     t_diag_reset(?ctx);
-    if (R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_TOKENIZE, 1))) { dnit(?db); ret 1; }
+    if (R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_TOKENIZE, 1))) { dnit(?db); ret 1; }
     if (diagnostic.len(?ctx.diags) != 1)                      { dnit(?db); ret 1; }
 
     t_diag_reset(?ctx);
-    if (R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_PARSE, 1))) { dnit(?db); ret 1; }
-    if (diagnostic.len(?ctx.diags) != 1)                   { dnit(?db); ret 1; }
+    if (R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_PARSE, 1))) { dnit(?db); ret 1; }
+    if (diagnostic.len(?ctx.diags) != 2)                   { dnit(?db); ret 1; }
 
     t_diag_reset(?ctx);
-    if (R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_PARSE, 1))) { dnit(?db); ret 1; }
-    if (diagnostic.len(?ctx.diags) != 1)                   { dnit(?db); ret 1; }
+    if (R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_PARSE, 1))) { dnit(?db); ret 1; }
+    if (diagnostic.len(?ctx.diags) != 2)                   { dnit(?db); ret 1; }
 
     if (R.is_err[R.Void, str](invalidate(?db, Q_PARSE, 1))) { dnit(?db); ret 1; }
     if (shard_len(?db, Q_PARSE) != 0)                     { dnit(?db); ret 1; }
 
     t_diag_reset(?ctx);
-    if (R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_PARSE, 1))) { dnit(?db); ret 1; }
-    if (diagnostic.len(?ctx.diags) != 1)                   { dnit(?db); ret 1; }
+    if (R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_PARSE, 1))) { dnit(?db); ret 1; }
+    if (diagnostic.len(?ctx.diags) != 2)                   { dnit(?db); ret 1; }
 
     dnit(?db);
     t_context_dnit(?ctx);
     ret 0;
 }
 
-fun t_direct_tokenize_recompute(ctx: *TestQueryContext, key: u64, a: *A.Allocator) R.Result[QueryOutput, fail.Fail] {
-    val g: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ctx, Q_TOKENIZE, key);
+fun t_direct_tokenize_recompute(ctx: *TestQueryContext, key: u64, a: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail] {
+    val g: R.Result[*QueryEntry, fail.Fail] = acquire_entry[TestQueryContext](?ctx.runtime, ctx, Q_TOKENIZE, key);
     if (R.is_err[*QueryEntry, fail.Fail](g)) { ret R.err[QueryOutput, fail.Fail](R.unwrap_err[*QueryEntry, fail.Fail](g)); }
     val seen: *QueryEntry = R.unwrap_ok[*QueryEntry, fail.Fail](g);
     val res_buf: R.Result[*u8, str] = A.allocate[u8](a, 1);
@@ -1270,28 +2259,32 @@ test "mach.lang.query.get:a_stale_entry_under_recomputation_is_a_cycle_not_its_o
     if (R.is_err[R.Void, str](register_derived(?db, Q_TOKENIZE)))   { dnit(?db); ret 1; }
     if (R.is_err[R.Void, str](set_input(?db, Q_FILE_TEXT, 1, "a"::*u8, 1))) { dnit(?db); ret 1; }
 
-    val first: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ?ctx, Q_TOKENIZE, 1);
+    val first: R.Result[*QueryEntry, fail.Fail] = t_get(?ctx, Q_TOKENIZE, 1);
     if (R.is_err[*QueryEntry, fail.Fail](first))                 { dnit(?db); ret 1; }
     val complete: *QueryEntry = R.unwrap_ok[*QueryEntry, fail.Fail](first);
     if (complete.value == nil || complete.value[0] != 42)        { dnit(?db); ret 1; }
 
     if (R.is_err[R.Void, str](set_input(?db, Q_FILE_TEXT, 1, "b"::*u8, 1))) { dnit(?db); ret 1; }
-    if (peek_valid(?db, Q_TOKENIZE, 1))                          { dnit(?db); ret 1; }
+    val valid_1: R.Result[bool, fail.Fail] = t_reusable(?ctx, Q_TOKENIZE, 1);
+    if (R.is_err[bool, fail.Fail](valid_1)) { dnit(?db); ret 1; }
+    if (R.unwrap_ok[bool, fail.Fail](valid_1))                          { dnit(?db); ret 1; }
 
     ctx.mode = T_MODE_DIRECT_TOKENIZE;
-    val again: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ?ctx, Q_TOKENIZE, 1);
+    val again: R.Result[*QueryEntry, fail.Fail] = t_get(?ctx, Q_TOKENIZE, 1);
     if (!R.is_err[*QueryEntry, fail.Fail](again))                { dnit(?db); ret 1; }
     if (!str_contains(R.unwrap_err[*QueryEntry, fail.Fail](again).message, "query cycle")) { dnit(?db); ret 1; }
     if (db.stack.len != 0)                                       { dnit(?db); ret 1; }
-    if (peek_valid(?db, Q_TOKENIZE, 1))                          { dnit(?db); ret 1; }
+    val valid_2: R.Result[bool, fail.Fail] = t_reusable(?ctx, Q_TOKENIZE, 1);
+    if (R.is_err[bool, fail.Fail](valid_2)) { dnit(?db); ret 1; }
+    if (R.unwrap_ok[bool, fail.Fail](valid_2))                          { dnit(?db); ret 1; }
 
     dnit(?db);
     t_context_dnit(?ctx);
     ret 0;
 }
 
-fun t_direct_cycle_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator) R.Result[QueryOutput, fail.Fail] {
-    val g: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ctx, Q_SEMA, key);
+fun t_direct_cycle_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail] {
+    val g: R.Result[*QueryEntry, fail.Fail] = acquire_entry[TestQueryContext](?ctx.runtime, ctx, Q_SEMA, key);
     if (R.is_err[*QueryEntry, fail.Fail](g)) { ret R.err[QueryOutput, fail.Fail](R.unwrap_err[*QueryEntry, fail.Fail](g)); }
     var out: QueryOutput;
     out.bytes = nil;
@@ -1310,11 +2303,13 @@ test "mach.lang.query.get:direct_self_recursion_reports_a_cycle_not_an_empty_val
 
     if (R.is_err[R.Void, str](register_derived(?db, Q_SEMA))) { dnit(?db); ret 1; }
 
-    if (!R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_SEMA, 1))) { dnit(?db); ret 1; }
+    if (!R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_SEMA, 1))) { dnit(?db); ret 1; }
     if (db.stack.len != 0)                                { dnit(?db); ret 1; }
-    if (peek_valid(?db, Q_SEMA, 1))                        { dnit(?db); ret 1; }
+    val valid_3: R.Result[bool, fail.Fail] = t_reusable(?ctx, Q_SEMA, 1);
+    if (R.is_err[bool, fail.Fail](valid_3)) { dnit(?db); ret 1; }
+    if (R.unwrap_ok[bool, fail.Fail](valid_3))                        { dnit(?db); ret 1; }
 
-    if (!R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_SEMA, 1))) { dnit(?db); ret 1; }
+    if (!R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_SEMA, 1))) { dnit(?db); ret 1; }
     if (db.stack.len != 0)                                { dnit(?db); ret 1; }
 
     dnit(?db);
@@ -1322,8 +2317,8 @@ test "mach.lang.query.get:direct_self_recursion_reports_a_cycle_not_an_empty_val
     ret 0;
 }
 
-fun t_cycle_a_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator) R.Result[QueryOutput, fail.Fail] {
-    val g: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ctx, Q_LOWER, key);
+fun t_cycle_a_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail] {
+    val g: R.Result[*QueryEntry, fail.Fail] = acquire_entry[TestQueryContext](?ctx.runtime, ctx, Q_LOWER, key);
     if (R.is_err[*QueryEntry, fail.Fail](g)) { ret R.err[QueryOutput, fail.Fail](R.unwrap_err[*QueryEntry, fail.Fail](g)); }
     var out: QueryOutput;
     out.bytes = nil;
@@ -1331,8 +2326,8 @@ fun t_cycle_a_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator) R.Resul
     ret R.ok[QueryOutput, fail.Fail](out);
 }
 
-fun t_cycle_b_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator) R.Result[QueryOutput, fail.Fail] {
-    val g: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ctx, Q_SEMA, key);
+fun t_cycle_b_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail] {
+    val g: R.Result[*QueryEntry, fail.Fail] = acquire_entry[TestQueryContext](?ctx.runtime, ctx, Q_SEMA, key);
     if (R.is_err[*QueryEntry, fail.Fail](g)) { ret R.err[QueryOutput, fail.Fail](R.unwrap_err[*QueryEntry, fail.Fail](g)); }
     var out: QueryOutput;
     out.bytes = nil;
@@ -1352,10 +2347,14 @@ test "mach.lang.query.get:indirect_two_kind_cycle_reports_the_full_chain" {
     if (R.is_err[R.Void, str](register_derived(?db, Q_SEMA)))  { dnit(?db); ret 1; }
     if (R.is_err[R.Void, str](register_derived(?db, Q_LOWER))) { dnit(?db); ret 1; }
 
-    if (!R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_SEMA, 1))) { dnit(?db); ret 1; }
+    if (!R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_SEMA, 1))) { dnit(?db); ret 1; }
     if (db.stack.len != 0)                                { dnit(?db); ret 1; }
-    if (peek_valid(?db, Q_SEMA, 1))                        { dnit(?db); ret 1; }
-    if (peek_valid(?db, Q_LOWER, 1))                       { dnit(?db); ret 1; }
+    val valid_4: R.Result[bool, fail.Fail] = t_reusable(?ctx, Q_SEMA, 1);
+    if (R.is_err[bool, fail.Fail](valid_4)) { dnit(?db); ret 1; }
+    if (R.unwrap_ok[bool, fail.Fail](valid_4))                        { dnit(?db); ret 1; }
+    val valid_5: R.Result[bool, fail.Fail] = t_reusable(?ctx, Q_LOWER, 1);
+    if (R.is_err[bool, fail.Fail](valid_5)) { dnit(?db); ret 1; }
+    if (R.unwrap_ok[bool, fail.Fail](valid_5))                       { dnit(?db); ret 1; }
 
     dnit(?db);
     t_context_dnit(?ctx);
@@ -1375,11 +2374,11 @@ test "mach.lang.query.invalidate:advances_revision_so_a_dependent_cannot_see_reu
     if (R.is_err[R.Void, str](register_derived(?db, Q_TOKENIZE))) { dnit(?db); ret 1; }
 
     if (R.is_err[R.Void, str](set_input(?db, Q_FILE_TEXT, 1, "a"::*u8, 1))) { dnit(?db); ret 1; }
-    if (R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_TOKENIZE, 1)))              { dnit(?db); ret 1; }
+    if (R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_TOKENIZE, 1)))              { dnit(?db); ret 1; }
     val r1: Revision = peek_revision(?db, Q_TOKENIZE, 1);
 
     if (R.is_err[R.Void, str](invalidate(?db, Q_TOKENIZE, 1)))     { dnit(?db); ret 1; }
-    if (R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_TOKENIZE, 1)))     { dnit(?db); ret 1; }
+    if (R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_TOKENIZE, 1)))     { dnit(?db); ret 1; }
     val r2: Revision = peek_revision(?db, Q_TOKENIZE, 1);
 
     if (r2 == r1) { dnit(?db); ret 1; }
@@ -1390,10 +2389,10 @@ test "mach.lang.query.invalidate:advances_revision_so_a_dependent_cannot_see_reu
     ret 0;
 }
 
-fun t_parse_deps_on_tokenize(ctx: *TestQueryContext, key: u64, a: *A.Allocator) R.Result[QueryOutput, fail.Fail] {
+fun t_parse_deps_on_tokenize(ctx: *TestQueryContext, key: u64, a: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail] {
     val db: *QueryDb = ctx.runtime.db;
-    val rd: R.Result[R.Void, str] = record_dep(db, Q_PARSE, key, Q_TOKENIZE, key);
-    if (R.is_err[R.Void, str](rd)) { ret R.err[QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rd))); }
+    val rd: R.Result[R.Void, fail.Fail] = depend[TestQueryContext](?ctx.runtime, ctx, Q_TOKENIZE, key);
+    if (R.is_err[R.Void, fail.Fail](rd)) { ret R.err[QueryOutput, fail.Fail](R.unwrap_err[R.Void, fail.Fail](rd)); }
     val res_buf: R.Result[*u8, str] = A.allocate[u8](a, 1);
     if (R.is_err[*u8, str](res_buf)) { ret R.err[QueryOutput, fail.Fail](fail.message(R.unwrap_err[*u8, str](res_buf))); }
     val buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
@@ -1418,14 +2417,18 @@ test "mach.lang.query.get:invalidated_dependency_recomputed_first_is_seen_stale_
     if (R.is_err[R.Void, str](register_derived(?db, Q_PARSE)))    { dnit(?db); ret 1; }
 
     if (R.is_err[R.Void, str](set_input(?db, Q_FILE_TEXT, 1, "a"::*u8, 1))) { dnit(?db); ret 1; }
-    if (R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_TOKENIZE, 1)))              { dnit(?db); ret 1; }
-    if (R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_PARSE, 1)))                 { dnit(?db); ret 1; }
-    if (!peek_valid(?db, Q_PARSE, 1))                                     { dnit(?db); ret 1; }
+    if (R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_TOKENIZE, 1)))              { dnit(?db); ret 1; }
+    if (R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_PARSE, 1)))                 { dnit(?db); ret 1; }
+    val valid_6: R.Result[bool, fail.Fail] = t_reusable(?ctx, Q_PARSE, 1);
+    if (R.is_err[bool, fail.Fail](valid_6)) { dnit(?db); ret 1; }
+    if (!R.unwrap_ok[bool, fail.Fail](valid_6))                                     { dnit(?db); ret 1; }
 
     if (R.is_err[R.Void, str](invalidate(?db, Q_TOKENIZE, 1)))  { dnit(?db); ret 1; }
-    if (R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_TOKENIZE, 1)))  { dnit(?db); ret 1; }
+    if (R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_TOKENIZE, 1)))  { dnit(?db); ret 1; }
 
-    if (peek_valid(?db, Q_PARSE, 1)) { dnit(?db); ret 1; }
+    val valid_7: R.Result[bool, fail.Fail] = t_reusable(?ctx, Q_PARSE, 1);
+    if (R.is_err[bool, fail.Fail](valid_7)) { dnit(?db); ret 1; }
+    if (R.unwrap_ok[bool, fail.Fail](valid_7)) { dnit(?db); ret 1; }
 
     dnit(?db);
     t_context_dnit(?ctx);
@@ -1448,13 +2451,13 @@ test "mach.lang.query.init:first_revision_is_never_the_absent_sentinel" {
     ret 0;
 }
 
-fun t_dedup_owner_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator) R.Result[QueryOutput, fail.Fail] {
+fun t_dedup_owner_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail] {
     val db: *QueryDb = ctx.runtime.db;
-    val rd1: R.Result[R.Void, str] = record_dep(db, Q_PARSE, key, Q_FILE_TEXT, key);
-    if (R.is_err[R.Void, str](rd1)) { ret R.err[QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rd1))); }
-    val rd2: R.Result[R.Void, str] = record_dep(db, Q_PARSE, key, Q_FILE_TEXT, key);
-    if (R.is_err[R.Void, str](rd2)) { ret R.err[QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](rd2))); }
-    val g: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ctx, Q_FILE_TEXT, key);
+    val rd1: R.Result[R.Void, fail.Fail] = depend[TestQueryContext](?ctx.runtime, ctx, Q_FILE_TEXT, key);
+    if (R.is_err[R.Void, fail.Fail](rd1)) { ret R.err[QueryOutput, fail.Fail](R.unwrap_err[R.Void, fail.Fail](rd1)); }
+    val rd2: R.Result[R.Void, fail.Fail] = depend[TestQueryContext](?ctx.runtime, ctx, Q_FILE_TEXT, key);
+    if (R.is_err[R.Void, fail.Fail](rd2)) { ret R.err[QueryOutput, fail.Fail](R.unwrap_err[R.Void, fail.Fail](rd2)); }
+    val g: R.Result[*QueryEntry, fail.Fail] = acquire_entry[TestQueryContext](?ctx.runtime, ctx, Q_FILE_TEXT, key);
     if (R.is_err[*QueryEntry, fail.Fail](g)) { ret R.err[QueryOutput, fail.Fail](R.unwrap_err[*QueryEntry, fail.Fail](g)); }
     val res_buf: R.Result[*u8, str] = A.allocate[u8](a, 1);
     if (R.is_err[*u8, str](res_buf)) { ret R.err[QueryOutput, fail.Fail](fail.message(R.unwrap_err[*u8, str](res_buf))); }
@@ -1479,7 +2482,7 @@ test "mach.lang.query.record_dep:manual_and_automatic_edges_to_the_same_pair_ded
     if (R.is_err[R.Void, str](register_derived(?db, Q_PARSE))) { dnit(?db); ret 1; }
 
     if (R.is_err[R.Void, str](set_input(?db, Q_FILE_TEXT, 1, "a"::*u8, 1))) { dnit(?db); ret 1; }
-    val res_g: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ?ctx, Q_PARSE, 1);
+    val res_g: R.Result[*QueryEntry, fail.Fail] = t_get(?ctx, Q_PARSE, 1);
     if (R.is_err[*QueryEntry, fail.Fail](res_g)) { dnit(?db); ret 1; }
 
     if (R.unwrap_ok[*QueryEntry, fail.Fail](res_g).dep_len != 1) { dnit(?db); ret 1; }
@@ -1489,29 +2492,18 @@ test "mach.lang.query.record_dep:manual_and_automatic_edges_to_the_same_pair_ded
     ret 0;
 }
 
-test "mach.lang.query.record_dep_rev:rejects_an_unregistered_or_lookup_less_dependency_kind" {
+test "mach.lang.query.observe:requires_a_provider_and_an_active_computation" {
     var alloc: A.Allocator;
     page.make(?alloc);
-    val res_db: R.Result[QueryDb, str] = init(?alloc);
-    if (R.is_err[QueryDb, str](res_db)) { ret 1; }
-    var db: QueryDb = R.unwrap_ok[QueryDb, str](res_db);
-    var ctx: TestQueryContext;
-    if (!t_context_init(?ctx, ?db, T_MODE_TOKENIZE)) { dnit(?db); ret 1; }
-
-    if (R.is_err[R.Void, str](register_input(?db, Q_FILE_TEXT)))                 { dnit(?db); ret 1; }
-    if (R.is_err[R.Void, str](register_derived(?db, Q_TOKENIZE))) { dnit(?db); ret 1; }
-    if (R.is_err[R.Void, str](register_metadata(?db, Q_SEMA, nil::RevisionFn)))  { dnit(?db); ret 1; }
-
-    if (R.is_err[R.Void, str](set_input(?db, Q_FILE_TEXT, 1, "a"::*u8, 1))) { dnit(?db); ret 1; }
-    if (R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_TOKENIZE, 1)))              { dnit(?db); ret 1; }
-
-    if (!R.is_err[Revision, str](record_dep_rev(?db, Q_TOKENIZE, 1, Q_LOWER, 1))) { dnit(?db); ret 1; }
-    if (!R.is_err[Revision, str](record_dep_rev(?db, Q_TOKENIZE, 1, Q_SEMA, 1)))  { dnit(?db); ret 1; }
-
-    dnit(?db);
-    t_context_dnit(?ctx);
+    val initialized: R.Result[QueryDb, str] = init(?alloc);
+    if (R.is_err[QueryDb, str](initialized)) { ret 1; }
+    var db: QueryDb = R.unwrap_ok[QueryDb, str](initialized);
+    fin { dnit(?db); }
+    if (!R.is_err[R.Void, str](register_metadata(?db, Q_SEMA, RevisionProvider{}))) { ret 2; }
+    if (!R.is_err[MetadataRevision, fail.Fail](observe(?db, Q_SEMA, 1))) { ret 3; }
     ret 0;
 }
+
 
 fun t_probe_allocate(ctx: ptr, size: usize, align: usize) O.Option[ptr] {
     val p: *FailProbe = ctx::*FailProbe;
@@ -1562,7 +2554,7 @@ test "mach.lang.query.runtime:rejects_each_missing_required_capability" {
     var diags: diagnostic.DiagnosticStore = diagnostic.store_init(?alloc);
 
     val no_db: R.Result[QueryRuntime[TestQueryContext], str] =
-        runtime[TestQueryContext](nil, ?diags, t_dispatch);
+        runtime[TestQueryContext](nil, t_dispatch);
     if (!R.is_err[QueryRuntime[TestQueryContext], str](no_db)) {
         diagnostic.store_dnit(?diags);
         ret 1;
@@ -1572,16 +2564,8 @@ test "mach.lang.query.runtime:rejects_each_missing_required_capability" {
     if (R.is_err[QueryDb, str](db_r)) { diagnostic.store_dnit(?diags); ret 1; }
     var db: QueryDb = R.unwrap_ok[QueryDb, str](db_r);
 
-    val no_diags: R.Result[QueryRuntime[TestQueryContext], str] =
-        runtime[TestQueryContext](?db, nil, t_dispatch);
-    if (!R.is_err[QueryRuntime[TestQueryContext], str](no_diags)) {
-        dnit(?db);
-        diagnostic.store_dnit(?diags);
-        ret 1;
-    }
-
     val no_compute: R.Result[QueryRuntime[TestQueryContext], str] =
-        runtime[TestQueryContext](?db, ?diags, nil::TestComputeFn);
+        runtime[TestQueryContext](?db, nil::TestComputeFn);
     if (!R.is_err[QueryRuntime[TestQueryContext], str](no_compute)) {
         dnit(?db);
         diagnostic.store_dnit(?diags);
@@ -1621,26 +2605,37 @@ test "mach.lang.query.get:diag_capture_failure_after_a_successful_compute_is_fat
             dnit(?db); t_context_dnit(?ctx); ret 1;
         }
 
-        probe.calls   = 0;
+        val opened: R.Result[Operation, str] = begin(?db);
+        if (R.is_err[Operation, str](opened)) { dnit(?db); t_context_dnit(?ctx); ret 2; }
+        val operation: Operation = R.unwrap_ok[Operation, str](opened);
+        probe.calls = 0;
         probe.fail_at = fail_at;
         val get_r: R.Result[*QueryEntry, fail.Fail] =
-            get[TestQueryContext](?ctx.runtime, ?ctx, Q_PARSE, 1);
-
-        if (R.is_err[*QueryEntry, fail.Fail](get_r) && diagnostic.len(?ctx.diags) == 1) {
+            acquire_entry[TestQueryContext](?ctx.runtime, ?ctx, Q_PARSE, 1);
+        probe.fail_at = 0;
+        val ended: R.Result[R.Void, fail.Fail] = end(?db, operation);
+        var code: i32 = 0;
+        if (ctx.diagnostic_refused) {
             saw_capture_failure = true;
-            if (t_live != 0 || shard_len(?db, Q_PARSE) != 0) {
-                probe.fail_at = 0;
-                dnit(?db); t_context_dnit(?ctx); ret 1;
-            }
-
-            probe.fail_at = 0;
-            if (R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_PARSE, 1))) {
-                dnit(?db); t_context_dnit(?ctx); ret 1;
-            }
-            if (t_live != 1 || !peek_valid(?db, Q_PARSE, 1)) {
-                dnit(?db); t_context_dnit(?ctx); ret 1;
-            }
+            if (R.is_ok[*QueryEntry, fail.Fail](get_r) || R.is_ok[R.Void, fail.Fail](ended)) { code = 3; }
         }
+        if (R.is_err[*QueryEntry, fail.Fail](get_r)) {
+            if (R.unwrap_err[*QueryEntry, fail.Fail](get_r).kind != fail.MESSAGE
+                || R.is_ok[R.Void, fail.Fail](ended) || t_live != 0 || shard_len(?db, Q_PARSE) != 0) { code = 4; }
+        }
+        or {
+            if (R.is_err[R.Void, fail.Fail](ended) || t_live != 1) { code = 5; }
+        }
+        if (R.is_err[R.Void, str](t_present(?ctx, operation, Q_PARSE, 1))) { code = 6; }
+        if (R.is_err[*QueryEntry, fail.Fail](get_r)) {
+            val ready: R.Result[bool, fail.Fail] = t_reusable(?ctx, Q_PARSE, 1);
+            if (R.is_err[bool, fail.Fail](ready)) { code = 7; }
+            or { if (R.unwrap_ok[bool, fail.Fail](ready)) { code = 8; } }
+            t_diag_reset(?ctx);
+            if (R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_PARSE, 1))) { code = 9; }
+            if (t_live != 1 || diagnostic.len(?ctx.diags) != 1) { code = 10; }
+        }
+        if (code != 0) { dnit(?db); t_context_dnit(?ctx); ret code; }
 
         probe.fail_at = 0;
         dnit(?db);
@@ -1671,7 +2666,7 @@ test "mach.lang.query.get:diag_replay_failure_on_a_cache_hit_is_surfaced" {
     if (R.is_err[R.Void, str](set_input(?db, Q_FILE_TEXT, 1, "x"::*u8, 1))) {
         dnit(?db); t_context_dnit(?ctx); ret 1;
     }
-    if (R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_TOKENIZE, 1))) {
+    if (R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_TOKENIZE, 1))) {
         dnit(?db); t_context_dnit(?ctx); ret 1;
     }
 
@@ -1682,7 +2677,7 @@ test "mach.lang.query.get:diag_replay_failure_on_a_cache_hit_is_surfaced" {
     ctx.diags = diagnostic.store_init(?replay_alloc);
 
     val replay_r: R.Result[*QueryEntry, fail.Fail] =
-        get[TestQueryContext](?ctx.runtime, ?ctx, Q_TOKENIZE, 1);
+        t_get(?ctx, Q_TOKENIZE, 1);
     if (!R.is_err[*QueryEntry, fail.Fail](replay_r) || diagnostic.len(?ctx.diags) != 0 || probe.calls == 0) {
         probe.fail_at = 0;
         dnit(?db); t_context_dnit(?ctx); ret 1;
@@ -1690,7 +2685,7 @@ test "mach.lang.query.get:diag_replay_failure_on_a_cache_hit_is_surfaced" {
 
     probe.calls   = 0;
     probe.fail_at = 0;
-    if (R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_TOKENIZE, 1))) {
+    if (R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_TOKENIZE, 1))) {
         dnit(?db); t_context_dnit(?ctx); ret 1;
     }
     if (diagnostic.len(?ctx.diags) != 1) { dnit(?db); t_context_dnit(?ctx); ret 1; }
@@ -1701,8 +2696,8 @@ test "mach.lang.query.get:diag_replay_failure_on_a_cache_hit_is_surfaced" {
     ret 0;
 }
 
-fun t_auto_dep_outer_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator) R.Result[QueryOutput, fail.Fail] {
-    val g: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ctx, Q_TOKENIZE, key);
+fun t_auto_dep_outer_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail] {
+    val g: R.Result[*QueryEntry, fail.Fail] = acquire_entry[TestQueryContext](?ctx.runtime, ctx, Q_TOKENIZE, key);
     if (R.is_err[*QueryEntry, fail.Fail](g)) { ret R.err[QueryOutput, fail.Fail](R.unwrap_err[*QueryEntry, fail.Fail](g)); }
     val res_buf: R.Result[*u8, str] = A.allocate[u8](a, 1);
     if (R.is_err[*u8, str](res_buf)) { ret R.err[QueryOutput, fail.Fail](fail.message(R.unwrap_err[*u8, str](res_buf))); }
@@ -1733,26 +2728,47 @@ test "mach.lang.query.get:allocation_failure_during_automatic_dependency_capture
         if (R.is_err[R.Void, str](register_derived(?db, Q_PARSE)))    { dnit(?db); ret 1; }
 
         if (R.is_err[R.Void, str](set_input(?db, Q_FILE_TEXT, 1, "a"::*u8, 1))) { dnit(?db); ret 1; }
-        if (R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_TOKENIZE, 1)))              { dnit(?db); ret 1; }
+        if (R.is_err[*QueryEntry, fail.Fail](t_get(?ctx, Q_TOKENIZE, 1)))              { dnit(?db); ret 1; }
 
-        probe.calls   = 0;
+        val opened: R.Result[Operation, str] = begin(?db);
+        if (R.is_err[Operation, str](opened)) { dnit(?db); t_context_dnit(?ctx); ret 2; }
+        val operation: Operation = R.unwrap_ok[Operation, str](opened);
+        probe.calls = 0;
         probe.fail_at = fail_at;
-
-        val res_g: R.Result[*QueryEntry, fail.Fail] = get[TestQueryContext](?ctx.runtime, ?ctx, Q_PARSE, 1);
+        val res_g: R.Result[*QueryEntry, fail.Fail] =
+            acquire_entry[TestQueryContext](?ctx.runtime, ?ctx, Q_PARSE, 1);
+        probe.fail_at = 0;
+        val ended: R.Result[R.Void, fail.Fail] = end(?db, operation);
+        var code: i32 = 0;
         if (R.is_err[*QueryEntry, fail.Fail](res_g)) {
             saw_failure = true;
-
-            if (peek_valid(?db, Q_PARSE, 1)) { dnit(?db); ret 1; }
-
-            probe.fail_at = 0;
-            if (R.is_err[*QueryEntry, fail.Fail](get[TestQueryContext](?ctx.runtime, ?ctx, Q_PARSE, 1))) { dnit(?db); ret 1; }
-            if (!peek_valid(?db, Q_PARSE, 1))                     { dnit(?db); ret 1; }
-        } or {
-            if (R.unwrap_ok[*QueryEntry, fail.Fail](res_g).dep_len == 0) { saw_failure = true; dnit(?db); ret 1; }
+            if (R.unwrap_err[*QueryEntry, fail.Fail](res_g).kind != fail.MESSAGE
+                || R.is_ok[R.Void, fail.Fail](ended) || shard_len(?db, Q_PARSE) != 0) { code = 3; }
         }
+        or {
+            if (R.is_err[R.Void, fail.Fail](ended) || R.unwrap_ok[*QueryEntry, fail.Fail](res_g).dep_len != 1) { code = 4; }
+        }
+        if (R.is_err[R.Void, str](t_present(?ctx, operation, Q_PARSE, 1))) { code = 5; }
+        if (R.is_err[*QueryEntry, fail.Fail](res_g)) {
+            val ready: R.Result[bool, fail.Fail] = t_reusable(?ctx, Q_PARSE, 1);
+            if (R.is_err[bool, fail.Fail](ready)) { code = 6; }
+            or { if (R.unwrap_ok[bool, fail.Fail](ready)) { code = 7; } }
+            val retry: R.Result[*QueryEntry, fail.Fail] = t_get(?ctx, Q_PARSE, 1);
+            if (R.is_err[*QueryEntry, fail.Fail](retry)) { code = 8; }
+            or {
+                val entry: *QueryEntry = R.unwrap_ok[*QueryEntry, fail.Fail](retry);
+                if (entry.dep_len != 1 || entry.deps[0].kind != Q_TOKENIZE || entry.deps[0].key != 1
+                    || !entry.deps[0].observed || entry.value_len != 1 || entry.value[0] != 3) { code = 9; }
+            }
+            val valid: R.Result[bool, fail.Fail] = t_reusable(?ctx, Q_PARSE, 1);
+            if (R.is_err[bool, fail.Fail](valid)) { code = 10; }
+            or { if (!R.unwrap_ok[bool, fail.Fail](valid)) { code = 11; } }
+        }
+        if (code != 0) { dnit(?db); t_context_dnit(?ctx); ret code; }
 
         dnit(?db);
         t_context_dnit(?ctx);
+        if (probe.live != 0) { ret 12; }
         fail_at = fail_at + 1;
     }
 
@@ -1854,4 +2870,559 @@ test "mach.lang.query.deps_reserve:refuses_a_grown_u32_doubling_that_wraps_witho
     if (probe.allocate_calls != 0)    { ret 1; }
     if (probe.reallocate_calls != 0)  { ret 1; }
     ret 0;
+}
+
+rec MetadataFixture {
+    db: QueryDb;
+    diags: diagnostic.DiagnosticStore;
+    runtime: QueryRuntime[MetadataFixture];
+    stamp: MetadataRevision;
+    refuse: bool;
+    constant_parent: bool;
+    reads: u32;
+    child_calls: u32;
+    parent_calls: u32;
+}
+
+fun metadata_fixture_read(raw: ptr, key: u64) R.Result[MetadataRevision, fail.Fail] {
+    val fixture: *MetadataFixture = raw::*MetadataFixture;
+    fixture.reads = fixture.reads + 1;
+    if (fixture.refuse) { ret R.err[MetadataRevision, fail.Fail](fail.message("metadata producer refused")); }
+    ret R.ok[MetadataRevision, fail.Fail](fixture.stamp);
+}
+
+fun metadata_fixture_compute(fixture: *MetadataFixture, kind: QueryKind, key: u64,
+                             alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail] {
+    var byte: u8 = 0;
+    if (kind == Q_TOKENIZE) {
+        fixture.child_calls = fixture.child_calls + 1;
+        val state: R.Result[MetadataRevision, fail.Fail] = observe(?fixture.db, Q_TARGET, 0);
+        if (R.is_err[MetadataRevision, fail.Fail](state)) { ret R.err[QueryOutput, fail.Fail](R.unwrap_err[MetadataRevision, fail.Fail](state)); }
+        val stamp: MetadataRevision = R.unwrap_ok[MetadataRevision, fail.Fail](state);
+        if (stamp.present) { byte = (stamp.revision & 0x7f)::u8 | 0x80; }
+    } or {
+        fixture.parent_calls = fixture.parent_calls + 1;
+        val child: R.Result[*QueryEntry, fail.Fail] = acquire_entry[MetadataFixture](?fixture.runtime, fixture, Q_TOKENIZE, 0);
+        if (R.is_err[*QueryEntry, fail.Fail](child)) { ret R.err[QueryOutput, fail.Fail](R.unwrap_err[*QueryEntry, fail.Fail](child)); }
+        byte = R.unwrap_ok[*QueryEntry, fail.Fail](child).value[0];
+        if (fixture.constant_parent) { byte = 9; }
+    }
+    val storage: R.Result[*u8, str] = A.allocate[u8](alloc, 1);
+    if (R.is_err[*u8, str](storage)) { ret fail.lift[QueryOutput](R.err[QueryOutput, str](R.unwrap_err[*u8, str](storage))); }
+    val bytes: *u8 = R.unwrap_ok[*u8, str](storage);
+    bytes[0] = byte;
+    ret R.ok[QueryOutput, fail.Fail](QueryOutput{ bytes: bytes, len: 1 });
+}
+
+fun metadata_fixture_init(fixture: *MetadataFixture, alloc: *A.Allocator) R.Result[R.Void, str] {
+    val database: R.Result[QueryDb, str] = init(alloc);
+    if (R.is_err[QueryDb, str](database)) { ret R.void_of[QueryDb, str](database); }
+    fixture.db = R.unwrap_ok[QueryDb, str](database);
+    fixture.diags = diagnostic.store_init(alloc);
+    fixture.stamp = MetadataRevision{ present: true, revision: 1 };
+    fixture.refuse = false;
+    fixture.constant_parent = false;
+    fixture.reads = 0;
+    fixture.child_calls = 0;
+    fixture.parent_calls = 0;
+    val runtime_r: R.Result[QueryRuntime[MetadataFixture], str] = runtime[MetadataFixture](
+        ?fixture.db, metadata_fixture_compute);
+    if (R.is_err[QueryRuntime[MetadataFixture], str](runtime_r)) {
+        dnit(?fixture.db);
+        diagnostic.store_dnit(?fixture.diags);
+        ret R.void_of[QueryRuntime[MetadataFixture], str](runtime_r);
+    }
+    fixture.runtime = R.unwrap_ok[QueryRuntime[MetadataFixture], str](runtime_r);
+    val meta: R.Result[R.Void, str] = register_metadata(?fixture.db, Q_TARGET,
+        RevisionProvider{ context: fixture::ptr, read: metadata_fixture_read });
+    val child: R.Result[R.Void, str] = register_derived(?fixture.db, Q_TOKENIZE);
+    val parent: R.Result[R.Void, str] = register_derived(?fixture.db, Q_PARSE);
+    if (R.is_err[R.Void, str](meta) || R.is_err[R.Void, str](child) || R.is_err[R.Void, str](parent)) {
+        dnit(?fixture.db);
+        diagnostic.store_dnit(?fixture.diags);
+        if (R.is_err[R.Void, str](meta)) { ret meta; }
+        if (R.is_err[R.Void, str](child)) { ret child; }
+        ret parent;
+    }
+    ret R.ok_void[str]();
+}
+
+fun metadata_fixture_dnit(fixture: *MetadataFixture) {
+    dnit(?fixture.db);
+    diagnostic.store_dnit(?fixture.diags);
+}
+
+fun metadata_fixture_get(fixture: *MetadataFixture) R.Result[*QueryEntry, fail.Fail] {
+    val opened: R.Result[Operation, str] = begin(?fixture.db);
+    if (R.is_err[Operation, str](opened)) { ret fail.lift[*QueryEntry](R.err[*QueryEntry, str](R.unwrap_err[Operation, str](opened))); }
+    val result: R.Result[*QueryEntry, fail.Fail] = acquire_entry[MetadataFixture](?fixture.runtime, fixture, Q_PARSE, 0);
+    val closed: R.Result[R.Void, fail.Fail] = end(?fixture.db, R.unwrap_ok[Operation, str](opened));
+    if (R.is_err[*QueryEntry, fail.Fail](result)) { ret result; }
+    if (R.is_err[R.Void, fail.Fail](closed)) { ret R.err[*QueryEntry, fail.Fail](R.unwrap_err[R.Void, fail.Fail](closed)); }
+    val released: R.Result[R.Void, str] = discard(?fixture.db, R.unwrap_ok[Operation, str](opened));
+    if (R.is_err[R.Void, str](released)) { ret R.err[*QueryEntry, fail.Fail](fail.message(R.unwrap_err[R.Void, str](released))); }
+    ret result;
+}
+
+test "mach.lang.query.refresh:external_change_refreshes_transitively_without_a_local_input_write" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var fixture: MetadataFixture;
+    if (R.is_err[R.Void, str](metadata_fixture_init(?fixture, ?alloc))) { ret 1; }
+    fin { metadata_fixture_dnit(?fixture); }
+    val first: R.Result[*QueryEntry, fail.Fail] = metadata_fixture_get(?fixture);
+    if (R.is_err[*QueryEntry, fail.Fail](first)) { ret 2; }
+    val before: Revision = R.unwrap_ok[*QueryEntry, fail.Fail](first).last_changed;
+    fixture.stamp.revision = 2;
+    val second: R.Result[*QueryEntry, fail.Fail] = metadata_fixture_get(?fixture);
+    if (R.is_err[*QueryEntry, fail.Fail](second)) { ret 3; }
+    val entry: *QueryEntry = R.unwrap_ok[*QueryEntry, fail.Fail](second);
+    if (entry.value[0] != 0x82 || entry.last_changed <= before) { ret 4; }
+    if (fixture.child_calls != 2 || fixture.parent_calls != 2) { ret 5; }
+    if (fixture.reads != 4) { ret 6; }
+    ret 0;
+}
+
+test "mach.lang.query.refresh:constant_parent_cuts_off_after_refreshing_its_changed_child" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var fixture: MetadataFixture;
+    if (R.is_err[R.Void, str](metadata_fixture_init(?fixture, ?alloc))) { ret 1; }
+    fin { metadata_fixture_dnit(?fixture); }
+    fixture.constant_parent = true;
+    val first: R.Result[*QueryEntry, fail.Fail] = metadata_fixture_get(?fixture);
+    if (R.is_err[*QueryEntry, fail.Fail](first)) { ret 2; }
+    val before: Revision = R.unwrap_ok[*QueryEntry, fail.Fail](first).last_changed;
+    fixture.stamp.revision = 2;
+    val second: R.Result[*QueryEntry, fail.Fail] = metadata_fixture_get(?fixture);
+    if (R.is_err[*QueryEntry, fail.Fail](second)) { ret 3; }
+    val entry: *QueryEntry = R.unwrap_ok[*QueryEntry, fail.Fail](second);
+    if (entry.value[0] != 9 || entry.last_changed != before) { ret 4; }
+    if (fixture.child_calls != 2 || fixture.parent_calls != 2) { ret 5; }
+    if (R.is_err[*QueryEntry, fail.Fail](metadata_fixture_get(?fixture))) { ret 6; }
+    if (fixture.child_calls != 2 || fixture.parent_calls != 2) { ret 7; }
+    ret 0;
+}
+
+test "mach.lang.query.operation:sampled_metadata_is_stable_and_a_changed_final_stamp_refuses_success" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var fixture: MetadataFixture;
+    if (R.is_err[R.Void, str](metadata_fixture_init(?fixture, ?alloc))) { ret 1; }
+    fin { metadata_fixture_dnit(?fixture); }
+    val opened: R.Result[Operation, str] = begin(?fixture.db);
+    if (R.is_err[Operation, str](opened)) { ret 2; }
+    val operation: Operation = R.unwrap_ok[Operation, str](opened);
+    val first: R.Result[*QueryEntry, fail.Fail] = acquire_entry[MetadataFixture](?fixture.runtime, ?fixture, Q_PARSE, 0);
+    if (R.is_err[*QueryEntry, fail.Fail](first)) { end(?fixture.db, operation); ret 3; }
+    fixture.stamp.revision = 2;
+    val second: R.Result[*QueryEntry, fail.Fail] = acquire_entry[MetadataFixture](?fixture.runtime, ?fixture, Q_PARSE, 0);
+    if (R.is_err[*QueryEntry, fail.Fail](second)) { end(?fixture.db, operation); ret 4; }
+    if (fixture.child_calls != 1 || fixture.parent_calls != 1 || fixture.reads != 1) { end(?fixture.db, operation); ret 5; }
+    val closed: R.Result[R.Void, fail.Fail] = end(?fixture.db, operation);
+    if (!R.is_err[R.Void, fail.Fail](closed) || fixture.db.operation_active) { ret 6; }
+    if (!str_contains(R.unwrap_err[R.Void, fail.Fail](closed).message, "changed during")) { ret 7; }
+    ret 0;
+}
+
+rec ProvenanceFixture {
+    db: QueryDb;
+    runtime: QueryRuntime[ProvenanceFixture];
+    presentation: diagnostic.DiagnosticStore;
+    calls: [5]u32;
+    fail_leaf: bool;
+    swallow: bool;
+}
+
+fun provenance_compute(f: *ProvenanceFixture, kind: QueryKind, key: u64, a: *A.Allocator,
+                       diags: *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail] {
+    if (kind != Q_PARSE || key >= 5) { ret R.err[QueryOutput, fail.Fail](fail.message("unexpected provenance fixture key")); }
+    f.calls[key] = f.calls[key] + 1;
+    var message: str = "branch";
+    var offset: usize = 11;
+    if (key == 0) { message = "root"; offset = 0; }
+    or (key == 3) { message = "leaf"; offset = 3; }
+    or (key == 4) { message = "other"; offset = 4; }
+    val emitted: R.Result[R.Void, str] = diagnostic.error(diags, 0, token.Span{ offset: offset, len: 1 }, message);
+    if (R.is_err[R.Void, str](emitted)) { ret R.err[QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](emitted))); }
+    if (key == 3 && f.fail_leaf) { ret R.err[QueryOutput, fail.Fail](fail.message("provenance leaf failed")); }
+    if (key <= 2) {
+        var child: u64 = 3;
+        if (key == 0) { child = 1; }
+        val read: R.Result[*QueryEntry, fail.Fail] = acquire_entry[ProvenanceFixture](?f.runtime, f, Q_PARSE, child);
+        if (R.is_err[*QueryEntry, fail.Fail](read) && !f.swallow) { ret R.err[QueryOutput, fail.Fail](R.unwrap_err[*QueryEntry, fail.Fail](read)); }
+        if (key == 0) {
+            val second: R.Result[*QueryEntry, fail.Fail] = acquire_entry[ProvenanceFixture](?f.runtime, f, Q_PARSE, 2);
+            if (R.is_err[*QueryEntry, fail.Fail](second)) { ret R.err[QueryOutput, fail.Fail](R.unwrap_err[*QueryEntry, fail.Fail](second)); }
+        }
+    }
+    val bytes: R.Result[*u8, str] = A.allocate[u8](a, 1);
+    if (R.is_err[*u8, str](bytes)) { ret R.err[QueryOutput, fail.Fail](fail.message(R.unwrap_err[*u8, str](bytes))); }
+    val value: *u8 = R.unwrap_ok[*u8, str](bytes);
+    value[0] = key::u8;
+    ret R.ok[QueryOutput, fail.Fail](QueryOutput{ bytes: value, len: 1 });
+}
+
+fun provenance_init(f: *ProvenanceFixture, a: *A.Allocator) R.Result[R.Void, str] {
+    val initialized: R.Result[QueryDb, str] = init(a);
+    if (R.is_err[QueryDb, str](initialized)) { ret R.void_of[QueryDb, str](initialized); }
+    f.db = R.unwrap_ok[QueryDb, str](initialized);
+    f.presentation = diagnostic.store_init(a);
+    f.calls = [5]u32{ 0, 0, 0, 0, 0 };
+    f.fail_leaf = false;
+    f.swallow = false;
+    val configured: R.Result[QueryRuntime[ProvenanceFixture], str] = runtime[ProvenanceFixture](?f.db, provenance_compute);
+    if (R.is_err[QueryRuntime[ProvenanceFixture], str](configured)) {
+        dnit(?f.db);
+        diagnostic.store_dnit(?f.presentation);
+        ret R.void_of[QueryRuntime[ProvenanceFixture], str](configured);
+    }
+    f.runtime = R.unwrap_ok[QueryRuntime[ProvenanceFixture], str](configured);
+    val registered: R.Result[R.Void, str] = register_derived(?f.db, Q_PARSE);
+    if (R.is_err[R.Void, str](registered)) {
+        dnit(?f.db);
+        diagnostic.store_dnit(?f.presentation);
+    }
+    ret registered;
+}
+
+fun provenance_dnit(f: *ProvenanceFixture) {
+    dnit(?f.db);
+    diagnostic.store_dnit(?f.presentation);
+}
+
+fun provenance_collect(f: *ProvenanceFixture, roots: *QueryKey, count: usize) R.Result[*Presentation, fail.Fail] {
+    val opened: R.Result[Operation, str] = begin(?f.db);
+    if (R.is_err[Operation, str](opened)) { ret fail.lift[*Presentation](R.err[*Presentation, str](R.unwrap_err[Operation, str](opened))); }
+    val operation: Operation = R.unwrap_ok[Operation, str](opened);
+    var i: usize = 0;
+    for (i < count) {
+        val read: R.Result[*QueryEntry, fail.Fail] = acquire_entry[ProvenanceFixture](?f.runtime, f, roots[i].kind, roots[i].key);
+        if (R.is_err[*QueryEntry, fail.Fail](read)) {
+            end(?f.db, operation);
+            ret R.err[*Presentation, fail.Fail](R.unwrap_err[*QueryEntry, fail.Fail](read));
+        }
+        i = i + 1;
+    }
+    val closed: R.Result[R.Void, fail.Fail] = end(?f.db, operation);
+    if (R.is_err[R.Void, fail.Fail](closed)) {
+        ret R.err[*Presentation, fail.Fail](R.unwrap_err[R.Void, fail.Fail](closed));
+    }
+    ret fail.lift[*Presentation](collect(?f.db, operation, roots, count, f.db.a));
+}
+
+fun provenance_store_free(a: *A.Allocator, store: *Presentation) {
+    presentation_dnit(store);
+}
+
+test "mach.lang.query.collect:diamond_order_and_distinct_origins_are_cold_warm_invariant" {
+    var a: A.Allocator;
+    page.make(?a);
+    var f: ProvenanceFixture;
+    if (R.is_err[R.Void, str](provenance_init(?f, ?a))) { ret 1; }
+    fin { provenance_dnit(?f); }
+    var roots: [2]QueryKey = [2]QueryKey{ QueryKey{ kind: Q_PARSE, key: 0 }, QueryKey{ kind: Q_PARSE, key: 4 } };
+    val cold_r: R.Result[*Presentation, fail.Fail] = provenance_collect(?f, ?roots[0], 2);
+    if (R.is_err[*Presentation, fail.Fail](cold_r)) { ret 2; }
+    val cold: *Presentation = R.unwrap_ok[*Presentation, fail.Fail](cold_r);
+    fin { provenance_store_free(?a, cold); }
+    if (diagnostic.len(?cold.diags) != 5) { ret 3; }
+    if (cold.diags.items.data[0].loc.span.offset != 3 || cold.diags.items.data[1].loc.span.offset != 11
+        || cold.diags.items.data[2].loc.span.offset != 11 || cold.diags.items.data[3].loc.span.offset != 0
+        || cold.diags.items.data[4].loc.span.offset != 4) { ret 4; }
+    if (diagnostic.len(?f.presentation) != 0) { ret 5; }
+    val warm_r: R.Result[*Presentation, fail.Fail] = provenance_collect(?f, ?roots[0], 2);
+    if (R.is_err[*Presentation, fail.Fail](warm_r)) { ret 6; }
+    val warm: *Presentation = R.unwrap_ok[*Presentation, fail.Fail](warm_r);
+    fin { provenance_store_free(?a, warm); }
+    val equal: R.Result[bool, str] = diagnostic.content_equal(?cold.diags, ?warm.diags);
+    if (R.is_err[bool, str](equal) || !R.unwrap_ok[bool, str](equal)) { ret 7; }
+    var i: usize = 0;
+    for (i < 5) { if (f.calls[i] != 1) { ret 8; } i = i + 1; }
+    if (f.db.attempts.len != 0 || f.db.presentation_pending) { ret 9; }
+    ret 0;
+}
+
+test "mach.lang.query.collect:failed_child_cannot_be_swallowed_and_attempt_evidence_is_released" {
+    var a: A.Allocator;
+    page.make(?a);
+    var f: ProvenanceFixture;
+    if (R.is_err[R.Void, str](provenance_init(?f, ?a))) { ret 1; }
+    fin { provenance_dnit(?f); }
+    f.fail_leaf = true;
+    f.swallow = true;
+    val opened: R.Result[Operation, str] = begin(?f.db);
+    if (R.is_err[Operation, str](opened)) { ret 2; }
+    val operation: Operation = R.unwrap_ok[Operation, str](opened);
+    val read: R.Result[*QueryEntry, fail.Fail] = acquire_entry[ProvenanceFixture](?f.runtime, ?f, Q_PARSE, 0);
+    if (!R.is_err[*QueryEntry, fail.Fail](read)) { ret 3; }
+    val closed: R.Result[R.Void, fail.Fail] = end(?f.db, operation);
+    if (!R.is_err[R.Void, fail.Fail](closed)) { ret 4; }
+    if (shard_len(?f.db, Q_PARSE) != 0 || f.calls[2] != 0 || f.db.attempts.len != 3) { ret 5; }
+    var root: QueryKey = QueryKey{ kind: Q_PARSE, key: 0 };
+    val presented: R.Result[*Presentation, str] = collect(?f.db, operation, ?root, 1, ?a);
+    if (R.is_err[*Presentation, str](presented)) { ret 6; }
+    val store: *Presentation = R.unwrap_ok[*Presentation, str](presented);
+    fin { provenance_store_free(?a, store); }
+    if (diagnostic.len(?store.diags) != 3 || store.diags.items.data[0].loc.span.offset != 3
+        || store.diags.items.data[1].loc.span.offset != 11 || store.diags.items.data[2].loc.span.offset != 0) { ret 7; }
+    if (f.db.attempts.len != 0 || f.db.presentation_pending) { ret 8; }
+    f.fail_leaf = false;
+    f.swallow = false;
+    val retried: R.Result[*Presentation, fail.Fail] = provenance_collect(?f, ?root, 1);
+    if (R.is_err[*Presentation, fail.Fail](retried)) { ret 9; }
+    provenance_store_free(?a, R.unwrap_ok[*Presentation, fail.Fail](retried));
+    ret 0;
+}
+
+test "mach.lang.query.collect:allocation_refusal_keeps_one_retryable_presentation_owner" {
+    var a: A.Allocator;
+    page.make(?a);
+    var f: ProvenanceFixture;
+    if (R.is_err[R.Void, str](provenance_init(?f, ?a))) { ret 1; }
+    fin { provenance_dnit(?f); }
+    val opened: R.Result[Operation, str] = begin(?f.db);
+    if (R.is_err[Operation, str](opened)) { ret 2; }
+    val operation: Operation = R.unwrap_ok[Operation, str](opened);
+    if (R.is_err[*QueryEntry, fail.Fail](acquire_entry[ProvenanceFixture](?f.runtime, ?f, Q_PARSE, 0))) { ret 3; }
+    if (R.is_err[R.Void, fail.Fail](end(?f.db, operation))) { ret 4; }
+    var probe: FailProbe;
+    var refusing: A.Allocator;
+    if (!failprobe_make(?probe, ?refusing, 2)) { ret 5; }
+    var root: QueryKey = QueryKey{ kind: Q_PARSE, key: 0 };
+    val refused: R.Result[*Presentation, str] = collect(?f.db, operation, ?root, 1, ?refusing);
+    if (!R.is_err[*Presentation, str](refused) || probe.live != 0) { ret 6; }
+    if (!f.db.presentation_pending || f.db.attempts.len != 4) { ret 7; }
+    if (!R.is_err[Operation, str](begin(?f.db))) { ret 8; }
+    if (!R.is_err[R.Void, str](invalidate(?f.db, Q_PARSE, 0))) { ret 9; }
+    probe.fail_at = 0;
+    val retried: R.Result[*Presentation, str] = collect(?f.db, operation, ?root, 1, ?refusing);
+    if (R.is_err[*Presentation, str](retried)) { ret 10; }
+    val store: *Presentation = R.unwrap_ok[*Presentation, str](retried);
+    if (diagnostic.len(?store.diags) != 4) { provenance_store_free(?refusing, store); ret 11; }
+    provenance_store_free(?refusing, store);
+    if (probe.live != 0 || f.db.presentation_pending || f.db.attempts.len != 0) { ret 12; }
+    ret 0;
+}
+
+test "mach.lang.query.cycle:rich_failure_transfers_to_the_presentation_without_per_attempt_growth" {
+    var alloc: A.Allocator;
+    var probe: FailProbe;
+    if (!failprobe_make(?probe, ?alloc, 0)) { ret 1; }
+    val initialized: R.Result[QueryDb, str] = init(?alloc);
+    if (R.is_err[QueryDb, str](initialized)) { ret 2; }
+    var db: QueryDb = R.unwrap_ok[QueryDb, str](initialized);
+    var ctx: TestQueryContext;
+    if (!t_context_init(?ctx, ?db, T_MODE_INDIRECT)) { dnit(?db); ret 3; }
+    if (R.is_err[R.Void, str](register_derived(?db, Q_SEMA))
+        || R.is_err[R.Void, str](register_derived(?db, Q_LOWER))) { t_context_dnit(?ctx); dnit(?db); ret 4; }
+    var baseline: i64 = 0;
+    var i: u32 = 0;
+    for (i < 32) {
+        val result: R.Result[*QueryEntry, fail.Fail] = t_get(?ctx, Q_SEMA, 7);
+        if (!R.is_err[*QueryEntry, fail.Fail](result)) { t_context_dnit(?ctx); dnit(?db); ret 5; }
+        val failure: fail.Fail = R.unwrap_err[*QueryEntry, fail.Fail](result);
+        if (failure.kind != fail.MESSAGE || !str_contains(failure.message, "9:7 -> 10:7 -> 9:7")) {
+            t_context_dnit(?ctx); dnit(?db); ret 6;
+        }
+        if (ctx.last_presentation == nil || db.operation_message != nil || db.attempts.len != 0) {
+            t_context_dnit(?ctx); dnit(?db); ret 7;
+        }
+        presentation_dnit(ctx.last_presentation);
+        ctx.last_presentation = nil;
+        if (i == 1) { baseline = probe.live; }
+        if (i > 1 && probe.live != baseline) { t_context_dnit(?ctx); dnit(?db); ret 8; }
+        i = i + 1;
+    }
+    t_context_dnit(?ctx);
+    dnit(?db);
+    if (probe.live != 0) { ret 9; }
+    ret 0;
+}
+
+test "mach.lang.query.reusable:validates_transitive_inputs_without_computing_the_requested_product" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var fixture: MetadataFixture;
+    if (R.is_err[R.Void, str](metadata_fixture_init(?fixture, ?alloc))) { ret 2; }
+    fin { metadata_fixture_dnit(?fixture); }
+    if (R.is_err[*QueryEntry, fail.Fail](metadata_fixture_get(?fixture))) { ret 3; }
+    fixture.stamp.revision = 2;
+    val begun: R.Result[Operation, str] = begin(?fixture.db);
+    if (R.is_err[Operation, str](begun)) { ret 4; }
+    val operation: Operation = R.unwrap_ok[Operation, str](begun);
+    val stale: R.Result[bool, fail.Fail] = reusable[MetadataFixture](?fixture.runtime, ?fixture, Q_PARSE, 0);
+    if (R.is_err[bool, fail.Fail](stale) || R.unwrap_ok[bool, fail.Fail](stale)) { ret 5; }
+    if (fixture.child_calls != 2 || fixture.parent_calls != 1) { ret 6; }
+    val current: R.Result[QueryView, fail.Fail] = get[MetadataFixture](?fixture.runtime, ?fixture, Q_PARSE, 0);
+    if (R.is_err[QueryView, fail.Fail](current) || R.unwrap_ok[QueryView, fail.Fail](current).value[0] != 0x82) { ret 7; }
+    if (fixture.child_calls != 2 || fixture.parent_calls != 2) { ret 8; }
+    val warm: R.Result[bool, fail.Fail] = reusable[MetadataFixture](?fixture.runtime, ?fixture, Q_PARSE, 0);
+    if (R.is_err[bool, fail.Fail](warm) || !R.unwrap_ok[bool, fail.Fail](warm)) { ret 9; }
+    if (R.is_err[R.Void, fail.Fail](end(?fixture.db, operation))) { ret 10; }
+    if (R.is_err[R.Void, str](discard(?fixture.db, operation))) { ret 11; }
+    fixture.refuse = true;
+    val retry: R.Result[Operation, str] = begin(?fixture.db);
+    if (R.is_err[Operation, str](retry)) { ret 12; }
+    val refused: R.Result[bool, fail.Fail] = reusable[MetadataFixture](?fixture.runtime, ?fixture, Q_PARSE, 0);
+    if (R.is_ok[bool, fail.Fail](refused)) { ret 13; }
+    if (!str_equals(R.unwrap_err[bool, fail.Fail](refused).message, "metadata producer refused")) { ret 14; }
+    if (R.is_ok[R.Void, fail.Fail](end(?fixture.db, R.unwrap_ok[Operation, str](retry)))) { ret 15; }
+    if (fixture.parent_calls != 2) { ret 16; }
+    ret 0;
+}
+
+
+var t_retire_db: *QueryDb = nil;
+var t_retire_order: u32 = 0;
+var t_retire_inputs_live: bool = true;
+
+fun t_retire_parent(value: *u8, len: u32, a: *A.Allocator) {
+    t_retire_order = t_retire_order * 10 + 1;
+    val child: R.Result[*QueryEntry, str] = peek(t_retire_db, Q_TOKENIZE, 1);
+    if (R.is_err[*QueryEntry, str](child) || R.unwrap_ok[*QueryEntry, str](child).value == nil) {
+        t_retire_inputs_live = false;
+    }
+}
+
+fun t_retire_child(value: *u8, len: u32, a: *A.Allocator) {
+    t_retire_order = t_retire_order * 10 + 2;
+    val input: R.Result[*QueryEntry, str] = peek(t_retire_db, Q_FILE_TEXT, 1);
+    if (R.is_err[*QueryEntry, str](input) || R.unwrap_ok[*QueryEntry, str](input).value == nil) {
+        t_retire_inputs_live = false;
+    }
+}
+
+test "mach.lang.query.retirement:dependents_retire_before_inputs_and_unrelated_roots_survive" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var db: QueryDb = R.unwrap_ok[QueryDb, str](init(?alloc));
+    fin { dnit(?db); t_retire_db = nil; }
+    var ctx: TestQueryContext;
+    if (!t_context_init(?ctx, ?db, T_MODE_PARSE_DEPS)) { ret 1; }
+    fin { t_context_dnit(?ctx); }
+    R.unwrap_ok[R.Void, str](register_input(?db, Q_FILE_TEXT));
+    R.unwrap_ok[R.Void, str](register_derived_owned(?db, Q_TOKENIZE, t_retire_child));
+    R.unwrap_ok[R.Void, str](register_derived_owned(?db, Q_PARSE, t_retire_parent));
+    R.unwrap_ok[R.Void, str](set_input(?db, Q_FILE_TEXT, 1, "a"::*u8, 1));
+    R.unwrap_ok[R.Void, str](set_input(?db, Q_FILE_TEXT, 2, "unrelated"::*u8, 9));
+    R.unwrap_ok[*QueryEntry, fail.Fail](t_get(?ctx, Q_PARSE, 1));
+    val unrelated: Revision = peek_revision(?db, Q_FILE_TEXT, 2);
+    t_retire_db = ?db;
+    t_retire_order = 0;
+    t_retire_inputs_live = true;
+    var root: QueryKey = QueryKey{ kind: Q_FILE_TEXT, key: 1 };
+    var prepared: PreparedRetirement = R.unwrap_ok[PreparedRetirement, str](prepare_retirement(?db, ?root, 1));
+    fin { discard_retirement(?prepared); }
+    if (t_retire_order != 0 || shard_len(?db, Q_FILE_TEXT) != 2) { ret 2; }
+    R.unwrap_ok[R.Void, str](commit_retirement(?prepared));
+    if (t_retire_order != 12 || !t_retire_inputs_live) { ret 3; }
+    if (shard_len(?db, Q_PARSE) != 0 || shard_len(?db, Q_TOKENIZE) != 0 || shard_len(?db, Q_FILE_TEXT) != 1) { ret 4; }
+    if (peek_revision(?db, Q_FILE_TEXT, 2) != unrelated || peek_revision(?db, Q_FILE_TEXT, 1) != 0) { ret 5; }
+    ret 0;
+}
+
+test "mach.lang.query.retirement:input_mutation_refuses_a_stale_preparation_without_retiring_owners" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var db: QueryDb = R.unwrap_ok[QueryDb, str](init(?alloc));
+    fin { dnit(?db); }
+    R.unwrap_ok[R.Void, str](register_input(?db, Q_FILE_TEXT));
+    R.unwrap_ok[R.Void, str](set_input(?db, Q_FILE_TEXT, 1, "a"::*u8, 1));
+    var root: QueryKey = QueryKey{ kind: Q_FILE_TEXT, key: 1 };
+    var prepared: PreparedRetirement = R.unwrap_ok[PreparedRetirement, str](prepare_retirement(?db, ?root, 1));
+    fin { discard_retirement(?prepared); }
+    R.unwrap_ok[R.Void, str](set_input(?db, Q_FILE_TEXT, 1, "b"::*u8, 1));
+    val changed: Revision = peek_revision(?db, Q_FILE_TEXT, 1);
+    if (R.is_ok[R.Void, str](commit_retirement(?prepared))) { ret 1; }
+    if (shard_len(?db, Q_FILE_TEXT) != 1 || peek_revision(?db, Q_FILE_TEXT, 1) != changed) { ret 2; }
+    if (R.unwrap_ok[*QueryEntry, str](peek(?db, Q_FILE_TEXT, 1)).value[0] != 'b'::u8) { ret 3; }
+    ret 0;
+}
+
+
+fun t_branch_compute(ctx: *TestQueryContext, kind: QueryKind, key: u64,
+                     a: *A.Allocator, diags: *diagnostic.DiagnosticStore) R.Result[QueryOutput, fail.Fail] {
+    val selected: R.Result[QueryView, fail.Fail] = get[TestQueryContext](?ctx.runtime, ctx, Q_FILE_TEXT, key);
+    if (R.is_err[QueryView, fail.Fail](selected)) { ret R.err[QueryOutput, fail.Fail](R.unwrap_err[QueryView, fail.Fail](selected)); }
+    val branch: u8 = R.unwrap_ok[QueryView, fail.Fail](selected).value[0];
+    if (kind == Q_TOKENIZE && branch != 0) {
+        ret R.err[QueryOutput, fail.Fail](fail.message("the previous branch has no current definition"));
+    }
+    var byte: u8 = branch;
+    if (kind == Q_TOKENIZE) { byte = 77; }
+    or (branch == 0) {
+        val child: R.Result[QueryView, fail.Fail] = get[TestQueryContext](?ctx.runtime, ctx, Q_TOKENIZE, key);
+        if (R.is_err[QueryView, fail.Fail](child)) { ret R.err[QueryOutput, fail.Fail](R.unwrap_err[QueryView, fail.Fail](child)); }
+        byte = R.unwrap_ok[QueryView, fail.Fail](child).value[0];
+    }
+    val copied: R.Result[*u8, str] = bytes_dup(a, ?byte, 1);
+    if (R.is_err[*u8, str](copied)) { ret fail.lift[QueryOutput](R.err[QueryOutput, str](R.unwrap_err[*u8, str](copied))); }
+    ret R.ok[QueryOutput, fail.Fail](QueryOutput{ bytes: R.unwrap_ok[*u8, str](copied), len: 1 });
+}
+
+test "mach.lang.query.get:changed_selector_does_not_validate_an_obsolete_branch" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    val initialized: R.Result[QueryDb, str] = init(?a);
+    if (R.is_err[QueryDb, str](initialized)) { ret 2; }
+    var db: QueryDb = R.unwrap_ok[QueryDb, str](initialized);
+    fin { dnit(?db); }
+    var ctx: TestQueryContext;
+    if (!t_context_init(?ctx, ?db, T_MODE_BRANCH)) { ret 3; }
+    fin { t_context_dnit(?ctx); }
+    if (R.is_err[R.Void, str](register_input(?db, Q_FILE_TEXT))) { ret 4; }
+    if (R.is_err[R.Void, str](register_derived(?db, Q_TOKENIZE))) { ret 5; }
+    if (R.is_err[R.Void, str](register_derived(?db, Q_PARSE))) { ret 6; }
+    var turn: u32 = 0;
+    for (turn < 4) {
+        var branch: u8 = (turn & 1)::u8;
+        if (R.is_err[R.Void, str](set_input(?db, Q_FILE_TEXT, 1, ?branch, 1))) { ret 7; }
+        val reusable_r: R.Result[bool, fail.Fail] = t_reusable(?ctx, Q_PARSE, 1);
+        if (R.is_err[bool, fail.Fail](reusable_r) || R.unwrap_ok[bool, fail.Fail](reusable_r)) { ret 8; }
+        val read: R.Result[*QueryEntry, fail.Fail] = t_get(?ctx, Q_PARSE, 1);
+        if (R.is_err[*QueryEntry, fail.Fail](read)) { ret 9; }
+        var expected: u8 = 77;
+        if (branch != 0) { expected = branch; }
+        if (R.unwrap_ok[*QueryEntry, fail.Fail](read).value[0] != expected) { ret 10; }
+        turn = turn + 1;
+    }
+    ret 0;
+}
+
+fun t_owned_equal(a: *u8, a_len: u32, b: *u8, b_len: u32) bool {
+    if (a_len != $size_of(ptr)::u32 || b_len != a_len) { ret false; }
+    val x: *u64 = (@(a::*ptr))::*u64;
+    val y: *u64 = (@(b::*ptr))::*u64;
+    ret @x == @y;
+}
+
+test "mach.lang.query:equal_owned_candidates_preserve_identity_and_release_once" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    val initialized: R.Result[QueryDb, str] = init(?a);
+    if (R.is_err[QueryDb, str](initialized)) { ret 2; }
+    var db: QueryDb = R.unwrap_ok[QueryDb, str](initialized);
+    var ctx: TestQueryContext;
+    if (!t_context_init(?ctx, ?db, T_MODE_OWNED)) { dnit(?db); ret 3; }
+    fin { t_context_dnit(?ctx); }
+    t_live = 0;
+    if (R.is_err[R.Void, str](register_input(?db, Q_FILE_TEXT))
+        || R.is_err[R.Void, str](register_derived_equatable(?db, Q_PARSE, t_owned_finalize, t_owned_equal))) { dnit(?db); ret 4; }
+    var identity: ptr = nil;
+    var revision: Revision = 0;
+    var i: u8 = 0;
+    var code: i32 = 0;
+    for (i < 4) {
+        if (R.is_err[R.Void, str](set_input(?db, Q_FILE_TEXT, 1, ?i, 1))) { code = 5; brk; }
+        val result: R.Result[*QueryEntry, fail.Fail] = t_get(?ctx, Q_PARSE, 1);
+        if (R.is_err[*QueryEntry, fail.Fail](result)) { code = 6; brk; }
+        val entry: *QueryEntry = R.unwrap_ok[*QueryEntry, fail.Fail](result);
+        if (i == 0) { identity = t_handle_ptr(entry); revision = entry.last_changed; }
+        if (t_handle_ptr(entry) != identity || entry.last_changed != revision || t_live != 1) { code = 7; brk; }
+        i = i + 1;
+    }
+    dnit(?db);
+    if (t_live != 0) { ret 8; }
+    ret code;
 }

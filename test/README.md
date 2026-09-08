@@ -189,7 +189,7 @@ engine: one host decodes and validates every column, which is how a target with 
 runner of its own still gets goldens.
 
 Before this, the driver selected by capability everywhere, and a target with
-`engine none` needs no execution host, so `spirv`, `riscv32` and `mos6502` were
+`engine none` needs no execution host, so `spirv` and `riscv32` were
 recomputed on the windows and arm runners as well. That is coverage nobody scheduled
 and, for spirv, coverage whose pinned decoder has no build for those hosts at all
 (#2948). Windows accordingly needs no spirv-tools.

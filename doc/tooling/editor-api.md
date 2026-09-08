@@ -1,196 +1,121 @@
-# Editor query surface (`mach.lang.editor`)
+# Editor API (`mach.lang.editor`)
 
-The compiler-as-library entry point for editor tooling: language servers,
-plugins, single-file linters. `mach-lsp` is its consumer. It analyzes one
-in-memory buffer at a time and, when that buffer belongs to a project, does so
-**project-aware**: the buffer is analyzed as the module it is inside its
-project, through the same target-aware load, resolve, and sema services the
-driver uses, with the project's real dependency set. A buffer outside any
-project is analyzed on its own.
+The editor facade analyzes unsaved buffers through the compiler's frontend and
+query cache. The caller owns a `session.Session` and its allocator. One
+`EditorSession` borrows that Session for serial use. Neither object may move
+while its address is borrowed. There is no concurrent request support.
 
-This module, the CLI, and the manifest schema are the supported surface of the
-compiler. They are source-stable within a major version and not binary-stable;
-everything else under `src/` is internal and carries no promise.
+## Buffer ownership
 
-It is built on the same front-end phases the driver uses (`source`, `lexer`,
-`parser`, `resolve`, `sema`, `diagnostic`) and reuses the session services
-(`SourceMap`, the diagnostic store, interners). Every entry tolerates a
-malformed buffer: it records diagnostics and returns a usable partial result
-rather than bailing at the first error.
+`open(es, path, text)` copies an overlay and source payload and returns a stable
+`FileId`. `update(es, file, text)` replaces an open buffer. Identical text is a
+no-op. `close(es, file)` removes its overlay, cached dependent products and
+source payload. Closing an unopened file returns `ok(false)`.
 
-## Lifecycle
+File identity and path metadata survive close. Reopening the same canonical
+path returns the same `FileId` with a fresh source revision. Buffer slots are
+reused independently of FileIds and grow to peak simultaneous opens. A closed
+buffer stops contributing an extra project root. If another module imports
+that file, a later project analysis reads its current disk contents.
 
-```
-session.Session              // caller owns; provides SourceMap + diagnostic store
-  └─ editor.EditorSession    // borrows the session, owns per-buffer analysis
-       ├─ Buffer (per FileId)   // owned Ast / ResolveResult / SemaResult, or borrowed from the project
-       └─ Project               // loaded on demand for a buffer inside a project root
-```
+Open, update, close and teardown prepare every fallible allocation before
+publishing their changes. An error preserves the open buffers and current
+views, including their overlays and project state. Internal table capacity can
+remain reserved after a refusal. Retry is permitted.
 
-```mach
-var s: session.Session = unwrap_ok[...](session.init(?alloc));
-var es: editor.EditorSession = editor.init(?s);
-// ... drive es ...
-editor.dnit(?es);   // frees every buffer's owned analysis and the loaded project
-session.dnit(?s);   // tears the session down (editor never touches it)
-```
+`dnit(es) -> Result[Void, str]` retires all editor-owned inputs together, then
+frees the editor's structural state. Check this result. Failure leaves the
+editor and Session intact. Success leaves unrelated Session cache entries and
+stable source identities intact. Destroy the Session only after successful
+editor teardown. There is no separate public close-all protocol.
 
-The session must outlive the editor session. `editor.dnit` releases only what
-the editor owns: per-buffer analysis it computed itself, and the project it
-loaded. The borrowed `SourceMap` and diagnostic store belong to the session.
+## Analysis request and owned result
 
-## API
+Create an `AnalysisRequest` with `analysis_request(file, phase)` and call
+`analyze(es, request) -> Result[AnalysisResult, outcome.Fail]`.
 
-| Function | Signature | Purpose |
-|---|---|---|
-| `init` | `fun(*session.Session) EditorSession` | construct the facade over a session |
-| `dnit` | `fun(*EditorSession)` | release owned per-buffer analysis and the loaded project |
-| `open` | `fun(*EditorSession, str, str) Result[source.FileId, str]` | register an unsaved buffer (path, text); return its `FileId` |
-| `update` | `fun(*EditorSession, source.FileId, str) Result[bool, str]` | replace a buffer's text; `true` when the text changed, dropping cached analysis |
-| `tokenize` | `fun(*EditorSession, source.FileId) Result[lexer.TokenStream, str]` | lex; lex errors land on the diagnostic store (caller frees the stream) |
-| `parse` | `fun(*EditorSession, source.FileId) Result[*ast.Ast, str]` | best-effort parse; the project's AST for a project module |
-| `resolve` | `fun(*EditorSession, source.FileId) Result[*res.ResolveResult, str]` | name-resolution side tables; project-aware |
-| `analyze` | `fun(*EditorSession, source.FileId) Result[*context.SemaResult, str]` | type-check; project-aware |
-| `diagnostics` | `fun(*EditorSession, source.FileId) Result[*diagnostic.DiagnosticStore, str]` | reset, then lex and parse; the session store holding this buffer's syntactic diagnostics |
-| `ast_of` | `fun(*EditorSession, source.FileId) *ast.Ast` | cached `Ast`, or nil |
-| `resolve_of` | `fun(*EditorSession, source.FileId) *res.ResolveResult` | cached `ResolveResult`, or nil |
-| `sema_of` | `fun(*EditorSession, source.FileId) *context.SemaResult` | cached `SemaResult`, or nil |
-| `expr_type_of` | `fun(*EditorSession, source.FileId, id.ExprId) type.TypeId` | the checked type of an expression (`TYPE_NIL` for `EXPR_NIL`, `TYPE_ERROR` when unavailable) |
-| `decl_type_of` | `fun(*EditorSession, source.FileId, id.DeclId) type.TypeId` | the checked type of a declaration |
-| `resolved_type_of` | `fun(*EditorSession, source.FileId, id.TypeId) type.TypeId` | the semantic type a syntactic type node resolved to |
-| `build` | `fun(*EditorSession, *request.BuildRequest) Result[outcome.BuildOutcome, outcome.Fail]` | run a full build of the buffer's project through the build engine |
-| `fail_dnit` | `fun(*EditorSession, *outcome.Fail)` | release a `Fail` returned by `build` |
+| Phase | Work |
+|---|---|
+| `PHASE_PARSE` | Lex and parse the selected source roots. No import traversal, gate evaluation, name resolution or type checking. |
+| `PHASE_RESOLVE` | Discover active dependencies and resolve names and gates. No ordinary sema pass. |
+| `PHASE_SEMA` | Resolve and type-check. |
 
-`open` loads the buffer text into the session's `SourceMap` as an **overlay**:
-when the project is loaded, the module at that path is read from the buffer,
-not from disk, so unsaved edits are what get analyzed. `open` and `update`
-both mark the project dirty, so the next project-aware query reloads it.
-`update` returns `false` when the new text equals the old and keeps the cached
-analysis.
+For a file under its nearest manifest's `src` directory, `request.build` uses
+the existing `BuildRequest` selection and effective options. This is the same
+project/configuration boundary as the driver. Opening that project still
+validates its configuration and dependency manifests. Parse-only analysis does
+not read dependency source files. Currently open files belonging to that same
+nearest project form the extra analysis roots. An open nested project's file
+does not become an extra root of its parent project.
 
-Every analysis entry (`tokenize`, `parse`, `resolve`, `diagnostics`) first
-resets the session's diagnostic store, so the store holds only the diagnostics
-of the most recent query.
+For a standalone file, `standalone_target` optionally borrows a resolved
+`target.Target`. Its registry-owned definitions must remain live with the
+Session. Omitting it selects the registered host target. A project target name
+cannot select a standalone target. Conversely, a standalone target cannot
+replace a project's target selection. Effective build mode and PIE come from
+`request.build`, whose profile options must already be composed. Request
+strings and vectors are borrowed only during the call.
 
-## Project-aware analysis
+A successful `Result` means the owned analysis envelope was produced. Inspect
+`AnalysisResult.status` for accepted, rejected or internal phase status.
+Operational project failures retain their `outcome.Fail` category in
+`result.failure`. Diagnostic counts do not determine phase status. A rejected
+standalone parse can still expose a partial AST. A fatal project acquisition
+can leave no raw product, while retaining the owned failure diagnostics.
 
-`parse`, `resolve`, and `analyze` decide how to analyze a buffer from its path:
+The result owns:
 
-1. Walk up from the buffer's directory to the nearest `mach.toml`. That
-   directory is the project root.
-2. If the buffer lies under that project's `src` directory, compose its module
-   FQN and load the project (manifest, dependencies, every module the buffer's
-   module reaches) exactly as `mach build` would, with the buffer's overlay
-   text in place of the file. The query then returns the project's own `Ast`,
-   `ResolveResult`, or `SemaResult` for that module: cross-module references
-   through `use` bind to their real declarations, and `$if` gates evaluate
-   against the project's selected target.
-3. Otherwise (no manifest above the buffer, or a file outside `src`) the buffer
-   is analyzed **in isolation** with an empty dependency set: local
-   declarations bind, and anything reached through a `use` resolves to
-   `SYMBOL_NIL`. The comptime context is seeded with host defaults.
+- Its diagnostic store, including related locations, fix edits and lost-diagnostic evidence.
+- The requested source version and every other source version referenced by those locations.
+- A copied failure message, source revision, requested phase and target metadata.
+- For an opened project, its root, resolved profile name and the existing canonical build-configuration bytes.
 
-A project load failure (an invalid manifest, a missing dependency) is returned
-as the query's error string; it is the same message `mach build` would print.
-The project is cached across queries and reloaded when a buffer changes, when
-a buffer from a different project root is queried, or when a module not yet
-among the loaded roots is queried.
+`target_available` is false when the requested target context was not acquired.
+The API does not substitute host metadata for a failed project target.
 
-Only the target the project selects by default is loaded; there is no
-per-query target override on this surface.
+Release each result exactly once with `analysis_dnit`. Do not copy it as an
+independent owner. Its allocator must outlive it. Owned diagnostics, source
+versions and metadata remain usable after buffer update/close, subsequent
+analysis and Session destruction. `analysis_source(result, file)` finds the
+owned `SourceFile` for a diagnostic location. Use `source.position` on that
+file, rather than looking up current Session text.
 
-## Diagnostics
+If the envelope cannot be allocated, `analyze` returns an operational failure.
+Release that failure with `fail_dnit`, as for failures returned by `build`.
+The current Session still owns any diagnostics the frontend produced.
 
-`diagnostics` runs `tokenize → emit-lex-errors → parse` and returns the
-session's store of **syntactic** diagnostics only. Each `diag.Diagnostic`
-carries `(severity, loc, message, note, help, related[])`: `loc` is a
-`Location` (`file_id`, `span`) for the primary report, `note` and `help` are
-optional trailing lines, and `related` is a growable array (`related_len`
-entries) of secondary `Location`s each with an optional `label`. Map each
-`loc.span` to a position with `source.position`:
+## Raw product lifetime
 
-```mach
-val store: *diagnostic.DiagnosticStore = unwrap_ok[...](editor.diagnostics(?es, fid));
-var i: usize = 0;
-for (i < store.len) {
-    val d: *diagnostic.Diagnostic = ?store.items[i];
-    val sf: *source.SourceFile = unwrap[...](source.get(?s.sources, d.loc.file_id));
-    val pos: source.Position = source.position(sf, d.loc.span.offset); // 1-based line/col
-    // d.severity, pos.line, pos.col, d.message -> LSP Diagnostic
-    i = i + 1;
-}
-```
+`ast_of(result)`, `resolve_of(result)` and `sema_of(result)` return checked
+`Result` borrows. Their products belong to the current serial Session view.
+They do not own a retained AST or IR generation. Both the EditorSession and
+Session must still exist when calling these accessors.
 
-`help` and `related` are populated by the **resolve** and **sema** stages (a
-suggestion rides `help`, rendered `= help:`; a prior binding rides `related`,
-e.g. `previous definition here`), so an integrator wanting them drives
-`resolve` or `analyze` and reads the session store afterwards. The parse-only
-`diagnostics` slice never sets them. Map a `related` entry's `loc` to a
-position the same way, and surface its `label` as an LSP `relatedInformation`
-item.
+A successful buffer mutation, close or teardown expires the view. Starting a
+new analysis, build or query operation, or replacing Session source/module/type
+projections, also expires it. A checked accessor then returns an expiry error.
+Pointers already obtained must not be dereferenced after that boundary.
+`analysis_dnit` ends the result's own lifetime too.
 
-## Position lookup: offset to id
+The phase must include the requested product. A valid view can return a nil
+product after rejected acquisition. `expr_type_of`, `decl_type_of` and
+`resolved_type_of` perform the same lifetime and sema-phase checks before
+reading side tables. Node IDs are meaningful only with their matching AST.
+Resolve consumers must distinguish `SYMBOL_NIL` and `SYMBOL_REJECTED` before
+indexing the symbol array.
 
-Hover, go-to-definition, and references pivot on finding the AST node under a
-byte offset, then reading the side tables. `mach.lang.fe.ast` provides the
-lookups, each returning the *tightest* (smallest-span) enclosing node, or the
-id-type sentinel when none covers the offset:
+`tokenize(result)` lexes the result's owned source version without mutating the
+Session. The caller owns the returned token storage and frees it with
+`lexer.dnit(stream, result.alloc)`. Its source bytes borrow the result, so free
+the token stream before `analysis_dnit`.
 
-```mach
-pub fun offset_to_expr(a: *ast.Ast, offset: usize) id.ExprId   // or id.EXPR_NIL
-pub fun offset_to_stmt(a: *ast.Ast, offset: usize) id.StmtId   // or id.STMT_NIL
-pub fun offset_to_decl(a: *ast.Ast, offset: usize) id.DeclId   // or id.DECL_NIL
-pub fun offset_to_type(a: *ast.Ast, offset: usize) id.TypeId   // or id.TYPE_NIL
-```
+## Building
 
-From an `ExprId`, the resolve side tables give the binding and the sema
-tables give the type:
+`build(es, request)` runs the existing warm build engine with current overlays.
+It expires previous raw analysis views. The returned `BuildOutcome` retains
+its existing ownership contract. Release an error message with `fail_dnit`.
+No analysis phase invokes build generators or the backend.
 
-```mach
-val eid: id.ExprId = ast.offset_to_expr(a, offset);
-if (eid != id.EXPR_NIL) {
-    val sid: res.SymbolId = rr.expr_resolved[eid];     // SYMBOL_NIL if unbound
-    if (sid != res.SYMBOL_NIL) {
-        val sym: *res.Symbol = ?rr.symbols[sid];
-        // sym.decl (DeclId in sym.origin's module), sym.kind, sym.name
-    }
-    val ty: type.TypeId = editor.expr_type_of(?es, fid, eid);   // after analyze
-}
-```
-
-`rr.expr_resolved`, `rr.type_resolved`, and `rr.decl_symbol` are parallel to
-`a.exprs`, `a.types`, and `a.decls` respectively. For a project module the
-`ResolveResult` is the project's, so `sym.origin` may name another module of
-the project or of a dependency.
-
-## Partial-result tolerance
-
-Every phase is best-effort by construction:
-
-- The **lexer** records malformed input as `LexError`s on the stream instead
-  of aborting; `lexer.emit_diagnostics` (and the editor's `tokenize`/`parse`)
-  drains them onto the diagnostic store.
-- The **parser** is explicitly malformed-input tolerant: it emits diagnostics
-  and synthesizes `*_KIND_ERROR` nodes while continuing, so a broken buffer
-  still yields a partial `Ast` with a set `root_module`.
-- **resolve** records name-resolution diagnostics and leaves the offending
-  side-table slots as `SYMBOL_NIL`, producing usable tables over a broken tree.
-
-A buffer with a missing `)` and a stray backtick still parses to a tree
-containing its function declaration, surfaces both the lex and the parse
-error, and resolves to populated side tables.
-
-## Building from the editor
-
-`build` runs a complete build of the project named by the request's
-`project_root`: it loads the manifest, plans the artifact cells, and executes
-them through the same engine `mach build` uses, so an editor can offer "build"
-without spawning the CLI. The outcome and its `Fail` are the driver's own
-types; a `Fail` whose kind is `FAIL_REPORTED` means the diagnostics were
-already recorded on the session store, and `fail_dnit` releases whatever the
-editor duplicated for the other kinds.
-
-## See also
-
-- [../cli.md](../cli.md) — the command-line surface the editor mirrors
-- [../manifest.md](../manifest.md) — the project the editor discovers
+The editor API, CLI and manifest are supported compiler surfaces. They are
+source-stable within a major version, not binary-stable. This v5 lifecycle
+replaces the old pointer-only editor operations without compatibility adapters.

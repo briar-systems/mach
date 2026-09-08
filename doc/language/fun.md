@@ -120,3 +120,25 @@ reference.
 - [comptime-control.md](comptime-control.md) — `$if` inside function bodies
 - [expressions.md](expressions.md) — function calls and generic
   instantiation
+
+## SPIR-V function values and references
+
+The SPIR-V module backend passes each scalar, vector, array or record as one typed
+logical value. A composite parameter has its own local object when the function
+needs addressable storage. Calls and returns do not consume a synthetic register
+bank. Parameter and call operand storage grows with the actual signature, including
+signatures with more than sixteen parameters.
+
+A reference to a whole Function-storage object can be passed to another function,
+including forwarding an incoming reference. Its pointee type remains part of the
+IR signature. The current Logical Shader environment refuses function-pointer calls,
+Function-storage reference results, pointer-containing local objects and recursive
+reference type graphs. A Function-storage subobject access chain cannot be passed
+as a reference argument. These restrictions follow the declared environment and
+capabilities, not the native ABI or the number of available registers.
+
+The SPIR-V universal limits table specifies a minimum supported parameter count of
+255, not a maximum. Mach allocates operands from the signature and checks the
+instruction's 16-bit word-count encoding before emission. Environment-specific
+resource limits remain the validator or execution environment's responsibility.
+See the [SPIR-V validation rules and universal limits](https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#_universal_validation_rules).
