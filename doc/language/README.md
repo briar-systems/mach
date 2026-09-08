@@ -1,5 +1,9 @@
 # Mach language reference
 
+Tag, canonical type, and `try` descriptions include the accepted v5 contract.
+Implementation is incomplete at base commit `fc5c9e7e`. See
+[tag.md](tag.md#implementation-status) and [try.md](try.md#implementation-status).
+
 Per-element reference docs. Each file covers one language component;
 read the index below or follow `see also` links to navigate.
 

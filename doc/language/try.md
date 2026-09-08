@@ -7,7 +7,8 @@ payload on success, and routes failure through a mandatory terminating block.
 ## Implementation status
 
 The features described on this page represent the accepted Mach v5 contract
-specified in `doc/design/tagged-values.md`. In the current repository state,
+specified in [the tagged value design](../design/tagged-values.md). At base
+commit `fc5c9e7e`,
 parsing of `try` expressions and explicit failure blocks is implemented. Semantic
 type checking, payload extraction lowering, and runtime support remain under
 active development.
@@ -30,7 +31,9 @@ val sum: i64 = (try parse(a) or (e: ParseError) {
 });
 ```
 
-The failure block is introduced by `or` and is mandatory. Mach provides no
+The failure block is introduced by `or` and is mandatory. Error bindings are
+optional for `res` and `err`. When present, the declared binding type must match
+the exact error payload type. Options permit no error binding. Mach provides no
 shorthand try syntax, no implicit error propagation, and no method constructors.
 
 ## Supported operands
@@ -42,7 +45,7 @@ The `try` operator accepts only the three canonical tag types:
 - `err[E]` produces no value on `ok`, or binds error `E` on failure
 
 User-declared tags acquire no automatic `try` convention. Non-canonical tags use
-explicit case tests (`if (val == MyTag.case)`) instead.
+explicit case tests (`if (value == MyTag.case)`) instead.
 
 ## Mandatory terminating failure blocks
 
@@ -139,7 +142,9 @@ Evaluation proceeds under strict left-to-right rules:
 - In assignments, the right hand side evaluates and captures before the destination place on the left hand side is evaluated
 
 If a `try` extraction fails, remaining evaluation of the enclosing expression
-skips entirely. The destination variable or place is not initialized or mutated.
+skips entirely. The failed extraction does not initialize or assign its destination. Side effects
+from operand evaluation, earlier expression evaluation, or the failure block
+remain in effect. `try` does not roll them back.
 
 ```mach
 consume(try parse(input) or (error: ParseError) {
