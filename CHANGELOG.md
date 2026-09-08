@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- Legacy declassification spellings `:^` and `:^T`. Use `:>T` with an explicit
+  public result type, including pointer and array types. Ordinary `::^T` casts remain.
+
 - Withdrawn MOS 6502 instruction set, ABI, registry entries and corpus column.
   Shared width legalization and retained target coverage remain available.
 

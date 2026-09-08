@@ -527,7 +527,6 @@ member       ::= "." IDENT
 project      ::= "." "[" expr "]"          (* v.[f]: comptime field projection *)
 cast         ::= ( "::" | ":~" ) type
               | ":>" type                  (* secret-qualifier strip cast *)
-              | ":^" [ named-type ]        (* deprecated strip spellings *)
 ```
 
 `::` is a value conversion and `:~` a same-size bit reinterpret; see
@@ -537,10 +536,10 @@ operand's type, producing a new public value (#1643, [secrecy.md](secrecy.md)).
 Its target type is required and names the operand's stripped public type; a bare
 `:>` is a parse error, and `:>` never reinterprets storage.
 
-The deprecated spellings `:^` and `:^Type` produce the same node and are
-accepted through 4.30.0, rejected in 5.0.0. A bare `:^` needs no target, and a
-non-`named-type` lead (`*`, `[`, ...) after `:^` leaves a bare strip so it still
-binds as a multiply/index on the stripped value. All bind as postfix.
+The removed spellings `:^` and `:^Type` are rejected with a migration diagnostic
+naming `:>T`. This includes pointer and array type tails such as `:^*u8` and
+`:^[4]u32`. The lexer retains the token only to report that diagnostic.
+Ordinary casts to secret types such as `x::^u32` remain ordinary `::` casts.
 
 Disambiguating a postfix `[`: the bracket may open a generic argument list
 (`callee[T, U](args)`, or `f[T]` naming an instance as a value) or be an index

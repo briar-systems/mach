@@ -335,7 +335,7 @@ is walked). A `fun(...)` type may carry a trailing `...` for FFI only.
 and be stored but may never reach an observable position: a branch or loop
 condition, the left operand of `&&`/`||`, a memory index, or a `/`/`%`
 operand - each is a compile error. Public flows up to secret implicitly; the
-**only** downgrade is the explicit strip cast `x:>T` (the result type is required; `x:^` and `x:^T` are deprecated spellings accepted through 4.30.0). Any operation
+**only** downgrade is the explicit strip cast `x:>T` (the result type is required; `x:^` and `x:^T` are removed spellings and are rejected). Any operation
 with a secret operand yields a secret result; `uni` variants must agree on
 secrecy; a secret-welded pointer (`*^T`) cannot be erased to `ptr`. Also
 rejected: a secret float operand, a secret integer multiply or variable shift
