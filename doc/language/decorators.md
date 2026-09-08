@@ -478,9 +478,12 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
   `symbol` and `section` — the path is taken as written.
 - The path resolves relative to the **declaring source file's** directory. An
   absolute path is taken as written. The resolved file must lie inside the
-  project root: in 4.30.0 an embed that escapes it (`../../outside.txt` from
-  `src/`) is a **warning** naming the path, and 5.0.0 rejects it. Keep assets
-  under the project.
+  project root. Lexical escapes (`../../outside.txt` from `src/`) and symlinks
+  in the relative parent path or final file are rejected before content is read,
+  including symlinks whose targets remain inside the project. The compiler holds
+  the parent directory and reads only the regular file opened relative to it.
+  Keep assets under the project. A missing contained generated file remains a
+  missing-file diagnostic until its prerequisite supplies it.
 - A path holding `{artifact.<id>.out}` names the output of an artifact this one
   requires through the manifest's `need`, and resolves against the **project
   root** rather than the declaring file's directory; the required artifact is

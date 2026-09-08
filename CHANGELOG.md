@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Test listing stops after collecting tests without generating or linking machine code.
 
+- Embedded files are read through held directory and file handles. Escaping paths
+  and symlinks are rejected before reading, and failed refreshes preserve cache
+  ownership and the prior query input.
+
 - Build planning, driver setup and request hashing reject unknown request catalog values. Invalid phases report their tag and catalog instead of appearing as linking, and invalid goals no longer masquerade as allocation failures.
 
 - Instruction selection preserves each register operand's required bank. Post-allocation
