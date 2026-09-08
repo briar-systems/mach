@@ -1,3 +1,4 @@
+use io_error: std.io.error;
 use std.allocator.page;
 use std.collections.sort;
 use std.collections.vector;
@@ -1197,6 +1198,19 @@ fun glob_visit(alloc: *A.Allocator, root: str, base_rel: str, name: str, pat: st
     ret R.ok_void[str]();
 }
 
+fun directory_failure(alloc: *A.Allocator, fmt: str, va: ...) R.Result[R.Void, str] {
+    val message: R.Result[str, str] = format.sprint(alloc, fmt, va...);
+    if (R.is_err[str, str](message)) { ret R.err[R.Void, str](R.unwrap_err[str, str](message)); }
+    ret R.err[R.Void, str](R.unwrap_ok[str, str](message));
+}
+
+fun directory_cleanup_result(alloc: *A.Allocator, result: R.Result[R.Void, str], code: i64) R.Result[R.Void, str] {
+    if (code >= 0) { ret result; }
+    if (R.is_ok[R.Void, str](result)) { ret R.err[R.Void, str](sysos.message(code)); }
+    ret directory_failure(alloc, "{}; directory cleanup failed: {} (code {})",
+        R.unwrap_err[R.Void, str](result), sysos.message(code), code);
+}
+
 fun glob_dot_entry(name: *u8) bool {
     if (name[0] != '.'::u8) { ret false; }
     if (name[1] == 0) { ret true; }
@@ -1219,37 +1233,26 @@ fun glob_walk(alloc: *A.Allocator, root: str, base_rel: str, pat: str, recursive
     str_free(alloc, dir_abs);
     val fd: i32 = fd_raw::i32;
 
-    var dbuf: [8192]u8;
+    var cursor: sysos.DirectoryCursor = sysos.DirectoryCursor{};
+    val initialized: sysos.DirectoryInitResult = sysos.directory_init(?cursor, fd);
+    if (initialized.code < 0) {
+        var failed: R.Result[R.Void, str] = R.err[R.Void, str](sysos.message(initialized.code));
+        failed = directory_cleanup_result(alloc, failed, initialized.cleanup_code);
+        ret directory_cleanup_result(alloc, failed, sysos.close(fd));
+    }
     var result: R.Result[R.Void, str] = R.ok_void[str]();
-    var reading: bool = true;
-    for (reading) {
-        val nread: i64 = sysos.read_dir(fd, (?dbuf[0])::*sysos.dirent64, 8192);
-        if (nread < 0)  { result = R.err[R.Void, str](sysos.message(nread)); reading = false; }
-        or (nread == 0) { reading = false; }
-        or {
-            var pos: usize = 0;
-            for (reading && pos < nread::usize) {
-                val ent:    *sysos.dirent64 = ((?dbuf[0])::usize + pos)::*sysos.dirent64;
-                val reclen: usize           = ent.d_reclen::usize;
-                if (reclen == 0 || reclen > nread::usize - pos) {
-                    result = R.err[R.Void, str]("invalid directory entry while expanding build step glob");
-                    reading = false;
-                }
-                or {
-                    val name: *u8 = ?ent.d_name[0];
-                    if (!glob_dot_entry(name)) {
-                        val rr: R.Result[R.Void, str] = glob_visit(alloc, root, base_rel, name::str, pat, recursive, out);
-                        if (R.is_err[R.Void, str](rr)) { result = rr; reading = false; }
-                    }
-                    pos = pos + reclen;
-                }
-            }
+    for {
+        var entry: sysos.DirectoryEntry;
+        val next: i64 = sysos.directory_next(?cursor, ?entry);
+        if (next < 0) { result = R.err[R.Void, str](sysos.message(next)); brk; }
+        if (next == 0) { brk; }
+        if (!glob_dot_entry(entry.name::*u8)) {
+            result = glob_visit(alloc, root, base_rel, entry.name, pat, recursive, out);
         }
+        if (R.is_err[R.Void, str](result)) { brk; }
     }
-    val close_r: i64 = sysos.close(fd);
-    if (R.is_ok[R.Void, str](result) && close_r < 0) {
-        result = R.err[R.Void, str](sysos.message(close_r));
-    }
+    result = directory_cleanup_result(alloc, result, sysos.directory_close(?cursor));
+    result = directory_cleanup_result(alloc, result, sysos.close(fd));
     ret result;
 }
 
@@ -1792,9 +1795,13 @@ fun collect_tree_files(a: *A.Allocator, dir: str, out: *vector.Vector[TreeFile])
     for (root_digest_i < 32) { root_entry.digest[root_digest_i] = 0; root_digest_i = root_digest_i + 1; }
     val root_push_r: R.Result[usize, str] = vector.push[TreeFile](out, root_entry);
     if (R.is_err[usize, str](root_push_r)) { str_free(a, root_entry.path); ret R.err[R.Void, str](R.unwrap_err[usize, str](root_push_r)); }
-    val names_r: R.Result[Vector[str], str] = fs.read_dir(a, root_entry.path);
-    if (R.is_err[Vector[str], str](names_r)) { ret R.err[R.Void, str](R.unwrap_err[Vector[str], str](names_r)); }
-    var names: Vector[str] = R.unwrap_ok[Vector[str], str](names_r);
+    val names_r: R.Result[Vector[str], io_error.Error] = fs.read_dir(a, root_entry.path);
+    if (R.is_err[Vector[str], io_error.Error](names_r)) {
+        val error: io_error.Error = R.unwrap_err[Vector[str], io_error.Error](names_r);
+        ret directory_failure(a, "failed to read directory '{}': {} (code {}, cleanup code {})",
+            root_entry.path, io_error.message(error), error.code, error.cleanup_code);
+    }
+    var names: Vector[str] = R.unwrap_ok[Vector[str], io_error.Error](names_r);
     sort.sort[str](names.data, names.len, cmp_str);
 
     var i: usize = 0;
@@ -2176,12 +2183,29 @@ fun step_staging_home_out(a: *A.Allocator, home_out: str, step_name: str) str {
     ret sfmt(a, "{}/{}/{}", home_out, STEP_STAGE_DIR, step_name);
 }
 
+fun step_remove_staging(a: *A.Allocator, staging_root: str, result: R.Result[R.Void, str]) R.Result[R.Void, str] {
+    val removed: O.Option[fs.RemovalError] = fs.remove_all(a, staging_root);
+    if (O.is_none[fs.RemovalError](removed)) { ret result; }
+    val error: fs.RemovalError = O.unwrap[fs.RemovalError](removed);
+    if (R.is_err[R.Void, str](result)) {
+        ret directory_failure(a, "{}; failed to remove build step staging area '{}': {} (code {}, cleanup code {})",
+            R.unwrap_err[R.Void, str](result), staging_root, fs.removal_message(error), error.code, error.cleanup_code);
+    }
+    ret directory_failure(a, "failed to remove build step staging area '{}': {} (code {}, cleanup code {})",
+        staging_root, fs.removal_message(error), error.code, error.cleanup_code);
+}
+
 fun step_prepare_staging(a: *A.Allocator, output_root: str, staging_root: str, step_name: str) R.Result[R.Void, str] {
     val rel: str = sfmt(a, "{}/{}", STEP_STAGE_DIR, step_name);
     val ancestors_r: R.Result[R.Void, str] = validate_contained_ancestors(a, output_root, rel, "build step staging area");
     if (R.is_err[R.Void, str](ancestors_r)) { str_free(a, rel); ret ancestors_r; }
-    val rm: O.Option[str] = fs.remove_all(a, staging_root);
-    if (O.is_some[str](rm)) { str_free(a, rel); ret R.err[R.Void, str](sfmt(a, "failed to prepare build step staging area: {}", O.unwrap[str](rm))); }
+    val rm: O.Option[fs.RemovalError] = fs.remove_all(a, staging_root);
+    if (O.is_some[fs.RemovalError](rm)) {
+        val error: fs.RemovalError = O.unwrap[fs.RemovalError](rm);
+        str_free(a, rel);
+        ret directory_failure(a, "failed to prepare build step staging area: {} (code {}, cleanup code {})",
+            fs.removal_message(error), error.code, error.cleanup_code);
+    }
     val make_r: R.Result[R.Void, str] = ensure_physical_directory_path(a, output_root, rel, "build step staging area");
     str_free(a, rel);
     ret make_r;
@@ -2483,13 +2507,13 @@ fun run_one_step(a: *A.Allocator, p: *project.Project, step: *manifest.StepDef, 
 
     val finished: R.Result[R.Void, str] = combine_step_terminal_results(a, object_integrity, output_integrity, res_run);
     if (R.is_err[R.Void, str](finished)) {
-        fs.remove_all(a, staging_root);
+        val cleaned: R.Result[R.Void, str] = step_remove_staging(a, staging_root, finished);
         step_free_inputs(a, ?staging_declared);
         str_free(a, hex); str_free(a, stamp_path);
         str_free(a, staging_root); str_free(a, staging_home_out);
         step_paths_free(a, ?outputs);
         str_free(a, output_root);
-        ret finished;
+        ret cleaned;
     }
 
     val publish_r: R.Result[R.Void, str] = publish_staged_outputs(a, staging_root, output_root, ?outputs);
@@ -2501,11 +2525,10 @@ fun run_one_step(a: *A.Allocator, p: *project.Project, step: *manifest.StepDef, 
         str_free(a, output_root);
         ret publish_r;
     }
-    fs.remove_all(a, staging_root);
+    var stamped: R.Result[R.Void, str] = step_remove_staging(a, staging_root, R.ok_void[str]());
     step_free_inputs(a, ?staging_declared);
 
-    var stamped: R.Result[R.Void, str] = R.ok_void[str]();
-    if (step.out_count > 0) {
+    if (R.is_ok[R.Void, str](stamped) && step.out_count > 0) {
         stamped = write_stamp(a, stamp_path, hex);
         if (R.is_err[R.Void, str](stamped)) {
             stamped = R.err[R.Void, str](sfmt(a, "build step '{}' completed but its cache record could not be published: {}",
@@ -4085,5 +4108,29 @@ test "mach.lang.driver.config.step_outputs:native_snapshot_and_declarations_shar
     val named: bool = str_contains(message, "obj-sibling");
     str_free(?alloc, message);
     if (!named) { ret 7; }
+    ret 0;
+}
+
+test "mach.lang.driver.config.directory:cleanup_preserves_primary_and_secondary_failures" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val success: R.Result[R.Void, str] = R.ok_void[str]();
+    if (R.is_err[R.Void, str](directory_cleanup_result(?alloc, success, 0))) { ret 2; }
+    val close_only: R.Result[R.Void, str] = directory_cleanup_result(?alloc, success, sysos.EBADF);
+    if (R.is_ok[R.Void, str](close_only) || !str_equals(R.unwrap_err[R.Void, str](close_only), sysos.message(sysos.EBADF))) { ret 3; }
+    val primary: R.Result[R.Void, str] = R.err[R.Void, str]("directory visitor failed");
+    val unchanged: R.Result[R.Void, str] = directory_cleanup_result(?alloc, primary, 0);
+    if (R.is_ok[R.Void, str](unchanged) || !str_equals(R.unwrap_err[R.Void, str](unchanged), "directory visitor failed")) { ret 4; }
+    val secondary: R.Result[R.Void, str] = directory_cleanup_result(?alloc, primary, sysos.EBADF);
+    if (R.is_ok[R.Void, str](secondary)) { ret 5; }
+    val first: str = R.unwrap_err[R.Void, str](secondary);
+    fin { str_free(?alloc, first); }
+    if (!str_contains(first, "directory visitor failed") || !str_contains(first, sysos.message(sysos.EBADF))
+        || !str_contains(first, "code -9")) { ret 6; }
+    val closed: R.Result[R.Void, str] = directory_cleanup_result(?alloc, secondary, sysos.EIO);
+    if (R.is_ok[R.Void, str](closed)) { ret 7; }
+    val both: str = R.unwrap_err[R.Void, str](closed);
+    fin { str_free(?alloc, both); }
+    if (!str_contains(both, first) || !str_contains(both, sysos.message(sysos.EIO))) { ret 8; }
     ret 0;
 }

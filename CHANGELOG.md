@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Instruction selection preserves each register operand's required bank. Post-allocation
   verification independently rejects wrong-bank operands, including conversions,
   moves, and memory addresses.
+- Compiler directory scans use owned cursors and typed cleanup errors. Process
+  supervision preserves complete exit codes and native wait causes, and releases
+  stale child ownership without inventing a completion after `ECHILD`.
 
 - Memory promotion removes unreachable blocks before rewriting locals, preserving
   valid IR when an unconditional loop leaves a dead cleanup or return path.
@@ -26,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI rebuilds its audited compiler from published 4.26.5 and source commits reachable from main after withdrawal of the 4.30.0 release.
 
 ### Changed
+
+- Removed `$project.name`, `$project.description` and the `$mach.abi.sysv` alias. Diagnostics identify the removed forms, and the ABI tag uses only `sysv64`.
 
 - Every dependency action selects its project with `mach dep <action> <path>`.
   Dependency names follow the path. Missing or extra operands are refused.
