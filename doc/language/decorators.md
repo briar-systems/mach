@@ -1,12 +1,11 @@
 # Decorators
 
-A decorator is a codegen directive attached to a declaration. It expresses
-metadata that influences how the compiler emits the symbol: its linker name,
+A decorator attaches metadata to a declaration. It can provide source-use
+notices or influence how the compiler emits the symbol: its linker name,
 alignment, section placement, inlining, dynamic import attribution, constant-time
 obligations, or exclusion from auto-vectorization.
 
-Decorators are **codegen-only**. Visibility (`pub` / `ext`) is separate and
-unaffected by decorators.
+Visibility (`pub` / `ext`) is separate and unaffected by decorators.
 
 ## Surface
 
@@ -25,9 +24,40 @@ A decorator is written as an attribute:
 > (with no space) opens an attribute. Write such a comment with a separating
 > space — `# [...]`.
 
+## Deprecation notices
+
+`#[deprecated]` and `#[deprecated("message")]` mark a declaration as deprecated.
+The optional message must be one string literal and uses the normal literal
+escape decoding. Repeating the attribute or providing other arguments is an
+error. The attribute does not alter visibility, type identity, ABI, or codegen.
+
+Uses of a deprecated named declaration from another source module warn at the
+identifier being used. Value references, calls, and type references are covered,
+including generic uses. Each source site warns once, even when a generic body is
+instantiated more than once. The declaring source module does not warn on its
+own uses. An unused import alone produces no warning.
+
+Notices follow imported symbols and re-exports. An annotation on a re-export
+belongs to the forwarding module and replaces any inherited notice for that
+exported name. Other aliases of the same canonical definition keep their own
+notices. A clean alias is not made deprecated by using a deprecated alias first.
+
+```mach
+#[deprecated("use replacement")]
+pub fun old() i32 { ret replacement(); }
+
+pub fun replacement() i32 { ret 1; }
+```
+
+The attribute supports `fun`, `rec`, `uni`, `def`, `val`, `var`, `use`, and `fwd`
+declarations. Tests, comptime directives, and comptime declaration blocks reject
+it because they do not declare an externally usable name.
+
 ## Grammar
 
 ```
+#[deprecated]        # external uses warn
+#[deprecated("message")] # external uses warn with this message
 #[symbol("name")]    # linker name override
 #[library("dep")]    # dynamic import attribution (ext only)
 #[inline]            # force inlining (no arguments)

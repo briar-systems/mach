@@ -525,7 +525,7 @@ manifest does not declare is reported unavailable, not folded to `""`.
 
 ### Decorators - `#[...]`
 
-Codegen directives on the line(s) above a declaration (after the docstring).
+Declaration metadata on the line(s) above a declaration (after the docstring).
 One clause each, stackable on one line or several; they attach only to the
 immediately following declaration. Closed set:
 
@@ -533,6 +533,7 @@ immediately following declaration. Closed set:
 |---|---|---|---|
 | `#[symbol("name")]` | fun, ext fun, val/var | string | linker name override |
 | `#[library("name")]` | ext import | string | dynamic import dependency pin |
+| `#[deprecated]` / `#[deprecated("message")]` | `fun`, `rec`, `uni`, `def`, `val`, `var`, `use`, `fwd` | zero or one literal string | warn once per external use, preserving re-export notice ownership |
 | `#[inline]` | fun | none | force inlining |
 | `#[align(expr)]` | val/var, rec/uni | comptime int | alignment override |
 | `#[section(".name")]` | fun, ext fun, val/var | string | object section placement |

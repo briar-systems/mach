@@ -63,6 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `#[deprecated]` and `#[deprecated("message")]` warn once per external source
+  use, preserving notices through imports, generics, and re-exports.
+
 - `{artifact.suffix}` expands artifact output extensions through the target naming rules. Scaffolds use one artifact across supported targets, and collision checks compare expanded paths for the selected target.
 
 - `mach build <path> --plan` reports the selected entries, prerequisites, outputs and link requirements through the shared planner. It replaces `--explain`.
