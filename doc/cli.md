@@ -141,8 +141,12 @@ The optimisation pipeline comes from the selected profile's `opt` — the profil
 is how a build picks its optimisation level.
 
 `--plan` resolves the full build plan — the (target, artifact) matrix and each
-unit's entry, output paths, ordered prerequisite steps and link requirements,
-prints it, and exits without running generators, compiling or linking. Generated
+unit's entry, output paths, ordered local and dependency-export prerequisite
+steps, and local and dependency-export link requirements,
+prints it, and exits without fetching dependencies, running generators, compiling
+or linking. Realized dependency manifests and content are validated through the
+normal configuration path, including dependency cycles. Missing realized
+dependencies are errors. Generated
 input bytes remain unresolved until their prerequisites run. The plan does not
 claim those bytes or the final link are valid.
 
