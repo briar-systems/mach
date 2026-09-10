@@ -45,7 +45,7 @@ The `try` operator accepts only the three canonical tag types:
 - `err[E]` produces no value on `ok`, or binds error `E` on failure
 
 User-declared tags acquire no automatic `try` convention. Non-canonical tags use
-explicit case tests (`if (value == MyTag.case)`) instead.
+explicit case tests (`if (sel value.case)`) instead.
 
 ## Mandatory terminating failure blocks
 

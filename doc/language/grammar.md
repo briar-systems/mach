@@ -7,7 +7,7 @@ this directory. Where the live parser diverges from a doc, the divergence
 is called out inline. Productions that could not be fully pinned to the
 parser are marked `(* approximate, verify *)`.
 
-Tag and `try` syntax is parsed at base commit `fc5c9e7e`. Canonical tag types,
+Tag and `try` syntax is parsed. Canonical tag types,
 case descriptor construction, and the new reflection forms below also describe
 the [accepted v5 contract](../design/tagged-values.md), whose implementation is
 still incomplete. See [tag.md](tag.md) and [try.md](try.md) for status and semantic
@@ -101,11 +101,11 @@ The reserved keywords (matched as `IDENT` text by the parser) are:
 
 ```
 asm  brk  cnt  def  ext  fin  for  fun  fwd  if
-nil  or   pub  rec  ret  tag  test try  uni  use
-val  var
+nil  or   pub  rec  ret  sel  tag  test try  uni
+use  val  var
 ```
 
-`nil` is an expression literal, and `try` is a prefix expression operator. The rest are statement, declaration, or type
+`nil` is an expression literal, and `sel` and `try` are prefix expression operators. The rest are statement, declaration, or type
 introducers. Note these are *contextual*: nothing in the lexer prevents a
 binding or field from being named after one, but the parser will treat the
 keyword in its keyword position. The operand-less statement keywords `brk`
@@ -301,13 +301,16 @@ layout). Both may be generic and both share the same field-block grammar.
 ### `tag` - tagged value
 
 ```ebnf
-tag-decl ::= "tag" IDENT [ generic-params ] "{" { tag-case ";" } "}"
+tag-decl ::= "tag" IDENT [ generic-params ] ":" discriminator "{" { tag-case ";" } "}"
+
+discriminator ::= "u8" | "u16" | "u32" | "u64"
 
 tag-case ::= IDENT [ ":" type ]
 ```
 
 `tag` defines a discriminated aggregate value with one active case at any time.
-Each case specifies a name and either one payload type or no payload.
+Each case specifies a name and either one payload type or no payload. The
+discriminator type is mandatory and must be able to number every case.
 
 ### `fun` — function
 
@@ -510,10 +513,14 @@ prefix ::= LIT_INT | LIT_FLOAT | LIT_CHAR | LIT_STR
          | IDENT
          | comptime-ident
          | typed-literal
+         | tag-literal
          | array-literal
+         | sel-expr
          | try-expr
          | unary-op prefix { postfix }
          | "(" expr ")"
+
+sel-expr ::= "sel" prefix { postfix }
 
 try-expr ::= "try" prefix { postfix } "or" [ "(" IDENT ":" type ")" ] block
 
@@ -528,6 +535,8 @@ unary-op ::= "-"      (* numeric negation *)
 
 - A unary operator binds its operand as `prefix` followed by any postfix
   chain, so `@p.field` and `?arr[i]` apply member/index *inside* the unary.
+- `sel` binds the same way and requires the result to be a member access, so
+  `sel r.ok && r.ok > 3` parses as `(sel r.ok) && (r.ok > 3)`.
 - `(expr)` is a plain grouping; there is no tuple form.
 
 ### Postfix
@@ -593,24 +602,24 @@ outcomes apply whether or not a `(` follows the `]`:
 
 ```ebnf
 typed-literal ::= named-type "{" [ member-init { "," member-init } [ "," ] ] "}"
+tag-literal   ::= named-type "." IDENT "{" [ expr ] "}"
 array-literal ::= array-type "{" [ expr { "," expr } [ "," ] ] "}"
 
 member-init ::= IDENT ":" expr | expr
               | "[" expr "]" [ ":" expr ]   (* accepted v5 case descriptor construction *)
 ```
 
-- `typed-literal` is a record, union, or tag literal: a named type
-  (optionally generic) followed by a brace-delimited initializer list.
-  For records and unions, each member is a `field: value` pair (`Point{ x: 1, y: 2 }`,
-  `Pair[i64, u8]{ left: 5, right: 6u8 }`).
-  For tags, exactly one case is initialized: either a bare case name for a payloadless
-  case (`Reply.empty{}`) or a named payload (`Reply.value{42}`).
+- `typed-literal` is a record or union literal: a named type (optionally
+  generic) followed by a brace-delimited initializer list, where each member is a
+  `field: value` pair (`Point{ x: 1, y: 2 }`, `Pair[i64, u8]{ left: 5, right: 6u8 }`).
   Numeric vector types use positional expressions, as in `f32x4{1.0, 2.0, 3.0, 4.0}`.
-  A bare identifier is interpreted after resolving the type, as a tag case or a
-  vector element expression. The accepted v5 descriptor forms `T{[case]: payload}`
-  and `T{[case]}` obey the same single-case rule after specialization.
-  The parser commits to this form via a lookahead
-  (`Name (.Name)* ([...])? {`).
+- `tag-literal` names the type, the case and the payload (`Reply.value{42}`,
+  `Reply.empty{}`, `res[i64, E].ok{42}`). The payload is positional and exactly
+  one; a payloadless case takes empty braces. The descriptor form `T.[case]{...}`
+  obeys the same single-case rule after specialization.
+  The parser commits to a literal via a lookahead
+  (`Name (.Name)* ([...])? (.Name)? {`); where the head reads as `A.b` the
+  resolver decides whether `b` is a case name or the final segment of a type path.
 - `array-literal` is `[N]T{ e0, e1, ... }`, an array type followed by a
   brace-delimited positional element list.
 
