@@ -10,7 +10,7 @@ There are **164 source modules and 1,806 public function declarations**, includi
 
 ## Accepted language contract
 
-`res[T, E]` has `ok: T` and `err: E`. `opt[T]` has `none` and `some: T`. The distinct `err[E]` has `ok` and `err: E`. Construction uses the explicit type, for example `res[usize, Error]{ok: n}`, `opt[usize]{none}` and `err[Error]{ok}`. Ordinary `tag` cases have no implicit success convention.
+`res[T, E]` has `ok: T` and `err: E`. `opt[T]` has `none` and `some: T`. The distinct `err[E]` has `ok` and `err: E`. Construction uses the explicit type, for example `res[usize, Error].ok{n}`, `opt[usize].none{}` and `err[Error].ok{}`. Ordinary `tag` cases have no implicit success convention.
 
 `err[E]` is an ordinary first-class type that can be stored, returned, passed and inspected. Only the success use of **`try` on `err`** is restricted to a direct expression statement. It is not an alias of `opt`, and it does not require optional generic arity on `res`.
 

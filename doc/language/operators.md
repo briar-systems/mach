@@ -61,10 +61,9 @@ variants, so no whole-value structural equality is provided. Write an explicit f
 comparison for records. Comparing pointers to aggregates is unaffected, and the rejection
 applies to a generic instantiated at an aggregate type as well as to a concrete one.
 
-For tagged values, `==` and `!=` are legal only when comparing a tag value against
-a case selector of its own type (`value == Reply.value` or `value != Reply.value`).
-This tests which case is active. It does not compare whole tags, compare payloads, or
-introduce ordering. See [tag.md](tag.md).
+For tagged values, `==` and `!=` are rejected entirely: there is no whole-tag
+equality, no payload equality and no ordering. Test which case is active with the
+`sel place.case` expression instead. See [tag.md](tag.md).
 
 ## Logical
 

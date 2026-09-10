@@ -50,7 +50,7 @@ every use in type position resolves to the vector instead:
 
 ```mach
 rec f32x3 { x: f32; }           # error: `f32x3` is spelled as a vector type
-tag f32x4 { empty; }            # error: `f32x4` is spelled as a vector type
+tag f32x4: u8 { empty; }            # error: `f32x4` is spelled as a vector type
 ```
 
 This holds for any well-formed spelling, so the name cannot be claimed by a type
@@ -297,7 +297,7 @@ A `tag` declaration introduces a named tagged value type that holds exactly one
 active case. A case may be payloadless or carry one explicitly typed payload:
 
 ```mach
-tag Reply {
+tag Reply: u8 {
     empty;
     value: i64;
 }
@@ -317,13 +317,12 @@ The case names `ok`, `err`, `some`, and `none` are contextual case names, not
 global keywords.
 
 Numeric vector spellings such as `f32x4` denote SIMD vector types and require
-full-lane initialization, whereas tag types use brace initialization with
-exactly one selected case (`Reply{empty}` or `res[i64, ParseError]{ok: 42}`).
+full-lane initialization, whereas a tag value names one case and its payload
+(`Reply.empty{}` or `res[i64, ParseError].ok{42}`).
 
-Accepted v5 contract. The accepted Mach v5 design specifies canonical tags, case
-selectors, and proof-required payload access. In the current compiler base, tag
-declaration parsing is landed, while canonical types and runtime support remain
-under active development. See [tag.md](tag.md) and [try.md](try.md).
+Accepted v5 contract. The accepted Mach v5 design specifies an explicit
+discriminator type, `Type.case{payload}` construction, `sel` case tests and
+payload places under a lexical guard. See [tag.md](tag.md).
 
 ## Type aliases
 

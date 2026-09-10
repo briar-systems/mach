@@ -25,9 +25,9 @@ larger expression requires explicit parentheses:
 
 ```mach
 val sum: i64 = (try parse(a) or (e: ParseError) {
-    ret res[i64, ParseError]{err: e};
+    ret res[i64, ParseError].err{e};
 }) + (try parse(b) or (e: ParseError) {
-    ret res[i64, ParseError]{err: e};
+    ret res[i64, ParseError].err{e};
 });
 ```
 
@@ -45,7 +45,7 @@ The `try` operator accepts only the three canonical tag types:
 - `err[E]` produces no value on `ok`, or binds error `E` on failure
 
 User-declared tags acquire no automatic `try` convention. Non-canonical tags use
-explicit case tests (`if (value == MyTag.case)`) instead.
+explicit case tests (`if (sel value.case)`) instead.
 
 ## Mandatory terminating failure blocks
 
@@ -66,9 +66,9 @@ ordinary, visible statements:
 ```mach
 fun increment(input: str) res[i64, ParseError] {
     val number: i64 = try parse(input) or (error: ParseError) {
-        ret res[i64, ParseError]{err: error};
+        ret res[i64, ParseError].err{error};
     };
-    ret res[i64, ParseError]{ok: number + 1};
+    ret res[i64, ParseError].ok{number + 1};
 }
 ```
 
@@ -82,9 +82,9 @@ Options carry no failure payload, so the failure block takes no binding:
 ```mach
 fun fetch_item(table: *Table, key: str) res[i64, TableError] {
     val index: usize = try lookup(table, key) or {
-        ret res[i64, TableError]{err: TableError{missing}};
+        ret res[i64, TableError].err{TableError.missing{}};
     };
-    ret res[i64, TableError]{ok: get_entry(table, index)};
+    ret res[i64, TableError].ok{get_entry(table, index)};
 }
 ```
 
@@ -109,27 +109,27 @@ produces no value. It is legal only as a direct expression statement. It cannot
 serve as a variable initializer, call argument, or arithmetic operand.
 
 ```mach
-pub tag WriteError {
+pub tag WriteError: u8 {
     denied;
     full;
 }
 
 pub fun flush() err[WriteError] {
     # standalone successful outcome
-    ret err[WriteError]{ok};
+    ret err[WriteError].ok{};
 }
 
 pub fun sync_disk() err[WriteError] {
     # statement try consuming flush
     try flush() or (error: WriteError) {
-        ret err[WriteError]{err: error};
+        ret err[WriteError].err{error};
     };
-    ret err[WriteError]{ok};
+    ret err[WriteError].ok{};
 }
 
 pub fun fail_flush() err[WriteError] {
     # standalone failure outcome
-    ret err[WriteError]{err: WriteError{denied}};
+    ret err[WriteError].err{WriteError.denied{}};
 }
 ```
 
@@ -148,7 +148,7 @@ remain in effect. `try` does not roll them back.
 
 ```mach
 consume(try parse(input) or (error: ParseError) {
-    ret res[i64, ParseError]{err: error};
+    ret res[i64, ParseError].err{error};
 }, later());
 ```
 

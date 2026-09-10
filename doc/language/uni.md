@@ -43,8 +43,8 @@ rules forbid. See [secrecy.md](secrecy.md).
 A `uni` is unchecked, raw memory. The compiler tracks neither which variant was
 written nor whether reading a variant is valid.
 
-For safe, discriminated values where the active case is tracked and payloads
-require proof before access, use `tag`. See [tag.md](tag.md).
+For safe, discriminated values where the selected case is stored and payload
+access requires a guard, use `tag`. See [tag.md](tag.md).
 
 Low-level systems code can still compose `rec` and `uni` manually when modeling
 foreign data structures, hardware registers, or wire formats:
@@ -62,7 +62,7 @@ Mach code, prefer first-class `tag` declarations.
 
 ## See also
 
-- [tag.md](tag.md) - checked tagged values with proof-guarded payload access
+- [tag.md](tag.md) - checked tagged values with guarded payload access
 - [rec.md](rec.md) - records and sequential aggregate layout
 - [statements.md](statements.md) - if/or chains for branching
 - [secrecy.md](secrecy.md) - secrecy agreement across overlapping variants
