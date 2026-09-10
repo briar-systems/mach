@@ -160,6 +160,11 @@ a payload does not pin a case or extend a lifetime. No borrow checker, proof
 analysis or runtime validator is introduced. A debug-profile discriminator trap
 on payload access is an open owner decision and not part of this contract.
 
+Assignment evaluates and captures its RHS before evaluating its destination,
+so a replacement initializer may read the old selected payload before
+overwriting it. Historical #469/#494 chose LHS-first. The accepted v5 rule is
+RHS-first and preserves the audited 4.30 behavior.
+
 Guards obey ordinary scoping. A guard opened in a loop body is re-established on
 every iteration by the chain that opens it. `fin` blocks and cleanup order are
 unchanged; an exit inside a guarded block follows the existing `fin` rules.
