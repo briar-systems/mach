@@ -8,6 +8,7 @@ use std.types.string.str_empty;
 use std.types.string.str_len;
 use std.types.string.str_join;
 use std.text.string.str_free;
+use std.text.string.str_dup;
 
 use A: std.allocator;
 use O: std.types.option;
@@ -22,6 +23,8 @@ use mach.lang.fe.resolve;
 use mach.lang.fe.sema;
 use mach.lang.fe.token;
 use mach.lang.build.request;
+use mach.lang.build.outcome;
+use mach.lang.diagnostic;
 use mach.lang.intern;
 use mach.lang.manifest;
 use mach.lang.me.ir;
@@ -177,8 +180,6 @@ pub rec ModuleEntry {
     sema_result:       *sema.SemaResult;
     ir_module:         *ir.Module;
     object_image:      *of.ObjectImage;
-    staged_ir:         *ir.Module;
-    staged_home:       *ir.ModuleHome;
     staged_image:      *of.ObjectImage;
     stable_id:         session.StableModuleId;
     target_gated:      bool;
@@ -215,6 +216,7 @@ pub rec Project {
     alloc:        *A.Allocator;
     req:          request.BuildRequest;
     queries:      query.QueryRuntime[Project];
+    diags:        diagnostic.DiagnosticStore;
     config:       ProjectConfig;
     target_entry: *TargetEntry;
     target:       target.Target;
@@ -257,6 +259,117 @@ pub rec Project {
     gate_tuple_index:   u32;
     in_gated_decl_walk: bool;
     gate_terminal:      bool;
+}
+
+pub fun begin_query_phase(p: *Project) R.Result[query.Operation, outcome.Fail] {
+    val reset: R.Result[R.Void, str] = session.reset_type_projection(p.s);
+    if (R.is_err[R.Void, str](reset)) {
+        ret R.err[query.Operation, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](reset)));
+    }
+    val begun: R.Result[query.Operation, str] = query.begin(?p.s.queries);
+    if (R.is_err[query.Operation, str](begun)) {
+        ret R.err[query.Operation, outcome.Fail](outcome.internal(R.unwrap_err[query.Operation, str](begun)));
+    }
+    ret R.ok[query.Operation, outcome.Fail](R.unwrap_ok[query.Operation, str](begun));
+}
+
+pub fun refresh_diagnostics(p: *Project) R.Result[R.Void, outcome.Fail] {
+    var staged: diagnostic.DiagnosticStore = diagnostic.store_init(p.s.alloc);
+    var copied: R.Result[R.Void, str] = diagnostic.replay_into(?staged, ?p.diags);
+    if (R.is_ok[R.Void, str](copied) && p.s.query_presentation != nil) {
+        copied = diagnostic.replay_into(?staged, ?p.s.query_presentation.diags);
+    }
+    if (R.is_err[R.Void, str](copied)) {
+        diagnostic.store_dnit(?staged);
+        ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](copied)));
+    }
+    diagnostic.store_dnit(?p.s.diags);
+    p.s.diags = staged;
+    ret R.ok_void[outcome.Fail]();
+}
+
+pub fun finish_query_phase(p: *Project, operation: query.Operation,
+                          roots: *query.QueryKey, count: usize,
+                          result: R.Result[R.Void, outcome.Fail]) R.Result[R.Void, outcome.Fail] {
+    val db: *query.QueryDb = ?p.s.queries;
+    val ended: R.Result[R.Void, fail.Fail] = query.end(db, operation);
+    var final_result: R.Result[R.Void, outcome.Fail] = result;
+    var operation_failure: bool = false;
+    var message: str = nil;
+    var lost: bool = false;
+    if (R.is_err[R.Void, fail.Fail](ended)) {
+        val failure: outcome.Fail = outcome.from_fail(R.unwrap_err[R.Void, fail.Fail](ended));
+        if (R.is_ok[R.Void, outcome.Fail](result)
+            || (failure.kind == outcome.FAIL_INTERNAL && R.unwrap_err[R.Void, outcome.Fail](result).kind != outcome.FAIL_INTERNAL)) {
+            final_result = R.err[R.Void, outcome.Fail](failure);
+            operation_failure = true;
+        }
+    }
+    if (!operation_failure && R.is_err[R.Void, outcome.Fail](result)) {
+        var failure: outcome.Fail = R.unwrap_err[R.Void, outcome.Fail](result);
+        if (failure.message != nil) {
+            val copied: R.Result[str, str] = str_dup(db.a, failure.message);
+            if (R.is_err[str, str](copied)) {
+                failure.message = R.unwrap_err[str, str](copied);
+                lost = true;
+            }
+            or {
+                message = R.unwrap_ok[str, str](copied);
+                failure.message = message;
+            }
+            final_result = R.err[R.Void, outcome.Fail](failure);
+        }
+    }
+
+    val collected: R.Result[*query.Presentation, str] = query.collect(db, operation, roots, count, p.s.alloc);
+    if (R.is_err[*query.Presentation, str](collected)) {
+        val taken: R.Result[str, str] = query.take_failure_message(db, operation);
+        if (R.is_ok[str, str](taken) && R.unwrap_ok[str, str](taken) != nil) {
+            if (operation_failure) { message = R.unwrap_ok[str, str](taken); }
+            or { str_free(db.a, R.unwrap_ok[str, str](taken)); }
+        }
+        or (R.is_err[str, str](taken)) { lost = true; }
+        val discarded: R.Result[R.Void, str] = query.discard(db, operation);
+        if (R.is_err[R.Void, str](discarded)) { lost = true; }
+        if (R.is_ok[R.Void, outcome.Fail](final_result)) {
+            final_result = R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[*query.Presentation, str](collected)));
+        }
+        lost = true;
+    }
+    or {
+        val presentation: *query.Presentation = R.unwrap_ok[*query.Presentation, str](collected);
+        if (p.s.query_presentation != nil) { query.presentation_dnit(p.s.query_presentation); }
+        p.s.query_presentation = presentation;
+        val refreshed: R.Result[R.Void, outcome.Fail] = refresh_diagnostics(p);
+        if (R.is_err[R.Void, outcome.Fail](refreshed)) {
+            if (R.is_ok[R.Void, outcome.Fail](final_result)) { final_result = refreshed; }
+            lost = true;
+        }
+    }
+    if (p.s.query_failure_message != nil) { str_free(db.a, p.s.query_failure_message); }
+    p.s.query_failure_message = message;
+    if (lost) {
+        diagnostic.note_lost(?p.diags);
+        diagnostic.note_lost(?p.s.diags);
+    }
+    if (R.is_err[R.Void, fail.Fail](ended)) {
+        var i: u32 = 0;
+        for (i < p.module_len) {
+            val m: *ModuleEntry = ?p.modules[i];
+            m.a = nil;
+            m.resolve_result = nil;
+            m.sema_result = nil;
+            m.ir_module = nil;
+            m.object_image = nil;
+            i = i + 1;
+        }
+        i = 0;
+        for (i < p.s.module_ast_count) { p.s.module_asts[i] = nil; i = i + 1; }
+        map.clear[session.ModuleId, ptr](?p.s.module_resolve);
+        map.clear[session.ModuleId, ptr](?p.s.module_sema);
+        map.clear[session.ModuleId, ptr](?p.s.module_comptime);
+    }
+    ret final_result;
 }
 
 pub fun span_eq_str(source: str, span: token.Span, s: str) bool {
@@ -362,18 +475,23 @@ pub fun dnit_project(p: *Project) {
         A.deallocate[intern.StrId](p.alloc, p.union_entries, p.union_entry_count::usize);
     }
     map.dnit[intern.StrId, session.ModuleId](?p.by_fqn);
+    diagnostic.store_dnit(?p.diags);
     deallocate_config(?p.config, p.alloc);
 
     session.reset_module_registry(p.s);
 }
 
 pub fun init_project(p: *Project, s: *session.Session) {
+    if (s.query_presentation != nil) { query.presentation_dnit(s.query_presentation); s.query_presentation = nil; }
+    if (s.query_failure_message != nil) { str_free(s.queries.a, s.query_failure_message); s.query_failure_message = nil; }
+    diagnostic.store_dnit(?s.diags);
+    s.diags = diagnostic.store_init(s.alloc);
     p.s             = s;
     p.alloc         = s.build_alloc;
     p.req           = request.defaults();
     p.queries.db    = nil;
-    p.queries.diags = nil;
     p.queries.caps.compute = nil;
+    p.diags         = diagnostic.store_init(p.alloc);
     p.target_entry  = nil;
     p.union              = false;
     p.union_tuples       = nil;
