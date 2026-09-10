@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fetching dependencies or building. Check mode is read only, and file replacement
   uses held-root publication while preserving exact POSIX permission bits.
 
+### Changed
+
+- rename `sel` identifiers ahead of the v5 keyword (#3219)
+
 ### Removed
 
 - Implicit dependency public entries. Bare imports require an explicitly defaulted
