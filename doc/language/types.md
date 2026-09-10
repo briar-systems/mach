@@ -50,7 +50,7 @@ every use in type position resolves to the vector instead:
 
 ```mach
 rec f32x3 { x: f32; }           # error: `f32x3` is spelled as a vector type
-tag f32x4 { empty; }            # error: `f32x4` is spelled as a vector type
+tag f32x4: u8 { empty; }            # error: `f32x4` is spelled as a vector type
 ```
 
 This holds for any well-formed spelling, so the name cannot be claimed by a type
@@ -297,7 +297,7 @@ A `tag` declaration introduces a named tagged value type that holds exactly one
 active case. A case may be payloadless or carry one explicitly typed payload:
 
 ```mach
-tag Reply {
+tag Reply: u8 {
     empty;
     value: i64;
 }

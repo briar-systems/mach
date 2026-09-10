@@ -109,7 +109,7 @@ produces no value. It is legal only as a direct expression statement. It cannot
 serve as a variable initializer, call argument, or arithmetic operand.
 
 ```mach
-pub tag WriteError {
+pub tag WriteError: u8 {
     denied;
     full;
 }
