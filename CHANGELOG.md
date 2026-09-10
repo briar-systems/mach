@@ -40,6 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Dotted import, re-export and type names resolve identically with spacing or comments around dots. Diagnostics retain the original source spans (#3229).
+
+- Unresolved imports report at their own source coordinates instead of an unlocated message. Internal load failures stay internal instead of collapsing into a user rejection (#3229).
+
 - Relocatable linking preserves native section identities, symbol definitions,
   import declarations and relocation relations instead of applying final-image
   section merging. ELF groups, Mach-O indirect symbols and difference relocations,
@@ -86,7 +90,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values or successful cached lowering products. Nonnumeric equal-size casts retain
   their representation in both constant evaluation and runtime lowering.
 
-- Dotted import, re-export and type names resolve identically with spacing or comments around dots. Diagnostics retain the original source spans.
 - Embedded files are read through held directory and file handles. Escaping paths
   and symlinks are rejected before reading, and failed refreshes preserve cache
   ownership and the prior query input.

@@ -9,9 +9,15 @@ import tempfile
 
 
 census = runpy.run_path(str(Path(__file__).with_name('census.py')))['census']
+# (name, compiler source, std pin, mode). 'single' stages are one-way bridges built
+# once by the previous compiler. 'fixpoint' stages build A, B and C and require B == C.
+# the transition bridge is f2569491's source with the pre-suffix manifest of 52a53af8:
+# it parses under 4.30, implements the v5 manifest, and cannot rebuild itself against
+# a published std, so it is one-way. it lives on branch bootstrap/v5-transition.
 STAGES = [
-    ('bridge', '878a8f66a90127360dc23de4480241934fc1bf0d', '3ee8e709a8ed7baff6e93780ce9b3582a907a91f'),
-    ('audited', 'b65afb9704218e89998af5f71050ca315e7709a9', '168a9f760d7c0f7a182f3b0685081e62f1a4f682'),
+    ('bridge', '878a8f66a90127360dc23de4480241934fc1bf0d', '3ee8e709a8ed7baff6e93780ce9b3582a907a91f', 'single'),
+    ('audited', 'b65afb9704218e89998af5f71050ca315e7709a9', '168a9f760d7c0f7a182f3b0685081e62f1a4f682', 'fixpoint'),
+    ('transition', 'cd283ceeae8deb1ffbe760980f2d1db3ef22a7ac', '168a9f760d7c0f7a182f3b0685081e62f1a4f682', 'single'),
 ]
 
 
@@ -32,6 +38,15 @@ def run(label, command, source, evidence):
         raise RuntimeError(label + ' failed with exit ' + str(result.returncode))
 
 
+def required_stage():
+    # the source tree names the chain stage that compiles it; absent means the audited compiler
+    marker = Path('.mach-bootstrap')
+    name = marker.read_text(encoding='utf-8').strip() if marker.exists() else 'audited'
+    if name not in [stage[0] for stage in STAGES] or name == 'bridge':
+        raise ValueError('.mach-bootstrap names an unknown stage: ' + name)
+    return name
+
+
 def main():
     destination = Path('.mach-toolchain').resolve()
     evidence = destination / 'evidence'
@@ -44,11 +59,14 @@ def main():
         raise ValueError('bootstrap requires the published v4.26.5 seed')
     for name in ['release.json', 'SHA256SUMS', 'provenance.json']:
         shutil.copy2(seed_dir / name, evidence / ('seed-' + name))
-    provenance = dict(seed=seed, seed_sha256=digest(compiler), profile='debug', stages=[], fixpoint=False)
+    last = required_stage()
+    provenance = dict(seed=seed, seed_sha256=digest(compiler), profile='debug', required=last, stages=[], fixpoint=False)
     record = evidence / 'provenance.json'
     record.write_text(json.dumps(provenance, indent=2), encoding='utf-8')
     with tempfile.TemporaryDirectory(prefix='mach-bootstrap-', dir=os.environ.get('RUNNER_TEMP')) as scratch:
-        for name, source_ref, std_ref in STAGES:
+        for name, source_ref, std_ref, mode in STAGES:
+            if STAGES.index((name, source_ref, std_ref, mode)) > [stage[0] for stage in STAGES].index(last):
+                break
             source = Path(scratch) / name
             subprocess.run(['git', 'clone', '--quiet', 'https://github.com/briar-systems/mach', str(source)], check=True)
             subprocess.run(['git', 'checkout', '--detach', source_ref], cwd=source, check=True)
@@ -57,16 +75,16 @@ def main():
                 raise RuntimeError('bootstrap source differs from its committed pins')
             stage = dict(name=name, compiler=source_ref, std=std_ref, binaries={})
             provenance['stages'].append(stage)
-            for letter in (['H'] if name == 'bridge' else ['A', 'B', 'C']):
+            for letter in (['H'] if mode == 'single' else ['A', 'B', 'C']):
                 output = source / ('m' + letter + suffix)
                 run(name + '-' + letter, [str(compiler), 'build', '.', '--profile', 'debug', '-o', output.name], source, evidence)
                 stage['binaries'][letter] = digest(output)
                 compiler = output
                 record.write_text(json.dumps(provenance, indent=2), encoding='utf-8')
-            if name == 'audited':
+            if mode == 'fixpoint':
                 compiler = source / ('mB' + suffix)
                 if compiler.read_bytes() != (source / ('mC' + suffix)).read_bytes():
-                    raise RuntimeError('audited compiler B and C differ')
+                    raise RuntimeError(name + ' compiler B and C differ')
                 stage['fixpoint'] = True
             for checkout in [source, source / 'dep/std']:
                 if git(checkout, 'status', '--porcelain', '--untracked-files=no'):
@@ -74,7 +92,7 @@ def main():
         census('bootstrap-complete', evidence)
         installed = destination / ('mach' + suffix)
         shutil.copy2(compiler, installed)
-        provenance.update(fixpoint=True, sha256=digest(installed))
+        provenance.update(fixpoint=all(stage.get('fixpoint', False) for stage in provenance['stages'] if stage['name'] == 'audited'), sha256=digest(installed))
         record.write_text(json.dumps(provenance, indent=2), encoding='utf-8')
         with Path(os.environ['GITHUB_PATH']).open('a', encoding='utf-8') as output:
             output.write(str(destination) + '\n')
