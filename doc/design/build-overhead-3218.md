@@ -124,3 +124,79 @@ owned by the builder for the duration of the build and freed with it.
 
 `read_typed_surface` calls: 1811 -> 1064. `remap_result` still entered 12007 times but
 returns at the census check.
+
+## Step 4: second pass, verification, and what remains
+
+Compilers for this step were all built from this branch by the v5-integration
+bootstrap on 2026-09-10 (`base` is 60c2c479, fixes A+B; `fixc` adds fix C), plus the
+merge base a4107eb4 rebuilt at release by the installed seed (`BR`). Host load
+average 7 to 12 throughout from concurrent workers; every row is 3 repetitions in
+alternation, spreads stated where they exceed 10%.
+
+Review of the interrupted worker's uncommitted edits:
+
+- Fix C, `cache.compiler.digest` memo: kept. Every build unit begins a fresh
+  `Project` (`engine.execute_warm` -> `driver.begin_build` -> `init_project`), which
+  resets `compiler_identity_initialized`, so an N-unit process hashed the executable
+  N times. The running image cannot change under a live process, and the digest is
+  only requested from the operation setup on the main thread, so one hash per process
+  is the same value every time. Proven by strace on a 3-artifact freestanding
+  project: `/proc/self/exe` opened 3 times by `base`, once by `fixc`.
+- Fix D, `ResolveResult.definition_index` replacing the linear scan in
+  `acquire_symbol`: dropped. The scan runs 9134 times on the `one` build (gdb), but
+  the timing cannot separate it from noise: sema is 93 to 100 ms for `base`, `fixc`
+  and a `fixd` build alike at o0, 65 to 80 ms at release. A fix whose reversal
+  restores no cost has no mutation control; it also adds a map to every resolve
+  product. The patch is preserved on commit fe56b9ad for the day a profile shows it.
+
+Fix C numbers. Single-unit builds are unchanged by construction (`one` o0 debug:
+`base` 825/827/852 ms, `fixc` 830/845/853 ms; release 570/583/591 vs 595/604/609;
+`nostd` 283 to 305 ms both). The 91-artifact corpus project built by one process
+(`corpus91`, o0, debug compiler):
+
+| compiler | run0 | run1 | run2 | median |
+|---|---|---|---|---|
+| base | 100878 | 106755 | 112345 | 106755 (spread 11%) |
+| fixc | 81290 | 75793 | 75421 | 75793 (spread 8%) |
+
+The 25 to 31 s recovered is 90 digests at 275 ms each. Reverting fix C is the `base`
+row. The real corpus driver (`test/run.sh`) spawns one `mach build --bin` per case,
+so it still pays the digest 91 times; that is finding 2, below.
+
+Suite: `mach test . --jobs 8` with the fix-C debug compiler passes 2799 of 2799;
+`base` passes 2798 of 2798. The delta is the one added test, which proves the memo
+by perturbing it: with the memo branch disabled that test fails and nothing else
+changes.
+
+Matched-profile regression that remains (release compilers, `one`, median of 3, ms):
+
+| project | profile | BR | fixc | ratio | where |
+|---|---|---|---|---|---|
+| one | o0 | 269 | 636 | 2.4x | sema 23->69, lower 58->121, codegen 66->271, resolve 15->25, link 7->17 |
+| one | o2 | 526 | 834 | 1.6x | same phases; optimize equal |
+| nostd | o0 | 7 | 159 | 23x | codegen: the executable digest |
+
+Was 2.8x / 1.9x at step 1. Of the codegen delta on `one`, about 150 ms is the
+digest plus cache store and about 55 ms is per module. Warm second build with the
+object cache populated (`fixc`, o0, 3 reps): debug 861 to 882 cold -> 778 to 829
+warm, release 572 to 595 -> 509 to 524; only the object compile (about 70 ms of
+codegen) is recovered, the digest and the per-module sema/lower costs are not.
+
+Handed to F4/R2, not optimized here because each is the cost of an accepted contract:
+
+1. Per-invocation executable digest, 139 ms release / 275 ms debug, every process.
+   The cache key is the content of the running compiler, and content hashing 13 to
+   18 MB with the pure-mach std sha256 (46 / 130 MB/s) is what that costs. Ways out
+   all change a contract or a layer: a linker-emitted build id (ELF note, LC_UUID, PE
+   debug directory) read from the running image with a full-hash fallback when the
+   note is absent; a digest sidecar keyed by file identity (device, inode, size,
+   mtime, ctime); a faster hash in std. The 91-process corpus lane pays this 91
+   times per target.
+2. Per-module-loaded cost from d9373679 (owned products, transitive validation):
+   `typed_surface_decode`, `constant_decode` and `verify_function` over the 40 std
+   modules, about 46 ms sema + 64 ms lower + 55 ms codegen + 20 ms resolve/link at
+   release for `one`. Decoding an owned copy per consumer and verifying every lowered
+   function are the contract; fixes A and B removed the part that was repeated.
+3. The warm cache recovers only the object compile. A hit still decodes, lowers and
+   verifies every module; whether the cache should also carry the front-end products
+   is a design question for the query engine, not a redundancy.
