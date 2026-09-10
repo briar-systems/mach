@@ -318,7 +318,7 @@ global keywords.
 
 Numeric vector spellings such as `f32x4` denote SIMD vector types and require
 full-lane initialization, whereas tag types use brace initialization with
-exactly one selected case (`Reply{empty}` or `res[i64, ParseError]{ok: 42}`).
+exactly one selected case (`Reply.empty{}` or `res[i64, ParseError].ok{42}`).
 
 Accepted v5 contract. The accepted Mach v5 design specifies canonical tags, case
 selectors, and proof-required payload access. In the current compiler base, tag

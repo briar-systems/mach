@@ -66,16 +66,16 @@ pub tag Entry: u8 {
 A tag literal names the type and initializes exactly one case in braces:
 
 ```mach
-val empty_reply: Reply = Reply{empty};
-val num_reply:   Reply = Reply{value: 42};
+val empty_reply: Reply = Reply.empty{};
+val num_reply:   Reply = Reply.value{42};
 ```
 
 Brace initialization requires selecting exactly one case:
 
 - Selecting no cases (`Reply{}`) is a compile error
 - Selecting multiple cases (`Reply{empty, value: 42}`) is a compile error
-- Omitting a payload on a payload-bearing case (`Reply{value}`) is a compile error
-- Supplying a payload to a payloadless case (`Reply{empty: 1}`) is a compile error
+- Omitting a payload on a payload-bearing case (`Reply.value{}`) is a compile error
+- Supplying a payload to a payloadless case (`Reply.empty{1}`) is a compile error
 
 Unlike vector literals such as `f32x4{1.0, 2.0, 3.0, 4.0}`, which require one
 positional initializer for every vector lane, a tag literal specifies only the
@@ -103,14 +103,14 @@ The `err[E]` form is distinct from `opt[E]` and is not an alias. Mach has no
 dummy success type, unit type, or general type argument inference.
 
 ```mach
-val good: res[i64, ParseError] = res[i64, ParseError]{ok: 42};
-val bad:  res[i64, ParseError] = res[i64, ParseError]{err: ParseError{invalid}};
+val good: res[i64, ParseError] = res[i64, ParseError].ok{42};
+val bad:  res[i64, ParseError] = res[i64, ParseError].err{ParseError.invalid{}};
 
-val present: opt[i64] = opt[i64]{some: 42};
-val absent:  opt[i64] = opt[i64]{none};
+val present: opt[i64] = opt[i64].some{42};
+val absent:  opt[i64] = opt[i64].none{};
 
-val finished: err[ParseError] = err[ParseError]{ok};
-val failed:   err[ParseError] = err[ParseError]{err: ParseError{overflow}};
+val finished: err[ParseError] = err[ParseError].ok{};
+val failed:   err[ParseError] = err[ParseError].err{ParseError.overflow{}};
 ```
 
 Default initialization of `opt[T]` selects `none`. Default initialization of

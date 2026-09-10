@@ -144,7 +144,7 @@ direct expression statement:
 
 ```mach
 try flush() or (error: WriteError) {
-    ret err[WriteError]{err: error};
+    ret err[WriteError].err{error};
 };
 ```
 
