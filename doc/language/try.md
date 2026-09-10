@@ -25,9 +25,9 @@ larger expression requires explicit parentheses:
 
 ```mach
 val sum: i64 = (try parse(a) or (e: ParseError) {
-    ret res[i64, ParseError]{err: e};
+    ret res[i64, ParseError].err{e};
 }) + (try parse(b) or (e: ParseError) {
-    ret res[i64, ParseError]{err: e};
+    ret res[i64, ParseError].err{e};
 });
 ```
 
@@ -66,9 +66,9 @@ ordinary, visible statements:
 ```mach
 fun increment(input: str) res[i64, ParseError] {
     val number: i64 = try parse(input) or (error: ParseError) {
-        ret res[i64, ParseError]{err: error};
+        ret res[i64, ParseError].err{error};
     };
-    ret res[i64, ParseError]{ok: number + 1};
+    ret res[i64, ParseError].ok{number + 1};
 }
 ```
 
@@ -82,9 +82,9 @@ Options carry no failure payload, so the failure block takes no binding:
 ```mach
 fun fetch_item(table: *Table, key: str) res[i64, TableError] {
     val index: usize = try lookup(table, key) or {
-        ret res[i64, TableError]{err: TableError{missing}};
+        ret res[i64, TableError].err{TableError.missing{}};
     };
-    ret res[i64, TableError]{ok: get_entry(table, index)};
+    ret res[i64, TableError].ok{get_entry(table, index)};
 }
 ```
 
@@ -116,20 +116,20 @@ pub tag WriteError: u8 {
 
 pub fun flush() err[WriteError] {
     # standalone successful outcome
-    ret err[WriteError]{ok};
+    ret err[WriteError].ok{};
 }
 
 pub fun sync_disk() err[WriteError] {
     # statement try consuming flush
     try flush() or (error: WriteError) {
-        ret err[WriteError]{err: error};
+        ret err[WriteError].err{error};
     };
-    ret err[WriteError]{ok};
+    ret err[WriteError].ok{};
 }
 
 pub fun fail_flush() err[WriteError] {
     # standalone failure outcome
-    ret err[WriteError]{err: WriteError{denied}};
+    ret err[WriteError].err{WriteError.denied{}};
 }
 ```
 
@@ -148,7 +148,7 @@ remain in effect. `try` does not roll them back.
 
 ```mach
 consume(try parse(input) or (error: ParseError) {
-    ret res[i64, ParseError]{err: error};
+    ret res[i64, ParseError].err{error};
 }, later());
 ```
 

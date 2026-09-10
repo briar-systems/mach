@@ -604,7 +604,7 @@ member-init ::= IDENT ":" expr | expr
   For records and unions, each member is a `field: value` pair (`Point{ x: 1, y: 2 }`,
   `Pair[i64, u8]{ left: 5, right: 6u8 }`).
   For tags, exactly one case is initialized: either a bare case name for a payloadless
-  case (`Reply{empty}`) or a named payload (`Reply{value: 42}`).
+  case (`Reply.empty{}`) or a named payload (`Reply.value{42}`).
   Numeric vector types use positional expressions, as in `f32x4{1.0, 2.0, 3.0, 4.0}`.
   A bare identifier is interpreted after resolving the type, as a tag case or a
   vector element expression. The accepted v5 descriptor forms `T{[case]: payload}`

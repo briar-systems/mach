@@ -36,10 +36,10 @@ val p:    Point             = Point{ x: 1, y: 2 };
 val a:    [3]i64            = [3]i64{10, 20, 30};
 val u:    Number            = Number{ i: 99 };
 val pair: Pair[i64, u8]     = Pair[i64, u8]{ left: 5, right: 6u8 };
-val rep0: Reply             = Reply{empty};
-val rep1: Reply             = Reply{value: 42};
-val good: res[i64, MyErr]   = res[i64, MyErr]{ok: 42};
-val done: err[MyErr]        = err[MyErr]{ok};
+val rep0: Reply             = Reply.empty{};
+val rep1: Reply             = Reply.value{42};
+val good: res[i64, MyErr]   = res[i64, MyErr].ok{42};
+val done: err[MyErr]        = err[MyErr].ok{};
 ```
 
 For generics, the type arguments appear in brackets before the body.
@@ -76,7 +76,7 @@ A `try` expression performs explicit, visible failure handling for canonical
 
 ```mach
 val number: i64 = try parse(input) or (error: ParseError) {
-    ret res[i64, ParseError]{err: error};
+    ret res[i64, ParseError].err{error};
 };
 ```
 
