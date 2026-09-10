@@ -539,12 +539,12 @@ Accessing `case.type` or `case.offset` on a descriptor whose `has_payload` is fa
 is a compile error. `case.type` preserves all declared payload qualifiers.
 `$is_tag(^T)` is false, and `$cases(^T)` is rejected.
 
-Inside the loop body, `T.[case]` denotes the case selector, and `v.[case]`
-projects the payload under proof checking:
+Inside the loop body, `sel value.[case]` is the case test and `value.[case]` is
+the guarded payload place:
 
 ```mach
 $each case in $cases(T) {
-    if (value == T.[case]) {
+    if (sel value.[case]) {
         $if (case.has_payload) {
             consume[case.type](value.[case]);
         }

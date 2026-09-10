@@ -7,11 +7,11 @@ or no payload at all.
 ## Implementation status
 
 The features described on this page represent the accepted Mach v5 contract
-specified in [the tagged value design](../design/tagged-values.md). At base
-commit `fc5c9e7e`, tag parsing, declaration and constructor type checking, checked
-layout, `$is_tag`, and documentation comment validation are implemented.
-Canonical types, proof-based payload tracking, and code generation remain in
-progress.
+specified in [the tagged value design](../design/tagged-values.md). Declarations
+with an explicit discriminator, `Type.case{payload}` construction, `sel` case
+tests, function-scope `def`, checked layout, `$is_tag` and `$discriminant_of`
+are implemented. Lexical payload guards, `$cases` and the debug discriminator
+trap remain in progress; until guards land, every payload access is rejected.
 
 ## Grammar
 
@@ -63,23 +63,24 @@ pub tag Entry: u8 {
 
 ## Construction and initialization
 
-A tag literal names the type and initializes exactly one case in braces:
+A tag value is constructed by naming the type, the case and the payload:
 
 ```mach
 val empty_reply: Reply = Reply.empty{};
 val num_reply:   Reply = Reply.value{42};
 ```
 
-Brace initialization requires selecting exactly one case:
+The payload is positional because a case carries exactly one, and a payloadless
+case takes empty braces. There is no other construction form:
 
-- Selecting no cases (`Reply{}`) is a compile error
-- Selecting multiple cases (`Reply{empty, value: 42}`) is a compile error
 - Omitting a payload on a payload-bearing case (`Reply.value{}`) is a compile error
 - Supplying a payload to a payloadless case (`Reply.empty{1}`) is a compile error
+- Supplying more than one payload (`Reply.value{1, 2}`) is a compile error
+- Naming the payload (`Reply.value{value: 1}`) is a compile error
+- The record-literal form (`Reply{value: 1}` or `Reply{empty}`) is a compile error
+- A case selector alone (`Reply.value`) is not a value
 
-Unlike vector literals such as `f32x4{1.0, 2.0, 3.0, 4.0}`, which require one
-positional initializer for every vector lane, a tag literal specifies only the
-single active case.
+Whole-value assignment replaces the selected case and payload together.
 
 ### Default initialization
 
@@ -119,92 +120,68 @@ both `res[T, E]` and `err[E]` selects `err` with a zero-initialized error payloa
 The case names `ok`, `err`, `some`, and `none` are contextual members within
 their respective tags. They are not global keywords.
 
-## Case selectors and testing
+## Case tests
 
-A case selector is written `TypeName.case`:
-
-```mach
-Reply.empty
-Reply.value
-```
-
-A selector denotes a case identity, not a value. It cannot be stored in a
-variable or passed as a function argument.
-
-Comparing a tag value with a selector using `==` or `!=` tests which case is
-currently active:
+`sel place.case` is a boolean expression that is true when `place` currently
+holds `case`. It reads only the discriminator, never a payload, and has no side
+effects.
 
 ```mach
-if (reply == Reply.value) {
-    # reply has case value active here
+if (sel reply.value) {
+    # reply holds value here
 }
 or {
-    # reply has case empty active here
+    # reply holds empty here
 }
 ```
 
-Whole-tag equality (`a == b`) is a compile error, as is whole-tag inequality.
-Selector comparisons test only the active case code and do not compare or order
-payload values.
+The operand is a place: a binding, a field, an index or a dereference, followed
+by exactly one case name of that place's tag type. A call or other temporary is
+not a place. The result is an ordinary `bool`, so it composes with `!`, `&&` and
+`||`, can initialize a `bool` binding, and can be returned.
 
-## Proof-required payload access
+```mach
+val done: bool = sel reply.value;
+if (!sel next.some) { brk; }
+if (sel a.ok && sel b.ok) { }
+```
 
-Reading a payload requires a current proof that the corresponding case is active.
-The compiler tracks active proofs along control flow paths:
+`sel` is a keyword. Comparing a tag with `==`, whole-tag equality, payload
+equality, ordering, a `.kind` field and a `match` construct do not exist. An
+outer-secret `^Tag` protects the selected case as well as the payload, so `sel`
+refuses one.
 
-- Constructing a tag establishes proof of that case
-- Testing `value == TagName.case` establishes proof inside the true branch
-- Testing `value != TagName.case` excludes that case in the true branch and proves that case in the false branch
-- Excluding a case proves another specific case only when it is the sole remaining possibility
-- Branch joins retain only proofs that hold on every incoming path
+## Payload places and guards
+
+`value.case` is a payload place. Reading it, writing it and taking its address
+are legal only inside a guard for that place and case. A guard is a lexical
+region, not a flow fact: a chain arm whose condition is exactly `sel P.c` guards
+`P.c` inside its block, and a chain whose every arm exits guards the remainder
+of the enclosing block for the case the chain left untested.
 
 ```mach
 fun read_value(reply: Reply) i64 {
-    if (reply == Reply.value) {
-        ret reply.value;    # valid because the branch proved reply is Reply.value
+    if (sel reply.value) {
+        ret reply.value;    # guarded by the arm condition
     }
     ret 0;
 }
 ```
 
-Attempting to read `reply.value` without an active proof is a compile error.
+Inside a condition, the right operand of `&&` is guarded by a `sel P.c` that is
+its left operand, because `&&` short-circuits. `||`, `!` and every other
+operator open no guard.
 
-Assigning to a payload (`reply.value = 100`) requires an active proof of that
-case and does not alter the selected case. Whole-value assignment changes the
-active case and invalidates prior proofs.
+Inside a guard the payload place is ordinary storage: reading it copies under
+the existing value rules, writing it keeps the selected case, and `?value.case`
+yields a typed pointer to naturally aligned storage. Whole-value assignment to
+the guarded place is a compile error; rebind to a new name instead.
 
-## Mutation and alias invalidation
-
-A write through a possibly overlapping mutable alias, or a call that can modify
-the tested tag, invalidates active proofs for that tag.
-
-```mach
-fun inspect(reply: *Reply) i64 {
-    if (@reply == Reply.value) {
-        replace(reply);
-        ret reply.value;    # rejected because the call invalidated the proof
-    }
-    ret 0;
-}
-```
-
-An immutable value snapshot owns independent storage and preserves its proof:
-
-```mach
-fun snapshot(reply: *Reply) i64 {
-    val saved: Reply = @reply;
-    if (saved == Reply.value) {
-        replace(reply);
-        ret saved.value;    # accepted because saved is an independent value
-    }
-    ret 0;
-}
-```
-
-Taking the address of a payload (`?value.case`) requires an active proof and a
-naturally aligned payload place. The resulting raw pointer remains valid only
-while the tag lives and retains that case. It does not pin the case or extend
-object lifetime.
+A payload read whose case is no longer selected is undefined behavior of the
+same class as a stale pointer read. A raw pointer to a payload does not pin a
+case or extend a lifetime. There is no borrow checker, proof analysis or runtime
+validator. In the debug profile only, each guarded payload access compares the
+discriminator and traps on mismatch.
 
 ## Failure handling
 
@@ -276,7 +253,7 @@ error.
 
 ```mach
 $each case in $cases(T) {
-    if (value == T.[case]) {
+    if (sel value.[case]) {
         $if (case.has_payload) {
             consume[case.type](value.[case]);
         }
@@ -284,8 +261,9 @@ $each case in $cases(T) {
 }
 ```
 
-`T.[case]` denotes the case selector, and `value.[case]` provides the
-proof-checked payload projection.
+`sel value.[case]` is the case test, `value.[case]` is the guarded payload
+place, and `T.[case]{payload}` constructs through the same single-case rule
+after specialization.
 
 ## See also
 

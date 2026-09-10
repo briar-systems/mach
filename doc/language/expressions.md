@@ -44,9 +44,10 @@ val done: err[MyErr]        = err[MyErr].ok{};
 
 For generics, the type arguments appear in brackets before the body.
 
-A tag literal requires selecting exactly one case. Selecting zero cases, selecting
-multiple cases, omitting a required payload, or supplying a payload to a
-payloadless case is a compile error.
+A tag value names its type and its case, and carries a positional payload only
+when the case declares one. Omitting a required payload, supplying a payload to a
+payloadless case, supplying more than one, naming the payload, or using the
+withdrawn record-literal form is a compile error.
 
 Vector literals (`f32x4{ 1.0, 2.0, 3.0, 4.0 }`) follow the same brace shape, but
 require one positional initializer per lane. See [types.md](types.md#simd-vectors).
@@ -64,10 +65,11 @@ length, such as a fixed array length `N` or a vector lane count. See
 
 For tagged values:
 
-- `TypeName.case` is a case selector used in comparisons. It is not a value and cannot be stored or passed.
-- `tag_val.case` accesses the payload of that case. It requires a current compiler proof that the case is active. Reading an unproved payload is a compile error.
+- `sel tag_val.case` tests whether that case is currently selected. It reads only the discriminator and is an ordinary `bool`.
+- `tag_val.case` accesses the payload of that case. It is legal only inside a lexical guard for that place and case; an unguarded payload access is a compile error.
+- `TypeName.case` alone is a case selector, not a value. It cannot be stored or passed.
 
-See [tag.md](tag.md) for proof tracking and alias invalidation rules.
+See [tag.md](tag.md) for the guard rules.
 
 ## `try` expressions
 
