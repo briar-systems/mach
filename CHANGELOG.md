@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Name resolution reports one phase row per build. A deferred comptime gate no
+  longer makes the resolver report every module again for each pass it takes,
+  and each module's resolve time is accumulated across those passes (#3231).
+
 - Dotted import, re-export and type names resolve identically with spacing or comments around dots. Diagnostics retain the original source spans (#3229).
 
 - Unresolved imports report at their own source coordinates instead of an unlocated message. Internal load failures stay internal instead of collapsing into a user rejection (#3229).
