@@ -24,21 +24,21 @@ if (cond) {
 - A trailing `or { ... }` is the catch-all.
 - Bodies are blocks; there is no one-statement-without-braces form.
 
-Testing a tagged value against a case selector in an `if`/`or` condition refines
-active proofs for that tag inside each branch:
+An `if`/`or` arm whose condition is exactly `sel P.c` guards the payload place
+`P.c` inside its block:
 
 ```mach
-if (reply == Reply.value) {
-    val number: i64 = reply.value;  # valid because value is proved active here
+if (sel reply.value) {
+    val number: i64 = reply.value;  # guarded by the arm condition
 }
 or {
-    # reply is empty on this path
+    # reply holds empty on this path
 }
 ```
 
-Joining branches preserves only proofs that hold on every incoming path. Prior
-proofs are invalidated if the tag is overwritten, modified through an alias, or
-passed to a mutating call. See [tag.md](tag.md).
+A guard is a lexical region, not a flow fact. A chain whose every arm exits
+guards the remainder of the enclosing block for the case the chain left
+untested. See [tag.md](tag.md).
 
 ## `for`
 
@@ -144,7 +144,7 @@ direct expression statement:
 
 ```mach
 try flush() or (error: WriteError) {
-    ret err[WriteError]{err: error};
+    ret err[WriteError].err{error};
 };
 ```
 
