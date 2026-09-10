@@ -8,8 +8,9 @@ and secrecy contracts are carried forward unchanged.
 
 The language surface is five things: `tag` declarations with an explicit
 discriminator, `Type.case{...}` construction, `value.case` payload places under
-a lexical guard, `sel` as the case test, and `def` at function scope. None of
-them is flow-sensitive.
+a lexical guard, and `sel` as the case test. None of them is flow-sensitive.
+Function-scope `def` was considered and withdrawn on 2026-09-10 as cosmetic;
+module-scope `def` is unchanged and may alias any tag type.
 
 ## Types and declaration
 
@@ -46,13 +47,9 @@ pub tag opt[T]: u8    { none; some: T; }
 pub tag err[E]: u8    { err: E; ok; }
 ```
 
-`def` is accepted at function scope with its existing form. A local alias is
-visible from its declaration to the end of the enclosing block.
-
 ```mach
 fun flush() err[WriteError] {
-    def E: err[WriteError];
-    ret E.ok{};
+    ret err[WriteError].ok{};
 }
 ```
 
@@ -63,7 +60,7 @@ literal braces. The payload is positional because a case has exactly one. A
 payloadless case takes empty braces. There is no other construction form.
 
 ```mach
-def R: res[i64, ParseError];
+def R: res[i64, ParseError];   # module scope
 
 val empty: Reply = Reply.empty{};
 val value: Reply = Reply.value{42};
@@ -124,8 +121,9 @@ is exactly `sel P.c`. `sel r.ok && r.ok > 3` is therefore legal. `||`, `!`
 and any other operator open no guard. Nothing else opens a guard.
 
 ```mach
-fun increment(input: str) res[i64, ParseError] {
-    def R: res[i64, ParseError];
+def R: res[i64, ParseError];   # module scope
+
+fun increment(input: str) R {
     val r: R = parse(input);
     if (sel r.err) { ret R.err{r.err}; }
     ret R.ok{r.ok + 1};
@@ -351,8 +349,7 @@ public-payload pointer expires when the enclosing tag changes to another case.
 The existing source bootstrap starts with published Mach 4.26.5, builds the
 pinned bridge and audited compiler sources, and checks self-hosting convergence.
 It does not require the withdrawn Mach 4.30.0 release. Published std 1.0.1
-remains immutable. Implement the tag model, construction, `sel`, guards and
-function-scope `def` in a compiler that still builds the current compiler and
+remains immutable. Implement the tag model, construction, `sel` and guards in a compiler that still builds the current compiler and
 std sources. Rename every existing `sel` identifier in both source trees before
 that compiler reserves the keyword, because the self-host fixpoint compiles the
 compiler's own source with the new lexer. Record a pinned usable compiler at that
