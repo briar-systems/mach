@@ -117,10 +117,11 @@ the chain. Arms of such a chain are conditions of the form `sel P.c` or
 for the rest of the block. A tag with more cases is guarded for the one case the
 chain leaves untested, and for nothing when more than one case remains.
 
-No other condition opens a guard. A compound condition such as
-`sel r.ok && r.ok > 3` is rejected because `r.ok` is read outside a guard.
-Nest instead. Allowing the left operand of `&&` to guard its right operand is
-an additive later decision.
+Inside a condition, the right operand of `&&` is guarded by a `sel P.c` that is
+its left operand, because `&&` short-circuits and the operand is a place. The
+guard covers only that right operand, not the block, unless the whole condition
+is exactly `sel P.c`. `sel r.ok && r.ok > 3` is therefore legal. `||`, `!`
+and any other operator open no guard. Nothing else opens a guard.
 
 ```mach
 fun increment(input: str) res[i64, ParseError] {
@@ -157,8 +158,10 @@ call is the programmer's obligation under the ordinary raw-memory rules, exactly
 as for any pointer today. A payload read whose case is no longer selected is
 undefined behavior of the same class as a stale pointer read. A raw pointer to
 a payload does not pin a case or extend a lifetime. No borrow checker, proof
-analysis or runtime validator is introduced. A debug-profile discriminator trap
-on payload access is an open owner decision and not part of this contract.
+analysis or runtime validator is introduced. In the debug profile only, each
+guarded payload access compares the discriminator and traps on mismatch, in
+the same class as the existing division trap. The release profile emits no
+check. Both profiles accept and reject the same programs.
 
 Assignment evaluates and captures its RHS before evaluating its destination,
 so a replacement initializer may read the old selected payload before
@@ -303,7 +306,9 @@ val wrong: Reply = Reply.value;          # rejected, selector is not a value
 val bad: Reply = Reply{value: 1};        # rejected, record literal form
 
 val n: i64 = r.ok;                       # rejected outside a guard
-if (sel r.ok && r.ok > 3) { }            # rejected, compound condition guards nothing
+if (sel r.ok && r.ok > 3) { }            # accepted, the right operand is guarded
+if (r.ok > 3 && sel r.ok) { }            # rejected, the read precedes the test
+if (sel r.ok || r.ok > 3) { }            # rejected, || opens no guard
 
 if (sel r.err) { log(r.err); }
 val m: i64 = r.ok;                       # rejected, the arm does not exit
