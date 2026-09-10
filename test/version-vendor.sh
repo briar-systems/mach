@@ -49,9 +49,12 @@ os = "linux"
 abi = "$abi"
 
 [profile.debug]
+default = true
 opt = 0
 debug = true
 simd = "scalarize"
+vectorize = true
+float_reassoc = false
 
 [artifact.host]
 kind = "bin"
