@@ -20,9 +20,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fetching dependencies or building. Check mode is read only, and file replacement
   uses held-root publication while preserving exact POSIX permission bits.
 
+- `#[deprecated]` and `#[deprecated("message")]` warn once per external source
+  use, preserving notices through imports, generics, and re-exports.
+
+- `{artifact.suffix}` expands artifact output extensions through the target naming rules. Scaffolds use one artifact across supported targets, and collision checks compare expanded paths for the selected target.
+
+- `mach build <path> --plan` reports the selected entries, prerequisites, outputs and link requirements through the shared planner. It replaces `--explain`.
+
+- `mach check <path>` checks selected artifact source through the shared frontend without executing build steps or producing artifacts.
+
 ### Changed
 
 - rename `sel` identifiers ahead of the v5 keyword (#3219)
+
+- Vector operations require an explicit target capability row. Missing or malformed
+  operation and lane shapes no longer default to packed support.
+
+- Removed `$project.name`, `$project.description` and the `$mach.abi.sysv` alias. Diagnostics identify the removed forms, and the ABI tag uses only `sysv64`.
+
+- Every dependency action selects its project with `mach dep <action> <path>`.
+  Dependency names follow the path. Missing or extra operands are refused.
+  Use `.` for the current project. Pull retains existing local copies and update
+  refreshes them. Dependency commands preserve the project's Git history.
+- Removed the ignored manifest keys `[project].name`, `description`, `mach`, and `[profile.*].emit_ir`/`emit_asm`. Use the CLI emission switches for side artifacts.
+- Editor analysis returns an owned diagnostic/source snapshot with explicit phase and target selection. Raw products have checked serial-view lifetimes. Closing a buffer retires its overlay, source payload and cached dependents while retaining its FileId. Buffer slots are reused, and checked editor teardown preserves owners on preparation failure (#2999).
+- Root and dependency manifests share one strict schema. Profiles explicitly declare all compilation policy, and ambiguous target, profile, or artifact selections require a selector or a declared default.
+- Manifest requirements use explicit `step.<name>` and `artifact.<name>` categories, including category-specific globs. Step cycles are rejected during manifest parsing.
 
 ### Removed
 
@@ -112,33 +135,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conversions are recognized as copies and removed by register coalescing, including
   when RV32 and RV64 targets are selected in the same process.
 - CI rebuilds its audited compiler from published 4.26.5 and source commits reachable from main after withdrawal of the 4.30.0 release.
-
-### Changed
-
-- Vector operations require an explicit target capability row. Missing or malformed
-  operation and lane shapes no longer default to packed support.
-
-- Removed `$project.name`, `$project.description` and the `$mach.abi.sysv` alias. Diagnostics identify the removed forms, and the ABI tag uses only `sysv64`.
-
-- Every dependency action selects its project with `mach dep <action> <path>`.
-  Dependency names follow the path. Missing or extra operands are refused.
-  Use `.` for the current project. Pull retains existing local copies and update
-  refreshes them. Dependency commands preserve the project's Git history.
-- Removed the ignored manifest keys `[project].name`, `description`, `mach`, and `[profile.*].emit_ir`/`emit_asm`. Use the CLI emission switches for side artifacts.
-- Editor analysis returns an owned diagnostic/source snapshot with explicit phase and target selection. Raw products have checked serial-view lifetimes. Closing a buffer retires its overlay, source payload and cached dependents while retaining its FileId. Buffer slots are reused, and checked editor teardown preserves owners on preparation failure (#2999).
-- Root and dependency manifests share one strict schema. Profiles explicitly declare all compilation policy, and ambiguous target, profile, or artifact selections require a selector or a declared default.
-- Manifest requirements use explicit `step.<name>` and `artifact.<name>` categories, including category-specific globs. Step cycles are rejected during manifest parsing.
-
-### Added
-
-- `#[deprecated]` and `#[deprecated("message")]` warn once per external source
-  use, preserving notices through imports, generics, and re-exports.
-
-- `{artifact.suffix}` expands artifact output extensions through the target naming rules. Scaffolds use one artifact across supported targets, and collision checks compare expanded paths for the selected target.
-
-- `mach build <path> --plan` reports the selected entries, prerequisites, outputs and link requirements through the shared planner. It replaces `--explain`.
-
-- `mach check <path>` checks selected artifact source through the shared frontend without executing build steps or producing artifacts.
 
 ## [4.30.0] - 2026-09-07
 
