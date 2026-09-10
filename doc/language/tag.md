@@ -9,7 +9,7 @@ or no payload at all.
 The features described on this page represent the accepted Mach v5 contract
 specified in [the tagged value design](../design/tagged-values.md). Declarations
 with an explicit discriminator, `Type.case{payload}` construction, `sel` case
-tests, function-scope `def`, checked layout, `$is_tag` and `$discriminant_of`
+tests, checked layout, `$is_tag` and `$discriminant_of`
 are implemented. Lexical payload guards, `$cases` and the debug discriminator
 trap remain in progress; until guards land, every payload access is rejected.
 
