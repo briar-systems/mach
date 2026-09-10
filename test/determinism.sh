@@ -116,9 +116,12 @@ isa = "$isa"
 os = "linux"
 abi = "$abi"
 [profile.debug]
+default = true
 opt = 0
 debug = false
 simd = "scalarize"
+vectorize = true
+float_reassoc = false
 [artifact.det]
 kind = "static"
 entry = "main.mach"
