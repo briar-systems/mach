@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Name resolution reports one phase row per build. A deferred comptime gate no
+  longer makes the resolver report every module again for each pass it takes,
+  and each module's resolve time is accumulated across those passes (#3231).
+
 - Test listing stops after collecting tests. It no longer generates or links
   machine code, and it produces no test executable (#3230).
 
