@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Dotted import, re-export and type names resolve identically with spacing or comments around dots. Diagnostics retain the original source spans (#3229).
+
 - Relocatable linking preserves native sections, symbols, imports, attributes and
   relocation relations across ELF, Mach-O and COFF. Final linking resolves absolute
   definitions separately from image-relative symbols (#3119).
