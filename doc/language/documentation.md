@@ -144,7 +144,7 @@ pub def Age: i64;
 # [T]: value type
 # none: empty case
 # some: payload case
-pub tag Option[T] {
+pub tag Option[T]: u8 {
     none;
     some: T;
 }
@@ -156,7 +156,7 @@ pub tag Option[T] {
 # [E]: error type
 # err: failure case
 # ok: success case
-pub tag Err[E] {
+pub tag Err[E]: u8 {
     err: E;
     ok;
 }

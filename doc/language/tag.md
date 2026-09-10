@@ -16,13 +16,13 @@ progress.
 ## Grammar
 
 ```mach
-tag NAME {
+tag NAME: u8 {
     case1;
     case2: type;
     ...
 }
 
-tag NAME[T, E] { ... }      # generic over type parameters
+tag NAME[T, E]: u8 { ... }      # generic over type parameters
 ```
 
 A case is declared with an identifier, an optional colon followed by a payload
@@ -36,17 +36,17 @@ because vector spellings resolve as vector types in type positions.
 ## Examples
 
 ```mach
-pub tag Reply {
+pub tag Reply: u8 {
     empty;
     value: i64;
 }
 
-pub tag ParseError {
+pub tag ParseError: u8 {
     invalid;
     overflow;
 }
 
-pub tag Tree[T] {
+pub tag Tree[T]: u8 {
     leaf: T;
     empty;
 }
@@ -55,7 +55,7 @@ pub tag Tree[T] {
 When multiple values must accompany a case, use an ordinary record payload:
 
 ```mach
-pub tag Entry {
+pub tag Entry: u8 {
     none;
     pair: rec { key: str; count: usize; };
 }
