@@ -12,16 +12,54 @@ products and transitive validation but not 60570613's object-image cache: the CI
 targets job's corpus step went from 342 to 620 seconds. Fixes A and B apply to dev
 unchanged and were cherry-picked from 60c2c479. Fix C has no target on dev, since
 dev never hashes the running compiler (there is no `src/lang/build/cache/`); it
-stays on feat/3218 to land with the object cache. Finding 1 below (the
-per-invocation digest) therefore does not apply to dev today, and finding 2 is the
-remainder handed to F4/R2. On dev (debug compilers built by the 4.30.0 seed,
-load average 7 to 12 from peer workers, 3 alternating repetitions): the 91-case
-x86_64-linux layer A corpus as one `test/run.sh` process went from 245/282/266 s
-(median 266) to 196/228/191 s (median 196); a one-file build reaching 42 std
-modules from 677/694/676 ms to 518/488/472 ms, sema 209 to 88 ms and lower 253 to
-176 ms. The mutation control is both memos disabled (`false &&` on the
-`remap_result` early return and on the `origin_surface` lookup): 739/673/679 ms,
-sema 231/210/213 ms, which is the baseline cost back.
+lands with the object cache under F4 (#3221). Finding 1 below (the per-invocation
+digest) therefore does not apply to dev today.
+
+On dev the regression is per-artifact compile time in the sema and lower phases,
+not per-process overhead. `-v` on one o2 corpus artifact (43 modules, 40 of them
+std), debug compilers built by the 4.30.0 seed, median of 3, ms:
+
+| compiler | resolve | sema | lower | optimize | codegen | wall |
+|---|---|---|---|---|---|---|
+| pre-#3247 dev (44d1df47) | 22 | 37 | 82 | 271 | 113 | 615 |
+| dev (853d4c17) | 27 | 212 | 261 | 274 | 122 | 986 |
+| dev + A + B | 26 | 86 | 180 | 274 | 115 | 781 |
+| dev + A + B + E + F | 28 | 75 | 117 | 275 | 115 | 706 |
+
+Optimize and codegen do not move on dev. A + B recovered 72% of the sema delta and
+45% of the lower delta, so the remainder was profiled (`perf record` on the single
+build, stacks diffed against the pre-#3247 compiler). The lower phase's serial
+main-thread work (`lower_raw`) had grown from 421 to 921 samples, and 346 of the
+new samples were `read_definition` reached from `lower_callee`: every imported
+call site acquired the callee's current definition through the query layer again,
+and each acquisition re-ran `fields.install` (223 samples) to verify the origin's
+field graph against the already published tables, plus a Q_SEMA lookup with its
+dependency edge (101) and the parsed-definition lookup (48). The optimize pipeline
+inclusive of verification is identical in both compilers (5873 vs 5930 samples); it
+only shifts between the phase timers because the lower workers overlap it.
+
+Fix E: the definition reader remembers each origin it has acquired for the life of
+the reader (one sema or lower computation), serving later requests at the same or a
+lower phase from the entry and upgrading it when a higher phase is asked for. The
+first acquisition still records the dependency edge. Fix F: a field graph records
+the projection generation it was installed under; published tables only change
+through a projection reset, which bumps the generation, so a second install under
+the same projection returns at once. Both carry a unit test that fails with the
+memo disabled and nothing else changes (2676 tests either way, one failure each).
+
+Fix D (the `definition_index` map replacing the linear scan in `acquire_symbol`,
+fe56b9ad) was retried on top of E + F: lower 113/130/115/113/115 ms without it
+against 114/109/110/109/114 with it, five alternating repetitions. About 5 ms
+inside the spread, the same verdict as step 4; not taken.
+
+What remains over the pre-#3247 compiler, sema +38 ms and lower +35 ms, is the
+accepted contract: the owned typed-surface copy decoded per consumer in
+`build_sema_deps_query` (about 80 samples in each phase), the by-value expression
+view through `interpretation.get` (#3121, about 40 per phase), the per-consumer
+`constant_decode`, and the generic-instance queueing in sema. Those are finding 2,
+handed to F4/R2.
+
+The corpus wall numbers for this landing are in the pull request.
 
 ## Step 1: shape
 
