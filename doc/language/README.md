@@ -83,7 +83,8 @@ neighboring links; start from the index below.
 
 The supported, source-stable surface of the compiler is the editor API, the
 command line, and the manifest schema. Everything else under `src/` is
-internal.
+internal. Source API authors can mark deprecated declarations with
+[`#[deprecated]`](decorators.md#deprecated--deprecatedstr--source-use-notice), which warns on external use.
 
 ## Design
 

@@ -1,12 +1,11 @@
 # Decorators
 
-A decorator is a codegen directive attached to a declaration. It expresses
-metadata that influences how the compiler emits the symbol: its linker name,
+A decorator attaches metadata to a declaration. It can provide source-use
+notices or influence how the compiler emits the symbol: its linker name,
 alignment, section placement, inlining, dynamic import attribution, constant-time
 obligations, or exclusion from auto-vectorization.
 
-Decorators are **codegen-only**. Visibility (`pub` / `ext`) is separate and
-unaffected by decorators.
+Visibility (`pub` / `ext`) is separate and unaffected by decorators.
 
 ## Surface
 
@@ -28,6 +27,8 @@ A decorator is written as an attribute:
 ## Grammar
 
 ```
+#[deprecated]        # external uses warn
+#[deprecated("msg")] # external uses warn with this message
 #[symbol("name")]    # linker name override
 #[library("dep")]    # dynamic import attribution (ext only)
 #[inline]            # force inlining (no arguments)
@@ -71,6 +72,50 @@ Each directive is wrapped in its own clause: `#[name]` for a bare flag or
 expressions.
 
 ## Directives
+
+### `deprecated` / `deprecated(str)` — source-use notice
+
+Marks a declaration deprecated. The optional argument is one string literal
+carrying a message, decoded with the ordinary literal escapes; repeating the
+attribute or giving it more than one argument, or a non-literal argument, is an
+error. The attribute changes nothing about visibility, type identity, ABI or
+codegen.
+
+A use of the deprecated declaration from another source module warns at the
+identifier, carrying the message. Value references, calls and type references
+are covered, including through imports, re-exports and generic instantiation,
+and each source site warns once even when a generic body is instantiated more
+than once. The declaring module does not warn on its own uses, and an unused
+import alone produces no warning.
+
+```mach
+#[deprecated("use replacement")]
+pub fun old() i32 { ret replacement(); }
+
+pub fun replacement() i32 { ret 1; }
+```
+
+It applies to `fun`, `rec`, `uni`, `tag`, `def`, `val`, `var`, `use` and `fwd`
+declarations, and to a tag case, where it is the only decorator a case accepts:
+
+```mach
+pub tag Reply: u8 {
+    empty;
+    #[deprecated("use fresh")] value: i64;
+    fresh: i64;
+}
+```
+
+A deprecated case warns at every external use that names it: `Reply.value{...}`
+construction, the `sel place.value` test and the `place.value` payload place.
+Descriptor forms that name no case in source (`Reply.[c]{...}`, `sel v.[c]`,
+`v.[c]`) warn nowhere.
+
+Notices follow imported symbols and re-exports. A `#[deprecated]` on a `use`
+alias or a `fwd` re-export belongs to the forwarding module and replaces any
+inherited notice for that exported name; a clean alias of the same canonical
+definition keeps no notice. `test` blocks and comptime directives reject the
+attribute because they declare no externally usable name.
 
 ### `symbol(str)` — linker name
 
@@ -830,6 +875,7 @@ in it.
 
 | Directive   | `fun` | `ext fun` | `val` / `var` | `rec` / `uni` |
 |-------------|:-----:|:---------:|:-------------:|:-------------:|
+| `deprecated`|  yes  |    yes    |      yes      |      yes      |
 | `symbol`    |  yes  |    yes    |      yes      |      no       |
 | `library`   |  no   |    yes    |      no       |      no       |
 | `inline`    |  yes  |    no     |      no       |      no       |
@@ -854,6 +900,8 @@ in it.
 
 The `val` / `var` column is shared, but `embed` accepts only `val` — a `var`
 is refused (see [`embed`](#embedstr--compile-time-file-embedding) above).
+`deprecated` also applies to `tag`, `def`, `use` and `fwd` declarations and to a
+tag case, none of which the table columns cover.
 
 The set is closed. New directives require a compiler change.
 

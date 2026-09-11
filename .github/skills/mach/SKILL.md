@@ -510,12 +510,13 @@ manifest does not declare is reported unavailable, not folded to `""`.
 
 ### Decorators - `#[...]`
 
-Codegen directives on the line(s) above a declaration (after the docstring).
+Declaration metadata on the line(s) above a declaration (after the docstring).
 One clause each, stackable on one line or several; they attach only to the
 immediately following declaration. Closed set:
 
 | Decorator | Applies to | Argument | Purpose |
 |---|---|---|---|
+| `#[deprecated]` / `#[deprecated("message")]` | fun, ext fun, rec, uni, tag, def, val/var, use, fwd, tag case | zero or one literal string | warn once per external use, preserving re-export notice ownership |
 | `#[symbol("name")]` | fun, ext fun, val/var | string | linker name override |
 | `#[library("name")]` | ext import | string | dynamic import dependency pin |
 | `#[inline]` | fun | none | force inlining |

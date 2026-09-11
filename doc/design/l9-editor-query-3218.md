@@ -117,7 +117,7 @@ Canonical tags are re-established after every reset already.
 | deprecation message edit advances `Q_EXPORTS` and re-reports in the dependent; revert restores the first message | `driver:deprecation_message_edit_and_revert_replay_the_public_surface` |
 | editor: open A and B, edit A's case list, re-analyze B, revert, re-analyze; no stale case in B's data | `editor.tag:dependency_case_list_edit_and_revert_replay_without_stale_cases` |
 
-Mutation controls, one per guard or rule added (recorded in section 6 once run).
+Mutation controls, one per invalidation rule added, are recorded in section 6.
 
 ## 5. Documentation
 
@@ -129,4 +129,30 @@ and case forms and the applicability table.
 
 ## 6. Gap count and mutation results
 
-Filled in at the end of the pass.
+Verdict: every cell in sections 1-4 was a gap before this pass (no editor test
+named a tag, no deprecation on the branch, the discriminator carried no
+revision) and is accepted after it. Sections 1 and 2 are established by the
+`editor.tag` and `editor.recovery` tests; section 3 by the `driver:deprecated_*`
+and `editor.deprecation` tests; section 4 by the `driver:tag_*_edit*` and
+`editor.tag:dependency_case_list_edit*` replay tests and the two query codec
+tests (`query.typed_surface`, `query.public_surface`).
+
+Two defects were found and fixed, each with the mutation control that shows its
+test failing without the fix:
+
+- **The tag discriminator carried no revision** (this pass). It lived on the
+  interned nominal, outside the projection, so a width edit left every
+  dependent's cached products unchanged. Fixed by moving it onto the projection
+  (`disc_index`, captured into `fields.Node`, encoded in the typed surface,
+  compared by `same_fields`). Mutation: dropping the `node.disc` term from
+  `same_fields` makes `tag_discriminator_edit_advances_the_typed_surface_and_replays_dependents`
+  accept the reverted `u8` build without recomputing (fails), and recording it
+  off the case-table path reintroduces the layout-query failures the two seed
+  tests `tag_discriminator_is_declared_and_checked` and
+  `offset_of_answers_from_the_checked_layout` exhibited.
+- **No `#[deprecated]` recognition on feat/3218** (this pass). Mutation:
+  removing the tag-case warn arm from `warn_deprecated_uses` makes
+  `deprecated_tag_cases_warn_at_construction_sel_and_payload_places_from_other_files`
+  see zero notices; keying the imported-symbol cache without the notice makes
+  `deprecated_reexports_keep_annotation_owner_and_do_not_taint_clean_aliases`
+  taint the clean alias.

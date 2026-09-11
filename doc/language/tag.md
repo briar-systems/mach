@@ -136,9 +136,12 @@ or {
 ```
 
 The operand is a place: a binding, a field, an index or a dereference, followed
-by exactly one case name of that place's tag type. A call or other temporary is
-not a place. The result is an ordinary `bool`, so it composes with `!`, `&&` and
-`||`, can initialize a `bool` binding, and can be returned.
+by exactly one case name of that place's tag type. A pointer to a tag is a place
+too: `sel p.case` with `p: *Reply` auto-dereferences the pointer once and tests
+its pointee, exactly as the payload place `p.value` already reads through it. A
+call or other temporary is not a place. The result is an ordinary `bool`, so it
+composes with `!`, `&&` and `||`, can initialize a `bool` binding, and can be
+returned.
 
 ```mach
 val done: bool = sel reply.value;
@@ -150,6 +153,16 @@ if (sel a.ok && sel b.ok) { }
 equality, ordering, a `.kind` field and a `match` construct do not exist. An
 outer-secret `^Tag` protects the selected case as well as the payload, so `sel`
 refuses one.
+
+`sel` also evaluates at comptime over a constant tag. A `$if (sel C.case)`
+gate on a module `val` constructed with `C.case{...}` tests the constant's
+selected case, guards `C.case` in its arm the same way a runtime chain arm
+does, and its payload reads fold to the constant payload. A comptime `sel` on
+anything that is not a constant tag element (a parameter, a local, a module
+`var`, or a constant of another module) is rejected with a located diagnostic
+at the condition, and a payload read of a case the constant does not hold is a
+compile-time error rather than the runtime undefined behavior, because comptime
+state is never stale.
 
 ## Payload places and guards
 
@@ -197,10 +210,10 @@ failure handling via `try` is reserved for the canonical types `res[T, E]`,
 ## Layout and representation
 
 A tag is laid out with its discriminator at byte offset zero in target byte
-order. The discriminator type is the smallest unsigned integer among `u8`,
-`u16`, `u32`, and `u64` capable of representing every declared case ordinal.
-Declaration order determines case codes, starting at zero. Single-case tags
-still include a discriminator.
+order. The discriminator type is the one the declaration names after the tag
+name (`tag Name: u8 { ... }`), one of `u8`, `u16`, `u32` or `u64`; a type too
+narrow to number every declared case is rejected. Declaration order determines
+case codes, starting at zero. Single-case tags still include a discriminator.
 
 Let `D` be the discriminator size. Let `M` be the maximum payload size, and
 `PAlign` the maximum payload alignment (or 1 when no cases have payloads). The
