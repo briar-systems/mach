@@ -19,6 +19,13 @@ struct al16 { unsigned char d; union { unsigned char p; } u; } __attribute__((al
 struct tf { unsigned char d; union { double p; } u; };
 struct tf8 { unsigned char d; union { float p; } u; };
 struct tfm { unsigned char d; union { double p; long long q; } u; };
+/* packed shapes: pk9 holds its payload union at an offset the union's alignment does not divide (System V
+ * MEMORY class, as for the packed record), pka packs an 8-byte discriminator ahead of a payload that sits
+ * aligned anyway */
+#pragma pack(push, 1)
+struct pk9 { unsigned char d; union { long long p; } u; };
+struct pka { unsigned long long d; union { long long p; } u; };
+#pragma pack(pop)
 
 long long c_p1(struct p1 v, long long next) { return v.d * 100 + next; }
 long long c_t3(struct t3 v, long long next) { return v.d * 100 + v.u.p[0] + v.u.p[1] * 10 + next * 1000; }
@@ -32,6 +39,8 @@ long long c_al16_after(long long first, struct al16 v, long long next) { return 
 long long c_tf(struct tf v, long long next) { return v.d * 100 + (long long)v.u.p + next * 1000; }
 long long c_tf8(struct tf8 v, long long next) { return v.d * 100 + (long long)v.u.p + next * 1000; }
 long long c_tfm(struct tfm v, long long next) { return v.d * 100 + v.u.q + next * 1000; }
+long long c_pk9(struct pk9 v, long long next) { return v.d * 100 + v.u.p + next * 1000000; }
+long long c_pka(struct pka v, long long next) { return (long long)v.d * 100 + v.u.p + next * 1000000; }
 
 struct p1 c_mk_p1(unsigned char d) { struct p1 r; r.d = d; return r; }
 struct t3 c_mk_t3(unsigned char x) { struct t3 r; r.d = 1; r.u.p[0] = x; r.u.p[1] = x + 1; return r; }
@@ -44,6 +53,8 @@ struct al16 c_mk_al16(unsigned char x) { struct al16 r; r.d = 1; r.u.p = x; retu
 struct tf c_mk_tf(double x) { struct tf r; r.d = 1; r.u.p = x; return r; }
 struct tf8 c_mk_tf8(float x) { struct tf8 r; r.d = 1; r.u.p = x; return r; }
 struct tfm c_mk_tfm(long long x) { struct tfm r; r.d = 2; r.u.q = x; return r; }
+struct pk9 c_mk_pk9(long long x) { struct pk9 r; r.d = 1; r.u.p = x; return r; }
+struct pka c_mk_pka(long long x) { struct pka r; r.d = 1; r.u.p = x; return r; }
 
 /* the reverse direction: C calls mach with the same shapes */
 long long m_t3(struct t3 v, long long next);
@@ -56,6 +67,10 @@ struct t9 m_mk_t9(unsigned char x);
 struct al16 m_mk_al16(unsigned char x);
 struct tf m_mk_tf(double x);
 struct t3 m_mk_t3(unsigned char x);
+long long m_pk9(struct pk9 v, long long next);
+long long m_pka(struct pka v, long long next);
+struct pk9 m_mk_pk9(long long x);
+struct pka m_mk_pka(long long x);
 
 long long c_drives_mach(void) {
     struct t3 a = c_mk_t3(4);
@@ -77,5 +92,13 @@ long long c_drives_mach(void) {
     if (rd.d != 1 || rd.u.p != 14.5) return 9;
     struct t3 ra = m_mk_t3(15);
     if (ra.d != 1 || ra.u.p[0] != 15 || ra.u.p[1] != 16) return 10;
+    struct pk9 g = c_mk_pk9(-5000000000LL);
+    struct pka h = c_mk_pka(21);
+    if (m_pk9(g, 7) != 100 - 5000000000LL + 7000000) return 11;
+    if (m_pka(h, 8) != 100 + 21 + 8000000) return 12;
+    struct pk9 rg = m_mk_pk9(-6000000000LL);
+    if (rg.d != 1 || rg.u.p != -6000000000LL) return 13;
+    struct pka rh = m_mk_pka(22);
+    if (rh.d != 1 || rh.u.p != 22) return 14;
     return 0;
 }
