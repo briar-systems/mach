@@ -532,8 +532,9 @@ is refused rather than assumed.
 
 ## See also
 
-- [types.md](types.md) — the compound type grammar `^` qualifies
-- [comptime-intrinsics.md](comptime-intrinsics.md) — `$is_secret` and the rest of the type-predicate family
-- [operators.md](operators.md) — the `::` / `:~` casts that preserve secrecy
-- [decorators.md](decorators.md) — the `#[oblivious]` decorator reference
-- [grammar.md](grammar.md) — the formal grammar of `^` and `:>T`
+- [types.md](types.md) - the compound type grammar ^ qualifies
+- [tag.md](tag.md) - tagged values and outer-secret ^Tag rules
+- [comptime-intrinsics.md](comptime-intrinsics.md) - $is_secret and the rest of the type-predicate family
+- [operators.md](operators.md) - the :: / :~ casts that preserve secrecy and :>T
+- [decorators.md](decorators.md) - the #[oblivious] decorator reference
+- [grammar.md](grammar.md) - the formal grammar of ^ and :>T

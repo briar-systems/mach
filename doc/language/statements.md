@@ -1,5 +1,9 @@
 # Statements
 
+Tag, canonical type, and `try` descriptions include the accepted v5 contract.
+Implementation is incomplete at base commit `fc5c9e7e`. See
+[tag.md](tag.md#implementation-status) and [try.md](try.md#implementation-status).
+
 Statement forms compose into function bodies and blocks. Statements end
 with `;` except where they end with a block `{...}`.
 
@@ -19,6 +23,22 @@ if (cond) {
 - Each `or (cond) { ... }` adds another branch.
 - A trailing `or { ... }` is the catch-all.
 - Bodies are blocks; there is no one-statement-without-braces form.
+
+An `if`/`or` arm whose condition is exactly `sel P.c` guards the payload place
+`P.c` inside its block:
+
+```mach
+if (sel reply.value) {
+    val number: i64 = reply.value;  # guarded by the arm condition
+}
+or {
+    # reply holds empty on this path
+}
+```
+
+A guard is a lexical region, not a flow fact. A chain whose every arm exits
+guards the remainder of the enclosing block for the case the chain left
+untested. See [tag.md](tag.md).
 
 ## `for`
 
@@ -110,8 +130,37 @@ in order. Blocks can stand alone:
 }
 ```
 
+## Expression statements and `try`
+
+An expression followed by a semicolon executes as a statement:
+
+```mach
+compute();
+```
+
+When using `try` with canonical `err[E]`, the successful `ok` case produces no
+payload value. As a result, `try` on an `err[E]` operand is permitted only as a
+direct expression statement:
+
+```mach
+try flush() or (error: WriteError) {
+    ret err[WriteError].err{error};
+};
+```
+
+Attempting to use `try` on `err[E]` in a value position, such as a binding
+initializer or function argument, is a compile error.
+
+Every reachable path through a `try` failure block must terminate control flow
+with `ret`, or with `brk` or `cnt` targeting an outer enclosing loop. Failure
+blocks cannot fall through or provide fallback values.
+
+Ordinary user-defined tags acquire no automatic `try` convention and use explicit
+`if`/`or` statements instead. See [try.md](try.md) and [tag.md](tag.md).
+
 ## See also
 
-- [expressions.md](expressions.md) — what goes into the right side of `=`
-  etc.
-- [comptime-control.md](comptime-control.md) — the comptime counterpart
+- [expressions.md](expressions.md) - expressions, literals, and try syntax
+- [try.md](try.md) - explicit failure handling reference
+- [tag.md](tag.md) - tagged values reference
+- [comptime-control.md](comptime-control.md) - the comptime counterpart

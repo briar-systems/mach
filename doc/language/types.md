@@ -44,12 +44,13 @@ be named `f32x4` without colliding with the type:
 val f32x4: i64 = 7;             # fine: values are a different position
 ```
 
-A **type** may not. `rec`, `uni`, and `def` reject a name spelled as a vector
-form, because a type declared with a vector's name would be silently unreachable
-— every use in type position resolves to the vector instead:
+A **type** may not. `rec`, `uni`, `tag`, and `def` reject a name spelled as a vector
+form, because a type declared with a vector's name would be silently unreachable:
+every use in type position resolves to the vector instead:
 
 ```mach
 rec f32x3 { x: f32; }           # error: `f32x3` is spelled as a vector type
+tag f32x4: u8 { empty; }            # error: `f32x4` is spelled as a vector type
 ```
 
 This holds for any well-formed spelling, so the name cannot be claimed by a type
@@ -289,6 +290,39 @@ val r:  i64   = op(2, 3);
 
 `rec` and `uni` declarations produce named types. See [rec.md](rec.md) and
 [uni.md](uni.md).
+
+## Tag types and canonical tags
+
+A `tag` declaration introduces a named tagged value type that holds exactly one
+active case. A case may be payloadless or carry one explicitly typed payload:
+
+```mach
+tag Reply: u8 {
+    empty;
+    value: i64;
+}
+```
+
+Mach also provides three compiler-known canonical tag types with fixed generic
+arities:
+
+- `res[T, E]` represents an outcome with error case `err: E` and success case `ok: T`
+- `opt[T]` represents optional presence with absence case `none` and value case `some: T`
+- `err[E]` represents a distinct outcome with error case `err: E` and payloadless success case `ok`
+
+Canonical `err[E]` is not an alias of `opt[E]`. There are no defaulted generic
+arguments, general type inference, or dummy success types.
+
+The case names `ok`, `err`, `some`, and `none` are contextual case names, not
+global keywords.
+
+Numeric vector spellings such as `f32x4` denote SIMD vector types and require
+full-lane initialization, whereas a tag value names one case and its payload
+(`Reply.empty{}` or `res[i64, ParseError].ok{42}`).
+
+Accepted v5 contract. The accepted Mach v5 design specifies an explicit
+discriminator type, `Type.case{payload}` construction, `sel` case tests and
+payload places under a lexical guard. See [tag.md](tag.md).
 
 ## Type aliases
 

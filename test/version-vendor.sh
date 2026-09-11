@@ -49,6 +49,7 @@ os = "linux"
 abi = "$abi"
 
 [profile.debug]
+default = true
 opt = 0
 debug = true
 simd = "scalarize"

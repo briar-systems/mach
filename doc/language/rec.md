@@ -51,7 +51,7 @@ for what a packed record refuses.
 
 ## See also
 
-- [uni.md](uni.md) — overlapping-memory counterpart
-- [decorators.md](decorators.md) — `#[align]` and `#[packed]`
-- [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of`,
-  `$offset_of`
+- [tag.md](tag.md) - tagged value
+- [uni.md](uni.md) - overlapping-memory counterpart
+- [decorators.md](decorators.md) - #[align] and #[packed]
+- [comptime-intrinsics.md](comptime-intrinsics.md) - $size_of, $offset_of

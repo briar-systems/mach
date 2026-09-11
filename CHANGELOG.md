@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Tagged values (Mach v5, #3218, #3219). `tag Name: u8 { ... }` declares a
+  discriminated value with an explicit `u8`, `u16`, `u32` or `u64`
+  discriminator; a case has one typed payload or none. `Type.case{payload}` and
+  `Type.case{}` are the only construction forms. `sel place.case` is the case
+  test, reading only the discriminator. Payload places `place.case` are legal
+  only under a lexical guard: a chain arm whose condition is exactly
+  `sel P.c`, the rest of a block after a chain whose every arm exits, and the
+  right operand of `&&` after a `sel`. Whole-value assignment to a guarded
+  place is refused. The debug profile checks the discriminator at every
+  guarded access and traps on a mismatch; the release profile emits no check
+  and both profiles accept and reject the same programs. Layout puts the
+  discriminator at offset zero and every payload at one common offset;
+  `#[packed]` and `#[align(N)]` apply; `$is_tag`, `$cases` (walked with
+  `$each`, with `sel v.[c]`, `v.[c]` and `T.[c]{}` through a descriptor) and
+  `$discriminant_of` reflect a tag; `$size_of`, `$align_of` and `$offset_of`
+  answer from the checked layout. Representation-changing casts that contain a
+  tag are refused. Tags are carried by value through every native convention,
+  through SPIR-V as a per-case composite, and by the editor's type, resolve
+  and recovery products. The canonical `res`, `opt` and `err` are std tags;
+  the compiler seeds them at this integration state until std 2.0.0 declares
+  them. The corpus gains a `tag` group of nine cases with C references.
+- `#[deprecated]` and `#[deprecated("msg")]` on `fun`, `ext fun`, `rec`,
+  `uni`, `tag`, `def`, `val`, `var`, `use`, `fwd` and on a tag case: every use
+  from another source module warns once with the message; the declaring
+  module is silent; notices follow re-exports and are owned by the forwarding
+  declaration (#3129).
 - `mach build --cache` and `mach test --cache` reuse object images across
   compiler processes from `.mach-cache` under the output directory, keyed on the
   running compiler's content, the build configuration, the whole active source
@@ -133,6 +159,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Name resolution reports one phase row per build. A deferred comptime gate no
   longer makes the resolver report every module again for each pass it takes,
   and each module's resolve time is accumulated across those passes (#3231).
+
+- Comptime evaluation distinguishes unknown internal tags from unsupported values
+  and rejects comparisons of reflection descriptors without equality semantics.
+
+- Native encoder failures preserve full opcode values and report owned diagnostics.
+  Selected target instructions are validated in their own opcode domain.
+
+- Unknown syntax, operator, IR operand and backend instruction, operand and register
+  class tags report internal failures with their catalog and numeric value. Verifier diagnostics own their text and propagate
+  allocation failures without losing tag or source information.
 
 - Constant expressions evaluate nested scalar casts and preserve integer widths and
   signedness. A failed global initializer now rejects the compilation instead of

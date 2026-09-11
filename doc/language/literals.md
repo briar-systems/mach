@@ -119,5 +119,7 @@ a migration error naming `#[...]`; anywhere else it is a syntax error. See
 
 ## See also
 
-- [types.md](types.md) — what these literals are typed as
-- [val-var.md](val-var.md) — using literals as binding initializers
+- [types.md](types.md) - what these literals are typed as
+- [expressions.md](expressions.md) - record, array, union, and tag literals
+- [tag.md](tag.md) - tagged value construction
+- [val-var.md](val-var.md) - using literals as binding initializers

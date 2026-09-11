@@ -3,7 +3,7 @@
 Mach source-level documentation uses `#` comments immediately above
 declarations. Each docstring is one summary followed by an optional
 component block. `mach doc` renders them, and the compiler's docstring lint
-checks the component block of every `pub fun`, `pub rec`, and `pub uni`
+checks the component block of every `pub fun`, `pub rec`, `pub uni`, and `pub tag`
 against the declaration it documents.
 
 A docstring states **what** a declaration is and **how** it is used. Why a
@@ -41,19 +41,23 @@ belongs in the changelog. Documentation never changes generated code.
 | Return value | `ret` |
 | Record field | field name |
 | Union variant | variant name |
+| Tag case | case name |
 
 ## What the lint checks
 
-For a `pub fun`, `pub rec`, or `pub uni` whose docstring has a component
+For a `pub fun`, `pub rec`, `pub uni`, or `pub tag` whose docstring has a component
 block, every component line must name an element of that declaration, carry
-a description, and appear in declaration order (generics, then parameters or
-fields, then `ret`). Each violation is a warning naming the line:
+a description, and appear in declaration order (generics, then parameters,
+fields, or cases, then `ret` for functions). Each violation is a warning naming the line:
 
 ```
-documented component matches no parameter, field, generic, or `ret` of this declaration
+documented component matches no parameter, field, case, generic, or `ret` of this declaration
 documented component has no description
 documented components are out of declaration order
 ```
+
+Tags have no return value, so a `ret:` component line on a tag is rejected. A bare
+generic name without brackets (such as `T:` instead of `[T]:`) is also rejected.
 
 A summary-only docstring, a docstring on a `val`, `var`, `def`, `use`, or
 `fwd` (which are summary-only forms), and a non-`pub` declaration are not
@@ -132,6 +136,36 @@ pub uni Number { i: i64; f: f64; }
 pub def Age: i64;
 ```
 
+## Tag
+
+```mach
+# optional outcome container
+# ---
+# [T]: value type
+# none: empty case
+# some: payload case
+pub tag Option[T]: u8 {
+    none;
+    some: T;
+}
+```
+
+```mach
+# distinct error tag
+# ---
+# [E]: error type
+# err: failure case
+# ok: success case
+pub tag Err[E]: u8 {
+    err: E;
+    ok;
+}
+```
+
+Cases appear in declaration order after generic parameters. Tags have no return
+value, so `ret:` is refused. Undocumented cases are permitted, but any documented
+case must exist on the tag.
+
 ## Module
 
 A `.mach` file begins with a module docstring as the first content in the
@@ -169,8 +203,8 @@ comment as `# [...]`.
 
 ## See also
 
-- [fun.md](fun.md) — function declaration grammar
-- [rec.md](rec.md), [uni.md](uni.md), [def.md](def.md) — type forms
-- [val-var.md](val-var.md) — binding declarations
-- [modules.md](modules.md) — module structure and file layout
-- [../cli.md](../cli.md#mach-doc) — `mach doc`, which renders docstrings
+- [fun.md](fun.md) - function declaration grammar
+- [rec.md](rec.md), [uni.md](uni.md), [tag.md](tag.md), [def.md](def.md) - type forms
+- [val-var.md](val-var.md) - binding declarations
+- [modules.md](modules.md) - module structure and file layout
+- [../cli.md](../cli.md#mach-doc) - mach doc command, which renders docstrings

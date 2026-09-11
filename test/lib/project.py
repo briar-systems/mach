@@ -135,6 +135,8 @@ class Project(object):
             out.append('simd = "scalarize"')
             out.append("vectorize = true")
             out.append("float_reassoc = false")
+            if prof == "o0":
+                out.append("default = true")
             out.append("")
         for case in self.cases:
             for key, entry, kind in self.variants():

@@ -1,0 +1,375 @@
+use std.format;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+
+use O: std.types.option;
+use R: std.types.result;
+
+use mach.lang.fail;
+use mach.lang.fe.ast;
+use mach.lang.fe.ast.decl;
+use mach.lang.fe.ast.expr;
+use mach.lang.fe.ast.id;
+use mach.lang.fe.ast.stmt;
+use mach.lang.fe.comptime;
+use mach.lang.fe.resolve;
+use mach.lang.fe.sema.context;
+use mach.lang.fe.token;
+use mach.lang.intern;
+use mach.lang.type;
+
+# a tag payload place `P.c` is readable, writable and addressable only inside a lexical guard for
+# that place and case. guards are frames on the caller's stack linked through the sema context;
+# the walker that opens one closes it when its lexical region ends, so no flow fact is ever kept.
+
+pub fun push(sc: *context.SemaContext, frame: *context.Guard, place: id.ExprId, case_name: intern.StrId) {
+    frame.place     = place;
+    frame.case_name = case_name;
+    frame.prev      = sc.guards;
+    sc.guards       = frame;
+}
+
+pub fun close(sc: *context.SemaContext, frame: *context.Guard) {
+    sc.guards = frame.prev;
+}
+
+# opens a guard for `P.c` when the condition is exactly `sel P.c`
+pub fun open_sel(sc: *context.SemaContext, cond: id.ExprId, frame: *context.Guard) bool {
+    var neg: bool = false;
+    var place: id.ExprId = id.EXPR_NIL;
+    var case_name: intern.StrId = intern.STR_NIL;
+    if (!sel_test(sc, cond, ?neg, ?place, ?case_name)) { ret false; }
+    if (neg) { ret false; }
+    push(sc, frame, place, case_name);
+    ret true;
+}
+
+pub fun guarded(sc: *context.SemaContext, place: id.ExprId, case_name: intern.StrId) bool {
+    var g: *context.Guard = sc.guards;
+    for (g != nil) {
+        if (g.case_name == case_name && place_equal(sc, g.place, place)) { ret true; }
+        g = g.prev;
+    }
+    ret false;
+}
+
+# a chain whose arms all test one place with `sel` or `!sel` and all exit leaves the block knowing
+# which cases remain; when exactly one remains the rest of the block is guarded for it
+pub fun open_exit_chain(sc: *context.SemaContext, sid: id.StmtId, frame: *context.Guard) bool {
+    var place: id.ExprId = id.EXPR_NIL;
+    var cur: id.StmtId = sid;
+    for (cur != id.STMT_NIL) {
+        val s_opt: O.Option[*stmt.Stmt] = ast.get_stmt(sc.a, cur);
+        if (O.is_none[*stmt.Stmt](s_opt)) { ret false; }
+        val s: *stmt.Stmt = O.unwrap[*stmt.Stmt](s_opt);
+        if (s.kind != stmt.STMT_KIND_IF) { ret false; }
+        var neg: bool = false;
+        var arm_place: id.ExprId = id.EXPR_NIL;
+        var arm_case: intern.StrId = intern.STR_NIL;
+        if (!sel_test(sc, s.data.if_.cond, ?neg, ?arm_place, ?arm_case)) { ret false; }
+        if (place == id.EXPR_NIL) { place = arm_place; }
+        or (!place_equal(sc, place, arm_place)) { ret false; }
+        if (!stmt_exits(sc, s.data.if_.then_block, 0)) { ret false; }
+        cur = s.data.if_.else_block;
+    }
+    if (place == id.EXPR_NIL) { ret false; }
+
+    val tag_ty: type.TypeId = type.strip_secret(?sc.s.types, tested_type(sc, place));
+    if (!type.is_tag(?sc.s.types, tag_ty)) { ret false; }
+    val count: u32 = type.field_count(?sc.s.types, tag_ty);
+
+    var remaining: u32 = 0;
+    var last: intern.StrId = intern.STR_NIL;
+    var k: u32 = 0;
+    for (k < count) {
+        val f_opt: O.Option[*type.FieldEntry] = type.field_at(?sc.s.types, tag_ty, k);
+        if (O.is_none[*type.FieldEntry](f_opt)) { ret false; }
+        val name: intern.StrId = O.unwrap[*type.FieldEntry](f_opt).name;
+        if (case_possible(sc, sid, name)) { remaining = remaining + 1; last = name; }
+        k = k + 1;
+    }
+    if (remaining != 1) { ret false; }
+    push(sc, frame, place, last);
+    ret true;
+}
+
+# whole-value assignment to a guarded place, or to an object it is reached through, replaces the case
+pub fun check_assign(sc: *context.SemaContext, lhs: id.ExprId, span: token.Span) {
+    var g: *context.Guard = sc.guards;
+    for (g != nil) {
+        if (covers(sc, lhs, g.place)) {
+            val name_opt: O.Option[str] = intern.lookup(?sc.s.interner, g.case_name);
+            var name: str = "";
+            if (O.is_some[str](name_opt)) { name = O.unwrap[str](name_opt); }
+            val msg_r: R.Result[str, str] = format.sprint(sc.s.alloc,
+                "cannot assign to this place inside a guard for its `{}` payload; rebind the new value to a new name", name);
+            if (R.is_err[str, str](msg_r)) {
+                context.report(sc, span, "cannot assign to a place inside a guard for its payload; rebind the new value to a new name");
+                ret;
+            }
+            val msg: str = R.unwrap_ok[str, str](msg_r);
+            context.report(sc, span, msg);
+            str_free(sc.s.alloc, msg);
+            ret;
+        }
+        g = g.prev;
+    }
+}
+
+fun covers(sc: *context.SemaContext, lhs: id.ExprId, place: id.ExprId) bool {
+    # a pointer place guards its pointee, so reassigning the pointer or anything it hangs off
+    # does not replace the case, exactly as with an explicit dereference
+    if (type.is_pointer(?sc.s.types, place_type(sc, place))) { ret false; }
+    var cur: id.ExprId = place;
+    for (cur != id.EXPR_NIL) {
+        if (place_equal(sc, lhs, cur)) { ret true; }
+        cur = object_of(sc, cur);
+    }
+    ret false;
+}
+
+# the object a field, projection or index is reached through; a dereference, explicit or the
+# implicit one of a pointer receiver, ends the chain because reassigning the pointer does not
+# write the tag
+fun object_of(sc: *context.SemaContext, eid: id.ExprId) id.ExprId {
+    val e_opt: R.Result[expr.Expr, str] = context.expression(sc, eid);
+    if (R.is_err[expr.Expr, str](e_opt)) { ret id.EXPR_NIL; }
+    val e: expr.Expr = R.unwrap_ok[expr.Expr, str](e_opt);
+    var object: id.ExprId = id.EXPR_NIL;
+    if (e.kind == expr.EXPR_KIND_MEMBER)  { object = e.data.member.object; }
+    if (e.kind == expr.EXPR_KIND_PROJECT) { object = e.data.project.object; }
+    if (e.kind == expr.EXPR_KIND_INDEX)   { object = e.data.index.object; }
+    if (object != id.EXPR_NIL && type.is_pointer(?sc.s.types, place_type(sc, object))) { ret id.EXPR_NIL; }
+    ret object;
+}
+
+fun sel_test(sc: *context.SemaContext, cond: id.ExprId, neg: *bool, place: *id.ExprId, case_name: *intern.StrId) bool {
+    if (cond == id.EXPR_NIL) { ret false; }
+    val e_opt: R.Result[expr.Expr, str] = context.expression(sc, cond);
+    if (R.is_err[expr.Expr, str](e_opt)) { ret false; }
+    var e: expr.Expr = R.unwrap_ok[expr.Expr, str](e_opt);
+    @neg = false;
+    if (e.kind == expr.EXPR_KIND_UNARY && e.data.unary.op == expr.UN_NOT) {
+        val inner_opt: R.Result[expr.Expr, str] = context.expression(sc, e.data.unary.operand);
+        if (R.is_err[expr.Expr, str](inner_opt)) { ret false; }
+        e = R.unwrap_ok[expr.Expr, str](inner_opt);
+        @neg = true;
+    }
+    if (e.kind != expr.EXPR_KIND_SEL) { ret false; }
+    val name: intern.StrId = sel_case_name(sc, ?e.data.sel);
+    if (name == intern.STR_NIL) { ret false; }
+    @place     = e.data.sel.place;
+    @case_name = name;
+    ret true;
+}
+
+# the case a `sel` names, spelled directly or through a comptime case descriptor; STR_NIL when the
+# descriptor does not evaluate, which type checking reports at the `sel` itself
+pub fun sel_case_name(sc: *context.SemaContext, s: *expr.ExprSel) intern.StrId {
+    if (s.case_desc == id.EXPR_NIL) { ret case_id(sc, s.case_name); }
+    val r: R.Result[comptime.CTValue, comptime.EvalFail] = comptime.evaluate[context.SemaContext](sc.ctx, sc, sc.caps, sc.a, sc.source, s.case_desc, ?sc.s.interner);
+    context.record_eval_result(sc, r);
+    if (R.is_err[comptime.CTValue, comptime.EvalFail](r)) { ret intern.STR_NIL; }
+    val desc: comptime.CTValue = R.unwrap_ok[comptime.CTValue, comptime.EvalFail](r);
+    if (desc.kind != comptime.CT_KIND_CASE) { ret intern.STR_NIL; }
+    val fa: O.Option[*type.FieldEntry] = type.field_at(?sc.s.types, desc.data.fld.owner::type.TypeId, desc.data.fld.index);
+    if (O.is_none[*type.FieldEntry](fa)) { ret intern.STR_NIL; }
+    ret O.unwrap[*type.FieldEntry](fa).name;
+}
+
+fun case_possible(sc: *context.SemaContext, chain: id.StmtId, name: intern.StrId) bool {
+    var cur: id.StmtId = chain;
+    for (cur != id.STMT_NIL) {
+        val s_opt: O.Option[*stmt.Stmt] = ast.get_stmt(sc.a, cur);
+        if (O.is_none[*stmt.Stmt](s_opt)) { ret false; }
+        val s: *stmt.Stmt = O.unwrap[*stmt.Stmt](s_opt);
+        var neg: bool = false;
+        var arm_place: id.ExprId = id.EXPR_NIL;
+        var arm_case: intern.StrId = intern.STR_NIL;
+        if (!sel_test(sc, s.data.if_.cond, ?neg, ?arm_place, ?arm_case)) { ret false; }
+        if (!neg && arm_case == name) { ret false; }
+        if (neg && arm_case != name)  { ret false; }
+        cur = s.data.if_.else_block;
+    }
+    ret true;
+}
+
+# every reachable path through the statement leaves by `ret`, or by `brk`/`cnt` targeting a loop
+# outside it; `loops` counts the loops entered since the statement of interest
+pub fun stmt_exits(sc: *context.SemaContext, sid: id.StmtId, loops: u32) bool {
+    if (sid == id.STMT_NIL) { ret false; }
+    val s_opt: O.Option[*stmt.Stmt] = ast.get_stmt(sc.a, sid);
+    if (O.is_none[*stmt.Stmt](s_opt)) { ret false; }
+    val s: *stmt.Stmt = O.unwrap[*stmt.Stmt](s_opt);
+    val k: stmt.StmtKind = s.kind;
+    if (k == stmt.STMT_KIND_RET) { ret true; }
+    if (k == stmt.STMT_KIND_BRK || k == stmt.STMT_KIND_CNT) { ret loops == 0; }
+    if (k == stmt.STMT_KIND_BLOCK) { ret list_exits(sc, s.data.block.stmts_start, s.data.block.stmts_len, loops); }
+    if (k == stmt.STMT_KIND_FOR) {
+        # a conditional loop runs zero times when its condition starts false and falls through, so
+        # only an unconditional one can exit; inside it a `brk` or `cnt` targets the loop, not the chain
+        if (s.data.for_.cond != id.EXPR_NIL) { ret false; }
+        ret stmt_exits(sc, s.data.for_.body, loops + 1);
+    }
+    if (k == stmt.STMT_KIND_IF) {
+        if (s.data.if_.else_block == id.STMT_NIL) { ret false; }
+        ret stmt_exits(sc, s.data.if_.then_block, loops) && stmt_exits(sc, s.data.if_.else_block, loops);
+    }
+    if (k == stmt.STMT_KIND_COMPTIME_IF) {
+        var closed: bool = false;
+        var b: u32 = 0;
+        for (b < s.data.comptime_if.branches_len) {
+            val br: *decl.ComptimeBranch = ?sc.a.comptime_branches[s.data.comptime_if.branches_start + b];
+            if (br.cond == id.EXPR_NIL) { closed = true; }
+            if (!list_exits(sc, br.body_start, br.body_len, loops)) { ret false; }
+            b = b + 1;
+        }
+        ret closed;
+    }
+    ret false;
+}
+
+fun list_exits(sc: *context.SemaContext, start: u32, len: u32, loops: u32) bool {
+    var i: u32 = 0;
+    for (i < len) {
+        if (stmt_exits(sc, sc.a.stmt_ids[start + i], loops)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the spelling rule `place_equal` implements, enforced where a guard place is written so an
+# unmatchable place is rejected at the `sel` rather than at every read inside the region
+pub fun check_stable(sc: *context.SemaContext, place: id.ExprId, span: token.Span) bool {
+    val bad: id.ExprId = unstable_part(sc, place);
+    if (bad == id.EXPR_NIL) { ret true; }
+    val fallback: str = "`sel` names a place matched by its spelling; bind any computed part of it to a name first";
+    val e_opt: R.Result[expr.Expr, str] = context.expression(sc, bad);
+    if (R.is_err[expr.Expr, str](e_opt)) { context.report(sc, span, fallback); ret false; }
+    val text: O.Option[str] = span_text(sc, R.unwrap_ok[expr.Expr, str](e_opt).span);
+    if (O.is_none[str](text)) { context.report(sc, span, fallback); ret false; }
+    val msg_r: R.Result[str, str] = format.sprint(sc.s.alloc,
+        "`sel` names a place matched by its spelling, so `{}` cannot appear in it; bind it to a name and write the place over that name",
+        O.unwrap[str](text));
+    if (R.is_err[str, str](msg_r)) { context.report(sc, span, fallback); ret false; }
+    val msg: str = R.unwrap_ok[str, str](msg_r);
+    context.report(sc, span, msg);
+    str_free(sc.s.alloc, msg);
+    ret false;
+}
+
+# the first sub-expression of a place that `place_equal` can never match, or nil when the whole
+# place is a path: an identifier, field, projection, dereference, or an index by a name or a literal
+fun unstable_part(sc: *context.SemaContext, eid: id.ExprId) id.ExprId {
+    if (eid == id.EXPR_NIL) { ret id.EXPR_NIL; }
+    val e_opt: R.Result[expr.Expr, str] = context.expression(sc, eid);
+    if (R.is_err[expr.Expr, str](e_opt)) { ret id.EXPR_NIL; }
+    val e: expr.Expr = R.unwrap_ok[expr.Expr, str](e_opt);
+    val k: expr.ExprKind = e.kind;
+    if (k == expr.EXPR_KIND_IDENT || k == expr.EXPR_KIND_ERROR) { ret id.EXPR_NIL; }
+    if (k == expr.EXPR_KIND_MEMBER) { ret unstable_part(sc, e.data.member.object); }
+    if (k == expr.EXPR_KIND_PROJECT) {
+        val f: id.ExprId = unstable_subscript(sc, e.data.project.field);
+        if (f != id.EXPR_NIL) { ret f; }
+        ret unstable_part(sc, e.data.project.object);
+    }
+    if (k == expr.EXPR_KIND_INDEX) {
+        val i: id.ExprId = unstable_subscript(sc, e.data.index.index);
+        if (i != id.EXPR_NIL) { ret i; }
+        ret unstable_part(sc, e.data.index.object);
+    }
+    if (k == expr.EXPR_KIND_UNARY && e.data.unary.op == expr.UN_DEREF) { ret unstable_part(sc, e.data.unary.operand); }
+    ret eid;
+}
+
+# a subscript is compared by spelling too, so only a name or a literal can stand in one
+fun unstable_subscript(sc: *context.SemaContext, eid: id.ExprId) id.ExprId {
+    if (eid == id.EXPR_NIL) { ret id.EXPR_NIL; }
+    val e_opt: R.Result[expr.Expr, str] = context.expression(sc, eid);
+    if (R.is_err[expr.Expr, str](e_opt)) { ret id.EXPR_NIL; }
+    val k: expr.ExprKind = R.unwrap_ok[expr.Expr, str](e_opt).kind;
+    if (k == expr.EXPR_KIND_IDENT || k == expr.EXPR_KIND_LIT_INT || k == expr.EXPR_KIND_ERROR) { ret id.EXPR_NIL; }
+    ret eid;
+}
+
+fun span_text(sc: *context.SemaContext, span: token.Span) O.Option[str] {
+    if (span.len == 0) { ret O.none[str](); }
+    val ir: R.Result[intern.StrId, str] = intern.intern_span(?sc.s.interner, sc.source, span);
+    if (R.is_err[intern.StrId, str](ir)) { fail.internal(?sc.status, R.unwrap_err[intern.StrId, str](ir)); ret O.none[str](); }
+    ret intern.lookup(?sc.s.interner, R.unwrap_ok[intern.StrId, str](ir));
+}
+
+# two place expressions name the same storage when they are spelled the same way over the same
+# bindings; this is lexical identity, exactly what a guard region is
+pub fun place_equal(sc: *context.SemaContext, a: id.ExprId, b: id.ExprId) bool {
+    if (a == b) { ret true; }
+    if (a == id.EXPR_NIL || b == id.EXPR_NIL) { ret false; }
+    val ea_opt: R.Result[expr.Expr, str] = context.expression(sc, a);
+    val eb_opt: R.Result[expr.Expr, str] = context.expression(sc, b);
+    if (R.is_err[expr.Expr, str](ea_opt) || R.is_err[expr.Expr, str](eb_opt)) { ret false; }
+    val ea: expr.Expr = R.unwrap_ok[expr.Expr, str](ea_opt);
+    val eb: expr.Expr = R.unwrap_ok[expr.Expr, str](eb_opt);
+    if (ea.kind != eb.kind) { ret false; }
+    val k: expr.ExprKind = ea.kind;
+    if (k == expr.EXPR_KIND_IDENT)   { ret same_symbol(sc, a, b); }
+    if (k == expr.EXPR_KIND_MEMBER)  {
+        ret span_text_equal(sc, ea.data.member.name, eb.data.member.name)
+            && place_equal(sc, ea.data.member.object, eb.data.member.object);
+    }
+    if (k == expr.EXPR_KIND_PROJECT) {
+        ret place_equal(sc, ea.data.project.field, eb.data.project.field)
+            && place_equal(sc, ea.data.project.object, eb.data.project.object);
+    }
+    if (k == expr.EXPR_KIND_INDEX) {
+        ret place_equal(sc, ea.data.index.index, eb.data.index.index)
+            && place_equal(sc, ea.data.index.object, eb.data.index.object);
+    }
+    if (k == expr.EXPR_KIND_UNARY) {
+        ret ea.data.unary.op == expr.UN_DEREF && eb.data.unary.op == expr.UN_DEREF
+            && place_equal(sc, ea.data.unary.operand, eb.data.unary.operand);
+    }
+    if (k == expr.EXPR_KIND_LIT_INT) { ret ea.data.lit_int.value == eb.data.lit_int.value; }
+    # a `$name` is the base of a comptime path or an intrinsic callee, so it names a compile-time
+    # value and never storage; every remaining kind is not a place and matches nothing
+    ret false;
+}
+
+fun same_symbol(sc: *context.SemaContext, a: id.ExprId, b: id.ExprId) bool {
+    val sa: O.Option[*resolve.Symbol] = context.symbol_for_expr(sc, a);
+    val sb: O.Option[*resolve.Symbol] = context.symbol_for_expr(sc, b);
+    if (O.is_none[*resolve.Symbol](sa) || O.is_none[*resolve.Symbol](sb)) { ret false; }
+    ret O.unwrap[*resolve.Symbol](sa) == O.unwrap[*resolve.Symbol](sb);
+}
+
+fun span_text_equal(sc: *context.SemaContext, a: token.Span, b: token.Span) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (sc.source[a.offset + i] != sc.source[b.offset + i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun case_id(sc: *context.SemaContext, span: token.Span) intern.StrId {
+    if (span.len == 0) { ret intern.STR_NIL; }
+    val r: R.Result[intern.StrId, str] = intern.intern_span(?sc.s.interner, sc.source, span);
+    if (R.is_err[intern.StrId, str](r)) { fail.internal(?sc.status, R.unwrap_err[intern.StrId, str](r)); ret intern.STR_NIL; }
+    ret R.unwrap_ok[intern.StrId, str](r);
+}
+
+fun place_type(sc: *context.SemaContext, eid: id.ExprId) type.TypeId {
+    if (sc.expr_type == nil || eid >= sc.a.expr_len::u32) { ret type.TYPE_ERROR; }
+    ret sc.expr_type[eid];
+}
+
+# the type `sel` tests: a pointer place tests its pointee
+fun tested_type(sc: *context.SemaContext, eid: id.ExprId) type.TypeId {
+    val t: type.TypeId = place_type(sc, eid);
+    if (type.is_pointer(?sc.s.types, t)) { ret type.deref_one(?sc.s.types, t); }
+    ret t;
+}
