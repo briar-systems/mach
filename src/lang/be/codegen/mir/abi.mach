@@ -271,10 +271,7 @@ fun agg_layout(ctx: *context.LowerCtx, ty: type.IrTypeId, is_aggr: bool) abi.Agg
 }
 
 fun advance_arg_cursors(slot: *abi.ParamSlot, gp_used: *i32, fp_used: *i32) {
-    if (slot.class == abi.CLASS_AGG) {
-        @gp_used = @gp_used + 1;
-        ret;
-    }
+
     var i: u32 = 0;
     for (i < slot.piece_count) {
         val k: abi.PieceKind = slot.pieces[i].kind;
@@ -472,6 +469,93 @@ fun call_ret_type(ctx: *context.LowerCtx, sig: type.IrTypeId, fallback: type.IrT
     ret fallback;
 }
 
+fun value_slot_valid(slot: *abi.ParamSlot, extent: u64) bool {
+    ret slot.class == abi.CLASS_VALUE && slot.size == extent && slot.reg == -1
+        && slot.piece_count == 0 && slot.offset == 0 && slot.indirect_size == 0 && slot.indirect_align == 0;
+}
+
+fun value_operand(ctx: *context.LowerCtx, v: value.Value) mir.MirOperand {
+    var op: mir.MirOperand = context.lower_value(ctx, v);
+    if (context.value_is_aggregate(ctx, v.ty) && op.kind == mir.MIR_OP_VREG) {
+        op = mir.op_mem_value(op.vreg, 0);
+    }
+    ret op;
+}
+
+fun push_value_instr(ctx: *context.LowerCtx, mb: *mir.MirBlock, opcode: mir.MirOpcode,
+                     ops: *mir.MirOperand, count: u32) R.Result[R.Void, str] {
+    val pushed: R.Result[R.Void, str] = context.push_instr(ctx, mb, mir.instr(opcode, ops, count, 0, 0));
+    if (R.is_err[R.Void, str](pushed)) { A.deallocate[mir.MirOperand](ctx.alloc, ops, count::usize); }
+    ret pushed;
+}
+
+fun lower_value_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.Instruction,
+                     iid: id.InstructionId, ret_type: type.IrTypeId, slots: *abi.SigLayout) R.Result[R.Void, str] {
+    val sig: O.Option[*type.IrType] = type.get(ctx.types, inst.aux_ty);
+    if (O.is_none[*type.IrType](sig)) { ret R.err[R.Void, str]("mir.abi: logical call requires a typed signature"); }
+    val fn_ty: *type.IrType = O.unwrap[*type.IrType](sig);
+    if (fn_ty.kind != type.IRT_FN || fn_ty.data.fn.variadic || inst.operand_count - 1 != slots.param_count) {
+        ret R.err[R.Void, str]("mir.abi: logical call requires exact nonvariadic arguments");
+    }
+    if (!value_slot_valid(?slots.ret_slot, type.byte_size_for_machine(ctx.types, ret_type, ctx.layout)::u64)) {
+        ret R.err[R.Void, str]("mir.abi: invalid logical result slot");
+    }
+    var i: u32 = 0;
+    for (i < slots.param_count) {
+        if (!value_slot_valid(?slots.params[i], type.byte_size_for_machine(ctx.types, fn_ty.data.fn.params[i], ctx.layout)::u64)) {
+            ret R.err[R.Void, str]("mir.abi: invalid logical argument slot");
+        }
+        i = i + 1;
+    }
+    val dst: u32 = context.instr_vreg(ctx, iid);
+    var result: mir.MirOperand = mir.op_vreg(dst);
+    if (context.value_is_aggregate(ctx, ret_type)) {
+        if (dst == mir.MIR_VREG_NIL) { ret R.err[R.Void, str]("mir.abi: logical composite call has no result owner"); }
+        val home: R.Result[R.Void, str] = context.alloc_object_storage(ctx, mb, dst, ret_type);
+        if (R.is_err[R.Void, str](home)) { ret home; }
+        result = mir.op_mem_value(dst, 0);
+    }
+    if (inst.operand_count == 0xFFFFFFFF) { ret R.err[R.Void, str]("mir.abi: logical call operand extent overflow"); }
+    val count: u32 = inst.operand_count + 1;
+    val ar: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, count::usize);
+    if (R.is_err[*mir.MirOperand, str](ar)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](ar)); }
+    val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](ar);
+    ops[0] = context.lower_value(ctx, inst.operands[0]);
+    ops[1] = result;
+    i = 0;
+    for (i < slots.param_count) { ops[i + 2] = value_operand(ctx, inst.operands[i + 1]); i = i + 1; }
+    ret push_value_instr(ctx, mb, mir.MIR_VALUE_CALL, ops, count);
+}
+
+fun lower_value_params(ctx: *context.LowerCtx, mb: *mir.MirBlock, slots: *abi.SigLayout) R.Result[R.Void, str] {
+    if (slots.param_count != ctx.param_count || slots.param_count != ctx.fn.param_count) {
+        ret R.err[R.Void, str]("mir.abi: logical parameter signature does not match its bindings");
+    }
+    var i: u32 = 0;
+    for (i < slots.param_count) {
+        val ty: type.IrTypeId = ctx.fn.params[i].ty;
+        if (!value_slot_valid(?slots.params[i], type.byte_size_for_machine(ctx.types, ty, ctx.layout)::u64)) {
+            ret R.err[R.Void, str]("mir.abi: invalid logical parameter slot");
+        }
+        val dst: u32 = ctx.param_vregs[i];
+        var dest: mir.MirOperand = mir.op_vreg(dst);
+        if (context.value_is_aggregate(ctx, ty)) {
+            val home: R.Result[R.Void, str] = context.alloc_object_storage(ctx, mb, dst, ty);
+            if (R.is_err[R.Void, str](home)) { ret home; }
+            dest = mir.op_mem_value(dst, 0);
+        }
+        val ar: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
+        if (R.is_err[*mir.MirOperand, str](ar)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](ar)); }
+        val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](ar);
+        ops[0] = dest;
+        ops[1] = mir.op_imm(i::i64);
+        val pushed: R.Result[R.Void, str] = push_value_instr(ctx, mb, mir.MIR_VALUE_PARAM, ops, 2);
+        if (R.is_err[R.Void, str](pushed)) { ret pushed; }
+        i = i + 1;
+    }
+    ret R.ok_void[str]();
+}
+
 pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.Instruction, iid: id.InstructionId) R.Result[R.Void, str] {
     if (inst.operand_count == 0) {
         ret R.err[R.Void, str]("mir.lower_ir: call with no callee operand");
@@ -491,6 +575,12 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     var layout: abi.SigLayout;
     val cls: R.Result[R.Void, str] = classify_signature(ctx, sig, ret_type, ?layout);
     if (R.is_err[R.Void, str](cls)) { ret cls; }
+
+    if (context.values_convention(ctx)) {
+        val vr: R.Result[R.Void, str] = lower_value_call(ctx, mb, inst, iid, ret_type, ?layout);
+        sig_layout_free(ctx, ?layout);
+        ret vr;
+    }
 
     val rslot: abi.ParamSlot = layout.ret_slot;
 
@@ -519,28 +609,24 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     var sret_ptr: u32 = mir.MIR_VREG_NIL;
     if (ret_mem && res_dst != mir.MIR_VREG_NIL) {
         var ra: R.Result[R.Void, str] = R.ok_void[str]();
-        if (rslot.class == abi.CLASS_AGG) {
-            ra = context.alloc_object_storage(ctx, mb, res_dst, ret_type);
-        } or {
-            var owned_size: u64 = ret_size;
-            if (rslot.class != abi.CLASS_SRET) {
-                val extent: R.Result[u64, str] = abi.carrier_storage_extent(?rslot);
-                if (R.is_err[u64, str](extent)) {
-                    sig_layout_free(ctx, ?layout);
-                    ret R.err[R.Void, str](R.unwrap_err[u64, str](extent));
-                }
-                owned_size = R.unwrap_ok[u64, str](extent);
-                val alignment: R.Result[u32, str] = abi.carrier_storage_alignment(?rslot);
-                if (R.is_err[u32, str](alignment)) {
-                    sig_layout_free(ctx, ?layout);
-                    ret R.err[R.Void, str](R.unwrap_err[u32, str](alignment));
-                }
-                if (R.unwrap_ok[u32, str](alignment) > ret_storage_align) {
-                    ret_storage_align = R.unwrap_ok[u32, str](alignment);
-                }
+        var owned_size: u64 = ret_size;
+        if (rslot.class != abi.CLASS_SRET) {
+            val extent: R.Result[u64, str] = abi.carrier_storage_extent(?rslot);
+            if (R.is_err[u64, str](extent)) {
+                sig_layout_free(ctx, ?layout);
+                ret R.err[R.Void, str](R.unwrap_err[u64, str](extent));
             }
-            ra = context.alloc_result_storage(ctx, mb, res_dst, owned_size, ret_storage_align);
+            owned_size = R.unwrap_ok[u64, str](extent);
+            val alignment: R.Result[u32, str] = abi.carrier_storage_alignment(?rslot);
+            if (R.is_err[u32, str](alignment)) {
+                sig_layout_free(ctx, ?layout);
+                ret R.err[R.Void, str](R.unwrap_err[u32, str](alignment));
+            }
+            if (R.unwrap_ok[u32, str](alignment) > ret_storage_align) {
+                ret_storage_align = R.unwrap_ok[u32, str](alignment);
+            }
         }
+        ra = context.alloc_result_storage(ctx, mb, res_dst, owned_size, ret_storage_align);
         if (R.is_err[R.Void, str](ra)) {
             sig_layout_free(ctx, ?layout);
             ret ra;
@@ -964,9 +1050,7 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, registers: *mir.Mir
         if (R.is_err[R.Void, str](ar)) { ret ar; }
         ret emit_call_reg(ctx, mb, registers, mir.op_preg(slot.reg::u32), mir.op_vreg(base), ptr_move_width(ctx));
     }
-    if (slot.class == abi.CLASS_AGG) {
-        ret context.emit_agg_load(ctx, registers, slot.reg::u32, argop);
-    }
+
     if (is_aggr) {
         var base: u32 = mir.MIR_VREG_NIL;
         val ar: R.Result[R.Void, str] = context.addr_to_vreg(ctx, mb, argop, ?base);
@@ -1083,9 +1167,7 @@ fun record_outgoing_size(ctx: *context.LowerCtx, bytes: i64) {
 }
 
 fun emit_ret_slot_to_vreg(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, dst: u32, is_aggr: bool, ty: type.IrTypeId, owned_align: u32) R.Result[R.Void, str] {
-    if (slot.class == abi.CLASS_AGG) {
-        ret context.emit_agg_store(ctx, mb, mir.op_mem_value(dst, 0), slot.reg::u32);
-    }
+
     if (is_aggr) {
         val extent: R.Result[u64, str] = abi.carrier_storage_extent(?slot);
         if (R.is_err[u64, str](extent)) { ret R.err[R.Void, str](R.unwrap_err[u64, str](extent)); }
@@ -1111,6 +1193,12 @@ pub fun lower_params(ctx: *context.LowerCtx, mb: *mir.MirBlock) R.Result[R.Void,
     var layout: abi.SigLayout;
     val cls: R.Result[R.Void, str] = classify_signature(ctx, ctx.fn.sig, ret_type, ?layout);
     if (R.is_err[R.Void, str](cls)) { ret cls; }
+
+    if (context.values_convention(ctx)) {
+        val vr: R.Result[R.Void, str] = lower_value_params(ctx, mb, ?layout);
+        sig_layout_free(ctx, ?layout);
+        ret vr;
+    }
 
     if (layout.ret_slot.class == abi.CLASS_SRET) {
         val sret_reg: i32 = ctx.tgt.abi.indirect_result_reg;
@@ -1203,11 +1291,7 @@ fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, copies: *mir.MirB
     if (slot.class == abi.CLASS_BYREF) {
         ret context.emit_mov_w(ctx, mb, mir.op_vreg(pv), mir.op_preg(slot.reg::u32), ptr_move_width(ctx));
     }
-    if (slot.class == abi.CLASS_AGG) {
-        val ar: R.Result[R.Void, str] = context.alloc_object_storage(ctx, mb, pv, ty);
-        if (R.is_err[R.Void, str](ar)) { ret ar; }
-        ret context.emit_agg_store(ctx, mb, mir.op_mem_value(pv, 0), slot.reg::u32);
-    }
+
     if (is_aggr) {
         val extent: R.Result[u64, str] = abi.carrier_storage_extent(?slot);
         if (R.is_err[u64, str](extent)) { ret R.err[R.Void, str](R.unwrap_err[u64, str](extent)); }
@@ -1291,10 +1375,14 @@ pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.
     ctx.cur_writes_secret = rv.secret;
     fin { ctx.cur_writes_secret = false; }
 
-    if (slot.class == abi.CLASS_AGG) {
-        val lr: R.Result[R.Void, str] = context.emit_agg_load(ctx, mb, slot.reg::u32, rvop);
-        if (R.is_err[R.Void, str](lr)) { ret lr; }
-        ret emit_bare_ret(ctx, mb);
+
+    if (context.values_convention(ctx)) {
+        if (!value_slot_valid(?slot, rsz)) { ret R.err[R.Void, str]("mir.abi: invalid logical result slot"); }
+        val ar: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 1::usize);
+        if (R.is_err[*mir.MirOperand, str](ar)) { ret R.err[R.Void, str](R.unwrap_err[*mir.MirOperand, str](ar)); }
+        val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](ar);
+        ops[0] = value_operand(ctx, rv);
+        ret push_value_instr(ctx, mb, mir.MIR_RET, ops, 1);
     }
     if (slot.class == abi.CLASS_SRET) {
         if (ctx.sret_vreg == mir.MIR_VREG_NIL) {
