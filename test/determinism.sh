@@ -119,7 +119,7 @@ abi = "$abi"
 opt = 0
 debug = false
 simd = "scalarize"
-vectorize = false
+vectorize = true
 float_reassoc = false
 [artifact.det]
 kind = "static"
