@@ -284,3 +284,122 @@ their shape (a `{ptr}`/`{result}` binding pair around one memory instruction).
 
 Verdict: compiler policy covered by the effect legs above; the std-side
 annotations remain Track C's S4 and are not needed for elimination.
+
+## Corpus goldens moved by this change
+
+Layer B compares `llvm-objdump` text of the `o2` build against
+`test/golden/<target>/<group>/<case>.dis`. Every corpus case folds its operands
+through `corpus.lib.fold`, whose `mix_*` entry points are small unannotated
+helpers in another module, so cross-module inlining reaches every case: each
+fold site now carries the byte loop inline instead of a call. The evidence
+below follows `doc/design/corpus-goldens-3218.md`: cases are classified by the
+first rule that applies (fewer calls, then a smaller first frame adjustment
+with no call removed, then a larger one, then an identical instruction
+multiset with frame offsets normalized, then other), calls are `call*` on
+x86-64 and `bl`/`blr` on aarch64, and the frame adjustment is the first
+`subq $N, %rsp` or `sub sp, sp, #N`. Computed by comparing each blessed golden
+with its `HEAD` version.
+
+## x86_64-linux: 91 goldens changed
+
+| classification | cases |
+| --- | --- |
+| calls removed | 91 |
+
+calls before 4304, after 1791, cases reaching zero calls 31
+frame direction: frame larger 37, frame same 44, frame smaller 10
+
+| golden | lines removed | lines added | calls before | calls after | class |
+| --- | --- | --- | --- | --- | --- |
+| bits/logic_u32 | 65 | 322 | 22 | 5 | calls removed |
+| bits/logic_u64 | 61 | 337 | 22 | 5 | calls removed |
+| bits/shift_i32 | 68 | 366 | 28 | 11 | calls removed |
+| bits/shift_i64 | 39 | 320 | 28 | 11 | calls removed |
+| bits/shift_u32 | 67 | 357 | 27 | 10 | calls removed |
+| bits/shift_u64 | 44 | 315 | 27 | 10 | calls removed |
+| call/call_chain | 199 | 460 | 172 | 154 | calls removed |
+| call/call_float_regs | 281 | 483 | 87 | 30 | calls removed |
+| call/call_indirect | 303 | 447 | 69 | 24 | calls removed |
+| call/call_int_regs | 415 | 557 | 123 | 24 | calls removed |
+| call/call_mixed | 283 | 551 | 53 | 35 | calls removed |
+| call/call_rec_edge | 335 | 398 | 87 | 50 | calls removed |
+| call/call_rec_large | 207 | 653 | 134 | 97 | calls removed |
+| call/call_rec_small | 306 | 705 | 71 | 30 | calls removed |
+| call/call_recursive | 240 | 248 | 53 | 13 | calls removed |
+| call/call_ret_large | 489 | 1162 | 138 | 96 | calls removed |
+| call/call_ret_small | 372 | 754 | 88 | 42 | calls removed |
+| call/call_variadic | 140 | 551 | 158 | 141 | calls removed |
+| cmp/branch_nest | 97 | 131 | 3 | 0 | calls removed |
+| cmp/cmp_i32 | 106 | 210 | 7 | 0 | calls removed |
+| cmp/cmp_i64 | 109 | 206 | 7 | 0 | calls removed |
+| cmp/cmp_u32 | 106 | 210 | 7 | 0 | calls removed |
+| cmp/cmp_u64 | 109 | 206 | 7 | 0 | calls removed |
+| cmp/loop_shapes | 95 | 185 | 6 | 0 | calls removed |
+| cmp/short_circuit | 360 | 348 | 36 | 11 | calls removed |
+| comptime/ct_runtime_agree | 175 | 405 | 54 | 37 | calls removed |
+| convert/bitcast | 46 | 215 | 11 | 0 | calls removed |
+| convert/ext_sign | 70 | 307 | 15 | 0 | calls removed |
+| convert/ext_zero | 70 | 305 | 15 | 0 | calls removed |
+| convert/f2f | 57 | 224 | 11 | 0 | calls removed |
+| convert/f2i | 125 | 735 | 54 | 21 | calls removed |
+| convert/f2u_high | 172 | 579 | 25 | 0 | calls removed |
+| convert/i2f | 101 | 702 | 37 | 4 | calls removed |
+| convert/trunc | 46 | 183 | 9 | 0 | calls removed |
+| float/arith_f32 | 437 | 405 | 65 | 46 | calls removed |
+| float/arith_f64 | 380 | 366 | 65 | 46 | calls removed |
+| float/cmp_f32 | 259 | 459 | 20 | 2 | calls removed |
+| float/cmp_f64 | 311 | 709 | 26 | 7 | calls removed |
+| float/special_f32 | 483 | 618 | 117 | 84 | calls removed |
+| float/special_f64 | 511 | 652 | 127 | 94 | calls removed |
+| frame/frame_align | 463 | 522 | 79 | 24 | calls removed |
+| frame/frame_large | 193 | 432 | 16 | 0 | calls removed |
+| frame/frame_spill | 149 | 373 | 32 | 15 | calls removed |
+| imm/imm_add | 66 | 332 | 25 | 8 | calls removed |
+| imm/imm_addr | 175 | 491 | 21 | 4 | calls removed |
+| imm/imm_logic | 90 | 363 | 21 | 4 | calls removed |
+| imm/imm_mov | 81 | 268 | 12 | 0 | calls removed |
+| mem/addr_modes | 299 | 517 | 36 | 19 | calls removed |
+| mem/array_index | 358 | 664 | 36 | 15 | calls removed |
+| mem/global_data | 160 | 436 | 35 | 12 | calls removed |
+| mem/global_zero | 210 | 492 | 28 | 7 | calls removed |
+| mem/loadstore | 107 | 375 | 25 | 8 | calls removed |
+| mem/ptr_arith | 233 | 491 | 29 | 8 | calls removed |
+| mem/rec_layout | 473 | 880 | 50 | 25 | calls removed |
+| mem/uni_layout | 216 | 493 | 32 | 15 | calls removed |
+| scalar/arith_i16 | 79 | 299 | 13 | 0 | calls removed |
+| scalar/arith_i32 | 87 | 301 | 13 | 0 | calls removed |
+| scalar/arith_i64 | 68 | 285 | 13 | 0 | calls removed |
+| scalar/arith_i8 | 79 | 299 | 13 | 0 | calls removed |
+| scalar/arith_u16 | 77 | 297 | 13 | 0 | calls removed |
+| scalar/arith_u32 | 85 | 299 | 13 | 0 | calls removed |
+| scalar/arith_u64 | 66 | 283 | 13 | 0 | calls removed |
+| scalar/arith_u8 | 77 | 297 | 13 | 0 | calls removed |
+| scalar/divrem_i32 | 112 | 357 | 13 | 0 | calls removed |
+| scalar/divrem_i64 | 91 | 285 | 13 | 0 | calls removed |
+| scalar/divrem_u32 | 82 | 259 | 10 | 0 | calls removed |
+| scalar/divrem_u64 | 70 | 230 | 10 | 0 | calls removed |
+| scalar/mul_i32 | 56 | 184 | 8 | 0 | calls removed |
+| scalar/mul_i64 | 41 | 164 | 8 | 0 | calls removed |
+| scalar/mul_u32 | 54 | 182 | 8 | 0 | calls removed |
+| scalar/mul_u64 | 38 | 160 | 8 | 0 | calls removed |
+| vec/autovec_loop | 502 | 550 | 10 | 0 | calls removed |
+| vec/vec_cmp_select | 301 | 534 | 169 | 109 | calls removed |
+| vec/vec_f32x2 | 265 | 217 | 37 | 16 | calls removed |
+| vec/vec_f32x3 | 310 | 273 | 33 | 9 | calls removed |
+| vec/vec_f32x4 | 413 | 273 | 71 | 16 | calls removed |
+| vec/vec_f32x5 | 1225 | 945 | 88 | 16 | calls removed |
+| vec/vec_f32x8 | 1639 | 1142 | 139 | 16 | calls removed |
+| vec/vec_f64x2 | 258 | 210 | 37 | 16 | calls removed |
+| vec/vec_i16x4 | 373 | 229 | 78 | 23 | calls removed |
+| vec/vec_i16x8 | 654 | 319 | 146 | 23 | calls removed |
+| vec/vec_i32x4 | 560 | 393 | 78 | 23 | calls removed |
+| vec/vec_i64x2 | 369 | 305 | 44 | 23 | calls removed |
+| vec/vec_i8x16 | 425 | 773 | 42 | 25 | calls removed |
+| vec/vec_lane_ops | 537 | 733 | 107 | 39 | calls removed |
+| vec/vec_mem | 1339 | 1369 | 78 | 19 | calls removed |
+| vec/vec_scalar_mix | 568 | 650 | 67 | 20 | calls removed |
+| vec/vec_u16x8 | 654 | 319 | 146 | 23 | calls removed |
+| vec/vec_u32x4 | 559 | 394 | 78 | 23 | calls removed |
+| vec/vec_u64x2 | 369 | 305 | 44 | 23 | calls removed |
+| vec/vec_u8x16 | 433 | 781 | 42 | 25 | calls removed |
+
