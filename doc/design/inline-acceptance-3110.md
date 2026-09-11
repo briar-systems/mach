@@ -950,3 +950,130 @@ frame direction: frame larger 27, frame same 9, frame smaller 32, no frame adjus
 | vec/vec_u32x4 | 789 | 420 | 78 | 23 | calls removed |
 | vec/vec_u64x2 | 505 | 346 | 44 | 23 | calls removed |
 | vec/vec_u8x16 | 425 | 598 | 42 | 25 | calls removed |
+
+## spirv: the module column
+
+`spirv` decodes with `spirv-dis` and has no layer C, so a golden move here is
+read more closely than on a machine column. Against `dev` at `da4fe7146`,
+layer B failed 84 cells (167 pass, 84 fail, 101 declared skips; every failure
+a `layer b o2` cell, layer A green). Calls are `OpFunctionCall`. Lines
+removed and added are counted on id-stripped text (every `%id` replaced by
+`%_`, the `; Bound:` line dropped), so id renumbering does not inflate them.
+
+Two module-wide facts hold on every one of the 84 goldens, checked by script:
+no golden gains an opcode kind it did not already use, and the only opcode
+kind that disappears from any module is `OpFunctionCall` (the 31 cases that
+reach zero calls). On 35 goldens the opcode multiset delta is exactly
+`OpFunctionCall` removals, the bodies of helper functions dropped once they
+had no caller left, and copies of the remaining helper bodies. On the other
+49 the residual, listed per golden in the last column, comes from three
+inlining consequences rather than from the copied bodies themselves: a
+same-module callee that grew past the growth bound once its own callees
+were inlined (`fold_vec` in the `vec` family, `fold32`/`fold64` in `float`)
+is now inlined at fewer of its call sites, so the copied `OpCompositeExtract`
+and NaN-check `OpFUnordNotEqual`/`OpSelectionMerge` counts fall while the
+callee stays called; an inlined copy specialized to constant arguments folds
+part of its body (`call/call_float_regs`, `frame/frame_align`,
+`vec/vec_cmp_*`); and single-digit changes in a case's own expressions where
+the copied loop sits between two uses (`+OpBitwiseOr 1` in `bits/logic_*`,
+`OpAccessChain` and `OpTypePointer` for pointer-typed locals and the dropped
+helpers' parameter types). The class rule is unchanged: every golden has fewer
+calls, and the per-golden call counts match the `x86_64-linux` rows on 83
+of the 84 goldens; `frame/frame_align` reads 76 to 21 against 79 to 24, three
+fewer both before and after, the same 55 calls removed.
+
+## spirv: 84 goldens changed
+
+| classification | cases |
+| --- | --- |
+| calls removed | 84 |
+
+calls (`OpFunctionCall`) before 3880, after 1557, cases reaching zero calls 31
+opcode multiset delta fully accounted for by OpFunctionCall removals, dropped helper functions and inlined helper-body opcodes: 35 of 84; residual across the rest: 105 opcodes up, 1517 down
+
+| golden | lines removed | lines added | calls before | calls after | functions before | functions after | class | residual opcode delta |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| bits/logic_u32 | 184 | 1090 | 22 | 5 | 3 | 2 | calls removed | +OpBitwiseOr 1 |
+| bits/logic_u64 | 178 | 956 | 22 | 5 | 3 | 2 | calls removed | +OpBitwiseOr 1 |
+| bits/shift_i32 | 193 | 1094 | 28 | 11 | 3 | 2 | calls removed | none |
+| bits/shift_i64 | 200 | 1037 | 28 | 11 | 3 | 2 | calls removed | none |
+| bits/shift_u32 | 204 | 1105 | 27 | 10 | 3 | 2 | calls removed | none |
+| bits/shift_u64 | 200 | 973 | 27 | 10 | 3 | 2 | calls removed | none |
+| call/call_float_regs | 1192 | 1962 | 87 | 30 | 10 | 8 | calls removed | -OpFAdd 2 -OpFMul 2 -OpFSub 2 |
+| call/call_int_regs | 1804 | 1946 | 123 | 24 | 13 | 5 | calls removed | -OpAccessChain 38 |
+| call/call_mixed | 621 | 1256 | 53 | 35 | 14 | 7 | calls removed | +OpCompositeExtract 3 |
+| call/call_rec_edge | 2710 | 3305 | 87 | 50 | 22 | 17 | calls removed | -OpAccessChain 28 |
+| call/call_rec_large | 2438 | 3512 | 134 | 97 | 23 | 19 | calls removed | -OpAccessChain 14 |
+| call/call_rec_small | 1692 | 2554 | 71 | 30 | 19 | 13 | calls removed | -OpAccessChain 13 |
+| call/call_ret_large | 932 | 2162 | 138 | 96 | 26 | 23 | calls removed | +OpAccessChain 13 |
+| call/call_ret_small | 1690 | 2272 | 88 | 42 | 28 | 22 | calls removed | +OpAccessChain 8 |
+| call/call_variadic | 615 | 1450 | 158 | 141 | 24 | 21 | calls removed | none |
+| cmp/branch_nest | 88 | 126 | 3 | 0 | 3 | 1 | calls removed | none |
+| cmp/cmp_i32 | 142 | 403 | 7 | 0 | 3 | 1 | calls removed | -OpTypePointer 1 |
+| cmp/cmp_i64 | 138 | 399 | 7 | 0 | 3 | 1 | calls removed | -OpTypePointer 1 |
+| cmp/cmp_u32 | 150 | 411 | 7 | 0 | 3 | 1 | calls removed | -OpTypePointer 1 |
+| cmp/cmp_u64 | 146 | 407 | 7 | 0 | 3 | 1 | calls removed | -OpTypePointer 1 |
+| cmp/loop_shapes | 134 | 340 | 6 | 0 | 3 | 1 | calls removed | none |
+| comptime/ct_runtime_agree | 299 | 1080 | 54 | 37 | 8 | 5 | calls removed | none |
+| convert/bitcast | 344 | 611 | 11 | 0 | 6 | 1 | calls removed | none |
+| convert/ext_sign | 318 | 886 | 15 | 0 | 5 | 1 | calls removed | none |
+| convert/ext_zero | 314 | 854 | 15 | 0 | 5 | 1 | calls removed | none |
+| convert/f2f | 197 | 626 | 11 | 0 | 4 | 1 | calls removed | none |
+| convert/f2i | 801 | 2217 | 54 | 21 | 12 | 4 | calls removed | none |
+| convert/f2u_high | 452 | 1565 | 25 | 0 | 8 | 5 | calls removed | none |
+| convert/i2f | 297 | 2107 | 37 | 4 | 5 | 3 | calls removed | none |
+| convert/trunc | 362 | 521 | 9 | 0 | 6 | 1 | calls removed | none |
+| float/arith_f32 | 2421 | 1971 | 65 | 46 | 6 | 3 | calls removed | -OpFUnordNotEqual 16 -OpSelectionMerge 16 |
+| float/arith_f64 | 2386 | 1940 | 65 | 46 | 6 | 3 | calls removed | -OpFUnordNotEqual 16 -OpSelectionMerge 16 |
+| float/cmp_f32 | 718 | 1296 | 20 | 2 | 6 | 2 | calls removed | +OpFOrdLessThan 1 -OpFUnordNotEqual 2 -OpSelectionMerge 2 |
+| float/cmp_f64 | 714 | 1457 | 26 | 7 | 7 | 4 | calls removed | +OpFConvert 5 +OpFOrdLessThan 1 -OpFUnordNotEqual 2 -OpSelectionMerge 2 |
+| float/special_f32 | 1321 | 1606 | 117 | 84 | 9 | 4 | calls removed | +OpConstant 1 +OpFNegate 1 -OpFUnordNotEqual 16 -OpSelectionMerge 16 -OpTypePointer 1 |
+| float/special_f64 | 1610 | 1761 | 127 | 94 | 11 | 4 | calls removed | -OpFUnordNotEqual 16 -OpSelectionMerge 16 -OpTypePointer 1 |
+| frame/frame_align | 1133 | 1226 | 76 | 21 | 12 | 6 | calls removed | +OpAccessChain 1 -OpCompositeExtract 54 -OpConstant 1 |
+| frame/frame_large | 335 | 934 | 16 | 0 | 5 | 1 | calls removed | +OpAccessChain 3 |
+| frame/frame_spill | 670 | 1407 | 32 | 15 | 6 | 3 | calls removed | none |
+| imm/imm_add | 335 | 1017 | 25 | 8 | 6 | 2 | calls removed | +OpISub 1 |
+| imm/imm_addr | 335 | 1099 | 21 | 4 | 4 | 2 | calls removed | +OpAccessChain 29 |
+| imm/imm_logic | 349 | 1023 | 21 | 4 | 6 | 2 | calls removed | +OpBitwiseOr 2 +OpNot 2 |
+| imm/imm_mov | 181 | 608 | 12 | 0 | 4 | 1 | calls removed | +OpConstant 2 |
+| mem/addr_modes | 902 | 1648 | 36 | 19 | 6 | 2 | calls removed | +OpAccessChain 9 |
+| mem/array_index | 1064 | 1758 | 36 | 15 | 7 | 3 | calls removed | -OpAccessChain 6 |
+| mem/loadstore | 729 | 1125 | 25 | 8 | 11 | 3 | calls removed | none |
+| mem/rec_layout | 435 | 1515 | 50 | 25 | 11 | 7 | calls removed | +OpAccessChain 4 |
+| scalar/arith_i16 | 173 | 771 | 13 | 0 | 3 | 1 | calls removed | none |
+| scalar/arith_i32 | 173 | 771 | 13 | 0 | 3 | 1 | calls removed | none |
+| scalar/arith_i64 | 169 | 723 | 13 | 0 | 3 | 1 | calls removed | none |
+| scalar/arith_i8 | 173 | 771 | 13 | 0 | 3 | 1 | calls removed | none |
+| scalar/arith_u16 | 179 | 777 | 13 | 0 | 3 | 1 | calls removed | none |
+| scalar/arith_u32 | 179 | 777 | 13 | 0 | 3 | 1 | calls removed | none |
+| scalar/arith_u64 | 165 | 675 | 13 | 0 | 3 | 1 | calls removed | none |
+| scalar/arith_u8 | 179 | 777 | 13 | 0 | 3 | 1 | calls removed | none |
+| scalar/divrem_i32 | 172 | 770 | 13 | 0 | 3 | 1 | calls removed | none |
+| scalar/divrem_i64 | 166 | 720 | 13 | 0 | 3 | 1 | calls removed | none |
+| scalar/divrem_u32 | 142 | 572 | 10 | 0 | 3 | 1 | calls removed | none |
+| scalar/divrem_u64 | 133 | 499 | 10 | 0 | 3 | 1 | calls removed | none |
+| scalar/mul_i32 | 149 | 467 | 8 | 0 | 3 | 1 | calls removed | none |
+| scalar/mul_i64 | 146 | 440 | 8 | 0 | 3 | 1 | calls removed | none |
+| scalar/mul_u32 | 175 | 493 | 8 | 0 | 3 | 1 | calls removed | none |
+| scalar/mul_u64 | 162 | 432 | 8 | 0 | 3 | 1 | calls removed | none |
+| vec/autovec_loop | 472 | 841 | 10 | 0 | 4 | 1 | calls removed | none |
+| vec/vec_cmp_i64 | 573 | 514 | 33 | 13 | 6 | 3 | calls removed | -OpCompositeExtract 26 -OpSLessThan 1 -OpSelect 2 |
+| vec/vec_cmp_select | 5507 | 6128 | 169 | 109 | 12 | 7 | calls removed | -OpCompositeConstruct 1 -OpCompositeExtract 68 -OpISub 8 -OpSelect 8 |
+| vec/vec_f32x2 | 476 | 290 | 37 | 16 | 5 | 2 | calls removed | +OpAccessChain 1 -OpCompositeExtract 32 |
+| vec/vec_f32x3 | 406 | 308 | 33 | 9 | 5 | 2 | calls removed | +OpAccessChain 1 -OpCompositeExtract 27 -OpFAdd 1 -OpFMul 1 |
+| vec/vec_f32x4 | 772 | 418 | 71 | 16 | 5 | 2 | calls removed | +OpAccessChain 1 -OpCompositeExtract 64 |
+| vec/vec_f32x5 | 1685 | 1247 | 88 | 16 | 5 | 2 | calls removed | +OpAccessChain 1 -OpCompositeExtract 80 |
+| vec/vec_f32x8 | 2632 | 1942 | 139 | 16 | 5 | 2 | calls removed | +OpAccessChain 1 -OpCompositeExtract 128 |
+| vec/vec_f64x2 | 472 | 282 | 37 | 16 | 5 | 2 | calls removed | +OpAccessChain 1 -OpCompositeExtract 32 |
+| vec/vec_i16x4 | 799 | 428 | 78 | 23 | 5 | 2 | calls removed | +OpAccessChain 1 -OpCompositeExtract 64 |
+| vec/vec_i16x8 | 2810 | 1948 | 146 | 23 | 5 | 2 | calls removed | +OpAccessChain 1 -OpCompositeExtract 144 -OpCompositeInsert 8 |
+| vec/vec_i32x4 | 796 | 426 | 78 | 23 | 5 | 2 | calls removed | +OpAccessChain 1 -OpCompositeExtract 64 |
+| vec/vec_i64x2 | 499 | 300 | 44 | 23 | 5 | 2 | calls removed | +OpAccessChain 1 -OpCompositeExtract 32 |
+| vec/vec_i8x16 | 161 | 993 | 42 | 25 | 5 | 3 | calls removed | +OpAccessChain 2 |
+| vec/vec_lane_ops | 2766 | 2927 | 107 | 39 | 10 | 6 | calls removed | -OpCompositeExtract 83 |
+| vec/vec_mem | 1187 | 1475 | 78 | 19 | 7 | 4 | calls removed | -OpAccessChain 2 -OpCompositeExtract 58 |
+| vec/vec_scalar_mix | 1050 | 1606 | 67 | 20 | 8 | 5 | calls removed | -OpCompositeExtract 33 |
+| vec/vec_u16x8 | 2808 | 1946 | 146 | 23 | 5 | 2 | calls removed | +OpAccessChain 1 -OpCompositeExtract 144 -OpCompositeInsert 8 |
+| vec/vec_u32x4 | 747 | 445 | 78 | 23 | 4 | 2 | calls removed | +OpAccessChain 1 -OpCompositeExtract 64 |
+| vec/vec_u64x2 | 500 | 297 | 44 | 23 | 5 | 2 | calls removed | +OpAccessChain 1 -OpCompositeExtract 32 |
+| vec/vec_u8x16 | 161 | 993 | 42 | 25 | 5 | 3 | calls removed | +OpAccessChain 2 |
