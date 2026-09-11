@@ -62,6 +62,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The ELF, COFF and Mach-O writers size and serialize every file from one
+  checked plan. A region is placed once, with its alignment, offset and extent
+  checked through the shared layout primitives, and every field is narrowed from
+  that plan; a section, table or address that would overflow, misalign or exceed
+  a format's field width is refused before any buffer exists, and a region whose
+  written bytes do not end on its planned extent refuses publication instead of
+  shipping. Section identity in object records, deferred relocations and the
+  writers is the nominal `SectionId`, so a section cannot be used as a symbol,
+  segment or table index without an explicit conversion. Valid output is
+  byte-identical, including RV32 static and relocatable images (#3113).
+
 - rename `sel` identifiers ahead of the v5 keyword (#3219)
 
 - Vector operations require an explicit target capability row. Each ISA declares
@@ -81,11 +92,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refreshes them. Dependency commands preserve the project's Git history.
 - Query products validate their inputs transitively before reuse, own their diagnostics and release replaced or failed candidates through their finalizers. Equal recomputed dependencies keep their revision, changed diagnostics with equal bytes stay observable, external revisions and the selected target invalidate what read them, and a failed dependency never leaves a stale successful product. Importers depend on a dependency's public surface, so a body-only edit reuses their typed results (#3220).
 - A build decodes each origin module's typed surface once per surface it builds,
-  however many public symbols forward from that origin, and remaps a resolve result
-  once per operation instead of on every definition read. A one-file build reaching
-  42 std modules drops from 677 ms to 488 ms in the debug compiler (sema 209 ms to
-  88 ms), and the 91-case x86_64-linux layer A corpus from 266 s to 196 s; the log
-  is `doc/design/build-overhead-3218.md` (#2299).
+  remaps a resolve result once per operation, acquires each origin's current
+  definition once per sema or lower computation, and verifies a field graph once
+  per type projection. On one 43-module artifact with the debug compiler, sema
+  drops from 212 ms to 75 ms and lower from 261 ms to 117 ms (37 ms and 82 ms
+  before the query work of #3247); the log is `doc/design/build-overhead-3218.md`
+  (#2299).
 - Editor analysis returns an owned diagnostic/source snapshot with explicit phase and target selection. Raw products have checked serial-view lifetimes. Closing a buffer retires its overlay, source payload and cached dependents while retaining its FileId. Buffer slots are reused, and checked editor teardown preserves owners on preparation failure (#2999).
 
 ## [4.30.0] - 2026-09-07
