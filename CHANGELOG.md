@@ -54,6 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - rename `sel` identifiers ahead of the v5 keyword (#3219)
 
+- Vector operations require an explicit target capability row. Each ISA declares
+  its supported (operation, lane kind, lane width) rows positively. Missing or
+  malformed operation and lane shapes no longer default to packed support (#3120).
+
 - Every dependency action selects its project with `mach dep <action> <path>`.
   Dependency names follow the path. Missing or extra operands are refused.
   Use `.` for the current project. Pull retains existing local copies and update
