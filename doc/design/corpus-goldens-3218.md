@@ -158,3 +158,7 @@ Blessed with the compiler at 023890ca after the sweep showed the same three case
 | spirv/call/call_ret_large.dis | 1455 | 1657 | 53 | 64 |
 | spirv/call/call_variadic.dis | 2156 | 2324 | 125 | 139 |
 | spirv/vec/vec_cmp_select.dis | 3920 | 4038 | 81 | 87 |
+
+## Third refresh: riscv64 frame alignment fix (d1376627, L3)
+
+`d1376627` keeps riscv64 frame slots 16-byte aligned below an odd saved-register area, which the L3 probe surfaced with an `#[align(16)]` tag local. It moved 36 riscv64 layer B goldens and nothing on any other target. Evidence, computed over every changed golden with frame-offset immediates normalized to `#`: all 36 have the same line count before and after, and the multiset of instructions is identical, so the only change is the frame offset each slot lands on (an 8-byte shift where the padding now sits). No instruction was added, removed or reordered.
