@@ -5,8 +5,8 @@ mach <command> [options]
 ```
 
 The compiler dispatches on `argv[1]`. With no command, or an unknown one, it
-prints usage and exits `1`. The project commands — `build`, `run`, `test`,
-`clean`, and `doc` — take the project as a **required** positional: a directory
+prints usage and exits `1`. The project commands — `build`, `check`, `run`,
+`test`, `clean`, and `doc` — take the project as a **required** positional: a directory
 containing `mach.toml`, or the path of a `mach.toml` itself. Nothing is
 searched for: `mach build src` inside a project is `error: no mach.toml in the
 project directory`, and a bare invocation with no path is a user error.
@@ -41,6 +41,7 @@ argument forwarding.
 | Command | Summary |
 |---------|---------|
 | `build` | compile the project to objects and (for a `bin` artifact) a linked binary |
+| `check` | run the frontend over the source the selected artifacts reach, and stop |
 | `run`   | execute the already-built binary (a post-`build` convenience, not a rebuild) |
 | `test`  | build the test binary and run the collected tests |
 | `clean` | remove the project's build output directory trees |
@@ -52,8 +53,10 @@ argument forwarding.
 
 ## Global flags
 
-Read by `build` and `test`, which share one schema. `run` accepts only the
-selection subset (`--target`, `--profile`, `--bin`, `-o`) and `doc` only
+Read by `build` and `test`, which share one schema. `check` accepts the
+selection subset without `-o` (`--target`, `--profile`, `--bin`, `--lib`) and
+the readout flags, `run` only the selection subset (`--target`, `--profile`,
+`--bin`, `-o`) and `doc` only
 `--target`, `--bin`, `--lib`, `--out`, and `--quiet`; every other option is
 unknown to them by name (`unknown flag '--emit-ir' for 'mach doc'`,
 `unknown flag '--lib' for 'mach run'`), exactly as a misspelled one is. A
@@ -66,7 +69,7 @@ verbosity flag (`-v`/`-vv`) and `--quiet` together is an error
 | `-vv`            | —                | `-v` plus a per-module/file line under each phase with its duration and a `(slow)` marker on the slowest |
 | `--quiet`, `-q`  | —                | suppress non-error output |
 | `--target <name>`| target name      | select a declared target; absent, resolves the host-matching declared target (`native`) |
-| `--profile <name>`| profile name    | select a `[profile.<name>]` build variant, whose `opt` sets the optimisation pipeline; absent, the sole declared profile, else the one marked `default = true`, else the built-in `debug` when the manifest declares none (see [manifest.md](manifest.md#built-in-profiles-and-profile-selection)) |
+| `--profile <name>`| profile name    | select a `[profile.<name>]` build variant, whose `opt` sets the optimisation pipeline; absent, the sole declared profile, else the one marked `default = true` (see [manifest.md](manifest.md#profile-requirement-and-selection)) |
 | `--bin <name>`   | artifact name    | narrow the build to one `bin` `[artifact.<name>]` |
 | `--lib <name>`   | artifact name    | narrow the build to one `static`/`shared` `[artifact.<name>]` (mutually exclusive with `--bin`) |
 | `-o <path>`      | path             | override the artifact path, rooted at the project root (build/run/test); accepted only when the selection resolves to one cell |
@@ -85,6 +88,36 @@ unknown flag).
 
 > `mach dep`, `mach init`, and `mach clean` do not use the shared config
 > parser; they read only their own flags listed below.
+
+## `mach check`
+
+```
+mach check <path> [--target <name>] [--profile <name>] [--bin <name> | --lib <name>] [-v | -vv | --quiet]
+```
+
+Runs the frontend over the source a build would compile and stops there.
+Selection is `mach build`'s: every artifact declared for the resolved target,
+or the one `--bin`/`--lib` names, on the selected profile, and the source
+checked is what those artifacts reach from their entries through `use`,
+including dependency modules. That is the selected-artifact graph, not the
+whole `src` tree: a file nothing selected imports is not read, and a `--bin`
+that reaches less checks less.
+
+Each cell runs load, resolve and sema through the same driver, queries and
+phase outcomes `mach build` and the editor use, so what check accepts, rejects
+or fails on is what the same build's frontend would, with the same diagnostics
+at the same locations and the same classification. The exit status is that
+classification: 0 accepted, 1 rejected (or a user error such as a bad manifest
+or selection), 2 an internal failure, 3 an environment failure. It is never
+derived from counting or matching diagnostic text.
+
+Nothing else runs. No build step or dependency step executes, nothing is
+lowered, generated, linked, published or written, and `out/` is not created.
+A generated source module or an embedded input that a step or a required
+artifact would produce is reported as the missing input it is, naming it; run
+the build that produces it first. A clean check is a statement about the
+frontend only: it does not establish that lowering, code generation, the ABI or
+the link would succeed.
 
 ## `mach build`
 
@@ -145,8 +178,22 @@ adjustment, including differences between absolute and image-relative symbols.
 The optimisation pipeline comes from the selected profile's `opt` — the profile
 is how a build picks its optimisation level.
 
-`--explain` resolves the full build plan — the (target, artifact) matrix and each
-unit's inputs — prints it, and exits without compiling or linking.
+`--plan` resolves the effective build — the (target, artifact) matrix and, per
+unit, the selected project, target, profile, artifact, entry, output paths, the
+prerequisite steps in execution order (each dependency's exported steps first,
+then the project's own), the artifact requirements, the manifest, dependency
+export and command-line link requirements, and the phase order — prints it, and
+exits. Nothing is executed: no generator or build step runs, no dependency is
+fetched, no compiler or linker runs, and no output is written or published.
+
+The plan is resolved through the same planner and the same dependency
+configuration a build uses, so an invalid manifest, a dependency that is not
+realized, and a dependency cycle are reported here exactly as a build reports
+them, with the same classification. What planning cannot know it says instead of
+guessing: a unit with prerequisites prints that its generated input bytes are
+unresolved until those prerequisites run. A printed plan is a statement about
+selection, not a claim that those bytes are valid or that the link will
+succeed.
 
 | Flag           | Value          | Effect |
 |----------------|----------------|--------|
@@ -159,7 +206,7 @@ unit's inputs — prints it, and exits without compiling or linking.
 | `--subsystem <k>` | `console`\|`gui` | the environment a windows executable declares it runs under, overriding the artifact's `subsystem` key (see below) |
 | `-L <dir>`     | dir            | add a search directory for `-l`-resolved inputs; repeatable |
 | `-l <name>`    | name           | link a named object, archive, or target-format shared library, resolved through the `-L` dirs (see below); repeatable |
-| `--explain`    | —              | print the resolved build plan and exit without building |
+| `--plan`       | —              | print the effective build plan and exit without building |
 | *(positional)* | input path     | a bare argument that contains `/`, ends in `.o` / `.obj` / `.a` / `.lib`, or names a `.so`, `.dylib`, or `.dll` is linked explicitly |
 
 Plus the global flags above.
@@ -657,11 +704,13 @@ mach init [dir] [options]
 
 Scaffolds a new project in `[dir]` (default: the current directory). It
 writes a complete `mach.toml` with a `[project]` block, `[target.*]` platforms
-for `linux`/`windows`/`darwin` on the host ISA, extension-correct binary
-artifacts split on `.exe` (or one `static` library artifact under `--lib`), a
-`[link.kernel32]` entry for the Windows artifact, `[profile.debug]`
-(`default = true`) and `[profile.release]`, and a `[dep.std]` dependency on
-`mach-std` at `branch/main`; then a starter source file, `src/root.mach` for a
+for `linux`/`windows`/`darwin` on the host ISA, one binary artifact whose
+`out = "bin/<id>{artifact.suffix}"` names `<id>.exe` on Windows and `<id>`
+elsewhere (or one `static` library artifact, `lib/lib<id>{artifact.suffix}`,
+under `--lib`), a `[link.kernel32]` entry the binary links on Windows,
+`[profile.debug]` (`default = true`) and `[profile.release]` with all five
+policy keys spelled out, and a `[dep.std]` dependency on `mach-std` at
+`branch/main`; then a starter source file, `src/root.mach` for a
 binary (`use std.runtime; use print: std.print;` and a `#[symbol("main")]`
 entry) or `src/lib.mach` for a library; then, as a separate stage, it
 initializes the directory as a git repository if it is not one and realizes

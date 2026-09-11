@@ -32,8 +32,8 @@ use std;                         # bare project id: binds std's public module
 ```
 
 A one-segment path equal to a resolvable project id binds that project's
-public module, the `entry` its artifacts share — see
-[modules.md](modules.md#bare-project-id-imports).
+public module, the `entry` shared by its library artifacts marked
+`default = true` — see [modules.md](modules.md#bare-project-id-imports).
 
 ## Design rule
 

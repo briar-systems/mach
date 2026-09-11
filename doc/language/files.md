@@ -59,7 +59,7 @@ abi = "sysv64"
 [artifact.myproj]
 kind = "bin"
 entry = "root.mach"
-out = "bin/myproj"
+out = "bin/myproj{artifact.suffix}"
 targets = ["*"]
 link = []
 need = []
@@ -68,6 +68,8 @@ need = []
 opt = 0
 debug = true
 simd = "scalarize"
+vectorize = false
+float_reassoc = false
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"

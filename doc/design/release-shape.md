@@ -21,7 +21,7 @@ main commit `b65afb9704218e89998af5f71050ca315e7709a9` with std **1.0.1**
 reachable from main. The bridge contains the same compiler source and manifest
 as the earlier audit bridge. No retired proof branch is required.
 
-A one-way transition stage follows: audited B builds `cd283ceeae8deb1ffbe760980f2d1db3ef22a7ac` (f2569491's source with the pre-suffix manifest of 52a53af8, branch `bootstrap/v5-transition`) once, and that compiler builds the development source, whose manifest and std pin the audited compiler cannot parse. There are five builds: one bridge build, audited A, B and C, and one transition build. A root `.mach-bootstrap` file names the stage a source tree requires (absent means `audited`), so `dev` keeps building with the audited compiler while the integration branch names `transition`. The
+There are four builds: one bridge build followed by audited A, B and C. The
 bootstrap uses the debug profile, with optimization and compiler debug symbols
 disabled. Both repositories install audited B only after B and C match byte for
 byte. Ordinary CI then runs its existing debug and release checks with that
