@@ -91,17 +91,28 @@ payload if one exists.
 var reply: Reply;           # selects Reply.empty
 ```
 
-## Canonical tag types
+## The std failure tags
 
-Mach provides three canonical tag types with fixed generic arities. They require
-no imports and use the same underlying tag mechanisms as user-defined tags:
+The canonical failure types are ordinary std tags, declared in std with fixed
+generic arities and no compiler knowledge of their names. They use the same
+mechanisms as every user tag: the same construction form, `sel`, guards,
+layout and reflection.
 
-- `res[T, E]` represents either an error of type `E` or a successful value of type `T`. It has fixed arity 2. Its first declared case is `err: E` and its second case is `ok: T`.
-- `opt[T]` represents either absence or a present value of type `T`. It has fixed arity 1. Its first declared case is payloadless `none` and its second case is `some: T`.
-- `err[E]` represents either an error of type `E` or payloadless success. It has fixed arity 1. Its first declared case is `err: E` and its second case is payloadless `ok`.
+```mach
+pub tag res[T, E]: u8 { err: E; ok: T; }
+pub tag opt[T]: u8    { none; some: T; }
+pub tag err[E]: u8    { err: E; ok; }
+```
 
-The `err[E]` form is distinct from `opt[E]` and is not an alias. Mach has no
-dummy success type, unit type, or general type argument inference.
+- `res[T, E]` is either an error of type `E` or a value of type `T`; `err: E` is
+  the first declared case and `ok: T` the second.
+- `opt[T]` is either absence or a value of type `T`; payloadless `none` is
+  first and `some: T` second.
+- `err[E]` is either an error of type `E` or payloadless success; `err: E` is
+  first and payloadless `ok` second. It is distinct from `opt[E]`, not an alias.
+
+There is no defaulted type argument, general type inference, dummy success
+type, unit value, constructor function or automatic error conversion.
 
 ```mach
 val good: res[i64, ParseError] = res[i64, ParseError].ok{42};
@@ -115,10 +126,15 @@ val failed:   err[ParseError] = err[ParseError].err{ParseError.overflow{}};
 ```
 
 Default initialization of `opt[T]` selects `none`. Default initialization of
-both `res[T, E]` and `err[E]` selects `err` with a zero-initialized error payload.
+both `res[T, E]` and `err[E]` selects `err` with a zero-initialized error
+payload. The case names `ok`, `err`, `some` and `none` are members of their
+tags, not keywords.
 
-The case names `ok`, `err`, `some`, and `none` are contextual members within
-their respective tags. They are not global keywords.
+Their layouts and closed case sets are part of std's SemVer contract; they ship
+in std 2.0.0 paired with Mach 5.0.0. Until that std lands, the compiler at the
+v5 integration state still seeds the three names itself so they resolve without
+an import; the std migration (S1, mach-std#617) removes that seeding, and a
+module declaring its own `res`, `opt` or `err` is refused until then.
 
 ## Case tests
 
@@ -201,12 +217,6 @@ case or extend a lifetime. There is no borrow checker, proof analysis or runtime
 validator. In the debug profile only, each guarded payload access compares the
 discriminator and traps on mismatch.
 
-## Failure handling
-
-Ordinary user-declared tags acquire no automatic `try` conventions. Explicit
-failure handling via `try` is reserved for the canonical types `res[T, E]`,
-`opt[T]`, and `err[E]`. See [try.md](try.md) for details.
-
 ## Layout and representation
 
 A tag is laid out with its discriminator at byte offset zero in target byte
@@ -247,7 +257,7 @@ payload qualifiers.
 
 A public tag has a public discriminator, while each payload retains its declared
 secrecy. Outer `^Tag` also protects the active case. Secret-dependent case tests
-and `try` branches must obey the constant-time rules. Copies preserve potentially
+must obey the constant-time rules. Copies preserve potentially
 secret storage across all cases and use the fixed public type extent, rather
 than choosing a copy size from a secret active case.
 
@@ -283,9 +293,16 @@ $each case in $cases(T) {
 place, and `T.[case]{payload}` constructs through the same single-case rule
 after specialization.
 
+## Deprecation
+
+`#[deprecated]` and `#[deprecated("msg")]` apply to a `tag` declaration and,
+inside the body, to a single case, where it is the only decorator a case
+accepts. A deprecated case warns at every external construction, `sel` test
+and payload place that names it; see [decorators.md](decorators.md).
+
 ## See also
 
-- [try.md](try.md) - explicit failure handling with canonical tags
+- [decorators.md](decorators.md) - `#[deprecated]`, `#[packed]`, `#[align(N)]`
 - [rec.md](rec.md) - records and struct layout
 - [uni.md](uni.md) - raw unions
 - [types.md](types.md) - primitive and compound type reference
