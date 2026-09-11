@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `{artifact.suffix}` in an artifact `out` expands to the conventional filename
+  suffix for the artifact's kind on the selected target (`.exe`/`.lib`/`.dll` on
+  Windows, `.a`/`.so` on Linux, `.a`/`.dylib` on Darwin, `.spv` for a SPIR-V
+  module), so one artifact names its output on every target while its identity
+  and `$bin.name` stay the table key. Literal paths stay literal, output
+  collisions are checked after expansion among the artifacts selected for a
+  target, and library forms an object format lacks are refused. `mach init`
+  writes one such artifact instead of a per-extension split (#3222).
+
+### Changed
+
+- Artifact and step requirements are category-qualified: `need` names
+  `step.<name>`, `artifact.<name>`, or a glob such as `artifact.shader-*` that
+  matches only within its category. A step and an artifact may share a name.
+  Bare entries, entries matching nothing in their category, self-requirements,
+  an artifact named by a step, and step cycles are manifest errors reported at
+  parse time (#3222).
+
 ### Fixed
+
 
 - Bracket interpretation of an imported name follows the imported declaration's
   own kind. An imported value keeps its subscript reading, and the resolver's
