@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an artifact named by a step, and step cycles are manifest errors reported at
   parse time (#3222).
 
+- A bare `use <id>;` of a dependency binds the entry shared by its library
+  artifacts marked `default = true`; several defaults may share that entry, a
+  `bin` never publishes one, and full-path imports need no default. The
+  artifact-less `lib.mach` fallback of 4.30 stays until 5.0.0 removes it
+  (#3222).
+
 ### Fixed
 
 - The names of tables marked `default = true` collected while parsing
