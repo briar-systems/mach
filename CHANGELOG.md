@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Use `.` for the current project. Pull retains existing local copies and update
   refreshes them. Dependency commands preserve the project's Git history.
 - Removed the ignored manifest keys `[project].name`, `description`, `mach`, and `[profile.*].emit_ir`/`emit_asm`. Use the CLI emission switches for side artifacts.
+- Query products validate their inputs transitively before reuse, own their diagnostics and release replaced or failed candidates through their finalizers. Equal recomputed dependencies keep their revision, changed diagnostics with equal bytes stay observable, external revisions and the selected target invalidate what read them, and a failed dependency never leaves a stale successful product. Importers depend on a dependency's public surface, so a body-only edit reuses their typed results (#3220).
 - Editor analysis returns an owned diagnostic/source snapshot with explicit phase and target selection. Raw products have checked serial-view lifetimes. Closing a buffer retires its overlay, source payload and cached dependents while retaining its FileId. Buffer slots are reused, and checked editor teardown preserves owners on preparation failure (#2999).
 - Root and dependency manifests share one strict schema. Profiles explicitly declare all compilation policy, and ambiguous target, profile, or artifact selections require a selector or a declared default.
 - Manifest requirements use explicit `step.<name>` and `artifact.<name>` categories, including category-specific globs. Step cycles are rejected during manifest parsing.
@@ -62,6 +63,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Shared width legalization and retained target coverage remain available.
 
 ### Fixed
+
+- Bracket interpretation of an imported name follows the imported declaration's
+  own kind. An imported value keeps its subscript reading, and the resolver's
+  choice tracks a dependency change without rewriting the parse tree (#3121).
+
+- Name resolution reports one phase row per build. A deferred comptime gate no
+  longer makes the resolver report every module again for each pass it takes,
+  and each module's resolve time is accumulated across those passes (#3231).
+
+- Test listing stops after collecting tests. It no longer generates or links
+  machine code, and it produces no test executable (#3230).
 
 - Dotted import, re-export and type names resolve identically with spacing or comments around dots. Diagnostics retain the original source spans (#3229).
 
