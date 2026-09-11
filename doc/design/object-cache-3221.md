@@ -51,11 +51,11 @@ operation; `project.begin_query_phase` resets the per-operation cache state and
 | class | candidate | verdict |
 |---|---|---|
 | compiler / schema identity | SHA-256 of the running executable, computed through `/proc/self/exe`, the darwin vnode of the code mapping, or the windows module path with delete sharing denied. The codec has a magic but no version number; the executable hash covers the codec's code. | keyed (see the identity decision below) |
-| transitive source | every loaded module's path and full text plus the dependency edges and emission order. std modules are loaded modules, so they are here too. | keyed, coarse: any edit misses the whole cell; the absolute path is in the key, so a relocated checkout misses too |
+| transitive source | every loaded module's path and full text plus the dependency edges and emission order. std modules are loaded modules, so they are here too. | keyed, coarse: any edit misses the whole cell. The path is keyed as spelled (`mach build .` and `mach build /abs/path` miss each other); that is sound, because with `-g` the spelling reaches the line tables and the objects differ (34 of 41 hello objects), and without `-g` they are identical. Phase 2 may key the canonical path and add the spelling only when debug info is on. |
 | resolved generic or inline bodies | covered by the whole-cell source hash, not by an instance graph | keyed, by construction |
 | std and dependency content | dependency manifest identity (alias, id, source, ref, content, version, direct aliases) plus the dependency modules' text through the class above | keyed |
 | target / ABI | request semantic hash (target, profile, artifact, goal, opt, debug, pie, simd, vectorize, float_reassoc, include_deps), `target.fingerprint`, os/isa/abi/platform names, project id, version and binary name, `[define]` names | keyed. The candidate hashes names by interner id (`fp_u32(id)`); ids are process-local, so the same names can produce different bytes across processes. It replaced them with `fp_name` (spelling). Ported. |
-| environment | the whole inherited process environment, sorted, whenever the project has a dependency or a step (dev's `write_step_environment` for #3146) | keyed, over-broad: a build from another shell misses even though objects only depend on the environment through steps, which the step chain already keys. Phase 2 narrows the snapshot to the identity part of the configuration. |
+| environment | the candidate keys the build-configuration bytes, which sample the whole inherited process environment whenever the project has a dependency or a step (dev's `write_step_environment` for #3146) | **wrong** as a persistent key: a build from another shell missed every entry (observed: `SHLVL` and `_` differ between a script and an interactive shell). Objects depend on the environment only through the steps that ran, and the step chain keys each step's program content, argv, env, inputs and outputs. Not ported: the snapshot keys `capture_build_identity` (request, target, names, defines, declared steps) and the planner environment stays in the in-process `Q_TARGET` input. Control: `passes.capture_build_identity:excludes_the_planner_environment`, plus the cross-environment hit below. |
 | artifact identity | `req.artifact` and `config.bin_name` are in the snapshot | keyed. Two artifacts of one project never share entries even for common modules; phase 2 may move artifact identity out of the module key once link inputs are cached separately. |
 | profiles | profile name, opt, debug, vectorize, float_reassoc, simd through the semantic hash | keyed |
 | embedded data | per typed module: embed path, length and content digest; an unavailable embed refuses the snapshot | keyed |
@@ -167,16 +167,82 @@ change and is preferred.
   Behavior is the same: unrelated names refuse the directory as foreign.
 - **`fp_name` in the configuration fingerprint** (spelling, not interner id),
   including dev's `config.name` which the candidate predates.
+- **Configuration identity, not configuration bytes**, in the snapshot: the
+  environment verdict above.
 - **`Q_LINK_CONFIG` keys `include_referenced`** (in-process fix the candidate
   carried; independent of the persistent cache, separate commit).
 - **Not ported:** the candidate's std pin bump and the `mach fmt` era
   `replace_source` helper; the CHANGELOG entry is rewritten for the opt-in.
 
-## Controls
+## Controls and measurement
 
-Recorded with the measurement in the follow-up commit on this branch: a cached
-and an uncached build of one corpus case produce byte-identical objects and
-binaries; each class marked keyed above has a change-one-input test in
-`src/lang/driver/cache.mach` (snapshot axes) or `src/lang/driver/tests.mach`
-(end to end: second process hits, edited source misses); and the codec, store
-and identity units carry their own fault-injection tests.
+Compiler: this branch at `486c92f1` built by the 4.30.0 seed, `release`
+profile (`out/release/mach`, 17.3 MB). Projects at profile `o2`,
+x86_64-linux: `hello` (one file plus std, 41 modules) and the corpus case
+`bits/logic_u32` in the hosted corpus project (43 modules). Host load average
+6 to 14 from concurrent workers throughout; spreads are stated. `hits` is the
+count of `-vv` `cached object` lines, the reuse signal; every sequence starts
+with one untimed build that warms the OS file cache, and "cold" means the
+output directory including `.mach-cache` was removed before the build.
+
+**Byte identity.** The corpus case built uncached, cached-cold (publishing)
+and cached-warm (43 of 43 hits): the 45 objects and binaries are identical
+across the three (`diff -r`).
+
+**Inert without `--cache`.** `strace -e openat` on an uncached hello build:
+zero opens of `/proc/self/exe` and zero of `.mach-cache`; with `--cache`, one
+open of `/proc/self/exe` (the memo) and 82 of `.mach-cache`. The no-flag build
+is dev's build.
+
+**Cross-environment hit.** hello published from an interactive shell, then
+rebuilt under `env -i PATH=... HOME=... SHLVL=9`: 41 of 41 hits.
+
+**Cold and warm, three repetitions, wall in ms (codegen phase in brackets).**
+
+| project | off, cold | off, warm | on, cold | on, warm | hits |
+|---|---|---|---|---|---|
+| hello | 518 / 518 / 535 [99, 100, 101] | 511 / 520 / 514 [98, 106, 97] | 688 / 699 / 673 [256, 257, 255] | 602 / 597 / 604 [171, 178, 170] | 41 / 41 |
+| corpus | 525 / 528 / 524 [95, 104, 99] | 534 / 525 / 519 [97, 100, 95] | 683 / 685 / 717 [261, 257, 269] | 609 / 614 / 597 [175, 174, 173] | 43 / 43 |
+
+With 16 codegen workers a warm hit is **not faster**: about 80 ms slower than
+an uncached build. The codegen phase of an uncached build is 95 to 106 ms
+because 41 to 43 modules generate in parallel; the hit path replaces it with
+the executable digest (about 139 ms, measured at 186 ms under `strace`) plus a
+serial restore of every entry (read, payload hash, decode, re-intern: about 35
+ms for 43 entries). Publication costs about 25 to 35 ms on top of the digest.
+With `--jobs 1` (serial codegen, hello, warm): uncached 218 / 219 / 225 ms
+against cached 193 / 189 ms after the first process at that spelling (the
+first missed because the earlier entries were published under the absolute
+project path), so the restore path does beat serial codegen by about 30 ms and
+the digest eats the gain.
+
+Where the remaining per-process cost is, warm corpus build at 16 workers,
+about 600 ms wall: load 34, resolve 19, sema 47, lower 75, **optimize 173**,
+codegen 173 (of which the digest about 139 and the restore about 35), emit 12,
+link 15. Two items dominate and neither is the object compile:
+
+1. the executable digest, addressed by the build id (phase 2, above);
+2. the optimize phase, which runs on every module before the cache decision.
+   The object key does not depend on the optimized IR, so phase 2 should ask
+   the store before lowering and optimizing a module whose object it can
+   restore; on this project that is the whole 173 ms, and with the digest gone
+   a warm build would be roughly load + resolve + sema + restore + link, near
+   200 ms against 520 uncached.
+
+**Mutation controls** (each removes one keyed input or guard from the
+implementation; the named test must fail; all 17 failed as required):
+source text, embedded digest, step chain, dependency content, compiler
+identity, configuration bytes, request digest, placement policy, link provider
+(`driver.cache:snapshot_tracks_...`); restore never hits
+(`driver.cache:repeated_project_operations_...`); `include_referenced` in the
+link configuration (`engine.link_config:...`); native section metadata in the
+codec (`cache.image:roundtrip_...`); `fp_name` by id (`query:fp_name_...`);
+payload hash check in the store (`cache.store:replace_digest_...`); the digest
+memo (`cache.compiler:second_digest_...`); the `--no-cache` stamp guard
+(`driver:build_steps_repeat_no_cache_...`); the planner environment in the
+identity (`passes.capture_build_identity:...`).
+
+**Suite, census, corpus.** Full suite through the from-source compiler at the
+final head: see the pull request for the exact count against the dev baseline
+of 2732; `sh test/census.sh` 9 of 9 ok; corpus layer B on x86_64-linux 91
+pass, 0 fail, 0 skip.
