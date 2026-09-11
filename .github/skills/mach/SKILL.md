@@ -105,11 +105,13 @@ fwd impl.page_size;
 
 ## Entrypoint and output
 
-An artifact's `out` is literal across every target it names. A cross-platform
-executable therefore uses disjoint artifacts for extension conventions:
-`out = "bin/app"` for non-Windows targets and `out = "bin/app.exe"` for Windows.
-`mach init` emits that split for binary projects. Do not use one `targets = ["*"]`
-artifact when its output must be directly executable on Windows and elsewhere.
+An artifact's `out` expands `{artifact.suffix}` using its selected target's naming
+rules. `out = "bin/app{artifact.suffix}"` gives `app.exe` on Windows and `app` on
+Linux/Darwin with one stable artifact identity. Literal output paths stay literal.
+`mach init` emits one artifact with this placeholder. `need` entries are qualified:
+`step.generate`, `artifact.support`, or globs such as `artifact.shader-*`. A root
+manifest declares at least one `[profile.<name>]`, and every declared profile
+states all five policy keys: `opt`, `debug`, `simd`, `vectorize`, `float_reassoc`.
 
 The stdlib provides the platform `_start`, which calls whatever function
 exports the linker symbol `main`. `use std.runtime;` is required to link it in
@@ -551,7 +553,7 @@ known open disclosure path - do not write production crypto against it.
 `#[scalar]` excludes a function from loop auto-vectorization (which runs in the
 release pipeline on targets with 128-bit vectors) and also blocks inlining, so
 the opt-out survives. The project-wide lever is the `vectorize` profile key in
-`mach.toml`, optional and default-on.
+`mach.toml`, stated by every profile.
 
 `#[naked]` emits the body exactly as written - no frame record, no stack
 allocation, no argument moves, and no return. The body may hold only inline

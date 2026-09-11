@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `{artifact.suffix}` in an artifact `out` expands to the conventional filename
+  suffix for the artifact's kind on the selected target (`.exe`/`.lib`/`.dll` on
+  Windows, `.a`/`.so` on Linux, `.a`/`.dylib` on Darwin, `.spv` for a SPIR-V
+  module), so one artifact names its output on every target while its identity
+  and `$bin.name` stay the table key. Literal paths stay literal, output
+  collisions are checked after expansion among the artifacts selected for a
+  target, and library forms an object format lacks are refused. `mach init`
+  writes one such artifact instead of a per-extension split (#3222).
 - `isa` accepts a canonical RISC-V extension string (`rv32imc`, `rv64imafd`,
   `rv64gc`) over the retained I, M, A, F, D, C, Zicsr and Zifencei vocabulary.
   The selection declares the machine's multiply and float facts, bounds the
@@ -18,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default machine (#3127).
 
 ### Fixed
+
+- The names of tables marked `default = true` collected while parsing
+  `[target.*]` and `[profile.*]` were never released (#3222).
+
 
 - Bracket interpretation of an imported name follows the imported declaration's
   own kind. An imported value keeps its subscript reading, and the resolver's
@@ -75,6 +87,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - rename `sel` identifiers ahead of the v5 keyword (#3219)
 
+- A root manifest declares at least one `[profile.<name>]`, and every declared
+  profile, in a root or a dependency manifest, states `opt`, `debug`, `simd`,
+  `vectorize` and `float_reassoc`. The built-in `debug`/`release` pair is now
+  synthesized only for a dependency that declares none, and `mach init` writes
+  both profiles in full with `debug` marked `default = true` (#3222).
+
+- Artifact and step requirements are category-qualified: `need` names
+  `step.<name>`, `artifact.<name>`, or a glob such as `artifact.shader-*` that
+  matches only within its category. A step and an artifact may share a name.
+  Bare entries, entries matching nothing in their category, self-requirements,
+  an artifact named by a step, and step cycles are manifest errors reported at
+  parse time (#3222).
+
+- A bare `use <id>;` of a dependency binds the entry shared by its library
+  artifacts marked `default = true`; several defaults may share that entry, a
+  `bin` never publishes one, and full-path imports need no default. The
+  artifact-less `lib.mach` fallback of 4.30 stays until 5.0.0 removes it
+  (#3222).
 - Vector operations require an explicit target capability row. Each ISA declares
   its supported (operation, lane kind, lane width) rows positively. Missing or
   malformed operation and lane shapes no longer default to packed support (#3120).
