@@ -172,6 +172,11 @@ Inside a condition, the right operand of `&&` is guarded by a `sel P.c` that is
 its left operand, because `&&` short-circuits. `||`, `!` and every other
 operator open no guard.
 
+A guard is matched by spelling, so a guarded place must be a path of
+identifiers, fields, dereferences and indexes by a name or a literal, `sel`
+rejects anything else, and reassigning an index binding inside the guard is not
+tracked and leaves the debug-profile discriminator check as the only net.
+
 Inside a guard the payload place is ordinary storage: reading it copies under
 the existing value rules, writing it keeps the selected case, and `?value.case`
 yields a typed pointer to naturally aligned storage. Whole-value assignment to
