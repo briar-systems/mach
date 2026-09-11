@@ -62,6 +62,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tail padding. Padding-only eightbytes now consume no register, the
   classifier emits one piece per populated eightbyte, and the store side zeroes
   every logical byte no piece delivers (#3263).
+- Secrecy provenance of a by-value aggregate was attached to its home instead
+  of its bytes: an aggregate's MIR vreg is the address of its home, and seeding
+  it secret for an outer-secret parameter or call result made every field read
+  of a by-value `^Rec` inside an `#[oblivious]` function a secret-dependent
+  address, while a public record with a `^` field reached the argument
+  registers straight from memory with public provenance. Call arguments,
+  returned values and parameters now carry the union of the object's secret
+  byte ranges, aggregate homes are never seeded secret, transport runs with the
+  object's secrecy so every carrier and caller copy is secret, and the release
+  profile's scalar replacement taints each field slot from the typed accesses
+  to that field rather than from the whole object, so a public field of a
+  record with a secret field stays public in both profiles (#3263).
 - The names of tables marked `default = true` collected while parsing
   `[target.*]` and `[profile.*]` were never released (#3222).
 
