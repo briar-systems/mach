@@ -70,18 +70,20 @@ isa = "x86_64"
 os  = "linux"
 abi = "sysv64"
 
-[profile.debug]                        # a build variant
+[profile.debug]                        # a build variant; at least one is required
 opt   = 0                              # 0 (debug pipeline) | 1 | 2 (release pipeline)
 debug = true                           # emit debug info for this profile
 simd  = "scalarize"                    # SIMD lever: "scalarize" | "require"
+vectorize = false                      # auto-vectorization lever
+float_reassoc = false                  # float reassociation permission
 
 [artifact.demo]                        # a produced artifact
 kind    = "bin"                        # "bin" | "static" | "shared"
 entry   = "main.mach"                  # entry source, relative to src
-out     = "bin/demo"                   # output path, relative to the project out
+out     = "bin/demo{artifact.suffix}"  # output path, relative to the project out
 targets = ["*"]                        # which declared targets build it ("*" = all)
 link    = []                           # [link.X] names this artifact links
-need    = []                           # [step.X] / [artifact.X] names this artifact requires
+need    = []                           # step.X / artifact.X requirements
 # subsystem = "gui"                    # optional: windows console/GUI selector
 # icon = "assets/demo.ico"             # optional: PE executable icon
 # manifest = "assets/demo.manifest"    # optional: PE application manifest
@@ -368,28 +370,49 @@ has to zero anything at startup.
 
 ## `[profile.<name>]`
 
-A profile is a build variant. The optimization level and debug-emission toggle
-live here because they are variant concerns.
+A profile is one explicit compilation policy: a build variant. The optimization
+level, the debug-emission toggle and the three SIMD levers live here because
+they are variant concerns, and every one of them is stated. A root manifest
+declares at least one profile; nothing is synthesized. Values that are
+*derived* rather than declared live elsewhere: a target's object format and
+naming come from `[target.*]` facts, and an absent optional feature such as a
+`[link.*]` filter axis is spelled `"*"` where it applies, not defaulted here.
 
 | Key     | Type    | Meaning |
 |---------|---------|---------|
 | `opt`   | integer | Optimization level: `0` selects the debug pipeline (the always-on passes only), `1` and `2` select the release pipeline. `1` and `2` currently share a pass set, which includes loop auto-vectorization (see `vectorize` below). Any other integer — or a non-integer — is a manifest error. |
 | `debug` | bool    | Emit debug info (DWARF on ELF/Mach-O, CodeView on COFF) for this profile. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
 | `simd`  | string  | SIMD scalarization lever. `"scalarize"` emits a defined unrolled scalar expansion wherever the target has no packed instruction for a vector operator, with a build-time note. `"require"` makes that a hard error naming the operation, its **lane width**, the function and the target. It applies **per operation on every target**, not only to targets with no vector unit: x86-64's SSE2 baseline has no 32-bit lane integer multiply and NEON has no 64-bit one, so a capable target scalarizes too. Any other string is a manifest error. |
-| `vectorize` | bool | **Optional** auto-vectorization lever; absent it defaults to `true`. When `true`, the release pipeline rewrites provably-safe counted loops to 128-bit SIMD on a target with hardware vectors; `false` skips the pass, so release output stays scalar. A non-boolean is a manifest error. |
-| `float_reassoc` | bool | **Optional** permission to treat floating-point addition and multiplication as **associative**; absent it defaults to `false`. It lets the vectorizer reduce an `f32`/`f64` accumulator through lane-count partial sums, which changes the result — see [Float reassociation](#float-reassociation) for what that costs and what it buys. A non-boolean is a manifest error. |
-| `default` | bool | **Optional.** `true` marks the profile a build uses when several are declared and `--profile` is absent. Exactly one profile may carry it. See [Built-in profiles and profile selection](#built-in-profiles-and-profile-selection). |
+| `vectorize` | bool | Auto-vectorization lever. When `true`, the release pipeline rewrites provably-safe counted loops to 128-bit SIMD on a target with hardware vectors; `false` skips the pass, so release output stays scalar. A non-boolean is a manifest error. |
+| `float_reassoc` | bool | Permission to treat floating-point addition and multiplication as **associative**. It lets the vectorizer reduce an `f32`/`f64` accumulator through lane-count partial sums, which changes the result — see [Float reassociation](#float-reassociation) for what that costs and what it buys. A non-boolean is a manifest error. |
+| `default` | bool | **Optional.** `true` marks the profile a build uses when several are declared and `--profile` is absent. Exactly one profile may carry it. See [Profile requirement and selection](#profile-requirement-and-selection). |
 
-Three keys (`opt`, `debug`, `simd`) are required in a declared profile;
-`vectorize` and `float_reassoc` are optional, defaulting to on and off
-respectively, and `default` is optional.
+Five keys (`opt`, `debug`, `simd`, `vectorize`, `float_reassoc`) are required
+in a declared profile, in a root and in a dependency manifest alike; only
+`default` is optional. A missing key is a manifest error naming the table and
+the key:
 
-### Built-in profiles and profile selection
+```
+error: mach.toml: [profile.debug] is missing required key 'vectorize'; a profile declares opt, debug, simd, vectorize and float_reassoc
+```
 
-A manifest that declares no `[profile.*]` table at all gets two built-in
-profiles, `debug` (`opt = 0`, `debug = true`) and `release` (`opt = 2`), and
-`debug` is the default. Declaring any profile replaces both built-ins: a
-manifest with only `[profile.fast]` has no `debug` and no `release`.
+### Profile requirement and selection
+
+A root manifest declares at least one `[profile.*]` table. A root that
+declares none does not build:
+
+```
+error: mach.toml: no [profile.<name>] table is declared; a build needs an explicit profile declaring opt, debug, simd, vectorize and float_reassoc
+```
+
+`mach init` writes `debug` (`opt = 0`, `debug = true`, `default = true`) and
+`release` (`opt = 2`, `vectorize = true`) in full, so a scaffold never starts
+from that error. A dependency manifest that declares no profile is still read
+(its profiles are never used to build the consumer, see
+[Root vs. dependency strictness](#root-vs-dependency-strictness)); it gets the
+two built-in profiles `debug` and `release` for its own `{profile.name}`
+templates. That synthesis is a dependency-only convenience and applies to no
+root.
 
 Which profile a build uses follows one rule, the same one that selects a
 target and an artifact:
@@ -425,10 +448,10 @@ it.
 
 The `simd`, `vectorize` and `float_reassoc` levers are always the **consumer's**.
 Consistent with the root-vs-dependency strictness above, a dependency's `[profile.*]`
-is parsed permissively and never read to build the consumer, so a library's values are
-inert — the effective levers come from the consumer's resolved profile. Libraries set
-nothing SIMD-specific and inherit the consumer's choice; there is no ecosystem fork and
-no dual API.
+is parsed by the same schema and never read to build the consumer, so a library's
+values are inert — the effective levers come from the consumer's resolved profile.
+Libraries set nothing SIMD-specific and inherit the consumer's choice; there is no
+ecosystem fork and no dual API.
 
 ### Float reassociation
 
@@ -1016,7 +1039,7 @@ in a dependency's manifest applies to consumers.
 
 ## Path templates
 
-Paths and `cmd`s expand over a closed, final set of seven variables:
+Paths and `cmd`s expand over a closed, final set of eight variables:
 
 - `{project.out}` — the **root** project's expanded `[project].out`, in every
   manifest of the closure.
@@ -1025,6 +1048,10 @@ Paths and `cmd`s expand over a closed, final set of seven variables:
 - `{target.os}` — the resolved target's `os` (e.g. `linux`).
 - `{target.abi}` — the resolved target's `abi` (e.g. `sysv64`).
 - `{profile.name}` — the selected profile name.
+- `{artifact.suffix}` — the conventional filename suffix of the artifact being
+  named, for its kind on the selected target (`.exe`, `.a`, `.so`, ...).
+  Available only in an artifact's own `out`. See
+  [Artifact filenames and identity](#artifact-filenames-and-identity).
 - `{artifact.<id>.out}` — the output path of a required artifact, relative to the
   project root exactly as `{project.out}` is. See
   [Artifact requirements](#artifact-requirements).
@@ -1042,8 +1069,9 @@ There are no `{name}`/`{ext}` or bare `{target}`/`{profile}` aliases. An
 unresolvable `{...}` reference, or an unterminated `{`, is a strict-parse error.
 `{project.out}` is not available inside `[project].out` itself (it would be
 self-referential), and `{artifact.<id>.out}` is not available inside an artifact's
-own `out` for the same reason. Two artifacts that resolve to the same `out` path
-collide and fail at build start.
+own `out` for the same reason. `{artifact.suffix}` is available nowhere but an
+artifact's own `out`. Two artifacts selected for one target that resolve to the
+same `out` path collide and fail at build start.
 
 ## Artifact requirements
 
@@ -1378,8 +1406,9 @@ need = []
 
 ## The compiler's own manifest
 
-Mach builds itself from a manifest that declares six targets, two binary
-artifacts split on the executable extension, and one dependency, `std`:
+Mach builds itself from a manifest that declares six targets, two explicit
+profiles, two binary artifacts with literal output paths, and one dependency,
+`std`:
 
 ```toml
 [project]
@@ -1400,14 +1429,19 @@ abi  = "win64"
 stack_reserve = 0x800000
 
 [profile.debug]
+default = true
 opt = 0
 debug = false
 simd = "scalarize"
+vectorize = true
+float_reassoc = false
 
 [profile.release]
 opt = 2
 debug = false
 simd = "scalarize"
+vectorize = true
+float_reassoc = false
 
 [artifact.mach]
 kind = "bin"
@@ -1427,13 +1461,17 @@ need = []
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v1.0.0"
+ref = "tag/v1.0.1"
 ```
 
 (The full manifest declares all six targets; `version` is whatever the tree's
 current release is.) `mach build .` selects the host-matching target via
 `native`, compiles `src/bin/main.mach` and its transitive imports — including
 modules from `std` at `dep/std/` — and links `out/<target>/<profile>/bin/mach`.
+The two artifacts keep literal outputs rather than one
+`bin/mach{artifact.suffix}` because the published seed compiler that
+bootstraps this tree predates the template; a manifest the seed must parse
+stays within what the seed accepts.
 `dep/std` is a git submodule whose gitlink is the pin; the build resolves it
 purely by that directory and verifies the gitlink from the repository's index,
 fetching nothing.

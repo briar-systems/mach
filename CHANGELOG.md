@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A root manifest declares at least one `[profile.<name>]`, and every declared
+  profile, in a root or a dependency manifest, states `opt`, `debug`, `simd`,
+  `vectorize` and `float_reassoc`. The built-in `debug`/`release` pair is now
+  synthesized only for a dependency that declares none, and `mach init` writes
+  both profiles in full with `debug` marked `default = true` (#3222).
+
 - Artifact and step requirements are category-qualified: `need` names
   `step.<name>`, `artifact.<name>`, or a glob such as `artifact.shader-*` that
   matches only within its category. A step and an artifact may share a name.
@@ -28,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parse time (#3222).
 
 ### Fixed
+
+- The names of tables marked `default = true` collected while parsing
+  `[target.*]` and `[profile.*]` were never released (#3222).
 
 
 - Bracket interpretation of an imported name follows the imported declaration's

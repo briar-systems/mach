@@ -66,7 +66,7 @@ verbosity flag (`-v`/`-vv`) and `--quiet` together is an error
 | `-vv`            | —                | `-v` plus a per-module/file line under each phase with its duration and a `(slow)` marker on the slowest |
 | `--quiet`, `-q`  | —                | suppress non-error output |
 | `--target <name>`| target name      | select a declared target; absent, resolves the host-matching declared target (`native`) |
-| `--profile <name>`| profile name    | select a `[profile.<name>]` build variant, whose `opt` sets the optimisation pipeline; absent, the sole declared profile, else the one marked `default = true`, else the built-in `debug` when the manifest declares none (see [manifest.md](manifest.md#built-in-profiles-and-profile-selection)) |
+| `--profile <name>`| profile name    | select a `[profile.<name>]` build variant, whose `opt` sets the optimisation pipeline; absent, the sole declared profile, else the one marked `default = true` (see [manifest.md](manifest.md#profile-requirement-and-selection)) |
 | `--bin <name>`   | artifact name    | narrow the build to one `bin` `[artifact.<name>]` |
 | `--lib <name>`   | artifact name    | narrow the build to one `static`/`shared` `[artifact.<name>]` (mutually exclusive with `--bin`) |
 | `-o <path>`      | path             | override the artifact path, rooted at the project root (build/run/test); accepted only when the selection resolves to one cell |
@@ -657,11 +657,13 @@ mach init [dir] [options]
 
 Scaffolds a new project in `[dir]` (default: the current directory). It
 writes a complete `mach.toml` with a `[project]` block, `[target.*]` platforms
-for `linux`/`windows`/`darwin` on the host ISA, extension-correct binary
-artifacts split on `.exe` (or one `static` library artifact under `--lib`), a
-`[link.kernel32]` entry for the Windows artifact, `[profile.debug]`
-(`default = true`) and `[profile.release]`, and a `[dep.std]` dependency on
-`mach-std` at `branch/main`; then a starter source file, `src/root.mach` for a
+for `linux`/`windows`/`darwin` on the host ISA, one binary artifact whose
+`out = "bin/<id>{artifact.suffix}"` names `<id>.exe` on Windows and `<id>`
+elsewhere (or one `static` library artifact, `lib/lib<id>{artifact.suffix}`,
+under `--lib`), a `[link.kernel32]` entry the binary links on Windows,
+`[profile.debug]` (`default = true`) and `[profile.release]` with all five
+policy keys spelled out, and a `[dep.std]` dependency on `mach-std` at
+`branch/main`; then a starter source file, `src/root.mach` for a
 binary (`use std.runtime; use print: std.print;` and a `#[symbol("main")]`
 entry) or `src/lib.mach` for a library; then, as a separate stage, it
 initializes the directory as a git repository if it is not one and realizes
