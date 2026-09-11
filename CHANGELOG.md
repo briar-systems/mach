@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `mach check <path>` runs load, resolve and sema over the source reachable from
+  the artifacts `mach build` would select, through the same driver, queries and
+  phase outcomes, and exits with the frontend's own classification: 0 accepted,
+  1 rejected or user error, 2 internal, 3 environment. No step runs, nothing is
+  lowered, generated, linked or written, and a generated or embedded input that
+  does not exist yet is reported as missing rather than produced (#3224).
+
 - `mach build <path> --plan` prints the effective build through the normal
   planner and exits: per cell the project, target, profile, artifact, entry,
   output paths, the dependency and project prerequisite steps in execution

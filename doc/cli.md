@@ -5,8 +5,8 @@ mach <command> [options]
 ```
 
 The compiler dispatches on `argv[1]`. With no command, or an unknown one, it
-prints usage and exits `1`. The project commands — `build`, `run`, `test`,
-`clean`, and `doc` — take the project as a **required** positional: a directory
+prints usage and exits `1`. The project commands — `build`, `check`, `run`,
+`test`, `clean`, and `doc` — take the project as a **required** positional: a directory
 containing `mach.toml`, or the path of a `mach.toml` itself. Nothing is
 searched for: `mach build src` inside a project is `error: no mach.toml in the
 project directory`, and a bare invocation with no path is a user error.
@@ -41,6 +41,7 @@ argument forwarding.
 | Command | Summary |
 |---------|---------|
 | `build` | compile the project to objects and (for a `bin` artifact) a linked binary |
+| `check` | run the frontend over the source the selected artifacts reach, and stop |
 | `run`   | execute the already-built binary (a post-`build` convenience, not a rebuild) |
 | `test`  | build the test binary and run the collected tests |
 | `clean` | remove the project's build output directory trees |
@@ -52,8 +53,10 @@ argument forwarding.
 
 ## Global flags
 
-Read by `build` and `test`, which share one schema. `run` accepts only the
-selection subset (`--target`, `--profile`, `--bin`, `-o`) and `doc` only
+Read by `build` and `test`, which share one schema. `check` accepts the
+selection subset without `-o` (`--target`, `--profile`, `--bin`, `--lib`) and
+the readout flags, `run` only the selection subset (`--target`, `--profile`,
+`--bin`, `-o`) and `doc` only
 `--target`, `--bin`, `--lib`, `--out`, and `--quiet`; every other option is
 unknown to them by name (`unknown flag '--emit-ir' for 'mach doc'`,
 `unknown flag '--lib' for 'mach run'`), exactly as a misspelled one is. A
@@ -85,6 +88,36 @@ unknown flag).
 
 > `mach dep`, `mach init`, and `mach clean` do not use the shared config
 > parser; they read only their own flags listed below.
+
+## `mach check`
+
+```
+mach check <path> [--target <name>] [--profile <name>] [--bin <name> | --lib <name>] [-v | -vv | --quiet]
+```
+
+Runs the frontend over the source a build would compile and stops there.
+Selection is `mach build`'s: every artifact declared for the resolved target,
+or the one `--bin`/`--lib` names, on the selected profile, and the source
+checked is what those artifacts reach from their entries through `use`,
+including dependency modules. That is the selected-artifact graph, not the
+whole `src` tree: a file nothing selected imports is not read, and a `--bin`
+that reaches less checks less.
+
+Each cell runs load, resolve and sema through the same driver, queries and
+phase outcomes `mach build` and the editor use, so what check accepts, rejects
+or fails on is what the same build's frontend would, with the same diagnostics
+at the same locations and the same classification. The exit status is that
+classification: 0 accepted, 1 rejected (or a user error such as a bad manifest
+or selection), 2 an internal failure, 3 an environment failure. It is never
+derived from counting or matching diagnostic text.
+
+Nothing else runs. No build step or dependency step executes, nothing is
+lowered, generated, linked, published or written, and `out/` is not created.
+A generated source module or an embedded input that a step or a required
+artifact would produce is reported as the missing input it is, naming it; run
+the build that produces it first. A clean check is a statement about the
+frontend only: it does not establish that lowering, code generation, the ABI or
+the link would succeed.
 
 ## `mach build`
 
