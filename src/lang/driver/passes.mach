@@ -62,6 +62,7 @@ use mach.lang.target.of;
 use mach.lang.type;
 
 use mach.lang.driver.project;
+use persistent: mach.lang.driver.cache;
 use step_env: mach.lang.driver.environment;
 use mach.lang.driver.union;
 use dq: mach.lang.driver.query;
@@ -957,7 +958,11 @@ pub fun back_half_key_for(p: *project.Project, m: *project.ModuleEntry) u64 {
 
 pub fun codegen_reusable(p: *project.Project, mid: session.ModuleId) R.Result[bool, fail.Fail] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
-    ret query.reusable[project.Project](?p.queries, p, query.Q_CODEGEN, back_half_key_for(p, m));
+    val reusable: R.Result[bool, fail.Fail] = query.reusable[project.Project](?p.queries, p, query.Q_CODEGEN, back_half_key_for(p, m));
+    if (R.is_err[bool, fail.Fail](reusable) || R.unwrap_ok[bool, fail.Fail](reusable)) { ret reusable; }
+    val restored: R.Result[bool, str] = persistent.restore(p, mid);
+    if (R.is_err[bool, str](restored)) { ret R.err[bool, fail.Fail](fail.message(R.unwrap_err[bool, str](restored))); }
+    ret R.ok[bool, fail.Fail](R.unwrap_ok[bool, str](restored));
 }
 
 pub fun test_build(p: *project.Project) bool {
@@ -1877,9 +1882,30 @@ pub fun acquire_codegen_inputs(p: *project.Project) R.Result[R.Void, outcome.Fai
     ret R.ok_void[outcome.Fail]();
 }
 
+pub fun prepare_persistent_cache(p: *project.Project) R.Result[R.Void, outcome.Fail] {
+    if (!persistent.operation_active(p)) { ret R.err[R.Void, outcome.Fail](outcome.internal("persistent cache requires the current query operation")); }
+    if (p.cache_initialized) { ret R.ok_void[outcome.Fail](); }
+    if (!p.req.object_cache) {
+        val disabled: R.Result[R.Void, str] = persistent.prepare(p, nil, 0);
+        if (R.is_err[R.Void, str](disabled)) { ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](disabled))); }
+        ret R.ok_void[outcome.Fail]();
+    }
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret R.err[R.Void, outcome.Fail](outcome.internal("cache fingerprint allocator is unavailable")); }
+    val captured: R.Result[query.QueryOutput, str] = capture_build_identity(p, ?backing);
+    if (R.is_err[query.QueryOutput, str](captured)) { ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[query.QueryOutput, str](captured))); }
+    val bytes: query.QueryOutput = R.unwrap_ok[query.QueryOutput, str](captured);
+    fin { if (bytes.bytes != nil) { A.deallocate[u8](?backing, bytes.bytes, bytes.len::usize); } }
+    val prepared: R.Result[R.Void, str] = persistent.prepare(p, bytes.bytes, bytes.len::usize);
+    if (R.is_err[R.Void, str](prepared)) { ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](prepared))); }
+    ret R.ok_void[outcome.Fail]();
+}
+
 pub fun run_codegen_pass(p: *project.Project) R.Result[R.Void, outcome.Fail] {
     val inputs: R.Result[R.Void, outcome.Fail] = acquire_codegen_inputs(p);
     if (R.is_err[R.Void, outcome.Fail](inputs)) { ret inputs; }
+    val cached: R.Result[R.Void, outcome.Fail] = prepare_persistent_cache(p);
+    if (R.is_err[R.Void, outcome.Fail](cached)) { ret cached; }
     var i: u32 = 0;
     for (i < p.emit_len) {
         val mid: session.ModuleId = p.topo[i];
@@ -2060,10 +2086,23 @@ pub fun q_codegen_compute(p: *project.Project, key: u64, alloc: *A.Allocator, di
         di = di + 1;
     }
 
+    if (m.staged_image == nil) {
+        val restored: R.Result[bool, str] = persistent.restore(p, mid);
+        if (R.is_err[bool, str](restored)) {
+            sources_dnit(s.alloc, ?srcs);
+            ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[bool, str](restored)));
+        }
+    }
     val staged: *of.ObjectImage = m.staged_image;
     if (staged != nil) {
         m.staged_image = nil;
         sources_dnit(s.alloc, ?srcs);
+        val published: R.Result[R.Void, str] = persistent.publish(p, m, staged);
+        if (R.is_err[R.Void, str](published)) {
+            obj.dnit(staged);
+            A.deallocate[of.ObjectImage](s.alloc, staged, 1);
+            ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](published)));
+        }
         ret image_handle_encode(alloc, staged);
     }
 
@@ -2079,6 +2118,11 @@ pub fun q_codegen_compute(p: *project.Project, key: u64, alloc: *A.Allocator, di
     if (R.is_err[of.ObjectImage, fail.Fail](res_cg)) { ret R.err[query.QueryOutput, fail.Fail](R.unwrap_err[of.ObjectImage, fail.Fail](res_cg)); }
     readout.item(p.events, readout.PH_CODEGEN, project.fqn_name(p, m.fqn), t_cg);
     var img: of.ObjectImage = R.unwrap_ok[of.ObjectImage, fail.Fail](res_cg);
+    val published: R.Result[R.Void, str] = persistent.publish(p, m, ?img);
+    if (R.is_err[R.Void, str](published)) {
+        obj.dnit(?img);
+        ret R.err[query.QueryOutput, fail.Fail](fail.message(R.unwrap_err[R.Void, str](published)));
+    }
 
     val br: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](alloc, 1::usize);
     if (R.is_err[*of.ObjectImage, str](br)) {
@@ -2321,6 +2365,17 @@ pub fun capture_build_config(p: *project.Project, alloc: *A.Allocator) R.Result[
     ret dq.fp_take(?fb);
 }
 
+# the configuration without the planner environment: what a persistent product
+# may key on. steps that ran are keyed by their own fingerprint chain, and the
+# inherited environment reaches an object only through them.
+pub fun capture_build_identity(p: *project.Project, alloc: *A.Allocator) R.Result[query.QueryOutput, str] {
+    var fb: dq.FpBuf = dq.FpBuf{ alloc: alloc };
+    fin { dq.fp_free(?fb); }
+    val written: R.Result[R.Void, str] = write_build_identity(?fb, p);
+    if (R.is_err[R.Void, str](written)) { ret R.err[query.QueryOutput, str](R.unwrap_err[R.Void, str](written)); }
+    ret dq.fp_take(?fb);
+}
+
 pub fun set_build_config_input(p: *project.Project) R.Result[R.Void, str] {
     val captured: R.Result[query.QueryOutput, str] = capture_build_config(p, p.s.alloc);
     if (R.is_err[query.QueryOutput, str](captured)) { ret R.void_of[query.QueryOutput, str](captured); }
@@ -2330,8 +2385,14 @@ pub fun set_build_config_input(p: *project.Project) R.Result[R.Void, str] {
 }
 
 fun write_build_config(fb: *dq.FpBuf, p: *project.Project) R.Result[R.Void, str] {
+    val identity: R.Result[R.Void, str] = write_build_identity(fb, p);
+    if (R.is_err[R.Void, str](identity)) { ret identity; }
+    ret write_step_environment(fb, p);
+}
+
+fun write_build_identity(fb: *dq.FpBuf, p: *project.Project) R.Result[R.Void, str] {
     var digest: [32]u8;
-    val hr: R.Result[R.Void, str] = request.semantic_hash(p.s.alloc, ?p.req, ?digest[0]);
+    val hr: R.Result[R.Void, str] = request.semantic_hash(fb.alloc, ?p.req, ?digest[0]);
     if (R.is_err[R.Void, str](hr)) { ret hr; }
     val ah: R.Result[R.Void, str] = dq.fp_bytes(fb, ?digest[0], request.HASH_SIZE::u32);
     if (R.is_err[R.Void, str](ah)) { ret ah; }
@@ -2339,27 +2400,27 @@ fun write_build_config(fb: *dq.FpBuf, p: *project.Project) R.Result[R.Void, str]
     val tf: R.Result[R.Void, str] = write_target_fingerprint(fb, p);
     if (R.is_err[R.Void, str](tf)) { ret tf; }
 
-    val a5: R.Result[R.Void, str] = dq.fp_u32(fb, p.target_entry.os_name::u32);  if (R.is_err[R.Void, str](a5)) { ret a5; }
-    val a6: R.Result[R.Void, str] = dq.fp_u32(fb, p.target_entry.isa_name::u32); if (R.is_err[R.Void, str](a6)) { ret a6; }
-    val a7: R.Result[R.Void, str] = dq.fp_u32(fb, p.target_entry.abi_name::u32); if (R.is_err[R.Void, str](a7)) { ret a7; }
-    val apl: R.Result[R.Void, str] = dq.fp_u32(fb, p.target_entry.platform_name::u32); if (R.is_err[R.Void, str](apl)) { ret apl; }
-    val a8: R.Result[R.Void, str] = dq.fp_u32(fb, p.config.id::u32);      if (R.is_err[R.Void, str](a8)) { ret a8; }
-    val a9: R.Result[R.Void, str] = dq.fp_u32(fb, p.config.version::u32); if (R.is_err[R.Void, str](a9)) { ret a9; }
-    val aa: R.Result[R.Void, str] = dq.fp_u32(fb, p.config.name::u32);    if (R.is_err[R.Void, str](aa)) { ret aa; }
-    val ab: R.Result[R.Void, str] = dq.fp_u32(fb, p.config.bin_name::u32); if (R.is_err[R.Void, str](ab)) { ret ab; }
+    val a5: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, p.target_entry.os_name);  if (R.is_err[R.Void, str](a5)) { ret a5; }
+    val a6: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, p.target_entry.isa_name); if (R.is_err[R.Void, str](a6)) { ret a6; }
+    val a7: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, p.target_entry.abi_name); if (R.is_err[R.Void, str](a7)) { ret a7; }
+    val apl: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, p.target_entry.platform_name); if (R.is_err[R.Void, str](apl)) { ret apl; }
+    val a8: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, p.config.id);      if (R.is_err[R.Void, str](a8)) { ret a8; }
+    val a9: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, p.config.version); if (R.is_err[R.Void, str](a9)) { ret a9; }
+    val aa: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, p.config.name);    if (R.is_err[R.Void, str](aa)) { ret aa; }
+    val ab: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, p.config.bin_name); if (R.is_err[R.Void, str](ab)) { ret ab; }
 
     val ac: R.Result[R.Void, str] = dq.fp_u32(fb, p.config.define_count); if (R.is_err[R.Void, str](ac)) { ret ac; }
     var i: u32 = 0;
     for (i < p.config.define_count) {
-        val ad: R.Result[R.Void, str] = dq.fp_u32(fb, p.config.defines[i]::u32);
+        val ad: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, p.config.defines[i]);
         if (R.is_err[R.Void, str](ad)) { ret ad; }
         i = i + 1;
     }
-    ret write_step_environment(fb, p);
+    ret write_step_declarations(fb, p);
 }
 
 fun write_target_fingerprint(fb: *dq.FpBuf, p: *project.Project) R.Result[R.Void, str] {
-    var e: binary.Encoder = binary.encoder(p.s.alloc, binary.LITTLE);
+    var e: binary.Encoder = binary.encoder(fb.alloc, binary.LITTLE);
     if (!target.fingerprint(?p.target, ?e)) {
         binary.encoder_dnit(?e);
         ret R.err[R.Void, str]("out of memory fingerprinting the selected target");
@@ -2375,22 +2436,26 @@ fun write_target_fingerprint(fb: *dq.FpBuf, p: *project.Project) R.Result[R.Void
     ret rb;
 }
 
-fun write_step_environment(fb: *dq.FpBuf, p: *project.Project) R.Result[R.Void, str] {
+fun write_step_declarations(fb: *dq.FpBuf, p: *project.Project) R.Result[R.Void, str] {
     val rc: R.Result[R.Void, str] = dq.fp_u32(fb, p.config.step_count);
     if (R.is_err[R.Void, str](rc)) { ret rc; }
     var si: u32 = 0;
     for (si < p.config.step_count) {
         val st: *manifest.StepDef = ?p.config.steps[si];
-        val rn: R.Result[R.Void, str] = dq.fp_u32(fb, st.name::u32);  if (R.is_err[R.Void, str](rn)) { ret rn; }
+        val rn: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, st.name);  if (R.is_err[R.Void, str](rn)) { ret rn; }
         val re: R.Result[R.Void, str] = dq.fp_u32(fb, st.env_count);  if (R.is_err[R.Void, str](re)) { ret re; }
         var ei: u32 = 0;
         for (ei < st.env_count) {
-            val rk: R.Result[R.Void, str] = dq.fp_u32(fb, st.env_keys[ei]::u32);   if (R.is_err[R.Void, str](rk)) { ret rk; }
-            val rv: R.Result[R.Void, str] = dq.fp_u32(fb, st.env_values[ei]::u32); if (R.is_err[R.Void, str](rv)) { ret rv; }
+            val rk: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, st.env_keys[ei]);   if (R.is_err[R.Void, str](rk)) { ret rk; }
+            val rv: R.Result[R.Void, str] = dq.fp_name(fb, ?p.s.interner, st.env_values[ei]); if (R.is_err[R.Void, str](rv)) { ret rv; }
             ei = ei + 1;
         }
         si = si + 1;
     }
+    ret R.ok_void[str]();
+}
+
+fun write_step_environment(fb: *dq.FpBuf, p: *project.Project) R.Result[R.Void, str] {
     if (p.config.step_count == 0 && p.config.dep_count == 0) { ret dq.fp_u32(fb, 0); }
     val inherited: **u8 = env.environ();
     if (inherited == nil) { ret R.err[R.Void, str]("planner environment unavailable"); }
@@ -2436,8 +2501,12 @@ test "mach.lang.driver.passes.write_build_config:distinguishes_target_identity" 
     if (R.is_err[session.Session, str](sr)) { ret 1; }
     var s: session.Session = R.unwrap_ok[session.Session, str](sr);
 
-    var te:  project.TargetEntry;
+    var te: project.TargetEntry;
+    te.os_name = intern.STR_NIL; te.isa_name = intern.STR_NIL;
+    te.abi_name = intern.STR_NIL; te.platform_name = intern.STR_NIL;
     var cfg: project.ProjectConfig;
+    cfg.id = intern.STR_NIL; cfg.version = intern.STR_NIL;
+    cfg.name = intern.STR_NIL; cfg.bin_name = intern.STR_NIL;
 
     var px: project.Project;
     px.s            = ?s;
@@ -2700,8 +2769,12 @@ test "mach.lang.driver.passes.write_build_config:every_tuple_field_moves_the_fin
     var s: session.Session = R.unwrap_ok[session.Session, str](sr);
     fin { session.dnit(?s); }
 
-    var te:  project.TargetEntry;
+    var te: project.TargetEntry;
+    te.os_name = intern.STR_NIL; te.isa_name = intern.STR_NIL;
+    te.abi_name = intern.STR_NIL; te.platform_name = intern.STR_NIL;
     var cfg: project.ProjectConfig;
+    cfg.id = intern.STR_NIL; cfg.version = intern.STR_NIL;
+    cfg.name = intern.STR_NIL; cfg.bin_name = intern.STR_NIL;
 
     var base: project.Project;
     base.s            = ?s;
@@ -2741,7 +2814,7 @@ test "mach.lang.driver.passes.write_build_config:every_tuple_field_moves_the_fin
     if (!ut_fp_digest(?alloc, ?v, ?digests[8][0])) { ret 1; }
 
     var define_ids: [1]intern.StrId;
-    define_ids[0] = 7;
+    define_ids[0] = R.unwrap_ok[intern.StrId, str](intern.intern(?s.interner, "TRACE"));
     v = base;
     v.config.defines      = ?define_ids[0];
     v.config.define_count = 1;
@@ -2749,10 +2822,10 @@ test "mach.lang.driver.passes.write_build_config:every_tuple_field_moves_the_fin
 
     var env_keys:   [1]intern.StrId;
     var env_values: [1]intern.StrId;
-    env_keys[0]   = 11;
-    env_values[0] = 13;
+    env_keys[0] = R.unwrap_ok[intern.StrId, str](intern.intern(?s.interner, "MODE"));
+    env_values[0] = R.unwrap_ok[intern.StrId, str](intern.intern(?s.interner, "audit"));
     var steps: [1]manifest.StepDef;
-    steps[0].name       = 17;
+    steps[0].name = R.unwrap_ok[intern.StrId, str](intern.intern(?s.interner, "generate"));
     steps[0].env_keys   = ?env_keys[0];
     steps[0].env_values = ?env_values[0];
     steps[0].env_count  = 1;
@@ -2773,6 +2846,58 @@ test "mach.lang.driver.passes.write_build_config:every_tuple_field_moves_the_fin
     ret 0;
 }
 
+
+fun t_capture_bytes(p: *project.Project, a: *A.Allocator, identity: bool) R.Result[query.QueryOutput, str] {
+    if (identity) { ret capture_build_identity(p, a); }
+    ret capture_build_config(p, a);
+}
+
+fun t_capture_equal(a: *A.Allocator, left: *project.Project, right: *project.Project, identity: bool) i32 {
+    val l: R.Result[query.QueryOutput, str] = t_capture_bytes(left, a, identity);
+    val r: R.Result[query.QueryOutput, str] = t_capture_bytes(right, a, identity);
+    if (R.is_err[query.QueryOutput, str](l) || R.is_err[query.QueryOutput, str](r)) { ret -1; }
+    val lb: query.QueryOutput = R.unwrap_ok[query.QueryOutput, str](l);
+    val rb: query.QueryOutput = R.unwrap_ok[query.QueryOutput, str](r);
+    fin {
+        if (lb.bytes != nil) { A.deallocate[u8](a, lb.bytes, lb.len::usize); }
+        if (rb.bytes != nil) { A.deallocate[u8](a, rb.bytes, rb.len::usize); }
+    }
+    if (lb.len != rb.len) { ret 0; }
+    var i: u32 = 0;
+    for (i < lb.len) { if (lb.bytes[i] != rb.bytes[i]) { ret 0; } i = i + 1; }
+    ret 1;
+}
+
+test "mach.lang.driver.passes.capture_build_identity:excludes_the_planner_environment" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](target.register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+    val tx: R.Result[target.Target, str] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (R.is_err[target.Target, str](tx)) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    fin { session.dnit(?s); }
+    var te: project.TargetEntry;
+    te.os_name = intern.STR_NIL; te.isa_name = intern.STR_NIL;
+    te.abi_name = intern.STR_NIL; te.platform_name = intern.STR_NIL;
+    var cfg: project.ProjectConfig;
+    cfg.id = intern.STR_NIL; cfg.version = intern.STR_NIL;
+    cfg.name = intern.STR_NIL; cfg.bin_name = intern.STR_NIL;
+    var alone: project.Project;
+    alone.s = ?s; alone.req = request.defaults(); alone.target = R.unwrap_ok[target.Target, str](tx);
+    alone.target_entry = ?te; alone.config = cfg;
+    var hosted: project.Project = alone;
+    hosted.config.dep_count = 1;
+    # a dependency makes the configuration sample the inherited environment; the identity never does
+    if (t_capture_equal(?alloc, ?alone, ?hosted, false) != 0) { ret 2; }
+    if (t_capture_equal(?alloc, ?alone, ?hosted, true) != 1) { ret 3; }
+    hosted.req.profile = "release";
+    if (t_capture_equal(?alloc, ?alone, ?hosted, true) != 0) { ret 4; }
+    ret 0;
+}
 
 fun t_planner_environment_digest(a: *A.Allocator, inherited: **u8, digest: *u8) bool {
     var fb: dq.FpBuf;

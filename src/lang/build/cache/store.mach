@@ -1,0 +1,561 @@
+# bounded content-keyed disk bytes with short exclusive filesystem ownership
+
+use A: std.allocator;
+use R: std.types.result;
+use O: std.types.option;
+use std.collections.vector;
+use std.crypto.hash.sha256;
+use std.system.os;
+use txn: std.filesystem.transaction;
+use ownership: std.filesystem.transaction.ownership;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.string.str_equals;
+use mach.lang.publication;
+use mach.lang.build.cache.image;
+$if ($mach.build.os == $mach.os.linux) { use native: std.system.os.linux; }
+$or ($mach.build.os == $mach.os.darwin) { use native: std.system.os.darwin; }
+
+# logical entry bytes include headers, excluding filesystem metadata and allocation units
+pub val MAX_STORE_BYTES: u64 = 536870912;
+pub val HIT: u8 = 1;
+pub val MISS: u8 = 2;
+pub val UNAVAILABLE: u8 = 3;
+pub val STORED: u8 = 4;
+val HEADER_BYTES: usize = 76;
+val MAGIC: u32 = 0x5348434D;
+val HEX: str = "0123456789abcdef";
+val DIRENT_BUFFER: usize = 8192;
+$if ($mach.build.os == $mach.os.linux) { val O_NONBLOCK: i32 = 0o4000; }
+
+pub rec Error {
+    message: str;
+    native: txn.Error;
+}
+
+pub rec Status {
+    kind: u8;
+    problem: txn.Error;
+}
+
+pub rec Lookup {
+    status: Status;
+    bytes: vector.Vector[u8];
+}
+
+rec Access {
+    alloc: *A.Allocator;
+    root: txn.Root;
+    held: txn.Lock;
+    opened: bool;
+    locked: bool;
+    failed: bool;
+    error: Error;
+}
+
+fun internal(e: txn.Error) bool {
+    ret e.kind == txn.MEMORY || e.kind == txn.INVALID || e.code == os.ENOMEM;
+}
+
+# the first failure is reported unless a later one is internal, which outranks it
+fun record(a: *Access, e: txn.Error, message: str) {
+    if (!a.failed) { a.failed = true; a.error = Error{message: message, native: e}; ret; }
+    if (internal(e) && !internal(a.error.native)) { a.error = Error{message: message, native: e}; }
+}
+
+fun native_error(a: *Access, code: i64, op: txn.Op) {
+    if (code >= 0) { ret; }
+    var e: txn.Error = txn.io_error(op, code);
+    if (code == os.ENOMEM) { e.kind = txn.MEMORY; }
+    or (code == os.EINVAL) { e.kind = txn.INVALID; }
+    record(a, e, txn.error_message(e));
+}
+
+fun transaction_error(a: *Access, error: O.Option[txn.Error]) {
+    if (O.is_some[txn.Error](error)) {
+        val e: txn.Error = O.unwrap[txn.Error](error);
+        record(a, e, txn.error_message(e));
+    }
+}
+
+fun begin(a: *Access, alloc: *A.Allocator, directory: str) {
+    a.alloc = alloc;
+    if (alloc == nil || directory == nil || str_len(directory) == 0) {
+        record(a, txn.error(txn.INVALID, txn.OP_ROOT_OPEN), "cache store requires an allocator and existing directory"); ret;
+    }
+    transaction_error(a, txn.root_open(?a.root, directory, ""));
+    if (a.failed) { ret; }
+    a.opened = true;
+    transaction_error(a, txn.lock(?a.held, ?a.root));
+    if (a.failed) { ret; }
+    a.locked = true;
+    val recovered: R.Result[usize, txn.Error] = txn.recover(alloc, ?a.held, "");
+    if (R.is_err[usize, txn.Error](recovered)) {
+        val e: txn.Error = R.unwrap_err[usize, txn.Error](recovered);
+        record(a, e, txn.error_message(e));
+    }
+}
+
+fun finish(a: *Access) {
+    if (a.locked) { transaction_error(a, txn.unlock(?a.held)); a.locked = false; }
+    if (a.opened) { transaction_error(a, txn.root_dnit(?a.root)); a.opened = false; }
+}
+
+fun leaf(key: *[32]u8, name: *[65]u8) {
+    var i: usize = 0;
+    for (i < 32) { (@name)[i * 2] = HEX[((@key)[i] >> 4)::usize]; (@name)[i * 2 + 1] = HEX[((@key)[i] & 15)::usize]; i = i + 1; }
+    (@name)[64] = 0;
+}
+
+fun entry_name(name: str) bool {
+    if (str_len(name) != 64) { ret false; }
+    var i: usize = 0;
+    for (i < 64) {
+        val c: u8 = name[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the transaction module reserves its journal prefix and lock leaf case-insensitively
+fun reserved_prefix(name: str, prefix: str) bool {
+    val size: usize = str_len(prefix);
+    if (str_len(name) < size) { ret false; }
+    var i: usize = 0;
+    for (i < size) {
+        var byte: u8 = name[i];
+        if (byte >= 'A' && byte <= 'Z') { byte = byte + 32; }
+        if (byte != prefix[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun metadata(name: str) bool {
+    if (str_equals(name, ".") || str_equals(name, "..")) { ret true; }
+    if (str_len(name) == str_len(txn.LOCK_LEAF) && reserved_prefix(name, txn.LOCK_LEAF)) { ret true; }
+    if (str_equals(name, ownership.CLAIMS_LEAF)) { ret true; }
+    ret reserved_prefix(name, txn.STAGING_TAG);
+}
+
+fun put(bytes: *u8, offset: usize, value: u64, width: usize) {
+    var i: usize = 0;
+    for (i < width) { bytes[offset + i] = (value >> (i * 8))::u8; i = i + 1; }
+}
+
+fun get(bytes: *u8, offset: usize, width: usize) u64 {
+    var value: u64 = 0;
+    var i: usize = 0;
+    for (i < width) { value = value | (bytes[offset + i]::u64 << (i * 8)); i = i + 1; }
+    ret value;
+}
+
+fun read_exact(a: *Access, fd: i32, bytes: *u8, len: usize) bool {
+    var got: usize = 0;
+    for (got < len) {
+        val n: i64 = os.read(fd, ?bytes[got], len - got);
+        if (n < 0) { native_error(a, n, txn.OP_ROOT_OPEN); ret false; }
+        if (n == 0) { ret false; }
+        got = got + n::usize;
+    }
+    ret true;
+}
+
+fun read_entry(a: *Access, key: *[32]u8, result: *Lookup) {
+    var name: [65]u8;
+    leaf(key, ?name);
+    var flags: i32 = os.O_RDONLY;
+    $if ($mach.build.os == $mach.os.linux) { flags = flags | native.O_NOFOLLOW | O_NONBLOCK; }
+    $or ($mach.build.os == $mach.os.darwin) { flags = flags | native.O_NOFOLLOW | native.O_NONBLOCK; }
+    # windows descriptor-relative open rejects reparse points before returning a handle
+    val opened: i64 = os.open(txn.root_fd(?a.root), ?name[0], flags, 0);
+    if (opened == os.ENOENT) { ret; }
+    if (opened < 0) { native_error(a, opened, txn.OP_ROOT_OPEN); ret; }
+    val fd: i32 = opened::i32;
+    fin { native_error(a, os.close(fd), txn.OP_ROOT_OPEN); }
+    var info: os.stat_t;
+    val observed: i64 = os.stat(fd, ?info);
+    if (observed < 0) { native_error(a, observed, txn.OP_ROOT_OPEN); ret; }
+    if ((os.stat_mode(?info) & os.S_IFMT) != os.S_IFREG || info.st_size < HEADER_BYTES::i64
+        || info.st_size::u64 > (HEADER_BYTES + image.MAX_ENTRY_BYTES)::u64) { ret; }
+    var header: [HEADER_BYTES]u8;
+    if (!read_exact(a, fd, ?header[0], HEADER_BYTES)) { ret; }
+    if (get(?header[0], 0, 4)::u32 != MAGIC) { ret; }
+    var i: usize = 0;
+    for (i < 32) { if (header[4 + i] != (@key)[i]) { ret; } i = i + 1; }
+    val len: u64 = get(?header[0], 68, 8);
+    if (len > image.MAX_ENTRY_BYTES::u64 || len + HEADER_BYTES::u64 != info.st_size::u64) { ret; }
+    if (len != 0) {
+        val bytes: R.Result[*u8, str] = A.allocate[u8](a.alloc, len::usize);
+        if (R.is_err[*u8, str](bytes)) { record(a, txn.error(txn.MEMORY, txn.OP_ROOT_OPEN), R.unwrap_err[*u8, str](bytes)); ret; }
+        result.bytes.data = R.unwrap_ok[*u8, str](bytes);
+        result.bytes.cap = len::usize;
+    }
+    if (!read_exact(a, fd, result.bytes.data, len::usize)) { ret; }
+    var extra: u8 = 0;
+    val tail: i64 = os.read(fd, ?extra, 1);
+    if (tail < 0) { native_error(a, tail, txn.OP_ROOT_OPEN); ret; }
+    if (tail != 0) { ret; }
+    var digest: [32]u8;
+    sha256.hash(result.bytes.data, len::usize, ?digest[0]);
+    i = 0;
+    for (i < 32) { if (digest[i] != header[36 + i]) { ret; } i = i + 1; }
+    result.bytes.len = len::usize;
+    result.status.kind = HIT;
+}
+
+# directory and compiler work remain caller-owned, returned hit bytes use alloc.
+pub fun read(alloc: *A.Allocator, directory: str, key: *[32]u8) R.Result[Lookup, Error] {
+    if (key == nil) { ret R.err[Lookup, Error](Error{message: "cache store requires a key", native: txn.error(txn.INVALID, txn.OP_ROOT_OPEN)}); }
+    var access: Access = Access{};
+    var result: Lookup = Lookup{status: Status{kind: MISS}, bytes: vector.init[u8](alloc)};
+    begin(?access, alloc, directory);
+    if (!access.failed) { read_entry(?access, key, ?result); }
+    finish(?access);
+    if (access.failed) {
+        vector.dnit[u8](?result.bytes);
+        if (internal(access.error.native)) { ret R.err[Lookup, Error](access.error); }
+        result.status = Status{kind: UNAVAILABLE, problem: access.error.native};
+    }
+    or (result.status.kind != HIT) { vector.dnit[u8](?result.bytes); }
+    ret R.ok[Lookup, Error](result);
+}
+
+fun remove_entry(a: *Access, name: str) {
+    var claim: txn.Claim = txn.Claim{};
+    transaction_error(a, txn.claim(?claim, a.alloc, ?a.held, name));
+    if (a.failed) { ret; }
+    transaction_error(a, txn.entry_unlink(?claim));
+    transaction_error(a, txn.release_claim(?claim));
+}
+
+# scans keep no entry list and only remove names from the private hash namespace.
+fun sweep(a: *Access, wanted: u64, remove: bool, replacing: str) u64 {
+    val dirfd: i32 = txn.root_fd(?a.root);
+    native_error(a, os.seek(dirfd, 0, os.SEEK_SET), txn.OP_RECOVER);
+    if (a.failed) { ret 0; }
+    var total: u64 = 0;
+    var removed: u64 = 0;
+    var buffer: [DIRENT_BUFFER]u8;
+    var done: bool = false;
+    for (!a.failed && !done) {
+        val got: i64 = os.read_dir(dirfd, (?buffer[0])::*os.dirent64, DIRENT_BUFFER);
+        if (got < 0) { native_error(a, got, txn.OP_RECOVER); brk; }
+        if (got == 0) { brk; }
+        var pos: usize = 0;
+        for (pos < got::usize && !a.failed) {
+            val entry: *os.dirent64 = ((?buffer[0])::usize + pos)::*os.dirent64;
+            if (entry.d_reclen == 0) { record(a, txn.error(txn.INVALID, txn.OP_RECOVER), "cache directory listing is malformed"); brk; }
+            pos = pos + entry.d_reclen::usize;
+            val name: str = (?entry.d_name[0])::str;
+            if (metadata(name)) { cnt; }
+            if (!entry_name(name)) { record(a, txn.error(txn.CONTAINMENT, txn.OP_RECOVER), "cache directory contains an unrelated entry"); brk; }
+            var info: os.stat_t;
+            val observed: i64 = os.stat_path(dirfd, name, ?info, os.AT_SYMLINK_NOFOLLOW);
+            if (observed < 0) { native_error(a, observed, txn.OP_RECOVER); brk; }
+            if ((os.stat_mode(?info) & os.S_IFMT) != os.S_IFREG || info.st_size < 0) {
+                record(a, txn.error(txn.CONTAINMENT, txn.OP_RECOVER), "cache hash entry is not a regular file"); brk;
+            }
+            if (replacing != nil && str_equals(name, replacing)) { cnt; }
+            val size: u64 = info.st_size::u64;
+            if (size > 18446744073709551615 - total) { record(a, txn.error(txn.REJECTED, txn.OP_RECOVER), "cache size accounting overflow"); brk; }
+            total = total + size;
+            if (remove && removed < wanted) {
+                remove_entry(a, name);
+                if (!a.failed) { removed = removed + size; }
+            }
+        }
+    }
+    if (remove) { ret removed; }
+    ret total;
+}
+
+fun make_room(a: *Access, incoming: usize, replacing: str, limit: u64) {
+    var prior: u64 = 0;
+    if (replacing != nil) {
+        var info: os.stat_t;
+        val observed: i64 = os.stat_path(txn.root_fd(?a.root), replacing, ?info, os.AT_SYMLINK_NOFOLLOW);
+        if (observed < 0 && observed != os.ENOENT) { native_error(a, observed, txn.OP_PREPARE); ret; }
+        if (observed >= 0) {
+            if ((os.stat_mode(?info) & os.S_IFMT) != os.S_IFREG || info.st_size < 0) {
+                record(a, txn.error(txn.CONTAINMENT, txn.OP_PREPARE), "cache replacement is not a regular file"); ret;
+            }
+            prior = info.st_size::u64;
+            if (prior > (HEADER_BYTES + image.MAX_ENTRY_BYTES)::u64) {
+                record(a, txn.error(txn.REJECTED, txn.OP_PREPARE), "cache replacement exceeds the entry limit"); ret;
+            }
+        }
+    }
+    # retain the prior entry while charging only the larger final generation
+    var charged: u64 = incoming::u64;
+    if (prior > charged) { charged = prior; }
+    if (charged > limit) { record(a, txn.error(txn.REJECTED, txn.OP_PREPARE), "cache entry exceeds the store byte limit"); ret; }
+    val available: u64 = limit - charged;
+    var total: u64 = sweep(a, 0, false, replacing);
+    for (!a.failed && total > available) {
+        val needed: u64 = total - available;
+        val removed: u64 = sweep(a, needed, true, replacing);
+        if (a.failed) { ret; }
+        if (removed == 0) { record(a, txn.error(txn.CONFLICT, txn.OP_REMOVE), "cache eviction made no progress"); ret; }
+        val next: u64 = sweep(a, 0, false, replacing);
+        if (a.failed) { ret; }
+        if (next >= total) { record(a, txn.error(txn.CONFLICT, txn.OP_REMOVE), "cache contents changed during eviction"); ret; }
+        total = next;
+    }
+}
+
+# publication may report unavailable after replacement or partial eviction
+pub fun publish(alloc: *A.Allocator, directory: str, key: *[32]u8, payload: *u8, len: usize) R.Result[Status, Error] {
+    if (alloc == nil || key == nil || (len != 0 && payload == nil)) {
+        ret R.err[Status, Error](Error{message: "cache publication requires valid owners and payload", native: txn.error(txn.INVALID, txn.OP_PREPARE)});
+    }
+    if (len > image.MAX_ENTRY_BYTES) { ret R.ok[Status, Error](Status{kind: UNAVAILABLE, problem: txn.error(txn.REJECTED, txn.OP_PREPARE)}); }
+    val size: usize = HEADER_BYTES + len;
+    val allocated: R.Result[*u8, str] = A.allocate[u8](alloc, size);
+    if (R.is_err[*u8, str](allocated)) { ret R.err[Status, Error](Error{message: R.unwrap_err[*u8, str](allocated), native: txn.error(txn.MEMORY, txn.OP_PREPARE)}); }
+    val bytes: *u8 = R.unwrap_ok[*u8, str](allocated);
+    fin { A.deallocate[u8](alloc, bytes, size); }
+    put(bytes, 0, MAGIC::u64, 4);
+    var i: usize = 0;
+    for (i < 32) { bytes[4 + i] = (@key)[i]; i = i + 1; }
+    sha256.hash(payload, len, ?bytes[36]);
+    put(bytes, 68, len::u64, 8);
+    i = 0;
+    for (i < len) { bytes[HEADER_BYTES + i] = payload[i]; i = i + 1; }
+    var access: Access = Access{};
+    begin(?access, alloc, directory);
+    var name: [65]u8;
+    leaf(key, ?name);
+    if (!access.failed) { make_room(?access, size, ?name[0], MAX_STORE_BYTES); }
+    if (!access.failed) {
+        var claim: txn.Claim = txn.Claim{};
+        transaction_error(?access, txn.claim(?claim, alloc, ?access.held, ?name[0]));
+        if (!access.failed) {
+            val written: R.Result[R.Void, txn.Error] = publication.bytes_at_typed(alloc, ?claim, bytes, size, 0o600, publication.REPLACE, nil);
+            if (R.is_err[R.Void, txn.Error](written)) {
+                val e: txn.Error = R.unwrap_err[R.Void, txn.Error](written);
+                record(?access, e, txn.error_message(e));
+            }
+            transaction_error(?access, txn.release_claim(?claim));
+        }
+    }
+    finish(?access);
+    if (access.failed) {
+        if (internal(access.error.native)) { ret R.err[Status, Error](access.error); }
+        ret R.ok[Status, Error](Status{kind: UNAVAILABLE, problem: access.error.native});
+    }
+    ret R.ok[Status, Error](Status{kind: STORED});
+}
+
+use std.allocator.page;
+use fs: std.filesystem;
+use std.types.path;
+use std.text.string.str_free;
+use std.print;
+
+fun t_status(result: R.Result[Status, Error], kind: u8) bool {
+    if (R.is_err[Status, Error](result)) { print.eprintln(R.unwrap_err[Status, Error](result).message); ret false; }
+    val status: Status = R.unwrap_ok[Status, Error](result);
+    if (status.kind != kind) { print.eprintlnf("cache publication status {}, native {}", status.kind, status.problem.code); ret false; }
+    ret true;
+}
+
+fun t_read(alloc: *A.Allocator, directory: str, key: *[32]u8, kind: u8, expected: str) bool {
+    val result: R.Result[Lookup, Error] = read(alloc, directory, key);
+    if (R.is_err[Lookup, Error](result)) { print.eprintln(R.unwrap_err[Lookup, Error](result).message); ret false; }
+    var lookup: Lookup = R.unwrap_ok[Lookup, Error](result);
+    fin { vector.dnit[u8](?lookup.bytes); }
+    if (lookup.status.kind != kind) { print.eprintlnf("cache read status {}, native {}", lookup.status.kind, lookup.status.problem.code); ret false; }
+    if (kind != HIT) { ret lookup.bytes.data == nil && lookup.bytes.cap == 0 && lookup.bytes.len == 0; }
+    val len: usize = str_len(expected);
+    if (lookup.bytes.len != len) { ret false; }
+    var i: usize = 0;
+    for (i < len) { if (lookup.bytes.data[i] != expected[i]) { ret false; } i = i + 1; }
+    ret true;
+}
+
+test "mach.lang.build.cache.store:replace_digest_key_length_and_lock_contract" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val temporary: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "mach-cache-store");
+    if (R.is_err[fs.TempFile, str](temporary)) { ret 2; }
+    var temp: fs.TempFile = R.unwrap_ok[fs.TempFile, str](temporary);
+    fin { str_free(?alloc, temp.path); }
+    if (O.is_some[str](fs.temp_close_and_remove(?temp))) { ret 3; }
+    if (os.make_dir(os.AT_FDCWD, temp.path, 0o700) < 0) { ret 4; }
+    fin { fs.remove_all(?alloc, temp.path); }
+    var key: [32]u8;
+    sha256.hash("source", 6, ?key[0]);
+    if (!t_read(?alloc, temp.path, ?key, MISS, "")) { ret 5; }
+    if (!t_status(publish(?alloc, temp.path, ?key, "first", 5), STORED)) { ret 6; }
+    if (!t_read(?alloc, temp.path, ?key, HIT, "first")) { ret 7; }
+    if (!t_status(publish(?alloc, temp.path, ?key, "replacement", 11), STORED)) { ret 8; }
+    if (!t_read(?alloc, temp.path, ?key, HIT, "replacement")) { ret 9; }
+    var name: [65]u8;
+    leaf(?key, ?name);
+    val full_r: R.Result[path.Path, str] = path.join(?alloc, temp.path, ?name[0]);
+    if (R.is_err[path.Path, str](full_r)) { ret 10; }
+    val full: str = R.unwrap_ok[path.Path, str](full_r);
+    fin { str_free(?alloc, full); }
+    val bytes_r: R.Result[vector.Vector[u8], str] = fs.read_bytes(?alloc, full);
+    if (R.is_err[vector.Vector[u8], str](bytes_r)) { ret 11; }
+    var bytes: vector.Vector[u8] = R.unwrap_ok[vector.Vector[u8], str](bytes_r);
+    fin { vector.dnit[u8](?bytes); }
+    bytes.data[HEADER_BYTES] = bytes.data[HEADER_BYTES] ^ 1;
+    if (O.is_some[str](fs.write_bytes(full, bytes.data, bytes.len, 0o600)) || !t_read(?alloc, temp.path, ?key, MISS, "")) { ret 12; }
+    bytes.data[HEADER_BYTES] = bytes.data[HEADER_BYTES] ^ 1;
+    bytes.data[4] = bytes.data[4] ^ 1;
+    if (O.is_some[str](fs.write_bytes(full, bytes.data, bytes.len, 0o600)) || !t_read(?alloc, temp.path, ?key, MISS, "")) { ret 13; }
+    bytes.data[4] = bytes.data[4] ^ 1;
+    if (O.is_some[str](fs.write_bytes(full, bytes.data, bytes.len - 1, 0o600)) || !t_read(?alloc, temp.path, ?key, MISS, "")) { ret 14; }
+    if (!t_status(publish(?alloc, temp.path, ?key, nil, 0), STORED) || !t_read(?alloc, temp.path, ?key, HIT, "")) { ret 15; }
+    var root: txn.Root = txn.Root{};
+    if (O.is_some[txn.Error](txn.root_open(?root, temp.path, ""))) { ret 16; }
+    fin { txn.root_dnit(?root); }
+    var held: txn.Lock = txn.Lock{};
+    if (O.is_some[txn.Error](txn.lock(?held, ?root))) { ret 17; }
+    val unavailable: bool = t_read(?alloc, temp.path, ?key, UNAVAILABLE, "")
+        && t_status(publish(?alloc, temp.path, ?key, "blocked", 7), UNAVAILABLE);
+    if (O.is_some[txn.Error](txn.unlock(?held)) || !unavailable) { ret 18; }
+    if (!t_read(?alloc, temp.path, ?key, HIT, "")) { ret 19; }
+    val outside_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "mach-cache-outside");
+    if (R.is_err[fs.TempFile, str](outside_r)) { ret 20; }
+    var outside: fs.TempFile = R.unwrap_ok[fs.TempFile, str](outside_r);
+    fin { fs.temp_remove(?outside); str_free(?alloc, outside.path); }
+    if (O.is_some[str](fs.temp_close(?outside)) || O.is_some[str](fs.write_bytes(outside.path, bytes.data, bytes.len, 0o600))) { ret 21; }
+    if (O.is_some[str](fs.remove_file(full)) || os.symlink(outside.path, full) < 0) { ret 22; }
+    if (!t_read(?alloc, temp.path, ?key, UNAVAILABLE, "")
+        || !t_status(publish(?alloc, temp.path, ?key, "refused", 7), UNAVAILABLE)) { ret 23; }
+    val outside_bytes_r: R.Result[vector.Vector[u8], str] = fs.read_bytes(?alloc, outside.path);
+    if (R.is_err[vector.Vector[u8], str](outside_bytes_r)) { ret 24; }
+    var outside_bytes: vector.Vector[u8] = R.unwrap_ok[vector.Vector[u8], str](outside_bytes_r);
+    fin { vector.dnit[u8](?outside_bytes); }
+    if (outside_bytes.len != bytes.len) { ret 25; }
+    var j: usize = 0;
+    for (j < bytes.len) { if (outside_bytes.data[j] != bytes.data[j]) { ret 26; } j = j + 1; }
+    ret 0;
+}
+
+test "mach.lang.build.cache.store:byte_eviction_preserves_unrelated_entries_and_reports_invalid_owners" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val temporary: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "mach-cache-quota");
+    if (R.is_err[fs.TempFile, str](temporary)) { ret 2; }
+    var temp: fs.TempFile = R.unwrap_ok[fs.TempFile, str](temporary);
+    fin { str_free(?alloc, temp.path); }
+    if (O.is_some[str](fs.temp_close_and_remove(?temp)) || os.make_dir(os.AT_FDCWD, temp.path, 0o700) < 0) { ret 3; }
+    fin { fs.remove_all(?alloc, temp.path); }
+    var key: [32]u8;
+    sha256.hash("entry", 5, ?key[0]);
+    if (!t_status(publish(?alloc, temp.path, ?key, "keep", 4), STORED)) { ret 4; }
+    var peer: [32]u8;
+    sha256.hash("peer", 4, ?peer[0]);
+    if (!t_status(publish(?alloc, temp.path, ?peer, "peer", 4), STORED)) { ret 12; }
+    var name: [65]u8;
+    leaf(?key, ?name);
+    var replacement: Access = Access{};
+    begin(?replacement, ?alloc, temp.path);
+    if (!replacement.failed) {
+        make_room(?replacement, HEADER_BYTES + 4, ?name[0], 2 * (HEADER_BYTES::u64 + 4));
+        if (!replacement.failed && sweep(?replacement, 0, false, nil) != 2 * (HEADER_BYTES::u64 + 4)) {
+            record(?replacement, txn.error(txn.INVALID, txn.OP_RECOVER), "same-size replacement evicted a current cache entry");
+        }
+        if (!replacement.failed) { leaf(?peer, ?name); remove_entry(?replacement, ?name[0]); }
+    }
+    finish(?replacement);
+    if (replacement.failed || !t_read(?alloc, temp.path, ?key, HIT, "keep")) { ret 13; }
+    var access: Access = Access{};
+    begin(?access, ?alloc, temp.path);
+    if (!access.failed) {
+        val total: u64 = sweep(?access, 0, false, nil);
+        if (total != HEADER_BYTES::u64 + 4) { record(?access, txn.error(txn.INVALID, txn.OP_RECOVER), "cache byte inventory differs from file size"); }
+        if (!access.failed) {
+            make_room(?access, 1, nil, total + 1);
+            if (!access.failed && sweep(?access, 0, false, nil) != total) { record(?access, txn.error(txn.INVALID, txn.OP_RECOVER), "cache evicted bytes at the exact quota boundary"); }
+        }
+        if (!access.failed) {
+            make_room(?access, 1, nil, total);
+            if (!access.failed && sweep(?access, 0, false, nil) != 0) { record(?access, txn.error(txn.INVALID, txn.OP_RECOVER), "cache eviction did not release its accounted bytes"); }
+        }
+    }
+    finish(?access);
+    if (access.failed || !t_read(?alloc, temp.path, ?key, MISS, "")) { ret 5; }
+    val foreign_r: R.Result[path.Path, str] = path.join(?alloc, temp.path, "user-note");
+    if (R.is_err[path.Path, str](foreign_r)) { ret 6; }
+    val foreign: str = R.unwrap_ok[path.Path, str](foreign_r);
+    fin { str_free(?alloc, foreign); }
+    if (O.is_some[str](fs.write_bytes(foreign, "retained", 8, 0o600))) { ret 7; }
+    if (!t_status(publish(?alloc, temp.path, ?key, "new", 3), UNAVAILABLE)) { ret 8; }
+    val note_r: R.Result[vector.Vector[u8], str] = fs.read_bytes(?alloc, foreign);
+    if (R.is_err[vector.Vector[u8], str](note_r)) { ret 9; }
+    var note: vector.Vector[u8] = R.unwrap_ok[vector.Vector[u8], str](note_r);
+    fin { vector.dnit[u8](?note); }
+    if (note.len != 8 || note.data[0] != 'r' || note.data[7] != 'd') { ret 10; }
+    if (R.is_ok[Lookup, Error](read(nil, temp.path, ?key))
+        || R.is_ok[Status, Error](publish(?alloc, temp.path, nil, "x", 1))) { ret 11; }
+    ret 0;
+}
+
+use T: std.allocator.testing;
+
+fun t_allocation_attempt(directory: str, key: *[32]u8, writing: bool, ordinal: usize, attempts: *usize) i32 {
+    var t: T.Testing;
+    if (O.is_some[str](T.make(?t))) { ret 1; }
+    fin { T.dnit(?t); }
+    T.fail_at_ordinal(?t, ordinal);
+    var code: i32 = 0;
+    if (writing) {
+        val result: R.Result[Status, Error] = publish(T.allocator_of(?t), directory, key, "payload", 7);
+        if (R.is_ok[Status, Error](result)) {
+            if (ordinal != 0 || R.unwrap_ok[Status, Error](result).kind != STORED) { code = 2; }
+        }
+        or (ordinal == 0 || R.unwrap_err[Status, Error](result).native.kind != txn.MEMORY) { code = 3; }
+    }
+    or {
+        val result: R.Result[Lookup, Error] = read(T.allocator_of(?t), directory, key);
+        if (R.is_ok[Lookup, Error](result)) {
+            var lookup: Lookup = R.unwrap_ok[Lookup, Error](result);
+            if (ordinal != 0 || lookup.status.kind != HIT || lookup.bytes.len != 7) { code = 4; }
+            vector.dnit[u8](?lookup.bytes);
+        }
+        or (ordinal == 0 || R.unwrap_err[Lookup, Error](result).native.kind != txn.MEMORY) { code = 5; }
+    }
+    @attempts = T.attempt_count(?t);
+    if (T.leaked(?t) || T.double_free_count(?t) != 0 || T.tracking_exhausted(?t)) { code = 6; }
+    if (code != 0) { print.eprintlnf("cache allocation {} writing {} control {}", ordinal, writing, code); }
+    ret code;
+}
+
+test "mach.lang.build.cache.store:allocation_refusal_is_internal_and_releases_operation_owners" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val temporary: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "mach-cache-fault");
+    if (R.is_err[fs.TempFile, str](temporary)) { ret 2; }
+    var temp: fs.TempFile = R.unwrap_ok[fs.TempFile, str](temporary);
+    fin { str_free(?alloc, temp.path); }
+    if (O.is_some[str](fs.temp_close_and_remove(?temp)) || os.make_dir(os.AT_FDCWD, temp.path, 0o700) < 0) { ret 3; }
+    fin { fs.remove_all(?alloc, temp.path); }
+    var key: [32]u8;
+    sha256.hash("fault", 5, ?key[0]);
+    if (!t_status(publish(?alloc, temp.path, ?key, "payload", 7), STORED)) { ret 4; }
+    var mode: u8 = 0;
+    for (mode < 2) {
+        var attempts: usize = 0;
+        val writing: bool = mode != 0;
+        if (t_allocation_attempt(temp.path, ?key, writing, 0, ?attempts) != 0 || attempts == 0) { ret 5; }
+        var ordinal: usize = 1;
+        for (ordinal <= attempts) {
+            var refused_attempts: usize = 0;
+            if (t_allocation_attempt(temp.path, ?key, writing, ordinal, ?refused_attempts) != 0) { ret 6; }
+            if (!t_read(?alloc, temp.path, ?key, HIT, "payload")) { ret 7; }
+            ordinal = ordinal + 1;
+        }
+        mode = mode + 1;
+    }
+    ret 0;
+}
