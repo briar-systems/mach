@@ -192,3 +192,206 @@ words through 25 `pack_*` functions and notifies the printer with a
 | rules | `arm64/rules.mach:81 RULES` 87 rows, 3 guards, 5 expanders; names no physical register | `arm64/rules.mach:369` restates `87` as a literal in the coverage test (deliberate tripwire) | ok |
 | asm hooks | `arm64/register.mach:122 with_assembly` (4), `:124 with_dwarf_regs`, `:125 with_frame_dist`, `:130 with_local_got_kinds` | — | ok |
 | independent control | layer B goldens `test/golden/aarch64-linux` (external disassembler) | no in-tree reference decoder (riscv has one) | — |
+
+## 4. riscv64 and riscv32
+
+Files: `src/lang/target/isa/riscv.mach`, `riscv/{inst,encode,printer,register,reloc,rules,attributes,refcore}.mach`.
+One backend, two registrations: `riscv/register.mach:92 register_riscv64` and
+`:97 register_riscv32` are one-line wrappers over `:102 build_riscv(reg, arch_id,
+name, xw, ...)` and differ only in arch id, name and `xw` (8 vs 4). Both share
+`rules.select`, `encode.encode_riscv64`, the reloc seam, the attributes hooks
+and `model.flen_bits = 64` (`:175`, unconditional); only `xbank_widths` is
+xlen-gated (`:180-181`).
+
+| aspect | authoritative site | duplicates / derived | gap |
+|---|---|---|---|
+| opcode set | `riscv/inst.mach:3 def MachOp: u16`, 140 opcodes (`MOP_NONE=0` … `CSRRCI=140`, `:170 MOP_LAST`) | `riscv.mach:97-116 def Opcode: u16` (18 selected opcodes, a second namespace bridged at `riscv/encode.mach:2374` and dispatched at `:2072 encode_mir_instr`); `riscv/encode.mach:2573 RV_MNEMONICS` 107 rows | DUP |
+| per-opcode form (format, opcode7, funct3, funct7) | **no table in `inst.mach`** (0 `rec`s); the forward description is `riscv/encode.mach:2746 rv_fields` (70 arms + AMO range, absent for every FP arithmetic/convert/move opcode) | inverse: `:383 classify_r`, `:419 classify_fp`, `:459 classify_amo`, `:478 classify_i`, `:529 classify_s`, `:545 classify_b`, `:556 classify_u`, `:562 classify_j` (140 distinct returns); MIR call sites hardcode `F3_*`/`F7_*` a third time (111 `emit_[risbuj](st, ...)` sites, e.g. `:933`, `:1371`) | ADM, DUP x3 |
+| operand shape | `riscv/encode.mach:247 shape_of` (23 arms → 19 `SH_*`), consumed by `:215 build_inst` to squeeze every form into `isa.Inst.dst/src1/src2` | — | ok |
+| instruction value | `isa.Inst` built by `build_inst` and printed by `riscv/printer.mach:292 mnemonic` (140 rows) | — | ok |
+| xlen admission | `riscv/inst.mach:182 xlens` (10-branch range ladder), `:204 admits` | `admits` is called at exactly one site, `riscv/encode.mach:3221` (inline asm). The MIR path enforces xlen independently by width: `:650 alu_opcode`, `:655 alu_imm_opcode`, `:661-663` inside `int_mem_funct3` | DUP (and `xlens` unenforced for codegen) |
+| memory-access rows (#2766) | `riscv/encode.mach:660 int_mem_funct3` (4 widths × load/store, refuses `width > xl`), `:1521 fp_mem_funct3` (2 rows, no xlen) | the same funct3 values restated per named opcode inside `rv_fields` (`:2801-2812`) and inverted in `classify_i`/`classify_s` | DUP |
+| load vs store | none as a predicate over `MachOp`; range arithmetic in `shape_of` (`:253-254`) | printer re-derives store-ness from `mi.dst.kind == OPK_MEM` (`riscv/printer.mach:77 render_operands`); encoder threads an unrelated `is_load: bool` | ADM, DUP |
+| flags effect | n/a (no flags register; `riscv/register.mach:201-203` sets `div_reg/div_hi_reg/shift_count_reg = -1`) | — | ok |
+| ordering (aq/rl) | `riscv/inst.mach:208-209 FLAG_AQ/FLAG_RL` on `Inst.flags`, set at `riscv/encode.mach:277` from `:369 amo_ordering_flags(funct7)` | asm parser has its own `RVF_AQ/RVF_RL = 0x0100/0x0200` (`:2566-2567`, `:2694 rv_decode_amo`); the raw funct7 bits are a third spelling | DUP x3 |
+| fence | `FENCE`/`PAUSE` are `SH_NONE`; the pred/succ sets are fixed immediates at `riscv/encode.mach:3237-3238` and never modeled | — | ADM |
+| physical aliasing | none for GPRs; FPRs are one flat 64-bit class; NaN boxing exists only in the reference core (`riscv/refcore.mach:703 box_s`, `:707 unbox_s`) | — | ok |
+| clobbers | `Inst.clobbers` never written; asm: `riscv/encode.mach:3520 asm_clobbers`, `:138 CALLER_SAVED_GP = 0xF003FCE2` as one raw bitmask not derived from the ABI module | — | ADM, DUP |
+| latency provenance | catalog `ct_class`; asm `riscv/encode.mach:5880 asm_ct_class` (94 MachOps named; 13 M-extension mnemonics variable-latency, 6 variable shifts) | — | ok |
+| register file | `riscv/register.mach:102-115` classes `gpr/GPR_COUNT`, `fpr/FPR_COUNT`; `riscv.mach:93 GPR_COUNT = 32`, `:95 FPR_COUNT = 30` | `riscv.mach:60-91 F0..F31` and `riscv/printer.mach:256 fp_name` cover 32; `F30/F31` reserved by omission for `riscv/encode.mach:113-114 FP_SCRATCH/FP_SCRATCH2`, stated nowhere | DUP |
+| ABI register names | none in `register.mach` | `riscv/printer.mach:220 gp_name`/`:256 fp_name` (index → name, 64 rows) vs `riscv/encode.mach:2474 asm_reg_index_region` (name → index, 33 rows); `:3502 asm_fp_reg_index` does derive from `fp_name` | DUP |
+| raw register literals | `riscv/encode.mach:131-136 RZERO/RRA/RSP/RFP/SCRATCH/SCRATCH2 = 0/1/2/8/5/6` restate `riscv.ZERO/RA/SP/FP/SCRATCH_REG/SCRATCH_REG2` (`riscv.mach:39-58`); `:113-114` restate `F31/F30` | 170 production literal sites in total (64 in `riscv.mach`, 64 in `printer.mach`, 41 in `encode.mach`, 1 in `register.mach`) | NIE |
+| number ↔ regid | `riscv/encode.mach:207 gpr(idx)` (class 0 implicit), `:211 fpr(idx)`, `:671 req_gpr`, `:1500 req_fpr`; `riscv/register.mach:75 riscv64_dwarf_reg` | — | NIE |
+| rounding mode | `riscv/encode.mach:101-108 RM_*`, `:1762 int_to_fp_rm` | `riscv/printer.mach:71 rounding_operand` re-derives `rtz` from the opcode range | DUP |
+| encoding | `riscv/encode.mach:152-179 pack_r/i/s/b/u/j` (12 production call sites, 0 with literal funct fields); relaxation `:2226 relax_function_riscv64` → `:2245 relax_function_bounded` with bound `:2231 relax_round_bound = 2n+1`; no compressed encoding (`:185 WORD_SIZE = 4`) while `has_compressed` still feeds `EF_RISCV_RVC` (`riscv/register.mach:69`) and the `c2p0` attribute (`riscv/attributes.mach:569`) | — | ADM (claims C it cannot emit) |
+| extension vocabulary (#3127) | emitted string is built at `riscv/attributes.mach:558 riscv64_build_attributes` (`i m a f d [c]`, `:563-569`) | the canonical single-letter order `:61 SINGLE_ORDER = "mafdqlcbkjtpvn"` with a hard-coded `i < 14` bound at `:80 single_rank`; classes at `:447 ext_class` and `:180 parse_arch` use raw ASCII codes | DUP |
+| rules | `riscv/rules.mach:21 RULES` 64 rows (33 retag, 31 pass, 0 expand), 5 guarded rules over 2 guard fns; `guard_identity_copy` (`:139`) reads `tgt.model.gpr_width` (#2865 fixed); names no physical register | `:118 name: "riscv64"` is shared by the riscv32 registration (read nowhere in production) | ok |
+| independent control | `riscv/refcore.mach:897 exec_reference`, an RV32IMFD interpreter that imports nothing from `inst`/`encode`/`isa` and decodes raw words (~97 instructions; refuses RV64-only, AMO, CSR, system, `:1064`); layer B goldens `test/golden/riscv64-linux`, `riscv32` | — | ok |
+
+## 5. SPIR-V (whole-module emitter)
+
+Files: `src/lang/target/isa/spirv.mach`, `spirv/{defs,emit,cfg,types,register}.mach`,
+`src/lang/target/abi/spirv.mach`, `src/lang/target/of/spv.mach`.
+Registered through `spirv/register.mach:75 isa.module_emitter(emit.emit_module)`;
+no select, encode or regalloc hook. The family fork is honoured at
+`src/lang/be/codegen.mach:144` (`emits_whole_module` → `whole_module_image`) and
+`src/lang/be/codegen/ctvalidate.mach:28` (an `oblivious` function on an emitter
+is refused outright, not validated).
+
+| aspect | authoritative site | duplicates / derived | gap |
+|---|---|---|---|
+| opcode set | `spirv.mach:32-122` 91 `OP_*` constants (no operand count, result-type flag or word count per row) | `spirv/defs.mach:57-59` restate `148`, `86`, `87` as literals beside `OP_DOT`, `OP_SAMPLED_IMAGE`, `OP_IMAGE_SAMPLE_IMPLICIT_LOD` | DUP |
+| published op/type definitions | `spirv/defs.mach:52 register_defs`: 38 `isa.op_def` rows (3 core + 35 `GLSL.std.450`), 3 `isa.type_def` rows, one `TypeRefuseFn` (`:115 refuse_image`, 6 shapes) | `DefStorage` sizes `[38]`/`[3]` (`:40-41`) and the literals `38, 3` in `:111 isa.target_defs(...)` | DUP |
+| word count | computed at emission `spirv.mach:348 inst_word = (n+1) << 16 \| opcode` | the `arity` column of each `OpDef` is never consulted for sizing | ADM |
+| MIR → SPIR-V mapping | `spirv/emit.mach:2612 emit_instr`, a linear `if` chain (~60 arms) with the int/float pairing in `:2589 by_class` | — | ADM (not data) |
+| environments | `spirv.mach:146-151 ENV_PROFILES` (4, with capability ceilings) | rebuilt as `[4]isa.Environment` at `spirv/register.mach:67-73`; SPIR-V version chosen in `EnvProfile.version` and again in `of/spv.mach:154,159` | DUP |
+| register-machine residue (#2963) | `abi/spirv.mach:11 ARG_REG_COUNT = 16`, `:40 arg_regs` identity convention (argument i → nominal register i); `spirv/register.mach:25-32` two 16-wide `RegClass` rows; `spirv/emit.mach:76 rec Regs` 16-slot pre-coloured shadow file | the 16 limit is stated at 12 named sites (`types.mach:51,53`, `emit.mach:1495,1672,2534,2720,2889,3205`, `mir/abi.mach:33 MAX_GP_ARG_REGS`, `abi/spirv.mach:11`, `register.mach:27,30`) plus 10 bare `[16]` bounds in `emit.mach`; a separate arity cap of 12 at `emit.mach:2801` | DUP, NIE |
+| pointer parameters (#2940) | `spirv/emit.mach:2164 spv_type_of` has no `IRT_PTR` arm and returns 0; `:1500-1503 emit_function` then refuses "unsupported parameter type" | `spirv/types.mach:451 type_fn` silently returns 0 for `n > MAX_FN_PARAMS`, a third statement of the limit | ADM |
+| structured control flow | `spirv/cfg.mach:63 analyze` with 7 refusal statuses (`:26-33`), merges emitted only by `spirv/emit.mach:1691 emit_merge` | — | ok |
+| effects | none: no flags, no clobbers, no latency class; `ctvalidate` refuses rather than models (`ctvalidate.mach:28`) | — | ADM (by design until N5 defines the emitter guarantee) |
+| independent control | `test/lib/layers.py:44 layer_a` runs `spirv-val`; layer B uses `spirv-dis` goldens `test/golden/spirv` | — | ok |
+
+## 6. VReg/PReg identity model
+
+### 6.1 The types as they are
+
+| domain | carrier | site |
+|---|---|---|
+| MIR virtual register | `u32` | `src/lang/be/codegen/mir.mach:754 MirOperand.vreg`, `:872 MirVReg.id` |
+| MIR physical register (class-tagged regid, widened) | `u32` | `mir.mach:754 MirOperand.preg`, `:872 MirVReg.assigned` |
+| MIR memory base | `vreg`/`preg` fields of the same record; base is a preg iff `vreg == MIR_VREG_NIL` | `mir.mach:1086 op_mem_preg`, `:1102 op_mem_value`, `regalloc.mach:2344` |
+| MIR memory index | `index: u32` meaning a vreg or a preg according to `index_is_preg: bool` | `mir.mach:754`; 37 production sites read `index_is_preg` |
+| the nil sentinel | one value, `mir.mach:748 MIR_VREG_NIL = 0xFFFFFFFF`, serves vreg, preg and index; 22 production comparisons test a preg or index against `MIR_VREG_NIL` | `regalloc.mach:2344-2350`, `mir.mach:1022-1150` constructors |
+| isa register id | `i32` regid | `src/lang/target/isa.mach:71 Operand.reg/base/index`, `:59 Register.id`, `RegMachine.scratch_reg/...`, `MachineModel.frame_ptr_reg/...`, `abi.ParamSlot.reg`, `abi.ParamPiece.reg` |
+| MIR class index (index into `model.reg_classes`) | `u32` | `mir.mach:752 REG_CLASS_GP = 0`, `MirVReg.class`, `regalloc.mach:142 fp_class_index` (found dynamically) |
+| isa class id (the regid high byte) | `i32` | `isa.mach:56-57 REG_CLASS_ID_GP/XMM` |
+| asm-parser register | `i32` regid in `asm.Operand.reg`; `(bank: u8, index: u32)` pair from `DeclRegFn` | `src/lang/target/isa/asm.mach:43`, `:177` |
+| DWARF/CodeView register | `fun(i32) i32` | `src/lang/target/arch.mach:9-11` |
+
+`def` in mach is a transparent alias ("there is no nominal distinction",
+`doc/language/def.md:3-4`), so `def VRegId: u32` would enforce nothing. Nominal
+identity needs single-field records, which is a thread-through of every `u32`
+vreg/preg parameter in the allocator (21 `fun ...(v: u32 ...)` signatures in
+`regalloc.mach` alone) and is the non-mechanical remainder of #3114 (section 9).
+
+### 6.2 Where a raw integer stands in (NIE tally, production only)
+
+| site class | count | examples |
+|---|---|---|
+| `preg::i32` / `assigned::i32` / `index::i32` / `base::i32` bare casts between the u32 and i32 carriers | 48 | `regalloc.mach` 18, `mos6502/encode.mach` 10, `x64/encode.mach` 5, `riscv/encode.mach` 5, `arm64/encode.mach` 5, `rules.mach` 2, `encode.mach` 2, `mir/abi.mach` 1 |
+| `regid_make(` call sites (the only sanctioned constructor) | 33 | regalloc 9, abi packs 10, ISA files 11, `mir/abi.mach` 2, `isa.mach` 1 |
+| `regid_class(`/`regid_index(` decode sites | 86 | regalloc 33, `x64/encode.mach` 16, arm64 printer+encode 13, riscv 8, rest 16 |
+| `op_preg(<literal>)` / `op_vreg(<literal>)` in production | 0 | (17 hits are all in `t_*` helpers and `arm64/rules.mach:612 vec_op_select_fails`, a test-only helper without the prefix) |
+| `make_reg(<literal>, ...)` in production | 0 | — |
+| adjacent `u32` parameters where a vreg and a preg can be swapped silently | 1 signature, 21 vreg-typed | `regalloc.mach:1925 assign(ctx, v: u32, preg: u32, reg_class: u32)` |
+| MIR preg → isa regid with no conversion function | 4 ISAs | `x64/encode.mach:4014 mir_to_operand`, `arm64/encode.mach:1051 req_gpr`, `riscv/encode.mach:671 req_gpr`, all `op.preg::i32` |
+| named ISA register constants that are indices, not regids | x86_64 XMM (16), aarch64 X/V (63), riscv X/F (64) | `x64.mach:28-43`, `arm64.mach:6-76`, `riscv.mach:6-91` |
+| encoder-local restatements of those constants | 12 | `arm64/encode.mach:92-95,116-117`, `riscv/encode.mach:113-114,131-136`, `x64/encode.mach:2522-2523` |
+
+### 6.3 What is enforced today
+
+- `regalloc.mach:1925 assign` panics if the regid class disagrees with the
+  live-range class.
+- `regalloc.mach:2360 verify_allocation` re-checks every assigned regid against
+  its class and the reserved set.
+- `regalloc.mach:2322 verify_rewritten_operands` (4.30.0, #3117 closed) refuses a
+  surviving vreg, a preg outside every class (`:2287 rewritten_preg_ok`,
+  `:2300 special_gp_register`), a bank mismatch against the operand's
+  `required_bank` (`:2316 operand_bank_matches`, captured at selection by
+  `rules.mach:80 capture_operand_banks`), and a non-GP memory base or index.
+- None of these is a type-level refusal; all are runtime walks after the fact.
+
+## 7. Target registry: ownership and borrow lifetime
+
+### 7.1 Ownership chain
+
+- `src/lang/session.mach:95` `Session.registry: target.TargetRegistry` **by value**;
+  `src/lang/session.mach:214` `session.dnit` → `target.registry_dnit`.
+- `src/lang/target.mach:90 rec TargetRegistry { isa: isa.IsaRegistry; os; abi; of;
+  debug; state: u8; version: u32 }`, all sub-registries by value.
+- `src/lang/target/isa.mach:778 rec IsaRegistry { entries: [8]IsaRegistryEntry;
+  count; alloc; alloc_ready }` — the entries are an **inline array**.
+- `src/lang/target/isa.mach:1267 register` copies the caller's descriptor into
+  `entries[count]` and re-points every internal pointer at entry-owned storage:
+  `:1488 entry.descriptor.model = ?entry.model`, `:1500 .machine = ?entry.machine`,
+  `:1504 .emitter`, `:1508 .reloc`, `:1591 .defs`, with `own_copy` duplicates of
+  `reg_classes`, reserved/reload register lists, `packed_gaps`, `envs`, op/type
+  defs and their name strings (`:973 own_copy`, `:986 own_space`), all freed by
+  `:991 release_entry`. So a registered `IsaVTable` is **self-referential into the
+  inline array that holds it**.
+- `src/lang/target.mach:211 register_all` publishes once (`REGISTRY_FRESH` →
+  `BUILDING` → `READY`, `version = REGISTRY_VERSION`) and refuses a partial or
+  foreign registry. Ownership of descriptor storage is therefore immutable after
+  publication, which is the property #3116 wanted; it is enforced by state, not
+  by type.
+
+### 7.2 Borrowers
+
+- `src/lang/target.mach:338 resolve` returns `resolved.Target` by value. It holds
+  six borrowed pointers into the registry (`src/lang/target/resolved.mach:11`:
+  `os: *OsVTable`, `isa: *IsaVTable`, `arch: *RegMachine`, `abi: *AbiVTable`,
+  `of: *OfVTable`, `debug: *DebugVTable`) and one **copied** `model: MachineModel`
+  (`target.mach:471`) whose `reg_classes`, `reserved_regs` and `packed_gaps`
+  pointers still borrow entry storage.
+- `src/lang/driver/project.mach:222 Project.target: target.Target` by value, with
+  `Project.s: *session.Session`; `project.mach:206 TargetTuple.target_defs:
+  *isa.TargetDefs` borrows an entry's `defs` for every union tuple.
+- Every middle-end and backend context borrows `*target.Target` from the project:
+  `src/lang/me/pipeline.mach:52,243`, `src/lang/me/lower/context.mach:121,133`,
+  `src/lang/me/transform/licm.mach:30`, `sroa.mach:47,86`, `scalarize.mach:35,46`,
+  `src/lang/be/codegen/mir/context.mach:31`, `src/lang/be/codegen.mach:89
+  codegen_module(s, tgt: *target.Target, ...)`.
+- `src/lang/target/resolved.mach:39 backend_target` copies the borrowed vtables'
+  scalar fields into an `isa.BackendTarget` **value** with no pointers; this is
+  the one place the borrow is severed, and it is what `select`/`encode`/
+  `emit_module` receive.
+- Editor: `src/lang/editor.mach:108 AnalysisRequest.standalone_target: *target.Target`
+  is caller-owned; the synthesized host target is a stack value
+  (`editor.mach:1409 var host: target.Target`, fix c86dac09) consumed inside the
+  same call (`:1423-1427`), never retained.
+
+### 7.3 Where a borrow can outlive its owner (BLU)
+
+1. **No generation stamp.** `resolved.Target` carries nothing identifying the
+   registry it was resolved against, and `backend_target` checks nothing. A
+   `Target` used after `session.dnit` (or against a re-initialized registry) is
+   undetectable. #3116's acceptance ("a resolved target used against a different
+   registry generation fails closed in a test") is not implemented; the
+   `TargetRegistry.version` field only gates `resolve` itself
+   (`target.mach:342`).
+2. **Session is copied by value with its inline registry.**
+   `src/lang/build/engine.mach:1181 pcg_worker_init`: `w.sess = @p.s`. The copy's
+   `entries[i].descriptor.model` still points into the **original** session's
+   entry (set at registration), and the copy's `reg_classes`/`reserved` pointers
+   alias the original's heap blocks. It is sound today only because
+   `pcg_worker_teardown` (`:1187`) never calls `session.dnit` on the copy and the
+   original outlives every worker; a `session.dnit(?w.sess)` would double-free
+   every entry. Nothing in the types or in `registry_dnit` detects an aliased copy.
+3. **Inline entries make `IsaVTable` pointers address-stable only while `Session`
+   is not moved.** `session.init` returns `Session` by value
+   (`src/lang/session.mach:107`) before any registration, so the move is
+   harmless in practice, and every production registration goes through
+   `driver.setup_registry(?s.registry)` on the settled session. Unproven, not
+   broken.
+4. **Test-only self-referential records.** `src/lang/me/ir/verify.mach:1242 rec
+   TEnv { registry: target.TargetRegistry; ...; tgt: resolved.Target }` holds the
+   owner and the borrower in one value; copying a `TEnv` dangles `tgt`. Same
+   shape at the 14 `fin { registry_dnit(?reg) }` test sites in
+   `src/lang/be/codegen/mir/abi.mach`, `obj.mach`, `emit.mach`, `linker.mach`,
+   all of which drop the target before the registry by scope order.
+
+Which of "immutable ownership" or "a generation stamp" closes item 1 is the
+owner's call named in #2212 ("choose immutable ownership rather than a redundant
+version scheme where sufficient"); section 9 records it as non-mechanical.
+
+## 8. Gap tally per ISA
+
+Counts are of distinct sites or site families named in sections 2 to 7.
+
+| ISA | ADM | DUP | NIE | BLU |
+|---|---|---|---|---|
+| x86_64 | 5 (form/shape, codegen flags, memory, aliasing, clobbers) | 9 (mnemonic x3, SSE bytes, width ladder x5, cond codes x6, flag facts x3, GP names, XMM count) | 4 (`FLOAT_SCRATCH0/1`, XMM indices, `op.preg::i32`, decl_reg triple) | — |
+| aarch64 | 6 (private `Inst`, mnemonics, codegen flags, memory, aliasing, clobbers) | 10 (opcode x4, shape, access scale, load/store x3, mnemonics, cond codes, branch/nullary words, NEON size, vector count) | 3 (`ZR/SP_REG/SCRATCH*`, 24 literal sites, `op.preg::i32`) | — |
+| riscv64/32 | 6 (form table, load/store predicate, fence, clobbers, C claimed not emitted, xlens unenforced) | 11 (opcode x2, fields x3, mem funct3, aq/rl x3, names, numbers, FPR count, rounding, extension order) | 3 (`RZERO..SCRATCH2`, 170 literal sites, `op.preg::i32`) | — |
+| SPIR-V | 4 (word count, mapping as code, pointer type, effects) | 5 (opcode literals, def counts, environments, version, the 16 limit x22) | 1 (synthetic 16-register bank) | — |
+| shared | 1 (`Inst.clobbers` dead) | — | 4 (shared NIL sentinel, `index_is_preg`, `assign` signature, `def` non-nominal) | 4 (items 7.3.1-4) |
