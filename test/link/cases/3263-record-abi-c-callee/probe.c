@@ -48,7 +48,10 @@ struct t9 c_mk_t9(unsigned char x) { struct t9 r; r.d = 1; r.p[0] = x; r.p[7] = 
 struct t16 c_mk_t16(long long x) { struct t16 r; r.d = 1; r.p = x; return r; }
 struct o24 c_mk_o24(long long x) { struct o24 r; r.d = 1; r.p[0] = x; r.p[1] = x + 1; return r; }
 struct nest c_mk_nest(unsigned int x) { struct nest r; r.d = 1; r.p.d = 1; r.p.p = x; return r; }
-struct al16 c_mk_al16(unsigned char x) { struct al16 r; r.d = 1; r.p = x; return r; }
+/* zeroed on purpose: the tail padding is delivered whole on aapcs64, lp64d and win64, so an
+   indeterminate tail would be C's stack garbage there and only System V's undelivered eightbyte
+   makes it a compiler property; the compiler's own transport tests pin that zeroing */
+struct al16 c_mk_al16(unsigned char x) { struct al16 r = {0}; r.d = 1; r.p = x; return r; }
 struct tf c_mk_tf(double x) { struct tf r; r.d = 1; r.p = x; return r; }
 struct tf8 c_mk_tf8(float x) { struct tf8 r; r.d = 1; r.p = x; return r; }
 struct tfm c_mk_tfm(long long x) { struct tfm r; r.p = 2.5; r.q = x; return r; }
