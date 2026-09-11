@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Bracket interpretation of an imported name follows the imported declaration's
+  own kind. An imported value keeps its subscript reading, and the resolver's
+  choice tracks a dependency change without rewriting the parse tree (#3121).
+
 - Name resolution reports one phase row per build. A deferred comptime gate no
   longer makes the resolver report every module again for each pass it takes,
   and each module's resolve time is accumulated across those passes (#3231).
