@@ -190,7 +190,7 @@ such an image is refused at link rather than silently dropped.
 
 | Axis  | Values |
 |-------|--------|
-| `isa` | `x86_64`, `aarch64`, `riscv64`, `riscv32`, `spirv` |
+| `isa` | `x86_64`, `aarch64`, `riscv64`, `riscv32`, a canonical RISC-V extension string such as `rv32imc`, `spirv` |
 | `os`  | `linux`, `windows`, `darwin`, `freestanding` |
 | `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, `ilp32d`, `spirv` |
 
@@ -210,12 +210,30 @@ emits a finished GPU module rather than machine code (see
 [Finished-module targets](#finished-module-targets)).
 
 `riscv64` and `riscv32` are width-only spellings, and each names a **default
-profile**: `riscv64` is `rv64gc` and `riscv32` is `rv32imac`. That default is
-the only profile a target can name today. There is no key that bounds the
-extensions below it (an `isa = "rv32imc"` or a standard profile string is not
-accepted), and the width-only spelling is never rejected; extension bounding is
-future additive work. The ABI, not the isa, selects the calling convention and
-the float facts.
+profile**: `riscv64` is `rv64gc` and `riscv32` is `rv32imac`. A canonical
+extension string such as `rv32imc` or `rv64imafd` selects a smaller machine.
+The retained vocabulary is I, M, A, F, D, C, Zicsr and Zifencei, written in
+lowercase canonical order with multi-letter names after an underscore; `g`
+expands to IMAFD plus Zicsr and Zifencei. F carries its required Zicsr, and D
+requires F. An optional version must be the one mach models: I 2.1, M 2.0,
+A 2.1, F and D 2.2, C 2.0, Zicsr and Zifencei 2.0. Unknown extensions,
+other versions, duplicates, noncanonical order and the E base are refused
+rather than rounded up to the default machine.
+
+The selected ISA bounds what the compiler generates and what named inline
+assembly may use: an instruction needing an extension the selection lacks is
+refused with a diagnostic naming that extension. A foreign object's
+`Tag_RISCV_arch` must declare only selected extensions at the modeled versions
+and the same register width, and its header flags may not claim compressed
+code without C; linking never widens the selection. A raw `.word` directive is
+the documented unchecked encoding boundary. C is accepted as a capability of the
+selected machine, but the emitter writes full-width instructions only.
+
+The ABI still selects the calling convention on its own, and it must fit the
+selected machine: `rv32imc` has no floating-point registers, so it takes
+`ilp32`, and `riscv32` (rv32imac) is refused with `ilp32f` or `ilp32d`; spell
+`rv32imafdc` when RV32 hardware floating point is wanted. `mach init` scaffolds
+`riscv32`/`freestanding` with `ilp32` for that reason.
 
 `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, and `ilp32d` are the RISC-V psABI
 calling-convention family, one `abi` per member. The lp64 three target

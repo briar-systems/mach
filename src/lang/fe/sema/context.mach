@@ -92,9 +92,26 @@ pub rec Definition {
     ctx: *comptime.ComptimeCtx;
 }
 
+pub rec AcquiredDefinition {
+    phase: DefinitionPhase;
+    definition: Definition;
+}
+
 pub rec DefinitionReader {
     ctx: ptr;
     read: fun(ptr, session.ModuleId, DefinitionPhase) R.Result[Definition, fail.Fail];
+    acquired: vector.Vector[AcquiredDefinition];
+}
+
+# a reader lives for one computation, which acquires the same current definition once per origin
+pub fun reader_init(ctx: ptr, read: fun(ptr, session.ModuleId, DefinitionPhase) R.Result[Definition, fail.Fail],
+                    a: *A.Allocator) DefinitionReader {
+    ret DefinitionReader{ ctx: ctx, read: read, acquired: vector.init[AcquiredDefinition](a) };
+}
+
+pub fun reader_dnit(reader: *DefinitionReader) {
+    if (reader == nil) { ret; }
+    vector.dnit[AcquiredDefinition](?reader.acquired);
 }
 
 pub rec DefinedSymbol {
@@ -106,6 +123,17 @@ pub fun acquire_definition(reader: *DefinitionReader, origin: session.ModuleId,
                            phase: DefinitionPhase) R.Result[Definition, fail.Fail] {
     if (reader == nil || reader.ctx == nil || reader.read == nil || phase > DEFINITION_TYPED) {
         ret R.err[Definition, fail.Fail](fail.message("current definition acquisition requires an active phase capability"));
+    }
+    var slot: usize = reader.acquired.len;
+    var ai: usize = 0;
+    for (ai < reader.acquired.len) {
+        val entry: *AcquiredDefinition = ?reader.acquired.data[ai];
+        if (entry.definition.origin == origin) {
+            if (entry.phase >= phase) { ret R.ok[Definition, fail.Fail](entry.definition); }
+            slot = ai;
+            brk;
+        }
+        ai = ai + 1;
     }
     val acquired: R.Result[Definition, fail.Fail] = reader.read(reader.ctx, origin, phase);
     if (R.is_err[Definition, fail.Fail](acquired)) { ret acquired; }
@@ -126,6 +154,12 @@ pub fun acquire_definition(reader: *DefinitionReader, origin: session.ModuleId,
     }
     if (phase == DEFINITION_TYPED && current.sr.status.kind != fail.ACCEPTED) {
         ret R.err[Definition, fail.Fail](fail.phase_failure(current.sr.status));
+    }
+    val entry: AcquiredDefinition = AcquiredDefinition{ phase: phase, definition: current };
+    if (slot < reader.acquired.len) { reader.acquired.data[slot] = entry; }
+    or {
+        val added: R.Result[usize, str] = vector.push[AcquiredDefinition](?reader.acquired, entry);
+        if (R.is_err[usize, str](added)) { ret R.err[Definition, fail.Fail](fail.message(R.unwrap_err[usize, str](added))); }
     }
     ret acquired;
 }
@@ -1376,4 +1410,67 @@ pub fun record_eval_result(sc: *SemaContext, r: R.Result[comptime.CTValue, compt
     if (!R.is_err[comptime.CTValue, comptime.EvalFail](r)) { ret; }
     val f: comptime.EvalFail = R.unwrap_err[comptime.CTValue, comptime.EvalFail](r);
     if (f.kind == comptime.EVAL_FAIL_INTERNAL) { fail.internal(?sc.status, f.message); }
+}
+
+rec CountingDefinition {
+    current: Definition;
+    reads: u32;
+}
+
+fun t_counting_definition(raw: ptr, origin: session.ModuleId, phase: DefinitionPhase) R.Result[Definition, fail.Fail] {
+    val probe: *CountingDefinition = raw::*CountingDefinition;
+    probe.reads = probe.reads + 1;
+    if (probe.current.origin != origin) { ret R.err[Definition, fail.Fail](fail.message("counting definition owner differs")); }
+    ret R.ok[Definition, fail.Fail](probe.current);
+}
+
+test "mach.lang.fe.sema.context.acquire_definition:reads_each_origin_once_per_reader_and_upgrades_the_phase" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    fin { session.dnit(?s); }
+
+    var a1: ast.Ast;
+    var sm1: SemaResult = SemaResult{};
+    var rr1: resolve.ResolveResult;
+    var cc1: comptime.ComptimeCtx;
+    a1.incarnation = 1;
+    rr1.status = fail.accepted();
+    sm1.status = fail.accepted();
+    val mid: session.ModuleId = 0::session.ModuleId;
+    if (R.is_err[R.Void, str](session.register_module_identity(?s, mid, ?a1, 7::intern.StrId, 5))) { ret 1; }
+
+    var probe: CountingDefinition = CountingDefinition{
+        current: Definition{
+            parsed: resolve.ParsedDefinition{ a: ?a1, owner: resolve.type_owner(?s, mid, a1.file_id), incarnation: a1.incarnation },
+            origin: mid, rr: ?rr1, sr: ?sm1, ctx: ?cc1
+        },
+        reads: 0
+    };
+    var reader: DefinitionReader = reader_init((?probe)::ptr, t_counting_definition, ?alloc);
+    fin { reader_dnit(?reader); }
+
+    val first: R.Result[Definition, fail.Fail] = acquire_definition(?reader, mid, DEFINITION_RESOLVED);
+    val second: R.Result[Definition, fail.Fail] = acquire_definition(?reader, mid, DEFINITION_RESOLVED);
+    if (R.is_err[Definition, fail.Fail](first) || R.is_err[Definition, fail.Fail](second)) { ret 2; }
+    if (probe.reads != 1) { ret 3; }
+    if (R.unwrap_ok[Definition, fail.Fail](second).rr != ?rr1) { ret 4; }
+
+    # a typed request outranks the resolved entry and replaces it
+    val typed: R.Result[Definition, fail.Fail] = acquire_definition(?reader, mid, DEFINITION_TYPED);
+    if (R.is_err[Definition, fail.Fail](typed) || probe.reads != 2) { ret 5; }
+    if (R.unwrap_ok[Definition, fail.Fail](typed).sr != ?sm1) { ret 6; }
+    val resolved_again: R.Result[Definition, fail.Fail] = acquire_definition(?reader, mid, DEFINITION_RESOLVED);
+    val typed_again: R.Result[Definition, fail.Fail] = acquire_definition(?reader, mid, DEFINITION_TYPED);
+    if (R.is_err[Definition, fail.Fail](resolved_again) || R.is_err[Definition, fail.Fail](typed_again)) { ret 7; }
+    if (probe.reads != 2 || reader.acquired.len != 1) { ret 8; }
+
+    # a failed read is not remembered, and another origin is its own entry
+    val other: R.Result[Definition, fail.Fail] = acquire_definition(?reader, 1::session.ModuleId, DEFINITION_RESOLVED);
+    if (R.is_ok[Definition, fail.Fail](other) || probe.reads != 3 || reader.acquired.len != 1) { ret 9; }
+    val other_again: R.Result[Definition, fail.Fail] = acquire_definition(?reader, 1::session.ModuleId, DEFINITION_RESOLVED);
+    if (R.is_ok[Definition, fail.Fail](other_again) || probe.reads != 4) { ret 10; }
+    ret 0;
 }

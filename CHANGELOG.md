@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collisions are checked after expansion among the artifacts selected for a
   target, and library forms an object format lacks are refused. `mach init`
   writes one such artifact instead of a per-extension split (#3222).
+- `isa` accepts a canonical RISC-V extension string (`rv32imc`, `rv64imafd`,
+  `rv64gc`) over the retained I, M, A, F, D, C, Zicsr and Zifencei vocabulary.
+  The selection declares the machine's multiply and float facts, bounds the
+  instructions the compiler and named inline assembly may emit, and is written
+  into the object's `Tag_RISCV_arch`; an unknown extension, another version, a
+  noncanonical string or the E base is refused rather than rounded up to the
+  default machine (#3127).
 
 ### Fixed
 
@@ -67,6 +74,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The ELF, COFF and Mach-O writers size and serialize every file from one
+  checked plan. A region is placed once, with its alignment, offset and extent
+  checked through the shared layout primitives, and every field is narrowed from
+  that plan; a section, table or address that would overflow, misalign or exceed
+  a format's field width is refused before any buffer exists, and a region whose
+  written bytes do not end on its planned extent refuses publication instead of
+  shipping. Section identity in object records, deferred relocations and the
+  writers is the nominal `SectionId`, so a section cannot be used as a symbol,
+  segment or table index without an explicit conversion. Valid output is
+  byte-identical, including RV32 static and relocatable images (#3113).
+
 - rename `sel` identifiers ahead of the v5 keyword (#3219)
 
 - A root manifest declares at least one `[profile.<name>]`, and every declared
@@ -87,12 +105,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bin` never publishes one, and full-path imports need no default. The
   artifact-less `lib.mach` fallback of 4.30 stays until 5.0.0 removes it
   (#3222).
+- Vector operations require an explicit target capability row. Each ISA declares
+  its supported (operation, lane kind, lane width) rows positively. Missing or
+  malformed operation and lane shapes no longer default to packed support (#3120).
+
+- `riscv32` means its documented rv32imac default, so it takes `ilp32` and is
+  refused with the `ilp32f` and `ilp32d` conventions; spell `rv32imafdc` for RV32
+  hardware float. Linking refuses a RISC-V object whose attributes or header
+  flags need an extension the selected target lacks, and mach's own objects
+  declare `zicsr` and `zifencei` alongside the selected single-letter
+  extensions (#3127).
 
 - Every dependency action selects its project with `mach dep <action> <path>`.
   Dependency names follow the path. Missing or extra operands are refused.
   Use `.` for the current project. Pull retains existing local copies and update
   refreshes them. Dependency commands preserve the project's Git history.
 - Query products validate their inputs transitively before reuse, own their diagnostics and release replaced or failed candidates through their finalizers. Equal recomputed dependencies keep their revision, changed diagnostics with equal bytes stay observable, external revisions and the selected target invalidate what read them, and a failed dependency never leaves a stale successful product. Importers depend on a dependency's public surface, so a body-only edit reuses their typed results (#3220).
+- A build decodes each origin module's typed surface once per surface it builds,
+  remaps a resolve result once per operation, acquires each origin's current
+  definition once per sema or lower computation, and verifies a field graph once
+  per type projection. On one 43-module artifact with the debug compiler, sema
+  drops from 212 ms to 75 ms and lower from 261 ms to 117 ms (37 ms and 82 ms
+  before the query work of #3247); the log is `doc/design/build-overhead-3218.md`
+  (#2299).
 - Editor analysis returns an owned diagnostic/source snapshot with explicit phase and target selection. Raw products have checked serial-view lifetimes. Closing a buffer retires its overlay, source payload and cached dependents while retaining its FileId. Buffer slots are reused, and checked editor teardown preserves owners on preparation failure (#2999).
 
 ## [4.30.0] - 2026-09-07
