@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `mach build --cache` and `mach test --cache` reuse object images across
+  compiler processes from `.mach-cache` under the output directory, keyed on the
+  running compiler's content, the build configuration, the whole active source
+  graph, dependency identity, embedded bytes and executed build steps, with
+  bounded storage and atomic publication. Off by default in this phase;
+  `--no-cache` forces a genuinely uncached build with no build-step reuse
+  (#3221).
+
 - `mach check <path>` runs load, resolve and sema over the source reachable from
   the artifacts `mach build` would select, through the same driver, queries and
   phase outcomes, and exits with the frontend's own classification: 0 accepted,

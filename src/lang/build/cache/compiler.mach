@@ -1,0 +1,317 @@
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+use fs: std.filesystem;
+use io_error: std.io.error;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.memory;
+use std.system.os;
+use std.allocator.page;
+use identities: std.system.file_identity;
+use mach.lang.build.fingerprint;
+
+pub val UNAVAILABLE: u8 = 1;
+pub val INTERNAL: u8 = 2;
+pub rec Error { kind: u8; message: str; }
+
+fun unavailable(message: str) Error { ret Error{kind: UNAVAILABLE, message: message}; }
+fun internal(message: str) Error { ret Error{kind: INTERNAL, message: message}; }
+fun io_failure(error: io_error.Error) Error {
+    if (error.kind == io_error.RESOURCE_EXHAUSTED || error.kind == io_error.INVALID || error.kind == io_error.CLOSED) {
+        ret internal(io_error.message(error));
+    }
+    ret unavailable(io_error.message(error));
+}
+
+fun hash_held(held: fs.File, out: *u8) R.Result[R.Void, Error] {
+    val hashed: R.Result[R.Void, str] = fingerprint.held_file_sha256(held, out);
+    if (R.is_err[R.Void, str](hashed)) { ret R.err[R.Void, Error](internal(R.unwrap_err[R.Void, str](hashed))); }
+    ret R.ok_void[Error]();
+}
+
+fun finish_owned(held: *fs.File, out: *u8) R.Result[R.Void, Error] {
+    var computed: [32]u8;
+    val hashed: R.Result[R.Void, Error] = hash_held(@held, ?computed[0]);
+    val closed: O.Option[io_error.Error] = fs.close(held);
+    if (R.is_err[R.Void, Error](hashed)) { ret hashed; }
+    if (O.is_some[io_error.Error](closed)) { ret R.err[R.Void, Error](internal(io_error.message(O.unwrap[io_error.Error](closed)))); }
+    memory.raw_copy(out::ptr, (?computed[0])::ptr, 32);
+    ret R.ok_void[Error]();
+}
+
+fun identified_digest(path: str, expected: fs.Identity, out: *u8) R.Result[R.Void, Error] {
+    val opened: R.Result[fs.File, io_error.Error] = fs.open(path);
+    if (R.is_err[fs.File, io_error.Error](opened)) { ret R.err[R.Void, Error](io_failure(R.unwrap_err[fs.File, io_error.Error](opened))); }
+    var held: fs.File = R.unwrap_ok[fs.File, io_error.Error](opened);
+    val observed: R.Result[fs.Identity, io_error.Error] = fs.identity_of(held);
+    if (R.is_err[fs.Identity, io_error.Error](observed)) {
+        val closed: O.Option[io_error.Error] = fs.close(?held);
+        if (O.is_some[io_error.Error](closed)) { ret R.err[R.Void, Error](internal("compiler identity query and file cleanup both failed")); }
+        ret R.err[R.Void, Error](io_failure(R.unwrap_err[fs.Identity, io_error.Error](observed)));
+    }
+    if (!fs.identity_equal(expected, R.unwrap_ok[fs.Identity, io_error.Error](observed))) {
+        val closed: O.Option[io_error.Error] = fs.close(?held);
+        if (O.is_some[io_error.Error](closed)) { ret R.err[R.Void, Error](internal("compiler identity changed and file cleanup failed")); }
+        ret R.err[R.Void, Error](unavailable("compiler path no longer names the running image"));
+    }
+    ret finish_owned(?held, out);
+}
+
+$if ($mach.build.os == $mach.os.darwin) {
+    use ls: std.system.os.darwin.libsystem;
+
+    #[library("libSystem")] #[symbol("_proc_pidinfo")]
+    ext fun proc_pidinfo(pid: i32, flavor: i32, argument: u64, buffer: ptr, size: i32) i32;
+
+    rec Region {
+        protection: u32; maximum_protection: u32; inheritance: u32; flags: u32;
+        offset: u64;
+        behavior: u32; user_wired_count: u32; user_tag: u32;
+        pages_resident: u32; pages_shared_now_private: u32; pages_swapped_out: u32;
+        pages_dirtied: u32; ref_count: u32; shadow_depth: u32; share_mode: u32;
+        private_pages_resident: u32; shared_pages_resident: u32; object_id: u32; depth: u32;
+        address: u64; size: u64;
+    }
+    rec VnodeStat {
+        device: u32; mode: u16; links: u16; inode: u64; uid: u32; gid: u32;
+        access_seconds: i64; access_nanoseconds: i64;
+        modified_seconds: i64; modified_nanoseconds: i64;
+        changed_seconds: i64; changed_nanoseconds: i64;
+        birth_seconds: i64; birth_nanoseconds: i64;
+        size: i64; blocks: i64; block_size: i32; flags: u32;
+        generation: u32; raw_device: u32; reserved: [2]i64;
+    }
+    rec Vnode {
+        stat: VnodeStat; kind: i32; padding: i32; filesystem: [2]i32;
+    }
+    rec RegionPath {
+        region: Region; vnode: Vnode; path: [1024]u8;
+    }
+
+    #[noinline]
+    fun darwin_digest(out: *u8) R.Result[R.Void, Error] {
+        val address: u64 = darwin_digest::u64;
+        var mapped: RegionPath;
+        val count: i32 = proc_pidinfo(os.getpid()::i32, 8, address, (?mapped)::ptr, $size_of(RegionPath)::i32);
+        if (count <= 0) { ret R.err[R.Void, Error](io_failure(io_error.from_code(0 - ls.errno()::i64, io_error.OP_OPTION))); }
+        if (count != $size_of(RegionPath)::i32) { ret R.err[R.Void, Error](internal("running compiler vnode response has the wrong size")); }
+        if (!mapped_region_valid(?mapped, address)) {
+            ret R.err[R.Void, Error](unavailable("running compiler mapping has no complete file identity"));
+        }
+        val expected: fs.Identity = identities.native(identities.DARWIN_LOCAL,
+            (mapped.vnode.stat.device:~i32)::u64, mapped.vnode.stat.inode);
+        ret identified_digest((?mapped.path[0])::str, expected, out);
+    }
+
+    fun mapped_region_valid(mapped: *RegionPath, address: u64) bool {
+        if (address < mapped.region.address || address - mapped.region.address >= mapped.region.size
+            || mapped.vnode.kind != 1 || (mapped.vnode.stat.mode & 0xf000) != 0x8000
+            || mapped.path[0] != '/') { ret false; }
+        var i: usize = 1;
+        for (i < 1024) {
+            if (mapped.path[i] == 0) { ret true; }
+            i = i + 1;
+        }
+        ret false;
+    }
+
+    test "mach.lang.build.cache.compiler:darwin_mapping_layout_and_bounds" {
+        if ($size_of(Region) != 96 || $size_of(VnodeStat) != 136 || $size_of(Vnode) != 152
+            || $size_of(RegionPath) != 1272 || $offset_of(Region, address) != 80
+            || $offset_of(RegionPath, vnode) != 96 || $offset_of(RegionPath, path) != 248
+            || $offset_of(VnodeStat, inode) != 8) { ret 1; }
+        var mapped: RegionPath;
+        mapped.region.address = 100; mapped.region.size = 20;
+        mapped.vnode.kind = 1; mapped.vnode.stat.mode = 0x8000;
+        mapped.path[0] = '/'; mapped.path[1] = 'x'; mapped.path[2] = 0;
+        if (!mapped_region_valid(?mapped, 100) || !mapped_region_valid(?mapped, 119)
+            || mapped_region_valid(?mapped, 99) || mapped_region_valid(?mapped, 120)) { ret 2; }
+        mapped.vnode.kind = 0;
+        if (mapped_region_valid(?mapped, 100)) { ret 3; }
+        val address: u64 = darwin_digest::u64;
+        val count: i32 = proc_pidinfo(os.getpid()::i32, 8, address, (?mapped)::ptr, $size_of(RegionPath)::i32);
+        if (count != $size_of(RegionPath)::i32) { ret 4; }
+        if (!mapped_region_valid(?mapped, address)) { ret 5; }
+        ret 0;
+    }
+}
+
+$if ($mach.build.os == $mach.os.windows) {
+    use std.types.size.isize;
+
+    #[library("kernel32.dll")]
+    ext fun GetModuleHandleW(name: *u16) ptr;
+    #[library("kernel32.dll")]
+    ext fun GetModuleFileNameW(module: ptr, path: *u16, capacity: u32) u32;
+    #[library("kernel32.dll")]
+    ext fun K32GetMappedFileNameW(process: isize, address: ptr, path: *u16, capacity: u32) u32;
+    #[library("kernel32.dll")]
+    ext fun GetFinalPathNameByHandleW(handle: isize, path: *u16, capacity: u32, flags: u32) u32;
+    #[library("kernel32.dll")]
+    ext fun CreateFileW(path: *u16, access: u32, sharing: u32, security: ptr, disposition: u32, flags: u32, template_file: isize) isize;
+    #[library("kernel32.dll")]
+    ext fun CloseHandle(handle: isize) i32;
+    #[library("kernel32.dll")]
+    ext fun GetLastError() u32;
+    #[library("kernel32.dll")]
+    ext fun GetFileInformationByHandleEx(handle: isize, kind: u32, info: ptr, size: u32) i32;
+    #[library("kernel32.dll")]
+    ext fun WideCharToMultiByte(codepage: u32, flags: u32, wide: *u16, units: i32, text: *u8, bytes: i32, replacement: *u8, replaced: *i32) i32;
+
+    rec WidePath { data: *u16; capacity: u32; len: u32; }
+    rec FileId { volume: u64; file: [16]u8; }
+
+    fun windows_failure(message: str) Error {
+        val code: u32 = GetLastError();
+        if (code == 8 || code == 14 || code == 1450 || code == 1455 || code == 1816 || code == 6 || code == 87) { ret internal(message); }
+        ret unavailable(message);
+    }
+
+    # kind selects the loader path, mapped nt path, or held file's normalized nt path
+    fun windows_path(a: *A.Allocator, kind: u8, image: ptr, held: isize) R.Result[WidePath, Error] {
+        var capacity: u32 = 256;
+        for {
+            val allocated: R.Result[*u16, str] = A.allocate[u16](a, capacity::usize);
+            if (R.is_err[*u16, str](allocated)) { ret R.err[WidePath, Error](internal(R.unwrap_err[*u16, str](allocated))); }
+            val data: *u16 = R.unwrap_ok[*u16, str](allocated);
+            var len: u32 = 0;
+            if (kind == 0) { len = GetModuleFileNameW(nil, data, capacity); }
+            or (kind == 1) { len = K32GetMappedFileNameW(0 - 1, image, data, capacity); }
+            or { len = GetFinalPathNameByHandleW(held, data, capacity, 2); }
+            if (len == 0) {
+                val failure: Error = windows_failure("cannot obtain the running compiler file path");
+                A.deallocate[u16](a, data, capacity::usize);
+                ret R.err[WidePath, Error](failure);
+            }
+            if (len < capacity) {
+                if (data[len::usize] != 0) {
+                    A.deallocate[u16](a, data, capacity::usize);
+                    ret R.err[WidePath, Error](internal("compiler path response has no terminator"));
+                }
+                ret R.ok[WidePath, Error](WidePath{data: data, capacity: capacity, len: len});
+            }
+            A.deallocate[u16](a, data, capacity::usize);
+            if (capacity > 0x3fffffff) { ret R.err[WidePath, Error](unavailable("compiler path exceeds the native conversion range")); }
+            capacity = capacity * 2;
+        }
+        ret R.err[WidePath, Error](internal("compiler path discovery did not finish"));
+    }
+
+    fun windows_digest(a: *A.Allocator, out: *u8) R.Result[R.Void, Error] {
+        val image: ptr = GetModuleHandleW(nil);
+        if (image == nil) { ret R.err[R.Void, Error](windows_failure("cannot locate the running compiler image")); }
+        val named: R.Result[WidePath, Error] = windows_path(a, 0, image, 0);
+        if (R.is_err[WidePath, Error](named)) { ret R.err[R.Void, Error](R.unwrap_err[WidePath, Error](named)); }
+        val path: WidePath = R.unwrap_ok[WidePath, Error](named);
+        fin { A.deallocate[u16](a, path.data, path.capacity::usize); }
+        # deny write/delete sharing while verifying mapping association and hashing
+        val guard: isize = CreateFileW(path.data, 0x80000000, 1, nil, 3, 0x80, 0);
+        if (guard == (0 - 1)) { ret R.err[R.Void, Error](windows_failure("cannot retain the running compiler file")); }
+        var computed: [32]u8;
+        val hashed: R.Result[R.Void, Error] = windows_guarded_digest(a, image, guard, path, ?computed[0]);
+        val close_ok: i32 = CloseHandle(guard);
+        if (close_ok == 0) { ret R.err[R.Void, Error](internal("cannot close the compiler identity guard")); }
+        if (R.is_err[R.Void, Error](hashed)) { ret hashed; }
+        memory.raw_copy(out::ptr, (?computed[0])::ptr, 32);
+        ret R.ok_void[Error]();
+    }
+
+    fun windows_guarded_digest(a: *A.Allocator, image: ptr, guard: isize, path: WidePath, out: *u8) R.Result[R.Void, Error] {
+        val mapped_r: R.Result[WidePath, Error] = windows_path(a, 1, image, guard);
+        if (R.is_err[WidePath, Error](mapped_r)) { ret R.err[R.Void, Error](R.unwrap_err[WidePath, Error](mapped_r)); }
+        val mapped: WidePath = R.unwrap_ok[WidePath, Error](mapped_r);
+        fin { A.deallocate[u16](a, mapped.data, mapped.capacity::usize); }
+        val final_r: R.Result[WidePath, Error] = windows_path(a, 2, image, guard);
+        if (R.is_err[WidePath, Error](final_r)) { ret R.err[R.Void, Error](R.unwrap_err[WidePath, Error](final_r)); }
+        val final_path: WidePath = R.unwrap_ok[WidePath, Error](final_r);
+        fin { A.deallocate[u16](a, final_path.data, final_path.capacity::usize); }
+        if (mapped.len != final_path.len || !memory.raw_equal(mapped.data::ptr, final_path.data::ptr, mapped.len::usize * 2)) {
+            ret R.err[R.Void, Error](unavailable("compiler path no longer names the running image"));
+        }
+        var native_id: FileId;
+        if (GetFileInformationByHandleEx(guard, 18, (?native_id)::ptr, $size_of(FileId)::u32) == 0) {
+            ret R.err[R.Void, Error](windows_failure("cannot identify the retained compiler file"));
+        }
+        var expected: fs.Identity = identities.native(identities.WINDOWS_LOCAL, native_id.volume, 0);
+        var i: usize = 0;
+        for (i < 16) { expected.representation[25 + i] = native_id.file[i]; i = i + 1; }
+        val bytes: i32 = WideCharToMultiByte(65001, 0x80, path.data, path.len::i32, nil, 0, nil, nil);
+        if (bytes <= 0) { ret R.err[R.Void, Error](windows_failure("cannot encode the compiler path as utf-8")); }
+        val allocated: R.Result[*u8, str] = A.allocate[u8](a, bytes::usize + 1);
+        if (R.is_err[*u8, str](allocated)) { ret R.err[R.Void, Error](internal(R.unwrap_err[*u8, str](allocated))); }
+        val text: *u8 = R.unwrap_ok[*u8, str](allocated);
+        fin { A.deallocate[u8](a, text, bytes::usize + 1); }
+        if (WideCharToMultiByte(65001, 0x80, path.data, path.len::i32, text, bytes, nil, nil) != bytes) {
+            ret R.err[R.Void, Error](windows_failure("compiler path conversion failed"));
+        }
+        text[bytes::usize] = 0;
+        ret identified_digest(text::str, expected, out);
+    }
+}
+
+fun running_digest(alloc: *A.Allocator, out: *u8) R.Result[R.Void, Error] {
+    $if ($mach.build.os == $mach.os.linux) { val opened: R.Result[fs.File, io_error.Error] = fs.open("/proc/self/exe");
+        if (R.is_err[fs.File, io_error.Error](opened)) { ret R.err[R.Void, Error](io_failure(R.unwrap_err[fs.File, io_error.Error](opened))); }
+        var held: fs.File = R.unwrap_ok[fs.File, io_error.Error](opened);
+        ret finish_owned(?held, out); }
+    $or ($mach.build.os == $mach.os.darwin) { ret darwin_digest(out); }
+    $or ($mach.build.os == $mach.os.windows) { ret windows_digest(alloc, out); }
+    $or { ret R.err[R.Void, Error](unavailable("running compiler identity is unavailable on this host")); }
+}
+
+# the running image cannot change under a live process (text-busy on linux,
+# share-denied on windows, identity-checked on darwin), so one hash of it serves
+# every build unit the process executes; each unit begins a fresh project, and
+# only the operation setup on the main thread asks for the digest
+var memo_valid: bool = false;
+var memo: [32]u8;
+
+# hashes the current executable, never argv[0], once per process
+# success writes exactly 32 bytes, failure leaves the output and the memo untouched
+pub fun digest(alloc: *A.Allocator, out: *u8) R.Result[R.Void, Error] {
+    if (alloc == nil || out == nil) { ret R.err[R.Void, Error](internal("compiler digest allocator or output is missing")); }
+    if (memo_valid) { memory.raw_copy(out::ptr, (?memo[0])::ptr, 32); ret R.ok_void[Error](); }
+    val hashed: R.Result[R.Void, Error] = running_digest(alloc, ?memo[0]);
+    if (R.is_err[R.Void, Error](hashed)) { ret hashed; }
+    memo_valid = true;
+    memory.raw_copy(out::ptr, (?memo[0])::ptr, 32);
+    ret R.ok_void[Error]();
+}
+
+test "mach.lang.build.cache.compiler:second_digest_is_served_from_the_memo" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var first: [32]u8;
+    val hashed: R.Result[R.Void, Error] = digest(?alloc, ?first[0]);
+    if (R.is_err[R.Void, Error](hashed)) {
+        if (R.unwrap_err[R.Void, Error](hashed).kind == UNAVAILABLE) { ret 0; }
+        ret 2;
+    }
+    if (!memo_valid) { ret 3; }
+    var second: [32]u8;
+    if (R.is_err[R.Void, Error](digest(?alloc, ?second[0]))) { ret 4; }
+    if (!memory.raw_equal((?first[0])::ptr, (?second[0])::ptr, 32)) { ret 5; }
+    # a perturbed memo must show through, proving the second call did not rehash
+    val kept: u8 = memo[0];
+    memo[0] = kept ^ 0xff;
+    var third: [32]u8;
+    val served: R.Result[R.Void, Error] = digest(?alloc, ?third[0]);
+    memo[0] = kept;
+    if (R.is_err[R.Void, Error](served) || third[0] != (kept ^ 0xff)) { ret 6; }
+    ret 0;
+}
+
+test "mach.lang.build.cache.compiler:missing_allocator_keeps_output_untouched" {
+    var output: [32]u8;
+    var i: usize = 0;
+    for (i < 32) { output[i] = 0xa5; i = i + 1; }
+    val result: R.Result[R.Void, Error] = digest(nil, ?output[0]);
+    if (R.is_ok[R.Void, Error](result) || R.unwrap_err[R.Void, Error](result).kind != INTERNAL) { ret 1; }
+    i = 0;
+    for (i < 32) { if (output[i] != 0xa5) { ret 2; } i = i + 1; }
+    ret 0;
+}
