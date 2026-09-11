@@ -30,7 +30,7 @@ with no test before this pass; `n/a` marks a cell the grammar cannot express.
 | record field | `sel b.r.value` | L3 storage (`Box`) | same |
 | array index (runtime) | `sel a[i].value` | L3 storage | same |
 | explicit deref | `sel (@p).value` | L3 storage (`bump`) | same |
-| pointer auto-deref | `sel p.value` with `p: *T` | **gap: rejected** (`sel` expects a tag, but this place has type `*Reply`) | L8 `tag_sel_and_payload_places_auto_deref_a_pointer_on_every_native_backend` |
+| pointer auto-deref | `sel p.value` with `p: *T` | **gap: rejected** (`sel` expects a tag, but this place has type `*Reply`) | L8 `tag_sel_and_payload_places_auto_deref_a_pointer_on_every_native_backend`, sema `sel_auto_derefs_a_pointer_place` |
 | descriptor | `sel v.[c]` | L4 agreement (`code_of`) | same |
 | nested payload place | `sel o.inner.value` | L3 storage (tags in tags) | same |
 | `$each` constant element | `sel t.value` with `t` over a constant array | **gap: lowering error** (address of a `$each` element) | L8 `tag_comptime_sel_and_payload_reads_agree_with_runtime_on_every_native_backend` |
@@ -40,9 +40,11 @@ auto-derefs a pointer) and left for the guard lane by the L3 inventory. The
 payload place `p.value` already dereferenced (record member access rules), so
 only `sel` refused it; fixed in `infer_sel` (one pointer level, outer secrecy
 checked on the pointee), in `open_exit_chain` (the chain's tag type is the
-pointee's), in `object_of` (an auto-deref ends the assignment cover chain like
-an explicit one) and in `lower_sel` (the discriminator loads through the
-pointer value).
+pointee's), in the whole-value assignment rule (a pointer place guards its
+pointee, so reassigning the pointer or anything it hangs off is allowed, exactly
+as `p = q` under `sel (@p).value` already was, while `b.r = ...` under
+`sel b.r.value` with `b: *Box` is still refused) and in `lower_sel` (the
+discriminator loads through the pointer value, as a member access does).
 
 ## 2. Payload access under each guard kind
 
@@ -57,6 +59,7 @@ fixture check on all six ISA/profile columns.
 | exiting chain, `cnt` | L7 (`item.some`) | **gap** → L8 | **gap** → L8 |
 | `&&` right operand | compiled only (L7 profile test) → **gap at runtime** → L8 | n/a (assignment is a statement) | **gap** → L8 |
 | nested guard `o.inner.value` | L3 | L3 | **gap** → L8 |
+| three-case exiting chain (one case left) | sema only → **gap** → L8 | **gap** → L8 | **gap** → L8 |
 
 L8 fixture: `ut_l8_guards_program`, test
 `tag_payload_access_under_every_guard_kind_on_every_native_backend`.
@@ -85,14 +88,18 @@ pass a single fixture had been inspected by hand.
 | index read | 1 | gap | L8 |
 | field read | 1 | gap | L8 |
 | aggregate payload copy | 1 | gap | L8 |
+| three-case chain: `t.c` in an arm, `t.b` after the chain | 2 | gap | L8 |
+| control: `sel` alone, no payload access | 0 | gap | L8 |
 
 Runtime trap behaviour per access kind (the case switched through a pointer
 between the guard and the access, trapping under debug and reading or writing
 through under release on the three ISAs): before this pass only the arm read
 was run (L7 `debug_profile_traps_a_guarded_read_after_the_case_changes`). L8
 adds `tag_debug_trap_fires_for_every_guarded_access_kind_on_every_native_backend`
-covering arm write, arm address, exiting-chain read, `&&` right-operand read
-and the nested inner read.
+covering arm write, arm address, exiting-chain read, `&&` right-operand read,
+the nested inner read and the pointer auto-deref read (argc 1 to 7 trap under
+debug; under release argc 2 lands the write on the payload and every other
+access reads through), plus a no-switch control that reads through under both.
 
 ## 4. Construction into each place kind
 
@@ -107,9 +114,13 @@ and the nested inner read.
 | destination call `@pick() = T.c{}` | L3 order | same |
 | descriptor head `T.[c]{}` | L4 agreement | same |
 | payload of a nested construction | L3 storage (`Outer.inner{Reply.value{9}}`) | same |
+| static initializer naming another constant (`val B: T = A;`, `A::T`, `Box{r: A}`, `[2]T{x, A}`, `ARR[1]`) | sema accepted, **lowering refused** ("must be a constant expression") | L8 `static_tag_initializers_fold_the_constant_they_name_on_every_native_backend` |
 
-No gap. The rows are restated here so the matrix is complete; the L3 inventory
-holds the byte-level evidence.
+The construction rows themselves had no gap; the L3 inventory holds the
+byte-level evidence. The static-initializer row is the defect the corpus test
+of section 6 surfaced: a `val` copied from another constant aggregate was
+accepted by sema (the canonical-tag identity-cast fixture) and refused by the
+constant aggregate folder, which only knew literals.
 
 ## 5. Comptime evaluation
 
@@ -127,14 +138,21 @@ module-member path and were "not a constant".
 | payload read `C.c` under a guard, scalar payload | **gap** | L8 |
 | payload read through a nested constant `O.inner.value` | **gap** | L8 |
 | `$if (sel C.c)` arm guards `C.c` in its block | **gap** (no guard opened by a comptime arm) | L8 |
-| `sel` on a non-constant place (param, local, module `var`) | **gap: internal error** | located diagnostic, L8 sema test |
+| `sel` on a non-constant place (param, local, module `var`, a constant of another module) | **gap: internal error** | located diagnostic, L8 sema tests `comptime_sel_tests_constant_tags` and driver `comptime_sel_on_a_mutable_or_foreign_place_is_reported_at_the_condition` |
 | payload read of the case a constant does not hold | **gap** | located diagnostic, L8 sema test |
-| runtime and comptime twins agree | **gap** | L8 parity fixture on every native backend |
+| a constant declared after the gate that tests it | **gap** | L8 sema test (bound before any body is bound) |
+| runtime `sel` and payload read over a `$each` element | **gap: lowering error** | fold, L8 parity fixture |
+| runtime and comptime twins agree | **gap** | L8 `tag_comptime_sel_and_payload_reads_agree_with_runtime_on_every_native_backend` |
 
 Mechanism: a module `val` whose initializer is a case literal is bound in the
 module's comptime context as a constant element (the same `CT_KIND_CONST_ELEM`
-the `$each` machinery uses) at name resolution, and rebound with its checked
-type once type checking has it. `sel` evaluates its place to a constant
+the `$each` machinery uses) by name resolution, after every declaration is
+collected and before any body is bound (the literal head `T.c` is a dotted
+path until the tag symbol is known, so the loader cannot recognize it), then
+rebound with its checked type by type checking and bound again by lowering for
+the gates it decides. A constant element points into its module's syntax tree,
+so it is never exported: a constant tag of another module is not a comptime
+place, and `sel` on one is rejected like any non-constant place. `sel` evaluates its place to a constant
 element, requires that element to be a case literal, and compares the literal's
 head case with the tested case, by name or through a descriptor. A payload read
 on a constant element that is a case literal yields the literal's payload when
@@ -143,7 +161,9 @@ literal, and is rejected when the case differs, which is the comptime analogue
 of the debug trap: comptime state is never stale, so the mismatch is a
 compile-time error rather than undefined behaviour. A comptime `sel` on
 anything that is not a constant element is rejected with a located diagnostic
-at the condition.
+at the condition, and a gate that reaches lowering still undecided is reported
+at its condition instead of failing internally. A `$if` arm whose condition is
+exactly `sel P.c` guards `P.c` in its body, the same rule as a chain arm.
 
 ## 6. Profile agreement at scale
 
@@ -158,30 +178,40 @@ native fixtures are already built under both profiles by `ut_tag_native_all`.
 
 ## Gap count
 
+Cells: 9 `sel` places, 18 guard-by-access cells (one unexpressible), 17 IR trap
+rows, 7 runtime trap rows, 10 construction rows, 10 comptime rows and the
+profile-agreement row.
+
 | | cells | gaps |
 | --- | --- | --- |
-| before | 60 | 41 |
-| after | 60 | 0 |
+| before | 71 | 49 |
+| after | 71 | 0 |
 
 ## Defects found and fixed
 
-Recorded as they were found, with the mutation control that shows the test
-fails without the fix.
+Each with the mutation control that shows its test failing without the fix.
 
-- `sel p.c` with `p: *T` was refused by `infer_sel` while the payload place
-  `p.c` was accepted, so a pointer receiver had to be spelled `(@p).c` for the
-  test and `p.c` for the access. Owner ruling 2026-09-10: `sel p.value`
-  auto-derefs. Fixed at sema (`infer_sel`, `open_exit_chain`, `object_of`)
-  and lowering (`lower_sel`). Mutation: reverting the `infer_sel` deref makes
-  the auto-deref fixture fail to compile on every target.
-- `sel` had no comptime evaluation and no gate-visitor entry; a `sel` in any
-  `$if` condition was an internal error. Fixed in `comptime.mach` (evaluation,
-  dependency visitor, constant-element payload reads) and `resolve.mach` /
-  `sema.mach` (constant binding of case-literal module values, `$if` arm
-  guards). Mutation: removing the `EXPR_KIND_SEL` evaluation arm makes the
-  comptime sema tests fail with the gate visitor's internal error again.
-- `sel t.c` on a `$each` constant element failed in lowering with "cannot take
-  the address of a `$each` constant array element". Fixed in `lower_sel`: a
-  constant-element place evaluates the test at compile time and materializes
-  the `u8`. Mutation: reverting the fold restores the lowering error in the
-  comptime parity fixture.
+- **`sel p.c` through a pointer** (dcce8cbbb). `infer_sel` refused a pointer
+  place while the payload place accepted it. Fixed at sema (`infer_sel`,
+  `open_exit_chain`, the assignment cover rule) and lowering (`lower_sel`).
+  Mutation: reverting the `infer_sel` dereference makes
+  `tag_sel_and_payload_places_auto_deref_a_pointer_on_every_native_backend`
+  and `sel_auto_derefs_a_pointer_place` fail.
+- **No comptime `sel`** (007cb2eea). Any `sel` in a `$if` condition was an
+  internal error from the gate dependency visitor. Fixed in `comptime.mach`
+  (evaluation, visitor, constant-element payload reads), `resolve.mach`
+  (constant binding before bodies), `sema.mach` (typed rebind, `$if` arm
+  guards), `lower/context.mach` (located gate failure) and `lower/expr.mach`
+  (`sel` over a `$each` element folds). Mutation: removing the
+  `EXPR_KIND_SEL` evaluation arm makes `comptime_sel_tests_constant_tags` and
+  the comptime parity fixture fail.
+- **A static initializer naming a constant aggregate** (b1d0db700). Found by
+  the corpus test: sema accepts `val r2: T = r;` and `r::T`, the constant
+  aggregate folder refused them. Fixed in `constagg.mach` through
+  `constant_literal_expr`. Mutation: bypassing the resolution in
+  `try_const_aggregate` makes
+  `static_tag_initializers_fold_the_constant_they_name_on_every_native_backend`
+  fail and the corpus test disagree on the identity-cast row.
+
+Mutation results are recorded in `migration-compiler-3218.md` with the run
+they were taken from.
