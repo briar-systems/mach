@@ -11,13 +11,9 @@ import tempfile
 census = runpy.run_path(str(Path(__file__).with_name('census.py')))['census']
 # (name, compiler source, std pin, mode). 'single' stages are one-way bridges built
 # once by the previous compiler. 'fixpoint' stages build A, B and C and require B == C.
-# the transition bridge is f2569491's source with the pre-suffix manifest of 52a53af8:
-# it parses under 4.30, implements the v5 manifest, and cannot rebuild itself against
-# a published std, so it is one-way. it lives on branch bootstrap/v5-transition.
 STAGES = [
     ('bridge', '878a8f66a90127360dc23de4480241934fc1bf0d', '3ee8e709a8ed7baff6e93780ce9b3582a907a91f', 'single'),
     ('audited', 'b65afb9704218e89998af5f71050ca315e7709a9', '168a9f760d7c0f7a182f3b0685081e62f1a4f682', 'fixpoint'),
-    ('transition', 'cd283ceeae8deb1ffbe760980f2d1db3ef22a7ac', '168a9f760d7c0f7a182f3b0685081e62f1a4f682', 'single'),
 ]
 
 
@@ -38,15 +34,6 @@ def run(label, command, source, evidence):
         raise RuntimeError(label + ' failed with exit ' + str(result.returncode))
 
 
-def required_stage():
-    # the source tree names the chain stage that compiles it; absent means the audited compiler
-    marker = Path('.mach-bootstrap')
-    name = marker.read_text(encoding='utf-8').strip() if marker.exists() else 'audited'
-    if name not in [stage[0] for stage in STAGES] or name == 'bridge':
-        raise ValueError('.mach-bootstrap names an unknown stage: ' + name)
-    return name
-
-
 def main():
     destination = Path('.mach-toolchain').resolve()
     evidence = destination / 'evidence'
@@ -59,14 +46,11 @@ def main():
         raise ValueError('bootstrap requires the published v4.26.5 seed')
     for name in ['release.json', 'SHA256SUMS', 'provenance.json']:
         shutil.copy2(seed_dir / name, evidence / ('seed-' + name))
-    last = required_stage()
-    provenance = dict(seed=seed, seed_sha256=digest(compiler), profile='debug', required=last, stages=[], fixpoint=False)
+    provenance = dict(seed=seed, seed_sha256=digest(compiler), profile='debug', stages=[], fixpoint=False)
     record = evidence / 'provenance.json'
     record.write_text(json.dumps(provenance, indent=2), encoding='utf-8')
     with tempfile.TemporaryDirectory(prefix='mach-bootstrap-', dir=os.environ.get('RUNNER_TEMP')) as scratch:
         for name, source_ref, std_ref, mode in STAGES:
-            if STAGES.index((name, source_ref, std_ref, mode)) > [stage[0] for stage in STAGES].index(last):
-                break
             source = Path(scratch) / name
             subprocess.run(['git', 'clone', '--quiet', 'https://github.com/briar-systems/mach', str(source)], check=True)
             subprocess.run(['git', 'checkout', '--detach', source_ref], cwd=source, check=True)

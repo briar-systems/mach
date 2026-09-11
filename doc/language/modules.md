@@ -16,19 +16,22 @@ syntactically uniform regardless of where it appears.
 ## Bare project-id imports
 
 A one-segment `use`/`fwd` path equal to a resolvable project id — a dependency's
-id or the current project's own id — binds that project's **public module**,
-the module its artifacts enter at. For a dependency that is the `entry` its
-artifacts share: `std` declares one `static` artifact with
-`entry = "lib/libstd.mach"`, so `use std;` binds the module `std.lib.libstd`.
-For the current project it is the selected artifact's entry. A dependency
-whose artifacts name different entries has no single public module, and a
-bare import of it is an error (`project 'x' has no public module because its
-artifacts name different entries; import a full path, or give every
-[artifact.*] table in its manifest the same entry`). Longer paths are
-unaffected. A dependency that declares no artifact at all falls back to
-`lib.mach` (`dep 'lib1' mach.toml: default entry names no file` when that
-file is absent); the fallback is removed in 5.0.0, so a library should
-declare its artifact.
+id or the current project's own id — binds that project's **public module**.
+For a dependency that is the `entry` shared by its library artifacts marked
+`default = true`: a library that declares one `static` artifact with
+`default = true` and `entry = "lib/libstd.mach"` gives `use std;` the module
+`std.lib.libstd`. Several default `static`/`shared` artifacts may share that
+entry; a `bin` never publishes one. For the current project it is the selected
+artifact's entry. A dependency with no default library artifact, or whose
+default library artifacts name different entries, has no public module, and a
+bare import of it is an error (`project 'x' has no public module: a bare
+import binds the entry shared by its library artifacts marked `default =
+true`; import a full path, or mark one static or shared [artifact.*] table (or
+several sharing one entry) default = true in its manifest`). Longer paths are
+unaffected: `use std.print;` needs no default artifact. A dependency that
+declares no artifact at all falls back to `lib.mach` (`dep 'lib1' mach.toml:
+public entry names no file` when that file is absent); the fallback is removed
+in 5.0.0, so a library should declare its artifact.
 
 ## Shadow-module pattern
 
