@@ -145,8 +145,22 @@ adjustment, including differences between absolute and image-relative symbols.
 The optimisation pipeline comes from the selected profile's `opt` — the profile
 is how a build picks its optimisation level.
 
-`--explain` resolves the full build plan — the (target, artifact) matrix and each
-unit's inputs — prints it, and exits without compiling or linking.
+`--plan` resolves the effective build — the (target, artifact) matrix and, per
+unit, the selected project, target, profile, artifact, entry, output paths, the
+prerequisite steps in execution order (each dependency's exported steps first,
+then the project's own), the artifact requirements, the manifest, dependency
+export and command-line link requirements, and the phase order — prints it, and
+exits. Nothing is executed: no generator or build step runs, no dependency is
+fetched, no compiler or linker runs, and no output is written or published.
+
+The plan is resolved through the same planner and the same dependency
+configuration a build uses, so an invalid manifest, a dependency that is not
+realized, and a dependency cycle are reported here exactly as a build reports
+them, with the same classification. What planning cannot know it says instead of
+guessing: a unit with prerequisites prints that its generated input bytes are
+unresolved until those prerequisites run. A printed plan is a statement about
+selection, not a claim that those bytes are valid or that the link will
+succeed.
 
 | Flag           | Value          | Effect |
 |----------------|----------------|--------|
@@ -159,7 +173,7 @@ unit's inputs — prints it, and exits without compiling or linking.
 | `--subsystem <k>` | `console`\|`gui` | the environment a windows executable declares it runs under, overriding the artifact's `subsystem` key (see below) |
 | `-L <dir>`     | dir            | add a search directory for `-l`-resolved inputs; repeatable |
 | `-l <name>`    | name           | link a named object, archive, or target-format shared library, resolved through the `-L` dirs (see below); repeatable |
-| `--explain`    | —              | print the resolved build plan and exit without building |
+| `--plan`       | —              | print the effective build plan and exit without building |
 | *(positional)* | input path     | a bare argument that contains `/`, ends in `.o` / `.obj` / `.a` / `.lib`, or names a `.so`, `.dylib`, or `.dll` is linked explicitly |
 
 Plus the global flags above.
