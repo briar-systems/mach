@@ -107,10 +107,55 @@ every shape, because no tag ever reaches a float register on RISC-V.
   the tag's padding stays zero through the round trip. The same rule covers an
   over-aligned record.
 
+- **Secret content was modelled as a secret home.** An aggregate's vreg in MIR
+  is the address of its home, and the lowering seeded that vreg secret whenever
+  the parameter or call result was outer-secret, so every field read of a
+  by-value `^Rec` parameter and every copy of a `^Tag` inside an `#[oblivious]`
+  function was refused as a secret-dependent memory address. Meanwhile a tag
+  whose payload is `^u64` reached the argument registers straight from memory,
+  so the register holding the secret payload carried public provenance. Fixed:
+  `type.contains_secret` computes the union of a type's secret byte ranges
+  (the type itself, an element, a field or a case payload), call arguments,
+  returned values and parameters carry it, aggregate homes are never seeded
+  secret, and the transport paths run with the object's secrecy so every
+  carrier, caller copy and temporary between them is secret, with secret
+  content reaching a physical register through a vreg that declares it. The
+  discriminator load stays public because loads take their secrecy from the
+  loaded type, which is what lets `sel` on a secret-payload tag branch in an
+  oblivious function while a branch on the payload itself is still refused.
+
 ## Already correct (verified by probe)
 
 - The carrier machinery keeps logical and carrier extents apart: a piece moves
   `piece_memory_width` bytes out of the object, an outgoing carrier narrower
   than its register is loaded through a zeroed carrier home, and an incoming
   carrier is stored into an owned home of the carrier extent that the logical
-  copy then reads by the type's size.
+  copy then reads by the type's size. The runtime fixture
+  `tag_transport_preserves_logical_extents_through_wider_carriers_on_every_native_backend`
+  drives every shape above through a poisoned stack on the three Linux ISAs
+  in both profiles: the callee never sees carrier padding as payload, a
+  returned carrier stored into a packed neighbour or an array element leaves
+  the adjacent bytes alone, and gap, inactive-suffix and tail bytes are zero
+  after the round trip.
+- Win64, AAPCS64, LP64D and the RV32 forms classify every shape as the table
+  says, and the C controls agree: a clang-built C callee and C caller of
+  matching layout exchange all twelve shapes with mach on linux-x86_64,
+  linux-arm64, linux-riscv64 and windows-x86_64 (under wine), in both
+  profiles, including the argument after an over-aligned tag. A C struct of
+  9 bytes and mach's 9-byte tag agree on two 8-byte carriers with one
+  logical byte in the second, which is the logical-versus-carrier distinction
+  the roadmap row asks the controls to draw.
+- Outer-secret tags copy by the fixed logical extent: `fun c(v: ^T) ^T { val u:
+  ^T = v; ret u; }` lowers to a whole-object copy with no case test, and an
+  oblivious body containing it is accepted, while `sel` on a `^T` is refused
+  by sema.
+
+## Not covered
+
+- Darwin has no lane on this host; its SysV64 and AAPCS64 vtables are the
+  Linux ones, so the classification table applies, but no fixture executed
+  there.
+- The RV32 forms have no execution engine, so their column is classification
+  and unit-level only.
+- The Windows control runs under wine, which is faithful for register and
+  stack argument placement but not a Windows kernel.
