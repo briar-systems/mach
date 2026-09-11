@@ -102,6 +102,10 @@
 #                 the offset alone cannot see #2759, because a producer that derives
 #                 it a second way is self-consistent under the bug. requires
 #                 llvm-dwarfdump and llvm-objdump.
+#   readobj     — parse the linked image and every relocatable object with
+#                 llvm-readobj --all and fail on any reader diagnostic; then name the
+#                 image's sections, alignments and segments (#3113). requires
+#                 llvm-readobj.
 #   riscv-pcrel — run the program, then read the linked riscv64 image and the foreign
 #                 clang object it links: every psABI `auipc` + `%pcrel_lo(.Lpcrel_hiK)`
 #                 pair must resolve to an aligned address outside the text range
@@ -2510,6 +2514,72 @@ GDBEOF
     rm -rf "$gdbtmp"
 }
 
+# produce_readobj <engine> <leg> <binary>
+# an independent decoder over everything the writer published for the case: the
+# linked image and every relocatable object under the case's out/ tree are each
+# parsed by llvm-readobj (--all: headers, sections, segments, symbols, relocations
+# and every format-specific table), and any diagnostic the reader prints is a
+# failure. the writer's own tiling checks prove that its plan and its bytes agree
+# with each other; this proves the bytes are the format (#3113). the golden then
+# names the image's sections and their alignments, which is what the file plan
+# decides, without offsets or sizes so that a dependency bump does not rebless it.
+produce_readobj() {
+    bin=$3
+    profile=$5
+    tool=$(resolve_readobj) || {
+        echo "link: readobj: llvm-readobj is required" >&2; return 2
+    }
+    casedir=$(dirname "$(dirname "$(dirname "$bin")")")
+    files=$(mktemp)
+    printf '%s\n' "$bin" >"$files"
+    # this profile's objects only: the other profile's tree may still be present
+    find "$casedir"/out/*/"$profile" -type f \( -name '*.o' -o -name '*.obj' \) 2>/dev/null | LC_ALL=C sort >>"$files"
+    n=0
+    failed=0
+    while IFS= read -r f; do
+        n=$((n + 1))
+        rc=0
+        errs=$("$tool" --all "$f" 2>&1 >/dev/null) || rc=$?
+        if [ "$rc" -ne 0 ] || [ -n "$errs" ]; then
+            failed=$((failed + 1))
+            echo "readobj: FAIL ${f#"$casedir"/}: $(printf '%s' "$errs" | head -1)"
+        fi
+    done <"$files"
+    rm -f "$files"
+    # the object count follows the dependency, so it is reported, not recorded
+    echo "readobj: objects $n failed $failed" >&2
+    if [ "$failed" -ne 0 ]; then return 2; fi
+    if [ "$n" -lt 2 ]; then echo "readobj: no relocatable object was found beside the image" >&2; return 2; fi
+    echo "readobj: image and objects parse"
+
+    # the image's sections as the reader names them: one row per section with its
+    # alignment, and for a mapped image its segments' kinds. ELF, COFF and Mach-O
+    # each print these under different keys, so the awk keys on all three.
+    "$tool" --sections "$bin" 2>/dev/null | awk '
+        /^ *Name: /             { name = $2; sub(/ \(.*/, "", name) }
+        /^ *Segment: /          { seg = $2 }
+        /^ *AddressAlignment: / { print "section " name " align=" $2 }
+        /^ *Alignment: /        { print "section " seg "," name " align=" $2 }
+        /^ *Characteristics \[/ { print "section " name }
+    '
+    "$tool" --segments "$bin" 2>/dev/null | awk '
+        /^ *Type: /  { t = $2 }
+        /^ *Flags \[/ { print "segment " t }
+    '
+    "$tool" --macho-segment "$bin" 2>/dev/null | awk '
+        /^ *Name: /  { print "segment " $2 }
+    '
+    return 0
+}
+
+# resolve_readobj — the llvm-readobj twin of resolve_objdump
+resolve_readobj() {
+    if command -v llvm-readobj >/dev/null 2>&1; then echo llvm-readobj; return 0; fi
+    newest=$(compgen -c 'llvm-readobj-' 2>/dev/null | sort -t- -k3 -n | tail -1)
+    [ -n "$newest" ] && { echo "$newest"; return 0; }
+    return 1
+}
+
 # resolve_objdump — print an llvm-objdump on PATH, preferring the unversioned name
 # and falling back to the highest-versioned one (ubuntu ships llvm-objdump-NN, from
 # the same `llvm` package as llvm-dwarfdump). llvm-objdump decodes every ISA mach
@@ -2935,6 +3005,7 @@ produce() {
         spirv-image)  produce_spirv_image "$@" ;;
         varloc-fbreg) produce_varloc_fbreg "$@" ;;
         riscv-pcrel) produce_riscv_pcrel "$@" ;;
+        readobj)     produce_readobj "$@" ;;
         *) echo "link: unknown run mode '$run'" >&2; return 2 ;;
     esac
 }
