@@ -18,27 +18,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   target, and library forms an object format lacks are refused. `mach init`
   writes one such artifact instead of a per-extension split (#3222).
 
-### Changed
-
-- A root manifest declares at least one `[profile.<name>]`, and every declared
-  profile, in a root or a dependency manifest, states `opt`, `debug`, `simd`,
-  `vectorize` and `float_reassoc`. The built-in `debug`/`release` pair is now
-  synthesized only for a dependency that declares none, and `mach init` writes
-  both profiles in full with `debug` marked `default = true` (#3222).
-
-- Artifact and step requirements are category-qualified: `need` names
-  `step.<name>`, `artifact.<name>`, or a glob such as `artifact.shader-*` that
-  matches only within its category. A step and an artifact may share a name.
-  Bare entries, entries matching nothing in their category, self-requirements,
-  an artifact named by a step, and step cycles are manifest errors reported at
-  parse time (#3222).
-
-- A bare `use <id>;` of a dependency binds the entry shared by its library
-  artifacts marked `default = true`; several defaults may share that entry, a
-  `bin` never publishes one, and full-path imports need no default. The
-  artifact-less `lib.mach` fallback of 4.30 stays until 5.0.0 removes it
-  (#3222).
-
 ### Fixed
 
 - The names of tables marked `default = true` collected while parsing
@@ -89,6 +68,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - rename `sel` identifiers ahead of the v5 keyword (#3219)
+
+- A root manifest declares at least one `[profile.<name>]`, and every declared
+  profile, in a root or a dependency manifest, states `opt`, `debug`, `simd`,
+  `vectorize` and `float_reassoc`. The built-in `debug`/`release` pair is now
+  synthesized only for a dependency that declares none, and `mach init` writes
+  both profiles in full with `debug` marked `default = true` (#3222).
+
+- Artifact and step requirements are category-qualified: `need` names
+  `step.<name>`, `artifact.<name>`, or a glob such as `artifact.shader-*` that
+  matches only within its category. A step and an artifact may share a name.
+  Bare entries, entries matching nothing in their category, self-requirements,
+  an artifact named by a step, and step cycles are manifest errors reported at
+  parse time (#3222).
+
+- A bare `use <id>;` of a dependency binds the entry shared by its library
+  artifacts marked `default = true`; several defaults may share that entry, a
+  `bin` never publishes one, and full-path imports need no default. The
+  artifact-less `lib.mach` fallback of 4.30 stays until 5.0.0 removes it
+  (#3222).
 
 - Every dependency action selects its project with `mach dep <action> <path>`.
   Dependency names follow the path. Missing or extra operands are refused.

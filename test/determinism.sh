@@ -119,6 +119,8 @@ abi = "$abi"
 opt = 0
 debug = false
 simd = "scalarize"
+vectorize = false
+float_reassoc = false
 [artifact.det]
 kind = "static"
 entry = "main.mach"

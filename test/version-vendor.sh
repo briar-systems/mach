@@ -52,6 +52,8 @@ abi = "$abi"
 opt = 0
 debug = true
 simd = "scalarize"
+vectorize = false
+float_reassoc = false
 
 [artifact.host]
 kind = "bin"
