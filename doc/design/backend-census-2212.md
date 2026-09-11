@@ -395,3 +395,178 @@ Counts are of distinct sites or site families named in sections 2 to 7.
 | riscv64/32 | 6 (form table, load/store predicate, fence, clobbers, C claimed not emitted, xlens unenforced) | 11 (opcode x2, fields x3, mem funct3, aq/rl x3, names, numbers, FPR count, rounding, extension order) | 3 (`RZERO..SCRATCH2`, 170 literal sites, `op.preg::i32`) | — |
 | SPIR-V | 4 (word count, mapping as code, pointer type, effects) | 5 (opcode literals, def counts, environments, version, the 16 limit x22) | 1 (synthetic 16-register bank) | — |
 | shared | 1 (`Inst.clobbers` dead) | — | 4 (shared NIL sentinel, `index_is_preg`, `assign` signature, `def` non-nominal) | 4 (items 7.3.1-4) |
+
+## 9. Mechanical fixes landed on `feat/2212-census`
+
+Each is a pure restatement: the same value, named at its authoritative site
+instead of restated as a literal. Codegen output is unchanged; the proof is the
+layer B corpus (section 11).
+
+| commit | gap | change |
+|---|---|---|
+| `94335e87` | aarch64 NIE/DUP | `arm64/encode.mach` `ZR`, `SP_REG`, `SCRATCH0`, `SCRATCH1`, `FP_SCRATCH0/1` now read `arm64.SP/IP0/IP1/V31/V30`; new `FP_REG`/`LR_REG` from `arm64.FP/LR` replace the eight `29`/`30` literals in `emit_prologue`, `emit_epilogue`, `save_callee_gp`, `restore_callee_gp` |
+| `5ab1f9c0` | riscv NIE/DUP | `riscv/encode.mach` `RZERO`, `RRA`, `RSP`, `RFP`, `SCRATCH`, `SCRATCH2`, `FP_SCRATCH`, `FP_SCRATCH2` now read `riscv.ZERO/RA/SP/FP/SCRATCH_REG/SCRATCH_REG2/F31/F30` |
+| `02d37b7e` | x86_64 NIE | `x64/encode.mach` `FLOAT_SCRATCH0/1 = (1 << 8) \| 14/15` became `float_scratch0()/float_scratch1()` returning `isa.regid_make(isa.REG_CLASS_ID_XMM, x64.XMM14/15)`; a function because a global initialiser must be a constant expression and the regid layout belongs to `regid_make` alone |
+| `45d60099` | riscv DUP | `riscv/attributes.mach single_rank` loops to `str_len(SINGLE_ORDER)` instead of a literal `14` |
+| `46b3214b` | SPIR-V DUP | `spirv/defs.mach` `OP_DEF_COUNT`/`TYPE_DEF_COUNT` size both `DefStorage` and `target_defs`; the three core opcodes cite `spirv.OP_DOT`, `OP_SAMPLED_IMAGE`, `OP_IMAGE_SAMPLE_IMPLICIT_LOD` |
+
+Not fixed mechanically, and why:
+
+- the 170 riscv and 24 aarch64 name-table literals (`gp_name`, `fp_name`,
+  `asm_reg_index_region`, `emit_reg_id`) are the name tables themselves; the
+  fix is one table per ISA that both the printer and the asm parser read, which
+  is a description change, not a rename;
+- `FPR_COUNT = 30` / `VECTOR_COUNT = 30` / xmm class `len 14` reserve the top
+  registers by omission; stating the reservation as data (`reserved_regs`) would
+  change what the allocator sees and needs the identity bar, not the corpus bar;
+- the `[16]` bounds in `spirv/emit.mach` are inside the region N4 (#2963)
+  replaces; naming them now only adds merge conflict to that work.
+
+## 10. Non-mechanical remainder of N1
+
+Ordered by what the roadmap row names. Each is a design change with a stated
+owner decision or a proven bar beyond "goldens unchanged".
+
+1. **aarch64 onto the shared instruction value.** `arm64/printer.mach:63 rec Inst`
+   is the last private representation. The printer forms, the encoder's 154 base
+   words and the 201 printer literals collapse into one form table keyed by base
+   word only if `isa.Inst` grows a fourth operand or aarch64 keeps a form byte;
+   that is #2212's open question 1 (per-ISA shape vs one generic type) and needs
+   the owner's ruling before code.
+2. **Per-opcode description tables where none exist** (ADM rows above):
+   x86_64 form/flags/memory for the codegen path; a riscv `inst.mach` table
+   (format, opcode7, funct3, funct7, xlen mask, mnemonic, load/store) that
+   `rv_fields`, `classify_*`, `shape_of`, `printer.mnemonic` and `RV_MNEMONICS.code`
+   all read; an aarch64 base-word table. The #2766 access rows are the template.
+   Bar: byte-identical corpus plus `llvm-mc` conformance per #2118's acceptance.
+3. **`isa.Inst.clobbers`.** Either delete the field or make every encoder
+   populate it and add a reader; leaving a zero-filled effect field for N5 to
+   discover is the fail-open shape #2212 forbids. N5 should rule.
+4. **Nominal `VRegId`/`PRegId`.** `def` cannot express it; the carriers become
+   single-field records and thread through `MirOperand`, `MirVReg.assigned`,
+   the 21 `v: u32` allocator signatures, every ISA's `req_gpr`/`req_vec`/
+   `mir_to_operand`, and `abi.ParamSlot.reg`. Same change adds a `MIR_PREG_NIL`
+   and replaces `index`+`index_is_preg` with a tagged operand. Bar: identity
+   (byte-identical) on every target, plus a negative test that assigning a vreg
+   to a preg field is a type error (#3114 acceptance).
+5. **Registry ownership.** Section 7.3: either stamp a generation into
+   `resolved.Target` and check it in `backend_target`, or make the registry a
+   heap-owned immutable object that `Session` and `PcgWorker` hold by pointer so
+   the by-value copy at `engine.mach:1181` becomes impossible. #2212 prefers the
+   second where sufficient; it is sufficient here. Bar: the fail-at-N allocator
+   leak check and a fail-closed test for a target used after `registry_dnit`.
+6. **riscv admission on the codegen path.** `inst.admits` guards only inline
+   asm; the MIR path relies on width arithmetic. One admission point, and the
+   `has_compressed` claim (`EF_RISCV_RVC`, `c2p0`) removed until an emitter
+   exists. This is the seam N3 (#3127) builds on.
+7. **SPIR-V opcode table.** An `OpDef`-shaped row (opcode, arity, result-type)
+   for the ~60 `emit_instr` arms, so word counts and the int/float pairing are
+   data. Sequenced after N4 so the value ABI is not rebuilt twice.
+
+## 11. Frozen interfaces for N3 to N6
+
+These are the exact types and functions the later increments consume. A change
+to any of them is a roadmap revision, not a local refactor. Everything not
+listed here (encoder internals, printer tables, the per-ISA constants renamed
+in section 9) may move under the byte-identity bar without notice.
+
+### N3 (#3120 vector capability catalog, #3127 RISC-V selection)
+
+- `isa.MachineModel` (`src/lang/target/isa.mach:157`) and its accessors
+  `packed_width`, `packed_lane_cap`, `moves_unaligned_gp`, `moves_vector_memory`,
+  `moves_cross_bank`, `fits_vector_register`, plus `rec PackedGap` and the
+  `VEC_OP_*`/`VEC_MEM_*`/`XBANK_*` vocabularies: the declared-capability record
+  N3 makes positive and complete; field meanings may not change, only rows added.
+- `target.mach:338 resolve` and `resolved.Target.model` (the per-target copy with
+  ABI overrides at `target.mach:471-474`): the one place a capability reaches the
+  backend; N3 may not add a second capability channel.
+- `rules.GuardFn: fun(*isa.BackendTarget, *mir.MirFunction, *mir.MirInstr) bool`,
+  `rules.Rule`, `rules.RulePack`, `RuleGate` (`src/lang/be/codegen/rules.mach:18-63`):
+  guards see the machine through `BackendTarget.model` only.
+- `mir.MirOpDescriptor.operand_banks` and `mir.operand_bank` (`mir.mach:635`),
+  `mir.selection_reachable_float`, `mir.selection_lane`: the catalog columns that
+  decide packed vs scalar vs refused.
+- `riscv/register.mach:102 build_riscv(reg, arch_id, name, xw, attrs)` and
+  `riscv/inst.mach:182 xlens` / `:204 admits`: the extension-admission seam.
+- `riscv/attributes.mach:558 riscv64_build_attributes(alloc, xlen_bits,
+  float_arg_bits, has_compressed, out_len)`, `:581 riscv64_merge_attributes`,
+  `:160 parse_arch`, `rec Ext/Arch/Attrs`, and the `of.BuildAttributesFn`/
+  `MergeAttributesFn`/`MachineFlagsFn` slots installed by `isa.with_attributes`,
+  `with_elf_attributes`, `with_machine_flags`: the emitted extension string and
+  its merge rule.
+- `isa.lookup`, `isa.arch_id_for`, `target.mach:660 TupleCapabilitySpec` and
+  `:678 tuple_capability`: where an `isa = "rv32imc"` spelling must be refused or
+  resolved.
+
+### N4 (#2963 module-emitter value ABI, #2940 pointer-to-record)
+
+- `isa.ModuleEmitter`, `isa.EmitModuleFn: fun(*A.Allocator, *isa.BackendTarget,
+  *unit_input.Unit, **u8, *u32)`, `isa.module_emitter`, `isa.emitter_isa`
+  (`isa.mach:390,352,738,729`): the whole-module family contract.
+- `isa.BackendTarget` (`isa.mach:342`) and `resolved.backend_target`
+  (`resolved.mach:39`): the pointer-free view an emitter receives; N4 may add
+  fields, not pointers.
+- `isa.emits_whole_module`, `isa.backend_family`, `isa.is_whole_module`
+  (`isa.mach:1621-1662`) and the fork sites `codegen.mach:144`,
+  `ctvalidate.mach:28`: the family test every caller uses.
+- `abi.ParamClass` (`CLASS_AGG = 8`), `abi.ParamSlot`, `abi.ParamPiece`,
+  `abi.AggLayout`, `abi.ClassifyFn`/`ArgPassingFn`/`RetPassingFn`
+  (`src/lang/target/abi.mach:93-140`) and `abi/spirv.mach` `classify_arg`/
+  `classify_return`/`arg_regs`: the contract N4 replaces with a value-oriented
+  one. Register machines keep the `reg: i32` carrier unchanged.
+- `src/lang/be/codegen/mir/abi.mach:45 abi_gp_arg_reg` and `MAX_GP_ARG_REGS`:
+  the shared consumer that must stop reading a bank for emitters.
+- `isa.TargetDefs`/`OpDef`/`TypeDef`/`TypeRefuseFn`, `isa.with_defs`,
+  `isa.Environment`, `isa.with_environments`, `environment_lookup`,
+  `environment_profile` (`isa.mach:396-542`): the published op/type/env surface
+  L6 will read; names and tags are stable.
+- `mir.SEL_CLASS_SPIRV_ONLY`, `MIR_VEC_BUILD`, `MIR_AGG_LOAD`, `MIR_AGG_STORE`:
+  the emitter-only opcodes and their catalog rows.
+
+### N5 (#3126 secrecy against final machine effects)
+
+- `mir.MirOpDescriptor` columns `flags`, `ct_class`, `operand_banks` and the
+  readers `mir.has`, `mir.ct_class`, `mir.ct_op`, `mir.operand_bank`: the only
+  per-opcode effect description; N5 extends rows, it does not add a parallel
+  table.
+- `ct.CtOp`, `ct.CtCap`, `ct.AsmClass` and its constructors
+  (`src/lang/ct.mach:5-157`), `ct.target_provides`: the effect vocabulary shared
+  by the MIR validator and the asm scan.
+- `isa.AsmCtScanFn`, `isa.AsmClobbersFn`, `isa.AsmReturnsFn`
+  (`isa.mach:283-287`), `asm.Grammar.ct_class: CtClassFn`, `asm.Mnemonic`
+  (`writes`, `implicit`, `implicit_mem`), and each ISA's `asm_ct_class(code,
+  flags)`: the closed per-instruction effect description inline asm uses.
+- `isa.Inst`, `isa.Operand`, `isa.inst_blank`, `regid_make/class/index`: the
+  physical-register stream after allocation; the `clobbers` field is frozen as
+  **unpopulated** until item 10.3 rules.
+- `mir.MirInstr.writes_secret`, `memory_flags`, `mir.MirVReg.secret`,
+  `mir.MirOperand.required_bank`, `regalloc.verify_rewritten_operands`
+  (`regalloc.mach:2322`): the post-rewrite facts N5 validates against.
+- `encode.sink_claim`/`sink_claims`/`sink_unaccounted`/`note_inst_count`/
+  `AsmNote`, `encode.encode_driver`/`EncodeHooks` (`src/lang/be/codegen/encode.mach`),
+  and the three per-ISA `check_accounted`: the invariant that ties every emitted
+  byte to one instruction notification, which is how N5 reaches late-introduced
+  instructions.
+- `ctvalidate.run(tgt, m)` (`ctvalidate.mach:23`) and its position in
+  `codegen.mach:131 codegen_scratch`: the early checker N5 keeps as a diagnostic.
+- `MachineModel.ct_trust_mul`, `ct_trust_var_shift`: the target trust
+  declarations.
+
+### N6 (#3110 cross-module inlining with correct effects)
+
+- `mir.MirAsm`, `mir.MirAsmBind`, `mir.asm_bind`, `mir.MirInstr.asm_block`
+  (`mir.mach:768-792`) and `ir.clone_asm_payload` (used at
+  `src/lang/me/pass/inline.mach:621,744`): the asm payload that survives a clone.
+- `asm.Grammar.no_fall: NoFallThroughFn`, `writes_sp: WritesSpFn`,
+  `asm.returns(g, body)`, `asm.clobbers(g, body, gp, fp)`
+  (`src/lang/target/isa/asm.mach:169-171,925,949`) and `isa.AssemblyCapabilities`
+  / `RegMachine.has_assembly`: the block-level facts that decide whether an asm
+  body may be inlined and what it clobbers.
+- `ct.AsmClass` via `asm_ct_class` (as in N5): the ordering/latency facts of the
+  eight atomic wrappers are read from here, not inferred from body length.
+- `mir.MIRF_MEMORY`, `mir.MirInstr.memory_flags` (`MEMORY_VOLATILE`),
+  `mir.MirFunction.naked`/`oblivious`, `mir.emits_instr`: the effect bits an
+  inlined body must keep.
+- `rules.emit`, `rules.ExpansionBuilder`, `rules.ExpandFn`
+  (`rules.mach:32-42,144`): the only sanctioned way to introduce instructions
+  after selection.
