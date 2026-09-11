@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `mach check <path>` runs load, resolve and sema over the source reachable from
+  the artifacts `mach build` would select, through the same driver, queries and
+  phase outcomes, and exits with the frontend's own classification: 0 accepted,
+  1 rejected or user error, 2 internal, 3 environment. No step runs, nothing is
+  lowered, generated, linked or written, and a generated or embedded input that
+  does not exist yet is reported as missing rather than produced (#3224).
+
+- `mach build <path> --plan` prints the effective build through the normal
+  planner and exits: per cell the project, target, profile, artifact, entry,
+  output paths, the dependency and project prerequisite steps in execution
+  order, the artifact requirements, and the manifest, dependency-export and
+  command-line link requirements. The plan is configured against the realized
+  dependency closure the way a build is, so an unrealized dependency, an invalid
+  dependency manifest or a dependency cycle is reported with the build's own
+  diagnostic; nothing is fetched, generated, compiled, linked or written, and a
+  cell with prerequisites says its generated inputs are unresolved. It replaces
+  `--explain` (#3223).
+
+- `{artifact.suffix}` in an artifact `out` expands to the conventional filename
+  suffix for the artifact's kind on the selected target (`.exe`/`.lib`/`.dll` on
+  Windows, `.a`/`.so` on Linux, `.a`/`.dylib` on Darwin, `.spv` for a SPIR-V
+  module), so one artifact names its output on every target while its identity
+  and `$bin.name` stay the table key. Literal paths stay literal, output
+  collisions are checked after expansion among the artifacts selected for a
+  target, and library forms an object format lacks are refused. `mach init`
+  writes one such artifact instead of a per-extension split (#3222).
 - `isa` accepts a canonical RISC-V extension string (`rv32imc`, `rv64imafd`,
   `rv64gc`) over the retained I, M, A, F, D, C, Zicsr and Zifencei vocabulary.
   The selection declares the machine's multiply and float facts, bounds the
@@ -16,8 +42,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into the object's `Tag_RISCV_arch`; an unknown extension, another version, a
   noncanonical string or the E base is refused rather than rounded up to the
   default machine (#3127).
+- `test/memory.py` measures a compiler's peak resident memory and wall time over
+  a cold self-build and three synthetic workload families (many modules, one
+  dense module, a large by-value aggregate) at both profiles and two worker
+  counts, checking every generated executable's output and the worker-count
+  image identity; with a control compiler the two alternate over identical
+  inputs. The `compiler memory` workflow runs it on demand, never on the PR
+  lane. The 2026-09-06 archive measurements it replaces are preserved in
+  `doc/design/2299-archive-inventory.md` (#2299).
+
+- Every RISC-V selection refusal names what it refused: the offending letter or
+  token and the selection string for an unknown extension, a noncanonical or
+  duplicated order, an unsupported version, the E base and a trailing separator,
+  and the F or D extension the selection lacks when a calling convention needs
+  float registers. A floating-point type on a selection without F is refused
+  naming the missing extension, not only the selection (#3127).
+
+- Each ISA with a vector unit declares every retained (operation, lane kind, lane
+  width) cell as a packed instruction or the documented scalar expansion, and
+  registration refuses a catalog that leaves a cell undeclared. A vector operator
+  whose lane shape the catalog does not name is refused with a diagnostic naming
+  the operation, shape, function and target in every `simd` mode, never
+  scalarized silently. `test/vecrows` probes every declared row on x86_64,
+  aarch64 and riscv64 against the external decoder and execution (#3120).
 
 ### Fixed
+
+- The System V x86-64 classifier spent a register on an eightbyte that holds
+  only padding: a 16-byte aggregate with data in its first eightbyte alone (an
+  over-aligned `#[align(16)] rec { a: u8; }`) rode rdi and rsi and returned
+  through rax and rdx, where gcc and clang classify the empty eightbyte
+  NO_CLASS and use rdi and rax alone. A C callee read its next argument from
+  the wrong register and a returned object copied rdx's leftovers into its
+  tail padding. Padding-only eightbytes now consume no register, the
+  classifier emits one piece per populated eightbyte, and the store side zeroes
+  every logical byte no piece delivers (#3263).
+- A `#[packed]` record with a field at an offset that is not a multiple of the
+  field's own alignment (`#[packed] rec { a: u8; b: u32; }`) was classified by
+  its eightbytes under System V x86-64 and rode rdi and rsi, where the ABI's
+  unaligned-field rule makes the whole aggregate MEMORY class: gcc and clang
+  pass it on the stack and return it through a hidden pointer, so a C callee
+  read the argument as garbage and a C caller's return faulted. The eightbyte
+  walk now flags any struct member or array element at an unaligned offset and
+  the classifier takes the flag as MEMORY; a packed record whose fields happen
+  to sit aligned keeps its registers, and Win64 (non-power-of-two sizes were
+  already by reference) and AAPCS64 (records classify by size alone) are
+  unchanged (#3266).
+- Secrecy provenance of a by-value aggregate was attached to its home instead
+  of its bytes: an aggregate's MIR vreg is the address of its home, and seeding
+  it secret for an outer-secret parameter or call result made every field read
+  of a by-value `^Rec` inside an `#[oblivious]` function a secret-dependent
+  address, while a public record with a `^` field reached the argument
+  registers straight from memory with public provenance. Call arguments,
+  returned values and parameters now carry the union of the object's secret
+  byte ranges, aggregate homes are never seeded secret, transport runs with the
+  object's secrecy so every carrier and caller copy is secret, and the release
+  profile's scalar replacement taints each field slot from the typed accesses
+  to that field rather than from the whole object, so a public field of a
+  record with a secret field stays public in both profiles (#3263).
+- The names of tables marked `default = true` collected while parsing
+  `[target.*]` and `[profile.*]` were never released (#3222).
+
 
 - Bracket interpretation of an imported name follows the imported declaration's
   own kind. An imported value keeps its subscript reading, and the resolver's
@@ -85,6 +170,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - rename `sel` identifiers ahead of the v5 keyword (#3219)
 
+- A root manifest declares at least one `[profile.<name>]`, and every declared
+  profile, in a root or a dependency manifest, states `opt`, `debug`, `simd`,
+  `vectorize` and `float_reassoc`. The built-in `debug`/`release` pair is now
+  synthesized only for a dependency that declares none, and `mach init` writes
+  both profiles in full with `debug` marked `default = true` (#3222).
+
+- Artifact and step requirements are category-qualified: `need` names
+  `step.<name>`, `artifact.<name>`, or a glob such as `artifact.shader-*` that
+  matches only within its category. A step and an artifact may share a name.
+  Bare entries, entries matching nothing in their category, self-requirements,
+  an artifact named by a step, and step cycles are manifest errors reported at
+  parse time (#3222).
+
+- A bare `use <id>;` of a dependency binds the entry shared by its library
+  artifacts marked `default = true`; several defaults may share that entry, a
+  `bin` never publishes one, and full-path imports need no default. The
+  artifact-less `lib.mach` fallback of 4.30 stays until 5.0.0 removes it
+  (#3222).
 - Vector operations require an explicit target capability row. Each ISA declares
   its supported (operation, lane kind, lane width) rows positively. Missing or
   malformed operation and lane shapes no longer default to packed support (#3120).

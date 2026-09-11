@@ -271,3 +271,29 @@ The dominant historical defect class is a test reporting more than it verifies.
 4. `./run.sh --bless --case <group>/<name>` and read the diff. A golden you have not
    read is not a golden.
 5. `./run.sh --case <group>/<name>` must exit 0.
+
+## The vector rows
+
+`vecrows/` asks one narrower question the corpus cannot: **does each ISA's declared
+vector catalog match what it emits and computes, cell by cell?** The compiler
+declares every retained (operation, lane kind, lane width) cell as a packed
+instruction or a scalar expansion (`isa.MachineModel.packed_forms` and
+`scalar_forms`); `vecrows/rows.conf` states the same decisions a second time, each
+with the mnemonic the external decoder must show for a packed row and must not show
+for a scalar row. The driver generates one noinline probe per row and signedness
+(and per predicate for a compare), builds it for every served target at `-O0` and
+`-O2`, decodes each probe with the pinned decoder, and executes the program against
+a per-lane scalar reference. It shares `engines.conf` and `tools.lock` with the
+corpus and selects by the same runner column.
+
+```
+vecrows/run.sh                   # every target this host serves
+vecrows/run.sh --runner <label>  # the targets engines.conf assigns to that runner
+vecrows/run.sh --target <t>      # one target (repeatable)
+vecrows/run.sh --dump            # print each probe's decoded text
+```
+
+`vecrows/EXCEPTIONS` is the reviewed list of probes whose witness the catalog
+cannot express, in the `SKIPS` spirit: an entry names the issue it dies with, the
+run counts it apart from passes, and an entry that matches a passing probe fails the
+run so a fix deletes its line.

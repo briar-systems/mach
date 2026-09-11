@@ -472,31 +472,67 @@ in section 9) may move under the byte-identity bar without notice.
 
 ### N3 (#3120 vector capability catalog, #3127 RISC-V selection)
 
-- `isa.MachineModel` (`src/lang/target/isa.mach:157`) and its accessors
+Amended 2026-09-11 to the shapes N3 landed (PRs #3257, #3258 and the phase 2
+PR). Two deviations from the list as frozen were accepted by the owner: the
+`PackedGap` record became `PackedForm`, because its meaning flipped from absent
+to present, and the RISC-V attribute hook gained the selected extension bits plus
+a validate slot, because the selection cannot reach the emitted string or the
+link admission any other way without a second capability channel.
+
+- `isa.MachineModel` (`src/lang/target/isa.mach:172`) and its accessors
   `packed_width`, `packed_lane_cap`, `moves_unaligned_gp`, `moves_vector_memory`,
-  `moves_cross_bank`, `fits_vector_register`, plus `rec PackedGap` and the
-  `VEC_OP_*`/`VEC_MEM_*`/`XBANK_*` vocabularies: the declared-capability record
-  N3 makes positive and complete; field meanings may not change, only rows added.
-- `target.mach:338 resolve` and `resolved.Target.model` (the per-target copy with
-  ABI overrides at `target.mach:471-474`): the one place a capability reaches the
-  backend; N3 may not add a second capability channel.
+  `moves_cross_bank`, `fits_vector_register`, plus `rec PackedForm` (`:136`, the
+  positive packed row: operation, lane kind, lane width), `rec ScalarForm` (`:145`,
+  the declared scalar expansion, same key), `VectorForm` with `FORM_UNDECLARED`,
+  `FORM_SCALAR`, `FORM_PACKED` (`:151`) and the `VEC_OP_*`/`VEC_MEM_*`/`XBANK_*`
+  vocabularies: the declared-capability record, now positive and complete. An ISA
+  with a vector unit declares every retained cell in exactly one of
+  `packed_forms` and `scalar_forms`; `vector_form` (`:367`) is the one decision
+  accessor and `vector_domain_complete` (`:337`) is what registration enforces, so
+  a new domain member is a registration refusal for every ISA that has not decided
+  it. A machine with `has_v128 == false` declares every cell scalar by that fact
+  and may hold no rows. Field meanings may not change; rows may be added.
+- `vecform.decide` (`src/lang/me/vecform.mach:95`) and `realizes_packed` (`:103`):
+  how an IR operator reads the catalog. `scalarize.detect_undeclared`
+  (`src/lang/me/pass/scalarize.mach:137`) and the pipeline's `declared_check`
+  (`src/lang/me/pipeline.mach:219`) refuse an undeclared shape in every `simd`
+  mode; `simd = "require"` then refuses a declared scalar row on top.
+- `target.mach:341 resolve` and `resolved.Target.model` (the per-target copy,
+  narrowed for a RISC-V selection at `target.mach:406` through
+  `riscv/register.mach:95 select_features`): the one place a capability reaches
+  the backend; N3 added no second capability channel. `MachineModel.riscv_extensions`
+  is the selected extension bits on that copy and the fingerprint covers it. It
+  stays ISA-named on the shared record on purpose: the parse, the narrowing and
+  the field are one seam, and generalizing the field alone would leave the
+  `resolve` fork in place. When a second ISA gains a selection vocabulary the three
+  move together into vtable hooks (parse, narrow) over an ISA-interpreted
+  `features` field, and that is a roadmap revision.
 - `rules.GuardFn: fun(*isa.BackendTarget, *mir.MirFunction, *mir.MirInstr) bool`,
   `rules.Rule`, `rules.RulePack`, `RuleGate` (`src/lang/be/codegen/rules.mach:18-63`):
   guards see the machine through `BackendTarget.model` only.
 - `mir.MirOpDescriptor.operand_banks` and `mir.operand_bank` (`mir.mach:635`),
   `mir.selection_reachable_float`, `mir.selection_lane`: the catalog columns that
   decide packed vs scalar vs refused.
-- `riscv/register.mach:102 build_riscv(reg, arch_id, name, xw, attrs)` and
-  `riscv/inst.mach:182 xlens` / `:204 admits`: the extension-admission seam.
-- `riscv/attributes.mach:558 riscv64_build_attributes(alloc, xlen_bits,
-  float_arg_bits, has_compressed, out_len)`, `:581 riscv64_merge_attributes`,
-  `:160 parse_arch`, `rec Ext/Arch/Attrs`, and the `of.BuildAttributesFn`/
-  `MergeAttributesFn`/`MachineFlagsFn` slots installed by `isa.with_attributes`,
-  `with_elf_attributes`, `with_machine_flags`: the emitted extension string and
-  its merge rule.
-- `isa.lookup`, `isa.arch_id_for`, `target.mach:660 TupleCapabilitySpec` and
-  `:678 tuple_capability`: where an `isa = "rv32imc"` spelling must be refused or
-  resolved.
+- `riscv/features.mach`: `parse` / `parse_at` (`:116`, `:133`; the span names the
+  refused token), `rec Selection` (`:75`), `rec Span` (`:111`), the `I..ZIFENCEI`
+  bits, `DEFAULT32`/`DEFAULT64`, and `EXTS` (`:48`, the admission and emission
+  table). `riscv/inst.mach:210 required_extensions`, `:183 xlens`, `:205 admits`:
+  the extension-admission seam, total over the opcode catalog.
+- `riscv/attributes.mach:553 riscv64_build_attributes(alloc, xlen_bits,
+  extension_bits, float_arg_bits, has_compressed, out_len)`, `:591
+  validate_selected(bytes, len, xlen_bits, selected, flags)`, `:641
+  riscv64_merge_attributes`, `:165 parse_arch`, `rec Ext/Arch/Attrs`, and the
+  `of.BuildAttributesFn` (`of.mach:1237`, carrying the selected bits) /
+  `MergeAttributesFn` / `ValidateAttributesFn` (`:1240`) / `MachineFlagsFn` slots
+  installed together by `isa.with_attributes(s, build, merge, validate)`
+  (`isa.mach:830`), `with_elf_attributes`, `with_machine_flags`: the emitted
+  extension string, its merge rule and the admission of a foreign object against
+  the selection. The three hooks are declared together or not at all.
+- `isa.lookup`, `isa.arch_id_for`, `isa.float_absence_note` (`isa.mach:994`, the
+  front end's way to name the F extension a refused float needs without naming an
+  ISA), `target.mach:700 tuple_capability` and `TupleCapabilitySpec`: where an
+  `isa = "rv32imc"` spelling is refused or resolved, and every refusal names the
+  token and the selection string.
 
 ### N4 (#2963 module-emitter value ABI, #2940 pointer-to-record)
 
