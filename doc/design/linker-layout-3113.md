@@ -324,29 +324,94 @@ placed with `plan.place` (aligns the cursor up through `layout.alignment` and
 `layout.align_offset_up`, adds through `layout.usize_add`, refuses an
 alignment that is zero or not a power of two, an overflowing add, or a
 result outside the format's field width) or `plan.place_at` (a row whose
-position is dictated, refused if it would overlap the previous row). The
-plan is sealed once; sealing yields the total. The writer allocates the
-sealed total and serializes by reading `plan.offset(row)`; nothing after
-sealing recomputes an offset. Every inner cursor (a string table, a symbol
-table, a relocation list, a load-command list, an opcode stream) is closed
-with `plan.close(row, cursor)`, which refuses if the bytes written do not
-end exactly on the row's planned end. Field narrowing goes through
-`plan.field_u32` / `field_u16` / `field_u8`, which refuse on narrowing with
-the row's label in the message. `bin.Layout`, `bin.align_up` and
-`bin.align_up_u64` are deleted; the linker's `align_up_u64_checked` is
-replaced by the same primitives.
+position is dictated, refused if it would start before the rows ahead of
+it end). The plan is sealed once; sealing yields the total. The writer
+allocates the sealed total and serializes by reading `plan.offset(row)`;
+nothing after sealing recomputes an offset. Every inner cursor (a string
+table, a symbol table, a relocation list, a load-command list, an opcode
+stream) is closed with `plan.close(row, cursor)` or `plan.close_size`, which
+refuse if the bytes written do not end exactly on the row's planned extent.
+Field narrowing goes through `plan.field_u32` / `field_u16` / `field_u8` /
+`field_u64_u32`, which refuse on narrowing with the field's name in the
+message. Address-side arithmetic (an ELF `p_vaddr`, a PE RVA, a Mach-O
+segment address) goes through `plan.address` (the mapped twin of a file row)
+or `plan.align_address`, both over `layout.align_u64_up`, the one u64
+alignment the linker also uses. `bin.Layout`, `bin.align_up` and
+`bin.align_up_u64` are deleted; the linker's local `align_up_u64_checked`
+is a wrapper over the same layout primitive.
+
+Format-specific rows, per writer:
+
+| writer | rows placed, in order | second plan |
+|---|---|---|
+| ELF `emit_object` | header, section data (one per non-BSS section), symtab, strtab, shstrtab, rela (one per section with relocations), build attributes, section header table | |
+| ELF `emit_exec` | header, program headers, page pad, one row per load segment, attributes, debug sections, symtab, strtab, shstrtab, section header table | |
+| ELF PIE / shared / dynamic | header, program headers, page pad, load segments, then the dynamic structures (`.rela.dyn`, `.dynsym`, `.dynstr`, `.hash`, `.rela.plt`, `.plt`, `.got.plt`, data GOT, `.dynamic`) as rows whose addresses derive from the read-only base, then `debug_sht_plan` rows | |
+| COFF object | header, section headers, section data, relocations per section, symbol table, string table | |
+| PE image | headers (`place_at` 0), one file-aligned row per section, string table | an RVA plan: headers, the first segment page-aligned after the header page, later segments dictated (`place_at`, so an overlapping segment is refused), the synthetic sections page-aligned; and an import-directory plan (descriptors, ILT, IAT, hint/name area) whose offsets `write_pe_imports` and the IAT slot lookups read instead of recomputing |
+| Mach-O object | header and load commands, segment pad, one row per output section, relocation pad, relocations per output section, indirect table, symtab, strtab | a segment address plan: one row per input section, padded to each output section's alignment |
+| Mach-O images | header and load commands, header reservation (`pad_to`), load segments, `__stubs`, `__got`, `__DWARF` sections, `__LINKEDIT` (rebase, bind, symtab, strtab, code signature) | a mapped-address plan: segments to `hi_va`, then `__STUBS`, `__GOT`, `__LINKEDIT` page-aligned |
+
+Cursor closes: ELF symtab / strtab / rela / shdr / phdr / dynstr / dynsym /
+hash / `.rela.*` / `.dynamic` / shstrtab; COFF section headers / relocations
+per section / symtab / strtab; PE strtab / import thunks and names / unwind
+xdata and pdata / base relocations / section table; Mach-O section commands /
+load commands / symtab / strtab / relocations per output section / rebase /
+bind / code signature.
+
+Refusals added beyond the plan's own (each with a test): ELF32 addend,
+absolute value and native metadata past the 32-bit width; ELF32 entry and
+segment addresses past the address width; ELF `e_shnum` past `SHN_LORESERVE`
+in the image paths (the object path already refused); a COFF relocation whose
+addend targets a section without data; a COFF long section name past the
+seven-digit `/nnnnnnn` field; a PE segment that overlaps its predecessor's
+RVA range; a PE base relocation naming a segment out of range; Mach-O
+`sizeofcmds`, section offsets, `__LINKEDIT` offsets and sizes narrowed
+through the plan; a Mach-O ARM64 addend past the 24-bit `ARM64_RELOC_ADDEND`
+field; a Mach-O dynamic-library ordinal past `n_desc`'s eight bits and a
+`__GOT` segment ordinal past the bind opcode's four bits; a Mach-O
+import-address fixup naming a segment or import out of range.
 
 `of.SectionId` is a record (`{ index: u32 }`), not a `def` alias (a `def`
 in mach is a weak alias and interchanges freely with its base type, verified
 by compiling a probe). `Symbol.section`, `Relocation.section`,
-`FrameUnwind.section`, `NativeIndirect.section` and `DeferredReloc.section`
-carry it, with `of.section_id`, `of.section_index`, `of.SECTION_NONE` /
-`of.is_external` / `of.is_absolute` as the only way in and out, so a section
-id cannot index a symbol, segment or module table and a symbol index cannot
-be stored where a section is meant. The status of that propagation across
-the tree is recorded in the closing section.
+`FrameUnwind.section`, `NativeIndirect.section`, the deferred relocation's
+`section` and the COFF import reader's `Location.section` carry it, with
+`of.section_id`, `of.section_index`, `of.external_section` /
+`of.absolute_section` / `of.no_section`, `of.section_is_external` /
+`of.section_is_absolute`, `of.section_defined` and `of.section_same` as the
+only way in and out. The driver test
+`section_identity_is_not_another_identity_domain` pins the rule the type
+rests on: a section id handed where a symbol id, a table index or a plain
+`u32` is meant is a type error, and the explicit conversion is accepted.
+
+Not converted, and why: `NativeSection.link_section` is a 1-based native
+index with `0` meaning none, a different encoding from the object model's
+0-based id with sentinels, and stays `u32` on the native record; the
+linker's flat index (`sec_base[m] + section`), merged-slot index and
+placement index are its own domains and remain `u32`, converted from the
+object id at explicit `of.section_index` seams (`collect_symbols`,
+`build_merged_image`, `patch_module_relocations`, `local_symbol_target`);
+the DWARF request's `text_section` and the debug line rows' `sec` are
+codegen-side `u32` indices compared through `of.section_index`, the
+`VRegId` / `PRegId` half of #3114 is #2212's. The `.rsrc` builder keeps its
+own size/emit pair (the writer already compares the two) over a private
+`align4` on the checked primitive, its values bounded by the 65535-byte
+version-node refusals it already had.
 
 ## Status
 
-See the closing section of this page in the merged branch for what each
-writer became, which refusal classes have tests, and what is left.
+Every retained writer path (ELF object, static, PIE, shared and dynamic;
+COFF object and PE; Mach-O object, static and dynamic) sizes and serializes
+from the plan. On valid input every emitted byte is identical to `dev` at
+`853d4c17`: the link cases (both profiles, image and `--emit obj`, all
+formats) and the compiler itself for six targets were compared file by file.
+The refusal classes are each constructed and asserted, with the destination
+proven untouched: an oversize section past a format's field width (ELF32,
+COFF, Mach-O), a misaligned placement (ELF and Mach-O debug sections, the
+plan's own tests), a count past its field (`e_shnum`), an overlapping
+dictated placement (PE), and allocation refusal at every ordinal through the
+standard library's failing allocator (ELF, COFF and Mach-O objects, no leak
+at any ordinal). Five link cases decode every published image and every
+relocatable object with `llvm-readobj --all` for x86_64 and riscv64 ELF,
+win64 PE, and x86_64 and arm64 Mach-O.

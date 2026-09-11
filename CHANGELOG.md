@@ -52,6 +52,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The ELF, COFF and Mach-O writers size and serialize every file from one
+  checked plan. A region is placed once, with its alignment, offset and extent
+  checked through the shared layout primitives, and every field is narrowed from
+  that plan; a section, table or address that would overflow, misalign or exceed
+  a format's field width is refused before any buffer exists, and a region whose
+  written bytes do not end on its planned extent refuses publication instead of
+  shipping. Section identity in object records, deferred relocations and the
+  writers is the nominal `SectionId`, so a section cannot be used as a symbol,
+  segment or table index without an explicit conversion. Valid output is
+  byte-identical, including RV32 static and relocatable images (#3113).
+
 - rename `sel` identifiers ahead of the v5 keyword (#3219)
 
 - Every dependency action selects its project with `mach dep <action> <path>`.
