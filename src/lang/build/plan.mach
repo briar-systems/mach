@@ -34,9 +34,14 @@ use mach.lang.target.of.bin;
 use mach.lang.target.of.coff;
 use mach.lang.target.of.elf;
 use mach.lang.target.of.macho;
+use std.io.writer;
+
 use mach.lang.build.outcome;
 use mach.lang.build.request;
+use mach.lang.driver;
+use dcfg: mach.lang.driver.config;
 use mach.lang.driver.project;
+use mach.lang.session;
 use mach.lang.intern;
 use mach.lang.manifest;
 use mach.lang.me.pipeline;
@@ -78,6 +83,16 @@ pub rec LinkInput {
     include_referenced: bool;
 }
 
+# one planned cell: an artifact on a target for a profile, with every decision
+# the engine executes. `plan` fills everything the root manifest decides; `configure`
+# adds what the realized dependency closure decides
+# ---
+# steps: the root manifest's prerequisite steps in execution order, by name
+# dep_steps: exported dependency steps in execution order as `<dep id>.<step>`;
+#  empty until `configure`
+# export_links: the dependency closure's exported link requirements for this
+#  cell, in link order; empty until `configure`
+# configured: `configure` ran, so `dep_steps` and `export_links` are effective
 pub rec BuildUnit {
     target_entry: *project.TargetEntry;
     profile:      str;
@@ -90,6 +105,10 @@ pub rec BuildUnit {
     asm_dir:      str;
     link_inputs:  Vector[LinkInput];
     phases:       Vector[PhaseKind];
+    steps:        Vector[str];
+    dep_steps:    Vector[str];
+    export_links: Vector[manifest.LinkRequirement];
+    configured:   bool;
 
     sel_target:   str;
     sel_artifact: str;
@@ -102,8 +121,10 @@ pub rec BuildUnit {
 
 pub def BuildRequest: request.BuildRequest;
 
+# project: the root manifest's `[project].id`
 pub rec BuildPlan {
     request: BuildRequest;
+    project: str;
     units:   Vector[BuildUnit];
 }
 
@@ -112,6 +133,7 @@ pub fun plan(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry
     var bp: BuildPlan;
     bp.request = owned_req;
     bp.units   = vector.init[BuildUnit](a);
+    bp.project = entry_name(itn, m.id);
     val req: *request.BuildRequest = ?bp.request;
 
     if (request.test_goal(req.goal)) {
@@ -200,6 +222,80 @@ pub fun plan(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry
         ret R.err[BuildPlan, outcome.Fail](outcome.user(out_conflict_msg(a, ?bp)));
     }
     ret R.ok[BuildPlan, outcome.Fail](bp);
+}
+
+# resolve every planned cell against the realized dependency closure, filling in
+# the exported dependency steps and export link requirements each cell consumes.
+# it configures projects through the same `driver.begin_build` a build runs, so a
+# missing realization, an invalid dependency manifest or a dependency cycle is
+# reported here exactly as the build would report it. nothing is fetched, no step
+# runs and no output is written
+# ---
+# s: the session the plan was made in
+# m: the root manifest
+# bp: the plan, mutated in place; each unit becomes `configured`
+# ret: ok; the configuration failure of the first cell that has one
+pub fun configure(s: *session.Session, m: *manifest.Manifest, bp: *BuildPlan) R.Result[R.Void, outcome.Fail] {
+    var i: usize = 0;
+    for (i < bp.units.len) {
+        val u: *BuildUnit = ?bp.units.data[i];
+        var req: request.BuildRequest = request.for_cell(?bp.request, u.sel_target,
+            u.sel_artifact, u.want_lib, u.subsystem, u.goal);
+        val begun: R.Result[project.Project, outcome.Fail] = driver.begin_build(s, m, ?req, nil);
+        if (R.is_err[project.Project, outcome.Fail](begun)) {
+            ret R.err[R.Void, outcome.Fail](R.unwrap_err[project.Project, outcome.Fail](begun));
+        }
+        var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](begun);
+        val collected: R.Result[R.Void, outcome.Fail] = collect_dependency_plan(?p, u);
+        project.dnit_project(?p);
+        if (R.is_err[R.Void, outcome.Fail](collected)) { ret collected; }
+        u.configured = true;
+        i = i + 1;
+    }
+    ret R.ok_void[outcome.Fail]();
+}
+
+fun collect_dependency_plan(p: *project.Project, u: *BuildUnit) R.Result[R.Void, outcome.Fail] {
+    val itn: *intern.Interner = ?p.s.interner;
+    val planned: R.Result[Vector[dcfg.DependencyStep], str] = dcfg.plan_dep_steps(p,
+        entry_name(itn, u.target_entry.isa_name), entry_name(itn, u.target_entry.os_name),
+        entry_name(itn, u.target_entry.abi_name));
+    if (R.is_err[Vector[dcfg.DependencyStep], str](planned)) {
+        ret R.err[R.Void, outcome.Fail](outcome.user(R.unwrap_err[Vector[dcfg.DependencyStep], str](planned)));
+    }
+    var steps: Vector[dcfg.DependencyStep] = R.unwrap_ok[Vector[dcfg.DependencyStep], str](planned);
+    fin { vector.dnit[dcfg.DependencyStep](?steps); }
+
+    var i: usize = 0;
+    for (i < steps.len) {
+        val selected: dcfg.DependencyStep = steps.data[i];
+        val dm: *manifest.Manifest = ?p.config.deps[selected.dependency].manifest;
+        val labelled: R.Result[str, str] = format.sprint(u.dep_steps.a, "{}.{}",
+            entry_name(itn, dm.id), entry_name(itn, dm.steps[selected.step].name));
+        if (R.is_err[str, str](labelled)) {
+            ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[str, str](labelled)));
+        }
+        val pushed: R.Result[usize, str] = vector.push[str](?u.dep_steps, R.unwrap_ok[str, str](labelled));
+        if (R.is_err[usize, str](pushed)) {
+            ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[usize, str](pushed)));
+        }
+        i = i + 1;
+    }
+
+    # the claimed-symbol array belongs to the project config and dies with it; the
+    # plan keeps only the interned identity it displays
+    var li: u32 = 0;
+    for (li < p.config.cascade_lib_count) {
+        var retained: manifest.LinkRequirement = p.config.cascade_libs[li];
+        retained.symbols      = nil;
+        retained.symbol_count = 0;
+        val pushed: R.Result[usize, str] = vector.push[manifest.LinkRequirement](?u.export_links, retained);
+        if (R.is_err[usize, str](pushed)) {
+            ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[usize, str](pushed)));
+        }
+        li = li + 1;
+    }
+    ret R.ok_void[outcome.Fail]();
 }
 
 fun selected_unit_count(bp: *BuildPlan) usize {
@@ -361,6 +457,12 @@ fun unit_decisions_equal(a: *BuildUnit, b: *BuildUnit) bool {
         if (!str_equals(a.requires.data[ri], b.requires.data[ri])) { ret false; }
         ri = ri + 1;
     }
+    if (a.steps.len != b.steps.len) { ret false; }
+    var si: usize = 0;
+    for (si < a.steps.len) {
+        if (!str_equals(a.steps.data[si], b.steps.data[si])) { ret false; }
+        si = si + 1;
+    }
     if (!str_equals(a.out_path, b.out_path)) { ret false; }
     if (!str_equals(a.obj_dir, b.obj_dir))   { ret false; }
     if (!str_equals(a.ir_dir, b.ir_dir))     { ret false; }
@@ -488,7 +590,10 @@ fun plan_unit(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistr
     if (R.is_err[str, outcome.Fail](op_r)) { ret R.err[BuildUnit, outcome.Fail](R.unwrap_err[str, outcome.Fail](op_r)); }
     u.out_path = R.unwrap_ok[str, outcome.Fail](op_r);
 
-    u.link_inputs = vector.init[LinkInput](a);
+    u.link_inputs  = vector.init[LinkInput](a);
+    u.dep_steps    = vector.init[str](a);
+    u.export_links = vector.init[manifest.LinkRequirement](a);
+    u.configured   = false;
     var ti: usize = 0;
     for (ti < req.link_tokens.len) {
         val token: str = req.link_tokens.data[ti].text;
@@ -622,8 +727,9 @@ fun derive_phases(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
                   req: *request.BuildRequest, bu: *manifest.BuildUnit,
                   tgt: *target.Target, u: *BuildUnit) R.Result[R.Void, outcome.Fail] {
     u.phases = vector.init[PhaseKind](a);
+    u.steps  = vector.init[str](a);
 
-    val demanded_r: R.Result[bool, outcome.Fail] = steps_demanded(a, itn, m, req, bu);
+    val demanded_r: R.Result[bool, outcome.Fail] = steps_demanded(a, itn, m, req, bu, ?u.steps);
     if (R.is_err[bool, outcome.Fail](demanded_r)) { ret R.void_of[bool, outcome.Fail](demanded_r); }
     if (m.dep_count > 0) {
         val r1: R.Result[R.Void, outcome.Fail] = push_phase(u, PH_DEP_STEPS);
@@ -666,8 +772,12 @@ fun push_phase(u: *BuildUnit, k: PhaseKind) R.Result[R.Void, outcome.Fail] {
     ret R.ok_void[outcome.Fail]();
 }
 
+# the root manifest's prerequisite steps this cell demands, appended to `steps`
+# in execution order. the same `manifest.plan_steps` the driver runs, so the
+# displayed order is the executed order
 fun steps_demanded(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
-                   req: *request.BuildRequest, bu: *manifest.BuildUnit) R.Result[bool, outcome.Fail] {
+                   req: *request.BuildRequest, bu: *manifest.BuildUnit,
+                   steps: *Vector[str]) R.Result[bool, outcome.Fail] {
     if (m.step_count == 0) { ret R.ok[bool, outcome.Fail](false); }
 
     val pn_opt: O.Option[str] = intern.lookup(itn, bu.profile_name);
@@ -706,7 +816,15 @@ fun steps_demanded(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest
     if (R.is_err[R.Void, str](r)) {
         ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[R.Void, str](r)));
     }
-    if (order != nil && count > 0) { A.deallocate[u32](a, order, count::usize); }
+    fin { if (order != nil && count > 0) { A.deallocate[u32](a, order, count::usize); } }
+    var i: u32 = 0;
+    for (i < count) {
+        val named: O.Option[str] = intern.lookup(itn, m.steps[order[i]].name);
+        if (O.is_none[str](named)) { ret R.err[bool, outcome.Fail](outcome.internal("planned step name is not interned")); }
+        val pushed: R.Result[usize, str] = vector.push[str](steps, O.unwrap[str](named));
+        if (R.is_err[usize, str](pushed)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+        i = i + 1;
+    }
     ret R.ok[bool, outcome.Fail](count > 0);
 }
 
@@ -1375,49 +1493,103 @@ fun write_named_versioned(dir: *u8, name: *u8, v: u32, buf: *u8, cap: usize) boo
     ret true;
 }
 
-pub fun explain(p: *BuildPlan, itn: *intern.Interner) {
-    print.printf("plan: {}\n", p.request.project_root);
-    print.printf("units: {}\n", p.units.len::i64);
+# render the effective plan: one block per selected cell, naming the project,
+# target, profile, artifact, entry, output paths, ordered prerequisite steps and
+# link requirements. a plan the caller never configured says so instead of
+# claiming an empty dependency closure
+# ---
+# w: the sink; `explain` passes stdout
+# p: the plan
+# itn: resolves interned names
+pub fun render(w: *writer.Writer, p: *BuildPlan, itn: *intern.Interner) {
+    format.format(w, "plan:    {}\n", p.request.project_root);
+    format.format(w, "project: {}\n", p.project);
+    format.format(w, "units:   {}\n", p.units.len::i64);
 
     var i: usize = 0;
     for (i < p.units.len) {
         val u: *BuildUnit = ?p.units.data[i];
-        print.print("\n");
-        print.printf("unit {}: {} ({})  target {}  profile {}\n",
+        format.write_str(w, "\n");
+        format.format(w, "unit {}: {} ({})  target {}  profile {}\n",
             (i + 1)::i64, unit_artifact_label(u), unit_kind_label(u),
             entry_name(itn, u.target_entry.name), u.profile);
-        print.printf("  goal    {}\n", request.goal_name(u.goal));
-        print.printf("  tuple   {}-{}-{}\n",
+        format.format(w, "  goal    {}\n", request.goal_name(u.goal));
+        format.format(w, "  tuple   {}-{}-{}\n",
             entry_name(itn, u.target_entry.isa_name),
             entry_name(itn, u.target_entry.os_name),
             entry_name(itn, u.target_entry.abi_name));
-        print.printf("  opt     {}\n", opt_name(u.opt_level));
-        if (!str_empty(u.out_path)) { print.printf("  out     {}\n", u.out_path); }
-        print.printf("  obj     {}\n", u.obj_dir);
-        if (!str_empty(u.ir_dir))  { print.printf("  ir      {}\n", u.ir_dir); }
-        if (!str_empty(u.asm_dir)) { print.printf("  asm     {}\n", u.asm_dir); }
+        format.format(w, "  opt     {}\n", opt_name(u.opt_level));
+        format.format(w, "  entry   {}\n", entry_name(itn, u.target_entry.entrypoint));
+        if (!str_empty(u.out_path)) { format.format(w, "  out     {}\n", u.out_path); }
+        format.format(w, "  obj     {}\n", u.obj_dir);
+        if (!str_empty(u.ir_dir))  { format.format(w, "  ir      {}\n", u.ir_dir); }
+        if (!str_empty(u.asm_dir)) { format.format(w, "  asm     {}\n", u.asm_dir); }
 
+        var ri: usize = 0;
+        for (ri < u.requires.len) {
+            format.format(w, "  need    artifact {}\n", u.requires.data[ri]);
+            ri = ri + 1;
+        }
+        var di: usize = 0;
+        for (di < u.dep_steps.len) {
+            format.format(w, "  step    dependency {}\n", u.dep_steps.data[di]);
+            di = di + 1;
+        }
+        var si: usize = 0;
+        for (si < u.steps.len) {
+            format.format(w, "  step    project {}\n", u.steps.data[si]);
+            si = si + 1;
+        }
+
+        var mi: u32 = 0;
+        for (mi < u.target_entry.lib_count) {
+            format.format(w, "  link    manifest {}\n", link_requirement_label(itn, ?u.target_entry.libs[mi]));
+            mi = mi + 1;
+        }
+        var ei: usize = 0;
+        for (ei < u.export_links.len) {
+            format.format(w, "  link    dependency export {}\n", link_requirement_label(itn, ?u.export_links.data[ei]));
+            ei = ei + 1;
+        }
         var li: usize = 0;
         for (li < u.link_inputs.len) {
             val inp: *LinkInput = ?u.link_inputs.data[li];
-            if (inp.kind == LINK_STATIC) { print.printf("  link    static  {}\n", inp.text); }
+            if (inp.kind == LINK_STATIC) { format.format(w, "  link    static  {}\n", inp.text); }
             or {
-                print.printf("  link    dynamic {}\n", inp.text);
-                if (!str_empty(inp.rpath)) { print.printf("  rpath   {}\n", inp.rpath); }
+                format.format(w, "  link    dynamic {}\n", inp.text);
+                if (!str_empty(inp.rpath)) { format.format(w, "  rpath   {}\n", inp.rpath); }
             }
             li = li + 1;
         }
 
-        print.print("  phases  ");
+        format.write_str(w, "  phases  ");
         var pi: usize = 0;
         for (pi < u.phases.len) {
-            if (pi > 0) { print.print(" -> "); }
-            print.print(phase_name(u.phases.data[pi]));
+            if (pi > 0) { format.write_str(w, " -> "); }
+            format.write_str(w, phase_name(u.phases.data[pi]));
             pi = pi + 1;
         }
-        print.print("\n");
+        format.write_str(w, "\n");
+
+        if (!u.configured) {
+            format.write_str(w, "  deps    not resolved: this plan was not configured against the dependency closure\n");
+        }
+        if (u.dep_steps.len != 0 || u.steps.len != 0 || u.requires.len != 0) {
+            format.write_str(w, "  inputs  generated bytes are unresolved until the prerequisites above run\n");
+        }
         i = i + 1;
     }
+    format.write_str(w, "\nthis plan reports the selected build. it does not read generated bytes, and it does not claim the link succeeds\n");
+}
+
+pub fun explain(p: *BuildPlan, itn: *intern.Interner) {
+    var w: writer.Writer = fs.writer(fs.STDOUT);
+    render(?w, p, itn);
+}
+
+fun link_requirement_label(itn: *intern.Interner, l: *manifest.LinkRequirement) str {
+    if (l.source == manifest.LINK_LOCAL) { ret entry_name(itn, l.text); }
+    ret entry_name(itn, l.library);
 }
 
 fun unit_artifact_label(u: *BuildUnit) str {

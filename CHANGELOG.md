@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `mach build <path> --plan` prints the effective build through the normal
+  planner and exits: per cell the project, target, profile, artifact, entry,
+  output paths, the dependency and project prerequisite steps in execution
+  order, the artifact requirements, and the manifest, dependency-export and
+  command-line link requirements. The plan is configured against the realized
+  dependency closure the way a build is, so an unrealized dependency, an invalid
+  dependency manifest or a dependency cycle is reported with the build's own
+  diagnostic; nothing is fetched, generated, compiled, linked or written, and a
+  cell with prerequisites says its generated inputs are unresolved. It replaces
+  `--explain` (#3223).
+
 - `{artifact.suffix}` in an artifact `out` expands to the conventional filename
   suffix for the artifact's kind on the selected target (`.exe`/`.lib`/`.dll` on
   Windows, `.a`/`.so` on Linux, `.a`/`.dylib` on Darwin, `.spv` for a SPIR-V
