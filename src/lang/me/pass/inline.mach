@@ -11,6 +11,7 @@ use R: std.types.result;
 
 use mach.lang.intern;
 use mach.lang.me.ir;
+use mach.lang.me.ir.body;
 use mach.lang.me.ir.builder;
 use mach.lang.me.ir.id;
 use mach.lang.me.ir.instruction;
@@ -22,11 +23,9 @@ use mach.lang.source;
 use mach.lang.target;
 use semtype: mach.lang.type;
 
-val INLINE_INSTR_THRESHOLD: u32 = 25;
+val INLINE_INSTR_THRESHOLD: u32 = body.SMALL_INSTRUCTIONS;
 
-val INLINE_BUDGET: u32 = 1024;
-
-val PEEL_BUDGET: u32 = 1024;
+val INLINE_BUDGET: u32 = body.MAX_INSTRUCTIONS;
 
 val INLINE_SMALL_CALLEE_FANOUT_CAP: u32 = 16;
 
@@ -133,6 +132,10 @@ fun build_inline_facts(m: *ir.Module) R.Result[InlineFacts, str] {
 }
 
 pub fun run(m: *ir.Module, tgt: *target.Target, out_report: *InlineBudget) R.Result[bool, str] {
+    ret run_available(m, tgt, nil, out_report);
+}
+
+pub fun run_available(m: *ir.Module, tgt: *target.Target, available: *body.Available, out_report: *InlineBudget) R.Result[bool, str] {
     if (out_report != nil) {
         out_report.inline_exhausted = false;
         out_report.peel_exhausted   = false;
@@ -183,10 +186,10 @@ pub fun run(m: *ir.Module, tgt: *target.Target, out_report: *InlineBudget) R.Res
     for (i < m.function_len) {
         val caller: *ir.Function = ?m.functions[i];
         if ((caller.flags & ir.FN_FLAG_EXTERN) == 0) {
-            var budget: u32 = INLINE_BUDGET;
+            var budget: body.Budget;
             var progress: bool = true;
-            for (progress && budget > 0) {
-                val inlined_r: R.Result[bool, str] = inline_one_in_fn(m, recursive, counts, ?facts, dup_count, caller);
+            for (progress && budget.instructions < INLINE_BUDGET) {
+                val inlined_r: R.Result[bool, str] = inline_one_in_fn(m, recursive, counts, ?facts, dup_count, caller, available, ?budget, ?any_exhausted);
                 if (R.is_err[bool, str](inlined_r)) {
                     A.deallocate[u32](m.alloc, dup_count, m.function_len::usize);
                     inline_facts_free(m, ?facts);
@@ -195,9 +198,9 @@ pub fun run(m: *ir.Module, tgt: *target.Target, out_report: *InlineBudget) R.Res
                     ret inlined_r;
                 }
                 progress = R.unwrap_ok[bool, str](inlined_r);
-                if (progress) { budget = budget - 1; any_inlined = true; }
+                if (progress) { any_inlined = true; }
             }
-            if (budget == 0) { any_exhausted = true; }
+            if (budget.instructions == INLINE_BUDGET) { any_exhausted = true; }
         }
         i = i + 1;
     }
@@ -215,7 +218,7 @@ pub fun run(m: *ir.Module, tgt: *target.Target, out_report: *InlineBudget) R.Res
     ret R.ok[bool, str](any_inlined || R.unwrap_ok[bool, str](peeled_r));
 }
 
-fun inline_one_in_fn(m: *ir.Module, recursive: *bool, counts: *u32, facts: *InlineFacts, dup_count: *u32, caller: *ir.Function) R.Result[bool, str] {
+fun inline_one_in_fn(m: *ir.Module, recursive: *bool, counts: *u32, facts: *InlineFacts, dup_count: *u32, caller: *ir.Function, available: *body.Available, budget: *body.Budget, exhausted: *bool) R.Result[bool, str] {
     var i: u32 = 0;
     for (i < caller.block_count) {
         val blk: *ir.Block = ?caller.blocks[i];
@@ -229,7 +232,11 @@ fun inline_one_in_fn(m: *ir.Module, recursive: *bool, counts: *u32, facts: *Inli
                     val callee_ix: u32 = callee_index(inst);
                     if (callee_ix != 0xFFFFFFFF && callee_ix < m.function_len) {
                         val callee: *ir.Function = ?m.functions[callee_ix];
-                        if (should_inline(recursive, counts, facts, dup_count, callee_ix, callee)) {
+                        if (should_inline(recursive, counts, facts, dup_count, caller, callee_ix, callee, available)) {
+                            var cost: body.Budget;
+                            if (!body.growth_cost(callee, ?cost) || !body.charge(budget, cost.instructions, cost.bytes)) {
+                                @exhausted = true; ii = ii + 1; cnt;
+                            }
                             val res_inline: R.Result[R.Void, str] =
                                 do_inline(m, counts, caller, i, ii, iid, callee_ix, callee);
                             if (R.is_err[R.Void, str](res_inline)) { ret R.err[bool, str](R.unwrap_err[R.Void, str](res_inline)); }
@@ -252,18 +259,20 @@ fun callee_index(call: *instruction.Instruction) u32 {
     ret 0xFFFFFFFF;
 }
 
-fun should_inline(recursive: *bool, counts: *u32, facts: *InlineFacts, dup_count: *u32, callee_ix: u32, callee: *ir.Function) bool {
-    if ((callee.flags & ir.FN_FLAG_EXTERN) != 0)             { ret false; }
+fun should_inline(recursive: *bool, counts: *u32, facts: *InlineFacts, dup_count: *u32, caller: *ir.Function, callee_ix: u32, callee: *ir.Function, available: *body.Available) bool {
+    if ((callee.flags & ir.FN_FLAG_EXTERN) != 0 && !body.contains(available, callee_ix)) { ret false; }
     if ((callee.flags & ir.FN_FLAG_SCALAR) != 0)             { ret false; }
     if ((callee.flags & ir.FN_FLAG_NOINLINE) != 0)           { ret false; }
     if ((callee.flags & ir.FN_FLAG_NAKED) != 0)              { ret false; }
+    # constant-time validation runs per #[oblivious] function, so its instructions stay inside one
+    if ((callee.flags & ir.FN_FLAG_OBLIVIOUS) != 0 && (caller.flags & ir.FN_FLAG_OBLIVIOUS) == 0) { ret false; }
     if (recursive[callee_ix])                                { ret false; }
     if (callee.block_count == 0)                             { ret false; }
     if ((callee.flags & ir.FN_FLAG_INLINE) != 0)             { ret true; }
 
     val single_caller: bool = counts[callee_ix] == 1
         && !facts.address_taken[callee_ix]
-        && !facts.exposed[callee_ix];
+        && !facts.exposed[callee_ix] && !body.contains(available, callee_ix);
     if (single_caller) { ret true; }
 
     if (callee_instr_count(callee) < INLINE_INSTR_THRESHOLD
@@ -272,21 +281,7 @@ fun should_inline(recursive: *bool, counts: *u32, facts: *InlineFacts, dup_count
 }
 
 fun callee_instr_count(callee: *ir.Function) u32 {
-    var total: u32 = 0;
-    var i: u32 = 0;
-    for (i < callee.block_count) {
-        val blk: *ir.Block = ?callee.blocks[i];
-        total = total + blk.phi_count;
-        var k: u32 = 0;
-        for (k < blk.instr_count) {
-            val oi: O.Option[*instruction.Instruction] = ir.instruction_get(callee, blk.instructions[k]);
-            if (O.is_some[*instruction.Instruction](oi) && O.unwrap[*instruction.Instruction](oi).kind != instruction.OP_DBG_VALUE) { total = total + 1; }
-            k = k + 1;
-        }
-        if (blk.terminator != id.INSTR_NIL) { total = total + 1; }
-        i = i + 1;
-    }
-    ret total;
+    ret body.live_instructions(callee);
 }
 
 fun build_call_counts(m: *ir.Module, counts: *u32) {
@@ -324,76 +319,109 @@ fun add_fn_call_counts(m: *ir.Module, fn: *ir.Function, counts: *u32) {
     }
 }
 
-fun mark_recursive(m: *ir.Module, recursive: *bool) R.Result[R.Void, str] {
-    val n: u32 = m.function_len;
-    val res_visited: R.Result[*bool, str] = A.allocate[bool](m.alloc, n::usize);
-    if (R.is_err[*bool, str](res_visited)) {
-        ret R.err[R.Void, str](R.unwrap_err[*bool, str](res_visited));
-    }
-    val visited: *bool = R.unwrap_ok[*bool, str](res_visited);
-    val res_queue: R.Result[*u32, str] = A.allocate[u32](m.alloc, n::usize);
-    if (R.is_err[*u32, str](res_queue)) {
-        A.deallocate[bool](m.alloc, visited, n::usize);
-        ret R.err[R.Void, str](R.unwrap_err[*u32, str](res_queue));
-    }
-    val queue: *u32 = R.unwrap_ok[*u32, str](res_queue);
-
-    var i: u32 = 0;
-    for (i < n) {
-        recursive[i] = reaches_self(m, i, visited, queue, n);
-        i = i + 1;
-    }
-
-    A.deallocate[bool](m.alloc, visited, n::usize);
-    A.deallocate[u32](m.alloc, queue, n::usize);
-    ret R.ok_void[str]();
+rec CallVisit {
+    index: u32;
+    low: u32;
+    block: u32;
+    instr: u32;
+    active: bool;
+    self_call: bool;
 }
 
-fun reaches_self(m: *ir.Module, start: u32, visited: *bool, queue: *u32, n: u32) bool {
-    var i: u32 = 0;
-    for (i < n) {
-        visited[i] = false;
-        i = i + 1;
-    }
-
-    var qt: u32 = 0;
-    if (scan_callees(m, start, start, visited, queue, ?qt)) { ret true; }
-    var qh: u32 = 0;
-    for (qh < qt) {
-        val fn_ix: u32 = queue[qh];
-        qh = qh + 1;
-        if (scan_callees(m, fn_ix, start, visited, queue, ?qt)) { ret true; }
-    }
-    ret false;
-}
-
-fun scan_callees(m: *ir.Module, fn_ix: u32, target_ix: u32, visited: *bool, queue: *u32, qt: *u32) bool {
+fun next_callee(m: *ir.Module, fn_ix: u32, visit: *CallVisit) u32 {
     val fn: *ir.Function = ?m.functions[fn_ix];
-    var i: u32 = 0;
-    for (i < fn.block_count) {
-        val blk: *ir.Block = ?fn.blocks[i];
-        var ii: u32 = 0;
-        for (ii < blk.instr_count) {
-            val opt_inst: O.Option[*instruction.Instruction] = ir.instruction_get(fn, blk.instructions[ii]);
-            if (O.is_some[*instruction.Instruction](opt_inst)) {
-                val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_inst);
-                if (inst.kind == instruction.OP_CALL && inst.operand_count >= 1) {
-                    val callee_ix: u32 = callee_index(inst);
-                    if (callee_ix != 0xFFFFFFFF && callee_ix < m.function_len) {
-                        if (callee_ix == target_ix) { ret true; }
-                        if (visited[callee_ix] == false) {
-                            visited[callee_ix] = true;
-                            queue[@qt] = callee_ix;
-                            @qt = @qt + 1;
-                        }
-                    }
-                }
-            }
-            ii = ii + 1;
+    for (visit.block < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[visit.block];
+        for (visit.instr < blk.instr_count) {
+            val oi: O.Option[*instruction.Instruction] = ir.instruction_get(fn, blk.instructions[visit.instr]);
+            visit.instr = visit.instr + 1;
+            if (O.is_none[*instruction.Instruction](oi)) { cnt; }
+            val ins: *instruction.Instruction = O.unwrap[*instruction.Instruction](oi);
+            if (ins.kind != instruction.OP_CALL || ins.operand_count == 0) { cnt; }
+            val callee: u32 = callee_index(ins);
+            if (callee < m.function_len) { ret callee; }
         }
+        visit.block = visit.block + 1;
+        visit.instr = 0;
+    }
+    ret 0xFFFFFFFF;
+}
+
+pub fun mark_recursive(m: *ir.Module, recursive: *bool) R.Result[R.Void, str] {
+    val n: u32 = m.function_len;
+    if (n == 0) { ret R.ok_void[str](); }
+    val rv: R.Result[*CallVisit, str] = A.allocate[CallVisit](m.alloc, n::usize);
+    if (R.is_err[*CallVisit, str](rv)) { ret R.err[R.Void, str](R.unwrap_err[*CallVisit, str](rv)); }
+    val visits: *CallVisit = R.unwrap_ok[*CallVisit, str](rv);
+    fin { A.deallocate[CallVisit](m.alloc, visits, n::usize); }
+    val rd: R.Result[*u32, str] = A.allocate[u32](m.alloc, n::usize);
+    if (R.is_err[*u32, str](rd)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](rd)); }
+    val dfs: *u32 = R.unwrap_ok[*u32, str](rd);
+    fin { A.deallocate[u32](m.alloc, dfs, n::usize); }
+    val rs: R.Result[*u32, str] = A.allocate[u32](m.alloc, n::usize);
+    if (R.is_err[*u32, str](rs)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](rs)); }
+    val stack: *u32 = R.unwrap_ok[*u32, str](rs);
+    fin { A.deallocate[u32](m.alloc, stack, n::usize); }
+
+    var i: u32 = 0;
+    for (i < n) {
+        visits[i] = CallVisit{ index: 0xFFFFFFFF };
+        recursive[i] = false;
         i = i + 1;
     }
-    ret false;
+    var serial: u32 = 0;
+    var stack_len: u32 = 0;
+    var root: u32 = 0;
+    for (root < n) {
+        if (visits[root].index != 0xFFFFFFFF) { root = root + 1; cnt; }
+        visits[root].index = serial;
+        visits[root].low = serial;
+        visits[root].active = true;
+        serial = serial + 1;
+        stack[stack_len] = root;
+        stack_len = stack_len + 1;
+        dfs[0] = root;
+        var depth: u32 = 1;
+        for (depth > 0) {
+            val current: u32 = dfs[depth - 1];
+            val visit: *CallVisit = ?visits[current];
+            val child: u32 = next_callee(m, current, visit);
+            if (child != 0xFFFFFFFF) {
+                if (child == current) { visit.self_call = true; }
+                if (visits[child].index == 0xFFFFFFFF) {
+                    visits[child].index = serial;
+                    visits[child].low = serial;
+                    visits[child].active = true;
+                    serial = serial + 1;
+                    stack[stack_len] = child;
+                    stack_len = stack_len + 1;
+                    dfs[depth] = child;
+                    depth = depth + 1;
+                } or (visits[child].active && visits[child].index < visit.low) {
+                    visit.low = visits[child].index;
+                }
+                cnt;
+            }
+            if (visit.low == visit.index) {
+                val end: u32 = stack_len;
+                var member: u32 = 0xFFFFFFFF;
+                for (member != current) {
+                    stack_len = stack_len - 1;
+                    member = stack[stack_len];
+                    visits[member].active = false;
+                }
+                val cycle: bool = end - stack_len > 1 || visit.self_call;
+                var k: u32 = stack_len;
+                for (k < end) { recursive[stack[k]] = cycle; k = k + 1; }
+            }
+            depth = depth - 1;
+            if (depth > 0 && visit.low < visits[dfs[depth - 1]].low) {
+                visits[dfs[depth - 1]].low = visit.low;
+            }
+        }
+        root = root + 1;
+    }
+    ret R.ok_void[str]();
 }
 
 rec InlineCtx {
@@ -534,11 +562,12 @@ fun peel_all(m: *ir.Module, out_exhausted: *bool) R.Result[bool, str] {
     for (f_ix < m.function_len) {
         val fn: *ir.Function = ?m.functions[f_ix];
         if ((fn.flags & ir.FN_FLAG_EXTERN) == 0 && peel_eligible(fn, f_ix)) {
-            var budget: u32 = PEEL_BUDGET;
-            val peeled_r: R.Result[bool, str] = peel_function(m, f_ix, fn, ?budget);
+            var budget: body.Budget;
+            var exhausted: bool = false;
+            val peeled_r: R.Result[bool, str] = peel_function(m, f_ix, fn, ?budget, ?exhausted);
             if (R.is_err[bool, str](peeled_r)) { ret peeled_r; }
             if (R.unwrap_ok[bool, str](peeled_r)) { changed = true; }
-            if (budget == 0 && out_exhausted != nil) { @out_exhausted = true; }
+            if (exhausted && out_exhausted != nil) { @out_exhausted = true; }
         }
         f_ix = f_ix + 1;
     }
@@ -546,6 +575,7 @@ fun peel_all(m: *ir.Module, out_exhausted: *bool) R.Result[bool, str] {
 }
 
 fun peel_eligible(fn: *ir.Function, f_ix: u32) bool {
+    if ((fn.flags & (ir.FN_FLAG_NOINLINE | ir.FN_FLAG_SCALAR | ir.FN_FLAG_NAKED)) != 0) { ret false; }
     if (fn.block_count == 0)                              { ret false; }
     if (callee_instr_count(fn) >= INLINE_INSTR_THRESHOLD) { ret false; }
     ret has_direct_self_call(fn, f_ix);
@@ -611,6 +641,7 @@ fun locate_call(fn: *ir.Function, call_id: id.InstructionId, out_bi: *u32, out_i
 
 fun build_snapshot(m: *ir.Module, fn: *ir.Function, snap: *ir.Function) R.Result[R.Void, str] {
     @snap = ir.function_new(m.alloc, fn.name, fn.sig, fn.flags);
+    snap.body_module = fn.body_module;
 
     var i: u32 = 0;
     for (i < fn.instr_len) {
@@ -647,7 +678,7 @@ fun build_snapshot(m: *ir.Module, fn: *ir.Function, snap: *ir.Function) R.Result
     ret R.ok_void[str]();
 }
 
-fun peel_function(m: *ir.Module, f_ix: u32, fn: *ir.Function, budget: *u32) R.Result[bool, str] {
+fun peel_function(m: *ir.Module, f_ix: u32, fn: *ir.Function, budget: *body.Budget, exhausted: *bool) R.Result[bool, str] {
     var snap: ir.Function;
     val res_snap: R.Result[R.Void, str] = build_snapshot(m, fn, ?snap);
     if (R.is_err[R.Void, str](res_snap)) { ir.function_dnit(m, ?snap); ret R.err[bool, str](R.unwrap_err[R.Void, str](res_snap)); }
@@ -668,20 +699,23 @@ fun peel_function(m: *ir.Module, f_ix: u32, fn: *ir.Function, budget: *u32) R.Re
     var err: R.Result[bool, str] = R.ok[bool, str](true);
     var did_peel: bool = false;
     var level: u32 = 0;
-    for (level < PEEL_LEVELS && cur_n > 0 && @budget > 0) {
+    for (level < PEEL_LEVELS && cur_n > 0 && !@exhausted) {
         if (callee_instr_count(fn) >= INLINE_INSTR_THRESHOLD * (level + 2)) { brk; }
 
         var nxt_n: u32 = 0;
         var k: u32 = 0;
-        for (k < cur_n && @budget > 0) {
+        for (k < cur_n && !@exhausted) {
             val call_id: id.InstructionId = cur[k]::id.InstructionId;
             var bi: u32 = 0;
             var ii: u32 = 0;
             if (locate_call(fn, call_id, ?bi, ?ii)) {
+                var cost: body.Budget;
+                if (!body.growth_cost(?snap, ?cost) || !body.charge(budget, cost.instructions, cost.bytes)) {
+                    @exhausted = true; brk;
+                }
                 val r: R.Result[R.Void, str] =
                     inline_body(m, fn, bi, ii, call_id, ?snap, f_ix, nxt, PEEL_FRONTIER_CAP, ?nxt_n);
                 if (R.is_err[R.Void, str](r)) { err = R.err[bool, str](R.unwrap_err[R.Void, str](r)); brk; }
-                @budget   = @budget - 1;
                 did_peel  = true;
             } or {
                 err = R.err[bool, str]("inline: peel self-call site not found");
@@ -817,6 +851,15 @@ fun clone_instructions(cx: *InlineCtx) R.Result[R.Void, str] {
             ret R.err[R.Void, str](R.unwrap_err[id.InstructionId, str](res_id));
         }
         cx.instr_map[i] = R.unwrap_ok[id.InstructionId, str](res_id)::u32;
+        if ((callee.flags & ir.FN_FLAG_EXTERN) != 0) {
+            val cloned: *instruction.Instruction = ?cx.caller.instrs[cx.instr_map[i]];
+            var oi: u32 = 0;
+            for (oi < cloned.operand_count) {
+                val owned: R.Result[value.Value, str] = body.own_constant(m.alloc, cloned.operands[oi]);
+                if (R.is_err[value.Value, str](owned)) { ret R.err[R.Void, str](R.unwrap_err[value.Value, str](owned)); }
+                cloned.operands[oi] = R.unwrap_ok[value.Value, str](owned); oi = oi + 1;
+            }
+        }
         i = i + 1;
     }
     ret R.ok_void[str]();
@@ -1160,6 +1203,54 @@ test "mach.lang.me.pass.inline.mark_recursive:direct_self_call" {
     A.deallocate[bool](m.alloc, recursive, 1::usize);
     ir.dnit(?m);
     if (is_recursive == false) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.me.pass.inline.mark_recursive:cycles_exclude_callers_and_completed_components" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+    fin { ir.dnit(?m); }
+    val rv: R.Result[type.IrTypeId, str] = type.intern_void(?m.types);
+    if (R.is_err[type.IrTypeId, str](rv)) { ret 1; }
+    val vt: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](rv);
+    val rs: R.Result[type.IrTypeId, str] = type.intern_fn(?m.types, vt, nil, 0, false);
+    if (R.is_err[type.IrTypeId, str](rs)) { ret 1; }
+    val sig: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](rs);
+    var i: u32 = 0;
+    for (i < 64) {
+        if (R.is_err[u32, str](ir.function_add(?m, intern.STR_NIL, sig, 0))) { ret 1; }
+        i = i + 1;
+    }
+    var b: builder.Builder = builder.init(?m);
+    i = 0;
+    for (i < 64) {
+        builder.set_function(?b, ?m.functions[i]);
+        val rb: R.Result[id.BlockId, str] = builder.new_block(?b);
+        if (R.is_err[id.BlockId, str](rb)) { ret 1; }
+        builder.set_block(?b, R.unwrap_ok[id.BlockId, str](rb));
+        var callee: u32 = 0xFFFFFFFF;
+        if (i < 29) { callee = i + 1; }
+        if (i == 12) { callee = 9; }
+        if (i == 30) { callee = 31; }
+        if (i == 31 || i == 33) { callee = 30; }
+        if (i == 32) { callee = 32; }
+        if (callee != 0xFFFFFFFF) {
+            if (R.is_err[value.Value, str](builder.emit_call(?b, value.fn(callee, sig), nil, 0, vt))) { ret 1; }
+        }
+        if (R.is_err[R.Void, str](builder.emit_ret_void(?b))) { ret 1; }
+        i = i + 1;
+    }
+    var recursive: [64]bool;
+    if (R.is_err[R.Void, str](mark_recursive(?m, ?recursive[0]))) { ret 1; }
+    i = 0;
+    for (i < 64) {
+        val expected: bool = (i >= 9 && i <= 12) || (i >= 30 && i <= 32);
+        if (recursive[i] != expected) { ret 1; }
+        i = i + 1;
+    }
     ret 0;
 }
 
@@ -1611,6 +1702,19 @@ test "mach.lang.me.pass.inline.run:peels_direct_self_recursion" {
     val rsum: R.Result[value.Value, str] = builder.emit_add(?bld, R.unwrap_ok[value.Value, str](ra), R.unwrap_ok[value.Value, str](rb));
     if (R.is_err[value.Value, str](rsum)) { ir.dnit(?m); ret 1; }
     if (R.is_err[R.Void, str](builder.emit_ret(?bld, R.unwrap_ok[value.Value, str](rsum)))) { ir.dnit(?m); ret 1; }
+
+    val original_instrs: u32 = m.functions[fib_ix].instr_len;
+    var blocked_flags: [3]u32 = [3]u32{ ir.FN_FLAG_NOINLINE, ir.FN_FLAG_SCALAR, ir.FN_FLAG_NAKED };
+    var flag_ix: u32 = 0;
+    for (flag_ix < 3) {
+        m.functions[fib_ix].flags = blocked_flags[flag_ix];
+        val blocked: R.Result[bool, str] = run(?m, nil, nil);
+        if (R.is_err[bool, str](blocked)) { ir.dnit(?m); ret 1; }
+        if (R.unwrap_ok[bool, str](blocked) || m.functions[fib_ix].instr_len != original_instrs
+            || m.functions[fib_ix].block_count != 3) { ir.dnit(?m); ret 1; }
+        flag_ix = flag_ix + 1;
+    }
+    m.functions[fib_ix].flags = 0;
 
     val rr: R.Result[bool, str] = run(?m, nil, nil);
     if (R.is_err[bool, str](rr)) { ir.dnit(?m); ret 1; }
@@ -2739,4 +2843,126 @@ test "mach.lang.me.pass.inline.stamp_inline_metadata:carries_alloca_debug_metada
 
     if (!found) { ret 4; }
     ret bad;
+}
+
+# a callee of `adds` chained adds plus its return, called once from each of `callers`
+# functions carrying `caller_flags`; the callee index is returned and every caller follows it
+fun t_fanned_callee(m: *ir.Module, callee_flags: u32, adds: u32, callers: u32, caller_flags: *u32) R.Result[u32, str] {
+    val ri: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](ri)) { ret R.err[u32, str](R.unwrap_err[type.IrTypeId, str](ri)); }
+    val i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](ri);
+    var pi: type.IrTypeId = i64t;
+    val rs: R.Result[type.IrTypeId, str] = type.intern_fn(?m.types, i64t, ?pi, 1, false);
+    if (R.is_err[type.IrTypeId, str](rs)) { ret R.err[u32, str](R.unwrap_err[type.IrTypeId, str](rs)); }
+    val sig: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](rs);
+    val rs0: R.Result[type.IrTypeId, str] = type.intern_fn(?m.types, i64t, nil, 0, false);
+    if (R.is_err[type.IrTypeId, str](rs0)) { ret R.err[u32, str](R.unwrap_err[type.IrTypeId, str](rs0)); }
+    val sig0: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](rs0);
+
+    val r_callee: R.Result[u32, str] = ir.function_add(m, intern.STR_NIL, sig, callee_flags);
+    if (R.is_err[u32, str](r_callee)) { ret r_callee; }
+    val callee_ix: u32 = R.unwrap_ok[u32, str](r_callee);
+    var bld: builder.Builder = builder.init(m);
+    builder.set_function(?bld, ?m.functions[callee_ix]);
+    val rcb: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rcb)) { ret R.err[u32, str](R.unwrap_err[id.BlockId, str](rcb)); }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](rcb));
+    var acc: value.Value = value.param(0, i64t);
+    var k: u32 = 0;
+    for (k < adds) {
+        val r_add: R.Result[value.Value, str] = builder.emit_add(?bld, acc, value.const_int((k + 1)::u64, i64t));
+        if (R.is_err[value.Value, str](r_add)) { ret R.err[u32, str](R.unwrap_err[value.Value, str](r_add)); }
+        acc = R.unwrap_ok[value.Value, str](r_add);
+        k = k + 1;
+    }
+    val r_ret: R.Result[R.Void, str] = builder.emit_ret(?bld, acc);
+    if (R.is_err[R.Void, str](r_ret)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](r_ret)); }
+
+    var c: u32 = 0;
+    for (c < callers) {
+        val r_caller: R.Result[u32, str] = ir.function_add(m, intern.STR_NIL, sig0, caller_flags[c]);
+        if (R.is_err[u32, str](r_caller)) { ret r_caller; }
+        builder.set_function(?bld, ?m.functions[R.unwrap_ok[u32, str](r_caller)]);
+        val rlb: R.Result[id.BlockId, str] = builder.new_block(?bld);
+        if (R.is_err[id.BlockId, str](rlb)) { ret R.err[u32, str](R.unwrap_err[id.BlockId, str](rlb)); }
+        builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](rlb));
+        var arg: value.Value = value.const_int(7, i64t);
+        val rcall: R.Result[value.Value, str] = builder.emit_call(?bld, value.fn(callee_ix, sig), ?arg, 1, i64t);
+        if (R.is_err[value.Value, str](rcall)) { ret R.err[u32, str](R.unwrap_err[value.Value, str](rcall)); }
+        val rr: R.Result[R.Void, str] = builder.emit_ret(?bld, R.unwrap_ok[value.Value, str](rcall));
+        if (R.is_err[R.Void, str](rr)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](rr)); }
+        c = c + 1;
+    }
+    ret R.ok[u32, str](callee_ix);
+}
+
+fun t_calls_to(fn: *ir.Function, callee_ix: u32) u32 {
+    var calls: u32 = 0;
+    var i: u32 = 0;
+    for (i < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[i];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val oi: O.Option[*instruction.Instruction] = ir.instruction_get(fn, blk.instructions[ii]);
+            if (O.is_some[*instruction.Instruction](oi)) {
+                val ins: *instruction.Instruction = O.unwrap[*instruction.Instruction](oi);
+                if (ins.kind == instruction.OP_CALL && callee_index(ins) == callee_ix) { calls = calls + 1; }
+            }
+            ii = ii + 1;
+        }
+        i = i + 1;
+    }
+    ret calls;
+}
+
+# the size bar is INLINE_INSTR_THRESHOLD live instructions: a two-caller helper one under
+# it loses both calls, one at it keeps both. mutation control: `<` to `<=` in should_inline
+# inlines the 25-instruction body and fails the second half.
+test "mach.lang.me.pass.inline.run:helper_at_the_size_bar_keeps_its_call" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var flags: [2]u32 = [2]u32{ 0, 0 };
+    var adds: u32 = INLINE_INSTR_THRESHOLD - 2;
+    for (adds <= INLINE_INSTR_THRESHOLD - 1) {
+        val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+        if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+        var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+        val built: R.Result[u32, str] = t_fanned_callee(?m, 0, adds, 2, ?flags[0]);
+        if (R.is_err[u32, str](built)) { ir.dnit(?m); ret 2; }
+        val callee_ix: u32 = R.unwrap_ok[u32, str](built);
+        if (body.live_instructions(?m.functions[callee_ix]) != adds + 1) { ir.dnit(?m); ret 3; }
+        val rr: R.Result[bool, str] = run(?m, nil, nil);
+        if (R.is_err[bool, str](rr)) { ir.dnit(?m); ret 4; }
+        val calls: u32 = t_calls_to(?m.functions[callee_ix + 1], callee_ix) + t_calls_to(?m.functions[callee_ix + 2], callee_ix);
+        ir.dnit(?m);
+        var expected: u32 = 2;
+        if (adds + 1 < INLINE_INSTR_THRESHOLD) { expected = 0; }
+        if (calls != expected) { ret 5; }
+        adds = adds + 1;
+    }
+    ret 0;
+}
+
+# an #[oblivious] body is validated for constant time inside its own function; inlining it
+# into a function that is not #[oblivious] would move those instructions out of every
+# validation, so the public caller keeps its call and the oblivious caller loses it.
+# mutation control: dropping the FN_FLAG_OBLIVIOUS line in should_inline inlines both.
+test "mach.lang.me.pass.inline.run:oblivious_callee_inlines_only_into_an_oblivious_caller" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+    var flags: [2]u32 = [2]u32{ 0, ir.FN_FLAG_OBLIVIOUS };
+    val built: R.Result[u32, str] = t_fanned_callee(?m, ir.FN_FLAG_OBLIVIOUS | ir.FN_FLAG_INLINE, 2, 2, ?flags[0]);
+    if (R.is_err[u32, str](built)) { ir.dnit(?m); ret 2; }
+    val callee_ix: u32 = R.unwrap_ok[u32, str](built);
+    val rr: R.Result[bool, str] = run(?m, nil, nil);
+    if (R.is_err[bool, str](rr)) { ir.dnit(?m); ret 3; }
+    val public_calls: u32 = t_calls_to(?m.functions[callee_ix + 1], callee_ix);
+    val oblivious_calls: u32 = t_calls_to(?m.functions[callee_ix + 2], callee_ix);
+    ir.dnit(?m);
+    if (public_calls != 1)    { ret 4; }
+    if (oblivious_calls != 0) { ret 5; }
+    ret 0;
 }
