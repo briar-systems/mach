@@ -1,0 +1,490 @@
+use std.allocator.page;
+use std.format;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+use T: std.allocator.testing;
+
+use mach.lang.intern;
+use mach.lang.layout;
+use mach.lang.publication;
+use mach.lang.target.of;
+
+# the one file layout every object writer sizes and serializes from
+#
+# a plan is an ordered list of regions. a writer places every region it will
+# write, seals the plan, allocates exactly the sealed total, and then writes
+# each region at the offset the plan recorded; nothing after sealing recomputes
+# an offset. placement is checked: an alignment that is zero or not a power of
+# two, an offset or size that overflows, or a result past the format's field
+# width is refused with a message naming the region, before any buffer exists.
+# a region written through a running cursor is closed with `close`, which
+# refuses when the cursor did not land on the region's planned end, so a
+# measure/write pair that drifts apart is a refusal, never a corrupt file.
+
+pub rec FileUnit {
+}
+
+pub rec Region {
+    label:   str;
+    section: of.SectionId;
+    align:   usize;
+    offset:  usize;
+    size:    usize;
+}
+
+pub rec FilePlan {
+    alloc:  *A.Allocator;
+    itn:    *intern.Interner;
+    format: str;
+    rows:   *Region;
+    count:  u32;
+    cap:    u32;
+    end:    usize;
+    limit:  usize;
+    sealed: bool;
+    total:  usize;
+}
+
+pub val NO_ROW: u32 = 0xFFFFFFFF;
+
+pub val LIMIT_32: usize = 0xFFFFFFFF;
+
+pub fun limit_64() usize {
+    ret ~(0::usize);
+}
+
+val ROW_CAP_FIRST: u32 = 16;
+
+fun generic(p: *FilePlan, what: str) str {
+    if (str_contains(what, "alignment")) { ret "object writer: a region's alignment is not a power of two"; }
+    if (str_contains(what, "overflow"))  { ret "object writer: a region's offset overflows the file"; }
+    if (str_contains(what, "width"))     { ret "object writer: a region does not fit the format's field width"; }
+    if (str_contains(what, "cursor"))    { ret "object writer: a region's bytes do not end where the plan placed them"; }
+    ret "object writer: file layout refused";
+}
+
+fun message(p: *FilePlan, what: str, label: str, value: u64, bound: u64) str {
+    val fallback: str = generic(p, what);
+    if (p.itn == nil) { ret fallback; }
+    val rendered: R.Result[str, str] = format.sprint(p.alloc,
+        "{}: the `{}` region {} ({} against {})", p.format, label, what, value, bound);
+    if (R.is_err[str, str](rendered)) { ret fallback; }
+    val text: str = R.unwrap_ok[str, str](rendered);
+    ret publication.intern_message(p.itn, p.alloc, text::*u8, str_len(text), fallback);
+}
+
+pub fun init(alloc: *A.Allocator, itn: *intern.Interner, format: str, limit: usize) R.Result[FilePlan, str] {
+    var p: FilePlan;
+    p.alloc  = alloc;
+    p.itn    = itn;
+    p.format = format;
+    p.rows   = nil;
+    p.count  = 0;
+    p.cap    = 0;
+    p.end    = 0;
+    p.limit  = limit;
+    p.sealed = false;
+    p.total  = 0;
+    if (alloc == nil) { ret R.err[FilePlan, str]("object writer: a file plan needs an allocator"); }
+    val made: R.Result[*Region, str] = A.zallocate[Region](alloc, ROW_CAP_FIRST::usize);
+    if (R.is_err[*Region, str](made)) { ret R.err[FilePlan, str]("object writer: file plan alloc failed"); }
+    p.rows = R.unwrap_ok[*Region, str](made);
+    p.cap  = ROW_CAP_FIRST;
+    ret R.ok[FilePlan, str](p);
+}
+
+pub fun dnit(p: *FilePlan) {
+    if (p.rows != nil) { A.deallocate[Region](p.alloc, p.rows, p.cap::usize); }
+    p.rows  = nil;
+    p.count = 0;
+    p.cap   = 0;
+}
+
+fun grow(p: *FilePlan) R.Result[R.Void, str] {
+    if (p.count < p.cap) { ret R.ok_void[str](); }
+    val doubled: R.Result[usize, layout.CheckCause] = layout.usize_mul(p.cap::usize, 2);
+    if (R.is_err[usize, layout.CheckCause](doubled)) { ret R.err[R.Void, str]("object writer: file plan row count overflows"); }
+    val next_cap: usize = R.unwrap_ok[usize, layout.CheckCause](doubled);
+    val narrowed: R.Result[u32, layout.CheckCause] = layout.usize_to_u32(next_cap);
+    if (R.is_err[u32, layout.CheckCause](narrowed)) { ret R.err[R.Void, str]("object writer: file plan row count overflows"); }
+    val moved: R.Result[*Region, str] = A.reallocate[Region](p.alloc, p.rows, p.cap::usize, next_cap);
+    if (R.is_err[*Region, str](moved)) { ret R.err[R.Void, str]("object writer: file plan alloc failed"); }
+    p.rows = R.unwrap_ok[*Region, str](moved);
+    p.cap  = R.unwrap_ok[u32, layout.CheckCause](narrowed);
+    ret R.ok_void[str]();
+}
+
+fun push(p: *FilePlan, label: str, section: of.SectionId, align: usize, offset: usize, size: usize) R.Result[u32, str] {
+    val grown: R.Result[R.Void, str] = grow(p);
+    if (R.is_err[R.Void, str](grown)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](grown)); }
+    val row: u32 = p.count;
+    p.rows[row].label   = label;
+    p.rows[row].section = section;
+    p.rows[row].align   = align;
+    p.rows[row].offset  = offset;
+    p.rows[row].size    = size;
+    p.count = row + 1;
+    p.end   = offset + size;
+    ret R.ok[u32, str](row);
+}
+
+fun fits(p: *FilePlan, label: str, offset: usize, size: usize) R.Result[usize, str] {
+    val summed: R.Result[usize, layout.CheckCause] = layout.usize_add(offset, size);
+    if (R.is_err[usize, layout.CheckCause](summed)) {
+        ret R.err[usize, str](message(p, "overflows the file offset", label, offset::u64, size::u64));
+    }
+    val end: usize = R.unwrap_ok[usize, layout.CheckCause](summed);
+    if (offset > p.limit || size > p.limit || end > p.limit) {
+        ret R.err[usize, str](message(p, "does not fit the format's field width", label, end::u64, p.limit::u64));
+    }
+    ret R.ok[usize, str](end);
+}
+
+# place a region at the next offset that satisfies `align`
+pub fun place(p: *FilePlan, label: str, section: of.SectionId, align: usize, size: usize) R.Result[u32, str] {
+    if (p.sealed) { ret R.err[u32, str]("object writer: a sealed file plan cannot place a region"); }
+    val checked_align: R.Result[layout.CheckedPowerAlignment[FileUnit], layout.CheckCause] =
+        layout.power_alignment[FileUnit](align);
+    if (R.is_err[layout.CheckedPowerAlignment[FileUnit], layout.CheckCause](checked_align)) {
+        ret R.err[u32, str](message(p, "has an alignment that is not a power of two", label, align::u64, 0));
+    }
+    val general: R.Result[layout.CheckedAlignment[FileUnit], layout.CheckCause] =
+        layout.alignment[FileUnit](align);
+    val aligned: R.Result[layout.CheckedOffset[FileUnit], layout.CheckCause] =
+        layout.align_offset_up[FileUnit](layout.offset[FileUnit](p.end),
+            R.unwrap_ok[layout.CheckedAlignment[FileUnit], layout.CheckCause](general));
+    if (R.is_err[layout.CheckedOffset[FileUnit], layout.CheckCause](aligned)) {
+        ret R.err[u32, str](message(p, "overflows the file offset", label, p.end::u64, align::u64));
+    }
+    val offset: usize = R.unwrap_ok[layout.CheckedOffset[FileUnit], layout.CheckCause](aligned).value;
+    val end: R.Result[usize, str] = fits(p, label, offset, size);
+    if (R.is_err[usize, str](end)) { ret R.err[u32, str](R.unwrap_err[usize, str](end)); }
+    ret push(p, label, section, align, offset, size);
+}
+
+# place a region whose offset is dictated; it must not overlap what came before
+pub fun place_at(p: *FilePlan, label: str, section: of.SectionId, offset: usize, size: usize) R.Result[u32, str] {
+    if (p.sealed) { ret R.err[u32, str]("object writer: a sealed file plan cannot place a region"); }
+    if (offset < p.end) {
+        ret R.err[u32, str](message(p, "starts before the regions placed ahead of it end", label, offset::u64, p.end::u64));
+    }
+    val end: R.Result[usize, str] = fits(p, label, offset, size);
+    if (R.is_err[usize, str](end)) { ret R.err[u32, str](R.unwrap_err[usize, str](end)); }
+    ret push(p, label, section, 1, offset, size);
+}
+
+# advance the cursor to `align` without placing a region; the gap is padding
+pub fun pad(p: *FilePlan, label: str, align: usize) R.Result[R.Void, str] {
+    if (p.sealed) { ret R.err[R.Void, str]("object writer: a sealed file plan cannot pad"); }
+    val placed: R.Result[u32, str] = place(p, label, of.no_section(), align, 0);
+    if (R.is_err[u32, str](placed)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](placed)); }
+    p.count = p.count - 1;
+    ret R.ok_void[str]();
+}
+
+pub fun seal(p: *FilePlan) R.Result[usize, str] {
+    if (p.sealed) { ret R.err[usize, str]("object writer: a file plan is sealed once"); }
+    p.sealed = true;
+    p.total  = p.end;
+    ret R.ok[usize, str](p.total);
+}
+
+pub fun total(p: *FilePlan) usize {
+    ret p.total;
+}
+
+pub fun row_count(p: *FilePlan) u32 {
+    ret p.count;
+}
+
+pub fun offset(p: *FilePlan, row: u32) usize {
+    ret p.rows[row].offset;
+}
+
+pub fun size(p: *FilePlan, row: u32) usize {
+    ret p.rows[row].size;
+}
+
+pub fun end(p: *FilePlan, row: u32) usize {
+    ret p.rows[row].offset + p.rows[row].size;
+}
+
+pub fun label(p: *FilePlan, row: u32) str {
+    ret p.rows[row].label;
+}
+
+pub fun section(p: *FilePlan, row: u32) of.SectionId {
+    ret p.rows[row].section;
+}
+
+# a region written through a cursor must end exactly where it was planned
+pub fun close(p: *FilePlan, row: u32, cursor: usize) R.Result[R.Void, str] {
+    val planned: usize = end(p, row);
+    if (cursor != planned) {
+        ret R.err[R.Void, str](message(p, "wrote to a cursor that is not the planned end", p.rows[row].label, cursor::u64, planned::u64));
+    }
+    ret R.ok_void[str]();
+}
+
+# a region filled by a writer that reports the bytes it produced
+pub fun close_size(p: *FilePlan, row: u32, written: usize) R.Result[R.Void, str] {
+    if (written != p.rows[row].size) {
+        ret R.err[R.Void, str](message(p, "wrote a length that is not the planned size", p.rows[row].label, written::u64, p.rows[row].size::u64));
+    }
+    ret R.ok_void[str]();
+}
+
+pub fun field_u32(p: *FilePlan, value: usize, what: str) R.Result[u32, str] {
+    val narrowed: R.Result[u32, layout.CheckCause] = layout.usize_to_u32(value);
+    if (R.is_err[u32, layout.CheckCause](narrowed)) {
+        ret R.err[u32, str](message(p, "does not fit a 32-bit field width", what, value::u64, LIMIT_32::u64));
+    }
+    ret R.ok[u32, str](R.unwrap_ok[u32, layout.CheckCause](narrowed));
+}
+
+pub fun field_u16(p: *FilePlan, value: usize, what: str) R.Result[u16, str] {
+    val narrowed: R.Result[u16, layout.CheckCause] = layout.usize_to_u16(value);
+    if (R.is_err[u16, layout.CheckCause](narrowed)) {
+        ret R.err[u16, str](message(p, "does not fit a 16-bit field width", what, value::u64, 0xFFFF));
+    }
+    ret R.ok[u16, str](R.unwrap_ok[u16, layout.CheckCause](narrowed));
+}
+
+pub fun field_u8(p: *FilePlan, value: usize, what: str) R.Result[u8, str] {
+    val narrowed: R.Result[u8, layout.CheckCause] = layout.usize_to_u8(value);
+    if (R.is_err[u8, layout.CheckCause](narrowed)) {
+        ret R.err[u8, str](message(p, "does not fit an 8-bit field width", what, value::u64, 0xFF));
+    }
+    ret R.ok[u8, str](R.unwrap_ok[u8, layout.CheckCause](narrowed));
+}
+
+pub fun field_u64_u32(p: *FilePlan, value: u64, what: str) R.Result[u32, str] {
+    val narrowed: R.Result[u32, layout.CheckCause] = layout.u64_to_u32(value);
+    if (R.is_err[u32, layout.CheckCause](narrowed)) {
+        ret R.err[u32, str](message(p, "does not fit a 32-bit field width", what, value, LIMIT_32::u64));
+    }
+    ret R.ok[u32, str](R.unwrap_ok[u32, layout.CheckCause](narrowed));
+}
+
+# a checked address: `base + (file offset - file base)`, the mapped twin of a row
+pub fun address(p: *FilePlan, row: u32, file_base: usize, address_base: u64) R.Result[u64, str] {
+    val off: usize = p.rows[row].offset;
+    if (off < file_base) {
+        ret R.err[u64, str](message(p, "is mapped before its address base", p.rows[row].label, off::u64, file_base::u64));
+    }
+    val delta: u64 = (off - file_base)::u64;
+    if (delta > ~(0::u64) - address_base) {
+        ret R.err[u64, str](message(p, "overflows its virtual address", p.rows[row].label, delta, address_base));
+    }
+    ret R.ok[u64, str](address_base + delta);
+}
+
+# a checked count-times-size product for a table region
+pub fun table(p: *FilePlan, label: str, count: usize, entry: usize) R.Result[usize, str] {
+    val product: R.Result[usize, layout.CheckCause] = layout.usize_mul(count, entry);
+    if (R.is_err[usize, layout.CheckCause](product)) {
+        ret R.err[usize, str](message(p, "overflows the file offset", label, count::u64, entry::u64));
+    }
+    ret R.ok[usize, str](R.unwrap_ok[usize, layout.CheckCause](product));
+}
+
+# a checked sum for a size accumulated before placement
+pub fun sum(p: *FilePlan, label: str, left: usize, right: usize) R.Result[usize, str] {
+    val added: R.Result[usize, layout.CheckCause] = layout.usize_add(left, right);
+    if (R.is_err[usize, layout.CheckCause](added)) {
+        ret R.err[usize, str](message(p, "overflows the file offset", label, left::u64, right::u64));
+    }
+    ret R.ok[usize, str](R.unwrap_ok[usize, layout.CheckCause](added));
+}
+
+# a checked u32 count that a format field carries
+pub fun count_u32(p: *FilePlan, label: str, left: u32, right: u32) R.Result[u32, str] {
+    if (right > 0xFFFFFFFF - left) {
+        ret R.err[u32, str](message(p, "overflows a 32-bit count", label, left::u64, right::u64));
+    }
+    ret R.ok[u32, str](left + right);
+}
+
+# an aligned address in a mapped space, the address-side twin of `place`
+pub fun align_address(p: *FilePlan, label: str, value: u64, align: u64) R.Result[u64, str] {
+    if (align == 0 || (align & (align - 1)) != 0) {
+        ret R.err[u64, str](message(p, "has an alignment that is not a power of two", label, align, 0));
+    }
+    val remainder: u64 = value % align;
+    if (remainder == 0) { ret R.ok[u64, str](value); }
+    val pad_by: u64 = align - remainder;
+    if (pad_by > ~(0::u64) - value) {
+        ret R.err[u64, str](message(p, "overflows its virtual address", label, value, align));
+    }
+    ret R.ok[u64, str](value + pad_by);
+}
+
+test "mach.lang.target.of.plan.place:aligns_and_records_rows_in_order" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val made: R.Result[FilePlan, str] = init(?alloc, nil, "test", limit_64());
+    if (R.is_err[FilePlan, str](made)) { ret 1; }
+    var p: FilePlan = R.unwrap_ok[FilePlan, str](made);
+    fin { dnit(?p); }
+
+    val h: R.Result[u32, str] = place(?p, "header", of.no_section(), 1, 64);
+    if (R.is_err[u32, str](h)) { ret 2; }
+    val a: R.Result[u32, str] = place(?p, "a", of.section_id(0), 16, 17);
+    if (R.is_err[u32, str](a)) { ret 3; }
+    val b: R.Result[u32, str] = place(?p, "b", of.section_id(1), 8, 3);
+    if (R.is_err[u32, str](b)) { ret 4; }
+    if (offset(?p, R.unwrap_ok[u32, str](h)) != 0)  { ret 5; }
+    if (offset(?p, R.unwrap_ok[u32, str](a)) != 64) { ret 6; }
+    if (offset(?p, R.unwrap_ok[u32, str](b)) != 88) { ret 7; }
+    if (end(?p, R.unwrap_ok[u32, str](b)) != 91)    { ret 8; }
+    if (of.section_index(section(?p, R.unwrap_ok[u32, str](b))) != 1) { ret 9; }
+    val sealed: R.Result[usize, str] = seal(?p);
+    if (R.is_err[usize, str](sealed)) { ret 10; }
+    if (R.unwrap_ok[usize, str](sealed) != 91) { ret 11; }
+    if (R.is_ok[u32, str](place(?p, "late", of.no_section(), 1, 1))) { ret 12; }
+    ret 0;
+}
+
+test "mach.lang.target.of.plan.place:refuses_non_power_of_two_and_zero_alignment" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    val made: R.Result[FilePlan, str] = init(?alloc, ?itn, "test", limit_64());
+    if (R.is_err[FilePlan, str](made)) { ret 1; }
+    var p: FilePlan = R.unwrap_ok[FilePlan, str](made);
+    fin { dnit(?p); }
+    val three: R.Result[u32, str] = place(?p, "odd", of.no_section(), 3, 8);
+    if (R.is_ok[u32, str](three)) { ret 2; }
+    if (!str_contains(R.unwrap_err[u32, str](three), "`odd`")) { ret 3; }
+    if (!str_contains(R.unwrap_err[u32, str](three), "not a power of two")) { ret 4; }
+    if (R.is_ok[u32, str](place(?p, "zero", of.no_section(), 0, 8))) { ret 5; }
+    if (row_count(?p) != 0) { ret 6; }
+    if (p.end != 0) { ret 7; }
+    ret 0;
+}
+
+test "mach.lang.target.of.plan.place:refuses_offset_overflow_before_any_row_exists" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val made: R.Result[FilePlan, str] = init(?alloc, nil, "test", limit_64());
+    if (R.is_err[FilePlan, str](made)) { ret 1; }
+    var p: FilePlan = R.unwrap_ok[FilePlan, str](made);
+    fin { dnit(?p); }
+    val big: usize = ~(0::usize) - 8;
+    val first: R.Result[u32, str] = place(?p, "first", of.no_section(), 1, big);
+    if (R.is_err[u32, str](first)) { ret 2; }
+    val second: R.Result[u32, str] = place(?p, "second", of.no_section(), 16, 1);
+    if (R.is_ok[u32, str](second)) { ret 3; }
+    if (!str_contains(R.unwrap_err[u32, str](second), "overflows")) { ret 4; }
+    val third: R.Result[u32, str] = place(?p, "third", of.no_section(), 1, 16);
+    if (R.is_ok[u32, str](third)) { ret 5; }
+    if (row_count(?p) != 1) { ret 6; }
+    ret 0;
+}
+
+test "mach.lang.target.of.plan.place:refuses_a_region_past_the_field_width" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val made: R.Result[FilePlan, str] = init(?alloc, nil, "test", LIMIT_32);
+    if (R.is_err[FilePlan, str](made)) { ret 1; }
+    var p: FilePlan = R.unwrap_ok[FilePlan, str](made);
+    fin { dnit(?p); }
+    val a: R.Result[u32, str] = place(?p, "a", of.section_id(0), 1, 0xFFFFFFF0);
+    if (R.is_err[u32, str](a)) { ret 2; }
+    val b: R.Result[u32, str] = place(?p, "b", of.section_id(1), 1, 0x10);
+    if (R.is_ok[u32, str](b)) { ret 3; }
+    if (!str_contains(R.unwrap_err[u32, str](b), "field width")) { ret 4; }
+    ret 0;
+}
+
+test "mach.lang.target.of.plan.place_at:refuses_overlap" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val made: R.Result[FilePlan, str] = init(?alloc, nil, "test", limit_64());
+    if (R.is_err[FilePlan, str](made)) { ret 1; }
+    var p: FilePlan = R.unwrap_ok[FilePlan, str](made);
+    fin { dnit(?p); }
+    if (R.is_err[u32, str](place(?p, "a", of.no_section(), 1, 100))) { ret 2; }
+    if (R.is_ok[u32, str](place_at(?p, "b", of.no_section(), 99, 1))) { ret 3; }
+    val c: R.Result[u32, str] = place_at(?p, "c", of.no_section(), 4096, 1);
+    if (R.is_err[u32, str](c)) { ret 4; }
+    if (offset(?p, R.unwrap_ok[u32, str](c)) != 4096) { ret 5; }
+    ret 0;
+}
+
+test "mach.lang.target.of.plan.close:refuses_a_cursor_off_the_planned_end" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val made: R.Result[FilePlan, str] = init(?alloc, nil, "test", limit_64());
+    if (R.is_err[FilePlan, str](made)) { ret 1; }
+    var p: FilePlan = R.unwrap_ok[FilePlan, str](made);
+    fin { dnit(?p); }
+    val a: R.Result[u32, str] = place(?p, "strings", of.no_section(), 1, 10);
+    if (R.is_err[u32, str](a)) { ret 2; }
+    val row: u32 = R.unwrap_ok[u32, str](a);
+    if (R.is_err[R.Void, str](close(?p, row, 10))) { ret 3; }
+    if (R.is_ok[R.Void, str](close(?p, row, 9)))   { ret 4; }
+    if (R.is_ok[R.Void, str](close(?p, row, 11)))  { ret 5; }
+    if (R.is_err[R.Void, str](close_size(?p, row, 10))) { ret 6; }
+    if (R.is_ok[R.Void, str](close_size(?p, row, 0)))   { ret 7; }
+    ret 0;
+}
+
+test "mach.lang.target.of.plan.field:refuses_narrowing" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val made: R.Result[FilePlan, str] = init(?alloc, nil, "test", limit_64());
+    if (R.is_err[FilePlan, str](made)) { ret 1; }
+    var p: FilePlan = R.unwrap_ok[FilePlan, str](made);
+    fin { dnit(?p); }
+    if (R.is_err[u32, str](field_u32(?p, 0xFFFFFFFF, "x"))) { ret 2; }
+    if (R.is_ok[u32, str](field_u32(?p, 0x100000000, "x"))) { ret 3; }
+    if (R.is_err[u16, str](field_u16(?p, 0xFFFF, "x")))     { ret 4; }
+    if (R.is_ok[u16, str](field_u16(?p, 0x10000, "x")))     { ret 5; }
+    if (R.is_err[u8, str](field_u8(?p, 0xFF, "x")))         { ret 6; }
+    if (R.is_ok[u8, str](field_u8(?p, 0x100, "x")))         { ret 7; }
+    if (R.is_ok[u32, str](field_u64_u32(?p, 0x100000000, "x"))) { ret 8; }
+    if (R.is_ok[usize, str](table(?p, "t", ~(0::usize), 2))) { ret 9; }
+    if (R.is_ok[usize, str](sum(?p, "s", ~(0::usize), 1)))   { ret 10; }
+    if (R.is_ok[u32, str](count_u32(?p, "c", 0xFFFFFFFF, 1))) { ret 11; }
+    if (R.is_ok[u64, str](align_address(?p, "va", ~(0::u64) - 1, 4096))) { ret 12; }
+    if (R.is_ok[u64, str](align_address(?p, "va", 0, 3))) { ret 13; }
+    val va: R.Result[u64, str] = align_address(?p, "va", 4097, 4096);
+    if (R.is_err[u64, str](va) || R.unwrap_ok[u64, str](va) != 8192) { ret 14; }
+    ret 0;
+}
+
+test "mach.lang.target.of.plan.init:allocation_refusal_is_a_typed_error" {
+    var failing: T.Testing;
+    if (O.is_some[str](T.make(?failing))) { ret 1; }
+    T.fail_at_ordinal(?failing, 1);
+    val made: R.Result[FilePlan, str] = init(T.allocator_of(?failing), nil, "test", limit_64());
+    if (R.is_ok[FilePlan, str](made)) { ret 1; }
+    if (!str_contains(R.unwrap_err[FilePlan, str](made), "alloc failed")) { ret 2; }
+
+    T.clear_failure(?failing);
+    val ok: R.Result[FilePlan, str] = init(T.allocator_of(?failing), nil, "test", limit_64());
+    if (R.is_err[FilePlan, str](ok)) { ret 3; }
+    var p: FilePlan = R.unwrap_ok[FilePlan, str](ok);
+    var i: u32 = 0;
+    for (i < ROW_CAP_FIRST) {
+        if (R.is_err[u32, str](place(?p, "row", of.no_section(), 1, 1))) { dnit(?p); ret 4; }
+        i = i + 1;
+    }
+    T.fail_at_ordinal(?failing, T.attempt_count(?failing) + 1);
+    val grown: R.Result[u32, str] = place(?p, "row", of.no_section(), 1, 1);
+    if (R.is_ok[u32, str](grown)) { dnit(?p); ret 5; }
+    if (row_count(?p) != ROW_CAP_FIRST) { dnit(?p); ret 6; }
+    dnit(?p);
+    if (T.leaked(?failing)) { ret 7; }
+    ret 0;
+}
