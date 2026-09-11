@@ -115,12 +115,12 @@ a silently-typed binding.
 
 ### Where a layout intrinsic is constant
 
-`$size_of`, `$length_of` and `$align_of` fold in every **type** position, including ones resolved
+`$size_of`, `$length_of`, `$align_of` and `$offset_of` fold in every **type** position, including ones resolved
 before layout would otherwise be known — the measured type's layout is established
 on demand when the measurement asks for it, so where the type is *declared* relative
 to where it is measured makes no difference:
 
-| position | `$size_of` / `$length_of` / `$align_of` |
+| position | `$size_of` / `$length_of` / `$align_of` / `$offset_of` |
 |---|---|
 | `val` / `var` initializer | yes |
 | global `align` | yes |
@@ -138,9 +138,9 @@ rec Over { x: u8; }
 rec Holder { buf: [$size_of(Pair)]u8; }   # an array length, inside a field type
 ```
 
-At base commit `fc5c9e7e`, `$offset_of` folds in a value position but not a
-type position. The accepted v5 complete-type rule described above removes this
-implementation restriction.
+`$offset_of` and a descriptor's `.offset` answer from the same checked layout that
+sizes the type, under the same complete-type rules as `$size_of`. A layout the
+walk cannot determine is reported, never guessed.
 
 A `$if` / `$or` condition is not a type position, so what it can measure depends on
 when the gate is decided. A gate in a function body, and a gate in declaration scope
@@ -512,10 +512,8 @@ fun cross(p: Pair, q: Pair) i64 {
 
 ## Tag reflection: `$cases` and `$discriminant_of`
 
-Accepted v5 contract. The intrinsics described here reflect the accepted Mach v5
-tagged value design in [the accepted contract](../design/tagged-values.md). At
-base commit `fc5c9e7e`, `$is_tag` is implemented, while `$cases`, descriptor
-projections, `$discriminant_of`, and runtime tag lowering remain unfinished.
+The intrinsics described here implement the accepted Mach v5 tagged value design
+in [the accepted contract](../design/tagged-values.md).
 
 `$cases(T)` produces a comptime sequence of owner-qualified case descriptors for
 a tag type `T`, in declaration order:
@@ -527,17 +525,19 @@ $cases(T)               # comptime case descriptor sequence for tag T
 `$cases(T)` is consumed by `$each case in $cases(T)`. Each case descriptor provides
 five readable properties:
 
-| Property           | Type     | Value                                                   |
-|--------------------|----------|---------------------------------------------------------|
-| `case.name`        | `*u8`    | case name as a NUL-terminated string                    |
-| `case.has_payload` | bool     | comptime predicate indicating whether a payload exists  |
-| `case.type`        | type val | comptime type value of the payload                      |
-| `case.offset`      | u64      | byte offset of the payload in `T`'s layout              |
-| `case.code`        | u64      | declaration ordinal case code                           |
+| Property           | Type      | Value                                                        |
+|--------------------|-----------|--------------------------------------------------------------|
+| `case.name`        | `*u8`     | case name as a NUL-terminated string                         |
+| `case.has_payload` | predicate | comptime predicate, valid only as a `$if` gate condition     |
+| `case.type`        | type val  | comptime type value of the payload                           |
+| `case.offset`      | `u64`     | byte offset of the payload in `T`'s layout                   |
+| `case.code`        | `u64`     | declaration ordinal case code, the stored discriminator value |
 
 Accessing `case.type` or `case.offset` on a descriptor whose `has_payload` is false
-is a compile error. `case.type` preserves all declared payload qualifiers.
-`$is_tag(^T)` is false, and `$cases(^T)` is rejected.
+is a compile error; gate on `case.has_payload` first. `case.type` preserves all
+declared payload qualifiers, and over a generic instantiation it names the
+specialized payload type. `$is_tag(^T)` is false, and `$cases(^T)` is rejected.
+`$fields` refuses a tag and `$cases` refuses a record.
 
 Inside the loop body, `sel value.[case]` is the case test and `value.[case]` is
 the guarded payload place:
@@ -552,10 +552,12 @@ $each case in $cases(T) {
 }
 ```
 
-Tags reconstruct through the same single-case literal rule after specialization,
-using `T{[case]: payload}` for payload cases or `T{[case]}` for payloadless cases.
+`sel value.[case]` opens the same guards as `sel value.case`, so `value.[case]`
+is readable, writable and addressable exactly where the named place would be.
+Tags construct through the same single-case literal rule after specialization:
+`T.[case]{payload}` for a payload case and `T.[case]{}` for a payloadless one.
 A descriptor from another nominal type or another generic instantiation is
-rejected.
+rejected wherever it is used: in `sel`, in a projection and in a literal head.
 
 `$discriminant_of(T)` produces the actual unsigned integer type used to store
 the discriminator (`u8`, `u16`, `u32`, or `u64`). It may inspect outer-secret
@@ -564,8 +566,9 @@ the active case. Conversely, `$cases(^T)` is refused, matching current shape que
 conventions.
 
 `$offset_of(T, payload_case)` reuses the layout intrinsic to report the common
-payload offset. Like `$size_of` and `$align_of`, layout answers for tags come
-from the checked target layout.
+payload offset; naming a payloadless case is an error. Like `$size_of` and
+`$align_of`, layout answers for tags come from the checked target layout and are
+available during type checking.
 
 ## `$each` — compile-time unroll
 
