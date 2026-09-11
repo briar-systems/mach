@@ -610,3 +610,17 @@ frame direction: frame larger 8, frame same 5, frame smaller 64, no frame adjust
 | vec/vec_u64x2 | 980 | 400 | 44 | 23 | calls removed |
 | vec/vec_u8x16 | 2119 | 1199 | 42 | 25 | calls removed |
 
+## vec/vec_cmp_i64, added by #3271 after the tables above
+
+The case arrived on `dev` with its own goldens on every target while this lane
+was open. Merging it and re-running layer B with the merged compiler moved
+exactly that golden on each ISA and nothing else (367 pass, 1 fail, 0 skip
+per target before the bless); every previously blessed golden kept its
+content. Same classification as the rest of the corpus: the fold sites lose
+their calls.
+
+| target | lines removed | lines added | calls before | calls after | frame | class |
+| --- | --- | --- | --- | --- | --- | --- |
+| x86_64-linux | 433 | 297 | 33 | 13 | same | calls removed |
+| aarch64-linux | 269 | 164 | 33 | 13 | larger | calls removed |
+| riscv64-linux | 690 | 679 | 33 | 13 | smaller | calls removed |
