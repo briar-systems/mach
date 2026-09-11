@@ -118,8 +118,9 @@ every shape, because no tag ever reaches a float register on RISC-V.
   (the type itself, an element, a field or a case payload), call arguments,
   returned values and parameters carry it, aggregate homes are never seeded
   secret, and the transport paths run with the object's secrecy so every
-  carrier, caller copy and temporary between them is secret, with secret
-  content reaching a physical register through a vreg that declares it. The
+  carrier, caller copy and temporary between them is secret: the vreg each
+  piece already loads through before its register now takes the object's
+  secrecy instead of the public default. The
   discriminator load stays public because loads take their secrecy from the
   loaded type, which is what lets `sel` on a secret-payload tag branch in an
   oblivious function while a branch on the payload itself is still refused.
