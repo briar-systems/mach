@@ -9,9 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Bracket interpretation of an imported name follows the imported declaration's
+  own kind. An imported value keeps its subscript reading, and the resolver's
+  choice tracks a dependency change without rewriting the parse tree (#3121).
+
 - Name resolution reports one phase row per build. A deferred comptime gate no
   longer makes the resolver report every module again for each pass it takes,
   and each module's resolve time is accumulated across those passes (#3231).
+
+- Constant expressions evaluate nested scalar casts and preserve integer widths and
+  signedness. A failed global initializer now rejects the compilation instead of
+  publishing a zero value or a successful cached lowering product (#3122).
+
+- Integer vector `/` is supported end to end. Each lane follows scalar division,
+  signedness is preserved, secret operands are rejected, and targets without a
+  packed integer divide scalarize the operation (#3122).
 
 - Test listing stops after collecting tests. It no longer generates or links
   machine code, and it produces no test executable (#3230).
