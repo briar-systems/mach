@@ -10,9 +10,9 @@ base 872e1c6f), whose base moved when dev was merged through PR #3273.
 
 | | |
 | --- | --- |
-| branch | `feat/3218-l10`, the L10 lane on top of `feat/3218` at `8832b8b87` (dev fully merged through PR #3273) |
-| measured tree | commit `b89a6ab46` (`fba341086`, the corpus and doc commits of this lane, merged with origin/feat/3218 at `c14511dcd`, whose only delta is the link-leg case `3263-record-abi-c-callee`; the link leg was re-run on `b89a6ab46` and every other bar was taken on `fba341086`, whose compiler sources, tests, corpus and goldens are byte-identical to `b89a6ab46`'s) |
-| lane head | `the commit on top of `b89a6ab46` that carries this document and `l10-acceptance-3218.md` (the tip of `feat/3218-l10`; no measured input differs between the two)` (the measured tree plus this document and `l10-acceptance-3218.md`) |
+| branch | `feat/3218` (PR #3236), with dev fully merged through PR #3276 (N5 phase 1) |
+| measured tree | commit `860b121f8` (the L10 lane `feat/3218-l10` merged into `feat/3218`; every bar below was taken on this commit by the coordinator, in one worktree, after the merge) |
+| pinned head | the commit on top of `860b121f8` that carries this document, which is what #3236 merges into `dev`; no compiler source, test, corpus case or golden differs between the two |
 | std pin | `168a9f760d7c0f7a182f3b0685081e62f1a4f682` at `dep/std` (the old pin, std 1.0.1; the std 2.0.0 migration is S1's) |
 | seed that built it | Mach 4.30.0 at `/home/octalide/.local/bin/mach`, sha256 `29b9264cfd5477419a190a8d6649e9ae8302744d935991ac8ffc47f2b4c26535` |
 | host | linux x86_64 natively; aarch64 and riscv64 under qemu-user (qemu-riscv64 11.1.0); cc 16.2.1; llvm-objdump 22.1.8; SPIRV-Tools 2026.3 (`test/tools.lock`) |
@@ -26,9 +26,9 @@ compiler's source with the new lexer.
 
 | generation | built by | command | sha256 |
 | --- | --- | --- | --- |
-| A | the 4.30.0 seed | `mach build . -o out/audit/mach` | `70dd51d489b078828032076d844d7fce689b8c2fef426d038f5af1b36447e203` |
-| B | A | `out/audit/mach build . -o out/audit/mach-b` | `d70175efc75ee7342552ebe72d1219e7d3e04522519871f8ea6d0f05d5ed3cfa` |
-| C | B | `out/audit/mach-b build . -o out/audit/mach-c` | `d70175efc75ee7342552ebe72d1219e7d3e04522519871f8ea6d0f05d5ed3cfa` |
+| A | the 4.30.0 seed | `mach build . -o out/audit/mach` | `a881f3c288cadee62d3ffd302af46ca5f8f0d41216ce183a9d26e8b0ada130eb` |
+| B | A | `out/audit/mach build . -o out/audit/mach-b` | `b1fe8a8747120bebae334fbb6dc196342bd77875c0667901983b9e0b0b6a13cd` |
+| C | B | `out/audit/mach-b build . -o out/audit/mach-c` | `b1fe8a8747120bebae334fbb6dc196342bd77875c0667901983b9e0b0b6a13cd` |
 
 `cmp out/audit/mach-b out/audit/mach-c`: byte-identical. A differs from B
 because the seed's code generation differs from this tree's; the invariant is
@@ -38,17 +38,20 @@ release-profile compiler used for the second suite run is
 
 ## What the acceptance proved
 
-Numbers as measured with generation A on the measured tree, in one process
-(the runs are the ones `l10-acceptance-3218.md` section 6 records).
+Numbers as measured on the measured tree with generation B (the fixpoint
+compiler) for the corpus, link, vecrows and debug suite, and the release build
+of generation A for the release suite. The L10 lane's own run at its lane head
+(`l10-acceptance-3218.md` section 6) agrees on every corpus, link and vecrows
+count; the suite grew by N5's five tests between the two.
 
 | check | result |
 | --- | --- |
-| unit suite, debug from-source compiler (`out/audit/mach test . --jobs 8`) | 2911 passed, 0 failed, 2911 total (unchanged from the feat/3218 base: this lane adds no suite test) |
-| unit suite, release from-source compiler (`out/audit/mach-release test . --jobs 8`) | 2911 passed, 0 failed, 2911 total (agrees with the debug build) |
+| unit suite, debug from-source compiler (generation B, `out/b/mach test .`) | 2916 passed, 0 failed, 2916 total (2911 at the L10 lane head plus the five N5 phase 1 tests merged from dev) |
+| unit suite, release from-source compiler (`out/a/mach build . --profile release -o out/rel/mach`, then `out/rel/mach test .`) | 2916 passed, 0 failed, 2916 total (agrees with the debug build) |
 | `sh test/census.sh` | every census ok |
 | corpus layers A and B, nine columns | 2625 pass, 0 fail, 623 skip over the nine columns (per-column counts in `migration-compiler-3218.md`); every skip is a declared SKIPS entry or a verified `g` refusal |
 | corpus layer C, x86_64-linux (native) and riscv64-linux (qemu) | 408 pass, 0 fail, 0 skip (102 cases, o0 and o2 on each of the two executing columns, every checksum equal to the C reference) |
-| link leg, x86_64-linux (`MACH_LINK_MACH=out/audit/mach bash test/link/run.sh --leg x86_64-linux`) | 140 pass / 0 fail / 0 skip over 140 cells (debug and release) |
+| link leg, x86_64-linux (`MACH_LINK_MACH=out/b/mach bash test/link/run.sh --leg x86_64-linux`) | 140 pass / 0 fail / 0 skip over 140 cells (debug and release) |
 | link leg, riscv64-linux | not run on this host (no riscv64 libc headers); CI runs it |
 | vecrows, x86_64-linux | ok, 184 probe cells, 0 declared exceptions |
 
@@ -76,8 +79,8 @@ moved.
 
 ```sh
 cd /abs/path/to/mach || exit 1
-git fetch -q origin feat/3218-l10
-git checkout -q the commit on top of `b89a6ab46` that carries this document and `l10-acceptance-3218.md` (the tip of `feat/3218-l10`; no measured input differs between the two)
+git fetch -q origin feat/3218
+git checkout -q 860b121f8
 rm -rf dep/std && git clone -q https://github.com/briar-systems/mach-std dep/std \
     && git -C dep/std checkout -q 168a9f760d7c0f7a182f3b0685081e62f1a4f682
 sha256sum "$(command -v mach)"          # 29b9264c... (Mach 4.30.0)
