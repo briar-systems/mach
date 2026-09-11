@@ -34,8 +34,21 @@ pub fun charge(b: *Budget, instructions: u32, bytes: usize) bool {
 
 fun candidate(fn: *ir.Function) bool {
     if ((fn.flags & (ir.FN_FLAG_EXTERN | ir.FN_FLAG_NOINLINE | ir.FN_FLAG_SCALAR | ir.FN_FLAG_NAKED)) != 0) { ret false; }
-    if (fn.block_count == 0 || fn.instr_len > MAX_INSTRUCTIONS) { ret false; }
-    ret (fn.flags & ir.FN_FLAG_INLINE) != 0 || live_instructions(fn) < SMALL_INSTRUCTIONS;
+    val live: u32 = live_instructions(fn);
+    if (fn.block_count == 0 || live > MAX_INSTRUCTIONS) { ret false; }
+    ret (fn.flags & ir.FN_FLAG_INLINE) != 0 || live < SMALL_INSTRUCTIONS;
+}
+
+# what a body costs is a fact about the program, never about its debug annotation:
+# `-g` must not move an inlining decision (#1944), so a dbg_value instruction and the
+# debug variable and expression tables are not part of the body, and neither is a dead
+# arena slot. this is the one reading of "counted" every cost below shares.
+fun counted(fn: *ir.Function, iid: id.InstructionId) *instruction.Instruction {
+    val ins: O.Option[*instruction.Instruction] = ir.instruction_get(fn, iid);
+    if (O.is_none[*instruction.Instruction](ins)) { ret nil; }
+    val p: *instruction.Instruction = O.unwrap[*instruction.Instruction](ins);
+    if (p.kind == instruction.OP_DBG_VALUE) { ret nil; }
+    ret p;
 }
 
 pub fun live_instructions(fn: *ir.Function) u32 {
@@ -43,14 +56,17 @@ pub fun live_instructions(fn: *ir.Function) u32 {
     var i: u32 = 0;
     for (i < fn.block_count) {
         val block: *ir.Block = ?fn.blocks[i];
-        count = count + block.phi_count;
         var j: u32 = 0;
-        for (j < block.instr_count) {
-            val ins: O.Option[*instruction.Instruction] = ir.instruction_get(fn, block.instructions[j]);
-            if (O.is_some[*instruction.Instruction](ins) && O.unwrap[*instruction.Instruction](ins).kind != instruction.OP_DBG_VALUE) { count = count + 1; }
+        for (j < block.phi_count) {
+            if (counted(fn, block.phis[j]) != nil) { count = count + 1; }
             j = j + 1;
         }
-        if (block.terminator != id.INSTR_NIL) { count = count + 1; }
+        j = 0;
+        for (j < block.instr_count) {
+            if (counted(fn, block.instructions[j]) != nil) { count = count + 1; }
+            j = j + 1;
+        }
+        if (counted(fn, block.terminator) != nil) { count = count + 1; }
         i = i + 1;
     }
     ret count;
@@ -435,18 +451,24 @@ fun mark_type(c: *Copy, seen: *bool, ty: type.IrTypeId) bool {
     ret true;
 }
 
+fun constant_bytes(v: *value.Value, bytes: *usize) bool {
+    if (v.kind == value.VAL_CONST_BYTES) {
+        ret add_bytes(bytes, v.data.bytes.len::usize);
+    } or (v.kind == value.VAL_CONST_AGG) {
+        ret add_bytes(bytes, v.data.agg.len::usize) && add_bytes(bytes, v.data.agg.reloc_count::usize * $size_of(value.AggReloc));
+    }
+    ret true;
+}
+
 fun value_cost(c: *Copy, seen: *bool, v: *value.Value, bytes: *usize) bool {
-    if (!mark_type(c, seen, v.ty)) { ret false; }
+    if (!mark_type(c, seen, v.ty) || !constant_bytes(v, bytes)) { ret false; }
     if (v.kind == value.VAL_GLOBAL) {
         if (v.data.global_ix >= c.src.global_len || c.src.globals[v.data.global_ix].is_local) { ret false; }
         if (!mark_type(c, seen, c.src.globals[v.data.global_ix].ty) || !add_bytes(bytes, $size_of(ir.Global))) { ret false; }
     } or (v.kind == value.VAL_FN) {
         if (v.data.fn_ix >= c.src.function_len) { ret false; }
         if (!mark_type(c, seen, c.src.functions[v.data.fn_ix].sig) || !add_bytes(bytes, $size_of(ir.Function))) { ret false; }
-    } or (v.kind == value.VAL_CONST_BYTES) {
-        if (!add_bytes(bytes, v.data.bytes.len::usize)) { ret false; }
     } or (v.kind == value.VAL_CONST_AGG) {
-        if (!add_bytes(bytes, v.data.agg.len::usize) || !add_bytes(bytes, v.data.agg.reloc_count::usize * $size_of(value.AggReloc))) { ret false; }
         var i: u32 = 0;
         for (i < v.data.agg.reloc_count) {
             val r: *value.AggReloc = ?v.data.agg.relocs[i];
@@ -463,6 +485,65 @@ fun value_cost(c: *Copy, seen: *bool, v: *value.Value, bytes: *usize) bool {
     ret true;
 }
 
+# instruction_cost: one counted instruction's share of the body: its arena slot, its
+# block membership, its inline-site entry, its operands and their constant payloads,
+# and its assembly bindings. with a Copy the types and module-level values it names are
+# marked and priced as well, which is what a cross-module import pays on top.
+fun instruction_cost(fn: *ir.Function, c: *Copy, seen: *bool, iid: id.InstructionId, instructions: *u32, bytes: *usize) bool {
+    val ins: *instruction.Instruction = counted(fn, iid);
+    if (ins == nil) { ret true; }
+    @instructions = @instructions + 1;
+    if (!add_bytes(bytes, $size_of(instruction.Instruction) + $size_of(id.InstructionId)
+            + $size_of(id.InstructionId) + $size_of(u32) + 1)
+        || !add_bytes(bytes, ins.operand_count::usize * $size_of(value.Value))) { ret false; }
+    if (c != nil && (!mark_type(c, seen, ins.ty) || !mark_type(c, seen, ins.aux_ty))) { ret false; }
+    var oi: u32 = 0;
+    for (oi < ins.operand_count) {
+        val v: *value.Value = ?ins.operands[oi];
+        if (c != nil) {
+            if (!value_cost(c, seen, v, bytes)) { ret false; }
+        } or (!constant_bytes(v, bytes)) { ret false; }
+        oi = oi + 1;
+    }
+    var key: id.InstructionId = iid;
+    val assembly: R.Result[*ir.IrAsm, str] = map.get[id.InstructionId, ir.IrAsm](?fn.asm_blocks, ?key);
+    if (R.is_ok[*ir.IrAsm, str](assembly) && (!add_bytes(bytes, $size_of(id.InstructionId) + $size_of(ir.IrAsm) + 1)
+        || !add_bytes(bytes, R.unwrap_ok[*ir.IrAsm, str](assembly).bind_count::usize * $size_of(ir.IrAsmBind)))) { ret false; }
+    ret true;
+}
+
+# shape: the growth an inlined copy of fn adds to its host, over the counted
+# instructions only, so the same body prices the same with and without `-g`. a nil
+# Copy prices the in-module case; a Copy adds what a cross-module import carries.
+fun shape(fn: *ir.Function, c: *Copy, seen: *bool, out: *Budget) bool {
+    @out = Budget{};
+    var instructions: u32 = 0;
+    var bytes: usize = 0;
+    if (!add_bytes(?bytes, fn.block_count::usize * $size_of(ir.Block))
+        || !add_bytes(?bytes, (fn.inline_site_len::usize + 1) * $size_of(ir.InlineSite))) { ret false; }
+    var i: u32 = 0;
+    for (i < fn.block_count) {
+        val b: *ir.Block = ?fn.blocks[i];
+        if (!add_bytes(?bytes, b.pred_count::usize * $size_of(id.BlockId))) { ret false; }
+        var j: u32 = 0;
+        for (j < b.phi_count) {
+            if (!instruction_cost(fn, c, seen, b.phis[j], ?instructions, ?bytes)) { ret false; }
+            j = j + 1;
+        }
+        j = 0;
+        for (j < b.instr_count) {
+            if (!instruction_cost(fn, c, seen, b.instructions[j], ?instructions, ?bytes)) { ret false; }
+            j = j + 1;
+        }
+        if (!instruction_cost(fn, c, seen, b.terminator, ?instructions, ?bytes)) { ret false; }
+        i = i + 1;
+    }
+    if (instructions > MAX_INSTRUCTIONS) { ret false; }
+    out.instructions = instructions;
+    out.bytes = bytes;
+    ret true;
+}
+
 fun measure(c: *Copy, fn: *ir.Function, out: *Budget) R.Result[bool, str] {
     @out = Budget{};
     if (!candidate(fn)) { ret R.ok[bool, str](false); }
@@ -472,49 +553,14 @@ fun measure(c: *Copy, fn: *ir.Function, out: *Budget) R.Result[bool, str] {
     fin { if (seen != nil) { A.deallocate[bool](c.scratch, seen, c.src.types.len::usize); } }
     var i: u32 = 0;
     for (i < c.src.types.len) { seen[i] = false; i = i + 1; }
-    var bytes: usize = $size_of(ir.Function);
+    var body_cost: Budget;
+    if (!shape(fn, c, seen, ?body_cost)) { ret R.ok[bool, str](false); }
+    var bytes: usize = body_cost.bytes;
     if (!mark_type(c, seen, fn.sig)
-        || !add_bytes(?bytes, fn.instr_len::usize * $size_of(instruction.Instruction))
-        || !add_bytes(?bytes, fn.block_count::usize * $size_of(ir.Block))
-        || !add_bytes(?bytes, fn.param_count::usize * $size_of(value.Value))
-        || !add_bytes(?bytes, fn.inline_site_len::usize * $size_of(ir.InlineSite))) { ret R.ok[bool, str](false); }
+        || !add_bytes(?bytes, $size_of(ir.Function))
+        || !add_bytes(?bytes, fn.param_count::usize * $size_of(value.Value))) { ret R.ok[bool, str](false); }
     i = 0;
     for (i < fn.param_count) { if (!value_cost(c, seen, ?fn.params[i], ?bytes)) { ret R.ok[bool, str](false); } i = i + 1; }
-    i = 0;
-    for (i < fn.block_count) {
-        val b: *ir.Block = ?fn.blocks[i];
-        if (!add_bytes(?bytes, b.instr_count::usize * $size_of(id.InstructionId))
-            || !add_bytes(?bytes, b.phi_count::usize * $size_of(id.InstructionId))
-            || !add_bytes(?bytes, b.pred_count::usize * $size_of(id.BlockId))) { ret R.ok[bool, str](false); }
-        i = i + 1;
-    }
-    i = 0;
-    for (i < fn.instr_len) {
-        val ins: *instruction.Instruction = ?fn.instrs[i];
-        if (!mark_type(c, seen, ins.ty) || !mark_type(c, seen, ins.aux_ty)
-            || !add_bytes(?bytes, ins.operand_count::usize * $size_of(value.Value))) { ret R.ok[bool, str](false); }
-        var oi: u32 = 0;
-        for (oi < ins.operand_count) { if (!value_cost(c, seen, ?ins.operands[oi], ?bytes)) { ret R.ok[bool, str](false); } oi = oi + 1; }
-        val dv: O.Option[*ir.DbgVar] = ir.dbg_var_get(fn, i::id.InstructionId);
-        if (O.is_some[*ir.DbgVar](dv) && !mark_type(c, seen, O.unwrap[*ir.DbgVar](dv).ty)) { ret R.ok[bool, str](false); }
-        val av: O.Option[*ir.DbgVar] = ir.alloca_dbg_var_get(fn, i::id.InstructionId);
-        if (O.is_some[*ir.DbgVar](av) && !mark_type(c, seen, O.unwrap[*ir.DbgVar](av).ty)) { ret R.ok[bool, str](false); }
-        var key: id.InstructionId = i::id.InstructionId;
-        val assembly: R.Result[*ir.IrAsm, str] = map.get[id.InstructionId, ir.IrAsm](?fn.asm_blocks, ?key);
-        if (R.is_ok[*ir.IrAsm, str](assembly) && !add_bytes(?bytes,
-            R.unwrap_ok[*ir.IrAsm, str](assembly).bind_count::usize * $size_of(ir.IrAsmBind))) { ret R.ok[bool, str](false); }
-        i = i + 1;
-    }
-    if (!add_bytes(?bytes, fn.asm_blocks.cap * ($size_of(id.InstructionId) + $size_of(ir.IrAsm) + 1))
-        || !add_bytes(?bytes, fn.dbg_vars.cap * ($size_of(id.InstructionId) + $size_of(ir.DbgVar) + 1))
-        || !add_bytes(?bytes, fn.alloca_dbg_vars.cap * ($size_of(id.InstructionId) + $size_of(ir.DbgVar) + 1))
-        || !add_bytes(?bytes, fn.dbg_expr_ids.cap * ($size_of(id.InstructionId) + $size_of(ir.DbgExprId) + 1))
-        || !add_bytes(?bytes, fn.instr_inline_site.cap * ($size_of(id.InstructionId) + $size_of(u32) + 1))) { ret R.ok[bool, str](false); }
-    i = 0;
-    for (i < fn.dbg_expr_len) {
-        if (!add_bytes(?bytes, $size_of(ir.DbgExpr)) || !add_bytes(?bytes, fn.dbg_exprs[i].op_count::usize * $size_of(ir.DbgOp))) { ret R.ok[bool, str](false); }
-        i = i + 1;
-    }
     i = c.src.types.len;
     for (i > 0) {
         i = i - 1;
@@ -546,7 +592,7 @@ fun measure(c: *Copy, fn: *ir.Function, out: *Budget) R.Result[bool, str] {
             j = j + 1;
         }
     }
-    out.instructions = fn.instr_len;
+    out.instructions = body_cost.instructions;
     out.bytes = bytes;
     ret R.ok[bool, str](true);
 }
@@ -680,56 +726,13 @@ pub fun acquire(a: *Available, dst: *ir.Module, provider: *ir.Module, name: inte
 }
 
 pub fun growth_cost(fn: *ir.Function, out: *Budget) bool {
-    @out = Budget{};
-    if (fn.instr_len > MAX_INSTRUCTIONS) { ret false; }
-    var bytes: usize = 0;
-    if (!add_bytes(?bytes, fn.instr_len::usize * $size_of(instruction.Instruction))
-        || !add_bytes(?bytes, fn.block_count::usize * $size_of(ir.Block))) { ret false; }
-    var i: u32 = 0;
-    for (i < fn.block_count) {
-        val b: *ir.Block = ?fn.blocks[i];
-        if (!add_bytes(?bytes, b.instr_count::usize * $size_of(id.InstructionId))
-            || !add_bytes(?bytes, b.phi_count::usize * $size_of(id.InstructionId))
-            || !add_bytes(?bytes, b.pred_count::usize * $size_of(id.BlockId))) { ret false; }
-        i = i + 1;
-    }
-    i = 0;
-    for (i < fn.instr_len) {
-        val ins: *instruction.Instruction = ?fn.instrs[i];
-        if (!add_bytes(?bytes, ins.operand_count::usize * $size_of(value.Value))) { ret false; }
-        var oi: u32 = 0;
-        for (oi < ins.operand_count) {
-            val v: *value.Value = ?ins.operands[oi];
-            if (v.kind == value.VAL_CONST_BYTES && !add_bytes(?bytes, v.data.bytes.len::usize)) { ret false; }
-            if (v.kind == value.VAL_CONST_AGG && (!add_bytes(?bytes, v.data.agg.len::usize)
-                || !add_bytes(?bytes, v.data.agg.reloc_count::usize * $size_of(value.AggReloc)))) { ret false; }
-            oi = oi + 1;
-        }
-        var key: id.InstructionId = i::id.InstructionId;
-        val assembly: R.Result[*ir.IrAsm, str] = map.get[id.InstructionId, ir.IrAsm](?fn.asm_blocks, ?key);
-        if (R.is_ok[*ir.IrAsm, str](assembly) && !add_bytes(?bytes,
-            R.unwrap_ok[*ir.IrAsm, str](assembly).bind_count::usize * $size_of(ir.IrAsmBind))) { ret false; }
-        i = i + 1;
-    }
-    if (!add_bytes(?bytes, fn.asm_blocks.cap * ($size_of(id.InstructionId) + $size_of(ir.IrAsm) + 1))
-        || !add_bytes(?bytes, fn.dbg_vars.cap * ($size_of(id.InstructionId) + $size_of(ir.DbgVar) + 1))
-        || !add_bytes(?bytes, fn.alloca_dbg_vars.cap * ($size_of(id.InstructionId) + $size_of(ir.DbgVar) + 1))
-        || !add_bytes(?bytes, fn.dbg_expr_ids.cap * ($size_of(id.InstructionId) + $size_of(ir.DbgExprId) + 1))
-        || !add_bytes(?bytes, fn.instr_inline_site.cap * ($size_of(id.InstructionId) + $size_of(u32) + 1))
-        || !add_bytes(?bytes, (fn.inline_site_len::usize + 1) * $size_of(ir.InlineSite))) { ret false; }
-    i = 0;
-    for (i < fn.dbg_expr_len) {
-        if (!add_bytes(?bytes, $size_of(ir.DbgExpr)) || !add_bytes(?bytes, fn.dbg_exprs[i].op_count::usize * $size_of(ir.DbgOp))) { ret false; }
-        i = i + 1;
-    }
-    out.instructions = fn.instr_len;
-    out.bytes = bytes;
-    ret true;
+    ret shape(fn, nil, nil, out);
 }
 
 use std.allocator.page;
 use T: std.allocator.testing;
 use mach.lang.me.ir.builder;
+use semtype: mach.lang.type;
 
 test "mach.lang.me.ir.body:owned_constants_types_and_effect_flags_survive_provider_retirement" {
     var source_home: ir.ModuleHome;
@@ -837,5 +840,78 @@ test "mach.lang.me.ir.body:scratch_refusal_releases_partial_remapping_and_budget
     if (charge(?budget, 2, 0) || charge(?budget, 0, 2)
         || budget.instructions != MAX_INSTRUCTIONS - 1 || budget.bytes != MAX_BYTES - 1) { ret 11; }
     if (!charge(?budget, 1, 1) || budget.instructions != MAX_INSTRUCTIONS || budget.bytes != MAX_BYTES) { ret 12; }
+    ret 0;
+}
+
+# the same program annotated for `-g` and not: an alloca, a debug variable on it, a
+# dbg_value reading it, a return. every cost a decision reads must agree, or `-g`
+# moves an inlining decision and the release image stops being byte-additive (#1944).
+fun annotated_pair(m: *ir.Module, i64t: type.IrTypeId, sig: type.IrTypeId) i32 {
+    var b: builder.Builder = builder.init(m);
+    var k: u32 = 0;
+    for (k < 2) {
+        val added: R.Result[u32, str] = ir.function_add(m, (2 + k)::intern.StrId, sig, 0);
+        if (R.is_err[u32, str](added)) { ret 1; }
+        val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](added)];
+        builder.set_function(?b, fn);
+        val block: R.Result[id.BlockId, str] = builder.new_block(?b);
+        if (R.is_err[id.BlockId, str](block)) { ret 2; }
+        builder.set_block(?b, R.unwrap_ok[id.BlockId, str](block));
+        val slot: R.Result[value.Value, str] = builder.emit_alloca(?b, i64t, value.const_int(1, i64t));
+        if (R.is_err[value.Value, str](slot)) { ret 3; }
+        if (k == 1) {
+            var dv: ir.DbgVar;
+            dv.name = 9::intern.StrId;
+            dv.ty   = i64t;
+            if (R.is_err[R.Void, str](ir.record_alloca_dbg_var(fn, R.unwrap_ok[value.Value, str](slot).data.instr, dv))) { ret 4; }
+            if (R.is_err[R.Void, str](builder.emit_dbg_value(?b, R.unwrap_ok[value.Value, str](slot), 9::intern.StrId, i64t, semtype.TYPE_NIL, false, 0))) { ret 5; }
+        }
+        if (R.is_err[R.Void, str](builder.emit_ret_void(?b))) { ret 6; }
+        k = k + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.me.ir.body:debug_annotation_does_not_move_a_bodys_cost" {
+    var home: ir.ModuleHome;
+    if (O.is_some[str](ir.home_init(?home))) { ret 1; }
+    fin { ir.home_dnit(?home); }
+    val made: R.Result[ir.Module, str] = ir.init(?home.alloc, 1);
+    if (R.is_err[ir.Module, str](made)) { ret 2; }
+    var src: ir.Module = R.unwrap_ok[ir.Module, str](made);
+    val vt: R.Result[type.IrTypeId, str] = type.intern_void(?src.types);
+    val it: R.Result[type.IrTypeId, str] = type.intern_int(?src.types, 64);
+    if (R.is_err[type.IrTypeId, str](vt) || R.is_err[type.IrTypeId, str](it)) { ret 3; }
+    val i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](it);
+    val signature: R.Result[type.IrTypeId, str] = type.intern_fn(?src.types, R.unwrap_ok[type.IrTypeId, str](vt), nil, 0, false);
+    if (R.is_err[type.IrTypeId, str](signature)) { ret 4; }
+    val built: i32 = annotated_pair(?src, i64t, R.unwrap_ok[type.IrTypeId, str](signature));
+    if (built != 0) { ret 10 + built; }
+    val plain: *ir.Function = ?src.functions[0];
+    val annotated: *ir.Function = ?src.functions[1];
+    if (annotated.instr_len == plain.instr_len || annotated.alloca_dbg_vars.cap == 0) { ret 20; }
+    if (live_instructions(plain) != 2 || live_instructions(annotated) != 2 || !candidate(plain) || !candidate(annotated)) { ret 21; }
+    var plain_cost: Budget;
+    var annotated_cost: Budget;
+    if (!growth_cost(plain, ?plain_cost) || !growth_cost(annotated, ?annotated_cost)) { ret 22; }
+    if (plain_cost.instructions != 2 || annotated_cost.instructions != plain_cost.instructions
+        || annotated_cost.bytes != plain_cost.bytes) { ret 23; }
+    var dst_home: ir.ModuleHome;
+    if (O.is_some[str](ir.home_init(?dst_home))) { ret 24; }
+    fin { ir.home_dnit(?dst_home); }
+    val made_dst: R.Result[ir.Module, str] = ir.init(?dst_home.alloc, 5);
+    if (R.is_err[ir.Module, str](made_dst)) { ret 25; }
+    var dst: ir.Module = R.unwrap_ok[ir.Module, str](made_dst);
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret 26; }
+    var tgt: target.Target;
+    var c: Copy;
+    if (R.is_err[R.Void, str](copy_init(?c, ?dst, ?src, ?tgt, ?backing))) { ret 27; }
+    fin { copy_dnit(?c); }
+    val plain_measured: R.Result[bool, str] = measure(?c, plain, ?plain_cost);
+    val annotated_measured: R.Result[bool, str] = measure(?c, annotated, ?annotated_cost);
+    if (R.is_err[bool, str](plain_measured) || R.is_err[bool, str](annotated_measured)
+        || !R.unwrap_ok[bool, str](plain_measured) || !R.unwrap_ok[bool, str](annotated_measured)) { ret 28; }
+    if (annotated_cost.instructions != plain_cost.instructions || annotated_cost.bytes != plain_cost.bytes) { ret 29; }
     ret 0;
 }
