@@ -5,6 +5,24 @@ Numbers are wall and `-v` phase times on x86_64-linux, serial, 3 repetitions eac
 host load average 7 to 8 from a concurrent test-suite run (noise under 5% on every
 row below, worst observed spread 61 ms on a 1.3 s row).
 
+## Landing on dev (#2299)
+
+The same regression reached dev through PR #3247, which carried d9373679's owned
+products and transitive validation but not 60570613's object-image cache: the CI
+targets job's corpus step went from 342 to 620 seconds. Fixes A and B apply to dev
+unchanged and were cherry-picked from 60c2c479. Fix C has no target on dev, since
+dev never hashes the running compiler (there is no `src/lang/build/cache/`); it
+stays on feat/3218 to land with the object cache. Finding 1 below (the
+per-invocation digest) therefore does not apply to dev today, and finding 2 is the
+remainder handed to F4/R2. On dev (debug compilers built by the 4.30.0 seed,
+load average 7 to 12 from peer workers, 3 alternating repetitions): the 91-case
+x86_64-linux layer A corpus as one `test/run.sh` process went from 245/282/266 s
+(median 266) to 196/228/191 s (median 196); a one-file build reaching 42 std
+modules from 677/694/676 ms to 518/488/472 ms, sema 209 to 88 ms and lower 253 to
+176 ms. The mutation control is both memos disabled (`false &&` on the
+`remap_result` early return and on the `origin_surface` lookup): 739/673/679 ms,
+sema 231/210/213 ms, which is the baseline cost back.
+
 ## Step 1: shape
 
 Compilers (all built from source on this host, 2026-09-10):
