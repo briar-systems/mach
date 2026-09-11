@@ -51,6 +51,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lane. The 2026-09-06 archive measurements it replaces are preserved in
   `doc/design/2299-archive-inventory.md` (#2299).
 
+- Every RISC-V selection refusal names what it refused: the offending letter or
+  token and the selection string for an unknown extension, a noncanonical or
+  duplicated order, an unsupported version, the E base and a trailing separator,
+  and the F or D extension the selection lacks when a calling convention needs
+  float registers. A floating-point type on a selection without F is refused
+  naming the missing extension, not only the selection (#3127).
+
+- Each ISA with a vector unit declares every retained (operation, lane kind, lane
+  width) cell as a packed instruction or the documented scalar expansion, and
+  registration refuses a catalog that leaves a cell undeclared. A vector operator
+  whose lane shape the catalog does not name is refused with a diagnostic naming
+  the operation, shape, function and target in every `simd` mode, never
+  scalarized silently. `test/vecrows` probes every declared row on x86_64,
+  aarch64 and riscv64 against the external decoder and execution (#3120).
+
 ### Fixed
 
 - The System V x86-64 classifier spent a register on an eightbyte that holds
