@@ -191,6 +191,68 @@ lane widens or narrows that.
 - `pointer_shape`, `instruction_operands_fit`, `TargetDefs`, `Environment` and
   the environment profiles are untouched.
 
-## 4. Acceptance record
+## 4. What the lane landed
 
-Filled in below by this lane once the tests are green.
+- `spirv/types.mach`: `type_tag_struct` (a struct interned apart from records,
+  `struct_is_tag` answers from the type alone), `type_unit` (the empty
+  composite), `is_composite`; `logically_match` treats the tag flag as shape.
+- `spirv/emit.mach`: the `IRT_TAG` arm of `spv_type_of` (`tag_spv_type`), the
+  ordinal map in `emit_access_chain` (case `c` is member `1 + c`), the
+  leading-leaf rule in `emit_global_load`/`emit_global_store` and in the
+  interface load typing of `type_computed_defs` (`leading_leaf`,
+  `leading_leaf_type`, `stored_scalar`), the block refusal in `laid_out_type`,
+  the tag arm of `location_span`, and the tag spellings in `spell_type`,
+  `type_refusal_reason` (the 15-case bound) and `ir_type_spelling`.
+- `me/lower/expr.mach condition_value`: a runtime `sel` is already the
+  discriminator compare, so a branch takes it directly instead of widening the
+  bool to `i8` and comparing it with 1. Found by this lane, not tag-specific in
+  mechanism but only `sel` was affected: with the round trip a `u32` tag tested
+  by `if (sel ...)` declared `Int8` and was refused under `vulkan1.0` for a
+  reason unrelated to its own scalars. Native targets lose one redundant
+  compare per `sel` condition; every native tag test still passes and the
+  x86_64 corpus is unchanged.
+
+Every "gap" cell of section 1 now builds and validates in both profiles; the
+two "refused-by-policy" cells are unchanged; the block member is refused with
+the located message of section 2.4.
+
+## 5. Acceptance record
+
+| cell | test | evidence |
+|---|---|---|
+| local, construction, `sel`, guarded read and write, whole copy, debug check | `mach.lang.driver:tag_local_construction_sel_and_guarded_access_carry_through_spirv` | both profiles: `OpTypeStruct %uint %_struct_ %uint` (one unit composite), `OpConstantNull` of it, access chains ending in member 2 (payload) and member 0 (discriminator), the discriminator `OpIEqual` feeding `OpBranchConditional` (four in debug: the `sel` and three guarded accesses), three `OpUnreachable` blocks in debug and none in release, no `Int8`; `spirv-val` and `spirv-dis` agree when on PATH |
+| by-value parameter, return, call, pointer to a tag | `mach.lang.driver:tag_crosses_a_value_call_and_returns_whole_on_spirv` | `OpFunctionParameter` of the composite, `OpReturnValue` of one whole `OpLoad`, `OpFunctionCall` with one whole `OpLoad` argument, `OpTypePointer Function` to the composite as a parameter |
+| record field, array element | `mach.lang.driver:tag_in_a_record_and_an_array_walks_constant_ordinals_on_spirv` | the field and the element are reached as composites, then member 2 and member 0 by constant ordinal; three discriminator branches |
+| `#[output]` of a tag, location span, block member | `mach.lang.driver:tag_interface_variables_carry_and_block_members_are_refused_on_spirv` | `OpTypePointer Output` to the composite with a `Location`; a second output at location 1 overlaps ("a tag, occupies 2 location(s)"); a `#[uniform]` block member is refused with the section 2.4 message |
+| environment ceilings | `mach.lang.driver:tag_scalars_are_checked_against_the_declared_spirv_environment` | `u8` discriminator under `vulkan1.0`: "needs the Int8 capability, which the `vulkan1.0` environment does not guarantee"; `u32` and `u16` discriminators and a `u64` payload build, validate under `spirv-val --target-env vulkan1.0` and declare no `Int8` |
+| comptime `sel`, secret payload | `mach.lang.driver:tag_comptime_sel_folds_and_a_secret_payload_is_carried_on_spirv` | the folded module has no compare, branch or struct; the `^u32` payload tag is `{u32, u32, u32}` and validates |
+| the 16-member bound | `mach.lang.driver:tag_with_more_than_fifteen_cases_is_refused_with_the_bound_on_spirv` | sixteen cases: located "at most 15 cases"; fifteen build and validate |
+| type-table identity | `mach.lang.target.isa.spirv.types:tag_composite_is_interned_apart_from_a_record_of_the_same_members` | distinct ids, `logically_match` false across them, `type_unit` interned once |
+
+Mutation controls, each run on the committed tree and restored after
+(`out/audit/mach test . --filter tag_`, 64 tests):
+
+| mutation | failing tests |
+|---|---|
+| case ordinal not offset (`+ 1` becomes `+ 0`) | 6 driver tests |
+| load never descends to the leading leaf | 6 driver tests |
+| store never descends to the leading leaf | 7 driver tests |
+| tag composite interned as a record (`struct_is_tag` always false) | the types test and 6 driver tests |
+| block refusal arm removed | the interface test |
+| location span ignores the tag's members | the interface test |
+| 15-case bound reason removed | the bound test |
+| `sel` re-compared as a bool (`condition_value` arm removed) | the local test (`Int8` declared) and the environment test |
+
+Corpus: no tag case exists in `test/cases` on any target (section 1), so no
+spirv golden is added and `test/golden/spirv/SKIPS` is unchanged; the spirv
+column and the x86_64 layer B control are the bars below.
+
+Verification, from-source compiler built by the seed 3.x at `out/audit/mach`:
+
+| bar | result |
+|---|---|
+| full suite | FULL_SUITE |
+| `sh test/census.sh` | CENSUS |
+| corpus spirv layers A and B | CORPUS_SPIRV |
+| corpus x86_64-linux layer B | CORPUS_X64 |
+| seed fixpoint (B built by A, C built by B) | FIXPOINT |
