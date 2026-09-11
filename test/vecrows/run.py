@@ -285,7 +285,8 @@ def manifest(targets):
             out.append('of  = "%s"' % t.of)
         out.append("")
     for name, opt in (("o0", 0), ("o2", 2)):
-        out += ["[profile.%s]" % name, "opt = %d" % opt, "debug = false", 'simd = "scalarize"', ""]
+        out += ["[profile.%s]" % name, "opt = %d" % opt, "debug = false", 'simd = "scalarize"',
+                "vectorize = true", "float_reassoc = false", ""]
     out += ["[artifact.vecrows]", 'kind = "bin"', 'entry = "main.mach"', 'out = "bin/vecrows"',
             'targets = ["*"]', "link = []", "need = []", "", "[dep.std]", 'path = "dep/std"', ""]
     return "\n".join(out)
