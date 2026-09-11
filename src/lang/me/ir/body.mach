@@ -1,0 +1,827 @@
+use std.collections.map;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+use mach.lang.intern;
+use mach.lang.me.ir;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use mach.lang.target;
+use mach.lang.target.isa;
+
+pub val MAX_INSTRUCTIONS: u32 = 1024;
+pub val MAX_BYTES: usize = 262144;
+pub val SMALL_INSTRUCTIONS: u32 = 25;
+
+pub rec Budget {
+    instructions: u32;
+    bytes: usize;
+}
+
+pub fun charge(b: *Budget, instructions: u32, bytes: usize) bool {
+    if (instructions > MAX_INSTRUCTIONS - b.instructions || bytes > MAX_BYTES - b.bytes) { ret false; }
+    b.instructions = b.instructions + instructions;
+    b.bytes = b.bytes + bytes;
+    ret true;
+}
+
+fun candidate(fn: *ir.Function) bool {
+    if ((fn.flags & (ir.FN_FLAG_EXTERN | ir.FN_FLAG_NOINLINE | ir.FN_FLAG_SCALAR | ir.FN_FLAG_NAKED)) != 0) { ret false; }
+    if (fn.block_count == 0 || fn.instr_len > MAX_INSTRUCTIONS) { ret false; }
+    ret (fn.flags & ir.FN_FLAG_INLINE) != 0 || live_instructions(fn) < SMALL_INSTRUCTIONS;
+}
+
+pub fun live_instructions(fn: *ir.Function) u32 {
+    var count: u32 = 0;
+    var i: u32 = 0;
+    for (i < fn.block_count) {
+        val block: *ir.Block = ?fn.blocks[i];
+        count = count + block.phi_count;
+        var j: u32 = 0;
+        for (j < block.instr_count) {
+            val ins: O.Option[*instruction.Instruction] = ir.instruction_get(fn, block.instructions[j]);
+            if (O.is_some[*instruction.Instruction](ins) && O.unwrap[*instruction.Instruction](ins).kind != instruction.OP_DBG_VALUE) { count = count + 1; }
+            j = j + 1;
+        }
+        if (block.terminator != id.INSTR_NIL) { count = count + 1; }
+        i = i + 1;
+    }
+    ret count;
+}
+
+rec Copy {
+    dst: *ir.Module;
+    src: *ir.Module;
+    target: *target.Target;
+    scratch: *A.Allocator;
+    types: *type.IrTypeId;
+    marked: *bool;
+    functions: *u32;
+    globals: *u32;
+}
+
+fun copy_init(c: *Copy, dst: *ir.Module, src: *ir.Module, tgt: *target.Target, a: *A.Allocator) R.Result[R.Void, str] {
+    @c = Copy{};
+    c.dst = dst; c.src = src; c.target = tgt; c.scratch = a;
+    val tr: R.Result[*type.IrTypeId, str] = A.allocate[type.IrTypeId](a, src.types.len::usize);
+    if (R.is_err[*type.IrTypeId, str](tr)) { ret R.err[R.Void, str](R.unwrap_err[*type.IrTypeId, str](tr)); }
+    c.types = R.unwrap_ok[*type.IrTypeId, str](tr);
+    val mr: R.Result[*bool, str] = A.allocate[bool](a, src.types.len::usize);
+    if (R.is_err[*bool, str](mr)) { copy_dnit(c); ret R.err[R.Void, str](R.unwrap_err[*bool, str](mr)); }
+    c.marked = R.unwrap_ok[*bool, str](mr);
+    val fr: R.Result[*u32, str] = A.allocate[u32](a, src.function_len::usize);
+    if (R.is_err[*u32, str](fr)) { copy_dnit(c); ret R.err[R.Void, str](R.unwrap_err[*u32, str](fr)); }
+    c.functions = R.unwrap_ok[*u32, str](fr);
+    val gr: R.Result[*u32, str] = A.allocate[u32](a, src.global_len::usize);
+    if (R.is_err[*u32, str](gr)) { copy_dnit(c); ret R.err[R.Void, str](R.unwrap_err[*u32, str](gr)); }
+    c.globals = R.unwrap_ok[*u32, str](gr);
+    var i: u32 = 0;
+    for (i < src.types.len) { c.types[i] = type.IRT_NIL; c.marked[i] = false; i = i + 1; }
+    i = 0; for (i < src.function_len) { c.functions[i] = 0xFFFFFFFF; i = i + 1; }
+    i = 0; for (i < src.global_len) { c.globals[i] = 0xFFFFFFFF; i = i + 1; }
+    ret R.ok_void[str]();
+}
+
+fun copy_dnit(c: *Copy) {
+    if (c.types != nil) { A.deallocate[type.IrTypeId](c.scratch, c.types, c.src.types.len::usize); }
+    if (c.marked != nil) { A.deallocate[bool](c.scratch, c.marked, c.src.types.len::usize); }
+    if (c.functions != nil) { A.deallocate[u32](c.scratch, c.functions, c.src.function_len::usize); }
+    if (c.globals != nil) { A.deallocate[u32](c.scratch, c.globals, c.src.global_len::usize); }
+    c.types = nil; c.marked = nil; c.functions = nil; c.globals = nil;
+}
+
+fun mark_child(c: *Copy, parent: u32, child: type.IrTypeId) bool {
+    if (child::u32 >= parent) { ret false; }
+    c.marked[child::u32] = true;
+    ret true;
+}
+
+fun copy_type(c: *Copy, wanted: type.IrTypeId) R.Result[type.IrTypeId, str] {
+    if (wanted == type.IRT_NIL) { ret R.ok[type.IrTypeId, str](wanted); }
+    if (wanted >= c.src.types.len) { ret R.err[type.IrTypeId, str]("inline body: type id is out of range"); }
+    if (c.types[wanted] != type.IRT_NIL) { ret R.ok[type.IrTypeId, str](c.types[wanted]); }
+    c.marked[wanted] = true;
+    var i: u32 = wanted + 1;
+    for (i > 0) {
+        i = i - 1;
+        if (!c.marked[i] || c.types[i] != type.IRT_NIL) { cnt; }
+        val t: *type.IrType = ?c.src.types.types[i];
+        var valid: bool = true;
+        if (t.kind == type.IRT_ARRAY) { valid = mark_child(c, i, t.data.array_.element); }
+        or (t.kind == type.IRT_VECTOR) { valid = mark_child(c, i, t.data.vector_.element); }
+        or (t.kind == type.IRT_STRUCT || t.kind == type.IRT_UNION) {
+            var j: u32 = 0;
+            for (j < t.data.struct_.field_count) { valid = valid && mark_child(c, i, t.data.struct_.fields[j]); j = j + 1; }
+        } or (t.kind == type.IRT_FN) {
+            valid = mark_child(c, i, t.data.fn.ret_type);
+            var j: u32 = 0;
+            for (j < t.data.fn.param_count) { valid = valid && mark_child(c, i, t.data.fn.params[j]); j = j + 1; }
+        } or (t.kind == type.IRT_HANDLE) {
+            val schema: *isa.TypeDef = isa.type_def_by_tag(c.target.isa.defs, t.data.handle_.ctor);
+            if (schema == nil || schema.arity != t.data.handle_.count) { ret R.err[type.IrTypeId, str]("inline body: handle type has no matching operand schema"); }
+            var j: u32 = 0;
+            for (j < schema.arity) {
+                if (schema.operands[j] != isa.TYPE_OPERAND_WORD) { valid = valid && mark_child(c, i, t.data.handle_.operands[j]); }
+                j = j + 1;
+            }
+        }
+        if (!valid) { ret R.err[type.IrTypeId, str]("inline body: type reference does not precede its owning interned type"); }
+    }
+    i = 0;
+    for (i <= wanted) {
+        if (c.marked[i] && c.types[i] == type.IRT_NIL) {
+            val made: R.Result[type.IrTypeId, str] = copy_type_ready(c, ?c.src.types.types[i]);
+            if (R.is_err[type.IrTypeId, str](made)) { ret made; }
+            c.types[i] = R.unwrap_ok[type.IrTypeId, str](made);
+        }
+        i = i + 1;
+    }
+    ret R.ok[type.IrTypeId, str](c.types[wanted]);
+}
+
+fun copy_type_ready(c: *Copy, t: *type.IrType) R.Result[type.IrTypeId, str] {
+    val dst: *type.IrTypeTable = ?c.dst.types;
+    if (t.kind == type.IRT_VOID) { ret type.intern_void(dst); }
+    if (t.kind == type.IRT_INT) { ret type.intern_int(dst, t.data.bits); }
+    if (t.kind == type.IRT_FLOAT) { ret type.intern_float(dst, t.data.bits); }
+    if (t.kind == type.IRT_PTR) { ret type.intern_ptr(dst); }
+    if (t.kind == type.IRT_ARRAY) { ret type.intern_array(dst, c.types[t.data.array_.element], t.data.array_.count); }
+    if (t.kind == type.IRT_VECTOR) { ret type.intern_vector(dst, c.types[t.data.vector_.element], t.data.vector_.lanes); }
+    var n: u32 = 0;
+    var fields: *type.IrTypeId = nil;
+    if (t.kind == type.IRT_STRUCT || t.kind == type.IRT_UNION) { n = t.data.struct_.field_count; fields = t.data.struct_.fields; }
+    or (t.kind == type.IRT_FN) { n = t.data.fn.param_count; fields = t.data.fn.params; }
+    or (t.kind == type.IRT_HANDLE) { n = t.data.handle_.count; fields = t.data.handle_.operands; }
+    or { ret R.err[type.IrTypeId, str]("inline body: unknown IR type kind"); }
+    val ar: R.Result[*type.IrTypeId, str] = A.allocate[type.IrTypeId](c.scratch, n::usize);
+    if (R.is_err[*type.IrTypeId, str](ar)) { ret R.err[type.IrTypeId, str](R.unwrap_err[*type.IrTypeId, str](ar)); }
+    val mapped: *type.IrTypeId = R.unwrap_ok[*type.IrTypeId, str](ar);
+    fin { if (mapped != nil) { A.deallocate[type.IrTypeId](c.scratch, mapped, n::usize); } }
+    var schema: *isa.TypeDef = nil;
+    if (t.kind == type.IRT_HANDLE) { schema = isa.type_def_by_tag(c.target.isa.defs, t.data.handle_.ctor); }
+    var i: u32 = 0;
+    for (i < n) {
+        mapped[i] = fields[i];
+        if (schema == nil || schema.operands[i] != isa.TYPE_OPERAND_WORD) { mapped[i] = c.types[fields[i]]; }
+        i = i + 1;
+    }
+    if (t.kind == type.IRT_STRUCT) { ret type.intern_struct(dst, mapped, n, t.data.struct_.align, t.data.struct_.packed); }
+    if (t.kind == type.IRT_UNION) { ret type.intern_union(dst, mapped, n, t.data.struct_.align, t.data.struct_.packed); }
+    if (t.kind == type.IRT_FN) { ret type.intern_fn(dst, c.types[t.data.fn.ret_type], mapped, n, t.data.fn.variadic); }
+    ret type.intern_handle(dst, t.data.handle_.ctor, mapped, n);
+}
+
+fun copy_slice[T](a: *A.Allocator, src: *T, n: u32) R.Result[*T, str] {
+    if (n == 0) { ret R.ok[*T, str](nil); }
+    if (src == nil) { ret R.err[*T, str]("inline body: missing owned slice"); }
+    val r: R.Result[*T, str] = A.allocate[T](a, n::usize);
+    if (R.is_err[*T, str](r)) { ret r; }
+    val dst: *T = R.unwrap_ok[*T, str](r);
+    var i: u32 = 0;
+    for (i < n) { dst[i] = src[i]; i = i + 1; }
+    ret r;
+}
+
+# constant payloads belong to the destination module arena
+pub fun own_constant(a: *A.Allocator, original: value.Value) R.Result[value.Value, str] {
+    var v: value.Value = original;
+    if (v.kind == value.VAL_CONST_BYTES) {
+        val r: R.Result[*u8, str] = copy_slice[u8](a, v.data.bytes.ptr, v.data.bytes.len);
+        if (R.is_err[*u8, str](r)) { ret R.err[value.Value, str](R.unwrap_err[*u8, str](r)); }
+        v.data.bytes.ptr = R.unwrap_ok[*u8, str](r);
+    } or (v.kind == value.VAL_CONST_AGG) {
+        val r: R.Result[*u8, str] = copy_slice[u8](a, v.data.agg.bytes, v.data.agg.len);
+        if (R.is_err[*u8, str](r)) { ret R.err[value.Value, str](R.unwrap_err[*u8, str](r)); }
+        val bytes: *u8 = R.unwrap_ok[*u8, str](r);
+        val rr: R.Result[*value.AggReloc, str] = copy_slice[value.AggReloc](a, v.data.agg.relocs, v.data.agg.reloc_count);
+        if (R.is_err[*value.AggReloc, str](rr)) {
+            if (bytes != nil) { A.deallocate[u8](a, bytes, v.data.agg.len::usize); }
+            ret R.err[value.Value, str](R.unwrap_err[*value.AggReloc, str](rr));
+        }
+        v.data.agg.bytes = bytes;
+        v.data.agg.relocs = R.unwrap_ok[*value.AggReloc, str](rr);
+        v.data.agg.reloc_cap = v.data.agg.reloc_count;
+    }
+    ret R.ok[value.Value, str](v);
+}
+
+fun function_header(c: *Copy, ix: u32) R.Result[u32, str] {
+    if (ix >= c.src.function_len) { ret R.err[u32, str]("inline body: function id is out of range"); }
+    if (c.functions[ix] != 0xFFFFFFFF) { ret R.ok[u32, str](c.functions[ix]); }
+    val src: *ir.Function = ?c.src.functions[ix];
+    val sig: R.Result[type.IrTypeId, str] = copy_type(c, src.sig);
+    if (R.is_err[type.IrTypeId, str](sig)) { ret R.err[u32, str](R.unwrap_err[type.IrTypeId, str](sig)); }
+    val found: O.Option[u32] = ir.function_lookup(c.dst, src.name);
+    if (O.is_some[u32](found)) {
+        val at: u32 = O.unwrap[u32](found);
+        if (c.dst.functions[at].sig != R.unwrap_ok[type.IrTypeId, str](sig)) { ret R.err[u32, str]("inline body: function identity has incompatible IR signatures"); }
+        var origin: intern.StrId = src.body_module;
+        if (origin == intern.STR_NIL && (src.flags & ir.FN_FLAG_EXTERN) == 0) { origin = c.src.name; }
+        if (origin != intern.STR_NIL) {
+            if (c.dst.functions[at].body_module != intern.STR_NIL && c.dst.functions[at].body_module != origin) {
+                ret R.err[u32, str]("inline body: function identity has conflicting defining modules");
+            }
+            c.dst.functions[at].body_module = origin;
+        }
+        c.functions[ix] = at;
+        ret R.ok[u32, str](at);
+    }
+    val added: R.Result[u32, str] = ir.function_add(c.dst, src.name, R.unwrap_ok[type.IrTypeId, str](sig), src.flags | ir.FN_FLAG_EXTERN);
+    if (R.is_err[u32, str](added)) { ret added; }
+    val at: u32 = R.unwrap_ok[u32, str](added);
+    val fn: *ir.Function = ?c.dst.functions[at];
+    fn.body_module = src.body_module;
+    if (fn.body_module == intern.STR_NIL && (src.flags & ir.FN_FLAG_EXTERN) == 0) { fn.body_module = c.src.name; }
+    fn.is_import = src.is_import;
+    fn.label = src.label; fn.line = src.line; fn.section = src.section;
+    fn.stage = src.stage; fn.wg_x = src.wg_x; fn.wg_y = src.wg_y; fn.wg_z = src.wg_z;
+    fn.op_set = src.op_set; fn.op_code = src.op_code; fn.disp = src.disp; fn.ret_sem = src.ret_sem;
+    val registered: R.Result[R.Void, str] = ir.function_register(c.dst, src.name, at);
+    if (R.is_err[R.Void, str](registered)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](registered)); }
+    c.functions[ix] = at;
+    ret added;
+}
+
+fun global_header(c: *Copy, ix: u32) R.Result[u32, str] {
+    if (ix >= c.src.global_len) { ret R.err[u32, str]("inline body: global id is out of range"); }
+    if (c.globals[ix] != 0xFFFFFFFF) { ret R.ok[u32, str](c.globals[ix]); }
+    val src: *ir.Global = ?c.src.globals[ix];
+    if (src.is_local) { ret R.err[u32, str]("inline body: local pool address has no cross-module symbol identity"); }
+    val ty: R.Result[type.IrTypeId, str] = copy_type(c, src.ty);
+    if (R.is_err[type.IrTypeId, str](ty)) { ret R.err[u32, str](R.unwrap_err[type.IrTypeId, str](ty)); }
+    val found: O.Option[u32] = ir.global_lookup(c.dst, src.name);
+    if (O.is_some[u32](found)) {
+        val at: u32 = O.unwrap[u32](found);
+        if (c.dst.globals[at].ty != R.unwrap_ok[type.IrTypeId, str](ty)) { ret R.err[u32, str]("inline body: global identity has incompatible IR types"); }
+        c.globals[ix] = at;
+        ret R.ok[u32, str](at);
+    }
+    if (c.dst.global_len == c.dst.global_cap) {
+        var cap: u32 = c.dst.global_cap;
+        if (cap == 0) { cap = 8; } or { cap = cap * 2; }
+        val grown: R.Result[*ir.Global, str] = A.reallocate[ir.Global](c.dst.alloc, c.dst.globals, c.dst.global_cap::usize, cap::usize);
+        if (R.is_err[*ir.Global, str](grown)) { ret R.err[u32, str](R.unwrap_err[*ir.Global, str](grown)); }
+        c.dst.globals = R.unwrap_ok[*ir.Global, str](grown); c.dst.global_cap = cap;
+    }
+    val at: u32 = c.dst.global_len;
+    var g: ir.Global = @src;
+    g.ty = R.unwrap_ok[type.IrTypeId, str](ty);
+    g.init = value.const_int(0, g.ty);
+    g.is_extern = true;
+    c.dst.globals[at] = g;
+    c.dst.global_len = at + 1;
+    val registered: R.Result[R.Void, str] = ir.global_register(c.dst, g.name, at);
+    if (R.is_err[R.Void, str](registered)) { ret R.err[u32, str](R.unwrap_err[R.Void, str](registered)); }
+    c.globals[ix] = at;
+    ret R.ok[u32, str](at);
+}
+
+fun copy_value(c: *Copy, a: *A.Allocator, original: value.Value) R.Result[value.Value, str] {
+    var v: value.Value = original;
+    val ty: R.Result[type.IrTypeId, str] = copy_type(c, v.ty);
+    if (R.is_err[type.IrTypeId, str](ty)) { ret R.err[value.Value, str](R.unwrap_err[type.IrTypeId, str](ty)); }
+    v.ty = R.unwrap_ok[type.IrTypeId, str](ty);
+    if (v.kind == value.VAL_FN) {
+        val r: R.Result[u32, str] = function_header(c, v.data.fn_ix);
+        if (R.is_err[u32, str](r)) { ret R.err[value.Value, str](R.unwrap_err[u32, str](r)); }
+        v.data.fn_ix = R.unwrap_ok[u32, str](r);
+    } or (v.kind == value.VAL_GLOBAL) {
+        val r: R.Result[u32, str] = global_header(c, v.data.global_ix);
+        if (R.is_err[u32, str](r)) { ret R.err[value.Value, str](R.unwrap_err[u32, str](r)); }
+        v.data.global_ix = R.unwrap_ok[u32, str](r);
+    } or (v.kind > value.VAL_CONST_AGG) { ret R.err[value.Value, str]("inline body: unknown value kind"); }
+    ret own_constant(a, v);
+}
+
+fun copy_function(c: *Copy, ix: u32, a: *A.Allocator) R.Result[ir.Function, str] {
+    if (ix >= c.src.function_len) { ret R.err[ir.Function, str]("inline body: function id is out of range"); }
+    val src: *ir.Function = ?c.src.functions[ix];
+    val header: R.Result[u32, str] = function_header(c, ix);
+    if (R.is_err[u32, str](header)) { ret R.err[ir.Function, str](R.unwrap_err[u32, str](header)); }
+    val at: u32 = R.unwrap_ok[u32, str](header);
+    var fn: ir.Function = ir.function_new(a, src.name, c.dst.functions[at].sig, src.flags);
+    fn.body_module = src.body_module;
+    if (fn.body_module == intern.STR_NIL && (src.flags & ir.FN_FLAG_EXTERN) == 0) { fn.body_module = c.src.name; }
+    fn.is_import = src.is_import;
+    fn.label = src.label; fn.line = src.line; fn.section = src.section;
+    fn.stage = src.stage; fn.wg_x = src.wg_x; fn.wg_y = src.wg_y; fn.wg_z = src.wg_z;
+    fn.op_set = src.op_set; fn.op_code = src.op_code; fn.disp = src.disp; fn.ret_sem = src.ret_sem;
+    var storage: ir.Module;
+    storage.alloc = a;
+    var complete: bool = false;
+    fin { if (!complete) { ir.function_dnit(?storage, ?fn); } }
+    val params: R.Result[*value.Value, str] = copy_slice[value.Value](a, src.params, src.param_count);
+    if (R.is_err[*value.Value, str](params)) { ret R.err[ir.Function, str](R.unwrap_err[*value.Value, str](params)); }
+    fn.params = R.unwrap_ok[*value.Value, str](params); fn.param_count = src.param_count;
+    var i: u32 = 0;
+    for (i < fn.param_count) {
+        val v: R.Result[value.Value, str] = copy_value(c, a, src.params[i]);
+        if (R.is_err[value.Value, str](v)) { ret R.err[ir.Function, str](R.unwrap_err[value.Value, str](v)); }
+        fn.params[i] = R.unwrap_ok[value.Value, str](v); i = i + 1;
+    }
+    val br: R.Result[*ir.Block, str] = A.allocate[ir.Block](a, src.block_count::usize);
+    if (R.is_err[*ir.Block, str](br)) { ret R.err[ir.Function, str](R.unwrap_err[*ir.Block, str](br)); }
+    fn.blocks = R.unwrap_ok[*ir.Block, str](br); fn.block_cap = src.block_count;
+    i = 0; for (i < src.block_count) { fn.blocks[i] = ir.Block{}; i = i + 1; }
+    fn.block_count = src.block_count;
+    i = 0;
+    for (i < src.block_count) {
+        val sb: *ir.Block = ?src.blocks[i];
+        val db: *ir.Block = ?fn.blocks[i];
+        db.id = sb.id; db.terminator = sb.terminator;
+        val ins: R.Result[*id.InstructionId, str] = copy_slice[id.InstructionId](a, sb.instructions, sb.instr_count);
+        if (R.is_err[*id.InstructionId, str](ins)) { ret R.err[ir.Function, str](R.unwrap_err[*id.InstructionId, str](ins)); }
+        db.instructions = R.unwrap_ok[*id.InstructionId, str](ins); db.instr_count = sb.instr_count; db.instr_cap = sb.instr_count;
+        val phis: R.Result[*id.InstructionId, str] = copy_slice[id.InstructionId](a, sb.phis, sb.phi_count);
+        if (R.is_err[*id.InstructionId, str](phis)) { ret R.err[ir.Function, str](R.unwrap_err[*id.InstructionId, str](phis)); }
+        db.phis = R.unwrap_ok[*id.InstructionId, str](phis); db.phi_count = sb.phi_count; db.phi_cap = sb.phi_count;
+        val preds: R.Result[*id.BlockId, str] = copy_slice[id.BlockId](a, sb.preds, sb.pred_count);
+        if (R.is_err[*id.BlockId, str](preds)) { ret R.err[ir.Function, str](R.unwrap_err[*id.BlockId, str](preds)); }
+        db.preds = R.unwrap_ok[*id.BlockId, str](preds); db.pred_count = sb.pred_count; db.pred_cap = sb.pred_count;
+        i = i + 1;
+    }
+    val instrs: R.Result[*instruction.Instruction, str] = A.allocate[instruction.Instruction](a, src.instr_len::usize);
+    if (R.is_err[*instruction.Instruction, str](instrs)) { ret R.err[ir.Function, str](R.unwrap_err[*instruction.Instruction, str](instrs)); }
+    fn.instrs = R.unwrap_ok[*instruction.Instruction, str](instrs); fn.instr_cap = src.instr_len;
+    i = 0;
+    for (i < src.instr_len) {
+        val si: *instruction.Instruction = ?src.instrs[i];
+        val di: *instruction.Instruction = ?fn.instrs[i];
+        @di = @si; di.operands = nil; di.operand_count = 0; di.operand_cap = 0;
+        fn.instr_len = i + 1;
+        val ty: R.Result[type.IrTypeId, str] = copy_type(c, si.ty);
+        if (R.is_err[type.IrTypeId, str](ty)) { ret R.err[ir.Function, str](R.unwrap_err[type.IrTypeId, str](ty)); }
+        di.ty = R.unwrap_ok[type.IrTypeId, str](ty);
+        val aux: R.Result[type.IrTypeId, str] = copy_type(c, si.aux_ty);
+        if (R.is_err[type.IrTypeId, str](aux)) { ret R.err[ir.Function, str](R.unwrap_err[type.IrTypeId, str](aux)); }
+        di.aux_ty = R.unwrap_ok[type.IrTypeId, str](aux);
+        val ops: R.Result[*value.Value, str] = copy_slice[value.Value](a, si.operands, si.operand_count);
+        if (R.is_err[*value.Value, str](ops)) { ret R.err[ir.Function, str](R.unwrap_err[*value.Value, str](ops)); }
+        di.operands = R.unwrap_ok[*value.Value, str](ops); di.operand_count = si.operand_count; di.operand_cap = si.operand_count;
+        var oi: u32 = 0;
+        for (oi < si.operand_count) {
+            val v: R.Result[value.Value, str] = copy_value(c, a, si.operands[oi]);
+            if (R.is_err[value.Value, str](v)) { ret R.err[ir.Function, str](R.unwrap_err[value.Value, str](v)); }
+            di.operands[oi] = R.unwrap_ok[value.Value, str](v); oi = oi + 1;
+        }
+        i = i + 1;
+    }
+    val sites: R.Result[*ir.InlineSite, str] = copy_slice[ir.InlineSite](a, src.inline_sites, src.inline_site_len);
+    if (R.is_err[*ir.InlineSite, str](sites)) { ret R.err[ir.Function, str](R.unwrap_err[*ir.InlineSite, str](sites)); }
+    fn.inline_sites = R.unwrap_ok[*ir.InlineSite, str](sites); fn.inline_site_len = src.inline_site_len; fn.inline_site_cap = src.inline_site_len;
+    val ids: R.Result[*u32, str] = A.allocate[u32](c.scratch, src.instr_len::usize);
+    if (R.is_err[*u32, str](ids)) { ret R.err[ir.Function, str](R.unwrap_err[*u32, str](ids)); }
+    val identity: *u32 = R.unwrap_ok[*u32, str](ids);
+    fin { if (identity != nil) { A.deallocate[u32](c.scratch, identity, src.instr_len::usize); } }
+    i = 0; for (i < src.instr_len) { identity[i] = i; i = i + 1; }
+    i = 0;
+    for (i < src.instr_len) {
+        val iid: id.InstructionId = i::id.InstructionId;
+        val dbg: R.Result[R.Void, str] = ir.clone_dbg_metadata(?storage, src, ?fn, iid, iid);
+        if (R.is_err[R.Void, str](dbg)) { ret R.err[ir.Function, str](R.unwrap_err[R.Void, str](dbg)); }
+        val adbg: R.Result[R.Void, str] = ir.clone_alloca_dbg_var(src, ?fn, iid, iid);
+        if (R.is_err[R.Void, str](adbg)) { ret R.err[ir.Function, str](R.unwrap_err[R.Void, str](adbg)); }
+        val dv: O.Option[*ir.DbgVar] = ir.dbg_var_get(?fn, iid);
+        if (O.is_some[*ir.DbgVar](dv)) {
+            val ty: R.Result[type.IrTypeId, str] = copy_type(c, O.unwrap[*ir.DbgVar](dv).ty);
+            if (R.is_err[type.IrTypeId, str](ty)) { ret R.err[ir.Function, str](R.unwrap_err[type.IrTypeId, str](ty)); }
+            O.unwrap[*ir.DbgVar](dv).ty = R.unwrap_ok[type.IrTypeId, str](ty);
+        }
+        val av: O.Option[*ir.DbgVar] = ir.alloca_dbg_var_get(?fn, iid);
+        if (O.is_some[*ir.DbgVar](av)) {
+            val ty: R.Result[type.IrTypeId, str] = copy_type(c, O.unwrap[*ir.DbgVar](av).ty);
+            if (R.is_err[type.IrTypeId, str](ty)) { ret R.err[ir.Function, str](R.unwrap_err[type.IrTypeId, str](ty)); }
+            O.unwrap[*ir.DbgVar](av).ty = R.unwrap_ok[type.IrTypeId, str](ty);
+        }
+        val assembly: R.Result[R.Void, str] = ir.clone_asm_payload(?storage, src, ?fn, iid, iid, identity, src.instr_len);
+        if (R.is_err[R.Void, str](assembly)) { ret R.err[ir.Function, str](R.unwrap_err[R.Void, str](assembly)); }
+        val site: R.Result[R.Void, str] = ir.clone_instr_inline_site(src, ?fn, iid, iid);
+        if (R.is_err[R.Void, str](site)) { ret R.err[ir.Function, str](R.unwrap_err[R.Void, str](site)); }
+        i = i + 1;
+    }
+    complete = true;
+    ret R.ok[ir.Function, str](fn);
+}
+
+fun add_bytes(total: *usize, n: usize) bool {
+    if (n > MAX_BYTES - @total) { ret false; }
+    @total = @total + n;
+    ret true;
+}
+
+fun mark_type(c: *Copy, seen: *bool, ty: type.IrTypeId) bool {
+    if (ty == type.IRT_NIL) { ret true; }
+    if (ty >= c.src.types.len) { ret false; }
+    seen[ty] = true;
+    ret true;
+}
+
+fun value_cost(c: *Copy, seen: *bool, v: *value.Value, bytes: *usize) bool {
+    if (!mark_type(c, seen, v.ty)) { ret false; }
+    if (v.kind == value.VAL_GLOBAL) {
+        if (v.data.global_ix >= c.src.global_len || c.src.globals[v.data.global_ix].is_local) { ret false; }
+        if (!mark_type(c, seen, c.src.globals[v.data.global_ix].ty) || !add_bytes(bytes, $size_of(ir.Global))) { ret false; }
+    } or (v.kind == value.VAL_FN) {
+        if (v.data.fn_ix >= c.src.function_len) { ret false; }
+        if (!mark_type(c, seen, c.src.functions[v.data.fn_ix].sig) || !add_bytes(bytes, $size_of(ir.Function))) { ret false; }
+    } or (v.kind == value.VAL_CONST_BYTES) {
+        if (!add_bytes(bytes, v.data.bytes.len::usize)) { ret false; }
+    } or (v.kind == value.VAL_CONST_AGG) {
+        if (!add_bytes(bytes, v.data.agg.len::usize) || !add_bytes(bytes, v.data.agg.reloc_count::usize * $size_of(value.AggReloc))) { ret false; }
+        var i: u32 = 0;
+        for (i < v.data.agg.reloc_count) {
+            val r: *value.AggReloc = ?v.data.agg.relocs[i];
+            if (!r.is_fn) {
+                var gi: u32 = 0;
+                for (gi < c.src.global_len) {
+                    if (c.src.globals[gi].name == r.symbol && c.src.globals[gi].is_local) { ret false; }
+                    gi = gi + 1;
+                }
+            }
+            i = i + 1;
+        }
+    }
+    ret true;
+}
+
+fun measure(c: *Copy, fn: *ir.Function, out: *Budget) R.Result[bool, str] {
+    @out = Budget{};
+    if (!candidate(fn)) { ret R.ok[bool, str](false); }
+    val ar: R.Result[*bool, str] = A.allocate[bool](c.scratch, c.src.types.len::usize);
+    if (R.is_err[*bool, str](ar)) { ret R.err[bool, str](R.unwrap_err[*bool, str](ar)); }
+    val seen: *bool = R.unwrap_ok[*bool, str](ar);
+    fin { if (seen != nil) { A.deallocate[bool](c.scratch, seen, c.src.types.len::usize); } }
+    var i: u32 = 0;
+    for (i < c.src.types.len) { seen[i] = false; i = i + 1; }
+    var bytes: usize = $size_of(ir.Function);
+    if (!mark_type(c, seen, fn.sig)
+        || !add_bytes(?bytes, fn.instr_len::usize * $size_of(instruction.Instruction))
+        || !add_bytes(?bytes, fn.block_count::usize * $size_of(ir.Block))
+        || !add_bytes(?bytes, fn.param_count::usize * $size_of(value.Value))
+        || !add_bytes(?bytes, fn.inline_site_len::usize * $size_of(ir.InlineSite))) { ret R.ok[bool, str](false); }
+    i = 0;
+    for (i < fn.param_count) { if (!value_cost(c, seen, ?fn.params[i], ?bytes)) { ret R.ok[bool, str](false); } i = i + 1; }
+    i = 0;
+    for (i < fn.block_count) {
+        val b: *ir.Block = ?fn.blocks[i];
+        if (!add_bytes(?bytes, b.instr_count::usize * $size_of(id.InstructionId))
+            || !add_bytes(?bytes, b.phi_count::usize * $size_of(id.InstructionId))
+            || !add_bytes(?bytes, b.pred_count::usize * $size_of(id.BlockId))) { ret R.ok[bool, str](false); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < fn.instr_len) {
+        val ins: *instruction.Instruction = ?fn.instrs[i];
+        if (!mark_type(c, seen, ins.ty) || !mark_type(c, seen, ins.aux_ty)
+            || !add_bytes(?bytes, ins.operand_count::usize * $size_of(value.Value))) { ret R.ok[bool, str](false); }
+        var oi: u32 = 0;
+        for (oi < ins.operand_count) { if (!value_cost(c, seen, ?ins.operands[oi], ?bytes)) { ret R.ok[bool, str](false); } oi = oi + 1; }
+        val dv: O.Option[*ir.DbgVar] = ir.dbg_var_get(fn, i::id.InstructionId);
+        if (O.is_some[*ir.DbgVar](dv) && !mark_type(c, seen, O.unwrap[*ir.DbgVar](dv).ty)) { ret R.ok[bool, str](false); }
+        val av: O.Option[*ir.DbgVar] = ir.alloca_dbg_var_get(fn, i::id.InstructionId);
+        if (O.is_some[*ir.DbgVar](av) && !mark_type(c, seen, O.unwrap[*ir.DbgVar](av).ty)) { ret R.ok[bool, str](false); }
+        var key: id.InstructionId = i::id.InstructionId;
+        val assembly: R.Result[*ir.IrAsm, str] = map.get[id.InstructionId, ir.IrAsm](?fn.asm_blocks, ?key);
+        if (R.is_ok[*ir.IrAsm, str](assembly) && !add_bytes(?bytes,
+            R.unwrap_ok[*ir.IrAsm, str](assembly).bind_count::usize * $size_of(ir.IrAsmBind))) { ret R.ok[bool, str](false); }
+        i = i + 1;
+    }
+    if (!add_bytes(?bytes, fn.asm_blocks.cap * ($size_of(id.InstructionId) + $size_of(ir.IrAsm) + 1))
+        || !add_bytes(?bytes, fn.dbg_vars.cap * ($size_of(id.InstructionId) + $size_of(ir.DbgVar) + 1))
+        || !add_bytes(?bytes, fn.alloca_dbg_vars.cap * ($size_of(id.InstructionId) + $size_of(ir.DbgVar) + 1))
+        || !add_bytes(?bytes, fn.dbg_expr_ids.cap * ($size_of(id.InstructionId) + $size_of(ir.DbgExprId) + 1))
+        || !add_bytes(?bytes, fn.instr_inline_site.cap * ($size_of(id.InstructionId) + $size_of(u32) + 1))) { ret R.ok[bool, str](false); }
+    i = 0;
+    for (i < fn.dbg_expr_len) {
+        if (!add_bytes(?bytes, $size_of(ir.DbgExpr)) || !add_bytes(?bytes, fn.dbg_exprs[i].op_count::usize * $size_of(ir.DbgOp))) { ret R.ok[bool, str](false); }
+        i = i + 1;
+    }
+    i = c.src.types.len;
+    for (i > 0) {
+        i = i - 1;
+        if (!seen[i]) { cnt; }
+        val t: *type.IrType = ?c.src.types.types[i];
+        if (!add_bytes(?bytes, $size_of(type.IrType) * 3)) { ret R.ok[bool, str](false); }
+        var fields: *type.IrTypeId = nil;
+        var count: u32 = 0;
+        var single: type.IrTypeId = type.IRT_NIL;
+        if (t.kind == type.IRT_ARRAY) { single = t.data.array_.element; }
+        or (t.kind == type.IRT_VECTOR) { single = t.data.vector_.element; }
+        or (t.kind == type.IRT_STRUCT || t.kind == type.IRT_UNION) { fields = t.data.struct_.fields; count = t.data.struct_.field_count; }
+        or (t.kind == type.IRT_FN) { single = t.data.fn.ret_type; fields = t.data.fn.params; count = t.data.fn.param_count; }
+        or (t.kind == type.IRT_HANDLE) { fields = t.data.handle_.operands; count = t.data.handle_.count; }
+        if (single != type.IRT_NIL && (single >= i || !mark_type(c, seen, single))) { ret R.err[bool, str]("inline body: invalid forward type reference"); }
+        if (!add_bytes(?bytes, count::usize * $size_of(type.IrTypeId))) { ret R.ok[bool, str](false); }
+        var schema: *isa.TypeDef = nil;
+        if (t.kind == type.IRT_HANDLE) {
+            schema = isa.type_def_by_tag(c.target.isa.defs, t.data.handle_.ctor);
+            if (schema == nil || schema.arity != count) { ret R.err[bool, str]("inline body: handle schema is unavailable"); }
+        }
+        var j: u32 = 0;
+        for (j < count) {
+            if (schema == nil || schema.operands[j] != isa.TYPE_OPERAND_WORD) {
+                if (fields[j] >= i || !mark_type(c, seen, fields[j])) { ret R.err[bool, str]("inline body: invalid forward type reference"); }
+            }
+            j = j + 1;
+        }
+    }
+    out.instructions = fn.instr_len;
+    out.bytes = bytes;
+    ret R.ok[bool, str](true);
+}
+
+pub fun extract(dst: *ir.Module, src: *ir.Module, tgt: *target.Target, scratch: *A.Allocator, recursive: *bool) R.Result[R.Void, str] {
+    var c: Copy;
+    val initialized: R.Result[R.Void, str] = copy_init(?c, dst, src, tgt, scratch);
+    if (R.is_err[R.Void, str](initialized)) { ret initialized; }
+    fin { copy_dnit(?c); }
+    var budget: Budget;
+    var i: u32 = 0;
+    for (i < src.function_len) {
+        if (recursive != nil && recursive[i]) { i = i + 1; cnt; }
+        var cost: Budget;
+        val eligible: R.Result[bool, str] = measure(?c, ?src.functions[i], ?cost);
+        if (R.is_err[bool, str](eligible)) { ret R.err[R.Void, str](R.unwrap_err[bool, str](eligible)); }
+        if (R.unwrap_ok[bool, str](eligible) && charge(?budget, cost.instructions, cost.bytes)) {
+            val fn: R.Result[ir.Function, str] = copy_function(?c, i, dst.alloc);
+            if (R.is_err[ir.Function, str](fn)) { ret R.err[R.Void, str](R.unwrap_err[ir.Function, str](fn)); }
+            val at: u32 = c.functions[i];
+            ir.function_dnit(dst, ?dst.functions[at]);
+            dst.functions[at] = R.unwrap_ok[ir.Function, str](fn);
+        }
+        i = i + 1;
+    }
+    ret R.ok_void[str]();
+}
+
+pub rec Available {
+    home: ir.ModuleHome;
+    storage: ir.Module;
+    indices: *u32;
+    originals: *ir.Function;
+    len: u32;
+    cap: u32;
+    budget: Budget;
+    attached: bool;
+}
+
+pub fun available_init(a: *Available, name: intern.StrId) R.Result[R.Void, str] {
+    @a = Available{};
+    val opened: O.Option[str] = ir.home_init(?a.home);
+    if (O.is_some[str](opened)) { ret R.err[R.Void, str](O.unwrap[str](opened)); }
+    val initialized: R.Result[ir.Module, str] = ir.init(?a.home.alloc, name);
+    if (R.is_err[ir.Module, str](initialized)) { ir.home_dnit(?a.home); ret R.err[R.Void, str](R.unwrap_err[ir.Module, str](initialized)); }
+    a.storage = R.unwrap_ok[ir.Module, str](initialized);
+    ret R.ok_void[str]();
+}
+
+pub fun detach(a: *Available, dst: *ir.Module) {
+    if (a == nil || !a.attached) { ret; }
+    var i: u32 = 0;
+    for (i < a.len) { dst.functions[a.indices[i]] = a.originals[i]; i = i + 1; }
+    a.attached = false;
+}
+
+pub fun available_dnit(a: *Available, dst: *ir.Module) {
+    if (a == nil) { ret; }
+    detach(a, dst);
+    ir.home_dnit(?a.home);
+}
+
+pub fun attach(a: *Available, dst: *ir.Module) R.Result[R.Void, str] {
+    if (a == nil) { ret R.ok_void[str](); }
+    if (a.attached) { ret R.err[R.Void, str]("inline body: available bodies already attached"); }
+    var i: u32 = 0;
+    for (i < a.len) {
+        val ix: u32 = a.indices[i];
+        if (ix >= dst.function_len || (dst.functions[ix].flags & ir.FN_FLAG_EXTERN) == 0
+            || dst.functions[ix].block_count != 0) { ret R.err[R.Void, str]("inline body: destination is not the original external declaration"); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < a.len) {
+        val ix: u32 = a.indices[i];
+        a.originals[i] = dst.functions[ix];
+        dst.functions[ix] = a.storage.functions[i];
+        dst.functions[ix].flags = dst.functions[ix].flags | ir.FN_FLAG_EXTERN;
+        i = i + 1;
+    }
+    a.attached = true;
+    ret R.ok_void[str]();
+}
+
+pub fun contains(a: *Available, ix: u32) bool {
+    if (a == nil) { ret false; }
+    var i: u32 = 0;
+    for (i < a.len) { if (a.indices[i] == ix) { ret true; } i = i + 1; }
+    ret false;
+}
+
+pub fun acquire(a: *Available, dst: *ir.Module, provider: *ir.Module, name: intern.StrId, tgt: *target.Target, scratch: *A.Allocator) R.Result[R.Void, str] {
+    if (a.attached) { ret R.err[R.Void, str]("inline body: cannot import during inline execution"); }
+    val found: O.Option[u32] = ir.function_lookup(provider, name);
+    if (O.is_none[u32](found)) { ret R.ok_void[str](); }
+    val i: u32 = O.unwrap[u32](found);
+    var c: Copy;
+    val initialized: R.Result[R.Void, str] = copy_init(?c, dst, provider, tgt, scratch);
+    if (R.is_err[R.Void, str](initialized)) { ret initialized; }
+    fin { copy_dnit(?c); }
+    val src: *ir.Function = ?provider.functions[i];
+    val existing: O.Option[u32] = ir.function_lookup(dst, src.name);
+    if (O.is_none[u32](existing) || !candidate(src)) { ret R.ok_void[str](); }
+    val ix: u32 = O.unwrap[u32](existing);
+    if ((dst.functions[ix].flags & ir.FN_FLAG_EXTERN) == 0 || contains(a, ix)) { ret R.ok_void[str](); }
+    var cost: Budget;
+    val measured: R.Result[bool, str] = measure(?c, src, ?cost);
+    if (R.is_err[bool, str](measured)) { ret R.err[R.Void, str](R.unwrap_err[bool, str](measured)); }
+    if (!R.unwrap_ok[bool, str](measured) || !charge(?a.budget, cost.instructions, cost.bytes)) { ret R.ok_void[str](); }
+    val copied: R.Result[ir.Function, str] = copy_function(?c, i, ?a.home.alloc);
+    if (R.is_err[ir.Function, str](copied)) { ret R.err[R.Void, str](R.unwrap_err[ir.Function, str](copied)); }
+    if (a.len == a.cap) {
+        var cap: u32 = 8;
+        if (a.cap != 0) { cap = a.cap * 2; }
+        val indices: R.Result[*u32, str] = A.reallocate[u32](?a.home.alloc, a.indices, a.cap::usize, cap::usize);
+        if (R.is_err[*u32, str](indices)) { ret R.err[R.Void, str](R.unwrap_err[*u32, str](indices)); }
+        a.indices = R.unwrap_ok[*u32, str](indices);
+        val originals: R.Result[*ir.Function, str] = A.reallocate[ir.Function](?a.home.alloc, a.originals, a.cap::usize, cap::usize);
+        if (R.is_err[*ir.Function, str](originals)) { ret R.err[R.Void, str](R.unwrap_err[*ir.Function, str](originals)); }
+        a.originals = R.unwrap_ok[*ir.Function, str](originals);
+        a.cap = cap;
+    }
+    val added: R.Result[u32, str] = ir.function_add(?a.storage, src.name, R.unwrap_ok[ir.Function, str](copied).sig, src.flags);
+    if (R.is_err[u32, str](added)) { ret R.err[R.Void, str](R.unwrap_err[u32, str](added)); }
+    val at: u32 = R.unwrap_ok[u32, str](added);
+    ir.function_dnit(?a.storage, ?a.storage.functions[at]);
+    a.storage.functions[at] = R.unwrap_ok[ir.Function, str](copied);
+    a.indices[a.len] = ix;
+    a.len = a.len + 1;
+    ret R.ok_void[str]();
+}
+
+pub fun growth_cost(fn: *ir.Function, out: *Budget) bool {
+    @out = Budget{};
+    if (fn.instr_len > MAX_INSTRUCTIONS) { ret false; }
+    var bytes: usize = 0;
+    if (!add_bytes(?bytes, fn.instr_len::usize * $size_of(instruction.Instruction))
+        || !add_bytes(?bytes, fn.block_count::usize * $size_of(ir.Block))) { ret false; }
+    var i: u32 = 0;
+    for (i < fn.block_count) {
+        val b: *ir.Block = ?fn.blocks[i];
+        if (!add_bytes(?bytes, b.instr_count::usize * $size_of(id.InstructionId))
+            || !add_bytes(?bytes, b.phi_count::usize * $size_of(id.InstructionId))
+            || !add_bytes(?bytes, b.pred_count::usize * $size_of(id.BlockId))) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < fn.instr_len) {
+        val ins: *instruction.Instruction = ?fn.instrs[i];
+        if (!add_bytes(?bytes, ins.operand_count::usize * $size_of(value.Value))) { ret false; }
+        var oi: u32 = 0;
+        for (oi < ins.operand_count) {
+            val v: *value.Value = ?ins.operands[oi];
+            if (v.kind == value.VAL_CONST_BYTES && !add_bytes(?bytes, v.data.bytes.len::usize)) { ret false; }
+            if (v.kind == value.VAL_CONST_AGG && (!add_bytes(?bytes, v.data.agg.len::usize)
+                || !add_bytes(?bytes, v.data.agg.reloc_count::usize * $size_of(value.AggReloc)))) { ret false; }
+            oi = oi + 1;
+        }
+        var key: id.InstructionId = i::id.InstructionId;
+        val assembly: R.Result[*ir.IrAsm, str] = map.get[id.InstructionId, ir.IrAsm](?fn.asm_blocks, ?key);
+        if (R.is_ok[*ir.IrAsm, str](assembly) && !add_bytes(?bytes,
+            R.unwrap_ok[*ir.IrAsm, str](assembly).bind_count::usize * $size_of(ir.IrAsmBind))) { ret false; }
+        i = i + 1;
+    }
+    if (!add_bytes(?bytes, fn.asm_blocks.cap * ($size_of(id.InstructionId) + $size_of(ir.IrAsm) + 1))
+        || !add_bytes(?bytes, fn.dbg_vars.cap * ($size_of(id.InstructionId) + $size_of(ir.DbgVar) + 1))
+        || !add_bytes(?bytes, fn.alloca_dbg_vars.cap * ($size_of(id.InstructionId) + $size_of(ir.DbgVar) + 1))
+        || !add_bytes(?bytes, fn.dbg_expr_ids.cap * ($size_of(id.InstructionId) + $size_of(ir.DbgExprId) + 1))
+        || !add_bytes(?bytes, fn.instr_inline_site.cap * ($size_of(id.InstructionId) + $size_of(u32) + 1))
+        || !add_bytes(?bytes, (fn.inline_site_len::usize + 1) * $size_of(ir.InlineSite))) { ret false; }
+    i = 0;
+    for (i < fn.dbg_expr_len) {
+        if (!add_bytes(?bytes, $size_of(ir.DbgExpr)) || !add_bytes(?bytes, fn.dbg_exprs[i].op_count::usize * $size_of(ir.DbgOp))) { ret false; }
+        i = i + 1;
+    }
+    out.instructions = fn.instr_len;
+    out.bytes = bytes;
+    ret true;
+}
+
+use std.allocator.page;
+use T: std.allocator.testing;
+use mach.lang.me.ir.builder;
+
+test "mach.lang.me.ir.body:owned_constants_types_and_effect_flags_survive_provider_retirement" {
+    var source_home: ir.ModuleHome;
+    if (O.is_some[str](ir.home_init(?source_home))) { ret 1; }
+    var source_live: bool = true;
+    fin { if (source_live) { ir.home_dnit(?source_home); } }
+    var dest_home: ir.ModuleHome;
+    if (O.is_some[str](ir.home_init(?dest_home))) { ret 2; }
+    fin { ir.home_dnit(?dest_home); }
+    val sr: R.Result[ir.Module, str] = ir.init(?source_home.alloc, 1);
+    val dr: R.Result[ir.Module, str] = ir.init(?dest_home.alloc, 1);
+    if (R.is_err[ir.Module, str](sr) || R.is_err[ir.Module, str](dr)) { ret 3; }
+    var src: ir.Module = R.unwrap_ok[ir.Module, str](sr);
+    var dst: ir.Module = R.unwrap_ok[ir.Module, str](dr);
+    val byte: R.Result[type.IrTypeId, str] = type.intern_int(?src.types, 8);
+    if (R.is_err[type.IrTypeId, str](byte)) { ret 4; }
+    val array: R.Result[type.IrTypeId, str] = type.intern_array(?src.types, R.unwrap_ok[type.IrTypeId, str](byte), 4);
+    if (R.is_err[type.IrTypeId, str](array)) { ret 5; }
+    val aty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](array);
+    val signature: R.Result[type.IrTypeId, str] = type.intern_fn(?src.types, aty, nil, 0, false);
+    if (R.is_err[type.IrTypeId, str](signature)) { ret 6; }
+    val added: R.Result[u32, str] = ir.function_add(?src, 2, R.unwrap_ok[type.IrTypeId, str](signature), ir.FN_FLAG_INLINE);
+    if (R.is_err[u32, str](added) || R.is_err[R.Void, str](ir.function_register(?src, 2, 0))) { ret 7; }
+    var b: builder.Builder = builder.init(?src);
+    builder.set_function(?b, ?src.functions[0]);
+    val block: R.Result[id.BlockId, str] = builder.new_block(?b);
+    if (R.is_err[id.BlockId, str](block)) { ret 8; }
+    builder.set_block(?b, R.unwrap_ok[id.BlockId, str](block));
+    var payload: [4]u8 = [4]u8{7, 11, 19, 23};
+    var result: value.Value = value.const_agg(?payload[0], 4, nil, 0, 0, aty);
+    result.secret = true;
+    if (R.is_err[R.Void, str](builder.emit_ret(?b, result))) { ret 9; }
+    val term: id.InstructionId = src.functions[0].blocks[0].terminator;
+    src.functions[0].instrs[term].secret = true;
+    src.functions[0].instrs[term].flags = instruction.INSTR_FLAG_EXACT;
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret 10; }
+    if (R.is_err[type.IrTypeId, str](type.intern_float(?dst.types, 64))) { ret 11; }
+    var tgt: target.Target;
+    val copied: R.Result[R.Void, str] = extract(?dst, ?src, ?tgt, ?backing, nil);
+    if (R.is_err[R.Void, str](copied)) { ret 12; }
+    ir.home_dnit(?source_home);
+    source_live = false;
+    payload[0] = 99;
+    val found: O.Option[u32] = ir.function_lookup(?dst, 2);
+    if (O.is_none[u32](found)) { ret 13; }
+    val fn: *ir.Function = ?dst.functions[O.unwrap[u32](found)];
+    val ins: *instruction.Instruction = ?fn.instrs[fn.blocks[0].terminator];
+    val owned: *value.Value = ?ins.operands[0];
+    if (fn.body_module != 1 || (fn.flags & ir.FN_FLAG_EXTERN) != 0 || !owned.secret || !ins.secret
+        || ins.flags != instruction.INSTR_FLAG_EXACT || owned.data.agg.bytes == ?payload[0]
+        || owned.data.agg.bytes[0] != 7 || owned.data.agg.bytes[3] != 23) { ret 14; }
+    if (dst.types.types[owned.ty].kind != type.IRT_ARRAY || dst.types.types[owned.ty].data.array_.count != 4
+        || dst.types.types[dst.types.types[owned.ty].data.array_.element].data.bits != 8) { ret 15; }
+    ret 0;
+}
+
+fun scratch_attempt(src: *ir.Module, ordinal: usize, attempts: *usize) i32 {
+    var testing: T.Testing;
+    if (O.is_some[str](T.make(?testing))) { ret 1; }
+    fin { T.dnit(?testing); }
+    T.fail_at_ordinal(?testing, ordinal);
+    var home: ir.ModuleHome;
+    if (O.is_some[str](ir.home_init(?home))) { ret 2; }
+    fin { ir.home_dnit(?home); }
+    val made: R.Result[ir.Module, str] = ir.init(?home.alloc, src.name);
+    if (R.is_err[ir.Module, str](made)) { ret 3; }
+    var dst: ir.Module = R.unwrap_ok[ir.Module, str](made);
+    var tgt: target.Target;
+    val copied: R.Result[R.Void, str] = extract(?dst, src, ?tgt, T.allocator_of(?testing), nil);
+    @attempts = T.attempt_count(?testing);
+    if ((ordinal == 0) != R.is_ok[R.Void, str](copied)) { ret 4; }
+    if (T.leaked(?testing) || T.double_free_count(?testing) != 0 || T.tracking_exhausted(?testing)) { ret 5; }
+    ret 0;
+}
+
+test "mach.lang.me.ir.body:scratch_refusal_releases_partial_remapping_and_budget_refusal_does_not_charge" {
+    var home: ir.ModuleHome;
+    if (O.is_some[str](ir.home_init(?home))) { ret 1; }
+    fin { ir.home_dnit(?home); }
+    val made: R.Result[ir.Module, str] = ir.init(?home.alloc, 1);
+    if (R.is_err[ir.Module, str](made)) { ret 2; }
+    var src: ir.Module = R.unwrap_ok[ir.Module, str](made);
+    val vt: R.Result[type.IrTypeId, str] = type.intern_void(?src.types);
+    if (R.is_err[type.IrTypeId, str](vt)) { ret 3; }
+    val signature: R.Result[type.IrTypeId, str] = type.intern_fn(?src.types, R.unwrap_ok[type.IrTypeId, str](vt), nil, 0, false);
+    if (R.is_err[type.IrTypeId, str](signature)) { ret 4; }
+    if (R.is_err[u32, str](ir.function_add(?src, 2, R.unwrap_ok[type.IrTypeId, str](signature), ir.FN_FLAG_INLINE))) { ret 5; }
+    var b: builder.Builder = builder.init(?src);
+    builder.set_function(?b, ?src.functions[0]);
+    val block: R.Result[id.BlockId, str] = builder.new_block(?b);
+    if (R.is_err[id.BlockId, str](block)) { ret 6; }
+    builder.set_block(?b, R.unwrap_ok[id.BlockId, str](block));
+    if (R.is_err[R.Void, str](builder.emit_ret_void(?b))) { ret 7; }
+    var attempts: usize = 0;
+    if (scratch_attempt(?src, 0, ?attempts) != 0 || attempts == 0) { ret 8; }
+    var ordinal: usize = 1;
+    for (ordinal <= attempts) {
+        var ignored: usize = 0;
+        if (scratch_attempt(?src, ordinal, ?ignored) != 0) { ret 9; }
+        ordinal = ordinal + 1;
+    }
+    var budget: Budget;
+    if (!charge(?budget, MAX_INSTRUCTIONS - 1, MAX_BYTES - 1)) { ret 10; }
+    if (charge(?budget, 2, 0) || charge(?budget, 0, 2)
+        || budget.instructions != MAX_INSTRUCTIONS - 1 || budget.bytes != MAX_BYTES - 1) { ret 11; }
+    if (!charge(?budget, 1, 1) || budget.instructions != MAX_INSTRUCTIONS || budget.bytes != MAX_BYTES) { ret 12; }
+    ret 0;
+}

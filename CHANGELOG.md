@@ -68,6 +68,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Release builds inline small helpers across module boundaries. A dependency's
+  raw lowered module yields a per-module `Q_INLINE_BODIES` product holding every
+  body under the size bar (or `#[inline]`) that is not recursive, `noinline`,
+  `scalar` or naked; an importer acquires those bodies into storage owned by its
+  own lowering and the inline pass expands them in place. No copy is emitted, a
+  remaining call or taken address still names the provider's symbol, assembly
+  payloads, effect flags, secrecy and debug metadata travel with the body, and
+  growth is charged in live instructions and owned bytes. `#[inline]` is no
+  longer monomorphized into importers and no longer part of the lowered
+  surface; an edit to a provider body reaches importers through the product,
+  which stops propagation when the extracted bodies are unchanged. (#3110)
+
 - The System V x86-64 classifier spent a register on an eightbyte that holds
   only padding: a 16-byte aggregate with data in its first eightbyte alone (an
   over-aligned `#[align(16)] rec { a: u8; }`) rode rdi and rsi and returned

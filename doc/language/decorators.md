@@ -130,7 +130,19 @@ ext fun wsa_startup(ver: u16, data: *u8) i32;
 ### `inline` — force inlining
 
 Marks a function for inlining at every call site, overriding the compiler's
-size- and use-count heuristics. Applies to functions only; takes no arguments.
+size and use-count heuristics. Applies to functions only and takes no arguments.
+The optimization pipeline must enable inlining. Indirect calls and recursive
+call cycles are not expanded by this attribute. Taking a function's address
+retains its callable identity even when direct calls are inlined.
+
+Release optimization makes small ordinary helper bodies available across source
+modules without emitting extra definitions. Extraction, import and per-caller
+expansion each have a limit of 1024 copied IR instructions and 256 KiB of owned
+payload. `inline` overrides size and use-count heuristics within those limits.
+A remaining call or taken address still names the original defining function.
+Helpers referencing compiler-local literal pools retain their calls because those
+objects have module-local identity. Named globals keep their original symbols,
+and copied instructions preserve effects, assembly bindings and debug locations.
 
 ```mach
 #[inline]
@@ -159,8 +171,8 @@ caller's instruction cache, or to hold code size down on a constrained target.
 - Purely a hint to the inliner; it does not otherwise change codegen. It binds
   at every optimization level — the debug pipeline runs no inlining pass at
   all, so `noinline` is inert (and unnecessary) there — and it will bind
-  identically to any future cross-module or LTO inlining path, which is not a
-  separate mechanism exempt from it.
+  identically when a callee body is available from another module. Recursive
+  peeling also respects `noinline` and `scalar`.
 
 ### `align(expr)` — alignment override
 
