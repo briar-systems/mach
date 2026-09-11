@@ -251,8 +251,8 @@ Verification, from-source compiler built by the seed 3.x at `out/audit/mach`:
 
 | bar | result |
 |---|---|
-| full suite | FULL_SUITE |
-| `sh test/census.sh` | CENSUS |
-| corpus spirv layers A and B | CORPUS_SPIRV |
-| corpus x86_64-linux layer B | CORPUS_X64 |
-| seed fixpoint (B built by A, C built by B) | FIXPOINT |
+| full suite | 2872 passed, 0 failed (baseline 2864 on feat/3218 b430e268e; the delta is exactly the seven `mach.lang.driver:tag_*_spirv` tests and `mach.lang.target.isa.spirv.types:tag_composite_is_interned_apart_from_a_record_of_the_same_members`) |
+| `sh test/census.sh` | all ok |
+| corpus spirv layers A and B | 248 pass, 0 fail, 100 skip (83 debug-unsupported, 17 declared), unchanged from the N4 baseline; no golden moved |
+| corpus x86_64-linux layer B | 91 pass, 0 fail, unchanged |
+| seed fixpoint (B built by A, C built by B) | `cmp` byte-identical, sha256 af286b02c03b90fc |
