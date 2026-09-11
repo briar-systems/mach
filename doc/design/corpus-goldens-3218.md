@@ -124,3 +124,31 @@ The nine skips are the nine corpus cases SPIR-V does not cover.
 | x86_64-darwin | 91 | 0 | 0 |
 | x86_64-linux | 91 | 0 | 0 |
 | x86_64-windows | 91 | 0 | 0 |
+
+
+## Second refresh: release -g additivity fix (d2a9842d)
+
+The additivity fix makes inlining cost count only live non-debug instructions, so the release inliner's decisions change for bodies near the size boundary. Exactly three cases moved on every one of the six machine targets, all O2, and nothing moved on SPIR-V (no inliner). Where the count of call instructions rises, a body that debug slots had pushed past the budget is now inlined less; where it is unchanged, only frame layout moved.
+
+| golden | lines removed | lines added | calls before | calls after |
+|---|---|---|---|---|
+| aarch64-darwin/call/call_ret_large.dis | 279 | 283 | 42 | 53 |
+| aarch64-darwin/call/call_variadic.dis | 16 | 62 | 0 | 14 |
+| aarch64-darwin/vec/vec_cmp_select.dis | 130 | 230 | 24 | 30 |
+| aarch64-linux/call/call_ret_large.dis | 279 | 283 | 42 | 53 |
+| aarch64-linux/call/call_variadic.dis | 16 | 62 | 0 | 14 |
+| aarch64-linux/vec/vec_cmp_select.dis | 130 | 230 | 24 | 30 |
+| riscv64-linux/call/call_ret_large.dis | 686 | 850 | 86 | 97 |
+| riscv64-linux/call/call_variadic.dis | 18 | 70 | 4 | 18 |
+| riscv64-linux/vec/vec_cmp_select.dis | 1357 | 1453 | 85 | 91 |
+| x86_64-darwin/call/call_ret_large.dis | 550 | 640 | 2 | 2 |
+| x86_64-darwin/call/call_variadic.dis | 31 | 96 | 0 | 0 |
+| x86_64-darwin/vec/vec_cmp_select.dis | 225 | 274 | 0 | 0 |
+| x86_64-linux/call/call_ret_large.dis | 550 | 640 | 2 | 2 |
+| x86_64-linux/call/call_variadic.dis | 31 | 96 | 0 | 0 |
+| x86_64-linux/vec/vec_cmp_select.dis | 225 | 274 | 0 | 0 |
+| x86_64-windows/call/call_ret_large.dis | 534 | 633 | 5 | 5 |
+| x86_64-windows/call/call_variadic.dis | 26 | 102 | 0 | 0 |
+| x86_64-windows/vec/vec_cmp_select.dis | 65 | 111 | 0 | 0 |
+
+Blessed with the compiler at 023890ca after the sweep showed the same three cases on all six targets (88 pass, 3 fail each) and nothing else.
