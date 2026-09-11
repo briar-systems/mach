@@ -8,6 +8,7 @@ use std.types.string.str;
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
+use V: std.collections.vector;
 
 use mach.lang.intern;
 use mach.lang.be.codegen.mir;
@@ -1186,6 +1187,140 @@ fun emit_ret_slot_to_vreg(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.P
     ret capture_slot_reg(ctx, mb, dst, slot, ty);
 }
 
+fun append_abi_input(inputs: *V.Vector[mir.MirAbiInput], input: mir.MirAbiInput) R.Result[R.Void, str] {
+    if (input.width == 0 || input.logical_width > input.width) {
+        ret R.err[R.Void, str]("mir.abi: invalid incoming carrier extent");
+    }
+    if (input.location == mir.ABI_INPUT_REGISTER) {
+        if (input.reg == mir.MIR_VREG_NIL) {
+            ret R.err[R.Void, str]("mir.abi: incoming carrier has no physical register");
+        }
+    } or (input.location != mir.ABI_INPUT_ARG_STACK || input.offset < 0) {
+        ret R.err[R.Void, str]("mir.abi: invalid incoming argument-area location");
+    }
+    val pushed: R.Result[usize, str] = V.push[mir.MirAbiInput](inputs, input);
+    if (R.is_err[usize, str](pushed)) { ret R.err[R.Void, str](R.unwrap_err[usize, str](pushed)); }
+    ret R.ok_void[str]();
+}
+
+fun record_param_input(ctx: *context.LowerCtx, inputs: *V.Vector[mir.MirAbiInput],
+                       index: u32, slot: abi.ParamSlot) R.Result[R.Void, str] {
+    val param: value.Value = ctx.fn.params[index];
+    val ty: O.Option[*type.IrType] = type.get(ctx.types, param.ty);
+    if (O.is_none[*type.IrType](ty)) { ret R.err[R.Void, str]("mir.abi: incoming parameter type is absent"); }
+    val size: u64 = type.byte_size_for_machine(ctx.types, param.ty, ctx.layout)::u64;
+    if (size == 0) { ret R.ok_void[str](); }
+    val aggregate: bool = context.value_is_aggregate(ctx, param.ty);
+    val indirect: bool = slot.class == abi.CLASS_BYREF || slot.class == abi.CLASS_STACK_BYREF
+        || slot.class == abi.CLASS_VEC_BYREF || slot.class == abi.CLASS_VEC_STACK_BYREF;
+    var input: mir.MirAbiInput;
+    input.argument = index;
+    input.reg = mir.MIR_VREG_NIL;
+    input.secret = param.secret;
+    input.content = mir.ABI_CONTENT_NONE;
+    input.content_size = 0;
+    # a pointee's secrecy is not visible at the ir boundary, so it is unknown rather than public
+    if (O.unwrap[*type.IrType](ty).kind == type.IRT_PTR) { input.content = mir.ABI_CONTENT_UNKNOWN; }
+    if (indirect) {
+        input.width = ctx.tgt.model.pointer_width::u64;
+        input.logical_width = input.width;
+        input.content_size = size;
+        input.content = mir.ABI_CONTENT_PUBLIC;
+        if (input.secret) { input.content = mir.ABI_CONTENT_SECRET; }
+        input.secret = false;
+        if (slot.class == abi.CLASS_STACK_BYREF || slot.class == abi.CLASS_VEC_STACK_BYREF) {
+            input.location = mir.ABI_INPUT_ARG_STACK;
+            input.offset = slot.offset;
+        } or {
+            if (slot.reg < 0) { ret R.err[R.Void, str]("mir.abi: indirect input has no physical register"); }
+            input.reg = slot.reg::u32;
+        }
+        ret append_abi_input(inputs, input);
+    }
+    if (slot.class == abi.CLASS_STACK) {
+        input.location = mir.ABI_INPUT_ARG_STACK;
+        input.offset = slot.offset;
+        input.width = size;
+        if (!aggregate) {
+            input.width = scalar_mem_move_width(ctx.tgt.model.gpr_width, size,
+                natural_stack_slot(ctx.tgt, false))::u64;
+        }
+        input.logical_width = size;
+        ret append_abi_input(inputs, input);
+    }
+    if (slot.class != abi.CLASS_GP && slot.class != abi.CLASS_FP) {
+        ret R.err[R.Void, str]("mir.abi: incoming parameter has no native carrier class");
+    }
+    if (slot.piece_count == 0 || slot.piece_count > abi.PARAM_MAX_PIECES) {
+        ret R.err[R.Void, str]("mir.abi: incoming parameter has invalid carrier pieces");
+    }
+    var i: u32 = 0;
+    for (i < slot.piece_count) {
+        val piece: abi.ParamPiece = slot.pieces[i];
+        val wr: R.Result[u8, str] = abi.piece_memory_width(?slot, ?slot.pieces[i]);
+        if (R.is_err[u8, str](wr)) { ret R.err[R.Void, str](R.unwrap_err[u8, str](wr)); }
+        input.logical_width = R.unwrap_ok[u8, str](wr)::u64;
+        input.width = piece.width::u64;
+        input.location = mir.ABI_INPUT_REGISTER;
+        input.offset = 0;
+        if (piece.kind == abi.PIECE_STACK) {
+            if (piece.stk_off < 0 || slot.offset < 0 || slot.offset > 0x7FFFFFFFFFFFFFFF - piece.stk_off) {
+                ret R.err[R.Void, str]("mir.abi: incoming stack piece offset overflow");
+            }
+            input.location = mir.ABI_INPUT_ARG_STACK;
+            input.reg = mir.MIR_VREG_NIL;
+            input.offset = slot.offset + piece.stk_off;
+            input.width = input.logical_width;
+        } or {
+            if (piece.reg < 0) { ret R.err[R.Void, str]("mir.abi: incoming piece has no physical register"); }
+            input.reg = piece.reg::u32;
+        }
+        if (input.logical_width != 0) {
+            val added: R.Result[R.Void, str] = append_abi_input(inputs, input);
+            if (R.is_err[R.Void, str](added)) { ret added; }
+        }
+        i = i + 1;
+    }
+    ret R.ok_void[str]();
+}
+
+fun record_abi_inputs(ctx: *context.LowerCtx, slots: *abi.SigLayout) R.Result[R.Void, str] {
+    if (slots.param_count != ctx.param_count || ctx.param_count != ctx.fn.param_count) {
+        ret R.err[R.Void, str]("mir.abi: incoming signature does not match declared parameters");
+    }
+    if (ctx.f.abi_inputs != nil || ctx.f.abi_input_count != 0 || ctx.f.abi_input_cap != 0) {
+        ret R.err[R.Void, str]("mir.abi: incoming carrier facts were already recorded");
+    }
+    var inputs: V.Vector[mir.MirAbiInput] = V.init[mir.MirAbiInput](ctx.alloc);
+    fin { V.dnit[mir.MirAbiInput](?inputs); }
+    if (slots.ret_slot.class == abi.CLASS_SRET) {
+        if (ctx.tgt.abi.indirect_result_reg < 0) { ret R.err[R.Void, str]("mir.abi: indirect result has no physical register"); }
+        var result: mir.MirAbiInput;
+        result.argument = mir.ABI_INPUT_SRET;
+        result.reg = ctx.tgt.abi.indirect_result_reg::u32;
+        result.width = ctx.tgt.model.pointer_width::u64;
+        result.logical_width = result.width;
+        result.secret = false;
+        result.content = mir.ABI_CONTENT_OUTPUT;
+        result.content_size = type.byte_size_for_machine(ctx.types, context.fn_return_type(ctx), ctx.layout)::u64;
+        val added: R.Result[R.Void, str] = append_abi_input(?inputs, result);
+        if (R.is_err[R.Void, str](added)) { ret added; }
+    }
+    var i: u32 = 0;
+    for (i < slots.param_count) {
+        val added: R.Result[R.Void, str] = record_param_input(ctx, ?inputs, i, slots.params[i]);
+        if (R.is_err[R.Void, str](added)) { ret added; }
+        i = i + 1;
+    }
+    ctx.f.abi_inputs = inputs.data;
+    ctx.f.abi_input_count = inputs.len;
+    ctx.f.abi_input_cap = inputs.cap;
+    inputs.data = nil;
+    inputs.len = 0;
+    inputs.cap = 0;
+    ret R.ok_void[str]();
+}
+
 pub fun lower_params(ctx: *context.LowerCtx, mb: *mir.MirBlock) R.Result[R.Void, str] {
     var copies: mir.MirBlock;
     fin { mir.dnit_block(ctx.alloc, ?copies); }
@@ -1198,6 +1333,14 @@ pub fun lower_params(ctx: *context.LowerCtx, mb: *mir.MirBlock) R.Result[R.Void,
         val vr: R.Result[R.Void, str] = lower_value_params(ctx, mb, ?layout);
         sig_layout_free(ctx, ?layout);
         ret vr;
+    }
+
+    if (ctx.f.oblivious) {
+        val inputs: R.Result[R.Void, str] = record_abi_inputs(ctx, ?layout);
+        if (R.is_err[R.Void, str](inputs)) {
+            sig_layout_free(ctx, ?layout);
+            ret inputs;
+        }
     }
 
     if (layout.ret_slot.class == abi.CLASS_SRET) {
@@ -1800,6 +1943,94 @@ test "mach.lang.be.codegen.mir.abi.classify_signature:odd_vector_sret_shifts_mix
     ret 0;
 }
 
+test "mach.lang.be.codegen.mir.abi:incoming_security_facts_preserve_carriers_and_indirect_contents" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val mr: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](mr)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](mr);
+    fin { ir.dnit(?m); }
+    var reg: treg.TargetRegistry = treg.registry_init();
+    fin { treg.registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](treg.register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
+    val tr: R.Result[target.Target, str] = treg.select(?reg, "x86_64", "windows", "win64");
+    if (R.is_err[target.Target, str](tr)) { ret 1; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+    val br: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 8);
+    val fr: R.Result[type.IrTypeId, str] = type.intern_float(?m.types, 64);
+    val pr: R.Result[type.IrTypeId, str] = type.intern_ptr(?m.types);
+    if (R.is_err[type.IrTypeId, str](br) || R.is_err[type.IrTypeId, str](fr)
+        || R.is_err[type.IrTypeId, str](pr)) { ret 1; }
+    val ar: R.Result[type.IrTypeId, str] = type.intern_array(?m.types, R.unwrap_ok[type.IrTypeId, str](br), 24);
+    val vr: R.Result[type.IrTypeId, str] = type.intern_vector(?m.types, R.unwrap_ok[type.IrTypeId, str](br), 16);
+    if (R.is_err[type.IrTypeId, str](ar) || R.is_err[type.IrTypeId, str](vr)) { ret 1; }
+    val array: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](ar);
+    val ptr: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](pr);
+    var types: [7]type.IrTypeId = [7]type.IrTypeId{R.unwrap_ok[type.IrTypeId, str](br),
+        R.unwrap_ok[type.IrTypeId, str](fr), ptr, ptr, array, array, R.unwrap_ok[type.IrTypeId, str](vr)};
+    val sr: R.Result[type.IrTypeId, str] = type.intern_fn(?m.types, array, ?types[0], 7, false);
+    if (R.is_err[type.IrTypeId, str](sr)) { ret 1; }
+    var params: [7]value.Value;
+    var i: u32 = 0;
+    for (i < 7) { params[i] = value.param(i, types[i]); i = i + 1; }
+    params[0].secret = true;
+    params[3].secret = true;
+    params[4].secret = true;
+    var fn: ir.Function;
+    fn.sig = R.unwrap_ok[type.IrTypeId, str](sr);
+    fn.params = ?params[0];
+    fn.param_count = 7;
+    var f: mir.MirFunction;
+    fin { mir.dnit_function(?alloc, ?f); }
+    var ctx: context.LowerCtx;
+    ctx.alloc = ?alloc;
+    ctx.tgt = ?tgt;
+    ctx.layout = target.layout_machine(?tgt);
+    ctx.types = ?m.types;
+    ctx.fn = ?fn;
+    ctx.f = ?f;
+    ctx.param_count = 7;
+    var slots: abi.SigLayout;
+    if (R.is_err[R.Void, str](classify_signature(?ctx, fn.sig, array, ?slots))) { ret 2; }
+    fin { sig_layout_free(?ctx, ?slots); }
+    if (R.is_err[R.Void, str](record_abi_inputs(?ctx, ?slots))) { ret 3; }
+    if (f.abi_input_count != 8) { ret 4; }
+    val inputs: *mir.MirAbiInput = f.abi_inputs;
+    if (inputs[0].argument != mir.ABI_INPUT_SRET || inputs[0].reg != 1
+        || inputs[0].secret || inputs[0].content != mir.ABI_CONTENT_OUTPUT
+        || inputs[0].content_size != 24) { ret 5; }
+    i = 1;
+    for (i < 8) {
+        var logical: u64 = 8;
+        if (i == 1) { logical = 1; }
+        if (inputs[i].argument != i - 1 || inputs[i].width != 8 || inputs[i].logical_width != logical
+            || param_has_use(?fn, i - 1)) { ret 6; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 4) {
+        if (inputs[i].location != mir.ABI_INPUT_REGISTER) { ret 7; }
+        i = i + 1;
+    }
+    if (inputs[1].reg != 2 || !inputs[1].secret || inputs[1].content != mir.ABI_CONTENT_NONE
+        || inputs[2].reg != isa.regid_make(isa.REG_CLASS_ID_XMM, 2)::u32 || inputs[2].secret
+        || inputs[3].reg != 9 || inputs[3].secret || inputs[3].content != mir.ABI_CONTENT_UNKNOWN) { ret 7; }
+    i = 4;
+    for (i < 8) {
+        if (inputs[i].location != mir.ABI_INPUT_ARG_STACK || inputs[i].offset != 32 + (i - 4)::i64 * 8) { ret 8; }
+        i = i + 1;
+    }
+    if (!inputs[4].secret || inputs[4].content != mir.ABI_CONTENT_UNKNOWN
+        || inputs[5].secret || inputs[5].content != mir.ABI_CONTENT_SECRET || inputs[5].content_size != 24
+        || inputs[6].secret || inputs[6].content != mir.ABI_CONTENT_PUBLIC || inputs[6].content_size != 24
+        || inputs[7].secret || inputs[7].content != mir.ABI_CONTENT_PUBLIC || inputs[7].content_size != 16) { ret 9; }
+    params[0].secret = false;
+    if (!inputs[1].secret || !R.is_err[R.Void, str](record_abi_inputs(?ctx, ?slots))) { ret 10; }
+    mir.dnit_function(?alloc, ?f);
+    if (f.abi_inputs != nil || f.abi_input_count != 0 || f.abi_input_cap != 0) { ret 11; }
+    ret 0;
+}
+
 fun t_call_preparation(indirect: bool, sret: bool) i32 {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }
@@ -2257,6 +2488,7 @@ test "mach.lang.be.codegen.mir.abi:incoming_copies_follow_all_parameter_captures
     fn.params = ?params[0];
     fn.param_count = 3;
     var f: mir.MirFunction;
+    f.oblivious = true;
     fin { mir.dnit_function(?alloc, ?f); }
     val regs: R.Result[*mir.MirVReg, str] = A.allocate[mir.MirVReg](?alloc, mir.INITIAL_VREG_CAP::usize);
     if (R.is_err[*mir.MirVReg, str](regs)) { ret 1; }
@@ -2279,6 +2511,13 @@ test "mach.lang.be.codegen.mir.abi:incoming_copies_follow_all_parameter_captures
     var mb: mir.MirBlock;
     fin { mir.dnit_block(?alloc, ?mb); }
     if (R.is_err[R.Void, str](lower_params(?ctx, ?mb))) { ret 2; }
+    if (f.abi_input_count != 5 || f.abi_inputs[0].secret || f.abi_inputs[1].secret
+        || f.abi_inputs[2].secret || f.abi_inputs[3].secret || f.abi_inputs[4].secret) { ret 4; }
+    if (f.abi_inputs[0].width != 4 || f.abi_inputs[1].width != 8
+        || f.abi_inputs[1].reg != isa.regid_make(isa.REG_CLASS_ID_XMM, 0)::u32
+        || f.abi_inputs[2].location != mir.ABI_INPUT_ARG_STACK || f.abi_inputs[2].width != 4
+        || f.abi_inputs[2].argument != 0 || f.abi_inputs[3].argument != 1
+        || f.abi_inputs[4].argument != 2 || f.abi_inputs[4].width != 16) { ret 4; }
     var bytes: CarrierBytes;
     bytes.strict_alignment = true;
     bytes.copy_clobbers_registers = true;
