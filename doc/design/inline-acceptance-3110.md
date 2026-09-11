@@ -63,6 +63,16 @@ Resolutions against `dev` made while porting:
 - `lower_parallel_enabled` and the `slot_len <= 1` gate keep `dev`'s shape; the
   candidate's change to run the prepared path unconditionally came with its
   readout test rewrite and is not part of the inline concern.
+- The candidate's `Q_LOWER` compute recorded no dependency on the module's own
+  typed definition when it took the raw module `Q_INLINE_BODIES` had captured:
+  the definition read lived inside the raw lowering, which the capture skips.
+  Under the owned registration every recompute of the bodies product advanced
+  its revision and hid that; under the equatable one an edit to a provider
+  function that is not extracted left the provider's own `Q_LOWER` reused with
+  the old body. `lower_inputs` now records the definition and target reads on
+  every product built from a raw lowering, capture or not
+  (`driver:inline_body_product_stops_propagation_when_extracted_bodies_are_equal`
+  fails without it).
 
 Not taken from `c2fbd635` (owned by other lanes): the SPIR-V logical
 addressing hunks (`ir/type.mach` pointee, `ir/printer.mach`, `ir/verify.mach`
@@ -128,9 +138,11 @@ not recorded. The candidate bar `SMALL_INSTRUCTIONS` (25) is the documented
 threshold below which an unannotated helper is eligible.
 
 Verdict: accepted with the port. Phase 1 adds
-`driver:inline_helper_at_the_size_threshold_keeps_its_call` (a 25-live-instruction
-helper keeps its call, a 24-instruction one does not) with a mutation control
-on the threshold.
+`inline.run:helper_at_the_size_bar_keeps_its_call` (a two-caller helper of 24
+live instructions loses both calls, one of 25 keeps both; mutation control:
+`<` to `<=` on the bar inlines the 25-instruction body) and the `bg` leg of the
+rule test below, a 27-instruction provider body that keeps its call across
+modules.
 
 ### Recursion, indirect calls, `noinline`, unsupported asm
 
@@ -153,8 +165,12 @@ extraction skips every member of a call cycle, `peel_eligible` refuses
 and an extern-attached body is never treated as a free single-caller inline.
 
 Verdict: accepted with the port; the rule is documented in
-`doc/language/decorators.md`. Phase 1 adds one driver test over the four cases
-with a control per guard: `driver:inline_rule_keeps_recursive_indirect_noinline_and_naked_calls`.
+`doc/language/decorators.md`. Phase 1 adds one cross-module driver test over
+every case beside a small direct helper that does lose its call:
+`driver:inline_rule_keeps_recursive_indirect_noinline_naked_and_large_calls`
+(a self-recursive provider, a call through a function-pointer parameter whose
+callee operand is not a `VAL_FN`, a `noinline` provider, a `naked` asm provider
+and a body over the bar each keep exactly one call).
 
 ### Effects and order
 
@@ -171,10 +187,12 @@ extern-attached body. Shown by the `assembly` (one `OP_ASM`, zero `OP_CALL`,
 which stays `is_extern` and not `is_local`) legs of the cross-module test.
 
 Verdict: accepted with the port. Phase 1 adds
-`driver:inline_effectful_asm_wrapper_keeps_its_effects_and_order` (an atomic-shaped
-wrapper inlined cross-module: the asm survives the release pipeline with its
-result unused, two identical wrappers are not merged, and the MIR instruction
-keeps its `MirAsm` payload) and `driver:inline_naked_asm_wrapper_is_refused`.
+`driver:inline_effectful_asm_wrapper_keeps_its_effects_and_order`: `load`,
+`store` and `fence` shaped like the std wrappers, inlined across modules; two
+identical loads stay two `OP_ASM`, a load whose result is unused survives the
+release pipeline, store/fence/store keep their order in IR and at MIR, and each
+MIR asm keeps its `MirAsm` payload with both `{name}` bindings. The `naked`
+refusal is the `nkd` leg of the rule test.
 
 ### Secrecy
 
@@ -191,9 +209,11 @@ the secret `OP_ADD` and its flag. The caller-side hole above is untouched.
 
 Verdict: gap on both. Phase 1 closes it in the inline pass: an `#[oblivious]`
 callee is inlined only into an `#[oblivious]` caller, so the validation domain a
-function declared is the one its instructions are validated in.
-`driver:inline_oblivious_callee_stays_a_call_in_a_public_caller` with a
-mutation control.
+function declared is the one its instructions are validated in. Same-module
+`inline.run:oblivious_callee_inlines_only_into_an_oblivious_caller` and
+cross-module `driver:inline_oblivious_callee_stays_a_call_in_a_public_caller`;
+mutation control: dropping the flag check in `should_inline` inlines into the
+public caller and fails both.
 
 ### Debug mapping
 
@@ -211,9 +231,12 @@ excludes `OP_DBG_VALUE` and dead arena slots (`body:debug_annotation_does_not_mo
 so `-g` cannot change an inlining decision.
 
 Verdict: accepted with the port. Phase 1 adds
-`driver:release_text_is_byte_identical_with_and_without_g_at_the_inline_threshold`
-over a fixture whose callee sits one instruction under the bar with a `dbg_value`
-that would push it over.
+`driver:release_text_is_byte_identical_with_and_without_g_at_the_inline_bar`:
+a provider body of 23 live instructions with eleven locals, whose `-g` build
+adds a `dbg_value` per local, is inlined at both call sites with and without
+`-g` and the importer's `.text` bytes are identical; mutation control: counting
+`OP_DBG_VALUE` in `body.counted()` keeps the calls under `-g` and the texts
+differ.
 
 ### Cache and query dependency invalidation
 
@@ -228,10 +251,12 @@ a helper that was ineligible (it names a module-local literal pool) becomes
 eligible and then changes, and the importer's `Q_LOWER` revision moves each
 round while the provider's surface does not.
 
-Verdict: accepted with the port, with the equatable registration above. The
-`dev` test is retargeted: the surface no longer moves on an `#[inline]` body
-edit and the importer still re-lowers. Phase 1 adds the early-cutoff control
-`driver:inline_body_product_stops_propagation_when_extracted_bodies_are_equal`.
+Verdict: accepted with the port, with the equatable registration and the
+`lower_inputs` fix above. The `dev` test is retargeted: the surface no longer
+moves on an `#[inline]` body edit and the importer still re-lowers. Phase 1
+adds `driver:inline_body_product_stops_propagation_when_extracted_bodies_are_equal`:
+an edit to a `noinline` provider function moves the provider's `Q_LOWER` and
+not the importer's, and an edit to the extracted helper moves both.
 
 ### Pure versus atomic controls
 

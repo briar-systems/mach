@@ -136,9 +136,14 @@ call cycles are not expanded by this attribute. Taking a function's address
 retains its callable identity even when direct calls are inlined.
 
 Release optimization makes small ordinary helper bodies available across source
-modules without emitting extra definitions. Extraction, import and per-caller
-expansion each have a limit of 1024 copied IR instructions and 256 KiB of owned
-payload. `inline` overrides size and use-count heuristics within those limits.
+modules without emitting extra definitions. A helper is small when its body has
+fewer than 25 live instructions after promotion, debug annotations excluded, so
+`-g` never moves the decision. Extraction, import and per-caller expansion each
+have a limit of 1024 copied IR instructions and 256 KiB of owned payload.
+`inline` overrides size and use-count heuristics within those limits. An
+`oblivious` function is expanded only into another `oblivious` function, so
+its instructions never leave a constant-time validated body; a `naked` or
+`noinline` function, a recursive cycle and an indirect call are never expanded.
 A remaining call or taken address still names the original defining function.
 Generic, comptime and pack specializations keep their existing shared weak
 linkage. When several modules materialize that same specialization, body import

@@ -78,7 +78,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   growth is charged in live instructions and owned bytes. `#[inline]` is no
   longer monomorphized into importers and no longer part of the lowered
   surface; an edit to a provider body reaches importers through the product,
-  which stops propagation when the extracted bodies are unchanged. (#3110)
+  which stops propagation when the extracted bodies are unchanged. An
+  `#[oblivious]` body is expanded only into an `#[oblivious]` caller, so its
+  instructions never leave a constant-time validated function. (#3110)
 
 - The System V x86-64 classifier spent a register on an eightbyte that holds
   only padding: a 16-byte aggregate with data in its first eightbyte alone (an
