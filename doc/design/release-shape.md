@@ -21,7 +21,7 @@ main commit `b65afb9704218e89998af5f71050ca315e7709a9` with std **1.0.1**
 reachable from main. The bridge contains the same compiler source and manifest
 as the earlier audit bridge. No retired proof branch is required.
 
-There are four builds: one bridge build followed by audited A, B and C.
+There are four builds: one bridge build followed by audited A, B and C. The
 bootstrap uses the debug profile, with optimization and compiler debug symbols
 disabled. Both repositories install audited B only after B and C match byte for
 byte. Ordinary CI then runs its existing debug and release checks with that
