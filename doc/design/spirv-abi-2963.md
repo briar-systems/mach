@@ -57,7 +57,9 @@ sites on `dev`, every one of which the acceptance below removes:
   nominal positions) and `mir/context.mach:586-594` their constructors.
 - `mir/abi.mach:33 MAX_GP_ARG_REGS = 16` and `:45 abi_gp_arg_reg` filling a fixed
   `[16]isa.Register` from the convention's bank (the shared overrun hazard #2962
-  guards), reachable for SPIR-V only because the bank exists.
+  guards), reachable for SPIR-V only because the bank exists. It stays for the
+  carriers conventions and is unreachable from a values convention, which
+  publishes no bank.
 
 ### 1.2 What the candidate era adds that `dev` lacks
 
@@ -146,7 +148,8 @@ hand-written module under `spv1.0`, `spv1.3`, `spv1.4`, `spv1.6`, `vulkan1.0`,
 | pointer result (`fun f(p: *Rec) *Rec`) | refused, located | a `Function`-storage pointer result needs VariablePointers-class capabilities outside the declared environments |
 | pointer held in a record or array, pointer-valued local | refused, located | a pointer in memory is a variable pointer |
 | recursive reference type (`rec Node { next: *Node; }`) by pointer | refused at lowering, located | the pointee type itself contains a pointer |
-| function value parameter | refused, located | no function pointers in logical addressing |
+| function value parameter | refused, located, "unsupported parameter N of type `fun(...) ...`: logical addressing has no function pointers" | no function pointers in logical addressing |
+| raw union parameter | refused, located, "unsupported parameter N of type `uni{...}`: SPIR-V has no untyped union" | no untyped union type |
 | pointer arithmetic (`mem/ptr_arith`) | refused | unchanged target limitation |
 
 Debug: the v5 release contract says SPIR-V "explicitly refuses debug requests".
@@ -155,9 +158,55 @@ registers no debug model. The driver test pins it on a SPIR-V target selection.
 
 ## 4. Acceptance map
 
-Filled in as the tests land; see the PR body for the final mapping.
+Every class in section 1 is demonstrated by a test that runs `spirv-val` on the
+module (the driver tests evaluate the module as well) or by a corpus cell whose
+layer A cell is `spirv-val` and whose layer B golden is `spirv-dis` text.
 
-## 5. The interface L6 will call
+| class | demonstration | evidence |
+|---|---|---|
+| scalar, vector, composite by value, pointer to record, more than 16 arguments, composite return | `mach.lang.driver:logical_value_abi_preserves_mixed_arguments_and_references_on_spirv` (21 parameters: 17 `u32`, `f32`, `Pair`, `*Pair`, `u32x4`; returns `Pair`; evaluates the module and finds the 25-word `OpFunctionCall`) | `src/lang/driver/tests.mach` |
+| more than 16 arguments in the corpus (#2923) | `call/call_mixed` layer A (o0, o2) and layer B; `mixed` has 20 `OpFunctionParameter` | `test/golden/spirv/call/call_mixed.dis` |
+| pointer to record, whole object (#2940 repro) | builds and validates at `-O0` and `-O2`: `%7 = OpTypePointer Function %Pair`, `fill` takes `%9 = OpFunctionParameter %7`, each field write is `OpAccessChain %12 %9 ...` + `OpStore`, the caller passes `%26 = OpVariable %7 Function` directly: `%33 = OpFunctionCall %4 %1 %26 %32` | this document, section 4 |
+| pointer to record, forwarded parameter | the driver test above (`forwarded(p, 8)` re-passes an `OpFunctionParameter`) | |
+| pointer to record in the corpus | `mem/rec_layout` layer B golden blessed; layer A o2 passes; o0 declared a target limitation (subobject argument) | `test/golden/spirv/mem/rec_layout.dis`, `test/golden/spirv/SKIPS` |
+| pointer to scalar | `mem/ptr_arith`'s `bump(p: *u64)` parameter is accepted; the refusal moved to the `MIR_GEP` that indexes off it | `SKIPS` entry quotes the new message |
+| illegal pointer classes still refused, located | `mach.lang.driver:logical_shader_reference_capabilities_refuse_returns_subobjects_and_cycles` (pointer result, subobject argument, recursive reference type), each with `main.mach:` in the diagnostic | |
+| function reference refused, located, naming the parameter and type | `mach.lang.driver:logical_shader_refuses_a_function_value_parameter_with_its_type`; corpus `call/call_indirect` quotes "unsupported parameter 1 of type `fun(i64, i64) i64` ..." | |
+| union refused naming the type | corpus `mem/uni_layout` quotes "unsupported parameter 2 of type `uni{f32, i32, i32, [4]i8}` ..." | |
+| readonly storage binding reached through a reference argument | `mach.lang.driver:spirv_refuses_an_escaping_readonly_storage_address` (a reference argument of a value call is a potential write to its origin) | |
+| `-g` refused by policy | `mach.lang.driver:spirv_debug_request_is_refused_by_the_declared_target_policy`; the corpus reports 83 `debug unsupported` cells for spirv | |
+| limit refusals are typed | `types.instruction_operands_fit` bounds `OpTypeFunction`, `OpFunctionCall` and mapped instructions by the 16-bit word count; `mach.lang.target.isa.spirv.types:logical_signature_has_no_synthetic_parameter_bank` interns a 256-parameter signature | `src/lang/target/isa/spirv/types.mach` |
+| no bank anywhere | `abi/spirv.mach` publishes no `gp_arg_regs`; `register.mach` publishes no register class; `emit.mach` has no `Regs`, no `MIR_OP_PREG` arm; `mach.lang.target.abi_vtable:granularity_matches_its_classifier` checks the values convention publishes nothing a bank would need | |
+| machine targets unchanged | corpus layer B on `x86_64-linux`: 91 pass, 0 fail, before and after; `tuple_capability` refuses a values convention on a register machine (`TUPLE_ABI_TRANSPORT`) | |
+
+Two rules landed beside the port because the first green run exposed them:
+
+- `MIR_RET` is `MIRF_NO_SHAPE`. On a values target the return carries its value
+  operand, and `instr_defines_shape` would otherwise type that operand as a fresh
+  definition of the machine word (an `f32` return became `f64`, a `u8` counter
+  `i64`). Machine targets emit `MIR_RET` with no operands, so the flag is inert
+  there.
+- A reference argument of `MIR_VALUE_CALL` is a potential write to its origin.
+  The candidate marked every argument read-only, which let a `*f32x4` argument
+  rooted in a `readonly` storage binding pass the readonly check and fail later
+  with an unrelated message.
+- An `OpFunctionCall` result id is allocated after its operands are read, so the
+  constants a call materializes precede the result. Twenty layer B goldens are
+  renumbered by exactly that; for each the id-stripped text, the opcode multiset
+  and the line count are unchanged (checked mechanically before blessing).
+
+## 5. Verification record
+
+| bar | result |
+|---|---|
+| full suite, from-source compiler | 2738 passed, 0 failed (baseline on `dev` 2633d5ba4: 2732); the six new tests are the two logical-ABI driver tests, the function-value refusal, the debug refusal, the 256-parameter signature and the typed-reference identity test |
+| `sh test/census.sh` | ok |
+| corpus spirv layers A and B | 248 pass, 0 fail, 100 skip (83 debug-unsupported cells, 17 declared); 22 goldens blessed: 2 new, 20 renumbered |
+| corpus x86_64-linux layer B | 91 pass, 0 fail |
+| `spirv-val` probe of the subobject-argument rule | rejected under spv1.0, spv1.3, spv1.4, spv1.6, vulkan1.0 through vulkan1.3 |
+| mutation controls | each refusal deleted in turn, its test fails: debug refusal in `passes.mach debug_info_of` (exit 4); subobject argument check in `read_value` (exit 14); pointer-result check in `emit_function` (exit 4); recursive-reference guard in `lower/context.mach` (segfault: unbounded `lower_type` recursion); parameter-type refusal in `emit_function` (exit 5). The `MIR_RET` shape flag and the reference-argument write rule were each seen failing four and one existing tests before they landed |
+
+## 6. The interface L6 will call
 
 L6 carries a tag (declared discriminator plus payload composite) through SPIR-V
 storage, composites, calls and returns. The surface it uses, and what may not
