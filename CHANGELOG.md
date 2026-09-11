@@ -53,6 +53,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The System V x86-64 classifier spent a register on an eightbyte that holds
+  only padding: a 16-byte aggregate with data in its first eightbyte alone (an
+  over-aligned `#[align(16)] rec { a: u8; }`) rode rdi and rsi and returned
+  through rax and rdx, where gcc and clang classify the empty eightbyte
+  NO_CLASS and use rdi and rax alone. A C callee read its next argument from
+  the wrong register and a returned object copied rdx's leftovers into its
+  tail padding. Padding-only eightbytes now consume no register, the
+  classifier emits one piece per populated eightbyte, and the store side zeroes
+  every logical byte no piece delivers (#3263).
 - The names of tables marked `default = true` collected while parsing
   `[target.*]` and `[profile.*]` were never released (#3222).
 
