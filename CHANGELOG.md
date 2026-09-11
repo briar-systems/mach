@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into the object's `Tag_RISCV_arch`; an unknown extension, another version, a
   noncanonical string or the E base is refused rather than rounded up to the
   default machine (#3127).
+- `test/memory.py` measures a compiler's peak resident memory and wall time over
+  a cold self-build and three synthetic workload families (many modules, one
+  dense module, a large by-value aggregate) at both profiles and two worker
+  counts, checking every generated executable's output and the worker-count
+  image identity; with a control compiler the two alternate over identical
+  inputs. The `compiler memory` workflow runs it on demand, never on the PR
+  lane. The 2026-09-06 archive measurements it replaces are preserved in
+  `doc/design/2299-archive-inventory.md` (#2299).
 
 ### Fixed
 
