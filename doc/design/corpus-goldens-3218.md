@@ -128,7 +128,7 @@ The nine skips are the nine corpus cases SPIR-V does not cover.
 
 ## Second refresh: release -g additivity fix (d2a9842d)
 
-The additivity fix makes inlining cost count only live non-debug instructions, so the release inliner's decisions change for bodies near the size boundary. Exactly three cases moved on every one of the six machine targets, all O2, and nothing moved on SPIR-V (no inliner). Where the count of call instructions rises, a body that debug slots had pushed past the budget is now inlined less; where it is unchanged, only frame layout moved.
+The additivity fix makes inlining cost count only live non-debug instructions, so the release inliner's decisions change for bodies near the size boundary. Exactly three cases moved on every one of the six machine targets, all O2, and the same three moved on SPIR-V, because the decision is made in the middle end before any backend. Where the count of call instructions rises, a body that debug slots had pushed past the budget is now inlined less; where it is unchanged, only frame layout moved.
 
 | golden | lines removed | lines added | calls before | calls after |
 |---|---|---|---|---|
@@ -152,3 +152,9 @@ The additivity fix makes inlining cost count only live non-debug instructions, s
 | x86_64-windows/vec/vec_cmp_select.dis | 65 | 111 | 0 | 0 |
 
 Blessed with the compiler at 023890ca after the sweep showed the same three cases on all six targets (88 pass, 3 fail each) and nothing else.
+
+| golden | lines removed | lines added | OpFunctionCall before | OpFunctionCall after |
+|---|---|---|---|---|
+| spirv/call/call_ret_large.dis | 1455 | 1657 | 53 | 64 |
+| spirv/call/call_variadic.dis | 2156 | 2324 | 125 | 139 |
+| spirv/vec/vec_cmp_select.dis | 3920 | 4038 | 81 | 87 |
