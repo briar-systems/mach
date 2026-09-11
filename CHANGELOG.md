@@ -77,6 +77,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tail padding. Padding-only eightbytes now consume no register, the
   classifier emits one piece per populated eightbyte, and the store side zeroes
   every logical byte no piece delivers (#3263).
+- A `#[packed]` record with a field at an offset that is not a multiple of the
+  field's own alignment (`#[packed] rec { a: u8; b: u32; }`) was classified by
+  its eightbytes under System V x86-64 and rode rdi and rsi, where the ABI's
+  unaligned-field rule makes the whole aggregate MEMORY class: gcc and clang
+  pass it on the stack and return it through a hidden pointer, so a C callee
+  read the argument as garbage and a C caller's return faulted. The eightbyte
+  walk now flags any struct member or array element at an unaligned offset and
+  the classifier takes the flag as MEMORY; a packed record whose fields happen
+  to sit aligned keeps its registers, and Win64 (non-power-of-two sizes were
+  already by reference) and AAPCS64 (records classify by size alone) are
+  unchanged (#3266).
 - Secrecy provenance of a by-value aggregate was attached to its home instead
   of its bytes: an aggregate's MIR vreg is the address of its home, and seeding
   it secret for an outer-secret parameter or call result made every field read
