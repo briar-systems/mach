@@ -149,7 +149,7 @@ fun collect_leaves(ctx: *context.LowerCtx, ty: type.IrTypeId, base_off: u64, str
     ret count + 1;
 }
 
-fun aggregate_sse_mask(ctx: *context.LowerCtx, ty: type.IrTypeId) u8 {
+fun aggregate_eightbyte_mask(ctx: *context.LowerCtx, ty: type.IrTypeId) u8 {
     if (!context.value_is_aggregate(ctx, ty)) { ret 0; }
     val size: u64 = type.byte_size_for_machine(ctx.types, ty, ctx.layout)::u64;
     if (size == 0 || size > 16) { ret 0; }
@@ -166,8 +166,10 @@ fun aggregate_sse_mask(ctx: *context.LowerCtx, ty: type.IrTypeId) u8 {
         i = i + 1;
     }
     var mask: u8 = 0;
-    if (classes[0] == EB_SSE) { mask = mask | 1; }
-    if (classes[1] == EB_SSE) { mask = mask | 2; }
+    if (classes[0] == EB_SSE)      { mask = mask | abi.EB_SSE_LO; }
+    if (classes[1] == EB_SSE)      { mask = mask | abi.EB_SSE_HI; }
+    if (classes[0] == EB_NO_CLASS) { mask = mask | abi.EB_EMPTY_LO; }
+    if (size > 8 && classes[1] == EB_NO_CLASS) { mask = mask | abi.EB_EMPTY_HI; }
     ret mask;
 }
 
@@ -351,7 +353,7 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
     val ret_float: bool = context.value_is_float(ctx, ret_type);
     val ret_aggr:  bool = context.value_is_aggregate(ctx, ret_type);
     val ret_vec:   bool = context.value_is_vector(ctx, ret_type);
-    val ret_eb:    u8   = aggregate_sse_mask(ctx, ret_type);
+    val ret_eb:    u8   = aggregate_eightbyte_mask(ctx, ret_type);
     var ret_hm:    u8   = 0;
     var ret_he:    u8   = 0;
     hfa_info(ctx, ret_type, ?ret_hm, ?ret_he);
@@ -399,7 +401,7 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
         val pal:  u64  = type.byte_align_for_machine(ctx.types, pty, ctx.layout)::u64;
         val pfl:  bool = context.value_is_float(ctx, pty);
         val pag:  bool = context.value_is_aggregate(ctx, pty);
-        val peb:  u8   = aggregate_sse_mask(ctx, pty);
+        val peb:  u8   = aggregate_eightbyte_mask(ctx, pty);
         var phm:  u8   = 0;
         var phe:  u8   = 0;
         hfa_info(ctx, pty, ?phm, ?phe);
@@ -594,8 +596,11 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         }
         val argop: mir.MirOperand = R.unwrap_ok[mir.MirOperand, str](aor);
 
+        # the carriers, the caller's copy and every temporary between them are secret when any byte of the object is
+        ctx.cur_writes_secret = av.secret;
         val er: R.Result[R.Void, str] = emit_arg_slot(ctx, mb, registers, slot, argop, soff, aag, av.ty,
                                                     natural_stack_slot(ctx.tgt, pidx >= layout.param_count));
+        ctx.cur_writes_secret = false;
         if (R.is_err[R.Void, str](er)) {
             sig_layout_free(ctx, ?layout);
             ret er;
@@ -666,7 +671,9 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
 
     val dst: u32 = context.instr_vreg(ctx, iid);
     if (dst != mir.MIR_VREG_NIL && rslot.class != abi.CLASS_SRET) {
+        ctx.cur_writes_secret = inst.secret;
         val rr: R.Result[R.Void, str] = emit_ret_slot_to_vreg(ctx, mb, rslot, dst, ret_aggr, ret_type, ret_storage_align);
+        ctx.cur_writes_secret = false;
         if (R.is_err[R.Void, str](rr)) { ret rr; }
     }
     if (ret_sret_register && dst != mir.MIR_VREG_NIL) {
@@ -785,6 +792,41 @@ fun load_piece_carrier(ctx: *context.LowerCtx, mb: *mir.MirBlock, registers: *mi
     ret emit_call_reg(ctx, mb, registers, reg, mir.op_mem_slot(key, 0), carrier_width);
 }
 
+fun zero_range(ctx: *context.LowerCtx, mb: *mir.MirBlock, plan: PiecePlan, from: u64, to: u64) R.Result[R.Void, str] {
+    var off: u64 = from;
+    for (off < to) {
+        val width: u8 = context.copy_chunk_width(ctx.tgt, to - off);
+        var mem: mir.MirOperand = mir.op_mem_value(plan.mem_base, off::i64);
+        if (plan.mem_slot) { mem = mir.op_mem_slot(plan.mem_base, off::i64); }
+        val zero: R.Result[R.Void, str] = context.push_store_chunk(ctx, mb, mem, mir.op_imm(0), width);
+        if (R.is_err[R.Void, str](zero)) { ret zero; }
+        off = off + width::u64;
+    }
+    ret R.ok_void[str]();
+}
+
+# a convention may deliver nothing for a padding-only eightbyte; the logical object still owns those bytes,
+# so the store side zeroes every logical byte no piece delivers before the pieces land
+fun zero_undelivered_bytes(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: *abi.ParamSlot, plan: PiecePlan) R.Result[R.Void, str] {
+    var cursor: u64 = 0;
+    var i: u32 = 0;
+    for (i < slot.piece_count) {
+        val p: *abi.ParamPiece = ?slot.pieces[i];
+        val wr: R.Result[u8, str] = abi.piece_memory_width(slot, p);
+        if (R.is_err[u8, str](wr)) { ret R.err[R.Void, str](R.unwrap_err[u8, str](wr)); }
+        val start: u64 = p.src_off::u64;
+        if (start > cursor) {
+            val zr: R.Result[R.Void, str] = zero_range(ctx, mb, plan, cursor, start);
+            if (R.is_err[R.Void, str](zr)) { ret zr; }
+        }
+        val end: u64 = start + R.unwrap_ok[u8, str](wr)::u64;
+        if (end > cursor) { cursor = end; }
+        i = i + 1;
+    }
+    if (cursor < slot.size) { ret zero_range(ctx, mb, plan, cursor, slot.size); }
+    ret R.ok_void[str]();
+}
+
 fun materialize_pieces(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, plan: PiecePlan) R.Result[R.Void, str] {
     val er: R.Result[u64, str] = abi.carrier_storage_extent(?slot);
     if (R.is_err[u64, str](er)) { ret R.err[R.Void, str](R.unwrap_err[u64, str](er)); }
@@ -799,6 +841,10 @@ fun materialize_pieces(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.Para
     if (copies == nil) { copies = ?pending_copies; }
     var registers: *mir.MirBlock = plan.registers;
     if (!plan.store && registers == mb) { registers = ?pending; }
+    if (plan.store) {
+        val zr: R.Result[R.Void, str] = zero_undelivered_bytes(ctx, mb, ?slot, plan);
+        if (R.is_err[R.Void, str](zr)) { ret zr; }
+    }
     var i: u32 = 0;
     for (i < slot.piece_count) {
         val p: abi.ParamPiece = slot.pieces[i];
@@ -1075,7 +1121,9 @@ pub fun lower_params(ctx: *context.LowerCtx, mb: *mir.MirBlock) R.Result[R.Void,
         val slot: abi.ParamSlot = layout.params[i];
 
         if (pag || param_has_use(ctx.fn, i)) {
+            ctx.cur_writes_secret = ctx.fn.params[i].secret;
             val er: R.Result[R.Void, str] = emit_param_slot(ctx, mb, ?copies, slot, pv, pty, slot.offset, pag);
+            ctx.cur_writes_secret = false;
             if (R.is_err[R.Void, str](er)) {
                 sig_layout_free(ctx, ?layout);
                 ret er;
@@ -1222,6 +1270,8 @@ pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.
     val rvr: R.Result[mir.MirOperand, str] = lower_value_addr(ctx, mb, rv);
     if (R.is_err[mir.MirOperand, str](rvr)) { ret R.err[R.Void, str](R.unwrap_err[mir.MirOperand, str](rvr)); }
     val rvop: mir.MirOperand = R.unwrap_ok[mir.MirOperand, str](rvr);
+    ctx.cur_writes_secret = rv.secret;
+    fin { ctx.cur_writes_secret = false; }
 
     if (slot.class == abi.CLASS_AGG) {
         val lr: R.Result[R.Void, str] = context.emit_agg_load(ctx, mb, slot.reg::u32, rvop);
@@ -2222,4 +2272,312 @@ test "mach.lang.be.codegen.mir.abi:call_result_owns_carrier_alignment_without_ch
     val nine: i32 = t_result_carrier_alignment(8, 9);
     if (nine != 0) { ret nine; }
     ret t_result_carrier_alignment(32, 3);
+}
+
+# tag shapes for the L5 transport inventory (#3218); each is a tag IR type built the way lower_tag builds it
+val TAG_P1:    u32 = 0;
+val TAG_T3:    u32 = 1;
+val TAG_S8:    u32 = 2;
+val TAG_T9:    u32 = 3;
+val TAG_T16:   u32 = 4;
+val TAG_O24:   u32 = 5;
+val TAG_NEST:  u32 = 6;
+val TAG_PK9:   u32 = 7;
+val TAG_AL16:  u32 = 8;
+val TAG_TF16:  u32 = 9;
+val TAG_TF8:   u32 = 10;
+val TAG_TFM:   u32 = 11;
+val TAG_SHAPE_COUNT: u32 = 12;
+
+fun t_tag_shape(types: *type.IrTypeTable, which: u32) R.Result[type.IrTypeId, str] {
+    val vr: R.Result[type.IrTypeId, str] = type.intern_void(types);
+    val u8r: R.Result[type.IrTypeId, str] = type.intern_int(types, 8);
+    val u32r: R.Result[type.IrTypeId, str] = type.intern_int(types, 32);
+    val i64r: R.Result[type.IrTypeId, str] = type.intern_int(types, 64);
+    val f32r: R.Result[type.IrTypeId, str] = type.intern_float(types, 32);
+    val f64r: R.Result[type.IrTypeId, str] = type.intern_float(types, 64);
+    if (R.is_err[type.IrTypeId, str](vr) || R.is_err[type.IrTypeId, str](u8r) || R.is_err[type.IrTypeId, str](u32r)
+        || R.is_err[type.IrTypeId, str](i64r) || R.is_err[type.IrTypeId, str](f32r) || R.is_err[type.IrTypeId, str](f64r)) {
+        ret R.err[type.IrTypeId, str]("leaf");
+    }
+    val void_t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](vr);
+    val u8t:    type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](u8r);
+    val u32t:   type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](u32r);
+    val i64t:   type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](i64r);
+    val f32t:   type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](f32r);
+    val f64t:   type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](f64r);
+    var cases: [3]type.IrTypeId;
+    cases[0] = void_t;
+    var count: u32 = 2;
+    var align: u32 = 0;
+    var packed: bool = false;
+    if (which == TAG_P1)  { cases[1] = void_t; }
+    or (which == TAG_T3)  { val a: R.Result[type.IrTypeId, str] = type.intern_array(types, u8t, 2); if (R.is_err[type.IrTypeId, str](a)) { ret a; } cases[1] = R.unwrap_ok[type.IrTypeId, str](a); }
+    or (which == TAG_S8)  { cases[1] = u32t; }
+    or (which == TAG_T9)  { val a: R.Result[type.IrTypeId, str] = type.intern_array(types, u8t, 8); if (R.is_err[type.IrTypeId, str](a)) { ret a; } cases[1] = R.unwrap_ok[type.IrTypeId, str](a); }
+    or (which == TAG_T16) { cases[1] = i64t; }
+    or (which == TAG_O24) { val a: R.Result[type.IrTypeId, str] = type.intern_array(types, i64t, 2); if (R.is_err[type.IrTypeId, str](a)) { ret a; } cases[1] = R.unwrap_ok[type.IrTypeId, str](a); cases[2] = u8t; count = 3; }
+    or (which == TAG_NEST) { val inner: R.Result[type.IrTypeId, str] = t_tag_shape(types, TAG_S8); if (R.is_err[type.IrTypeId, str](inner)) { ret inner; } cases[1] = R.unwrap_ok[type.IrTypeId, str](inner); }
+    or (which == TAG_PK9) { cases[1] = i64t; packed = true; }
+    or (which == TAG_AL16) { cases[1] = u8t; align = 16; }
+    or (which == TAG_TF16) { cases[1] = f64t; }
+    or (which == TAG_TF8) { cases[1] = f32t; }
+    or (which == TAG_TFM) { cases[1] = f64t; cases[2] = i64t; count = 3; }
+    or { ret R.err[type.IrTypeId, str]("shape"); }
+    ret type.intern_tag(types, ?cases[0], count, 1, align, packed);
+}
+
+rec TagTransport {
+    size:     u64;
+    align:    u32;
+    hfa:      u8;
+    eightbytes: u8;
+    arg:      abi.ParamSlot;
+    ret:      abi.ParamSlot;
+}
+
+# classifies `fun(T) T` for one convention through the real type derivation and the real vtable
+fun t_tag_transport(alloc: *A.Allocator, isa_name: str, os_name: str, abi_name: str, which: u32, out: *TagTransport) i32 {
+    val mr: R.Result[ir.Module, str] = ir.init(alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](mr)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](mr);
+    fin { ir.dnit(?m); }
+    var reg: treg.TargetRegistry = treg.registry_init();
+    fin { treg.registry_dnit(?reg); }
+    if (R.is_err[R.Void, str](treg.register_all(?reg, target_testing.debug_descriptor))) { ret 2; }
+    val tr: R.Result[target.Target, str] = treg.select(?reg, isa_name, os_name, abi_name);
+    if (R.is_err[target.Target, str](tr)) { ret 3; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+    val sr: R.Result[type.IrTypeId, str] = t_tag_shape(?m.types, which);
+    if (R.is_err[type.IrTypeId, str](sr)) { ret 4; }
+    var tag: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](sr);
+    val vr: R.Result[type.IrTypeId, str] = type.intern_void(?m.types);
+    if (R.is_err[type.IrTypeId, str](vr)) { ret 5; }
+    val void_t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](vr);
+    # the argument is classified on `fun(T)` and the return on `fun() T`, so a hidden result pointer never shifts the argument
+    val ar: R.Result[type.IrTypeId, str] = type.intern_fn(?m.types, void_t, ?tag, 1, false);
+    val rr: R.Result[type.IrTypeId, str] = type.intern_fn(?m.types, tag, nil, 0, false);
+    if (R.is_err[type.IrTypeId, str](ar) || R.is_err[type.IrTypeId, str](rr)) { ret 5; }
+    var ctx: context.LowerCtx;
+    ctx.alloc  = alloc;
+    ctx.tgt    = ?tgt;
+    ctx.layout = target.layout_machine(?tgt);
+    ctx.m      = ?m;
+    ctx.types  = ?m.types;
+    var layout: abi.SigLayout;
+    if (R.is_err[R.Void, str](classify_signature(?ctx, R.unwrap_ok[type.IrTypeId, str](ar), void_t, ?layout))) { ret 6; }
+    if (layout.param_count != 1) { sig_layout_free(?ctx, ?layout); ret 7; }
+    out.arg = layout.params[0];
+    sig_layout_free(?ctx, ?layout);
+    var rlayout: abi.SigLayout;
+    if (R.is_err[R.Void, str](classify_signature(?ctx, R.unwrap_ok[type.IrTypeId, str](rr), tag, ?rlayout))) { ret 8; }
+    out.ret = rlayout.ret_slot;
+    sig_layout_free(?ctx, ?rlayout);
+    out.size  = type.byte_size_for_machine(?m.types, tag, ctx.layout)::u64;
+    out.align = type.byte_align_for_machine(?m.types, tag, ctx.layout);
+    var he: u8 = 0;
+    hfa_info(?ctx, tag, ?out.hfa, ?he);
+    out.eightbytes = aggregate_eightbyte_mask(?ctx, tag);
+    ret 0;
+}
+
+# one register piece: class, register, transport width; the logical bytes it moves come from piece_memory_width
+fun t_piece_is(slot: *abi.ParamSlot, i: u32, kind: abi.PieceKind, reg: i32, width: u8, logical: u8) bool {
+    if (i >= slot.piece_count) { ret false; }
+    val p: *abi.ParamPiece = ?slot.pieces[i];
+    if (p.kind != kind || p.reg != reg || p.width != width) { ret false; }
+    val lw: R.Result[u8, str] = abi.piece_memory_width(slot, p);
+    if (R.is_err[u8, str](lw)) { ret false; }
+    ret R.unwrap_ok[u8, str](lw) == logical;
+}
+
+fun t_one_gp(slot: *abi.ParamSlot, reg: i32, width: u8, logical: u8) bool {
+    ret slot.class == abi.CLASS_GP && slot.piece_count == 1 && t_piece_is(slot, 0, abi.PIECE_GP, reg, width, logical);
+}
+
+fun t_gp_pair(slot: *abi.ParamSlot, r0: i32, r1: i32, width: u8, logical1: u8) bool {
+    ret slot.class == abi.CLASS_GP && slot.piece_count == 2
+        && t_piece_is(slot, 0, abi.PIECE_GP, r0, width, width)
+        && t_piece_is(slot, 1, abi.PIECE_GP, r1, width, logical1);
+}
+
+fun t_byref(slot: *abi.ParamSlot, reg: i32) bool {
+    ret slot.class == abi.CLASS_BYREF && slot.reg == reg;
+}
+
+fun t_sret(slot: *abi.ParamSlot, reg: i32) bool {
+    ret slot.class == abi.CLASS_SRET && slot.reg == reg;
+}
+
+val SYSV_RDI: i32 = 7;
+val SYSV_RSI: i32 = 6;
+val SYSV_RAX: i32 = 0;
+val SYSV_RDX: i32 = 2;
+val WIN_RCX:  i32 = 1;
+val AAPCS_X8: i32 = 8;
+val RV_A0:    i32 = 10;
+val RV_A1:    i32 = 11;
+
+fun t_xmm(i: i32) i32 { ret isa.regid_make(isa.REG_CLASS_ID_XMM, i); }
+
+# the SysV cells: every tag classifies as the record of its layout, so the discriminator eightbyte is INTEGER
+# and a float payload eightbyte is SSE; a trailing eightbyte that holds only padding consumes no register
+fun t_sysv_cells(alloc: *A.Allocator) i32 {
+    var t: TagTransport;
+    if (t_tag_transport(alloc, "x86_64", "linux", "sysv64", TAG_P1, ?t) != 0) { ret 1; }
+    if (t.size != 1 || !t_one_gp(?t.arg, SYSV_RDI, 8, 1) || !t_one_gp(?t.ret, SYSV_RAX, 8, 1)) { ret 2; }
+    if (t_tag_transport(alloc, "x86_64", "linux", "sysv64", TAG_T3, ?t) != 0) { ret 3; }
+    if (t.size != 3 || !t_one_gp(?t.arg, SYSV_RDI, 8, 3) || !t_one_gp(?t.ret, SYSV_RAX, 8, 3)) { ret 4; }
+    if (t_tag_transport(alloc, "x86_64", "linux", "sysv64", TAG_S8, ?t) != 0) { ret 5; }
+    if (t.size != 8 || !t_one_gp(?t.arg, SYSV_RDI, 8, 8) || !t_one_gp(?t.ret, SYSV_RAX, 8, 8)) { ret 6; }
+    if (t_tag_transport(alloc, "x86_64", "linux", "sysv64", TAG_T9, ?t) != 0) { ret 7; }
+    if (t.size != 9 || !t_gp_pair(?t.arg, SYSV_RDI, SYSV_RSI, 8, 1) || !t_gp_pair(?t.ret, SYSV_RAX, SYSV_RDX, 8, 1)) { ret 8; }
+    if (t_tag_transport(alloc, "x86_64", "linux", "sysv64", TAG_T16, ?t) != 0) { ret 9; }
+    if (t.size != 16 || !t_gp_pair(?t.arg, SYSV_RDI, SYSV_RSI, 8, 8) || !t_gp_pair(?t.ret, SYSV_RAX, SYSV_RDX, 8, 8)) { ret 10; }
+    if (t_tag_transport(alloc, "x86_64", "linux", "sysv64", TAG_O24, ?t) != 0) { ret 11; }
+    if (t.size != 24 || t.arg.class != abi.CLASS_STACK || t.arg.size != 24 || !t_sret(?t.ret, SYSV_RAX)) { ret 12; }
+    if (t_tag_transport(alloc, "x86_64", "linux", "sysv64", TAG_NEST, ?t) != 0) { ret 13; }
+    if (t.size != 12 || !t_gp_pair(?t.arg, SYSV_RDI, SYSV_RSI, 8, 4) || !t_gp_pair(?t.ret, SYSV_RAX, SYSV_RDX, 8, 4)) { ret 14; }
+    if (t_tag_transport(alloc, "x86_64", "linux", "sysv64", TAG_PK9, ?t) != 0) { ret 15; }
+    if (t.size != 9 || t.align != 1 || !t_gp_pair(?t.arg, SYSV_RDI, SYSV_RSI, 8, 1) || !t_gp_pair(?t.ret, SYSV_RAX, SYSV_RDX, 8, 1)) { ret 16; }
+    if (t_tag_transport(alloc, "x86_64", "linux", "sysv64", TAG_AL16, ?t) != 0) { ret 17; }
+    if (t.size != 16 || t.align != 16) { ret 18; }
+    if (!t_one_gp(?t.arg, SYSV_RDI, 8, 8) || !t_one_gp(?t.ret, SYSV_RAX, 8, 8)) { ret 19; }
+    if (t_tag_transport(alloc, "x86_64", "linux", "sysv64", TAG_TF16, ?t) != 0) { ret 20; }
+    if (t.size != 16 || t.eightbytes != 2 || t.arg.class != abi.CLASS_GP || t.arg.piece_count != 2) { ret 21; }
+    if (!t_piece_is(?t.arg, 0, abi.PIECE_GP, SYSV_RDI, 8, 8) || !t_piece_is(?t.arg, 1, abi.PIECE_FP, t_xmm(0), 8, 8)) { ret 22; }
+    if (!t_piece_is(?t.ret, 0, abi.PIECE_GP, SYSV_RAX, 8, 8) || !t_piece_is(?t.ret, 1, abi.PIECE_FP, t_xmm(0), 8, 8)) { ret 23; }
+    if (t_tag_transport(alloc, "x86_64", "linux", "sysv64", TAG_TF8, ?t) != 0) { ret 24; }
+    if (t.size != 8 || t.eightbytes != 0 || !t_one_gp(?t.arg, SYSV_RDI, 8, 8) || !t_one_gp(?t.ret, SYSV_RAX, 8, 8)) { ret 25; }
+    if (t_tag_transport(alloc, "x86_64", "linux", "sysv64", TAG_TFM, ?t) != 0) { ret 26; }
+    if (t.size != 16 || t.eightbytes != 0 || !t_gp_pair(?t.arg, SYSV_RDI, SYSV_RSI, 8, 8) || !t_gp_pair(?t.ret, SYSV_RAX, SYSV_RDX, 8, 8)) { ret 27; }
+    ret 0;
+}
+
+# the Win64 cells: only 1, 2, 4 and 8 byte tags ride a register; everything else is the address of a caller copy
+fun t_win64_cells(alloc: *A.Allocator) i32 {
+    var t: TagTransport;
+    if (t_tag_transport(alloc, "x86_64", "windows", "win64", TAG_P1, ?t) != 0) { ret 1; }
+    if (!t_one_gp(?t.arg, WIN_RCX, 8, 1) || !t_one_gp(?t.ret, SYSV_RAX, 8, 1)) { ret 2; }
+    if (t_tag_transport(alloc, "x86_64", "windows", "win64", TAG_T3, ?t) != 0) { ret 3; }
+    if (!t_byref(?t.arg, WIN_RCX) || !t_sret(?t.ret, SYSV_RAX)) { ret 4; }
+    if (t_tag_transport(alloc, "x86_64", "windows", "win64", TAG_S8, ?t) != 0) { ret 5; }
+    if (!t_one_gp(?t.arg, WIN_RCX, 8, 8) || !t_one_gp(?t.ret, SYSV_RAX, 8, 8)) { ret 6; }
+    var which: u32 = TAG_T9;
+    for (which <= TAG_TFM) {
+        if (which != TAG_TF8) {
+            if (t_tag_transport(alloc, "x86_64", "windows", "win64", which, ?t) != 0) { ret 7; }
+            if (!t_byref(?t.arg, WIN_RCX) || !t_sret(?t.ret, SYSV_RAX)) { ret 8; }
+        }
+        which = which + 1;
+    }
+    if (t_tag_transport(alloc, "x86_64", "windows", "win64", TAG_TF8, ?t) != 0) { ret 9; }
+    if (!t_one_gp(?t.arg, WIN_RCX, 8, 8) || !t_one_gp(?t.ret, SYSV_RAX, 8, 8)) { ret 10; }
+    ret 0;
+}
+
+# the AAPCS64 cells: a tag is never an HFA because its discriminator is an integer leaf, so a float payload
+# still rides the general registers; up to 16 bytes ride x0/x1, larger goes by reference with x8 for returns
+fun t_aapcs64_cells(alloc: *A.Allocator) i32 {
+    var t: TagTransport;
+    if (t_tag_transport(alloc, "aarch64", "linux", "aapcs64", TAG_P1, ?t) != 0) { ret 1; }
+    if (!t_one_gp(?t.arg, 0, 8, 1) || !t_one_gp(?t.ret, 0, 8, 1)) { ret 2; }
+    if (t_tag_transport(alloc, "aarch64", "linux", "aapcs64", TAG_T3, ?t) != 0) { ret 3; }
+    if (!t_one_gp(?t.arg, 0, 8, 3) || !t_one_gp(?t.ret, 0, 8, 3)) { ret 4; }
+    if (t_tag_transport(alloc, "aarch64", "linux", "aapcs64", TAG_S8, ?t) != 0) { ret 5; }
+    if (!t_one_gp(?t.arg, 0, 8, 8) || !t_one_gp(?t.ret, 0, 8, 8)) { ret 6; }
+    if (t_tag_transport(alloc, "aarch64", "linux", "aapcs64", TAG_T9, ?t) != 0) { ret 7; }
+    if (!t_gp_pair(?t.arg, 0, 1, 8, 1) || !t_gp_pair(?t.ret, 0, 1, 8, 1)) { ret 8; }
+    if (t_tag_transport(alloc, "aarch64", "linux", "aapcs64", TAG_T16, ?t) != 0) { ret 9; }
+    if (!t_gp_pair(?t.arg, 0, 1, 8, 8) || !t_gp_pair(?t.ret, 0, 1, 8, 8)) { ret 10; }
+    if (t_tag_transport(alloc, "aarch64", "linux", "aapcs64", TAG_O24, ?t) != 0) { ret 11; }
+    if (!t_byref(?t.arg, 0) || !t_sret(?t.ret, AAPCS_X8)) { ret 12; }
+    if (t_tag_transport(alloc, "aarch64", "linux", "aapcs64", TAG_NEST, ?t) != 0) { ret 13; }
+    if (!t_gp_pair(?t.arg, 0, 1, 8, 4) || !t_gp_pair(?t.ret, 0, 1, 8, 4)) { ret 14; }
+    if (t_tag_transport(alloc, "aarch64", "linux", "aapcs64", TAG_PK9, ?t) != 0) { ret 15; }
+    if (!t_gp_pair(?t.arg, 0, 1, 8, 1) || !t_gp_pair(?t.ret, 0, 1, 8, 1)) { ret 16; }
+    if (t_tag_transport(alloc, "aarch64", "linux", "aapcs64", TAG_AL16, ?t) != 0) { ret 17; }
+    if (t.align != 16 || !t_gp_pair(?t.arg, 0, 1, 8, 8) || !t_gp_pair(?t.ret, 0, 1, 8, 8)) { ret 18; }
+    if (t_tag_transport(alloc, "aarch64", "linux", "aapcs64", TAG_TF16, ?t) != 0) { ret 19; }
+    if (t.hfa != 0 || !t_gp_pair(?t.arg, 0, 1, 8, 8) || !t_gp_pair(?t.ret, 0, 1, 8, 8)) { ret 20; }
+    if (t_tag_transport(alloc, "aarch64", "linux", "aapcs64", TAG_TF8, ?t) != 0) { ret 21; }
+    if (t.hfa != 0 || !t_one_gp(?t.arg, 0, 8, 8) || !t_one_gp(?t.ret, 0, 8, 8)) { ret 22; }
+    if (t_tag_transport(alloc, "aarch64", "linux", "aapcs64", TAG_TFM, ?t) != 0) { ret 23; }
+    if (t.hfa != 0 || !t_gp_pair(?t.arg, 0, 1, 8, 8) || !t_gp_pair(?t.ret, 0, 1, 8, 8)) { ret 24; }
+    ret 0;
+}
+
+# the RV64 cells (lp64d and soft-float lp64 agree): a tag's payload area is a union, which the psABI never
+# flattens into the float registers, so every tag rides a0/a1 or goes by reference above two words
+fun t_rv64_cells(alloc: *A.Allocator, abi_name: str) i32 {
+    var t: TagTransport;
+    if (t_tag_transport(alloc, "riscv64", "linux", abi_name, TAG_P1, ?t) != 0) { ret 1; }
+    if (!t_one_gp(?t.arg, RV_A0, 8, 1) || !t_one_gp(?t.ret, RV_A0, 8, 1)) { ret 2; }
+    if (t_tag_transport(alloc, "riscv64", "linux", abi_name, TAG_T3, ?t) != 0) { ret 3; }
+    if (!t_one_gp(?t.arg, RV_A0, 8, 3) || !t_one_gp(?t.ret, RV_A0, 8, 3)) { ret 4; }
+    if (t_tag_transport(alloc, "riscv64", "linux", abi_name, TAG_S8, ?t) != 0) { ret 5; }
+    if (!t_one_gp(?t.arg, RV_A0, 8, 8) || !t_one_gp(?t.ret, RV_A0, 8, 8)) { ret 6; }
+    if (t_tag_transport(alloc, "riscv64", "linux", abi_name, TAG_T9, ?t) != 0) { ret 7; }
+    if (!t_gp_pair(?t.arg, RV_A0, RV_A1, 8, 1) || !t_gp_pair(?t.ret, RV_A0, RV_A1, 8, 1)) { ret 8; }
+    if (t_tag_transport(alloc, "riscv64", "linux", abi_name, TAG_T16, ?t) != 0) { ret 9; }
+    if (!t_gp_pair(?t.arg, RV_A0, RV_A1, 8, 8) || !t_gp_pair(?t.ret, RV_A0, RV_A1, 8, 8)) { ret 10; }
+    if (t_tag_transport(alloc, "riscv64", "linux", abi_name, TAG_O24, ?t) != 0) { ret 11; }
+    if (!t_byref(?t.arg, RV_A0) || !t_sret(?t.ret, RV_A0)) { ret 12; }
+    if (t_tag_transport(alloc, "riscv64", "linux", abi_name, TAG_NEST, ?t) != 0) { ret 13; }
+    if (!t_gp_pair(?t.arg, RV_A0, RV_A1, 8, 4) || !t_gp_pair(?t.ret, RV_A0, RV_A1, 8, 4)) { ret 14; }
+    if (t_tag_transport(alloc, "riscv64", "linux", abi_name, TAG_PK9, ?t) != 0) { ret 15; }
+    if (!t_gp_pair(?t.arg, RV_A0, RV_A1, 8, 1) || !t_gp_pair(?t.ret, RV_A0, RV_A1, 8, 1)) { ret 16; }
+    if (t_tag_transport(alloc, "riscv64", "linux", abi_name, TAG_AL16, ?t) != 0) { ret 17; }
+    if (!t_gp_pair(?t.arg, RV_A0, RV_A1, 8, 8) || !t_gp_pair(?t.ret, RV_A0, RV_A1, 8, 8)) { ret 18; }
+    if (t_tag_transport(alloc, "riscv64", "linux", abi_name, TAG_TF16, ?t) != 0) { ret 19; }
+    if (!t_gp_pair(?t.arg, RV_A0, RV_A1, 8, 8) || !t_gp_pair(?t.ret, RV_A0, RV_A1, 8, 8)) { ret 20; }
+    if (t_tag_transport(alloc, "riscv64", "linux", abi_name, TAG_TF8, ?t) != 0) { ret 21; }
+    if (!t_one_gp(?t.arg, RV_A0, 8, 8) || !t_one_gp(?t.ret, RV_A0, 8, 8)) { ret 22; }
+    if (t_tag_transport(alloc, "riscv64", "linux", abi_name, TAG_TFM, ?t) != 0) { ret 23; }
+    if (!t_gp_pair(?t.arg, RV_A0, RV_A1, 8, 8) || !t_gp_pair(?t.ret, RV_A0, RV_A1, 8, 8)) { ret 24; }
+    ret 0;
+}
+
+# the RV32 cells (ilp32d and soft-float ilp32 agree): the word is four bytes, so an 8-byte tag already
+# needs the a0/a1 pair and anything above eight bytes goes by reference
+fun t_rv32_cells(alloc: *A.Allocator, isa_name: str, abi_name: str) i32 {
+    var t: TagTransport;
+    if (t_tag_transport(alloc, isa_name, "freestanding", abi_name, TAG_P1, ?t) != 0) { ret 1; }
+    if (!t_one_gp(?t.arg, RV_A0, 4, 1) || !t_one_gp(?t.ret, RV_A0, 4, 1)) { ret 2; }
+    if (t_tag_transport(alloc, isa_name, "freestanding", abi_name, TAG_T3, ?t) != 0) { ret 3; }
+    if (!t_one_gp(?t.arg, RV_A0, 4, 3) || !t_one_gp(?t.ret, RV_A0, 4, 3)) { ret 4; }
+    if (t_tag_transport(alloc, isa_name, "freestanding", abi_name, TAG_S8, ?t) != 0) { ret 5; }
+    if (!t_gp_pair(?t.arg, RV_A0, RV_A1, 4, 4) || !t_gp_pair(?t.ret, RV_A0, RV_A1, 4, 4)) { ret 6; }
+    if (t_tag_transport(alloc, isa_name, "freestanding", abi_name, TAG_TF8, ?t) != 0) { ret 7; }
+    if (!t_gp_pair(?t.arg, RV_A0, RV_A1, 4, 4) || !t_gp_pair(?t.ret, RV_A0, RV_A1, 4, 4)) { ret 8; }
+    var which: u32 = TAG_T9;
+    for (which <= TAG_TFM) {
+        if (which != TAG_TF8) {
+            if (t_tag_transport(alloc, isa_name, "freestanding", abi_name, which, ?t) != 0) { ret 9; }
+            if (!t_byref(?t.arg, RV_A0) || !t_sret(?t.ret, RV_A0)) { ret 10; }
+        }
+        which = which + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.mir.abi:tag_transport_classifies_as_the_record_of_its_layout_on_every_convention" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    # exit codes: convention block of thirty plus the failing cell
+    val sysv: i32 = t_sysv_cells(?alloc);
+    if (sysv != 0) { ret 30 + sysv; }
+    val win: i32 = t_win64_cells(?alloc);
+    if (win != 0) { ret 60 + win; }
+    val arm: i32 = t_aapcs64_cells(?alloc);
+    if (arm != 0) { ret 90 + arm; }
+    val rv64d: i32 = t_rv64_cells(?alloc, "lp64d");
+    if (rv64d != 0) { ret 120 + rv64d; }
+    val rv64: i32 = t_rv64_cells(?alloc, "lp64");
+    if (rv64 != 0) { ret 150 + rv64; }
+    val rv32d: i32 = t_rv32_cells(?alloc, "rv32imafdc", "ilp32d");
+    if (rv32d != 0) { ret 180 + rv32d; }
+    val rv32: i32 = t_rv32_cells(?alloc, "rv32imc", "ilp32");
+    if (rv32 != 0) { ret 210 + rv32; }
+    ret 0;
 }
