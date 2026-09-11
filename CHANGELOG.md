@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `isa` accepts a canonical RISC-V extension string (`rv32imc`, `rv64imafd`,
+  `rv64gc`) over the retained I, M, A, F, D, C, Zicsr and Zifencei vocabulary.
+  The selection declares the machine's multiply and float facts, bounds the
+  instructions the compiler and named inline assembly may emit, and is written
+  into the object's `Tag_RISCV_arch`; an unknown extension, another version, a
+  noncanonical string or the E base is refused rather than rounded up to the
+  default machine (#3127).
+
 ### Fixed
 
 - Bracket interpretation of an imported name follows the imported declaration's
@@ -57,6 +67,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Vector operations require an explicit target capability row. Each ISA declares
   its supported (operation, lane kind, lane width) rows positively. Missing or
   malformed operation and lane shapes no longer default to packed support (#3120).
+
+- `riscv32` means its documented rv32imac default, so it takes `ilp32` and is
+  refused with the `ilp32f` and `ilp32d` conventions; spell `rv32imafdc` for RV32
+  hardware float. Linking refuses a RISC-V object whose attributes or header
+  flags need an extension the selected target lacks, and mach's own objects
+  declare `zicsr` and `zifencei` alongside the selected single-letter
+  extensions (#3127).
 
 - Every dependency action selects its project with `mach dep <action> <path>`.
   Dependency names follow the path. Missing or extra operands are refused.
