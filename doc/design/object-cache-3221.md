@@ -246,3 +246,130 @@ identity (`passes.capture_build_identity:...`).
 final head: see the pull request for the exact count against the dev baseline
 of 2732; `sh test/census.sh` 9 of 9 ok; corpus layer B on x86_64-linux 91
 pass, 0 fail, 0 skip.
+
+# Phase 2a: the linker-emitted build id
+
+Status: replaces the per-process executable digest (identity candidate 2 above)
+with candidate 1. The digest was the largest single warm-build cost measured in
+phase 1 (139 ms release / 275 ms debug per process, paid before any entry can be
+read). After this phase the compiler's identity is a note the linker wrote into
+the image and the running compiler reads back from its own mapped headers; no
+file is opened and nothing is hashed at run time.
+
+## What the build id hashes
+
+Every image writer computes the id after its file plan is sealed and every other
+byte of the image has been written, so it is a function of the bytes the file
+will contain and of nothing else: no time, path, name, environment or random
+source enters it, and byte-identical inputs yield byte-identical notes. The hash
+is SHA-256 over the bytes the loader maps, taken with the note payload as zero:
+
+- **ELF**: every `PT_LOAD` file extent in program-header order, with the ELF
+  header's `e_shoff`, `e_shnum` and `e_shstrndx` taken as zero. The section
+  header table, `.symtab`, `.strtab`, `.shstrtab`, the debug sections and the
+  build attributes are not loaded and are not hashed. The id is therefore the
+  identity of the loaded program, the same whether or not debug information
+  accompanies it, exactly as a stripped binary keeps the id of its unstripped
+  twin. This is what the release-additivity constraint below requires.
+- **Mach-O**: the file from offset zero to the code signature, which is the
+  range the ad-hoc signature covers (header, load commands, every segment,
+  `__DWARF`, and the `__LINKEDIT` structures before the signature), with the 16
+  `LC_UUID` bytes as zero. The signature is written after the id, so it covers
+  the final UUID (ld64's order). `-g` adds a `__DWARF` segment command to the
+  header, so the loaded program already differs and there is no additivity to
+  keep on this format.
+- **PE**: the whole file with the 16-byte CodeView GUID as zero. `-g` adds
+  section headers, so the same applies as on Mach-O.
+
+The 32-byte digest is carried whole on ELF. Mach-O and PE carry a 16-byte
+identifier by format, so they carry the first 16 bytes with the RFC 4122
+version and variant bits forced (version 4, as ld64 and lld do), which is a
+deterministic function of the content and still 122 bits of it.
+
+## Where each format carries it
+
+- **ELF**: a `.note.gnu.build-id` note (`namesz` 4, `descsz` 32, `type`
+  `NT_GNU_BUILD_ID` 3, name `GNU\0`, 32-byte descriptor, 52 bytes in all) placed
+  in the header page directly after the program headers, so it lies inside the
+  first `PT_LOAD` (the header mapping) and is in memory at run time. A `PT_NOTE`
+  program header names it, and when the image has a section header table an
+  `SHT_NOTE` section header with `SHF_ALLOC` names it too, so `readelf -n`,
+  `file`, `llvm-readobj --notes`, debuginfod and `dl_iterate_phdr` consumers all
+  find it. All four ELF image writers emit it (static executable, static PIE,
+  dynamic executable, shared object). A freestanding image whose headers are
+  not mapped still carries the note and `PT_NOTE` in the file, with a zero
+  address, since there is no mapping to name.
+- **Mach-O**: `LC_UUID`, in every executable the writer produces (the static
+  `LC_UNIXTHREAD` image, the dynamic image and the PIE image; it was previously
+  written only under `--pie` and derived from the artifact name, which is not
+  an identity). `LC_UUID` is the Mach-O build id: dyld, crash reports, dSYM
+  matching and `dwarfdump --uuid` read it, and it sits in the header inside
+  `__TEXT`, which `_dyld_get_image_header(0)` hands back mapped.
+- **PE**: a `.buildid` section (read-only initialized data, the MinGW
+  convention for `ld --build-id`) holding one `IMAGE_DEBUG_DIRECTORY` entry of
+  type `IMAGE_DEBUG_TYPE_CODEVIEW` followed by the `RSDS` record (GUID, age 1,
+  empty path), named by the optional header's debug data directory. A dedicated
+  section with no directory entry would be invisible to every Windows consumer;
+  the CodeView record is what WinDbg, symbol servers, `dumpbin /headers` and
+  `llvm-readobj --coff-debug-directory` already treat as the image identity.
+  The section is mapped, so the running compiler reads it through the image
+  base and the RVA.
+
+The byte layouts are defined once, in `src/lang/target/of/buildid.mach`, and
+both the writers and the run-time reader use that definition.
+
+## How the running compiler reads it back
+
+`cache.compiler.identity` reads the note from the process's own mapped image,
+without opening any file:
+
+- **linux**: the auxiliary vector follows the environment block the runtime
+  captured (`os.environ()`); `AT_PHDR`, `AT_PHNUM` and `AT_PHENT` locate the
+  program header table in memory. The load bias is `AT_PHDR` minus the
+  `PT_PHDR` address (zero when there is no `PT_PHDR`, an `ET_EXEC`). `PT_NOTE`
+  plus the bias is the note; it is accepted only if one `PT_LOAD` maps its whole
+  extent and its header reads `4 / 32 / 3 / GNU\0`.
+- **darwin**: `_dyld_get_image_header(0)` is the main executable's header; the
+  load commands are walked for `LC_UUID`.
+- **windows**: `GetModuleHandleW(nil)` is the image base; `e_lfanew`, the PE
+  signature, the PE32+ optional header and its debug data directory lead to the
+  `IMAGE_DEBUG_DIRECTORY` entries, and the first CodeView entry's `RSDS` record
+  holds the GUID.
+
+Every reader is bounds-checked against the mapped image and answers "absent"
+rather than failing when any piece is missing or malformed.
+
+## Fallback and the seed-lag chain
+
+The identity is the note when the image carries one and otherwise the phase-1
+memoized full digest. It carries a source tag (`BUILD_ID` or `DIGEST`) and its
+length, and the snapshot keys the tag and the length-framed bytes, so a
+digest-identified compiler and a note-identified compiler cannot share a key
+even in principle.
+
+The seed lag rule holds: a compiler linked by a seed that predates this phase
+carries no note and identifies itself by digest exactly as before; the first
+compiler it links carries a note. The fixpoint is undisturbed because the note
+is a deterministic function of the loaded bytes: B (linked by A) and C (linked
+by B) are byte-identical as before, and identical bytes carry identical notes.
+
+## Release additivity
+
+The suite's guard (`test/link/cases/debuginfo` `g_additive`, and
+`elf.emit_shared:debug_additive_nonloaded`) compares the `PT_LOAD` file extents
+of the `-g` and non-`-g` images after zeroing `e_shoff`, `e_shnum` and
+`e_shstrndx`. The ELF build id is a function of exactly that comparison input,
+so wherever the two images were identical they still are: the note lies inside
+the loaded image and is equal in both. Byte-identical inputs yield
+byte-identical notes because nothing outside the image bytes enters the hash.
+
+## What the note cannot do
+
+The note is a link-time content identity, not a run-time integrity check. An
+image edited after linking, outside the note, still reports the note it was
+linked with, so such an image is served entries the unedited compiler
+published. The phase-1 digest caught this incidentally, and this design cannot
+by construction: verifying the note against the file would mean hashing the
+file, which is the cost being removed. The cache's question is "which compiler
+produced this entry", and the linker answers it; a post-link edit is outside
+that contract. The digest remains the identity of any image without a note.
