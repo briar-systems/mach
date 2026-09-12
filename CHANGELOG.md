@@ -262,6 +262,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The compiler builds against std 2.0 (std dev `e204cb81f`) and CI
+  bootstraps it through the v5 migration stage (mach `2a2918b23` with std
+  1.0.1) after the audited 4.30 fixpoint (#3226, lane C1). The language
+  layer's `fail.Fail` is `tag Fail: u8 { reported; message: str; }`, the
+  driver's `outcome.Fail` is `tag Fail: u8 { reported; user: str; internal:
+  str; environment: str; }`, a phase status carries its internal text on its
+  `PhaseKind` case, the closed-catalog fault is a tag over its three classes,
+  a build event is a tag over `unit`, `note`, `fail` and `diagnostics`, and
+  every `record_*` on a build outcome answers `err[allocator.Error]`
+  (`record_diagnostics` `err[outcome.Fail]`). `mach.lang.alloc` is the
+  compiler's allocation layer. Every std consumer not yet migrated compiles
+  through `mach.lang.legacy`, one façade per std module presenting the 1.x
+  shape over the 2.0 producer; C2 to C4 remove the façade imports as they
+  migrate and C5 deletes the directory. The cancellation reason a
+  subprocess supervisor records is the compiler's own `subprocess.Request`
+  kind with the 1.x codes, the directory scans use std's directory cursor,
+  event sources and writer sinks report typed outcomes, and a reported
+  failure carries no message instead of a nil one.
 - Every build of a module that contains an `#[oblivious]` function records an
   instruction notification for each emitted machine instruction on x86_64,
   aarch64 and riscv64, the stream `--emit-asm` alone used to produce, without
