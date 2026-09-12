@@ -63,7 +63,7 @@ $mach.project.root
 ```
 
 > Project metadata lives at the top-level `$project.*` root
-> (`$project.{id,version,name,description}` and the declared target tuple
+> (`$project.{id,version}` and the declared target tuple
 > `$project.target.{os,arch,abi}`), fed from `[project]` / `[target.*]` in
 > `mach.toml` — see [comptime.md](comptime.md). These `$mach.project.*` paths
 > remain reserved stubs.

@@ -370,6 +370,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and never read: remove the key`, so the refusal is never mistaken for an
   unknown key. The manifest no longer records deprecated keys and the driver
   emits no deprecation warnings for them (#3226, #3112).
+- `$project.name` and `$project.description`, which read those manifest keys.
+  Each is refused at its use site by name, `` `$project.name` was removed in
+  5.0.0 with the `[project] name` manifest key; the project is identified by
+  `$project.id` ``, and is not re-sourced from another key. A rooted comptime
+  path that the evaluator rejects now reports the path's own message at the
+  path; it used to fall through to the generic "comptime parameters are
+  referenced without `$`" error on the root identifier (#3226, #3112, #3128).
 
 ## [4.30.0] - 2026-09-07
 
