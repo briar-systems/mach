@@ -229,11 +229,14 @@ if want real-bools; then
     # test/census/real-bools.txt as path:function; a declaration off the list,
     # or a list entry with no declaration, fails. no function-pointer type
     # returns a bool Result, and no error is an empty string standing in for a
-    # kind.
+    # kind. src/lang/legacy reproduces std 1.x declarations verbatim as the
+    # translation shim of #3226 (deallocate and terminate_* answered a bool
+    # that was always true there); it is not a compiler declaration, and C5
+    # deletes it with the last legacy import.
     list="$root/test/census/real-bools.txt"
     found=$(mktemp)
     listed=$(mktemp)
-    find "$root/src" -name '*.mach' | sort | while IFS= read -r f; do
+    find "$root/src" -name '*.mach' -not -path "$root/src/lang/legacy/*" | sort | while IFS= read -r f; do
         rel=${f#"$root"/}
         awk -v rel="$rel" '
             /^(pub[ \t]+)?fun[ \t]+[A-Za-z0-9_]+/ {
