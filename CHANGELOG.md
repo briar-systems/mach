@@ -358,6 +358,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parses. A strip whose operand is typed by a generic parameter defers the
   target-type equality from the template to each instance, which is what the
   untyped form used to allow inside generic bodies (#3226, #3112).
+- `$mach.abi.sysv`. The registry spells the ABI `sysv64` and the alias is
+  refused by name, `` `$mach.abi.sysv` was removed in 5.0.0; the registry
+  spells this ABI `sysv64`: write `$mach.abi.sysv64` ``. Comptime path
+  evaluation no longer carries a diagnostic store, which existed only for that
+  alias's warning (#3226, #3112).
 
 ## [4.30.0] - 2026-09-07
 

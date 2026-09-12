@@ -106,10 +106,10 @@ The tag names are the target registries' own spellings, read from them
 directly; there is no second list to keep in step. A tag name the registry
 does not carry is a compile error, never a silent fold.
 
-One spelling survives from before the registries were the source: `$mach.abi.sysv`
-still resolves in 4.30.0, to the same value as `$mach.abi.sysv64`, and warns that
-the registry spells this ABI `sysv64`. 5.0.0 rejects it, so write
-`$mach.abi.sysv64`. `$mach.arch.mos6502` likewise still resolves in 4.30.0 for
+The 4.30 alias `$mach.abi.sysv` was removed in 5.0.0. It is refused by name
+(`` `$mach.abi.sysv` was removed in 5.0.0; the registry spells this ABI
+`sysv64` ``) rather than as an unknown tag, so write `$mach.abi.sysv64`.
+`$mach.arch.mos6502` likewise still resolves in 4.30.0 for
 the withdrawn MOS 6502 target and is gone in 5.0.0.
 
 ## Comparison
