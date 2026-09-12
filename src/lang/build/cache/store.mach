@@ -21,6 +21,7 @@ use std.types.string.str_len;
 use std.types.string.str_equals;
 use mach.lang.publication;
 use mach.lang.build.cache.image;
+use sort: std.collections.sort;
 $if ($mach.build.os == $mach.os.linux) { use native: std.system.os.linux; }
 $or ($mach.build.os == $mach.os.darwin) { use native: std.system.os.darwin; }
 
@@ -239,13 +240,43 @@ fun remove_entry(a: *Access, name: str) {
     transaction_error(a, txn.release_claim(?claim));
 }
 
-# scans keep no entry list and only remove names from the private hash namespace.
-fun sweep(a: *Access, wanted: u64, remove: bool, replacing: str) u64 {
+rec Entry {
+    name: [65]u8;
+    size: u64;
+    mtime: i64;
+    mtime_nsec: i64;
+}
+
+# least recently published first; the name breaks ties so the order is total
+fun older(a: *Entry, b: *Entry) i64 {
+    if (a.mtime != b.mtime) { if (a.mtime < b.mtime) { ret -1; } ret 1; }
+    if (a.mtime_nsec != b.mtime_nsec) { if (a.mtime_nsec < b.mtime_nsec) { ret -1; } ret 1; }
+    var i: usize = 0;
+    for (i < 64) {
+        if (a.name[i] != b.name[i]) { if (a.name[i] < b.name[i]) { ret -1; } ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+fun protected(name: *u8, keys: *[32]u8, count: usize) bool {
+    var i: usize = 0;
+    for (i < count) {
+        var leaf_name: [65]u8;
+        leaf(?keys[i], ?leaf_name);
+        if (str_equals(name::str, ?leaf_name[0])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the directory's entries, oldest publication first; only names from the private
+# hash namespace are listed and anything else refuses the directory as foreign
+fun inventory(a: *Access, entries: *vector.Vector[Entry], replacing: str) u64 {
     val dirfd: i32 = txn.root_fd(?a.root);
     native_error(a, os.seek(dirfd, 0, os.SEEK_SET), txn.OP_RECOVER);
     if (a.failed) { ret 0; }
     var total: u64 = 0;
-    var removed: u64 = 0;
     var cursor: os.DirectoryCursor = os.DirectoryCursor{};
     val opened: os.DirectoryInitResult = os.directory_init(?cursor, dirfd);
     if (opened.code < 0) { native_error(a, opened.code, txn.OP_RECOVER); ret 0; }
@@ -267,18 +298,30 @@ fun sweep(a: *Access, wanted: u64, remove: bool, replacing: str) u64 {
         val size: u64 = info.st_size::u64;
         if (size > 18446744073709551615 - total) { record(a, txn.error(txn.REJECTED, txn.OP_RECOVER), "cache size accounting overflow"); brk; }
         total = total + size;
-        if (remove && removed < wanted) {
-            remove_entry(a, name);
-            if (!a.failed) { removed = removed + size; }
-        }
+        var listed: Entry = Entry{size: size, mtime: info.st_mtime, mtime_nsec: info.st_mtime_nsec};
+        var c: usize = 0;
+        for (c < 64) { listed.name[c] = name[c]; c = c + 1; }
+        listed.name[64] = 0;
+        val pushed: res[usize, A.Error] = vector.push[Entry](entries, listed);
+        if (sel pushed.err) { record(a, txn.error(txn.MEMORY, txn.OP_RECOVER), alloc.text(pushed.err)); brk; }
     }
     val closed: i64 = os.directory_close(?cursor);
     if (closed < 0 && !a.failed) { native_error(a, closed, txn.OP_RECOVER); }
-    if (remove) { ret removed; }
+    if (a.failed) { ret 0; }
+    sort.sort[Entry](entries.data, entries.len, older);
     ret total;
 }
 
-fun make_room(a: *Access, incoming: usize, replacing: str, limit: u64) {
+fun sweep(a: *Access, replacing: str) u64 {
+    var entries: vector.Vector[Entry] = vector.init[Entry](a.alloc);
+    fin { vector.dnit[Entry](?entries); }
+    ret inventory(a, ?entries, replacing);
+}
+
+# eviction policy: least recently published first (entry mtime, then name), never
+# an entry this build restored or published, and never past the store limit by
+# leaving the store as it was: a publication that cannot make room is declined
+fun make_room(a: *Access, incoming: usize, replacing: str, limit: u64, keys: *[32]u8, key_count: usize) {
     var prior: u64 = 0;
     if (replacing != nil) {
         var info: os.stat_t;
@@ -299,22 +342,27 @@ fun make_room(a: *Access, incoming: usize, replacing: str, limit: u64) {
     if (prior > charged) { charged = prior; }
     if (charged > limit) { record(a, txn.error(txn.REJECTED, txn.OP_PREPARE), "cache entry exceeds the store byte limit"); ret; }
     val available: u64 = limit - charged;
-    var total: u64 = sweep(a, 0, false, replacing);
-    for (!a.failed && total > available) {
-        val needed: u64 = total - available;
-        val removed: u64 = sweep(a, needed, true, replacing);
-        if (a.failed) { ret; }
-        if (removed == 0) { record(a, txn.error(txn.CONFLICT, txn.OP_REMOVE), "cache eviction made no progress"); ret; }
-        val next: u64 = sweep(a, 0, false, replacing);
-        if (a.failed) { ret; }
-        if (next >= total) { record(a, txn.error(txn.CONFLICT, txn.OP_REMOVE), "cache contents changed during eviction"); ret; }
-        total = next;
+    var entries: vector.Vector[Entry] = vector.init[Entry](a.alloc);
+    fin { vector.dnit[Entry](?entries); }
+    var total: u64 = inventory(a, ?entries, replacing);
+    if (a.failed || total <= available) { ret; }
+    var i: usize = 0;
+    for (i < entries.len && total > available && !a.failed) {
+        val victim: *Entry = ?entries.data[i];
+        i = i + 1;
+        if (protected(?victim.name[0], keys, key_count)) { cnt; }
+        remove_entry(a, ?victim.name[0]);
+        if (!a.failed) { total = total - victim.size; }
     }
+    if (a.failed) { ret; }
+    if (total > available) { record(a, txn.error(txn.REJECTED, txn.OP_REMOVE), "cache eviction would remove an entry this build restored or published"); ret; }
 }
 
 # publication may report unavailable after replacement or partial eviction
-pub fun publish(alloc: *A.Allocator, directory: str, key: *[32]u8, payload: *u8, len: usize) res[Status, Error] {
-    if (alloc == nil || key == nil || (len != 0 && payload == nil)) {
+# keys names the entries this build restored or published, which eviction keeps
+pub fun publish(alloc: *A.Allocator, directory: str, key: *[32]u8, payload: *u8, len: usize,
+                keys: *[32]u8, key_count: usize) res[Status, Error] {
+    if (alloc == nil || key == nil || (len != 0 && payload == nil) || (key_count != 0 && keys == nil)) {
         ret res[Status, Error].err{Error{message: "cache publication requires valid owners and payload", native: txn.error(txn.INVALID, txn.OP_PREPARE)}};
     }
     if (len > image.MAX_ENTRY_BYTES) { ret res[Status, Error].ok{Status{kind: UNAVAILABLE, problem: txn.error(txn.REJECTED, txn.OP_PREPARE)}}; }
@@ -334,7 +382,7 @@ pub fun publish(alloc: *A.Allocator, directory: str, key: *[32]u8, payload: *u8,
     begin(?access, alloc, directory);
     var name: [65]u8;
     leaf(key, ?name);
-    if (!access.failed) { make_room(?access, size, ?name[0], MAX_STORE_BYTES); }
+    if (!access.failed) { make_room(?access, size, ?name[0], MAX_STORE_BYTES, keys, key_count); }
     if (!access.failed) {
         var claim: txn.Claim = txn.Claim{};
         transaction_error(?access, txn.claim(?claim, alloc, ?access.held, ?name[0]));
@@ -397,9 +445,9 @@ test "mach.lang.build.cache.store:replace_digest_key_length_and_lock_contract" {
     var key: [32]u8;
     sha256.hash("source", 6, ?key[0]);
     if (!t_read(?alloc, temp.path, ?key, MISS, "")) { ret 5; }
-    if (!t_status(publish(?alloc, temp.path, ?key, "first", 5), STORED)) { ret 6; }
+    if (!t_status(publish(?alloc, temp.path, ?key, "first", 5, nil, 0), STORED)) { ret 6; }
     if (!t_read(?alloc, temp.path, ?key, HIT, "first")) { ret 7; }
-    if (!t_status(publish(?alloc, temp.path, ?key, "replacement", 11), STORED)) { ret 8; }
+    if (!t_status(publish(?alloc, temp.path, ?key, "replacement", 11, nil, 0), STORED)) { ret 8; }
     if (!t_read(?alloc, temp.path, ?key, HIT, "replacement")) { ret 9; }
     var name: [65]u8;
     leaf(?key, ?name);
@@ -424,7 +472,7 @@ test "mach.lang.build.cache.store:replace_digest_key_length_and_lock_contract" {
     val write_bytes_r3: err[fs.FsError] = fs.write_bytes(full, bytes.data, bytes.len - 1, 0o600);
     if (sel write_bytes_r3.err) { ret 14; }
     if (!t_read(?alloc, temp.path, ?key, MISS, "")) { ret 14; }
-    if (!t_status(publish(?alloc, temp.path, ?key, nil, 0), STORED) || !t_read(?alloc, temp.path, ?key, HIT, "")) { ret 15; }
+    if (!t_status(publish(?alloc, temp.path, ?key, nil, 0, nil, 0), STORED) || !t_read(?alloc, temp.path, ?key, HIT, "")) { ret 15; }
     var root: txn.Root = txn.Root{};
     val root_open_r: err[txn.Error] = txn.root_open(?root, temp.path, "");
     if (sel root_open_r.err) { ret 16; }
@@ -433,7 +481,7 @@ test "mach.lang.build.cache.store:replace_digest_key_length_and_lock_contract" {
     val lock_r: err[txn.Error] = txn.lock(?held, ?root);
     if (sel lock_r.err) { ret 17; }
     val unavailable: bool = t_read(?alloc, temp.path, ?key, UNAVAILABLE, "")
-        && t_status(publish(?alloc, temp.path, ?key, "blocked", 7), UNAVAILABLE);
+        && t_status(publish(?alloc, temp.path, ?key, "blocked", 7, nil, 0), UNAVAILABLE);
     val unlock_r: err[txn.Error] = txn.unlock(?held);
     if (sel unlock_r.err) { ret 18; }
     if (!unavailable) { ret 18; }
@@ -450,7 +498,7 @@ test "mach.lang.build.cache.store:replace_digest_key_length_and_lock_contract" {
     if (sel remove_file_r.err) { ret 22; }
     if (os.symlink(outside.path, full) < 0) { ret 22; }
     if (!t_read(?alloc, temp.path, ?key, UNAVAILABLE, "")
-        || !t_status(publish(?alloc, temp.path, ?key, "refused", 7), UNAVAILABLE)) { ret 23; }
+        || !t_status(publish(?alloc, temp.path, ?key, "refused", 7, nil, 0), UNAVAILABLE)) { ret 23; }
     val outside_bytes_r: res[vector.Vector[u8], fs.FsError] = fs.read_bytes(?alloc, outside.path);
     if (sel outside_bytes_r.err) { ret 24; }
     var outside_bytes: vector.Vector[u8] = outside_bytes_r.ok;
@@ -458,6 +506,115 @@ test "mach.lang.build.cache.store:replace_digest_key_length_and_lock_contract" {
     if (outside_bytes.len != bytes.len) { ret 25; }
     var j: usize = 0;
     for (j < bytes.len) { if (outside_bytes.data[j] != bytes.data[j]) { ret 26; } j = j + 1; }
+    ret 0;
+}
+
+fun t_key(text: str, out: *[32]u8) {
+    sha256.hash(text, str_len(text), ?(@out)[0]);
+}
+
+# the coarse kernel file clock makes back-to-back publications share an mtime
+fun t_settle() {
+    os.sleep(20000000);
+}
+
+fun t_inventory(alloc: *A.Allocator, directory: str) u64 {
+    var access: Access = Access{};
+    begin(?access, alloc, directory);
+    var total: u64 = 0;
+    if (!access.failed) { total = sweep(?access, nil); }
+    finish(?access);
+    if (access.failed) { print.eprintln(access.error.message); ret 0xFFFFFFFFFFFFFFFF; }
+    ret total;
+}
+
+fun t_make_room(alloc: *A.Allocator, directory: str, incoming: usize, replacing: str, limit: u64,
+                keys: *[32]u8, key_count: usize) res[u64, Error] {
+    var access: Access = Access{};
+    begin(?access, alloc, directory);
+    if (!access.failed) { make_room(?access, incoming, replacing, limit, keys, key_count); }
+    var total: u64 = 0;
+    if (!access.failed) { total = sweep(?access, nil); }
+    finish(?access);
+    if (access.failed) { ret res[u64, Error].err{access.error}; }
+    ret res[u64, Error].ok{total};
+}
+
+test "mach.lang.build.cache.store:eviction_is_oldest_publication_first_under_the_limit_and_keeps_this_builds_entries" {
+    var alloc: A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val temporary: res[fs.TempFile, fs.FsError] = fs.temp_create(?alloc, "mach-cache-lru");
+    if (sel temporary.err) { ret 2; }
+    var temp: fs.TempFile = temporary.ok;
+    fin { str_free(?alloc, temp.path); }
+    val temp_close_and_remove_r: err[io_error.Error] = fs.temp_close_and_remove(?temp);
+    if (sel temp_close_and_remove_r.err) { ret 3; }
+    if (os.make_dir(os.AT_FDCWD, temp.path, 0o700) < 0) { ret 3; }
+    fin { fs.remove_all(?alloc, temp.path); }
+    val entry: u64 = HEADER_BYTES::u64 + 4;
+    # three publications at distinct mtimes, in the name order c, a, b so that
+    # mtime order and name order disagree and the policy is observable
+    var keys: [3][32]u8;
+    t_key("first", ?keys[0]); t_key("second", ?keys[1]); t_key("third", ?keys[2]);
+    var names: [3][65]u8;
+    leaf(?keys[0], ?names[0]); leaf(?keys[1], ?names[1]); leaf(?keys[2], ?names[2]);
+    if (!t_status(publish(?alloc, temp.path, ?keys[0], "aaaa", 4, nil, 0), STORED)) { ret 4; }
+    t_settle();
+    if (!t_status(publish(?alloc, temp.path, ?keys[1], "bbbb", 4, nil, 0), STORED)) { ret 5; }
+    t_settle();
+    if (!t_status(publish(?alloc, temp.path, ?keys[2], "cccc", 4, nil, 0), STORED)) { ret 6; }
+    if (t_inventory(?alloc, temp.path) != 3 * entry) { ret 7; }
+    # the inventory orders by mtime whatever the names say
+    var listed: Access = Access{};
+    begin(?listed, ?alloc, temp.path);
+    var entries: vector.Vector[Entry] = vector.init[Entry](?alloc);
+    fin { vector.dnit[Entry](?entries); }
+    if (!listed.failed) { inventory(?listed, ?entries, nil); }
+    finish(?listed);
+    if (listed.failed || entries.len != 3) { ret 8; }
+    var order: usize = 0;
+    for (order < 3) {
+        if (!str_equals(?entries.data[order].name[0], ?names[order][0])) { ret 9; }
+        order = order + 1;
+    }
+    # room for one more entry at a limit of three: the oldest goes, the two newer stay
+    val evicted: res[u64, Error] = t_make_room(?alloc, temp.path, entry::usize, nil, 3 * entry, nil, 0);
+    if (sel evicted.err) { print.eprintln(evicted.err.message); ret 10; }
+    if (evicted.ok != 2 * entry) { ret 10; }
+    if (!t_read(?alloc, temp.path, ?keys[0], MISS, "") || !t_read(?alloc, temp.path, ?keys[1], HIT, "bbbb")
+        || !t_read(?alloc, temp.path, ?keys[2], HIT, "cccc")) { ret 11; }
+    # the oldest remaining entry is one this build restored: eviction skips it and
+    # removes the next oldest instead
+    val kept: res[u64, Error] = t_make_room(?alloc, temp.path, entry::usize, nil, 2 * entry, ?keys[1], 1);
+    if (sel kept.err) { print.eprintln(kept.err.message); ret 12; }
+    if (kept.ok != entry) { ret 12; }
+    if (!t_read(?alloc, temp.path, ?keys[1], HIT, "bbbb") || !t_read(?alloc, temp.path, ?keys[2], MISS, "")) { ret 13; }
+    # only protected entries remain and the incoming entry does not fit: declined,
+    # the store unchanged
+    val declined: res[u64, Error] = t_make_room(?alloc, temp.path, entry::usize, nil, entry, ?keys[1], 1);
+    if (sel declined.ok) { ret 14; }
+    if (declined.err.native.kind != txn.REJECTED) { ret 14; }
+    if (!t_read(?alloc, temp.path, ?keys[1], HIT, "bbbb") || t_inventory(?alloc, temp.path) != entry) { ret 15; }
+    # publication itself runs at the store limit, where the two entries fit
+    if (!t_status(publish(?alloc, temp.path, ?keys[0], "aaaa", 4, ?keys[1], 1), STORED)) { ret 16; }
+    if (t_inventory(?alloc, temp.path) != 2 * entry) { ret 16; }
+    # a run of publications under a store limit never exceeds it: the limit is
+    # MAX_STORE_BYTES in production, exercised here through make_room at a small one
+    var round: u32 = 0;
+    for (round < 6) {
+        var fresh: [32]u8;
+        var text: [8]u8 = [8]u8{'r', 'o', 'u', 'n', 'd', ('0' + round::u8), 0, 0};
+        t_key(?text[0], ?fresh);
+        val room: res[u64, Error] = t_make_room(?alloc, temp.path, entry::usize, nil, 3 * entry, ?keys[1], 1);
+        if (sel room.err) { print.eprintln(room.err.message); ret 17; }
+        if (room.ok > 2 * entry) { ret 17; }
+        if (!t_status(publish(?alloc, temp.path, ?fresh, "rrrr", 4, ?keys[1], 1), STORED)) { ret 18; }
+        if (t_inventory(?alloc, temp.path) > 3 * entry) { ret 19; }
+        if (!t_read(?alloc, temp.path, ?keys[1], HIT, "bbbb")) { ret 20; }
+        t_settle();
+        round = round + 1;
+    }
     ret 0;
 }
 
@@ -475,17 +632,17 @@ test "mach.lang.build.cache.store:byte_eviction_preserves_unrelated_entries_and_
     fin { fs.remove_all(?alloc, temp.path); }
     var key: [32]u8;
     sha256.hash("entry", 5, ?key[0]);
-    if (!t_status(publish(?alloc, temp.path, ?key, "keep", 4), STORED)) { ret 4; }
+    if (!t_status(publish(?alloc, temp.path, ?key, "keep", 4, nil, 0), STORED)) { ret 4; }
     var peer: [32]u8;
     sha256.hash("peer", 4, ?peer[0]);
-    if (!t_status(publish(?alloc, temp.path, ?peer, "peer", 4), STORED)) { ret 12; }
+    if (!t_status(publish(?alloc, temp.path, ?peer, "peer", 4, nil, 0), STORED)) { ret 12; }
     var name: [65]u8;
     leaf(?key, ?name);
     var replacement: Access = Access{};
     begin(?replacement, ?alloc, temp.path);
     if (!replacement.failed) {
-        make_room(?replacement, HEADER_BYTES + 4, ?name[0], 2 * (HEADER_BYTES::u64 + 4));
-        if (!replacement.failed && sweep(?replacement, 0, false, nil) != 2 * (HEADER_BYTES::u64 + 4)) {
+        make_room(?replacement, HEADER_BYTES + 4, ?name[0], 2 * (HEADER_BYTES::u64 + 4), nil, 0);
+        if (!replacement.failed && sweep(?replacement, nil) != 2 * (HEADER_BYTES::u64 + 4)) {
             record(?replacement, txn.error(txn.INVALID, txn.OP_RECOVER), "same-size replacement evicted a current cache entry");
         }
         if (!replacement.failed) { leaf(?peer, ?name); remove_entry(?replacement, ?name[0]); }
@@ -495,15 +652,15 @@ test "mach.lang.build.cache.store:byte_eviction_preserves_unrelated_entries_and_
     var access: Access = Access{};
     begin(?access, ?alloc, temp.path);
     if (!access.failed) {
-        val total: u64 = sweep(?access, 0, false, nil);
+        val total: u64 = sweep(?access, nil);
         if (total != HEADER_BYTES::u64 + 4) { record(?access, txn.error(txn.INVALID, txn.OP_RECOVER), "cache byte inventory differs from file size"); }
         if (!access.failed) {
-            make_room(?access, 1, nil, total + 1);
-            if (!access.failed && sweep(?access, 0, false, nil) != total) { record(?access, txn.error(txn.INVALID, txn.OP_RECOVER), "cache evicted bytes at the exact quota boundary"); }
+            make_room(?access, 1, nil, total + 1, nil, 0);
+            if (!access.failed && sweep(?access, nil) != total) { record(?access, txn.error(txn.INVALID, txn.OP_RECOVER), "cache evicted bytes at the exact quota boundary"); }
         }
         if (!access.failed) {
-            make_room(?access, 1, nil, total);
-            if (!access.failed && sweep(?access, 0, false, nil) != 0) { record(?access, txn.error(txn.INVALID, txn.OP_RECOVER), "cache eviction did not release its accounted bytes"); }
+            make_room(?access, 1, nil, total, nil, 0);
+            if (!access.failed && sweep(?access, nil) != 0) { record(?access, txn.error(txn.INVALID, txn.OP_RECOVER), "cache eviction did not release its accounted bytes"); }
         }
     }
     finish(?access);
@@ -514,7 +671,7 @@ test "mach.lang.build.cache.store:byte_eviction_preserves_unrelated_entries_and_
     fin { str_free(?alloc, foreign); }
     val write_bytes_r: err[fs.FsError] = fs.write_bytes(foreign, "retained", 8, 0o600);
     if (sel write_bytes_r.err) { ret 7; }
-    if (!t_status(publish(?alloc, temp.path, ?key, "new", 3), UNAVAILABLE)) { ret 8; }
+    if (!t_status(publish(?alloc, temp.path, ?key, "new", 3, nil, 0), UNAVAILABLE)) { ret 8; }
     val note_r: res[vector.Vector[u8], fs.FsError] = fs.read_bytes(?alloc, foreign);
     if (sel note_r.err) { ret 9; }
     var note: vector.Vector[u8] = note_r.ok;
@@ -522,8 +679,10 @@ test "mach.lang.build.cache.store:byte_eviction_preserves_unrelated_entries_and_
     if (note.len != 8 || note.data[0] != 'r' || note.data[7] != 'd') { ret 10; }
     val read_r: res[Lookup, Error] = read(nil, temp.path, ?key);
     if (sel read_r.ok) { ret 11; }
-    val publish_r: res[Status, Error] = publish(?alloc, temp.path, nil, "x", 1);
+    val publish_r: res[Status, Error] = publish(?alloc, temp.path, nil, "x", 1, nil, 0);
     if (sel publish_r.ok) { ret 11; }
+    val unowned: res[Status, Error] = publish(?alloc, temp.path, ?key, "x", 1, nil, 1);
+    if (sel unowned.ok) { ret 11; }
     ret 0;
 }
 
@@ -537,7 +696,7 @@ fun t_allocation_attempt(directory: str, key: *[32]u8, writing: bool, ordinal: u
     T.fail_at_ordinal(?t, ordinal);
     var code: i32 = 0;
     if (writing) {
-        val result: res[Status, Error] = publish(T.allocator_of(?t), directory, key, "payload", 7);
+        val result: res[Status, Error] = publish(T.allocator_of(?t), directory, key, "payload", 7, nil, 0);
         if (sel result.ok) {
             if (ordinal != 0 || result.ok.kind != STORED) { code = 2; }
         }
@@ -576,7 +735,7 @@ test "mach.lang.build.cache.store:allocation_refusal_is_internal_and_releases_op
     fin { fs.remove_all(?alloc, temp.path); }
     var key: [32]u8;
     sha256.hash("fault", 5, ?key[0]);
-    if (!t_status(publish(?alloc, temp.path, ?key, "payload", 7), STORED)) { ret 4; }
+    if (!t_status(publish(?alloc, temp.path, ?key, "payload", 7, nil, 0), STORED)) { ret 4; }
     var mode: u8 = 0;
     for (mode < 2) {
         var attempts: usize = 0;
