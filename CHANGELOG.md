@@ -142,6 +142,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inputs. The `compiler memory` workflow runs it on demand, never on the PR
   lane. The 2026-09-06 archive measurements it replaces are preserved in
   `doc/design/2299-archive-inventory.md` (#2299).
+- `test/memory.py` runs every cell uncached, cache-cold (publishing) and
+  cache-warm, and requires a warm build to restore every module, so OS
+  file-cache warmth never counts as reuse; it holds the compiler under test
+  to a peak-memory ceiling per workload and profile derived from the measured
+  curves in `doc/design/r2-measurements.md`, and fails above it. The child
+  runs with transparent huge pages disabled and the sampler tracks swap-out,
+  which were the two apparatus effects that made a deterministic serial build
+  read anywhere between 1542 and 1997 MiB; the host's THP mode, load average
+  and available memory are recorded beside every process. A control that
+  cannot build the checkout takes `--control-checkout` for its own tree, and
+  the self-build runs serial and at the host's CPU count (#2299).
+- `doc/design/r2-measurements.md` records the final peak-memory and time
+  curves for the many-module, dense-function, large-aggregate, blocks and
+  self-build workloads on dev, uncached and cached, serial and parallel, at
+  both profiles, against the 4.30.0 seed and the preserved 2026-09-06
+  curves, with the object cache's storage and resident bounds measured past
+  the 512 MiB store limit, the four scratch-ownership mutation anchors
+  re-run, and the attribution of the debug self-build's growth since 4.30.0
+  to #3247 plus two quadratic cliffs (dense liveness sets and the verifier's
+  predecessor check in one large function, DWARF emission in one module of
+  many functions) reported with their cause (#2299, #3221).
 
 - Every RISC-V selection refusal names what it refused: the offending letter or
   token and the selection string for an unknown extension, a noncanonical or
