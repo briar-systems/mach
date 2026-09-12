@@ -289,7 +289,7 @@ deterministic function of the content and still 122 bits of it.
 ## Where each format carries it
 
 - **ELF**: a `.note.gnu.build-id` note (`namesz` 4, `descsz` 32, `type`
-  `NT_GNU_BUILD_ID` 3, name `GNU\0`, 32-byte descriptor, 52 bytes in all) placed
+  `NT_GNU_BUILD_ID` 3, name `GNU\0`, 32-byte descriptor, 48 bytes in all) placed
   in the header page directly after the program headers, so it lies inside the
   first `PT_LOAD` (the header mapping) and is in memory at run time. A `PT_NOTE`
   program header names it, and when the image has a section header table an
