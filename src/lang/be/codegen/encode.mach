@@ -7,6 +7,7 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
+use std.types.string.str_contains;
 
 use std.allocator.page;
 use std.collections.map;
@@ -18,6 +19,8 @@ use R: std.types.result;
 
 use mach.lang.be.codegen.mir;
 use mach.lang.be.codegen.encoding;
+use mach.lang.be.codegen.notes;
+use mach.lang.be.codegen.ctwalk;
 use mach.lang.intern;
 use mach.lang.fail;
 use mach.lang.layout;
@@ -106,28 +109,20 @@ pub rec AsmSink {
     refused:    u32;
 }
 
-pub val ASM_NOTE_INST:  u8 = 0;
-pub val ASM_NOTE_FUNC:  u8 = 1;
-pub val ASM_NOTE_BLOCK: u8 = 2;
-pub val ASM_NOTE_BYTES: u8 = 3;
-# a declassify barrier: no bytes, the MirInstr names the register it downgrades
-pub val ASM_NOTE_BARRIER: u8 = 4;
+# the stream records live in notes.mach so the walk that consumes them can
+# sit beside the driver instead of inside it; the names stay reachable here
+pub def AsmNote:   notes.AsmNote;
+pub def NoteSeeds: notes.NoteSeeds;
 
-pub val ASM_NOTE_BYTES_WIDTH: usize = 4;
+pub val ASM_NOTE_INST:    u8 = notes.ASM_NOTE_INST;
+pub val ASM_NOTE_FUNC:    u8 = notes.ASM_NOTE_FUNC;
+pub val ASM_NOTE_BLOCK:   u8 = notes.ASM_NOTE_BLOCK;
+pub val ASM_NOTE_BYTES:   u8 = notes.ASM_NOTE_BYTES;
+pub val ASM_NOTE_BARRIER: u8 = notes.ASM_NOTE_BARRIER;
 
-pub rec AsmNote {
-    kind:  u8;
-    off:   u32;
-    byte_len: u32;
-    loc: source.SrcLoc;
-    inline_site: u32;
-    # the MirInstr whose encoding emitted this note, nil for bytes with no MIR origin
-    mi:    *mir.MirInstr;
-    inst:  isa.Inst;
-    name:  intern.StrId;
-    id:    u32;
-    bytes: [ASM_NOTE_BYTES_WIDTH]u8;
-}
+pub val ASM_NOTE_BYTES_WIDTH: usize = notes.ASM_NOTE_BYTES_WIDTH;
+
+pub val NOTE_SEED_MAX: u32 = notes.NOTE_SEED_MAX;
 
 val ASM_NOTE_INIT_CAP: u32 = 64;
 
@@ -149,17 +144,7 @@ pub fun sink_init(out: *writer.Writer, interner: *intern.Interner) AsmSink {
 }
 
 pub fun note_blank() AsmNote {
-    var n: AsmNote;
-    n.byte_len = 0;
-    n.loc = source.loc_nil();
-    n.inline_site = 0;
-    n.mi   = nil;
-    n.kind = ASM_NOTE_INST;
-    n.off  = 0;
-    n.inst = isa.inst_blank();
-    n.name = intern.STR_NIL;
-    n.id   = 0;
-    ret n;
+    ret notes.note_blank();
 }
 
 pub fun note_push(buf: *ByteBuf, n: *AsmNote) R.Result[R.Void, str] {
@@ -391,58 +376,12 @@ pub fun sink_unaccounted(buf: *ByteBuf) usize {
     ret buf.len - buf.asm.accounted;
 }
 
-pub val NOTE_SEED_MAX: u32 = 16;
-
-# the secrecy seeds a notification carries, per operand of the MirInstr it
-# encodes: the origin vreg each register or slot operand was rewritten from
-# and that vreg's declared secrecy. per operand, not per register: one
-# register can carry a dying secret source and a born public destination in
-# the same instruction, so a set keyed by register cannot say which
-pub rec NoteSeeds {
-    count:      u32;
-    origin:     [NOTE_SEED_MAX]u32;
-    secret:     [NOTE_SEED_MAX]bool;
-    # a writes_secret load: operand 0 is secret by declaration
-    dst_secret: bool;
-    # an ASM_NOTE_BARRIER: operand 0 is public after this point
-    barrier:    bool;
-}
-
 pub fun note_seeds_clear(out: *NoteSeeds) {
-    out.count      = 0;
-    out.dst_secret = false;
-    out.barrier    = false;
+    notes.note_seeds_clear(out);
 }
 
-# every seed the walk needs at one notification. a note without a MirInstr
-# (prologue, epilogue, relaxation) carries no seed. operands past
-# NOTE_SEED_MAX are not described; no MIR instruction has that many.
 pub fun note_seeds(f: *mir.MirFunction, n: *AsmNote, out: *NoteSeeds) {
-    note_seeds_clear(out);
-    if (f == nil || n == nil || n.mi == nil) { ret; }
-    val mi: *mir.MirInstr = n.mi;
-    out.barrier = n.kind == ASM_NOTE_BARRIER;
-    if (out.barrier && mi.operand_count == 0) {
-        # a dropped self-copy: the downgraded vreg names its own carrier
-        out.count     = 1;
-        out.origin[0] = mi.declassified;
-        out.secret[0] = mi.declassified != mir.MIR_VREG_NIL && mi.declassified < f.vreg_count
-                        && f.vregs[mi.declassified].secret;
-        ret;
-    }
-    val defines: bool = mi.operand_count > 0 && mir.instr_defines_shape(mi);
-    var k: u32 = 0;
-    for (k < mi.operand_count && k < NOTE_SEED_MAX) {
-        val op: *mir.MirOperand = ?mi.operands[k];
-        out.origin[k] = mir.operand_origin(op);
-        out.secret[k] = mir.operand_seed_secret(f, op);
-        if (k == 0 && defines && mi.writes_secret && op.kind == mir.MIR_OP_PREG) {
-            out.dst_secret = true;
-            out.secret[k]  = true;
-        }
-        k = k + 1;
-    }
-    out.count = k;
+    notes.note_seeds(f, n, out);
 }
 
 pub fun sink_set_mir(buf: *ByteBuf, mi: *mir.MirInstr) {
@@ -582,6 +521,17 @@ pub rec EncodeHooks {
     patch_branch:    PatchBranchFn;
     # declared: every emitted byte reaches the sink through one instruction notification
     stream:          bool;
+    # the per-instruction effect description the post-expansion walk reads
+    effects:         ctwalk.IsaEffects;
+}
+
+pub fun hooks_blank() EncodeHooks {
+    var h: EncodeHooks;
+    h.encode_function = nil;
+    h.patch_branch    = nil;
+    h.stream          = false;
+    h.effects         = ctwalk.isa_effects_none();
+    ret h;
 }
 
 pub fun module_has_oblivious(m: *mir.MirModule) bool {
@@ -596,6 +546,70 @@ pub fun module_has_oblivious(m: *mir.MirModule) bool {
 pub fun encode_driver(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.MirModule, hooks: *EncodeHooks) R.Result[EncoderOutput, str] {
     ret encode_driver_asm(alloc, tgt, m, hooks, nil);
 }
+
+fun no_stream_message(m: *mir.MirModule, tgt: *isa.BackendTarget) str {
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        if (m.functions[fi].oblivious) {
+            val r: R.Result[str, str] = format.sprint(m.alloc,
+                "codegen: #[oblivious] function `{}` cannot be compiled for the `{}` target: its encoder notifies no instruction stream, so the emitted instructions cannot be validated constant-time",
+                fn_name(m.interner, m.functions[fi].name), tgt.identity.arch_name);
+            if (R.is_ok[str, str](r)) { ret stable_message(m, R.unwrap_ok[str, str](r), NO_STREAM_DETAIL); }
+            ret NO_STREAM_DETAIL;
+        }
+        fi = fi + 1;
+    }
+    ret NO_STREAM_DETAIL;
+}
+
+val NO_STREAM_DETAIL: str = "codegen: an #[oblivious] function cannot be compiled for a target whose encoder notifies no instruction stream; the emitted instructions cannot be validated constant-time";
+
+fun fn_name(interner: *intern.Interner, id: intern.StrId) str {
+    if (interner == nil) { ret "<unknown>"; }
+    val o: O.Option[str] = intern.lookup(interner, id);
+    if (O.is_some[str](o)) { ret O.unwrap[str](o); }
+    ret "<unknown>";
+}
+
+fun stable_message(m: *mir.MirModule, buf: str, fallback: str) str {
+    if (m.interner == nil) { ret buf; }
+    val ir: R.Result[intern.StrId, str] = intern.intern(m.interner, buf);
+    A.deallocate[u8](m.alloc, buf, str_len(buf) + 1);
+    if (R.is_err[intern.StrId, str](ir)) { ret fallback; }
+    val lo: O.Option[str] = intern.lookup(m.interner, R.unwrap_ok[intern.StrId, str](ir));
+    if (O.is_some[str](lo)) { ret O.unwrap[str](lo); }
+    ret fallback;
+}
+
+# the post-expansion walk over one function's notifications; a refusal is
+# located at the instruction's source position and names the function
+fun walk_function(st: *EncodeState, tgt: *isa.BackendTarget, hooks: *EncodeHooks, f: *mir.MirFunction) R.Result[R.Void, str] {
+    if (!sink_active(?st.buf)) {
+        ret R.err[R.Void, str]("codegen: an #[oblivious] function reached the encoder with no instruction stream to validate");
+    }
+    val s: *AsmSink = st.buf.asm;
+    val wr: R.Result[R.Void, ctwalk.Refusal] = ctwalk.run(f, s.notes, s.note_count, ?hooks.effects, tgt, st.alloc);
+    if (R.is_ok[R.Void, ctwalk.Refusal](wr)) { ret R.ok_void[str](); }
+    var refusal: ctwalk.Refusal = R.unwrap_err[R.Void, ctwalk.Refusal](wr);
+    fin { ctwalk.refusal_free(st.alloc, ?refusal); }
+    if (st.interner == nil || refusal.detail == nil) { ret R.err[R.Void, str](WALK_REFUSED_DETAIL); }
+    val rf: R.Result[str, str] = format.sprint(st.alloc, "codegen: #[oblivious] function `{}` {}",
+                                               fn_name(st.interner, f.name), refusal.detail);
+    if (R.is_err[str, str](rf)) { ret R.err[R.Void, str](WALK_REFUSED_DETAIL); }
+    val body: str = R.unwrap_ok[str, str](rf);
+    fin { A.deallocate[u8](st.alloc, body, str_len(body) + 1); }
+    var loc: source.SrcLoc = source.loc_nil();
+    if (refusal.index < s.note_count) { loc = s.notes[refusal.index].loc; }
+    val located: str = asm_located_message(st, loc, body);
+    if (located != body) { ret R.err[R.Void, str](located); }
+    val ir: R.Result[intern.StrId, str] = intern.intern(st.interner, body);
+    if (R.is_err[intern.StrId, str](ir)) { ret R.err[R.Void, str](WALK_REFUSED_DETAIL); }
+    val lo: O.Option[str] = intern.lookup(st.interner, R.unwrap_ok[intern.StrId, str](ir));
+    if (O.is_some[str](lo)) { ret R.err[R.Void, str](O.unwrap[str](lo)); }
+    ret R.err[R.Void, str](WALK_REFUSED_DETAIL);
+}
+
+val WALK_REFUSED_DETAIL: str = "codegen: an #[oblivious] function was refused by the post-expansion constant-time walk";
 
 fun apply_emission_order_module(alloc: *A.Allocator, m: *mir.MirModule) R.Result[R.Void, str] {
     var fi: u32 = 0;
@@ -652,9 +666,16 @@ pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.
     state_init(?st, alloc, m, tgt);
 
     # the stream exists under --emit-asm and on every build of a module with an
-    # oblivious function; a nil writer notifies and claims without rendering
+    # oblivious function; a nil writer notifies and claims without rendering.
+    # an ISA without a stream cannot validate an oblivious function's final
+    # instructions and refuses it, like the whole-module emitter does
+    val oblivious: bool = module_has_oblivious(m);
+    if (oblivious && !hooks.stream) {
+        state_dnit(?st);
+        ret R.err[EncoderOutput, str](no_stream_message(m, tgt));
+    }
     var sink: AsmSink = sink_init(asm_out, m.interner);
-    if (asm_out != nil || (hooks.stream && module_has_oblivious(m))) { st.buf.asm = ?sink; }
+    if (asm_out != nil || (hooks.stream && oblivious)) { st.buf.asm = ?sink; }
 
     var notified: u32 = 0;
     var fi: u32 = 0;
@@ -671,7 +692,16 @@ pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.
             st.syms[pre_sym_count].size = st.buf.len::u32 - st.syms[pre_sym_count].offset;
         }
         if (sink.failed) { brk; }
-        # one function's notifications are complete here; a consumer runs before the reset
+        # one function's notifications are complete here: the post-expansion
+        # walk validates an oblivious function before the reset
+        if (m.functions[fi].oblivious) {
+            val vr: R.Result[R.Void, str] = walk_function(?st, tgt, hooks, ?m.functions[fi]);
+            if (R.is_err[R.Void, str](vr)) {
+                notes_free(?st.buf);
+                state_dnit(?st);
+                ret R.err[EncoderOutput, str](R.unwrap_err[R.Void, str](vr));
+            }
+        }
         notified = notified + note_inst_count(?st.buf);
         notes_reset(?st.buf);
         fi = fi + 1;
@@ -2240,53 +2270,50 @@ test "mach.lang.be.codegen.encode.emit_byte:doubling_is_still_exact_at_ordinary_
 # the seed reader: a load declared writes_secret seeds its destination, a
 # frame-slot operand seeds by its slot key, a precolored register and an
 # immediate carry no origin, and a note with no MirInstr carries nothing
-test "mach.lang.be.codegen.encode.note_seeds:declared_destination_slot_key_and_no_origin" {
-    var vregs: [2]mir.MirVReg;
-    vregs[0] = mir.vreg(0, 0, false, false);
-    vregs[1] = mir.vreg(1, 0, false, true);
-    vregs[1].spill_slot = 0;
+
+fun t_no_stream_encode(st: *EncodeState, f: *mir.MirFunction) R.Result[R.Void, str] {
+    ret R.ok_void[str]();
+}
+
+fun t_no_stream_patch(st: *EncodeState, fx: *BranchFixup, target_off: u32) R.Result[R.Void, str] {
+    ret R.ok_void[str]();
+}
+
+# an ISA that declares no notification stream cannot validate an oblivious
+# function's final instructions and refuses the module, like the
+# whole-module emitter does; without the contract the same module encodes
+test "mach.lang.be.codegen.encode.encode_driver:an_isa_without_a_stream_refuses_an_oblivious_function" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var interner: intern.Interner = intern.init(?alloc);
+    fin { intern.dnit(?interner); }
+    var m: mir.MirModule = mir.MirModule{alloc: ?alloc, interner: ?interner};
+    fin { mir.dnit_module(?m); }
     var f: mir.MirFunction;
-    f.vregs = ?vregs[0];
-    f.vreg_count = 2;
+    f.name      = intern.STR_NIL;
+    f.oblivious = true;
+    f.blocks    = nil;
+    f.block_count = 0;
+    f.vregs     = nil;
+    f.vreg_count = 0;
+    if (R.is_err[R.Void, str](mir.push_function(?m, f))) { ret 2; }
+    var bt: isa.BackendTarget;
+    bt.model = @t_machine();
+    bt.identity.arch_name = "silent";
+    bt.abi.callee_saved = nil;
+    var hooks: EncodeHooks = hooks_blank();
+    hooks.encode_function = t_no_stream_encode;
+    hooks.patch_branch    = t_no_stream_patch;
+    hooks.stream          = false;
+    val r: R.Result[EncoderOutput, str] = encode_driver(?alloc, ?bt, ?m, ?hooks);
+    if (R.is_ok[EncoderOutput, str](r)) { ret 3; }
+    if (!str_contains(R.unwrap_err[EncoderOutput, str](r), "notifies no instruction stream")) { ret 4; }
+    if (!str_contains(R.unwrap_err[EncoderOutput, str](r), "silent")) { ret 5; }
 
-    var ops: [2]mir.MirOperand;
-    ops[0] = mir.op_preg_of(3, 0);
-    ops[1] = mir.op_mem_preg(5, 16);
-    var load: mir.MirInstr = mir.instr(mir.MIR_LOAD, ?ops[0], 2, 8, 8);
-    load.writes_secret = true;
-    var n: AsmNote = note_blank();
-    n.mi = ?load;
-    var seeds: NoteSeeds;
-    note_seeds(?f, ?n, ?seeds);
-    if (seeds.count != 2 || !seeds.dst_secret || seeds.barrier) { ret 1; }
-    if (seeds.origin[0] != 0 || !seeds.secret[0])               { ret 2; }
-    if (seeds.origin[1] != mir.MIR_VREG_NIL || seeds.secret[1]) { ret 3; }
-
-    # without the declaration a public origin stays public
-    load.writes_secret = false;
-    note_seeds(?f, ?n, ?seeds);
-    if (seeds.dst_secret || seeds.secret[0]) { ret 4; }
-
-    var sops: [2]mir.MirOperand;
-    sops[0] = mir.op_mem_slot(1, 0);
-    sops[1] = mir.op_preg(9);
-    var store: mir.MirInstr = mir.instr(mir.MIR_MOV, ?sops[0], 2, 8, 8);
-    n.mi = ?store;
-    note_seeds(?f, ?n, ?seeds);
-    if (seeds.count != 2 || seeds.dst_secret)                   { ret 5; }
-    if (seeds.origin[0] != 1 || !seeds.secret[0])               { ret 6; }
-    if (seeds.origin[1] != mir.MIR_VREG_NIL || seeds.secret[1]) { ret 7; }
-
-    var iops: [2]mir.MirOperand;
-    iops[0] = mir.op_preg_of(3, 1);
-    iops[1] = mir.op_imm(4);
-    var mov: mir.MirInstr = mir.instr(mir.MIR_MOV, ?iops[0], 2, 8, 8);
-    n.mi = ?mov;
-    note_seeds(?f, ?n, ?seeds);
-    if (seeds.count != 2 || seeds.origin[0] != 1 || !seeds.secret[0] || seeds.origin[1] != mir.MIR_VREG_NIL) { ret 8; }
-
-    n.mi = nil;
-    note_seeds(?f, ?n, ?seeds);
-    if (seeds.count != 0 || seeds.barrier || seeds.dst_secret) { ret 9; }
+    m.functions[0].oblivious = false;
+    val ok: R.Result[EncoderOutput, str] = encode_driver(?alloc, ?bt, ?m, ?hooks);
+    if (R.is_err[EncoderOutput, str](ok)) { ret 6; }
+    val out: EncoderOutput = R.unwrap_ok[EncoderOutput, str](ok);
+    if (out.text_len != 0 || out.notified != 0) { ret 7; }
     ret 0;
 }
