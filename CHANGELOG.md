@@ -189,6 +189,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   relocation relations across ELF, Mach-O and COFF. Final linking resolves absolute
   definitions separately from image-relative symbols (#3119).
 
+- Build planning, driver setup and request hashing reject unknown request catalog values. Invalid phases report their tag and catalog instead of appearing as linking, and invalid goals no longer masquerade as allocation failures.
+
 - Instruction selection preserves each register operand's required bank. Post-allocation
   verification independently rejects wrong-bank operands, including conversions,
   moves, and memory addresses.
