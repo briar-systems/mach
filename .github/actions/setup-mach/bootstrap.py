@@ -11,9 +11,13 @@ import tempfile
 census = runpy.run_path(str(Path(__file__).with_name('census.py')))['census']
 # (name, compiler source, std pin, mode). 'single' stages are one-way bridges built
 # once by the previous compiler. 'fixpoint' stages build A, B and C and require B == C.
+# the chain ends at the v5 migration compiler (mach #3218, #3226): the tree that
+# CI builds with it pins std 2.0, whose v5 syntax only a v5 compiler reads, and
+# the stage reaches that compiler only through the audited 4.30 fixpoint.
 STAGES = [
     ('bridge', '878a8f66a90127360dc23de4480241934fc1bf0d', '3ee8e709a8ed7baff6e93780ce9b3582a907a91f', 'single'),
     ('audited', 'b65afb9704218e89998af5f71050ca315e7709a9', '168a9f760d7c0f7a182f3b0685081e62f1a4f682', 'fixpoint'),
+    ('v5', '2a2918b23af735e13301e91774a438a1bf3ede42', '168a9f760d7c0f7a182f3b0685081e62f1a4f682', 'fixpoint'),
 ]
 
 
@@ -57,7 +61,7 @@ def main():
             subprocess.run(['git', 'submodule', 'update', '--init', '--recursive'], cwd=source, check=True)
             if git(source, 'rev-parse', 'HEAD') != source_ref or git(source / 'dep/std', 'rev-parse', 'HEAD') != std_ref:
                 raise RuntimeError('bootstrap source differs from its committed pins')
-            stage = dict(name=name, compiler=source_ref, std=std_ref, binaries={})
+            stage = dict(name=name, compiler=source_ref, std=std_ref, mode=mode, binaries={})
             provenance['stages'].append(stage)
             for letter in (['H'] if mode == 'single' else ['A', 'B', 'C']):
                 output = source / ('m' + letter + suffix)
@@ -76,7 +80,7 @@ def main():
         census('bootstrap-complete', evidence)
         installed = destination / ('mach' + suffix)
         shutil.copy2(compiler, installed)
-        provenance.update(fixpoint=all(stage.get('fixpoint', False) for stage in provenance['stages'] if stage['name'] == 'audited'), sha256=digest(installed))
+        provenance.update(fixpoint=all(stage.get('fixpoint', False) for stage in provenance['stages'] if stage['mode'] == 'fixpoint'), sha256=digest(installed))
         record.write_text(json.dumps(provenance, indent=2), encoding='utf-8')
         with Path(os.environ['GITHUB_PATH']).open('a', encoding='utf-8') as output:
             output.write(str(destination) + '\n')
