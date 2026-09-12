@@ -109,6 +109,10 @@ depends on what its producer observes:
   structural producer.
 - `expect.<profile>.txt` — the observable is a real function of the active
   profile's own codegen. Only `gdb-session` is, and only since #2779.
+- `expect.<target>.<profile>.txt` — the observable is a function of both: an ISA's
+  instruction vocabulary under a profile's inlining policy. Only `atomic-inline` is
+  (#3110), where the release cell's zero calls are the claim and the debug cell's
+  eight calls are the control.
 
 `run.sh --bless` rewrites them and prints the diff, and refuses to run when `CI` is
 set: a golden nobody read is not a golden.
