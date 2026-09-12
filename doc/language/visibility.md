@@ -8,11 +8,18 @@ Marks a declaration as part of its module's public surface. Other modules
 that `use` this module can reference `pub`-marked symbols by name; symbols
 without `pub` are file-private.
 
-```mach
+```mach reject "helper"
+# file: src/lib.mach
 pub fun add(a: i64, b: i64) i64 { ret a + b; }
-fun helper() { ... }            # private: only callable inside this file
+fun helper() i64 { ret 1; }     # private: only callable inside this file
 pub rec Point { x: i64; y: i64; }
 pub val MAX: i64 = 100;
+
+# file: src/root.mach
+use example.lib;
+
+fun sum() i64 { ret lib.add(lib.MAX, 1); }     # fine: pub
+fun peek() i64 { ret lib.helper(); }           # error: helper is not exported
 ```
 
 Applies to: `fun`, `rec`, `uni`, `def`, `val`, `var`, `ext fun`, `ext val`,

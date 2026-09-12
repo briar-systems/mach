@@ -88,22 +88,43 @@ and each source site warns once even when a generic body is instantiated more
 than once. The declaring module does not warn on its own uses, and an unused
 import alone produces no warning.
 
-```mach
+```mach warn "`old` is deprecated: use replacement"
+# file: src/legacy.mach
 #[deprecated("use replacement")]
 pub fun old() i32 { ret replacement(); }
 
 pub fun replacement() i32 { ret 1; }
+
+# file: src/root.mach
+use example.legacy;
+
+fun caller() i32 { ret legacy.old(); }      # warning: `old` is deprecated: use replacement
 ```
 
 It applies to `fun`, `rec`, `uni`, `tag`, `def`, `val`, `var`, `use` and `fwd`
 declarations, and to a tag case, where it is the only decorator a case accepts:
 
-```mach
+```mach warn "tag case `value` is deprecated: use fresh"
+# file: src/reply.mach
+#[deprecated("the whole tag")]
+pub tag Old: u8 { empty; }
+
 pub tag Reply: u8 {
     empty;
     #[deprecated("use fresh")] value: i64;
     fresh: i64;
 }
+
+# file: src/root.mach
+use example.reply;
+
+fun read(r: reply.Reply) i64 {
+    if (sel r.value) { ret r.value; }        # both sites warn: tag case `value` is deprecated: use fresh
+    ret 0;
+}
+
+fun make() reply.Reply { ret reply.Reply.value{1}; }   # construction warns too
+fun stale() reply.Old { ret reply.Old.empty{}; }        # warning: `Old` is deprecated: the whole tag
 ```
 
 A deprecated case warns at every external use that names it: `Reply.value{...}`
@@ -137,7 +158,7 @@ it (Darwin's underscore prefix, nothing elsewhere; see
 platform prefix applied to it.
 
 A mangled name is the source FQN, dotted, with generic arguments after a `$`:
-`std.types.string.str_len`, `std.types.option.unwrap$ptr`. Each argument is
+`std.types.string.str_len`, `std.collections.vector.push$ptr`. Each argument is
 introduced by a run of `$` whose length is its nesting depth, so a nested
 argument closes without a bracket — `f[Map[Vec[i64], str], u8]` is
 `m.f$m.Map$$m.Vec$$$i64$$str$u8`. `p$u8` is `*u8`, `sec$u32` is `^u32`,
@@ -198,7 +219,7 @@ Helpers referencing compiler-local literal pools retain their calls because thos
 objects have module-local identity. Named globals keep their original symbols,
 and copied instructions preserve effects, assembly bindings and debug locations.
 
-```mach
+```mach accept
 #[inline]
 fun fast_path(x: i64) i64 { ret x * 2; }
 ```
@@ -209,9 +230,9 @@ The inverse of `inline`: forbids inlining a function into any caller, overriding
 the compiler's size- and use-count heuristics that would otherwise fold it in.
 Applies to functions only; takes no arguments.
 
-```mach
+```mach accept
 #[noinline]
-fun cold_path(code: i64) i64 { panic("unreachable state"); }
+fun cold_path(code: i64) i64 { ret code * 100; }
 ```
 
 Use it to keep a function's frame and symbol real — for a profiler or stack
@@ -238,7 +259,9 @@ A type's alignment is settled during type resolution, before layouts are otherwi
 known; the measured type's layout is established on demand when the intrinsic asks
 for it, so the answer does not depend on whether `T` is declared above or below.
 
-```mach
+```mach accept
+rec Pair { a: u64; b: u64; }
+
 #[align(64)]
 pub var cache_line: u8 = 0;
 
@@ -282,7 +305,10 @@ case where the layout is not mach's to choose — a C struct, a file header, a w
 frame, a vertex whose stride a buffer fixes. Without it such a shape cannot be
 described as a record at all.
 
-```mach
+```mach run "15 1 7"
+use std.runtime;
+use print: std.print;
+
 #[packed]
 rec Header {
     magic:    u8;    # offset 0
@@ -290,6 +316,12 @@ rec Header {
     length:   u32;   # offset 3
     checksum: u64;   # offset 7
 }                    # $size_of == 15, $align_of == 1
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{} {} {}", $size_of(Header), $align_of(Header), $offset_of(Header, checksum));
+    ret 0;
+}
 ```
 
 Naturally the same shape is 24 bytes. `$size_of`, `$align_of` and `$offset_of` all
@@ -304,9 +336,18 @@ The two compose rather than conflict, and each owns one question:
 - `align(N)` decides the **record's own alignment**, and rounds its size up to a
   multiple of `N`.
 
-```mach
+```mach run "8 8 1"
+use std.runtime;
+use print: std.print;
+
 #[packed] #[align(8)]
 rec Frame { a: u8; b: u32; }   # fields at 0 and 1; $align_of == 8, $size_of == 8
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{} {} {}", $size_of(Frame), $align_of(Frame), $offset_of(Frame, b));
+    ret 0;
+}
 ```
 
 #### Packing is not transitive
@@ -316,11 +357,20 @@ internal padding and is merely *placed* without padding. This matches C, and it 
 the rule that composes: an inner type's layout does not change depending on who
 holds it.
 
-```mach
+```mach run "4 8 1 9"
+use std.runtime;
+use print: std.print;
+
 rec Point { x: u8; y: u32; }   # natural: y at 4, size 8
 
 #[packed]
 rec Msg { tag: u8; p: Point; } # p at offset 1, still 8 bytes; $size_of(Msg) == 9
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{} {} {} {}", $offset_of(Point, y), $size_of(Point), $offset_of(Msg, p), $size_of(Msg));
+    ret 0;
+}
 ```
 
 A transitive rule would make `Msg` 6 bytes and silently change `Point`'s meaning
@@ -399,7 +449,7 @@ natively.
 Places a function or global variable in a named section instead of the
 default `.text` / `.data`.
 
-```mach
+```mach accept
 #[section(".hottext")] #[symbol("f_hot")]
 fun f_hot(x: i64) i64 { ret x + 1; }
 

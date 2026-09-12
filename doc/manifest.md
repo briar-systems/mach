@@ -708,6 +708,7 @@ the same entries, so nothing behaves differently as a dependency.
 | `isa`     | yes | Filter axis over `isa`, same forms. |
 | `abi`     | yes | Filter axis over `abi`, same forms. |
 | `export`  | yes | `true` cascades this entry to consumers; `false` keeps it to this project's own builds. |
+| `include` | no | `"always"` (the default) names the dynamic library in the linked image whether or not anything imports from it; `"referenced"` names it only when a live import references it, so an unused provider leaves no load command behind. Any other value is a manifest error (`[link.k].include must be "always" or "referenced"`). |
 
 The `os`/`isa`/`abi` axes select the build cells an entry applies to. Each takes a
 single canonical value, `"*"` for any, or an array — `os = "linux"` and
@@ -1444,7 +1445,7 @@ profiles, two binary artifacts with literal output paths, and one dependency,
 ```toml
 [project]
 id = "mach"
-version = "4.30.0"
+version = "5.0.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
@@ -1492,11 +1493,12 @@ need = []
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v1.0.1"
+ref = "commit/e6fc41251e442eb736d4d15de677903a4ba52461"
 ```
 
 (The full manifest declares all six targets; `version` is whatever the tree's
-current release is.) `mach build .` selects the host-matching target via
+current release is, and the `std` selector is the exact std 2.0.0 commit the
+tree builds against until the tag is cut.) `mach build .` selects the host-matching target via
 `native`, compiles `src/bin/main.mach` and its transitive imports — including
 modules from `std` at `dep/std/` — and links `out/<target>/<profile>/bin/mach`.
 The two artifacts keep literal outputs rather than one

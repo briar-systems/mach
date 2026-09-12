@@ -4,14 +4,11 @@ A `tag` is a discriminated aggregate value that represents exactly one active
 case at any moment. Each case has a name and either one explicitly typed payload
 or no payload at all.
 
-## Implementation status
-
-The features described on this page represent the accepted Mach v5 contract
-specified in [the tagged value design](../design/tagged-values.md). Declarations
-with an explicit discriminator, `Type.case{payload}` construction, `sel` case
-tests, checked layout, `$is_tag`, `$discriminant_of`, `$cases` with descriptor
-projection and construction, lexical payload guards and the debug-profile
-discriminator trap are implemented.
+This page is the language reference for the
+[v5 tagged-value contract](../design/tagged-values.md): declarations with an
+explicit discriminator, `Type.case{payload}` construction, `sel` case tests,
+lexical payload guards, the debug-profile discriminator trap, checked layout
+and the reflection intrinsics.
 
 ## Grammar
 
@@ -35,7 +32,7 @@ because vector spellings resolve as vector types in type positions.
 
 ## Examples
 
-```mach
+```mach accept
 pub tag Reply: u8 {
     empty;
     value: i64;
@@ -54,10 +51,23 @@ pub tag Tree[T]: u8 {
 
 When multiple values must accompany a case, use an ordinary record payload:
 
-```mach
+```mach accept
+use std.types.size.usize;
+use std.types.string.str;
+
 pub tag Entry: u8 {
     none;
     pair: rec { key: str; count: usize; };
+}
+```
+
+An empty tag, a duplicate case name and a discriminator too narrow for the
+case count are rejected:
+
+```mach reject "duplicate tag case name"
+tag Twice: u8 {
+    one;
+    one;
 }
 ```
 
@@ -65,7 +75,9 @@ pub tag Entry: u8 {
 
 A tag value is constructed by naming the type, the case and the payload:
 
-```mach
+```mach accept
+tag Reply: u8 { empty; value: i64; }
+
 val empty_reply: Reply = Reply.empty{};
 val num_reply:   Reply = Reply.value{42};
 ```
@@ -80,6 +92,12 @@ case takes empty braces. There is no other construction form:
 - The record-literal form (`Reply{value: 1}` or `Reply{empty}`) is a compile error
 - A case selector alone (`Reply.value`) is not a value
 
+```mach reject "payload"
+tag Reply: u8 { empty; value: i64; }
+
+val missing: Reply = Reply.value{};     # the case declares a payload
+```
+
 Whole-value assignment replaces the selected case and payload together.
 
 ### Default initialization
@@ -87,16 +105,35 @@ Whole-value assignment replaces the selected case and payload together.
 Zero initialization selects the first declared case and zero-initializes its
 payload if one exists.
 
-```mach
-var reply: Reply;           # selects Reply.empty
+```mach run "empty"
+use std.runtime;
+use print: std.print;
+
+tag Reply: u8 { empty; value: i64; }
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var reply: Reply;           # selects Reply.empty
+    if (sel reply.empty) { print.println("empty"); }
+    ret 0;
+}
 ```
 
 ## The std failure tags
 
-The canonical failure types are ordinary std tags, declared in std with fixed
-generic arities and no compiler knowledge of their names. They use the same
-mechanisms as every user tag: the same construction form, `sel`, guards,
-layout and reflection.
+The canonical failure types are ordinary std tags, declared in
+`std.types.canonical` with fixed generic arities and no compiler knowledge of
+their names. They use the same mechanisms as every user tag: the same
+construction form, `sel`, guards, layout and reflection. A module imports the
+ones it spells:
+
+```mach
+use std.types.canonical.res;
+use std.types.canonical.opt;
+use std.types.canonical.err;
+```
+
+std declares them as:
 
 ```mach
 pub tag res[T, E]: u8 { err: E; ok: T; }
@@ -114,7 +151,13 @@ pub tag err[E]: u8    { err: E; ok; }
 There is no defaulted type argument, general type inference, dummy success
 type, unit value, constructor function or automatic error conversion.
 
-```mach
+```mach accept
+use std.types.canonical.res;
+use std.types.canonical.opt;
+use std.types.canonical.err;
+
+tag ParseError: u8 { invalid; overflow; }
+
 val good: res[i64, ParseError] = res[i64, ParseError].ok{42};
 val bad:  res[i64, ParseError] = res[i64, ParseError].err{ParseError.invalid{}};
 
@@ -135,7 +178,14 @@ in std 2.0.0 paired with Mach 5.0.0. They are std declarations like any other:
 the compiler has no knowledge of the three names, they resolve only through an
 import or a declaration in scope, and a module may declare its own `res`, `opt`
 or `err` as a tag or as anything else. Declaring one twice in a module is the
-ordinary duplicate definition.
+ordinary duplicate definition. A module that spells `res` without importing it
+is rejected the way any unresolved type name is:
+
+```mach reject "unresolved type name `res`"
+tag ParseError: u8 { invalid; }
+
+fun parse(x: i64) res[i64, ParseError] { ret res[i64, ParseError].ok{x}; }
+```
 
 ## Case tests
 
@@ -143,12 +193,16 @@ ordinary duplicate definition.
 holds `case`. It reads only the discriminator, never a payload, and has no side
 effects.
 
-```mach
-if (sel reply.value) {
-    # reply holds value here
-}
-or {
-    # reply holds empty here
+```mach accept
+tag Reply: u8 { empty; value: i64; }
+
+fun describe(reply: Reply) i64 {
+    if (sel reply.value) {
+        ret reply.value;        # reply holds value here
+    }
+    or {
+        ret 0;                  # reply holds empty here
+    }
 }
 ```
 
@@ -160,10 +214,35 @@ call or other temporary is not a place. The result is an ordinary `bool`, so it
 composes with `!`, `&&` and `||`, can initialize a `bool` binding, and can be
 returned.
 
-```mach
-val done: bool = sel reply.value;
-if (!sel next.some) { brk; }
-if (sel a.ok && sel b.ok) { }
+```mach accept
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.canonical.opt;
+
+tag Reply: u8 { empty; value: i64; }
+
+fun tests(reply: Reply, next: opt[i64], a: opt[i64], b: opt[i64]) bool {
+    val done: bool = sel reply.value;
+    for {
+        if (!sel next.some) { brk; }
+        brk;
+    }
+    if (sel a.some && sel b.some) { ret done; }
+    ret false;
+}
+```
+
+`sel` takes a place, so a call result is refused:
+
+```mach reject "sel"
+tag Reply: u8 { empty; value: i64; }
+
+fun make() Reply { ret Reply.empty{}; }
+
+fun test() i64 {
+    if (sel make().empty) { ret 1; }
+    ret 0;
+}
 ```
 
 `sel` is a keyword. Comparing a tag with `==`, whole-tag equality, payload
@@ -189,12 +268,24 @@ region, not a flow fact: a chain arm whose condition is exactly `sel P.c` guards
 `P.c` inside its block, and a chain whose every arm exits guards the remainder
 of the enclosing block for the case the chain left untested.
 
-```mach
+```mach accept
+tag Reply: u8 { empty; value: i64; }
+
 fun read_value(reply: Reply) i64 {
     if (sel reply.value) {
         ret reply.value;    # guarded by the arm condition
     }
     ret 0;
+}
+```
+
+A payload read outside a guard is a compile error:
+
+```mach reject "guard"
+tag Reply: u8 { empty; value: i64; }
+
+fun read_value(reply: Reply) i64 {
+    ret reply.value;        # no guard opens here
 }
 ```
 
@@ -211,6 +302,26 @@ Inside a guard the payload place is ordinary storage: reading it copies under
 the existing value rules, writing it keeps the selected case, and `?value.case`
 yields a typed pointer to naturally aligned storage. Whole-value assignment to
 the guarded place is a compile error; rebind to a new name instead.
+
+```mach reject "cannot assign to this place inside a guard"
+tag Reply: u8 { empty; value: i64; }
+
+fun reset(reply: Reply) i64 {
+    var r: Reply = reply;
+    if (sel r.value) {
+        r = Reply.empty{};          # whole-value assignment inside the guard
+        ret 1;
+    }
+    ret 0;
+}
+```
+
+The check covers the guarded place and every object it is reached through by
+value (`b.r = ...` under `sel b.r.value` is refused too). A pointer ends that
+chain: under `sel p.value` with `p: *Reply`, reassigning `p` or writing
+`@p = ...` is not tracked, because the guard covers the storage the pointer
+reached when the test ran, and a write through a pointer is the ordinary
+raw-memory obligation below.
 
 A payload read whose case is no longer selected is undefined behavior of the
 same class as a stale pointer read. A raw pointer to a payload does not pin a

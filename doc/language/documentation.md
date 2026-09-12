@@ -67,13 +67,16 @@ declaration whether or not it is documented.
 
 ## Placement
 
-The lexer folds line-adjacent `#` lines into one run, and a run becomes a
-declaration's docstring when it ends on the line directly above the
-declaration or directly above the declaration's `#[...]` decorators. A blank
-line between the run and the declaration breaks the attachment, and a
-decorator line is not a comment, so it never joins a run. The docstring is
-therefore the first thing above the declaration, with decorators between it
-and the declaration:
+The lexer folds line-adjacent `#` lines that each start their own line into
+one run, and a run becomes a declaration's docstring when it ends on the line
+directly above the declaration or directly above the declaration's `#[...]`
+decorators. A blank line between the run and the declaration breaks the
+attachment, and a decorator line is not a comment, so it never joins a run. A
+comment that shares its line with code (`val x: i32 = 1; # note`) is not
+documentation: it neither starts a run, nor joins the comment on the next
+line, nor attaches to the declaration below it. The docstring is therefore
+the first thing above the declaration, with decorators between it and the
+declaration:
 
 ```mach
 # terminate the program with a message
@@ -115,7 +118,7 @@ pub fun spin_hint() { ... }
 
 ## Record / union / def
 
-```mach
+```mach accept
 # a 2D Cartesian point with i64 coordinates
 # ---
 # x: horizontal coordinate
@@ -123,7 +126,7 @@ pub fun spin_hint() { ... }
 pub rec Point { x: i64; y: i64; }
 ```
 
-```mach
+```mach accept
 # holds either an integer or a float
 # ---
 # i: integer interpretation
@@ -131,32 +134,32 @@ pub rec Point { x: i64; y: i64; }
 pub uni Number { i: i64; f: f64; }
 ```
 
-```mach
+```mach accept
 # an i64 representing years since birth
 pub def Age: i64;
 ```
 
 ## Tag
 
-```mach
-# optional outcome container
+```mach accept
+# a value that may be absent
 # ---
 # [T]: value type
 # none: empty case
 # some: payload case
-pub tag Option[T]: u8 {
+pub tag Maybe[T]: u8 {
     none;
     some: T;
 }
 ```
 
-```mach
-# distinct error tag
+```mach accept
+# a unit outcome with a typed failure
 # ---
 # [E]: error type
 # err: failure case
 # ok: success case
-pub tag Err[E]: u8 {
+pub tag Outcome[E]: u8 {
     err: E;
     ok;
 }
@@ -164,7 +167,19 @@ pub tag Err[E]: u8 {
 
 Cases appear in declaration order after generic parameters. Tags have no return
 value, so `ret:` is refused. Undocumented cases are permitted, but any documented
-case must exist on the tag.
+case must exist on the tag; `doclint` warns at the component otherwise:
+
+```mach warn "documented component matches no parameter, field, generic, or `ret`"
+# a unit outcome with a typed failure
+# ---
+# [E]: error type
+# err: failure case
+# done: no such case
+pub tag Outcome[E]: u8 {
+    err: E;
+    ok;
+}
+```
 
 ## Module
 

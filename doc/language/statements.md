@@ -1,9 +1,5 @@
 # Statements
 
-Tag, canonical type, and `try` descriptions include the accepted v5 contract.
-Implementation is incomplete at base commit `fc5c9e7e`. See
-[tag.md](tag.md#implementation-status) and [try.md](try.md#implementation-status).
-
 Statement forms compose into function bodies and blocks. Statements end
 with `;` except where they end with a block `{...}`.
 
@@ -27,12 +23,16 @@ if (cond) {
 An `if`/`or` arm whose condition is exactly `sel P.c` guards the payload place
 `P.c` inside its block:
 
-```mach
-if (sel reply.value) {
-    val number: i64 = reply.value;  # guarded by the arm condition
-}
-or {
-    # reply holds empty on this path
+```mach accept
+tag Reply: u8 { empty; value: i64; }
+
+fun read(reply: Reply) i64 {
+    if (sel reply.value) {
+        ret reply.value;            # guarded by the arm condition
+    }
+    or {
+        ret 0;                      # reply holds empty on this path
+    }
 }
 ```
 
@@ -44,10 +44,36 @@ untested. See [tag.md](tag.md).
 
 A single condition-loop form. There is no for-each.
 
-```mach
-var i: i64 = 0;
-for (i < 10) {
-    i = i + 1;
+```mach run "10"
+use std.runtime;
+use print: std.print;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var i: i64 = 0;
+    for (i < 10) {
+        i = i + 1;
+    }
+    print.printlnf("{}", i);
+    ret 0;
+}
+```
+
+A `for` with no condition loops until a `brk` or a `ret` leaves it:
+
+```mach run "3"
+use std.runtime;
+use print: std.print;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var i: i64 = 0;
+    for {
+        i = i + 1;
+        if (i == 3) { brk; }
+    }
+    print.printlnf("{}", i);
+    ret 0;
 }
 ```
 
@@ -63,11 +89,22 @@ ret;                        # return from a void function
 Loop control: `brk` exits the enclosing `for`; `cnt` continues to the
 next iteration.
 
-```mach
-for (i < 10) {
-    i = i + 1;
-    if (i == 3) { cnt; }
-    if (i == 8) { brk; }
+```mach run "1 2 4 5 6 7 8"
+use std.runtime;
+use print: std.print;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var i: i64 = 0;
+    for (i < 10) {
+        i = i + 1;
+        if (i == 3) { cnt; }
+        print.printf("{}", i);
+        if (i == 8) { brk; }
+        print.print(" ");
+    }
+    print.println("");
+    ret 0;
 }
 ```
 
@@ -82,14 +119,25 @@ loop that also uses bare `cnt;` for control flow.
 order of declaration. Useful for cleanup that should happen regardless of how
 the scope exits.
 
-```mach
-{
-    fin { counter = counter - 1; }
-    fin { counter = counter * 2; }
+```mach run "5 9"
+use std.runtime;
+use print: std.print;
 
-    # ... code ...
+var counter: i64 = 0;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    {
+        fin { counter = counter - 1; }
+        fin { counter = counter * 2; }
+
+        counter = 5;
+        print.printf("{} ", counter);
+    }
+    # at block exit, in reverse order: counter * 2 runs first, then counter - 1
+    print.printlnf("{}", counter);
+    ret 0;
 }
-# at block exit, in reverse order: counter * 2 runs first, then counter - 1
 ```
 
 `fin` is block-scoped: it belongs to the block that declares it and covers
@@ -116,7 +164,14 @@ whose target loop encloses the fin. A loop fully inside the fin body uses
 `brk` / `cnt` normally.
 
 `fin` requires a block body (`fin { ... }`). The bare single-statement form
-(`fin stmt;`) is rejected.
+(`fin stmt;`) is rejected, and so is a `ret` inside a `fin` body:
+
+```mach reject "fin"
+fun leave() i64 {
+    fin { ret 1; }
+    ret 0;
+}
+```
 
 ## Block
 
@@ -130,7 +185,7 @@ in order. Blocks can stand alone:
 }
 ```
 
-## Expression statements and `try`
+## Expression statements
 
 An expression followed by a semicolon executes as a statement:
 
@@ -138,29 +193,40 @@ An expression followed by a semicolon executes as a statement:
 compute();
 ```
 
-When using `try` with canonical `err[E]`, the successful `ok` case produces no
-payload value. As a result, `try` on an `err[E]` operand is permitted only as a
-direct expression statement:
+Assignment is an expression (`x = y;` is an expression statement whose top
+operator is `=`), and so is a call whose result is discarded.
 
-```mach
-try flush() or (error: WriteError) {
-    ret err[WriteError].err{error};
-};
+## Failure handling
+
+A function that can fail returns a tag. The caller tests the case with `sel`
+and exits the arm that handles the failure; the exiting chain guards the
+success payload for the rest of the block:
+
+```mach accept
+use std.types.canonical.res;
+use std.types.canonical.err;
+
+tag WriteError: u8 { closed; full; }
+
+fun flush() err[WriteError] { ret err[WriteError].ok{}; }
+fun parse(input: u8) res[i64, WriteError] { ret res[i64, WriteError].ok{input::i64}; }
+
+fun increment(input: u8) res[i64, WriteError] {
+    val flushed: err[WriteError] = flush();
+    if (sel flushed.err) { ret res[i64, WriteError].err{flushed.err}; }
+    val r: res[i64, WriteError] = parse(input);
+    if (sel r.err) { ret res[i64, WriteError].err{r.err}; }
+    ret res[i64, WriteError].ok{r.ok + 1};      # r.ok is guarded: the chain above exits
+}
 ```
 
-Attempting to use `try` on `err[E]` in a value position, such as a binding
-initializer or function argument, is a compile error.
-
-Every reachable path through a `try` failure block must terminate control flow
-with `ret`, or with `brk` or `cnt` targeting an outer enclosing loop. Failure
-blocks cannot fall through or provide fallback values.
-
-Ordinary user-defined tags acquire no automatic `try` convention and use explicit
-`if`/`or` statements instead. See [try.md](try.md) and [tag.md](tag.md).
+Every reachable path through the failure arm must leave the block, with `ret`,
+or with `brk` or `cnt` targeting a loop that encloses the chain; an arm that
+falls through opens no guard, and the payload read after it is rejected. See
+[tag.md](tag.md) for the guard rules.
 
 ## See also
 
-- [expressions.md](expressions.md) - expressions, literals, and try syntax
-- [try.md](try.md) - explicit failure handling reference
-- [tag.md](tag.md) - tagged values reference
+- [expressions.md](expressions.md) - expressions and literals
+- [tag.md](tag.md) - tagged values, `sel` and guards
 - [comptime-control.md](comptime-control.md) - the comptime counterpart

@@ -23,7 +23,7 @@ its right, so it nests with `*` and `[N]` in any order: `^u32`, `*^u8`, `^*u8`,
 A public value coerces *up* to secret wherever a secret is expected, with no
 syntax:
 
-```mach
+```mach accept
 fun up(p: u32) ^u32 { ret p; }      # public u32 flows into a secret slot
 ```
 
@@ -44,7 +44,7 @@ Any operation with a secret operand yields a secret result. Taint joins across
 arithmetic, bitwise, shift, and comparison operators, and through a value read
 out of a secret container:
 
-```mach
+```mach accept
 fun mix(a: ^u32, b: u32) ^u32 { ret a + b; }    # ^u32 + u32 -> ^u32
 rec Key { d: ^[32]u8; }
 fun first(k: Key) ^u8 { ret k.d[0]; }            # element of a secret array is ^u8
@@ -70,7 +70,7 @@ error decided by operand type:
   public address, and a `*^T` is a public address to secret storage
 - a secret operand of the always-variable-latency `/` or `%`
 
-```mach
+```mach reject "branch condition"
 fun leak(a: ^u32, t: *u8, p: ^*u8) u8 {
     if (a) { ret 1; }       # error: secret value used as a branch condition
     ret t[a];               # error: secret value used as a memory index
@@ -148,9 +148,15 @@ walk that gates wrongly is a compile error, not a silent disclosure.
 `:>T` is the only way to remove `^`. It produces a new public value and never
 reinterprets storage in place, and it always names the public type it lands on:
 
-```mach
+```mach accept
 fun publish(a: ^u32) u32 { ret a:>u32; }
 fun publish2(a: ^*u8) *u8 { ret a:>*u8; }
+```
+
+The 4.30 spellings are refused by name:
+
+```mach reject "`:^` and `:^T` were removed in 5.0.0"
+fun publish(a: ^u32) u32 { ret a:^u32; }
 ```
 
 `:>T` peels exactly the outer qualifier, so it can never launder a welded pointee
@@ -176,7 +182,7 @@ public/secret aliasing leak unconstructable with no alias analysis:
 - a secret-welded pointer cannot be erased to the untyped `ptr`
 - a `uni`'s overlapping variants must agree on secrecy
 
-```mach
+```mach reject "secret"
 fun erase(p: *^u8) ptr { ret p; }     # error: cannot erase a secret pointer to ptr
 uni Bad { a: ^u32; b: u32; }          # error: variants disagree on secrecy
 ```
@@ -340,7 +346,7 @@ that only moves, stores, or declassifies secrets is transparent and stays
 annotation-free. The check runs per monomorphized instance, so a generic
 instantiated at a secret type is held to the concrete type's rules.
 
-```mach
+```mach accept
 #[oblivious]
 fun ct_select(mask: ^u32, a: ^u32, b: ^u32) ^u32 { ret (a & mask) | (b & ~mask); }
 ```
