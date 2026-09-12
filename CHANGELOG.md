@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Every `#[oblivious]` function is validated a second time on its final
+  instruction stream, after register allocation, frame insertion, encoding
+  expansion and riscv64 branch relaxation, on x86_64, aarch64 and riscv64.
+  The walk re-derives secrecy over physical registers (keyed by register id,
+  so sub-register aliases are free), the flags register where the machine
+  declares one, frame slots as byte extents and memory with no address as one
+  monotone bit, seeded from the declared ABI inputs and from the secrecy each
+  register operand kept through allocation; block targets make it a fixpoint
+  over the emitted layout, so a loop-carried secret is seen at the loop head.
+  It refuses a branch on tainted flags, a branch or indirect transfer through a
+  tainted register, a load or store whose base or index is tainted, a
+  variable-latency instruction on a tainted operand the target does not trust,
+  a data directive, and any emitted instruction without a row in the closed
+  effect table, each with a located diagnostic naming the emitted instruction.
+  The rows are the inline-asm grammar's `asm_ct_class` table, extended for every
+  opcode the encoders emit (x86_64 `imul`/`idiv`/`div`, the SSE scalar and
+  packed sets, `cvt*`, `ucomis*`, `setcc`, `movabs`; aarch64 `b.cond`,
+  `mul`/`madd`/`msub`, `sdiv`/`udiv`, the FP and NEON sets; riscv64 the F and D
+  sets and `fcvt.*`), and a per-ISA census pins that every notifiable opcode
+  has one. `ctvalidate.run` stays as the early diagnostic; the walk never
+  changes emitted bytes. An ISA that declares no notification stream refuses
+  an oblivious function the way the whole-module emitter does. Mutation
+  controls on all three ISAs seed a secret after allocation, where only the
+  physical walk can see it, into a late branch, a late address through the
+  reload scratch of a spilled secret (and, on riscv64, a relaxed jump's
+  trampoline) and a late multiply (#3126, N5 phase 2 parts 3 to 5).
 - Tagged values (Mach v5, #3218, #3219). `tag Name: u8 { ... }` declares a
   discriminated value with an explicit `u8`, `u16`, `u32` or `u64`
   discriminator; a case has one typed payload or none. `Type.case{payload}` and
