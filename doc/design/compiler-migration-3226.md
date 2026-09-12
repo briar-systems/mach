@@ -235,9 +235,99 @@ names (`source.get`/`add`/`prepare_load`/`prepare_release`/`copy_file`/
   windows-x86_64 (the darwin and windows blocks of `build/cache/compiler` and
   the PATHEXT read in `cli/util` are only compiled there)
 
+## C5a: the compiler-side unshim
+
+The four modules no lane owned (`embed`, `source`, `diagnostic`, `ct/probe`)
+read std 2.0 directly and answer the type set: `source.add`/`update`/
+`prepare_load`/`load`/`copy_file`/`snapshot_from` are `res[T, fail.Fail]`,
+`prepare_release` is `err[fail.Fail]`, `get`/`line_start`/`line_bounds` are
+`opt[T]`; `diagnostic.get`, `resolve` and `last_id` are `opt[T]` (an index
+past the store, a stale id and an empty store are absences, exactly as
+`vector.get` answers them), every append and builder step is `res[T,
+fail.Fail]` or `err[fail.Fail]`; `embed.get` and `path_arg_span` are `opt[T]`,
+`resolve_arg` keeps `manifest.TemplateError`, `escapes_root` and `refresh`
+answer `fail.Fail`. `src/lang/legacy.mach` and `src/lang/legacy/` are deleted
+with their census exclusion.
+
+Every joint contract is flipped in one change: the comptime evaluation
+carrier and the `PhaseCapabilities[T]` callbacks are `res[T, EvalFail]` over
+fe/comptime, fe/sema, me/lower and driver/load; `parser.parse` answers
+`res[fail.PhaseStatus, state.ParseFail]`; `DefinitionReader.read` is
+`fun(ptr, ModuleId, DefinitionPhase) res[Definition, fail.Fail]`;
+`fields.capture`'s prepare callback is `fun(*T, TypeId) err[fail.Fail]` and
+the capture answers `res[Graph, fail.Fail]`; every codegen-boundary vtable
+typedef in `target/isa.mach`, `target/of.mach`, `be/codegen/rules.mach` and
+`be/codegen/encode.mach` (`SelectFn`, `EncodeFn`, `EmitAsmFn`, `AsmCtScanFn`,
+`EmitModuleFn`, `RelocTraitsFn`, `NormalizeImageFn`, the attribute trio, the
+writer, parser and image quintet, `DebugProduceFn`, `ExpandFn`,
+`EncodeFunctionFn`, `PatchBranchFn`, `target.DebugDescriptorProvider`) is
+typed and every ISA and OF implementer registers its typed name. `EvalFail`
+and `ParseFail` keep their kind-beside-message records under the flipped
+carrier: their kinds are closed integer catalogs that the evaluator and the
+parser compare, and the design leaves kind-catalog conversion outside #3226.
+
+The 87 `<name>_typed` cores took back their canonical names and their 1.x
+exports are gone; C3b's named twins keep the names C3b chose
+(`codegen_unit`, `prepare_debug`, `image_init`, `section_install`,
+`symbol_add`, `rehome`, `emit_image`, `lower_module`, `validate`, `walk`,
+`produce_debug`, `select_function`, `emit_instr`, `check_operand_banks`,
+`encode_module`, `encode_module_asm`) and their legacy exports are deleted;
+the 57 `<name>_legacy` vtable wrappers, the four identity `_cb` callbacks,
+`sema.legacy_sema_result`/`legacy_unit`, `fields.captured_of` and
+`handle.chunk_get`/`chunk_edit`/`chunk_reserve`/`chunk_push` (the type table
+reads `chunk_at`, `chunk_editor`, `chunk_grow` and `chunk_append` in
+`handle.Error`) are deleted. `fail.lift`, `lift_res`, `lift_err`, `lift_of`,
+`lift_opt`, `lower`, `lower_res`, `lower_err`, `lower_of`, `lower_unit`,
+`lower_unit_of`, `lower_opt`, `discard`, `discard_refused` and
+`outcome.lift_user`/`lift_internal`/`lift_environment` (with their `_unit`
+forms), `lower`, `lower_unit`, `lower_fail`, `lower_fail_unit` are deleted
+with their last caller; a unit outcome of a result whose value is not needed
+is spelled at the site (`if (sel r.err) { ret err[Fail].err{r.err}; }`).
+
+A pattern the flip surfaced: a `fail.Fail` that was lowered to text and lifted
+back (`fail.message(fail.describe(f))`) lost its `reported` case; every such
+site now propagates `f`. `type.mach`'s absent table slot is one constant
+(`TABLE_INDEX_TEXT`), a defect, never an input fault.
+
+### C5a verification
+
+Counted over `src`, `test/cases`, `test/link/cases` and the corpus fixtures on
+this lane's head (before at 2ac0cc720):
+
+| pattern | before | after |
+| --- | ---: | ---: |
+| `R.Result[` | 1,498 | 0 |
+| `O.Option[` | 515 | 0 |
+| `ok_void` / `void_of` | 89 | 0 |
+| `R.Void` | 762 | 0 |
+| `use R: std.types.result` / `use O: std.types.option` | 186 | 0 |
+| `mach.lang.legacy` imports | 4 files (plus the façade itself) | 0 |
+| `<name>_typed` twins / `<name>_legacy` wrappers | 87 / 57 | 0 / 0 |
+
+The two `R.Result[` spellings left under `test/fuzz/corpus/{lexer,parser}`
+are retained fuzz inputs (bytes the lexer and parser are handed), not compiler
+code, and stay as retained.
+
+- unit suite through the from-source compiler (A by the v5 stage): 2997
+  passed, 0 failed (2997 at `origin/dev` 2ac0cc720 built the same way;
+  per-module counts identical; by name the only delta is the 28 test labels
+  under `mach.cli.cmd.{build,clean,dep,doc,info,init,run,testing}` whose
+  function under test lost its `_typed` suffix, no test added or removed)
+- `sh test/census.sh` all ok (real-bools 122 listed: the two deleted `_typed`
+  twins delisted, nothing else; a predicate answering `res[bool, Fail]` stays
+  listed)
+- corpus layer B: x86_64-linux 102 pass, 0 fail, 0 skip; aarch64-linux 102
+  pass, 0 fail, 0 skip; riscv64-linux 102 pass, 0 fail, 0 skip; spirv 94
+  pass, 0 fail, 8 skip; goldens unchanged
+- link leg x86_64-linux: 140 pass, 0 fail, 0 skip
+- three-generation fixpoint from the v5 stage: A = B = C `947240c3`
+- cross-builds of the compiler for darwin-aarch64, darwin-x86_64 and
+  windows-x86_64 with A
+- `mach init` of a scratch project under `out/` and a build and run of it
+
 ## Owed to C5
 
-- delete `src/lang/legacy.mach` and `src/lang/legacy/` once no import remains
-- delete `fail.lift`
-- `std.types.result` and `std.types.option` leave std with the last
-  `R.`/`O.` use in the compiler
+- ~~delete `src/lang/legacy.mach` and `src/lang/legacy/` once no import remains~~ done (C5a)
+- ~~delete `fail.lift`~~ done (C5a), with every `lift*`/`lower*`/`discard*` shim
+- `std.types.result` and `std.types.option` leave std now that the compiler
+  has no `R.`/`O.` use (the std lane, after C5a lands)
