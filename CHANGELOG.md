@@ -153,6 +153,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and available memory are recorded beside every process. A control that
   cannot build the checkout takes `--control-checkout` for its own tree, and
   the self-build runs serial and at the host's CPU count (#2299).
+- `doc/design/r2-measurements.md` records the final peak-memory and time
+  curves for the many-module, dense-function, large-aggregate, blocks and
+  self-build workloads on dev, uncached and cached, serial and parallel, at
+  both profiles, against the 4.30.0 seed and the preserved 2026-09-06
+  curves, with the object cache's storage and resident bounds measured past
+  the 512 MiB store limit, the four scratch-ownership mutation anchors
+  re-run, and the attribution of the debug self-build's growth since 4.30.0
+  to #3247 plus two quadratic cliffs (dense liveness sets and the verifier's
+  predecessor check in one large function, DWARF emission in one module of
+  many functions) reported with their cause (#2299, #3221).
 
 - Every RISC-V selection refusal names what it refused: the offending letter or
   token and the selection string for an unknown extension, a noncanonical or
