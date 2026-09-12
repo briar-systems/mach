@@ -88,6 +88,18 @@ false, zero, empty, a continuable error type), and a diagnostic append
 result is never discarded. Those are the invariants the closed kind exists
 to make checkable.
 
+Build requests validate their goal, optimization level, SIMD mode and subsystem
+selectors before planning, driver setup or hashing. An unknown member is an
+internal failure naming its catalog and numeric tag. Request hashing preserves
+that error instead of misreporting it as encoder allocation failure. Unknown
+phase tags likewise fail before phase execution. The shared
+`outcome.catalog` and `outcome.unknown_catalog` constructors allocate their
+message in the caller's allocator and land a malformed or unsupported member on
+FAIL_USER and an internal one on FAIL_INTERNAL. Invalid user spellings retain
+their existing input diagnostics. The whole-compiler inventory of closed
+catalogs, the three classes and the census live in
+[closed-catalogs-3124.md](closed-catalogs-3124.md).
+
 ## Frontend phase products
 
 `fail.PhaseStatus` is the authority for a frontend phase. Its kinds are
