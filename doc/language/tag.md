@@ -131,10 +131,11 @@ payload. The case names `ok`, `err`, `some` and `none` are members of their
 tags, not keywords.
 
 Their layouts and closed case sets are part of std's SemVer contract; they ship
-in std 2.0.0 paired with Mach 5.0.0. Until that std lands, the compiler at the
-v5 integration state still seeds the three names itself so they resolve without
-an import; the std migration (S1, mach-std#617) removes that seeding, and a
-module declaring its own `res`, `opt` or `err` is refused until then.
+in std 2.0.0 paired with Mach 5.0.0. They are std declarations like any other:
+the compiler has no knowledge of the three names, they resolve only through an
+import or a declaration in scope, and a module may declare its own `res`, `opt`
+or `err` as a tag or as anything else. Declaring one twice in a module is the
+ordinary duplicate definition.
 
 ## Case tests
 
