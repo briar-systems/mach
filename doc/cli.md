@@ -6,7 +6,7 @@ mach <command> [options]
 
 The compiler dispatches on `argv[1]`. With no command, or an unknown one, it
 prints usage and exits `1`. The project commands — `build`, `check`, `run`,
-`test`, `clean`, and `doc` — take the project as a **required** positional: a directory
+`test`, `clean`, `fmt`, and `doc` — take the project as a **required** positional: a directory
 containing `mach.toml`, or the path of a `mach.toml` itself. Nothing is
 searched for: `mach build src` inside a project is `error: no mach.toml in the
 project directory`, and a bare invocation with no path is a user error.
@@ -45,6 +45,7 @@ argument forwarding.
 | `run`   | execute the already-built binary (a post-`build` convenience, not a rebuild) |
 | `test`  | build the test binary and run the collected tests |
 | `clean` | remove the project's build output directory trees |
+| `fmt`   | rewrite the project's own source in the one canonical layout, or report what differs |
 | `dep`   | realize, verify, and change the project's dependencies under `dep/` |
 | `init`  | scaffold a new project |
 | `doc`   | generate Markdown reference docs from source docstrings |
@@ -585,6 +586,114 @@ prints `nothing to clean` and succeeds). The command takes no options.
 
 Exit codes: `0` on success, `1` on a missing project or unparseable manifest, `2`
 on an allocator or io failure.
+
+## `mach fmt`
+
+```
+mach fmt <path> [--check]
+```
+
+Formats every `.mach` file under the manifest's `project.src`, including
+subdirectories, in the one canonical layout described below, and prints the
+path of each file it rewrote. With `--check` it prints the path of each file
+whose layout differs and writes nothing: no file, no publication lock, no
+claim, no staging entry. `<path>` names the project (a directory or a manifest
+file), like every project-rooted command.
+
+Only the manifest is read: no module graph is loaded, no build step or
+dependency step runs, and nothing under `dep/` is read or fetched. The source
+directory is reached one component at a time through held directory
+capabilities, so a symlinked component or file is refused rather than
+followed, and a `project.src` that resolves to the dependency tree by any
+spelling is refused by identity. Directories are visited in name order.
+
+A file that does not parse is reported through the ordinary located
+diagnostics (`path:line:col: error: ...`) and left byte for byte as it was;
+the walk continues to the next file and the exit status is `1`. A file whose
+layout is already canonical is not touched. A rewrite goes through the
+publication boundary every compiler output uses (`std.filesystem.transaction`
+under `mach.lang.publication`): the canonical text is staged beside the file
+and renamed over it in one step, the rename is refused when the file is no
+longer the object that was read, and the file's permission bits are kept.
+Before any rewrite the canonical text is parsed again and compared with the
+original structurally, so the formatter never writes a file whose tree
+differs from the source's.
+
+Exit codes: `0` when every file is canonical or was made so, `1` when a file
+differs under `--check`, a file is malformed, or the invocation is a user
+error, `2` on an internal failure, `3` on a filesystem failure.
+
+### The layout
+
+There is exactly one layout and no configuration: no option, no file, no
+comment directive selects another. The formatter re-emits the file's tokens
+from the parse; it never adds, removes or reorders a token, so the formatted
+file has the same token sequence, the same tree, the same comments and the
+same inline assembly as the original, and formatting is a fixed point
+(formatting a formatted file changes nothing).
+
+Line structure:
+
+- Indentation is four spaces per enclosing `{` block; tabs are never emitted.
+  Output lines are terminated by `\n` alone, carry no trailing whitespace,
+  and the file ends with exactly one newline. A file with no tokens and no
+  comments is empty.
+- Every `{` that opens a body (a function, `rec`, `uni`, `tag` or `test` body,
+  an `if`/`or`/`for`/`fin` block, a comptime branch, an inline `rec`/`uni`
+  type) ends its line; its `}` starts a line at the enclosing indentation. An
+  empty body is `{}` on one line. `or` after a `}` stays on that line
+  (`} or {`), as do a `;`, `)`, `]`, `,`, `.` and an infix operator.
+- Every `;` ends its line, as does a decorator (`#[...]`), a comment and an
+  inline assembly body.
+- A top-level declaration with a body (`fun`, `rec`, `uni`, `tag`, `test`, a
+  top-level `$if`) is separated from its neighbours by one blank line. Between
+  single-line declarations (`use`, `fwd`, `val`, `var`, `def`, `ext fun`) the
+  author's grouping is kept: at most one blank line where the source had one.
+  Between statements, and between the elements of a literal, one blank line
+  is likewise kept where the source had one; runs of blank lines collapse to
+  one, and a blank line directly after a `{` or before a `}` is dropped.
+- A struct, array or vector literal stays on one line unless the author broke
+  the line after its `{`; then its `{` ends the line, its elements are
+  indented one level, and its `}` starts a line. Between elements a line
+  break is kept where the source has one.
+- A line break the author placed inside an expression, a parameter list, a
+  call or a condition is kept, and the continuation line is indented one
+  level past the statement. A `)` or `]` that the author placed on its own
+  line after a trailing comma keeps its line, at the statement's indentation.
+  Line length is not a rule: nothing is wrapped and nothing is joined that the
+  author broke.
+
+Spacing:
+
+- One space around binary operators and `=`, after `,`, `:`, `;` and a
+  keyword, before a body's `{`, and between a type and the name it follows.
+  Column alignment is never produced: `x:    i32` becomes `x: i32`.
+- No space inside `(`, `[`, `#[` or a literal's `{}`, before `,`, `;`, `:`,
+  `.`, `)`, `]`, or after a prefix operator (`-x`, `!b`, `~m`, `?p`, `@p`),
+  a pointer or secret type marker (`*T`, `^T`, `*^T`), or `$` (`$if`,
+  `$cases(T)`).
+- Casts and declassification are tight: `x::u8`, `x:~T`, `x:>u32`. A `^` after
+  `:` keeps its space (`x: ^u32`), since `:^` is a token of its own.
+- A call, index or generic argument list is tight to what it applies to:
+  `f(x)`, `a[i]`, `res[T, E].err{e}`, `vector.push[u8](?v, b)`, `f()()`. An
+  array type is spaced before and tight after: `x: [4]u8`, `ret [2]i32{1, 2}`.
+  The keywords `if`, `or`, `for` and `ret` are spaced before `(`.
+- A spread is tight (`args...`); a variadic parameter is spaced (`va: ...`).
+- Tag construction, case tests and projections are tight: `Fail.user{m}`,
+  `sel f.user`, `sel f.[c]`, `v.[f]`.
+
+Comments and inline assembly:
+
+- A comment is carried verbatim from its `#` to the end of its text, with
+  trailing whitespace dropped. A comment that shares a line with code stays
+  on that line after one space; a comment on its own line stays on its own
+  line at the current indentation. A doc run (own-line comments directly
+  above a declaration, with no blank line between) stays attached to that
+  declaration, and a comment separated from the declaration below by a blank
+  line stays separated.
+- An inline assembly body is carried verbatim from its `{` to its `}`,
+  including its line breaks and indentation. Its language has no formatting
+  contract of its own, so it is never reflowed.
 
 ## `mach dep`
 
