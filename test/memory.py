@@ -164,14 +164,51 @@ CENSUS = re.compile(rb'(mach[-_.0-9A-Za-z]*|m[0-9A-Za-z]*|A|B|C|D)')
 RESTORED = re.compile(rb'^\s*cached object\b', re.M)
 BUILT = re.compile(rb'^built .*?(\d+) modules?\b', re.M)
 
-# peak-RSS ceilings in MiB per workload and profile, applied to every jobs and
+# peak ceilings in MiB per workload and profile, applied to every jobs and
 # cache-mode cell of the workload for the compiler under test. each is the
-# measured peak of doc/design/r2-measurements.md times the multiple stated
-# there: 1.5 for the synthetic families, whose peak is mostly the fixed
-# per-process floor, and 1.25 for the self-build, where the two 2026-09-06
-# scratch fixes were each worth more than that. the values are filled from the
-# measurement, not tuned to pass.
-THRESHOLDS = {}
+# largest peak measured in doc/design/r2-measurements.md (dev 83d3c1c9d, both
+# compiler profiles, jobs 1 and 16, all cache modes) times the multiple stated
+# there: 1.25 for the self-build, where the two 2026-09-06 scratch fixes were
+# each worth more and the spread with THP disabled is under 3 percent, and 1.5
+# for the synthetic families with a 32 MiB minimum for cells that sit within a
+# few MiB of the spawner floor. the blocks ceilings describe the dense
+# block-by-register liveness sets and come down when that is fixed.
+THRESHOLDS = {
+    'self-debug': 2867,
+    'self-release': 3601,
+    'modules-10-debug': 32,
+    'modules-10-release': 32,
+    'modules-50-debug': 41,
+    'modules-50-release': 41,
+    'modules-150-debug': 88,
+    'modules-150-release': 87,
+    'modules-400-debug': 201,
+    'modules-400-release': 203,
+    'dense-10-debug': 32,
+    'dense-10-release': 32,
+    'dense-50-debug': 50,
+    'dense-50-release': 48,
+    'dense-150-debug': 118,
+    'dense-150-release': 111,
+    'dense-400-debug': 279,
+    'dense-400-release': 260,
+    'aggregate-4096-debug': 32,
+    'aggregate-4096-release': 32,
+    'aggregate-16384-debug': 32,
+    'aggregate-16384-release': 32,
+    'aggregate-65536-debug': 32,
+    'aggregate-65536-release': 32,
+    'aggregate-262144-debug': 32,
+    'aggregate-262144-release': 32,
+    'blocks-500-debug': 47,
+    'blocks-500-release': 47,
+    'blocks-1000-debug': 119,
+    'blocks-1000-release': 119,
+    'blocks-2000-debug': 393,
+    'blocks-2000-release': 393,
+    'blocks-4000-debug': 1456,
+    'blocks-4000-release': 1454,
+}
 
 
 def sha256(path):
@@ -535,8 +572,8 @@ def main():
                         help='the tree the control self-builds when it cannot build this checkout')
     parser.add_argument('--repetitions', type=int, default=1, help='measurements per cell and variant (default 1)')
     parser.add_argument('--families', default='modules,dense,aggregate,blocks', help='synthetic families to run; empty for none')
-    parser.add_argument('--sizes', default='modules=10,50,150,400;dense=10,50,150,400;aggregate=4096,16384,65536,262144;blocks=500,1000,2000,4000',
-                        help='per-family size lists')
+    parser.add_argument('--sizes', default='modules=10,50,150,400;dense=10,50,150,400;aggregate=4096,16384,65536,262144;blocks=500,1000,2000',
+                        help='per-family size lists (blocks=4000 is measured in the design note and takes 100 s a cell)')
     parser.add_argument('--profiles', default='debug,release')
     parser.add_argument('--jobs', default='1,4', help='codegen worker counts to compare on the synthetic families')
     parser.add_argument('--cache-modes', default='off,cold,warm', help='off (uncached), cold (publishing), warm (restoring)')
