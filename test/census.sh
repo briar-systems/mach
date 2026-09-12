@@ -225,7 +225,8 @@ fi
 if want real-bools; then
     # B-DIAG-3: a Result[bool, E] is a declared real outcome, never a success
     # that is always true. every declaration whose return type is
-    # R.Result[bool, str] or R.Result[bool, outcome.Fail] is listed in
+    # R.Result[bool, str], R.Result[bool, outcome.Fail] or, once migrated
+    # (#3226), res[bool, fail.Fail] or res[bool, outcome.Fail] is listed in
     # test/census/real-bools.txt as path:function; a declaration off the list,
     # or a list entry with no declaration, fails. no function-pointer type
     # returns a bool Result, and no error is an empty string standing in for a
@@ -244,14 +245,14 @@ if want real-bools; then
                 name = substr($0, RSTART + 4, RLENGTH - 4)
                 sub(/^[ \t]+/, "", name)
             }
-            /\) R\.Result\[bool, (str|outcome\.Fail)\][ \t]*\{/ { print rel ":" name }
+            /\) (R\.Result\[bool, (str|outcome\.Fail)\]|res\[bool, (fail|outcome)\.Fail\])[ \t]*\{/ { print rel ":" name }
         ' "$f"
     done | sort > "$found"
     awk '{ sub(/\r$/, ""); print }' "$list" | sort > "$listed"
     : > "$tmp"
     comm -23 "$found" "$listed" | sed 's|^|  declared, not listed: |' >> "$tmp"
     comm -13 "$found" "$listed" | sed 's|^|  listed, not declared: |' >> "$tmp"
-    grep -rnE 'fun\([^)]*\) R\.Result\[bool, (str|outcome\.Fail)\]|^[ \t]*[^(]*\) R\.Result\[bool, (str|outcome\.Fail)\];' "$root/src" \
+    grep -rnE 'fun\([^)]*\) (R\.Result\[bool, (str|outcome\.Fail)\]|res\[bool, (fail|outcome)\.Fail\])|^[ \t]*[^(]*\) (R\.Result\[bool, (str|outcome\.Fail)\]|res\[bool, (fail|outcome)\.Fail\]);' "$root/src" \
         | sed "s|^$root/||; s|^|  bool-result function type: |" >> "$tmp"
     grep -rnE 'R\.err\[[^]]*\]\(""\)' "$root/src" \
         | sed "s|^$root/||; s|^|  empty-string error: |" >> "$tmp"
