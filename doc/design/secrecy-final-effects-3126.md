@@ -438,7 +438,7 @@ has five parts; each is a drop-in against a frozen interface.
    `MirOperand.vreg` as provenance (`verify_rewritten_operands` only checks
    `kind`) or the seeds are taken at the `MirInstr` the sink names.
 
-3. **Effect description per emitted instruction.** Reuse
+3. **Effect description per emitted instruction.** DONE (section 15.5). Reuse
    `asm.Grammar.ct_class` (`asm_ct_class(code, flags)`) plus
    `Mnemonic.writes`/`implicit`/`implicit_mem` for every notified `isa.Inst`:
    this is the same closed table inline asm uses (acceptance bullet). Rows are
@@ -450,7 +450,7 @@ has five parts; each is a drop-in against a frozen interface.
    non-constant-time). `isa.Inst.clobbers` stays unpopulated; implicit writes
    come from `Mnemonic.implicit` (item 10.3 rules).
 
-4. **The walk.** Per function, in emission order over the notification list:
+4. **The walk.** DONE (section 15.6). Per function, in emission order over the notification list:
    register taint keyed by regid (aliases free), a flags bit (x86_64,
    aarch64), slot-granular memory taint for `[fp/sp + const]` extents and the
    asm walk's monotone bit for everything else, `MIR_CALL` clears
@@ -463,7 +463,7 @@ has five parts; each is a drop-in against a frozen interface.
    diagnostic (its messages name the source construct; the physical walk names
    the instruction).
 
-5. **Mutation controls, one per introduced-late class per ISA**, each proving
+5. **Mutation controls, one per introduced-late class per ISA**, DONE (section 15.7), each proving
    the walk rejects a program the vreg walk accepts: (a) a late branch, by
    seeding the divisor preg of a `MIR_SEL_DIV_U` (aarch64, riscv64) or the
    source of `MIR_FP_TO_UI` (x86_64) secret at the notification level, which
@@ -644,15 +644,177 @@ generation-B compiler from this branch and a generation-C compiler from
 a generation-C `a151921cd` compiler and this branch's generation-A compiler
 produce byte-identical binaries from this branch's source.
 
+### 15.5 Part 3 as landed: the effect description
+
+- **One table, extended.** Each ISA's `asm_ct_class(code, flags)` gained rows
+  for every opcode its encoder emits that the inline-asm grammar has no
+  spelling for; the walk calls the same function the asm scan calls. x86-64:
+  `jl/jle/jg/jge/jbe/ja` (`asm_branch_flags`), the ten remaining `setcc`
+  (`flags_read`), `imul` (`CT_OP_INT_MUL`, flags written), `pmullw`
+  (`INT_MUL`), `idiv/div` (`INT_DIVMOD`, flags written), `cdq/cqo/cwd/cbw`,
+  `movabs`, `movsxd`, `movsb`, `movq`, `movaps/movups`, `movss/movsd`,
+  `pshufd`, `pslld`, `xorps`, `pand/por/pxor`, the packed integer add, sub,
+  saturating sub and compares (`CT_OP_NONE`, untouched); the SSE scalar and
+  packed arithmetic, `cmpps/cmppd` and every `cvt*` (`CT_OP_FLOAT`, untouched);
+  `ucomiss/ucomisd` (`CT_OP_FLOAT`, flags defined). aarch64: `b.cond` under
+  its own `mop.BCOND` (the grammar reaches the same row through `A64P_BCOND`
+  on `mop.B`), `adds/subs/cmn` (defined), `mul/mneg/madd/msub` and NEON `mul`
+  (`INT_MUL`), `sdiv/udiv` (`INT_DIVMOD`), `mvn/neg/orn`, the bitfield and
+  extend aliases, `ldur*/stur*`, `fmov`, the NEON integer, bitwise, compare
+  and lane moves (`NONE`), `fadd..fdiv`, `fneg`, `fcvt`, `scvtf/ucvtf`,
+  `fcvtzs/fcvtzu` and the NEON float set (`FLOAT`), `fcmp` (`FLOAT`, defined).
+  riscv64: `flw/fld/fsw/fsd`, `fmv.x.w/fmv.x.d/fmv.w.x/fmv.d.x` and the
+  plain `fsgnj` move (`NONE`); `fadd..fdiv`, `fsgnjn/fsgnjx` (the `MIR_FNEG`
+  class), `feq/flt/fle` and every `fcvt.*` (`FLOAT`).
+- **Census.** `x64.encode.asm_ct_class:every_notifiable_opcode_has_a_row`
+  walks every `x64.Opcode` except the two pseudo entries (`ASM_BLOCK` is a
+  MIR marker, `RAW_BYTE` reaches the stream as an `ASM_NOTE_BYTES` note) and
+  requires a known row with flags stated and a printer mnemonic;
+  `arm64.encode.asm_ct_class:every_notifiable_opcode_has_a_row` walks the
+  whole `mop` space, which names exactly what the encoder emits and what the
+  grammar accepts; `riscv.encode.asm_ct_class:every_notifiable_opcode_has_a_row`
+  walks the whole `inst.MachOp` space. The exception list of each is empty by
+  construction: an opcode the census admits without a row fails the test, and
+  the space is total over what a notification can carry, so it subsumes any
+  census over the corpus. `inst_effects` describes an opcode outside the space
+  as unknown, and the walk refuses an unknown row in an oblivious function
+  whether or not a secret reaches it.
+- **`ct.InstEffects`.** The class row alone does not say which registers an
+  instruction defines. The complete description is `ct.InstEffects`: the
+  `AsmClass` row, a role per `isa.Inst` position (read, write, both, or
+  address-only for `lea`), implicit register reads and writes as index masks
+  (the grammar row's `implicit` where one exists: `syscall`, `svc`, `ecall`,
+  `cmpxchg`; the divide, sign-extend, `rep movsb`, `push/pop` and `ret`
+  families otherwise), implicit memory, the zeroing idiom (`xor r, r`,
+  `sub r, r`, `pxor`, `xorps`), the count position of a count-gated class,
+  the bytes a pair access covers, and the transfer kind with its target
+  (block, forward local, backward or unstated local, external, register).
+  Each ISA fills it in `inst_effects` over its own notification layout:
+  x86-64 over the Intel operand order with gaps skipped, aarch64 over the
+  `to_inst` layout (stores put the data in `src1` and the address in `dst`,
+  pairs read two registers, `madd/msub` read `src3`), riscv64 over
+  `build_inst`'s shapes (a branch reads `dst` and `src1`, `jalr`'s target
+  rides in a load-shaped memory operand and is read as a value, `jalr zero,
+  0(ra)` is the return, a trampoline `jalr` names its block).
+- **Targets travel with the notification.** x86-64's expansion-internal
+  branches are `isa.make_local_label(forward)` (`imm` -1 ahead, -2 behind;
+  block 0 was ambiguous with the old nil label), the stack-probe loop is the
+  one backward member; aarch64's `to_inst` carries the block under
+  `mop.FLAG_TARGET_BLOCK` and a pcrel skip as a forward local label with its
+  byte displacement; riscv64's `FLAG_LABEL_SKIP`/`FLAG_LABEL_LOCAL`/
+  `FLAG_LABEL_FWD` already distinguished them.
+
+### 15.6 Part 4 as landed: the walk
+
+`ctwalk.run(f, notes, count, effects, target, alloc)` in
+`src/lang/be/codegen/ctwalk.mach`, called by `encode_driver_asm` at the
+consumer point for every oblivious function on every build, before the notes
+reset. The stream records (`AsmNote`, `NoteSeeds`, `note_seeds`) moved to
+`notes.mach` so the walk sits beside the driver rather than inside it;
+`encode` re-exports every name. The ISA reaches the walk through
+`EncodeHooks.effects` (`ctwalk.IsaEffects`: `describe`, `mnemonic`,
+`reg_name`, `const_regs`), filled by `x64_hooks`, `arm64_hooks` and
+`riscv64_hooks`; a stream with no description is refused, never walked as
+public. An ISA that declares `stream = false` (mos6502) refuses an oblivious
+module at the driver, like the whole-module emitter.
+
+- **State.** Register taint by regid (`gp`, `fp` as 64-bit index masks; the
+  ISA's `const_regs` never carry a value: riscv64 `x0`, aarch64 index 31), a
+  flags bit when the model declares an `RC_FLAGS` class (x86-64, aarch64),
+  frame extents `(base, lo, hi)` for a memory operand whose base is the
+  model's frame or stack pointer with no index, and the asm walk's monotone
+  bit for `implicit_mem` instructions. Entry taint: every secret
+  `MirAbiInput` (register, or the argument-area extent at
+  `incoming_arg_base + offset` under the frame pointer when a frame exists).
+- **Seeds.** For a register read, the physical taint or a secret seed on a
+  source operand of the note's `MirInstr` rewritten to that register; for a
+  register write, the derived taint or the secret seed on the destination
+  operand (a `writes_secret` load included); for a frame load, an overlapping
+  tainted extent or a secret slot key on a source operand; for a frame store,
+  the data's taint or a secret slot key on the destination. Sources are read
+  before any destination is written, so `xor r1, r1, r2` carries the dying
+  secret source and the born public destination correctly. A public
+  definition clears the register; a public store covering an extent kills
+  it, a partial overwrite leaves it. The barrier note clears the register the
+  move wrote, or the assigned register and slot extent of the vreg a dropped
+  self-copy names (`frame.slot_extent`).
+- **Calls.** `XFER_CALL` clears every register outside
+  `BackendTarget.abi.callee_saved` (plus the frame and stack pointers) and
+  makes the flags opaque; the result is re-seeded at its first use by the
+  declared secrecy of the vreg the return register was moved into.
+- **Control flow.** Block labels are join targets: a branch to block `b`
+  joins its state into `b`'s entry, a block note takes the join of its entry
+  and the fall-through state, and the walk repeats until no entry grows
+  (bounded by `PASS_BOUND`, refusing beyond it) before the checking pass, so
+  a register defined from a secret at the end of a loop body is secret at
+  the loop head. A forward local skip with a recorded displacement joins into
+  the instruction it lands on; one without joins into every later
+  instruction of its expansion; a backward or unstated local branch joins
+  into the expansion's entry and makes the expansion monotone (no
+  definition clears taint there), the asm walk's model. A register-indirect
+  jump joins into every block. `jump`, `ret` and `trap` end fall-through.
+- **Refusals**, each located by `AsmNote.loc`, naming the function, the
+  rendered instruction (the ISA's mnemonic and register names) and the
+  inline site when there is one: `cond_flags` under flags taint;
+  `cond_reg` or an indirect target on a tainted register (a tainted base of
+  a `jalr`'s memory-shaped operand included); a memory operand with a tainted
+  base or index, or an implicit address (`rep movsb`) on a tainted register;
+  a variable-latency class the target does not provide (`ct.ct_cap`,
+  `target_provides`, count-only gating for shifts) on a tainted operand,
+  including implicit reads (`div` on a tainted `rdx`); a register outside the
+  walk's two classes; a data directive; an unknown row.
+
+### 15.7 Part 5 as landed: the mutation controls
+
+`codegen.walk:*` builds each program at the vreg level, checks
+`ctvalidate.run` accepts it at its pipeline position (the validator moved
+back before expansion, which sees a public program), allocates, injects the
+secret, frames and encodes through `encode.run`, and requires the refusal to
+name the class and the emitted instruction. Every control has a public
+sibling built the same way without the injection that encodes.
+
+| class | ISA | injection | refused at |
+|---|---|---|---|
+| (a) late branch | aarch64 | `MIR_DIV_U v2, v0, v1`, `v1.secret` flipped after allocation | `cbnz` of the divide guard, "branches on" |
+| (a) late branch | riscv64 | same | `bne rs2, x0` of the divide guard |
+| (a) late branch | x86-64 | `MIR_UI_TO_FP v2, v0` (u64 source), `v0.secret` flipped after allocation | `jl` after `test r11, r11` in `emit_u64_to_fp` (flags taint) |
+| (a) sibling site | x86-64 | `MOV rax, v0; MIR_DIV_U rax, v1; MOV v2, rax`, `v1.secret` flipped | `div`, variable latency (no guard branch on x86-64) |
+| (b) late address | all three | `v0` declared secret, `MIR_LOAD v3, [v2]` with `v2` public; after allocation `v0` is homed in a spill slot, reloaded into the ISA's first reload scratch, and the load's base is rewritten to that scratch | the load, "addresses memory with a secret value" |
+| (b) relaxation | riscv64 | `mv t0, a0` (a0 a secret ABI input) then a far `bne a1, x0` relaxed to `guard; auipc t0; jalr zero, t0`: accepted, `auipc` redefines `t0`; the pre-relaxation stream accepted; the stream whose trampoline never redefined `t0` refused at the `jalr` | `riscv.encode.walk:a_relaxed_jump_is_validated_through_its_trampoline` |
+| (c) late variable latency | all three | `MIR_MUL v2, v0, v1`, `v0.secret` flipped after allocation, `ct_trust_mul = false` | `imul` / `mul` / `mul`, "performs a variable-latency operation" |
+
+The walk's own rules are pinned on hand-built x86-64 streams
+(`x64.encode.walk:*`): flags taint into a branch and into `setcc`, the loop
+fixpoint, a call clearing caller-saved and keeping callee-saved taint with
+opaque flags after it, slot extents by byte range with kill on a covering
+public store and survival under a partial one, secret bases, indexes and
+indirect calls, `lea` as an address-only read, the divide's implicit
+dividend and the zeroing idiom, count-only shift gating, unknown rows, data
+directives, the barrier by named carrier, and a forward local skip joining
+ahead. `riscv.encode.walk:the_zero_register_is_constant` pins `x0`.
+
+### 15.8 Measured
+
+The compiler builds itself with the walk active (its own oblivious modules,
+`std.crypto.ct`, `std.system.os.secret` and `mach.lang.ct.probe`, pass), the
+corpus layer B is unchanged on the three ISAs, and the seed fixpoint holds;
+the numbers are in the PR. Two shapes the walk found on the way and that
+the encoders now state: riscv64's `jalr zero, 0(ra)` had to be classed a
+return rather than an indirect jump (an indirect jump joins into every
+block, which carried the epilogue's state back to the entry), and a forward
+skip that lands past a redefinition must join at its landing instruction,
+not on every later one, or the trampoline's `jalr` sees the taint `auipc`
+removed.
+
 ## 16. Acceptance bullets of #3126 mapped to this lane
 
-| bullet | status |
-|---|---|
-| legalization, selection, allocation, spill/reload, flags, frame effects in final validation | inventory (sections 3 to 9); phase 2 parts 1 and 2 done (15.1, 15.2), 3 and 4 open |
-| whole-module emitter guarantee defined | section 12, validated |
-| encoding and relaxation reach every emitted instruction | done: the stream exists on every build of a module with an oblivious function (15.1) |
-| late secret-dependent branches, addresses, variable-latency uses rejected by mutation controls | phase 2 part 5; classes and sites named in section 9 |
-| inline asm uses the same closed effect descriptions | section 10, validated; phase 2 part 3 reuses the table |
-| unknown effects are not public or constant-time by default | early walk and asm walk, validated (`failclosed:*`, `ct_check_item`); phase 2 part 3 |
-| leakage model and target assumptions documented | section 1 |
-| secret-safe boundary tests with mach-std#550 | `MirAbiInput` recorded (section 14); read at `ASM_NOTE_FUNC` by part 4 through the seeds of 15.2 |
+| bullet | status | test |
+|---|---|---|
+| legalization, selection, allocation, spill/reload, flags, frame effects in final validation | done: the walk runs on the final stream after every stage (15.6) | `codegen.walk:*` (allocation, spill/reload, expansion), `x64.encode.walk:flags_filled_from_a_secret_refuse_the_branch_that_reads_them`, `x64.encode.walk:frame_extents_carry_taint_slot_by_slot`, `codegen.stream:*` (the shaped fixture through legalize, isel, regalloc, frame, encode with the walk active) |
+| whole-module emitter guarantee defined | section 12, validated; an ISA without a stream refuses the same way | `ctvalidate.scope:whole_module_backend_refused`, `mach.lang.driver:oblivious_spirv_refused`, `encode.encode_driver:an_isa_without_a_stream_refuses_an_oblivious_function` |
+| encoding and relaxation reach every emitted instruction | done: every notification is walked, relaxation's inserted instructions included (15.1, 15.6) | `codegen.stream:*`, `riscv.encode.walk:a_relaxed_jump_is_validated_through_its_trampoline`, `x64.encode.walk:a_local_branch_joins_its_state_forward_within_the_expansion` |
+| late secret-dependent branches, addresses, variable-latency uses rejected by mutation controls | done (15.7) | `codegen.walk:*_rejects_a_late_branch_*`, `codegen.walk:*_rejects_a_load_through_the_reload_scratch_*`, `codegen.walk:*_rejects_a_multiply_*`, `codegen.walk:x86_64_rejects_a_divide_*` |
+| inline asm uses the same closed effect descriptions | done: the walk reads `asm_ct_class` and the grammar's implicit sets (15.5) | `*.encode.asm_ct_class:every_notifiable_opcode_has_a_row`, `*.encode.asm_ct_class:every_grammar_row_is_classified`, `x64.encode.inst_effects:roles_follow_intel_operand_order` (`syscall` carries the grammar row's implicit set) |
+| unknown effects are not public or constant-time by default | done: an unknown row, a data directive and a register outside the catalog are refused (15.6) | `x64.encode.walk:unknown_rows_and_data_directives_are_refused`, `*.encode.inst_effects:*` (pseudo and out-of-range opcodes describe as unknown), `failclosed:*`, `ct_check_item` |
+| leakage model and target assumptions documented | section 1; the walk's model in 15.6 | `x64.encode.walk:loop_carried_taint_reaches_the_loop_head` (the fixpoint the model requires) |
+| secret-safe boundary tests with mach-std#550 | `MirAbiInput` recorded (section 14) and read at entry by the walk (15.6): a secret register input taints its carrier, a secret stack input its argument-area extent | `abi:incoming_security_facts_preserve_carriers_and_indirect_contents`, `abi:incoming_copies_follow_all_parameter_captures`, every `x64.encode.walk:*` and `riscv.encode.walk:*` stream (the secret enters only through an ABI input) |

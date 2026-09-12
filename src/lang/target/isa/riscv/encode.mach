@@ -1,5 +1,6 @@
 use std.format;
 use std.allocator.page;
+use std.print;
 use std.collections.map;
 use std.io.writer;
 use std.text.parse;
@@ -6685,3 +6686,146 @@ test "mach.lang.target.isa.riscv.encode.inst_effects:roles_follow_the_notificati
     ret 0;
 }
 
+
+var t_walk_inputs_rv: [1]mir.MirAbiInput;
+
+# a0 is a declared secret at entry; no callee-saved list, no flags class
+fun t_walk_rv_target() isa.BackendTarget {
+    var bt: isa.BackendTarget;
+    bt.model = @rv64_machine();
+    bt.model.frame_ptr_reg      = riscv.FRAME_REG;
+    bt.model.stack_ptr_reg      = riscv.STACK_REG;
+    bt.model.ct_trust_mul       = false;
+    bt.model.ct_trust_var_shift = true;
+    bt.model.reg_classes        = nil;
+    bt.model.reg_class_len      = 0;
+    bt.abi.callee_saved         = nil;
+    bt.identity.arch_name       = "riscv64";
+    ret bt;
+}
+
+fun t_walk_rv_function(f: *mir.MirFunction) {
+    f.name        = intern.STR_NIL;
+    f.oblivious   = true;
+    f.vregs       = nil;
+    f.vreg_count  = 0;
+    f.blocks      = nil;
+    f.block_count = 0;
+    f.frame.omit  = false;
+    t_walk_inputs_rv[0].argument      = 0;
+    t_walk_inputs_rv[0].location      = mir.ABI_INPUT_REGISTER;
+    t_walk_inputs_rv[0].reg           = isa.regid_make(isa.REG_CLASS_ID_GP, 10)::u32;
+    t_walk_inputs_rv[0].offset        = 0;
+    t_walk_inputs_rv[0].width         = 8;
+    t_walk_inputs_rv[0].logical_width = 8;
+    t_walk_inputs_rv[0].secret        = true;
+    t_walk_inputs_rv[0].content       = mir.ABI_CONTENT_NONE;
+    t_walk_inputs_rv[0].content_size  = 0;
+    f.abi_inputs      = ?t_walk_inputs_rv[0];
+    f.abi_input_count = 1;
+    f.abi_input_cap   = 1;
+}
+
+# 0 accepted, 1 refused naming the needle, 2 refused otherwise
+fun t_walk_rv(st: *encode.EncodeState, f: *mir.MirFunction, needle: str) i32 {
+    var bt: isa.BackendTarget = t_walk_rv_target();
+    val hooks: encode.EncodeHooks = riscv64_hooks();
+    val s: *encode.AsmSink = st.buf.asm;
+    val r: R.Result[R.Void, ctwalk.Refusal] = ctwalk.run(f, s.notes, s.note_count, ?hooks.effects, ?bt, st.alloc);
+    if (R.is_ok[R.Void, ctwalk.Refusal](r)) { ret 0; }
+    var refusal: ctwalk.Refusal = R.unwrap_err[R.Void, ctwalk.Refusal](r);
+    var code: i32 = 2;
+    if (refusal.detail != nil && needle != nil && str_contains(refusal.detail, needle)) { code = 1; }
+    if (code == 2 && refusal.detail != nil) { print.eprintlnf("unexpected refusal at note {}: {}", refusal.index, refusal.detail); }
+    ctwalk.refusal_free(st.alloc, ?refusal);
+    ret code;
+}
+
+fun t_note_block_rv(st: *encode.EncodeState, id: u32) bool {
+    var label: encode.AsmNote = encode.note_blank();
+    label.kind = encode.ASM_NOTE_BLOCK;
+    label.off  = st.buf.len::u32;
+    label.id   = id;
+    ret R.is_ok[R.Void, str](encode.note_push(?st.buf, ?label));
+}
+
+# a relaxed jump's trampoline: `mv t0, a0` taints the scratch, the far
+# branch becomes `guard; auipc t0; jalr zero, t0`. the walk reaches the
+# inserted instructions through their notifications: auipc redefines t0
+# publicly and the jump through it is accepted; the stream before
+# relaxation (the vreg walk's view, a plain branch) is accepted too; a
+# stream in which the trampoline's register still carries the secret at
+# the jump is refused at the jalr
+test "mach.lang.target.isa.riscv.encode.walk:a_relaxed_jump_is_validated_through_its_trampoline" {
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    var itn: intern.Interner;
+    tbuf_interned(?st, ?alloc, ?itn);
+    var sink: encode.AsmSink = encode.sink_init(nil, ?itn);
+    st.buf.asm = ?sink;
+    var f: mir.MirFunction;
+    t_walk_rv_function(?f);
+
+    var head: encode.AsmNote = encode.note_blank();
+    head.kind = encode.ASM_NOTE_FUNC;
+    if (R.is_err[R.Void, str](encode.note_push(?st.buf, ?head))) { ret 1; }
+    if (!t_note_block_rv(?st, 0)) { ret 1; }
+    emit_i(?st, OPC_OP_IMM, F3_ADD, SCRATCH, 10, 0);
+    emit_b(?st, OPC_BRANCH, F3_BNE, 11, 0, 0);
+    note_block_target(?st, 1);
+    if (R.is_err[R.Void, str](encode.push_block(?st, 0, 1, 4000000))) { ret 2; }
+    if (R.is_err[R.Void, str](encode.push_fixup(?st, 4, 8, 1, 0)))    { ret 2; }
+    emit_i(?st, OPC_JALR, F3_ADD, RZERO, riscv.RA::u32, 0);
+
+    # before relaxation: one conditional branch on a public register
+    if (t_walk_rv(?st, ?f, nil) != 0) { ret 3; }
+
+    if (R.is_err[R.Void, str](relax_function_riscv64(?st, 0, 0))) { ret 4; }
+    if (encode.note_inst_count(?st.buf) != 5) { ret 5; }
+    val auipc: *encode.AsmNote = encode.note_at(?st.buf, 4);
+    val jalr:  *encode.AsmNote = encode.note_at(?st.buf, 5);
+    if (auipc.inst.opcode != inst.AUIPC::u16 || jalr.inst.opcode != inst.JALR::u16) { ret 6; }
+    if (t_walk_rv(?st, ?f, nil) != 0) { ret 7; }
+
+    # the same stream whose trampoline never redefined the register it jumps through
+    auipc.inst.dst = gpr(SCRATCH2);
+    if (t_walk_rv(?st, ?f, "transfers control through a secret") != 1) { ret 8; }
+    # and with a public write into the scratch instead, the jump is fine again
+    val mv: *encode.AsmNote = encode.note_at(?st.buf, 2);
+    mv.inst.src1 = gpr(11);
+    if (t_walk_rv(?st, ?f, nil) != 0) { ret 9; }
+
+    encode.notes_free(?st.buf);
+    encode.buf_dnit(?st.buf);
+    ret 0;
+}
+
+# the zero register never carries a value: a write to it from a secret does
+# not taint the reads that compare against it
+test "mach.lang.target.isa.riscv.encode.walk:the_zero_register_is_constant" {
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    var itn: intern.Interner;
+    tbuf_interned(?st, ?alloc, ?itn);
+    var sink: encode.AsmSink = encode.sink_init(nil, ?itn);
+    st.buf.asm = ?sink;
+    var f: mir.MirFunction;
+    t_walk_rv_function(?f);
+    var head: encode.AsmNote = encode.note_blank();
+    head.kind = encode.ASM_NOTE_FUNC;
+    if (R.is_err[R.Void, str](encode.note_push(?st.buf, ?head))) { ret 1; }
+    if (!t_note_block_rv(?st, 0)) { ret 1; }
+    emit_i(?st, OPC_OP_IMM, F3_ADD, RZERO, 10, 0);
+    emit_b(?st, OPC_BRANCH, F3_BNE, 11, RZERO, 0);
+    note_block_target(?st, 1);
+    if (!t_note_block_rv(?st, 1)) { ret 1; }
+    emit_i(?st, OPC_JALR, F3_ADD, RZERO, riscv.RA::u32, 0);
+    if (t_walk_rv(?st, ?f, nil) != 0) { ret 2; }
+    # the branch on the secret itself is refused
+    val b: *encode.AsmNote = encode.note_at(?st.buf, 3);
+    b.inst.dst = gpr(10);
+    if (t_walk_rv(?st, ?f, "branches on") != 1) { ret 3; }
+    encode.notes_free(?st.buf);
+    encode.buf_dnit(?st.buf);
+    ret 0;
+}
