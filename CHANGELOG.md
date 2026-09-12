@@ -190,7 +190,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   relocation relations across ELF, Mach-O and COFF. Final linking resolves absolute
   definitions separately from image-relative symbols (#3119).
 
-- Build planning, driver setup and request hashing reject unknown request catalog values. Invalid phases report their tag and catalog instead of appearing as linking, and invalid goals no longer masquerade as allocation failures.
+- Every closed catalog rejects an unknown member under one policy that names the
+  catalog and the member and distinguishes malformed input, a declared
+  capability a target or format does not honor, and an impossible internal state
+  (#3124). Build planning, driver setup and request hashing reject unknown
+  request catalog values before use. Object images, cache entries and query
+  surfaces refuse a section kind, relocation kind, constant kind or symbol kind
+  outside its catalog as malformed input. A relocation kind a format has no type
+  for is reported as unsupported by that format, never as an internal failure.
+  Section and relocation kinds are descriptor tables every format and the linker
+  derive from, so a new kind is a row rather than a default. An unknown
+  constant-time operation class is refused instead of answering as needing no
+  capability. The CLI, the editor and the x86-64 packed encoder no longer panic
+  on a kind outside its catalog. A census keeps the default-picking site count
+  for boundary-crossing catalogs at zero.
 
 - Instruction selection preserves each register operand's required bank. Post-allocation
   verification independently rejects wrong-bank operands, including conversions,

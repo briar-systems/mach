@@ -93,9 +93,12 @@ selectors before planning, driver setup or hashing. An unknown member is an
 internal failure naming its catalog and numeric tag. Request hashing preserves
 that error instead of misreporting it as encoder allocation failure. Unknown
 phase tags likewise fail before phase execution. The shared
-`outcome.unknown_catalog` constructor allocates its message in the caller's
-allocator. Invalid user spellings and valid unsupported capabilities retain
-their existing input and capability diagnostics.
+`outcome.catalog` and `outcome.unknown_catalog` constructors allocate their
+message in the caller's allocator and land a malformed or unsupported member on
+FAIL_USER and an internal one on FAIL_INTERNAL. Invalid user spellings retain
+their existing input diagnostics. The whole-compiler inventory of closed
+catalogs, the three classes and the census live in
+[closed-catalogs-3124.md](closed-catalogs-3124.md).
 
 ## Frontend phase products
 
