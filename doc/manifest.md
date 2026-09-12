@@ -104,12 +104,13 @@ ref = "branch/main"
 | `src`     | string | Source root, project-root-relative. Module paths resolve under it. |
 | `out`     | string | The output-path template root, referenced as `{project.out}` by artifact `out`, step paths, and `cmd`s. Expanded over `{target.name}`/`{target.isa}`/`{target.os}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). |
 
-`[project]` is exactly these four keys. `name`, `description`, and `mach` are
-deprecated until 5.0.0: 4.26.x accepted them and never read them, so 4.30.0
-accepts them with a warning naming the key, the table, and the 5.0.0 refusal,
-in a root manifest and a dependency's alike; `[profile.<name>]`'s `emit_ir` and
-`emit_asm` are in the same window (emission is `--emit-ir`/`--emit-asm` on the
-command line). Any other key is an unknown-key error in every manifest.
+`[project]` is exactly these four keys. The 4.26.x keys `name`, `description`
+and `mach`, and `[profile.<name>]`'s `emit_ir` and `emit_asm`, were accepted
+and never read and were removed in 5.0.0: each is refused by name, in a root
+manifest and a dependency's alike, with `mach.toml: [project] key 'name' was
+removed in 5.0.0; it was accepted and never read: remove the key` (emission is
+`--emit-ir`/`--emit-asm` on the command line). Any other key is an unknown-key
+error in every manifest.
 
 ## `[target.<name>]`
 

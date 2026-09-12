@@ -363,6 +363,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spells this ABI `sysv64`: write `$mach.abi.sysv64` ``. Comptime path
   evaluation no longer carries a diagnostic store, which existed only for that
   alias's warning (#3226, #3112).
+- The manifest keys `[project] name`, `description` and `mach` and
+  `[profile.*] emit_ir` and `emit_asm`. 4.26.x accepted and never read them and
+  4.30 warned; each is now refused by name in a root and a dependency manifest
+  alike, `mach.toml: [project] key 'name' was removed in 5.0.0; it was accepted
+  and never read: remove the key`, so the refusal is never mistaken for an
+  unknown key. The manifest no longer records deprecated keys and the driver
+  emits no deprecation warnings for them (#3226, #3112).
 
 ## [4.30.0] - 2026-09-07
 
