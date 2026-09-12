@@ -487,9 +487,9 @@ golden.
   attaches a sink when `asm_out != nil` or when the ISA declares
   `EncodeHooks.stream = true` and `module_has_oblivious(m)`. The stream is a
   declared capability, not derived from `has_assembly`: x86_64, aarch64 and
-  riscv64 declare it, mos6502 declares `false` and an oblivious function there
-  is part 4's refusal (no stream, no validation, like the whole-module
-  emitter). `sink.refused`, the per-ISA `check_accounted` and a new
+  riscv64 declare it, and an ISA declaring `false` (the since-deleted mos6502
+  was one) has an oblivious function there refused by part 4 (no stream, no
+  validation, like the whole-module emitter). `sink.refused`, the per-ISA `check_accounted` and a new
   driver-level `sink_unaccounted == 0` check at the end of the module fail the
   build if a byte escapes. `EncoderOutput.notified` reports the instruction
   count (0 when no stream was attached); the three `codegen.stream:*` tests
@@ -715,8 +715,8 @@ reset. The stream records (`AsmNote`, `NoteSeeds`, `note_seeds`) moved to
 `EncodeHooks.effects` (`ctwalk.IsaEffects`: `describe`, `mnemonic`,
 `reg_name`, `const_regs`), filled by `x64_hooks`, `arm64_hooks` and
 `riscv64_hooks`; a stream with no description is refused, never walked as
-public. An ISA that declares `stream = false` (mos6502) refuses an oblivious
-module at the driver, like the whole-module emitter.
+public. An ISA that declares `stream = false` (the since-deleted mos6502 did)
+refuses an oblivious module at the driver, like the whole-module emitter.
 
 - **State.** Register taint by regid (`gp`, `fp` as 64-bit index masks; the
   ISA's `const_regs` never carry a value: riscv64 `x0`, aarch64 index 31), a

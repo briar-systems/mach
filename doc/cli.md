@@ -739,8 +739,10 @@ Scaffolds a new project in `[dir]` (default: the current directory). It
 writes a complete `mach.toml` with a `[project]` block, `[target.*]` platforms
 for `linux`/`windows`/`darwin` on the host ISA, one binary artifact whose
 `out = "bin/<id>{artifact.suffix}"` names `<id>.exe` on Windows and `<id>`
-elsewhere (or one `static` library artifact, `lib/lib<id>{artifact.suffix}`,
-under `--lib`), a `[link.kernel32]` entry the binary links on Windows,
+elsewhere (or, under `--lib`, one `static` library artifact,
+`lib/lib<id>{artifact.suffix}`, marked `default = true` so a bare
+`use <id>;` in a consumer binds its entry), a `[link.kernel32]` entry the
+binary links on Windows,
 `[profile.debug]` (`default = true`) and `[profile.release]` with all five
 policy keys spelled out, and a `[dep.std]` dependency on `mach-std` at
 `branch/main`; then a starter source file, `src/root.mach` for a
@@ -764,7 +766,7 @@ exports the `main` symbol.
 |----------------|-------|--------|
 | `--name <id>`  | id    | project id (default: the last path component of `[dir]`, so `mach init /work/ia`, `mach init ib/`, and `mach init .` name the project `ia`, `ib`, and the current directory's name) |
 | `--force`      | —     | scaffold even when `mach.toml` or `src` already exists |
-| `--lib`        | —     | library layout: `src/lib.mach` and one `static` `[artifact.<id>]` |
+| `--lib`        | —     | library layout: `src/lib.mach` and one `static` `[artifact.<id>]` marked `default = true` |
 | `--no-deps`    | —     | publish the scaffold and declare its dependencies without realizing them; a later `mach dep pull` realizes them (`dependencies declared but not realized; run `mach dep pull <path>` to realize them`) |
 | `--no-git`     | —     | skip repository initialization and submodule registration, using plain dependency checkouts instead |
 | `--quiet`, `-q`| —     | suppress non-error output |

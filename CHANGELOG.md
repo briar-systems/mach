@@ -321,6 +321,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A bare `use <id>;` of a dependency binds the entry shared by its library
   artifacts marked `default = true`; several defaults may share that entry, a
   `bin` never publishes one, and full-path imports need no default (#3222).
+- `mach init --lib` marks its one `static` artifact `default = true`, so the
+  scaffolded library has the explicitly defaulted public entry a consumer's
+  bare `use <id>;` binds; nothing else about the scaffold changes (#3226).
 - Vector operations require an explicit target capability row. Each ISA declares
   its supported (operation, lane kind, lane width) rows positively. Missing or
   malformed operation and lane shapes no longer default to packed support (#3120).
