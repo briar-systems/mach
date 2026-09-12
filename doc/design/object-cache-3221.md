@@ -246,3 +246,225 @@ identity (`passes.capture_build_identity:...`).
 final head: see the pull request for the exact count against the dev baseline
 of 2732; `sh test/census.sh` 9 of 9 ok; corpus layer B on x86_64-linux 91
 pass, 0 fail, 0 skip.
+
+# Phase 2a: the linker-emitted build id
+
+Status: replaces the per-process executable digest (identity candidate 2 above)
+with candidate 1. The digest was the largest single warm-build cost measured in
+phase 1 (139 ms release / 275 ms debug per process, paid before any entry can be
+read). After this phase the compiler's identity is a note the linker wrote into
+the image and the running compiler reads back from its own mapped headers; no
+file is opened and nothing is hashed at run time.
+
+## What the build id hashes
+
+Every image writer computes the id after its file plan is sealed and every other
+byte of the image has been written, so it is a function of the bytes the file
+will contain and of nothing else: no time, path, name, environment or random
+source enters it, and byte-identical inputs yield byte-identical notes. The hash
+is SHA-256 over the bytes the loader maps, taken with the note payload as zero:
+
+- **ELF**: every `PT_LOAD` file extent in program-header order, with the ELF
+  header's `e_shoff`, `e_shnum` and `e_shstrndx` taken as zero. The section
+  header table, `.symtab`, `.strtab`, `.shstrtab`, the debug sections and the
+  build attributes are not loaded and are not hashed. The id is therefore the
+  identity of the loaded program, the same whether or not debug information
+  accompanies it, exactly as a stripped binary keeps the id of its unstripped
+  twin. This is what the release-additivity constraint below requires.
+- **Mach-O**: the file from offset zero to the code signature, which is the
+  range the ad-hoc signature covers (header, load commands, every segment,
+  `__DWARF`, and the `__LINKEDIT` structures before the signature), with the 16
+  `LC_UUID` bytes as zero. The signature is written after the id, so it covers
+  the final UUID (ld64's order). `-g` adds a `__DWARF` segment command to the
+  header, so the loaded program already differs and there is no additivity to
+  keep on this format.
+- **PE**: the whole file with the 16-byte CodeView GUID as zero. `-g` adds
+  section headers, so the same applies as on Mach-O.
+
+The 32-byte digest is carried whole on ELF. Mach-O and PE carry a 16-byte
+identifier by format, so they carry the first 16 bytes with the RFC 4122
+version and variant bits forced (version 4, as ld64 and lld do), which is a
+deterministic function of the content and still 122 bits of it.
+
+## Where each format carries it
+
+- **ELF**: a `.note.gnu.build-id` note (`namesz` 4, `descsz` 32, `type`
+  `NT_GNU_BUILD_ID` 3, name `GNU\0`, 32-byte descriptor, 48 bytes in all) placed
+  in the header page directly after the program headers, so it lies inside the
+  first `PT_LOAD` (the header mapping) and is in memory at run time. A `PT_NOTE`
+  program header names it, and when the image has a section header table an
+  `SHT_NOTE` section header with `SHF_ALLOC` names it too, so `readelf -n`,
+  `file`, `llvm-readobj --notes`, debuginfod and `dl_iterate_phdr` consumers all
+  find it. All four ELF image writers emit it (static executable, static PIE,
+  dynamic executable, shared object). A freestanding image whose headers are
+  not mapped still carries the note and `PT_NOTE` in the file, with a zero
+  address, since there is no mapping to name.
+- **Mach-O**: `LC_UUID`, in every executable the writer produces (the static
+  `LC_UNIXTHREAD` image, the dynamic image and the PIE image; it was previously
+  written only under `--pie` and derived from the artifact name, which is not
+  an identity). `LC_UUID` is the Mach-O build id: dyld, crash reports, dSYM
+  matching and `dwarfdump --uuid` read it, and it sits in the header inside
+  `__TEXT`, which `_dyld_get_image_header(0)` hands back mapped.
+- **PE**: a `.buildid` section (read-only initialized data, the MinGW
+  convention for `ld --build-id`) holding one `IMAGE_DEBUG_DIRECTORY` entry of
+  type `IMAGE_DEBUG_TYPE_CODEVIEW` followed by the `RSDS` record (GUID, age 1,
+  empty path), named by the optional header's debug data directory. A dedicated
+  section with no directory entry would be invisible to every Windows consumer;
+  the CodeView record is what WinDbg, symbol servers, `dumpbin /headers` and
+  `llvm-readobj --coff-debug-directory` already treat as the image identity.
+  The section is mapped, so the running compiler reads it through the image
+  base and the RVA.
+
+The byte layouts are defined once, in `src/lang/target/of/buildid.mach`, and
+both the writers and the run-time reader use that definition.
+
+## How the running compiler reads it back
+
+`cache.compiler.identity` reads the note from the process's own mapped image,
+without opening any file:
+
+- **linux**: the auxiliary vector follows the environment block the runtime
+  captured (`os.environ()`); `AT_PHDR`, `AT_PHNUM` and `AT_PHENT` locate the
+  program header table in memory. The load bias is `AT_PHDR` minus the
+  `PT_PHDR` address (zero when there is no `PT_PHDR`, an `ET_EXEC`). `PT_NOTE`
+  plus the bias is the note; it is accepted only if one `PT_LOAD` maps its whole
+  extent and its header reads `4 / 32 / 3 / GNU\0`.
+- **darwin**: `_dyld_get_image_header(0)` is the main executable's header; the
+  load commands are walked for `LC_UUID`.
+- **windows**: `GetModuleHandleW(nil)` is the image base; `e_lfanew`, the PE
+  signature, the PE32+ optional header and its debug data directory lead to the
+  `IMAGE_DEBUG_DIRECTORY` entries, and the first CodeView entry's `RSDS` record
+  holds the GUID.
+
+Every reader is bounds-checked against the mapped image and answers "absent"
+rather than failing when any piece is missing or malformed.
+
+## Fallback and the seed-lag chain
+
+The identity is the note when the image carries one and otherwise the phase-1
+memoized full digest. It carries a source tag (`BUILD_ID` or `DIGEST`) and its
+length, and the snapshot keys the tag and the length-framed bytes, so a
+digest-identified compiler and a note-identified compiler cannot share a key
+even in principle.
+
+The seed lag rule holds: a compiler linked by a seed that predates this phase
+carries no note and identifies itself by digest exactly as before; the first
+compiler it links carries a note. The fixpoint is undisturbed because the note
+is a deterministic function of the loaded bytes: B (linked by A) and C (linked
+by B) are byte-identical as before, and identical bytes carry identical notes.
+
+## Release additivity
+
+The suite's guard (`test/link/cases/debuginfo` `g_additive`, and
+`elf.emit_shared:debug_additive_nonloaded`) compares the `PT_LOAD` file extents
+of the `-g` and non-`-g` images after zeroing `e_shoff`, `e_shnum` and
+`e_shstrndx`. The ELF build id is a function of exactly that comparison input,
+so wherever the two images were identical they still are: the note lies inside
+the loaded image and is equal in both. Byte-identical inputs yield
+byte-identical notes because nothing outside the image bytes enters the hash.
+
+## What the note cannot do
+
+The note is a link-time content identity, not a run-time integrity check. An
+image edited after linking, outside the note, still reports the note it was
+linked with, so such an image is served entries the unedited compiler
+published. The phase-1 digest caught this incidentally, and this design cannot
+by construction: verifying the note against the file would mean hashing the
+file, which is the cost being removed. The cache's question is "which compiler
+produced this entry", and the linker answers it; a post-link edit is outside
+that contract. The digest remains the identity of any image without a note.
+
+## Phase 2a controls and measurement
+
+Compiler: this branch at `8cf32993d`, `release` profile, linked by the
+branch's own seed-built compiler so that it carries a note (`out/rel/mach`,
+18.7 MB, build id `0fd3f8d7…`). The "before" row is the same source at the
+same profile linked by the 4.30.0 seed (`out/relseed/mach`, 17.9 MB), which
+carries no note and therefore identifies itself by the phase-1 digest. Projects
+as in phase 1: `hello` (41 modules, profile `release`) and the corpus case
+`bits/logic_u32` in the hosted corpus project (43 modules, profile `o2`),
+x86_64-linux. Host load average 6 to 16 from concurrent workers throughout;
+cells that a load spike visibly hit are kept and marked rather than dropped.
+
+**Fixpoint.** A (seed-built) carries no note; B (built by A) and C (built by B)
+are byte-identical (`cmp`), and their notes are equal
+(`6c0dc874…`). The identity of A is reported as `compiler identity: image
+digest`, of B and C as `compiler identity: build id`.
+
+**No file is opened.** `strace -f -e openat` on the warm cached corpus build
+through the note-carrying compiler: zero opens of `/proc/self/exe`, 43 of
+`.mach-cache` (the 43 entries read). The same build through the seed-built
+compiler: one open of `/proc/self/exe` (the digest), and `-vv` names it.
+
+**Identity cost, same conditions, warm corpus hit (43 of 43), three runs.**
+
+| compiler | identity | codegen phase | wall |
+|---|---|---|---|
+| no note, digest (release, 17.9 MB) | 132 / 131 / 132 ms | 180 / 179 / 181 ms | 616 / 608 / 623 ms |
+| note, build id (release, 18.7 MB) | 19 / 17 / 12 us | 48 / 49 / 48 ms | 542 / 528 / 516 ms |
+
+The codegen phase of the warm hit drops by about 130 ms, which is the digest
+(phase 1 measured it at 139 ms release). What remains, 48 ms, is the serial
+restore of 43 entries (read, payload hash, decode, re-intern) plus the
+identity read, which is microseconds. A warm cached build is now faster than
+an uncached one (516 to 542 against 572 to 620 wall on the clean cells below)
+where in phase 1 it was about 80 ms slower.
+
+**Cold and warm, three repetitions, wall in ms (codegen phase in brackets),
+note-carrying release compiler.** Two rounds are shown because the host was
+shared; a cell marked † was hit by a load spike (load average above 9 during
+the run) and is reported as measured.
+
+| project | round | off, warm | on, cold | on, warm | hits |
+|---|---|---|---|---|---|
+| hello | 1 | 579 / 567 / 862† [125, 117, 117] | 613 / 660 / 716† [150, 152, 215†] | 509 / 507 / 506 [47, 47, 46] | 41 / 41 |
+| hello | 2 | 569 / 569 / 582 [120, 124, 130] | 597 / 626 / 624 [156, 160, 154] | 626† / 971† / 762† [68, 108†, 49] | 41 / 41 |
+| corpus | 1 | 572 / 746† / 876† [122, 200†, 141] | 608 / 617 / 630 [152, 156, 156] | 625† / 551 / 808† [76, 68, 49] | 43 / 43 |
+| corpus | 2 | 1600† / 1200† / 690 [499†, 337†, 127] | 616 / 607 / 602 [164, 158, 159] | 517 / 521 / 514 [56, 51, 51] | 43 / 43 |
+
+Phase 1's warm hit at 16 workers was 597 to 614 ms on corpus with a codegen
+phase of 173 to 175 ms; the same cell is now 514 to 521 ms with 48 to 56 ms.
+Publication (on, cold) still costs about 30 ms over an uncached build, as in
+phase 1. The optimize phase (item 2 of the phase-1 list) is untouched and
+remains the largest cost of a warm hit; that is phase 2b.
+
+**Mutation control: one byte outside the note.** One byte of a string literal
+in `.rodata` of the note-carrying release compiler was changed (`X` for `e`
+in an error message, file offset 17135272, inside the second `PT_LOAD`); the
+note in the file is unchanged. The tampered image built the warm corpus
+project with 43 of 43 hits and reported `compiler identity: build id`. That is
+the limitation stated above, by design: the note is what the linker computed,
+and reading it back cannot see a later edit without hashing the file. The
+same one-byte edit applied to the seed-built (note-less) compiler produced 0
+of 43 hits with `compiler identity: image digest`, so the digest fallback
+still detects it wherever it is the identity in use.
+
+**Readers.** The linux reader is exercised by the suite on every run (the
+test dispatcher is linked by the compiler under test and carries a note;
+`cache.compiler:identity_is_the_mapped_build_id` requires the build id
+source, 32 bytes, and agreement with a second read) on both `ET_EXEC` and,
+with `mach test --pie`, `ET_DYN` with a non-zero load bias. The darwin and
+windows readers are cross-built here and structurally checked against the
+cross-linked images' headers (`llvm-dwarfdump --uuid`, `llvm-readobj
+--coff-debug-directory`); they run natively on those hosts' CI lanes.
+
+**External readers on cross-linked images.** The compiler itself cross-built
+for `darwin-aarch64`, `darwin-x86_64` and `windows-x86_64`:
+`llvm-readobj --coff-debug-directory` shows the CodeView entry (`PDBGUID`,
+age 1, empty name) and `--sections` the `.buildid` section on PE;
+`llvm-dwarfdump --uuid` shows the `LC_UUID` on both Mach-O images (llvm-readobj
+prints no load commands beyond its named ones); `llvm-readobj --notes` shows
+`NT_GNU_BUILD_ID` on the ELF image. Each value was recomputed host-side over
+the file by the rule stated above and agreed.
+
+**Suite, census, link, corpus.** Full suite through the from-source compiler:
+2925 passed, 0 failed, against the dev baseline of 2918 at `8464568d0`; the
+delta is the seven new tests (`buildid` three, `elf.emit_exec` one,
+`coff.coff_emit_exec` one, `cache.compiler` two) and one renamed
+(`second_digest_…` to `second_identity_…`). After merging dev at `a151921cd`
+(which added eleven tests of its own): 2936 passed, 0 failed, the same seven.
+`sh test/census.sh` 9 of 9 ok (10 of 10 after the merge).
+Link leg x86_64-linux 140 pass, 0 fail, 0 skip, including `debuginfo`
+(`g_additive=yes`) and the six `readobj` cases, whose goldens now record
+`build-id len=<n> content-derived=yes` from an independent recomputation.
+Corpus layer B on x86_64-linux 102 pass, 0 fail, 0 skip.
