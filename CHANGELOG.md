@@ -149,6 +149,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `#[deprecated]` warning on a dotted type path whose segments were split
+  by a line comment containing a dot was placed inside the comment, with a
+  span running onto the next line; the leaf is now read through the path
+  reader that skips trivia, so the warning lands on the identifier at its
+  own line and column (#3129, the #3229 obligation).
+
 - The aarch64 inline-asm grammar read `lsl`, `lsr` and `asr` with a register
   count under the immediate-shift row, so the constant-time scan classed a
   variable shift as needing no trust; the parse now retags the register-count
