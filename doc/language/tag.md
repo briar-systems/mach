@@ -122,15 +122,15 @@ fun main(argc: i64, argv: **u8) i64 {
 ## The std failure tags
 
 The canonical failure types are ordinary std tags, declared in
-`std.types.canonical` with fixed generic arities and no compiler knowledge of
+`std.types.result`, `std.types.option` and `std.types.error` with fixed generic arities and no compiler knowledge of
 their names. They use the same mechanisms as every user tag: the same
 construction form, `sel`, guards, layout and reflection. A module imports the
 ones it spells:
 
 ```mach
-use std.types.canonical.res;
-use std.types.canonical.opt;
-use std.types.canonical.err;
+use std.types.result.res;
+use std.types.option.opt;
+use std.types.error.err;
 ```
 
 std declares them as:
@@ -152,9 +152,9 @@ There is no defaulted type argument, general type inference, dummy success
 type, unit value, constructor function or automatic error conversion.
 
 ```mach accept
-use std.types.canonical.res;
-use std.types.canonical.opt;
-use std.types.canonical.err;
+use std.types.result.res;
+use std.types.option.opt;
+use std.types.error.err;
 
 tag ParseError: u8 { invalid; overflow; }
 
@@ -217,7 +217,7 @@ returned.
 ```mach accept
 use std.types.bool.bool;
 use std.types.bool.false;
-use std.types.canonical.opt;
+use std.types.option.opt;
 
 tag Reply: u8 { empty; value: i64; }
 
