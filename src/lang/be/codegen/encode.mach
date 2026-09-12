@@ -111,6 +111,8 @@ pub val ASM_NOTE_INST:  u8 = 0;
 pub val ASM_NOTE_FUNC:  u8 = 1;
 pub val ASM_NOTE_BLOCK: u8 = 2;
 pub val ASM_NOTE_BYTES: u8 = 3;
+# a declassify barrier: no bytes, the MirInstr names the register it downgrades
+pub val ASM_NOTE_BARRIER: u8 = 4;
 
 pub val ASM_NOTE_BYTES_WIDTH: usize = 4;
 
@@ -120,6 +122,8 @@ pub rec AsmNote {
     byte_len: u32;
     loc: source.SrcLoc;
     inline_site: u32;
+    # the MirInstr whose encoding emitted this note, nil for bytes with no MIR origin
+    mi:    *mir.MirInstr;
     inst:  isa.Inst;
     name:  intern.StrId;
     id:    u32;
@@ -150,6 +154,7 @@ pub fun note_blank() AsmNote {
     n.byte_len = 0;
     n.loc = source.loc_nil();
     n.inline_site = 0;
+    n.mi   = nil;
     n.kind = ASM_NOTE_INST;
     n.off  = 0;
     n.inst = isa.inst_blank();
@@ -169,6 +174,7 @@ pub fun note_push(buf: *ByteBuf, n: *AsmNote) R.Result[R.Void, str] {
     if (s.mi != nil) {
         s.notes[s.note_count].loc = s.mi.loc;
         s.notes[s.note_count].inline_site = s.mi.inline_site;
+        s.notes[s.note_count].mi = s.mi;
     }
     if (n.kind == ASM_NOTE_INST || n.kind == ASM_NOTE_BYTES) {
         if (buf.len < n.off::usize || buf.len - n.off::usize > 0xFFFFFFFF::usize) {
@@ -182,6 +188,18 @@ pub fun note_push(buf: *ByteBuf, n: *AsmNote) R.Result[R.Void, str] {
         sink_claim(buf, n.off::usize);
     }
     ret R.ok_void[str]();
+}
+
+# the barrier reaches the stream whether or not the move it selected to emitted
+# bytes (a coalesced self-copy emits none); it follows the instruction's bytes
+pub fun note_barrier(buf: *ByteBuf, mi: *mir.MirInstr) R.Result[R.Void, str] {
+    if (!sink_active(buf)) { ret R.ok_void[str](); }
+    if (!mir.instr_declassifies(mi)) { ret R.ok_void[str](); }
+    var n: AsmNote = note_blank();
+    n.kind = ASM_NOTE_BARRIER;
+    n.off  = buf.len::u32;
+    n.mi   = mi;
+    ret note_push(buf, ?n);
 }
 
 pub fun note_insert_after(buf: *ByteBuf, idx: u32, n: *AsmNote, nbytes: u32) R.Result[R.Void, str] {
@@ -306,6 +324,12 @@ pub fun sink_active(buf: *ByteBuf) bool {
     ret !buf.asm.failed;
 }
 
+# rendering is gated on a writer; notification and byte accounting are not
+pub fun sink_renders(buf: *ByteBuf) bool {
+    if (!sink_active(buf)) { ret false; }
+    ret buf.asm.out != nil;
+}
+
 pub fun sink_claim(buf: *ByteBuf, start: usize) {
     if (buf == nil || buf.asm == nil) { ret; }
     val s: *AsmSink = buf.asm;
@@ -343,10 +367,13 @@ pub fun render_bytes_text(out: *writer.Writer, bytes: *u8, n: usize) R.Result[R.
 
 pub fun render_bytes_directive(buf: *ByteBuf, bytes: *u8, n: usize, start: usize) R.Result[R.Void, str] {
     if (!sink_active(buf)) { ret R.ok_void[str](); }
-    val res: R.Result[R.Void, str] = render_bytes_text(buf.asm.out, bytes, n);
-    if (R.is_err[R.Void, str](res)) { ret res; }
-    sink_claim(buf, start);
-    ret R.ok_void[str]();
+    var note: AsmNote = note_blank();
+    note.kind = ASM_NOTE_BYTES;
+    note.off  = start::u32;
+    val kept: R.Result[R.Void, str] = note_push(buf, ?note);
+    if (R.is_err[R.Void, str](kept)) { ret kept; }
+    if (!sink_renders(buf)) { ret R.ok_void[str](); }
+    ret render_bytes_text(buf.asm.out, bytes, n);
 }
 
 fun hex_digit(v: u8) u8 {
@@ -363,6 +390,60 @@ pub fun sink_unaccounted(buf: *ByteBuf) usize {
     if (!sink_active(buf)) { ret 0; }
     if (buf.len <= buf.asm.accounted) { ret 0; }
     ret buf.len - buf.asm.accounted;
+}
+
+pub val NOTE_SEED_MAX: u32 = 16;
+
+# the secrecy seeds a notification carries, per operand of the MirInstr it
+# encodes: the origin vreg each register or slot operand was rewritten from
+# and that vreg's declared secrecy. per operand, not per register: one
+# register can carry a dying secret source and a born public destination in
+# the same instruction, so a set keyed by register cannot say which
+pub rec NoteSeeds {
+    count:      u32;
+    origin:     [NOTE_SEED_MAX]u32;
+    secret:     [NOTE_SEED_MAX]bool;
+    # a writes_secret load: operand 0 is secret by declaration
+    dst_secret: bool;
+    # an ASM_NOTE_BARRIER: operand 0 is public after this point
+    barrier:    bool;
+}
+
+pub fun note_seeds_clear(out: *NoteSeeds) {
+    out.count      = 0;
+    out.dst_secret = false;
+    out.barrier    = false;
+}
+
+# every seed the walk needs at one notification. a note without a MirInstr
+# (prologue, epilogue, relaxation) carries no seed. operands past
+# NOTE_SEED_MAX are not described; no MIR instruction has that many.
+pub fun note_seeds(f: *mir.MirFunction, n: *AsmNote, out: *NoteSeeds) {
+    note_seeds_clear(out);
+    if (f == nil || n == nil || n.mi == nil) { ret; }
+    val mi: *mir.MirInstr = n.mi;
+    out.barrier = n.kind == ASM_NOTE_BARRIER;
+    if (out.barrier && mi.operand_count == 0) {
+        # a dropped self-copy: the downgraded vreg names its own carrier
+        out.count     = 1;
+        out.origin[0] = mi.declassified;
+        out.secret[0] = mi.declassified != mir.MIR_VREG_NIL && mi.declassified < f.vreg_count
+                        && f.vregs[mi.declassified].secret;
+        ret;
+    }
+    val defines: bool = mi.operand_count > 0 && mir.instr_defines_shape(mi);
+    var k: u32 = 0;
+    for (k < mi.operand_count && k < NOTE_SEED_MAX) {
+        val op: *mir.MirOperand = ?mi.operands[k];
+        out.origin[k] = mir.operand_origin(op);
+        out.secret[k] = mir.operand_seed_secret(f, op);
+        if (k == 0 && defines && mi.writes_secret && op.kind == mir.MIR_OP_PREG) {
+            out.dst_secret = true;
+            out.secret[k]  = true;
+        }
+        k = k + 1;
+    }
+    out.count = k;
 }
 
 pub fun sink_set_mir(buf: *ByteBuf, mi: *mir.MirInstr) {
@@ -500,6 +581,17 @@ pub def PatchBranchFn: fun(*EncodeState, *BranchFixup, u32) R.Result[R.Void, str
 pub rec EncodeHooks {
     encode_function: EncodeFunctionFn;
     patch_branch:    PatchBranchFn;
+    # declared: every emitted byte reaches the sink through one instruction notification
+    stream:          bool;
+}
+
+pub fun module_has_oblivious(m: *mir.MirModule) bool {
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        if (m.functions[fi].oblivious) { ret true; }
+        fi = fi + 1;
+    }
+    ret false;
 }
 
 pub fun encode_driver(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.MirModule, hooks: *EncodeHooks) R.Result[EncoderOutput, str] {
@@ -560,9 +652,12 @@ pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.
     var st: EncodeState;
     state_init(?st, alloc, m, tgt);
 
+    # the stream exists under --emit-asm and on every build of a module with an
+    # oblivious function; a nil writer notifies and claims without rendering
     var sink: AsmSink = sink_init(asm_out, m.interner);
-    if (asm_out != nil) { st.buf.asm = ?sink; }
+    if (asm_out != nil || (hooks.stream && module_has_oblivious(m))) { st.buf.asm = ?sink; }
 
+    var notified: u32 = 0;
     var fi: u32 = 0;
     for (fi < m.function_len) {
         st.last_inline_site = 0;
@@ -576,6 +671,10 @@ pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.
         if (st.sym_count > pre_sym_count) {
             st.syms[pre_sym_count].size = st.buf.len::u32 - st.syms[pre_sym_count].offset;
         }
+        if (sink.failed) { brk; }
+        # one function's notifications are complete here; a consumer runs before the reset
+        notified = notified + note_inst_count(?st.buf);
+        notes_reset(?st.buf);
         fi = fi + 1;
     }
 
@@ -589,6 +688,12 @@ pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.
         state_dnit(?st);
         ret R.err[EncoderOutput, str](
             "--emit-asm: an instruction notification claimed a byte range that does not begin where the previous one ended");
+    }
+    if (sink_unaccounted(?st.buf) > 0) {
+        notes_free(?st.buf);
+        state_dnit(?st);
+        ret R.err[EncoderOutput, str](
+            "--emit-asm: the encoder emitted bytes that no instruction notification claimed");
     }
     notes_free(?st.buf);
 
@@ -664,6 +769,7 @@ pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.
     out.const_count  = st.const_count;
     out.frames       = st.frames;
     out.frame_count  = st.frame_count;
+    out.notified     = notified;
 
     scratch_release(?st);
     ret R.ok[EncoderOutput, str](out);
@@ -2130,4 +2236,58 @@ test "mach.lang.be.codegen.encode.emit_byte:doubling_is_still_exact_at_ordinary_
     }
     buf_dnit(?buf);
     ret bad;
+}
+
+# the seed reader: a load declared writes_secret seeds its destination, a
+# frame-slot operand seeds by its slot key, a precolored register and an
+# immediate carry no origin, and a note with no MirInstr carries nothing
+test "mach.lang.be.codegen.encode.note_seeds:declared_destination_slot_key_and_no_origin" {
+    var vregs: [2]mir.MirVReg;
+    vregs[0] = mir.vreg(0, 0, false, false);
+    vregs[1] = mir.vreg(1, 0, false, true);
+    vregs[1].spill_slot = 0;
+    var f: mir.MirFunction;
+    f.vregs = ?vregs[0];
+    f.vreg_count = 2;
+
+    var ops: [2]mir.MirOperand;
+    ops[0] = mir.op_preg_of(3, 0);
+    ops[1] = mir.op_mem_preg(5, 16);
+    var load: mir.MirInstr = mir.instr(mir.MIR_LOAD, ?ops[0], 2, 8, 8);
+    load.writes_secret = true;
+    var n: AsmNote = note_blank();
+    n.mi = ?load;
+    var seeds: NoteSeeds;
+    note_seeds(?f, ?n, ?seeds);
+    if (seeds.count != 2 || !seeds.dst_secret || seeds.barrier) { ret 1; }
+    if (seeds.origin[0] != 0 || !seeds.secret[0])               { ret 2; }
+    if (seeds.origin[1] != mir.MIR_VREG_NIL || seeds.secret[1]) { ret 3; }
+
+    # without the declaration a public origin stays public
+    load.writes_secret = false;
+    note_seeds(?f, ?n, ?seeds);
+    if (seeds.dst_secret || seeds.secret[0]) { ret 4; }
+
+    var sops: [2]mir.MirOperand;
+    sops[0] = mir.op_mem_slot(1, 0);
+    sops[1] = mir.op_preg(9);
+    var store: mir.MirInstr = mir.instr(mir.MIR_MOV, ?sops[0], 2, 8, 8);
+    n.mi = ?store;
+    note_seeds(?f, ?n, ?seeds);
+    if (seeds.count != 2 || seeds.dst_secret)                   { ret 5; }
+    if (seeds.origin[0] != 1 || !seeds.secret[0])               { ret 6; }
+    if (seeds.origin[1] != mir.MIR_VREG_NIL || seeds.secret[1]) { ret 7; }
+
+    var iops: [2]mir.MirOperand;
+    iops[0] = mir.op_preg_of(3, 1);
+    iops[1] = mir.op_imm(4);
+    var mov: mir.MirInstr = mir.instr(mir.MIR_MOV, ?iops[0], 2, 8, 8);
+    n.mi = ?mov;
+    note_seeds(?f, ?n, ?seeds);
+    if (seeds.count != 2 || seeds.origin[0] != 1 || !seeds.secret[0] || seeds.origin[1] != mir.MIR_VREG_NIL) { ret 8; }
+
+    n.mi = nil;
+    note_seeds(?f, ?n, ?seeds);
+    if (seeds.count != 0 || seeds.barrier || seeds.dst_secret) { ret 9; }
+    ret 0;
 }

@@ -331,9 +331,11 @@ description phase 2 reuses for generated code.
 
 ## 11. The notification stream today
 
-`encode.sink_claim`/`note_push`/`note_insert_after`/`check_accounted` tie every
-emitted byte to exactly one instruction notification, including bytes inserted
-by riscv64 relaxation. Two facts phase 2 depends on:
+Phase 2 part 1 (section 15.1) replaced both facts below; they are kept as the
+inventory phase 1 took. `encode.sink_claim`/`note_push`/`note_insert_after`/
+`check_accounted` tie every emitted byte to exactly one instruction
+notification, including bytes inserted by riscv64 relaxation. Two facts phase 2
+depended on:
 
 - **The sink exists only under `--emit-asm`.** `encode_driver_asm` attaches an
   `AsmSink` only when `asm_out != nil`; on the binary path `buf.asm == nil`,
@@ -416,7 +418,7 @@ checker is unfinished, and the inventory agrees.
 Sized against sections 5, 9 and 11, the validator is larger than one lane. It
 has five parts; each is a drop-in against a frozen interface.
 
-1. **Notification stream on every build.** Split "notify" from "render":
+1. **Notification stream on every build.** DONE (section 15.1). Split "notify" from "render":
    `AsmSink` with a nil writer records `AsmNote`s and claims bytes without
    rendering; `encode_driver_asm` attaches a sink whenever the module contains
    an oblivious function, not only under `--emit-asm`. The x86_64 and aarch64
@@ -427,7 +429,7 @@ has five parts; each is a drop-in against a frozen interface.
    effect table in part 3 must accept the form record. `check_accounted` and
    `sink.refused` already fail the build if a byte escapes.
 
-2. **Seeds.** `MirAbiInput` (this lane) for entry pregs and argument-area
+2. **Seeds.** DONE (section 15.2). `MirAbiInput` (phase 1) for entry pregs and argument-area
    bytes; `MirVReg.secret` through `MirVReg.assigned` and `spill_slot` for
    every seeded vreg; `writes_secret` loads mark their destination preg at the
    notification that encodes them; `MIR_DECLASSIFY` (kept as an opcode through
@@ -478,15 +480,179 @@ has five parts; each is a drop-in against a frozen interface.
 The corpus bar for phase 2 is byte-identity: a validator must not move a
 golden.
 
+### 15.1 Part 1 as landed: the stream on every build
+
+- `encode.AsmSink` with a nil writer records `AsmNote`s and claims bytes;
+  `sink_renders(buf)` is the one gate on rendering. `encode_driver_asm`
+  attaches a sink when `asm_out != nil` or when the ISA declares
+  `EncodeHooks.stream = true` and `module_has_oblivious(m)`. The stream is a
+  declared capability, not derived from `has_assembly`: x86_64, aarch64 and
+  riscv64 declare it, mos6502 declares `false` and an oblivious function there
+  is part 4's refusal (no stream, no validation, like the whole-module
+  emitter). `sink.refused`, the per-ISA `check_accounted` and a new
+  driver-level `sink_unaccounted == 0` check at the end of the module fail the
+  build if a byte escapes. `EncoderOutput.notified` reports the instruction
+  count (0 when no stream was attached); the three `codegen.stream:*` tests
+  show a plain build of a module with one oblivious function notifying exactly
+  the instructions the `--emit-asm` rendering prints, with bytes identical to
+  the rendering's and to a build of the same function without the contract.
+- x86_64 `printer.note_inst` and `note_function`/`note_block` notify first and
+  render only for a writer. `render_bytes_directive` pushes an
+  `ASM_NOTE_BYTES` note (which claims) and renders only for a writer, so an
+  inline-asm data directive is in the stream on every ISA the way riscv64's
+  already was.
+- aarch64 gained its machine-opcode space, `arm64/inst.mach:MachOp`, the same
+  split riscv64 makes between `riscv.Opcode` (the selection rows) and
+  `riscv.inst.MachOp` (what a notification carries). `arm64.Opcode` is a MIR
+  row alias and cannot name `sdiv`, `msub`, `fcvtzs` or `cbnz`; the new space
+  names every instruction the encoder emits and every row the inline-asm
+  grammar accepts (the grammar's `A64M_*` codes are now `mop.*`, one space for
+  both). The printer classifies its form record to a `MachOp` (`classify`),
+  renders `inst.mnemonic(op)` from that one table, and `note_inst` translates
+  the form record to an `isa.Inst` (`to_inst`: opcode, dst/src1/src2/src3 as
+  the regids and base/index/disp the encoder already built, operation width in
+  `size`, condition, writeback and vector element width in `flags`) before
+  rendering. Aliases are named by the spelling the assembler reads back
+  (`orr` with `xzr` is `MOV`, `subs` to `xzr` is `CMP`, `madd` with `xzr` is
+  `MUL`); the register-count shifts are `LSLV`/`LSRV`/`ASRV`, distinct from the
+  bitfield `LSL`/`LSR`/`ASR` even though both render as `lsl`, because only the
+  first is the variable-latency member. `encode.stream:translation_round_trips_
+  against_the_printer_for_every_emitted_base` drives every base word the
+  encoder can emit through its emit helper and checks the notification's
+  spelling against the rendered line and, wherever the grammar has a row for
+  that spelling, against the grammar's code; `inst.mnemonic:spellings_are_the_
+  assembler_mnemonics` pins the 111 spellings the grammar cannot cross-check.
+  The grammar has no vector rows, so a NEON spelling shared with a scalar row
+  (`add`, `mov`) is exempt from the cross-check: part 3's rows close that.
+- **Frozen-interface amendment (additive).** `isa.Inst` gained `src3`, blank
+  by `inst_blank`. aarch64 `madd`/`msub` read three registers and `isa.Inst`
+  held two; a notification that drops the fourth register cannot be walked
+  soundly, and the alternative (a parallel operand beside the `isa.Inst`)
+  would make part 3's table key on two records. x86_64 and riscv64 never set
+  it. Section 11 of `backend-census-2212.md` lists `isa.Inst` as frozen; this
+  is the same kind of additive field phase 1 added to `AsmNote` and is flagged
+  for the owner in the PR.
+- `AsmNote.mi` is the `MirInstr` whose encoding emitted the note (nil for
+  prologue, epilogue and stack-probe bytes; riscv64 relaxation re-notes
+  inherit the guard's). The driver resets the notes after each function at a
+  marked consumer point, so a walk sees one function's notifications complete
+  and bounded in memory; riscv64 no longer resets inside `encode_function`.
+- The consumer seam for part 4, not yet wired: the driver calls the walk at
+  the marked point with `(f, sink.notes, sink.note_count)`, and the ISA's
+  effect description (part 3) reaches it through `EncodeHooks`, a per-ISA
+  `effects` slot beside `stream`. The notes cannot travel out through
+  `EncoderOutput` instead: `encoding.mach` and `mir.mach` sit below `isa.mach`
+  in the import graph and cannot name an `isa.Inst`, and an opaque pointer
+  there would be the fail-open shape #2212 forbids.
+
+### 15.2 Part 2 as landed: the seeds and the provenance decision
+
+- **Provenance decision: `rewrite_instr` retains the origin vreg.** Every
+  rewritten register operand is `mir.op_preg_of(preg, origin)`: the assigned
+  register keeps the vreg it was rewritten from in `MirOperand.vreg`, the
+  reload scratch keeps the spilled vreg it aliases, and the spill store's
+  register operand keeps it too (its slot operand was already keyed by the
+  vreg). `verify_rewritten_operands` checks only `kind`, no reader of `.vreg`
+  on a `PREG` operand existed (every post-allocation reader is on `MEM`, where
+  `.vreg` is the slot key), and the `MirVReg.secret` seed is only a seed with
+  a location: a register carries many vregs over a function, so `assigned`
+  alone says where a secret lives, never when. The alternative, taking seeds
+  at the `MirInstr` the sink names, would have left `MirVReg.secret` unread
+  and made part 4 a pure re-derivation from `MirAbiInput` and `writes_secret`
+  loads, trusting the in-register dataflow it is meant to check. With
+  provenance the walk can compare its physical taint against the vreg seeds at
+  every operand. Memory base and index registers do not carry provenance: the
+  early walk refused every secret base and index before allocation, so their
+  seed is public by construction, and the physical walk checks the base
+  register's derived taint anyway. `regalloc.rewrite_instr:a_spilled_secret_
+  keeps_its_slot_key_through_the_scratch` and `..._destination_keeps_its_
+  origin_through_the_store` pin the reload and store shapes.
+- **Seeds are per operand, not per register.** `encode.note_seeds(f, note,
+  out)` fills `NoteSeeds`: for each operand of `note.mi` the origin vreg and
+  its declared secrecy, `dst_secret` for a `writes_secret` load, `barrier` for
+  a declassify. A set keyed by register was tried first and is wrong: an
+  instruction like `xor r1, r1, r2` after allocation carries a dying secret
+  source and a born public destination in the same `r1`, and only the operand
+  position tells them apart. The walk reads sources before the destination.
+- **The barrier survives selection and coalescing.** Selection retags
+  `MIR_DECLASSIFY` to the ISA move (`x64.MOV`, `arm64.MOV`/`FMOV`,
+  `riscv.MOV`/`FMV`), so the opcode is gone after `isel.run`; `rules.retag`
+  sets `MirInstr.declassifies` at that moment and expansions copy it
+  (`mir.instr_declassifies` is the reader). The allocator then coalesces the
+  declassify's public destination web into its (derived-secret) source web,
+  because `try_coalesce` compares seeds and a computed secret is not one, and
+  drops the resulting self-copy. Every drop site (`drop_self_copies`, the
+  same-register path of `rewrite_instr`, `drop_self_copies_physical`) now
+  keeps a zero-byte `ISA_USE` marker (`mir.declassify_marker`) with
+  `declassifies = true` and `declassified = <vreg>`, and each ISA's encode loop
+  pushes an `ASM_NOTE_BARRIER` after the instruction's bytes for any
+  instruction that declassifies. The barrier note names the downgraded
+  register through the operand (a real move) or through `declassified` and
+  `MirVReg.assigned`/`spill_slot` (a dropped self-copy). Bytes are unchanged:
+  the marker emits nothing and the printers skip it. `codegen.seeds:*` walks
+  the post-allocation instructions of the phase 1 shaped fixture on each ISA
+  and checks the seed at every register operand against
+  `ctvalidate.derive_secret_vregs` (the early walk's fixpoint, now exposed): a
+  seeded operand is in the walk's set, the one derived value is in the walk's
+  set and not a seed, and the barrier is the marker naming that value.
+- `writes_secret` is read at the notification of the load that carries it
+  (`dst_secret`), and `MirAbiInput` is read from `f.abi_inputs` at the
+  function's `ASM_NOTE_FUNC`; neither needed a new carrier.
+- The per-ISA `encode.stream:notes_name_their_instruction_and_carry_the_
+  barrier` tests pin the stream shape a walk consumes: `FUNC`, `BLOCK`, one
+  `INST` per emitted instruction with `mi` set, the `BARRIER` between its
+  instruction's bytes and the next.
+
+### 15.3 A hole found on the way, fixed
+
+The aarch64 inline-asm grammar accepted `lsl x0, x1, x2` (a register count)
+under the `lsl` row, which `asm_ct_class` classes `CT_OP_NONE`, while the
+same instruction spelled `lslv` is `CT_OP_VAR_SHIFT`. The parse now retags the
+three shift rows to the v-form when the count operand is a register, so a
+secret count is refused on a target that does not trust variable shifts
+(`asm_ct_scan:register_count_shift_alias_is_a_variable_shift`). Today every
+ISA declares `ct_trust_var_shift = true`, so no program's outcome changed.
+
+### 15.4 Measured cost
+
+Three repetitions each, same machine, `--no-cache`, wall time of the whole
+build and the per-module codegen time the `-vv` report prints (1 ms
+resolution). `dev` is a compiler built from `a151921cd`, `new` is this branch;
+both compiled the same sources.
+
+| build | dev wall | new wall | dev codegen | new codegen |
+|---|---|---|---|---|
+| corpus case project with oblivious modules (`meas.obl` 1 fn, `std.crypto.ct` 38 fns, `std.system.os.secret` 1 fn) | 616, 629, 661 ms | 615, 620, 628 ms | 63, 64, 64 ms | 64, 65, 65 ms |
+| same project without its own oblivious function (`std.system.os.secret` still linked) | 612, 613, 619 ms | 613, 621, 623 ms | 62, 63, 66 ms | 64, 66, 68 ms |
+| compiler self-build, 279 modules, one oblivious module (`mach.lang.ct.probe`) | 32.8, 33.0, 33.7 s | 32.8, 33.8, 34.4 s | 2.0, 2.2, 2.4 s | 2.3, 2.4, 2.5 s |
+
+Per module: `meas.case` (no oblivious function, no sink attached) 1 to 3 ms
+on both; `std.crypto.ct` (38 oblivious functions) 2 to 3 ms on `dev`, 3 to 4
+ms on `new`; `meas.obl` 0.2 to 1 ms on both. The stream's cost on a
+non-oblivious module is a function-count scan (`module_has_oblivious`), below
+the timer's resolution; on an oblivious module it is one `AsmNote` (about 300
+bytes, one struct copy) per emitted instruction, bounded by the instruction
+count and freed per function, at most 1 ms on the largest oblivious module in
+the standard library.
+
+Byte identity: the seed fixpoint holds (`A` by the seed, `B` by `A`, `C` by
+`B`, `B == C`), the corpus layer B is unchanged on x86_64-linux, aarch64-linux
+and riscv64-linux (306 cells), and two cross-builds pin the stream itself as
+byte-neutral on a module set that contains oblivious functions: a
+generation-B compiler from this branch and a generation-C compiler from
+`a151921cd` produce byte-identical binaries from the `a151921cd` source, and
+a generation-C `a151921cd` compiler and this branch's generation-A compiler
+produce byte-identical binaries from this branch's source.
+
 ## 16. Acceptance bullets of #3126 mapped to this lane
 
 | bullet | status |
 |---|---|
-| legalization, selection, allocation, spill/reload, flags, frame effects in final validation | inventory (sections 3 to 9); phase 2 parts 1 to 4 |
+| legalization, selection, allocation, spill/reload, flags, frame effects in final validation | inventory (sections 3 to 9); phase 2 parts 1 and 2 done (15.1, 15.2), 3 and 4 open |
 | whole-module emitter guarantee defined | section 12, validated |
-| encoding and relaxation reach every emitted instruction | section 11 (stream exists under `--emit-asm` only); phase 2 part 1 |
+| encoding and relaxation reach every emitted instruction | done: the stream exists on every build of a module with an oblivious function (15.1) |
 | late secret-dependent branches, addresses, variable-latency uses rejected by mutation controls | phase 2 part 5; classes and sites named in section 9 |
 | inline asm uses the same closed effect descriptions | section 10, validated; phase 2 part 3 reuses the table |
 | unknown effects are not public or constant-time by default | early walk and asm walk, validated (`failclosed:*`, `ct_check_item`); phase 2 part 3 |
 | leakage model and target assumptions documented | section 1 |
-| secret-safe boundary tests with mach-std#550 | `MirAbiInput` recorded (section 14); consumer is phase 2 part 2 |
+| secret-safe boundary tests with mach-std#550 | `MirAbiInput` recorded (section 14); read at `ASM_NOTE_FUNC` by part 4 through the seeds of 15.2 |
