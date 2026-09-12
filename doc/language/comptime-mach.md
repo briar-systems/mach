@@ -35,9 +35,15 @@ $mach.build.git.commit          # stub — not yet available
 $mach.build.git.dirty           # stub — not yet available
 ```
 
-A bare `$mach.build.<name>` that names none of the reserved facts resolves to
-the manifest comptime define of that name, or is a compile error when no such
-define was declared.
+A bare `$mach.build.<name>` that names none of the facts above is a compile
+error (`` no manifest define named in `$mach.build.<name>` ``). The manifest
+schema has no key that declares such a define, so today every other name is
+refused; a project's own configuration constants are ordinary `val`s selected
+with `$if` over the facts above.
+
+```mach reject "no manifest define named"
+val TRACING: u64 = $mach.build.TRACING;
+```
 
 ### `$mach.version` — the compiler version
 
