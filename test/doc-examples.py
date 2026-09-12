@@ -8,6 +8,7 @@ exercised example. an exercised fence names its expectation after the language:
     ```mach reject "text"       is refused; a diagnostic contains `text`
     ```mach warn "text"         compiles; a warning contains `text`
     ```mach run "text"          builds, runs, and prints exactly `text`
+    ```mach test "text"         `mach test .` passes and its report contains `text`
 
 a block may hold several files, each introduced by a line `# file: <path>`
 relative to the project root; the text before the first such line, or the
@@ -18,9 +19,10 @@ each exercised block is written into one generated project under the output
 directory (a copy of the pinned dep/std beside it, one host target, one bin
 artifact whose entry is src/root.mach) and driven through the compiler under
 test: `mach check .` for accept, reject and warn, `mach build .` and the built
-binary for run. the summary reports how many fences the reference carries and
-how many of them are exercised, per file, and the run fails on the first
-expectation that does not hold, printing the compiler's output.
+binary for run, `mach test .` for test. the summary reports how many fences
+the reference carries and how many of them are exercised, per file, and the
+run fails on every expectation that does not hold, printing the compiler's
+output.
 
 usage: doc-examples.py [--mach <path>] [--doc <dir>] [--out <dir>] [--only <file.md>] [--list]
 
@@ -43,9 +45,9 @@ HOST = {("linux", "x86_64"): ("linux-x86_64", "x86_64", "linux", "sysv64"),
         ("darwin", "arm64"): ("darwin-aarch64", "aarch64", "darwin", "aapcs64"),
         ("windows", "amd64"): ("windows-x86_64", "x86_64", "windows", "win64")}
 
-FENCE = re.compile(r'^```mach(?:\s+(accept|reject|warn|run))?(?:\s+"((?:[^"\\]|\\.)*)")?\s*$')
+FENCE = re.compile(r'^```mach(?:\s+(accept|reject|warn|run|test))?(?:\s+"((?:[^"\\]|\\.)*)")?\s*$')
 FILE_MARK = re.compile(r'^# file: (\S+)\s*$')
-MODES = ("accept", "reject", "warn", "run")
+MODES = ("accept", "reject", "warn", "run", "test")
 
 
 def die(msg):
@@ -262,6 +264,13 @@ def check(example, project, mach):
             return "expected acceptance with a warning, `mach check` exited %d\n%s" % (rc, text)
         if not any(example.expect in line for line in warnings_of(text)):
             return "expected a warning containing %r\n%s" % (example.expect, text)
+        return None
+    if example.mode == "test":
+        rc, out, err = run([mach, "test", "."], project.root)
+        if rc != 0:
+            return "expected the tests to pass, `mach test` exited %d\n%s" % (rc, out + err)
+        if example.expect not in out + err:
+            return "expected the test report to contain %r\n%s" % (example.expect, out + err)
         return None
     rc, out, err = run([mach, "build", "."], project.root)
     if rc != 0:

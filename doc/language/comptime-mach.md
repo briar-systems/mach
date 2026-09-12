@@ -5,13 +5,14 @@ context, the compiler identity, and source position. All reads, all comptime
 constants. The tags `$mach.{os,arch,abi,mode}.*` exist for path-value
 comparison against the resolved-build facts.
 
-> **Implementation status.** The resolved-build facts (`$mach.build.{os,arch,
+> **Live and reserved paths.** The resolved-build facts (`$mach.build.{os,arch,
 > abi,pointer_width,mode,pie}`), the tag tables (`$mach.{os,arch,abi,mode}.*`),
 > the compiler version (`$mach.version` and `$mach.version.{major,minor,patch}`),
 > and `$mach.compiler.{name,version}` are live. The `$mach.build.{timestamp,
 > host}`, `$mach.build.git.*`, `$mach.project.*`, and `$mach.source.*` paths are
-> reserved stubs — reading one is a compile error ("not yet available"). Each
-> subtree below notes its status.
+> reserved: the spelling is held for a later release and reading one is a
+> compile error naming the subtree (`` `$mach.source.*` is not yet available ``).
+> Each subtree below notes which it is.
 
 ## Subtrees
 
@@ -56,10 +57,8 @@ $mach.compiler.version          # live; same value as $mach.version
 
 ### `$mach.project.*` — values from mach.toml (stubs)
 
-```mach
-$mach.project.name
-$mach.project.version
-$mach.project.root
+```mach reject "`$mach.project.*` is not yet available"
+val root: u64 = $mach.project.root;
 ```
 
 > Project metadata lives at the top-level `$project.*` root
@@ -70,11 +69,8 @@ $mach.project.root
 
 ### `$mach.source.*` — current source position (stubs)
 
-```mach
-$mach.source.file
-$mach.source.line
-$mach.source.module
-$mach.source.function
+```mach reject "`$mach.source.*` is not yet available"
+val line: u64 = $mach.source.line;
 ```
 
 ### `$mach.os.*`, `$mach.arch.*`, `$mach.abi.*`, `$mach.mode.*` — tag values
@@ -127,9 +123,14 @@ $if ($mach.build.arch == $mach.arch.x86_64) { ... }
 A `$mach.*` read can initialize a runtime binding. The compiler folds the
 RHS at compile time:
 
-```mach
+```mach accept
+use std.types.string.str;
+
 pub val IS_LINUX: u8   = $mach.build.os == $mach.os.linux;
 pub val COMPILER: *u8  = $mach.compiler.name;
+pub val VERSION:  str  = $mach.version;
+pub val MAJOR:    u64  = $mach.version.major;
+pub val WIDTH:    u64  = $mach.build.pointer_width;
 ```
 
 ## See also

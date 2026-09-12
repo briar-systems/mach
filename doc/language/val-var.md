@@ -13,15 +13,20 @@ var NAME: TYPE = EXPR;              # mutable; explicit initializer
 
 ## Examples
 
-```mach
+```mach accept
 val pi: f64 = 3.14159;
 val n:  i64 = 42;
 
 var counter: i64 = 0;
 var buf:     [256]u8;               # default-initialized to zero
 
-counter = counter + 1;              # var is reassignable
-n = 43;                             # ERROR — `n` is a val
+fun bump() { counter = counter + 1; }   # var is reassignable
+```
+
+```mach reject "immutable"
+val n: i64 = 42;
+
+fun change() { n = 43; }            # ERROR: `n` is a val
 ```
 
 ## Immutability
@@ -104,7 +109,7 @@ Every binding declares its type. An untyped numeric literal is checked
 against the binding's declared type; it does not participate in inferring
 that type.
 
-```mach
+```mach reject "type"
 val n: i64 = 42;                    # ok — 42 conforms to i64
 val x       = 42;                   # ERROR — a binding declares its type
 val y       = 42i64;                # ERROR — a suffix is not an annotation

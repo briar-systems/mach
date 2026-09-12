@@ -91,8 +91,9 @@ A fenced `mach` block in this directory is either a display fragment or an
 exercised example. An exercised fence names its expectation after the
 language: `mach accept` must compile clean, `mach reject "text"` must be
 refused with a diagnostic containing `text`, `mach warn "text"` must compile
-with a warning containing `text`, and `mach run "text"` must build, run and
-print `text`. A block may hold several files, each introduced by a line
+with a warning containing `text`, `mach run "text"` must build, run and
+print `text`, and `mach test "text"` must pass under `mach test` with `text`
+in the report. A block may hold several files, each introduced by a line
 `# file: <path>` (the first file is `src/root.mach` when no line names it).
 `python3 test/doc-examples.py` extracts every exercised fence, compiles it
 with the compiler under test against the pinned `dep/std`, checks the

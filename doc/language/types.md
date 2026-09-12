@@ -48,9 +48,9 @@ A **type** may not. `rec`, `uni`, `tag`, and `def` reject a name spelled as a ve
 form, because a type declared with a vector's name would be silently unreachable:
 every use in type position resolves to the vector instead:
 
-```mach
+```mach reject "spelled as a vector type"
 rec f32x3 { x: f32; }           # error: `f32x3` is spelled as a vector type
-tag f32x4: u8 { empty; }            # error: `f32x4` is spelled as a vector type
+tag f32x4: u8 { empty; }        # error: `f32x4` is spelled as a vector type
 ```
 
 This holds for any well-formed spelling, so the name cannot be claimed by a type
@@ -259,11 +259,14 @@ val g: [2][2]i64 = [2][2]i64{ [2]i64{1, 2}, [2]i64{3, 4} };
 **Constant indices are bounds-checked at compile time.** `N` is part of the
 type, so an index the compiler can fold must land in `[0, N)`:
 
-```mach
-var xs: [4]i32;
-val a: i32 = xs[3];             # ok
-val b: i32 = xs[4];             # error: index 4 is out of bounds for `[4]i32` of length 4
-val c: i32 = xs[-1];            # error: index -1 is out of bounds ...
+```mach reject "out of bounds"
+fun read() i32 {
+    var xs: [4]i32;
+    val a: i32 = xs[3];             # ok
+    val b: i32 = xs[4];             # error: index 4 is out of bounds for `[4]i32` of length 4
+    val c: i32 = xs[-1];            # error: index -1 is out of bounds ...
+    ret a + b + c;
+}
 ```
 
 The rule is keyed on the length the type carries, not on how the array was
@@ -280,10 +283,21 @@ not indexed against any length at all — `*T` carries none.
 
 `fun(T1, T2) R` — first-class function-pointer type.
 
-```mach
+```mach run "5"
+use std.runtime;
+use print: std.print;
+
+fun add(a: i64, b: i64) i64 { ret a + b; }
+
 def BinOp: fun(i64, i64) i64;
 val op: BinOp = add;
-val r:  i64   = op(2, 3);
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val r: i64 = op(2, 3);
+    print.printlnf("{}", r);
+    ret 0;
+}
 ```
 
 ## Record and union types

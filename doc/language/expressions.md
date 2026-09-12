@@ -27,7 +27,16 @@ core.add            # symbol from module `core`
 
 A type name followed by a brace-delimited initializer:
 
-```mach
+```mach accept
+use std.types.canonical.res;
+use std.types.canonical.err;
+
+rec Point { x: i64; y: i64; }
+uni Number { i: i64; f: f64; }
+rec Pair[T, U] { left: T; right: U; }
+tag Reply: u8 { empty; value: i64; }
+tag MyErr: u8 { bad; }
+
 val p:    Point             = Point{ x: 1, y: 2 };
 val a:    [3]i64            = [3]i64{10, 20, 30};
 val u:    Number            = Number{ i: 99 };
@@ -50,9 +59,21 @@ require one positional initializer per lane. See [types.md](types.md#simd-vector
 
 ## Field, index, and tag access
 
-```mach
-val x:     i64 = p.x;            # record field
-val first: i64 = a[0];           # array index
+```mach run "1 10"
+use std.runtime;
+use print: std.print;
+
+rec Point { x: i64; y: i64; }
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val p: Point  = Point{ x: 1, y: 2 };
+    val a: [3]i64 = [3]i64{10, 20, 30};
+    val x:     i64 = p.x;            # record field
+    val first: i64 = a[0];           # array index
+    print.printlnf("{} {}", x, first);
+    ret 0;
+}
 ```
 
 An index the compiler can fold is bounds-checked against a statically known

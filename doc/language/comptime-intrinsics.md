@@ -17,7 +17,9 @@ narrower binding is a choice of representation rather than a conversion. It
 adopts the binding's width and signedness, and is **refused** — never truncated —
 when the measured value does not fit:
 
-```mach
+```mach reject "out of range"
+use std.types.size.usize;
+
 rec Point { x: i64; y: i64; }
 
 val A: u8    = $size_of(Point);   # 16, stored in one byte
@@ -127,7 +129,7 @@ to where it is measured makes no difference:
 | `$if` / `$or` condition, in a function body | yes |
 | `$if` / `$or` condition, in declaration scope | only when no arm of the chain declares anything |
 
-```mach
+```mach accept
 rec Pair { a: u64; b: u64; }
 
 #[align($align_of(Pair))]        # a type's alignment
@@ -435,7 +437,10 @@ $fields(T)              # comptime field sequence for record T
 v.[f]                   # comptime field projection: access the field f on v
 ```
 
-```mach
+```mach run "7"
+use std.runtime;
+use print: std.print;
+
 rec Pair { x: i64; y: i64; }
 
 fun sum(p: Pair) i64 {
@@ -444,6 +449,12 @@ fun sum(p: Pair) i64 {
         total = total + p.[f];      # p.x on iteration 1, p.y on iteration 2
     }
     ret total;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{}", sum(Pair{x: 3, y: 4}));
+    ret 0;
 }
 ```
 
@@ -454,7 +465,10 @@ fun sum(p: Pair) i64 {
 Because each `$each` iteration re-types `v.[f]` to the concrete field type,
 heterogeneous records work naturally:
 
-```mach
+```mach run "12"
+use std.runtime;
+use print: std.print;
+
 rec Mixed { a: i64; b: u8; }
 
 fun total(m: Mixed) i64 {
@@ -464,13 +478,24 @@ fun total(m: Mixed) i64 {
     }
     ret t;
 }
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{}", total(Mixed{a: 10, b: 2u8}));
+    ret 0;
+}
 ```
 
 ### Descriptor reads
 
 Field descriptor properties can be read inside the loop body:
 
-```mach
+```mach run "8 1"
+use std.runtime;
+use print: std.print;
+
+rec Mixed { a: i64; b: u8; }
+
 fun offsum(m: Mixed) i64 {
     var s: i64 = 0;
     $each f in $fields(Mixed) {
@@ -485,6 +510,13 @@ fun count_i64(m: Mixed) i64 {
         $if (f.type == i64) { n = n + 1; } $or { }
     }
     ret n;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val m: Mixed = Mixed{a: 10, b: 2u8};
+    print.printlnf("{} {}", offsum(m), count_i64(m));
+    ret 0;
 }
 ```
 
@@ -540,13 +572,28 @@ specialized payload type. `$is_tag(^T)` is false, and `$cases(^T)` is rejected.
 Inside the loop body, `sel value.[case]` is the case test and `value.[case]` is
 the guarded payload place:
 
-```mach
-$each case in $cases(T) {
-    if (sel value.[case]) {
-        $if (case.has_payload) {
-            consume[case.type](value.[case]);
+```mach run "value 42"
+use std.runtime;
+use print: std.print;
+
+tag Reply: u8 { empty; value: i64; }
+
+fun consume[T](v: T) { print.printlnf("value {}", v); }
+
+fun walk[T](value: T) {
+    $each case in $cases(T) {
+        if (sel value.[case]) {
+            $if (case.has_payload) {
+                consume[case.type](value.[case]);
+            }
         }
     }
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    walk[Reply](Reply.value{42});
+    ret 0;
 }
 ```
 
@@ -595,7 +642,10 @@ forms, every element shares one type (the array's element type), so the loop
 variable is an ordinary constant value: it reads as a value, casts, dispatches a
 per-element `$if`, and — for a record element — projects fields with `x.field`.
 
-```mach
+```mach run "17"
+use std.runtime;
+use print: std.print;
+
 val PRIMES: [4]i64 = [4]i64{2, 3, 5, 7};
 
 fun sum() i64 {
@@ -604,6 +654,12 @@ fun sum() i64 {
         total = total + x;      # x is 2, then 3, then 5, then 7
     }
     ret total;                  # 17
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{}", sum());
+    ret 0;
 }
 ```
 

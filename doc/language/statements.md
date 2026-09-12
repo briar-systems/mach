@@ -23,12 +23,16 @@ if (cond) {
 An `if`/`or` arm whose condition is exactly `sel P.c` guards the payload place
 `P.c` inside its block:
 
-```mach
-if (sel reply.value) {
-    val number: i64 = reply.value;  # guarded by the arm condition
-}
-or {
-    # reply holds empty on this path
+```mach accept
+tag Reply: u8 { empty; value: i64; }
+
+fun read(reply: Reply) i64 {
+    if (sel reply.value) {
+        ret reply.value;            # guarded by the arm condition
+    }
+    or {
+        ret 0;                      # reply holds empty on this path
+    }
 }
 ```
 
@@ -40,10 +44,36 @@ untested. See [tag.md](tag.md).
 
 A single condition-loop form. There is no for-each.
 
-```mach
-var i: i64 = 0;
-for (i < 10) {
-    i = i + 1;
+```mach run "10"
+use std.runtime;
+use print: std.print;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var i: i64 = 0;
+    for (i < 10) {
+        i = i + 1;
+    }
+    print.printlnf("{}", i);
+    ret 0;
+}
+```
+
+A `for` with no condition loops until a `brk` or a `ret` leaves it:
+
+```mach run "3"
+use std.runtime;
+use print: std.print;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var i: i64 = 0;
+    for {
+        i = i + 1;
+        if (i == 3) { brk; }
+    }
+    print.printlnf("{}", i);
+    ret 0;
 }
 ```
 
@@ -59,11 +89,22 @@ ret;                        # return from a void function
 Loop control: `brk` exits the enclosing `for`; `cnt` continues to the
 next iteration.
 
-```mach
-for (i < 10) {
-    i = i + 1;
-    if (i == 3) { cnt; }
-    if (i == 8) { brk; }
+```mach run "1 2 4 5 6 7 8"
+use std.runtime;
+use print: std.print;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var i: i64 = 0;
+    for (i < 10) {
+        i = i + 1;
+        if (i == 3) { cnt; }
+        print.printf("{}", i);
+        if (i == 8) { brk; }
+        print.print(" ");
+    }
+    print.println("");
+    ret 0;
 }
 ```
 
@@ -78,14 +119,25 @@ loop that also uses bare `cnt;` for control flow.
 order of declaration. Useful for cleanup that should happen regardless of how
 the scope exits.
 
-```mach
-{
-    fin { counter = counter - 1; }
-    fin { counter = counter * 2; }
+```mach run "5 9"
+use std.runtime;
+use print: std.print;
 
-    # ... code ...
+var counter: i64 = 0;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    {
+        fin { counter = counter - 1; }
+        fin { counter = counter * 2; }
+
+        counter = 5;
+        print.printf("{} ", counter);
+    }
+    # at block exit, in reverse order: counter * 2 runs first, then counter - 1
+    print.printlnf("{}", counter);
+    ret 0;
 }
-# at block exit, in reverse order: counter * 2 runs first, then counter - 1
 ```
 
 `fin` is block-scoped: it belongs to the block that declares it and covers
@@ -112,7 +164,14 @@ whose target loop encloses the fin. A loop fully inside the fin body uses
 `brk` / `cnt` normally.
 
 `fin` requires a block body (`fin { ... }`). The bare single-statement form
-(`fin stmt;`) is rejected.
+(`fin stmt;`) is rejected, and so is a `ret` inside a `fin` body:
+
+```mach reject "fin"
+fun leave() i64 {
+    fin { ret 1; }
+    ret 0;
+}
+```
 
 ## Block
 

@@ -78,7 +78,7 @@ under the ordinary scoping rules — never whichever binding happens to share it
 spelling. A block-scoped binding shadows an outer one of the same name here
 exactly as it does at runtime:
 
-```mach
+```mach reject "comptime"
 val N: i64 = 9;
 
 fun f(k: i64) i64 {
@@ -98,7 +98,10 @@ A binding marked `$` — a comptime value parameter, an `$each` loop variable �
 *is* a comptime binding, and shadows an outer name of its own spelling in the
 same way. Inside the `$each` below the name `N` is the element, not the 9:
 
-```mach
+```mach run "3"
+use std.runtime;
+use print: std.print;
+
 val N:  i64    = 9;
 val ES: [2]i64 = [2]i64{1, 2};
 
@@ -106,6 +109,12 @@ fun g() i64 {
     var s: i64 = 0;
     $each N in ES { s = s + N; }   # 3, not 18
     ret s;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{}", g());
+    ret 0;
 }
 ```
 

@@ -18,7 +18,7 @@ uni NAME[T] { ... }         # generic
 
 ## Examples
 
-```mach
+```mach accept
 pub uni Number {
     i: i64;
     f: f64;
