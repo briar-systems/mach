@@ -815,10 +815,11 @@ documented 613 public entities across 36 modules -> /home/me/p1/doc/api
 The artifact is selected the way `mach build` selects it: an explicit
 `--bin`/`--lib` wins, otherwise the sole artifact that supports the target,
 otherwise the one marked `default = true`. When several support the target
-and none is marked, 4.30.0 takes the first declared and warns; 5.0.0 refuses:
+and none is marked, the command refuses (the 4.30 first-declared fallback was
+removed in 5.0.0; table order carries no meaning):
 
 ```
-warning: mach.toml: several artifacts are declared and none is marked `default = true`; the first declared artifact is selected by table order, which 5.0.0 stops doing: mark exactly one [artifact.<name>] with `default = true` or select one with --bin/--lib
+error: mach.toml: several artifacts support the selected target and none is marked `default = true`; no artifact is selected by table order: mark exactly one [artifact.<name>] with `default = true` or select one with --bin/--lib (first, second)
 ```
 
 Exit codes: `0` ok, `1` user error, `2` internal error.

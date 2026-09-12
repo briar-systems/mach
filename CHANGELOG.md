@@ -377,6 +377,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path that the evaluator rejects now reports the path's own message at the
   path; it used to fall through to the generic "comptime parameters are
   referenced without `$`" error on the root identifier (#3226, #3112, #3128).
+- The first-declared target, profile and artifact fallbacks. A manifest that
+  declares several targets none of which matches the host, several profiles,
+  or several artifacts supporting the selected target, and marks none
+  `default = true`, is refused where a command must pick one, with a message
+  naming the axis, the `default = true` key and the selecting flag
+  (`` mach.toml: several profiles are declared and none is marked
+  `default = true`; no profile is selected by table order: mark exactly one
+  [profile.<name>] with `default = true` or select one with --profile ``).
+  Nothing is ever selected by table order, and the build request no longer
+  carries a by-table-order bit (#3226, #3112, #3222).
 
 ## [4.30.0] - 2026-09-07
 

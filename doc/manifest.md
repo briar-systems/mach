@@ -440,12 +440,12 @@ target and an artifact:
 2. otherwise a sole declared profile is chosen;
 3. otherwise the one marked `default = true` is chosen.
 
-Table order carries no meaning. In 4.30.0 a manifest that declares several
-profiles and marks none still builds: the first declared profile is taken with
-a warning that names the fix. 5.0.0 refuses that manifest.
+Table order carries no meaning. A manifest that declares several profiles and
+marks none is refused wherever a command must pick one (the 4.30 first-declared
+fallback was removed in 5.0.0):
 
 ```
-warning: mach.toml: several profiles are declared and none is marked `default = true`; the first declared profile is selected by table order, which 5.0.0 stops doing: mark exactly one [profile.<name>] with `default = true` or select one with --profile
+error: mach.toml: several profiles are declared and none is marked `default = true`; no profile is selected by table order: mark exactly one [profile.<name>] with `default = true` or select one with --profile
 ```
 Emission of the human-readable IR and assembly side-artifacts is **not** a profile
 concern — it is controlled only by the `--emit-ir` / `--emit-asm` CLI flags (see
@@ -1170,8 +1170,8 @@ A build cell is one artifact × one target × one profile.
 - `mach test <path>` and `mach doc <path>` need one artifact as their primary
   context and select it by the same rule as everything else: `--bin`/`--lib`
   wins, a sole artifact that declares the resolved target is chosen, several
-  need exactly one `default = true` (4.30.0 falls back to the first declared
-  with a warning; 5.0.0 refuses). `mach test` links the union of all artifacts' referenced entries plus
+  need exactly one `default = true` (several with none marked is refused; the
+  4.30 first-declared fallback was removed in 5.0.0). `mach test` links the union of all artifacts' referenced entries plus
   exported dependency entries, filtered to that target. Foreign-target tests require
   a compatible `--runner`. If two artifacts' objects collide on symbols in that union,
   that is an honest link error — restructure the entries.
@@ -1230,10 +1230,16 @@ never a synthesized tuple. Exactly one host match is chosen; several matching tu
 is an ambiguity error naming the candidates. With no match, a sole declared target
 is chosen with a warning, so a cross-only project still builds on a foreign host;
 several declared targets select the one marked `default = true` (or an explicit
-`--target`). A manifest that declares several and marks none still builds in 4.x:
-the first declared target is taken, with a deprecation warning, and 5.0.0 refuses
-that manifest, since table order carries no meaning. The same window applies to
-`[profile.*]` and to `[artifact.*]` when a command needs one artifact.
+`--target`). A manifest that declares several and marks none is refused, since
+table order carries no meaning (the 4.30 first-declared fallback was removed in
+5.0.0):
+
+```
+error: mach.toml: several targets are declared, none matches the host and none is marked `default = true`; no target is selected by table order: mark exactly one [target.<name>] with `default = true` or select one with --target
+```
+
+The same rule applies to `[profile.*]` and to `[artifact.*]` when a command
+needs one artifact.
 
 ## Worked example: a consumer of C bindings and vendored C
 
