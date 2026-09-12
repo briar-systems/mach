@@ -23,7 +23,19 @@ test is never part of a module's public surface.
 
 ## Examples
 
-```mach
+```mach test "2 passed"
+use std.runtime;
+use std.types.bool.bool;
+
+fun is_leap_year(y: i64) bool {
+    if (y % 400 == 0) { ret 1; }
+    if (y % 100 == 0) { ret 0; }
+    ret y % 4 == 0;
+}
+
+fun debug(msg: *u8) { if (msg == nil) { ret; } }
+fun info(msg: *u8) { if (msg == nil) { ret; } }
+
 test "date: is_leap_year" {
     if (!is_leap_year(2000)) { ret 1; }
     if (is_leap_year(1900))  { ret 1; }

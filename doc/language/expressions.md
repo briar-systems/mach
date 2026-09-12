@@ -1,9 +1,5 @@
 # Expressions
 
-Tag, canonical type, and `try` descriptions include the accepted v5 contract.
-Implementation is incomplete at base commit `fc5c9e7e`. See
-[tag.md](tag.md#implementation-status) and [try.md](try.md#implementation-status).
-
 Expressions evaluate to values. They appear on the right side of bindings,
 as conditions, and as call arguments.
 
@@ -31,7 +27,16 @@ core.add            # symbol from module `core`
 
 A type name followed by a brace-delimited initializer:
 
-```mach
+```mach accept
+use std.types.canonical.res;
+use std.types.canonical.err;
+
+rec Point { x: i64; y: i64; }
+uni Number { i: i64; f: f64; }
+rec Pair[T, U] { left: T; right: U; }
+tag Reply: u8 { empty; value: i64; }
+tag MyErr: u8 { bad; }
+
 val p:    Point             = Point{ x: 1, y: 2 };
 val a:    [3]i64            = [3]i64{10, 20, 30};
 val u:    Number            = Number{ i: 99 };
@@ -54,9 +59,21 @@ require one positional initializer per lane. See [types.md](types.md#simd-vector
 
 ## Field, index, and tag access
 
-```mach
-val x:     i64 = p.x;            # record field
-val first: i64 = a[0];           # array index
+```mach run "1 10"
+use std.runtime;
+use print: std.print;
+
+rec Point { x: i64; y: i64; }
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val p: Point  = Point{ x: 1, y: 2 };
+    val a: [3]i64 = [3]i64{10, 20, 30};
+    val x:     i64 = p.x;            # record field
+    val first: i64 = a[0];           # array index
+    print.printlnf("{} {}", x, first);
+    ret 0;
+}
 ```
 
 An index the compiler can fold is bounds-checked against a statically known
@@ -69,29 +86,9 @@ For tagged values:
 - `tag_val.case` accesses the payload of that case. It is legal only inside a lexical guard for that place and case; an unguarded payload access is a compile error.
 - `TypeName.case` alone is a case selector, not a value. It cannot be stored or passed.
 
-See [tag.md](tag.md) for the guard rules.
-
-## `try` expressions
-
-A `try` expression performs explicit, visible failure handling for canonical
-`res[T, E]`, `opt[T]`, and `err[E]` values:
-
-```mach
-val number: i64 = try parse(input) or (error: ParseError) {
-    ret res[i64, ParseError].err{error};
-};
-```
-
-On success, `try` extracts the active payload. On failure, it binds the error
-(if applicable) and executes a mandatory terminating failure block. A failed
-`try` skips the remainder of the enclosing expression and does not initialize its
-destination.
-
-In assignments, the right hand side evaluates and captures before the destination
-place on the left hand side is evaluated.
-
-Ordinary user-defined tags do not acquire an automatic `try` convention. See
-[try.md](try.md) for complete failure handling rules.
+See [tag.md](tag.md) for the guard rules. There is no other operator over a
+tag: failure handling is an ordinary `if`/`or` chain over `sel`, and the
+guard it opens is what makes the payload readable.
 
 ## Function calls
 
