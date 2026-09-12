@@ -103,6 +103,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The aarch64 inline-asm grammar read `lsl`, `lsr` and `asr` with a register
+  count under the immediate-shift row, so the constant-time scan classed a
+  variable shift as needing no trust; the parse now retags the register-count
+  form to `lslv`/`lsrv`/`asrv`, the variable-shift class. No target declares
+  distrust of variable shifts today, so no program's verdict changed. (#3126)
+
 - Release builds inline small helpers across module boundaries. A dependency's
   raw lowered module yields a per-module `Q_INLINE_BODIES` product holding every
   body under the size bar (or `#[inline]`) that is not recursive, `noinline`,
@@ -220,6 +226,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI rebuilds its audited compiler from published 4.26.5 and source commits reachable from main after withdrawal of the 4.30.0 release.
 
 ### Changed
+
+- Every build of a module that contains an `#[oblivious]` function records an
+  instruction notification for each emitted machine instruction on x86_64,
+  aarch64 and riscv64, the stream `--emit-asm` alone used to produce, without
+  rendering it; each notification names the MIR instruction that emitted it,
+  and after register allocation every register operand keeps the virtual
+  register it was rewritten from, so a later validator can read which
+  registers and frame slots are declared secret at every instruction. aarch64
+  gained a machine-opcode space shared by its assembly printer and inline-asm
+  grammar. Emitted bytes are unchanged; the cost is one notification record per
+  instruction in an oblivious module and nothing elsewhere (#3126, N5 phase 2
+  parts 1 and 2).
 
 - The ELF, COFF and Mach-O writers size and serialize every file from one
   checked plan. A region is placed once, with its alignment, offset and extent
