@@ -574,7 +574,11 @@ link admission any other way without a second capability channel.
   flags)`: the closed per-instruction effect description inline asm uses.
 - `isa.Inst`, `isa.Operand`, `isa.inst_blank`, `regid_make/class/index`: the
   physical-register stream after allocation; the `clobbers` field is frozen as
-  **unpopulated** until item 10.3 rules.
+  **unpopulated** until item 10.3 rules. Amended 2026-09-12 (#3126, accepted as
+  additive like N3's): `isa.Inst.src3`, blank by `inst_blank`, because aarch64
+  `madd`/`msub` read three registers (Rn, Rm, Ra) and a notification that drops
+  the fourth register cannot be walked soundly; no existing reader changes,
+  x86_64 and riscv64 never set it.
 - `mir.MirInstr.writes_secret`, `memory_flags`, `mir.MirVReg.secret`,
   `mir.MirOperand.required_bank`, `regalloc.verify_rewritten_operands`
   (`regalloc.mach:2322`): the post-rewrite facts N5 validates against.
