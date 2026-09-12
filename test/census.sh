@@ -263,4 +263,61 @@ if want real-bools; then
     fi
 fi
 
+if want catalog-defaults; then
+    # #3124: a closed catalog whose members come from input or a cross-module
+    # product never answers an unknown member with a default. every production
+    # function that takes a type listed in test/census/input-catalogs.txt,
+    # branches on that parameter, and ends with an unconditional literal
+    # return is a default-picking site and fails the census.
+    types=$(grep -vE '^(#|$)' "$root/test/census/input-catalogs.txt" | tr '\n' '|' | sed 's/|$//')
+    : > "$tmp"
+    find "$root/src" -name '*.mach' | sort | while IFS= read -r f; do
+        rel=${f#"$root"/}
+        awk -v types="$types" '
+            # a production function that takes a listed catalog type, branches on that
+            # parameter, and ends with an unconditional literal return picks a default
+            BEGIN { fn=""; depth=0; intest=0; sig=""; insig=0 }
+            {
+                line=$0
+                if (intest==0 && (line ~ /^test[ \t]+"/ || line ~ /^(pub[ \t]+)?fun[ \t]+u?t_/)) { intest=1; depth=0 }
+                if (intest==1) { n=gsub(/\{/,"{",line); m=gsub(/\}/,"}",line); depth+=n-m; if (depth<=0) intest=0; next }
+                if (fn=="" && insig==0 && line ~ /^(pub[ \t]+)?fun[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\(/) {
+                    name=line; sub(/^(pub[ \t]+)?fun[ \t]+/,"",name); sub(/[ \t]*\(.*$/,"",name)
+                    start=NR; sig=line; insig=1
+                }
+                if (insig==1) {
+                    if (line!=sig) sig=sig " " line
+                    if (line ~ /\{/) {
+                        insig=0; fn=""
+                        params=sig; sub(/^[^(]*\(/,"",params); sub(/\)[^)]*$/,"",params)
+                        np=split(params,ps,",")
+                        pname=""
+                        for (i=1;i<=np;i++) { p=ps[i]; if (match(p, "[A-Za-z_][A-Za-z0-9_]*[ \t]*:[ \t]*([A-Za-z_][A-Za-z0-9_]*\\.)?(" types ")[ \t]*$")) { q=substr(p,RSTART,RLENGTH); sub(/[ \t]*:.*$/,"",q); sub(/^[ \t]+/,"",q); pname=q } }
+                        if (pname!="") { fn=name; depth=0; branched=0; lastret=""; lastdepth=0 }
+                    }
+                    if (fn=="") next
+                }
+                if (fn!="") {
+                    if (line ~ ("(if|or)[ \t]*\\([ \t]*" pname "[ \t]*==")) branched=1
+                    n=gsub(/\{/,"{",line); m=gsub(/\}/,"}",line)
+                    d0=depth; depth+=n-m
+                    if (d0==1 && line ~ /^[ \t]*ret[ \t]/) { lastret=line; sub(/^[ \t]*/,"",lastret) }
+                    if (depth<=0) {
+                        if (branched==1 && lastret ~ /^ret[ \t]+("[^"]*"|[0-9]+|true|false|nil|[A-Z][A-Z0-9_.]*|[a-z_]+\.[A-Z][A-Z0-9_]*)[ \t]*;/) print start ": " name " (" pname ") " lastret
+                        fn=""
+                    }
+                }
+            }
+        ' "$f" | sed "s|^|$rel:|" >> "$tmp"
+    done
+    hits=$(wc -l < "$tmp" | tr -d ' ')
+    if [ "$hits" -ne 0 ]; then
+        sed 's|^|  |' "$tmp"
+        echo "census catalog-defaults: FAIL ($hits default-picking site(s) for an input-sourced catalog)"
+        status=1
+    else
+        echo "census catalog-defaults: ok"
+    fi
+fi
+
 exit $status
