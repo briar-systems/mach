@@ -30,6 +30,8 @@ use mach.lang.target.of;
 use mach.lang.target.of.bin;
 
 use page: std.allocator.page;
+use sort: std.collections.sort;
+use format: std.format;
 
 val DW_TAG_compile_unit:     u8 = 0x11;
 val DW_TAG_base_type:        u8 = 0x24;
@@ -411,20 +413,88 @@ fun memb_reserve(tc: *TypeCtx) bool {
     ret true;
 }
 
+# the string table with its own open-addressed index of (hash, offset), so
+# a string is found or appended without a scan of the table; an index
+# refusal is recorded on the buffer, which the section install renders
 rec StrTab {
-    buf: enc.ByteBuf;
+    buf:   enc.ByteBuf;
+    slots: *StrSlot;
+    cap:   u32;
+    len:   u32;
+}
+
+rec StrSlot {
+    hash: u64;
+    off:  u32;
+    used: bool;
+}
+
+fun strtab_init(alloc: *A.Allocator) StrTab {
+    var st: StrTab;
+    st.buf   = enc.buf_init(alloc);
+    st.slots = nil;
+    st.cap   = 0;
+    st.len   = 0;
+    ret st;
+}
+
+fun strtab_dnit(st: *StrTab) {
+    if (st.slots != nil && st.cap > 0) { A.deallocate[StrSlot](st.buf.alloc, st.slots, st.cap::usize); }
+    st.slots = nil;
+    st.cap   = 0;
+    st.len   = 0;
+    enc.buf_dnit(?st.buf);
+}
+
+fun str_hash(s: str) u64 {
+    val n: usize = str_len(s);
+    var h: u64 = 0xcbf29ce484222325;
+    var i: usize = 0;
+    for (i < n) { h = (h ^ (s[i]::u64)) * 0x100000001b3; i = i + 1; }
+    ret h;
+}
+
+fun strtab_grow(st: *StrTab) bool {
+    var new_cap: u32 = 64;
+    if (st.cap > 0) { new_cap = st.cap * 2; }
+    val r: res[*StrSlot, A.Error] = A.allocate[StrSlot](st.buf.alloc, new_cap::usize);
+    if (sel r.err) { st.buf.failed = true; st.buf.fail_err = r.err; ret false; }
+    val slots: *StrSlot = r.ok;
+    var i: u32 = 0;
+    for (i < new_cap) { slots[i].used = false; i = i + 1; }
+    i = 0;
+    for (i < st.cap) {
+        if (st.slots[i].used) {
+            var j: u32 = (st.slots[i].hash::u32) & (new_cap - 1);
+            for (slots[j].used) { j = (j + 1) & (new_cap - 1); }
+            slots[j] = st.slots[i];
+        }
+        i = i + 1;
+    }
+    if (st.slots != nil && st.cap > 0) { A.deallocate[StrSlot](st.buf.alloc, st.slots, st.cap::usize); }
+    st.slots = slots;
+    st.cap   = new_cap;
+    ret true;
 }
 
 fun str_off(st: *StrTab, s: str) u32 {
-    var i: usize = 0;
-    for (i < st.buf.len) {
-        val start: usize = i;
-        for (i < st.buf.len && st.buf.data[i] != 0) { i = i + 1; }
-        if (bytes_eq_str(?st.buf, start, i, s)) { ret start::u32; }
-        i = i + 1;
+    if (st.buf.failed) { ret 0; }
+    if ((st.len + 1) * 2 > st.cap && !strtab_grow(st)) { ret 0; }
+    val h: u64 = str_hash(s);
+    val n: usize = str_len(s);
+    var j: u32 = (h::u32) & (st.cap - 1);
+    for (st.slots[j].used) {
+        val slot: *StrSlot = ?st.slots[j];
+        if (slot.hash == h && bytes_eq_str(?st.buf, slot.off::usize, slot.off::usize + n, s)) { ret slot.off; }
+        j = (j + 1) & (st.cap - 1);
     }
     val off: u32 = st.buf.len::u32;
     emit_cstr(?st.buf, s);
+    if (st.buf.failed) { ret 0; }
+    st.slots[j].hash = h;
+    st.slots[j].off  = off;
+    st.slots[j].used = true;
+    st.len = st.len + 1;
     ret off;
 }
 
@@ -670,6 +740,7 @@ fun copy_exact(alloc: *A.Allocator, b: *enc.ByteBuf) res[*u8, fail.Fail] {
 }
 
 fun add_debug_section(image: *of.ObjectImage, name: intern.StrId, b: *enc.ByteBuf) res[u32, fail.Fail] {
+    if (b.failed) { ret res[u32, fail.Fail].err{fail.refused(b.fail_err)}; }
     val rb: res[*u8, fail.Fail] = copy_exact(image.alloc, b);
     if (sel rb.err) { ret res[u32, fail.Fail].err{rb.err}; }
     var sec: of.Section;
@@ -1490,7 +1561,9 @@ fun emit_row(b: *enc.ByteBuf, addr_delta: u32, line_delta: i32) {
     enc.emit_byte(b, DW_LNS_copy);
 }
 
-fun build_line(s: *debug_input.DebugProgram, funcs: *DwFunc, nfuncs: u32, rows: *enc.LineRow, row_count: u32,
+# row_start and row_items group the rows by function in row order (FuncIndex)
+fun build_line(s: *debug_input.DebugProgram, funcs: *DwFunc, nfuncs: u32, rows: *enc.LineRow,
+               row_start: *u32, row_items: *u32,
                text_sec: u32, address_size: u8, comp_dir: str, name: str, ft: *FileTable,
                b: *enc.ByteBuf, addr_off: *u32) {
     val len_pos: usize = b.len;
@@ -1547,9 +1620,9 @@ fun build_line(s: *debug_input.DebugProgram, funcs: *DwFunc, nfuncs: u32, rows: 
         var cur_file: i64 = -1;
         var first_row: bool = true;
 
-        var r: u32 = 0;
-        for (r < row_count) {
-            val row: *enc.LineRow = ?rows[r];
+        var r: u32 = row_start[f];
+        for (r < row_start[f + 1]) {
+            val row: *enc.LineRow = ?rows[row_items[r]];
             if (row.sec == text_sec && row.text_offset >= fn.offset && row.text_offset < fn.offset + fn.size) {
                 val pl: PosLine = pos_of(s, row.loc, ft);
                 if (pl.file::i64 != cur_file) {
@@ -1615,6 +1688,218 @@ fun emit_addr(b: *enc.ByteBuf, address_size: u8) {
     or                          { enc.emit_u32(b, 0); }
 }
 
+val FUNC_NONE: u32 = 0xFFFFFFFF;
+
+# one index per module: the text section's function symbols by offset (ties
+# by symbol index, the order the emitter's stable sort produced), so the
+# function holding a pc is a binary search, and the line rows, variable
+# locations and inline pcs grouped per function in their own order, so each
+# function walks its own spans rather than every span of the module. the
+# mir table maps a function name to its first mir function
+rec FuncIndex {
+    alloc:     *A.Allocator;
+    sec:       u32;
+    text_len:  u32;
+    count:     u32;
+    syms:      *u32;
+    offsets:   *u32;
+    row_start: *u32;
+    rows:      *u32;
+    row_total: u32;
+    var_start: *u32;
+    vars:      *u32;
+    var_total: u32;
+    pc_start:  *u32;
+    pcs:       *u32;
+    pc_total:  u32;
+    mir:       map.Map[u32, u32];
+}
+
+rec SymOrder {
+    offset: u32;
+    sym:    u32;
+}
+
+fun sym_order_cmp(a: *SymOrder, b: *SymOrder) i64 {
+    if (a.offset != b.offset) { ret (a.offset::i64) - (b.offset::i64); }
+    ret (a.sym::i64) - (b.sym::i64);
+}
+
+fun func_index_release(fi: *FuncIndex, arr: **u32, n: u32) {
+    if (@arr != nil && n > 0) { A.deallocate[u32](fi.alloc, @arr, n::usize); }
+    @arr = nil;
+}
+
+fun func_index_dnit(fi: *FuncIndex) {
+    map.dnit[u32, u32](?fi.mir);
+    func_index_release(fi, ?fi.pcs, fi.pc_total);
+    func_index_release(fi, ?fi.pc_start, fi.count + 1);
+    func_index_release(fi, ?fi.vars, fi.var_total);
+    func_index_release(fi, ?fi.var_start, fi.count + 1);
+    func_index_release(fi, ?fi.rows, fi.row_total);
+    func_index_release(fi, ?fi.row_start, fi.count + 1);
+    func_index_release(fi, ?fi.offsets, fi.count);
+    func_index_release(fi, ?fi.syms, fi.count);
+}
+
+fun func_index_init(fi: *FuncIndex, alloc: *A.Allocator, image: *of.ObjectImage, mirmod: *mir.MirModule, sec: u32) err[fail.Fail] {
+    fi.alloc     = alloc;
+    fi.sec       = sec;
+    fi.text_len  = image.sections[sec].len;
+    fi.count     = count_funcs(image, sec);
+    fi.syms      = nil;
+    fi.offsets   = nil;
+    fi.row_start = nil;
+    fi.rows      = nil;
+    fi.row_total = 0;
+    fi.var_start = nil;
+    fi.vars      = nil;
+    fi.var_total = 0;
+    fi.pc_start  = nil;
+    fi.pcs       = nil;
+    fi.pc_total  = 0;
+    fi.mir       = map.init[u32, u32](alloc, map.hash_u32, map.eq_u32);
+    if (mirmod != nil) {
+        var mi: u32 = 0;
+        for (mi < mirmod.function_len) {
+            val name: u32 = mirmod.functions[mi].name::u32;
+            if (!map.contains[u32, u32](?fi.mir, ?name)) {
+                val inserted: res[bool, A.Error] = map.insert[u32, u32](?fi.mir, name, mi);
+                if (sel inserted.err) { func_index_dnit(fi); ret err[fail.Fail].err{fail.refused(inserted.err)}; }
+            }
+            mi = mi + 1;
+        }
+    }
+    if (fi.count == 0) { ret err[fail.Fail].ok{}; }
+    val ro: res[*SymOrder, A.Error] = A.allocate[SymOrder](alloc, fi.count::usize);
+    if (sel ro.err) { func_index_dnit(fi); ret err[fail.Fail].err{fail.refused(ro.err)}; }
+    val order: *SymOrder = ro.ok;
+    fin { A.deallocate[SymOrder](alloc, order, fi.count::usize); }
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < image.symbol_count) {
+        val sym: *of.Symbol = ?image.symbols[i];
+        if ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0 && of.section_index(sym.section) == sec) {
+            order[n].offset = sym.offset;
+            order[n].sym    = i;
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    sort.sort[SymOrder](order, fi.count::usize, sym_order_cmp);
+    val rs: res[*u32, A.Error] = A.allocate[u32](alloc, fi.count::usize);
+    if (sel rs.err) { func_index_dnit(fi); ret err[fail.Fail].err{fail.refused(rs.err)}; }
+    fi.syms = rs.ok;
+    val rf: res[*u32, A.Error] = A.allocate[u32](alloc, fi.count::usize);
+    if (sel rf.err) { func_index_dnit(fi); ret err[fail.Fail].err{fail.refused(rf.err)}; }
+    fi.offsets = rf.ok;
+    i = 0;
+    for (i < fi.count) { fi.syms[i] = order[i].sym; fi.offsets[i] = order[i].offset; i = i + 1; }
+    ret err[fail.Fail].ok{};
+}
+
+# the position of the function whose span holds pc: the last function at
+# or before pc, when pc precedes the next function's offset (or the text
+# end); FUNC_NONE otherwise. equal offsets make the earlier functions empty
+fun func_index_holding(fi: *FuncIndex, sec: u32, pc: u32) u32 {
+    if (sec != fi.sec || fi.count == 0 || pc < fi.offsets[0]) { ret FUNC_NONE; }
+    var lo: u32 = 0;
+    var hi: u32 = fi.count;
+    for (hi - lo > 1) {
+        val mid: u32 = lo + (hi - lo) / 2;
+        if (fi.offsets[mid] <= pc) { lo = mid; } or { hi = mid; }
+    }
+    var end: u32 = fi.text_len;
+    if (lo + 1 < fi.count) { end = fi.offsets[lo + 1]; }
+    if (pc >= end) { ret FUNC_NONE; }
+    ret lo;
+}
+
+# the first symbol of an offset group, which is the one a symbol scan meets
+fun func_index_first_at(fi: *FuncIndex, pos: u32) u32 {
+    var p: u32 = pos;
+    for (p > 0 && fi.offsets[p - 1] == fi.offsets[p]) { p = p - 1; }
+    ret p;
+}
+
+fun func_index_mir(fi: *FuncIndex, mirmod: *mir.MirModule, name: intern.StrId) *mir.MirFunction {
+    val key: u32 = name::u32;
+    val found: opt[*u32] = map.get[u32, u32](?fi.mir, ?key);
+    if (sel found.none) { ret nil; }
+    ret ?mirmod.functions[@found.some];
+}
+
+# spans grouped by the function holding them, in their own order: two
+# passes, a count and a fill, over the caller's position function
+fun bucket_spans(fi: *FuncIndex, n: u32, ctx: ptr, position: fun(ptr, u32) u32,
+                 out_start: **u32, out_items: **u32, out_total: *u32) err[fail.Fail] {
+    val slots: u32 = fi.count + 1;
+    val rs: res[*u32, A.Error] = A.allocate[u32](fi.alloc, slots::usize);
+    if (sel rs.err) { ret err[fail.Fail].err{fail.refused(rs.err)}; }
+    val start: *u32 = rs.ok;
+    @out_start = start;
+    var z: u32 = 0;
+    for (z < slots) { start[z] = 0; z = z + 1; }
+    var i: u32 = 0;
+    for (i < n) {
+        val pos: u32 = position(ctx, i);
+        if (pos != FUNC_NONE) { start[pos + 1] = start[pos + 1] + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < fi.count) { start[i + 1] = start[i + 1] + start[i]; i = i + 1; }
+    val total: u32 = start[fi.count];
+    @out_total = total;
+    @out_items = nil;
+    if (total == 0) { ret err[fail.Fail].ok{}; }
+    val ri: res[*u32, A.Error] = A.allocate[u32](fi.alloc, total::usize);
+    if (sel ri.err) { ret err[fail.Fail].err{fail.refused(ri.err)}; }
+    val items: *u32 = ri.ok;
+    @out_items = items;
+    i = 0;
+    for (i < n) {
+        val pos: u32 = position(ctx, i);
+        if (pos != FUNC_NONE) { items[start[pos]] = i; start[pos] = start[pos] + 1; }
+        i = i + 1;
+    }
+    i = fi.count;
+    for (i > 0) { start[i] = start[i - 1]; i = i - 1; }
+    start[0] = 0;
+    ret err[fail.Fail].ok{};
+}
+
+rec RowSpans  { fi: *FuncIndex; rows: *enc.LineRow; }
+rec VarSpans  { fi: *FuncIndex; varlocs: *enc.VarLoc; }
+rec PcSpans   { fi: *FuncIndex; pcs: *enc.InlinePc; }
+
+fun row_position(ctx: ptr, i: u32) u32 {
+    val c: *RowSpans = ctx::*RowSpans;
+    ret func_index_holding(c.fi, c.rows[i].sec, c.rows[i].text_offset);
+}
+
+fun var_position(ctx: ptr, i: u32) u32 {
+    val c: *VarSpans = ctx::*VarSpans;
+    ret func_index_holding(c.fi, c.varlocs[i].sec, c.varlocs[i].text_offset);
+}
+
+fun pc_position(ctx: ptr, i: u32) u32 {
+    val c: *PcSpans = ctx::*PcSpans;
+    ret func_index_holding(c.fi, c.pcs[i].sec, c.pcs[i].text_offset);
+}
+
+fun func_index_spans(fi: *FuncIndex, rows: *enc.LineRow, row_count: u32,
+                     varlocs: *enc.VarLoc, varloc_count: u32,
+                     pcs: *enc.InlinePc, pc_count: u32) err[fail.Fail] {
+    var rc: RowSpans; rc.fi = fi; rc.rows = rows;
+    val r0: err[fail.Fail] = bucket_spans(fi, row_count, (?rc)::ptr, row_position, ?fi.row_start, ?fi.rows, ?fi.row_total);
+    if (sel r0.err) { ret r0; }
+    var vc: VarSpans; vc.fi = fi; vc.varlocs = varlocs;
+    val r1: err[fail.Fail] = bucket_spans(fi, varloc_count, (?vc)::ptr, var_position, ?fi.var_start, ?fi.vars, ?fi.var_total);
+    if (sel r1.err) { ret r1; }
+    var pc: PcSpans; pc.fi = fi; pc.pcs = pcs;
+    ret bucket_spans(fi, pc_count, (?pc)::ptr, pc_position, ?fi.pc_start, ?fi.pcs, ?fi.pc_total);
+}
+
 fun count_funcs(image: *of.ObjectImage, text_sec: u32) u32 {
     var n: u32 = 0;
     var i: u32 = 0;
@@ -1628,63 +1913,27 @@ fun count_funcs(image: *of.ObjectImage, text_sec: u32) u32 {
     ret n;
 }
 
-fun mir_omits_frame(mirmod: *mir.MirModule, name: intern.StrId) bool {
-    if (mirmod == nil) { ret false; }
-    var i: u32 = 0;
-    for (i < mirmod.function_len) {
-        if (mirmod.functions[i].name == name) { ret mirmod.functions[i].frame.omit; }
-        i = i + 1;
-    }
-    ret false;
-}
-
-fun mir_realigns_frame(mirmod: *mir.MirModule, name: intern.StrId) bool {
-    if (mirmod == nil) { ret false; }
-    var i: u32 = 0;
-    for (i < mirmod.function_len) {
-        if (mirmod.functions[i].name == name) { ret mirmod.functions[i].frame.realign != 0; }
-        i = i + 1;
-    }
-    ret false;
-}
-
-fun mir_is_naked(mirmod: *mir.MirModule, name: intern.StrId) bool {
-    if (mirmod == nil) { ret false; }
-    var i: u32 = 0;
-    for (i < mirmod.function_len) {
-        if (mirmod.functions[i].name == name) { ret mirmod.functions[i].naked; }
-        i = i + 1;
-    }
-    ret false;
-}
-
-fun gather_funcs(image: *of.ObjectImage, mirmod: *mir.MirModule, text_sec: u32, out: *DwFunc) {
+# the index already holds the function symbols in offset order
+fun gather_funcs(image: *of.ObjectImage, mirmod: *mir.MirModule, fi: *FuncIndex, out: *DwFunc) {
     var n: u32 = 0;
-    var i: u32 = 0;
-    for (i < image.symbol_count) {
-        val sym: *of.Symbol = ?image.symbols[i];
-        if ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0 && of.section_index(sym.section) == text_sec) {
-            out[n].name     = sym.name;
-            out[n].offset   = sym.offset;
-            out[n].external = (sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0;
-            out[n].weak     = (sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0;
-            out[n].omit     = mir_omits_frame(mirmod, sym.name);
-            out[n].realign  = mir_realigns_frame(mirmod, sym.name);
-            out[n].naked    = mir_is_naked(mirmod, sym.name);
-            n = n + 1;
+    for (n < fi.count) {
+        val sym: *of.Symbol = ?image.symbols[fi.syms[n]];
+        out[n].name     = sym.name;
+        out[n].offset   = sym.offset;
+        out[n].external = (sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0;
+        out[n].weak     = (sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0;
+        out[n].omit     = false;
+        out[n].realign  = false;
+        out[n].naked    = false;
+        if (mirmod != nil) {
+            val mf: *mir.MirFunction = func_index_mir(fi, mirmod, sym.name);
+            if (mf != nil) {
+                out[n].omit    = mf.frame.omit;
+                out[n].realign = mf.frame.realign != 0;
+                out[n].naked   = mf.naked;
+            }
         }
-        i = i + 1;
-    }
-    var a: u32 = 1;
-    for (a < n) {
-        val key: DwFunc = out[a];
-        var b: i64 = a::i64 - 1;
-        for (b >= 0 && out[b::u32].offset > key.offset) {
-            out[(b + 1)::u32] = out[b::u32];
-            b = b - 1;
-        }
-        out[(b + 1)::u32] = key;
-        a = a + 1;
+        n = n + 1;
     }
 }
 
@@ -1706,13 +1955,35 @@ fun intern_anchor(itn: *intern.Interner, base: str, suffix: str) res[intern.StrI
     ret res[intern.StrId, fail.Fail].ok{ri.ok};
 }
 
-fun add_reloc(image: *of.ObjectImage, sec: u32, offset: u32, kind: of.RelocKind, sym: intern.StrId) err[fail.Fail] {
-    ret add_reloc_addend(image, sec, offset, kind, sym, 0);
+# the image's first symbol per name, built once after the debug anchors are
+# added so each relocation asks a map rather than a symbol scan
+fun index_symbol_names(image: *of.ObjectImage, alloc: *A.Allocator) res[map.Map[u32, u32], fail.Fail] {
+    var names: map.Map[u32, u32] = map.init[u32, u32](alloc, map.hash_u32, map.eq_u32);
+    var i: u32 = 0;
+    for (i < image.symbol_count) {
+        val name: u32 = image.symbols[i].name::u32;
+        if (name != intern.STR_NIL::u32 && !map.contains[u32, u32](?names, ?name)) {
+            val inserted: res[bool, A.Error] = map.insert[u32, u32](?names, name, i);
+            if (sel inserted.err) {
+                map.dnit[u32, u32](?names);
+                ret res[map.Map[u32, u32], fail.Fail].err{fail.refused(inserted.err)};
+            }
+        }
+        i = i + 1;
+    }
+    ret res[map.Map[u32, u32], fail.Fail].ok{names};
 }
 
-fun add_reloc_addend(image: *of.ObjectImage, sec: u32, offset: u32, kind: of.RelocKind,
+fun add_reloc(image: *of.ObjectImage, names: *map.Map[u32, u32], sec: u32, offset: u32, kind: of.RelocKind, sym: intern.StrId) err[fail.Fail] {
+    ret add_reloc_addend(image, names, sec, offset, kind, sym, 0);
+}
+
+fun add_reloc_addend(image: *of.ObjectImage, names: *map.Map[u32, u32], sec: u32, offset: u32, kind: of.RelocKind,
                      sym: intern.StrId, addend: i64) err[fail.Fail] {
-    val sym_ix: u32 = obj.symbol_index(image, sym);
+    var sym_ix: u32 = of.SYMBOL_NONE;
+    val key: u32 = sym::u32;
+    val found: opt[*u32] = map.get[u32, u32](names, ?key);
+    if (sel found.some) { sym_ix = @found.some; }
     if (sym_ix == of.SYMBOL_NONE) {
         ret err[fail.Fail].err{fail.message("dwarf: relocation target absent from the image symbol table")};
     }
@@ -1727,25 +1998,10 @@ fun add_reloc_addend(image: *of.ObjectImage, sec: u32, offset: u32, kind: of.Rel
     ret obj.add_relocation(image, rel);
 }
 
-fun ir_function_at(image: *of.ObjectImage, irmod: *ir.Module, sec: u32, pc: u32) *ir.Function {
-    var best: *of.Symbol = nil;
-    var end: u32 = image.sections[sec].len;
-    var i: u32 = 0;
-    for (i < image.symbol_count) {
-        val sym: *of.Symbol = ?image.symbols[i];
-        if ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0 && of.section_index(sym.section) == sec
-            && sym.offset <= pc && (best == nil || sym.offset > best.offset)) { best = sym; }
-        i = i + 1;
-    }
-    if (best == nil) { ret nil; }
-    i = 0;
-    for (i < image.symbol_count) {
-        val next: *of.Symbol = ?image.symbols[i];
-        if ((next.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0 && of.section_index(next.section) == sec
-            && next.offset > best.offset && next.offset < end) { end = next.offset; }
-        i = i + 1;
-    }
-    if (pc >= end) { ret nil; }
+fun ir_function_at(fi: *FuncIndex, image: *of.ObjectImage, irmod: *ir.Module, sec: u32, pc: u32) *ir.Function {
+    val pos: u32 = func_index_holding(fi, sec, pc);
+    if (pos == FUNC_NONE) { ret nil; }
+    val best: *of.Symbol = ?image.symbols[fi.syms[func_index_first_at(fi, pos)]];
     val found: opt[u32] = ir.function_lookup(irmod, best.name);
     if (sel found.none) { ret nil; }
     ret ?irmod.functions[found.some];
@@ -1761,7 +2017,7 @@ fun inline_tree_valid(fn: *ir.Function) bool {
     ret true;
 }
 
-fun validate_request(req: *of.DebugProduceRequest) err[fail.Fail] {
+fun validate_shape(req: *of.DebugProduceRequest) err[fail.Fail] {
     if (req == nil) { ret err[fail.Fail].err{fail.message("dwarf.produce: nil request")}; }
     if (req.image == nil) { ret err[fail.Fail].err{fail.message("dwarf.produce: nil object image")}; }
     val s: *debug_input.DebugProgram = ?req.program;
@@ -1815,6 +2071,15 @@ fun validate_request(req: *of.DebugProduceRequest) err[fail.Fail] {
         }
         row_i = row_i + 1;
     }
+    ret err[fail.Fail].ok{};
+}
+
+# the checks that need the function index: inline pcs and variable
+# locations against the function holding them
+fun validate_spans(req: *of.DebugProduceRequest, fi: *FuncIndex) err[fail.Fail] {
+    val s: *debug_input.DebugProgram = ?req.program;
+    val image: *of.ObjectImage = req.image;
+    val text_len: u32 = image.sections[req.text_section].len;
     var inline_i: u32 = 0;
     for (inline_i < req.inline_pc_count) {
         val pc: *enc.InlinePc = ?req.inline_pcs[inline_i];
@@ -1824,7 +2089,7 @@ fun validate_request(req: *of.DebugProduceRequest) err[fail.Fail] {
         if (inline_i > 0 && req.inline_pcs[inline_i - 1].text_offset > pc.text_offset) {
             ret err[fail.Fail].err{fail.message("dwarf.produce: inline PCs are not monotonic within a section")};
         }
-        val fn: *ir.Function = ir_function_at(image, s.ir_module, pc.sec, pc.text_offset);
+        val fn: *ir.Function = ir_function_at(fi, image, s.ir_module, pc.sec, pc.text_offset);
         if (!inline_tree_valid(fn) || (pc.inline_site != 0 && pc.inline_site > fn.inline_site_len)) {
             ret err[fail.Fail].err{fail.message("dwarf.produce: inline PC refers to an invalid inline site")};
         }
@@ -1838,12 +2103,12 @@ fun validate_request(req: *of.DebugProduceRequest) err[fail.Fail] {
                 && (loc.end_offset < loc.text_offset || loc.end_offset > text_len))) {
             ret err[fail.Fail].err{fail.message("dwarf.produce: variable location range lies outside the selected text section")};
         }
-        val fn: *ir.Function = ir_function_at(image, s.ir_module, loc.sec, loc.text_offset);
+        val fn: *ir.Function = ir_function_at(fi, image, s.ir_module, loc.sec, loc.text_offset);
         if (fn == nil || loc.iid >= fn.instr_len) {
             ret err[fail.Fail].err{fail.message("dwarf.produce: variable location refers to an invalid instruction")};
         }
         if (loc.end_offset != 0) {
-            val end_fn: *ir.Function = ir_function_at(image, s.ir_module, loc.sec, loc.end_offset - 1);
+            val end_fn: *ir.Function = ir_function_at(fi, image, s.ir_module, loc.sec, loc.end_offset - 1);
             if (end_fn != fn) {
                 ret err[fail.Fail].err{fail.message("dwarf.produce: variable location crosses a function boundary")};
             }
@@ -1853,11 +2118,30 @@ fun validate_request(req: *of.DebugProduceRequest) err[fail.Fail] {
     ret err[fail.Fail].ok{};
 }
 
+fun validate_request(req: *of.DebugProduceRequest) err[fail.Fail] {
+    val shaped: err[fail.Fail] = validate_shape(req);
+    if (sel shaped.err) { ret shaped; }
+    val s: *debug_input.DebugProgram = ?req.program;
+    var fi: FuncIndex;
+    val indexed: err[fail.Fail] = func_index_init(?fi, s.alloc, req.image, nil, req.text_section);
+    if (sel indexed.err) { ret indexed; }
+    fin { func_index_dnit(?fi); }
+    ret validate_spans(req, ?fi);
+}
+
 pub fun produce_debug(req: *of.DebugProduceRequest) err[fail.Fail] {
-    val valid: err[fail.Fail] = validate_request(req);
-    if (sel valid.err) { ret valid; }
+    val shaped: err[fail.Fail] = validate_shape(req);
+    if (sel shaped.err) { ret shaped; }
     val s: *debug_input.DebugProgram = ?req.program;
     val image: *of.ObjectImage = req.image;
+    var fi: FuncIndex;
+    val indexed: err[fail.Fail] = func_index_init(?fi, s.alloc, image, s.mir_module, req.text_section);
+    if (sel indexed.err) { ret indexed; }
+    fin { func_index_dnit(?fi); }
+    val valid: err[fail.Fail] = validate_spans(req, ?fi);
+    if (sel valid.err) { ret valid; }
+    val spanned: err[fail.Fail] = func_index_spans(?fi, req.rows, req.row_count, req.varlocs, req.varloc_count, req.inline_pcs, req.inline_pc_count);
+    if (sel spanned.err) { ret spanned; }
     val irmod: *ir.Module = s.ir_module;
     val mirmod: *mir.MirModule = s.mir_module;
     val rows: *enc.LineRow = req.rows;
@@ -1869,7 +2153,7 @@ pub fun produce_debug(req: *of.DebugProduceRequest) err[fail.Fail] {
     val producer_id: intern.StrId = req.producer;
     val comp_dir_id: intern.StrId = req.comp_dir;
     val text_sec: u32 = req.text_section;
-    val nfuncs: u32 = count_funcs(image, text_sec);
+    val nfuncs: u32 = fi.count;
     if (nfuncs == 0) { ret err[fail.Fail].ok{}; }
 
     val fb_reg:      i32 = frame_base_reg(s);
@@ -1889,7 +2173,7 @@ pub fun produce_debug(req: *of.DebugProduceRequest) err[fail.Fail] {
     val rf: res[*DwFunc, A.Error] = A.allocate[DwFunc](s.alloc, nfuncs::usize);
     if (sel rf.err) { ret err[fail.Fail].err{fail.refused(rf.err)}; }
     val funcs: *DwFunc = rf.ok;
-    gather_funcs(image, mirmod, text_sec, funcs);
+    gather_funcs(image, mirmod, ?fi, funcs);
 
     val text_len: u32 = image.sections[text_sec].len;
     var fi0: u32 = 0;
@@ -1942,20 +2226,19 @@ pub fun produce_debug(req: *of.DebugProduceRequest) err[fail.Fail] {
     val ranges: *LocRange = rgr.ok;
 
     var tc: TypeCtx = type_ctx_init(s.alloc);
-    var strtab: StrTab;
-    strtab.buf = enc.buf_init(s.alloc);
+    var strtab: StrTab = strtab_init(s.alloc);
     var var_count: u32 = 0;
     var range_count: u32 = 0;
 
     var dtypes: ir_type.IrTypeTable;
     val rdt: err[fail.Fail] = ir_type.init(?dtypes, s.alloc);
     if (sel rdt.err) {
-        enc.buf_dnit(?strtab.buf); type_ctx_dnit(?tc);
+        strtab_dnit(?strtab); type_ctx_dnit(?tc);
         A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
         A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
         ret err[fail.Fail].err{rdt.err};
     }
-    gather_subprograms(s, irmod, subs, nsub, rows, row_count, varlocs, varloc_count, text_sec, ?ft, address_size,
+    gather_subprograms(s, irmod, ?fi, subs, nsub, rows, varlocs, text_sec, ?ft, address_size,
                        ?tc, ?strtab, ?dtypes, vars, ?var_count, var_cap, ranges, ?range_count, range_cap);
     ir_type.dnit(?dtypes);
 
@@ -1965,7 +2248,7 @@ pub fun produce_debug(req: *of.DebugProduceRequest) err[fail.Fail] {
 
     val ra: res[*u32, A.Error] = A.allocate[u32](s.alloc, nfuncs::usize);
     if (sel ra.err) {
-        enc.buf_dnit(?strtab.buf); type_ctx_dnit(?tc);
+        strtab_dnit(?strtab); type_ctx_dnit(?tc);
         A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
         A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
         ret err[fail.Fail].err{fail.refused(ra.err)};
@@ -1975,7 +2258,7 @@ pub fun produce_debug(req: *of.DebugProduceRequest) err[fail.Fail] {
     val reloc_cap: u32 = 2 + 2 * nsub + tc.ntypes + tc.nmemb + 2 * var_count + 2 * tot_sites;
     val rr2: res[*InfoReloc, A.Error] = A.allocate[InfoReloc](s.alloc, reloc_cap::usize);
     if (sel rr2.err) {
-        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); enc.buf_dnit(?strtab.buf);
+        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); strtab_dnit(?strtab);
         type_ctx_dnit(?tc);
         A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
         A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
@@ -1988,7 +2271,7 @@ pub fun produce_debug(req: *of.DebugProduceRequest) err[fail.Fail] {
     val rlr: res[*LocReloc, A.Error] = A.allocate[LocReloc](s.alloc, loc_reloc_cap::usize);
     if (sel rlr.err) {
         A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
-        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); enc.buf_dnit(?strtab.buf);
+        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); strtab_dnit(?strtab);
         type_ctx_dnit(?tc);
         A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
         A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
@@ -2009,7 +2292,7 @@ pub fun produce_debug(req: *of.DebugProduceRequest) err[fail.Fail] {
     if (ir_cap == 0) { ir_cap = 1; }
     val rinl: res[*DwInline, A.Error] = A.allocate[DwInline](s.alloc, inl_cap::usize);
     if (sel rinl.err) {
-        enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); enc.buf_dnit(?strtab.buf);
+        enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); strtab_dnit(?strtab);
         A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize); A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
         A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); type_ctx_dnit(?tc);
         A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
@@ -2020,7 +2303,7 @@ pub fun produce_debug(req: *of.DebugProduceRequest) err[fail.Fail] {
     val rirng: res[*DwInlineRange, A.Error] = A.allocate[DwInlineRange](s.alloc, ir_cap::usize);
     if (sel rirng.err) {
         A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
-        enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); enc.buf_dnit(?strtab.buf);
+        enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); strtab_dnit(?strtab);
         A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize); A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
         A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); type_ctx_dnit(?tc);
         A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
@@ -2030,10 +2313,10 @@ pub fun produce_debug(req: *of.DebugProduceRequest) err[fail.Fail] {
     val iranges: *DwInlineRange = rirng.ok;
     var ninl: u32 = 0;
     var nir:  u32 = 0;
-    val rgi: err[fail.Fail] = gather_inlines(s, irmod, subs, nsub, inline_pcs, inline_pc_count, text_sec, ?ft, inlines, ?ninl, inl_cap, iranges, ?nir, ir_cap);
+    val rgi: err[fail.Fail] = gather_inlines(s, irmod, ?fi, subs, nsub, inline_pcs, text_sec, ?ft, inlines, ?ninl, inl_cap, iranges, ?nir, ir_cap);
     if (sel rgi.err) {
         A.deallocate[DwInlineRange](s.alloc, iranges, ir_cap::usize); A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
-        enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); enc.buf_dnit(?strtab.buf);
+        enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); strtab_dnit(?strtab);
         A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize); A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
         A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); type_ctx_dnit(?tc);
         A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
@@ -2046,7 +2329,7 @@ pub fun produce_debug(req: *of.DebugProduceRequest) err[fail.Fail] {
     val rrr: res[*RngReloc, A.Error] = A.allocate[RngReloc](s.alloc, rng_reloc_cap::usize);
     if (sel rrr.err) {
         A.deallocate[DwInlineRange](s.alloc, iranges, ir_cap::usize); A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
-        enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); enc.buf_dnit(?strtab.buf);
+        enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); strtab_dnit(?strtab);
         A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize); A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
         A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); type_ctx_dnit(?tc);
         A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
@@ -2061,7 +2344,7 @@ pub fun produce_debug(req: *of.DebugProduceRequest) err[fail.Fail] {
     if (sel rfx.err) {
         A.deallocate[RngReloc](s.alloc, rng_relocs, rng_reloc_cap::usize);
         A.deallocate[DwInlineRange](s.alloc, iranges, ir_cap::usize); A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
-        enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); enc.buf_dnit(?strtab.buf);
+        enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); strtab_dnit(?strtab);
         A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize); A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
         A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); type_ctx_dnit(?tc);
         A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
@@ -2071,7 +2354,7 @@ pub fun produce_debug(req: *of.DebugProduceRequest) err[fail.Fail] {
     val type_fixups: *TypeFixup = rfx.ok;
 
     build_abbrev(?b_abbrev);
-    build_line(s, funcs, nfuncs, rows, row_count, text_sec, address_size, comp_dir, name, ?ft, ?b_line, addr_off);
+    build_line(s, funcs, nfuncs, rows, fi.row_start, fi.rows, text_sec, address_size, comp_dir, name, ?ft, ?b_line, addr_off);
     if (has_loclists) {
         build_loclists(?b_loclists, subs, nsub, vars, ranges, address_size, loc_relocs, ?loc_reloc_count, loc_reloc_cap);
     }
@@ -2094,7 +2377,7 @@ pub fun produce_debug(req: *of.DebugProduceRequest) err[fail.Fail] {
     enc.buf_dnit(?b_info);
     enc.buf_dnit(?b_loclists);
     enc.buf_dnit(?b_rnglists);
-    enc.buf_dnit(?strtab.buf);
+    strtab_dnit(?strtab);
     A.deallocate[TypeFixup](s.alloc, type_fixups, fixup_cap::usize);
     A.deallocate[DwInlineRange](s.alloc, iranges, ir_cap::usize);
     A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
@@ -2124,9 +2407,9 @@ pub fun debug_descriptor() of.DebugVTable {
     ret descriptor;
 }
 
-fun gather_subprograms(s: *debug_input.DebugProgram, irmod: *ir.Module,
-                       funcs: *DwFunc, nfuncs: u32, rows: *enc.LineRow, row_count: u32,
-                       varlocs: *enc.VarLoc, varloc_count: u32, text_sec: u32,
+fun gather_subprograms(s: *debug_input.DebugProgram, irmod: *ir.Module, fi: *FuncIndex,
+                       funcs: *DwFunc, nfuncs: u32, rows: *enc.LineRow,
+                       varlocs: *enc.VarLoc, text_sec: u32,
                        ft: *FileTable, address_size: u8, tc: *TypeCtx, strtab: *StrTab,
                        dtypes: *ir_type.IrTypeTable,
                        vars: *DwVar, var_count: *u32, var_cap: u32,
@@ -2154,7 +2437,7 @@ fun gather_subprograms(s: *debug_input.DebugProgram, irmod: *ir.Module,
         if (fn.disp == intern.STR_NIL) { nm = resolve(s.interner, fn.name); }
         fn.disp_off = str_off(strtab, nm);
 
-        val first: opt[source.SrcLoc] = first_row_loc(rows, row_count, text_sec, fn.offset, fn.offset + fn.size);
+        val first: opt[source.SrcLoc] = first_row_loc(rows, ?fi.rows[fi.row_start[i]], fi.row_start[i + 1] - fi.row_start[i], text_sec, fn.offset, fn.offset + fn.size);
         if (sel first.some) {
             val pl: PosLine = pos_of(s, first.some, ft);
             fn.decl_file = pl.file;
@@ -2164,7 +2447,8 @@ fun gather_subprograms(s: *debug_input.DebugProgram, irmod: *ir.Module,
         fn.ret_ty = type_intern(s, dtypes, tc, strtab, ret_sem, address_size);
 
         if (irfn != nil) {
-            gather_vars(s, irmod, dtypes, irfn, fn.offset, fn.offset + fn.size, varlocs, varloc_count, text_sec,
+            gather_vars(s, irmod, dtypes, irfn, fn.offset, fn.offset + fn.size, varlocs,
+                        ?fi.vars[fi.var_start[i]], fi.var_start[i + 1] - fi.var_start[i], text_sec,
                         address_size, tc, strtab, vars, var_count, var_cap, ranges, range_count, range_cap);
             fn.var_count = @var_count - fn.var_start;
         }
@@ -2203,8 +2487,8 @@ fun inline_caps(irmod: *ir.Module, funcs: *DwFunc, nfuncs: u32, total: *u32, max
     }
 }
 
-fun gather_inlines(s: *debug_input.DebugProgram, irmod: *ir.Module, funcs: *DwFunc, nfuncs: u32,
-                   inline_pcs: *enc.InlinePc, inline_pc_count: u32, text_sec: u32, ft: *FileTable,
+fun gather_inlines(s: *debug_input.DebugProgram, irmod: *ir.Module, fi: *FuncIndex, funcs: *DwFunc, nfuncs: u32,
+                   inline_pcs: *enc.InlinePc, text_sec: u32, ft: *FileTable,
                    out: *DwInline, ninl: *u32, inl_cap: u32,
                    iranges: *DwInlineRange, nir: *u32, ir_cap: u32) err[fail.Fail] {
     var i: u32 = 0;
@@ -2240,14 +2524,13 @@ fun gather_inlines(s: *debug_input.DebugProgram, irmod: *ir.Module, funcs: *DwFu
                 di.call_line = funcs[i].decl_line;
             }
 
-            var j: u32 = 0;
-            for (j < inline_pc_count) {
+            var pj: u32 = fi.pc_start[i];
+            for (pj < fi.pc_start[i + 1]) {
+                val j: u32 = fi.pcs[pj];
                 val o: u32 = inline_pcs[j].text_offset;
                 if (inline_pcs[j].sec == text_sec && o >= lo && o < hi && inline_ancestor_or_self(irfn, k, inline_pcs[j].inline_site)) {
                     var seg_end: u32 = hi;
-                    var jn: u32 = j + 1;
-                    for (jn < inline_pc_count && inline_pcs[jn].sec != text_sec) { jn = jn + 1; }
-                    if (jn < inline_pc_count && inline_pcs[jn].text_offset < hi) { seg_end = inline_pcs[jn].text_offset; }
+                    if (pj + 1 < fi.pc_start[i + 1] && inline_pcs[fi.pcs[pj + 1]].text_offset < hi) { seg_end = inline_pcs[fi.pcs[pj + 1]].text_offset; }
                     if (o < seg_end) {
                         if (@nir >= ir_cap) { ret err[fail.Fail].err{fail.message("dwarf.gather_inlines: inline-range capacity exceeded")}; }
                         iranges[@nir].start = o;
@@ -2256,7 +2539,7 @@ fun gather_inlines(s: *debug_input.DebugProgram, irmod: *ir.Module, funcs: *DwFu
                         di.range_count = di.range_count + 1;
                     }
                 }
-                j = j + 1;
+                pj = pj + 1;
             }
 
             if (di.range_count > 0) { @ninl = @ninl + 1; }
@@ -2267,15 +2550,16 @@ fun gather_inlines(s: *debug_input.DebugProgram, irmod: *ir.Module, funcs: *DwFu
     ret err[fail.Fail].ok{};
 }
 
+# var_items lists the function's variable locations in varloc order (FuncIndex)
 fun gather_vars(s: *debug_input.DebugProgram, irmod: *ir.Module, dtypes: *ir_type.IrTypeTable, irfn: *ir.Function, lo: u32, hi: u32,
-                varlocs: *enc.VarLoc, varloc_count: u32, text_sec: u32, address_size: u8,
+                varlocs: *enc.VarLoc, var_items: *u32, var_item_count: u32, text_sec: u32, address_size: u8,
                 tc: *TypeCtx, strtab: *StrTab, vars: *DwVar, var_count: *u32, var_cap: u32,
                 ranges: *LocRange, range_count: *u32, range_cap: u32) {
     val fn_var_start: u32 = @var_count;
 
     var i: u32 = 0;
-    for (i < varloc_count) {
-        val vl: *enc.VarLoc = ?varlocs[i];
+    for (i < var_item_count) {
+        val vl: *enc.VarLoc = ?varlocs[var_items[i]];
         if (vl.sec != text_sec || vl.text_offset < lo || vl.text_offset >= hi) { i = i + 1; cnt; }
         val obt: opt[u32] = varloc_ident(s, irmod, dtypes, irfn, vl, address_size, tc, strtab);
         if (sel obt.none) { i = i + 1; cnt; }
@@ -2313,8 +2597,8 @@ fun gather_vars(s: *debug_input.DebugProgram, irmod: *ir.Module, dtypes: *ir_typ
         val v: *DwVar = ?vars[vi];
         v.range_start = @range_count;
         var k: u32 = 0;
-        for (k < varloc_count) {
-            val vl: *enc.VarLoc = ?varlocs[k];
+        for (k < var_item_count) {
+            val vl: *enc.VarLoc = ?varlocs[var_items[k]];
             if (vl.sec != text_sec || vl.text_offset < lo || vl.text_offset >= hi) { k = k + 1; cnt; }
             if (@range_count >= range_cap) { k = k + 1; cnt; }
             val oid: opt[u32] = varloc_ident(s, irmod, dtypes, irfn, vl, address_size, tc, strtab);
@@ -2695,13 +2979,14 @@ fun ptr_base_type(address_size: u8) TypeDie {
     ret bt;
 }
 
-fun first_row_loc(rows: *enc.LineRow, row_count: u32, text_sec: u32, start: u32, end: u32) opt[source.SrcLoc] {
+# row_items lists the function's rows in row order (FuncIndex)
+fun first_row_loc(rows: *enc.LineRow, row_items: *u32, row_item_count: u32, text_sec: u32, start: u32, end: u32) opt[source.SrcLoc] {
     var found: bool = false;
     var best_off: u32 = 0;
     var best_loc: source.SrcLoc;
     var r: u32 = 0;
-    for (r < row_count) {
-        val row: *enc.LineRow = ?rows[r];
+    for (r < row_item_count) {
+        val row: *enc.LineRow = ?rows[row_items[r]];
         if (row.sec == text_sec && row.text_offset >= start && row.text_offset < end && source.loc_is_valid(row.loc)) {
             if (!found || row.text_offset < best_off) {
                 found = true; best_off = row.text_offset; best_loc = row.loc;
@@ -2784,7 +3069,12 @@ fun install_into(s: *debug_input.DebugProgram, image: *of.ObjectImage, itn: *int
         if (sel rlar.err) { ret err[fail.Fail].err{rlar.err}; }
     }
 
-    val r2: err[fail.Fail] = add_reloc(image, info_sec, stmt_off, of.RK_ABS32, anchor);
+    val names_r: res[map.Map[u32, u32], fail.Fail] = index_symbol_names(image, s.alloc);
+    if (sel names_r.err) { ret err[fail.Fail].err{names_r.err}; }
+    var names: map.Map[u32, u32] = names_r.ok;
+    fin { map.dnit[u32, u32](?names); }
+
+    val r2: err[fail.Fail] = add_reloc(image, ?names, info_sec, stmt_off, of.RK_ABS32, anchor);
     if (sel r2.err) { ret r2; }
 
     var k: u32 = 0;
@@ -2794,7 +3084,7 @@ fun install_into(s: *debug_input.DebugProgram, image: *of.ObjectImage, itn: *int
         if (ir2.target == IRLT_STR)     { sym = str_anchor; }
         or (ir2.target == IRLT_LOCLIST) { sym = loclists_anchor; }
         or (ir2.target == IRLT_RNGLIST) { sym = rnglists_anchor; }
-        val rk: err[fail.Fail] = add_reloc_addend(image, info_sec, ir2.off, ir2.kind, sym, ir2.addend);
+        val rk: err[fail.Fail] = add_reloc_addend(image, ?names, info_sec, ir2.off, ir2.kind, sym, ir2.addend);
         if (sel rk.err) { ret rk; }
         k = k + 1;
     }
@@ -2802,7 +3092,7 @@ fun install_into(s: *debug_input.DebugProgram, image: *of.ObjectImage, itn: *int
     var li: u32 = 0;
     for (li < loc_reloc_count) {
         val lr: *LocReloc = ?loc_relocs[li];
-        val rlrx: err[fail.Fail] = add_reloc(image, loclists_sec, lr.off, addr_kind, lr.sym);
+        val rlrx: err[fail.Fail] = add_reloc(image, ?names, loclists_sec, lr.off, addr_kind, lr.sym);
         if (sel rlrx.err) { ret rlrx; }
         li = li + 1;
     }
@@ -2810,14 +3100,14 @@ fun install_into(s: *debug_input.DebugProgram, image: *of.ObjectImage, itn: *int
     var ri3: u32 = 0;
     for (ri3 < rng_reloc_count) {
         val rr3: *RngReloc = ?rng_relocs[ri3];
-        val rrx: err[fail.Fail] = add_reloc(image, rnglists_sec, rr3.off, addr_kind, rr3.sym);
+        val rrx: err[fail.Fail] = add_reloc(image, ?names, rnglists_sec, rr3.off, addr_kind, rr3.sym);
         if (sel rrx.err) { ret rrx; }
         ri3 = ri3 + 1;
     }
 
     var i: u32 = 0;
     for (i < nfuncs) {
-        val rr: err[fail.Fail] = add_reloc(image, line_sec, addr_off[i], addr_kind, funcs[i].name);
+        val rr: err[fail.Fail] = add_reloc(image, ?names, line_sec, addr_off[i], addr_kind, funcs[i].name);
         if (sel rr.err) { ret rr; }
         i = i + 1;
     }
@@ -3622,7 +3912,9 @@ test "mach.lang.be.codegen.dwarf.build_line:prologue_end_and_entry_row" {
     var ft: FileTable; ft.count = 0;
     var b: enc.ByteBuf = enc.buf_init(?alloc);
     var addr_off: [1]u32; addr_off[0] = 0;
-    build_line(?program, ?fn, 1, ?row, 1, 0, 8, "/", "/", ?ft, ?b, ?addr_off[0]);
+    var row_start: [2]u32; row_start[0] = 0; row_start[1] = 1;
+    var row_items: [1]u32; row_items[0] = 0;
+    build_line(?program, ?fn, 1, ?row, ?row_start[0], ?row_items[0], 0, 8, "/", "/", ?ft, ?b, ?addr_off[0]);
 
     var pe: u32 = 0;
     var i: usize = (addr_off[0] + 8)::usize;
@@ -3658,7 +3950,9 @@ test "mach.lang.be.codegen.dwarf.build_line:file_table_declares_slot_one" {
 
     var b: enc.ByteBuf = enc.buf_init(?alloc);
     var addr_off: [1]u32; addr_off[0] = 0;
-    build_line(?program, ?fn, 1, ?row, 1, 0, 8, "/", "/", ?ft, ?b, ?addr_off[0]);
+    var row_start: [2]u32; row_start[0] = 0; row_start[1] = 1;
+    var row_items: [1]u32; row_items[0] = 0;
+    build_line(?program, ?fn, 1, ?row, ?row_start[0], ?row_items[0], 0, 8, "/", "/", ?ft, ?b, ?addr_off[0]);
 
     val fc: usize = 30 + 1 + 2 + 1 + 2 + 1 + 4;
     if (b.data[fc] != 2) { code = 1; }
@@ -3676,8 +3970,7 @@ test "mach.lang.be.codegen.dwarf.str_off:dedup" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var code: i32 = 0;
-    var st: StrTab;
-    st.buf = enc.buf_init(?alloc);
+    var st: StrTab = strtab_init(?alloc);
 
     val a0: u32 = str_off(?st, "i32");
     val b0: u32 = str_off(?st, "u32");
@@ -3686,8 +3979,18 @@ test "mach.lang.be.codegen.dwarf.str_off:dedup" {
     if (b0 != 4) { code = 1; }
     if (a1 != a0) { code = 1; }
     if (st.buf.len != 8::usize) { code = 1; }
+    var extra: u32 = 0;
+    for (extra < 200) {
+        val rs: res[str, format.FormatError] = format.sprint(?alloc, "name{}", extra);
+        if (sel rs.err) { code = 1; brk; }
+        val first: u32 = str_off(?st, rs.ok);
+        if (str_off(?st, rs.ok) != first || str_off(?st, "i32") != a0) { code = 1; }
+        A.deallocate[u8](?alloc, rs.ok, str_len(rs.ok) + 1);
+        extra = extra + 1;
+    }
+    if (st.len != 202 || st.buf.failed) { code = 1; }
 
-    enc.buf_dnit(?st.buf);
+    strtab_dnit(?st);
     ret code;
 }
 
