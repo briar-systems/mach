@@ -468,3 +468,215 @@ Link leg x86_64-linux 140 pass, 0 fail, 0 skip, including `debuginfo`
 (`g_additive=yes`) and the six `readobj` cases, whose goldens now record
 `build-id len=<n> content-derived=yes` from an independent recomputation.
 Corpus layer B on x86_64-linux 102 pass, 0 fail, 0 skip.
+
+# Phase 2b: restore before lowering, bounded eviction, the default
+
+Status: closes the phase-1 list except the artifact-identity item, which is
+recorded below as the condition for flipping the default. The phase-1 warm hit
+still lowered, optimized and verified every module and skipped only the object
+compile; after this phase a module whose object the store holds skips lower,
+optimize and codegen, and the warm build is the front end plus the restores.
+
+## Ask the store before lowering
+
+The object key is the cell snapshot plus the module name, and neither depends
+on the lowered or optimized IR, so the decision can be taken as soon as the
+typed definitions are current. The lower pass now prepares the cache first
+(`passes.prepare_persistent_cache`, moved from the codegen pass), asks the store
+for every emitted module (`restore_before_lowering`), and lowers only the
+modules that missed. The codegen pass finds the restored image staged on the
+module and publishes it as the module's `Q_CODEGEN` product without touching
+`Q_LOWER`.
+
+**Product ownership** (`doc/design/query-semantic-results.md`) holds as
+follows. A restored product is published by the same `Q_CODEGEN` compute that
+publishes a generated one, so the database owns it through the same finalizer
+and the link fingerprint reads the same revision. Its edges are recorded by
+reading, as the contract requires: the module's typed definition, `Q_TARGET`
+and `Q_CODEGEN_FLAGS` (the edges a generated product carries directly) plus
+`Q_CELL_SNAPSHOT`, a derived query whose compute reads every typed definition
+in the cell, `Q_TARGET` and `Q_CODEGEN_FLAGS` and whose bytes are the cell
+digest. The snapshot query is the persistent key's in-process image: any
+edit the key would miss across processes advances it in process, so the
+restored product recomputes, asks the store under the new key, misses, and is
+generated. A generated product keeps its exact `Q_LOWER` edges; the cell edge
+is coarser than those (an edit anywhere in the cell recomputes every restored
+product), which is exactly the coarseness of the key. The snapshot query also
+means an unchanged cell is not rehashed by the codegen operation after the
+lower operation computed it: the database validates its edges and serves the
+digest. `Q_CODEGEN_FLAGS` is now set from the lower pass on, and `Q_CODEGEN` is
+registered there too, because the early restore first asks whether the session
+still holds a codegen product for the module and restores nothing it does.
+
+**Staging across operations.** The lower and codegen phases are separate
+query operations. A restored image and its facts stay staged on the module
+across them, tagged with the snapshot they were read under (`cache_under`);
+the next preparation discards any staged product whose snapshot differs and
+forgets its verdict, so the store is asked again under the new key. An image a
+codegen worker staged (`run_codegen_parallel`) is fresh and leaves with its
+operation as before. `dnit_project` releases whatever is left. The hit and
+miss counters span the project rather than one operation.
+
+**What the engine read from lowered IR.** Two things: the scalarization note
+(`vector_ops_scalarized`, summed over modules after lowering) and the test
+scope (the `FN_FLAG_TEST` functions with their linkage name, label and line,
+collected in module order). Both are facts of the module, not of the
+operation, so the entry carries them: the format is now `MCH2`, the image
+followed by the scalarization count and the test declarations, and the codec
+round trip covers them. A restored module answers both from its facts
+(`persistent.scalarized`, `persistent.collect_tests`), so a cached test build
+lists the same tests in the same order and prints the same note as a clean
+one. Diagnostics are equal by construction: the back half emits errors only
+(there is no lowering or codegen warning), an entry is published only after
+lowering and codegen succeeded, and the key ties it to the same inputs.
+
+**When the early restore is off.** `--emit-ir` and `--emit-asm` read the
+lowered IR, and a whole-module backend (`isa.emits_whole_module`) reads every
+referenced module's IR while generating one object, so under either the
+restore stays at codegen time as in phase 1 (the objects are still reused,
+lowering is not skipped). Everything else, including test builds, restores
+early. `mach test --list` lowers exactly what `mach test` lowers and stops
+before codegen, so the snapshot keys the list goal as the test goal: a list
+reads the test build's entries for their facts and publishes nothing. On the
+compiler's own tree (306 modules, debug profile, through the debug compiler)
+`mach test --list` takes 24.7 s uncached and 8.9 s warm, and `mach test`
+with one filtered module 47.7 s uncached, 49.1 s cold (publishing 39 MB) and
+26.7 s warm.
+
+## Bounded eviction
+
+Policy: least recently published first. Before a publication, under the store's
+exclusive lock, the store inventories the directory (name, size, mtime),
+sorts by mtime then name so the order is total, and removes from the oldest
+until the incoming entry fits under the limit. Two rules bound it:
+
+- an entry the current build restored or published is never removed; the
+  driver keeps the keys it read or wrote (`Project.cache_keys`) and hands
+  them to every publication;
+- a publication that cannot make room without removing one of those is
+  declined (`UNAVAILABLE`, the process stops publishing) and the store is left
+  as it was, so the limit is never exceeded and a build never loses an entry
+  it is using.
+
+"Used" means published, not read. The std pin exposes no way to set a file's
+times (no `utimensat`/`futimens`), so a hit does not refresh the entry, and
+the ordering is a FIFO over publications. With a whole-cell key that is the
+right order in practice: a generation of entries is published together by one
+build and is only ever read again by an identical cell, so the entries a
+project keeps hitting are also the ones it keeps republishing after each
+revert. When std gains a file-time setter, the hit can touch the entry and the
+same code becomes LRU. The test publishes at distinct mtimes in an order that
+disagrees with the name order, evicts under a small limit, and checks the
+oldest went, a protected entry survived while the next oldest went, a
+publication with only protected entries left was declined with the store
+unchanged, and a run of publications never exceeded the limit. Control:
+dropping the protected check fails it.
+
+## Link products
+
+Not cached, and this is the final answer. The link reads every object's
+current revision, the link configuration (`Q_LINK_CONFIG`: output kind,
+tokens, library directories, archives, resources) and the target, resolves
+archives and shared libraries against the filesystem as it is now, and writes
+the artifact through the publication transaction. A cached link would have to
+key every external input by content, would save 9 to 19 ms on the projects
+measured, and would put the one product a user runs behind a second identity
+check. The objects are where the time is; the link always runs against
+current inputs.
+
+## Canonical path keying
+
+Phase 1 keyed every path as spelled, so `mach build .` and `mach build
+/abs/project` missed each other. The snapshot now keys each path (the project
+root, every source file, every dependency's vendor root, and the request,
+whose semantic hash names the root) in canonical form: resolved against the
+process's working directory and lexically cleaned (`path.clean`), which is a
+pure function of the spelling and the working directory and touches no
+filesystem. The spelling is keyed in addition only when `req.debug` is set,
+because then it reaches the line tables and the two spellings really do
+produce two objects. The configuration identity the snapshot hashes no longer
+includes the request (`capture_configuration_identity`), since the snapshot
+hashes the canonicalized request itself; `capture_build_identity` is
+unchanged for its own consumers. Control:
+`driver.cache:snapshot_tracks_...` keys `/project`, `/project/./` and
+`/project/dep/../dep/support` equal without debug and different with it, and
+hello built from `.` and from its absolute path hit each other (40 of 40)
+without `-g` and miss each other with it.
+
+## The default
+
+**Kept opt-in.** The measurement below shows a warm hit is now about 2.6
+times faster than an uncached build, and a cold cached build about 4 to 7
+percent slower than an uncached one (the publication). What decides the
+default is the hit rate, and the key spans the whole cell: an edit to any
+module misses every module (hello, 40 modules: unchanged rebuild 40 of 40
+hits; one-character edit to `main.mach` 0 of 40, republishing all 40;
+reverted 40 of 40). An edit-and-rebuild loop, the common case, would pay the
+publication on every build and hit on none. The cache pays for itself on
+unchanged rebuilds, reverted edits and branches switched back, which is what
+`--cache` is for today.
+
+The condition for flipping is a per-module key: a module's object keyed by
+its own definition, its import closure and the inline bodies it absorbed,
+so that an edit to `main.mach` leaves the 39 std entries hitting. That is
+the same item phase 1 recorded as "artifact identity in the module key", and
+it is not a key gap but a structural one: `Q_SEMA` depends on
+`Q_MODULE_NUMBER`, the module's position in the cell's load order, so a
+typed definition and everything below it carry the cell's shape, and two
+cells that share a module do not share its object. Stable module identities
+in the typed products are the prerequisite; the cache's own layout needs no
+change for it (the key builder, the store and the restore path are all
+per-module already). Until then `--cache` is the opt-in and `--no-cache`
+the force-uncached mechanism, both documented in `doc/cli.md`.
+
+## Phase 2b controls and measurement
+
+Compiler: this branch at `1121976c2`, `release` profile, linked by the v5
+stage compiler so that it carries a build id (`out/rel/mach`, 17.5 MB).
+Projects as before: `hello` (40 modules with std 2.0.0, profile `release`)
+and the corpus case `bits/logic_u32` in the hosted corpus project (42
+modules, profile `o2`), x86_64-linux. Host load average 6 to 8 from
+concurrent workers; the first hello round was hit by a load spike and is
+reported as measured beside a clean second round.
+
+**Cold and warm, three repetitions, wall in ms [lower, optimize, codegen].**
+"cold" removes the output directory including `.mach-cache` before the build.
+
+| project | off, cold | off, warm | on, cold | on, warm | hits |
+|---|---|---|---|---|---|
+| hello, round 1 | 771† / 841† / 461 [93, 115, 102] | 739† / 1000† / 906† | 486 / 484 / 473 [98, 118, 117] | 186 / 183 / 180 [31, 0, 1] | 40 / 40 |
+| hello, round 2 | 456 / 456 / 446 [91, 114, 98] | 454 / 449 / 498 [90, 113, 106] | 482 / 511 / 471 [98, 114, 113] | 174 / 171 / 172 [29, 0, 1] | 40 / 40 |
+| corpus | 466 / 468 / 460 [97, 116, 105] | 467 / 457 / 463 [96, 114, 102] | 500 / 477 / 478 [102, 118, 125] | 178 / 177 / 174 [31, 0, 1] | 42 / 42 |
+
+Phase 1 predicted about 200 ms warm against 520 uncached; measured, 171 to
+186 against 446 to 498 (hello) and 174 to 178 against 457 to 468 (corpus).
+The warm lower phase, 29 to 31 ms, is the cell snapshot (6 ms, reported as
+`cell snapshot` under `-vv`) plus the 40 to 42 restores (0.13 to 6 ms each by
+entry size, about 18 ms in all, each reported as `cached object` with its
+time) plus the acquisition of the typed definitions. Optimize and codegen are
+0 and 1 ms. The link is unchanged at 9 to 10 ms. Publication (on, cold) costs
+17 to 35 ms over an uncached build.
+
+**Byte identity.** hello built uncached, cached-cold (publishing) and
+cached-warm (40 of 40 hits): the binaries are identical (`cmp`), and the
+corpus case's objects and binary likewise across the three.
+
+**Mutation controls.** Dropping the `Q_CELL_SNAPSHOT` edge from the restored
+product fails `driver.cache:restored_product_is_invalidated_by_each_keyed_input_edit`
+at the inline-body edit (the importer's typed surface is unchanged, its
+restored object absorbed the old body, and nothing else would recompute it).
+Dropping the protected check from eviction fails
+`cache.store:eviction_is_oldest_publication_first_...` at the entry the build
+restored. Both were run and reverted.
+
+**In-process invalidation, one per key class that can change in process.** The
+test rebuilds on one session through an edit to a provider's inline body
+(transitive source), an edit to the module's own source, and a request change
+(`debug`), and after each the restored product's revision advanced, the module
+lowered, and the store missed under the new key and published; a fresh session
+then restored what the edits published. Dependency content, the executed step
+chain, the compiler identity and the link providers are process or plan
+constants that no query edit can change in process; embedded inputs reach the
+typed definition through `Q_EMBED_FILE` and are covered by the same edge. The
+placement policy has one valid value, so its edge (`Q_CODEGEN_FLAGS`) is
+present but cannot be exercised end to end.

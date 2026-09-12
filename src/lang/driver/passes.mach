@@ -1029,6 +1029,10 @@ test "mach.lang.driver.passes.intern_producer:name_version" {
 pub fun run_lower_pass(p: *project.Project) err[outcome.Fail] {
     val prepared: err[outcome.Fail] = acquire_lower_inputs(p);
     if (sel prepared.err) { ret prepared; }
+    val cached: err[outcome.Fail] = prepare_persistent_cache(p);
+    if (sel cached.err) { ret cached; }
+    val restored: err[outcome.Fail] = restore_before_lowering(p);
+    if (sel restored.err) { ret restored; }
 
     if (lower_parallel_enabled(p)) {
 
@@ -1041,11 +1045,30 @@ pub fun run_lower_pass(p: *project.Project) err[outcome.Fail] {
     var i: u32 = 0;
     for (i < p.emit_len) {
         val mid: session.ModuleId = p.topo[i];
+        if (persistent.restored(p, ?p.modules[mid::u32])) { i = i + 1; cnt; }
 
         val r: err[fail.Fail] = run_lower_one(p, mid);
         if (sel r.err) {
             ret err[outcome.Fail].err{outcome.from_fail(r.err)};
         }
+        i = i + 1;
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+# the object key does not depend on the lowered or optimized ir, so a module
+# whose object the store holds is restored here and never lowers
+fun restore_before_lowering(p: *project.Project) err[outcome.Fail] {
+    if (!p.cache_ready || !persistent.early_restore_enabled(p)) { ret err[outcome.Fail].ok{}; }
+    var i: u32 = 0;
+    for (i < p.emit_len) {
+        val mid: session.ModuleId = p.topo[i];
+        # a codegen product this session still holds needs no restoring
+        val held: res[bool, fail.Fail] = query.reusable[project.Project](?p.queries, p, query.Q_CODEGEN, back_half_key_for(p, ?p.modules[mid::u32]));
+        if (sel held.err) { ret err[outcome.Fail].err{outcome.from_fail(held.err)}; }
+        if (held.ok) { i = i + 1; cnt; }
+        val restored: res[bool, fail.Fail] = persistent.restore(p, mid);
+        if (sel restored.err) { ret err[outcome.Fail].err{outcome.from_fail(restored.err)}; }
         i = i + 1;
     }
     ret err[outcome.Fail].ok{};
@@ -1067,8 +1090,47 @@ pub fun prepare_lower_pass(p: *project.Project) err[outcome.Fail] {
         val rl: err[fail.Fail] = query.register_derived_equatable(?p.s.queries, query.Q_LOWER, q_lower_finalize, lower_output_equal);
         if (sel rl.err) { ret err[outcome.Fail].err{outcome.from_fail(rl.err)}; }
     }
+    if (!query.is_registered(?p.s.queries, query.Q_CELL_SNAPSHOT)) {
+        val rc: err[fail.Fail] = query.register_derived(?p.s.queries, query.Q_CELL_SNAPSHOT);
+        if (sel rc.err) { ret err[outcome.Fail].err{outcome.from_fail(rc.err)}; }
+    }
+    val registered: err[outcome.Fail] = register_codegen_product(p);
+    if (sel registered.err) { ret registered; }
+    ret set_codegen_flags_input(p);
+}
 
-    ret err[outcome.Fail].ok{};
+# the persistent object key's inputs as one query product: every typed
+# definition in the cell, the target configuration and the codegen flags. its
+# bytes are the cell digest, so an edit anywhere in the cell advances it and
+# every product restored under the old digest recomputes
+pub fun q_cell_snapshot_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
+    if (key != 0) { ret res[query.QueryOutput, fail.Fail].err{fail.message("Q_CELL_SNAPSHOT has one key")}; }
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val definition: res[scx.Definition, fail.Fail] = read_definition(p::ptr, p.topo[i], scx.DEFINITION_TYPED);
+        if (sel definition.err) { ret res[query.QueryOutput, fail.Fail].err{definition.err}; }
+        i = i + 1;
+    }
+    val rt: err[fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_TARGET, 0);
+    if (sel rt.err) { ret res[query.QueryOutput, fail.Fail].err{rt.err}; }
+    val rf: err[fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_CODEGEN_FLAGS, 0);
+    if (sel rf.err) { ret res[query.QueryOutput, fail.Fail].err{rf.err}; }
+    if (!persistent.identity_available(p)) { ret res[query.QueryOutput, fail.Fail].err{fail.message("Q_CELL_SNAPSHOT requires the compiler identity")}; }
+    var backing: A.Allocator;
+    val make_r: err[A.Error] = page.make(?backing);
+    if (sel make_r.err) { ret res[query.QueryOutput, fail.Fail].err{fail.message("cache fingerprint allocator is unavailable")}; }
+    val captured: res[query.QueryOutput, fail.Fail] = capture_configuration_identity(p, ?backing);
+    if (sel captured.err) { ret captured; }
+    val config: query.QueryOutput = captured.ok;
+    fin { if (config.bytes != nil) { A.deallocate[u8](?backing, config.bytes, config.len::usize); } }
+    var digest: [32]u8;
+    val keyed: err[fail.Fail] = persistent.snapshot(?backing, p, config.bytes, config.len::usize, ?p.compiler_identity, ?digest);
+    if (sel keyed.err) { ret res[query.QueryOutput, fail.Fail].err{keyed.err}; }
+    val bytes: res[*u8, A.Error] = A.allocate[u8](alloc, 32);
+    if (sel bytes.err) { ret res[query.QueryOutput, fail.Fail].err{fail.refused(bytes.err)}; }
+    var b: usize = 0;
+    for (b < 32) { bytes.ok[b] = digest[b]; b = b + 1; }
+    ret res[query.QueryOutput, fail.Fail].ok{query.QueryOutput{bytes: bytes.ok, len: 32}};
 }
 
 fun acquire_frontend_inputs(p: *project.Project) err[outcome.Fail] {
@@ -1666,7 +1728,7 @@ fun run_lower_batch(p: *project.Project, slots: *PlwSlot, emit_len: u32) err[fai
         if (sel reusable.err) {
             ret err[fail.Fail].err{reusable.err};
         }
-        if (!reusable.ok) {
+        if (!reusable.ok && !persistent.restored(p, ?p.modules[mid::u32])) {
             slots[slot_len].mid = mid;
             slots[slot_len].m   = nil;
             slots[slot_len].failed = false;
@@ -1864,29 +1926,45 @@ fun free_lower_closure(alloc: *A.Allocator, cl: *LowerClosure) {
     cl.cap   = 0;
 }
 
-pub fun prepare_codegen_pass(p: *project.Project) err[outcome.Fail] {
+# the codegen flags are a request constant; the cell snapshot reads them from
+# the lower operation on, so they are set before either back-half pass
+fun set_codegen_flags_input(p: *project.Project) err[outcome.Fail] {
+    var pflag: u32 = codegen.resolve_placement_policy(p.req.placement_policy);
+    val pf: err[fail.Fail] = query.set_input(?p.s.queries, query.Q_CODEGEN_FLAGS, 0, (?pflag)::*u8, 4);
+    if (sel pf.err) { ret err[outcome.Fail].err{outcome.from_fail(pf.err)}; }
+    ret err[outcome.Fail].ok{};
+}
+
+# the codegen product is registered from the lower pass on: the early restore
+# asks whether the session still holds one before it asks the store
+fun register_codegen_product(p: *project.Project) err[outcome.Fail] {
     if (!query.is_registered(?p.s.queries, query.Q_CODEGEN)) {
         val rcg: err[fail.Fail] = query.register_derived_owned(?p.s.queries, query.Q_CODEGEN, q_codegen_finalize);
         if (sel rcg.err) { ret err[outcome.Fail].err{outcome.from_fail(rcg.err)}; }
     }
-
-    var pflag: u32 = codegen.resolve_placement_policy(p.req.placement_policy);
-    val pf: err[fail.Fail] = query.set_input(?p.s.queries, query.Q_CODEGEN_FLAGS, 0, (?pflag)::*u8, 4);
-    if (sel pf.err) {
-        ret err[outcome.Fail].err{outcome.from_fail(pf.err)};
-    }
-
     ret err[outcome.Fail].ok{};
 }
 
+pub fun prepare_codegen_pass(p: *project.Project) err[outcome.Fail] {
+    val registered: err[outcome.Fail] = register_codegen_product(p);
+    if (sel registered.err) { ret registered; }
+    ret set_codegen_flags_input(p);
+}
+
+# the modules that still lower here are those without a product restored under
+# this operation's snapshot; a module restored in the lower operation keeps its
+# staged product when the snapshot is unchanged and lowers now if it changed
 pub fun acquire_codegen_inputs(p: *project.Project) err[outcome.Fail] {
     var clear: u32 = 0;
     for (clear < p.module_len) { p.modules[clear].ir_module = nil; clear = clear + 1; }
     val frontend: err[outcome.Fail] = acquire_frontend_inputs(p);
     if (sel frontend.err) { ret frontend; }
+    val cached: err[outcome.Fail] = prepare_persistent_cache(p);
+    if (sel cached.err) { ret cached; }
     var i: u32 = 0;
     for (i < p.emit_len) {
         val mid: session.ModuleId = p.topo[i];
+        if (persistent.restored(p, ?p.modules[mid::u32])) { i = i + 1; cnt; }
         val acquired: err[fail.Fail] = run_lower_one(p, mid);
         if (sel acquired.err) { ret err[outcome.Fail].err{outcome.from_fail(acquired.err)}; }
         i = i + 1;
@@ -1894,22 +1972,34 @@ pub fun acquire_codegen_inputs(p: *project.Project) err[outcome.Fail] {
     ret err[outcome.Fail].ok{};
 }
 
+# once per query operation, after the typed definitions are current: the
+# compiler identity (once per project), then the cell snapshot through its
+# query so an unchanged cell is not rehashed, then the store directory
 pub fun prepare_persistent_cache(p: *project.Project) err[outcome.Fail] {
     if (!persistent.operation_active(p)) { ret err[outcome.Fail].err{outcome.internal("persistent cache requires the current query operation")}; }
     if (p.cache_initialized) { ret err[outcome.Fail].ok{}; }
     if (!p.req.object_cache) {
-        val disabled: err[fail.Fail] = persistent.prepare(p, nil, 0);
+        val disabled: err[fail.Fail] = persistent.prepare(p, nil);
         if (sel disabled.err) { ret err[outcome.Fail].err{outcome.from_fail(disabled.err)}; }
         ret err[outcome.Fail].ok{};
     }
-    var backing: A.Allocator;
-    val make_r: err[A.Error] = page.make(?backing);
-    if (sel make_r.err) { ret err[outcome.Fail].err{outcome.internal("cache fingerprint allocator is unavailable")}; }
-    val captured: res[query.QueryOutput, fail.Fail] = capture_build_identity(p, ?backing);
-    if (sel captured.err) { ret err[outcome.Fail].err{outcome.from_fail(captured.err)}; }
-    val bytes: query.QueryOutput = captured.ok;
-    fin { if (bytes.bytes != nil) { A.deallocate[u8](?backing, bytes.bytes, bytes.len::usize); } }
-    val prepared: err[fail.Fail] = persistent.prepare(p, bytes.bytes, bytes.len::usize);
+    val identified: err[fail.Fail] = persistent.identify(p);
+    if (sel identified.err) { ret err[outcome.Fail].err{outcome.from_fail(identified.err)}; }
+    if (!persistent.identity_available(p)) {
+        val unidentified: err[fail.Fail] = persistent.prepare(p, nil);
+        if (sel unidentified.err) { ret err[outcome.Fail].err{outcome.from_fail(unidentified.err)}; }
+        ret err[outcome.Fail].ok{};
+    }
+    if (!query.is_registered(?p.s.queries, query.Q_CELL_SNAPSHOT)) {
+        val rc: err[fail.Fail] = query.register_derived(?p.s.queries, query.Q_CELL_SNAPSHOT);
+        if (sel rc.err) { ret err[outcome.Fail].err{outcome.from_fail(rc.err)}; }
+    }
+    val t_cell: readout.Instant = readout.item_begin(p.events);
+    val cell: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_CELL_SNAPSHOT, 0);
+    if (sel cell.err) { ret err[outcome.Fail].err{outcome.from_fail(cell.err)}; }
+    readout.item(p.events, readout.PH_LOWER, "cell snapshot", t_cell);
+    if (cell.ok.value == nil || cell.ok.value_len != 32) { ret err[outcome.Fail].err{outcome.internal("Q_CELL_SNAPSHOT produced no digest")}; }
+    val prepared: err[fail.Fail] = persistent.prepare(p, cell.ok.value::*[32]u8);
     if (sel prepared.err) { ret err[outcome.Fail].err{outcome.from_fail(prepared.err)}; }
     ret err[outcome.Fail].ok{};
 }
@@ -1917,8 +2007,6 @@ pub fun prepare_persistent_cache(p: *project.Project) err[outcome.Fail] {
 pub fun run_codegen_pass(p: *project.Project) err[outcome.Fail] {
     val inputs: err[outcome.Fail] = acquire_codegen_inputs(p);
     if (sel inputs.err) { ret inputs; }
-    val cached: err[outcome.Fail] = prepare_persistent_cache(p);
-    if (sel cached.err) { ret cached; }
     var i: u32 = 0;
     for (i < p.emit_len) {
         val mid: session.ModuleId = p.topo[i];
@@ -2075,6 +2163,7 @@ pub fun q_codegen_compute(p: *project.Project, key: u64, alloc: *A.Allocator, di
     val mid: session.ModuleId = session.module_id_for_stable(s, stable);
     if (mid == session.MODULE_NIL) { ret res[query.QueryOutput, fail.Fail].err{fail.message("Q_CODEGEN: stable id not loaded this build")}; }
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
+    if (persistent.staged_restored(p, m)) { ret q_codegen_restored(p, mid, alloc); }
     val lower_owner: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_LOWER, key);
     if (sel lower_owner.err) { ret res[query.QueryOutput, fail.Fail].err{lower_owner.err}; }
     val irmod: *ir.Module = ir_handle_decode(lower_owner.ok);
@@ -2106,9 +2195,8 @@ pub fun q_codegen_compute(p: *project.Project, key: u64, alloc: *A.Allocator, di
             ret res[query.QueryOutput, fail.Fail].err{restored.err};
         }
     }
-    val staged: *of.ObjectImage = m.staged_image;
+    val staged: *of.ObjectImage = persistent.take_staged(p, m);
     if (staged != nil) {
-        m.staged_image = nil;
         sources_dnit(s.alloc, ?srcs);
         val published: err[fail.Fail] = persistent.publish(p, m, staged);
         if (sel published.err) {
@@ -2145,6 +2233,25 @@ pub fun q_codegen_compute(p: *project.Project, key: u64, alloc: *A.Allocator, di
     val box: *of.ObjectImage = br.ok;
     box[0] = img;
     ret image_handle_encode(alloc, box);
+}
+
+# a product the store restored becomes the module's codegen product with the
+# edges a generated one carries directly (its typed definition, the target and
+# the codegen flags) plus the cell snapshot, which is the persistent key's
+# in-process image: any input the key covers advances it
+fun q_codegen_restored(p: *project.Project, mid: session.ModuleId, alloc: *A.Allocator) res[query.QueryOutput, fail.Fail] {
+    val m: *project.ModuleEntry = ?p.modules[mid::u32];
+    val definition: res[scx.Definition, fail.Fail] = read_definition(p::ptr, mid, scx.DEFINITION_TYPED);
+    if (sel definition.err) { ret res[query.QueryOutput, fail.Fail].err{definition.err}; }
+    val rt: err[fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_TARGET, 0);
+    if (sel rt.err) { ret res[query.QueryOutput, fail.Fail].err{rt.err}; }
+    val rpp: err[fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_CODEGEN_FLAGS, 0);
+    if (sel rpp.err) { ret res[query.QueryOutput, fail.Fail].err{rpp.err}; }
+    val cell: err[fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_CELL_SNAPSHOT, 0);
+    if (sel cell.err) { ret res[query.QueryOutput, fail.Fail].err{cell.err}; }
+    val staged: *of.ObjectImage = persistent.take_staged(p, m);
+    if (staged == nil) { ret res[query.QueryOutput, fail.Fail].err{fail.message("Q_CODEGEN: restored product left the module")}; }
+    ret image_handle_encode(alloc, staged);
 }
 
 pub fun q_codegen_finalize(value: *u8, value_len: u32, alloc: *A.Allocator) {
@@ -2392,6 +2499,16 @@ pub fun capture_build_identity(p: *project.Project, alloc: *A.Allocator) res[que
     ret dq.fp_take(?fb);
 }
 
+# the build identity without the request: the persistent key hashes the request
+# itself, with the project root in canonical form, so the spelled root stays out
+pub fun capture_configuration_identity(p: *project.Project, alloc: *A.Allocator) res[query.QueryOutput, fail.Fail] {
+    var fb: dq.FpBuf = dq.FpBuf{ alloc: alloc };
+    fin { dq.fp_free(?fb); }
+    val written: err[fail.Fail] = write_configuration_identity(?fb, p);
+    if (sel written.err) { ret res[query.QueryOutput, fail.Fail].err{written.err}; }
+    ret dq.fp_take(?fb);
+}
+
 pub fun set_build_config_input(p: *project.Project) err[fail.Fail] {
     val captured: res[query.QueryOutput, fail.Fail] = capture_build_config(p, p.s.alloc);
     if (sel captured.err) { ret err[fail.Fail].err{captured.err}; }
@@ -2412,7 +2529,10 @@ fun write_build_identity(fb: *dq.FpBuf, p: *project.Project) err[fail.Fail] {
     if (sel hr.err) { ret err[fail.Fail].err{fail.message(outcome.describe(hr.err))}; }
     val ah: err[fail.Fail] = dq.fp_bytes(fb, ?digest[0], request.HASH_SIZE::u32);
     if (sel ah.err) { ret ah; }
+    ret write_configuration_identity(fb, p);
+}
 
+fun write_configuration_identity(fb: *dq.FpBuf, p: *project.Project) err[fail.Fail] {
     val tf: err[fail.Fail] = write_target_fingerprint(fb, p);
     if (sel tf.err) { ret tf; }
 

@@ -89,6 +89,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at startup, and hashes the executable only when it carries none. The Mach-O
   uuid was previously written only under `--pie` and derived from the artifact
   name (#3221).
+- The object cache asks the store before lowering: a module whose object it
+  holds skips lower, optimize and codegen, and the entry carries the module's
+  scalarization count and test declarations so a cached test build lists the
+  same tests. A warm hit builds a 42-module project in about 175 ms against
+  460 ms uncached. Paths are keyed canonically, so `mach build .` and
+  `mach build /abs/project` share entries unless `-g` puts the spelling into
+  the line tables. Eviction removes the least recently published entries
+  first and never one the current build restored or published. The linked
+  artifact is not cached. The cache stays opt-in: an edit misses the whole
+  cell, so a default-on cache would pay publication on every edit and hit only
+  on unchanged rebuilds (#3221).
 
 - `mach check <path>` runs load, resolve and sema over the source reachable from
   the artifacts `mach build` would select, through the same driver, queries and

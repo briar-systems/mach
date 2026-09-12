@@ -8,6 +8,9 @@ use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
+use std.types.string.OwnedString;
+use std.types.string.owned_release;
+use env: std.process.env;
 use key: mach.lang.build.cache.key;
 use mach.lang.build.request;
 use mach.lang.driver.project;
@@ -16,6 +19,32 @@ use mach.lang.fe.sema;
 use mach.lang.intern;
 use mach.lang.source;
 
+# a path as the filesystem would name it from this process: absolute and
+# lexically clean, so `mach build .` and `mach build /abs/project` agree
+fun canonical(scratch: *A.Allocator, cwd: str, spelled: str) res[str, fail.Fail] {
+    val absolute: res[str, A.Error] = path.resolve(scratch, cwd, spelled);
+    if (sel absolute.err) { ret res[str, fail.Fail].err{fail.refused(absolute.err)}; }
+    val joined: str = absolute.ok;
+    fin { str_free(scratch, joined); }
+    val cleaned: res[str, A.Error] = path.clean(scratch, joined);
+    if (sel cleaned.err) { ret res[str, fail.Fail].err{fail.refused(cleaned.err)}; }
+    ret res[str, fail.Fail].ok{cleaned.ok};
+}
+
+# the key holds every path in canonical form; the spelling is added only when
+# debug information is requested, because then it reaches the line tables and
+# two spellings really do produce two objects
+fun key_path(b: *key.Builder, scratch: *A.Allocator, cwd: str, spelled: str, spelling_matters: bool) err[fail.Fail] {
+    val canon: res[str, fail.Fail] = canonical(scratch, cwd, spelled);
+    if (sel canon.err) { ret err[fail.Fail].err{canon.err}; }
+    key.text(b, canon.ok);
+    str_free(scratch, canon.ok);
+    if (spelling_matters) { key.text(b, spelled); }
+    or { key.text(b, nil); }
+    ret err[fail.Fail].ok{};
+}
+
+
 # hash the whole active build cell because generic instantiations can cross import direction
 pub fun snapshot(scratch: *A.Allocator, p: *project.Project, config: *u8, config_len: usize,
                  compiler_id: *compiler.Identity, digest: *[32]u8) err[fail.Fail] {
@@ -23,21 +52,39 @@ pub fun snapshot(scratch: *A.Allocator, p: *project.Project, config: *u8, config
         || compiler_id.len == 0 || compiler_id.len > 32) {
         ret err[fail.Fail].err{fail.message("cache snapshot requires a project and compiler identity")};
     }
+    val cwd_r: res[OwnedString, env.EnvError] = env.current_dir(scratch);
+    if (sel cwd_r.err) { ret err[fail.Fail].err{fail.message("cache snapshot cannot read the current directory")}; }
+    var cwd_owned: OwnedString = cwd_r.ok;
+    fin { owned_release(?cwd_owned); }
+    val cwd: str = cwd_owned.data;
+    val spelling_matters: bool = p.req.debug;
     var b: key.Builder = key.begin("mach.compilation-cell");
     key.number(?b, compiler_id.source::u64);
     key.bytes(?b, ?compiler_id.bytes[0], compiler_id.len);
     key.bytes(?b, config, config_len);
     key.name(?b, ?p.s.interner, p.compiler_name);
     key.name(?b, ?p.s.interner, p.compiler_ver);
+    # the request names the project by its spelled root; the key names it canonically
+    val canonical_root: res[str, fail.Fail] = canonical(scratch, cwd, p.req.project_root);
+    if (sel canonical_root.err) { ret err[fail.Fail].err{canonical_root.err}; }
+    var keyed_request: request.BuildRequest = p.req;
+    keyed_request.project_root = canonical_root.ok;
+    # listing tests lowers exactly what running them lowers and stops before
+    # codegen, so it reads (and never publishes) the test build's entries
+    if (keyed_request.goal == request.GOAL_TEST_LIST) { keyed_request.goal = request.GOAL_TESTS; }
     var request_digest: [32]u8;
-    val requested: err[outcome.Fail] = request.semantic_hash(scratch, ?p.req, ?request_digest[0]);
+    val requested: err[outcome.Fail] = request.semantic_hash(scratch, ?keyed_request, ?request_digest[0]);
+    str_free(scratch, canonical_root.ok);
     if (sel requested.err) { ret err[fail.Fail].err{fail.message(outcome.describe(requested.err))}; }
     key.bytes(?b, ?request_digest[0], 32);
     key.number(?b, p.req.placement_policy::u64);
     key.bytes(?b, ?p.step_digest[0], 32);
     key.name(?b, ?p.s.interner, p.config.module);
     key.name(?b, ?p.s.interner, p.config.dir_src);
-    key.name(?b, ?p.s.interner, p.config.project_root);
+    val root: opt[str] = intern.lookup(?p.s.interner, p.config.project_root);
+    if (sel root.none) { ret err[fail.Fail].err{fail.message("cache snapshot has no project root")}; }
+    val root_keyed: err[fail.Fail] = key_path(?b, scratch, cwd, root.some, spelling_matters);
+    if (sel root_keyed.err) { ret root_keyed; }
     key.number(?b, p.roots::u64);
     key.number(?b, p.module_len::u64);
     var i: u32 = 0;
@@ -48,7 +95,8 @@ pub fun snapshot(scratch: *A.Allocator, p: *project.Project, config: *u8, config
         val f: *source.SourceFile = file.some;
         if (!f.present || f.text == nil) { ret err[fail.Fail].err{fail.message("cache snapshot source is not present")}; }
         key.name(?b, ?p.s.interner, m.fqn);
-        key.text(?b, f.path);
+        val file_keyed: err[fail.Fail] = key_path(?b, scratch, cwd, f.path, spelling_matters);
+        if (sel file_keyed.err) { ret file_keyed; }
         key.bytes(?b, f.text, str_len(f.text));
         key.number(?b, m.dep_count::u64);
         var d: u32 = 0;
@@ -76,7 +124,10 @@ pub fun snapshot(scratch: *A.Allocator, p: *project.Project, config: *u8, config
         key.name(?b, ?p.s.interner, d.project_id);
         key.name(?b, ?p.s.interner, d.project_dir_src);
         key.name(?b, ?p.s.interner, d.project_module);
-        key.name(?b, ?p.s.interner, d.vendor_root);
+        val vendor: opt[str] = intern.lookup(?p.s.interner, d.vendor_root);
+        if (sel vendor.none) { ret err[fail.Fail].err{fail.message("cache snapshot dependency has no vendor root")}; }
+        val vendor_keyed: err[fail.Fail] = key_path(?b, scratch, cwd, vendor.some, spelling_matters);
+        if (sel vendor_keyed.err) { ret vendor_keyed; }
         key.name(?b, ?p.s.interner, d.source);
         key.name(?b, ?p.s.interner, d.ref);
         key.name(?b, ?p.s.interner, d.content);
@@ -131,10 +182,13 @@ use compiler: mach.lang.build.cache.compiler;
 use mach.lang.target.of;
 use mach.lang.session;
 use mach.lang.readout;
-use std.chrono.duration;
-use ctime: std.chrono.time;
 use mach.lang.query;
 use mach.lang.build.outcome;
+use mach.lang.me.ir;
+use mach.lang.target.isa;
+use testrunner: mach.lang.me.lower.testrunner;
+use fs: std.filesystem;
+use io_error: std.io.error;
 
 fun transaction_internal(error: txn.Error) bool {
     ret error.kind == txn.INVALID || error.kind == txn.MEMORY || error.code == os.ENOMEM;
@@ -145,39 +199,61 @@ pub fun operation_active(p: *project.Project) bool {
         && p.cache_operation_sequence != 0 && p.cache_operation_sequence == p.s.queries.operation_sequence;
 }
 
-pub fun prepare(p: *project.Project, config: *u8, config_len: usize) err[fail.Fail] {
-    if (!operation_active(p)) { ret err[fail.Fail].err{fail.message("cache preparation requires the current query operation")}; }
-    if (p.cache_initialized) { ret err[fail.Fail].ok{}; }
-    val prepared: err[fail.Fail] = prepare_operation(p, config, config_len);
-    if (sel prepared.ok) { p.cache_initialized = true; }
-    ret prepared;
-}
-
-fun prepare_operation(p: *project.Project, config: *u8, config_len: usize) err[fail.Fail] {
-    if (!p.req.object_cache) { ret err[fail.Fail].ok{}; }
+# the compiler identity is a process constant: read once per project
+pub fun identify(p: *project.Project) err[fail.Fail] {
+    if (p.compiler_identity_initialized) { ret err[fail.Fail].ok{}; }
     var backing: A.Allocator;
     val make_r: err[A.Error] = page.make(?backing);
     if (sel make_r.err) { ret err[fail.Fail].err{fail.message("cache scratch allocator is unavailable")}; }
-    if (!p.compiler_identity_initialized) {
-        val t_identity: readout.Instant = readout.item_begin(p.events);
-        val identified: err[compiler.Error] = compiler.identity(?backing, ?p.compiler_identity);
-        if (sel identified.err) {
-            val error: compiler.Error = identified.err;
-            if (error.kind != compiler.UNAVAILABLE) { ret err[fail.Fail].err{fail.message(error.message)}; }
-            readout.item(p.events, readout.PH_CODEGEN, "compiler identity unavailable", t_identity);
-        }
-        if (sel identified.ok) {
-            p.compiler_identity_available = true;
-            if (p.compiler_identity.source == compiler.SOURCE_BUILD_ID) {
-                readout.item(p.events, readout.PH_CODEGEN, "compiler identity: build id", t_identity);
-            }
-            or { readout.item(p.events, readout.PH_CODEGEN, "compiler identity: image digest", t_identity); }
-        }
-        p.compiler_identity_initialized = true;
+    val t_identity: readout.Instant = readout.item_begin(p.events);
+    val identified: err[compiler.Error] = compiler.identity(?backing, ?p.compiler_identity);
+    if (sel identified.err) {
+        val error: compiler.Error = identified.err;
+        if (error.kind != compiler.UNAVAILABLE) { ret err[fail.Fail].err{fail.message(error.message)}; }
+        readout.item(p.events, readout.PH_LOWER, "compiler identity unavailable", t_identity);
     }
-    if (!p.compiler_identity_available) { ret err[fail.Fail].ok{}; }
-    val keyed: err[fail.Fail] = snapshot(?backing, p, config, config_len, ?p.compiler_identity, ?p.cache_snapshot);
-    if (sel keyed.err) { ret err[fail.Fail].err{keyed.err}; }
+    if (sel identified.ok) {
+        p.compiler_identity_available = true;
+        if (p.compiler_identity.source == compiler.SOURCE_BUILD_ID) {
+            readout.item(p.events, readout.PH_LOWER, "compiler identity: build id", t_identity);
+        }
+        or { readout.item(p.events, readout.PH_LOWER, "compiler identity: image digest", t_identity); }
+    }
+    p.compiler_identity_initialized = true;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun identity_available(p: *project.Project) bool {
+    ret p.compiler_identity_initialized && p.compiler_identity_available;
+}
+
+# once per query operation. snapshot is the cell digest the operation computed,
+# nil when the cache is off or the compiler has no identity
+pub fun prepare(p: *project.Project, snapshot: *[32]u8) err[fail.Fail] {
+    if (!operation_active(p)) { ret err[fail.Fail].err{fail.message("cache preparation requires the current query operation")}; }
+    if (p.cache_initialized) { ret err[fail.Fail].ok{}; }
+    p.cache_initialized = true;
+    if (snapshot == nil || !p.req.object_cache) { ret err[fail.Fail].ok{}; }
+    p.cache_snapshot = @snapshot;
+    discard_stale(p);
+    ret open_directory(p);
+}
+
+# a module's cache verdict and staged product belong to the snapshot they were
+# taken under; a new snapshot asks the store again
+fun discard_stale(p: *project.Project) {
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        val m: *project.ModuleEntry = ?p.modules[i];
+        if (m.cache_checked && !key.equal(?m.cache_under, ?p.cache_snapshot)) { project.release_staged(p, m); }
+        i = i + 1;
+    }
+}
+
+fun open_directory(p: *project.Project) err[fail.Fail] {
+    var backing: A.Allocator;
+    val make_r: err[A.Error] = page.make(?backing);
+    if (sel make_r.err) { ret err[fail.Fail].err{fail.message("cache scratch allocator is unavailable")}; }
     val root: opt[str] = intern.lookup(?p.s.interner, p.config.project_root);
     val out: opt[str] = intern.lookup(?p.s.interner, p.config.project_out);
     if (sel root.none) { ret err[fail.Fail].err{fail.message("cache directory has no resolved output root")}; }
@@ -209,6 +285,35 @@ fun prepare_operation(p: *project.Project, config: *u8, config_len: usize) err[f
     ret err[fail.Fail].ok{};
 }
 
+# a module whose object the store holds skips lowering when nothing else needs
+# its ir: the ir and asm emitters read it, and a whole-module backend reads
+# every referenced module's ir while generating one object
+pub fun early_restore_enabled(p: *project.Project) bool {
+    ret p.req.object_cache && !p.req.emit_ir && !p.req.emit_asm && !isa.emits_whole_module(p.target.isa);
+}
+
+# the module's codegen product came from the store under the current snapshot,
+# whether it is still staged or a query already took it: the module does not lower
+pub fun restored(p: *project.Project, m: *project.ModuleEntry) bool {
+    ret m.cache_hit && key.equal(?m.cache_under, ?p.cache_snapshot);
+}
+
+# restored and still staged, which is what the codegen query publishes
+pub fun staged_restored(p: *project.Project, m: *project.ModuleEntry) bool {
+    ret m.staged_image != nil && restored(p, m);
+}
+
+fun remember(p: *project.Project, digest: *[32]u8) err[fail.Fail] {
+    val pushed: res[usize, A.Error] = vector.push[project.CacheKey](?p.cache_keys, project.CacheKey{bytes: @digest});
+    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun protected_keys(p: *project.Project) *[32]u8 {
+    if (p.cache_keys.len == 0) { ret nil; }
+    ret ?p.cache_keys.data[0].bytes;
+}
+
 pub fun restore(p: *project.Project, mid: session.ModuleId) res[bool, fail.Fail] {
     if (!operation_active(p)) { ret res[bool, fail.Fail].err{fail.message("cache restoration requires the current query operation")}; }
     val index: u32 = mid::u32;
@@ -216,6 +321,8 @@ pub fun restore(p: *project.Project, mid: session.ModuleId) res[bool, fail.Fail]
     val m: *project.ModuleEntry = ?p.modules[index];
     if (!p.cache_ready || m.cache_checked) { ret res[bool, fail.Fail].ok{m.cache_hit}; }
     m.cache_checked = true;
+    m.cache_under = p.cache_snapshot;
+    val t_restore: readout.Instant = readout.item_begin(p.events);
     var backing: A.Allocator;
     val make_r: err[A.Error] = page.make(?backing);
     if (sel make_r.err) { ret res[bool, fail.Fail].err{fail.message("cache scratch allocator is unavailable")}; }
@@ -231,40 +338,101 @@ pub fun restore(p: *project.Project, mid: session.ModuleId) res[bool, fail.Fail]
         p.cache_misses = p.cache_misses + 1;
         ret res[bool, fail.Fail].ok{false};
     }
-    val decoded: res[of.ObjectImage, codec.Error] = codec.decode(p.s.alloc, ?p.s.interner, entry.bytes.data, entry.bytes.len);
+    val decoded: res[codec.Product, codec.Error] = codec.decode(p.s.alloc, ?p.s.interner, entry.bytes.data, entry.bytes.len);
     if (sel decoded.err) {
         val error: codec.Error = decoded.err;
         if (error.kind == codec.INTERNAL) { ret res[bool, fail.Fail].err{fail.message(error.message)}; }
         p.cache_misses = p.cache_misses + 1;
         ret res[bool, fail.Fail].ok{false};
     }
-    var image: of.ObjectImage = decoded.ok;
-    if (m.ir_module == nil || image.name != m.ir_module.name) {
-        of.object_image_dnit(?image);
+    var product: codec.Product = decoded.ok;
+    if (product.image.name != m.fqn) {
+        codec.product_dnit(?product);
         p.cache_misses = p.cache_misses + 1;
         ret res[bool, fail.Fail].ok{false};
     }
     val boxed: res[*of.ObjectImage, A.Error] = A.allocate[of.ObjectImage](p.s.alloc, 1);
     if (sel boxed.err) {
-        of.object_image_dnit(?image);
+        codec.product_dnit(?product);
         ret res[bool, fail.Fail].err{fail.refused(boxed.err)};
     }
     val box: *of.ObjectImage = boxed.ok;
-    @box = image;
+    @box = product.image;
+    codec.facts_dnit(p.s.alloc, ?m.staged_facts);
     m.staged_image = box;
+    m.staged_facts = product.facts;
     m.cache_hit = true;
+    val remembered: err[fail.Fail] = remember(p, ?digest);
+    if (sel remembered.err) { ret res[bool, fail.Fail].err{remembered.err}; }
     p.cache_hits = p.cache_hits + 1;
-    readout.item_dur(p.events, readout.PH_CODEGEN, "cached object", 0::duration.Duration);
+    readout.item(p.events, readout.PH_LOWER, "cached object", t_restore);
     ret res[bool, fail.Fail].ok{true};
+}
+
+# hand the staged image to the query that publishes it; the facts stay with the module
+pub fun take_staged(p: *project.Project, m: *project.ModuleEntry) *of.ObjectImage {
+    val image: *of.ObjectImage = m.staged_image;
+    m.staged_image = nil;
+    ret image;
+}
+
+# what the engine reads from lowered ir, answered from the ir when the module
+# lowered and from the restored facts when it did not
+pub fun scalarized(p: *project.Project, m: *project.ModuleEntry) u32 {
+    if (m.ir_module != nil) { ret m.ir_module.vector_ops_scalarized; }
+    ret m.staged_facts.scalarized;
+}
+
+pub fun collect_tests(p: *project.Project, m: *project.ModuleEntry, mid: u32, c: *testrunner.Collected) err[fail.Fail] {
+    if (m.ir_module != nil) { ret testrunner.collect_module(p.s, c, m.ir_module, mid); }
+    var i: u32 = 0;
+    for (i < m.staged_facts.test_count) {
+        val f: *codec.TestFact = ?m.staged_facts.tests[i];
+        val pushed: err[fail.Fail] = testrunner.push(p.s, c, testrunner.Test{linkage: f.linkage, label: f.label, line: f.line, mod_idx: mid});
+        if (sel pushed.err) { ret pushed; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun gather_facts(scratch: *A.Allocator, irmod: *ir.Module, facts: *codec.Facts) err[fail.Fail] {
+    facts.scalarized = irmod.vector_ops_scalarized;
+    var tests: u32 = 0;
+    var i: u32 = 0;
+    for (i < irmod.function_len) {
+        if ((irmod.functions[i].flags & ir.FN_FLAG_TEST) != 0) { tests = tests + 1; }
+        i = i + 1;
+    }
+    if (tests == 0) { ret err[fail.Fail].ok{}; }
+    val allocated: res[*codec.TestFact, A.Error] = A.allocate[codec.TestFact](scratch, tests::usize);
+    if (sel allocated.err) { ret err[fail.Fail].err{fail.refused(allocated.err)}; }
+    facts.tests = allocated.ok;
+    facts.test_count = tests;
+    var n: u32 = 0;
+    i = 0;
+    for (i < irmod.function_len) {
+        val fn: *ir.Function = ?irmod.functions[i];
+        if ((fn.flags & ir.FN_FLAG_TEST) != 0) {
+            facts.tests[n] = codec.TestFact{linkage: fn.name, label: fn.label, line: fn.line};
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
 }
 
 pub fun publish(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectImage) err[fail.Fail] {
     if (!operation_active(p)) { ret err[fail.Fail].err{fail.message("cache publication requires the current query operation")}; }
     if (!p.cache_ready || m.cache_hit) { ret err[fail.Fail].ok{}; }
+    if (m.ir_module == nil) { ret err[fail.Fail].err{fail.message("cache publication requires the module's lowered ir")}; }
     var backing: A.Allocator;
     val make_r: err[A.Error] = page.make(?backing);
     if (sel make_r.err) { ret err[fail.Fail].err{fail.message("cache scratch allocator is unavailable")}; }
-    val encoded: res[vector.Vector[u8], codec.Error] = codec.encode(?backing, image);
+    var facts: codec.Facts = codec.Facts{};
+    fin { codec.facts_dnit(?backing, ?facts); }
+    val gathered: err[fail.Fail] = gather_facts(?backing, m.ir_module, ?facts);
+    if (sel gathered.err) { ret gathered; }
+    val encoded: res[vector.Vector[u8], codec.Error] = codec.encode(?backing, image, ?facts);
     if (sel encoded.err) {
         val error: codec.Error = encoded.err;
         if (error.kind == codec.LIMIT) { ret err[fail.Fail].ok{}; }
@@ -274,11 +442,12 @@ pub fun publish(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectI
     fin { vector.dnit[u8](?bytes); }
     var digest: [32]u8;
     val keyed: err[fail.Fail] = key.object(?p.cache_snapshot, project.fqn_name(p, m.fqn), ?digest);
-    if (sel keyed.err) { ret err[fail.Fail].err{keyed.err}; }
-    val stored: res[store.Status, store.Error] = store.publish(?backing, p.cache_dir, ?digest, bytes.data, bytes.len);
+    if (sel keyed.err) { ret keyed; }
+    val stored: res[store.Status, store.Error] = store.publish(?backing, p.cache_dir, ?digest, bytes.data, bytes.len,
+        protected_keys(p), p.cache_keys.len);
     if (sel stored.err) { ret err[fail.Fail].err{fail.message(stored.err.message)}; }
-    if (stored.ok.kind == store.UNAVAILABLE) { p.cache_ready = false; }
-    ret err[fail.Fail].ok{};
+    if (stored.ok.kind == store.UNAVAILABLE) { p.cache_ready = false; ret err[fail.Fail].ok{}; }
+    ret remember(p, ?digest);
 }
 
 fun t_snapshot(p: *project.Project, config: *[1]u8, compiler_id: *compiler.Identity, out: *[32]u8) bool {
@@ -303,7 +472,10 @@ test "mach.lang.driver.cache:snapshot_tracks_source_compiler_configuration_steps
         project.dnit_project(?p);
     }
     p.config.dir_src = intern.STR_NIL;
-    p.config.project_root = intern.STR_NIL;
+    val root_id: res[intern.StrId, A.Error] = intern.intern(?s.interner, "/project");
+    if (sel root_id.err) { ret 3; }
+    p.config.project_root = root_id.ok;
+    p.req.project_root = "/project";
     val f: res[source.FileId, fail.Fail] = source.add(?s.sources, "/project/main.mach", "use support.lib.answer; pub fun main() i64 { ret answer(); }");
     val n: res[intern.StrId, A.Error] = intern.intern(?s.interner, "project.main");
     if (sel f.err) { ret 3; }
@@ -390,6 +562,36 @@ test "mach.lang.driver.cache:snapshot_tracks_source_compiler_configuration_steps
     p.req.jobs = 17;
     p.req.emit_ir = true;
     if (!t_snapshot(?p, ?config, ?compiler_id, ?changed) || !key.equal(?baseline, ?changed)) { ret 27; }
+    p.req = original;
+    p.req.goal = request.GOAL_TESTS;
+    var tests_key: [32]u8;
+    if (!t_snapshot(?p, ?config, ?compiler_id, ?tests_key) || key.equal(?baseline, ?tests_key)) { ret 34; }
+    p.req.goal = request.GOAL_TEST_LIST;
+    if (!t_snapshot(?p, ?config, ?compiler_id, ?changed) || !key.equal(?tests_key, ?changed)) { ret 35; }
+    # another spelling of the same paths keys the same cell, unless debug
+    # information is requested and the spelling reaches the line tables
+    p.req = original;
+    p.req.project_root = "/project/./";
+    val spelled_root: res[intern.StrId, A.Error] = intern.intern(?s.interner, "/project/./");
+    if (sel spelled_root.err) { ret 30; }
+    p.config.project_root = spelled_root.ok;
+    val get_spelled: opt[*source.SourceFile] = source.get(?s.sources, modules[0].file_id);
+    if (sel get_spelled.none) { ret 30; }
+    val spelled_path: str = get_spelled.some.path;
+    get_spelled.some.path = "/project/./main.mach";
+    val spelled_vendor: res[intern.StrId, A.Error] = intern.intern(?s.interner, "/project/dep/../dep/support");
+    if (sel spelled_vendor.err) { ret 30; }
+    dependencies[0].vendor_root = spelled_vendor.ok;
+    if (!t_snapshot(?p, ?config, ?compiler_id, ?changed) || !key.equal(?baseline, ?changed)) { ret 31; }
+    p.req.debug = true;
+    var debug_spelled: [32]u8;
+    if (!t_snapshot(?p, ?config, ?compiler_id, ?debug_spelled)) { ret 32; }
+    get_spelled.some.path = spelled_path;
+    p.config.project_root = root_id.ok;
+    p.req.project_root = "/project";
+    dependencies[0].vendor_root = ids[5];
+    var debug_canonical: [32]u8;
+    if (!t_snapshot(?p, ?config, ?compiler_id, ?debug_canonical) || key.equal(?debug_spelled, ?debug_canonical)) { ret 33; }
     compiler_id.len = 0;
     if (t_snapshot(?p, ?config, ?compiler_id, ?changed)) { ret 28; }
     compiler_id.len = 32;
@@ -419,27 +621,50 @@ test "mach.lang.driver.cache:snapshot_tracks_source_compiler_configuration_steps
     ret 0;
 }
 
-test "mach.lang.driver.cache:operation_reset_preserves_compiler_identity_and_query_owned_images" {
+fun t_boxed_image(s: *session.Session) *of.ObjectImage {
+    val allocated: res[*of.ObjectImage, A.Error] = A.allocate[of.ObjectImage](s.alloc, 1);
+    if (sel allocated.err) { ret nil; }
+    val staged: *of.ObjectImage = allocated.ok;
+    @staged = of.object_image_init(s.alloc, ?s.interner, intern.STR_NIL);
+    ret staged;
+}
+
+test "mach.lang.driver.cache:operation_reset_keeps_restored_products_under_their_snapshot_and_drops_fresh_ones" {
     var a: A.Allocator;
     val make_r: err[A.Error] = page.make(?a);
     if (sel make_r.err) { ret 1; }
+    val temporary: res[fs.TempFile, fs.FsError] = fs.temp_create(?a, "mach-cache-ops");
+    if (sel temporary.err) { ret 1; }
+    var temp: fs.TempFile = temporary.ok;
+    fin { str_free(?a, temp.path); }
+    val temp_close_and_remove_r: err[io_error.Error] = fs.temp_close_and_remove(?temp);
+    if (sel temp_close_and_remove_r.err) { ret 1; }
+    if (os.make_dir(os.AT_FDCWD, temp.path, 0o700) < 0) { ret 1; }
+    fin { fs.remove_all(?a, temp.path); }
     val initialized: res[session.Session, fail.Fail] = session.init(?a);
     if (sel initialized.err) { ret 2; }
     var s: session.Session = initialized.ok;
     fin { session.dnit(?s); }
     var p: project.Project;
     project.init_project(?p, ?s);
-    var modules: [1]project.ModuleEntry;
-    p.modules = ?modules[0]; p.module_len = 1;
+    var modules: [2]project.ModuleEntry;
+    p.modules = ?modules[0]; p.module_len = 2;
     fin {
-        if (modules[0].staged_image != nil) {
-            of.object_image_dnit(modules[0].staged_image);
-            A.deallocate[of.ObjectImage](s.alloc, modules[0].staged_image, 1);
-            modules[0].staged_image = nil;
-        }
+        project.release_all_staged(?p);
         p.modules = nil; p.module_len = 0; p.module_cap = 0;
         project.dnit_project(?p);
     }
+    val root_id: res[intern.StrId, A.Error] = intern.intern(?s.interner, temp.path);
+    val out_id: res[intern.StrId, A.Error] = intern.intern(?s.interner, "out");
+    if (sel root_id.err) { ret 2; }
+    if (sel out_id.err) { ret 2; }
+    p.config.project_root = root_id.ok;
+    p.config.project_out = out_id.ok;
+    val out_dir: res[str, A.Error] = path.join(?a, temp.path, "out");
+    if (sel out_dir.err) { ret 2; }
+    val created: err[fs.FsError] = fs.create_dir_all(?a, out_dir.ok, 0o700);
+    str_free(?a, out_dir.ok);
+    if (sel created.err) { ret 2; }
     p.req.object_cache = true;
     p.compiler_identity_initialized = true;
     p.compiler_identity_available = false;
@@ -447,49 +672,76 @@ test "mach.lang.driver.cache:operation_reset_preserves_compiler_identity_and_que
     val begun: res[query.Operation, outcome.Fail] = project.begin_query_phase(?p);
     if (sel begun.err) { ret 3; }
     val first: query.Operation = begun.ok;
-    val prepare_r: err[fail.Fail] = prepare(?p, nil, 0);
+    # no identity: the operation prepares as disabled and touches nothing
+    val prepare_r: err[fail.Fail] = prepare(?p, nil);
     if (sel prepare_r.err) { ret 4; }
-    p.cache_snapshot[0] = 37;
-    p.cache_ready = true;
+    if (!p.cache_initialized || p.cache_ready) { ret 4; }
+    val finished_disabled: err[outcome.Fail] = project.finish_query_phase(?p, first, nil, 0, err[outcome.Fail].ok{});
+    if (sel finished_disabled.err) { ret 4; }
+    # a snapshot: the directory opens and the store is ready
+    var snapshot_a: [32]u8;
+    var snapshot_b: [32]u8;
+    snapshot_a[0] = 37; snapshot_b[0] = 38;
+    val second_r: res[query.Operation, outcome.Fail] = project.begin_query_phase(?p);
+    if (sel second_r.err) { ret 5; }
+    val second: query.Operation = second_r.ok;
+    val prepared: err[fail.Fail] = prepare(?p, ?snapshot_a);
+    if (sel prepared.err) { ret 5; }
+    if (!p.cache_ready || p.cache_snapshot[0] != 37 || p.cache_dir == nil) { ret 5; }
     p.cache_hits = 2; p.cache_misses = 3;
-    modules[0].cache_checked = true; modules[0].cache_hit = true;
+    # module 0 holds a product restored under snapshot a; module 1 a fresh image a worker staged
+    modules[0].cache_checked = true; modules[0].cache_hit = true; modules[0].cache_under = snapshot_a;
+    val restored: *of.ObjectImage = t_boxed_image(?s);
+    if (restored == nil) { ret 6; }
+    modules[0].staged_image = restored;
+    val fresh: *of.ObjectImage = t_boxed_image(?s);
+    if (fresh == nil) { ret 6; }
+    modules[1].staged_image = fresh;
     var borrowed: of.ObjectImage = of.object_image_init(?a, ?s.interner, intern.STR_NIL);
     modules[0].object_image = ?borrowed;
-    val allocated: res[*of.ObjectImage, A.Error] = A.allocate[of.ObjectImage](s.alloc, 1);
-    if (sel allocated.err) { ret 5; }
-    val staged: *of.ObjectImage = allocated.ok;
-    @staged = of.object_image_init(s.alloc, ?s.interner, intern.STR_NIL);
-    modules[0].staged_image = staged;
-    val prepare_r2: err[fail.Fail] = prepare(?p, nil, 0);
-    if (sel prepare_r2.err) { ret 6; }
-    if (modules[0].staged_image != staged) { ret 6; }
-    if (!modules[0].cache_hit) { ret 6; }
-    if (p.cache_snapshot[0] != 37) { ret 6; }
-    if (p.cache_hits != 2) { ret 6; }
-    val finished: err[outcome.Fail] = project.finish_query_phase(?p, first, nil, 0, err[outcome.Fail].ok{});
-    if (sel finished.err) { ret 7; }
-    if (modules[0].staged_image != nil || modules[0].object_image != ?borrowed
-        || modules[0].cache_checked || modules[0].cache_hit || p.cache_ready
-        || p.cache_operation_sequence != 0 || p.cache_hits != 2 || p.cache_misses != 3) { ret 8; }
-    val prepare_r3: err[fail.Fail] = prepare(?p, nil, 0);
-    if (sel prepare_r3.ok) { ret 9; }
+    if (!staged_restored(?p, ?modules[0]) || staged_restored(?p, ?modules[1])) { ret 6; }
+    val prepare_again: err[fail.Fail] = prepare(?p, ?snapshot_b);
+    if (sel prepare_again.err) { ret 7; }
+    if (p.cache_snapshot[0] != 37 || modules[0].staged_image != restored) { ret 7; }
+    val finished: err[outcome.Fail] = project.finish_query_phase(?p, second, nil, 0, err[outcome.Fail].ok{});
+    if (sel finished.err) { ret 8; }
+    if (modules[0].staged_image != restored || !modules[0].cache_hit || !modules[0].cache_checked
+        || modules[1].staged_image != nil || modules[0].object_image != ?borrowed
+        || p.cache_ready || p.cache_initialized || p.cache_operation_sequence != 0
+        || p.cache_hits != 2 || p.cache_misses != 3 || p.cache_dir != nil) { ret 9; }
+    val prepare_r3: err[fail.Fail] = prepare(?p, ?snapshot_a);
+    if (sel prepare_r3.ok) { ret 10; }
     val restore_r: res[bool, fail.Fail] = restore(?p, 0);
     val publish_r: err[fail.Fail] = publish(?p, ?modules[0], ?borrowed);
-    if (sel restore_r.ok) { ret 9; }
-    if (sel publish_r.ok) { ret 9; }
-    val restarted: res[query.Operation, outcome.Fail] = project.begin_query_phase(?p);
-    if (sel restarted.err) { ret 10; }
-    val second: query.Operation = restarted.ok;
-    if (second.sequence == first.sequence || p.cache_hits != 0 || p.cache_misses != 0
-        || p.cache_snapshot[0] != 0 || p.cache_initialized
+    if (sel restore_r.ok) { ret 10; }
+    if (sel publish_r.ok) { ret 10; }
+    # the next operation under the same snapshot keeps the restored product
+    val third_r: res[query.Operation, outcome.Fail] = project.begin_query_phase(?p);
+    if (sel third_r.err) { ret 11; }
+    val third: query.Operation = third_r.ok;
+    if (third.sequence == second.sequence || p.cache_snapshot[0] != 0 || p.cache_initialized
         || !p.compiler_identity_initialized || p.compiler_identity_available || p.compiler_identity.bytes[0] != 91) { ret 11; }
+    val prepared_same: err[fail.Fail] = prepare(?p, ?snapshot_a);
+    if (sel prepared_same.err) { ret 12; }
+    if (modules[0].staged_image != restored || !staged_restored(?p, ?modules[0])) { ret 12; }
+    if (take_staged(?p, ?modules[0]) != restored || modules[0].staged_image != nil) { ret 12; }
+    of.object_image_dnit(restored);
+    A.deallocate[of.ObjectImage](s.alloc, restored, 1);
+    modules[0].staged_image = t_boxed_image(?s);
+    if (modules[0].staged_image == nil) { ret 12; }
+    val ended_third: err[outcome.Fail] = project.finish_query_phase(?p, third, nil, 0, err[outcome.Fail].ok{});
+    if (sel ended_third.err) { ret 13; }
+    if (modules[0].staged_image == nil) { ret 13; }
+    # a different snapshot discards it and forgets the verdict: the store is asked again
+    val fourth_r: res[query.Operation, outcome.Fail] = project.begin_query_phase(?p);
+    if (sel fourth_r.err) { ret 14; }
+    val fourth: query.Operation = fourth_r.ok;
+    val prepared_other: err[fail.Fail] = prepare(?p, ?snapshot_b);
+    if (sel prepared_other.err) { ret 14; }
+    if (modules[0].staged_image != nil || modules[0].cache_hit || modules[0].cache_checked) { ret 15; }
     p.req.object_cache = false;
-    val prepare_r4: err[fail.Fail] = prepare(?p, nil, 0);
-    if (sel prepare_r4.err) { ret 12; }
-    if (!p.cache_initialized) { ret 12; }
-    if (p.cache_ready) { ret 12; }
-    val ended: err[outcome.Fail] = project.finish_query_phase(?p, second, nil, 0, err[outcome.Fail].ok{});
-    if (sel ended.err) { ret 13; }
-    if (modules[0].object_image != ?borrowed || borrowed.alloc != ?a) { ret 14; }
+    val ended: err[outcome.Fail] = project.finish_query_phase(?p, fourth, nil, 0, err[outcome.Fail].ok{});
+    if (sel ended.err) { ret 16; }
+    if (modules[0].object_image != ?borrowed || borrowed.alloc != ?a) { ret 17; }
     ret 0;
 }
