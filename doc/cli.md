@@ -603,7 +603,7 @@ transitive closure one level deep; and there is no lock file.
 | Action   | Args | Effect |
 |----------|------|--------|
 | `pull`   | `<path>` | restore existing Git dependencies to their recorded gitlinks and initialize empty gitlink checkouts. Realize missing declared dependencies, cloning Git sources or copying path sources as needed. Retain existing path copies. Use `update` to refresh them from their sources. |
-| `verify` | `<path>` | run the build's dependency checks as a command, closure and selectors included, and print `ok`, or the first failure. A stale `mach.lock` in the root is noted here as on `pull`, since this is where a user looks when something is wrong. |
+| `verify` | `<path>` | run the build's dependency checks as a command, closure and selectors included, and print `ok`, or the first failure. A `mach.lock` in the root is refused here as everywhere else. |
 | `add`    | `<path> <name> (--git <url> [--ref <ref>] \| --path <dir>)` | validate the candidate declaration, realize its dependency closure, then publish `[dep.<name>]` in `mach.toml`. Git stages `.gitmodules` and gitlinks. Nothing is committed. |
 | `update` | `<path> (<name> \| --all)` | advance `branch/` selectors to their current remote tips and re-stage the gitlinks; move an identity to the exact selector the root declares for it (`b: <old> -> <new> (pinned to the exact selector)`, or `(exact selector, already pinned)` when nothing moves). |
 | `remove` | `<path> <name> [--purge]` | remove a Git dependency’s registration from the index and `.gitmodules` when no longer required, then publish the manifest without its declaration. The checkout is retained unless `--purge` is given. |
@@ -711,15 +711,20 @@ the identity at the root to override`), except for an identity the root
 declares with a `tag/`, whose gitlink is the pin; the rules are in
 [manifest.md](manifest.md#what-a-build-verifies).
 
-### 4.30.0 and 5.0.0
+### Removed forms
 
 A `[dep.<key>]` whose realized project declares a different id is an **alias
-key**. 4.30.0 realizes it and prints a migration note
-(`note: [dep.foo] realizes project 'std'; rename the table to [dep.std] and the
-directory to dep/std. alias keys are rejected in 5.0.0`). A `mach.lock` from
-an earlier release is not read; `pull` prints `note: mach.lock is not read;
-the committed gitlinks under dep/ are the pins, so delete it. mach.lock is
-rejected in 5.0.0`.
+key**, removed in 5.0.0: `pull`, `verify` and every build refuse it
+(`[dep.foo] realizes project 'std'; alias keys were removed in 5.0.0: the
+manifest key, the directory under dep/, and the project id are one name, so
+rename the table to [dep.std] and the directory to dep/std`); `pull` rolls the
+refused realization back. A realized `dep/<id>/dep/<x>/mach.toml` (a **nested
+realization** left by an older tool) is refused the same way, naming the
+directory to delete; the empty directory git materializes for a consumed
+dependency's own gitlink is not a realization and passes. A `mach.lock` in the
+project root is refused by every command that opens the project
+(`mach.lock was removed in 5.0.0 and is refused; the committed gitlinks under
+dep/ are the pins: delete mach.lock`).
 
 Exit codes: `0` ok, `1` user error, `2` internal error, `3` environmental
 error (git missing or a git operation that failed).

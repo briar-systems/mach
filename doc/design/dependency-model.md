@@ -58,8 +58,9 @@ Three spellings of one thing is three places for a mismatch, and a reader of
 collapses them: `[dep.<id>]`, `dep/<id>/`, `<id>.*` in source, and the build
 checks that `dep/<id>/mach.toml` declares that id. Aliases are gone rather
 than tolerated because an alias changes spelling without changing identity,
-and identity is the thing every rule below keys on. 4.30.0 accepts an alias
-key with a note naming the rename; 5.0.0 rejects it.
+and identity is the thing every rule below keys on. 4.30.0 accepted an alias
+key with a note naming the rename; 5.0.0 removed it and refuses the key by
+name.
 
 ## One commit per identity, and the consumer resolves a clash
 
@@ -165,7 +166,8 @@ repository sharing one `dep/`); and cross-package artifact requirements.
 
 ## Release shape
 
-4.30.0 accepts the older forms (alias keys, nested realization, a stray
-`mach.lock`) beside the new ones, each with a migration note; 5.0.0 rejects
-them. The reason is the seed compiler that builds mach itself — see
+4.30.0 accepted the older forms (alias keys, nested realization, a stray
+`mach.lock`) beside the new ones, each with a migration note; 5.0.0 removed
+them and refuses each by name. The reason is the seed compiler that builds
+mach itself — see
 [release-shape.md](release-shape.md).

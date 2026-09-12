@@ -923,9 +923,10 @@ registry-style `version =` is reserved and rejected
 
 The record of which commit a dependency is at is the **gitlink** committed in
 the root repository, generated into `.gitmodules` by `mach dep`. Nothing else
-records a pin: there is no `mach.lock`, and a `mach.lock` left over from an
-earlier release is not read. In 4.30.0 it is ignored; 5.0.0 rejects a project
-that carries one, with a diagnostic naming the migration.
+records a pin: there is no `mach.lock`, and a project that still carries one
+is refused by every command that opens it, with a diagnostic naming the
+removal (`mach.lock was removed in 5.0.0 and is refused; the committed
+gitlinks under dep/ are the pins: delete mach.lock`).
 
 A project does not need its own Git repository. In a repository root, Git
 dependencies use the staged gitlinks as their pins. In a filesystem project or a
@@ -1033,20 +1034,23 @@ proposal to select the highest same-major release is not accepted for v5.
 retains explicit selection for v5. Future compatibility-range selection requires
 a separate decision.
 
-### 4.30.0 and 5.0.0
+### Removed forms
 
-4.30.0 accepts two older forms beside the ones above and notes the migration;
-5.0.0 rejects them:
+Three older forms that 4.30.0 accepted with a migration note were removed in
+5.0.0 and are refused by `pull`, `verify` and every build:
 
 - an **alias key**, a `[dep.<key>]` whose realized project declares a
-  different id. 4.30.0 realizes it and prints
-  `note: [dep.foo] realizes project 'std'; rename the table to [dep.std] and
-  the directory to dep/std. alias keys are rejected in 5.0.0`;
-- **nested realization**, a `dep/<id>/dep/` left by an older tool; 4.30.0
-  ignores it;
-- `mach.lock`, ignored in 4.30.0 as above; `pull` prints
-  `note: mach.lock is not read; the committed gitlinks under dep/ are the
-  pins, so delete it. mach.lock is rejected in 5.0.0`.
+  different id:
+  `[dep.foo] realizes project 'std'; alias keys were removed in 5.0.0: the
+  manifest key, the directory under dep/, and the project id are one name, so
+  rename the table to [dep.std] and the directory to dep/std`;
+- a **nested realization**, a `dep/<id>/dep/<x>/mach.toml` left by an older
+  tool: `dependency 'a': dep/a/dep/b is a nested realization; nested
+  realizations were removed in 5.0.0 (the root's dep/ owns the flat closure and
+  a dependency's own dep/ is never realized): delete dep/a/dep`. The empty
+  directory git materializes for a consumed dependency's own gitlink is not a
+  realization and passes;
+- `mach.lock`, refused as above.
 
 Command-line usage (`pull`, `verify`, `add`, `update`, `remove`, `list`) is
 documented in [cli.md](cli.md#mach-dep).

@@ -392,6 +392,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file must live inside the project ``, and the driver skips the path when it
   collects embed inputs, so the file outside the project is never opened. 4.30
   read it and warned (#3226, #3112).
+- Alias dependency keys, nested realizations and `mach.lock`. A `[dep.<key>]`
+  whose realized project declares a different id is refused by `pull`,
+  `verify` and every build (`[dep.foo] realizes project 'std'; alias keys were
+  removed in 5.0.0: ... rename the table to [dep.std] and the directory to
+  dep/std`), so the manifest key, the directory under `dep/` and the project
+  id are one name everywhere; the build checked none of this in 4.30. A
+  realized `dep/<id>/dep/<x>/mach.toml` is refused naming the directory to
+  delete, while git's empty gitlink directory for a consumed dependency's own
+  dependency still passes. A `mach.lock` in the project root is refused by
+  every command that opens the project (`mach.lock was removed in 5.0.0 and
+  is refused; the committed gitlinks under dep/ are the pins: delete
+  mach.lock`) instead of being noted and ignored. With aliases gone one
+  identity is one directory, so the driver's content-conflict diagnostic for
+  two keys realizing one id is unreachable and is deleted; a selector clash is
+  reported by `mach dep` as before (#3226, #3112).
 
 ## [4.30.0] - 2026-09-07
 
