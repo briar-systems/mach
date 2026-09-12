@@ -148,6 +148,32 @@ migrate, and leaves `mach.lang.legacy` for C5 to delete when
 `grep -rl 'mach\.lang\.legacy' src` is empty. The lanes do not add
 compatibility fallbacks and do not classify a neighbour's rendered text.
 
+## C4 decisions
+
+An allocation refusal met by the driver stays an internal failure:
+`outcome.refused(e)` is `Fail.internal{alloc.text(e)}` and the process exits
+2, exactly as before the migration. The reason is where the refusal is met.
+The driver's allocations are the compiler's own working set (module tables,
+query storage, plan and outcome records), sized by the input and the
+compiler's choices, not by the machine: a refusal there says the compiler
+asked for more than it should have, which is the internal class, and a
+script that keys on exit 3 to retry or to report the host rather than the
+compiler must not be told that. Environmental failures (exit 3) stay what
+they are today: the host refusing a filesystem, process or lock operation
+the compiler was entitled to make. The cost of the alternative would have
+been an exit-code change visible to every caller for no diagnostic gain, since
+the rendered text ("out of memory") is the same either way. Pinned by
+`mach.cli.diagnostic.render_fail:an_allocation_refusal_met_by_the_driver_exits_internal`
+(the case, the rendered text and the code through both `render_fail_w` and
+`outcome_code`) alongside C1's `mach.lang.build.outcome.fail:cases_text_and_lift`.
+
+Zero-valued carriers: `err[E]` and `res[T, E]` are zero as their `err` case
+(std's canonical layout puts the failure first), where the legacy
+`O.Option[str]` was zero as "no error". Every accumulator the driver keeps
+across a sequence of clean-up steps (`directory_close`, `operation_close` in
+`cli.cmd.init`) is therefore initialised to `.ok{}` explicitly, and the lane
+carries no other zero-relying carrier.
+
 ## Verification
 
 - unit suite, from-source compiler built by the v5 stage, debug and release:
