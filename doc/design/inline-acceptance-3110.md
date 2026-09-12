@@ -1,11 +1,17 @@
 # Inlining acceptance inventory for #3110
 
-Roadmap item N6, phase 1. One row per acceptance bullet of #3110: what `dev`
-does at the start of this lane (`853d4c17`) with the test that shows it, what
-the three candidate commits on `archive/3218-candidate-era` add, and a verdict.
-The compiler policy is covered here with local fixtures shaped like the eight
-`std.sync.atomic` wrappers (short asm bodies with volatile memory effects); the
-std-side annotations are Track C's S4 and are not part of this lane.
+Roadmap item N6. One row per acceptance bullet of #3110: what `dev` does at the
+start of the phase 1 lane (`853d4c17`) with the test that shows it, what the
+three candidate commits on `archive/3218-candidate-era` add, and a verdict.
+Phase 1 (#3270) covered the compiler policy with local fixtures shaped like the
+eight `std.sync.atomic` wrappers (short asm bodies with volatile memory
+effects). Phase 2, recorded in the `Phase 2` paragraphs below, asserts the same
+claims on the wrappers std ships: `dev` at `83d3c1c9d` pins std 2.0.0
+(`e6fc41251`), whose `std.sync.atomic` carries the eight `#[inline]`
+annotations (S4a, std PR #633), and the evidence is a link-suite case that
+links and runs them on the three native ELF targets with the call counts read
+from the linked image, plus three driver tests that read the pinned
+`dep/std/src/sync/atomic.mach` itself.
 
 Candidate commits, in the order they are ported:
 
@@ -125,6 +131,19 @@ Candidate: `Q_INLINE_BODIES` plus `body.Available` as described above. Shown by
 Verdict: gap on `dev`, closed by the port. Phase 1 adds the machine-text
 check `driver:inline_cross_module_helper_leaves_no_call_in_x86_64_text`.
 
+Phase 2: `test/link/cases/3110-atomic-inline` builds a program that calls each
+of the eight wrappers from the pinned std across the module boundary and reads
+the linked image with `llvm-objdump`: the release cell's
+`calls from case text:` line is `load=0 store=0 cas=0 fetch_add=0 fetch_sub=0
+exchange=0 fence=0 spin_hint=0` over every function the case defines (`main`
+and `case.*`), on `x86_64-linux`, `aarch64-linux` and `riscv64-linux`; the
+debug cell is the control with `load=4 store=4 cas=3 fetch_add=3 fetch_sub=2
+exchange=2 fence=2 spin_hint=5`, the counts the source has. Mutation control:
+`#[noinline]` on `fetch_add` in the case's std copy reads `fetch_add=3` and
+`call std.sync.atomic.fetch_add` in the probe sequence. At the IR level
+`driver:inline_std_atomic_wrappers_lose_their_calls_and_keep_their_asm_in_order`
+counts zero `OP_CALL` and eight `OP_ASM` in the importer.
+
 ### Bounded growth
 
 `dev`: `INLINE_BUDGET` (1024) counts inlining events per caller, not
@@ -195,6 +214,26 @@ release pipeline, store/fence/store keep their order in IR and at MIR, and each
 MIR asm keeps its `MirAsm` payload with both `{name}` bindings. The `naked`
 refusal is the `nkd` leg of the rule test.
 
+Phase 2: the same case's `probe:` block lists the atomic instructions of
+`case.main.probe` in text order, which is the order the eight wrappers were
+called in. The goldens (`expect.<target>.release.txt`) record, per ISA:
+
+| ISA | sequence the importer's text carries |
+| --- | --- |
+| x86_64 | `xchgq` (store), `lock cmpxchgq` (cas), `lock xaddq` (fetch_add), `lock xaddq` after `neg` (fetch_sub), `xchgq` (exchange), `mfence`, `pause`; the load is a plain aligned `mov` |
+| aarch64 | `ldar` (load), `stlr` (store), then `ldaxr`/`stlxr`/`dmb ish` for cas, fetch_add, fetch_sub and exchange, `dmb ish` (fence), `yield` |
+| riscv64 | `fence`/`ld`/`fence` (load), `amoswap.d.aqrl zero` (store), `lr.d.aqrl`/`sc.d.aqrl` (cas), `amoadd.d.aqrl` twice, `amoswap.d.aqrl` (exchange), `fence`, `fence w, 0` (the `pause` hint) |
+
+The program the case runs uses every wrapper from two threads in shapes whose
+correctness depends on the atomicity and the ordering the wrappers promise (a
+fetch_add counter, a cas loop counter, a fetch_sub countdown, a spinlock from
+exchange and store, and a producer/consumer handshake through store/load with
+a fence), and its `added=40000 swapped=40000 remaining=0 guarded=40000 torn=0`
+line is part of the golden. In IR,
+`driver:inline_std_atomic_wrappers_lose_their_calls_and_keep_their_asm_in_order`
+checks each of the eight inlined `OP_ASM` payloads in call order for its own
+x86-64 instruction.
+
 ### Secrecy
 
 `dev`: `secret` on values and instructions survives cloning
@@ -239,6 +278,11 @@ adds a `dbg_value` per local, is inlined at both call sites with and without
 `OP_DBG_VALUE` in `body.counted()` keeps the calls under `-g` and the texts
 differ.
 
+Phase 2:
+`driver:release_text_is_byte_identical_with_and_without_g_for_the_std_atomic_wrappers`
+runs the same comparison over an importer of the pinned std's eight wrappers:
+zero calls in both builds and identical `.text` bytes.
+
 ### Cache and query dependency invalidation
 
 `dev`: an `#[inline]` body is part of `Q_LOWERED_SURFACE`, so its edit
@@ -259,6 +303,14 @@ adds `driver:inline_body_product_stops_propagation_when_extracted_bodies_are_equ
 an edit to a `noinline` provider function moves the provider's `Q_LOWER` and
 not the importer's, and an edit to the extracted helper moves both.
 
+Phase 2: `driver:std_atomic_wrapper_body_edit_relowers_the_importer` runs three
+rounds over the pinned `atomic.mach` as the std dependency: the shipped text,
+then `fence`'s `mfence` edited to `lfence`, then an edit to a `noinline`
+function appended beside the wrappers. The importer's `Q_LOWER` revision moves
+on the body edit while the provider's `Q_LOWERED_SURFACE` does not, and the
+importer's seventh inlined asm carries `lfence`; the edit beside the wrappers
+moves the provider's `Q_LOWER` and leaves the importer's.
+
 ### Pure versus atomic controls
 
 `dev`: there is no purity model in the inliner or the pipeline; an inlining
@@ -272,19 +324,57 @@ Verdict: accepted on `dev`. The controls are the effect legs above: an inlined
 atomic-shaped wrapper whose result is unused is not removed and two identical
 ones are not merged.
 
+Phase 2: the link case's `contend` calls `fetch_add` and `fetch_sub` for their
+effect only, and its counts come out right on all three targets; the release
+goldens show the `lock xaddq` / `ldaxr`+`stlxr` / `amoadd.d.aqrl` still in the
+importer's text, not dropped as a pure call with an unused result.
+
 ### The eight atomic wrappers
 
-`std.sync.atomic` at the pinned std (`168a9f76`, 1.0.1) defines `load`,
+`std.sync.atomic` at the std phase 1 pinned (`168a9f76`, 1.0.1) defined `load`,
 `store`, `cas`, `fetch_add`, `fetch_sub`, `exchange`, `fence` and `spin_hint`
 as unannotated `pub fun` bodies of one `asm` block under `$if` on the build
 arch, each well under 25 live instructions after `mem2reg`. Under the ported
 policy every one is extracted into `Q_INLINE_BODIES` and inlined at its
-importers with no std-side annotation; `#[inline]` would only override the
-size bar, which they clear. The local fixtures in the phase 1 tests mirror
-their shape (a `{ptr}`/`{result}` binding pair around one memory instruction).
+importers with no std-side annotation; `#[inline]` only overrides the size
+bar, which they clear. The local fixtures in the phase 1 tests mirror their
+shape (a `{ptr}`/`{result}` binding pair around one memory instruction).
 
-Verdict: compiler policy covered by the effect legs above; the std-side
-annotations remain Track C's S4 and are not needed for elimination.
+Phase 1 verdict: compiler policy covered by the effect legs above; the
+std-side annotations were Track C's S4 and not needed for elimination.
+
+Phase 2: std 2.0.0 (`e6fc41251`, pinned by `dev` at `83d3c1c9d`) carries the
+eight `#[inline]` annotations (S4a, std PR #633; its MIGRATION.md records that
+the release policy already inlines them unannotated and the annotations pin
+the decision). The wrappers themselves are now the subject:
+
+| evidence | where | what it shows |
+| --- | --- | --- |
+| link case `3110-atomic-inline`, release cells | `test/link/cases/3110-atomic-inline/expect.{x86_64,aarch64,riscv64}-linux.release.txt` | zero direct calls to any `std.sync.atomic.*` symbol from the case's text; the ISA's atomic instruction sequence in call order in `probe`; the program's single-thread results and two-thread counts |
+| link case, debug cells | `expect.<target>.debug.txt` | the control: eight `call std.sync.atomic.*` in `probe`, per-wrapper call counts matching the source |
+| link case, `by-address=100` | the goldens | a call through a function value the optimizer cannot see through (`pick` is `noinline`) reaches the provider's one strong definition, which no inlined copy replaces |
+| `driver:inline_std_atomic_wrappers_lose_their_calls_and_keep_their_asm_in_order` | `src/lang/driver/tests.mach` | zero `OP_CALL`, eight `OP_ASM` in call order, each payload the wrapper's own x86-64 instruction |
+| `driver:release_text_is_byte_identical_with_and_without_g_for_the_std_atomic_wrappers` | same | `-g` moves no inlining decision on the real wrappers |
+| `driver:std_atomic_wrapper_body_edit_relowers_the_importer` | same | an edit to `atomic.mach`'s body re-lowers the importer and reaches its text; an edit beside the wrappers does not |
+
+The three driver tests read `dep/std/src/sync/atomic.mach` and
+`dep/std/src/types/bool.mach` from the repository at test time and place them
+verbatim in a `std` path dependency of the scaffold, so they measure the file
+std ships at the pin rather than a restatement of it. Mutation controls:
+`#[noinline]` on `fetch_add` in the case's std copy fails the release goldens
+(`fetch_add=3`, `call std.sync.atomic.fetch_add` in the sequence), and
+`#[noinline]` on `cas` in the pinned `dep/std` fails the three driver tests
+(exits 8, 50 and 10: calls present).
+
+The link case's `aarch64-linux` goldens were blessed from a `qemu-aarch64` run
+of the producer on the x86-64 host (the observable is the instruction text
+and the program's deterministic output); the leg itself executes natively on
+CI's arm runner. `riscv64-linux` executes under qemu on both, which
+`test/engines.conf` marks as compute evidence only: the ordering claim on that
+ISA rests on the instruction sequence the case reads from the image.
+
+Verdict: every #3110 bullet is demonstrated on the wrappers std ships, on the
+three native ELF targets.
 
 ## Corpus goldens moved by this change
 
