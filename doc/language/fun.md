@@ -15,7 +15,10 @@ fun NAME(fixed, va: ...) RET { ... }    # variadic pack parameter
 
 ## Examples
 
-```mach
+```mach accept
+rec Pair[T, U] { left: T; right: U; }
+var counter: i64 = 0;
+
 pub fun add(a: i64, b: i64) i64 {
     ret a + b;
 }
@@ -34,7 +37,6 @@ pub fun make_pair[T, U](a: T, b: U) Pair[T, U] {
     p.right = b;
     ret p;
 }
-
 ```
 
 ## Generic type parameters
@@ -92,7 +94,10 @@ variable number of trailing arguments. The compiler monomorphizes the
 function once per distinct call-site type-list; the pack is consumed by
 `$each a in va` at compile time — there is no runtime `va_list`.
 
-```mach
+```mach run "60 61"
+use std.runtime;
+use print: std.print;
+
 pub fun sum(va: ...) i64 {
     var t: i64 = 0;
     $each a in va {
@@ -106,6 +111,12 @@ pub fun bias(base: i64, va: ...) i64 {
     var t: i64 = base;
     $each a in va { t = t + a; }
     ret t;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{} {}", sum(10i64, 20i64, 30i64), bias(1, 10i64, 20i64, 30i64));
+    ret 0;
 }
 ```
 

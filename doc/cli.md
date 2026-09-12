@@ -51,6 +51,9 @@ argument forwarding.
 | `info`  | print compiler version, build host, and registered target capabilities |
 | `help`  | print usage; `mach help <command>` for detail |
 
+`mach fmt`, the canonical formatter (#3225), is in a parallel lane and is not
+a command of this binary; it is documented here when it merges.
+
 ## Global flags
 
 Read by `build` and `test`, which share one schema. `check` accepts the
@@ -608,6 +611,7 @@ transitive closure one level deep; and there is no lock file.
 | `update` | `<path> (<name> \| --all)` | advance `branch/` selectors to their current remote tips and re-stage the gitlinks; move an identity to the exact selector the root declares for it (`b: <old> -> <new> (pinned to the exact selector)`, or `(exact selector, already pinned)` when nothing moves). |
 | `remove` | `<path> <name> [--purge]` | remove a Git dependency’s registration from the index and `.gitmodules` when no longer required, then publish the manifest without its declaration. The checkout is retained unless `--purge` is given. |
 | `list`   | `<path>` | print each realized dependency with its source, selector, pinned commit, and state (`realized`/`missing`). |
+| `sync`   | `<path>` | the pre-`pull` name, kept as a deprecated alias of `pull`; it runs `pull` exactly. |
 
 Dependency changes use Git's normal submodule and index operations. Validation
 rejects conflicts that can be determined before those operations begin. A remote
@@ -624,8 +628,6 @@ error. Completed Git operations remain. Concurrent Mach manifest
 edits are serialized. Git provides its own locking for each Git operation.
 Directories outside the resulting closure are reported and retained for explicit
 removal.
-
-`sync` is the pre-`pull` name, kept as a deprecated alias of `pull`.
 
 Every action requires its project directory or manifest path as the first
 positional operand, resolved by the same rules as `mach build <path>`. Write `.`
@@ -844,7 +846,7 @@ needs no project (it runs from anywhere, with or without a `mach.toml`). The
 output is line-oriented and stable for scripts:
 
 ```
-mach 4.30.0
+mach 5.0.0
 host: linux/x86_64
 isa: x86_64 aarch64 riscv64 riscv32 spirv
 os: linux darwin windows freestanding
@@ -852,9 +854,9 @@ abi: sysv64 win64 aapcs64 lp64 lp64f lp64d ilp32 ilp32f ilp32d spirv
 object: elf coff macho raw spv
 ```
 
-The version line and `host:` line fold at compile time; the four capability
-lines are read from the binary's target registries, so they report exactly what
-this build can target. `mach info --version` prints the version string alone
+The version line (the compiler's own version string) and `host:` line fold at
+compile time; the four capability lines are read from the binary's target
+registries, so they report exactly what this build can target. `mach info --version` prints the version string alone
 on one line, for tooling.
 
 `mach info targets` prints the **supported target-tuple matrix** — one

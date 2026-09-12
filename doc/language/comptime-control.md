@@ -56,7 +56,10 @@ fixed per call site. `$if` / `$or` may branch on it: the compiler
 **monomorphizes** the function body once per distinct comptime-argument value,
 and each instance compiles only the arm its value selects.
 
-```mach
+```mach run "14 49"
+use std.runtime;
+use print: std.print;
+
 val MODE_DOUBLE: u8 = 0;
 val MODE_SQUARE: u8 = 1;
 
@@ -72,6 +75,11 @@ fun apply($mode: u8, n: i64) i64 {
 
 # apply(MODE_DOUBLE, ..) and apply(MODE_SQUARE, ..) emit two distinct bodies,
 # each carrying only its selected arm.
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{} {}", apply(MODE_DOUBLE, 7), apply(MODE_SQUARE, 7));
+    ret 0;
+}
 ```
 
 Rules:
@@ -143,13 +151,17 @@ and the stage that would have to know that is the one being chosen.
 A `use` is a declaration, so a conditional import is always decided while names are
 resolved. That is what makes the common target-gating form work.
 
-```mach
+```mach accept
 rec MeshUniforms { model: [16]f32; }
 
 # no arm declares: decided during type checking, so the gate may measure
 $if ($size_of(MeshUniforms) != 64) {
     $error("MeshUniforms must be 64 bytes");
 }
+```
+
+```mach reject "an arm of this `$if` declares something"
+rec MeshUniforms { model: [16]f32; }
 
 # the second arm declares, so the whole chain is decided while names are
 # resolved - and the gate is rejected there

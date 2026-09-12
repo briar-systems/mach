@@ -26,7 +26,7 @@ digit separators (`0xFFu8`, `0b1010u16`, `1_000_000u32`, `1.5e2f32`).
 A suffixed literal *is* that type, in the same way a variable of that type
 is. It is not a hint, and it is never silently retyped:
 
-```mach
+```mach reject "type mismatch"
 val a: u32 = 7u32;      # fine
 val b: u64 = 7u32;      # error: type mismatch, expected u64, found u32
 val c: f64 = 1.5f32;    # error: type mismatch, expected f64, found f32
@@ -37,16 +37,16 @@ val e: u32 = 7u32 + 8u64;  # error: operands are different types
 Because a suffixed literal is already typed, it is what types the elements
 of a pack tail, where nothing else constrains them:
 
-```mach
+```mach accept
 fun sink(va: ...) u32 { var acc: u32 = 0; $each a in va { acc = acc + a; } ret acc; }
-val total: u32 = sink(7u32, 8u32);
+fun total() u32 { ret sink(7u32, 8u32); }
 ```
 
 A literal outside the range of the type its suffix declares is rejected,
 with the range named. A leading `-` is part of the range check, so the
 most negative value of a signed type is written the way it reads:
 
-```mach
+```mach reject "out of range"
 val a: i8  = -128i8;   # fine
 val b: i8  = 128i8;    # error: literal 128 is out of range for i8 (-128..127)
 val c: u8  = 256u8;    # error: literal 256 is out of range for u8 (0..255)
@@ -99,12 +99,12 @@ address is a valid null callback). The coercion is uniform across every
 position a value flows into: globals, locals, record fields, array elements,
 call arguments, and return slots.
 
-```mach
+```mach accept
 def F: fun(u32);
 var p: *i64 = nil;          # null pointer
 var cb: fun(u32) = nil;     # null function pointer
 var k:  F = nil::F;         # the cast spelling works too
-val absent: u8 = p == nil;  # nil compares against any pointer-like value
+fun absent() u8 { ret p == nil; }  # nil compares against any pointer-like value
 ```
 
 nil coerces only to pointer-like targets; assigning it to a non-pointer slot

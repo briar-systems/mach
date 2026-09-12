@@ -48,9 +48,9 @@ A **type** may not. `rec`, `uni`, `tag`, and `def` reject a name spelled as a ve
 form, because a type declared with a vector's name would be silently unreachable:
 every use in type position resolves to the vector instead:
 
-```mach
+```mach reject "spelled as a vector type"
 rec f32x3 { x: f32; }           # error: `f32x3` is spelled as a vector type
-tag f32x4: u8 { empty; }            # error: `f32x4` is spelled as a vector type
+tag f32x4: u8 { empty; }        # error: `f32x4` is spelled as a vector type
 ```
 
 This holds for any well-formed spelling, so the name cannot be claimed by a type
@@ -259,11 +259,14 @@ val g: [2][2]i64 = [2][2]i64{ [2]i64{1, 2}, [2]i64{3, 4} };
 **Constant indices are bounds-checked at compile time.** `N` is part of the
 type, so an index the compiler can fold must land in `[0, N)`:
 
-```mach
-var xs: [4]i32;
-val a: i32 = xs[3];             # ok
-val b: i32 = xs[4];             # error: index 4 is out of bounds for `[4]i32` of length 4
-val c: i32 = xs[-1];            # error: index -1 is out of bounds ...
+```mach reject "out of bounds"
+fun read() i32 {
+    var xs: [4]i32;
+    val a: i32 = xs[3];             # ok
+    val b: i32 = xs[4];             # error: index 4 is out of bounds for `[4]i32` of length 4
+    val c: i32 = xs[-1];            # error: index -1 is out of bounds ...
+    ret a + b + c;
+}
 ```
 
 The rule is keyed on the length the type carries, not on how the array was
@@ -280,10 +283,21 @@ not indexed against any length at all — `*T` carries none.
 
 `fun(T1, T2) R` — first-class function-pointer type.
 
-```mach
+```mach run "5"
+use std.runtime;
+use print: std.print;
+
+fun add(a: i64, b: i64) i64 { ret a + b; }
+
 def BinOp: fun(i64, i64) i64;
 val op: BinOp = add;
-val r:  i64   = op(2, 3);
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val r: i64 = op(2, 3);
+    print.printlnf("{}", r);
+    ret 0;
+}
 ```
 
 ## Record and union types
@@ -291,10 +305,11 @@ val r:  i64   = op(2, 3);
 `rec` and `uni` declarations produce named types. See [rec.md](rec.md) and
 [uni.md](uni.md).
 
-## Tag types and canonical tags
+## Tag types and the std failure tags
 
 A `tag` declaration introduces a named tagged value type that holds exactly one
-active case. A case may be payloadless or carry one explicitly typed payload:
+active case, selected by an explicitly typed discriminator. A case may be
+payloadless or carry one explicitly typed payload:
 
 ```mach
 tag Reply: u8 {
@@ -303,26 +318,26 @@ tag Reply: u8 {
 }
 ```
 
-Mach also provides three compiler-known canonical tag types with fixed generic
-arities:
+The failure types every std API answers with are three ordinary std tags with
+fixed generic arities, declared in `std.types.canonical` and imported like any
+other declaration (`use std.types.canonical.res;`):
 
-- `res[T, E]` represents an outcome with error case `err: E` and success case `ok: T`
-- `opt[T]` represents optional presence with absence case `none` and value case `some: T`
-- `err[E]` represents a distinct outcome with error case `err: E` and payloadless success case `ok`
+- `res[T, E]` is an outcome with error case `err: E` first and success case `ok: T` second
+- `opt[T]` is presence with payloadless `none` first and `some: T` second
+- `err[E]` is an outcome with error case `err: E` first and payloadless success `ok` second
 
-Canonical `err[E]` is not an alias of `opt[E]`. There are no defaulted generic
-arguments, general type inference, or dummy success types.
+`err[E]` is not an alias of `opt[E]`. There are no defaulted generic
+arguments, no general type inference and no dummy success types; the compiler
+has no knowledge of the three names, so a module that imports none of them
+cannot spell them, and a module may declare its own.
 
-The case names `ok`, `err`, `some`, and `none` are contextual case names, not
-global keywords.
+The case names `ok`, `err`, `some`, and `none` are members of their tags, not
+keywords.
 
 Numeric vector spellings such as `f32x4` denote SIMD vector types and require
 full-lane initialization, whereas a tag value names one case and its payload
-(`Reply.empty{}` or `res[i64, ParseError].ok{42}`).
-
-Accepted v5 contract. The accepted Mach v5 design specifies an explicit
-discriminator type, `Type.case{payload}` construction, `sel` case tests and
-payload places under a lexical guard. See [tag.md](tag.md).
+(`Reply.empty{}` or `res[i64, ParseError].ok{42}`). Construction, the `sel`
+case test and the lexical payload guards are in [tag.md](tag.md).
 
 ## Type aliases
 

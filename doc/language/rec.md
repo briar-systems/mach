@@ -18,7 +18,7 @@ rec NAME[T, U] { ... }      # generic over type parameters
 
 ## Examples
 
-```mach
+```mach accept
 pub rec Point {
     x: i64;
     y: i64;
@@ -34,10 +34,21 @@ pub rec Pair[T, U] {
 
 A record literal names the type and provides each field by name:
 
-```mach
-val p: Point          = Point{ x: 1, y: 2 };
-val q: Pair[i64, u8]  = Pair[i64, u8]{ left: 5, right: 6u8 };
-val n: i64            = p.x;            # field access via .
+```mach run "1 6"
+use std.runtime;
+use print: std.print;
+
+rec Point { x: i64; y: i64; }
+rec Pair[T, U] { left: T; right: U; }
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val p: Point          = Point{ x: 1, y: 2 };
+    val q: Pair[i64, u8]  = Pair[i64, u8]{ left: 5, right: 6u8 };
+    val n: i64            = p.x;            # field access via .
+    print.printlnf("{} {}", n, q.right);
+    ret 0;
+}
 ```
 
 ## Layout

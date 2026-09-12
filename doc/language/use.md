@@ -23,17 +23,28 @@ the symbol, not its module.
 
 ## Examples
 
-```mach
+```mach accept
 use std.types.size;             # binds module 'size'; use as `size.usize`
 use sz: std.types.size;         # binds module under 'sz'; use as `sz.usize`
 use std.types.size.usize;       # binds symbol 'usize'; use bare as `usize`
 use my_usize: std.types.size.usize;  # binds symbol under 'my_usize'
-use std;                         # bare project id: binds std's public module
+
+val a: size.usize = 1;
+val b: sz.usize = 2;
+val c: usize = 3;
+val d: my_usize = 4;
+```
+
+```mach
+use mylib;                       # bare project id: binds mylib's public module
 ```
 
 A one-segment path equal to a resolvable project id binds that project's
 public module, the `entry` shared by its library artifacts marked
-`default = true` — see [modules.md](modules.md#bare-project-id-imports).
+`default = true` — see [modules.md](modules.md#bare-project-id-imports). A
+dependency that marks none has no public module and is imported by full
+path only; std 2.0.0 is one (`use std;` is refused naming the rule, while
+`use std.print;` needs no default artifact).
 
 ## Design rule
 
