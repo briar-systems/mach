@@ -63,7 +63,7 @@ if want b-be-7; then
     # B-BE-7 / G-8: an ISA identity is known to the target layer and the registry
     # alone. shared codegen, the frontend, the middle end, the linker and the
     # driver read a target's declarations, never its name.
-    census b-be-7 'ARCH_X86_64|ARCH_AARCH64|ARCH_RISCV|ARCH_SPIRV|ARCH_MOS6502' \
+    census b-be-7 'ARCH_X86_64|ARCH_AARCH64|ARCH_RISCV|ARCH_SPIRV' \
         "$root/src/lang/be" "$root/src/lang/fe" "$root/src/lang/me" \
         "$root/src/lang/build" "$root/src/lang/driver" "$root/src/cli"
 fi

@@ -195,8 +195,10 @@ such an image is refused at link rather than silently dropped.
 | `os`  | `linux`, `windows`, `darwin`, `freestanding` |
 | `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, `ilp32d`, `spirv` |
 
-`mos6502` (an `isa` and an `abi`) is still accepted by 4.30.0 as a withdrawn
-experiment and is removed in 5.0.0; do not declare it.
+The withdrawn MOS 6502 target was deleted in 5.0.0: a `[target.*]` naming
+`mos6502` as its `isa` or `abi` is refused by name (`target 'mos6502' was
+withdrawn and removed in 5.0.0; no isa or abi implementation is registered for
+it: retarget the [target.*] table to a supported tuple`).
 
 `x86_64`/`linux`/`sysv64` is the primary host and target. `aarch64`-linux builds
 and runs natively in CI on every PR; `riscv64`-linux runs under qemu and

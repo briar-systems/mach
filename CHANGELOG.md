@@ -413,6 +413,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   artifact-less dependency was removed in 5.0.0: import a full path, or declare
   a static or shared [artifact.*] table marked default = true in its
   manifest ``. Full-path imports need no artifact (#3226, #3112).
+- The MOS 6502 target. Its instruction set (`target/isa/mos6502/`), ABI
+  member, registry rows, freestanding OS row, `$mach.arch.mos6502` tag, the
+  `target_unavailable` tuple capability that existed only to hold it, its
+  corpus column (`test/golden/mos6502`, its `engines.conf` row and SKIPS) and
+  its fuzz seed are deleted; the `da65` decoder was never pinned. A
+  `[target.*]` that still names `mos6502` as its `isa` or `abi` is refused by
+  name at target resolution, `target 'mos6502' was withdrawn and removed in
+  5.0.0; no isa or abi implementation is registered for it`. The architecture
+  catalog is at version 2 (its fingerprint tags closed the gap) and `arch` id
+  4 is reserved as `MOS6502_WITHDRAWN`. The width legalization pass the target
+  drove stays as shared infrastructure, exercised by its unit tests and the
+  riscv32 column (#3226, #3112).
 
 ## [4.30.0] - 2026-09-07
 

@@ -844,17 +844,16 @@ output is line-oriented and stable for scripts:
 ```
 mach 4.30.0
 host: linux/x86_64
-isa: x86_64 aarch64 riscv64 riscv32 spirv mos6502
+isa: x86_64 aarch64 riscv64 riscv32 spirv
 os: linux darwin windows freestanding
-abi: sysv64 win64 aapcs64 lp64 lp64f lp64d ilp32 ilp32f ilp32d spirv mos6502
+abi: sysv64 win64 aapcs64 lp64 lp64f lp64d ilp32 ilp32f ilp32d spirv
 object: elf coff macho raw spv
 ```
 
 The version line and `host:` line fold at compile time; the four capability
 lines are read from the binary's target registries, so they report exactly what
-this build can target (`mos6502` is the withdrawn experiment still registered
-in 4.30.0 and removed in 5.0.0). `mach info --version` prints the version
-string alone on one line, for tooling.
+this build can target. `mach info --version` prints the version string alone
+on one line, for tooling.
 
 `mach info targets` prints the **supported target-tuple matrix** — one
 `<os>-<isa>` per line — for exactly the tuples this binary can compose and emit
