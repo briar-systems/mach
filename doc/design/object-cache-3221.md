@@ -373,3 +373,96 @@ by construction: verifying the note against the file would mean hashing the
 file, which is the cost being removed. The cache's question is "which compiler
 produced this entry", and the linker answers it; a post-link edit is outside
 that contract. The digest remains the identity of any image without a note.
+
+## Phase 2a controls and measurement
+
+Compiler: this branch at `8cf32993d`, `release` profile, linked by the
+branch's own seed-built compiler so that it carries a note (`out/rel/mach`,
+18.7 MB, build id `0fd3f8d7…`). The "before" row is the same source at the
+same profile linked by the 4.30.0 seed (`out/relseed/mach`, 17.9 MB), which
+carries no note and therefore identifies itself by the phase-1 digest. Projects
+as in phase 1: `hello` (41 modules, profile `release`) and the corpus case
+`bits/logic_u32` in the hosted corpus project (43 modules, profile `o2`),
+x86_64-linux. Host load average 6 to 16 from concurrent workers throughout;
+cells that a load spike visibly hit are kept and marked rather than dropped.
+
+**Fixpoint.** A (seed-built) carries no note; B (built by A) and C (built by B)
+are byte-identical (`cmp`), and their notes are equal
+(`6c0dc874…`). The identity of A is reported as `compiler identity: image
+digest`, of B and C as `compiler identity: build id`.
+
+**No file is opened.** `strace -f -e openat` on the warm cached corpus build
+through the note-carrying compiler: zero opens of `/proc/self/exe`, 43 of
+`.mach-cache` (the 43 entries read). The same build through the seed-built
+compiler: one open of `/proc/self/exe` (the digest), and `-vv` names it.
+
+**Identity cost, same conditions, warm corpus hit (43 of 43), three runs.**
+
+| compiler | identity | codegen phase | wall |
+|---|---|---|---|
+| no note, digest (release, 17.9 MB) | 132 / 131 / 132 ms | 180 / 179 / 181 ms | 616 / 608 / 623 ms |
+| note, build id (release, 18.7 MB) | 19 / 17 / 12 us | 48 / 49 / 48 ms | 542 / 528 / 516 ms |
+
+The codegen phase of the warm hit drops by about 130 ms, which is the digest
+(phase 1 measured it at 139 ms release). What remains, 48 ms, is the serial
+restore of 43 entries (read, payload hash, decode, re-intern) plus the
+identity read, which is microseconds. A warm cached build is now faster than
+an uncached one (516 to 542 against 572 to 620 wall on the clean cells below)
+where in phase 1 it was about 80 ms slower.
+
+**Cold and warm, three repetitions, wall in ms (codegen phase in brackets),
+note-carrying release compiler.** Two rounds are shown because the host was
+shared; a cell marked † was hit by a load spike (load average above 9 during
+the run) and is reported as measured.
+
+| project | round | off, warm | on, cold | on, warm | hits |
+|---|---|---|---|---|---|
+| hello | 1 | 579 / 567 / 862† [125, 117, 117] | 613 / 660 / 716† [150, 152, 215†] | 509 / 507 / 506 [47, 47, 46] | 41 / 41 |
+| hello | 2 | 569 / 569 / 582 [120, 124, 130] | 597 / 626 / 624 [156, 160, 154] | 626† / 971† / 762† [68, 108†, 49] | 41 / 41 |
+| corpus | 1 | 572 / 746† / 876† [122, 200†, 141] | 608 / 617 / 630 [152, 156, 156] | 625† / 551 / 808† [76, 68, 49] | 43 / 43 |
+| corpus | 2 | 1600† / 1200† / 690 [499†, 337†, 127] | 616 / 607 / 602 [164, 158, 159] | 517 / 521 / 514 [56, 51, 51] | 43 / 43 |
+
+Phase 1's warm hit at 16 workers was 597 to 614 ms on corpus with a codegen
+phase of 173 to 175 ms; the same cell is now 514 to 521 ms with 48 to 56 ms.
+Publication (on, cold) still costs about 30 ms over an uncached build, as in
+phase 1. The optimize phase (item 2 of the phase-1 list) is untouched and
+remains the largest cost of a warm hit; that is phase 2b.
+
+**Mutation control: one byte outside the note.** One byte of a string literal
+in `.rodata` of the note-carrying release compiler was changed (`X` for `e`
+in an error message, file offset 17135272, inside the second `PT_LOAD`); the
+note in the file is unchanged. The tampered image built the warm corpus
+project with 43 of 43 hits and reported `compiler identity: build id`. That is
+the limitation stated above, by design: the note is what the linker computed,
+and reading it back cannot see a later edit without hashing the file. The
+same one-byte edit applied to the seed-built (note-less) compiler produced 0
+of 43 hits with `compiler identity: image digest`, so the digest fallback
+still detects it wherever it is the identity in use.
+
+**Readers.** The linux reader is exercised by the suite on every run (the
+test dispatcher is linked by the compiler under test and carries a note;
+`cache.compiler:identity_is_the_mapped_build_id` requires the build id
+source, 32 bytes, and agreement with a second read) on both `ET_EXEC` and,
+with `mach test --pie`, `ET_DYN` with a non-zero load bias. The darwin and
+windows readers are cross-built here and structurally checked against the
+cross-linked images' headers (`llvm-dwarfdump --uuid`, `llvm-readobj
+--coff-debug-directory`); they run natively on those hosts' CI lanes.
+
+**External readers on cross-linked images.** The compiler itself cross-built
+for `darwin-aarch64`, `darwin-x86_64` and `windows-x86_64`:
+`llvm-readobj --coff-debug-directory` shows the CodeView entry (`PDBGUID`,
+age 1, empty name) and `--sections` the `.buildid` section on PE;
+`llvm-dwarfdump --uuid` shows the `LC_UUID` on both Mach-O images (llvm-readobj
+prints no load commands beyond its named ones); `llvm-readobj --notes` shows
+`NT_GNU_BUILD_ID` on the ELF image. Each value was recomputed host-side over
+the file by the rule stated above and agreed.
+
+**Suite, census, link, corpus.** Full suite through the from-source compiler:
+2925 passed, 0 failed, against the dev baseline of 2918 at `8464568d0`; the
+delta is the seven new tests (`buildid` three, `elf.emit_exec` one,
+`coff.coff_emit_exec` one, `cache.compiler` two) and one renamed
+(`second_digest_…` to `second_identity_…`). `sh test/census.sh` 9 of 9 ok.
+Link leg x86_64-linux 140 pass, 0 fail, 0 skip, including `debuginfo`
+(`g_additive=yes`) and the six `readobj` cases, whose goldens now record
+`build-id len=<n> content-derived=yes` from an independent recomputation.
+Corpus layer B on x86_64-linux 102 pass, 0 fail, 0 skip.
