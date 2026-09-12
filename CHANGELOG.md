@@ -392,7 +392,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decorator is refused, `` `embed` path escapes the project root; an embedded
   file must live inside the project ``, and the driver skips the path when it
   collects embed inputs, so the file outside the project is never opened. 4.30
-  read it and warned (#3226, #3112).
+  read it and warned. The containment check compares the project root and the
+  resolved file in one coordinate system: `mach build .` used to hand it a
+  relative root beside a relative source path and report every embed under
+  `src/` as escaping, which was a stray warning in 4.30 and would have been a
+  false refusal here (#3226, #3112).
 - Alias dependency keys, nested realizations and `mach.lock`. A `[dep.<key>]`
   whose realized project declares a different id is refused by `pull`,
   `verify` and every build (`[dep.foo] realizes project 'std'; alias keys were
