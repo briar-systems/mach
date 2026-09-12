@@ -9240,6 +9240,149 @@ test "mach.lang.driver.cache:repeated_project_operations_publish_under_current_s
     ret 0;
 }
 
+# a cached back half on an existing session: the cache directory exists, the
+# request carries the given optimization level and debug flag, and the target
+# input reflects them
+fun ut_cached_back_half(s: *session.Session, root: str, debug: bool) res[project.Project, outcome.Fail] {
+    val pr: res[project.Project, outcome.Fail] = driver.build_project_union(s, root);
+    if (sel pr.err) { ret pr; }
+    var p: project.Project = pr.ok;
+    p.req.object_cache = true;
+    if (p.req.debug != debug) {
+        p.req.debug = debug;
+        val configured: err[fail.Fail] = passes.set_build_config_input(?p);
+        if (sel configured.err) { project.dnit_project(?p); ret res[project.Project, outcome.Fail].err{outcome.from_fail(configured.err)}; }
+    }
+    val out: opt[str] = intern.lookup(?s.interner, p.config.project_out);
+    if (sel out.none) { project.dnit_project(?p); ret res[project.Project, outcome.Fail].err{outcome.internal("no project out")}; }
+    val resolved: res[str, A.Error] = path.resolve(p.alloc, root, out.some);
+    if (sel resolved.err) { project.dnit_project(?p); ret res[project.Project, outcome.Fail].err{outcome.refused(resolved.err)}; }
+    val made: err[fs.FsError] = fs.create_dir_all(p.alloc, resolved.ok, 493);
+    str_free(p.alloc, resolved.ok);
+    if (sel made.err) { project.dnit_project(?p); ret res[project.Project, outcome.Fail].err{outcome.internal("cannot create the output directory")}; }
+    val rs: err[outcome.Fail] = driver.run_sema_pass(?p);
+    if (sel rs.err) { project.dnit_project(?p); ret res[project.Project, outcome.Fail].err{rs.err}; }
+    val rl: err[outcome.Fail] = driver.run_lower_pass(?p);
+    if (sel rl.err) { project.dnit_project(?p); ret res[project.Project, outcome.Fail].err{rl.err}; }
+    val rc: err[outcome.Fail] = driver.run_codegen_pass(?p);
+    if (sel rc.err) { project.dnit_project(?p); ret res[project.Project, outcome.Fail].err{rc.err}; }
+    ret res[project.Project, outcome.Fail].ok{p};
+}
+
+fun ut_lowered(p: *project.Project, s: *session.Session, fqn: str) bool {
+    val mid: session.ModuleId = ut_mid(p, s, fqn);
+    if (mid == session.MODULE_NIL) { ret false; }
+    ret p.modules[mid::u32].ir_module != nil;
+}
+
+# one cached round: build, then report the codegen revisions and whether the
+# modules lowered; a restored module never lowers, a generated one always does
+rec UtCachedRound {
+    ok: bool;
+    hits: u32;
+    misses: u32;
+    lowered_main: bool;
+    lowered_leaf: bool;
+    cg_main: query.Revision;
+    cg_leaf: query.Revision;
+}
+
+fun ut_cached_round(s: *session.Session, root: str, debug: bool) UtCachedRound {
+    var r: UtCachedRound = UtCachedRound{};
+    val pr: res[project.Project, outcome.Fail] = ut_cached_back_half(s, root, debug);
+    if (sel pr.err) { print.eprintln(outcome.describe(pr.err)); ret r; }
+    var p: project.Project = pr.ok;
+    r.hits = p.cache_hits;
+    r.misses = p.cache_misses;
+    r.lowered_main = ut_lowered(?p, s, "uniontest.main");
+    r.lowered_leaf = ut_lowered(?p, s, "uniontest.leaf");
+    r.cg_main = ut_codegen_lc(s, ut_stable(?p, s, "uniontest.main"));
+    r.cg_leaf = ut_codegen_lc(s, ut_stable(?p, s, "uniontest.leaf"));
+    r.ok = true;
+    project.dnit_project(?p);
+    ret r;
+}
+
+# the in-process image of the persistent key: a product restored from the store
+# is invalidated by an edit to its own source, to a module whose inline body it
+# absorbed, and to the request, and the store then misses under the new key
+test "mach.lang.driver.cache:restored_product_is_invalidated_by_each_keyed_input_edit" {
+    var alloc: A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.inl;\nfun main() i32 { ret inl(); }\n";
+    texts[1] = "#[inline]\npub fun inl() i32 { ret 3; }\n";
+    # the default profile is the release pipeline without debug information, so
+    # the request the loader records is the request every round builds with
+    val manifest_text: str = "[project]\nid = \"uniontest\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[artifact.uniontest]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/uniontest\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[profile.release]\ndefault = true\nopt = 2\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n";
+    val root_r: res[str, fail.Fail] = ut_scaffold_m(?alloc, manifest_text, ?names[0], ?texts[0], 2);
+    if (sel root_r.err) { ret 1; }
+    val root: str = root_r.ok;
+    fin { fs.remove_all(?alloc, root); }
+    val src_dir:   str = ut_cc3(?alloc, root, "/", "src");
+    val leaf_path: str = ut_cc3(?alloc, src_dir, "/", "leaf.mach");
+    val main_path: str = ut_cc3(?alloc, src_dir, "/", "main.mach");
+
+    # a first process publishes both objects
+    val first_r: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel first_r.err) { ret 2; }
+    var first: session.Session = first_r.ok;
+    val registered: err[outcome.Fail] = driver.setup_registry(?first.registry);
+    if (sel registered.err) { session.dnit(?first); ret 2; }
+    val published: UtCachedRound = ut_cached_round(?first, root, false);
+    session.dnit(?first);
+    if (!published.ok || published.hits != 0 || published.misses != 2 || !published.lowered_main || !published.lowered_leaf) { ret 3; }
+
+    # a second process restores both without lowering
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 4; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+    val registered2: err[outcome.Fail] = driver.setup_registry(?s.registry);
+    if (sel registered2.err) { ret 4; }
+    val restored: UtCachedRound = ut_cached_round(?s, root, false);
+    if (!restored.ok || restored.hits != 2 || restored.misses != 0 || restored.lowered_main || restored.lowered_leaf) { ret 5; }
+
+    # the same session, an inline body edited: the importer's own typed surface
+    # is unchanged, yet its restored object absorbed the old body
+    val leaf_v2: str = "#[inline]\npub fun inl() i32 { ret 4; }\n";
+    val wrote_leaf: err[fs.FsError] = fs.write_bytes(leaf_path, leaf_v2, str_len(leaf_v2), 420);
+    if (sel wrote_leaf.err) { ret 6; }
+    val after_leaf: UtCachedRound = ut_cached_round(?s, root, false);
+    if (!after_leaf.ok || after_leaf.cg_main == restored.cg_main || after_leaf.cg_leaf == restored.cg_leaf) { ret 7; }
+    if (after_leaf.hits != 0 || after_leaf.misses != 2 || !after_leaf.lowered_main || !after_leaf.lowered_leaf) { ret 8; }
+
+    # the module's own source: the leaf's generated product is held by the
+    # session and neither restores nor regenerates, main misses under the new key
+    val main_v2: str = "use uniontest.leaf.inl;\nfun main() i32 { ret inl() + 1; }\n";
+    val wrote_main: err[fs.FsError] = fs.write_bytes(main_path, main_v2, str_len(main_v2), 420);
+    if (sel wrote_main.err) { ret 9; }
+    val after_main: UtCachedRound = ut_cached_round(?s, root, false);
+    if (!after_main.ok || after_main.cg_main == after_leaf.cg_main || after_main.cg_leaf != after_leaf.cg_leaf) { ret 10; }
+    if (after_main.hits != 0 || after_main.misses != 1 || !after_main.lowered_main) { ret 11; }
+
+    # the request: what was just published restores, then a debug flip misses
+    val again: UtCachedRound = ut_cached_round(?s, root, false);
+    if (!again.ok || again.hits != 0 || again.misses != 0 || again.cg_main != after_main.cg_main) { ret 12; }
+    val debug: UtCachedRound = ut_cached_round(?s, root, true);
+    if (!debug.ok || debug.cg_main == again.cg_main || debug.cg_leaf == again.cg_leaf) { ret 13; }
+    if (debug.hits != 0 || debug.misses != 2 || !debug.lowered_main || !debug.lowered_leaf) { ret 14; }
+
+    # a fresh session under the edited inputs restores what the edits published
+    val third_r: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel third_r.err) { ret 15; }
+    var third: session.Session = third_r.ok;
+    fin { session.dnit(?third); }
+    val registered3: err[outcome.Fail] = driver.setup_registry(?third.registry);
+    if (sel registered3.err) { ret 15; }
+    val final: UtCachedRound = ut_cached_round(?third, root, true);
+    if (!final.ok || final.hits != 2 || final.misses != 0 || final.lowered_main || final.lowered_leaf) { ret 16; }
+    ret 0;
+}
+
 test "mach.lang.driver:incremental_link_reuse_and_fingerprint" {
     var alloc: A.Allocator;
     val make_r: err[A.Error] = page.make(?alloc);
