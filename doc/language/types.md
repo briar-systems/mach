@@ -319,8 +319,8 @@ tag Reply: u8 {
 ```
 
 The failure types every std API answers with are three ordinary std tags with
-fixed generic arities, declared in `std.types.canonical` and imported like any
-other declaration (`use std.types.canonical.res;`):
+fixed generic arities, declared in `std.types.result`, `std.types.option` and `std.types.error` and imported like any
+other declaration (`use std.types.result.res;`):
 
 - `res[T, E]` is an outcome with error case `err: E` first and success case `ok: T` second
 - `opt[T]` is presence with payloadless `none` first and `some: T` second

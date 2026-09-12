@@ -4,7 +4,7 @@ Mach 5.0.0 ships paired with std 2.0.0. The language gains tagged values and
 loses every form that let a failure be spelled as a string, a sentinel or a
 record with a kind beside a union; the manifest and the comptime channel lose
 the keys and paths 4.x accepted and never read; std spells every fallible or
-absent outcome with three tags declared in `std.types.canonical`. This page is
+absent outcome with three tags declared in `std.types.result`, `std.types.option` and `std.types.error`. This page is
 the order of operations for a project that builds with 4.30 today. The
 normative language contract is [design/tagged-values.md](design/tagged-values.md)
 and the reference is [language/](language/README.md); std's own inventory is
@@ -105,14 +105,14 @@ pub tag opt[T]: u8    { none; some: T; }
 pub tag err[E]: u8    { err: E; ok; }
 ```
 
-They are declared in `std.types.canonical` and imported like any declaration;
+They are declared in `std.types.result`, `std.types.option` and `std.types.error` and imported like any declaration;
 the compiler knows nothing of the three names. A module that spells `res`
 without importing it fails with `unresolved type name`.
 
 ```mach accept
-use std.types.canonical.res;
-use std.types.canonical.opt;
-use std.types.canonical.err;
+use std.types.result.res;
+use std.types.option.opt;
+use std.types.error.err;
 ```
 
 The mechanical translation of each 1.x site:
@@ -144,8 +144,8 @@ lexical rather than flow facts:
   become a fresh `val` per iteration, or be tested inside the loop body.
 
 ```mach accept
-use std.types.canonical.res;
-use std.types.canonical.opt;
+use std.types.result.res;
+use std.types.option.opt;
 
 tag ParseError: u8 { invalid; overflow; }
 
@@ -202,7 +202,7 @@ Two std facts to know before reading a signature:
   `res`;
 - std 2.0.0 declares its one artifact without `default = true`, so a bare
   `use std;` has no module to bind and is refused; import std's modules by
-  full path (`use std.print;`, `use std.types.canonical.res;`).
+  full path (`use std.print;`, `use std.types.result.res;`).
 
 ## 6. Tooling that arrived with 5.0
 
@@ -229,7 +229,7 @@ Two std facts to know before reading a signature:
    trees, remove the five unread manifest keys, mark defaults. `mach dep pull
    .` then `mach dep verify .` until it prints `ok`.
 3. Rename every identifier spelled `sel`. Replace `:^`/`:^T` with `:>T`.
-4. Import `std.types.canonical.{res,opt,err}` where a module spells them and
+4. Import `std.types.result.res`, `std.types.option.opt` and `std.types.error.err` where a module spells them and
    translate each `Result`/`Option`/`Void` site with the table in section 4,
    module by module, running `mach check .` after each.
 5. Follow each std signature change through `MIGRATION.md`'s domain table

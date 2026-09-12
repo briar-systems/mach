@@ -24,7 +24,7 @@ there is no function-scope alias. An alias of a tag constructs, tests and
 copies as the tag:
 
 ```mach accept
-use std.types.canonical.res;
+use std.types.result.res;
 
 tag ParseError: u8 { invalid; overflow; }
 def R: res[i64, ParseError];

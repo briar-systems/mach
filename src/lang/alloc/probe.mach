@@ -1,0 +1,523 @@
+# the compiler's one allocation probe: a counting, tracking, refusing
+# allocator for its own tests
+#
+# a probe sits in front of a backing allocator (a page allocator unless the
+# test hands one in) or in front of nothing. every allocate and reallocate
+# request is one ordinal in a single sequence, so a test that runs an
+# operation once per ordinal, from one to the number of requests the
+# operation makes, meets every refusal path the operation has. the probe
+# tracks every block it handed out, so after each run it can say whether the
+# operation released everything (`leaked`), released something twice or with
+# the wrong size (`mismatch`), and how many requests it made (`counted`).
+#
+# ## refusal modes
+#
+# `fail_at_ordinal` refuses exactly one request; `fail_from_ordinal` refuses
+# that request and every later one; `make_refusing` builds a probe over no
+# backing that refuses everything and only counts, for the growth checks that
+# prove a capacity overflow is refused before any reallocate is attempted;
+# `refuse_reallocate` refuses every reallocate while allocates still succeed.
+# `arm` starts the counted window: the ordinal is measured from the arm
+# point, so a fixture built through the probe before the operation runs does
+# not shift the ordinal the operation is refused at.
+#
+# ## the walk
+#
+# `walk` runs an attempt at ordinal zero to learn how many requests the
+# operation makes, then once per ordinal from one to that count with a fresh
+# probe each time. after every attempt it checks the probe: nothing
+# outstanding, no mismatch, tracking never overflowed, and when an ordinal
+# was armed the refusal fired exactly once. the attempt itself asserts what
+# the operation promised: the typed refusal, the input contract, the
+# teardown. an operation that makes no requests at ordinal zero is reported
+# as such; the test then classifies it nonallocating instead of probing it.
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.error.err;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.memory;
+
+use A: std.allocator;
+use page: std.allocator.page;
+
+# every fresh byte is filled with this, so an uninitialized read is visible
+pub val POISON: u8 = 0xAA;
+
+# how many live blocks one probe tracks; the table is open addressed, so this
+# is a hard cap on live blocks, not on blocks ever handed out
+pub val MAX_TRACKED: usize = 4096;
+val SLOTS: usize = 8192;
+
+# the attempt made no request at ordinal zero
+pub val WALK_NONALLOCATING: i32 = -1;
+# the attempt left a block outstanding
+pub val WALK_LEAK: i32 = -2;
+# the attempt released a block it did not own, or with the wrong size
+pub val WALK_MISMATCH: i32 = -3;
+# the attempt held more live blocks than the probe tracks
+pub val WALK_OVERFLOW: i32 = -4;
+# the armed ordinal was never reached, or was refused more than once
+pub val WALK_UNFIRED: i32 = -5;
+
+rec Slot {
+    p:    ptr;
+    size: usize;
+    # 0 empty, 1 live, 2 released (a tombstone the lookup walks past)
+    state: u8;
+}
+
+pub rec Probe {
+    # the interface to hand to the code under test
+    a: A.Allocator;
+    backing: A.Allocator;
+    refuse_all: bool;
+    refuse_reallocate: bool;
+
+    # the walk's target for this attempt: zero is the baseline
+    ordinal: usize;
+    # the absolute request number to refuse, zero never
+    fail_at: usize;
+    # keep refusing after `fail_at`
+    sticky: bool;
+    # requests made when `arm` was called
+    armed_at: usize;
+
+    # allocate and reallocate requests, refused or not
+    attempts: usize;
+    allocate_calls: usize;
+    reallocate_calls: usize;
+    deallocate_calls: usize;
+    # refusals this probe injected
+    refused: usize;
+    # refusals the backing made on its own
+    backing_refused: usize;
+
+    live: usize;
+    live_bytes: i64;
+    total: usize;
+    mismatch: bool;
+    overflow: bool;
+
+    last_size: usize;
+    last_old_size: usize;
+    last_new_size: usize;
+    last_reallocated: ptr;
+
+    slots: [8192]Slot;
+}
+
+fun hash(p: ptr) usize {
+    var h: usize = p::usize >> 4;
+    h = h * 0x9E3779B97F4A7C15;
+    ret (h >> 20) & (SLOTS - 1);
+}
+
+fun find(t: *Probe, p: ptr) usize {
+    var i: usize = hash(p);
+    var steps: usize = 0;
+    for (steps < SLOTS) {
+        if (t.slots[i].state == 0) { ret SLOTS; }
+        if (t.slots[i].state == 1 && t.slots[i].p == p) { ret i; }
+        i = (i + 1) & (SLOTS - 1);
+        steps = steps + 1;
+    }
+    ret SLOTS;
+}
+
+fun record(t: *Probe, p: ptr, size: usize) bool {
+    if (t.live >= MAX_TRACKED) { t.overflow = true; ret false; }
+    var i: usize = hash(p);
+    var first_free: usize = SLOTS;
+    var steps: usize = 0;
+    for (steps < SLOTS) {
+        val state: u8 = t.slots[i].state;
+        if (state == 0) {
+            if (first_free == SLOTS) { first_free = i; }
+            brk;
+        }
+        if (state == 2 && first_free == SLOTS) { first_free = i; }
+        if (state == 1 && t.slots[i].p == p) { t.mismatch = true; ret false; }
+        i = (i + 1) & (SLOTS - 1);
+        steps = steps + 1;
+    }
+    if (first_free == SLOTS) { t.overflow = true; ret false; }
+    t.slots[first_free] = Slot{p: p, size: size, state: 1};
+    t.live = t.live + 1;
+    t.live_bytes = t.live_bytes + size::i64;
+    t.total = t.total + 1;
+    ret true;
+}
+
+fun release(t: *Probe, i: usize) {
+    t.slots[i].state = 2;
+    t.live = t.live - 1;
+    t.live_bytes = t.live_bytes - t.slots[i].size::i64;
+}
+
+# one request in the ordinal sequence: true when this one is refused
+fun refuse(t: *Probe) bool {
+    t.attempts = t.attempts + 1;
+    if (t.refuse_all) { t.refused = t.refused + 1; ret true; }
+    if (t.fail_at == 0) { ret false; }
+    if (t.attempts == t.fail_at || (t.sticky && t.attempts > t.fail_at)) {
+        t.refused = t.refused + 1;
+        ret true;
+    }
+    ret false;
+}
+
+fun do_allocate(ctx: ptr, size: usize, align: usize) opt[ptr] {
+    val t: *Probe = ctx::*Probe;
+    t.allocate_calls = t.allocate_calls + 1;
+    t.last_size = size;
+    if (refuse(t)) { ret opt[ptr].none{}; }
+    if (size == 0) { ret opt[ptr].none{}; }
+    val got: opt[ptr] = t.backing.fn_allocate(t.backing.ctx, size, align);
+    if (sel got.none) { t.backing_refused = t.backing_refused + 1; ret got; }
+    memory.raw_fill(got.some, POISON, size);
+    record(t, got.some, size);
+    ret got;
+}
+
+fun do_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr] {
+    val t: *Probe = ctx::*Probe;
+    t.reallocate_calls = t.reallocate_calls + 1;
+    t.last_old_size = old_size;
+    t.last_new_size = new_size;
+    t.last_reallocated = p;
+    if (t.refuse_reallocate) { t.attempts = t.attempts + 1; t.refused = t.refused + 1; ret opt[ptr].none{}; }
+    if (refuse(t)) { ret opt[ptr].none{}; }
+    if (p == nil) {
+        if (new_size == 0) { ret opt[ptr].none{}; }
+        val fresh: opt[ptr] = t.backing.fn_allocate(t.backing.ctx, new_size, align);
+        if (sel fresh.none) { t.backing_refused = t.backing_refused + 1; ret fresh; }
+        memory.raw_fill(fresh.some, POISON, new_size);
+        record(t, fresh.some, new_size);
+        ret fresh;
+    }
+    val idx: usize = find(t, p);
+    if (idx == SLOTS) { t.mismatch = true; }
+    or (t.slots[idx].size != old_size) { t.mismatch = true; }
+    if (new_size == 0) {
+        if (idx != SLOTS) { release(t, idx); }
+        t.backing.fn_deallocate(t.backing.ctx, p, old_size, align);
+        ret opt[ptr].none{};
+    }
+    val got: opt[ptr] = t.backing.fn_reallocate(t.backing.ctx, p, old_size, new_size, align);
+    if (sel got.none) { t.backing_refused = t.backing_refused + 1; ret got; }
+    if (idx != SLOTS) { release(t, idx); }
+    if (new_size > old_size) {
+        memory.raw_fill((got.some::usize + old_size)::ptr, POISON, new_size - old_size);
+    }
+    record(t, got.some, new_size);
+    ret got;
+}
+
+fun do_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
+    val t: *Probe = ctx::*Probe;
+    t.deallocate_calls = t.deallocate_calls + 1;
+    if (p == nil) { ret 0; }
+    if (t.refuse_all) { ret 0; }
+    val idx: usize = find(t, p);
+    if (idx == SLOTS) {
+        t.mismatch = true;
+        ret t.backing.fn_deallocate(t.backing.ctx, p, size, align);
+    }
+    if (t.slots[idx].size != size) { t.mismatch = true; }
+    release(t, idx);
+    ret t.backing.fn_deallocate(t.backing.ctx, p, size, align);
+}
+
+fun reset(t: *Probe) {
+    t.refuse_all = false;
+    t.refuse_reallocate = false;
+    t.ordinal = 0;
+    t.fail_at = 0;
+    t.sticky = false;
+    t.armed_at = 0;
+    t.attempts = 0;
+    t.allocate_calls = 0;
+    t.reallocate_calls = 0;
+    t.deallocate_calls = 0;
+    t.refused = 0;
+    t.backing_refused = 0;
+    t.live = 0;
+    t.live_bytes = 0;
+    t.total = 0;
+    t.mismatch = false;
+    t.overflow = false;
+    t.last_size = 0;
+    t.last_old_size = 0;
+    t.last_new_size = 0;
+    t.last_reallocated = nil;
+    var i: usize = 0;
+    for (i < SLOTS) { t.slots[i].state = 0; i = i + 1; }
+    t.a.ctx           = (t)::ptr;
+    t.a.fn_allocate   = do_allocate;
+    t.a.fn_reallocate = do_reallocate;
+    t.a.fn_deallocate = do_deallocate;
+}
+
+# a probe over a fresh page allocator
+pub fun make(t: *Probe) err[A.Error] {
+    if (t == nil) { ret err[A.Error].err{A.Error.invalid{}}; }
+    val made: err[A.Error] = page.make(?t.backing);
+    if (sel made.err) { ret made; }
+    reset(t);
+    ret err[A.Error].ok{};
+}
+
+# a probe over the given backing, copied
+pub fun make_over(t: *Probe, backing: *A.Allocator) err[A.Error] {
+    if (t == nil || backing == nil) { ret err[A.Error].err{A.Error.invalid{}}; }
+    t.backing = @backing;
+    reset(t);
+    ret err[A.Error].ok{};
+}
+
+# a probe over nothing: every request is refused and counted
+pub fun make_refusing(t: *Probe) {
+    t.backing.ctx = nil;
+    t.backing.fn_allocate = do_allocate;
+    t.backing.fn_reallocate = do_reallocate;
+    t.backing.fn_deallocate = do_deallocate;
+    reset(t);
+    t.refuse_all = true;
+}
+
+pub fun allocator_of(t: *Probe) *A.Allocator { ret ?t.a; }
+
+# refuse exactly the nth request from now, counting from one; zero never
+pub fun fail_at_ordinal(t: *Probe, n: usize) {
+    t.sticky = false;
+    t.fail_at = 0;
+    if (n != 0) { t.fail_at = t.attempts + n; }
+}
+
+# refuse the nth request from now and every one after it
+pub fun fail_from_ordinal(t: *Probe, n: usize) {
+    fail_at_ordinal(t, n);
+    t.sticky = true;
+}
+
+pub fun clear_failure(t: *Probe) {
+    t.fail_at = 0;
+    t.sticky = false;
+}
+
+# start the counted window: the walk's ordinal is measured from here
+pub fun arm(t: *Probe) {
+    t.armed_at = t.attempts;
+    fail_at_ordinal(t, t.ordinal);
+}
+
+# requests since `arm`
+pub fun counted(t: *Probe) usize { ret t.attempts - t.armed_at; }
+
+# whether an injected refusal has fired
+pub fun fired(t: *Probe) bool { ret t.refused != 0; }
+
+pub fun owns(t: *Probe, p: ptr) bool {
+    if (p == nil) { ret false; }
+    ret find(t, p) != SLOTS;
+}
+
+pub fun size_of(t: *Probe, p: ptr) usize {
+    val idx: usize = find(t, p);
+    if (idx == SLOTS) { ret 0; }
+    ret t.slots[idx].size;
+}
+
+pub fun leaked(t: *Probe) bool { ret t.live != 0; }
+
+# nothing outstanding, nothing released wrongly, nothing untracked
+pub fun clean(t: *Probe) bool { ret t.live == 0 && !t.mismatch && !t.overflow; }
+
+# release everything still outstanding to the backing and reset the counters
+# ---
+# ret: how many live blocks had to be reclaimed, which is the leak count
+pub fun dnit(t: *Probe) usize {
+    if (t == nil) { ret 0; }
+    var reclaimed: usize = 0;
+    if (!t.refuse_all) {
+        var i: usize = 0;
+        for (i < SLOTS) {
+            if (t.slots[i].state == 1) {
+                t.backing.fn_deallocate(t.backing.ctx, t.slots[i].p, t.slots[i].size, 1);
+                reclaimed = reclaimed + 1;
+            }
+            i = i + 1;
+        }
+    }
+    reset(t);
+    ret reclaimed;
+}
+
+pub rec Outcome {
+    code:     i32;
+    ordinal:  usize;
+    # requests the operation made at ordinal zero
+    attempts: usize;
+}
+
+fun check(t: *Probe, code: i32) i32 {
+    if (code != 0) { ret code; }
+    if (t.overflow) { ret WALK_OVERFLOW; }
+    if (t.mismatch) { ret WALK_MISMATCH; }
+    if (t.live != 0) { ret WALK_LEAK; }
+    if (t.ordinal != 0 && t.refused != 1) { ret WALK_UNFIRED; }
+    ret 0;
+}
+
+# run `attempt` once per ordinal: zero first, then one to the count the
+# baseline made. the attempt builds its fixture through the probe, calls
+# `arm`, runs the operation, asserts its promises and tears the fixture down,
+# returning zero on a pass. the walk stops at the first failing ordinal.
+pub fun walk[C](context: *C, attempt: fun(*C, *Probe) i32) Outcome {
+    var out: Outcome = Outcome{code: 0, ordinal: 0, attempts: 0};
+    var ordinal: usize = 0;
+    for (ordinal == 0 || ordinal <= out.attempts) {
+        var t: Probe;
+        val made: err[A.Error] = make(?t);
+        if (sel made.err) { out.code = WALK_LEAK; out.ordinal = ordinal; ret out; }
+        t.ordinal = ordinal;
+        val code: i32 = check(?t, attempt(context, ?t));
+        if (ordinal == 0) { out.attempts = counted(?t); }
+        dnit(?t);
+        out.ordinal = ordinal;
+        if (code != 0) { out.code = code; ret out; }
+        if (ordinal == 0 && out.attempts == 0) { out.code = WALK_NONALLOCATING; ret out; }
+        ordinal = ordinal + 1;
+    }
+    out.ordinal = 0;
+    ret out;
+}
+
+rec Walked {
+    depth: usize;
+}
+
+fun t_walked(w: *Walked, t: *Probe) i32 {
+    val a: *A.Allocator = allocator_of(t);
+    val fixture: res[*u8, A.Error] = A.allocate[u8](a, 16::usize);
+    if (sel fixture.err) { ret 1; }
+    arm(t);
+    var held: [4]*u64;
+    var n: usize = 0;
+    var refused_at: usize = 0;
+    for (n < w.depth) {
+        val got: res[*u64, A.Error] = A.allocate[u64](a, 8::usize);
+        if (sel got.err) {
+            if (!sel got.err.exhausted) { ret 2; }
+            refused_at = n + 1;
+            brk;
+        }
+        held[n] = got.ok;
+        n = n + 1;
+    }
+    var k: usize = 0;
+    for (k < n) { A.deallocate[u64](a, held[k], 8::usize); k = k + 1; }
+    A.deallocate[u8](a, fixture.ok, 16::usize);
+    if (t.ordinal == 0 && refused_at != 0) { ret 3; }
+    if (t.ordinal != 0 && refused_at != t.ordinal) { ret 4; }
+    ret 0;
+}
+
+test "mach.lang.alloc.probe:walk_refuses_each_ordinal_after_the_arm_point" {
+    var w: Walked = Walked{depth: 4};
+    val out: Outcome = walk[Walked](?w, t_walked);
+    if (out.code != 0) { ret 1; }
+    if (out.attempts != 4) { ret 2; }
+    ret 0;
+}
+
+fun t_leaky(w: *Walked, t: *Probe) i32 {
+    arm(t);
+    val got: res[*u64, A.Error] = A.allocate[u64](allocator_of(t), 8::usize);
+    if (sel got.err) { ret 0; }
+    if (w.depth == 0) { A.deallocate[u64](allocator_of(t), got.ok, 8::usize); }
+    ret 0;
+}
+
+test "mach.lang.alloc.probe:walk_reports_a_leak_and_a_nonallocating_attempt" {
+    var leaky: Walked = Walked{depth: 1};
+    val leak: Outcome = walk[Walked](?leaky, t_leaky);
+    if (leak.code != WALK_LEAK || leak.ordinal != 0) { ret 1; }
+    var quiet: Walked = Walked{depth: 0};
+    val none: Outcome = walk[Walked](?quiet, t_nothing);
+    if (none.code != WALK_NONALLOCATING) { ret 2; }
+    ret 0;
+}
+
+fun t_nothing(w: *Walked, t: *Probe) i32 { arm(t); ret 0; }
+
+test "mach.lang.alloc.probe:tracks_size_and_reports_a_double_free_as_mismatch" {
+    var t: Probe;
+    val made: err[A.Error] = make(?t);
+    if (sel made.err) { ret 1; }
+    fin { dnit(?t); }
+    val a: *A.Allocator = allocator_of(?t);
+    val got: res[*u8, A.Error] = A.allocate[u8](a, 24::usize);
+    if (sel got.err) { ret 2; }
+    if (got.ok[0] != POISON || got.ok[23] != POISON) { ret 3; }
+    if (!owns(?t, got.ok::ptr) || size_of(?t, got.ok::ptr) != 24 || t.live != 1 || t.live_bytes != 24) { ret 4; }
+    val grown: res[*u8, A.Error] = A.reallocate[u8](a, got.ok, 24::usize, 40::usize);
+    if (sel grown.err) { ret 5; }
+    if (owns(?t, got.ok::ptr) && got.ok != grown.ok) { ret 6; }
+    if (size_of(?t, grown.ok::ptr) != 40 || grown.ok[39] != POISON || t.live != 1 || t.attempts != 2) { ret 7; }
+    A.deallocate[u8](a, grown.ok, 40::usize);
+    if (t.live != 0 || t.mismatch || leaked(?t)) { ret 8; }
+    A.deallocate[u8](a, grown.ok, 40::usize);
+    if (!t.mismatch) { ret 9; }
+    ret 0;
+}
+
+test "mach.lang.alloc.probe:refusing_probe_counts_without_a_backing" {
+    var t: Probe;
+    make_refusing(?t);
+    val a: *A.Allocator = allocator_of(?t);
+    val got: res[*u8, A.Error] = A.allocate[u8](a, 8::usize);
+    if (sel got.ok) { ret 1; }
+    val grown: res[*u8, A.Error] = A.reallocate[u8](a, nil, 0::usize, 8::usize);
+    if (sel grown.ok) { ret 2; }
+    if (t.allocate_calls != 1 || t.reallocate_calls != 1 || t.refused != 2 || t.attempts != 2) { ret 3; }
+    if (t.last_new_size != 8) { ret 4; }
+    ret 0;
+}
+
+test "mach.lang.alloc.probe:fail_from_ordinal_keeps_refusing" {
+    var t: Probe;
+    val made: err[A.Error] = make(?t);
+    if (sel made.err) { ret 1; }
+    fin { dnit(?t); }
+    val a: *A.Allocator = allocator_of(?t);
+    fail_from_ordinal(?t, 2);
+    val first: res[*u8, A.Error] = A.allocate[u8](a, 8::usize);
+    if (sel first.err) { ret 2; }
+    val second: res[*u8, A.Error] = A.allocate[u8](a, 8::usize);
+    val third: res[*u8, A.Error] = A.allocate[u8](a, 8::usize);
+    if (sel second.ok || sel third.ok) { ret 3; }
+    clear_failure(?t);
+    val fourth: res[*u8, A.Error] = A.allocate[u8](a, 8::usize);
+    if (sel fourth.err) { ret 4; }
+    A.deallocate[u8](a, first.ok, 8::usize);
+    A.deallocate[u8](a, fourth.ok, 8::usize);
+    if (!clean(?t) || t.refused != 2) { ret 5; }
+    ret 0;
+}
+
+test "mach.lang.alloc.probe:dnit_reclaims_outstanding_blocks_and_reports_the_count" {
+    var t: Probe;
+    val made: err[A.Error] = make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator = allocator_of(?t);
+    val one: res[*u8, A.Error] = A.allocate[u8](a, 8::usize);
+    val two: res[*u8, A.Error] = A.allocate[u8](a, 8::usize);
+    if (sel one.err || sel two.err) { ret 2; }
+    if (dnit(?t) != 2) { ret 3; }
+    if (t.live != 0 || t.attempts != 0) { ret 4; }
+    ret 0;
+}

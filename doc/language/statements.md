@@ -203,8 +203,8 @@ and exits the arm that handles the failure; the exiting chain guards the
 success payload for the rest of the block:
 
 ```mach accept
-use std.types.canonical.res;
-use std.types.canonical.err;
+use std.types.result.res;
+use std.types.error.err;
 
 tag WriteError: u8 { closed; full; }
 
