@@ -49,10 +49,12 @@ Precompiled binaries are also available directly on the [releases](https://githu
 
 ## Building Mach
 
-Mach builds itself. The current development source needs the audited 4.30.0
-compiler implementation. Its public release was withdrawn, so follow the
-[pinned source bootstrap recipe](doc/tooling/bootstrap.md) if you only have
-4.26.5. The recipe also explains how CI builds its compiler.
+Mach builds itself. The development source is Mach 5 source and pins std
+2.0.0, so it needs a 5.0 compiler: a 4.x release cannot read it. Install a
+5.0 release, or build one from the published 4.26.5 seed through the
+[pinned source bootstrap chain](doc/tooling/bootstrap.md), which is also how
+CI builds its compiler. A project moving from 4.x reads
+[doc/migration-v5.md](doc/migration-v5.md).
 
 ```bash
 git clone https://github.com/briar-systems/mach

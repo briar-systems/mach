@@ -15,7 +15,11 @@ Be respectful, constructive, and professional. Treat Mach like a passion project
 ### Prerequisites
 
 - Git
-- An existing `mach` binary. Mach is self-hosting, so building from source needs one. Install the latest [release](https://github.com/briar-systems/mach/releases).
+- A Mach 5 compiler. Mach is self-hosting, so building from source needs one,
+  and the development source (Mach 5 syntax, std 2.0.0) is unreadable to any
+  4.x release. Install a 5.0 [release](https://github.com/briar-systems/mach/releases),
+  or build one from the published 4.26.5 seed through the
+  [pinned bootstrap chain](doc/tooling/bootstrap.md).
 
 ### Building
 
@@ -24,7 +28,7 @@ Mach builds its own source with an existing `mach`:
 ```bash
 git clone https://github.com/briar-systems/mach.git
 cd mach
-mach dep pull
+mach dep pull .
 mach build .
 ```
 
@@ -36,6 +40,15 @@ The installed compiler is the seed. Build generation A with the seed, B with
 A, and C with B. Release verification requires B and C to be byte-identical.
 A can differ from B while the installed seed carries an older code generator.
 See the [release shape](doc/design/release-shape.md) for the seed transition.
+
+### Checking
+
+`python3 test/doc-agreement.py` holds `doc/cli.md`, `doc/manifest.md`, the
+`mach init` scaffolds and the grammar's keyword list to the compiler under
+test, and `python3 test/doc-examples.py` compiles every exercised example of
+the language reference; both read `MACH_DOC_MACH` or the checkout's
+`out/<host>/debug/bin/mach`. `sh test/census.sh` runs the structural
+censuses. `mach test .` through the freshly built compiler is the unit suite.
 
 ---
 
@@ -100,8 +113,9 @@ Mach uses [Semantic Versioning](https://semver.org/) (`vMAJOR.MINOR.PATCH`):
 
 Tags are created and pushed on `main` after merging from `dev`. The standard
 library is versioned separately in its own repository. The
-[4.30.0 / 5.0.0 release shape](doc/design/release-shape.md) records the current
-migration window and the compatibility limits of the transition release.
+[4.30.0 / 5.0.0 release shape](doc/design/release-shape.md) records the
+migration window and the compatibility limits of the transition release, and
+[doc/migration-v5.md](doc/migration-v5.md) is the user-facing migration.
 
 A release bump updates both `[project].version` in `mach.toml` and
 `MACH_VERSION` in `src/lang/version.mach`. CI and the tag workflow require the
@@ -137,6 +151,27 @@ dev (ongoing work)
 ### Mach Code (in `src/` and `dep/std/`)
 
 Mach coding standards are in flux while syntax stabilizes and the userbase grows. Follow existing patterns and refer to the [language reference](doc/language/README.md) for language features.
+
+### Documentation
+
+Every fact has one home: a docstring says what a declaration is and how it
+is used, `doc/design/` says why it is shaped that way, and `CHANGELOG.md`
+says when it changed ([source documentation](doc/design/source-documentation.md)
+is the paradigm, [language/documentation.md](doc/language/documentation.md)
+the docstring form).
+
+Docstring coverage is a property of the supported surface, not a quota.
+The supported, source-stable surface is the editor API
+(`mach.lang.editor`, [tooling/editor-api.md](doc/tooling/editor-api.md)),
+the command line ([cli.md](doc/cli.md)) and the manifest schema
+([manifest.md](doc/manifest.md)); every `pub` declaration of that surface
+carries a docstring stating its ownership, lifetime and error contract (who
+frees what, how long a borrowed product stays valid, which outcome case means
+what). Everything else under `src/` is internal: a `pub` there is documented
+when its contract is not evident from its signature and its callers, and a
+comment explains a genuine invariant, never restates the line below it. No
+check counts docstrings, and a pull request is not asked to add boilerplate to
+reach a number; `mach doc .` renders whatever is there.
 
 ---
 

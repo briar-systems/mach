@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """exercise the behavioral examples of the language reference.
 
-every fenced `mach` block under doc/language is either a display fragment or an
-exercised example. an exercised fence names its expectation after the language:
+every fenced `mach` block under doc/language, and in doc/migration-v5.md, is
+either a display fragment or an exercised example. an exercised fence names its expectation after the language:
 
     ```mach accept              compiles with no diagnostic at all
     ```mach reject "text"       is refused; a diagnostic contains `text`
@@ -24,7 +24,9 @@ the reference carries and how many of them are exercised, per file, and the
 run fails on every expectation that does not hold, printing the compiler's
 output.
 
-usage: doc-examples.py [--mach <path>] [--doc <dir>] [--out <dir>] [--only <file.md>] [--list]
+usage: doc-examples.py [--mach <path>] [--page <file.md>]... [--out <dir>] [--only <file.md>] [--list]
+
+`--page` replaces the default page set (doc/language/*.md and doc/migration-v5.md).
 
 environment:
   MACH_DOC_MACH   the compiler under test (default the checkout's out/<host>/debug/bin/mach)
@@ -45,7 +47,7 @@ HOST = {("linux", "x86_64"): ("linux-x86_64", "x86_64", "linux", "sysv64"),
         ("darwin", "arm64"): ("darwin-aarch64", "aarch64", "darwin", "aapcs64"),
         ("windows", "amd64"): ("windows-x86_64", "x86_64", "windows", "win64")}
 
-FENCE = re.compile(r'^```mach(?:\s+(accept|reject|warn|run|test))?(?:\s+"((?:[^"\\]|\\.)*)")?\s*$')
+FENCE = re.compile(r'^( *)```mach(?:\s+(accept|reject|warn|run|test))?(?:\s+"((?:[^"\\]|\\.)*)")?\s*$')
 FILE_MARK = re.compile(r'^# file: (\S+)\s*$')
 MODES = ("accept", "reject", "warn", "run", "test")
 
@@ -111,13 +113,21 @@ def split_files(body):
             if path != "src/root.mach" or "".join(lines).strip()}
 
 
-def extract(doc_dir, only):
+def default_pages():
+    lang = os.path.join(REPO, "doc", "language")
+    pages = [os.path.join(lang, n) for n in sorted(os.listdir(lang)) if n.endswith(".md")]
+    pages.append(os.path.join(REPO, "doc", "migration-v5.md"))
+    return pages
+
+
+def extract(paths, only):
     """every mach fence of every page: (page, fragments, examples)."""
     pages = []
-    for name in sorted(os.listdir(doc_dir)):
-        if not name.endswith(".md") or (only and name != only):
+    for path in paths:
+        name = os.path.basename(path)
+        if only and name != only:
             continue
-        with open(os.path.join(doc_dir, name), encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             lines = fh.read().split("\n")
         fragments = 0
         examples = []
@@ -125,20 +135,22 @@ def extract(doc_dir, only):
         while i < len(lines):
             m = FENCE.match(lines[i])
             if not m:
-                if lines[i].startswith("```mach"):
+                if lines[i].lstrip().startswith("```mach"):
                     die("%s:%d: malformed fence info string: %s" % (name, i + 1, lines[i]))
                 i += 1
                 continue
             start = i
+            indent = m.group(1)
             i += 1
             body = []
-            while i < len(lines) and not lines[i].startswith("```"):
-                body.append(lines[i])
+            while i < len(lines) and not lines[i].lstrip().startswith("```"):
+                line = lines[i]
+                body.append(line[len(indent):] if line.startswith(indent) else line.lstrip())
                 i += 1
             if i >= len(lines):
                 die("%s:%d: unterminated fence" % (name, start + 1))
             i += 1
-            mode, expect = m.group(1), m.group(2)
+            mode, expect = m.group(2), m.group(3)
             if mode is None:
                 if expect is not None:
                     die("%s:%d: an expectation string needs a mode" % (name, start + 1))
@@ -288,7 +300,7 @@ def check(example, project, mach):
 
 def main(argv):
     mach = os.environ.get("MACH_DOC_MACH")
-    doc_dir = os.path.join(REPO, "doc", "language")
+    paths = []
     out_dir = os.path.join(REPO, "test", "out", "doc-examples")
     only = None
     list_only = False
@@ -298,9 +310,9 @@ def main(argv):
         if arg == "--mach":
             i += 1
             mach = argv[i]
-        elif arg == "--doc":
+        elif arg == "--page":
             i += 1
-            doc_dir = os.path.abspath(argv[i])
+            paths.append(os.path.abspath(argv[i]))
         elif arg == "--out":
             i += 1
             out_dir = os.path.abspath(argv[i])
@@ -316,7 +328,7 @@ def main(argv):
             die("unknown argument %s" % arg)
         i += 1
 
-    pages = extract(doc_dir, only)
+    pages = extract(paths or default_pages(), only)
     if list_only:
         for name, fragments, examples in pages:
             for ex in examples:
