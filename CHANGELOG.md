@@ -387,6 +387,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [profile.<name>] with `default = true` or select one with --profile ``).
   Nothing is ever selected by table order, and the build request no longer
   carries a by-table-order bit (#3226, #3112, #3222).
+- Reading an `#[embed]` whose resolved path escapes the project root. The
+  decorator is refused, `` `embed` path escapes the project root; an embedded
+  file must live inside the project ``, and the driver skips the path when it
+  collects embed inputs, so the file outside the project is never opened. 4.30
+  read it and warned (#3226, #3112).
 
 ## [4.30.0] - 2026-09-07
 
