@@ -367,11 +367,14 @@ for dir in "$here"/cases/*/; do
             # observables (exec, the relro-fault guard, and debuginfo / varloc-fbreg
             # / symtab, whose facts hold identically on every ELF ISA), per-profile
             # for gdb-session (its stop/frame/value facts are a real function of the
-            # active profile's own codegen, #2779), and per-build-target for
-            # structural producers, whose fact is format-specific.
+            # active profile's own codegen, #2779), per-build-target and per-profile
+            # for atomic-inline (an ISA's instruction vocabulary under a profile's
+            # inlining policy, #3110), and per-build-target for structural
+            # producers, whose fact is format-specific.
             case "$case_run" in
                 exec|relro-fault|debuginfo|varloc-fbreg|symtab) golden="$dir/expect.txt" ;;
                 gdb-session) golden="$dir/expect.$profile.txt" ;;
+                atomic-inline) golden="$dir/expect.$build_target.$profile.txt" ;;
                 *)           golden="$dir/expect.$build_target.txt" ;;
             esac
 

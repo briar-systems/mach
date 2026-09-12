@@ -1,5 +1,6 @@
-use std.types.canonical.res;
-use std.types.canonical.err;
+use std.types.result.res;
+use std.types.error.err;
+use std.types.option.opt;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -7,11 +8,13 @@ use std.types.size.usize;
 use std.types.string.str;
 
 use A: std.allocator;
+use page: std.allocator.page;
 
 use mach.lang.intern;
 use mach.lang.me.ir;
 use mach.lang.me.ir.builder;
 use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
 use mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.session;
@@ -102,6 +105,21 @@ pub fun neutralize_main(main_id: intern.StrId, mod: *ir.Module) {
     }
 }
 
+# the status a test result outside 0..255 exits with: the process exit code is
+# eight bits on posix, so a wider result is folded to this value rather than
+# truncated, and it can never read as a pass
+pub val TEST_STATUS_WIDE: u64 = 255;
+
+# synthesize the test dispatcher module: a `main(argc, argv)` that parses argv[1]
+# as a decimal test index, calls that test, and exits with its result folded to the
+# status protocol. a result in 0..255 is the exit code as is; any other result
+# exits `TEST_STATUS_WIDE`; a missing or malformed index, or one past `count`,
+# exits 2
+# ---
+# s: the session whose interner names the dispatcher and `main`
+# tests: the collected tests in dispatch order, indexed by argv[1]
+# count: how many tests there are, at least one
+# ret: the dispatcher module, owned by the caller, or why it could not be built
 pub fun synthesize_dispatcher(s: *session.Session, tests: *Test, count: u32) res[ir.Module, fail.Fail] {
     if (count == 0) { ret res[ir.Module, fail.Fail].err{fail.message("test dispatcher: no tests to dispatch")}; }
 
@@ -235,6 +253,10 @@ fun build_dispatcher(s: *session.Session, m: *ir.Module, tests: *Test, count: u3
     if (sel res_body.err) { ret err[fail.Fail].err{res_body.err}; }
     val b_body: id.BlockId = res_body.ok;
 
+    val res_wide: res[id.BlockId, fail.Fail] = builder.new_block(?b);
+    if (sel res_wide.err) { ret err[fail.Fail].err{res_wide.err}; }
+    val b_wide: id.BlockId = res_wide.ok;
+
     val res_dblocks: res[*id.BlockId, A.Error] = A.allocate[id.BlockId](m.alloc, count::usize);
     if (sel res_dblocks.err) { ret err[fail.Fail].err{fail.refused(res_dblocks.err)}; }
     val dblocks: *id.BlockId = res_dblocks.ok;
@@ -353,12 +375,28 @@ fun build_dispatcher(s: *session.Session, m: *ir.Module, tests: *Test, count: u3
         builder.set_block(?b, cblocks[k]);
         val res_call: res[value.Value, fail.Fail] = builder.emit_call(?b, callees[k], nil, 0, i32t);
         if (sel res_call.err) { ret err[fail.Fail].err{res_call.err}; }
-        val res_r64: res[value.Value, fail.Fail] = builder.emit_sext(?b, res_call.ok, i64t);
+        val result: value.Value = res_call.ok;
+
+        # an unsigned compare puts every negative result past 255 as well
+        val res_over: res[value.Value, fail.Fail] = builder.emit_cmp_lt_u(?b, value.const_int(TEST_STATUS_WIDE, i32t), result);
+        if (sel res_over.err) { ret err[fail.Fail].err{res_over.err}; }
+        val res_narrow: res[id.BlockId, fail.Fail] = builder.new_block(?b);
+        if (sel res_narrow.err) { ret err[fail.Fail].err{res_narrow.err}; }
+        val b_narrow: id.BlockId = res_narrow.ok;
+        val res_cbrw: err[fail.Fail] = builder.emit_cbr(?b, res_over.ok, b_wide, b_narrow);
+        if (sel res_cbrw.err) { ret res_cbrw; }
+
+        builder.set_block(?b, b_narrow);
+        val res_r64: res[value.Value, fail.Fail] = builder.emit_sext(?b, result, i64t);
         if (sel res_r64.err) { ret err[fail.Fail].err{res_r64.err}; }
         val res_retk: err[fail.Fail] = builder.emit_ret(?b, res_r64.ok);
         if (sel res_retk.err) { ret res_retk; }
         k = k + 1;
     }
+
+    builder.set_block(?b, b_wide);
+    val res_retw: err[fail.Fail] = builder.emit_ret(?b, value.const_int(TEST_STATUS_WIDE, i64t));
+    if (sel res_retw.err) { ret res_retw; }
 
     ret err[fail.Fail].ok{};
 }
@@ -376,4 +414,66 @@ fun append_function(m: *ir.Module, name: intern.StrId, sig: type.IrTypeId, flags
     }
 
     ret res[u32, fail.Fail].ok{idx};
+}
+
+# the synthesized dispatcher folds every result outside 0..255 to `TEST_STATUS_WIDE`:
+# the entry compares each test's result against 255 unsigned, and one block returns
+# the fold. this reads the module, so it holds on every host the compiler runs on
+test "mach.lang.me.lower.testrunner.synthesize_dispatcher:folds_a_wide_result_to_the_status_range" {
+    var alloc: A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+
+    var tests: [2]Test;
+    var k: u32 = 0;
+    for (k < 2) {
+        val name_r: res[intern.StrId, A.Error] = intern.intern(?s.interner, "t_probe");
+        if (sel name_r.err) { ret 1; }
+        tests[k].linkage = name_r.ok;
+        tests[k].label   = name_r.ok;
+        tests[k].line    = k + 1;
+        tests[k].mod_idx = 0;
+        k = k + 1;
+    }
+    val mr: res[ir.Module, fail.Fail] = synthesize_dispatcher(?s, ?tests[0], 2);
+    if (sel mr.err) { ret 1; }
+    var m: ir.Module = mr.ok;
+    fin { ir.dnit(?m); }
+
+    val main_r: res[intern.StrId, A.Error] = intern.intern(?s.interner, "main");
+    if (sel main_r.err) { ret 1; }
+    val main_ix: opt[u32] = ir.function_lookup(?m, main_r.ok);
+    if (sel main_ix.none) { ret 2; }
+    val fn: *ir.Function = ?m.functions[main_ix.some];
+
+    # every branch on a `255 <u result` compare must take the true edge to a block
+    # that does nothing but `ret 255`
+    var guarded: u32 = 0;
+    var i: u32 = 0;
+    for (i < fn.instr_len) {
+        val ins: *instruction.Instruction = ?fn.instrs[i];
+        if (ins.kind != instruction.OP_CBR || ins.operand_count != 3) { i = i + 1; cnt; }
+        if (ins.operands[0].kind != value.VAL_INSTR) { i = i + 1; cnt; }
+        val cond: *instruction.Instruction = ?fn.instrs[ins.operands[0].data.instr::u32];
+        if (cond.kind != instruction.OP_CMP_LT_U || cond.operand_count != 2
+            || cond.operands[0].kind != value.VAL_CONST_INT
+            || cond.operands[0].data.int_lit != TEST_STATUS_WIDE) { i = i + 1; cnt; }
+        guarded = guarded + 1;
+        val target: u32 = ins.operands[1].data.int_lit::u32;
+        if (target >= fn.block_count) { ret 3; }
+        val blk: *ir.Block = ?fn.blocks[target];
+        if (blk.instr_count != 0 || blk.phi_count != 0) { ret 4; }
+        val fold: *instruction.Instruction = ?fn.instrs[blk.terminator::u32];
+        if (fold.kind != instruction.OP_RET || fold.operand_count != 1
+            || fold.operands[0].kind != value.VAL_CONST_INT
+            || fold.operands[0].data.int_lit != TEST_STATUS_WIDE) { ret 5; }
+        i = i + 1;
+    }
+    # one guard per test
+    if (guarded != 2) { ret 6; }
+    ret 0;
 }

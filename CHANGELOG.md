@@ -192,6 +192,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A test whose result was `256` or more, or negative, was reported as passing
+  on linux and darwin: the dispatcher exited with the raw `i32` and the kernel
+  kept its low eight bits, so `256` read as `0`. The test result is now a
+  status in `0..255` at both ends of the protocol. A literal-shaped `ret`
+  outside the range in a test body is a compile error at the `ret` naming the
+  value (`test result 256 is outside the status range 0..255`), and the
+  dispatcher folds a run-time result outside the range to `255` before it
+  exits, so it is a failure on every host with the same status reported. Four
+  tests in the tree that accumulated more than eight failure bits now return
+  the ordinal of the first failing check. The decision is recorded in
+  `doc/design/test-status-range.md`. (#3241)
 - A comment that shares its line with code is no longer taken as the doc run
   of the declaration on the next line, and never joins the comment on the
   following line into one run. (#3225)
@@ -502,6 +513,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4 is reserved as `MOS6502_WITHDRAWN`. The width legalization pass the target
   drove stays as shared infrastructure, exercised by its unit tests and the
   riscv32 column (#3226, #3112).
+- The comptime manifest defines table. `$mach.build.<name>` was documented as
+  a lookup of a manifest `defines` key, but no manifest key ever populated the
+  driver's define list, so the comptime environment's define table, its
+  binding step and its slot in the build fingerprint were unreachable. The
+  known `$mach.build.*` members are unchanged; a name outside them is refused
+  at the use site as `` unknown `$mach.*` path `` (#3131).
 
 ## [4.30.0] - 2026-09-07
 

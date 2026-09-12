@@ -496,7 +496,7 @@ Notes:
 There is **no `?T` option-type sugar and no special Result keyword sugar in the grammar.**
 `?` is exclusively the prefix address-of operator (below). The std failure tags
 `res[T, E]`, `opt[T]`, and `err[E]` are ordinary `named-type` generic
-instantiations of declarations imported from `std.types.canonical`; the parser
+instantiations of declarations imported from `std.types.result`, `std.types.option` and `std.types.error`; the parser
 and the compiler know nothing of the three names.
 
 

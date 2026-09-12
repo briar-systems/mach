@@ -40,7 +40,7 @@ authoritative reference and wins on any disagreement.
   condition is exactly `sel place.case`, the rest of the block after a chain
   whose every arm exits, or the right operand of `&&`). There is no `match`
   and no `==` on a tag. std 2.0.0's `res[T, E]`, `opt[T]` and `err[E]` are
-  ordinary tags imported from `std.types.canonical`.
+  ordinary tags imported from `std.types.result`, `std.types.option` and `std.types.error`.
 - **`sel` is a keyword.** Never name a binding, field or function `sel`.
 - **No compound assignment.** `+=` etc. do not exist; write `x = x + 1;`.
 - **`fwd` is bare and always public** (no `pub fwd`). `ext fun` is the only
@@ -228,8 +228,8 @@ Whole-tag `==`, `.kind` and `match` do not exist. Reflection: `$is_tag(T)`,
 `$cases(T)` walked with `$each c in $cases(T)` (`sel v.[c]`, `v.[c]`,
 `T.[c]{...}`), `$discriminant_of(T)`.
 
-The std failure tags, declared in `std.types.canonical` and imported like any
-declaration (`use std.types.canonical.res;`):
+The std failure tags, declared in `std.types.result`, `std.types.option` and `std.types.error` and imported like any
+declaration (`use std.types.result.res;`):
 
 ```mach
 pub tag res[T, E]: u8 { err: E; ok: T; }        # err first: a zero res is a zero err

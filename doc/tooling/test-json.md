@@ -79,7 +79,7 @@ order as the human readout), regardless of completion order.
 | `file`        | string        | source file path of the declaring module |
 | `line`        | int           | 1-based source line of the `test` keyword |
 | `kind`        | string        | outcome (see below) |
-| `code`        | int           | exit code (`kind` = `exit`) or signal number (`kind` = `signal`); `0` otherwise |
+| `code`        | int           | exit code in `1..255` (`kind` = `exit`; a test result outside `0..255` arrives as `255`) or signal number (`kind` = `signal`); `0` otherwise |
 | `timeout_seconds` | int       | the bound the test exceeded (`kind` = `timeout`); `0` otherwise |
 | `duration_ns` | int           | wall time of the test process, in nanoseconds |
 | `index`       | int           | the test's collection-order dispatch index (`<exe> <index>` reruns exactly this test; sort by it for declaration order) |
