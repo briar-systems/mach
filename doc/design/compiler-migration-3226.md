@@ -192,6 +192,49 @@ carries no other zero-relying carrier.
 - cross-builds of the compiler for darwin-aarch64, darwin-x86_64 and
   windows-x86_64
 
+## C4 verification
+
+Counted over the 63 files of the C4 partition (the 59 above plus
+`build/outcome`, `fail`'s C4 hunk, `driver/tests` and `cli/diagnostic`),
+before at 2f2f47cb6 and after on this lane's head:
+
+| pattern | before | after |
+| --- | ---: | ---: |
+| `R.Result[` | 6,329 | 94 |
+| `O.Option[` | 843 | 53 |
+| `ok_void` / `void_of` | 522 | 8 |
+| `mach.lang.legacy` imports | 411 | 0 |
+| `R.Result[T, str]`-shaped | 4,785 | 78 |
+
+The 78 `R.Result[T, str]` sites left are the lane's own translation shims
+(the legacy `<name>` over `<name>_typed` in `session`, `query`, `manifest`,
+`publication`, `publication/plan`, `publication/testing`, `driver`,
+`driver/registry`, `handle`; the legacy-kept callbacks
+`load.resolve_module_member_const_load_cb`, `passes.read_definition_cb`,
+`passes.prepared_surface_recipe_cb`, `editor.buffer_definition_cb`,
+`registry`/`fuzz` `provide_debug_descriptor`) and the reads of the
+neighbours' legacy-shaped exports that C2 and C3b kept under their canonical
+names (`source.get`/`add`/`prepare_load`/`prepare_release`/`copy_file`/
+`snapshot_from`/`line_bounds`, `diagnostic.gate_error`/`error`/`get`/
+`snapshot_from`/`replay_into`/`content_equal`/`truncate`/`builder_init`/
+`attach_fix`/`commit`/`last_id`, `parser.parse`, `comptime.eval*`, `embed.*`,
+`linker.link`/`link_images`/`link_images_captured`, the assembly vtable's
+`ct_scan`, `dwarf.debug_descriptor`). None is a C4 return type.
+
+- unit suite through the from-source compiler (A by the v5 stage): 2997
+  passed, 0 failed (2996 at `origin/dev` 3b66e0f70; by name +1
+  `mach.cli.diagnostic.render_fail:an_allocation_refusal_met_by_the_driver_exits_internal`,
+  no test removed)
+- `sh test/census.sh` all ok (real-bools: the seven `reusable` predicates that
+  moved from `R.Result[bool, fail.Fail]` to `res[bool, fail.Fail]` listed)
+- corpus layer B x86_64-linux: 102 pass, 0 fail, 0 skip; spirv: 94 pass, 0
+  fail, 8 skip; goldens unchanged
+- link leg x86_64-linux: 140 pass, 0 fail, 0 skip
+- three-generation fixpoint from the v5 stage: A = B = C `4ce07b110c63bc3c`
+- cross-builds of the compiler for darwin-aarch64, darwin-x86_64 and
+  windows-x86_64 (the darwin and windows blocks of `build/cache/compiler` and
+  the PATHEXT read in `cli/util` are only compiled there)
+
 ## Owed to C5
 
 - delete `src/lang/legacy.mach` and `src/lang/legacy/` once no import remains
