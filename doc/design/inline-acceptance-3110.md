@@ -360,10 +360,11 @@ the decision). The wrappers themselves are now the subject:
 The three driver tests read `dep/std/src/sync/atomic.mach` and
 `dep/std/src/types/bool.mach` from the repository at test time and place them
 verbatim in a `std` path dependency of the scaffold, so they measure the file
-std ships at the pin rather than a restatement of it. Mutation control for
-all four: `#[noinline]` on one wrapper in the pinned std fails the release
-goldens (`fetch_add=3`, `call std.sync.atomic.fetch_add` in the sequence) and
-the three driver tests (calls present).
+std ships at the pin rather than a restatement of it. Mutation controls:
+`#[noinline]` on `fetch_add` in the case's std copy fails the release goldens
+(`fetch_add=3`, `call std.sync.atomic.fetch_add` in the sequence), and
+`#[noinline]` on `cas` in the pinned `dep/std` fails the three driver tests
+(exits 8, 50 and 10: calls present).
 
 The link case's `aarch64-linux` goldens were blessed from a `qemu-aarch64` run
 of the producer on the x86-64 host (the observable is the instruction text
