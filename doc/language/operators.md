@@ -1,9 +1,5 @@
 # Operators
 
-Tag, canonical type, and `try` descriptions include the accepted v5 contract.
-Implementation is incomplete at base commit `fc5c9e7e`. See
-[tag.md](tag.md#implementation-status) and [try.md](try.md#implementation-status).
-
 ## Arithmetic
 
 `+` `-` `*` `/` `%` — work on integer and floating-point scalars. On the seeded

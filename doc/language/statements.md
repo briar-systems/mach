@@ -1,9 +1,5 @@
 # Statements
 
-Tag, canonical type, and `try` descriptions include the accepted v5 contract.
-Implementation is incomplete at base commit `fc5c9e7e`. See
-[tag.md](tag.md#implementation-status) and [try.md](try.md#implementation-status).
-
 Statement forms compose into function bodies and blocks. Statements end
 with `;` except where they end with a block `{...}`.
 
@@ -130,7 +126,7 @@ in order. Blocks can stand alone:
 }
 ```
 
-## Expression statements and `try`
+## Expression statements
 
 An expression followed by a semicolon executes as a statement:
 
@@ -138,29 +134,40 @@ An expression followed by a semicolon executes as a statement:
 compute();
 ```
 
-When using `try` with canonical `err[E]`, the successful `ok` case produces no
-payload value. As a result, `try` on an `err[E]` operand is permitted only as a
-direct expression statement:
+Assignment is an expression (`x = y;` is an expression statement whose top
+operator is `=`), and so is a call whose result is discarded.
 
-```mach
-try flush() or (error: WriteError) {
-    ret err[WriteError].err{error};
-};
+## Failure handling
+
+A function that can fail returns a tag. The caller tests the case with `sel`
+and exits the arm that handles the failure; the exiting chain guards the
+success payload for the rest of the block:
+
+```mach accept
+use std.types.canonical.res;
+use std.types.canonical.err;
+
+tag WriteError: u8 { closed; full; }
+
+fun flush() err[WriteError] { ret err[WriteError].ok{}; }
+fun parse(input: u8) res[i64, WriteError] { ret res[i64, WriteError].ok{input::i64}; }
+
+fun increment(input: u8) res[i64, WriteError] {
+    val flushed: err[WriteError] = flush();
+    if (sel flushed.err) { ret res[i64, WriteError].err{flushed.err}; }
+    val r: res[i64, WriteError] = parse(input);
+    if (sel r.err) { ret res[i64, WriteError].err{r.err}; }
+    ret res[i64, WriteError].ok{r.ok + 1};      # r.ok is guarded: the chain above exits
+}
 ```
 
-Attempting to use `try` on `err[E]` in a value position, such as a binding
-initializer or function argument, is a compile error.
-
-Every reachable path through a `try` failure block must terminate control flow
-with `ret`, or with `brk` or `cnt` targeting an outer enclosing loop. Failure
-blocks cannot fall through or provide fallback values.
-
-Ordinary user-defined tags acquire no automatic `try` convention and use explicit
-`if`/`or` statements instead. See [try.md](try.md) and [tag.md](tag.md).
+Every reachable path through the failure arm must leave the block, with `ret`,
+or with `brk` or `cnt` targeting a loop that encloses the chain; an arm that
+falls through opens no guard, and the payload read after it is rejected. See
+[tag.md](tag.md) for the guard rules.
 
 ## See also
 
-- [expressions.md](expressions.md) - expressions, literals, and try syntax
-- [try.md](try.md) - explicit failure handling reference
-- [tag.md](tag.md) - tagged values reference
+- [expressions.md](expressions.md) - expressions and literals
+- [tag.md](tag.md) - tagged values, `sel` and guards
 - [comptime-control.md](comptime-control.md) - the comptime counterpart

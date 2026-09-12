@@ -1,9 +1,5 @@
 # Expressions
 
-Tag, canonical type, and `try` descriptions include the accepted v5 contract.
-Implementation is incomplete at base commit `fc5c9e7e`. See
-[tag.md](tag.md#implementation-status) and [try.md](try.md#implementation-status).
-
 Expressions evaluate to values. They appear on the right side of bindings,
 as conditions, and as call arguments.
 
@@ -69,29 +65,9 @@ For tagged values:
 - `tag_val.case` accesses the payload of that case. It is legal only inside a lexical guard for that place and case; an unguarded payload access is a compile error.
 - `TypeName.case` alone is a case selector, not a value. It cannot be stored or passed.
 
-See [tag.md](tag.md) for the guard rules.
-
-## `try` expressions
-
-A `try` expression performs explicit, visible failure handling for canonical
-`res[T, E]`, `opt[T]`, and `err[E]` values:
-
-```mach
-val number: i64 = try parse(input) or (error: ParseError) {
-    ret res[i64, ParseError].err{error};
-};
-```
-
-On success, `try` extracts the active payload. On failure, it binds the error
-(if applicable) and executes a mandatory terminating failure block. A failed
-`try` skips the remainder of the enclosing expression and does not initialize its
-destination.
-
-In assignments, the right hand side evaluates and captures before the destination
-place on the left hand side is evaluated.
-
-Ordinary user-defined tags do not acquire an automatic `try` convention. See
-[try.md](try.md) for complete failure handling rules.
+See [tag.md](tag.md) for the guard rules. There is no other operator over a
+tag: failure handling is an ordinary `if`/`or` chain over `sel`, and the
+guard it opens is what makes the payload readable.
 
 ## Function calls
 

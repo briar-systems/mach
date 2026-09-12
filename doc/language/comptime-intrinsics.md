@@ -55,16 +55,14 @@ fun probe[T]() u64 {
 }
 ```
 
-`$offset_of`'s **second** argument is the exception: a bare field name, resolved
-against the aggregate layout, never a type or a value. The accepted v5 tag
-contract also permits a payload case name.
+`$offset_of`'s **second** argument is the exception: a bare field name, or a
+tag's payload case name, resolved against the aggregate layout, never a type or
+a value.
 
-`$offset_of` adopts its binding's width like the other three. The accepted v5
-contract makes checked offsets available under the same complete-type rules as
-size and alignment. Unresolved or recursive layout is diagnosed. This supersedes
-the earlier lowering-only offset exception. That exception still describes the
-implementation at base commit `fc5c9e7e`, where offset queries cannot be used in
-`$if` gates and their result width is checked during lowering.
+`$offset_of` adopts its binding's width like the other three, and answers from
+the same checked layout under the same complete-type rules as size and
+alignment (see [Where a layout intrinsic is constant](#where-a-layout-intrinsic-is-constant)).
+An unresolved or recursive layout is diagnosed, never guessed.
 
 ### `$length_of` — elements, not bytes
 

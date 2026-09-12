@@ -7,11 +7,12 @@ this directory. Where the live parser diverges from a doc, the divergence
 is called out inline. Productions that could not be fully pinned to the
 parser are marked `(* approximate, verify *)`.
 
-Tag and `try` syntax is parsed. Canonical tag types,
-case descriptor construction, and the new reflection forms below also describe
-the [accepted v5 contract](../design/tagged-values.md), whose implementation is
-still incomplete. See [tag.md](tag.md) and [try.md](try.md) for status and semantic
-restrictions.
+The tag productions (`tag-decl`, `tag-literal`, `sel-expr`, the `$cases`
+sequence and the `.[desc]` projection) implement the
+[v5 tagged-value contract](../design/tagged-values.md); see [tag.md](tag.md)
+for the semantic restrictions the parser does not enforce (guards, places,
+payload arity). `test/doc-agreement.py` checks the keyword list below against
+the parser's `token.mach`.
 
 This is a reference grammar, not the parser's exact control flow. The
 parser is a hybrid recursive-descent / Pratt climber that is
@@ -102,12 +103,12 @@ The reserved keywords (matched as `IDENT` text by the parser) are:
 
 ```
 asm  brk  cnt  def  ext  fin  for  fun  fwd  if
-nil  or   pub  rec  ret  sel  tag  test try  uni
-use  val  var
+nil  or   pub  rec  ret  sel  tag  test uni  use
+val  var
 ```
 
-`nil` is an expression literal, and `sel` and `try` are prefix expression operators. The rest are statement, declaration, or type
-introducers. Note these are *contextual*: nothing in the lexer prevents a
+`nil` is an expression literal and `sel` is a prefix expression operator. The
+rest are statement, declaration, or type introducers. Note these are *contextual*: nothing in the lexer prevents a
 binding or field from being named after one, but the parser will treat the
 keyword in its keyword position. The operand-less statement keywords `brk`
 and `cnt` are keywords only in their bare form (`brk;` / `cnt;`); the same
@@ -491,8 +492,10 @@ Notes:
   entries do **not** accept the leading `$` comptime marker.
 
 There is **no `?T` option-type sugar and no special Result keyword sugar in the grammar.**
-`?` is exclusively the prefix address-of operator (below). Canonical `res[T, E]`,
-`opt[T]`, and `err[E]` are compiler-known tags written with ordinary generic brackets.
+`?` is exclusively the prefix address-of operator (below). The std failure tags
+`res[T, E]`, `opt[T]`, and `err[E]` are ordinary `named-type` generic
+instantiations of declarations imported from `std.types.canonical`; the parser
+and the compiler know nothing of the three names.
 
 
 ## Expressions
@@ -517,13 +520,10 @@ prefix ::= LIT_INT | LIT_FLOAT | LIT_CHAR | LIT_STR
          | tag-literal
          | array-literal
          | sel-expr
-         | try-expr
          | unary-op prefix { postfix }
          | "(" expr ")"
 
 sel-expr ::= "sel" prefix { postfix }
-
-try-expr ::= "try" prefix { postfix } "or" [ "(" IDENT ":" type ")" ] block
 
 comptime-ident ::= "$" IDENT
 
@@ -536,8 +536,10 @@ unary-op ::= "-"      (* numeric negation *)
 
 - A unary operator binds its operand as `prefix` followed by any postfix
   chain, so `@p.field` and `?arr[i]` apply member/index *inside* the unary.
-- `sel` binds the same way and requires the result to be a member access, so
-  `sel r.ok && r.ok > 3` parses as `(sel r.ok) && (r.ok > 3)`.
+- `sel` binds the same way and requires the result to be a member access or
+  a descriptor projection (`sel r.ok`, `sel v.[c]`), so `sel r.ok && r.ok > 3`
+  parses as `(sel r.ok) && (r.ok > 3)`; any other operand is a parse error
+  (`` `sel` tests one case of a place: write `sel place.case` or `sel place.[case]` ``).
 - `(expr)` is a plain grouping; there is no tuple form.
 
 ### Postfix
@@ -605,11 +607,10 @@ outcomes apply whether or not a `(` follows the `]`:
 
 ```ebnf
 typed-literal ::= named-type "{" [ member-init { "," member-init } [ "," ] ] "}"
-tag-literal   ::= named-type "." IDENT "{" [ expr ] "}"
+tag-literal   ::= named-type ( "." IDENT | "." "[" expr "]" ) "{" [ expr ] "}"
 array-literal ::= array-type "{" [ expr { "," expr } [ "," ] ] "}"
 
 member-init ::= IDENT ":" expr | expr
-              | "[" expr "]" [ ":" expr ]   (* accepted v5 case descriptor construction *)
 ```
 
 - `typed-literal` is a record or union literal: a named type (optionally
@@ -619,10 +620,13 @@ member-init ::= IDENT ":" expr | expr
 - `tag-literal` names the type, the case and the payload (`Reply.value{42}`,
   `Reply.empty{}`, `res[i64, E].ok{42}`). The payload is positional and exactly
   one; a payloadless case takes empty braces. The descriptor form `T.[case]{...}`
-  obeys the same single-case rule after specialization.
-  The parser commits to a literal via a lookahead
-  (`Name (.Name)* ([...])? (.Name)? {`); where the head reads as `A.b` the
-  resolver decides whether `b` is a case name or the final segment of a type path.
+  names the case through a comptime case descriptor bound by `$each` and obeys
+  the same single-case rule after specialization. The parser commits to a
+  literal via a lookahead (`Name (.Name)* ([...])? (.Name | .[...])? {`); where
+  the head reads as `A.b` the resolver decides whether `b` is a case name or the
+  final segment of a type path. The parser accepts named, positional and bare
+  initializers in every literal; sema enforces that a tag literal carries at
+  most one positional payload and a record literal names its fields.
 - `array-literal` is `[N]T{ e0, e1, ... }`, an array type followed by a
   brace-delimited positional element list.
 
@@ -705,9 +709,8 @@ comptime-each-stmt ::= "$" "each" IDENT "in" expr stmt-branch-body
 ```
 
 `$each` is a compile-time unroll: the body is duplicated once per element of
-the sequence, which must be `$fields(T)`, `$cases(T)` in the accepted v5
-contract, a variadic pack identifier, or a
-comptime-constant array `val` (see
+the sequence, which must be `$fields(T)`, `$cases(T)`, a variadic pack
+identifier, or a comptime-constant array `val` (see
 [comptime-intrinsics.md](comptime-intrinsics.md)). `in` is a contextual keyword.
 
 Notes:
@@ -806,25 +809,26 @@ Productions verified directly against the parser source:
   (incl. the `#[` attribute-open exception), the "keywords are `IDENT`s" model.
 - **Precedence ladder** — `token.infix_precedence` / `token.is_right_assoc`
   (the table is a direct transcription; only `=` is right-associative).
-- **Decorators** — `parser/decl.mach` `parse_decorators` / `parse_one_decorator`:
+- **Decorators** — `parser/grammar.mach` `parse_decorators` / `parse_one_decorator`:
   leading `#[name(args)]` clauses (one Decorator node); a backtick at decorator
   position is rejected as the removed surface (v2.4.0), closed directive set.
-- **Declarations** — `parser/decl.mach`: `use`, `fwd` (incl. `pub fwd`
+- **Declarations** — `parser/grammar.mach`: `use`, `fwd` (incl. `pub fwd`
   rejection), `fun` (generics, params, variadic `...`, named pack `name: ...`,
   comptime `$` params, optional return type, block-or-`;` body), `rec`, `uni`,
+  `tag` (mandatory discriminator, cases with an optional payload type),
   `val`/`var` (type annotation required; `val x = 42;` is rejected), `def`, `test`, `flags`
   (`pub`/`ext` any order/count), the decl-scope `$if`/`$or` chain, and the
   `comptime-directive` (attribute-write vs. bare directive) form.
-- **Statements** — `parser/decl.mach`: `block`, `if`/`or` chain, `for`
+- **Statements** — `parser/grammar.mach`: `block`, `if`/`or` chain, `for`
   (optional condition), `ret`/`brk`/`cnt`/`fin`, local `val`/`var`, the
   stmt-scope `$if`/`$or` chain, `$each … in … { }`, and `expr-stmt`.
-- **Expressions** — `parser/expr.mach`: prefix atoms, all five unary
-  prefix operators (`-`, `!`, `~`, `?`, `@`), the postfix chain
+- **Expressions** — `parser/grammar.mach`: prefix atoms, `sel`, all five
+  unary prefix operators (`-`, `!`, `~`, `?`, `@`), the postfix chain
   (call with optional `...` spread on arguments, generic-call, index,
-  member, field projection `.[f]`, cast), struct/array literals and the
+  member, field projection `.[f]`, cast), struct/array/tag literals and the
   typed-literal lookahead, the generic-call-vs-index `[` disambiguation,
   and `comptime-ident`.
-- **Types** — `parser/expr.mach`: `*T`, `[N]T`, `fun(...) R` (with variadic,
+- **Types** — `parser/grammar.mach`: `*T`, `[N]T`, `fun(...) R` (with variadic,
   pack `name: ...`, and optional return), anonymous `rec {...}` / `uni {...}`,
   and named types with generic args / dotted paths.
 - **Inline asm** — `parser/iasm.mach`: mandatory ISA tag, raw brace-balanced
