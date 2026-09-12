@@ -201,7 +201,7 @@ succeed.
 | `-O2`          | —              | select the release pipeline, overriding the selected profile's `opt`; it includes loop auto-vectorization on a vector-capable target (the profile's `vectorize` key and the `#[scalar]` decorator opt out). `-O1` is rejected on every command with one message (`-O1 was removed; use -O0 or -O2`) until a distinct pipeline exists |
 | `-g`           | —              | emit debug info for this build, forcing the selected profile's `debug` on (precedence `-g` > profile > off) |
 | `--emit <kind>`| `obj`\|`exe`   | `obj` stops at the relocatable objects; `exe` (default) links a binary |
-| `--cache`      | —              | reuse and publish persistent object images under the output directory (phase 1 of #3221: off by default) |
+| `--cache`      | —              | reuse and publish persistent object images under the output directory (opt-in, see below) |
 | `--no-cache`   | —              | force a genuinely uncached build: no persistent object images and no build-step reuse; wins over `--cache` |
 | `--jobs <n>`   | count          | codegen worker threads (default: host CPUs; `1` serialises) |
 | `--pie`        | —              | emit a position-independent (ET_DYN) executable for ASLR instead of the default fixed-address one; opt-in (see below) |
@@ -215,27 +215,42 @@ Plus the global flags above.
 
 With `--cache`, successful code generation stores serializable object images in
 `.mach-cache` under the selected project output directory, and a later compiler
-process that opts in reuses them. The front end and lowering still run, and
-linking still resolves and validates its current inputs. The key includes the
-running compiler's file digest, the selected build configuration, the active
-source graph including dependency and generic bodies, embedded bytes, and the
-executed build-step inputs and tools. A change to any source in the active build
-cell invalidates that cell's objects. The cache is off by default until the keys
-are complete (`doc/design/object-cache-3221.md`); a build without `--cache`
-executes no cache code.
+process that opts in reuses them. The front end still runs; a module whose
+object the cache holds skips lowering, optimization and code generation, and
+linking still resolves and validates its current inputs (the linked artifact is
+never cached). The key includes the running compiler's build id, the selected
+build configuration, the active source graph including dependency and generic
+bodies, embedded bytes, and the executed build-step inputs and tools. Paths are
+keyed in canonical form, so `mach build .` and `mach build /abs/project` share
+entries; with `-g` the spelling reaches the line tables and is keyed as well. A
+change to any source in the active build cell invalidates that cell's objects:
+the key is the whole cell, so an edit misses every module and a rebuild of an
+unchanged tree, a reverted edit or a branch switched back hits every module.
+
+The cache is opt-in. A warm hit is about 2.6 times faster than an uncached
+build (about 175 ms against 460 ms on a 42-module project), but publishing costs
+an uncached build 4 to 7 percent and a cell misses as a whole, so an edit and
+rebuild loop would pay the publication on every build and hit on none; the
+default flips when a module's key no longer spans the whole cell
+(`doc/design/object-cache-3221.md`). A build without `--cache` executes no
+cache code.
 
 `mach build . --no-cache` and `mach test . --no-cache` neither read nor write
 persistent object entries or build-step stamps, and force every declared build
-step to execute. `-vv` reports each reused image as `cached object`.
+step to execute. `-vv` reports each restored image as `cached object` with the
+time its restore took, and the cell key's cost as `cell snapshot`.
 
 A missing, corrupt, locked, or inaccessible cache falls back to compilation.
 Allocation failures and internal compiler failures remain errors. Each cache
 holds at most 512 MiB of logical entry bytes, with at most one additional staged
 entry during publication. Individual entries and decoded image owners are limited
 to 64 MiB each. Filesystem metadata, allocation-unit overhead, and the compiler's
-other live state are separate from those limits. Eviction removes private cache
-entries under a short exclusive lock. Cache operations never fetch dependencies
-or modify Git state.
+other live state are separate from those limits. Eviction runs under a short
+exclusive lock before a publication and removes the least recently published
+entries first (entry mtime, then name), never one the current build restored or
+published; a publication that cannot make room without one is declined and the
+store is left as it was. Cache operations never fetch dependencies or modify
+Git state.
 
 `--pie` is an opt-in: without it, a linux executable links fixed-address
 (`ET_EXEC`) exactly as before — a normal build is byte-identical. With it, the
@@ -504,7 +519,7 @@ bin p1-windows)`, `no bin named 'nosuch'`, `no profile named 'nosuch'`.
 
 | Flag                | Value   | Effect |
 |---------------------|---------|--------|
-| `--cache`           | —       | reuse and publish persistent object images while compiling tests (off by default) |
+| `--cache`           | —       | reuse and publish persistent object images while compiling tests (opt-in, as for `build`) |
 | `--no-cache`        | —       | force a genuinely uncached test build: no persistent object images and no build-step reuse; wins over `--cache` |
 | `--jobs <n>`        | count   | run up to `<n>` test processes at once **and** size the build's codegen workers (default: the CPUs available; 1 serializes) |
 | `--filter <pattern>`| pattern | run only tests whose name contains `<pattern>` |
