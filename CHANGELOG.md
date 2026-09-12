@@ -348,6 +348,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#2299).
 - Editor analysis returns an owned diagnostic/source snapshot with explicit phase and target selection. Raw products have checked serial-view lifetimes. Closing a buffer retires its overlay, source payload and cached dependents while retaining its FileId. Buffer slots are reused, and checked editor teardown preserves owners on preparation failure (#2999).
 
+### Removed
+
+- The `:^` and `:^T` declassification spellings. `:>T` is the one form and
+  always names its public result type; writing `x:^` or `x:^u32` is a parse
+  error at the operator, `` `:^` and `:^T` were removed in 5.0.0;
+  declassification is `expr:>T` and always names its public result type ``,
+  and the parser consumes a following type so the rest of the expression
+  parses. A strip whose operand is typed by a generic parameter defers the
+  target-type equality from the template to each instance, which is what the
+  untyped form used to allow inside generic bodies (#3226, #3112).
+
 ## [4.30.0] - 2026-09-07
 
 The transition release that becomes the seed for 5.0.0. Replacement language
