@@ -27,9 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answer from the checked layout. Representation-changing casts that contain a
   tag are refused. Tags are carried by value through every native convention,
   through SPIR-V as a per-case composite, and by the editor's type, resolve
-  and recovery products. The canonical `res`, `opt` and `err` are std tags;
-  the compiler seeds them at this integration state until std 2.0.0 declares
-  them. The corpus gains a `tag` group of nine cases with C references.
+  and recovery products. The canonical `res`, `opt` and `err` are std tags
+  declared by std 2.0.0; the compiler has no knowledge of their names, and a
+  module may declare its own (#3226, mach-std#617). The corpus gains a `tag`
+  group of nine cases with C references.
 - `#[deprecated]` and `#[deprecated("msg")]` on `fun`, `ext fun`, `rec`,
   `uni`, `tag`, `def`, `val`, `var`, `use`, `fwd` and on a tag case: every use
   from another source module warns once with the message; the declaring
