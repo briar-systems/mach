@@ -492,6 +492,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4 is reserved as `MOS6502_WITHDRAWN`. The width legalization pass the target
   drove stays as shared infrastructure, exercised by its unit tests and the
   riscv32 column (#3226, #3112).
+- The comptime manifest defines table. `$mach.build.<name>` was documented as
+  a lookup of a manifest `defines` key, but no manifest key ever populated the
+  driver's define list, so the comptime environment's define table, its
+  binding step and its slot in the build fingerprint were unreachable. The
+  known `$mach.build.*` members are unchanged; a name outside them is refused
+  at the use site as `` unknown `$mach.*` path `` (#3131).
 
 ## [4.30.0] - 2026-09-07
 
