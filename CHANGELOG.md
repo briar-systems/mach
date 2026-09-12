@@ -43,6 +43,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded storage and atomic publication. Off by default in this phase;
   `--no-cache` forces a genuinely uncached build with no build-step reuse
   (#3221).
+- Every linked image carries a build id derived from its own content: an ELF
+  `.note.gnu.build-id` note under `PT_NOTE` holding the SHA-256 of the loaded
+  image (so `-g` leaves it unchanged), an `LC_UUID` in every Mach-O executable
+  and a `.buildid` CodeView record in every PE image, both the first sixteen
+  bytes of the content hash shaped as a version 4 uuid. The object cache
+  identifies the running compiler by that id, read from its own mapped headers
+  at startup, and hashes the executable only when it carries none. The Mach-O
+  uuid was previously written only under `--pie` and derived from the artifact
+  name (#3221).
 
 - `mach check <path>` runs load, resolve and sema over the source reachable from
   the artifacts `mach build` would select, through the same driver, queries and
