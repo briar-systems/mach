@@ -331,3 +331,78 @@ code, and stay as retained.
 - ~~delete `fail.lift`~~ done (C5a), with every `lift*`/`lower*`/`discard*` shim
 - `std.types.result` and `std.types.option` leave std now that the compiler
   has no `R.`/`O.` use (the std lane, after C5a lands)
+
+## #3112 removal inventory
+
+C5b (`feat/3226-c5b`, on dev `33d60001e`). Every item of #3226's "Exact
+removal inventory" that C5 owns, with the commit that retires it, the
+diagnostic a user still writing the form receives, and the negative test that
+holds it (each test's source carries an `intentional removal test` comment).
+The last row is the item C5 does not own.
+
+| # | item | commit | diagnostic (located where the form is written) | test |
+| --- | --- | --- | --- | --- |
+| 1 | `:^` and `:^T` refused, `:>T` only | `c6bf473ef` | `` `:^` and `:^T` were removed in 5.0.0; declassification is `expr:>T` and always names its public result type, as in `x:>u32` `` at the operator (parser, `parse_removed_strip`); dep/std at `e204cb81f` carries no `:^` (only `::^T` casts) | `mach.lang.fe.parser.expr.parse_strip:removed_caret_forms_are_refused`, `mach.lang.driver:colon_caret_is_refused_with_the_migration_diagnostic`; the generic-body replacement for the untyped form: `mach.lang.driver:generic_strip_target_is_checked_per_instance` |
+| 2 | alias dependency keys, nested `dep/<id>/dep/` realizations, root `mach.lock` | `09f7cf5da` | `[dep.foo] realizes project 'std'; alias keys were removed in 5.0.0: ... rename the table to [dep.std] and the directory to dep/std` (pull, verify and the build; F3 had only the pull note and no build check); `dependency 'a': dep/a/dep/b is a nested realization; nested realizations were removed in 5.0.0 (...): delete dep/a/dep` (an empty gitlink directory passes); `mach.lock was removed in 5.0.0 and is refused; the committed gitlinks under dep/ are the pins: delete mach.lock` (every command that opens the project) | `mach.cli.cmd.dep.pull:an_alias_key_is_refused_naming_the_removal`, `mach.lang.driver.deps.realize_git_submodule:alias_key_is_refused_after_checkout`, `mach.lang.driver:dep_closure_refuses_an_alias_key_before_any_conflict`, `mach.cli.cmd.dep.verify:a_nested_realization_is_refused_and_an_empty_gitlink_directory_is_not`, `mach.cli.cmd.dep.pull_and_verify:a_stale_lock_file_is_refused_naming_the_removal` |
+| 3 | `sysv` as an alias of `sysv64` | `c7b4e6069` | `` `$mach.abi.sysv` was removed in 5.0.0; the registry spells this ABI `sysv64`: write `$mach.abi.sysv64` `` at the path (the manifest never accepted the alias) | `mach.lang.fe.comptime.tag_for:removed_sysv_alias_is_refused_by_name` |
+| 4 | ambiguous target/profile/artifact selection without an explicit default | `f63b673d2` | `mach.toml: several {targets are declared, none matches the host \| profiles are declared \| artifacts support the selected target} and none is marked `default = true`; no ... is selected by table order: mark exactly one [...] with `default = true` or select one with {--target \| --profile \| --bin/--lib}` (F3 had left the warned first-declared fallbacks) | `mach.lang.manifest.resolve_target:native_without_a_host_match_uses_the_sole_or_default_declaration_never_table_order`, `mach.lang.manifest.resolve_profile:several_profiles_without_a_default_are_refused_naming_the_default_key`, `mach.lang.build.plan.plan:a_test_goal_without_a_default_among_several_artifacts_is_refused_naming_the_default_key`, `mach.lang.driver:a_test_build_over_several_artifacts_without_a_default_is_refused_at_planning`, `mach.cli.cmd.doc.build_project:several_artifacts_without_a_default_are_refused` |
+| 5 | embedded paths escaping the project root | `467631b08`, `b1cca76f1` | `` `embed` path escapes the project root; an embedded file must live inside the project (4.30 read it with a warning, 5.0.0 refuses it and does not read the file) `` at the decorator; the driver skips the path when collecting embed inputs so the file is never opened; root and file are compared in absolute coordinates (a relative root used to flag every embed) | `mach.lang.driver:embed_outside_the_project_root_is_refused_and_never_read`, `mach.lang.embed.containment:relative_roots_and_source_paths_share_absolute_coordinates` |
+| 6 | `[project] name`, `description`, `mach`; `[profile.*] emit_ir`, `emit_asm` | `08c080a27` | `mach.toml: [project] key 'name' was removed in 5.0.0; it was accepted and never read: remove the key` (root and dependency manifests, `dep '<id>': ` prefixed); the deprecated-key record and driver warnings are deleted | `mach.lang.manifest.parse:the_five_unread_keys_are_refused_naming_the_removal_in_both_forms`, `mach.lang.manifest.parse:mach_key_is_refused_as_removed_not_unknown`, `mach.lang.manifest.native_owner:removed_key_rejection_owns_only_its_message`, `mach.lang.driver:removed_manifest_keys_are_refused_for_the_root_and_each_dependency_naming_the_removal` |
+| 7 | `$project.name`, `$project.description` (#3128) | `53f683f8e` | `` `$project.name` was removed in 5.0.0 with the `[project] name` manifest key; the project is identified by `$project.id` `` and `` `$project.description` was removed in 5.0.0 with the `[project] description` manifest key; there is no comptime project description `` at the path; not re-sourced (the config, build context and fingerprint fields are deleted); a rejected rooted path now reports its own message instead of the generic bare-ident error | `mach.lang.fe.comptime.resolve_project_path:removed_name_and_description_are_refused_by_name`, `mach.lang.driver:project_name_and_description_paths_are_refused_naming_the_removal` |
+| 8 | MOS 6502 target | `f7f0c644a` | `target 'mos6502' was withdrawn and removed in 5.0.0; no isa or abi implementation is registered for it: retarget the [target.*] table to a supported tuple` at target resolution (manifest `isa`/`abi`); `$mach.arch.mos6502` is an unknown tag. Deleted: `src/lang/target/isa/mos6502/` (4 files), `isa/mos6502.mach`, `abi/mos6502.mach`, the registry rows, `freestanding` OS row, `TUPLE_TARGET_UNAVAILABLE`, `test/golden/mos6502/`, its `engines.conf` row and SKIPS, `test/fuzz/corpus/asm/mos6502-in-any.asm`; `da65` was never pinned in `tools.lock`. Arch catalog version 2 (`arch.MOS6502_WITHDRAWN = 4` reserved, no row). `closed-catalogs-3124.md` records the deleted `mos6502.Opcode` catalog. The width legalization pass is untouched: `mach.lang.be.codegen.legalize` 30 tests pass and the riscv32 column still refuses every case through it (`* ab` declared skip, 204 cells) | `mach.lang.driver:mos6502_target_is_refused_as_withdrawn`; `mach.lang.target.isa.arch_id_for:name_roundtrip` (`mos6502` is `ARCH_UNKNOWN`); `mach.lang.fe.comptime.tag_for:registry_names_are_the_only_names`; 18 mos6502 unit tests deleted with their sources (listed under Verification) |
+| 9 | explicitly defaulted library public entry, no implicit `lib.mach` | `4a4d8cf91` | `` project 'x' declares no artifact, so it has no public module; the implicit `lib.mach` entry of an artifact-less dependency was removed in 5.0.0: import a full path, or declare a static or shared [artifact.*] table marked default = true in its manifest `` at the `use`; `mach init --lib` scaffolds its artifact `default = true` (`1b725eaf4`) | `mach.lang.driver:bare_import_of_an_artifact_less_dependency_names_the_removed_lib_mach_fallback` |
+| 10 | doc/, `mach init` templates and fixtures | `1b725eaf4` and each row's commit | `doc/manifest.md`, `doc/cli.md`, `doc/language/{grammar,secrecy,comptime,comptime-mach,modules,decorators}.md` and the mach skill describe only the retained forms and name each refusal; `doc/design/release-shape.md` and the closed historical design records keep their "removed in 5.0.0" statements; the 4.30.0 CHANGELOG section is history | the negative tests above; `grep` of `:^`, `emit_ir`, `$project.name`, `$mach.abi.sysv`, `lib.mach` fallback and `mos6502` over `doc/`, `src/cli`, `test/` finds only removal statements and these tests |
+| - | legacy result/option/Void APIs | C5a (`33d60001e`) and mach-std#617 | out of C5b's scope | see "C5a: the compiler-side unshim" |
+
+Not in this inventory and left as F3 landed it: the dependency-form leniency
+on `link`, `need`, the link filter axes and `export` (owner ruling 2026-09-11
+ties the strict root rules for dependencies to the coordinated std 2.0.0
+landing).
+
+### C5b verification
+
+All through A, the from-source compiler the v5 stage
+(`.wt/v5stage/out/v5/mach`) builds from this branch, against std `e204cb81f`.
+
+- unit suite: 2985 passed, 0 failed (2997 at `33d60001e`); by name 36 removed
+  and 24 added. Removed: the 18 mos6502 unit tests that lived in the deleted
+  sources (`mach.lang.target.isa.mos6502.{encode,reloc,rules}.*`,
+  `mach.lang.target.abi.mos6502.register:*`), the 3 driver tests exercising
+  the mos6502 tuple, and 15 tests asserting a 4.30 fallback, warning or note
+  (`colon_gt_lowers_identically_to_colon_caret`,
+  `deprecated_caret_forms_still_accepted`,
+  `the_five_unread_keys_are_accepted_recorded_and_never_read_in_both_forms`,
+  `mach_key_is_deprecated_not_unknown`,
+  `early_parse_rejection_releases_recorded_keys`,
+  `deprecated_manifest_keys_warn_for_the_root_and_each_dependency_naming_the_refusal`,
+  `several_profiles_without_a_default_take_the_first_declared_and_say_so`,
+  `a_test_goal_without_a_default_takes_the_first_declared_artifact_and_says_so_in_the_request`,
+  `a_test_build_that_picks_the_first_declared_artifact_records_the_deprecation_warning`,
+  `the_first_declared_fallback_records_the_deprecation_warning`,
+  `embed_outside_the_project_root_warns_until_5_0_0`,
+  `a_stale_lock_file_is_noted_not_read`, `alias_key_realizes_at_the_key`,
+  `dep_closure_conflict_names_chains`, `dep_content_conflicts_unify_mirrors`).
+  Added: the 23 tests in the table plus
+  `float_gated_out_of_a_freestanding_tuple` (the mos6502 fixture retargeted
+  to `rv32imc`/`freestanding`/`ilp32`).
+- `sh test/census.sh` all ok; `b-be-7` no longer lists `ARCH_MOS6502`.
+- `python3 test/test-corpus.py` ok (the column list no longer carries
+  mos6502).
+- corpus layers A and B, every remaining column, no golden moves:
+  x86_64-linux 408 pass / 0 fail / 0 skip; aarch64-linux 408/0/0;
+  riscv64-linux 408/0/0; spirv 281/0/111; riscv32 0/0/204 (the declared
+  `* ab` skip, every case still refused by the width legalization pass);
+  x86_64-windows 306/0/102; x86_64-darwin 408/0/0; aarch64-darwin 408/0/0.
+- link leg x86_64-linux: 140 pass, 0 fail, 0 skip (the embed cases were the
+  false refusal `b1cca76f1` fixes).
+- vecrows x86_64-linux: 184 probe cells ok, 0 declared exceptions.
+- three-generation fixpoint from the v5 stage: A = B = C `e0983e34`.
+- cross-builds of the compiler with A for darwin-aarch64 (Mach-O arm64),
+  darwin-x86_64 (Mach-O x86_64) and windows-x86_64 (PE32+).
+- `mach init` of a scratch bin project under `out/` builds and runs, and a
+  `--lib` scaffold builds with its `default = true` artifact. The scaffold
+  pins `[dep.std] ref = "branch/main"`, which is std 1.x and is refused by
+  this compiler at its first `:^` (the item 1 diagnostic, located in
+  `dep/std/src/system/os/secret.mach`); the scratch projects were verified
+  with `dep/std` at `e204cb81f`, and the scaffold pin moves with the std
+  2.0.0 landing.
