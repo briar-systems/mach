@@ -51,6 +51,9 @@ argument forwarding.
 | `info`  | print compiler version, build host, and registered target capabilities |
 | `help`  | print usage; `mach help <command>` for detail |
 
+`mach fmt`, the canonical formatter (#3225), is in a parallel lane and is not
+a command of this binary; it is documented here when it merges.
+
 ## Global flags
 
 Read by `build` and `test`, which share one schema. `check` accepts the
@@ -843,7 +846,7 @@ needs no project (it runs from anywhere, with or without a `mach.toml`). The
 output is line-oriented and stable for scripts:
 
 ```
-mach 4.30.0
+mach 5.0.0
 host: linux/x86_64
 isa: x86_64 aarch64 riscv64 riscv32 spirv
 os: linux darwin windows freestanding
@@ -851,9 +854,9 @@ abi: sysv64 win64 aapcs64 lp64 lp64f lp64d ilp32 ilp32f ilp32d spirv
 object: elf coff macho raw spv
 ```
 
-The version line and `host:` line fold at compile time; the four capability
-lines are read from the binary's target registries, so they report exactly what
-this build can target. `mach info --version` prints the version string alone
+The version line (the compiler's own version string) and `host:` line fold at
+compile time; the four capability lines are read from the binary's target
+registries, so they report exactly what this build can target. `mach info --version` prints the version string alone
 on one line, for tooling.
 
 `mach info targets` prints the **supported target-tuple matrix** — one

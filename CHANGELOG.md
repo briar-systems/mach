@@ -136,6 +136,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scalarized silently. `test/vecrows` probes every declared row on x86_64,
   aarch64 and riscv64 against the external decoder and execution (#3120).
 
+- `doc/migration-v5.md` walks a 4.x project to 5.0: the compiler it needs
+  first, the refused manifest keys and spellings with their diagnostics, the
+  `Result`/`Option`/`Void` to `res`/`opt`/`err` translation and the guard
+  rules that bite, and the std 2.0.0 outcome forms by domain.
+  `test/doc-examples.py` compiles every language-reference example that
+  carries an expectation (`accept`, `reject`, `warn`, `run`, `test`) against
+  the compiler under test, and `test/doc-agreement.py` holds `doc/cli.md`,
+  `doc/manifest.md`, the `mach init` scaffolds and the grammar's keyword
+  list to the generated help, the manifest parser and the token table
+  (#3131).
+
 ### Fixed
 
 - The aarch64 inline-asm grammar read `lsl`, `lsr` and `asr` with a register
@@ -351,6 +362,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- The `try` production the parser still carried from the withdrawn
+  2026-09-08 design. `try` was never a released form; it is an ordinary
+  identifier again, and a program written in the withdrawn shape is a parse
+  error rather than the internal failure it produced before. `doc/language/
+  try.md` and every reference to the withdrawn design (flow-sensitive proofs,
+  compiler-known `res`/`opt`/`err`, function-scope `def`) are gone from the
+  reference (#3131).
 - The `:^` and `:^T` declassification spellings. `:>T` is the one form and
   always names its public result type; writing `x:^` or `x:^u32` is a parse
   error at the operator, `` `:^` and `:^T` were removed in 5.0.0;
