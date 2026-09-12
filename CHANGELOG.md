@@ -320,9 +320,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A bare `use <id>;` of a dependency binds the entry shared by its library
   artifacts marked `default = true`; several defaults may share that entry, a
-  `bin` never publishes one, and full-path imports need no default. The
-  artifact-less `lib.mach` fallback of 4.30 stays until 5.0.0 removes it
-  (#3222).
+  `bin` never publishes one, and full-path imports need no default (#3222).
+- `mach init --lib` marks its one `static` artifact `default = true`, so the
+  scaffolded library has the explicitly defaulted public entry a consumer's
+  bare `use <id>;` binds; nothing else about the scaffold changes (#3226).
 - Vector operations require an explicit target capability row. Each ISA declares
   its supported (operation, lane kind, lane width) rows positively. Missing or
   malformed operation and lane shapes no longer default to packed support (#3120).
@@ -347,6 +348,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before the query work of #3247); the log is `doc/design/build-overhead-3218.md`
   (#2299).
 - Editor analysis returns an owned diagnostic/source snapshot with explicit phase and target selection. Raw products have checked serial-view lifetimes. Closing a buffer retires its overlay, source payload and cached dependents while retaining its FileId. Buffer slots are reused, and checked editor teardown preserves owners on preparation failure (#2999).
+
+### Removed
+
+- The `:^` and `:^T` declassification spellings. `:>T` is the one form and
+  always names its public result type; writing `x:^` or `x:^u32` is a parse
+  error at the operator, `` `:^` and `:^T` were removed in 5.0.0;
+  declassification is `expr:>T` and always names its public result type ``,
+  and the parser consumes a following type so the rest of the expression
+  parses. A strip whose operand is typed by a generic parameter defers the
+  target-type equality from the template to each instance, which is what the
+  untyped form used to allow inside generic bodies (#3226, #3112).
+- `$mach.abi.sysv`. The registry spells the ABI `sysv64` and the alias is
+  refused by name, `` `$mach.abi.sysv` was removed in 5.0.0; the registry
+  spells this ABI `sysv64`: write `$mach.abi.sysv64` ``. Comptime path
+  evaluation no longer carries a diagnostic store, which existed only for that
+  alias's warning (#3226, #3112).
+- The manifest keys `[project] name`, `description` and `mach` and
+  `[profile.*] emit_ir` and `emit_asm`. 4.26.x accepted and never read them and
+  4.30 warned; each is now refused by name in a root and a dependency manifest
+  alike, `mach.toml: [project] key 'name' was removed in 5.0.0; it was accepted
+  and never read: remove the key`, so the refusal is never mistaken for an
+  unknown key. The manifest no longer records deprecated keys and the driver
+  emits no deprecation warnings for them (#3226, #3112).
+- `$project.name` and `$project.description`, which read those manifest keys.
+  Each is refused at its use site by name, `` `$project.name` was removed in
+  5.0.0 with the `[project] name` manifest key; the project is identified by
+  `$project.id` ``, and is not re-sourced from another key. A rooted comptime
+  path that the evaluator rejects now reports the path's own message at the
+  path; it used to fall through to the generic "comptime parameters are
+  referenced without `$`" error on the root identifier (#3226, #3112, #3128).
+- The first-declared target, profile and artifact fallbacks. A manifest that
+  declares several targets none of which matches the host, several profiles,
+  or several artifacts supporting the selected target, and marks none
+  `default = true`, is refused where a command must pick one, with a message
+  naming the axis, the `default = true` key and the selecting flag
+  (`` mach.toml: several profiles are declared and none is marked
+  `default = true`; no profile is selected by table order: mark exactly one
+  [profile.<name>] with `default = true` or select one with --profile ``).
+  Nothing is ever selected by table order, and the build request no longer
+  carries a by-table-order bit (#3226, #3112, #3222).
+- Reading an `#[embed]` whose resolved path escapes the project root. The
+  decorator is refused, `` `embed` path escapes the project root; an embedded
+  file must live inside the project ``, and the driver skips the path when it
+  collects embed inputs, so the file outside the project is never opened. 4.30
+  read it and warned. The containment check compares the project root and the
+  resolved file in one coordinate system: `mach build .` used to hand it a
+  relative root beside a relative source path and report every embed under
+  `src/` as escaping, which was a stray warning in 4.30 and would have been a
+  false refusal here (#3226, #3112).
+- Alias dependency keys, nested realizations and `mach.lock`. A `[dep.<key>]`
+  whose realized project declares a different id is refused by `pull`,
+  `verify` and every build (`[dep.foo] realizes project 'std'; alias keys were
+  removed in 5.0.0: ... rename the table to [dep.std] and the directory to
+  dep/std`), so the manifest key, the directory under `dep/` and the project
+  id are one name everywhere; the build checked none of this in 4.30. A
+  realized `dep/<id>/dep/<x>/mach.toml` is refused naming the directory to
+  delete, while git's empty gitlink directory for a consumed dependency's own
+  dependency still passes. A `mach.lock` in the project root is refused by
+  every command that opens the project (`mach.lock was removed in 5.0.0 and
+  is refused; the committed gitlinks under dep/ are the pins: delete
+  mach.lock`) instead of being noted and ignored. With aliases gone one
+  identity is one directory, so the driver's content-conflict diagnostic for
+  two keys realizing one id is unreachable and is deleted; a selector clash is
+  reported by `mach dep` as before (#3226, #3112).
+- The implicit `lib.mach` entry of an artifact-less dependency. A bare
+  `use <id>;` binds only the entry shared by the dependency's library artifacts
+  marked `default = true`; a dependency that declares no artifact has no public
+  module and the refusal names the removal, `` project 'x' declares no
+  artifact, so it has no public module; the implicit `lib.mach` entry of an
+  artifact-less dependency was removed in 5.0.0: import a full path, or declare
+  a static or shared [artifact.*] table marked default = true in its
+  manifest ``. Full-path imports need no artifact (#3226, #3112).
+- The MOS 6502 target. Its instruction set (`target/isa/mos6502/`), ABI
+  member, registry rows, freestanding OS row, `$mach.arch.mos6502` tag, the
+  `target_unavailable` tuple capability that existed only to hold it, its
+  corpus column (`test/golden/mos6502`, its `engines.conf` row and SKIPS) and
+  its fuzz seed are deleted; the `da65` decoder was never pinned. A
+  `[target.*]` that still names `mos6502` as its `isa` or `abi` is refused by
+  name at target resolution, `target 'mos6502' was withdrawn and removed in
+  5.0.0; no isa or abi implementation is registered for it`. The architecture
+  catalog is at version 2 (its fingerprint tags closed the gap) and `arch` id
+  4 is reserved as `MOS6502_WITHDRAWN`. The width legalization pass the target
+  drove stays as shared infrastructure, exercised by its unit tests and the
+  riscv32 column (#3226, #3112).
 
 ## [4.30.0] - 2026-09-07
 

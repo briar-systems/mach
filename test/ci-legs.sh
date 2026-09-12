@@ -4,9 +4,9 @@
 # usage: ci-legs.sh <pr|main>
 #
 # a CI leg is a RUNNER, not a target row, and the runner column is what assigns rows
-# to it: the five ubuntu-latest rows (x86_64-linux, riscv64-linux, riscv32, spirv,
-# mos6502) are one job that covers all five, and a job per row would build the same
-# artifacts five times over.
+# to it: the four ubuntu-latest rows (x86_64-linux, riscv64-linux, riscv32, spirv)
+# are one job that covers all four, and a job per row would build the same
+# artifacts four times over.
 #
 # the workflow hands each job its runner LABEL and the driver reads this file itself
 # (`run.sh --runner`), so no step names a target list it could get wrong.

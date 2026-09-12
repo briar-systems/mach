@@ -158,9 +158,13 @@ fun publish2(a: ^*u8) *u8 { ret a:>*u8; }
 no operator of its own: a public value coerces up to secret implicitly, and a
 cast to a secret type (`x::^u16`) is an ordinary cast.
 
-The older spellings `:^` (bare, no target) and `:^T` mean the same thing and are
-accepted through 4.30.0. They are rejected in 5.0.0 with a diagnostic naming
-`:>T`, so new code writes `:>T`.
+The 4.30 spellings `:^` (bare, no target) and `:^T` were removed in 5.0.0.
+Writing either is a parse error naming the removal and `:>T`; there is no
+untyped declassification. Inside a generic body the operand may be typed by a
+parameter (`fun show[U](s: U) u32 { ret s:>u32; }`): the template cannot decide
+whether `u32` is `U` stripped, so it checks only that the target is public and
+each instance settles the equality under its concrete arguments, the way every
+other secrecy gate is checked against the instance.
 
 ## Welded-storage pointers
 

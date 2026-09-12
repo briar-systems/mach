@@ -10,7 +10,7 @@ there are two projects, split by whether the target's entry needs a program runt
 the hosted project declares mach-std, because its entry prints the checksum through
 it. the bare project declares no dependency at all, which is the honest shape for a
 target that executes nothing: its entry is the case file itself, and the split is
-what proves a case reaches no runtime on the way to spirv, riscv32 or mos6502.
+what proves a case reaches no runtime on the way to spirv or riscv32.
 """
 
 import os

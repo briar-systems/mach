@@ -57,7 +57,8 @@ token ::= IDENT
 punctuation ::= "(" | ")" | "{" | "}" | "[" | "]"
               | ";" | ":" | "," | "." | "?" | "@" | "$" | "`"
               | "#["    (* attribute-open: "#" immediately followed by "[" *)
-              | "::" | ":~" | ":^" | ":>" | "..."
+              | "::" | ":~" | ":>" | "..."
+              | ":^"    (* lexed only so the parser can refuse it by name, see cast *)
 
 operator ::= "+" | "-" | "*" | "/" | "%"
            | "&" | "|" | "^" | "~"
@@ -557,7 +558,6 @@ member       ::= "." IDENT
 project      ::= "." "[" expr "]"          (* v.[f]: comptime field projection *)
 cast         ::= ( "::" | ":~" ) type
               | ":>" type                  (* secret-qualifier strip cast *)
-              | ":^" [ named-type ]        (* deprecated strip spellings *)
 ```
 
 `::` is a value conversion and `:~` a same-size bit reinterpret; see
@@ -567,10 +567,12 @@ operand's type, producing a new public value (#1643, [secrecy.md](secrecy.md)).
 Its target type is required and names the operand's stripped public type; a bare
 `:>` is a parse error, and `:>` never reinterprets storage.
 
-The deprecated spellings `:^` and `:^Type` produce the same node and are
-accepted through 4.30.0, rejected in 5.0.0. A bare `:^` needs no target, and a
-non-`named-type` lead (`*`, `[`, ...) after `:^` leaves a bare strip so it still
-binds as a multiply/index on the stripped value. All bind as postfix.
+The 4.30 spellings `:^` and `:^Type` were removed in 5.0.0. The lexer still
+produces the `:^` token so the parser can refuse it in place: `` `:^` and `:^T`
+were removed in 5.0.0; declassification is `expr:>T` and always names its
+public result type ``. The parser then consumes a following type, if any, the
+way `:>` would, so the rest of the expression parses without a cascade. All
+casts bind as postfix.
 
 Disambiguating a postfix `[`: the bracket may open a generic argument list
 (`callee[T, U](args)`, or `f[T]` naming an instance as a value) or be an index

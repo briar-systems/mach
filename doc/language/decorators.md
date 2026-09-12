@@ -544,9 +544,11 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
   `symbol` and `section` — the path is taken as written.
 - The path resolves relative to the **declaring source file's** directory. An
   absolute path is taken as written. The resolved file must lie inside the
-  project root: in 4.30.0 an embed that escapes it (`../../outside.txt` from
-  `src/`) is a **warning** naming the path, and 5.0.0 rejects it. Keep assets
-  under the project.
+  project root: an embed that escapes it (`../../outside.txt` from `src/`) is
+  refused at the decorator (`` `embed` path escapes the project root; an
+  embedded file must live inside the project ``) and the file outside is never
+  read. 4.30 read it with a warning; 5.0.0 removed that. Keep assets under the
+  project.
 - A path holding `{artifact.<id>.out}` names the output of an artifact this one
   requires through the manifest's `need`, and resolves against the **project
   root** rather than the declaring file's directory; the required artifact is

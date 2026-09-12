@@ -104,12 +104,13 @@ ref = "branch/main"
 | `src`     | string | Source root, project-root-relative. Module paths resolve under it. |
 | `out`     | string | The output-path template root, referenced as `{project.out}` by artifact `out`, step paths, and `cmd`s. Expanded over `{target.name}`/`{target.isa}`/`{target.os}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). |
 
-`[project]` is exactly these four keys. `name`, `description`, and `mach` are
-deprecated until 5.0.0: 4.26.x accepted them and never read them, so 4.30.0
-accepts them with a warning naming the key, the table, and the 5.0.0 refusal,
-in a root manifest and a dependency's alike; `[profile.<name>]`'s `emit_ir` and
-`emit_asm` are in the same window (emission is `--emit-ir`/`--emit-asm` on the
-command line). Any other key is an unknown-key error in every manifest.
+`[project]` is exactly these four keys. The 4.26.x keys `name`, `description`
+and `mach`, and `[profile.<name>]`'s `emit_ir` and `emit_asm`, were accepted
+and never read and were removed in 5.0.0: each is refused by name, in a root
+manifest and a dependency's alike, with `mach.toml: [project] key 'name' was
+removed in 5.0.0; it was accepted and never read: remove the key` (emission is
+`--emit-ir`/`--emit-asm` on the command line). Any other key is an unknown-key
+error in every manifest.
 
 ## `[target.<name>]`
 
@@ -194,8 +195,10 @@ such an image is refused at link rather than silently dropped.
 | `os`  | `linux`, `windows`, `darwin`, `freestanding` |
 | `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, `ilp32d`, `spirv` |
 
-`mos6502` (an `isa` and an `abi`) is still accepted by 4.30.0 as a withdrawn
-experiment and is removed in 5.0.0; do not declare it.
+The withdrawn MOS 6502 target was deleted in 5.0.0: a `[target.*]` naming
+`mos6502` as its `isa` or `abi` is refused by name (`target 'mos6502' was
+withdrawn and removed in 5.0.0; no isa or abi implementation is registered for
+it: retarget the [target.*] table to a supported tuple`).
 
 `x86_64`/`linux`/`sysv64` is the primary host and target. `aarch64`-linux builds
 and runs natively in CI on every PR; `riscv64`-linux runs under qemu and
@@ -439,12 +442,12 @@ target and an artifact:
 2. otherwise a sole declared profile is chosen;
 3. otherwise the one marked `default = true` is chosen.
 
-Table order carries no meaning. In 4.30.0 a manifest that declares several
-profiles and marks none still builds: the first declared profile is taken with
-a warning that names the fix. 5.0.0 refuses that manifest.
+Table order carries no meaning. A manifest that declares several profiles and
+marks none is refused wherever a command must pick one (the 4.30 first-declared
+fallback was removed in 5.0.0):
 
 ```
-warning: mach.toml: several profiles are declared and none is marked `default = true`; the first declared profile is selected by table order, which 5.0.0 stops doing: mark exactly one [profile.<name>] with `default = true` or select one with --profile
+error: mach.toml: several profiles are declared and none is marked `default = true`; no profile is selected by table order: mark exactly one [profile.<name>] with `default = true` or select one with --profile
 ```
 Emission of the human-readable IR and assembly side-artifacts is **not** a profile
 concern — it is controlled only by the `--emit-ir` / `--emit-asm` CLI flags (see
@@ -922,9 +925,10 @@ registry-style `version =` is reserved and rejected
 
 The record of which commit a dependency is at is the **gitlink** committed in
 the root repository, generated into `.gitmodules` by `mach dep`. Nothing else
-records a pin: there is no `mach.lock`, and a `mach.lock` left over from an
-earlier release is not read. In 4.30.0 it is ignored; 5.0.0 rejects a project
-that carries one, with a diagnostic naming the migration.
+records a pin: there is no `mach.lock`, and a project that still carries one
+is refused by every command that opens it, with a diagnostic naming the
+removal (`mach.lock was removed in 5.0.0 and is refused; the committed
+gitlinks under dep/ are the pins: delete mach.lock`).
 
 A project does not need its own Git repository. In a repository root, Git
 dependencies use the staged gitlinks as their pins. In a filesystem project or a
@@ -1032,20 +1036,23 @@ proposal to select the highest same-major release is not accepted for v5.
 retains explicit selection for v5. Future compatibility-range selection requires
 a separate decision.
 
-### 4.30.0 and 5.0.0
+### Removed forms
 
-4.30.0 accepts two older forms beside the ones above and notes the migration;
-5.0.0 rejects them:
+Three older forms that 4.30.0 accepted with a migration note were removed in
+5.0.0 and are refused by `pull`, `verify` and every build:
 
 - an **alias key**, a `[dep.<key>]` whose realized project declares a
-  different id. 4.30.0 realizes it and prints
-  `note: [dep.foo] realizes project 'std'; rename the table to [dep.std] and
-  the directory to dep/std. alias keys are rejected in 5.0.0`;
-- **nested realization**, a `dep/<id>/dep/` left by an older tool; 4.30.0
-  ignores it;
-- `mach.lock`, ignored in 4.30.0 as above; `pull` prints
-  `note: mach.lock is not read; the committed gitlinks under dep/ are the
-  pins, so delete it. mach.lock is rejected in 5.0.0`.
+  different id:
+  `[dep.foo] realizes project 'std'; alias keys were removed in 5.0.0: the
+  manifest key, the directory under dep/, and the project id are one name, so
+  rename the table to [dep.std] and the directory to dep/std`;
+- a **nested realization**, a `dep/<id>/dep/<x>/mach.toml` left by an older
+  tool: `dependency 'a': dep/a/dep/b is a nested realization; nested
+  realizations were removed in 5.0.0 (the root's dep/ owns the flat closure and
+  a dependency's own dep/ is never realized): delete dep/a/dep`. The empty
+  directory git materializes for a consumed dependency's own gitlink is not a
+  realization and passes;
+- `mach.lock`, refused as above.
 
 Command-line usage (`pull`, `verify`, `add`, `update`, `remove`, `list`) is
 documented in [cli.md](cli.md#mach-dep).
@@ -1169,8 +1176,8 @@ A build cell is one artifact × one target × one profile.
 - `mach test <path>` and `mach doc <path>` need one artifact as their primary
   context and select it by the same rule as everything else: `--bin`/`--lib`
   wins, a sole artifact that declares the resolved target is chosen, several
-  need exactly one `default = true` (4.30.0 falls back to the first declared
-  with a warning; 5.0.0 refuses). `mach test` links the union of all artifacts' referenced entries plus
+  need exactly one `default = true` (several with none marked is refused; the
+  4.30 first-declared fallback was removed in 5.0.0). `mach test` links the union of all artifacts' referenced entries plus
   exported dependency entries, filtered to that target. Foreign-target tests require
   a compatible `--runner`. If two artifacts' objects collide on symbols in that union,
   that is an honest link error — restructure the entries.
@@ -1229,10 +1236,16 @@ never a synthesized tuple. Exactly one host match is chosen; several matching tu
 is an ambiguity error naming the candidates. With no match, a sole declared target
 is chosen with a warning, so a cross-only project still builds on a foreign host;
 several declared targets select the one marked `default = true` (or an explicit
-`--target`). A manifest that declares several and marks none still builds in 4.x:
-the first declared target is taken, with a deprecation warning, and 5.0.0 refuses
-that manifest, since table order carries no meaning. The same window applies to
-`[profile.*]` and to `[artifact.*]` when a command needs one artifact.
+`--target`). A manifest that declares several and marks none is refused, since
+table order carries no meaning (the 4.30 first-declared fallback was removed in
+5.0.0):
+
+```
+error: mach.toml: several targets are declared, none matches the host and none is marked `default = true`; no target is selected by table order: mark exactly one [target.<name>] with `default = true` or select one with --target
+```
+
+The same rule applies to `[profile.*]` and to `[artifact.*]` when a command
+needs one artifact.
 
 ## Worked example: a consumer of C bindings and vendored C
 

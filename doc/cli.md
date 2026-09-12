@@ -603,7 +603,7 @@ transitive closure one level deep; and there is no lock file.
 | Action   | Args | Effect |
 |----------|------|--------|
 | `pull`   | `<path>` | restore existing Git dependencies to their recorded gitlinks and initialize empty gitlink checkouts. Realize missing declared dependencies, cloning Git sources or copying path sources as needed. Retain existing path copies. Use `update` to refresh them from their sources. |
-| `verify` | `<path>` | run the build's dependency checks as a command, closure and selectors included, and print `ok`, or the first failure. A stale `mach.lock` in the root is noted here as on `pull`, since this is where a user looks when something is wrong. |
+| `verify` | `<path>` | run the build's dependency checks as a command, closure and selectors included, and print `ok`, or the first failure. A `mach.lock` in the root is refused here as everywhere else. |
 | `add`    | `<path> <name> (--git <url> [--ref <ref>] \| --path <dir>)` | validate the candidate declaration, realize its dependency closure, then publish `[dep.<name>]` in `mach.toml`. Git stages `.gitmodules` and gitlinks. Nothing is committed. |
 | `update` | `<path> (<name> \| --all)` | advance `branch/` selectors to their current remote tips and re-stage the gitlinks; move an identity to the exact selector the root declares for it (`b: <old> -> <new> (pinned to the exact selector)`, or `(exact selector, already pinned)` when nothing moves). |
 | `remove` | `<path> <name> [--purge]` | remove a Git dependency’s registration from the index and `.gitmodules` when no longer required, then publish the manifest without its declaration. The checkout is retained unless `--purge` is given. |
@@ -711,15 +711,20 @@ the identity at the root to override`), except for an identity the root
 declares with a `tag/`, whose gitlink is the pin; the rules are in
 [manifest.md](manifest.md#what-a-build-verifies).
 
-### 4.30.0 and 5.0.0
+### Removed forms
 
 A `[dep.<key>]` whose realized project declares a different id is an **alias
-key**. 4.30.0 realizes it and prints a migration note
-(`note: [dep.foo] realizes project 'std'; rename the table to [dep.std] and the
-directory to dep/std. alias keys are rejected in 5.0.0`). A `mach.lock` from
-an earlier release is not read; `pull` prints `note: mach.lock is not read;
-the committed gitlinks under dep/ are the pins, so delete it. mach.lock is
-rejected in 5.0.0`.
+key**, removed in 5.0.0: `pull`, `verify` and every build refuse it
+(`[dep.foo] realizes project 'std'; alias keys were removed in 5.0.0: the
+manifest key, the directory under dep/, and the project id are one name, so
+rename the table to [dep.std] and the directory to dep/std`); `pull` rolls the
+refused realization back. A realized `dep/<id>/dep/<x>/mach.toml` (a **nested
+realization** left by an older tool) is refused the same way, naming the
+directory to delete; the empty directory git materializes for a consumed
+dependency's own gitlink is not a realization and passes. A `mach.lock` in the
+project root is refused by every command that opens the project
+(`mach.lock was removed in 5.0.0 and is refused; the committed gitlinks under
+dep/ are the pins: delete mach.lock`).
 
 Exit codes: `0` ok, `1` user error, `2` internal error, `3` environmental
 error (git missing or a git operation that failed).
@@ -734,8 +739,10 @@ Scaffolds a new project in `[dir]` (default: the current directory). It
 writes a complete `mach.toml` with a `[project]` block, `[target.*]` platforms
 for `linux`/`windows`/`darwin` on the host ISA, one binary artifact whose
 `out = "bin/<id>{artifact.suffix}"` names `<id>.exe` on Windows and `<id>`
-elsewhere (or one `static` library artifact, `lib/lib<id>{artifact.suffix}`,
-under `--lib`), a `[link.kernel32]` entry the binary links on Windows,
+elsewhere (or, under `--lib`, one `static` library artifact,
+`lib/lib<id>{artifact.suffix}`, marked `default = true` so a bare
+`use <id>;` in a consumer binds its entry), a `[link.kernel32]` entry the
+binary links on Windows,
 `[profile.debug]` (`default = true`) and `[profile.release]` with all five
 policy keys spelled out, and a `[dep.std]` dependency on `mach-std` at
 `branch/main`; then a starter source file, `src/root.mach` for a
@@ -759,7 +766,7 @@ exports the `main` symbol.
 |----------------|-------|--------|
 | `--name <id>`  | id    | project id (default: the last path component of `[dir]`, so `mach init /work/ia`, `mach init ib/`, and `mach init .` name the project `ia`, `ib`, and the current directory's name) |
 | `--force`      | —     | scaffold even when `mach.toml` or `src` already exists |
-| `--lib`        | —     | library layout: `src/lib.mach` and one `static` `[artifact.<id>]` |
+| `--lib`        | —     | library layout: `src/lib.mach` and one `static` `[artifact.<id>]` marked `default = true` |
 | `--no-deps`    | —     | publish the scaffold and declare its dependencies without realizing them; a later `mach dep pull` realizes them (`dependencies declared but not realized; run `mach dep pull <path>` to realize them`) |
 | `--no-git`     | —     | skip repository initialization and submodule registration, using plain dependency checkouts instead |
 | `--quiet`, `-q`| —     | suppress non-error output |
@@ -815,10 +822,11 @@ documented 613 public entities across 36 modules -> /home/me/p1/doc/api
 The artifact is selected the way `mach build` selects it: an explicit
 `--bin`/`--lib` wins, otherwise the sole artifact that supports the target,
 otherwise the one marked `default = true`. When several support the target
-and none is marked, 4.30.0 takes the first declared and warns; 5.0.0 refuses:
+and none is marked, the command refuses (the 4.30 first-declared fallback was
+removed in 5.0.0; table order carries no meaning):
 
 ```
-warning: mach.toml: several artifacts are declared and none is marked `default = true`; the first declared artifact is selected by table order, which 5.0.0 stops doing: mark exactly one [artifact.<name>] with `default = true` or select one with --bin/--lib
+error: mach.toml: several artifacts support the selected target and none is marked `default = true`; no artifact is selected by table order: mark exactly one [artifact.<name>] with `default = true` or select one with --bin/--lib (first, second)
 ```
 
 Exit codes: `0` ok, `1` user error, `2` internal error.
@@ -838,17 +846,16 @@ output is line-oriented and stable for scripts:
 ```
 mach 4.30.0
 host: linux/x86_64
-isa: x86_64 aarch64 riscv64 riscv32 spirv mos6502
+isa: x86_64 aarch64 riscv64 riscv32 spirv
 os: linux darwin windows freestanding
-abi: sysv64 win64 aapcs64 lp64 lp64f lp64d ilp32 ilp32f ilp32d spirv mos6502
+abi: sysv64 win64 aapcs64 lp64 lp64f lp64d ilp32 ilp32f ilp32d spirv
 object: elf coff macho raw spv
 ```
 
 The version line and `host:` line fold at compile time; the four capability
 lines are read from the binary's target registries, so they report exactly what
-this build can target (`mos6502` is the withdrawn experiment still registered
-in 4.30.0 and removed in 5.0.0). `mach info --version` prints the version
-string alone on one line, for tooling.
+this build can target. `mach info --version` prints the version string alone
+on one line, for tooling.
 
 `mach info targets` prints the **supported target-tuple matrix** — one
 `<os>-<isa>` per line — for exactly the tuples this binary can compose and emit
