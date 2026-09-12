@@ -52,9 +52,6 @@ argument forwarding.
 | `info`  | print compiler version, build host, and registered target capabilities |
 | `help`  | print usage; `mach help <command>` for detail |
 
-`mach fmt`, the canonical formatter (#3225), is in a parallel lane and is not
-a command of this binary; it is documented here when it merges.
-
 ## Global flags
 
 Read by `build` and `test`, which share one schema. `check` accepts the
@@ -634,8 +631,8 @@ under `mach.lang.publication`): the canonical text is staged beside the file
 and renamed over it in one step, the rename is refused when the file is no
 longer the object that was read, and the file's permission bits are kept.
 Before any rewrite the canonical text is parsed again and compared with the
-original structurally, so the formatter never writes a file whose tree
-differs from the source's.
+original for meaning (the check is described under the layout below), so the
+formatter never writes a file that means something other than its source.
 
 Exit codes: `0` when every file is canonical or was made so, `1` when a file
 differs under `--check`, a file is malformed, or the invocation is a user
@@ -645,10 +642,11 @@ error, `2` on an internal failure, `3` on a filesystem failure.
 
 There is exactly one layout and no configuration: no option, no file, no
 comment directive selects another. The formatter re-emits the file's tokens
-from the parse; it never adds, removes or reorders a token, so the formatted
-file has the same token sequence, the same tree, the same comments and the
-same inline assembly as the original, and formatting is a fixed point
-(formatting a formatted file changes nothing).
+from the parse. It never changes a token, and it reorders and removes tokens
+in exactly two places, both without changing meaning: a `use` block is
+sorted, and a `use` alias that repeats the last segment of its path is
+dropped. Comments and inline assembly are carried verbatim, and formatting is
+a fixed point (formatting a formatted file changes nothing).
 
 Line structure:
 
@@ -656,19 +654,32 @@ Line structure:
   Output lines are terminated by `\n` alone, carry no trailing whitespace,
   and the file ends with exactly one newline. A file with no tokens and no
   comments is empty.
-- Every `{` that opens a body (a function, `rec`, `uni`, `tag` or `test` body,
-  an `if`/`or`/`for`/`fin` block, a comptime branch, an inline `rec`/`uni`
-  type) ends its line; its `}` starts a line at the enclosing indentation. An
-  empty body is `{}` on one line. `or` after a `}` stays on that line
-  (`} or {`), as do a `;`, `)`, `]`, `,`, `.` and an infix operator.
+- A function or `test` body always expands: its `{` ends its line, its
+  contents are indented one level, and its `}` starts a line at the enclosing
+  indentation. An empty body is `{}` on one line.
+- A statement body (an `if`, `or`, `for` or `fin` block, a comptime branch,
+  a `$each` body) that holds exactly one statement and that the author wrote
+  on one line stays on one line: `if (neg) { ret false; }`. A body with two
+  or more statements, a nested block, a comment, a decorator or an assembly
+  body always expands, even when the author wrote it on one line. A
+  single-statement body the author broke across lines stays expanded: the
+  author's break is kept.
+- A `rec`, `uni` or `tag` body, declared or inline in a type, stays on one
+  line when the author wrote it on one line and expands otherwise.
+- `or` always starts its own line, at the indentation of its `if`; `} or {`
+  is never emitted. An expanded chain is `}` on one line and `or (...) {` on
+  the next; an inline chain puts each arm on its own line.
+- Every `}` that closes a body ends its line. A `;`, `)`, `]`, `,`, `.` or an
+  infix operator after a `}` stays on its line.
 - Every `;` ends its line, as does a decorator (`#[...]`), a comment and an
   inline assembly body.
-- A top-level declaration with a body (`fun`, `rec`, `uni`, `tag`, `test`, a
-  top-level `$if`) is separated from its neighbours by one blank line. Between
-  single-line declarations (`use`, `fwd`, `val`, `var`, `def`, `ext fun`) the
-  author's grouping is kept: at most one blank line where the source had one.
-  Between statements, and between the elements of a literal, one blank line
-  is likewise kept where the source had one; runs of blank lines collapse to
+- A top-level declaration whose body expands (`fun`, `test`, a multi-line
+  `rec`, `uni`, `tag` or top-level `$if`) is separated from its neighbours by
+  one blank line. Between single-line declarations (`use`, `fwd`, `val`,
+  `var`, `def`, `ext fun`, a one-line type declaration or `$if`) the author's
+  grouping is kept: at most one blank line where the source had one. Between
+  statements, and between the elements of a literal, one blank line is
+  likewise kept where the source had one; runs of blank lines collapse to
   one, and a blank line directly after a `{` or before a `}` is dropped.
 - A struct, array or vector literal stays on one line unless the author broke
   the line after its `{`; then its `{` ends the line, its elements are
@@ -684,12 +695,12 @@ Line structure:
 Spacing:
 
 - One space around binary operators and `=`, after `,`, `:`, `;` and a
-  keyword, before a body's `{`, and between a type and the name it follows.
-  Column alignment is never produced: `x:    i32` becomes `x: i32`.
+  keyword, before a body's `{`, and between a type and the name it follows;
+  more where column alignment (below) pads a line.
 - No space inside `(`, `[`, `#[` or a literal's `{}`, before `,`, `;`, `:`,
   `.`, `)`, `]`, or after a prefix operator (`-x`, `!b`, `~m`, `?p`, `@p`),
   a pointer or secret type marker (`*T`, `^T`, `*^T`), or `$` (`$if`,
-  `$cases(T)`).
+  `$cases(T)`). An inline body is spaced inside its braces: `{ ret; }`.
 - Casts and declassification are tight: `x::u8`, `x:~T`, `x:>u32`. A `^` after
   `:` keeps its space (`x: ^u32`), since `:^` is a token of its own.
 - A call, index or generic argument list is tight to what it applies to:
@@ -700,10 +711,101 @@ Spacing:
 - Tag construction, case tests and projections are tight: `Fail.user{m}`,
   `sel f.user`, `sel f.[c]`, `v.[f]`.
 
+Column alignment:
+
+Mach's one-line declarations and statements share one skeleton,
+`[keywords] name[: type] [= value]`, and the formatter aligns the columns of
+that skeleton across a run. A run is a sequence of consecutive lines of one
+shape at one indentation; a blank line, a comment line, a line of another
+shape, a continuation line or a line at another indentation ends it. Within
+a run each column is padded with spaces to the longest key before it in the
+run plus one space. A run of one line takes single spaces. Padding is spaces
+only, counted in characters, and only ever widens a line: nothing else about
+the line changes. The shapes and their columns:
+
+| Shape | Columns |
+|-------|---------|
+| `[pub] val\|var NAME: Type [= init];` | the name (after the keywords), the type, the `=` |
+| `[pub] def NAME: Type;` | the name, the type |
+| `use alias: path;`, `fwd alias: path;` | the alias, the path |
+| a `rec`/`uni` field or a `tag` case with a payload, `name: Type;` | the type |
+| an assignment statement `place = value;` | the `=` |
+| a named entry of an expanded literal, `name: value,` | the value |
+| an inline `if`/`or`/`$if`/`$or` arm | the body `{` |
+| a one-line `rec`/`uni`/`tag` declaration | the name, a tag's discriminator type, the body `{` |
+| a doc comment `# name: description` | the description |
+
+A `use` or `fwd` without an alias, a bare tag case and a positional literal
+element have no column and end a run. `val` and `var`, and `pub` and
+unqualified, are one shape: the keywords differ in length and the name column
+absorbs the difference. Only whole lines are aligned: the assignment inside
+`if (x) { a = 1; }` is spaced, not padded. A doc comment is a comment of the
+form `# name: description` on its own line; a run of them aligns the
+descriptions, and a comment of `#` followed by two or more spaces directly
+under one is a continuation of its description and is re-padded to the
+description column. Every other comment is verbatim.
+
+`use` blocks:
+
+- A `use` alias that repeats the last segment of its path is dropped:
+  `use str: std.types.string.str;` becomes `use std.types.string.str;`. The
+  binding is the same name either way. An alias that differs from the last
+  segment is kept.
+- A block is a run of `use` lines with nothing between them: no blank line
+  and no comment line. Within a block the lines are sorted by the path text
+  in byte order, after alias dropping; lines with equal paths keep their
+  order. Blank lines between blocks are kept and blocks are sorted
+  independently. A `use` under a doc comment is pinned where it is, so the
+  comment never moves: it ends the block above it, and the lines under it
+  form a new block.
+
+A worked example, excerpts of `src/lang/fe/sema/guard.mach`,
+`src/lang/target/abi/sysv.mach` and std's `collections/vector.mach` as the
+formatter leaves them:
+
+```
+use mach.lang.alloc;
+use A: std.allocator;
+use std.format;
+use std.text.string.str_free;
+
+pub rec Vector[T] {
+    a:    *A.Allocator;
+    data: *T;
+    len:  usize;
+    cap:  usize;
+}
+
+        var neg:       bool         = false;
+        var arm_place: id.ExprId    = id.EXPR_NIL;
+        var arm_case:  intern.StrId = intern.STR_NIL;
+        if (!sel_test(sc, s.data.if_.cond, ?neg, ?arm_place, ?arm_case)) { ret false; }
+        if (place == id.EXPR_NIL)                                        { place = arm_place; }
+        or (!place_equal(sc, place, arm_place))                          { ret false; }
+
+        if (eb0_used) {
+            if (eb0_sse) { fp_need = fp_need + 1; }
+            or           { gp_need = gp_need + 1; }
+        }
+        if (sel e_opt.err) {
+            context.report(sc, span, fallback);
+            ret false;
+        }
+```
+
+The `use` block is sorted by path (`mach.lang.alloc` before `std.format`)
+with `format: std.format` de-aliased; the record's fields align on the type
+column; the three `var` lines align on their type and `=` columns and the
+`if` that follows, a different shape, starts a new run with the two arms
+under it; the inner `if`/`or` chain aligns its braces with `or` on its own
+line; and the last body, which held two statements on one line in the
+source, expands.
+
 Comments and inline assembly:
 
 - A comment is carried verbatim from its `#` to the end of its text, with
-  trailing whitespace dropped. A comment that shares a line with code stays
+  trailing whitespace dropped, except that a doc comment's description is
+  re-padded as described above. A comment that shares a line with code stays
   on that line after one space; a comment on its own line stays on its own
   line at the current indentation. A doc run (own-line comments directly
   above a declaration, with no blank line between) stays attached to that
@@ -712,6 +814,13 @@ Comments and inline assembly:
 - An inline assembly body is carried verbatim from its `{` to its `}`,
   including its line breaks and indentation. Its language has no formatting
   contract of its own, so it is never reflowed.
+
+The meaning check before a write compares the two texts as token sequences
+with the same comments, the same tree shape and the same doc runs, where a
+`use` block compares as the set of its lines, a dropped alias as no alias,
+and a doc comment by its key and description; so the two places the
+formatter moves or drops a token are exactly the two places the check
+allows a difference.
 
 ## `mach dep`
 
