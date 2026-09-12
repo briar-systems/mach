@@ -67,13 +67,16 @@ declaration whether or not it is documented.
 
 ## Placement
 
-The lexer folds line-adjacent `#` lines into one run, and a run becomes a
-declaration's docstring when it ends on the line directly above the
-declaration or directly above the declaration's `#[...]` decorators. A blank
-line between the run and the declaration breaks the attachment, and a
-decorator line is not a comment, so it never joins a run. The docstring is
-therefore the first thing above the declaration, with decorators between it
-and the declaration:
+The lexer folds line-adjacent `#` lines that each start their own line into
+one run, and a run becomes a declaration's docstring when it ends on the line
+directly above the declaration or directly above the declaration's `#[...]`
+decorators. A blank line between the run and the declaration breaks the
+attachment, and a decorator line is not a comment, so it never joins a run. A
+comment that shares its line with code (`val x: i32 = 1; # note`) is not
+documentation: it neither starts a run, nor joins the comment on the next
+line, nor attaches to the declaration below it. The docstring is therefore
+the first thing above the declaration, with decorators between it and the
+declaration:
 
 ```mach
 # terminate the program with a message

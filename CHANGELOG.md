@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `mach fmt <path> [--check]` rewrites the project's own source in one
+  canonical layout, or with `--check` reports the files that differ and writes
+  nothing. The formatter re-emits the parsed token stream, so a formatted file
+  keeps its tokens, tree, comments, doc runs and inline assembly, and is a
+  fixed point; the layout is documented in `doc/cli.md` and has no
+  configuration. Only the manifest's `project.src` is visited, through held
+  directory capabilities that refuse symlinks and the dependency tree, and a
+  rewrite goes through the publication boundary on the object that was read,
+  keeping its permission bits. A malformed file is reported with located
+  diagnostics and left unchanged. (#3225)
+
 - Every `#[oblivious]` function is validated a second time on its final
   instruction stream, after register allocation, frame insertion, encoding
   expansion and riscv64 branch relaxation, on x86_64, aarch64 and riscv64.
@@ -149,6 +160,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A comment that shares its line with code is no longer taken as the doc run
+  of the declaration on the next line, and never joins the comment on the
+  following line into one run. (#3225)
 - A `#[deprecated]` warning on a dotted type path whose segments were split
   by a line comment containing a dot was placed inside the comment, with a
   span running onto the next line; the leaf is now read through the path
