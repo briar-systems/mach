@@ -461,7 +461,9 @@ the file by the rule stated above and agreed.
 2925 passed, 0 failed, against the dev baseline of 2918 at `8464568d0`; the
 delta is the seven new tests (`buildid` three, `elf.emit_exec` one,
 `coff.coff_emit_exec` one, `cache.compiler` two) and one renamed
-(`second_digest_…` to `second_identity_…`). `sh test/census.sh` 9 of 9 ok.
+(`second_digest_…` to `second_identity_…`). After merging dev at `a151921cd`
+(which added eleven tests of its own): 2936 passed, 0 failed, the same seven.
+`sh test/census.sh` 9 of 9 ok (10 of 10 after the merge).
 Link leg x86_64-linux 140 pass, 0 fail, 0 skip, including `debuginfo`
 (`g_additive=yes`) and the six `readobj` cases, whose goldens now record
 `build-id len=<n> content-derived=yes` from an independent recomputation.
