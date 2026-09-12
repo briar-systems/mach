@@ -320,9 +320,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A bare `use <id>;` of a dependency binds the entry shared by its library
   artifacts marked `default = true`; several defaults may share that entry, a
-  `bin` never publishes one, and full-path imports need no default. The
-  artifact-less `lib.mach` fallback of 4.30 stays until 5.0.0 removes it
-  (#3222).
+  `bin` never publishes one, and full-path imports need no default (#3222).
 - Vector operations require an explicit target capability row. Each ISA declares
   its supported (operation, lane kind, lane width) rows positively. Missing or
   malformed operation and lane shapes no longer default to packed support (#3120).
@@ -407,6 +405,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity is one directory, so the driver's content-conflict diagnostic for
   two keys realizing one id is unreachable and is deleted; a selector clash is
   reported by `mach dep` as before (#3226, #3112).
+- The implicit `lib.mach` entry of an artifact-less dependency. A bare
+  `use <id>;` binds only the entry shared by the dependency's library artifacts
+  marked `default = true`; a dependency that declares no artifact has no public
+  module and the refusal names the removal, `` project 'x' declares no
+  artifact, so it has no public module; the implicit `lib.mach` entry of an
+  artifact-less dependency was removed in 5.0.0: import a full path, or declare
+  a static or shared [artifact.*] table marked default = true in its
+  manifest ``. Full-path imports need no artifact (#3226, #3112).
 
 ## [4.30.0] - 2026-09-07
 
