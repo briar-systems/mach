@@ -102,12 +102,14 @@ ident-char  ::= ident-start | '0'..'9'
 The reserved keywords (matched as `IDENT` text by the parser) are:
 
 ```
-asm  brk  cnt  def  ext  fin  for  fun  fwd  if
-nil  or   pub  rec  ret  sel  tag  test uni  use
-val  var
+asm  brk  cnt  def  each error ext  fin  for  fun
+fwd  if   in   nil  or   pub  rec  ret  sel  tag
+test uni  use  val  var
 ```
 
-`nil` is an expression literal and `sel` is a prefix expression operator. The
+`nil` is an expression literal and `sel` is a prefix expression operator.
+`each`, `error` and `in` are recognized only in the comptime forms that spell
+them (`$each x in ...`, `$error(...)`; see [Statements](#statements)). The
 rest are statement, declaration, or type introducers. Note these are *contextual*: nothing in the lexer prevents a
 binding or field from being named after one, but the parser will treat the
 keyword in its keyword position. The operand-less statement keywords `brk`

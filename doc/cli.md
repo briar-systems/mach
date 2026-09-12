@@ -608,6 +608,7 @@ transitive closure one level deep; and there is no lock file.
 | `update` | `<path> (<name> \| --all)` | advance `branch/` selectors to their current remote tips and re-stage the gitlinks; move an identity to the exact selector the root declares for it (`b: <old> -> <new> (pinned to the exact selector)`, or `(exact selector, already pinned)` when nothing moves). |
 | `remove` | `<path> <name> [--purge]` | remove a Git dependency’s registration from the index and `.gitmodules` when no longer required, then publish the manifest without its declaration. The checkout is retained unless `--purge` is given. |
 | `list`   | `<path>` | print each realized dependency with its source, selector, pinned commit, and state (`realized`/`missing`). |
+| `sync`   | `<path>` | the pre-`pull` name, kept as a deprecated alias of `pull`; it runs `pull` exactly. |
 
 Dependency changes use Git's normal submodule and index operations. Validation
 rejects conflicts that can be determined before those operations begin. A remote
@@ -624,8 +625,6 @@ error. Completed Git operations remain. Concurrent Mach manifest
 edits are serialized. Git provides its own locking for each Git operation.
 Directories outside the resulting closure are reported and retained for explicit
 removal.
-
-`sync` is the pre-`pull` name, kept as a deprecated alias of `pull`.
 
 Every action requires its project directory or manifest path as the first
 positional operand, resolved by the same rules as `mach build <path>`. Write `.`
