@@ -63,26 +63,37 @@ point so the runner can iterate it. The label is interned and becomes the lowere
 function's name. Ordinary builds omit test bodies from IR and object files.
 
 The body is checked against an `i32` return type. A test reports its result
-through that return value, treated as a process-style status:
+through that return value, treated as a process-style status in the range
+`0..255`:
 
 - `ret 0` — pass.
-- any non-zero `ret N` — fail.
+- any `ret N` with `N` in `1..255` — fail, reported as `(exit N)`.
 - falling off the end of the body returns `0` (the default terminator for
   a non-void function is a zero return), so a body that never returns
   explicitly is treated as a pass.
 
-The return value is an ordinary integer status; the compiler does not
-attach any special pass/fail meaning to particular non-zero codes, nor does
-it provide built-in assertion intrinsics. A test signals failure by
-returning non-zero — typically by returning early from a failed check, as
-in the example above.
+The result is the test process's exit status, and a process exit status is
+eight bits wide on every host (`mach test` reads the same eight bits on
+windows). The range is therefore part of the protocol, enforced at both
+ends:
 
-> **Note.** The convention above (`0` = pass, non-zero = fail) is the
-> interpretation the test runner applies to each test's exit status; it is
-> not enforced by the type system. Existing standard-library tests are not
-> all consistent about which non-zero codes they use, and some return `1`
-> on the success path. When writing new tests, prefer `ret 0` for pass and
-> a non-zero `ret` for failure.
+- A `ret` in a test body whose value is a literal (or a literal-shaped
+  expression: a negated literal, or an arithmetic expression over literals)
+  outside `0..255` is a compile error located at the `ret`, naming the value:
+  `test result 256 is outside the status range 0..255`. An ordinary function
+  returning the same value is unaffected; only test bodies carry the range.
+- A result computed at run time that lands outside `0..255` — a bit mask that
+  has grown past eight bits, a negative code — is folded by the dispatcher to
+  `255` before the process exits. It is reported as `(exit 255)` and is
+  always a failure. The low eight bits are never used on their own, so a
+  result of `256` cannot read as a pass.
+
+Within the range the compiler attaches no special pass/fail meaning to
+particular non-zero codes, nor does it provide built-in assertion
+intrinsics. A test signals failure by returning non-zero — typically by
+returning early from a failed check, as in the example above. A test that
+accumulates a bit mask must keep it within eight bits; past that, return
+the ordinal of the first failing check instead.
 
 ### Collection across modules
 
@@ -179,6 +190,11 @@ one dispatcher object whose entry selects a test by its index argument. That
 object links with the project's objects into a single executable, even for a
 library artifact; in a test build the project's own entry is neutralised so
 the dispatcher is the sole program entry.
+
+The dispatcher's entry calls the selected test and exits with its result:
+as is when the result is in `0..255`, and `255` otherwise (see
+[Semantics](#semantics)). A missing, malformed, or out-of-range index exits
+`2`.
 
 `mach test` then keeps up to `--jobs` children in flight, each spawned as
 `<exe> <index>`, captures each child's stdout and stderr to a per-test file

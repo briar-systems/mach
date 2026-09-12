@@ -6,7 +6,7 @@ constants. The tags `$mach.{os,arch,abi,mode}.*` exist for path-value
 comparison against the resolved-build facts.
 
 > **Live and reserved paths.** The resolved-build facts (`$mach.build.{os,arch,
-> abi,pointer_width,mode,pie}`), the tag tables (`$mach.{os,arch,abi,mode}.*`),
+> abi,pointer_width,mode,pie,platform}`), the tag tables (`$mach.{os,arch,abi,mode}.*`),
 > the compiler version (`$mach.version` and `$mach.version.{major,minor,patch}`),
 > and `$mach.compiler.{name,version}` are live. The `$mach.build.{timestamp,
 > host}`, `$mach.build.git.*`, `$mach.project.*`, and `$mach.source.*` paths are
@@ -29,19 +29,19 @@ $mach.build.abi                 # live; compared against $mach.abi.* tags
 $mach.build.pointer_width       # live; integer count of bytes
 $mach.build.mode                # live; compared against $mach.mode.* tags
 $mach.build.pie                 # live; 1 when building position-independent, else 0
+$mach.build.platform            # live; the target's open platform tag as a string, "" when unset
 $mach.build.timestamp           # stub — not yet available
 $mach.build.host                # stub — not yet available
 $mach.build.git.commit          # stub — not yet available
 $mach.build.git.dirty           # stub — not yet available
 ```
 
-A bare `$mach.build.<name>` that names none of the facts above is a compile
-error (`` no manifest define named in `$mach.build.<name>` ``). The manifest
-schema has no key that declares such a define, so today every other name is
-refused; a project's own configuration constants are ordinary `val`s selected
-with `$if` over the facts above.
+The members above are the whole subtree, and no manifest key adds one. A
+`$mach.build.<name>` that names none of them is a compile error at the use site
+(`` unknown `$mach.*` path ``). A project's own configuration constants are
+ordinary `val`s selected with `$if` over the facts above.
 
-```mach reject "no manifest define named"
+```mach reject "unknown `$mach.*` path"
 val TRACING: u64 = $mach.build.TRACING;
 ```
 
