@@ -124,34 +124,16 @@ pub fun replace_uses(fn: *ir.Function, old_id: id.InstructionId, replacement: va
 # every allocation the erasure needs happens in the salvage phase, before a
 # list is compacted: a refusal leaves the function with its dead instructions
 # still listed and some `dbg_value`s already rebased onto their salvage
-# expression, which is a valid function, never a list mid-compaction
-pub fun erase_marked[T](m: *ir.Module, fn: *ir.Function, ctx: *T,
+# expression, which is a valid function, never a list mid-compaction. `alloc`
+# holds the salvage's own scratch (the set of listed, erased instructions)
+pub fun erase_marked[T](m: *ir.Module, fn: *ir.Function, alloc: *A.Allocator, ctx: *T,
                         test: fun(*T, id.InstructionId) bool) res[bool, fail.Fail] {
     if (ctx == nil || test == nil) {
         ret res[bool, fail.Fail].err{fail.message("instruction erasure predicate is incomplete")};
     }
     if (has_dbg_values(fn)) {
-        var b: u32 = 0;
-        for (b < fn.block_count) {
-            val blk: *ir.Block = ?fn.blocks[b];
-            var r: u32 = 0;
-            for (r < blk.phi_count) {
-                if (test(ctx, blk.phis[r])) {
-                    val res_: err[fail.Fail] = salvage_dbg_values[T](m, fn, ctx, test, blk.phis[r]);
-                    if (sel res_.err) { ret res[bool, fail.Fail].err{res_.err}; }
-                }
-                r = r + 1;
-            }
-            r = 0;
-            for (r < blk.instr_count) {
-                if (test(ctx, blk.instructions[r])) {
-                    val res_: err[fail.Fail] = salvage_dbg_values[T](m, fn, ctx, test, blk.instructions[r]);
-                    if (sel res_.err) { ret res[bool, fail.Fail].err{res_.err}; }
-                }
-                r = r + 1;
-            }
-            b = b + 1;
-        }
+        val salvaged: err[fail.Fail] = salvage_dbg_values[T](m, fn, alloc, ctx, test);
+        if (sel salvaged.err) { ret res[bool, fail.Fail].err{salvaged.err}; }
     }
 
     var changed: bool = false;
@@ -198,32 +180,59 @@ fun has_dbg_values(fn: *ir.Function) bool {
     ret false;
 }
 
-fun salvage_dbg_values[T](m: *ir.Module, fn: *ir.Function, ctx: *T,
-                          test: fun(*T, id.InstructionId) bool,
-                          dropped: id.InstructionId) err[fail.Fail] {
-    var base:        value.Value;
-    var op:          ir.DbgOp;
-    var recoverable: bool = false;
-    salvage_decode(fn, dropped, ?base, ?op, ?recoverable);
-
-    var base_live: bool = false;
-    if (recoverable) {
-        if (base.kind != value.VAL_INSTR) { base_live = true; }
-        or { base_live = test(ctx, base.data.instr) == false; }
+# one pass over the `dbg_value`s: each whose operand is a listed, erased
+# instruction is rebased onto that instruction's live base through a salvage
+# expression when it has one, and nulled otherwise
+fun salvage_dbg_values[T](m: *ir.Module, fn: *ir.Function, alloc: *A.Allocator, ctx: *T,
+                          test: fun(*T, id.InstructionId) bool) err[fail.Fail] {
+    if (fn.instr_len == 0) { ret err[fail.Fail].ok{}; }
+    val res_listed: res[*bool, A.Error] = A.allocate[bool](alloc, fn.instr_len::usize);
+    if (sel res_listed.err) { ret err[fail.Fail].err{fail.refused(res_listed.err)}; }
+    val listed: *bool = res_listed.ok;
+    fin { A.deallocate[bool](alloc, listed, fn.instr_len::usize); }
+    var z: u32 = 0;
+    for (z < fn.instr_len) { listed[z] = false; z = z + 1; }
+    var b: u32 = 0;
+    for (b < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[b];
+        var r: u32 = 0;
+        for (r < blk.phi_count) {
+            val iid: id.InstructionId = blk.phis[r];
+            if (iid::u32 < fn.instr_len && test(ctx, iid)) { listed[iid::u32] = true; }
+            r = r + 1;
+        }
+        r = 0;
+        for (r < blk.instr_count) {
+            val iid: id.InstructionId = blk.instructions[r];
+            if (iid::u32 < fn.instr_len && test(ctx, iid)) { listed[iid::u32] = true; }
+            r = r + 1;
+        }
+        b = b + 1;
     }
 
     var i: u32 = 0;
     for (i < fn.instr_len) {
         val d: *instruction.Instruction = ?fn.instrs[i];
-        if (d.kind == instruction.OP_DBG_VALUE && d.operand_count == 1
-            && d.operands[0].kind == value.VAL_INSTR && d.operands[0].data.instr == dropped) {
-            if (recoverable && base_live) {
-                val res_: err[fail.Fail] = salvage_rebase(m, fn, i::id.InstructionId, d, base, op);
-                if (sel res_.err) { ret res_; }
-            }
-            or {
-                d.operands[0] = value.const_null(d.operands[0].ty);
-            }
+        if (d.kind != instruction.OP_DBG_VALUE || d.operand_count != 1
+            || d.operands[0].kind != value.VAL_INSTR) { i = i + 1; cnt; }
+        val dropped: id.InstructionId = d.operands[0].data.instr;
+        if (dropped::u32 >= fn.instr_len || !listed[dropped::u32]) { i = i + 1; cnt; }
+
+        var base:        value.Value;
+        var op:          ir.DbgOp;
+        var recoverable: bool = false;
+        salvage_decode(fn, dropped, ?base, ?op, ?recoverable);
+        var base_live: bool = false;
+        if (recoverable) {
+            if (base.kind != value.VAL_INSTR) { base_live = true; }
+            or { base_live = test(ctx, base.data.instr) == false; }
+        }
+        if (recoverable && base_live) {
+            val res_: err[fail.Fail] = salvage_rebase(m, fn, i::id.InstructionId, d, base, op);
+            if (sel res_.err) { ret res_; }
+        }
+        or {
+            d.operands[0] = value.const_null(d.operands[0].ty);
         }
         i = i + 1;
     }
@@ -450,7 +459,7 @@ test "mach.lang.me.ir.mutate.erase_marked:reports_no_change_when_nothing_is_mark
     var target: id.InstructionId = id.INSTR_NIL;
     val target_ptr: *id.InstructionId = ?target;
     val res_: res[bool, fail.Fail] =
-        erase_marked[id.InstructionId](?m, fn, target_ptr, t_erase_none);
+        erase_marked[id.InstructionId](?m, fn, ?alloc, target_ptr, t_erase_none);
     if (sel res_.err) { ir.dnit(?m); ret 1; }
     val changed: bool = res_.ok;
     ir.dnit(?m);
@@ -498,7 +507,7 @@ test "mach.lang.me.ir.mutate.erase_marked:reports_change_when_the_marked_instruc
     var target: id.InstructionId = x_id;
     val target_ptr: *id.InstructionId = ?target;
     val res_: res[bool, fail.Fail] =
-        erase_marked[id.InstructionId](?m, fn, target_ptr, t_erase_target);
+        erase_marked[id.InstructionId](?m, fn, ?alloc, target_ptr, t_erase_target);
     if (sel res_.err) { ir.dnit(?m); ret 1; }
     val changed: bool = res_.ok;
     val after: u32 = blk.instr_count;
