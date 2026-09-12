@@ -150,16 +150,19 @@ compatibility fallbacks and do not classify a neighbour's rendered text.
 
 ## Verification
 
-- unit suite, from-source compiler built by the v5 stage: 2949 passed, 0
-  failed (2943 at `origin/dev` 2a2918b23; +3 `mach.lang.alloc`, +2
-  `mach.lang.fail`, +1 `mach.lang.build.outcome.fail`, no test removed; the
-  out-of-catalog `FailKind` assertion inside
-  `mach.cli.diagnostic.render_fail_w` went with the kind)
+- unit suite, from-source compiler built by the v5 stage, debug and release:
+  2965 passed, 0 failed (2959 at `origin/dev` 0e4c62b5c, dev merged through
+  PR #3282; by name +3 `mach.lang.alloc`, +2 `mach.lang.fail`, +1
+  `mach.lang.build.outcome.fail`, no test removed; the out-of-catalog
+  `FailKind` assertion inside `mach.cli.diagnostic.render_fail_w` went with
+  the kind)
 - `sh test/census.sh` all ok
 - corpus layer B, x86_64-linux and spirv: unchanged goldens
 - link leg x86_64-linux
+- corpus layer B: 196 pass, 0 fail, 8 skip (the declared spirv limitations)
+- link leg: 140 pass, 0 fail, 0 skip
 - three-generation fixpoint from the v5 stage: A by the stage, B by A, C by
-  B, `cmp B C` byte-identical
+  B, A = B = C `38861714` (no code generation changed)
 - cross-builds of the compiler for darwin-aarch64, darwin-x86_64 and
   windows-x86_64
 
