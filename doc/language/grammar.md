@@ -585,7 +585,7 @@ grammars overlap — a bare name is both a type and a value — so the parser ca
 decide locally. It probes the payload against both grammars, and the same four
 outcomes apply whether or not a `(` follows the `]`:
 - reads cleanly **only** as a type list (`*T`, `[N]T`, a comma list, or a
-  nested generic like `Result[bool, str]`) → generic arguments;
+  nested generic like `res[bool, ParseError]`) → generic arguments;
 - reads cleanly **only** as an expression (`i + 1`, `f(x)`, a literal) → an
   index, so `table[0]()` and `table[i + 1]()` are index-then-call;
 - reads cleanly as **both** (a bare identifier, a dotted path, a generic

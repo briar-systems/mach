@@ -158,7 +158,7 @@ it (Darwin's underscore prefix, nothing elsewhere; see
 platform prefix applied to it.
 
 A mangled name is the source FQN, dotted, with generic arguments after a `$`:
-`std.types.string.str_len`, `std.types.option.unwrap$ptr`. Each argument is
+`std.types.string.str_len`, `std.collections.vector.push$ptr`. Each argument is
 introduced by a run of `$` whose length is its nesting depth, so a nested
 argument closes without a bracket — `f[Map[Vec[i64], str], u8]` is
 `m.f$m.Map$$m.Vec$$$i64$$str$u8`. `p$u8` is `*u8`, `sec$u32` is `^u32`,
