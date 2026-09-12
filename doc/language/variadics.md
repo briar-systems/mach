@@ -203,7 +203,7 @@ shape, answering `res[usize, FormatError]` the way std's does:
 use std.runtime;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.canonical.res;
+use std.types.result.res;
 use print: std.print;
 
 tag FormatError: u8 { few_holes; }

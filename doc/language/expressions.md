@@ -28,8 +28,8 @@ core.add            # symbol from module `core`
 A type name followed by a brace-delimited initializer:
 
 ```mach accept
-use std.types.canonical.res;
-use std.types.canonical.err;
+use std.types.result.res;
+use std.types.error.err;
 
 rec Point { x: i64; y: i64; }
 uni Number { i: i64; f: f64; }
