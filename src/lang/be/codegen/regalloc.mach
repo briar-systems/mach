@@ -16,6 +16,7 @@ use std.types.string.str_len;
 use std.types.string.str_contains;
 
 use A: std.allocator;
+use T: std.allocator.testing;
 
 use mach.lang.be.codegen.mir;
 use mach.lang.be.codegen.rules;
@@ -1222,91 +1223,255 @@ fun maybe_reverse_hint(ctx: *AllocCtx, mi: *mir.MirInstr, pos: u32, nv: u32) {
     ctx.hints[sv].dst_copy_pos = p;
 }
 
-fun extend_liveness(ctx: *AllocCtx) err[fail.Fail] {
+# liveness scratch: per-register use and definition blocks and per-block
+# predecessors, each grouped as offset ranges, so the propagation touches
+# only the blocks a register reaches instead of a block-by-register matrix
+rec LiveScratch {
+    alloc:      *A.Allocator;
+    nb:         u32;
+    nv:         u32;
+    use_start:  *u32;
+    def_start:  *u32;
+    pred_start: *u32;
+    use_mark:   *u32;
+    def_mark:   *u32;
+    def_of:     *u32;
+    visited:    *u32;
+    pending:    *u32;
+    use_count:  u32;
+    def_count:  u32;
+    edge_count: u32;
+    use_blocks: *u32;
+    def_blocks: *u32;
+    preds:      *u32;
+    fill:       bool;
+}
+
+fun live_scratch_array(l: *LiveScratch, out: **u32, n: u32, value: u32) err[fail.Fail] {
+    if (n == 0) { @out = nil; ret err[fail.Fail].ok{}; }
+    val r: res[*u32, A.Error] = A.allocate[u32](l.alloc, n::usize);
+    if (sel r.err) { ret err[fail.Fail].err{fail.refused(r.err)}; }
+    @out = r.ok;
+    var i: u32 = 0;
+    for (i < n) { r.ok[i] = value; i = i + 1; }
+    ret err[fail.Fail].ok{};
+}
+
+fun live_scratch_release(l: *LiveScratch, arr: **u32, n: u32) {
+    if (@arr != nil && n > 0) { A.deallocate[u32](l.alloc, @arr, n::usize); }
+    @arr = nil;
+}
+
+fun live_scratch_dnit(l: *LiveScratch) {
+    live_scratch_release(l, ?l.preds, l.edge_count);
+    live_scratch_release(l, ?l.def_blocks, l.def_count);
+    live_scratch_release(l, ?l.use_blocks, l.use_count);
+    live_scratch_release(l, ?l.pending, l.nb);
+    live_scratch_release(l, ?l.visited, l.nb);
+    live_scratch_release(l, ?l.def_of, l.nb);
+    live_scratch_release(l, ?l.def_mark, l.nv);
+    live_scratch_release(l, ?l.use_mark, l.nv);
+    live_scratch_release(l, ?l.pred_start, l.nb + 1);
+    live_scratch_release(l, ?l.def_start, l.nv + 1);
+    live_scratch_release(l, ?l.use_start, l.nv + 1);
+}
+
+fun live_scratch_init(l: *LiveScratch, alloc: *A.Allocator, nb: u32, nv: u32) err[fail.Fail] {
+    l.alloc      = alloc;
+    l.nb         = nb;
+    l.nv         = nv;
+    l.use_start  = nil;
+    l.def_start  = nil;
+    l.pred_start = nil;
+    l.use_mark   = nil;
+    l.def_mark   = nil;
+    l.def_of     = nil;
+    l.visited    = nil;
+    l.pending    = nil;
+    l.use_count  = 0;
+    l.def_count  = 0;
+    l.edge_count = 0;
+    l.use_blocks = nil;
+    l.def_blocks = nil;
+    l.preds      = nil;
+    l.fill       = false;
+    val r0: err[fail.Fail] = live_scratch_array(l, ?l.use_start, nv + 1, 0);
+    if (sel r0.err) { ret r0; }
+    val r1: err[fail.Fail] = live_scratch_array(l, ?l.def_start, nv + 1, 0);
+    if (sel r1.err) { live_scratch_dnit(l); ret r1; }
+    val r2: err[fail.Fail] = live_scratch_array(l, ?l.pred_start, nb + 1, 0);
+    if (sel r2.err) { live_scratch_dnit(l); ret r2; }
+    val r3: err[fail.Fail] = live_scratch_array(l, ?l.use_mark, nv, RANGE_NIL);
+    if (sel r3.err) { live_scratch_dnit(l); ret r3; }
+    val r4: err[fail.Fail] = live_scratch_array(l, ?l.def_mark, nv, RANGE_NIL);
+    if (sel r4.err) { live_scratch_dnit(l); ret r4; }
+    val r5: err[fail.Fail] = live_scratch_array(l, ?l.def_of, nb, RANGE_NIL);
+    if (sel r5.err) { live_scratch_dnit(l); ret r5; }
+    val r6: err[fail.Fail] = live_scratch_array(l, ?l.visited, nb, RANGE_NIL);
+    if (sel r6.err) { live_scratch_dnit(l); ret r6; }
+    val r7: err[fail.Fail] = live_scratch_array(l, ?l.pending, nb, RANGE_NIL);
+    if (sel r7.err) { live_scratch_dnit(l); ret r7; }
+    ret err[fail.Fail].ok{};
+}
+
+# a use counts once per block and only before the block's first definition
+fun note_use(l: *LiveScratch, reg: u32, block: u32) {
+    if (reg >= l.nv || l.def_mark[reg] == block || l.use_mark[reg] == block) { ret; }
+    l.use_mark[reg] = block;
+    if (l.fill) { l.use_blocks[l.use_start[reg]] = block; l.use_start[reg] = l.use_start[reg] + 1; }
+    or          { l.use_start[reg + 1] = l.use_start[reg + 1] + 1; }
+}
+
+fun note_def(l: *LiveScratch, reg: u32, block: u32) {
+    if (reg >= l.nv || l.def_mark[reg] == block) { ret; }
+    l.def_mark[reg] = block;
+    if (l.fill) { l.def_blocks[l.def_start[reg]] = block; l.def_start[reg] = l.def_start[reg] + 1; }
+    or          { l.def_start[reg + 1] = l.def_start[reg + 1] + 1; }
+}
+
+fun note_edge(l: *LiveScratch, pred: u32, succ: u32) {
+    if (l.fill) { l.preds[l.pred_start[succ]] = pred; l.pred_start[succ] = l.pred_start[succ] + 1; }
+    or          { l.pred_start[succ + 1] = l.pred_start[succ + 1] + 1; }
+}
+
+# the same walk counts on the first pass and fills on the second; the start
+# arrays hold counts per index + 1 after the first pass, prefix sums after
+# exclusive_offsets, and each fill advances its own start, which
+# restore_offsets shifts back
+fun collect_references(ctx: *AllocCtx, l: *LiveScratch) {
     val f: *mir.MirFunction = ctx.f;
-    val nb: u32 = f.block_count;
-    val nv: u32 = f.vreg_count;
-    if (nb == 0 || nv == 0) { ret err[fail.Fail].ok{}; }
-
-    val total: usize = (nb::usize) * (nv::usize);
-    val use_set: res[*bool, A.Error] = A.allocate[bool](ctx.alloc, total);
-    if (sel use_set.err) { ret err[fail.Fail].err{fail.refused(use_set.err)}; }
-    val uses: *bool = use_set.ok;
-    val def_set: res[*bool, A.Error] = A.allocate[bool](ctx.alloc, total);
-    if (sel def_set.err) { A.deallocate[bool](ctx.alloc, uses, total); ret err[fail.Fail].err{fail.refused(def_set.err)}; }
-    val defs: *bool = def_set.ok;
-    val in_set: res[*bool, A.Error] = A.allocate[bool](ctx.alloc, total);
-    if (sel in_set.err) {
-        A.deallocate[bool](ctx.alloc, uses, total);
-        A.deallocate[bool](ctx.alloc, defs, total);
-        ret err[fail.Fail].err{fail.refused(in_set.err)};
-    }
-    val live_in: *bool = in_set.ok;
-    val out_set: res[*bool, A.Error] = A.allocate[bool](ctx.alloc, total);
-    if (sel out_set.err) {
-        A.deallocate[bool](ctx.alloc, uses, total);
-        A.deallocate[bool](ctx.alloc, defs, total);
-        A.deallocate[bool](ctx.alloc, live_in, total);
-        ret err[fail.Fail].err{fail.refused(out_set.err)};
-    }
-    val live_out: *bool = out_set.ok;
-
-    var z: usize = 0;
-    for (z < total) {
-        uses[z] = false;
-        defs[z] = false;
-        live_in[z] = false;
-        live_out[z] = false;
-        z = z + 1;
-    }
-
-    compute_use_def(ctx, uses, defs, nv);
-
-    var changed: bool = true;
-    for (changed) {
-        changed = false;
-        var ri: i64 = nb::i64 - 1;
-        for (ri >= 0) {
-            val b: u32 = ri::u32;
-            val base: usize = (b::usize) * (nv::usize);
-
-            var v: u32 = 0;
-            for (v < nv) { live_out[base + v::usize] = false; v = v + 1; }
-            union_succ_live_in(ctx, b, live_out, live_in, nv);
-
-            v = 0;
-            for (v < nv) {
-                val idx: usize = base + v::usize;
-                var new_in: bool = uses[idx];
-                if (live_out[idx] && !defs[idx]) { new_in = true; }
-                if (new_in && !live_in[idx]) {
-                    live_in[idx] = true;
-                    changed = true;
-                }
-                v = v + 1;
-            }
-            ri = ri - 1;
-        }
-    }
-
+    var i: u32 = 0;
+    for (i < l.nv) { l.use_mark[i] = RANGE_NIL; l.def_mark[i] = RANGE_NIL; i = i + 1; }
     var bi: u32 = 0;
-    for (bi < nb) {
-        val span: BlockSpan = ctx.block_spans[bi];
-        val base: usize = (bi::usize) * (nv::usize);
-        var v: u32 = 0;
-        for (v < nv) {
-            val idx: usize = base + v::usize;
-            extend_range_for_block(?ctx.ranges[v], span, live_in[idx], live_out[idx]);
-            v = v + 1;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            val has_def: bool = instr_defines(mi);
+            var k: u32 = 0;
+            for (k < mi.operand_count) {
+                val op: *mir.MirOperand = ?mi.operands[k];
+                if (op.kind == mir.MIR_OP_VREG || op.kind == mir.MIR_OP_MEM) {
+                    val is_dst: bool = has_def && k == 0 && op.kind == mir.MIR_OP_VREG;
+                    if (!is_dst) { note_use(l, op.vreg, bi); }
+                }
+                if (op.kind == mir.MIR_OP_MEM && !op.index_is_preg) { note_use(l, op.index, bi); }
+                k = k + 1;
+            }
+            if (has_def) { note_def(l, mi.operands[0].vreg, bi); }
+            ii = ii + 1;
         }
         bi = bi + 1;
     }
+}
 
-    A.deallocate[bool](ctx.alloc, uses, total);
-    A.deallocate[bool](ctx.alloc, defs, total);
-    A.deallocate[bool](ctx.alloc, live_in, total);
-    A.deallocate[bool](ctx.alloc, live_out, total);
+fun collect_edges(ctx: *AllocCtx, l: *LiveScratch) {
+    val f: *mir.MirFunction = ctx.f;
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        if (blk.instr_count > 0) {
+            val term: *mir.MirInstr = ?blk.instrs[blk.instr_count - 1];
+            var k: u32 = 0;
+            for (k < term.operand_count) {
+                val op: *mir.MirOperand = ?term.operands[k];
+                if (op.kind == mir.MIR_OP_BLOCK) {
+                    val si: u32 = block_index_of(ctx, op.imm::u32);
+                    if (si != RANGE_NIL) { note_edge(l, bi, si); }
+                }
+                k = k + 1;
+            }
+        }
+        if (bi + 1 < f.block_count && block_lists_pred(?f.blocks[bi + 1], blk.id)) {
+            note_edge(l, bi, bi + 1);
+        }
+        bi = bi + 1;
+    }
+}
+
+fun exclusive_offsets(start: *u32, n: u32) u32 {
+    var i: u32 = 0;
+    for (i < n) { start[i + 1] = start[i + 1] + start[i]; i = i + 1; }
+    ret start[n];
+}
+
+fun restore_offsets(start: *u32, n: u32) {
+    var i: u32 = n;
+    for (i > 0) { start[i] = start[i - 1]; i = i - 1; }
+    start[0] = 0;
+}
+
+fun extend_liveness(ctx: *AllocCtx) err[fail.Fail] {
+    val nb: u32 = ctx.f.block_count;
+    val nv: u32 = ctx.f.vreg_count;
+    if (nb == 0 || nv == 0) { ret err[fail.Fail].ok{}; }
+    var l: LiveScratch;
+    val li: err[fail.Fail] = live_scratch_init(?l, ctx.alloc, nb, nv);
+    if (sel li.err) { ret li; }
+    fin { live_scratch_dnit(?l); }
+
+    collect_references(ctx, ?l);
+    collect_edges(ctx, ?l);
+    l.use_count  = exclusive_offsets(l.use_start, nv);
+    l.def_count  = exclusive_offsets(l.def_start, nv);
+    l.edge_count = exclusive_offsets(l.pred_start, nb);
+    val ru: err[fail.Fail] = live_scratch_array(?l, ?l.use_blocks, l.use_count, RANGE_NIL);
+    if (sel ru.err) { ret ru; }
+    val rd: err[fail.Fail] = live_scratch_array(?l, ?l.def_blocks, l.def_count, RANGE_NIL);
+    if (sel rd.err) { ret rd; }
+    val rp: err[fail.Fail] = live_scratch_array(?l, ?l.preds, l.edge_count, RANGE_NIL);
+    if (sel rp.err) { ret rp; }
+    l.fill = true;
+    collect_references(ctx, ?l);
+    collect_edges(ctx, ?l);
+    restore_offsets(l.use_start, nv);
+    restore_offsets(l.def_start, nv);
+    restore_offsets(l.pred_start, nb);
+
+    propagate_liveness(ctx, ?l);
     ret err[fail.Fail].ok{};
+}
+
+# backward reachability per register: every block with an upward-exposed use
+# is live-in, every predecessor of a live-in block is live-out, and a
+# predecessor without a definition of the register is live-in in turn
+fun propagate_liveness(ctx: *AllocCtx, l: *LiveScratch) {
+    var reg: u32 = 0;
+    for (reg < l.nv) {
+        val lr: *LiveRange = ?ctx.ranges[reg];
+        var d: u32 = l.def_start[reg];
+        for (d < l.def_start[reg + 1]) { l.def_of[l.def_blocks[d]] = reg; d = d + 1; }
+        var count: u32 = 0;
+        var u: u32 = l.use_start[reg];
+        for (u < l.use_start[reg + 1]) {
+            val b: u32 = l.use_blocks[u];
+            if (l.visited[b] != reg) {
+                l.visited[b] = reg;
+                l.pending[count] = b;
+                count = count + 1;
+                extend_range_for_block(lr, ctx.block_spans[b], true, false);
+            }
+            u = u + 1;
+        }
+        for (count > 0) {
+            count = count - 1;
+            val b: u32 = l.pending[count];
+            var e: u32 = l.pred_start[b];
+            for (e < l.pred_start[b + 1]) {
+                val p: u32 = l.preds[e];
+                extend_range_for_block(lr, ctx.block_spans[p], false, true);
+                if (l.def_of[p] != reg && l.visited[p] != reg) {
+                    l.visited[p] = reg;
+                    l.pending[count] = p;
+                    count = count + 1;
+                    extend_range_for_block(lr, ctx.block_spans[p], true, false);
+                }
+                e = e + 1;
+            }
+        }
+        reg = reg + 1;
+    }
 }
 
 fun extend_range_for_block(lr: *LiveRange, span: BlockSpan, live_in: bool, live_out: bool) {
@@ -1335,74 +1500,9 @@ fun build_block_spans(ctx: *AllocCtx) err[fail.Fail] {
     ret err[fail.Fail].ok{};
 }
 
-fun compute_use_def(ctx: *AllocCtx, uses: *bool, defs: *bool, nv: u32) {
-    val f: *mir.MirFunction = ctx.f;
-    var bi: u32 = 0;
-    for (bi < f.block_count) {
-        val blk: *mir.MirBlock = ?f.blocks[bi];
-        val base: usize = (bi::usize) * (nv::usize);
-        var ii: u32 = 0;
-        for (ii < blk.instr_count) {
-            val mi: *mir.MirInstr = ?blk.instrs[ii];
-            val has_def: bool = instr_defines(mi);
-
-            var k: u32 = 0;
-            for (k < mi.operand_count) {
-                val op: *mir.MirOperand = ?mi.operands[k];
-                var v: u32 = mir.MIR_VREG_NIL;
-                if (op.kind == mir.MIR_OP_VREG)                               { v = op.vreg; }
-                if (op.kind == mir.MIR_OP_MEM && op.vreg != mir.MIR_VREG_NIL) { v = op.vreg; }
-                if (v != mir.MIR_VREG_NIL && v < nv) {
-                    val is_dst: bool = has_def && k == 0 && op.kind == mir.MIR_OP_VREG;
-                    if (!is_dst) {
-                        if (!defs[base + v::usize]) { uses[base + v::usize] = true; }
-                    }
-                }
-                if (op.kind == mir.MIR_OP_MEM && !op.index_is_preg && op.index != mir.MIR_VREG_NIL && op.index < nv) {
-                    if (!defs[base + op.index::usize]) { uses[base + op.index::usize] = true; }
-                }
-                k = k + 1;
-            }
-            if (has_def) {
-                val d: *mir.MirOperand = ?mi.operands[0];
-                if (d.kind == mir.MIR_OP_VREG && d.vreg < nv) {
-                    defs[base + d.vreg::usize] = true;
-                }
-            }
-            ii = ii + 1;
-        }
-        bi = bi + 1;
-    }
-}
-
 fun instr_defines(mi: *mir.MirInstr) bool {
     if (!mir.instr_defines_shape(mi)) { ret false; }
     ret mi.operands[0].kind == mir.MIR_OP_VREG;
-}
-
-fun union_succ_live_in(ctx: *AllocCtx, b: u32, live_out: *bool, live_in: *bool, nv: u32) {
-    val f: *mir.MirFunction = ctx.f;
-    val blk: *mir.MirBlock = ?f.blocks[b];
-    val ob: usize = (b::usize) * (nv::usize);
-
-    if (blk.instr_count > 0) {
-        val term: *mir.MirInstr = ?blk.instrs[blk.instr_count - 1];
-        var k: u32 = 0;
-        for (k < term.operand_count) {
-            val op: *mir.MirOperand = ?term.operands[k];
-            if (op.kind == mir.MIR_OP_BLOCK) {
-                val si: u32 = block_index_of(ctx, op.imm::u32);
-                if (si != RANGE_NIL) {
-                    or_row(live_out, ob, live_in, (si::usize) * (nv::usize), nv);
-                }
-            }
-            k = k + 1;
-        }
-    }
-
-    if (b + 1 < f.block_count && block_lists_pred(?f.blocks[b + 1], blk.id)) {
-        or_row(live_out, ob, live_in, ((b + 1)::usize) * (nv::usize), nv);
-    }
 }
 
 fun block_lists_pred(blk: *mir.MirBlock, pred_id: u32) bool {
@@ -1412,14 +1512,6 @@ fun block_lists_pred(blk: *mir.MirBlock, pred_id: u32) bool {
         i = i + 1;
     }
     ret false;
-}
-
-fun or_row(dst: *bool, dbase: usize, src: *bool, sbase: usize, nv: u32) {
-    var v: u32 = 0;
-    for (v < nv) {
-        if (src[sbase + v::usize]) { dst[dbase + v::usize] = true; }
-        v = v + 1;
-    }
 }
 
 fun mark_call_crossing(ctx: *AllocCtx) err[fail.Fail] {
@@ -4361,5 +4453,231 @@ test "mach.lang.be.codegen.regalloc:unknown_catalog_inputs_never_use_the_fp_or_n
     val bad_operand: err[fail.Fail] = run(?tgt, ?module);
     if (sel bad_operand.ok) { ret 10; }
     if (!str_contains(fail.describe(bad_operand.err), "unknown MirOperandKind tag 200")) { ret 10; }
+    ret 0;
+}
+
+# the dense block-by-register equations, kept only as the oracle the sparse
+# propagation is checked against on small graphs
+fun t_dense_liveness(ctx: *AllocCtx) err[fail.Fail] {
+    val f: *mir.MirFunction = ctx.f;
+    val nb: u32 = f.block_count;
+    val nv: u32 = f.vreg_count;
+    if (nb == 0 || nv == 0) { ret err[fail.Fail].ok{}; }
+    val total: usize = (nb::usize) * (nv::usize) * 4;
+    val cells: res[*bool, A.Error] = A.allocate[bool](ctx.alloc, total);
+    if (sel cells.err) { ret err[fail.Fail].err{fail.refused(cells.err)}; }
+    fin { A.deallocate[bool](ctx.alloc, cells.ok, total); }
+    val stride: usize = (nb::usize) * (nv::usize);
+    val uses: *bool = cells.ok;
+    val defs: *bool = ?cells.ok[stride];
+    val live_in: *bool = ?cells.ok[stride * 2];
+    val live_out: *bool = ?cells.ok[stride * 3];
+    var z: usize = 0;
+    for (z < total) { cells.ok[z] = false; z = z + 1; }
+
+    var bi: u32 = 0;
+    for (bi < nb) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        val base: usize = (bi::usize) * (nv::usize);
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            val has_def: bool = instr_defines(mi);
+            var k: u32 = 0;
+            for (k < mi.operand_count) {
+                val op: *mir.MirOperand = ?mi.operands[k];
+                var v: u32 = mir.MIR_VREG_NIL;
+                if (op.kind == mir.MIR_OP_VREG || op.kind == mir.MIR_OP_MEM) { v = op.vreg; }
+                if (v < nv && !(has_def && k == 0 && op.kind == mir.MIR_OP_VREG) && !defs[base + v::usize]) {
+                    uses[base + v::usize] = true;
+                }
+                if (op.kind == mir.MIR_OP_MEM && !op.index_is_preg && op.index < nv && !defs[base + op.index::usize]) {
+                    uses[base + op.index::usize] = true;
+                }
+                k = k + 1;
+            }
+            if (has_def && mi.operands[0].vreg < nv) { defs[base + mi.operands[0].vreg::usize] = true; }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var ri: i64 = nb::i64 - 1;
+        for (ri >= 0) {
+            val b: u32 = ri::u32;
+            val base: usize = (b::usize) * (nv::usize);
+            var v: u32 = 0;
+            for (v < nv) { live_out[base + v::usize] = false; v = v + 1; }
+            val blk: *mir.MirBlock = ?f.blocks[b];
+            if (blk.instr_count > 0) {
+                val term: *mir.MirInstr = ?blk.instrs[blk.instr_count - 1];
+                var k: u32 = 0;
+                for (k < term.operand_count) {
+                    if (term.operands[k].kind == mir.MIR_OP_BLOCK) {
+                        val si: u32 = block_index_of(ctx, term.operands[k].imm::u32);
+                        if (si != RANGE_NIL) { t_or_row(live_out, base, live_in, (si::usize) * (nv::usize), nv); }
+                    }
+                    k = k + 1;
+                }
+            }
+            if (b + 1 < nb && block_lists_pred(?f.blocks[b + 1], blk.id)) {
+                t_or_row(live_out, base, live_in, ((b + 1)::usize) * (nv::usize), nv);
+            }
+            v = 0;
+            for (v < nv) {
+                val idx: usize = base + v::usize;
+                if ((uses[idx] || (live_out[idx] && !defs[idx])) && !live_in[idx]) { live_in[idx] = true; changed = true; }
+                v = v + 1;
+            }
+            ri = ri - 1;
+        }
+    }
+
+    bi = 0;
+    for (bi < nb) {
+        val base: usize = (bi::usize) * (nv::usize);
+        var v: u32 = 0;
+        for (v < nv) {
+            extend_range_for_block(?ctx.ranges[v], ctx.block_spans[bi], live_in[base + v::usize], live_out[base + v::usize]);
+            v = v + 1;
+        }
+        bi = bi + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun t_or_row(dst: *bool, dbase: usize, src: *bool, sbase: usize, nv: u32) {
+    var v: u32 = 0;
+    for (v < nv) { if (src[sbase + v::usize]) { dst[dbase + v::usize] = true; } v = v + 1; }
+}
+
+# eight blocks of four instructions whose uses, definitions, memory operands,
+# fallthroughs, self loops and an empty block vary with the sample bits
+fun t_sparse_liveness_case(sample: u32, ordinal: usize, attempts: *usize) i32 {
+    var track: T.Testing;
+    val made: err[A.Error] = T.make(?track);
+    if (sel made.err) { ret 1; }
+    fin { T.dnit(?track); }
+    var alloc: A.Allocator;
+    val paged: err[A.Error] = page.make(?alloc);
+    if (sel paged.err) { ret 2; }
+    var blocks: [8]mir.MirBlock;
+    var instrs: [8][4]mir.MirInstr;
+    var operands: [8][4][3]mir.MirOperand;
+    var preds: [8]u32;
+    var spans: [8]BlockSpan;
+    var block_map: [64]u32;
+    var sparse: [8]LiveRange;
+    var dense: [8]LiveRange;
+    var bi: u32 = 0;
+    for (bi < 64) { block_map[bi] = RANGE_NIL; bi = bi + 1; }
+    bi = 0;
+    for (bi < 8) {
+        val bid: u32 = 40 - bi * 3;
+        blocks[bi].id = bid;
+        block_map[bid] = bi;
+        blocks[bi].instrs = ?instrs[bi][0];
+        blocks[bi].instr_count = 4;
+        blocks[bi].preds = nil;
+        blocks[bi].pred_count = 0;
+        if (bi > 0 && ((sample + bi) & 1) == 0) {
+            preds[bi] = 40 - (bi - 1) * 3;
+            blocks[bi].preds = ?preds[bi];
+            blocks[bi].pred_count = 1;
+        }
+        var definition: u32 = 0;
+        var use_index: u32 = 1;
+        if ((sample & 2) != 0) { definition = 1; use_index = 0; }
+        operands[bi][definition][0] = mir.op_vreg(bi);
+        operands[bi][definition][1] = mir.op_preg(0);
+        instrs[bi][definition] = mir.instr(mir.MIR_MOV, ?operands[bi][definition][0], 2, 8, 8);
+        operands[bi][use_index][0] = mir.op_preg(0);
+        operands[bi][use_index][1] = mir.op_vreg((bi + sample) % 8);
+        instrs[bi][use_index] = mir.instr(mir.MIR_MOV, ?operands[bi][use_index][0], 2, 8, 8);
+        var destination: u32 = (bi + 1) % 8;
+        if ((sample & 4) != 0) { destination = bi; }
+        if ((sample & 3) == 3) { destination = (bi + 2) % 8; }
+        operands[bi][2][0] = mir.op_vreg(destination);
+        operands[bi][2][1] = mir.op_mem_value((bi + 2) % 8, 0);
+        operands[bi][2][1].index = (bi + 3) % 8;
+        operands[bi][2][1].index_is_preg = (sample & 1) != 0;
+        instrs[bi][2] = mir.instr(mir.MIR_LOAD, ?operands[bi][2][0], 2, 8, 8);
+        operands[bi][3][0] = mir.op_vreg((bi + 4) % 8);
+        operands[bi][3][1] = mir.op_block(40 - ((bi + 1) % 8) * 3);
+        operands[bi][3][2] = mir.op_block(40 - ((bi + sample + 6) % 8) * 3);
+        instrs[bi][3] = mir.instr(mir.MIR_CBR, ?operands[bi][3][0], 3, 8, 8);
+        spans[bi].start = (bi * 4)::i64;
+        spans[bi].end = (bi * 4 + 3)::i64;
+        if (bi == 5 && (sample & 8) != 0) {
+            blocks[bi].instr_count = 0;
+            spans[bi].start = -1;
+            spans[bi].end = -1;
+        }
+        sparse[bi].vreg = bi; sparse[bi].start = POS_MAX; sparse[bi].end_pos = -1;
+        dense[bi] = sparse[bi];
+        bi = bi + 1;
+    }
+    var f: mir.MirFunction;
+    f.blocks = ?blocks[0];
+    f.block_count = 8;
+    f.vreg_count = 8;
+    var ctx: AllocCtx;
+    ctx.alloc = T.allocator_of(?track);
+    ctx.f = ?f;
+    ctx.block_spans = ?spans[0];
+    ctx.block_id_index = ?block_map[0];
+    ctx.block_id_index_cap = 64;
+    ctx.ranges = ?sparse[0];
+    T.fail_at_ordinal(?track, ordinal);
+    val result: err[fail.Fail] = extend_liveness(?ctx);
+    @attempts = T.attempt_count(?track);
+    if (T.leaked(?track) || T.double_free_count(?track) != 0 || T.tracking_exhausted(?track)) { ret 3; }
+    if (ordinal != 0) {
+        if (sel result.ok) { ret 4; }
+        bi = 0;
+        for (bi < 8) {
+            if (sparse[bi].start != POS_MAX || sparse[bi].end_pos != -1) { ret 5; }
+            bi = bi + 1;
+        }
+        ret 0;
+    }
+    if (sel result.err) { ret 6; }
+    ctx.alloc = ?alloc;
+    ctx.ranges = ?dense[0];
+    val oracle: err[fail.Fail] = t_dense_liveness(?ctx);
+    if (sel oracle.err) { ret 7; }
+    bi = 0;
+    for (bi < 8) {
+        if (sparse[bi].start != dense[bi].start || sparse[bi].end_pos != dense[bi].end_pos) { ret 8; }
+        bi = bi + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.regalloc.extend_liveness:sparse_matches_dense_loops_definitions_and_memory_uses" {
+    var sample: u32 = 0;
+    for (sample < 16) {
+        var attempts: usize = 0;
+        val result: i32 = t_sparse_liveness_case(sample, 0, ?attempts);
+        if (result != 0) { ret result; }
+        sample = sample + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.regalloc.extend_liveness:allocation_failure_preserves_ranges_and_releases_scratch" {
+    var attempts: usize = 0;
+    val baseline: i32 = t_sparse_liveness_case(9, 0, ?attempts);
+    if (baseline != 0 || attempts == 0) { ret 1; }
+    var ordinal: usize = 1;
+    for (ordinal <= attempts) {
+        var refused_attempts: usize = 0;
+        val result: i32 = t_sparse_liveness_case(9, ordinal, ?refused_attempts);
+        if (result != 0) { ret result; }
+        ordinal = ordinal + 1;
+    }
     ret 0;
 }
