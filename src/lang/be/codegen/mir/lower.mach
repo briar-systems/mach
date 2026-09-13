@@ -156,6 +156,8 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, alloc: 
     mf.blocks    = rb.ok;
     mf.block_cap = fn.block_count;
 
+    lctx.seed_gep_mems(?ctx, fn, pure_gep_mem);
+
     var bi: u32 = 0;
     for (bi < fn.block_count) {
         val is_entry: bool           = bi == 0;
@@ -1699,6 +1701,87 @@ fun agg_pointer_mem(ctx: *lctx.LowerCtx, v: value.Value, disp: i64) res[mir.MirO
     ret res[mir.MirOperand, fail.Fail].ok{op};
 }
 
+# the memory operand of an element address that needs no instruction of its
+# own: a register, frame or symbol base, constant indices folded into the
+# displacement, and at most one runtime index whose stride the addressing
+# mode scales, on a register base. blocks are lowered in index order and the
+# address may be defined after its uses, so a folded address is computed
+# from the IR alone, never from lowered state
+pub fun pure_gep_mem(ctx: *lctx.LowerCtx, inst: *instr.Instruction) opt[mir.MirOperand] {
+    if (inst.operand_count < 2 || inst.aux_ty == ir_type.IRT_NIL) { ret opt[mir.MirOperand].none{}; }
+    val base_r: res[mir.MirOperand, fail.Fail] = lctx.mem_operand_of_plain(ctx, inst.operands[0]);
+    if (sel base_r.err) { ret opt[mir.MirOperand].none{}; }
+    val base: mir.MirOperand = base_r.ok;
+    if (base.kind != mir.MIR_OP_MEM && base.kind != mir.MIR_OP_SYM) { ret opt[mir.MirOperand].none{}; }
+
+    var disp:      i64              = 0;
+    var idx_vreg:  mir.VRegId       = mir.MIR_VREG_NIL;
+    var idx_scale: u8               = 0;
+    var cur_ty:    ir_type.IrTypeId = inst.aux_ty;
+    var k:         u32              = 1;
+    for (k < inst.operand_count) {
+        val v:         value.Value = inst.operands[k];
+        var stride:    u64         = 0;
+        var is_struct: bool        = false;
+        if (k == 1) {
+            stride = ir_type.byte_size_for_machine(ctx.types, cur_ty, ctx.layout)::u64;
+        }
+        or {
+            val ct_opt: opt[*ir_type.IrType] = ir_type.get(ctx.types, cur_ty);
+            if (!sel ct_opt.some) { ret opt[mir.MirOperand].none{}; }
+            val ct: *ir_type.IrType = ct_opt.some;
+            if (ct.kind == ir_type.IRT_ARRAY) {
+                stride = ir_type.byte_size_for_machine(ctx.types, ct.data.array_.element, ctx.layout)::u64;
+                cur_ty = ct.data.array_.element;
+            }
+            or (ct.kind == ir_type.IRT_VECTOR) {
+                stride = ir_type.byte_size_for_machine(ctx.types, ct.data.vector_.element, ctx.layout)::u64;
+                cur_ty = ct.data.vector_.element;
+            }
+            or (ct.kind == ir_type.IRT_STRUCT || ct.kind == ir_type.IRT_UNION || ct.kind == ir_type.IRT_TAG) {
+                is_struct = true;
+            }
+            or {
+                ret opt[mir.MirOperand].none{};
+            }
+        }
+        if (is_struct) {
+            if (v.kind != value.VAL_CONST_INT) { ret opt[mir.MirOperand].none{}; }
+            val fo: res[i64, fail.Fail] = struct_field_offset(ctx, cur_ty, v.data.int_lit::u32);
+            if (sel fo.err) { ret opt[mir.MirOperand].none{}; }
+            disp = disp + fo.ok;
+            val ft: res[ir_type.IrTypeId, fail.Fail] = struct_field_type(ctx, cur_ty, v.data.int_lit::u32);
+            if (sel ft.err) { ret opt[mir.MirOperand].none{}; }
+            cur_ty = ft.ok;
+        }
+        or (v.kind == value.VAL_CONST_INT) {
+            disp = disp + (v.data.int_lit * stride)::i64;
+        }
+        or {
+            if (!mir.vreg_is_nil(idx_vreg) || !is_sib_scale(stride) || base.kind != mir.MIR_OP_MEM) { ret opt[mir.MirOperand].none{}; }
+            if (v.kind != value.VAL_INSTR && v.kind != value.VAL_PARAM)                             { ret opt[mir.MirOperand].none{}; }
+            val iv: res[mir.MirOperand, fail.Fail] = lctx.lower_value(ctx, v);
+            if (sel iv.err)                    { ret opt[mir.MirOperand].none{}; }
+            if (iv.ok.kind != mir.MIR_OP_VREG) { ret opt[mir.MirOperand].none{}; }
+            idx_vreg  = iv.ok.vreg;
+            idx_scale = stride::u8;
+        }
+        k = k + 1;
+    }
+
+    var o: mir.MirOperand = base;
+    if (base.kind == mir.MIR_OP_SYM) {
+        o.sym_off = base.sym_off + disp::i32;
+        ret opt[mir.MirOperand].some{o};
+    }
+    o.imm = base.imm + disp;
+    if (!mir.vreg_is_nil(idx_vreg)) {
+        o.index = mir.index_vreg(idx_vreg);
+        o.scale = idx_scale;
+    }
+    ret opt[mir.MirOperand].some{o};
+}
+
 fun lower_gep(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) err[fail.Fail] {
     if (inst.operand_count == 0) {
         ret err[fail.Fail].err{fail.message("mir.lower_ir: gep with no base operand")};
@@ -1791,10 +1874,7 @@ fun lower_gep(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, 
     val mem: res[mir.MirOperand, fail.Fail] = fold_gep_mem(ctx, mb, base, idx_vreg, idx_scale, disp);
     if (sel mem.err) { ret err[fail.Fail].err{mem.err}; }
 
-    if (lctx.gep_folds(ctx, iid)) {
-        lctx.note_gep_mem(ctx, iid, mem.ok);
-        ret err[fail.Fail].ok{};
-    }
+    if (lctx.gep_folds(ctx, iid)) { ret err[fail.Fail].ok{}; }
 
     val r: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
     if (sel r.err) { ret err[fail.Fail].err{fail.refused(r.err)}; }
