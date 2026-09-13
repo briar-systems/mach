@@ -42,6 +42,8 @@ use mach.lang.fe.token;
 use mach.lang.intern;
 use mach.lang.manifest;
 use mach.lang.publication;
+use planned: mach.lang.publication.plan;
+use fixture: mach.lang.publication.testing;
 use mach.lang.session;
 use src: mach.lang.source;
 use mach.lang.target;
@@ -346,15 +348,17 @@ fun write_page(ctx: *PageCtx, dst: *writer.Writer) err[writer.WriteError] {
 }
 
 # publish one page whole: a reader never sees a partially generated page, and a
-# crash leaves the previous one intact rather than a truncated replacement
-fun publish_page[C](alloc: *A.Allocator, out_path: str, ctx: *C,
+# crash leaves the previous one intact rather than a truncated replacement.
+# the page's directory is rooted through the project's control home, so a
+# page under the project leaves no lock sentinel or claims beside it
+fun publish_page[C](alloc: *A.Allocator, home: *planned.Home, out_path: str, ctx: *C,
     write_cb: fun(*C, *writer.Writer) err[writer.WriteError]) bool {
-    val writer_r: err[outcome.Fail] = publication.writer[C](nil, alloc, out_path, ctx, write_cb, FILE_MODE,
+    val writer_r: err[outcome.Fail] = publication.writer_homed[C](nil, alloc, home, out_path, ctx, write_cb, FILE_MODE,
         publication.REPLACE, publication.PARENTS_EXIST, "write", "the page could not be published");
     ret sel writer_r.ok;
 }
 
-fun document_module(alloc: *A.Allocator, out_path: *u8, fqn: *u8, a: *ast.Ast, source: str) i64 {
+fun document_module(alloc: *A.Allocator, home: *planned.Home, out_path: *u8, fqn: *u8, a: *ast.Ast, source: str) i64 {
     val ensure_parents_r: err[outcome.Fail] = util.ensure_parents(alloc, out_path::str);
     if (sel ensure_parents_r.err) { ret -1; }
 
@@ -364,12 +368,13 @@ fun document_module(alloc: *A.Allocator, out_path: *u8, fqn: *u8, a: *ast.Ast, s
     ctx.fqn        = fqn;
     ctx.documented = 0;
 
-    if (!publish_page[PageCtx](alloc, out_path::str, ?ctx, write_page)) { ret -1; }
+    if (!publish_page[PageCtx](alloc, home, out_path::str, ?ctx, write_page)) { ret -1; }
     ret ctx.documented;
 }
 
 rec IndexCtx {
     alloc:   *A.Allocator;
+    home:    *planned.Home;
     p:       *driver.Project;
     api_dir: str;
     stats:   *DocStats;
@@ -425,7 +430,7 @@ fun write_index(ctx: *IndexCtx, dst: *writer.Writer) err[writer.WriteError] {
         }
         val page_path: str = page_r.ok;
 
-        val documented: i64 = document_module(alloc, page_path, fqn, m.a, source);
+        val documented: i64 = document_module(alloc, ctx.home, page_path, fqn, m.a, source);
         if (documented < 0) {
             print.eprint("error: failed to write page for ");
             print.eprint(fqn::str);
@@ -449,7 +454,7 @@ fun write_index(ctx: *IndexCtx, dst: *writer.Writer) err[writer.WriteError] {
     ret err[writer.WriteError].ok{};
 }
 
-fun generate(alloc: *A.Allocator, p: *driver.Project, api_dir: str, stats: *DocStats) i64 {
+fun generate(alloc: *A.Allocator, home: *planned.Home, p: *driver.Project, api_dir: str, stats: *DocStats) i64 {
     val create_dir_all_r: err[fs.FsError] = fs.create_dir_all(alloc, api_dir, 0o755);
     if (sel create_dir_all_r.err) {
         print.eprint("error: could not create output directory\n");
@@ -462,6 +467,7 @@ fun generate(alloc: *A.Allocator, p: *driver.Project, api_dir: str, stats: *DocS
 
     var ctx: IndexCtx;
     ctx.alloc   = alloc;
+    ctx.home    = home;
     ctx.p       = p;
     ctx.api_dir = api_dir;
     ctx.stats   = stats;
@@ -469,7 +475,7 @@ fun generate(alloc: *A.Allocator, p: *driver.Project, api_dir: str, stats: *DocS
 
     # the index names the pages, so it is published after them and only when
     # every one of them landed: a reader never follows a link to a missing page
-    if (!publish_page[IndexCtx](alloc, index_path, ?ctx, write_index)) {
+    if (!publish_page[IndexCtx](alloc, home, index_path, ?ctx, write_index)) {
         if (ctx.failed) { ret 2; }
         print.eprint("error: could not publish the documentation index\n");
         ret 2;
@@ -585,7 +591,27 @@ pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64 {
     stats.modules = 0;
     stats.entries = 0;
 
-    val code: i64 = generate(?alloc, ?p, api_dir, ?stats);
+    # pages under the project are published through its control home under
+    # the build output; an `--out` elsewhere is rooted plainly
+    var home:  planned.Home;
+    val homed: err[txn.Error] = publication.project_home(?home, ?alloc, root);
+    if (sel homed.err) {
+        print.eprint("error: ");
+        print.eprint(txn.error_message(homed.err));
+        print.eprint("\n");
+        driver.dnit_project(?p);
+        session.dnit(?s);
+        arena.dnit(?ar);
+        ret 2;
+    }
+    var code:        i64            = generate(?alloc, ?home, ?p, api_dir, ?stats);
+    val home_closed: err[txn.Error] = publication.project_home_dnit(?home, ?alloc);
+    if (sel home_closed.err) {
+        print.eprint("error: ");
+        print.eprint(txn.error_message(home_closed.err));
+        print.eprint("\n");
+        if (code == 0) { code = 2; }
+    }
 
     if (code == 0 && !parsed.quiet) {
         print.print("documented ");
@@ -961,6 +987,35 @@ test "mach.cli.cmd.doc.build_project:several_artifacts_without_a_default_are_ref
     ret bad;
 }
 
+test "mach.cli.cmd.doc.run:pages_keep_their_control_files_under_the_build_output" {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var root: [4096]u8;
+    if (!t_scratch_project(?alloc, ?root[0])) {
+        fs.remove_all(?alloc, ?root[0]);
+        ret 1;
+    }
+    fin { fs.remove_all(?alloc, ?root[0]); }
+    var av: [4]*u8;
+    av[0] = "mach"::*u8;
+    av[1] = "doc"::*u8;
+    av[2] = ?root[0];
+    av[3] = "--quiet"::*u8;
+    if (t_doc_run(4, ?av[0]) != 0) { ret 2; }
+    val pages: str = t_join(?alloc, (?root[0])::str, "doc/api");
+    # the page tree holds nothing but pages, walked to the leaves
+    if (!fixture.control_free(?alloc, pages)) { ret 3; }
+    val is_file_r: res[bool, io_error.Error] = fs.is_file(t_join(?alloc, pages, "doctest/main.md"));
+    if (!(sel is_file_r.ok && is_file_r.ok)) { ret 4; }
+    # every page directory has its sentinel in the home keyed by its path
+    val home:     str                       = t_join(?alloc, (?root[0])::str, "out/.mach-txn/doc/api");
+    val lock_r:   res[bool, io_error.Error] = fs.is_file(t_join(?alloc, home, txn.LOCK_LEAF));
+    val nested_r: res[bool, io_error.Error] = fs.is_file(t_join(?alloc, t_join(?alloc, home, "doctest"), txn.LOCK_LEAF));
+    if (!(sel lock_r.ok && lock_r.ok) || !(sel nested_r.ok && nested_r.ok)) { ret 5; }
+    ret 0;
+}
+
 test "mach.cli.cmd.doc.run:a_relative_out_is_project_rooted_and_an_absolute_out_is_used_as_given" {
     var alloc:  A.Allocator;
     val make_r: err[A.Error] = page.make(?alloc);
@@ -1081,7 +1136,7 @@ test "mach.cli.cmd.doc.generate:creates_missing_output_dirs" {
     var stats: DocStats;
     stats.modules = 0;
     stats.entries = 0;
-    if (generate(?alloc, ?p, api_dir, ?stats) != 0) { bad = 1; }
+    if (generate(?alloc, nil, ?p, api_dir, ?stats) != 0) { bad = 1; }
     val is_dir_r: res[bool, io_error.Error] = fs.is_dir(api_dir);
     if (sel is_dir_r.err)                  { ret 99; }
     if (!(sel is_dir_r.ok && is_dir_r.ok)) { bad = 1; }
@@ -1189,7 +1244,7 @@ test "mach.cli.cmd.doc.publish_page:a_failed_callback_leaves_the_destination_alo
     ctx.fqn        = "m"::*u8;
     ctx.documented = 0;
 
-    if (bad == 0 && publish_page[PageCtx](?alloc, kept, ?ctx, t_always_fails)) { bad = 2; }
+    if (bad == 0 && publish_page[PageCtx](?alloc, nil, kept, ?ctx, t_always_fails)) { bad = 2; }
 
     # the previous content is still there, whole
     if (bad == 0) {
@@ -1201,7 +1256,7 @@ test "mach.cli.cmd.doc.publish_page:a_failed_callback_leaves_the_destination_alo
     # a destination that did not exist stays absent rather than appearing empty
     if (bad == 0) {
         val fresh: str = t_join(?alloc, dir, "fresh.md");
-        if (publish_page[PageCtx](?alloc, fresh, ?ctx, t_always_fails)) { bad = 5; }
+        if (publish_page[PageCtx](?alloc, nil, fresh, ?ctx, t_always_fails)) { bad = 5; }
         or {
             val exists_r: res[bool, io_error.Error] = fs.exists(fresh);
             if (sel exists_r.ok && exists_r.ok) { bad = 6; }
@@ -1288,7 +1343,7 @@ test "mach.cli.cmd.doc.generate:documents_public_generic_tag" {
     var stats: DocStats;
     stats.modules = 0;
     stats.entries = 0;
-    if (generate(?alloc, ?p, api_dir, ?stats) != 0) { bad = 1; }
+    if (generate(?alloc, nil, ?p, api_dir, ?stats) != 0) { bad = 1; }
 
     val pagep:  str                  = t_join(?alloc, api_dir, "doctest/main.md");
     val page_r: res[str, fs.FsError] = fs.read_string(?alloc, pagep);
