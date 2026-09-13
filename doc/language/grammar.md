@@ -55,10 +55,9 @@ token ::= IDENT
         | ERROR    (* emitted for an unexpected character, see below *)
 
 punctuation ::= "(" | ")" | "{" | "}" | "[" | "]"
-              | ";" | ":" | "," | "." | "?" | "@" | "$" | "`"
+              | ";" | ":" | "," | "." | "?" | "@" | "$"
               | "#["    (* attribute-open: "#" immediately followed by "[" *)
               | "::" | ":~" | ":>" | "..."
-              | ":^"    (* lexed only so the parser can refuse it by name, see cast *)
 
 operator ::= "+" | "-" | "*" | "/" | "%"
            | "&" | "|" | "^" | "~"
@@ -209,11 +208,9 @@ none of the token forms above is an **unexpected character**. The lexer
 records a `LEX_ERR_UNEXPECTED_CHAR`, emits a one-byte `ERROR` token
 (`KIND_ERROR`) for it, and continues.
 
-The backtick `` ` `` is a real punctuation token (`KIND_BACKTICK`) but has no
-grammar production: it delimited decorators through v2.3.0 and was removed in
-v2.4.0, so a backtick at decorator position is now a migration error. `#[` is the
-two-byte attribute-open token (`KIND_ATTR_OPEN`) that opens a decorator (see
-[Decorators](#decorators) below).
+The backtick `` ` `` is not a token: it is an unexpected character wherever it
+appears. `#[` is the two-byte attribute-open token (`KIND_ATTR_OPEN`) that
+opens a decorator (see [Decorators](#decorators) below).
 
 
 ## Module
@@ -247,8 +244,8 @@ decorated-decl ::= { decorator } decl
   full list (`symbol`, `library`, `inline`, `noinline`, `align`, `packed`,
   `section`, `oblivious`, `scalar`, `naked`, `embed`, and the shader and
   target-type directives) is in [decorators.md](decorators.md).
-- A backtick form (`` `name(args)` ``) existed through v2.3.0 and was removed in
-  v2.4.0; a backtick at decorator position is a migration error.
+- `#[...]` is the only decorator surface; a backtick is an unexpected
+  character.
 
 
 ## Declarations
@@ -345,9 +342,10 @@ typed-name ::= [ "$" ] IDENT ":" type
   parameters are the fixed arity and a call may pass further arguments, placed by
   the target's C variadic rules (see
   [ext-fun.md](ext-fun.md#c-variadic-imports)). It is accepted only on an `ext`
-  declaration and only after at least one fixed parameter. Anywhere else it is the
-  C-style marker **removed in v2.0.0**, rejected with a migration diagnostic that
-  names both surviving forms. (A function *pointer type* also carries `...`; see
+  declaration and only after at least one fixed parameter. On any other
+  declaration a bare `...` is not a parameter and the parser reports the
+  missing parameter name; a comptime variadic pack is a named parameter
+  (`va: ...`). (A function *pointer type* also carries `...`; see
   `fun-type-params` below.)
 - A leading `$` on a `typed-name` marks it a **comptime value parameter**.
 
@@ -408,12 +406,11 @@ comptime-directive ::= expr-no-assign ";"
 ```
 
 - `comptime-directive` is a bare **comptime intrinsic / directive call**
-  (`$error("msg");`). The legacy attribute-write setter (`$sym.attr = value;`)
-  was removed in v2.0.0 — per-declaration codegen attributes are written as
-  `#[...]` decorators now (see [decorators.md](decorators.md)) — so a stray `=`
-  after the target is a parse error. The target is parsed at a binding power
-  above assignment so that `=` is detected rather than swallowed into the
-  expression.
+  (`$error("msg");`). Per-declaration codegen attributes are written as
+  `#[...]` decorators (see [decorators.md](decorators.md)); a directive takes
+  no `=`, so a stray one after the target is a parse error at the directive's
+  `;`. The target is parsed at a binding power above assignment so that `=`
+  is never swallowed into the expression.
 - `expr-no-assign` is `expr` parsed with the assignment operator excluded
   at the top level (binding power >= 2; see [Expressions](#expressions)). It
   still begins with the leading `$` because the first prefix atom is a
@@ -570,12 +567,9 @@ operand's type, producing a new public value (#1643, [secrecy.md](secrecy.md)).
 Its target type is required and names the operand's stripped public type; a bare
 `:>` is a parse error, and `:>` never reinterprets storage.
 
-The 4.30 spellings `:^` and `:^Type` were removed in 5.0.0. The lexer still
-produces the `:^` token so the parser can refuse it in place: `` `:^` and `:^T`
-were removed in 5.0.0; declassification is `expr:>T` and always names its
-public result type ``. The parser then consumes a following type, if any, the
-way `:>` would, so the rest of the expression parses without a cascade. All
-casts bind as postfix.
+`:^` is not a token: `x:^u32` lexes as `x`, `:`, `^`, `u32`, the postfix
+chain stops at the colon, and the enclosing statement reports its own
+terminator error there. All casts bind as postfix.
 
 Disambiguating a postfix `[`: the bracket may open a generic argument list
 (`callee[T, U](args)`, or `f[T]` naming an instance as a value) or be an index
@@ -805,14 +799,13 @@ disambiguated from a regular member access `v.name` by the `[` lookahead:
 Productions verified directly against the parser source:
 
 - **Lexical grammar** — `lexer.mach` / `token.mach`: token set (incl.
-  `KIND_BACKTICK` and `KIND_ATTR_OPEN`), operator maximal-munch,
+  `KIND_ATTR_OPEN`), operator maximal-munch,
   number/char/string scanning and escapes, comment and whitespace handling
   (incl. the `#[` attribute-open exception), the "keywords are `IDENT`s" model.
 - **Precedence ladder** — `token.infix_precedence` / `token.is_right_assoc`
   (the table is a direct transcription; only `=` is right-associative).
 - **Decorators** — `parser/grammar.mach` `parse_decorators` / `parse_one_decorator`:
-  leading `#[name(args)]` clauses (one Decorator node); a backtick at decorator
-  position is rejected as the removed surface (v2.4.0), closed directive set.
+  leading `#[name(args)]` clauses (one Decorator node), closed directive set.
 - **Declarations** — `parser/grammar.mach`: `use`, `fwd` (incl. `pub fwd`
   rejection), `fun` (generics, params, variadic `...`, named pack `name: ...`,
   comptime `$` params, optional return type, block-or-`;` body), `rec`, `uni`,

@@ -16,9 +16,8 @@ A decorator is written as an attribute:
 #[name(args)]      # directive with comptime-expr arguments
 ```
 
-> A backtick form (`` `name(args)` ``) existed through v2.3.0 and was removed in
-> v2.4.0; a backtick at decorator position is now a migration error. `#[...]` is
-> the only decorator surface.
+> `#[...]` is the only decorator surface. A backtick is not a token: one
+> anywhere in source is a lexer error.
 
 > One caveat the attribute form introduces: a line comment that begins `#[`
 > (with no space) opens an attribute. Write such a comment with a separating
@@ -596,9 +595,8 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
   absolute path is taken as written. The resolved file must lie inside the
   project root: an embed that escapes it (`../../outside.txt` from `src/`) is
   refused at the decorator (`` `embed` path escapes the project root; an
-  embedded file must live inside the project ``) and the file outside is never
-  read. 4.30 read it with a warning; 5.0.0 removed that. Keep assets under the
-  project.
+  embedded file must live inside the project and the file is not read ``) and
+  the file outside is never read. Keep assets under the project.
 - A path holding `{artifact.<id>.out}` names the output of an artifact this one
   requires through the manifest's `need`, and resolves against the **project
   root** rather than the declaring file's directory; the required artifact is

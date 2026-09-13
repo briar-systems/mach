@@ -108,11 +108,9 @@ The tag names are the target registries' own spellings, read from them
 directly; there is no second list to keep in step. A tag name the registry
 does not carry is a compile error, never a silent fold.
 
-The 4.30 alias `$mach.abi.sysv` was removed in 5.0.0. It is refused by name
-(`` `$mach.abi.sysv` was removed in 5.0.0; the registry spells this ABI
-`sysv64` ``) rather than as an unknown tag, so write `$mach.abi.sysv64`.
-`$mach.arch.mos6502` went with the deleted MOS 6502 target: the registry no
-longer carries the spelling, so it is an unknown tag.
+The x86-64 System V ABI is spelled `sysv64`, as the registry spells it;
+`$mach.abi.sysv` is an unknown tag, as is any other name the registry does not
+carry.
 
 ## Comparison
 

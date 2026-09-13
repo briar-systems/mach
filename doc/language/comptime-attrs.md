@@ -16,10 +16,9 @@ ext fun wsa_startup(ver: u16, data: *u8) i32;
 pub var cache_line: u8 = 0;
 ```
 
-A backtick form (`` `name(args)` ``) existed through v2.3.0 and was removed in
-v2.4.0; a backtick at decorator position is now a migration error. The earlier
-`$sym.attr = value;` setter form was removed in v2.0.0 in favor of decorators; a
-stray `=` after a comptime directive is also a parse error.
+A backtick is not a token: one anywhere in source is a lexer error. A comptime
+directive takes no `=`; a stray one is a parse error at the directive's
+terminator.
 
 ## See also
 
