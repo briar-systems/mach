@@ -125,6 +125,8 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, alloc: 
     ctx.param_count       = fn.param_count;
     ctx.instr_vregs       = nil;
     ctx.slot_key_vregs    = nil;
+    ctx.gep_fold          = nil;
+    ctx.gep_mem           = nil;
     ctx.instr_count       = fn.instr_len;
     ctx.interner          = interner;
     ctx.sret_vreg         = mir.MIR_VREG_NIL;
@@ -153,6 +155,8 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, alloc: 
     }
     mf.blocks    = rb.ok;
     mf.block_cap = fn.block_count;
+
+    lctx.seed_gep_mems(?ctx, fn, pure_gep_mem);
 
     var bi: u32 = 0;
     for (bi < fn.block_count) {
@@ -1005,6 +1009,82 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
     ret lctx.push_instr(ctx, mb, mi);
 }
 
+# the exponent of a divisor that is a power of two at least 2, or none
+fun pow2_exponent(v: value.Value, bits: u32) opt[u32] {
+    if (v.kind != value.VAL_CONST_INT) { ret opt[u32].none{}; }
+    var m: u64 = v.data.int_lit;
+    if (bits < 64)                   { m = m & ((1::u64 << bits::u64) - 1); }
+    if (m < 2 || (m & (m - 1)) != 0) { ret opt[u32].none{}; }
+    var k: u32 = 0;
+    for ((1::u64 << k::u64) != m) { k = k + 1; }
+    ret opt[u32].some{k};
+}
+
+fun div_temp(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, op: mir.MirOpcode, a: mir.MirOperand, b: mir.MirOperand, w: u8) res[mir.MirOperand, fail.Fail] {
+    val tr: res[mir.VRegId, fail.Fail] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
+    if (sel tr.err) { ret res[mir.MirOperand, fail.Fail].err{tr.err}; }
+    val rop: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](ctx.alloc, 3::usize);
+    if (sel rop.err) { ret res[mir.MirOperand, fail.Fail].err{fail.refused(rop.err)}; }
+    val ops: *mir.MirOperand = rop.ok;
+    ops[0] = mir.op_vreg(tr.ok);
+    ops[1] = a;
+    ops[2] = b;
+    var mi: mir.MirInstr   = mir.instr(op, ops, 3, w, w);
+    val pd: err[fail.Fail] = lctx.push_instr(ctx, mb, mi);
+    if (sel pd.err) { ret res[mir.MirOperand, fail.Fail].err{pd.err}; }
+    ret res[mir.MirOperand, fail.Fail].ok{mir.op_vreg(tr.ok)};
+}
+
+# a division or remainder by a power of two is shifts and masks. the signed
+# forms round toward zero by adding the sign-extended low bits of the divisor
+# before the arithmetic shift, the way every C compiler does
+fun lower_div_pow2(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, dst: mir.VRegId, k: u32) err[fail.Fail] {
+    val signed: bool = inst.kind == instr.OP_DIV_S || inst.kind == instr.OP_REM_S;
+    val is_rem: bool = inst.kind == instr.OP_REM_S || inst.kind == instr.OP_REM_U;
+
+    val natural_w: u8  = lctx.op_width_of(ctx, inst.ty);
+    val w:         u8  = lctx.clamp_alu_width(ctx.tgt.model.alu_min_width, natural_w);
+    val bits:      i64 = w::i64 * 8;
+
+    val dividend_r: res[mir.MirOperand, fail.Fail] = lctx.lower_value(ctx, inst.operands[0]);
+    if (sel dividend_r.err) { ret err[fail.Fail].err{dividend_r.err}; }
+    val nvr: res[mir.VRegId, fail.Fail] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
+    if (sel nvr.err) { ret err[fail.Fail].err{nvr.err}; }
+    val ne: err[fail.Fail] = emit_promote(ctx, mb, mir.op_vreg(nvr.ok), dividend_r.ok, w, natural_w, signed);
+    if (sel ne.err) { ret ne; }
+    val n: mir.MirOperand = mir.op_vreg(nvr.ok);
+
+    var out: mir.MirOperand = n;
+    if (!signed) {
+        var r: res[mir.MirOperand, fail.Fail];
+        if (is_rem)    { r = div_temp(ctx, mb, mir.MIR_AND, n, mir.op_imm(((1::u64 << k::u64) - 1)::i64), w); }
+        or             { r = div_temp(ctx, mb, mir.MIR_SHR_U, n, mir.op_imm(k::i64), w); }
+        if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+        out = r.ok;
+    }
+    or {
+        val rs: res[mir.MirOperand, fail.Fail] = div_temp(ctx, mb, mir.MIR_SHR_S, n, mir.op_imm(bits - 1), w);
+        if (sel rs.err) { ret err[fail.Fail].err{rs.err}; }
+        val rb: res[mir.MirOperand, fail.Fail] = div_temp(ctx, mb, mir.MIR_SHR_U, rs.ok, mir.op_imm(bits - k::i64), w);
+        if (sel rb.err) { ret err[fail.Fail].err{rb.err}; }
+        val ra: res[mir.MirOperand, fail.Fail] = div_temp(ctx, mb, mir.MIR_ADD, n, rb.ok, w);
+        if (sel ra.err) { ret err[fail.Fail].err{ra.err}; }
+        if (is_rem) {
+            val rm: res[mir.MirOperand, fail.Fail] = div_temp(ctx, mb, mir.MIR_AND, ra.ok, mir.op_imm((0 - (1::i64 << k::i64))), w);
+            if (sel rm.err) { ret err[fail.Fail].err{rm.err}; }
+            val rr: res[mir.MirOperand, fail.Fail] = div_temp(ctx, mb, mir.MIR_SUB, n, rm.ok, w);
+            if (sel rr.err) { ret err[fail.Fail].err{rr.err}; }
+            out = rr.ok;
+        }
+        or {
+            val rq: res[mir.MirOperand, fail.Fail] = div_temp(ctx, mb, mir.MIR_SHR_S, ra.ok, mir.op_imm(k::i64), w);
+            if (sel rq.err) { ret err[fail.Fail].err{rq.err}; }
+            out = rq.ok;
+        }
+    }
+    ret lctx.emit_mov_w(ctx, mb, mir.op_vreg(dst), out, natural_w);
+}
+
 fun lower_div(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) err[fail.Fail] {
     if (inst.operand_count < 2) {
         ret err[fail.Fail].err{fail.message("mir.lower_ir: division missing dividend or divisor operand")};
@@ -1013,6 +1093,8 @@ fun lower_div(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, 
     if (mir.vreg_is_nil(dst)) {
         ret err[fail.Fail].err{fail.message("mir.lower_ir: division defines no result vreg")};
     }
+    val kp: opt[u32] = pow2_exponent(inst.operands[1], lctx.op_width_of(ctx, inst.ty)::u32 * 8);
+    if (sel kp.some) { ret lower_div_pow2(ctx, mb, inst, dst, kp.some); }
     val acc_reg: i32 = ctx.tgt.model.div_reg;
     val hi_reg:  i32 = ctx.tgt.model.div_hi_reg;
     if (acc_reg < 0 || hi_reg < 0) {
@@ -1619,6 +1701,87 @@ fun agg_pointer_mem(ctx: *lctx.LowerCtx, v: value.Value, disp: i64) res[mir.MirO
     ret res[mir.MirOperand, fail.Fail].ok{op};
 }
 
+# the memory operand of an element address that needs no instruction of its
+# own: a register, frame or symbol base, constant indices folded into the
+# displacement, and at most one runtime index whose stride the addressing
+# mode scales, on a register base. blocks are lowered in index order and the
+# address may be defined after its uses, so a folded address is computed
+# from the IR alone, never from lowered state
+pub fun pure_gep_mem(ctx: *lctx.LowerCtx, inst: *instr.Instruction) opt[mir.MirOperand] {
+    if (inst.operand_count < 2 || inst.aux_ty == ir_type.IRT_NIL) { ret opt[mir.MirOperand].none{}; }
+    val base_r: res[mir.MirOperand, fail.Fail] = lctx.mem_operand_of_plain(ctx, inst.operands[0]);
+    if (sel base_r.err) { ret opt[mir.MirOperand].none{}; }
+    val base: mir.MirOperand = base_r.ok;
+    if (base.kind != mir.MIR_OP_MEM && base.kind != mir.MIR_OP_SYM) { ret opt[mir.MirOperand].none{}; }
+
+    var disp:      i64              = 0;
+    var idx_vreg:  mir.VRegId       = mir.MIR_VREG_NIL;
+    var idx_scale: u8               = 0;
+    var cur_ty:    ir_type.IrTypeId = inst.aux_ty;
+    var k:         u32              = 1;
+    for (k < inst.operand_count) {
+        val v:         value.Value = inst.operands[k];
+        var stride:    u64         = 0;
+        var is_struct: bool        = false;
+        if (k == 1) {
+            stride = ir_type.byte_size_for_machine(ctx.types, cur_ty, ctx.layout)::u64;
+        }
+        or {
+            val ct_opt: opt[*ir_type.IrType] = ir_type.get(ctx.types, cur_ty);
+            if (!sel ct_opt.some) { ret opt[mir.MirOperand].none{}; }
+            val ct: *ir_type.IrType = ct_opt.some;
+            if (ct.kind == ir_type.IRT_ARRAY) {
+                stride = ir_type.byte_size_for_machine(ctx.types, ct.data.array_.element, ctx.layout)::u64;
+                cur_ty = ct.data.array_.element;
+            }
+            or (ct.kind == ir_type.IRT_VECTOR) {
+                stride = ir_type.byte_size_for_machine(ctx.types, ct.data.vector_.element, ctx.layout)::u64;
+                cur_ty = ct.data.vector_.element;
+            }
+            or (ct.kind == ir_type.IRT_STRUCT || ct.kind == ir_type.IRT_UNION || ct.kind == ir_type.IRT_TAG) {
+                is_struct = true;
+            }
+            or {
+                ret opt[mir.MirOperand].none{};
+            }
+        }
+        if (is_struct) {
+            if (v.kind != value.VAL_CONST_INT) { ret opt[mir.MirOperand].none{}; }
+            val fo: res[i64, fail.Fail] = struct_field_offset(ctx, cur_ty, v.data.int_lit::u32);
+            if (sel fo.err) { ret opt[mir.MirOperand].none{}; }
+            disp = disp + fo.ok;
+            val ft: res[ir_type.IrTypeId, fail.Fail] = struct_field_type(ctx, cur_ty, v.data.int_lit::u32);
+            if (sel ft.err) { ret opt[mir.MirOperand].none{}; }
+            cur_ty = ft.ok;
+        }
+        or (v.kind == value.VAL_CONST_INT) {
+            disp = disp + (v.data.int_lit * stride)::i64;
+        }
+        or {
+            if (!mir.vreg_is_nil(idx_vreg) || !is_sib_scale(stride) || base.kind != mir.MIR_OP_MEM) { ret opt[mir.MirOperand].none{}; }
+            if (v.kind != value.VAL_INSTR && v.kind != value.VAL_PARAM)                             { ret opt[mir.MirOperand].none{}; }
+            val iv: res[mir.MirOperand, fail.Fail] = lctx.lower_value(ctx, v);
+            if (sel iv.err)                    { ret opt[mir.MirOperand].none{}; }
+            if (iv.ok.kind != mir.MIR_OP_VREG) { ret opt[mir.MirOperand].none{}; }
+            idx_vreg  = iv.ok.vreg;
+            idx_scale = stride::u8;
+        }
+        k = k + 1;
+    }
+
+    var o: mir.MirOperand = base;
+    if (base.kind == mir.MIR_OP_SYM) {
+        o.sym_off = base.sym_off + disp::i32;
+        ret opt[mir.MirOperand].some{o};
+    }
+    o.imm = base.imm + disp;
+    if (!mir.vreg_is_nil(idx_vreg)) {
+        o.index = mir.index_vreg(idx_vreg);
+        o.scale = idx_scale;
+    }
+    ret opt[mir.MirOperand].some{o};
+}
+
 fun lower_gep(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) err[fail.Fail] {
     if (inst.operand_count == 0) {
         ret err[fail.Fail].err{fail.message("mir.lower_ir: gep with no base operand")};
@@ -1710,6 +1873,8 @@ fun lower_gep(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, 
 
     val mem: res[mir.MirOperand, fail.Fail] = fold_gep_mem(ctx, mb, base, idx_vreg, idx_scale, disp);
     if (sel mem.err) { ret err[fail.Fail].err{mem.err}; }
+
+    if (lctx.gep_folds(ctx, iid)) { ret err[fail.Fail].ok{}; }
 
     val r: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
     if (sel r.err) { ret err[fail.Fail].err{fail.refused(r.err)}; }
@@ -1831,10 +1996,10 @@ fun struct_field_offset(ctx: *lctx.LowerCtx, struct_ty: ir_type.IrTypeId, ix: u3
     }
     val st: *ir_type.IrType = st_opt.some;
     if (st.kind == ir_type.IRT_TAG) {
-        if (ix >= st.data.tag_.case_count) {
-            ret res[i64, fail.Fail].err{fail.message("mir.lower_ir: gep tag case index out of range")};
+        if (ix >= ir_type.tag_field_count(ctx.types, struct_ty)) {
+            ret res[i64, fail.Fail].err{fail.message("mir.lower_ir: gep tag field index out of range")};
         }
-        ret res[i64, fail.Fail].ok{ir_type.byte_offset_for_machine(ctx.types, struct_ty, ix, ctx.layout)::i64};
+        ret res[i64, fail.Fail].ok{ir_type.tag_field_offset_for_machine(ctx.types, struct_ty, ix, ctx.layout)::i64};
     }
     if (st.kind == ir_type.IRT_UNION) {
         if (ix >= st.data.struct_.field_count) {
@@ -1858,10 +2023,10 @@ fun struct_field_type(ctx: *lctx.LowerCtx, struct_ty: ir_type.IrTypeId, ix: u32)
     }
     val st: *ir_type.IrType = st_opt.some;
     if (st.kind == ir_type.IRT_TAG) {
-        if (ix >= st.data.tag_.case_count) {
-            ret res[ir_type.IrTypeId, fail.Fail].err{fail.message("mir.lower_ir: gep tag case index out of range")};
+        if (ix >= ir_type.tag_field_count(ctx.types, struct_ty)) {
+            ret res[ir_type.IrTypeId, fail.Fail].err{fail.message("mir.lower_ir: gep tag field index out of range")};
         }
-        ret res[ir_type.IrTypeId, fail.Fail].ok{st.data.tag_.cases[ix]};
+        ret res[ir_type.IrTypeId, fail.Fail].ok{ir_type.tag_field_type(ctx.types, struct_ty, ix)};
     }
     if ((st.kind != ir_type.IRT_STRUCT && st.kind != ir_type.IRT_UNION) || ix >= st.data.struct_.field_count) {
         ret res[ir_type.IrTypeId, fail.Fail].err{fail.message("mir.lower_ir: gep struct field index out of range")};
