@@ -32,6 +32,7 @@ use me_testing: mach.lang.me.testing;
 use ver:        mach.lang.me.transform.versioning;
 use mach.lang.me.vecform;
 use mach.lang.target;
+use mach.lang.target.resolved;
 use target_testing: mach.lang.target.testing;
 use semtype:        mach.lang.type;
 
@@ -53,7 +54,9 @@ rec SplatEntry {
     vec: value.Value;
 }
 
-pub fun run(m: *ir.Module, tgt: *target.Target, float_reassoc: bool) res[bool, fail.Fail] {
+# `itn` names the constant globals a splat of a constant reads from; nil
+# keeps every splat on the stack
+pub fun run(m: *ir.Module, tgt: *target.Target, float_reassoc: bool, itn: *intern.Interner) res[bool, fail.Fail] {
     if (!tgt.model.has_v128)       { ret res[bool, fail.Fail].ok{false}; }
     if (!tgt.model.auto_vectorize) { ret res[bool, fail.Fail].ok{false}; }
 
@@ -115,7 +118,7 @@ pub fun run(m: *ir.Module, tgt: *target.Target, float_reassoc: bool) res[bool, f
             var la2: loops.LoopAnalysis = ra2.ok;
             val lx2: u32                = find_loop_by_header(?la2, headers[hi]);
             if (lx2 != ver.NONE_U32) {
-                val vectorized_r: res[bool, fail.Fail] = vectorize_one(m, tgt, fn, ?la2, lx2, ?deps[hi]);
+                val vectorized_r: res[bool, fail.Fail] = vectorize_one(m, tgt, fn, ?la2, lx2, ?deps[hi], itn);
                 if (sel vectorized_r.err) {
                     loops.dnit(?la2);
                     free_candidates(m, headers, deps, hn, cap);
@@ -557,7 +560,7 @@ fun in_increment_table(k: instruction.InstrKind, is_float: bool) bool {
     ret opdesc.has(k, opdesc.EFF_VEC_INCR_INT);
 }
 
-fun vectorize_one(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, d0: *dep.DepInfo) res[bool, fail.Fail] {
+fun vectorize_one(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, d0: *dep.DepInfo, itn: *intern.Interner) res[bool, fail.Fail] {
     val lp0:   *loops.Loop = ?la.loops[lx];
     var pred0: PredShape;
     if (!loop_shape_ok(fn, lp0, ?pred0))   { ret res[bool, fail.Fail].ok{false}; }
@@ -590,7 +593,10 @@ fun vectorize_one(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, la: *loo
     var b:    builder.Builder = builder.init(m);
     builder.set_function(?b, fn);
     builder.set_block(?b, vpre);
-    val r_539: err[fail.Fail] = builder.emit_br(?b, fast_header);
+    val rlb: res[value.Value, fail.Fail] = emit_lane_bound(?b, bound_ex, shape.lanes, iv_ty, lp0.counted.pred);
+    if (sel rlb.err) { ret res[bool, fail.Fail].err{rlb.err}; }
+    val lane_bound: value.Value    = rlb.ok;
+    val r_539:      err[fail.Fail] = builder.emit_br(?b, fast_header);
     if (sel r_539.err) { ret res[bool, fail.Fail].err{r_539.err}; }
     ver.redirect_terminator(fn, guard, fast_header, vpre);
     ver.relabel_phi_pred(fn, fast_header, guard, vpre);
@@ -682,7 +688,7 @@ fun vectorize_one(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, la: *loo
     val vset: *bool = rset.ok;
     build_vset(m, tgt, fn, ?fla, flx, fd.accesses, fd.access_count, fshape.elem_ty, fshape.is_float, true, false, pred_mask(?fpred), vset);
     retype_to_vector(fn, flp, vset, vec_ty);
-    val rsp: err[fail.Fail] = splat_invariants(m, tgt, fn, flp, vset, vpre, fast_header, ?fshape, vec_ty);
+    val rsp: err[fail.Fail] = splat_invariants(m, tgt, fn, flp, vset, vpre, fast_header, ?fshape, vec_ty, itn);
     A.deallocate[bool](m.alloc, vset, fn.instr_len::usize);
     if (sel rsp.err) {
         A.deallocate[id.BlockId](m.alloc, fbody, body_len::usize);
@@ -701,27 +707,13 @@ fun vectorize_one(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, la: *loo
         ret res[bool, fail.Fail].err{rss.err};
     }
 
-    var le_kind: instruction.InstrKind = instruction.OP_CMP_LE_S;
-    if (flp.counted.pred == instruction.OP_CMP_LT_U || flp.counted.pred == instruction.OP_CMP_LE_U) {
-        le_kind = instruction.OP_CMP_LE_U;
-    }
-    val rrem: res[value.Value, fail.Fail] =
-        emit_add_prepend(m, fn, fast_header, iv_phi_val, value.const_int(shape.lanes::u64, iv_ty), iv_ty, fast_cmp);
-    if (sel rrem.err) {
+    val rbt: err[fail.Fail] = rewrite_lane_bound_test(m, fn, fast_header, iv_phi_val, shape.lanes, iv_ty, lane_bound, flp.counted.pred, fast_cmp);
+    if (sel rbt.err) {
         A.deallocate[id.BlockId](m.alloc, fbody, body_len::usize);
         A.deallocate[id.BlockId](m.alloc, rem_blocks, body_len::usize);
         dep.dep_dnit(?fd);
         loops.dnit(?fla);
-        ret res[bool, fail.Fail].err{rrem.err};
-    }
-    val iv_plus_lanes: value.Value = rrem.ok;
-
-    val copt: opt[*instruction.Instruction] = ir.instruction_get(fn, fast_cmp);
-    if (sel copt.some) {
-        val cmp: *instruction.Instruction = copt.some;
-        cmp.kind        = le_kind;
-        cmp.operands[0] = iv_plus_lanes;
-        cmp.operands[1] = bound_ex;
+        ret res[bool, fail.Fail].err{rbt.err};
     }
 
     ver.redirect_terminator(fn, fast_header, merge, rem_header);
@@ -831,6 +823,42 @@ fun emit_select(m: *ir.Module, fn: *ir.Function, blk: id.BlockId, mask: value.Va
 }
 
 fun emit_add_prepend(m: *ir.Module, fn: *ir.Function, blk: id.BlockId, lhs: value.Value, rhs: value.Value, ty: ir_type.IrTypeId, loc_ref: id.InstructionId) res[value.Value, fail.Fail] {
+    ret emit_binary_prepend(m, fn, blk, instruction.OP_ADD, lhs, rhs, ty, loc_ref);
+}
+
+# the vector loop's exit test: a signed loop compares the induction variable
+# against `bound - lanes` computed once in the preheader, an unsigned loop
+# keeps `iv + lanes <= bound` in the header because the subtraction could
+# wrap below zero
+fun lanes_pred_unsigned(orig_pred: instruction.InstrKind) bool {
+    ret orig_pred == instruction.OP_CMP_LT_U || orig_pred == instruction.OP_CMP_LE_U;
+}
+
+fun emit_lane_bound(b: *builder.Builder, bound_ex: value.Value, lanes: u32, iv_ty: ir_type.IrTypeId, orig_pred: instruction.InstrKind) res[value.Value, fail.Fail] {
+    if (lanes_pred_unsigned(orig_pred)) { ret res[value.Value, fail.Fail].ok{bound_ex}; }
+    ret builder.emit_sub(b, bound_ex, value.const_int(lanes::u64, iv_ty));
+}
+
+fun rewrite_lane_bound_test(m: *ir.Module, fn: *ir.Function, header: id.BlockId, iv: value.Value, lanes: u32, iv_ty: ir_type.IrTypeId, lane_bound: value.Value, orig_pred: instruction.InstrKind, cmp_id: id.InstructionId) err[fail.Fail] {
+    val unsigned: bool        = lanes_pred_unsigned(orig_pred);
+    var lhs:      value.Value = iv;
+    if (unsigned) {
+        val rl: res[value.Value, fail.Fail] = emit_binary_prepend(m, fn, header, instruction.OP_ADD, iv, value.const_int(lanes::u64, iv_ty), iv_ty, cmp_id);
+        if (sel rl.err) { ret err[fail.Fail].err{rl.err}; }
+        lhs = rl.ok;
+    }
+    val copt: opt[*instruction.Instruction] = ir.instruction_get(fn, cmp_id);
+    if (sel copt.some) {
+        val cmp: *instruction.Instruction = copt.some;
+        if (unsigned) { cmp.kind = instruction.OP_CMP_LE_U; }
+        or            { cmp.kind = instruction.OP_CMP_LE_S; }
+        cmp.operands[0] = lhs;
+        cmp.operands[1] = lane_bound;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun emit_binary_prepend(m: *ir.Module, fn: *ir.Function, blk: id.BlockId, kind: instruction.InstrKind, lhs: value.Value, rhs: value.Value, ty: ir_type.IrTypeId, loc_ref: id.InstructionId) res[value.Value, fail.Fail] {
     val rops: res[ir.OperandArray, fail.Fail] = ir.operands_alloc(m, 2);
     if (sel rops.err) { ret res[value.Value, fail.Fail].err{rops.err}; }
     val arr: ir.OperandArray = rops.ok;
@@ -838,7 +866,7 @@ fun emit_add_prepend(m: *ir.Module, fn: *ir.Function, blk: id.BlockId, lhs: valu
     arr.ops[1] = rhs;
 
     var ni: instruction.Instruction;
-    ni.kind          = instruction.OP_ADD;
+    ni.kind          = kind;
     ni.ty            = ty;
     ni.operands      = arr.ops;
     ni.operand_count = 2;
@@ -901,7 +929,7 @@ fun body_operand_slots(fn: *ir.Function, lp: *loops.Loop) u32 {
     ret n;
 }
 
-fun splat_invariants(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, lp: *loops.Loop, vset: *bool, vpre: id.BlockId, fast_header: id.BlockId, shape: *MapShape, vec_ty: ir_type.IrTypeId) err[fail.Fail] {
+fun splat_invariants(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, lp: *loops.Loop, vset: *bool, vpre: id.BlockId, fast_header: id.BlockId, shape: *MapShape, vec_ty: ir_type.IrTypeId, itn: *intern.Interner) err[fail.Fail] {
     val cap: u32 = body_operand_slots(fn, lp);
     if (cap == 0) { ret err[fail.Fail].ok{}; }
     val rss: res[*SplatSite, A.Error] = A.allocate[SplatSite](m.alloc, cap::usize);
@@ -964,7 +992,7 @@ fun splat_invariants(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, lp: *
     var i:  u32 = 0;
     for (i < n) {
         if (splat_lookup(cache, cn, sites[i].val) == ver.NONE_U32) {
-            val rsv: res[value.Value, fail.Fail] = emit_splat(?b, sites[i].val, arr_ty, vec_ty, shape.lanes);
+            val rsv: res[value.Value, fail.Fail] = emit_splat(?b, sites[i].val, arr_ty, vec_ty, shape.lanes, tgt, itn);
             if (sel rsv.err) {
                 splat_free(m, sites, cache, cap);
                 ret err[fail.Fail].err{rsv.err};
@@ -1010,7 +1038,14 @@ fun splat_lookup(cache: *SplatEntry, cn: u32, v: value.Value) u32 {
     ret ver.NONE_U32;
 }
 
-fun emit_splat(b: *builder.Builder, v: value.Value, arr_ty: ir_type.IrTypeId, vec_ty: ir_type.IrTypeId, lanes: u32) res[value.Value, fail.Fail] {
+# a splat of a constant is one load from a read-only global holding the
+# lanes; any other splat is built on the stack
+fun emit_splat(b: *builder.Builder, v: value.Value, arr_ty: ir_type.IrTypeId, vec_ty: ir_type.IrTypeId, lanes: u32, tgt: *target.Target, itn: *intern.Interner) res[value.Value, fail.Fail] {
+    if (itn != nil && (v.kind == value.VAL_CONST_INT || v.kind == value.VAL_CONST_FLOAT)) {
+        val rc: res[value.Value, fail.Fail] = const_splat_global(b.m, v, arr_ty, lanes, tgt, itn);
+        if (sel rc.err) { ret rc; }
+        ret builder.emit_load(b, rc.ok, vec_ty);
+    }
     val rit: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?b.m.types, 64);
     if (sel rit.err) { ret res[value.Value, fail.Fail].err{rit.err}; }
     val idx_ty: ir_type.IrTypeId            = rit.ok;
@@ -1026,6 +1061,88 @@ fun emit_splat(b: *builder.Builder, v: value.Value, arr_ty: ir_type.IrTypeId, ve
         lane = lane + 1;
     }
     ret builder.emit_load(b, slot, vec_ty);
+}
+
+fun const_splat_global(m: *ir.Module, v: value.Value, arr_ty: ir_type.IrTypeId, lanes: u32, tgt: *target.Target, itn: *intern.Interner) res[value.Value, fail.Fail] {
+    val elem_bytes: u32 = ir_type.byte_size_for_machine(?m.types, v.ty, resolved.layout_machine(tgt));
+    if (elem_bytes == 0 || elem_bytes > 8) { ret res[value.Value, fail.Fail].err{fail.message("vectorize: splat lane width is not a scalar width")}; }
+    var bits: u64 = 0;
+    if (v.kind == value.VAL_CONST_INT) { bits = v.data.int_lit; }
+    or (elem_bytes == 4) {
+        val f: f32 = v.data.float_lit::f32;
+        bits = (f:~u32)::u64;
+    }
+    or {
+        bits = v.data.float_lit:~u64;
+    }
+
+    val total: u32               = elem_bytes * lanes;
+    val rb:    res[*u8, A.Error] = A.allocate[u8](m.alloc, total::usize);
+    if (sel rb.err) { ret res[value.Value, fail.Fail].err{fail.refused(rb.err)}; }
+    val bytes: *u8 = rb.ok;
+    var i:     u32 = 0;
+    for (i < total) {
+        val k: u32 = i % elem_bytes;
+        bytes[i] = ((bits >> (k::u64 * 8)) & 0xFF)::u8;
+        i        = i + 1;
+    }
+
+    val rp: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
+    if (sel rp.err) { ret res[value.Value, fail.Fail].err{rp.err}; }
+    val init: value.Value = value.const_bytes(bytes, total, arr_ty);
+
+    var name_buf: [32]u8;
+    val prefix:   str   = ".Lsplat.";
+    var n:        usize = 0;
+    val pp:       *u8   = prefix::*u8;
+    for (pp[n] != 0) {
+        name_buf[n] = pp[n];
+        n           = n + 1;
+    }
+    var idx:    u32   = m.global_len;
+    var digits: [10]u8;
+    var nd:     usize = 0;
+    for (nd == 0 || idx > 0) {
+        digits[nd] = ('0'::u32 + idx % 10)::u8;
+        idx        = idx / 10;
+        nd         = nd + 1;
+    }
+    for (nd > 0) {
+        nd          = nd - 1;
+        name_buf[n] = digits[nd];
+        n           = n + 1;
+    }
+    val rn: res[intern.StrId, A.Error] = intern.intern_bytes(itn, (?name_buf[0])::str, n);
+    if (sel rn.err) { ret res[value.Value, fail.Fail].err{fail.refused(rn.err)}; }
+
+    if (m.global_len == m.global_cap) {
+        var new_cap: u32 = m.global_cap * 2;
+        if (new_cap == 0) { new_cap = 4; }
+        val rg: res[*ir.Global, A.Error] = A.reallocate[ir.Global](m.alloc, m.globals, m.global_cap::usize, new_cap::usize);
+        if (sel rg.err) { ret res[value.Value, fail.Fail].err{fail.refused(rg.err)}; }
+        m.globals    = rg.ok;
+        m.global_cap = new_cap;
+    }
+    val gix: u32 = m.global_len;
+    var g:   ir.Global;
+    g.name         = rn.ok;
+    g.ty           = arr_ty;
+    g.init         = init;
+    g.is_mut       = false;
+    g.is_pub       = false;
+    g.is_extern    = false;
+    g.is_import    = false;
+    g.is_local     = true;
+    g.is_embed     = false;
+    g.align        = 16;
+    g.section      = intern.STR_NIL;
+    g.iface        = 0;
+    g.iface_a      = 0;
+    g.iface_b      = 0;
+    g.iface_flags  = 0;
+    m.globals[gix] = g;
+    m.global_len   = gix + 1;
+    ret res[value.Value, fail.Fail].ok{value.global(gix, rp.ok)};
 }
 
 fun latch_update(fn: *ir.Function, pid: id.InstructionId, latch: id.BlockId) id.InstructionId {
@@ -1294,8 +1411,11 @@ fun vectorize_reduction(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, la
     val vacc0: value.Value                 = rv0.ok;
     val rbe:   res[value.Value, fail.Fail] = ver.emit_exclusive_bound(?b, ?lp.counted);
     if (sel rbe.err) { ret res[bool, fail.Fail].err{rbe.err}; }
-    val bound_ex: value.Value    = rbe.ok;
-    val r_1137:   err[fail.Fail] = builder.emit_br(?b, header);
+    val bound_ex: value.Value                 = rbe.ok;
+    val rlb:      res[value.Value, fail.Fail] = emit_lane_bound(?b, bound_ex, lanes, iv_ty, orig_pred);
+    if (sel rlb.err) { ret res[bool, fail.Fail].err{rlb.err}; }
+    val lane_bound: value.Value    = rlb.ok;
+    val r_1137:     err[fail.Fail] = builder.emit_br(?b, header);
     if (sel r_1137.err) { ret res[bool, fail.Fail].err{r_1137.err}; }
     ver.redirect_terminator(fn, preheader, header, vpre);
     ver.relabel_phi_pred(fn, header, preheader, vpre);
@@ -1330,22 +1450,8 @@ fun vectorize_reduction(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, la
 
     step_iv_by_lanes(fn, iv_upd, lanes, iv_ty);
 
-    var le_kind: instruction.InstrKind = instruction.OP_CMP_LE_S;
-    if (orig_pred == instruction.OP_CMP_LT_U || orig_pred == instruction.OP_CMP_LE_U) {
-        le_kind = instruction.OP_CMP_LE_U;
-    }
-    val rrem: res[value.Value, fail.Fail] =
-        emit_add_prepend(m, fn, header, value.instr(iv_phi, iv_ty), value.const_int(lanes::u64, iv_ty), iv_ty, cmp_id);
-    if (sel rrem.err) { ret res[bool, fail.Fail].err{rrem.err}; }
-    val iv_plus_lanes: value.Value = rrem.ok;
-
-    val copt: opt[*instruction.Instruction] = ir.instruction_get(fn, cmp_id);
-    if (sel copt.some) {
-        val cmp: *instruction.Instruction = copt.some;
-        cmp.kind        = le_kind;
-        cmp.operands[0] = iv_plus_lanes;
-        cmp.operands[1] = bound_ex;
-    }
+    val rbt: err[fail.Fail] = rewrite_lane_bound_test(m, fn, header, value.instr(iv_phi, iv_ty), lanes, iv_ty, lane_bound, orig_pred, cmp_id);
+    if (sel rbt.err) { ret res[bool, fail.Fail].err{rbt.err}; }
 
     val rpr: err[fail.Fail] = ir.preds_rebuild(m, fn);
     if (sel rpr.err) { ret res[bool, fail.Fail].err{rpr.err}; }
@@ -1580,6 +1686,8 @@ fun operand0_is_add(fn: *ir.Function, iid: id.InstructionId) bool {
     ret aopt.some.kind == instruction.OP_ADD;
 }
 
+# the vector loop's exit compare: an unsigned loop adds the lane count on the
+# left, a signed loop subtracts it from the bound on the right
 fun find_add_fed_counted_cmp(fn: *ir.Function, out_cmp: *id.InstructionId) bool {
     var i: u32 = 0;
     for (i < fn.instr_len) {
@@ -1587,7 +1695,8 @@ fun find_add_fed_counted_cmp(fn: *ir.Function, out_cmp: *id.InstructionId) bool 
         val opt_: opt[*instruction.Instruction] = ir.instruction_get(fn, iid);
         if (sel opt_.some) {
             val inst: *instruction.Instruction = opt_.some;
-            if ((inst.kind == instruction.OP_CMP_LE_S || inst.kind == instruction.OP_CMP_LE_U) && operand0_is_add(fn, iid)) {
+            if ((inst.kind == instruction.OP_CMP_LE_S || inst.kind == instruction.OP_CMP_LE_U)
+                && (operand0_is_add(fn, iid) || operand1_is_sub(fn, iid))) {
                 @out_cmp = iid;
                 ret true;
             }
@@ -1595,6 +1704,16 @@ fun find_add_fed_counted_cmp(fn: *ir.Function, out_cmp: *id.InstructionId) bool 
         i = i + 1;
     }
     ret false;
+}
+
+fun operand1_is_sub(fn: *ir.Function, iid: id.InstructionId) bool {
+    val opt_: opt[*instruction.Instruction] = ir.instruction_get(fn, iid);
+    if (sel opt_.none) { ret false; }
+    val inst: *instruction.Instruction = opt_.some;
+    if (inst.operand_count < 2 || inst.operands[1].kind != value.VAL_INSTR) { ret false; }
+    val opt_src: opt[*instruction.Instruction] = ir.instruction_get(fn, inst.operands[1].data.instr);
+    if (sel opt_src.none) { ret false; }
+    ret opt_src.some.kind == instruction.OP_SUB;
 }
 
 fun run_axpy_signedness(use_unsigned: bool, want_kind: instruction.InstrKind) i32 {
@@ -1644,7 +1763,7 @@ fun run_axpy_signedness(use_unsigned: bool, want_kind: instruction.InstrKind) i3
         ret 1;
     }
 
-    val changed_r: res[bool, fail.Fail] = run(?m, ?tgt, false);
+    val changed_r: res[bool, fail.Fail] = run(?m, ?tgt, false, nil);
     if (sel changed_r.err) {
         ir.dnit(?m);
         ret 1;
@@ -1849,7 +1968,7 @@ fun run_reduction_signedness(use_unsigned: bool, want_kind: instruction.InstrKin
         ret 1;
     }
 
-    val changed_r: res[bool, fail.Fail] = run(?m, ?tgt, false);
+    val changed_r: res[bool, fail.Fail] = run(?m, ?tgt, false, nil);
     if (sel changed_r.err) {
         ir.dnit(?m);
         ret 1;
@@ -2034,7 +2153,7 @@ test "mach.lang.me.transform.vectorize:decline_leaves_function_untouched" {
     val instrs_before: u32 = fn.instr_len;
 
     var code: i32                  = 0;
-    val rr:   res[bool, fail.Fail] = run(?m, ?tgt, false);
+    val rr:   res[bool, fail.Fail] = run(?m, ?tgt, false, nil);
     if (sel rr.err) { code = 1; }
     or (sel rr.ok) {
         if (rr.ok)                           { code = 1; }
@@ -2336,7 +2455,7 @@ fun probe_build(a: *me_testing.Attempt, m: *ir.Module) i32 {
 }
 
 fun probe_transform(a: *me_testing.Attempt, m: *ir.Module, workspace: *scratch.Workspace) err[fail.Fail] {
-    val r: res[bool, fail.Fail] = run(m, a.target, false);
+    val r: res[bool, fail.Fail] = run(m, a.target, false, nil);
     if (sel r.err) { ret err[fail.Fail].err{r.err}; }
     ret err[fail.Fail].ok{};
 }
