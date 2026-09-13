@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.0.2] - 2026-09-13
+
+### Fixed
+
+- The editor analyzes a buffer standalone when its project cannot be loaded before the frontend runs (a manifest that does not parse, a refused load), carrying the failure in `AnalysisResult.failure` and answering the buffer's own tree, resolve result and standing; a buffer under a loadable manifest still goes through the project (#3343).
+
 ## [5.0.1] - 2026-09-13
 
 ### Added
