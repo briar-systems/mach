@@ -16,7 +16,7 @@ spec.loader.exec_module(verify)
 class SeedGuards(unittest.TestCase):
     def test_checksum_requires_one_matching_entry(self):
         with tempfile.TemporaryDirectory() as directory:
-            archive = Path(directory) / 'mach-4.30.0-x86_64-linux.tar.gz'
+            archive = Path(directory) / 'mach-4.99.0-x86_64-linux.tar.gz'
             archive.write_bytes(b'published archive')
             digest = verify.hashlib.sha256(archive.read_bytes()).hexdigest()
             valid = digest + '  ' + archive.name + '\n'
@@ -44,16 +44,16 @@ class SeedGuards(unittest.TestCase):
             self.assertIn('FileNotFoundError',missing.stderr)
 
     def test_published_metadata_requires_exact_unique_assets(self):
-        asset = 'mach-4.30.0-x86_64-linux.tar.gz'
-        metadata = dict(tag_name='v4.30.0', draft=False, prerelease=False, published_at='2026-09-07',
+        asset = 'mach-4.99.0-x86_64-linux.tar.gz'
+        metadata = dict(tag_name='v4.99.0', draft=False, prerelease=False, published_at='2026-09-07',
                         assets=[dict(name=asset), dict(name='SHA256SUMS')])
-        self.assertEqual(verify.select_release(metadata, 'v4.30.0', 'x86_64-linux', 'tar.gz'), ('v4.30.0', asset))
+        self.assertEqual(verify.select_release(metadata, 'v4.99.0', 'x86_64-linux', 'tar.gz'), ('v4.99.0', asset))
         for change in [dict(draft=True), dict(prerelease=True), dict(published_at=None),
-                       dict(tag_name='v4.26.5'), dict(assets=[]),
+                       dict(tag_name='v5.0.0'), dict(assets=[]),
                        dict(assets=metadata['assets'] + [dict(name=asset)]),
                        dict(assets=metadata['assets'] + [dict(name='SHA256SUMS')])]:
             with self.assertRaises(ValueError):
-                verify.select_release(dict(metadata, **change), 'v4.30.0', 'x86_64-linux', 'tar.gz')
+                verify.select_release(dict(metadata, **change), 'v4.99.0', 'x86_64-linux', 'tar.gz')
 
     def test_installed_version_requires_success_without_diagnostics(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -64,12 +64,12 @@ class SeedGuards(unittest.TestCase):
             archive.write_bytes(b'archive')
             (directory / 'SHA256SUMS').write_text(verify.hashlib.sha256(b'archive').hexdigest() + '  fixture.tar.gz\n')
             with patch.dict(os.environ, GITHUB_OUTPUT=str(directory / 'output')):
-                for code, out, err in [(1,'4.30.0\n',''), (0,'4.26.5\n',''), (0,'4.30.0\n','warning')]:
+                for code, out, err in [(1,'4.99.0\n',''), (0,'5.0.0\n',''), (0,'4.99.0\n','warning')]:
                     with patch.object(verify.subprocess, 'run', return_value=subprocess.CompletedProcess([],code,out,err)):
-                        with self.assertRaises(ValueError): verify.installed(directory,'v4.30.0',archive.name)
-                with patch.object(verify.subprocess, 'run', return_value=subprocess.CompletedProcess([],0,'4.30.0\n','')):
-                    verify.installed(directory,'v4.30.0',archive.name)
-            self.assertEqual(json.loads((directory / 'provenance.json').read_text())['version'],'4.30.0')
+                        with self.assertRaises(ValueError): verify.installed(directory,'v4.99.0',archive.name)
+                with patch.object(verify.subprocess, 'run', return_value=subprocess.CompletedProcess([],0,'4.99.0\n','')):
+                    verify.installed(directory,'v4.99.0',archive.name)
+            self.assertEqual(json.loads((directory / 'provenance.json').read_text())['version'],'4.99.0')
 
 
 if __name__ == '__main__':
