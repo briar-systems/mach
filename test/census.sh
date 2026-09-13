@@ -33,6 +33,7 @@ census() {
             BEGIN { depth = 0; intest = 0; pending = "" }
             {
                 line = $0
+                if (intest == 1 && line ~ /^(test[ \t]+"|(pub[ \t]+)?(fun|rec|tag|def|val|var|use)[ \t])/) { intest = 0 }
                 if (intest == 0 && (line ~ /^test[ \t]+"/ || line ~ /^(pub[ \t]+)?fun[ \t]+u?t_/)) { intest = 1; depth = 0 }
                 if (intest == 0) {
                     out = line
@@ -264,23 +265,67 @@ if want real-bools; then
 fi
 
 if want catalog-defaults; then
-    # #3124: a closed catalog whose members come from input or a cross-module
-    # product never answers an unknown member with a default. every production
-    # function that takes a type listed in test/census/input-catalogs.txt,
-    # branches on that parameter, and ends with an unconditional literal
-    # return is a default-picking site and fails the census.
-    types=$(grep -vE '^(#|$)' "$root/test/census/input-catalogs.txt" | tr '\n' '|' | sed 's/|$//')
+    # #3124: no closed catalog answers an unknown member with a default. a
+    # catalog is every integer typedef under src/ with two or more literal
+    # members; an id (sentinel members only) and a bit set (every member a
+    # power of two) are not catalogs and are set apart by that shape. every
+    # production function that takes a catalog type, branches on that
+    # parameter, and ends with an unconditional literal return is a
+    # default-picking site unless the same file records the function as a
+    # partition: a test named `<fn>:partition_<Catalog>` that names every
+    # member of the catalog, which the census checks, so a member added later
+    # fails the census until the test classifies it.
+    # test/census/catalog-exceptions.txt lists a catalog the census skips
+    # (none today).
+    skip=$(grep -vE '^(#|$)' "$root/test/census/catalog-exceptions.txt" | tr '\n' '|' | sed 's/|$//')
+    types=$(find "$root/src" -name '*.mach' | sort | while IFS= read -r f; do
+        awk '
+            /^(pub[ \t]+)?def[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*:[ \t]*(u8|u16|u32|u64|i8|i16|i32|i64|usize)[ \t]*;/ {
+                name=$0; sub(/^(pub[ \t]+)?def[ \t]+/,"",name); sub(/[ \t]*:.*$/,"",name); defs[name]=1
+            }
+            /^(pub[ \t]+)?val[ \t]+[A-Z][A-Z0-9_]*[ \t]*:[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*=[ \t]*[^;]+;/ {
+                l=$0; sub(/^(pub[ \t]+)?val[ \t]+[A-Z][A-Z0-9_]*[ \t]*:[ \t]*/,"",l)
+                t=l; sub(/[ \t]*=.*$/,"",t)
+                v=l; sub(/^[^=]*=[ \t]*/,"",v); sub(/[ \t]*;.*$/,"",v)
+                n[t]++
+                if (v ~ /^0[xX]/) { hex[t]++; v=sprintf("%d", strtonum(v)) }
+                if (v ~ /^[0-9]+$/) { lit[t]++; x=v+0; if (x>0 && int(x)==x) { p=x; while (p>1 && p%2==0) p=p/2; if (p==1) pow2[t]++ } }
+            }
+            END {
+                for (t in defs) {
+                    if (n[t] < 2) continue
+                    if (hex[t]==n[t]) continue
+                    if (n[t] >= 3 && pow2[t] == lit[t] && lit[t] == n[t]) continue
+                    print t
+                }
+            }
+        ' "$f"
+    done | sort -u | grep -vE "^(${skip:-__none__})$" | tr '\n' '|' | sed 's/|$//')
+    ncat=$(printf '%s' "$types" | tr '|' '\n' | wc -l | tr -d ' ')
     : > "$tmp"
+    parts=$(mktemp)
     find "$root/src" -name '*.mach' | sort | while IFS= read -r f; do
         rel=${f#"$root"/}
-        awk -v types="$types" '
-            # a production function that takes a listed catalog type, branches on that
-            # parameter, and ends with an unconditional literal return picks a default
-            BEGIN { fn=""; depth=0; intest=0; sig=""; insig=0 }
+        awk -v types="$types" -v parts="$parts" -v rel="$rel" '
+            # a production function that takes a catalog type, branches on that
+            # parameter, and ends with an unconditional literal return picks a
+            # default; a `<fn>:partition_<Type>` test in the file records it as a
+            # partition instead
+            BEGIN { fn=""; depth=0; intest=0; sig=""; insig=0; nd=0 }
             {
                 line=$0
+                # a column-0 declaration ends any test block: brace counting drifts
+                # over string literals that spell braces
+                if (intest==1 && line ~ /^(test[ \t]+"|(pub[ \t]+)?(fun|rec|tag|def|val|var|use)[ \t])/) { intest=0; if (curtest!="") { tend[curtest]=NR-1; curtest="" } }
+                if (intest==0 && line ~ /^test[ \t]+"/) {
+                    tn=line; sub(/^test[ \t]+"/,"",tn); sub(/".*$/,"",tn)
+                    curtest=""
+                    if (tn ~ /(^|[.:])[A-Za-z_][A-Za-z0-9_]*:partition_[A-Za-z_][A-Za-z0-9_]*$/) {
+                        key=tn; sub(/^.*[.]/,"",key); recorded[key]=1; curtest=key; tstart[key]=NR
+                    }
+                }
                 if (intest==0 && (line ~ /^test[ \t]+"/ || line ~ /^(pub[ \t]+)?fun[ \t]+u?t_/)) { intest=1; depth=0 }
-                if (intest==1) { n=gsub(/\{/,"{",line); m=gsub(/\}/,"}",line); depth+=n-m; if (depth<=0) intest=0; next }
+                if (intest==1) { n=gsub(/\{/,"{",line); m=gsub(/\}/,"}",line); depth+=n-m; if (depth<=0) { intest=0; if (curtest!="") { tend[curtest]=NR; curtest="" } }; next }
                 if (fn=="" && insig==0 && line ~ /^(pub[ \t]+)?fun[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\(/) {
                     name=line; sub(/^(pub[ \t]+)?fun[ \t]+/,"",name); sub(/[ \t]*\(.*$/,"",name)
                     start=NR; sig=line; insig=1
@@ -291,8 +336,8 @@ if want catalog-defaults; then
                         insig=0; fn=""
                         params=sig; sub(/^[^(]*\(/,"",params); sub(/\)[^)]*$/,"",params)
                         np=split(params,ps,",")
-                        pname=""
-                        for (i=1;i<=np;i++) { p=ps[i]; if (match(p, "[A-Za-z_][A-Za-z0-9_]*[ \t]*:[ \t]*([A-Za-z_][A-Za-z0-9_]*\\.)?(" types ")[ \t]*$")) { q=substr(p,RSTART,RLENGTH); sub(/[ \t]*:.*$/,"",q); sub(/^[ \t]+/,"",q); pname=q } }
+                        pname=""; ptype=""
+                        for (i=1;i<=np;i++) { p=ps[i]; if (match(p, "[A-Za-z_][A-Za-z0-9_]*[ \t]*:[ \t]*([A-Za-z_][A-Za-z0-9_]*\\.)?(" types ")[ \t]*$")) { q=substr(p,RSTART,RLENGTH); t=q; sub(/^.*[:.][ \t]*/,"",t); al=q; sub(/^[^:]*:[ \t]*/,"",al); if (al ~ /\./) { sub(/\..*$/,"",al) } else { al="" }; sub(/[ \t]*:.*$/,"",q); sub(/^[ \t]+/,"",q); pname=q; ptype=t; palias=al } }
                         if (pname!="") { fn=name; depth=0; branched=0; lastret=""; lastdepth=0 }
                     }
                     if (fn=="") next
@@ -303,20 +348,51 @@ if want catalog-defaults; then
                     d0=depth; depth+=n-m
                     if (d0==1 && line ~ /^[ \t]*ret[ \t]/) { lastret=line; sub(/^[ \t]*/,"",lastret) }
                     if (depth<=0) {
-                        if (branched==1 && lastret ~ /^ret[ \t]+("[^"]*"|[0-9]+|true|false|nil|[A-Z][A-Z0-9_.]*|[a-z_]+\.[A-Z][A-Z0-9_]*)[ \t]*;/) print start ": " name " (" pname ") " lastret
+                        if (branched==1 && lastret ~ /^ret[ \t]+((opt|res)\[[^\]]*\]\.(some|ok)\{)?("[^"]*"|[0-9]+|true|false|nil|[A-Z][A-Z0-9_.]*|[a-z_]+\.[A-Z][A-Z0-9_]*)\}?[ \t]*;/) { nd++; dl[nd]=start ": " name " (" pname ": " ptype ") " lastret; dk[nd]=name ":partition_" ptype; dt[nd]=ptype; da[nd]=palias }
                         fn=""
                     }
                 }
             }
+            END {
+                for (i=1;i<=nd;i++) {
+                    if (dk[i] in recorded) { print rel "|" dk[i] "|" dt[i] "|" da[i] "|" tstart[dk[i]] "|" tend[dk[i]] >> parts } else { print dl[i] }
+                }
+            }
         ' "$f" | sed "s|^|$rel:|" >> "$tmp"
     done
+    # a recorded partition's test names every member of the catalog, so a member
+    # added later is a census failure until the test classifies it. the catalog
+    # is the file that defines the parameter's type: the same file for a bare
+    # name, else the `use` line of its alias.
+    while IFS='|' read -r rel key ptype palias ts te; do
+        f="$root/$rel"
+        if [ -z "$palias" ]; then
+            deffile="$f"
+        else
+            # `use mach.a.b;` or `use alias: mach.a.b;` names src/a/b.mach
+            path=$(grep -E "^use ($palias: )?mach(\.[a-z0-9_]+)*\.$palias;|^use $palias: mach(\.[a-z0-9_]+)+;" "$f" | head -n1 | sed -E "s/^use ($palias: )?mach\.//; s/;.*//; s/\./\//g")
+            deffile="$root/src/$path.mach"
+        fi
+        if [ ! -f "$deffile" ] || ! grep -qE "^(pub[[:space:]]+)?def[[:space:]]+$ptype[[:space:]]*:" "$deffile"; then
+            echo "$rel: $key: the catalog $ptype could not be located from the signature" >> "$tmp"
+            continue
+        fi
+        body=$(sed -n "${ts},${te}p" "$f")
+        grep -E "^(pub[[:space:]]+)?val[[:space:]]+[A-Z][A-Z0-9_]*[[:space:]]*:[[:space:]]*$ptype[[:space:]]*=" "$deffile" \
+            | sed -E 's/^(pub[[:space:]]+)?val[[:space:]]+//; s/[[:space:]]*:.*//' | while IFS= read -r member; do
+            printf '%s\n' "$body" | grep -qE "(^|[^A-Za-z0-9_])$member([^A-Za-z0-9_]|$)" \
+                || echo "$rel: $key: the partition test does not name the member $member" >> "$tmp"
+        done
+    done < "$parts"
     hits=$(wc -l < "$tmp" | tr -d ' ')
+    npart=$(wc -l < "$parts" | tr -d ' ')
+    rm -f "$parts"
     if [ "$hits" -ne 0 ]; then
         sed 's|^|  |' "$tmp"
-        echo "census catalog-defaults: FAIL ($hits default-picking site(s) for an input-sourced catalog)"
+        echo "census catalog-defaults: FAIL ($hits default-picking site(s) on a closed catalog)"
         status=1
     else
-        echo "census catalog-defaults: ok"
+        echo "census catalog-defaults: ok ($ncat catalogs, $npart recorded partitions)"
     fi
 fi
 
