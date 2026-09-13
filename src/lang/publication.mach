@@ -15,8 +15,15 @@ use std.types.string.str_len;
 use mach.lang.intern;
 use planned: mach.lang.publication.plan;
 use A:       std.allocator;
-use txn:     std.filesystem.transaction;
+use std.crypto.rand;
+use std.encoding.hex;
+use fs:       std.filesystem;
+use txn:      std.filesystem.transaction;
+use io_error: std.io.error;
 use std.system.os;
+use std.types.path;
+use std.types.string.StrError;
+use std.types.string.str_copy_slice;
 fwd planned.Plan;
 fwd planned.Destination;
 fwd plan_init: planned.init;
@@ -254,4 +261,122 @@ pub fun subtree(a: *A.Allocator, destination: *txn.Claim, inv: *txn.Inventory, d
         ret err[outcome.Fail].err{outcome.environment(txn.error_message(committed.err))};
     }
     ret err[outcome.Fail].ok{};
+}
+
+# the control home of a project: `out/.mach-txn` under its root, created on
+# demand, so a publication into the source tree leaves nothing beside the
+# sources. a root opened with this home derives children homed by their
+# relative path, one claims directory per destination
+pub val HOME_OUTPUT: str = "out";
+pub val HOME_LEAF:   str = ".mach-txn";
+
+fun make_dir_if_absent(dirfd: i32, leaf: str, mode: i32) err[txn.Error] {
+    val made: i64 = os.make_dir(dirfd, leaf, mode);
+    if (made < 0 && made != os.EEXIST) { ret err[txn.Error].err{txn.io_error(txn.OP_ROOT_OPEN, made)}; }
+    ret err[txn.Error].ok{};
+}
+
+pub fun control_home(home: *txn.Root, project: *txn.Root) err[txn.Error] {
+    val made_output: err[txn.Error] = make_dir_if_absent(txn.root_fd(project), HOME_OUTPUT, DIR_MODE);
+    if (sel made_output.err) { ret made_output; }
+    var output: txn.Root;
+    val opened: err[txn.Error] = txn.root_open_child(?output, project, HOME_OUTPUT);
+    if (sel opened.err) { ret opened; }
+    val made:    err[txn.Error] = make_dir_if_absent(txn.root_fd(?output), HOME_LEAF, 0o700);
+    var result:  err[txn.Error] = made;
+    val made_ok: bool           = sel made.ok;
+    if (made_ok) { result = txn.root_open_child(home, ?output, HOME_LEAF); }
+    val closed: err[txn.Error] = txn.root_dnit(?output);
+    if (sel result.ok && sel closed.err) {
+        txn.root_dnit(home);
+        ret closed;
+    }
+    ret result;
+}
+
+# open a project root homed at its control home: `home` outlives `out` and
+# the caller releases both, `out` first
+pub fun project_root(out: *txn.Root, home: *txn.Root, base: str, rel: str) err[txn.Error] {
+    var plain:  txn.Root;
+    val opened: err[txn.Error] = txn.root_open(?plain, base, rel);
+    if (sel opened.err) { ret opened; }
+    val homed:    err[txn.Error] = control_home(home, ?plain);
+    var result:   err[txn.Error] = homed;
+    val homed_ok: bool           = sel homed.ok;
+    if (homed_ok) {
+        result = txn.root_open_with_home(out, base, rel, home);
+        if (sel result.err) { txn.root_dnit(home); }
+    }
+    val closed: err[txn.Error] = txn.root_dnit(?plain);
+    if (sel result.ok && sel closed.err) {
+        txn.root_dnit(out);
+        txn.root_dnit(home);
+        ret closed;
+    }
+    ret result;
+}
+
+val EPHEMERAL_PREFIX:   str   = "mach-txn-";
+val EPHEMERAL_ATTEMPTS: usize = 64;
+
+# a private control home under the temporary directory for a publication
+# whose project does not exist yet: the destination directory receives no
+# sentinel, and exclusion against a concurrent creator rests on the one
+# atomic rename. the caller removes it with `ephemeral_home_dnit`
+pub fun ephemeral_home(out: *txn.Root, a: *A.Allocator) res[str, txn.Error] {
+    var buf:     [512]u8;
+    val dir_len: i64 = os.temp_dir(?buf[0], 512);
+    if (dir_len < 0) { ret res[str, txn.Error].err{txn.io_error(txn.OP_ROOT_OPEN, dir_len)}; }
+    var off: usize = dir_len::usize;
+    if (off == 0 || !path.is_separator(buf[off - 1])) {
+        buf[off] = os.separator;
+        off      = off + 1;
+    }
+    val prefix_len: usize = str_len(EPHEMERAL_PREFIX);
+    if (off + prefix_len + 16 + 1 > 512) { ret res[str, txn.Error].err{txn.io_error(txn.OP_ROOT_OPEN, os.ENAMETOOLONG)}; }
+    var i: usize = 0;
+    for (i < prefix_len) {
+        buf[off + i] = EPHEMERAL_PREFIX[i];
+        i            = i + 1;
+    }
+    off = off + prefix_len;
+    var attempt: usize = 0;
+    for (attempt < EPHEMERAL_ATTEMPTS) {
+        var rnd:    [8]u8;
+        val filled: err[io_error.Error] = rand.fill(?rnd[0], 8);
+        if (sel filled.err) { ret res[str, txn.Error].err{txn.error(txn.ENTROPY, txn.OP_ROOT_OPEN)}; }
+        hex.encode(?rnd[0], 8, ?buf[off], 17);
+        buf[off + 16] = 0;
+        val made: i64 = os.make_dir(os.AT_FDCWD, (?buf[0])::str, 0o700);
+        if (made == os.EEXIST) {
+            attempt = attempt + 1;
+            cnt;
+        }
+        if (made < 0) { ret res[str, txn.Error].err{txn.io_error(txn.OP_ROOT_OPEN, made)}; }
+        val copied: res[str, StrError] = str_copy_slice(a, (?buf[0])::str, 0, off + 16);
+        if (sel copied.err) {
+            os.unlink(os.AT_FDCWD, (?buf[0])::str, os.AT_REMOVEDIR);
+            ret res[str, txn.Error].err{txn.error(txn.MEMORY, txn.OP_ROOT_OPEN)};
+        }
+        val home:   str            = copied.ok;
+        val opened: err[txn.Error] = txn.root_open(out, home, "");
+        if (sel opened.err) {
+            os.unlink(os.AT_FDCWD, home, os.AT_REMOVEDIR);
+            str_free(a, home);
+            ret res[str, txn.Error].err{opened.err};
+        }
+        ret res[str, txn.Error].ok{home};
+    }
+    ret res[str, txn.Error].err{txn.error(txn.ENTROPY, txn.OP_ROOT_OPEN)};
+}
+
+# release an ephemeral home and remove its directory; `home` must have no
+# live lock
+pub fun ephemeral_home_dnit(a: *A.Allocator, home: *txn.Root, dir: str) err[txn.Error] {
+    val closed:  err[txn.Error]  = txn.root_dnit(home);
+    val removed: err[fs.FsError] = fs.remove_all(a, dir);
+    str_free(a, dir);
+    if (sel closed.err)  { ret closed; }
+    if (sel removed.err) { ret err[txn.Error].err{txn.error(txn.IO, txn.OP_ROOT_OPEN)}; }
+    ret err[txn.Error].ok{};
 }
