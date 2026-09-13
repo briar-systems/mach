@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- The filesystem transaction layer behind every mutating command. Build outputs, cache entries and generated docs are written in place, and writes into the source tree (`mach fmt`, the `mach.toml` edits made by `dep` and `init`) go through a sibling `<file>.tmp` and rename. Nothing creates `.mach-txn-lock`, `.machtxn.claims/` or `out/.mach-txn/` any more, and `mach init` no longer needs those gitignore entries. Delete any stray `.mach-txn-lock`, `.machtxn.*` and `out/.mach-txn` left in existing checkouts (#3357).
+
 ## [5.0.3] - 2026-09-13
 
 ### Added
