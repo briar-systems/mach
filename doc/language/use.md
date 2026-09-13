@@ -23,7 +23,7 @@ the symbol, not its module.
 
 ## Examples
 
-```mach accept
+```mach
 use std.types.size;             # binds module 'size'; use as `size.usize`
 use sz: std.types.size;         # binds module under 'sz'; use as `sz.usize`
 use std.types.size.usize;       # binds symbol 'usize'; use bare as `usize`

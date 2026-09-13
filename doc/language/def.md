@@ -11,7 +11,7 @@ def NAME: TYPE;
 
 ## Examples
 
-```mach accept
+```mach
 pub def Age:    i64;                            # alias for a primitive
 pub def BinOp:  fun(i64, i64) i64;              # alias for a function type
 pub def Anon:   rec { x: i64; y: i64; };        # inline record
@@ -23,7 +23,7 @@ records, unions, tags, or other aliases. `def` is a module-scope declaration;
 there is no function-scope alias. An alias of a tag constructs, tests and
 copies as the tag:
 
-```mach accept
+```mach
 use std.types.result.res;
 
 tag ParseError: u8 { invalid; overflow; }

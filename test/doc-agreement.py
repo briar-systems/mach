@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""check that the reference documentation and the compiler agree.
+"""check that the language reference and the compiler agree.
 
-four surfaces, each read from its source of truth and from its documentation,
+three surfaces, each read from its source of truth and from its documentation,
 compared both ways:
 
-  cli       every command `mach --help` lists has a `## \\`mach <cmd>\\`` section in
-            doc/cli.md; every flag and `dep` action a command's generated help
-            lists is named in doc/cli.md; every flag a doc/cli.md flag table names
-            is one the generated help lists
   manifest  every key `manifest.key_known` accepts for a table is a row of that
-            table's key table in doc/manifest.md, and every documented row is an
-            accepted key; every key `key_removed` refuses is named as removed
+            table's key table in doc/language/manifest.md, and every documented
+            row is an accepted key; every key `key_removed` refuses is named as
+            removed
   init      every table and key the `mach init` scaffolds (binary and library)
-            write is one the manifest parser accepts and doc/manifest.md documents
+            write is one the manifest parser accepts and doc/language/manifest.md
+            documents
   grammar   the keyword list in doc/language/grammar.md is the parser's KW_* set
+
+the command line has no page: `mach --help` and `mach <command> --help` are
+the reference.
 
 usage: doc-agreement.py [--mach <path>] [--out <dir>]
 
@@ -34,8 +35,8 @@ HOST_DIR = {("linux", "x86_64"): "linux-x86_64", ("linux", "aarch64"): "linux-ar
             ("darwin", "x86_64"): "darwin-x86_64", ("darwin", "arm64"): "darwin-aarch64",
             ("windows", "amd64"): "windows-x86_64"}
 
-# manifest.key_known's TableKind constants against the doc/manifest.md section that
-# documents the table; the `[dep.<id>]` section names its keys in prose rows too
+# manifest.key_known's TableKind constants against the doc/language/manifest.md
+# section that documents the table; the `[dep.<id>]` section names its keys in prose rows too
 TABLES = {"TK_PROJECT": "project", "TK_TARGET": "target", "TK_ARTIFACT": "artifact",
           "TK_PROFILE": "profile", "TK_DEP": "dep", "TK_LINK": "link", "TK_STEP": "step"}
 
@@ -88,91 +89,6 @@ class Report(object):
         self.failures.append("%s: %s" % (surface, text))
 
 
-# cli
-
-COMMAND_LINE = re.compile(r"^  ([a-z]+)\s{2,}\S")
-OPTION_LINE = re.compile(r"^\s+(-[-a-zA-Z0-9_]+)(?:\s|$)")
-ACTION_LINE = re.compile(r"^  ([a-z]+) <path>")
-
-
-def help_commands(mach):
-    rc, text = run([mach, "--help"])
-    commands = []
-    in_list = False
-    for line in text.split("\n"):
-        if line.startswith("commands:"):
-            in_list = True
-            continue
-        if in_list:
-            m = COMMAND_LINE.match(line)
-            if m:
-                commands.append(m.group(1))
-            elif line.strip() == "":
-                if commands:
-                    in_list = False
-    if not commands:
-        die("`mach --help` lists no commands:\n" + text)
-    return commands
-
-
-def help_flags(mach, command):
-    """the flags a command's generated help lists, and its dep actions."""
-    rc, text = run([mach, command, "--help"])
-    flags = set()
-    actions = set()
-    for line in text.split("\n"):
-        m = OPTION_LINE.match(line)
-        if m:
-            flags.add(m.group(1))
-        m = ACTION_LINE.match(line)
-        if m:
-            actions.add(m.group(1))
-    return flags, actions, text
-
-
-FLAG_ROW = re.compile(r"^\| ((?:`[^`]*`(?:, )?)+)\s*\|")
-FLAG_IN_CELL = re.compile(r"`(-[-a-zA-Z0-9_]+)(?: [^`]*)?`")
-
-
-def doc_flag_rows(text):
-    """the flags the flag tables of a page name, by their leading token."""
-    flags = set()
-    for line in text.split("\n"):
-        m = FLAG_ROW.match(line)
-        if not m:
-            continue
-        for f in FLAG_IN_CELL.findall(m.group(1)):
-            flags.add(f)
-    return flags
-
-
-def check_cli(mach, report):
-    cli = read("doc/cli.md")
-    commands = help_commands(mach)
-    all_flags = set()
-    for command in commands:
-        if command == "help":
-            continue
-        report.check("## `mach %s`" % command in cli, "cli",
-                     "`mach %s` is a command of the generated help with no section in doc/cli.md" % command)
-        flags, actions, text = help_flags(mach, command)
-        all_flags |= flags
-        for flag in sorted(flags):
-            report.check("`%s" % flag in cli, "cli",
-                         "`mach %s %s` is in the generated help and not in doc/cli.md" % (command, flag))
-        for action in sorted(actions):
-            report.check("| `%s`" % action in cli, "cli",
-                         "`mach %s %s` is an action of the generated help with no row in doc/cli.md" % (command, action))
-    for flag in sorted(doc_flag_rows(cli)):
-        report.check(flag in all_flags, "cli",
-                     "doc/cli.md tables a flag `%s` that no command's generated help lists" % flag)
-    # the top-level command table
-    for command in commands:
-        report.check("| `%s`" % command in cli, "cli",
-                     "`mach %s` has no row in doc/cli.md's command table" % command)
-    return commands
-
-
 # manifest
 
 def parser_keys():
@@ -205,8 +121,8 @@ KEY_ROW = re.compile(r"^\| `([a-z_]+)`\s+\|")
 
 
 def doc_manifest_keys():
-    """{table: keys} from the key tables under each `## [table]` section of doc/manifest.md."""
-    text = read("doc/manifest.md")
+    """{table: keys} from the key tables under each `## [table]` section of doc/language/manifest.md."""
+    text = read("doc/language/manifest.md")
     out = {}
     table = None
     for line in text.split("\n"):
@@ -229,14 +145,14 @@ def check_manifest(report):
         docs = documented.get(table, set())
         for key in sorted(known[table] - docs):
             report.check(False, "manifest",
-                         "[%s] key '%s' is accepted by the parser and has no row in doc/manifest.md" % (table, key))
+                         "[%s] key '%s' is accepted by the parser and has no row in doc/language/manifest.md" % (table, key))
         for key in sorted(docs - known[table]):
             report.check(False, "manifest",
-                         "[%s] key '%s' is documented in doc/manifest.md and the parser refuses it" % (table, key))
+                         "[%s] key '%s' is documented in doc/language/manifest.md and the parser refuses it" % (table, key))
     for table in sorted(removed):
         for key in sorted(removed[table]):
             report.check("`%s`" % key in text and "removed" in text, "manifest",
-                         "[%s] key '%s' is refused as removed and doc/manifest.md does not name it" % (table, key))
+                         "[%s] key '%s' is refused as removed and doc/language/manifest.md does not name it" % (table, key))
     return known
 
 
@@ -278,7 +194,7 @@ def check_init(mach, known, out_dir, report):
                 report.check(key in known.get(table, set()), "init",
                              "the %s scaffold writes [%s] %s, which the parser refuses" % (layout, table, key))
                 report.check(key in documented.get(table, set()), "init",
-                             "the %s scaffold writes [%s] %s, which doc/manifest.md does not document" % (layout, table, key))
+                             "the %s scaffold writes [%s] %s, which doc/language/manifest.md does not document" % (layout, table, key))
         rc, text = run([mach, "build", ".", "--plan"], cwd=root)
         # the scaffold declares std without realizing it, so planning stops at the
         # dependency; a manifest the parser rejects would have failed before that
@@ -322,13 +238,12 @@ def main(argv):
     mach = resolve_mach(mach)
     os.makedirs(out_dir, exist_ok=True)
     report = Report()
-    commands = check_cli(mach, report)
     known = check_manifest(report)
     check_init(mach, known, out_dir, report)
     check_grammar(report)
     print("doc-agreement: compiler %s" % mach)
-    print("doc-agreement: %d commands, %d manifest tables, %d keywords checked" % (
-        len(commands), len(known), len(re.findall(r"^pub val KW_", read("src/lang/fe/token.mach"), re.M))))
+    print("doc-agreement: %d manifest tables, %d keywords checked" % (
+        len(known), len(re.findall(r"^pub val KW_", read("src/lang/fe/token.mach"), re.M))))
     for f in report.failures:
         print("FAIL " + f)
     if report.failures:

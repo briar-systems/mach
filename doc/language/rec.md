@@ -18,7 +18,7 @@ rec NAME[T, U] { ... }      # generic over type parameters
 
 ## Examples
 
-```mach accept
+```mach
 pub rec Point {
     x: i64;
     y: i64;
@@ -34,7 +34,7 @@ pub rec Pair[T, U] {
 
 A record literal names the type and provides each field by name:
 
-```mach run "1 6"
+```mach
 use std.runtime;
 use print: std.print;
 

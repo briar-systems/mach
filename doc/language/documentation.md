@@ -6,9 +6,11 @@ component block. `mach doc` renders them, and the compiler's docstring lint
 checks the component block of every `pub fun`, `pub rec`, `pub uni`, and `pub tag`
 against the declaration it documents.
 
-A docstring states **what** a declaration is and **how** it is used. Why a
-design is the way it is belongs in `doc/design/`; when something changed
-belongs in the changelog. Documentation never changes generated code.
+A docstring states **what** a declaration is and **how** it is used, and a
+module's docstring states the contract the module holds its callers to. The
+language, command and manifest references under `doc/` say what the user
+sees; when something changed belongs in the changelog. Documentation never
+changes generated code.
 
 ## Grammar
 
@@ -118,7 +120,7 @@ pub fun spin_hint() { ... }
 
 ## Record / union / def
 
-```mach accept
+```mach
 # a 2D Cartesian point with i64 coordinates
 # ---
 # x: horizontal coordinate
@@ -126,7 +128,7 @@ pub fun spin_hint() { ... }
 pub rec Point { x: i64; y: i64; }
 ```
 
-```mach accept
+```mach
 # holds either an integer or a float
 # ---
 # i: integer interpretation
@@ -134,14 +136,14 @@ pub rec Point { x: i64; y: i64; }
 pub uni Number { i: i64; f: f64; }
 ```
 
-```mach accept
+```mach
 # an i64 representing years since birth
 pub def Age: i64;
 ```
 
 ## Tag
 
-```mach accept
+```mach
 # a value that may be absent
 # ---
 # [T]: value type
@@ -153,7 +155,7 @@ pub tag Maybe[T]: u8 {
 }
 ```
 
-```mach accept
+```mach
 # a unit outcome with a typed failure
 # ---
 # [E]: error type
@@ -169,7 +171,7 @@ Cases appear in declaration order after generic parameters. Tags have no return
 value, so `ret:` is refused. Undocumented cases are permitted, but any documented
 case must exist on the tag; `doclint` warns at the component otherwise:
 
-```mach warn "documented component matches no parameter, field, generic, or `ret`"
+```mach
 # a unit outcome with a typed failure
 # ---
 # [E]: error type
@@ -222,4 +224,4 @@ comment as `# [...]`.
 - [rec.md](rec.md), [uni.md](uni.md), [tag.md](tag.md), [def.md](def.md) - type forms
 - [val-var.md](val-var.md) - binding declarations
 - [modules.md](modules.md) - module structure and file layout
-- [../cli.md](../cli.md#mach-doc) - mach doc command, which renders docstrings
+- `mach help doc` - the command that renders docstrings

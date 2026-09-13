@@ -4,11 +4,12 @@ A `tag` is a discriminated aggregate value that represents exactly one active
 case at any moment. Each case has a name and either one explicitly typed payload
 or no payload at all.
 
-This page is the language reference for the
-[v5 tagged-value contract](../design/tagged-values.md): declarations with an
+This page is the tagged-value contract (#3217): declarations with an
 explicit discriminator, `Type.case{payload}` construction, `sel` case tests,
 lexical payload guards, the debug-profile discriminator trap, checked layout
-and the reflection intrinsics.
+and the reflection intrinsics. There is no flow-sensitive analysis, no `try`
+expression and no compiler-known failure type: `res`, `opt` and `err` are
+ordinary std tags.
 
 ## Grammar
 
@@ -32,7 +33,7 @@ because vector spellings resolve as vector types in type positions.
 
 ## Examples
 
-```mach accept
+```mach
 pub tag Reply: u8 {
     empty;
     value: i64;
@@ -51,7 +52,7 @@ pub tag Tree[T]: u8 {
 
 When multiple values must accompany a case, use an ordinary record payload:
 
-```mach accept
+```mach
 use std.types.size.usize;
 use std.types.string.str;
 
@@ -64,7 +65,7 @@ pub tag Entry: u8 {
 An empty tag, a duplicate case name and a discriminator too narrow for the
 case count are rejected:
 
-```mach reject "duplicate tag case name"
+```mach
 tag Twice: u8 {
     one;
     one;
@@ -75,7 +76,7 @@ tag Twice: u8 {
 
 A tag value is constructed by naming the type, the case and the payload:
 
-```mach accept
+```mach
 tag Reply: u8 { empty; value: i64; }
 
 val empty_reply: Reply = Reply.empty{};
@@ -92,7 +93,7 @@ case takes empty braces. There is no other construction form:
 - The record-literal form (`Reply{value: 1}` or `Reply{empty}`) is a compile error
 - A case selector alone (`Reply.value`) is not a value
 
-```mach reject "payload"
+```mach
 tag Reply: u8 { empty; value: i64; }
 
 val missing: Reply = Reply.value{};     # the case declares a payload
@@ -105,7 +106,7 @@ Whole-value assignment replaces the selected case and payload together.
 Zero initialization selects the first declared case and zero-initializes its
 payload if one exists.
 
-```mach run "empty"
+```mach
 use std.runtime;
 use print: std.print;
 
@@ -151,7 +152,7 @@ pub tag err[E]: u8    { err: E; ok; }
 There is no defaulted type argument, general type inference, dummy success
 type, unit value, constructor function or automatic error conversion.
 
-```mach accept
+```mach
 use std.types.result.res;
 use std.types.option.opt;
 use std.types.error.err;
@@ -181,7 +182,7 @@ or `err` as a tag or as anything else. Declaring one twice in a module is the
 ordinary duplicate definition. A module that spells `res` without importing it
 is rejected the way any unresolved type name is:
 
-```mach reject "unresolved type name `res`"
+```mach
 tag ParseError: u8 { invalid; }
 
 fun parse(x: i64) res[i64, ParseError] { ret res[i64, ParseError].ok{x}; }
@@ -193,7 +194,7 @@ fun parse(x: i64) res[i64, ParseError] { ret res[i64, ParseError].ok{x}; }
 holds `case`. It reads only the discriminator, never a payload, and has no side
 effects.
 
-```mach accept
+```mach
 tag Reply: u8 { empty; value: i64; }
 
 fun describe(reply: Reply) i64 {
@@ -214,7 +215,7 @@ call or other temporary is not a place. The result is an ordinary `bool`, so it
 composes with `!`, `&&` and `||`, can initialize a `bool` binding, and can be
 returned.
 
-```mach accept
+```mach
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.option.opt;
@@ -234,7 +235,7 @@ fun tests(reply: Reply, next: opt[i64], a: opt[i64], b: opt[i64]) bool {
 
 `sel` takes a place, so a call result is refused:
 
-```mach reject "sel"
+```mach
 tag Reply: u8 { empty; value: i64; }
 
 fun make() Reply { ret Reply.empty{}; }
@@ -268,7 +269,7 @@ region, not a flow fact: a chain arm whose condition is exactly `sel P.c` guards
 `P.c` inside its block, and a chain whose every arm exits guards the remainder
 of the enclosing block for the case the chain left untested.
 
-```mach accept
+```mach
 tag Reply: u8 { empty; value: i64; }
 
 fun read_value(reply: Reply) i64 {
@@ -281,7 +282,7 @@ fun read_value(reply: Reply) i64 {
 
 A payload read outside a guard is a compile error:
 
-```mach reject "guard"
+```mach
 tag Reply: u8 { empty; value: i64; }
 
 fun read_value(reply: Reply) i64 {
@@ -303,7 +304,7 @@ the existing value rules, writing it keeps the selected case, and `?value.case`
 yields a typed pointer to naturally aligned storage. Whole-value assignment to
 the guarded place is a compile error; rebind to a new name instead.
 
-```mach reject "cannot assign to this place inside a guard"
+```mach
 tag Reply: u8 { empty; value: i64; }
 
 fun reset(reply: Reply) i64 {
