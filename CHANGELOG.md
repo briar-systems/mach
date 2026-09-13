@@ -242,16 +242,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Source programs using the withdrawn `try` syntax produce a parse error instead of an internal compiler failure (#3131).
 - `doc/language/try.md` and all references to flow-sensitive proofs, compiler-known `res`/`opt`/`err` tags, and function-scope `def` declarations are removed from the language reference (#3131).
 - The `:^` and `:^T` declassification spellings are removed in favor of `expr:>T` which always names its public result type (#3226, #3112).
-- Writing `x:^` or `x:^u32` produces a parse error at the operator stating that `:^` and `:^T` were removed in 5.0.0 and that declassification is `expr:>T` naming a public result type (#3226, #3112).
-- The parser consumes a following type after an invalid `:^` operator so the remainder of the expression parses cleanly (#3226, #3112).
+- `:^` is no token: `x:^` and `x:^u32` lex as a colon followed by a caret and fail at the enclosing statement's terminator check (#3226, #3112, #3324).
 - Declassifying an operand typed by a generic parameter defers target-type equality checks from the template to each concrete instance (#3226, #3112).
-- The `$mach.abi.sysv` comptime reflection alias is removed and refused by name in favor of `$mach.abi.sysv64` (#3226, #3112).
+- The `$mach.abi.sysv` comptime reflection alias is removed; the ABI is spelled `$mach.abi.sysv64` and `sysv` is an unknown tag (#3226, #3112, #3324).
 - Comptime path evaluation removes the diagnostic store previously maintained for `$mach.abi.sysv` deprecation warnings (#3226, #3112).
-- Manifest keys `name`, `description` and `mach` under `[project]` are removed and refused by name in root and dependency manifests alike (#3226, #3112).
-- Manifest keys `emit_ir` and `emit_asm` under `[profile.*]` are removed and refused by name in root and dependency manifests alike (#3226, #3112).
-- Removed manifest key diagnostics state that the key was removed in 5.0.0 and was accepted and unread, instructing removing the key rather than diagnosing an unknown key (#3226, #3112).
+- Manifest keys `name`, `description` and `mach` under `[project]` are removed and are unknown keys in root and dependency manifests alike (#3226, #3112, #3324).
+- Manifest keys `emit_ir` and `emit_asm` under `[profile.*]` are removed and are unknown keys in root and dependency manifests alike (#3226, #3112, #3324).
 - The manifest parser no longer records deprecated keys and the driver emits no deprecation warnings for them (#3226, #3112).
-- Comptime reflection properties `$project.name` and `$project.description` are removed and refused at their use site by name, directing callers to `$project.id` (#3226, #3112, #3128).
+- Comptime reflection properties `$project.name` and `$project.description` are removed and are unknown `$project.*` paths (#3226, #3112, #3128, #3324).
 - A rejected rooted comptime path reports the path own error message at the path instead of falling through to generic errors on the root identifier (#3226, #3112, #3128).
 - First-declared target, profile and artifact fallbacks are removed, prohibiting any selection by table order (#3226, #3112, #3222).
 - Manifests declaring multiple targets without a host match, multiple profiles, or multiple matching artifacts with none marked `default = true` are refused when a command must select one (#3226, #3112, #3222).
@@ -261,16 +259,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The embed path containment check compares the project root and resolved file in a unified coordinate system, preventing false escape refusals when running `mach build .` with relative paths (#3226, #3112).
 - Alias dependency keys are removed: a `[dep.<key>]` whose realized project declares a different id is refused by `pull`, `verify` and build commands, requiring the manifest key, directory under `dep/` and project id to match (#3226, #3112).
 - Realized nested dependency directories `dep/<id>/dep/<x>/mach.toml` are refused with a diagnostic naming the directory to delete, while empty gitlink directories continue to pass (#3226, #3112).
-- A `mach.lock` file in the project root is refused by every command that opens the project rather than noted and ignored, instructing users that committed gitlinks under `dep/` are the pins (#3226, #3112).
+- `mach.lock` is removed: a file of that name in the project root is an unrelated file no command reads; the committed gitlinks under `dep/` are the pins (#3226, #3112, #3324).
 - The driver content-conflict diagnostic for two keys realizing one id is removed as unreachable with aliases gone, while selector clashes continue to be reported by `mach dep` (#3226, #3112).
 - The implicit `lib.mach` entry for an artifact-less dependency is removed (#3226, #3112).
-- A bare `use <id>` import of a dependency declaring no artifacts is refused with a message noting the removal and explaining that it has no public module, while full-path imports remain supported without artifacts (#3226, #3112).
+- A bare `use <id>` import of a dependency declaring no artifacts is refused because it has no public module, while full-path imports remain supported without artifacts (#3226, #3112).
 - Support for the MOS 6502 target architecture is removed, deleting its instruction set (`target/isa/mos6502/`), ABI member, registry rows, freestanding OS row, `$mach.arch.mos6502` tag, the `target_unavailable` tuple capability, golden corpus column, and fuzz seed (#3226, #3112).
-- A `[target.*]` manifest table naming `mos6502` as its `isa` or `abi` is refused by name at target resolution (#3226, #3112).
+- A `[target.*]` manifest table naming `mos6502` as its `isa` or `abi` is refused as an unregistered name at target resolution (#3226, #3112, #3324).
 - The architecture catalog is updated to version 2, reserving arch id 4 as `MOS6502_WITHDRAWN` (#3226, #3112).
 - The width legalization pass driven by the MOS 6502 target is retained as shared infrastructure for targets such as riscv32 (#3226, #3112).
 - The comptime manifest defines table, its binding step, and its slot in the build fingerprint are removed (#3131).
 - Unrecognized `$mach.build.*` property paths are refused at the use site as unknown paths (#3131).
+- The compiler no longer recognizes any pre-5.0 spelling by name: the migration diagnostics for `:^`, `$project.name`, `$project.description`, `$mach.abi.sysv`, the unread manifest keys, `mos6502`, `mach.lock`, backtick decorators, comptime attribute setters and C-style variadic `...` are deleted, and each form fails at its site with that site's ordinary diagnostic (#3324).
+- `mach dep sync`, the alias of `mach dep pull`, is removed along with the `DepActionSpec.alias_of` slot; `sync` is an unknown dep action (#3324).
+- The unused `classify` slot on `AbiVTable` and `abi.with_legacy_classifier` are removed (#3324, #3124).
 
 ## [4.30.0] - 2026-09-07
 
