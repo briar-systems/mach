@@ -578,7 +578,11 @@ link admission any other way without a second capability channel.
   additive like N3's): `isa.Inst.src3`, blank by `inst_blank`, because aarch64
   `madd`/`msub` read three registers (Rn, Rm, Ra) and a notification that drops
   the fourth register cannot be walked soundly; no existing reader changes,
-  x86_64 and riscv64 never set it.
+  x86_64 and riscv64 never set it. Amended 2026-09-12 (item 10.3, N5 ruled):
+  `isa.Inst.clobbers` is deleted. Implicit writes come from `asm.Mnemonic.implicit`
+  and the per-opcode `MirOpDescriptor` effect columns; the field had one writer
+  (`inst_blank`, `= 0`) and no reader, so its removal changes no byte and closes
+  the fail-open shape that a future reader would have inherited.
 - `mir.MirInstr.writes_secret`, `memory_flags`, `mir.MirVReg.secret`,
   `mir.MirOperand.required_bank`, `regalloc.verify_rewritten_operands`
   (`regalloc.mach:2322`): the post-rewrite facts N5 validates against.
