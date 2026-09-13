@@ -173,6 +173,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The windows-x86_64 target reserves a 16 MiB stack, so the parser's 2048-level nesting bound (8.2 MiB of win64 release frames) is answered with a diagnostic instead of `STATUS_STACK_OVERFLOW`, and the release-profile unit suite runs on windows in CI again (#3325).
 - `mach fmt` and `mach init` keep the transaction layer's lock sentinel, claims directory and backup container under `out/.mach-txn/<relative path>` instead of beside the sources they rewrite, so a formatted tree gains no `.mach-txn-lock` or `.machtxn.*` entries (#3310).
 - `mach fmt --check` locks nothing and creates no control home, and `mach init` into an absent destination locks through an ephemeral home under the temporary directory so the parent directory receives no sentinel (#3310).
 - `.gitignore` covers `.mach-txn-lock` and `.machtxn.*` against a pre-fix formatter (#3310).
