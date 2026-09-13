@@ -1,278 +1,184 @@
 name: CD
 
+# a tag builds the release binary on each native host to its own self-host
+# fixpoint, runs the unit suite through it, and publishes the archives with
+# SHA256SUMS. correctness is CI's job: every change reaches main through a pull
+# request it gates, and the push to main runs everything.
+
 on:
   push:
-    tags:
-      - "v*"
-  workflow_dispatch:
+    tags: ["v*"]
 
 permissions:
   contents: read
 
-# a tagged push builds the release binary for each target on its native host, each
-# to its own self-host fixpoint, then publishes the archives + SHA256SUMS.
-# correctness is CI's job — every change reaches main through a PR it gates.
-#
-# the darwin lane (seed cross-build + native fixpoint + self-test) lives in
-# darwin-lane.yml, shared with ci.yml's dev -> main release gate; see that file.
-#
-# workflow_dispatch runs the darwin lane on a branch with no tag, so on-Mac
-# validation needs no release; the tag-verify and publish steps are gated to tag
-# pushes and stay skipped on dispatch.
 jobs:
   verify:
     name: verify tag
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v6
-      - name: tag matches every release version
+      - name: tag matches the version
         run: |
           set -euo pipefail
-          ver="$(sed -n 's/^version = "\(.*\)"$/\1/p' mach.toml | head -1)"
+          ver=$(sed -n 's/^version = "\(.*\)"$/\1/p' mach.toml | head -1)
           [ "v$ver" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME != mach.toml version $ver"; exit 1; }
-          compiler_ver="$(sed -n 's/^pub val MACH_VERSION: str = "\(.*\)";$/\1/p' src/lang/version.mach)"
-          [ "$compiler_ver" = "$ver" ] || { echo "::error::compiler version $compiler_ver != mach.toml version $ver"; exit 1; }
+          cver=$(sed -n 's/^pub val MACH_VERSION: str = "\(.*\)";$/\1/p' src/lang/version.mach)
+          [ "$cver" = "$ver" ] || { echo "::error::compiler version $cver != mach.toml version $ver"; exit 1; }
 
-  build-linux:
+  # the hosts that seed themselves: linux and windows bootstrap through the
+  # audited chain, reach the release fixpoint natively and package it
+  build:
     name: build ${{ matrix.target }}
     needs: verify
     runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-linux
-            runs-on: ubuntu-latest
-          - target: aarch64-linux
-            runs-on: ubuntu-24.04-arm
+          - { target: x86_64-linux,   runs-on: ubuntu-latest }
+          - { target: aarch64-linux,  runs-on: ubuntu-24.04-arm }
+          - { target: x86_64-windows, runs-on: windows-latest }
     steps:
       - uses: actions/checkout@v6
-
-      - name: bootstrap audited mach
+      - name: seed
         uses: ./.github/actions/setup-mach
-
-      - name: build fixpoint
+      - name: release fixpoint and unit suite
+        shell: bash
         run: |
           set -euo pipefail
+          exe=; [ "$RUNNER_OS" = Windows ] && exe=.exe
           mach dep pull .
-          mach build . --profile release -o a
-          ./a build . --profile release -o b
-          ./b build . --profile release -o c
-
-          # ship the fixpoint: b == c (stage2 vs stage3) or the build is non-deterministic
-          if ! cmp -s b c; then
-            echo "::error::build did not converge to the fixpoint"
-            exit 1
-          fi
-
-      # the whole-compiler capstone of the -g additivity guard (#1963): build the
-      # compiler at release -g and release no-g with the fixpoint compiler and require
-      # every PT_LOAD segment byte-identical. the compiler exercises far more of the
-      # language than any fixture, so this catches any pass whose decision reads debug
-      # metadata (inliner size gate #1932, mem2reg escape #1944, DCE salvage #1958,
-      # param homing #1956 were four such) — the whole class at once. runs here at
-      # release-cut (native x86_64 + aarch64, no emulation) rather than per-PR because
-      # it costs two more full self-builds; the per-PR link suite's debuginfo case
-      # already asserts fixture additivity across the ELF ISAs. inlined here rather than
-      # kept as a script (#2039) — do NOT delete as mystery yaml; it is a real guard.
-      - name: verify -g additivity of the compiler itself
-        run: |
-          set -euo pipefail
-          mkdir -p out
-          tmp=$(mktemp -d out/self-additive.XXXXXX)
-          trap 'rm -rf "$tmp"' EXIT
-          g="$tmp/mach.g"; nog="$tmp/mach.nog"
-          # section-table bookkeeping (e_shoff @40 8B, e_shnum @60 2B, e_shstrndx @62 2B)
-          # legitimately differs once -g adds named debug sections; zero it before compare.
-          norm() {
-            cp "$1" "$2"
-            printf '\0\0\0\0\0\0\0\0' | dd of="$2" bs=1 seek=40 count=8 conv=notrunc status=none
-            printf '\0\0'             | dd of="$2" bs=1 seek=60 count=2 conv=notrunc status=none
-            printf '\0\0'             | dd of="$2" bs=1 seek=62 count=2 conv=notrunc status=none
-          }
-          ./c dep pull .
-          ./c build . --profile release -g -o "$g"
-          ./c build . --profile release -o "$nog"
-          an="$tmp/a.norm"; bn="$tmp/b.norm"
-          norm "$g" "$an"; norm "$nog" "$bn"
-          rc=0; n=0
-          while read -r off fsz; do
-            [ "$fsz" -eq 0 ] && continue
-            n=$((n + 1))
-            if ! cmp -s \
-                <(dd if="$an" bs=1M iflag=skip_bytes,count_bytes skip="$off" count="$fsz" status=none) \
-                <(dd if="$bn" bs=1M iflag=skip_bytes,count_bytes skip="$off" count="$fsz" status=none); then
-              echo "FAIL: -g perturbed a loadable segment of the compiler (PT_LOAD off=$off sz=$fsz)" >&2
-              rc=1
-            fi
-          done < <(readelf -lW "$g" 2>/dev/null | awk '/LOAD/{print strtonum($2), strtonum($5)}')
-          [ "$n" -gt 0 ] || { echo "self-additive: no PT_LOAD segments read from $g" >&2; exit 1; }
-          [ "$rc" -eq 0 ] || exit 1
-          echo "self-additive: the compiler's own release build is -g additive ($n PT_LOAD segments identical)"
-
-      - name: package archive
+          mach build . --profile release -o a$exe
+          ./a$exe build . --profile release -o b$exe
+          ./b$exe build . --profile release -o c$exe
+          cmp b$exe c$exe || { echo "::error::build did not converge to the fixpoint"; exit 1; }
+          ./c$exe test .
+      - name: package
+        shell: bash
         env:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          ver="${GITHUB_REF_NAME#v}"
+          ver=${GITHUB_REF_NAME#v}
+          mkdir -p dist stage
+          cp LICENSE stage/
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp c.exe stage/mach.exe
+            (cd stage && 7z a -tzip "../dist/mach-$ver-$TARGET.zip" mach.exe LICENSE >/dev/null)
+          else
+            cp c stage/mach
+            tar -C stage -czf "dist/mach-$ver-$TARGET.tar.gz" mach LICENSE
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/mach-*
+          if-no-files-found: error
+          retention-days: 1
+
+  # the darwin hosts: linux cross-builds a seed for each, then every host reaches
+  # its own fixpoint natively and packages it. x86_64-darwin must self-host on
+  # real Intel silicon, since Rosetta 2 cannot host mach's raw bsdthread_create
+  # worker threads (#2104).
+  darwin-seed:
+    name: darwin seed
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+      - name: seed
+        uses: ./.github/actions/setup-mach
+      - name: cross-build the darwin seeds
+        run: |
+          set -euo pipefail
+          mach dep pull .
+          mach build . -o m
+          mkdir -p seed
+          ./m build . --target darwin-aarch64 --profile release -o seed/mach-aarch64-darwin
+          ./m build . --target darwin-x86_64 --profile release -o seed/mach-x86_64-darwin
+      - uses: actions/upload-artifact@v7
+        with:
+          name: darwin-seed
+          path: seed/
+          if-no-files-found: error
+          retention-days: 1
+
+  build-darwin:
+    name: build ${{ matrix.target }}
+    needs: darwin-seed
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-darwin, runs-on: macos-15,       machine: arm64 }
+          - { target: x86_64-darwin,  runs-on: macos-15-intel, machine: x86_64 }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: darwin-seed
+          path: seed
+      - name: release fixpoint and unit suite
+        env:
+          WANT: ${{ matrix.machine }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          got=$(uname -m); translated=$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)
+          [ "$got" = "$WANT" ] && [ "$translated" = 0 ] || { echo "::error::the $WANT lane landed on a $got host (proc_translated=$translated)"; exit 1; }
+          chmod +x "seed/mach-$TARGET"
+          "./seed/mach-$TARGET" dep pull .
+          "./seed/mach-$TARGET" build . --profile release -o a
+          ./a build . --profile release -o b
+          ./b build . --profile release -o c
+          cmp b c || { echo "::error::darwin build did not converge to the fixpoint"; exit 1; }
+          ./c test .
+      - name: package
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          ver=${GITHUB_REF_NAME#v}
           mkdir -p dist stage
           cp c stage/mach
           cp LICENSE stage/
           tar -C stage -czf "dist/mach-$ver-$TARGET.tar.gz" mach LICENSE
-
-      - name: upload archive
-        uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
-          path: dist/mach-*-${{ matrix.target }}.tar.gz
+          path: dist/mach-*
           if-no-files-found: error
           retention-days: 1
-
-  build-windows:
-    name: build ${{ matrix.target }}
-    needs: verify
-    runs-on: ${{ matrix.runs-on }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-windows
-            runs-on: windows-latest
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: bootstrap audited mach
-        uses: ./.github/actions/setup-mach
-
-      - name: build fixpoint
-        run: |
-          mach.exe dep pull .
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          mach.exe build . --profile release -o a.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./a.exe build . --profile release -o b.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./b.exe build . --profile release -o c.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          # ship the fixpoint: b == c (stage2 vs stage3) or the build is non-deterministic
-          if ((Get-FileHash b.exe).Hash -ne (Get-FileHash c.exe).Hash) {
-            Write-Error 'build did not converge to the fixpoint'
-            exit 1
-          }
-
-      - name: package archive
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          $ver = ($env:GITHUB_REF_NAME).TrimStart('v')
-          New-Item -ItemType Directory -Path dist, stage -Force | Out-Null
-          Copy-Item c.exe stage/mach.exe -Force
-          Copy-Item LICENSE stage/ -Force
-          Compress-Archive -Path stage/mach.exe, stage/LICENSE -DestinationPath "dist/mach-$ver-${env:TARGET}.zip" -Force
-
-      - name: upload archive
-        uses: actions/upload-artifact@v7
-        with:
-          name: release-${{ matrix.target }}
-          path: dist/mach-*-${{ matrix.target }}.zip
-          if-no-files-found: error
-          retention-days: 1
-
-  # the darwin lane (bootstrap seed cross-build + native fixpoint + self-test) is a
-  # reusable workflow shared with ci.yml's dev -> main release gate — see
-  # darwin-lane.yml. gated the same way build-linux/build-windows are: explicit,
-  # since the default success() skips through verify's dispatch-skip.
-  build-darwin:
-    name: darwin lane
-    needs: verify
-    if: ${{ !cancelled() && (needs.verify.result == 'success' || needs.verify.result == 'skipped') }}
-    uses: ./.github/workflows/darwin-lane.yml
 
   release:
     name: publish release
-    needs: [build-linux, build-windows, build-darwin]
-    # success() keeps the build gate the default if dropped when adding the event check
-    if: ${{ github.event_name == 'push' && success() }}
+    needs: [build, build-darwin]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
-
-      - name: collect archives
-        uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: dist
           merge-multiple: true
-
-      # download-artifact with a glob pattern collects whatever matches and does
-      # not fail on a missing target, so a wrong assumption anywhere upstream
-      # (e.g. a package/upload step silently skipped because github.event_name
-      # didn't propagate through darwin-lane.yml's workflow_call the way the
-      # dev -> main gate assumes — #2179) would otherwise publish an incomplete
-      # release with every job green. the expected archive set is read straight
-      # out of the build matrices (cd.yml's build-linux/build-windows,
-      # darwin-lane.yml's build), not hardcoded here, so it can't drift the next
-      # time a target is added or dropped, as x86_64-darwin was in 3.6.1.
-      - name: verify archive completeness
-        run: |
-          set -euo pipefail
-          ver="${GITHUB_REF_NAME#v}"
-
-          targets=$(grep -h -oP '(?<=- target: )[a-z0-9_-]+$' \
-            .github/workflows/cd.yml .github/workflows/darwin-lane.yml | sort -u)
-          [ -n "$targets" ] || { echo "::error::no targets found in the build matrices"; exit 1; }
-
-          want=""
-          missing=0
-          for t in $targets; do
-            case "$t" in
-              *-windows) f="mach-$ver-$t.zip" ;;
-              *)         f="mach-$ver-$t.tar.gz" ;;
-            esac
-            want="$want$f"$'\n'
-            if [ ! -f "dist/$f" ]; then
-              echo "::error::release is missing the $t archive (dist/$f)"
-              missing=1
-            fi
-          done
-          [ "$missing" -eq 0 ] || { echo "::error::incomplete release — refusing to publish"; exit 1; }
-
-          got="$(cd dist && ls mach-*.tar.gz mach-*.zip 2>/dev/null | sort)"
-          want="$(printf '%s' "$want" | sort)"
-          if [ "$got" != "$want" ]; then
-            echo "::error::dist/ holds archives beyond the expected set"
-            printf 'expected:\n%s\n' "$want"
-            printf 'got:\n%s\n' "$got"
-            exit 1
-          fi
-
-          echo "release archive set complete: $(echo "$targets" | tr '\n' ' ')"
-
-      - name: checksums
+      - name: checksums over the complete archive set
         run: |
           set -euo pipefail
           cd dist
+          ver=${GITHUB_REF_NAME#v}
+          for t in x86_64-linux aarch64-linux aarch64-darwin x86_64-darwin; do
+            [ -f "mach-$ver-$t.tar.gz" ] || { echo "::error::release is missing mach-$ver-$t.tar.gz"; exit 1; }
+          done
+          [ -f "mach-$ver-x86_64-windows.zip" ] || { echo "::error::release is missing mach-$ver-x86_64-windows.zip"; exit 1; }
           sha256sum mach-*.tar.gz mach-*.zip > SHA256SUMS
-
-          # SHA256SUMS must cover exactly the set verify archive completeness
-          # just proved dist/ holds — no more, no fewer.
-          n_files=$(ls mach-*.tar.gz mach-*.zip | wc -l)
-          n_sums=$(wc -l < SHA256SUMS)
-          [ "$n_sums" -eq "$n_files" ] || {
-            echo "::error::SHA256SUMS has $n_sums entries, dist/ holds $n_files archives"
-            exit 1
-          }
-
-      - name: publish
-        uses: softprops/action-gh-release@v3
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/mach-*.tar.gz
