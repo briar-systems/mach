@@ -15,14 +15,26 @@ Mach is a self hosted, statically-typed, compiled systems language designed to b
 
 The compiler, code generators, and linker are written in native Mach, with no
 LLVM or external assembler or linker. Ordinary Linux programs using the
-standard library need no libc. The standard library uses platform libraries
-where required, including libSystem on Darwin and Windows system DLLs.
+standard library need no libc: the standard library talks to the kernel
+directly. Where a platform requires its own libraries the standard library
+links them, which today means libSystem on Darwin and `kernel32`, `ws2_32`,
+`bcrypt` and the synchronization API set on Windows.
 
 Memory is managed manually. There is no garbage collector and no hidden allocation. Memory flows through allocators that you create and pass explicitly, and the standard library is built around that style end to end: anything that allocates takes an allocator, and anything that doesn't never will. 
 
 Batteries are not included. Many ways to do the same thing are not provided, and the language will not stop you from doing dangerous things. Safety is a decision made by the programmer, not a restriction imposed upon them.
 
-Use Mach when you want C's reach with one coherent toolchain: a single binary that builds, links (no external linker), tests, vendors dependencies, and cross-compiles.
+Use Mach when you want C's reach with one coherent toolchain: a single binary that builds, links (no external linker), tests, formats, vendors dependencies, and cross-compiles.
+
+Mach 5 adds tagged values with a declared discriminator (`tag`), `sel` as the
+case test with lexical payload guards, the standard library's `res`, `opt` and
+`err` failure tags, the `:>T` declassification cast for secret values, `mach
+fmt` with one canonical layout, and an opt-in persistent object cache that
+reuses generated objects across compiler processes. The compiler targets the
+x86_64, aarch64, riscv64, riscv32 and SPIR-V instruction sets, the linux,
+darwin, windows and freestanding operating systems, and writes ELF, COFF,
+Mach-O, raw and SPIR-V images; `mach info` prints the full list for any
+build.
 
 
 # Getting Started
@@ -32,7 +44,9 @@ Read the [language reference](doc/language/README.md) before installing. The doc
 
 ## Installing Mach
 
-Install the latest release with one line:
+Install the latest published release with one line. Until 5.0.0 is published
+that release is a 4.x compiler, which reads the 4.x dialect and cannot build
+this repository's source; see [Building Mach](#building-mach).
 
 ```bash
 curl -fsSL https://machlang.org/install.sh | sh
@@ -59,13 +73,15 @@ CI builds its compiler. A project moving from 4.x reads
 ```bash
 git clone https://github.com/briar-systems/mach
 cd mach
-git submodule update --init --recursive
+mach dep pull .
 mach build .
 ```
 
 The compiler is written to `out/<target>/<profile>/bin/mach`, or `bin/mach.exe`
 on Windows. A default Linux x86_64 build writes
-`out/linux-x86_64/debug/bin/mach`.
+`out/linux-x86_64/debug/bin/mach`. The compiler you build is generation A;
+A builds B, B builds C, and B and C are byte-identical. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the checks.
 
 
 # Examples
@@ -137,6 +153,8 @@ build system is documented in:
 - [`doc/manifest.md`](doc/manifest.md): the `mach.toml` manifest reference
 - [`doc/cli.md`](doc/cli.md): the `mach` command-line reference
 - [`doc/distribution.md`](doc/distribution.md): shipping an application to users
+- [`doc/migration-v5.md`](doc/migration-v5.md): moving a 4.x project to Mach 5
+- [`doc/tooling/`](doc/tooling/bootstrap.md): the bootstrap chain, the editor API and the test JSON stream
 
 
 # Credit
