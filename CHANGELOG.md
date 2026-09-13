@@ -178,6 +178,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.gitignore` covers `.mach-txn-lock` and `.machtxn.*` against a pre-fix formatter (#3310).
 - `mach doc` publishes each page through the project's control home, so `doc/` and every directory under it gains no `.mach-txn-lock`, claims directory or backup; an `--out` outside the project is rooted as before (#3310).
 - `mach doc` documents only the root project's modules: a dependency's pages and index rows are no longer generated into the consumer's tree (#3321).
+- A narrow integer divide or remainder is widened to the target's declared ALU floor rather than a fixed 32 bits, so the spirv target divides 8-bit and 16-bit lanes at their own width and the quotient keeps the lane type; `vec/rows_i8` and `vec/rows_i16` leave `test/golden/spirv/SKIPS` and carry the column (#3318).
 - `mach doc` writes under `doc/` rather than `doc/api/`: the index is `doc/README.md` and each page is `doc/<module path>.md`; `--out <dir>` is unchanged (#3321).
 - The dependency conflict diagnostic's example `[dep.<id>]` table escapes its `git`, `ref` and `path` values as the manifest writer does, so a host path with backslashes reparses as written (#3317).
 - Four unit tests that encoded an x86_64-linux host (a two-target union fixture with no default, an absolute out probed through a host-invalid joined path, and a fixture path written into a scaffolded `mach.toml` unescaped) are host-independent, and the aarch64-linux and x86_64-windows test legs pass again (#3317).
