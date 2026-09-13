@@ -6,7 +6,6 @@ use std.collections.sort;
 use std.collections.vector;
 use std.collections.vector.Vector;
 use fs:       std.filesystem;
-use txn:      std.filesystem.transaction;
 use io_error: std.io.error;
 use std.print;
 use std.system.os;
@@ -36,6 +35,7 @@ use mach.cli.util;
 use mach.lang.driver.registry.setup_registry;
 use mach.lang.intern;
 use mach.lang.manifest;
+use mach.lang.output.remove;
 use mach.lang.target;
 
 # what a clean entry names
@@ -377,140 +377,52 @@ fun normalize_and_collapse(a: *A.Allocator, raw: *Vector[CleanEntry]) res[Vector
     ret res[Vector[CleanEntry], outcome.Fail].ok{out};
 }
 
-rec CleanTarget {
-    destination: *txn.Claim;
-    suffix:      str;
-}
-
-rec CleanScope {
-    root:        txn.Root;
-    lock:        txn.Lock;
-    claims:      *txn.Claim;
-    claim_count: usize;
-    capacity:    usize;
-    targets:     *CleanTarget;
-}
-
-fun clean_scope_dnit(a: *A.Allocator, scope: *CleanScope) err[outcome.Fail] {
-    var failure: err[outcome.Fail] = err[outcome.Fail].ok{};
-    var i:       usize             = 0;
-    for (i < scope.claim_count) {
-        val released: err[txn.Error] = txn.release_claim(?scope.claims[i]);
-        if (sel released.err) {
-            val failure_ok: bool = sel failure.ok;
-            if (failure_ok) { failure = err[outcome.Fail].err{outcome.user(txn.error_message(released.err))}; }
-        }
-        i = i + 1;
-    }
-    if (scope.claims != nil)  { A.deallocate[txn.Claim](a, scope.claims, scope.capacity); }
-    if (scope.targets != nil) { A.deallocate[CleanTarget](a, scope.targets, scope.capacity); }
-    scope.claims      = nil;
-    scope.targets     = nil;
-    scope.claim_count = 0;
-    scope.capacity    = 0;
-    val unlocked: err[txn.Error] = txn.unlock(?scope.lock);
-    val closed:   err[txn.Error] = txn.root_dnit(?scope.root);
-    if (sel unlocked.err) {
-        val failure_ok2: bool = sel failure.ok;
-        if (failure_ok2) { failure = err[outcome.Fail].err{outcome.user(txn.error_message(unlocked.err))}; }
-    }
-    if (sel closed.err) {
-        val failure_ok3: bool = sel failure.ok;
-        if (failure_ok3) { failure = err[outcome.Fail].err{outcome.user(txn.error_message(closed.err))}; }
-    }
-    ret failure;
-}
-
-fun clean_scope_init(scope: *CleanScope, a: *A.Allocator, root: str, entries: *CleanEntry, count: usize) err[outcome.Fail] {
+# every target is validated as a canonical path beneath the project root
+# before anything is removed, so a refused entry leaves the plan untouched
+fun check_plan(entries: *CleanEntry, count: usize) err[outcome.Fail] {
     var i: usize = 0;
     for (i < count) {
         if (!manifest.is_project_path(entries[i].rel)) { ret err[outcome.Fail].err{outcome.user("clean target is not a canonical path beneath the project root")}; }
-        i = i + 1;
-    }
-    val opened: err[txn.Error] = txn.root_open(?scope.root, root, "");
-    if (sel opened.err) { ret err[outcome.Fail].err{outcome.user(txn.error_message(opened.err))}; }
-    val locked: err[txn.Error] = txn.lock(?scope.lock, ?scope.root);
-    if (sel locked.err) { ret err[outcome.Fail].err{outcome.user(txn.error_message(locked.err))}; }
-    val recovered: res[usize, txn.Error] = txn.recover(a, ?scope.lock, "");
-    if (sel recovered.err) { ret err[outcome.Fail].err{outcome.user(txn.error_message(recovered.err))}; }
-    if (count == 0)        { ret err[outcome.Fail].ok{}; }
-    scope.capacity = count;
-    val owners: res[*txn.Claim, A.Error] = A.allocate[txn.Claim](a, count);
-    if (sel owners.err) { ret err[outcome.Fail].err{outcome.refused(owners.err)}; }
-    scope.claims = owners.ok;
-    val targets: res[*CleanTarget, A.Error] = A.allocate[CleanTarget](a, count);
-    if (sel targets.err) { ret err[outcome.Fail].err{outcome.refused(targets.err)}; }
-    scope.targets = targets.ok;
-    i             = 0;
-    for (i < count) {
-        var empty: txn.Claim;
-        scope.claims[i] = empty;
-        i               = i + 1;
-    }
-    i = 0;
-    for (i < count) {
-        val rel: str   = entries[i].rel;
-        val n:   usize = str_len(rel);
-        var end: usize = 0;
-        for (end < n && rel[end] != '/') { end = end + 1; }
-        val copied: res[str, string.StrError] = str_copy_slice(a, rel, 0, end);
-        if (sel copied.err) { ret err[outcome.Fail].err{outcome.user(outcome.str_text(copied.err))}; }
-        val leaf:  str   = copied.ok;
-        var which: usize = 0;
-        for (which < scope.claim_count && !str_equals(txn.claim_leaf(?scope.claims[which]), leaf)) { which = which + 1; }
-        if (which == scope.claim_count) {
-            val claimed: err[txn.Error] = txn.claim(?scope.claims[which], a, ?scope.lock, leaf);
-            str_free(a, leaf);
-            if (sel claimed.err) { ret err[outcome.Fail].err{outcome.user(txn.error_message(claimed.err))}; }
-            scope.claim_count = scope.claim_count + 1;
-        }
-        or { str_free(a, leaf); }
-        scope.targets[i].destination = ?scope.claims[which];
-        scope.targets[i].suffix      = "";
-        if (end < n) { scope.targets[i].suffix = (rel::usize + end + 1)::str; }
         i = i + 1;
     }
     ret err[outcome.Fail].ok{};
 }
 
 fun execute_plan(a: *A.Allocator, root: str, entries: *CleanEntry, count: usize, removed: *usize) i64 {
-    var scope:    CleanScope;
-    val prepared: err[outcome.Fail] = clean_scope_init(?scope, a, root, entries, count);
-    var code:     i64               = 0;
-    if (sel prepared.err) {
+    val checked: err[outcome.Fail] = check_plan(entries, count);
+    if (sel checked.err) {
         print.eprint("error: cannot reserve clean targets: ");
-        print.eprintln(outcome.describe(prepared.err));
-        code = 2;
+        print.eprintln(outcome.describe(checked.err));
+        ret 2;
     }
-    if (sel prepared.ok) {
-        var i: usize = 0;
-        for (i < count) {
-            code = execute_entry(?scope.targets[i], ?entries[i], removed, code);
-            i    = i + 1;
-        }
+    val opened: i64 = remove.open_path(root);
+    if (opened < 0) {
+        print.eprint("error: cannot open the project root: ");
+        print.eprintln(os.message(opened));
+        ret 2;
     }
-    val released: err[outcome.Fail] = clean_scope_dnit(a, ?scope);
-    if (sel released.err) {
-        print.eprint("error: ");
-        print.eprintln(outcome.describe(released.err));
-        code = 2;
+    val root_fd: i32 = opened::i32;
+    fin { os.close(root_fd); }
+    var code: i64   = 0;
+    var i:    usize = 0;
+    for (i < count) {
+        code = execute_entry(root_fd, ?entries[i], removed, code);
+        i    = i + 1;
     }
     ret code;
 }
 
-fun execute_entry(target: *CleanTarget, e: *CleanEntry, removed: *usize, code: i64) i64 {
-    val rr: res[usize, txn.Error] = txn.root_remove_tree(target.destination, target.suffix);
-    if (sel rr.err) {
-        val fault: txn.Error = rr.err;
-        if (fault.kind == txn.IO && fault.code == os.ENOENT) { ret code; }
+fun execute_entry(root_fd: i32, e: *CleanEntry, removed: *usize, code: i64) i64 {
+    val rr: remove.Removal = remove.relative(root_fd, e.rel);
+    if (rr.code < 0) {
+        if (rr.code == os.ENOENT) { ret code; }
         print.eprint("error: cannot remove clean target '");
         print.eprint(e.rel);
         print.eprint("': ");
-        if (fault.kind == txn.CONTAINMENT) { print.eprintln("it escapes the project root or is reached through a symlink"); }
-        or                                 { print.eprintln(txn.error_message(fault)); }
+        print.eprintln(remove.message(rr));
         ret 2;
     }
-    if (rr.ok == 0) { ret code; }
+    if (rr.removed == 0) { ret code; }
 
     print.print("removed ");
     print.println(e.rel);
@@ -807,7 +719,7 @@ test "mach.cli.cmd.clean.execute_entry:a_dotdot_target_is_refused_through_the_ro
     ret 0;
 }
 
-test "mach.cli.cmd.clean:plans_every_claim_before_deletion_and_shares_common_roots" {
+test "mach.cli.cmd.clean:refuses_the_whole_plan_before_deleting_anything" {
     var a:      A.Allocator;
     val make_r: err[A.Error] = page.make(?a);
     if (sel make_r.err) { ret 1; }
@@ -845,22 +757,6 @@ test "mach.cli.cmd.clean:plans_every_claim_before_deletion_and_shares_common_roo
     if (removed != 0)                                          { ret 7; }
     if (!(sel exists_r.ok && exists_r.ok))                     { ret 7; }
     entries[1].rel = "out/b";
-    var held:     CleanScope;
-    val prepared: err[outcome.Fail] = clean_scope_init(?held, ?a, root, ?entries[0], 2);
-    if (sel prepared.err) {
-        clean_scope_dnit(?a, ?held);
-        ret 8;
-    }
-    fin { clean_scope_dnit(?a, ?held); }
-    if (held.claim_count != 1 || held.targets[0].destination != held.targets[1].destination) { ret 9; }
-    val exists_r2: res[bool, io_error.Error] = fs.exists(left);
-    val exists_r3: res[bool, io_error.Error] = fs.exists(right);
-    if (execute_plan(?a, root, ?entries[0], 2, ?removed) != 2) { ret 10; }
-    if (removed != 0)                                          { ret 10; }
-    if (!(sel exists_r2.ok && exists_r2.ok))                   { ret 10; }
-    if (!(sel exists_r3.ok && exists_r3.ok))                   { ret 10; }
-    val clean_scope_dnit_r: err[outcome.Fail] = clean_scope_dnit(?a, ?held);
-    if (sel clean_scope_dnit_r.err)                                            { ret 11; }
     if (execute_plan(?a, root, ?entries[0], 2, ?removed) != 0 || removed != 2) { ret 12; }
     val exists_r4: res[bool, io_error.Error] = fs.exists(left);
     val exists_r5: res[bool, io_error.Error] = fs.exists(right);
