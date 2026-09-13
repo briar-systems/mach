@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.0.3] - 2026-09-13
+
+### Added
+
+- The register allocator weights a value's uses by loop depth when choosing what to spill, so a loop-invariant such as an array base keeps its register over a guard's short temporaries (#3335).
+- The vectorizer proves guard ranges statically from constants and counted induction variables through `add`, `sub`, `mul` and `shl`, folds constant conjunctions, emits no overlap guard between distinct globals, computes the lane bound once in the preheader, and folds a guard proven true so the scalar copy of the loop is pruned (#3335).
+- A tag is addressed like a struct: gep field 0 is the discriminator and field `k + 1` is the payload of case `k` (`tag_disc_field`, `tag_case_field`, `tag_field_type`, `member_offset_for_machine`); the discriminator's integer type is interned with the tag and the SPIR-V emitter's private index shift is gone (#3335).
+- Scalar replacement splits a tag into its discriminator and one slot per payload case, so a `res`, `opt` or `err` returned by an inlined helper lives in registers (#3335).
+- An element address whose every use is a scalar, non-volatile load or store folds into the access as its memory operand on targets whose memory operands take a scaled index (`indexed_memory`, x86-64) (#3335).
+- Scalar float arithmetic is two-address for the allocator and packed vector arithmetic runs in the destination register instead of through the scratch register (#3335).
+- Division and remainder by a constant power of two lower to shifts and masks (#3335).
+- Jump threading over a boolean phi join sends each predecessor straight to the branch target it already knows, or branches on its own compare; skipped on `structured_control_flow` targets (#3335).
+- A splat of a constant loads from a 16-byte aligned read-only global instead of being built on the stack (#3335).
+- A division or remainder by a constant that cannot trap is discardable, so a folded division no longer survives to `idiv` (#3335).
+- `--emit-asm` lists a direct call or jump by its symbol and gives encoder-local labels numbers with their definitions (#3335).
+
+### Changed
+
+- The machine model gains `indexed_memory` and `structured_control_flow`, both in the model fingerprint (#3335).
+
 ## [5.0.2] - 2026-09-13
 
 ### Fixed
