@@ -93,6 +93,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `test/run.sh` is the one test driver, in plain shell: it loops the codegen cases over the targets, builds, decodes with `llvm-objdump`, diffs against the goldens, and compares O0 and O2 execution with the C reference; `--link` runs the link cases, `--dwarf` the `-g` builds through `llvm-dwarfdump --verify`, `--qemu` the foreign linux targets, `--bless` writes instead of diffing (#3316).
+- The vector rows are ordinary cases under `test/cases/vec/rows_*`, one `#[noinline]` probe per operation, signedness and predicate of each lane width, folded through the corpus checksum and witnessed by the golden (#3316).
+- A link case is checked by its own `check.sh` or a shared reader under `test/link/check/`, and declares the checkout's `dep/std` as a path dependency (#3316).
+- CI is two workflows: `ci.yml` proves the primary hosts on every pull request (fixpoint, unit suite in both profiles, formatter, cross-compiles, every golden, the host differential) and runs qemu, spirv, riscv32, the link legs, dwarf and darwin on a push to main or by `workflow_dispatch`; `cd.yml` builds and publishes a tag (#3316).
 - A declared `subsystem`, from `--subsystem` or an artifact `subsystem` key, is refused as unsupported on a target whose image format has no such field (ELF, Mach-O, flat image), naming the declaration, target and format rather than being accepted and unread (#3124).
 - An omitted subsystem key remains the console default everywhere (#3124).
 - An artifact that needs the subsystem key on Windows and also targets a Linux or Darwin cell must declare one artifact per format (#3124).
@@ -233,6 +237,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- The python corpus driver (`test/lib/`), `engines.conf`, `tools.lock`, `ci-legs.sh`, `ci-tools.sh`, `test-corpus.py`, `test/vecrows/`, `test/link/run.sh` and its `lib/`, `test/memory.py`, `test/census.sh` and `test/census/`, `doc-agreement.py`, `doc-examples.py`, `determinism.sh`, `test/checked-types/`, `version-vendor.sh`, the fuzz runner, `.github/scripts/`, and the `test-main`, `darwin-lane` and `compiler-memory` workflows (#3316).
 - The `clobbers` field on `isa.Inst` is removed (#2212).
 - Implicit instruction writes derive from `asm.Mnemonic.implicit` and opcode descriptors, eliminating zero-filled effects that read as having no clobbers for every instruction (#2212).
 - The unreleased `try` grammar production from the withdrawn 2026-09-08 design is removed from the parser, restoring `try` as an ordinary identifier (#3131).
