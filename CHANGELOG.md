@@ -167,6 +167,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The dependency conflict diagnostic's example `[dep.<id>]` table escapes its `git`, `ref` and `path` values as the manifest writer does, so a host path with backslashes reparses as written (#3317).
+- Four unit tests that encoded an x86_64-linux host (a two-target union fixture with no default, an absolute out probed through a host-invalid joined path, and a fixture path written into a scaffolded `mach.toml` unescaped) are host-independent, and the aarch64-linux and x86_64-windows test legs pass again (#3317).
 - Test return values are constrained to a status in `0..255` across test protocols, preventing return codes of 256 or multiples of 256 from being masked as passing exit status 0 on Linux and Darwin (#3241).
 - A literal-shaped `ret` outside `0..255` in a test body is a compile error at the `ret` naming the value, such as `test result 256 is outside the status range 0..255` (#3241).
 - The test dispatcher folds runtime results outside `0..255` to `255` before exiting, ensuring failure reporting with identical status across every host (#3241).
