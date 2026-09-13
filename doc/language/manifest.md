@@ -250,13 +250,19 @@ float argument rides an integer register — while the `f` and `d` suffixes are
 means by "riscv64", and is the convention `mach init` scaffolds for a
 `riscv64`/`linux` target; a manifest that wants soft float, or the `f`-only
 convention, must name it explicitly, since `abi` has no default of its own
-(see [Totality](#totality)). `riscv32`
+(see [Totality](#totality)). `linux` accepts all three on `riscv64` because
+its kernel ABI is integer-only, whereas every operating system accepts only
+the conventions it declares per instruction set (`linux` and `darwin` refuse
+`win64` on `x86_64`, `windows` refuses `sysv64`) and `freestanding` accepts
+every convention the instruction set covers. `riscv32`
 currently only reaches a `freestanding` target — `mach info targets` lists
-`freestanding-riscv32` and no `linux`/`darwin` riscv32 tuple.
+`freestanding-riscv32` rows and no `linux`/`darwin` riscv32 row.
 
-`mach info targets` prints the tuples this binary can actually build; it is
+`mach info targets` prints every tuple this binary can actually build, one
+`(os, isa, abi, object)` cell per line with every dimension spelled; it is
 derived from the same declarations composition reads, so it never advertises a
-tuple that would fail to resolve.
+tuple that would fail to resolve. `mach info` alone prints the tuple the host
+resolves to.
 
 A value outside its axis's set is a strict-parse error, so a typo is caught rather
 than silently never matching.
