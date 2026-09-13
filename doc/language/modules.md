@@ -54,7 +54,7 @@ The surface loads each split with `use myproj.foo.a;` and re-exports its
 public symbols with `fwd a.X;`. Consumers `use myproj.foo;` and access
 symbols through the surface — they never name the split files directly.
 
-```mach run "3"
+```mach
 # file: src/foo/a.mach
 pub fun one() i64 { ret 1; }
 

@@ -37,7 +37,7 @@ tree its self-build compiles instead; the two self-builds are then reported
 side by side and not compared for identity.
 
 Regression thresholds: THRESHOLDS below holds a peak-RSS ceiling per workload
-and profile, derived from measured curves (doc/design/r2-measurements.md). The
+and profile, derived from the measured curves recorded on #2299 (PR #3302). The
 compiler under test fails the run when any of its cells exceeds its ceiling;
 the control is never held to them.
 
@@ -166,13 +166,13 @@ BUILT = re.compile(rb'^built .*?(\d+) modules?\b', re.M)
 
 # peak ceilings in MiB per workload and profile, applied to every jobs and
 # cache-mode cell of the workload for the compiler under test. each is the
-# largest peak measured in doc/design/r2-measurements.md (dev 83d3c1c9d, both
+# largest peak measured on #2299 (PR #3302, dev 83d3c1c9d, both
 # compiler profiles, jobs 1 and 16, all cache modes) times the multiple stated
 # there: 1.25 for the self-build, where the two 2026-09-06 scratch fixes were
 # each worth more and the spread with THP disabled is under 3 percent, and 1.5
 # for the synthetic families with a 32 MiB minimum for cells that sit within a
 # few MiB of the spawner floor. the blocks ceilings follow the sparse liveness
-# (doc/design/r2-measurements.md, "cliffs addressed"): 18.1 / 24.9 / 38.7 /
+# ("cliffs addressed" on PR #3302): 18.1 / 24.9 / 38.7 /
 # 65.8 MiB measured at 500 / 1000 / 2000 / 4000, linear.
 THRESHOLDS = {
     'self-debug': 2867,

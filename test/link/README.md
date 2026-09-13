@@ -89,9 +89,12 @@ self-host: linux-riscv64             # cross-build the compiler and let it compi
 ```
 
 Every producer is catalogued in `lib/produce.sh`'s header, which says what each one
-observes. `doc/design/test-observability.md` says what running a program
-structurally *cannot* observe and maps each of those classes to the surface that
-can. Read it before adding anything here.
+observes and what running a program structurally *cannot* observe. Read it before
+adding anything here: an integration case earns its place only when the fact it
+asserts is owned by something outside this repository (a foreign toolchain's
+conventions, a real kernel's behaviour, a real linked image, another
+architecture's execution). Everything else is a unit test that has not been
+written yet.
 
 `self-host` names a target in the **repo's own** `mach.toml`, which is a different
 vocabulary from this suite's legs. It is written out rather than derived: the two

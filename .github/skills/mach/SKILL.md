@@ -850,8 +850,9 @@ The authoritative per-feature reference lives in the Mach repository under
 [`doc/language/`](https://github.com/briar-systems/mach/tree/dev/doc/language)
 - including `tag.md`, the full EBNF in `grammar.md`, `variadics.md`,
 `secrecy.md`, `decorators.md`, the `comptime-*.md` set, `asm.md`, and
-`policy.md` (the compiler-vs-stdlib boundary); `doc/migration-v5.md` maps
-every 4.x form to its 5.0 spelling. When this skill and the reference
+`policy.md` (the compiler-vs-stdlib boundary) and `manifest.md` (the
+`mach.toml` reference); the 5.0.0 changelog entry maps every 4.x form to its
+5.0 spelling. When this skill and the reference
 disagree, the reference wins. Tooling: `mach check <path>` runs the frontend
 alone (the inner loop), `mach build <path> --plan` prints the effective build
 without running it; `mach fmt` is in a parallel lane and is not documented

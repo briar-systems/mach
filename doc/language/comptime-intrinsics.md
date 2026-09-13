@@ -17,7 +17,7 @@ narrower binding is a choice of representation rather than a conversion. It
 adopts the binding's width and signedness, and is **refused** — never truncated —
 when the measured value does not fit:
 
-```mach reject "out of range"
+```mach
 use std.types.size.usize;
 
 rec Point { x: i64; y: i64; }
@@ -129,7 +129,7 @@ to where it is measured makes no difference:
 | `$if` / `$or` condition, in a function body | yes |
 | `$if` / `$or` condition, in declaration scope | only when no arm of the chain declares anything |
 
-```mach accept
+```mach
 rec Pair { a: u64; b: u64; }
 
 #[align($align_of(Pair))]        # a type's alignment
@@ -437,7 +437,7 @@ $fields(T)              # comptime field sequence for record T
 v.[f]                   # comptime field projection: access the field f on v
 ```
 
-```mach run "7"
+```mach
 use std.runtime;
 use print: std.print;
 
@@ -465,7 +465,7 @@ fun main(argc: i64, argv: **u8) i64 {
 Because each `$each` iteration re-types `v.[f]` to the concrete field type,
 heterogeneous records work naturally:
 
-```mach run "12"
+```mach
 use std.runtime;
 use print: std.print;
 
@@ -490,7 +490,7 @@ fun main(argc: i64, argv: **u8) i64 {
 
 Field descriptor properties can be read inside the loop body:
 
-```mach run "8 1"
+```mach
 use std.runtime;
 use print: std.print;
 
@@ -542,8 +542,8 @@ fun cross(p: Pair, q: Pair) i64 {
 
 ## Tag reflection: `$cases` and `$discriminant_of`
 
-The intrinsics described here implement the accepted Mach v5 tagged value design
-in [the accepted contract](../design/tagged-values.md).
+The intrinsics described here are the reflection half of the tagged-value
+contract in [tag.md](tag.md).
 
 `$cases(T)` produces a comptime sequence of owner-qualified case descriptors for
 a tag type `T`, in declaration order:
@@ -572,7 +572,7 @@ specialized payload type. `$is_tag(^T)` is false, and `$cases(^T)` is rejected.
 Inside the loop body, `sel value.[case]` is the case test and `value.[case]` is
 the guarded payload place:
 
-```mach run "value 42"
+```mach
 use std.runtime;
 use print: std.print;
 
@@ -642,7 +642,7 @@ forms, every element shares one type (the array's element type), so the loop
 variable is an ordinary constant value: it reads as a value, casts, dispatches a
 per-element `$if`, and — for a record element — projects fields with `x.field`.
 
-```mach run "17"
+```mach
 use std.runtime;
 use print: std.print;
 

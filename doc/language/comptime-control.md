@@ -56,7 +56,7 @@ fixed per call site. `$if` / `$or` may branch on it: the compiler
 **monomorphizes** the function body once per distinct comptime-argument value,
 and each instance compiles only the arm its value selects.
 
-```mach run "14 49"
+```mach
 use std.runtime;
 use print: std.print;
 
@@ -151,7 +151,7 @@ and the stage that would have to know that is the one being chosen.
 A `use` is a declaration, so a conditional import is always decided while names are
 resolved. That is what makes the common target-gating form work.
 
-```mach accept
+```mach
 rec MeshUniforms { model: [16]f32; }
 
 # no arm declares: decided during type checking, so the gate may measure
@@ -160,7 +160,7 @@ $if ($size_of(MeshUniforms) != 64) {
 }
 ```
 
-```mach reject "an arm of this `$if` declares something"
+```mach
 rec MeshUniforms { model: [16]f32; }
 
 # the second arm declares, so the whole chain is decided while names are

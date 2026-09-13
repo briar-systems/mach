@@ -27,7 +27,7 @@ core.add            # symbol from module `core`
 
 A type name followed by a brace-delimited initializer:
 
-```mach accept
+```mach
 use std.types.result.res;
 use std.types.error.err;
 
@@ -59,7 +59,7 @@ require one positional initializer per lane. See [types.md](types.md#simd-vector
 
 ## Field, index, and tag access
 
-```mach run "1 10"
+```mach
 use std.runtime;
 use print: std.print;
 

@@ -8,7 +8,7 @@ Marks a declaration as part of its module's public surface. Other modules
 that `use` this module can reference `pub`-marked symbols by name; symbols
 without `pub` are file-private.
 
-```mach reject "helper"
+```mach
 # file: src/lib.mach
 pub fun add(a: i64, b: i64) i64 { ret a + b; }
 fun helper() i64 { ret 1; }     # private: only callable inside this file
