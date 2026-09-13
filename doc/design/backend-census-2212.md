@@ -449,6 +449,20 @@ owner decision or a proven bar beyond "goldens unchanged".
    word only if `isa.Inst` grows a fourth operand or aarch64 keeps a form byte;
    that is #2212's open question 1 (per-ISA shape vs one generic type) and needs
    the owner's ruling before code.
+   *Landed 2026-09-12 (#2212, "one instruction representation").* Ruled as one
+   generic `isa.Inst` (`src3` from N5). The private record, its 22 form bytes and
+   the `to_inst` translation are gone: `arm64/inst.mach:Form` is one row per
+   `MachOp` (spelling, `Layout`, base word and immediate-form base, `WidthRule`,
+   `LaneClass`, alias flag); `inst.assemble(*isa.Inst)` packs the word from the row
+   and the operands, `inst.spell` renames an encoding to the alias an assembler
+   reads back (the notification carries the spelled form), and `arm64/printer.mach`
+   renders from `isa.Inst` alone. The layout is the old form byte as a row column;
+   `FLAG_SP`, `FLAG_LABEL_LOCAL/FWD/SKIP` carry what the record's `target`/`sym_mod`
+   fields did (the symbol modifier is now `isa.Operand.sym_mod`). Three members
+   were added for encodings that shared a spelling: `FMOV_GEN`, `FMOV_IMM`,
+   `INS_EL`. `inst.form:every_member_has_a_complete_row` is the opcode-space
+   census; an instruction the table cannot hold emits nothing and refuses the
+   buffer (`encode.buf_refuse`, reported at the function boundary).
 2. **Per-opcode description tables where none exist** (ADM rows above):
    x86_64 form/flags/memory for the codegen path (landed 2026-09-12:
    `x64.describe`, section 2); a riscv `inst.mach` table
@@ -456,6 +470,9 @@ owner decision or a proven bar beyond "goldens unchanged".
    `rv_fields`, `classify_*`, `shape_of`, `printer.mnemonic` and `RV_MNEMONICS.code`
    all read; an aarch64 base-word table. The #2766 access rows are the template.
    Bar: byte-identical corpus plus `llvm-mc` conformance per #2118's acceptance.
+   *aarch64 landed 2026-09-12* with item 1: the base-word table is the `Form` row,
+   the access rows (`encode.mach:A64Access`) now name members instead of words,
+   and the packer unit tests state their expectations through `inst.assemble`.
 3. **`isa.Inst.clobbers`.** Either delete the field or make every encoder
    populate it and add a reader; leaving a zero-filled effect field for N5 to
    discover is the fail-open shape #2212 forbids. N5 should rule.
@@ -480,6 +497,11 @@ owner decision or a proven bar beyond "goldens unchanged".
 7. **SPIR-V opcode table.** An `OpDef`-shaped row (opcode, arity, result-type)
    for the ~60 `emit_instr` arms, so word counts and the int/float pairing are
    data. Sequenced after N4 so the value ABI is not rebuilt twice.
+   *Landed 2026-09-12.* `spirv/ops.mach`: `CoreOp` (opcode, name, arity; every
+   row typed) and `MirMap` (MIR opcode, emitter shape, int/float opcode, source
+   class). `emit_instr` dispatches by the mapping row; `emit_binary`/`unary`/
+   `compare`/`convert` size the word from the core row and refuse an opcode whose
+   arity is not the shape's. The N4 value ABI is untouched.
 
 ## 11. Frozen interfaces for N3 to N6
 
