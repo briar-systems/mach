@@ -15,7 +15,7 @@
 #   --target <t>   one target (repeatable); default every target with a golden dir
 #   --case <g/n>   one case (repeatable)
 #   --bless        write the goldens instead of diffing them, print the diff
-#   --qemu         execute a foreign linux target under qemu-<isa>
+#   --qemu         execute riscv64-linux under qemu-riscv64
 #   --link         run the link cases (test/link/cases) instead of the corpus
 #   --dwarf        build every case with -g and run llvm-dwarfdump --verify
 #   MACH           the compiler under test, default out/<host>/debug/bin/mach
@@ -130,12 +130,14 @@ object_format() {
     case "$os" in linux) echo elf ;; windows) echo coff ;; darwin) echo macho ;; *) echo raw ;; esac
 }
 
-# engine <target>: "" for the host itself, the qemu command, or "-" when nothing here runs it
+# engine <target>: "" for the host itself, the qemu command, or "-" when nothing here
+# runs it. qemu serves riscv64 only, the one linux target with no native runner:
+# it is compute evidence, never ABI evidence, so aarch64 is proven on real silicon.
 engine() {
     isa=$(target_field "$1" 2); os=$(target_field "$1" 3)
     if [ "$os" = "$host_os" ] && [ "$isa" = "$host_isa" ]; then echo ""; return; fi
-    if [ "$qemu" -eq 1 ] && [ "$os" = linux ] && command -v "qemu-$isa" >/dev/null 2>&1; then
-        echo "qemu-$isa"; return
+    if [ "$qemu" -eq 1 ] && [ "$1" = riscv64-linux ] && command -v qemu-riscv64 >/dev/null 2>&1; then
+        echo qemu-riscv64; return
     fi
     echo -
 }

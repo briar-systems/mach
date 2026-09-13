@@ -24,7 +24,7 @@ test/
 bash test/run.sh                          # every golden, plus the differential this host can execute
 bash test/run.sh --target x86_64-linux    # one target (repeatable)
 bash test/run.sh --case bits/logic_u32    # one case (repeatable)
-bash test/run.sh --qemu                   # also execute foreign linux targets under qemu-<isa>
+bash test/run.sh --qemu                   # also execute riscv64-linux under qemu-riscv64
 bash test/run.sh --dwarf                  # also build every case with -g and run llvm-dwarfdump --verify
 bash test/run.sh --link [--qemu]          # the link cases instead of the corpus (--case <name> selects one)
 bash test/run.sh --bless [...]            # write the goldens or expect files instead of diffing, print the diff
