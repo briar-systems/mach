@@ -336,6 +336,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The target registry is one heap-owned immutable object. `Session` creates
+  it through `target.registry_new` over its own allocator, holds it by
+  pointer and releases it once in `dnit`; the parallel codegen workers' session
+  copies borrow that pointer instead of aliasing an inline registry. A
+  registry is published once by `register_all` and released once by
+  `registry_dnit`, which is terminal: a released registry refuses
+  `register_all` and `resolve`. A resolved target records the registry it was
+  resolved against, and `isel`, the encoder, `codegen_unit` and every link
+  entry refuse a target whose registry has been released as a typed error
+  rather than following a dead vtable. A fail-at-N probe walk over
+  build/publish/resolve/release proves the registry releases everything at
+  every refusal ordinal. (#2212)
+
 - The compiler builds against std 2.0 (std dev `e204cb81f`) and CI
   bootstraps it through the v5 migration stage (mach `2a2918b23` with std
   1.0.1) after the audited 4.30 fixpoint (#3226, lane C1). The language
