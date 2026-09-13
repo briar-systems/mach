@@ -10,8 +10,7 @@ normative language contract is [design/tagged-values.md](design/tagged-values.md
 and the reference is [language/](language/README.md); std's own inventory is
 its `MIGRATION.md` at the repository root of `mach-std`.
 
-Every example below with an expectation on its fence is compiled by
-`test/doc-examples.py` against the compiler in the tree; see
+Every example below carries an expectation on its fence; see
 [language/README.md](language/README.md#exercised-examples).
 
 ## 1. Get a 5.0 compiler first
@@ -49,8 +48,7 @@ accepted with a note are refused in 5.0.0 by name:
 | a `#[embed("...")]` path outside the project root | `` `embed` path escapes the project root; an embedded file must live inside the project (4.30 read it with a warning, 5.0.0 refuses it and does not read the file) `` | move the asset under the project root |
 
 Nothing else in the manifest schema changed between 4.30 and 5.0; every
-accepted key is tabled in [manifest.md](manifest.md) and
-`test/doc-agreement.py` holds that table to the parser. `mach dep pull` then
+accepted key is tabled in [manifest.md](manifest.md). `mach dep pull` then
 realizes the closure against the committed gitlinks; the scaffold's
 `[dep.std] ref = "branch/main"` resolves to std 2.0.0.
 

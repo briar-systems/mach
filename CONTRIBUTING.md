@@ -43,12 +43,11 @@ See the [release shape](doc/design/release-shape.md) for the seed transition.
 
 ### Checking
 
-`python3 test/doc-agreement.py` holds `doc/cli.md`, `doc/manifest.md`, the
-`mach init` scaffolds and the grammar's keyword list to the compiler under
-test, and `python3 test/doc-examples.py` compiles every exercised example of
-the language reference; both read `MACH_DOC_MACH` or the checkout's
-`out/<host>/debug/bin/mach`. `sh test/census.sh` runs the structural
-censuses. `mach test .` through the freshly built compiler is the unit suite.
+`mach test .` through the freshly built compiler is the unit suite, in both
+profiles. `bash test/run.sh` runs the codegen corpus (golden disassembly of every
+target this host can decode, plus differential execution against a C reference
+where it can execute) and `bash test/run.sh --link` runs the link cases; see
+[test/README.md](test/README.md).
 
 ---
 

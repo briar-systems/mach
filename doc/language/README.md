@@ -6,8 +6,8 @@ read the index below or follow `see also` links to navigate.
 This directory is the authoritative reference for the Mach 5 dialect. Each
 file is a focused doc with grammar, examples, and neighboring links; start
 from the index below. Examples whose fence carries an expectation (`accept`,
-`reject`, `warn`, `run`) are compiled by `test/doc-examples.py` against the
-compiler in the tree; see [Exercised examples](#exercised-examples). Users
+`reject`, `warn`, `run`) state how the compiler in the tree answers them; see
+[Exercised examples](#exercised-examples). Users
 moving from 4.x read [../migration-v5.md](../migration-v5.md) first.
 
 ## Files and structure
@@ -95,10 +95,7 @@ with a warning containing `text`, `mach run "text"` must build, run and
 print `text`, and `mach test "text"` must pass under `mach test` with `text`
 in the report. A block may hold several files, each introduced by a line
 `# file: <path>` (the first file is `src/root.mach` when no line names it).
-`python3 test/doc-examples.py` extracts every exercised fence, compiles it
-with the compiler under test against the pinned `dep/std`, checks the
-expectation, and reports how many fences exist and how many are exercised.
-A fence with no expectation is a fragment and is counted, never compiled.
+A fence with no expectation is a fragment.
 
 ## Design
 
