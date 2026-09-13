@@ -461,7 +461,9 @@ link_cell() {
             [ -s "$tmp/out.txt" ] || { fail "$label failed without an 'error:' diagnostic: $(tail -n1 "$tmp/build.log")"; rm -rf "$tmp"; return; }
             ;;
         *)
-            if [ "$built" -eq 0 ]; then fail "$label build: $(first_error "$tmp/build.log")"; rm -rf "$tmp"; return; fi
+            if [ "$built" -eq 0 ]; then
+                fail "$label build: $(first_error "$tmp/build.log")"; tail -n 6 "$tmp/build.log" | sed 's/^/    /'; rm -rf "$tmp"; return
+            fi
             gbin=
             if [ "$case_gbuild" = yes ]; then
                 gbin=$dir/out/link/prog-g$exe
